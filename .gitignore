@@ -1,0 +1,34 @@
+# 环境变量 - 包含 API 密钥
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# 内部工具目录
+.codegraph/
+
+# 大型安装包 - 需用户手动下载安装
+*.msi
+*.exe
+
+# 放弃的项目
+放弃的项目/
+
+# 临时文件
+*.tmp
+*.temp
+~$*.docx
+~$*.xlsx
+
+# 系统文件
+Thumbs.db
+Desktop.ini

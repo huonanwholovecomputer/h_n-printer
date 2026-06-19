@@ -1,0 +1,2766 @@
+===== 合并文件列表 (共 10 个文件) =====
+===== 扫描目录: D:\打印机项目\local_print_tool =====
+===== 文件类型: .json, .h, .js, .py, .cpp, .wxml, .c, .wxss, .txt =====
+===== 不扫描子文件夹 =====
+
+===== converter.py =====
+"""
+converter.py — 通用文件转换器 UniversalConverter
+将所有可打印文件格式统一转换为 PDF，支持:
+  - TXT / CSV  → reportlab
+  - 图片 (JPG/PNG/BMP/GIF/WEBP) → reportlab
+  - Markdown    → markdown → HTML → pdfkit (wkhtmltopdf)
+  - Office 文档 → LibreOffice 无头模式
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import platform
+import shutil
+import subprocess
+import tempfile
+import time
+from typing import Callable
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def _find_executable(name: str, search_paths: list[str]) -> str | None:
+    """在指定路径列表中查找可执行文件，返回首个存在的路径。"""
+    for p in search_paths:
+        if os.path.isfile(p):
+            return p
+    # 尝试 PATH 中查找
+    which = shutil.which(name)
+    return which
+
+
+def _find_libreoffice() -> str | None:
+    """跨平台查找 LibreOffice 可执行文件路径。"""
+    system = platform.system()
+    if system == "Windows":
+        candidates = [
+            os.path.expandvars(r"%ProgramFiles%\LibreOffice\program\soffice.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\LibreOffice\program\soffice.exe"),
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ]
+    elif system == "Darwin":
+        candidates = [
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        ]
+    else:  # Linux
+        candidates = [
+            "/usr/bin/soffice",
+            "/usr/lib/libreoffice/program/soffice",
+            "/usr/lib64/libreoffice/program/soffice",
+        ]
+    return _find_executable("soffice", candidates)
+
+
+def _find_wkhtmltopdf() -> str | None:
+    """查找 wkhtmltopdf 可执行文件。"""
+    system = platform.system()
+    if system == "Windows":
+        candidates = [
+            os.path.expandvars(r"%ProgramFiles%\wkhtmltopdf\bin\wkhtmltopdf.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\wkhtmltopdf\bin\wkhtmltopdf.exe"),
+            r"C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe",
+        ]
+    elif system == "Darwin":
+        candidates = [
+            "/usr/local/bin/wkhtmltopdf",
+            "/opt/homebrew/bin/wkhtmltopdf",
+        ]
+    else:
+        candidates = [
+            "/usr/bin/wkhtmltopdf",
+            "/usr/local/bin/wkhtmltopdf",
+        ]
+    return _find_executable("wkhtmltopdf", candidates)
+
+
+# ============================================================
+# 各格式转换器
+# ============================================================
+
+def _convert_txt_to_pdf(file_path: str, output_pdf: str) -> None:
+    """TXT 文本 → PDF（reportlab，支持中文）。"""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    # 注册中文字体
+    _register_chinese_font()
+
+    # 读取文本内容
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+
+    c = canvas.Canvas(output_pdf, pagesize=A4)
+    width, height = A4
+
+    margin_left = 20 * mm
+    margin_right = 20 * mm
+    margin_top = 15 * mm
+    margin_bottom = 15 * mm
+    usable_width = width - margin_left - margin_right
+    usable_height = height - margin_top - margin_bottom
+
+    font_name = _get_chinese_font_name()
+    font_size = 11
+    line_height = font_size + 4
+
+    lines = text.split("\n")
+    y = height - margin_top
+
+    for line in lines:
+        if not line.strip():
+            y -= line_height
+        else:
+            # 中文自动换行
+            wrapped = _wrap_text_line(line, font_name, font_size, usable_width, c)
+            for wline in wrapped:
+                if y < margin_bottom:
+                    c.showPage()
+                    c.setFont(font_name, font_size)
+                    y = height - margin_top
+                c.setFont(font_name, font_size)
+                c.drawString(margin_left, y, wline)
+                y -= line_height
+
+        if y < margin_bottom:
+            c.showPage()
+            c.setFont(font_name, font_size)
+            y = height - margin_top
+
+    c.save()
+    logger.info(f"TXT → PDF 完成: {output_pdf}")
+
+
+def _convert_csv_to_pdf(file_path: str, output_pdf: str) -> None:
+    """CSV 表格 → PDF（reportlab 绘制表格）。"""
+    import csv
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import PageBreak
+
+    _register_chinese_font()
+    font_name = _get_chinese_font_name()
+
+    # 读取 CSV
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+
+    if not rows:
+        # 空 CSV，写个占位
+        from reportlab.pdfgen import canvas as cvs
+        c = cvs.Canvas(output_pdf, pagesize=A4)
+        c.drawString(100, 500, "(空 CSV 文件)")
+        c.save()
+        return
+
+    # 使用 landscape 方向（宽表友好）
+    doc = SimpleDocTemplate(output_pdf, pagesize=landscape(A4),
+                            leftMargin=10*mm, rightMargin=10*mm,
+                            topMargin=10*mm, bottomMargin=10*mm)
+
+    styles = getSampleStyleSheet()
+    style_normal = styles["Normal"]
+    style_normal.fontName = font_name
+    style_normal.fontSize = 9
+
+    # 将每格包装为 Paragraph
+    def cell(text: str) -> Paragraph:
+        return Paragraph(str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), style_normal)
+
+    table_data = [[cell(val) for val in row] for row in rows]
+
+    max_rows_per_page = 40  # 横向每页大约行数
+    elements = []
+
+    for i in range(0, len(table_data), max_rows_per_page):
+        chunk = table_data[i:i + max_rows_per_page]
+        tbl = Table(chunk, repeatRows=1 if i == 0 else 0)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#45475a")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#888888")),
+            ("FONTNAME", (0, 0), (-1, -1), font_name),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        elements.append(tbl)
+        if i + max_rows_per_page < len(table_data):
+            elements.append(PageBreak())
+
+    doc.build(elements)
+    logger.info(f"CSV → PDF 完成: {output_pdf}")
+
+
+def _convert_image_to_pdf(file_path: str, output_pdf: str) -> None:
+    """图片 → PDF（reportlab，居中适应 A4）。"""
+    from PIL import Image as PILImage
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+
+    img = PILImage.open(file_path)
+    if img.mode not in ("RGB", "RGBA", "L"):
+        img = img.convert("RGB")
+
+    c = canvas.Canvas(output_pdf, pagesize=A4)
+    page_w, page_h = A4
+    margin = 10 * mm
+    max_w = page_w - 2 * margin
+    max_h = page_h - 2 * margin
+
+    iw, ih = img.size
+    scale = min(max_w / iw, max_h / ih, 1.0)
+    draw_w = iw * scale
+    draw_h = ih * scale
+
+    x = (page_w - draw_w) / 2
+    y = (page_h - draw_h) / 2
+
+    # 保存临时图片用于嵌入
+    tmp_img_path = output_pdf + ".tmp.png"
+    try:
+        img.save(tmp_img_path)
+        c.drawImage(tmp_img_path, x, y, width=draw_w, height=draw_h)
+    finally:
+        if os.path.exists(tmp_img_path):
+            os.remove(tmp_img_path)
+
+    c.save()
+    logger.info(f"图片 → PDF 完成: {output_pdf}")
+
+
+def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content: bool = False) -> None:
+    """HTML 文件或内容 → PDF（pdfkit / wkhtmltopdf）。"""
+    wk_path = _find_wkhtmltopdf()
+
+    if wk_path:
+        import pdfkit
+        options = {
+            "page-size": "A4",
+            "encoding": "UTF-8",
+            "enable-local-file-access": "",
+            "no-outline": None,
+            "margin-top": "10mm",
+            "margin-bottom": "10mm",
+            "margin-left": "10mm",
+            "margin-right": "10mm",
+        }
+        config = pdfkit.configuration(wkhtmltopdf=wk_path)
+        if is_content:
+            pdfkit.from_string(html_path_or_content, output_pdf, options=options, configuration=config)
+        else:
+            pdfkit.from_file(html_path_or_content, output_pdf, options=options, configuration=config)
+    else:
+        raise RuntimeError(
+            "未找到 wkhtmltopdf。请安装后加入 PATH。\n"
+            "下载地址: https://wkhtmltopdf.org/downloads.html"
+        )
+
+    logger.info(f"HTML → PDF 完成: {output_pdf}")
+
+
+def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
+    """Markdown → HTML → PDF。"""
+    import markdown
+
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        md_text = f.read()
+
+    # Markdown → HTML（包含基本样式）
+    md_body = markdown.markdown(md_text, extensions=["tables", "fenced_code", "codehilite"])
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  body {{ font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 12pt; line-height: 1.8; max-width: 780px; margin: 0 auto; padding: 20px; color: #222; }}
+  pre {{ background: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; }}
+  code {{ background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: "Consolas", "Courier New", monospace; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
+  th {{ background: #eee; }}
+  img {{ max-width: 100%; }}
+</style>
+</head>
+<body>
+{md_body}
+</body>
+</html>"""
+
+    _convert_html_to_pdf(html, output_pdf, is_content=True)
+    logger.info(f"Markdown → PDF 完成: {output_pdf}")
+
+
+def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
+    """
+    Office 文档 → PDF（LibreOffice 无头模式）。
+    支持 .doc / .docx / .xls / .xlsx / .ppt / .pptx
+    """
+    libreoffice = _find_libreoffice()
+    if not libreoffice:
+        raise RuntimeError(
+            "未找到 LibreOffice。请安装 LibreOffice 来转换 Office 文档。\n"
+            "下载地址: https://www.libreoffice.org/download/"
+        )
+
+    output_dir = os.path.dirname(output_pdf) or tempfile.gettempdir()
+    abs_input = os.path.abspath(file_path)
+    abs_output_dir = os.path.abspath(output_dir)
+
+    cmd = [
+        libreoffice,
+        "--headless",
+        "--convert-to", "pdf",
+        "--outdir", abs_output_dir,
+        abs_input,
+    ]
+
+    logger.info(f"执行 LibreOffice 转换: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("LibreOffice 转换超时（60 秒）")
+    except FileNotFoundError:
+        raise RuntimeError(f"LibreOffice 可执行文件未找到: {libreoffice}")
+
+    if result.returncode != 0:
+        raise RuntimeError(f"LibreOffice 转换失败 (rc={result.returncode}): {result.stderr}")
+
+    # LibreOffice 输出的 PDF 文件名 = 原始文件名（改扩展名 .pdf）
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    generated_pdf = os.path.join(abs_output_dir, base_name + ".pdf")
+
+    if not os.path.isfile(generated_pdf):
+        raise RuntimeError(f"LibreOffice 未生成预期的 PDF: {generated_pdf}")
+
+    # 如果输出路径与生成路径不同，移动/重命名
+    if os.path.abspath(generated_pdf) != os.path.abspath(output_pdf):
+        if os.path.exists(output_pdf):
+            os.remove(output_pdf)
+        shutil.move(generated_pdf, output_pdf)
+
+    logger.info(f"Office → PDF 完成: {output_pdf}")
+
+
+# ============================================================
+# 字体工具
+# ============================================================
+
+_chinese_font_registered = False
+_chinese_font_name = "Helvetica"
+
+
+def _register_chinese_font() -> None:
+    """注册系统中可用的中文字体到 reportlab。"""
+    global _chinese_font_registered, _chinese_font_name
+    if _chinese_font_registered:
+        return
+
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    system = platform.system()
+
+    # 字体候选列表：(字体名, 路径列表)
+    candidates: list[tuple[str, list[str]]] = []
+    if system == "Windows":
+        candidates = [
+            ("Microsoft YaHei", [
+                os.path.expandvars(r"%SystemRoot%\Fonts\msyh.ttc"),
+                os.path.expandvars(r"%SystemRoot%\Fonts\msyh.ttf"),
+            ]),
+            ("SimSun", [
+                os.path.expandvars(r"%SystemRoot%\Fonts\simsun.ttc"),
+                os.path.expandvars(r"%SystemRoot%\Fonts\simsun.ttf"),
+            ]),
+            ("SimHei", [
+                os.path.expandvars(r"%SystemRoot%\Fonts\simhei.ttf"),
+            ]),
+        ]
+    elif system == "Darwin":
+        candidates = [
+            ("PingFang SC", [
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            ]),
+        ]
+    else:
+        candidates = [
+            ("Noto Sans CJK SC", [
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            ]),
+            ("WenQuanYi Micro Hei", [
+                "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+            ]),
+            ("Droid Sans Fallback", [
+                "/usr/share/fonts/droid/DroidSansFallbackFull.ttf",
+            ]),
+        ]
+
+    for font_name, paths in candidates:
+        for path in paths:
+            if os.path.isfile(path):
+                try:
+                    pdfmetrics.registerFont(TTFont(font_name, path))
+                    _chinese_font_name = font_name
+                    _chinese_font_registered = True
+                    logger.info(f"已注册中文字体: {font_name} ({path})")
+                    return
+                except Exception:
+                    continue
+
+    # 回退
+    logger.warning("未找到中文字体，将使用 Helvetica（中文可能无法正常显示）")
+    _chinese_font_registered = True
+
+
+def _get_chinese_font_name() -> str:
+    return _chinese_font_name
+
+
+def _wrap_text_line(text: str, font_name: str, font_size: int, max_width: float,
+                    canvas_obj) -> list[str]:
+    """将单行文本按宽度自动换行，返回分行列表。"""
+    result: list[str] = []
+    current = ""
+    for ch in text:
+        test = current + ch
+        w = canvas_obj.stringWidth(test, font_name, font_size)
+        if w > max_width and current:
+            result.append(current)
+            current = ch
+        else:
+            current = test
+    if current:
+        result.append(current)
+    return result if result else [""]
+
+
+# ============================================================
+# UniversalConverter
+# ============================================================
+
+class UniversalConverter:
+    """
+    通用文件转 PDF 转换器。
+    根据文件扩展名自动选择转换策略。
+    """
+
+    # 扩展名 → 转换函数 映射
+    CONVERSION_MAP: dict[str, Callable[[str, str], None]] = {}
+
+    def __init__(self) -> None:
+        self._init_conversion_map()
+
+    def _init_conversion_map(self) -> None:
+        """初始化扩展名→转换函数映射。"""
+        cm = self.CONVERSION_MAP
+        # TXT / 文本类
+        cm[".txt"] = _convert_txt_to_pdf
+        cm[".csv"] = _convert_csv_to_pdf
+        # 图片类
+        for ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"):
+            cm[ext] = _convert_image_to_pdf
+        # Office 文档
+        for ext in (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"):
+            cm[ext] = _convert_office_to_pdf
+        # Markdown
+        cm[".md"] = _convert_markdown_to_pdf
+        # HTML
+        cm[".html"] = _convert_html_to_pdf
+        cm[".htm"] = _convert_html_to_pdf
+
+    def convert(self, file_path: str, output_pdf: str | None = None) -> str:
+        """
+        将文件转换为 PDF。
+
+        Args:
+            file_path: 源文件路径（含扩展名）
+            output_pdf: 输出 PDF 路径；若为 None 则自动生成临时文件
+
+        Returns:
+            生成的 PDF 文件路径
+
+        Raises:
+            ValueError: 不支持的文件类型
+            FileNotFoundError: 源文件不存在
+            RuntimeError: 转换失败
+        """
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"文件不存在: {file_path}")
+
+        ext = os.path.splitext(file_path)[1].lower()
+
+        # PDF 无需转换
+        if ext == ".pdf":
+            if output_pdf and os.path.abspath(file_path) != os.path.abspath(output_pdf):
+                shutil.copy2(file_path, output_pdf)
+                return output_pdf
+            return file_path
+
+        convert_func = self.CONVERSION_MAP.get(ext)
+        if convert_func is None:
+            raise ValueError(f"不支持的文件类型: {ext}  (文件: {file_path})")
+
+        if output_pdf is None:
+            fd, output_pdf = tempfile.mkstemp(suffix=".pdf", prefix="_conv_")
+            os.close(fd)
+
+        logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF")
+        convert_func(file_path, output_pdf)
+
+        if not os.path.isfile(output_pdf) or os.path.getsize(output_pdf) == 0:
+            raise RuntimeError(f"转换为 PDF 后文件为空或不存在: {output_pdf}")
+
+        return output_pdf
+
+
+# 模块级单例
+_converter_instance: UniversalConverter | None = None
+
+
+def get_converter() -> UniversalConverter:
+    """获取 UniversalConverter 单例。"""
+    global _converter_instance
+    if _converter_instance is None:
+        _converter_instance = UniversalConverter()
+    return _converter_instance
+
+===== gui.py =====
+"""
+gui.py — PySide6 主界面 MainWindow + 打印工作线程 PrintWorker
+HN 本地打印工具 — 支持浅色/深色双主题
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import traceback
+from datetime import datetime
+from typing import Optional
+
+from PySide6.QtCore import (
+    QThread,
+    Signal,
+    Qt,
+    QTimer,
+    QObject,
+    QEvent,
+    QPropertyAnimation,
+    QEasingCurve,
+)
+from PySide6.QtGui import QAction, QFont, QColor
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QGroupBox,
+    QLabel,
+    QLineEdit,
+    QComboBox,
+    QDoubleSpinBox,
+    QPushButton,
+    QProgressBar,
+    QTextEdit,
+    QFileDialog,
+    QMessageBox,
+    QMenuBar,
+    QMenu,
+    QAbstractItemView,
+    QScrollArea,
+    QStatusBar,
+    QStyleFactory,
+)
+
+from printer_config import PrinterConfig, PrintJob, calc_cost
+from converter import get_converter, UniversalConverter
+from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation
+from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 辅助工具
+# ============================================================
+
+def _disable_combo_wheel(combo: QComboBox) -> None:
+    """禁止 QComboBox 响应鼠标滚轮事件，避免滚动页面时误改选项。"""
+    class _WheelBlocker(QObject):
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Wheel:
+                return True  # 吞掉滚轮事件
+            return super().eventFilter(obj, event)
+
+    combo.installEventFilter(_WheelBlocker(combo))
+
+
+def _enable_smooth_scroll(scroll_area: QScrollArea) -> None:
+    """为 QScrollArea 启用平滑滚动：拦截滚轮事件并用动画过渡。"""
+    class _SmoothFilter(QObject):
+        def __init__(self, area):
+            super().__init__(area)
+            self._area = area
+            self._anim: QPropertyAnimation | None = None
+
+        def eventFilter(self, obj, event):
+            if event.type() == QEvent.Wheel:
+                vbar = self._area.verticalScrollBar()
+                delta = event.angleDelta().y()
+                if delta == 0:
+                    return False
+
+                # 每次滚轮滚动 3 倍单步步长
+                step = vbar.singleStep() or 15
+                current = vbar.value()
+                target = current - (delta // 120) * step * 3
+                target = max(vbar.minimum(), min(vbar.maximum(), target))
+
+                # 停止上次动画
+                if self._anim and self._anim.state() == QPropertyAnimation.Running:
+                    self._anim.stop()
+
+                self._anim = QPropertyAnimation(vbar, b"value", self)
+                self._anim.setDuration(180)
+                self._anim.setStartValue(current)
+                self._anim.setEndValue(target)
+                self._anim.setEasingCurve(QEasingCurve.OutCubic)
+                self._anim.start()
+                return True  # 已处理，阻止默认滚动
+            return super().eventFilter(obj, event)
+
+    scroll_area.viewport().installEventFilter(_SmoothFilter(scroll_area))
+
+
+# ============================================================
+# 自定义计数器控件
+# ============================================================
+
+class CounterWidget(QWidget):
+    """自定义计数器：[−] 按钮 + 数字标签 + [+] 按钮，替代默认 QSpinBox。"""
+
+    valueChanged = Signal(int)
+
+    def __init__(self, min_val: int = 1, max_val: int = 99, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._min = min_val
+        self._max = max_val
+        self._value = min_val
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._btn_minus = QPushButton("−")  # minus sign (−)
+        self._btn_minus.setObjectName("counterMinus")
+        self._btn_minus.setFixedSize(32, 32)
+        self._btn_minus.clicked.connect(self._decrease)
+
+        self._label = QLabel(str(self._value))
+        self._label.setObjectName("counterLabel")
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setFixedHeight(32)
+
+        self._btn_plus = QPushButton("+")
+        self._btn_plus.setObjectName("counterPlus")
+        self._btn_plus.setFixedSize(32, 32)
+        self._btn_plus.clicked.connect(self._increase)
+
+        layout.addWidget(self._btn_minus)
+        layout.addWidget(self._label, 1)
+        layout.addWidget(self._btn_plus)
+
+        self._update_state()
+
+    # -- 公开 API（与 QSpinBox 兼容）--
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, v: int) -> None:
+        if self._min <= v <= self._max:
+            self._value = v
+            self._label.setText(str(v))
+            self._update_state()
+
+    def setRange(self, min_val: int, max_val: int) -> None:
+        self._min = min_val
+        self._max = max_val
+        clamped = max(min_val, min(max_val, self._value))
+        if clamped != self._value:
+            self._value = clamped
+            self._label.setText(str(self._value))
+            self.valueChanged.emit(self._value)
+        self._update_state()
+
+    # -- 内部逻辑 --
+
+    def _increase(self) -> None:
+        if self._value < self._max:
+            self._value += 1
+            self._label.setText(str(self._value))
+            self._update_state()
+            self.valueChanged.emit(self._value)
+
+    def _decrease(self) -> None:
+        if self._value > self._min:
+            self._value -= 1
+            self._label.setText(str(self._value))
+            self._update_state()
+            self.valueChanged.emit(self._value)
+
+    def _update_state(self) -> None:
+        self._btn_minus.setEnabled(self._value > self._min)
+        self._btn_plus.setEnabled(self._value < self._max)
+
+
+# ============================================================
+# 打印工作线程
+# ============================================================
+
+class PrintWorker(QThread):
+    """
+    后台打印工作线程。
+    顺序处理任务列表中的每个文件：转换 → 打印 → 清理。
+    通过信号与主界面通信。
+    """
+
+    # 信号定义
+    progress = Signal(int, int, str)          # (current, total, status_text)
+    log_message = Signal(str)                  # 日志消息
+    job_finished = Signal(int, bool, str)      # (job_index, success, message)
+    all_finished = Signal(int, int)            # (success_count, fail_count)
+    error_occurred = Signal(str)               # 全局错误
+
+    def __init__(
+        self,
+        jobs: list[PrintJob],
+        printer_name: str,
+        duplex_mode: str,
+        keep_temp_pdf: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._jobs = jobs
+        self._printer_name = printer_name
+        self._duplex_mode = duplex_mode
+        self._keep_temp_pdf = keep_temp_pdf
+        self._converter: Optional[UniversalConverter] = None
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        self.log_message.emit("[取消] 用户取消了打印任务")
+
+    def run(self):
+        """线程主函数。"""
+        self._converter = get_converter()
+        total = len(self._jobs)
+        success_count = 0
+        fail_count = 0
+
+        self.progress.emit(0, total, "开始处理...")
+        self.log_message.emit(f"共 {total} 个任务待处理")
+
+        for idx, job in enumerate(self._jobs):
+            if self._cancelled:
+                self.log_message.emit(f"[跳过] 第 {idx + 1} 个任务（已取消）")
+                break
+
+            file_name = os.path.basename(job.file_path)
+            self.progress.emit(idx, total, f"正在处理: {file_name}")
+            self.log_message.emit(f"[{idx + 1}/{total}] {file_name}")
+
+            temp_pdf: Optional[str] = None
+            try:
+                # 1. 检查文件是否存在
+                if not os.path.isfile(job.file_path):
+                    raise FileNotFoundError(f"文件不存在: {job.file_path}")
+
+                # 2. 如果不是 PDF，转换为 PDF
+                ext = os.path.splitext(job.file_path)[1].lower()
+                if ext == ".pdf":
+                    print_path = job.file_path
+                    self.log_message.emit(f"  → 已是 PDF，跳过转换")
+                else:
+                    self.log_message.emit(f"  → 正在转换为 PDF...")
+                    temp_pdf = self._converter.convert(job.file_path)
+                    print_path = temp_pdf
+                    self.log_message.emit(f"  → 转换完成: {os.path.basename(temp_pdf)}")
+
+                # 3. 静默打印（份数由原生 API 一次性处理）
+                copies = max(1, job.copies)
+                self.log_message.emit(f"  → 正在打印 (份数:{copies}, 双面:{job.duplex})...")
+                ok, msg = print_pdf(
+                    pdf_path=print_path,
+                    printer_name=self._printer_name,
+                    copies=copies,
+                    duplex=job.duplex,
+                    duplex_mode=self._duplex_mode,
+                    page_range=job.page_range,
+                )
+                if ok:
+                    self.log_message.emit(f"  ✓ {msg}")
+                    success_count += 1
+                else:
+                    self.log_message.emit(f"  ✗ 打印失败: {msg}")
+                    fail_count += 1
+
+                self.job_finished.emit(idx, ok, msg)
+
+            except Exception as e:
+                self.log_message.emit(f"  ✗ 错误: {e}")
+                fail_count += 1
+                self.job_finished.emit(idx, False, str(e))
+
+            finally:
+                # 4. 清理临时 PDF
+                if temp_pdf and os.path.isfile(temp_pdf):
+                    if self._keep_temp_pdf:
+                        self.log_message.emit(f"  → 保留临时 PDF: {temp_pdf}")
+                    else:
+                        try:
+                            os.remove(temp_pdf)
+                            self.log_message.emit(f"  → 已清理临时 PDF")
+                        except OSError as e:
+                            self.log_message.emit(f"  → 清理临时 PDF 失败: {e}")
+
+        self.progress.emit(total, total, "全部完成")
+        self.all_finished.emit(success_count, fail_count)
+        self.log_message.emit(
+            f"========== 打印完毕：成功 {success_count}，失败 {fail_count} =========="
+        )
+
+
+# ============================================================
+# 支持拖放添加文件的表格
+# ============================================================
+
+class DropTableWidget(QTableWidget):
+    """支持从资源管理器拖放文件到表格中。"""
+
+    filesDropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            files = []
+            for url in urls:
+                path = url.toLocalFile()
+                if path and os.path.isfile(path):
+                    files.append(path)
+            if files:
+                self.filesDropped.emit(files)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+# ============================================================
+# 主窗口
+# ============================================================
+
+class MainWindow(QMainWindow):
+    """HN 本地打印工具 — 主窗口"""
+
+    COL_FILE = 0
+    COL_COPIES = 1
+    COL_DUPLEX = 2
+    COL_RANGE = 3
+    COL_PAGES = 4
+    COL_ORIENT = 5
+    COL_COST = 6
+
+    def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
+        super().__init__()
+        self._config_path = config_path
+        self._config = PrinterConfig.load(config_path)
+        self._worker: Optional[PrintWorker] = None
+        self._pending_jobs: list[PrintJob] = []
+        self._theme_manager = theme_manager
+        self._last_dir = self._config.last_dir
+
+        self.setWindowTitle("HN 本地打印工具")
+        self.setMinimumSize(900, 650)
+        self.resize(1100, 720)
+
+        self._setup_ui()
+        self._load_config_to_ui()
+
+    # ---- UI 构建 ----
+
+    def _setup_ui(self):
+        """构建完整界面。"""
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(12, 8, 12, 12)
+        root.setSpacing(8)
+
+        # -- 菜单栏 --
+        self._setup_menu()
+
+        # -- 顶部：打印机信息 + 配置 --
+        self._setup_top_bar(root)
+
+        # -- 中部：文件列表 + 编辑面板（QSplitter） --
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._setup_file_table())
+        splitter.addWidget(self._setup_edit_panel())
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, 1)
+
+        # -- 进度条 --
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setValue(0)
+        root.addWidget(self._progress_bar)
+
+        # -- 按钮栏 --
+        root.addLayout(self._setup_button_bar())
+
+        # -- 日志区域 --
+        self._log_text = QTextEdit()
+        self._log_text.setObjectName("logTextEdit")
+        self._log_text.setReadOnly(True)
+        self._log_text.setMaximumHeight(180)
+        root.addWidget(self._log_text)
+
+        # -- 状态栏 --
+        self._status_bar = QStatusBar()
+        self.setStatusBar(self._status_bar)
+        self._status_label = QLabel("就绪")
+        self._status_bar.addWidget(self._status_label)
+
+    def _setup_menu(self):
+        """设置菜单栏。"""
+        mb = self.menuBar()
+
+        # 文件菜单
+        file_menu = mb.addMenu("文件(&F)")
+
+        exit_action = QAction("退出(&X)", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        # 主题菜单
+        if self._theme_manager is not None:
+            theme_menu = mb.addMenu("主题(&T)")
+            self._setup_theme_menu(theme_menu)
+
+        # 帮助菜单
+        help_menu = mb.addMenu("帮助(&H)")
+        about_action = QAction("关于(&A)", self)
+        about_action.triggered.connect(self._on_about)
+        help_menu.addAction(about_action)
+
+    def _setup_theme_menu(self, menu):
+        """构建主题切换子菜单（单选模式）。"""
+        from PySide6.QtGui import QActionGroup
+
+        group = QActionGroup(self)
+        group.setExclusive(True)
+
+        for mode in [MODE_SYSTEM, MODE_LIGHT, MODE_DARK]:
+            action = QAction(MODE_LABELS[mode], self)
+            action.setCheckable(True)
+            action.setData(mode)
+            if mode == self._theme_manager.mode:
+                action.setChecked(True)
+            action.triggered.connect(self._on_theme_changed)
+            group.addAction(action)
+            menu.addAction(action)
+
+    def _setup_top_bar(self, root: QVBoxLayout):
+        """顶部：打印机选择 + 双面模式 + 保留 PDF 选项。"""
+        layout = QHBoxLayout()
+
+        layout.addWidget(QLabel("打印机:"))
+
+        self._printer_combo = QComboBox()
+        self._printer_combo.setMinimumWidth(200)
+        _disable_combo_wheel(self._printer_combo)
+        layout.addWidget(self._printer_combo, 1)
+
+        btn_refresh = QPushButton("🔄")
+        btn_refresh.setObjectName("btnRefreshPrinters")
+        btn_refresh.setToolTip("刷新打印机列表")
+        btn_refresh.setFixedSize(36, 36)
+        btn_refresh.clicked.connect(self._on_refresh_printers)
+        layout.addWidget(btn_refresh)
+
+        layout.addWidget(QLabel("双面模式:"))
+
+        self._duplex_combo = QComboBox()
+        self._duplex_combo.addItems(["long-edge (长边翻转)", "short-edge (短边翻转)"])
+        self._duplex_combo.setCurrentIndex(0)
+        _disable_combo_wheel(self._duplex_combo)
+        layout.addWidget(self._duplex_combo)
+
+        layout.addWidget(QLabel("保留临时PDF:"))
+
+        self._keep_temp_check = QComboBox()
+        self._keep_temp_check.addItems(["否", "是"])
+        self._keep_temp_check.setCurrentIndex(0)
+        _disable_combo_wheel(self._keep_temp_check)
+        layout.addWidget(self._keep_temp_check)
+
+        layout.addWidget(QLabel("  单面:"))
+
+        self._simplex_price_spin = QDoubleSpinBox()
+        self._simplex_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self._simplex_price_spin.setRange(0.01, 99.99)
+        self._simplex_price_spin.setDecimals(2)
+        self._simplex_price_spin.setValue(self._config.simplex_price)
+        self._simplex_price_spin.setFixedWidth(60)
+        self._simplex_price_spin.valueChanged.connect(self._on_price_changed)
+        layout.addWidget(self._simplex_price_spin)
+        layout.addWidget(QLabel("元/页"))
+
+        layout.addWidget(QLabel(" 双面:"))
+
+        self._duplex_price_spin = QDoubleSpinBox()
+        self._duplex_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self._duplex_price_spin.setRange(0.01, 99.99)
+        self._duplex_price_spin.setDecimals(2)
+        self._duplex_price_spin.setValue(self._config.duplex_price)
+        self._duplex_price_spin.setFixedWidth(60)
+        self._duplex_price_spin.valueChanged.connect(self._on_price_changed)
+        layout.addWidget(self._duplex_price_spin)
+        layout.addWidget(QLabel("元/页"))
+
+        root.addLayout(layout)
+
+    def _setup_file_table(self) -> QWidget:
+        """左侧：文件列表表格。"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel("📄 打印任务列表")
+        title.setObjectName("sectionLabel")
+        layout.addWidget(title)
+
+        self._table = DropTableWidget()
+        self._table.setColumnCount(7)
+        self._table.setHorizontalHeaderLabels(["文件名", "份数", "双面", "页码范围", "页数", "方向", "费用"])
+        self._table.filesDropped.connect(self._on_files_dropped)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setAlternatingRowColors(True)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.cellDoubleClicked.connect(self._on_table_double_click)
+        self._table.verticalHeader().setVisible(False)
+
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(self.COL_FILE, QHeaderView.Stretch)
+        hh.setSectionResizeMode(self.COL_COPIES, QHeaderView.Fixed)
+        hh.setSectionResizeMode(self.COL_DUPLEX, QHeaderView.Fixed)
+        hh.setSectionResizeMode(self.COL_RANGE, QHeaderView.Fixed)
+        hh.setSectionResizeMode(self.COL_PAGES, QHeaderView.Fixed)
+        hh.setSectionResizeMode(self.COL_ORIENT, QHeaderView.Fixed)
+        hh.setSectionResizeMode(self.COL_COST, QHeaderView.Fixed)
+        self._table.setColumnWidth(self.COL_COPIES, 50)
+        self._table.setColumnWidth(self.COL_DUPLEX, 50)
+        self._table.setColumnWidth(self.COL_RANGE, 90)
+        self._table.setColumnWidth(self.COL_PAGES, 50)
+        self._table.setColumnWidth(self.COL_ORIENT, 40)
+        self._table.setColumnWidth(self.COL_COST, 240)
+
+        # 选中行变化 → 右侧编辑面板同步
+        self._table.selectionModel().selectionChanged.connect(self._on_table_selection)
+        # 右键菜单
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_table_context_menu)
+
+        layout.addWidget(self._table)
+
+        # 合计费用
+        self._total_label = QLabel("合计: ¥0.00")
+        self._total_label.setObjectName("totalCostLabel")
+        self._total_label.setAlignment(Qt.AlignRight)
+        layout.addWidget(self._total_label)
+
+        # 添加文件按钮 — 置于表格下方
+        btn_add = QPushButton("📂 添加文件")
+        btn_add.clicked.connect(self._on_add_files)
+        layout.addWidget(btn_add)
+
+        return container
+
+    def _setup_edit_panel(self) -> QWidget:
+        """右侧：选中任务的参数编辑面板。"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 0, 0, 0)
+
+        title = QLabel("⚙ 任务参数")
+        title.setObjectName("sectionLabel")
+        layout.addWidget(title)
+
+        # ---- 可滚动区域：空间不足时上下滑动，不压缩内容 ----
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        _enable_smooth_scroll(scroll)
+
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(8)
+
+        gb = QGroupBox("编辑选中任务")
+        gl = QVBoxLayout(gb)
+        gl.setSpacing(10)
+
+        # 份数
+        label_copies = QLabel("份数:")
+        gl.addWidget(label_copies)
+        self._edit_copies = CounterWidget(1, 99)
+        self._edit_copies.valueChanged.connect(self._auto_apply_edit)
+        gl.addWidget(self._edit_copies)
+
+        # 双面
+        label_duplex = QLabel("单/双面:")
+        gl.addWidget(label_duplex)
+        self._edit_duplex = QComboBox()
+        self._edit_duplex.addItems(["双面打印", "单面打印"])
+        _disable_combo_wheel(self._edit_duplex)
+        self._edit_duplex.currentIndexChanged.connect(self._auto_apply_edit)
+        gl.addWidget(self._edit_duplex)
+
+        # 页码范围
+        label_range = QLabel("页码范围:")
+        gl.addWidget(label_range)
+        self._edit_page_range = QLineEdit()
+        self._edit_page_range.setPlaceholderText("如: 1-5,7,9 (留空=全部)")
+        self._edit_page_range.textChanged.connect(self._auto_apply_edit)
+        gl.addWidget(self._edit_page_range)
+
+        gl.addStretch()
+
+        # 统一管理：无选中任务时全部禁用
+        self._edit_widgets = [
+            label_copies, self._edit_copies,
+            label_duplex, self._edit_duplex,
+            label_range, self._edit_page_range,
+        ]
+        for w in self._edit_widgets:
+            w.setEnabled(False)
+
+        scroll_layout.addWidget(gb)
+
+        # 当前选中文件信息
+        self._selected_file_label = QLabel("(未选中任务)")
+        self._selected_file_label.setObjectName("selectedFileLabel")
+        self._selected_file_label.setWordWrap(True)
+        scroll_layout.addWidget(self._selected_file_label)
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll, 1)
+
+        return container
+
+    def _setup_button_bar(self) -> QHBoxLayout:
+        """底部按钮栏。"""
+        layout = QHBoxLayout()
+
+        btn_clear = QPushButton("✖ 清空列表")
+        btn_clear.clicked.connect(self._on_clear_list)
+        layout.addWidget(btn_clear)
+
+        layout.addStretch()
+
+        self._btn_start = QPushButton("▶ 开始打印")
+        self._btn_start.setObjectName("btnStartPrint")
+        self._btn_start.clicked.connect(self._on_start_print)
+        layout.addWidget(self._btn_start)
+
+        self._btn_cancel = QPushButton("■ 取消")
+        self._btn_cancel.setEnabled(False)
+        self._btn_cancel.clicked.connect(self._on_cancel_print)
+        layout.addWidget(self._btn_cancel)
+
+        return layout
+
+    # ---- 数据 → UI ----
+
+    def _load_config_to_ui(self):
+        """将配置数据同步到 UI 控件。"""
+        # 先加载打印机列表，再设置当前选中项
+        self._refresh_printer_list()
+        self._printer_combo.setCurrentText(self._config.printer_name)
+
+        dm = self._config.duplex_mode
+        if dm == "short-edge":
+            self._duplex_combo.setCurrentIndex(1)
+        else:
+            self._duplex_combo.setCurrentIndex(0)
+
+        self._keep_temp_check.setCurrentIndex(1 if self._config.keep_temp_pdf else 0)
+        self._rebuild_table()
+
+    def _refresh_printer_list(self):
+        """刷新下拉列表中的系统打印机。"""
+        current = self._printer_combo.currentText().strip()
+        self._printer_combo.clear()
+        # 空选项 = 系统默认打印机
+        self._printer_combo.addItem("（系统默认打印机）", "")
+        printers = list_system_printers()
+        for name in printers:
+            self._printer_combo.addItem(name, name)
+        # 如果当前有选中的打印机，尝试恢复
+        if current:
+            idx = self._printer_combo.findText(current)
+            if idx >= 0:
+                self._printer_combo.setCurrentIndex(idx)
+
+    def _on_refresh_printers(self):
+        """刷新打印机列表按钮回调。"""
+        self._refresh_printer_list()
+        self._log("已刷新打印机列表")
+
+    def _on_price_changed(self):
+        """单价变更 → 重算所有费用。"""
+        self._config.simplex_price = self._simplex_price_spin.value()
+        self._config.duplex_price = self._duplex_price_spin.value()
+        for row in range(self._table.rowCount()):
+            self._recalc_row_cost(row)
+        self._update_total_cost()
+
+    def _sync_ui_to_config(self):
+        """将 UI 控件数据同步回配置对象。"""
+        self._config.printer_name = self._printer_combo.currentText().strip()
+
+        idx = self._duplex_combo.currentIndex()
+        if idx == 1:
+            self._config.duplex_mode = "short-edge"
+        else:
+            self._config.duplex_mode = "long-edge"
+
+        self._config.keep_temp_pdf = (self._keep_temp_check.currentIndex() == 1)
+
+        self._config.simplex_price = self._simplex_price_spin.value()
+        self._config.duplex_price = self._duplex_price_spin.value()
+
+        self._config.last_dir = self._last_dir
+
+        # jobs 已通过表格实时维护，这里不需要再同步
+
+    def _rebuild_table(self):
+        """用 config.jobs 重建表格。"""
+        self._table.setRowCount(0)
+        for job in self._config.jobs:
+            self._add_table_row(job)
+
+    def _add_table_row(self, job: PrintJob):
+        """添加一行到表格。"""
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+
+        name_item = QTableWidgetItem(os.path.basename(job.file_path))
+        name_item.setData(Qt.UserRole, job.file_path)  # 存储完整路径
+        name_item.setToolTip(job.file_path)
+        self._table.setItem(row, self.COL_FILE, name_item)
+
+        copies_item = QTableWidgetItem(str(job.copies))
+        copies_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_COPIES, copies_item)
+
+        duplex_item = QTableWidgetItem("双面" if job.duplex == "on" else "单面")
+        duplex_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_DUPLEX, duplex_item)
+
+        range_item = QTableWidgetItem(job.page_range or "全部")
+        range_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_RANGE, range_item)
+
+        # 页数
+        pages_text = str(job.page_count) if job.page_count > 0 else "?"
+        pages_item = QTableWidgetItem(pages_text)
+        pages_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_PAGES, pages_item)
+
+        # 方向
+        ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+        ori_text = ori_map.get(job.orientation, "")
+        ori_item = QTableWidgetItem(ori_text)
+        ori_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_ORIENT, ori_item)
+
+        # 费用
+        cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
+                                  self._config.simplex_price, self._config.duplex_price)
+        if cost > 0:
+            cost_text = f"{formula}=¥{cost:.2f}"
+        elif job.page_count <= 0:
+            cost_text = "?"
+        else:
+            cost_text = "¥0.00"
+        cost_item = QTableWidgetItem(cost_text)
+        cost_item.setTextAlignment(Qt.AlignCenter)
+        cost_item.setData(Qt.UserRole, cost)
+        cost_item.setToolTip(cost_text)
+        self._table.setItem(row, self.COL_COST, cost_item)
+
+        self._update_total_cost()
+
+    def _update_total_cost(self):
+        """重新计算并更新合计费用标签。"""
+        total = 0.0
+        all_known = True
+        for row in range(self._table.rowCount()):
+            cost_item = self._table.item(row, self.COL_COST)
+            if cost_item:
+                c = cost_item.data(Qt.UserRole)
+                if isinstance(c, (int, float)) and c > 0:
+                    total += c
+                elif cost_item.text() == "?":
+                    all_known = False
+        if total > 0:
+            prefix = "≈ " if not all_known else ""
+            self._total_label.setText(f"合计: {prefix}¥{total:.2f}")
+        else:
+            self._total_label.setText("合计: ¥0.00")
+
+    def _recalc_row_cost(self, row: int):
+        """重新计算指定行的费用。"""
+        pages_text = self._table.item(row, self.COL_PAGES).text()
+        page_count = int(pages_text) if pages_text.isdigit() else 0
+        copies = int(self._table.item(row, self.COL_COPIES).text())
+        duplex_text = self._table.item(row, self.COL_DUPLEX).text()
+        duplex = "on" if "双" in duplex_text else "off"
+
+        cost, formula = calc_cost(page_count, copies, duplex,
+                                  self._config.simplex_price, self._config.duplex_price)
+        if cost > 0:
+            cost_text = f"{formula}=¥{cost:.2f}"
+        elif page_count <= 0:
+            cost_text = "?"
+        else:
+            cost_text = "¥0.00"
+        cost_item = self._table.item(row, self.COL_COST)
+        if cost_item:
+            cost_item.setText(cost_text)
+            cost_item.setToolTip(cost_text)
+            cost_item.setData(Qt.UserRole, cost)
+
+    def _refresh_config_jobs_from_table(self):
+        """从表格数据重建 config.jobs 列表。"""
+        jobs: list[PrintJob] = []
+        for row in range(self._table.rowCount()):
+            file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
+            copies = int(self._table.item(row, self.COL_COPIES).text())
+            duplex_text = self._table.item(row, self.COL_DUPLEX).text()
+            duplex = "on" if "双" in duplex_text else "off"
+            page_range = self._table.item(row, self.COL_RANGE).text()
+            if page_range == "全部":
+                page_range = ""
+            pages_text = self._table.item(row, self.COL_PAGES).text()
+            page_count = int(pages_text) if pages_text.isdigit() else 0
+            ori_map = {"竖": "portrait", "横": "landscape", "混": "mixed"}
+            ori_text = self._table.item(row, self.COL_ORIENT).text()
+            orientation = ori_map.get(ori_text, "")
+            jobs.append(PrintJob(file_path=file_path, copies=copies, duplex=duplex,
+                                 page_range=page_range, page_count=page_count,
+                                 orientation=orientation))
+        self._config.jobs = jobs
+
+    # ---- 事件处理 ----
+
+    def _on_table_selection(self):
+        """表格选中行变化 → 右侧编辑面板同步。"""
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            self._selected_file_label.setText("(未选中任务)")
+            self._edit_copies.setValue(1)
+            self._edit_duplex.setCurrentIndex(0)
+            self._edit_page_range.setText("")
+            for w in self._edit_widgets:
+                w.setEnabled(False)
+            return
+
+        for w in self._edit_widgets:
+            w.setEnabled(True)
+
+        row = rows[0].row()
+        file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
+        copies = int(self._table.item(row, self.COL_COPIES).text())
+        duplex_text = self._table.item(row, self.COL_DUPLEX).text()
+        page_range = self._table.item(row, self.COL_RANGE).text()
+
+        self._selected_file_label.setText(f"当前文件:\n{file_path}")
+        # 阻断信号避免加载时误触发自动应用
+        self._edit_copies.blockSignals(True)
+        self._edit_copies.setValue(copies)
+        self._edit_copies.blockSignals(False)
+        self._edit_duplex.blockSignals(True)
+        self._edit_duplex.setCurrentIndex(0 if "双" in duplex_text else 1)
+        self._edit_duplex.blockSignals(False)
+        self._edit_page_range.blockSignals(True)
+        self._edit_page_range.setText("" if page_range == "全部" else page_range)
+        self._edit_page_range.blockSignals(False)
+
+    def _on_table_double_click(self, row: int, col: int):
+        """双击表格行 → 用系统默认程序打开文件。"""
+        file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
+        if file_path and os.path.isfile(file_path):
+            os.startfile(file_path)
+            self._log(f"打开文件: {os.path.basename(file_path)}")
+
+    def _on_table_context_menu(self, pos):
+        """表格右键菜单。"""
+        row = self._table.rowAt(pos.y())
+        if row < 0:
+            return  # 未点击在有效行上，不弹出菜单
+        menu = QMenu(self)
+        remove_action = menu.addAction("移除选中")
+        action = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if action == remove_action:
+            self._on_remove_selected()
+
+    def _auto_apply_edit(self):
+        """编辑面板参数变更 → 即时写回选中行。"""
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            return
+        row = rows[0].row()
+        self._table.item(row, self.COL_COPIES).setText(str(self._edit_copies.value()))
+        self._table.item(row, self.COL_DUPLEX).setText("双面" if self._edit_duplex.currentIndex() == 0 else "单面")
+        page_range = self._edit_page_range.text().strip()
+        self._table.item(row, self.COL_RANGE).setText(page_range if page_range else "全部")
+
+        self._recalc_row_cost(row)
+        self._update_total_cost()
+
+    def _on_add_files(self):
+        """通过文件对话框添加文件。"""
+        file_filter = (
+            "所有支持格式 (*.pdf *.doc *.docx *.xls *.xlsx *.ppt *.pptx *.txt *.csv *.md *.html *.htm"
+            " *.jpg *.jpeg *.png *.bmp *.gif *.webp);;"
+            "PDF (*.pdf);;"
+            "Office 文档 (*.doc *.docx *.xls *.xlsx *.ppt *.pptx);;"
+            "文本 (*.txt *.csv *.md *.html *.htm);;"
+            "图片 (*.jpg *.jpeg *.png *.bmp *.gif *.webp);;"
+            "所有文件 (*.*)"
+        )
+        files, _ = QFileDialog.getOpenFileNames(self, "添加文件", self._last_dir, file_filter)
+        if not files:
+            return
+        self._last_dir = os.path.dirname(files[0])
+        self._add_files_to_table(files)
+
+    def _on_files_dropped(self, files: list[str]):
+        """拖放文件到表格。"""
+        self._add_files_to_table(files)
+
+    def _add_files_to_table(self, files: list[str]):
+        """添加文件到任务列表的核心逻辑。"""
+        converter = get_converter()
+        converted = 0
+
+        for f in files:
+            page_count = 0
+            orientation = ""
+            ext = os.path.splitext(f)[1].lower()
+
+            if ext == ".pdf":
+                info = get_pdf_info(f)
+                page_count = info["page_count"]
+                orientation = info["orientation"]
+            elif ext in (".docx", ".doc"):
+                orientation = get_docx_orientation(f)
+
+            job = PrintJob(file_path=f, copies=1, duplex="on", page_range="",
+                           page_count=page_count, orientation=orientation)
+            self._config.jobs.append(job)
+            self._add_table_row(job)
+
+        self._log(f"已添加 {len(files)} 个文件")
+
+        # 非 PDF 文件：转为临时 PDF 以统计页数
+        for row in range(self._table.rowCount()):
+            file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == ".pdf":
+                continue
+
+            self._table.item(row, self.COL_PAGES).setText("...")
+            QApplication.processEvents()
+
+            try:
+                temp_pdf = converter.convert(file_path)
+                info = get_pdf_info(temp_pdf)
+                page_count = info["page_count"]
+                orientation = info["orientation"]
+
+                self._table.item(row, self.COL_PAGES).setText(str(page_count))
+                ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+                self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
+                self._recalc_row_cost(row)
+
+                try:
+                    os.remove(temp_pdf)
+                except OSError:
+                    pass
+
+                converted += 1
+            except Exception as e:
+                self._table.item(row, self.COL_PAGES).setText("?")
+                logger.warning(f"预转换失败 ({os.path.basename(file_path)}): {e}")
+
+        self._update_total_cost()
+        if converted > 0:
+            self._log(f"已预转换 {converted} 个文件以统计页数")
+
+    def _on_remove_selected(self):
+        """移除表格中选中的行。"""
+        rows = self._table.selectionModel().selectedRows()
+        if not rows:
+            return
+        # 从后往前删避免索引偏移
+        for r in sorted(rows, key=lambda x: x.row(), reverse=True):
+            self._table.removeRow(r.row())
+        self._refresh_config_jobs_from_table()
+        self._update_total_cost()
+        self._log("已移除选中任务")
+
+    def _on_clear_list(self):
+        """清空任务列表。"""
+        if self._config.jobs:
+            ret = QMessageBox.question(self, "确认", "确定要清空所有任务吗？")
+            if ret != QMessageBox.Yes:
+                return
+        self._table.setRowCount(0)
+        self._config.jobs.clear()
+        self._update_total_cost()
+        self._log("已清空任务列表")
+
+    def _on_start_print(self):
+        """开始打印。"""
+        self._refresh_config_jobs_from_table()
+        self._sync_ui_to_config()
+
+        if not self._config.jobs:
+            QMessageBox.warning(self, "提示", "请先添加要打印的文件。")
+            return
+
+        # 自动保存配置
+        try:
+            self._config.save(self._config_path)
+        except Exception as e:
+            logger.warning(f"保存配置失败: {e}")
+
+        # 禁用按钮，防止重复点击
+        self._btn_start.setEnabled(False)
+        self._btn_cancel.setEnabled(True)
+        self._progress_bar.setValue(0)
+
+        worker = PrintWorker(
+            jobs=list(self._config.jobs),
+            printer_name=self._config.printer_name,
+            duplex_mode=self._config.duplex_mode,
+            keep_temp_pdf=self._config.keep_temp_pdf,
+        )
+        worker.progress.connect(self._on_progress)
+        worker.log_message.connect(self._log)
+        worker.job_finished.connect(self._on_job_finished)
+        worker.all_finished.connect(self._on_all_finished)
+        self._worker = worker
+        worker.start()
+
+    def _on_cancel_print(self):
+        """取消打印。"""
+        if self._worker and self._worker.isRunning():
+            self._worker.cancel()
+            self._btn_cancel.setEnabled(False)
+            self._log("[用户] 已请求取消，等待当前任务结束...")
+
+    def _on_progress(self, current: int, total: int, status: str):
+        """更新进度条。"""
+        self._progress_bar.setMaximum(total)
+        self._progress_bar.setValue(current)
+        self._status_label.setText(status)
+
+    def _on_job_finished(self, idx: int, success: bool, message: str):
+        """单个任务完成回调：更新表格行颜色。"""
+        if idx < self._table.rowCount():
+            fg = QColor("#6b9e6b") if success else QColor("#c96b6b")
+            for col in range(7):
+                item = self._table.item(idx, col)
+                if item:
+                    item.setForeground(fg)
+
+    def _on_all_finished(self, success_count: int, fail_count: int):
+        """全部任务完成。"""
+        self._btn_start.setEnabled(True)
+        self._btn_cancel.setEnabled(False)
+        self._worker = None
+
+        total = success_count + fail_count
+        self._status_label.setText(f"完成：成功 {success_count} / {total}")
+
+        if fail_count > 0:
+            QMessageBox.warning(
+                self, "打印完成（有错误）",
+                f"全部 {total} 个任务处理完毕。\n成功: {success_count}\n失败: {fail_count}\n\n详情请查看日志。"
+            )
+        else:
+            self._log(f"✓ 全部 {total} 个任务打印成功！")
+
+    def _on_about(self):
+        """关于对话框。"""
+        QMessageBox.about(
+            self, "关于 HN 本地打印工具",
+            "<h3>HN 本地打印工具 v1.0</h3>"
+            "<p>本地文件一键打印工具，支持多种文件格式。</p>"
+            "<p>核心流程：文件 → PDF → 静默打印</p>"
+            "<hr>"
+            "<p>依赖：LibreOffice | wkhtmltopdf | SumatraPDF (推荐)</p>"
+            "<p>技术：PySide6 + reportlab + pdfkit</p>"
+        )
+
+    def _on_theme_changed(self):
+        """主题菜单项点击回调。"""
+        action = self.sender()
+        if action and self._theme_manager:
+            mode = action.data()
+            self._theme_manager.set_mode(mode)
+
+    def _log(self, msg: str):
+        """追加日志到界面文本框。"""
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._log_text.append(f"[{ts}] {msg}")
+        # 自动滚动到底部
+        self._log_text.verticalScrollBar().setValue(
+            self._log_text.verticalScrollBar().maximum()
+        )
+
+    # ---- 关闭事件 ----
+
+    def closeEvent(self, event):
+        """关闭窗口时自动保存配置。"""
+        try:
+            self._refresh_config_jobs_from_table()
+            self._sync_ui_to_config()
+            self._config.save(self._config_path)
+            self._log(f"配置已自动保存至: {self._config_path}")
+        except Exception as e:
+            logger.warning(f"自动保存配置失败: {e}")
+        super().closeEvent(event)
+
+===== main.py =====
+"""
+main.py — HN 本地打印工具 程序入口
+启动 PySide6 应用，检查依赖，加载样式，显示主窗口。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+
+# 确保本地模块可以导入
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import Qt
+
+from theme_manager import ThemeManager
+
+
+def setup_logging():
+    """配置日志系统。"""
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    logging.basicConfig(
+        level=logging.INFO,
+        format=fmt,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
+
+
+def check_dependencies() -> list[str]:
+    """
+    检查 Python 依赖是否可导入。
+    返回缺少的模块名称列表。
+    """
+    required = {
+        "PySide6": "PySide6",
+        "PIL": "Pillow",
+        "reportlab": "reportlab",
+        "markdown": "markdown",
+    }
+    missing: list[str] = []
+    for mod, pkg in required.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+    return missing
+
+
+def load_stylesheet(path: str) -> str:
+    """加载 QSS 样式表文件。"""
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return ""
+
+
+def main():
+    """主函数。"""
+    setup_logging()
+    logger = logging.getLogger("main")
+
+    # 切换到脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(script_dir)
+
+    # 检查依赖
+    missing = check_dependencies()
+    app = QApplication(sys.argv)
+    app.setApplicationName("HN 本地打印工具")
+    app.setOrganizationName("HN-Print")
+
+    # 加载样式表（浅色 + 深色）
+    dark_qss_path = os.path.join(script_dir, "styles_dark.qss")
+    light_qss_path = os.path.join(script_dir, "styles_light.qss")
+    dark_qss = load_stylesheet(dark_qss_path)
+    light_qss = load_stylesheet(light_qss_path)
+
+    # 初始化主题管理器
+    theme_settings_path = os.path.join(script_dir, "theme_settings.json")
+    theme_manager = ThemeManager(theme_settings_path)
+    theme_manager.init(app, dark_qss, light_qss)
+
+    if dark_qss and light_qss:
+        logger.info("已加载浅色/深色双主题样式表")
+    else:
+        logger.warning("部分样式表文件未找到")
+
+    # 如果有缺失的 Python 依赖，弹窗警告
+    if missing:
+        QMessageBox.warning(
+            None,
+            "缺少 Python 依赖",
+            f"以下 Python 包未安装:\n{', '.join(missing)}\n\n"
+            f"请运行: pip install -r requirements.txt\n\n"
+            f"程序可能部分功能无法使用。"
+        )
+
+    # 检查外部工具（非阻塞提示，仅日志记录）
+    _check_external_tools(logger)
+
+    # 配置路径
+    config_path = os.path.join(script_dir, "print_config.json")
+
+    # 启动主窗口
+    from gui import MainWindow
+    window = MainWindow(config_path=config_path, theme_manager=theme_manager)
+    window.show()
+
+    logger.info("HN 本地打印工具已启动")
+    sys.exit(app.exec())
+
+
+def _check_external_tools(logger: logging.Logger):
+    """检查并记录外部工具可用性。"""
+    from converter import _find_libreoffice, _find_wkhtmltopdf
+    from pdf_printer import _find_sumatra_pdf
+
+    lo = _find_libreoffice()
+    if lo:
+        logger.info(f"✓ LibreOffice: {lo}")
+    else:
+        logger.warning("✗ 未找到 LibreOffice — Office 文档无法转换")
+
+    wk = _find_wkhtmltopdf()
+    if wk:
+        logger.info(f"✓ wkhtmltopdf: {wk}")
+    else:
+        logger.warning("✗ 未找到 wkhtmltopdf — HTML/Markdown 无法转换")
+
+    sumatra = _find_sumatra_pdf()
+    if sumatra:
+        logger.info(f"✓ SumatraPDF: {sumatra}")
+    else:
+        logger.warning("✗ 未找到 SumatraPDF — 将使用降级打印方案（可能弹出对话框）")
+
+
+if __name__ == "__main__":
+    main()
+
+===== pdf_printer.py =====
+"""
+pdf_printer.py — 静默打印 PDF 模块 (Windows)
+优先使用 Windows 原生 GDI API 打印，SumatraPDF 降级。
+支持双面、页码范围参数。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import platform
+import subprocess
+import sys
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# PDF 信息读取
+# ============================================================
+
+def get_docx_orientation(docx_path: str) -> str:
+    """读取 .docx 页面方向，失败返回空字符串。"""
+    try:
+        from docx import Document
+        doc = Document(docx_path)
+        for section in doc.sections:
+            w = section.page_width  # EMU
+            h = section.page_height
+            if w and h and w > h:
+                return "landscape"
+        return "portrait"
+    except ImportError:
+        return ""
+    except Exception as e:
+        logger.warning(f"读取 docx 方向失败 ({docx_path}): {e}")
+        return ""
+
+
+def count_pdf_pages(pdf_path: str) -> int:
+    """统计 PDF 文件页数，失败返回 0。"""
+    return get_pdf_info(pdf_path).get("page_count", 0)
+
+
+def get_pdf_info(pdf_path: str) -> dict:
+    """
+    获取 PDF 信息：页数 + 页面方向。
+
+    Returns:
+        {
+            "page_count": int,       # 总页数，0 = 失败
+            "orientation": str,      # "portrait" | "landscape" | "mixed" | "unknown"
+        }
+    """
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(pdf_path)
+        page_count = len(reader.pages)
+        if page_count == 0:
+            return {"page_count": 0, "orientation": "unknown"}
+
+        has_portrait = False
+        has_landscape = False
+
+        for page in reader.pages:
+            mb = page.mediabox
+            if mb is None:
+                continue
+            w = float(mb.width)
+            h = float(mb.height)
+            if w > h:
+                has_landscape = True
+            else:
+                has_portrait = True
+
+        if has_landscape and has_portrait:
+            orientation = "mixed"
+        elif has_landscape:
+            orientation = "landscape"
+        else:
+            orientation = "portrait"
+
+        return {"page_count": page_count, "orientation": orientation}
+
+    except ImportError:
+        logger.warning("PyPDF2 未安装，无法读取 PDF 信息")
+        return {"page_count": 0, "orientation": "unknown"}
+    except Exception as e:
+        logger.warning(f"读取 PDF 信息失败 ({pdf_path}): {e}")
+        return {"page_count": 0, "orientation": "unknown"}
+
+
+# ============================================================
+# 系统打印机列表
+# ============================================================
+
+def list_system_printers() -> list[str]:
+    """
+    枚举系统中所有可用的打印机名称。
+    返回打印机名称列表，失败时返回空列表。
+    """
+    printers: list[str] = []
+
+    try:
+        import win32print
+        flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+        for info in win32print.EnumPrinters(flags, None, 1):
+            name = info[2]
+            if name:
+                printers.append(name)
+    except ImportError:
+        logger.warning("pywin32 未安装，无法枚举打印机列表")
+    except Exception as e:
+        logger.warning(f"枚举打印机列表失败: {e}")
+
+    return printers
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
+
+def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
+    """
+    解析用户输入的页码范围，返回 0-based 页码列表。
+
+    输入示例: "1-5", "1,3,5-7", "1-5、7、9"
+    """
+    if not page_range or not page_range.strip():
+        return list(range(total_pages))
+
+    raw = page_range.strip()
+    raw = raw.replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
+
+    pages: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                start, end = int(a), int(b)
+                for p in range(start, end + 1):
+                    if 1 <= p <= total_pages:
+                        pages.add(p - 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                p = int(part)
+                if 1 <= p <= total_pages:
+                    pages.add(p - 1)
+            except ValueError:
+                continue
+
+    if not pages:
+        return list(range(total_pages))
+    return sorted(pages)
+
+
+# ============================================================
+# 打印函数
+# ============================================================
+
+def print_pdf(
+    pdf_path: str,
+    printer_name: str = "",
+    copies: int = 1,
+    duplex: str = "on",
+    duplex_mode: str = "long-edge",
+    page_range: str = "",
+) -> tuple[bool, str]:
+    """
+    静默打印 PDF 文件。
+
+    Args:
+        pdf_path: PDF 文件路径
+        printer_name: 目标打印机名称（空字符串 = 系统默认打印机）
+        copies: 打印份数
+        duplex: 'on' 开启双面, 'off' 关闭双面
+        duplex_mode: 双面模式 'long-edge' | 'short-edge'
+        page_range: 页码范围，如 "1-5"
+
+    Returns:
+        (success, message)
+    """
+    if not os.path.isfile(pdf_path):
+        return False, f"PDF 文件不存在: {pdf_path}"
+
+    system = platform.system()
+
+    if system == "Windows":
+        # 方案 1: Windows 原生 GDI 打印
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+        if ok:
+            return True, msg
+        # 方案 2: SumatraPDF 降级
+        sumatra = _find_sumatra_pdf()
+        if sumatra:
+            logger.info("原生打印失败，降级为 SumatraPDF")
+            return _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range)
+        # 方案 3: ShellExecute
+        logger.warning("原生打印和 SumatraPDF 均不可用，使用 ShellExecute 降级")
+        return _print_via_shell_execute(pdf_path, printer_name)
+    else:
+        return _print_pdf_fallback(pdf_path, printer_name)
+
+
+def _print_pdf_native(
+    pdf_path: str,
+    printer_name: str,
+    duplex: str,
+    duplex_mode: str,
+    page_range: str,
+    copies: int = 1,
+) -> tuple[bool, str]:
+    """
+    Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
+    份数通过 DEVMODE.dmCopies 设置，文档只传输一次。
+    """
+    import fitz
+
+    try:
+        import win32print
+        import win32ui
+        import win32con
+    except ImportError:
+        return False, "pywin32 未安装"
+
+    doc = None
+    hdc = None
+    started = False
+
+    try:
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        if total_pages == 0:
+            return False, "PDF 无页面"
+
+        pages_to_print = _parse_page_range(page_range, total_pages)
+        printer = printer_name or win32print.GetDefaultPrinter()
+
+        # -- 创建打印机 DC --
+        hdc = win32ui.CreateDC()
+        hdc.CreatePrinterDC(printer)
+
+        # 获取打印机可打印区域和分辨率
+        dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
+        dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
+        printable_w = hdc.GetDeviceCaps(win32con.HORZRES)
+        printable_h = hdc.GetDeviceCaps(win32con.VERTRES)
+
+        # -- 设置双面模式和份数（在 StartDoc 之前）--
+        _set_printer_settings(printer, duplex, duplex_mode, copies)
+
+        title = os.path.basename(pdf_path)
+        hdc.StartDoc(title)
+        started = True
+
+        from PIL import Image, ImageWin
+
+        for page_idx in pages_to_print:
+            hdc.StartPage()
+
+            page = doc[page_idx]
+            mat = fitz.Matrix(dpi_x / 72.0, dpi_y / 72.0)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+
+            img = Image.frombuffer(
+                "RGB", (pix.width, pix.height),
+                pix.samples, "raw", "RGB", pix.stride, 1,
+            )
+
+            x = (printable_w - pix.width) // 2
+            y = (printable_h - pix.height) // 2
+
+            dib = ImageWin.Dib(img)
+            dib.draw(hdc.GetHandleOutput(), (x, y, x + pix.width, y + pix.height))
+
+            hdc.EndPage()
+
+        hdc.EndDoc()
+        started = False
+        return True, f"打印成功 (GDI, {len(pages_to_print)} 页)"
+
+    except ImportError as e:
+        return False, f"缺少依赖: {e}"
+    except Exception as e:
+        if started and hdc:
+            try:
+                hdc.AbortDoc()
+            except Exception:
+                pass
+        logger.warning(f"原生 GDI 打印失败: {e}")
+        return False, str(e)
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        if hdc:
+            try:
+                hdc.DeleteDC()
+            except Exception:
+                pass
+
+
+def _set_printer_settings(printer_name: str, duplex: str, duplex_mode: str, copies: int) -> None:
+    """通过 DEVMODE 设置打印机双面模式和份数。"""
+    try:
+        import win32print
+        import win32con
+
+        handle = win32print.OpenPrinter(printer_name)
+        try:
+            devmode = win32print.GetPrinter(handle, 2)["pDevMode"]
+            if duplex == "on":
+                if duplex_mode == "short-edge":
+                    devmode.Duplex = 2   # DMDUP_HORIZONTAL
+                else:
+                    devmode.Duplex = 3   # DMDUP_VERTICAL (长边翻转)
+            else:
+                devmode.Duplex = 1       # DMDUP_SIMPLEX
+
+            devmode.Copies = copies
+
+            win32print.DocumentProperties(
+                0, handle, printer_name,
+                devmode, devmode,
+                win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
+            )
+        finally:
+            win32print.ClosePrinter(handle)
+    except Exception as e:
+        logger.warning(f"设置打印机参数失败: {e}")
+
+
+# ============================================================
+# 降级方案：SumatraPDF
+# ============================================================
+
+def _find_sumatra_pdf() -> str | None:
+    """查找 SumatraPDF.exe 的安装路径。"""
+    system = platform.system()
+    if system != "Windows":
+        return None
+
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "SumatraPDF.exe"),
+        os.path.join(os.path.dirname(sys.executable), "SumatraPDF.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\SumatraPDF\SumatraPDF.exe"),
+        os.path.expandvars(r"%APPDATA%\SumatraPDF\SumatraPDF.exe"),
+        r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
+        r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
+    ]
+
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+
+    import shutil
+    return shutil.which("SumatraPDF.exe")
+
+
+def _print_via_sumatra(
+    sumatra_path: str,
+    pdf_path: str,
+    printer_name: str,
+    duplex: str,
+    duplex_mode: str,
+    page_range: str,
+) -> tuple[bool, str]:
+    """使用 SumatraPDF 命令行进行静默打印。"""
+    settings_parts: list[str] = []
+
+    if duplex == "on":
+        if duplex_mode == "short-edge":
+            settings_parts.append("duplex=short")
+        else:
+            settings_parts.append("duplex=long")
+    else:
+        settings_parts.append("duplex=simplex")
+
+    if page_range:
+        parsed = page_range.strip().replace("、", ",").replace("，", ",").replace(" ", "")
+        if parsed:
+            settings_parts.append(f"range={parsed}")
+
+    cmd = [sumatra_path, "-print-to", printer_name or "default"]
+
+    if settings_parts:
+        cmd += ["-print-settings", ",".join(settings_parts)]
+
+    cmd.append(os.path.abspath(pdf_path))
+
+    logger.info(f"SumatraPDF 打印: {' '.join(cmd)}")
+
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            startupinfo=si,
+        )
+        if result.returncode != 0:
+            return False, f"SumatraPDF 失败 (rc={result.returncode})"
+        return True, "打印成功 (SumatraPDF)"
+    except subprocess.TimeoutExpired:
+        return False, "SumatraPDF 超时"
+    except FileNotFoundError:
+        return False, "SumatraPDF 未找到"
+    except Exception as e:
+        return False, f"SumatraPDF 异常: {e}"
+
+
+def _print_via_shell_execute(pdf_path: str, printer_name: str) -> tuple[bool, str]:
+    """降级方案：ShellExecute — 可能弹出打印对话框。"""
+    try:
+        import win32api
+        win32api.ShellExecute(
+            0, "print",
+            os.path.abspath(pdf_path),
+            f'"{printer_name}"' if printer_name else "",
+            ".", 0,
+        )
+        return True, "打印任务已发送 (ShellExecute)"
+    except ImportError:
+        return False, "缺少 pywin32"
+    except Exception as e:
+        return False, f"ShellExecute 失败: {e}"
+
+
+def _print_pdf_fallback(pdf_path: str, printer_name: str) -> tuple[bool, str]:
+    """非 Windows 平台降级打印（lp 命令）。"""
+    try:
+        if printer_name:
+            cmd = ["lp", "-d", printer_name, os.path.abspath(pdf_path)]
+        else:
+            cmd = ["lp", os.path.abspath(pdf_path)]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=60)
+        if result.returncode == 0:
+            return True, "已通过 lp 命令发送到打印机"
+        else:
+            return False, f"lp 命令失败: {result.stderr}"
+    except FileNotFoundError:
+        return False, "未找到 lp 命令"
+    except Exception as e:
+        return False, f"打印异常: {e}"
+
+===== print_config.json =====
+{
+  "printer_name": "HP LaserJet MFP M232-M237",
+  "duplex_mode": "long-edge",
+  "keep_temp_pdf": true,
+  "simplex_price": 0.2,
+  "duplex_price": 0.3,
+  "last_dir": "C:/Users/Administrator/Desktop",
+  "jobs": [
+    {
+      "file_path": "C:/Users/Administrator/Desktop/1.docx",
+      "copies": 4,
+      "duplex": "on",
+      "page_range": "",
+      "page_count": 1,
+      "orientation": "portrait"
+    }
+  ]
+}
+
+===== printer_config.py =====
+"""
+printer_config.py — 配置管理模块
+负责读取/写入 JSON 配置文件，管理打印机名称、双面模式、任务列表等。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class PrintJob:
+    """单个打印任务"""
+    file_path: str = ""
+    copies: int = 1
+    duplex: str = "on"       # 'on' | 'off'
+    page_range: str = ""     # 页码范围字符串，如 "1-5" 或 "1,3,5-7"
+    page_count: int = 0      # 总页数，0 表示未知（非 PDF 文件）
+    orientation: str = ""    # "portrait" | "landscape" | "mixed" | ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "file_path": self.file_path,
+            "copies": self.copies,
+            "duplex": self.duplex,
+            "page_range": self.page_range,
+            "page_count": self.page_count,
+            "orientation": self.orientation,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PrintJob":
+        return cls(
+            file_path=data.get("file_path", ""),
+            copies=int(data.get("copies", 1)),
+            duplex=data.get("duplex", "on"),
+            page_range=data.get("page_range", ""),
+            page_count=int(data.get("page_count", 0)),
+            orientation=data.get("orientation", ""),
+        )
+
+
+def calc_cost(
+    page_count: int,
+    copies: int,
+    duplex: str,
+    simplex_price: float = 0.2,
+    duplex_price: float = 0.3,
+) -> tuple[float, str]:
+    """
+    计算打印费用，返回 (金额, 计算式)。
+
+    单价均为每页价格：
+      - 单面: page_count × simplex_price × copies
+      - 双面: page_count × duplex_price × copies
+              奇数页时最后一页按单面计:
+              (page_count-1) × duplex_price + 1 × simplex_price
+    """
+    if page_count <= 0:
+        return 0.0, ""
+    if duplex == "on":
+        if page_count == 1:
+            cost = simplex_price * copies
+            formula = f"1页×{simplex_price:.2f}"
+        elif page_count % 2 == 0:
+            cost = page_count * duplex_price * copies
+            formula = f"{page_count}页×{duplex_price:.2f}"
+        else:
+            cost = ((page_count - 1) * duplex_price + simplex_price) * copies
+            formula = f"{page_count-1}页×{duplex_price:.2f}+1页×{simplex_price:.2f}"
+        if copies > 1:
+            formula = f"({formula})×{copies}份"
+    else:
+        cost = page_count * simplex_price * copies
+        formula = f"{page_count}页×{simplex_price:.2f}"
+        if copies > 1:
+            formula += f"×{copies}份"
+    return cost, formula
+
+
+@dataclass
+class PrinterConfig:
+    """
+    打印机配置数据类。
+
+    JSON 结构示例:
+    {
+      "printer_name": "HP LaserJet MFP M232-M237",
+      "duplex_mode": "long-edge",
+      "keep_temp_pdf": false,
+      "jobs": [
+        {
+          "file_path": "C:/docs/report.docx",
+          "copies": 2,
+          "duplex": "on",
+          "page_range": "1-5"
+        }
+      ]
+    }
+    """
+    printer_name: str = ""
+    duplex_mode: str = "long-edge"    # 'simplex' | 'long-edge' | 'short-edge'
+    keep_temp_pdf: bool = False
+    simplex_price: float = 0.2
+    duplex_price: float = 0.3
+    last_dir: str = ""
+    jobs: list[PrintJob] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "printer_name": self.printer_name,
+            "duplex_mode": self.duplex_mode,
+            "keep_temp_pdf": self.keep_temp_pdf,
+            "simplex_price": self.simplex_price,
+            "duplex_price": self.duplex_price,
+            "last_dir": self.last_dir,
+            "jobs": [job.to_dict() for job in self.jobs],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PrinterConfig":
+        jobs_data = data.get("jobs", [])
+        jobs = [PrintJob.from_dict(j) for j in jobs_data] if isinstance(jobs_data, list) else []
+        return cls(
+            printer_name=data.get("printer_name", ""),
+            duplex_mode=data.get("duplex_mode", "long-edge"),
+            keep_temp_pdf=bool(data.get("keep_temp_pdf", False)),
+            simplex_price=float(data.get("simplex_price", 0.2)),
+            duplex_price=float(data.get("duplex_price", 0.3)),
+            last_dir=data.get("last_dir", ""),
+            jobs=jobs,
+        )
+
+    def save(self, path: str) -> None:
+        """保存配置到 JSON 文件"""
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "PrinterConfig":
+        """从 JSON 文件加载配置；若文件不存在则返回默认配置"""
+        if not os.path.exists(path):
+            return cls()
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls.from_dict(data)
+
+===== requirements.txt =====
+# ============================================================
+# 本地文件一键打印工具 — 依赖清单
+# ============================================================
+# Python 依赖（pip install -r requirements.txt）
+# ============================================================
+
+PySide6>=6.5
+pywin32>=300
+Pillow>=10.0
+reportlab>=4.0
+pdfkit>=1.0
+markdown>=3.0
+PyPDF2>=3.0
+python-docx>=1.0
+
+# ============================================================
+# 需要单独安装的外部程序（下载安装后加入系统 PATH）
+# ============================================================
+#
+# 1. LibreOffice — Office 文档转 PDF 的核心引擎
+#    下载: https://www.libreoffice.org/download/
+#    默认路径:
+#      Windows: C:\Program Files\LibreOffice\program\soffice.exe
+#      Linux:   /usr/bin/soffice
+#      macOS:   /Applications/LibreOffice.app/Contents/MacOS/soffice
+#
+# 2. wkhtmltopdf — HTML / Markdown 转 PDF
+#    下载: https://wkhtmltopdf.org/downloads.html
+#    默认路径:
+#      Windows: C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe
+#
+# 3. SumatraPDF — Windows 静默打印 PDF（强烈推荐）
+#    下载: https://www.sumatrapdfreader.org/download-free-pdf-viewer
+#    绿色版可直接放入本工具目录，或加入 PATH。
+#    默认搜索路径:
+#      本程序同级目录下的 SumatraPDF.exe
+#      C:\Program Files\SumatraPDF\SumatraPDF.exe
+#      %LOCALAPPDATA%\SumatraPDF\SumatraPDF.exe
+#      %APPDATA%\SumatraPDF\SumatraPDF.exe
+
+===== theme_manager.py =====
+"""
+theme_manager.py — 主题管理器
+支持浅色/深色双主题，可手动切换或跟随系统设置。
+检测 Windows 系统深浅模式，监听系统主题变化实时响应。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+
+from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtWidgets import QApplication
+
+logger = logging.getLogger(__name__)
+
+# 主题模式常量
+MODE_SYSTEM = "system"
+MODE_LIGHT = "light"
+MODE_DARK = "dark"
+
+ALL_MODES = [MODE_SYSTEM, MODE_LIGHT, MODE_DARK]
+
+MODE_LABELS = {
+    MODE_SYSTEM: "🌐 跟随系统",
+    MODE_LIGHT: "☀️ 浅色模式",
+    MODE_DARK: "🌙 深色模式",
+}
+
+
+class ThemeManager(QObject):
+    """
+    主题管理器 — 单例模式。
+
+    职责:
+    - 检测系统当前颜色方案（浅色/深色）
+    - 支持三种模式：跟随系统、浅色、深色
+    - 持久化用户偏好到 JSON 文件
+    - 应用 QSS 样式表到 QApplication
+    - 监听系统主题变化并自动响应（仅在"跟随系统"模式下）
+    """
+
+    theme_changed = Signal(str)  # 参数: "light" | "dark"
+
+    def __init__(self, settings_path: str, parent: QObject | None = None):
+        super().__init__(parent)
+        self._settings_path = settings_path
+        self._mode: str = MODE_SYSTEM
+        self._dark_qss: str = ""
+        self._light_qss: str = ""
+        self._app: QApplication | None = None
+        self._load_setting()
+
+    # ---- 公开 API ----
+
+    def init(self, app: QApplication, dark_qss: str, light_qss: str) -> None:
+        """初始化：绑定 QApplication、加载样式表、连接系统信号。"""
+        self._app = app
+        self._dark_qss = dark_qss
+        self._light_qss = light_qss
+
+        # 监听系统主题变化
+        app.styleHints().colorSchemeChanged.connect(self._on_system_theme_changed)
+
+        # 首次应用主题
+        self._apply()
+
+    @property
+    def mode(self) -> str:
+        """当前模式：'system' | 'light' | 'dark'"""
+        return self._mode
+
+    @property
+    def effective_theme(self) -> str:
+        """当前生效的主题：'light' | 'dark'"""
+        if self._mode == MODE_SYSTEM:
+            return self._detect_system_theme()
+        return self._mode
+
+    def set_mode(self, mode: str) -> None:
+        """切换模式并立即生效。"""
+        if mode not in ALL_MODES:
+            logger.warning(f"无效的主题模式: {mode}")
+            return
+        if mode == self._mode:
+            return
+        self._mode = mode
+        self._save_setting()
+        self._apply()
+        logger.info(f"主题模式已切换: {MODE_LABELS.get(mode, mode)}")
+
+    def cycle_mode(self) -> None:
+        """在三种模式间循环切换（调试/快捷键用）。"""
+        idx = ALL_MODES.index(self._mode)
+        next_idx = (idx + 1) % len(ALL_MODES)
+        self.set_mode(ALL_MODES[next_idx])
+
+    # ---- 内部方法 ----
+
+    def _apply(self) -> None:
+        """应用当前生效的 QSS 样式表。"""
+        effective = self.effective_theme
+        qss = self._dark_qss if effective == MODE_DARK else self._light_qss
+        if self._app:
+            self._app.setStyleSheet(qss)
+        self.theme_changed.emit(effective)
+        logger.debug(f"已应用主题: {effective}")
+
+    def _detect_system_theme(self) -> str:
+        """检测系统当前颜色方案。"""
+        if self._app is None:
+            return MODE_LIGHT
+        cs = self._app.styleHints().colorScheme()
+        if cs == Qt.ColorScheme.Dark:
+            return MODE_DARK
+        return MODE_LIGHT
+
+    def _on_system_theme_changed(self) -> None:
+        """系统主题变化回调：仅在跟随系统模式下自动切换。"""
+        if self._mode == MODE_SYSTEM:
+            logger.info("检测到系统主题变化，自动切换")
+            self._apply()
+
+    # ---- 持久化 ----
+
+    def _load_setting(self) -> None:
+        """从 JSON 文件加载用户偏好。"""
+        try:
+            if os.path.isfile(self._settings_path):
+                with open(self._settings_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                mode = data.get("theme_mode", MODE_SYSTEM)
+                if mode in ALL_MODES:
+                    self._mode = mode
+                    logger.info(f"已加载主题设置: {MODE_LABELS.get(mode, mode)}")
+        except Exception as e:
+            logger.warning(f"加载主题设置失败: {e}，使用默认值")
+
+    def _save_setting(self) -> None:
+        """保存用户偏好到 JSON 文件。"""
+        try:
+            os.makedirs(os.path.dirname(self._settings_path) or ".", exist_ok=True)
+            with open(self._settings_path, "w", encoding="utf-8") as f:
+                json.dump({"theme_mode": self._mode}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存主题设置失败: {e}")
+
+===== theme_settings.json =====
+{
+  "theme_mode": "dark"
+}
+
+===== 汇总代码文件内容_v2.py =====
+import os
+import sys
+from pathlib import Path
+
+def merge_text_files(directory: str, output_name: str = "代码文件内容汇总.txt") -> None:
+    """
+    将 directory 目录下的直接文件（不扫描子文件夹）合并到 output_name。
+    每个文件内容前插入 "===== 文件名 =====" 分隔行。
+    自动排除输出文件自身和指定的脚本文件。
+    """
+    dir_path = Path(directory).resolve()
+    if not dir_path.is_dir():
+        print(f"错误：'{directory}' 不是一个有效的目录。")
+        sys.exit(1)
+
+    output_path = dir_path / output_name
+    script_name = "汇总文件内容.py"  # 要排除的脚本文件名
+
+    # 定义允许的文件扩展名
+    allowed_extensions = {'.py', '.txt', '.js', '.json', '.c', '.cpp', '.h', '.wxml', '.wxss'}
+
+    # 收集符合条件的文件（仅扫描当前目录的直接文件）
+    files = []
+    for f in dir_path.iterdir():
+        if not f.is_file():
+            continue
+        # 排除输出文件和脚本自身
+        if f.name == output_name or f.name == script_name:
+            continue
+        # 只处理指定扩展名
+        if f.suffix.lower() not in allowed_extensions:
+            continue
+        
+        files.append(f)
+
+    if not files:
+        print(f"在当前目录中没有找到指定类型（{', '.join(allowed_extensions)}）的文件。")
+        return
+
+    # 按文件名排序，使输出更有条理
+    files.sort(key=lambda x: x.name)
+
+    with output_path.open("w", encoding="utf-8") as outfile:
+        outfile.write(f"===== 合并文件列表 (共 {len(files)} 个文件) =====\n")
+        outfile.write(f"===== 扫描目录: {dir_path} =====\n")
+        outfile.write(f"===== 文件类型: {', '.join(allowed_extensions)} =====\n")
+        outfile.write(f"===== 不扫描子文件夹 =====\n\n")
+        
+        for file_path in files:
+            separator = f"===== {file_path.name} =====\n"
+            outfile.write(separator)
+
+            try:
+                with file_path.open("r", encoding="utf-8") as infile:
+                    content = infile.read()
+                outfile.write(content)
+                if not content.endswith("\n"):
+                    outfile.write("\n")
+            except UnicodeDecodeError:
+                try:
+                    with file_path.open("r", encoding="gbk", errors="ignore") as infile:
+                        content = infile.read()
+                    outfile.write(content)
+                    if not content.endswith("\n"):
+                        outfile.write("\n")
+                except Exception as e:
+                    outfile.write(f"[无法读取此文件: {e}]\n")
+            except Exception as e:
+                outfile.write(f"[处理文件时出错: {e}]\n")
+
+            outfile.write("\n")
+
+    print(f"已将所有文件内容合并到: {output_path}")
+    print(f"共处理了 {len(files)} 个文件")
+    print(f"处理的文件类型: {', '.join(allowed_extensions)}")
+    print(f"扫描目录: {dir_path} (仅直接文件，不扫描子文件夹)")
+
+if __name__ == "__main__":
+    # 如果命令行提供了目录参数，则使用该目录，否则使用当前目录
+    if len(sys.argv) > 1:
+        target_dir = sys.argv[1]
+    else:
+        target_dir = "."
+
+    merge_text_files(target_dir)
+
