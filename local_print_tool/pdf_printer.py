@@ -151,6 +151,7 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
     raw = raw.replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
 
     pages: set[int] = set()
+    skipped: list[str] = []
     for part in raw.split(","):
         part = part.strip()
         if not part:
@@ -173,17 +174,27 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
                                 pages.add(p - 1)
                         if 1 <= prefix <= total_pages:
                             pages.add(prefix - 1)
+                else:
+                    skipped.append(part)
             except ValueError:
-                continue
+                skipped.append(part)
         else:
             try:
                 p = int(part)
                 if 1 <= p <= total_pages:
                     pages.add(p - 1)
+                else:
+                    skipped.append(part)
             except ValueError:
-                continue
+                skipped.append(part)
+
+    if skipped:
+        logger.warning(f"页码范围包含无效/超限部分（已忽略）: {', '.join(skipped)} (总页数={total_pages})")
+        print(f"[打印] ⚠ 页码范围无效/超限部分已忽略: {', '.join(skipped)}")
 
     if not pages:
+        logger.warning(f"页码范围解析后无有效页，退回全打印 (输入: '{page_range}', 总页数={total_pages})")
+        print(f"[打印] ⚠ 页码范围解析后无有效页，将打印全部 {total_pages} 页")
         return list(range(total_pages))
     return sorted(pages)
 
@@ -219,23 +230,44 @@ def print_pdf(
 
     system = platform.system()
 
+    # ── 打印参数总览 ──
+    duplex_label = f"{'双面' if duplex == 'on' else '单面'}"
+    if duplex == "on":
+        duplex_label += f"({ '短边翻转' if duplex_mode == 'short-edge' else '长边翻转' })"
+    print(f"[打印] 文件: {os.path.basename(pdf_path)}")
+    print(f"[打印] 参数: {duplex_label} | {copies} 份 | 页码: '{page_range or '全部'}'")
+    logger.info(f"开始打印: pdf={pdf_path}, printer={printer_name or '(默认)'}, "
+                f"duplex={duplex}/{duplex_mode}, copies={copies}, pages='{page_range}'")
+
     if system == "Windows":
-        # 方案 1: Windows 原生 GDI 打印（DEVMODE.Copies 一次设置）
+        # 方案 1: Windows 原生 GDI 打印
+        print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
         if ok:
+            print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
+        print(f"[打印] ✗ 方案1 失败: {msg}")
 
-        # 方案 2: SumatraPDF 降级（-print-settings copies=N）
+        # 方案 2: SumatraPDF 降级
         sumatra = _find_sumatra_pdf()
         if sumatra:
-            logger.info("原生打印失败，降级为 SumatraPDF")
-            return _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+            print(f"[打印] 方案2: 降级为 SumatraPDF ({sumatra})")
+            logger.info(f"原生 GDI 失败，降级 SumatraPDF: {sumatra}")
+            ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+            print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
+            return ok, msg
 
         # 方案 3: 应用层循环打印（最可靠兜底）
+        print("[打印] 方案3: 应用层循环打印（兜底）...")
         logger.warning("原生和 SumatraPDF 均不可用，使用循环打印")
-        return _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+        ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+        print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
+        return ok, msg
     else:
-        return _print_pdf_fallback(pdf_path, printer_name)
+        print(f"[打印] 非 Windows 平台，使用 lp 命令...")
+        ok, msg = _print_pdf_fallback(pdf_path, printer_name)
+        print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
+        return ok, msg
 
 
 def _print_pdf_native(
@@ -248,7 +280,6 @@ def _print_pdf_native(
 ) -> tuple[bool, str]:
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
-    份数通过 DEVMODE.dmCopies 设置，文档只传输一次。
     """
     import fitz
 
@@ -272,27 +303,60 @@ def _print_pdf_native(
         pages_to_print = _parse_page_range(page_range, total_pages)
         printer = printer_name or win32print.GetDefaultPrinter()
 
-        # -- 创建打印机 DC --
+        logger.info(f"GDI 打印: 打印机={printer}, 总页数={total_pages}, "
+                    f"待打页数={len(pages_to_print)}, 份数={copies}")
+        print(f"[GDI] 目标打印机: {printer}")
+        print(f"[GDI] PDF 共 {total_pages} 页，本次打印 {len(pages_to_print)} 页 × {copies} 份 = {len(pages_to_print) * copies} 面")
+
+        # -- 获取配置好双面的 DEVMODE --
+        print(f"[GDI] 获取打印机 DEVMODE...")
+        devmode = _get_printer_devmode(printer, duplex, duplex_mode)
+
+        # -- 创建打印机 DC（有 DEVMODE 则通过 win32gui.ResetDC 应用）--
         hdc = win32ui.CreateDC()
         hdc.CreatePrinterDC(printer)
+
+        if devmode is not None:
+            try:
+                import win32gui
+                hdc_handle = hdc.GetHandleOutput()
+                result = win32gui.ResetDC(hdc_handle, devmode)
+                if result:
+                    duplex_desc = {"on": {"long-edge": "长边翻转", "short-edge": "短边翻转"},
+                                   "off": {"long-edge": "单面", "short-edge": "单面"}}
+                    desc = duplex_desc.get(duplex, {}).get(duplex_mode, f"duplex={duplex}")
+                    print(f"[GDI] ✓ DEVMODE 已应用 (win32gui.ResetDC): 双面模式={desc}")
+                    logger.info(f"GDI: win32gui.ResetDC 成功, duplex={duplex}/{duplex_mode}")
+                else:
+                    print(f"[GDI] ⚠ win32gui.ResetDC 返回 0，双面设置可能未生效")
+                    logger.warning("GDI: win32gui.ResetDC 返回 0")
+            except Exception as e:
+                print(f"[GDI] ⚠ win32gui.ResetDC 失败（使用默认设置）: {e}")
+                logger.warning(f"GDI: win32gui.ResetDC 失败: {e}")
+        else:
+            print(f"[GDI] ⚠ 未能获取 DEVMODE，使用打印机默认设置")
+            logger.warning("GDI: 未能获取 DEVMODE，双面设置可能不生效")
 
         # 获取打印机可打印区域和分辨率
         dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
         dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
         printable_w = hdc.GetDeviceCaps(win32con.HORZRES)
         printable_h = hdc.GetDeviceCaps(win32con.VERTRES)
-
-        # -- 设置双面模式（在 StartDoc 之前）--
-        _set_printer_settings(printer, duplex, duplex_mode)
+        logger.info(f"GDI: DPI=({dpi_x},{dpi_y}), 可打印区域=({printable_w},{printable_h})")
+        print(f"[GDI] 分辨率: {dpi_x}×{dpi_y} DPI, 可打印区域: {printable_w}×{printable_h}")
 
         title = os.path.basename(pdf_path)
         hdc.StartDoc(title)
         started = True
+        print(f"[GDI] StartDoc 完成，开始逐页渲染...")
 
         from PIL import Image, ImageWin
 
+        page_seq = 0
+        total_sheets = len(pages_to_print) * copies
         for copy_idx in range(copies):
             for page_idx in pages_to_print:
+                page_seq += 1
                 hdc.StartPage()
 
                 page = doc[page_idx]
@@ -311,11 +375,14 @@ def _print_pdf_native(
                 dib.draw(hdc.GetHandleOutput(), (x, y, x + pix.width, y + pix.height))
 
                 hdc.EndPage()
+                print(f"[GDI]   ✓ 第 {page_seq}/{total_sheets} 面 (PDF p.{page_idx + 1}, 第 {copy_idx + 1} 份)")
 
         hdc.EndDoc()
         started = False
         total_pages_printed = len(pages_to_print) * copies
-        return True, f"打印成功 (GDI, {total_pages_printed} 页, {copies} 份)"
+        msg = f"打印成功 (GDI, {total_pages_printed} 面, {copies} 份)"
+        logger.info(f"GDI 打印完成: {msg}")
+        return True, msg
 
     except ImportError as e:
         return False, f"缺少依赖: {e}"
@@ -340,15 +407,23 @@ def _print_pdf_native(
                 pass
 
 
-def _set_printer_settings(printer_name: str, duplex: str, duplex_mode: str) -> None:
-    """通过 DEVMODE 设置打印机双面模式。"""
+def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str):
+    """
+    获取并配置打印机的 DEVMODE 结构。
+
+    Returns:
+        配置好的 PyDEVMODE 对象，失败返回 None。
+    """
     try:
         import win32print
         import win32con
 
+        duplex_map = {1: "单面 (DMDUP_SIMPLEX)", 2: "短边翻转 (DMDUP_HORIZONTAL)", 3: "长边翻转 (DMDUP_VERTICAL)"}
+
         handle = win32print.OpenPrinter(printer_name)
         try:
             devmode = win32print.GetPrinter(handle, 2)["pDevMode"]
+            old_duplex = devmode.Duplex
             if duplex == "on":
                 if duplex_mode == "short-edge":
                     devmode.Duplex = 2   # DMDUP_HORIZONTAL
@@ -357,15 +432,30 @@ def _set_printer_settings(printer_name: str, duplex: str, duplex_mode: str) -> N
             else:
                 devmode.Duplex = 1       # DMDUP_SIMPLEX
 
-            win32print.DocumentProperties(
+            new_duplex = devmode.Duplex
+            print(f"[DEVMODE] 打印机: {printer_name}")
+            print(f"[DEVMODE] 双面设置: {duplex_map.get(old_duplex, f'未知({old_duplex})')} → {duplex_map.get(new_duplex, f'未知({new_duplex})')}")
+            logger.info(f"DEVMODE: OpenPrinter={printer_name}, Duplex {old_duplex}→{new_duplex}")
+
+            # DocumentProperties 验证/合并 DEVMODE
+            result = win32print.DocumentProperties(
                 0, handle, printer_name,
                 devmode, devmode,
                 win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
             )
+            logger.info(f"DEVMODE: DocumentProperties 返回 {result} (正数=成功)")
+            if result <= 0:
+                print(f"[DEVMODE] ⚠ DocumentProperties 验证返回 {result}（可能无效）")
+            else:
+                print(f"[DEVMODE] ✓ DocumentProperties 验证通过")
+
+            return devmode
         finally:
             win32print.ClosePrinter(handle)
     except Exception as e:
-        logger.warning(f"设置打印机参数失败: {e}")
+        print(f"[DEVMODE] ✗ 失败: {e}")
+        logger.warning(f"获取/配置打印机 DEVMODE 失败: {e}")
+        return None
 
 
 # ============================================================
@@ -430,7 +520,8 @@ def _print_via_sumatra(
 
     cmd.append(os.path.abspath(pdf_path))
 
-    logger.info(f"SumatraPDF 打印: {' '.join(cmd)}")
+    print(f"[SumatraPDF] 命令: {' '.join(cmd)}")
+    logger.info(f"SumatraPDF 执行: {' '.join(cmd)}")
 
     try:
         si = subprocess.STARTUPINFO()
@@ -446,14 +537,27 @@ def _print_via_sumatra(
             timeout=120,
             startupinfo=si,
         )
+        print(f"[SumatraPDF] 退出码: {result.returncode}")
+        if result.stdout.strip():
+            logger.info(f"SumatraPDF stdout: {result.stdout.strip()[:200]}")
+        if result.stderr.strip():
+            logger.warning(f"SumatraPDF stderr: {result.stderr.strip()[:200]}")
+            print(f"[SumatraPDF] stderr: {result.stderr.strip()[:200]}")
+
         if result.returncode != 0:
-            return False, f"SumatraPDF 失败 (rc={result.returncode})"
+            logger.warning(f"SumatraPDF 返回非零: rc={result.returncode}, stderr={result.stderr.strip()}")
+            return False, f"SumatraPDF 失败 (rc={result.returncode}): {result.stderr.strip()[:100]}"
+        if result.stderr.strip():
+            logger.warning("SumatraPDF 虽然 rc=0 但输出了 stderr 警告")
         return True, "打印成功 (SumatraPDF)"
     except subprocess.TimeoutExpired:
+        print("[SumatraPDF] ✗ 超时 (120s)")
         return False, "SumatraPDF 超时"
     except FileNotFoundError:
+        print("[SumatraPDF] ✗ 可执行文件未找到")
         return False, "SumatraPDF 未找到"
     except Exception as e:
+        print(f"[SumatraPDF] ✗ 异常: {e}")
         return False, f"SumatraPDF 异常: {e}"
 
 
@@ -466,10 +570,14 @@ def _print_via_loop(
     copies: int = 1,
 ) -> tuple[bool, str]:
     """终极兜底：应用层循环打印，每次只打 1 份。成功率最高。"""
+    print(f"[循环打印] 共 {copies} 份，每次 1 份...")
     for i in range(copies):
+        print(f"[循环打印] 第 {i + 1}/{copies} 份...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, 1)
         if not ok:
+            print(f"[循环打印] ✗ 第 {i + 1} 份失败: {msg}")
             return False, f"第 {i + 1}/{copies} 份打印失败: {msg}"
+        print(f"[循环打印] ✓ 第 {i + 1} 份完成")
     return True, f"循环打印完成 ({copies} 份)"
 
 

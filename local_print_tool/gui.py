@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import traceback
 from datetime import datetime
 from typing import Optional
@@ -480,16 +481,23 @@ class PrintWorker(QThread):
                 self.job_finished.emit(idx, False, str(e))
 
             finally:
-                # 4. 清理临时 PDF
+                # 4. 清理临时 PDF（如需要则先复制到桌面供人工核对）
                 if temp_pdf and os.path.isfile(temp_pdf):
                     if self._keep_temp_pdf:
-                        self.log_message.emit(f"  → 保留临时 PDF: {temp_pdf}")
-                    else:
+                        original_base = os.path.splitext(os.path.basename(job.file_path))[0]
+                        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+                        dest_name = f"[转换]{original_base}.pdf"
+                        dest_path = os.path.join(desktop, dest_name)
                         try:
-                            os.remove(temp_pdf)
-                            self.log_message.emit(f"  → 已清理临时 PDF")
+                            shutil.copy2(temp_pdf, dest_path)
+                            self.log_message.emit(f"  → 转换副本已保存到桌面: {dest_name}")
                         except OSError as e:
-                            self.log_message.emit(f"  → 清理临时 PDF 失败: {e}")
+                            self.log_message.emit(f"  → 保存转换副本到桌面失败: {e}")
+                    # 无论是否保留副本，TEMP 中的临时文件始终清理
+                    try:
+                        os.remove(temp_pdf)
+                    except OSError as e:
+                        self.log_message.emit(f"  → 清理临时 PDF 失败: {e}")
 
         self.progress.emit(total, total, "全部完成")
         self.all_finished.emit(success_count, fail_count)
@@ -683,7 +691,7 @@ class MainWindow(QMainWindow):
         _disable_combo_wheel(self._duplex_combo)
         layout.addWidget(self._duplex_combo)
 
-        layout.addWidget(QLabel("保留临时PDF:"))
+        layout.addWidget(QLabel("保存转换副本到桌面:"))
 
         self._keep_temp_check = QComboBox()
         self._keep_temp_check.addItems(["否", "是"])
@@ -911,7 +919,8 @@ class MainWindow(QMainWindow):
 
     def _sync_ui_to_config(self):
         """将 UI 控件数据同步回配置对象。"""
-        self._config.printer_name = self._printer_combo.currentText().strip()
+        printer_data = self._printer_combo.currentData()
+        self._config.printer_name = printer_data if printer_data else ""
 
         idx = self._duplex_combo.currentIndex()
         if idx == 1:
@@ -1093,8 +1102,13 @@ class MainWindow(QMainWindow):
         """双击表格行 → 用系统默认程序打开文件。"""
         file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
         if file_path and os.path.isfile(file_path):
-            os.startfile(file_path)
-            self._log(f"打开文件: {os.path.basename(file_path)}")
+            try:
+                os.startfile(file_path)
+                self._log(f"打开文件: {os.path.basename(file_path)}")
+            except OSError as e:
+                logger.warning(f"无法打开文件 ({file_path}): {e}")
+                QMessageBox.warning(self, "无法打开文件",
+                                    f"没有找到可以打开此类型文件的程序。\n\n{file_path}")
 
     def _on_table_context_menu(self, pos):
         """表格右键菜单。"""
@@ -1144,6 +1158,17 @@ class MainWindow(QMainWindow):
 
     def _add_files_to_table(self, files: list[str]):
         """添加文件到任务列表的核心逻辑。"""
+        if getattr(self, '_loading_files', False):
+            logger.warning("上一批文件仍在处理中，忽略本次添加请求")
+            return
+        self._loading_files = True
+        try:
+            self.__add_files_to_table_impl(files)
+        finally:
+            self._loading_files = False
+
+    def __add_files_to_table_impl(self, files: list[str]):
+        """_add_files_to_table 的内部实现（由重入保护包装）。"""
         converter = get_converter()
         converted = 0
         allowed_types = {
@@ -1197,6 +1222,7 @@ class MainWindow(QMainWindow):
             self._table.item(row, self.COL_PAGES).setText("...")
             QApplication.processEvents()
 
+            temp_pdf: str | None = None
             try:
                 temp_pdf = converter.convert(file_path)
                 info = get_pdf_info(temp_pdf)
@@ -1208,15 +1234,16 @@ class MainWindow(QMainWindow):
                 self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
                 self._recalc_row_cost(row)
 
-                try:
-                    os.remove(temp_pdf)
-                except OSError:
-                    pass
-
                 converted += 1
             except Exception as e:
                 self._table.item(row, self.COL_PAGES).setText("?")
                 logger.warning(f"预转换失败 ({os.path.basename(file_path)}): {e}")
+            finally:
+                if temp_pdf and os.path.isfile(temp_pdf):
+                    try:
+                        os.remove(temp_pdf)
+                    except OSError as e:
+                        logger.warning(f"无法删除临时 PDF ({temp_pdf}): {e}")
 
         self._update_total_cost()
         if converted > 0:
@@ -1328,7 +1355,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v2.0</h3>"
+            "<h3>HN 本地打印工具 v2.1</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"

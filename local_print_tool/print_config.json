@@ -1,5 +1,5 @@
 {
-  "printer_name": "Microsoft Print to PDF",
+  "printer_name": "HP LaserJet MFP M232-M237",
   "duplex_mode": "long-edge",
   "keep_temp_pdf": true,
   "simplex_price": 0.2,
@@ -7,19 +7,11 @@
   "last_dir": "C:/Users/Administrator/Desktop",
   "jobs": [
     {
-      "file_path": "C:/Users/Administrator/Documents/xwechat_files/wxid_gte01inc1og222_22a7/msg/file/2026-06/判断简答题库(1).pdf",
-      "copies": 6,
+      "file_path": "C:/Users/Administrator/Desktop/6.docx",
+      "copies": 2,
       "duplex": "on",
       "page_range": "",
-      "page_count": 3,
-      "orientation": "portrait"
-    },
-    {
-      "file_path": "C:/Users/Administrator/Documents/xwechat_files/wxid_gte01inc1og222_22a7/msg/file/2026-06/2025-2026-2 马原试题库(2).docx",
-      "copies": 6,
-      "duplex": "on",
-      "page_range": "",
-      "page_count": 20,
+      "page_count": 1,
       "orientation": "portrait"
     }
   ]

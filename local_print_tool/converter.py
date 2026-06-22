@@ -258,7 +258,13 @@ def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content:
     wk_path = _find_wkhtmltopdf()
 
     if wk_path:
-        import pdfkit
+        try:
+            import pdfkit
+        except ImportError:
+            raise RuntimeError(
+                "缺少 Python 包 pdfkit。请运行: pip install pdfkit\n"
+                f"(已检测到 wkhtmltopdf: {wk_path})"
+            )
         options = {
             "page-size": "A4",
             "encoding": "UTF-8",
@@ -438,11 +444,12 @@ def _register_chinese_font() -> None:
                     _chinese_font_registered = True
                     logger.info(f"已注册中文字体: {font_name} ({path})")
                     return
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"注册字体失败 {font_name} ({path}): {e}")
                     continue
 
     # 回退
-    logger.warning("未找到中文字体，将使用 Helvetica（中文可能无法正常显示）")
+    logger.warning("未找到任何可用中文字体，将使用 Helvetica（中文可能无法正常显示）")
     _chinese_font_registered = True
 
 
@@ -534,17 +541,28 @@ class UniversalConverter:
         if convert_func is None:
             raise ValueError(f"不支持的文件类型: {ext}  (文件: {file_path})")
 
+        created_temp = False
         if output_pdf is None:
             fd, output_pdf = tempfile.mkstemp(suffix=".pdf", prefix="_conv_")
             os.close(fd)
+            created_temp = True
 
-        logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF")
-        convert_func(file_path, output_pdf)
+        try:
+            logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF")
+            convert_func(file_path, output_pdf)
 
-        if not os.path.isfile(output_pdf) or os.path.getsize(output_pdf) == 0:
-            raise RuntimeError(f"转换为 PDF 后文件为空或不存在: {output_pdf}")
+            if not os.path.isfile(output_pdf) or os.path.getsize(output_pdf) == 0:
+                raise RuntimeError(f"转换为 PDF 后文件为空或不存在: {output_pdf}")
 
-        return output_pdf
+            return output_pdf
+        except Exception:
+            if created_temp and output_pdf and os.path.isfile(output_pdf):
+                try:
+                    os.remove(output_pdf)
+                    logger.debug(f"已清理失败的临时 PDF: {output_pdf}")
+                except OSError:
+                    pass
+            raise
 
 
 # 模块级单例
