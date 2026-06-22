@@ -22,7 +22,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
 )
-from PySide6.QtGui import QAction, QFont, QColor, QIcon
+from PySide6.QtGui import QAction, QFont, QColor, QIcon, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -275,21 +275,62 @@ class RangeListWidget(QWidget):
             inp.deleteLater()
         self._inputs.clear()
 
-    def _rebuild_lines(self) -> None:
-        """重建行列表：移除多余空行，保证末尾一个空行。"""
+    def _sort_inputs(self) -> None:
+        """按页码范围起始值升序排列非空输入行，保持末尾空行。"""
+        if self._rebuilding:
+            return
+        # 收集非空行，附带排序键
+        entries: list[tuple[int, str]] = []
+        for inp in self._inputs:
+            t = inp.text().strip()
+            if not t:
+                continue
+            pages = self._parse_range(t)
+            key = min(pages) if pages else 10 ** 9  # 解析失败排末尾
+            entries.append((key, t))
+        if len(entries) <= 1:
+            return
+        # 判断是否需要排序
+        sorted_entries = sorted(entries, key=lambda x: x[0])
+        if entries == sorted_entries:
+            return
+        # 重建：排序后内容 + 一个空行
         self._rebuilding = True
-        # 收集非空行
-        filled = [inp for inp in self._inputs if inp.text().strip()]
+        for inp in self._inputs:
+            inp.blockSignals(True)
+            self._layout.removeWidget(inp)
+            inp.deleteLater()
+        self._inputs.clear()
+        for _, text in sorted_entries:
+            new_inp = self._add_row()
+            new_inp.setText(text)
+        self._add_row()  # 底部空行
+        self._rebuilding = False
+
+    def _rebuild_lines(self) -> None:
+        """重建行列表：移除多余空行，排序后保证末尾一个空行。"""
+        self._rebuilding = True
+        # 收集非空行，附带排序键
+        entries: list[tuple[int, str]] = []
+        for inp in self._inputs:
+            t = inp.text().strip()
+            if not t:
+                continue
+            pages = self._parse_range(t)
+            key = min(pages) if pages else 10 ** 9
+            entries.append((key, t))
+        # 排序
+        entries.sort(key=lambda x: x[0])
         # 移除所有旧行
         for inp in self._inputs:
             inp.blockSignals(True)
             self._layout.removeWidget(inp)
             inp.deleteLater()
         self._inputs.clear()
-        # 添加非空行 + 一个空行
-        for inp in filled:
+        # 添加排序后的非空行 + 一个空行
+        for _, text in entries:
             new_inp = self._add_row()
-            new_inp.setText(inp.text().strip())
+            new_inp.setText(text)
         self._add_row()  # 底部空行
         self._rebuilding = False
 
@@ -302,6 +343,8 @@ class RangeListWidget(QWidget):
             self._add_row()
             self._rebuilding = False
         self._check_all()
+        if self._valid:
+            self.rangesChanged.emit()
 
     def _on_focus_lost(self, sender: QLineEdit) -> None:
         if self._rebuilding:
@@ -318,12 +361,18 @@ class RangeListWidget(QWidget):
             self._add_row()
             self._rebuilding = False
         self._check_all()
+        # 验证通过后自动排序，然后通知表格更新
+        if self._valid:
+            self._sort_inputs()
+            self.rangesChanged.emit()
 
     def _check_all(self) -> None:
         """检测格式、重叠、超限。"""
-        # 清除所有样式
+        # 清除所有错误样式
         for inp in self._inputs:
-            inp.setStyleSheet("")
+            inp.setProperty("invalid", False)
+            inp.style().unpolish(inp)
+            inp.style().polish(inp)
 
         parsed: list[tuple[QLineEdit, set[int]]] = []
         has_error = False
@@ -334,10 +383,10 @@ class RangeListWidget(QWidget):
                 continue
             pages = self._parse_range(t)
             if pages is None:
-                inp.setStyleSheet("background-color: #553333;")
+                self._mark_invalid(inp)
                 has_error = True
             elif self._total_pages > 0 and max(pages) > self._total_pages:
-                inp.setStyleSheet("background-color: #553333;")
+                self._mark_invalid(inp)
                 has_error = True
             else:
                 parsed.append((inp, pages))
@@ -346,17 +395,22 @@ class RangeListWidget(QWidget):
         for i in range(len(parsed)):
             for j in range(i + 1, len(parsed)):
                 if parsed[i][1] & parsed[j][1]:
-                    parsed[i][0].setStyleSheet("background-color: #553333;")
-                    parsed[j][0].setStyleSheet("background-color: #553333;")
+                    self._mark_invalid(parsed[i][0])
+                    self._mark_invalid(parsed[j][0])
                     has_error = True
 
         self._valid = not has_error
-        if self._valid:
-            self.rangesChanged.emit()
+
+    @staticmethod
+    def _mark_invalid(inp: QLineEdit) -> None:
+        """标记输入框为错误状态（通过 QSS 动态属性驱动样式）。"""
+        inp.setProperty("invalid", True)
+        inp.style().unpolish(inp)
+        inp.style().polish(inp)
 
     @staticmethod
     def _parse_range(text: str) -> set[int] | None:
-        """解析单个范围字符串。"""
+        """解析单个范围字符串（如 "1-5"、"7"），start > end 视为格式错误。"""
         text = text.strip()
         if not text:
             return None
@@ -366,13 +420,6 @@ class RangeListWidget(QWidget):
                 start, end = int(a), int(b)
                 if 1 <= start < end:
                     return set(range(start, end + 1))
-                elif start > end and len(a) > 1:
-                    prefix = int(a[:-1])
-                    last = int(a[-1])
-                    if prefix < end:
-                        result = set(range(last, end + 1))
-                        result.add(prefix)
-                        return result
                 return None
             else:
                 v = int(text)
@@ -569,6 +616,8 @@ class MainWindow(QMainWindow):
         self._pending_jobs: list[PrintJob] = []
         self._theme_manager = theme_manager
         self._last_dir = self._config.last_dir
+        self._copy_total_btn: Optional[QPushButton] = None
+        self._copy_total_timer: Optional[QTimer] = None
 
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
@@ -633,6 +682,12 @@ class MainWindow(QMainWindow):
         # 文件菜单
         file_menu = mb.addMenu("文件(&F)")
 
+        open_action = QAction("打开(&O)", self)
+        open_action.triggered.connect(self._on_add_files)
+        file_menu.addAction(open_action)
+
+        file_menu.addSeparator()
+
         exit_action = QAction("退出(&X)", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
@@ -644,9 +699,28 @@ class MainWindow(QMainWindow):
 
         # 帮助菜单
         help_menu = mb.addMenu("帮助(&H)")
+        shortcuts_action = QAction("快捷键(&K)", self)
+        shortcuts_action.triggered.connect(self._on_shortcuts)
+        help_menu.addAction(shortcuts_action)
+        help_menu.addSeparator()
         about_action = QAction("关于(&A)", self)
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
+
+        # 全局快捷键（ApplicationShortcut 确保不被子控件拦截）
+        self._shortcut_copy = QShortcut(QKeySequence("Ctrl+C"), self)
+        self._shortcut_copy.setContext(Qt.ApplicationShortcut)
+        self._shortcut_copy.activated.connect(self._on_shortcut_copy_total)
+        self._shortcut_copyd = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
+        self._shortcut_copyd.setContext(Qt.ApplicationShortcut)
+        self._shortcut_copyd.activated.connect(self._on_shortcut_copy_detail)
+        # Delete 需防止在文本输入框中误触发
+        self._shortcut_del = QShortcut(QKeySequence(QKeySequence.Delete), self)
+        self._shortcut_del.setContext(Qt.ApplicationShortcut)
+        self._shortcut_del.activated.connect(self._on_shortcut_delete)
+        self._shortcut_ctrl_d = QShortcut(QKeySequence("Ctrl+D"), self)
+        self._shortcut_ctrl_d.setContext(Qt.ApplicationShortcut)
+        self._shortcut_ctrl_d.activated.connect(self._on_remove_selected)
 
     def _setup_theme_menu(self, menu):
         """构建主题切换子菜单（单选模式）。"""
@@ -737,7 +811,7 @@ class MainWindow(QMainWindow):
 
         self._table = DropTableWidget()
         self._table.setColumnCount(7)
-        self._table.setHorizontalHeaderLabels(["文件名", "份数", "双面", "页码范围", "页数", "方向", "费用"])
+        self._table.setHorizontalHeaderLabels(["文件名", "份数", "单/双面", "页码范围", "页数", "方向", "费用"])
         self._table.filesDropped.connect(self._on_files_dropped)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -748,18 +822,12 @@ class MainWindow(QMainWindow):
 
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(self.COL_FILE, QHeaderView.Stretch)
-        hh.setSectionResizeMode(self.COL_COPIES, QHeaderView.Fixed)
-        hh.setSectionResizeMode(self.COL_DUPLEX, QHeaderView.Fixed)
-        hh.setSectionResizeMode(self.COL_RANGE, QHeaderView.Fixed)
-        hh.setSectionResizeMode(self.COL_PAGES, QHeaderView.Fixed)
-        hh.setSectionResizeMode(self.COL_ORIENT, QHeaderView.Fixed)
-        hh.setSectionResizeMode(self.COL_COST, QHeaderView.Fixed)
-        self._table.setColumnWidth(self.COL_COPIES, 50)
-        self._table.setColumnWidth(self.COL_DUPLEX, 50)
-        self._table.setColumnWidth(self.COL_RANGE, 90)
-        self._table.setColumnWidth(self.COL_PAGES, 50)
-        self._table.setColumnWidth(self.COL_ORIENT, 40)
-        self._table.setColumnWidth(self.COL_COST, 240)
+        hh.setSectionResizeMode(self.COL_COPIES, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_DUPLEX, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_RANGE, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_PAGES, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_ORIENT, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_COST, QHeaderView.ResizeToContents)
 
         # 选中行变化 → 右侧编辑面板同步
         self._table.selectionModel().selectionChanged.connect(self._on_table_selection)
@@ -770,10 +838,33 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._table)
 
         # 合计费用
+        total_row = QHBoxLayout()
+        total_row.setContentsMargins(0, 0, 0, 0)
+        total_row.addStretch()
         self._total_label = QLabel("合计: ¥0.00")
         self._total_label.setObjectName("totalCostLabel")
-        self._total_label.setAlignment(Qt.AlignRight)
-        layout.addWidget(self._total_label)
+        self._total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        total_row.addWidget(self._total_label)
+        self._copy_total_btn = QPushButton("📋 复制")
+        self._copy_total_btn.setFixedWidth(100)
+        self._copy_total_btn.clicked.connect(self._on_copy_total)
+        self._copy_total_timer = QTimer(self)
+        self._copy_total_timer.setSingleShot(True)
+        self._copy_total_timer.timeout.connect(self._reset_copy_button)
+        total_row.addWidget(self._copy_total_btn)
+        # 复制计费明细按钮（默认隐藏，由 ⏷ 控制）
+        self._copy_detail_btn = QPushButton("📋 复制计费明细")
+        self._copy_detail_btn.setVisible(False)
+        self._copy_detail_btn.clicked.connect(self._on_copy_detail)
+        total_row.addWidget(self._copy_detail_btn)
+        # 展开计费明细的切换按钮
+        self._detail_toggle_btn = QPushButton("⏷")
+        self._detail_toggle_btn.setObjectName("detailToggleBtn")
+        self._detail_toggle_btn.setCheckable(True)
+        self._detail_toggle_btn.setToolTip("展开计费明细")
+        self._detail_toggle_btn.toggled.connect(self._on_toggle_detail)
+        total_row.addWidget(self._detail_toggle_btn)
+        layout.addLayout(total_row)
 
         # 添加文件按钮 — 置于表格下方
         btn_add = QPushButton("📂 添加文件")
@@ -1013,6 +1104,71 @@ class MainWindow(QMainWindow):
             self._total_label.setText(f"合计: {prefix}¥{total:.2f}")
         else:
             self._total_label.setText("合计: ¥0.00")
+        # 总价变化时立即恢复复制按钮
+        self._reset_copy_button()
+
+    def _on_copy_total(self):
+        """复制合计金额到剪贴板。"""
+        text = self._total_label.text()
+        # 去掉"合计: "前缀和"≈ "前缀，保留 ¥ 符号
+        amount = text.replace("合计: ", "").replace("≈ ", "").strip()
+        try:
+            # 验证是否为有效金额
+            float(amount.replace("¥", ""))
+            clipboard = QApplication.clipboard()
+            clipboard.setText(amount)
+            if self._copy_total_btn:
+                self._copy_total_btn.setText("✅ 已复制")
+                self._copy_total_btn.setEnabled(False)
+            if self._copy_total_timer:
+                self._copy_total_timer.start(5000)
+        except ValueError:
+            pass  # 金额无效时不复制
+
+    def _reset_copy_button(self):
+        """恢复复制按钮为可点击状态。"""
+        if self._copy_total_timer and self._copy_total_timer.isActive():
+            self._copy_total_timer.stop()
+        if self._copy_total_btn:
+            self._copy_total_btn.setText("📋 复制")
+            self._copy_total_btn.setEnabled(True)
+        if self._copy_detail_btn:
+            self._copy_detail_btn.setText("📋 复制计费明细")
+            self._copy_detail_btn.setEnabled(True)
+
+    def _on_toggle_detail(self, checked: bool):
+        """展开/收起计费明细复制按钮。"""
+        self._copy_detail_btn.setVisible(checked)
+        self._detail_toggle_btn.setText("⏶" if checked else "⏷")
+        self._detail_toggle_btn.setToolTip("隐藏计费明细" if checked else "展开计费明细")
+
+    def _on_copy_detail(self):
+        """复制计费明细到剪贴板。"""
+        lines = ["HN 本地打印工具 — 计费明细", "─" * 30]
+        for row in range(self._table.rowCount()):
+            file_item = self._table.item(row, self.COL_FILE)
+            filename = file_item.text() if file_item else "?"
+            copies = self._table.item(row, self.COL_COPIES).text()
+            duplex = self._table.item(row, self.COL_DUPLEX).text()
+            page_range = self._table.item(row, self.COL_RANGE).text()
+            orient = self._table.item(row, self.COL_ORIENT).text()
+            cost_item = self._table.item(row, self.COL_COST)
+            cost_text = cost_item.text() if cost_item else "?"
+            lines.append(
+                f"{row + 1}. {filename}\n"
+                f"   份数: {copies} | 单/双面: {duplex} | "
+                f"页码范围: {page_range} | 方向: {orient} | 费用: {cost_text}"
+            )
+        lines.append("─" * 30)
+        total_text = self._total_label.text()
+        lines.append(total_text)
+        QApplication.clipboard().setText("\n".join(lines))
+        # 按钮反馈
+        if self._copy_detail_btn:
+            self._copy_detail_btn.setText("✅ 已复制明细")
+            self._copy_detail_btn.setEnabled(False)
+        if self._copy_total_timer:
+            self._copy_total_timer.start(5000)
 
     def _recalc_row_cost(self, row: int):
         """重新计算指定行的费用。"""
@@ -1177,6 +1333,9 @@ class MainWindow(QMainWindow):
             ".txt", ".md", ".html", ".htm",
             ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
         }
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        # 记录添加前的行数，避免重复转换已有文件
+        start_row = self._table.rowCount()
 
         blocked = 0
         blocked_names: list[str] = []
@@ -1191,8 +1350,6 @@ class MainWindow(QMainWindow):
 
             page_count = 0
             orientation = ""
-
-            image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
             if ext == ".pdf":
                 info = get_pdf_info(f)
@@ -1212,11 +1369,11 @@ class MainWindow(QMainWindow):
 
         self._log(f"已添加 {len(files)} 个文件")
 
-        # 非 PDF 文件：转为临时 PDF 以统计页数
-        for row in range(self._table.rowCount()):
+        # 仅对新添加的非 PDF/非图片文件转为临时 PDF 以统计页数
+        for row in range(start_row, self._table.rowCount()):
             file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
             ext = os.path.splitext(file_path)[1].lower()
-            if ext == ".pdf":
+            if ext == ".pdf" or ext in image_exts:
                 continue
 
             self._table.item(row, self.COL_PAGES).setText("...")
@@ -1257,6 +1414,27 @@ class MainWindow(QMainWindow):
                 f"以下 {blocked} 个文件格式不支持，"
                 f"请手动转换为 PDF 后添加：\n\n{names}{more}"
             )
+
+    def _on_shortcut_copy_total(self):
+        """Ctrl+C：仅在非文本编辑状态下复制总价格。"""
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QLineEdit) or isinstance(focused, QTextEdit):
+            return  # 让输入框正常处理 Ctrl+C
+        self._on_copy_total()
+
+    def _on_shortcut_copy_detail(self):
+        """Ctrl+Shift+C：仅在非文本编辑状态下复制计费明细。"""
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QLineEdit) or isinstance(focused, QTextEdit):
+            return
+        self._on_copy_detail()
+
+    def _on_shortcut_delete(self):
+        """Delete 快捷键：仅在非文本编辑状态下删除任务。"""
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QLineEdit) or isinstance(focused, QTextEdit):
+            return  # 让输入框正常处理 Delete 键
+        self._on_remove_selected()
 
     def _on_remove_selected(self):
         """移除表格中选中的行。"""
@@ -1355,13 +1533,24 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v2.2</h3>"
+            "<h3>HN 本地打印工具 v2.3</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
             "<p>核心流程：文件 → PDF → Windows 原生 GDI 打印</p>"
             "<p>外部工具（可选）：LibreOffice | wkhtmltopdf | SumatraPDF</p>"
             "<p>技术：PySide6 + PyMuPDF + PyPDF2 + python-docx</p>"
+        )
+
+    def _on_shortcuts(self):
+        """快捷键说明对话框。"""
+        QMessageBox.information(
+            self, "快捷键",
+            "<table cellspacing='8'>"
+            "<tr><td><b>Ctrl+C</b></td><td>复制合计金额</td></tr>"
+            "<tr><td><b>Ctrl+Shift+C</b></td><td>复制计费明细</td></tr>"
+            "<tr><td><b>Delete</b> / <b>Ctrl+D</b></td><td>删除选中任务</td></tr>"
+            "</table>"
         )
 
     def _on_theme_changed(self):

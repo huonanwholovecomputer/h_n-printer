@@ -141,7 +141,7 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
     """
     解析用户输入的页码范围，返回 0-based 页码列表。
 
-    输入示例: "1-5", "1,3,5-7", "1-5、7、9", "34-18"(自动交换顺序)
+    输入示例: "1-5", "1,3,5-7", "1-5、7、9"
     """
     if not page_range or not page_range.strip():
         return list(range(total_pages))
@@ -159,17 +159,12 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
             try:
                 a, b = part.split("-", 1)
                 start, end = int(a), int(b)
-                if start > end:
-                    start, end = end, start   # 自动交换顺序，如 "34-18" → 18~34
-                if start < end:
+                if 1 <= start < end:
                     for p in range(start, end + 1):
                         if 1 <= p <= total_pages:
                             pages.add(p - 1)
-                elif start == end:
-                    if 1 <= start <= total_pages:
-                        pages.add(start - 1)
                 else:
-                    skipped.append(part)
+                    skipped.append(part)  # start >= end 视为格式错误
             except ValueError:
                 skipped.append(part)
         else:
