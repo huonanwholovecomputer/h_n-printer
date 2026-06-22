@@ -45,7 +45,11 @@ class PrintJob:
 
 def _parse_range_parts(raw: str, total_pages: int) -> set[int]:
     """将页码范围字符串解析为页码集合，支持智能拆分 '23-4' → {2,3,4}。"""
+    import logging
+    logger = logging.getLogger(__name__)
+
     pages: set[int] = set()
+    skipped: list[str] = []
     for part in raw.split(","):
         part = part.strip()
         if not part:
@@ -68,15 +72,21 @@ def _parse_range_parts(raw: str, total_pages: int) -> set[int]:
                                 pages.add(p)
                         if 1 <= prefix <= total_pages:
                             pages.add(prefix)
+                else:
+                    skipped.append(part)
             except ValueError:
-                pass
+                skipped.append(part)
         else:
             try:
                 p = int(part)
                 if 1 <= p <= total_pages:
                     pages.add(p)
+                else:
+                    skipped.append(part)
             except ValueError:
-                pass
+                skipped.append(part)
+    if skipped:
+        logger.warning(f"页码范围有无效部分（已忽略）: {skipped}")
     return pages
 
 
@@ -194,9 +204,16 @@ class PrinterConfig:
 
     @classmethod
     def load(cls, path: str) -> "PrinterConfig":
-        """从 JSON 文件加载配置；若文件不存在则返回默认配置"""
+        """从 JSON 文件加载配置；文件不存在或损坏则返回默认配置"""
+        import logging
+        logger = logging.getLogger(__name__)
+
         if not os.path.exists(path):
             return cls()
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return cls.from_dict(data)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return cls.from_dict(data)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.warning(f"加载配置失败 ({path}): {e}，将使用默认配置")
+            return cls()

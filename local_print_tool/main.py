@@ -8,13 +8,83 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 
 # 确保本地模块可以导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, qInstallMessageHandler, QtMsgType
+
+
+# ═══════════════════════════════════════════════════════════════
+# stderr 过滤器 — 在文件描述符层面拦截 C 库的 fprintf(stderr, ...)
+# ═══════════════════════════════════════════════════════════════
+
+_STDERR_FILTERS = [
+    b"iCCP: known incorrect sRGB profile",
+    b"setPointSize: Point size <= 0",
+]
+
+
+def _install_stderr_filter() -> None:
+    """劫持 fd 2 (stderr)，后台线程过滤无害的 C 库警告。"""
+    # 保存原始 stderr fd
+    saved_fd = os.dup(2)
+
+    # 创建管道
+    pipe_r, pipe_w = os.pipe()
+
+    # 将 fd 2 指向管道写端（此后所有 fprintf(stderr,...) 进入管道）
+    os.dup2(pipe_w, 2)
+    os.close(pipe_w)
+
+    def _worker() -> None:
+        try:
+            with os.fdopen(pipe_r, "rb", buffering=0) as reader:
+                while True:
+                    line = reader.readline()
+                    if not line:
+                        break
+                    if any(f in line for f in _STDERR_FILTERS):
+                        continue
+                    os.write(saved_fd, line)
+        except OSError:
+            # 管道关闭 / 进程退出 — 正常退出路径
+            pass
+        except Exception as e:
+            # 意外错误，尝试写回原始 stderr
+            try:
+                os.write(saved_fd, f"\n[stderr-filter 线程异常] {e}\n".encode())
+            except Exception:
+                pass
+        finally:
+            try:
+                os.close(saved_fd)
+            except OSError:
+                pass
+
+    t = threading.Thread(target=_worker, daemon=True, name="stderr-filter")
+    t.start()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Qt 消息过滤器（双重保险）
+# ═══════════════════════════════════════════════════════════════
+
+_qt_default_handler = None
+
+
+def _qt_message_filter(msg_type: QtMsgType, context, msg: str) -> None:
+    """过滤已知无害的 Qt 内部警告。"""
+    if "setPointSize: Point size <= 0" in msg:
+        return
+    if "iCCP: known incorrect sRGB profile" in msg:
+        return
+    if _qt_default_handler is not None:
+        _qt_default_handler(msg_type, context, msg)
+
 
 from theme_manager import ThemeManager
 
@@ -52,14 +122,21 @@ def check_dependencies() -> list[str]:
 
 def load_stylesheet(path: str) -> str:
     """加载 QSS 样式表文件。"""
-    if os.path.isfile(path):
+    if not os.path.isfile(path):
+        return ""
+    try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
-    return ""
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"[警告] 无法读取样式表 {path}: {e}", file=sys.stderr)
+        return ""
 
 
 def main():
     """主函数。"""
+    # ── 必须在一切输出之前安装，拦截 C 库直接写 stderr ──
+    _install_stderr_filter()
+
     setup_logging()
     logger = logging.getLogger("main")
 
@@ -70,6 +147,11 @@ def main():
     # 检查依赖
     missing = check_dependencies()
     app = QApplication(sys.argv)
+
+    # 安装 Qt 消息过滤器，屏蔽已知无害警告
+    global _qt_default_handler
+    _qt_default_handler = qInstallMessageHandler(_qt_message_filter)
+
     app.setApplicationName("HN 本地打印工具")
     app.setOrganizationName("HN-Print")
     # 设置程序图标
