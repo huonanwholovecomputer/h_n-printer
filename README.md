@@ -7,7 +7,7 @@
 - **多格式支持**：PDF、Word (`.doc`/`.docx`)、Markdown、HTML、TXT、CSV、图片 (JPG/PNG/BMP/GIF/WEBP)
 - **拖放添加**：从资源管理器直接拖拽文件到任务列表
 - **自动转换**：所有非 PDF 文件自动转换为 PDF 后再打印
-- **静默打印**：优先使用 Windows 原生 GDI API，无需弹出打印对话框
+- **静默打印**：三级降级策略——Windows GDI 原生 API → SumatraPDF → 应用层循环打印，无需弹出打印对话框
 - **双面打印**：支持长边/短边翻转
 - **页码范围**：精确指定要打印的页面，支持多段范围（如 `1-5,7,10-15`）
 - **份数控制**：每个文件独立设置打印份数
@@ -71,7 +71,7 @@ python main.py
 ┌─────────────────────────────────────────────────────────┐
 │  菜单栏: 文件 | 主题 | 帮助                              │
 ├─────────────────────────────────────────────────────────┤
-│  打印机选择 | 双面模式 | 保留临时PDF | 单面/双面单价     │
+│  打印机选择 | 双面模式 | 保存转换副本到桌面 | 单面/双面单价     │
 ├───────────────────────────┬─────────────────────────────┤
 │  文件列表表格              │  编辑面板                    │
 │  - 文件名                  │  - 份数 [+/-]              │
@@ -91,10 +91,10 @@ python main.py
 
 ```
 local_print_tool/
-├── main.py              # 程序入口，依赖检查，启动窗口
+├── main.py              # 程序入口，依赖检查，stderr 过滤，启动窗口
 ├── gui.py               # PySide6 主窗口界面 (MainWindow)
 ├── converter.py         # 通用文件转换器 (→ PDF)
-├── pdf_printer.py       # PDF 静默打印模块 (Windows GDI)
+├── pdf_printer.py       # PDF 静默打印模块 (三级降级: GDI → SumatraPDF → 循环)
 ├── printer_config.py    # 配置管理 (JSON 读写 + 计费)
 ├── theme_manager.py     # 主题管理器 (浅色/深色/系统)
 ├── styles_dark.qss      # 深色主题样式表
@@ -102,7 +102,11 @@ local_print_tool/
 ├── requirements.txt     # Python 依赖清单
 ├── print_config.json    # 用户配置文件 (自动生成)
 ├── theme_settings.json  # 主题设置 (自动生成)
-└── HN_printer.png       # 程序图标
+├── HN_printer.png       # 程序图标 (PNG)
+├── HN_printer.ico       # 程序图标 (ICO)
+├── HN打印工具.spec      # PyInstaller 打包配置 (Release)
+├── HN打印工具_debug.spec # PyInstaller 打包配置 (Debug/控制台)
+└── version_info.txt     # Windows 可执行文件版本信息
 ```
 
 ## 技术栈
