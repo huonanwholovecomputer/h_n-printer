@@ -140,9 +140,8 @@ def list_system_printers() -> list[str]:
 def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
     """
     解析用户输入的页码范围，返回 0-based 页码列表。
-    支持智能拆分，如 "23-4" → 页码 2 + 范围 3-4。
 
-    输入示例: "1-5", "1,3,5-7", "1-5、7、9"
+    输入示例: "1-5", "1,3,5-7", "1-5、7、9", "34-18"(自动交换顺序)
     """
     if not page_range or not page_range.strip():
         return list(range(total_pages))
@@ -160,20 +159,15 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
             try:
                 a, b = part.split("-", 1)
                 start, end = int(a), int(b)
+                if start > end:
+                    start, end = end, start   # 自动交换顺序，如 "34-18" → 18~34
                 if start < end:
                     for p in range(start, end + 1):
                         if 1 <= p <= total_pages:
                             pages.add(p - 1)
-                elif start > end and len(a) > 1:
-                    # 智能拆分: "23-4" → 页码 2 + 范围 3-4
-                    prefix = int(a[:-1])
-                    last = int(a[-1])
-                    if prefix < end:
-                        for p in range(last, end + 1):
-                            if 1 <= p <= total_pages:
-                                pages.add(p - 1)
-                        if 1 <= prefix <= total_pages:
-                            pages.add(prefix - 1)
+                elif start == end:
+                    if 1 <= start <= total_pages:
+                        pages.add(start - 1)
                 else:
                     skipped.append(part)
             except ValueError:
@@ -418,7 +412,7 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str):
         import win32print
         import win32con
 
-        duplex_map = {1: "单面 (DMDUP_SIMPLEX)", 2: "短边翻转 (DMDUP_HORIZONTAL)", 3: "长边翻转 (DMDUP_VERTICAL)"}
+        duplex_map = {1: "单面 (DMDUP_SIMPLEX)", 2: "长边翻转 (DMDUP_VERTICAL)", 3: "短边翻转 (DMDUP_HORIZONTAL)"}
 
         handle = win32print.OpenPrinter(printer_name)
         try:
@@ -426,9 +420,9 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str):
             old_duplex = devmode.Duplex
             if duplex == "on":
                 if duplex_mode == "short-edge":
-                    devmode.Duplex = 2   # DMDUP_HORIZONTAL
+                    devmode.Duplex = 3   # DMDUP_HORIZONTAL (短边翻转)
                 else:
-                    devmode.Duplex = 3   # DMDUP_VERTICAL (长边翻转)
+                    devmode.Duplex = 2   # DMDUP_VERTICAL (长边翻转)
             else:
                 devmode.Duplex = 1       # DMDUP_SIMPLEX
 
