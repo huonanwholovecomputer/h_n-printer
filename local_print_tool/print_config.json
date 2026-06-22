@@ -1,18 +1,9 @@
 {
   "printer_name": "HP LaserJet MFP M232-M237",
   "duplex_mode": "long-edge",
-  "keep_temp_pdf": true,
+  "keep_temp_pdf": false,
   "simplex_price": 0.2,
   "duplex_price": 0.3,
   "last_dir": "C:/Users/Administrator/Desktop",
-  "jobs": [
-    {
-      "file_path": "C:/Users/Administrator/Desktop/6.docx",
-      "copies": 2,
-      "duplex": "on",
-      "page_range": "",
-      "page_count": 1,
-      "orientation": "portrait"
-    }
-  ]
+  "jobs": []
 }

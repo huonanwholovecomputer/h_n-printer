@@ -94,6 +94,14 @@ QPushButton#btnStartPrint:disabled {
     color: #6c7086;
 }
 
+/* 计费明细展开按钮 — 竖窄条 */
+QPushButton#detailToggleBtn {
+    min-width: 20px;
+    max-width: 20px;
+    padding: 0;
+    font-size: 10px;
+}
+
 /* ---------- 表格 ---------- */
 QTableWidget {
     background-color: #181825;
@@ -126,6 +134,11 @@ QLineEdit {
 }
 QLineEdit:focus {
     border-color: #89b4fa;
+}
+QLineEdit[invalid="true"] {
+    background-color: #3A2025;
+    color: #E64553;
+    border: 1px solid #E64553;
 }
 QDoubleSpinBox {
     background-color: #313244;
