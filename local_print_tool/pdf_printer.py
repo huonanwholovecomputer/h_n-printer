@@ -199,6 +199,7 @@ def print_pdf(
     duplex: str = "on",
     duplex_mode: str = "long-edge",
     page_range: str = "",
+    orientation: str = "",
 ) -> tuple[bool, str]:
     """
     静默打印 PDF 文件。
@@ -210,6 +211,7 @@ def print_pdf(
         duplex: 'on' 开启双面, 'off' 关闭双面
         duplex_mode: 双面模式 'long-edge' | 'short-edge'
         page_range: 页码范围，如 "1-5"
+        orientation: 页面方向 "portrait" | "landscape" | "" (空=不强制)
 
     Returns:
         (success, message)
@@ -223,15 +225,17 @@ def print_pdf(
     duplex_label = f"{'双面' if duplex == 'on' else '单面'}"
     if duplex == "on":
         duplex_label += f"({ '短边翻转' if duplex_mode == 'short-edge' else '长边翻转' })"
+    orient_label = {"portrait": "竖向", "landscape": "横向"}.get(orientation, "")
     print(f"[打印] 文件: {os.path.basename(pdf_path)}")
-    print(f"[打印] 参数: {duplex_label} | {copies} 份 | 页码: '{page_range or '全部'}'")
+    print(f"[打印] 参数: {duplex_label} | {copies} 份 | 页码: '{page_range or '全部'}'" +
+          (f" | 方向: {orient_label}" if orient_label else ""))
     logger.info(f"开始打印: pdf={pdf_path}, printer={printer_name or '(默认)'}, "
-                f"duplex={duplex}/{duplex_mode}, copies={copies}, pages='{page_range}'")
+                f"duplex={duplex}/{duplex_mode}, copies={copies}, pages='{page_range}', orientation='{orientation}'")
 
     if system == "Windows":
         # 方案 1: Windows 原生 GDI 打印
         print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
-        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
         if ok:
             print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
@@ -242,14 +246,14 @@ def print_pdf(
         if sumatra:
             print(f"[打印] 方案2: 降级为 SumatraPDF ({sumatra})")
             logger.info(f"原生 GDI 失败，降级 SumatraPDF: {sumatra}")
-            ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+            ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
             print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
             return ok, msg
 
         # 方案 3: 应用层循环打印（最可靠兜底）
         print("[打印] 方案3: 应用层循环打印（兜底）...")
         logger.warning("原生和 SumatraPDF 均不可用，使用循环打印")
-        ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies)
+        ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
         print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
         return ok, msg
     else:
@@ -266,6 +270,7 @@ def _print_pdf_native(
     duplex_mode: str,
     page_range: str,
     copies: int = 1,
+    orientation: str = "",
 ) -> tuple[bool, str]:
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
@@ -297,9 +302,9 @@ def _print_pdf_native(
         print(f"[GDI] 目标打印机: {printer}")
         print(f"[GDI] PDF 共 {total_pages} 页，本次打印 {len(pages_to_print)} 页 × {copies} 份 = {len(pages_to_print) * copies} 面")
 
-        # -- 获取配置好双面的 DEVMODE --
+        # -- 获取配置好双面和方向的 DEVMODE --
         print(f"[GDI] 获取打印机 DEVMODE...")
-        devmode = _get_printer_devmode(printer, duplex, duplex_mode)
+        devmode = _get_printer_devmode(printer, duplex, duplex_mode, orientation)
 
         # -- 创建打印机 DC（有 DEVMODE 则通过 win32gui.ResetDC 应用）--
         hdc = win32ui.CreateDC()
@@ -396,9 +401,15 @@ def _print_pdf_native(
                 pass
 
 
-def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str):
+def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orientation: str = ""):
     """
     获取并配置打印机的 DEVMODE 结构。
+
+    Args:
+        printer_name: 打印机名称
+        duplex: 'on' | 'off'
+        duplex_mode: 'long-edge' | 'short-edge'
+        orientation: 'portrait' | 'landscape' | '' (空=使用默认)
 
     Returns:
         配置好的 PyDEVMODE 对象，失败返回 None。
@@ -408,10 +419,13 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str):
         import win32con
 
         duplex_map = {1: "单面 (DMDUP_SIMPLEX)", 2: "长边翻转 (DMDUP_VERTICAL)", 3: "短边翻转 (DMDUP_HORIZONTAL)"}
+        orient_map = {1: "纵向 (DMORIENT_PORTRAIT)", 2: "横向 (DMORIENT_LANDSCAPE)"}
 
         handle = win32print.OpenPrinter(printer_name)
         try:
             devmode = win32print.GetPrinter(handle, 2)["pDevMode"]
+
+            # -- 双面设置 --
             old_duplex = devmode.Duplex
             if duplex == "on":
                 if duplex_mode == "short-edge":
@@ -420,17 +434,31 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str):
                     devmode.Duplex = 2   # DMDUP_VERTICAL (长边翻转)
             else:
                 devmode.Duplex = 1       # DMDUP_SIMPLEX
-
             new_duplex = devmode.Duplex
+
+            # -- 方向设置 --
+            old_orient = getattr(devmode, 'Orientation', 0)
+            dm_flags = win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER
+            if orientation == "landscape":
+                devmode.Orientation = win32con.DMORIENT_LANDSCAPE  # 2
+                dm_flags |= win32con.DM_ORIENTATION
+            elif orientation == "portrait":
+                devmode.Orientation = win32con.DMORIENT_PORTRAIT   # 1
+                dm_flags |= win32con.DM_ORIENTATION
+            new_orient = getattr(devmode, 'Orientation', 0)
+
             print(f"[DEVMODE] 打印机: {printer_name}")
             print(f"[DEVMODE] 双面设置: {duplex_map.get(old_duplex, f'未知({old_duplex})')} → {duplex_map.get(new_duplex, f'未知({new_duplex})')}")
-            logger.info(f"DEVMODE: OpenPrinter={printer_name}, Duplex {old_duplex}→{new_duplex}")
+            if orientation:
+                print(f"[DEVMODE] 方向设置: {orient_map.get(old_orient, f'未知({old_orient})')} → {orient_map.get(new_orient, f'未知({new_orient})')}")
+            logger.info(f"DEVMODE: OpenPrinter={printer_name}, Duplex {old_duplex}→{new_duplex}, "
+                        f"Orientation {old_orient}→{new_orient} (orientation='{orientation}')")
 
             # DocumentProperties 验证/合并 DEVMODE
             result = win32print.DocumentProperties(
                 0, handle, printer_name,
                 devmode, devmode,
-                win32con.DM_IN_BUFFER | win32con.DM_OUT_BUFFER,
+                dm_flags,
             )
             logger.info(f"DEVMODE: DocumentProperties 返回 {result} (正数=成功)")
             if result <= 0:
@@ -482,8 +510,13 @@ def _print_via_sumatra(
     duplex_mode: str,
     page_range: str,
     copies: int = 1,
+    orientation: str = "",
 ) -> tuple[bool, str]:
-    """使用 SumatraPDF 命令行进行静默打印。"""
+    """使用 SumatraPDF 命令行进行静默打印。
+
+    SumatraPDF 会根据 PDF 内部元数据自动处理页面方向，无需显式指定。
+    orientation 参数仅用于日志记录。
+    """
     settings_parts: list[str] = []
 
     if copies > 1:
@@ -557,12 +590,13 @@ def _print_via_loop(
     duplex_mode: str,
     page_range: str,
     copies: int = 1,
+    orientation: str = "",
 ) -> tuple[bool, str]:
     """终极兜底：应用层循环打印，每次只打 1 份。成功率最高。"""
     print(f"[循环打印] 共 {copies} 份，每次 1 份...")
     for i in range(copies):
         print(f"[循环打印] 第 {i + 1}/{copies} 份...")
-        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, 1)
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, 1, orientation)
         if not ok:
             print(f"[循环打印] ✗ 第 {i + 1} 份失败: {msg}")
             return False, f"第 {i + 1}/{copies} 份打印失败: {msg}"

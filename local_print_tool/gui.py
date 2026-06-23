@@ -504,7 +504,8 @@ class PrintWorker(QThread):
 
                 # 3. 静默打印（份数由原生 API 一次性处理）
                 copies = max(1, job.copies)
-                self.log_message.emit(f"  → 正在打印 (份数:{copies}, 双面:{job.duplex})...")
+                orient_info = f", 方向:{job.orientation}" if job.orientation else ""
+                self.log_message.emit(f"  → 正在打印 (份数:{copies}, 双面:{job.duplex}{orient_info})...")
                 ok, msg = print_pdf(
                     pdf_path=print_path,
                     printer_name=self._printer_name,
@@ -512,6 +513,7 @@ class PrintWorker(QThread):
                     duplex=job.duplex,
                     duplex_mode=self._duplex_mode,
                     page_range=job.page_range,
+                    orientation=job.orientation,
                 )
                 if ok:
                     self.log_message.emit(f"  ✓ {msg}")

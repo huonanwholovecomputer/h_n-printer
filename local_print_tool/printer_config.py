@@ -127,8 +127,13 @@ def calc_cost(
         pairs = effective // 2      # 双面纸张数
         remainder = effective % 2   # 剩余单面纸张数
         if remainder == 0:
+            # 纯双面：全部可配对
             cost = pairs * duplex_price * copies
             formula = f"{pairs}张×{duplex_price:.2f}"
+        elif pairs == 0:
+            # 单页：无双面纸张，仅单面计费
+            cost = remainder * simplex_price * copies
+            formula = f"{remainder}张×{simplex_price:.2f}"
         else:
             cost = (pairs * duplex_price + remainder * simplex_price) * copies
             formula = f"{pairs}张×{duplex_price:.2f}+{remainder}张×{simplex_price:.2f}"

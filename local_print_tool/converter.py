@@ -214,7 +214,7 @@ def _convert_image_to_pdf(file_path: str, output_pdf: str) -> None:
     """图片 → PDF（reportlab，居中适应 A4）。"""
     from PIL import Image as PILImage
     from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import mm
 
     img = PILImage.open(file_path)
