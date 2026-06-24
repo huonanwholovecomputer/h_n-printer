@@ -300,7 +300,13 @@ def _print_pdf_native(
         logger.info(f"GDI 打印: 打印机={printer}, 总页数={total_pages}, "
                     f"待打页数={len(pages_to_print)}, 份数={copies}")
         print(f"[GDI] 目标打印机: {printer}")
-        print(f"[GDI] PDF 共 {total_pages} 页，本次打印 {len(pages_to_print)} 页 × {copies} 份 = {len(pages_to_print) * copies} 面")
+        # 预估总面数（如需要空白分隔页则后面再补）
+        est_sep = (copies - 1) if (duplex == "on" and copies > 1 and len(pages_to_print) % 2 == 1) else 0
+        est_sides = len(pages_to_print) * copies + est_sep
+        if est_sep:
+            print(f"[GDI] PDF 共 {total_pages} 页，本次打印 {len(pages_to_print)} 页 × {copies} 份 + {est_sep} 空白分隔页 = {est_sides} 面")
+        else:
+            print(f"[GDI] PDF 共 {total_pages} 页，本次打印 {len(pages_to_print)} 页 × {copies} 份 = {est_sides} 面")
 
         # -- 获取配置好双面和方向的 DEVMODE --
         print(f"[GDI] 获取打印机 DEVMODE...")
@@ -346,8 +352,15 @@ def _print_pdf_native(
 
         from PIL import Image, ImageWin
 
+        # 单数页 + 双面 + 多份 → 每份之间需插入空白页，确保副本独立
+        needs_separator = duplex == "on" and copies > 1 and len(pages_to_print) % 2 == 1
+        sep_count = (copies - 1) if needs_separator else 0
+        total_sides = len(pages_to_print) * copies + sep_count
+        if needs_separator:
+            logger.info(f"GDI: 奇数页({len(pages_to_print)}页)双面多份打印，将在副本间插入空白分隔页")
+            print(f"[GDI] ⚙ 奇数页({len(pages_to_print)}页) + 双面 + 多份({copies}份) → 副本间插入空白分隔页")
+
         page_seq = 0
-        total_sheets = len(pages_to_print) * copies
         for copy_idx in range(copies):
             for page_idx in pages_to_print:
                 page_seq += 1
@@ -369,12 +382,24 @@ def _print_pdf_native(
                 dib.draw(hdc.GetHandleOutput(), (x, y, x + pix.width, y + pix.height))
 
                 hdc.EndPage()
-                print(f"[GDI]   ✓ 第 {page_seq}/{total_sheets} 面 (PDF p.{page_idx + 1}, 第 {copy_idx + 1} 份)")
+                print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (PDF p.{page_idx + 1}, 第 {copy_idx + 1} 份)")
+
+            # 单数页双面多份：每份结束后插入空白页（最后一份除外）
+            if needs_separator and copy_idx < copies - 1:
+                page_seq += 1
+                hdc.StartPage()
+                blank_img = Image.new("RGB", (printable_w, printable_h), "white")
+                blank_dib = ImageWin.Dib(blank_img)
+                blank_dib.draw(hdc.GetHandleOutput(), (0, 0, printable_w, printable_h))
+                hdc.EndPage()
+                print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (副本分隔页)")
 
         hdc.EndDoc()
         started = False
         total_pages_printed = len(pages_to_print) * copies
         msg = f"打印成功 (GDI, {total_pages_printed} 面, {copies} 份)"
+        if needs_separator:
+            msg += f" [已插入 {sep_count} 张空白分隔页]"
         logger.info(f"GDI 打印完成: {msg}")
         return True, msg
 
@@ -516,7 +541,30 @@ def _print_via_sumatra(
 
     SumatraPDF 会根据 PDF 内部元数据自动处理页面方向，无需显式指定。
     orientation 参数仅用于日志记录。
+
+    当双面 + 多份 + 选中页数为单数时，自动改为逐份打印（copies=1），
+    确保每份副本从新纸张开始，不会出现跨份共页的问题。
     """
+    # 单数页 + 双面 + 多份 → 逐份打印，确保副本独立
+    if duplex == "on" and copies > 1:
+        info = get_pdf_info(pdf_path)
+        total_pages = info["page_count"]
+        if total_pages > 0:
+            pages_to_print = _parse_page_range(page_range, total_pages)
+            if len(pages_to_print) % 2 == 1:
+                print(f"[SumatraPDF] ⚙ 奇数页({len(pages_to_print)}页) + 双面 + 多份({copies}份) → 逐份打印确保副本独立")
+                logger.info(f"SumatraPDF: 奇数页双面多份，改为逐份打印")
+                for i in range(copies):
+                    print(f"[SumatraPDF] 第 {i + 1}/{copies} 份...")
+                    ok, msg = _print_via_sumatra(
+                        sumatra_path, pdf_path, printer_name,
+                        duplex, duplex_mode, page_range, 1, orientation,
+                    )
+                    if not ok:
+                        return False, f"第 {i + 1}/{copies} 份失败: {msg}"
+                    print(f"[SumatraPDF] ✓ 第 {i + 1} 份完成")
+                return True, f"SumatraPDF 逐份打印完成 ({copies} 份)"
+
     settings_parts: list[str] = []
 
     if copies > 1:
