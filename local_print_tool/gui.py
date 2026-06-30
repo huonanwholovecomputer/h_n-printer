@@ -467,7 +467,7 @@ class PrintWorker(QThread):
         self.log_message.emit("[取消] 用户取消了打印任务")
 
     def run(self):
-        """线程主函数。"""
+        """线程主函数：统一 PDF 打印流程（GDI 优先）。"""
         self._converter = get_converter()
         total = len(self._jobs)
         success_count = 0
@@ -485,33 +485,39 @@ class PrintWorker(QThread):
             self.progress.emit(idx, total, f"正在处理: {file_name}")
             self.log_message.emit(f"[{idx + 1}/{total}] {file_name}")
 
+            ext = os.path.splitext(job.file_path)[1].lower()
+            copies = max(1, job.copies)
+            orient_info = f", 方向:{job.orientation}" if job.orientation else ""
             temp_pdf: Optional[str] = None
+
             try:
-                # 1. 检查文件是否存在
                 if not os.path.isfile(job.file_path):
                     raise FileNotFoundError(f"文件不存在: {job.file_path}")
 
-                # 2. 如果不是 PDF，转换为 PDF
-                ext = os.path.splitext(job.file_path)[1].lower()
+                # 1. 确定打印用的 PDF 路径
                 if ext == ".pdf":
                     print_path = job.file_path
                     self.log_message.emit(f"  → 已是 PDF，跳过转换")
+                elif job.cached_pdf and os.path.isfile(job.cached_pdf):
+                    print_path = job.cached_pdf
+                    self.log_message.emit(f"  → 使用缓存的 PDF")
                 else:
                     self.log_message.emit(f"  → 正在转换为 PDF...")
                     temp_pdf = self._converter.convert(job.file_path)
                     print_path = temp_pdf
                     self.log_message.emit(f"  → 转换完成: {os.path.basename(temp_pdf)}")
 
-                # 3. 静默打印（份数由原生 API 一次性处理）
-                copies = max(1, job.copies)
-                orient_info = f", 方向:{job.orientation}" if job.orientation else ""
-                self.log_message.emit(f"  → 正在打印 (份数:{copies}, 双面:{job.duplex}{orient_info})...")
+                # 2. 打印 PDF
+                self.log_message.emit(
+                    f"  → 正在打印 (份数:{copies}, 双面:{job.duplex}{orient_info})..."
+                )
+                dm = job.duplex_mode or self._duplex_mode
                 ok, msg = print_pdf(
                     pdf_path=print_path,
                     printer_name=self._printer_name,
                     copies=copies,
                     duplex=job.duplex,
-                    duplex_mode=self._duplex_mode,
+                    duplex_mode=dm,
                     page_range=job.page_range,
                     orientation=job.orientation,
                 )
@@ -530,7 +536,7 @@ class PrintWorker(QThread):
                 self.job_finished.emit(idx, False, str(e))
 
             finally:
-                # 4. 清理临时 PDF（如需要则先复制到桌面供人工核对）
+                # 3. 清理临时 PDF（缓存的 PDF 不删，下次打印复用）
                 if temp_pdf and os.path.isfile(temp_pdf):
                     if self._keep_temp_pdf:
                         original_base = os.path.splitext(os.path.basename(job.file_path))[0]
@@ -542,7 +548,6 @@ class PrintWorker(QThread):
                             self.log_message.emit(f"  → 转换副本已保存到桌面: {dest_name}")
                         except OSError as e:
                             self.log_message.emit(f"  → 保存转换副本到桌面失败: {e}")
-                    # 无论是否保留副本，TEMP 中的临时文件始终清理
                     try:
                         os.remove(temp_pdf)
                     except OSError as e:
@@ -553,6 +558,59 @@ class PrintWorker(QThread):
         self.log_message.emit(
             f"========== 打印完毕：成功 {success_count}，失败 {fail_count} =========="
         )
+
+
+class ConvertWorker(QThread):
+    """
+    后台线程：将 Word 文件转为 PDF。
+    不阻塞 UI，转换完成后通过信号返回结果。
+    """
+    finished = Signal(int, str, int, str)  # (row, cached_pdf, page_count, orientation)
+
+    def __init__(self, row: int, file_path: str, engine: str):
+        super().__init__()
+        self._row = row
+        self._file_path = file_path
+        self._engine = engine
+
+    def run(self):
+        import tempfile
+        from converter import _convert_via_word_com, _convert_via_wps_com, get_converter
+        from pdf_printer import get_pdf_info
+
+        temp_pdf: str | None = None
+        try:
+            ext = os.path.splitext(self._file_path)[1].lower()
+            if ext in (".doc", ".docx") and self._engine != "libreoffice":
+                fd, temp_pdf = tempfile.mkstemp(suffix=".pdf", prefix="_conv_")
+                os.close(fd)
+                if self._engine == "wps":
+                    _convert_via_wps_com(self._file_path, temp_pdf)
+                else:
+                    _convert_via_word_com(self._file_path, temp_pdf)
+            else:
+                converter = get_converter()
+                temp_pdf = converter.convert(self._file_path)
+        except Exception:
+            # Word/WPS 引擎失败，降级到 LibreOffice
+            if ext in (".doc", ".docx") and self._engine != "libreoffice":
+                try:
+                    if temp_pdf and os.path.isfile(temp_pdf):
+                        os.remove(temp_pdf)
+                except OSError:
+                    pass
+                try:
+                    converter = get_converter()
+                    temp_pdf = converter.convert(self._file_path)
+                except Exception:
+                    self.finished.emit(self._row, "", 0, "")
+                    return
+            else:
+                self.finished.emit(self._row, "", 0, "")
+                return
+
+        info = get_pdf_info(temp_pdf)
+        self.finished.emit(self._row, temp_pdf, info["page_count"], info["orientation"])
 
 
 # ============================================================
@@ -608,7 +666,8 @@ class MainWindow(QMainWindow):
     COL_RANGE = 3
     COL_PAGES = 4
     COL_ORIENT = 5
-    COL_COST = 6
+    COL_ENGINE = 6
+    COL_COST = 7
 
     def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
         super().__init__()
@@ -742,7 +801,7 @@ class MainWindow(QMainWindow):
             menu.addAction(action)
 
     def _setup_top_bar(self, root: QVBoxLayout):
-        """顶部：打印机选择 + 双面模式 + 保留 PDF 选项。"""
+        """顶部：打印机选择 + 保留 PDF 选项。"""
         layout = QHBoxLayout()
 
         layout.addWidget(QLabel("打印机:"))
@@ -758,14 +817,6 @@ class MainWindow(QMainWindow):
         btn_refresh.setFixedSize(36, 36)
         btn_refresh.clicked.connect(self._on_refresh_printers)
         layout.addWidget(btn_refresh)
-
-        layout.addWidget(QLabel("双面模式:"))
-
-        self._duplex_combo = QComboBox()
-        self._duplex_combo.addItems(["long-edge (长边翻转)", "short-edge (短边翻转)"])
-        self._duplex_combo.setCurrentIndex(0)
-        _disable_combo_wheel(self._duplex_combo)
-        layout.addWidget(self._duplex_combo)
 
         layout.addWidget(QLabel("保存转换副本到桌面:"))
 
@@ -812,8 +863,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
 
         self._table = DropTableWidget()
-        self._table.setColumnCount(7)
-        self._table.setHorizontalHeaderLabels(["文件名", "份数", "单/双面", "页码范围", "页数", "方向", "费用"])
+        self._table.setColumnCount(8)
+        self._table.setHorizontalHeaderLabels(["文件名", "份数", "单/双面", "页码范围", "页数", "方向", "引擎", "费用"])
         self._table.filesDropped.connect(self._on_files_dropped)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -829,6 +880,7 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(self.COL_RANGE, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_PAGES, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_ORIENT, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(self.COL_ENGINE, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(self.COL_COST, QHeaderView.ResizeToContents)
 
         # 选中行变化 → 右侧编辑面板同步
@@ -854,6 +906,7 @@ class MainWindow(QMainWindow):
         self._copy_total_timer.setSingleShot(True)
         self._copy_total_timer.timeout.connect(self._reset_copy_button)
         total_row.addWidget(self._copy_total_btn)
+        self._convert_workers: list[ConvertWorker] = []
         # 复制计费明细按钮（默认隐藏，由 ⏷ 控制）
         self._copy_detail_btn = QPushButton("📋 复制计费明细")
         self._copy_detail_btn.setVisible(False)
@@ -916,6 +969,15 @@ class MainWindow(QMainWindow):
         self._edit_duplex.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_duplex)
 
+        # 双面模式（仅双面时可用）
+        label_duplex_mode = QLabel("双面模式:")
+        gl.addWidget(label_duplex_mode)
+        self._edit_duplex_mode = QComboBox()
+        self._edit_duplex_mode.addItems(["长边翻转", "短边翻转"])
+        _disable_combo_wheel(self._edit_duplex_mode)
+        self._edit_duplex_mode.currentIndexChanged.connect(self._auto_apply_edit)
+        gl.addWidget(self._edit_duplex_mode)
+
         # 页码范围
         label_range = QLabel("页码范围:")
         gl.addWidget(label_range)
@@ -923,13 +985,26 @@ class MainWindow(QMainWindow):
         self._edit_page_range.rangesChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_page_range)
 
+        # 打印引擎
+        self._label_engine = QLabel("PDF转换引擎:")
+        gl.addWidget(self._label_engine)
+        self._edit_engine = QComboBox()
+        self._edit_engine.addItems(["Word", "WPS", "LibreOffice"])
+        _disable_combo_wheel(self._edit_engine)
+        self._edit_engine.currentIndexChanged.connect(self._auto_apply_edit)
+        gl.addWidget(self._edit_engine)
+        # 灰度不可用引擎（延迟到窗口显示后，避免阻塞启动）
+        QTimer.singleShot(0, self._refresh_engine_availability)
+
         gl.addStretch()
 
         # 统一管理：无选中任务时全部禁用
         self._edit_widgets = [
             label_copies, self._edit_copies,
             label_duplex, self._edit_duplex,
+            label_duplex_mode, self._edit_duplex_mode,
             label_range, self._edit_page_range,
+            self._label_engine, self._edit_engine,
         ]
         for w in self._edit_widgets:
             w.setEnabled(False)
@@ -973,12 +1048,6 @@ class MainWindow(QMainWindow):
         self._refresh_printer_list()
         self._printer_combo.setCurrentText(self._config.printer_name)
 
-        dm = self._config.duplex_mode
-        if dm == "short-edge":
-            self._duplex_combo.setCurrentIndex(1)
-        else:
-            self._duplex_combo.setCurrentIndex(0)
-
         self._keep_temp_check.setCurrentIndex(1 if self._config.keep_temp_pdf else 0)
         self._rebuild_table()
 
@@ -1015,12 +1084,6 @@ class MainWindow(QMainWindow):
         printer_data = self._printer_combo.currentData()
         self._config.printer_name = printer_data if printer_data else ""
 
-        idx = self._duplex_combo.currentIndex()
-        if idx == 1:
-            self._config.duplex_mode = "short-edge"
-        else:
-            self._config.duplex_mode = "long-edge"
-
         self._config.keep_temp_pdf = (self._keep_temp_check.currentIndex() == 1)
 
         self._config.simplex_price = self._simplex_price_spin.value()
@@ -1050,7 +1113,12 @@ class MainWindow(QMainWindow):
         copies_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_COPIES, copies_item)
 
-        duplex_item = QTableWidgetItem("双面" if job.duplex == "on" else "单面")
+        if job.duplex == "on":
+            dm = "长边" if job.duplex_mode != "short-edge" else "短边"
+            duplex_text = f"双面({dm})"
+        else:
+            duplex_text = "单面"
+        duplex_item = QTableWidgetItem(duplex_text)
         duplex_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_DUPLEX, duplex_item)
 
@@ -1071,6 +1139,19 @@ class MainWindow(QMainWindow):
         ori_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_ORIENT, ori_item)
 
+        # 打印引擎（仅 Word 文件显示；非 Word 文件显示 "—"）
+        ext = os.path.splitext(job.file_path)[1].lower()
+        is_word_file = ext in (".doc", ".docx")
+        eng_labels = {"word": "Word", "wps": "WPS", "libreoffice": "LibreOffice"}
+        eng_text = eng_labels.get(job.engine, "Word") if is_word_file else "—"
+        eng_item = QTableWidgetItem(eng_text)
+        eng_item.setTextAlignment(Qt.AlignCenter)
+        if not is_word_file:
+            eng_item.setToolTip("仅 Word 文档(.doc/.docx)支持选择转换引擎")
+        else:
+            eng_item.setToolTip("Word: Microsoft Word | WPS: WPS Office | LibreOffice: 兜底")
+        self._table.setItem(row, self.COL_ENGINE, eng_item)
+
         # 费用
         cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
                                   self._config.simplex_price, self._config.duplex_price,
@@ -1088,6 +1169,74 @@ class MainWindow(QMainWindow):
         self._table.setItem(row, self.COL_COST, cost_item)
 
         self._update_total_cost()
+
+    def _on_convert_finished(self, row: int, cached_pdf: str, page_count: int, orientation: str):
+        """后台 PDF 转换完成 → 更新表格和缓存。"""
+        if row >= self._table.rowCount():
+            return
+        if not cached_pdf:
+            self._table.item(row, self.COL_PAGES).setText("?")
+            return
+        # 清理该行旧的缓存 PDF
+        if row < len(self._config.jobs):
+            old_pdf = self._config.jobs[row].cached_pdf
+            if old_pdf and os.path.isfile(old_pdf) and old_pdf != cached_pdf:
+                try:
+                    os.remove(old_pdf)
+                except OSError:
+                    pass
+            self._config.jobs[row].cached_pdf = cached_pdf
+            self._config.jobs[row].page_count = page_count
+            self._config.jobs[row].orientation = orientation
+        self._table.item(row, self.COL_PAGES).setText(str(page_count))
+        ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+        self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
+        self._recalc_row_cost(row)
+        self._update_total_cost()
+
+    def _start_convert_worker(self, row: int, file_path: str, engine: str):
+        """启动后台 PDF 转换线程。"""
+        # 取消该行之前的转换 worker
+        self._convert_workers = [w for w in self._convert_workers if w.isRunning()]
+        for w in self._convert_workers:
+            if w._row == row:
+                w.finished.disconnect()
+                w.wait(100)
+        worker = ConvertWorker(row, file_path, engine)
+        worker.finished.connect(self._on_convert_finished)
+        self._convert_workers.append(worker)
+        worker.start()
+
+    def _resolve_engine(self, job: PrintJob) -> str:
+        """
+        返回最终使用的引擎名。
+        非 Word 文件固定使用 LibreOffice；
+        Word 文件使用 job.engine（已在拖入时自动检测好，或用户手动选择）。
+        """
+        ext = os.path.splitext(job.file_path)[1].lower()
+        if ext not in (".doc", ".docx"):
+            return "libreoffice"
+        return job.engine
+
+    def _refresh_engine_availability(self):
+        """查询引擎可用性，灰度不可用的下拉选项。"""
+        from converter import get_available_engines
+        available = get_available_engines()
+        eng_to_idx = {"word": 0, "wps": 1, "libreoffice": 2}
+        model = self._edit_engine.model()
+        for eng, idx in eng_to_idx.items():
+            if model and idx < model.rowCount():
+                item = model.item(idx)
+                if item:
+                    item.setEnabled(available.get(eng, False))
+                    if not available.get(eng, False):
+                        item.setToolTip(f"{eng.upper()} 未安装，不可用")
+
+    def _check_word_engine_available(self) -> bool:
+        """检查是否至少有一个 Word 引擎可用（用于阻止无引擎打印）。"""
+        from converter import get_available_engines
+        available = get_available_engines()
+        return available.get("word", False) or available.get("wps", False) or available.get("libreoffice", False)
 
     def _update_total_cost(self):
         """重新计算并更新合计费用标签。"""
@@ -1206,6 +1355,10 @@ class MainWindow(QMainWindow):
             copies = int(self._table.item(row, self.COL_COPIES).text())
             duplex_text = self._table.item(row, self.COL_DUPLEX).text()
             duplex = "on" if "双" in duplex_text else "off"
+            # 从 "双面(长边)" / "双面(短边)" 中解析双面模式
+            duplex_mode = ""
+            if duplex == "on":
+                duplex_mode = "short-edge" if "短边" in duplex_text else "long-edge"
             page_range = self._table.item(row, self.COL_RANGE).text()
             if page_range == "全部":
                 page_range = ""
@@ -1214,15 +1367,22 @@ class MainWindow(QMainWindow):
             ori_map = {"竖": "portrait", "横": "landscape", "混": "mixed"}
             ori_text = self._table.item(row, self.COL_ORIENT).text()
             orientation = ori_map.get(ori_text, "")
+            # 读取引擎（静态文本列）
+            engine_text = self._table.item(row, self.COL_ENGINE).text() if self._table.item(row, self.COL_ENGINE) else ""
+            eng_rev = {"Word": "word", "WPS": "wps", "LibreOffice": "libreoffice"}
+            engine = eng_rev.get(engine_text, "word")
             jobs.append(PrintJob(file_path=file_path, copies=copies, duplex=duplex,
+                                 duplex_mode=duplex_mode,
                                  page_range=page_range, page_count=page_count,
-                                 orientation=orientation))
+                                 orientation=orientation, engine=engine))
         self._config.jobs = jobs
 
     # ---- 事件处理 ----
 
     def _on_table_selection(self):
         """表格选中行变化 → 右侧编辑面板同步。"""
+        if getattr(self, '_loading_files', False):
+            return
         rows = self._table.selectionModel().selectedRows()
         if not rows:
             self._selected_file_label.setText("(未选中任务)")
@@ -1250,11 +1410,28 @@ class MainWindow(QMainWindow):
         self._edit_duplex.blockSignals(True)
         self._edit_duplex.setCurrentIndex(0 if "双" in duplex_text else 1)
         self._edit_duplex.blockSignals(False)
+        # 双面模式
+        is_duplex = "双" in duplex_text
+        self._edit_duplex_mode.setEnabled(is_duplex)
+        self._edit_duplex_mode.blockSignals(True)
+        self._edit_duplex_mode.setCurrentIndex(0 if "长边" in duplex_text else 1)
+        self._edit_duplex_mode.blockSignals(False)
         # 设置总页数用于范围校验
         pages_text = self._table.item(row, self.COL_PAGES).text()
         total_pages = int(pages_text) if pages_text.isdigit() else 0
         self._edit_page_range.set_total_pages(total_pages)
         self._edit_page_range.set_ranges("" if page_range == "全部" else page_range)
+        # 同步引擎
+        eng_text = self._table.item(row, self.COL_ENGINE).text() if self._table.item(row, self.COL_ENGINE) else "Word"
+        eng_map = {"Word": 0, "WPS": 1, "LibreOffice": 2}
+        self._edit_engine.blockSignals(True)
+        self._edit_engine.setCurrentIndex(eng_map.get(eng_text, 0))
+        self._edit_engine.blockSignals(False)
+        # PDF / 图片文件不需要转换，引擎不可用
+        ext = os.path.splitext(file_path)[1].lower()
+        is_convertible = ext in (".doc", ".docx")
+        self._label_engine.setEnabled(is_convertible)
+        self._edit_engine.setEnabled(is_convertible)
 
     def _on_table_double_click(self, row: int, col: int):
         """双击表格行 → 用系统默认程序打开文件。"""
@@ -1281,14 +1458,43 @@ class MainWindow(QMainWindow):
 
     def _auto_apply_edit(self):
         """编辑面板参数变更 → 即时写回选中行。"""
+        # 文件加载期间不处理（避免 processEvents 递归触发）
+        if getattr(self, '_loading_files', False):
+            return
         rows = self._table.selectionModel().selectedRows()
         if not rows:
             return
         row = rows[0].row()
         self._table.item(row, self.COL_COPIES).setText(str(self._edit_copies.value()))
-        self._table.item(row, self.COL_DUPLEX).setText("双面" if self._edit_duplex.currentIndex() == 0 else "单面")
+        # 双面 + 双面模式合并显示
+        if self._edit_duplex.currentIndex() == 0:
+            dm_text = "长边" if self._edit_duplex_mode.currentIndex() == 0 else "短边"
+            self._table.item(row, self.COL_DUPLEX).setText(f"双面({dm_text})")
+        else:
+            self._table.item(row, self.COL_DUPLEX).setText("单面")
+        # 双面模式仅双面时启用
+        is_duplex = self._edit_duplex.currentIndex() == 0
+        self._edit_duplex_mode.setEnabled(is_duplex)
         page_range = self._edit_page_range.get_ranges()
         self._table.item(row, self.COL_RANGE).setText(page_range if page_range else "全部")
+        # 引擎
+        eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
+        eng_labels = {"word": "Word", "wps": "WPS", "libreoffice": "LibreOffice"}
+        engine = eng_map.get(self._edit_engine.currentIndex(), "word")
+        self._table.item(row, self.COL_ENGINE).setText(eng_labels.get(engine, "Word"))
+        if row < len(self._config.jobs):
+            old_engine = self._config.jobs[row].engine
+            self._config.jobs[row].engine = engine
+            self._config.jobs[row].duplex = "on" if is_duplex else "off"
+            dm_map = {0: "long-edge", 1: "short-edge"}
+            self._config.jobs[row].duplex_mode = dm_map.get(self._edit_duplex_mode.currentIndex(), "long-edge")
+            # 引擎变更时重新转换 PDF
+            if engine != old_engine:
+                job = self._config.jobs[row]
+                ext = os.path.splitext(job.file_path)[1].lower()
+                if ext in (".doc", ".docx"):
+                    self._table.item(row, self.COL_PAGES).setText("...")
+                    self._start_convert_worker(row, job.file_path, job.engine)
 
         self._recalc_row_cost(row)
         self._update_total_cost()
@@ -1327,8 +1533,6 @@ class MainWindow(QMainWindow):
 
     def __add_files_to_table_impl(self, files: list[str]):
         """_add_files_to_table 的内部实现（由重入保护包装）。"""
-        converter = get_converter()
-        converted = 0
         allowed_types = {
             ".pdf",
             ".doc", ".docx",
@@ -1336,7 +1540,6 @@ class MainWindow(QMainWindow):
             ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
         }
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        # 记录添加前的行数，避免重复转换已有文件
         start_row = self._table.rowCount()
 
         blocked = 0
@@ -1357,21 +1560,42 @@ class MainWindow(QMainWindow):
                 info = get_pdf_info(f)
                 page_count = info["page_count"]
                 orientation = info["orientation"]
-            elif ext in (".docx", ".doc"):
+            elif ext == ".docx":
                 orientation = get_docx_orientation(f)
+            elif ext == ".doc":
+                # .doc 不支持 python-docx，方向在转 PDF 后获取
+                orientation = ""
             elif ext in image_exts:
                 info = get_image_info(f)
                 page_count = info["page_count"]
                 orientation = info["orientation"]
 
-            job = PrintJob(file_path=f, copies=1, duplex="on", page_range="",
-                           page_count=page_count, orientation=orientation)
+            # 根据元数据自动选择引擎；不可用时按 Word→WPS→LibreOffice 降级
+            engine = "word"
+            if ext in (".doc", ".docx"):
+                from converter import _read_docx_last_editor, get_available_engines
+                available = get_available_engines()
+                editor = _read_docx_last_editor(f) if ext == ".docx" else None
+                preferred = "wps" if editor == "wps" else "word"
+                fallback_order = ["word", "wps", "libreoffice"]
+                if preferred in fallback_order:
+                    fallback_order.remove(preferred)
+                    fallback_order.insert(0, preferred)
+                for eng in fallback_order:
+                    if available.get(eng, False):
+                        engine = eng
+                        break
+
+            duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
+            job = PrintJob(file_path=f, copies=1, duplex="on",
+                           duplex_mode=duplex_mode, page_range="",
+                           page_count=page_count, orientation=orientation, engine=engine)
             self._config.jobs.append(job)
             self._add_table_row(job)
 
         self._log(f"已添加 {len(files)} 个文件")
 
-        # 仅对新添加的非 PDF/非图片文件转为临时 PDF 以统计页数
+        # ── 转换为 PDF 并统计页数（Word 文件用指定引擎）──
         for row in range(start_row, self._table.rowCount()):
             file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
             ext = os.path.splitext(file_path)[1].lower()
@@ -1379,34 +1603,12 @@ class MainWindow(QMainWindow):
                 continue
 
             self._table.item(row, self.COL_PAGES).setText("...")
-            QApplication.processEvents()
 
-            temp_pdf: str | None = None
-            try:
-                temp_pdf = converter.convert(file_path)
-                info = get_pdf_info(temp_pdf)
-                page_count = info["page_count"]
-                orientation = info["orientation"]
-
-                self._table.item(row, self.COL_PAGES).setText(str(page_count))
-                ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
-                self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
-                self._recalc_row_cost(row)
-
-                converted += 1
-            except Exception as e:
-                self._table.item(row, self.COL_PAGES).setText("?")
-                logger.warning(f"预转换失败 ({os.path.basename(file_path)}): {e}")
-            finally:
-                if temp_pdf and os.path.isfile(temp_pdf):
-                    try:
-                        os.remove(temp_pdf)
-                    except OSError as e:
-                        logger.warning(f"无法删除临时 PDF ({temp_pdf}): {e}")
+            # 后台线程转换 PDF
+            job = self._config.jobs[row]
+            self._start_convert_worker(row, job.file_path, job.engine)
 
         self._update_total_cost()
-        if converted > 0:
-            self._log(f"已预转换 {converted} 个文件以统计页数")
 
         if blocked > 0:
             names = "\n".join(f"  • {n}" for n in blocked_names[:5])
@@ -1470,6 +1672,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先添加要打印的文件。")
             return
 
+        # 打印开始 — 所有行变绿
+        fg = QColor("#6b9e6b")
+        for row in range(self._table.rowCount()):
+            for col in range(self._table.columnCount()):
+                item = self._table.item(row, col)
+                if item:
+                    item.setForeground(fg)
+        self._table.viewport().update()
+
         # 检查页码范围有效性
         if hasattr(self._edit_page_range, 'is_valid') and not self._edit_page_range.is_valid():
             QMessageBox.warning(self, "页码范围错误",
@@ -1507,13 +1718,8 @@ class MainWindow(QMainWindow):
         self._status_label.setText(status)
 
     def _on_job_finished(self, idx: int, success: bool, message: str):
-        """单个任务完成回调：更新表格行颜色。"""
-        if idx < self._table.rowCount():
-            fg = QColor("#6b9e6b") if success else QColor("#c96b6b")
-            for col in range(7):
-                item = self._table.item(idx, col)
-                if item:
-                    item.setForeground(fg)
+        """单个任务完成回调（颜色已在打印开始时统一设绿）。"""
+        pass
 
     def _on_all_finished(self, success_count: int, fail_count: int):
         """全部任务完成。"""

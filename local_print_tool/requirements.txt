@@ -17,19 +17,25 @@ python-docx>=1.0
 # 需要单独安装的外部程序（下载安装后加入系统 PATH）
 # ============================================================
 #
-# 1. LibreOffice — Office 文档转 PDF 的核心引擎
+# 1. Microsoft Word 或 WPS Office（强烈推荐）— Word 文档转 PDF 的最佳方案
+#    程序会按  Word → WPS → LibreOffice 优先级自动降级选择。
+#    Windows 默认路径:
+#      Word:  C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE
+#      WPS:   C:\Program Files\WPS Office\wps.exe
+#
+# 2. LibreOffice — Office 文档转 PDF 的兜底引擎（Word/WPS 均不可用时使用）
 #    下载: https://www.libreoffice.org/download/
 #    默认路径:
 #      Windows: C:\Program Files\LibreOffice\program\soffice.exe
 #      Linux:   /usr/bin/soffice
 #      macOS:   /Applications/LibreOffice.app/Contents/MacOS/soffice
 #
-# 2. wkhtmltopdf — HTML / Markdown 转 PDF
+# 3. wkhtmltopdf — HTML / Markdown 转 PDF
 #    下载: https://wkhtmltopdf.org/downloads.html
 #    默认路径:
 #      Windows: C:\Program Files\wkhtmltopdf\bin\wkhtmltopdf.exe
 #
-# 3. SumatraPDF — Windows 静默打印 PDF（强烈推荐）
+# 4. SumatraPDF — Windows 静默打印 PDF（强烈推荐）
 #    下载: https://www.sumatrapdfreader.org/download-free-pdf-viewer
 #    绿色版可直接放入本工具目录，或加入 PATH。
 #    默认搜索路径:

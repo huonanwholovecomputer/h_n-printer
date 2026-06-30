@@ -185,16 +185,29 @@ def main():
             f"程序可能部分功能无法使用。"
         )
 
-    # 检查外部工具（非阻塞提示，仅日志记录）
-    _check_external_tools(logger)
-
     # 配置路径
     config_path = os.path.join(script_dir, "print_config.json")
 
-    # 启动主窗口
+    # 启动主窗口（UI 优先显示，其他检查放入后台）
     from gui import MainWindow
     window = MainWindow(config_path=config_path, theme_manager=theme_manager)
     window.show()
+
+    # 后台：外部工具检测（日志记录，不阻塞 UI）
+    _check_external_tools(logger)
+
+    # 后台：预热 Word COM + WPS COM
+    from converter import start_word_warmup, stop_word_warmup, start_wps_warmup, stop_wps_warmup
+    start_word_warmup()
+    start_wps_warmup()
+
+    # 后台：刷新引擎可用性（灰度 UI 下拉框）
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(500, window._refresh_engine_availability)
+
+    # 应用退出时清理预热实例
+    app.aboutToQuit.connect(stop_word_warmup)
+    app.aboutToQuit.connect(stop_wps_warmup)
 
     logger.info("HN 本地打印工具已启动")
     sys.exit(app.exec())

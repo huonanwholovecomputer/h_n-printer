@@ -15,10 +15,181 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# 多引擎转换缓存
+# ============================================================
+
+# 引擎可用性缓存 (None=未检测, True=可用, False=不可用)
+_engine_cache: dict[str, bool | None] = {
+    "word": None,
+    "wps": None,
+}
+
+# WPS COM ProgID 缓存 (检测到可用时记录)
+_wps_progid: str | None = None
+
+# Word COM 后台预热
+_warm_word_thread: threading.Thread | None = None
+_warm_word_running = False
+
+
+def start_word_warmup() -> None:
+    """
+    后台线程预热 Word COM — 启动 WINWORD.EXE 并保持存活。
+    后续所有 COM Dispatch 不再冷启动，显著加速页数统计和打印。
+    """
+    global _warm_word_thread, _warm_word_running
+    if _warm_word_running:
+        return
+
+    _warm_word_running = True
+
+    def _warm_worker() -> None:
+        global _warm_word_running
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        try:
+            word = win32com.client.dynamic.Dispatch("Word.Application")
+            word.Visible = False
+            try:
+                word.DisplayAlerts = 0
+            except Exception:
+                pass
+            logger.info("Word COM 已预热（后台常驻）")
+
+            # 保持存活，等待外部信号
+            while _warm_word_running:
+                time.sleep(1)
+
+            try:
+                word.Quit()
+            except Exception:
+                pass
+            logger.info("Word COM 预热进程已退出")
+        except Exception as e:
+            logger.warning(f"Word COM 预热失败（系统可能未安装 Word）: {e}")
+            _warm_word_running = False
+        finally:
+            pythoncom.CoUninitialize()
+
+    _warm_word_thread = threading.Thread(
+        target=_warm_worker, daemon=True, name="word-warmup"
+    )
+    _warm_word_thread.start()
+
+
+def stop_word_warmup() -> None:
+    """停止 Word COM 预热实例。"""
+    global _warm_word_running
+    _warm_word_running = False
+
+
+# WPS COM 后台预热
+_warm_wps_thread: threading.Thread | None = None
+_warm_wps_running = False
+
+
+def start_wps_warmup() -> None:
+    """后台线程预热 WPS COM — 启动 wps.exe 并保持存活。"""
+    global _warm_wps_thread, _warm_wps_running
+    if _warm_wps_running:
+        return
+
+    _warm_wps_running = True
+
+    def _warm_worker() -> None:
+        global _warm_wps_running
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        try:
+            # 先检测 WPS ProgID
+            for pid in ["WPS.Application", "KWPS.Application"]:
+                try:
+                    wps = win32com.client.dynamic.Dispatch(pid)
+                    global _wps_progid
+                    _wps_progid = pid
+                    break
+                except Exception:
+                    continue
+            else:
+                raise RuntimeError("WPS COM ProgID 未注册")
+
+            wps.Visible = False
+            try:
+                wps.DisplayAlerts = 0
+            except Exception:
+                pass
+            logger.info(f"WPS COM 已预热（后台常驻, ProgID={_wps_progid}）")
+
+            while _warm_wps_running:
+                time.sleep(1)
+
+            try:
+                wps.Quit()
+            except Exception:
+                pass
+            logger.info("WPS COM 预热进程已退出")
+        except Exception as e:
+            logger.warning(f"WPS COM 预热失败（系统可能未安装 WPS）: {e}")
+            _warm_wps_running = False
+        finally:
+            pythoncom.CoUninitialize()
+
+    _warm_wps_thread = threading.Thread(
+        target=_warm_worker, daemon=True, name="wps-warmup"
+    )
+    _warm_wps_thread.start()
+
+
+def stop_wps_warmup() -> None:
+    """停止 WPS COM 预热实例。"""
+    global _warm_wps_running
+    _warm_wps_running = False
+
+
+def _safe_word_dispatch():
+    """
+    获取 Word COM 实例。
+    有预热时复用预热进程（瞬间连接），无预热时正常 Dispatch。
+    配合 _copy_to_temp() 使用——COM 操作副本文件，不干扰用户原文件。
+    """
+    import win32com.client
+    return win32com.client.dynamic.Dispatch("Word.Application")
+
+
+def get_available_engines() -> dict[str, bool]:
+    """
+    检测本机可用的 Word 打印引擎。
+
+    有预热时直接认定 Word 可用（避免主线程冷启动 Dispatch）；
+    无预热时才通过 _detect_word() 检测。
+    """
+    return {
+        "word": _warm_word_running or _detect_word(),
+        "wps": _warm_wps_running or _detect_wps(),
+        "libreoffice": _find_libreoffice() is not None,
+    }
+
+
+def _copy_to_temp(file_path: str) -> str:
+    """将文件复制到临时目录，返回临时路径。用于 COM 安全操作。"""
+    ext = os.path.splitext(file_path)[1]
+    fd, temp_path = tempfile.mkstemp(suffix=ext, prefix="_word_")
+    os.close(fd)
+    shutil.copy2(file_path, temp_path)
+    logger.debug(f"已复制到临时文件: {os.path.basename(temp_path)}")
+    return temp_path
 
 
 # ============================================================
@@ -78,6 +249,517 @@ def _find_wkhtmltopdf() -> str | None:
             "/usr/local/bin/wkhtmltopdf",
         ]
     return _find_executable("wkhtmltopdf", candidates)
+
+
+# ============================================================
+# Office 引擎检测 (Word / WPS)
+# ============================================================
+
+def _detect_word() -> bool:
+    """
+    检测 Microsoft Word 是否可用。
+    先快速检查 EXE 文件，再通过 COM Dispatch 确认，结果缓存。
+    """
+    global _engine_cache
+    if _engine_cache["word"] is not None:
+        return _engine_cache["word"]
+
+    # Step 1: 快速文件检测
+    exe_found = False
+    word_candidates = [
+        os.path.expandvars(r"%ProgramFiles%\Microsoft Office\root\Office16\WINWORD.EXE"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft Office\root\Office16\WINWORD.EXE"),
+        r"C:\Program Files\Microsoft Office\Office16\WINWORD.EXE",
+        r"C:\Program Files (x86)\Microsoft Office\Office16\WINWORD.EXE",
+        # Office 365 / Click-to-Run 路径
+        os.path.expandvars(r"%ProgramFiles%\Microsoft Office\root\Office15\WINWORD.EXE"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft Office\root\Office15\WINWORD.EXE"),
+    ]
+    for p in word_candidates:
+        if os.path.isfile(p):
+            exe_found = True
+            break
+    if not exe_found and shutil.which("WINWORD.EXE"):
+        exe_found = True
+
+    if not exe_found:
+        logger.info("未检测到 Microsoft Word (WINWORD.EXE)")
+        _engine_cache["word"] = False
+        return False
+
+    # Step 2: COM Dispatch 确认（有预热时不杀进程）
+    try:
+        import win32com.client
+        word = win32com.client.dynamic.Dispatch("Word.Application")
+        if not _warm_word_running:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        _engine_cache["word"] = True
+        logger.info("✓ 检测到 Microsoft Word (COM 可用)")
+        return True
+    except Exception as e:
+        logger.warning(f"检测到 WINWORD.EXE 但 COM 调用失败: {e}")
+        _engine_cache["word"] = False
+        return False
+
+
+def _detect_wps() -> bool:
+    """
+    检测 WPS Office 是否可用。
+    先搜索 wps.exe，再尝试多种 ProgID COM Dispatch，结果缓存。
+    """
+    global _engine_cache, _wps_progid
+    if _engine_cache["wps"] is not None:
+        return _engine_cache["wps"]
+
+    # Step 1: 搜索 wps.exe
+    exe_found = False
+    wps_candidates = [
+        os.path.expandvars(r"%LocalAppData%\Kingsoft\WPS Office\wps.exe"),
+        os.path.expandvars(r"%ProgramFiles%\WPS Office\wps.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\WPS Office\wps.exe"),
+        r"C:\Program Files\WPS Office\wps.exe",
+        r"C:\Program Files (x86)\WPS Office\wps.exe",
+    ]
+
+    for p in wps_candidates:
+        if os.path.isfile(p):
+            exe_found = True
+            break
+
+    # 在 WPS 目录树中搜索（WPS 路径常带版本号）
+    if not exe_found:
+        search_bases = []
+        for base in [
+            os.path.expandvars(r"%ProgramFiles%\WPS Office"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\WPS Office"),
+            os.path.expandvars(r"%LocalAppData%\Kingsoft\WPS Office"),
+        ]:
+            if os.path.isdir(base):
+                search_bases.append(base)
+        for base in search_bases:
+            try:
+                for root, dirs, files in os.walk(base):
+                    if "wps.exe" in files:
+                        exe_found = True
+                        logger.info(f"搜索到 WPS: {os.path.join(root, 'wps.exe')}")
+                        break
+            except (PermissionError, OSError):
+                continue
+            if exe_found:
+                break
+
+    if not exe_found and shutil.which("wps.exe"):
+        exe_found = True
+
+    if not exe_found:
+        logger.info("未检测到 WPS Office (wps.exe)")
+        _engine_cache["wps"] = False
+        return False
+
+    # Step 2: COM Dispatch 确认（尝试不同 ProgID）
+    try:
+        import win32com.client
+        for prog_id in ["WPS.Application", "KWPS.Application"]:
+            try:
+                wps = win32com.client.dynamic.Dispatch(prog_id)
+                try:
+                    wps.Quit()
+                except Exception:
+                    pass
+                _engine_cache["wps"] = True
+                _wps_progid = prog_id
+                logger.info(f"✓ 检测到 WPS Office (ProgID={prog_id})")
+                return True
+            except Exception:
+                continue
+        logger.warning("检测到 wps.exe 但所有 ProgID COM 调用均失败")
+        _engine_cache["wps"] = False
+        return False
+    except Exception as e:
+        logger.warning(f"WPS COM 检测异常: {e}")
+        _engine_cache["wps"] = False
+        return False
+
+
+# ============================================================
+# Office COM 转换器 (Word / WPS)
+# ============================================================
+
+def _convert_via_word_com(file_path: str, output_pdf: str) -> None:
+    """
+    使用 Microsoft Word COM 将 .doc/.docx 文档转为 PDF。
+    布局保真度最高 — 使用 Word 自身渲染引擎。
+    操作临时副本，不干扰原文件。
+    """
+    import pythoncom
+    import win32com.client
+
+    abs_output = os.path.abspath(output_pdf)
+    temp_input = _copy_to_temp(file_path)
+
+    logger.info(f"Word COM: 开始转换 {os.path.basename(file_path)}")
+
+    # COM 线程初始化（仅在首次初始化时才 CoUninitialize）
+    com_init = pythoncom.CoInitialize()
+
+    word = None
+    doc = None
+    try:
+        word = _safe_word_dispatch()
+        word.Visible = False
+        # 兼容不同 Word 版本的 DisplayAlerts 属性名
+        try:
+            word.DisplayAlerts = 0  # wdAlertsNone
+        except Exception:
+            pass
+
+        # wdOpenFormat = 自动检测, ReadOnly=True 避免修改原文件
+        doc = word.Documents.Open(os.path.abspath(temp_input), ReadOnly=True)
+
+        # ExportFormat=17 = wdExportFormatPDF
+        doc.ExportAsFixedFormat(abs_output, ExportFormat=17)
+
+        # wdDoNotSaveChanges = 0
+        doc.Close(SaveChanges=0)
+        doc = None
+
+        if not _warm_word_running:
+            word.Quit()
+        word = None
+
+        logger.info(f"Word COM → PDF 完成: {output_pdf}")
+    except Exception as e:
+        logger.error(f"Word COM 转换失败: {e}")
+        raise RuntimeError(f"Microsoft Word 转换失败: {e}") from e
+    finally:
+        # 确保 COM 资源释放
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                if not _warm_word_running:
+                    word.Quit()
+            except Exception:
+                pass
+        # 仅当我们是首次初始化 COM 时才反初始化
+        if com_init is None:
+            pythoncom.CoUninitialize()
+        if os.path.isfile(temp_input):
+            try:
+                os.remove(temp_input)
+            except OSError:
+                pass
+
+
+def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
+    """
+    使用 WPS Office COM 将 .doc/.docx 文档转为 PDF。
+    对中文文档排版兼容性好。
+    """
+    global _wps_progid
+    import pythoncom
+    import win32com.client
+
+    abs_input = os.path.abspath(file_path)
+    abs_output = os.path.abspath(output_pdf)
+
+    # 复用检测阶段缓存的 ProgID
+    prog_id = _wps_progid
+
+    logger.info(f"WPS COM: 开始转换 {os.path.basename(file_path)} (ProgID={prog_id})")
+
+    com_init = pythoncom.CoInitialize()
+
+    wps = None
+    doc = None
+    try:
+        wps = win32com.client.dynamic.Dispatch(prog_id)
+        wps.Visible = False
+        try:
+            wps.DisplayAlerts = 0
+        except Exception:
+            pass
+
+        doc = wps.Documents.Open(abs_input, ReadOnly=True)
+
+        # WPS 兼容 Word ExportFormat 常量 (17 = PDF)
+        doc.ExportAsFixedFormat(abs_output, ExportFormat=17)
+
+        doc.Close(SaveChanges=0)
+        doc = None
+
+        wps.Quit()
+        wps = None
+
+        logger.info(f"WPS COM → PDF 完成: {output_pdf}")
+    except Exception as e:
+        logger.error(f"WPS COM 转换失败: {e}")
+        raise RuntimeError(f"WPS Office 转换失败: {e}") from e
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+        if wps is not None:
+            try:
+                wps.Quit()
+            except Exception:
+                pass
+        if com_init is None:
+            pythoncom.CoUninitialize()
+
+
+# ============================================================
+# .docx 元数据检测
+# ============================================================
+
+def _read_docx_last_editor(file_path: str) -> str | None:
+    """
+    读取 .docx 文档最后编辑者。
+    从 ZIP 内部 docProps/app.xml 的 <Application> 标签获取。
+
+    Returns:
+        "wps"  — 最后被 WPS 编辑
+        "word" — 最后被 Microsoft Word 编辑
+        None   — 无法判断（标签缺失、非 .docx 文件、读取失败）
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext != ".docx":
+        return None
+
+    try:
+        import zipfile
+        import xml.etree.ElementTree as ET
+
+        with zipfile.ZipFile(file_path, 'r') as z:
+            if 'docProps/app.xml' not in z.namelist():
+                return None
+            with z.open('docProps/app.xml') as f:
+                ns = '{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}'
+                tree = ET.parse(f)
+                app = tree.find(f'{ns}Application')
+                if app is None or not app.text:
+                    return None
+                text = app.text.upper()
+                if "WPS" in text:
+                    return "wps"
+                if "MICROSOFT" in text or "WORD" in text:
+                    return "word"
+        return None
+    except Exception:
+        return None
+
+
+# ============================================================
+# COM 快速页数获取 (Word / WPS ComputeStatistics + 批量)
+# ============================================================
+
+def _get_com_page_counts_batch(
+    file_paths: list[str],
+    prefer_engine: str = "word",
+) -> dict[str, int]:
+    """
+    一次 COM 会话批量获取多个 Word 文件的页数。
+    比逐个调用 _get_word_page_count() 快 N 倍（只启动一次 COM 进程）。
+
+    Args:
+        file_paths: Word 文件路径列表
+        prefer_engine: 首选引擎 "word" | "wps"
+
+    Returns:
+        {file_path: page_count}，失败的条目不会出现在结果中
+    """
+    if not file_paths:
+        return {}
+
+    results: dict[str, int] = {}
+
+    def _batch_via_engine(prog_id: str, label: str) -> list[str]:
+        """用指定引擎批量处理，返回未成功的文件列表。"""
+        import pythoncom
+        import win32com.client
+
+        remaining: list[str] = []
+        com_init = pythoncom.CoInitialize()
+
+        app = None
+        try:
+            if prog_id == "Word.Application":
+                app = _safe_word_dispatch()
+            else:
+                app = win32com.client.dynamic.Dispatch(prog_id)
+            app.Visible = False
+            try:
+                app.DisplayAlerts = 0
+            except Exception:
+                pass
+
+            for fp in file_paths:
+                doc = None
+                temp_fp: str | None = None
+                try:
+                    # 复制到临时文件，避免文件锁冲突
+                    temp_fp = _copy_to_temp(fp)
+                    doc = app.Documents.Open(os.path.abspath(temp_fp), ReadOnly=True)
+                    results[fp] = int(doc.ComputeStatistics(2))  # 2 = wdStatisticPages
+                    doc.Close(SaveChanges=0)
+                    doc = None
+                    logger.info(f"{label} 页数: {os.path.basename(fp)} → {results[fp]} 页")
+                except Exception as e:
+                    logger.warning(f"{label} 页数获取失败 ({os.path.basename(fp)}): {e}")
+                    remaining.append(fp)
+                    if doc is not None:
+                        try:
+                            doc.Close(SaveChanges=0)
+                        except Exception:
+                            pass
+                finally:
+                    if temp_fp and os.path.isfile(temp_fp):
+                        try:
+                            os.remove(temp_fp)
+                        except OSError:
+                            pass
+
+            # 不要杀预热线程维持的 Word 进程
+            if not _warm_word_running or "Word" not in label:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            app = None
+        except Exception as e:
+            logger.warning(f"{label} 批量页数初始化失败: {e}")
+            remaining = list(file_paths)
+        finally:
+            if app is not None:
+                if not _warm_word_running or "Word" not in label:
+                    try:
+                        app.Quit()
+                    except Exception:
+                        pass
+            if com_init is None:
+                pythoncom.CoUninitialize()
+
+        return remaining
+
+    # 首选引擎
+    first_choice = prefer_engine
+    if first_choice == "word":
+        remaining = _batch_via_engine("Word.Application", "Word")
+        if remaining:
+            _batch_via_engine(_wps_progid or "WPS.Application", "WPS")
+    elif first_choice == "wps":
+        remaining = _batch_via_engine(_wps_progid or "WPS.Application", "WPS")
+        if remaining:
+            _batch_via_engine("Word.Application", "Word")
+
+    return results
+
+
+def _get_word_page_count(file_path: str) -> int:
+    """
+    使用 Microsoft Word COM ComputeStatistics 快速获取页数。
+    不生成 PDF，秒级响应。操作临时副本，不干扰原文件。
+    """
+    import pythoncom
+    import win32com.client
+
+    temp_fp = _copy_to_temp(file_path)
+    com_init = pythoncom.CoInitialize()
+    word = None
+    doc = None
+    try:
+        word = _safe_word_dispatch()
+        word.Visible = False
+        try:
+            word.DisplayAlerts = 0
+        except Exception:
+            pass
+
+        doc = word.Documents.Open(os.path.abspath(temp_fp), ReadOnly=True)
+        # 2 = wdStatisticPages
+        page_count = doc.ComputeStatistics(2)
+        doc.Close(SaveChanges=0)
+        doc = None
+        if not _warm_word_running:
+            word.Quit()
+        word = None
+
+        logger.info(f"Word COM 页数: {os.path.basename(file_path)} → {page_count} 页")
+        return int(page_count)
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                if not _warm_word_running:
+                    word.Quit()
+            except Exception:
+                pass
+        if com_init is None:
+            pythoncom.CoUninitialize()
+        if os.path.isfile(temp_fp):
+            try:
+                os.remove(temp_fp)
+            except OSError:
+                pass
+
+
+def _get_wps_page_count(file_path: str) -> int:
+    """
+    使用 WPS Office COM ComputeStatistics 快速获取页数。
+    """
+    global _wps_progid
+    import pythoncom
+    import win32com.client
+
+    abs_input = os.path.abspath(file_path)
+    prog_id = _wps_progid
+
+    com_init = pythoncom.CoInitialize()
+    wps = None
+    doc = None
+    try:
+        wps = win32com.client.dynamic.Dispatch(prog_id)
+        wps.Visible = False
+        try:
+            wps.DisplayAlerts = 0
+        except Exception:
+            pass
+
+        doc = wps.Documents.Open(abs_input, ReadOnly=True)
+        # 2 = wdStatisticPages (WPS 兼容此常量)
+        page_count = doc.ComputeStatistics(2)
+        doc.Close(SaveChanges=0)
+        doc = None
+        wps.Quit()
+        wps = None
+
+        logger.info(f"WPS COM 页数: {os.path.basename(file_path)} → {page_count} 页")
+        return int(page_count)
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=0)
+            except Exception:
+                pass
+        if wps is not None:
+            try:
+                wps.Quit()
+            except Exception:
+                pass
+        if com_init is None:
+            pythoncom.CoUninitialize()
 
 
 # ============================================================
@@ -324,6 +1006,47 @@ def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
 
 def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
     """
+    Office 文档 → PDF（多引擎智能降级）。
+
+    Word 文档 (.doc/.docx):
+      1. Microsoft Word COM  →  最佳布局保真度
+      2. WPS Office COM      →  中文排版兼容性好
+      3. LibreOffice 无头模式 →  兜底
+
+    其他 Office 格式 (.xls/.xlsx/.ppt/.pptx):
+      → LibreOffice 无头模式
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+
+    # Word 文档：多引擎降级
+    if ext in (".doc", ".docx"):
+        # ── 引擎 1: Microsoft Word ──
+        if _detect_word():
+            try:
+                logger.info(f"引擎选择: Microsoft Word COM ({os.path.basename(file_path)})")
+                _convert_via_word_com(file_path, output_pdf)
+                return
+            except Exception as e:
+                logger.warning(f"Microsoft Word 转换失败，降级到下一引擎: {e}")
+
+        # ── 引擎 2: WPS Office ──
+        if _detect_wps():
+            try:
+                logger.info(f"引擎选择: WPS Office COM ({os.path.basename(file_path)})")
+                _convert_via_wps_com(file_path, output_pdf)
+                return
+            except Exception as e:
+                logger.warning(f"WPS Office 转换失败，降级到下一引擎: {e}")
+
+        # ── 引擎 3: LibreOffice ──
+        logger.info(f"引擎选择: LibreOffice (降级) ({os.path.basename(file_path)})")
+
+    # 其他 Office 格式 / Word 文档最终降级
+    _convert_office_via_libreoffice(file_path, output_pdf)
+
+
+def _convert_office_via_libreoffice(file_path: str, output_pdf: str) -> None:
+    """
     Office 文档 → PDF（LibreOffice 无头模式）。
     支持 .doc / .docx / .xls / .xlsx / .ppt / .pptx
     """
@@ -376,7 +1099,7 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
             os.remove(output_pdf)
         shutil.move(generated_pdf, output_pdf)
 
-    logger.info(f"Office → PDF 完成: {output_pdf}")
+    logger.info(f"LibreOffice → PDF 完成: {output_pdf}")
 
 
 # ============================================================

@@ -20,15 +20,21 @@ class PrintJob:
     page_range: str = ""     # 页码范围字符串，如 "1-5" 或 "1,3,5-7"
     page_count: int = 0      # 总页数，0 表示未知（非 PDF 文件）
     orientation: str = ""    # "portrait" | "landscape" | "mixed" | ""
+    engine: str = "word"     # "word" | "wps" | "libreoffice"
+    duplex_mode: str = ""    # "long-edge" | "short-edge" | "" (空=按方向自动)
+    cached_pdf: str = ""     # 引擎转换后的 PDF 缓存路径
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "file_path": self.file_path,
             "copies": self.copies,
             "duplex": self.duplex,
+            "duplex_mode": self.duplex_mode,
             "page_range": self.page_range,
             "page_count": self.page_count,
             "orientation": self.orientation,
+            "engine": self.engine,
+            # cached_pdf 不持久化，每次启动重新生成
         }
 
     @classmethod
@@ -37,9 +43,11 @@ class PrintJob:
             file_path=data.get("file_path", ""),
             copies=int(data.get("copies", 1)),
             duplex=data.get("duplex", "on"),
+            duplex_mode=data.get("duplex_mode", ""),
             page_range=data.get("page_range", ""),
             page_count=int(data.get("page_count", 0)),
             orientation=data.get("orientation", ""),
+            engine=data.get("engine", "word"),
         )
 
 
@@ -144,7 +152,7 @@ def calc_cost(
         cost = effective * simplex_price * copies
         formula = f"{effective}张×{simplex_price:.2f}"
         if copies > 1:
-            formula += f"×{copies}份"
+            formula = f"({formula})×{copies}份"
     return cost, formula
 
 
@@ -163,7 +171,9 @@ class PrinterConfig:
           "file_path": "C:/docs/report.docx",
           "copies": 2,
           "duplex": "on",
-          "page_range": "1-5"
+          "duplex_mode": "long-edge",
+          "page_range": "1-5",
+          "engine": "word"
         }
       ]
     }
