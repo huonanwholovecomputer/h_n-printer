@@ -29,6 +29,9 @@ build/
 ~$*.docx
 ~$*.xlsx
 
+# 发布构建产物
+local_print_tool/Release/
+
 # 系统文件
 Thumbs.db
 Desktop.ini
