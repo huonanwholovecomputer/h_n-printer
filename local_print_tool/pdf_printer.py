@@ -228,6 +228,7 @@ def print_pdf(
     page_range: str = "",
     orientation: str = "",
     progress_callback: Callable[[int, int], None] | None = None,
+    dpi: int = 0,
 ) -> tuple[bool, str]:
     """
     静默打印 PDF 文件。
@@ -241,6 +242,7 @@ def print_pdf(
         page_range: 页码范围，如 "1-5"
         orientation: 页面方向 "portrait" | "landscape" | "" (空=不强制)
         progress_callback: 进度回调 (current, total)，每打印一面调用一次
+        dpi: 渲染 DPI，0=使用打印机原生 DPI
 
     Returns:
         (success, message)
@@ -264,7 +266,7 @@ def print_pdf(
     if system == "Windows":
         # 方案 1: Windows 原生 GDI 打印（驱动级双面/份数控制，最可靠）
         print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
-        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback)
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback, dpi)
         if ok:
             print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
@@ -284,7 +286,7 @@ def print_pdf(
 
         # 方案 3: 应用层循环打印（最可靠兜底）
         print("[打印] 方案3: 应用层循环打印（兜底）...")
-        ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback)
+        ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback, dpi)
         print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
         return ok, msg
     else:
@@ -303,10 +305,12 @@ def _print_pdf_native(
     copies: int = 1,
     orientation: str = "",
     progress_callback: Callable[[int, int], None] | None = None,
+    dpi: int = 0,
 ) -> tuple[bool, str]:
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
     progress_callback: 每完成一面的 EndPage 后调用 (current_side, total_sides)
+    dpi: 渲染 DPI，0=使用打印机原生 DPI
     """
     import fitz
 
@@ -371,12 +375,19 @@ def _print_pdf_native(
             logger.warning("GDI: 未能获取 DEVMODE，双面设置可能不生效")
 
         # 获取打印机可打印区域和分辨率
-        dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
-        dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
+        native_dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
+        native_dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
+        # 使用指定 DPI 或打印机原生 DPI
+        dpi_x = dpi if dpi > 0 else native_dpi_x
+        dpi_y = dpi if dpi > 0 else native_dpi_y
         printable_w = hdc.GetDeviceCaps(win32con.HORZRES)
         printable_h = hdc.GetDeviceCaps(win32con.VERTRES)
-        logger.info(f"GDI: DPI=({dpi_x},{dpi_y}), 可打印区域=({printable_w},{printable_h})")
-        print(f"[GDI] 分辨率: {dpi_x}×{dpi_y} DPI, 可打印区域: {printable_w}×{printable_h}")
+        if dpi > 0:
+            logger.info(f"GDI: DPI=({dpi_x},{dpi_y}) [指定], 原生=({native_dpi_x},{native_dpi_y}), 可打印区域=({printable_w},{printable_h})")
+            print(f"[GDI] 分辨率: {dpi_x}×{dpi_y} DPI (指定, 原生{native_dpi_x}×{native_dpi_y}), 可打印区域: {printable_w}×{printable_h}")
+        else:
+            logger.info(f"GDI: DPI=({dpi_x},{dpi_y}), 可打印区域=({printable_w},{printable_h})")
+            print(f"[GDI] 分辨率: {dpi_x}×{dpi_y} DPI, 可打印区域: {printable_w}×{printable_h}")
 
         title = os.path.basename(pdf_path)
         hdc.StartDoc(title)
@@ -683,12 +694,13 @@ def _print_via_loop(
     copies: int = 1,
     orientation: str = "",
     progress_callback: Callable[[int, int], None] | None = None,
+    dpi: int = 0,
 ) -> tuple[bool, str]:
     """终极兜底：应用层循环打印，每次只打 1 份。成功率最高。"""
     print(f"[循环打印] 共 {copies} 份，每次 1 份...")
     for i in range(copies):
         print(f"[循环打印] 第 {i + 1}/{copies} 份...")
-        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, 1, orientation, progress_callback)
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, 1, orientation, progress_callback, dpi)
         if not ok:
             print(f"[循环打印] ✗ 第 {i + 1} 份失败: {msg}")
             return False, f"第 {i + 1}/{copies} 份打印失败: {msg}"

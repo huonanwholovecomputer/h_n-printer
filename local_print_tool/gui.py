@@ -74,7 +74,7 @@ def _disable_combo_wheel(combo: QComboBox) -> None:
     combo.installEventFilter(_WheelBlocker(combo))
 
 
-def _truncate_filename(filename: str, max_width: int = 26) -> str:
+def _truncate_filename(filename: str, max_width: int = 52) -> str:
     """截断文件名到指定显示宽度（中文=2单位，ASCII=1单位）。
 
     格式: base[...][.ext]，超出部分用三个点替代。
@@ -493,6 +493,7 @@ class PrintWorker(QThread):
         printer_name: str,
         duplex_mode: str,
         keep_temp_pdf: bool,
+        render_dpi: int = 400,
         parent=None,
     ):
         super().__init__(parent)
@@ -500,6 +501,7 @@ class PrintWorker(QThread):
         self._printer_name = printer_name
         self._duplex_mode = duplex_mode
         self._keep_temp_pdf = keep_temp_pdf
+        self._render_dpi = render_dpi
         self._converter: Optional[UniversalConverter] = None
         self._cancelled = False
 
@@ -575,6 +577,7 @@ class PrintWorker(QThread):
                     f"  → 正在打印 (份数:{copies}, 双面:{job.duplex}{orient_info})..."
                 )
                 dm = job.duplex_mode or self._duplex_mode
+                effective_dpi = job.dpi if job.dpi > 0 else self._render_dpi
                 ok, msg = print_pdf(
                     pdf_path=print_path,
                     printer_name=self._printer_name,
@@ -584,6 +587,7 @@ class PrintWorker(QThread):
                     page_range=job.page_range,
                     orientation=job.orientation,
                     progress_callback=_make_progress_callback(offset_sides, total_sides),
+                    dpi=effective_dpi,
                 )
                 if ok:
                     self.log_message.emit(f"  ✓ {msg}")
@@ -916,6 +920,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._duplex_price_spin)
         layout.addWidget(QLabel("元/张"))
 
+        layout.addWidget(QLabel(" 渲染:"))
+
+        self._render_dpi_combo = QComboBox()
+        self._render_dpi_combo.addItems(["高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
+        _disable_combo_wheel(self._render_dpi_combo)
+        self._render_dpi_combo.setToolTip("全局默认渲染质量，DPI越高越清晰但越慢")
+        self._render_dpi_combo.currentIndexChanged.connect(self._on_render_dpi_changed)
+        layout.addWidget(self._render_dpi_combo)
+
         root.addLayout(layout)
 
     def _setup_file_table(self) -> QWidget:
@@ -1062,6 +1075,15 @@ class MainWindow(QMainWindow):
         # 灰度不可用引擎（延迟到窗口显示后，避免阻塞启动）
         QTimer.singleShot(0, self._refresh_engine_availability)
 
+        # 渲染质量（逐文件）
+        label_dpi = QLabel("渲染质量:")
+        gl.addWidget(label_dpi)
+        self._edit_dpi = QComboBox()
+        self._edit_dpi.addItems(["跟随全局(默认)", "高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
+        _disable_combo_wheel(self._edit_dpi)
+        self._edit_dpi.currentIndexChanged.connect(self._auto_apply_edit)
+        gl.addWidget(self._edit_dpi)
+
         gl.addStretch()
 
         # 统一管理：无选中任务时全部禁用
@@ -1071,6 +1093,7 @@ class MainWindow(QMainWindow):
             label_duplex_mode, self._edit_duplex_mode,
             label_range, self._edit_page_range,
             self._label_engine, self._edit_engine,
+            label_dpi, self._edit_dpi,
         ]
         for w in self._edit_widgets:
             w.setEnabled(False)
@@ -1121,6 +1144,11 @@ class MainWindow(QMainWindow):
         self._printer_combo.setCurrentText(self._config.printer_name)
 
         self._keep_temp_check.setCurrentIndex(1 if self._config.keep_temp_pdf else 0)
+
+        # 全局渲染 DPI
+        dpi_map = {200: 0, 300: 1, 400: 2, 600: 3}
+        self._render_dpi_combo.setCurrentIndex(dpi_map.get(self._config.render_dpi, 2))
+
         self._rebuild_table()
 
     def _refresh_printer_list(self):
@@ -1151,6 +1179,12 @@ class MainWindow(QMainWindow):
             self._recalc_row_cost(row)
         self._update_total_cost()
 
+    def _on_render_dpi_changed(self):
+        """全局渲染 DPI 变更。"""
+        dpi_values = [200, 300, 400, 600]
+        idx = self._render_dpi_combo.currentIndex()
+        self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
+
     def _sync_ui_to_config(self):
         """将 UI 控件数据同步回配置对象。"""
         printer_data = self._printer_combo.currentData()
@@ -1160,6 +1194,10 @@ class MainWindow(QMainWindow):
 
         self._config.simplex_price = self._simplex_price_spin.value()
         self._config.duplex_price = self._duplex_price_spin.value()
+
+        dpi_values = [200, 300, 400, 600]
+        idx = self._render_dpi_combo.currentIndex()
+        self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
 
         self._config.last_dir = self._last_dir
 
@@ -1255,7 +1293,7 @@ class MainWindow(QMainWindow):
         self._update_total_cost()
 
     def _on_convert_finished(self, row: int, cached_pdf: str, page_count: int, orientation: str):
-        """后台 PDF 转换完成 → 更新表格和缓存。"""
+        """后台 PDF 转换完成 → 更新表格、缓存、按需保存副本到桌面。"""
         if row >= self._table.rowCount():
             return
         if not cached_pdf:
@@ -1277,6 +1315,21 @@ class MainWindow(QMainWindow):
         self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
         self._recalc_row_cost(row)
         self._update_total_cost()
+
+        # 转换完成后立刻保存副本到桌面（而非等到打印完成）
+        if self._config.keep_temp_pdf and cached_pdf and os.path.isfile(cached_pdf):
+            file_path = ""
+            if row < len(self._config.jobs):
+                file_path = self._config.jobs[row].file_path
+            original_base = os.path.splitext(os.path.basename(file_path))[0] if file_path else "document"
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            dest_name = f"[转换]{original_base}.pdf"
+            dest_path = os.path.join(desktop, dest_name)
+            try:
+                shutil.copy2(cached_pdf, dest_path)
+                self._log(f"  → 转换副本已保存到桌面: {dest_name}")
+            except OSError as e:
+                self._log(f"  → 保存转换副本到桌面失败: {e}")
 
     def _start_convert_worker(self, row: int, file_path: str, engine: str):
         """启动后台 PDF 转换线程。"""
@@ -1487,10 +1540,13 @@ class MainWindow(QMainWindow):
             engine_text = self._table.item(row, self.COL_ENGINE).text() if self._table.item(row, self.COL_ENGINE) else ""
             eng_rev = {"Word": "word", "WPS": "wps", "LibreOffice": "libreoffice"}
             engine = eng_rev.get(engine_text, "word")
+            # DPI 不在表格中，从 config.jobs 保留
+            job_dpi = self._config.jobs[row].dpi if row < len(self._config.jobs) else 0
             jobs.append(PrintJob(file_path=file_path, copies=copies, duplex=duplex,
                                  duplex_mode=duplex_mode,
                                  page_range=page_range, page_count=page_count,
-                                 orientation=orientation, engine=engine))
+                                 orientation=orientation, engine=engine,
+                                 dpi=job_dpi))
         self._config.jobs = jobs
 
     # ---- 事件处理 ----
@@ -1554,6 +1610,14 @@ class MainWindow(QMainWindow):
         self._edit_duplex.setEnabled(not is_image)
         self._edit_duplex_mode.setEnabled(not is_image and is_duplex)
         self._edit_page_range.setEnabled(not is_image)
+        # 同步渲染 DPI
+        job_dpi = 0
+        if row < len(self._config.jobs):
+            job_dpi = self._config.jobs[row].dpi
+        dpi_map = {0: 0, 200: 1, 300: 2, 400: 3, 600: 4}
+        self._edit_dpi.blockSignals(True)
+        self._edit_dpi.setCurrentIndex(dpi_map.get(job_dpi, 0))
+        self._edit_dpi.blockSignals(False)
 
     def _on_table_double_click(self, row: int, col: int):
         """双击表格行 → 用系统默认程序打开文件。"""
@@ -1623,6 +1687,10 @@ class MainWindow(QMainWindow):
             self._config.jobs[row].duplex = "on" if is_duplex else "off"
             dm_map = {0: "long-edge", 1: "short-edge"}
             self._config.jobs[row].duplex_mode = dm_map.get(self._edit_duplex_mode.currentIndex(), "long-edge")
+            # 渲染 DPI
+            dpi_values = [0, 200, 300, 400, 600]
+            idx = self._edit_dpi.currentIndex()
+            self._config.jobs[row].dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 0
             # 引擎变更时重新转换 PDF
             if engine != old_engine:
                 job = self._config.jobs[row]
@@ -1806,6 +1874,7 @@ class MainWindow(QMainWindow):
         self._table.setRowCount(0)
         self._config.jobs.clear()
         self._update_total_cost()
+        self._progress_bar.reset()
         self._log("已清空任务列表（5秒内可撤回）")
 
         # 按钮变为撤回样式（琥珀色醒目样式）
@@ -1900,6 +1969,7 @@ class MainWindow(QMainWindow):
             printer_name=self._config.printer_name,
             duplex_mode=self._config.duplex_mode,
             keep_temp_pdf=self._config.keep_temp_pdf,
+            render_dpi=self._config.render_dpi,
         )
         worker.progress.connect(self._on_progress)
         worker.log_message.connect(self._log)
