@@ -23,6 +23,7 @@ class PrintJob:
     engine: str = "word"     # "word" | "wps" | "libreoffice"
     duplex_mode: str = ""    # "long-edge" | "short-edge" | "" (空=按方向自动)
     cached_pdf: str = ""     # 引擎转换后的 PDF 缓存路径
+    dpi: int = 0             # 渲染 DPI，0=跟随全局默认
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +35,7 @@ class PrintJob:
             "page_count": self.page_count,
             "orientation": self.orientation,
             "engine": self.engine,
+            "dpi": self.dpi,
             # cached_pdf 不持久化，每次启动重新生成
         }
 
@@ -48,6 +50,7 @@ class PrintJob:
             page_count=int(data.get("page_count", 0)),
             orientation=data.get("orientation", ""),
             engine=data.get("engine", "word"),
+            dpi=int(data.get("dpi", 0)),
         )
 
 
@@ -180,6 +183,7 @@ class PrinterConfig:
     """
     printer_name: str = ""
     duplex_mode: str = "long-edge"    # 'simplex' | 'long-edge' | 'short-edge'
+    render_dpi: int = 400             # 全局默认渲染 DPI
     keep_temp_pdf: bool = False
     simplex_price: float = 0.2
     duplex_price: float = 0.3
@@ -190,6 +194,7 @@ class PrinterConfig:
         return {
             "printer_name": self.printer_name,
             "duplex_mode": self.duplex_mode,
+            "render_dpi": self.render_dpi,
             "keep_temp_pdf": self.keep_temp_pdf,
             "simplex_price": self.simplex_price,
             "duplex_price": self.duplex_price,
@@ -204,6 +209,7 @@ class PrinterConfig:
         return cls(
             printer_name=data.get("printer_name", ""),
             duplex_mode=data.get("duplex_mode", "long-edge"),
+            render_dpi=int(data.get("render_dpi", 400)),
             keep_temp_pdf=bool(data.get("keep_temp_pdf", False)),
             simplex_price=float(data.get("simplex_price", 0.2)),
             duplex_price=float(data.get("duplex_price", 0.3)),

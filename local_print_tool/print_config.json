@@ -1,20 +1,22 @@
 {
   "printer_name": "HP LaserJet MFP M232-M237",
   "duplex_mode": "long-edge",
+  "render_dpi": 200,
   "keep_temp_pdf": false,
   "simplex_price": 0.2,
   "duplex_price": 0.3,
   "last_dir": "C:/Users/Administrator/Desktop",
   "jobs": [
     {
-      "file_path": "C:/Users/Administrator/Desktop/PixPin_2026-06-30_20-24-28.jpg",
+      "file_path": "C:/Users/Administrator/Desktop/C&C++程序设计(2)习题集.docx",
       "copies": 2,
-      "duplex": "off",
-      "duplex_mode": "",
+      "duplex": "on",
+      "duplex_mode": "long-edge",
       "page_range": "",
-      "page_count": 1,
+      "page_count": 24,
       "orientation": "portrait",
-      "engine": "word"
+      "engine": "word",
+      "dpi": 0
     }
   ]
 }
