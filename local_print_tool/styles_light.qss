@@ -306,16 +306,16 @@ QScrollArea {
 /* ---------- 滚动条 ---------- */
 QScrollBar:vertical {
     background: #e6e9ef;
-    width: 10px;
-    border-radius: 5px;
+    width: 5px;
+    border-radius: 3px;
 }
 QScrollBar::handle:vertical {
     background: #ccd0da;
-    border-radius: 5px;
+    border-radius: 3px;
     min-height: 30px;
 }
 QScrollBar::handle:vertical:hover {
-    background: #bcc0cc;
+    background: #4a90d9;
 }
 QScrollBar::add-line:vertical,
 QScrollBar::sub-line:vertical {
@@ -323,16 +323,16 @@ QScrollBar::sub-line:vertical {
 }
 QScrollBar:horizontal {
     background: #e6e9ef;
-    height: 10px;
-    border-radius: 5px;
+    height: 5px;
+    border-radius: 3px;
 }
 QScrollBar::handle:horizontal {
     background: #ccd0da;
-    border-radius: 5px;
+    border-radius: 3px;
     min-width: 30px;
 }
 QScrollBar::handle:horizontal:hover {
-    background: #bcc0cc;
+    background: #4a90d9;
 }
 QScrollBar::add-line:horizontal,
 QScrollBar::sub-line:horizontal {

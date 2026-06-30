@@ -777,13 +777,17 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 8, 12, 12)
-        root.setSpacing(8)
+        root.setSpacing(0)
 
         # -- 菜单栏 --
         self._setup_menu()
 
         # -- 顶部：打印机信息 + 配置 --
-        self._setup_top_bar(root)
+        top_container = QWidget()
+        top_layout = QVBoxLayout(top_container)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(8)
+        self._setup_top_bar(top_layout)
 
         # -- 中部：文件列表 + 编辑面板（QSplitter） --
         splitter = QSplitter(Qt.Horizontal)
@@ -791,22 +795,30 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._setup_edit_panel())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        root.addWidget(splitter, 1)
+        top_layout.addWidget(splitter, 1)
 
         # -- 进度条 --
         self._progress_bar = QProgressBar()
         self._progress_bar.setValue(0)
-        root.addWidget(self._progress_bar)
+        top_layout.addWidget(self._progress_bar)
 
         # -- 按钮栏 --
-        root.addLayout(self._setup_button_bar())
+        top_layout.addLayout(self._setup_button_bar())
 
-        # -- 日志区域 --
+        # -- 日志区域（可拖动顶边调整高度） --
         self._log_text = QTextEdit()
         self._log_text.setObjectName("logTextEdit")
         self._log_text.setReadOnly(True)
-        self._log_text.setMaximumHeight(180)
-        root.addWidget(self._log_text)
+        self._log_text.setMinimumHeight(40)
+        _enable_smooth_scroll(self._log_text)
+
+        v_splitter = QSplitter(Qt.Vertical)
+        v_splitter.addWidget(top_container)
+        v_splitter.addWidget(self._log_text)
+        v_splitter.setStretchFactor(0, 1)
+        v_splitter.setStretchFactor(1, 0)
+        v_splitter.setSizes([600, 120])
+        root.addWidget(v_splitter, 1)
 
         # -- 状态栏 --
         self._status_bar = QStatusBar()
@@ -1366,6 +1378,18 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self._on_convert_finished)
         self._convert_workers.append(worker)
         worker.start()
+
+    def _cancel_all_convert_workers(self):
+        """终止所有正在进行的 PDF 转换线程。"""
+        for w in self._convert_workers:
+            if w.isRunning():
+                try:
+                    w.finished.disconnect()
+                except Exception:
+                    pass
+                w.terminate()
+                w.wait(100)
+        self._convert_workers.clear()
 
     def _resolve_engine(self, job: PrintJob) -> str:
         """
@@ -1972,6 +1996,9 @@ class MainWindow(QMainWindow):
         if not self._config.jobs:
             return
 
+        # 终止正在进行的转换，避免回调更新已不存在的行
+        self._cancel_all_convert_workers()
+
         # 备份并清空
         self._cleared_jobs_backup = list(self._config.jobs)
         self._table.setRowCount(0)
@@ -2002,11 +2029,17 @@ class MainWindow(QMainWindow):
         self._clear_undo_timer.start(5000)
 
     def _on_undo_clear(self):
-        """撤回清空操作，恢复任务列表。"""
+        """撤回清空操作，恢复任务列表并重新转换。"""
         self._clear_undo_timer.stop()
-        for job in self._cleared_jobs_backup:
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        for row, job in enumerate(self._cleared_jobs_backup):
             self._config.jobs.append(job)
             self._add_table_row(job)
+            # 需要转换的文件重新启动后台转换
+            ext = os.path.splitext(job.file_path)[1].lower()
+            if ext not in (".pdf",) and ext not in image_exts:
+                self._table.item(row, self.COL_PAGES).setText("...")
+                self._start_convert_worker(row, job.file_path, job.engine)
         self._cleared_jobs_backup.clear()
         self._update_total_cost()
         self._log("已撤回清空操作")
@@ -2109,9 +2142,9 @@ class MainWindow(QMainWindow):
 
     def _on_about(self):
         """关于对话框。"""
-        html = (
-            "<div style='padding: 0 48px;'>"
-            "<h3>HN 本地打印工具 v2.9</h3>"
+        QMessageBox.about(
+            self, "关于 HN 本地打印工具",
+            "<h3>HN 本地打印工具 v3.0</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -2122,9 +2155,7 @@ class MainWindow(QMainWindow):
             "<p><b>⚠ 仅用于学习用途</b></p>"
             "<p>GitHub: <a href='https://github.com/huonanwholovecomputer/h_n-printer'>"
             "github.com/huonanwholovecomputer/h_n-printer</a></p>"
-            "</div>"
         )
-        QMessageBox.about(self, "关于 HN 本地打印工具", html)
 
     def _on_self_check(self):
         """自检：检查外部工具和 COM 引擎状态。"""
