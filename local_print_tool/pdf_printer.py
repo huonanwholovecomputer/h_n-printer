@@ -11,7 +11,7 @@ import os
 import platform
 import subprocess
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +188,33 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
     return sorted(pages)
 
 
+def estimate_print_sides(
+    total_pages: int,
+    copies: int,
+    duplex: str,
+    page_range: str,
+) -> int:
+    """预估打印总面数，用于精确进度条。
+
+    Args:
+        total_pages: PDF 总页数
+        copies: 打印份数
+        duplex: 'on' | 'off'
+        page_range: 页码范围，如 "1-5"
+
+    Returns:
+        预估总面数（含分隔页），最小为 1
+    """
+    if total_pages <= 0:
+        return max(1, copies)
+    pages = _parse_page_range(page_range, total_pages)
+    n = len(pages)
+    sides = n * copies
+    if duplex == "on" and copies > 1 and n % 2 == 1:
+        sides += copies - 1  # 每份间插入空白分隔页
+    return max(1, sides)
+
+
 # ============================================================
 # 打印函数
 # ============================================================
@@ -200,6 +227,7 @@ def print_pdf(
     duplex_mode: str = "long-edge",
     page_range: str = "",
     orientation: str = "",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[bool, str]:
     """
     静默打印 PDF 文件。
@@ -212,6 +240,7 @@ def print_pdf(
         duplex_mode: 双面模式 'long-edge' | 'short-edge'
         page_range: 页码范围，如 "1-5"
         orientation: 页面方向 "portrait" | "landscape" | "" (空=不强制)
+        progress_callback: 进度回调 (current, total)，每打印一面调用一次
 
     Returns:
         (success, message)
@@ -235,7 +264,7 @@ def print_pdf(
     if system == "Windows":
         # 方案 1: Windows 原生 GDI 打印（驱动级双面/份数控制，最可靠）
         print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
-        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback)
         if ok:
             print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
@@ -246,7 +275,7 @@ def print_pdf(
         if sumatra:
             print(f"[打印] 方案2: 降级为 SumatraPDF ({sumatra})")
             logger.info(f"原生 GDI 失败，降级 SumatraPDF: {sumatra}")
-            ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
+            ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback)
             if ok:
                 print(f"[打印] ✓ 成功 ({msg})")
                 return True, msg
@@ -255,7 +284,7 @@ def print_pdf(
 
         # 方案 3: 应用层循环打印（最可靠兜底）
         print("[打印] 方案3: 应用层循环打印（兜底）...")
-        ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
+        ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback)
         print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
         return ok, msg
     else:
@@ -273,9 +302,11 @@ def _print_pdf_native(
     page_range: str,
     copies: int = 1,
     orientation: str = "",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[bool, str]:
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
+    progress_callback: 每完成一面的 EndPage 后调用 (current_side, total_sides)
     """
     import fitz
 
@@ -385,6 +416,8 @@ def _print_pdf_native(
 
                 hdc.EndPage()
                 print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (PDF p.{page_idx + 1}, 第 {copy_idx + 1} 份)")
+                if progress_callback:
+                    progress_callback(page_seq, total_sides)
 
             # 单数页双面多份：每份结束后插入空白页（最后一份除外）
             if needs_separator and copy_idx < copies - 1:
@@ -395,6 +428,8 @@ def _print_pdf_native(
                 blank_dib.draw(hdc.GetHandleOutput(), (0, 0, printable_w, printable_h))
                 hdc.EndPage()
                 print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (副本分隔页)")
+                if progress_callback:
+                    progress_callback(page_seq, total_sides)
 
         hdc.EndDoc()
         started = False
@@ -538,6 +573,7 @@ def _print_via_sumatra(
     page_range: str,
     copies: int = 1,
     orientation: str = "",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[bool, str]:
     """使用 SumatraPDF 命令行进行静默打印。
 
@@ -563,11 +599,13 @@ def _print_via_sumatra(
                     print(f"[SumatraPDF] 第 {i + 1}/{copies} 份...")
                     ok, msg = _print_via_sumatra(
                         sumatra_path, pdf_path, printer_name,
-                        duplex, duplex_mode, page_range, 1, orientation,
+                        duplex, duplex_mode, page_range, 1, orientation, progress_callback,
                     )
                     if not ok:
                         return False, f"第 {i + 1}/{copies} 份失败: {msg}"
                     print(f"[SumatraPDF] ✓ 第 {i + 1} 份完成")
+                    if progress_callback:
+                        progress_callback(i + 1, copies)
                 return True, f"SumatraPDF 逐份打印完成 ({copies} 份)"
 
     settings_parts: list[str] = []
@@ -644,12 +682,13 @@ def _print_via_loop(
     page_range: str,
     copies: int = 1,
     orientation: str = "",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> tuple[bool, str]:
     """终极兜底：应用层循环打印，每次只打 1 份。成功率最高。"""
     print(f"[循环打印] 共 {copies} 份，每次 1 份...")
     for i in range(copies):
         print(f"[循环打印] 第 {i + 1}/{copies} 份...")
-        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, 1, orientation)
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, 1, orientation, progress_callback)
         if not ok:
             print(f"[循环打印] ✗ 第 {i + 1} 份失败: {msg}")
             return False, f"第 {i + 1}/{copies} 份打印失败: {msg}"

@@ -53,7 +53,7 @@ from PySide6.QtWidgets import (
 
 from printer_config import PrinterConfig, PrintJob, calc_cost
 from converter import get_converter, UniversalConverter
-from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info
+from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 
 logger = logging.getLogger(__name__)
@@ -72,6 +72,47 @@ def _disable_combo_wheel(combo: QComboBox) -> None:
             return super().eventFilter(obj, event)
 
     combo.installEventFilter(_WheelBlocker(combo))
+
+
+def _truncate_filename(filename: str, max_width: int = 26) -> str:
+    """截断文件名到指定显示宽度（中文=2单位，ASCII=1单位）。
+
+    格式: base[...][.ext]，超出部分用三个点替代。
+    例: "PixPin_2026-06-30_20-24-28.jpg" → "PixPin_2026-06-30...[.jpg]"
+    """
+    def _display_width(s: str) -> int:
+        w = 0
+        for ch in s:
+            if ord(ch) > 0x2000:  # 中文/全角字符占2个显示位
+                w += 2
+            else:
+                w += 1
+        return w
+
+    base, ext = os.path.splitext(filename)
+    suffix = f"[{ext}]"
+    suffix_w = _display_width(suffix)
+
+    full_w = _display_width(base) + suffix_w
+    if full_w <= max_width:
+        return f"{base}{suffix}"
+
+    # 需要截断：预留 "..." (3) 和 suffix 的空间
+    available = max_width - 3 - suffix_w
+    if available <= 0:
+        return f"...{suffix}"
+
+    # 逐字符截断 base
+    truncated = ""
+    w = 0
+    for ch in base:
+        cw = 2 if ord(ch) > 0x2000 else 1
+        if w + cw > available:
+            break
+        truncated += ch
+        w += cw
+
+    return f"{truncated}...{suffix}"
 
 
 def _enable_smooth_scroll(scroll_area: QScrollArea) -> None:
@@ -467,28 +508,50 @@ class PrintWorker(QThread):
         self.log_message.emit("[取消] 用户取消了打印任务")
 
     def run(self):
-        """线程主函数：统一 PDF 打印流程（GDI 优先）。"""
+        """线程主函数：统一 PDF 打印流程（GDI 优先），精确到每面的进度条。"""
         self._converter = get_converter()
-        total = len(self._jobs)
+        task_count = len(self._jobs)
         success_count = 0
         fail_count = 0
 
-        self.progress.emit(0, total, "开始处理...")
-        self.log_message.emit(f"共 {total} 个任务待处理")
+        # 预计算总面数（用于精确进度条）
+        job_sides: list[int] = []
+        for job in self._jobs:
+            sides = estimate_print_sides(
+                max(1, job.page_count), max(1, job.copies), job.duplex, job.page_range,
+            )
+            job_sides.append(sides)
+        total_sides = sum(job_sides)
+        if total_sides <= 0:
+            total_sides = 1
 
+        self.progress.emit(0, total_sides, f"共 {task_count} 个任务, 预估 {total_sides} 面")
+        self.log_message.emit(f"共 {task_count} 个任务待处理")
+
+        offset_sides = 0
         for idx, job in enumerate(self._jobs):
             if self._cancelled:
                 self.log_message.emit(f"[跳过] 第 {idx + 1} 个任务（已取消）")
                 break
 
             file_name = os.path.basename(job.file_path)
-            self.progress.emit(idx, total, f"正在处理: {file_name}")
-            self.log_message.emit(f"[{idx + 1}/{total}] {file_name}")
+            self.progress.emit(offset_sides, total_sides, f"正在处理: {file_name}")
+            self.log_message.emit(f"[{idx + 1}/{task_count}] {file_name}")
 
             ext = os.path.splitext(job.file_path)[1].lower()
             copies = max(1, job.copies)
             orient_info = f", 方向:{job.orientation}" if job.orientation else ""
             temp_pdf: Optional[str] = None
+
+            # 此任务的预估面数
+            this_job_sides = job_sides[idx] if idx < len(job_sides) else 1
+
+            def _make_progress_callback(base_offset: int, total_all: int):
+                def _on_side(page_seq: int, _task_total: int):
+                    # page_seq 是此任务内部的当前面号（从1开始）
+                    self.progress.emit(base_offset + page_seq, total_all,
+                                       f"正在打印: {file_name} ({page_seq}/{this_job_sides}面)")
+                return _on_side
 
             try:
                 if not os.path.isfile(job.file_path):
@@ -507,7 +570,7 @@ class PrintWorker(QThread):
                     print_path = temp_pdf
                     self.log_message.emit(f"  → 转换完成: {os.path.basename(temp_pdf)}")
 
-                # 2. 打印 PDF
+                # 2. 打印 PDF（传入进度回调）
                 self.log_message.emit(
                     f"  → 正在打印 (份数:{copies}, 双面:{job.duplex}{orient_info})..."
                 )
@@ -520,6 +583,7 @@ class PrintWorker(QThread):
                     duplex_mode=dm,
                     page_range=job.page_range,
                     orientation=job.orientation,
+                    progress_callback=_make_progress_callback(offset_sides, total_sides),
                 )
                 if ok:
                     self.log_message.emit(f"  ✓ {msg}")
@@ -553,7 +617,9 @@ class PrintWorker(QThread):
                     except OSError as e:
                         self.log_message.emit(f"  → 清理临时 PDF 失败: {e}")
 
-        self.progress.emit(total, total, "全部完成")
+            offset_sides += this_job_sides
+
+        self.progress.emit(total_sides, total_sides, "全部完成")
         self.all_finished.emit(success_count, fail_count)
         self.log_message.emit(
             f"========== 打印完毕：成功 {success_count}，失败 {fail_count} =========="
@@ -1027,9 +1093,15 @@ class MainWindow(QMainWindow):
         """底部按钮栏。"""
         layout = QHBoxLayout()
 
-        btn_clear = QPushButton("✖ 清空列表")
-        btn_clear.clicked.connect(self._on_clear_list)
-        layout.addWidget(btn_clear)
+        self._btn_clear = QPushButton("✖ 清空列表")
+        self._btn_clear.clicked.connect(self._on_clear_list)
+        layout.addWidget(self._btn_clear)
+
+        # 撤回定时器：清空后 5 秒内可撤回
+        self._clear_undo_timer = QTimer(self)
+        self._clear_undo_timer.setSingleShot(True)
+        self._clear_undo_timer.timeout.connect(self._on_undo_expired)
+        self._cleared_jobs_backup: list[PrintJob] = []
 
         layout.addStretch()
 
@@ -1104,6 +1176,10 @@ class MainWindow(QMainWindow):
         row = self._table.rowCount()
         self._table.insertRow(row)
 
+        ext = os.path.splitext(job.file_path)[1].lower()
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        is_image = ext in image_exts
+
         name_item = QTableWidgetItem(os.path.basename(job.file_path))
         name_item.setData(Qt.UserRole, job.file_path)  # 存储完整路径
         name_item.setToolTip(job.file_path)
@@ -1113,7 +1189,10 @@ class MainWindow(QMainWindow):
         copies_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_COPIES, copies_item)
 
-        if job.duplex == "on":
+        # 图片：双面无意义
+        if is_image:
+            duplex_text = "—"
+        elif job.duplex == "on":
             dm = "长边" if job.duplex_mode != "short-edge" else "短边"
             duplex_text = f"双面({dm})"
         else:
@@ -1122,7 +1201,12 @@ class MainWindow(QMainWindow):
         duplex_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_DUPLEX, duplex_item)
 
-        range_item = QTableWidgetItem(job.page_range or "全部")
+        # 图片：页码范围无意义
+        if is_image:
+            range_text = "—"
+        else:
+            range_text = job.page_range or "全部"
+        range_item = QTableWidgetItem(range_text)
         range_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_RANGE, range_item)
 
@@ -1295,9 +1379,13 @@ class MainWindow(QMainWindow):
 
     def _on_copy_detail(self):
         """复制计费明细到剪贴板。"""
-        lines = ["HN 本地打印工具 — 计费明细", "─" * 30]
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        lines = ["计费明细", "─" * 14]
+        total_parts: list[str] = []
+
         for row in range(self._table.rowCount()):
             file_item = self._table.item(row, self.COL_FILE)
+            file_path = file_item.data(Qt.UserRole) if file_item else ""
             filename = file_item.text() if file_item else "?"
             copies = self._table.item(row, self.COL_COPIES).text()
             duplex = self._table.item(row, self.COL_DUPLEX).text()
@@ -1305,14 +1393,42 @@ class MainWindow(QMainWindow):
             orient = self._table.item(row, self.COL_ORIENT).text()
             cost_item = self._table.item(row, self.COL_COST)
             cost_text = cost_item.text() if cost_item else "?"
-            lines.append(
-                f"{row + 1}. {filename}\n"
-                f"   份数: {copies} | 单/双面: {duplex} | "
-                f"页码范围: {page_range} | 方向: {orient} | 费用: {cost_text}"
-            )
-        lines.append("─" * 30)
-        total_text = self._total_label.text()
-        lines.append(total_text)
+
+            # 文件名格式：name[.ext]，超长自动截断
+            display_name = _truncate_filename(filename)
+
+            # 图片：只显示份数和方向
+            ext_lower = os.path.splitext(file_path)[1].lower()
+            is_image = ext_lower in image_exts
+
+            if is_image:
+                meta_parts = [f"{copies}份"]
+                if orient:
+                    meta_parts.append(orient)
+                meta_line = " | ".join(meta_parts)
+            else:
+                meta_parts = [f"{copies}份", duplex]
+                if page_range:
+                    meta_parts.append(f"{page_range}页")
+                else:
+                    meta_parts.append("全部页")
+                if orient:
+                    meta_parts.append(orient)
+                meta_line = " | ".join(meta_parts)
+
+            lines.append(f"{row + 1}. {display_name}")
+            lines.append(f"   {meta_line}")
+            lines.append(f"   💰 {cost_text}")
+
+            # 提取金额用于合计
+            cost_val = cost_item.data(Qt.UserRole) if cost_item else 0
+            if isinstance(cost_val, (int, float)) and cost_val > 0:
+                total_parts.append(f"{cost_val:.2f}")
+
+        lines.append("─" * 14)
+        total_sum = sum(float(p) for p in total_parts) if total_parts else 0.0
+        formula = "+".join(total_parts) if total_parts else "0"
+        lines.append(f"合计: {formula}=¥{total_sum:.2f}")
         QApplication.clipboard().setText("\n".join(lines))
         # 按钮反馈
         if self._copy_detail_btn:
@@ -1329,7 +1445,7 @@ class MainWindow(QMainWindow):
         duplex_text = self._table.item(row, self.COL_DUPLEX).text()
         duplex = "on" if "双" in duplex_text else "off"
         page_range = self._table.item(row, self.COL_RANGE).text()
-        if page_range == "全部":
+        if page_range in ("全部", "—"):
             page_range = ""
 
         cost, formula = calc_cost(page_count, copies, duplex,
@@ -1360,7 +1476,7 @@ class MainWindow(QMainWindow):
             if duplex == "on":
                 duplex_mode = "short-edge" if "短边" in duplex_text else "long-edge"
             page_range = self._table.item(row, self.COL_RANGE).text()
-            if page_range == "全部":
+            if page_range in ("全部", "—"):
                 page_range = ""
             pages_text = self._table.item(row, self.COL_PAGES).text()
             page_count = int(pages_text) if pages_text.isdigit() else 0
@@ -1420,7 +1536,7 @@ class MainWindow(QMainWindow):
         pages_text = self._table.item(row, self.COL_PAGES).text()
         total_pages = int(pages_text) if pages_text.isdigit() else 0
         self._edit_page_range.set_total_pages(total_pages)
-        self._edit_page_range.set_ranges("" if page_range == "全部" else page_range)
+        self._edit_page_range.set_ranges("" if page_range in ("全部", "—") else page_range)
         # 同步引擎
         eng_text = self._table.item(row, self.COL_ENGINE).text() if self._table.item(row, self.COL_ENGINE) else "Word"
         eng_map = {"Word": 0, "WPS": 1, "LibreOffice": 2}
@@ -1432,6 +1548,12 @@ class MainWindow(QMainWindow):
         is_convertible = ext in (".doc", ".docx")
         self._label_engine.setEnabled(is_convertible)
         self._edit_engine.setEnabled(is_convertible)
+        # 图片只有一页，单双面和页码范围无意义
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        is_image = ext in image_exts
+        self._edit_duplex.setEnabled(not is_image)
+        self._edit_duplex_mode.setEnabled(not is_image and is_duplex)
+        self._edit_page_range.setEnabled(not is_image)
 
     def _on_table_double_click(self, row: int, col: int):
         """双击表格行 → 用系统默认程序打开文件。"""
@@ -1465,18 +1587,31 @@ class MainWindow(QMainWindow):
         if not rows:
             return
         row = rows[0].row()
+
+        file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
+        ext = os.path.splitext(file_path)[1].lower()
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        is_image = ext in image_exts
+
         self._table.item(row, self.COL_COPIES).setText(str(self._edit_copies.value()))
-        # 双面 + 双面模式合并显示
-        if self._edit_duplex.currentIndex() == 0:
-            dm_text = "长边" if self._edit_duplex_mode.currentIndex() == 0 else "短边"
-            self._table.item(row, self.COL_DUPLEX).setText(f"双面({dm_text})")
+        # 图片：双面和页码范围不适用
+        if is_image:
+            # 保持 "—" 不覆盖
+            pass
         else:
-            self._table.item(row, self.COL_DUPLEX).setText("单面")
+            if self._edit_duplex.currentIndex() == 0:
+                dm_text = "长边" if self._edit_duplex_mode.currentIndex() == 0 else "短边"
+                self._table.item(row, self.COL_DUPLEX).setText(f"双面({dm_text})")
+            else:
+                self._table.item(row, self.COL_DUPLEX).setText("单面")
         # 双面模式仅双面时启用
         is_duplex = self._edit_duplex.currentIndex() == 0
-        self._edit_duplex_mode.setEnabled(is_duplex)
+        self._edit_duplex_mode.setEnabled(is_duplex and not is_image)
         page_range = self._edit_page_range.get_ranges()
-        self._table.item(row, self.COL_RANGE).setText(page_range if page_range else "全部")
+        if is_image:
+            self._table.item(row, self.COL_RANGE).setText("—")
+        else:
+            self._table.item(row, self.COL_RANGE).setText(page_range if page_range else "全部")
         # 引擎
         eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
         eng_labels = {"word": "Word", "wps": "WPS", "libreoffice": "LibreOffice"}
@@ -1522,6 +1657,7 @@ class MainWindow(QMainWindow):
 
     def _add_files_to_table(self, files: list[str]):
         """添加文件到任务列表的核心逻辑。"""
+        self._cancel_undo_if_active()
         if getattr(self, '_loading_files', False):
             logger.warning("上一批文件仍在处理中，忽略本次添加请求")
             return
@@ -1586,8 +1722,11 @@ class MainWindow(QMainWindow):
                         engine = eng
                         break
 
+            # 图片强制单面，无页码/双面概念
+            is_image = ext in image_exts
             duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
-            job = PrintJob(file_path=f, copies=1, duplex="on",
+            job_duplex = "off" if is_image else "on"
+            job = PrintJob(file_path=f, copies=1, duplex=job_duplex,
                            duplex_mode=duplex_mode, page_range="",
                            page_count=page_count, orientation=orientation, engine=engine)
             self._config.jobs.append(job)
@@ -1653,15 +1792,73 @@ class MainWindow(QMainWindow):
         self._log("已移除选中任务")
 
     def _on_clear_list(self):
-        """清空任务列表。"""
-        if self._config.jobs:
-            ret = QMessageBox.question(self, "确认", "确定要清空所有任务吗？")
-            if ret != QMessageBox.Yes:
-                return
+        """清空任务列表（5秒内可撤回）。"""
+        # 如果是撤回模式，执行撤回
+        if self._clear_undo_timer.isActive():
+            self._on_undo_clear()
+            return
+
+        if not self._config.jobs:
+            return
+
+        # 备份并清空
+        self._cleared_jobs_backup = list(self._config.jobs)
         self._table.setRowCount(0)
         self._config.jobs.clear()
         self._update_total_cost()
-        self._log("已清空任务列表")
+        self._log("已清空任务列表（5秒内可撤回）")
+
+        # 按钮变为撤回样式（琥珀色醒目样式）
+        self._btn_clear.setText("↩ 撤回")
+        self._btn_clear.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #e8960a;"
+            "  color: #fff;"
+            "  font-weight: bold;"
+            "  border: 2px solid #c47e08;"
+            "  border-radius: 4px;"
+            "  padding: 4px 14px;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: #f0a81e;"
+            "}"
+            "QPushButton:pressed {"
+            "  background-color: #c47e08;"
+            "}"
+        )
+
+        self._clear_undo_timer.start(5000)
+
+    def _on_undo_clear(self):
+        """撤回清空操作，恢复任务列表。"""
+        self._clear_undo_timer.stop()
+        for job in self._cleared_jobs_backup:
+            self._config.jobs.append(job)
+            self._add_table_row(job)
+        self._cleared_jobs_backup.clear()
+        self._update_total_cost()
+        self._log("已撤回清空操作")
+        self._restore_clear_button()
+
+    def _on_undo_expired(self):
+        """撤回超时，清除备份。"""
+        self._cleared_jobs_backup.clear()
+        self._restore_clear_button()
+
+    def _restore_clear_button(self):
+        """恢复清空按钮正常样式。"""
+        self._btn_clear.setText("✖ 清空列表")
+        self._btn_clear.setStyleSheet("")
+        self._btn_clear.setObjectName("")
+        self._btn_clear.style().unpolish(self._btn_clear)
+        self._btn_clear.style().polish(self._btn_clear)
+
+    def _cancel_undo_if_active(self):
+        """新增任务时取消撤回状态。"""
+        if self._clear_undo_timer.isActive():
+            self._clear_undo_timer.stop()
+            self._cleared_jobs_backup.clear()
+            self._restore_clear_button()
 
     def _on_start_print(self):
         """开始打印。"""
