@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QAbstractItemView,
     QScrollArea,
+    QAbstractScrollArea,
     QStatusBar,
     QStyleFactory,
 )
@@ -64,11 +65,18 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def _disable_combo_wheel(combo: QComboBox) -> None:
-    """禁止 QComboBox 响应鼠标滚轮事件，避免滚动页面时误改选项。"""
+    """禁止 QComboBox 响应鼠标滚轮事件，改为转发给父 QScrollArea 实现滚动。"""
     class _WheelBlocker(QObject):
         def eventFilter(self, obj, event):
             if event.type() == QEvent.Wheel:
-                return True  # 吞掉滚轮事件
+                # 查找最近的 QScrollArea 并转发滚轮事件
+                w = obj.parent()
+                while w is not None:
+                    if isinstance(w, QScrollArea):
+                        QApplication.sendEvent(w.viewport(), event)
+                        return True
+                    w = w.parent()
+                return True  # 找不到 ScrollArea 则吞掉
             return super().eventFilter(obj, event)
 
     combo.installEventFilter(_WheelBlocker(combo))
@@ -115,8 +123,8 @@ def _truncate_filename(filename: str, max_width: int = 52) -> str:
     return f"{truncated}...{suffix}"
 
 
-def _enable_smooth_scroll(scroll_area: QScrollArea) -> None:
-    """为 QScrollArea 启用平滑滚动：拦截滚轮事件并用动画过渡。"""
+def _enable_smooth_scroll(view: QAbstractScrollArea) -> None:
+    """为可滚动区域启用平滑滚动：拦截滚轮事件并用动画过渡。"""
     class _SmoothFilter(QObject):
         def __init__(self, area):
             super().__init__(area)
@@ -149,7 +157,7 @@ def _enable_smooth_scroll(scroll_area: QScrollArea) -> None:
                 return True  # 已处理，阻止默认滚动
             return super().eventFilter(obj, event)
 
-    scroll_area.viewport().installEventFilter(_SmoothFilter(scroll_area))
+    view.viewport().installEventFilter(_SmoothFilter(view))
 
 
 # ============================================================
@@ -947,6 +955,9 @@ class MainWindow(QMainWindow):
         self._table.filesDropped.connect(self._on_files_dropped)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self._table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        _enable_smooth_scroll(self._table)
         self._table.setAlternatingRowColors(True)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.cellDoubleClicked.connect(self._on_table_double_click)
@@ -1634,13 +1645,64 @@ class MainWindow(QMainWindow):
     def _on_table_context_menu(self, pos):
         """表格右键菜单。"""
         row = self._table.rowAt(pos.y())
-        if row < 0:
-            return  # 未点击在有效行上，不弹出菜单
         menu = QMenu(self)
+
+        if row < 0:
+            # 空白区域：粘贴文件
+            paste_action = menu.addAction("📋 粘贴")
+            paste_action.setEnabled(self._can_paste_files())
+            action = menu.exec(self._table.viewport().mapToGlobal(pos))
+            if action == paste_action:
+                self._on_paste_files()
+            return
+
+        # 有效行：移除 + 粘贴
         remove_action = menu.addAction("移除选中")
+        menu.addSeparator()
+        paste_action = menu.addAction("📋 粘贴")
+        paste_action.setEnabled(self._can_paste_files())
         action = menu.exec(self._table.viewport().mapToGlobal(pos))
         if action == remove_action:
             self._on_remove_selected()
+        elif action == paste_action:
+            self._on_paste_files()
+
+    def _can_paste_files(self) -> bool:
+        """检查剪贴板是否包含可粘贴的文件路径。"""
+        import re
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            return False
+        # 提取可能为文件路径的行，检查是否存在有效扩展名
+        allowed = {".pdf", ".doc", ".docx", ".txt", ".md", ".html", ".htm",
+                   ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        for line in text.splitlines():
+            line = line.strip().strip('"').strip("'")
+            ext = os.path.splitext(line)[1].lower()
+            if ext in allowed:
+                return True
+        return False
+
+    def _on_paste_files(self):
+        """从剪贴板粘贴文件路径，与拖入做相同的类型检查。"""
+        import re
+        allowed = {".pdf", ".doc", ".docx", ".txt", ".md", ".html", ".htm",
+                   ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        text = QApplication.clipboard().text().strip()
+        files: list[str] = []
+        for line in text.splitlines():
+            line = line.strip().strip('"').strip("'")
+            if not line:
+                continue
+            ext = os.path.splitext(line)[1].lower()
+            if ext in allowed and os.path.isfile(line):
+                files.append(os.path.normpath(line))
+        if files:
+            self._add_files_to_table(files)
+        else:
+            QMessageBox.information(self, "粘贴", "剪贴板中没有可识别的文件路径。\n\n"
+                                    "支持格式: PDF, Word(.doc/.docx), "
+                                    "文本(.txt/.md/.html), 图片(.jpg/.png/.bmp等)")
 
     def _auto_apply_edit(self):
         """编辑面板参数变更 → 即时写回选中行。"""
