@@ -842,6 +842,10 @@ class MainWindow(QMainWindow):
         shortcuts_action.triggered.connect(self._on_shortcuts)
         help_menu.addAction(shortcuts_action)
         help_menu.addSeparator()
+        selfcheck_action = QAction("自检(&S)", self)
+        selfcheck_action.triggered.connect(self._on_self_check)
+        help_menu.addAction(selfcheck_action)
+        help_menu.addSeparator()
         about_action = QAction("关于(&A)", self)
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
@@ -860,6 +864,9 @@ class MainWindow(QMainWindow):
         self._shortcut_ctrl_d = QShortcut(QKeySequence("Ctrl+D"), self)
         self._shortcut_ctrl_d.setContext(Qt.ApplicationShortcut)
         self._shortcut_ctrl_d.activated.connect(self._on_remove_selected)
+        self._shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self)
+        self._shortcut_paste.setContext(Qt.ApplicationShortcut)
+        self._shortcut_paste.activated.connect(self._on_shortcut_paste)
 
     def _setup_theme_menu(self, menu):
         """构建主题切换子菜单（单选模式）。"""
@@ -901,6 +908,7 @@ class MainWindow(QMainWindow):
         self._keep_temp_check = QComboBox()
         self._keep_temp_check.addItems(["否", "是"])
         self._keep_temp_check.setCurrentIndex(0)
+        self._keep_temp_check.currentIndexChanged.connect(self._on_keep_temp_changed)
         _disable_combo_wheel(self._keep_temp_check)
         layout.addWidget(self._keep_temp_check)
 
@@ -1189,6 +1197,10 @@ class MainWindow(QMainWindow):
         for row in range(self._table.rowCount()):
             self._recalc_row_cost(row)
         self._update_total_cost()
+
+    def _on_keep_temp_changed(self):
+        """保存转换副本设置变更 → 实时同步到 config。"""
+        self._config.keep_temp_pdf = (self._keep_temp_check.currentIndex() == 1)
 
     def _on_render_dpi_changed(self):
         """全局渲染 DPI 变更。"""
@@ -1668,39 +1680,60 @@ class MainWindow(QMainWindow):
             self._on_paste_files()
 
     def _can_paste_files(self) -> bool:
-        """检查剪贴板是否包含可粘贴的文件路径。"""
-        import re
-        text = QApplication.clipboard().text().strip()
-        if not text:
-            return False
-        # 提取可能为文件路径的行，检查是否存在有效扩展名
+        """检查剪贴板是否包含可粘贴的文件。"""
         allowed = {".pdf", ".doc", ".docx", ".txt", ".md", ".html", ".htm",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        for line in text.splitlines():
-            line = line.strip().strip('"').strip("'")
-            ext = os.path.splitext(line)[1].lower()
-            if ext in allowed:
-                return True
+        # 1. 来自文件管理器的 URL 列表
+        mime = QApplication.clipboard().mimeData()
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext in allowed and os.path.isfile(path):
+                        return True
+        # 2. 纯文本路径
+        text = QApplication.clipboard().text().strip()
+        if text:
+            for line in text.splitlines():
+                line = line.strip().strip('"').strip("'")
+                ext = os.path.splitext(line)[1].lower()
+                if ext in allowed:
+                    return True
         return False
 
     def _on_paste_files(self):
-        """从剪贴板粘贴文件路径，与拖入做相同的类型检查。"""
-        import re
+        """从剪贴板粘贴文件，支持文件管理器复制和纯文本路径。"""
         allowed = {".pdf", ".doc", ".docx", ".txt", ".md", ".html", ".htm",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        text = QApplication.clipboard().text().strip()
         files: list[str] = []
-        for line in text.splitlines():
-            line = line.strip().strip('"').strip("'")
-            if not line:
-                continue
-            ext = os.path.splitext(line)[1].lower()
-            if ext in allowed and os.path.isfile(line):
-                files.append(os.path.normpath(line))
+
+        # 1. 优先处理文件管理器复制的 URL 列表
+        mime = QApplication.clipboard().mimeData()
+        if mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext in allowed and os.path.isfile(path):
+                        files.append(os.path.normpath(path))
+
+        # 2. 降级处理纯文本路径（每行一个）
+        if not files:
+            text = QApplication.clipboard().text().strip()
+            for line in text.splitlines():
+                line = line.strip().strip('"').strip("'")
+                if not line:
+                    continue
+                ext = os.path.splitext(line)[1].lower()
+                if ext in allowed and os.path.isfile(line):
+                    files.append(os.path.normpath(line))
+
         if files:
             self._add_files_to_table(files)
         else:
-            QMessageBox.information(self, "粘贴", "剪贴板中没有可识别的文件路径。\n\n"
+            QMessageBox.information(self, "粘贴", "剪贴板中没有可识别的文件。\n\n"
+                                    "请先在文件管理器中复制文件(Ctrl+C)，再来粘贴。\n"
                                     "支持格式: PDF, Word(.doc/.docx), "
                                     "文本(.txt/.md/.html), 图片(.jpg/.png/.bmp等)")
 
@@ -1909,6 +1942,14 @@ class MainWindow(QMainWindow):
             return  # 让输入框正常处理 Delete 键
         self._on_remove_selected()
 
+    def _on_shortcut_paste(self):
+        """Ctrl+V 快捷键：非文本编辑时粘贴文件。"""
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QLineEdit) or isinstance(focused, QTextEdit):
+            return  # 让输入框正常处理粘贴
+        if self._can_paste_files():
+            self._on_paste_files()
+
     def _on_remove_selected(self):
         """移除表格中选中的行。"""
         rows = self._table.selectionModel().selectedRows()
@@ -2068,16 +2109,84 @@ class MainWindow(QMainWindow):
 
     def _on_about(self):
         """关于对话框。"""
-        QMessageBox.about(
-            self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v2.5</h3>"
+        html = (
+            "<div style='padding: 0 48px;'>"
+            "<h3>HN 本地打印工具 v2.9</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
             "<p>核心流程：文件 → PDF → Windows 原生 GDI 打印</p>"
             "<p>外部工具（可选）：LibreOffice | wkhtmltopdf | SumatraPDF</p>"
             "<p>技术：PySide6 + PyMuPDF + PyPDF2 + python-docx</p>"
+            "<hr>"
+            "<p><b>⚠ 仅用于学习用途</b></p>"
+            "<p>GitHub: <a href='https://github.com/huonanwholovecomputer/h_n-printer'>"
+            "github.com/huonanwholovecomputer/h_n-printer</a></p>"
+            "</div>"
         )
+        QMessageBox.about(self, "关于 HN 本地打印工具", html)
+
+    def _on_self_check(self):
+        """自检：检查外部工具和 COM 引擎状态。"""
+        from converter import _find_libreoffice, _find_wkhtmltopdf, get_available_engines
+        from converter import _warm_word_running, _warm_wps_running
+        from pdf_printer import _find_sumatra_pdf
+
+        def _status_icon(ok: bool) -> str:
+            return "✅" if ok else "❌"
+
+        def _status_text(ok: bool, detail: str = "") -> str:
+            icon = _status_icon(ok)
+            if ok:
+                return f"{icon} <span style='color:#4a9;font-weight:bold'>可用</span> {detail}"
+            else:
+                return f"{icon} <span style='color:#c55;font-weight:bold'>不可用</span> {detail}"
+
+        rows = []
+
+        # ── 外部工具 ──
+        lo = _find_libreoffice()
+        rows.append(("LibreOffice<br><small>(Office→PDF)</small>",
+                     _status_text(lo is not None, f"<small>{lo or ''}</small>")))
+
+        wk = _find_wkhtmltopdf()
+        rows.append(("wkhtmltopdf<br><small>(HTML/MD→PDF)</small>",
+                     _status_text(wk is not None, f"<small>{wk or ''}</small>")))
+
+        sumatra = _find_sumatra_pdf()
+        rows.append(("SumatraPDF<br><small>(备用打印)</small>",
+                     _status_text(sumatra is not None, f"<small>{sumatra or ''}</small>")))
+
+        # ── COM 引擎 ──
+        engines = get_available_engines()
+        word_ok = engines.get("word", False)
+        wps_ok = engines.get("wps", False)
+        lo_ok = engines.get("libreoffice", False)
+
+        ww = " (已预热)" if _warm_word_running else ""
+        wps_w = " (已预热)" if _warm_wps_running else ""
+
+        rows.append(("<hr><b>COM 引擎</b>", ""))
+        rows.append(("Microsoft Word COM", _status_text(word_ok, ww)))
+        rows.append(("WPS Office COM", _status_text(wps_ok, wps_w)))
+        rows.append(("LibreOffice 无头模式", _status_text(lo_ok)))
+
+        # ── 系统打印机 ──
+        printers = list_system_printers()
+        printer_count = len(printers)
+        printer_ok = printer_count > 0
+        printer_detail = f"共 {printer_count} 台"
+        rows.append(("<hr><b>系统打印机</b>", ""))
+        rows.append(("打印机", _status_text(printer_ok, printer_detail)))
+
+        # 构建 HTML 表格
+        html = "<style>td{padding:3px 8px;}</style>"
+        html += "<table>"
+        for label, status in rows:
+            html += f"<tr><td>{label}</td><td>{status}</td></tr>"
+        html += "</table>"
+
+        QMessageBox.information(self, "自检", html)
 
     def _on_shortcuts(self):
         """快捷键说明对话框。"""
@@ -2087,6 +2196,7 @@ class MainWindow(QMainWindow):
             "<tr><td><b>Ctrl+C</b></td><td>复制合计金额</td></tr>"
             "<tr><td><b>Ctrl+Shift+C</b></td><td>复制计费明细</td></tr>"
             "<tr><td><b>Delete</b> / <b>Ctrl+D</b></td><td>删除选中任务</td></tr>"
+            "<tr><td><b>Ctrl+V</b></td><td>粘贴文件</td></tr>"
             "</table>"
         )
 

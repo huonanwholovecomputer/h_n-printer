@@ -2,87 +2,9 @@
   "printer_name": "HP LaserJet MFP M232-M237",
   "duplex_mode": "long-edge",
   "render_dpi": 400,
-  "keep_temp_pdf": true,
+  "keep_temp_pdf": false,
   "simplex_price": 0.2,
   "duplex_price": 0.3,
   "last_dir": "C:/Users/Administrator/Desktop",
-  "jobs": [
-    {
-      "file_path": "C:/Users/Administrator/Desktop/[2026年6月22日修改]2025-2026-2 马原试题库.docx",
-      "copies": 1,
-      "duplex": "on",
-      "duplex_mode": "long-edge",
-      "page_range": "",
-      "page_count": 24,
-      "orientation": "portrait",
-      "engine": "word",
-      "dpi": 0
-    },
-    {
-      "file_path": "C:/Users/Administrator/Desktop/111.docx",
-      "copies": 1,
-      "duplex": "on",
-      "duplex_mode": "long-edge",
-      "page_range": "",
-      "page_count": 2,
-      "orientation": "portrait",
-      "engine": "word",
-      "dpi": 0
-    },
-    {
-      "file_path": "C:/Users/Administrator/Desktop/[2026年6月22日修改]近代史判断简答题库.docx",
-      "copies": 1,
-      "duplex": "on",
-      "duplex_mode": "long-edge",
-      "page_range": "",
-      "page_count": 4,
-      "orientation": "portrait",
-      "engine": "word",
-      "dpi": 0
-    },
-    {
-      "file_path": "C:/Users/Administrator/Desktop/C&C++程序设计(2)习题集.docx",
-      "copies": 1,
-      "duplex": "on",
-      "duplex_mode": "long-edge",
-      "page_range": "",
-      "page_count": 24,
-      "orientation": "portrait",
-      "engine": "word",
-      "dpi": 0
-    },
-    {
-      "file_path": "C:/Users/Administrator/Desktop/延安大学西安创新学院2026年暑期留校承诺书（审核稿） (2).pdf",
-      "copies": 1,
-      "duplex": "on",
-      "duplex_mode": "long-edge",
-      "page_range": "",
-      "page_count": 2,
-      "orientation": "portrait",
-      "engine": "word",
-      "dpi": 0
-    },
-    {
-      "file_path": "C:/Users/Administrator/Desktop/只打印第五张.docx",
-      "copies": 1,
-      "duplex": "on",
-      "duplex_mode": "long-edge",
-      "page_range": "",
-      "page_count": 5,
-      "orientation": "portrait",
-      "engine": "wps",
-      "dpi": 0
-    },
-    {
-      "file_path": "C:/Users/Administrator/Desktop/一张.docx",
-      "copies": 1,
-      "duplex": "on",
-      "duplex_mode": "long-edge",
-      "page_range": "",
-      "page_count": 1,
-      "orientation": "portrait",
-      "engine": "wps",
-      "dpi": 0
-    }
-  ]
+  "jobs": []
 }
