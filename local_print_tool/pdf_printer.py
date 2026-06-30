@@ -233,7 +233,7 @@ def print_pdf(
                 f"duplex={duplex}/{duplex_mode}, copies={copies}, pages='{page_range}', orientation='{orientation}'")
 
     if system == "Windows":
-        # 方案 1: Windows 原生 GDI 打印
+        # 方案 1: Windows 原生 GDI 打印（驱动级双面/份数控制，最可靠）
         print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
         if ok:
@@ -247,12 +247,14 @@ def print_pdf(
             print(f"[打印] 方案2: 降级为 SumatraPDF ({sumatra})")
             logger.info(f"原生 GDI 失败，降级 SumatraPDF: {sumatra}")
             ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
-            print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
-            return ok, msg
+            if ok:
+                print(f"[打印] ✓ 成功 ({msg})")
+                return True, msg
+            print(f"[打印] ✗ SumatraPDF 失败: {msg}")
+            logger.info(f"SumatraPDF 也失败: {msg}")
 
         # 方案 3: 应用层循环打印（最可靠兜底）
         print("[打印] 方案3: 应用层循环打印（兜底）...")
-        logger.warning("原生和 SumatraPDF 均不可用，使用循环打印")
         ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation)
         print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
         return ok, msg
@@ -539,12 +541,15 @@ def _print_via_sumatra(
 ) -> tuple[bool, str]:
     """使用 SumatraPDF 命令行进行静默打印。
 
-    SumatraPDF 会根据 PDF 内部元数据自动处理页面方向，无需显式指定。
-    orientation 参数仅用于日志记录。
-
-    当双面 + 多份 + 选中页数为单数时，自动改为逐份打印（copies=1），
-    确保每份副本从新纸张开始，不会出现跨份共页的问题。
+    先通过 DEVMODE 配置打印机（双面/份数），确保打印机驱动不忽略参数。
     """
+    # 先配置打印机 DEVMODE，确保驱动层面参数正确
+    if printer_name:
+        try:
+            _get_printer_devmode(printer_name, duplex, duplex_mode, orientation)
+        except Exception as e:
+            logger.warning(f"SumatraPDF 前 DEVMODE 配置失败: {e}")
+
     # 单数页 + 双面 + 多份 → 逐份打印，确保副本独立
     if duplex == "on" and copies > 1:
         info = get_pdf_info(pdf_path)

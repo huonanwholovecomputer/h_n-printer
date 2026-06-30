@@ -1,0 +1,26 @@
+cd C:\Users\Administrator\WeChatProjects\printer-backend
+scp root@82.156.66.18:/home/printer-backend/orders.db .
+
+scp -r . root@82.156.66.18:/home/printer-backend/
+
+
+或者：
+cd C:\Users\Administrator\WeChatProjects\printer-backend
+scp root@82.156.66.18:/home/printer-backend/orders.db .
+rsync -avz --exclude 'orders.db' --exclude 'uploads/' --exclude '__pycache__/' --exclude 'venv/' --exclude '*.pyc' . root@82.156.66.18:/home/printer-backend/
+
+
+
+ssh root@82.156.66.18
+
+cd /home/printer-backend
+source venv/bin/activate
+pip install -r requirements.txt
+systemctl restart printer-backend
+systemctl status printer-backend
+
+
+
+journalctl -u printer-backend --since "1 minute ago" -f  # 检查最新日志
+
+curl http://127.0.0.1:5000/api/ping  # 验证更新是否生效

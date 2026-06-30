@@ -5,5 +5,16 @@
   "simplex_price": 0.2,
   "duplex_price": 0.3,
   "last_dir": "C:/Users/Administrator/Desktop",
-  "jobs": []
+  "jobs": [
+    {
+      "file_path": "C:/Users/Administrator/Documents/xwechat_files/wxid_gte01inc1og222_22a7/msg/file/2026-06/历史.pdf",
+      "copies": 1,
+      "duplex": "on",
+      "duplex_mode": "long-edge",
+      "page_range": "",
+      "page_count": 10,
+      "orientation": "portrait",
+      "engine": "word"
+    }
+  ]
 }
