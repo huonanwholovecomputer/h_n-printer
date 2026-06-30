@@ -80,13 +80,13 @@ def _truncate_filename(filename: str, max_width: int = 26) -> str:
     格式: base[...][.ext]，超出部分用三个点替代。
     例: "PixPin_2026-06-30_20-24-28.jpg" → "PixPin_2026-06-30...[.jpg]"
     """
-    def _display_width(s: str) -> int:
-        w = 0
+    def _display_width(s: str) -> float:
+        w = 0.0
         for ch in s:
-            if ord(ch) > 0x2000:  # 中文/全角字符占2个显示位
-                w += 2
+            if ord(ch) > 0x2000:  # 中文/全角字符占1.5个显示位
+                w += 1.5
             else:
-                w += 1
+                w += 1.0
         return w
 
     base, ext = os.path.splitext(filename)
@@ -104,9 +104,9 @@ def _truncate_filename(filename: str, max_width: int = 26) -> str:
 
     # 逐字符截断 base
     truncated = ""
-    w = 0
+    w = 0.0
     for ch in base:
-        cw = 2 if ord(ch) > 0x2000 else 1
+        cw = 1.5 if ord(ch) > 0x2000 else 1.0
         if w + cw > available:
             break
         truncated += ch
