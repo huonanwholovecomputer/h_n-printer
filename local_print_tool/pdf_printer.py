@@ -419,11 +419,19 @@ def _print_pdf_native(
                     pix.samples, "raw", "RGB", pix.stride, 1,
                 )
 
-                x = (printable_w - pix.width) // 2
-                y = (printable_h - pix.height) // 2
+                # ── 将渲染 DPI 的 pixmap 映射到打印机原生 DPI 的物理尺寸 ──
+                # pix 尺寸基于 render_dpi（如400），但设备坐标基于 native_dpi（如600）
+                # 必须按打印机原生 DPI 计算目标矩形，否则打印尺寸会偏小
+                page_rect = page.rect  # PDF 点数 (1/72 inch)
+                page_w_device = int(page_rect.width * native_dpi_x / 72.0)
+                page_h_device = int(page_rect.height * native_dpi_y / 72.0)
+
+                x = (printable_w - page_w_device) // 2
+                y = (printable_h - page_h_device) // 2
 
                 dib = ImageWin.Dib(img)
-                dib.draw(hdc.GetHandleOutput(), (x, y, x + pix.width, y + pix.height))
+                dib.draw(hdc.GetHandleOutput(),
+                         (x, y, x + page_w_device, y + page_h_device))
 
                 hdc.EndPage()
                 print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (PDF p.{page_idx + 1}, 第 {copy_idx + 1} 份)")
