@@ -948,7 +948,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._duplex_price_spin)
         layout.addWidget(QLabel("元/张"))
 
-        layout.addWidget(QLabel(" 渲染:"))
+        layout.addWidget(QLabel(" DPI:"))
 
         self._render_dpi_combo = QComboBox()
         self._render_dpi_combo.addItems(["高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
@@ -1107,7 +1107,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._refresh_engine_availability)
 
         # 渲染质量（逐文件）
-        label_dpi = QLabel("渲染质量:")
+        label_dpi = QLabel("DPI:")
         gl.addWidget(label_dpi)
         self._edit_dpi = QComboBox()
         self._edit_dpi.addItems(["跟随全局(默认)", "高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
@@ -1925,7 +1925,7 @@ class MainWindow(QMainWindow):
         for row in range(start_row, self._table.rowCount()):
             file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
             ext = os.path.splitext(file_path)[1].lower()
-            if ext == ".pdf" or ext in image_exts:
+            if ext == ".pdf":
                 continue
 
             self._table.item(row, self.COL_PAGES).setText("...")
@@ -2031,13 +2031,12 @@ class MainWindow(QMainWindow):
     def _on_undo_clear(self):
         """撤回清空操作，恢复任务列表并重新转换。"""
         self._clear_undo_timer.stop()
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         for row, job in enumerate(self._cleared_jobs_backup):
             self._config.jobs.append(job)
             self._add_table_row(job)
             # 需要转换的文件重新启动后台转换
             ext = os.path.splitext(job.file_path)[1].lower()
-            if ext not in (".pdf",) and ext not in image_exts:
+            if ext != ".pdf":
                 self._table.item(row, self.COL_PAGES).setText("...")
                 self._start_convert_worker(row, job.file_path, job.engine)
         self._cleared_jobs_backup.clear()
@@ -2144,7 +2143,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v3.0</h3>"
+            "<h3>HN 本地打印工具 v3.1</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
