@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QTextEdit,
+    QDialog,
     QFileDialog,
     QMessageBox,
     QMenuBar,
@@ -52,10 +53,11 @@ from PySide6.QtWidgets import (
     QStyleFactory,
 )
 
-from printer_config import PrinterConfig, PrintJob, calc_cost
+from printer_config import PrinterConfig, PrintJob, calc_cost, generate_order_number
 from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
+from cloud_client import CloudClient, CloudTask
 
 logger = logging.getLogger(__name__)
 
@@ -83,22 +85,22 @@ def _disable_combo_wheel(combo: QComboBox) -> None:
 
 
 def _truncate_filename(filename: str, max_width: int = 52) -> str:
-    """截断文件名到指定显示宽度（中文=2单位，ASCII=1单位）。
+    """截断文件名到指定显示宽度（中文=1.5，ASCII=1）。
 
-    格式: base[...][.ext]，超出部分用三个点替代。
-    例: "PixPin_2026-06-30_20-24-28.jpg" → "PixPin_2026-06-30...[.jpg]"
+    格式: base.ext，超出部分用...替代。
+    例: "PixPin_2026-06-30_20-24-28.jpg" → "PixPin_2026-06-30....jpg"
     """
     def _display_width(s: str) -> float:
         w = 0.0
         for ch in s:
-            if ord(ch) > 0x2000:  # 中文/全角字符占1.5个显示位
+            if ord(ch) > 0x2000:
                 w += 1.5
             else:
                 w += 1.0
         return w
 
     base, ext = os.path.splitext(filename)
-    suffix = f"[{ext}]"
+    suffix = ext  # 含点，如 ".pdf"
     suffix_w = _display_width(suffix)
 
     full_w = _display_width(base) + suffix_w
@@ -732,6 +734,119 @@ class DropTableWidget(QTableWidget):
 
 
 # ============================================================
+# 地点管理对话框
+# ============================================================
+
+class LocationManagerDialog(QDialog):
+    """管理派送地点及百分比。"""
+
+    def __init__(self, locations: dict[str, float], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("管理派送地点")
+        self.setMinimumSize(400, 300)
+        self.resize(450, 350)
+        self._locations = dict(locations)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # 表格：地点名称 | 百分比
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["地点名称", "百分比"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
+        self._table.setColumnWidth(1, 80)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._on_context_menu)
+        layout.addWidget(self._table)
+
+        # 添加按钮 — 置于表格下方（参考文件列表样式）
+        btn_add = QPushButton("📂 添加地点")
+        btn_add.clicked.connect(self._on_add)
+        layout.addWidget(btn_add)
+
+        # 确定 / 取消
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        btn_ok = QPushButton("确定")
+        btn_ok.clicked.connect(self._on_ok)
+        bottom.addWidget(btn_ok)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        bottom.addWidget(btn_cancel)
+        layout.addLayout(bottom)
+
+        self._populate_table()
+
+    def _populate_table(self):
+        self._table.setRowCount(0)
+        for name, pct in self._locations.items():
+            self._add_row(name, pct)
+
+    def _add_row(self, name: str = "", pct: float = 0.0):
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+
+        name_item = QTableWidgetItem(name)
+        self._table.setItem(row, 0, name_item)
+
+        pct_spin = QDoubleSpinBox()
+        pct_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        pct_spin.setRange(0.0, 100.0)
+        pct_spin.setDecimals(0)
+        pct_spin.setSingleStep(1)
+        pct_spin.setSuffix("%")
+        pct_spin.setValue(pct)
+        pct_spin.setMaximumWidth(70)
+        self._table.setCellWidget(row, 1, pct_spin)
+
+    def _on_add(self):
+        self._add_row("新地点", 0.0)
+        row = self._table.rowCount() - 1
+        self._table.selectRow(row)
+        self._table.editItem(self._table.item(row, 0))
+        self._table.scrollToBottom()
+
+    def _on_context_menu(self, pos):
+        """右键菜单：删除选中地点。"""
+        item = self._table.itemAt(pos)
+        if item is None:
+            return
+        row = item.row()
+        self._table.selectRow(row)
+        name = self._table.item(row, 0).text()
+
+        menu = QMenu(self)
+        del_action = menu.addAction(f"删除「{name}」")
+        action = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if action == del_action:
+            reply = QMessageBox.question(self, "确认删除", f"确定要删除地点「{name}」吗？")
+            if reply == QMessageBox.Yes:
+                self._table.removeRow(row)
+
+    def _on_ok(self):
+        new_locations: dict[str, float] = {}
+        for row in range(self._table.rowCount()):
+            name = self._table.item(row, 0).text().strip()
+            if not name:
+                continue
+            pct_widget = self._table.cellWidget(row, 1)
+            pct = pct_widget.value() if pct_widget else 0.0
+            new_locations[name] = pct
+        if not new_locations:
+            QMessageBox.warning(self, "提示", "至少需要保留一个地点。")
+            return
+        self._locations = new_locations
+        self.accept()
+
+    def get_locations(self) -> dict[str, float]:
+        return self._locations
+
+
+# ============================================================
 # 主窗口
 # ============================================================
 
@@ -758,6 +873,12 @@ class MainWindow(QMainWindow):
         self._copy_total_btn: Optional[QPushButton] = None
         self._copy_total_timer: Optional[QTimer] = None
 
+        # ── 云端客户端 ──
+        self._cloud_client: CloudClient | None = None
+        self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
+        self._cloud_task_widgets: dict[int, QWidget] = {}  # task_id → 面板控件
+        self._cloud_origin_files: dict[str, int] = {}  # file_path → task_id 映射
+
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "HN_printer.png")
@@ -768,6 +889,70 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._load_config_to_ui()
+        self._init_cloud_client()
+
+    # ---- 云端连接 ----
+
+    def _init_cloud_client(self):
+        """初始化云打印客户端（根据配置决定是否自动连接）。"""
+        import socket
+        client_id = socket.gethostname()
+
+        self._cloud_client = CloudClient(
+            api_url=self._config.cloud_api_url,
+            ws_url=self._config.cloud_ws_url,
+            token=self._config.cloud_token,
+            client_id=client_id,
+            parent=self,
+        )
+
+        # 连接信号
+        self._cloud_client.task_received.connect(self._on_cloud_task_received)
+        self._cloud_client.task_updated.connect(self._on_cloud_task_updated)
+        self._cloud_client.connection_changed.connect(self._on_cloud_connection_changed)
+        self._cloud_client.status_message.connect(self._on_cloud_status_message)
+
+        # 如果配置了 token 且启用了云端，自动连接
+        if self._config.cloud_enabled and self._config.cloud_token:
+            self._cloud_client.start()
+            self._update_cloud_connect_button()
+
+    def _toggle_cloud_connection(self):
+        """切换云端连接状态。"""
+        if not self._cloud_client:
+            return
+        if self._cloud_client.is_connected():
+            self._cloud_client.stop()
+            self._update_cloud_connect_button()
+        else:
+            # 从 UI 读取配置并更新
+            self._config.cloud_api_url = self._cloud_api_input.text().strip()
+            self._config.cloud_ws_url = self._cloud_ws_input.text().strip()
+            self._config.cloud_token = self._cloud_token_input.text().strip()
+            self._config.cloud_enabled = True
+            self._cloud_client.api_url = self._config.cloud_api_url
+            self._cloud_client.ws_url = self._config.cloud_ws_url
+            self._cloud_client.token = self._config.cloud_token
+            self._cloud_client.start()
+            self._update_cloud_connect_button()
+
+    def _update_cloud_connect_button(self):
+        """更新云端连接按钮的外观。"""
+        if self._cloud_client and self._cloud_client.is_connected():
+            self._cloud_connect_btn.setText("☁ 断开")
+            self._cloud_connect_btn.setObjectName("cloudConnected")
+            self._cloud_status_label.setText("🟢 已连接")
+            self._cloud_status_label.setObjectName("cloudStatusOn")
+        else:
+            self._cloud_connect_btn.setText("☁ 连接")
+            self._cloud_connect_btn.setObjectName("cloudDisconnected")
+            self._cloud_status_label.setText("🔴 未连接")
+            self._cloud_status_label.setObjectName("cloudStatusOff")
+        # 强制刷新样式
+        self._cloud_connect_btn.style().unpolish(self._cloud_connect_btn)
+        self._cloud_connect_btn.style().polish(self._cloud_connect_btn)
+        self._cloud_status_label.style().unpolish(self._cloud_status_label)
+        self._cloud_status_label.style().polish(self._cloud_status_label)
 
     # ---- UI 构建 ----
 
@@ -836,6 +1021,12 @@ class MainWindow(QMainWindow):
         open_action = QAction("打开(&O)", self)
         open_action.triggered.connect(self._on_add_files)
         file_menu.addAction(open_action)
+
+        file_menu.addSeparator()
+
+        locations_action = QAction("地点(&L)", self)
+        locations_action.triggered.connect(self._on_manage_locations)
+        file_menu.addAction(locations_action)
 
         file_menu.addSeparator()
 
@@ -930,6 +1121,7 @@ class MainWindow(QMainWindow):
         self._simplex_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
         self._simplex_price_spin.setRange(0.01, 99.99)
         self._simplex_price_spin.setDecimals(2)
+        self._simplex_price_spin.setSingleStep(0.01)
         self._simplex_price_spin.setValue(self._config.simplex_price)
         self._simplex_price_spin.setFixedWidth(60)
         self._simplex_price_spin.valueChanged.connect(self._on_price_changed)
@@ -942,6 +1134,7 @@ class MainWindow(QMainWindow):
         self._duplex_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
         self._duplex_price_spin.setRange(0.01, 99.99)
         self._duplex_price_spin.setDecimals(2)
+        self._duplex_price_spin.setSingleStep(0.01)
         self._duplex_price_spin.setValue(self._config.duplex_price)
         self._duplex_price_spin.setFixedWidth(60)
         self._duplex_price_spin.valueChanged.connect(self._on_price_changed)
@@ -959,12 +1152,211 @@ class MainWindow(QMainWindow):
 
         root.addLayout(layout)
 
+        # ---- 第二行：附加服务全局配置 ----
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        # —— 先创建所有控件 ——
+
+        # 派送开关
+        self._delivery_onoff_combo = QComboBox()
+        self._delivery_onoff_combo.addItems(["否", "是"])
+        _disable_combo_wheel(self._delivery_onoff_combo)
+        self._delivery_onoff_combo.currentIndexChanged.connect(self._on_delivery_toggled)
+
+        # 派送地点
+        self._delivery_location_combo = QComboBox()
+        self._delivery_location_combo.addItems(list(self._config.delivery_percentages.keys()))
+        _disable_combo_wheel(self._delivery_location_combo)
+        self._delivery_location_combo.currentIndexChanged.connect(self._on_delivery_location_changed)
+
+        # 派送百分比
+        self._delivery_percent_spin = QDoubleSpinBox()
+        self._delivery_percent_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self._delivery_percent_spin.setRange(0.0, 100.0)
+        self._delivery_percent_spin.setDecimals(0)
+        self._delivery_percent_spin.setSingleStep(1)
+        self._delivery_percent_spin.setSuffix("%")
+        self._delivery_percent_spin.setFixedWidth(60)
+        self._delivery_percent_spin.valueChanged.connect(self._on_delivery_percent_changed)
+
+        # 优先程度
+        self._urgency_combo = QComboBox()
+        self._urgency_combo.addItems(list(self._config.urgency_prices.keys()))
+        _disable_combo_wheel(self._urgency_combo)
+        self._urgency_combo.currentIndexChanged.connect(self._on_urgency_changed)
+
+        # 优先级价格
+        self._urgency_price_spin = QDoubleSpinBox()
+        self._urgency_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self._urgency_price_spin.setRange(0.0, 99.99)
+        self._urgency_price_spin.setDecimals(2)
+        self._urgency_price_spin.setSingleStep(0.01)
+        self._urgency_price_spin.setFixedWidth(60)
+        self._urgency_price_spin.valueChanged.connect(self._on_urgency_price_changed)
+
+        # 首页开关
+        self._cover_page_onoff_combo = QComboBox()
+        self._cover_page_onoff_combo.addItems(["否", "是"])
+        _disable_combo_wheel(self._cover_page_onoff_combo)
+        self._cover_page_onoff_combo.currentIndexChanged.connect(self._on_price_changed)
+
+        # 首页价格
+        self._cover_page_price_spin = QDoubleSpinBox()
+        self._cover_page_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self._cover_page_price_spin.setRange(0.0, 99.99)
+        self._cover_page_price_spin.setDecimals(2)
+        self._cover_page_price_spin.setSingleStep(0.01)
+        self._cover_page_price_spin.setValue(self._config.cover_page_price)
+        self._cover_page_price_spin.setFixedWidth(60)
+        self._cover_page_price_spin.valueChanged.connect(self._on_price_changed)
+
+        # —— 派送/地点居左 + 优先级居右 + 首页居右 ——
+
+        # Group 1: 派送（居左，最小宽度）
+        g1 = QHBoxLayout()
+        g1.setSpacing(2)
+        g1.addWidget(QLabel("派送:"))
+        g1.addWidget(self._delivery_onoff_combo)
+        row2.addLayout(g1)
+
+        row2.addSpacing(12)
+
+        # Group 2: 地点（居左，平分剩余空间）
+        g2 = QHBoxLayout()
+        g2.setSpacing(2)
+        g2.addWidget(QLabel("地点:"))
+        g2.addWidget(self._delivery_location_combo)
+        g2.addWidget(self._delivery_percent_spin)
+        g2.addStretch()
+        row2.addLayout(g2, 1)
+
+        # Group 3: 优先级（居右，平分剩余空间）
+        g3 = QHBoxLayout()
+        g3.setSpacing(2)
+        g3.addStretch()
+        g3.addWidget(QLabel("优先级:"))
+        g3.addWidget(self._urgency_combo)
+        g3.addWidget(self._urgency_price_spin)
+        g3.addWidget(QLabel("元"))
+        row2.addLayout(g3, 1)
+
+        row2.addSpacing(12)
+
+        # Group 4: 首页（居右，最小宽度）
+        g4 = QHBoxLayout()
+        g4.setSpacing(2)
+        g4.addStretch()
+        g4.addWidget(QLabel("首页:"))
+        g4.addWidget(self._cover_page_onoff_combo)
+        g4.addWidget(self._cover_page_price_spin)
+        g4.addWidget(QLabel("元"))
+        row2.addLayout(g4)
+
+        # 初始状态：派送=否时禁用地点和百分比
+        self._delivery_location_combo.setEnabled(False)
+        self._delivery_percent_spin.setEnabled(False)
+
+        root.addLayout(row2)
+
+        # —— Row 3: 云端连接配置 ——
+        row3 = QHBoxLayout()
+        row3.setSpacing(6)
+
+        row3.addWidget(QLabel("☁ 云端:"))
+
+        # 云端开关
+        self._cloud_status_label = QLabel("🔴 未连接")
+        self._cloud_status_label.setObjectName("cloudStatusOff")
+        row3.addWidget(self._cloud_status_label)
+
+        row3.addWidget(QLabel("API:"))
+        self._cloud_api_input = QLineEdit(self._config.cloud_api_url)
+        self._cloud_api_input.setPlaceholderText("https://hn-space.cn")
+        self._cloud_api_input.setFixedWidth(180)
+        row3.addWidget(self._cloud_api_input)
+
+        row3.addWidget(QLabel("WS:"))
+        self._cloud_ws_input = QLineEdit(self._config.cloud_ws_url)
+        self._cloud_ws_input.setPlaceholderText("wss://hn-space.cn")
+        self._cloud_ws_input.setFixedWidth(180)
+        row3.addWidget(self._cloud_ws_input)
+
+        row3.addWidget(QLabel("Token:"))
+        self._cloud_token_input = QLineEdit(self._config.cloud_token)
+        self._cloud_token_input.setPlaceholderText("打印机认证token")
+        self._cloud_token_input.setEchoMode(QLineEdit.Password)
+        self._cloud_token_input.setFixedWidth(150)
+        row3.addWidget(self._cloud_token_input)
+
+        self._cloud_connect_btn = QPushButton("☁ 连接")
+        self._cloud_connect_btn.setObjectName("cloudDisconnected")
+        self._cloud_connect_btn.setFixedWidth(80)
+        self._cloud_connect_btn.clicked.connect(self._toggle_cloud_connection)
+        row3.addWidget(self._cloud_connect_btn)
+
+        row3.addStretch()
+        root.addLayout(row3)
+
+        # 统一输入框高度为下拉框高度（延迟到布局完成后测量实际高度）
+        def _normalize_spin_heights():
+            combo_h = self._printer_combo.height()
+            if combo_h > 0:
+                for sp in (self._simplex_price_spin, self._duplex_price_spin,
+                           self._delivery_percent_spin, self._urgency_price_spin,
+                           self._cover_page_price_spin):
+                    sp.setFixedHeight(combo_h)
+                for le in (self._cloud_api_input, self._cloud_ws_input, self._cloud_token_input):
+                    le.setFixedHeight(combo_h)
+        QTimer.singleShot(0, _normalize_spin_heights)
+
     def _setup_file_table(self) -> QWidget:
-        """左侧：文件列表表格。"""
+        """左侧：云端任务面板 + 本地文件列表表格。"""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
+        # ── 云端任务面板（可折叠） ──
+        self._cloud_panel_header = QWidget()
+        header_layout = QHBoxLayout(self._cloud_panel_header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(4)
+
+        self._cloud_panel_toggle = QPushButton("☁ 云端待处理 (0)")
+        self._cloud_panel_toggle.setObjectName("cloudPanelToggle")
+        self._cloud_panel_toggle.setCheckable(True)
+        self._cloud_panel_toggle.setChecked(True)
+        self._cloud_panel_toggle.toggled.connect(self._on_toggle_cloud_panel)
+        header_layout.addWidget(self._cloud_panel_toggle)
+
+        self._cloud_badge = QLabel("")
+        self._cloud_badge.setObjectName("cloudBadge")
+        header_layout.addWidget(self._cloud_badge)
+        header_layout.addStretch()
+
+        self._cloud_refresh_btn = QPushButton("🔄 拉取")
+        self._cloud_refresh_btn.setToolTip("手动拉取云端排队任务")
+        self._cloud_refresh_btn.clicked.connect(self._on_cloud_pull)
+        header_layout.addWidget(self._cloud_refresh_btn)
+
+        layout.addWidget(self._cloud_panel_header)
+
+        # 云端任务列表区域（可折叠）
+        self._cloud_tasks_container = QWidget()
+        self._cloud_tasks_layout = QVBoxLayout(self._cloud_tasks_container)
+        self._cloud_tasks_layout.setContentsMargins(0, 4, 0, 0)
+        self._cloud_tasks_layout.setSpacing(3)
+
+        self._cloud_empty_label = QLabel("暂无云端任务，等待小程序提交...")
+        self._cloud_empty_label.setObjectName("cloudEmptyLabel")
+        self._cloud_empty_label.setAlignment(Qt.AlignCenter)
+        self._cloud_tasks_layout.addWidget(self._cloud_empty_label)
+        self._cloud_tasks_layout.addStretch()
+
+        layout.addWidget(self._cloud_tasks_container)
+
+        # ── 本地任务列表 ──
         title = QLabel("📄 打印任务列表")
         title.setObjectName("sectionLabel")
         layout.addWidget(title)
@@ -1180,6 +1572,46 @@ class MainWindow(QMainWindow):
         dpi_map = {200: 0, 300: 1, 400: 2, 600: 3}
         self._render_dpi_combo.setCurrentIndex(dpi_map.get(self._config.render_dpi, 2))
 
+        # 附加服务
+        self._delivery_onoff_combo.blockSignals(True)
+        self._delivery_onoff_combo.setCurrentIndex(1 if self._config.delivery_enabled else 0)
+        self._delivery_onoff_combo.blockSignals(False)
+
+        # 刷新派送地点列表
+        self._delivery_location_combo.blockSignals(True)
+        self._delivery_location_combo.clear()
+        self._delivery_location_combo.addItems(list(self._config.delivery_percentages.keys()))
+        idx = self._delivery_location_combo.findText(self._config.delivery_location)
+        if idx >= 0:
+            self._delivery_location_combo.setCurrentIndex(idx)
+        self._delivery_location_combo.blockSignals(False)
+
+        self._delivery_percent_spin.blockSignals(True)
+        self._delivery_percent_spin.setValue(
+            self._config.delivery_percentages.get(self._config.delivery_location, 0.0))
+        self._delivery_percent_spin.blockSignals(False)
+
+        delivery_on = self._config.delivery_enabled
+        self._delivery_location_combo.setEnabled(delivery_on)
+        self._delivery_percent_spin.setEnabled(delivery_on)
+
+        self._urgency_combo.blockSignals(True)
+        self._urgency_combo.setCurrentText(self._config.urgency)
+        self._urgency_combo.blockSignals(False)
+
+        self._urgency_price_spin.blockSignals(True)
+        self._urgency_price_spin.setValue(
+            self._config.urgency_prices.get(self._config.urgency, 0.0))
+        self._urgency_price_spin.blockSignals(False)
+
+        self._cover_page_onoff_combo.blockSignals(True)
+        self._cover_page_onoff_combo.setCurrentIndex(1 if self._config.cover_page else 0)
+        self._cover_page_onoff_combo.blockSignals(False)
+
+        self._cover_page_price_spin.blockSignals(True)
+        self._cover_page_price_spin.setValue(self._config.cover_page_price)
+        self._cover_page_price_spin.blockSignals(False)
+
         self._rebuild_table()
 
     def _refresh_printer_list(self):
@@ -1206,6 +1638,8 @@ class MainWindow(QMainWindow):
         """单价变更 → 重算所有费用。"""
         self._config.simplex_price = self._simplex_price_spin.value()
         self._config.duplex_price = self._duplex_price_spin.value()
+        self._config.cover_page = (self._cover_page_onoff_combo.currentIndex() == 1)
+        self._config.cover_page_price = self._cover_page_price_spin.value()
         for row in range(self._table.rowCount()):
             self._recalc_row_cost(row)
         self._update_total_cost()
@@ -1219,6 +1653,54 @@ class MainWindow(QMainWindow):
         dpi_values = [200, 300, 400, 600]
         idx = self._render_dpi_combo.currentIndex()
         self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
+
+    # ---- 附加服务信号处理 ----
+
+    def _on_delivery_toggled(self):
+        """派送开关变更。"""
+        enabled = (self._delivery_onoff_combo.currentIndex() == 1)
+        self._config.delivery_enabled = enabled
+        self._delivery_location_combo.setEnabled(enabled)
+        self._delivery_percent_spin.setEnabled(enabled)
+        if enabled:
+            loc = self._delivery_location_combo.currentText()
+            pct = self._config.delivery_percentages.get(loc, 0.0)
+            self._delivery_percent_spin.blockSignals(True)
+            self._delivery_percent_spin.setValue(pct)
+            self._delivery_percent_spin.blockSignals(False)
+        self._on_price_changed()
+
+    def _on_delivery_location_changed(self):
+        """派送地点变更 → 更新百分比 spinbox。"""
+        loc = self._delivery_location_combo.currentText()
+        self._config.delivery_location = loc
+        pct = self._config.delivery_percentages.get(loc, 0.0)
+        self._delivery_percent_spin.blockSignals(True)
+        self._delivery_percent_spin.setValue(pct)
+        self._delivery_percent_spin.blockSignals(False)
+        self._on_price_changed()
+
+    def _on_delivery_percent_changed(self):
+        """派送百分比编辑 → 回写地点百分比表。"""
+        loc = self._delivery_location_combo.currentText()
+        self._config.delivery_percentages[loc] = self._delivery_percent_spin.value()
+        self._on_price_changed()
+
+    def _on_urgency_changed(self):
+        """优先级变更 → 更新价格 spinbox。"""
+        level = self._urgency_combo.currentText()
+        self._config.urgency = level
+        price = self._config.urgency_prices.get(level, 0.0)
+        self._urgency_price_spin.blockSignals(True)
+        self._urgency_price_spin.setValue(price)
+        self._urgency_price_spin.blockSignals(False)
+        self._on_price_changed()
+
+    def _on_urgency_price_changed(self):
+        """紧急价格编辑 → 回写紧急价格表。"""
+        level = self._urgency_combo.currentText()
+        self._config.urgency_prices[level] = self._urgency_price_spin.value()
+        self._on_price_changed()
 
     def _sync_ui_to_config(self):
         """将 UI 控件数据同步回配置对象。"""
@@ -1235,6 +1717,13 @@ class MainWindow(QMainWindow):
         self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
 
         self._config.last_dir = self._last_dir
+
+        # 附加服务
+        self._config.delivery_enabled = (self._delivery_onoff_combo.currentIndex() == 1)
+        self._config.delivery_location = self._delivery_location_combo.currentText()
+        self._config.urgency = self._urgency_combo.currentText()
+        self._config.cover_page = (self._cover_page_onoff_combo.currentIndex() == 1)
+        self._config.cover_page_price = self._cover_page_price_spin.value()
 
         # jobs 已通过表格实时维护，这里不需要再同步
 
@@ -1424,16 +1913,27 @@ class MainWindow(QMainWindow):
 
     def _update_total_cost(self):
         """重新计算并更新合计费用标签。"""
-        total = 0.0
+        base_total = 0.0  # 纸张费用合计（用于计算派送百分比）
         all_known = True
         for row in range(self._table.rowCount()):
             cost_item = self._table.item(row, self.COL_COST)
             if cost_item:
                 c = cost_item.data(Qt.UserRole)
                 if isinstance(c, (int, float)) and c > 0:
-                    total += c
+                    base_total += c
                 elif cost_item.text() == "?":
                     all_known = False
+
+        total = base_total
+
+        # 订单级附加费用
+        if self._config.delivery_enabled:
+            pct = self._config.delivery_percentages.get(self._config.delivery_location, 0.0)
+            total += base_total * (pct / 100.0)
+        total += self._config.urgency_prices.get(self._config.urgency, 0.0)
+        if self._config.cover_page:
+            total += self._config.cover_page_price
+
         if total > 0:
             prefix = "≈ " if not all_known else ""
             self._total_label.setText(f"合计: {prefix}¥{total:.2f}")
@@ -1481,9 +1981,13 @@ class MainWindow(QMainWindow):
         """复制计费明细到剪贴板。"""
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         lines = ["计费明细", "─" * 14]
-        total_parts: list[str] = []
+        all_parts: list[str] = []  # 所有费用项的值，用于合计公式
+        base_total = 0.0  # 纸张费用合计（用于计算派送费）
+        item_num = 0
 
+        # ── 1. 逐文件打印明细 ──
         for row in range(self._table.rowCount()):
+            item_num += 1
             file_item = self._table.item(row, self.COL_FILE)
             file_path = file_item.data(Qt.UserRole) if file_item else ""
             filename = file_item.text() if file_item else "?"
@@ -1491,13 +1995,8 @@ class MainWindow(QMainWindow):
             duplex = self._table.item(row, self.COL_DUPLEX).text()
             page_range = self._table.item(row, self.COL_RANGE).text()
             orient = self._table.item(row, self.COL_ORIENT).text()
-            cost_item = self._table.item(row, self.COL_COST)
-            cost_text = cost_item.text() if cost_item else "?"
 
-            # 文件名格式：name[.ext]，超长自动截断
             display_name = _truncate_filename(filename)
-
-            # 图片：只显示份数和方向
             ext_lower = os.path.splitext(file_path)[1].lower()
             is_image = ext_lower in image_exts
 
@@ -1508,7 +2007,7 @@ class MainWindow(QMainWindow):
                 meta_line = " | ".join(meta_parts)
             else:
                 meta_parts = [f"{copies}份", duplex]
-                if page_range:
+                if page_range and page_range not in ("全部", "—"):
                     meta_parts.append(f"{page_range}页")
                 else:
                     meta_parts.append("全部页")
@@ -1516,19 +2015,69 @@ class MainWindow(QMainWindow):
                     meta_parts.append(orient)
                 meta_line = " | ".join(meta_parts)
 
-            lines.append(f"{row + 1}. {display_name}")
+            # 获取纸张费用
+            pages_text = self._table.item(row, self.COL_PAGES).text()
+            page_count = int(pages_text) if pages_text.isdigit() else 0
+            dup = "on" if "双" in duplex else "off"
+            pr = page_range if page_range not in ("全部", "—") else ""
+            paper_cost, paper_formula = calc_cost(page_count, int(copies), dup,
+                                                  self._config.simplex_price,
+                                                  self._config.duplex_price, pr)
+
+            lines.append(f"{item_num}. {display_name}")
             lines.append(f"   {meta_line}")
-            lines.append(f"   💰 {cost_text}")
+            if paper_cost > 0:
+                lines.append(f"   {paper_formula}=¥{paper_cost:.2f}")
+                all_parts.append(f"{paper_cost:.2f}")
+                base_total += paper_cost
+            elif page_count <= 0:
+                lines.append(f"   💰 ?")
 
-            # 提取金额用于合计
-            cost_val = cost_item.data(Qt.UserRole) if cost_item else 0
-            if isinstance(cost_val, (int, float)) and cost_val > 0:
-                total_parts.append(f"{cost_val:.2f}")
+        # ── 2. 派送 ──
+        item_num += 1
+        if self._config.delivery_enabled:
+            loc = self._config.delivery_location
+            pct = self._config.delivery_percentages.get(loc, 0.0)
+            delivery_cost = base_total * (pct / 100.0)
+            if pct > 0 and delivery_cost > 0:
+                lines.append(f"{item_num}. 派送：是 | {loc} {pct:.1f}% | ￥{delivery_cost:.2f}")
+                all_parts.append(f"{delivery_cost:.2f}")
+            else:
+                lines.append(f"{item_num}. 派送：是 | {loc}免费")
+        else:
+            lines.append(f"{item_num}. 派送：否")
 
+        # ── 3. 优先级 ──
+        item_num += 1
+        urgency_price = self._config.urgency_prices.get(self._config.urgency, 0.0)
+        if urgency_price > 0:
+            lines.append(f"{item_num}. 优先级：{self._config.urgency} | ￥{urgency_price:.2f}")
+            all_parts.append(f"{urgency_price:.2f}")
+        else:
+            lines.append(f"{item_num}. 优先级：{self._config.urgency} | ￥0")
+
+        # ── 4. 打印首页信息 ──
+        if self._config.cover_page:
+            item_num += 1
+            lines.append(f"{item_num}. 打印首页信息 | {self._config.cover_page_price:.2f}")
+            all_parts.append(f"{self._config.cover_page_price:.2f}")
+
+        # ── 合计 ──
         lines.append("─" * 14)
-        total_sum = sum(float(p) for p in total_parts) if total_parts else 0.0
-        formula = "+".join(total_parts) if total_parts else "0"
-        lines.append(f"合计: {formula}=¥{total_sum:.2f}")
+        total_sum = sum(float(p) for p in all_parts) if all_parts else 0.0
+        formula = "+".join(all_parts) if all_parts else "0"
+        lines.append(f"💰合计: {formula}=￥{total_sum:.2f}")
+
+        # ── 自取提示 ──
+        if not self._config.delivery_enabled:
+            order_no, next_num = generate_order_number(self._config.last_order_number)
+            self._config.last_order_number = next_num
+            from datetime import date
+            today = date.today()
+            short_no = f"{today.month}-{today.day}-{next_num:04d}"
+            lines.append("")
+            lines.append(f"⚠️ 您选择了自取，请凭{short_no}号码去[{self._config.pickup_address}]取件，请不要敲门，你必须提前联系打印机管理者才能取件，为保证良好的宿舍秩序，请提前10分钟询问是否可取件，不要过早或过晚。")
+
         QApplication.clipboard().setText("\n".join(lines))
         # 按钮反馈
         if self._copy_detail_btn:
@@ -1589,11 +2138,14 @@ class MainWindow(QMainWindow):
             engine = eng_rev.get(engine_text, "word")
             # DPI 不在表格中，从 config.jobs 保留
             job_dpi = self._config.jobs[row].dpi if row < len(self._config.jobs) else 0
+            # cached_pdf 也需要保留
+            job_cached_pdf = self._config.jobs[row].cached_pdf if row < len(self._config.jobs) else ""
             jobs.append(PrintJob(file_path=file_path, copies=copies, duplex=duplex,
                                  duplex_mode=duplex_mode,
                                  page_range=page_range, page_count=page_count,
                                  orientation=orientation, engine=engine,
-                                 dpi=job_dpi))
+                                 dpi=job_dpi,
+                                 cached_pdf=job_cached_pdf))
         self._config.jobs = jobs
 
     # ---- 事件处理 ----
@@ -1803,9 +2355,13 @@ class MainWindow(QMainWindow):
         if row < len(self._config.jobs):
             old_engine = self._config.jobs[row].engine
             self._config.jobs[row].engine = engine
+            self._config.jobs[row].copies = self._edit_copies.value()
             self._config.jobs[row].duplex = "on" if is_duplex else "off"
             dm_map = {0: "long-edge", 1: "short-edge"}
             self._config.jobs[row].duplex_mode = dm_map.get(self._edit_duplex_mode.currentIndex(), "long-edge")
+            # 页码范围（"全部" 对应空字符串）
+            pr = page_range if not is_image else ""
+            self._config.jobs[row].page_range = pr
             # 渲染 DPI
             dpi_values = [0, 200, 300, 400, 600]
             idx = self._edit_dpi.currentIndex()
@@ -1820,6 +2376,30 @@ class MainWindow(QMainWindow):
 
         self._recalc_row_cost(row)
         self._update_total_cost()
+
+    def _on_manage_locations(self):
+        """打开地点管理对话框。"""
+        dlg = LocationManagerDialog(self._config.delivery_percentages, self)
+        if dlg.exec() == QDialog.Accepted:
+            new_locs = dlg.get_locations()
+            self._config.delivery_percentages = new_locs
+            # 如果当前选中的地点已被删除，改为第一个
+            if self._config.delivery_location not in new_locs:
+                self._config.delivery_location = next(iter(new_locs))
+            # 刷新地点下拉框
+            self._delivery_location_combo.blockSignals(True)
+            self._delivery_location_combo.clear()
+            self._delivery_location_combo.addItems(list(new_locs.keys()))
+            idx = self._delivery_location_combo.findText(self._config.delivery_location)
+            if idx >= 0:
+                self._delivery_location_combo.setCurrentIndex(idx)
+            self._delivery_location_combo.blockSignals(False)
+            # 更新百分比显示
+            pct = new_locs.get(self._config.delivery_location, 0.0)
+            self._delivery_percent_spin.blockSignals(True)
+            self._delivery_percent_spin.setValue(pct)
+            self._delivery_percent_spin.blockSignals(False)
+            self._on_price_changed()
 
     def _on_add_files(self):
         """通过文件对话框添加文件。"""
@@ -2120,8 +2700,26 @@ class MainWindow(QMainWindow):
         self._status_label.setText(status)
 
     def _on_job_finished(self, idx: int, success: bool, message: str):
-        """单个任务完成回调（颜色已在打印开始时统一设绿）。"""
-        pass
+        """单个任务完成回调：恢复行颜色 + 上报云端。"""
+        # 恢复该行的正常颜色
+        if 0 <= idx < self._table.rowCount():
+            for col in range(self._table.columnCount()):
+                item = self._table.item(idx, col)
+                if item:
+                    item.setBackground(QColor(255, 255, 255, 0))
+
+        # 如果是云端任务，上报结果
+        if 0 <= idx < len(self._config.jobs):
+            job = self._config.jobs[idx]
+            file_path = job.file_path
+            task_id = self._cloud_origin_files.get(file_path)
+            if task_id is not None and self._cloud_client:
+                if success:
+                    self._cloud_client.report_success(task_id)
+                else:
+                    self._cloud_client.report_fail(task_id, message)
+                # 清理映射
+                del self._cloud_origin_files[file_path]
 
     def _on_all_finished(self, success_count: int, fail_count: int):
         """全部任务完成。"""
@@ -2246,15 +2844,241 @@ class MainWindow(QMainWindow):
             self._log_text.verticalScrollBar().maximum()
         )
 
+    # ---- 云端任务处理 ----
+
+    def _on_cloud_task_received(self, task: CloudTask):
+        """收到新的云端打印任务。"""
+        self._cloud_tasks[task.task_id] = task
+        self._rebuild_cloud_tasks_panel()
+        self._log(f"☁ 新任务 #{task.task_id}: {task.file_name}")
+
+    def _on_cloud_task_updated(self, task: CloudTask):
+        """云端任务状态更新（下载进度等）。"""
+        self._cloud_tasks[task.task_id] = task
+        if task.status == "error":
+            self._log(f"☁ 任务 #{task.task_id} 出错: {task.error_message}")
+        elif task.status == "ready":
+            self._log(f"☁ 任务 #{task.task_id} 下载完成，可加入打印列表")
+        self._rebuild_cloud_tasks_panel()
+
+    def _on_cloud_connection_changed(self, connected: bool):
+        """云端连接状态改变。"""
+        self._update_cloud_connect_button()
+
+    def _on_cloud_status_message(self, msg: str):
+        """云端日志消息 → 写入界面日志。"""
+        self._log(msg)
+
+    def _on_cloud_pull(self):
+        """手动拉取云端排队任务。"""
+        if self._cloud_client:
+            self._cloud_client.pull_pending()
+            self._log("☁ 已手动请求拉取云端排队任务")
+
+    def _on_toggle_cloud_panel(self, checked: bool):
+        """折叠/展开云端任务面板。"""
+        self._cloud_tasks_container.setVisible(checked)
+        if checked:
+            self._cloud_panel_toggle.setText(
+                f"☁ 云端待处理 ({len(self._cloud_tasks)})"
+            )
+        else:
+            self._cloud_panel_toggle.setText("☁ 云端待处理 ▸")
+
+    def _rebuild_cloud_tasks_panel(self):
+        """重建云端任务面板的卡片列表。"""
+        # 清空现有卡片
+        for w in self._cloud_task_widgets.values():
+            w.deleteLater()
+        self._cloud_task_widgets.clear()
+
+        # 移除空状态标签
+        self._cloud_empty_label.setVisible(False)
+
+        # 重建每张任务卡片
+        pending_tasks = [
+            t for t in self._cloud_tasks.values()
+            if t.status not in ("accepted", "rejected")
+        ]
+
+        if not pending_tasks:
+            self._cloud_empty_label.setVisible(True)
+            self._cloud_panel_toggle.setText("☁ 云端待处理 (0)")
+            self._cloud_badge.setText("")
+            return
+
+        self._cloud_panel_toggle.setText(f"☁ 云端待处理 ({len(pending_tasks)})")
+
+        for task in pending_tasks:
+            card = self._build_cloud_task_card(task)
+            # 在 stretch 之前插入
+            self._cloud_tasks_layout.insertWidget(
+                self._cloud_tasks_layout.count() - 1, card
+            )
+            self._cloud_task_widgets[task.task_id] = card
+
+    def _build_cloud_task_card(self, task: CloudTask) -> QWidget:
+        """为单个云端任务构建 UI 卡片。"""
+        card = QWidget()
+        card.setObjectName("cloudTaskCard")
+        outer = QVBoxLayout(card)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(2)
+
+        # 第一行：文件名 + 状态
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+
+        file_label = QLabel(f"📎 {task.file_name}")
+        file_label.setObjectName("cloudTaskFileName")
+        file_label.setWordWrap(False)
+        file_label.setMinimumWidth(200)
+        row1.addWidget(file_label, 1)
+
+        status_text = {
+            "pending": "⏳ 等待下载",
+            "downloading": f"⬇ {task.download_progress}%",
+            "ready": "✅ 就绪",
+            "error": f"❌ {task.error_message[:20]}",
+        }.get(task.status, task.status)
+        status_label = QLabel(status_text)
+        status_label.setObjectName(f"cloudTaskStatus_{task.status}")
+        row1.addWidget(status_label)
+
+        outer.addLayout(row1)
+
+        # 第二行：参数 + 操作按钮
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        params = []
+        params.append(f"📋 {task.copies}份")
+        params.append(f"{'🔄 双面' if task.duplex == 'on' else '📄 单面'}")
+        if task.page_range:
+            params.append(f"🔢 {task.page_range}")
+        if task.created_at:
+            params.append(f"🕐 {task.created_at}")
+
+        params_label = QLabel(" · ".join(params))
+        params_label.setObjectName("cloudTaskParams")
+        row2.addWidget(params_label, 1)
+
+        # 操作按钮
+        if task.status == "ready":
+            btn_accept = QPushButton("📥 加入打印列表")
+            btn_accept.setObjectName("cloudAcceptBtn")
+            btn_accept.setFixedWidth(130)
+            btn_accept.clicked.connect(
+                lambda checked=False, tid=task.task_id: self._on_cloud_accept(tid)
+            )
+            row2.addWidget(btn_accept)
+
+        elif task.status == "error":
+            btn_retry = QPushButton("🔄 重试")
+            btn_retry.setObjectName("cloudRetryBtn")
+            btn_retry.setFixedWidth(70)
+            btn_retry.clicked.connect(
+                lambda checked=False, tid=task.task_id: self._on_cloud_retry(tid)
+            )
+            row2.addWidget(btn_retry)
+
+        btn_reject = QPushButton("✕")
+        btn_reject.setObjectName("cloudRejectBtn")
+        btn_reject.setFixedSize(28, 28)
+        btn_reject.setToolTip("移除此任务")
+        btn_reject.clicked.connect(
+            lambda checked=False, tid=task.task_id: self._on_cloud_reject(tid)
+        )
+        row2.addWidget(btn_reject)
+
+        outer.addLayout(row2)
+        return card
+
+    def _on_cloud_accept(self, task_id: int):
+        """接受云端任务：下载完成后加入本地打印列表。"""
+        task = self._cloud_tasks.get(task_id)
+        if not task or task.status != "ready":
+            return
+        if not task.local_path or not os.path.exists(task.local_path):
+            self._log(f"☁ 任务 #{task_id} 文件不存在，请重试")
+            return
+
+        # 记录云来源映射（用于打印后上报）
+        self._cloud_origin_files[task.local_path] = task_id
+
+        # 加入本地打印列表（会按默认参数创建 PrintJob）
+        self._add_files_to_table([task.local_path])
+
+        # 将云端参数应用到刚刚加入的任务（最后一行）
+        if self._table.rowCount() > 0:
+            last_row = self._table.rowCount() - 1
+            job = self._config.jobs[last_row]
+
+            # 应用云端的份数、双面、页码范围
+            if task.copies > 0:
+                job.copies = task.copies
+            job.duplex = task.duplex if task.duplex in ("on", "off") else "on"
+            if task.page_range:
+                job.page_range = task.page_range
+
+            # 刷新表格行显示：份数、双面、页码范围
+            copies_item = self._table.item(last_row, self.COL_COPIES)
+            if copies_item:
+                copies_item.setText(str(job.copies))
+            duplex_item = self._table.item(last_row, self.COL_DUPLEX)
+            if duplex_item:
+                dm_label = job.duplex_mode or ""
+                if job.duplex == "on":
+                    display = "双面(长边)" if dm_label in ("long-edge", "") else f"双面({dm_label})"
+                else:
+                    display = "单面"
+                duplex_item.setText(display)
+            range_item = self._table.item(last_row, self.COL_RANGE)
+            if range_item:
+                range_item.setText(job.page_range if job.page_range.strip() else "全部")
+            self._recalc_row_cost(last_row)
+
+        # 从云端列表移除
+        task = self._cloud_client.accept_and_add_to_local(task_id)
+        if task:
+            self._cloud_tasks.pop(task_id, None)
+        self._rebuild_cloud_tasks_panel()
+
+        self._log(f"☁ 任务 #{task_id} 已加入本地打印列表")
+
+    def _on_cloud_reject(self, task_id: int):
+        """拒绝/移除云端任务。"""
+        if self._cloud_client:
+            self._cloud_client.reject_task(task_id)
+        self._cloud_tasks.pop(task_id, None)
+        self._rebuild_cloud_tasks_panel()
+        self._log(f"☁ 任务 #{task_id} 已移除")
+
+    def _on_cloud_retry(self, task_id: int):
+        """重试失败的云端任务下载。"""
+        if self._cloud_client:
+            self._cloud_client.accept_task(task_id)
+            self._log(f"☁ 重试下载任务 #{task_id}")
+
     # ---- 关闭事件 ----
 
     def closeEvent(self, event):
-        """关闭窗口时自动保存配置。"""
+        """关闭窗口时自动保存配置并断开云端。"""
         try:
+            # 保存 cloud 配置
+            self._config.cloud_api_url = self._cloud_api_input.text().strip()
+            self._config.cloud_ws_url = self._cloud_ws_input.text().strip()
+            self._config.cloud_token = self._cloud_token_input.text().strip()
+
             self._refresh_config_jobs_from_table()
             self._sync_ui_to_config()
             self._config.save(self._config_path)
             self._log(f"配置已自动保存至: {self._config_path}")
         except Exception as e:
             logger.warning(f"自动保存配置失败: {e}")
+
+        # 断开云端连接
+        if self._cloud_client:
+            self._cloud_client.stop()
+
         super().closeEvent(event)

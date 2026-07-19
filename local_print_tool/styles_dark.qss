@@ -357,6 +357,96 @@ QLabel#totalCostLabel {
     font-weight: bold;
 }
 
+/* ---------- 云端面板 ---------- */
+QPushButton#cloudConnected {
+    background-color: #a6e3a1;
+    color: #1e1e2e;
+    border-radius: 12px;
+    padding: 3px 12px;
+    font-weight: bold;
+}
+QPushButton#cloudDisconnected {
+    background-color: #89b4fa;
+    color: #1e1e2e;
+    border-radius: 12px;
+    padding: 3px 12px;
+    font-weight: bold;
+}
+QLabel#cloudStatusOn {
+    color: #a6e3a1;
+    font-weight: bold;
+}
+QLabel#cloudStatusOff {
+    color: #f38ba8;
+    font-weight: bold;
+}
+QPushButton#cloudPanelToggle {
+    background: transparent;
+    border: none;
+    color: #cdd6f4;
+    font-weight: bold;
+    text-align: left;
+    padding: 4px 0;
+}
+QWidget#cloudTaskCard {
+    background-color: #313244;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    margin: 1px 0;
+}
+QLabel#cloudTaskFileName {
+    color: #89b4fa;
+    font-weight: bold;
+}
+QLabel#cloudTaskParams {
+    color: #6c7086;
+    font-size: 12px;
+}
+QLabel#cloudTaskStatus_ready {
+    color: #a6e3a1;
+    font-weight: bold;
+    font-size: 12px;
+}
+QLabel#cloudTaskStatus_downloading {
+    color: #fab387;
+    font-size: 12px;
+}
+QLabel#cloudTaskStatus_error {
+    color: #f38ba8;
+    font-size: 12px;
+}
+QLabel#cloudTaskStatus_pending {
+    color: #6c7086;
+    font-size: 12px;
+}
+QPushButton#cloudAcceptBtn {
+    background-color: #a6e3a1;
+    color: #1e1e2e;
+    border-radius: 10px;
+    padding: 3px 10px;
+    font-size: 12px;
+    font-weight: bold;
+}
+QPushButton#cloudRejectBtn {
+    background-color: #f38ba8;
+    color: #1e1e2e;
+    border-radius: 14px;
+    font-size: 12px;
+    font-weight: bold;
+}
+QPushButton#cloudRetryBtn {
+    background-color: #fab387;
+    color: #1e1e2e;
+    border-radius: 10px;
+    padding: 3px 10px;
+    font-size: 12px;
+}
+QLabel#cloudEmptyLabel {
+    color: #6c7086;
+    font-size: 12px;
+    padding: 8px;
+}
+
 /* ---------- 提示信息 ---------- */
 QToolTip {
     background-color: #313244;

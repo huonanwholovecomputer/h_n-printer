@@ -159,6 +159,14 @@ def calc_cost(
     return cost, formula
 
 
+def generate_order_number(last_number: int) -> "tuple[str, int]":
+    """生成订单号 HNyyyymmdd-NNNN，返回 (编号字符串, 下一个计数器值)。"""
+    from datetime import date
+    today = date.today().strftime("%Y%m%d")
+    next_num = last_number + 1
+    return f"HN{today}-{next_num:04d}", next_num
+
+
 @dataclass
 class PrinterConfig:
     """
@@ -188,6 +196,32 @@ class PrinterConfig:
     simplex_price: float = 0.2
     duplex_price: float = 0.3
     last_dir: str = ""
+    # ---- 附加服务 ----
+    delivery_enabled: bool = False          # 是否派送
+    delivery_location: str = "1号楼北楼"    # 当前选中的派送地点
+    delivery_percentages: dict[str, float] = field(default_factory=lambda: {
+        "1号楼北楼": 0.0,
+        "1号楼南楼": 5.0,
+        "图书馆": 10.0,
+        "教学楼E/F": 25.0,
+        "女生宿舍": 10.0,
+    })  # 百分比（派送费 = 纸张费用 × 百分比/100）
+    urgency: str = "低"                     # 当前紧急程度
+    urgency_prices: dict[str, float] = field(default_factory=lambda: {
+        "低": 0.0,
+        "中": 0.08,
+        "高": 0.15,
+    })
+    cover_page: bool = False                # 是否打印首页信息
+    cover_page_price: float = 0.15          # 首页信息单价
+    pickup_address: str = "1号楼202宿舍"    # 自取地址
+    last_order_number: int = 0              # 订单号计数器
+    # ---- 云端配置 ----
+    cloud_enabled: bool = False             # 是否启用云端连接
+    cloud_api_url: str = "https://hn-space.cn"      # 云端 API 地址
+    cloud_ws_url: str = "wss://hn-space.cn"         # WebSocket 地址
+    cloud_token: str = ""                   # 打印机客户端认证 token
+    cloud_auto_accept: bool = False         # 是否自动接受云端任务（false=手动确认）
     jobs: list[PrintJob] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -199,6 +233,22 @@ class PrinterConfig:
             "simplex_price": self.simplex_price,
             "duplex_price": self.duplex_price,
             "last_dir": self.last_dir,
+            # 附加服务
+            "delivery_enabled": self.delivery_enabled,
+            "delivery_location": self.delivery_location,
+            "delivery_percentages": self.delivery_percentages,
+            "urgency": self.urgency,
+            "urgency_prices": self.urgency_prices,
+            "cover_page": self.cover_page,
+            "cover_page_price": self.cover_page_price,
+            "pickup_address": self.pickup_address,
+            "last_order_number": self.last_order_number,
+            # 云端配置
+            "cloud_enabled": self.cloud_enabled,
+            "cloud_api_url": self.cloud_api_url,
+            "cloud_ws_url": self.cloud_ws_url,
+            "cloud_token": self.cloud_token,
+            "cloud_auto_accept": self.cloud_auto_accept,
             "jobs": [job.to_dict() for job in self.jobs],
         }
 
@@ -214,6 +264,27 @@ class PrinterConfig:
             simplex_price=float(data.get("simplex_price", 0.2)),
             duplex_price=float(data.get("duplex_price", 0.3)),
             last_dir=data.get("last_dir", ""),
+            # 附加服务
+            delivery_enabled=bool(data.get("delivery_enabled", False)),
+            delivery_location=data.get("delivery_location", "1号楼北楼"),
+            delivery_percentages=data.get("delivery_percentages", data.get("delivery_locations", {
+                "1号楼北楼": 0.0, "1号楼南楼": 5.0,
+                "图书馆": 10.0, "教学楼E/F": 25.0, "女生宿舍": 10.0,
+            })),
+            urgency=data.get("urgency", "低"),
+            urgency_prices=data.get("urgency_prices", {
+                "低": 0.0, "中": 0.08, "高": 0.15,
+            }),
+            cover_page=bool(data.get("cover_page", False)),
+            cover_page_price=float(data.get("cover_page_price", 0.15)),
+            pickup_address=data.get("pickup_address", "1号楼202宿舍"),
+            last_order_number=int(data.get("last_order_number", 0)),
+            # 云端配置
+            cloud_enabled=bool(data.get("cloud_enabled", False)),
+            cloud_api_url=data.get("cloud_api_url", "https://hn-space.cn"),
+            cloud_ws_url=data.get("cloud_ws_url", "wss://hn-space.cn"),
+            cloud_token=data.get("cloud_token", ""),
+            cloud_auto_accept=bool(data.get("cloud_auto_accept", False)),
             jobs=jobs,
         )
 
