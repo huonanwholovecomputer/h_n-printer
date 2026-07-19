@@ -984,44 +984,121 @@ class MainWindow(QMainWindow):
         # 如果配置了 token 且启用了云端，自动连接
         if self._config.cloud_enabled and self._config.cloud_token:
             self._cloud_client.start()
-            self._update_cloud_connect_button()
+            self._update_cloud_status()
+
+    def _on_cloud_settings(self):
+        """打开云端连接设置对话框。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("☁ 云端连接设置")
+        dlg.setMinimumWidth(460)
+        dlg.setModal(True)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+        layout.setContentsMargins(20, 16, 20, 16)
+
+        # 说明文字
+        title = QLabel("<b>☁ 云打印服务器连接设置</b>")
+        layout.addWidget(title)
+        layout.addWidget(QLabel("连接到你部署的后端服务器，接收小程序/APP 提交的打印任务。"))
+
+        layout.addSpacing(8)
+
+        # API 地址
+        layout.addWidget(QLabel("API 地址:"))
+        api_input = QLineEdit(self._config.cloud_api_url)
+        api_input.setPlaceholderText("https://hn-space.cn")
+        layout.addWidget(api_input)
+
+        # WebSocket 地址
+        layout.addWidget(QLabel("WebSocket 地址:"))
+        ws_input = QLineEdit(self._config.cloud_ws_url)
+        ws_input.setPlaceholderText("wss://hn-space.cn")
+        layout.addWidget(ws_input)
+
+        # Token
+        layout.addWidget(QLabel("认证 Token:"))
+        token_input = QLineEdit(self._config.cloud_token)
+        token_input.setPlaceholderText("打印机认证 token")
+        token_input.setEchoMode(QLineEdit.Password)
+        layout.addWidget(token_input)
+
+        # 连接状态
+        layout.addSpacing(4)
+        status_text = "🟢 已连接" if (self._cloud_client and self._cloud_client.is_connected()) else "🔴 未连接"
+        status_label = QLabel(status_text)
+        layout.addWidget(status_label)
+
+        # 按钮行
+        layout.addSpacing(8)
+        btn_row = QHBoxLayout()
+
+        if self._cloud_client and self._cloud_client.is_connected():
+            disconnect_btn = QPushButton("断开连接")
+            disconnect_btn.setObjectName("cloudDisconnected")
+            disconnect_btn.clicked.connect(lambda: self._cloud_client.stop())
+            disconnect_btn.clicked.connect(lambda: status_label.setText("🔴 未连接"))
+            btn_row.addWidget(disconnect_btn)
+
+        btn_row.addStretch()
+
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(save_btn)
+
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(cancel_btn)
+
+        layout.addLayout(btn_row)
+
+        if dlg.exec() == QDialog.Accepted:
+            # 保存配置
+            self._config.cloud_api_url = api_input.text().strip()
+            self._config.cloud_ws_url = ws_input.text().strip()
+            self._config.cloud_token = token_input.text().strip()
+            self._config.cloud_enabled = True
+
+            # 更新 CloudClient 并连接
+            if self._cloud_client:
+                self._cloud_client.stop()
+                self._cloud_client.api_url = self._config.cloud_api_url
+                self._cloud_client.ws_url = self._config.cloud_ws_url
+                self._cloud_client.token = self._config.cloud_token
+                self._cloud_client.start()
+                self._update_cloud_status()
+            self._log("☁ 云端配置已保存，正在连接...")
 
     def _toggle_cloud_connection(self):
-        """切换云端连接状态。"""
+        """状态栏按钮：切换云端连接。"""
         if not self._cloud_client:
+            # 还没初始化 → 打开设置
+            self._on_cloud_settings()
             return
         if self._cloud_client.is_connected():
             self._cloud_client.stop()
-            self._update_cloud_connect_button()
         else:
-            # 从 UI 读取配置并更新
-            self._config.cloud_api_url = self._cloud_api_input.text().strip()
-            self._config.cloud_ws_url = self._cloud_ws_input.text().strip()
-            self._config.cloud_token = self._cloud_token_input.text().strip()
-            self._config.cloud_enabled = True
-            self._cloud_client.api_url = self._config.cloud_api_url
-            self._cloud_client.ws_url = self._config.cloud_ws_url
-            self._cloud_client.token = self._config.cloud_token
+            if not self._config.cloud_token:
+                # 没配置 token → 打开设置对话框
+                self._on_cloud_settings()
+                return
             self._cloud_client.start()
-            self._update_cloud_connect_button()
+        self._update_cloud_status()
 
-    def _update_cloud_connect_button(self):
-        """更新云端连接按钮的外观。"""
-        if self._cloud_client and self._cloud_client.is_connected():
-            self._cloud_connect_btn.setText("☁ 断开")
-            self._cloud_connect_btn.setObjectName("cloudConnected")
-            self._cloud_status_label.setText("🟢 已连接")
-            self._cloud_status_label.setObjectName("cloudStatusOn")
+    def _update_cloud_status(self):
+        """更新状态栏的云端状态指示器。"""
+        connected = self._cloud_client and self._cloud_client.is_connected()
+        if connected:
+            self._cloud_status_indicator.setText("☁ 已连接")
+            self._cloud_status_indicator.setObjectName("cloudStatusOn")
+            self._cloud_status_btn.setText("断开云端")
         else:
-            self._cloud_connect_btn.setText("☁ 连接")
-            self._cloud_connect_btn.setObjectName("cloudDisconnected")
-            self._cloud_status_label.setText("🔴 未连接")
-            self._cloud_status_label.setObjectName("cloudStatusOff")
-        # 强制刷新样式
-        self._cloud_connect_btn.style().unpolish(self._cloud_connect_btn)
-        self._cloud_connect_btn.style().polish(self._cloud_connect_btn)
-        self._cloud_status_label.style().unpolish(self._cloud_status_label)
-        self._cloud_status_label.style().polish(self._cloud_status_label)
+            self._cloud_status_indicator.setText("☁ 未连接")
+            self._cloud_status_indicator.setObjectName("cloudStatusOff")
+            self._cloud_status_btn.setText("连接云端")
+        # 刷新样式
+        self._cloud_status_indicator.style().unpolish(self._cloud_status_indicator)
+        self._cloud_status_indicator.style().polish(self._cloud_status_indicator)
 
     # ---- UI 构建 ----
 
@@ -1080,6 +1157,17 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("就绪")
         self._status_bar.addWidget(self._status_label)
 
+        self._status_bar.addPermanentWidget(QLabel("  "))
+
+        self._cloud_status_indicator = QLabel("☁ 未连接")
+        self._cloud_status_indicator.setObjectName("cloudStatusOff")
+        self._status_bar.addPermanentWidget(self._cloud_status_indicator)
+
+        self._cloud_status_btn = QPushButton("连接云端")
+        self._cloud_status_btn.setFixedWidth(80)
+        self._cloud_status_btn.clicked.connect(self._toggle_cloud_connection)
+        self._status_bar.addPermanentWidget(self._cloud_status_btn)
+
     def _setup_menu(self):
         """设置菜单栏。"""
         mb = self.menuBar()
@@ -1092,6 +1180,10 @@ class MainWindow(QMainWindow):
         file_menu.addAction(open_action)
 
         file_menu.addSeparator()
+
+        cloud_action = QAction("云端(&C)", self)
+        cloud_action.triggered.connect(self._on_cloud_settings)
+        file_menu.addAction(cloud_action)
 
         locations_action = QAction("地点(&L)", self)
         locations_action.triggered.connect(self._on_manage_locations)
@@ -1328,45 +1420,6 @@ class MainWindow(QMainWindow):
 
         root.addLayout(row2)
 
-        # —— Row 3: 云端连接配置 ——
-        row3 = QHBoxLayout()
-        row3.setSpacing(6)
-
-        row3.addWidget(QLabel("☁ 云端:"))
-
-        # 云端开关
-        self._cloud_status_label = QLabel("🔴 未连接")
-        self._cloud_status_label.setObjectName("cloudStatusOff")
-        row3.addWidget(self._cloud_status_label)
-
-        row3.addWidget(QLabel("API:"))
-        self._cloud_api_input = QLineEdit(self._config.cloud_api_url)
-        self._cloud_api_input.setPlaceholderText("https://hn-space.cn")
-        self._cloud_api_input.setFixedWidth(180)
-        row3.addWidget(self._cloud_api_input)
-
-        row3.addWidget(QLabel("WS:"))
-        self._cloud_ws_input = QLineEdit(self._config.cloud_ws_url)
-        self._cloud_ws_input.setPlaceholderText("wss://hn-space.cn")
-        self._cloud_ws_input.setFixedWidth(180)
-        row3.addWidget(self._cloud_ws_input)
-
-        row3.addWidget(QLabel("Token:"))
-        self._cloud_token_input = QLineEdit(self._config.cloud_token)
-        self._cloud_token_input.setPlaceholderText("打印机认证token")
-        self._cloud_token_input.setEchoMode(QLineEdit.Password)
-        self._cloud_token_input.setFixedWidth(150)
-        row3.addWidget(self._cloud_token_input)
-
-        self._cloud_connect_btn = QPushButton("☁ 连接")
-        self._cloud_connect_btn.setObjectName("cloudDisconnected")
-        self._cloud_connect_btn.setFixedWidth(80)
-        self._cloud_connect_btn.clicked.connect(self._toggle_cloud_connection)
-        row3.addWidget(self._cloud_connect_btn)
-
-        row3.addStretch()
-        root.addLayout(row3)
-
         # 统一输入框高度为下拉框高度（延迟到布局完成后测量实际高度）
         def _normalize_spin_heights():
             combo_h = self._printer_combo.height()
@@ -1375,8 +1428,6 @@ class MainWindow(QMainWindow):
                            self._delivery_percent_spin, self._urgency_price_spin,
                            self._cover_page_price_spin):
                     sp.setFixedHeight(combo_h)
-                for le in (self._cloud_api_input, self._cloud_ws_input, self._cloud_token_input):
-                    le.setFixedHeight(combo_h)
         QTimer.singleShot(0, _normalize_spin_heights)
 
     def _setup_file_table(self) -> QWidget:
@@ -2955,7 +3006,7 @@ class MainWindow(QMainWindow):
 
     def _on_cloud_connection_changed(self, connected: bool):
         """云端连接状态改变。"""
-        self._update_cloud_connect_button()
+        self._update_cloud_status()
 
     def _on_cloud_status_message(self, msg: str):
         """云端日志消息 → 写入界面日志。"""
@@ -3157,11 +3208,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """关闭窗口时自动保存配置并断开云端。"""
         try:
-            # 保存 cloud 配置
-            self._config.cloud_api_url = self._cloud_api_input.text().strip()
-            self._config.cloud_ws_url = self._cloud_ws_input.text().strip()
-            self._config.cloud_token = self._cloud_token_input.text().strip()
-
             self._refresh_config_jobs_from_table()
             self._sync_ui_to_config()
             self._config.save(self._config_path)

@@ -376,10 +376,12 @@ QPushButton#cloudDisconnected {
 QLabel#cloudStatusOn {
     color: #40a02b;
     font-weight: bold;
+    font-size: 12px;
 }
 QLabel#cloudStatusOff {
-    color: #d20f39;
+    color: #9ca0b0;
     font-weight: bold;
+    font-size: 12px;
 }
 QPushButton#cloudPanelToggle {
     background: transparent;
