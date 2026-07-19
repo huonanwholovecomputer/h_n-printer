@@ -227,6 +227,9 @@ class CloudClient(QObject):
                             self.status_message.emit(
                                 f"☁ HTTP 拉取到任务 #{task.task_id}: {task.file_name}"
                             )
+                            # 自动开始下载
+                            self.accept_task(task.task_id)
+                            )
         except Exception as e:
             logger.debug(f"HTTP 拉取排队任务失败: {e}")
 
