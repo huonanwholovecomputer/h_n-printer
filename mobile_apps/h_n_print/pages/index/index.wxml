@@ -1,0 +1,146 @@
+<!-- Apple-style Index Page — 提交打印 -->
+<navigation-bar title="提交打印" back="{{false}}" color="black" background="#FFF"></navigation-bar>
+
+<view class="page-root">
+  <view
+    class="scroller"
+    bindtouchstart="onScrollerTouchStart"
+    bindtouchmove="onScrollerTouchMove"
+    bindtouchend="onScrollerTouchEnd"
+    bindtouchcancel="onScrollerTouchEnd"
+  >
+    <view class="scroll-content" style="transform: translateY({{-scrollTop}}px);">
+      <view class="container">
+
+        <!-- Logo + Status -->
+        <view class="header-area" style="padding-top: {{logoPadding}}rpx; padding-bottom: {{logoPadding}}rpx;">
+          <view class="logo-wrap" style="transform: scale({{logoScale}}); transform-origin: center top;">
+            <image class="logo" src="/images/HN_print.png" mode="widthFix" style="width: 320rpx;" />
+          </view>
+        </view>
+
+        <!-- Printer Status -->
+        <view class="status-bar {{printerActive ? 'status-active' : 'status-inactive'}}">
+          <view class="status-dot"></view>
+          <text class="status-text">{{printerActive ? '打印机在线' : '打印机离线'}}</text>
+        </view>
+
+        <!-- File List Section -->
+        <view class="card file-section">
+          <view class="section-header inline-header">
+            <view class="section-header-bar"></view>
+            <text class="section-header-title">打印文件</text>
+            <text wx:if="{{selectedFiles.length > 0}}" class="section-header-badge">{{selectedFiles.length}}</text>
+          </view>
+
+          <!-- File Cards -->
+          <view
+            wx:for="{{selectedFiles}}"
+            wx:key="index"
+            class="file-card {{item.entering ? 'card-entering' : ''}} {{item.removing ? 'card-exiting' : ''}}"
+          >
+            <!-- Header: name + remove -->
+            <view class="file-card-top">
+              <view class="file-name-area">
+                <text class="file-name">{{item.name}}</text>
+                <text class="file-size">{{item.sizeDisplay}} KB</text>
+              </view>
+              <view class="file-remove" bindtap="onRemoveFile" data-index="{{index}}" hover-class="tap-active">✕</view>
+            </view>
+
+            <!-- Upload Status -->
+            <view class="file-status-area">
+              <block wx:if="{{item.uploading}}">
+                <view class="upload-row">
+                  <text class="status-label uploading">上传中…</text>
+                  <text class="upload-pct">{{item.progress}}%</text>
+                </view>
+                <view class="progress-track">
+                  <view class="progress-fill" style="width: {{item.progress}}%;"></view>
+                </view>
+              </block>
+              <block wx:elif="{{item.failed}}">
+                <text class="status-label failed">上传失败</text>
+              </block>
+              <block wx:elif="{{item.fileId && item.excelWarning}}">
+                <text class="status-label warn">Excel 不支持自动打印，请联系管理员</text>
+              </block>
+              <block wx:elif="{{item.fileId}}">
+                <text class="status-label done">已上传</text>
+              </block>
+            </view>
+
+            <!-- Per-file controls (uploaded only) -->
+            <view wx:if="{{item.fileId && !item.excelWarning}}" class="file-controls">
+
+              <!-- Copies stepper -->
+              <view class="control-row">
+                <text class="control-label">份数</text>
+                <view class="stepper">
+                  <view class="stepper-btn {{item.copies <= 1 ? 'stepper-disabled' : ''}}" bindtap="onFileCopiesMinus" data-index="{{index}}" hover-class="tap-active">−</view>
+                  <input class="stepper-input" type="number" value="{{item.copies}}" bindinput="onFileCopiesChange" data-index="{{index}}" />
+                  <view class="stepper-btn" bindtap="onFileCopiesPlus" data-index="{{index}}" hover-class="tap-active">+</view>
+                </view>
+              </view>
+
+              <!-- Page range -->
+              <view class="control-row">
+                <text class="control-label">范围</text>
+                <input class="input-ios range-input" type="text" value="{{item.pageRange}}" placeholder="全部（如 1-5,7,9）" bindinput="onFilePageRangeInput" data-index="{{index}}" />
+              </view>
+
+              <!-- Duplex toggle -->
+              <view class="control-row">
+                <text class="control-label">模式</text>
+                <view class="duplex-toggle">
+                  <view class="duplex-slider {{item.duplex === 'on' ? 'slider-right' : ''}}"></view>
+                  <view class="duplex-opt {{item.duplex === 'off' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="off">单面</view>
+                  <view class="duplex-opt {{item.duplex === 'on' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="on">双面</view>
+                </view>
+              </view>
+            </view>
+          </view>
+
+          <!-- Add file button -->
+          <button class="add-file-btn" bindtap="onChooseFile" hover-class="tap-active">
+            <text class="add-icon">+</text>
+            <text>{{selectedFiles.length ? '添加文件' : '选择打印文件'}}</text>
+          </button>
+        </view>
+
+        <!-- Submit Button -->
+        <view class="submit-area">
+          <button class="btn-primary" bindtap="onSubmit" hover-class="tap-active" loading="{{submitting}}" disabled="{{submitting}}">
+            提交打印任务
+          </button>
+        </view>
+
+      </view>
+    </view>
+  </view>
+</view>
+
+<!-- Success Modal -->
+<view wx:if="{{showSuccessModal}}" class="modal-mask" bindtap="onCloseModal">
+  <view class="modal-sheet" catchtap="noop">
+    <view class="modal-icon-wrap">✓</view>
+    <text class="title-medium" style="margin-bottom: 8rpx;">任务提交成功</text>
+    <text class="body-small">文件已上传，打印任务已创建</text>
+    <view class="modal-buttons">
+      <button class="btn-secondary" bindtap="onCloseModal" hover-class="tap-active">继续打印</button>
+      <button class="btn-primary" style="flex:1;" bindtap="onViewOrders" hover-class="tap-active">查看任务</button>
+    </view>
+  </view>
+</view>
+
+<!-- Access Denied Modal -->
+<view wx:if="{{showAccessDeniedModal}}" class="modal-mask" bindtap="onAccessDeniedConfirm">
+  <view class="modal-sheet" catchtap="noop">
+    <view class="modal-icon-wrap" style="background-color: rgba(255, 59, 48, 0.1); color: var(--red);">!</view>
+    <text class="title-medium" style="margin-bottom: 8rpx;">需要许可</text>
+    <text class="body-small">请先出示管理员许可</text>
+    <view class="modal-buttons">
+      <button class="btn-primary" bindtap="onAccessDeniedConfirm" hover-class="tap-active">前往获取</button>
+    </view>
+  </view>
+</view>

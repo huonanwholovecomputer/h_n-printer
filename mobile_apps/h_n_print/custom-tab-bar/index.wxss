@@ -1,0 +1,73 @@
+/* Apple-style Custom Tab Bar — translucent with blur */
+
+.tab-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: calc(100rpx + env(safe-area-inset-bottom));
+  padding-bottom: env(safe-area-inset-bottom);
+  display: flex;
+  background-color: rgba(255, 255, 255, 0.72);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-top: 0.5px solid rgba(60, 60, 67, 0.12);
+  z-index: 9999;
+}
+
+.tab-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2rpx;
+  padding: 8rpx 0 4rpx;
+}
+
+/* Instant touch-down feedback */
+.tab-hover {
+  opacity: 0.6;
+}
+
+/* Icon container */
+.tab-icon-wrap {
+  width: 56rpx;
+  height: 56rpx;
+  border-radius: 16rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 2rpx;
+  transition: background-color 0.2s ease;
+}
+
+.icon-active {
+  background-color: rgba(0, 122, 255, 0.08);
+}
+
+.tab-icon {
+  width: 44rpx;
+  height: 44rpx;
+  opacity: 0.5;
+  transition: opacity 0.2s ease;
+}
+
+.icon-active .tab-icon,
+.tab-item.active .tab-icon {
+  opacity: 1;
+}
+
+/* Label text */
+.tab-text {
+  font-size: 18rpx;
+  font-weight: 500;
+  color: #8E8E93;
+  letter-spacing: 0.01em;
+  transition: color 0.2s ease;
+}
+
+.text-active {
+  color: #007AFF;
+  font-weight: 600;
+}

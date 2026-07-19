@@ -1,0 +1,323 @@
+/** Apple-style Index Page Styles **/
+
+/* ── Root & Container ── */
+.page-root {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  min-height: 0;
+}
+
+.scroller {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+
+.scroll-content {
+  will-change: transform;
+}
+
+.container {
+  padding: 24rpx 32rpx;
+  padding-bottom: calc(140rpx + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+}
+
+/* ── Header: Logo ── */
+.header-area {
+  text-align: center;
+  padding: 32rpx 0;
+  transition: padding 0.06s linear;
+}
+
+.logo-wrap {
+  display: inline-block;
+  transition: transform 0.06s linear;
+}
+
+.logo {
+  width: 320rpx;
+}
+
+/* ── Printer Status ── */
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8rpx 0 28rpx;
+  gap: 10rpx;
+}
+
+.status-dot {
+  width: 12rpx;
+  height: 12rpx;
+  border-radius: 6rpx;
+  flex-shrink: 0;
+}
+
+.status-active .status-dot {
+  background-color: var(--green);
+  animation: statusPulse 2s infinite;
+}
+
+.status-inactive .status-dot {
+  background-color: var(--gray3);
+}
+
+.status-text {
+  font-size: 22rpx;
+  font-weight: 500;
+}
+
+.status-active .status-text { color: var(--green); }
+.status-inactive .status-text { color: var(--gray); }
+
+/* ── File Section ── */
+.file-section {
+  margin-bottom: 20rpx;
+}
+
+.inline-header {
+  padding: 0 0 20rpx 0;
+  border-bottom: 0.5px solid var(--separator);
+  margin-bottom: 20rpx;
+}
+
+/* ── File Cards ── */
+.file-card {
+  background-color: var(--gray6);
+  border-radius: var(--radius-md);
+  padding: 20rpx 22rpx;
+  margin-bottom: 12rpx;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+.file-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.file-name-area {
+  flex: 1;
+  min-width: 0;
+}
+
+.file-name {
+  display: block;
+  font-size: 26rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-size {
+  display: block;
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+  margin-top: 4rpx;
+}
+
+.file-remove {
+  width: 40rpx;
+  height: 40rpx;
+  border-radius: 20rpx;
+  background-color: rgba(60, 60, 67, 0.1);
+  color: var(--text-tertiary);
+  font-size: 20rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-left: 12rpx;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.file-remove:active {
+  background-color: var(--red);
+  color: #fff;
+}
+
+/* Upload Status */
+.file-status-area {
+  margin-top: 14rpx;
+  min-height: 28rpx;
+}
+
+.status-label {
+  font-size: 22rpx;
+  font-weight: 500;
+}
+.status-label.uploading { color: var(--blue); }
+.status-label.done      { color: var(--green); }
+.status-label.failed    { color: var(--red); }
+.status-label.warn      { color: var(--orange); font-size: 20rpx; }
+
+.upload-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10rpx;
+}
+
+.upload-pct {
+  font-size: 22rpx;
+  font-family: var(--font-mono);
+  color: var(--blue);
+}
+
+/* Progress bar */
+.progress-track {
+  width: 100%;
+  height: 8rpx;
+  background-color: rgba(60, 60, 67, 0.1);
+  border-radius: 4rpx;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background-color: var(--blue);
+  border-radius: 4rpx;
+  transition: width 0.4s ease-out;
+}
+
+/* ── File Controls (per-file) ── */
+.file-controls {
+  margin-top: 16rpx;
+  padding-top: 14rpx;
+  border-top: 0.5px solid var(--separator);
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 10rpx;
+  gap: 14rpx;
+}
+.control-row:last-child {
+  margin-bottom: 0;
+}
+
+.control-label {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  width: 56rpx;
+  flex-shrink: 0;
+}
+
+.range-input {
+  height: 56rpx;
+  font-size: 24rpx;
+  padding: 0 14rpx;
+}
+
+/* ── Duplex Toggle (per-file, compact) ── */
+.duplex-toggle {
+  flex: 1;
+  position: relative;
+  display: flex;
+  border-radius: 14rpx;
+  overflow: hidden;
+  background-color: rgba(60, 60, 67, 0.08);
+  height: 56rpx;
+}
+
+.duplex-slider {
+  position: absolute;
+  top: 3rpx;
+  left: 3rpx;
+  width: calc(50% - 3rpx);
+  height: calc(100% - 6rpx);
+  border-radius: 12rpx;
+  background-color: var(--blue);
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  z-index: 0;
+}
+
+.duplex-slider.slider-right {
+  transform: translateX(100%);
+}
+
+.duplex-opt {
+  flex: 1;
+  position: relative;
+  z-index: 1;
+  text-align: center;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24rpx;
+  font-weight: 500;
+  color: var(--text-secondary);
+  transition: color 0.25s ease;
+}
+
+.duplex-opt.opt-active {
+  color: #fff;
+  font-weight: 600;
+}
+
+/* ── Add File Button ── */
+.add-file-btn {
+  width: 100%;
+  background-color: rgba(0, 122, 255, 0.06);
+  color: var(--blue);
+  font-size: 28rpx;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  padding: 22rpx;
+  text-align: center;
+  border: 2rpx dashed rgba(0, 122, 255, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8rpx;
+  transition: transform 0.1s ease;
+}
+.add-file-btn:active {
+  transform: scale(0.97);
+  background-color: rgba(0, 122, 255, 0.1);
+}
+
+.add-icon {
+  font-size: 30rpx;
+  font-weight: 300;
+  line-height: 1;
+}
+
+/* ── Submit ── */
+.submit-area {
+  padding: 16rpx 0;
+}
+
+/* ── Success Modal ── */
+.modal-icon-wrap {
+  width: 100rpx;
+  height: 100rpx;
+  border-radius: 50rpx;
+  background-color: rgba(52, 199, 89, 0.1);
+  color: var(--green);
+  font-size: 52rpx;
+  font-weight: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20rpx;
+}
+
+.modal-buttons {
+  display: flex;
+  width: 100%;
+  gap: 16rpx;
+  margin-top: 32rpx;
+}

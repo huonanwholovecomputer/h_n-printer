@@ -1,0 +1,919 @@
+/** Apple-style Me Page Styles **/
+
+/* ── Root & Container ── */
+.page-root {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  min-height: 0;
+}
+
+.scroller {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+
+.scroll-content {
+  will-change: transform;
+}
+
+.container {
+  padding: 20rpx 32rpx;
+  padding-bottom: calc(140rpx + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+}
+
+/* ═══════════════ User Profile Card ═══════════════ */
+
+.user-card {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 32rpx 28rpx;
+  margin-bottom: 20rpx;
+  display: flex;
+  align-items: center;
+  box-shadow: var(--shadow-sm);
+}
+
+.avatar-btn {
+  width: 108rpx;
+  height: 108rpx;
+  border-radius: 54rpx;
+  padding: 0;
+  margin: 0 24rpx 0 0;
+  background: transparent;
+  flex-shrink: 0;
+  line-height: 1;
+  overflow: hidden;
+}
+.avatar-btn:active {
+  opacity: 0.7;
+}
+
+.avatar {
+  width: 108rpx;
+  height: 108rpx;
+  border-radius: 54rpx;
+  background-color: var(--gray5);
+}
+
+.user-info {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.nickname-input {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6rpx;
+  padding: 0;
+  background: transparent;
+  border: none;
+  line-height: 44rpx;
+  width: 100%;
+  letter-spacing: -0.01em;
+}
+
+.uid {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+/* ═══════════════ Section Headers ═══════════════ */
+
+.section-title {
+  display: flex;
+  align-items: center;
+  padding: 16rpx 0 16rpx 8rpx;
+  gap: 12rpx;
+}
+
+.section-bar {
+  width: 6rpx;
+  height: 26rpx;
+  background-color: var(--blue);
+  border-radius: 3rpx;
+}
+
+.section-title text:first-of-type {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.order-count {
+  margin-left: 10rpx;
+  font-size: 20rpx;
+  font-weight: 600;
+  color: #fff;
+  background-color: var(--blue);
+  padding: 3rpx 14rpx;
+  border-radius: 20rpx;
+}
+
+/* ═══════════════ Role Action Buttons ═══════════════ */
+
+.role-actions {
+  margin-bottom: 20rpx;
+}
+
+.role-btn {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 28rpx;
+  display: flex;
+  align-items: center;
+  box-shadow: var(--shadow-sm);
+  border-left: 6rpx solid var(--green);
+}
+.role-btn:active {
+  background-color: var(--gray6);
+}
+
+.role-btn-icon {
+  font-size: 36rpx;
+  margin-right: 18rpx;
+}
+
+.role-btn-text {
+  flex: 1;
+  font-size: 28rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.role-btn-arrow {
+  font-size: 32rpx;
+  color: var(--text-quaternary);
+}
+
+/* ═══════════════ Cards (generic) ═══════════════ */
+
+.license-section, .users-section, .storage-section, .orders-section {
+  margin-bottom: 20rpx;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.license-card, .storage-card {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 28rpx;
+  text-align: left;
+  box-shadow: var(--shadow-sm);
+}
+
+/* ═══════════════ License Key Generator ═══════════════ */
+
+.license-label {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  margin-bottom: 14rpx;
+  display: block;
+}
+
+.license-stepper {
+  margin-bottom: 20rpx;
+}
+
+.key-type-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20rpx;
+}
+
+.key-type-label {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+}
+
+.key-type-toggle {
+  display: flex;
+  background-color: var(--gray6);
+  border-radius: 18rpx;
+  padding: 4rpx;
+}
+
+.key-type-option {
+  padding: 12rpx 22rpx;
+  font-size: 22rpx;
+  color: var(--text-secondary);
+  border-radius: 15rpx;
+  transition: all 0.2s ease;
+}
+
+.key-type-active {
+  background-color: var(--blue);
+  color: #fff;
+  font-weight: 600;
+}
+
+.generate-btn {
+  width: 100%;
+  background-color: var(--blue);
+  color: #fff;
+  font-size: 26rpx;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  padding: 20rpx 0;
+  border: none;
+}
+.generate-btn:active {
+  opacity: 0.85;
+  transform: scale(0.97);
+}
+.generate-btn[disabled] {
+  opacity: 0.4;
+}
+
+/* ═══════════════ License Key Drawer ═══════════════ */
+
+.key-drawer {
+  margin-top: 0;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  position: relative;
+  transition: max-height 0.32s cubic-bezier(0.34, 1.56, 0.64, 1),
+              opacity 0.28s ease,
+              margin-top 0.32s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.key-drawer-show {
+  max-height: 500rpx;
+  opacity: 1;
+  margin-top: 14rpx;
+}
+
+/* Delete button behind card */
+.key-delete {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 140rpx;
+  background-color: var(--red);
+  color: #fff;
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26rpx;
+  font-weight: 500;
+  z-index: 0;
+}
+.key-delete:active {
+  background-color: #d63031;
+}
+
+/* Key drawer card */
+.key-drawer-inner {
+  position: relative;
+  z-index: 1;
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 22rpx;
+  box-shadow: var(--shadow-sm);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.key-drawer-inner.no-transition {
+  transition: none;
+}
+
+.key-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16rpx;
+}
+
+.key-left {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.key-right {
+  margin-left: 16rpx;
+}
+
+.key-label {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  margin-bottom: 6rpx;
+}
+
+.key-value {
+  font-size: 36rpx;
+  font-weight: 700;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  letter-spacing: 5rpx;
+}
+
+.key-countdown {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--orange);
+  font-family: var(--font-mono);
+}
+
+.countdown-expired {
+  color: var(--text-quaternary) !important;
+}
+
+/* Key actions */
+.key-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.copy-btn {
+  font-size: 22rpx;
+  font-weight: 500;
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 10rpx 32rpx;
+  margin: 0;
+  border: none;
+}
+.copy-btn:active {
+  background-color: rgba(0, 122, 255, 0.15);
+}
+.copy-btn-disabled {
+  color: var(--text-quaternary) !important;
+  background-color: var(--gray6) !important;
+}
+.btn-waiting {
+  color: var(--text-tertiary) !important;
+  background-color: var(--gray6) !important;
+}
+.btn-end-task {
+  color: var(--red) !important;
+  background-color: rgba(255, 59, 48, 0.08) !important;
+}
+.btn-confirm-admin {
+  color: var(--green) !important;
+  background-color: rgba(52, 199, 89, 0.08) !important;
+}
+
+/* Expired / locked states */
+.key-drawer-expired .key-value { color: var(--text-quaternary); }
+.key-drawer-locked .key-drawer-inner {
+  background-color: #fafafa;
+  opacity: 0.75;
+}
+.key-drawer-locked .key-value { color: var(--gray); }
+
+/* User info in key drawer */
+.key-user-info {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  margin-bottom: 16rpx;
+  padding: 12rpx 16rpx;
+  background-color: rgba(52, 199, 89, 0.06);
+  border-radius: var(--radius-sm);
+}
+
+.key-user-avatar {
+  width: 44rpx;
+  height: 44rpx;
+  border-radius: 50%;
+}
+
+.key-user-name {
+  font-size: 24rpx;
+  color: var(--green);
+  font-weight: 600;
+}
+
+/* ═══════════════ Guest: Redeem Key ═══════════════ */
+
+.redeem-desc {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  margin-bottom: 18rpx;
+  display: block;
+}
+
+.redeem-input-row {
+  display: flex;
+  align-items: center;
+  gap: 14rpx;
+}
+
+.redeem-input {
+  flex: 1;
+  height: 68rpx;
+  background-color: var(--gray6);
+  border-radius: var(--radius-sm);
+  padding: 0 20rpx;
+  font-size: 26rpx;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+}
+
+.redeem-btn {
+  flex-shrink: 0;
+  background-color: var(--blue);
+  color: #fff;
+  font-size: 26rpx;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  padding: 18rpx 30rpx;
+  margin: 0;
+}
+.redeem-btn:active {
+  opacity: 0.85;
+}
+
+/* ═══════════════ License Active (user) ═══════════════ */
+
+.license-active {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 32rpx 28rpx;
+  gap: 8rpx;
+}
+
+.license-status-header {
+  display: flex;
+  align-items: center;
+  gap: 14rpx;
+}
+
+.license-status-icon {
+  font-size: 36rpx;
+}
+
+.license-status-text {
+  font-size: 26rpx;
+  font-weight: 600;
+  color: var(--green);
+}
+
+.temp-countdown {
+  font-size: 22rpx;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  margin-left: 50rpx;
+}
+
+/* ═══════════════ Storage Stats ═══════════════ */
+
+.storage-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10rpx 0;
+}
+
+.storage-label {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+}
+
+.storage-value {
+  font-size: 24rpx;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.retention-title {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  display: block;
+  margin-bottom: 6rpx;
+}
+
+.retention-forever-hint {
+  font-size: 20rpx;
+  color: var(--orange);
+  display: block;
+  margin-bottom: 10rpx;
+}
+
+.retention-row {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  margin-bottom: 20rpx;
+}
+
+.retention-stepper {
+  display: flex;
+  align-items: center;
+}
+
+.retention-stepper-btn {
+  width: 52rpx;
+  height: 52rpx;
+  border-radius: 14rpx;
+  background-color: var(--gray6);
+  color: var(--text-primary);
+  font-size: 28rpx;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.retention-stepper-btn:active {
+  background-color: var(--gray5);
+}
+
+.retention-stepper-input {
+  width: 72rpx;
+  height: 52rpx;
+  margin: 0 6rpx;
+  text-align: center;
+  font-size: 26rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  background-color: var(--bg-card);
+  border-radius: 12rpx;
+  font-family: var(--font-mono);
+}
+
+.retention-unit {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+}
+
+.retention-save-btn {
+  width: 100%;
+  background-color: var(--blue);
+  color: #fff;
+  font-size: 24rpx;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  padding: 16rpx 0;
+  margin: 0;
+  border: none;
+}
+.retention-save-btn:active {
+  opacity: 0.85;
+}
+
+/* ═══════════════ User List ═══════════════ */
+
+.user-item {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 22rpx 28rpx;
+  margin-bottom: 12rpx;
+  display: flex;
+  align-items: center;
+}
+
+.user-avatar {
+  width: 72rpx;
+  height: 72rpx;
+  border-radius: 50%;
+  background-color: var(--gray5);
+  margin-right: 18rpx;
+}
+
+.user-nickname {
+  font-size: 26rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+  display: block;
+  margin-bottom: 4rpx;
+}
+
+.user-licensed-at {
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+}
+
+/* ═══════════════ Admin List (Super Admin) ═══════════════ */
+
+.admin-card-wrap {
+  position: relative;
+  margin-bottom: 12rpx;
+}
+
+.admin-delete {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: 140rpx;
+  background-color: var(--red);
+  color: #fff;
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26rpx;
+  z-index: 0;
+}
+.admin-delete:active {
+  background-color: #d63031;
+}
+
+.admin-card {
+  position: relative;
+  z-index: 1;
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 22rpx;
+  display: flex;
+  align-items: center;
+  box-shadow: var(--shadow-sm);
+}
+.admin-card.admin-swipe-trans {
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.admin-avatar {
+  width: 64rpx;
+  height: 64rpx;
+  border-radius: 50%;
+  margin-right: 16rpx;
+}
+.admin-avatar-placeholder {
+  background-color: var(--gray5);
+}
+
+.admin-info {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+}
+
+.admin-name {
+  font-size: 26rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.admin-badge {
+  font-size: 20rpx;
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+  border-radius: 10rpx;
+  padding: 3rpx 12rpx;
+  font-weight: 600;
+}
+
+/* ═══════════════ Order Cards ═══════════════ */
+
+.status-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 60rpx 0;
+}
+
+.status-text {
+  font-size: 26rpx;
+  color: var(--text-tertiary);
+}
+
+.order-card {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 24rpx 28rpx;
+  margin-bottom: 14rpx;
+  box-sizing: border-box;
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+  transition: box-shadow 0.2s ease, transform 0.15s ease;
+}
+
+.order-card:active {
+  background-color: var(--gray6);
+}
+
+.order-expanded {
+  box-shadow: var(--shadow-md);
+}
+
+.order-card-header {
+  /* collapsed view container */
+}
+
+.order-card-main {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10rpx;
+}
+
+.order-filename {
+  font-size: 26rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 16rpx;
+  letter-spacing: -0.01em;
+}
+
+.order-card-meta {
+  display: flex;
+  gap: 24rpx;
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  margin-bottom: 10rpx;
+}
+
+.order-card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.order-created {
+  font-size: 20rpx;
+  color: var(--text-quaternary);
+  font-family: var(--font-mono);
+}
+
+.order-arrow {
+  font-size: 28rpx;
+  color: var(--text-quaternary);
+  transition: transform 0.25s ease;
+  display: inline-block;
+}
+
+.arrow-up {
+  transform: rotate(90deg);
+  color: var(--blue);
+}
+
+/* ═══════════════ Order Detail (Expanded) ═══════════════ */
+
+.order-card-detail {
+  animation: detailSlideIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes detailSlideIn {
+  from { opacity: 0; transform: translateY(-12rpx); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.detail-divider {
+  height: 1rpx;
+  background-color: var(--separator);
+  margin: 16rpx 0;
+}
+
+.detail-section {
+  margin-bottom: 20rpx;
+}
+
+.detail-section-title {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  margin-bottom: 12rpx;
+  font-weight: 500;
+}
+
+.detail-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8rpx 0;
+}
+
+.detail-label {
+  font-size: 24rpx;
+  color: var(--text-secondary);
+}
+
+.detail-value {
+  font-size: 24rpx;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* File rows in detail */
+.detail-file-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  background-color: var(--gray6);
+  border-radius: var(--radius-sm);
+  padding: 16rpx 18rpx;
+  margin-bottom: 8rpx;
+}
+
+.detail-file-info {
+  flex: 1;
+  min-width: 0;
+  margin-right: 14rpx;
+}
+
+.detail-file-name {
+  display: block;
+  font-size: 24rpx;
+  color: var(--text-primary);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 6rpx;
+}
+
+.detail-file-tags {
+  display: flex;
+  gap: 8rpx;
+}
+
+.file-type-tag {
+  font-size: 18rpx;
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+  padding: 2rpx 10rpx;
+  border-radius: 6rpx;
+}
+
+.file-size-tag {
+  font-size: 18rpx;
+  color: var(--text-tertiary);
+}
+
+.detail-file-right {
+  flex-shrink: 0;
+  text-align: right;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4rpx;
+}
+
+.detail-file-copies {
+  font-size: 22rpx;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.detail-file-range {
+  font-size: 18rpx;
+  color: var(--orange);
+}
+
+.file-status-mini {
+  font-size: 18rpx;
+  padding: 2rpx 10rpx;
+  border-radius: 14rpx;
+  font-weight: 600;
+}
+.file-status-mini.status-queued   { background-color: #FFF3E0; color: #E65100; }
+.file-status-mini.status-printing { background-color: #E3F2FD; color: #1565C0; }
+.file-status-mini.status-sent     { background-color: #E8F5E9; color: #2E7D32; }
+.file-status-mini.status-failed   { background-color: #FFEBEE; color: #C62828; }
+.file-status-mini.status-canceled { background-color: var(--gray6); color: var(--gray); }
+
+/* Cancel order button */
+.btn-cancel-sm {
+  width: 100%;
+  background-color: transparent;
+  color: var(--red);
+  border: 2rpx solid var(--red);
+  font-size: 24rpx;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  padding: 16rpx 0;
+}
+.btn-cancel-sm:active {
+  background-color: rgba(255, 59, 48, 0.06);
+}
+
+/* ═══════════════ Load More ═══════════════ */
+
+.load-more-wrap {
+  display: flex;
+  justify-content: center;
+  margin: 20rpx 0;
+}
+
+.load-more-btn {
+  background-color: var(--gray6);
+  color: var(--blue);
+  font-size: 24rpx;
+  font-weight: 500;
+  border-radius: var(--radius-lg);
+  padding: 16rpx 44rpx;
+  border: none;
+}
+.load-more-btn:active {
+  background-color: rgba(0, 122, 255, 0.1);
+}

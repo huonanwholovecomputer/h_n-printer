@@ -1,0 +1,531 @@
+/**app.wxss** — Apple Design System for HN 云打印 */
+
+/* ============================================================
+   1. Design Tokens — Apple-style color & spacing system
+   ============================================================ */
+
+page {
+  /* iOS system colors */
+  --blue: #007AFF;
+  --blue-light: #409CFF;
+  --blue-dark: #0055CC;
+  --green: #34C759;
+  --orange: #FF9500;
+  --red: #FF3B30;
+  --pink: #FF2D55;
+  --purple: #AF52DE;
+  --gray: #8E8E93;
+  --gray2: #AEAEB2;
+  --gray3: #C7C7CC;
+  --gray4: #D1D1D6;
+  --gray5: #E5E5EA;
+  --gray6: #F2F2F7;
+
+  /* Semantic colors */
+  --bg-primary: #F2F2F7;
+  --bg-card: #FFFFFF;
+  --bg-elevated: rgba(255, 255, 255, 0.85);
+  --text-primary: #000000;
+  --text-secondary: #3C3C43;
+  --text-tertiary: #8E8E93;
+  --text-quaternary: #C7C7CC;
+  --separator: rgba(60, 60, 67, 0.12);
+  --shadow-sm: 0 1rpx 4rpx rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4rpx 16rpx rgba(0, 0, 0, 0.08);
+  --shadow-lg: 0 8rpx 32rpx rgba(0, 0, 0, 0.12);
+
+  /* Typography scale */
+  --font-system: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+    "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", "Menlo", "Monaco", "Courier New", monospace;
+
+  /* Spacing scale */
+  --space-xs: 8rpx;
+  --space-sm: 12rpx;
+  --space-md: 16rpx;
+  --space-lg: 20rpx;
+  --space-xl: 24rpx;
+  --space-2xl: 32rpx;
+
+  /* Radii */
+  --radius-sm: 10rpx;
+  --radius-md: 14rpx;
+  --radius-lg: 20rpx;
+  --radius-xl: 24rpx;
+
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  font-family: var(--font-system);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 28rpx;
+  color: var(--text-primary);
+}
+
+/* ============================================================
+   2. Typography
+   ============================================================ */
+
+/* Display — large titles */
+.display-large {
+  font-size: 56rpx;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+.display-medium {
+  font-size: 44rpx;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+}
+
+/* Title */
+.title-large {
+  font-size: 34rpx;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+.title-medium {
+  font-size: 28rpx;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+/* Body */
+.body-regular {
+  font-size: 28rpx;
+  font-weight: 400;
+  line-height: 1.5;
+}
+.body-small {
+  font-size: 24rpx;
+  font-weight: 400;
+  line-height: 1.45;
+  color: var(--text-tertiary);
+}
+
+/* Caption */
+.caption {
+  font-size: 22rpx;
+  font-weight: 400;
+  line-height: 1.4;
+  color: var(--text-tertiary);
+}
+.caption-mono {
+  font-family: var(--font-mono);
+  font-size: 22rpx;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   3. Interactive Feedback — Apple's instant touch-down response
+   ============================================================ */
+
+/* Scale-down on press (instant, no delay) */
+.tap-active {
+  transform: scale(0.97);
+  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Subtle highlight (for list items) */
+.tap-highlight {
+  background-color: rgba(0, 0, 0, 0.04);
+  transition: background-color 0.1s ease;
+}
+
+/* ============================================================
+   4. Cards — iOS-style rounded containers
+   ============================================================ */
+
+.card {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  box-shadow: var(--shadow-sm);
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.card-elevated {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  box-shadow: var(--shadow-md);
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Card entrance animation — spring curve */
+@keyframes cardEnter {
+  from {
+    opacity: 0;
+    transform: translateY(30rpx) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.card-entering {
+  animation: cardEnter 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* Card exit */
+@keyframes cardExit {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-20rpx) scale(0.95);
+  }
+}
+.card-exiting {
+  animation: cardExit 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  pointer-events: none;
+}
+
+/* ============================================================
+   5. Section Headers — iOS-style with accent bar
+   ============================================================ */
+
+.section-header {
+  display: flex;
+  align-items: center;
+  padding: var(--space-lg) var(--space-sm) var(--space-md);
+  gap: var(--space-sm);
+}
+
+.section-header-bar {
+  width: 6rpx;
+  height: 28rpx;
+  background-color: var(--blue);
+  border-radius: 3rpx;
+}
+
+.section-header-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.section-header-badge {
+  margin-left: var(--space-sm);
+  font-size: 22rpx;
+  font-weight: 500;
+  color: #fff;
+  background-color: var(--blue);
+  padding: 4rpx 14rpx;
+  border-radius: 20rpx;
+}
+
+/* ============================================================
+   6. Buttons — Apple's SF-style buttons
+   ============================================================ */
+
+/* Primary action button */
+.btn-primary {
+  width: 100%;
+  background-color: var(--blue);
+  color: #fff;
+  font-size: 32rpx;
+  font-weight: 600;
+  border-radius: var(--radius-lg);
+  padding: 26rpx 0;
+  text-align: center;
+  border: none;
+  letter-spacing: -0.01em;
+  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.1s ease;
+}
+.btn-primary:active {
+  transform: scale(0.97);
+  opacity: 0.85;
+}
+.btn-primary[disabled] {
+  opacity: 0.4;
+  transform: none;
+}
+
+/* Secondary / outline button */
+.btn-secondary {
+  width: 100%;
+  background-color: transparent;
+  color: var(--blue);
+  font-size: 28rpx;
+  font-weight: 500;
+  border: 2rpx solid var(--blue);
+  border-radius: var(--radius-lg);
+  padding: 22rpx 0;
+  text-align: center;
+  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.1s ease;
+}
+.btn-secondary:active {
+  transform: scale(0.97);
+  background-color: rgba(0, 122, 255, 0.08);
+}
+
+/* Destructive button */
+.btn-destructive {
+  width: 100%;
+  background-color: transparent;
+  color: var(--red);
+  font-size: 28rpx;
+  font-weight: 500;
+  border: 2rpx solid var(--red);
+  border-radius: var(--radius-lg);
+  padding: 22rpx 0;
+  text-align: center;
+  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.1s ease;
+}
+.btn-destructive:active {
+  transform: scale(0.97);
+  background-color: rgba(255, 59, 48, 0.08);
+}
+
+/* Small inline button */
+.btn-small {
+  font-size: 24rpx;
+  font-weight: 500;
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 10rpx 28rpx;
+  border: none;
+  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.btn-small:active {
+  transform: scale(0.95);
+  background-color: rgba(0, 122, 255, 0.15);
+}
+
+/* ============================================================
+   7. Status Badges — iOS-style compact pills
+   ============================================================ */
+
+.badge {
+  display: inline-block;
+  font-size: 20rpx;
+  font-weight: 600;
+  padding: 4rpx 14rpx;
+  border-radius: 20rpx;
+  letter-spacing: 0.02em;
+}
+.badge-queued    { background-color: #FFF3E0; color: #E65100; }
+.badge-printing  { background-color: #E3F2FD; color: #1565C0; }
+.badge-sent      { background-color: #E8F5E9; color: #2E7D32; }
+.badge-delivered { background-color: #E8F5E9; color: #1B5E20; }
+.badge-failed    { background-color: #FFEBEE; color: #C62828; }
+.badge-canceled  { background-color: var(--gray6); color: var(--gray); }
+
+/* ============================================================
+   8. Dividers & Separators
+   ============================================================ */
+
+.divider {
+  height: 1rpx;
+  background-color: var(--separator);
+  margin: var(--space-md) 0;
+}
+.divider-thick {
+  height: 8rpx;
+  background-color: var(--bg-primary);
+  margin: 0;
+}
+
+/* ============================================================
+   9. Modal / Sheet — iOS action sheet style
+   ============================================================ */
+
+.modal-mask {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.2s ease;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.modal-sheet {
+  width: 540rpx;
+  background-color: var(--bg-card);
+  border-radius: var(--radius-xl);
+  padding: 48rpx 40rpx 36rpx;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  animation: sheetSpringIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+  box-shadow: var(--shadow-lg);
+}
+
+@keyframes sheetSpringIn {
+  from {
+    opacity: 0;
+    transform: translateY(80rpx) scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ============================================================
+   10. Form Elements — iOS-style inputs & steppers
+   ============================================================ */
+
+/* Stepper (iOS-style [+]/[-]) */
+.stepper {
+  display: flex;
+  align-items: center;
+}
+
+.stepper-btn {
+  width: 64rpx;
+  height: 64rpx;
+  border-radius: var(--radius-md);
+  background-color: var(--gray6);
+  color: var(--text-primary);
+  font-size: 34rpx;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition: background-color 0.1s ease;
+}
+.stepper-btn:active {
+  background-color: var(--gray5);
+}
+.stepper-btn.stepper-disabled {
+  color: var(--gray3);
+}
+
+.stepper-input {
+  flex: 1;
+  height: 64rpx;
+  margin: 0 16rpx;
+  text-align: center;
+  font-size: 28rpx;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  background-color: var(--bg-card);
+  border-radius: var(--radius-sm);
+  border: 1rpx solid var(--separator);
+}
+
+/* Text input — iOS style */
+.input-ios {
+  flex: 1;
+  height: 72rpx;
+  background-color: var(--gray6);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-lg);
+  font-size: 28rpx;
+  color: var(--text-primary);
+  font-family: var(--font-system);
+}
+.input-ios::placeholder {
+  color: var(--text-quaternary);
+}
+
+/* ============================================================
+   11. Empty State
+   ============================================================ */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 80rpx 0;
+}
+
+.empty-state-icon {
+  width: 120rpx;
+  height: 120rpx;
+  background-color: rgba(0, 122, 255, 0.06);
+  border-radius: 60rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 56rpx;
+  margin-bottom: var(--space-xl);
+}
+
+.empty-state-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--space-xs);
+}
+
+.empty-state-desc {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+}
+
+/* ============================================================
+   12. Scroll physics — shared root
+   ============================================================ */
+
+.page-root {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: var(--bg-primary);
+  min-height: 0;
+}
+
+.scroller {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+}
+
+.scroll-content {
+  will-change: transform;
+}
+
+/* ============================================================
+   13. Animation curves — Apple's spring equivalents
+   ============================================================ */
+
+/* Quick spring (buttons, small transitions) */
+@keyframes springQuick {
+  from { transform: scale(0.9); opacity: 0; }
+  60%  { transform: scale(1.02); }
+  to   { transform: scale(1); opacity: 1; }
+}
+
+/* Smooth fade+slide (list items) */
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(20rpx); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Status dot pulse */
+@keyframes statusPulse {
+  0%   { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.4); }
+  70%  { box-shadow: 0 0 0 10rpx rgba(0, 122, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0); }
+}

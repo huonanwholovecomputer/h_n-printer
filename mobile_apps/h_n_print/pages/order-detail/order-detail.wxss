@@ -1,0 +1,194 @@
+/** Apple-style Order Detail Page **/
+
+page {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--bg-primary);
+}
+
+.scrollarea {
+  flex: 1;
+  height: 0;
+}
+
+.container {
+  padding: 24rpx 32rpx;
+  padding-bottom: calc(32rpx + env(safe-area-inset-bottom));
+}
+
+/* ── Loading & Empty ── */
+.loading-box, .empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 160rpx 0;
+}
+
+.loading-text {
+  font-size: 26rpx;
+  color: var(--text-tertiary);
+}
+
+.empty-icon {
+  font-size: 72rpx;
+  margin-bottom: 20rpx;
+}
+
+.empty-text {
+  font-size: 26rpx;
+  color: var(--text-tertiary);
+}
+
+/* ── Detail Card ── */
+.detail-card {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
+}
+
+.status-bar {
+  padding: 28rpx 28rpx 0;
+}
+
+.status-tag {
+  display: inline-block;
+  font-size: 22rpx;
+  padding: 6rpx 20rpx;
+  border-radius: 20rpx;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.status-queued    { background-color: #FFF3E0; color: #E65100; }
+.status-printing  { background-color: #E3F2FD; color: #1565C0; }
+.status-sent      { background-color: #E8F5E9; color: #2E7D32; }
+.status-failed    { background-color: #FFEBEE; color: #C62828; }
+.status-canceled  { background-color: var(--gray6); color: var(--gray); }
+
+/* ── Info Groups ── */
+.info-group {
+  padding: 28rpx;
+  border-bottom: 0.5px solid var(--separator);
+}
+.info-group:last-of-type {
+  border-bottom: none;
+}
+
+.info-title {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  font-weight: 500;
+  margin-bottom: 18rpx;
+}
+
+.info-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12rpx 0;
+}
+
+.info-label {
+  font-size: 26rpx;
+  color: var(--text-secondary);
+}
+
+.info-value {
+  font-size: 26rpx;
+  color: var(--text-primary);
+  text-align: right;
+  max-width: 380rpx;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+/* ── File Cards in Detail ── */
+.detail-file-card {
+  background-color: var(--gray6);
+  border-radius: var(--radius-sm);
+  padding: 18rpx 20rpx;
+  margin-bottom: 10rpx;
+}
+.detail-file-card:last-child {
+  margin-bottom: 0;
+}
+
+.detail-file-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8rpx;
+}
+
+.detail-file-name {
+  font-size: 26rpx;
+  color: var(--text-primary);
+  font-weight: 500;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-right: 14rpx;
+}
+
+.status-tag-mini {
+  font-size: 18rpx;
+  padding: 4rpx 12rpx;
+  border-radius: 16rpx;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.status-tag-mini.status-queued   { background-color: #FFF3E0; color: #E65100; }
+.status-tag-mini.status-printing { background-color: #E3F2FD; color: #1565C0; }
+.status-tag-mini.status-sent     { background-color: #E8F5E9; color: #2E7D32; }
+.status-tag-mini.status-failed   { background-color: #FFEBEE; color: #C62828; }
+.status-tag-mini.status-canceled { background-color: var(--gray6); color: var(--gray); }
+
+.detail-file-meta {
+  display: flex;
+  align-items: center;
+  gap: 18rpx;
+  font-size: 20rpx;
+  color: var(--text-gray);
+}
+
+/* ── Action Buttons ── */
+.action-bar {
+  padding: 32rpx 28rpx;
+  display: flex;
+  flex-direction: column;
+  gap: 16rpx;
+}
+
+.btn-cancel {
+  width: 100%;
+  background-color: transparent;
+  color: var(--red);
+  border: 2rpx solid var(--red);
+  font-size: 28rpx;
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  padding: 20rpx 0;
+}
+.btn-cancel:active {
+  background-color: rgba(255, 59, 48, 0.06);
+}
+
+.btn-reprint {
+  width: 100%;
+  background-color: var(--blue);
+  color: #fff;
+  font-size: 28rpx;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  padding: 22rpx 0;
+  border: none;
+}
+.btn-reprint:active {
+  opacity: 0.85;
+  transform: scale(0.97);
+}
