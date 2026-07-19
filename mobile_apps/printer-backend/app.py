@@ -527,6 +527,24 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # v5 迁移：订单附加服务字段（派送/紧急/首页/地址）
+    for col, col_type, default in [
+        ("delivery_enabled", "INTEGER", "0"),
+        ("delivery_location", "TEXT", "''"),
+        ("delivery_percentage", "REAL", "0"),
+        ("urgency", "TEXT", "'低'"),
+        ("urgency_price", "REAL", "0"),
+        ("cover_page", "INTEGER", "0"),
+        ("cover_page_price", "REAL", "0.15"),
+        ("pickup_address", "TEXT", "''"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type} DEFAULT {default}")
+            conn.commit()
+            print(f"  已添加 orders.{col} 列")
+        except sqlite3.OperationalError:
+            pass
+
     # 许可密钥表
     conn.execute(
         """
@@ -1365,6 +1383,16 @@ def submit_order():
     duplex = data.get("duplex", "on")  # 顶层 duplex 作为默认值（向后兼容）
     files_input = data.get("files", None)
 
+    # ---- v5 新增：附加服务参数 ----
+    delivery_enabled = int(data.get("delivery_enabled", 0) or 0)
+    delivery_location = data.get("delivery_location", "")
+    delivery_percentage = float(data.get("delivery_percentage", 0) or 0)
+    urgency = data.get("urgency", "低")
+    urgency_price = float(data.get("urgency_price", 0) or 0)
+    cover_page = int(data.get("cover_page", 0) or 0)
+    cover_page_price = float(data.get("cover_page_price", 0.15) or 0)
+    pickup_address = data.get("pickup_address", "")
+
     # ---- 兼容旧格式：单文件字段转为新格式数组 ----
     if files_input is None:
         file_id = data.get("file_id", "")
@@ -1401,11 +1429,16 @@ def submit_order():
         first_file_name = files_input[0].get("file", files_input[0].get("file_name", ""))
         conn.execute(
             """INSERT INTO orders (file_id, file, copies, status, created_at, openid, duplex,
-                                   page_count, price_per_page, total_price, is_free)
-               VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?)""",
+                                   page_count, price_per_page, total_price, is_free,
+                                   delivery_enabled, delivery_location, delivery_percentage,
+                                   urgency, urgency_price, cover_page, cover_page_price, pickup_address)
+               VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
-             1 if user_is_admin else 0),
+             1 if user_is_admin else 0,
+             delivery_enabled, delivery_location, delivery_percentage,
+             urgency, urgency_price, cover_page, cover_page_price, pickup_address),
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -1646,7 +1679,9 @@ def get_orders():
     orders_rows = conn.execute(
         f"""
         SELECT id, file_id, file, copies, status, created_at, openid, duplex,
-               page_count, is_free, total_price
+               page_count, is_free, total_price,
+               delivery_enabled, delivery_location, delivery_percentage,
+               urgency, urgency_price, cover_page, cover_page_price, pickup_address
         FROM orders
         WHERE {where_clause}
         ORDER BY id DESC
@@ -1728,7 +1763,10 @@ def get_order_detail(order_id):
         """
         SELECT o.id, o.file_id, o.file, o.copies,
                o.status, o.created_at, o.openid, o.duplex,
-               o.page_count, o.is_free, o.total_price
+               o.page_count, o.is_free, o.total_price,
+               o.delivery_enabled, o.delivery_location, o.delivery_percentage,
+               o.urgency, o.urgency_price, o.cover_page, o.cover_page_price,
+               o.pickup_address
         FROM orders o
         WHERE o.id = ? AND o.openid = ?
         """,

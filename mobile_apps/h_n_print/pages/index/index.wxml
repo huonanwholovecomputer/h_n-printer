@@ -108,6 +108,73 @@
           </button>
         </view>
 
+        <!-- v5: 附加服务参数 -->
+        <view class="card ext-params-card">
+          <view class="section-header inline-header">
+            <view class="section-header-bar"></view>
+            <text class="section-header-title">附加服务</text>
+          </view>
+
+          <!-- 派送开关 -->
+          <view class="param-row">
+            <text class="param-label">派送</text>
+            <view class="ios-switch {{deliveryEnabled ? 'switch-on' : ''}}" bindtap="onToggleDelivery">
+              <view class="switch-thumb"></view>
+            </view>
+          </view>
+
+          <!-- 派送地点（派送开启时显示）-->
+          <view wx:if="{{deliveryEnabled}}" class="param-row">
+            <text class="param-label">地点</text>
+            <view class="picker-trigger" bindtap="onToggleDeliveryPicker">
+              <text>{{deliveryLocation}}</text>
+              <text class="picker-arrow">›</text>
+            </view>
+          </view>
+          <view wx:if="{{showDeliveryPicker}}" class="picker-sheet">
+            <view wx:for="{{deliveryLocations}}" wx:key="*this" class="picker-option {{deliveryLocation === item ? 'picker-selected' : ''}}" bindtap="onSelectDeliveryLocation" data-loc="{{item}}">
+              <text>{{item}}</text>
+              <text class="picker-pct">{{deliveryPercentages[item]}}%</text>
+            </view>
+          </view>
+
+          <!-- 紧急程度 -->
+          <view class="param-row">
+            <text class="param-label">优先级</text>
+            <view class="picker-trigger" bindtap="onToggleUrgencyPicker">
+              <text class="{{urgency === '高' ? 'urgency-high' : urgency === '中' ? 'urgency-mid' : ''}}">{{urgency}}</text>
+              <text class="picker-arrow">›</text>
+            </view>
+          </view>
+          <view wx:if="{{showUrgencyPicker}}" class="picker-sheet">
+            <view wx:for="{{urgencyOptions}}" wx:key="*this" class="picker-option {{urgency === item ? 'picker-selected' : ''}}" bindtap="onSelectUrgency" data-urg="{{item}}">
+              <text>{{item}}</text>
+              <text class="picker-pct">¥{{urgencyPrices[item]}}</text>
+            </view>
+          </view>
+
+          <!-- 打印首页 -->
+          <view class="param-row">
+            <text class="param-label">打印首页</text>
+            <view class="ios-switch {{coverPage ? 'switch-on' : ''}}" bindtap="onToggleCoverPage">
+              <view class="switch-thumb"></view>
+            </view>
+          </view>
+
+          <!-- 首页价格（首页开启时显示）-->
+          <view wx:if="{{coverPage}}" class="param-row">
+            <text class="param-label">首页费</text>
+            <input class="control-input" type="digit" value="{{coverPagePrice}}" bindinput="onCoverPagePriceInput" placeholder="0.15" />
+            <text class="param-unit">元</text>
+          </view>
+
+          <!-- 自取地址（未派送时显示）-->
+          <view wx:if="{{!deliveryEnabled}}" class="param-row">
+            <text class="param-label">自取地址</text>
+            <input class="control-input" value="{{pickupAddress}}" bindinput="onPickupAddressInput" placeholder="如 1号楼202宿舍" />
+          </view>
+        </view>
+
         <!-- Submit Button -->
         <view class="submit-area">
           <button class="btn-primary" bindtap="onSubmit" hover-class="tap-active" loading="{{submitting}}" disabled="{{submitting}}">

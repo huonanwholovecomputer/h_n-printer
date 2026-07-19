@@ -321,3 +321,120 @@
   gap: 16rpx;
   margin-top: 32rpx;
 }
+
+/* ── v5: 附加服务参数卡 ── */
+.ext-params-card {
+  margin-bottom: 20rpx;
+}
+
+.param-row {
+  display: flex;
+  align-items: center;
+  padding: 14rpx 0;
+  gap: 16rpx;
+  border-bottom: 0.5px solid var(--separator);
+}
+.param-row:last-child {
+  border-bottom: none;
+}
+
+.param-label {
+  font-size: 26rpx;
+  color: var(--text-secondary);
+  width: 120rpx;
+  flex-shrink: 0;
+}
+
+.param-unit {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+}
+
+.control-input {
+  flex: 1;
+  height: 56rpx;
+  background: var(--gray6);
+  border-radius: var(--radius-sm);
+  padding: 0 14rpx;
+  font-size: 24rpx;
+  color: var(--text-primary);
+}
+
+/* iOS Toggle Switch */
+.ios-switch {
+  width: 88rpx;
+  height: 52rpx;
+  border-radius: 26rpx;
+  background: rgba(60, 60, 67, 0.18);
+  position: relative;
+  transition: background 0.2s ease;
+}
+.ios-switch.switch-on {
+  background: var(--green);
+}
+.switch-thumb {
+  position: absolute;
+  top: 4rpx;
+  left: 4rpx;
+  width: 44rpx;
+  height: 44rpx;
+  border-radius: 22rpx;
+  background: #fff;
+  box-shadow: 0 2rpx 4rpx rgba(0,0,0,0.12);
+  transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.ios-switch.switch-on .switch-thumb {
+  transform: translateX(36rpx);
+}
+
+/* Picker trigger */
+.picker-trigger {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 26rpx;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+.picker-arrow {
+  font-size: 28rpx;
+  color: var(--text-quaternary);
+}
+
+/* Picker dropdown */
+.picker-sheet {
+  background: var(--gray6);
+  border-radius: var(--radius-md);
+  padding: 4rpx;
+  margin: 4rpx 0 8rpx 136rpx;
+}
+.picker-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14rpx 20rpx;
+  font-size: 26rpx;
+  color: var(--text-primary);
+  border-radius: var(--radius-sm);
+  font-weight: 500;
+}
+.picker-option:active {
+  background: rgba(0, 122, 255, 0.08);
+}
+.picker-selected {
+  background: var(--blue);
+  color: #fff;
+  font-weight: 600;
+}
+.picker-pct {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+}
+.picker-selected .picker-pct {
+  color: rgba(255,255,255,0.8);
+}
+
+/* Urgency colors */
+.urgency-high { color: var(--red) !important; font-weight: 600; }
+.urgency-mid  { color: var(--orange) !important; font-weight: 600; }
