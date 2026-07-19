@@ -1,6 +1,7 @@
 """
 printer_config.py — 配置管理模块
 负责读取/写入 JSON 配置文件，管理打印机名称、双面模式、任务列表等。
+含打印首页(Cover Page) PDF 生成功能。
 """
 
 from __future__ import annotations
@@ -309,3 +310,296 @@ class PrinterConfig:
         except (json.JSONDecodeError, OSError, ValueError) as e:
             logger.warning(f"加载配置失败 ({path}): {e}，将使用默认配置")
             return cls()
+
+
+# ============================================================
+# 打印首页 (Cover Page) 生成
+# ============================================================
+
+def generate_cover_page_pdf(
+    output_path: str,
+    config: "PrinterConfig",
+    jobs: list["PrintJob"],
+    order_number: str = "",
+    created_at: str = "",
+) -> bool:
+    """
+    生成打印首页 PDF 文件。
+
+    首页包含:
+      - 标题 & 订单号
+      - 发起时间 / 实际执行时间
+      - 文件清单（文件名、份数、单双面、页数）
+      - 费用明细（纸张费、派送费、加急费、首页费）
+      - 总金额
+      - 派送地址 / 自取地址
+
+    Returns: True 表示生成成功。
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm, cm
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.colors import HexColor
+    from reportlab.platypus import (
+        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
+        HRFlowable,
+    )
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from datetime import datetime
+
+    # ── 中文字体注册 ──
+    _font_registered = False
+    _font_name = "Helvetica"
+    _font_name_bold = "Helvetica-Bold"
+    for _ttf_path in [
+        os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "msyh.ttc"),
+        os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "msyhbd.ttc"),
+    ]:
+        if os.path.isfile(_ttf_path):
+            try:
+                pdfmetrics.registerFont(TTFont("MSYH", _ttf_path, subfontIndex=0))
+                _font_name = "MSYH"
+                _font_name_bold = "MSYH"
+                _font_registered = True
+                break
+            except Exception:
+                pass
+
+    # 如果没有微软雅黑，尝试 SimSun
+    if not _font_registered:
+        for _ttf_path in [
+            os.path.join(os.environ.get("WINDIR", "C:/Windows"), "Fonts", "simsun.ttc"),
+        ]:
+            if os.path.isfile(_ttf_path):
+                try:
+                    pdfmetrics.registerFont(TTFont("SimSun", _ttf_path, subfontIndex=0))
+                    _font_name = "SimSun"
+                    _font_name_bold = "SimSun"
+                    break
+                except Exception:
+                    pass
+
+    # ── 样式 ──
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "CoverTitle", parent=styles["Title"],
+        fontName=_font_name_bold, fontSize=22, leading=30,
+        alignment=TA_CENTER, spaceAfter=4 * mm,
+        textColor=HexColor("#1a1a2e"),
+    )
+    subtitle_style = ParagraphStyle(
+        "CoverSubtitle", parent=styles["Normal"],
+        fontName=_font_name, fontSize=10, leading=14,
+        alignment=TA_CENTER, spaceAfter=10 * mm,
+        textColor=HexColor("#666666"),
+    )
+    section_style = ParagraphStyle(
+        "CoverSection", parent=styles["Heading2"],
+        fontName=_font_name_bold, fontSize=13, leading=18,
+        spaceBefore=6 * mm, spaceAfter=3 * mm,
+        textColor=HexColor("#1a1a2e"),
+    )
+    body_style = ParagraphStyle(
+        "CoverBody", parent=styles["Normal"],
+        fontName=_font_name, fontSize=10, leading=16,
+        textColor=HexColor("#333333"),
+    )
+    body_right_style = ParagraphStyle(
+        "CoverBodyRight", parent=body_style,
+        alignment=TA_RIGHT,
+    )
+    total_style = ParagraphStyle(
+        "CoverTotal", parent=styles["Normal"],
+        fontName=_font_name_bold, fontSize=16, leading=22,
+        alignment=TA_RIGHT, spaceBefore=4 * mm,
+        textColor=HexColor("#d4380d"),
+    )
+    footer_style = ParagraphStyle(
+        "CoverFooter", parent=styles["Normal"],
+        fontName=_font_name, fontSize=8, leading=12,
+        alignment=TA_CENTER, textColor=HexColor("#999999"),
+    )
+
+    # ── 构建内容 ──
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    story = []
+
+    # 标题
+    story.append(Paragraph("HN 打印 · 首页信息", title_style))
+    story.append(Paragraph(
+        f"订单号: {order_number}" if order_number else "本地打印任务",
+        subtitle_style,
+    ))
+
+    # ── 时间信息 ──
+    story.append(Paragraph("📅 时间信息", section_style))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#e0e0e0")))
+    time_data = [
+        [Paragraph("<b>发起时间</b>", body_style),
+         Paragraph(created_at or now_str, body_style)],
+        [Paragraph("<b>执行时间</b>", body_style),
+         Paragraph(now_str, body_style)],
+    ]
+    time_table = Table(time_data, colWidths=[80, 380])
+    time_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    story.append(time_table)
+
+    # ── 文件清单 ──
+    story.append(Paragraph("📄 文件清单", section_style))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#e0e0e0")))
+
+    file_header = [
+        Paragraph("<b>#</b>", body_style),
+        Paragraph("<b>文件名</b>", body_style),
+        Paragraph("<b>份数</b>", body_style),
+        Paragraph("<b>模式</b>", body_style),
+        Paragraph("<b>页码范围</b>", body_style),
+        Paragraph("<b>页数</b>", body_style),
+    ]
+    file_rows = [file_header]
+    for i, job in enumerate(jobs, 1):
+        fname = os.path.basename(job.file_path) if job.file_path else "(未知)"
+        # 截断过长文件名
+        if len(fname) > 40:
+            fname = fname[:37] + "…"
+        duplex_label = "双面" if job.duplex == "on" else "单面"
+        page_range_label = job.page_range if job.page_range.strip() else "全部"
+        page_count_label = str(job.page_count) if job.page_count > 0 else "?"
+        file_rows.append([
+            Paragraph(str(i), body_style),
+            Paragraph(fname, body_style),
+            Paragraph(str(job.copies), body_right_style),
+            Paragraph(duplex_label, body_style),
+            Paragraph(page_range_label, body_style),
+            Paragraph(page_count_label, body_right_style),
+        ])
+
+    file_table = Table(file_rows, colWidths=[20, 235, 40, 45, 70, 40])
+    file_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, HexColor("#cccccc")),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.5, HexColor("#e0e0e0")),
+        ("BACKGROUND", (0, 0), (-1, 0), HexColor("#f5f5f5")),
+    ]))
+    story.append(file_table)
+
+    # ── 费用明细 ──
+    story.append(Paragraph("💰 费用明细", section_style))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#e0e0e0")))
+
+    bill_rows = []
+    bill_rows.append([
+        Paragraph("<b>项目</b>", body_style),
+        Paragraph("<b>详情</b>", body_style),
+        Paragraph("<b>金额</b>", body_right_style),
+    ])
+
+    base_total = 0.0
+    all_known = True
+    for i, job in enumerate(jobs, 1):
+        cost, formula = calc_cost(
+            job.page_count, job.copies, job.duplex,
+            config.simplex_price, config.duplex_price,
+            job.page_range,
+        )
+        base_total += cost
+        if job.page_count == 0:
+            all_known = False
+        bill_rows.append([
+            Paragraph(f"文件{i}", body_style),
+            Paragraph(formula if formula else "—", body_style),
+            Paragraph(f"¥{cost:.2f}", body_right_style),
+        ])
+
+    # 纸张费小计
+    bill_rows.append([
+        Paragraph("<b>纸张费小计</b>", body_style),
+        Paragraph("", body_style),
+        Paragraph(f"<b>¥{base_total:.2f}</b>", body_right_style),
+    ])
+
+    total = base_total
+
+    # 派送费
+    if config.delivery_enabled:
+        pct = config.delivery_percentages.get(config.delivery_location, 0.0)
+        delivery_fee = base_total * (pct / 100.0)
+        total += delivery_fee
+        bill_rows.append([
+            Paragraph("派送费", body_style),
+            Paragraph(f"{config.delivery_location} ({pct:.0f}%)", body_style),
+            Paragraph(f"¥{delivery_fee:.2f}", body_right_style),
+        ])
+
+    # 加急费
+    urgency_price = config.urgency_prices.get(config.urgency, 0.0)
+    if urgency_price > 0:
+        total += urgency_price
+        bill_rows.append([
+            Paragraph("加急费", body_style),
+            Paragraph(f"优先级: {config.urgency}", body_style),
+            Paragraph(f"¥{urgency_price:.2f}", body_right_style),
+        ])
+
+    # 首页费
+    if config.cover_page:
+        total += config.cover_page_price
+        bill_rows.append([
+            Paragraph("首页费", body_style),
+            Paragraph("打印首页信息", body_style),
+            Paragraph(f"¥{config.cover_page_price:.2f}", body_right_style),
+        ])
+
+    bill_table = Table(bill_rows, colWidths=[80, 290, 80])
+    bill_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, HexColor("#cccccc")),
+        ("BACKGROUND", (0, 0), (-1, 0), HexColor("#f5f5f5")),
+    ]))
+    story.append(bill_table)
+
+    # 合计
+    prefix = "≈ " if not all_known else ""
+    story.append(Paragraph(f"{prefix}合计: ¥{total:.2f}", total_style))
+
+    # ── 地址信息 ──
+    story.append(Paragraph("📍 取件信息", section_style))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#e0e0e0")))
+    if config.delivery_enabled:
+        addr_text = f"派送至: <b>{config.delivery_location}</b>"
+    else:
+        addr_text = f"自取地址: <b>{config.pickup_address}</b>"
+    story.append(Paragraph(addr_text, body_style))
+
+    # 页脚
+    story.append(Spacer(1, 15 * mm))
+    story.append(HRFlowable(width="60%", thickness=0.3, color=HexColor("#e0e0e0")))
+    story.append(Paragraph(
+        f"HN 本地打印工具 · 生成于 {now_str}",
+        footer_style,
+    ))
+
+    # ── 生成 PDF ──
+    try:
+        doc = SimpleDocTemplate(
+            output_path, pagesize=A4,
+            leftMargin=20 * mm, rightMargin=20 * mm,
+            topMargin=15 * mm, bottomMargin=15 * mm,
+        )
+        doc.build(story)
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"生成首页 PDF 失败: {e}")
+        return False

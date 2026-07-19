@@ -8,6 +8,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import tempfile
+import time
 import traceback
 from datetime import datetime
 from typing import Optional
@@ -504,6 +506,8 @@ class PrintWorker(QThread):
         duplex_mode: str,
         keep_temp_pdf: bool,
         render_dpi: int = 400,
+        cover_page: bool = False,
+        cover_page_config: dict | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -512,6 +516,8 @@ class PrintWorker(QThread):
         self._duplex_mode = duplex_mode
         self._keep_temp_pdf = keep_temp_pdf
         self._render_dpi = render_dpi
+        self._cover_page = cover_page
+        self._cover_page_config = cover_page_config or {}
         self._converter: Optional[UniversalConverter] = None
         self._cancelled = False
 
@@ -539,6 +545,69 @@ class PrintWorker(QThread):
 
         self.progress.emit(0, total_sides, f"共 {task_count} 个任务, 预估 {total_sides} 面")
         self.log_message.emit(f"共 {task_count} 个任务待处理")
+
+        # ── 打印首页 (Cover Page) ──
+        cover_pdf_path: Optional[str] = None
+        if self._cover_page:
+            self.log_message.emit("📋 正在生成打印首页...")
+            try:
+                from printer_config import generate_cover_page_pdf
+
+                cover_pdf_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"hn_cover_{os.getpid()}_{int(time.time())}.pdf"
+                )
+                cfg_dict = self._cover_page_config
+                order_number = cfg_dict.get("order_number", "")
+                created_at = cfg_dict.get("created_at", "")
+
+                # 构建临时的 PrinterConfig 用于生成首页
+                config = PrinterConfig()
+                config.simplex_price = cfg_dict.get("simplex_price", 0.2)
+                config.duplex_price = cfg_dict.get("duplex_price", 0.3)
+                config.delivery_enabled = cfg_dict.get("delivery_enabled", False)
+                config.delivery_location = cfg_dict.get("delivery_location", "")
+                config.delivery_percentages = cfg_dict.get("delivery_percentages", {})
+                config.urgency = cfg_dict.get("urgency", "低")
+                config.urgency_prices = cfg_dict.get("urgency_prices", {})
+                config.cover_page = True
+                config.cover_page_price = cfg_dict.get("cover_page_price", 0.15)
+                config.pickup_address = cfg_dict.get("pickup_address", "")
+
+                ok = generate_cover_page_pdf(
+                    cover_pdf_path, config, self._jobs,
+                    order_number=order_number,
+                    created_at=created_at,
+                )
+                if ok and os.path.isfile(cover_pdf_path):
+                    # 打印首页（单面、1份、无页码范围）
+                    self.log_message.emit("📋 正在打印首页...")
+                    cover_ok, cover_msg = print_pdf(
+                        pdf_path=cover_pdf_path,
+                        printer_name=self._printer_name,
+                        copies=1,
+                        duplex="off",
+                        duplex_mode="long-edge",
+                        page_range="",
+                        orientation="portrait",
+                        progress_callback=None,
+                        dpi=self._render_dpi,
+                    )
+                    if cover_ok:
+                        self.log_message.emit(f"  ✓ 首页: {cover_msg}")
+                    else:
+                        self.log_message.emit(f"  ✗ 首页打印失败: {cover_msg}")
+                else:
+                    self.log_message.emit("  ✗ 首页生成失败")
+            except Exception as e:
+                self.log_message.emit(f"  ✗ 首页生成异常: {e}")
+            finally:
+                # 清理临时首页 PDF
+                if cover_pdf_path and os.path.isfile(cover_pdf_path):
+                    try:
+                        os.remove(cover_pdf_path)
+                    except OSError:
+                        pass
 
         offset_sides = 0
         for idx, job in enumerate(self._jobs):
@@ -2669,6 +2738,12 @@ class MainWindow(QMainWindow):
                                 "可能原因：格式错误、范围重叠、页码超出文件总页数。")
             return
 
+        # 生成订单号
+        from datetime import datetime
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        order_number, next_num = generate_order_number(self._config.last_order_number)
+        self._config.last_order_number = next_num
+
         # 自动保存配置
         try:
             self._config.save(self._config_path)
@@ -2679,12 +2754,29 @@ class MainWindow(QMainWindow):
         self._btn_start.setEnabled(False)
         self._progress_bar.setValue(0)
 
+        # 构建首页配置
+        cover_page_config = {
+            "simplex_price": self._config.simplex_price,
+            "duplex_price": self._config.duplex_price,
+            "delivery_enabled": self._config.delivery_enabled,
+            "delivery_location": self._config.delivery_location,
+            "delivery_percentages": self._config.delivery_percentages,
+            "urgency": self._config.urgency,
+            "urgency_prices": self._config.urgency_prices,
+            "cover_page_price": self._config.cover_page_price,
+            "pickup_address": self._config.pickup_address,
+            "order_number": order_number,
+            "created_at": created_at,
+        }
+
         worker = PrintWorker(
             jobs=list(self._config.jobs),
             printer_name=self._config.printer_name,
             duplex_mode=self._config.duplex_mode,
             keep_temp_pdf=self._config.keep_temp_pdf,
             render_dpi=self._config.render_dpi,
+            cover_page=self._config.cover_page,
+            cover_page_config=cover_page_config,
         )
         worker.progress.connect(self._on_progress)
         worker.log_message.connect(self._log)
