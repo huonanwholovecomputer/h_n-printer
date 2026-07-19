@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#F2F2F7">
+<title>HN 云打印</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ===== Navigation Bar ===== -->
+<div class="nav-bar" id="navBar">
+  <div class="nav-inner">
+    <div class="nav-center" id="navTitle">提交打印</div>
+  </div>
+</div>
+
+<!-- ===== Tab: Print (提交打印) ===== -->
+<div class="page" id="page-print">
+  <div class="scroller" id="scroller-print">
+    <div class="scroll-content" id="scrollContentPrint">
+      <div class="container">
+
+        <!-- Logo -->
+        <div class="header-area" id="headerArea">
+          <div class="logo-wrap" id="logoWrap">
+            <img class="logo" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='60'%3E%3Crect width='160' height='60' rx='14' fill='%23007AFF'/%3E%3Ctext x='80' y='38' text-anchor='middle' fill='white' font-size='24' font-weight='700' font-family='sans-serif'%3EHN 打印%3C/text%3E%3C/svg%3E" alt="HN Print">
+          </div>
+        </div>
+
+        <!-- Printer Status -->
+        <div class="status-bar" id="printerStatus">
+          <div class="status-dot offline"></div>
+          <span class="status-text" id="statusText">检查中…</span>
+        </div>
+
+        <!-- File List -->
+        <div class="card file-section">
+          <div class="section-header inline-header">
+            <div class="section-header-bar"></div>
+            <span class="section-header-title">打印文件</span>
+            <span class="section-header-badge" id="fileCount" style="display:none">0</span>
+          </div>
+
+          <div id="fileList"></div>
+
+          <button class="add-file-btn" id="addFileBtn">
+            <span class="add-icon">+</span>
+            <span>选择打印文件</span>
+          </button>
+          <input type="file" id="fileInput" accept=".pdf,.doc,.docx,.txt,.md,.html,.htm,.jpg,.jpeg,.png,.bmp,.gif,.webp" style="display:none" multiple>
+        </div>
+
+        <!-- Submit -->
+        <div class="submit-area">
+          <button class="btn-primary" id="submitBtn">提交打印任务</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Tab: Me (我) ===== -->
+<div class="page" id="page-me" style="display:none">
+  <div class="scroller" id="scroller-me">
+    <div class="scroll-content" id="scrollContentMe">
+      <div class="container">
+
+        <!-- Profile Card -->
+        <div class="user-card">
+          <div class="avatar-btn" id="avatarBtn">
+            <img class="avatar" id="avatarImg" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='108' height='108'%3E%3Ccircle cx='54' cy='54' r='54' fill='%23E5E5EA'/%3E%3Ccircle cx='54' cy='44' r='18' fill='%23C7C7CC'/%3E%3Cellipse cx='54' cy='80' rx='32' ry='22' fill='%23C7C7CC'/%3E%3C/svg%3E">
+          </div>
+          <div class="user-info">
+            <input class="nickname-input" id="nicknameInput" placeholder="点击输入昵称">
+            <span class="uid" id="roleLabel">访客</span>
+          </div>
+        </div>
+
+        <!-- Guest: Redeem Key -->
+        <div class="license-section" id="guestSection">
+          <div class="section-header">
+            <div class="section-header-bar"></div>
+            <span class="section-header-title">验证许可密钥</span>
+          </div>
+          <div class="license-card">
+            <span class="redeem-desc">请输入管理员提供的许可密钥</span>
+            <div class="redeem-input-row">
+              <input class="redeem-input" id="redeemInput" placeholder="8位密钥" maxlength="8">
+              <button class="redeem-btn" id="redeemBtn">验证</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- User: Licensed -->
+        <div class="license-section" id="userSection" style="display:none">
+          <div class="license-card license-active">
+            <div class="license-status-header">
+              <span class="license-status-icon">✅</span>
+              <span class="license-status-text">已获得打印许可</span>
+            </div>
+            <span class="temp-countdown" id="tempCountdown"></span>
+          </div>
+        </div>
+
+        <!-- Orders -->
+        <div class="orders-section">
+          <div class="section-header">
+            <div class="section-header-bar"></div>
+            <span class="section-header-title">我的打印任务</span>
+            <span class="section-header-badge" id="orderCountBadge" style="display:none">0</span>
+          </div>
+          <div id="ordersLoading" class="status-box"><span class="status-text">加载中…</span></div>
+          <div id="ordersEmpty" class="empty-state" style="display:none">
+            <div class="empty-state-icon">📋</div>
+            <div class="empty-state-title">暂无任务</div>
+            <div class="empty-state-desc">快去打印你的第一份文件吧</div>
+          </div>
+          <div id="orderList"></div>
+          <div id="loadMoreWrap" class="load-more-wrap" style="display:none">
+            <button class="load-more-btn" id="loadMoreBtn">加载更多</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Tab Bar ===== -->
+<div class="tab-bar" id="tabBar">
+  <div class="tab-item active" data-tab="print">
+    <div class="tab-icon-wrap active">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="6" y="3" width="12" height="18" rx="2"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>
+    </div>
+    <span class="tab-text active">打印</span>
+  </div>
+  <div class="tab-item" data-tab="me">
+    <div class="tab-icon-wrap">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-7 8-7s8 3 8 7"/></svg>
+    </div>
+    <span class="tab-text">我</span>
+  </div>
+</div>
+
+<!-- ===== Modals ===== -->
+<div class="modal-mask" id="successModal" style="display:none">
+  <div class="modal-sheet">
+    <div class="modal-icon-wrap">✓</div>
+    <div class="title-medium" style="margin-bottom:8px">任务提交成功</div>
+    <div class="body-small">文件已上传，打印任务已创建</div>
+    <div class="modal-buttons">
+      <button class="btn-secondary" id="modalContinue">继续打印</button>
+      <button class="btn-primary" style="flex:1" id="modalViewOrders">查看任务</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="denyModal" style="display:none">
+  <div class="modal-sheet">
+    <div class="modal-icon-wrap" style="background:rgba(255,59,48,0.1);color:var(--red)">!</div>
+    <div class="title-medium" style="margin-bottom:8px">需要许可</div>
+    <div class="body-small">请先出示管理员许可</div>
+    <div class="modal-buttons">
+      <button class="btn-primary" id="denyGoMe">前往获取</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
