@@ -2667,14 +2667,17 @@ def recover_stale_printing_tasks():
     return count
 
 
+# ==================== 定时任务调度器（模块级，供 Gunicorn worker 钩子引用）========
+
+scheduler = BackgroundScheduler()
+
+
 # ==================== 启动 ====================
 
 if __name__ == "__main__":
     init_db()
     print("数据库已初始化")
-    # recover_stale_printing_tasks()  # 已由定时任务 recover_orphaned_printing_tasks 替代
 
-    scheduler = BackgroundScheduler()
     scheduler.add_job(process_pending_orders, "interval", seconds=30, id="scan_orders")
     scheduler.add_job(check_printing_timeout, "interval", seconds=60, id="check_timeout")
     scheduler.add_job(cleanup_expired_license_keys, "interval", minutes=10, id="cleanup_licenses")
