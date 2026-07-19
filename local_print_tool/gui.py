@@ -1053,11 +1053,17 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         if dlg.exec() == QDialog.Accepted:
-            # 保存配置
+            # 保存配置到内存
             self._config.cloud_api_url = api_input.text().strip()
             self._config.cloud_ws_url = ws_input.text().strip()
             self._config.cloud_token = token_input.text().strip()
             self._config.cloud_enabled = True
+
+            # 立刻写入磁盘，防止程序崩溃丢失
+            try:
+                self._config.save(self._config_path)
+            except Exception as e:
+                logger.warning(f"保存云端配置失败: {e}")
 
             # 更新 CloudClient 并连接
             if self._cloud_client:
@@ -1067,7 +1073,7 @@ class MainWindow(QMainWindow):
                 self._cloud_client.token = self._config.cloud_token
                 self._cloud_client.start()
                 self._update_cloud_status()
-            self._log("☁ 云端配置已保存，正在连接...")
+            self._log("☁ 云端配置已保存并写入磁盘，正在连接...")
 
     def _toggle_cloud_connection(self):
         """状态栏按钮：切换云端连接。"""
