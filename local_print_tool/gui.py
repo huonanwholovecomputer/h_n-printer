@@ -2959,17 +2959,16 @@ class MainWindow(QMainWindow):
         return available.get("word", False) or available.get("wps", False) or available.get("libreoffice", False)
 
     def _ensure_order_number(self) -> str:
-        """确保当前标签页有订单号，若无则从后端获取（保证全局唯一）。离线时降级为本地生成。"""
+        """确保当前标签页有订单号。连线时从后端获取，离线时生成本地临时号（L 前缀）。"""
         jobs = self._get_current_jobs()
         if not jobs:
             return ""
-        # 检查是否已有订单号
         for j in jobs:
             if j.order_number:
                 return j.order_number
-        # 优先从后端获取唯一订单号
-        order_number = ""
-        if self._cloud_client and self._cloud_client.api_url and self._cloud_client.token:
+        # 尝试从后端获取
+        online = self._cloud_client and self._cloud_client.is_connected()
+        if online and self._cloud_client.api_url and self._cloud_client.token:
             try:
                 resp = http_requests.get(
                     f"{self._cloud_client.api_url}/api/next_order_number",
@@ -2980,20 +2979,93 @@ class MainWindow(QMainWindow):
                     data = resp.json()
                     if data.get("success"):
                         order_number = data.get("order_number", "")
+                        if order_number:
+                            for j in jobs: j.order_number = order_number
+                            self._set_current_jobs(jobs)
+                            self._refresh_tab_display()
+                            self._log(f"📋 已分配订单号: {order_number}")
+                            return order_number
             except Exception:
                 pass
-        # 降级：离线时本地生成
-        if not order_number:
-            from printer_config import generate_order_number
-            order_number, next_num = generate_order_number(self._config.last_order_number)
-            self._config.last_order_number = next_num
-        # 分配给当前标签页所有任务
+        # 离线：生成本地临时号
+        from datetime import date
+        today = date.today().strftime("%Y%m%d")
+        self._config.last_order_number += 1
+        order_number = f"HN{today}-L{self._config.last_order_number:04d}"
         for j in jobs:
             j.order_number = order_number
         self._set_current_jobs(jobs)
         self._refresh_tab_display()
-        self._log(f"📋 已分配订单号: {order_number}")
+        self._log(f"📋 已分配本地订单号: {order_number}（连线后将自动同步）")
         return order_number
+
+    def _sync_local_orders_to_cloud(self):
+        """连线后：将所有本地临时订单号（L 前缀）同步到云端，替换为云端正式订单号。"""
+        if not self._cloud_client or not self._cloud_client.is_connected():
+            return
+        replacements = {}  # old_number → new_number
+        for key, jobs in self._config.tabs.items():
+            for job in jobs:
+                if job.order_number and "-L" in job.order_number and job.order_number not in replacements:
+                    try:
+                        resp = http_requests.get(
+                            f"{self._cloud_client.api_url}/api/next_order_number",
+                            params={"token": self._cloud_client.token},
+                            timeout=5,
+                        )
+                        if resp.ok:
+                            data = resp.json()
+                            if data.get("success"):
+                                new_num = data.get("order_number", "")
+                                if new_num:
+                                    replacements[job.order_number] = new_num
+                    except Exception:
+                        pass
+        if not replacements:
+            return
+        # 替换所有本地号为云端号
+        for key, jobs in self._config.tabs.items():
+            for job in jobs:
+                if job.order_number in replacements:
+                    job.order_number = replacements[job.order_number]
+            self._config.tabs[key] = jobs
+        self._save_config()
+        self._refresh_tab_display()
+        self._log(f"📋 已同步 {len(replacements)} 个本地订单号到云端: {' '.join(replacements.values())}")
+        # 上报到后端
+        for old_num, new_num in replacements.items():
+            # 收集该订单号对应的所有任务
+            order_jobs = []
+            for jobs in self._config.tabs.values():
+                for j in jobs:
+                    if j.order_number == new_num:
+                        order_jobs.append(j)
+            if order_jobs:
+                try:
+                    http_requests.post(
+                        f"{self._cloud_client.api_url}/api/local_orders",
+                        params={"token": self._cloud_client.token},
+                        json={
+                            "order_number": new_num,
+                            "total_price": sum(calc_cost(j.page_count, j.copies, j.duplex,
+                                self._config.simplex_price, self._config.duplex_price,
+                                j.page_range)[0] for j in order_jobs),
+                            "files": [{
+                                "file_name": j.display_name or os.path.basename(j.file_path),
+                                "copies": j.copies,
+                                "page_count": j.page_count,
+                                "cost": calc_cost(j.page_count, j.copies, j.duplex,
+                                    self._config.simplex_price, self._config.duplex_price,
+                                    j.page_range)[0],
+                                "duplex": j.duplex,
+                                "page_range": j.page_range,
+                            } for j in order_jobs],
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        },
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
 
     def _on_copy_total(self):
         """复制合计金额到剪贴板（含订单号）。"""
@@ -3564,8 +3636,10 @@ class MainWindow(QMainWindow):
             self._cloud_tasks.pop(task.task_id, None)
 
     def _on_cloud_connection_changed(self, connected: bool):
-        """云端连接状态改变。"""
+        """云端连接状态改变。连线后同步本地离线订单到云端。"""
         self._update_cloud_status()
+        if connected:
+            self._sync_local_orders_to_cloud()
 
     def _on_cloud_status_message(self, msg: str):
         """云端日志消息 → 写入界面日志。"""
