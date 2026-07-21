@@ -151,6 +151,11 @@ QDoubleSpinBox {
 QDoubleSpinBox:focus {
     border-color: #1e66f5;
 }
+QDoubleSpinBox:disabled {
+    background-color: #d0d3db;
+    color: #9ca0b0;
+    border-color: #ccd0da;
+}
 QSpinBox {
     background-color: #e6e9ef;
     color: #4c4f69;
@@ -160,6 +165,11 @@ QSpinBox {
 }
 QSpinBox:focus {
     border-color: #1e66f5;
+}
+QSpinBox:disabled {
+    background-color: #d0d3db;
+    color: #9ca0b0;
+    border-color: #ccd0da;
 }
 
 /* ---------- 自定义计数器 ---------- */
