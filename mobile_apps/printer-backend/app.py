@@ -1575,6 +1575,19 @@ def ping():
     return {"msg": "pong", "status": "ok"}
 
 
+@app.route("/api/printer_status", methods=["GET"])
+@login_required
+def printer_status():
+    """返回打印机在线状态。"""
+    with printer_clients_lock:
+        online_count = len(printer_clients)
+    return jsonify({
+        "success": True,
+        "online": online_count > 0,
+        "count": online_count,
+    })
+
+
 @app.route("/api/pricing", methods=["GET"])
 def get_pricing():
     """返回打印定价配置（地点、优先级、首页费等），前端加载后与本地打印工具保持一致。"""

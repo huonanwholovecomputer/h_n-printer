@@ -53,6 +53,9 @@ Component({
     tempUntil: '',
     tempCountdownText: '',
 
+    // 打印机在线状态
+    printerOnline: false,
+    printerCount: 0,
     // 管理员：许可密钥轮询定时器（内部状态，非响应式）
     _keyPollTimer: null,
     // 内部滚动位置（驱动 scroll-content 的 translateY）
@@ -109,9 +112,44 @@ Component({
       this._scheduleMeasure()
       // 页面切换后 DOM 可能尚未稳定，追加一次延迟测量
       setTimeout(() => this._scheduleMeasure(300), 300)
+      // 开启订单状态定时轮询（每8秒）
+      this._startOrderPolling()
+    },
+    hide() {
+      this._stopOrderPolling()
     },
   },
   methods: {
+    // 订单状态轮询（含打印机在线状态）
+    _startOrderPolling() {
+      this._stopOrderPolling()
+      this._checkPrinterStatus()  // 立即检查一次
+      this._orderPollTimer = setInterval(() => {
+        this.loadOrders(1, false)
+        this._checkPrinterStatus()
+      }, 8000)
+    },
+    _stopOrderPolling() {
+      if (this._orderPollTimer) {
+        clearInterval(this._orderPollTimer)
+        this._orderPollTimer = null
+      }
+    },
+    _checkPrinterStatus() {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      wx.request({
+        url: CONFIG.BASE_URL + '/api/printer_status',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        success: (res) => {
+          if (res.data && res.data.success) {
+            this.setData({ printerOnline: res.data.online, printerCount: res.data.count })
+          }
+        },
+        fail: () => {}
+      })
+    },
     // ==================== 自定义橡皮筋滚动引擎 ====================
     // 与首页 index.js 同构，去掉 Logo 联动；新增 _scheduleMeasure
     // 以便在动态内容（任务/角色/许可用户）加载后刷新滚动上下界。
