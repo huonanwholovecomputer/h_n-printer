@@ -1518,8 +1518,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._setup_file_table())
         splitter.addWidget(self._setup_edit_panel())
         splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([600, 350])
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([650, 260])
         top_layout.addWidget(splitter, 1)
 
         # -- 进度条 --
