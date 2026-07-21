@@ -1935,7 +1935,7 @@ class MainWindow(QMainWindow):
         total_row = QHBoxLayout()
         total_row.setContentsMargins(0, 0, 0, 0)
         # F9: 当前标签页订单号
-        self._order_number_label = QLabel("")
+        self._order_number_label = QLabel("📋 未分配订单号")
         self._order_number_label.setObjectName("orderNumberLabel")
         total_row.addWidget(self._order_number_label)
         total_row.addStretch()
@@ -2761,6 +2761,15 @@ class MainWindow(QMainWindow):
         self._cover_page_price_spin.blockSignals(False)
 
         self._rebuild_table()
+        # 刷新订单号显示（初始加载时 _refresh_tab_display 中 hasattr 跳过了）
+        if hasattr(self, '_order_number_label') and self._order_number_label:
+            jobs = self._config.tabs.get(self._current_tab, [])
+            order_num = ""
+            for j in jobs:
+                if j.order_number:
+                    order_num = j.order_number
+                    break
+            self._order_number_label.setText(f"📋 {order_num}" if order_num else "📋 未分配订单号")
 
     def _refresh_printer_list(self):
         """刷新下拉列表中的系统打印机。"""
