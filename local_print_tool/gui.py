@@ -59,7 +59,7 @@ from PySide6.QtWidgets import (
     QStyleFactory,
 )
 
-from printer_config import PrinterConfig, PrintJob, calc_cost, generate_order_number
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, generate_order_number
 from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
@@ -1331,7 +1331,7 @@ class MainWindow(QMainWindow):
         # ── 标签页系统 ──
         # 确保 tabs 中至少有一个标签
         if not self._config.tabs:
-            self._config.tabs = {"1": []}
+            self._config.tabs = {"1": TabSettings()}
         self._current_tab = self._config.active_tab or "1"
         if self._current_tab not in self._config.tabs:
             self._current_tab = next(iter(self._config.tabs.keys()))
@@ -1992,7 +1992,7 @@ class MainWindow(QMainWindow):
         """切换标签页。delta: -1 上一页, +1 下一页（若已在最后一页则新建）。"""
         tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
         if not tab_keys:
-            self._config.tabs = {"1": []}
+            self._config.tabs = {"1": TabSettings()}
             tab_keys = ["1"]
 
         try:
@@ -2010,7 +2010,7 @@ class MainWindow(QMainWindow):
         if new_idx >= len(tab_keys):
             # 在最后一页点 + → 新建标签
             new_key = str(int(tab_keys[-1]) + 1)
-            self._config.tabs[new_key] = []
+            self._config.tabs[new_key] = TabSettings()
             self._current_tab = new_key
             self._config.active_tab = new_key
             self._save_config()
@@ -2033,8 +2033,8 @@ class MainWindow(QMainWindow):
 
     def _has_empty_tabs_except_current(self) -> bool:
         """检查是否存在非当前标签页的空标签页。"""
-        for key, jobs in self._config.tabs.items():
-            if key != self._current_tab and len(jobs) == 0:
+        for key, tab in self._config.tabs.items():
+            if key != self._current_tab and len(tab.jobs) == 0:
                 return True
         return False
 
@@ -2042,10 +2042,7 @@ class MainWindow(QMainWindow):
         """删除标签页后重新从 1 开始编号。更新 _current_tab 指向同一标签的新 key。"""
         old_current = self._current_tab
         old_tabs = self._config.tabs
-        # 按当前 key 的数值排序，保留 current 对应的 jobs
         sorted_keys = sorted(old_tabs.keys(), key=lambda x: int(x))
-        current_jobs = old_tabs.get(old_current, [])
-        # 重新编号
         new_tabs = {}
         new_current = "1"
         new_idx = 1
@@ -2067,7 +2064,8 @@ class MainWindow(QMainWindow):
                 continue
             if after_key is not None and int(key) <= int(after_key):
                 continue
-            if len(self._config.tabs.get(key, [])) == 0:
+            tab = self._config.tabs.get(key)
+            if tab and len(tab.jobs) == 0:
                 removed.append(key)
         for key in removed:
             del self._config.tabs[key]
@@ -2099,33 +2097,39 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_tab_btn_cleanup_empty') and self._tab_btn_cleanup_empty:
             self._tab_btn_cleanup_empty.setEnabled(self._has_empty_tabs_except_current())
 
-        # 更新信息标签
-        jobs = self._config.tabs.get(self._current_tab, [])
+        # 更新信息标签 & 订单号
+        tab = self._config.tabs.get(self._current_tab)
+        tb_jobs = tab.jobs if tab else []
         total = sum(calc_cost(j.page_count, j.copies, j.duplex,
                               self._config.simplex_price, self._config.duplex_price,
-                              j.page_range)[0] for j in jobs)
-        self._tab_info_label.setText(f"共 {len(jobs)} 个文件 · 合计 ¥{total:.2f}")
+                              j.page_range)[0] for j in tb_jobs)
+        self._tab_info_label.setText(f"共 {len(tb_jobs)} 个文件 · 合计 ¥{total:.2f}")
 
-        # F9: 更新订单号显示
-        order_num = ""
-        for j in jobs:
-            if j.order_number:
-                order_num = j.order_number
-                break
+        # 同步当前标签页的附加服务设置到 UI 控件
+        self._sync_tab_settings_to_ui(tab)
+
         if hasattr(self, '_order_number_label') and self._order_number_label:
-            if order_num:
-                self._order_number_label.setText(f"📋 {order_num}")
-            else:
-                self._order_number_label.setText("📋 未分配订单号")
+            order_num = ""
+            for j in tb_jobs:
+                if j.order_number:
+                    order_num = j.order_number
+                    break
+            self._order_number_label.setText(f"📋 {order_num}" if order_num else "📋 未分配订单号")
 
     def _get_current_jobs(self) -> list[PrintJob]:
         """返回当前标签页的任务列表。"""
-        return self._config.tabs.get(self._current_tab, [])
+        tab = self._config.tabs.get(self._current_tab)
+        return tab.jobs if tab else []
 
     def _set_current_jobs(self, jobs: list[PrintJob]):
         """设置当前标签页的任务列表并保存配置。"""
-        self._config.tabs[self._current_tab] = jobs
+        if self._current_tab in self._config.tabs:
+            self._config.tabs[self._current_tab].jobs = jobs
         self._save_config()
+
+    def _get_tab(self, key: str):
+        """获取标签页设置对象。"""
+        return self._config.tabs.get(key)
 
     def _save_config(self):
         """实时保存配置到 JSON 文件。"""
@@ -2177,7 +2181,8 @@ class MainWindow(QMainWindow):
             tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
             table.setRowCount(0)
             for key in tab_keys:
-                jobs = self._config.tabs.get(key, [])
+                tb = self._config.tabs.get(key)
+                jobs = tb.jobs if tb else []
                 file_count = len(jobs)
                 total_pages = sum(j.page_count * j.copies for j in jobs)
                 total_cost = sum(calc_cost(j.page_count, j.copies, j.duplex,
@@ -2255,7 +2260,8 @@ class MainWindow(QMainWindow):
             if len(tab_keys) <= 1:
                 QMessageBox.warning(dlg, "无法删除", "至少保留一个标签页。")
                 return
-            jobs = self._config.tabs.get(key, [])
+            tab_entry = self._config.tabs.get(key)
+            jobs = tab_entry.jobs if tab_entry else []
             if jobs:
                 reply = QMessageBox.question(
                     dlg, "确认删除",
@@ -2275,7 +2281,7 @@ class MainWindow(QMainWindow):
 
         def _delete_all_tabs():
             """删除全部标签页并重置为仅标签页 1"""
-            total = sum(len(j) for j in self._config.tabs.values())
+            total = sum(len(t.jobs) for t in self._config.tabs.values())
             if total > 0:
                 reply = QMessageBox.question(
                     dlg, "确认清空全部",
@@ -2285,7 +2291,7 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            self._config.tabs = {"1": []}
+            self._config.tabs = {"1": TabSettings()}
             self._current_tab = "1"
             self._config.active_tab = "1"
             self._save_config()
@@ -2301,7 +2307,8 @@ class MainWindow(QMainWindow):
             for key in sorted(self._config.tabs.keys(), key=lambda x: int(x)):
                 if key == self._current_tab:
                     continue
-                if len(self._config.tabs.get(key, [])) == 0:
+                tab = self._config.tabs.get(key)
+            if tab and len(tab.jobs) == 0:
                     removed.append(key)
             if not removed:
                 return
@@ -2449,16 +2456,19 @@ class MainWindow(QMainWindow):
         self._update_total_cost()
 
     def _update_total_cost(self):
-        """更新合计费用标签。"""
-        total = 0.0
+        """更新合计费用标签（含附加服务）。"""
+        base_total = 0.0
         all_known = True
         for job in self._get_current_jobs():
             cost, _ = calc_cost(job.page_count, job.copies, job.duplex,
                                 self._config.simplex_price, self._config.duplex_price,
                                 job.page_range)
-            total += cost
+            base_total += cost
             if job.page_count <= 0:
                 all_known = False
+        tab = self._config.tabs.get(self._current_tab)
+        extra = tab.calc_extra_total(base_total, self._config) if tab else 0.0
+        total = base_total + extra
         prefix = "≈ " if not all_known else ""
         self._total_label.setText(f"合计: {prefix}¥{total:.2f}")
 
@@ -2779,7 +2789,8 @@ class MainWindow(QMainWindow):
         self._rebuild_table()
         # 刷新订单号显示（初始加载时 _refresh_tab_display 中 hasattr 跳过了）
         if hasattr(self, '_order_number_label') and self._order_number_label:
-            jobs = self._config.tabs.get(self._current_tab, [])
+            tb = self._config.tabs.get(self._current_tab)
+            jobs = tb.jobs if tb else []
             order_num = ""
             for j in jobs:
                 if j.order_number:
@@ -2808,9 +2819,13 @@ class MainWindow(QMainWindow):
         self._log("已刷新打印机列表")
 
     def _on_price_changed(self):
-        """单价变更 → 重算当前标签页所有费用并保存。"""
+        """单价/附加服务变更 → 重算当前标签页所有费用并保存。"""
         self._config.simplex_price = self._simplex_price_spin.value()
         self._config.duplex_price = self._duplex_price_spin.value()
+        # 首页价格写回当前标签页
+        tab = self._config.tabs.get(self._current_tab)
+        if tab and hasattr(self, '_cover_page_price_spin'):
+            tab.cover_page_price = self._cover_page_price_spin.value()
         for row in range(self._table.rowCount()):
             self._recalc_row_cost(row)
         self._update_total_cost()
@@ -2826,12 +2841,48 @@ class MainWindow(QMainWindow):
         idx = self._render_dpi_combo.currentIndex()
         self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
 
-    # ---- 附加服务信号处理 ----
+    # ---- 附加服务信号处理（每标签页独立）----
+
+    def _sync_tab_settings_to_ui(self, tab):
+        """将标签页的附加服务设置同步到 UI 控件。"""
+        if not tab or not hasattr(self, '_delivery_onoff_combo'):
+            return
+        self._delivery_onoff_combo.blockSignals(True)
+        self._delivery_onoff_combo.setCurrentIndex(1 if tab.delivery_enabled else 0)
+        self._delivery_onoff_combo.blockSignals(False)
+        self._delivery_location_combo.setEnabled(tab.delivery_enabled)
+        self._delivery_percent_spin.setEnabled(tab.delivery_enabled)
+        if tab.delivery_location:
+            idx = self._delivery_location_combo.findText(tab.delivery_location)
+            if idx >= 0:
+                self._delivery_location_combo.setCurrentIndex(idx)
+        if tab.delivery_enabled:
+            pct = self._config.delivery_percentages.get(tab.delivery_location, 0.0)
+            self._delivery_percent_spin.blockSignals(True)
+            self._delivery_percent_spin.setValue(pct)
+            self._delivery_percent_spin.blockSignals(False)
+        self._urgency_combo.blockSignals(True)
+        self._urgency_combo.setCurrentText(tab.urgency)
+        self._urgency_combo.blockSignals(False)
+        is_low = (tab.urgency == "低")
+        self._urgency_price_spin.setEnabled(not is_low)
+        self._urgency_price_spin.blockSignals(True)
+        self._urgency_price_spin.setValue(0.0 if is_low else self._config.urgency_prices.get(tab.urgency, 0.0))
+        self._urgency_price_spin.blockSignals(False)
+        self._cover_page_onoff_combo.blockSignals(True)
+        self._cover_page_onoff_combo.setCurrentIndex(1 if tab.cover_page else 0)
+        self._cover_page_onoff_combo.blockSignals(False)
+        self._cover_page_price_spin.setEnabled(tab.cover_page)
+        self._cover_page_price_spin.blockSignals(True)
+        self._cover_page_price_spin.setValue(tab.cover_page_price)
+        self._cover_page_price_spin.blockSignals(False)
 
     def _on_delivery_toggled(self):
-        """派送开关变更。"""
+        """派送开关变更 → 写入当前标签页。"""
         enabled = (self._delivery_onoff_combo.currentIndex() == 1)
-        self._config.delivery_enabled = enabled
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            tab.delivery_enabled = enabled
         self._delivery_location_combo.setEnabled(enabled)
         self._delivery_percent_spin.setEnabled(enabled)
         if enabled:
@@ -2840,47 +2891,59 @@ class MainWindow(QMainWindow):
             self._delivery_percent_spin.blockSignals(True)
             self._delivery_percent_spin.setValue(pct)
             self._delivery_percent_spin.blockSignals(False)
+        self._save_config()
         self._on_price_changed()
 
     def _on_cover_page_toggled(self):
-        """首页开关变更。"""
+        """首页开关变更 → 写入当前标签页。"""
         enabled = (self._cover_page_onoff_combo.currentIndex() == 1)
-        self._config.cover_page = enabled
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            tab.cover_page = enabled
         self._cover_page_price_spin.setEnabled(enabled)
+        self._save_config()
         self._on_price_changed()
 
     def _on_delivery_location_changed(self):
-        """派送地点变更 → 更新百分比 spinbox。"""
+        """派送地点变更 → 更新百分比 spinbox 并写入当前标签页。"""
         loc = self._delivery_location_combo.currentText()
-        self._config.delivery_location = loc
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            tab.delivery_location = loc
         pct = self._config.delivery_percentages.get(loc, 0.0)
         self._delivery_percent_spin.blockSignals(True)
         self._delivery_percent_spin.setValue(pct)
         self._delivery_percent_spin.blockSignals(False)
+        self._save_config()
         self._on_price_changed()
 
     def _on_delivery_percent_changed(self):
-        """派送百分比编辑 → 回写地点百分比表。"""
+        """派送百分比编辑 → 回写全局百分比表（所有标签页共享）。"""
         loc = self._delivery_location_combo.currentText()
         self._config.delivery_percentages[loc] = self._delivery_percent_spin.value()
+        self._save_config()
         self._on_price_changed()
 
     def _on_urgency_changed(self):
-        """优先级变更 → 更新价格 spinbox。"低"时锁定为 0.00 并禁用。"""
+        """优先级变更 → 写入当前标签页。"低"时锁定为 0.00 并禁用。"""
         level = self._urgency_combo.currentText()
-        self._config.urgency = level
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            tab.urgency = level
         is_low = (level == "低")
         self._urgency_price_spin.setEnabled(not is_low)
         price = 0.0 if is_low else self._config.urgency_prices.get(level, 0.0)
         self._urgency_price_spin.blockSignals(True)
         self._urgency_price_spin.setValue(price)
         self._urgency_price_spin.blockSignals(False)
+        self._save_config()
         self._on_price_changed()
 
     def _on_urgency_price_changed(self):
-        """紧急价格编辑 → 回写紧急价格表。"""
+        """紧急价格编辑 → 回写全局紧急价格表。"""
         level = self._urgency_combo.currentText()
         self._config.urgency_prices[level] = self._urgency_price_spin.value()
+        self._save_config()
         self._on_price_changed()
 
     def _sync_ui_to_config(self):
@@ -3060,8 +3123,8 @@ class MainWindow(QMainWindow):
         if not self._cloud_client or not self._cloud_client.is_connected():
             return
         replacements = {}  # old_number → new_number
-        for key, jobs in self._config.tabs.items():
-            for job in jobs:
+        for key, tab in self._config.tabs.items():
+            for job in tab.jobs:
                 if job.order_number and "-L" in job.order_number and job.order_number not in replacements:
                     try:
                         resp = http_requests.get(
@@ -3080,11 +3143,11 @@ class MainWindow(QMainWindow):
         if not replacements:
             return
         # 替换所有本地号为云端号
-        for key, jobs in self._config.tabs.items():
-            for job in jobs:
+        for key, tab in self._config.tabs.items():
+            for job in tab.jobs:
                 if job.order_number in replacements:
                     job.order_number = replacements[job.order_number]
-            self._config.tabs[key] = jobs
+            tab.jobs = jobs
         self._save_config()
         self._refresh_tab_display()
         self._log(f"📋 已同步 {len(replacements)} 个本地订单号到云端: {' '.join(replacements.values())}")
@@ -3092,8 +3155,8 @@ class MainWindow(QMainWindow):
         for old_num, new_num in replacements.items():
             # 收集该订单号对应的所有任务
             order_jobs = []
-            for jobs in self._config.tabs.values():
-                for j in jobs:
+            for tab2 in self._config.tabs.values():
+                for j in tab2.jobs:
                     if j.order_number == new_num:
                         order_jobs.append(j)
             if order_jobs:
@@ -3662,8 +3725,8 @@ class MainWindow(QMainWindow):
         if self._cloud_task_window:
             self._cloud_task_window.mark_canceled(order_id, task_ids)
         # 如果已添加到标签页中，弹出提示
-        for key, jobs in list(self._config.tabs.items()):
-            for job in jobs:
+        for key, tab in list(self._config.tabs.items()):
+            for job in tab.jobs:
                 if job.task_id in task_ids:
                     QMessageBox.information(
                         self, "任务已取消",
@@ -3717,8 +3780,8 @@ class MainWindow(QMainWindow):
 
         # 检查所有标签页是否有未完成的文件
         total_files = 0
-        for key, jobs in self._config.tabs.items():
-            total_files += len(jobs)
+        for key, tab in self._config.tabs.items():
+            total_files += len(tab.jobs)
 
         if total_files > 0:
             reply = QMessageBox.question(
@@ -3731,7 +3794,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             # 用户确认退出 → 清空全部标签页
-            self._config.tabs = {"1": []}
+            self._config.tabs = {"1": TabSettings()}
             self._config.active_tab = "1"
             self._current_tab = "1"
 
@@ -3886,7 +3949,7 @@ class MainWindow(QMainWindow):
         if is_first:
             tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
             new_key = str(int(tab_keys[-1]) + 1) if tab_keys else "1"
-            self._config.tabs[new_key] = []
+            self._config.tabs[new_key] = TabSettings()
             self._current_tab = new_key
             self._config.active_tab = new_key
         else:
@@ -3956,7 +4019,7 @@ class MainWindow(QMainWindow):
             order_number=task.order_number,  # 云端订单号
             cached_pdf=cached_pdf,        # 使用缓存的 PDF（如有）
         )
-        self._config.tabs[new_key].append(job)
+        self._config.tabs[new_key].jobs.append(job)
 
         # Word 文件：缓存未命中时才启动转换
         if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
