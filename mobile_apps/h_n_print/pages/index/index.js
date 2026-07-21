@@ -48,6 +48,8 @@ Component({
   pageLifetimes: {
     show() {
       this.loadPrinterStatus()
+      // 启动打印机状态轮询（30秒）
+      this._startPrinterPolling()
       // 首次加载定价配置（与本地打印工具保持同步）
       if (!this.data.pricingLoaded) {
         this.loadPricing()
@@ -75,8 +77,23 @@ Component({
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(300), 300)
     },
+    hide() {
+      this._stopPrinterPolling()
+    },
   },
   methods: {
+    _startPrinterPolling() {
+      this._stopPrinterPolling()
+      this._printerPollTimer = setInterval(() => {
+        this.loadPrinterStatus()
+      }, 30000)
+    },
+    _stopPrinterPolling() {
+      if (this._printerPollTimer) {
+        clearInterval(this._printerPollTimer)
+        this._printerPollTimer = null
+      }
+    },
     // ==================== 微信登录 ====================
 
     doLogin() {
