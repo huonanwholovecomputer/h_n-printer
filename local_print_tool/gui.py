@@ -2056,7 +2056,8 @@ class MainWindow(QMainWindow):
         # 更新按钮启用状态
         self._tab_btn_minus.setEnabled(idx > 0)
         # F4: 存在空标签页（不含当前）时启用按钮
-        self._tab_btn_cleanup_empty.setEnabled(self._has_empty_tabs_except_current())
+        if hasattr(self, '_tab_btn_cleanup_empty') and self._tab_btn_cleanup_empty:
+            self._tab_btn_cleanup_empty.setEnabled(self._has_empty_tabs_except_current())
 
         # 更新信息标签
         jobs = self._config.tabs.get(self._current_tab, [])
@@ -2071,10 +2072,11 @@ class MainWindow(QMainWindow):
             if j.order_number:
                 order_num = j.order_number
                 break
-        if order_num:
-            self._order_number_label.setText(f"📋 {order_num}")
-        else:
-            self._order_number_label.setText("📋 未分配订单号")
+        if hasattr(self, '_order_number_label') and self._order_number_label:
+            if order_num:
+                self._order_number_label.setText(f"📋 {order_num}")
+            else:
+                self._order_number_label.setText("📋 未分配订单号")
 
     def _get_current_jobs(self) -> list[PrintJob]:
         """返回当前标签页的任务列表。"""
