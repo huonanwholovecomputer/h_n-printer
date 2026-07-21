@@ -1061,3 +1061,170 @@ Traceback (most recent call last):
                          ^^^^^^^^
 NameError: name 'QSpinBox' is not defined
 === END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:02.995386 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1899, in <lambda>
+    self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
+                                               ^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2019, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:04.010647 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1882, in <lambda>
+    self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
+                                                ^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:04.962148 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1899, in <lambda>
+    self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
+                                               ^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:08.752651 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1899, in <lambda>
+    self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
+                                               ^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2019, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:09.208151 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1882, in <lambda>
+    self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
+                                                ^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:09.328459 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1882, in <lambda>
+    self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
+                                                ^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:16.220657 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1899, in <lambda>
+    self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
+                                               ^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:16.635759 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1899, in <lambda>
+    self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
+                                               ^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:17.299880 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1882, in <lambda>
+    self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
+                                                ^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:17.379303 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1882, in <lambda>
+    self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
+                                                ^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2028, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:18.789311 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2083, in _on_cleanup_empty_tabs
+    self._cleanup_empty_tabs()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2077, in _cleanup_empty_tabs
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:23.410596 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1899, in <lambda>
+    self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
+                                               ^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 2019, in _switch_tab
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 19:24:38.082783 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2083, in _on_cleanup_empty_tabs
+    self._cleanup_empty_tabs()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2077, in _cleanup_empty_tabs
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2109, in _refresh_tab_display
+    for j in tb_jobs:
+             ^^^^^^^
+NameError: name 'tb_jobs' is not defined
+=== END CRASH ===
