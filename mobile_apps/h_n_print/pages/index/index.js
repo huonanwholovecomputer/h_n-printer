@@ -9,6 +9,7 @@ Component({
     printerActive: false,
     showSuccessModal: false,
     showAccessDeniedModal: false,
+    showPageCountWarning: false,   // 页数未验证警告弹窗
     userRole: '',
     submitting: false,
     logoScale: 1,
@@ -25,25 +26,32 @@ Component({
     urgencyPrices: { '低': 0, '中': 0.08, '高': 0.15 },
     urgencyPrice: 0,
     coverPage: false,
-    coverPagePrice: 0.15,
+    coverPagePrice: 0.10,  // 与本地打印工具 print_config.json 保持一致
     pickupAddress: '1号楼202宿舍',
     showDeliveryPicker: false,
     showUrgencyPicker: false,
+    lastOrderNumber: '',
   },
   lifetimes: {
     attached() {
       this._initScrollEngine()
       this._uploadTimers = {}   // { index: intervalId } — 每个文件独立的进度条定时器
+      this._pollTimers = {}     // { index: intervalId } — 页数轮询定时器
       this.doLogin()
     },
     detached() {
       this._destroyScrollEngine()
       this._stopAllUploadTimers()
+      this._stopAllPollTimers()
     },
   },
   pageLifetimes: {
     show() {
       this.loadPrinterStatus()
+      // 首次加载定价配置（与本地打印工具保持同步）
+      if (!this.data.pricingLoaded) {
+        this.loadPricing()
+      }
       // 每次切回页面时重新检查角色（可能在"我"页面兑换了许可）
       if (wx.getStorageSync('token')) {
         this.loadUserRole()
@@ -245,8 +253,8 @@ Component({
         this._contentH = ch
         this._maxY = Math.max(0, ch - vp + this._bottomPad)
         if (this._y > this._maxY) {
-          this._y = this._maxY
-          this._applyY()
+          // 不直接跳变，让 _snapBack() 从当前位置平滑回弹到新边界
+          this._snapBack()
         }
       })
     },
@@ -484,8 +492,10 @@ Component({
           const sizeKB = Number(file.size) || 0
           const fileIndex = this.data.selectedFiles.length
 
-          // 检测是否为 Excel
+          // 检测是否为 Excel 或图片
           const ext = name.slice(name.lastIndexOf('.')).toLowerCase()
+          const imageExts = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']
+          const isImage = imageExts.includes(ext)
           const isExcel = ext === '.xls' || ext === '.xlsx'
 
           const newFile = {
@@ -498,11 +508,15 @@ Component({
             progress: 0,
             failed: false,
             copies: 1,
-            pageRange: '',
+            pageRange: '',                        // 提交用，由 rangeLines 合并得出
+            rangeLines: [{value: '', error: ''}],  // 多行输入，对齐本地工具 RangeListWidget
             duplex: 'on',
             entering: true,
             removing: false,
             excelWarning: isExcel,
+            isImage: isImage,
+            pageCount: 0,
+            pageCountStatus: '',  // '' | 'analyzing' | 'confirmed' — 页数分析进度
           }
           this.setData({
             ['selectedFiles[' + fileIndex + ']']: newFile
@@ -525,22 +539,23 @@ Component({
       const index = e.currentTarget.dataset.index
       // 先标记退场动画（opacity + transform transition ~220ms），等动画完成后再移除
       this.stopFileUploadTimer(index)
+      this._stopPageCountPoll(index)
       this.setData({ ['selectedFiles[' + index + '].removing']: true })
       setTimeout(() => {
         const files = this.data.selectedFiles.slice()
         files.splice(index, 1)
         // 重映射定时器索引
-        const newTimers = {}
-        const oldKeys = Object.keys(this._uploadTimers).map(Number)
-        oldKeys.forEach((k) => {
-          if (k > index) {
-            newTimers[k - 1] = this._uploadTimers[k]
-          } else if (k < index) {
-            newTimers[k] = this._uploadTimers[k]
-          }
-          // k === index 跳过（已清理）
-        })
-        this._uploadTimers = newTimers
+        const remapTimers = (timersObj) => {
+          const newTimers = {}
+          const oldKeys = Object.keys(timersObj).map(Number)
+          oldKeys.forEach((k) => {
+            if (k > index) newTimers[k - 1] = timersObj[k]
+            else if (k < index) newTimers[k] = timersObj[k]
+          })
+          return newTimers
+        }
+        this._uploadTimers = remapTimers(this._uploadTimers || {})
+        this._pollTimers = remapTimers(this._pollTimers || {})
         this.setData({ selectedFiles: files })
         this._scheduleMeasure()
       }, 350)  // fileCardExit 动画 300ms + 50ms buffer
@@ -593,10 +608,12 @@ Component({
           }
 
           let fileId = null
+          let pageCount = 0
           let errMsg = ''
           try {
             const data = JSON.parse(uploadRes.data)
             fileId = data.file_id || data.id
+            pageCount = data.page_count || 0
             if (!fileId) {
               errMsg = data.message || '上传失败'
             }
@@ -620,15 +637,30 @@ Component({
             return
           }
 
-          console.log('文件上传成功，返回 ID:', fileId, 'index:', fileIndex)
+          console.log('文件上传成功，返回 ID:', fileId, '页数:', pageCount, 'index:', fileIndex)
           this._uploadTimers[fileIndex].realProgress = 100
           this.stopFileUploadTimer(fileIndex)
+          // 图片固定 1 页，覆盖后端返回值（确保一致性）
+          const file = this.data.selectedFiles[fileIndex]
+          if (file && file.isImage) pageCount = 1
+
+          // 判断页数状态：PDF 直接确认，doc/docx 进入分析中
+          let pageCountStatus = ''
+          if (!file || !file.isImage) {
+            pageCountStatus = pageCount > 0 ? 'confirmed' : 'analyzing'
+          }
           this.setData({
             [key + '.uploading']: false,
             [key + '.progress']: 100,
             [key + '.fileId']: fileId,
             [key + '.failed']: false,
+            [key + '.pageCount']: pageCount,
+            [key + '.pageCountStatus']: pageCountStatus,
           })
+          // 页数未知时启动轮询（等待本地打印工具分析回报）
+          if (pageCount <= 0 && file && !file.isImage) {
+            this._startPageCountPoll(fileIndex, fileId)
+          }
           // DOM 从"上传中+进度条"切换为"已上传+份数+打印范围"，需更长延迟等渲染稳定
           this._scheduleMeasure(200)
           setTimeout(() => this._scheduleMeasure(450), 450)
@@ -664,6 +696,73 @@ Component({
       })
     },
 
+    _stopAllPollTimers() {
+      if (!this._pollTimers) return
+      Object.keys(this._pollTimers).forEach((k) => {
+        this._stopPageCountPoll(Number(k))
+      })
+    },
+
+    // ==================== 页数轮询（等待本地打印工具分析）====================
+
+    _MAX_POLL_ATTEMPTS: 15,   // 15 次 × 2s = 最多等 30 秒
+
+    _startPageCountPoll(fileIndex, fileId) {
+      this._stopPageCountPoll(fileIndex)
+      if (!fileId) return
+      let attempts = 0
+
+      const poll = () => {
+        if (attempts >= this._MAX_POLL_ATTEMPTS) {
+          this._stopPageCountPoll(fileIndex)
+          console.log('页数轮询超时: fileIndex=' + fileIndex)
+          return
+        }
+        attempts++
+        const token = wx.getStorageSync('token') || ''
+        wx.request({
+          url: CONFIG.BASE_URL + '/api/file_page/' + fileId,
+          method: 'GET',
+          header: { 'Authorization': 'Bearer ' + token },
+          success: (res) => {
+            if (res.statusCode === 200 && res.data && res.data.success) {
+              const pc = res.data.page_count || 0
+              const verified = res.data.verified || false
+              if (pc > 0 && verified) {
+                // 页数已验证，更新文件数据并重新校验已有的页码范围
+                const files = this.data.selectedFiles
+                if (files[fileIndex] && files[fileIndex].fileId === fileId) {
+                  this.setData({
+                    ['selectedFiles[' + fileIndex + '].pageCount']: pc,
+                    ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'confirmed',
+                  })
+                  // 页数已知后，对已填写的范围重新做上限校验
+                  this._normalizeAndValidateRangeLines(fileIndex)
+                }
+                this._stopPageCountPoll(fileIndex)
+                console.log('页数轮询成功: fileIndex=' + fileIndex + ', pages=' + pc)
+              }
+              // pc === 0 或未验证 → 继续轮询
+            }
+          },
+          fail: () => {
+            // 网络错误 → 继续轮询
+          }
+        })
+      }
+
+      // 立即发第一次，之后每 2 秒一次
+      poll()
+      this._pollTimers[fileIndex] = setInterval(poll, 2000)
+    },
+
+    _stopPageCountPoll(fileIndex) {
+      if (this._pollTimers && this._pollTimers[fileIndex]) {
+        clearInterval(this._pollTimers[fileIndex])
+        delete this._pollTimers[fileIndex]
+      }
+    },
+
     // ==================== 每文件份数操作 ====================
 
     onFileCopiesMinus(e) {
@@ -693,11 +792,151 @@ Component({
       })
     },
 
-    onFilePageRangeInput(e) {
-      const index = e.currentTarget.dataset.index
-      if (this.data.selectedFiles[index].excelWarning) return
+    // ---- 页码范围 — 多行输入（对齐本地工具 RangeListWidget）----
+
+    _parseSingleRange(text) {
+      // 匹配 gui.py RangeListWidget._parse_range
+      text = (text || '').trim()
+      if (!text) return null
+      if (text.indexOf('-') !== -1) {
+        const parts = text.split('-')
+        if (parts.length !== 2) return null
+        const start = parseInt(parts[0], 10)
+        const end = parseInt(parts[1], 10)
+        if (isNaN(start) || isNaN(end)) return null
+        if (start >= 1 && start < end) {
+          const pages = new Set()
+          for (let p = start; p <= end; p++) pages.add(p)
+          return pages
+        }
+        return null
+      } else {
+        const v = parseInt(text, 10)
+        if (isNaN(v) || v < 1) return null
+        return new Set([v])
+      }
+    },
+
+    onRangeLineInput(e) {
+      const fileIndex = e.currentTarget.dataset.fileIndex
+      const lineIndex = e.currentTarget.dataset.lineIndex
+      const value = e.detail.value || ''
+      const file = this.data.selectedFiles[fileIndex]
+      if (!file || file.excelWarning || file.isImage) return
+
       this.setData({
-        ['selectedFiles[' + index + '].pageRange']: e.detail.value || ''
+        ['selectedFiles[' + fileIndex + '].rangeLines[' + lineIndex + '].value']: value,
+        ['selectedFiles[' + fileIndex + '].rangeLines[' + lineIndex + '].error']: '',
+      })
+
+      // 如果在最后一行输入了内容，自动追加新空行
+      const lines = this.data.selectedFiles[fileIndex].rangeLines
+      if (lineIndex === lines.length - 1 && value.trim()) {
+        const newLines = lines.concat([{value: '', error: ''}])
+        this.setData({ ['selectedFiles[' + fileIndex + '].rangeLines']: newLines })
+        this._scheduleMeasure(200)
+      }
+    },
+
+    onRangeLineBlur(e) {
+      const fileIndex = e.currentTarget.dataset.fileIndex
+      const file = this.data.selectedFiles[fileIndex]
+      if (!file || file.excelWarning || file.isImage) return
+      this._normalizeAndValidateRangeLines(fileIndex)
+    },
+
+    _normalizeAndValidateRangeLines(fileIndex) {
+      const file = this.data.selectedFiles[fileIndex]
+      if (!file) return
+      const lines = file.rangeLines || [{value: '', error: ''}]
+      const maxPages = file.pageCount || 0
+
+      // 收集非空行，解析每行
+      const entries = []
+      for (const line of lines) {
+        const v = (line.value || '').trim()
+        if (!v) continue
+        const pages = this._parseSingleRange(v)
+        if (pages) {
+          entries.push({ value: v, pages, error: '' })
+        } else {
+          entries.push({ value: v, pages: null, error: '格式错误（应为 1-5 或 7）' })
+        }
+      }
+
+      // 超限检测
+      if (maxPages > 0) {
+        for (const e of entries) {
+          if (e.pages && Math.max(...e.pages) > maxPages) {
+            e.error = '超出总页数 ' + maxPages
+            e.pages = null
+          }
+        }
+      }
+
+      // 重叠检测
+      for (let i = 0; i < entries.length; i++) {
+        if (!entries[i].pages) continue
+        for (let j = i + 1; j < entries.length; j++) {
+          if (!entries[j].pages) continue
+          if ([...entries[i].pages].some(p => entries[j].pages.has(p))) {
+            entries[i].error = '重叠: ' + entries[j].value
+            entries[j].error = '重叠: ' + entries[i].value
+            entries[i].pages = null
+            entries[j].pages = null
+          }
+        }
+      }
+
+      // 按起始页排序
+      entries.sort((a, b) => {
+        if (!a.pages && !b.pages) return 0
+        if (!a.pages) return 1
+        if (!b.pages) return -1
+        return Math.min(...a.pages) - Math.min(...b.pages)
+      })
+
+      // 重建 lines：排序后条目 + 一个底部空行
+      const newLines = entries.map(e => ({ value: e.value, error: e.error }))
+      newLines.push({ value: '', error: '' })
+
+      // 合并有效范围
+      const validParts = entries.filter(e => e.pages).map(e => e.value)
+      const pageRange = validParts.join(',')
+
+      this.setData({
+        ['selectedFiles[' + fileIndex + '].rangeLines']: newLines,
+        ['selectedFiles[' + fileIndex + '].pageRange']: pageRange,
+      })
+    },
+
+    loadPricing() {
+      wx.request({
+        url: CONFIG.BASE_URL + '/api/pricing',
+        method: 'GET',
+        success: (res) => {
+          if (res.statusCode === 200 && res.data && res.data.success) {
+            const p = res.data.pricing
+            this.setData({
+              pricingLoaded: true,
+              deliveryLocations: p.delivery_locations || this.data.deliveryLocations,
+              deliveryPercentages: p.delivery_percentages || this.data.deliveryPercentages,
+              urgencyOptions: p.urgency_levels || this.data.urgencyOptions,
+              urgencyPrices: p.urgency_prices || this.data.urgencyPrices,
+              coverPagePrice: p.cover_page_price != null ? p.cover_page_price : this.data.coverPagePrice,
+              pickupAddress: p.pickup_address || this.data.pickupAddress,
+            })
+            // 刷新当前地点百分比显示
+            const loc = this.data.deliveryLocation
+            const updatedPct = (p.delivery_percentages || {})[loc]
+            if (updatedPct != null) {
+              this.setData({ deliveryPercent: updatedPct })
+            }
+          }
+        },
+        fail: () => {
+          // 加载失败使用默认值，不阻塞
+        }
       })
     },
 
@@ -737,7 +976,11 @@ Component({
       this.setData({
         deliveryEnabled: next,
         deliveryPercent: next ? (this.data.deliveryPercentages[loc] || 0) : 0,
+        showDeliveryPicker: false,  // 切换派送时关闭展开的地点列表
       })
+      // 派送开关影响地点行 + 自取地址行，内容高度变化 → 刷新滚动边界
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(400), 400)
     },
 
     onSelectDeliveryLocation(e) {
@@ -748,10 +991,16 @@ Component({
         deliveryPercent: pct,
         showDeliveryPicker: false,
       })
+      // 关闭地点选择器，内容高度变小 → 刷新滚动边界
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(400), 400)
     },
 
     onToggleDeliveryPicker() {
       this.setData({ showDeliveryPicker: !this.data.showDeliveryPicker })
+      // 展开/收起有 350ms 动画，动画完成后重新测量
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(400), 400)
     },
 
     onSelectUrgency(e) {
@@ -762,14 +1011,23 @@ Component({
         urgencyPrice: price,
         showUrgencyPicker: false,
       })
+      // 关闭优先级选择器，内容高度变小 → 刷新滚动边界
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(400), 400)
     },
 
     onToggleUrgencyPicker() {
       this.setData({ showUrgencyPicker: !this.data.showUrgencyPicker })
+      // 展开/收起有 350ms 动画，动画完成后重新测量
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(400), 400)
     },
 
     onToggleCoverPage() {
       this.setData({ coverPage: !this.data.coverPage })
+      // 首页开关影响"首页费"行，内容高度变化 → 刷新滚动边界
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(400), 400)
     },
 
     onPickupAddressInput(e) {
@@ -819,16 +1077,61 @@ Component({
         }
       }
 
+      // 检查是否有设置了页码范围但页数未验证的文件
+      const unverifiedFiles = selectedFiles.filter(f => {
+        if (f.isImage || f.excelWarning) return false
+        if (!f.pageRange || !f.pageRange.trim()) return false  // 未设范围=打印全部，无需警告
+        return (f.pageCount || 0) <= 0
+      })
+      if (unverifiedFiles.length > 0) {
+        // 显示警告弹窗
+        this.setData({ showPageCountWarning: true })
+        return
+      }
+
+      // 检查所有页码范围语法错误（多行输入模式）
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const f = selectedFiles[i]
+        const lines = f.rangeLines || []
+        const hasError = lines.some(line => line.error)
+        if (hasError) {
+          wx.showToast({ title: `"${f.name}" 页码范围有误`, icon: 'none', duration: 2000 })
+          return
+        }
+      }
+
+      this._doSubmit(false)
+    },
+
+    // 确认强制提交（忽略页数未验证警告）
+    onConfirmForceSubmit() {
+      this.setData({ showPageCountWarning: false })
+      this._doSubmit(true)
+    },
+
+    // 取消强制提交，返回等待
+    onCancelForceSubmit() {
+      this.setData({ showPageCountWarning: false })
+    },
+
+    _doSubmit(skipPageValidation) {
+      const { selectedFiles } = this.data
+
       this.setData({ submitting: true })
       wx.showLoading({ title: '提交中...' })
 
-      const filesPayload = selectedFiles.map(f => ({
-        file_id: f.fileId,
-        file: f.name,
-        copies: Number(f.copies),
-        page_range: f.pageRange || '',
-        duplex: f.duplex || 'on',
-      }))
+      const filesPayload = selectedFiles.map(f => {
+        // 从多行输入合并出 page_range（确保 blur 前的输入也不丢失）
+        const lines = (f.rangeLines || []).filter(l => (l.value || '').trim() && !l.error)
+        const range = lines.map(l => l.value.trim()).join(',')
+        return {
+          file_id: f.fileId,
+          file: f.name,
+          copies: Number(f.copies),
+          page_range: range || f.pageRange || '',
+          duplex: f.duplex || 'on',
+        }
+      })
 
       wx.request({
         url: CONFIG.BASE_URL + '/api/submit_order',
@@ -849,6 +1152,7 @@ Component({
           cover_page: this.data.coverPage ? 1 : 0,
           cover_page_price: this.data.coverPagePrice,
           pickup_address: this.data.pickupAddress,
+          skip_page_validation: skipPageValidation ? 1 : 0,
         },
         success: (submitRes) => {
           wx.hideLoading()
@@ -857,10 +1161,18 @@ Component({
             this.doLoginAndRetry(() => this.onSubmit())
             return
           }
+          if (submitRes.statusCode !== 200 || !submitRes.data || !submitRes.data.success) {
+            const msg = (submitRes.data && submitRes.data.message) || '服务器错误，请稍后重试'
+            this.setData({ submitting: false })
+            wx.showToast({ title: msg, icon: 'none', duration: 2500 })
+            return
+          }
           console.log('任务提交成功：', submitRes.data)
+          this._lastOrderResult = submitRes.data
           this.setData({
             submitting: false,
             showSuccessModal: true,
+            lastOrderNumber: submitRes.data.order_number || '',
           })
         },
         fail: (err) => {
@@ -872,20 +1184,156 @@ Component({
       })
     },
 
+    // ---- 价格计算（复刻本地工具 calc_cost）----
+
+    _calcCost(pageCount, copies, duplex) {
+      const simplex = 0.2
+      const duplexP = 0.3
+      if (pageCount <= 0) return { cost: 0, formula: '?', known: false }
+
+      if (duplex === 'on') {
+        const pairs = Math.floor(pageCount / 2)
+        const remainder = pageCount % 2
+        let cost, innerFormula
+        if (remainder === 0) {
+          cost = pairs * duplexP
+          innerFormula = pairs + '张×' + duplexP.toFixed(2)
+        } else if (pairs === 0) {
+          cost = remainder * simplex
+          innerFormula = remainder + '张×' + simplex.toFixed(2)
+        } else {
+          cost = pairs * duplexP + remainder * simplex
+          innerFormula = pairs + '张×' + duplexP.toFixed(2) + '+' + remainder + '张×' + simplex.toFixed(2)
+        }
+        const formula = copies > 1
+          ? '(' + innerFormula + ')×' + copies + '份'
+          : innerFormula
+        return { cost: Math.round(cost * copies * 100) / 100, formula, known: true }
+      } else {
+        const innerFormula = pageCount + '张×' + simplex.toFixed(2)
+        const formula = copies > 1
+          ? '(' + innerFormula + ')×' + copies + '份'
+          : innerFormula
+        return { cost: Math.round(pageCount * simplex * copies * 100) / 100, formula, known: true }
+      }
+    },
+
+    // ---- 复制价格（简略：仅金额，对齐本地工具 Ctrl+C）----
+
+    onCopyPrice() {
+      const d = this._lastOrderResult
+      if (!d || !d.files) return
+      const files = d.files
+
+      let baseTotal = 0
+      let allKnown = true
+      files.forEach(f => {
+        const r = this._calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on')
+        baseTotal += r.cost
+        if (!r.known) allKnown = false
+      })
+
+      let total = baseTotal
+      if (this.data.deliveryEnabled) {
+        total += baseTotal * (this.data.deliveryPercent / 100)
+      }
+      total += this.data.urgencyPrice
+      if (this.data.coverPage) total += this.data.coverPagePrice
+
+      const orderNumber = d.order_number || ''
+      const prefix = allKnown ? '' : '≈ '
+      const amount = (orderNumber ? orderNumber + ' ' : '') + prefix + '¥' + total.toFixed(2)
+      wx.setClipboardData({
+        data: amount,
+        success: () => wx.showToast({ title: '已复制价格', icon: 'success' })
+      })
+    },
+
+    // ---- 复制详细价格（对齐本地工具 Ctrl+Shift+C）----
+
+    onCopyDetailPrice() {
+      const d = this._lastOrderResult
+      if (!d || !d.files) return
+      const files = d.files
+      const orderNumber = d.order_number || ''
+      const lines = ['计费明细']
+      if (orderNumber) lines.push(orderNumber)
+      lines.push('─'.repeat(14))
+      const allParts = []
+      let baseTotal = 0
+      let itemNum = 0
+
+      files.forEach(f => {
+        itemNum++
+        const r = this._calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on')
+        const name = f.file_name || '未知文件'
+        const duplexLabel = f.duplex === 'on' ? '双面' : '单面'
+        const rangeLabel = f.page_range ? f.page_range + '页' : '全部页'
+
+        lines.push(itemNum + '. ' + name)
+        lines.push('   ' + f.copies + '份 | ' + duplexLabel + ' | ' + rangeLabel)
+        if (r.cost > 0) {
+          lines.push('   ' + r.formula + '=¥' + r.cost.toFixed(2))
+          allParts.push(r.cost.toFixed(2))
+          baseTotal += r.cost
+        } else {
+          lines.push('   💰 ?')
+        }
+      })
+
+      // 派送
+      itemNum++
+      if (this.data.deliveryEnabled) {
+        const loc = this.data.deliveryLocation
+        const pct = this.data.deliveryPercent
+        const deliveryCost = baseTotal * (pct / 100)
+        if (pct > 0 && deliveryCost > 0) {
+          lines.push(itemNum + '. 派送：是 | ' + loc + ' ' + pct.toFixed(1) + '% | ￥' + deliveryCost.toFixed(2))
+          allParts.push(deliveryCost.toFixed(2))
+        } else {
+          lines.push(itemNum + '. 派送：是 | ' + loc + '免费')
+        }
+      } else {
+        lines.push(itemNum + '. 派送：否')
+      }
+
+      // 优先级
+      itemNum++
+      const urgPrice = this.data.urgencyPrice
+      if (urgPrice > 0) {
+        lines.push(itemNum + '. 优先级：' + this.data.urgency + ' | ￥' + urgPrice.toFixed(2))
+        allParts.push(urgPrice.toFixed(2))
+      } else {
+        lines.push(itemNum + '. 优先级：' + this.data.urgency + ' | ￥0')
+      }
+
+      // 首页
+      if (this.data.coverPage) {
+        itemNum++
+        lines.push(itemNum + '. 打印首页信息 | ' + this.data.coverPagePrice.toFixed(2))
+        allParts.push(this.data.coverPagePrice.toFixed(2))
+      }
+
+      // 合计
+      const totalSum = allParts.reduce((s, p) => s + parseFloat(p), 0)
+      const formula = allParts.join('+') || '0'
+      lines.push('─'.repeat(14))
+      lines.push('💰合计: ' + formula + '=￥' + totalSum.toFixed(2))
+
+      wx.setClipboardData({
+        data: lines.join('\n'),
+        success: () => wx.showToast({ title: '已复制详细价格', icon: 'success' })
+      })
+    },
+
     onCloseModal() {
       this.setData({
         showSuccessModal: false,
         selectedFiles: [],
       })
       this._stopAllUploadTimers()
+      this._stopAllPollTimers()
       this._scheduleMeasure()
-    },
-
-    onViewOrders() {
-      this.setData({ showSuccessModal: false, selectedFiles: [] })
-      this._stopAllUploadTimers()
-      this._scheduleMeasure()
-      wx.switchTab({ url: '/pages/me/me' })
     },
 
     noop() {},

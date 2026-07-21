@@ -227,14 +227,24 @@ page {
 }
 
 /* ============================================================
-   6. Buttons — Apple's SF-style buttons
+   6. Buttons — Apple Liquid Glass system
+   Glass effect simulated via:
+   - Semi-transparent gradient bg (no backdrop-filter in mini-program)
+   - Bright inset top border → "light catching the glass edge"
+   - Subtle shadow underneath → depth
+   - Press: scale(0.97) + glass brightens
    ============================================================ */
 
-/* Primary action button */
+/* ── Glass Mixin Tokens ── */
+/* These are conceptual; applied inline since WXSS has no @mixin */
+
+/* Primary — tinted liquid glass (blue) */
 .btn-primary {
   width: 100%;
-  background-color: var(--blue);
-  color: #fff;
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.88) 0%,
+    rgba(0, 105, 220, 0.94) 100%);
+  color: #FFFFFF;
   font-size: 32rpx;
   font-weight: 600;
   border-radius: var(--radius-lg);
@@ -242,70 +252,92 @@ page {
   text-align: center;
   border: none;
   letter-spacing: -0.01em;
-  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
-              opacity 0.1s ease;
+  /* Glass depth */
+  box-shadow:
+    0 4rpx 16rpx rgba(0, 122, 255, 0.25),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.35),
+    inset 0 -1rpx 0 rgba(0, 0, 0, 0.08);
+  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.12s ease,
+              filter 0.12s ease;
 }
 .btn-primary:active {
   transform: scale(0.97);
-  opacity: 0.85;
+  filter: brightness(1.1);
+  box-shadow:
+    0 2rpx 8rpx rgba(0, 122, 255, 0.2),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.4);
 }
 .btn-primary[disabled] {
-  opacity: 0.4;
+  opacity: 0.35;
   transform: none;
+  filter: none;
 }
 
-/* Secondary / outline button */
+/* Secondary — clear glass */
 .btn-secondary {
   width: 100%;
-  background-color: transparent;
+  background: rgba(255, 255, 255, 0.6);
   color: var(--blue);
   font-size: 28rpx;
   font-weight: 500;
-  border: 2rpx solid var(--blue);
+  border: 1rpx solid rgba(0, 122, 255, 0.2);
   border-radius: var(--radius-lg);
   padding: 22rpx 0;
   text-align: center;
-  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
-              background-color 0.1s ease;
+  box-shadow:
+    0 2rpx 8rpx rgba(0, 0, 0, 0.04),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.8);
+  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.12s ease,
+              box-shadow 0.12s ease;
 }
 .btn-secondary:active {
   transform: scale(0.97);
-  background-color: rgba(0, 122, 255, 0.08);
+  background: rgba(0, 122, 255, 0.1);
+  box-shadow:
+    0 1rpx 4rpx rgba(0, 0, 0, 0.04),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.9);
 }
 
-/* Destructive button */
+/* Destructive — red-tinted glass */
 .btn-destructive {
   width: 100%;
-  background-color: transparent;
+  background: rgba(255, 255, 255, 0.6);
   color: var(--red);
   font-size: 28rpx;
   font-weight: 500;
-  border: 2rpx solid var(--red);
+  border: 1rpx solid rgba(255, 59, 48, 0.2);
   border-radius: var(--radius-lg);
   padding: 22rpx 0;
   text-align: center;
-  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
-              background-color 0.1s ease;
+  box-shadow:
+    0 2rpx 8rpx rgba(0, 0, 0, 0.04),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.8);
+  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.12s ease;
 }
 .btn-destructive:active {
   transform: scale(0.97);
-  background-color: rgba(255, 59, 48, 0.08);
+  background: rgba(255, 59, 48, 0.1);
 }
 
-/* Small inline button */
+/* Small glass chip */
 .btn-small {
   font-size: 24rpx;
   font-weight: 500;
   color: var(--blue);
-  background-color: rgba(0, 122, 255, 0.08);
+  background: rgba(0, 122, 255, 0.08);
   border-radius: var(--radius-sm);
   padding: 10rpx 28rpx;
-  border: none;
-  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1rpx solid rgba(0, 122, 255, 0.12);
+  box-shadow: inset 0 1rpx 0 rgba(255, 255, 255, 0.6);
+  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.1s ease;
 }
 .btn-small:active {
   transform: scale(0.95);
-  background-color: rgba(0, 122, 255, 0.15);
+  background: rgba(0, 122, 255, 0.15);
 }
 
 /* ============================================================
@@ -401,7 +433,7 @@ page {
   width: 64rpx;
   height: 64rpx;
   border-radius: var(--radius-md);
-  background-color: var(--gray6);
+  background: rgba(255, 255, 255, 0.5);
   color: var(--text-primary);
   font-size: 34rpx;
   font-weight: 500;
@@ -409,10 +441,16 @@ page {
   align-items: center;
   justify-content: center;
   line-height: 1;
-  transition: background-color 0.1s ease;
+  border: 1rpx solid rgba(60, 60, 67, 0.08);
+  box-shadow:
+    0 2rpx 6rpx rgba(0, 0, 0, 0.04),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.8);
+  transition: transform 0.1s ease, background-color 0.1s ease, box-shadow 0.1s ease;
 }
 .stepper-btn:active {
-  background-color: var(--gray5);
+  transform: scale(0.93);
+  background: rgba(0, 0, 0, 0.04);
+  box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.04);
 }
 .stepper-btn.stepper-disabled {
   color: var(--gray3);
@@ -437,11 +475,13 @@ page {
   flex: 1;
   height: 72rpx;
   background-color: var(--gray6);
+  border: 1rpx solid transparent;
   border-radius: var(--radius-sm);
   padding: 0 var(--space-lg);
   font-size: 28rpx;
   color: var(--text-primary);
   font-family: var(--font-system);
+  transition: border-color 0.2s ease, background-color 0.2s ease;
 }
 .input-ios::placeholder {
   color: var(--text-quaternary);

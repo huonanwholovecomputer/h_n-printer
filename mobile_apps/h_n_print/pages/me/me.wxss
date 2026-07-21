@@ -554,7 +554,9 @@
 
 .retention-save-btn {
   width: 100%;
-  background-color: var(--blue);
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.88) 0%,
+    rgba(0, 105, 220, 0.94) 100%);
   color: #fff;
   font-size: 24rpx;
   font-weight: 600;
@@ -562,9 +564,37 @@
   padding: 16rpx 0;
   margin: 0;
   border: none;
+  box-shadow:
+    0 2rpx 10rpx rgba(0, 122, 255, 0.2),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.3);
+  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
 }
 .retention-save-btn:active {
-  opacity: 0.85;
+  transform: scale(0.97);
+  filter: brightness(1.1);
+  box-shadow:
+    0 1rpx 4rpx rgba(0, 122, 255, 0.15),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.35);
+}
+
+.delete-all-btn {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.5);
+  color: var(--red);
+  font-size: 24rpx;
+  font-weight: 500;
+  border: 1rpx solid rgba(255, 59, 48, 0.2);
+  border-radius: var(--radius-md);
+  padding: 14rpx 0;
+  margin-top: 12rpx;
+  box-shadow:
+    0 2rpx 6rpx rgba(0, 0, 0, 0.04),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.7);
+  transition: transform 0.12s ease, background-color 0.12s ease;
+}
+.delete-all-btn:active {
+  transform: scale(0.97);
+  background: rgba(255, 59, 48, 0.12);
 }
 
 /* ═══════════════ User List ═══════════════ */
@@ -724,6 +754,19 @@
   white-space: nowrap;
   margin-right: 16rpx;
   letter-spacing: -0.01em;
+}
+
+.order-number-label {
+  font-family: var(--font-mono);
+  font-size: 20rpx;
+  font-weight: 600;
+  color: var(--blue);
+  background: rgba(0, 122, 255, 0.06);
+  border-radius: 6rpx;
+  padding: 4rpx 14rpx;
+  align-self: flex-start;
+  margin-top: 6rpx;
+  letter-spacing: 0.02em;
 }
 
 .order-card-meta {

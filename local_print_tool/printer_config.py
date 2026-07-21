@@ -25,6 +25,9 @@ class PrintJob:
     duplex_mode: str = ""    # "long-edge" | "short-edge" | "" (空=按方向自动)
     cached_pdf: str = ""     # 引擎转换后的 PDF 缓存路径
     dpi: int = 0             # 渲染 DPI，0=跟随全局默认
+    task_id: int = 0         # 云端任务子任务 ID (order_files.id)，0=本地任务
+    source_md5: str = ""     # 源文件 MD5，用于 PDF 缓存查找
+    display_name: str = ""   # 显示用的文件名（云端任务用原始文件名，本地任务为空则用 file_path 的 basename）
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -37,6 +40,7 @@ class PrintJob:
             "orientation": self.orientation,
             "engine": self.engine,
             "dpi": self.dpi,
+            "display_name": self.display_name,
             # cached_pdf 不持久化，每次启动重新生成
         }
 
@@ -52,6 +56,7 @@ class PrintJob:
             orientation=data.get("orientation", ""),
             engine=data.get("engine", "word"),
             dpi=int(data.get("dpi", 0)),
+            display_name=data.get("display_name", ""),
         )
 
 
@@ -178,16 +183,20 @@ class PrinterConfig:
       "printer_name": "HP LaserJet MFP M232-M237",
       "duplex_mode": "long-edge",
       "keep_temp_pdf": false,
-      "jobs": [
-        {
-          "file_path": "C:/docs/report.docx",
-          "copies": 2,
-          "duplex": "on",
-          "duplex_mode": "long-edge",
-          "page_range": "1-5",
-          "engine": "word"
-        }
-      ]
+      "tabs": {
+        "1": [
+          {
+            "file_path": "C:/docs/report.docx",
+            "copies": 2,
+            "duplex": "on",
+            "duplex_mode": "long-edge",
+            "page_range": "1-5",
+            "engine": "word"
+          }
+        ],
+        "2": []
+      },
+      "active_tab": "1"
     }
     """
     printer_name: str = ""
@@ -223,7 +232,11 @@ class PrinterConfig:
     cloud_ws_url: str = "wss://hn-space.cn"         # WebSocket 地址
     cloud_token: str = ""                   # 打印机客户端认证 token
     cloud_auto_accept: bool = False         # 是否自动接受云端任务（false=手动确认）
-    jobs: list[PrintJob] = field(default_factory=list)
+    # ---- 标签页任务（v6+）----
+    # 每个标签页独立存储任务列表，key 为 "1", "2", "3" ...
+    # 兼容旧格式：如果 JSON 中没有 "tabs" 键但有 "jobs"，自动迁移为 {"1": jobs}
+    tabs: dict[str, list[PrintJob]] = field(default_factory=lambda: {"1": []})
+    active_tab: str = "1"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -250,13 +263,25 @@ class PrinterConfig:
             "cloud_ws_url": self.cloud_ws_url,
             "cloud_token": self.cloud_token,
             "cloud_auto_accept": self.cloud_auto_accept,
-            "jobs": [job.to_dict() for job in self.jobs],
+            # 标签页任务
+            "tabs": {k: [job.to_dict() for job in v] for k, v in self.tabs.items()},
+            "active_tab": self.active_tab,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PrinterConfig":
-        jobs_data = data.get("jobs", [])
-        jobs = [PrintJob.from_dict(j) for j in jobs_data] if isinstance(jobs_data, list) else []
+        # 兼容旧格式：无 "tabs" 键但有 "jobs" 时自动迁移
+        tabs_data = data.get("tabs")
+        if tabs_data is None:
+            jobs_data = data.get("jobs", [])
+            jobs = [PrintJob.from_dict(j) for j in jobs_data] if isinstance(jobs_data, list) else []
+            tabs = {"1": jobs}
+        else:
+            tabs = {}
+            for k, v in tabs_data.items():
+                tabs[k] = [PrintJob.from_dict(j) for j in v] if isinstance(v, list) else []
+            if not tabs:
+                tabs = {"1": []}
         return cls(
             printer_name=data.get("printer_name", ""),
             duplex_mode=data.get("duplex_mode", "long-edge"),
@@ -286,7 +311,9 @@ class PrinterConfig:
             cloud_ws_url=data.get("cloud_ws_url", "wss://hn-space.cn"),
             cloud_token=data.get("cloud_token", ""),
             cloud_auto_accept=bool(data.get("cloud_auto_accept", False)),
-            jobs=jobs,
+            # 标签页任务
+            tabs=tabs,
+            active_tab=data.get("active_tab", "1"),
         )
 
     def save(self, path: str) -> None:

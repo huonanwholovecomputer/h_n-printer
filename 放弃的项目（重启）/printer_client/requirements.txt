@@ -1,0 +1,6 @@
+python-socketio
+requests
+pypdf
+pywin32
+Pillow
+PyMuPDF
