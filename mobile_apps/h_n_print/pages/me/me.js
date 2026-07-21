@@ -143,8 +143,8 @@ Component({
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
         success: (res) => {
-          if (res.data && res.data.success) {
-            this.setData({ printerOnline: res.data.online, printerCount: res.data.count })
+          if (res.data && res.data.success && typeof res.data.online !== 'undefined') {
+            this.setData({ printerOnline: res.data.online, printerCount: res.data.count || 0 })
           }
         },
         fail: () => {}
