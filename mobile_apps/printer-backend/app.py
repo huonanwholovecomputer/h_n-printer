@@ -850,7 +850,7 @@ def calculate_price(page_count, duplex):
 
 # 状态优先级：失败 > 打印中/排队中 > 已完成 > 被打回 > 已取消
 # 用于把多个子任务 (order_files) 的状态聚合为父订单 (orders) 的状态
-_STATUS_PRIORITY = {"failed": 7, "printing": 6, "accepted": 5, "queued": 4, "sent": 3, "abandoned": 2, "rejected": 1, "canceled": 0}
+_STATUS_PRIORITY = {"failed": 8, "printing": 7, "accepted": 6, "offline_unknown": 5, "queued": 4, "sent": 3, "abandoned": 2, "rejected": 1, "canceled": 0}
 
 
 def aggregate_order_status(conn, order_id):
@@ -871,10 +871,12 @@ def aggregate_order_status(conn, order_id):
         return "sent"
     if all(s == "rejected" for s in statuses):
         return "rejected"
-    if all(s in ("sent", "accepted", "abandoned", "canceled", "rejected") for s in statuses):
-        # 混合终态：有 sent 优先，有 accepted 次之，有 abandoned 再次
+    if all(s in ("sent", "accepted", "offline_unknown", "abandoned", "canceled", "rejected") for s in statuses):
+        # 混合终态：有 sent 优先，有 offline_unknown 次之
         if any(s == "sent" for s in statuses):
             return "sent"
+        if any(s == "offline_unknown" for s in statuses):
+            return "offline_unknown"
         if any(s == "accepted" for s in statuses):
             return "accepted"
         if any(s == "abandoned" for s in statuses):
@@ -883,7 +885,7 @@ def aggregate_order_status(conn, order_id):
             return "rejected"
         return "canceled"
     # 取优先级最高的非终态
-    active = [s for s in statuses if s not in ("sent", "accepted", "abandoned", "canceled", "rejected")]
+    active = [s for s in statuses if s not in ("sent", "accepted", "offline_unknown", "abandoned", "canceled", "rejected")]
     if not active:
         return "sent"
     return max(active, key=lambda s: _STATUS_PRIORITY.get(s, 0))
@@ -1287,7 +1289,7 @@ def on_disconnect(reason=None):
         with db_lock:
             conn = get_db_conn()
             try:
-                # 查找该客户端名下所有 printing 子任务
+                # 查找该客户端名下所有 printing 子任务 → 回滚为 queued
                 rows = conn.execute(
                     "SELECT id, order_id FROM order_files WHERE status = 'printing' AND operator_client = ?",
                     (client_id,)
@@ -1299,13 +1301,27 @@ def on_disconnect(reason=None):
                         f"UPDATE order_files SET status = 'queued', operator_client = '' WHERE id IN ({placeholders})",
                         ids
                     )
-                    # 刷新所有涉及的父订单
                     for r in rows:
                         refresh_order_status(conn, r["order_id"])
-                    conn.commit()
                     print(f"[RECOVER] 客户端 {client_id} 断开，已回滚 {len(rows)} 个任务")
-                else:
-                    conn.rollback()
+
+                # 已接受但未打印的任务：标记为"断线未知"
+                accepted_rows = conn.execute(
+                    "SELECT id, order_id FROM order_files WHERE status = 'accepted' AND operator_client = ?",
+                    (client_id,)
+                ).fetchall()
+                if accepted_rows:
+                    a_ids = [str(r["id"]) for r in accepted_rows]
+                    a_placeholders = ",".join("?" for _ in accepted_rows)
+                    conn.execute(
+                        f"UPDATE order_files SET status = 'offline_unknown' WHERE id IN ({a_placeholders})",
+                        a_ids
+                    )
+                    for r in accepted_rows:
+                        refresh_order_status(conn, r["order_id"])
+                    print(f"[RECOVER] 客户端 {client_id} 断开，{len(accepted_rows)} 个已接受任务标记为断线未知")
+
+                conn.commit()
             except Exception:
                 conn.rollback()
                 raise
@@ -1347,7 +1363,7 @@ def on_print_success(data):
 
     conn = get_db()
     conn.execute(
-        "UPDATE order_files SET status = 'sent' WHERE id = ? AND status IN ('printing', 'accepted')",
+        "UPDATE order_files SET status = 'sent' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown')",
         (task_id,),
     )
     # 获取父订单 ID 并刷新聚合状态
