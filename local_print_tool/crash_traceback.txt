@@ -981,3 +981,43 @@ Traceback (most recent call last):
           ^^^^^^^
 AttributeError: 'int' object has no attribute 'row'
 === END CRASH ===
+
+=== CRASH at 2026-07-21 16:51:31.051538 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\main.py", line 267, in <module>
+    main()
+  File "D:\打印机项目\local_print_tool\main.py", line 219, in main
+    window = MainWindow(config_path=config_path, theme_manager=theme_manager)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1339, in __init__
+    self._setup_ui()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1517, in _setup_ui
+    splitter.addWidget(self._setup_file_table())
+                       ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1897, in _setup_file_table
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2077, in _refresh_tab_display
+    self._order_number_label.setText("📋 未分配订单号")
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'MainWindow' object has no attribute '_order_number_label'
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 16:52:16.393167 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\main.py", line 267, in <module>
+    main()
+  File "D:\打印机项目\local_print_tool\main.py", line 219, in main
+    window = MainWindow(config_path=config_path, theme_manager=theme_manager)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1339, in __init__
+    self._setup_ui()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1517, in _setup_ui
+    splitter.addWidget(self._setup_file_table())
+                       ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1897, in _setup_file_table
+    self._refresh_tab_display()
+  File "D:\打印机项目\local_print_tool\gui.py", line 2077, in _refresh_tab_display
+    self._order_number_label.setText("📋 未分配订单号")
+    ^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'MainWindow' object has no attribute '_order_number_label'
+=== END CRASH ===
