@@ -13,6 +13,55 @@ from typing import Any
 
 
 @dataclass
+class TabSettings:
+    """单个标签页的独立设置（v7+：附加服务从全局移入标签页）。"""
+    jobs: list = field(default_factory=list)          # list[PrintJob]
+    delivery_enabled: bool = False
+    delivery_location: str = ""
+    cover_page: bool = False
+    cover_page_price: float = 0.15
+    urgency: str = "低"
+
+    def to_dict(self) -> dict:
+        return {
+            "jobs": [j.to_dict() for j in self.jobs],
+            "delivery_enabled": self.delivery_enabled,
+            "delivery_location": self.delivery_location,
+            "cover_page": self.cover_page,
+            "cover_page_price": self.cover_page_price,
+            "urgency": self.urgency,
+        }
+
+    @classmethod
+    def from_dict(cls, data) -> "TabSettings":
+        if isinstance(data, list):
+            # 兼容旧格式：直接存 jobs 列表
+            return cls(jobs=[PrintJob.from_dict(j) for j in data])
+        jobs_data = data.get("jobs", [])
+        return cls(
+            jobs=[PrintJob.from_dict(j) for j in jobs_data],
+            delivery_enabled=bool(data.get("delivery_enabled", False)),
+            delivery_location=data.get("delivery_location", ""),
+            cover_page=bool(data.get("cover_page", False)),
+            cover_page_price=float(data.get("cover_page_price", 0.15)),
+            urgency=data.get("urgency", "低"),
+        )
+
+    def calc_extra_total(self, base_total: float, config: "PrinterConfig") -> float:
+        """计算附加服务总额（派送费+加急费+首页费）。"""
+        extra = 0.0
+        if self.delivery_enabled and self.delivery_location:
+            pct = config.delivery_percentages.get(self.delivery_location, 0.0)
+            extra += base_total * (pct / 100.0)
+        urgency_price = config.urgency_prices.get(self.urgency, 0.0)
+        if urgency_price > 0:
+            extra += urgency_price
+        if self.cover_page:
+            extra += self.cover_page_price
+        return extra
+
+
+@dataclass
 class PrintJob:
     """单个打印任务"""
     file_path: str = ""
@@ -240,7 +289,7 @@ class PrinterConfig:
     # ---- 标签页任务（v6+）----
     # 每个标签页独立存储任务列表，key 为 "1", "2", "3" ...
     # 兼容旧格式：如果 JSON 中没有 "tabs" 键但有 "jobs"，自动迁移为 {"1": jobs}
-    tabs: dict[str, list[PrintJob]] = field(default_factory=lambda: {"1": []})
+    tabs: dict[str, TabSettings] = field(default_factory=lambda: {"1": TabSettings()})
     active_tab: str = "1"
 
     def to_dict(self) -> dict[str, Any]:
@@ -252,7 +301,7 @@ class PrinterConfig:
             "simplex_price": self.simplex_price,
             "duplex_price": self.duplex_price,
             "last_dir": self.last_dir,
-            # 附加服务
+            # 附加服务（全局默认值 + 标签页可覆盖）
             "delivery_enabled": self.delivery_enabled,
             "delivery_location": self.delivery_location,
             "delivery_percentages": self.delivery_percentages,
@@ -268,8 +317,8 @@ class PrinterConfig:
             "cloud_ws_url": self.cloud_ws_url,
             "cloud_token": self.cloud_token,
             "cloud_auto_accept": self.cloud_auto_accept,
-            # 标签页任务
-            "tabs": {k: [job.to_dict() for job in v] for k, v in self.tabs.items()},
+            # 标签页任务（每标签含独立附加服务设置）
+            "tabs": {k: v.to_dict() for k, v in self.tabs.items()},
             "active_tab": self.active_tab,
         }
 
@@ -280,13 +329,13 @@ class PrinterConfig:
         if tabs_data is None:
             jobs_data = data.get("jobs", [])
             jobs = [PrintJob.from_dict(j) for j in jobs_data] if isinstance(jobs_data, list) else []
-            tabs = {"1": jobs}
+            tabs = {"1": TabSettings(jobs=jobs)}
         else:
             tabs = {}
             for k, v in tabs_data.items():
-                tabs[k] = [PrintJob.from_dict(j) for j in v] if isinstance(v, list) else []
+                tabs[k] = TabSettings.from_dict(v)
             if not tabs:
-                tabs = {"1": []}
+                tabs = {"1": TabSettings()}
         return cls(
             printer_name=data.get("printer_name", ""),
             duplex_mode=data.get("duplex_mode", "long-edge"),
