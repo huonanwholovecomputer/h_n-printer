@@ -257,10 +257,10 @@
         <!-- 收缩态：一行摘要 -->
         <view class="order-card-header">
           <view class="order-card-main">
-            <text class="order-filename">{{item.file_summary || item.file}}</text>
+            <text class="order-filename">{{item.order_number || ('#' + item.id)}}</text>
             <text class="order-status status-{{item.status}} {{item.isExcel && item.status === 'sent' ? 'status-delivered' : ''}}">{{item.isExcel && item.status === 'sent' ? '已送达' : (statusMap[item.status] || item.status)}}</text>
           </view>
-          <text wx:if="{{item.order_number}}" class="order-number-label">{{item.order_number}}</text>
+          <text class="order-number-label">{{item.file_summary || item.file}}</text>
           <view wx:if="{{item.isExcel}}" class="order-card-meta">
             <text class="order-card-stat">📄 不适用</text>
             <text class="order-card-stat">📋 不适用</text>
