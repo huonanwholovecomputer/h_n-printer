@@ -2812,8 +2812,6 @@ def license_create():
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
     data = request.get_json() or {}
-    validity = int(data.get("validity_minutes", 5))
-    validity = max(1, min(10, validity))
     key_type = (data.get("type", "temp") or "temp").strip().lower()
     if key_type not in ("temp", "admin"):
         return jsonify({"success": False, "message": "type 只能为 temp 或 admin"}), 400
@@ -2843,7 +2841,14 @@ def license_create():
         if not dup:
             break
 
-    expires = now + timedelta(minutes=validity)
+    # admin 类型永久有效，temp 类型限时 1-10 分钟
+    if key_type == "admin":
+        validity = 52560000  # 100 年（永久）
+        expires = now + timedelta(minutes=validity)
+    else:
+        validity = int(data.get("validity_minutes", 5))
+        validity = max(1, min(10, validity))
+        expires = now + timedelta(minutes=validity)
     conn.execute(
         """INSERT INTO license_keys (key, created_by, validity_minutes, created_at, expires_at, type)
            VALUES (?, ?, ?, ?, ?, ?)""",
