@@ -720,23 +720,31 @@ class ConvertWorker(QThread):
     """
     finished = Signal(int, str, int, str)  # (row, cached_pdf, page_count, orientation)
 
-    def __init__(self, row: int, file_path: str, engine: str):
+    def __init__(self, row: int, file_path: str, engine: str, source_md5: str = ""):
         super().__init__()
         self._row = row
         self._file_path = file_path
         self._engine = engine
+        self._source_md5 = source_md5
 
     def run(self):
-        import tempfile
         from converter import _convert_via_word_com, _convert_via_wps_com, get_converter
         from pdf_printer import get_pdf_info
 
+        # PDF 缓存目录（与 cloud_client.py 共用）
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+        os.makedirs(cache_dir, exist_ok=True)
         temp_pdf: str | None = None
         try:
             ext = os.path.splitext(self._file_path)[1].lower()
             if ext in (".doc", ".docx") and self._engine != "libreoffice":
-                fd, temp_pdf = tempfile.mkstemp(suffix=".pdf", prefix="_conv_")
-                os.close(fd)
+                # 直接以 MD5 命名存入 pdf_cache（若无 MD5 则用临时文件）
+                if self._source_md5:
+                    temp_pdf = os.path.join(cache_dir, f"{self._source_md5}.pdf")
+                else:
+                    import tempfile as _tf
+                    fd, temp_pdf = _tf.mkstemp(suffix=".pdf", prefix="_conv_")
+                    os.close(fd)
                 if self._engine == "wps":
                     _convert_via_wps_com(self._file_path, temp_pdf)
                 else:
@@ -2901,7 +2909,55 @@ class MainWindow(QMainWindow):
         # jobs 已通过表格实时维护并保存到 tabs 中
 
     def _start_convert_worker(self, row: int, file_path: str, engine: str):
-        """启动后台 PDF 转换线程。"""
+        """启动后台 PDF 转换线程。先检查 MD5 缓存，命中则跳过转换。"""
+        # 计算源文件 MD5 并检查 PDF 缓存
+        source_md5 = ""
+        jobs = self._get_current_jobs()
+        if row < len(jobs):
+            source_md5 = jobs[row].source_md5
+        if not source_md5 and os.path.isfile(file_path):
+            try:
+                if self._cloud_client:
+                    source_md5 = self._cloud_client._compute_md5_file(file_path)
+                else:
+                    import hashlib
+                    m = hashlib.md5()
+                    with open(file_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            m.update(chunk)
+                    source_md5 = m.hexdigest()
+            except Exception:
+                source_md5 = ""
+        # 检查本地 PDF 缓存
+        if source_md5:
+            if self._cloud_client:
+                cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(source_md5)
+            else:
+                # 离线：直接检查 pdf_cache 目录
+                cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+                cached_pdf = os.path.join(cache_dir, f"{source_md5}.pdf")
+                cached_meta = {}
+                if not os.path.isfile(cached_pdf):
+                    cached_pdf = None
+            if cached_pdf:
+                from pdf_printer import get_pdf_info as _gpi
+                info = _gpi(cached_pdf)
+                page_count = info.get("page_count", cached_meta.get("page_count", 0))
+                orientation = info.get("orientation", "")
+                self._log(f"📦 缓存命中: {os.path.basename(file_path)} → {page_count} 页 (MD5={source_md5[:8]}...)")
+                if row < len(jobs):
+                    jobs[row].source_md5 = source_md5
+                    jobs[row].cached_pdf = cached_pdf
+                    jobs[row].page_count = page_count
+                    jobs[row].orientation = orientation
+                    self._set_current_jobs(jobs)
+                    self._table.item(row, self.COL_PAGES).setText(str(page_count))
+                    ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+                    self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
+                    self._recalc_row_cost(row)
+                    self._update_total_cost()
+                return  # 缓存命中，跳过转换
+        # 缓存未命中 → 启动转换线程
         self._convert_workers = [w for w in self._convert_workers if w.isRunning()]
         for w in self._convert_workers:
             if getattr(w, '_file_path', '') == file_path:
@@ -2910,7 +2966,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
                 w.wait(100)
-        worker = ConvertWorker(row, file_path, engine)
+        worker = ConvertWorker(row, file_path, engine, source_md5)
         worker.finished.connect(self._on_convert_finished)
         self._convert_workers.append(worker)
         worker.start()
@@ -3771,18 +3827,39 @@ class MainWindow(QMainWindow):
                     job.source_md5 = self._cloud_client._compute_md5_file(job.file_path) if self._cloud_client else ""
                 except Exception:
                     pass
-            # 存入缓存
-            if job.source_md5 and self._cloud_client:
-                try:
-                    self._cloud_client._save_pdf_to_cache(
-                        job.source_md5, cached_pdf,
-                        job.display_name or os.path.basename(job.file_path),
-                        os.path.splitext(job.file_path)[1].lower(),
-                        page_count,
-                    )
-                    self._set_current_jobs(jobs)  # 保存 source_md5 到配置
-                except Exception as e:
-                    self._log(f"  → MD5 缓存保存失败: {e}")
+            # 存入 MD5 缓存索引
+            if job.source_md5:
+                if self._cloud_client:
+                    try:
+                        self._cloud_client._save_pdf_to_cache(
+                            job.source_md5, cached_pdf,
+                            job.display_name or os.path.basename(job.file_path),
+                            os.path.splitext(job.file_path)[1].lower(),
+                            page_count,
+                        )
+                    except Exception as e:
+                        self._log(f"  → MD5 缓存保存失败: {e}")
+                else:
+                    # 离线：直接更新 pdf_cache/index.json
+                    try:
+                        import json as _json
+                        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+                        idx_path = os.path.join(cache_dir, "index.json")
+                        idx = {}
+                        if os.path.exists(idx_path):
+                            with open(idx_path, "r", encoding="utf-8") as _f:
+                                idx = _json.load(_f)
+                        idx[job.source_md5] = {
+                            "original_name": job.display_name or os.path.basename(job.file_path),
+                            "source_ext": os.path.splitext(job.file_path)[1].lower(),
+                            "page_count": page_count,
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                        with open(idx_path, "w", encoding="utf-8") as _f:
+                            _json.dump(idx, _f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        self._log(f"  → 离线缓存保存失败: {e}")
+                self._set_current_jobs(jobs)  # 保存 source_md5 到配置
 
         # 转换完成后立刻保存副本到桌面
         if self._config.keep_temp_pdf and cached_pdf and os.path.isfile(cached_pdf):
