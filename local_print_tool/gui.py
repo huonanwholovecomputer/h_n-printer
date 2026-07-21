@@ -2105,6 +2105,7 @@ class MainWindow(QMainWindow):
         self._sync_tab_settings_to_ui(tab)
 
         if hasattr(self, '_order_number_label') and self._order_number_label:
+            tb_jobs = tab.jobs if tab else []
             order_num = ""
             for j in tb_jobs:
                 if j.order_number:
