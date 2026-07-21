@@ -2794,6 +2794,11 @@ class MainWindow(QMainWindow):
                     break
             self._order_number_label.setText(f"📋 {order_num}" if order_num else "📋 未分配订单号")
 
+        # 初始加载后，用当前标签页的附加服务覆盖全局默认值
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            self._sync_tab_settings_to_ui(tab)
+
     def _refresh_printer_list(self):
         """刷新下拉列表中的系统打印机。"""
         current = self._printer_combo.currentText().strip()
