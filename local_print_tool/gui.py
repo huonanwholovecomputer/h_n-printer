@@ -2021,6 +2021,27 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
+    def _renumber_tabs(self):
+        """删除标签页后重新从 1 开始编号。更新 _current_tab 指向同一标签的新 key。"""
+        old_current = self._current_tab
+        old_tabs = self._config.tabs
+        # 按当前 key 的数值排序，保留 current 对应的 jobs
+        sorted_keys = sorted(old_tabs.keys(), key=lambda x: int(x))
+        current_jobs = old_tabs.get(old_current, [])
+        # 重新编号
+        new_tabs = {}
+        new_current = "1"
+        new_idx = 1
+        for old_key in sorted_keys:
+            new_key = str(new_idx)
+            new_tabs[new_key] = old_tabs[old_key]
+            if old_key == old_current:
+                new_current = new_key
+            new_idx += 1
+        self._config.tabs = new_tabs
+        self._current_tab = new_current
+        self._config.active_tab = new_current
+
     def _cleanup_empty_tabs(self, after_key: str | None = None):
         """删除空标签页。after_key 不为 None 时仅删除 key > after_key 的标签页。"""
         removed = []
@@ -2035,6 +2056,7 @@ class MainWindow(QMainWindow):
             del self._config.tabs[key]
             self._log(f"🗑 已删除空标签页 {key}")
         if removed:
+            self._renumber_tabs()
             self._save_config()
             self._refresh_tab_display()
 
@@ -2222,10 +2244,7 @@ class MainWindow(QMainWindow):
                 if reply != QMessageBox.Yes:
                     return
             del self._config.tabs[key]
-            if key == self._current_tab:
-                new_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
-                self._current_tab = new_keys[0]
-                self._config.active_tab = self._current_tab
+            self._renumber_tabs()
             self._save_config()
             self._rebuild_table()
             self._refresh_tab_display()
@@ -2268,6 +2287,7 @@ class MainWindow(QMainWindow):
             for key in removed:
                 del self._config.tabs[key]
                 self._log(f"🗑 已删除空标签页 {key}")
+            self._renumber_tabs()
             self._save_config()
             self._rebuild_table()
             self._refresh_tab_display()
