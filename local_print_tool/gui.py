@@ -1552,7 +1552,7 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("就绪")
         self._status_bar.addWidget(self._status_label)
 
-        self._status_bar.addPermanentWidget(QLabel("  "))
+        self._status_bar.addPermanentWidget(QLabel(" "))
 
         self._cloud_status_indicator = QLabel("☁ 未连接")
         self._cloud_status_indicator.setObjectName("cloudStatusOff")
