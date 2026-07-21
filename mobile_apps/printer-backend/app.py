@@ -775,6 +775,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # v17 迁移：orders 添加 source 列（区分云端/本地来源）
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN source TEXT DEFAULT 'cloud'")
+        conn.commit()
+        print("  已添加 orders.source 列")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -1835,9 +1843,9 @@ def submit_order():
                                    page_count, price_per_page, total_price, is_free,
                                    delivery_enabled, delivery_location, delivery_percentage,
                                    urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-                                   order_number)
+                                   order_number, source)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud')""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              1 if user_is_admin else 0,
@@ -2069,18 +2077,25 @@ def get_orders():
     is_super = SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID
     target_openid = (request.args.get("openid", "") or "").strip()
     view_all = is_super and request.args.get("view", "") == "all"
+    source_filter = (request.args.get("source", "") or "").strip()
 
     conn = get_db()
 
     # 构建查询条件
+    source_clause = ""
+    source_params = []
+    if source_filter in ("cloud", "local"):
+        source_clause = " AND source = ?"
+        source_params = [source_filter]
+
     if view_all:
         # 超级管理员查看全部订单
-        where_clause = "1 = 1"
-        params = []
+        where_clause = "1 = 1" + source_clause
+        params = source_params.copy()
     elif is_super and target_openid:
         # 超级管理员查看指定用户
-        where_clause = "openid = ?"
-        params = [target_openid]
+        where_clause = "openid = ?" + source_clause
+        params = [target_openid] + source_params
     elif role == "admin" and target_openid:
         # 管理员查看指定用户：需验证该用户是否由本管理员授权
         auth_row = conn.execute(
@@ -2090,12 +2105,12 @@ def get_orders():
         if not auth_row:
             conn.close()
             return jsonify({"success": False, "message": "无权查看该用户的订单"}), 403
-        where_clause = "openid = ?"
-        params = [target_openid]
+        where_clause = "openid = ?" + source_clause
+        params = [target_openid] + source_params
     else:
         # 默认：所有角色只看自己的订单
-        where_clause = "openid = ?"
-        params = [g.openid]
+        where_clause = "openid = ?" + source_clause
+        params = [g.openid] + source_params
 
     # 查询总数
     total = conn.execute(
@@ -2180,6 +2195,7 @@ def get_orders():
         "total": total,
         "page": page,
         "per_page": per_page,
+        "has_more": (page * per_page) < total,
     })
 
 
@@ -2430,6 +2446,51 @@ def reject_order():
 
     print(f"  [REJECT] 订单 #{order_id} 已被打印机打回")
     return jsonify({"success": True, "message": "订单已打回"})
+
+
+# ==================== 本地订单上报（本地打印工具使用）====================
+
+@app.route("/api/local_orders", methods=["POST"])
+def local_orders():
+    """本地打印工具上报本地打印任务。需 token 认证。"""
+    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    data = request.get_json(silent=True) or {}
+    order_number = data.get("order_number", "")
+    files = data.get("files", [])
+    total_price = data.get("total_price", 0)
+    created_at = data.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    if not order_number or not files:
+        return jsonify({"success": False, "message": "缺少 order_number 或 files"}), 400
+
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO orders (file, copies, status, created_at, openid, order_number,
+                                   total_price, source)
+               VALUES (?, 1, 'sent', ?, 'local', ?, ?, 'local')""",
+            (f"本地打印 {len(files)} 个文件", created_at, order_number, total_price),
+        )
+        order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for f_info in files:
+            conn.execute(
+                """INSERT INTO order_files (order_id, file_name, copies, page_count,
+                                            total_price, status, duplex, created_at, page_range)
+                   VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?)""",
+                (order_id, f_info.get("file_name", ""), f_info.get("copies", 1),
+                 f_info.get("page_count", 0), f_info.get("cost", 0),
+                 f_info.get("duplex", "on"), created_at, f_info.get("page_range", "")),
+            )
+        conn.commit()
+        return jsonify({"success": True, "order_id": order_id})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"success": False, "message": str(e)}), 500
+    finally:
+        conn.close()
 
 
 # ==================== 用户身份接口 ====================
