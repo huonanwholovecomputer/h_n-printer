@@ -2310,8 +2310,8 @@ class MainWindow(QMainWindow):
             for key in sorted(self._config.tabs.keys(), key=lambda x: int(x)):
                 if key == self._current_tab:
                     continue
-                tab = self._config.tabs.get(key)
-            if tab and len(tab.jobs) == 0:
+                tab_entry = self._config.tabs.get(key)
+                if tab_entry and len(tab_entry.jobs) == 0:
                     removed.append(key)
             if not removed:
                 return
