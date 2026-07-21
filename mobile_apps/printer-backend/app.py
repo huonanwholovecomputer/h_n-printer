@@ -850,7 +850,7 @@ def calculate_price(page_count, duplex):
 
 # 状态优先级：失败 > 打印中/排队中 > 已完成 > 被打回 > 已取消
 # 用于把多个子任务 (order_files) 的状态聚合为父订单 (orders) 的状态
-_STATUS_PRIORITY = {"failed": 5, "printing": 4, "queued": 3, "sent": 2, "rejected": 1, "canceled": 0}
+_STATUS_PRIORITY = {"failed": 6, "printing": 5, "accepted": 4, "queued": 3, "sent": 2, "rejected": 1, "canceled": 0}
 
 
 def aggregate_order_status(conn, order_id):
@@ -871,15 +871,17 @@ def aggregate_order_status(conn, order_id):
         return "sent"
     if all(s == "rejected" for s in statuses):
         return "rejected"
-    if all(s in ("sent", "canceled", "rejected") for s in statuses):
-        # 混合终态：有 sent 优先 sent，全 rejected 则 rejected，全 canceled 则 canceled
+    if all(s in ("sent", "accepted", "canceled", "rejected") for s in statuses):
+        # 混合终态：有 sent 优先 sent，有 accepted 次之，全 rejected 则 rejected
         if any(s == "sent" for s in statuses):
             return "sent"
+        if any(s == "accepted" for s in statuses):
+            return "accepted"
         if any(s == "rejected" for s in statuses):
             return "rejected"
         return "canceled"
     # 取优先级最高的非终态
-    active = [s for s in statuses if s not in ("sent", "canceled", "rejected")]
+    active = [s for s in statuses if s not in ("sent", "accepted", "canceled", "rejected")]
     if not active:
         return "sent"
     return max(active, key=lambda s: _STATUS_PRIORITY.get(s, 0))
@@ -1343,7 +1345,7 @@ def on_print_success(data):
 
     conn = get_db()
     conn.execute(
-        "UPDATE order_files SET status = 'sent' WHERE id = ? AND status = 'printing'",
+        "UPDATE order_files SET status = 'sent' WHERE id = ? AND status IN ('printing', 'accepted')",
         (task_id,),
     )
     # 获取父订单 ID 并刷新聚合状态
@@ -2452,6 +2454,31 @@ def cancel_order():
                     print(f"  [CANCEL] 通知打印机失败: {e}")
 
     return jsonify({"success": True, "message": "任务已取消"})
+
+
+@app.route("/api/accept_order", methods=["POST"])
+def accept_order():
+    """打印机确认接受订单（需 token 认证）。将状态从 printing 改为 accepted（终端状态）。"""
+    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    data = request.get_json(silent=True) or {}
+    order_id = data.get("order_id", "") or request.args.get("order_id", "")
+    if not order_id:
+        return jsonify({"success": False, "message": "缺少 order_id"}), 400
+    conn = get_db()
+    conn.execute(
+        "UPDATE order_files SET status = 'accepted' WHERE order_id = ? AND status = 'printing'",
+        (order_id,),
+    )
+    conn.execute(
+        "UPDATE orders SET status = 'accepted' WHERE id = ?",
+        (order_id,),
+    )
+    conn.commit()
+    conn.close()
+    print(f"  [ACCEPT] 订单 #{order_id} 已被打印机接受")
+    return jsonify({"success": True, "message": "订单已接受"})
 
 
 @app.route("/api/reject_order", methods=["POST"])

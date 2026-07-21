@@ -3748,11 +3748,12 @@ class MainWindow(QMainWindow):
         """用户从云端任务列表窗口确认添加订单中的全部任务到同一个新标签页。"""
         if not tasks:
             return
-        # 第一个任务用现有逻辑创建标签页
-        first = tasks[0]
         for task in tasks:
             self._processed_cloud_tasks.add(task.task_id)
         self._add_cloud_tasks_to_new_tab(tasks)
+        # 通知后端：订单已接受
+        if tasks[0].order_id and self._cloud_client:
+            self._cloud_client.accept_order_to_server(tasks[0].order_id)
 
     def _on_cloud_order_rejected(self, tasks: list):
         """用户从云端任务列表窗口打回订单中的任务。"""
