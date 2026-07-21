@@ -53,9 +53,6 @@ Component({
     tempUntil: '',
     tempCountdownText: '',
 
-    // 打印机在线状态
-    printerOnline: false,
-    printerCount: 0,
     // 管理员：许可密钥轮询定时器（内部状态，非响应式）
     _keyPollTimer: null,
     // 内部滚动位置（驱动 scroll-content 的 translateY）
@@ -120,13 +117,11 @@ Component({
     },
   },
   methods: {
-    // 订单状态轮询（含打印机在线状态）
+    // 订单状态轮询
     _startOrderPolling() {
       this._stopOrderPolling()
-      this._checkPrinterStatus()  // 立即检查一次
       this._orderPollTimer = setInterval(() => {
         this.loadOrders(1, false)
-        this._checkPrinterStatus()
       }, 8000)
     },
     _stopOrderPolling() {
@@ -134,21 +129,6 @@ Component({
         clearInterval(this._orderPollTimer)
         this._orderPollTimer = null
       }
-    },
-    _checkPrinterStatus() {
-      const token = wx.getStorageSync('token')
-      if (!token) return
-      wx.request({
-        url: CONFIG.BASE_URL + '/api/printer_status',
-        method: 'GET',
-        header: { 'Authorization': 'Bearer ' + token },
-        success: (res) => {
-          if (res.data && res.data.success && typeof res.data.online !== 'undefined') {
-            this.setData({ printerOnline: res.data.online, printerCount: res.data.count || 0 })
-          }
-        },
-        fail: () => {}
-      })
     },
     // ==================== 自定义橡皮筋滚动引擎 ====================
     // 与首页 index.js 同构，去掉 Logo 联动；新增 _scheduleMeasure
