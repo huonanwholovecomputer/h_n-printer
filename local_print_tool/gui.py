@@ -3550,6 +3550,9 @@ class MainWindow(QMainWindow):
             self._current_tab = "1"
 
         try:
+            # 删除所有空标签页并重新编号（确保下次启动从 1 开始）
+            self._cleanup_empty_tabs()
+            self._renumber_tabs()
             self._sync_ui_to_config()
             self._config.save(self._config_path)
             self._log(f"配置已自动保存至: {self._config_path}")
