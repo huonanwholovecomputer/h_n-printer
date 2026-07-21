@@ -1770,7 +1770,7 @@ class MainWindow(QMainWindow):
         self._cover_page_onoff_combo = QComboBox()
         self._cover_page_onoff_combo.addItems(["否", "是"])
         _disable_combo_wheel(self._cover_page_onoff_combo)
-        self._cover_page_onoff_combo.currentIndexChanged.connect(self._on_price_changed)
+        self._cover_page_onoff_combo.currentIndexChanged.connect(self._on_cover_page_toggled)
 
         # 首页价格
         self._cover_page_price_spin = QDoubleSpinBox()
@@ -2755,6 +2755,7 @@ class MainWindow(QMainWindow):
 
         self._cover_page_price_spin.blockSignals(True)
         self._cover_page_price_spin.setValue(self._config.cover_page_price)
+        self._cover_page_price_spin.setEnabled(self._config.cover_page)
         self._cover_page_price_spin.blockSignals(False)
 
         self._rebuild_table()
@@ -2812,6 +2813,13 @@ class MainWindow(QMainWindow):
             self._delivery_percent_spin.blockSignals(True)
             self._delivery_percent_spin.setValue(pct)
             self._delivery_percent_spin.blockSignals(False)
+        self._on_price_changed()
+
+    def _on_cover_page_toggled(self):
+        """首页开关变更。"""
+        enabled = (self._cover_page_onoff_combo.currentIndex() == 1)
+        self._config.cover_page = enabled
+        self._cover_page_price_spin.setEnabled(enabled)
         self._on_price_changed()
 
     def _on_delivery_location_changed(self):
