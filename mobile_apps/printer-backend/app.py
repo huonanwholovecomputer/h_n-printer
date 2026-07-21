@@ -924,9 +924,11 @@ def fetch_and_lock_task(client_id):
             if parent_row:
                 refresh_order_status(conn, parent_row["order_id"])
             conn.commit()
-            # 重新查询完整数据返回（含父订单 order_number 和文件 MD5）
+            # 重新查询完整数据返回（含父订单信息 + 文件 MD5）
             full_task = conn.execute(
-                """SELECT of.*, o.order_number, f.md5 as source_md5
+                """SELECT of.*, o.order_number, o.delivery_enabled, o.delivery_location,
+                          o.urgency, o.cover_page, o.cover_page_price,
+                          f.md5 as source_md5
                    FROM order_files of
                    LEFT JOIN orders o ON of.order_id = o.id
                    LEFT JOIN files f ON of.file_id = f.id
@@ -1089,6 +1091,21 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             "page_range": page_range or "",
         },
     }
+
+    # 查询父订单的附加服务配置，传递给本地工具
+    if order_id:
+        conn2 = get_db()
+        o_row = conn2.execute(
+            "SELECT delivery_enabled, delivery_location, urgency, cover_page, cover_page_price FROM orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        conn2.close()
+        if o_row:
+            task_msg["delivery_enabled"] = bool(o_row["delivery_enabled"])
+            task_msg["delivery_location"] = o_row["delivery_location"] or ""
+            task_msg["urgency"] = o_row["urgency"] or "低"
+            task_msg["cover_page"] = bool(o_row["cover_page"])
+            task_msg["cover_page_price"] = float(o_row["cover_page_price"] or 0.15)
 
     # 查询文件 MD5（供本地工具 PDF 缓存命中，避免重复下载）
     if file_id:
@@ -2061,6 +2078,11 @@ def pull_queued_orders():
             "duplex": duplex,
             "page_range": task.get("page_range", "") or "",
         },
+        "delivery_enabled": bool(task.get("delivery_enabled", False)),
+        "delivery_location": task.get("delivery_location", "") or "",
+        "urgency": task.get("urgency", "低") or "低",
+        "cover_page": bool(task.get("cover_page", False)),
+        "cover_page_price": float(task.get("cover_page_price", 0.15) or 0.15),
     }
     if task["file_id"]:
         item["download_url"] = make_download_url(task["file_id"])

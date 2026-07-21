@@ -59,6 +59,7 @@ class CloudTask:
         "page_range", "download_url", "created_at",
         "local_path", "download_progress", "status",
         "error_message", "source_md5",
+        "delivery_enabled", "delivery_location", "urgency", "cover_page", "cover_page_price",
     )
 
     def __init__(self, data: dict):
@@ -79,6 +80,12 @@ class CloudTask:
         self.status: str = "pending"  # pending | downloading | ready | accepted | rejected | error
         self.error_message: str = ""
         self.source_md5: str = data.get("source_md5", "") or ""  # 后端传来的文件 MD5，用于 PDF 缓存查找
+        # 附加服务（来自前端订单配置，传递给本地标签页）
+        self.delivery_enabled: bool = bool(data.get("delivery_enabled", False))
+        self.delivery_location: str = data.get("delivery_location", "") or ""
+        self.urgency: str = data.get("urgency", "低") or "低"
+        self.cover_page: bool = bool(data.get("cover_page", False))
+        self.cover_page_price: float = float(data.get("cover_page_price", 0.15) or 0.15)
 
     def to_dict(self) -> dict:
         return {
