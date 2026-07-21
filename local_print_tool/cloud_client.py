@@ -121,6 +121,7 @@ class CloudClient(QObject):
     task_updated = Signal(object)         # CloudTask — 任务状态更新（下载进度等）
     connection_changed = Signal(bool)     # True=已连接, False=已断开
     status_message = Signal(str)          # 日志消息
+    order_canceled = Signal(int, list)    # int=order_id, list=task_ids — 订单被用户取消
 
     def __init__(
         self,
@@ -199,6 +200,24 @@ class CloudClient(QObject):
         if task:
             task.status = "rejected"
             self.task_updated.emit(task)
+
+    def reject_order_to_server(self, order_id: int):
+        """打回订单：调用后端 API，将订单状态设为 rejected。"""
+        if not self.api_url or not self.token:
+            return
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/reject_order",
+                params={"token": self.token},
+                json={"order_id": order_id},
+                timeout=10,
+            )
+            if resp.ok:
+                self.status_message.emit(f"☁ 订单 #{order_id} 已打回")
+            else:
+                self.status_message.emit(f"☁ 打回订单 #{order_id} 失败: {resp.text}")
+        except Exception as e:
+            self.status_message.emit(f"☁ 打回订单 #{order_id} 异常: {e}")
 
     def accept_and_add_to_local(self, task_id: int) -> CloudTask | None:
         """标记任务为已接受（下载完成后调用），返回任务供 GUI 添加到本地列表。"""
@@ -376,6 +395,16 @@ class CloudClient(QObject):
                 except OSError:
                     pass
             self.status_message.emit(f"📦 已清空本地 PDF 缓存 ({removed} 个文件)")
+
+        @self._sio.on("order_canceled")
+        def _on_order_canceled(data):
+            order_id = int(data.get("order_id", 0)) if isinstance(data, dict) else 0
+            task_ids = data.get("task_ids", []) if isinstance(data, dict) else []
+            self.status_message.emit(f"☁ 订单 #{order_id} 已被用户取消")
+            self.order_canceled.emit(order_id, task_ids)
+            # 从待处理列表中移除对应任务
+            for tid in task_ids:
+                self._pending_tasks.pop(tid, None)
 
         @self._sio.on("pong")
         def _on_pong():

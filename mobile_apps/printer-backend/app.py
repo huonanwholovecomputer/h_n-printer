@@ -826,14 +826,15 @@ def calculate_price(page_count, duplex):
 
 # ==================== 订单状态聚合 ====================
 
-# 状态优先级：失败 > 打印中/排队中 > 已完成
+# 状态优先级：失败 > 打印中/排队中 > 已完成 > 被打回 > 已取消
 # 用于把多个子任务 (order_files) 的状态聚合为父订单 (orders) 的状态
-_STATUS_PRIORITY = {"failed": 4, "printing": 3, "queued": 2, "sent": 1, "canceled": 0}
+_STATUS_PRIORITY = {"failed": 5, "printing": 4, "queued": 3, "sent": 2, "rejected": 1, "canceled": 0}
 
 
 def aggregate_order_status(conn, order_id):
     """根据 order_files 的状态聚合父订单状态：
     - 全部 sent → sent
+    - 全部 rejected → rejected
     - 任一 failed → failed（其余继续）
     - 否则取优先级最高者（printing 优先于 queued）
     - 无子任务时保持原状态
@@ -846,11 +847,17 @@ def aggregate_order_status(conn, order_id):
     statuses = [r["status"] for r in rows]
     if all(s == "sent" for s in statuses):
         return "sent"
-    if all(s in ("sent", "canceled") for s in statuses):
-        # 全部完成或取消 → 视为完成
-        return "sent" if any(s == "sent" for s in statuses) else "canceled"
+    if all(s == "rejected" for s in statuses):
+        return "rejected"
+    if all(s in ("sent", "canceled", "rejected") for s in statuses):
+        # 混合终态：有 sent 优先 sent，全 rejected 则 rejected，全 canceled 则 canceled
+        if any(s == "sent" for s in statuses):
+            return "sent"
+        if any(s == "rejected" for s in statuses):
+            return "rejected"
+        return "canceled"
     # 取优先级最高的非终态
-    active = [s for s in statuses if s not in ("sent", "canceled")]
+    active = [s for s in statuses if s not in ("sent", "canceled", "rejected")]
     if not active:
         return "sent"
     return max(active, key=lambda s: _STATUS_PRIORITY.get(s, 0))
@@ -2326,7 +2333,8 @@ def get_order_price(order_id):
 @app.route("/api/cancel_order", methods=["POST"])
 @login_required
 def cancel_order():
-    """取消任务（仅限 queued 或 printing 状态且属于当前用户）。"""
+    """取消任务（仅限 queued 或 printing 状态且属于当前用户）。
+    取消后通过 SocketIO 通知已连接的打印机客户端。"""
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
@@ -2353,6 +2361,12 @@ def cancel_order():
         conn.close()
         return jsonify({"success": False, "message": f"任务状态为 {row['status']}，无法取消"}), 400
 
+    # 查询被取消的子任务 ID 和已连接的打印机客户端
+    sub_tasks = conn.execute(
+        "SELECT id, operator_client FROM order_files WHERE order_id = ? AND status IN ('queued', 'printing')",
+        (order_id,),
+    ).fetchall()
+
     # 取消父订单和所有子任务
     conn.execute(
         "UPDATE order_files SET status = 'canceled' WHERE order_id = ? AND status IN ('queued', 'printing')",
@@ -2365,7 +2379,56 @@ def cancel_order():
     conn.commit()
     conn.close()
 
+    # 通过 SocketIO 通知已连接的打印机客户端
+    task_ids = [t["id"] for t in sub_tasks]
+    notified_clients = set()
+    for t in sub_tasks:
+        client_id = t["operator_client"]
+        if client_id and client_id not in notified_clients:
+            notified_clients.add(client_id)
+            with printer_clients_lock:
+                info = printer_clients.get(client_id)
+                sid = info["sid"] if info else None
+            if sid:
+                try:
+                    socketio.emit("order_canceled", {
+                        "order_id": order_id,
+                        "task_ids": task_ids,
+                    }, to=sid)
+                    print(f"  [CANCEL] 已通知打印机 {client_id}: 订单 #{order_id} 已取消")
+                except Exception as e:
+                    print(f"  [CANCEL] 通知打印机失败: {e}")
+
     return jsonify({"success": True, "message": "任务已取消"})
+
+
+@app.route("/api/reject_order", methods=["POST"])
+def reject_order():
+    """打印机打回订单（需 token 认证）。将订单状态设为 rejected。"""
+    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    data = request.get_json(silent=True) or {}
+    order_id = data.get("order_id", "") or request.args.get("order_id", "")
+    if not order_id:
+        return jsonify({"success": False, "message": "缺少 order_id"}), 400
+
+    conn = get_db()
+    # 将子任务和父订单都设为 rejected
+    conn.execute(
+        "UPDATE order_files SET status = 'rejected' WHERE order_id = ? AND status IN ('queued', 'printing')",
+        (order_id,),
+    )
+    conn.execute(
+        "UPDATE orders SET status = 'rejected' WHERE id = ?",
+        (order_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"  [REJECT] 订单 #{order_id} 已被打印机打回")
+    return jsonify({"success": True, "message": "订单已打回"})
 
 
 # ==================== 用户身份接口 ====================

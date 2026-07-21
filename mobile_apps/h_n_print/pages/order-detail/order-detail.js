@@ -10,6 +10,7 @@ Component({
       printing: '打印中',
       sent: '已完成',
       failed: '失败',
+      rejected: '被打回',
       canceled: '已取消',
     },
   },
