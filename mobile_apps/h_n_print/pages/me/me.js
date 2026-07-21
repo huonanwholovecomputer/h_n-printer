@@ -109,7 +109,7 @@ Component({
       this._scheduleMeasure()
       // 页面切换后 DOM 可能尚未稳定，追加一次延迟测量
       setTimeout(() => this._scheduleMeasure(300), 300)
-      // 开启订单状态定时轮询（每8秒）
+      // 开启订单状态定时轮询（每5秒）
       this._startOrderPolling()
     },
     hide() {
@@ -122,7 +122,7 @@ Component({
       this._stopOrderPolling()
       this._orderPollTimer = setInterval(() => {
         this.loadOrders(1, false)
-      }, 8000)
+      }, 5000)
     },
     _stopOrderPolling() {
       if (this._orderPollTimer) {
@@ -1481,7 +1481,7 @@ Component({
               ordersPage: page,
               ordersTotal: total,
               ordersHasMore: allOrders.length < total,
-              expandedOrders: append ? this.data.expandedOrders : {},
+              expandedOrders: this.data.expandedOrders,
             })
           } else {
             this.setData({ loading: false })

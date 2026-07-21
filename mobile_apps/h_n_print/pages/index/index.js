@@ -86,7 +86,7 @@ Component({
       this._stopPrinterPolling()
       this._printerPollTimer = setInterval(() => {
         this.loadPrinterStatus()
-      }, 30000)
+      }, 5000)
     },
     _stopPrinterPolling() {
       if (this._printerPollTimer) {
