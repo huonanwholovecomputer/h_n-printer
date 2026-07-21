@@ -1021,3 +1021,43 @@ Traceback (most recent call last):
     ^^^^^^^^^^^^^^^^^^^^^^^^
 AttributeError: 'MainWindow' object has no attribute '_order_number_label'
 === END CRASH ===
+
+=== CRASH at 2026-07-21 16:53:56.929013 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\main.py", line 267, in <module>
+    main()
+  File "D:\打印机项目\local_print_tool\main.py", line 219, in main
+    window = MainWindow(config_path=config_path, theme_manager=theme_manager)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1341, in __init__
+    self._init_cloud_client()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1366, in _init_cloud_client
+    self._cloud_task_window = CloudTaskListWindow(self)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1000, in __init__
+    self._setup_ui()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1010, in _setup_ui
+    self._auto_minutes = QSpinBox()
+                         ^^^^^^^^
+NameError: name 'QSpinBox' is not defined
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 16:54:11.289898 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\main.py", line 267, in <module>
+    main()
+  File "D:\打印机项目\local_print_tool\main.py", line 219, in main
+    window = MainWindow(config_path=config_path, theme_manager=theme_manager)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1341, in __init__
+    self._init_cloud_client()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1366, in _init_cloud_client
+    self._cloud_task_window = CloudTaskListWindow(self)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 1000, in __init__
+    self._setup_ui()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1010, in _setup_ui
+    self._auto_minutes = QSpinBox()
+                         ^^^^^^^^
+NameError: name 'QSpinBox' is not defined
+=== END CRASH ===

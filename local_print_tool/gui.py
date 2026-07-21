@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QComboBox,
     QDoubleSpinBox,
+    QSpinBox,
     QPushButton,
     QProgressBar,
     QTextEdit,
