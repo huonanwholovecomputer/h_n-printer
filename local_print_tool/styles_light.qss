@@ -458,3 +458,49 @@ QToolTip {
     padding: 4px;
     border-radius: 4px;
 }
+
+/* ---------- 标签页选择器 ---------- */
+QPushButton#tabBtnMinus, QPushButton#tabBtnPlus {
+    background-color: #ccd0da;
+    color: #4c4f69;
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: bold;
+    min-width: 24px;
+    max-width: 24px;
+    min-height: 28px;
+    max-height: 28px;
+    padding: 0px;
+}
+QPushButton#tabBtnMinus:hover, QPushButton#tabBtnPlus:hover {
+    background-color: #1e66f5;
+    color: #fff;
+}
+QPushButton#tabBtnMinus:disabled, QPushButton#tabBtnPlus:disabled {
+    background-color: #e6e9ef;
+    color: #bcc0cc;
+}
+QLabel#tabLabel {
+    color: #1e66f5;
+    font-size: 14px;
+    font-weight: bold;
+}
+QLabel#tabInfoLabel {
+    color: #6c6f85;
+    font-size: 11px;
+    margin-left: 8px;
+}
+
+/* ---------- 撤回按钮 ---------- */
+QPushButton#btnUndo {
+    background-color: #fe640b;
+    color: #fff;
+    border: none;
+    padding: 6px 16px;
+    border-radius: 6px;
+    font-weight: bold;
+}
+QPushButton#btnUndo:hover {
+    background-color: #d4580a;
+}

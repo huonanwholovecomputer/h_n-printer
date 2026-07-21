@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HN 云打印 — 系统工作流程</title>
+<style>
+:root {
+  --blue: #007AFF; --green: #34C759; --orange: #FF9500; --red: #FF3B30;
+  --purple: #AF52DE; --teal: #5AC8FA;
+  --bg: #F2F2F7; --card: #fff; --text: #1d1d1f; --text2: #6e6e73;
+  --font: -apple-system,BlinkMacSystemFont,"SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif;
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:var(--font); background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased; }
+.header { text-align:center; padding:48px 24px 32px; }
+.header h1 { font-size:32px; font-weight:700; letter-spacing:-0.02em; margin-bottom:6px; }
+.header p { font-size:15px; color:var(--text2); }
+.diagram { max-width:1100px; margin:0 auto; padding:0 20px 60px; }
+
+/* Flow sections */
+.flow-section { margin-bottom:28px; }
+.flow-label { font-size:12px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; color:var(--text2); margin-bottom:10px; padding-left:4px; }
+
+/* Actor row */
+.actor-row { display:flex; gap:16px; justify-content:center; flex-wrap:wrap; margin-bottom:16px; }
+.actor {
+  background:var(--card); border-radius:16px; padding:20px 24px; text-align:center;
+  box-shadow:0 1px 4px rgba(0,0,0,0.04); min-width:180px; flex:1; max-width:240px;
+  border-top:4px solid var(--blue); position:relative;
+}
+.actor.phone { border-top-color:var(--teal); }
+.actor.server { border-top-color:var(--purple); }
+.actor.desktop { border-top-color:var(--green); }
+.actor.printer { border-top-color:var(--orange); }
+.actor-icon { font-size:36px; margin-bottom:8px; display:block; }
+.actor-name { font-size:15px; font-weight:600; letter-spacing:-0.01em; margin-bottom:4px; }
+.actor-sub { font-size:12px; color:var(--text2); }
+
+/* Arrows between rows */
+.arrow-row { display:flex; justify-content:center; align-items:center; padding:4px 0 8px; }
+.arrow-down { font-size:28px; color:#c7c7cc; text-align:center; line-height:1; }
+.arrow-label { font-size:11px; color:var(--text2); text-align:center; margin-bottom:2px; }
+
+/* Step cards */
+.steps { display:flex; flex-wrap:wrap; gap:12px; justify-content:center; }
+.step {
+  background:var(--card); border-radius:12px; padding:16px 20px; flex:1; min-width:200px; max-width:280px;
+  box-shadow:0 1px 4px rgba(0,0,0,0.04); position:relative; padding-left:48px;
+}
+.step-num {
+  position:absolute; left:14px; top:16px; width:24px; height:24px; border-radius:12px;
+  color:#fff; font-size:12px; font-weight:700; display:flex; align-items:center; justify-content:center;
+  background:var(--blue);
+}
+.step.client .step-num { background:var(--teal); }
+.step.server .step-num { background:var(--purple); }
+.step.local .step-num { background:var(--green); }
+.step-title { font-size:14px; font-weight:600; margin-bottom:4px; letter-spacing:-0.01em; }
+.step-desc { font-size:12px; color:var(--text2); line-height:1.5; }
+.step-tech { font-size:10px; color:var(--blue); font-weight:500; margin-top:4px; font-family:"SF Mono",Menlo,monospace; }
+
+/* Divider */
+.divider { border:none; border-top:1px solid rgba(60,60,67,0.12); margin:24px 0; }
+
+/* Legend */
+.legend { display:flex; gap:20px; justify-content:center; flex-wrap:wrap; margin-top:40px; padding:20px; }
+.legend-item { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--text2); }
+.legend-dot { width:10px; height:10px; border-radius:5px; }
+.legend-dot.client { background:var(--teal); }
+.legend-dot.server { background:var(--purple); }
+.legend-dot.local { background:var(--green); }
+.legend-dot.print { background:var(--orange); }
+
+/* Print homepage mockup */
+.homepage-mockup { background:var(--card); border-radius:16px; padding:24px; max-width:500px; margin:20px auto 0; box-shadow:0 4px 16px rgba(0,0,0,0.08); }
+.homepage-mockup h3 { font-size:15px; font-weight:600; text-align:center; margin-bottom:14px; letter-spacing:-0.01em; }
+.homepage-row { display:flex; justify-content:space-between; padding:6px 0; font-size:13px; border-bottom:0.5px solid rgba(60,60,67,0.08); }
+.homepage-row .label { color:var(--text2); }
+.homepage-row .value { font-weight:500; text-align:right; }
+.homepage-total { font-size:18px; font-weight:700; text-align:right; margin-top:10px; color:var(--red); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>HN 云打印 · 系统工作流程</h1>
+  <p>微信小程序 / Android APP → 云端后端 → 本地打印工具 → 打印机</p>
+</div>
+
+<div class="diagram">
+
+<!-- ====== 角色总览 ====== -->
+<div class="flow-section">
+  <div class="flow-label">系统角色</div>
+  <div class="actor-row">
+    <div class="actor phone">
+      <span class="actor-icon">📱</span>
+      <div class="actor-name">微信小程序</div>
+      <div class="actor-sub">WeChat Mini Program</div>
+    </div>
+    <div class="actor phone">
+      <span class="actor-icon">📲</span>
+      <div class="actor-name">Android APP</div>
+      <div class="actor-sub">Capacitor WebView</div>
+    </div>
+    <div class="actor server">
+      <span class="actor-icon">☁️</span>
+      <div class="actor-name">云端后端</div>
+      <div class="actor-sub">Flask + SocketIO + SQLite</div>
+    </div>
+    <div class="actor desktop">
+      <span class="actor-icon">🖥️</span>
+      <div class="actor-name">本地打印工具</div>
+      <div class="actor-sub">PySide6 + CloudClient</div>
+    </div>
+    <div class="actor printer">
+      <span class="actor-icon">🖨️</span>
+      <div class="actor-name">物理打印机</div>
+      <div class="actor-sub">HP LaserJet / GDI 直打</div>
+    </div>
+  </div>
+</div>
+
+<hr class="divider">
+
+<!-- ====== 流程1: 用户提交任务 ====== -->
+<div class="flow-section">
+  <div class="flow-label">流程 ① — 用户提交打印任务</div>
+  <div class="steps">
+    <div class="step client">
+      <div class="step-num">1</div>
+      <div class="step-title">微信/设备登录</div>
+      <div class="step-desc">小程序 → wx.login() → code<br>Android → device_id → SHA256</div>
+      <div class="step-tech">POST /api/login<br>POST /api/device_login</div>
+    </div>
+    <div class="step client">
+      <div class="step-num">2</div>
+      <div class="step-title">选择文件 & 上传</div>
+      <div class="step-desc">多文件选择，逐文件上传<br>实时进度条，MD5 去重</div>
+      <div class="step-tech">wx.uploadFile / XHR<br>POST /api/upload</div>
+    </div>
+    <div class="step client">
+      <div class="step-num">3</div>
+      <div class="step-title">配置 & 提交</div>
+      <div class="step-desc">设置份数/单双面/页码范围<br>点击"提交打印任务"</div>
+      <div class="step-tech">POST /api/submit_order</div>
+    </div>
+    <div class="step server">
+      <div class="step-num">4</div>
+      <div class="step-title">后端创建订单</div>
+      <div class="step-desc">orders(父) + order_files(子)<br>每文件独立 status/份数/双面<br>状态: queued</div>
+      <div class="step-tech">SQLite WAL 模式<br>原子事务</div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 流程2: 任务分发 ====== -->
+<div class="flow-section">
+  <div class="flow-label">流程 ② — 任务分发到本地</div>
+  <div class="steps">
+    <div class="step server">
+      <div class="step-num">1</div>
+      <div class="step-title">实时推送 (SocketIO)</div>
+      <div class="step-desc">后端检测排队任务<br>SocketIO emit "print_task"<br>推送到在线客户端</div>
+      <div class="step-tech">Flask-SocketIO<br>eventlet 异步</div>
+    </div>
+    <div class="step server">
+      <div class="step-num">2</div>
+      <div class="step-title">兜底拉取 (HTTP)</div>
+      <div class="step-desc">客户端定时/手动拉取<br>原子取锁防重复分配<br>status → printing</div>
+      <div class="step-tech">GET /api/pull_queued_orders<br>db_lock + BEGIN IMMEDIATE</div>
+    </div>
+    <div class="step local">
+      <div class="step-num">3</div>
+      <div class="step-title">CloudClient 接收</div>
+      <div class="step-desc">SocketIO 长连接接收任务<br>Signal → GUI 主线程<br>显示在云端待处理面板</div>
+      <div class="step-tech">python-socketio<br>PySide6 Signal 跨线程</div>
+    </div>
+    <div class="step local">
+      <div class="step-num">4</div>
+      <div class="step-title">自动下载文件</div>
+      <div class="step-desc">后台线程下载文件到临时目录<br>下载进度实时更新<br>status: pending → ready</div>
+      <div class="step-tech">requests stream<br>POST /api/download/:id</div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 流程3: 手动确认 & 打印 ====== -->
+<div class="flow-section">
+  <div class="flow-label">流程 ③ — 手动确认 & 打印</div>
+  <div class="steps">
+    <div class="step local">
+      <div class="step-num">1</div>
+      <div class="step-title">👆 用户手动确认</div>
+      <div class="step-desc">查看云端任务详情<br>点击 "📥 加入打印列表"<br>云端参数(份数/双面/范围)自动应用</div>
+      <div class="step-tech">GUI 面板操作<br>人工审核</div>
+    </div>
+    <div class="step local">
+      <div class="step-num">2</div>
+      <div class="step-title">打印首页生成 (可选)</div>
+      <div class="step-desc">封面开关=是时生成 A4 首页<br>含: 订单号/时间/文件清单/费用/地址<br>单面打印首页 → 再打印正文</div>
+      <div class="step-tech">reportlab<br>generate_cover_page_pdf()</div>
+    </div>
+    <div class="step local">
+      <div class="step-num">3</div>
+      <div class="step-title">文件转换 → PDF</div>
+      <div class="step-desc">Word: COM(Word→WPS→Libre)<br>MD/HTML: wkhtmltopdf<br>TXT/CSV/图片: reportlab<br>PDF: 直接打印</div>
+      <div class="step-tech">converter.py<br>多引擎智能降级</div>
+    </div>
+    <div class="step local">
+      <div class="step-num">4</div>
+      <div class="step-title">GDI 静默打印</div>
+      <div class="step-desc">PyMuPDF 渲染位图<br>Windows GDI 直打(DEVMODE)<br>逐面进度回调<br>3级降级(GDI→Sumatra→循环)</div>
+      <div class="step-tech">PyMuPDF + pywin32<br>print_pdf()</div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 流程4: 结果上报 ====== -->
+<div class="flow-section">
+  <div class="flow-label">流程 ④ — 结果上报 & 完成</div>
+  <div class="steps">
+    <div class="step local">
+      <div class="step-num">1</div>
+      <div class="step-title">上报打印结果</div>
+      <div class="step-desc">成功 → emit "print_success"<br>失败 → emit "print_fail"<br>云端更新 order_files.status</div>
+      <div class="step-tech">SocketIO emit<br>task_id 关联</div>
+    </div>
+    <div class="step server">
+      <div class="step-num">2</div>
+      <div class="step-title">父订单状态聚合</div>
+      <div class="step-desc">聚合所有子任务状态<br>优先级: failed > printing > queued > sent<br>全部完成 → orders.status = sent</div>
+      <div class="step-tech">aggregate_order_status()</div>
+    </div>
+    <div class="step client">
+      <div class="step-num">3</div>
+      <div class="step-title">用户查看结果</div>
+      <div class="step-desc">小程序/APP "我" 页面<br>查看订单列表 & 详情<br>支持取消排队任务</div>
+      <div class="step-tech">GET /api/orders<br>GET /api/order/:id</div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 打印首页内容预览 ====== -->
+<div class="flow-section">
+  <div class="flow-label">📄 打印首页 (Cover Page) 内容预览</div>
+  <div class="homepage-mockup">
+    <h3>HN 打印 · 首页信息</h3>
+    <div class="homepage-row"><span class="label">订单号</span><span class="value">HN20260719-0001</span></div>
+    <div class="homepage-row"><span class="label">发起时间</span><span class="value">2026-07-19 14:30:00</span></div>
+    <div class="homepage-row"><span class="label">执行时间</span><span class="value">2026-07-19 14:32:15</span></div>
+    <div class="homepage-row"><span class="label">文件清单</span><span class="value">报告.docx (2份×3页, 双面)<br>照片.png (1份×1页, 单面)</span></div>
+    <div class="homepage-row"><span class="label">纸张费</span><span class="value">¥0.80 (3张×0.2 + 1张×0.2)×2份</span></div>
+    <div class="homepage-row"><span class="label">派送费</span><span class="value">¥0.04 (女生宿舍 5%)</span></div>
+    <div class="homepage-row"><span class="label">加急费</span><span class="value">¥0.08 (中)</span></div>
+    <div class="homepage-row"><span class="label">首页费</span><span class="value">¥0.10</span></div>
+    <div class="homepage-total">合计: ¥1.02</div>
+    <div class="homepage-row" style="margin-top:8px;"><span class="label">📍 派送至</span><span class="value">女生宿舍</span></div>
+  </div>
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot client"></div> 移动端 (小程序/APP)</div>
+  <div class="legend-item"><div class="legend-dot server"></div> 云端后端</div>
+  <div class="legend-item"><div class="legend-dot local"></div> 本地打印工具</div>
+  <div class="legend-item"><div class="legend-dot print"></div> 打印机</div>
+</div>
+
+</div>
+</body>
+</html>

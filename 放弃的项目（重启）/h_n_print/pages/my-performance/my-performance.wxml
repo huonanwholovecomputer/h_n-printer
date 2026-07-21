@@ -1,0 +1,48 @@
+<!--my-performance.wxml — 个人月度打印统计-->
+<navigation-bar title="我的统计" back="{{true}}" color="black" background="#FFF"></navigation-bar>
+<scroll-view class="scrollarea" scroll-y type="list">
+  <view class="container">
+
+    <!-- 月份选择器 -->
+    <view class="date-picker">
+      <view class="picker-group">
+        <text class="picker-label">年份</text>
+        <picker range="{{yearList}}" value="{{yearIndex}}" bindchange="onYearChange">
+          <view class="picker-value">{{year}} 年</view>
+        </picker>
+      </view>
+      <view class="picker-group">
+        <text class="picker-label">月份</text>
+        <picker range="{{monthList}}" value="{{monthIndex}}" bindchange="onMonthChange">
+          <view class="picker-value">{{month}} 月</view>
+        </picker>
+      </view>
+    </view>
+
+    <!-- 加载中 -->
+    <view wx:if="{{loading}}" class="status-box">
+      <text>加载中...</text>
+    </view>
+
+    <!-- 统计卡片 -->
+    <view wx:elif="{{stats}}" class="stats-cards">
+      <view class="cards-grid">
+        <view class="stat-card">
+          <text class="card-value">{{stats.total_pages}}</text>
+          <text class="card-label">打印页数</text>
+        </view>
+        <view class="stat-card">
+          <text class="card-value">{{stats.total_orders}}</text>
+          <text class="card-label">任务次数</text>
+        </view>
+      </view>
+    </view>
+
+    <!-- 空状态 -->
+    <view wx:elif="{{!loading}}" class="empty-state">
+      <text class="empty-icon">📋</text>
+      <text class="empty-title">{{year}}年{{month}}月暂无打印记录</text>
+    </view>
+
+  </view>
+</scroll-view>

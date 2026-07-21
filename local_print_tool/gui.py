@@ -9,8 +9,10 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -762,6 +764,14 @@ class ConvertWorker(QThread):
         self.finished.emit(self._row, temp_pdf, info["page_count"], info["orientation"])
 
 
+def _cleanup_temp(path: str | None) -> None:
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 # ============================================================
 # 支持拖放添加文件的表格
 # ============================================================
@@ -916,20 +926,54 @@ class LocationManagerDialog(QDialog):
 
 
 # ============================================================
+# DropTableWidget — 支持拖放文件
+# ============================================================
+
+class DropTableWidget(QTableWidget):
+    """支持从资源管理器拖放文件到表格中。"""
+
+    filesDropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            files = []
+            for url in urls:
+                path = url.toLocalFile()
+                if path and os.path.isfile(path):
+                    files.append(path)
+            if files:
+                self.filesDropped.emit(files)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
+# ============================================================
 # 主窗口
 # ============================================================
 
 class MainWindow(QMainWindow):
     """HN 本地打印工具 — 主窗口"""
 
-    COL_FILE = 0
-    COL_COPIES = 1
-    COL_DUPLEX = 2
-    COL_RANGE = 3
-    COL_PAGES = 4
-    COL_ORIENT = 5
-    COL_ENGINE = 6
-    COL_COST = 7
+    # 表格列索引常量
+    COL_FILE, COL_COPIES, COL_DUPLEX, COL_RANGE, COL_PAGES, COL_ORIENT, COL_ENGINE, COL_COST = range(8)
 
     def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
         super().__init__()
@@ -942,11 +986,21 @@ class MainWindow(QMainWindow):
         self._copy_total_btn: Optional[QPushButton] = None
         self._copy_total_timer: Optional[QTimer] = None
 
+        # ── 标签页系统 ──
+        # 确保 tabs 中至少有一个标签
+        if not self._config.tabs:
+            self._config.tabs = {"1": []}
+        self._current_tab = self._config.active_tab or "1"
+        if self._current_tab not in self._config.tabs:
+            self._current_tab = next(iter(self._config.tabs.keys()))
+        # 撤回备份（每个标签独立）
+        self._cleared_jobs_backup: dict[str, list[PrintJob]] = {}
+        # 已处理的云端任务 ID（防重复弹窗）
+        self._processed_cloud_tasks: set[int] = set()
+
         # ── 云端客户端 ──
         self._cloud_client: CloudClient | None = None
         self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
-        self._cloud_task_widgets: dict[int, QWidget] = {}  # task_id → 面板控件
-        self._cloud_origin_files: dict[str, int] = {}  # file_path → task_id 映射
 
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
@@ -1146,7 +1200,7 @@ class MainWindow(QMainWindow):
         self._log_text = QTextEdit()
         self._log_text.setObjectName("logTextEdit")
         self._log_text.setReadOnly(True)
-        self._log_text.setMinimumHeight(40)
+        self._log_text.setMinimumHeight(24)
         _enable_smooth_scroll(self._log_text)
 
         v_splitter = QSplitter(Qt.Vertical)
@@ -1154,7 +1208,7 @@ class MainWindow(QMainWindow):
         v_splitter.addWidget(self._log_text)
         v_splitter.setStretchFactor(0, 1)
         v_splitter.setStretchFactor(1, 0)
-        v_splitter.setSizes([600, 120])
+        v_splitter.setSizes([650, 50])
         root.addWidget(v_splitter, 1)
 
         # -- 状态栏 --
@@ -1254,6 +1308,19 @@ class MainWindow(QMainWindow):
             action.triggered.connect(self._on_theme_changed)
             group.addAction(action)
             menu.addAction(action)
+
+    def _log(self, msg: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self._log_text.append(f"[{timestamp}] {msg}")
+        sb = self._log_text.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_theme_changed(self):
+        action = self.sender()
+        if action:
+            mode = action.data()
+            self._theme_manager.set_mode(mode)
+            self._theme_manager.apply_to_app(QApplication.instance(), mode)
 
     def _setup_top_bar(self, root: QVBoxLayout):
         """顶部：打印机选择 + 保留 PDF 选项。"""
@@ -1437,56 +1504,56 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, _normalize_spin_heights)
 
     def _setup_file_table(self) -> QWidget:
-        """左侧：云端任务面板 + 本地文件列表表格。"""
+        """左侧：标签页选择器 + 文件列表表格。"""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        # ── 云端任务面板（可折叠） ──
-        self._cloud_panel_header = QWidget()
-        header_layout = QHBoxLayout(self._cloud_panel_header)
-        header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setSpacing(4)
+        # ── 标签页选择器：[-] [N] [+] ──
+        tab_row = QHBoxLayout()
+        tab_row.setContentsMargins(0, 0, 0, 0)
+        tab_row.setSpacing(2)
 
-        self._cloud_panel_toggle = QPushButton("☁ 云端待处理 (0)")
-        self._cloud_panel_toggle.setObjectName("cloudPanelToggle")
-        self._cloud_panel_toggle.setCheckable(True)
-        self._cloud_panel_toggle.setChecked(True)
-        self._cloud_panel_toggle.toggled.connect(self._on_toggle_cloud_panel)
-        header_layout.addWidget(self._cloud_panel_toggle)
+        self._tab_btn_minus = QPushButton("−")
+        self._tab_btn_minus.setObjectName("tabBtnMinus")
+        self._tab_btn_minus.setFixedSize(24, 28)
+        self._tab_btn_minus.setToolTip("上一个标签页")
+        self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
 
-        self._cloud_badge = QLabel("")
-        self._cloud_badge.setObjectName("cloudBadge")
-        header_layout.addWidget(self._cloud_badge)
-        header_layout.addStretch()
+        self._tab_label = QLabel(self._current_tab)
+        self._tab_label.setObjectName("tabLabel")
+        self._tab_label.setAlignment(Qt.AlignCenter)
+        self._tab_label.setFixedSize(36, 28)
+        self._tab_label.setCursor(Qt.PointingHandCursor)
+        self._tab_label.setToolTip("点击管理标签页")
+        font_tab = QFont(self.font()); font_tab.setPointSize(12); font_tab.setBold(True)
+        self._tab_label.setFont(font_tab)
+        # 点击标签数字 → 弹出标签页管理窗口
+        self._tab_label.mousePressEvent = lambda e: self._show_tab_manager()
 
-        self._cloud_refresh_btn = QPushButton("🔄 拉取")
-        self._cloud_refresh_btn.setToolTip("手动拉取云端排队任务")
-        self._cloud_refresh_btn.clicked.connect(self._on_cloud_pull)
-        header_layout.addWidget(self._cloud_refresh_btn)
+        self._tab_btn_plus = QPushButton("+")
+        self._tab_btn_plus.setObjectName("tabBtnPlus")
+        self._tab_btn_plus.setFixedSize(24, 28)
+        self._tab_btn_plus.setToolTip("下一个标签页 / 新建标签页")
+        self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
 
-        layout.addWidget(self._cloud_panel_header)
+        tab_row.addWidget(self._tab_btn_minus)
+        tab_row.addWidget(self._tab_label)
+        tab_row.addWidget(self._tab_btn_plus)
+        tab_row.addStretch()
 
-        # 云端任务列表区域（可折叠）
-        self._cloud_tasks_container = QWidget()
-        self._cloud_tasks_layout = QVBoxLayout(self._cloud_tasks_container)
-        self._cloud_tasks_layout.setContentsMargins(0, 4, 0, 0)
-        self._cloud_tasks_layout.setSpacing(3)
+        # 标签页信息标签
+        self._tab_info_label = QLabel("")
+        self._tab_info_label.setObjectName("tabInfoLabel")
+        tab_row.addWidget(self._tab_info_label)
 
-        self._cloud_empty_label = QLabel("暂无云端任务，等待小程序提交...")
-        self._cloud_empty_label.setObjectName("cloudEmptyLabel")
-        self._cloud_empty_label.setAlignment(Qt.AlignCenter)
-        self._cloud_tasks_layout.addWidget(self._cloud_empty_label)
-        self._cloud_tasks_layout.addStretch()
+        layout.addLayout(tab_row)
 
-        layout.addWidget(self._cloud_tasks_container)
+        # 刷新标签页显示状态
+        self._refresh_tab_display()
 
-        # ── 本地任务列表 ──
-        title = QLabel("📄 打印任务列表")
-        title.setObjectName("sectionLabel")
-        layout.addWidget(title)
-
+        # ── 文件表格 (v3.1 风格) ──
         self._table = DropTableWidget()
         self._table.setColumnCount(8)
         self._table.setHorizontalHeaderLabels(["文件名", "份数", "单/双面", "页码范围", "页数", "方向", "引擎", "费用"])
@@ -1517,9 +1584,9 @@ class MainWindow(QMainWindow):
         self._table.setContextMenuPolicy(Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_table_context_menu)
 
-        layout.addWidget(self._table)
+        layout.addWidget(self._table, 1)
 
-        # 合计费用
+        # ── 合计费用 ──
         total_row = QHBoxLayout()
         total_row.setContentsMargins(0, 0, 0, 0)
         total_row.addStretch()
@@ -1535,12 +1602,10 @@ class MainWindow(QMainWindow):
         self._copy_total_timer.timeout.connect(self._reset_copy_button)
         total_row.addWidget(self._copy_total_btn)
         self._convert_workers: list[ConvertWorker] = []
-        # 复制计费明细按钮（默认隐藏，由 ⏷ 控制）
         self._copy_detail_btn = QPushButton("📋 复制计费明细")
         self._copy_detail_btn.setVisible(False)
         self._copy_detail_btn.clicked.connect(self._on_copy_detail)
         total_row.addWidget(self._copy_detail_btn)
-        # 展开计费明细的切换按钮
         self._detail_toggle_btn = QPushButton("⏷")
         self._detail_toggle_btn.setObjectName("detailToggleBtn")
         self._detail_toggle_btn.setCheckable(True)
@@ -1549,12 +1614,515 @@ class MainWindow(QMainWindow):
         total_row.addWidget(self._detail_toggle_btn)
         layout.addLayout(total_row)
 
-        # 添加文件按钮 — 置于表格下方
+        # ── 添加文件按钮 ──
         btn_add = QPushButton("📂 添加文件")
         btn_add.clicked.connect(self._on_add_files)
         layout.addWidget(btn_add)
 
         return container
+
+    # ──────── 标签页切换 ────────
+
+    def _switch_tab(self, delta: int):
+        """切换标签页。delta: -1 上一页, +1 下一页（若已在最后一页则新建）。"""
+        tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+        if not tab_keys:
+            self._config.tabs = {"1": []}
+            tab_keys = ["1"]
+
+        try:
+            idx = tab_keys.index(self._current_tab)
+        except ValueError:
+            idx = 0
+
+        # 切换标签页时取消撤回状态（备份属于旧标签页）
+        self._cancel_undo_if_active()
+
+        new_idx = idx + delta
+        if new_idx < 0:
+            return
+
+        if new_idx >= len(tab_keys):
+            # 在最后一页点 + → 新建标签
+            new_key = str(int(tab_keys[-1]) + 1)
+            self._config.tabs[new_key] = []
+            self._current_tab = new_key
+            self._config.active_tab = new_key
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+            self._log(f"📑 新建标签页 {new_key}")
+            return
+
+        self._current_tab = tab_keys[new_idx]
+        self._config.active_tab = self._current_tab
+        self._save_config()
+        self._rebuild_table()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+
+    def _refresh_tab_display(self):
+        """刷新标签页数字显示和按钮状态。"""
+        self._tab_label.setText(self._current_tab)
+
+        tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+        try:
+            idx = tab_keys.index(self._current_tab)
+        except ValueError:
+            idx = 0
+
+        # 更新按钮启用状态
+        self._tab_btn_minus.setEnabled(idx > 0)
+
+        # 更新信息标签
+        jobs = self._config.tabs.get(self._current_tab, [])
+        total = sum(calc_cost(j.page_count, j.copies, j.duplex,
+                              self._config.simplex_price, self._config.duplex_price,
+                              j.page_range)[0] for j in jobs)
+        self._tab_info_label.setText(f"共 {len(jobs)} 个文件 · 合计 ¥{total:.2f}")
+
+    def _get_current_jobs(self) -> list[PrintJob]:
+        """返回当前标签页的任务列表。"""
+        return self._config.tabs.get(self._current_tab, [])
+
+    def _set_current_jobs(self, jobs: list[PrintJob]):
+        """设置当前标签页的任务列表并保存配置。"""
+        self._config.tabs[self._current_tab] = jobs
+        self._save_config()
+
+    def _save_config(self):
+        """实时保存配置到 JSON 文件。"""
+        try:
+            self._sync_ui_to_config()
+            self._config.save(self._config_path)
+        except Exception as e:
+            logger.warning(f"自动保存配置失败: {e}")
+
+    # ──────── 标签页管理窗口 ────────
+
+    def _show_tab_manager(self):
+        """弹出标签页管理窗口，可查看各标签页信息、新建和删除标签页。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("📑 标签页管理")
+        dlg.setMinimumWidth(500)
+        dlg.setMinimumHeight(350)
+        dlg.setModal(True)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 14, 16, 14)
+
+        # 说明
+        layout.addWidget(QLabel("<b>所有标签页</b> · 点击数字可切换，选择后可删除"))
+
+        # 表格
+        from PySide6.QtWidgets import QTableWidget as _QTW, QTableWidgetItem as _QTWI
+        table = _QTW()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["标签", "文件数", "总页数", "合计费用", "来源"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        hh = table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+
+        tab_keys = []
+
+        def _rebuild_dialog_table():
+            """重建对话框内的标签页表格。"""
+            nonlocal tab_keys
+            tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+            table.setRowCount(0)
+            for key in tab_keys:
+                jobs = self._config.tabs.get(key, [])
+                file_count = len(jobs)
+                total_pages = sum(j.page_count * j.copies for j in jobs)
+                total_cost = sum(calc_cost(j.page_count, j.copies, j.duplex,
+                                           self._config.simplex_price, self._config.duplex_price,
+                                           j.page_range)[0] for j in jobs)
+                has_cloud = any(j.task_id > 0 for j in jobs)
+                source = "☁ 云端" if has_cloud else ("📂 本地" if file_count > 0 else "空")
+
+                row = table.rowCount()
+                table.insertRow(row)
+                marker = " ★" if key == self._current_tab else ""
+                table.setItem(row, 0, _QTWI(f"标签 {key}{marker}"))
+                table.setItem(row, 1, _QTWI(str(file_count)))
+                table.setItem(row, 2, _QTWI(str(total_pages)))
+                table.setItem(row, 3, _QTWI(f"¥{total_cost:.2f}"))
+                table.setItem(row, 4, _QTWI(source))
+
+        _rebuild_dialog_table()
+
+        # 双击切换标签页，右键删除
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+
+        def _on_double_click(row, col):
+            if 0 <= row < len(tab_keys):
+                key = tab_keys[row]
+                if key != self._current_tab:
+                    self._cancel_undo_if_active()
+                    self._current_tab = key
+                    self._config.active_tab = key
+                    self._save_config()
+                    self._rebuild_table()
+                    self._refresh_tab_display()
+                    self._sync_edit_enabled(False)
+                dlg.accept()  # 切换后关闭标签页管理器
+        table.cellDoubleClicked.connect(_on_double_click)
+
+        def _on_context_menu(pos):
+            item = table.itemAt(pos)
+            if item is None:
+                return
+            row = item.row()
+            table.selectRow(row)
+            menu = QMenu(dlg)
+            del_action = menu.addAction(f"🗑 删除标签页 {tab_keys[row]}")
+            del_action.triggered.connect(lambda: _delete_one_tab(tab_keys[row]))
+            menu.exec(table.viewport().mapToGlobal(pos))
+        table.customContextMenuRequested.connect(_on_context_menu)
+
+        layout.addWidget(table, 1)
+
+        # 按钮行
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        new_btn = QPushButton("＋ 新建标签页")
+        new_btn.clicked.connect(lambda: (
+            self._switch_tab(999),
+            _rebuild_dialog_table(),
+        ))
+        btn_row.addWidget(new_btn)
+
+        def _delete_one_tab(key):
+            """删除单个标签页"""
+            if len(tab_keys) <= 1:
+                QMessageBox.warning(dlg, "无法删除", "至少保留一个标签页。")
+                return
+            jobs = self._config.tabs.get(key, [])
+            if jobs:
+                reply = QMessageBox.question(
+                    dlg, "确认删除",
+                    f"标签页 {key} 中有 {len(jobs)} 个文件，删除后无法恢复。\n确定删除吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            del self._config.tabs[key]
+            if key == self._current_tab:
+                new_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+                self._current_tab = new_keys[0]
+                self._config.active_tab = self._current_tab
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+            self._log(f"已删除标签页 {key}")
+            _rebuild_dialog_table()
+
+        def _delete_all_tabs():
+            """删除全部标签页并重置为仅标签页 1"""
+            total = sum(len(j) for j in self._config.tabs.values())
+            if total > 0:
+                reply = QMessageBox.question(
+                    dlg, "确认清空全部",
+                    f"将删除全部 {len(self._config.tabs)} 个标签页（共 {total} 个文件），"
+                    "重置为单个空标签页。\n\n确定清空吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            self._config.tabs = {"1": []}
+            self._current_tab = "1"
+            self._config.active_tab = "1"
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+            self._log("已清空全部标签页")
+            _rebuild_dialog_table()
+
+        del_all_btn = QPushButton("✕ 清空全部标签页")
+        del_all_btn.setObjectName("cloudRejectBtn")
+        del_all_btn.clicked.connect(_delete_all_tabs)
+        btn_row.addWidget(del_all_btn)
+
+        btn_row.addStretch()
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+        dlg.exec()
+
+    # ──────── 表格重建与行操作 ────────
+
+    def _rebuild_table(self):
+        """用当前标签页的 jobs 重建表格。"""
+        self._table.setRowCount(0)
+        for job in self._get_current_jobs():
+            self._add_table_row(job)
+        self._update_total_cost()
+
+    def _add_table_row(self, job: PrintJob):
+        """添加一行到表格。"""
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+
+        ext = os.path.splitext(job.file_path)[1].lower()
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        is_image = ext in image_exts
+
+        display = job.display_name or os.path.basename(job.file_path)
+        name_item = QTableWidgetItem(display)
+        name_item.setData(Qt.UserRole, job.file_path)  # 存储完整路径
+        name_item.setToolTip(job.file_path)
+        self._table.setItem(row, self.COL_FILE, name_item)
+
+        copies_item = QTableWidgetItem(str(job.copies))
+        copies_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_COPIES, copies_item)
+
+        # 图片：双面无意义
+        if is_image:
+            duplex_text = "—"
+        elif job.duplex == "on":
+            dm = "长边" if job.duplex_mode != "short-edge" else "短边"
+            duplex_text = f"双面({dm})"
+        else:
+            duplex_text = "单面"
+        duplex_item = QTableWidgetItem(duplex_text)
+        duplex_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_DUPLEX, duplex_item)
+
+        # 图片：页码范围无意义
+        if is_image:
+            range_text = "—"
+        else:
+            range_text = job.page_range or "全部"
+        range_item = QTableWidgetItem(range_text)
+        range_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_RANGE, range_item)
+
+        # 页数
+        pages_text = str(job.page_count) if job.page_count > 0 else "?"
+        pages_item = QTableWidgetItem(pages_text)
+        pages_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_PAGES, pages_item)
+
+        # 方向
+        ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+        ori_text = ori_map.get(job.orientation, "")
+        ori_item = QTableWidgetItem(ori_text)
+        ori_item.setTextAlignment(Qt.AlignCenter)
+        self._table.setItem(row, self.COL_ORIENT, ori_item)
+
+        # 打印引擎（仅 Word 文件显示；非 Word 文件显示 "—"）
+        is_word_file = ext in (".doc", ".docx")
+        eng_labels = {"word": "Word", "wps": "WPS", "libreoffice": "LibreOffice"}
+        eng_text = eng_labels.get(job.engine, "Word") if is_word_file else "—"
+        eng_item = QTableWidgetItem(eng_text)
+        eng_item.setTextAlignment(Qt.AlignCenter)
+        if not is_word_file:
+            eng_item.setToolTip("仅 Word 文档(.doc/.docx)支持选择转换引擎")
+        else:
+            eng_item.setToolTip("Word: Microsoft Word | WPS: WPS Office | LibreOffice: 兜底")
+        self._table.setItem(row, self.COL_ENGINE, eng_item)
+
+        # 费用
+        cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
+                                  self._config.simplex_price, self._config.duplex_price,
+                                  job.page_range)
+        if cost > 0:
+            cost_text = f"{formula}=¥{cost:.2f}"
+        elif job.page_count <= 0:
+            cost_text = "?"
+        else:
+            cost_text = "¥0.00"
+        cost_item = QTableWidgetItem(cost_text)
+        cost_item.setTextAlignment(Qt.AlignCenter)
+        cost_item.setData(Qt.UserRole, cost)
+        cost_item.setToolTip(cost_text)
+        self._table.setItem(row, self.COL_COST, cost_item)
+
+    def _recalc_row_cost(self, row: int):
+        """重新计算指定行的费用。"""
+        name_item = self._table.item(row, self.COL_FILE)
+        if not name_item:
+            return
+        jobs = self._get_current_jobs()
+        if row >= len(jobs):
+            return
+        job = jobs[row]
+        cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
+                                  self._config.simplex_price, self._config.duplex_price,
+                                  job.page_range)
+        if cost > 0:
+            cost_text = f"{formula}=¥{cost:.2f}"
+        elif job.page_count <= 0:
+            cost_text = "?"
+        else:
+            cost_text = "¥0.00"
+        cost_item = self._table.item(row, self.COL_COST)
+        if cost_item:
+            cost_item.setText(cost_text)
+            cost_item.setData(Qt.UserRole, cost)
+            cost_item.setToolTip(cost_text)
+        self._update_total_cost()
+
+    def _update_total_cost(self):
+        """更新合计费用标签。"""
+        total = 0.0
+        all_known = True
+        for job in self._get_current_jobs():
+            cost, _ = calc_cost(job.page_count, job.copies, job.duplex,
+                                self._config.simplex_price, self._config.duplex_price,
+                                job.page_range)
+            total += cost
+            if job.page_count <= 0:
+                all_known = False
+        prefix = "≈ " if not all_known else ""
+        self._total_label.setText(f"合计: {prefix}¥{total:.2f}")
+
+    def _on_table_double_click(self, row: int, col: int):
+        """双击表格行 → 用默认程序打开文件。"""
+        name_item = self._table.item(row, self.COL_FILE)
+        if name_item:
+            file_path = name_item.data(Qt.UserRole)
+            if file_path and os.path.isfile(file_path):
+                os.startfile(file_path)
+
+    def _on_table_selection(self):
+        """选中行变化 → 同步编辑面板。"""
+        rows = set(idx.row() for idx in self._table.selectedIndexes())
+        if not rows:
+            self._sync_edit_enabled(False)
+            return
+        row = min(rows)
+        jobs = self._get_current_jobs()
+        if row >= len(jobs):
+            self._sync_edit_enabled(False)
+            return
+        job = jobs[row]
+        self._sync_edit_enabled(True)
+
+        # 同步编辑控件
+        self._edit_copies.blockSignals(True)
+        self._edit_copies.setValue(job.copies)
+        self._edit_copies.blockSignals(False)
+
+        self._edit_duplex.blockSignals(True)
+        self._edit_duplex.setCurrentIndex(0 if job.duplex == "on" else 1)
+        self._edit_duplex.blockSignals(False)
+
+        self._edit_duplex_mode.blockSignals(True)
+        self._edit_duplex_mode.setCurrentIndex(0 if job.duplex_mode != "short-edge" else 1)
+        self._edit_duplex_mode.blockSignals(False)
+
+        self._edit_page_range.set_total_pages(job.page_count)
+        self._edit_page_range.set_ranges(job.page_range)
+
+        eng_map = {"word": 0, "wps": 1, "libreoffice": 2}
+        self._edit_engine.blockSignals(True)
+        self._edit_engine.setCurrentIndex(eng_map.get(job.engine, 0))
+        self._edit_engine.blockSignals(False)
+
+        dpi_map = {0: 0, 200: 1, 300: 2, 400: 3, 600: 4}
+        self._edit_dpi.blockSignals(True)
+        self._edit_dpi.setCurrentIndex(dpi_map.get(job.dpi, 0))
+        self._edit_dpi.blockSignals(False)
+
+        # 更新选中文件标签
+        self._selected_file_label.setText(
+            f"📄 {os.path.basename(job.file_path)}\n"
+            f"路径: {job.file_path}"
+        )
+
+    def _sync_edit_enabled(self, enabled: bool):
+        """统一启用/禁用编辑面板所有控件。"""
+        if not hasattr(self, '_edit_widgets') or not self._edit_widgets:
+            return
+        for w in self._edit_widgets:
+            w.setEnabled(enabled)
+        if not enabled:
+            self._selected_file_label.setText("(未选中任务)")
+
+    def _auto_apply_edit(self):
+        """编辑面板参数变更 → 自动应用到当前选中行并保存。"""
+        rows = set(idx.row() for idx in self._table.selectedIndexes())
+        if not rows:
+            return
+        row = min(rows)
+        jobs = self._get_current_jobs()
+        if row >= len(jobs):
+            return
+
+        job = jobs[row]
+
+        # 读取编辑控件值
+        job.copies = self._edit_copies.value()
+        job.duplex = "on" if self._edit_duplex.currentIndex() == 0 else "off"
+        job.duplex_mode = "short-edge" if self._edit_duplex_mode.currentIndex() == 1 else "long-edge"
+
+        # 页码范围
+        ranges_str = ",".join(
+            inp.text().strip() for inp in self._edit_page_range._inputs
+            if inp.text().strip()
+        )
+        job.page_range = ranges_str
+
+        # 引擎
+        eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
+        job.engine = eng_map.get(self._edit_engine.currentIndex(), "word")
+
+        # DPI
+        dpi_map = {0: 0, 1: 200, 2: 300, 3: 400, 4: 600}
+        job.dpi = dpi_map.get(self._edit_dpi.currentIndex(), 0)
+
+        # 更新表格行显示
+        self._recalc_row_cost(row)
+        # 实时保存配置
+        self._set_current_jobs(jobs)
+
+    def _on_table_context_menu(self, pos):
+        """表格右键菜单。"""
+        menu = QMenu(self)
+        # 检查是否点击在有效行上
+        item = self._table.itemAt(pos)
+        if item is not None:
+            row = item.row()
+            # 选中该行
+            self._table.selectRow(row)
+            # 移除选中
+            remove_action = menu.addAction("🗑 移除选中")
+            remove_action.triggered.connect(self._on_remove_selected)
+            menu.addSeparator()
+            # 打开文件位置
+            name_item = self._table.item(row, self.COL_FILE)
+            if name_item:
+                fp = name_item.data(Qt.UserRole)
+                open_action = menu.addAction("📂 打开文件位置")
+                open_action.triggered.connect(lambda checked=False, p=fp: (
+                    os.startfile(os.path.dirname(p)) if p and os.path.isfile(p) else None
+                ))
+                menu.addSeparator()
+
+        # 粘贴
+        paste_action = menu.addAction("📋 粘贴")
+        paste_action.setEnabled(self._can_paste_files())
+        paste_action.triggered.connect(self._on_paste_files)
+
+        menu.exec(self._table.viewport().mapToGlobal(pos))
+
 
     def _setup_edit_panel(self) -> QWidget:
         """右侧：选中任务的参数编辑面板。"""
@@ -1669,11 +2237,10 @@ class MainWindow(QMainWindow):
         self._btn_clear.clicked.connect(self._on_clear_list)
         layout.addWidget(self._btn_clear)
 
-        # 撤回定时器：清空后 5 秒内可撤回
+        # 撤回定时器：清空后 5 秒内可撤回（每个标签页独立备份）
         self._clear_undo_timer = QTimer(self)
         self._clear_undo_timer.setSingleShot(True)
         self._clear_undo_timer.timeout.connect(self._on_undo_expired)
-        self._cleared_jobs_backup: list[PrintJob] = []
 
         layout.addStretch()
 
@@ -1761,14 +2328,13 @@ class MainWindow(QMainWindow):
         self._log("已刷新打印机列表")
 
     def _on_price_changed(self):
-        """单价变更 → 重算所有费用。"""
+        """单价变更 → 重算当前标签页所有费用并保存。"""
         self._config.simplex_price = self._simplex_price_spin.value()
         self._config.duplex_price = self._duplex_price_spin.value()
-        self._config.cover_page = (self._cover_page_onoff_combo.currentIndex() == 1)
-        self._config.cover_page_price = self._cover_page_price_spin.value()
         for row in range(self._table.rowCount()):
             self._recalc_row_cost(row)
         self._update_total_cost()
+        self._save_config()
 
     def _on_keep_temp_changed(self):
         """保存转换副本设置变更 → 实时同步到 config。"""
@@ -1851,143 +2417,17 @@ class MainWindow(QMainWindow):
         self._config.cover_page = (self._cover_page_onoff_combo.currentIndex() == 1)
         self._config.cover_page_price = self._cover_page_price_spin.value()
 
-        # jobs 已通过表格实时维护，这里不需要再同步
-
-    def _rebuild_table(self):
-        """用 config.jobs 重建表格。"""
-        self._table.setRowCount(0)
-        for job in self._config.jobs:
-            self._add_table_row(job)
-
-    def _add_table_row(self, job: PrintJob):
-        """添加一行到表格。"""
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-
-        ext = os.path.splitext(job.file_path)[1].lower()
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        is_image = ext in image_exts
-
-        name_item = QTableWidgetItem(os.path.basename(job.file_path))
-        name_item.setData(Qt.UserRole, job.file_path)  # 存储完整路径
-        name_item.setToolTip(job.file_path)
-        self._table.setItem(row, self.COL_FILE, name_item)
-
-        copies_item = QTableWidgetItem(str(job.copies))
-        copies_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, self.COL_COPIES, copies_item)
-
-        # 图片：双面无意义
-        if is_image:
-            duplex_text = "—"
-        elif job.duplex == "on":
-            dm = "长边" if job.duplex_mode != "short-edge" else "短边"
-            duplex_text = f"双面({dm})"
-        else:
-            duplex_text = "单面"
-        duplex_item = QTableWidgetItem(duplex_text)
-        duplex_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, self.COL_DUPLEX, duplex_item)
-
-        # 图片：页码范围无意义
-        if is_image:
-            range_text = "—"
-        else:
-            range_text = job.page_range or "全部"
-        range_item = QTableWidgetItem(range_text)
-        range_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, self.COL_RANGE, range_item)
-
-        # 页数
-        pages_text = str(job.page_count) if job.page_count > 0 else "?"
-        pages_item = QTableWidgetItem(pages_text)
-        pages_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, self.COL_PAGES, pages_item)
-
-        # 方向
-        ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
-        ori_text = ori_map.get(job.orientation, "")
-        ori_item = QTableWidgetItem(ori_text)
-        ori_item.setTextAlignment(Qt.AlignCenter)
-        self._table.setItem(row, self.COL_ORIENT, ori_item)
-
-        # 打印引擎（仅 Word 文件显示；非 Word 文件显示 "—"）
-        ext = os.path.splitext(job.file_path)[1].lower()
-        is_word_file = ext in (".doc", ".docx")
-        eng_labels = {"word": "Word", "wps": "WPS", "libreoffice": "LibreOffice"}
-        eng_text = eng_labels.get(job.engine, "Word") if is_word_file else "—"
-        eng_item = QTableWidgetItem(eng_text)
-        eng_item.setTextAlignment(Qt.AlignCenter)
-        if not is_word_file:
-            eng_item.setToolTip("仅 Word 文档(.doc/.docx)支持选择转换引擎")
-        else:
-            eng_item.setToolTip("Word: Microsoft Word | WPS: WPS Office | LibreOffice: 兜底")
-        self._table.setItem(row, self.COL_ENGINE, eng_item)
-
-        # 费用
-        cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
-                                  self._config.simplex_price, self._config.duplex_price,
-                                  job.page_range)
-        if cost > 0:
-            cost_text = f"{formula}=¥{cost:.2f}"
-        elif job.page_count <= 0:
-            cost_text = "?"
-        else:
-            cost_text = "¥0.00"
-        cost_item = QTableWidgetItem(cost_text)
-        cost_item.setTextAlignment(Qt.AlignCenter)
-        cost_item.setData(Qt.UserRole, cost)
-        cost_item.setToolTip(cost_text)
-        self._table.setItem(row, self.COL_COST, cost_item)
-
-        self._update_total_cost()
-
-    def _on_convert_finished(self, row: int, cached_pdf: str, page_count: int, orientation: str):
-        """后台 PDF 转换完成 → 更新表格、缓存、按需保存副本到桌面。"""
-        if row >= self._table.rowCount():
-            return
-        if not cached_pdf:
-            self._table.item(row, self.COL_PAGES).setText("?")
-            return
-        # 清理该行旧的缓存 PDF
-        if row < len(self._config.jobs):
-            old_pdf = self._config.jobs[row].cached_pdf
-            if old_pdf and os.path.isfile(old_pdf) and old_pdf != cached_pdf:
-                try:
-                    os.remove(old_pdf)
-                except OSError:
-                    pass
-            self._config.jobs[row].cached_pdf = cached_pdf
-            self._config.jobs[row].page_count = page_count
-            self._config.jobs[row].orientation = orientation
-        self._table.item(row, self.COL_PAGES).setText(str(page_count))
-        ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
-        self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
-        self._recalc_row_cost(row)
-        self._update_total_cost()
-
-        # 转换完成后立刻保存副本到桌面（而非等到打印完成）
-        if self._config.keep_temp_pdf and cached_pdf and os.path.isfile(cached_pdf):
-            file_path = ""
-            if row < len(self._config.jobs):
-                file_path = self._config.jobs[row].file_path
-            original_base = os.path.splitext(os.path.basename(file_path))[0] if file_path else "document"
-            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-            dest_name = f"[转换]{original_base}.pdf"
-            dest_path = os.path.join(desktop, dest_name)
-            try:
-                shutil.copy2(cached_pdf, dest_path)
-                self._log(f"  → 转换副本已保存到桌面: {dest_name}")
-            except OSError as e:
-                self._log(f"  → 保存转换副本到桌面失败: {e}")
+        # jobs 已通过表格实时维护并保存到 tabs 中
 
     def _start_convert_worker(self, row: int, file_path: str, engine: str):
         """启动后台 PDF 转换线程。"""
-        # 取消该行之前的转换 worker
         self._convert_workers = [w for w in self._convert_workers if w.isRunning()]
         for w in self._convert_workers:
-            if w._row == row:
-                w.finished.disconnect()
+            if getattr(w, '_file_path', '') == file_path:
+                try:
+                    w.finished.disconnect()
+                except Exception:
+                    pass
                 w.wait(100)
         worker = ConvertWorker(row, file_path, engine)
         worker.finished.connect(self._on_convert_finished)
@@ -2037,37 +2477,6 @@ class MainWindow(QMainWindow):
         available = get_available_engines()
         return available.get("word", False) or available.get("wps", False) or available.get("libreoffice", False)
 
-    def _update_total_cost(self):
-        """重新计算并更新合计费用标签。"""
-        base_total = 0.0  # 纸张费用合计（用于计算派送百分比）
-        all_known = True
-        for row in range(self._table.rowCount()):
-            cost_item = self._table.item(row, self.COL_COST)
-            if cost_item:
-                c = cost_item.data(Qt.UserRole)
-                if isinstance(c, (int, float)) and c > 0:
-                    base_total += c
-                elif cost_item.text() == "?":
-                    all_known = False
-
-        total = base_total
-
-        # 订单级附加费用
-        if self._config.delivery_enabled:
-            pct = self._config.delivery_percentages.get(self._config.delivery_location, 0.0)
-            total += base_total * (pct / 100.0)
-        total += self._config.urgency_prices.get(self._config.urgency, 0.0)
-        if self._config.cover_page:
-            total += self._config.cover_page_price
-
-        if total > 0:
-            prefix = "≈ " if not all_known else ""
-            self._total_label.setText(f"合计: {prefix}¥{total:.2f}")
-        else:
-            self._total_label.setText("合计: ¥0.00")
-        # 总价变化时立即恢复复制按钮
-        self._reset_copy_button()
-
     def _on_copy_total(self):
         """复制合计金额到剪贴板。"""
         text = self._total_label.text()
@@ -2102,284 +2511,6 @@ class MainWindow(QMainWindow):
         self._copy_detail_btn.setVisible(checked)
         self._detail_toggle_btn.setText("⏶" if checked else "⏷")
         self._detail_toggle_btn.setToolTip("隐藏计费明细" if checked else "展开计费明细")
-
-    def _on_copy_detail(self):
-        """复制计费明细到剪贴板。"""
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        lines = ["计费明细", "─" * 14]
-        all_parts: list[str] = []  # 所有费用项的值，用于合计公式
-        base_total = 0.0  # 纸张费用合计（用于计算派送费）
-        item_num = 0
-
-        # ── 1. 逐文件打印明细 ──
-        for row in range(self._table.rowCount()):
-            item_num += 1
-            file_item = self._table.item(row, self.COL_FILE)
-            file_path = file_item.data(Qt.UserRole) if file_item else ""
-            filename = file_item.text() if file_item else "?"
-            copies = self._table.item(row, self.COL_COPIES).text()
-            duplex = self._table.item(row, self.COL_DUPLEX).text()
-            page_range = self._table.item(row, self.COL_RANGE).text()
-            orient = self._table.item(row, self.COL_ORIENT).text()
-
-            display_name = _truncate_filename(filename)
-            ext_lower = os.path.splitext(file_path)[1].lower()
-            is_image = ext_lower in image_exts
-
-            if is_image:
-                meta_parts = [f"{copies}份"]
-                if orient:
-                    meta_parts.append(orient)
-                meta_line = " | ".join(meta_parts)
-            else:
-                meta_parts = [f"{copies}份", duplex]
-                if page_range and page_range not in ("全部", "—"):
-                    meta_parts.append(f"{page_range}页")
-                else:
-                    meta_parts.append("全部页")
-                if orient:
-                    meta_parts.append(orient)
-                meta_line = " | ".join(meta_parts)
-
-            # 获取纸张费用
-            pages_text = self._table.item(row, self.COL_PAGES).text()
-            page_count = int(pages_text) if pages_text.isdigit() else 0
-            dup = "on" if "双" in duplex else "off"
-            pr = page_range if page_range not in ("全部", "—") else ""
-            paper_cost, paper_formula = calc_cost(page_count, int(copies), dup,
-                                                  self._config.simplex_price,
-                                                  self._config.duplex_price, pr)
-
-            lines.append(f"{item_num}. {display_name}")
-            lines.append(f"   {meta_line}")
-            if paper_cost > 0:
-                lines.append(f"   {paper_formula}=¥{paper_cost:.2f}")
-                all_parts.append(f"{paper_cost:.2f}")
-                base_total += paper_cost
-            elif page_count <= 0:
-                lines.append(f"   💰 ?")
-
-        # ── 2. 派送 ──
-        item_num += 1
-        if self._config.delivery_enabled:
-            loc = self._config.delivery_location
-            pct = self._config.delivery_percentages.get(loc, 0.0)
-            delivery_cost = base_total * (pct / 100.0)
-            if pct > 0 and delivery_cost > 0:
-                lines.append(f"{item_num}. 派送：是 | {loc} {pct:.1f}% | ￥{delivery_cost:.2f}")
-                all_parts.append(f"{delivery_cost:.2f}")
-            else:
-                lines.append(f"{item_num}. 派送：是 | {loc}免费")
-        else:
-            lines.append(f"{item_num}. 派送：否")
-
-        # ── 3. 优先级 ──
-        item_num += 1
-        urgency_price = self._config.urgency_prices.get(self._config.urgency, 0.0)
-        if urgency_price > 0:
-            lines.append(f"{item_num}. 优先级：{self._config.urgency} | ￥{urgency_price:.2f}")
-            all_parts.append(f"{urgency_price:.2f}")
-        else:
-            lines.append(f"{item_num}. 优先级：{self._config.urgency} | ￥0")
-
-        # ── 4. 打印首页信息 ──
-        if self._config.cover_page:
-            item_num += 1
-            lines.append(f"{item_num}. 打印首页信息 | {self._config.cover_page_price:.2f}")
-            all_parts.append(f"{self._config.cover_page_price:.2f}")
-
-        # ── 合计 ──
-        lines.append("─" * 14)
-        total_sum = sum(float(p) for p in all_parts) if all_parts else 0.0
-        formula = "+".join(all_parts) if all_parts else "0"
-        lines.append(f"💰合计: {formula}=￥{total_sum:.2f}")
-
-        # ── 自取提示 ──
-        if not self._config.delivery_enabled:
-            order_no, next_num = generate_order_number(self._config.last_order_number)
-            self._config.last_order_number = next_num
-            from datetime import date
-            today = date.today()
-            short_no = f"{today.month}-{today.day}-{next_num:04d}"
-            lines.append("")
-            lines.append(f"⚠️ 您选择了自取，请凭{short_no}号码去[{self._config.pickup_address}]取件，请不要敲门，你必须提前联系打印机管理者才能取件，为保证良好的宿舍秩序，请提前10分钟询问是否可取件，不要过早或过晚。")
-
-        QApplication.clipboard().setText("\n".join(lines))
-        # 按钮反馈
-        if self._copy_detail_btn:
-            self._copy_detail_btn.setText("✅ 已复制明细")
-            self._copy_detail_btn.setEnabled(False)
-        if self._copy_total_timer:
-            self._copy_total_timer.start(5000)
-
-    def _recalc_row_cost(self, row: int):
-        """重新计算指定行的费用。"""
-        pages_text = self._table.item(row, self.COL_PAGES).text()
-        page_count = int(pages_text) if pages_text.isdigit() else 0
-        copies = int(self._table.item(row, self.COL_COPIES).text())
-        duplex_text = self._table.item(row, self.COL_DUPLEX).text()
-        duplex = "on" if "双" in duplex_text else "off"
-        page_range = self._table.item(row, self.COL_RANGE).text()
-        if page_range in ("全部", "—"):
-            page_range = ""
-
-        cost, formula = calc_cost(page_count, copies, duplex,
-                                  self._config.simplex_price, self._config.duplex_price,
-                                  page_range)
-        if cost > 0:
-            cost_text = f"{formula}=¥{cost:.2f}"
-        elif page_count <= 0:
-            cost_text = "?"
-        else:
-            cost_text = "¥0.00"
-        cost_item = self._table.item(row, self.COL_COST)
-        if cost_item:
-            cost_item.setText(cost_text)
-            cost_item.setToolTip(cost_text)
-            cost_item.setData(Qt.UserRole, cost)
-
-    def _refresh_config_jobs_from_table(self):
-        """从表格数据重建 config.jobs 列表。"""
-        jobs: list[PrintJob] = []
-        for row in range(self._table.rowCount()):
-            file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
-            copies = int(self._table.item(row, self.COL_COPIES).text())
-            duplex_text = self._table.item(row, self.COL_DUPLEX).text()
-            duplex = "on" if "双" in duplex_text else "off"
-            # 从 "双面(长边)" / "双面(短边)" 中解析双面模式
-            duplex_mode = ""
-            if duplex == "on":
-                duplex_mode = "short-edge" if "短边" in duplex_text else "long-edge"
-            page_range = self._table.item(row, self.COL_RANGE).text()
-            if page_range in ("全部", "—"):
-                page_range = ""
-            pages_text = self._table.item(row, self.COL_PAGES).text()
-            page_count = int(pages_text) if pages_text.isdigit() else 0
-            ori_map = {"竖": "portrait", "横": "landscape", "混": "mixed"}
-            ori_text = self._table.item(row, self.COL_ORIENT).text()
-            orientation = ori_map.get(ori_text, "")
-            # 读取引擎（静态文本列）
-            engine_text = self._table.item(row, self.COL_ENGINE).text() if self._table.item(row, self.COL_ENGINE) else ""
-            eng_rev = {"Word": "word", "WPS": "wps", "LibreOffice": "libreoffice"}
-            engine = eng_rev.get(engine_text, "word")
-            # DPI 不在表格中，从 config.jobs 保留
-            job_dpi = self._config.jobs[row].dpi if row < len(self._config.jobs) else 0
-            # cached_pdf 也需要保留
-            job_cached_pdf = self._config.jobs[row].cached_pdf if row < len(self._config.jobs) else ""
-            jobs.append(PrintJob(file_path=file_path, copies=copies, duplex=duplex,
-                                 duplex_mode=duplex_mode,
-                                 page_range=page_range, page_count=page_count,
-                                 orientation=orientation, engine=engine,
-                                 dpi=job_dpi,
-                                 cached_pdf=job_cached_pdf))
-        self._config.jobs = jobs
-
-    # ---- 事件处理 ----
-
-    def _on_table_selection(self):
-        """表格选中行变化 → 右侧编辑面板同步。"""
-        if getattr(self, '_loading_files', False):
-            return
-        rows = self._table.selectionModel().selectedRows()
-        if not rows:
-            self._selected_file_label.setText("(未选中任务)")
-            self._edit_copies.setValue(1)
-            self._edit_duplex.setCurrentIndex(0)
-            self._edit_page_range.set_ranges("")
-            for w in self._edit_widgets:
-                w.setEnabled(False)
-            return
-
-        for w in self._edit_widgets:
-            w.setEnabled(True)
-
-        row = rows[0].row()
-        file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
-        copies = int(self._table.item(row, self.COL_COPIES).text())
-        duplex_text = self._table.item(row, self.COL_DUPLEX).text()
-        page_range = self._table.item(row, self.COL_RANGE).text()
-
-        self._selected_file_label.setText(f"当前文件:\n{file_path}")
-        # 阻断信号避免加载时误触发自动应用
-        self._edit_copies.blockSignals(True)
-        self._edit_copies.setValue(copies)
-        self._edit_copies.blockSignals(False)
-        self._edit_duplex.blockSignals(True)
-        self._edit_duplex.setCurrentIndex(0 if "双" in duplex_text else 1)
-        self._edit_duplex.blockSignals(False)
-        # 双面模式
-        is_duplex = "双" in duplex_text
-        self._edit_duplex_mode.setEnabled(is_duplex)
-        self._edit_duplex_mode.blockSignals(True)
-        self._edit_duplex_mode.setCurrentIndex(0 if "长边" in duplex_text else 1)
-        self._edit_duplex_mode.blockSignals(False)
-        # 设置总页数用于范围校验
-        pages_text = self._table.item(row, self.COL_PAGES).text()
-        total_pages = int(pages_text) if pages_text.isdigit() else 0
-        self._edit_page_range.set_total_pages(total_pages)
-        self._edit_page_range.set_ranges("" if page_range in ("全部", "—") else page_range)
-        # 同步引擎
-        eng_text = self._table.item(row, self.COL_ENGINE).text() if self._table.item(row, self.COL_ENGINE) else "Word"
-        eng_map = {"Word": 0, "WPS": 1, "LibreOffice": 2}
-        self._edit_engine.blockSignals(True)
-        self._edit_engine.setCurrentIndex(eng_map.get(eng_text, 0))
-        self._edit_engine.blockSignals(False)
-        # PDF / 图片文件不需要转换，引擎不可用
-        ext = os.path.splitext(file_path)[1].lower()
-        is_convertible = ext in (".doc", ".docx")
-        self._label_engine.setEnabled(is_convertible)
-        self._edit_engine.setEnabled(is_convertible)
-        # 图片只有一页，单双面和页码范围无意义
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        is_image = ext in image_exts
-        self._edit_duplex.setEnabled(not is_image)
-        self._edit_duplex_mode.setEnabled(not is_image and is_duplex)
-        self._edit_page_range.setEnabled(not is_image)
-        # 同步渲染 DPI
-        job_dpi = 0
-        if row < len(self._config.jobs):
-            job_dpi = self._config.jobs[row].dpi
-        dpi_map = {0: 0, 200: 1, 300: 2, 400: 3, 600: 4}
-        self._edit_dpi.blockSignals(True)
-        self._edit_dpi.setCurrentIndex(dpi_map.get(job_dpi, 0))
-        self._edit_dpi.blockSignals(False)
-
-    def _on_table_double_click(self, row: int, col: int):
-        """双击表格行 → 用系统默认程序打开文件。"""
-        file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
-        if file_path and os.path.isfile(file_path):
-            try:
-                os.startfile(file_path)
-                self._log(f"打开文件: {os.path.basename(file_path)}")
-            except OSError as e:
-                logger.warning(f"无法打开文件 ({file_path}): {e}")
-                QMessageBox.warning(self, "无法打开文件",
-                                    f"没有找到可以打开此类型文件的程序。\n\n{file_path}")
-
-    def _on_table_context_menu(self, pos):
-        """表格右键菜单。"""
-        row = self._table.rowAt(pos.y())
-        menu = QMenu(self)
-
-        if row < 0:
-            # 空白区域：粘贴文件
-            paste_action = menu.addAction("📋 粘贴")
-            paste_action.setEnabled(self._can_paste_files())
-            action = menu.exec(self._table.viewport().mapToGlobal(pos))
-            if action == paste_action:
-                self._on_paste_files()
-            return
-
-        # 有效行：移除 + 粘贴
-        remove_action = menu.addAction("移除选中")
-        menu.addSeparator()
-        paste_action = menu.addAction("📋 粘贴")
-        paste_action.setEnabled(self._can_paste_files())
-        action = menu.exec(self._table.viewport().mapToGlobal(pos))
-        if action == remove_action:
-            self._on_remove_selected()
-        elif action == paste_action:
-            self._on_paste_files()
 
     def _can_paste_files(self) -> bool:
         """检查剪贴板是否包含可粘贴的文件。"""
@@ -2439,70 +2570,6 @@ class MainWindow(QMainWindow):
                                     "支持格式: PDF, Word(.doc/.docx), "
                                     "文本(.txt/.md/.html), 图片(.jpg/.png/.bmp等)")
 
-    def _auto_apply_edit(self):
-        """编辑面板参数变更 → 即时写回选中行。"""
-        # 文件加载期间不处理（避免 processEvents 递归触发）
-        if getattr(self, '_loading_files', False):
-            return
-        rows = self._table.selectionModel().selectedRows()
-        if not rows:
-            return
-        row = rows[0].row()
-
-        file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
-        ext = os.path.splitext(file_path)[1].lower()
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        is_image = ext in image_exts
-
-        self._table.item(row, self.COL_COPIES).setText(str(self._edit_copies.value()))
-        # 图片：双面和页码范围不适用
-        if is_image:
-            # 保持 "—" 不覆盖
-            pass
-        else:
-            if self._edit_duplex.currentIndex() == 0:
-                dm_text = "长边" if self._edit_duplex_mode.currentIndex() == 0 else "短边"
-                self._table.item(row, self.COL_DUPLEX).setText(f"双面({dm_text})")
-            else:
-                self._table.item(row, self.COL_DUPLEX).setText("单面")
-        # 双面模式仅双面时启用
-        is_duplex = self._edit_duplex.currentIndex() == 0
-        self._edit_duplex_mode.setEnabled(is_duplex and not is_image)
-        page_range = self._edit_page_range.get_ranges()
-        if is_image:
-            self._table.item(row, self.COL_RANGE).setText("—")
-        else:
-            self._table.item(row, self.COL_RANGE).setText(page_range if page_range else "全部")
-        # 引擎
-        eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
-        eng_labels = {"word": "Word", "wps": "WPS", "libreoffice": "LibreOffice"}
-        engine = eng_map.get(self._edit_engine.currentIndex(), "word")
-        self._table.item(row, self.COL_ENGINE).setText(eng_labels.get(engine, "Word"))
-        if row < len(self._config.jobs):
-            old_engine = self._config.jobs[row].engine
-            self._config.jobs[row].engine = engine
-            self._config.jobs[row].copies = self._edit_copies.value()
-            self._config.jobs[row].duplex = "on" if is_duplex else "off"
-            dm_map = {0: "long-edge", 1: "short-edge"}
-            self._config.jobs[row].duplex_mode = dm_map.get(self._edit_duplex_mode.currentIndex(), "long-edge")
-            # 页码范围（"全部" 对应空字符串）
-            pr = page_range if not is_image else ""
-            self._config.jobs[row].page_range = pr
-            # 渲染 DPI
-            dpi_values = [0, 200, 300, 400, 600]
-            idx = self._edit_dpi.currentIndex()
-            self._config.jobs[row].dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 0
-            # 引擎变更时重新转换 PDF
-            if engine != old_engine:
-                job = self._config.jobs[row]
-                ext = os.path.splitext(job.file_path)[1].lower()
-                if ext in (".doc", ".docx"):
-                    self._table.item(row, self.COL_PAGES).setText("...")
-                    self._start_convert_worker(row, job.file_path, job.engine)
-
-        self._recalc_row_cost(row)
-        self._update_total_cost()
-
     def _on_manage_locations(self):
         """打开地点管理对话框。"""
         dlg = LocationManagerDialog(self._config.delivery_percentages, self)
@@ -2560,97 +2627,6 @@ class MainWindow(QMainWindow):
         finally:
             self._loading_files = False
 
-    def __add_files_to_table_impl(self, files: list[str]):
-        """_add_files_to_table 的内部实现（由重入保护包装）。"""
-        allowed_types = {
-            ".pdf",
-            ".doc", ".docx",
-            ".txt", ".md", ".html", ".htm",
-            ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
-        }
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        start_row = self._table.rowCount()
-
-        blocked = 0
-        blocked_names: list[str] = []
-
-        for f in files:
-            ext = os.path.splitext(f)[1].lower()
-
-            if ext not in allowed_types:
-                blocked += 1
-                blocked_names.append(os.path.basename(f))
-                continue
-
-            page_count = 0
-            orientation = ""
-
-            if ext == ".pdf":
-                info = get_pdf_info(f)
-                page_count = info["page_count"]
-                orientation = info["orientation"]
-            elif ext == ".docx":
-                orientation = get_docx_orientation(f)
-            elif ext == ".doc":
-                # .doc 不支持 python-docx，方向在转 PDF 后获取
-                orientation = ""
-            elif ext in image_exts:
-                info = get_image_info(f)
-                page_count = info["page_count"]
-                orientation = info["orientation"]
-
-            # 根据元数据自动选择引擎；不可用时按 Word→WPS→LibreOffice 降级
-            engine = "word"
-            if ext in (".doc", ".docx"):
-                from converter import _read_docx_last_editor, get_available_engines
-                available = get_available_engines()
-                editor = _read_docx_last_editor(f) if ext == ".docx" else None
-                preferred = "wps" if editor == "wps" else "word"
-                fallback_order = ["word", "wps", "libreoffice"]
-                if preferred in fallback_order:
-                    fallback_order.remove(preferred)
-                    fallback_order.insert(0, preferred)
-                for eng in fallback_order:
-                    if available.get(eng, False):
-                        engine = eng
-                        break
-
-            # 图片强制单面，无页码/双面概念
-            is_image = ext in image_exts
-            duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
-            job_duplex = "off" if is_image else "on"
-            job = PrintJob(file_path=f, copies=1, duplex=job_duplex,
-                           duplex_mode=duplex_mode, page_range="",
-                           page_count=page_count, orientation=orientation, engine=engine)
-            self._config.jobs.append(job)
-            self._add_table_row(job)
-
-        self._log(f"已添加 {len(files)} 个文件")
-
-        # ── 转换为 PDF 并统计页数（Word 文件用指定引擎）──
-        for row in range(start_row, self._table.rowCount()):
-            file_path = self._table.item(row, self.COL_FILE).data(Qt.UserRole)
-            ext = os.path.splitext(file_path)[1].lower()
-            if ext == ".pdf":
-                continue
-
-            self._table.item(row, self.COL_PAGES).setText("...")
-
-            # 后台线程转换 PDF
-            job = self._config.jobs[row]
-            self._start_convert_worker(row, job.file_path, job.engine)
-
-        self._update_total_cost()
-
-        if blocked > 0:
-            names = "\n".join(f"  • {n}" for n in blocked_names[:5])
-            more = f"\n  ... 等共 {blocked} 个文件" if blocked > 5 else ""
-            QMessageBox.warning(
-                self, "不支持的文件类型",
-                f"以下 {blocked} 个文件格式不支持，"
-                f"请手动转换为 PDF 后添加：\n\n{names}{more}"
-            )
-
     def _on_shortcut_copy_total(self):
         """Ctrl+C：仅在非文本编辑状态下复制总价格。"""
         focused = QApplication.focusWidget()
@@ -2680,79 +2656,9 @@ class MainWindow(QMainWindow):
         if self._can_paste_files():
             self._on_paste_files()
 
-    def _on_remove_selected(self):
-        """移除表格中选中的行。"""
-        rows = self._table.selectionModel().selectedRows()
-        if not rows:
-            return
-        # 从后往前删避免索引偏移
-        for r in sorted(rows, key=lambda x: x.row(), reverse=True):
-            self._table.removeRow(r.row())
-        self._refresh_config_jobs_from_table()
-        self._update_total_cost()
-        self._log("已移除选中任务")
-
-    def _on_clear_list(self):
-        """清空任务列表（5秒内可撤回）。"""
-        # 如果是撤回模式，执行撤回
-        if self._clear_undo_timer.isActive():
-            self._on_undo_clear()
-            return
-
-        if not self._config.jobs:
-            return
-
-        # 终止正在进行的转换，避免回调更新已不存在的行
-        self._cancel_all_convert_workers()
-
-        # 备份并清空
-        self._cleared_jobs_backup = list(self._config.jobs)
-        self._table.setRowCount(0)
-        self._config.jobs.clear()
-        self._update_total_cost()
-        self._progress_bar.reset()
-        self._log("已清空任务列表（5秒内可撤回）")
-
-        # 按钮变为撤回样式（琥珀色醒目样式）
-        self._btn_clear.setText("↩ 撤回")
-        self._btn_clear.setStyleSheet(
-            "QPushButton {"
-            "  background-color: #e8960a;"
-            "  color: #fff;"
-            "  font-weight: bold;"
-            "  border: 2px solid #c47e08;"
-            "  border-radius: 4px;"
-            "  padding: 4px 14px;"
-            "}"
-            "QPushButton:hover {"
-            "  background-color: #f0a81e;"
-            "}"
-            "QPushButton:pressed {"
-            "  background-color: #c47e08;"
-            "}"
-        )
-
-        self._clear_undo_timer.start(5000)
-
-    def _on_undo_clear(self):
-        """撤回清空操作，恢复任务列表并重新转换。"""
-        self._clear_undo_timer.stop()
-        for row, job in enumerate(self._cleared_jobs_backup):
-            self._config.jobs.append(job)
-            self._add_table_row(job)
-            # 需要转换的文件重新启动后台转换
-            ext = os.path.splitext(job.file_path)[1].lower()
-            if ext != ".pdf":
-                self._table.item(row, self.COL_PAGES).setText("...")
-                self._start_convert_worker(row, job.file_path, job.engine)
-        self._cleared_jobs_backup.clear()
-        self._update_total_cost()
-        self._log("已撤回清空操作")
-        self._restore_clear_button()
-
     def _on_undo_expired(self):
-        """撤回超时，清除备份。"""
-        self._cleared_jobs_backup.clear()
+        """撤回超时，清除当前标签页的备份。"""
+        self._cleared_jobs_backup.pop(self._current_tab, None)
         self._restore_clear_button()
 
     def _restore_clear_button(self):
@@ -2764,54 +2670,47 @@ class MainWindow(QMainWindow):
         self._btn_clear.style().polish(self._btn_clear)
 
     def _cancel_undo_if_active(self):
-        """新增任务时取消撤回状态。"""
+        """新增任务时取消撤回状态，丢弃备份。"""
         if self._clear_undo_timer.isActive():
             self._clear_undo_timer.stop()
-            self._cleared_jobs_backup.clear()
-            self._restore_clear_button()
+        self._cleared_jobs_backup.pop(self._current_tab, None)
+        self._restore_clear_button()
 
-    def _on_start_print(self):
-        """开始打印。"""
-        self._refresh_config_jobs_from_table()
+    def _on_progress(self, current: int, total: int, status: str):
+        """更新进度条。"""
+        self._progress_bar.setMaximum(total)
+        self._progress_bar.setValue(current)
+        self._status_label.setText(status)
+
+    def _on_job_finished(self, idx: int, success: bool, message: str):
+        """单个任务完成回调：上报云端（新 UI 无表格行操作）。"""
+        flat_jobs = getattr(self, '_flat_jobs', [])
+        if 0 <= idx < len(flat_jobs):
+            job = flat_jobs[idx]
+            task_id = getattr(job, 'task_id', 0)
+            if task_id and self._cloud_client:
+                if success:
+                    self._cloud_client.report_success(task_id)
+                else:
+                    self._cloud_client.report_fail(task_id, message)
+
+    def _start_print_worker(self, flat_jobs: list):
+        """用给定的任务列表启动打印 Worker。"""
+        self._flat_jobs = flat_jobs
         self._sync_ui_to_config()
 
-        if not self._config.jobs:
-            QMessageBox.warning(self, "提示", "请先添加要打印的文件。")
-            return
-
-        # 打印开始 — 所有行变绿
-        fg = QColor("#6b9e6b")
-        for row in range(self._table.rowCount()):
-            for col in range(self._table.columnCount()):
-                item = self._table.item(row, col)
-                if item:
-                    item.setForeground(fg)
-        self._table.viewport().update()
-
-        # 检查页码范围有效性
-        if hasattr(self._edit_page_range, 'is_valid') and not self._edit_page_range.is_valid():
-            QMessageBox.warning(self, "页码范围错误",
-                                "当前存在无效的页码范围设置，请修正后再打印。\n"
-                                "可能原因：格式错误、范围重叠、页码超出文件总页数。")
-            return
-
-        # 生成订单号
         from datetime import datetime
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         order_number, next_num = generate_order_number(self._config.last_order_number)
         self._config.last_order_number = next_num
-
-        # 自动保存配置
         try:
             self._config.save(self._config_path)
         except Exception as e:
             logger.warning(f"保存配置失败: {e}")
 
-        # 禁用按钮，防止重复点击
         self._btn_start.setEnabled(False)
         self._progress_bar.setValue(0)
 
-        # 构建首页配置
         cover_page_config = {
             "simplex_price": self._config.simplex_price,
             "duplex_price": self._config.duplex_price,
@@ -2827,7 +2726,7 @@ class MainWindow(QMainWindow):
         }
 
         worker = PrintWorker(
-            jobs=list(self._config.jobs),
+            jobs=flat_jobs,
             printer_name=self._config.printer_name,
             duplex_mode=self._config.duplex_mode,
             keep_temp_pdf=self._config.keep_temp_pdf,
@@ -2841,34 +2740,6 @@ class MainWindow(QMainWindow):
         worker.all_finished.connect(self._on_all_finished)
         self._worker = worker
         worker.start()
-
-    def _on_progress(self, current: int, total: int, status: str):
-        """更新进度条。"""
-        self._progress_bar.setMaximum(total)
-        self._progress_bar.setValue(current)
-        self._status_label.setText(status)
-
-    def _on_job_finished(self, idx: int, success: bool, message: str):
-        """单个任务完成回调：恢复行颜色 + 上报云端。"""
-        # 恢复该行的正常颜色
-        if 0 <= idx < self._table.rowCount():
-            for col in range(self._table.columnCount()):
-                item = self._table.item(idx, col)
-                if item:
-                    item.setBackground(QColor(255, 255, 255, 0))
-
-        # 如果是云端任务，上报结果
-        if 0 <= idx < len(self._config.jobs):
-            job = self._config.jobs[idx]
-            file_path = job.file_path
-            task_id = self._cloud_origin_files.get(file_path)
-            if task_id is not None and self._cloud_client:
-                if success:
-                    self._cloud_client.report_success(task_id)
-                else:
-                    self._cloud_client.report_fail(task_id, message)
-                # 清理映射
-                del self._cloud_origin_files[file_path]
 
     def _on_all_finished(self, success_count: int, fail_count: int):
         """全部任务完成。"""
@@ -2996,19 +2867,29 @@ class MainWindow(QMainWindow):
     # ---- 云端任务处理 ----
 
     def _on_cloud_task_received(self, task: CloudTask):
-        """收到新的云端打印任务。"""
+        """收到新的云端打印任务 → 任务就绪时弹窗（已处理过的跳过）。"""
+        if task.task_id in self._processed_cloud_tasks:
+            return  # 已处理过，跳过（防 SocketIO + HTTP 双通道重复）
         self._cloud_tasks[task.task_id] = task
-        self._rebuild_cloud_tasks_panel()
-        self._log(f"☁ 新任务 #{task.task_id}: {task.file_name}")
+        self._log(f"☁ 收到云端任务 #{task.task_id}: {task.file_name}")
+        if task.status == "ready":
+            self._show_cloud_task_dialog(task)
 
     def _on_cloud_task_updated(self, task: CloudTask):
-        """云端任务状态更新（下载进度等）。"""
+        """云端任务状态更新 → 就绪时弹窗显示，出错时通知服务器标记失败。"""
+        if task.status == "ready" and task.task_id in self._processed_cloud_tasks:
+            return  # 已弹窗处理过
         self._cloud_tasks[task.task_id] = task
         if task.status == "error":
-            self._log(f"☁ 任务 #{task.task_id} 出错: {task.error_message}")
+            self._processed_cloud_tasks.add(task.task_id)
+            self._log(f"☁ 云端任务 #{task.task_id} 出错: {task.error_message}")
+            if self._cloud_client:
+                self._cloud_client.report_fail(task.task_id, f"下载失败: {task.error_message}")
+                self._cloud_client.reject_task(task.task_id)
+            self._cloud_tasks.pop(task.task_id, None)
         elif task.status == "ready":
-            self._log(f"☁ 任务 #{task.task_id} 下载完成，可加入打印列表")
-        self._rebuild_cloud_tasks_panel()
+            self._log(f"☁ 云端任务 #{task.task_id} 下载完成")
+            self._show_cloud_task_dialog(task)
 
     def _on_cloud_connection_changed(self, connected: bool):
         """云端连接状态改变。"""
@@ -3024,197 +2905,31 @@ class MainWindow(QMainWindow):
             self._cloud_client.pull_pending()
             self._log("☁ 已手动请求拉取云端排队任务")
 
-    def _on_toggle_cloud_panel(self, checked: bool):
-        """折叠/展开云端任务面板。"""
-        self._cloud_tasks_container.setVisible(checked)
-        if checked:
-            self._cloud_panel_toggle.setText(
-                f"☁ 云端待处理 ({len(self._cloud_tasks)})"
-            )
-        else:
-            self._cloud_panel_toggle.setText("☁ 云端待处理 ▸")
-
-    def _rebuild_cloud_tasks_panel(self):
-        """重建云端任务面板的卡片列表。"""
-        # 清空现有卡片
-        for w in self._cloud_task_widgets.values():
-            w.deleteLater()
-        self._cloud_task_widgets.clear()
-
-        # 移除空状态标签
-        self._cloud_empty_label.setVisible(False)
-
-        # 重建每张任务卡片
-        pending_tasks = [
-            t for t in self._cloud_tasks.values()
-            if t.status not in ("accepted", "rejected")
-        ]
-
-        if not pending_tasks:
-            self._cloud_empty_label.setVisible(True)
-            self._cloud_panel_toggle.setText("☁ 云端待处理 (0)")
-            self._cloud_badge.setText("")
-            return
-
-        self._cloud_panel_toggle.setText(f"☁ 云端待处理 ({len(pending_tasks)})")
-
-        for task in pending_tasks:
-            card = self._build_cloud_task_card(task)
-            # 在 stretch 之前插入
-            self._cloud_tasks_layout.insertWidget(
-                self._cloud_tasks_layout.count() - 1, card
-            )
-            self._cloud_task_widgets[task.task_id] = card
-
-    def _build_cloud_task_card(self, task: CloudTask) -> QWidget:
-        """为单个云端任务构建 UI 卡片。"""
-        card = QWidget()
-        card.setObjectName("cloudTaskCard")
-        outer = QVBoxLayout(card)
-        outer.setContentsMargins(8, 6, 8, 6)
-        outer.setSpacing(2)
-
-        # 第一行：文件名 + 状态
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
-
-        file_label = QLabel(f"📎 {task.file_name}")
-        file_label.setObjectName("cloudTaskFileName")
-        file_label.setWordWrap(False)
-        file_label.setMinimumWidth(200)
-        row1.addWidget(file_label, 1)
-
-        status_text = {
-            "pending": "⏳ 等待下载",
-            "downloading": f"⬇ {task.download_progress}%",
-            "ready": "✅ 就绪",
-            "error": f"❌ {task.error_message[:20]}",
-        }.get(task.status, task.status)
-        status_label = QLabel(status_text)
-        status_label.setObjectName(f"cloudTaskStatus_{task.status}")
-        row1.addWidget(status_label)
-
-        outer.addLayout(row1)
-
-        # 第二行：参数 + 操作按钮
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-
-        params = []
-        params.append(f"📋 {task.copies}份")
-        params.append(f"{'🔄 双面' if task.duplex == 'on' else '📄 单面'}")
-        if task.page_range:
-            params.append(f"🔢 {task.page_range}")
-        if task.created_at:
-            params.append(f"🕐 {task.created_at}")
-
-        params_label = QLabel(" · ".join(params))
-        params_label.setObjectName("cloudTaskParams")
-        row2.addWidget(params_label, 1)
-
-        # 操作按钮
-        if task.status == "ready":
-            btn_accept = QPushButton("📥 加入打印列表")
-            btn_accept.setObjectName("cloudAcceptBtn")
-            btn_accept.setFixedWidth(130)
-            btn_accept.clicked.connect(
-                lambda checked=False, tid=task.task_id: self._on_cloud_accept(tid)
-            )
-            row2.addWidget(btn_accept)
-
-        elif task.status == "error":
-            btn_retry = QPushButton("🔄 重试")
-            btn_retry.setObjectName("cloudRetryBtn")
-            btn_retry.setFixedWidth(70)
-            btn_retry.clicked.connect(
-                lambda checked=False, tid=task.task_id: self._on_cloud_retry(tid)
-            )
-            row2.addWidget(btn_retry)
-
-        btn_reject = QPushButton("✕")
-        btn_reject.setObjectName("cloudRejectBtn")
-        btn_reject.setFixedSize(28, 28)
-        btn_reject.setToolTip("移除此任务")
-        btn_reject.clicked.connect(
-            lambda checked=False, tid=task.task_id: self._on_cloud_reject(tid)
-        )
-        row2.addWidget(btn_reject)
-
-        outer.addLayout(row2)
-        return card
-
-    def _on_cloud_accept(self, task_id: int):
-        """接受云端任务：下载完成后加入本地打印列表。"""
-        task = self._cloud_tasks.get(task_id)
-        if not task or task.status != "ready":
-            return
-        if not task.local_path or not os.path.exists(task.local_path):
-            self._log(f"☁ 任务 #{task_id} 文件不存在，请重试")
-            return
-
-        # 记录云来源映射（用于打印后上报）
-        self._cloud_origin_files[task.local_path] = task_id
-
-        # 加入本地打印列表（会按默认参数创建 PrintJob）
-        self._add_files_to_table([task.local_path])
-
-        # 将云端参数应用到刚刚加入的任务（最后一行）
-        if self._table.rowCount() > 0:
-            last_row = self._table.rowCount() - 1
-            job = self._config.jobs[last_row]
-
-            # 应用云端的份数、双面、页码范围
-            if task.copies > 0:
-                job.copies = task.copies
-            job.duplex = task.duplex if task.duplex in ("on", "off") else "on"
-            if task.page_range:
-                job.page_range = task.page_range
-
-            # 刷新表格行显示：份数、双面、页码范围
-            copies_item = self._table.item(last_row, self.COL_COPIES)
-            if copies_item:
-                copies_item.setText(str(job.copies))
-            duplex_item = self._table.item(last_row, self.COL_DUPLEX)
-            if duplex_item:
-                dm_label = job.duplex_mode or ""
-                if job.duplex == "on":
-                    display = "双面(长边)" if dm_label in ("long-edge", "") else f"双面({dm_label})"
-                else:
-                    display = "单面"
-                duplex_item.setText(display)
-            range_item = self._table.item(last_row, self.COL_RANGE)
-            if range_item:
-                range_item.setText(job.page_range if job.page_range.strip() else "全部")
-            self._recalc_row_cost(last_row)
-
-        # 从云端列表移除
-        task = self._cloud_client.accept_and_add_to_local(task_id)
-        if task:
-            self._cloud_tasks.pop(task_id, None)
-        self._rebuild_cloud_tasks_panel()
-
-        self._log(f"☁ 任务 #{task_id} 已加入本地打印列表")
-
-    def _on_cloud_reject(self, task_id: int):
-        """拒绝/移除云端任务。"""
-        if self._cloud_client:
-            self._cloud_client.reject_task(task_id)
-        self._cloud_tasks.pop(task_id, None)
-        self._rebuild_cloud_tasks_panel()
-        self._log(f"☁ 任务 #{task_id} 已移除")
-
-    def _on_cloud_retry(self, task_id: int):
-        """重试失败的云端任务下载。"""
-        if self._cloud_client:
-            self._cloud_client.accept_task(task_id)
-            self._log(f"☁ 重试下载任务 #{task_id}")
-
     # ---- 关闭事件 ----
 
     def closeEvent(self, event):
-        """关闭窗口时自动保存配置并断开云端。"""
+        """关闭窗口时检查未完成任务，确认后保存并退出。"""
+        # 检查所有标签页是否有未完成的文件
+        total_files = 0
+        for key, jobs in self._config.tabs.items():
+            total_files += len(jobs)
+
+        if total_files > 0:
+            reply = QMessageBox.question(
+                self, "存在未完成的任务",
+                f"当前共有 {total_files} 个文件分布在 {len(self._config.tabs)} 个标签页中尚未打印。\n\n"
+                "退出将清空全部标签页，确定退出吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+            # 用户确认退出 → 清空全部标签页
+            self._config.tabs = {"1": []}
+            self._config.active_tab = "1"
+            self._current_tab = "1"
+
         try:
-            self._refresh_config_jobs_from_table()
             self._sync_ui_to_config()
             self._config.save(self._config_path)
             self._log(f"配置已自动保存至: {self._config_path}")
@@ -3226,3 +2941,368 @@ class MainWindow(QMainWindow):
             self._cloud_client.stop()
 
         super().closeEvent(event)
+
+
+    # ──────── 复制详情 ────────
+
+    def _on_copy_detail(self):
+        """复制当前标签页的计费明细到剪贴板。"""
+        jobs = self._get_current_jobs()
+        if not jobs:
+            return
+        lines = ["计费明细", "-" * 14]
+        for i, job in enumerate(jobs, 1):
+            cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
+                                       self._config.simplex_price, self._config.duplex_price,
+                                       job.page_range)
+            lines.append(f"{i}. {os.path.basename(job.file_path)}")
+            lines.append(f"   {job.copies}x {'双面' if job.duplex=='on' else '单面'} 范围:{job.page_range or '全部'}")
+            if cost > 0:
+                lines.append(f"   {formula} = ¥{cost:.2f}")
+        total = sum(calc_cost(j.page_count, j.copies, j.duplex,
+                              self._config.simplex_price, self._config.duplex_price,
+                              j.page_range)[0] for j in jobs)
+        lines.append(f"合计: ¥{total:.2f}")
+        QApplication.clipboard().setText("\n".join(lines))
+
+    # ──────── 转换完成回调 ────────
+
+    def _on_convert_finished(self, row: int, cached_pdf: str, page_count: int, orientation: str):
+        """后台 PDF 转换完成 → 更新表格、缓存。"""
+        if row >= self._table.rowCount():
+            return
+        if not cached_pdf:
+            if row < self._table.rowCount():
+                self._table.item(row, self.COL_PAGES).setText("?")
+            return
+
+        jobs = self._get_current_jobs()
+        if row < len(jobs):
+            old_pdf = jobs[row].cached_pdf
+            if old_pdf and os.path.isfile(old_pdf) and old_pdf != cached_pdf:
+                try:
+                    os.remove(old_pdf)
+                except OSError:
+                    pass
+            jobs[row].cached_pdf = cached_pdf
+            jobs[row].page_count = page_count
+            jobs[row].orientation = orientation
+            self._set_current_jobs(jobs)
+
+        if row < self._table.rowCount():
+            self._table.item(row, self.COL_PAGES).setText(str(page_count))
+            ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+            ori_text = ori_map.get(orientation, "")
+            self._table.item(row, self.COL_ORIENT).setText(ori_text)
+        self._recalc_row_cost(row)
+        self._update_total_cost()
+
+        # 转换完成后存入 MD5 缓存（供后续同文件复用，避免重复转换）
+        if cached_pdf and os.path.isfile(cached_pdf) and row < len(jobs):
+            job = jobs[row]
+            # 如果没有 source_md5，从源文件计算
+            if not job.source_md5 and job.file_path and os.path.isfile(job.file_path):
+                try:
+                    job.source_md5 = self._cloud_client._compute_md5_file(job.file_path) if self._cloud_client else ""
+                except Exception:
+                    pass
+            # 存入缓存
+            if job.source_md5 and self._cloud_client:
+                try:
+                    self._cloud_client._save_pdf_to_cache(
+                        job.source_md5, cached_pdf,
+                        job.display_name or os.path.basename(job.file_path),
+                        os.path.splitext(job.file_path)[1].lower(),
+                        page_count,
+                    )
+                    self._set_current_jobs(jobs)  # 保存 source_md5 到配置
+                except Exception as e:
+                    self._log(f"  → MD5 缓存保存失败: {e}")
+
+        # 转换完成后立刻保存副本到桌面
+        if self._config.keep_temp_pdf and cached_pdf and os.path.isfile(cached_pdf):
+            file_path = jobs[row].file_path if row < len(jobs) else ""
+            original_base = os.path.splitext(os.path.basename(file_path))[0] if file_path else "document"
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            dest_name = f"[转换]{original_base}.pdf"
+            dest_path = os.path.join(desktop, dest_name)
+            try:
+                shutil.copy2(cached_pdf, dest_path)
+                self._log(f"  → 转换副本已保存到桌面: {dest_name}")
+            except OSError as e:
+                self._log(f"  → 保存转换副本到桌面失败: {e}")
+
+    # ──────── 云端任务弹窗 ────────
+
+    def _show_cloud_task_dialog(self, task: CloudTask):
+        """弹窗显示云端任务详情，提供"添加到新标签页"按钮。"""
+        # 防重复：已处理过的任务不再弹窗
+        if task.task_id in self._processed_cloud_tasks:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"☁ 云端订单 — {task.order_number or ('#' + str(task.order_id))}")
+        dlg.setMinimumWidth(420)
+        dlg.setModal(True)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+        layout.setContentsMargins(16, 14, 16, 14)
+
+        title = QLabel("<b>📦 收到云端打印订单</b>")
+        layout.addWidget(title)
+
+        info_text = (
+            f"<b>订单号:</b> {task.order_number or ('#' + str(task.order_id))}<br>"
+            f"<b>文件名:</b> {task.file_name}<br>"
+            f"<b>份数:</b> {task.copies} 份 &nbsp;|&nbsp; "
+            f"<b>模式:</b> {'双面' if task.duplex == 'on' else '单面'}"
+        )
+        if task.page_range:
+            info_text += f"<br><b>页码范围:</b> {task.page_range}"
+        if task.created_at:
+            info_text += f"<br><b>时间:</b> {task.created_at}"
+        info_label = QLabel(info_text)
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        layout.addSpacing(8)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        reject_btn = QPushButton("✕ 忽略")
+        reject_btn.setObjectName("cloudRejectBtn")
+        def _reject():
+            self._processed_cloud_tasks.add(task.task_id)
+            if self._cloud_client:
+                self._cloud_client.reject_task(task.task_id)
+            self._cloud_tasks.pop(task.task_id, None)
+            dlg.reject()
+        reject_btn.clicked.connect(_reject)
+        btn_row.addWidget(reject_btn)
+
+        accept_btn = QPushButton("📥 添加到新标签页")
+        accept_btn.setObjectName("cloudAcceptBtn")
+        def _accept():
+            self._processed_cloud_tasks.add(task.task_id)
+            self._add_cloud_task_to_new_tab(task)
+            dlg.accept()
+        accept_btn.clicked.connect(_accept)
+        btn_row.addWidget(accept_btn)
+
+        layout.addLayout(btn_row)
+        dlg.exec()
+
+    def _add_cloud_task_to_new_tab(self, task: CloudTask):
+        """将云端任务添加到新的标签页并切换过去。会检查 PDF 缓存避免重复转换。"""
+        tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+        new_key = str(int(tab_keys[-1]) + 1) if tab_keys else "1"
+        self._config.tabs[new_key] = []
+
+        ext = os.path.splitext(task.local_path)[1].lower() if task.local_path else ""
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        source_md5 = getattr(task, 'source_md5', '') or ''
+
+        # 计算 MD5（如果 task 里没有）
+        if not source_md5 and task.local_path and os.path.isfile(task.local_path):
+            try:
+                source_md5 = self._cloud_client._compute_md5_file(task.local_path) if self._cloud_client else ""
+            except Exception:
+                source_md5 = ""
+
+        page_count = 0; orientation = ""; cached_pdf = ""
+        need_convert = False
+
+        # 1. 检查 PDF 缓存（MD5 索引）
+        if source_md5 and self._cloud_client:
+            cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(source_md5)
+            if cached_pdf and cached_meta:
+                page_count = cached_meta.get("page_count", 0)
+                orientation = ""  # 缓存里可能没有 orientation，从 PDF 读取
+                if page_count > 0:
+                    from pdf_printer import get_pdf_info as _gpi
+                    _info = _gpi(cached_pdf)
+                    page_count = _info.get("page_count", page_count)
+                    orientation = _info.get("orientation", "")
+                self._log(f"📦 缓存命中: {task.file_name} → {page_count} 页 (MD5={source_md5[:8]}...)")
+                cached_pdf = cached_pdf  # 直接使用缓存的 PDF
+
+        # 2. 未命中缓存 → 从本地文件获取信息
+        if page_count <= 0 and task.local_path and os.path.isfile(task.local_path):
+            if ext == ".pdf":
+                info = get_pdf_info(task.local_path); page_count = info["page_count"]; orientation = info["orientation"]
+            elif ext in image_exts:
+                info = get_image_info(task.local_path); page_count = info["page_count"]; orientation = info["orientation"]
+            elif ext == ".docx":
+                orientation = get_docx_orientation(task.local_path)
+
+        engine = "word"
+        if ext in (".doc", ".docx") and task.local_path:
+            from converter import _read_docx_last_editor, get_available_engines
+            available = get_available_engines()
+            editor = _read_docx_last_editor(task.local_path) if ext == ".docx" else None
+            preferred = "wps" if editor == "wps" else "word"
+            for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
+                if available.get(eng, False): engine = eng; break
+
+        is_image = ext in image_exts
+        duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
+
+        job = PrintJob(
+            file_path=task.local_path or "",
+            copies=task.copies if task.copies > 0 else 1,
+            duplex="off" if is_image else (task.duplex or "on"),
+            duplex_mode=duplex_mode,
+            page_range=task.page_range or "",
+            page_count=page_count,
+            orientation=orientation,
+            engine=engine,
+            task_id=task.task_id,
+            source_md5=source_md5,
+            display_name=task.file_name,  # 使用后端返回的原始文件名
+            cached_pdf=cached_pdf,        # 使用缓存的 PDF（如有）
+        )
+        self._config.tabs[new_key].append(job)
+
+        self._current_tab = new_key
+        self._config.active_tab = new_key
+        self._save_config()
+        self._rebuild_table()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+
+        # Word 文件：缓存未命中时才启动转换
+        if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
+            self._start_convert_worker(0, task.local_path, engine)
+
+        self._log(f"☁ 云端任务 #{task.task_id} 已添加到标签页 {new_key}")
+        if self._cloud_client:
+            self._cloud_client.accept_task(task.task_id)
+
+    # ──────── 清空 / 撤回 / 移除 / 打印 ────────
+
+    def _on_clear_list(self):
+        """清空当前标签页 / 撤回清空（按钮双功能）。"""
+        # 如果已经在撤回模式，则执行撤回
+        if self._clear_undo_timer.isActive():
+            self._on_undo_clear()
+            return
+
+        jobs = self._get_current_jobs()
+        if not jobs:
+            return
+        self._cancel_all_convert_workers()
+        self._cleared_jobs_backup[self._current_tab] = list(jobs)
+        self._set_current_jobs([])
+        self._rebuild_table()
+        self._update_total_cost()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+        self._btn_clear.setText("↩ 撤回清空")
+        self._btn_clear.setObjectName("btnUndo")
+        self._btn_clear.style().unpolish(self._btn_clear)
+        self._btn_clear.style().polish(self._btn_clear)
+        self._clear_undo_timer.start(5000)
+        self._log(f"已清空标签页 {self._current_tab}（5秒内可撤回）")
+
+    def _on_undo_clear(self):
+        """撤回清空操作（按钮点击）。"""
+        # 先取备份，再取消定时器（cancel 也会 pop，所以先取）
+        backup = self._cleared_jobs_backup.pop(self._current_tab, None)
+        self._cancel_undo_if_active()
+        if backup:
+            self._set_current_jobs(backup)
+            self._rebuild_table()
+            self._update_total_cost()
+            self._refresh_tab_display()
+            self._log(f"已撤回标签页 {self._current_tab} 的清空操作")
+        else:
+            self._log("没有可撤回的清空操作")
+
+    def _on_remove_selected(self):
+        """移除表格中选中的行。"""
+        rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()), reverse=True)
+        if not rows:
+            return
+        jobs = self._get_current_jobs()
+        for row in rows:
+            if row < len(jobs):
+                self._cancel_undo_if_active()
+                del jobs[row]
+        self._set_current_jobs(jobs)
+        self._rebuild_table()
+        self._update_total_cost()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+
+    def _on_start_print(self):
+        """开始打印当前标签页的所有文件。"""
+        jobs = self._get_current_jobs()
+        if not jobs:
+            self._log("当前标签页没有文件可以打印")
+            return
+        self._start_print_worker(list(jobs))
+
+    def _refresh_config_jobs_from_table(self):
+        """从表格同步任务列表到配置（已通过实时保存自动处理）。"""
+        pass
+
+    # ──────── 添加文件核心实现 ────────
+
+    def __add_files_to_table_impl(self, files, target_order_key=None):
+        """添加文件到当前标签页的核心逻辑。"""
+        allowed_types = {
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+            ".txt", ".md", ".html", ".htm",
+            ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
+        }
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+        self._cancel_undo_if_active()
+        jobs = self._get_current_jobs()
+        rows_before = len(jobs)
+        existing_paths = {j.file_path for j in jobs}
+
+        for f in files:
+            # 跳过已存在的文件
+            if f in existing_paths:
+                continue
+            ext = os.path.splitext(f)[1].lower()
+            if ext not in allowed_types:
+                continue
+            existing_paths.add(f)
+            page_count = 0; orientation = ""
+            if ext == ".pdf":
+                info = get_pdf_info(f); page_count = info["page_count"]; orientation = info["orientation"]
+            elif ext == ".docx":
+                orientation = get_docx_orientation(f)
+            elif ext in image_exts:
+                info = get_image_info(f); page_count = info["page_count"]; orientation = info["orientation"]
+            engine = "word"
+            if ext in (".doc", ".docx"):
+                from converter import _read_docx_last_editor, get_available_engines
+                available = get_available_engines()
+                editor = _read_docx_last_editor(f) if ext == ".docx" else None
+                preferred = "wps" if editor == "wps" else "word"
+                for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
+                    if available.get(eng, False): engine = eng; break
+            is_image = ext in image_exts
+            duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
+
+            job = PrintJob(
+                file_path=f, copies=1,
+                duplex="off" if is_image else "on",
+                duplex_mode=duplex_mode,
+                page_count=page_count, orientation=orientation, engine=engine,
+            )
+            jobs.append(job)
+
+        if len(jobs) > rows_before:
+            self._set_current_jobs(jobs)
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._log(f"标签页 {self._current_tab}: 已添加 {len(jobs) - rows_before} 个文件")
+            for i, job in enumerate(jobs):
+                ext = os.path.splitext(job.file_path)[1].lower()
+                if ext in (".doc", ".docx"):
+                    self._start_convert_worker(i, job.file_path, job.engine)

@@ -73,7 +73,8 @@ def get_file_md5(file_path):
 
 
 def load_md5_index():
-    """加载 MD5 索引文件，不存在则返回空字典"""
+    """加载 MD5 索引文件，不存在则返回空字典。
+    兼容两种格式：旧 {md5: rel_path} 和 新 {md5: {path, original_name, page_count, page_count_verified}}"""
     if not os.path.exists(MD5_INDEX_FILE):
         return {}
     try:
@@ -90,15 +91,61 @@ def save_md5_index(index):
         json.dump(index, f, ensure_ascii=False, indent=2)
 
 
+def _md5_entry_get(index, md5):
+    """读取 MD5 条目，兼容旧格式 {md5: rel_path}"""
+    val = index.get(md5)
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return {"path": val, "original_name": "", "page_count": 0, "page_count_verified": False}
+    return val
+
+
+def _md5_entry_set(index, md5, path=None, original_name=None, page_count=None, page_count_verified=None):
+    """写入/更新 MD5 条目，自动升级旧格式。返回更新后的 index。"""
+    existing = index.get(md5)
+    if isinstance(existing, str):
+        existing = {"path": existing, "original_name": "", "page_count": 0, "page_count_verified": False}
+    elif existing is None:
+        existing = {}
+    if path is not None:
+        existing["path"] = path
+    if original_name is not None:
+        existing["original_name"] = original_name
+    if page_count is not None:
+        existing["page_count"] = page_count
+    if page_count_verified is not None:
+        existing["page_count_verified"] = page_count_verified
+    index[md5] = existing
+    return index
+
+
+def _md5_entry_has_verified_count(index, md5):
+    """检查某 MD5 是否有已验证的页数"""
+    entry = _md5_entry_get(index, md5)
+    if not entry:
+        return False
+    return entry.get("page_count", 0) > 0 and entry.get("page_count_verified", False)
+
+
 def build_md5_index():
     """扫描 uploads/ 目录下所有文件，构建 MD5 索引。已有索引则跳过全量重建但会补全缺失条目。"""
     os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+    # 提取所有已索引的相对路径（兼容新旧格式）
+    def _indexed_paths(idx):
+        paths = set()
+        for v in idx.values():
+            if isinstance(v, str):
+                paths.add(v)
+            elif isinstance(v, dict) and v.get("path"):
+                paths.add(v["path"])
+        return paths
+
     existing = load_md5_index()
     if existing:
-        # 已有索引：仅补充磁盘上有但索引中没有的文件
+        indexed = _indexed_paths(existing)
         for root, dirs, files in os.walk(UPLOAD_DIR):
-            # 跳过 avatars 子目录
             if os.path.basename(root) == "avatars":
                 continue
             for fname in files:
@@ -106,12 +153,16 @@ def build_md5_index():
                     continue
                 fpath = os.path.join(root, fname)
                 rel = os.path.relpath(fpath, UPLOAD_DIR)
-                # 检查该路径是否已在索引值中
-                if rel not in existing.values():
+                if rel not in indexed:
                     try:
                         md5 = get_file_md5(fpath)
                         if md5 not in existing:
-                            existing[md5] = rel
+                            # 新格式：存储字典
+                            ext = os.path.splitext(fname)[1].lower().lstrip(".")
+                            existing[md5] = {
+                                "path": rel, "original_name": fname,
+                                "page_count": 0, "page_count_verified": False,
+                            }
                             print(f"  [MD5] 补充索引: {md5[:8]}... → {rel}")
                     except Exception as e:
                         print(f"  [MD5] 扫描文件失败 {fpath}: {e}")
@@ -119,7 +170,7 @@ def build_md5_index():
         print(f"  [MD5] 索引已更新，共 {len(existing)} 条记录")
         return
 
-    # 首次构建：全量扫描
+    # 首次构建：全量扫描，使用新格式
     print("  [MD5] 首次构建 MD5 索引...")
     index = {}
     for root, dirs, files in os.walk(UPLOAD_DIR):
@@ -132,9 +183,13 @@ def build_md5_index():
             rel = os.path.relpath(fpath, UPLOAD_DIR)
             try:
                 md5 = get_file_md5(fpath)
+                ext = os.path.splitext(fname)[1].lower().lstrip(".")
                 if md5 in index:
-                    print(f"  [MD5] 重复文件: {fpath} (已有 {index[md5]})")
-                index[md5] = rel
+                    print(f"  [MD5] 重复文件: {fpath}")
+                index[md5] = {
+                    "path": rel, "original_name": fname,
+                    "page_count": 0, "page_count_verified": False,
+                }
             except Exception as e:
                 print(f"  [MD5] 扫描文件失败 {fpath}: {e}")
     save_md5_index(index)
@@ -201,10 +256,14 @@ def cleanup_expired_files():
                 print(f"  [CLEANUP] 删除文件失败 {file_path}: {e}")
                 continue
 
-        # 从 MD5 索引中移除
+        # 从 MD5 索引中移除（兼容新旧格式）
         rel_path = os.path.relpath(file_path, UPLOAD_DIR) if file_path else None
         if rel_path:
-            keys_to_remove = [k for k, v in md5_index.items() if v == rel_path]
+            keys_to_remove = [
+                k for k, v in md5_index.items()
+                if (isinstance(v, str) and v == rel_path) or
+                   (isinstance(v, dict) and v.get("path") == rel_path)
+            ]
             for k in keys_to_remove:
                 del md5_index[k]
 
@@ -358,13 +417,50 @@ def download_file(file_id):
 # ==================== 文件页数分析（统计基础）====================
 
 
+def _count_pages_via_libreoffice(file_path: str, ext: str) -> int:
+    """通过 LibreOffice 将文档转为临时 PDF，再用 pypdf 统计页数。
+    成功返回页数（≥1），失败返回 0 表示未知。"""
+    import subprocess
+    import tempfile
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = subprocess.run(
+                ["soffice", "--headless", "--convert-to", "pdf", "--outdir", tmpdir, file_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode != 0:
+                stderr_tail = (result.stderr or "").strip()[-200:]
+                print(f"  [WARN] LibreOffice 转换失败 (rc={result.returncode}): {stderr_tail}")
+                return 0
+            # LibreOffice 输出的 PDF 文件名 = 原始 basename 改扩展名 .pdf
+            base = os.path.splitext(os.path.basename(file_path))[0]
+            for fname in os.listdir(tmpdir):
+                if fname.lower().endswith(".pdf"):
+                    pdf_path = os.path.join(tmpdir, fname)
+                    from pypdf import PdfReader
+                    reader = PdfReader(pdf_path)
+                    page_count = len(reader.pages)
+                    print(f"  [PAGE] {ext.upper()} {os.path.basename(file_path)}: {page_count} 页 (via LibreOffice)")
+                    return max(page_count, 1)
+            print(f"  [WARN] LibreOffice 未生成预期 PDF（base={base}），目录内容: {os.listdir(tmpdir)}")
+            return 0
+    except FileNotFoundError:
+        print(f"  [WARN] LibreOffice (soffice) 未安装，.{ext} 文件页数无法获取")
+    except subprocess.TimeoutExpired:
+        print(f"  [WARN] LibreOffice 转换超时 (15s)，.{ext} 文件页数未知")
+    except Exception as e:
+        print(f"  [WARN] LibreOffice 转换异常 ({e})，.{ext} 文件页数未知")
+    return 0
+
+
 def get_file_page_count(file_path, file_type=None):
     """
     根据文件路径计算页数：
     - PDF: 使用 pypdf 读取实际页数
+    - DOC/DOCX: 通过 LibreOffice 转换为 PDF 后统计页数（不可用时返回 0）
     - 图片 (png/jpg/jpeg/gif/bmp/webp): 按 1 页计算
     - 其他: 默认返回 1 页
-    file_path 为 None 时（文件不存在于磁盘），仅根据 file_type 判断
+    file_path 为 None 时（文件不存在于磁盘），仅根据 file_type 判断，返回 0 表示未知
     """
     if file_type is None and file_path:
         file_type = os.path.splitext(file_path)[1].lower().lstrip(".")
@@ -384,6 +480,12 @@ def get_file_page_count(file_path, file_type=None):
         else:
             print(f"  [PAGE] PDF 文件不在磁盘，默认按 1 页计算")
             return 1
+
+    # Word 文档：交本地打印工具转换计数（Word/WPS 比服务器 LibreOffice 更可靠）
+    if file_type in ("doc", "docx"):
+        name = os.path.basename(file_path) if file_path else "未知文件"
+        print(f"  [PAGE] {file_type.upper()} {name}: 等待本地打印工具分析页数")
+        return 0  # 0 表示"待验证"，由本地打印工具通过 Word/WPS 转换后回报
 
     # 图片文件：按 1 页计算
     if file_type in ("png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"):
@@ -628,8 +730,82 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
+    # v12 迁移：orders 添加 order_number 列（HN20260720-0001 格式订单号）
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN order_number TEXT DEFAULT ''")
+        conn.commit()
+        print("  已添加 orders.order_number 列")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
+    # v13 迁移：files 添加 page_count 列（缓存文件页数，避免重复转换）
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN page_count INTEGER DEFAULT 0")
+        conn.commit()
+        print("  已添加 files.page_count 列")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
+    # v14 迁移：files 添加 page_count_verified 列（页数是否经本地工具验证）
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN page_count_verified INTEGER DEFAULT 0")
+        conn.commit()
+        print("  已添加 files.page_count_verified 列")
+    except sqlite3.OperationalError:
+        pass
+
+    # v15 迁移：order_files 添加 page_range_original / page_range_truncated 列
+    for col, col_type, default in [
+        ("page_range_original", "TEXT", "''"),
+        ("page_range_truncated", "INTEGER", "0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE order_files ADD COLUMN {col} {col_type} DEFAULT {default}")
+            conn.commit()
+            print(f"  已添加 order_files.{col} 列")
+        except sqlite3.OperationalError:
+            pass
+
+    # v16 迁移：files 添加 md5 列（用于本地工具 MD5 缓存命中，避免重复下载）
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN md5 TEXT DEFAULT ''")
+        conn.commit()
+        print("  已添加 files.md5 列")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
+
+
+# ==================== 订单号生成 ====================
+
+_ORDER_COUNTER_LOCK = threading.Lock()
+ORDER_COUNTER_FILE = os.path.join(UPLOAD_DIR, "order_counter.json")
+
+
+def generate_order_number():
+    """生成订单号 HN{YYYYMMDD}-{4位当日序号}，线程安全，跨天自动归零。"""
+    today = datetime.now().strftime("%Y%m%d")
+
+    with _ORDER_COUNTER_LOCK:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        try:
+            with open(ORDER_COUNTER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {"date": today, "counter": 0}
+
+        if data.get("date") != today:
+            data = {"date": today, "counter": 0}
+
+        data["counter"] += 1
+        counter = data["counter"]
+
+        with open(ORDER_COUNTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    return f"HN{today}-{counter:04d}"
 
 
 # ==================== 价格计算 ====================
@@ -719,9 +895,14 @@ def fetch_and_lock_task(client_id):
             if parent_row:
                 refresh_order_status(conn, parent_row["order_id"])
             conn.commit()
-            # 重新查询完整数据返回
+            # 重新查询完整数据返回（含父订单 order_number 和文件 MD5）
             full_task = conn.execute(
-                "SELECT * FROM order_files WHERE id = ?", (task_id,)
+                """SELECT of.*, o.order_number, f.md5 as source_md5
+                   FROM order_files of
+                   LEFT JOIN orders o ON of.order_id = o.id
+                   LEFT JOIN files f ON of.file_id = f.id
+                   WHERE of.id = ?""",
+                (task_id,),
             ).fetchone()
             return dict(full_task)
         except Exception:
@@ -853,17 +1034,40 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
         sid = client_info["sid"] if client_info else None
 
     download_url = make_download_url(file_id)
+
+    # 查询订单号
+    order_number = ""
+    if order_id:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT order_number FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        conn.close()
+        if row:
+            order_number = row["order_number"] or ""
+
     task_msg = {
         "type": "print_task",
         "task_id": sub_task_id,          # 语义切换为 order_files.id
+        "order_id": order_id,
+        "order_number": order_number,
         "file_url": download_url,
         "file_name": file_name,          # 原始文件名（含扩展名）
+        "source_md5": "",               # 由后续代码填充
         "options": {
             "copies": copies,
             "duplex": duplex or "on",
             "page_range": page_range or "",
         },
     }
+
+    # 查询文件 MD5（供本地工具 PDF 缓存命中，避免重复下载）
+    if file_id:
+        conn = get_db()
+        row = conn.execute("SELECT md5 FROM files WHERE id = ?", (file_id,)).fetchone()
+        conn.close()
+        if row and row["md5"]:
+            task_msg["source_md5"] = row["md5"]
 
     if not sid:
         # 客户端刚断开：回滚为 queued，等下次扫描重试
@@ -946,29 +1150,57 @@ def check_printing_timeout():
 
 
 def recover_orphaned_printing_tasks():
-    """扫描超过 5 分钟仍处于 printing 的任务，强制回退为 queued。
+    """扫描超过 5 分钟仍处于 printing 的任务，检查文件是否存在：
+    - 文件存在 → 回退为 queued（让其他打印机重试）
+    - 文件不存在 → 标记为 failed（避免无限循环）
     覆盖极端场景：服务器断电/客户端失联但未触发 disconnect 事件。"""
     cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
     with db_lock:
         conn = get_db_conn()
         rows = conn.execute(
-            "SELECT id, order_id FROM order_files WHERE status = 'printing' AND created_at < ?",
+            """SELECT of.id, of.order_id, of.file_id, f.path
+               FROM order_files of
+               LEFT JOIN files f ON of.file_id = f.id
+               WHERE of.status = 'printing' AND of.created_at < ?""",
             (cutoff_time,)
         ).fetchall()
         if not rows:
             conn.close()
             return
-        ids = [str(r["id"]) for r in rows]
-        placeholders = ",".join("?" for _ in rows)
-        conn.execute(
-            f"UPDATE order_files SET status = 'queued', operator_client = '' WHERE id IN ({placeholders})",
-            ids
-        )
+
+        reset_ids = []  # → queued（文件还在）
+        fail_ids = []   # → failed（文件已删）
         for r in rows:
-            refresh_order_status(conn, r["order_id"])
+            file_path = r["path"]
+            if file_path and os.path.isfile(file_path):
+                reset_ids.append(r["id"])
+            else:
+                fail_ids.append(r["id"])
+
+        if reset_ids:
+            placeholders = ",".join("?" for _ in reset_ids)
+            conn.execute(
+                f"UPDATE order_files SET status = 'queued', operator_client = '' WHERE id IN ({placeholders})",
+                [str(x) for x in reset_ids]
+            )
+        if fail_ids:
+            placeholders = ",".join("?" for _ in fail_ids)
+            conn.execute(
+                f"UPDATE order_files SET status = 'failed' WHERE id IN ({placeholders})",
+                [str(x) for x in fail_ids]
+            )
+
+        all_ids = set(reset_ids + fail_ids)
+        for r in rows:
+            if r["id"] in all_ids:
+                refresh_order_status(conn, r["order_id"])
         conn.commit()
         conn.close()
-        print(f"[ORPHAN] 已回收 {len(rows)} 个超过 5 分钟的孤儿 printing 任务")
+
+        if reset_ids:
+            print(f"[ORPHAN] 已回收 {len(reset_ids)} 个孤儿 printing 任务 → queued")
+        if fail_ids:
+            print(f"[ORPHAN] 文件不存在，{len(fail_ids)} 个孤儿任务标记为 failed")
 
 
 # ==================== SocketIO 事件 ====================
@@ -1106,6 +1338,113 @@ def on_print_fail(data):
         pushed_tasks.pop(task_id, None)
 
 
+@socketio.on("page_count_result")
+def on_page_count_result(data):
+    """本地打印工具回报文件页数分析结果。
+    data: {file_id, page_count, orientation, success}"""
+    file_id = data.get("file_id", "")
+    page_count = int(data.get("page_count", 0) or 0)
+    orientation = data.get("orientation", "")
+    success = data.get("success", True)
+
+    if not file_id or page_count <= 0:
+        print(f"  [PAGE] page_count_result 无效: file_id={file_id}, pages={page_count}")
+        return
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE files SET page_count = ?, page_count_verified = 1 WHERE id = ?",
+        (page_count, file_id),
+    )
+    # 同步更新 MD5 索引：下次同 MD5 文件上传直接复用页数，无需再次分析
+    row = conn.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    if row and row["path"] and os.path.exists(row["path"]):
+        try:
+            file_md5 = get_file_md5(row["path"])
+            md5_index = load_md5_index()
+            _md5_entry_set(md5_index, file_md5, page_count=page_count, page_count_verified=True)
+            save_md5_index(md5_index)
+            print(f"  [PAGE] MD5 索引已更新: {file_md5[:8]}... → {page_count} 页")
+        except Exception as e:
+            print(f"  [WARN] 更新 MD5 页数缓存失败: {e}")
+    print(f"  [PAGE] ✓ 本地工具回报: {file_id[:8]}... → {page_count} 页 ({orientation})")
+
+
+@socketio.on("page_range_truncated")
+def on_page_range_truncated(data):
+    """本地打印工具回报：某任务的页码范围被截断。
+    data: {task_id, original_range, effective_range, total_pages}"""
+    task_id = data.get("task_id")
+    original = data.get("original_range", "")
+    effective = data.get("effective_range", "")
+    total_pages = data.get("total_pages", 0)
+
+    if not task_id:
+        return
+
+    task_id = int(task_id)
+    print(f"  [TRUNC] 子任务 #{task_id}: 页码范围被截断 {original} → {effective} (总 {total_pages} 页)")
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE order_files SET page_range_original = ?, page_range_truncated = 1, page_range = ? WHERE id = ?",
+        (original, effective, task_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ==================== 页面分析请求（推送到本地打印工具）====================
+
+
+def _notify_clients(event: str, data: dict):
+    """向所有活跃的打印机客户端广播事件（如储存配置更新、清空缓存等）。"""
+    active = get_active_clients()
+    if not active:
+        return
+    for client_id in active:
+        with printer_clients_lock:
+            info = printer_clients.get(client_id)
+            sid = info["sid"] if info else None
+        if sid:
+            try:
+                socketio.emit(event, data, to=sid)
+            except Exception as e:
+                print(f"  [NOTIFY] 推送 {event} 到 {client_id} 失败: {e}")
+
+
+def request_page_analysis(file_id: str, file_name: str) -> bool:
+    """请求本地打印工具下载文件并分析页数。成功推送返回 True。"""
+    active_clients = get_active_clients()
+    if not active_clients:
+        print(f"  [PAGE] 无活跃打印客户端，跳过页数分析请求")
+        return False
+
+    download_url = make_download_url(file_id)
+    client_id = active_clients[0]
+
+    with printer_clients_lock:
+        client_info = printer_clients.get(client_id)
+        sid = client_info["sid"] if client_info else None
+
+    if not sid:
+        return False
+
+    try:
+        socketio.emit("analyze_page_count", {
+            "file_id": file_id,
+            "file_name": file_name,
+            "download_url": download_url,
+        }, to=sid)
+        print(f"  [PAGE] 已推送页数分析请求: {file_name} (file_id={file_id[:8]}...) → {client_id}")
+        return True
+    except Exception as e:
+        print(f"  [PAGE] 推送分析请求失败: {e}")
+        return False
+
+
 # ==================== 认证 ====================
 
 
@@ -1168,6 +1507,37 @@ def require_printer_access(f):
 @app.route("/api/ping")
 def ping():
     return {"msg": "pong", "status": "ok"}
+
+
+@app.route("/api/pricing", methods=["GET"])
+def get_pricing():
+    """返回打印定价配置（地点、优先级、首页费等），前端加载后与本地打印工具保持一致。"""
+    pricing_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing.json")
+    try:
+        with open(pricing_path, "r", encoding="utf-8") as f:
+            pricing = json.load(f)
+        return jsonify({"success": True, "pricing": pricing})
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        return jsonify({"success": False, "message": f"定价配置不可用: {e}"}), 500
+
+
+@app.route("/api/file_page/<file_id>", methods=["GET"])
+@login_required
+def get_file_page(file_id):
+    """查询文件的页数信息（供前端轮询本地工具分析结果）。
+    返回 page_count 和 page_count_verified 标志。"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT page_count, page_count_verified FROM files WHERE id = ?", (file_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"success": False, "message": "文件不存在"}), 404
+    return jsonify({
+        "success": True,
+        "page_count": row["page_count"] or 0,
+        "verified": bool(row["page_count_verified"]),
+    })
 
 
 @app.route("/api/login", methods=["POST"])
@@ -1304,24 +1674,32 @@ def upload_file():
     # 2. 计算 MD5 并查重
     file_md5 = get_file_md5(temp_path)
     md5_index = load_md5_index()
+    existing_entry = _md5_entry_get(md5_index, file_md5)
 
     reused = False
-    if file_md5 in md5_index:
-        existing_rel = md5_index[file_md5]
-        existing_path = os.path.join(UPLOAD_DIR, existing_rel)
-        if os.path.exists(existing_path):
+    cached_page_count = 0
+    cached_page_verified = False
+
+    if existing_entry:
+        existing_rel = existing_entry.get("path", "")
+        existing_path = os.path.join(UPLOAD_DIR, existing_rel) if existing_rel else ""
+        if existing_path and os.path.exists(existing_path):
             # MD5 命中且文件存在 → 复用
             os.remove(temp_path)
             file_path = existing_path
             file_size = os.path.getsize(file_path)
-            # saved_name 沿用已有文件的 basename（保持与 files 表一致）
             saved_name = os.path.basename(existing_path)
             reused = True
-            print(f"  [MD5] 文件复用: {f.filename} → {existing_rel} (MD5={file_md5[:8]}...)")
+            # 读取缓存的页数
+            cached_page_count = existing_entry.get("page_count", 0) or 0
+            cached_page_verified = existing_entry.get("page_count_verified", False)
+            print(f"  [MD5] 文件复用: {f.filename} → {existing_rel} (MD5={file_md5[:8]}..."
+                  f"{', 页数已验证=' + str(cached_page_count) if cached_page_verified else ''})")
         else:
             # 索引记录存在但磁盘文件丢失 → 清理索引，走新文件保存
             del md5_index[file_md5]
             save_md5_index(md5_index)
+            existing_entry = None
             print(f"  [MD5] 索引记录失效（文件丢失），重新保存: {existing_rel}")
 
     if not reused:
@@ -1330,33 +1708,49 @@ def upload_file():
         target_dir = os.path.join(UPLOAD_DIR, subdir)
         os.makedirs(target_dir, exist_ok=True)
         final_path = os.path.join(target_dir, saved_name)
-        # 如果目标文件已存在（不同 MD5 但同名，极小概率），加后缀避免冲突
         if os.path.exists(final_path):
             saved_name = f"{file_id}_{uuid.uuid4().hex[:6]}{ext}"
             final_path = os.path.join(target_dir, saved_name)
         shutil.move(temp_path, final_path)
         file_path = final_path
 
-        # 4. 更新 MD5 索引
+        # 4. 更新 MD5 索引（新格式：含原始文件名）
         rel_path = os.path.relpath(file_path, UPLOAD_DIR)
-        md5_index[file_md5] = rel_path
+        _md5_entry_set(md5_index, file_md5, path=rel_path, original_name=f.filename,
+                        page_count=0, page_count_verified=False)
         save_md5_index(md5_index)
         print(f"  [MD5] 新增索引: {file_md5[:8]}... → {rel_path}")
+    else:
+        # 更新 MD5 索引中的原始文件名（可能不同用户上传了不同命名的同一文件）
+        _md5_entry_set(md5_index, file_md5, original_name=f.filename)
+        save_md5_index(md5_index)
 
-    # 5. 计算文件页数（用于后续统计）
-    page_count = get_file_page_count(file_path, ext_lower)
+    # 5. 计算/复用文件页数
+    if cached_page_verified and cached_page_count > 0:
+        # 同 MD5 文件已由本地工具验证 → 直接复用页数，跳过分析
+        page_count = cached_page_count
+        print(f"  [PAGE] 复用已验证页数: {f.filename} → {page_count} 页 (from MD5 cache)")
+    else:
+        page_count = get_file_page_count(file_path, ext_lower)
 
-    # 6. 写入 files 表
+    # 6. 写入 files 表（含 page_count 缓存和 md5）
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO files (id, original_name, saved_name, path, size, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO files (id, original_name, saved_name, path, size, created_at, page_count, page_count_verified, md5)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (file_id, f.filename, saved_name, file_path, file_size, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        (file_id, f.filename, saved_name, file_path, file_size,
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), page_count,
+         int(cached_page_verified), file_md5),
     )
     conn.commit()
     conn.close()
+
+    # 对需要本地工具分析的文档格式，请求直连的打印客户端下载并分析页数
+    # 但若同 MD5 已有验证页数，跳过分析
+    if page_count == 0 and ext_lower in ("doc", "docx") and not cached_page_verified:
+        request_page_analysis(file_id, f.filename)
 
     print(f"文件上传: {f.filename} -> {file_path} (id={file_id}, pages={page_count}, reused={reused})")
 
@@ -1418,6 +1812,7 @@ def submit_order():
 
     user_is_admin = (g.user_role == "admin")
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    order_number = generate_order_number()
 
     # ---- 检查打印机在线状态 ----
     printer_online = len(get_active_clients()) > 0
@@ -1431,14 +1826,16 @@ def submit_order():
             """INSERT INTO orders (file_id, file, copies, status, created_at, openid, duplex,
                                    page_count, price_per_page, total_price, is_free,
                                    delivery_enabled, delivery_location, delivery_percentage,
-                                   urgency, urgency_price, cover_page, cover_page_price, pickup_address)
+                                   urgency, urgency_price, cover_page, cover_page_price, pickup_address,
+                                   order_number)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              1 if user_is_admin else 0,
              delivery_enabled, delivery_location, delivery_percentage,
-             urgency, urgency_price, cover_page, cover_page_price, pickup_address),
+             urgency, urgency_price, cover_page, cover_page_price, pickup_address,
+             order_number),
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -1450,21 +1847,36 @@ def submit_order():
             f_copies = int(f.get("copies", 1))
             f_page_range = (f.get("page_range", "") or "").strip()
 
-            # 计算页数与价格
+            # 计算页数与价格（优先从 files 表缓存读取）
             page_count = 1
+            page_count_verified = False
             if f_id:
-                frow = conn.execute("SELECT path, original_name FROM files WHERE id = ?", (f_id,)).fetchone()
-                if frow and os.path.exists(frow["path"]):
-                    ext = os.path.splitext(frow["path"])[1].lower().lstrip(".")
-                    page_count = get_file_page_count(frow["path"], ext)
+                frow = conn.execute(
+                    "SELECT path, original_name, page_count, page_count_verified FROM files WHERE id = ?",
+                    (f_id,),
+                ).fetchone()
+                if frow:
+                    cached = frow["page_count"] or 0
+                    if cached > 0:
+                        page_count = cached
+                        page_count_verified = bool(frow["page_count_verified"])
+                    elif frow["path"] and os.path.exists(frow["path"]):
+                        # 缓存未命中，重新计算（PDF可当场获取，doc/docx返回0）
+                        ext = os.path.splitext(frow["path"])[1].lower().lstrip(".")
+                        page_count = get_file_page_count(frow["path"], ext) or 1
+                        page_count_verified = ext not in ("doc", "docx")
+                        conn.execute(
+                            "UPDATE files SET page_count = ?, page_count_verified = ? WHERE id = ?",
+                            (page_count, int(page_count_verified), f_id),
+                        )
                     if not f_name:
                         f_name = frow["original_name"]
                 else:
                     ext = os.path.splitext(f_name)[1].lower().lstrip(".")
-                    page_count = get_file_page_count(None, ext)
+                    page_count = get_file_page_count(None, ext) or 1
             else:
                 ext = os.path.splitext(f_name)[1].lower().lstrip(".")
-                page_count = get_file_page_count(None, ext)
+                page_count = get_file_page_count(None, ext) or 1
 
             if not f_name:
                 f_name = "未知文件"
@@ -1475,7 +1887,8 @@ def submit_order():
             is_free_val = 1 if user_is_admin else 0
             per_copy_price = calculate_price(page_count, f_duplex)
             total_price = 0 if user_is_admin else round(per_copy_price * f_copies, 2)
-            sub_status = "printing" if (printer_online and f_id) else "queued"
+            # 统一从 queued 开始，由 push_print_task_to_client 原子锁定为 printing
+            sub_status = "queued"
 
             conn.execute(
                 """INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,
@@ -1488,6 +1901,7 @@ def submit_order():
             sub_tasks.append({
                 "id": sub_task_id, "file_id": f_id, "file_name": f_name,
                 "copies": f_copies, "page_count": page_count,
+                "page_count_verified": page_count_verified,
                 "page_range": f_page_range,
                 "total_price": total_price, "status": sub_status,
                 "duplex": f_duplex,
@@ -1532,7 +1946,7 @@ def submit_order():
         if active_clients:
             client_id = active_clients[0]
             for st in sub_tasks:
-                if st["file_id"] and st["status"] == "printing":
+                if st["file_id"]:
                     if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
                                                   st["copies"], st.get("duplex", duplex),
                                                   st.get("page_range", ""), client_id):
@@ -1563,6 +1977,7 @@ def submit_order():
         "success": True,
         "message": "任务已接收" + ("，已推送打印" if pushed_count > 0 else "，排队等待打印"),
         "order_id": order_id,
+        "order_number": order_number,
         "status": final_status,
         "files": sub_tasks,
         "pushed_count": pushed_count,
@@ -1601,9 +2016,11 @@ def pull_queued_orders():
     item = {
         "id": task["id"],
         "order_id": task["order_id"],
+        "order_number": task.get("order_number", ""),
         "file_id": task["file_id"],
         "file": task["file_name"],           # 兼容旧客户端字段名
         "file_name": task["file_name"],
+        "source_md5": task.get("source_md5", "") or "",
         "copies": task["copies"],
         "page_range": task.get("page_range", "") or "",
         "status": task["status"],
@@ -1629,10 +2046,9 @@ def pull_queued_orders():
 @app.route("/api/orders", methods=["GET"])
 @login_required
 def get_orders():
-    """返回任务列表，含聚合文件摘要。根据角色返回不同范围：
-    - 超级管理员: 全部订单
-    - 普通管理员: 自己的订单 + 自己创建临时密钥的用户的订单
-    - 普通用户/临时用户: 仅自己的订单
+    """返回任务列表。默认仅返回当前用户自己的订单。
+    管理员可通过 ?openid=xxx 查看指定授权用户的订单。
+    超级管理员可通过 ?view=all 查看全部订单，或 ?openid=xxx 查看指定用户。
     支持分页: ?page=1&per_page=20
     """
     page = request.args.get("page", 1, type=int)
@@ -1643,29 +2059,33 @@ def get_orders():
 
     role = compute_role(g.openid)
     is_super = SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID
+    target_openid = (request.args.get("openid", "") or "").strip()
+    view_all = is_super and request.args.get("view", "") == "all"
 
     conn = get_db()
 
     # 构建查询条件
-    if is_super:
-        # 超级管理员：看所有订单
+    if view_all:
+        # 超级管理员查看全部订单
         where_clause = "1 = 1"
         params = []
-    elif role == "admin":
-        # 普通管理员：自己的订单 + 自己创建的临时密钥的用户的订单
-        temp_user_openids = [
-            row["used_by"] for row in
-            conn.execute(
-                "SELECT DISTINCT used_by FROM license_keys WHERE created_by = ? AND used_by IS NOT NULL",
-                (g.openid,),
-            ).fetchall()
-        ]
-        all_openids = [g.openid] + temp_user_openids
-        placeholders = ",".join(["?" for _ in all_openids])
-        where_clause = f"openid IN ({placeholders})"
-        params = all_openids
+    elif is_super and target_openid:
+        # 超级管理员查看指定用户
+        where_clause = "openid = ?"
+        params = [target_openid]
+    elif role == "admin" and target_openid:
+        # 管理员查看指定用户：需验证该用户是否由本管理员授权
+        auth_row = conn.execute(
+            "SELECT used_by FROM license_keys WHERE created_by = ? AND used_by = ? LIMIT 1",
+            (g.openid, target_openid),
+        ).fetchone()
+        if not auth_row:
+            conn.close()
+            return jsonify({"success": False, "message": "无权查看该用户的订单"}), 403
+        where_clause = "openid = ?"
+        params = [target_openid]
     else:
-        # 普通用户 / 临时用户：只看自己的订单
+        # 默认：所有角色只看自己的订单
         where_clause = "openid = ?"
         params = [g.openid]
 
@@ -1679,7 +2099,7 @@ def get_orders():
     orders_rows = conn.execute(
         f"""
         SELECT id, file_id, file, copies, status, created_at, openid, duplex,
-               page_count, is_free, total_price,
+               page_count, is_free, total_price, order_number,
                delivery_enabled, delivery_location, delivery_percentage,
                urgency, urgency_price, cover_page, cover_page_price, pickup_address
         FROM orders
@@ -1698,6 +2118,7 @@ def get_orders():
         # 查询子任务
         of_rows = conn.execute(
             """SELECT id, file_id, file_name, copies, page_count, page_range,
+                      page_range_original, page_range_truncated,
                       total_price, is_free, status, created_at, duplex
                FROM order_files WHERE order_id = ? ORDER BY id ASC""",
             (oid,),
@@ -1782,7 +2203,8 @@ def get_order_detail(order_id):
     # 查询子任务
     of_rows = conn.execute(
         """SELECT of.id, of.file_id, of.file_name, of.copies, of.page_count,
-                  of.page_range, of.total_price, of.is_free, of.status, of.duplex
+                  of.page_range, of.page_range_original, of.page_range_truncated,
+                  of.total_price, of.is_free, of.status, of.duplex
            FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
         (order_id,),
     ).fetchall()
@@ -1904,9 +2326,7 @@ def get_order_price(order_id):
 @app.route("/api/cancel_order", methods=["POST"])
 @login_required
 def cancel_order():
-    """取消任务（仅限 queued 或 printing 状态且属于当前用户）。
-    队列保护：若任务正在打印中，或前面仅有 <=1 个排队任务，禁止取消。
-    """
+    """取消任务（仅限 queued 或 printing 状态且属于当前用户）。"""
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
@@ -1917,7 +2337,7 @@ def cancel_order():
 
     conn = get_db()
     row = conn.execute(
-        "SELECT id, status, openid, created_at FROM orders WHERE id = ?",
+        "SELECT id, status, openid FROM orders WHERE id = ?",
         (order_id,),
     ).fetchone()
 
@@ -1932,21 +2352,6 @@ def cancel_order():
     if row["status"] not in ("queued", "printing"):
         conn.close()
         return jsonify({"success": False, "message": f"任务状态为 {row['status']}，无法取消"}), 400
-
-    # ---- 队列位置检查 ----
-    if row["status"] == "printing":
-        conn.close()
-        return jsonify({"success": False, "message": "任务正在打印中，无法取消"}), 400
-
-    # 查询该任务前面有多少个 queued 任务（不含自身）
-    ahead = conn.execute(
-        "SELECT COUNT(*) FROM orders WHERE status = 'queued' AND created_at < ?",
-        (row["created_at"],),
-    ).fetchone()[0]
-
-    if ahead <= 1:
-        conn.close()
-        return jsonify({"success": False, "message": "任务即将开始打印，无法取消"}), 400
 
     # 取消父订单和所有子任务
     conn.execute(
@@ -1992,6 +2397,45 @@ def get_me():
         "temp_until": temp_until,
         "has_temp_access": has_temp_access,
     })
+
+
+# ==================== 授权用户列表（管理员查看）====================
+
+
+@app.route("/api/authorized_users", methods=["GET"])
+@login_required
+def authorized_users():
+    """管理员查看自己授权过的用户列表（含最近订单摘要）。"""
+    role = compute_role(g.openid)
+    if role != "admin":
+        return jsonify({"success": False, "message": "仅限管理员操作"}), 403
+
+    conn = get_db()
+    # 查询该管理员创建的所有已使用的密钥（去重用户）
+    rows = conn.execute(
+        """SELECT DISTINCT lk.used_by, u.nickname,
+               (SELECT MAX(o.created_at) FROM orders o WHERE o.openid = lk.used_by) AS last_order,
+               (SELECT COUNT(*) FROM orders o WHERE o.openid = lk.used_by) AS order_count
+           FROM license_keys lk
+           LEFT JOIN users u ON lk.used_by = u.openid
+           WHERE lk.created_by = ? AND lk.used_by IS NOT NULL
+           ORDER BY last_order DESC NULLS LAST""",
+        (g.openid,),
+    ).fetchall()
+    conn.close()
+
+    users = []
+    for r in rows:
+        openid = r["used_by"]
+        users.append({
+            "openid": openid,
+            "openid_short": openid[:8] + "..." if openid else "",
+            "nickname": r["nickname"] or "",
+            "last_order": r["last_order"] or "",
+            "order_count": r["order_count"] or 0,
+        })
+
+    return jsonify({"success": True, "users": users, "count": len(users)})
 
 
 # ==================== 用户资料接口 ====================
@@ -2569,12 +3013,59 @@ def _format_size(size_bytes):
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
-@app.route("/api/admin/storage", methods=["GET", "POST"])
+@app.route("/api/admin/storage", methods=["GET", "POST", "DELETE"])
 @login_required
 def admin_storage():
     """管理员查看/设置服务器缓存文件统计与保留时间"""
     if not is_admin(g.openid):
         return jsonify({"success": False, "message": "需要管理员权限"}), 403
+
+    # ---- DELETE: 删除全部缓存文件 ----
+    if request.method == "DELETE":
+        deleted_count = 0
+        deleted_size = 0
+
+        md5_index = load_md5_index()
+
+        for root, dirs, files in os.walk(UPLOAD_DIR):
+            # 跳过 avatars 子树（用户头像）
+            if os.path.basename(root) == "avatars":
+                dirs[:] = []  # 阻止继续递归子目录
+                continue
+            for fname in files:
+                # 跳过配置文件
+                if fname in ("md5_index.json", "retention_config.json"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    size = os.path.getsize(fpath)
+                    os.remove(fpath)
+                    deleted_count += 1
+                    deleted_size += size
+                except OSError as e:
+                    print(f"  [DELETE-ALL] 删除失败 {fpath}: {e}")
+
+        # 清空 MD5 索引
+        save_md5_index({})
+
+        # 清空 files 表中的路径引用
+        conn = get_db()
+        conn.execute("UPDATE files SET path = '', size = 0")
+        conn.commit()
+        conn.close()
+
+        # 同步通知所有在线本地打印工具清空 PDF 缓存
+        _notify_clients("clear_local_cache", {
+            "message": f"管理员清空了服务器缓存 ({deleted_count} 个文件)",
+        })
+
+        print(f"  [DELETE-ALL] 已删除 {deleted_count} 个文件, 释放 {_format_size(deleted_size)}")
+        return jsonify({
+            "success": True,
+            "message": f"已删除 {deleted_count} 个文件",
+            "deleted_count": deleted_count,
+            "deleted_size_display": _format_size(deleted_size),
+        })
 
     # ---- POST: 设置保留时间 ----
     if request.method == "POST":
@@ -2605,6 +3096,12 @@ def admin_storage():
         # 保存后立即执行一次清理
         cleanup_expired_files()
 
+        # 同步通知所有在线本地打印工具更新缓存保留时间
+        _notify_clients("storage_config_updated", {
+            "retention_days": days,
+            "retention_hours": hours,
+        })
+
         return jsonify({"success": True, "message": "保留时间已更新"})
 
     # ---- GET: 查看存储统计 + 保留时间 ----
@@ -2612,7 +3109,14 @@ def admin_storage():
     total_size = 0
 
     for root, dirs, files in os.walk(UPLOAD_DIR):
+        # 跳过 avatars 子树（用户头像不参与缓存统计）
+        if os.path.basename(root) == "avatars":
+            dirs[:] = []  # 阻止继续递归
+            continue
         for fname in files:
+            # 跳过配置文件
+            if fname in ("md5_index.json", "retention_config.json"):
+                continue
             fpath = os.path.join(root, fname)
             try:
                 stat = os.stat(fpath)

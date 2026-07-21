@@ -1,0 +1,983 @@
+
+=== CRASH at 2026-07-20 21:10:28.059261 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1579, in _on_new_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 252, in set_tabs
+    self._add_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 307, in _add_tab
+    self._update_tab(order_key, order)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:28.107037 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:28.108579 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:28.218197 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:28.421893 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:28.720230 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:28.825416 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:29.130165 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:29.232710 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:29.335003 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:29.489480 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:29.665352 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:29.778320 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:29.912124 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:30.113433 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:30.300927 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:30.463702 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:30.635215 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:30.827461 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:31.015353 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:31.184866 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2497, in _on_cloud_task_updated
+    def _on_cloud_task_updated(self, task: CloudTask):
+    
+KeyboardInterrupt
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:31.368476 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:31.561835 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:31.723762 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:31.918830 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:32.089234 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:32.279997 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:32.457997 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2497, in _on_cloud_task_updated
+    def _on_cloud_task_updated(self, task: CloudTask):
+    
+KeyboardInterrupt
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:32.648073 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:32.870763 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:32.992571 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:33.195541 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:33.391767 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:33.557757 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:33.732455 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:33.908301 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:34.086298 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:34.273091 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1568, in _on_tab_activated
+    self._update_order_total_display(order_key)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1664, in _update_order_total_display
+    self._tab_bar.update_tab(order_key, order, subtotal_text=f"¥{subtotal:.2f}")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 280, in update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:34.274254 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:34.503749 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:34.639509 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:34.830816 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:35.046417 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:35.207497 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:35.359755 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:35.535949 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1726, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:35.590748 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1719, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:35.593003 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2504, in _on_cloud_task_updated
+    self._ensure_cloud_order_tab(task)
+  File "D:\打印机项目\local_print_tool\gui.py", line 1719, in _ensure_cloud_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 21:10:35.909575 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1579, in _on_new_order_tab
+    self._refresh_tabs_and_cards()
+  File "D:\打印机项目\local_print_tool\gui.py", line 1635, in _refresh_tabs_and_cards
+    self._tab_bar.set_tabs(self._orders, active or "")
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 254, in set_tabs
+    self._update_tab(k, o)
+  File "D:\打印机项目\local_print_tool\order_tabs.py", line 313, in _update_tab
+    label = order.order_number or getattr(order, 'summary', 'untitled')
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\打印机项目\local_print_tool\gui.py", line 974, in summary
+    return names[0] if len(names) == 1 else f"{names[0]} +{len(names)-1} files"
+                                               ~~~~~^^^
+IndexError: list index out of range
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 22:51:12.006021 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2942, in _on_clear_list
+    self._cleared_jobs_backup[self._current_tab] = list(jobs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+TypeError: list indices must be integers or slices, not str
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 22:51:13.365208 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2942, in _on_clear_list
+    self._cleared_jobs_backup[self._current_tab] = list(jobs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+TypeError: list indices must be integers or slices, not str
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 22:51:13.612694 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2942, in _on_clear_list
+    self._cleared_jobs_backup[self._current_tab] = list(jobs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+TypeError: list indices must be integers or slices, not str
+=== END CRASH ===
+
+=== CRASH at 2026-07-20 22:51:15.114567 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 2942, in _on_clear_list
+    self._cleared_jobs_backup[self._current_tab] = list(jobs)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+TypeError: list indices must be integers or slices, not str
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 12:47:54.356940 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1767, in _on_double_click
+    row = idx.row()
+          ^^^^^^^
+AttributeError: 'int' object has no attribute 'row'
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 12:47:55.188266 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1767, in _on_double_click
+    row = idx.row()
+          ^^^^^^^
+AttributeError: 'int' object has no attribute 'row'
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 14:15:14.233771 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1767, in _on_double_click
+    row = idx.row()
+          ^^^^^^^
+AttributeError: 'int' object has no attribute 'row'
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 14:18:02.312442 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1767, in _on_double_click
+    row = idx.row()
+          ^^^^^^^
+AttributeError: 'int' object has no attribute 'row'
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 14:19:29.928094 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1767, in _on_double_click
+    row = idx.row()
+          ^^^^^^^
+AttributeError: 'int' object has no attribute 'row'
+=== END CRASH ===
+
+=== CRASH at 2026-07-21 14:41:51.987522 ===
+Traceback (most recent call last):
+  File "D:\打印机项目\local_print_tool\gui.py", line 1767, in _on_double_click
+    row = idx.row()
+          ^^^^^^^
+AttributeError: 'int' object has no attribute 'row'
+=== END CRASH ===

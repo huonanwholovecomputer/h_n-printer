@@ -67,6 +67,15 @@
               </block>
               <block wx:elif="{{item.fileId}}">
                 <text class="status-label done">已上传</text>
+                <!-- 页数分析进度（非图片/Excel 文件）-->
+                <view wx:if="{{!item.isImage && !item.excelWarning && item.pageCountStatus === 'analyzing'}}" class="page-analysis-bar">
+                  <view class="analysis-dot-pulse"></view>
+                  <text class="analysis-text">正在分析页数，本地打印工具转换中…</text>
+                </view>
+                <view wx:elif="{{!item.isImage && !item.excelWarning && item.pageCountStatus === 'confirmed' && item.pageCount > 0}}" class="page-analysis-bar confirmed">
+                  <text class="analysis-dot-done">✓</text>
+                  <text class="analysis-text">共 {{item.pageCount}} 页</text>
+                </view>
               </block>
             </view>
 
@@ -83,10 +92,24 @@
                 </view>
               </view>
 
-              <!-- Page range -->
-              <view class="control-row">
+              <!-- Page range — multi-line (hidden for images, aligns with local tool RangeListWidget) -->
+              <view wx:if="{{!item.isImage}}" class="control-row range-control-multi">
                 <text class="control-label">范围</text>
-                <input class="input-ios range-input" type="text" value="{{item.pageRange}}" placeholder="全部（如 1-5,7,9）" bindinput="onFilePageRangeInput" data-index="{{index}}" />
+                <view class="range-lines-wrap">
+                  <view wx:for="{{item.rangeLines}}" wx:for-item="line" wx:for-index="li" wx:key="li" class="range-line-row">
+                    <input
+                      class="input-ios range-line-input {{line.error ? 'range-input-err' : ''}}"
+                      type="text"
+                      value="{{line.value}}"
+                      placeholder="{{li === 0 ? '如 1-5 或 7' : ''}}"
+                      bindinput="onRangeLineInput"
+                      bindblur="onRangeLineBlur"
+                      data-file-index="{{index}}"
+                      data-line-index="{{li}}"
+                    />
+                    <text wx:if="{{line.error}}" class="range-err-msg range-line-err">{{line.error}}</text>
+                  </view>
+                </view>
               </view>
 
               <!-- Duplex toggle -->
@@ -131,7 +154,7 @@
               <text class="picker-arrow">›</text>
             </view>
           </view>
-          <view wx:if="{{showDeliveryPicker}}" class="picker-sheet">
+          <view class="picker-sheet {{showDeliveryPicker ? 'picker-expanded' : ''}}">
             <view wx:for="{{deliveryLocations}}" wx:key="*this" class="picker-option {{deliveryLocation === item ? 'picker-selected' : ''}}" bindtap="onSelectDeliveryLocation" data-loc="{{item}}">
               <text>{{item}}</text>
               <text class="picker-pct">{{deliveryPercentages[item]}}%</text>
@@ -146,7 +169,7 @@
               <text class="picker-arrow">›</text>
             </view>
           </view>
-          <view wx:if="{{showUrgencyPicker}}" class="picker-sheet">
+          <view class="picker-sheet {{showUrgencyPicker ? 'picker-expanded' : ''}}">
             <view wx:for="{{urgencyOptions}}" wx:key="*this" class="picker-option {{urgency === item ? 'picker-selected' : ''}}" bindtap="onSelectUrgency" data-urg="{{item}}">
               <text>{{item}}</text>
               <text class="picker-pct">¥{{urgencyPrices[item]}}</text>
@@ -164,8 +187,8 @@
           <!-- 首页价格（首页开启时显示）-->
           <view wx:if="{{coverPage}}" class="param-row">
             <text class="param-label">首页费</text>
-            <input class="control-input" type="digit" value="{{coverPagePrice}}" bindinput="onCoverPagePriceInput" placeholder="0.15" />
-            <text class="param-unit">元</text>
+            <text class="param-value-glass">¥{{coverPagePrice}}</text>
+            <text class="param-unit">元（由本地打印工具设定）</text>
           </view>
 
           <!-- 自取地址（未派送时显示）-->
@@ -187,15 +210,30 @@
   </view>
 </view>
 
+<!-- Page Count Warning Modal -->
+<view wx:if="{{showPageCountWarning}}" class="modal-mask">
+  <view class="modal-sheet" catchtap="noop">
+    <view class="modal-icon-wrap" style="background-color: rgba(255, 149, 0, 0.1); color: #FF9500;">⚠</view>
+    <text class="title-medium" style="margin-bottom: 8rpx;">页数未经验证</text>
+    <text class="body-small" style="margin-bottom: 6rpx;">部分文档的页数尚未经本地打印工具确认，</text>
+    <text class="body-small">页码范围可能超出文档实际页数。</text>
+    <view class="modal-buttons">
+      <button class="btn-secondary modal-half-btn" bindtap="onCancelForceSubmit" hover-class="tap-active">返回等待</button>
+      <button class="btn-primary modal-half-btn" style="background-color: #FF9500;" bindtap="onConfirmForceSubmit" hover-class="tap-active">继续提交</button>
+    </view>
+  </view>
+</view>
+
 <!-- Success Modal -->
 <view wx:if="{{showSuccessModal}}" class="modal-mask" bindtap="onCloseModal">
   <view class="modal-sheet" catchtap="noop">
     <view class="modal-icon-wrap">✓</view>
     <text class="title-medium" style="margin-bottom: 8rpx;">任务提交成功</text>
+    <text wx:if="{{lastOrderNumber}}" class="order-number-modal">{{lastOrderNumber}}</text>
     <text class="body-small">文件已上传，打印任务已创建</text>
     <view class="modal-buttons">
-      <button class="btn-secondary" bindtap="onCloseModal" hover-class="tap-active">继续打印</button>
-      <button class="btn-primary" style="flex:1;" bindtap="onViewOrders" hover-class="tap-active">查看任务</button>
+      <button class="btn-secondary modal-half-btn" bindtap="onCopyPrice" hover-class="tap-active">复制价格</button>
+      <button class="btn-primary modal-half-btn" bindtap="onCopyDetailPrice" hover-class="tap-active">复制详细价格</button>
     </view>
   </view>
 </view>

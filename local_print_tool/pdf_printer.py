@@ -137,6 +137,68 @@ def list_system_printers() -> list[str]:
 # 辅助函数
 # ============================================================
 
+def check_page_range_truncation(page_range: str, total_pages: int) -> dict | None:
+    """检测页码范围是否会被截断。
+
+    Returns:
+        None – 无需截断（空范围或全部有效）
+        dict – {"original": str, "effective": str, "skipped": [str], "total": int}
+    """
+    if not page_range or not page_range.strip():
+        return None
+    if total_pages <= 0:
+        return None
+
+    raw = page_range.strip()
+    raw = raw.replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
+
+    skipped: list[str] = []
+    valid_parts: list[str] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                start, end = int(a), int(b)
+                if 1 <= start < end:
+                    if end > total_pages:
+                        actual_end = total_pages
+                        if actual_end > start:
+                            valid_parts.append(f"{start}-{actual_end}")
+                            skipped.append(part)
+                        else:
+                            skipped.append(part)
+                    else:
+                        valid_parts.append(part)
+                else:
+                    skipped.append(part)
+            except ValueError:
+                skipped.append(part)
+        else:
+            try:
+                p = int(part)
+                if 1 <= p <= total_pages:
+                    valid_parts.append(part)
+                else:
+                    skipped.append(part)
+            except ValueError:
+                skipped.append(part)
+
+    if not skipped:
+        return None
+    if not valid_parts:
+        return None  # 全部无效 → 回退全打印，不标记截断
+
+    return {
+        "original": page_range.strip(),
+        "effective": ",".join(valid_parts),
+        "skipped": skipped,
+        "total": total_pages,
+    }
+
+
 def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
     """
     解析用户输入的页码范围，返回 0-based 页码列表。

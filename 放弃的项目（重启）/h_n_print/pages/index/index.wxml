@@ -1,0 +1,159 @@
+<!--index.wxml-->
+<navigation-bar title="提交打印" back="{{false}}" color="black" background="#FFF"></navigation-bar>
+
+<view class="page-root">
+  <!-- 自定义滚动容器：负责橡皮筋回弹物理 -->
+  <view
+    class="scroller"
+    bindtouchstart="onScrollerTouchStart"
+    bindtouchmove="onScrollerTouchMove"
+    bindtouchend="onScrollerTouchEnd"
+    bindtouchcancel="onScrollerTouchEnd"
+  >
+    <view class="scroll-content" style="transform: translateY({{-scrollTop}}px);">
+      <view class="container">
+        <view class="announcement" style="padding-top: {{logoPadding}}rpx; padding-bottom: {{logoPadding}}rpx;">
+          <view class="logo-wrap" style="transform: scale({{logoScale}}); transform-origin: center top;">
+            <image class="logo" src="/images/HN_print.png" mode="widthFix" style="width: 400rpx;" />
+          </view>
+        </view>
+
+        <!-- 打印机在线状态 -->
+        <view class="printer-status {{printerActive ? 'status-active' : 'status-inactive'}}">
+          <view class="status-dot"></view>
+          <text>{{printerActive ? '打印机在线' : '打印机离线'}}</text>
+        </view>
+
+        <!-- 提交打印表单 -->
+        <view class="order-form">
+
+          <!-- 文件选择区域 -->
+          <view class="form-item file-list-container">
+            <view class="form-label">打印文件列表</view>
+
+            <!-- 已选择文件列表 -->
+            <view wx:for="{{selectedFiles}}" wx:key="index" class="file-card {{item.entering ? 'file-card-entering' : ''}} {{item.removing ? 'file-card-exit' : ''}}">
+              <!-- 文件头部：名称 + 删除按钮 -->
+              <view class="file-card-header">
+                <view class="file-name">
+                  <text class="file-name-text">{{item.name}}</text>
+                  <text class="file-size-text">{{item.sizeDisplay}} KB</text>
+                </view>
+                <view class="file-remove-btn" bindtap="onRemoveFile" data-index="{{index}}" hover-class="remove-hover">✕</view>
+              </view>
+
+              <!-- 上传进度 -->
+              <view class="file-upload-status">
+                <block wx:if="{{item.uploading}}">
+                  <view class="upload-status-row">
+                    <text class="upload-status-text uploading">上传中…</text>
+                    <text class="upload-percent">{{item.progress}}%</text>
+                  </view>
+                  <view class="progress-track">
+                    <view class="progress-fill" style="width: {{item.progress}}%;"></view>
+                  </view>
+                </block>
+                <block wx:elif="{{item.failed}}">
+                  <text class="upload-status-text failed">✕ 上传失败</text>
+                </block>
+                <block wx:elif="{{item.fileId && item.excelWarning}}">
+                  <text class="upload-status-text warn">! Excel 表格不支持自动打印，请联系管理员进行手动打印。</text>
+                </block>
+                <block wx:elif="{{item.fileId}}">
+                  <text class="upload-status-text done">✓ 已上传</text>
+                </block>
+              </view>
+
+              <!-- 每文件份数步进器（Excel 禁用） -->
+              <view class="file-copies-row {{item.excelWarning ? 'excel-disabled-row' : ''}}">
+                <text class="file-copies-label">份数</text>
+                <view class="stepper file-stepper">
+                  <view class="stepper-btn {{item.excelWarning || item.copies <= 1 ? 'stepper-disabled' : ''}}" bindtap="onFileCopiesMinus" data-index="{{index}}" hover-class="stepper-hover" hover-stay-time="100">−</view>
+                  <input
+                    class="stepper-input"
+                    type="number"
+                    value="{{item.copies}}"
+                    bindinput="onFileCopiesChange"
+                    data-index="{{index}}"
+                    disabled="{{item.excelWarning}}"
+                  />
+                  <view class="stepper-btn {{item.excelWarning ? 'stepper-disabled' : ''}}" bindtap="onFileCopiesPlus" data-index="{{index}}" hover-class="stepper-hover" hover-stay-time="100">+</view>
+                </view>
+              </view>
+
+              <!-- 每文件打印范围（Excel 禁用） -->
+              <view class="file-page-range-row {{item.excelWarning ? 'excel-disabled-row' : ''}}">
+                <text class="file-page-range-label">打印范围</text>
+                <input
+                  class="file-page-range-input"
+                  type="text"
+                  value="{{item.pageRange}}"
+                  placeholder="{{item.excelWarning ? '不适用' : '全部（如 1-5,7,9）'}}"
+                  bindinput="onFilePageRangeInput"
+                  data-index="{{index}}"
+                  disabled="{{item.excelWarning}}"
+                />
+              </view>
+              <!-- 每文件双面打印 -->
+              <view class="file-duplex-row {{item.excelWarning ? 'excel-disabled-row' : ''}}">
+                <text class="file-duplex-label">打印模式</text>
+                <view class="duplex-picker file-duplex-picker">
+                  <view class="duplex-slider {{item.duplex === 'on' ? 'slider-right' : ''}}"></view>
+                  <view
+                    class="duplex-option {{item.duplex === 'off' ? 'duplex-active' : ''}}"
+                    bindtap="onFileDuplexChange"
+                    data-index="{{index}}"
+                    data-value="off"
+                  >单面</view>
+                  <view
+                    class="duplex-option {{item.duplex === 'on' ? 'duplex-active' : ''}}"
+                    bindtap="onFileDuplexChange"
+                    data-index="{{index}}"
+                    data-value="on"
+                  >双面</view>
+                </view>
+              </view>
+            </view>
+
+            </view>
+
+            <!-- 添加文件按钮 -->
+            <button class="add-file-btn" bindtap="onChooseFile" hover-class="tap-active">
+              <text class="add-file-icon">+</text>
+              <text>{{selectedFiles.length ? '添加文件' : '点击选择文件'}}</text>
+            </button>
+          </view>
+
+                  <!-- 提交按钮：位于滚动流中，随内容自然滚动 -->
+        <view class="submit-bar">
+          <button class="submit-btn" bindtap="onSubmit" hover-class="submit-hover" loading="{{submitting}}" disabled="{{submitting}}">提交打印任务</button>
+        </view>
+      </view>
+    </view>
+  </view>
+</view>
+
+<!-- 提交成功弹窗 -->
+<view wx:if="{{showSuccessModal}}" class="modal-mask" bindtap="onCloseModal">
+  <view class="modal-card" catchtap="noop">
+    <view class="modal-icon">✅</view>
+    <view class="modal-title">任务提交成功</view>
+    <view class="modal-desc">文件已上传，打印任务已创建</view>
+    <view class="modal-actions">
+      <button class="modal-btn-cancel" bindtap="onCloseModal" hover-class="tap-active">继续打印</button>
+      <button class="modal-btn-confirm" bindtap="onViewOrders" hover-class="tap-active">查看任务</button>
+    </view>
+  </view>
+</view>
+
+<!-- 访问被拒弹窗 -->
+<view wx:if="{{showAccessDeniedModal}}" class="modal-mask" bindtap="onAccessDeniedConfirm">
+  <view class="modal-card" catchtap="noop">
+    <view class="modal-icon">🔒</view>
+    <view class="modal-title">需要许可</view>
+    <view class="modal-desc">请先出示管理员许可！</view>
+    <view class="modal-actions">
+      <button class="modal-btn-confirm" bindtap="onAccessDeniedConfirm" hover-class="tap-active">前往"我"页面</button>
+    </view>
+  </view>
+</view>

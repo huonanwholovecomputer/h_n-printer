@@ -1,0 +1,22 @@
+[Unit]
+Description=HN Cloud Print Backend (Gunicorn + Flask-SocketIO)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/printer-backend
+Environment="PATH=/opt/printer-backend/venv/bin"
+ExecStart=/opt/printer-backend/venv/bin/gunicorn -c gunicorn_config.py app:app
+
+# 自动重启
+Restart=always
+RestartSec=5
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

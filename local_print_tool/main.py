@@ -134,6 +134,32 @@ def load_stylesheet(path: str) -> str:
 
 def main():
     """主函数。"""
+    # ── 在 stderr 被劫持前保存原始 fd，用于异常追踪 ──
+    _saved_stderr_fd = os.dup(2)
+
+    # ── 安装 excepthook：traceback 写文件 + 打印到控制台 ──
+    def _debug_excepthook(etype, value, tb):
+        import traceback, datetime as _dt
+        crash_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_traceback.txt")
+        lines = []
+        lines.append(f"\n=== CRASH at {_dt.datetime.now()} ===\n")
+        lines.extend(traceback.format_exception(etype, value, tb))
+        lines.append("=== END CRASH ===\n")
+        text = "".join(lines)
+        with open(crash_log, "a", encoding="utf-8") as f:
+            f.write(text)
+        # 直接写回原始 stderr fd（绕过管道过滤器）
+        try:
+            os.write(_saved_stderr_fd, text.encode("utf-8", errors="replace"))
+        except Exception:
+            pass
+        # 也输出到 stdout
+        try:
+            print(text, file=sys.stdout, flush=True)
+        except Exception:
+            pass
+    sys.excepthook = _debug_excepthook
+
     # ── 必须在一切输出之前安装，拦截 C 库直接写 stderr ──
     _install_stderr_filter()
 

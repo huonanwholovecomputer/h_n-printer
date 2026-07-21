@@ -1,0 +1,69 @@
+<!--order-detail.wxml-->
+<navigation-bar title="任务详情" back="{{true}}" color="black" background="#FFF"></navigation-bar>
+<scroll-view class="scrollarea" scroll-y type="list">
+  <view class="container">
+
+    <!-- 加载中 -->
+    <view wx:if="{{loading}}" class="loading-box">
+      <text class="loading-text">加载中...</text>
+    </view>
+
+    <!-- 任务不存在 -->
+    <view wx:elif="{{!order && !loading}}" class="empty-state">
+      <text class="empty-icon">📋</text>
+      <text class="empty-text">任务不存在</text>
+    </view>
+
+    <!-- 任务详情 -->
+    <view wx:else class="detail-card">
+      <!-- 状态标签 -->
+      <view class="status-bar">
+        <text class="status-tag status-{{order.status}}">{{statusMap[order.status] || order.status}}</text>
+      </view>
+
+      <!-- 文件列表（多文件模式下每个文件一张卡片） -->
+      <view class="info-group">
+        <view class="info-title">文件列表 ({{order.files.length}} 个)</view>
+        <view wx:for="{{order.files}}" wx:key="id" wx:if="{{order.files.length > 0}}" class="detail-file-card">
+          <view class="detail-file-header">
+            <text class="detail-file-name">{{item.original_name || item.file_name}}</text>
+            <text class="status-tag-mini status-{{item.status}}">{{statusMap[item.status] || item.status}}</text>
+          </view>
+          <view class="detail-file-meta">
+            <text wx:if="{{item.file_type}}" class="detail-file-type">{{item.file_type}}</text>
+            <text wx:if="{{item.sizeDisplay}}" class="detail-file-size">{{item.sizeDisplay}}</text>
+            <text class="detail-file-copies">{{item.copies}} 份</text>
+          </view>
+        </view>
+      </view>
+
+      <!-- 打印信息（订单级聚合） -->
+      <view class="info-group">
+        <view class="info-title">打印信息</view>
+        <view class="info-item">
+          <text class="info-label">合计份数</text>
+          <text class="info-value">{{order.total_copies || order.copies}} 份</text>
+        </view>
+        <view class="info-item">
+          <text class="info-label">打印模式</text>
+          <text class="info-value">{{order.duplex === 'on' ? '双面' : '单面'}}</text>
+        </view>
+        <view class="info-item">
+          <text class="info-label">提交时间</text>
+          <text class="info-value">{{order.created_at}}</text>
+        </view>
+        <view class="info-item">
+          <text class="info-label">任务编号</text>
+          <text class="info-value">{{order.id}}</text>
+        </view>
+      </view>
+
+      <!-- 操作按钮 -->
+      <view class="action-bar">
+        <button wx:if="{{order.status === 'queued' || order.status === 'printing'}}" class="btn-cancel" bindtap="onCancelOrder" hover-class="cancel-hover">取消任务</button>
+        <button wx:if="{{order.status === 'sent'}}" class="btn-reprint" bindtap="onReprint" hover-class="reprint-hover">重新打印</button>
+      </view>
+    </view>
+
+  </view>
+</scroll-view>

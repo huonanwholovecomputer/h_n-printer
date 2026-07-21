@@ -1,0 +1,20 @@
+{
+  "simplex_price": 0.2,
+  "duplex_price": 0.3,
+  "cover_page_price": 0.10,
+  "delivery_locations": ["1号楼北楼", "1号楼南楼", "图书馆", "教学楼E/F", "女生宿舍"],
+  "delivery_percentages": {
+    "1号楼北楼": 0,
+    "1号楼南楼": 5,
+    "图书馆": 15,
+    "教学楼E/F": 20,
+    "女生宿舍": 10
+  },
+  "urgency_levels": ["低", "中", "高"],
+  "urgency_prices": {
+    "低": 0,
+    "中": 0.08,
+    "高": 0.15
+  },
+  "pickup_address": "1号楼202宿舍"
+}
