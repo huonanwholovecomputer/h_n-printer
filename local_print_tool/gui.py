@@ -1043,6 +1043,7 @@ class CloudTaskListWindow(QDialog):
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(34)
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -1142,23 +1143,23 @@ class CloudTaskListWindow(QDialog):
             if status == "pending":
                 btn_widget = QWidget()
                 btn_layout = QHBoxLayout(btn_widget)
-                btn_layout.setContentsMargins(2, 1, 2, 1)
+                btn_layout.setContentsMargins(0, 0, 0, 0)
                 btn_layout.setSpacing(4)
 
                 accept_btn = QPushButton("📥 添加")
-                accept_btn.setFixedWidth(70)
+                accept_btn.setFixedSize(70, 24)
                 accept_btn.clicked.connect(lambda checked=False, ts=tasks: self._on_accept_order(ts))
                 btn_layout.addWidget(accept_btn)
 
                 reject_btn = QPushButton("↩ 打回")
-                reject_btn.setFixedWidth(70)
+                reject_btn.setFixedSize(70, 24)
                 reject_btn.clicked.connect(lambda checked=False, ts=tasks: self._on_reject_order(ts))
                 btn_layout.addWidget(reject_btn)
 
                 self._table.setCellWidget(row, 4, btn_widget)
             elif status == "canceled":
                 info_btn = QPushButton("✕ 已取消")
-                info_btn.setFixedWidth(80)
+                info_btn.setFixedSize(80, 24)
                 info_btn.setEnabled(False)
                 self._table.setCellWidget(row, 4, info_btn)
             else:
