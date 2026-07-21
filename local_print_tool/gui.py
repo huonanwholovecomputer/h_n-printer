@@ -972,13 +972,12 @@ class DropTableWidget(QTableWidget):
 # ============================================================
 
 class CloudTaskListWindow(QDialog):
-    """统一的云端任务列表窗口，管理所有待确认的云端打印任务。
+    """统一的云端任务列表窗口，按订单分组管理待确认的云端打印任务。
     非模态，支持批量操作、取消响应和自动关闭。"""
 
-    task_accepted = Signal(object)   # CloudTask — 用户确认添加
-    task_rejected = Signal(object)   # CloudTask — 用户打回
-    all_accepted = Signal()          # 全部添加
-    all_rejected = Signal()          # 全部打回
+    # 信号：emit 订单中所有任务的列表
+    order_accepted = Signal(list)   # list[CloudTask] — 用户确认添加某订单
+    order_rejected = Signal(list)   # list[CloudTask] — 用户打回某订单
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -988,8 +987,9 @@ class CloudTaskListWindow(QDialog):
         self.setModal(False)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
-        self._pending_tasks: dict[int, dict] = {}  # task_id → {"task": CloudTask, "status": str, "canceled_at": float}
-        self._auto_close_seconds = 300  # 默认 5 分钟
+        # order_id → {"order_number": str, "tasks": [CloudTask], "status": str, "canceled_at": float|None}
+        self._pending_orders: dict[int, dict] = {}
+        self._auto_close_seconds = 300
         self._auto_close_timer = QTimer(self)
         self._auto_close_timer.setSingleShot(True)
         self._auto_close_timer.timeout.connect(self._on_auto_close)
@@ -1026,21 +1026,21 @@ class CloudTaskListWindow(QDialog):
         auto_row.addWidget(QLabel("后自动关闭"))
         layout.addLayout(auto_row)
 
-        # ── 表格 ──
+        # ── 表格：订单号 | 文件数 | 总页数 | 状态 | 操作 ──
         from PySide6.QtWidgets import QTableWidget as _QTW, QTableWidgetItem as _QTWI
         self._table = _QTW()
         self._table.setColumnCount(5)
-        self._table.setHorizontalHeaderLabels(["订单号", "文件名", "份数", "状态", "操作"])
+        self._table.setHorizontalHeaderLabels(["订单号", "文件数", "总页数", "状态", "操作"])
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
         hh = self._table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.Stretch)
         layout.addWidget(self._table, 1)
 
         # ── 按钮行 ──
@@ -1067,14 +1067,22 @@ class CloudTaskListWindow(QDialog):
     # ── 公共 API ──
 
     def add_task(self, task: CloudTask):
-        """添加一个待确认的云端任务。若窗口未显示则自动弹出。"""
-        if task.task_id in self._pending_tasks:
-            return  # 去重
-        self._pending_tasks[task.task_id] = {
-            "task": task,
-            "status": "pending",
-            "canceled_at": None,
-        }
+        """添加一个待确认的云端任务，按订单分组。"""
+        oid = task.order_id or task.task_id  # 无 order_id 时按 task_id 自分组
+        if oid not in self._pending_orders:
+            self._pending_orders[oid] = {
+                "order_number": task.order_number or f"#{oid}",
+                "tasks": [],
+                "status": "pending",
+                "canceled_at": None,
+            }
+        entry = self._pending_orders[oid]
+        # 去重
+        if any(t.task_id == task.task_id for t in entry["tasks"]):
+            return
+        entry["tasks"].append(task)
+        if entry["status"] != "canceled":
+            entry["status"] = "pending"
         self._cancel_auto_close()
         self._rebuild_table()
         if not self.isVisible():
@@ -1082,36 +1090,38 @@ class CloudTaskListWindow(QDialog):
             self._cancel_remove_timer.start()
 
     def mark_canceled(self, order_id: int, task_ids: list[int]):
-        """标记指定订单的任务为已取消（响应 F6 取消推送）。"""
-        now = time.time()
-        for tid in task_ids:
-            if tid in self._pending_tasks:
-                entry = self._pending_tasks[tid]
-                if entry["status"] == "pending":
-                    entry["status"] = "canceled"
-                    entry["canceled_at"] = now
+        """标记指定订单为已取消（响应 F6 取消推送）。"""
+        if order_id in self._pending_orders:
+            entry = self._pending_orders[order_id]
+            if entry["status"] == "pending":
+                entry["status"] = "canceled"
+                entry["canceled_at"] = time.time()
         self._rebuild_table()
         self._check_auto_close()
 
     def _rebuild_table(self):
-        """刷新表格内容。"""
+        """刷新表格：按订单分组显示。"""
+        from PySide6.QtWidgets import QTableWidgetItem as _QTWI
         self._table.setRowCount(0)
-        for tid, entry in self._pending_tasks.items():
-            task = entry["task"]
+        for oid, entry in self._pending_orders.items():
+            tasks = entry["tasks"]
             status = entry["status"]
+            file_count = len(tasks)
+            total_pages = sum(getattr(t, 'page_count', 0) or 0 for t in tasks) * sum(max(1, t.copies) for t in tasks) if tasks else 0
+            # 简化：总页数暂不计算（CloudTask无page_count），显示文件数即可
+            total_cost = 0  # 后续可从任务详情获取
+
             row = self._table.rowCount()
             self._table.insertRow(row)
 
             # 订单号
-            from PySide6.QtWidgets import QTableWidgetItem as _QTWI
-            order_text = task.order_number or f"#{task.order_id}"
-            self._table.setItem(row, 0, _QTWI(order_text))
+            self._table.setItem(row, 0, _QTWI(entry["order_number"]))
 
-            # 文件名
-            self._table.setItem(row, 1, _QTWI(task.file_name))
+            # 文件数
+            self._table.setItem(row, 1, _QTWI(str(file_count)))
 
-            # 份数
-            self._table.setItem(row, 2, _QTWI(str(task.copies)))
+            # 总页数（暂无精确数据，显示 "—"）
+            self._table.setItem(row, 2, _QTWI("—"))
 
             # 状态
             status_text = {"pending": "待确认", "canceled": "已取消", "accepted": "已添加", "rejected": "已打回"}
@@ -1129,12 +1139,12 @@ class CloudTaskListWindow(QDialog):
 
                 accept_btn = QPushButton("📥 添加")
                 accept_btn.setFixedWidth(70)
-                accept_btn.clicked.connect(lambda checked=False, t=task: self._on_accept_one(t))
+                accept_btn.clicked.connect(lambda checked=False, ts=tasks: self._on_accept_order(ts))
                 btn_layout.addWidget(accept_btn)
 
                 reject_btn = QPushButton("↩ 打回")
                 reject_btn.setFixedWidth(70)
-                reject_btn.clicked.connect(lambda checked=False, t=task: self._on_reject_one(t))
+                reject_btn.clicked.connect(lambda checked=False, ts=tasks: self._on_reject_order(ts))
                 btn_layout.addWidget(reject_btn)
 
                 self._table.setCellWidget(row, 4, btn_widget)
@@ -1146,58 +1156,63 @@ class CloudTaskListWindow(QDialog):
             else:
                 self._table.setItem(row, 4, _QTWI("—"))
 
-        # 更新按钮状态
-        has_pending = any(e["status"] == "pending" for e in self._pending_tasks.values())
+        has_pending = any(e["status"] == "pending" for e in self._pending_orders.values())
         self._accept_all_btn.setEnabled(has_pending)
         self._reject_all_btn.setEnabled(has_pending)
 
-    # ── 单任务操作 ──
+    # ── 单订单操作 ──
 
-    def _on_accept_one(self, task: CloudTask):
-        if task.task_id in self._pending_tasks:
-            self._pending_tasks[task.task_id]["status"] = "accepted"
-        self.task_accepted.emit(task)
+    def _on_accept_order(self, tasks: list):
+        """确认添加某订单的全部文件。"""
+        oid = tasks[0].order_id or tasks[0].task_id
+        if oid in self._pending_orders:
+            self._pending_orders[oid]["status"] = "accepted"
+        for task in tasks:
+            self.order_accepted.emit([task])
         self._rebuild_table()
         self._check_auto_close()
 
-    def _on_reject_one(self, task: CloudTask):
-        if task.task_id in self._pending_tasks:
-            self._pending_tasks[task.task_id]["status"] = "rejected"
-        self.task_rejected.emit(task)
+    def _on_reject_order(self, tasks: list):
+        """打回某订单的全部文件。"""
+        oid = tasks[0].order_id or tasks[0].task_id
+        if oid in self._pending_orders:
+            self._pending_orders[oid]["status"] = "rejected"
+        self.order_rejected.emit(tasks)
         self._rebuild_table()
         self._check_auto_close()
 
     # ── 批量操作 ──
 
     def _on_accept_all(self):
-        pending = [e["task"] for e in self._pending_tasks.values() if e["status"] == "pending"]
-        if not pending:
+        pending_orders = [(oid, e) for oid, e in self._pending_orders.items() if e["status"] == "pending"]
+        if not pending_orders:
             return
         reply = QMessageBox.question(
-            self, "全部添加", f"将为 {len(pending)} 个任务各创建一个新标签页，确定吗？",
+            self, "全部添加", f"将为 {len(pending_orders)} 个订单各创建一个新标签页，确定吗？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         )
         if reply != QMessageBox.Yes:
             return
-        for task in pending:
-            self._pending_tasks[task.task_id]["status"] = "accepted"
-            self.task_accepted.emit(task)
+        for oid, entry in pending_orders:
+            entry["status"] = "accepted"
+            for task in entry["tasks"]:
+                self.order_accepted.emit([task])
         self._rebuild_table()
         self._check_auto_close()
 
     def _on_reject_all(self):
-        pending = [e["task"] for e in self._pending_tasks.values() if e["status"] == "pending"]
-        if not pending:
+        pending_orders = [(oid, e) for oid, e in self._pending_orders.items() if e["status"] == "pending"]
+        if not pending_orders:
             return
         reply = QMessageBox.question(
-            self, "全部打回", f"将打回 {len(pending)} 个待确认任务，确定吗？",
+            self, "全部打回", f"将打回 {len(pending_orders)} 个待确认订单，确定吗？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
         )
         if reply != QMessageBox.Yes:
             return
-        for task in pending:
-            self._pending_tasks[task.task_id]["status"] = "rejected"
-            self.task_rejected.emit(task)
+        for oid, entry in pending_orders:
+            entry["status"] = "rejected"
+            self.order_rejected.emit(entry["tasks"])
         self._rebuild_table()
         self._check_auto_close()
 
@@ -1207,10 +1222,8 @@ class CloudTaskListWindow(QDialog):
         self._auto_close_seconds = self._auto_minutes.value() * 60 + self._auto_seconds.value()
 
     def _check_auto_close(self):
-        """检查是否所有任务已处理完毕，启动自动关闭计时器。"""
-        has_pending = any(e["status"] == "pending" for e in self._pending_tasks.values())
-        all_done = not has_pending and len(self._pending_tasks) > 0
-
+        has_pending = any(e["status"] == "pending" for e in self._pending_orders.values())
+        all_done = not has_pending and len(self._pending_orders) > 0
         if all_done:
             if not self._auto_close_timer.isActive():
                 self._auto_close_timer.start(self._auto_close_seconds * 1000)
@@ -1220,29 +1233,25 @@ class CloudTaskListWindow(QDialog):
     def _cancel_auto_close(self):
         if self._auto_close_timer.isActive():
             self._auto_close_timer.stop()
-        # 清理已处理的条目
-        self._pending_tasks = {
-            tid: e for tid, e in self._pending_tasks.items()
+        self._pending_orders = {
+            oid: e for oid, e in self._pending_orders.items()
             if e["status"] == "pending"
         }
-        if not self._pending_tasks:
+        if not self._pending_orders:
             self._auto_close_timer.start(self._auto_close_seconds * 1000)
 
     def _on_auto_close(self):
-        """自动关闭：无待确认任务且计时器到期。"""
-        pending = [e for e in self._pending_tasks.values() if e["status"] == "pending"]
-        if not pending:
+        if not any(e["status"] == "pending" for e in self._pending_orders.values()):
             self._cancel_remove_timer.stop()
             self.hide()
 
     def _check_canceled_expiry(self):
-        """定期检查已取消任务是否超过 5 秒，超时移除。"""
         now = time.time()
         changed = False
-        for tid, entry in list(self._pending_tasks.items()):
+        for oid, entry in list(self._pending_orders.items()):
             if entry["status"] == "canceled" and entry["canceled_at"]:
                 if now - entry["canceled_at"] > 5:
-                    del self._pending_tasks[tid]
+                    del self._pending_orders[oid]
                     changed = True
         if changed:
             self._rebuild_table()
@@ -1251,26 +1260,25 @@ class CloudTaskListWindow(QDialog):
     # ── 关闭 ──
 
     def _on_close(self):
-        """关闭窗口：检查是否有未确认任务，提示全部打回。"""
-        pending = [e["task"] for e in self._pending_tasks.values() if e["status"] == "pending"]
-        if pending:
+        pending_orders = [(oid, e) for oid, e in self._pending_orders.items() if e["status"] == "pending"]
+        if pending_orders:
             reply = QMessageBox.question(
                 self, "关闭窗口",
-                f"还有 {len(pending)} 个未确认的任务，关闭将全部打回。\n确定关闭吗？",
+                f"还有 {len(pending_orders)} 个未确认的订单，关闭将全部打回。\n确定关闭吗？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 return
-            for task in pending:
-                self._pending_tasks[task.task_id]["status"] = "rejected"
-                self.task_rejected.emit(task)
+            for oid, entry in pending_orders:
+                entry["status"] = "rejected"
+                self.order_rejected.emit(entry["tasks"])
         self._cancel_remove_timer.stop()
         self._auto_close_timer.stop()
         self.hide()
 
     def closeEvent(self, event):
         self._on_close()
-        event.ignore()  # 不真正关闭，只是隐藏
+        event.ignore()
 
 
 # ============================================================
@@ -1365,8 +1373,8 @@ class MainWindow(QMainWindow):
 
         # 初始化云端任务列表窗口（非模态，复用）
         self._cloud_task_window = CloudTaskListWindow(self)
-        self._cloud_task_window.task_accepted.connect(self._on_cloud_task_accepted)
-        self._cloud_task_window.task_rejected.connect(self._on_cloud_task_rejected)
+        self._cloud_task_window.order_accepted.connect(self._on_cloud_order_accepted)
+        self._cloud_task_window.order_rejected.connect(self._on_cloud_order_rejected)
 
         # 如果配置了 token 且启用了云端，自动连接
         if self._config.cloud_enabled and self._config.cloud_token:
@@ -2951,7 +2959,7 @@ class MainWindow(QMainWindow):
         return available.get("word", False) or available.get("wps", False) or available.get("libreoffice", False)
 
     def _ensure_order_number(self) -> str:
-        """确保当前标签页有订单号，若无则生成并分配。返回订单号字符串。"""
+        """确保当前标签页有订单号，若无则从后端获取（保证全局唯一）。离线时降级为本地生成。"""
         jobs = self._get_current_jobs()
         if not jobs:
             return ""
@@ -2959,10 +2967,26 @@ class MainWindow(QMainWindow):
         for j in jobs:
             if j.order_number:
                 return j.order_number
-        # 生成新订单号
-        from printer_config import generate_order_number
-        order_number, next_num = generate_order_number(self._config.last_order_number)
-        self._config.last_order_number = next_num
+        # 优先从后端获取唯一订单号
+        order_number = ""
+        if self._cloud_client and self._cloud_client.api_url and self._cloud_client.token:
+            try:
+                resp = http_requests.get(
+                    f"{self._cloud_client.api_url}/api/next_order_number",
+                    params={"token": self._cloud_client.token},
+                    timeout=5,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    if data.get("success"):
+                        order_number = data.get("order_number", "")
+            except Exception:
+                pass
+        # 降级：离线时本地生成
+        if not order_number:
+            from printer_config import generate_order_number
+            order_number, next_num = generate_order_number(self._config.last_order_number)
+            self._config.last_order_number = next_num
         # 分配给当前标签页所有任务
         for j in jobs:
             j.order_number = order_number
@@ -3520,17 +3544,24 @@ class MainWindow(QMainWindow):
                     )
                     break
 
-    def _on_cloud_task_accepted(self, task: CloudTask):
-        """用户从云端任务列表窗口确认添加单个任务。"""
-        self._processed_cloud_tasks.add(task.task_id)
-        self._add_cloud_task_to_new_tab(task)
+    def _on_cloud_order_accepted(self, tasks: list):
+        """用户从云端任务列表窗口确认添加订单中的全部任务到同一个新标签页。"""
+        if not tasks:
+            return
+        # 第一个任务用现有逻辑创建标签页
+        first = tasks[0]
+        for task in tasks:
+            self._processed_cloud_tasks.add(task.task_id)
+        self._add_cloud_tasks_to_new_tab(tasks)
 
-    def _on_cloud_task_rejected(self, task: CloudTask):
-        """用户从云端任务列表窗口打回单个任务。"""
-        self._processed_cloud_tasks.add(task.task_id)
-        if task.order_id and self._cloud_client:
-            self._cloud_client.reject_order_to_server(task.order_id)
-        self._cloud_tasks.pop(task.task_id, None)
+    def _on_cloud_order_rejected(self, tasks: list):
+        """用户从云端任务列表窗口打回订单中的任务。"""
+        for task in tasks:
+            self._processed_cloud_tasks.add(task.task_id)
+        if tasks and tasks[0].order_id and self._cloud_client:
+            self._cloud_client.reject_order_to_server(tasks[0].order_id)
+        for task in tasks:
+            self._cloud_tasks.pop(task.task_id, None)
 
     def _on_cloud_connection_changed(self, connected: bool):
         """云端连接状态改变。"""
@@ -3687,11 +3718,23 @@ class MainWindow(QMainWindow):
             except OSError as e:
                 self._log(f"  → 保存转换副本到桌面失败: {e}")
 
-    def _add_cloud_task_to_new_tab(self, task: CloudTask):
-        """将云端任务添加到新的标签页并切换过去。会检查 PDF 缓存避免重复转换。"""
-        tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
-        new_key = str(int(tab_keys[-1]) + 1) if tab_keys else "1"
-        self._config.tabs[new_key] = []
+    def _add_cloud_tasks_to_new_tab(self, tasks: list):
+        """将同一订单的多个云端任务添加到同一个新标签页。"""
+        if not tasks:
+            return
+        for task in tasks:
+            self._add_cloud_task_to_new_tab(task, is_first=(task == tasks[0]))
+
+    def _add_cloud_task_to_new_tab(self, task: CloudTask, is_first: bool = True):
+        """将云端任务添加到新的标签页并切换过去。is_first=False 时追加到当前标签页。"""
+        if is_first:
+            tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+            new_key = str(int(tab_keys[-1]) + 1) if tab_keys else "1"
+            self._config.tabs[new_key] = []
+            self._current_tab = new_key
+            self._config.active_tab = new_key
+        else:
+            new_key = self._current_tab
 
         ext = os.path.splitext(task.local_path)[1].lower() if task.local_path else ""
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
@@ -3759,13 +3802,6 @@ class MainWindow(QMainWindow):
         )
         self._config.tabs[new_key].append(job)
 
-        self._current_tab = new_key
-        self._config.active_tab = new_key
-        self._save_config()
-        self._rebuild_table()
-        self._refresh_tab_display()
-        self._sync_edit_enabled(False)
-
         # Word 文件：缓存未命中时才启动转换
         if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
             self._start_convert_worker(0, task.local_path, engine)
@@ -3773,6 +3809,12 @@ class MainWindow(QMainWindow):
         self._log(f"☁ 云端任务 #{task.task_id} 已添加到标签页 {new_key}")
         if self._cloud_client:
             self._cloud_client.accept_task(task.task_id)
+
+        if is_first:
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
 
     # ──────── 清空 / 撤回 / 移除 / 打印 ────────
 
