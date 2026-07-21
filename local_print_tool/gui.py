@@ -1310,6 +1310,7 @@ class MainWindow(QMainWindow):
         self._last_dir = self._config.last_dir
         self._copy_total_btn: Optional[QPushButton] = None
         self._copy_total_timer: Optional[QTimer] = None
+        self._all_printed = False  # 是否已完成全部打印
 
         # ── 文件日志 ──
         self._log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -3461,6 +3462,7 @@ class MainWindow(QMainWindow):
         """全部任务完成。"""
         self._btn_start.setEnabled(True)
         self._worker = None
+        self._all_printed = (fail_count == 0)  # 无失败视为已完成
 
         total = success_count + fail_count
         self._status_label.setText(f"完成：成功 {success_count} / {total}")
@@ -3786,7 +3788,7 @@ class MainWindow(QMainWindow):
         for key, tab in self._config.tabs.items():
             total_files += len(tab.jobs)
 
-        if total_files > 0:
+        if total_files > 0 and not self._all_printed:
             reply = QMessageBox.question(
                 self, "存在未完成的任务",
                 f"当前共有 {total_files} 个文件分布在 {len(self._config.tabs)} 个标签页中尚未打印。\n\n"
@@ -3952,7 +3954,14 @@ class MainWindow(QMainWindow):
         if is_first:
             tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
             new_key = str(int(tab_keys[-1]) + 1) if tab_keys else "1"
-            self._config.tabs[new_key] = TabSettings()
+            # 用前端订单的附加服务覆盖默认值
+            tab_settings = TabSettings()
+            tab_settings.delivery_enabled = task.delivery_enabled
+            tab_settings.delivery_location = task.delivery_location
+            tab_settings.urgency = task.urgency
+            tab_settings.cover_page = task.cover_page
+            tab_settings.cover_page_price = task.cover_page_price
+            self._config.tabs[new_key] = tab_settings
             self._current_tab = new_key
             self._config.active_tab = new_key
         else:
