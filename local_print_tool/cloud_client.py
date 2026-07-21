@@ -208,6 +208,22 @@ class CloudClient(QObject):
             task.status = "rejected"
             self.task_updated.emit(task)
 
+    def accept_order_to_server(self, order_id: int):
+        """确认接受订单：调用后端 API，将订单状态设为 accepted。"""
+        if not self.api_url or not self.token:
+            return
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/accept_order",
+                params={"token": self.token},
+                json={"order_id": order_id},
+                timeout=10,
+            )
+            if resp.ok:
+                self.status_message.emit(f"☁ 订单 #{order_id} 已确认接受")
+        except Exception as e:
+            self.status_message.emit(f"☁ 确认订单 #{order_id} 异常: {e}")
+
     def reject_order_to_server(self, order_id: int):
         """打回订单：调用后端 API，将订单状态设为 rejected。"""
         if not self.api_url or not self.token:
