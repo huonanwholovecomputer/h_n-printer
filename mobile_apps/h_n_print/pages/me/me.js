@@ -15,7 +15,7 @@ Component({
     ordersHasMore: false,
     statusMap: {
       queued: '排队中',
-      printing: '打印中',
+      printing: '待添加',
       accepted: '已添加',
       offline_unknown: '断线未知',
       sent: '已完成',
