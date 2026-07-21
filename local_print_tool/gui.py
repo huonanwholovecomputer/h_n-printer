@@ -1851,9 +1851,16 @@ class MainWindow(QMainWindow):
         self._tab_btn_plus.setToolTip("下一个标签页 / 新建标签页")
         self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
 
+        self._tab_btn_cleanup_empty = QPushButton("🗑 空")
+        self._tab_btn_cleanup_empty.setObjectName("tabBtnCleanupEmpty")
+        self._tab_btn_cleanup_empty.setFixedHeight(28)
+        self._tab_btn_cleanup_empty.setToolTip("删除所有空标签页（不含当前）")
+        self._tab_btn_cleanup_empty.clicked.connect(self._on_cleanup_empty_tabs)
+
         tab_row.addWidget(self._tab_btn_minus)
         tab_row.addWidget(self._tab_label)
         tab_row.addWidget(self._tab_btn_plus)
+        tab_row.addWidget(self._tab_btn_cleanup_empty)
         tab_row.addStretch()
 
         # 标签页信息标签
@@ -1902,6 +1909,10 @@ class MainWindow(QMainWindow):
         # ── 合计费用 ──
         total_row = QHBoxLayout()
         total_row.setContentsMargins(0, 0, 0, 0)
+        # F9: 当前标签页订单号
+        self._order_number_label = QLabel("")
+        self._order_number_label.setObjectName("orderNumberLabel")
+        total_row.addWidget(self._order_number_label)
         total_row.addStretch()
         self._total_label = QLabel("合计: ¥0.00")
         self._total_label.setObjectName("totalCostLabel")
@@ -1975,6 +1986,40 @@ class MainWindow(QMainWindow):
         self._refresh_tab_display()
         self._sync_edit_enabled(False)
 
+        # F3: 向左切换后，删除序号更大的空标签页
+        if delta < 0:
+            self._cleanup_empty_tabs(after_key=self._current_tab)
+
+    def _has_empty_tabs_except_current(self) -> bool:
+        """检查是否存在非当前标签页的空标签页。"""
+        for key, jobs in self._config.tabs.items():
+            if key != self._current_tab and len(jobs) == 0:
+                return True
+        return False
+
+    def _cleanup_empty_tabs(self, after_key: str | None = None):
+        """删除空标签页。after_key 不为 None 时仅删除 key > after_key 的标签页。"""
+        removed = []
+        for key in sorted(self._config.tabs.keys(), key=lambda x: int(x)):
+            if key == self._current_tab:
+                continue
+            if after_key is not None and int(key) <= int(after_key):
+                continue
+            if len(self._config.tabs.get(key, [])) == 0:
+                removed.append(key)
+        for key in removed:
+            del self._config.tabs[key]
+            self._log(f"🗑 已删除空标签页 {key}")
+        if removed:
+            self._save_config()
+            self._refresh_tab_display()
+
+    def _on_cleanup_empty_tabs(self):
+        """F4: 点击"删除空标签页"按钮。"""
+        if not self._has_empty_tabs_except_current():
+            return
+        self._cleanup_empty_tabs()
+
     def _refresh_tab_display(self):
         """刷新标签页数字显示和按钮状态。"""
         self._tab_label.setText(self._current_tab)
@@ -1987,6 +2032,8 @@ class MainWindow(QMainWindow):
 
         # 更新按钮启用状态
         self._tab_btn_minus.setEnabled(idx > 0)
+        # F4: 存在空标签页（不含当前）时启用按钮
+        self._tab_btn_cleanup_empty.setEnabled(self._has_empty_tabs_except_current())
 
         # 更新信息标签
         jobs = self._config.tabs.get(self._current_tab, [])
@@ -1994,6 +2041,17 @@ class MainWindow(QMainWindow):
                               self._config.simplex_price, self._config.duplex_price,
                               j.page_range)[0] for j in jobs)
         self._tab_info_label.setText(f"共 {len(jobs)} 个文件 · 合计 ¥{total:.2f}")
+
+        # F9: 更新订单号显示
+        order_num = ""
+        for j in jobs:
+            if j.order_number:
+                order_num = j.order_number
+                break
+        if order_num:
+            self._order_number_label.setText(f"📋 {order_num}")
+        else:
+            self._order_number_label.setText("📋 未分配订单号")
 
     def _get_current_jobs(self) -> list[PrintJob]:
         """返回当前标签页的任务列表。"""
@@ -2032,8 +2090,8 @@ class MainWindow(QMainWindow):
         # 表格
         from PySide6.QtWidgets import QTableWidget as _QTW, QTableWidgetItem as _QTWI
         table = _QTW()
-        table.setColumnCount(5)
-        table.setHorizontalHeaderLabels(["标签", "文件数", "总页数", "合计费用", "来源"])
+        table.setColumnCount(6)
+        table.setHorizontalHeaderLabels(["标签", "文件数", "总页数", "合计费用", "来源", "订单号"])
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -2044,6 +2102,7 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.Stretch)
         hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
         tab_keys = []
 
@@ -2061,6 +2120,12 @@ class MainWindow(QMainWindow):
                                            j.page_range)[0] for j in jobs)
                 has_cloud = any(j.task_id > 0 for j in jobs)
                 source = "☁ 云端" if has_cloud else ("📂 本地" if file_count > 0 else "空")
+                # 取第一个非空订单号（云端任务有，本地任务在复制时生成）
+                order_num = ""
+                for j in jobs:
+                    if j.order_number:
+                        order_num = j.order_number
+                        break
 
                 row = table.rowCount()
                 table.insertRow(row)
@@ -2070,6 +2135,7 @@ class MainWindow(QMainWindow):
                 table.setItem(row, 2, _QTWI(str(total_pages)))
                 table.setItem(row, 3, _QTWI(f"¥{total_cost:.2f}"))
                 table.setItem(row, 4, _QTWI(source))
+                table.setItem(row, 5, _QTWI(order_num))
 
         _rebuild_dialog_table()
 
@@ -2162,6 +2228,29 @@ class MainWindow(QMainWindow):
             self._sync_edit_enabled(False)
             self._log("已清空全部标签页")
             _rebuild_dialog_table()
+
+        def _cleanup_empty_in_dialog():
+            """在标签页管理器中删除空标签页。"""
+            removed = []
+            for key in sorted(self._config.tabs.keys(), key=lambda x: int(x)):
+                if key == self._current_tab:
+                    continue
+                if len(self._config.tabs.get(key, [])) == 0:
+                    removed.append(key)
+            if not removed:
+                return
+            for key in removed:
+                del self._config.tabs[key]
+                self._log(f"🗑 已删除空标签页 {key}")
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+            _rebuild_dialog_table()
+
+        cleanup_empty_btn = QPushButton("🗑 删除空标签页")
+        cleanup_empty_btn.clicked.connect(_cleanup_empty_in_dialog)
+        btn_row.addWidget(cleanup_empty_btn)
 
         del_all_btn = QPushButton("✕ 清空全部标签页")
         del_all_btn.setObjectName("cloudRejectBtn")
@@ -2790,16 +2879,41 @@ class MainWindow(QMainWindow):
         available = get_available_engines()
         return available.get("word", False) or available.get("wps", False) or available.get("libreoffice", False)
 
+    def _ensure_order_number(self) -> str:
+        """确保当前标签页有订单号，若无则生成并分配。返回订单号字符串。"""
+        jobs = self._get_current_jobs()
+        if not jobs:
+            return ""
+        # 检查是否已有订单号
+        for j in jobs:
+            if j.order_number:
+                return j.order_number
+        # 生成新订单号
+        from printer_config import generate_order_number
+        order_number, next_num = generate_order_number(self._config.last_order_number)
+        self._config.last_order_number = next_num
+        # 分配给当前标签页所有任务
+        for j in jobs:
+            j.order_number = order_number
+        self._set_current_jobs(jobs)
+        self._refresh_tab_display()
+        self._log(f"📋 已分配订单号: {order_number}")
+        return order_number
+
     def _on_copy_total(self):
-        """复制合计金额到剪贴板。"""
+        """复制合计金额到剪贴板（含订单号）。"""
+        order_number = self._ensure_order_number()
         text = self._total_label.text()
         # 去掉"合计: "前缀和"≈ "前缀，保留 ¥ 符号
         amount = text.replace("合计: ", "").replace("≈ ", "").strip()
         try:
             # 验证是否为有效金额
             float(amount.replace("¥", ""))
+            copy_text = amount
+            if order_number:
+                copy_text = f"{order_number} — {amount}"
             clipboard = QApplication.clipboard()
-            clipboard.setText(amount)
+            clipboard.setText(copy_text)
             if self._copy_total_btn:
                 self._copy_total_btn.setText("✅ 已复制")
                 self._copy_total_btn.setEnabled(False)
@@ -3292,16 +3406,23 @@ class MainWindow(QMainWindow):
     # ──────── 复制详情 ────────
 
     def _on_copy_detail(self):
-        """复制当前标签页的计费明细到剪贴板。"""
+        """复制当前标签页的计费明细到剪贴板（含订单号）。"""
         jobs = self._get_current_jobs()
         if not jobs:
             return
-        lines = ["计费明细", "-" * 14]
+        order_number = self._ensure_order_number()
+        lines = []
+        if order_number:
+            lines.append(f"订单号: {order_number}")
+            lines.append("-" * 14)
+        lines.append("计费明细")
+        lines.append("-" * 14)
         for i, job in enumerate(jobs, 1):
             cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
                                        self._config.simplex_price, self._config.duplex_price,
                                        job.page_range)
-            lines.append(f"{i}. {os.path.basename(job.file_path)}")
+            display = job.display_name or os.path.basename(job.file_path)
+            lines.append(f"{i}. {display}")
             lines.append(f"   {job.copies}x {'双面' if job.duplex=='on' else '单面'} 范围:{job.page_range or '全部'}")
             if cost > 0:
                 lines.append(f"   {formula} = ¥{cost:.2f}")
@@ -3445,6 +3566,7 @@ class MainWindow(QMainWindow):
             task_id=task.task_id,
             source_md5=source_md5,
             display_name=task.file_name,  # 使用后端返回的原始文件名
+            order_number=task.order_number,  # 云端订单号
             cached_pdf=cached_pdf,        # 使用缓存的 PDF（如有）
         )
         self._config.tabs[new_key].append(job)
