@@ -1519,7 +1519,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._setup_edit_panel())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([780, 120])
+        splitter.setSizes([700, 200])
         top_layout.addWidget(splitter, 1)
 
         # -- 进度条 --
@@ -2746,8 +2746,9 @@ class MainWindow(QMainWindow):
         self._urgency_combo.blockSignals(False)
 
         self._urgency_price_spin.blockSignals(True)
-        self._urgency_price_spin.setValue(
-            self._config.urgency_prices.get(self._config.urgency, 0.0))
+        urgency_price = 0.0 if self._config.urgency == "低" else self._config.urgency_prices.get(self._config.urgency, 0.0)
+        self._urgency_price_spin.setValue(urgency_price)
+        self._urgency_price_spin.setEnabled(self._config.urgency != "低")
         self._urgency_price_spin.blockSignals(False)
 
         self._cover_page_onoff_combo.blockSignals(True)
@@ -2840,10 +2841,12 @@ class MainWindow(QMainWindow):
         self._on_price_changed()
 
     def _on_urgency_changed(self):
-        """优先级变更 → 更新价格 spinbox。"""
+        """优先级变更 → 更新价格 spinbox。"低"时锁定为 0.00 并禁用。"""
         level = self._urgency_combo.currentText()
         self._config.urgency = level
-        price = self._config.urgency_prices.get(level, 0.0)
+        is_low = (level == "低")
+        self._urgency_price_spin.setEnabled(not is_low)
+        price = 0.0 if is_low else self._config.urgency_prices.get(level, 0.0)
         self._urgency_price_spin.blockSignals(True)
         self._urgency_price_spin.setValue(price)
         self._urgency_price_spin.blockSignals(False)
