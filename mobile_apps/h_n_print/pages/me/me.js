@@ -117,12 +117,54 @@ Component({
     },
   },
   methods: {
-    // 订单状态轮询
+    // 订单状态轮询（静默增量更新，不触发全量渲染）
     _startOrderPolling() {
       this._stopOrderPolling()
       this._orderPollTimer = setInterval(() => {
-        this.loadOrders(1, false)
+        this._pollOrdersSilent()
       }, 5000)
+    },
+    _pollOrdersSilent() {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      wx.request({
+        url: CONFIG.BASE_URL + '/api/orders',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        data: { page: 1, per_page: 20 },
+        success: (res) => {
+          if (res.statusCode !== 200 || !res.data || !res.data.success) return
+          const newOrders = res.data.orders || []
+          const oldOrders = this.data.orders || []
+          // 逐条对比，仅更新变化的 status 字段
+          const updates = {}
+          let changed = false
+          const maxLen = Math.max(newOrders.length, oldOrders.length)
+          for (let i = 0; i < maxLen; i++) {
+            const n = newOrders[i], o = oldOrders[i]
+            if (!n || !o) { changed = true; break }  // 数量变了，全量刷新
+            if (n.id !== o.id) { changed = true; break }
+            if (n.status !== o.status) {
+              updates['orders[' + i + '].status'] = n.status
+              // 同步更新子文件状态
+              if (n.files && o.files) {
+                for (let j = 0; j < Math.min(n.files.length, o.files.length); j++) {
+                  if (n.files[j].status !== o.files[j].status) {
+                    updates['orders[' + i + '].files[' + j + '].status'] = n.files[j].status
+                  }
+                }
+              }
+            }
+          }
+          if (changed) {
+            // 结构变化（增删订单），做全量刷新但保留展开状态
+            this.setData({ orders: newOrders, expandedOrders: this.data.expandedOrders })
+          } else if (Object.keys(updates).length > 0) {
+            this.setData(updates)
+          }
+        },
+        fail: () => {}
+      })
     },
     _stopOrderPolling() {
       if (this._orderPollTimer) {
