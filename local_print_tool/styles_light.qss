@@ -492,10 +492,10 @@ QLabel#tabLabel {
     font-size: 14px;
     font-weight: bold;
 }
-QLabel#tabInfoLabel {
-    color: #6c6f85;
-    font-size: 11px;
-    margin-left: 8px;
+QLabel#tabScopeLabel {
+    color: #1e66f5;
+    font-weight: bold;
+    font-size: 12px;
 }
 
 /* ---------- 撤回按钮 ---------- */
