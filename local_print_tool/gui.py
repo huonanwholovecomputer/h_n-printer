@@ -966,6 +966,312 @@ class DropTableWidget(QTableWidget):
 
 
 # ============================================================
+# CloudTaskListWindow — 云端任务列表窗口（v7：替代单任务弹窗）
+# ============================================================
+
+class CloudTaskListWindow(QDialog):
+    """统一的云端任务列表窗口，管理所有待确认的云端打印任务。
+    非模态，支持批量操作、取消响应和自动关闭。"""
+
+    task_accepted = Signal(object)   # CloudTask — 用户确认添加
+    task_rejected = Signal(object)   # CloudTask — 用户打回
+    all_accepted = Signal()          # 全部添加
+    all_rejected = Signal()          # 全部打回
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("☁ 云端任务列表")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(380)
+        self.setModal(False)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+
+        self._pending_tasks: dict[int, dict] = {}  # task_id → {"task": CloudTask, "status": str, "canceled_at": float}
+        self._auto_close_seconds = 300  # 默认 5 分钟
+        self._auto_close_timer = QTimer(self)
+        self._auto_close_timer.setSingleShot(True)
+        self._auto_close_timer.timeout.connect(self._on_auto_close)
+
+        self._cancel_remove_timer = QTimer(self)
+        self._cancel_remove_timer.setInterval(1000)
+        self._cancel_remove_timer.timeout.connect(self._check_canceled_expiry)
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.setContentsMargins(12, 10, 12, 10)
+
+        # ── 自动关闭设置行 ──
+        auto_row = QHBoxLayout()
+        auto_row.addWidget(QLabel("自动关闭：待确认任务为 0 后"))
+        self._auto_minutes = QSpinBox()
+        self._auto_minutes.setRange(0, 60)
+        self._auto_minutes.setValue(5)
+        self._auto_minutes.setSuffix(" 分钟")
+        self._auto_minutes.setFixedWidth(100)
+        self._auto_minutes.valueChanged.connect(self._on_auto_close_changed)
+        auto_row.addWidget(self._auto_minutes)
+        self._auto_seconds = QSpinBox()
+        self._auto_seconds.setRange(0, 59)
+        self._auto_seconds.setValue(0)
+        self._auto_seconds.setSuffix(" 秒")
+        self._auto_seconds.setFixedWidth(80)
+        self._auto_seconds.valueChanged.connect(self._on_auto_close_changed)
+        auto_row.addWidget(self._auto_seconds)
+        auto_row.addStretch()
+        auto_row.addWidget(QLabel("后自动关闭"))
+        layout.addLayout(auto_row)
+
+        # ── 表格 ──
+        from PySide6.QtWidgets import QTableWidget as _QTW, QTableWidgetItem as _QTWI
+        self._table = _QTW()
+        self._table.setColumnCount(5)
+        self._table.setHorizontalHeaderLabels(["订单号", "文件名", "份数", "状态", "操作"])
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        hh = self._table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        layout.addWidget(self._table, 1)
+
+        # ── 按钮行 ──
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self._accept_all_btn = QPushButton("📥 全部添加到新标签页")
+        self._accept_all_btn.clicked.connect(self._on_accept_all)
+        btn_row.addWidget(self._accept_all_btn)
+
+        self._reject_all_btn = QPushButton("↩ 全部打回")
+        self._reject_all_btn.setObjectName("cloudRejectBtn")
+        self._reject_all_btn.clicked.connect(self._on_reject_all)
+        btn_row.addWidget(self._reject_all_btn)
+
+        btn_row.addStretch()
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self._on_close)
+        btn_row.addWidget(close_btn)
+
+        layout.addLayout(btn_row)
+
+    # ── 公共 API ──
+
+    def add_task(self, task: CloudTask):
+        """添加一个待确认的云端任务。若窗口未显示则自动弹出。"""
+        if task.task_id in self._pending_tasks:
+            return  # 去重
+        self._pending_tasks[task.task_id] = {
+            "task": task,
+            "status": "pending",
+            "canceled_at": None,
+        }
+        self._cancel_auto_close()
+        self._rebuild_table()
+        if not self.isVisible():
+            self.show()
+            self._cancel_remove_timer.start()
+
+    def mark_canceled(self, order_id: int, task_ids: list[int]):
+        """标记指定订单的任务为已取消（响应 F6 取消推送）。"""
+        now = time.time()
+        for tid in task_ids:
+            if tid in self._pending_tasks:
+                entry = self._pending_tasks[tid]
+                if entry["status"] == "pending":
+                    entry["status"] = "canceled"
+                    entry["canceled_at"] = now
+        self._rebuild_table()
+        self._check_auto_close()
+
+    def _rebuild_table(self):
+        """刷新表格内容。"""
+        self._table.setRowCount(0)
+        for tid, entry in self._pending_tasks.items():
+            task = entry["task"]
+            status = entry["status"]
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+
+            # 订单号
+            from PySide6.QtWidgets import QTableWidgetItem as _QTWI
+            order_text = task.order_number or f"#{task.order_id}"
+            self._table.setItem(row, 0, _QTWI(order_text))
+
+            # 文件名
+            self._table.setItem(row, 1, _QTWI(task.file_name))
+
+            # 份数
+            self._table.setItem(row, 2, _QTWI(str(task.copies)))
+
+            # 状态
+            status_text = {"pending": "待确认", "canceled": "已取消", "accepted": "已添加", "rejected": "已打回"}
+            status_item = _QTWI(status_text.get(status, status))
+            if status == "canceled":
+                status_item.setForeground(QColor("#999"))
+            self._table.setItem(row, 3, status_item)
+
+            # 操作按钮
+            if status == "pending":
+                btn_widget = QWidget()
+                btn_layout = QHBoxLayout(btn_widget)
+                btn_layout.setContentsMargins(2, 1, 2, 1)
+                btn_layout.setSpacing(4)
+
+                accept_btn = QPushButton("📥 添加")
+                accept_btn.setFixedWidth(70)
+                accept_btn.clicked.connect(lambda checked=False, t=task: self._on_accept_one(t))
+                btn_layout.addWidget(accept_btn)
+
+                reject_btn = QPushButton("↩ 打回")
+                reject_btn.setFixedWidth(70)
+                reject_btn.clicked.connect(lambda checked=False, t=task: self._on_reject_one(t))
+                btn_layout.addWidget(reject_btn)
+
+                self._table.setCellWidget(row, 4, btn_widget)
+            elif status == "canceled":
+                info_btn = QPushButton("✕ 已取消")
+                info_btn.setFixedWidth(80)
+                info_btn.setEnabled(False)
+                self._table.setCellWidget(row, 4, info_btn)
+            else:
+                self._table.setItem(row, 4, _QTWI("—"))
+
+        # 更新按钮状态
+        has_pending = any(e["status"] == "pending" for e in self._pending_tasks.values())
+        self._accept_all_btn.setEnabled(has_pending)
+        self._reject_all_btn.setEnabled(has_pending)
+
+    # ── 单任务操作 ──
+
+    def _on_accept_one(self, task: CloudTask):
+        if task.task_id in self._pending_tasks:
+            self._pending_tasks[task.task_id]["status"] = "accepted"
+        self.task_accepted.emit(task)
+        self._rebuild_table()
+        self._check_auto_close()
+
+    def _on_reject_one(self, task: CloudTask):
+        if task.task_id in self._pending_tasks:
+            self._pending_tasks[task.task_id]["status"] = "rejected"
+        self.task_rejected.emit(task)
+        self._rebuild_table()
+        self._check_auto_close()
+
+    # ── 批量操作 ──
+
+    def _on_accept_all(self):
+        pending = [e["task"] for e in self._pending_tasks.values() if e["status"] == "pending"]
+        if not pending:
+            return
+        reply = QMessageBox.question(
+            self, "全部添加", f"将为 {len(pending)} 个任务各创建一个新标签页，确定吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for task in pending:
+            self._pending_tasks[task.task_id]["status"] = "accepted"
+            self.task_accepted.emit(task)
+        self._rebuild_table()
+        self._check_auto_close()
+
+    def _on_reject_all(self):
+        pending = [e["task"] for e in self._pending_tasks.values() if e["status"] == "pending"]
+        if not pending:
+            return
+        reply = QMessageBox.question(
+            self, "全部打回", f"将打回 {len(pending)} 个待确认任务，确定吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        for task in pending:
+            self._pending_tasks[task.task_id]["status"] = "rejected"
+            self.task_rejected.emit(task)
+        self._rebuild_table()
+        self._check_auto_close()
+
+    # ── 自动关闭 ──
+
+    def _on_auto_close_changed(self):
+        self._auto_close_seconds = self._auto_minutes.value() * 60 + self._auto_seconds.value()
+
+    def _check_auto_close(self):
+        """检查是否所有任务已处理完毕，启动自动关闭计时器。"""
+        has_pending = any(e["status"] == "pending" for e in self._pending_tasks.values())
+        all_done = not has_pending and len(self._pending_tasks) > 0
+
+        if all_done:
+            if not self._auto_close_timer.isActive():
+                self._auto_close_timer.start(self._auto_close_seconds * 1000)
+        else:
+            self._cancel_auto_close()
+
+    def _cancel_auto_close(self):
+        if self._auto_close_timer.isActive():
+            self._auto_close_timer.stop()
+        # 清理已处理的条目
+        self._pending_tasks = {
+            tid: e for tid, e in self._pending_tasks.items()
+            if e["status"] == "pending"
+        }
+        if not self._pending_tasks:
+            self._auto_close_timer.start(self._auto_close_seconds * 1000)
+
+    def _on_auto_close(self):
+        """自动关闭：无待确认任务且计时器到期。"""
+        pending = [e for e in self._pending_tasks.values() if e["status"] == "pending"]
+        if not pending:
+            self._cancel_remove_timer.stop()
+            self.hide()
+
+    def _check_canceled_expiry(self):
+        """定期检查已取消任务是否超过 5 秒，超时移除。"""
+        now = time.time()
+        changed = False
+        for tid, entry in list(self._pending_tasks.items()):
+            if entry["status"] == "canceled" and entry["canceled_at"]:
+                if now - entry["canceled_at"] > 5:
+                    del self._pending_tasks[tid]
+                    changed = True
+        if changed:
+            self._rebuild_table()
+            self._check_auto_close()
+
+    # ── 关闭 ──
+
+    def _on_close(self):
+        """关闭窗口：检查是否有未确认任务，提示全部打回。"""
+        pending = [e["task"] for e in self._pending_tasks.values() if e["status"] == "pending"]
+        if pending:
+            reply = QMessageBox.question(
+                self, "关闭窗口",
+                f"还有 {len(pending)} 个未确认的任务，关闭将全部打回。\n确定关闭吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            for task in pending:
+                self._pending_tasks[task.task_id]["status"] = "rejected"
+                self.task_rejected.emit(task)
+        self._cancel_remove_timer.stop()
+        self._auto_close_timer.stop()
+        self.hide()
+
+    def closeEvent(self, event):
+        self._on_close()
+        event.ignore()  # 不真正关闭，只是隐藏
+
+
+# ============================================================
 # 主窗口
 # ============================================================
 
@@ -1001,6 +1307,7 @@ class MainWindow(QMainWindow):
         # ── 云端客户端 ──
         self._cloud_client: CloudClient | None = None
         self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
+        self._cloud_task_window: CloudTaskListWindow | None = None
 
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
@@ -1034,6 +1341,12 @@ class MainWindow(QMainWindow):
         self._cloud_client.task_updated.connect(self._on_cloud_task_updated)
         self._cloud_client.connection_changed.connect(self._on_cloud_connection_changed)
         self._cloud_client.status_message.connect(self._on_cloud_status_message)
+        self._cloud_client.order_canceled.connect(self._on_cloud_order_canceled)
+
+        # 初始化云端任务列表窗口（非模态，复用）
+        self._cloud_task_window = CloudTaskListWindow(self)
+        self._cloud_task_window.task_accepted.connect(self._on_cloud_task_accepted)
+        self._cloud_task_window.task_rejected.connect(self._on_cloud_task_rejected)
 
         # 如果配置了 token 且启用了云端，自动连接
         if self._config.cloud_enabled and self._config.cloud_token:
@@ -2867,18 +3180,18 @@ class MainWindow(QMainWindow):
     # ---- 云端任务处理 ----
 
     def _on_cloud_task_received(self, task: CloudTask):
-        """收到新的云端打印任务 → 任务就绪时弹窗（已处理过的跳过）。"""
+        """收到新的云端打印任务 → 加入云端任务列表窗口。"""
         if task.task_id in self._processed_cloud_tasks:
             return  # 已处理过，跳过（防 SocketIO + HTTP 双通道重复）
         self._cloud_tasks[task.task_id] = task
         self._log(f"☁ 收到云端任务 #{task.task_id}: {task.file_name}")
-        if task.status == "ready":
-            self._show_cloud_task_dialog(task)
+        if task.status == "ready" and self._cloud_task_window:
+            self._cloud_task_window.add_task(task)
 
     def _on_cloud_task_updated(self, task: CloudTask):
-        """云端任务状态更新 → 就绪时弹窗显示，出错时通知服务器标记失败。"""
+        """云端任务状态更新 → 就绪时加入窗口，出错时通知服务器标记失败。"""
         if task.status == "ready" and task.task_id in self._processed_cloud_tasks:
-            return  # 已弹窗处理过
+            return  # 已处理过
         self._cloud_tasks[task.task_id] = task
         if task.status == "error":
             self._processed_cloud_tasks.add(task.task_id)
@@ -2889,7 +3202,36 @@ class MainWindow(QMainWindow):
             self._cloud_tasks.pop(task.task_id, None)
         elif task.status == "ready":
             self._log(f"☁ 云端任务 #{task.task_id} 下载完成")
-            self._show_cloud_task_dialog(task)
+            if self._cloud_task_window:
+                self._cloud_task_window.add_task(task)
+
+    def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
+        """云端订单被用户取消 → 通知任务列表窗口更新状态。"""
+        self._log(f"☁ 订单 #{order_id} 已被用户取消")
+        if self._cloud_task_window:
+            self._cloud_task_window.mark_canceled(order_id, task_ids)
+        # 如果已添加到标签页中，弹出提示
+        for key, jobs in list(self._config.tabs.items()):
+            for job in jobs:
+                if job.task_id in task_ids:
+                    QMessageBox.information(
+                        self, "任务已取消",
+                        f"标签页 {key} 中的任务「{job.display_name or os.path.basename(job.file_path)}」已被用户取消。\n"
+                        f"建议删除该标签页。",
+                    )
+                    break
+
+    def _on_cloud_task_accepted(self, task: CloudTask):
+        """用户从云端任务列表窗口确认添加单个任务。"""
+        self._processed_cloud_tasks.add(task.task_id)
+        self._add_cloud_task_to_new_tab(task)
+
+    def _on_cloud_task_rejected(self, task: CloudTask):
+        """用户从云端任务列表窗口打回单个任务。"""
+        self._processed_cloud_tasks.add(task.task_id)
+        if task.order_id and self._cloud_client:
+            self._cloud_client.reject_order_to_server(task.order_id)
+        self._cloud_tasks.pop(task.task_id, None)
 
     def _on_cloud_connection_changed(self, connected: bool):
         """云端连接状态改变。"""
@@ -2909,6 +3251,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭窗口时检查未完成任务，确认后保存并退出。"""
+        # 关闭云端任务列表窗口
+        if self._cloud_task_window and self._cloud_task_window.isVisible():
+            self._cloud_task_window.close()
+
         # 检查所有标签页是否有未完成的文件
         total_files = 0
         for key, jobs in self._config.tabs.items():
@@ -3031,67 +3377,6 @@ class MainWindow(QMainWindow):
                 self._log(f"  → 转换副本已保存到桌面: {dest_name}")
             except OSError as e:
                 self._log(f"  → 保存转换副本到桌面失败: {e}")
-
-    # ──────── 云端任务弹窗 ────────
-
-    def _show_cloud_task_dialog(self, task: CloudTask):
-        """弹窗显示云端任务详情，提供"添加到新标签页"按钮。"""
-        # 防重复：已处理过的任务不再弹窗
-        if task.task_id in self._processed_cloud_tasks:
-            return
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"☁ 云端订单 — {task.order_number or ('#' + str(task.order_id))}")
-        dlg.setMinimumWidth(420)
-        dlg.setModal(True)
-
-        layout = QVBoxLayout(dlg)
-        layout.setSpacing(10)
-        layout.setContentsMargins(16, 14, 16, 14)
-
-        title = QLabel("<b>📦 收到云端打印订单</b>")
-        layout.addWidget(title)
-
-        info_text = (
-            f"<b>订单号:</b> {task.order_number or ('#' + str(task.order_id))}<br>"
-            f"<b>文件名:</b> {task.file_name}<br>"
-            f"<b>份数:</b> {task.copies} 份 &nbsp;|&nbsp; "
-            f"<b>模式:</b> {'双面' if task.duplex == 'on' else '单面'}"
-        )
-        if task.page_range:
-            info_text += f"<br><b>页码范围:</b> {task.page_range}"
-        if task.created_at:
-            info_text += f"<br><b>时间:</b> {task.created_at}"
-        info_label = QLabel(info_text)
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-
-        layout.addSpacing(8)
-
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-
-        reject_btn = QPushButton("✕ 忽略")
-        reject_btn.setObjectName("cloudRejectBtn")
-        def _reject():
-            self._processed_cloud_tasks.add(task.task_id)
-            if self._cloud_client:
-                self._cloud_client.reject_task(task.task_id)
-            self._cloud_tasks.pop(task.task_id, None)
-            dlg.reject()
-        reject_btn.clicked.connect(_reject)
-        btn_row.addWidget(reject_btn)
-
-        accept_btn = QPushButton("📥 添加到新标签页")
-        accept_btn.setObjectName("cloudAcceptBtn")
-        def _accept():
-            self._processed_cloud_tasks.add(task.task_id)
-            self._add_cloud_task_to_new_tab(task)
-            dlg.accept()
-        accept_btn.clicked.connect(_accept)
-        btn_row.addWidget(accept_btn)
-
-        layout.addLayout(btn_row)
-        dlg.exec()
 
     def _add_cloud_task_to_new_tab(self, task: CloudTask):
         """将云端任务添加到新的标签页并切换过去。会检查 PDF 缓存避免重复转换。"""
