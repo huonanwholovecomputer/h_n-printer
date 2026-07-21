@@ -815,6 +815,11 @@ Component({
     // 倒计时：以后端 expires_at 为唯一真相
     _startCountdown() {
       this._stopCountdown()
+      // admin 类型密钥永不过期，无需倒计时
+      if (this.data.keyType === 'admin') {
+        this.setData({ countdownText: '永久有效', keyExpired: false })
+        return
+      }
       const target = this._parseServerTime(this.data.expiresAt)
       if (!target) return
 
