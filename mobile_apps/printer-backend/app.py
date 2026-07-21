@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import shutil
 import socket
@@ -3275,6 +3276,60 @@ def recover_stale_printing_tasks():
 # ==================== 定时任务调度器（模块级，供 Gunicorn worker 钩子引用）========
 
 scheduler = BackgroundScheduler()
+
+
+# ==================== 日志系统 ====================
+
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+_server_log = logging.getLogger("printer_server")
+_server_log.setLevel(logging.WARNING)
+if not _server_log.handlers:
+    _sh = logging.FileHandler(os.path.join(LOG_DIR, "server.log"), encoding="utf-8")
+    _sh.setLevel(logging.WARNING)
+    _sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _server_log.addHandler(_sh)
+
+_frontend_log = logging.getLogger("printer_frontend")
+_frontend_log.setLevel(logging.WARNING)
+if not _frontend_log.handlers:
+    _fh = logging.FileHandler(os.path.join(LOG_DIR, "frontend.log"), encoding="utf-8")
+    _fh.setLevel(logging.WARNING)
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _frontend_log.addHandler(_fh)
+
+
+@app.route("/api/log/report", methods=["POST"])
+def log_report():
+    """前端上报错误/警告日志。"""
+    data = request.get_json(silent=True) or {}
+    level = data.get("level", "warning")
+    message = data.get("message", "")
+    if not message:
+        return jsonify({"success": False, "message": "缺少日志内容"}), 400
+    if level in ("error", "critical"):
+        _frontend_log.error(message)
+    else:
+        _frontend_log.warning(message)
+    return jsonify({"success": True})
+
+
+@app.route("/api/log/fetch", methods=["GET"])
+def log_fetch():
+    """本地打印工具拉取后端/前端日志（需 token 认证）。"""
+    token = request.args.get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    log_type = request.args.get("type", "server")
+    if log_type not in ("server", "frontend"):
+        return jsonify({"success": False, "message": "type 只能为 server 或 frontend"}), 400
+    log_path = os.path.join(LOG_DIR, f"{log_type}.log")
+    if not os.path.exists(log_path):
+        return jsonify({"success": True, "size": 0, "content": ""})
+    with open(log_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return jsonify({"success": True, "size": len(content.encode("utf-8")), "content": content})
 
 
 # ==================== 启动 ====================
