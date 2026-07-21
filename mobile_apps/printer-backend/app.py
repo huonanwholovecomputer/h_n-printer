@@ -1576,7 +1576,6 @@ def ping():
 
 
 @app.route("/api/printer_status", methods=["GET"])
-@login_required
 def printer_status():
     """返回打印机在线状态。"""
     with printer_clients_lock:
