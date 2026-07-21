@@ -789,6 +789,19 @@ def init_db():
 
 # ==================== 订单号生成 ====================
 
+@app.route("/api/next_order_number", methods=["GET"])
+def next_order_number():
+    """本地打印工具获取下一个可用订单号（需 token 认证）。
+    调用即分配，保证本地和云端订单号不冲突。"""
+    token = request.args.get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    order_number = generate_order_number()
+    return jsonify({"success": True, "order_number": order_number})
+
+
+# ==================== 订单号生成（内部函数）====================
+
 _ORDER_COUNTER_LOCK = threading.Lock()
 ORDER_COUNTER_FILE = os.path.join(UPLOAD_DIR, "order_counter.json")
 
