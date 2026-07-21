@@ -1584,7 +1584,9 @@ def printer_status():
     return jsonify({
         "success": True,
         "online": online_count > 0,
+        "active": online_count > 0,
         "count": online_count,
+        "client_count": online_count,
     })
 
 
@@ -2063,16 +2065,6 @@ def submit_order():
         "data": data,
     })
 
-
-@app.route("/api/printer_status", methods=["GET"])
-def printer_status():
-    """前端查询是否有活跃的打印机客户端"""
-    active = get_active_clients()
-    return jsonify({
-        "success": True,
-        "active": len(active) > 0,
-        "client_count": len(active),
-    })
 
 
 @app.route("/api/pull_queued_orders", methods=["GET"])
