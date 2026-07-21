@@ -2174,6 +2174,10 @@ class MainWindow(QMainWindow):
                     if j.order_number:
                         order_num = j.order_number
                         break
+                if file_count > 0 and not order_num:
+                    order_num = "未分配"
+                elif file_count == 0:
+                    order_num = "--"
 
                 row = table.rowCount()
                 table.insertRow(row)
