@@ -3769,6 +3769,8 @@ class MainWindow(QMainWindow):
         self._update_cloud_status()
         if connected:
             self._sync_local_orders_to_cloud()
+            if self._cloud_client:
+                self._cloud_client.sync_pending_statuses()
 
     def _on_cloud_status_message(self, msg: str):
         """云端日志消息 → 写入界面日志。"""
@@ -3803,7 +3805,11 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
-            # 用户确认退出 → 清空全部标签页
+            # 用户确认退出 → 通知后端放弃已接受的云端任务，然后清空
+            for key, tab in self._config.tabs.items():
+                for job in tab.jobs:
+                    if job.task_id > 0 and self._cloud_client:
+                        self._cloud_client.abandon_order_to_server(job.task_id)
             self._config.tabs = {"1": TabSettings()}
             self._config.active_tab = "1"
             self._current_tab = "1"
@@ -4065,6 +4071,10 @@ class MainWindow(QMainWindow):
         if not jobs:
             return
         self._cancel_all_convert_workers()
+        # 通知后端放弃已接受的云端任务
+        for job in jobs:
+            if job.task_id > 0 and self._cloud_client:
+                self._cloud_client.abandon_order_to_server(job.task_id)
         self._cleared_jobs_backup[self._current_tab] = list(jobs)
         self._set_current_jobs([])
         self._rebuild_table()
