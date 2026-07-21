@@ -276,7 +276,7 @@
         </view>
 
         <!-- 展开态：详细信息 -->
-        <view wx:if="{{expandedOrders[item.id]}}" class="order-card-detail">
+        <view class="order-card-detail {{expandedOrders[item.id] ? 'detail-expanded' : ''}}">
           <view class="detail-divider"></view>
 
           <!-- 打印信息 -->
