@@ -510,3 +510,6 @@ QPushButton#btnUndo {
 QPushButton#btnUndo:hover {
     background-color: #d4580a;
 }
+
+/* 状态栏去除组件间分隔线 */
+QStatusBar::item { border: none; }
