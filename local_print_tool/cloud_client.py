@@ -208,8 +208,19 @@ class CloudClient(QObject):
             task.status = "rejected"
             self.task_updated.emit(task)
 
+    def abandon_order_to_server(self, order_id: int):
+        """放弃已接受的订单：调用后端 API。"""
+        if not self.api_url or not self.token:
+            self._queue_status_sync(order_id, "abandoned")
+            return
+        self._try_status_sync(order_id, "abandoned")
+
     def accept_order_to_server(self, order_id: int):
-        """确认接受订单：调用后端 API，将订单状态设为 accepted。"""
+        """确认接受订单：调用后端 API。失败时加入同步队列。"""
+        if not self.api_url or not self.token:
+            self._queue_status_sync(order_id, "accepted")
+            return
+        self._try_status_sync(order_id, "accepted")
         if not self.api_url or not self.token:
             return
         try:
@@ -266,6 +277,99 @@ class CloudClient(QObject):
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印失败 — {error}")
             except Exception as e:
                 logger.warning(f"上报 print_fail 失败: {e}")
+
+    # ── 离线状态同步 ──
+
+    def _status_queue_path(self) -> str:
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+        return os.path.join(d, "status_queue.json")
+
+    def _queue_status_sync(self, order_id: int, status: str):
+        """离线时将状态变更暂存到本地队列。"""
+        import json as _json
+        path = self._status_queue_path()
+        queue = []
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    queue = _json.load(f)
+            except Exception:
+                queue = []
+        queue.append({"order_id": order_id, "status": status, "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(queue, f, ensure_ascii=False, indent=2)
+        self.status_message.emit(f"☁ 状态同步已暂存: 订单 #{order_id} → {status}")
+
+    def _try_status_sync(self, order_id: int, status: str):
+        """尝试同步状态到后端，失败则加入离线队列。"""
+        endpoint_map = {"accepted": "accept_order", "abandoned": "abandon_order"}
+        endpoint = endpoint_map.get(status, "")
+        if not endpoint or not self.api_url:
+            self._queue_status_sync(order_id, status)
+            return
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/{endpoint}",
+                params={"token": self.token},
+                json={"order_id": order_id},
+                timeout=10,
+            )
+            if not resp.ok:
+                self._queue_status_sync(order_id, status)
+        except Exception:
+            self._queue_status_sync(order_id, status)
+
+    def sync_pending_statuses(self):
+        """联网后重放离线状态同步队列。"""
+        import json as _json
+        path = self._status_queue_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                queue = _json.load(f)
+        except Exception:
+            queue = []
+        if not queue:
+            return
+        self.status_message.emit(f"☁ 正在同步 {len(queue)} 条离线状态...")
+        remaining = []
+        for item in queue:
+            endpoint_map = {"accepted": "accept_order", "abandoned": "abandon_order",
+                          "sent": "print_success", "failed": "print_fail"}
+            status = item["status"]
+            order_id = item["order_id"]
+            if status in ("sent", "failed"):
+                # print_success/print_fail 通过 SocketIO 发送
+                if self._sio and self._connected:
+                    try:
+                        self._sio.emit("print_success" if status == "sent" else "print_fail",
+                                      {"task_id": order_id})
+                    except Exception:
+                        remaining.append(item)
+                else:
+                    remaining.append(item)
+            else:
+                endpoint = endpoint_map.get(status, "").replace("_order", "_order")
+                try:
+                    resp = http_requests.post(
+                        f"{self.api_url}/api/{endpoint}",
+                        params={"token": self.token},
+                        json={"order_id": order_id},
+                        timeout=10,
+                    )
+                    if not resp.ok:
+                        remaining.append(item)
+                except Exception:
+                    remaining.append(item)
+        if remaining:
+            with open(path, "w", encoding="utf-8") as f:
+                _json.dump(remaining, f, ensure_ascii=False, indent=2)
+            self.status_message.emit(f"☁ {len(remaining)} 条状态同步失败，已重新暂存")
+        else:
+            os.remove(path)
+            self.status_message.emit(f"☁ 离线状态同步完成 ({len(queue)} 条)")
 
     def report_page_range_truncated(self, task_id: int, original_range: str,
                                       effective_range: str, total_pages: int):

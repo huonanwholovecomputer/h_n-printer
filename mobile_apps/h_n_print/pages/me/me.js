@@ -19,6 +19,7 @@ Component({
       accepted: '已添加',
       sent: '已完成',
       failed: '失败',
+      abandoned: '放弃打印',
       rejected: '被打回',
       canceled: '已取消',
     },

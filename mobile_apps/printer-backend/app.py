@@ -850,7 +850,7 @@ def calculate_price(page_count, duplex):
 
 # 状态优先级：失败 > 打印中/排队中 > 已完成 > 被打回 > 已取消
 # 用于把多个子任务 (order_files) 的状态聚合为父订单 (orders) 的状态
-_STATUS_PRIORITY = {"failed": 6, "printing": 5, "accepted": 4, "queued": 3, "sent": 2, "rejected": 1, "canceled": 0}
+_STATUS_PRIORITY = {"failed": 7, "printing": 6, "accepted": 5, "queued": 4, "sent": 3, "abandoned": 2, "rejected": 1, "canceled": 0}
 
 
 def aggregate_order_status(conn, order_id):
@@ -871,17 +871,19 @@ def aggregate_order_status(conn, order_id):
         return "sent"
     if all(s == "rejected" for s in statuses):
         return "rejected"
-    if all(s in ("sent", "accepted", "canceled", "rejected") for s in statuses):
-        # 混合终态：有 sent 优先 sent，有 accepted 次之，全 rejected 则 rejected
+    if all(s in ("sent", "accepted", "abandoned", "canceled", "rejected") for s in statuses):
+        # 混合终态：有 sent 优先，有 accepted 次之，有 abandoned 再次
         if any(s == "sent" for s in statuses):
             return "sent"
         if any(s == "accepted" for s in statuses):
             return "accepted"
+        if any(s == "abandoned" for s in statuses):
+            return "abandoned"
         if any(s == "rejected" for s in statuses):
             return "rejected"
         return "canceled"
     # 取优先级最高的非终态
-    active = [s for s in statuses if s not in ("sent", "accepted", "canceled", "rejected")]
+    active = [s for s in statuses if s not in ("sent", "accepted", "abandoned", "canceled", "rejected")]
     if not active:
         return "sent"
     return max(active, key=lambda s: _STATUS_PRIORITY.get(s, 0))
@@ -2508,6 +2510,31 @@ def reject_order():
 
     print(f"  [REJECT] 订单 #{order_id} 已被打印机打回")
     return jsonify({"success": True, "message": "订单已打回"})
+
+
+@app.route("/api/abandon_order", methods=["POST"])
+def abandon_order():
+    """打印机放弃已接受的订单（需 token 认证）。"""
+    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    data = request.get_json(silent=True) or {}
+    order_id = data.get("order_id", "") or request.args.get("order_id", "")
+    if not order_id:
+        return jsonify({"success": False, "message": "缺少 order_id"}), 400
+    conn = get_db()
+    conn.execute(
+        "UPDATE order_files SET status = 'abandoned' WHERE order_id = ? AND status = 'accepted'",
+        (order_id,),
+    )
+    conn.execute(
+        "UPDATE orders SET status = 'abandoned' WHERE id = ?",
+        (order_id,),
+    )
+    conn.commit()
+    conn.close()
+    print(f"  [ABANDON] 订单 #{order_id} 已被放弃打印")
+    return jsonify({"success": True, "message": "订单已标记为放弃打印"})
 
 
 # ==================== 本地订单上报（本地打印工具使用）====================
