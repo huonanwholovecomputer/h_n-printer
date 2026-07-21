@@ -1740,9 +1740,15 @@ class MainWindow(QMainWindow):
 
         root.addLayout(layout)
 
-        # ---- 第二行：附加服务全局配置 ----
+        # ---- 第二行：标签页附加服务 ----
         row2 = QHBoxLayout()
         row2.setSpacing(6)
+
+        # 标签页指示器
+        self._tab_scope_label = QLabel(f"📑 标签页 {self._current_tab}")
+        self._tab_scope_label.setObjectName("tabScopeLabel")
+        row2.addWidget(self._tab_scope_label)
+        row2.addSpacing(8)
 
         # —— 先创建所有控件 ——
 
@@ -1903,11 +1909,6 @@ class MainWindow(QMainWindow):
         tab_row.addWidget(self._tab_btn_plus)
         tab_row.addWidget(self._tab_btn_cleanup_empty)
         tab_row.addStretch()
-
-        # 标签页信息标签
-        self._tab_info_label = QLabel("")
-        self._tab_info_label.setObjectName("tabInfoLabel")
-        tab_row.addWidget(self._tab_info_label)
 
         layout.addLayout(tab_row)
 
@@ -2084,6 +2085,8 @@ class MainWindow(QMainWindow):
     def _refresh_tab_display(self):
         """刷新标签页数字显示和按钮状态。"""
         self._tab_label.setText(self._current_tab)
+        if hasattr(self, '_tab_scope_label') and self._tab_scope_label:
+            self._tab_scope_label.setText(f"📑 标签页 {self._current_tab}")
 
         tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
         try:
@@ -2097,15 +2100,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_tab_btn_cleanup_empty') and self._tab_btn_cleanup_empty:
             self._tab_btn_cleanup_empty.setEnabled(self._has_empty_tabs_except_current())
 
-        # 更新信息标签 & 订单号
-        tab = self._config.tabs.get(self._current_tab)
-        tb_jobs = tab.jobs if tab else []
-        total = sum(calc_cost(j.page_count, j.copies, j.duplex,
-                              self._config.simplex_price, self._config.duplex_price,
-                              j.page_range)[0] for j in tb_jobs)
-        self._tab_info_label.setText(f"共 {len(tb_jobs)} 个文件 · 合计 ¥{total:.2f}")
-
         # 同步当前标签页的附加服务设置到 UI 控件
+        tab = self._config.tabs.get(self._current_tab)
         self._sync_tab_settings_to_ui(tab)
 
         if hasattr(self, '_order_number_label') and self._order_number_label:
