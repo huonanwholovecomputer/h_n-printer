@@ -13,6 +13,12 @@
     <view class="scroll-content" style="transform: translateY({{-scrollTop}}px);">
       <view class="container">
 
+    <!-- 打印机在线状态 -->
+    <view class="printer-status-bar" wx:if="{{userRole === 'admin'}}">
+      <text class="printer-dot" style="color:{{printerOnline ? '#4caf50' : '#f44336'}}">{{printerOnline ? '🟢' : '🔴'}}</text>
+      <text class="printer-status-text">{{printerOnline ? '打印机在线' : '打印机离线'}}</text>
+    </view>
+
     <!-- 用户信息卡片 -->
     <view class="user-card">
       <view class="avatar-btn" bindtap="onChooseAvatar" hover-class="avatar-hover">
