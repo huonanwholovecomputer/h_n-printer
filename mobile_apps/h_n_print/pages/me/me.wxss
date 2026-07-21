@@ -27,21 +27,6 @@
   box-sizing: border-box;
 }
 
-/* ── Printer Status Bar ── */
-.printer-status-bar {
-  display: flex;
-  align-items: center;
-  padding: 6px 12px;
-  font-size: 12px;
-  background-color: var(--bg-card);
-  border-radius: 8px;
-  margin-bottom: 8px;
-}
-.printer-status-text {
-  margin-left: 4px;
-  color: var(--gray);
-}
-
 /* ═══════════════ User Profile Card ═══════════════ */
 
 .user-card {
