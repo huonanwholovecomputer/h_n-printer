@@ -1,0 +1,32 @@
+<!--pages/authorized-users/authorized-users.wxml-->
+<navigation-bar title="历史授权用户" back="{{true}}" color="black" background="#FFF"></navigation-bar>
+
+<view class="page-root">
+  <view class="container">
+    <!-- 加载中 -->
+    <view wx:if="{{loading}}" class="loading-hint">加载中...</view>
+
+    <!-- 空状态 -->
+    <view wx:elif="{{users.length === 0}}" class="empty-hint">
+      <text class="empty-icon">👥</text>
+      <text class="empty-text">暂无授权用户</text>
+      <text class="empty-desc">生成许可密钥分享给他人后，这里会显示授权记录</text>
+    </view>
+
+    <!-- 用户列表 -->
+    <view wx:else class="user-list">
+      <view wx:for="{{users}}" wx:key="openid" class="user-card-item"
+            bindtap="onUserTap" data-openid="{{item.openid}}" hover-class="tap-active">
+        <view class="user-card-left">
+          <text class="user-card-name">{{item.nickname || item.openid_short || '未知用户'}}</text>
+          <text class="user-card-id">{{item.openid_short}}</text>
+        </view>
+        <view class="user-card-right">
+          <text class="user-card-orders">{{item.order_count}} 个订单</text>
+          <text class="user-card-last" wx:if="{{item.last_order}}">最近: {{item.last_order}}</text>
+          <text class="role-btn-arrow">›</text>
+        </view>
+      </view>
+    </view>
+  </view>
+</view>

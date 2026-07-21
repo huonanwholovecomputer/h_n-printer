@@ -181,6 +181,24 @@
       </view>
     </view>
 
+    <!-- 管理员/超级管理员：历史授权用户 -->
+    <view wx:if="{{userRole === 'admin'}}" class="role-actions">
+      <view class="role-btn user-btn" bindtap="onGoAuthorizedUsers" hover-class="tap-active">
+        <text class="role-btn-icon">👥</text>
+        <text class="role-btn-text">历史授权用户</text>
+        <text class="role-btn-arrow">›</text>
+      </view>
+    </view>
+
+    <!-- 管理员/超级管理员：本地打印任务 -->
+    <view wx:if="{{userRole === 'admin'}}" class="role-actions">
+      <view class="role-btn user-btn" bindtap="onGoLocalOrders" hover-class="tap-active">
+        <text class="role-btn-icon">🖨️</text>
+        <text class="role-btn-text">本地打印任务</text>
+        <text class="role-btn-arrow">›</text>
+      </view>
+    </view>
+
     <!-- 超级管理员：管理员列表 -->
     <view wx:if="{{isSuperAdmin}}" class="license-section">
       <view class="section-title">

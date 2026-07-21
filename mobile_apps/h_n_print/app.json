@@ -4,7 +4,8 @@
     "pages/me/me",
     "pages/order-detail/order-detail",
     "pages/my-performance/my-performance",
-    "pages/logs/logs"
+    "pages/logs/logs",
+    "pages/authorized-users/authorized-users"
   ],
   "window": {
     "navigationBarTextStyle": "black",

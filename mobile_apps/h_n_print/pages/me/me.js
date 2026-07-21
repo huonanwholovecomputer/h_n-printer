@@ -1144,6 +1144,17 @@ Component({
       })
     },
 
+    // F10: 跳转历史授权用户页面
+    onGoAuthorizedUsers() {
+      wx.navigateTo({ url: '/pages/authorized-users/authorized-users' })
+    },
+
+    // F12: 跳转本地打印任务列表（通过 source=local 过滤）
+    onGoLocalOrders() {
+      // 复用订单列表页面但加 source=local 参数
+      wx.showToast({ title: '本地打印任务功能开发中', icon: 'none' })
+    },
+
     loadStorageStats() {
       const token = wx.getStorageSync('token')
       if (!token) return
