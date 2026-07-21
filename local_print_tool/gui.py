@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import threading
 import time
+import requests as http_requests
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1292,6 +1293,24 @@ class MainWindow(QMainWindow):
         self._copy_total_btn: Optional[QPushButton] = None
         self._copy_total_timer: Optional[QTimer] = None
 
+        # ── 文件日志 ──
+        self._log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(self._log_dir, exist_ok=True)
+        self._file_logger = logging.getLogger("hn_local_tool")
+        self._file_logger.setLevel(logging.DEBUG)
+        if not self._file_logger.handlers:
+            fh = logging.FileHandler(
+                os.path.join(self._log_dir, "local_tool.log"),
+                encoding="utf-8",
+            )
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            self._file_logger.addHandler(fh)
+        self._file_logger.info("HN 本地打印工具启动")
+
         # ── 标签页系统 ──
         # 确保 tabs 中至少有一个标签
         if not self._config.tabs:
@@ -1513,6 +1532,7 @@ class MainWindow(QMainWindow):
         self._log_text = QTextEdit()
         self._log_text.setObjectName("logTextEdit")
         self._log_text.setReadOnly(True)
+        self._log_text.setAcceptRichText(True)
         self._log_text.setMinimumHeight(24)
         _enable_smooth_scroll(self._log_text)
 
@@ -1582,6 +1602,9 @@ class MainWindow(QMainWindow):
         selfcheck_action = QAction("自检(&S)", self)
         selfcheck_action.triggered.connect(self._on_self_check)
         help_menu.addAction(selfcheck_action)
+        log_action = QAction("日志(&L)", self)
+        log_action.triggered.connect(self._on_show_log_manager)
+        help_menu.addAction(log_action)
         help_menu.addSeparator()
         about_action = QAction("关于(&A)", self)
         about_action.triggered.connect(self._on_about)
@@ -3263,6 +3286,93 @@ class MainWindow(QMainWindow):
 
         QMessageBox.information(self, "自检", html)
 
+    def _on_show_log_manager(self):
+        """弹出日志管理窗口。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("📋 日志管理")
+        dlg.setMinimumWidth(450)
+        dlg.setModal(True)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 12)
+
+        layout.addWidget(QLabel("<b>日志管理</b>"))
+
+        # 状态标签
+        status_label = QLabel("就绪")
+        status_label.setWordWrap(True)
+        layout.addWidget(status_label)
+
+        # 拉取按钮
+        fetch_btn = QPushButton("📥 拉取前后端日志")
+        fetch_btn.clicked.connect(lambda: self._fetch_remote_logs(status_label))
+        layout.addWidget(fetch_btn)
+
+        layout.addWidget(QLabel("<hr>"))
+
+        # 本地日志操作
+        local_layout = QHBoxLayout()
+        open_local_btn = QPushButton("📂 打开本地日志目录")
+        open_local_btn.clicked.connect(lambda: os.startfile(self._log_dir) if os.path.isdir(self._log_dir) else None)
+        local_layout.addWidget(open_local_btn)
+
+        clear_local_btn = QPushButton("🗑 清空本地日志")
+        clear_local_btn.clicked.connect(lambda: self._clear_local_logs(status_label))
+        local_layout.addWidget(clear_local_btn)
+        layout.addLayout(local_layout)
+
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+
+        dlg.exec()
+
+    def _fetch_remote_logs(self, status_label: QLabel):
+        """从后端拉取 server.log 和 frontend.log。"""
+        if not self._cloud_client or not self._cloud_client.api_url or not self._cloud_client.token:
+            status_label.setText("⚠ 云端未连接，无法拉取")
+            return
+        status_label.setText("⏳ 正在拉取...")
+        QApplication.processEvents()
+
+        results = []
+        for log_type in ("server", "frontend"):
+            try:
+                resp = http_requests.get(
+                    f"{self._cloud_client.api_url}/api/log/fetch",
+                    params={"token": self._cloud_client.token, "type": log_type},
+                    timeout=15,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    content = data.get("content", "")
+                    size = data.get("size", 0)
+                    if size > 0 and content:
+                        dest = os.path.join(self._log_dir, f"remote_{log_type}.log")
+                        with open(dest, "w", encoding="utf-8") as f:
+                            f.write(content)
+                    results.append(f"{log_type}: {size} 字节")
+                else:
+                    results.append(f"{log_type}: 请求失败")
+            except Exception as e:
+                results.append(f"{log_type}: 异常({e})")
+
+        status_label.setText("✓ 拉取完成: " + " | ".join(results))
+
+    def _clear_local_logs(self, status_label: QLabel):
+        """清空本地日志文件。"""
+        removed = 0
+        for fname in os.listdir(self._log_dir):
+            if fname.endswith(".log"):
+                try:
+                    os.remove(os.path.join(self._log_dir, fname))
+                    removed += 1
+                except OSError:
+                    pass
+        status_label.setText(f"✓ 已清空 {removed} 个本地日志文件")
+        self._log("📋 已清空本地日志")
+
     def _on_shortcuts(self):
         """快捷键说明对话框。"""
         QMessageBox.information(
@@ -3283,13 +3393,40 @@ class MainWindow(QMainWindow):
             self._theme_manager.set_mode(mode)
 
     def _log(self, msg: str):
-        """追加日志到界面文本框。"""
+        """追加日志到界面文本框（自动滚动到底部）并写入文件。"""
         ts = datetime.now().strftime("%H:%M:%S")
+        plain = f"[{ts}] {msg}"
+        # 写入界面（支持 HTML）
+        if "<span" in msg:
+            self._log_text.append(plain.replace(msg, msg))  # HTML 原样
         self._log_text.append(f"[{ts}] {msg}")
-        # 自动滚动到底部
         self._log_text.verticalScrollBar().setValue(
             self._log_text.verticalScrollBar().maximum()
         )
+        # 写入文件（纯文本，去掉 HTML 标签）
+        import re
+        plain_msg = re.sub(r'<[^>]+>', '', msg)
+        self._file_logger.info(plain_msg)
+
+    def _log_info(self, tag: str, msg: str):
+        """信息日志：[标签] ℹ 消息"""
+        self._log(f'<span style="color:#888">[{tag}]</span> <span style="color:#ccc">ℹ {msg}</span>')
+        self._file_logger.info(f"[{tag}] {msg}")
+
+    def _log_ok(self, tag: str, msg: str):
+        """成功日志：[标签] ✓ 消息"""
+        self._log(f'<span style="color:#888">[{tag}]</span> <span style="color:#4caf50">✓ {msg}</span>')
+        self._file_logger.info(f"[{tag}] ✓ {msg}")
+
+    def _log_warn(self, tag: str, msg: str):
+        """警告日志：[标签] ⚠ 消息"""
+        self._log(f'<span style="color:#888">[{tag}]</span> <span style="color:#ff9800">⚠ {msg}</span>')
+        self._file_logger.warning(f"[{tag}] {msg}")
+
+    def _log_error(self, tag: str, msg: str):
+        """错误日志：[标签] ✗ 消息"""
+        self._log(f'<span style="color:#888">[{tag}]</span> <span style="color:#f44336">✗ {msg}</span>')
+        self._file_logger.error(f"[{tag}] {msg}")
 
     # ---- 云端任务处理 ----
 
