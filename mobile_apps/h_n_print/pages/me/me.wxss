@@ -924,6 +924,7 @@
 .file-status-mini.status-sent     { background-color: #E8F5E9; color: #2E7D32; }
 .file-status-mini.status-failed   { background-color: #FFEBEE; color: #C62828; }
 .file-status-mini.status-accepted { background-color: #E3F2FD; color: #1565C0; }
+.file-status-mini.status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
 .file-status-mini.status-rejected { background-color: #FFF3E0; color: #E65100; }
 .file-status-mini.status-canceled { background-color: var(--gray6); color: var(--gray); }
 

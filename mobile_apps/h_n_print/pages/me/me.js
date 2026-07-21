@@ -17,6 +17,7 @@ Component({
       queued: '排队中',
       printing: '打印中',
       accepted: '已添加',
+      offline_unknown: '断线未知',
       sent: '已完成',
       failed: '失败',
       abandoned: '放弃打印',
