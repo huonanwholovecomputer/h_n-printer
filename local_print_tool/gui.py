@@ -3724,6 +3724,11 @@ class MainWindow(QMainWindow):
                               j.page_range)[0] for j in jobs)
         lines.append(f"合计: ¥{total:.2f}")
         QApplication.clipboard().setText("\n".join(lines))
+        if self._copy_detail_btn:
+            self._copy_detail_btn.setText("✅ 已复制")
+            self._copy_detail_btn.setEnabled(False)
+        if self._copy_total_timer:
+            self._copy_total_timer.start(5000)
 
     # ──────── 转换完成回调 ────────
 
