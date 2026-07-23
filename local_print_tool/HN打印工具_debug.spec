@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('theme_settings.json', '.'), ('print_config.json', '.')],
+    datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('theme_settings.json', '.'), ('print_config.json', '.'), ('finance/收支清算.html', 'finance'), ('finance/打印项目数据.json', 'finance')],
     hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client'],
     hookspath=[],
     hooksconfig={},

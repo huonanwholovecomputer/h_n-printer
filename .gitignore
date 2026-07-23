@@ -44,9 +44,18 @@ Desktop.ini
 local_print_tool/print_config.json
 local_print_tool/theme_settings.json
 
+# 云端后端配置（含微信 AppSecret、签名密钥、token）
+mobile_apps/printer-backend/config.py
+
+# 收支清算用户绑定（含 openid→姓名映射）
+local_print_tool/user_bindings.json
+
 # 日志（可能泄漏 token、路径等敏感信息）
 local_print_tool/logs/
 local_print_tool/crash_traceback.txt
+
+# PDF 缓存（运行时自动生成）
+local_print_tool/pdf_cache/
 
 # 部署脚本（含服务器 IP）
 更新后端服务.txt
@@ -61,6 +70,9 @@ mobile_apps/h_n_print/代码文件内容汇总.txt
 # 本地数据库
 *.db
 printer-local.db
+
+# 微信小程序本地配置覆盖（含真实服务器地址）
+mobile_apps/h_n_print/utils/config.local.js
 
 # 开发计划（仅本地参考）
 DEVELOPMENT_PLAN.md
@@ -79,3 +91,7 @@ project.private.config.json
 
 # 财务报表（含支出数据）
 财务报表/
+
+# 财务统计用户数据（含真实姓名/收支）
+local_print_tool/finance/打印项目数据.json
+财务统计/

@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>打印项目 · 收支清算</title>
+<style>
+:root {
+  --bg: #f5f6fa; --card: #fff; --text: #1a1a2e; --muted: #6b7280;
+  --blue: #4472C4; --green: #548235; --orange: #ED7D31;
+  --border: #e2e4e9; --pos: #16a34a; --neg: #dc2626;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI','Microsoft YaHei',sans-serif; background: var(--bg); color: var(--text); }
+header { background: #1a1a2e; color: #fff; padding: 12px 28px; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
+header h1 { font-size: 1.2rem; font-weight: 600; white-space: nowrap; }
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+.header-right .path { font-size:0.78rem; color:rgba(255,255,255,0.7); max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+nav { display: flex; gap: 2px; flex-wrap: wrap; }
+nav button { padding: 8px 14px; border: none; border-radius: 6px; cursor: pointer; color: rgba(255,255,255,0.8); background: none; font-size: 0.85rem; font-family: inherit; transition: all .2s; white-space: nowrap; }
+nav button:hover { background: rgba(255,255,255,0.15); color: #fff; }
+nav button.on { background: #fff; color: #1a1a2e; font-weight: 600; }
+main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+.tab { display: none; }
+.tab.on { display: block; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-bottom: 20px; }
+.card { background: var(--card); border-radius: 10px; padding: 18px 20px; border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+.card h3 { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+.card .big { font-size: 1.6rem; font-weight: 700; }
+.card .sub { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
+.section { background: var(--card); border-radius: 10px; padding: 20px; border: 1px solid var(--border); margin-bottom: 16px; }
+.section h2 { font-size: 1rem; margin-bottom: 14px; color: #1a1a2e; }
+table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+th, td { padding: 10px 14px; text-align: center; border-bottom: 1px solid var(--border); }
+th { background: #f0f2f5; font-weight: 600; font-size: 0.82rem; }
+td.l { text-align: left; }
+.tfoot td { font-weight: 700; background: #f7f8fa; border-top: 2px solid var(--border); }
+.pos { color: var(--pos); font-weight: 700; }
+.neg { color: var(--neg); font-weight: 700; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 10px; }
+.row label { font-size: 0.82rem; font-weight: 500; color: var(--muted); display: block; margin-bottom: 3px; }
+.row input, .row select { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem; font-family: inherit; }
+.row input:focus, .row select:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(68,114,196,.12); }
+.row input[type=number] { width: 110px; }
+.btn { display: inline-flex; align-items: center; gap: 5px; padding: 7px 16px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-family: inherit; background: #fff; color: var(--text); }
+.btn:hover { background: #f0f2f5; }
+.btn.pri { background: var(--blue); color: #fff; border-color: var(--blue); }
+.btn.pri:hover { background: #3560a8; }
+.btn.danger { color: var(--neg); border-color: var(--neg); }
+.btn.danger:hover { background: #fef2f2; }
+.btn.sm { padding: 4px 10px; font-size: 0.78rem; }
+.btn.green { background: var(--green); color: #fff; border-color: var(--green); }
+.btn.green:hover { background: #436d2a; }
+.settle-box { background: #fffbeb; border: 2px solid #f59e0b; border-radius: 12px; padding: 20px; margin-top: 16px; }
+.settle-box h2 { color: #92400e; margin-bottom: 12px; }
+.transfer { display: flex; align-items: center; gap: 10px; padding: 10px 0; font-size: 1.05rem; }
+.transfer .arrow { font-size: 1.3rem; }
+.transfer .amount { font-weight: 700; font-size: 1.2rem; }
+.empty { text-align: center; padding: 60px 20px; color: var(--muted); }
+.month-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+.month-bar select { padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem; font-family: inherit; }
+.toast { position: fixed; bottom: 24px; right: 24px; background: #333; color: #fff; padding: 12px 22px; border-radius: 8px; font-size: 0.85rem; z-index: 999; display: none; }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 500; }
+.tag.g { background: #dcfce7; color: #166534; }
+.tag.r { background: #fee2e2; color: #991b1b; }
+.tag.b { background: #dbeafe; color: #1e40af; }
+.tag.y { background: #fef3c7; color: #92400e; }
+.tag.p { background: #f3e8ff; color: #7c3aed; }
+.settings-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.settings-row:last-child { border-bottom: none; }
+.settings-row label { min-width: 100px; font-weight: 500; }
+.member-tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 20px; font-size: 0.82rem; font-weight: 500; color: #fff; }
+.member-del { cursor: pointer; opacity: 0.6; font-size: 1rem; }
+.member-del:hover { opacity: 1; }
+.member-color-input { width: 36px; height: 30px; padding: 0; border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
+@media (max-width: 600px) { .cards { grid-template-columns: 1fr; } header { flex-direction: column; align-items: stretch; } .header-right { margin-left: 0; } }
+
+/* Cloud data styles */
+.filter-bar { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 16px; padding: 14px 16px; background: var(--card); border-radius: 10px; border: 1px solid var(--border); }
+.filter-bar label { font-size: 0.82rem; font-weight: 500; display: block; margin-bottom: 3px; }
+.filter-bar input[type=date] { padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.88rem; font-family: inherit; }
+.status-checks { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.status-checks label { display: inline-flex; align-items: center; gap: 3px; font-size: 0.82rem; cursor: pointer; font-weight: 400; white-space: nowrap; }
+.status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+.status-dot.sent { background: #16a34a; }
+.status-dot.printing { background: #4472C4; }
+.status-dot.queued { background: #f59e0b; }
+.status-dot.failed { background: #dc2626; }
+.status-dot.canceled { background: #9ca3af; }
+.status-dot.offline_unknown { background: #8b5cf6; }
+.order-row { cursor: pointer; transition: background .15s; }
+.order-row:hover { background: #f8f9fb; }
+.order-row.expanded { background: #f0f4ff; }
+.file-sub-row { background: #fafbfc; font-size: 0.82rem; }
+.file-sub-row td { padding: 6px 14px 6px 36px; color: var(--muted); }
+.expand-icon { display: inline-block; transition: transform .2s; font-size: 0.7rem; margin-right: 4px; }
+.order-row.expanded .expand-icon { transform: rotate(90deg); }
+.loading-spin { display: inline-block; width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--blue); border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; margin-right: 6px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.bound-badge { font-size: 0.7rem; padding: 1px 6px; border-radius: 8px; font-weight: 500; }
+.bound-badge.yes { background: #dcfce7; color: #166534; }
+.bound-badge.no { background: #f3f4f6; color: #9ca3af; }
+.rev-compare { margin-top: 12px; padding: 12px; background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; font-size: 0.85rem; }
+.rev-compare h3 { font-size: 0.9rem; margin-bottom: 8px; color: #92400e; }
+.bind-input { width: 280px; font-family: monospace; font-size: 0.82rem; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🖨️ 打印项目 · 收支清算</h1>
+  <nav>
+    <button class="on" data-tab="dash">📊 本月总览</button>
+    <button data-tab="entry">📝 记账</button>
+    <button data-tab="cloud">📡 云端数据</button>
+    <button data-tab="history">📅 历史</button>
+    <button data-tab="settings">⚙️ 设置</button>
+    <button data-tab="about">📄 关于</button>
+  </nav>
+  <div class="header-right">
+    <span class="path" id="storageFilePath"></span>
+  </div>
+</header>
+<main>
+  <div class="tab on" id="tab-dash"></div>
+  <div class="tab" id="tab-entry"></div>
+  <div class="tab" id="tab-cloud"></div>
+  <div class="tab" id="tab-history"></div>
+  <div class="tab" id="tab-settings"></div>
+  <div class="tab" id="tab-about"></div>
+</main>
+<div id="toast" class="toast"></div>
+
+<script>
+// ==================== STORAGE ====================
+// 仅使用本地文件储存（通过内置 HTTP 服务器 API 读写 JSON 文件）
+// 不使用浏览器 localStorage，清除缓存不会丢失数据。
+
+// 默认成员和配置
+const DEFAULT_MEMBERS = [
+  { id: 'alice', name: '成员A', color: '#4472C4' },
+  { id: 'bob',   name: '成员B', color: '#548235' },
+  { id: 'carol', name: '成员C', color: '#ED7D31' },
+];
+const DEFAULT_SCORE_CAP = 15;
+const DEFAULT_RATE = 0.05;
+
+// 默认月份数据（首次使用的示例数据）
+const DEFAULT_MONTHS = {
+  '2026-07': {
+    key: '2026-07',
+    label: '2026年7月',
+    expenses: [
+      { item: '打印机', amount: 1000.00, payer: 'alice' },
+      { item: 'A4纸',   amount: 80.00,  payer: 'bob' },
+      { item: '墨盒',   amount: 50.00,  payer: 'carol' },
+    ],
+    income: { alice: 200.00, bob: 300.00, carol: 50.00 },
+    scores: {
+      alice: [
+        { item: '打印服务', score: 10 },
+        { item: '推广',     score: 5 },
+      ],
+      bob: [
+        { item: '打印服务', score: 12 },
+        { item: '物流',     score: 8 },
+      ],
+      carol: [
+        { item: '财务',     score: 7 },
+        { item: '采购',     score: 4 },
+      ],
+    },
+    note: '示例数据 — 在设置中自定义成员和评分',
+  },
+};
+
+// === 本地文件（通过服务器 API 读写） ===
+var _localFilePath = '';
+
+async function _saveToServer(data) {
+  try {
+    var resp = await fetch('/api/local/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: data }),
+    });
+    var result = await resp.json();
+    if (result.success) {
+      _localFilePath = result.path || '';
+      return true;
+    }
+    return false;
+  } catch(e) {
+    return false;
+  }
+}
+
+async function _loadFromServer() {
+  try {
+    var resp = await fetch('/api/local/data');
+    var result = await resp.json();
+    if (result.success) {
+      _localFilePath = result.path || '';
+      return result.data;
+    }
+    return null;
+  } catch(e) {
+    return null;
+  }
+}
+
+function downloadJSON(data, filename) {
+  var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(function() { URL.revokeObjectURL(a.href); }, 1000);
+}
+
+function saveData(data) {
+  _saveToServer(data);
+}
+
+// === 配置迁移 ===
+function migrateConfig(data) {
+  if (!data.config) data.config = {};
+  if (!data.config.scoreCap) data.config.scoreCap = DEFAULT_SCORE_CAP;
+  if (!data.config.members || data.config.members.length === 0) {
+    data.config.members = JSON.parse(JSON.stringify(DEFAULT_MEMBERS));
+  }
+  if (data.config.investRate == null) data.config.investRate = DEFAULT_RATE;
+  return data;
+}
+
+function getMembers() { return STORE.config.members || DEFAULT_MEMBERS; }
+function getScoreCap() { return STORE.config.scoreCap || DEFAULT_SCORE_CAP; }
+function getMember(id) { return getMembers().find(function(m) { return m.id === id; }); }
+function MN(id) { var x = getMember(id); return x ? x.name : id; }
+function MC(id) { var x = getMember(id); return x ? x.color : '#000'; }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// Global state
+var STORE = { config: { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) }, months: {} };
+STORE = migrateConfig(STORE);
+if (!STORE.config) STORE.config = { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) };
+var currentKey = Object.keys(STORE.months).sort().pop() || null;
+
+// Cloud data state
+var _cloudData = null;
+var _cloudLoading = false;
+var _cloudExpanded = {};
+var _cloudUserFilter = 'all';
+
+// ==================== CALC ====================
+function calcMonth(m) {
+  var members = getMembers();
+  var rate = (STORE.config && STORE.config.investRate != null) ? STORE.config.investRate : DEFAULT_RATE;
+  var scoreCap = getScoreCap();
+  var exps = m.expenses || [];
+  var inc = m.income || {};
+  var scores = m.scores || {};
+  var totalExp = exps.reduce(function(s, e) { return s + (e.amount||0); }, 0);
+  var perPerson = members.length > 0 ? totalExp / members.length : 0;
+  var totalInc = 0;
+  members.forEach(function(mem) { totalInc += inc[mem.id] || 0; });
+
+  var scoreTotals = {}, totalScore = 0;
+  members.forEach(function(mem) {
+    var items = scores[mem.id] || [];
+    scoreTotals[mem.id] = items.reduce(function(s, x) { return s + Math.min(x.score||0, scoreCap); }, 0);
+    totalScore += scoreTotals[mem.id];
+  });
+
+  var paid = {};
+  members.forEach(function(m) { paid[m.id] = 0; });
+  exps.forEach(function(e) { paid[e.payer] = (paid[e.payer]||0) + (e.amount||0); });
+
+  var investPool = totalInc * rate;
+  var servicePool = totalInc * (1 - rate);
+  var memberCount = members.length || 1;
+
+  var investReturn = {};
+  members.forEach(function(mem) { investReturn[mem.id] = investPool / memberCount; });
+
+  var serviceReturn = {};
+  members.forEach(function(mem) {
+    var ratio = totalScore > 0 ? scoreTotals[mem.id] / totalScore : 1/memberCount;
+    serviceReturn[mem.id] = servicePool * ratio;
+  });
+
+  var redist = {};
+  members.forEach(function(mem) { redist[mem.id] = investReturn[mem.id] + serviceReturn[mem.id]; });
+
+  var net = {};
+  members.forEach(function(mem) {
+    net[mem.id] = redist[mem.id] - perPerson - (inc[mem.id]||0) + (paid[mem.id]||0);
+  });
+
+  var balances = members.map(function(m) { return { id: m.id, net: net[m.id] }; });
+  var payers = balances.filter(function(b) { return b.net < -0.005; }).sort(function(a,b) { return a.net - b.net; });
+  var receivers = balances.filter(function(b) { return b.net > 0.005; }).sort(function(a,b) { return a.net - b.net; });
+  var transfers = [];
+  var pi = 0, ri = 0;
+  var rem = {};
+  balances.forEach(function(b) { rem[b.id] = b.net; });
+  while (pi < payers.length && ri < receivers.length) {
+    var debt = Math.abs(rem[payers[pi].id]);
+    var credit = rem[receivers[ri].id];
+    var amt = Math.min(debt, credit);
+    if (amt > 0.005) transfers.push({ from: payers[pi].id, to: receivers[ri].id, amount: amt });
+    rem[payers[pi].id] += amt;
+    rem[receivers[ri].id] -= amt;
+    if (Math.abs(rem[payers[pi].id]) < 0.005) pi++;
+    if (Math.abs(rem[receivers[ri].id]) < 0.005) ri++;
+  }
+
+  return { rate, totalExp, perPerson, totalInc, scoreTotals, totalScore,
+           paid, investPool, servicePool, investReturn, serviceReturn,
+           redist, net, transfers, members, memberCount, scoreCap };
+}
+
+function F(n) { return (n||0).toFixed(2); }
+function RMB(n) { return '¥' + F(n); }
+
+// ==================== HELPERS ====================
+function $(s) { return document.querySelector(s); }
+function $$(s) { return document.querySelectorAll(s); }
+function toast(msg) {
+  var t = $('#toast');
+  t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._tid);
+  t._tid = setTimeout(function() { t.style.display = 'none'; }, 2000);
+}
+
+function switchTab(name) {
+  $$('.tab').forEach(function(p) { p.classList.remove('on'); });
+  $$('nav button').forEach(function(b) { b.classList.remove('on'); });
+  var tab = $('#tab-' + name);
+  if (tab) tab.classList.add('on');
+  var btn = document.querySelector('nav button[data-tab="' + name + '"]');
+  if (btn) btn.classList.add('on');
+}
+
+function save() {
+  _saveToServer(STORE);
+}
+
+function updateStorageIndicator() {
+  var pathEl = document.getElementById('storageFilePath');
+  if (pathEl) {
+    if (_localFilePath) {
+      var shortPath = _localFilePath.replace(/^.*[\\/]/, '');
+      pathEl.textContent = '📄 ' + shortPath;
+      pathEl.title = _localFilePath;
+    } else {
+      pathEl.textContent = '';
+      pathEl.title = '';
+    }
+  }
+}
+
+// ==================== STATUS HELPERS ====================
+var STATUS_LABELS = {
+  sent: '已完成', printing: '打印中', queued: '排队中',
+  failed: '失败', canceled: '已取消', rejected: '已拒绝',
+  accepted: '已接单', abandoned: '已放弃', reserved: '已预留', offline_unknown: '离线未知'
+};
+var STATUS_CLASSES = {
+  sent: 'g', printing: 'b', queued: 'y',
+  failed: 'r', canceled: '', rejected: 'r',
+  accepted: 'b', abandoned: '', reserved: 'y', offline_unknown: 'p'
+};
+function statusLabel(s) { return STATUS_LABELS[s] || s; }
+function statusClass(s) { return STATUS_CLASSES[s] || ''; }
+
+// ==================== TAB: DASHBOARD ====================
+function renderDash() {
+  var members = getMembers();
+  var el = $('#tab-dash');
+  if (!currentKey || !STORE.months[currentKey]) {
+    el.innerHTML = '<div class="empty"><p style="font-size:3rem">📭</p><h3>暂无数据</h3><p>请切换到「记账」标签创建月度记录</p></div>';
+    return;
+  }
+  var m = STORE.months[currentKey];
+  var r = calcMonth(m);
+
+  var h = '<div class="cards">';
+  h += '<div class="card"><h3>📅 当前月份</h3><div class="big">' + m.label + '</div></div>';
+  h += '<div class="card"><h3>🧾 本月采购总额</h3><div class="big">' + RMB(r.totalExp) + '</div><div class="sub">' + r.memberCount + '人均摊 每人 ' + RMB(r.perPerson) + '</div></div>';
+  var rpctCard = (r.rate*100).toFixed(0);
+  h += '<div class="card"><h3>💵 代收总额</h3><div class="big">' + RMB(r.totalInc) + '</div><div class="sub">投资均分 ' + RMB(r.investPool) + '（' + rpctCard + '%）| 服务按分 ' + RMB(r.servicePool) + '（' + (100-rpctCard) + '%）</div></div>';
+  h += '</div>';
+
+  h += '<div class="section"><h2>🧾 采购明细（' + r.memberCount + '人均摊）</h2><table><thead><tr><th>项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
+  (m.expenses||[]).forEach(function(e) {
+    h += '<tr><td class="l">' + esc(e.item) + '</td><td>' + RMB(e.amount) + '</td><td style="color:' + MC(e.payer) + ';font-weight:600">' + MN(e.payer) + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalExp) + '</td><td>人均 ' + RMB(r.perPerson) + '</td></tr>';
+  h += '</tbody></table></div>';
+
+  var rpct = (r.rate * 100).toFixed(1);
+  var spct = ((1 - r.rate) * 100).toFixed(1);
+  h += '<div class="section"><h2>💵 收入分配 <span style="font-weight:400;font-size:0.85rem;color:var(--muted)">';
+  h += '投资均分 <input type="range" min="0" max="50" step="1" value="' + (r.rate*100) + '" onchange="updateRate(+this.value)" style="width:120px;vertical-align:middle"> <b id="rate-val">' + rpct + '%</b>';
+  h += ' | 服务按分 ' + spct + '% | 评分上限 ' + r.scoreCap + '分</span></h2>';
+  h += '<table><thead><tr><th></th><th>投资回报<br>（均分）</th><th>服务得分</th><th>服务占比</th><th>服务回报</th><th>应得收入</th><th>实际代收</th><th>差额</th></tr></thead><tbody>';
+  members.forEach(function(mem) {
+    var svcRatio = r.totalScore > 0 ? r.scoreTotals[mem.id] / r.totalScore : 1/r.memberCount;
+    var diff = r.redist[mem.id] - ((m.income||{})[mem.id]||0);
+    h += '<tr>';
+    h += '<td style="font-weight:600;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td>' + RMB(r.investReturn[mem.id]) + '</td>';
+    h += '<td>' + (r.scoreTotals[mem.id]||0) + '</td>';
+    h += '<td>' + (svcRatio*100).toFixed(1) + '%</td>';
+    h += '<td>' + RMB(r.serviceReturn[mem.id]) + '</td>';
+    h += '<td style="font-weight:600">' + RMB(r.redist[mem.id]) + '</td>';
+    h += '<td>' + RMB((m.income||{})[mem.id]||0) + '</td>';
+    h += '<td class="' + (diff>=0?'pos':'neg') + '">' + (diff>=0?'+':'') + RMB(diff) + '</td>';
+    h += '</tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.investPool) + '</td><td>' + r.totalScore + '</td><td>100%</td><td>' + RMB(r.servicePool) + '</td><td>' + RMB(r.totalInc) + '</td><td>' + RMB(r.totalInc) + '</td><td>0</td></tr>';
+  h += '</tbody></table>';
+  h += '<div style="margin-top:8px;font-size:0.82rem;color:var(--muted)">';
+  h += '投资回报 = 收入×' + rpct + '% ÷ ' + r.memberCount + '人（因采购均摊，故投资回报也均分）。差额 = 应得 − 实际代收（正=补足，负=分给别人）。拖动滑块可调节比例。</div></div>';
+
+  h += '<div class="section"><h2>📊 经营损益（本月每人实际赚/亏）</h2>';
+  h += '<table><thead><tr><th></th><th>应得收入</th><th>− 均摊支出</th><th>= 本月盈亏</th></tr></thead><tbody>';
+  var totalPL = 0;
+  members.forEach(function(mem) {
+    var pl = r.redist[mem.id] - r.perPerson;
+    totalPL += pl;
+    var tag = pl >= 0 ? '<span class="tag g">盈利</span>' : '<span class="tag r">亏损</span>';
+    h += '<tr><td style="font-weight:600;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td>' + RMB(r.redist[mem.id]) + '</td>';
+    h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
+    h += '<td class="' + (pl>=0?'pos':'neg') + '" style="font-weight:700">' + (pl>=0?'+':'') + RMB(pl) + ' ' + tag + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>−' + RMB(r.totalExp) + '</td><td class="' + (totalPL>=0?'pos':'neg') + '">' + (totalPL>=0?'+':'') + RMB(totalPL) + '</td></tr>';
+  h += '</tbody></table>';
+  h += '<div style="margin-top:6px;font-size:0.82rem;color:var(--muted)">经营损益 = 应得收入 − 均摊支出。正值=本月盈利，负值=本月亏损（支出大于收入）。</div></div>';
+
+  h += '<div class="section"><h2>💳 垫付清算（谁多垫了、谁少垫了）</h2>';
+  h += '<table><thead><tr><th></th><th>实际代付</th><th>− 应均摊</th><th>= 垫付差额</th></tr></thead><tbody>';
+  members.forEach(function(mem) {
+    var adv = (r.paid[mem.id]||0) - r.perPerson;
+    var tag2 = adv > 1 ? '<span class="tag g">多垫，应收</span>' : (adv < -1 ? '<span class="tag r">少垫，应付</span>' : '<span class="tag b">持平</span>');
+    h += '<tr><td style="font-weight:600;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td class="pos">+' + RMB(r.paid[mem.id]) + '</td>';
+    h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
+    h += '<td class="' + (adv>=0?'pos':'neg') + '" style="font-weight:700">' + (adv>=0?'+':'') + RMB(adv) + ' ' + tag2 + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(r.totalExp) + '</td><td>−' + RMB(r.perPerson * r.memberCount) + '</td><td>0</td></tr>';
+  h += '</tbody></table>';
+  h += '<div style="margin-top:6px;font-size:0.82rem;color:var(--muted)">垫付差额 = 实际代付 − 应均摊。采购是AA的，多垫的人要收回，少垫的人要补交。</div></div>';
+
+  h += '<div class="settle-box"><h2>🔄 资金重分配（实际转账）</h2>';
+  h += '<table style="margin-bottom:16px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>= 应转出/入</th></tr></thead><tbody>';
+  members.forEach(function(mem) {
+    var incomeAdj = r.redist[mem.id] - ((m.income||{})[mem.id]||0);
+    var adv = (r.paid[mem.id]||0) - r.perPerson;
+    var transfer = incomeAdj + adv;
+    h += '<tr><td style="font-weight:600;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td class="' + (incomeAdj>=0?'pos':'neg') + '">' + (incomeAdj>=0?'+':'') + RMB(incomeAdj) + '</td>';
+    h += '<td class="' + (adv>=0?'pos':'neg') + '">' + (adv>=0?'+':'') + RMB(adv) + '</td>';
+    h += '<td class="' + (transfer>=0?'pos':'neg') + '" style="font-weight:700">' + (transfer>=0?'+':'') + RMB(transfer) + '</td></tr>';
+  });
+  h += '</tbody></table>';
+  if (r.transfers.length > 0) {
+    h += '<div style="font-weight:600;margin-bottom:8px;color:#92400e">转账指令：</div>';
+    r.transfers.forEach(function(t) {
+      h += '<div class="transfer"><span style="color:' + MC(t.from) + ';font-weight:600">' + MN(t.from) + '</span>';
+      h += ' <span class="arrow">→</span> ';
+      h += '<span style="color:' + MC(t.to) + ';font-weight:600">' + MN(t.to) + '</span>';
+      h += ' <span class="amount">' + RMB(t.amount) + '</span></div>';
+    });
+  } else {
+    h += '<div style="color:var(--muted)">✅ 收支平衡，无需转账</div>';
+  }
+  h += '<div style="margin-top:12px;font-size:0.82rem;color:var(--muted)">资金重分配 = 收入调整（应得−代收）+ 垫付差额（代付−均摊）。正数=应收回，负数=应转出。两者之和始终为0。</div>';
+  h += '</div>';
+  el.innerHTML = h;
+}
+
+// ==================== TAB: ENTRY ====================
+function renderEntry() {
+  var members = getMembers();
+  var scoreCap = getScoreCap();
+  var el = $('#tab-entry');
+  var keys = Object.keys(STORE.months).sort();
+
+  var h = '<div class="month-bar"><label style="font-weight:600">月份：</label>';
+  h += '<select id="entry-sel" onchange="onSelMonth()">';
+  if (keys.length === 0) h += '<option value="">无数据</option>';
+  keys.forEach(function(k) {
+    h += '<option value="' + k + '"' + (currentKey===k?' selected':'') + '>' + STORE.months[k].label + '</option>';
+  });
+  h += '</select>';
+  h += ' <button class="btn pri" onclick="newMonth()">➕ 新建月份</button>';
+  h += ' <button class="btn" onclick="copyMonth()">📋 从上月复制</button>';
+  h += '</div>';
+
+  if (!currentKey || !STORE.months[currentKey]) {
+    el.innerHTML = h + '<div class="empty"><p style="font-size:3rem">📝</p><p>请新建或选择月份</p></div>';
+    return;
+  }
+  var m = STORE.months[currentKey];
+
+  h += '<div class="section"><h2>🧾 采购支出（谁垫付了什么）</h2><table><thead><tr><th>项目</th><th>金额（元）</th><th>代付人</th><th></th></tr></thead><tbody id="etbody">';
+  (m.expenses||[]).forEach(function(e, i) {
+    h += '<tr><td class="l"><input value="' + esc(e.item) + '" onchange="updExp(' + i + ',\'item\',this.value)" style="width:180px"></td>';
+    h += '<td><input type="number" step="0.01" value="' + e.amount + '" onchange="updExp(' + i + ',\'amount\',+this.value)" style="width:110px"></td>';
+    h += '<td><select onchange="updExp(' + i + ',\'payer\',this.value)">';
+    members.forEach(function(x) { h += '<option value="' + x.id + '"' + (e.payer===x.id?' selected':'') + '>' + x.name + '</option>'; });
+    h += '</select></td><td><button class="btn danger sm" onclick="delExp(' + i + ')">✕</button></td></tr>';
+  });
+  h += '</tbody></table><button class="btn sm" style="margin-top:8px" onclick="addExp()">+ 添加支出项</button></div>';
+
+  h += '<div class="section"><h2>💵 代收收入（手动填写，云端数据仅作核对参考）</h2><div class="row">';
+  members.forEach(function(mem) {
+    h += '<div><label>' + mem.name + '</label><input type="number" step="0.01" id="inc-' + mem.id + '" value="' + ((m.income||{})[mem.id]||0) + '" onchange="updInc(\'' + mem.id + '\',+this.value)"></div>';
+  });
+  h += '</div></div>';
+
+  h += '<div class="section"><h2>⭐ 服务贡献评分（CEO 每月评估，单项上限 ' + scoreCap + ' 分）</h2>';
+  members.forEach(function(mem) {
+    var sc = (m.scores||{})[mem.id] || [];
+    var capped = sc.reduce(function(s, x) { return s + Math.min(x.score||0, scoreCap); }, 0);
+    h += '<h3 style="margin:12px 0 6px;color:' + MC(mem.id) + '">' + mem.name + ' — 服务总分：' + capped + '</h3>';
+    h += '<table><thead><tr><th>评分项目</th><th>得分</th><th></th></tr></thead><tbody id="st-' + mem.id + '">';
+    sc.forEach(function(s, i) {
+      var over = (s.score||0) > scoreCap;
+      h += '<tr><td class="l"><input value="' + esc(s.item) + '" onchange="updScore(\'' + mem.id + '\',' + i + ',\'item\',this.value)" style="width:200px"></td>';
+      h += '<td><input type="number" step="0.1" value="' + s.score + '" onchange="updScore(\'' + mem.id + '\',' + i + ',\'score\',+this.value)" style="width:80px;color:' + (over?'var(--neg)':'inherit') + '">';
+      if (over) h += '<span style="color:var(--neg);font-size:0.78rem"> ⚠超限</span>';
+      h += '</td><td><button class="btn danger sm" onclick="delScore(\'' + mem.id + '\',' + i + ')">✕</button></td></tr>';
+    });
+    h += '</tbody></table>';
+    h += '<button class="btn sm" style="margin-top:4px" onclick="addScore(\'' + mem.id + '\')">+ 为' + mem.name + '添加评分项</button>';
+  });
+  h += '</div>';
+
+  h += '<div class="section"><h2>📝 备注</h2><textarea id="mnote" onchange="updNote(this.value)" style="width:100%;height:60px;padding:10px;border:1px solid var(--border);border-radius:6px;font-family:inherit;resize:vertical">' + esc(m.note||'') + '</textarea></div>';
+  h += '<button class="btn pri" onclick="saveAndRefresh()">💾 保存并刷新</button>';
+  el.innerHTML = h;
+}
+
+function updExp(idx, field, val) {
+  STORE.months[currentKey].expenses[idx][field] = val;
+  save();
+}
+function delExp(idx) {
+  STORE.months[currentKey].expenses.splice(idx, 1);
+  save();
+  renderEntry();
+}
+function addExp() {
+  var members = getMembers();
+  if (!STORE.months[currentKey].expenses) STORE.months[currentKey].expenses = [];
+  STORE.months[currentKey].expenses.push({ item: '新材料', amount: 0, payer: members.length > 0 ? members[0].id : '' });
+  save();
+  renderEntry();
+}
+function updInc(memId, val) {
+  if (!STORE.months[currentKey].income) STORE.months[currentKey].income = {};
+  STORE.months[currentKey].income[memId] = val;
+  save();
+}
+function updNote(val) {
+  STORE.months[currentKey].note = val;
+  save();
+}
+function updScore(memId, idx, field, val) {
+  if (!STORE.months[currentKey].scores) STORE.months[currentKey].scores = {};
+  if (!STORE.months[currentKey].scores[memId]) STORE.months[currentKey].scores[memId] = [];
+  STORE.months[currentKey].scores[memId][idx][field] = val;
+  save();
+}
+function delScore(memId, idx) {
+  STORE.months[currentKey].scores[memId].splice(idx, 1);
+  save();
+  renderEntry();
+}
+function addScore(memId) {
+  if (!STORE.months[currentKey].scores) STORE.months[currentKey].scores = {};
+  if (!STORE.months[currentKey].scores[memId]) STORE.months[currentKey].scores[memId] = [];
+  STORE.months[currentKey].scores[memId].push({ item: '新服务项', score: 0 });
+  save();
+  renderEntry();
+}
+function saveAndRefresh() {
+  save();
+  renderDash();
+  renderEntry();
+  toast('✅ 已保存');
+}
+function updateRate(val) {
+  STORE.config.investRate = val / 100;
+  save();
+  var el = document.getElementById('rate-val');
+  if (el) el.textContent = val + '%';
+  renderDash();
+}
+function onSelMonth() {
+  currentKey = document.getElementById('entry-sel').value;
+  renderEntry();
+}
+function newMonth() {
+  var now = new Date();
+  var key = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
+  if (STORE.months[key]) { toast('该月份已存在'); return; }
+  var members = getMembers();
+  var emptyScores = {};
+  members.forEach(function(m) { emptyScores[m.id] = []; });
+  STORE.months[key] = { key: key, label: now.getFullYear()+'年'+(now.getMonth()+1)+'月', expenses: [], income: {}, scores: emptyScores, note: '' };
+  currentKey = key;
+  save();
+  renderEntry();
+  toast('✅ 已创建 ' + STORE.months[key].label);
+}
+function copyMonth() {
+  var keys = Object.keys(STORE.months).sort();
+  if (keys.length === 0) { toast('无上月数据'); return; }
+  var now = new Date();
+  var newKey = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0');
+  if (STORE.months[newKey]) { toast('当月已存在'); return; }
+  STORE.months[newKey] = JSON.parse(JSON.stringify(STORE.months[keys[keys.length-1]]));
+  STORE.months[newKey].key = newKey;
+  STORE.months[newKey].label = now.getFullYear()+'年'+(now.getMonth()+1)+'月';
+  STORE.months[newKey].note = '(从上月复制，请更新)';
+  var members = getMembers();
+  var emptyInc = {};
+  members.forEach(function(m) { emptyInc[m.id] = 0; });
+  STORE.months[newKey].income = emptyInc;
+  currentKey = newKey;
+  save();
+  renderEntry();
+  toast('✅ 已复制（收入已清零）');
+}
+
+// ==================== TAB: CLOUD ====================
+function _defaultCloudDates() {
+  var now = new Date();
+  var y = now.getFullYear();
+  var m = now.getMonth() + 1;
+  var start = y + '-' + String(m).padStart(2,'0') + '-01';
+  var lastDay = new Date(y, m, 0).getDate();
+  var end = y + '-' + String(m).padStart(2,'0') + '-' + String(lastDay).padStart(2,'0');
+  return { start: start, end: end };
+}
+
+function fetchCloudData() {
+  var startEl = document.getElementById('cloud-start');
+  var endEl = document.getElementById('cloud-end');
+  if (!startEl || !endEl) return;
+  var start = startEl.value;
+  var end = endEl.value;
+  if (!start || !end) { toast('请选择日期范围'); return; }
+
+  var checks = document.querySelectorAll('#tab-cloud .status-checks input[type=checkbox]');
+  var statuses = [];
+  checks.forEach(function(cb) { if (cb.checked) statuses.push(cb.value); });
+  if (statuses.length === 0) {
+    ['sent','printing','queued','failed','offline_unknown'].forEach(function(s) { statuses.push(s); });
+  }
+
+  var params = 'start_date=' + encodeURIComponent(start) +
+               '&end_date=' + encodeURIComponent(end) +
+               '&status=' + encodeURIComponent(statuses.join(','));
+
+  _cloudLoading = true;
+  renderCloud();
+
+  fetch('/api/proxy/admin/statistics/revenue?' + params)
+    .then(function(resp) { return resp.json(); })
+    .then(function(data) {
+      _cloudLoading = false;
+      if (data.success) {
+        _cloudData = data.data;
+      } else {
+        _cloudData = null;
+        toast('❌ ' + (data.message || '查询失败'));
+      }
+      renderCloud();
+    })
+    .catch(function(err) {
+      _cloudLoading = false;
+      _cloudData = null;
+      toast('❌ 请求失败: ' + err.message);
+      renderCloud();
+    });
+}
+
+function _toggleOrderExpand(oid) {
+  if (_cloudExpanded[oid]) { delete _cloudExpanded[oid]; }
+  else { _cloudExpanded[oid] = true; }
+  renderCloud();
+}
+
+function _filterCloudUserChanged() {
+  _cloudUserFilter = document.getElementById('cloud-user-filter')?.value || 'all';
+  renderCloud();
+}
+
+function renderCloud() {
+  var el = $('#tab-cloud');
+  var dates = _defaultCloudDates();
+
+  var h = '<div class="filter-bar">';
+  h += '<div><label>起始日期</label><input type="date" id="cloud-start" value="' + dates.start + '"></div>';
+  h += '<div><label>结束日期</label><input type="date" id="cloud-end" value="' + dates.end + '"></div>';
+  h += '<div><label>订单状态</label><div class="status-checks">';
+  var defStatuses = ['sent','printing','queued','failed','offline_unknown'];
+  defStatuses.forEach(function(s) {
+    h += '<label><input type="checkbox" value="' + s + '" checked> <span class="status-dot ' + s + '"></span> ' + statusLabel(s) + '</label>';
+  });
+  h += '</div></div>';
+  h += '<div><label>&nbsp;</label><button class="btn pri" onclick="fetchCloudData()">🔍 查询</button></div>';
+  h += '</div>';
+
+  if (_cloudLoading) {
+    h += '<div class="section" style="text-align:center;padding:40px"><span class="loading-spin"></span> 正在从云端获取数据...</div>';
+    el.innerHTML = h;
+    return;
+  }
+
+  var d = _cloudData;
+  if (!d) {
+    h += '<div class="empty"><p style="font-size:3rem">📡</p><h3>点击「查询」从云端获取订单数据</h3><p>查看服务器中记录的订单收益，用于核对手动填写的代收收入。云端数据不影响现有计算。</p></div>';
+    el.innerHTML = h;
+    return;
+  }
+
+  var rs = d.revenue_summary;
+  var orders = d.orders || [];
+  var byUser = d.by_user || [];
+
+  var selectedUser = _cloudUserFilter;
+  h += '<div class="row" style="margin-bottom:14px"><div><label>按用户筛选</label>';
+  h += '<select id="cloud-user-filter" onchange="_filterCloudUserChanged()"><option value="all">全部用户</option>';
+  (byUser||[]).forEach(function(u) {
+    var label = u.nickname || u.openid.substring(0, 10);
+    h += '<option value="' + u.openid + '"' + (selectedUser === u.openid ? ' selected' : '') + '>' + esc(label) + '</option>';
+  });
+  h += '</select></div></div>';
+
+  var localRev = rs.local || 0;
+  var cloudRev = rs.cloud || 0;
+  h += '<div class="cards">';
+  h += '<div class="card"><h3>💰 总收入（已完成）</h3><div class="big">' + RMB(rs.total) + '</div></div>';
+  h += '<div class="card"><h3>☁ 云端收入</h3><div class="big">' + RMB(cloudRev) + '</div><div class="sub">' + (rs.cloud_orders||0) + ' 个订单 · ' + (rs.cloud_files||0) + ' 个文件 · ' + (rs.cloud_pages||0) + ' 页</div></div>';
+  h += '<div class="card"><h3>🖨 本地收入</h3><div class="big">' + RMB(localRev) + '</div><div class="sub">' + (rs.local_orders||0) + ' 个订单 · ' + (rs.local_files||0) + ' 个文件 · ' + (rs.local_pages||0) + ' 页</div></div>';
+  h += '<div class="card"><h3>📄 总页数</h3><div class="big">' + (rs.total_pages||0) + '</div></div>';
+  h += '</div>';
+
+  if (byUser.length > 0) {
+    h += '<div class="section"><h2>👥 云端各用户收益</h2><table><thead><tr><th>用户</th><th>已完成收益</th><th>订单数</th><th>文件数</th><th>页数</th></tr></thead><tbody>';
+    byUser.forEach(function(u) {
+      var avatarHtml = u.avatar_url
+        ? '<img src="' + esc(u.avatar_url) + '" style="width:24px;height:24px;border-radius:50%;vertical-align:middle;margin-right:6px;object-fit:cover" onerror="this.style.display=\'none\'">'
+        : '';
+      h += '<tr>';
+      h += '<td class="l">' + avatarHtml + esc(u.nickname || '微信用户') + ' <span style="font-size:0.75rem;color:var(--muted)">' + esc(u.openid.substring(0,10)) + '...</span></td>';
+      h += '<td class="pos">' + RMB(u.revenue) + '</td>';
+      h += '<td>' + u.order_count + '</td>';
+      h += '<td>' + u.file_count + '</td>';
+      h += '<td>' + u.total_pages + '</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div>';
+  }
+
+  var filteredOrders = orders;
+  if (selectedUser !== 'all') {
+    filteredOrders = orders.filter(function(o) { return o.openid === selectedUser; });
+  }
+
+  h += '<div class="section"><h2>📋 订单明细（' + filteredOrders.length + ' 条，时间倒序）</h2>';
+  if (filteredOrders.length === 0) {
+    h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
+  } else {
+    h += '<table><thead><tr><th></th><th>订单号</th><th>来源</th><th>用户</th><th>状态</th><th>收益</th><th>文件</th><th>页数</th><th>时间</th></tr></thead><tbody>';
+    filteredOrders.forEach(function(o) {
+      var isExp = !!_cloudExpanded[o.order_id];
+      var avatarHtml = o.avatar_url
+        ? '<img src="' + esc(o.avatar_url) + '" style="width:20px;height:20px;border-radius:50%;vertical-align:middle;margin-right:4px;object-fit:cover" onerror="this.style.display=\'none\'">'
+        : '';
+      h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '" onclick="_toggleOrderExpand(' + o.order_id + ')">';
+      h += '<td><span class="expand-icon">▶</span></td>';
+      h += '<td class="l" style="font-family:monospace;font-size:0.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
+      h += '<td>' + (o.source === 'local' ? '<span class="tag b">本地</span>' : '<span class="tag b">云端</span>') + '</td>';
+      h += '<td class="l">' + avatarHtml + esc(o.nickname || o.openid.substring(0,8) + '...') + '</td>';
+      h += '<td><span class="tag ' + statusClass(o.status) + '">' + statusLabel(o.status) + '</span></td>';
+      h += '<td class="pos">' + RMB(o.revenue) + '</td>';
+      h += '<td>' + o.files_count + '</td>';
+      h += '<td>' + (o.total_page_count || 0) + '</td>';
+      h += '<td style="font-size:0.78rem;color:var(--muted)">' + esc((o.created_at||'').substring(0,16)) + '</td>';
+      h += '</tr>';
+      if (isExp && o.files && o.files.length > 0) {
+        o.files.forEach(function(f) {
+          h += '<tr class="file-sub-row">';
+          h += '<td></td>';
+          h += '<td class="l" colspan="2" style="padding-left:36px">📄 ' + esc(f.file_name) + '</td>';
+          h += '<td><span class="tag ' + statusClass(f.status) + '">' + statusLabel(f.status) + '</span></td>';
+          h += '<td class="pos">' + RMB(f.total_price) + '</td>';
+          h += '<td>' + f.copies + '份 ' + (f.duplex==='on'?'双面':'单面') + '</td>';
+          h += '<td>' + f.page_count + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</td>';
+          h += '<td></td>';
+          h += '<td></td>';
+          h += '</tr>';
+        });
+      }
+    });
+    h += '</tbody></table>';
+  }
+  h += '</div>';
+
+  h += '<div style="font-size:0.78rem;color:var(--muted);text-align:right">查询周期: ' + d.period.start + ' ~ ' + d.period.end + '</div>';
+
+  el.innerHTML = h;
+}
+
+// ==================== TAB: HISTORY ====================
+function renderHistory() {
+  var members = getMembers();
+  var el = $('#tab-history');
+  var keys = Object.keys(STORE.months).sort().reverse();
+  if (keys.length === 0) {
+    el.innerHTML = '<div class="empty"><p style="font-size:3rem">📅</p><h3>暂无记录</h3></div>';
+    return;
+  }
+  var h = '<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">';
+  h += '<button class="btn pri" onclick="exportData()">📤 导出 JSON</button>';
+  h += '<button class="btn" onclick="document.getElementById(\'ifile\').click()">📥 导入 JSON</button>';
+  h += '<input type="file" id="ifile" accept=".json" style="display:none" onchange="importData(event)">';
+  h += '<button class="btn danger" onclick="resetData()">⚠ 重置</button></div>';
+
+  h += '<table><thead><tr><th>月份</th><th>采购总额</th><th>人均</th><th>总收入</th>';
+  members.forEach(function(m) { h += '<th>' + m.name + ' 净额</th>'; });
+  h += '<th>备注</th><th></th></tr></thead><tbody>';
+  keys.forEach(function(key) {
+    var m = STORE.months[key];
+    var r = calcMonth(m);
+    h += '<tr><td>' + m.label + '</td><td>' + RMB(r.totalExp) + '</td><td>' + RMB(r.perPerson) + '</td><td>' + RMB(r.totalInc) + '</td>';
+    members.forEach(function(mem) {
+      var net = r.redist[mem.id] - r.perPerson + (r.paid[mem.id]||0);
+      h += '<td class="' + (net>=0?'pos':'neg') + '">' + (net>=0?'+':'') + RMB(net) + '</td>';
+    });
+    h += '<td style="max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:0.78rem">' + (m.note||'-') + '</td>';
+    h += '<td><button class="btn sm" onclick="editMonth(\'' + key + '\')">编辑</button> <button class="btn danger sm" onclick="delMonth(\'' + key + '\')">删除</button></td></tr>';
+  });
+  h += '</tbody></table>';
+  el.innerHTML = h;
+}
+
+function editMonth(key) { currentKey = key; switchTab('entry'); renderEntry(); }
+function delMonth(key) {
+  if (!confirm('确定删除 ' + STORE.months[key].label + '？')) return;
+  delete STORE.months[key];
+  save();
+  var keys = Object.keys(STORE.months).sort();
+  currentKey = keys.length > 0 ? keys[keys.length - 1] : null;
+  renderDash();
+  renderHistory();
+  toast('已删除');
+}
+function exportData() {
+  downloadJSON(STORE, '打印项目_清算备份_' + new Date().toISOString().slice(0,10) + '.json');
+  toast('✅ 已导出');
+}
+function importData(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(ev) {
+    try {
+      var data = JSON.parse(ev.target.result);
+      if (!data.months) throw new Error('格式错误');
+      STORE = migrateConfig(data);
+      save();
+      var keys = Object.keys(STORE.months).sort();
+      currentKey = keys.length > 0 ? keys[keys.length - 1] : null;
+      renderAll();
+      toast('✅ 已导入 ' + keys.length + ' 个月');
+    } catch(err) { toast('❌ 导入失败：' + err.message); }
+  };
+  reader.readAsText(file);
+}
+function resetData() {
+  if (!confirm('⚠ 确定删除所有数据？建议先导出备份。')) return;
+  STORE = { config: { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) }, months: {} };
+  save();
+  currentKey = null;
+  renderAll();
+  toast('已重置，数据已清空');
+}
+
+// ==================== TAB: SETTINGS ====================
+function renderSettings() {
+  var members = getMembers();
+  var scoreCap = getScoreCap();
+  var el = $('#tab-settings');
+
+  var h = '';
+
+  h += '<div class="section"><h2>⭐ 服务评分上限</h2>';
+  h += '<div class="settings-row">';
+  h += '<label>单项评分上限</label>';
+  h += '<input type="number" min="1" max="100" step="1" value="' + scoreCap + '" onchange="updateScoreCap(+this.value)" style="width:100px">';
+  h += '<span style="color:var(--muted);font-size:0.85rem">当前上限 ' + scoreCap + ' 分，修改后所有月份计算将即时生效</span>';
+  h += '</div></div>';
+
+  h += '<div class="section"><h2>👥 成员管理</h2>';
+  h += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px">';
+  members.forEach(function(m, i) {
+    h += '<span class="member-tag" style="background:' + m.color + '">';
+    h += '<span>' + esc(m.name) + '</span>';
+    h += '<span class="member-del" onclick="removeMember(\'' + m.id + '\')" title="移除">✕</span>';
+    h += '</span>';
+  });
+  h += '</div>';
+
+  h += '<div class="settings-row">';
+  h += '<label>添加成员</label>';
+  h += '<input type="text" id="newMemberName" placeholder="姓名" style="width:120px">';
+  h += '<input type="color" id="newMemberColor" value="#4472C4" class="member-color-input" title="标签颜色">';
+  h += '<button class="btn green sm" onclick="addMember()">+ 添加</button>';
+  h += '</div>';
+
+  h += '<div style="margin-top:8px;font-size:0.82rem;color:var(--muted)">';
+  h += '成员 ID 由拼音字母自动生成。删除成员不会删除已有月份中该成员的数据（但不再参与后续计算）。';
+  h += '</div></div>';
+
+  h += '<div class="section"><h2>⚙️ 其他</h2>';
+  h += '<div class="settings-row">';
+  h += '<label>数据管理</label>';
+  h += '<button class="btn sm" onclick="exportData()">📤 导出 JSON</button>';
+  h += ' <button class="btn sm" onclick="document.getElementById(\'ifile-settings\').click()">📥 导入 JSON</button>';
+  h += ' <button class="btn danger sm" onclick="resetData()">⚠ 重置所有数据</button>';
+  h += '<input type="file" id="ifile-settings" accept=".json" style="display:none" onchange="importData(event)">';
+  h += '</div>';
+  h += '<div class="settings-row">';
+  h += '<label>文件路径</label>';
+  h += '<span id="settingsFilePath" style="font-size:0.85rem;color:var(--green);font-family:monospace"></span>';
+  h += '</div>';
+  h += '</div>';
+
+  el.innerHTML = h;
+
+  // Update file path display
+  var pathSpan = document.getElementById('settingsFilePath');
+  if (pathSpan) {
+    if (_localFilePath) {
+      pathSpan.textContent = '📄 ' + _localFilePath.replace(/^.*[\\/]/, '');
+      pathSpan.title = _localFilePath;
+    } else {
+      pathSpan.textContent = '等待服务器响应...';
+    }
+  }
+}
+
+function updateScoreCap(val) {
+  if (val < 1) val = 1;
+  STORE.config.scoreCap = val;
+  save();
+  renderDash();
+  toast('✅ 评分上限已设为 ' + val + ' 分');
+}
+
+function addMember() {
+  var name = document.getElementById('newMemberName').value.trim();
+  if (!name) { toast('请输入姓名'); return; }
+  var members = getMembers();
+  var id = 'm' + Date.now().toString(36).slice(-4);
+  var color = document.getElementById('newMemberColor').value;
+  members.push({ id: id, name: name, color: color });
+  STORE.config.members = members;
+  save();
+  document.getElementById('newMemberName').value = '';
+  renderSettings();
+  renderDash();
+  renderEntry();
+  toast('✅ 已添加成员：' + name);
+}
+
+function removeMember(mid) {
+  var members = getMembers();
+  var idx = -1;
+  members.forEach(function(m, i) { if (m.id === mid) idx = i; });
+  if (idx === -1) return;
+  var name = members[idx].name;
+  if (!confirm('确定移除成员「' + name + '」？已有月份中该成员的数据不会丢失，但不再参与后续计算。')) return;
+  members.splice(idx, 1);
+  STORE.config.members = members;
+  save();
+  renderSettings();
+  renderDash();
+  renderEntry();
+  toast('已移除：' + name);
+}
+
+// ==================== TAB: ABOUT ====================
+function renderAbout() {
+  var el = $('#tab-about');
+  el.innerHTML =
+    '<div class="section" style="text-align:center;padding:40px 20px">' +
+      '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
+      '<h2 style="font-size:1.3rem;margin-bottom:6px">打印项目 · 收支清算</h2>' +
+      '<div style="font-size:1rem;color:var(--blue);font-weight:600;margin-bottom:16px">v2.0</div>' +
+      '<div style="max-width:400px;margin:0 auto;line-height:1.8;font-size:0.9rem;color:var(--muted)">' +
+        '<p>打印项目的收支清算工具，支持多人均摊采购、按服务贡献分配收入。</p>' +
+        '<p style="margin-top:12px">v2.0 新增：☁ 云端数据同步，可从服务器拉取订单收益用于核对。</p>' +
+        '<p style="margin-top:12px">功能：多人均摊 / 服务评分 / 智能转账 / 月度历史 / 云端核对 / 本地文件储存</p>' +
+      '</div>' +
+      '<div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border);font-size:0.82rem;color:var(--muted)">' +
+        '<p>数据仅保存在本地文件中（通过内置 HTTP 服务器 API 读写），清除浏览器缓存不会丢失数据。</p>' +
+      '</div>' +
+    '</div>';
+}
+
+// ==================== ROUTER ====================
+function renderAll() {
+  renderDash();
+  renderEntry();
+  renderCloud();
+  renderHistory();
+  renderSettings();
+  renderAbout();
+}
+
+// ==================== INIT ====================
+(function() {
+  var navs = document.querySelectorAll('nav button');
+  navs.forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      switchTab(this.dataset.tab);
+      if (this.dataset.tab === 'dash') renderDash();
+      else if (this.dataset.tab === 'entry') renderEntry();
+      else if (this.dataset.tab === 'cloud') renderCloud();
+      else if (this.dataset.tab === 'history') renderHistory();
+      else if (this.dataset.tab === 'settings') renderSettings();
+      else if (this.dataset.tab === 'about') renderAbout();
+    });
+  });
+
+  updateStorageIndicator();
+  _loadFromServer().then(function(data) {
+    if (data) {
+      STORE = migrateConfig(data);
+      renderAll();
+      toast('✅ 已加载 ' + Object.keys(STORE.months).length + ' 个月数据 [本地文件]');
+    } else {
+      renderAll();
+      toast('ℹ️ 无数据文件，可在「设置」中导入或创建月份');
+    }
+  });
+})();
+</script>
+</body>
+</html>

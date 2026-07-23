@@ -1,0 +1,35 @@
+# ============================================================
+# config.py — HN 云打印配置文件（模板）
+# 使用前复制为 config.py 并填入真实值
+#   cp config.py.example config.py
+# config.py 已排除在 git 外，不会提交到仓库。
+# ============================================================
+
+# -------- 微信小程序配置 --------
+# 从小程序管理后台获取
+WECHAT_APPID = "你的微信小程序 AppID"
+WECHAT_APPSECRET = "你的微信小程序 AppSecret"
+
+# -------- 服务器密钥（用于签名登录 token）--------
+SECRET_KEY = "生成一个随机字符串，例如 python -c 'import secrets; print(secrets.token_hex(16))'"
+
+# -------- 管理员 OpenID 列表（用于权限控制）--------
+# 这些 openid 对应的用户为管理员，可查看全员打印排行榜
+ADMIN_OPENIDS = [
+    "你的微信 openid",
+]
+# 超级管理员 openid（唯一，可创建 admin 类型的许可密钥）
+SUPER_ADMIN_OPENID = "你的微信 openid"
+
+# -------- 打印机客户端配置 --------
+# 本地测试时使用 http://127.0.0.1:5000
+# 部署到云服务器后改为你的域名，例如:
+#   CLOUD_API_URL = "https://print.your-domain.com"
+#   WEBSOCKET_URL = "https://print.your-domain.com"
+PUBLIC_BASE_URL = "http://127.0.0.1:5000"
+CLOUD_API_URL = "http://127.0.0.1:5000"
+WEBSOCKET_URL = "http://127.0.0.1:5000"
+# 客户端认证 token
+TOKEN = "生成一个随机字符串，与本地打印工具 print_config.json 的 cloud_token 保持一致"
+# Windows 打印机名称（与控制面板中显示的完全一致）
+PRINTER_NAME = ""

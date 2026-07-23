@@ -288,38 +288,36 @@ def cleanup_expired_files():
         print(f"  [CLEANUP] 已清理 {deleted_count} 个过期文件（cutoff={cutoff_str}）")
 
 
-# -------- 加载配置 --------
+# -------- 加载配置（内部默认值 + config.py 覆盖）--------
+# 所有敏感信息使用占位符/空值作为内部默认值，
+# 部署后通过 config.py 覆盖（config.py 已排除在 git 外）。
+WECHAT_APPID = None
+WECHAT_APPSECRET = None
+SECRET_KEY = "fallback-dev-key-please-change-in-production"
+PUBLIC_BASE_URL = "http://127.0.0.1:5000"
+ADMIN_OPENIDS = set()
+SUPER_ADMIN_OPENID = None
+PRINTER_TOKEN = None
+PRINTER_NAME = ""
+
 try:
     import config
-
-    # 微信配置（用 getattr 兼容旧 config.py 缺少这些字段的情况）
-    WECHAT_APPID = getattr(config, "WECHAT_APPID", None)
-    WECHAT_APPSECRET = getattr(config, "WECHAT_APPSECRET", None)
-    SECRET_KEY = getattr(config, "SECRET_KEY", None)
-    PUBLIC_BASE_URL = getattr(config, "PUBLIC_BASE_URL", "http://127.0.0.1:5000")
-    if WECHAT_APPID and WECHAT_APPSECRET and SECRET_KEY:
+    WECHAT_APPID = getattr(config, "WECHAT_APPID", WECHAT_APPID)
+    WECHAT_APPSECRET = getattr(config, "WECHAT_APPSECRET", WECHAT_APPSECRET)
+    SECRET_KEY = getattr(config, "SECRET_KEY", SECRET_KEY)
+    PUBLIC_BASE_URL = getattr(config, "PUBLIC_BASE_URL", PUBLIC_BASE_URL)
+    PRINTER_TOKEN = getattr(config, "TOKEN", PRINTER_TOKEN)
+    PRINTER_NAME = getattr(config, "PRINTER_NAME", PRINTER_NAME)
+    ADMIN_OPENIDS = set(getattr(config, "ADMIN_OPENIDS", []))
+    SUPER_ADMIN_OPENID = getattr(config, "SUPER_ADMIN_OPENID", SUPER_ADMIN_OPENID)
+    if WECHAT_APPID and WECHAT_APPSECRET and SECRET_KEY != "fallback-dev-key-please-change-in-production":
         print("已加载 config.py 微信配置")
     else:
         print("[WARN] config.py 中缺少微信配置项（WECHAT_APPID / WECHAT_APPSECRET / SECRET_KEY），登录功能不可用")
-except ImportError:
-    print("[WARN] 未找到 config.py，请复制 config.py.example → config.py")
-    WECHAT_APPID = None
-    WECHAT_APPSECRET = None
-    SECRET_KEY = None
-
-# 管理员列表（从 config.py 加载，用于统计与权限控制）
-try:
-    ADMIN_OPENIDS = set(getattr(config, "ADMIN_OPENIDS", []))
     if ADMIN_OPENIDS:
         print(f"已加载 {len(ADMIN_OPENIDS)} 个管理员 openid")
-except Exception:
-    ADMIN_OPENIDS = set()
-
-# 超级管理员（从 config.py 加载，可创建 admin 类型许可密钥）
-try:
-    SUPER_ADMIN_OPENID = getattr(config, "SUPER_ADMIN_OPENID", None)
-except Exception:
-    SUPER_ADMIN_OPENID = None
+except ImportError:
+    print("[INFO] 未找到 config.py，使用内部默认配置。复制 config.py.example → config.py 后可自定义。")
 
 
 def is_admin(openid):
@@ -381,7 +379,7 @@ def compress_avatar(file_path, max_size=200):
 
 
 # Token 签名器（依赖 SECRET_KEY，必须在配置加载之后初始化）
-app.config["SECRET_KEY"] = SECRET_KEY or "fallback-dev-key-please-change-in-production"
+app.config["SECRET_KEY"] = SECRET_KEY
 TOKEN_MAX_AGE = 7 * 24 * 3600  # token 有效期 7 天
 token_serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
 
@@ -399,13 +397,6 @@ pushed_tasks_lock = threading.Lock()
 
 CLIENT_HEARTBEAT_TIMEOUT = 90    # 心跳超时秒数（超过此值视为离线）
 PRINT_FEEDBACK_TIMEOUT = 180     # 打印反馈超时秒数（3 分钟，断线回滚兜底）
-
-# 打印机客户端认证 token
-try:
-    PRINTER_TOKEN = config.TOKEN
-except (NameError, AttributeError):
-    PRINTER_TOKEN = None
-
 
 def get_active_clients():
     """返回心跳未超时的客户端 ID 列表"""
@@ -3597,6 +3588,211 @@ def statistics_my():
         "stats": {
             "total_pages": total_pages,
             "total_orders": total_orders,
+        },
+    })
+
+
+@app.route("/api/admin/statistics/revenue", methods=["GET"])
+def admin_statistics_revenue():
+    """管理员收益统计接口（printer token 鉴权）。
+    查询指定日期区间内的所有订单收益，按来源/用户/月份分组。
+    参数:
+        start_date  - 起始日期 (YYYY-MM-DD)，必填
+        end_date    - 结束日期 (YYYY-MM-DD)，必填
+        status      - 订单状态筛选，逗号分隔，默认不含 canceled/rejected/abandoned/reserved
+        token       - 打印机认证 token
+    """
+    token = request.args.get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+    if not start_date or not end_date:
+        return jsonify({"success": False, "message": "缺少 start_date 或 end_date 参数"}), 400
+
+    # 状态筛选（排除已取消/已拒绝/已放弃/已预留）
+    status_param = request.args.get("status", "").strip()
+    if status_param:
+        allowed_statuses = [s.strip() for s in status_param.split(",") if s.strip()]
+    else:
+        allowed_statuses = ["sent", "printing", "queued", "failed", "offline_unknown"]
+
+    conn = get_db()
+    # 构建状态占位符
+    status_placeholders = ",".join("?" for _ in allowed_statuses)
+    params = [start_date + " 00:00:00", end_date + " 23:59:59"] + allowed_statuses
+
+    # ── 汇总：按 source 分组统计收益和数量 ──
+    summary_rows = conn.execute(
+        f"""SELECT o.source,
+                   COUNT(DISTINCT o.id) AS order_count,
+                   COUNT(of.id) AS file_count,
+                   SUM(of.page_count * of.copies) AS total_pages,
+                   SUM(CASE WHEN of.status = 'sent' THEN of.total_price ELSE 0 END) AS revenue,
+                   SUM(of.total_price) AS total_price_all
+            FROM orders o
+            INNER JOIN order_files of ON o.id = of.order_id
+            WHERE o.created_at >= ? AND o.created_at <= ?
+              AND of.status IN ({status_placeholders})
+            GROUP BY o.source""",
+        params,
+    ).fetchall()
+
+    revenue_summary = {"total": 0.0, "cloud": 0.0, "local": 0.0,
+                       "cloud_orders": 0, "local_orders": 0,
+                       "cloud_files": 0, "local_files": 0,
+                       "total_pages": 0, "cloud_pages": 0, "local_pages": 0}
+    for row in summary_rows:
+        src = row["source"] or "cloud"
+        rev = round(row["revenue"] or 0.0, 2)
+        revenue_summary["total"] += rev
+        revenue_summary[src] = rev
+        revenue_summary[f"{src}_orders"] = row["order_count"] or 0
+        revenue_summary[f"{src}_files"] = row["file_count"] or 0
+        revenue_summary[f"{src}_pages"] = row["total_pages"] or 0
+        revenue_summary["total_pages"] += (row["total_pages"] or 0)
+    revenue_summary["total"] = round(revenue_summary["total"], 2)
+
+    # ── 按用户分组（仅云端订单，排除 openid='local'） ──
+    by_user_rows = conn.execute(
+        f"""SELECT o.openid,
+                   COUNT(DISTINCT o.id) AS order_count,
+                   COUNT(of.id) AS file_count,
+                   SUM(of.page_count * of.copies) AS total_pages,
+                   SUM(CASE WHEN of.status = 'sent' THEN of.total_price ELSE 0 END) AS revenue
+            FROM orders o
+            INNER JOIN order_files of ON o.id = of.order_id
+            WHERE o.created_at >= ? AND o.created_at <= ?
+              AND o.openid != 'local'
+              AND of.status IN ({status_placeholders})
+            GROUP BY o.openid
+            ORDER BY revenue DESC""",
+        params,
+    ).fetchall()
+
+    # 批量查询用户昵称和头像
+    user_openids = [r["openid"] for r in by_user_rows]
+    user_profiles = {}
+    if user_openids:
+        user_conn = get_user_db()
+        placeholders = ",".join("?" for _ in user_openids)
+        prof_rows = user_conn.execute(
+            f"SELECT openid, nickname, avatar_path FROM users WHERE openid IN ({placeholders})",
+            user_openids,
+        ).fetchall()
+        for pr in prof_rows:
+            user_profiles[pr["openid"]] = {
+                "nickname": pr["nickname"] or "",
+                "avatar_url": get_avatar_url(pr["openid"], pr["avatar_path"] or ""),
+            }
+        user_conn.close()
+
+    by_user = []
+    for row in by_user_rows:
+        prof = user_profiles.get(row["openid"], {})
+        by_user.append({
+            "openid": row["openid"],
+            "nickname": prof.get("nickname", ""),
+            "avatar_url": prof.get("avatar_url", ""),
+            "revenue": round(row["revenue"] or 0.0, 2),
+            "order_count": row["order_count"] or 0,
+            "file_count": row["file_count"] or 0,
+            "total_pages": row["total_pages"] or 0,
+        })
+
+    # ── 订单明细（时间倒序） ──
+    order_rows = conn.execute(
+        f"""SELECT o.id, o.order_number, o.source, o.openid, o.status,
+                   o.total_price, o.created_at, o.delivery_enabled,
+                   o.delivery_location, o.urgency, o.cover_page
+            FROM orders o
+            WHERE o.created_at >= ? AND o.created_at <= ?
+              AND o.status IN ({status_placeholders})
+            ORDER BY o.created_at DESC""",
+        params,
+    ).fetchall()
+
+    # 收集所有订单 ID 用于批量查询子文件
+    order_ids = [r["id"] for r in order_rows]
+    files_by_order = {}
+    if order_ids:
+        of_placeholders = ",".join("?" for _ in order_ids)
+        of_rows = conn.execute(
+            f"""SELECT id, order_id, file_name, copies, page_count, duplex,
+                       page_range, total_price, status, created_at
+                FROM order_files
+                WHERE order_id IN ({of_placeholders})
+                ORDER BY order_id, id""",
+            order_ids,
+        ).fetchall()
+        for of_row in of_rows:
+            oid = of_row["order_id"]
+            if oid not in files_by_order:
+                files_by_order[oid] = []
+            files_by_order[oid].append({
+                "id": of_row["id"],
+                "file_name": of_row["file_name"],
+                "copies": of_row["copies"] or 1,
+                "page_count": of_row["page_count"] or 0,
+                "duplex": of_row["duplex"] or "on",
+                "page_range": of_row["page_range"] or "",
+                "total_price": round(of_row["total_price"] or 0.0, 2),
+                "status": of_row["status"],
+                "created_at": of_row["created_at"],
+            })
+
+    # 批量查昵称和头像
+    all_openids = list(set(r["openid"] for r in order_rows if r["openid"] and r["openid"] != "local"))
+    all_profiles = {}
+    if all_openids:
+        user_conn2 = get_user_db()
+        ap_placeholders = ",".join("?" for _ in all_openids)
+        nn_rows = user_conn2.execute(
+            f"SELECT openid, nickname, avatar_path FROM users WHERE openid IN ({ap_placeholders})",
+            all_openids,
+        ).fetchall()
+        for nr in nn_rows:
+            all_profiles[nr["openid"]] = {
+                "nickname": nr["nickname"] or "",
+                "avatar_url": get_avatar_url(nr["openid"], nr["avatar_path"] or ""),
+            }
+        user_conn2.close()
+
+    orders = []
+    for row in order_rows:
+        oid = row["id"]
+        prof = all_profiles.get(row["openid"], {})
+        orders.append({
+            "order_id": oid,
+            "order_number": row["order_number"] or "",
+            "source": row["source"] or "cloud",
+            "openid": row["openid"] or "",
+            "nickname": prof.get("nickname", ""),
+            "avatar_url": prof.get("avatar_url", ""),
+            "status": row["status"],
+            "total_price": round(row["total_price"] or 0.0, 2),
+            "created_at": row["created_at"],
+            "delivery_enabled": bool(row["delivery_enabled"]),
+            "delivery_location": row["delivery_location"] or "",
+            "urgency": row["urgency"] or "低",
+            "cover_page": bool(row["cover_page"]),
+            "files_count": len(files_by_order.get(oid, [])),
+            "total_page_count": sum(f["page_count"] * f["copies"] for f in files_by_order.get(oid, [])),
+            "revenue": round(sum(f["total_price"] for f in files_by_order.get(oid, [])
+                                 if f["status"] == "sent"), 2),
+            "files": files_by_order.get(oid, []),
+        })
+
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "period": {"start": start_date, "end": end_date},
+            "revenue_summary": revenue_summary,
+            "by_user": by_user,
+            "orders": orders,
         },
     })
 

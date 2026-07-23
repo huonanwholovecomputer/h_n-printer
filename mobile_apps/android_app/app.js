@@ -1,7 +1,10 @@
 /* HN Cloud Print — Android App Logic */
 /* Replaces WeChat wx.* APIs with standard Web APIs */
 
-const BASE_URL = 'https://your-server.com'  // ⚠️ 部署前改为你的服务器地址;
+// 默认 BASE_URL 为占位符，提交 git 前无需修改。
+// 部署/测试时通过 localStorage 覆盖一次即可（浏览器控制台执行）:
+//   localStorage.setItem('hn_base_url', 'https://你的真实地址')
+const BASE_URL = localStorage.getItem('hn_base_url') || 'https://your-server.com';
 let token = localStorage.getItem('hn_token') || '';
 let userId = localStorage.getItem('hn_openid') || '';
 let userRole = localStorage.getItem('hn_role') || 'guest';

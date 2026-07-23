@@ -378,12 +378,15 @@ class PrinterConfig:
 
     @classmethod
     def load(cls, path: str) -> "PrinterConfig":
-        """从 JSON 文件加载配置；文件不存在或损坏则返回默认配置"""
+        """从 JSON 文件加载配置；文件不存在则创建默认配置并保存，损坏则返回默认配置"""
         import logging
         logger = logging.getLogger(__name__)
 
         if not os.path.exists(path):
-            return cls()
+            cfg = cls()
+            logger.info(f"配置文件不存在，已自动创建默认配置: {path}")
+            cfg.save(path)
+            return cfg
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
