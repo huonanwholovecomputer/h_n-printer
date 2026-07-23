@@ -26,8 +26,17 @@ from PySide6.QtCore import (
     QEvent,
     QPropertyAnimation,
     QEasingCurve,
+    QUrl,
 )
-from PySide6.QtGui import QAction, QFont, QColor, QIcon, QShortcut, QKeySequence
+from PySide6.QtGui import (
+    QAction,
+    QFont,
+    QColor,
+    QIcon,
+    QShortcut,
+    QKeySequence,
+    QDesktopServices,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -64,6 +73,7 @@ from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 from cloud_client import CloudClient, CloudTask
+from stats_server import StatsServer
 from offline_sync import OfflineSync
 
 logger = logging.getLogger(__name__)
@@ -1348,6 +1358,7 @@ class MainWindow(QMainWindow):
 
         # ── 云端客户端 ──
         self._cloud_client: CloudClient | None = None
+        self._stats_server: StatsServer | None = None  # 收支清算统计 HTTP 服务器
         self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
         self._cloud_task_window: CloudTaskListWindow | None = None
         self._offline_sync: OfflineSync | None = None  # 初始化在 _init_cloud_client 之后
@@ -1403,6 +1414,20 @@ class MainWindow(QMainWindow):
             token=self._config.cloud_token,
             interval=60,
         )
+
+    def _on_open_finance(self):
+        """打开收支清算页面。启动本地 HTTP 服务器，在浏览器中打开统计页面。"""
+        # 如果已启动则直接打开，否则先启动
+        if self._stats_server is None:
+            self._stats_server = StatsServer(
+                api_url=self._config.cloud_api_url,
+                token=self._config.cloud_token,
+            )
+            self._stats_server.start_in_thread()
+
+        url = self._stats_server.url
+        logger.info(f"打开收支清算页面: {url}")
+        QDesktopServices.openUrl(QUrl(url))
 
     def _on_cloud_settings(self):
         """打开云端连接设置对话框。"""
@@ -1615,6 +1640,12 @@ class MainWindow(QMainWindow):
         locations_action = QAction("地点(&L)", self)
         locations_action.triggered.connect(self._on_manage_locations)
         file_menu.addAction(locations_action)
+
+        file_menu.addSeparator()
+
+        finance_action = QAction("📊 收支清算(&S)", self)
+        finance_action.triggered.connect(self._on_open_finance)
+        file_menu.addAction(finance_action)
 
         file_menu.addSeparator()
 
@@ -3966,6 +3997,10 @@ class MainWindow(QMainWindow):
         # 断开云端连接
         if self._cloud_client:
             self._cloud_client.stop()
+
+        # 停止收支清算统计服务器
+        if self._stats_server:
+            self._stats_server.stop()
 
         super().closeEvent(event)
 

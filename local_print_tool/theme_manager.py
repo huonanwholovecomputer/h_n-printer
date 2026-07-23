@@ -125,7 +125,7 @@ class ThemeManager(QObject):
     # ---- 持久化 ----
 
     def _load_setting(self) -> None:
-        """从 JSON 文件加载用户偏好。"""
+        """从 JSON 文件加载用户偏好；文件不存在则自动创建默认设置。"""
         try:
             if os.path.isfile(self._settings_path):
                 with open(self._settings_path, "r", encoding="utf-8") as f:
@@ -134,6 +134,10 @@ class ThemeManager(QObject):
                 if mode in ALL_MODES:
                     self._mode = mode
                     logger.info(f"已加载主题设置: {MODE_LABELS.get(mode, mode)}")
+            else:
+                # 文件不存在，自动创建默认设置
+                self._save_setting()
+                logger.info(f"主题设置文件不存在，已自动创建默认设置: {self._settings_path}")
         except Exception as e:
             logger.warning(f"加载主题设置失败: {e}，使用默认值")
 

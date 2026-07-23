@@ -1,0 +1,38 @@
+{
+  "config": {
+    "investRate": 0.05,
+    "scoreCap": 15,
+    "members": [
+      { "id": "alice", "name": "成员A", "color": "#4472C4" },
+      { "id": "bob",   "name": "成员B", "color": "#548235" },
+      { "id": "carol", "name": "成员C", "color": "#ED7D31" }
+    ]
+  },
+  "months": {
+    "2026-07": {
+      "key": "2026-07",
+      "label": "2026年7月",
+      "expenses": [
+        { "item": "打印机",   "amount": 1000.00, "payer": "alice" },
+        { "item": "A4纸",     "amount": 80.00,  "payer": "bob"   },
+        { "item": "墨盒",     "amount": 50.00,  "payer": "carol" }
+      ],
+      "income": { "alice": 200.00, "bob": 300.00, "carol": 50.00 },
+      "scores": {
+        "alice": [
+          { "item": "打印服务", "score": 10 },
+          { "item": "推广",     "score": 5  }
+        ],
+        "bob": [
+          { "item": "打印服务", "score": 12 },
+          { "item": "物流",     "score": 8  }
+        ],
+        "carol": [
+          { "item": "财务",     "score": 7 },
+          { "item": "采购",     "score": 4 }
+        ]
+      },
+      "note": "示例数据，可在设置中自定义成员和评分"
+    }
+  }
+}

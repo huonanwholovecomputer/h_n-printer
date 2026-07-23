@@ -29,6 +29,8 @@ HN 打印系统 — 两个子系统共享定价模型和打印管线：
 | `order_tabs.py` | Tab 标签栏 + 文件卡片组件（QLabel+QSS 渲染，替代自定义 paintEvent 避免 IndexError） |
 | `cloud_client.py` | `CloudClient(QObject)`：SocketIO 长连接接收云端任务 → Signal 发射到 GUI 主线程，支持断线重连/HTTP 拉取补充 |
 | `offline_sync.py` | `OfflineSync` 类：离线时订单暂存本地 SQLite，联网后自动上传，最多重试 5 次 |
+| `stats_server.py` | 内置 HTTP 服务器：为 `finance/收支清算.html` 提供静态文件 + 云端 API 代理（附带 printer token）|
+| `finance/收支清算.html` | 收支清算页面：多人均摊采购/服务评分/转账清算，v2.0 新增云端数据核对 tab |
 | `theme_manager.py` | 主题管理器：跟随系统/浅色/深色三种模式，写 `theme_settings.json` |
 | `main.py:76` 附近 | `_disable_combo_wheel()`、`_truncate_filename()`、`_enable_smooth_scroll()` — 通用 UI 辅助函数 |
 
