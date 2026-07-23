@@ -1,5 +1,6 @@
 /* Apple-style Custom Tab Bar — translucent with blur */
 
+/* ── Tab Bar ── */
 .tab-bar {
   position: fixed;
   bottom: 0;
@@ -25,9 +26,17 @@
   padding: 8rpx 0 4rpx;
 }
 
-/* Instant touch-down feedback */
+/* Touch-down feedback */
 .tab-hover {
   opacity: 0.6;
+}
+.tab-hover .tab-icon {
+  animation: iconBounce 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes iconBounce {
+  0%   { transform: scale(1); }
+  35%  { transform: scale(0.78); }
+  100% { transform: scale(1); }
 }
 
 /* Icon container */

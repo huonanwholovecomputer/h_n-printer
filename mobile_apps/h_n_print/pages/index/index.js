@@ -31,9 +31,15 @@ Component({
     showDeliveryPicker: false,
     showUrgencyPicker: false,
     lastOrderNumber: '',
+    pageReady: false,         // 首次打开的入场动效
+    pageExit: '',             // 退出动画: page-exit-left / page-exit-right
+    pageSlide: 'page-init',   // 入场动画: page-fade-in / page-enter-left（初始隐藏防闪烁）
   },
   lifetimes: {
     attached() {
+      // 首次启动清理残留的转场标记，防止热重载/缓存触发误动画
+      wx.removeStorageSync('_tabFrom')
+      wx.removeStorageSync('_tabTo')
       this._initScrollEngine()
       this._uploadTimers = {}   // { index: intervalId } — 每个文件独立的进度条定时器
       this._pollTimers = {}     // { index: intervalId } — 页数轮询定时器
@@ -47,6 +53,25 @@ Component({
   },
   pageLifetimes: {
     show() {
+      // 重置退出动画残留态 + 入场起始位（仅 tab 切换时有 _tabFrom）
+      const tabFrom = wx.getStorageSync('_tabFrom')
+      const isFirstLaunch = (tabFrom == null || tabFrom === '')
+      let animationClass = ''
+      if (isFirstLaunch) {
+        animationClass = 'page-fade-in'
+      } else if (tabFrom === 1) {
+        animationClass = 'page-enter-left'
+      } else {
+        // 其他入口（非 tab 切换）也使用淡入，避免空字符串导致无动画直接显示
+        animationClass = 'page-fade-in'
+      }
+      this.setData({ pageExit: '', pageSlide: animationClass })
+
+      // 首次打开才有元素入场动画
+      if (!this._entrancePlayed && isFirstLaunch) {
+        this.setData({ pageReady: false })
+      }
+
       this.loadPrinterStatus()
       // 启动打印机状态轮询（30秒）
       this._startPrinterPolling()
@@ -76,12 +101,30 @@ Component({
       // 重新测量滚动引擎（因为 DOM 可能变化）
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(300), 300)
+      // 仅真实首次启动时触发入场动效（card-preload 保证卡片在动画触发前不可见）
+      if (!this._entrancePlayed && isFirstLaunch) {
+        if (this._readyTimer) clearTimeout(this._readyTimer)
+        this._readyTimer = setTimeout(() => {
+          this.setData({ pageReady: true })
+          this._entrancePlayed = true
+          this._readyTimer = null
+        }, 250)
+      }
     },
     hide() {
+      if (this._readyTimer) { clearTimeout(this._readyTimer); this._readyTimer = null }
       this._stopPrinterPolling()
+      // 不再重置为隐藏态，否则会覆盖 animateExit() 设置的退出动画类
+      // 退出动画（pageExit）的 animation-fill-mode: both 在动画结束后自然保持隐藏态
+      // 下次 show() 时动画类从 page-exit-* 变为 page-enter-*，CSS 类变更会重新触发 animation
     },
   },
   methods: {
+    // 由 tabBar 调用：退出动画 → 回调中切换页面
+    animateExit(direction) {
+      this.setData({ pageExit: direction === 'left' ? 'page-exit-left' : 'page-exit-right' })
+    },
+
     _startPrinterPolling() {
       this._stopPrinterPolling()
       this._printerPollTimer = setInterval(() => {

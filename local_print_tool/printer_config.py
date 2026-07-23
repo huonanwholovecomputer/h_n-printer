@@ -282,8 +282,8 @@ class PrinterConfig:
     last_order_number: int = 0              # 订单号计数器
     # ---- 云端配置 ----
     cloud_enabled: bool = False             # 是否启用云端连接
-    cloud_api_url: str = "https://hn-space.cn"      # 云端 API 地址
-    cloud_ws_url: str = "wss://hn-space.cn"         # WebSocket 地址
+    cloud_api_url: str = "https://your-server.com"   # 云端 API 地址（替换为你自己的服务器）
+    cloud_ws_url: str = "wss://your-server.com"     # WebSocket 地址（替换为你自己的服务器）
     cloud_token: str = ""                   # 打印机客户端认证 token
     cloud_auto_accept: bool = False         # 是否自动接受云端任务（false=手动确认）
     # ---- 标签页任务（v6+）----
@@ -361,8 +361,8 @@ class PrinterConfig:
             last_order_number=int(data.get("last_order_number", 0)),
             # 云端配置
             cloud_enabled=bool(data.get("cloud_enabled", False)),
-            cloud_api_url=data.get("cloud_api_url", "https://hn-space.cn"),
-            cloud_ws_url=data.get("cloud_ws_url", "wss://hn-space.cn"),
+            cloud_api_url=data.get("cloud_api_url", "https://your-server.com"),
+            cloud_ws_url=data.get("cloud_ws_url", "wss://your-server.com"),
             cloud_token=data.get("cloud_token", ""),
             cloud_auto_accept=bool(data.get("cloud_auto_accept", False)),
             # 标签页任务

@@ -8,11 +8,17 @@ Component({
     isAdmin: false,
     isSuperAdmin: false,
     userRole: '',
+    // 许可密钥详情（临时授权用户显示）
+    licenseInfo: null,
     orders: [],
     loading: true,
-    ordersPage: 1,
+    // 分页
+    ordersCurrentPage: 1,
+    ordersPerPage: 10,
     ordersTotal: 0,
-    ordersHasMore: false,
+    ordersTotalPages: 0,
+    pageOptions: [10, 20, 50, 100],
+    showPageSizePicker: false,
     statusMap: {
       queued: '排队中',
       printing: '待添加',
@@ -23,36 +29,24 @@ Component({
       abandoned: '放弃打印',
       rejected: '被打回',
       canceled: '已取消',
+      reserved: '已预留',
     },
     // 管理员：许可密钥 & 用户列表
     licenseMinutes: 1,
-    generatedKey: '',
     generating: false,
+    // 多密钥支持：所有活跃密钥以数组存储
+    activeKeys: [],
     licensedUsers: [],
-    // 许可密钥抽屉状态机：idle | opening | open
-    keyAnimState: 'idle',
-    keyExpired: false,
-    countdownText: '',
-    expiresAt: '',         // 后端返回的到期时间字符串 "YYYY-MM-DD HH:MM:SS"
-    keySwipeX: 0,          // 左滑位移（px）
-    keySwipeTransition: true,  // 是否启用 CSS 过渡（拖动时关闭，吸附时开启）
-    // 许可密钥状态: unused | used_waiting | used_done
-    keyStatus: 'unused',
-    keyType: 'temp',
-    // 兑换用户信息（used_by）
-    usedByNickname: '',
-    usedByAvatarUrl: '',
-    usedByOpenid: '',
-    // 关联订单（used_done 时）
-    relatedOrderId: null,
-    relatedOrderStatus: '',
-    // 访客：兑换密钥
     redeemKey: '',
     redeeming: false,
     // 临时授权倒计时
     tempUntil: '',
     tempCountdownText: '',
 
+    // 密钥类型选择（表单用）
+    keyType: 'temp',
+    // 多密钥倒计时定时器
+    _keyCountdownTimer: null,
     // 管理员：许可密钥轮询定时器（内部状态，非响应式）
     _keyPollTimer: null,
     // 内部滚动位置（驱动 scroll-content 的 translateY）
@@ -70,6 +64,9 @@ Component({
     adminsLoading: false,
     adminSwipeX: {},      // { openid: px }
     adminSwipeTransition: {},  // { openid: bool }
+    adminDeleteOpacity: {},  // { openid: 0~1 }
+    pageExit: '',             // 退出动画: page-exit-left / page-exit-right
+    pageSlide: 'page-init',   // 入场动画: page-enter-right（初始隐藏防闪烁）
   },
   lifetimes: {
     attached() {
@@ -84,39 +81,54 @@ Component({
   },
   pageLifetimes: {
     show() {
+      // tab 切换入场：从右滑入（打印→我），首次加载淡入，其他入口淡入
+      const tabFrom = wx.getStorageSync('_tabFrom')
+      const isFirstLaunch = (tabFrom == null || tabFrom === '')
+      let animationClass = ''
+      if (isFirstLaunch) {
+        animationClass = 'page-fade-in'
+      } else if (tabFrom === 0) {
+        animationClass = 'page-enter-right'
+      } else {
+        animationClass = 'page-fade-in'
+      }
+      this.setData({ pageExit: '', pageSlide: animationClass })
+
       this.loadUserRole()
       this.loadOrders()
-      // 每次切回页面时刷新头像（可能在其他端更新了）
       this.loadProfile()
-      // 管理员：刷新许可用户列表 + 恢复当前有效密钥（实现关闭再打开恢复显示）
       const cachedRole = wx.getStorageSync('userRole')
       if (cachedRole === 'admin') {
         this.loadLicensedUsers()
         this.loadActiveKey()
         this.loadStorageStats()
-        // 超级管理员加载管理员列表
         if (this.data.isSuperAdmin) {
           this.loadAdmins()
         }
       }
-      // 同步 tabBar 选中态（标准 WeChat 模式：每个页面主动更新）
       try {
         const tabBar = this.getTabBar && this.getTabBar()
         if (tabBar) {
           tabBar.setData({ selected: 1, 'list[0].active': false, 'list[1].active': true })
         }
-      } catch (e) { /* 兼容低版本 */ }
+      } catch (e) {}
       this._scheduleMeasure()
-      // 页面切换后 DOM 可能尚未稳定，追加一次延迟测量
       setTimeout(() => this._scheduleMeasure(300), 300)
-      // 开启订单状态定时轮询（每5秒）
       this._startOrderPolling()
     },
     hide() {
       this._stopOrderPolling()
+      // 不再重置为隐藏态，否则会覆盖 animateExit() 设置的退出动画类
+      // 退出动画（pageExit）的 animation-fill-mode: both 在动画结束后自然保持隐藏态
+      // 下次 show() 时动画类从 page-exit-* 变为 page-enter-*，CSS 类变更会重新触发 animation
     },
   },
   methods: {
+    // 由 tabBar 调用：退出动画 → 回调中切换页面
+    animateExit(direction) {
+      this.setData({ pageExit: direction === 'left' ? 'page-exit-left' : 'page-exit-right' })
+    },
+
     // 订单状态轮询（静默增量更新，不触发全量渲染）
     _startOrderPolling() {
       this._stopOrderPolling()
@@ -131,7 +143,7 @@ Component({
         url: CONFIG.BASE_URL + '/api/orders',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
-        data: { page: 1, per_page: 20 },
+        data: { page: this.data.ordersCurrentPage, per_page: this.data.ordersPerPage },
         success: (res) => {
           if (res.statusCode !== 200 || !res.data || !res.data.success) return
           const newOrders = res.data.orders || []
@@ -208,9 +220,14 @@ Component({
       this._keySwipeStartX = 0
       this._keySwipeStartY = 0
       this._keySwipeLastX = 0
+      this._keySwipeStartCardX = 0  // 触摸开始时卡片的初始偏移
       this._keySwipeHorizontal = false   // 本次触摸是否已锁定为水平
       this._swipeHorizontal = false      // 通知滚动引擎让出控制（卡片左滑中）
-      this._deleteWidthPx = 70           // 删除按钮宽度（140rpx ≈ 70px @750 设计稿）
+      // 删除按钮宽度：140rpx → px（按实际屏幕宽度换算，取代硬编码）
+      const sys = wx.getSystemInfoSync()
+      const rpxRatio = (sys.windowWidth || 375) / 750
+      this._deleteWidthPx = Math.round(140 * rpxRatio)      // 密钥作废按钮
+      this._adminDeleteWidthPx = Math.round(140 * rpxRatio)  // 管理员移除按钮
 
       // 初次测量（多次延迟以应对 swiper 布局稳定）
       setTimeout(() => this._measure(), 60)
@@ -220,6 +237,10 @@ Component({
 
     _destroyScrollEngine() {
       this._cancelSchedule()
+      if (this._scrollAnimTimer) {
+        clearTimeout(this._scrollAnimTimer)
+        this._scrollAnimTimer = null
+      }
       if (this._measureTimer) {
         clearTimeout(this._measureTimer)
         this._measureTimer = null
@@ -490,6 +511,12 @@ Component({
     // ==================== 用户资料 ====================
 
     loadProfile() {
+      // 先从缓存加载，避免每次切换从头下载大图
+      const cachedAvatar = wx.getStorageSync('avatarUrl')
+      if (cachedAvatar) {
+        this.setData({ avatarUrl: cachedAvatar })
+      }
+
       const token = wx.getStorageSync('token')
       if (!token) {
         console.warn('[loadProfile] token 不存在，跳过')
@@ -699,13 +726,13 @@ Component({
               isSuperAdmin: isSuper,
               userRole: role,
               tempUntil: tempUntil,
+              licenseInfo: res.data.license_info || null,
             })
             wx.setStorageSync('userRole', role)
             // 角色切换会改变 wx:if 区块，内容高度变化显著 → 刷新滚动边界
             this._scheduleMeasure()
-            // 管理员加载许可用户列表 + 存储统计
+            // 管理员加载存储统计 + 开启轮询（loadLicensedUsers 已在 show 中调用）
             if (role === 'admin') {
-              this.loadLicensedUsers()
               this.loadStorageStats()
               this._startKeyPolling()
               if (isSuper) {
@@ -759,8 +786,7 @@ Component({
     onGenerateKey() {
       const token = wx.getStorageSync('token')
       if (!token) return
-      // 动画中拦截（防止抽屉展开的 340ms 内连点）
-      if (this.data.keyAnimState === 'opening') return
+      if (this.data.generating) return
 
       this.setData({ generating: true })
       wx.request({
@@ -774,29 +800,9 @@ Component({
         success: (res) => {
           this.setData({ generating: false })
           if (res.data.success) {
-            // 后端已自动作废旧密钥；前端用新数据覆盖
-            const wasOpen = this.data.keyAnimState === 'open'
-            this.setData({
-              generatedKey: res.data.key,
-              expiresAt: res.data.expires_at,
-              keyExpired: false,
-              keySwipeX: 0,
-              keyStatus: 'unused',
-              keyType: res.data.type || 'temp',
-              usedByNickname: '',
-              usedByAvatarUrl: '',
-              usedByOpenid: '',
-              relatedOrderId: null,
-              relatedOrderStatus: '',
-            })
-            this._startCountdown()
-            if (wasOpen) {
-              // open 态再次生成：抽屉保持打开，仅内容刷新
-              this._scheduleMeasure()
-            } else {
-              // 首次生成：从卡片下方抽出抽屉
-              this._openKeyDrawer()
-            }
+            wx.showToast({ title: '密钥已生成', icon: 'success' })
+            // 刷新密钥列表
+            this.loadActiveKey(false)
           } else {
             wx.showToast({ title: res.data.message || '生成失败', icon: 'none' })
           }
@@ -808,60 +814,46 @@ Component({
       })
     },
 
-    // 抽屉展开：opening → open（340ms 动画）
-    _openKeyDrawer() {
-      this.setData({ keyAnimState: 'opening' })
-      setTimeout(() => {
-        this.setData({ keyAnimState: 'open' })
-        this._scheduleMeasure()
-        this._startKeyPolling()
-      }, 340)
-    },
-
-    // 抽屉收回：open → idle（320ms 动画），并清空密钥数据
-    _closeKeyDrawer() {
-      this._stopKeyPolling()
-      this.setData({ keyAnimState: 'idle', keySwipeX: 0 })
-      setTimeout(() => {
-        this.setData({
-          generatedKey: '', expiresAt: '', countdownText: '', keyExpired: false,
-          keyStatus: 'unused', keyType: 'temp',
-          usedByNickname: '', usedByAvatarUrl: '', usedByOpenid: '',
-          relatedOrderId: null, relatedOrderStatus: '',
-        })
-        this._scheduleMeasure()
-      }, 320)
-      this._stopCountdown()
-    },
-
-    // 倒计时：以后端 expires_at 为唯一真相
+    // 倒计时：对所有活跃密钥同时计时
     _startCountdown() {
       this._stopCountdown()
-      // admin 类型密钥永不过期，无需倒计时
-      if (this.data.keyType === 'admin') {
-        this.setData({ countdownText: '永久有效', keyExpired: false })
-        return
-      }
-      const target = this._parseServerTime(this.data.expiresAt)
-      if (!target) return
-
       const tick = () => {
-        const remain = target - Date.now()
-        if (remain > 0) {
-          const totalSec = Math.ceil(remain / 1000)
-          const m = Math.floor(totalSec / 60)
-          const s = totalSec % 60
-          this.setData({
-            countdownText: m + ':' + (s < 10 ? '0' + s : s),
-            keyExpired: false,
-          })
-        } else {
-          // 过期
-          this.setData({ countdownText: '已过期', keyExpired: true })
-          this._stopCountdown()
+        const keys = this.data.activeKeys
+        if (!keys.length) { this._stopCountdown(); return }
+        const updates = {}
+        let hasActive = false
+        keys.forEach((k, i) => {
+          // 已被使用的密钥不显示倒计时
+          if (k.status !== 'unused') {
+            if (k.countdownText !== '已使用') {
+              updates['activeKeys[' + i + '].countdownText'] = '已使用'
+              updates['activeKeys[' + i + '].expired'] = false
+            }
+            return
+          }
+          // admin 类型也显示倒计时（24小时自然过期）
+          const target = this._parseServerTime(k.expires_at)
+          if (!target) return
+          const remain = target - Date.now()
+          if (remain > 0) {
+            hasActive = true
+            const totalSec = Math.ceil(remain / 1000)
+            const m = Math.floor(totalSec / 60)
+            const s = totalSec % 60
+            const text = m + ':' + (s < 10 ? '0' + s : s)
+            updates['activeKeys[' + i + '].countdownText'] = text
+            updates['activeKeys[' + i + '].expired'] = false
+          } else {
+            updates['activeKeys[' + i + '].countdownText'] = '已过期'
+            updates['activeKeys[' + i + '].expired'] = true
+          }
+        })
+        if (Object.keys(updates).length > 0) this.setData(updates)
+        if (!hasActive && !keys.some(k => k.status === 'unused' && !k.expired)) {
+          // 所有未使用密钥都已过期且没有被使用的密钥，停止计时器
         }
       }
-      tick()  // 立即执行一次
+      tick()
       this._keyCountdownTimer = setInterval(tick, 1000)
     },
 
@@ -881,8 +873,9 @@ Component({
       return new Date(parts[0] + ' ' + parts[1]).getTime()
     },
 
-    // 从后端恢复当前有效密钥（attached / pageLifetimes.show 调用）
-    loadActiveKey() {
+    // 从后端恢复所有活跃密钥（attached / pageLifetimes.show / 轮询 调用）
+    // isInitial=true 时新卡片附加入场动画
+    loadActiveKey(isInitial) {
       const token = wx.getStorageSync('token')
       if (!token) return
       wx.request({
@@ -890,105 +883,129 @@ Component({
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
         success: (res) => {
-          if (res.statusCode === 200 && res.data && res.data.success && res.data.active) {
-            // 有未过期密钥 → 恢复抽屉显示
-            const wasOpen = this.data.keyAnimState === 'open'
-            this.setData({
-              generatedKey: res.data.key,
-              expiresAt: res.data.expires_at,
-              keyExpired: false,
-              keySwipeX: 0,
-              keyStatus: res.data.status || 'unused',
-              keyType: res.data.type || 'temp',
-              usedByNickname: res.data.used_by_nickname || '',
-              usedByAvatarUrl: res.data.used_by_avatar_url || '',
-              usedByOpenid: res.data.used_by || '',
-              relatedOrderId: res.data.order_id || null,
-              relatedOrderStatus: res.data.order_status || '',
-            })
-            this._startCountdown()
-            if (!wasOpen) this._openKeyDrawer()
-          } else {
-            // 无有效密钥 → 确保抽屉关闭
-            if (this.data.keyAnimState !== 'idle') {
-              this._closeKeyDrawer()
+          if (res.statusCode !== 200 || !res.data || !res.data.success) return
+          const newKeys = res.data.keys || []
+          const oldKeys = this.data.activeKeys || []
+          const oldKeySet = oldKeys.map(o => o.key).sort().join(',')
+          const newKeySet = newKeys.map(o => o.key).sort().join(',')
+          const isFresh = oldKeySet !== newKeySet || !oldKeys.length
+          // 合并：保留本地状态（swipeX/countdownText 等），更新服务端数据
+          const merged = newKeys.map((nk, i) => {
+            const old = oldKeys.find(o => o.key === nk.key)
+            const wasNew = isInitial && !old  // 首次加载时的新卡片
+            return {
+              ...nk,
+              expired: old ? old.expired : false,
+              countdownText: old ? old.countdownText : '',
+              swipeX: old ? old.swipeX : 0,
+              swipeTransition: old ? (old.swipeTransition !== false) : true,
+              deleteOpacity: old ? old.deleteOpacity : 0,
+              entering: wasNew || (isInitial && isFresh),  // 首次加载且是新的/首屏
+            }
+          })
+          if (isFresh) {
+            this.setData({ activeKeys: merged })
+            // 动画完成后清除 entering 标记
+            if (isInitial) {
+              setTimeout(() => {
+                const keys = this.data.activeKeys
+                const updates = {}
+                let changed = false
+                keys.forEach((k, i) => { if (k.entering) { updates['activeKeys[' + i + '].entering'] = false; changed = true } })
+                if (changed) this.setData(updates)
+              }, 800)
             }
           }
-        }
+          if (merged.length > 0) {
+            this._startCountdown()
+          } else {
+            this._stopCountdown()
+          }
+        },
+        fail: () => {},
       })
     },
 
     // ==================== 许可密钥左滑删除 ====================
 
     onKeyTouchStart(e) {
+      const idx = e.currentTarget.dataset.idx
       const t = e.touches[0]
-      if (!t) return
+      if (!t || idx == null) return
+      this._keySwipeIdx = idx
       this._keySwipeStartX = t.clientX
       this._keySwipeStartY = t.clientY
       this._keySwipeLastX = t.clientX
+      this._keySwipeStartCardX = this.data.activeKeys[idx].swipeX
       this._keySwipeHorizontal = false
       this._swipeHorizontal = false
-      // 左滑开始时关闭 CSS 过渡，让位移跟手
-      this.setData({ keySwipeTransition: false })
+      this.setData({ ['activeKeys[' + idx + '].swipeTransition']: false })
     },
 
     onKeyTouchMove(e) {
+      if (this._keySwipeIdx == null) return
       const t = e.touches[0]
       if (!t) return
       const dx = t.clientX - this._keySwipeStartX
       const dy = t.clientY - this._keySwipeStartY
 
-      // 方向锁定：首次显著位移时判定
       if (!this._keySwipeHorizontal) {
-        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return  // 尚未定向
+        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return
         if (Math.abs(dx) > Math.abs(dy)) {
-          // 水平主导 → 锁定左滑，通知滚动引擎让出
           this._keySwipeHorizontal = true
           this._swipeHorizontal = true
         } else {
-          // 垂直主导 → 不拦截，让滚动引擎处理；本手势退出
           this._keySwipeHorizontal = false
           this._swipeHorizontal = false
           return
         }
       }
 
-      // 水平锁定后：仅允许向左滑（dx<0），向右归位不超过 0
-      let x = dx
-      if (x > 0) x = 0
-      // 到达删除按钮宽度后硬限位（不再继续左滑）
-      if (x < -this._deleteWidthPx) x = -this._deleteWidthPx
-      this._keySwipeLastX = x
-      this.setData({ keySwipeX: x })
+      const idx = this._keySwipeIdx
+      const rawX = this._keySwipeStartCardX + dx
+      const maxX = -this._deleteWidthPx
+      const visualX = this._rubberBand(rawX, maxX, 0, 40)
+      this._keySwipeLastX = rawX
+      const opacity = Math.min(1, Math.abs(rawX) / (this._deleteWidthPx * 0.6))
+      this.setData({
+        ['activeKeys[' + idx + '].swipeX']: visualX,
+        ['activeKeys[' + idx + '].deleteOpacity']: opacity,
+      })
     },
 
     onKeyTouchEnd(e) {
       if (!this._keySwipeHorizontal) {
-        // 未进入水平滑动：复位让滚动引擎接管（已自行处理）
         this._swipeHorizontal = false
+        this._keySwipeIdx = null
         return
       }
-      // 启用过渡，吸附到目标位置
-      this.setData({ keySwipeTransition: true })
-      // 超过删除按钮一半 → 吸附露出删除；否则回弹归位
-      const target = this._keySwipeLastX < -this._deleteWidthPx / 2
-        ? -this._deleteWidthPx
-        : 0
-      this.setData({ keySwipeX: target })
-      // 释放滚动引擎控制
+      const idx = this._keySwipeIdx
+      const rawX = this._keySwipeLastX
+      const maxX = -this._deleteWidthPx
+      const target = rawX > 0 ? 0 : (rawX < maxX ? maxX : (rawX < maxX / 2 ? maxX : 0))
+      this.setData({
+        ['activeKeys[' + idx + '].swipeTransition']: true,
+        ['activeKeys[' + idx + '].swipeX']: target,
+        ['activeKeys[' + idx + '].deleteOpacity']: target === 0 ? 0 : 1,
+      })
       this._swipeHorizontal = false
       this._keySwipeHorizontal = false
+      this._keySwipeIdx = null
     },
 
-    // 点击删除按钮：先右滑归位，再上滑收回抽屉
-    onRevokeKey() {
+    // 作废指定密钥
+    onRevokeKey(e) {
+      const idx = e.currentTarget.dataset.idx
+      const k = this.data.activeKeys[idx]
+      if (!k) return
       const token = wx.getStorageSync('token')
       if (!token) return
 
+      const isUsed = k.status !== 'unused'
       wx.showModal({
-        title: '作废密钥',
-        content: '确定作废当前许可密钥？作废后他人将无法使用。',
-        confirmText: '作废',
+        title: isUsed ? '删除密钥' : '作废密钥',
+        content: isUsed ? '删除此密钥不会影响已获得的授权。' : '确定作废此许可密钥？作废后他人将无法使用。',
+        confirmText: isUsed ? '删除' : '作废',
         confirmColor: '#ff4d4f',
         success: (modal) => {
           if (!modal.confirm) return
@@ -996,43 +1013,45 @@ Component({
             url: CONFIG.BASE_URL + '/api/license/revoke',
             method: 'POST',
             header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
+            data: { key: k.key },
             success: (res) => {
               if (res.data && res.data.success) {
-                wx.showToast({ title: '已作废', icon: 'success' })
-                // 第一阶段：卡片右滑归位（250ms）
-                this.setData({ keySwipeTransition: true, keySwipeX: 0 })
-                // 第二阶段：抽屉上滑收回（与右滑重叠，体现"归位同时抽回"）
+                wx.showToast({ title: isUsed ? '已删除' : '已作废', icon: 'success' })
+                // 滑回再移除
+                this.setData({ ['activeKeys[' + idx + '].swipeX']: 0, ['activeKeys[' + idx + '].swipeTransition']: true })
                 setTimeout(() => {
-                  this._closeKeyDrawer()
-                }, 120)
+                  const keys = this.data.activeKeys.filter((_, i) => i !== idx)
+                  this.setData({ activeKeys: keys })
+                  if (!keys.length) this._stopCountdown()
+                }, 250)
               } else {
-                wx.showToast({ title: res.data.message || '作废失败', icon: 'none' })
+                wx.showToast({ title: res.data.message || '操作失败', icon: 'none' })
               }
             },
-            fail: () => {
-              wx.showToast({ title: '网络错误', icon: 'none' })
-            }
+            fail: () => wx.showToast({ title: '网络错误', icon: 'none' })
           })
         }
       })
     },
 
-    onCopyKey() {
-      // 用实际剩余时间（而非 licenseMinutes）生成文案
-      const remain = this.data.countdownText || (this.data.licenseMinutes + ':00')
-      const text = '这是HN同学的打印机的使用许可密钥，剩余有效时间' + remain + '，请在有效期内填写到小程序的指定位置:\n密钥: ' + this.data.generatedKey
+    // 复制密钥
+    onCopyKey(e) {
+      const idx = e.currentTarget.dataset.idx
+      const k = this.data.activeKeys[idx]
+      if (!k) return
+      const remain = k.countdownText || ''
+      const text = '这是HN同学的打印机的使用许可密钥，剩余有效时间' + remain + '，请在有效期内填写到小程序的指定位置:\n密钥: ' + k.key
       wx.setClipboardData({
         data: text,
-        success: () => {
-          wx.showToast({ title: '已复制到剪贴板', icon: 'success' })
-        }
+        success: () => wx.showToast({ title: '已复制到剪贴板', icon: 'success' })
       })
     },
 
-    // 结束打印任务：查询订单价格详情并复制
-    onEndPrintTask() {
-      const orderId = this.data.relatedOrderId
-      if (!orderId) {
+    // 结束打印任务
+    onEndPrintTask(e) {
+      const idx = e.currentTarget.dataset.idx
+      const k = this.data.activeKeys[idx]
+      if (!k || !k.order_id) {
         wx.showToast({ title: '未找到关联订单', icon: 'none' })
         return
       }
@@ -1041,7 +1060,7 @@ Component({
 
       wx.showLoading({ title: '获取订单详情...' })
       wx.request({
-        url: CONFIG.BASE_URL + '/api/order_price/' + orderId,
+        url: CONFIG.BASE_URL + '/api/order_price/' + k.order_id,
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
         success: (res) => {
@@ -1049,7 +1068,7 @@ Component({
           if (res.data && res.data.success) {
             const d = res.data
             const files = d.files || []
-            const username = this.data.usedByNickname || '用户'
+            const username = k.used_by_nickname || '用户'
             let text = '【打印任务结算】\n用户: ' + username
             if (d.is_free) {
               text += '\n总价: 免费'
@@ -1066,41 +1085,37 @@ Component({
             }
             wx.setClipboardData({
               data: text,
-              success: () => {
-                wx.showToast({ title: '已复制结算详情', icon: 'success' })
-              }
+              success: () => wx.showToast({ title: '已复制结算详情', icon: 'success' })
             })
           } else {
             wx.showToast({ title: (res.data && res.data.message) || '获取失败', icon: 'none' })
           }
         },
-        fail: () => {
-          wx.hideLoading()
-          wx.showToast({ title: '网络错误', icon: 'none' })
-        }
+        fail: () => { wx.hideLoading(); wx.showToast({ title: '网络错误', icon: 'none' }) }
       })
     },
 
-    // 确认管理员密钥生效（关闭抽屉）
-    onConfirmAdminKey() {
+    // 确认管理员密钥生效
+    onConfirmAdminKey(e) {
+      const idx = e.currentTarget.dataset.idx
+      const k = this.data.activeKeys[idx]
+      if (!k) return
       const token = wx.getStorageSync('token')
       if (!token) return
       wx.request({
         url: CONFIG.BASE_URL + '/api/license/finish',
         method: 'POST',
         header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
-        data: { key: this.data.generatedKey },
+        data: { key: k.key },
         success: (res) => {
           if (res.data && res.data.success) {
             wx.showToast({ title: '已确认', icon: 'success' })
-            this._closeKeyDrawer()
+            this.loadActiveKey(false)
           } else {
             wx.showToast({ title: (res.data && res.data.message) || '操作失败', icon: 'none' })
           }
         },
-        fail: () => {
-          wx.showToast({ title: '网络错误', icon: 'none' })
-        }
+        fail: () => wx.showToast({ title: '网络错误', icon: 'none' })
       })
     },
 
@@ -1138,7 +1153,9 @@ Component({
         startX: t.clientX,
         startY: t.clientY,
         lastX: t.clientX,
+        startCardX: this.data.adminSwipeX[openid] || 0,  // 卡片当前偏移，保证从已滑开位置继续拖拽
         horizontal: false,
+        moved: false,
       }
       const trans = { ...this.data.adminSwipeTransition }
       trans[openid] = false
@@ -1155,29 +1172,61 @@ Component({
       const dy = t.clientY - sd.startY
       if (!sd.horizontal) {
         if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return
-        if (Math.abs(dx) > Math.abs(dy)) { sd.horizontal = true }
-        else { return }
+        sd.moved = true
+        if (Math.abs(dx) > Math.abs(dy)) {
+          sd.horizontal = true
+          // 通知滚动引擎让出控制权（与密钥左滑共用 _swipeHorizontal 标记）
+          this._swipeHorizontal = true
+        } else {
+          return
+        }
       }
-      let x = dx
-      if (x > 0) x = 0
-      const maxX = -140  // rpx ≈ 70px
-      if (x < maxX) x = maxX
-      sd.lastX = x
+      sd.moved = true
+      const rawX = sd.startCardX + dx       // 原始位置（允许越界）
+      const maxX = -this._adminDeleteWidthPx
+      // 橡皮筋阻尼：过滑 >0 或 <maxX 时产生抵抗感，松手自动回弹
+      const visualX = this._rubberBand(rawX, maxX, 0, 55)
+      sd.lastX = rawX                       // 保存原始值用于吸附判断
+      sd.lastVisualX = visualX
       const swipeX = { ...this.data.adminSwipeX }
-      swipeX[openid] = x
-      this.setData({ adminSwipeX: swipeX })
+      swipeX[openid] = visualX
+      const opacity = { ...this.data.adminDeleteOpacity }
+      opacity[openid] = Math.min(1, Math.abs(rawX) / (this._adminDeleteWidthPx * 0.6))
+      this.setData({ adminSwipeX: swipeX, adminDeleteOpacity: opacity })
     },
 
     onAdminTouchEnd(e) {
+      // 释放滚动引擎控制权
+      this._swipeHorizontal = false
       const openid = e.currentTarget.dataset.openid
       const sd = this._adminSwipeData && this._adminSwipeData[openid]
-      if (!sd || !sd.horizontal) return
+      if (!sd) return
+      if (!sd.moved) {
+        // 没有任何移动 → 纯点击，跳转到该管理员的任务列表
+        const admin = this.data.admins.find(a => a.openid === openid)
+        if (admin) {
+          const nickname = encodeURIComponent(admin.nickname || '')
+          wx.navigateTo({
+            url: `/pages/user-orders/user-orders?openid=${openid}&nickname=${nickname}`
+          })
+        }
+        return
+      }
+      if (!sd.horizontal) return  // 垂直滑动滚屏，不处理
       const trans = { ...this.data.adminSwipeTransition }
       trans[openid] = true
-      const target = sd.lastX < -35 ? -140 : 0
-      const swipeX = { ...this.data.adminSwipeX }
-      swipeX[openid] = target
-      this.setData({ adminSwipeX: swipeX, adminSwipeTransition: trans })
+      const maxX = -this._adminDeleteWidthPx
+      const rawX = sd.lastX
+      // 吸附：越界弹回边界，正常范围过半则吸附露出按钮
+      const target = rawX > 0 ? 0 : (rawX < maxX ? maxX : (rawX < maxX / 2 ? maxX : 0))
+      const opacity = { ...this.data.adminDeleteOpacity }
+      opacity[openid] = target === 0 ? 0 : 1
+      this.setData({ adminSwipeTransition: trans, adminDeleteOpacity: opacity })
+      wx.nextTick(() => {
+        const swipeX = { ...this.data.adminSwipeX }
+        swipeX[openid] = target
+        this.setData({ adminSwipeX: swipeX })
+      })
     },
 
     onRemoveAdmin(e) {
@@ -1219,8 +1268,7 @@ Component({
 
     // F12: 跳转本地打印任务列表（通过 source=local 过滤）
     onGoLocalOrders() {
-      // 复用订单列表页面但加 source=local 参数
-      wx.showToast({ title: '本地打印任务功能开发中', icon: 'none' })
+      wx.navigateTo({ url: '/pages/user-orders/user-orders?source=local' })
     },
 
     loadStorageStats() {
@@ -1349,11 +1397,11 @@ Component({
     _startKeyPolling() {
       this._stopKeyPolling()
       this._pollKeyTick = () => {
-        if (this.data.keyAnimState !== 'open') {
+        if (!this.data.activeKeys.length) {
           this._stopKeyPolling()
           return
         }
-        this.loadActiveKey()
+        this.loadActiveKey(false)
       }
       this._keyPollTimer = setInterval(this._pollKeyTick, 5000)
     },
@@ -1478,16 +1526,16 @@ Component({
 
     // ==================== 任务列表 ====================
 
-    loadOrders(page = 1, append = false) {
+    loadOrders() {
       const token = wx.getStorageSync('token')
       if (!token) {
         this.setData({ loading: false })
         return
       }
 
-      // 初次加载显示 loading，追加加载不显示
-      if (!append) {
-        this.setData({ loading: true, ordersPage: 1 })
+      // 仅在列表为空时显示加载状态（首次加载），切换页面/条数时静默刷新
+      if (this.data.orders.length === 0) {
+        this.setData({ loading: true })
       }
 
       wx.request({
@@ -1496,7 +1544,7 @@ Component({
         header: {
           'Authorization': 'Bearer ' + token
         },
-        data: { page: page, per_page: 20 },
+        data: { page: this.data.ordersCurrentPage, per_page: this.data.ordersPerPage },
         success: (res) => {
           if (res.statusCode === 200 && res.data.success) {
             // 预处理文件大小显示（WXML 不支持 .toFixed()）
@@ -1513,18 +1561,18 @@ Component({
             })
 
             const total = res.data.total || 0
-            const allOrders = append
-              ? [...this.data.orders, ...newOrders]
-              : newOrders
-
+            const firstLoad = this.data.orders.length === 0 && newOrders.length > 0
             this.setData({
-              orders: allOrders,
+              orders: newOrders,
               loading: false,
-              ordersPage: page,
               ordersTotal: total,
-              ordersHasMore: allOrders.length < total,
-              expandedOrders: this.data.expandedOrders,
+              ordersTotalPages: Math.ceil(total / this.data.ordersPerPage),
+              expandedOrders: {},
+              ordersAnimated: firstLoad,
             })
+            if (firstLoad) {
+              setTimeout(() => this.setData({ ordersAnimated: false }), newOrders.length * 60 + 500)
+            }
           } else {
             this.setData({ loading: false })
           }
@@ -1538,9 +1586,114 @@ Component({
       })
     },
 
-    onLoadMoreOrders() {
-      const nextPage = this.data.ordersPage + 1
-      this.loadOrders(nextPage, true)
+    // ==================== 分页控制 ====================
+
+    onOrdersPageChange(e) {
+      const page = parseInt(e.currentTarget.dataset.page, 10)
+      if (page < 1 || page > this.data.ordersTotalPages || page === this.data.ordersCurrentPage) return
+      this.setData({ ordersCurrentPage: page }, () => {
+        this.loadOrders()
+        this._scrollToOrdersSection()
+      })
+    },
+
+    onOrdersPrevPage() {
+      if (this.data.ordersCurrentPage <= 1) return
+      this.setData({ ordersCurrentPage: this.data.ordersCurrentPage - 1 }, () => {
+        this.loadOrders()
+        this._scrollToOrdersSection()
+      })
+    },
+
+    onOrdersNextPage() {
+      if (this.data.ordersCurrentPage >= this.data.ordersTotalPages) return
+      this.setData({ ordersCurrentPage: this.data.ordersCurrentPage + 1 }, () => {
+        this.loadOrders()
+        this._scrollToOrdersSection()
+      })
+    },
+
+    onToggleOrdersPageSize() {
+      this.setData({ showPageSizePicker: !this.data.showPageSizePicker })
+    },
+
+    onSelectOrdersPageSize(e) {
+      const size = parseInt(e.currentTarget.dataset.size, 10)
+      if (isNaN(size)) return
+      this.setData({
+        ordersPerPage: size,
+        ordersCurrentPage: 1,
+        showPageSizePicker: false,
+      }, () => {
+        this.loadOrders()
+        this._scrollToOrdersSection()
+      })
+    },
+
+    // 滚动到"我的打印任务"区域而非页面顶部
+    _scrollToOrdersSection() {
+      const q = this.createSelectorQuery()
+      q.select('.orders-section').boundingClientRect()
+      q.select('.scroller').boundingClientRect()
+      q.exec((res) => {
+        if (!res || !res[0] || !res[1]) return
+        const sectionTop = res[0].top - res[1].top + this._y
+        const target = Math.min(this._maxY, Math.max(this._minY, sectionTop - 20))
+        this._animateScroll(target, 280)
+      })
+    },
+
+    // 平滑滚动到指定位置（ease-out 曲线）
+    _animateScroll(targetY, duration) {
+      this._cancelSchedule()
+      this._inDecel = false
+      const startY = this._y
+      const startT = Date.now()
+      const animate = () => {
+        const elapsed = Date.now() - startT
+        const p = Math.min(1, elapsed / duration)
+        // easeOutCubic: 1 - (1-p)^3
+        const eased = 1 - Math.pow(1 - p, 3)
+        this._y = startY + (targetY - startY) * eased
+        this._applyY()
+        if (p < 1) {
+          this._scrollAnimTimer = setTimeout(animate, 16)
+        }
+      }
+      animate()
+    },
+
+    // 橡皮筋阻尼：允许越界滑动，阻力渐增，松手回弹
+    _rubberBand(rawVal, minVal, maxVal, maxOverscroll = 60) {
+      if (rawVal > maxVal) {
+        const excess = rawVal - maxVal
+        return maxVal + maxOverscroll * (1 - Math.exp(-excess / (maxOverscroll * 1.6)))
+      }
+      if (rawVal < minVal) {
+        const excess = minVal - rawVal
+        return minVal - maxOverscroll * (1 - Math.exp(-excess / (maxOverscroll * 1.6)))
+      }
+      return rawVal
+    },
+
+    // 生成页码数组
+    getOrdersPageNumbers() {
+      const total = this.data.ordersTotalPages
+      const current = this.data.ordersCurrentPage
+      if (total <= 7) {
+        return Array.from({ length: total }, (_, i) => i + 1)
+      }
+      const pages = []
+      pages.push(1)
+      if (current > 3) pages.push('...')
+      const start = Math.max(2, current - 1)
+      const end = Math.min(total - 1, current + 1)
+      for (let i = start; i <= end; i++) {
+        pages.push(i)
+      }
+      if (current < total - 2) pages.push('...')
+      pages.push(total)
+      return pages
     },
 
     onOrderTap(e) {

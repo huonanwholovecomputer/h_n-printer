@@ -65,6 +65,9 @@ page {
 .status-printing  { background-color: #E3F2FD; color: #1565C0; }
 .status-sent      { background-color: #E8F5E9; color: #2E7D32; }
 .status-failed    { background-color: #FFEBEE; color: #C62828; }
+.status-abandoned { background-color: #F3E5F5; color: #7B1FA2; }
+.status-reserved  { background-color: #FFF8E1; color: #F57F17; }
+.status-rejected  { background-color: #FFF3E0; color: #E65100; }
 .status-canceled  { background-color: var(--gray6); color: var(--gray); }
 
 /* ── Info Groups ── */

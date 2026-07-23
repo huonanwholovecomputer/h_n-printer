@@ -15,6 +15,7 @@ Component({
       failed: '失败',
       rejected: '被打回',
       canceled: '已取消',
+      reserved: '已预留',
     },
   },
   lifetimes: {

@@ -1,8 +1,0 @@
-flask
-flask-socketio
-APScheduler
-requests
-python-socketio
-pypdf
-gunicorn
-eventlet

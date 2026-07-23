@@ -5,7 +5,8 @@
     "pages/order-detail/order-detail",
     "pages/my-performance/my-performance",
     "pages/logs/logs",
-    "pages/authorized-users/authorized-users"
+    "pages/authorized-users/authorized-users",
+    "pages/user-orders/user-orders"
   ],
   "window": {
     "navigationBarTextStyle": "black",

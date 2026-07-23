@@ -1,7 +1,7 @@
 <!--me.wxml-->
 <navigation-bar title="我" back="{{false}}" color="black" background="#FFF"></navigation-bar>
 
-<view class="page-root">
+<view class="page-root {{pageSlide}} {{pageExit}}">
   <!-- 自定义滚动容器：负责橡皮筋回弹物理（与首页一致） -->
   <view
     class="scroller"
@@ -14,7 +14,7 @@
       <view class="container">
 
     <!-- 用户信息卡片 -->
-    <view class="user-card">
+    <view class="user-card ">
       <view class="avatar-btn" bindtap="onChooseAvatar" hover-class="avatar-hover">
         <image class="avatar" src="{{avatarUrl || '/images/default-avatar.png'}}" mode="aspectFill"></image>
       </view>
@@ -54,45 +54,52 @@
             <view class="key-type-option {{keyType === 'admin' ? 'key-type-active' : ''}}" bindtap="onSelectKeyType" data-type="admin" hover-class="tap-active">管理员许可</view>
           </view>
         </view>
-        <button class="generate-btn" bindtap="onGenerateKey" hover-class="generate-hover" loading="{{generating}}" disabled="{{generating || keyAnimState === 'opening'}}">生成许可密钥</button>
+        <button class="generate-btn" bindtap="onGenerateKey" hover-class="generate-hover" loading="{{generating}}" disabled="{{generating}}">生成许可密钥</button>
       </view>
 
-      <!-- 独立抽屉卡片：从生成卡片下方平滑抽出 -->
-      <view class="key-drawer {{keyAnimState === 'open' || keyAnimState === 'opening' ? 'key-drawer-show' : ''}} {{keyExpired ? 'key-drawer-expired' : ''}} {{keyStatus !== 'unused' ? 'key-drawer-locked' : ''}}">
+      <!-- 活跃密钥列表（向下延伸排列，支持多个同时存在） -->
+      <view wx:for="{{activeKeys}}" wx:key="key"
+            class="key-drawer key-drawer-show {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}} {{item.status !== 'unused' ? 'key-drawer-locked' : ''}}">
         <!-- 右侧删除按钮（绝对定位，左滑时露出） -->
-        <view class="key-delete" catchtap="onRevokeKey">删除</view>
+        <view class="key-delete" catchtap="onRevokeKey" data-idx="{{index}}"
+              style="opacity: {{item.deleteOpacity}}">
+          <text class="delete-icon">✕</text>
+          <text>{{item.status === 'unused' ? '作废' : '删除'}}</text>
+        </view>
         <!-- 卡片本体：可左滑 -->
-        <view class="key-drawer-inner {{keySwipeTransition ? '' : 'no-transition'}}"
-              style="transform: translateX({{keySwipeX}}px);"
+        <view class="key-drawer-inner {{item.swipeTransition ? '' : 'no-transition'}}"
+              style="transform: translateX({{item.swipeX}}px);"
               bindtouchstart="onKeyTouchStart"
               catchtouchmove="onKeyTouchMove"
               bindtouchend="onKeyTouchEnd"
-              bindtouchcancel="onKeyTouchEnd">
+              bindtouchcancel="onKeyTouchEnd"
+              data-idx="{{index}}">
           <view class="key-row">
             <view class="key-left">
-              <text class="key-label">许可密钥</text>
-              <text class="key-value">{{generatedKey}}</text>
+              <text class="key-label">{{item.type === 'admin' ? '管理员密钥' : '许可密钥'}}</text>
+              <text class="key-value">{{item.key}}</text>
             </view>
             <view class="key-right">
-              <text class="key-countdown {{keyExpired ? 'countdown-expired' : ''}}">{{countdownText}}</text>
+              <text wx:if="{{item.status === 'unused'}}" class="key-countdown {{item.expired ? 'countdown-expired' : ''}}">{{item.countdownText}}</text>
+              <text wx:else class="key-countdown">已使用</text>
             </view>
           </view>
           <!-- 兑换用户信息（used_waiting / used_done 时显示） -->
-          <view wx:if="{{keyStatus !== 'unused'}}" class="key-user-info">
-            <image wx:if="{{usedByAvatarUrl}}" class="key-user-avatar" src="{{usedByAvatarUrl}}" mode="aspectFill" />
-            <text class="key-user-name">{{usedByNickname}}</text>
+          <view wx:if="{{item.status !== 'unused'}}" class="key-user-info">
+            <image wx:if="{{item.used_by_avatar_url}}" class="key-user-avatar" src="{{item.used_by_avatar_url}}" mode="aspectFill" />
+            <text class="key-user-name">{{item.used_by_nickname}}</text>
           </view>
           <view class="key-actions">
             <!-- unused: 未过期可复制 -->
-            <button wx:if="{{keyStatus === 'unused' && !keyExpired}}" class="copy-btn" bindtap="onCopyKey" hover-class="tap-active">复制</button>
+            <button wx:if="{{item.status === 'unused' && !item.expired}}" class="copy-btn" bindtap="onCopyKey" data-idx="{{index}}" hover-class="tap-active">复制</button>
             <!-- unused 已过期 -->
-            <button wx:elif="{{keyStatus === 'unused' && keyExpired}}" class="copy-btn copy-btn-disabled">已过期</button>
+            <button wx:elif="{{item.status === 'unused' && item.expired}}" class="copy-btn copy-btn-disabled">已过期</button>
             <!-- used_waiting + admin: 确认并关闭 -->
-            <button wx:elif="{{keyStatus === 'used_waiting' && keyType === 'admin'}}" class="copy-btn btn-confirm-admin" bindtap="onConfirmAdminKey" hover-class="tap-active">确认并关闭</button>
-            <!-- used_waiting + temp: 等待任务中（不可点击） -->
-            <button wx:elif="{{keyStatus === 'used_waiting' && keyType !== 'admin'}}" class="copy-btn btn-waiting" disabled>等待任务中</button>
+            <button wx:elif="{{item.status === 'used_waiting' && item.type === 'admin'}}" class="copy-btn btn-confirm-admin" bindtap="onConfirmAdminKey" data-idx="{{index}}" hover-class="tap-active">确认并关闭</button>
+            <!-- used_waiting + temp: 等待任务中 -->
+            <button wx:elif="{{item.status === 'used_waiting' && item.type !== 'admin'}}" class="copy-btn btn-waiting" disabled>等待任务中</button>
             <!-- used_done: 结束打印任务 -->
-            <button wx:elif="{{keyStatus === 'used_done'}}" class="copy-btn btn-end-task" bindtap="onEndPrintTask" hover-class="tap-active">结束打印任务</button>
+            <button wx:elif="{{item.status === 'used_done'}}" class="copy-btn btn-end-task" bindtap="onEndPrintTask" data-idx="{{index}}" hover-class="tap-active">结束打印任务</button>
           </view>
         </view>
       </view>
@@ -115,15 +122,31 @@
 
     <!-- 普通用户 / 临时授权：已获得许可 -->
     <view wx:if="{{userRole === 'user'}}" class="license-section">
-      <view class="license-card license-active">
-        <text class="license-status-icon">✅</text>
-        <text class="license-status-text">您已获得打印许可</text>
+      <view class="section-title">
+        <view class="section-bar"></view>
+        <text>打印许可</text>
+      </view>
+      <view class="license-card user-license-card">
+        <view class="user-license-header">
+          <text class="license-status-icon">✅</text>
+          <text class="license-status-text">您已获得打印许可</text>
+        </view>
+        <view wx:if="{{licenseInfo}}" class="user-license-detail">
+          <view class="license-detail-row">
+            <text class="license-detail-label">许可密钥</text>
+            <text class="license-detail-value license-key-value">{{licenseInfo.key}}</text>
+          </view>
+          <view class="license-detail-row">
+            <text class="license-detail-label">授权人</text>
+            <text class="license-detail-value">{{licenseInfo.creator_nickname}}</text>
+          </view>
+        </view>
         <text wx:if="{{tempCountdownText}}" class="temp-countdown">{{tempCountdownText}}</text>
       </view>
     </view>
 
     <!-- 管理员：存储统计 -->
-    <view wx:if="{{userRole === 'admin' && storageStats}}" class="storage-section">
+    <view wx:if="{{userRole === 'admin' && storageStats}}" class="storage-section " style="animation-delay: 0.08s">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>服务器存储</text>
@@ -161,7 +184,7 @@
     </view>
 
     <!-- 管理员：许可用户列表 -->
-    <view wx:if="{{userRole === 'admin'}}" class="users-section">
+    <view wx:if="{{userRole === 'admin'}}" class="users-section " style="animation-delay: 0.12s">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>许可用户</text>
@@ -172,6 +195,7 @@
         <image class="user-avatar" src="{{item.avatar_url || '/images/default-avatar.png'}}" mode="aspectFill"></image>
         <view class="user-detail">
           <text class="user-nickname">{{item.nickname}}</text>
+          <text wx:if="{{item.license_key}}" class="user-license-key">密钥: {{item.license_key}}</text>
           <text class="user-licensed-at">许可时间: {{item.licensed_at}}</text>
         </view>
       </view>
@@ -182,7 +206,7 @@
     </view>
 
     <!-- 管理员/超级管理员：历史授权用户 -->
-    <view wx:if="{{userRole === 'admin'}}" class="role-actions">
+    <view wx:if="{{userRole === 'admin'}}" class="role-actions" style="animation-delay: 0.14s">
       <view class="role-btn user-btn" bindtap="onGoAuthorizedUsers" hover-class="tap-active">
         <text class="role-btn-icon">👥</text>
         <text class="role-btn-text">历史授权用户</text>
@@ -191,7 +215,7 @@
     </view>
 
     <!-- 管理员/超级管理员：本地打印任务 -->
-    <view wx:if="{{userRole === 'admin'}}" class="role-actions">
+    <view wx:if="{{userRole === 'admin' || isSuperAdmin}}" class="role-actions" style="animation-delay: 0.16s">
       <view class="role-btn user-btn" bindtap="onGoLocalOrders" hover-class="tap-active">
         <text class="role-btn-icon">🖨️</text>
         <text class="role-btn-text">本地打印任务</text>
@@ -200,7 +224,7 @@
     </view>
 
     <!-- 超级管理员：管理员列表 -->
-    <view wx:if="{{isSuperAdmin}}" class="license-section">
+    <view wx:if="{{isSuperAdmin}}" class="license-section" style="animation-delay: 0.18s">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>管理管理员</text>
@@ -211,12 +235,16 @@
       </view>
       <view wx:for="{{admins}}" wx:key="openid" class="admin-card-wrap">
         <!-- 右侧删除按钮 -->
-        <view class="admin-delete" catchtap="onRemoveAdmin" data-openid="{{item.openid}}">移除</view>
+        <view class="admin-delete" catchtap="onRemoveAdmin" data-openid="{{item.openid}}"
+              style="opacity: {{adminDeleteOpacity[item.openid] || 0}}">
+          <text class="delete-icon">🗑</text>
+          <text>移除</text>
+        </view>
         <!-- 卡片本体：可左滑 -->
-        <view class="admin-card {{adminSwipeTransition[item.openid] === false ? '' : 'admin-swipe-trans'}}"
-              style="transform: translateX({{adminSwipeX[item.openid] || 0}}px);"
+        <view class="admin-card {{adminSwipeTransition[item.openid] === false ? 'no-transition' : ''}}"
+              style="transform: translateX({{adminSwipeX[item.openid] || 0}}px); transition: {{adminSwipeTransition[item.openid] === false ? 'none' : 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)'}};"
               bindtouchstart="onAdminTouchStart"
-              catchtouchmove="onAdminTouchMove"
+              bindtouchmove="onAdminTouchMove"
               bindtouchend="onAdminTouchEnd"
               bindtouchcancel="onAdminTouchEnd"
               data-openid="{{item.openid}}">
@@ -231,7 +259,7 @@
     </view>
 
     <!-- 我的打印任务 -->
-    <view class="orders-section">
+    <view class="orders-section " style="animation-delay: 0.1s">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>我的打印任务</text>
@@ -252,8 +280,37 @@
         <text class="empty-desc">快去打印你的第一份文件吧</text>
       </view>
 
+      <!-- 分页控制栏（顶部） -->
+      <view class="orders-pagination-bar" wx:if="{{ordersTotalPages > 0}}">
+        <view class="page-size-selector" bindtap="onToggleOrdersPageSize">
+          <text class="page-size-text">{{ordersPerPage}}条/页</text>
+          <text class="page-size-arrow {{showPageSizePicker ? 'arrow-up' : ''}}">▼</text>
+          <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}" wx:if="{{showPageSizePicker}}">
+            <view wx:for="{{pageOptions}}" wx:key="*this"
+                  class="page-size-option {{ordersPerPage === item ? 'option-active' : ''}}"
+                  catchtap="onSelectOrdersPageSize" data-size="{{item}}">
+              {{item}} 条/页
+            </view>
+          </view>
+        </view>
+        <view class="page-nav">
+          <view class="page-btn {{ordersCurrentPage <= 1 ? 'page-btn-disabled' : ''}}"
+                bindtap="onOrdersPrevPage" hover-class="tap-active">‹</view>
+          <block wx:for="{{getOrdersPageNumbers()}}" wx:key="*this">
+            <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
+            <view wx:else
+                  class="page-num {{ordersCurrentPage === item ? 'page-num-active' : ''}}"
+                  bindtap="onOrdersPageChange" data-page="{{item}}" hover-class="tap-active">{{item}}</view>
+          </block>
+          <view class="page-btn {{ordersCurrentPage >= ordersTotalPages ? 'page-btn-disabled' : ''}}"
+                bindtap="onOrdersNextPage" hover-class="tap-active">›</view>
+        </view>
+      </view>
+
       <!-- 任务列表 -->
-      <view wx:for="{{orders}}" wx:key="id" class="order-card {{expandedOrders[item.id] ? 'order-expanded' : ''}}" bindtap="onOrderTap" data-id="{{item.id}}">
+      <view wx:for="{{orders}}" wx:key="id"
+            class="order-card {{expandedOrders[item.id] ? 'order-expanded' : ''}}"
+            bindtap="onOrderTap" data-id="{{item.id}}">
         <!-- 收缩态：一行摘要 -->
         <view class="order-card-header">
           <view class="order-card-main">
@@ -327,9 +384,24 @@
         </view>
       </view>
 
-      <!-- 加载更多 -->
-      <view wx:if="{{ordersHasMore}}" class="load-more-wrap">
-        <button class="load-more-btn" bindtap="onLoadMoreOrders" hover-class="tap-active">加载更多</button>
+      <!-- 底部分页 + 结束提示 -->
+      <view class="orders-pagination-bar pagination-bottom" wx:if="{{ordersTotalPages > 1}}">
+        <view class="page-nav">
+          <view class="page-btn {{ordersCurrentPage <= 1 ? 'page-btn-disabled' : ''}}"
+                bindtap="onOrdersPrevPage" hover-class="tap-active">‹</view>
+          <block wx:for="{{getOrdersPageNumbers()}}" wx:key="*this">
+            <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
+            <view wx:else
+                  class="page-num {{ordersCurrentPage === item ? 'page-num-active' : ''}}"
+                  bindtap="onOrdersPageChange" data-page="{{item}}" hover-class="tap-active">{{item}}</view>
+          </block>
+          <view class="page-btn {{ordersCurrentPage >= ordersTotalPages ? 'page-btn-disabled' : ''}}"
+                bindtap="onOrdersNextPage" hover-class="tap-active">›</view>
+        </view>
+      </view>
+
+      <view wx:if="{{ordersCurrentPage >= ordersTotalPages && ordersTotalPages > 0 && orders.length > 0}}" class="end-hint">
+        <text class="end-hint-text">-- 没有更多内容啦 --</text>
       </view>
 
     </view>
