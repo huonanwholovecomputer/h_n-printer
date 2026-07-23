@@ -4,13 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-HN 云打印 — 微信小程序云打印系统，三个组件协作：
+HN 云打印 — 微信小程序云打印系统，两个组件协作：
 
 | 组件 | 目录 | 技术栈 |
 |---|---|---|
 | 微信小程序前端 | `h_n_print/` | 微信原生框架 (Component 模式, 自定义 tabBar) |
 | 后端 API 服务 | `printer-backend/` | Flask + Flask-SocketIO + SQLite + APScheduler |
-| Windows 打印客户端 | `printer_client/` | Python + SocketIO + PyMuPDF + pywin32 (GDI 直打) |
 
 **数据流**: 用户小程序上传文件 → 后端存储(MD5去重) → SocketIO 实时推送/HTTP 拉取 → Windows 客户端下载渲染 → GDI 直打打印机
 
@@ -28,16 +27,6 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
 - **认证**: `login_required` 装饰器验证 Bearer token (itsdangerous 签名, 7天有效)。`require_printer_access` 额外检查非 guest 角色。
 
 关键配置从 `printer-backend/config.py` 加载 (需手动创建，含 WECHAT_APPID/SECRET_KEY/TOKEN/ADMIN_OPENIDS 等)。
-
-## Windows 打印客户端 (`printer_client/printer_client.py`)
-
-- **连接**: SocketIO 长连接到后端，认证用 URL 参数 `token` + `client_id`(主机名)。断线指数退避重连(2s~120s)。
-- **打印管线**: 下载文件 → 类型检测 → Office文档(COM转PDF) → PyMuPDF渲染为位图(300 DPI) / 图片直接加载 → Windows GDI 打印(DEVMODE 设置份数/双面)。
-- **页码范围**: `parse_page_range()` 支持 "1-5,7,9" 格式，在渲染阶段过滤 PDF 页码。
-- **Excel 特殊处理**: .xls/.xlsx 不自动打印，转存到桌面 `需手动处理的打印任务/` 文件夹。
-- **并发控制**: `print_lock` 防止多任务同时操作打印机。
-
-配置从 `printer_client/config.py` 加载 (CLOUD_API_URL, WEBSOCKET_URL, TOKEN, PRINTER_NAME, DUPLEX_MODE)。
 
 ## 微信小程序 (`h_n_print/`)
 
@@ -83,8 +72,6 @@ bash backup.sh  # crontab 每天凌晨3点
 | `printer-backend/gunicorn_config.py` | Gunicorn + eventlet 配置 |
 | `printer-backend/nginx-http.conf` | Nginx 反向代理配置模板 |
 | `printer-backend/backup.sh` | 数据库备份脚本 |
-| `printer_client/printer_client.py` | Windows 打印客户端主程序 |
-| `printer_client/config.py` | 客户端配置 |
 | `h_n_print/app.json` | 小程序页面/窗口/tabBar 注册 |
 | `h_n_print/utils/config.js` | 小程序 API 地址配置 |
 | `h_n_print/pages/index/index.js` | 首页：文件选择/上传/提交/滚动引擎 |

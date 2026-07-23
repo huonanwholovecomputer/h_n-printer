@@ -1,32 +1,46 @@
 <!--pages/authorized-users/authorized-users.wxml-->
 <navigation-bar title="历史授权用户" back="{{true}}" color="black" background="#FFF"></navigation-bar>
 
-<view class="page-root">
+<scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
   <view class="container">
     <!-- 加载中 -->
-    <view wx:if="{{loading}}" class="loading-hint">加载中...</view>
+    <view wx:if="{{loading}}" class="status-box">
+      <text class="status-text">加载中...</text>
+    </view>
 
     <!-- 空状态 -->
-    <view wx:elif="{{users.length === 0}}" class="empty-hint">
-      <text class="empty-icon">👥</text>
-      <text class="empty-text">暂无授权用户</text>
+    <view wx:elif="{{users.length === 0}}" class="empty-state">
+      <view class="empty-illustration">
+        <text class="empty-icon">👥</text>
+      </view>
+      <text class="empty-title">暂无授权用户</text>
       <text class="empty-desc">生成许可密钥分享给他人后，这里会显示授权记录</text>
     </view>
 
     <!-- 用户列表 -->
     <view wx:else class="user-list">
+      <view class="list-summary">
+        <text class="summary-text">共 {{users.length}} 位授权用户</text>
+      </view>
       <view wx:for="{{users}}" wx:key="openid" class="user-card-item"
-            bindtap="onUserTap" data-openid="{{item.openid}}" hover-class="tap-active">
-        <view class="user-card-left">
-          <text class="user-card-name">{{item.nickname || item.openid_short || '未知用户'}}</text>
-          <text class="user-card-id">{{item.openid_short}}</text>
+            bindtap="onUserTap" data-openid="{{item.openid}}" data-nickname="{{item.nickname}}"
+            hover-class="tap-active">
+        <view class="user-avatar-circle">
+          <text class="user-avatar-char">{{item.avatarChar}}</text>
+        </view>
+        <view class="user-card-center">
+          <text class="user-card-name">{{item.nickname || '未知用户'}}</text>
+          <text class="user-card-id">ID: {{item.openid_short || item.openid}}</text>
         </view>
         <view class="user-card-right">
-          <text class="user-card-orders">{{item.order_count}} 个订单</text>
+          <view class="user-stat">
+            <text class="user-stat-num">{{item.order_count}}</text>
+            <text class="user-stat-label">个订单</text>
+          </view>
           <text class="user-card-last" wx:if="{{item.last_order}}">最近: {{item.last_order}}</text>
           <text class="role-btn-arrow">›</text>
         </view>
       </view>
     </view>
   </view>
-</view>
+</scroll-view>

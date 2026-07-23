@@ -20,11 +20,18 @@ from flask import Flask, g, request, jsonify, send_file
 from flask_socketio import SocketIO, emit, disconnect, join_room
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 最大上传 50MB
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DATABASE = "orders.db"
+USER_DATABASE = "users.db"
 UPLOAD_DIR = "uploads"
 AVATAR_DIR = os.path.join(UPLOAD_DIR, "avatars")
 MD5_INDEX_FILE = os.path.join(UPLOAD_DIR, "md5_index.json")
@@ -324,7 +331,7 @@ def compute_role(openid):
     """计算用户角色: admin / user / guest（含 DB 中 admin 角色和临时授权）"""
     if is_admin(openid):
         return "admin"
-    conn = get_db()
+    conn = get_user_db()
     row = conn.execute("SELECT role, temp_until FROM users WHERE openid = ?", (openid,)).fetchone()
     conn.close()
     if row:
@@ -346,6 +353,31 @@ def get_avatar_url(openid, avatar_path):
         return ""
     mtime = int(os.path.getmtime(avatar_path))
     return f"{PUBLIC_BASE_URL}/api/avatar?openid={openid}&v={mtime}"
+
+
+def compress_avatar(file_path, max_size=200):
+    """压缩头像：缩放到 max_size×max_size 以内，转 JPEG 质量 80。
+    返回压缩后的文件路径（可能不同于原路径，因为扩展名变为 .jpg）。"""
+    if not HAS_PIL:
+        return file_path  # 没有 Pillow 就原样存储
+
+    try:
+        img = Image.open(file_path)
+        # 统一为 RGB（去掉透明通道）
+        if img.mode in ('RGBA', 'P'):
+            img = img.convert('RGB')
+        # 等比缩放到 max_size 以内
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+        # 输出为 JPEG
+        jpg_path = os.path.splitext(file_path)[0] + '.jpg'
+        img.save(jpg_path, 'JPEG', quality=80, optimize=True)
+        # 如果原文件与压缩文件不同，删除原文件
+        if jpg_path != file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        return jpg_path
+    except Exception as e:
+        print(f"[WARN] 头像压缩失败: {e}")
+        return file_path
 
 
 # Token 签名器（依赖 SECRET_KEY，必须在配置加载之后初始化）
@@ -510,6 +542,13 @@ def get_db():
     conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
+def get_user_db():
+    """独立的用户数据库连接（users / license_keys 表）"""
+    conn = sqlite3.connect(USER_DATABASE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
+
 
 def _retry_on_lock(fn, *args, max_attempts=3, **kwargs):
     """在 database is locked 错误时自动重试（指数退避：0.2s / 0.4s / 0.8s）。
@@ -536,14 +575,13 @@ def init_db():
     build_md5_index()
 
     conn = get_db()
-    # 开启 WAL 模式：允许多个读连接与一个写连接并发，是解决
-    # "database is locked" 的关键。PRAGMA 在每个连接上设置，但 WAL
-    # 标志一旦设置就会持久化到数据库文件，这里重复设置确保旧库也生效。
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")
-    except sqlite3.OperationalError as e:
-        print(f"  [WARN] 开启 WAL 模式失败: {e}")
-    conn.commit()
+    user_conn = get_user_db()
+    for db_conn, db_name in [(conn, "orders.db"), (user_conn, "users.db")]:
+        try:
+            db_conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.OperationalError as e:
+            print(f"  [WARN] {db_name} 开启 WAL 模式失败: {e}")
+        db_conn.commit()
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS files (
@@ -601,18 +639,6 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
-    # 用户表（头像、昵称）
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            openid      TEXT PRIMARY KEY,
-            nickname    TEXT DEFAULT '',
-            avatar_path TEXT DEFAULT '',
-            updated_at  TEXT NOT NULL
-        )
-        """
-    )
-
     # v3 迁移：删除预约字段（SQLite 3.35+ 支持 DROP COLUMN）
     for col in ["reservation_date", "reservation_time"]:
         try:
@@ -622,13 +648,60 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # 字段不存在或 SQLite 版本不支持，忽略
 
-    # v4 迁移：给 users 表添加 role 列
+    # ============ 用户数据库 (users.db) ============
+    # 用户表
+    user_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            openid      TEXT PRIMARY KEY,
+            nickname    TEXT DEFAULT '',
+            avatar_path TEXT DEFAULT '',
+            updated_at  TEXT NOT NULL
+        )
+        """
+    )
     try:
-        conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'guest'")
-        conn.commit()
+        user_conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'guest'")
+        user_conn.commit()
         print("  已添加 users.role 列")
     except sqlite3.OperationalError:
         pass
+    try:
+        user_conn.execute("ALTER TABLE users ADD COLUMN temp_until TEXT DEFAULT NULL")
+        user_conn.commit()
+        print("  已添加 users.temp_until 列")
+    except sqlite3.OperationalError:
+        pass
+
+    # 许可密钥表
+    user_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS license_keys (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            key              TEXT    UNIQUE NOT NULL,
+            created_by       TEXT    NOT NULL,
+            used_by          TEXT    DEFAULT NULL,
+            validity_minutes INTEGER NOT NULL,
+            created_at       TEXT    NOT NULL,
+            expires_at       TEXT    NOT NULL,
+            used_at          TEXT    DEFAULT NULL
+        )
+        """
+    )
+    try:
+        user_conn.execute("ALTER TABLE license_keys ADD COLUMN type TEXT DEFAULT 'temp'")
+        user_conn.commit()
+        print("  已添加 license_keys.type 列")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        user_conn.execute("ALTER TABLE license_keys ADD COLUMN order_id INTEGER DEFAULT NULL")
+        user_conn.commit()
+        print("  已添加 license_keys.order_id 列")
+    except sqlite3.OperationalError:
+        pass
+    user_conn.commit()
+    user_conn.close()
 
     # v5 迁移：订单附加服务字段（派送/紧急/首页/地址）
     for col, col_type, default in [
@@ -647,22 +720,6 @@ def init_db():
             print(f"  已添加 orders.{col} 列")
         except sqlite3.OperationalError:
             pass
-
-    # 许可密钥表
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS license_keys (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            key              TEXT    UNIQUE NOT NULL,
-            created_by       TEXT    NOT NULL,
-            used_by          TEXT    DEFAULT NULL,
-            validity_minutes INTEGER NOT NULL,
-            created_at       TEXT    NOT NULL,
-            expires_at       TEXT    NOT NULL,
-            used_at          TEXT    DEFAULT NULL
-        )
-        """
-    )
 
     # v5 迁移：订单文件子任务表（一次提交可包含多个文件，每个文件独立份数/状态）
     conn.execute(
@@ -704,30 +761,6 @@ def init_db():
         conn.execute("ALTER TABLE order_files ADD COLUMN duplex TEXT DEFAULT 'on'")
         conn.commit()
         print("  已添加 order_files.duplex 列（文件级双面打印模式）")
-    except sqlite3.OperationalError:
-        pass  # 字段已存在
-
-    # v9 迁移：license_keys 添加 type 列（temp 表示临时许可，admin 表示永久管理许可）
-    try:
-        conn.execute("ALTER TABLE license_keys ADD COLUMN type TEXT DEFAULT 'temp'")
-        conn.commit()
-        print("  已添加 license_keys.type 列")
-    except sqlite3.OperationalError:
-        pass  # 字段已存在
-
-    # v10 迁移：users 添加 temp_until 列（临时用户有效期截止时间，永久用户为 NULL）
-    try:
-        conn.execute("ALTER TABLE users ADD COLUMN temp_until TEXT DEFAULT NULL")
-        conn.commit()
-        print("  已添加 users.temp_until 列")
-    except sqlite3.OperationalError:
-        pass  # 字段已存在
-
-    # v11 迁移：license_keys 添加 order_id 列（临时用户提交订单后关联）
-    try:
-        conn.execute("ALTER TABLE license_keys ADD COLUMN order_id INTEGER DEFAULT NULL")
-        conn.commit()
-        print("  已添加 license_keys.order_id 列")
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
@@ -792,11 +825,29 @@ def init_db():
 @app.route("/api/next_order_number", methods=["GET"])
 def next_order_number():
     """本地打印工具获取下一个可用订单号（需 token 认证）。
-    调用即分配，保证本地和云端订单号不冲突。"""
+    调用即分配，同时在数据库创建 reserved 状态占位记录，
+    防止订单号被浪费。若后续未调用 /api/local_orders 提交，
+    超时后由定时任务自动标记为 abandoned。"""
     token = request.args.get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     order_number = generate_order_number()
+
+    # 创建占位订单记录（状态 reserved），后续 /api/local_orders 会更新为 sent
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO orders (file, copies, status, created_at, openid, order_number, source)
+               VALUES (?, 1, 'reserved', ?, 'local', ?, 'local')""",
+            ("(等待打印)", created_at, order_number),
+        )
+        conn.commit()
+    except Exception:
+        pass  # 占位插入失败不影响订单号分配
+    finally:
+        conn.close()
+
     return jsonify({"success": True, "order_number": order_number})
 
 
@@ -1554,7 +1605,7 @@ def require_printer_access(f):
         if role not in ("admin", "user"):
             # 检查临时授权（temp_until > 当前时间）
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            conn = get_db()
+            conn = get_user_db()
             row = conn.execute(
                 "SELECT temp_until FROM users WHERE openid = ?", (g.openid,)
             ).fetchone()
@@ -1666,7 +1717,7 @@ def wx_login():
     token = token_serializer.dumps(openid)
 
     # 首次登录：创建用户记录并分配默认昵称
-    conn = get_db()
+    conn = get_user_db()
     existing = conn.execute("SELECT openid FROM users WHERE openid = ?", (openid,)).fetchone()
     if not existing:
         # 生成唯一默认昵称: user_ + 8位随机字母数字
@@ -1710,7 +1761,7 @@ def device_login():
     openid = "dev_" + hashlib.sha256(device_id.encode()).hexdigest()[:24]
     token = token_serializer.dumps(openid)
 
-    conn = get_db()
+    conn = get_user_db()
     existing = conn.execute("SELECT openid FROM users WHERE openid = ?", (openid,)).fetchone()
     if not existing:
         suffix = ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
@@ -1899,6 +1950,7 @@ def submit_order():
 
     # ---- 事务：插 1 条 orders + N 条 order_files ----
     conn = get_db()
+    user_conn = get_user_db()
     try:
         # 先插父订单（聚合字段用首文件填充，后续严格通过 order_files 聚合）
         first_file_name = files_input[0].get("file", files_input[0].get("file_name", ""))
@@ -2000,23 +2052,29 @@ def submit_order():
         conn.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
 
         # 若当前用户是临时授权用户，将订单关联到其许可密钥并清除临时授权
-        urow = conn.execute(
+        urow = user_conn.execute(
             "SELECT temp_until FROM users WHERE openid = ?", (g.openid,),
         ).fetchone()
         if urow and urow["temp_until"] and not user_is_admin:
-            conn.execute(
+            user_conn.execute(
                 "UPDATE license_keys SET order_id = ? WHERE used_by = ? AND order_id IS NULL ORDER BY id DESC LIMIT 1",
                 (order_id, g.openid),
             )
-            conn.execute(
+            user_conn.execute(
                 "UPDATE users SET temp_until = NULL WHERE openid = ?",
                 (g.openid,),
             )
+            user_conn.commit()
 
         conn.commit()
     except Exception:
         conn.rollback()
+        try:
+            user_conn.rollback()
+        except Exception:
+            pass
         conn.close()
+        user_conn.close()
         raise
 
     # ---- 推送（事务外，避免长事务） ----
@@ -2151,16 +2209,22 @@ def get_orders():
         # 超级管理员查看全部订单
         where_clause = "1 = 1" + source_clause
         params = source_params.copy()
+    elif source_filter == "local" and (is_super or role == "admin"):
+        # 管理员查看本地打印工具订单（openid='local'，不是微信 openid）
+        where_clause = "openid = 'local'"
+        params = []
     elif is_super and target_openid:
         # 超级管理员查看指定用户
         where_clause = "openid = ?" + source_clause
         params = [target_openid] + source_params
     elif role == "admin" and target_openid:
         # 管理员查看指定用户：需验证该用户是否由本管理员授权
-        auth_row = conn.execute(
+        user_conn = get_user_db()
+        auth_row = user_conn.execute(
             "SELECT used_by FROM license_keys WHERE created_by = ? AND used_by = ? LIMIT 1",
             (g.openid, target_openid),
         ).fetchone()
+        user_conn.close()
         if not auth_row:
             conn.close()
             return jsonify({"success": False, "message": "无权查看该用户的订单"}), 403
@@ -2577,13 +2641,40 @@ def local_orders():
 
     conn = get_db()
     try:
-        conn.execute(
-            """INSERT INTO orders (file, copies, status, created_at, openid, order_number,
-                                   total_price, source)
-               VALUES (?, 1, 'sent', ?, 'local', ?, ?, 'local')""",
-            (f"本地打印 {len(files)} 个文件", created_at, order_number, total_price),
-        )
-        order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # 查询是否已存在占位记录（由 /api/next_order_number 创建，或离线同步重复提交）
+        existing = conn.execute(
+            "SELECT id, status FROM orders WHERE order_number = ?", (order_number,)
+        ).fetchone()
+
+        order_file_label = f"本地打印 {len(files)} 个文件"
+
+        if existing:
+            order_id = existing["id"]
+            old_status = existing["status"]
+            # 如果已经是 sent/accepted 等终态 → 幂等跳过
+            if old_status in ("sent", "accepted"):
+                conn.close()
+                return jsonify({"success": True, "message": "订单已存在，跳过同步", "order_id": order_id})
+
+            # 更新占位记录为正式订单（reserved / abandoned → sent）
+            conn.execute(
+                """UPDATE orders SET file = ?, total_price = ?, status = 'sent',
+                                     created_at = ?, source = 'local'
+                   WHERE id = ?""",
+                (order_file_label, total_price, created_at, order_id),
+            )
+            # 清除旧子任务（如果有），重新插入
+            conn.execute("DELETE FROM order_files WHERE order_id = ?", (order_id,))
+        else:
+            # 新插入（离线同步或直接调用场景）
+            conn.execute(
+                """INSERT INTO orders (file, copies, status, created_at, openid, order_number,
+                                       total_price, source)
+                   VALUES (?, 1, 'sent', ?, 'local', ?, ?, 'local')""",
+                (order_file_label, created_at, order_number, total_price),
+            )
+            order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
         for f_info in files:
             conn.execute(
                 """INSERT INTO order_files (order_id, file_name, copies, page_count,
@@ -2608,19 +2699,38 @@ def local_orders():
 @app.route("/api/me", methods=["GET"])
 @login_required
 def get_me():
-    """返回当前用户的 openid、角色、临时授权信息"""
+    """返回当前用户的 openid、角色、临时授权信息（含许可密钥详情）"""
     role = compute_role(g.openid)
     temp_until = None
     has_temp_access = False
+    license_info = None
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_db()
+    conn = get_user_db()
     row = conn.execute(
         "SELECT temp_until FROM users WHERE openid = ?", (g.openid,)
     ).fetchone()
-    conn.close()
     if row and row["temp_until"]:
         temp_until = row["temp_until"]
         has_temp_access = row["temp_until"] > now_str
+    # 如果用户持有有效临时授权，查询关联的许可密钥和创建者信息
+    if has_temp_access:
+        lk_row = conn.execute(
+            """SELECT lk.key, lk.created_by, lk.expires_at,
+                      u.nickname AS creator_nickname
+               FROM license_keys lk
+               LEFT JOIN users u ON lk.created_by = u.openid
+               WHERE lk.used_by = ? AND lk.expires_at > ?
+               ORDER BY lk.id DESC LIMIT 1""",
+            (g.openid, now_str),
+        ).fetchone()
+        if lk_row:
+            license_info = {
+                "key": lk_row["key"],
+                "creator_openid": lk_row["created_by"],
+                "creator_nickname": lk_row["creator_nickname"] or "",
+                "expires_at": lk_row["expires_at"],
+            }
+    conn.close()
     is_super = SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID
     return jsonify({
         "success": True,
@@ -2630,6 +2740,7 @@ def get_me():
         "role": role,
         "temp_until": temp_until,
         "has_temp_access": has_temp_access,
+        "license_info": license_info,
     })
 
 
@@ -2644,30 +2755,53 @@ def authorized_users():
     if role != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
-    conn = get_db()
-    # 查询该管理员创建的所有已使用的密钥（去重用户）
+    conn = get_user_db()
+    # 查询该管理员创建的所有已使用的密钥（去重用户），只查 users.db 中的表
     rows = conn.execute(
-        """SELECT DISTINCT lk.used_by, u.nickname,
-               (SELECT MAX(o.created_at) FROM orders o WHERE o.openid = lk.used_by) AS last_order,
-               (SELECT COUNT(*) FROM orders o WHERE o.openid = lk.used_by) AS order_count
+        """SELECT DISTINCT lk.used_by, u.nickname
            FROM license_keys lk
            LEFT JOIN users u ON lk.used_by = u.openid
-           WHERE lk.created_by = ? AND lk.used_by IS NOT NULL
-           ORDER BY last_order DESC NULLS LAST""",
+           WHERE lk.created_by = ? AND lk.used_by IS NOT NULL""",
         (g.openid,),
     ).fetchall()
     conn.close()
 
+    # 从 orders.db 批量查询每个用户的最近订单和订单数
+    user_openids = [r["used_by"] for r in rows]
+    order_stats = {}
+    if user_openids:
+        orders_conn = get_db()
+        try:
+            # 用 IN 一次查询所有用户的最近订单时间
+            placeholders = ",".join("?" for _ in user_openids)
+            last_rows = orders_conn.execute(
+                f"""SELECT openid, MAX(created_at) AS last_order, COUNT(*) AS order_count
+                    FROM orders
+                    WHERE openid IN ({placeholders})
+                    GROUP BY openid""",
+                user_openids,
+            ).fetchall()
+            for lr in last_rows:
+                order_stats[lr["openid"]] = {
+                    "last_order": lr["last_order"] or "",
+                    "order_count": lr["order_count"] or 0,
+                }
+        finally:
+            orders_conn.close()
+
     users = []
     for r in rows:
         openid = r["used_by"]
+        stats = order_stats.get(openid, {})
         users.append({
             "openid": openid,
             "openid_short": openid[:8] + "..." if openid else "",
             "nickname": r["nickname"] or "",
-            "last_order": r["last_order"] or "",
-            "order_count": r["order_count"] or 0,
+            "last_order": stats.get("last_order", ""),
+            "order_count": stats.get("order_count", 0),
         })
+    # 按最近订单时间降序排列
+    users.sort(key=lambda u: u["last_order"] or "", reverse=True)
 
     return jsonify({"success": True, "users": users, "count": len(users)})
 
@@ -2679,7 +2813,7 @@ def authorized_users():
 @login_required
 def get_profile():
     """获取当前用户的头像和昵称"""
-    conn = get_db()
+    conn = get_user_db()
     row = conn.execute(
         "SELECT nickname, avatar_path FROM users WHERE openid = ?",
         (g.openid,),
@@ -2722,11 +2856,11 @@ def update_profile():
         saved_name = f"{g.openid}{ext}"
         file_path = os.path.join(AVATAR_DIR, saved_name)
         avatar_file.save(file_path)
-        avatar_path = file_path
+        avatar_path = compress_avatar(file_path)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = get_db()
+    conn = get_user_db()
     existing = conn.execute("SELECT openid FROM users WHERE openid = ?", (g.openid,)).fetchone()
 
     if existing:
@@ -2770,7 +2904,7 @@ def get_avatar():
     if not openid:
         return jsonify({"success": False, "message": "缺少 openid"}), 400
 
-    conn = get_db()
+    conn = get_user_db()
     row = conn.execute(
         "SELECT avatar_path FROM users WHERE openid = ?",
         (openid,),
@@ -2816,12 +2950,7 @@ def license_create():
     now = datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = get_db()
-    # 生成新密钥前，作废该管理员所有未使用的旧密钥（直接删除）
-    conn.execute(
-        "DELETE FROM license_keys WHERE created_by = ? AND used_by IS NULL",
-        (g.openid,),
-    )
+    conn = get_user_db()
     # 生成唯一密钥（避免与数据库中未失效的密钥冲突）
     for _ in range(20):
         license_key = ''.join(secrets.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(8))
@@ -2832,14 +2961,10 @@ def license_create():
         if not dup:
             break
 
-    # admin 类型永久有效，temp 类型限时 1-10 分钟
-    if key_type == "admin":
-        validity = 52560000  # 100 年（永久）
-        expires = now + timedelta(minutes=validity)
-    else:
-        validity = int(data.get("validity_minutes", 5))
-        validity = max(1, min(10, validity))
-        expires = now + timedelta(minutes=validity)
+    # admin 和 temp 都使用 1-10 分钟倒计时（admin 被兑换后变永久，temp 兑换后临时授权）
+    validity = int(data.get("validity_minutes", 5))
+    validity = max(1, min(10, validity))
+    expires = now + timedelta(minutes=validity)
     conn.execute(
         """INSERT INTO license_keys (key, created_by, validity_minutes, created_at, expires_at, type)
            VALUES (?, ?, ?, ?, ?, ?)""",
@@ -2876,7 +3001,7 @@ def license_redeem():
     now = datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    conn = get_db()
+    conn = get_user_db()
     # 原子条件 UPDATE：仅当未使用且未过期才生效
     conn.execute(
         """UPDATE license_keys SET used_by = ?, used_at = ?
@@ -2938,96 +3063,142 @@ def license_redeem():
 @app.route("/api/license/active", methods=["GET"])
 @login_required
 def license_active():
-    """查询当前管理员最新未过期的许可密钥及关联用户信息。
-    状态: unused（未兑换）/ used_waiting（已兑换等待提交任务）/ used_done（已提交任务）
+    """查询当前管理员所有未过期的许可密钥（支持同时创建多个密钥）。
+    每个密钥状态: unused（未兑换）/ used_waiting（已兑换等待提交任务）/ used_done（已提交任务）
     """
     if not is_admin(g.openid):
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_db()
-    row = conn.execute(
-        """SELECT id, key, type, used_by, order_id, validity_minutes, created_at, expires_at
-           FROM license_keys
-           WHERE created_by = ? AND expires_at > ?
-           ORDER BY id DESC LIMIT 1""",
-        (g.openid, now_str),
-    ).fetchone()
+    conn = get_user_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, key, type, used_by, order_id, validity_minutes, created_at, expires_at
+               FROM license_keys
+               WHERE created_by = ? AND expires_at > ?
+               ORDER BY id DESC""",
+            (g.openid, now_str),
+        ).fetchall()
 
-    if not row:
+        if not rows:
+            return jsonify({"success": True, "active": False, "keys": []})
+
+        keys = []
+        # 收集所有 used_by 用户，批量查昵称头像（避免 N+1）
+        used_by_set = set()
+        for row in rows:
+            ub = row["used_by"]
+            if ub:
+                used_by_set.add(ub)
+        user_info = {}
+        if used_by_set:
+            for ub in used_by_set:
+                urow = conn.execute(
+                    "SELECT nickname, avatar_path FROM users WHERE openid = ?", (ub,)
+                ).fetchone()
+                if urow:
+                    user_info[ub] = {
+                        "nickname": urow["nickname"] or "微信用户",
+                        "avatar_url": get_avatar_url(ub, urow["avatar_path"] or ""),
+                    }
+                else:
+                    user_info[ub] = {"nickname": "微信用户", "avatar_url": ""}
+
+        # 批量查订单状态（orders.db）
+        all_used = [row["used_by"] for row in rows if row["used_by"]]
+        order_map = {}
+        if all_used:
+            orders_conn = get_db()
+            try:
+                # 查各用户最近订单
+                for ub in set(all_used):
+                    orow = orders_conn.execute(
+                        "SELECT id, status, total_price FROM orders WHERE openid = ? ORDER BY id DESC LIMIT 1",
+                        (ub,),
+                    ).fetchone()
+                    if orow:
+                        order_map[ub] = {
+                            "order_id": orow["id"],
+                            "order_status": orow["status"],
+                            "order_total_price": orow["total_price"] or 0,
+                        }
+            finally:
+                orders_conn.close()
+
+        for row in rows:
+            r = dict(row)
+            used_by = r.get("used_by") or None
+            status = "unused"
+            order_info = {}
+            if used_by:
+                oi = order_map.get(used_by)
+                # 优先用 license_keys.order_id 关联的订单
+                license_oid = r.get("order_id")
+                if license_oid and oi and oi.get("order_id") == license_oid:
+                    order_info = oi
+                    status = "used_done"
+                elif oi:
+                    order_info = oi
+                    status = "used_done"
+                else:
+                    status = "used_waiting"
+
+            ui = user_info.get(used_by, {})
+            keys.append({
+                "key": r["key"],
+                "type": r.get("type") or "temp",
+                "status": status,
+                "expires_at": r["expires_at"],
+                "validity_minutes": r["validity_minutes"],
+                "created_at": r["created_at"],
+                "used_by": used_by,
+                "used_by_nickname": ui.get("nickname", ""),
+                "used_by_avatar_url": ui.get("avatar_url", ""),
+                "order_id": order_info.get("order_id"),
+                "order_status": order_info.get("order_status"),
+                "order_total_price": order_info.get("order_total_price"),
+            })
+
+        return jsonify({"success": True, "active": len(keys) > 0, "keys": keys})
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[ERROR] /api/license/active 查询失败: {e}")
+        return jsonify({"success": False, "message": "服务器内部错误"}), 500
+    finally:
         conn.close()
-        return jsonify({"success": True, "active": False})
-
-    result = {
-        "success": True,
-        "active": True,
-        "key": row["key"],
-        "type": row.get("type", "temp"),
-        "expires_at": row["expires_at"],
-        "validity_minutes": row["validity_minutes"],
-        "created_at": row["created_at"],
-        "used_by": row.get("used_by") or None,
-        "order_id": row.get("order_id") or None,
-    }
-
-    used_by = row.get("used_by")
-    if used_by:
-        # 查询兑换用户的昵称和头像
-        urow = conn.execute(
-            "SELECT nickname, avatar_path FROM users WHERE openid = ?", (used_by,)
-        ).fetchone()
-        if urow:
-            result["used_by_nickname"] = urow.get("nickname") or "微信用户"
-            result["used_by_avatar_url"] = get_avatar_url(used_by, urow.get("avatar_path") or "")
-        else:
-            result["used_by_nickname"] = "微信用户"
-            result["used_by_avatar_url"] = ""
-
-        # 查询该用户是否有订单（优先使用 license_keys.order_id 关联的订单）
-        license_order_id = row.get("order_id")
-        if license_order_id:
-            orow = conn.execute(
-                """SELECT id, status, total_price
-                   FROM orders WHERE id = ?""",
-                (license_order_id,),
-            ).fetchone()
-        else:
-            orow = conn.execute(
-                """SELECT id, status, total_price
-                   FROM orders WHERE openid = ? ORDER BY id DESC LIMIT 1""",
-                (used_by,),
-            ).fetchone()
-        if orow:
-            result["order_id"] = orow["id"]
-            result["order_status"] = orow["status"]
-            result["order_total_price"] = orow.get("total_price", 0)
-            result["status"] = "used_done"
-        else:
-            result["status"] = "used_waiting"
-            result["order_id"] = None
-    else:
-        result["status"] = "unused"
-
-    conn.close()
-    return jsonify(result)
 
 
 @app.route("/api/license/revoke", methods=["POST"])
 @login_required
 def license_revoke():
-    """管理员作废自己当前未使用的许可密钥"""
+    """管理员作废指定的许可密钥（可删除未使用或已使用的密钥，删除已用密钥不影响授权）。
+    body: { "key": "ABCD1234" }
+    不传 key 则删除所有未使用的密钥（兼容旧版）。
+    """
     if not is_admin(g.openid):
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
-    conn = get_db()
-    conn.execute(
-        "DELETE FROM license_keys WHERE created_by = ? AND used_by IS NULL",
-        (g.openid,),
-    )
+    data = request.get_json() or {}
+    target_key = (data.get("key", "") or "").strip().upper()
+
+    conn = get_user_db()
+    if target_key:
+        # 删除指定密钥（只能删除自己创建的，已使用或未使用均可）
+        conn.execute(
+            "DELETE FROM license_keys WHERE key = ? AND created_by = ?",
+            (target_key, g.openid),
+        )
+    else:
+        # 兼容旧版：删除所有未使用的密钥
+        conn.execute(
+            "DELETE FROM license_keys WHERE created_by = ? AND used_by IS NULL",
+            (g.openid,),
+        )
     conn.commit()
     conn.close()
 
-    print(f"管理员 {g.openid[:8]}... 作废了当前许可密钥")
+    print(f"管理员 {g.openid[:8]}... 作废许可密钥: {target_key or '全部未使用'}")
     return jsonify({"success": True})
 
 
@@ -3046,7 +3217,7 @@ def license_finish():
     if len(raw_key) != 8:
         return jsonify({"success": False, "message": "密钥格式不正确"}), 400
 
-    conn = get_db()
+    conn = get_user_db()
     lrow = conn.execute(
         "SELECT id, key, used_by, order_id FROM license_keys WHERE key = ? AND created_by = ?",
         (raw_key, g.openid),
@@ -3056,35 +3227,39 @@ def license_finish():
         conn.close()
         return jsonify({"success": False, "message": "密钥不存在或不属于您"}), 404
 
-    order_id = lrow.get("order_id")
+    order_id = lrow["order_id"]
     price_detail = None
 
     if order_id:
-        # 查询订单价格明细
-        orow = conn.execute(
-            "SELECT id, total_price, is_free FROM orders WHERE id = ?",
-            (order_id,),
-        ).fetchone()
-        if orow:
-            order = dict(orow)
-            of_rows = conn.execute(
-                """SELECT of.id, of.file_name, of.copies, of.page_count, of.duplex,
-                          of.total_price, of.is_free, of.status
-                   FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
+        # 查询订单价格明细（orders / order_files 在 orders.db）
+        orders_conn = get_db()
+        try:
+            orow = orders_conn.execute(
+                "SELECT id, total_price, is_free FROM orders WHERE id = ?",
                 (order_id,),
-            ).fetchall()
-            files = []
-            for of_row in of_rows:
-                f = dict(of_row)
-                f["per_copy_price"] = calculate_price(f["page_count"], f.get("duplex", "on"))
-                f["unit"] = "元/张" if f.get("duplex") == "on" else "元/页"
-                files.append(f)
-            price_detail = {
-                "order_id": order["id"],
-                "is_free": bool(order.get("is_free", 0)),
-                "total_price": sum(f.get("total_price", 0) for f in files),
-                "files": files,
-            }
+            ).fetchone()
+            if orow:
+                order = dict(orow)
+                of_rows = orders_conn.execute(
+                    """SELECT of.id, of.file_name, of.copies, of.page_count, of.duplex,
+                              of.total_price, of.is_free, of.status
+                       FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
+                    (order_id,),
+                ).fetchall()
+                files = []
+                for of_row in of_rows:
+                    f = dict(of_row)
+                    f["per_copy_price"] = calculate_price(f["page_count"], f.get("duplex", "on"))
+                    f["unit"] = "元/张" if f.get("duplex") == "on" else "元/页"
+                    files.append(f)
+                price_detail = {
+                    "order_id": order["id"],
+                    "is_free": bool(order.get("is_free", 0)),
+                    "total_price": sum(f.get("total_price", 0) for f in files),
+                    "files": files,
+                }
+        finally:
+            orders_conn.close()
 
     # 删除该许可密钥（标记为已完成）
     conn.execute(
@@ -3105,7 +3280,7 @@ def license_finish():
 def cleanup_expired_license_keys():
     """清理已过期且未使用的许可密钥（超过 1 小时）"""
     cutoff = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_db()
+    conn = get_user_db()
     conn.execute("DELETE FROM license_keys WHERE used_by IS NULL AND expires_at < ?", (cutoff,))
     conn.commit()
     conn.close()
@@ -3118,10 +3293,13 @@ def admin_users_list():
     if not is_admin(g.openid):
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
-    conn = get_db()
+    conn = get_user_db()
     rows = conn.execute(
         """
         SELECT u.openid, u.nickname, u.avatar_path,
+               (SELECT lk.key FROM license_keys lk
+                WHERE lk.used_by = u.openid
+                ORDER BY lk.used_at DESC LIMIT 1) as license_key,
                (SELECT lk.used_at FROM license_keys lk
                 WHERE lk.used_by = u.openid
                 ORDER BY lk.used_at DESC LIMIT 1) as licensed_at
@@ -3137,6 +3315,7 @@ def admin_users_list():
         entry = dict(row)
         entry["nickname"] = entry.get("nickname") or "微信用户"
         entry["avatar_url"] = get_avatar_url(entry["openid"], entry.get("avatar_path") or "")
+        entry["licence_key"] = entry.get("license_key") or ""
         entry["licensed_at"] = entry.get("licensed_at") or ""
         users.append(entry)
 
@@ -3165,7 +3344,7 @@ def admin_admins_list():
     page_size = max(1, min(100, page_size))
     offset = (page - 1) * page_size
 
-    conn = get_db()
+    conn = get_user_db()
     # 统计总数
     total = conn.execute(
         "SELECT COUNT(*) FROM users WHERE role = 'admin'"
@@ -3217,7 +3396,7 @@ def admin_remove_admin():
         return jsonify({"success": False, "message": "不能移除超级管理员自己"}), 400
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = get_db()
+    conn = get_user_db()
     existing = conn.execute(
         "SELECT role FROM users WHERE openid = ? AND role = 'admin'",
         (target_openid,),
@@ -3453,6 +3632,28 @@ def recover_stale_printing_tasks():
 scheduler = BackgroundScheduler()
 
 
+def cleanup_abandoned_reserved_orders():
+    """将超过 30 分钟仍未提交的 reserved 占位订单标记为 abandoned。
+    场景：用户在本地工具中点击了"复制"（分配了订单号）但从未点击"开始打印"，
+    或者获取订单号后离线了且从未同步成功。"""
+    cutoff = (datetime.now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db()
+    try:
+        cursor = conn.execute(
+            "UPDATE orders SET status = 'abandoned' WHERE status = 'reserved' AND created_at < ?",
+            (cutoff,),
+        )
+        count = cursor.rowcount
+        if count > 0:
+            conn.commit()
+            print(f"[CLEANUP] 已将 {count} 个超时 reserved 订单标记为 abandoned")
+    except Exception as e:
+        conn.rollback()
+        print(f"[CLEANUP] 清理 abandoned 订单失败: {e}")
+    finally:
+        conn.close()
+
+
 # ==================== 日志系统 ====================
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
@@ -3518,8 +3719,9 @@ if __name__ == "__main__":
     scheduler.add_job(cleanup_expired_license_keys, "interval", minutes=10, id="cleanup_licenses")
     scheduler.add_job(cleanup_expired_files, "interval", minutes=10, id="cleanup_files")
     scheduler.add_job(recover_orphaned_printing_tasks, "interval", minutes=2, id="recover_orphans")
+    scheduler.add_job(cleanup_abandoned_reserved_orders, "interval", minutes=5, id="cleanup_reserved")
     scheduler.start()
-    print("定时扫描已启动（任务扫描每 30s，超时检查每 60s，密钥清理每 10min）")
+    print("定时扫描已启动（任务扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
 
     socketio.run(app, host="127.0.0.1", port=5000,
                  debug=True, use_reloader=False,

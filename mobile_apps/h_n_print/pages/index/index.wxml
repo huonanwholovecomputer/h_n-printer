@@ -1,7 +1,7 @@
 <!-- Apple-style Index Page — 提交打印 -->
 <navigation-bar title="提交打印" back="{{false}}" color="black" background="#FFF"></navigation-bar>
 
-<view class="page-root">
+<view class="page-root {{pageSlide}} {{pageExit}}">
   <view
     class="scroller"
     bindtouchstart="onScrollerTouchStart"
@@ -20,13 +20,13 @@
         </view>
 
         <!-- Printer Status -->
-        <view class="status-bar {{printerActive ? 'status-active' : 'status-inactive'}}">
+        <view class="status-bar {{printerActive ? 'status-active' : 'status-inactive'}} {{pageReady ? 'card-entering' : 'card-preload'}}">
           <view class="status-dot"></view>
           <text class="status-text">{{printerActive ? '打印机在线' : '打印机离线'}}</text>
         </view>
 
         <!-- File List Section -->
-        <view class="card file-section">
+        <view class="card file-section {{pageReady ? 'card-entering' : 'card-preload'}}">
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">打印文件</text>
@@ -37,7 +37,7 @@
           <view
             wx:for="{{selectedFiles}}"
             wx:key="index"
-            class="file-card {{item.entering ? 'card-entering' : ''}} {{item.removing ? 'card-exiting' : ''}}"
+            class="file-card {{pageReady && item.entering ? 'card-entering' : ''}} {{item.removing ? 'card-exiting' : ''}}"
           >
             <!-- Header: name + remove -->
             <view class="file-card-top">
@@ -132,7 +132,7 @@
         </view>
 
         <!-- v5: 附加服务参数 -->
-        <view class="card ext-params-card">
+        <view class="card ext-params-card {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.15s">
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">附加服务</text>
@@ -199,7 +199,7 @@
         </view>
 
         <!-- Submit Button -->
-        <view class="submit-area">
+        <view class="submit-area {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.2s">
           <button class="btn-primary" bindtap="onSubmit" hover-class="tap-active" loading="{{submitting}}" disabled="{{submitting}}">
             提交打印任务
           </button>

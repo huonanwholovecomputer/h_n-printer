@@ -1,0 +1,155 @@
+<!--user-orders.wxml — 查看指定用户/来源的订单列表-->
+<navigation-bar title="{{pageTitle}}" back="{{true}}" color="black" background="#FFF"></navigation-bar>
+
+<scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
+  <view class="container">
+
+    <!-- 加载中 -->
+    <view wx:if="{{loading}}" class="status-box">
+      <text class="status-text">加载中...</text>
+    </view>
+
+    <!-- 空状态 -->
+    <view wx:elif="{{orders.length === 0}}" class="empty-state">
+      <view class="empty-illustration">
+        <text class="empty-icon">📋</text>
+      </view>
+      <text class="empty-title">暂无任务</text>
+      <text class="empty-desc">{{sourceFilter === 'local' ? '还没有本地打印任务记录' : '该用户还没有发起过打印任务'}}</text>
+    </view>
+
+    <!-- 订单列表 -->
+    <view wx:else>
+      <!-- 分页控制栏（顶部） -->
+      <view class="pagination-bar pagination-top" wx:if="{{totalPages > 0}}">
+        <view class="page-size-selector" bindtap="onTogglePageSizePicker">
+          <text class="page-size-text">{{perPage}}条/页</text>
+          <text class="page-size-arrow {{showPageSizePicker ? 'arrow-up' : ''}}">▼</text>
+          <!-- 下拉选项 -->
+          <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}" wx:if="{{showPageSizePicker}}">
+            <view wx:for="{{pageOptions}}" wx:key="*this"
+                  class="page-size-option {{perPage === item ? 'option-active' : ''}}"
+                  catchtap="onSelectPageSize" data-size="{{item}}">
+              {{item}} 条/页
+            </view>
+          </view>
+        </view>
+        <view class="page-nav">
+          <view class="page-btn {{currentPage <= 1 ? 'page-btn-disabled' : ''}}"
+                bindtap="onPrevPage" hover-class="tap-active">‹</view>
+          <block wx:for="{{getPageNumbers()}}" wx:key="*this">
+            <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
+            <view wx:else
+                  class="page-num {{currentPage === item ? 'page-num-active' : ''}}"
+                  bindtap="onPageChange" data-page="{{item}}" hover-class="tap-active">{{item}}</view>
+          </block>
+          <view class="page-btn {{currentPage >= totalPages ? 'page-btn-disabled' : ''}}"
+                bindtap="onNextPage" hover-class="tap-active">›</view>
+        </view>
+      </view>
+
+      <!-- 总览信息 -->
+      <view class="orders-summary" wx:if="{{totalOrders > 0}}">
+        <text class="summary-text">共 {{totalOrders}} 个订单，当前第 {{currentPage}}/{{totalPages}} 页</text>
+      </view>
+
+      <!-- 任务卡片列表 -->
+      <view wx:for="{{orders}}" wx:key="id"
+            class="order-card {{expandedOrders[item.id] ? 'order-expanded' : ''}}"
+            bindtap="onOrderTap" data-id="{{item.id}}">
+        <!-- 收缩态：一行摘要 -->
+        <view class="order-card-header">
+          <view class="order-card-main">
+            <text class="order-filename">{{item.order_number || ('#' + item.id)}}</text>
+            <text class="order-status status-{{item.status}}">{{statusMap[item.status] || item.status}}</text>
+          </view>
+          <text class="order-number-label">{{item.file_summary || item.file}}</text>
+          <view wx:if="{{item.isExcel}}" class="order-card-meta">
+            <text class="order-card-stat">📄 不适用</text>
+            <text class="order-card-stat">📋 不适用</text>
+          </view>
+          <view wx:else class="order-card-meta">
+            <text class="order-card-stat">📄 {{item.total_pages || (item.page_count * item.copies)}} 页</text>
+            <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份 · {{item.duplex === 'on' ? '双面' : '单面'}}</text>
+          </view>
+          <view class="order-card-footer">
+            <text class="order-created">{{item.created_at}}</text>
+            <text class="order-arrow {{expandedOrders[item.id] ? 'arrow-up' : ''}}">›</text>
+          </view>
+        </view>
+
+        <!-- 展开态：详细信息 -->
+        <view class="order-card-detail {{expandedOrders[item.id] ? 'detail-expanded' : ''}}">
+          <view class="detail-divider"></view>
+
+          <!-- 打印信息 -->
+          <view class="detail-section">
+            <view class="detail-section-title">打印信息</view>
+            <view class="detail-row">
+              <text class="detail-label">提交时间</text>
+              <text class="detail-value">{{item.created_at}}</text>
+            </view>
+            <view wx:if="{{!item.isExcel}}" class="detail-row">
+              <text class="detail-label">打印模式</text>
+              <text class="detail-value">{{item.duplex === 'on' ? '双面' : '单面'}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">合计页数</text>
+              <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_pages || (item.page_count * item.copies)) + ' 页'}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">合计份数</text>
+              <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_copies || item.copies) + ' 份'}}</text>
+            </view>
+          </view>
+
+          <!-- 文件列表 -->
+          <view wx:if="{{item.files && item.files.length > 0}}" class="detail-section">
+            <view class="detail-section-title">文件列表 ({{item.files.length}})</view>
+            <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row">
+              <view class="detail-file-info">
+                <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
+                <view class="detail-file-tags">
+                  <text wx:if="{{f.file_type}}" class="file-type-tag">{{f.file_type}}</text>
+                  <text wx:if="{{f.sizeDisplay}}" class="file-size-tag">{{f.sizeDisplay}}</text>
+                </view>
+              </view>
+              <view class="detail-file-right">
+                <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
+                <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
+                <text class="file-status-mini status-{{f.status}}">{{statusMap[f.status] || f.status}}</text>
+              </view>
+            </view>
+          </view>
+
+          <!-- 操作按钮 -->
+          <view class="detail-actions">
+            <button wx:if="{{item.status === 'queued' || item.status === 'printing'}}"
+                    class="btn-cancel-sm" catchtap="onDetailCancelOrder" data-id="{{item.id}}">取消任务</button>
+          </view>
+        </view>
+      </view>
+
+      <!-- 底部分页控制栏 -->
+      <view class="pagination-bar pagination-bottom" wx:if="{{totalPages > 1}}">
+        <view class="page-nav">
+          <view class="page-btn {{currentPage <= 1 ? 'page-btn-disabled' : ''}}"
+                bindtap="onPrevPage" hover-class="tap-active">‹</view>
+          <block wx:for="{{getPageNumbers()}}" wx:key="*this">
+            <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
+            <view wx:else
+                  class="page-num {{currentPage === item ? 'page-num-active' : ''}}"
+                  bindtap="onPageChange" data-page="{{item}}" hover-class="tap-active">{{item}}</view>
+          </block>
+          <view class="page-btn {{currentPage >= totalPages ? 'page-btn-disabled' : ''}}"
+                bindtap="onNextPage" hover-class="tap-active">›</view>
+        </view>
+      </view>
+
+      <!-- 最后一页提示 -->
+      <view wx:if="{{currentPage >= totalPages && totalPages > 0}}" class="end-hint">
+        <text class="end-hint-text">-- 没有更多内容啦 --</text>
+      </view>
+    </view>
+  </view>
+</scroll-view>

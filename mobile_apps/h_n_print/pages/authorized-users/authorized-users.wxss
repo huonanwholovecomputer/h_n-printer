@@ -1,0 +1,171 @@
+/** authorized-users.wxss — Apple-style authorized users list **/
+
+/* ── Root & Container ── */
+.scrollarea {
+  height: 100vh;
+  background-color: var(--bg-primary);
+}
+
+.container {
+  padding: 20rpx 32rpx;
+  padding-bottom: calc(60rpx + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+}
+
+/* ── Status / Empty ── */
+.status-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 120rpx 0;
+}
+
+.status-text {
+  font-size: 26rpx;
+  color: var(--text-tertiary);
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 120rpx 0;
+}
+
+.empty-illustration {
+  margin-bottom: 24rpx;
+}
+
+.empty-icon {
+  font-size: 80rpx;
+}
+
+.empty-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 12rpx;
+}
+
+.empty-desc {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  text-align: center;
+  line-height: 1.6;
+  max-width: 480rpx;
+}
+
+/* ── Summary ── */
+.list-summary {
+  margin-bottom: 16rpx;
+}
+
+.summary-text {
+  font-size: 22rpx;
+  color: var(--text-quaternary);
+}
+
+/* ═══════════════ User Cards ═══════════════ */
+
+.user-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.user-card-item {
+  background-color: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 24rpx 28rpx;
+  margin-bottom: 12rpx;
+  display: flex;
+  align-items: center;
+  box-shadow: var(--shadow-sm);
+  transition: transform 0.12s ease;
+}
+
+.user-card-item:active {
+  background-color: var(--gray6);
+}
+
+/* Avatar circle */
+.user-avatar-circle {
+  width: 80rpx;
+  height: 80rpx;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--blue), #40a9ff);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 20rpx;
+  flex-shrink: 0;
+}
+
+.user-avatar-char {
+  font-size: 32rpx;
+  font-weight: 700;
+  color: #fff;
+}
+
+/* Center info */
+.user-card-center {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+
+.user-card-name {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-card-id {
+  font-size: 20rpx;
+  color: var(--text-quaternary);
+  font-family: var(--font-mono);
+}
+
+/* Right stats */
+.user-card-right {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4rpx;
+  margin-left: 16rpx;
+}
+
+.user-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 4rpx;
+}
+
+.user-stat-num {
+  font-size: 28rpx;
+  font-weight: 700;
+  color: var(--blue);
+  font-family: var(--font-mono);
+}
+
+.user-stat-label {
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+}
+
+.user-card-last {
+  font-size: 18rpx;
+  color: var(--text-quaternary);
+  font-family: var(--font-mono);
+}
+
+.role-btn-arrow {
+  font-size: 32rpx;
+  color: var(--text-quaternary);
+  margin-top: 2rpx;
+}

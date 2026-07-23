@@ -8,6 +8,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+venv/
+.venv/
 
 # IDE
 .vscode/
@@ -35,3 +37,39 @@ local_print_tool/Release/
 # 系统文件
 Thumbs.db
 Desktop.ini
+
+# ====== 敏感/隐私文件 ======
+
+# 用户本地配置（含打印机名、token、服务器地址）
+local_print_tool/print_config.json
+local_print_tool/theme_settings.json
+
+# 日志（可能泄漏 token、路径等敏感信息）
+local_print_tool/logs/
+local_print_tool/crash_traceback.txt
+
+# 部署脚本（含服务器 IP）
+更新后端服务.txt
+
+# 代码汇总（含所有源码副本，包括敏感配置）
+代码内容汇总/
+汇总代码文件内容_v2.py
+local_print_tool/汇总代码文件内容_v2.py
+local_print_tool/代码文件内容汇总.txt
+mobile_apps/h_n_print/代码文件内容汇总.txt
+
+# 本地数据库
+*.db
+printer-local.db
+
+# 开发计划（仅本地参考）
+DEVELOPMENT_PLAN.md
+
+# 崩溃报告/调试文件
+crash_traceback.txt
+
+# 微信开发者工具私有配置
+project.private.config.json
+
+# 压缩包备份（含项目完整内容）
+*.7z

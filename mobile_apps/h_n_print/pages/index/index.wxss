@@ -10,6 +10,45 @@
   min-height: 0;
 }
 
+/* 初始隐藏态：防止页面首次渲染时闪烁 */
+.page-init {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* 入场：从左滑入 + 淡入 */
+.page-enter-left {
+  animation: enterLeft 0.28s 0.08s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+@keyframes enterLeft {
+  from { opacity: 0; transform: translateX(-100rpx); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+/* 首次加载淡入 */
+.page-fade-in {
+  animation: fadeIn 0.3s 0.08s ease both;
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+/* 退出动画：左滑淡出 */
+.page-exit-left {
+  animation: exitLeft 0.2s ease-in both;
+}
+@keyframes exitLeft {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(-100rpx); }
+}
+.page-exit-right {
+  animation: exitRight 0.2s ease-in both;
+}
+@keyframes exitRight {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(100rpx); }
+}
+
 .scroller {
   flex: 1;
   overflow: hidden;

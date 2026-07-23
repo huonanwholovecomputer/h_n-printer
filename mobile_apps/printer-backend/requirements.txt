@@ -6,3 +6,4 @@ python-socketio
 pypdf
 gunicorn
 eventlet
+Pillow

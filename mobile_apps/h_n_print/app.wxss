@@ -557,6 +557,16 @@ page {
   to   { transform: scale(1); opacity: 1; }
 }
 
+/* Page preload — invisible until entrance animation kicks in */
+.page-init {
+  opacity: 0;
+}
+
+/* Card preload — invisible until card-entering animation triggers */
+.card-preload {
+  opacity: 0;
+}
+
 /* Smooth fade+slide (list items) */
 @keyframes fadeSlideIn {
   from { opacity: 0; transform: translateY(20rpx); }

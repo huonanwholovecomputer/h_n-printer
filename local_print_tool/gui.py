@@ -64,6 +64,7 @@ from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 from cloud_client import CloudClient, CloudTask
+from offline_sync import OfflineSync
 
 logger = logging.getLogger(__name__)
 
@@ -1349,6 +1350,7 @@ class MainWindow(QMainWindow):
         self._cloud_client: CloudClient | None = None
         self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
         self._cloud_task_window: CloudTaskListWindow | None = None
+        self._offline_sync: OfflineSync | None = None  # 初始化在 _init_cloud_client 之后
 
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
@@ -1394,6 +1396,14 @@ class MainWindow(QMainWindow):
             self._cloud_client.start()
             self._update_cloud_status()
 
+        # 初始化离线同步引擎，启动后台定时同步
+        self._offline_sync = OfflineSync()
+        self._offline_sync.start_background_sync(
+            server_url=self._config.cloud_api_url,
+            token=self._config.cloud_token,
+            interval=60,
+        )
+
     def _on_cloud_settings(self):
         """打开云端连接设置对话框。"""
         dlg = QDialog(self)
@@ -1415,13 +1425,13 @@ class MainWindow(QMainWindow):
         # API 地址
         layout.addWidget(QLabel("API 地址:"))
         api_input = QLineEdit(self._config.cloud_api_url)
-        api_input.setPlaceholderText("https://hn-space.cn")
+        api_input.setPlaceholderText("https://your-server.com")
         layout.addWidget(api_input)
 
         # WebSocket 地址
         layout.addWidget(QLabel("WebSocket 地址:"))
         ws_input = QLineEdit(self._config.cloud_ws_url)
-        ws_input.setPlaceholderText("wss://hn-space.cn")
+        ws_input.setPlaceholderText("wss://your-server.com")
         layout.addWidget(ws_input)
 
         # Token
@@ -3422,12 +3432,130 @@ class MainWindow(QMainWindow):
 
         from datetime import datetime
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        order_number, next_num = generate_order_number(self._config.last_order_number)
-        self._config.last_order_number = next_num
+
+        # 构造文件数据（在线/离线共用）
+        files_data = []
+        total = 0.0
+        for j in flat_jobs:
+            cost = calc_cost(j.page_count, j.copies, j.duplex,
+                self._config.simplex_price, self._config.duplex_price,
+                j.page_range)[0]
+            total += cost
+            files_data.append({
+                "file_name": j.display_name or os.path.basename(j.file_path),
+                "copies": j.copies,
+                "page_count": j.page_count,
+                "cost": round(cost, 2),
+                "duplex": j.duplex,
+                "page_range": j.page_range,
+            })
+        total_price = round(total, 2)
+
+        # 获取订单号并上传：在线直接上报后端，离线暂存本地数据库
+        # 注意：如果标签页已有订单号（用户之前点击了"复制"），则复用该订单号，
+        # 避免重复调用 /api/next_order_number 导致订单号浪费。
+        online = self._cloud_client and self._cloud_client.is_connected()
+        order_number = ""
+        uploaded = False
+        existing_order = ""
+        for j in flat_jobs:
+            if j.order_number:
+                existing_order = j.order_number
+                break
+
+        if existing_order:
+            # 复用已有的订单号（来自之前的"复制"操作）
+            order_number = existing_order
+            self._log(f"📋 复用已有订单号: {order_number}")
+
+            # 在线时直接上传（离线时等待同步）
+            if online and self._cloud_client.api_url and self._cloud_client.token:
+                try:
+                    resp = http_requests.post(
+                        f"{self._cloud_client.api_url}/api/local_orders",
+                        params={"token": self._cloud_client.token},
+                        json={
+                            "order_number": order_number,
+                            "total_price": total_price,
+                            "files": files_data,
+                            "created_at": created_at,
+                        },
+                        timeout=10,
+                    )
+                    if resp.ok and resp.json().get("success"):
+                        self._log(f"📋 订单已上报云端: {order_number} ({len(files_data)} 个文件)")
+                        uploaded = True
+                    else:
+                        self._log(f"⚠️ 订单上报云端失败: {resp.text[:200] if resp.text else '无响应'}")
+                except Exception as e:
+                    self._log(f"⚠️ 订单上报云端失败: {e}")
+        elif online and self._cloud_client.api_url and self._cloud_client.token:
+            # 在线：从后端获取全局唯一订单号（同时后端创建 reserved 占位记录）
+            try:
+                resp = http_requests.get(
+                    f"{self._cloud_client.api_url}/api/next_order_number",
+                    params={"token": self._cloud_client.token},
+                    timeout=5,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    if data.get("success"):
+                        order_number = data.get("order_number", "")
+            except Exception as e:
+                self._log(f"⚠️ 获取云端订单号失败: {e}")
+
+            if not order_number:
+                # 获取订单号失败，回退到本地计数器
+                order_number, next_num = generate_order_number(self._config.last_order_number)
+                self._config.last_order_number = next_num
+
+            # 上传订单信息到后端（将 reserved 占位更新为 sent）
+            try:
+                resp = http_requests.post(
+                    f"{self._cloud_client.api_url}/api/local_orders",
+                    params={"token": self._cloud_client.token},
+                    json={
+                        "order_number": order_number,
+                        "total_price": total_price,
+                        "files": files_data,
+                        "created_at": created_at,
+                    },
+                    timeout=10,
+                )
+                if resp.ok and resp.json().get("success"):
+                    self._log(f"📋 订单已上报云端: {order_number} ({len(files_data)} 个文件)")
+                    uploaded = True
+                else:
+                    self._log(f"⚠️ 订单上报云端失败: {resp.text[:200] if resp.text else '无响应'}")
+            except Exception as e:
+                self._log(f"⚠️ 订单上报云端失败: {e}")
+        else:
+            # 离线：生成本地临时订单号，暂存到本地数据库
+            order_number = OfflineSync.generate_local_order_number()
+            self._log(f"📋 离线模式：已生成本地订单号 {order_number}")
+            if self._offline_sync:
+                try:
+                    self._offline_sync.save_order_offline(
+                        order_number=order_number,
+                        files_data=files_data,
+                        total_price=total_price,
+                        created_at=created_at,
+                    )
+                    self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
+                except Exception as e:
+                    self._log(f"⚠️ 离线缓存失败: {e}")
+
+        # 将订单号写回 jobs（重要：确保封面页等后续流程能读到订单号）
+        for j in flat_jobs:
+            j.order_number = order_number
+
         try:
             self._config.save(self._config_path)
         except Exception as e:
             logger.warning(f"保存配置失败: {e}")
+
+        # 刷新左下角订单号显示（用户可能未点击"复制"直接点击"开始打印"）
+        self._refresh_tab_display()
 
         self._btn_start.setEnabled(False)
         self._progress_bar.setValue(0)
@@ -3771,6 +3899,17 @@ class MainWindow(QMainWindow):
             self._sync_local_orders_to_cloud()
             if self._cloud_client:
                 self._cloud_client.sync_pending_statuses()
+            # 连线后立即同步离线缓存的订单
+            if self._offline_sync and self._cloud_client:
+                try:
+                    count = self._offline_sync.sync_all_pending_orders(
+                        server_url=self._cloud_client.api_url,
+                        token=self._cloud_client.token,
+                    )
+                    if count > 0:
+                        self._log(f"📋 离线订单已同步: {count} 个任务已上报云端")
+                except Exception as e:
+                    self._log(f"⚠️ 离线订单同步失败: {e}")
 
     def _on_cloud_status_message(self, msg: str):
         """云端日志消息 → 写入界面日志。"""
