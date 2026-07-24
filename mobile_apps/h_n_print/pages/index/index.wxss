@@ -483,10 +483,10 @@
 .bolt-canvas {
   position: absolute;
   top: 50%; left: 50%;
-  width: 200rpx;
-  height: 200rpx;
-  margin-left: -100rpx;
-  margin-top: -100rpx;
+  width: 240rpx;
+  height: 240rpx;
+  margin-left: -120rpx;
+  margin-top: -120rpx;
   pointer-events: none;
   background: transparent;
   border: none;
@@ -500,12 +500,17 @@
   z-index: 1;
 }
 
-/* 持续微光 + 浮动（无障碍打印开启期间，优先级低于 striking） */
+/* 浮动动画（无障碍打印开启期间常驻，无光晕） */
 .lightning-burst.active .auto-print-icon {
-  animation: iconIdleGlow 2s ease-in-out infinite, iconFloat 3s ease-in-out infinite;
+  animation: iconFloat 3s ease-in-out infinite;
 }
+/* 闪电爆发瞬间：闪白 + 抖动 */
 .lightning-burst.striking .auto-print-icon {
   animation: iconFlash 0.5s ease-out, iconShake 0.3s 0.02s ease-out;
+}
+/* JS 渐隐完成后强制复位（打断任何残留的 GPU 合成层） */
+.lightning-burst.reset .auto-print-icon {
+  animation: none !important;
 }
 /* 环形冲击波 */
 .lightning-burst::before {
@@ -540,10 +545,6 @@
 @keyframes shockRing {
   0%   { width: 4rpx; height: 4rpx; border-color: rgba(255,230,0,0.8); border-width: 3rpx; }
   100% { width: 90rpx; height: 90rpx; border-color: rgba(255,200,0,0); border-width: 1rpx; }
-}
-@keyframes iconIdleGlow {
-  0%, 100% { text-shadow: 0 0 5rpx rgba(255,200,0,0.45), 0 0 10rpx rgba(255,150,0,0.2); }
-  50%      { text-shadow: 0 0 10rpx rgba(255,220,0,0.7), 0 0 20rpx rgba(255,150,0,0.35); }
 }
 @keyframes iconFloat {
   0%, 100% { transform: translate(-50%, -50%); }

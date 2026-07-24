@@ -206,9 +206,9 @@
         <!-- 无障碍打印开关（仅管理员可见） -->
         <view wx:if="{{userRole === 'admin'}}" class="auto-print-switch-row {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.18s">
           <view class="auto-print-label">
-            <view class="lightning-burst {{autoPrintGlow ? 'striking' : ''}} {{autoPrintEnabled ? 'active' : ''}}">
+            <view class="lightning-burst {{autoPrintGlow ? 'striking' : ''}} {{glowPhase === 'fading' ? 'fading' : ''}} {{glowPhase === 'reset' ? 'reset' : ''}} {{autoPrintEnabled ? 'active' : ''}}">
               <canvas type="2d" id="boltCanvas" class="bolt-canvas"></canvas>
-              <text class="auto-print-icon">⚡</text>
+              <text class="auto-print-icon" style="{{glowStyle}}">⚡</text>
             </view>
             <text class="auto-print-title">无障碍打印</text>
             <text class="auto-print-desc">提交后自动开始打印，无需手动确认</text>
