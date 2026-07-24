@@ -3,6 +3,8 @@ const { CONFIG } = require('../../utils/config')
 
 Component({
   data: {
+    pageSlide: 'page-init',
+    pageExit: '',
     order: null,
     loading: true,
     statusMap: {
@@ -28,6 +30,17 @@ Component({
       } else {
         this.setData({ loading: false })
       }
+    },
+  },
+  pageLifetimes: {
+    show() {
+      const forward = wx.getStorageSync('_navForward')
+      wx.removeStorageSync('_navForward')
+      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
+    },
+    hide() {
+      const forward = wx.getStorageSync('_navForward')
+      this.setData({ pageExit: forward ? 'page-exit-left' : 'page-exit-right' })
     },
   },
   methods: {

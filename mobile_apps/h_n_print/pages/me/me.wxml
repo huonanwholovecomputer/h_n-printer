@@ -22,14 +22,10 @@
         <input class="nickname-input" type="nickname" value="{{nickname}}" bindinput="onNicknameInput" bindblur="onNicknameSave" placeholder="点击输入昵称" />
         <text class="uid">{{isSuperAdmin ? '超级管理员' : (userRole === 'admin' ? '管理员' : (userRole === 'user' ? '普通用户' : '访客'))}}</text>
       </view>
-    </view>
-
-    <!-- 角色入口：普通用户 → 我的统计（管理员/访客不显示） -->
-    <view wx:if="{{userRole === 'user'}}" class="role-actions">
-      <view class="role-btn user-btn" bindtap="onGoMyPerformance" hover-class="tap-active">
-        <text class="role-btn-icon">📈</text>
-        <text class="role-btn-text">我的统计</text>
-        <text class="role-btn-arrow">›</text>
+      <!-- 许可密钥徽章（临时授权或通过密钥升级的管理员） -->
+      <view wx:if="{{licenseInfo}}" class="license-badge {{licenseInfo.type === 'admin' ? 'license-badge-admin' : 'license-badge-temp'}}">
+        <text class="license-badge-key">{{licenseInfo.key}}</text>
+        <text class="license-badge-validity">{{licenseInfo.type === 'admin' ? '永久' : (tempCountdownText || '--')}}</text>
       </view>
     </view>
 
@@ -42,9 +38,9 @@
       <view class="license-card">
         <text class="license-label">有效时间（分钟）</text>
         <view class="stepper license-stepper">
-          <view class="stepper-btn {{licenseMinutes <= 1 ? 'stepper-disabled' : ''}}" bindtap="onLicenseMinutesMinus" hover-class="stepper-hover" hover-stay-time="100">−</view>
+          <view class="stepper-btn {{minusDisabled ? 'stepper-disabled' : ''}}" catchtap="onLicenseMinutesMinus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
           <input class="stepper-input" type="number" value="{{licenseMinutes}}" bindinput="onLicenseMinutesChange" />
-          <view class="stepper-btn" bindtap="onLicenseMinutesPlus" hover-class="stepper-hover" hover-stay-time="100">+</view>
+          <view class="stepper-btn {{plusDisabled ? 'stepper-disabled' : ''}}" catchtap="onLicenseMinutesPlus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
         </view>
         <!-- 超级管理员：许可密钥类型选择 -->
         <view wx:if="{{isSuperAdmin}}" class="key-type-row">
@@ -59,7 +55,7 @@
 
       <!-- 活跃密钥列表（向下延伸排列，支持多个同时存在） -->
       <view wx:for="{{activeKeys}}" wx:key="key"
-            class="key-drawer key-drawer-show {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}} {{item.status !== 'unused' ? 'key-drawer-locked' : ''}}">
+            class="key-drawer key-drawer-show {{item.entering ? 'key-entering' : ''}} {{item.exiting ? 'key-exiting' : ''}} {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}} {{item.status !== 'unused' ? 'key-drawer-locked' : ''}}">
         <!-- 右侧删除按钮（绝对定位，左滑时露出） -->
         <view class="key-delete" catchtap="onRevokeKey" data-idx="{{index}}"
               style="opacity: {{item.deleteOpacity}}">
@@ -70,7 +66,7 @@
         <view class="key-drawer-inner {{item.swipeTransition ? '' : 'no-transition'}}"
               style="transform: translateX({{item.swipeX}}px);"
               bindtouchstart="onKeyTouchStart"
-              catchtouchmove="onKeyTouchMove"
+              bindtouchmove="onKeyTouchMove"
               bindtouchend="onKeyTouchEnd"
               bindtouchcancel="onKeyTouchEnd"
               data-idx="{{index}}">
@@ -98,8 +94,7 @@
             <button wx:elif="{{item.status === 'used_waiting' && item.type === 'admin'}}" class="copy-btn btn-confirm-admin" bindtap="onConfirmAdminKey" data-idx="{{index}}" hover-class="tap-active">确认并关闭</button>
             <!-- used_waiting + temp: 等待任务中 -->
             <button wx:elif="{{item.status === 'used_waiting' && item.type !== 'admin'}}" class="copy-btn btn-waiting" disabled>等待任务中</button>
-            <!-- used_done: 结束打印任务 -->
-            <button wx:elif="{{item.status === 'used_done'}}" class="copy-btn btn-end-task" bindtap="onEndPrintTask" data-idx="{{index}}" hover-class="tap-active">结束打印任务</button>
+            <!-- used_done: 无操作按钮（仅显示已使用状态） -->
           </view>
         </view>
       </view>
@@ -115,8 +110,9 @@
         <text class="redeem-desc">请输入管理员提供的许可密钥以获取打印权限</text>
         <view class="redeem-input-row">
           <input class="redeem-input" type="text" value="{{redeemKey}}" bindinput="onRedeemKeyInput" placeholder="请输入8位密钥" maxlength="8" />
-          <button class="redeem-btn" bindtap="onRedeemKey" loading="{{redeeming}}" disabled="{{redeeming}}" hover-class="tap-active">验证</button>
+          <button class="redeem-paste-btn" bindtap="onPasteKey" hover-class="tap-active">粘贴</button>
         </view>
+        <button class="redeem-btn" bindtap="onRedeemKey" loading="{{redeeming}}" disabled="{{redeeming}}" hover-class="tap-active">验证</button>
       </view>
     </view>
 
@@ -166,15 +162,15 @@
         <text wx:if="{{retentionDays === 0 && retentionHours === 0}}" class="retention-forever-hint">当前为「永不过期」</text>
         <view class="retention-row">
           <view class="retention-stepper">
-            <view class="retention-stepper-btn {{retentionDays <= 0 ? 'stepper-disabled' : ''}}" bindtap="onRetentionDaysMinus" hover-class="stepper-hover">−</view>
+            <view class="retention-stepper-btn {{retentionDays <= 0 ? 'stepper-disabled' : ''}}" catchtap="onRetentionDaysMinus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
             <input class="retention-stepper-input" type="number" value="{{retentionDays}}" bindinput="onRetentionDaysChange" />
-            <view class="retention-stepper-btn" bindtap="onRetentionDaysPlus" hover-class="stepper-hover">+</view>
+            <view class="retention-stepper-btn" catchtap="onRetentionDaysPlus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
           </view>
           <text class="retention-unit">天</text>
           <view class="retention-stepper">
-            <view class="retention-stepper-btn {{retentionHours <= 0 ? 'stepper-disabled' : ''}}" bindtap="onRetentionHoursMinus" hover-class="stepper-hover">−</view>
+            <view class="retention-stepper-btn {{retentionHours <= 0 ? 'stepper-disabled' : ''}}" catchtap="onRetentionHoursMinus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
             <input class="retention-stepper-input" type="number" value="{{retentionHours}}" bindinput="onRetentionHoursChange" />
-            <view class="retention-stepper-btn" bindtap="onRetentionHoursPlus" hover-class="stepper-hover">+</view>
+            <view class="retention-stepper-btn" catchtap="onRetentionHoursPlus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
           </view>
           <text class="retention-unit">小时</text>
         </view>
@@ -233,7 +229,7 @@
       <view wx:if="{{admins.length === 0 && !adminsLoading}}" class="license-card">
         <text class="redeem-desc" style="text-align:center;margin:0;">暂无其他管理员</text>
       </view>
-      <view wx:for="{{admins}}" wx:key="openid" class="admin-card-wrap">
+      <view wx:for="{{admins}}" wx:key="openid" class="admin-card-wrap {{item._exiting ? 'admin-exiting' : ''}}">
         <!-- 右侧删除按钮 -->
         <view class="admin-delete" catchtap="onRemoveAdmin" data-openid="{{item.openid}}"
               style="opacity: {{adminDeleteOpacity[item.openid] || 0}}">
@@ -248,8 +244,7 @@
               bindtouchend="onAdminTouchEnd"
               bindtouchcancel="onAdminTouchEnd"
               data-openid="{{item.openid}}">
-          <image wx:if="{{item.avatar_url}}" class="admin-avatar" src="{{item.avatar_url}}" mode="aspectFill" />
-          <view wx:else class="admin-avatar admin-avatar-placeholder"></view>
+          <image class="admin-avatar" src="{{item.avatar_url || '/images/default-avatar.png'}}" mode="aspectFill" />
           <view class="admin-info">
             <text class="admin-name">{{item.nickname}}</text>
             <text wx:if="{{item.is_super}}" class="admin-badge">超级管理员</text>
@@ -372,6 +367,7 @@
                 <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
                 <text class="file-status-mini status-{{f.status}}">{{statusMap[f.status] || f.status}}</text>
+                <text wx:if="{{f.status === 'rejected' && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
             </view>
           </view>

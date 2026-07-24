@@ -1,4 +1,5 @@
 <!--pages/authorized-users/authorized-users.wxml-->
+<view class="page-root {{pageSlide}} {{pageExit}}">
 <navigation-bar title="历史授权用户" back="{{true}}" color="black" background="#FFF"></navigation-bar>
 
 <scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
@@ -26,7 +27,8 @@
             bindtap="onUserTap" data-openid="{{item.openid}}" data-nickname="{{item.nickname}}"
             hover-class="tap-active">
         <view class="user-avatar-circle">
-          <text class="user-avatar-char">{{item.avatarChar}}</text>
+          <image wx:if="{{item.avatarUrl}}" class="user-avatar-img" src="{{item.avatarUrl}}" mode="aspectFill" />
+          <text wx:else class="user-avatar-char">{{item.avatarChar}}</text>
         </view>
         <view class="user-card-center">
           <text class="user-card-name">{{item.nickname || '未知用户'}}</text>
@@ -44,3 +46,4 @@
     </view>
   </view>
 </scroll-view>
+</view>

@@ -286,6 +286,11 @@ def cleanup_expired_files():
     if deleted_count > 0:
         save_md5_index(md5_index)
         print(f"  [CLEANUP] 已清理 {deleted_count} 个过期文件（cutoff={cutoff_str}）")
+        # 通知所有在线打印机同步清理本地缓存
+        _notify_clients("storage_config_updated", {
+            "retention_days": days,
+            "retention_hours": hours,
+        })
 
 
 # -------- 加载配置（内部默认值 + config.py 覆盖）--------
@@ -712,6 +717,14 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # v6 迁移：无障碍打印标记
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN auto_print INTEGER DEFAULT 0")
+        conn.commit()
+        print("  已添加 orders.auto_print 列")
+    except sqlite3.OperationalError:
+        pass
+
     # v5 迁移：订单文件子任务表（一次提交可包含多个文件，每个文件独立份数/状态）
     conn.execute(
         """
@@ -804,6 +817,14 @@ def init_db():
         conn.execute("ALTER TABLE orders ADD COLUMN source TEXT DEFAULT 'cloud'")
         conn.commit()
         print("  已添加 orders.source 列")
+    except sqlite3.OperationalError:
+        pass
+
+    # v18 迁移：order_files 添加 reject_reason 列（打回原因）
+    try:
+        conn.execute("ALTER TABLE order_files ADD COLUMN reject_reason TEXT DEFAULT ''")
+        conn.commit()
+        print("  已添加 order_files.reject_reason 列")
     except sqlite3.OperationalError:
         pass
 
@@ -975,7 +996,7 @@ def fetch_and_lock_task(client_id):
             # 重新查询完整数据返回（含父订单信息 + 文件 MD5）
             full_task = conn.execute(
                 """SELECT of.*, o.order_number, o.delivery_enabled, o.delivery_location,
-                          o.urgency, o.cover_page, o.cover_page_price,
+                          o.urgency, o.cover_page, o.cover_page_price, o.auto_print,
                           f.md5 as source_md5
                    FROM order_files of
                    LEFT JOIN orders o ON of.order_id = o.id
@@ -1000,7 +1021,7 @@ def process_pending_orders():
     rows = conn.execute(
         """
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
-               of.copies, of.page_range, of.duplex
+               of.copies, of.page_range, of.duplex, o.auto_print
         FROM order_files of
         JOIN orders o ON of.order_id = o.id
         WHERE of.status = 'queued'
@@ -1055,7 +1076,9 @@ def process_pending_orders():
         # 推送给打印机客户端
         active_clients = get_active_clients()
         if active_clients:
-            pushed = push_print_task_to_client(of_id, file_id, file_name, copies, duplex, page_range, active_clients[0])
+            pushed = push_print_task_to_client(of_id, file_id, file_name, copies, duplex,
+                                               page_range, active_clients[0],
+                                               auto_print=bool(row["auto_print"]))
             if pushed:
                 continue
 
@@ -1063,7 +1086,7 @@ def process_pending_orders():
         print(f"  [WAIT] 子任务 #{of_id}: 推送失败，保持排队")
 
 
-def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, page_range, client_id):
+def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, page_range, client_id, auto_print=False):
     """通过 SocketIO 推送子任务 (order_files) 到指定打印机客户端。
     sub_task_id = order_files.id，推送后更新该子任务状态为 printing。
 
@@ -1133,6 +1156,7 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
         "file_url": download_url,
         "file_name": file_name,          # 原始文件名（含扩展名）
         "source_md5": "",               # 由后续代码填充
+        "auto_print": auto_print,       # 无障碍打印：本地工具收到后自动建标签页并开始打印
         "options": {
             "copies": copies,
             "duplex": duplex or "on",
@@ -1322,6 +1346,41 @@ def on_connect(auth=None):
     join_room(client_id)
     print(f"[LINK] 打印机客户端已连接: {client_id}")
 
+    # 打印机上线后，重推之前因离线而未能送达的页数分析请求
+    # 仅推送属于活跃任务的文件（已被取消/打回/放弃的文件不再分析）
+    try:
+        conn = get_db()
+        pending = conn.execute(
+            "SELECT DISTINCT f.id, f.original_name FROM files f"
+            " INNER JOIN order_files of ON f.id = of.file_id"
+            " WHERE f.page_count = 0 AND f.page_count_verified = 0"
+            " AND of.status IN ('queued', 'printing', 'accepted')"
+            " LIMIT 20"
+        ).fetchall()
+        conn.close()
+        pushed = 0
+        for row in pending:
+            fname = row["original_name"] or ""
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in (".doc", ".docx"):
+                if request_page_analysis(row["id"], fname):
+                    pushed += 1
+        if pushed > 0:
+            print(f"  [PAGE] 打印机上线后重推 {pushed} 个待分析文档（仅活跃任务）")
+    except Exception as e:
+        print(f"  [PAGE] 重推待分析文档时出错: {e}")
+
+    # 打印机上线后，同步当前缓存保留策略（离线期间可能已变更）
+    try:
+        cfg = load_retention_config()
+        socketio.emit("storage_config_updated", {
+            "retention_days": cfg.get("days", 7),
+            "retention_hours": cfg.get("hours", 0),
+        }, to=request.sid)
+        print(f"  [CACHE] 已同步保留策略到 {client_id}: {cfg.get('days', 7)}天{cfg.get('hours', 0)}小时")
+    except Exception as e:
+        print(f"  [CACHE] 同步保留策略失败: {e}")
+
 
 @socketio.on("disconnect")
 def on_disconnect(reason=None):
@@ -1478,6 +1537,62 @@ def on_page_count_result(data):
         except Exception as e:
             print(f"  [WARN] 更新 MD5 页数缓存失败: {e}")
     print(f"  [PAGE] ✓ 本地工具回报: {file_id[:8]}... → {page_count} 页 ({orientation})")
+
+    # 验证使用该文件的所有活跃子任务的页码范围是否超出总页数
+    _validate_page_ranges_for_file(file_id, page_count)
+
+
+def _parse_page_range_max(range_str: str) -> int:
+    """解析页码范围字符串（如 '1-5,7,9'），返回最大页码。空字符串或无效返回 0。"""
+    if not range_str or not range_str.strip():
+        return 0
+    max_page = 0
+    for part in range_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                max_page = max(max_page, int(a.strip()), int(b.strip()))
+            except ValueError:
+                pass
+        else:
+            try:
+                max_page = max(max_page, int(part))
+            except ValueError:
+                pass
+    return max_page
+
+
+def _validate_page_ranges_for_file(file_id: str, page_count: int):
+    """检查使用指定文件的所有活跃子任务，若页码范围超出总页数则自动打回。"""
+    conn = get_db()
+    tasks = conn.execute(
+        "SELECT id, order_id, page_range FROM order_files"
+        " WHERE file_id = ? AND status IN ('queued', 'printing')",
+        (file_id,),
+    ).fetchall()
+
+    rejected = 0
+    rejected_order_ids = set()
+    for t in tasks:
+        max_page = _parse_page_range_max(t["page_range"] or "")
+        if max_page > page_count:
+            conn.execute(
+                "UPDATE order_files SET status = 'rejected', reject_reason = ? WHERE id = ?",
+                (f"页码范围超出文件总页数（填写 {max_page} 页，文件共 {page_count} 页）", t["id"]),
+            )
+            rejected += 1
+            rejected_order_ids.add(t["order_id"])
+
+    if rejected > 0:
+        conn.commit()
+        for oid in rejected_order_ids:
+            refresh_order_status(conn, oid)
+        conn.commit()
+        print(f"  [REJECT] 页数验证完成: {file_id[:8]}... → 打回 {rejected} 个子任务（{len(rejected_order_ids)} 个订单），页数 {page_count}")
+    conn.close()
 
 
 @socketio.on("page_range_truncated")
@@ -1659,6 +1774,7 @@ def get_file_page(file_id):
         "success": True,
         "page_count": row["page_count"] or 0,
         "verified": bool(row["page_count_verified"]),
+        "printer_online": len(get_active_clients()) > 0,
     })
 
 
@@ -1908,6 +2024,7 @@ def submit_order():
     cover_page = int(data.get("cover_page", 0) or 0)
     cover_page_price = float(data.get("cover_page_price", 0.15) or 0)
     pickup_address = data.get("pickup_address", "")
+    auto_print = int(data.get("auto_print", 0) or 0)  # 无障碍打印：提交后自动开始打印
 
     # ---- 兼容旧格式：单文件字段转为新格式数组 ----
     if files_input is None:
@@ -1950,15 +2067,16 @@ def submit_order():
                                    page_count, price_per_page, total_price, is_free,
                                    delivery_enabled, delivery_location, delivery_percentage,
                                    urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-                                   order_number, source)
+                                   order_number, source, auto_print)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud')""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
-             1 if user_is_admin else 0,
+             0,  # is_free 恒为 0 — 价格仅用于统计
              delivery_enabled, delivery_location, delivery_percentage,
              urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-             order_number),
+             order_number, 1 if auto_print else 0),
+            # is_free 恒为 0 — 价格仅用于统计，无免费策略
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -2007,18 +2125,27 @@ def submit_order():
             # 读取每文件的双面设置（优先 files 数组中的值，其次顶层 duplex）
             f_duplex = f.get("duplex", duplex) or "on"
 
-            is_free_val = 1 if user_is_admin else 0
+            is_free_val = 0  # 价格仅用于统计，无免费策略
             per_copy_price = calculate_price(page_count, f_duplex)
-            total_price = 0 if user_is_admin else round(per_copy_price * f_copies, 2)
+            total_price = round(per_copy_price * f_copies, 2)  # 始终计算真实价格，is_free 控制是否收费
             # 统一从 queued 开始，由 push_print_task_to_client 原子锁定为 printing
             sub_status = "queued"
+            reject_reason = ""
+
+            # 若页数已确认，立即校验页码范围
+            if page_count_verified and page_count > 0 and f_page_range:
+                max_page = _parse_page_range_max(f_page_range)
+                if max_page > page_count:
+                    sub_status = "rejected"
+                    reject_reason = f"页码范围超出文件总页数（填写 {max_page} 页，文件共 {page_count} 页）"
+                    print(f"  [REJECT] 提交时打回: {f_name} range={f_page_range} 超出 {page_count} 页")
 
             conn.execute(
                 """INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,
-                                            page_range, price_per_page, total_price, is_free, status, created_at, duplex)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                            page_range, price_per_page, total_price, is_free, status, created_at, duplex, reject_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (order_id, f_id or None, f_name, f_copies, page_count,
-                 f_page_range, 0, total_price, is_free_val, sub_status, created_at, f_duplex),
+                 f_page_range, 0, total_price, is_free_val, sub_status, created_at, f_duplex, reject_reason),
             )
             sub_task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             sub_tasks.append({
@@ -2028,6 +2155,7 @@ def submit_order():
                 "page_range": f_page_range,
                 "total_price": total_price, "status": sub_status,
                 "duplex": f_duplex,
+                "reject_reason": reject_reason,
             })
 
         # 汇总父订单 total_price 和 page_count
@@ -2078,7 +2206,8 @@ def submit_order():
                 if st["file_id"]:
                     if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
                                                   st["copies"], st.get("duplex", duplex),
-                                                  st.get("page_range", ""), client_id):
+                                                  st.get("page_range", ""), client_id,
+                                                  auto_print=bool(auto_print)):
                         pushed_count += 1
                     else:
                         # 推送失败 → 降级子任务和父订单
@@ -2156,6 +2285,7 @@ def pull_queued_orders():
         "urgency": task.get("urgency", "低") or "低",
         "cover_page": bool(task.get("cover_page", False)),
         "cover_page_price": float(task.get("cover_page_price", 0.15) or 0.15),
+        "auto_print": bool(task.get("auto_print", False)),
     }
     if task["file_id"]:
         item["download_url"] = make_download_url(task["file_id"])
@@ -2256,6 +2386,7 @@ def get_orders():
         of_rows = conn.execute(
             """SELECT id, file_id, file_name, copies, page_count, page_range,
                       page_range_original, page_range_truncated,
+                      reject_reason,
                       total_price, is_free, status, created_at, duplex
                FROM order_files WHERE order_id = ? ORDER BY id ASC""",
             (oid,),
@@ -2698,15 +2829,18 @@ def get_me():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_user_db()
     row = conn.execute(
-        "SELECT temp_until FROM users WHERE openid = ?", (g.openid,)
+        "SELECT temp_until, role FROM users WHERE openid = ?", (g.openid,)
     ).fetchone()
     if row and row["temp_until"]:
         temp_until = row["temp_until"]
         has_temp_access = row["temp_until"] > now_str
-    # 如果用户持有有效临时授权，查询关联的许可密钥和创建者信息
-    if has_temp_access:
+    # 查询关联的许可密钥：temp 用户或通过许可密钥升级的 admin
+    need_license = has_temp_access or (
+        row and row["role"] == "admin" and not is_admin(g.openid)
+    )
+    if need_license:
         lk_row = conn.execute(
-            """SELECT lk.key, lk.created_by, lk.expires_at,
+            """SELECT lk.key, lk.created_by, lk.expires_at, lk.type,
                       u.nickname AS creator_nickname
                FROM license_keys lk
                LEFT JOIN users u ON lk.created_by = u.openid
@@ -2717,6 +2851,7 @@ def get_me():
         if lk_row:
             license_info = {
                 "key": lk_row["key"],
+                "type": lk_row["type"] or "temp",
                 "creator_openid": lk_row["created_by"],
                 "creator_nickname": lk_row["creator_nickname"] or "",
                 "expires_at": lk_row["expires_at"],
@@ -2749,7 +2884,7 @@ def authorized_users():
     conn = get_user_db()
     # 查询该管理员创建的所有已使用的密钥（去重用户），只查 users.db 中的表
     rows = conn.execute(
-        """SELECT DISTINCT lk.used_by, u.nickname
+        """SELECT DISTINCT lk.used_by, u.nickname, u.avatar_path
            FROM license_keys lk
            LEFT JOIN users u ON lk.used_by = u.openid
            WHERE lk.created_by = ? AND lk.used_by IS NOT NULL""",
@@ -2788,6 +2923,7 @@ def authorized_users():
             "openid": openid,
             "openid_short": openid[:8] + "..." if openid else "",
             "nickname": r["nickname"] or "",
+            "avatar_url": get_avatar_url(openid, r["avatar_path"] or ""),
             "last_order": stats.get("last_order", ""),
             "order_count": stats.get("order_count", 0),
         })
@@ -2924,7 +3060,7 @@ def license_create():
     支持 type 参数: 'temp'（临时许可，默认）或 'admin'（永久管理员权限）。
     admin 类型仅超级管理员可创建。
     """
-    if not is_admin(g.openid):
+    if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
     data = request.get_json() or {}
@@ -3057,7 +3193,7 @@ def license_active():
     """查询当前管理员所有未过期的许可密钥（支持同时创建多个密钥）。
     每个密钥状态: unused（未兑换）/ used_waiting（已兑换等待提交任务）/ used_done（已提交任务）
     """
-    if not is_admin(g.openid):
+    if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3167,7 +3303,7 @@ def license_revoke():
     body: { "key": "ABCD1234" }
     不传 key 则删除所有未使用的密钥（兼容旧版）。
     """
-    if not is_admin(g.openid):
+    if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
     data = request.get_json() or {}
@@ -3199,7 +3335,7 @@ def license_finish():
     """管理员结束打印任务：查询许可证关联的订单价格详情，标记许可证为已完成。
     body: { "key": "ABCD1234" }
     """
-    if not is_admin(g.openid):
+    if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
     data = request.get_json() or {}
@@ -3281,7 +3417,7 @@ def cleanup_expired_license_keys():
 @login_required
 def admin_users_list():
     """管理员查看所有普通用户列表（含头像、昵称、许可时间）"""
-    if not is_admin(g.openid):
+    if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
     conn = get_user_db()
@@ -3426,7 +3562,7 @@ def _format_size(size_bytes):
 @login_required
 def admin_storage():
     """管理员查看/设置服务器缓存文件统计与保留时间"""
-    if not is_admin(g.openid):
+    if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "需要管理员权限"}), 403
 
     # ---- DELETE: 删除全部缓存文件 ----

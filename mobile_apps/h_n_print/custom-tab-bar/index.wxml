@@ -1,5 +1,5 @@
 <!--custom-tab-bar/index.wxml-->
-<view class="tab-bar">
+<view class="tab-bar {{hideBorder ? 'border-hidden' : ''}}">
   <view
     wx:for="{{list}}"
     wx:key="pagePath"

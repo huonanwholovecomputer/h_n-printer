@@ -3,6 +3,8 @@ const { CONFIG } = require('../../utils/config')
 
 Component({
   data: {
+    pageSlide: 'page-init',
+    pageExit: '',
     year: 2026,
     month: 6,
     stats: null,
@@ -29,6 +31,17 @@ Component({
         monthIndex: currentMonth - 1,
       })
       this.loadMyStatistics()
+    },
+  },
+  pageLifetimes: {
+    show() {
+      const forward = wx.getStorageSync('_navForward')
+      wx.removeStorageSync('_navForward')
+      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
+    },
+    hide() {
+      const forward = wx.getStorageSync('_navForward')
+      this.setData({ pageExit: forward ? 'page-exit-left' : 'page-exit-right' })
     },
   },
   methods: {

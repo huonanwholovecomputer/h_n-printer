@@ -18,10 +18,10 @@
 
 /* 入场：从右滑入 + 淡入 */
 .page-enter-right {
-  animation: enterRight 0.28s 0.08s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: enterRight 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
 }
 @keyframes enterRight {
-  from { opacity: 0; transform: translateX(100rpx); }
+  from { opacity: 0; transform: translateX(260rpx); }
   to   { opacity: 1; transform: translateX(0); }
 }
 .page-fade-in {
@@ -34,18 +34,18 @@
 
 /* 退出动画 */
 .page-exit-left {
-  animation: exitLeft 0.2s ease-in both;
+  animation: exitLeft 0.22s ease-in both;
 }
 @keyframes exitLeft {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(-100rpx); }
+  to   { opacity: 0; transform: translateX(-260rpx); }
 }
 .page-exit-right {
-  animation: exitRight 0.2s ease-in both;
+  animation: exitRight 0.22s ease-in both;
 }
 @keyframes exitRight {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(100rpx); }
+  to   { opacity: 0; transform: translateX(260rpx); }
 }
 
 .scroller {
@@ -122,6 +122,43 @@
   font-size: 22rpx;
   color: var(--text-tertiary);
   font-weight: 500;
+}
+
+/* ── 许可密钥徽章（用户卡片右侧）── */
+.license-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10rpx 16rpx;
+  border-radius: var(--radius-sm);
+  gap: 2rpx;
+  flex-shrink: 0;
+  margin-left: 12rpx;
+}
+.license-badge-temp {
+  background: rgba(255, 149, 0, 0.08);
+  border: 1rpx solid rgba(255, 149, 0, 0.25);
+}
+.license-badge-admin {
+  background: rgba(0, 122, 255, 0.08);
+  border: 1rpx solid rgba(0, 122, 255, 0.25);
+}
+.license-badge-key {
+  font-family: var(--font-mono);
+  font-size: 20rpx;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: 2rpx;
+}
+.license-badge-validity {
+  font-size: 18rpx;
+  font-weight: 500;
+}
+.license-badge-temp .license-badge-validity {
+  color: #FF9500;
+}
+.license-badge-admin .license-badge-validity {
+  color: var(--blue);
 }
 
 /* ═══════════════ Section Headers ═══════════════ */
@@ -289,11 +326,22 @@
   margin-top: 14rpx;
 }
 
-/* 入场动画激活时：瞬间到位，由 card-entering 驱动动画 */
-.key-drawer.card-entering {
-  max-height: 500rpx;
-  opacity: 1;
-  margin-top: 14rpx;
+/* 入场动画：向下展开 + 淡入 */
+@keyframes keySlideIn {
+  from { opacity: 0; transform: translateY(-24rpx); max-height: 0; margin-top: 0; }
+  to   { opacity: 1; transform: translateY(0);     max-height: 500rpx; margin-top: 14rpx; }
+}
+.key-entering {
+  animation: keySlideIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+/* 离场动画：上移 + 淡出（收回由 JS 先滑回 0 完成） */
+@keyframes keySlideOut {
+  from { opacity: 1; transform: translateY(0);     max-height: 500rpx; margin-top: 14rpx; }
+  to   { opacity: 0; transform: translateY(-20rpx); max-height: 0;       margin-top: 0; }
+}
+.key-exiting {
+  animation: keySlideOut 0.3s ease-in both;
 }
 
 /* Delete button behind card — dynamically revealed during swipe */
@@ -457,7 +505,8 @@
 .redeem-input-row {
   display: flex;
   align-items: center;
-  gap: 14rpx;
+  gap: 12rpx;
+  margin-bottom: 18rpx;
 }
 
 .redeem-input {
@@ -472,15 +521,36 @@
   text-transform: uppercase;
 }
 
-.redeem-btn {
+/* 粘贴按钮（输入框右侧） */
+.redeem-paste-btn {
   flex-shrink: 0;
+  height: 68rpx;
+  background-color: var(--gray6);
+  color: var(--blue);
+  font-size: 24rpx;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  padding: 0 22rpx;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1rpx solid rgba(0, 122, 255, 0.2);
+}
+.redeem-paste-btn:active {
+  background-color: rgba(0, 122, 255, 0.08);
+}
+
+/* 验证按钮（输入框下方，居中，1/4屏幕宽） */
+.redeem-btn {
+  width: 50%;
   background-color: var(--blue);
   color: #fff;
   font-size: 26rpx;
   font-weight: 600;
   border-radius: var(--radius-md);
-  padding: 18rpx 30rpx;
-  margin: 0;
+  padding: 18rpx 0;
+  margin: 0 auto;
 }
 .redeem-btn:active {
   opacity: 0.85;
@@ -577,9 +647,13 @@
   align-items: center;
   justify-content: center;
   line-height: 1;
+  transition: transform 0.1s ease, background-color 0.1s ease;
 }
 .retention-stepper-btn:active {
   background-color: var(--gray5);
+}
+.retention-stepper-btn.stepper-disabled {
+  color: var(--gray4);
 }
 
 .retention-stepper-input {
@@ -736,6 +810,16 @@
 .admin-card-wrap {
   position: relative;
   margin-bottom: 12rpx;
+}
+
+/* 离场动画：上移 + 淡出（与许可密钥 keySlideOut 一致） */
+@keyframes adminSlideOut {
+  from { opacity: 1; transform: translateY(0);     max-height: 200rpx; margin-bottom: 12rpx; }
+  to   { opacity: 0; transform: translateY(-20rpx); max-height: 0;       margin-bottom: 0; }
+}
+.admin-exiting {
+  animation: adminSlideOut 0.3s ease-in both;
+  overflow: hidden;
 }
 
 .admin-delete {
@@ -1068,7 +1152,19 @@
 .file-status-mini.status-accepted { background-color: #E3F2FD; color: #1565C0; }
 .file-status-mini.status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
 .file-status-mini.status-rejected { background-color: #FFF3E0; color: #E65100; }
+.file-status-mini.status-rejected { background-color: #FFEBEE; color: #C62828; }
 .file-status-mini.status-canceled { background-color: var(--gray6); color: var(--gray); }
+
+/* Reject reason text */
+.file-reject-reason {
+  display: block;
+  font-size: 18rpx;
+  color: var(--red);
+  margin-top: 6rpx;
+  line-height: 1.4;
+  text-align: right;
+  word-break: break-all;
+}
 
 /* Cancel order button */
 .btn-cancel-sm {

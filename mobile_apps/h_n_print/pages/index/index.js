@@ -12,6 +12,8 @@ Component({
     showPageCountWarning: false,   // 页数未验证警告弹窗
     userRole: '',
     submitting: false,
+    autoPrintEnabled: false,   // 无障碍打印开关（仅管理员可见）
+    autoPrintGlow: false,      // ⚡ 闪电发光特效
     logoScale: 1,
     logoPadding: 40,
     scrollTop: 0,
@@ -27,10 +29,18 @@ Component({
     urgencyPrice: 0,
     coverPage: false,
     coverPagePrice: 0.10,  // 与本地打印工具 print_config.json 保持一致
+    coverPriceVisible: false,    // 首页价格标签是否可见（配合入场动画）
+    coverPriceEntering: false,   // 首页价格入场动画
+    coverPriceExiting: false,    // 首页价格退场动画
     pickupAddress: '1号楼202宿舍',
     showDeliveryPicker: false,
     showUrgencyPicker: false,
     lastOrderNumber: '',
+    badgeEntering: false,   // 圆点入场动画（首文件）
+    badgeBouncing: false,   // 圆点弹跳动画（已有文件时新增）
+    badgeExiting: false,    // 圆点退场动画（末文件删除）
+    badgeCount: 0,          // 延迟更新的计数，统一 0.25s 滞后于 selectedFiles.length
+    btnPulse: false,        // 添加按钮脉冲动画（文字变化时）
     pageReady: false,         // 首次打开的入场动效
     pageExit: '',             // 退出动画: page-exit-left / page-exit-right
     pageSlide: 'page-init',   // 入场动画: page-fade-in / page-enter-left（初始隐藏防闪烁）
@@ -53,19 +63,31 @@ Component({
   },
   pageLifetimes: {
     show() {
-      // 重置退出动画残留态 + 入场起始位（仅 tab 切换时有 _tabFrom）
+      // 系统对话框返回 → 跳过入场动画，直接恢复数据刷新
+      if (this._returningFromDialog) {
+        this._returningFromDialog = false
+        this.loadPrinterStatus()
+        this._startPrinterPolling()
+        this._scheduleMeasure()
+        setTimeout(() => this._scheduleMeasure(300), 300)
+        return
+      }
+      // 两步入场动画：先强制重置为隐藏态，下一帧再设入场动画
+      // 避免 pageSlide 与上次 show() 留下的类名相同导致 CSS 不重新触发动画（闪烁）
       const tabFrom = wx.getStorageSync('_tabFrom')
       const isFirstLaunch = (tabFrom == null || tabFrom === '')
-      let animationClass = ''
-      if (isFirstLaunch) {
-        animationClass = 'page-fade-in'
-      } else if (tabFrom === 1) {
-        animationClass = 'page-enter-left'
-      } else {
-        // 其他入口（非 tab 切换）也使用淡入，避免空字符串导致无动画直接显示
-        animationClass = 'page-fade-in'
-      }
-      this.setData({ pageExit: '', pageSlide: animationClass })
+      this.setData({ pageExit: '', pageSlide: 'page-init' })
+      setTimeout(() => {
+        let animationClass = ''
+        if (isFirstLaunch) {
+          animationClass = 'page-fade-in'
+        } else if (tabFrom === 1) {
+          animationClass = 'page-enter-left'
+        } else {
+          animationClass = 'page-fade-in'
+        }
+        this.setData({ pageSlide: animationClass })
+      }, 30)  // 确保 CSS 检测到类名变更
 
       // 首次打开才有元素入场动画
       if (!this._entrancePlayed && isFirstLaunch) {
@@ -112,11 +134,16 @@ Component({
       }
     },
     hide() {
+      // 系统对话框（文件选择器等）触发 hide 时不重置页面，避免白屏闪烁
+      if (this._choosingFile) {
+        this._returningFromDialog = true
+        return
+      }
       if (this._readyTimer) { clearTimeout(this._readyTimer); this._readyTimer = null }
       this._stopPrinterPolling()
-      // 不再重置为隐藏态，否则会覆盖 animateExit() 设置的退出动画类
-      // 退出动画（pageExit）的 animation-fill-mode: both 在动画结束后自然保持隐藏态
-      // 下次 show() 时动画类从 page-exit-* 变为 page-enter-*，CSS 类变更会重新触发 animation
+      // 重置入场动画类为隐藏态，确保下次 show 时框架首帧不可见，避免闪烁
+      // pageExit 控制退出动画，pageSlide 控制入场/静止态，互不冲突
+      this.setData({ pageSlide: 'page-init', pageExit: '' })
     },
   },
   methods: {
@@ -289,6 +316,35 @@ Component({
         this._measureTimer = null
         this._measure()
       }, delay || 100)
+    },
+
+    // 圆点清除计时器（badge 状态已在上层 setData 中同帧设置，这里只负责定时清除）
+    _scheduleBadgeClear(entering) {
+      if (this._badgeTimer) clearTimeout(this._badgeTimer)
+      this._prevFileCount = (this._prevFileCount || 0) + 1
+      this._badgeTimer = setTimeout(() => {
+        this.setData({ badgeEntering: false, badgeBouncing: false })
+      }, entering ? 450 : 400)  // 入场:400ms动画+50ms / 弹跳:350ms动画+50ms (延迟已在外部)
+    },
+
+    // 圆点退场动画（末文件删除时先播动画再移除）
+    _triggerBadgeExit() {
+      if (this._badgeTimer) clearTimeout(this._badgeTimer)
+      this._prevFileCount = 0
+      this.setData({ badgeExiting: true, badgeEntering: false, badgeBouncing: false })
+      this._triggerBtnPulse()  // 1→0: 按钮文字从「添加文件」→「选择打印文件」
+      this._badgeTimer = setTimeout(() => {
+        this.setData({ badgeExiting: false })
+      }, 650)  // 必须撑到卡片 splice 之后（600ms），否则 forwards 填充失效导致闪现
+    },
+
+    // 添加按钮脉冲动画：文字切换时（选择打印文件 ↔ 添加文件）轻微按压回弹
+    _triggerBtnPulse() {
+      if (this._btnPulseTimer) clearTimeout(this._btnPulseTimer)
+      this.setData({ btnPulse: true })
+      this._btnPulseTimer = setTimeout(() => {
+        this.setData({ btnPulse: false })
+      }, 450)  // 动画 0.45s
     },
 
     _schedule(fn) {
@@ -543,20 +599,34 @@ Component({
     // ==================== 多文件操作 ====================
 
     onChooseFile() {
+      this._choosingFile = true
       wx.chooseMessageFile({
         count: 1,
         type: 'all',
+        complete: () => { this._choosingFile = false },
         success: (res) => {
           const file = res.tempFiles[0]
           const name = file.name || ''
           const sizeKB = Number(file.size) || 0
           const fileIndex = this.data.selectedFiles.length
 
-          // 检测是否为 Excel 或图片
+          // 检测文件格式：图片 / 不支持格式（Excel/PPT/压缩包等）
           const ext = name.slice(name.lastIndexOf('.')).toLowerCase()
-          const imageExts = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']
+          const imageExts = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
           const isImage = imageExts.includes(ext)
           const isExcel = ext === '.xls' || ext === '.xlsx'
+
+          // 不支持的文件格式：直接拒绝，不上传
+          const supportedExts = ['.pdf', '.doc', '.docx', '.txt', '.csv', '.md', '.html', '.htm',
+            '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
+          if (!supportedExts.includes(ext) && !isExcel) {
+            wx.showToast({
+              title: `不支持 ${ext} 格式`,
+              icon: 'none',
+              duration: 2000
+            })
+            return  // 拒绝此文件，不添加到列表
+          }
 
           const newFile = {
             name: name,
@@ -574,19 +644,35 @@ Component({
             entering: true,
             removing: false,
             excelWarning: isExcel,
+            unsupportedFormat: false,   // 不支持格式已在选择时拦截，不会到达此处
             isImage: isImage,
             pageCount: 0,
             pageCountStatus: '',  // '' | 'analyzing' | 'confirmed' — 页数分析进度
           }
+          // 圆点动画和计数统一延迟 0.25s，与卡片入场同步
+          const isFirstFile = fileIndex === 0
+          const newCount = fileIndex + 1
           this.setData({
-            ['selectedFiles[' + fileIndex + ']']: newFile
+            ['selectedFiles[' + fileIndex + ']']: newFile,
+            badgeExiting: false
           })
-          // 入场动画 ~380ms 后清除 entering 标记，避免后续列表更新触发重播
+          if (this._badgeCountTimer) clearTimeout(this._badgeCountTimer)
+          this._badgeCountTimer = setTimeout(() => {
+            this.setData({
+              badgeCount: newCount,
+              badgeEntering: isFirstFile,
+              badgeBouncing: !isFirstFile
+            })
+            this._scheduleBadgeClear(isFirstFile)
+          }, 250)
+          if (isFirstFile) this._triggerBtnPulse()
+          // 入场动画延迟 0.25s（等待微信文件选择器关闭）+ 动画 0.5s
           setTimeout(() => {
             this.setData({ ['selectedFiles[' + fileIndex + '].entering']: false })
-          }, 400)
+          }, 800)  // 250ms delay + 500ms animation + 50ms buffer
           this._scheduleMeasure(400)
-          setTimeout(() => this._scheduleMeasure(500), 500)
+          setTimeout(() => this._scheduleMeasure(600), 600)
+          setTimeout(() => this._scheduleMeasure(850), 850)  // 动画完成后刷新滚动边界
           this.startFileUpload(fileIndex, file.path)
         },
         fail: (err) => {
@@ -597,14 +683,33 @@ Component({
 
     onRemoveFile(e) {
       const index = e.currentTarget.dataset.index
-      // 先标记退场动画（opacity + transform transition ~220ms），等动画完成后再移除
       this.stopFileUploadTimer(index)
       this._stopPageCountPoll(index)
+      const isLastFile = this.data.selectedFiles.length === 1
+      const newCount = this.data.selectedFiles.length - 1
+
+      // 最后一个文件 → 圆点先播退场动画
+      if (isLastFile) {
+        this._triggerBadgeExit()
+      } else {
+        // 非末文件：圆点弹跳 + 计数统一延迟 0.25s
+        if (this._badgeCountTimer) clearTimeout(this._badgeCountTimer)
+        this._badgeCountTimer = setTimeout(() => {
+          this.setData({
+            badgeCount: newCount,
+            badgeBouncing: true,
+            badgeExiting: false,
+            badgeEntering: false
+          })
+          this._scheduleBadgeClear(false)
+        }, 250)
+      }
+
+      // 触发 cardRemove 动画（0.55s 单段：淡出+收起），完成后移除
       this.setData({ ['selectedFiles[' + index + '].removing']: true })
       setTimeout(() => {
         const files = this.data.selectedFiles.slice()
         files.splice(index, 1)
-        // 重映射定时器索引
         const remapTimers = (timersObj) => {
           const newTimers = {}
           const oldKeys = Object.keys(timersObj).map(Number)
@@ -616,9 +721,12 @@ Component({
         }
         this._uploadTimers = remapTimers(this._uploadTimers || {})
         this._pollTimers = remapTimers(this._pollTimers || {})
-        this.setData({ selectedFiles: files })
+        this.setData({ selectedFiles: files, badgeCount: files.length })
+        if (!isLastFile) {
+          this._prevFileCount = files.length
+        }
         this._scheduleMeasure()
-      }, 350)  // fileCardExit 动画 300ms + 50ms buffer
+      }, 600)  // cardRemove 动画 0.55s + 50ms buffer
     },
 
     // ==================== 文件上传（每个文件独立进度条）====================
@@ -765,7 +873,7 @@ Component({
 
     // ==================== 页数轮询（等待本地打印工具分析）====================
 
-    _MAX_POLL_ATTEMPTS: 15,   // 15 次 × 2s = 最多等 30 秒
+    _MAX_POLL_ATTEMPTS: 60,   // 在线时 60 次 × 2s = 最多等 120 秒；离线时不计次，持续轮询
 
     _startPageCountPoll(fileIndex, fileId) {
       this._stopPageCountPoll(fileIndex)
@@ -773,12 +881,6 @@ Component({
       let attempts = 0
 
       const poll = () => {
-        if (attempts >= this._MAX_POLL_ATTEMPTS) {
-          this._stopPageCountPoll(fileIndex)
-          console.log('页数轮询超时: fileIndex=' + fileIndex)
-          return
-        }
-        attempts++
         const token = wx.getStorageSync('token') || ''
         wx.request({
           url: CONFIG.BASE_URL + '/api/file_page/' + fileId,
@@ -796,13 +898,40 @@ Component({
                     ['selectedFiles[' + fileIndex + '].pageCount']: pc,
                     ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'confirmed',
                   })
-                  // 页数已知后，对已填写的范围重新做上限校验
                   this._normalizeAndValidateRangeLines(fileIndex)
                 }
                 this._stopPageCountPoll(fileIndex)
                 console.log('页数轮询成功: fileIndex=' + fileIndex + ', pages=' + pc)
+                return
               }
-              // pc === 0 或未验证 → 继续轮询
+              // 页数未验证 → 检查打印机是否在线
+              const printerOnline = res.data.printer_online || false
+              const files = this.data.selectedFiles
+              if (files[fileIndex] && files[fileIndex].fileId === fileId) {
+                const currentStatus = files[fileIndex].pageCountStatus
+                if (!printerOnline) {
+                  // 打印机离线 → 显示黄色警告，不计入轮询次数（等待上线）
+                  if (currentStatus !== 'offline') {
+                    this.setData({
+                      ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'offline',
+                    })
+                  }
+                  // 离线时重置计数器，打印机上线后重新计时
+                  attempts = 0
+                } else {
+                  // 打印机在线 → 显示分析中，正常计数
+                  if (currentStatus !== 'analyzing') {
+                    this.setData({
+                      ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'analyzing',
+                    })
+                  }
+                  attempts++
+                  if (attempts >= this._MAX_POLL_ATTEMPTS) {
+                    this._stopPageCountPoll(fileIndex)
+                    console.log('页数轮询超时: fileIndex=' + fileIndex)
+                  }
+                }
+              }
             }
           },
           fail: () => {
@@ -827,7 +956,7 @@ Component({
 
     onFileCopiesMinus(e) {
       const index = e.currentTarget.dataset.index
-      if (this.data.selectedFiles[index].excelWarning) return
+      if (this.data.selectedFiles[index].excelWarning || this.data.selectedFiles[index].unsupportedFormat) return
       const v = this.data.selectedFiles[index].copies
       if (v > 1) {
         this.setData({ ['selectedFiles[' + index + '].copies']: v - 1 })
@@ -836,7 +965,7 @@ Component({
 
     onFileCopiesPlus(e) {
       const index = e.currentTarget.dataset.index
-      if (this.data.selectedFiles[index].excelWarning) return
+      if (this.data.selectedFiles[index].excelWarning || this.data.selectedFiles[index].unsupportedFormat) return
       const v = this.data.selectedFiles[index].copies
       if (v < 99) {
         this.setData({ ['selectedFiles[' + index + '].copies']: v + 1 })
@@ -845,7 +974,7 @@ Component({
 
     onFileCopiesChange(e) {
       const index = e.currentTarget.dataset.index
-      if (this.data.selectedFiles[index].excelWarning) return
+      if (this.data.selectedFiles[index].excelWarning || this.data.selectedFiles[index].unsupportedFormat) return
       const v = parseInt(e.detail.value, 10)
       this.setData({
         ['selectedFiles[' + index + '].copies']: isNaN(v) || v < 1 ? 1 : v > 99 ? 99 : v
@@ -882,7 +1011,7 @@ Component({
       const lineIndex = e.currentTarget.dataset.lineIndex
       const value = e.detail.value || ''
       const file = this.data.selectedFiles[fileIndex]
-      if (!file || file.excelWarning || file.isImage) return
+      if (!file || file.excelWarning || file.unsupportedFormat || file.isImage) return
 
       this.setData({
         ['selectedFiles[' + fileIndex + '].rangeLines[' + lineIndex + '].value']: value,
@@ -901,7 +1030,7 @@ Component({
     onRangeLineBlur(e) {
       const fileIndex = e.currentTarget.dataset.fileIndex
       const file = this.data.selectedFiles[fileIndex]
-      if (!file || file.excelWarning || file.isImage) return
+      if (!file || file.excelWarning || file.unsupportedFormat || file.isImage) return
       this._normalizeAndValidateRangeLines(fileIndex)
     },
 
@@ -1020,7 +1149,7 @@ Component({
     onFileDuplexChange(e) {
       const index = e.currentTarget.dataset.index
       const value = e.currentTarget.dataset.value
-      if (this.data.selectedFiles[index] && this.data.selectedFiles[index].excelWarning) return
+      if (this.data.selectedFiles[index] && (this.data.selectedFiles[index].excelWarning || this.data.selectedFiles[index].unsupportedFormat)) return
       this.setData({ ['selectedFiles[' + index + '].duplex']: value })
     },
 
@@ -1084,7 +1213,19 @@ Component({
     },
 
     onToggleCoverPage() {
-      this.setData({ coverPage: !this.data.coverPage })
+      const turningOn = !this.data.coverPage
+      this.setData({ coverPage: turningOn })
+      if (turningOn) {
+        // 打开：价格标签从右侧淡入
+        this.setData({ coverPriceVisible: true, coverPriceEntering: true, coverPriceExiting: false })
+        setTimeout(() => this.setData({ coverPriceEntering: false }), 350)
+      } else {
+        // 关闭：价格标签向左淡出，动画结束后移除
+        this.setData({ coverPriceExiting: true, coverPriceEntering: false })
+        setTimeout(() => {
+          this.setData({ coverPriceVisible: false, coverPriceExiting: false })
+        }, 300)
+      }
       // 首页开关影响"首页费"行，内容高度变化 → 刷新滚动边界
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(400), 400)
@@ -1101,6 +1242,93 @@ Component({
     },
 
     // ==================== 提交任务 ====================
+
+    onAutoPrintToggle() {
+      const turningOn = !this.data.autoPrintEnabled
+      this.setData({ autoPrintEnabled: turningOn })
+      if (turningOn) {
+        // ⚡ 闪电发光 + Canvas 绘制折线电流
+        this.setData({ autoPrintGlow: true })
+        setTimeout(() => {
+          this._drawLightningBolts()
+          setTimeout(() => this.setData({ autoPrintGlow: false }), 800)
+        }, 30)
+      }
+    },
+
+    // Canvas 绘制闪电折线（递归中点位移算法 + 随机分支）
+    _drawLightningBolts() {
+      const query = wx.createSelectorQuery()
+      query.select('#boltCanvas').fields({ node: true, size: true }).exec((res) => {
+        if (!res || !res[0] || !res[0].node) return
+        const canvas = res[0].node
+        const dpr = wx.getSystemInfoSync().pixelRatio || 2
+        // 显式设置 canvas 物理像素尺寸，确保坐标系与 CSS 布局对齐
+        canvas.width = res[0].width || 120 * dpr
+        canvas.height = res[0].height || 120 * dpr
+        const ctx = canvas.getContext('2d')
+        ctx.scale(dpr, dpr)
+        // CSS 尺寸（逻辑像素）
+        const w = canvas.width / dpr
+        const h = canvas.height / dpr
+        const cx = w / 2, cy = h / 2
+
+        const draw = (alpha) => {
+          ctx.clearRect(0, 0, w, h)
+          ctx.globalAlpha = alpha
+          const boltCount = 4
+          for (let i = 0; i < boltCount; i++) {
+            const angle = (i / boltCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.4
+            const len = 6 + Math.random() * 5
+            const ex = cx + Math.cos(angle) * len
+            const ey = cy + Math.sin(angle) * len
+            this._paintBolt(ctx, cx, cy, ex, ey, 9, 0)
+          }
+          ctx.globalAlpha = 1
+        }
+
+        draw(1)
+        // 渐隐
+        let step = 0
+        const steps = 10
+        const timer = setInterval(() => {
+          step++
+          if (step > steps) { clearInterval(timer); return }
+          draw(1 - step / steps)
+        }, 70)
+      })
+    },
+
+    // 递归中点位移：每次迭代在两点中点加入随机偏移，depth 越大线越细
+    _paintBolt(ctx, x1, y1, x2, y2, displace, depth) {
+      if (displace < 1.2 || depth > 6) {
+        ctx.beginPath()
+        ctx.moveTo(x1, y1)
+        ctx.lineTo(x2, y2)
+        const colors = ['#fff', '#ffe500', '#ffc000', '#ff9500', '#ff7000']
+        ctx.strokeStyle = colors[Math.min(depth, colors.length - 1)]
+        ctx.lineCap = 'round'
+        ctx.lineWidth = Math.max(0.08, 1.0 - depth * 0.12)
+        ctx.shadowColor = '#ffe500'
+        ctx.shadowBlur = 3 - depth * 0.5
+        ctx.stroke()
+        return
+      }
+      const midX = (x1 + x2) / 2 + (Math.random() - 0.5) * displace * 0.8
+      const midY = (y1 + y2) / 2 + (Math.random() - 0.5) * displace * 0.8
+      this._paintBolt(ctx, x1, y1, midX, midY, displace * 0.5, depth + 1)
+      this._paintBolt(ctx, midX, midY, x2, y2, displace * 0.5, depth + 1)
+      // 随机分支
+      if (Math.random() < 0.25 && depth < 3) {
+        const bx = midX + (Math.random() - 0.5) * displace * 2
+        const by = midY + (Math.random() - 0.5) * displace * 2
+        ctx.save()
+        ctx.shadowColor = '#ff9500'
+        ctx.shadowBlur = 1
+        this._paintBolt(ctx, midX, midY, bx, by, displace * 0.2, depth + 3)
+        ctx.restore()
+      }
+    },
 
     onSubmit() {
       const { selectedFiles } = this.data
@@ -1122,6 +1350,13 @@ Component({
         return
       }
 
+      // 检查是否有可打印的文件（排除 Excel 等不支持格式）
+      const printable = selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat)
+      if (printable.length === 0) {
+        wx.showToast({ title: '所选文件格式不支持打印', icon: 'none', duration: 2000 })
+        return
+      }
+
       // 检查是否有上传失败的文件
       if (selectedFiles.some(f => f.failed || !f.fileId)) {
         wx.showToast({ title: '有文件未上传成功，请重新选择', icon: 'none', duration: 2000 })
@@ -1139,7 +1374,7 @@ Component({
 
       // 检查是否有设置了页码范围但页数未验证的文件
       const unverifiedFiles = selectedFiles.filter(f => {
-        if (f.isImage || f.excelWarning) return false
+        if (f.isImage || f.excelWarning || f.unsupportedFormat) return false
         if (!f.pageRange || !f.pageRange.trim()) return false  // 未设范围=打印全部，无需警告
         return (f.pageCount || 0) <= 0
       })
@@ -1213,6 +1448,7 @@ Component({
           cover_page_price: this.data.coverPagePrice,
           pickup_address: this.data.pickupAddress,
           skip_page_validation: skipPageValidation ? 1 : 0,
+          auto_print: this.data.autoPrintEnabled ? 1 : 0,
         },
         success: (submitRes) => {
           wx.hideLoading()
@@ -1234,6 +1470,11 @@ Component({
             showSuccessModal: true,
             lastOrderNumber: submitRes.data.order_number || '',
           })
+          // 隐藏 tab 栏发丝线，让成功弹窗与 tab 栏融为一体
+          try {
+            const tabBar = this.getTabBar && this.getTabBar()
+            if (tabBar) tabBar.setData({ hideBorder: true })
+          } catch (e) { /* 兼容低版本 */ }
         },
         fail: (err) => {
           wx.hideLoading()
@@ -1391,6 +1632,11 @@ Component({
         showSuccessModal: false,
         selectedFiles: [],
       })
+      // 恢复 tab 栏发丝线
+      try {
+        const tabBar = this.getTabBar && this.getTabBar()
+        if (tabBar) tabBar.setData({ hideBorder: false })
+      } catch (e) { /* 兼容低版本 */ }
       this._stopAllUploadTimers()
       this._stopAllPollTimers()
       this._scheduleMeasure()
