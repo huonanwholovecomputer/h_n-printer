@@ -14,6 +14,8 @@ Component({
     submitting: false,
     autoPrintEnabled: false,   // 无障碍打印开关（仅管理员可见）
     autoPrintGlow: false,      // ⚡ 闪电发光特效
+    glowPhase: '',             // 光晕阶段: ''（无）| 'striking'（爆发）| 'fading'（渐隐）| 'reset'（强制清除）
+    glowStyle: '',             // 内联 text-shadow，JS 逐帧控制渐隐
     logoScale: 1,
     logoPadding: 40,
     scrollTop: 0,
@@ -59,6 +61,7 @@ Component({
       this._destroyScrollEngine()
       this._stopAllUploadTimers()
       this._stopAllPollTimers()
+      this._stopBreathingGlow()
     },
   },
   pageLifetimes: {
@@ -1248,85 +1251,213 @@ Component({
       this.setData({ autoPrintEnabled: turningOn })
       if (turningOn) {
         // ⚡ 闪电发光 + Canvas 绘制折线电流
-        this.setData({ autoPrintGlow: true })
+        // glowPhase 三态：'' | 'striking' | 'fading' | 'reset'（强制清除）
+        this.setData({
+          autoPrintGlow: true, glowPhase: 'striking',
+          glowStyle: 'text-shadow: 0 0 30rpx #fff, 0 0 12rpx #ffe500, 0 0 6rpx #ff9500;',
+        })
         setTimeout(() => {
           this._drawLightningBolts()
-          setTimeout(() => this.setData({ autoPrintGlow: false }), 800)
+          // 350ms 后抖动/闪白结束 → JS 逐帧渐隐（iconShake 0.3s 已结束，shockRing 被隐式截断回到透明）
+          setTimeout(() => {
+            this.setData({ autoPrintGlow: false })
+            this._fadeOutGlow()
+          }, 350)
         }, 30)
+      } else {
+        // 关闭开关时立即清除光晕
+        this._clearGlowCompletely()
+        this._stopBreathingGlow()
       }
     },
 
-    // Canvas 绘制闪电折线（递归中点位移算法 + 随机分支）
+    // JS 逐帧渐隐 text-shadow（保持与初始 glowStyle 相同的颜色/层数结构，仅缩放 alpha+blur）
+    _fadeOutGlow() {
+      this.setData({ glowPhase: 'fading' })
+      // 三组参数与初始 glowStyle 一一对应：
+      //   rgba(255,255,255,?)  ← #fff     blur 30→0
+      //   rgba(255,229,0,?)    ← #ffe500  blur 12→0
+      //   rgba(255,149,0,?)    ← #ff9500  blur  6→0
+      // 三路同步衰减，ease-out 曲线：α=(1-t)², blur=α×初始值
+      const MAX = 8
+      let step = 0
+      const tick = () => {
+        const t = step / MAX        // 0.0 → 1.0
+        if (t >= 1) {
+          this.setData({ glowPhase: 'reset', glowStyle: 'text-shadow: none !important;' })
+          this._clearGlowCanvas()
+          setTimeout(() => {
+            this.setData({ glowPhase: '', glowStyle: '' })
+            // 渐隐完毕且开关仍开 → 启动呼吸发光
+            if (this.data.autoPrintEnabled) {
+              this._startBreathingGlow()
+            }
+          }, 30)
+          return
+        }
+        const a = (1 - t) * (1 - t)  // ease-out：先快后慢
+        const w = Math.round(30 * a)
+        const y = Math.round(12 * a)
+        const o = Math.round(6 * a)
+        this.setData({
+          glowStyle: `text-shadow: 0 0 ${w}rpx rgba(255,255,255,${a.toFixed(3)}), 0 0 ${y}rpx rgba(255,229,0,${a.toFixed(3)}), 0 0 ${o}rpx rgba(255,149,0,${a.toFixed(3)});`,
+        })
+        step++
+        setTimeout(tick, 60)
+      }
+      tick()
+    },
+
+    // 清除 Canvas 电流绘制残留
+    _clearGlowCanvas() {
+      const query = wx.createSelectorQuery()
+      query.select('#boltCanvas').fields({ node: true, size: true }).exec((res) => {
+        if (!res || !res[0] || !res[0].node) return
+        const canvas = res[0].node
+        const ctx = canvas.getContext('2d')
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+      })
+    },
+
+    // 完全清除所有光晕状态
+    _clearGlowCompletely() {
+      this._stopBreathingGlow()
+      this.setData({ glowPhase: '', autoPrintGlow: false, glowStyle: '' })
+      this._clearGlowCanvas()
+    },
+
+    // ── ON 状态呼吸发光 ──
+
+    // 启动呼吸脉冲（ON 状态下常驻，~3s 周期正弦波）
+    _startBreathingGlow() {
+      this._stopBreathingGlow()
+      let frame = 0
+      this._breathTimer = setInterval(() => {
+        frame++
+        const t = (frame % 30) / 30            // 0.0 → 1.0，周期 30 帧 × 100ms = 3s
+        const pulse = 0.5 + 0.5 * Math.sin(t * Math.PI * 2)  // 0.0 → 1.0 正弦
+        const alpha = 0.12 + pulse * 0.58       // 0.12 → 0.70
+        const blur = 3 + pulse * 10             // 3rpx → 13rpx
+        this.setData({
+          glowStyle: `text-shadow: 0 0 ${blur * 0.5}rpx rgba(255,255,255,${(alpha * 0.35).toFixed(3)}), 0 0 ${blur}rpx rgba(255,225,0,${alpha.toFixed(3)}), 0 0 ${blur * 2}rpx rgba(255,180,0,${(alpha * 0.5).toFixed(3)});`,
+        })
+      }, 100)
+    },
+
+    // 停止呼吸脉冲
+    _stopBreathingGlow() {
+      if (this._breathTimer) {
+        clearInterval(this._breathTimer)
+        this._breathTimer = null
+      }
+    },
+
+    // Canvas 绘制闪电（随机方向+多级分支，告别均匀触手）
     _drawLightningBolts() {
       const query = wx.createSelectorQuery()
       query.select('#boltCanvas').fields({ node: true, size: true }).exec((res) => {
         if (!res || !res[0] || !res[0].node) return
         const canvas = res[0].node
         const dpr = wx.getSystemInfoSync().pixelRatio || 2
-        // 显式设置 canvas 物理像素尺寸，确保坐标系与 CSS 布局对齐
-        canvas.width = res[0].width || 120 * dpr
-        canvas.height = res[0].height || 120 * dpr
+        const cssW = res[0].width || 100
+        const cssH = res[0].height || 100
+        canvas.width = cssW * dpr * 2
+        canvas.height = cssH * dpr * 2
         const ctx = canvas.getContext('2d')
-        ctx.scale(dpr, dpr)
-        // CSS 尺寸（逻辑像素）
-        const w = canvas.width / dpr
-        const h = canvas.height / dpr
-        const cx = w / 2, cy = h / 2
+        ctx.scale(dpr * 2, dpr * 2)
+        ctx.imageSmoothingEnabled = true
+
+        const w = cssW, h = cssH, cx = w / 2, cy = h / 2
 
         const draw = (alpha) => {
           ctx.clearRect(0, 0, w, h)
+
+          // 光晕层：径向渐变
+          if (alpha > 0.04) {
+            const grad = ctx.createRadialGradient(cx, cy, 1, cx, cy, w * 0.48)
+            grad.addColorStop(0, `rgba(255,235,50,${(alpha * 0.40).toFixed(3)})`)
+            grad.addColorStop(0.4, `rgba(255,210,0,${(alpha * 0.18).toFixed(3)})`)
+            grad.addColorStop(1, 'rgba(255,180,0,0)')
+            ctx.fillStyle = grad
+            ctx.fillRect(0, 0, w, h)
+          }
+
           ctx.globalAlpha = alpha
-          const boltCount = 4
-          for (let i = 0; i < boltCount; i++) {
-            const angle = (i / boltCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.4
-            const len = 6 + Math.random() * 5
+
+          // 2-3 条主干闪电，随机方向/长度
+          const mainCount = 2 + Math.round(Math.random())
+          for (let i = 0; i < mainCount; i++) {
+            const angle = Math.random() * Math.PI * 2
+            const len = 13 + Math.random() * 10
             const ex = cx + Math.cos(angle) * len
             const ey = cy + Math.sin(angle) * len
-            this._paintBolt(ctx, cx, cy, ex, ey, 9, 0)
+            this._paintFork(ctx, cx, cy, ex, ey, 10, 0, 1.0)
           }
+
+          // 1-2 条次要闪电（更短、更细）
+          const subCount = 1 + Math.round(Math.random())
+          for (let i = 0; i < subCount; i++) {
+            const angle = Math.random() * Math.PI * 2
+            const len = 8 + Math.random() * 7
+            const ex = cx + Math.cos(angle) * len
+            const ey = cy + Math.sin(angle) * len
+            this._paintFork(ctx, cx, cy, ex, ey, 8, 0, 0.7)
+          }
+
           ctx.globalAlpha = 1
         }
 
         draw(1)
-        // 渐隐
         let step = 0
-        const steps = 10
+        const steps = 6
         const timer = setInterval(() => {
           step++
           if (step > steps) { clearInterval(timer); return }
           draw(1 - step / steps)
-        }, 70)
+        }, 80)
       })
     },
 
-    // 递归中点位移：每次迭代在两点中点加入随机偏移，depth 越大线越细
-    _paintBolt(ctx, x1, y1, x2, y2, displace, depth) {
-      if (displace < 1.2 || depth > 6) {
+    // 递归闪电折线（中点位移 + 多级分支，模拟真实放电）
+    // thickness 1.0=主干, <1.0=分支（继承上级粗细缩放）
+    _paintFork(ctx, x1, y1, x2, y2, displace, depth, thickness) {
+      if (displace < 1.5 || depth > 7) {
         ctx.beginPath()
         ctx.moveTo(x1, y1)
         ctx.lineTo(x2, y2)
-        const colors = ['#fff', '#ffe500', '#ffc000', '#ff9500', '#ff7000']
+        // 按深度和厚度调色：主干亮白，分支暖黄
+        const t = thickness * (1 - depth * 0.07)
+        const alpha = Math.max(0.25, t)
+        const colors = [
+          `rgba(255,255,255,${alpha.toFixed(3)})`,
+          `rgba(255,235,50,${(alpha * 0.92).toFixed(3)})`,
+          `rgba(255,200,0,${(alpha * 0.70).toFixed(3)})`,
+          `rgba(255,150,50,${(alpha * 0.48).toFixed(3)})`,
+        ]
         ctx.strokeStyle = colors[Math.min(depth, colors.length - 1)]
         ctx.lineCap = 'round'
-        ctx.lineWidth = Math.max(0.08, 1.0 - depth * 0.12)
-        ctx.shadowColor = '#ffe500'
-        ctx.shadowBlur = 3 - depth * 0.5
+        ctx.lineWidth = Math.max(0.4, thickness * (2.0 - depth * 0.18))
         ctx.stroke()
         return
       }
-      const midX = (x1 + x2) / 2 + (Math.random() - 0.5) * displace * 0.8
-      const midY = (y1 + y2) / 2 + (Math.random() - 0.5) * displace * 0.8
-      this._paintBolt(ctx, x1, y1, midX, midY, displace * 0.5, depth + 1)
-      this._paintBolt(ctx, midX, midY, x2, y2, displace * 0.5, depth + 1)
-      // 随机分支
-      if (Math.random() < 0.25 && depth < 3) {
-        const bx = midX + (Math.random() - 0.5) * displace * 2
-        const by = midY + (Math.random() - 0.5) * displace * 2
-        ctx.save()
-        ctx.shadowColor = '#ff9500'
-        ctx.shadowBlur = 1
-        this._paintBolt(ctx, midX, midY, bx, by, displace * 0.2, depth + 3)
-        ctx.restore()
+      // 中点随机偏移（偏移量×1.2 = 更锯齿、更凌厉）
+      const jitter = displace * 1.2
+      const midX = (x1 + x2) / 2 + (Math.random() - 0.5) * jitter
+      const midY = (y1 + y2) / 2 + (Math.random() - 0.5) * jitter
+      // 递归两段
+      this._paintFork(ctx, x1, y1, midX, midY, displace * 0.55, depth + 1, thickness)
+      this._paintFork(ctx, midX, midY, x2, y2, displace * 0.55, depth + 1, thickness)
+      // 分叉分支（中级深度、较高概率）
+      if (Math.random() < 0.35 && depth < 4 && depth > 0) {
+        const bx = midX + (Math.random() - 0.5) * displace * 2.0
+        const by = midY + (Math.random() - 0.5) * displace * 2.0
+        this._paintFork(ctx, midX, midY, bx, by, displace * 0.3, depth + 2, thickness * 0.55)
+      }
+      // 尖端二次分叉（低级深度、较低概率）
+      if (Math.random() < 0.15 && depth < 3 && depth > 1) {
+        const tx = x2 + (Math.random() - 0.5) * displace * 1.5
+        const ty = y2 + (Math.random() - 0.5) * displace * 1.5
+        this._paintFork(ctx, x2, y2, tx, ty, displace * 0.2, depth + 3, thickness * 0.4)
       }
     },
 
@@ -1639,6 +1770,7 @@ Component({
       } catch (e) { /* 兼容低版本 */ }
       this._stopAllUploadTimers()
       this._stopAllPollTimers()
+      this._stopBreathingGlow()
       this._scheduleMeasure()
     },
 
