@@ -4,6 +4,7 @@
 // pageLifetimes.show / attached 时根据当前路由自动同步，也支持页面通过 getTabBar().setData() 直接更新。
 Component({
   data: {
+    hideBorder: false,
     selected: 0,
     list: [
       {
@@ -62,10 +63,11 @@ Component({
       const target = this.data.list[index]
       if (!target) return
       if (index === this.data.selected) return  // 已在当前 tab
-      // 记录切换方向
-      wx.setStorageSync('_tabFrom', this.data.selected)
+      // 记录切换方向（必须在 setData 前读取旧值）
+      const prevSelected = this.data.selected
+      const direction = prevSelected === 0 ? 'left' : 'right'
+      wx.setStorageSync('_tabFrom', prevSelected)
       wx.setStorageSync('_tabTo', index)
-      // 更新高亮
       const patch = { selected: index }
       this.data.list.forEach((item, i) => {
         if (item.active !== (i === index)) {
@@ -73,9 +75,7 @@ Component({
         }
       })
       this.setData(patch)
-      // 退场动画先播 150ms，再切换（兼顾可见退场 + 缩短间隙）
-      const prevSelected = this.data.selected
-      const direction = prevSelected === 0 ? 'right' : 'left'
+      // 退场动画先播，再切换（animateExit 触发 CSS 动画，240ms 后切换确保动画播完）
       const pages = getCurrentPages()
       const curPage = pages[pages.length - 1]
       if (curPage && typeof curPage.animateExit === 'function') {
@@ -83,7 +83,7 @@ Component({
       }
       setTimeout(() => {
         wx.switchTab({ url: "/" + target.pagePath })
-      }, 200)
+      }, 240)  // 匹配 CSS exitLeft/exitRight 0.22s + 缓冲
     },
   },
 })

@@ -33,6 +33,8 @@ Component({
     },
     // 管理员：许可密钥 & 用户列表
     licenseMinutes: 1,
+    minusDisabled: true,   // 独立字段避免 setData licenseMinutes 时模板重渲染打断 hover
+    plusDisabled: false,
     generating: false,
     // 多密钥支持：所有活跃密钥以数组存储
     activeKeys: [],
@@ -81,18 +83,26 @@ Component({
   },
   pageLifetimes: {
     show() {
-      // tab 切换入场：从右滑入（打印→我），首次加载淡入，其他入口淡入
-      const tabFrom = wx.getStorageSync('_tabFrom')
-      const isFirstLaunch = (tabFrom == null || tabFrom === '')
-      let animationClass = ''
-      if (isFirstLaunch) {
-        animationClass = 'page-fade-in'
-      } else if (tabFrom === 0) {
-        animationClass = 'page-enter-right'
-      } else {
-        animationClass = 'page-fade-in'
-      }
-      this.setData({ pageExit: '', pageSlide: animationClass })
+      // 两步入场动画：先强制重置为隐藏态，下一帧再设入场动画
+      // 避免 pageSlide 与上次 show() 留下的类名相同导致 CSS 不重新触发动画（闪烁）
+      this.setData({ pageExit: '', pageSlide: 'page-init' })
+      setTimeout(() => {
+        const tabFrom = wx.getStorageSync('_tabFrom')
+        const returnFromSub = wx.getStorageSync('_meReturnFromSub')
+        wx.removeStorageSync('_meReturnFromSub')
+        const isFirstLaunch = (tabFrom == null || tabFrom === '')
+        let animationClass = ''
+        if (returnFromSub) {
+          animationClass = 'page-enter-left'          // 从子页面返回：从左滑入
+        } else if (isFirstLaunch) {
+          animationClass = 'page-fade-in'             // 首次加载淡入
+        } else if (tabFrom === 0) {
+          animationClass = 'page-enter-right'         // tab 切换：从右滑入
+        } else {
+          animationClass = 'page-fade-in'
+        }
+        this.setData({ pageSlide: animationClass })
+      }, 30)  // 确保 CSS 检测到类名变更
 
       this.loadUserRole()
       this.loadOrders()
@@ -118,15 +128,30 @@ Component({
     },
     hide() {
       this._stopOrderPolling()
-      // 不再重置为隐藏态，否则会覆盖 animateExit() 设置的退出动画类
-      // 退出动画（pageExit）的 animation-fill-mode: both 在动画结束后自然保持隐藏态
-      // 下次 show() 时动画类从 page-exit-* 变为 page-enter-*，CSS 类变更会重新触发 animation
+      // 重置入场动画类为隐藏态，确保下次 show 时框架首帧不可见，避免闪烁
+      // pageExit 控制退出动画，pageSlide 控制入场/静止态，互不冲突
+      this.setData({ pageSlide: 'page-init', pageExit: '' })
     },
   },
   methods: {
     // 由 tabBar 调用：退出动画 → 回调中切换页面
     animateExit(direction) {
       this.setData({ pageExit: direction === 'left' ? 'page-exit-left' : 'page-exit-right' })
+    },
+
+    // 带退出动画的子页面导航（防连点锁）
+    _navigateWithAnimation(url) {
+      if (this._navigating) return
+      this._navigating = true
+      this.setData({ pageExit: 'page-exit-left' })
+      wx.setStorageSync('_navForward', '1')
+      wx.setStorageSync('_meReturnFromSub', '1')
+      setTimeout(() => {
+        wx.navigateTo({
+          url,
+          complete: () => { this._navigating = false }
+        })
+      }, 280)
     },
 
     // 订单状态轮询（静默增量更新，不触发全量渲染）
@@ -761,18 +786,32 @@ Component({
 
     onLicenseMinutesMinus() {
       const v = this.data.licenseMinutes
-      if (v > 1) { this.setData({ licenseMinutes: v - 1 }) }
+      if (v > 1) {
+        const next = v - 1
+        // 延迟更新避免 setData 重渲染打断 hover 动画
+        setTimeout(() => {
+          this.setData({ licenseMinutes: next, minusDisabled: next <= 1, plusDisabled: next >= 10 })
+        }, 120)
+      }
     },
 
     onLicenseMinutesPlus() {
       const v = this.data.licenseMinutes
-      if (v < 10) { this.setData({ licenseMinutes: v + 1 }) }
+      if (v < 10) {
+        const next = v + 1
+        setTimeout(() => {
+          this.setData({ licenseMinutes: next, minusDisabled: next <= 1, plusDisabled: next >= 10 })
+        }, 120)
+      }
     },
 
     onLicenseMinutesChange(e) {
       const v = parseInt(e.detail.value, 10)
+      const next = isNaN(v) || v < 1 ? 1 : v > 10 ? 10 : v
       this.setData({
-        licenseMinutes: isNaN(v) || v < 1 ? 1 : v > 10 ? 10 : v
+        licenseMinutes: next,
+        minusDisabled: next <= 1,
+        plusDisabled: next >= 10
       })
     },
 
@@ -889,10 +928,10 @@ Component({
           const oldKeySet = oldKeys.map(o => o.key).sort().join(',')
           const newKeySet = newKeys.map(o => o.key).sort().join(',')
           const isFresh = oldKeySet !== newKeySet || !oldKeys.length
+          const newKeyLookup = new Set(newKeys.map(o => o.key))
           // 合并：保留本地状态（swipeX/countdownText 等），更新服务端数据
           const merged = newKeys.map((nk, i) => {
             const old = oldKeys.find(o => o.key === nk.key)
-            const wasNew = isInitial && !old  // 首次加载时的新卡片
             return {
               ...nk,
               expired: old ? old.expired : false,
@@ -900,21 +939,34 @@ Component({
               swipeX: old ? old.swipeX : 0,
               swipeTransition: old ? (old.swipeTransition !== false) : true,
               deleteOpacity: old ? old.deleteOpacity : 0,
-              entering: wasNew || (isInitial && isFresh),  // 首次加载且是新的/首屏
+              entering: !old && !isInitial,  // 非首次加载时的新 key → 播放入场动画
             }
           })
-          if (isFresh) {
-            this.setData({ activeKeys: merged })
-            // 动画完成后清除 entering 标记
-            if (isInitial) {
-              setTimeout(() => {
-                const keys = this.data.activeKeys
-                const updates = {}
-                let changed = false
-                keys.forEach((k, i) => { if (k.entering) { updates['activeKeys[' + i + '].entering'] = false; changed = true } })
-                if (changed) this.setData(updates)
-              }, 800)
-            }
+          // 已过期/被删的 key：保留并标记 exiting，动画结束后移除
+          const removedKeys = oldKeys.filter(o => !newKeyLookup.has(o.key) && !o.exiting)
+          for (const rk of removedKeys) {
+            merged.push({ ...rk, exiting: true })
+          }
+          // 始终更新（状态可能变化），只对新增的卡片播放入场动画
+          this.setData({ activeKeys: merged })
+          // 离场动画完成后真正移除
+          if (removedKeys.length > 0) {
+            setTimeout(() => {
+              const keys = this.data.activeKeys.filter(k => !k.exiting)
+              this.setData({ activeKeys: keys })
+              if (!keys.length) this._stopCountdown()
+            }, 350)
+          }
+          // 动画完成后清除 entering 标记
+          const hasEntering = merged.some(k => k.entering)
+          if (hasEntering) {
+            setTimeout(() => {
+              const keys = this.data.activeKeys
+              const updates = {}
+              let changed = false
+              keys.forEach((k, i) => { if (k.entering) { updates['activeKeys[' + i + '].entering'] = false; changed = true } })
+              if (changed) this.setData(updates)
+            }, 800)
           }
           if (merged.length > 0) {
             this._startCountdown()
@@ -966,7 +1018,7 @@ Component({
       const maxX = -this._deleteWidthPx
       const visualX = this._rubberBand(rawX, maxX, 0, 40)
       this._keySwipeLastX = rawX
-      const opacity = Math.min(1, Math.abs(rawX) / (this._deleteWidthPx * 0.6))
+      const opacity = rawX < 0 ? Math.min(1, Math.abs(rawX) / (this._deleteWidthPx * 0.6)) : 0
       this.setData({
         ['activeKeys[' + idx + '].swipeX']: visualX,
         ['activeKeys[' + idx + '].deleteOpacity']: opacity,
@@ -1017,13 +1069,20 @@ Component({
             success: (res) => {
               if (res.data && res.data.success) {
                 wx.showToast({ title: isUsed ? '已删除' : '已作废', icon: 'success' })
-                // 滑回再移除
-                this.setData({ ['activeKeys[' + idx + '].swipeX']: 0, ['activeKeys[' + idx + '].swipeTransition']: true })
+                // ① 先滑回收起（隐藏红色删除按钮）
+                this.setData({
+                  ['activeKeys[' + idx + '].swipeX']: 0,
+                  ['activeKeys[' + idx + '].swipeTransition']: true,
+                })
+                // ② 收回后再向上淡出
                 setTimeout(() => {
-                  const keys = this.data.activeKeys.filter((_, i) => i !== idx)
-                  this.setData({ activeKeys: keys })
-                  if (!keys.length) this._stopCountdown()
-                }, 250)
+                  this.setData({ ['activeKeys[' + idx + '].exiting']: true })
+                  setTimeout(() => {
+                    const keys = this.data.activeKeys.filter((_, i) => i !== idx)
+                    this.setData({ activeKeys: keys })
+                    if (!keys.length) this._stopCountdown()
+                  }, 350)
+                }, 180)
               } else {
                 wx.showToast({ title: res.data.message || '操作失败', icon: 'none' })
               }
@@ -1070,19 +1129,15 @@ Component({
             const files = d.files || []
             const username = k.used_by_nickname || '用户'
             let text = '【打印任务结算】\n用户: ' + username
-            if (d.is_free) {
-              text += '\n总价: 免费'
-            } else {
-              files.forEach((f, i) => {
-                const unitPrice = (typeof f.per_copy_price === 'number') ? f.per_copy_price : 0
-                const fileTotal = (typeof f.total_price === 'number') ? f.total_price : 0
-                text += '\n文件' + (i + 1) + ': ' + f.file_name
-                text += ' | ' + f.copies + '份 × ' + f.page_count + '页'
-                text += ' | 单价: ¥' + unitPrice.toFixed(2)
-                text += ' | 小计: ¥' + fileTotal.toFixed(2)
-              })
-              text += '\n总价: ¥' + (typeof d.total_price === 'number' ? d.total_price : 0).toFixed(2)
-            }
+            files.forEach((f, i) => {
+              const unitPrice = (typeof f.per_copy_price === 'number') ? f.per_copy_price : 0
+              const fileTotal = (typeof f.total_price === 'number') ? f.total_price : 0
+              text += '\n文件' + (i + 1) + ': ' + f.file_name
+              text += ' | ' + f.copies + '份 × ' + f.page_count + '页'
+              text += ' | 单价: ¥' + unitPrice.toFixed(2)
+              text += ' | 小计: ¥' + fileTotal.toFixed(2)
+            })
+            text += '\n总价: ¥' + (typeof d.total_price === 'number' ? d.total_price : 0).toFixed(2)
             wx.setClipboardData({
               data: text,
               success: () => wx.showToast({ title: '已复制结算详情', icon: 'success' })
@@ -1191,7 +1246,7 @@ Component({
       const swipeX = { ...this.data.adminSwipeX }
       swipeX[openid] = visualX
       const opacity = { ...this.data.adminDeleteOpacity }
-      opacity[openid] = Math.min(1, Math.abs(rawX) / (this._adminDeleteWidthPx * 0.6))
+      opacity[openid] = rawX < 0 ? Math.min(1, Math.abs(rawX) / (this._adminDeleteWidthPx * 0.6)) : 0
       this.setData({ adminSwipeX: swipeX, adminDeleteOpacity: opacity })
     },
 
@@ -1206,9 +1261,9 @@ Component({
         const admin = this.data.admins.find(a => a.openid === openid)
         if (admin) {
           const nickname = encodeURIComponent(admin.nickname || '')
-          wx.navigateTo({
-            url: `/pages/user-orders/user-orders?openid=${openid}&nickname=${nickname}`
-          })
+          this._navigateWithAnimation(
+            `/pages/user-orders/user-orders?openid=${openid}&nickname=${nickname}`
+          )
         }
         return
       }
@@ -1248,7 +1303,24 @@ Component({
             success: (res) => {
               if (res.data && res.data.success) {
                 wx.showToast({ title: '已移除', icon: 'success' })
-                this.loadAdmins()
+                // ① 先滑回收起（隐藏红色删除按钮）
+                const swipeX = { ...this.data.adminSwipeX }
+                swipeX[openid] = 0
+                const trans = { ...this.data.adminSwipeTransition }
+                trans[openid] = true
+                this.setData({ adminSwipeX: swipeX, adminSwipeTransition: trans })
+                // ② 收回后再向上淡出（与许可密钥卡片一致的删除动画）
+                setTimeout(() => {
+                  const admins = this.data.admins.map(a =>
+                    a.openid === openid ? { ...a, _exiting: true } : a
+                  )
+                  this.setData({ admins })
+                  // ③ 动画完成后真正移除
+                  setTimeout(() => {
+                    this.setData({ admins: this.data.admins.filter(a => a.openid !== openid) })
+                    this._scheduleMeasure()
+                  }, 350)
+                }, 180)
               } else {
                 wx.showToast({ title: res.data.message || '移除失败', icon: 'none' })
               }
@@ -1263,12 +1335,12 @@ Component({
 
     // F10: 跳转历史授权用户页面
     onGoAuthorizedUsers() {
-      wx.navigateTo({ url: '/pages/authorized-users/authorized-users' })
+      this._navigateWithAnimation('/pages/authorized-users/authorized-users')
     },
 
     // F12: 跳转本地打印任务列表（通过 source=local 过滤）
     onGoLocalOrders() {
-      wx.navigateTo({ url: '/pages/user-orders/user-orders?source=local' })
+      this._navigateWithAnimation('/pages/user-orders/user-orders?source=local')
     },
 
     loadStorageStats() {
@@ -1396,14 +1468,13 @@ Component({
     // 管理员许可密钥轮询：抽屉打开时每 5 秒刷新状态
     _startKeyPolling() {
       this._stopKeyPolling()
-      this._pollKeyTick = () => {
-        if (!this.data.activeKeys.length) {
-          this._stopKeyPolling()
-          return
-        }
+      this._keyPollTimer = setInterval(() => {
         this.loadActiveKey(false)
-      }
-      this._keyPollTimer = setInterval(this._pollKeyTick, 5000)
+        // 同步刷新管理员列表（头像等）
+        if (this.data.isSuperAdmin) {
+          this._pollAdminsSilent()
+        }
+      }, 5000)
     },
 
     _stopKeyPolling() {
@@ -1411,6 +1482,48 @@ Component({
         clearInterval(this._keyPollTimer)
         this._keyPollTimer = null
       }
+    },
+
+    // 管理员列表静默轮询（仅更新变化字段，不触发全量渲染）
+    _pollAdminsSilent() {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      wx.request({
+        url: CONFIG.BASE_URL + '/api/admin/admins',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        data: { page: 1, page_size: 50 },
+        success: (res) => {
+          if (!res.data || !res.data.success) return
+          const newAdmins = res.data.admins || []
+          const oldAdmins = this.data.admins || []
+          // 数量变化 → 全量刷新
+          if (newAdmins.length !== oldAdmins.length) {
+            this.setData({ admins: newAdmins })
+            this._scheduleMeasure()
+            return
+          }
+          // 逐条对比，仅更新变化的字段（avatar/nickname）
+          const updates = {}
+          let changed = false
+          for (let i = 0; i < newAdmins.length; i++) {
+            const n = newAdmins[i], o = oldAdmins[i]
+            if (!n || !o || n.openid !== o.openid) { changed = true; break }
+            if (n.avatar_url !== o.avatar_url) {
+              updates['admins[' + i + '].avatar_url'] = n.avatar_url
+            }
+            if (n.nickname !== o.nickname) {
+              updates['admins[' + i + '].nickname'] = n.nickname
+            }
+          }
+          if (changed) {
+            this.setData({ admins: newAdmins })
+          } else if (Object.keys(updates).length > 0) {
+            this.setData(updates)
+          }
+        },
+        fail: () => {}
+      })
     },
 
     // 临时授权倒计时（访客兑换 temp 密钥后显示）
@@ -1480,6 +1593,37 @@ Component({
 
     onRedeemKeyInput(e) {
       this.setData({ redeemKey: e.detail.value })
+    },
+
+    // 从剪贴板自动提取密钥
+    onPasteKey() {
+      wx.getClipboardData({
+        success: (res) => {
+          const text = (res.data || '').trim()
+          if (!text) {
+            wx.showToast({ title: '剪贴板为空', icon: 'none', duration: 1500 })
+            return
+          }
+          // 尝试匹配 "密钥: XXXXXXXX" 格式
+          const match = text.match(/密钥[：:]\s*([A-Za-z0-9]{8})/i)
+          if (match) {
+            this.setData({ redeemKey: match[1].toUpperCase() })
+            wx.showToast({ title: '已自动填入', icon: 'success', duration: 1200 })
+          } else {
+            // 回退：查找任意 8 位字母数字串
+            const fallback = text.match(/\b([A-Za-z0-9]{8})\b/)
+            if (fallback) {
+              this.setData({ redeemKey: fallback[1].toUpperCase() })
+              wx.showToast({ title: '已自动填入', icon: 'success', duration: 1200 })
+            } else {
+              wx.showToast({ title: '未识别到密钥', icon: 'none', duration: 1500 })
+            }
+          }
+        },
+        fail: () => {
+          wx.showToast({ title: '无法读取剪贴板', icon: 'none', duration: 1500 })
+        }
+      })
     },
 
     onRedeemKey() {
@@ -1748,9 +1892,7 @@ Component({
     // ==================== 导航 ====================
 
     onGoMyPerformance() {
-      wx.navigateTo({
-        url: '/pages/my-performance/my-performance'
-      })
+      this._navigateWithAnimation('/pages/my-performance/my-performance')
     },
   },
 })

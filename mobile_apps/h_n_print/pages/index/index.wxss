@@ -18,10 +18,10 @@
 
 /* 入场：从左滑入 + 淡入 */
 .page-enter-left {
-  animation: enterLeft 0.28s 0.08s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: enterLeft 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
 }
 @keyframes enterLeft {
-  from { opacity: 0; transform: translateX(-100rpx); }
+  from { opacity: 0; transform: translateX(-260rpx); }
   to   { opacity: 1; transform: translateX(0); }
 }
 /* 首次加载淡入 */
@@ -35,18 +35,18 @@
 
 /* 退出动画：左滑淡出 */
 .page-exit-left {
-  animation: exitLeft 0.2s ease-in both;
+  animation: exitLeft 0.22s ease-in both;
 }
 @keyframes exitLeft {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(-100rpx); }
+  to   { opacity: 0; transform: translateX(-260rpx); }
 }
 .page-exit-right {
-  animation: exitRight 0.2s ease-in both;
+  animation: exitRight 0.22s ease-in both;
 }
 @keyframes exitRight {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(100rpx); }
+  to   { opacity: 0; transform: translateX(260rpx); }
 }
 
 .scroller {
@@ -308,6 +308,10 @@
   border-color: var(--green);
   background: rgba(52, 199, 89, 0.06);
 }
+.page-analysis-bar.offline {
+  border-color: #FF9500;
+  background: rgba(255, 149, 0, 0.06);
+}
 .analysis-dot-pulse {
   width: 14rpx;
   height: 14rpx;
@@ -324,6 +328,12 @@
 .analysis-dot-done {
   font-size: 22rpx;
   color: var(--green);
+  margin-right: 10rpx;
+  flex-shrink: 0;
+}
+.analysis-dot-warn {
+  font-size: 22rpx;
+  color: #FF9500;
   margin-right: 10rpx;
   flex-shrink: 0;
 }
@@ -426,6 +436,15 @@
   transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
               background-color 0.12s ease;
 }
+.add-file-btn.pulsing {
+  animation: btnPulse 0.45s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes btnPulse {
+  0%   { transform: scale(1); }
+  35%  { transform: scale(0.96); }
+  70%  { transform: scale(1.015); }
+  100% { transform: scale(1); }
+}
 .add-file-btn:active {
   transform: scale(0.97);
   background-color: rgba(0, 122, 255, 0.12);
@@ -438,6 +457,108 @@
 }
 
 /* ── Submit ── */
+/* ── 无障碍打印开关（仅管理员可见）── */
+.auto-print-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 20rpx;
+  padding: 20rpx 24rpx;
+  background: rgba(255, 149, 0, 0.06);
+  border: 1rpx solid rgba(255, 149, 0, 0.2);
+  border-radius: var(--radius-md);
+}
+.auto-print-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+/* ── ⚡ 闪电图标 + Canvas 电流射线 ── */
+.lightning-burst {
+  position: relative;
+  display: inline-block;
+  width: 36rpx;
+  height: 36rpx;
+}
+.bolt-canvas {
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 200rpx;
+  height: 200rpx;
+  margin-left: -100rpx;
+  margin-top: -100rpx;
+  pointer-events: none;
+  background: transparent;
+  border: none;
+  outline: none;
+}
+.auto-print-icon {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 28rpx;
+  z-index: 1;
+}
+
+/* 持续微光 + 浮动（无障碍打印开启期间，优先级低于 striking） */
+.lightning-burst.active .auto-print-icon {
+  animation: iconIdleGlow 2s ease-in-out infinite, iconFloat 3s ease-in-out infinite;
+}
+.lightning-burst.striking .auto-print-icon {
+  animation: iconFlash 0.5s ease-out, iconShake 0.3s 0.02s ease-out;
+}
+/* 环形冲击波 */
+.lightning-burst::before {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 0; height: 0;
+  border: 2rpx solid rgba(255, 230, 0, 0);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.lightning-burst.striking::before {
+  animation: shockRing 0.5s 0.02s ease-out forwards;
+}
+
+@keyframes iconFlash {
+  0%   { text-shadow: 0 0 0 #fff; }
+  15%  { text-shadow: 0 0 30rpx #fff, 0 0 12rpx #ffe500; }
+  100% { text-shadow: 0 0 0 #fff; }
+}
+@keyframes iconShake {
+  0%   { margin-left: 0;    margin-top: 0; }
+  10%  { margin-left: 3rpx; margin-top: -2rpx; }
+  20%  { margin-left: -3rpx; margin-top: 1rpx; }
+  30%  { margin-left: 2rpx; margin-top: 2rpx; }
+  40%  { margin-left: -2rpx; margin-top: -1rpx; }
+  50%  { margin-left: 1rpx; margin-top: -1rpx; }
+  70%  { margin-left: -1rpx; margin-top: 1rpx; }
+  100% { margin-left: 0;    margin-top: 0; }
+}
+@keyframes shockRing {
+  0%   { width: 4rpx; height: 4rpx; border-color: rgba(255,230,0,0.8); border-width: 3rpx; }
+  100% { width: 90rpx; height: 90rpx; border-color: rgba(255,200,0,0); border-width: 1rpx; }
+}
+@keyframes iconIdleGlow {
+  0%, 100% { text-shadow: 0 0 5rpx rgba(255,200,0,0.45), 0 0 10rpx rgba(255,150,0,0.2); }
+  50%      { text-shadow: 0 0 10rpx rgba(255,220,0,0.7), 0 0 20rpx rgba(255,150,0,0.35); }
+}
+@keyframes iconFloat {
+  0%, 100% { transform: translate(-50%, -50%); }
+  50%      { transform: translate(-50%, calc(-50% - 4rpx)); }
+}
+.auto-print-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: #FF9500;
+}
+.auto-print-desc {
+  font-size: 22rpx;
+  color: var(--text-secondary);
+}
+
 .submit-area {
   padding: 16rpx 0;
 }
@@ -544,27 +665,96 @@
 }
 .ios-switch.switch-on {
   background: linear-gradient(180deg,
-    rgba(52, 199, 89, 0.85) 0%,
-    rgba(45, 175, 78, 0.92) 100%);
+    rgba(52, 199, 89, 1) 0%,
+    rgba(34, 180, 68, 1) 100%);
   box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.08);
 }
+
+/* 无障碍打印：加大 + 黄色主题 */
+.ios-switch-lg {
+  width: 108rpx;
+  height: 62rpx;
+  border-radius: 31rpx;
+}
+.ios-switch-lg.switch-on {
+  background: linear-gradient(180deg,
+    rgba(255, 149, 0, 0.85) 0%,
+    rgba(230, 120, 0, 0.92) 100%);
+}
+.ios-switch-lg .switch-thumb {
+  top: 3rpx;
+  left: 4rpx;
+  width: 56rpx;
+  height: 56rpx;
+  border-radius: 28rpx;
+}
+.ios-switch.ios-switch-lg.switch-on .switch-thumb {
+  transform: translateX(47rpx) !important;
+}
+
 .switch-thumb {
   position: absolute;
-  top: 4rpx;
-  left: 4rpx;
-  width: 44rpx;
-  height: 44rpx;
-  border-radius: 22rpx;
+  top: 3rpx;
+  left: 3rpx;
+  width: 48rpx;
+  height: 48rpx;
+  border-radius: 24rpx;
   background: linear-gradient(180deg,
     rgba(255, 255, 255, 1) 0%,
     rgba(248, 248, 248, 0.95) 100%);
   box-shadow:
-    0 3rpx 8rpx rgba(0, 0, 0, 0.12),
+    0 4rpx 12rpx rgba(0, 0, 0, 0.18),
+    0 1rpx 3rpx rgba(0, 0, 0, 0.10),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.9);
-  transition: transform 0.28s cubic-bezier(0.34, 1.56, 0.64, 1);
+  transition: transform 0.4s cubic-bezier(0.22, 1.85, 0.48, 1);
 }
 .ios-switch.switch-on .switch-thumb {
-  transform: translateX(36rpx);
+  transform: translateX(35rpx) !important;
+}
+
+.cover-price-tag {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  margin-left: 12rpx;
+  flex-shrink: 0;
+}
+.cover-price-tag.entering {
+  animation: coverPriceIn 0.3s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
+.cover-price-tag.exiting {
+  animation: coverPriceOut 0.25s ease forwards;
+}
+@keyframes coverPriceIn {
+  from { opacity: 0; transform: translateX(-16rpx); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes coverPriceOut {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(-16rpx); }
+}
+
+/* 自取地址折叠动画（与派送地点互斥，关闭派送时展开） */
+.pickup-collapse {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease, opacity 0.25s ease;
+}
+.pickup-collapse.pickup-open {
+  max-height: 200rpx;
+  opacity: 1;
+}
+
+/* 派送选项折叠动画 */
+.delivery-collapse {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease, opacity 0.25s ease;
+}
+.delivery-collapse.delivery-open {
+  max-height: 200rpx;
+  opacity: 1;
 }
 
 /* Picker trigger — glass chip */

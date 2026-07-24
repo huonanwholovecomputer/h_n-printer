@@ -60,6 +60,7 @@ class CloudTask:
         "local_path", "download_progress", "status",
         "error_message", "source_md5",
         "delivery_enabled", "delivery_location", "urgency", "cover_page", "cover_page_price",
+        "auto_print",
     )
 
     def __init__(self, data: dict):
@@ -86,6 +87,7 @@ class CloudTask:
         self.urgency: str = data.get("urgency", "低") or "低"
         self.cover_page: bool = bool(data.get("cover_page", False))
         self.cover_page_price: float = float(data.get("cover_page_price", 0.15) or 0.15)
+        self.auto_print: bool = bool(data.get("auto_print", False))  # 无障碍打印
 
     def to_dict(self) -> dict:
         return {

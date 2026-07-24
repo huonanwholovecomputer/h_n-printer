@@ -21,6 +21,7 @@ class TabSettings:
     cover_page: bool = False
     cover_page_price: float = 0.15
     urgency: str = "低"
+    frozen: bool = False  # 打印后锁定，禁止任何编辑，仅允许删除标签页
 
     def to_dict(self) -> dict:
         return {
@@ -30,6 +31,7 @@ class TabSettings:
             "cover_page": self.cover_page,
             "cover_page_price": self.cover_page_price,
             "urgency": self.urgency,
+            "frozen": self.frozen,
         }
 
     @classmethod
@@ -45,6 +47,7 @@ class TabSettings:
             cover_page=bool(data.get("cover_page", False)),
             cover_page_price=float(data.get("cover_page_price", 0.15)),
             urgency=data.get("urgency", "低"),
+            frozen=bool(data.get("frozen", False)),
         )
 
     def calc_extra_total(self, base_total: float, config: "PrinterConfig") -> float:

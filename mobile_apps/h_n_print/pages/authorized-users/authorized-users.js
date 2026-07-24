@@ -4,8 +4,22 @@ const { CONFIG } = require('../../utils/config')
 
 Component({
   data: {
+    pageSlide: 'page-init',
+    pageExit: '',
     users: [],
     loading: true,
+  },
+
+  pageLifetimes: {
+    show() {
+      const forward = wx.getStorageSync('_navForward')
+      wx.removeStorageSync('_navForward')
+      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
+    },
+    hide() {
+      const forward = wx.getStorageSync('_navForward')
+      this.setData({ pageExit: forward ? 'page-exit-left' : 'page-exit-right' })
+    },
   },
 
   lifetimes: {
@@ -15,6 +29,12 @@ Component({
   },
 
   methods: {
+    _navigateWithAnimation(url) {
+      wx.setStorageSync('_navForward', '1')
+      this.setData({ pageExit: 'page-exit-left' })
+      setTimeout(() => { wx.navigateTo({ url }) }, 280)
+    },
+
     loadUsers() {
       const token = wx.getStorageSync('token')
       if (!token) {
@@ -31,6 +51,8 @@ Component({
             const users = (res.data.users || []).map(u => ({
               ...u,
               avatarChar: (u.nickname || '?')[0],
+              // 头像 URL 加时间戳防缓存，确保每次打开显示最新头像
+              avatarUrl: u.avatar_url ? u.avatar_url + '?t=' + Date.now() : '',
             }))
             this.setData({ users })
           } else {
@@ -49,9 +71,9 @@ Component({
     onUserTap(e) {
       const openid = e.currentTarget.dataset.openid
       const nickname = e.currentTarget.dataset.nickname || ''
-      wx.navigateTo({
-        url: `/pages/user-orders/user-orders?openid=${openid}&nickname=${encodeURIComponent(nickname)}`
-      })
+      this._navigateWithAnimation(
+        `/pages/user-orders/user-orders?openid=${openid}&nickname=${encodeURIComponent(nickname)}`
+      )
     },
   },
 })

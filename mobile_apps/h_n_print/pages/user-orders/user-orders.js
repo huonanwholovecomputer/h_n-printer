@@ -10,6 +10,8 @@ Component({
   },
 
   data: {
+    pageSlide: 'page-init',
+    pageExit: '',
     // 页面标题和过滤参数
     pageTitle: '订单列表',
     viewOpenid: '',       // 查看指定用户的 openid（为空则只看 source）
@@ -70,10 +72,16 @@ Component({
   },
   pageLifetimes: {
     show() {
-      // 返回页面时刷新（切换 tab 后返回等场景）
+      const forward = wx.getStorageSync('_navForward')
+      wx.removeStorageSync('_navForward')
+      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
       if (this._hasLoaded) {
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
       }
+    },
+    hide() {
+      const forward = wx.getStorageSync('_navForward')
+      this.setData({ pageExit: forward ? 'page-exit-left' : 'page-exit-right' })
     },
   },
 

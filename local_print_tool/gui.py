@@ -1362,6 +1362,9 @@ class MainWindow(QMainWindow):
         self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
         self._cloud_task_window: CloudTaskListWindow | None = None
         self._offline_sync: OfflineSync | None = None  # 初始化在 _init_cloud_client 之后
+        # 无障碍打印：按订单收集自动任务，防抖后批量创建标签页并自动开始打印
+        self._auto_print_queue: dict[int, list[CloudTask]] = {}  # order_id → tasks
+        self._auto_print_timers: dict[int, QTimer] = {}          # order_id → debounce timer
 
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
@@ -2131,9 +2134,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_tab_display(self):
         """刷新标签页数字显示和按钮状态。"""
-        self._tab_label.setText(self._current_tab)
+        tab = self._config.tabs.get(self._current_tab)
+        is_frozen = tab.frozen if tab else False
+
+        # 锁定状态下标签显示为 🔒N
+        if is_frozen:
+            self._tab_label.setText(f"🔒{self._current_tab}")
+            self._tab_label.setFixedWidth(52)  # 锁图标需要更宽
+        else:
+            self._tab_label.setText(self._current_tab)
+            self._tab_label.setFixedWidth(36)
+
         if hasattr(self, '_tab_scope_label') and self._tab_scope_label:
-            self._tab_scope_label.setText(f"📑 标签页 {self._current_tab}")
+            prefix = "🔒 " if is_frozen else "📑 "
+            self._tab_scope_label.setText(f"{prefix}标签页 {self._current_tab}")
 
         tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
         try:
@@ -2147,8 +2161,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_tab_btn_cleanup_empty') and self._tab_btn_cleanup_empty:
             self._tab_btn_cleanup_empty.setEnabled(self._has_empty_tabs_except_current())
 
+        # 冻结时禁用打印和清空按钮（_setup_file_table 阶段按钮尚未创建）
+        if hasattr(self, '_btn_start'):
+            self._btn_start.setEnabled(not is_frozen)
+        if hasattr(self, '_btn_clear'):
+            self._btn_clear.setEnabled(not is_frozen)
+
         # 同步当前标签页的附加服务设置到 UI 控件
-        tab = self._config.tabs.get(self._current_tab)
         self._sync_tab_settings_to_ui(tab)
 
         if hasattr(self, '_order_number_label') and self._order_number_label:
@@ -2164,6 +2183,11 @@ class MainWindow(QMainWindow):
         """返回当前标签页的任务列表。"""
         tab = self._config.tabs.get(self._current_tab)
         return tab.jobs if tab else []
+
+    def _is_current_tab_frozen(self) -> bool:
+        """检查当前标签页是否已固定（打印后锁定，不可编辑）。"""
+        tab = self._config.tabs.get(self._current_tab)
+        return tab.frozen if tab else False
 
     def _set_current_jobs(self, jobs: list[PrintJob]):
         """设置当前标签页的任务列表并保存配置。"""
@@ -2247,13 +2271,24 @@ class MainWindow(QMainWindow):
 
                 row = table.rowCount()
                 table.insertRow(row)
-                marker = " ★" if key == self._current_tab else ""
+                marker = ""
+                if key == self._current_tab:
+                    marker += " ★"
+                if tb and tb.frozen:
+                    marker += " 🔒"
                 table.setItem(row, 0, _QTWI(f"标签 {key}{marker}"))
                 table.setItem(row, 1, _QTWI(str(file_count)))
                 table.setItem(row, 2, _QTWI(str(total_pages)))
                 table.setItem(row, 3, _QTWI(f"¥{total_cost:.2f}"))
                 table.setItem(row, 4, _QTWI(source))
                 table.setItem(row, 5, _QTWI(order_num))
+
+            # 更新"删除所有已完成订单"按钮状态
+            try:
+                has_frozen = any(t.frozen for t in self._config.tabs.values())
+                del_frozen_btn.setEnabled(has_frozen)
+            except NameError:
+                pass  # 首次调用时按钮尚未创建
 
         _rebuild_dialog_table()
 
@@ -2314,6 +2349,10 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
+            # 通知后端放弃该标签页中的云端任务
+            for job in jobs:
+                if job.task_id > 0 and self._cloud_client:
+                    self._cloud_client.abandon_order_to_server(job.task_id)
             del self._config.tabs[key]
             self._renumber_tabs()
             self._save_config()
@@ -2335,6 +2374,11 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
+            # 通知后端放弃所有云端任务
+            for tab_entry in self._config.tabs.values():
+                for job in (tab_entry.jobs if tab_entry else []):
+                    if job.task_id > 0 and self._cloud_client:
+                        self._cloud_client.abandon_order_to_server(job.task_id)
             self._config.tabs = {"1": TabSettings()}
             self._current_tab = "1"
             self._config.active_tab = "1"
@@ -2366,9 +2410,37 @@ class MainWindow(QMainWindow):
             self._sync_edit_enabled(False)
             _rebuild_dialog_table()
 
+        def _delete_all_frozen_tabs():
+            """删除所有已完成（已固定）的标签页并重新编号。"""
+            frozen_keys = [k for k, t in self._config.tabs.items() if t.frozen]
+            if not frozen_keys:
+                QMessageBox.information(dlg, "提示", "没有已完成的订单。")
+                return
+            reply = QMessageBox.question(
+                dlg, "确认删除",
+                f"将删除 {len(frozen_keys)} 个已完成订单的标签页，删除后无法恢复。\n确定删除吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            for key in frozen_keys:
+                del self._config.tabs[key]
+                self._log(f"🗑 已删除已完成标签页 {key}")
+            self._renumber_tabs()
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+            _rebuild_dialog_table()
+
         cleanup_empty_btn = QPushButton("🗑 删除空标签页")
         cleanup_empty_btn.clicked.connect(_cleanup_empty_in_dialog)
         btn_row.addWidget(cleanup_empty_btn)
+
+        del_frozen_btn = QPushButton("🗑 删除所有已完成订单")
+        del_frozen_btn.setObjectName("cloudRejectBtn")
+        del_frozen_btn.clicked.connect(_delete_all_frozen_tabs)
+        btn_row.addWidget(del_frozen_btn)
 
         del_all_btn = QPushButton("✕ 清空全部标签页")
         del_all_btn.setObjectName("cloudRejectBtn")
@@ -2530,6 +2602,10 @@ class MainWindow(QMainWindow):
         if not rows:
             self._sync_edit_enabled(False)
             return
+        # 标签页已固定时不允许编辑
+        if self._is_current_tab_frozen():
+            self._sync_edit_enabled(False)
+            return
         row = min(rows)
         jobs = self._get_current_jobs()
         if row >= len(jobs):
@@ -2581,6 +2657,8 @@ class MainWindow(QMainWindow):
 
     def _auto_apply_edit(self):
         """编辑面板参数变更 → 自动应用到当前选中行并保存。"""
+        if self._is_current_tab_frozen():
+            return
         rows = set(idx.row() for idx in self._table.selectedIndexes())
         if not rows:
             return
@@ -2896,6 +2974,17 @@ class MainWindow(QMainWindow):
         """将标签页的附加服务设置同步到 UI 控件。"""
         if not tab or not hasattr(self, '_delivery_onoff_combo'):
             return
+        # 冻结时禁用所有附加服务控件
+        if tab.frozen:
+            self._delivery_onoff_combo.setEnabled(False)
+            self._delivery_location_combo.setEnabled(False)
+            self._delivery_percent_spin.setEnabled(False)
+            self._urgency_combo.setEnabled(False)
+            self._urgency_price_spin.setEnabled(False)
+            self._cover_page_onoff_combo.setEnabled(False)
+            self._cover_page_price_spin.setEnabled(False)
+            return
+        self._delivery_onoff_combo.setEnabled(True)
         self._delivery_onoff_combo.blockSignals(True)
         self._delivery_onoff_combo.setCurrentIndex(1 if tab.delivery_enabled else 0)
         self._delivery_onoff_combo.blockSignals(False)
@@ -2928,6 +3017,8 @@ class MainWindow(QMainWindow):
 
     def _on_delivery_toggled(self):
         """派送开关变更 → 写入当前标签页。"""
+        if self._is_current_tab_frozen():
+            return
         enabled = (self._delivery_onoff_combo.currentIndex() == 1)
         tab = self._config.tabs.get(self._current_tab)
         if tab:
@@ -2945,6 +3036,8 @@ class MainWindow(QMainWindow):
 
     def _on_cover_page_toggled(self):
         """首页开关变更 → 写入当前标签页。"""
+        if self._is_current_tab_frozen():
+            return
         enabled = (self._cover_page_onoff_combo.currentIndex() == 1)
         tab = self._config.tabs.get(self._current_tab)
         if tab:
@@ -2955,6 +3048,8 @@ class MainWindow(QMainWindow):
 
     def _on_delivery_location_changed(self):
         """派送地点变更 → 更新百分比 spinbox 并写入当前标签页。"""
+        if self._is_current_tab_frozen():
+            return
         loc = self._delivery_location_combo.currentText()
         tab = self._config.tabs.get(self._current_tab)
         if tab:
@@ -2975,6 +3070,8 @@ class MainWindow(QMainWindow):
 
     def _on_urgency_changed(self):
         """优先级变更 → 写入当前标签页。"低"时锁定为 0.00 并禁用。"""
+        if self._is_current_tab_frozen():
+            return
         level = self._urgency_combo.currentText()
         tab = self._config.tabs.get(self._current_tab)
         if tab:
@@ -3134,6 +3231,9 @@ class MainWindow(QMainWindow):
         for j in jobs:
             if j.order_number:
                 return j.order_number
+        # 已固定的标签页不再申请新订单号
+        if self._is_current_tab_frozen():
+            return ""
         # 尝试从后端获取
         online = self._cloud_client and self._cloud_client.is_connected()
         if online and self._cloud_client.api_url and self._cloud_client.token:
@@ -3379,6 +3479,9 @@ class MainWindow(QMainWindow):
 
     def _add_files_to_table(self, files: list[str]):
         """添加文件到任务列表的核心逻辑。"""
+        if self._is_current_tab_frozen():
+            self._log("🔒 该标签页已固定，不可添加文件")
+            return
         self._cancel_undo_if_active()
         if getattr(self, '_loading_files', False):
             logger.warning("上一批文件仍在处理中，忽略本次添加请求")
@@ -3460,6 +3563,14 @@ class MainWindow(QMainWindow):
         """用给定的任务列表启动打印 Worker。"""
         self._flat_jobs = flat_jobs
         self._sync_ui_to_config()
+
+        # 立即冻结标签页 — 一旦开始打印，订单即已固定，不允许任何编辑
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            tab.frozen = True
+        self._save_config()
+        self._refresh_tab_display()
+        self._log(f"🔒 标签页 {self._current_tab} 已固定，打印完成后不可编辑")
 
         from datetime import datetime
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3622,21 +3733,22 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_all_finished(self, success_count: int, fail_count: int):
-        """全部任务完成。"""
-        self._btn_start.setEnabled(True)
+        """全部任务完成。标签页已固定，不允许再次打印或编辑。"""
         self._worker = None
-        self._all_printed = (fail_count == 0)  # 无失败视为已完成
+        self._all_printed = (fail_count == 0)
 
         total = success_count + fail_count
-        self._status_label.setText(f"完成：成功 {success_count} / {total}")
+        status = "✅ 全部成功" if fail_count == 0 else f"⚠️ 成功 {success_count} / 失败 {fail_count}"
+        self._status_label.setText(f"🔒 已完成：{status}（共 {total} 个任务）")
 
         if fail_count > 0:
             QMessageBox.warning(
                 self, "打印完成（有错误）",
-                f"全部 {total} 个任务处理完毕。\n成功: {success_count}\n失败: {fail_count}\n\n详情请查看日志。"
+                f"全部 {total} 个任务处理完毕。\n成功: {success_count}\n失败: {fail_count}\n\n"
+                f"⚠️ 该标签页已锁定，不可编辑。如需重试失败文件，请新建标签页。\n详情请查看日志。"
             )
         else:
-            self._log(f"✓ 全部 {total} 个任务打印成功！")
+            self._log(f"🔒 全部 {total} 个任务打印成功！标签页已锁定。")
 
     def _on_about(self):
         """关于对话框。"""
@@ -3862,16 +3974,20 @@ class MainWindow(QMainWindow):
     # ---- 云端任务处理 ----
 
     def _on_cloud_task_received(self, task: CloudTask):
-        """收到新的云端打印任务 → 加入云端任务列表窗口。"""
+        """收到新的云端打印任务 → 加入云端任务列表窗口（无障碍打印任务自动跳过窗口）。"""
         if task.task_id in self._processed_cloud_tasks:
             return  # 已处理过，跳过（防 SocketIO + HTTP 双通道重复）
         self._cloud_tasks[task.task_id] = task
-        self._log(f"☁ 收到云端任务 #{task.task_id}: {task.file_name}")
-        if task.status == "ready" and self._cloud_task_window:
-            self._cloud_task_window.add_task(task)
+        self._log(f"☁ 收到云端任务 #{task.task_id}: {task.file_name}"
+                  + (" ⚡无障碍" if task.auto_print else ""))
+        if task.status == "ready":
+            if task.auto_print:
+                self._enqueue_auto_print_task(task)
+            elif self._cloud_task_window:
+                self._cloud_task_window.add_task(task)
 
     def _on_cloud_task_updated(self, task: CloudTask):
-        """云端任务状态更新 → 就绪时加入窗口，出错时通知服务器标记失败。"""
+        """云端任务状态更新 → 就绪时加入窗口（或自动处理无障碍打印），出错时通知服务器标记失败。"""
         if task.status == "ready" and task.task_id in self._processed_cloud_tasks:
             return  # 已处理过
         self._cloud_tasks[task.task_id] = task
@@ -3882,10 +3998,79 @@ class MainWindow(QMainWindow):
                 self._cloud_client.report_fail(task.task_id, f"下载失败: {task.error_message}")
                 self._cloud_client.reject_task(task.task_id)
             self._cloud_tasks.pop(task.task_id, None)
+            # 无障碍打印任务出错：从队列中移除
+            if task.auto_print and task.order_id:
+                self._auto_print_queue.pop(task.order_id, None)
+                t = self._auto_print_timers.pop(task.order_id, None)
+                if t:
+                    t.stop()
         elif task.status == "ready":
-            self._log(f"☁ 云端任务 #{task.task_id} 下载完成")
-            if self._cloud_task_window:
+            self._log(f"☁ 云端任务 #{task.task_id} 下载完成"
+                      + (" ⚡无障碍" if task.auto_print else ""))
+            if task.auto_print:
+                self._enqueue_auto_print_task(task)
+            elif self._cloud_task_window:
                 self._cloud_task_window.add_task(task)
+
+    # ──────── 无障碍打印（自动建标签页 + 自动打印）────────
+
+    def _enqueue_auto_print_task(self, task: CloudTask):
+        """将无障碍打印任务加入队列，按订单分组，防抖后批量处理。"""
+        if not task.order_id:
+            self._log(f"⚠ 无障碍任务 #{task.task_id} 缺少 order_id，跳过")
+            return
+        oid = task.order_id
+        if oid not in self._auto_print_queue:
+            self._auto_print_queue[oid] = []
+        # 避免重复添加同一个 task_id
+        if not any(t.task_id == task.task_id for t in self._auto_print_queue[oid]):
+            self._auto_print_queue[oid].append(task)
+            self._log(f"⚡ 无障碍任务 #{task.task_id} 已加入队列（订单 #{oid}，"
+                      f"共 {len(self._auto_print_queue[oid])} 个文件）")
+
+        # 停止旧定时器，重新启动 3 秒防抖（同一订单的后续文件会重置计时）
+        old_timer = self._auto_print_timers.pop(oid, None)
+        if old_timer:
+            old_timer.stop()
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda o=oid: self._process_auto_print_order(o))
+        timer.start(3000)
+        self._auto_print_timers[oid] = timer
+
+    def _process_auto_print_order(self, order_id: int):
+        """防抖定时器触发：收集该订单全部就绪任务，创建标签页并自动开始打印。"""
+        tasks = self._auto_print_queue.pop(order_id, [])
+        self._auto_print_timers.pop(order_id, None)
+        if not tasks:
+            return
+
+        # 过滤掉未就绪的任务
+        ready_tasks = [t for t in tasks if t.status == "ready"]
+        if not ready_tasks:
+            self._log(f"⚡ 订单 #{order_id}: 无就绪文件，跳过自动打印")
+            return
+
+        self._log(f"⚡ 无障碍打印：订单 #{order_id} 共 {len(ready_tasks)} 个文件，自动创建标签页并开始打印")
+
+        # 标记为已处理（防重复）
+        for t in ready_tasks:
+            self._processed_cloud_tasks.add(t.task_id)
+
+        # 自动创建标签页
+        self._add_cloud_tasks_to_new_tab(ready_tasks)
+
+        # 通知后端已接受
+        if ready_tasks[0].order_id and self._cloud_client:
+            self._cloud_client.accept_order_to_server(ready_tasks[0].order_id)
+
+        # 自动开始打印
+        jobs = self._get_current_jobs()
+        if jobs:
+            self._log(f"⚡ 自动开始打印标签页 {self._current_tab}（{len(jobs)} 个文件）")
+            self._start_print_worker(list(jobs))
+        else:
+            self._log(f"⚠ 无障碍打印：标签页 {self._current_tab} 无文件，跳过")
 
     def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
         """云端订单被用户取消 → 通知任务列表窗口更新状态。"""
@@ -4241,6 +4426,10 @@ class MainWindow(QMainWindow):
             self._on_undo_clear()
             return
 
+        if self._is_current_tab_frozen():
+            self._log("🔒 该标签页已固定，不可清空")
+            return
+
         jobs = self._get_current_jobs()
         if not jobs:
             return
@@ -4278,10 +4467,19 @@ class MainWindow(QMainWindow):
 
     def _on_remove_selected(self):
         """移除表格中选中的行。"""
+        if self._is_current_tab_frozen():
+            self._log("🔒 该标签页已固定，不可移除文件")
+            return
         rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()), reverse=True)
         if not rows:
             return
         jobs = self._get_current_jobs()
+        # 通知后端放弃被移除的云端任务
+        for row in rows:
+            if row < len(jobs):
+                job = jobs[row]
+                if job.task_id > 0 and self._cloud_client:
+                    self._cloud_client.abandon_order_to_server(job.task_id)
         for row in rows:
             if row < len(jobs):
                 self._cancel_undo_if_active()
@@ -4294,6 +4492,9 @@ class MainWindow(QMainWindow):
 
     def _on_start_print(self):
         """开始打印当前标签页的所有文件。"""
+        if self._is_current_tab_frozen():
+            self._log("🔒 该标签页已固定，不能重复打印")
+            return
         jobs = self._get_current_jobs()
         if not jobs:
             self._log("当前标签页没有文件可以打印")

@@ -32,10 +32,11 @@ keepalive = 5
 
 def post_worker_init(worker):
     """
-    Gunicorn worker 启动后，初始化 APScheduler 定时任务。
+    Gunicorn worker 启动后，初始化数据库迁移和 APScheduler 定时任务。
     放在这里而不是 if __name__ 里，确保 Gunicorn 模式下也能运行。
     """
     from app import (
+        init_db,
         scheduler,
         process_pending_orders,
         check_printing_timeout,
@@ -43,6 +44,10 @@ def post_worker_init(worker):
         cleanup_expired_license_keys,
         recover_orphaned_printing_tasks,
     )
+
+    # 先执行数据库初始化/迁移（生产环境 Gunicorn 不会触发 __main__）
+    init_db()
+    print("[DB] 数据库初始化/迁移完成")
 
     # 避免 reload 时重复添加
     if scheduler.get_job("scan_orders"):

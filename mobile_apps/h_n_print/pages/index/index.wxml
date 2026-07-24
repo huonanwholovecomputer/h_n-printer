@@ -30,14 +30,14 @@
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">打印文件</text>
-            <text wx:if="{{selectedFiles.length > 0}}" class="section-header-badge">{{selectedFiles.length}}</text>
+            <text wx:if="{{badgeCount > 0 || badgeExiting}}" class="section-header-badge {{badgeEntering ? 'entering' : ''}} {{badgeBouncing ? 'bouncing' : ''}} {{badgeExiting ? 'exiting' : ''}}">{{badgeCount || 1}}</text>
           </view>
 
           <!-- File Cards -->
           <view
             wx:for="{{selectedFiles}}"
             wx:key="index"
-            class="file-card {{pageReady && item.entering ? 'card-entering' : ''}} {{item.removing ? 'card-exiting' : ''}}"
+            class="file-card {{item.entering ? 'card-entering' : ''}} {{item.removing ? 'card-removing' : ''}}"
           >
             <!-- Header: name + remove -->
             <view class="file-card-top">
@@ -65,14 +65,21 @@
               <block wx:elif="{{item.fileId && item.excelWarning}}">
                 <text class="status-label warn">Excel 不支持自动打印，请联系管理员</text>
               </block>
+              <block wx:elif="{{item.fileId && item.unsupportedFormat}}">
+                <text class="status-label warn">该文件格式不支持自动打印，请联系管理员</text>
+              </block>
               <block wx:elif="{{item.fileId}}">
                 <text class="status-label done">已上传</text>
                 <!-- 页数分析进度（非图片/Excel 文件）-->
-                <view wx:if="{{!item.isImage && !item.excelWarning && item.pageCountStatus === 'analyzing'}}" class="page-analysis-bar">
+                <view wx:if="{{!item.isImage && !item.excelWarning && !item.unsupportedFormat && item.pageCountStatus === 'analyzing'}}" class="page-analysis-bar">
                   <view class="analysis-dot-pulse"></view>
                   <text class="analysis-text">正在分析页数，本地打印工具转换中…</text>
                 </view>
-                <view wx:elif="{{!item.isImage && !item.excelWarning && item.pageCountStatus === 'confirmed' && item.pageCount > 0}}" class="page-analysis-bar confirmed">
+                <view wx:elif="{{!item.isImage && !item.excelWarning && !item.unsupportedFormat && item.pageCountStatus === 'offline'}}" class="page-analysis-bar offline">
+                  <text class="analysis-dot-warn">⚠</text>
+                  <text class="analysis-text">本地打印工具离线，无法返回总页数</text>
+                </view>
+                <view wx:elif="{{!item.isImage && !item.excelWarning && !item.unsupportedFormat && item.pageCountStatus === 'confirmed' && item.pageCount > 0}}" class="page-analysis-bar confirmed">
                   <text class="analysis-dot-done">✓</text>
                   <text class="analysis-text">共 {{item.pageCount}} 页</text>
                 </view>
@@ -80,7 +87,7 @@
             </view>
 
             <!-- Per-file controls (uploaded only) -->
-            <view wx:if="{{item.fileId && !item.excelWarning}}" class="file-controls">
+            <view wx:if="{{item.fileId && !item.excelWarning && !item.unsupportedFormat}}" class="file-controls">
 
               <!-- Copies stepper -->
               <view class="control-row">
@@ -125,7 +132,7 @@
           </view>
 
           <!-- Add file button -->
-          <button class="add-file-btn" bindtap="onChooseFile" hover-class="tap-active">
+          <button class="add-file-btn {{btnPulse ? 'pulsing' : ''}}" bindtap="onChooseFile" hover-class="tap-active">
             <text class="add-icon">+</text>
             <text>{{selectedFiles.length ? '添加文件' : '选择打印文件'}}</text>
           </button>
@@ -147,11 +154,13 @@
           </view>
 
           <!-- 派送地点（派送开启时显示）-->
-          <view wx:if="{{deliveryEnabled}}" class="param-row">
-            <text class="param-label">地点</text>
-            <view class="picker-trigger" bindtap="onToggleDeliveryPicker">
-              <text>{{deliveryLocation}}</text>
-              <text class="picker-arrow">›</text>
+          <view class="delivery-collapse {{deliveryEnabled ? 'delivery-open' : ''}}">
+            <view class="param-row">
+              <text class="param-label">地点</text>
+              <view class="picker-trigger" bindtap="onToggleDeliveryPicker">
+                <text>{{deliveryLocation}}</text>
+                <text class="picker-arrow">›</text>
+              </view>
             </view>
           </view>
           <view class="picker-sheet {{showDeliveryPicker ? 'picker-expanded' : ''}}">
@@ -182,19 +191,30 @@
             <view class="ios-switch {{coverPage ? 'switch-on' : ''}}" bindtap="onToggleCoverPage">
               <view class="switch-thumb"></view>
             </view>
+            <text wx:if="{{coverPriceVisible || coverPriceExiting}}" class="cover-price-tag {{coverPriceEntering ? 'entering' : ''}} {{coverPriceExiting ? 'exiting' : ''}}">¥{{coverPagePrice}}</text>
           </view>
 
-          <!-- 首页价格（首页开启时显示）-->
-          <view wx:if="{{coverPage}}" class="param-row">
-            <text class="param-label">首页费</text>
-            <text class="param-value-glass">¥{{coverPagePrice}}</text>
-            <text class="param-unit">元（由本地打印工具设定）</text>
+          <!-- 自取地址（未派送时显示，带展开/收起动画）-->
+          <view class="pickup-collapse {{!deliveryEnabled ? 'pickup-open' : ''}}">
+            <view class="param-row">
+              <text class="param-label">自取地址</text>
+              <input class="control-input" value="{{pickupAddress}}" bindinput="onPickupAddressInput" placeholder="如 1号楼202宿舍" />
+            </view>
           </view>
+        </view>
 
-          <!-- 自取地址（未派送时显示）-->
-          <view wx:if="{{!deliveryEnabled}}" class="param-row">
-            <text class="param-label">自取地址</text>
-            <input class="control-input" value="{{pickupAddress}}" bindinput="onPickupAddressInput" placeholder="如 1号楼202宿舍" />
+        <!-- 无障碍打印开关（仅管理员可见） -->
+        <view wx:if="{{userRole === 'admin'}}" class="auto-print-switch-row {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.18s">
+          <view class="auto-print-label">
+            <view class="lightning-burst {{autoPrintGlow ? 'striking' : ''}} {{autoPrintEnabled ? 'active' : ''}}">
+              <canvas type="2d" id="boltCanvas" class="bolt-canvas"></canvas>
+              <text class="auto-print-icon">⚡</text>
+            </view>
+            <text class="auto-print-title">无障碍打印</text>
+            <text class="auto-print-desc">提交后自动开始打印，无需手动确认</text>
+          </view>
+          <view class="ios-switch ios-switch-lg {{autoPrintEnabled ? 'switch-on' : ''}}" bindtap="onAutoPrintToggle">
+            <view class="switch-thumb"></view>
           </view>
         </view>
 
