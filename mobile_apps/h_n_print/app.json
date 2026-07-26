@@ -10,8 +10,11 @@
   ],
   "window": {
     "navigationBarTextStyle": "black",
-    "navigationStyle": "custom"
+    "navigationStyle": "custom",
+    "backgroundColor": "@bgColor"
   },
+  "darkmode": true,
+  "themeLocation": "theme.json",
   "tabBar": {
     "custom": true,
     "color": "#999999",

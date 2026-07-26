@@ -5,6 +5,7 @@ Component({
   data: {
     pageSlide: 'page-init',
     pageExit: '',
+    isDarkMode: wx.getStorageSync('isDarkMode') || false,
     year: 2026,
     month: 6,
     stats: null,
@@ -16,6 +17,8 @@ Component({
   },
   lifetimes: {
     attached() {
+      const app = getApp()
+      this.setData({ isDarkMode: app.globalData.isDarkMode })
       const now = new Date()
       const currentYear = now.getFullYear()
       const currentMonth = now.getMonth() + 1
@@ -35,9 +38,14 @@ Component({
   },
   pageLifetimes: {
     show() {
+      const app = getApp()
       const forward = wx.getStorageSync('_navForward')
       wx.removeStorageSync('_navForward')
-      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
+      this.setData({
+        pageSlide: forward ? 'page-enter-right' : 'page-enter-left',
+        pageExit: '',
+        isDarkMode: app.globalData.isDarkMode,
+      })
     },
     hide() {
       const forward = wx.getStorageSync('_navForward')

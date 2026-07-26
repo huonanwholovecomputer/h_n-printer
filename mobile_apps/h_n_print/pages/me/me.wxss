@@ -6,8 +6,27 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background-color: var(--bg-primary);
+  background: transparent;
   min-height: 0;
+}
+
+/* 深浅切换过渡：确保子元素在 class 移除时也能平滑过渡 */
+.page-root,
+.page-root .user-card,
+.page-root .license-card,
+.page-root .storage-card,
+.page-root .user-item,
+.page-root .role-btn,
+.page-root .order-card,
+.page-root .key-card,
+.page-root .license-section,
+.page-root .storage-section,
+.page-root .users-section,
+.page-root .orders-section,
+.page-root .page-num,
+.page-root .page-btn,
+.page-root .page-size-selector {
+  transition: background 0.45s ease, color 0.35s ease, border-color 0.45s ease, box-shadow 0.45s ease;
 }
 
 /* 初始隐藏态：防止页面首次渲染时闪烁 */
@@ -68,13 +87,15 @@
 /* ═══════════════ User Profile Card ═══════════════ */
 
 .user-card {
-  background-color: var(--bg-card);
+  background: var(--glass-heavy);
   border-radius: var(--radius-lg);
   padding: 32rpx 28rpx;
   margin-bottom: 20rpx;
   display: flex;
   align-items: center;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border);
+  transition: background 0.4s ease, box-shadow 0.4s ease;
 }
 
 .avatar-btn {
@@ -201,13 +222,14 @@
 }
 
 .role-btn {
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 28rpx;
   display: flex;
   align-items: center;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   border-left: 6rpx solid var(--green);
+  transition: background 0.4s ease, box-shadow 0.4s ease;
 }
 .role-btn:active {
   background-color: var(--gray6);
@@ -238,12 +260,34 @@
   box-sizing: border-box;
 }
 
+/* ── 管理员区域折叠过渡（避免 role 异步加载后卡片突然插入导致布局突变）── */
+.admin-collapsible {
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  margin-bottom: 0;
+  pointer-events: none;
+  transition: max-height 0.5s cubic-bezier(0.22, 0.61, 0.36, 1),
+              opacity 0.35s ease,
+              margin-bottom 0.5s cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.admin-collapsible.admin-expanded {
+  max-height: 3100rpx;
+  opacity: 1;
+  margin-bottom: 20rpx;
+  padding-bottom: 12rpx;
+  pointer-events: auto;
+}
+
 .license-card, .storage-card {
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 28rpx;
   text-align: left;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
+  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
 }
 
 /* ═══════════════ License Key Generator ═══════════════ */
@@ -272,86 +316,118 @@
 }
 
 .key-type-toggle {
+  position: relative;
   display: flex;
+  width: 340rpx;
   background-color: var(--gray6);
   border-radius: 18rpx;
   padding: 4rpx;
+  overflow: hidden;
+}
+
+.key-type-slider {
+  position: absolute;
+  top: 4rpx;
+  left: 4rpx;
+  width: calc(50% - 4rpx);
+  height: calc(100% - 8rpx);
+  border-radius: 15rpx;
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.88) 0%,
+    rgba(0, 105, 220, 0.94) 100%);
+  box-shadow:
+    0 2rpx 8rpx rgba(0, 122, 255, 0.25),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.35);
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  z-index: 0;
+}
+
+.key-type-slider.slider-right {
+  transform: translateX(100%);
 }
 
 .key-type-option {
-  padding: 12rpx 22rpx;
+  width: 50%;
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12rpx 0;
   font-size: 22rpx;
   color: var(--text-secondary);
   border-radius: 15rpx;
-  transition: all 0.2s ease;
+  text-align: center;
+  white-space: nowrap;
+  box-sizing: border-box;
+  transition: color 0.25s ease;
 }
 
-.key-type-active {
-  background-color: var(--blue);
+.key-type-option.opt-active {
   color: #fff;
   font-weight: 600;
 }
 
 .generate-btn {
   width: 100%;
-  background-color: var(--blue);
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.88) 0%,
+    rgba(0, 105, 220, 0.94) 100%);
   color: #fff;
   font-size: 26rpx;
   font-weight: 600;
   border-radius: var(--radius-md);
   padding: 20rpx 0;
   border: none;
+  box-shadow:
+    0 2rpx 10rpx rgba(0, 122, 255, 0.2),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.3);
+  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
 }
 .generate-btn:active {
-  opacity: 0.85;
   transform: scale(0.97);
+  filter: brightness(1.1);
 }
 .generate-btn[disabled] {
   opacity: 0.4;
 }
 
-/* ═══════════════ License Key Drawer ═══════════════ */
+/* ═══════════════ License Key Cards（与 admin-card 同构）═══════════════ */
 
-.key-drawer {
-  margin-top: 0;
-  max-height: 0;
-  opacity: 0;
-  overflow: hidden;
+.key-card-wrap {
   position: relative;
-}
-
-.key-drawer-show {
-  max-height: 500rpx;
-  opacity: 1;
   margin-top: 14rpx;
+  margin-bottom: 12rpx;
 }
 
-/* 入场动画：向下展开 + 淡入 */
+/* 入场动画：向下展开 + 回弹 */
 @keyframes keySlideIn {
-  from { opacity: 0; transform: translateY(-24rpx); max-height: 0; margin-top: 0; }
-  to   { opacity: 1; transform: translateY(0);     max-height: 500rpx; margin-top: 14rpx; }
+  from { opacity: 0; transform: translateY(-20rpx); max-height: 0; margin-bottom: 0; }
+  to   { opacity: 1; transform: translateY(0);      max-height: 300rpx; margin-bottom: 12rpx; }
 }
 .key-entering {
   animation: keySlideIn 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  overflow: hidden;
 }
 
-/* 离场动画：上移 + 淡出（收回由 JS 先滑回 0 完成） */
+/* 离场动画：上移 + 淡出 */
 @keyframes keySlideOut {
-  from { opacity: 1; transform: translateY(0);     max-height: 500rpx; margin-top: 14rpx; }
-  to   { opacity: 0; transform: translateY(-20rpx); max-height: 0;       margin-top: 0; }
+  from { opacity: 1; transform: translateY(0);      max-height: 300rpx; margin-bottom: 12rpx; }
+  to   { opacity: 0; transform: translateY(-20rpx); max-height: 0;        margin-bottom: 0; }
 }
 .key-exiting {
   animation: keySlideOut 0.3s ease-in both;
+  overflow: hidden;
 }
 
-/* Delete button behind card — dynamically revealed during swipe */
+/* Delete button behind card */
 .key-delete {
   position: absolute;
   top: 0; right: 0; bottom: 0;
   width: 140rpx;
   background: linear-gradient(160deg, #FF5E5B 0%, #E8302B 100%);
   color: #fff;
-  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
+  border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -360,27 +436,31 @@
   font-size: 24rpx;
   font-weight: 500;
   z-index: 0;
-  box-shadow: inset 0 0 0 2rpx rgba(255, 255, 255, 0.10),
-              0 2rpx 8rpx rgba(232, 48, 43, 0.25);
+  box-shadow: inset 0 0 0 2rpx rgba(255,255,255,0.10),
+              0 2rpx 8rpx rgba(232,48,43,0.25);
   transition: opacity 0.15s ease;
+}
+/* 右滑归位时加速淡出 */
+.key-card-wrap.quick-fade .key-delete {
+  transition: opacity 0.05s ease;
 }
 .key-delete:active {
   background: linear-gradient(160deg, #E8302B 0%, #C82020 100%);
   transform: scale(0.95);
 }
 
-/* Key drawer card */
-.key-drawer-inner {
+/* Key card body */
+.key-card {
   position: relative;
   z-index: 1;
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 22rpx;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
   transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
-
-.key-drawer-inner.no-transition {
+.key-card.no-transition {
   transition: none;
 }
 
@@ -463,12 +543,12 @@
 }
 
 /* Expired / locked states */
-.key-drawer-expired .key-value { color: var(--text-quaternary); }
-.key-drawer-locked .key-drawer-inner {
-  background-color: #fafafa;
-  opacity: 0.75;
+.key-card-wrap.key-drawer-expired .key-value { color: var(--text-quaternary); }
+.key-card-wrap.key-drawer-locked .key-card {
+  background: var(--glass-regular);
+  opacity: 0.55;
 }
-.key-drawer-locked .key-value { color: var(--gray); }
+.key-card-wrap.key-drawer-locked .key-value { color: var(--gray); }
 
 /* User info in key drawer */
 .key-user-info {
@@ -544,16 +624,24 @@
 /* 验证按钮（输入框下方，居中，1/4屏幕宽） */
 .redeem-btn {
   width: 50%;
-  background-color: var(--blue);
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.88) 0%,
+    rgba(0, 105, 220, 0.94) 100%);
   color: #fff;
   font-size: 26rpx;
   font-weight: 600;
   border-radius: var(--radius-md);
   padding: 18rpx 0;
   margin: 0 auto;
+  border: none;
+  box-shadow:
+    0 2rpx 10rpx rgba(0, 122, 255, 0.2),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.3);
+  transition: transform 0.12s ease, filter 0.12s ease;
 }
 .redeem-btn:active {
-  opacity: 0.85;
+  transform: scale(0.97);
+  filter: brightness(1.1);
 }
 
 /* ═══════════════ License Active (user) ═══════════════ */
@@ -701,33 +789,34 @@
 
 .delete-all-btn {
   width: 100%;
-  background: rgba(255, 255, 255, 0.5);
+  background: rgba(255, 59, 48, 0.06);
   color: var(--red);
   font-size: 24rpx;
   font-weight: 500;
-  border: 1rpx solid rgba(255, 59, 48, 0.2);
+  border: 1rpx solid rgba(255, 59, 48, 0.18);
   border-radius: var(--radius-md);
   padding: 14rpx 0;
   margin-top: 12rpx;
-  box-shadow:
-    0 2rpx 6rpx rgba(0, 0, 0, 0.04),
-    inset 0 1rpx 0 rgba(255, 255, 255, 0.7);
+  box-shadow: none;
   transition: transform 0.12s ease, background-color 0.12s ease;
 }
 .delete-all-btn:active {
   transform: scale(0.97);
-  background: rgba(255, 59, 48, 0.12);
+  background: rgba(255, 59, 48, 0.14);
 }
 
 /* ═══════════════ User List ═══════════════ */
 
 .user-item {
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 22rpx 28rpx;
   margin-bottom: 12rpx;
   display: flex;
   align-items: center;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
+  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
 }
 
 .user-avatar {
@@ -828,7 +917,7 @@
   width: 140rpx;
   background: linear-gradient(160deg, #FF5E5B 0%, #E8302B 100%);
   color: #fff;
-  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
+  border-radius: var(--radius-lg);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -855,12 +944,13 @@
 .admin-card {
   position: relative;
   z-index: 1;
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 22rpx;
   display: flex;
   align-items: center;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
   transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .admin-card.no-transition {
@@ -914,14 +1004,15 @@
 }
 
 .order-card {
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 24rpx 28rpx;
   margin-bottom: 14rpx;
   box-sizing: border-box;
   overflow: hidden;
-  box-shadow: var(--shadow-sm);
-  transition: box-shadow 0.2s ease, transform 0.15s ease;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
+  transition: background 0.4s ease, box-shadow 0.4s ease, transform 0.15s ease;
 }
 
 .order-card:active {
@@ -929,7 +1020,7 @@
 }
 
 .order-expanded {
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--glass-shadow-md), var(--glass-rim);
 }
 
 .order-card-header {
@@ -1324,5 +1415,80 @@
 .end-hint-text {
   font-size: 22rpx;
   color: var(--text-quaternary);
+}
+
+/* ═══════════════ Dark Mode ═══════════════ */
+.theme-dark .role-btn:active {
+  background: rgba(255, 255, 255, 0.06);
+}
+.theme-dark .order-card:active {
+  background: rgba(255, 255, 255, 0.04);
+}
+.theme-dark .key-user-info {
+  background: rgba(52, 199, 89, 0.10);
+}
+.theme-dark .retention-stepper-btn {
+  background: var(--glass-regular);
+  border: var(--glass-border-dark);
+}
+.theme-dark .retention-stepper-btn:active {
+  background: rgba(255, 255, 255, 0.10);
+}
+.theme-dark .retention-stepper-input {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+  border: 1rpx solid rgba(84, 84, 88, 0.30);
+}
+.theme-dark .redeem-input {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(84, 84, 88, 0.30);
+  color: var(--text-primary);
+}
+.theme-dark .redeem-paste-btn {
+  background: var(--glass-regular);
+  border-color: rgba(0, 122, 255, 0.20);
+}
+.theme-dark .delete-all-btn {
+  background: rgba(255, 59, 48, 0.08);
+  border-color: rgba(255, 59, 48, 0.15);
+  color: #FF6B6B;
+}
+.theme-dark .delete-all-btn:active {
+  background: rgba(255, 59, 48, 0.16);
+}
+.theme-dark .copy-btn {
+  background: rgba(0, 122, 255, 0.12);
+  color: var(--blue-light);
+}
+.theme-dark .copy-btn:active {
+  background: rgba(0, 122, 255, 0.18);
+}
+.theme-dark .btn-waiting {
+  background: rgba(255, 255, 255, 0.05) !important;
+  color: var(--text-quaternary) !important;
+}
+.theme-dark .btn-end-task {
+  background: rgba(255, 59, 48, 0.12) !important;
+}
+.theme-dark .btn-confirm-admin {
+  background: rgba(52, 199, 89, 0.12) !important;
+}
+.theme-dark .btn-cancel-sm:active {
+  background: rgba(255, 59, 48, 0.10);
+}
+.theme-dark .detail-divider {
+  background-color: rgba(84, 84, 88, 0.35);
+}
+.theme-dark .page-size-option:active {
+  background: rgba(255, 255, 255, 0.06);
+}
+.theme-dark .page-size-option.option-active {
+  background: rgba(0, 122, 255, 0.12);
+}
+.theme-dark .file-type-tag {
+  background: rgba(0, 122, 255, 0.12);
+}
+.theme-dark .storage-divider {
+  background-color: rgba(84, 84, 88, 0.30);
 }
 

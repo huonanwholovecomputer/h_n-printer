@@ -91,15 +91,15 @@
   align-items: center;
   gap: 6rpx;
   padding: 10rpx 18rpx;
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   font-size: 22rpx;
   color: var(--text-secondary);
 }
 
 .page-size-selector:active {
-  background-color: var(--gray6);
+  background: rgba(0, 0, 0, 0.04);
 }
 
 .page-size-arrow {
@@ -117,9 +117,9 @@
   top: calc(100% + 6rpx);
   left: 0;
   min-width: 160rpx;
-  background-color: var(--bg-card);
+  background: var(--glass-heavy);
   border-radius: var(--radius-sm);
-  box-shadow: 0 4rpx 20rpx rgba(0, 0, 0, 0.12);
+  box-shadow: 0 4rpx 24rpx rgba(0, 0, 0, 0.12), var(--glass-rim);
   z-index: 100;
   opacity: 0;
   transform: translateY(-8rpx);
@@ -166,12 +166,12 @@
   border-radius: var(--radius-sm);
   font-size: 24rpx;
   color: var(--text-secondary);
-  background-color: var(--bg-card);
-  box-shadow: var(--shadow-sm);
+  background: var(--glass-regular);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
 }
 
 .page-btn:active, .page-num:active {
-  background-color: var(--gray6);
+  background: rgba(0, 0, 0, 0.04);
 }
 
 .page-btn-disabled {
@@ -200,22 +200,23 @@
 /* ═══════════════ Order Cards ═══════════════ */
 
 .order-card {
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 24rpx 28rpx;
   margin-bottom: 14rpx;
   box-sizing: border-box;
   overflow: hidden;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
   transition: box-shadow 0.2s ease;
 }
 
 .order-card:active {
-  background-color: var(--gray6);
+  background: rgba(0, 0, 0, 0.04);
 }
 
 .order-expanded {
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--glass-shadow-md), var(--glass-rim);
 }
 
 .order-card-header {}
@@ -468,4 +469,21 @@
 .end-hint-text {
   font-size: 22rpx;
   color: var(--text-quaternary);
+}
+
+/* ═══════════════ Dark Mode ═══════════════ */
+.theme-dark .order-card:active {
+  background: rgba(255, 255, 255, 0.04);
+}
+.theme-dark .detail-file-row {
+  background: var(--glass-regular);
+}
+.theme-dark .detail-divider {
+  background-color: rgba(84, 84, 88, 0.35);
+}
+.theme-dark .page-size-option:active {
+  background: rgba(255, 255, 255, 0.06);
+}
+.theme-dark .page-size-option.option-active {
+  background: rgba(0, 122, 255, 0.12);
 }

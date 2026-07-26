@@ -10,6 +10,7 @@ Component({
     showSuccessModal: false,
     showAccessDeniedModal: false,
     showPageCountWarning: false,   // 页数未验证警告弹窗
+    modalClosing: false,           // 弹窗关闭动画进行中
     userRole: '',
     submitting: false,
     autoPrintEnabled: false,   // 无障碍打印开关（仅管理员可见）
@@ -46,12 +47,29 @@ Component({
     pageReady: false,         // 首次打开的入场动效
     pageExit: '',             // 退出动画: page-exit-left / page-exit-right
     pageSlide: 'page-init',   // 入场动画: page-fade-in / page-enter-left（初始隐藏防闪烁）
+    isDarkMode: wx.getStorageSync('isDarkMode') || false,
+    themeMode: wx.getStorageSync('themeMode') || 'auto',
+    themeSwitching: false,       // 主题切换过渡中
+    entranceDelay: {           // 打印页元素入场延时（从上到下逐个递进）
+      logo: '0.00s',
+      statusBar: '0.06s',
+      fileSection: '0.12s',
+      extParams: '0.18s',
+      autoPrint: '0.24s',
+      submit: '0.30s',
+    },
   },
   lifetimes: {
     attached() {
       // 首次启动清理残留的转场标记，防止热重载/缓存触发误动画
       wx.removeStorageSync('_tabFrom')
       wx.removeStorageSync('_tabTo')
+      // 从 app.globalData 初始化主题状态
+      const app = getApp()
+      this.setData({
+        isDarkMode: app.globalData.isDarkMode,
+        themeMode: app.globalData.themeMode,
+      })
       this._initScrollEngine()
       this._uploadTimers = {}   // { index: intervalId } — 每个文件独立的进度条定时器
       this._pollTimers = {}     // { index: intervalId } — 页数轮询定时器
@@ -69,6 +87,24 @@ Component({
       // 系统对话框返回 → 跳过入场动画，直接恢复数据刷新
       if (this._returningFromDialog) {
         this._returningFromDialog = false
+        this.loadPrinterStatus()
+        this._startPrinterPolling()
+        this._scheduleMeasure()
+        setTimeout(() => this._scheduleMeasure(300), 300)
+        return
+      }
+      // 从后台恢复 → 跳过入场动画，直接显示页面
+      const app = getApp()
+      const resumedFromBg = app.globalData._resumedFromBackground
+      if (resumedFromBg) {
+        app.globalData._resumedFromBackground = false
+        // 同步深色模式状态
+        const darkMode = wx.getStorageSync('darkMode') || false
+        this.setData({
+          pageExit: '', pageSlide: 'page-fade-in',
+          isDarkMode: app.globalData.isDarkMode,
+          themeMode: app.globalData.themeMode,
+        })
         this.loadPrinterStatus()
         this._startPrinterPolling()
         this._scheduleMeasure()
@@ -98,6 +134,14 @@ Component({
       }
 
       this.loadPrinterStatus()
+      // 同步主题状态（可能在"我"页面切换了，或系统自动切换）
+      if (app.globalData.isDarkMode !== this.data.isDarkMode ||
+          app.globalData.themeMode !== this.data.themeMode) {
+        this.setData({
+          isDarkMode: app.globalData.isDarkMode,
+          themeMode: app.globalData.themeMode,
+        })
+      }
       // 启动打印机状态轮询（30秒）
       this._startPrinterPolling()
       // 首次加载定价配置（与本地打印工具保持同步）
@@ -151,8 +195,43 @@ Component({
   },
   methods: {
     // 由 tabBar 调用：退出动画 → 回调中切换页面
+    // 弹窗打开时：播放关闭动画 → 关闭弹窗 + 切换 tab（一气呵成）
     animateExit(direction) {
+      if (this.data.showPageCountWarning || this.data.showSuccessModal || this.data.showAccessDeniedModal) {
+        this.setData({ modalClosing: true })
+        wx.setStorageSync('_tabFrom', 0)
+        wx.setStorageSync('_tabTo', 1)
+        const app = getApp()
+        const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
+        wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
+        const wasSuccess = this.data.showSuccessModal
+        setTimeout(() => {
+          const patch = {
+            showPageCountWarning: false,
+            showSuccessModal: false,
+            showAccessDeniedModal: false,
+            modalClosing: false
+          }
+          if (wasSuccess) {
+            patch.selectedFiles = []
+            patch.badgeCount = 0
+          }
+          this.setData(patch)
+          if (wasSuccess) {
+            try {
+              const tabBar = this.getTabBar && this.getTabBar()
+              if (tabBar) tabBar.setData({ hideBorder: false })
+            } catch (e) { /* 兼容低版本 */ }
+            this._stopAllUploadTimers()
+            this._stopAllPollTimers()
+            this._stopBreathingGlow()
+          }
+          wx.switchTab({ url: '/pages/me/me' })
+        }, 200)
+        return false
+      }
       this.setData({ pageExit: direction === 'left' ? 'page-exit-left' : 'page-exit-right' })
+      return true
     },
 
     _startPrinterPolling() {
@@ -254,6 +333,9 @@ Component({
               userRole: role,
             })
             wx.setStorageSync('userRole', role)
+            // 从服务端同步主题偏好（跨设备一致）
+            const app = getApp()
+            app.syncThemeFromServer(res.data.theme_mode)
           } else {
             console.error('[index.loadUserRole] 服务器返回异常:', res.statusCode, res.data)
           }
@@ -265,8 +347,12 @@ Component({
     },
 
     onAccessDeniedConfirm() {
-      this.setData({ showAccessDeniedModal: false })
-      wx.switchTab({ url: '/pages/me/me' })
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showAccessDeniedModal: false, modalClosing: false })
+        wx.switchTab({ url: '/pages/me/me' })
+      }, 200)
     },
 
     // ==================== 自定义橡皮筋滚动引擎 ====================
@@ -1531,13 +1617,19 @@ Component({
 
     // 确认强制提交（忽略页数未验证警告）
     onConfirmForceSubmit() {
-      this.setData({ showPageCountWarning: false })
-      this._doSubmit(true)
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showPageCountWarning: false, modalClosing: false })
+        this._doSubmit(true)
+      }, 200)
     },
 
     // 取消强制提交，返回等待
     onCancelForceSubmit() {
-      this.setData({ showPageCountWarning: false })
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showPageCountWarning: false, modalClosing: false })
+      }, 200)
     },
 
     _doSubmit(skipPageValidation) {
@@ -1759,19 +1851,25 @@ Component({
     },
 
     onCloseModal() {
-      this.setData({
-        showSuccessModal: false,
-        selectedFiles: [],
-      })
-      // 恢复 tab 栏发丝线
-      try {
-        const tabBar = this.getTabBar && this.getTabBar()
-        if (tabBar) tabBar.setData({ hideBorder: false })
-      } catch (e) { /* 兼容低版本 */ }
-      this._stopAllUploadTimers()
-      this._stopAllPollTimers()
-      this._stopBreathingGlow()
-      this._scheduleMeasure()
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({
+          showSuccessModal: false,
+          modalClosing: false,
+          selectedFiles: [],
+          badgeCount: 0,
+        })
+        // 恢复 tab 栏发丝线
+        try {
+          const tabBar = this.getTabBar && this.getTabBar()
+          if (tabBar) tabBar.setData({ hideBorder: false })
+        } catch (e) { /* 兼容低版本 */ }
+        this._stopAllUploadTimers()
+        this._stopAllPollTimers()
+        this._stopBreathingGlow()
+        this._scheduleMeasure()
+      }, 200)
     },
 
     noop() {},

@@ -5,6 +5,7 @@ Component({
   data: {
     pageSlide: 'page-init',
     pageExit: '',
+    isDarkMode: wx.getStorageSync('isDarkMode') || false,
     order: null,
     loading: true,
     statusMap: {
@@ -22,6 +23,8 @@ Component({
   },
   lifetimes: {
     attached() {
+      const app = getApp()
+      this.setData({ isDarkMode: app.globalData.isDarkMode })
       const pages = getCurrentPages()
       const options = pages[pages.length - 1].options || {}
       const orderId = options.order_id
@@ -34,9 +37,14 @@ Component({
   },
   pageLifetimes: {
     show() {
+      const app = getApp()
       const forward = wx.getStorageSync('_navForward')
       wx.removeStorageSync('_navForward')
-      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
+      this.setData({
+        pageSlide: forward ? 'page-enter-right' : 'page-enter-left',
+        pageExit: '',
+        isDarkMode: app.globalData.isDarkMode,
+      })
     },
     hide() {
       const forward = wx.getStorageSync('_navForward')

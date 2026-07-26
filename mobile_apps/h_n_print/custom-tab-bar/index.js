@@ -1,11 +1,10 @@
 // custom-tab-bar/index.js
 // 原生自定义 tabBar 组件（app.json 中 "tabBar.custom": true 时由框架注入）
-// 高亮通过每个 item 的 active 布尔值控制，避免 WXML 中 selected === index 的类型问题。
-// pageLifetimes.show / attached 时根据当前路由自动同步，也支持页面通过 getTabBar().setData() 直接更新。
 Component({
   data: {
     hideBorder: false,
     selected: 0,
+    isDarkMode: wx.getStorageSync('isDarkMode') || false,
     list: [
       {
         text: "打印",
@@ -24,14 +23,26 @@ Component({
   lifetimes: {
     attached() {
       this._syncSelected()
+      this._syncTheme()
     },
   },
   pageLifetimes: {
     show() {
       this._syncSelected()
+      this._syncTheme()
     },
   },
   methods: {
+    _syncTheme() {
+      const app = getApp()
+      const dark = typeof app.globalData.isDarkMode === 'boolean'
+        ? app.globalData.isDarkMode
+        : (wx.getStorageSync('isDarkMode') || false)
+      if (dark !== this.data.isDarkMode) {
+        this.setData({ isDarkMode: dark })
+      }
+    },
+
     // 根据当前页面路由批量更新 list[].active 与 selected
     _syncSelected() {
       const pages = getCurrentPages()
@@ -62,10 +73,19 @@ Component({
       const index = Number(e.currentTarget.dataset.index)
       const target = this.data.list[index]
       if (!target) return
-      if (index === this.data.selected) return  // 已在当前 tab
-      // 记录切换方向（必须在 setData 前读取旧值）
+      if (index === this.data.selected) return
+
       const prevSelected = this.data.selected
       const direction = prevSelected === 0 ? 'left' : 'right'
+
+      // 询问当前页面是否允许切换（弹窗打开时先关弹窗，不切换）
+      const pages = getCurrentPages()
+      const curPage = pages[pages.length - 1]
+      if (curPage && typeof curPage.animateExit === 'function') {
+        const shouldSwitch = curPage.animateExit(direction)
+        if (!shouldSwitch) return  // 弹窗被关闭，取消 tab 切换
+      }
+
       wx.setStorageSync('_tabFrom', prevSelected)
       wx.setStorageSync('_tabTo', index)
       const patch = { selected: index }
@@ -75,15 +95,13 @@ Component({
         }
       })
       this.setData(patch)
-      // 退场动画先播，再切换（animateExit 触发 CSS 动画，240ms 后切换确保动画播完）
-      const pages = getCurrentPages()
-      const curPage = pages[pages.length - 1]
-      if (curPage && typeof curPage.animateExit === 'function') {
-        curPage.animateExit(direction)
-      }
+
       setTimeout(() => {
+        const app = getApp()
+        const bg = (app.globalData.isDarkMode) ? '#1C1C1E' : '#F2F2F7'
+        wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
         wx.switchTab({ url: "/" + target.pagePath })
-      }, 240)  // 匹配 CSS exitLeft/exitRight 0.22s + 缓冲
+      }, 240)
     },
   },
 })

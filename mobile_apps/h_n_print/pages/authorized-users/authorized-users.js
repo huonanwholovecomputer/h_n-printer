@@ -6,15 +6,21 @@ Component({
   data: {
     pageSlide: 'page-init',
     pageExit: '',
+    isDarkMode: wx.getStorageSync('isDarkMode') || false,
     users: [],
     loading: true,
   },
 
   pageLifetimes: {
     show() {
+      const app = getApp()
       const forward = wx.getStorageSync('_navForward')
       wx.removeStorageSync('_navForward')
-      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
+      this.setData({
+        pageSlide: forward ? 'page-enter-right' : 'page-enter-left',
+        pageExit: '',
+        isDarkMode: app.globalData.isDarkMode,
+      })
     },
     hide() {
       const forward = wx.getStorageSync('_navForward')
@@ -24,6 +30,8 @@ Component({
 
   lifetimes: {
     attached() {
+      const app = getApp()
+      this.setData({ isDarkMode: app.globalData.isDarkMode })
       this.loadUsers()
     },
   },

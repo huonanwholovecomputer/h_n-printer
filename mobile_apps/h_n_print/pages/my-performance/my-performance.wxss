@@ -9,11 +9,12 @@
 .date-picker {
   display: flex;
   justify-content: space-around;
-  background: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 28rpx 20rpx;
   margin-bottom: 28rpx;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
 }
 
 .picker-group {
@@ -53,13 +54,14 @@
 }
 
 .stat-card {
-  background: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 36rpx 16rpx;
   display: flex;
   flex-direction: column;
   align-items: center;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
 }
 
 .card-value {

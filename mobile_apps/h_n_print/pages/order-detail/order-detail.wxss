@@ -42,10 +42,11 @@ page {
 
 /* ── Detail Card ── */
 .detail-card {
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   overflow: hidden;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
 }
 
 .status-bar {
@@ -194,4 +195,15 @@ page {
 .btn-reprint:active {
   opacity: 0.85;
   transform: scale(0.97);
+}
+
+/* ═══════════════ Dark Mode ═══════════════ */
+.theme-dark .detail-file-card {
+  background: var(--glass-regular);
+}
+.theme-dark .btn-cancel:active {
+  background: rgba(255, 59, 48, 0.08);
+}
+.theme-dark .info-group {
+  border-bottom-color: rgba(84, 84, 88, 0.35);
 }

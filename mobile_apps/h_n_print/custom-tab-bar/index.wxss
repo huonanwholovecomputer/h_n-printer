@@ -1,19 +1,29 @@
-/* Apple-style Custom Tab Bar — translucent with blur */
+/* Apple Liquid Glass Custom Tab Bar — 低透明度 + 适度模糊 + 层次感 */
 
 /* ── Tab Bar ── */
 .tab-bar {
   position: fixed;
-  bottom: 0;
-  left: 0;
-  right: 0;
-  height: calc(100rpx + env(safe-area-inset-bottom));
-  padding-bottom: env(safe-area-inset-bottom);
+  bottom: calc(12rpx + env(safe-area-inset-bottom));
+  left: 80rpx;
+  right: 80rpx;
+  height: 90rpx;
   display: flex;
-  background-color: rgba(255, 255, 255, 0.25);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
-  border-top: 0.5px solid rgba(60, 60, 67, 0.12);
-  transition: border-top-color 0.3s ease;
+  /* 半透明基底：足够透光，又能看清玻璃存在 */
+  background: var(--glass-regular);
+  /* Apple 风格：适度模糊 + 饱和度提升，让背景色渗出但不过度融糊 */
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  border-radius: 30rpx;
+  /* 多层阴影模拟玻璃深度：
+     1. 外投影 — 悬浮感
+     2. 顶部内高光 — 玻璃边缘折射亮线
+     3. 底部内阴影 — 玻璃厚度感
+     4. 极细外描边 — 玻璃轮廓 */
+  box-shadow:
+    0 8rpx 32rpx rgba(0, 0, 0, 0.08),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.7),
+    inset 0 -1rpx 0 rgba(0, 0, 0, 0.04),
+    0 0 0 0.5rpx rgba(0, 0, 0, 0.06);
   z-index: 9999;
 }
 

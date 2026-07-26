@@ -1,7 +1,22 @@
 <!--me.wxml-->
-<navigation-bar title="我" back="{{false}}" color="black" background="#FFF"></navigation-bar>
+<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}"></page-meta>
+<navigation-bar title="我" back="{{false}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 
-<view class="page-root {{pageSlide}} {{pageExit}}">
+<!-- 深色遮罩层：固定在视口底层，遮住页面切换动画时露出的白色窗口背景 -->
+<view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
+
+<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}} {{themeSwitching ? 'theme-switching' : ''}}">
+  <!-- 深色模式切换按钮（右上角） -->
+  <view class="theme-toggle-btn" bindtap="onToggleTheme" hover-class="tap-active">
+    <text>{{themeMode === 'auto' ? '🌓' : (themeMode === 'dark' ? '🌙' : '☀️')}}</text>
+  </view>
+  <!-- 返回顶部按钮（右下角） -->
+  <view class="scroll-top-btn {{scrollTop > 200 ? 'scroll-top-visible' : ''}}" bindtap="onScrollToTop" hover-class="tap-active">
+    <view class="scroll-top-arrow">
+      <view class="arrow-bar arrow-left"></view>
+      <view class="arrow-bar arrow-right"></view>
+    </view>
+  </view>
   <!-- 自定义滚动容器：负责橡皮筋回弹物理（与首页一致） -->
   <view
     class="scroller"
@@ -30,7 +45,7 @@
     </view>
 
     <!-- 管理员：生成许可密钥 -->
-    <view wx:if="{{userRole === 'admin'}}" class="license-section">
+    <view class="license-section admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>生成许可密钥</text>
@@ -46,25 +61,26 @@
         <view wx:if="{{isSuperAdmin}}" class="key-type-row">
           <text class="key-type-label">密钥类型</text>
           <view class="key-type-toggle">
-            <view class="key-type-option {{keyType === 'temp' ? 'key-type-active' : ''}}" bindtap="onSelectKeyType" data-type="temp" hover-class="tap-active">临时许可</view>
-            <view class="key-type-option {{keyType === 'admin' ? 'key-type-active' : ''}}" bindtap="onSelectKeyType" data-type="admin" hover-class="tap-active">管理员许可</view>
+            <view class="key-type-slider {{keyType === 'admin' ? 'slider-right' : ''}}"></view>
+            <view class="key-type-option {{keyType === 'temp' ? 'opt-active' : ''}}" bindtap="onSelectKeyType" data-type="temp" hover-class="tap-active">临时许可</view>
+            <view class="key-type-option {{keyType === 'admin' ? 'opt-active' : ''}}" bindtap="onSelectKeyType" data-type="admin" hover-class="tap-active">管理员许可</view>
           </view>
         </view>
         <button class="generate-btn" bindtap="onGenerateKey" hover-class="generate-hover" loading="{{generating}}" disabled="{{generating}}">生成许可密钥</button>
       </view>
 
-      <!-- 活跃密钥列表（向下延伸排列，支持多个同时存在） -->
+      <!-- 活跃密钥列表（与管理员卡片同构：扁平 wrap + 滑出删除） -->
       <view wx:for="{{activeKeys}}" wx:key="key"
-            class="key-drawer key-drawer-show {{item.entering ? 'key-entering' : ''}} {{item.exiting ? 'key-exiting' : ''}} {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}} {{item.status !== 'unused' ? 'key-drawer-locked' : ''}}">
+            class="key-card-wrap {{item.entering ? 'key-entering' : ''}} {{item.exiting ? 'key-exiting' : ''}} {{item.deleteQuickFade ? 'quick-fade' : ''}} {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}} {{item.status !== 'unused' ? 'key-drawer-locked' : ''}}">
         <!-- 右侧删除按钮（绝对定位，左滑时露出） -->
         <view class="key-delete" catchtap="onRevokeKey" data-idx="{{index}}"
               style="opacity: {{item.deleteOpacity}}">
-          <text class="delete-icon">✕</text>
+          <text class="delete-icon">🗑</text>
           <text>{{item.status === 'unused' ? '作废' : '删除'}}</text>
         </view>
         <!-- 卡片本体：可左滑 -->
-        <view class="key-drawer-inner {{item.swipeTransition ? '' : 'no-transition'}}"
-              style="transform: translateX({{item.swipeX}}px);"
+        <view class="key-card {{item.swipeTransition ? '' : 'no-transition'}}"
+              style="transform: translateX({{item.swipeX}}px); transition: {{item.swipeTransition === false ? 'none' : 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)'}};"
               bindtouchstart="onKeyTouchStart"
               bindtouchmove="onKeyTouchMove"
               bindtouchend="onKeyTouchEnd"
@@ -80,21 +96,15 @@
               <text wx:else class="key-countdown">已使用</text>
             </view>
           </view>
-          <!-- 兑换用户信息（used_waiting / used_done 时显示） -->
           <view wx:if="{{item.status !== 'unused'}}" class="key-user-info">
             <image wx:if="{{item.used_by_avatar_url}}" class="key-user-avatar" src="{{item.used_by_avatar_url}}" mode="aspectFill" />
             <text class="key-user-name">{{item.used_by_nickname}}</text>
           </view>
           <view class="key-actions">
-            <!-- unused: 未过期可复制 -->
             <button wx:if="{{item.status === 'unused' && !item.expired}}" class="copy-btn" bindtap="onCopyKey" data-idx="{{index}}" hover-class="tap-active">复制</button>
-            <!-- unused 已过期 -->
             <button wx:elif="{{item.status === 'unused' && item.expired}}" class="copy-btn copy-btn-disabled">已过期</button>
-            <!-- used_waiting + admin: 确认并关闭 -->
             <button wx:elif="{{item.status === 'used_waiting' && item.type === 'admin'}}" class="copy-btn btn-confirm-admin" bindtap="onConfirmAdminKey" data-idx="{{index}}" hover-class="tap-active">确认并关闭</button>
-            <!-- used_waiting + temp: 等待任务中 -->
             <button wx:elif="{{item.status === 'used_waiting' && item.type !== 'admin'}}" class="copy-btn btn-waiting" disabled>等待任务中</button>
-            <!-- used_done: 无操作按钮（仅显示已使用状态） -->
           </view>
         </view>
       </view>
@@ -142,7 +152,7 @@
     </view>
 
     <!-- 管理员：存储统计 -->
-    <view wx:if="{{userRole === 'admin' && storageStats}}" class="storage-section " style="animation-delay: 0.08s">
+    <view class="storage-section admin-collapsible {{userRole === 'admin' && storageStats ? 'admin-expanded' : ''}}" style="animation-delay: 0.08s">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>服务器存储</text>
@@ -180,7 +190,7 @@
     </view>
 
     <!-- 管理员：许可用户列表 -->
-    <view wx:if="{{userRole === 'admin'}}" class="users-section " style="animation-delay: 0.12s">
+    <view class="users-section admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}" style="animation-delay: 0.12s">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>许可用户</text>
@@ -202,7 +212,7 @@
     </view>
 
     <!-- 管理员/超级管理员：历史授权用户 -->
-    <view wx:if="{{userRole === 'admin'}}" class="role-actions" style="animation-delay: 0.14s">
+    <view class="role-actions admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}" style="animation-delay: 0.14s">
       <view class="role-btn user-btn" bindtap="onGoAuthorizedUsers" hover-class="tap-active">
         <text class="role-btn-icon">👥</text>
         <text class="role-btn-text">历史授权用户</text>
@@ -211,7 +221,7 @@
     </view>
 
     <!-- 管理员/超级管理员：本地打印任务 -->
-    <view wx:if="{{userRole === 'admin' || isSuperAdmin}}" class="role-actions" style="animation-delay: 0.16s">
+    <view class="role-actions admin-collapsible {{userRole === 'admin' || isSuperAdmin ? 'admin-expanded' : ''}}" style="animation-delay: 0.16s">
       <view class="role-btn user-btn" bindtap="onGoLocalOrders" hover-class="tap-active">
         <text class="role-btn-icon">🖨️</text>
         <text class="role-btn-text">本地打印任务</text>
@@ -405,3 +415,16 @@
   </view>
 </view>
 </view>
+
+  <!-- 通用确认弹窗（在 page-root 外，position:fixed 锚定真实视口） -->
+  <view wx:if="{{showConfirmModal}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCancelConfirm">
+    <view class="modal-sheet" catchtap="noop">
+      <view class="modal-icon-wrap" style="background-color: rgba(255, 59, 48, 0.1); color: {{confirmModalConfirmColor || '#ff4d4f'}};">!</view>
+      <text class="title-medium" style="margin-bottom: 8rpx;">{{confirmModalTitle}}</text>
+      <text class="body-small">{{confirmModalContent}}</text>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" bindtap="onCancelConfirm" hover-class="tap-active">取消</button>
+        <button class="btn-primary modal-half-btn" style="background-color: {{confirmModalConfirmColor || '#ff4d4f'}};" bindtap="onConfirmModal" hover-class="tap-active">{{confirmModalConfirmText}}</button>
+      </view>
+    </view>
+  </view>

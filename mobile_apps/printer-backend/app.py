@@ -246,9 +246,6 @@ def cleanup_expired_files():
     ).fetchall()
     conn.close()
 
-    if not rows:
-        return
-
     md5_index = load_md5_index()
     deleted_count = 0
 
@@ -291,6 +288,31 @@ def cleanup_expired_files():
             "retention_days": days,
             "retention_hours": hours,
         })
+
+    # 清理 uploads/ 根目录下的孤儿临时文件（上传中断遗留，无 files 表记录）
+    import re
+    try:
+        orphan_deleted = 0
+        for fname in os.listdir(UPLOAD_DIR):
+            fpath = os.path.join(UPLOAD_DIR, fname)
+            if not os.path.isfile(fpath):
+                continue
+            # 临时文件命名格式: <32位hex uuid>.<ext>
+            if not re.match(r'^[0-9a-f]{32}\.\w+$', fname):
+                continue
+            # 保留至少 1 小时，防止误删正在上传中的文件
+            mtime = datetime.fromtimestamp(os.path.getmtime(fpath))
+            if (datetime.now() - mtime).total_seconds() < 3600:
+                continue
+            try:
+                os.remove(fpath)
+                orphan_deleted += 1
+            except OSError:
+                pass
+        if orphan_deleted > 0:
+            print(f"  [CLEANUP] 已清理 {orphan_deleted} 个孤儿临时文件")
+    except Exception as e:
+        print(f"  [CLEANUP] 清理孤儿临时文件出错: {e}")
 
 
 # -------- 加载配置（内部默认值 + config.py 覆盖）--------
@@ -666,6 +688,12 @@ def init_db():
         user_conn.execute("ALTER TABLE users ADD COLUMN temp_until TEXT DEFAULT NULL")
         user_conn.commit()
         print("  已添加 users.temp_until 列")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        user_conn.execute("ALTER TABLE users ADD COLUMN theme_mode TEXT DEFAULT 'auto'")
+        user_conn.commit()
+        print("  已添加 users.theme_mode 列")
     except sqlite3.OperationalError:
         pass
 
@@ -2829,7 +2857,7 @@ def get_me():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_user_db()
     row = conn.execute(
-        "SELECT temp_until, role FROM users WHERE openid = ?", (g.openid,)
+        "SELECT temp_until, role, theme_mode FROM users WHERE openid = ?", (g.openid,)
     ).fetchone()
     if row and row["temp_until"]:
         temp_until = row["temp_until"]
@@ -2858,6 +2886,7 @@ def get_me():
             }
     conn.close()
     is_super = SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID
+    theme_mode = (row["theme_mode"] if row and row["theme_mode"] else "auto") if row else "auto"
     return jsonify({
         "success": True,
         "openid": g.openid,
@@ -2867,7 +2896,38 @@ def get_me():
         "temp_until": temp_until,
         "has_temp_access": has_temp_access,
         "license_info": license_info,
+        "theme_mode": theme_mode,
     })
+
+
+# ==================== 主题偏好同步 ====================
+
+
+@app.route("/api/me/theme", methods=["PUT"])
+@login_required
+def update_theme():
+    """保存用户主题偏好：'auto' | 'light' | 'dark'"""
+    data = request.get_json()
+    theme_mode = (data or {}).get("theme_mode", "auto")
+    if theme_mode not in ("auto", "light", "dark"):
+        return jsonify({"success": False, "message": "无效的主题模式"}), 400
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_user_db()
+    existing = conn.execute("SELECT openid FROM users WHERE openid = ?", (g.openid,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE users SET theme_mode = ?, updated_at = ? WHERE openid = ?",
+            (theme_mode, now, g.openid),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO users (openid, theme_mode, updated_at) VALUES (?, ?, ?)",
+            (g.openid, theme_mode, now),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({"success": True, "theme_mode": theme_mode})
 
 
 # ==================== 授权用户列表（管理员查看）====================
@@ -3660,7 +3720,7 @@ def admin_storage():
             continue
         for fname in files:
             # 跳过配置文件
-            if fname in ("md5_index.json", "retention_config.json"):
+            if fname in ("md5_index.json", "retention_config.json", "order_counter.json"):
                 continue
             fpath = os.path.join(root, fname)
             try:

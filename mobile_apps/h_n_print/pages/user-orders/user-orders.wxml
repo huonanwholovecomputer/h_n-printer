@@ -1,6 +1,8 @@
 <!--user-orders.wxml — 查看指定用户/来源的订单列表-->
-<view class="page-root {{pageSlide}} {{pageExit}}">
-<navigation-bar title="{{pageTitle}}" back="{{true}}" color="black" background="#FFF"></navigation-bar>
+<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}"></page-meta>
+<navigation-bar title="{{pageTitle}}" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
+<view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
+<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
 
 <scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
   <view class="container">

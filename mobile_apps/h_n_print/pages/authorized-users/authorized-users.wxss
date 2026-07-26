@@ -73,18 +73,19 @@
 }
 
 .user-card-item {
-  background-color: var(--bg-card);
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: 24rpx 28rpx;
   margin-bottom: 12rpx;
   display: flex;
   align-items: center;
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
   transition: transform 0.12s ease;
 }
 
 .user-card-item:active {
-  background-color: var(--gray6);
+  background: rgba(0, 0, 0, 0.04);
 }
 
 /* Avatar circle */
@@ -175,4 +176,9 @@
   font-size: 32rpx;
   color: var(--text-quaternary);
   margin-top: 2rpx;
+}
+
+/* ═══════════════ Dark Mode ═══════════════ */
+.theme-dark .user-card-item:active {
+  background: rgba(255, 255, 255, 0.04);
 }

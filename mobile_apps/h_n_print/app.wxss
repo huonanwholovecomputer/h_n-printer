@@ -1,7 +1,7 @@
-/**app.wxss** — Apple Design System for HN 云打印 */
+/**app.wxss** — Apple Liquid Glass Design System for HN 云打印 */
 
 /* ============================================================
-   1. Design Tokens — Apple-style color & spacing system
+   1. Design Tokens — Liquid Glass (iOS 26+) color & spacing system
    ============================================================ */
 
 page {
@@ -21,15 +21,35 @@ page {
   --gray5: #E5E5EA;
   --gray6: #F2F2F7;
 
-  /* Semantic colors */
+  /* Semantic colors — soft gradient background (liquid glass "sampling" surface) */
   --bg-primary: #F2F2F7;
+  --bg-primary-gradient: linear-gradient(175deg, #F8F8FC 0%, #EDEDF3 40%, #E8E8F0 100%);
   --bg-card: #FFFFFF;
   --bg-elevated: rgba(255, 255, 255, 0.85);
   --text-primary: #000000;
   --text-secondary: #3C3C43;
   --text-tertiary: #8E8E93;
   --text-quaternary: #C7C7CC;
-  --separator: rgba(60, 60, 67, 0.12);
+  --separator: rgba(60, 60, 67, 0.10);
+  --separator-strong: rgba(60, 60, 67, 0.15);
+
+  /* ═══ Liquid Glass Material Tokens ═══ */
+  /* 平衡点：既能让背景过渡透过，卡片在浅色背景上也有足够辨识度 */
+  --glass-light:   rgba(255, 255, 255, 0.35);
+  --glass-regular: rgba(255, 255, 255, 0.58);
+  --glass-heavy:   rgba(255, 255, 255, 0.76);
+  /* Rim highlight — 顶部内高光模拟玻璃折射 */
+  --glass-rim:        inset 0 0.5rpx 0 rgba(255, 255, 255, 0.6);
+  --glass-rim-strong: inset 0 1rpx 0 rgba(255, 255, 255, 0.75);
+  /* Glass shadow — 外阴影模拟悬浮深度（增强后卡片层次更分明） */
+  --glass-shadow-sm: 0 2rpx 8rpx rgba(0, 0, 0, 0.08), 0 0 0 0.5rpx rgba(0, 0, 0, 0.04);
+  --glass-shadow-md: 0 4rpx 16rpx rgba(0, 0, 0, 0.10), 0 0 0 0.5rpx rgba(0, 0, 0, 0.05);
+  --glass-shadow-lg: 0 8rpx 30rpx rgba(0, 0, 0, 0.12), 0 0 0 1rpx rgba(0, 0, 0, 0.04);
+  /* Glass border — 极细描边勾勒玻璃轮廓 */
+  --glass-border: 0.5rpx solid rgba(255, 255, 255, 0.4);
+  --glass-border-dark: 0.5rpx solid rgba(60, 60, 67, 0.07);
+
+  /* Legacy shadow tokens (still used in some components) */
   --shadow-sm: 0 1rpx 4rpx rgba(0, 0, 0, 0.04);
   --shadow-md: 0 4rpx 16rpx rgba(0, 0, 0, 0.08);
   --shadow-lg: 0 8rpx 32rpx rgba(0, 0, 0, 0.12);
@@ -47,17 +67,16 @@ page {
   --space-xl: 24rpx;
   --space-2xl: 32rpx;
 
-  /* Radii */
-  --radius-sm: 10rpx;
-  --radius-md: 14rpx;
-  --radius-lg: 20rpx;
-  --radius-xl: 24rpx;
+  /* Radii — slightly larger for Liquid Glass aesthetic */
+  --radius-sm: 12rpx;
+  --radius-md: 16rpx;
+  --radius-lg: 22rpx;
+  --radius-xl: 28rpx;
 
   height: 100vh;
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background-color: var(--bg-primary);
   font-family: var(--font-system);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
@@ -139,25 +158,51 @@ page {
 }
 
 /* ============================================================
-   4. Cards — iOS-style rounded containers
+   4. Cards — Liquid Glass containers (iOS 26 style)
    ============================================================ */
 
-.card {
-  background-color: var(--bg-card);
+/* Glass card — the default surface for Liquid Glass UI */
+.glass-card {
+  background: var(--glass-regular);
   border-radius: var(--radius-lg);
   padding: var(--space-lg);
-  box-shadow: var(--shadow-sm);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
   width: 100%;
   box-sizing: border-box;
 }
 
-.card-elevated {
-  background-color: var(--bg-card);
+.glass-card-elevated {
+  background: var(--glass-heavy);
   border-radius: var(--radius-lg);
   padding: var(--space-lg);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--glass-shadow-md), var(--glass-rim-strong);
+  border: var(--glass-border);
   width: 100%;
   box-sizing: border-box;
+}
+
+/* Legacy card aliases — remapped to glass */
+.card {
+  background: var(--glass-regular);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: var(--glass-border-dark);
+  width: 100%;
+  box-sizing: border-box;
+  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
+}
+
+.card-elevated {
+  background: var(--glass-heavy);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  box-shadow: var(--glass-shadow-md), var(--glass-rim-strong);
+  border: var(--glass-border);
+  width: 100%;
+  box-sizing: border-box;
+  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
 }
 
 /* Card entrance — layout expand (ease-out) + visual spring in (overshoot), dual animation */
@@ -302,20 +347,20 @@ page {
 .btn-primary {
   width: 100%;
   background: linear-gradient(180deg,
-    rgba(0, 122, 255, 0.88) 0%,
-    rgba(0, 105, 220, 0.94) 100%);
+    rgba(0, 122, 255, 0.90) 0%,
+    rgba(0, 110, 230, 0.95) 100%);
   color: #FFFFFF;
   font-size: 32rpx;
   font-weight: 600;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-md);
   padding: 26rpx 0;
   text-align: center;
   border: none;
   letter-spacing: -0.01em;
-  /* Glass depth */
+  /* Glass depth — rim highlight + lens shadow */
   box-shadow:
-    0 4rpx 16rpx rgba(0, 122, 255, 0.25),
-    inset 0 2rpx 0 rgba(255, 255, 255, 0.35),
+    0 4rpx 16rpx rgba(0, 122, 255, 0.28),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.40),
     inset 0 -1rpx 0 rgba(0, 0, 0, 0.08);
   transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
               box-shadow 0.12s ease,
@@ -323,10 +368,10 @@ page {
 }
 .btn-primary:active {
   transform: scale(0.97);
-  filter: brightness(1.1);
+  filter: brightness(1.12);
   box-shadow:
-    0 2rpx 8rpx rgba(0, 122, 255, 0.2),
-    inset 0 2rpx 0 rgba(255, 255, 255, 0.4);
+    0 2rpx 8rpx rgba(0, 122, 255, 0.22),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.50);
 }
 .btn-primary[disabled] {
   opacity: 0.35;
@@ -337,49 +382,49 @@ page {
 /* Secondary — clear glass */
 .btn-secondary {
   width: 100%;
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--glass-regular);
   color: var(--blue);
   font-size: 28rpx;
   font-weight: 500;
-  border: 1rpx solid rgba(0, 122, 255, 0.2);
-  border-radius: var(--radius-lg);
+  border: 1rpx solid rgba(0, 122, 255, 0.18);
+  border-radius: var(--radius-md);
   padding: 22rpx 0;
   text-align: center;
   box-shadow:
-    0 2rpx 8rpx rgba(0, 0, 0, 0.04),
-    inset 0 1rpx 0 rgba(255, 255, 255, 0.8);
+    0 2rpx 8rpx rgba(0, 0, 0, 0.05),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.85);
   transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
               background-color 0.12s ease,
               box-shadow 0.12s ease;
 }
 .btn-secondary:active {
   transform: scale(0.97);
-  background: rgba(0, 122, 255, 0.1);
+  background: rgba(0, 122, 255, 0.10);
   box-shadow:
     0 1rpx 4rpx rgba(0, 0, 0, 0.04),
-    inset 0 1rpx 0 rgba(255, 255, 255, 0.9);
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.95);
 }
 
 /* Destructive — red-tinted glass */
 .btn-destructive {
   width: 100%;
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--glass-regular);
   color: var(--red);
   font-size: 28rpx;
   font-weight: 500;
-  border: 1rpx solid rgba(255, 59, 48, 0.2);
-  border-radius: var(--radius-lg);
+  border: 1rpx solid rgba(255, 59, 48, 0.18);
+  border-radius: var(--radius-md);
   padding: 22rpx 0;
   text-align: center;
   box-shadow:
-    0 2rpx 8rpx rgba(0, 0, 0, 0.04),
-    inset 0 1rpx 0 rgba(255, 255, 255, 0.8);
+    0 2rpx 8rpx rgba(0, 0, 0, 0.05),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.85);
   transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
               background-color 0.12s ease;
 }
 .btn-destructive:active {
   transform: scale(0.97);
-  background: rgba(255, 59, 48, 0.1);
+  background: rgba(255, 59, 48, 0.10);
 }
 
 /* Small glass chip */
@@ -387,17 +432,17 @@ page {
   font-size: 24rpx;
   font-weight: 500;
   color: var(--blue);
-  background: rgba(0, 122, 255, 0.08);
+  background: rgba(0, 122, 255, 0.07);
   border-radius: var(--radius-sm);
   padding: 10rpx 28rpx;
   border: 1rpx solid rgba(0, 122, 255, 0.12);
-  box-shadow: inset 0 1rpx 0 rgba(255, 255, 255, 0.6);
+  box-shadow: inset 0 1rpx 0 rgba(255, 255, 255, 0.7);
   transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
               background-color 0.1s ease;
 }
 .btn-small:active {
   transform: scale(0.95);
-  background: rgba(0, 122, 255, 0.15);
+  background: rgba(0, 122, 255, 0.14);
 }
 
 /* ============================================================
@@ -435,22 +480,27 @@ page {
 }
 
 /* ============================================================
-   9. Modal / Sheet — iOS action sheet style
+   9. Modal / Sheet — Liquid Glass backdrop + spring card
    ============================================================ */
+   /* NOTE: backdrop-filter is intentionally omitted here because
+      WeChat's mini-program compositor cannot reliably sample
+      backdrop from GPU layers that use CSS transform (e.g. the
+      custom scroll engine's translateY). The uneven-blur symptom
+      (top half blur ≠ bottom half blur) is caused by partial
+      layer capture. A higher-opacity solid background provides
+      a uniform, reliable dimming effect instead. */
 
 .modal-mask {
   position: fixed;
   top: 0; left: 0; right: 0; bottom: 0;
-  background-color: rgba(255, 255, 255, 0.4);
-  backdrop-filter: saturate(180%) blur(20px);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  background-color: rgba(255, 255, 255, 0.45);
+  backdrop-filter: saturate(200%) blur(44px);
+  -webkit-backdrop-filter: saturate(200%) blur(44px);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 1000;
   animation: fadeIn 0.2s ease;
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
 }
 
 @keyframes fadeIn {
@@ -461,6 +511,7 @@ page {
 .modal-sheet {
   width: 540rpx;
   background-color: var(--bg-card);
+  color: var(--text-primary);
   border-radius: var(--radius-xl);
   padding: 48rpx 40rpx 36rpx;
   display: flex;
@@ -470,14 +521,50 @@ page {
   box-shadow: var(--shadow-lg);
 }
 
+/* Modal footer — two buttons side by side */
+.modal-buttons {
+  display: flex;
+  width: 100%;
+  gap: 24rpx;
+  margin-top: 32rpx;
+}
+.modal-half-btn {
+  flex: 1;
+  width: auto;
+  padding: 22rpx 0;
+  font-size: 26rpx;
+}
+
 @keyframes sheetSpringIn {
   from {
     opacity: 0;
-    transform: translateY(80rpx) scale(0.92);
+    transform: translateY(60rpx) scale(0.94);
   }
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+
+/* Modal close animation — mask fades, sheet shrinks */
+.modal-mask.modal-closing {
+  animation: fadeOut 0.18s ease forwards;
+}
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+.modal-mask.modal-closing .modal-sheet {
+  animation: sheetSpringOut 0.18s ease forwards;
+}
+@keyframes sheetSpringOut {
+  from {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(20rpx) scale(0.96);
   }
 }
 
@@ -494,8 +581,8 @@ page {
 .stepper-btn {
   width: 64rpx;
   height: 64rpx;
-  border-radius: var(--radius-md);
-  background: rgba(255, 255, 255, 0.5);
+  border-radius: var(--radius-sm);
+  background: var(--glass-regular);
   color: var(--text-primary);
   font-size: 34rpx;
   font-weight: 500;
@@ -503,16 +590,14 @@ page {
   align-items: center;
   justify-content: center;
   line-height: 1;
-  border: 1rpx solid rgba(60, 60, 67, 0.08);
-  box-shadow:
-    0 2rpx 6rpx rgba(0, 0, 0, 0.04),
-    inset 0 1rpx 0 rgba(255, 255, 255, 0.8);
+  border: var(--glass-border-dark);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   transition: transform 0.1s ease, background-color 0.1s ease, box-shadow 0.1s ease;
 }
 .stepper-btn:active {
   transform: scale(0.93);
-  background: rgba(0, 0, 0, 0.04);
-  box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.04);
+  background: rgba(0, 0, 0, 0.06);
+  box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.05);
 }
 .stepper-hover {
   transform: scale(0.9) !important;
@@ -598,8 +683,47 @@ page {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  background-color: var(--bg-primary);
+  background: var(--bg-primary-gradient);
   min-height: 0;
+  position: relative;
+  z-index: 1;
+}
+
+/* ═══════════════ 背景遮罩层 ═══════════════ */
+/* 固定在视口底层，使用微妙渐变让 glass 表面有内容可"折射" */
+.theme-bg-layer {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  background: var(--bg-primary-gradient);
+  pointer-events: none;
+  transition: background 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.theme-bg-layer.bg-dark {
+  background: linear-gradient(175deg, #222226 0%, #1C1C1E 40%, #18181C 100%);
+}
+
+/* 确保导航栏在遮罩层之上 */
+.weui-navigation-bar {
+  position: relative;
+  z-index: 2;
+}
+
+/* ═══════════════ 主题切换渐变 ═══════════════ */
+/* 只在全屏遮罩层上做过渡，其他元素瞬间切换，避免页面加载时闪白 */
+/* theme-bg-layer 的 transition 已在其定义处设置 */
+
+/* 主题切换脉冲：用亮度微调掩盖背景突变 */
+.theme-switching .theme-bg-layer {
+  animation: themeCrossfade 0.45s ease;
+}
+@keyframes themeCrossfade {
+  0%   { filter: brightness(1.00); }
+  40%  { filter: brightness(1.10); }
+  100% { filter: brightness(1.00); }
 }
 
 .scroller {
@@ -614,7 +738,448 @@ page {
 }
 
 /* ============================================================
-   13. Animation curves — Apple's spring equivalents
+   13. Dark Mode — Liquid Glass dark materials
+   ============================================================ */
+
+/* 深色模式：覆盖浅色变量 */
+.theme-dark {
+  /* Semantic colors — dark */
+  --bg-primary: #1C1C1E;
+  --bg-primary-gradient: linear-gradient(175deg, #222226 0%, #1C1C1E 40%, #18181C 100%);
+  --bg-card: #2C2C2E;
+  --bg-elevated: rgba(44, 44, 46, 0.85);
+  --text-primary: #FFFFFF;
+  --text-secondary: #EBEBF5;
+  --text-tertiary: #98989D;
+  --text-quaternary: #636366;
+  --separator: rgba(84, 84, 88, 0.40);
+  --separator-strong: rgba(84, 84, 88, 0.55);
+  --shadow-sm: 0 1rpx 4rpx rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4rpx 16rpx rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8rpx 32rpx rgba(0, 0, 0, 0.4);
+
+  /* ── Dark Liquid Glass Materials ── */
+  --glass-regular: rgba(255, 255, 255, 0.08);
+  --glass-heavy:  rgba(255, 255, 255, 0.12);
+  --glass-light:  rgba(255, 255, 255, 0.04);
+  --glass-rim:     inset 0 1rpx 0 rgba(255, 255, 255, 0.07);
+  --glass-rim-strong: inset 0 1rpx 0 rgba(255, 255, 255, 0.10);
+  --glass-shadow-sm: 0 2rpx 8rpx rgba(0, 0, 0, 0.30), 0 0 0 0.5rpx rgba(255, 255, 255, 0.04);
+  --glass-shadow-md: 0 4rpx 16rpx rgba(0, 0, 0, 0.35), 0 0 0 0.5rpx rgba(255, 255, 255, 0.05);
+  --glass-shadow-lg: 0 8rpx 30rpx rgba(0, 0, 0, 0.42), 0 0 0 1rpx rgba(255, 255, 255, 0.05);
+  --glass-border: 0.5rpx solid rgba(255, 255, 255, 0.07);
+  --glass-border-dark: 0.5rpx solid rgba(84, 84, 88, 0.22);
+
+  /* Raw grays — iOS dark mode equivalents, prevents white flash on :active/hover */
+  --gray: #98989D;
+  --gray2: #636366;
+  --gray3: #545458;
+  --gray4: #48484A;
+  --gray5: #3A3A3C;
+  --gray6: #2C2C2E;
+}
+
+/* 深色模式：导航栏背景 — 深色玻璃 */
+.theme-dark .weui-navigation-bar__inner {
+  background: rgba(28, 28, 30, 0.88);
+  box-shadow: inset 0 -1rpx 0 rgba(255, 255, 255, 0.08);
+}
+
+.theme-dark .weui-navigation-bar__btn_goback {
+  background-color: rgba(255, 255, 255, 0.85);
+}
+
+/* 深色模式：tabBar — 深色液态玻璃浮层 */
+.tab-bar.theme-dark,
+.theme-dark .tab-bar {
+  background: rgba(26, 26, 28, 0.50);
+  box-shadow:
+    0 8rpx 32rpx rgba(0, 0, 0, 0.45),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.12),
+    inset 0 -1rpx 0 rgba(0, 0, 0, 0.20),
+    0 0 0 0.5rpx rgba(255, 255, 255, 0.08);
+}
+
+.tab-bar.theme-dark .tab-text,
+.theme-dark .tab-text {
+  color: #98989D;
+}
+
+.tab-bar.theme-dark .text-active,
+.theme-dark .text-active {
+  color: #409CFF;
+}
+
+.tab-bar.theme-dark .icon-active,
+.theme-dark .icon-active {
+  background-color: rgba(64, 156, 255, 0.15);
+}
+
+/* 深色模式：卡片适配 — glass tokens auto-adapt dark values */
+.theme-dark .user-item,
+.theme-dark .role-btn {
+  background: var(--glass-regular);
+  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
+}
+
+.theme-dark .file-card {
+  background: var(--glass-regular);
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+
+.theme-dark .key-card {
+  background: var(--glass-heavy);
+  transition: background 0.4s ease, box-shadow 0.4s ease;
+}
+
+/* 深色模式：modal — 弹窗在 page-root 外，theme-dark 直接挂在 modal-mask 上 */
+.modal-mask.theme-dark .modal-sheet {
+  background-color: var(--bg-card);
+}
+.modal-mask.theme-dark {
+  background-color: rgba(0, 0, 0, 0.55);
+}
+
+/* 深色模式：输入框 — 保持暗色固体（输入框不是导航层，不应使用玻璃） */
+.theme-dark .input-ios,
+.theme-dark .stepper-input,
+.theme-dark .redeem-input,
+.theme-dark .control-input,
+.theme-dark .range-line-input {
+  background-color: #3A3A3C;
+  color: var(--text-primary);
+  border-color: rgba(84, 84, 88, 0.5);
+}
+
+/* 深色模式：灰色背景区域（file-card 由 glass tokens 处理，无需覆盖） */
+
+/* 深色模式：section header bar */
+.theme-dark .section-bar,
+.theme-dark .section-header-bar {
+  background-color: var(--blue-light);
+}
+
+/* 深色模式：次级按钮 — 压暗底色 + 调暗高光 */
+.theme-dark .btn-secondary {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(84, 84, 88, 0.20);
+  box-shadow:
+    0 2rpx 8rpx rgba(0, 0, 0, 0.15),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.12);
+}
+.theme-dark .btn-secondary:active {
+  box-shadow:
+    0 1rpx 4rpx rgba(0, 0, 0, 0.12),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.18);
+}
+.theme-dark .btn-destructive {
+  background: var(--glass-regular);
+  border-color: rgba(84, 84, 88, 0.25);
+}
+
+.theme-dark .stepper-btn {
+  background: var(--glass-regular);
+  border-color: rgba(84, 84, 88, 0.25);
+  color: var(--text-primary);
+}
+
+.theme-dark .stepper-btn.stepper-disabled {
+  color: var(--text-quaternary);
+}
+
+/* 深色模式：empty state */
+.theme-dark .empty-state-icon {
+  background-color: rgba(0, 122, 255, 0.12);
+}
+
+/* 深色模式：page analysis bar — glass */
+.theme-dark .page-analysis-bar {
+  background: var(--glass-regular);
+  border-color: rgba(84, 84, 88, 0.35);
+}
+
+/* 深色模式：picker */
+.theme-dark .picker-trigger {
+  background: var(--glass-regular);
+  border-color: rgba(84, 84, 88, 0.30);
+}
+
+.theme-dark .picker-sheet {
+  background: var(--glass-heavy);
+}
+
+/* 深色模式：badge backgrounds (keep readability) */
+.theme-dark .badge-queued    { background-color: rgba(255, 243, 224, 0.25); }
+.theme-dark .badge-printing  { background-color: rgba(227, 242, 253, 0.25); }
+.theme-dark .badge-sent      { background-color: rgba(232, 245, 233, 0.25); }
+.theme-dark .badge-failed    { background-color: rgba(255, 235, 238, 0.25); }
+.theme-dark .badge-canceled  { background-color: rgba(245, 245, 245, 0.15); }
+
+.theme-dark .status-queued    { background-color: rgba(255, 243, 224, 0.25); }
+.theme-dark .status-printing  { background-color: rgba(227, 242, 253, 0.25); }
+.theme-dark .status-sent      { background-color: rgba(232, 245, 233, 0.25); }
+.theme-dark .status-failed    { background-color: rgba(255, 235, 238, 0.25); }
+.theme-dark .status-canceled  { background-color: rgba(245, 245, 245, 0.15); }
+
+/* 深色模式：key drawer locked */
+.theme-dark .key-card-wrap.key-drawer-locked .key-card {
+  background: rgba(255, 255, 255, 0.08);
+  opacity: 0.55;
+}
+
+/* 深色模式：detail file row — glass */
+.theme-dark .detail-file-row {
+  background: var(--glass-regular);
+}
+
+/* 深色模式：user license detail — glass */
+.theme-dark .user-license-detail {
+  background: var(--glass-regular);
+}
+
+/* 深色模式：admin badge */
+.theme-dark .admin-badge {
+  background-color: rgba(0, 122, 255, 0.15);
+}
+
+/* 深色模式：page-size controls */
+.theme-dark .page-size-selector,
+.theme-dark .page-btn,
+.theme-dark .page-num {
+  background: var(--glass-regular);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+}
+
+.theme-dark .page-size-dropdown {
+  background: var(--glass-heavy);
+  box-shadow: 0 4rpx 24rpx rgba(0, 0, 0, 0.4), var(--glass-rim);
+}
+
+/* 深色模式：picker option hover */
+.theme-dark .picker-option:active {
+  background: rgba(0, 122, 255, 0.12);
+}
+
+/* 深色模式：key-type-toggle */
+.theme-dark .key-type-toggle {
+  background-color: #3A3A3C;
+}
+
+/* ═══════════════ Theme Toggle Button ═══════════════ */
+
+.theme-toggle-btn {
+  position: absolute;
+  top: calc(env(safe-area-inset-top) + 6px);
+  right: 16px;
+  width: 60rpx;
+  height: 60rpx;
+  border-radius: 30rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 32rpx;
+  background: rgba(255, 255, 255, 0.22);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  box-shadow:
+    0 4rpx 16rpx rgba(0, 0, 0, 0.08),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.7),
+    0 0 0 0.5rpx rgba(0, 0, 0, 0.06);
+  z-index: 10;
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.theme-toggle-btn:active {
+  transform: scale(0.88);
+}
+
+.theme-dark .theme-toggle-btn {
+  background: rgba(26, 26, 28, 0.50);
+  box-shadow:
+    0 4rpx 16rpx rgba(0, 0, 0, 0.40),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.12),
+    0 0 0 0.5rpx rgba(255, 255, 255, 0.08);
+}
+
+/* ═══════════════ Scroll To Top Button ═══════════════ */
+
+.scroll-top-btn {
+  position: absolute;
+  bottom: calc(100rpx + env(safe-area-inset-bottom) + 12rpx);
+  right: 16px;
+  width: 60rpx;
+  height: 60rpx;
+  border-radius: 30rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28rpx;
+  background: rgba(255, 255, 255, 0.22);
+  backdrop-filter: saturate(180%) blur(12px);
+  -webkit-backdrop-filter: saturate(180%) blur(12px);
+  box-shadow:
+    0 4rpx 16rpx rgba(0, 0, 0, 0.08),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.7),
+    0 0 0 0.5rpx rgba(0, 0, 0, 0.06);
+  z-index: 10;
+  opacity: 0;
+  transform: scale(0.8);
+  pointer-events: none;
+  transition: opacity 0.3s ease, transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.scroll-top-btn.scroll-top-visible {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+
+.scroll-top-btn:active {
+  transform: scale(0.88);
+}
+
+.scroll-top-btn.scroll-top-visible:active {
+  transform: scale(0.88);
+}
+
+.theme-dark .scroll-top-btn {
+  background: rgba(26, 26, 28, 0.50);
+  box-shadow:
+    0 4rpx 16rpx rgba(0, 0, 0, 0.40),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.12),
+    0 0 0 0.5rpx rgba(255, 255, 255, 0.08);
+}
+
+/* 返回顶部箭头（双短线拼成 ^ 形） */
+.scroll-top-arrow {
+  position: relative;
+  width: 28rpx;
+  height: 22rpx;
+  margin-top: 6rpx;
+}
+.arrow-bar {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  width: 4rpx;
+  height: 20rpx;
+  border-radius: 2rpx;
+  background: #8E8E93;
+  transform-origin: 50% 0%;
+}
+.arrow-left {
+  transform: translateX(-50%) rotate(-35deg);
+}
+.arrow-right {
+  transform: translateX(-50%) rotate(35deg);
+}
+
+.theme-dark .arrow-bar {
+  background: #98989D;
+}
+
+/* ============================================================
+   13b. Dark Mode — 按钮/控件微调（glass tokens 已处理主体，仅补细调）
+   ============================================================ */
+
+/* ── 危险按钮：暗色描边 ── */
+.theme-dark .btn-destructive {
+  border-color: rgba(255, 59, 48, 0.25);
+}
+.theme-dark .btn-destructive:active {
+  background: rgba(255, 59, 48, 0.12);
+}
+
+/* ── 小玻璃按钮 ── */
+.theme-dark .btn-small {
+  background: rgba(0, 122, 255, 0.12);
+}
+
+/* ── 文件删除按钮 ── */
+.theme-dark .file-remove {
+  background: var(--glass-regular);
+  border-color: rgba(84, 84, 88, 0.25);
+}
+
+/* ── 添加文件按钮 ── */
+.theme-dark .add-file-btn {
+  background: var(--glass-regular);
+  border-color: rgba(0, 122, 255, 0.18);
+}
+
+/* ── 玻璃数值标签 ── */
+.theme-dark .param-value-glass {
+  background: var(--glass-regular);
+  border-color: rgba(84, 84, 88, 0.25);
+}
+
+/* ── 删除全部按钮 ── */
+.theme-dark .delete-all-btn {
+  background: var(--glass-regular);
+  border-color: rgba(255, 59, 48, 0.20);
+}
+.theme-dark .delete-all-btn:active {
+  background: rgba(255, 59, 48, 0.12);
+}
+
+/* ── 留存保存按钮（主色玻璃） ── */
+.theme-dark .retention-save-btn {
+  box-shadow:
+    0 2rpx 10rpx rgba(0, 122, 255, 0.15),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.08);
+}
+.theme-dark .retention-save-btn:active {
+  box-shadow:
+    0 1rpx 4rpx rgba(0, 122, 255, 0.1),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.12);
+}
+
+/* ── iOS 开关滑块：降低白色亮度 ── */
+.theme-dark .switch-thumb {
+  background: linear-gradient(180deg,
+    rgba(220, 220, 225, 0.95) 0%,
+    rgba(200, 200, 208, 0.9) 100%);
+  box-shadow:
+    0 4rpx 12rpx rgba(0, 0, 0, 0.3),
+    0 1rpx 3rpx rgba(0, 0, 0, 0.2);
+}
+
+/* ── 主按钮玻璃高光减弱 ── */
+.theme-dark .btn-primary {
+  box-shadow:
+    0 4rpx 16rpx rgba(0, 122, 255, 0.2),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.12),
+    inset 0 -1rpx 0 rgba(0, 0, 0, 0.12);
+}
+.theme-dark .btn-primary:active {
+  box-shadow:
+    0 2rpx 8rpx rgba(0, 122, 255, 0.15),
+    inset 0 2rpx 0 rgba(255, 255, 255, 0.15);
+}
+
+/* ── 生成按钮 ── */
+.theme-dark .generate-btn {
+  box-shadow: 0 2rpx 8rpx rgba(0, 122, 255, 0.2);
+}
+
+/* ── 许可密钥输入/粘贴按钮 ── */
+.theme-dark .redeem-paste-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(0, 122, 255, 0.2);
+}
+
+/* ── 留存步进器按钮 ── */
+.theme-dark .retention-stepper-btn {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* ── 添加文件按钮按下态 ── */
+.theme-dark .add-file-btn:active {
+  background-color: rgba(0, 122, 255, 0.15);
+}
+
+/* ============================================================
+   14. Animation curves — Apple's spring equivalents
    ============================================================ */
 
 /* Quick spring (buttons, small transitions) */

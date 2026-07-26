@@ -12,6 +12,7 @@ Component({
   data: {
     pageSlide: 'page-init',
     pageExit: '',
+    isDarkMode: wx.getStorageSync('isDarkMode') || false,
     // 页面标题和过滤参数
     pageTitle: '订单列表',
     viewOpenid: '',       // 查看指定用户的 openid（为空则只看 source）
@@ -48,6 +49,8 @@ Component({
 
   lifetimes: {
     attached() {
+      const app = getApp()
+      this.setData({ isDarkMode: app.globalData.isDarkMode })
       const openid = this.data.openid || ''
       const nickname = this.data.nickname ? decodeURIComponent(this.data.nickname) : ''
       const source = this.data.source || ''
@@ -72,9 +75,14 @@ Component({
   },
   pageLifetimes: {
     show() {
+      const app = getApp()
       const forward = wx.getStorageSync('_navForward')
       wx.removeStorageSync('_navForward')
-      this.setData({ pageSlide: forward ? 'page-enter-right' : 'page-enter-left', pageExit: '' })
+      this.setData({
+        pageSlide: forward ? 'page-enter-right' : 'page-enter-left',
+        pageExit: '',
+        isDarkMode: app.globalData.isDarkMode,
+      })
       if (this._hasLoaded) {
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
       }

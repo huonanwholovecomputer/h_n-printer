@@ -69,9 +69,26 @@ Component({
     adminDeleteOpacity: {},  // { openid: 0~1 }
     pageExit: '',             // 退出动画: page-exit-left / page-exit-right
     pageSlide: 'page-init',   // 入场动画: page-enter-right（初始隐藏防闪烁）
+    isDarkMode: wx.getStorageSync('isDarkMode') || false,
+    themeMode: wx.getStorageSync('themeMode') || 'auto',
+    // 通用确认弹窗（跟随 app 主题，替代 wx.showModal）
+    showConfirmModal: false,
+    modalClosing: false,           // 弹窗关闭动画进行中
+    confirmModalTitle: '',
+    confirmModalContent: '',
+    confirmModalConfirmText: '',
+    confirmModalConfirmColor: '#ff4d4f',
+    _confirmCallback: null,
+    _revokeTargetIdx: null,
   },
   lifetimes: {
     attached() {
+      // 从 app.globalData 初始化主题状态
+      const app = getApp()
+      this.setData({
+        isDarkMode: app.globalData.isDarkMode,
+        themeMode: app.globalData.themeMode,
+      })
       this._initScrollEngine()
       this.loadProfile()
       this.loadUserRole()
@@ -83,6 +100,47 @@ Component({
   },
   pageLifetimes: {
     show() {
+      // 从后台恢复 → 跳过入场动画，直接显示页面
+      const app = getApp()
+      const resumedFromBg = app.globalData._resumedFromBackground
+      if (resumedFromBg) {
+        app.globalData._resumedFromBackground = false
+        this.setData({
+          pageExit: '', pageSlide: 'page-fade-in',
+          isDarkMode: app.globalData.isDarkMode,
+          themeMode: app.globalData.themeMode,
+        })
+        this.loadUserRole()
+        this.loadOrders()
+        this.loadProfile()
+        const cachedRole = wx.getStorageSync('userRole')
+        if (cachedRole === 'admin') {
+          this.loadLicensedUsers()
+          this.loadActiveKey(false)
+          this.loadStorageStats()
+          if (this.data.isSuperAdmin) {
+            this.loadAdmins()
+          }
+        }
+        try {
+          const tabBar = this.getTabBar && this.getTabBar()
+          if (tabBar) {
+            tabBar.setData({ selected: 1, 'list[0].active': false, 'list[1].active': true })
+          }
+        } catch (e) {}
+        this._scheduleMeasure()
+        setTimeout(() => this._scheduleMeasure(300), 300)
+        this._startOrderPolling()
+        return
+      }
+      // 同步主题状态（自动模式下系统可能已切换）
+      if (app.globalData.isDarkMode !== this.data.isDarkMode ||
+          app.globalData.themeMode !== this.data.themeMode) {
+        this.setData({
+          isDarkMode: app.globalData.isDarkMode,
+          themeMode: app.globalData.themeMode,
+        })
+      }
       // 两步入场动画：先强制重置为隐藏态，下一帧再设入场动画
       // 避免 pageSlide 与上次 show() 留下的类名相同导致 CSS 不重新触发动画（闪烁）
       this.setData({ pageExit: '', pageSlide: 'page-init' })
@@ -135,8 +193,23 @@ Component({
   },
   methods: {
     // 由 tabBar 调用：退出动画 → 回调中切换页面
+    // 弹窗打开时：播放关闭动画 → 关闭弹窗 + 切换 tab（一气呵成）
     animateExit(direction) {
+      if (this.data.showConfirmModal) {
+        this.setData({ modalClosing: true })
+        wx.setStorageSync('_tabFrom', 1)
+        wx.setStorageSync('_tabTo', 0)
+        const app = getApp()
+        const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
+        wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
+        setTimeout(() => {
+          this.setData({ showConfirmModal: false, modalClosing: false, _confirmCallback: null })
+          wx.switchTab({ url: '/pages/index/index' })
+        }, 200)
+        return false
+      }
       this.setData({ pageExit: direction === 'left' ? 'page-exit-left' : 'page-exit-right' })
+      return true
     },
 
     // 带退出动画的子页面导航（防连点锁）
@@ -533,6 +606,25 @@ Component({
       this._tick = this._schedule(tick)
     },
 
+    noop() {},
+
+    onScrollToTop() {
+      const target = this._minY
+      const tick = () => {
+        if (this._handoff) { this._tick = null; return }
+        this._y += (target - this._y) * 0.2
+        if (Math.abs(this._y - target) < 0.3) {
+          this._y = target
+          this._applyY()
+          this._tick = null
+          return
+        }
+        this._applyY()
+        this._tick = this._schedule(tick)
+      }
+      this._tick = this._schedule(tick)
+    },
+
     // ==================== 用户资料 ====================
 
     loadProfile() {
@@ -754,6 +846,9 @@ Component({
               licenseInfo: res.data.license_info || null,
             })
             wx.setStorageSync('userRole', role)
+            // 从服务端同步主题偏好（跨设备一致）
+            const app = getApp()
+            app.syncThemeFromServer(res.data.theme_mode)
             // 角色切换会改变 wx:if 区块，内容高度变化显著 → 刷新滚动边界
             this._scheduleMeasure()
             // 管理员加载存储统计 + 开启轮询（loadLicensedUsers 已在 show 中调用）
@@ -939,6 +1034,8 @@ Component({
               swipeX: old ? old.swipeX : 0,
               swipeTransition: old ? (old.swipeTransition !== false) : true,
               deleteOpacity: old ? old.deleteOpacity : 0,
+              deleteQuickFade: old ? !!old.deleteQuickFade : false,
+              exiting: old ? !!old.exiting : false,  // 保留离场标记避免被 poll 冲掉
               entering: !old && !isInitial,  // 非首次加载时的新 key → 播放入场动画
             }
           })
@@ -1018,10 +1115,13 @@ Component({
       const maxX = -this._deleteWidthPx
       const visualX = this._rubberBand(rawX, maxX, 0, 40)
       this._keySwipeLastX = rawX
-      const opacity = rawX < 0 ? Math.min(1, Math.abs(rawX) / (this._deleteWidthPx * 0.6)) : 0
+      // 延迟淡入：滑动超过 35% 才开始显示删除按钮，减少透明重叠
+      const progress = Math.abs(rawX) / this._deleteWidthPx
+      const opacity = rawX < 0 ? Math.min(1, Math.max(0, (progress - 0.35) / 0.65)) : 0
       this.setData({
         ['activeKeys[' + idx + '].swipeX']: visualX,
         ['activeKeys[' + idx + '].deleteOpacity']: opacity,
+        ['activeKeys[' + idx + '].deleteQuickFade']: rawX >= 0,
       })
     },
 
@@ -1035,14 +1135,44 @@ Component({
       const rawX = this._keySwipeLastX
       const maxX = -this._deleteWidthPx
       const target = rawX > 0 ? 0 : (rawX < maxX ? maxX : (rawX < maxX / 2 ? maxX : 0))
+      // 右滑归位时加速淡出，避免透明重叠
       this.setData({
         ['activeKeys[' + idx + '].swipeTransition']: true,
         ['activeKeys[' + idx + '].swipeX']: target,
         ['activeKeys[' + idx + '].deleteOpacity']: target === 0 ? 0 : 1,
+        ['activeKeys[' + idx + '].deleteQuickFade']: target === 0,
       })
       this._swipeHorizontal = false
       this._keySwipeHorizontal = false
       this._keySwipeIdx = null
+    },
+
+    // 通用确认弹窗（替代 wx.showModal，跟随 app 主题）
+    _showConfirm(title, content, confirmText, confirmColor, callback) {
+      this.setData({
+        showConfirmModal: true,
+        confirmModalTitle: title,
+        confirmModalContent: content,
+        confirmModalConfirmText: confirmText,
+        confirmModalConfirmColor: confirmColor || '#ff4d4f',
+        _confirmCallback: callback,
+      })
+    },
+    onCancelConfirm() {
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showConfirmModal: false, modalClosing: false, _confirmCallback: null })
+      }, 200)
+    },
+    onConfirmModal() {
+      if (this.data.modalClosing) return
+      const cb = this.data._confirmCallback
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showConfirmModal: false, modalClosing: false, _confirmCallback: null })
+        if (typeof cb === 'function') cb()
+      }, 200)
     },
 
     // 作废指定密钥
@@ -1052,45 +1182,46 @@ Component({
       if (!k) return
       const token = wx.getStorageSync('token')
       if (!token) return
-
       const isUsed = k.status !== 'unused'
-      wx.showModal({
-        title: isUsed ? '删除密钥' : '作废密钥',
-        content: isUsed ? '删除此密钥不会影响已获得的授权。' : '确定作废此许可密钥？作废后他人将无法使用。',
-        confirmText: isUsed ? '删除' : '作废',
-        confirmColor: '#ff4d4f',
-        success: (modal) => {
-          if (!modal.confirm) return
+      const that = this
+      this._showConfirm(
+        isUsed ? '删除密钥' : '作废密钥',
+        isUsed ? '删除此密钥不会影响已获得的授权。' : '确定作废此许可密钥？作废后他人将无法使用。',
+        isUsed ? '删除' : '作废',
+        '#ff4d4f',
+        function() {
+          const k2 = that.data.activeKeys[idx]
+          if (!k2) return
+          const isUsed2 = k2.status !== 'unused'
+          that.setData({
+            ['activeKeys[' + idx + '].swipeX']: 0,
+            ['activeKeys[' + idx + '].exiting']: true,
+          })
           wx.request({
             url: CONFIG.BASE_URL + '/api/license/revoke',
             method: 'POST',
             header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
-            data: { key: k.key },
-            success: (res) => {
+            data: { key: k2.key },
+            success: function(res) {
               if (res.data && res.data.success) {
-                wx.showToast({ title: isUsed ? '已删除' : '已作废', icon: 'success' })
-                // ① 先滑回收起（隐藏红色删除按钮）
-                this.setData({
-                  ['activeKeys[' + idx + '].swipeX']: 0,
-                  ['activeKeys[' + idx + '].swipeTransition']: true,
-                })
-                // ② 收回后再向上淡出
-                setTimeout(() => {
-                  this.setData({ ['activeKeys[' + idx + '].exiting']: true })
-                  setTimeout(() => {
-                    const keys = this.data.activeKeys.filter((_, i) => i !== idx)
-                    this.setData({ activeKeys: keys })
-                    if (!keys.length) this._stopCountdown()
-                  }, 350)
-                }, 180)
+                wx.showToast({ title: isUsed2 ? '已删除' : '已作废', icon: 'success' })
+                setTimeout(function() {
+                  var keys = that.data.activeKeys.filter(function(_, i) { return i !== idx })
+                  that.setData({ activeKeys: keys })
+                  if (!keys.length) that._stopCountdown()
+                }, 350)
               } else {
                 wx.showToast({ title: res.data.message || '操作失败', icon: 'none' })
+                that.setData({ ['activeKeys[' + idx + '].exiting']: false })
               }
             },
-            fail: () => wx.showToast({ title: '网络错误', icon: 'none' })
+            fail: function() {
+              wx.showToast({ title: '网络错误', icon: 'none' })
+              that.setData({ ['activeKeys[' + idx + '].exiting']: false })
+            }
           })
         }
-      })
+      )
     },
 
     // 复制密钥
@@ -1288,13 +1419,8 @@ Component({
       const openid = e.currentTarget.dataset.openid
       const token = wx.getStorageSync('token')
       if (!token) return
-      wx.showModal({
-        title: '移除管理员',
-        content: '确定要移除该管理员吗？',
-        confirmText: '移除',
-        confirmColor: '#ff4d4f',
-        success: (modal) => {
-          if (!modal.confirm) return
+      const that = this
+      this._showConfirm('移除管理员', '确定要移除该管理员吗？', '移除', '#ff4d4f', function() {
           wx.request({
             url: CONFIG.BASE_URL + '/api/admin/remove_admin',
             method: 'POST',
@@ -1329,7 +1455,6 @@ Component({
               wx.showToast({ title: '网络错误', icon: 'none' })
             }
           })
-        }
       })
     },
 
@@ -1432,16 +1557,14 @@ Component({
     },
 
     onDeleteAllFiles() {
-      wx.showModal({
-        title: '⚠️ 确认删除',
-        content: '将删除服务器及本地打印工具的全部缓存文件（不包括用户头像），此操作不可撤销。确定继续？',
-        confirmText: '确认删除',
-        confirmColor: '#FF3B30',
-        success: (modal) => {
-          if (!modal.confirm) return
-          const token = wx.getStorageSync('token')
-          if (!token) return
-
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      this._showConfirm(
+        '⚠️ 确认删除',
+        '将删除服务器及本地打印工具的全部缓存文件（不包括用户头像），此操作不可撤销。确定继续？',
+        '确认删除',
+        '#FF3B30',
+        () => {
           this.setData({ deletingAllFiles: true })
           wx.request({
             url: CONFIG.BASE_URL + '/api/admin/storage',
@@ -1462,7 +1585,7 @@ Component({
             }
           })
         }
-      })
+      )
     },
 
     // 管理员许可密钥轮询：抽屉打开时每 5 秒刷新状态
@@ -1859,34 +1982,47 @@ Component({
       const orderId = e.currentTarget.dataset.id
       const token = wx.getStorageSync('token')
       if (!token) return
-
-      wx.showModal({
-        title: '确认取消',
-        content: '确定要取消这个打印任务吗？',
-        success: (modalRes) => {
-          if (!modalRes.confirm) return
-          wx.showLoading({ title: '取消中...' })
-          wx.request({
-            url: CONFIG.BASE_URL + '/api/cancel_order',
-            method: 'POST',
-            header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
-            data: { order_id: String(orderId) },
-            success: (res) => {
-              wx.hideLoading()
-              if (res.data.success) {
-                wx.showToast({ title: '已取消' })
-                this.loadOrders()
-              } else {
-                wx.showToast({ title: res.data.message, icon: 'none' })
-              }
-            },
-            fail: () => {
-              wx.hideLoading()
-              wx.showToast({ title: '网络错误', icon: 'none' })
+      this._showConfirm('确认取消', '确定要取消这个打印任务吗？', '取消订单', '#FF9500', () => {
+        wx.showLoading({ title: '取消中...' })
+        wx.request({
+          url: CONFIG.BASE_URL + '/api/cancel_order',
+          method: 'POST',
+          header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
+          data: { order_id: String(orderId) },
+          success: (res) => {
+            wx.hideLoading()
+            if (res.data.success) {
+              wx.showToast({ title: '已取消' })
+              this.loadOrders()
+            } else {
+              wx.showToast({ title: res.data.message, icon: 'none' })
             }
-          })
-        }
+          },
+          fail: () => {
+            wx.hideLoading()
+            wx.showToast({ title: '网络错误', icon: 'none' })
+          }
+        })
       })
+    },
+
+    // ==================== 主题切换（自动/浅色/深色 三态循环）====================
+
+    onToggleTheme() {
+      const app = getApp()
+      const result = app.toggleTheme()
+      this.setData({
+        isDarkMode: result.isDarkMode,
+        themeMode: result.themeMode,
+      })
+    },
+
+    // 获取当前模式对应的图标文字
+    getThemeIcon() {
+      const mode = this.data.themeMode
+      if (mode === 'auto') return '🌓'
+      if (mode === 'dark') return '🌙'
+      return '☀️'
     },
 
     // ==================== 导航 ====================
