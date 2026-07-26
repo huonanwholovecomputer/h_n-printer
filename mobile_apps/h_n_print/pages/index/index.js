@@ -43,6 +43,7 @@ Component({
     badgeBouncing: false,   // 圆点弹跳动画（已有文件时新增）
     badgeExiting: false,    // 圆点退场动画（末文件删除）
     badgeCount: 0,          // 延迟更新的计数，统一 0.25s 滞后于 selectedFiles.length
+    scrollPadHeight: 0,     // 滚动垫片高度，强制撑开 scroll-content 规避微信布局上限
     btnPulse: false,        // 添加按钮脉冲动画（文字变化时）
     pageReady: false,         // 首次打开的入场动效
     pageExit: '',             // 退出动画: page-exit-left / page-exit-right
@@ -215,6 +216,8 @@ Component({
           if (wasSuccess) {
             patch.selectedFiles = []
             patch.badgeCount = 0
+            patch.scrollPadHeight = 0
+            this._contentEst = 0
           }
           this.setData(patch)
           if (wasSuccess) {
@@ -363,6 +366,7 @@ Component({
       this._maxY = 0
       this._scrollerH = 0
       this._contentH = 0
+      this._contentEst = 0   // 估算累积高度，兜底微信容器上限
 
       this._trackId = null
       this._lastY = 0
@@ -455,8 +459,9 @@ Component({
         const vp = res[0].height || 0
         const ch = res[1].height || 0
         this._scrollerH = vp
-        this._contentH = ch
-        this._maxY = Math.max(0, ch - vp + this._bottomPad)
+        if (!this._contentEst) this._contentEst = ch
+        this._contentH = Math.max(ch, this._contentEst)
+        this._maxY = Math.max(0, this._contentH - vp + this._bottomPad)
         if (this._y > this._maxY) {
           // 不直接跳变，让 _snapBack() 从当前位置平滑回弹到新边界
           this._snapBack()
@@ -467,20 +472,18 @@ Component({
     // 添加文件时立刻估算卡片高度并更新滚动边界，无需等待 cardExpand 动画完成
     // 后续 _measure() 会修正为精确值
     _bumpForNewFile() {
-      // 若滚动容器尚未测量则触发一次即时测量（首文件场景）
       if (!this._scrollerH) {
         this._measure()
         this._scheduleMeasure(200)
         return
       }
-      // 单张文件卡片典型高度 ≈ 300rpx，保守估算 320rpx
-      // 转换为 px：1rpx = screenWidth / 750
-      const sys = wx.getSystemInfoSync()
-      const rpxRatio = (sys.windowWidth || 375) / 750
-      const estPx = Math.round(320 * rpxRatio)
-      this._contentH += estPx
-      this._maxY = Math.max(0, this._contentH - this._scrollerH + this._bottomPad)
-      // 滚动位置不变，仅扩展边界；若当前位置已超出旧边界则回弹
+      if (!this._contentEst) this._contentEst = this._contentH
+      const { windowWidth } = wx.getWindowInfo()
+      const rpxRatio = (windowWidth || 375) / 750
+      const estPx = Math.round(470 * rpxRatio)
+      this._contentEst += estPx
+      this._maxY = Math.max(0, this._contentEst - this._scrollerH + this._bottomPad)
+      this.setData({ scrollPadHeight: this._contentEst })
       if (this._y > this._maxY) this._snapBack()
     },
 
@@ -830,7 +833,11 @@ Component({
         }
         this._uploadTimers = remapTimers(this._uploadTimers || {})
         this._pollTimers = remapTimers(this._pollTimers || {})
-        this.setData({ selectedFiles: files, badgeCount: files.length })
+        const { windowWidth: ww } = wx.getWindowInfo()
+        const rpxR = (ww || 375) / 750
+        const estPx = Math.round(470 * rpxR)
+        this._contentEst = Math.max(0, this._contentEst - estPx)
+        this.setData({ selectedFiles: files, badgeCount: files.length, scrollPadHeight: this._contentEst })
         if (!isLastFile) {
           this._prevFileCount = files.length
         }
@@ -848,11 +855,14 @@ Component({
       this._uploadTimers[fileIndex] = {
         realProgress: 0,
         timer: null,
+        task: task,
       }
 
       // 每 0.5s 把显示进度向真实进度推进
       this._uploadTimers[fileIndex].timer = setInterval(() => {
-        const real = this._uploadTimers[fileIndex].realProgress
+        const entry = this._uploadTimers[fileIndex]
+        if (!entry || !entry.realProgress) return  // 上传已被取消
+        const real = entry.realProgress
         const files = this.data.selectedFiles
         if (!files[fileIndex]) return
         const shown = files[fileIndex].progress
@@ -869,6 +879,8 @@ Component({
         name: 'file',
         header: { 'Authorization': 'Bearer ' + token },
         success: (uploadRes) => {
+          const entry = this._uploadTimers[fileIndex]
+          if (!entry || entry.cancelled) return  // 上传已被取消
           if (uploadRes.statusCode === 401) {
             this.stopFileUploadTimer(fileIndex)
             this.setData({ [key + '.uploading']: false })
@@ -943,6 +955,8 @@ Component({
           setTimeout(() => this._scheduleMeasure(450), 450)
         },
         fail: (err) => {
+          const entry2 = this._uploadTimers[fileIndex]
+          if (entry2 && entry2.cancelled) return  // 上传已被取消（abort 也会触发 fail）
           console.error('文件上传失败:', err)
           this.stopFileUploadTimer(fileIndex)
           this.setData({ [key + '.uploading']: false, [key + '.failed']: true })
@@ -960,9 +974,15 @@ Component({
 
     stopFileUploadTimer(fileIndex) {
       const entry = this._uploadTimers && this._uploadTimers[fileIndex]
-      if (entry && entry.timer) {
+      if (!entry) return
+      entry.cancelled = true
+      if (entry.timer) {
         clearInterval(entry.timer)
-        this._uploadTimers[fileIndex].timer = null
+        entry.timer = null
+      }
+      if (entry.task) {
+        try { entry.task.abort() } catch (e) { /* ok */ }
+        entry.task = null
       }
     },
 
@@ -1464,7 +1484,7 @@ Component({
       query.select('#boltCanvas').fields({ node: true, size: true }).exec((res) => {
         if (!res || !res[0] || !res[0].node) return
         const canvas = res[0].node
-        const dpr = wx.getSystemInfoSync().pixelRatio || 2
+        const dpr = wx.getWindowInfo().pixelRatio || 2
         const cssW = res[0].width || 100
         const cssH = res[0].height || 100
         canvas.width = cssW * dpr * 2
@@ -1879,7 +1899,9 @@ Component({
           modalClosing: false,
           selectedFiles: [],
           badgeCount: 0,
+          scrollPadHeight: 0,
         })
+        this._contentEst = 0
         // 恢复 tab 栏发丝线
         try {
           const tabBar = this.getTabBar && this.getTabBar()

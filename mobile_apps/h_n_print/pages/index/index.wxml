@@ -230,6 +230,8 @@
         </view>
 
       </view>
+      <!-- 垫片：在 container 外，强制撑开 scroll-content 总高度 -->
+      <view style="height: {{scrollPadHeight}}px; width: 100%; pointer-events: none;"></view>
     </view>
   </view>
 </view>

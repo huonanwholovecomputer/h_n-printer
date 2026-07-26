@@ -70,7 +70,7 @@
 }
 
 .scroll-content {
-  will-change: transform;
+  /* will-change 移除：避免微信预分配固定尺寸 GPU 层截断动态内容 */
 }
 
 .container {

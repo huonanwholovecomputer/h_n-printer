@@ -75,7 +75,8 @@
 }
 
 .scroll-content {
-  will-change: transform;
+  /* will-change: transform 会导致微信渲染器预分配固定尺寸 GPU 层，
+     动态添加子元素后层不扩展，内容被截断。依赖浏览器自动合成。 */
 }
 
 .container {
