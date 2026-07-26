@@ -464,6 +464,26 @@ Component({
       })
     },
 
+    // 添加文件时立刻估算卡片高度并更新滚动边界，无需等待 cardExpand 动画完成
+    // 后续 _measure() 会修正为精确值
+    _bumpForNewFile() {
+      // 若滚动容器尚未测量则触发一次即时测量（首文件场景）
+      if (!this._scrollerH) {
+        this._measure()
+        this._scheduleMeasure(200)
+        return
+      }
+      // 单张文件卡片典型高度 ≈ 300rpx，保守估算 320rpx
+      // 转换为 px：1rpx = screenWidth / 750
+      const sys = wx.getSystemInfoSync()
+      const rpxRatio = (sys.windowWidth || 375) / 750
+      const estPx = Math.round(320 * rpxRatio)
+      this._contentH += estPx
+      this._maxY = Math.max(0, this._contentH - this._scrollerH + this._bottomPad)
+      // 滚动位置不变，仅扩展边界；若当前位置已超出旧边界则回弹
+      if (this._y > this._maxY) this._snapBack()
+    },
+
     _applyY() {
       const real = Math.max(0, Math.min(this._y, this._maxY))
       const ratio = this._maxY > 0 ? Math.min(real / 400, 1) : 0
@@ -759,9 +779,9 @@ Component({
           setTimeout(() => {
             this.setData({ ['selectedFiles[' + fileIndex + '].entering']: false })
           }, 800)  // 250ms delay + 500ms animation + 50ms buffer
+          this._bumpForNewFile()                        // 立刻扩展滚动边界，不等动画
           this._scheduleMeasure(400)
-          setTimeout(() => this._scheduleMeasure(600), 600)
-          setTimeout(() => this._scheduleMeasure(850), 850)  // 动画完成后刷新滚动边界
+          setTimeout(() => this._scheduleMeasure(850), 850)  // 动画完成后修正为精确值
           this.startFileUpload(fileIndex, file.path)
         },
         fail: (err) => {
