@@ -1026,8 +1026,9 @@ class CloudTaskListWindow(QDialog):
 
         # ── 自动关闭设置行 ──
         auto_row = QHBoxLayout()
-        auto_row.addWidget(QLabel("自动关闭：待确认任务为 0 后"))
+        auto_row.addWidget(QLabel("自动关闭：待确认任务清空后"))
         self._auto_minutes = QSpinBox()
+        self._auto_minutes.setButtonSymbols(QSpinBox.NoButtons)  # 与主界面输入框一致：隐藏加减箭头
         self._auto_minutes.setRange(0, 60)
         self._auto_minutes.setValue(5)
         self._auto_minutes.setSuffix(" 分钟")
@@ -1035,15 +1036,25 @@ class CloudTaskListWindow(QDialog):
         self._auto_minutes.valueChanged.connect(self._on_auto_close_changed)
         auto_row.addWidget(self._auto_minutes)
         self._auto_seconds = QSpinBox()
+        self._auto_seconds.setButtonSymbols(QSpinBox.NoButtons)  # 与主界面输入框一致：隐藏加减箭头
         self._auto_seconds.setRange(0, 59)
         self._auto_seconds.setValue(0)
         self._auto_seconds.setSuffix(" 秒")
         self._auto_seconds.setFixedWidth(80)
         self._auto_seconds.valueChanged.connect(self._on_auto_close_changed)
         auto_row.addWidget(self._auto_seconds)
-        auto_row.addStretch()
         auto_row.addWidget(QLabel("后自动关闭"))
+        auto_row.addStretch()
+        self._countdown_label = QLabel("")
+        self._countdown_label.setObjectName("countdownLabel")
+        self._countdown_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        auto_row.addWidget(self._countdown_label)
         layout.addLayout(auto_row)
+
+        # 倒计时刷新定时器（每 1 秒更新右侧剩余时间）
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._update_countdown)
 
         # ── 表格：订单号 | 文件数 | 总页数 | 状态 | 操作 ──
         from PySide6.QtWidgets import QTableWidget as _QTW, QTableWidgetItem as _QTWI
@@ -1242,26 +1253,52 @@ class CloudTaskListWindow(QDialog):
     def _on_auto_close_changed(self):
         self._auto_close_seconds = self._auto_minutes.value() * 60 + self._auto_seconds.value()
 
+    def _update_countdown(self):
+        """每 1 秒刷新右侧倒计时文本（读取自动关闭定时器剩余时间）。"""
+        remaining_ms = self._auto_close_timer.remainingTime()
+        if remaining_ms < 0:
+            self._countdown_timer.stop()
+            self._countdown_label.setText("")
+            return
+        total = (remaining_ms + 999) // 1000  # 向上取整，避免闪现 00:00
+        if total <= 0:
+            self._countdown_timer.stop()
+            self._countdown_label.setText("")
+            return
+        mm, ss = divmod(total, 60)
+        self._countdown_label.setText(f"剩余 {mm:02d}:{ss:02d}")
+
+    def _start_auto_close(self):
+        """启动自动关闭倒计时（含右侧剩余时间显示）。"""
+        self._auto_close_timer.start(self._auto_close_seconds * 1000)
+        self._countdown_timer.start()
+        self._update_countdown()
+
     def _check_auto_close(self):
         has_pending = any(e["status"] == "pending" for e in self._pending_orders.values())
         all_done = not has_pending and len(self._pending_orders) > 0
         if all_done:
             if not self._auto_close_timer.isActive():
-                self._auto_close_timer.start(self._auto_close_seconds * 1000)
+                self._start_auto_close()
         else:
             self._cancel_auto_close()
 
     def _cancel_auto_close(self):
-        if self._auto_close_timer.isActive():
-            self._auto_close_timer.stop()
+        # 只要还有待确认订单就无条件停掉倒计时并清空文字，
+        # 否则手动关闭窗口后再来新订单时旧倒计时会残留。
+        self._auto_close_timer.stop()
+        self._countdown_timer.stop()
+        self._countdown_label.setText("")
         self._pending_orders = {
             oid: e for oid, e in self._pending_orders.items()
             if e["status"] == "pending"
         }
         if not self._pending_orders:
-            self._auto_close_timer.start(self._auto_close_seconds * 1000)
+            self._start_auto_close()
 
     def _on_auto_close(self):
+        self._countdown_timer.stop()
+        self._countdown_label.setText("")
         if not any(e["status"] == "pending" for e in self._pending_orders.values()):
             self._cancel_remove_timer.stop()
             self.hide()
@@ -1295,6 +1332,8 @@ class CloudTaskListWindow(QDialog):
                 self.order_rejected.emit(entry["tasks"])
         self._cancel_remove_timer.stop()
         self._auto_close_timer.stop()
+        self._countdown_timer.stop()
+        self._countdown_label.setText("")
         self.hide()
 
     def closeEvent(self, event):
@@ -1569,6 +1608,9 @@ class MainWindow(QMainWindow):
             self._cloud_status_indicator.setText("☁ 未连接")
             self._cloud_status_indicator.setObjectName("cloudStatusOff")
             self._cloud_status_btn.setText("连接云端")
+        # 收支清算入口：云端未连接时置灰（数据存云端，离线不可用）
+        if hasattr(self, "_finance_action"):
+            self._finance_action.setEnabled(connected)
         # 刷新样式
         self._cloud_status_indicator.style().unpolish(self._cloud_status_indicator)
         self._cloud_status_indicator.style().polish(self._cloud_status_indicator)
@@ -1667,9 +1709,10 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        finance_action = QAction("📊 收支清算(&S)", self)
-        finance_action.triggered.connect(self._on_open_finance)
-        file_menu.addAction(finance_action)
+        self._finance_action = QAction("📊 收支清算(&S)", self)
+        self._finance_action.triggered.connect(self._on_open_finance)
+        self._finance_action.setToolTip("收支清算数据存于云端，需连接云端后才能使用")
+        file_menu.addAction(self._finance_action)
 
         file_menu.addSeparator()
 
@@ -4050,6 +4093,12 @@ class MainWindow(QMainWindow):
             return  # 已处理过
         self._cloud_tasks[task.task_id] = task
         if task.status == "error":
+            if task.task_id in self._processed_cloud_tasks:
+                # 任务已被用户打回/接受，迟到的下载失败不再上报后端，
+                # 否则 print_fail 会把已 reject 的订单覆盖成 failed。
+                self._log(f"☁ 云端任务 #{task.task_id} 下载出错但已被处理，忽略上报: {task.error_message}")
+                self._cloud_tasks.pop(task.task_id, None)
+                return
             self._processed_cloud_tasks.add(task.task_id)
             self._log(f"☁ 云端任务 #{task.task_id} 出错: {task.error_message}")
             if self._cloud_client:

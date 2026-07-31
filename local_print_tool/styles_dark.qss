@@ -410,6 +410,11 @@ QLabel#cloudTaskParams {
     color: #6c7086;
     font-size: 12px;
 }
+QLabel#countdownLabel {
+    color: #89b4fa;
+    font-size: 12px;
+    font-weight: bold;
+}
 QLabel#cloudTaskStatus_ready {
     color: #a6e3a1;
     font-weight: bold;
