@@ -1351,6 +1351,9 @@ class MainWindow(QMainWindow):
     # 表格列索引常量
     COL_FILE, COL_COPIES, COL_DUPLEX, COL_RANGE, COL_PAGES, COL_ORIENT, COL_ENGINE, COL_COST = range(8)
 
+    # 图片扩展名（含 tiff/tif：小程序允许上传，本地工具需同样识别为图片 → 双面/页码范围无意义）
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
+
     def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
         super().__init__()
         self._config_path = config_path
@@ -2569,7 +2572,7 @@ class MainWindow(QMainWindow):
         self._table.insertRow(row)
 
         ext = os.path.splitext(job.file_path)[1].lower()
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        image_exts = self.IMAGE_EXTS
         is_image = ext in image_exts
 
         display = job.display_name or os.path.basename(job.file_path)
@@ -2738,6 +2741,15 @@ class MainWindow(QMainWindow):
         self._edit_dpi.setCurrentIndex(dpi_map.get(job.dpi, 0))
         self._edit_dpi.blockSignals(False)
 
+        # 图片：双面/双面模式无意义 → 禁用并固定单面
+        is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
+        self._edit_duplex.setEnabled(not is_img)
+        self._edit_duplex_mode.setEnabled(not is_img)
+        if is_img:
+            self._edit_duplex.blockSignals(True)
+            self._edit_duplex.setCurrentIndex(1)  # 单面
+            self._edit_duplex.blockSignals(False)
+
         # 更新选中文件标签
         self._selected_file_label.setText(
             f"📄 {os.path.basename(job.file_path)}\n"
@@ -2769,8 +2781,13 @@ class MainWindow(QMainWindow):
 
         # 读取编辑控件值
         job.copies = self._edit_copies.value()
-        job.duplex = "on" if self._edit_duplex.currentIndex() == 0 else "off"
-        job.duplex_mode = "short-edge" if self._edit_duplex_mode.currentIndex() == 1 else "long-edge"
+        # 图片：双面无意义，固定单面（避免被禁用的双面控件残留值误写）
+        is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
+        if is_img:
+            job.duplex = "off"
+        else:
+            job.duplex = "on" if self._edit_duplex.currentIndex() == 0 else "off"
+            job.duplex_mode = "short-edge" if self._edit_duplex_mode.currentIndex() == 1 else "long-edge"
 
         # 页码范围
         ranges_str = ",".join(
