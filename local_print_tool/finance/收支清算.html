@@ -88,6 +88,10 @@ td.l { text-align: left; }
 .status-dot.failed { background: #dc2626; }
 .status-dot.canceled { background: #9ca3af; }
 .status-dot.offline_unknown { background: #8b5cf6; }
+.status-dot.rejected { background: #991b1b; }
+.status-dot.accepted { background: #6366f1; }
+.status-dot.abandoned { background: #d97706; }
+.status-dot.reserved { background: #a1a1aa; }
 .order-row { cursor: pointer; transition: background .15s; }
 .order-row:hover { background: #f8f9fb; }
 .order-row.expanded { background: #f0f4ff; }
@@ -103,7 +107,20 @@ td.l { text-align: left; }
 .rev-compare { margin-top: 12px; padding: 12px; background: #fffbeb; border: 1px solid #fcd34d; border-radius: 8px; font-size: 0.85rem; }
 .rev-compare h3 { font-size: 0.9rem; margin-bottom: 8px; color: #92400e; }
 .bind-input { width: 280px; font-family: monospace; font-size: 0.82rem; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; }
+/* Chart styles */
+.chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.chart-grid .section { margin-bottom: 0; }
+.chart-wrap { position: relative; width: 100%; height: 280px; }
+.chart-wrap.tall { height: 340px; }
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.kpi-card { background: var(--card); border-radius: 10px; padding: 14px 16px; border: 1px solid var(--border); text-align: center; }
+.kpi-card .num { font-size: 1.4rem; font-weight: 700; line-height: 1.3; }
+.kpi-card .lbl { font-size: 0.72rem; color: var(--muted); margin-top: 3px; text-transform: uppercase; letter-spacing: 0.04em; }
+.kpi-card .sub-num { font-size: 0.78rem; color: var(--muted); margin-top: 2px; }
+@media (max-width: 700px) { .chart-grid { grid-template-columns: 1fr; } }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <header>
@@ -250,6 +267,7 @@ var _cloudData = null;
 var _cloudLoading = false;
 var _cloudExpanded = {};
 var _cloudUserFilter = 'all';
+var _cloudSourceFilter = 'all'; // 'all' | 'cloud' | 'local'
 
 // ==================== CALC ====================
 function calcMonth(m) {
@@ -638,6 +656,15 @@ function copyMonth() {
 }
 
 // ==================== TAB: CLOUD ====================
+// Chart.js instances (persist across renderCloud calls)
+var _cloudCharts = {};
+
+function _destroyCloudCharts() {
+  Object.keys(_cloudCharts).forEach(function(k) {
+    if (_cloudCharts[k]) { _cloudCharts[k].destroy(); delete _cloudCharts[k]; }
+  });
+}
+
 function _defaultCloudDates() {
   var now = new Date();
   var y = now.getFullYear();
@@ -647,6 +674,16 @@ function _defaultCloudDates() {
   var end = y + '-' + String(m).padStart(2,'0') + '-' + String(lastDay).padStart(2,'0');
   return { start: start, end: end };
 }
+
+var CHART_COLORS = {
+  status: { sent:'#16a34a', printing:'#4472C4', queued:'#f59e0b', failed:'#dc2626', canceled:'#9ca3af', rejected:'#991b1b', accepted:'#6366f1', abandoned:'#d97706', offline_unknown:'#8b5cf6', reserved:'#a1a1aa' },
+  source: { cloud:'#4472C4', local:'#548235' },
+  palette: ['#4472C4','#548235','#ED7D31','#6366f1','#d97706','#16a34a','#dc2626','#38bdf8','#f472b6','#a855f7','#14b8a6','#f97316']
+};
+
+function _statusColor(s) { return CHART_COLORS.status[s] || '#9ca3af'; }
+function _statusLabelCN(s) { return STATUS_LABELS[s] || s; }
+function _fmtDate(d) { return d.substring(0,10); }
 
 function fetchCloudData() {
   var startEl = document.getElementById('cloud-start');
@@ -660,7 +697,7 @@ function fetchCloudData() {
   var statuses = [];
   checks.forEach(function(cb) { if (cb.checked) statuses.push(cb.value); });
   if (statuses.length === 0) {
-    ['sent','printing','queued','failed','offline_unknown'].forEach(function(s) { statuses.push(s); });
+    ['sent','printing','queued','failed','canceled','rejected','accepted','abandoned','reserved','offline_unknown'].forEach(function(s) { statuses.push(s); });
   }
 
   var params = 'start_date=' + encodeURIComponent(start) +
@@ -701,30 +738,277 @@ function _filterCloudUserChanged() {
   renderCloud();
 }
 
+function _filterCloudSourceChanged() {
+  _cloudSourceFilter = document.getElementById('cloud-source-filter')?.value || 'all';
+  renderCloud();
+}
+
+// ── Chart data helpers ──
+
+function _computeDailyTrend(orders) {
+  var map = {};
+  orders.forEach(function(o) {
+    var day = _fmtDate(o.created_at);
+    if (!map[day]) map[day] = { date: day, count: 0, revenue: 0, pages: 0, files: 0 };
+    map[day].count++;
+    map[day].revenue += o.revenue || 0;
+    map[day].pages += o.total_page_count || 0;
+    map[day].files += o.files_count || 0;
+  });
+  var days = Object.keys(map).sort();
+  return days.map(function(d) { return map[d]; });
+}
+
+function _countByStatus(orders) {
+  var map = {};
+  orders.forEach(function(o) {
+    var s = o.status || 'unknown';
+    map[s] = (map[s] || 0) + 1;
+  });
+  return map;
+}
+
+function _countFilesByStatus(orders) {
+  var map = {};
+  orders.forEach(function(o) {
+    (o.files||[]).forEach(function(f) {
+      var s = f.status || 'unknown';
+      map[s] = (map[s] || 0) + 1;
+    });
+  });
+  return map;
+}
+
+// ── Chart renderers ──
+
+function _renderStatusDonut(canvasId, orderStatusCount, fileStatusCount) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  // Use file counts (more granular), fallback to order counts
+  var labels = [], data = [], colors = [];
+  var src = Object.keys(fileStatusCount).length > 0 ? fileStatusCount : orderStatusCount;
+  // Sort by count desc
+  var sorted = Object.keys(src).sort(function(a,b) { return src[b] - src[a]; });
+  sorted.forEach(function(s) {
+    labels.push(_statusLabelCN(s));
+    data.push(src[s]);
+    colors.push(_statusColor(s));
+  });
+
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels: labels, datasets: [{ data: data, backgroundColor: colors, borderWidth: 2, borderColor: '#fff' }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'right', labels: { font: { size: 11 }, padding: 10, boxWidth: 12, usePointStyle: true } },
+        tooltip: { callbacks: { label: function(ctx) {
+          var total = ctx.dataset.data.reduce(function(a,b){return a+b;},0);
+          var pct = total > 0 ? (ctx.parsed / total * 100).toFixed(1) : 0;
+          return ctx.label + ': ' + ctx.parsed + ' (' + pct + '%)';
+        }}}
+      },
+      animation: { animateRotate: true, duration: 1000, easing: 'easeOutQuart' }
+    }
+  });
+}
+
+function _renderSourceDonut(canvasId, rs) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  // Use revenue if >0, else order count
+  var cloudVal = rs.cloud > 0 ? rs.cloud : (rs.cloud_orders||0);
+  var localVal = rs.local > 0 ? rs.local : (rs.local_orders||0);
+  if (cloudVal <= 0 && localVal <= 0) { cloudVal = 1; localVal = 0; }
+
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: ['☁ 云端 ' + RMB(rs.cloud||0), '🖨 本地 ' + RMB(rs.local||0)],
+      datasets: [{ data: [Math.max(cloudVal,0.01), Math.max(localVal,0.01)], backgroundColor: ['#4472C4','#548235'], borderWidth: 2, borderColor: '#fff' }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: '55%',
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12 } },
+        tooltip: { callbacks: { label: function(ctx) {
+          var lbl = ctx.label;
+          var detail = ctx.dataIndex === 0
+            ? '订单 ' + (rs.cloud_orders||0) + ' · 文件 ' + (rs.cloud_files||0) + ' · ' + (rs.cloud_pages||0) + '页'
+            : '订单 ' + (rs.local_orders||0) + ' · 文件 ' + (rs.local_files||0) + ' · ' + (rs.local_pages||0) + '页';
+          return lbl + ' — ' + detail;
+        }}}
+      },
+      animation: { animateRotate: true, duration: 1200, easing: 'easeOutBack' }
+    }
+  });
+}
+
+function _renderUserMetricBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+
+  var sorted = (byUser||[]).slice().sort(function(a,b){ return b[field] - a[field]; });
+  var labels = sorted.map(function(u) { return u.nickname || u.openid.substring(0,8); });
+  var values = sorted.map(function(u) { return u[field]; });
+  var maxVal = Math.max.apply(null, values) || 1;
+  var barColors = sorted.map(function(u) {
+    return barColorFn ? barColorFn(u, field, maxVal) : '#4472C4';
+  });
+
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: label,
+        data: values,
+        backgroundColor: barColors,
+        borderColor: barColors,
+        borderWidth: 0,
+        borderRadius: field === 'revenue' ? 6 : 4
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: function(ctx2) { return label + ': ' + (field === 'revenue' ? RMB(ctx2.parsed.y) : ctx2.parsed.y + ' 单'); },
+            afterBody: function(items) {
+              var i = items[0].dataIndex;
+              var u = sorted[i];
+              return '文件: ' + (u.file_count||0) + ' | 页数: ' + (u.total_pages||0);
+            }
+          }
+        }
+      },
+      scales: {
+        y: { beginAtZero: true, max: maxVal * 1.3, grid: { color: 'rgba(0,0,0,0.04)' }, title: { display: true, text: label, font: { size: 10 } } },
+        x: { grid: { display: false }, ticks: { font: { size: 10, weight: 'bold' }, maxRotation: 30 } }
+      },
+      animation: { duration: 1000, easing: 'easeOutQuart' }
+    },
+    plugins: [{
+      id: 'barLabels',
+      afterDraw: function(chart) {
+        var ctx2 = chart.ctx;
+        chart.data.datasets.forEach(function(ds, dsIdx) {
+          var meta = chart.getDatasetMeta(dsIdx);
+          meta.data.forEach(function(bar, idx) {
+            var val = ds.data[idx];
+            var labelText = fmtLabel ? fmtLabel(val, sorted[idx]) : ('' + val);
+            ctx2.save();
+            ctx2.fillStyle = '#1a1a2e';
+            ctx2.font = 'bold 10px "Segoe UI","Microsoft YaHei",sans-serif';
+            ctx2.textAlign = 'center';
+            ctx2.textBaseline = 'bottom';
+            ctx2.fillText(labelText, bar.x, bar.y - 3);
+            ctx2.restore();
+          });
+        });
+      }
+    }]
+  });
+}
+
+function _renderDailyTrend(canvasId, trend) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  if (trend.length === 0) return;
+
+  var labels = trend.map(function(t) { return t.date; });
+  var revData = trend.map(function(t) { return Math.round(t.revenue * 100) / 100; });
+  var countData = trend.map(function(t) { return t.count; });
+
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: '收益',
+          data: revData,
+          borderColor: '#4472C4',
+          backgroundColor: 'rgba(68,114,196,0.12)',
+          fill: true,
+          tension: 0.35,
+          pointRadius: 4,
+          pointHoverRadius: 7,
+          pointBackgroundColor: '#4472C4',
+          yAxisID: 'y',
+          borderWidth: 2.5
+        },
+        {
+          label: '订单数',
+          data: countData,
+          borderColor: '#16a34a',
+          backgroundColor: 'rgba(22,163,52,0.08)',
+          fill: true,
+          tension: 0.35,
+          pointRadius: 3,
+          pointHoverRadius: 6,
+          pointBackgroundColor: '#16a34a',
+          yAxisID: 'y1',
+          borderWidth: 2,
+          borderDash: [5,3]
+        }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top', labels: { font: { size: 11 }, boxWidth: 14, padding: 10, usePointStyle: true } },
+      },
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: '收益 (元)', font: { size: 10 } }, grid: { color: 'rgba(0,0,0,0.05)' } },
+        y1: { position: 'right', beginAtZero: true, title: { display: true, text: '订单数', font: { size: 10 } }, grid: { display: false } },
+        x: { grid: { display: false }, ticks: { maxTicksLimit: 14, font: { size: 9 } } }
+      },
+      animation: { duration: 1200, easing: 'easeOutQuart' }
+    }
+  });
+}
+
+// ── Main cloud renderer ──
+
 function renderCloud() {
   var el = $('#tab-cloud');
   var dates = _defaultCloudDates();
 
+  // ── Filter bar ──
   var h = '<div class="filter-bar">';
   h += '<div><label>起始日期</label><input type="date" id="cloud-start" value="' + dates.start + '"></div>';
   h += '<div><label>结束日期</label><input type="date" id="cloud-end" value="' + dates.end + '"></div>';
   h += '<div><label>订单状态</label><div class="status-checks">';
-  var defStatuses = ['sent','printing','queued','failed','offline_unknown'];
+  var defStatuses = ['sent','printing','queued','failed','canceled','rejected','accepted','abandoned','reserved','offline_unknown'];
   defStatuses.forEach(function(s) {
-    h += '<label><input type="checkbox" value="' + s + '" checked> <span class="status-dot ' + s + '"></span> ' + statusLabel(s) + '</label>';
+    h += '<label><input type="checkbox" value="' + s + '" checked> <span class="status-dot ' + s + '"></span> ' + _statusLabelCN(s) + '</label>';
   });
   h += '</div></div>';
   h += '<div><label>&nbsp;</label><button class="btn pri" onclick="fetchCloudData()">🔍 查询</button></div>';
   h += '</div>';
 
+  // ── Loading state ──
   if (_cloudLoading) {
-    h += '<div class="section" style="text-align:center;padding:40px"><span class="loading-spin"></span> 正在从云端获取数据...</div>';
+    _destroyCloudCharts();
+    h += '<div class="section" style="text-align:center;padding:50px"><span class="loading-spin"></span> 正在从云端获取数据...</div>';
     el.innerHTML = h;
     return;
   }
 
+  // ── No data state ──
   var d = _cloudData;
   if (!d) {
+    _destroyCloudCharts();
     h += '<div class="empty"><p style="font-size:3rem">📡</p><h3>点击「查询」从云端获取订单数据</h3><p>查看服务器中记录的订单收益，用于核对手动填写的代收收入。云端数据不影响现有计算。</p></div>';
     el.innerHTML = h;
     return;
@@ -732,53 +1016,149 @@ function renderCloud() {
 
   var rs = d.revenue_summary;
   var orders = d.orders || [];
-  var byUser = d.by_user || [];
-
+  var byUser = (d.by_user || []).slice();
   var selectedUser = _cloudUserFilter;
-  h += '<div class="row" style="margin-bottom:14px"><div><label>按用户筛选</label>';
-  h += '<select id="cloud-user-filter" onchange="_filterCloudUserChanged()"><option value="all">全部用户</option>';
-  (byUser||[]).forEach(function(u) {
-    var label = u.nickname || u.openid.substring(0, 10);
-    h += '<option value="' + u.openid + '"' + (selectedUser === u.openid ? ' selected' : '') + '>' + esc(label) + '</option>';
-  });
-  h += '</select></div></div>';
+  var selectedSource = _cloudSourceFilter;
 
-  var localRev = rs.local || 0;
-  var cloudRev = rs.cloud || 0;
-  h += '<div class="cards">';
-  h += '<div class="card"><h3>💰 总收入（已完成）</h3><div class="big">' + RMB(rs.total) + '</div></div>';
-  h += '<div class="card"><h3>☁ 云端收入</h3><div class="big">' + RMB(cloudRev) + '</div><div class="sub">' + (rs.cloud_orders||0) + ' 个订单 · ' + (rs.cloud_files||0) + ' 个文件 · ' + (rs.cloud_pages||0) + ' 页</div></div>';
-  h += '<div class="card"><h3>🖨 本地收入</h3><div class="big">' + RMB(localRev) + '</div><div class="sub">' + (rs.local_orders||0) + ' 个订单 · ' + (rs.local_files||0) + ' 个文件 · ' + (rs.local_pages||0) + ' 页</div></div>';
-  h += '<div class="card"><h3>📄 总页数</h3><div class="big">' + (rs.total_pages||0) + '</div></div>';
+  // ── Augment by_user with local-data entry ──
+  var localOrders = orders.filter(function(o) { return o.source === 'local'; });
+  if (localOrders.length > 0) {
+    var localSummary = { openid: 'local', nickname: '本地订单', avatar_url: '',
+      revenue: 0, order_count: localOrders.length, file_count: 0, total_pages: 0 };
+    localOrders.forEach(function(o) {
+      localSummary.revenue += o.revenue || 0;
+      localSummary.file_count += o.files_count || 0;
+      localSummary.total_pages += o.total_page_count || 0;
+    });
+    localSummary.revenue = Math.round(localSummary.revenue * 100) / 100;
+    byUser.push(localSummary);
+  }
+
+  // Apply user + source filters for detail views
+  var filteredOrders = orders;
+  if (selectedUser !== 'all') {
+    filteredOrders = filteredOrders.filter(function(o) { return o.openid === selectedUser; });
+  }
+  if (selectedSource !== 'all') {
+    filteredOrders = filteredOrders.filter(function(o) { return o.source === selectedSource; });
+    // Also filter byUser to match selected source
+    if (selectedSource === 'local') {
+      byUser = byUser.filter(function(u) { return u.openid === 'local'; });
+    } else {
+      byUser = byUser.filter(function(u) { return u.openid !== 'local'; });
+    }
+  }
+
+  // Compute chart data from filtered orders (status/daily trend reflects current filters)
+  var dailyTrend = _computeDailyTrend(filteredOrders);
+  var orderStatusCount = _countByStatus(filteredOrders);
+  var fileStatusCount = _countFilesByStatus(filteredOrders);
+
+  // ── Filter row: user + source ──
+  h += '<div class="row" style="margin-bottom:12px">';
+  h += '<div><label>👤 按用户</label>';
+  h += '<select id="cloud-user-filter" onchange="_filterCloudUserChanged()"><option value="all">全部用户</option>';
+  var allUserIds = {};
+  orders.forEach(function(o) { if (o.openid && o.openid !== 'local') allUserIds[o.openid] = true; });
+  Object.keys(allUserIds).forEach(function(oid) {
+    var uInfo = byUser.find(function(u) { return u.openid === oid; });
+    var label = uInfo ? (uInfo.nickname || oid.substring(0,10)) : oid.substring(0,10);
+    h += '<option value="' + oid + '"' + (selectedUser === oid ? ' selected' : '') + '>' + esc(label) + '</option>';
+  });
+  h += '</select></div>';
+  h += '<div><label>📦 按来源</label>';
+  h += '<select id="cloud-source-filter" onchange="_filterCloudSourceChanged()">';
+  h += '<option value="all"' + (selectedSource==='all'?' selected':'') + '>全部来源</option>';
+  h += '<option value="cloud"' + (selectedSource==='cloud'?' selected':'') + '>☁ 云端</option>';
+  h += '<option value="local"' + (selectedSource==='local'?' selected':'') + '>🖨 本地</option>';
+  h += '</select></div>';
   h += '</div>';
 
+  // ── KPI cards ──
+  h += '<div class="kpi-grid">';
+  h += '<div class="kpi-card"><div class="num">' + RMB(rs.total) + '</div><div class="lbl">💰 总收入（已完成）</div></div>';
+  h += '<div class="kpi-card"><div class="num">' + ((rs.cloud_orders||0)+(rs.local_orders||0)) + '</div><div class="lbl">📦 总订单数</div><div class="sub-num">☁ ' + (rs.cloud_orders||0) + ' · 🖨 ' + (rs.local_orders||0) + '</div></div>';
+  h += '<div class="kpi-card"><div class="num">' + ((rs.cloud_files||0)+(rs.local_files||0)) + '</div><div class="lbl">📄 总文件数</div><div class="sub-num">☁ ' + (rs.cloud_files||0) + ' · 🖨 ' + (rs.local_files||0) + '</div></div>';
+  h += '<div class="kpi-card"><div class="num">' + (rs.total_pages||0) + '</div><div class="lbl">📃 总页数</div></div>';
+  var avgRev = orders.length > 0 ? (rs.total / orders.length) : 0;
+  h += '<div class="kpi-card"><div class="num">' + RMB(avgRev) + '</div><div class="lbl">📊 均单收益</div></div>';
+  var avgPages = orders.length > 0 ? Math.round((rs.total_pages||0) / orders.length) : 0;
+  h += '<div class="kpi-card"><div class="num">' + avgPages + '</div><div class="lbl">📐 均单页数</div></div>';
+  h += '</div>';
+
+  // ── Chart row 1: Status Distribution + Source Breakdown ──
+  h += '<div class="chart-grid">';
+
+  h += '<div class="section"><h2>🧩 订单状态分布</h2>';
+  h += '<div class="chart-wrap"><canvas id="cloud-chart-status"></canvas></div>';
+  // Mini legend with counts
+  h += '<div class="chart-legend-custom">';
+  var allStatusKeys = Object.keys(orderStatusCount).sort(function(a,b){ return orderStatusCount[b]-orderStatusCount[a]; });
+  if (allStatusKeys.length === 0) allStatusKeys = defStatuses;
+  allStatusKeys.forEach(function(s) {
+    var cnt = orderStatusCount[s] || 0;
+    h += '<span class="item"><span class="dot" style="background:' + _statusColor(s) + '"></span> ' + _statusLabelCN(s) + ' (' + cnt + ')</span>';
+  });
+  h += '</div></div>';
+
+  h += '<div class="section"><h2>💰 收益构成</h2>';
+  h += '<div class="chart-wrap"><canvas id="cloud-chart-source"></canvas></div>';
+  h += '<div style="text-align:center;font-size:0.82rem;color:var(--muted);margin-top:6px">';
+  h += '☁ 云端 ' + RMB(rs.cloud||0) + ' (' + (rs.cloud_orders||0) + '单)  |  🖨 本地 ' + RMB(rs.local||0) + ' (' + (rs.local_orders||0) + '单)';
+  h += '</div></div>';
+
+  h += '</div>'; // .chart-grid
+
+  // ── Chart row 2: User Revenue & Orders Bar ──
   if (byUser.length > 0) {
-    h += '<div class="section"><h2>👥 云端各用户收益</h2><table><thead><tr><th>用户</th><th>已完成收益</th><th>订单数</th><th>文件数</th><th>页数</th></tr></thead><tbody>';
+    h += '<div class="section chart-full"><h2>👥 各用户排行</h2>';
+    h += '<div class="chart-grid">';
+    h += '<div><h3 style="font-size:0.85rem;margin:0 0 6px 4px;color:var(--muted)">💰 收益</h3><div class="chart-wrap tall"><canvas id="cloud-chart-user-revenue"></canvas></div></div>';
+    h += '<div><h3 style="font-size:0.85rem;margin:0 0 6px 4px;color:var(--muted)">📋 接单数</h3><div class="chart-wrap tall"><canvas id="cloud-chart-user-orders"></canvas></div></div>';
+    h += '</div></div>';
+  }
+
+  // ── Chart row 3: Daily Trend ──
+  if (dailyTrend.length > 1) {
+    h += '<div class="section chart-full"><h2>📈 每日趋势 <span style="font-weight:400;font-size:0.82rem;color:var(--muted)">— 收益（左轴） / 订单数（右轴）</span></h2>';
+    h += '<div class="chart-wrap tall"><canvas id="cloud-chart-trend"></canvas></div></div>';
+  }
+
+  // ── User breakdown table ──
+  if (byUser.length > 0) {
+    h += '<div class="section"><h2>👥 用户收益明细</h2>';
+    h += '<table><thead><tr><th>用户</th><th>收益</th><th>占比</th><th>订单</th><th>文件</th><th>页数</th><th>均单收益</th><th>均单页数</th></tr></thead><tbody>';
     byUser.forEach(function(u) {
       var avatarHtml = u.avatar_url
-        ? '<img src="' + esc(u.avatar_url) + '" style="width:24px;height:24px;border-radius:50%;vertical-align:middle;margin-right:6px;object-fit:cover" onerror="this.style.display=\'none\'">'
+        ? '<img src="' + esc(u.avatar_url) + '" style="width:22px;height:22px;border-radius:50%;vertical-align:middle;margin-right:6px;object-fit:cover" onerror="this.style.display=\'none\'">'
         : '';
+      var pct = rs.total > 0 ? (u.revenue / rs.total * 100).toFixed(1) : 0;
+      var avgOrderRev = u.order_count > 0 ? (u.revenue / u.order_count) : 0;
+      var avgOrderPages = u.order_count > 0 ? Math.round((u.total_pages||0) / u.order_count) : 0;
       h += '<tr>';
-      h += '<td class="l">' + avatarHtml + esc(u.nickname || '微信用户') + ' <span style="font-size:0.75rem;color:var(--muted)">' + esc(u.openid.substring(0,10)) + '...</span></td>';
-      h += '<td class="pos">' + RMB(u.revenue) + '</td>';
+      var oidShort = u.openid === 'local' ? '' : ' <span style="font-size:0.75rem;color:var(--muted)">' + esc(u.openid.substring(0,8)) + '…</span>';
+      h += '<td class="l">' + avatarHtml + esc(u.nickname || '微信用户') + oidShort + '</td>';
+      h += '<td class="pos" style="font-weight:600">' + RMB(u.revenue) + '</td>';
+      h += '<td><span style="display:inline-block;background:#e0e7ff;border-radius:10px;padding:1px 10px;font-size:0.78rem">' + pct + '%</span></td>';
       h += '<td>' + u.order_count + '</td>';
       h += '<td>' + u.file_count + '</td>';
-      h += '<td>' + u.total_pages + '</td>';
+      h += '<td>' + (u.total_pages||0) + '</td>';
+      h += '<td>' + RMB(avgOrderRev) + '</td>';
+      h += '<td>' + avgOrderPages + '</td>';
       h += '</tr>';
     });
     h += '</tbody></table></div>';
   }
 
-  var filteredOrders = orders;
-  if (selectedUser !== 'all') {
-    filteredOrders = orders.filter(function(o) { return o.openid === selectedUser; });
-  }
-
-  h += '<div class="section"><h2>📋 订单明细（' + filteredOrders.length + ' 条，时间倒序）</h2>';
+  // ── Order detail table ──
+  // ── Order detail table (filteredOrders already computed above) ──
+  h += '<div class="section"><h2>📋 订单明细 <span style="font-weight:400;font-size:0.82rem;color:var(--muted)">' + filteredOrders.length + ' 条，时间倒序';
+  if (selectedSource !== 'all') h += ' · 来源: ' + (selectedSource==='local'?'🖨 本地':'☁ 云端');
+  h += '</span></h2>';
   if (filteredOrders.length === 0) {
     h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
   } else {
-    h += '<table><thead><tr><th></th><th>订单号</th><th>来源</th><th>用户</th><th>状态</th><th>收益</th><th>文件</th><th>页数</th><th>时间</th></tr></thead><tbody>';
+    h += '<div style="overflow-x:auto"><table style="table-layout:fixed"><colgroup><col style="width:30px"><col style="width:140px"><col style="width:54px"><col style="width:120px"><col style="width:74px"><col style="width:72px"><col style="width:44px"><col style="width:44px"><col style="width:90px"><col></colgroup><thead><tr><th></th><th>订单号</th><th>来源</th><th>用户</th><th>状态</th><th>收益</th><th>文件</th><th>页数</th><th>类型</th><th>时间</th></tr></thead><tbody>';
     filteredOrders.forEach(function(o) {
       var isExp = !!_cloudExpanded[o.order_id];
       var avatarHtml = o.avatar_url
@@ -788,35 +1168,60 @@ function renderCloud() {
       h += '<td><span class="expand-icon">▶</span></td>';
       h += '<td class="l" style="font-family:monospace;font-size:0.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
       h += '<td>' + (o.source === 'local' ? '<span class="tag b">本地</span>' : '<span class="tag b">云端</span>') + '</td>';
-      h += '<td class="l">' + avatarHtml + esc(o.nickname || o.openid.substring(0,8) + '...') + '</td>';
-      h += '<td><span class="tag ' + statusClass(o.status) + '">' + statusLabel(o.status) + '</span></td>';
-      h += '<td class="pos">' + RMB(o.revenue) + '</td>';
+      h += '<td class="l">' + avatarHtml + esc(o.nickname || (o.openid||'').substring(0,8) + '…') + '</td>';
+      h += '<td><span class="tag ' + statusClass(o.status) + '">' + _statusLabelCN(o.status) + '</span></td>';
+      h += '<td class="pos" style="font-weight:600">' + RMB(o.revenue) + '</td>';
       h += '<td>' + o.files_count + '</td>';
       h += '<td>' + (o.total_page_count || 0) + '</td>';
+      h += '<td style="font-size:0.78rem">' + (o.urgency||'低') + (o.delivery_enabled?' 🚚':'') + (o.cover_page?' 📄':'') + '</td>';
       h += '<td style="font-size:0.78rem;color:var(--muted)">' + esc((o.created_at||'').substring(0,16)) + '</td>';
       h += '</tr>';
       if (isExp && o.files && o.files.length > 0) {
         o.files.forEach(function(f) {
+          var fStatus = f.status || o.status;
           h += '<tr class="file-sub-row">';
           h += '<td></td>';
           h += '<td class="l" colspan="2" style="padding-left:36px">📄 ' + esc(f.file_name) + '</td>';
-          h += '<td><span class="tag ' + statusClass(f.status) + '">' + statusLabel(f.status) + '</span></td>';
+          h += '<td><span class="tag ' + statusClass(fStatus) + '">' + _statusLabelCN(fStatus) + '</span></td>';
           h += '<td class="pos">' + RMB(f.total_price) + '</td>';
-          h += '<td>' + f.copies + '份 ' + (f.duplex==='on'?'双面':'单面') + '</td>';
-          h += '<td>' + f.page_count + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</td>';
-          h += '<td></td>';
-          h += '<td></td>';
+          h += '<td>' + f.copies + '份</td>';
+          h += '<td>' + (f.page_count||0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</td>';
+          h += '<td>' + (f.duplex==='on'?'双面':'单面') + '</td>';
+          h += '<td colspan="2"></td>';
           h += '</tr>';
         });
       }
     });
-    h += '</tbody></table>';
+    h += '</tbody></table></div>';
   }
   h += '</div>';
 
-  h += '<div style="font-size:0.78rem;color:var(--muted);text-align:right">查询周期: ' + d.period.start + ' ~ ' + d.period.end + '</div>';
+  h += '<div style="font-size:0.78rem;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap">';
+  h += '<span>查询周期: ' + d.period.start + ' ~ ' + d.period.end + '</span>';
+  h += '<span>共 ' + orders.length + ' 笔订单 · ' + (rs.total_pages||0) + ' 页 · 收益 ' + RMB(rs.total) + '</span>';
+  h += '</div>';
 
+  // ── Insert HTML ──
+  _destroyCloudCharts();
   el.innerHTML = h;
+
+  // ── Initialize charts ──
+  // Use setTimeout to ensure DOM is rendered before Chart.js grabs canvases
+  setTimeout(function() {
+    _renderStatusDonut('cloud-chart-status', orderStatusCount, fileStatusCount);
+    _renderSourceDonut('cloud-chart-source', rs);
+    if (byUser.length > 0) {
+      _renderUserMetricBar('cloud-chart-user-revenue', byUser, 'revenue', '收益 (元)',
+        function(v,u){ return '¥' + v.toFixed(1) + '  (' + u.order_count + '单)'; },
+        function(u,f,m){ var r=Math.max(0.3,u[f]/m); return 'rgb('+Math.round(68+(30-68)*r)+','+Math.round(114+(60-114)*r)+','+Math.round(196+(130-196)*r)+')'; }
+      );
+      _renderUserMetricBar('cloud-chart-user-orders', byUser, 'order_count', '订单数 (单)',
+        function(v,u){ return v + '单  (¥' + u.revenue.toFixed(1) + ')'; },
+        function(u,f,m){ var r=Math.max(0.3,u[f]/m); return 'rgb('+Math.round(84+(40-84)*r)+','+Math.round(130+(80-130)*r)+','+Math.round(53+(35-53)*r)+')'; }
+      );
+    }
+    if (dailyTrend.length > 1) _renderDailyTrend('cloud-chart-trend', dailyTrend);
+  }, 50);
 }
 
 // ==================== TAB: HISTORY ====================
@@ -1046,6 +1451,7 @@ function renderAll() {
   _loadFromServer().then(function(data) {
     if (data) {
       STORE = migrateConfig(data);
+      currentKey = Object.keys(STORE.months).sort().pop() || null;
       renderAll();
       toast('✅ 已加载 ' + Object.keys(STORE.months).length + ' 个月数据 [本地文件]');
     } else {

@@ -1,5 +1,5 @@
 <!--pages/authorized-users/authorized-users.wxml-->
-<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}"></page-meta>
+<page-meta></page-meta>
 <navigation-bar title="历史授权用户" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">

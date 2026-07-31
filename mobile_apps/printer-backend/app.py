@@ -227,7 +227,9 @@ def save_retention_config(cfg):
 
 
 def cleanup_expired_files():
-    """清理超过保留时间的文件（删磁盘文件，不删数据库记录）"""
+    """清理超过保留时间的文件（删磁盘文件，不删数据库记录）。
+    跳过仍在活跃订单中引用的文件（reserved/queued/printing/accepted），
+    防止清理掉尚未完成或崩溃后待恢复的打印任务所需文件。"""
     cfg = load_retention_config()
     days = cfg.get("days", 0)
     hours = cfg.get("hours", 0)
@@ -244,14 +246,39 @@ def cleanup_expired_files():
         "SELECT id, path FROM files WHERE created_at < ? AND path != ''",
         (cutoff_str,),
     ).fetchall()
+
+    # 收集所有活跃订单引用的 file_id
+    active_statuses = ('queued', 'printing', 'accepted', 'reserved')
+    active_file_ids = set()
+    for (fid,) in conn.execute(
+        "SELECT DISTINCT file_id FROM orders WHERE file_id IS NOT NULL AND status IN (?,?,?,?)",
+        active_statuses,
+    ).fetchall():
+        if fid:
+            active_file_ids.add(fid)
+    for (fid,) in conn.execute(
+        "SELECT DISTINCT file_id FROM order_files WHERE file_id IS NOT NULL AND status IN (?,?,?,?)",
+        active_statuses,
+    ).fetchall():
+        if fid:
+            active_file_ids.add(fid)
     conn.close()
+
+    if active_file_ids:
+        print(f"  [CLEANUP] 跳过 {len(active_file_ids)} 个活跃订单引用的文件")
 
     md5_index = load_md5_index()
     deleted_count = 0
+    skipped_active = 0
 
     for row in rows:
         file_id = row["id"]
         file_path = row["path"]
+
+        # 跳过活跃订单引用的文件
+        if file_id in active_file_ids:
+            skipped_active += 1
+            continue
 
         # 删除磁盘文件
         if file_path and os.path.exists(file_path):
@@ -280,6 +307,8 @@ def cleanup_expired_files():
 
         deleted_count += 1
 
+    if skipped_active > 0:
+        print(f"  [CLEANUP] 已跳过 {skipped_active} 个活跃订单引用的过期文件")
     if deleted_count > 0:
         save_md5_index(md5_index)
         print(f"  [CLEANUP] 已清理 {deleted_count} 个过期文件（cutoff={cutoff_str}）")
@@ -2187,8 +2216,15 @@ def submit_order():
             })
 
         # 汇总父订单 total_price 和 page_count
-        parent_total_price = sum(st["total_price"] for st in sub_tasks)
+        parent_base_price = sum(st["total_price"] for st in sub_tasks)
         parent_page_count = sum(st["page_count"] * st["copies"] for st in sub_tasks)
+
+        # 计算最终价格 = 基础打印费 + 附加服务费
+        urgency_fee = urgency_price if urgency_price else 0
+        cover_fee = round(cover_page_price * cover_page, 2) if cover_page else 0
+        delivery_fee = round(parent_base_price * delivery_percentage / 100, 2) if delivery_percentage else 0
+        parent_total_price = round(parent_base_price + urgency_fee + cover_fee + delivery_fee, 2)
+
         conn.execute(
             "UPDATE orders SET total_price = ?, page_count = ? WHERE id = ?",
             (parent_total_price, parent_page_count, order_id),
@@ -2769,6 +2805,45 @@ def abandon_order():
     conn.close()
     print(f"  [ABANDON] 订单 #{order_id} 已被放弃打印")
     return jsonify({"success": True, "message": "订单已标记为放弃打印"})
+
+
+@app.route("/api/abandon_reserved_order", methods=["POST"])
+def abandon_reserved_order():
+    """本地打印工具放弃未提交的预留订单（按 order_number，需 token 认证）。
+    场景：用户在本地工具中点击"复制"获得了订单号但未点击"开始打印"，
+    直接关闭窗口或删除标签页时调用，将 reserved 标记为 abandoned，
+    同时补记价格（本地工具在获取订单号时已知文件/份数/双面配置）。"""
+    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    data = request.get_json(silent=True) or {}
+    order_number = data.get("order_number", "") or request.args.get("order_number", "")
+    if not order_number:
+        return jsonify({"success": False, "message": "缺少 order_number"}), 400
+    total_price = data.get("total_price", None)
+    conn = get_db()
+    try:
+        if total_price is not None:
+            cursor = conn.execute(
+                "UPDATE orders SET status = 'abandoned', total_price = ? WHERE order_number = ? AND status = 'reserved'",
+                (float(total_price), order_number),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE orders SET status = 'abandoned' WHERE order_number = ? AND status = 'reserved'",
+                (order_number,),
+            )
+        count = cursor.rowcount
+        if count > 0:
+            conn.commit()
+            price_info = f"，价格 ¥{float(total_price):.2f}" if total_price is not None else ""
+            print(f"  [ABANDON] 预留订单 {order_number} 已被放弃打印{price_info}")
+        return jsonify({"success": True, "message": f"已标记 {count} 个预留订单为放弃"})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"success": False, "message": str(e)}), 500
+    finally:
+        conn.close()
 
 
 # ==================== 本地订单上报（本地打印工具使用）====================

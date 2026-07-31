@@ -1,5 +1,5 @@
 <!--user-orders.wxml — 查看指定用户/来源的订单列表-->
-<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}"></page-meta>
+<page-meta></page-meta>
 <navigation-bar title="{{pageTitle}}" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
@@ -120,8 +120,32 @@
               <view class="detail-file-right">
                 <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
-                <text class="file-status-mini status-{{f.status}}">{{statusMap[f.status] || f.status}}</text>
               </view>
+            </view>
+          </view>
+
+          <!-- 附加服务 -->
+          <view wx:if="{{item.urgency !== '低' || item.cover_page > 0 || item.delivery_enabled}}" class="detail-section">
+            <view class="detail-section-title">附加服务</view>
+            <view wx:if="{{item.urgency && item.urgency !== '低'}}" class="detail-row">
+              <text class="detail-label">加急</text>
+              <text class="detail-value">{{item.urgency === '高' ? '🚀 高' : '⚡ 中'}}<text wx:if="{{item.urgency_price > 0}}"> + ¥{{item.urgency_price}}</text></text>
+            </view>
+            <view wx:if="{{item.cover_page > 0}}" class="detail-row">
+              <text class="detail-label">首页</text>
+              <text class="detail-value">{{item.cover_page}} 页<text wx:if="{{item.cover_page_price > 0}}"> · ¥{{item.cover_page_price}}/页</text></text>
+            </view>
+            <view wx:if="{{item.delivery_enabled}}" class="detail-row">
+              <text class="detail-label">派送</text>
+              <text class="detail-value">{{item.delivery_location || '未指定地点'}}<text wx:if="{{item.delivery_percentage > 0}}"> · 加收 {{item.delivery_percentage}}%</text></text>
+            </view>
+          </view>
+
+          <!-- 价格 -->
+          <view class="detail-section">
+            <view class="detail-row detail-price-row">
+              <text class="detail-label">合计价格</text>
+              <text class="detail-value detail-price-value">¥{{item.totalPriceDisplay}}</text>
             </view>
           </view>
 

@@ -10,7 +10,7 @@
   min-height: 0;
 }
 
-/* 深浅切换过渡：确保子元素在 class 移除时也能平滑过渡 */
+/* 深浅切换过渡：只作用于需要主题过渡的具名元素，不覆盖 auto-print-switch-row 等自身 transition */
 .page-root,
 .page-root .card,
 .page-root .card-elevated,
@@ -21,6 +21,19 @@
 .page-root .picker-trigger,
 .page-root .add-file-btn {
   transition: background 0.45s ease, color 0.35s ease, border-color 0.45s ease, box-shadow 0.45s ease;
+}
+
+/* 主题切换过渡期：禁用所有 CSS transition，防止缓存页面 show() 时 isDarkMode 变更触发旧→新值动画 */
+.page-root.theme-switching,
+.page-root.theme-switching .card,
+.page-root.theme-switching .card-elevated,
+.page-root.theme-switching .file-card,
+.page-root.theme-switching .ext-params-card,
+.page-root.theme-switching .file-section,
+.page-root.theme-switching .status-bar,
+.page-root.theme-switching .picker-trigger,
+.page-root.theme-switching .add-file-btn {
+  transition: none !important;
 }
 
 /* 初始隐藏态：防止页面首次渲染时闪烁 */

@@ -1,15 +1,16 @@
 <!--me.wxml-->
-<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}"></page-meta>
+<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" page-style="--tab-highlight:{{isDarkMode ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.7)'}};--tab-bg:{{isDarkMode ? 'rgba(26,26,28,0.50)' : 'var(--glass-regular)'}};--tab-text:{{isDarkMode ? '#98989D' : '#8E8E93'}};--tab-text-active:{{isDarkMode ? '#409CFF' : '#007AFF'}}"></page-meta>
 <navigation-bar title="我" back="{{false}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 
-<!-- 深色遮罩层：固定在视口底层，遮住页面切换动画时露出的白色窗口背景 -->
+<!-- theme-bg-layer 在 page-root 外，始终可见，确保淡入淡出间隙不露原生白色背景 -->
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
 
-<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}} {{themeSwitching ? 'theme-switching' : ''}}">
-  <!-- 深色模式切换按钮（右上角） -->
-  <view class="theme-toggle-btn" bindtap="onToggleTheme" hover-class="tap-active">
-    <text>{{themeMode === 'auto' ? '🌓' : (themeMode === 'dark' ? '🌙' : '☀️')}}</text>
-  </view>
+<!-- 深色模式切换按钮（page-root 外，避免与原生 type="nickname" 输入层冲突） -->
+<view class="theme-toggle-btn {{isDarkMode ? 'theme-dark' : ''}}" style="top: {{navBarBtnTop}}px;" bindtap="onToggleTheme" hover-class="tp-pressing" hover-stay-time="0">
+  <text>{{themeMode === 'auto' ? '🌓' : (themeMode === 'dark' ? '🌙' : '☀️')}}</text>
+</view>
+
+<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
   <!-- 返回顶部按钮（右下角） -->
   <view class="scroll-top-btn {{scrollTop > 200 ? 'scroll-top-visible' : ''}}" bindtap="onScrollToTop" hover-class="tap-active">
     <view class="scroll-top-arrow">
@@ -34,8 +35,13 @@
         <image class="avatar" src="{{avatarUrl || '/images/default-avatar.png'}}" mode="aspectFill"></image>
       </view>
       <view class="user-info">
-        <input class="nickname-input" type="nickname" value="{{nickname}}" bindinput="onNicknameInput" bindblur="onNicknameSave" placeholder="点击输入昵称" />
+        <view class="nickname-row" bindtap="onTapNickname" hover-class="tap-active">
+          <text class="nickname-text">{{nickname || '点击设置昵称'}}</text>
+          <text class="nickname-edit-icon">✎</text>
+        </view>
         <text class="uid">{{isSuperAdmin ? '超级管理员' : (userRole === 'admin' ? '管理员' : (userRole === 'user' ? '普通用户' : '访客'))}}</text>
+        <!-- 隐藏的原生 type="nickname" 输入，触发微信内置昵称自动填充 -->
+        <input class="hidden-nickname-input" type="nickname" focus="{{focusWechatNickname}}" bindinput="onHiddenNicknameInput" bindblur="onHiddenNicknameBlur" />
       </view>
       <!-- 许可密钥徽章（临时授权或通过密钥升级的管理员） -->
       <view wx:if="{{licenseInfo}}" class="license-badge {{licenseInfo.type === 'admin' ? 'license-badge-admin' : 'license-badge-temp'}}">
@@ -54,7 +60,7 @@
         <text class="license-label">有效时间（分钟）</text>
         <view class="stepper license-stepper">
           <view class="stepper-btn {{minusDisabled ? 'stepper-disabled' : ''}}" catchtap="onLicenseMinutesMinus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
-          <input class="stepper-input" type="number" value="{{licenseMinutes}}" bindinput="onLicenseMinutesChange" />
+          <input class="stepper-input" type="number" value="{{licenseMinutes}}" disabled />
           <view class="stepper-btn {{plusDisabled ? 'stepper-disabled' : ''}}" catchtap="onLicenseMinutesPlus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
         </view>
         <!-- 超级管理员：许可密钥类型选择 -->
@@ -79,8 +85,8 @@
           <text>{{item.status === 'unused' ? '作废' : '删除'}}</text>
         </view>
         <!-- 卡片本体：可左滑 -->
-        <view class="key-card {{item.swipeTransition ? '' : 'no-transition'}}"
-              style="transform: translateX({{item.swipeX}}px); transition: {{item.swipeTransition === false ? 'none' : 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)'}};"
+        <view class="key-card {{item.swipeTransition === false ? 'no-transition' : ''}}"
+              style="transform: translateX({{item.swipeX}}px);{{item.swipeTransition === false ? 'transition: none;' : (item.swipeTransition === true ? 'transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);' : '')}}"
               bindtouchstart="onKeyTouchStart"
               bindtouchmove="onKeyTouchMove"
               bindtouchend="onKeyTouchEnd"
@@ -173,13 +179,13 @@
         <view class="retention-row">
           <view class="retention-stepper">
             <view class="retention-stepper-btn {{retentionDays <= 0 ? 'stepper-disabled' : ''}}" catchtap="onRetentionDaysMinus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
-            <input class="retention-stepper-input" type="number" value="{{retentionDays}}" bindinput="onRetentionDaysChange" />
+            <input class="retention-stepper-input" type="number" value="{{retentionDays}}" disabled />
             <view class="retention-stepper-btn" catchtap="onRetentionDaysPlus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
           </view>
           <text class="retention-unit">天</text>
           <view class="retention-stepper">
             <view class="retention-stepper-btn {{retentionHours <= 0 ? 'stepper-disabled' : ''}}" catchtap="onRetentionHoursMinus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
-            <input class="retention-stepper-input" type="number" value="{{retentionHours}}" bindinput="onRetentionHoursChange" />
+            <input class="retention-stepper-input" type="number" value="{{retentionHours}}" disabled />
             <view class="retention-stepper-btn" catchtap="onRetentionHoursPlus" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
           </view>
           <text class="retention-unit">小时</text>
@@ -248,7 +254,7 @@
         </view>
         <!-- 卡片本体：可左滑 -->
         <view class="admin-card {{adminSwipeTransition[item.openid] === false ? 'no-transition' : ''}}"
-              style="transform: translateX({{adminSwipeX[item.openid] || 0}}px); transition: {{adminSwipeTransition[item.openid] === false ? 'none' : 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)'}};"
+              style="transform: translateX({{adminSwipeX[item.openid] || 0}}px);{{adminSwipeTransition[item.openid] === false ? 'transition: none;' : (adminSwipeTransition[item.openid] === true ? 'transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);' : '')}}"
               bindtouchstart="onAdminTouchStart"
               bindtouchmove="onAdminTouchMove"
               bindtouchend="onAdminTouchEnd"
@@ -376,9 +382,33 @@
               <view class="detail-file-right">
                 <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
-                <text class="file-status-mini status-{{f.status}}">{{statusMap[f.status] || f.status}}</text>
                 <text wx:if="{{f.status === 'rejected' && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
+            </view>
+          </view>
+
+          <!-- 附加服务 -->
+          <view wx:if="{{item.urgency !== '低' || item.cover_page > 0 || item.delivery_enabled}}" class="detail-section">
+            <view class="detail-section-title">附加服务</view>
+            <view wx:if="{{item.urgency && item.urgency !== '低'}}" class="detail-row">
+              <text class="detail-label">加急</text>
+              <text class="detail-value">{{item.urgency === '高' ? '🚀 高' : '⚡ 中'}}<text wx:if="{{item.urgency_price > 0}}"> + ¥{{item.urgency_price}}</text></text>
+            </view>
+            <view wx:if="{{item.cover_page > 0}}" class="detail-row">
+              <text class="detail-label">首页</text>
+              <text class="detail-value">{{item.cover_page}} 页<text wx:if="{{item.cover_page_price > 0}}"> · ¥{{item.cover_page_price}}/页</text></text>
+            </view>
+            <view wx:if="{{item.delivery_enabled}}" class="detail-row">
+              <text class="detail-label">派送</text>
+              <text class="detail-value">{{item.delivery_location || '未指定地点'}}<text wx:if="{{item.delivery_percentage > 0}}"> · 加收 {{item.delivery_percentage}}%</text></text>
+            </view>
+          </view>
+
+          <!-- 价格 -->
+          <view class="detail-section">
+            <view class="detail-row detail-price-row">
+              <text class="detail-label">合计价格</text>
+              <text class="detail-value detail-price-value">¥{{item.totalPriceDisplay}}</text>
             </view>
           </view>
 
@@ -415,6 +445,30 @@
   </view>
 </view>
 </view>
+
+  <!-- 昵称选择弹窗 -->
+  <view wx:if="{{showNicknamePicker}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCancelNicknamePicker">
+    <view class="modal-sheet" catchtap="noop">
+      <text class="title-medium" style="margin-bottom: 24rpx;">设置昵称</text>
+      <button class="btn-primary" bindtap="onChooseWechatNickname" hover-class="tap-active" style="margin-bottom: 16rpx;">📱 使用微信昵称</button>
+      <button class="btn-secondary" bindtap="onChooseCustomNickname" hover-class="tap-active">✏️ 使用自定义昵称</button>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" bindtap="onCancelNicknamePicker" hover-class="tap-active">取消</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- 自定义昵称输入弹窗 -->
+  <view wx:if="{{showNicknameInput}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCancelCustomNickname">
+    <view class="modal-sheet" catchtap="noop">
+      <text class="title-medium" style="margin-bottom: 16rpx;">输入昵称</text>
+      <input class="input-ios" type="text" value="{{customNickname}}" placeholder="请输入昵称" bindinput="onCustomNicknameInput" maxlength="20" style="margin-bottom: 24rpx;" />
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" bindtap="onCancelCustomNickname" hover-class="tap-active">取消</button>
+        <button class="btn-primary modal-half-btn" bindtap="onSaveCustomNickname" hover-class="tap-active">保存</button>
+      </view>
+    </view>
+  </view>
 
   <!-- 通用确认弹窗（在 page-root 外，position:fixed 锚定真实视口） -->
   <view wx:if="{{showConfirmModal}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCancelConfirm">

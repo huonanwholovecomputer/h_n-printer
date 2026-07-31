@@ -1190,8 +1190,7 @@ class CloudTaskListWindow(QDialog):
         oid = tasks[0].order_id or tasks[0].task_id
         if oid in self._pending_orders:
             self._pending_orders[oid]["status"] = "accepted"
-        for task in tasks:
-            self.order_accepted.emit([task])
+        self.order_accepted.emit(tasks)
         self._rebuild_table()
         self._check_auto_close()
 
@@ -1218,8 +1217,7 @@ class CloudTaskListWindow(QDialog):
             return
         for oid, entry in pending_orders:
             entry["status"] = "accepted"
-            for task in entry["tasks"]:
-                self.order_accepted.emit([task])
+            self.order_accepted.emit(entry["tasks"])
         self._rebuild_table()
         self._check_auto_close()
 
@@ -1377,6 +1375,29 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._load_config_to_ui()
         self._init_cloud_client()
+
+    # ---- 标签页 key 安全排序 ----
+
+    @staticmethod
+    def _sorted_tab_keys(tabs: dict) -> list[str]:
+        """安全排序标签页 key，非数字 key 按字符串自然顺序排末尾。"""
+        numeric = []
+        non_numeric = []
+        for k in tabs.keys():
+            try:
+                numeric.append((int(k), k))
+            except (ValueError, TypeError):
+                non_numeric.append(k)
+        numeric.sort(key=lambda x: x[0])
+        return [k for _, k in numeric] + sorted(non_numeric)
+
+    @staticmethod
+    def _safe_int_key(key: str, default: int = 0) -> int:
+        """安全地将标签页 key 转为 int，无法转换时返回 default。"""
+        try:
+            return int(key)
+        except (ValueError, TypeError):
+            return default
 
     # ---- 云端连接 ----
 
@@ -2041,7 +2062,7 @@ class MainWindow(QMainWindow):
 
     def _switch_tab(self, delta: int):
         """切换标签页。delta: -1 上一页, +1 下一页（若已在最后一页则新建）。"""
-        tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+        tab_keys = self._sorted_tab_keys(self._config.tabs)
         if not tab_keys:
             self._config.tabs = {"1": TabSettings()}
             tab_keys = ["1"]
@@ -2060,7 +2081,8 @@ class MainWindow(QMainWindow):
 
         if new_idx >= len(tab_keys):
             # 在最后一页点 + → 新建标签
-            new_key = str(int(tab_keys[-1]) + 1)
+            last_num = self._safe_int_key(tab_keys[-1]) if tab_keys else 0
+            new_key = str(last_num + 1)
             self._config.tabs[new_key] = TabSettings()
             self._current_tab = new_key
             self._config.active_tab = new_key
@@ -2093,7 +2115,7 @@ class MainWindow(QMainWindow):
         """删除标签页后重新从 1 开始编号。更新 _current_tab 指向同一标签的新 key。"""
         old_current = self._current_tab
         old_tabs = self._config.tabs
-        sorted_keys = sorted(old_tabs.keys(), key=lambda x: int(x))
+        sorted_keys = self._sorted_tab_keys(old_tabs)
         new_tabs = {}
         new_current = "1"
         new_idx = 1
@@ -2110,10 +2132,10 @@ class MainWindow(QMainWindow):
     def _cleanup_empty_tabs(self, after_key: str | None = None):
         """删除空标签页。after_key 不为 None 时仅删除 key > after_key 的标签页。"""
         removed = []
-        for key in sorted(self._config.tabs.keys(), key=lambda x: int(x)):
+        for key in self._sorted_tab_keys(self._config.tabs):
             if key == self._current_tab:
                 continue
-            if after_key is not None and int(key) <= int(after_key):
+            if after_key is not None and self._safe_int_key(key) <= self._safe_int_key(after_key):
                 continue
             tab = self._config.tabs.get(key)
             if tab and len(tab.jobs) == 0:
@@ -2149,7 +2171,7 @@ class MainWindow(QMainWindow):
             prefix = "🔒 " if is_frozen else "📑 "
             self._tab_scope_label.setText(f"{prefix}标签页 {self._current_tab}")
 
-        tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+        tab_keys = self._sorted_tab_keys(self._config.tabs)
         try:
             idx = tab_keys.index(self._current_tab)
         except ValueError:
@@ -2207,6 +2229,25 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"自动保存配置失败: {e}")
 
+    def _cleanup_orphan_pdf_cache(self, abandoned_jobs: list):
+        """放弃订单后清理不再被任何活跃任务引用的 PDF 缓存。
+        遍历 abandoned_jobs 中每个 job 的 source_md5，
+        若其他标签页中无任务引用同一 MD5，则从 pdf_cache 中删除。"""
+        if not self._cloud_client or not abandoned_jobs:
+            return
+        abandoned_md5s = {j.source_md5 for j in abandoned_jobs if j.source_md5}
+        if not abandoned_md5s:
+            return
+        # 收集所有仍在活跃标签页中引用的 MD5
+        active_md5s = set()
+        for tab_entry in self._config.tabs.values():
+            for job in (tab_entry.jobs if tab_entry.jobs else []):
+                if job.source_md5:
+                    active_md5s.add(job.source_md5)
+        for md5 in abandoned_md5s:
+            if md5 not in active_md5s:
+                self._cloud_client.remove_cached_pdf(md5)
+
     # ──────── 标签页管理窗口 ────────
 
     def _show_tab_manager(self):
@@ -2246,7 +2287,7 @@ class MainWindow(QMainWindow):
         def _rebuild_dialog_table():
             """重建对话框内的标签页表格。"""
             nonlocal tab_keys
-            tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
+            tab_keys = self._sorted_tab_keys(self._config.tabs)
             table.setRowCount(0)
             for key in tab_keys:
                 tb = self._config.tabs.get(key)
@@ -2349,11 +2390,17 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            # 通知后端放弃该标签页中的云端任务
+            # 通知后端放弃该标签页中的云端任务 + 本地预留订单
             for job in jobs:
-                if job.task_id > 0 and self._cloud_client:
+                if job.order_id > 0 and self._cloud_client:
+                    self._cloud_client.abandon_order_to_server(job.order_id)
+                elif job.task_id > 0 and self._cloud_client:
                     self._cloud_client.abandon_order_to_server(job.task_id)
+                elif job.order_number and "-L" not in job.order_number and self._cloud_client:
+                    price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
+                    self._cloud_client.abandon_reserved_order(job.order_number, price)
             del self._config.tabs[key]
+            self._cleanup_orphan_pdf_cache(jobs)
             self._renumber_tabs()
             self._save_config()
             self._rebuild_table()
@@ -2374,14 +2421,22 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            # 通知后端放弃所有云端任务
+            # 通知后端放弃所有云端任务 + 本地预留订单
+            all_abandoned = []
             for tab_entry in self._config.tabs.values():
                 for job in (tab_entry.jobs if tab_entry else []):
-                    if job.task_id > 0 and self._cloud_client:
+                    all_abandoned.append(job)
+                    if job.order_id > 0 and self._cloud_client:
+                        self._cloud_client.abandon_order_to_server(job.order_id)
+                    elif job.task_id > 0 and self._cloud_client:
                         self._cloud_client.abandon_order_to_server(job.task_id)
+                    elif job.order_number and "-L" not in job.order_number and self._cloud_client:
+                        price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
+                        self._cloud_client.abandon_reserved_order(job.order_number, price)
             self._config.tabs = {"1": TabSettings()}
             self._current_tab = "1"
             self._config.active_tab = "1"
+            self._cleanup_orphan_pdf_cache(all_abandoned)
             self._save_config()
             self._rebuild_table()
             self._refresh_tab_display()
@@ -2392,7 +2447,7 @@ class MainWindow(QMainWindow):
         def _cleanup_empty_in_dialog():
             """在标签页管理器中删除空标签页。"""
             removed = []
-            for key in sorted(self._config.tabs.keys(), key=lambda x: int(x)):
+            for key in self._sorted_tab_keys(self._config.tabs):
                 if key == self._current_tab:
                     continue
                 tab_entry = self._config.tabs.get(key)
@@ -3561,6 +3616,9 @@ class MainWindow(QMainWindow):
 
     def _start_print_worker(self, flat_jobs: list):
         """用给定的任务列表启动打印 Worker。"""
+        if self._worker is not None and self._worker.isRunning():
+            self._log("⚠️ 已有打印任务正在进行，不能重复启动")
+            return
         self._flat_jobs = flat_jobs
         self._sync_ui_to_config()
 
@@ -4073,10 +4131,22 @@ class MainWindow(QMainWindow):
             self._log(f"⚠ 无障碍打印：标签页 {self._current_tab} 无文件，跳过")
 
     def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
-        """云端订单被用户取消 → 通知任务列表窗口更新状态。"""
+        """云端订单被用户取消 → 通知任务列表窗口更新状态，若正在打印则立即取消。"""
         self._log(f"☁ 订单 #{order_id} 已被用户取消")
         if self._cloud_task_window:
             self._cloud_task_window.mark_canceled(order_id, task_ids)
+
+        # 检查当前打印的任务是否包含被取消的 task_id → 立即终止打印
+        cancel_current_print = False
+        if self._worker and self._worker.isRunning():
+            for job in self._worker._jobs:
+                if job.task_id in task_ids or job.order_id == order_id:
+                    cancel_current_print = True
+                    break
+        if cancel_current_print:
+            self._log(f"☁ 订单 #{order_id} 正在打印，已自动取消")
+            self._worker.cancel()
+
         # 如果已添加到标签页中，弹出提示
         for key, tab in list(self._config.tabs.items()):
             for job in tab.jobs:
@@ -4160,14 +4230,23 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
-            # 用户确认退出 → 通知后端放弃已接受的云端任务，然后清空
+            # 用户确认退出 → 通知后端放弃已接受的云端任务 + 本地预留订单，然后清空
+            all_abandoned = []
             for key, tab in self._config.tabs.items():
                 for job in tab.jobs:
-                    if job.task_id > 0 and self._cloud_client:
+                    all_abandoned.append(job)
+                    if job.order_id > 0 and self._cloud_client:
+                        self._cloud_client.abandon_order_to_server(job.order_id)
+                    elif job.task_id > 0 and self._cloud_client:
                         self._cloud_client.abandon_order_to_server(job.task_id)
+                    elif job.order_number and "-L" not in job.order_number and self._cloud_client:
+                        # 本地预留订单（仅获取了订单号但未提交打印）→ 标记为放弃，并补记价格
+                        price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
+                        self._cloud_client.abandon_reserved_order(job.order_number, price)
             self._config.tabs = {"1": TabSettings()}
             self._config.active_tab = "1"
             self._current_tab = "1"
+            self._cleanup_orphan_pdf_cache(all_abandoned)
 
         try:
             # 删除所有空标签页并重新编号（确保下次启动从 1 开始）
@@ -4322,8 +4401,9 @@ class MainWindow(QMainWindow):
     def _add_cloud_task_to_new_tab(self, task: CloudTask, is_first: bool = True):
         """将云端任务添加到新的标签页并切换过去。is_first=False 时追加到当前标签页。"""
         if is_first:
-            tab_keys = sorted(self._config.tabs.keys(), key=lambda x: int(x))
-            new_key = str(int(tab_keys[-1]) + 1) if tab_keys else "1"
+            tab_keys = self._sorted_tab_keys(self._config.tabs)
+            last_num = self._safe_int_key(tab_keys[-1]) if tab_keys else 0
+            new_key = str(last_num + 1)
             # 用前端订单的附加服务覆盖默认值
             tab_settings = TabSettings()
             tab_settings.delivery_enabled = task.delivery_enabled
@@ -4396,6 +4476,7 @@ class MainWindow(QMainWindow):
             orientation=orientation,
             engine=engine,
             task_id=task.task_id,
+            order_id=task.order_id or 0,
             source_md5=source_md5,
             display_name=task.file_name,  # 使用后端返回的原始文件名
             order_number=task.order_number,  # 云端订单号
@@ -4436,7 +4517,9 @@ class MainWindow(QMainWindow):
         self._cancel_all_convert_workers()
         # 通知后端放弃已接受的云端任务
         for job in jobs:
-            if job.task_id > 0 and self._cloud_client:
+            if job.order_id > 0 and self._cloud_client:
+                self._cloud_client.abandon_order_to_server(job.order_id)
+            elif job.task_id > 0 and self._cloud_client:
                 self._cloud_client.abandon_order_to_server(job.task_id)
         self._cleared_jobs_backup[self._current_tab] = list(jobs)
         self._set_current_jobs([])
@@ -4478,7 +4561,9 @@ class MainWindow(QMainWindow):
         for row in rows:
             if row < len(jobs):
                 job = jobs[row]
-                if job.task_id > 0 and self._cloud_client:
+                if job.order_id > 0 and self._cloud_client:
+                    self._cloud_client.abandon_order_to_server(job.order_id)
+                elif job.task_id > 0 and self._cloud_client:
                     self._cloud_client.abandon_order_to_server(job.task_id)
         for row in rows:
             if row < len(jobs):
@@ -4562,5 +4647,7 @@ class MainWindow(QMainWindow):
             self._log(f"标签页 {self._current_tab}: 已添加 {len(jobs) - rows_before} 个文件")
             for i, job in enumerate(jobs):
                 ext = os.path.splitext(job.file_path)[1].lower()
-                if ext in (".doc", ".docx"):
+                if ext != ".pdf":
+                    # 所有非 PDF 文件都在添加时预转换为 PDF 并缓存（图片/TXT/Word 等）
+                    # 这样崩溃恢复后即使源文件不可用，缓存 PDF 仍可用于打印
                     self._start_convert_worker(i, job.file_path, job.engine)

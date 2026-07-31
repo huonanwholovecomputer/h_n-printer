@@ -104,6 +104,7 @@ class CloudTask:
             "download_progress": self.download_progress,
             "status": self.status,
             "error_message": self.error_message,
+            "source_md5": self.source_md5,
         }
 
 
@@ -157,6 +158,9 @@ class CloudClient(QObject):
         # 本地任务缓存
         self._pending_tasks: dict[int, CloudTask] = {}
         self._download_lock = threading.Lock()
+        self._cache_index_lock = threading.Lock()
+        # 从本地持久化文件加载上次的保留时间（避免每次启动都从 7 天开始）
+        self._load_retention()
 
     # ── 公共 API ──
 
@@ -216,6 +220,26 @@ class CloudClient(QObject):
             self._queue_status_sync(order_id, "abandoned")
             return
         self._try_status_sync(order_id, "abandoned")
+
+    def abandon_reserved_order(self, order_number: str, total_price: float = 0.0):
+        """放弃本地预留订单（仅获取了订单号但未提交打印）。
+        调用后端 /api/abandon_reserved_order，将 reserved → abandoned，并补记价格。"""
+        if not self.api_url or not self.token or not order_number:
+            return
+        try:
+            payload = {"order_number": order_number}
+            if total_price > 0:
+                payload["total_price"] = round(total_price, 2)
+            resp = http_requests.post(
+                f"{self.api_url}/api/abandon_reserved_order",
+                params={"token": self.token},
+                json=payload,
+                timeout=10,
+            )
+            if resp.ok:
+                self.status_message.emit(f"☁ 预留订单 {order_number} 已标记为放弃")
+        except Exception:
+            pass  # 离线时静默跳过，后端定时任务兜底
 
     def accept_order_to_server(self, order_id: int):
         """确认接受订单：调用后端 API。失败时加入同步队列。"""
@@ -491,15 +515,25 @@ class CloudClient(QObject):
 
         @self._sio.on("storage_config_updated")
         def _on_storage_config_updated(data):
-            """后端推送：储存保留时间已更新 → 同步到本地缓存"""
+            """后端推送：储存保留时间已更新 → 同步到本地缓存（小时级精度）。
+            仅当与本地持久化值不同时记录日志，避免每次重连都刷屏。"""
             days = data.get("retention_days", None)
             hours = data.get("retention_hours", None)
             if days is not None and hours is not None:
-                total = int(days) + (int(hours) / 24.0)
-                new_retention = max(1, int(total + 0.5))  # 进位取整，最少保留 1 天
-                old = self._CACHE_RETENTION_DAYS
-                self._CACHE_RETENTION_DAYS = new_retention
-                self.status_message.emit(f"📦 缓存保留时间已同步: {old}天 → {new_retention}天")
+                new_hours = int(days) * 24 + int(hours)
+                old_hours = self._CACHE_RETENTION_HOURS
+                if new_hours == old_hours:
+                    return  # 未变化，跳过日志和清理
+                self._CACHE_RETENTION_HOURS = new_hours
+                # 持久化到本地文件，下次启动直接恢复此值
+                self._save_retention(new_hours)
+                # 友好显示
+                if new_hours >= 24 and new_hours % 24 == 0:
+                    display = f"{new_hours // 24}天"
+                else:
+                    display = f"{new_hours}小时"
+                old_display = f"{old_hours // 24}天" if old_hours >= 24 and old_hours % 24 == 0 else f"{old_hours}小时"
+                self.status_message.emit(f"📦 缓存保留时间已同步: {old_display} → {display}")
                 # 立即按新规则清理
                 self._cleanup_pdf_cache()
 
@@ -671,10 +705,36 @@ class CloudClient(QObject):
             self.task_updated.emit(task)
             self.status_message.emit(f"☁ 下载失败 #{task_id}: {e}")
 
-    # ── PDF 缓存（MD5 绑定，7 天自动清理）──
+    # ── PDF 缓存（MD5 绑定，默认 7 天自动清理）──
 
     _CACHE_DIR: str | None = None
-    _CACHE_RETENTION_DAYS = 7
+    _CACHE_RETENTION_HOURS = 168  # 7天，默认为小时；0 = 永不过期
+
+    def _retention_path(self) -> str:
+        """持久化保留时间的侧边文件路径。"""
+        return os.path.join(self._cache_dir, "retention.json")
+
+    def _load_retention(self):
+        """从本地文件加载上次保存的保留时间，避免每次启动从 7 天硬编码开始。"""
+        path = os.path.join(self._cache_dir, "retention.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    val = int(data.get("retention_hours", 0))
+                    if val > 0:
+                        self._CACHE_RETENTION_HOURS = val
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+
+    def _save_retention(self, hours: int):
+        """将保留时间持久化到本地文件，供下次启动恢复。"""
+        path = os.path.join(self._cache_dir, "retention.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"retention_hours": hours}, f)
+        except OSError:
+            pass
 
     @property
     def _cache_dir(self) -> str:
@@ -690,18 +750,34 @@ class CloudClient(QObject):
         return os.path.join(self._cache_dir, "index.json")
 
     def _load_cache_index(self) -> dict:
-        path = self._cache_index_path()
-        if not os.path.exists(path):
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return {}
+        with self._cache_index_lock:
+            path = self._cache_index_path()
+            if not os.path.exists(path):
+                return {}
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                return {}
 
     def _save_cache_index(self, index: dict):
-        with open(self._cache_index_path(), "w", encoding="utf-8") as f:
-            json.dump(index, f, ensure_ascii=False, indent=2)
+        # 写入临时文件后原子重命名，避免截断式写入导致 JSON 损坏
+        with self._cache_index_lock:
+            path = self._cache_index_path()
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(index, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+            except Exception:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                raise
 
     def _compute_md5_file(self, file_path: str) -> str:
         md5 = hashlib.md5()
@@ -722,6 +798,22 @@ class CloudClient(QObject):
             return pdf_path, meta
         return None, None
 
+    def remove_cached_pdf(self, source_md5: str):
+        """删除指定 MD5 的缓存 PDF 及其索引条目（用于放弃订单时清理）。"""
+        if not source_md5:
+            return
+        pdf_path = os.path.join(self._cache_dir, f"{source_md5}.pdf")
+        if os.path.isfile(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+        index = self._load_cache_index()
+        if source_md5 in index:
+            del index[source_md5]
+            self._save_cache_index(index)
+            self.status_message.emit(f"📦 已清理缓存: MD5={source_md5[:8]}...")
+
     def _save_pdf_to_cache(self, md5: str, pdf_path: str, original_name: str, source_ext: str, page_count: int = 0):
         """将 PDF 文件存入缓存并更新索引。"""
         dest = os.path.join(self._cache_dir, f"{md5}.pdf")
@@ -739,8 +831,10 @@ class CloudClient(QObject):
         self._schedule_cache_cleanup()
 
     def _cleanup_pdf_cache(self):
-        """清理过期的缓存 PDF（超过保留天数）。"""
-        cutoff = datetime.now() - timedelta(days=self._CACHE_RETENTION_DAYS)
+        """清理过期的缓存 PDF（超过保留小时数）。"""
+        if self._CACHE_RETENTION_HOURS <= 0:
+            return  # 0 = 永不过期
+        cutoff = datetime.now() - timedelta(hours=self._CACHE_RETENTION_HOURS)
         index = self._load_cache_index()
         removed = 0
         for md5, meta in list(index.items()):

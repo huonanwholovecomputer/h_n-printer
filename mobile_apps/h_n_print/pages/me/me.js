@@ -1,6 +1,21 @@
 // me.js
 const { CONFIG } = require('../../utils/config')
 
+function _initIsDark() {
+  try {
+    const a = getApp()
+    if (a && typeof a.globalData.isDarkMode === 'boolean') return a.globalData.isDarkMode
+  } catch (e) {}
+  return wx.getStorageSync('isDarkMode') || false
+}
+function _initThemeMode() {
+  try {
+    const a = getApp()
+    if (a && a.globalData.themeMode) return a.globalData.themeMode
+  } catch (e) {}
+  return wx.getStorageSync('themeMode') || 'auto'
+}
+
 Component({
   data: {
     nickname: '',
@@ -69,13 +84,19 @@ Component({
     adminDeleteOpacity: {},  // { openid: 0~1 }
     pageExit: '',             // 退出动画: page-exit-left / page-exit-right
     pageSlide: 'page-init',   // 入场动画: page-enter-right（初始隐藏防闪烁）
-    isDarkMode: wx.getStorageSync('isDarkMode') || false,
-    themeMode: wx.getStorageSync('themeMode') || 'auto',
+    isDarkMode: _initIsDark(),
+    themeMode: _initThemeMode(),
     // 通用确认弹窗（跟随 app 主题，替代 wx.showModal）
     showConfirmModal: false,
+    showNicknamePicker: false,     // 昵称选择弹窗
+    showNicknameInput: false,      // 自定义昵称输入弹窗
+    customNickname: '',            // 自定义昵称输入缓冲
+    focusWechatNickname: false,    // 聚焦隐藏的 type="nickname" 输入框
     modalClosing: false,           // 弹窗关闭动画进行中
     confirmModalTitle: '',
     confirmModalContent: '',
+    // 主题切换按钮位置（兼容所有设备，避免 env(safe-area-inset-top) 在某些设备返回 0）
+    navBarBtnTop: 72,  // 默认 20+44+8，attached 中根据实际 statusBarHeight 校正
     confirmModalConfirmText: '',
     confirmModalConfirmColor: '#ff4d4f',
     _confirmCallback: null,
@@ -83,11 +104,26 @@ Component({
   },
   lifetimes: {
     attached() {
-      // 从 app.globalData 初始化主题状态
+      // 注册到全局页面实例池，供主题切换时同步缓存页
+      try { const r = getApp().globalData._pageRegistry; if (r && !r.includes(this)) r.push(this) } catch(e) {}
+      // 首帧前直接覆写数据对象，绕过 setData 异步延迟
+      this.data.isDarkMode = getApp().globalData.isDarkMode
+      // 从 app.globalData 同步主题：先设原生背景色防止闪烁
       const app = getApp()
+      const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
+      wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
+      // 计算主题切换按钮位置：放在导航栏下方（导航栏 = statusBar + 内容区域）
+      // iOS 导航栏内容高 44px，Android/devtools 高 48px（与 navigation-bar 组件逻辑一致）
+      const sysInfo = wx.getSystemInfoSync()
+      const sbh = sysInfo.statusBarHeight || 20
+      const isAndroid = sysInfo.platform === 'android' || sysInfo.platform === 'devtools'
+      const navContentH = isAndroid ? 48 : 44
+      const btnTop = sbh + navContentH + 8  // +8px 间距
+      this.data.navBarBtnTop = btnTop
       this.setData({
         isDarkMode: app.globalData.isDarkMode,
         themeMode: app.globalData.themeMode,
+        navBarBtnTop: btnTop,
       })
       this._initScrollEngine()
       this.loadProfile()
@@ -95,13 +131,18 @@ Component({
       this.loadOrders()
     },
     detached() {
+      try { const r = getApp().globalData._pageRegistry; if (r) { const i = r.indexOf(this); if (i >= 0) r.splice(i, 1) } } catch(e) {}
       this._destroyScrollEngine()
     },
   },
   pageLifetimes: {
     show() {
-      // 从后台恢复 → 跳过入场动画，直接显示页面
+      // 【必须在任何操作前】覆写数据对象，因为首帧渲染可能早于 show() 生命周期
+      this.data.isDarkMode = getApp().globalData.isDarkMode
+      // 防止 tab 切换时闪白/闪黑：先同步原生背景色
       const app = getApp()
+      const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
+      wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
       const resumedFromBg = app.globalData._resumedFromBackground
       if (resumedFromBg) {
         app.globalData._resumedFromBackground = false
@@ -133,17 +174,14 @@ Component({
         this._startOrderPolling()
         return
       }
-      // 同步主题状态（自动模式下系统可能已切换）
-      if (app.globalData.isDarkMode !== this.data.isDarkMode ||
-          app.globalData.themeMode !== this.data.themeMode) {
-        this.setData({
-          isDarkMode: app.globalData.isDarkMode,
-          themeMode: app.globalData.themeMode,
-        })
-      }
-      // 两步入场动画：先强制重置为隐藏态，下一帧再设入场动画
-      // 避免 pageSlide 与上次 show() 留下的类名相同导致 CSS 不重新触发动画（闪烁）
-      this.setData({ pageExit: '', pageSlide: 'page-init' })
+      // 两步入场动画：① 强制隐藏 + 无条件同步主题，② 稍后播入场
+      // page-init 确保 isDarkMode 在首帧渲染前已提交，避免使用缓存页面的过期主题值
+      this.setData({
+        pageExit: '',
+        pageSlide: 'page-init',
+        isDarkMode: app.globalData.isDarkMode,
+        themeMode: app.globalData.themeMode,
+      })
       setTimeout(() => {
         const tabFrom = wx.getStorageSync('_tabFrom')
         const returnFromSub = wx.getStorageSync('_meReturnFromSub')
@@ -151,16 +189,16 @@ Component({
         const isFirstLaunch = (tabFrom == null || tabFrom === '')
         let animationClass = ''
         if (returnFromSub) {
-          animationClass = 'page-enter-left'          // 从子页面返回：从左滑入
+          animationClass = 'page-enter-left'
         } else if (isFirstLaunch) {
-          animationClass = 'page-fade-in'             // 首次加载淡入
+          animationClass = 'page-fade-in'
         } else if (tabFrom === 0) {
-          animationClass = 'page-enter-right'         // tab 切换：从右滑入
+          animationClass = 'page-enter-right'
         } else {
           animationClass = 'page-fade-in'
         }
         this.setData({ pageSlide: animationClass })
-      }, 30)  // 确保 CSS 检测到类名变更
+      }, 80)  // >2帧，让原生组件（page-meta/navigation-bar）有足够时间完成桥接更新
 
       this.loadUserRole()
       this.loadOrders()
@@ -268,6 +306,9 @@ Component({
           }
           if (changed) {
             // 结构变化（增删订单），做全量刷新但保留展开状态
+            newOrders.forEach(order => {
+              order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+            })
             this.setData({ orders: newOrders, expandedOrders: this.data.expandedOrders })
           } else if (Object.keys(updates).length > 0) {
             this.setData(updates)
@@ -322,8 +363,8 @@ Component({
       this._keySwipeHorizontal = false   // 本次触摸是否已锁定为水平
       this._swipeHorizontal = false      // 通知滚动引擎让出控制（卡片左滑中）
       // 删除按钮宽度：140rpx → px（按实际屏幕宽度换算，取代硬编码）
-      const sys = wx.getSystemInfoSync()
-      const rpxRatio = (sys.windowWidth || 375) / 750
+      const { windowWidth } = wx.getWindowInfo()
+      const rpxRatio = (windowWidth || 375) / 750
       this._deleteWidthPx = Math.round(140 * rpxRatio)      // 密钥作废按钮
       this._adminDeleteWidthPx = Math.round(140 * rpxRatio)  // 管理员移除按钮
 
@@ -787,35 +828,100 @@ Component({
       })
     },
 
-    onNicknameInput(e) {
-      this.setData({ nickname: e.detail.value })
+    // ==================== 昵称设置（表情弹窗，避免与主题切换按钮重叠） ====================
+
+    onTapNickname() {
+      if (this.data.modalClosing) return
+      this.setData({ showNicknamePicker: true })
+    },
+    onCancelNicknamePicker() {
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showNicknamePicker: false, modalClosing: false })
+        // 等弹窗关闭动画播完再聚焦，否则键盘被遮住
+        if (this._pendingNicknameAction === 'wechat') {
+          this.setData({ focusWechatNickname: true })
+          this._pendingNicknameAction = null
+        } else if (this._pendingNicknameAction === 'custom') {
+          this.setData({ customNickname: this.data.nickname || '', showNicknameInput: true })
+          this._pendingNicknameAction = null
+        }
+      }, 200)
     },
 
-    onNicknameSave(e) {
-      const nickname = e.detail.value || ''
-      if (!nickname) return
+    // 使用微信昵称：触发隐藏的 type="nickname" 原生输入
+    onChooseWechatNickname() {
+      if (this.data.modalClosing) return
+      this._pendingNicknameAction = 'wechat'
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showNicknamePicker: false, modalClosing: false, focusWechatNickname: true })
+        this._pendingNicknameAction = null
+      }, 200)
+    },
 
+    // 使用自定义昵称
+    onChooseCustomNickname() {
+      if (this.data.modalClosing) return
+      this._pendingNicknameAction = 'custom'
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showNicknamePicker: false, modalClosing: false, customNickname: this.data.nickname || '', showNicknameInput: true })
+        this._pendingNicknameAction = null
+      }, 200)
+    },
+    onCancelCustomNickname() {
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showNicknameInput: false, modalClosing: false })
+      }, 200)
+    },
+    onCustomNicknameInput(e) {
+      this.setData({ customNickname: e.detail.value })
+    },
+    onSaveCustomNickname() {
+      const name = (this.data.customNickname || '').trim()
+      if (!name) return
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showNicknameInput: false, modalClosing: false })
+        this._saveNickname(name)
+      }, 200)
+    },
+
+    // 隐藏的 type="nickname" 输入：微信自动填充后保存
+    onHiddenNicknameInput(e) {
+      const val = (e.detail.value || '').trim()
+      if (val) {
+        this.setData({ focusWechatNickname: false })
+        this._saveNickname(val)
+      }
+    },
+    onHiddenNicknameBlur(e) {
+      this.setData({ focusWechatNickname: false })
+      const val = (e.detail.value || '').trim()
+      if (val) this._saveNickname(val)
+    },
+
+    // 保存昵称到后端
+    _saveNickname(nickname) {
+      this.setData({ nickname })
       const token = wx.getStorageSync('token')
       if (!token) return
-
       wx.request({
         url: CONFIG.BASE_URL + '/api/profile',
         method: 'POST',
-        header: {
-          'Authorization': 'Bearer ' + token,
-          'content-type': 'application/json'
-        },
-        data: { nickname: nickname },
+        header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
+        data: { nickname },
         success: (res) => {
           if (res.statusCode === 200 && res.data.success) {
             wx.setStorageSync('nickname', nickname)
-          } else {
-            console.error('[onNicknameSave] 服务器返回异常:', res.statusCode, res.data)
           }
         },
-        fail: (err) => {
-          console.error('[onNicknameSave] 网络请求失败:', err)
-        }
+        fail: () => {}
       })
     },
 
@@ -1032,7 +1138,7 @@ Component({
               expired: old ? old.expired : false,
               countdownText: old ? old.countdownText : '',
               swipeX: old ? old.swipeX : 0,
-              swipeTransition: old ? (old.swipeTransition !== false) : true,
+              swipeTransition: old ? old.swipeTransition : undefined,
               deleteOpacity: old ? old.deleteOpacity : 0,
               deleteQuickFade: old ? !!old.deleteQuickFade : false,
               exiting: old ? !!old.exiting : false,  // 保留离场标记避免被 poll 冲掉
@@ -1136,12 +1242,19 @@ Component({
       const maxX = -this._deleteWidthPx
       const target = rawX > 0 ? 0 : (rawX < maxX ? maxX : (rawX < maxX / 2 ? maxX : 0))
       // 右滑归位时加速淡出，避免透明重叠
+      const capturedIdx = idx
       this.setData({
         ['activeKeys[' + idx + '].swipeTransition']: true,
         ['activeKeys[' + idx + '].swipeX']: target,
         ['activeKeys[' + idx + '].deleteOpacity']: target === 0 ? 0 : 1,
         ['activeKeys[' + idx + '].deleteQuickFade']: target === 0,
       })
+      // 回弹动画结束后移除内联 transition，让 CSS 重新接管主题过渡
+      setTimeout(() => {
+        if (capturedIdx < this.data.activeKeys.length) {
+          this.setData({ ['activeKeys[' + capturedIdx + '].swipeTransition']: undefined })
+        }
+      }, 300)
       this._swipeHorizontal = false
       this._keySwipeHorizontal = false
       this._keySwipeIdx = null
@@ -1412,6 +1525,13 @@ Component({
         const swipeX = { ...this.data.adminSwipeX }
         swipeX[openid] = target
         this.setData({ adminSwipeX: swipeX })
+        // 回弹动画结束后移除内联 transition，让 CSS 重新接管主题过渡
+        const capturedOpenid = openid
+        setTimeout(() => {
+          const cleanTrans = { ...this.data.adminSwipeTransition }
+          delete cleanTrans[capturedOpenid]
+          this.setData({ adminSwipeTransition: cleanTrans })
+        }, 300)
       })
     },
 
@@ -1817,6 +1937,7 @@ Component({
             // 预处理文件大小显示（WXML 不支持 .toFixed()）
             const newOrders = (res.data.orders || [])
             newOrders.forEach(order => {
+              order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
               if (order.files) {
                 order.files.forEach(f => {
                   f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''

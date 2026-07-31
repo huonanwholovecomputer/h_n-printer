@@ -15,7 +15,7 @@ HN 云打印 — 微信小程序云打印系统，两个组件协作：
 
 ## 后端架构 (`printer-backend/app.py`)
 
-单文件 Flask 应用 (~2600行)，核心子系统：
+单文件 Flask 应用 (约 4200 行)，核心子系统：
 
 - **数据库**: SQLite (WAL 模式)，3 张主表 — `files`(MD5去重), `orders`(父订单), `order_files`(子任务，v5引入，支持一单多文件)。`users` 表存头像/昵称/角色。`license_keys` 表存临时许可密钥。
 - **父子订单模型**: `orders` 是聚合容器，`order_files` 是实际打印子任务。每个子任务有独立的 `copies`, `page_range`, `duplex`, `status`。父订单状态通过 `aggregate_order_status()` 从子任务聚合（优先级: failed > printing > queued > sent > canceled）。
@@ -30,7 +30,7 @@ HN 云打印 — 微信小程序云打印系统，两个组件协作：
 
 ## 微信小程序 (`h_n_print/`)
 
-- **页面**: `pages/index/index`(首页，文件选择+上传+提交), `pages/me/me`(个人中心，订单列表+许可密钥+管理员面板), `pages/order-detail/order-detail`, `pages/my-performance/my-performance`(月度统计)
+- **页面**: `pages/index/index`(首页，文件选择+上传+提交), `pages/me/me`(个人中心，订单列表+许可密钥+管理员面板), `pages/order-detail/order-detail`, `pages/my-performance/my-performance`(月度统计), `pages/authorized-users/authorized-users`(历史授权用户列表，管理员/超管可见), `pages/user-orders/user-orders`(按 openid/来源查看订单列表，含分页与状态过滤，供管理员查看某用户/本地任务的打印记录)
 - **自定义滚动引擎**: index 和 me 页面都实现了手写的橡皮筋物理滚动（`_initScrollEngine` / `_startPhysics` / `_snapBack`），通过 `translateY` 驱动，含惯性衰减、阻尼过拉、方向锁定。非原生 scroll-view。
 - **自定义 tabBar**: `custom-tab-bar/` 组件。
 - **多文件上传**: 每个文件独立进度条（`wx.uploadFile` + `onProgressUpdate`），支持上传中移除。

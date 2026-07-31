@@ -86,14 +86,79 @@ Component({
       if (this._hasLoaded) {
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
       }
+      this._startPolling()
     },
     hide() {
+      this._stopPolling()
       const forward = wx.getStorageSync('_navForward')
       this.setData({ pageExit: forward ? 'page-exit-left' : 'page-exit-right' })
     },
   },
 
   methods: {
+    // 轮询：每 10 秒静默刷新，确保 reserved → abandoned 等后端状态变更可见
+    _startPolling() {
+      this._stopPolling()
+      this._pollTimer = setInterval(() => {
+        this._pollOrdersSilent()
+      }, 10000)
+    },
+    _stopPolling() {
+      if (this._pollTimer) {
+        clearInterval(this._pollTimer)
+        this._pollTimer = null
+      }
+    },
+    _pollOrdersSilent() {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      const data = {
+        page: this.data.currentPage,
+        per_page: this.data.perPage,
+      }
+      if (this.data.viewOpenid) data.openid = this.data.viewOpenid
+      if (this.data.sourceFilter) data.source = this.data.sourceFilter
+      wx.request({
+        url: CONFIG.BASE_URL + '/api/orders',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        data,
+        success: (res) => {
+          if (res.statusCode !== 200 || !res.data || !res.data.success) return
+          const newOrders = (res.data.orders || [])
+          // 格式化价格
+          newOrders.forEach(order => {
+            order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+          })
+          const oldOrders = this.data.orders || []
+          // 仅更新变化的 status 字段，避免整列表重渲染
+          const updates = {}
+          let changed = false
+          for (let i = 0; i < Math.min(newOrders.length, oldOrders.length); i++) {
+            if (newOrders[i].id !== oldOrders[i].id) { changed = true; break }
+            if (newOrders[i].status !== oldOrders[i].status) {
+              updates['orders[' + i + '].status'] = newOrders[i].status
+            }
+            // 同步子文件状态
+            if (newOrders[i].files && oldOrders[i].files) {
+              for (let j = 0; j < Math.min(newOrders[i].files.length, oldOrders[i].files.length); j++) {
+                if (newOrders[i].files[j].status !== oldOrders[i].files[j].status) {
+                  updates['orders[' + i + '].files[' + j + '].status'] = newOrders[i].files[j].status
+                }
+              }
+            }
+          }
+          if (newOrders.length !== oldOrders.length) changed = true
+          if (changed) {
+            this.setData({ orders: newOrders, expandedOrders: this.data.expandedOrders })
+          } else if (Object.keys(updates).length > 0) {
+            this.setData(updates)
+          }
+        },
+        fail: () => {}
+      })
+    },
+
     loadOrders(openid, source) {
       const token = wx.getStorageSync('token')
       if (!token) {
@@ -125,6 +190,7 @@ Component({
             const newOrders = (res.data.orders || [])
             // 预处理文件大小显示
             newOrders.forEach(order => {
+              order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
               if (order.files) {
                 order.files.forEach(f => {
                   f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''

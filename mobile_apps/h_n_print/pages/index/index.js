@@ -1,6 +1,23 @@
 // index.js
 const { CONFIG } = require('../../utils/config')
 
+// 初始主题值：直接从 app.globalData 读取（同步、无延迟），绕过 storage 的异步写窗口
+// 避免首次创建组件时首帧使用过期值触发 CSS transition 闪烁
+function _initIsDark() {
+  try {
+    const a = getApp()
+    if (a && typeof a.globalData.isDarkMode === 'boolean') return a.globalData.isDarkMode
+  } catch (e) {}
+  return wx.getStorageSync('isDarkMode') || false
+}
+function _initThemeMode() {
+  try {
+    const a = getApp()
+    if (a && a.globalData.themeMode) return a.globalData.themeMode
+  } catch (e) {}
+  return wx.getStorageSync('themeMode') || 'auto'
+}
+
 Component({
   data: {
     // 多文件列表：每项 { name, size, path, fileId, uploading, progress, failed, copies }
@@ -48,8 +65,8 @@ Component({
     pageReady: false,         // 首次打开的入场动效
     pageExit: '',             // 退出动画: page-exit-left / page-exit-right
     pageSlide: 'page-init',   // 入场动画: page-fade-in / page-enter-left（初始隐藏防闪烁）
-    isDarkMode: wx.getStorageSync('isDarkMode') || false,
-    themeMode: wx.getStorageSync('themeMode') || 'auto',
+    isDarkMode: _initIsDark(),
+    themeMode: _initThemeMode(),
     themeSwitching: false,       // 主题切换过渡中
     entranceDelay: {           // 打印页元素入场延时（从上到下逐个递进）
       logo: '0.00s',
@@ -62,11 +79,17 @@ Component({
   },
   lifetimes: {
     attached() {
+      // 注册到全局页面实例池，供主题切换时同步缓存页
+      try { const r = getApp().globalData._pageRegistry; if (r && !r.includes(this)) r.push(this) } catch(e) {}
+      // 首帧前直接覆写数据对象，绕过 setData 异步延迟
+      this.data.isDarkMode = getApp().globalData.isDarkMode
       // 首次启动清理残留的转场标记，防止热重载/缓存触发误动画
       wx.removeStorageSync('_tabFrom')
       wx.removeStorageSync('_tabTo')
-      // 从 app.globalData 初始化主题状态
+      // 从 app.globalData 同步主题，防止闪烁：先设原生背景色再设数据
       const app = getApp()
+      const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
+      wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
       this.setData({
         isDarkMode: app.globalData.isDarkMode,
         themeMode: app.globalData.themeMode,
@@ -77,6 +100,7 @@ Component({
       this.doLogin()
     },
     detached() {
+      try { const r = getApp().globalData._pageRegistry; if (r) { const i = r.indexOf(this); if (i >= 0) r.splice(i, 1) } } catch(e) {}
       this._destroyScrollEngine()
       this._stopAllUploadTimers()
       this._stopAllPollTimers()
@@ -85,6 +109,11 @@ Component({
   },
   pageLifetimes: {
     show() {
+      this.data.isDarkMode = getApp().globalData.isDarkMode
+      // 防止 tab 切换时闪白/闪黑：先同步原生背景色
+      const app = getApp()
+      const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
+      wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
       // 系统对话框返回 → 跳过入场动画，直接恢复数据刷新
       if (this._returningFromDialog) {
         this._returningFromDialog = false
@@ -95,7 +124,6 @@ Component({
         return
       }
       // 从后台恢复 → 跳过入场动画，直接显示页面
-      const app = getApp()
       const resumedFromBg = app.globalData._resumedFromBackground
       if (resumedFromBg) {
         app.globalData._resumedFromBackground = false
@@ -112,11 +140,17 @@ Component({
         setTimeout(() => this._scheduleMeasure(300), 300)
         return
       }
-      // 两步入场动画：先强制重置为隐藏态，下一帧再设入场动画
-      // 避免 pageSlide 与上次 show() 留下的类名相同导致 CSS 不重新触发动画（闪烁）
+      // 两步入场动画：① 强制隐藏 + 无条件同步主题，② 稍后播入场
+      // page-init 确保 isDarkMode 在首帧渲染前已提交，避免使用缓存页面的过期主题值
+      const app2 = getApp()
       const tabFrom = wx.getStorageSync('_tabFrom')
       const isFirstLaunch = (tabFrom == null || tabFrom === '')
-      this.setData({ pageExit: '', pageSlide: 'page-init' })
+      this.setData({
+        pageExit: '',
+        pageSlide: 'page-init',
+        isDarkMode: app2.globalData.isDarkMode,
+        themeMode: app2.globalData.themeMode,
+      })
       setTimeout(() => {
         let animationClass = ''
         if (isFirstLaunch) {
@@ -127,7 +161,7 @@ Component({
           animationClass = 'page-fade-in'
         }
         this.setData({ pageSlide: animationClass })
-      }, 30)  // 确保 CSS 检测到类名变更
+      }, 80)  // >2帧，让原生组件（page-meta/navigation-bar）有足够时间完成桥接更新
 
       // 首次打开才有元素入场动画
       if (!this._entrancePlayed && isFirstLaunch) {
@@ -135,14 +169,6 @@ Component({
       }
 
       this.loadPrinterStatus()
-      // 同步主题状态（可能在"我"页面切换了，或系统自动切换）
-      if (app.globalData.isDarkMode !== this.data.isDarkMode ||
-          app.globalData.themeMode !== this.data.themeMode) {
-        this.setData({
-          isDarkMode: app.globalData.isDarkMode,
-          themeMode: app.globalData.themeMode,
-        })
-      }
       // 启动打印机状态轮询（30秒）
       this._startPrinterPolling()
       // 首次加载定价配置（与本地打印工具保持同步）
@@ -161,7 +187,7 @@ Component({
           duplex: reprintInfo.duplex || 'on',
         })
       }
-      // 同步 tabBar 选中态（标准 WeChat 模式：每个页面主动更新）
+      // 同步 tabBar 选中态
       try {
         const tabBar = this.getTabBar && this.getTabBar()
         if (tabBar) {

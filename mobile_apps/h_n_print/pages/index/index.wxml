@@ -1,9 +1,9 @@
 <!-- Apple-style Index Page — 提交打印 -->
-<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}"></page-meta>
+<page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" page-style="--tab-highlight:{{isDarkMode ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.7)'}};--tab-bg:{{isDarkMode ? 'rgba(26,26,28,0.50)' : 'var(--glass-regular)'}};--tab-text:{{isDarkMode ? '#98989D' : '#8E8E93'}};--tab-text-active:{{isDarkMode ? '#409CFF' : '#007AFF'}}"></page-meta>
 <navigation-bar title="提交打印" back="{{false}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 
-<!-- 深色遮罩层：固定在视口底层，遮住页面切换动画时露出的白色窗口背景 -->
-<view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
+<!-- theme-bg-layer 在 page-root 外，始终可见，确保淡入淡出间隙不露原生白色背景 -->
+<view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}} {{themeSwitching ? 'theme-switching' : ''}}"></view>
 
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}} {{themeSwitching ? 'theme-switching' : ''}}">
   <view
@@ -98,7 +98,7 @@
                 <text class="control-label">份数</text>
                 <view class="stepper">
                   <view class="stepper-btn {{item.copies <= 1 ? 'stepper-disabled' : ''}}" bindtap="onFileCopiesMinus" data-index="{{index}}" hover-class="tap-active">−</view>
-                  <input class="stepper-input" type="number" value="{{item.copies}}" bindinput="onFileCopiesChange" data-index="{{index}}" />
+                  <input class="stepper-input" type="number" value="{{item.copies}}" disabled />
                   <view class="stepper-btn" bindtap="onFileCopiesPlus" data-index="{{index}}" hover-class="tap-active">+</view>
                 </view>
               </view>

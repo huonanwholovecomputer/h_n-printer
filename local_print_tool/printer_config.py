@@ -78,6 +78,7 @@ class PrintJob:
     cached_pdf: str = ""     # 引擎转换后的 PDF 缓存路径
     dpi: int = 0             # 渲染 DPI，0=跟随全局默认
     task_id: int = 0         # 云端任务子任务 ID (order_files.id)，0=本地任务
+    order_id: int = 0        # 云端父订单 ID (orders.id)，0=本地任务
     source_md5: str = ""     # 源文件 MD5，用于 PDF 缓存查找
     display_name: str = ""   # 显示用的文件名（云端任务用原始文件名，本地任务为空则用 file_path 的 basename）
     order_number: str = ""   # 订单号（云端的来自后端，本地的在复制时生成）
@@ -95,6 +96,7 @@ class PrintJob:
             "dpi": self.dpi,
             "display_name": self.display_name,
             "task_id": self.task_id,
+            "order_id": self.order_id,
             "order_number": self.order_number,
             # cached_pdf 不持久化，每次启动重新生成
         }
@@ -113,6 +115,7 @@ class PrintJob:
             dpi=int(data.get("dpi", 0)),
             display_name=data.get("display_name", ""),
             task_id=int(data.get("task_id", 0)),
+            order_id=int(data.get("order_id", 0)),
             order_number=data.get("order_number", ""),
         )
 

@@ -14,8 +14,8 @@ App({
 
     // 获取当前系统主题（需 darkmode: true）
     try {
-      const sysInfo = wx.getSystemInfoSync()
-      this.globalData._systemTheme = sysInfo.theme || 'light'
+      const { theme } = wx.getAppBaseInfo()
+      this.globalData._systemTheme = theme || 'light'
     } catch (e) {
       this.globalData._systemTheme = 'light'
     }
@@ -59,31 +59,25 @@ App({
 
   // 同步主题到所有活跃页面
   _syncThemeToAllPages() {
-    const pages = getCurrentPages()
-    pages.forEach(page => {
+    const isDark = this.globalData.isDarkMode
+    // 1. 更新当前页面栈中的页面（不加 themeSwitching，让 CSS transition 自然播放）
+    getCurrentPages().forEach(page => {
       if (page.setData) {
-        page.setData({
-          isDarkMode: this.globalData.isDarkMode,
-          themeMode: this.globalData.themeMode,
-          themeSwitching: true,
-        })
+        page.data.isDarkMode = isDark
+        page.setData({ isDarkMode: isDark, themeMode: this.globalData.themeMode })
       }
     })
-    // 同步自定义 tabBar（组件独立于页面栈，需单独更新）
-    if (pages.length > 0) {
-      const tabBar = pages[pages.length - 1].getTabBar?.()
-      if (tabBar) {
-        tabBar.setData({ isDarkMode: this.globalData.isDarkMode })
+
+    // 2. 更新注册表中的全部页面实例（包括缓存 tab 页，不触发视觉变化）
+    ;(this.globalData._pageRegistry || []).forEach(page => {
+      if (page !== getCurrentPages().find(p => p === page)) {
+        page.data.isDarkMode = isDark
+        page.setData({ isDarkMode: isDark, themeMode: this.globalData.themeMode })
       }
-    }
-    // 500ms 后清除脉冲标记，让动画完成
-    setTimeout(() => {
-      pages.forEach(page => {
-        if (page.setData) {
-          page.setData({ themeSwitching: false })
-        }
-      })
-    }, 500)
+    })
+
+    // 3. 同步原生背景
+    this._syncNativeBackground()
   },
 
   // 供页面调用：切换主题模式，返回新的 { themeMode, isDarkMode }
@@ -118,14 +112,18 @@ App({
     this._syncNativeBackground()
   },
 
-  // 同步原生窗口背景色，避免深色模式下页面切换时露出白色窗口背景
+  // 同步原生窗口背景色 + 导航栏颜色，避免深色模式下页面切换时露出白色窗口背景
   _syncNativeBackground() {
-    const bg = this.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
+    const isDark = this.globalData.isDarkMode
+    const bg = isDark ? '#1C1C1E' : '#F2F2F7'
     wx.setBackgroundColor({
       backgroundColor: bg,
       backgroundColorTop: bg,
       backgroundColorBottom: bg,
     })
+    try {
+      wx.setNavigationBarColor({ frontColor: isDark ? '#ffffff' : '#000000', backgroundColor: bg })
+    } catch (e) { /* 兼容 */ }
   },
 
   // 保存主题到后端
@@ -154,5 +152,6 @@ App({
     themeMode: 'auto',
     isDarkMode: false,
     _systemTheme: 'light',
+    _pageRegistry: [],  // 所有存活页面实例，供主题切换直接覆写缓存页数据
   }
 })

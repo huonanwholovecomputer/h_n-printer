@@ -6,24 +6,18 @@
   bottom: calc(12rpx + env(safe-area-inset-bottom));
   left: 80rpx;
   right: 80rpx;
-  height: 90rpx;
+  height: 110rpx;
   display: flex;
-  /* 半透明基底：足够透光，又能看清玻璃存在 */
-  background: var(--glass-regular);
-  /* Apple 风格：适度模糊 + 饱和度提升，让背景色渗出但不过度融糊 */
-  backdrop-filter: saturate(180%) blur(12px);
-  -webkit-backdrop-filter: saturate(180%) blur(12px);
-  border-radius: 30rpx;
-  /* 多层阴影模拟玻璃深度：
-     1. 外投影 — 悬浮感
-     2. 顶部内高光 — 玻璃边缘折射亮线
-     3. 底部内阴影 — 玻璃厚度感
-     4. 极细外描边 — 玻璃轮廓 */
+  /* 固定配色，不随主题变化，深色/浅色下都自然的玻璃效果 */
+  background: rgba(255, 255, 255, 0.12);
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  border-radius: 40rpx;
   box-shadow:
     0 8rpx 32rpx rgba(0, 0, 0, 0.08),
-    inset 0 1rpx 0 rgba(255, 255, 255, 0.7),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.20),
     inset 0 -1rpx 0 rgba(0, 0, 0, 0.04),
-    0 0 0 0.5rpx rgba(0, 0, 0, 0.06);
+    0 0 0 0.5rpx rgba(0, 0, 0, 0.04);
   z-index: 9999;
 }
 
@@ -37,8 +31,8 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 2rpx;
-  padding: 8rpx 0 4rpx;
+  gap: 4rpx;
+  padding: 14rpx 0 8rpx;
 }
 
 /* Touch-down feedback */
@@ -56,9 +50,9 @@
 
 /* Icon container */
 .tab-icon-wrap {
-  width: 56rpx;
-  height: 56rpx;
-  border-radius: 16rpx;
+  width: 64rpx;
+  height: 64rpx;
+  border-radius: 18rpx;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -71,8 +65,8 @@
 }
 
 .tab-icon {
-  width: 44rpx;
-  height: 44rpx;
+  width: 50rpx;
+  height: 50rpx;
   opacity: 0.5;
   transition: opacity 0.2s ease;
 }
@@ -84,14 +78,14 @@
 
 /* Label text */
 .tab-text {
-  font-size: 18rpx;
+  font-size: 20rpx;
   font-weight: 500;
-  color: #8E8E93;
+  color: var(--tab-text, #8E8E93);
   letter-spacing: 0.01em;
   transition: color 0.2s ease;
 }
 
 .text-active {
-  color: #007AFF;
+  color: var(--tab-text-active, #007AFF);
   font-weight: 600;
 }

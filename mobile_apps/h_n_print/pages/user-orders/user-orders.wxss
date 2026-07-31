@@ -357,6 +357,17 @@
   font-weight: 500;
 }
 
+/* 价格行 — 视觉突出 */
+.detail-price-row {
+  padding: 16rpx 0 8rpx;
+}
+.detail-price-value {
+  font-size: 28rpx;
+  font-weight: 700;
+  color: var(--orange);
+  font-family: var(--font-mono);
+}
+
 /* File rows in detail */
 .detail-file-row {
   display: flex;

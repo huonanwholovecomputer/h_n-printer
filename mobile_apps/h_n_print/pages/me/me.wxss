@@ -10,7 +10,7 @@
   min-height: 0;
 }
 
-/* 深浅切换过渡：确保子元素在 class 移除时也能平滑过渡 */
+/* 深浅切换过渡：所有在深色模式下变色的元素 */
 .page-root,
 .page-root .user-card,
 .page-root .license-card,
@@ -25,9 +25,32 @@
 .page-root .orders-section,
 .page-root .page-num,
 .page-root .page-btn,
-.page-root .page-size-selector {
+.page-root .page-size-selector,
+.page-root .stepper-btn,
+.page-root .key-type-toggle,
+.page-root .key-type-option,
+.page-root .btn-secondary,
+.page-root .input-ios,
+.page-root .stepper-input,
+.page-root .generate-btn,
+.page-root .retention-save-btn,
+.page-root .retention-stepper-btn,
+.page-root .retention-stepper-input,
+.page-root .redeem-input,
+.page-root .control-input,
+.page-root .range-line-input,
+.page-root .detail-file-row,
+.page-root .admin-card,
+.page-root .user-license-detail {
   transition: background 0.45s ease, color 0.35s ease, border-color 0.45s ease, box-shadow 0.45s ease;
 }
+
+/* page-root 下所有文字自动获得颜色过渡（继承 CSS 变量变值后的渐变） */
+.page-root text,
+.page-root input {
+  transition: color 0.35s ease;
+}
+
 
 /* 初始隐藏态：防止页面首次渲染时闪烁 */
 .page-init {
@@ -88,15 +111,15 @@
 /* ═══════════════ User Profile Card ═══════════════ */
 
 .user-card {
-  background: var(--glass-heavy);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: 32rpx 28rpx;
   margin-bottom: 20rpx;
   display: flex;
   align-items: center;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border);
-  transition: background 0.4s ease, box-shadow 0.4s ease;
+  border: 1rpx solid var(--separator);
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease;
 }
 
 .avatar-btn {
@@ -127,17 +150,34 @@
   flex-direction: column;
 }
 
-.nickname-input {
+.nickname-row {
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  margin-bottom: 6rpx;
+}
+.nickname-text {
   font-size: 32rpx;
   font-weight: 600;
   color: var(--text-primary);
-  margin-bottom: 6rpx;
-  padding: 0;
-  background: transparent;
-  border: none;
-  line-height: 44rpx;
-  width: 100%;
-  letter-spacing: -0.01em;
+  max-width: 300rpx;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nickname-edit-icon {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+}
+
+/* 隐藏的原生昵称输入：触发微信自动填充但不显示 */
+.hidden-nickname-input {
+  position: fixed;
+  left: -9999px;
+  opacity: 0;
+  pointer-events: none;
+  width: 1rpx;
+  height: 1rpx;
 }
 
 .uid {
@@ -223,14 +263,14 @@
 }
 
 .role-btn {
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: 28rpx;
   display: flex;
   align-items: center;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   border-left: 6rpx solid var(--green);
-  transition: background 0.4s ease, box-shadow 0.4s ease;
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease;
 }
 .role-btn:active {
   background-color: var(--gray6);
@@ -282,13 +322,13 @@
 }
 
 .license-card, .storage-card {
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: 28rpx;
   text-align: left;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border-dark);
-  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
+  border: 1rpx solid var(--separator);
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, border-color 0.4s ease;
 }
 
 /* ═══════════════ License Key Generator ═══════════════ */
@@ -454,12 +494,12 @@
 .key-card {
   position: relative;
   z-index: 1;
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: 22rpx;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border-dark);
-  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1rpx solid var(--separator);
+  transition: background-color 0.4s ease, color 0.35s ease, transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .key-card.no-transition {
   transition: none;
@@ -546,7 +586,7 @@
 /* Expired / locked states */
 .key-card-wrap.key-drawer-expired .key-value { color: var(--text-quaternary); }
 .key-card-wrap.key-drawer-locked .key-card {
-  background: var(--glass-regular);
+  background: var(--bg-card);
   opacity: 0.55;
 }
 .key-card-wrap.key-drawer-locked .key-value { color: var(--gray); }
@@ -728,7 +768,8 @@
   width: 52rpx;
   height: 52rpx;
   border-radius: 14rpx;
-  background-color: var(--gray6);
+  background: var(--glass-regular);
+  border: var(--glass-border-dark);
   color: var(--text-primary);
   font-size: 28rpx;
   font-weight: 500;
@@ -736,13 +777,15 @@
   align-items: center;
   justify-content: center;
   line-height: 1;
-  transition: transform 0.1s ease, background-color 0.1s ease;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  transition: transform 0.1s ease, background-color 0.1s ease, box-shadow 0.1s ease;
 }
 .retention-stepper-btn:active {
-  background-color: var(--gray5);
+  background: rgba(0, 0, 0, 0.06);
+  box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.06);
 }
 .retention-stepper-btn.stepper-disabled {
-  color: var(--gray4);
+  color: var(--text-quaternary);
 }
 
 .retention-stepper-input {
@@ -754,8 +797,17 @@
   font-weight: 600;
   color: var(--text-primary);
   background-color: var(--bg-card);
+  border: 1rpx solid transparent;
   border-radius: 12rpx;
+  box-sizing: border-box;
   font-family: var(--font-mono);
+}
+
+/* 禁用态：阻止键盘弹起但保持外观不变 */
+.retention-stepper-input[disabled] {
+  opacity: 1;
+  color: var(--text-primary);
+  -webkit-text-fill-color: var(--text-primary);
 }
 
 .retention-unit {
@@ -809,15 +861,15 @@
 /* ═══════════════ User List ═══════════════ */
 
 .user-item {
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: 22rpx 28rpx;
   margin-bottom: 12rpx;
   display: flex;
   align-items: center;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border-dark);
-  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
+  border: 1rpx solid var(--separator);
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, border-color 0.4s ease;
 }
 
 .user-avatar {
@@ -945,14 +997,14 @@
 .admin-card {
   position: relative;
   z-index: 1;
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: 22rpx;
   display: flex;
   align-items: center;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border-dark);
-  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  border: 1rpx solid var(--separator);
+  transition: background-color 0.4s ease, color 0.35s ease, transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .admin-card.no-transition {
   transition: none;
@@ -1005,15 +1057,15 @@
 }
 
 .order-card {
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: 24rpx 28rpx;
   margin-bottom: 14rpx;
   box-sizing: border-box;
   overflow: hidden;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border-dark);
-  transition: background 0.4s ease, box-shadow 0.4s ease, transform 0.15s ease;
+  border: 1rpx solid var(--separator);
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, transform 0.15s ease;
 }
 
 .order-card:active {
@@ -1163,6 +1215,17 @@
   font-size: 24rpx;
   color: var(--text-primary);
   font-weight: 500;
+}
+
+/* 价格行 — 视觉突出 */
+.detail-price-row {
+  padding: 16rpx 0 8rpx;
+}
+.detail-price-value {
+  font-size: 28rpx;
+  font-weight: 700;
+  color: var(--orange);
+  font-family: var(--font-mono);
 }
 
 /* File rows in detail */
@@ -1428,17 +1491,12 @@
 .theme-dark .key-user-info {
   background: rgba(52, 199, 89, 0.10);
 }
-.theme-dark .retention-stepper-btn {
-  background: var(--glass-regular);
-  border: var(--glass-border-dark);
-}
 .theme-dark .retention-stepper-btn:active {
   background: rgba(255, 255, 255, 0.10);
 }
 .theme-dark .retention-stepper-input {
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--text-primary);
-  border: 1rpx solid rgba(84, 84, 88, 0.30);
+  background: #2C2C2E;
+  border-color: rgba(84, 84, 88, 0.30);
 }
 .theme-dark .redeem-input {
   background: rgba(255, 255, 255, 0.08);
@@ -1491,5 +1549,15 @@
 }
 .theme-dark .storage-divider {
   background-color: rgba(84, 84, 88, 0.30);
+}
+
+/* 深色模式：密钥类型滑轨加亮 */
+.theme-dark .key-type-slider {
+  background: linear-gradient(180deg,
+    rgba(64, 156, 255, 0.92) 0%,
+    rgba(30, 130, 240, 0.96) 100%);
+  box-shadow:
+    0 2rpx 10rpx rgba(64, 156, 255, 0.35),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.25);
 }
 

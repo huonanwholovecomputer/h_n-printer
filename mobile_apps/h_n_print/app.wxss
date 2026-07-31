@@ -25,7 +25,7 @@ page {
   --bg-primary: #F2F2F7;
   --bg-primary-gradient: linear-gradient(175deg, #F8F8FC 0%, #EDEDF3 40%, #E8E8F0 100%);
   --bg-card: #FFFFFF;
-  --bg-elevated: rgba(255, 255, 255, 0.85);
+  --bg-elevated: #F2F2F7;
   --text-primary: #000000;
   --text-secondary: #3C3C43;
   --text-tertiary: #8E8E93;
@@ -38,9 +38,9 @@ page {
   --glass-light:   rgba(255, 255, 255, 0.35);
   --glass-regular: rgba(255, 255, 255, 0.58);
   --glass-heavy:   rgba(255, 255, 255, 0.76);
-  /* Rim highlight — 顶部内高光模拟玻璃折射 */
-  --glass-rim:        inset 0 0.5rpx 0 rgba(255, 255, 255, 0.6);
-  --glass-rim-strong: inset 0 1rpx 0 rgba(255, 255, 255, 0.75);
+  /* Rim highlight — 顶部内高光模拟玻璃折射（浅/深色分别取值） */
+  --glass-rim:        inset 0 1rpx 0 rgba(255, 255, 255, 0.85);
+  --glass-rim-strong: inset 0 1.5rpx 0 rgba(255, 255, 255, 0.95);
   /* Glass shadow — 外阴影模拟悬浮深度（增强后卡片层次更分明） */
   --glass-shadow-sm: 0 2rpx 8rpx rgba(0, 0, 0, 0.08), 0 0 0 0.5rpx rgba(0, 0, 0, 0.04);
   --glass-shadow-md: 0 4rpx 16rpx rgba(0, 0, 0, 0.10), 0 0 0 0.5rpx rgba(0, 0, 0, 0.05);
@@ -161,45 +161,45 @@ page {
    4. Cards — Liquid Glass containers (iOS 26 style)
    ============================================================ */
 
-/* Glass card — the default surface for Liquid Glass UI */
+/* Glass card — solid color surface, no backdrop sampling needed */
 .glass-card {
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: var(--space-lg);
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border-dark);
+  border: 1rpx solid var(--separator);
   width: 100%;
   box-sizing: border-box;
 }
 
 .glass-card-elevated {
-  background: var(--glass-heavy);
+  background: var(--bg-elevated);
   border-radius: var(--radius-lg);
   padding: var(--space-lg);
-  box-shadow: var(--glass-shadow-md), var(--glass-rim-strong);
-  border: var(--glass-border);
+  box-shadow: var(--glass-shadow-md), var(--glass-rim);
+  border: 1rpx solid var(--separator-strong);
   width: 100%;
   box-sizing: border-box;
 }
 
-/* Legacy card aliases — remapped to glass */
+/* Legacy card aliases — remapped to solid color */
 .card {
-  background: var(--glass-regular);
+  background: var(--bg-card);
   border-radius: var(--radius-lg);
   padding: var(--space-lg);
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  border: var(--glass-border-dark);
+  border: 1rpx solid var(--separator);
   width: 100%;
   box-sizing: border-box;
   transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
 }
 
 .card-elevated {
-  background: var(--glass-heavy);
+  background: var(--bg-elevated);
   border-radius: var(--radius-lg);
   padding: var(--space-lg);
-  box-shadow: var(--glass-shadow-md), var(--glass-rim-strong);
-  border: var(--glass-border);
+  box-shadow: var(--glass-shadow-md), var(--glass-rim);
+  border: 1rpx solid var(--separator-strong);
   width: 100%;
   box-sizing: border-box;
   transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
@@ -622,6 +622,13 @@ page {
   border: 1rpx solid var(--separator);
 }
 
+/* 禁用态：阻止键盘弹起但保持外观不变 */
+.stepper-input[disabled] {
+  opacity: 1;
+  color: var(--text-primary);
+  -webkit-text-fill-color: var(--text-primary);
+}
+
 /* Text input — iOS style */
 .input-ios {
   flex: 1;
@@ -690,7 +697,7 @@ page {
 }
 
 /* ═══════════════ 背景遮罩层 ═══════════════ */
-/* 固定在视口底层，使用微妙渐变让 glass 表面有内容可"折射" */
+/* 固定在视口底层，实体色 + 渐变叠层 opacity 交叉淡入淡出 */
 .theme-bg-layer {
   position: fixed;
   top: 0;
@@ -698,32 +705,46 @@ page {
   width: 100vw;
   height: 100vh;
   z-index: 0;
-  background: var(--bg-primary-gradient);
+  background-color: #F2F2F7;
   pointer-events: none;
-  transition: background 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: background-color 0.45s ease;
 }
-.theme-bg-layer.bg-dark {
+/* 浅色渐变叠层 — 浅色模式可见，深色模式淡出 */
+.theme-bg-layer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(175deg, #F8F8FC 0%, #EDEDF3 40%, #E8E8F0 100%);
+  opacity: 1;
+  transition: opacity 0.45s ease;
+}
+/* 深色渐变叠层 — 浅色模式隐藏，深色模式淡入 */
+.theme-bg-layer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
   background: linear-gradient(175deg, #222226 0%, #1C1C1E 40%, #18181C 100%);
+  opacity: 0;
+  transition: opacity 0.45s ease;
+}
+/* 切换到深色：交换两个叠层的透明度 */
+.theme-bg-layer.bg-dark::before { opacity: 0; }
+.theme-bg-layer.bg-dark::after  { opacity: 1; }
+
+.theme-bg-layer.bg-dark {
+  background-color: #1C1C1E;
 }
 
 /* 确保导航栏在遮罩层之上 */
 .weui-navigation-bar {
   position: relative;
   z-index: 2;
-}
-
-/* ═══════════════ 主题切换渐变 ═══════════════ */
-/* 只在全屏遮罩层上做过渡，其他元素瞬间切换，避免页面加载时闪白 */
-/* theme-bg-layer 的 transition 已在其定义处设置 */
-
-/* 主题切换脉冲：用亮度微调掩盖背景突变 */
-.theme-switching .theme-bg-layer {
-  animation: themeCrossfade 0.45s ease;
-}
-@keyframes themeCrossfade {
-  0%   { filter: brightness(1.00); }
-  40%  { filter: brightness(1.10); }
-  100% { filter: brightness(1.00); }
 }
 
 .scroller {
@@ -747,7 +768,7 @@ page {
   --bg-primary: #1C1C1E;
   --bg-primary-gradient: linear-gradient(175deg, #222226 0%, #1C1C1E 40%, #18181C 100%);
   --bg-card: #2C2C2E;
-  --bg-elevated: rgba(44, 44, 46, 0.85);
+  --bg-elevated: #1C1C1E;
   --text-primary: #FFFFFF;
   --text-secondary: #EBEBF5;
   --text-tertiary: #98989D;
@@ -779,56 +800,23 @@ page {
   --gray6: #2C2C2E;
 }
 
-/* 深色模式：导航栏背景 — 深色玻璃 */
+/* 深色模式：导航栏 — 深色玻璃 + 浅色文字 */
+.theme-dark .weui-navigation-bar {
+  color: rgba(255, 255, 255, 0.9);
+}
 .theme-dark .weui-navigation-bar__inner {
   background: rgba(28, 28, 30, 0.88);
   box-shadow: inset 0 -1rpx 0 rgba(255, 255, 255, 0.08);
 }
-
 .theme-dark .weui-navigation-bar__btn_goback {
   background-color: rgba(255, 255, 255, 0.85);
 }
 
-/* 深色模式：tabBar — 深色液态玻璃浮层 */
-.tab-bar.theme-dark,
-.theme-dark .tab-bar {
-  background: rgba(26, 26, 28, 0.50);
-  box-shadow:
-    0 8rpx 32rpx rgba(0, 0, 0, 0.45),
-    inset 0 1rpx 0 rgba(255, 255, 255, 0.12),
-    inset 0 -1rpx 0 rgba(0, 0, 0, 0.20),
-    0 0 0 0.5rpx rgba(255, 255, 255, 0.08);
-}
+/* 注：tab bar 使用固定配色,不随主题变化,详见 custom-tab-bar/index.wxss */
 
-.tab-bar.theme-dark .tab-text,
-.theme-dark .tab-text {
-  color: #98989D;
-}
-
-.tab-bar.theme-dark .text-active,
-.theme-dark .text-active {
-  color: #409CFF;
-}
-
-.tab-bar.theme-dark .icon-active,
-.theme-dark .icon-active {
-  background-color: rgba(64, 156, 255, 0.15);
-}
-
-/* 深色模式：卡片适配 — glass tokens auto-adapt dark values */
-.theme-dark .user-item,
-.theme-dark .role-btn {
-  background: var(--glass-regular);
-  transition: background 0.4s ease, box-shadow 0.4s ease, border-color 0.4s ease;
-}
-
+/* 深色模式：卡片适配 — 使用固定色变量（--bg-card / --bg-elevated），自动适配深浅色 */
 .theme-dark .file-card {
   background: var(--glass-regular);
-  transition: background 0.4s ease, box-shadow 0.4s ease;
-}
-
-.theme-dark .key-card {
-  background: var(--glass-heavy);
   transition: background 0.4s ease, box-shadow 0.4s ease;
 }
 
@@ -846,7 +834,7 @@ page {
 .theme-dark .redeem-input,
 .theme-dark .control-input,
 .theme-dark .range-line-input {
-  background-color: #3A3A3C;
+  background-color: #2C2C2E;
   color: var(--text-primary);
   border-color: rgba(84, 84, 88, 0.5);
 }
@@ -923,7 +911,7 @@ page {
 
 /* 深色模式：key drawer locked */
 .theme-dark .key-card-wrap.key-drawer-locked .key-card {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--bg-card);
   opacity: 0.55;
 }
 
@@ -960,24 +948,24 @@ page {
   background: rgba(0, 122, 255, 0.12);
 }
 
-/* 深色模式：key-type-toggle */
+/* 深色模式：key-type-toggle — 沿用 --gray6 变量，随 JS 动画同步渐变 */
 .theme-dark .key-type-toggle {
-  background-color: #3A3A3C;
+  background-color: var(--gray6);
 }
 
 /* ═══════════════ Theme Toggle Button ═══════════════ */
 
 .theme-toggle-btn {
-  position: absolute;
+  position: fixed;
   top: calc(env(safe-area-inset-top) + 6px);
   right: 16px;
-  width: 60rpx;
-  height: 60rpx;
-  border-radius: 30rpx;
+  width: 72rpx;
+  height: 72rpx;
+  border-radius: 36rpx;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 32rpx;
+  font-size: 36rpx;
   background: rgba(255, 255, 255, 0.22);
   backdrop-filter: saturate(180%) blur(12px);
   -webkit-backdrop-filter: saturate(180%) blur(12px);
@@ -985,15 +973,22 @@ page {
     0 4rpx 16rpx rgba(0, 0, 0, 0.08),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.7),
     0 0 0 0.5rpx rgba(0, 0, 0, 0.06);
-  z-index: 10;
-  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  z-index: 100;
+  /* 扩大隐式触摸区域 */
+  padding: 12rpx;
+  /* 松手回弹 + 深浅过渡 */
+  transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1),
+              background-color 0.45s ease,
+              box-shadow 0.45s ease;
 }
 
-.theme-toggle-btn:active {
-  transform: scale(0.88);
+/* 按压瞬间：立即缩到位（0s 过渡保证短按也能触发） */
+.theme-toggle-btn.tp-pressing {
+  transform: scale(0.78);
+  transition: transform 0s;
 }
 
-.theme-dark .theme-toggle-btn {
+.theme-toggle-btn.theme-dark {
   background: rgba(26, 26, 28, 0.50);
   box-shadow:
     0 4rpx 16rpx rgba(0, 0, 0, 0.40),
@@ -1166,11 +1161,6 @@ page {
 .theme-dark .redeem-paste-btn {
   background: rgba(255, 255, 255, 0.06);
   border-color: rgba(0, 122, 255, 0.2);
-}
-
-/* ── 留存步进器按钮 ── */
-.theme-dark .retention-stepper-btn {
-  background: rgba(255, 255, 255, 0.06);
 }
 
 /* ── 添加文件按钮按下态 ── */
