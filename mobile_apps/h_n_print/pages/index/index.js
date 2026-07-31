@@ -798,7 +798,7 @@ Component({
             copies: 1,
             pageRange: '',                        // 提交用，由 rangeLines 合并得出
             rangeLines: [{value: '', error: ''}],  // 多行输入，对齐本地工具 RangeListWidget
-            duplex: 'on',
+            duplex: isImage ? 'off' : 'on',  // 图片单页渲染，无双面概念 → 固定单面
             entering: true,
             removing: false,
             excelWarning: isExcel,

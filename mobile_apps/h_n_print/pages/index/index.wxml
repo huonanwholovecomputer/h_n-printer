@@ -124,8 +124,8 @@
                 </view>
               </view>
 
-              <!-- Duplex toggle -->
-              <view class="control-row">
+              <!-- Duplex toggle（图片单页渲染，无双面概念 → 隐藏） -->
+              <view wx:if="{{!item.isImage}}" class="control-row">
                 <text class="control-label">模式</text>
                 <view class="duplex-toggle">
                   <view class="duplex-slider {{item.duplex === 'on' ? 'slider-right' : ''}}"></view>
