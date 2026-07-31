@@ -61,6 +61,7 @@ Component({
     badgeExiting: false,    // 圆点退场动画（末文件删除）
     badgeCount: 0,          // 延迟更新的计数，统一 0.25s 滞后于 selectedFiles.length
     scrollPadHeight: 0,     // 滚动垫片高度，强制撑开 scroll-content 规避微信布局上限
+    fileListHeight: 0,      // 文件列表显式高度（随内容增长至上限后锁定并内部滚动）
     btnPulse: false,        // 添加按钮脉冲动画（文字变化时）
     pageReady: false,         // 首次打开的入场动效
     pageExit: '',             // 退出动画: page-exit-left / page-exit-right
@@ -393,6 +394,7 @@ Component({
       this._scrollerH = 0
       this._contentH = 0
       this._contentEst = 0   // 估算累积高度，兜底微信容器上限
+      this._fileListPx = 0   // 文件列表累计占用高度（有界 scroll-view，达到上限后不再增长）
 
       this._trackId = null
       this._lastY = 0
@@ -411,8 +413,13 @@ Component({
 
       this._measureTimer = null  // 去抖测量句柄
 
-      // 底部额外滚动留白，防止提交按钮贴边或被 tabBar 遮挡
+      // 底部额外滚动留白（提交按钮与 tabBar 顶边之间的小间隙）
       this._bottomPad = 20
+      // 悬浮 tabBar 遮挡高度：bottom 12rpx + 高度 110rpx（见 custom-tab-bar/index.wxss）+ 底部安全区。
+      // 滚动范围计算时显式加上它，保证滚到底时提交按钮不被 tabBar 遮住。
+      const _wi = wx.getWindowInfo()
+      const _safeBottom = _wi && _wi.safeArea ? Math.max(0, _wi.windowHeight - _wi.safeArea.bottom) : 0
+      this._tabOverlayPx = Math.round((12 + 110) * ((_wi.windowWidth || 375) / 750)) + _safeBottom
 
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(), 400)
@@ -485,9 +492,10 @@ Component({
         const vp = res[0].height || 0
         const ch = res[1].height || 0
         this._scrollerH = vp
-        if (!this._contentEst) this._contentEst = ch
+        // 估算同步为实测：避免 _contentEst 只涨不跌（否则 _contentH 恒取估算，滚动范围偏大）
+        if (ch > 0) this._contentEst = ch
         this._contentH = Math.max(ch, this._contentEst)
-        this._maxY = Math.max(0, this._contentH - vp + this._bottomPad)
+        this._maxY = Math.max(0, this._contentH - vp + this._bottomPad + this._tabOverlayPx)
         if (this._y > this._maxY) {
           // 不直接跳变，让 _snapBack() 从当前位置平滑回弹到新边界
           this._snapBack()
@@ -498,18 +506,30 @@ Component({
     // 添加文件时立刻估算卡片高度并更新滚动边界，无需等待 cardExpand 动画完成
     // 后续 _measure() 会修正为精确值
     _bumpForNewFile() {
+      const { windowWidth, windowHeight } = wx.getWindowInfo()
+      const rpxRatio = (windowWidth || 375) / 750
+      const estPx = Math.round(470 * rpxRatio)
+      // 文件列表为有界原生 scroll-view（显式高度驱动，上限 ≈ 75vh / 3 个卡片）。
+      // 达到上限后新增文件只内部滚动、不再撑高页面，故 contentEst 不再增长。
+      const listCapPx = Math.round((windowHeight || 800) * 0.75)
+      if (!this._fileListPx) this._fileListPx = 0
+      const prev = this._fileListPx
+      this._fileListPx = Math.min(listCapPx, this._fileListPx + estPx)
+      const delta = this._fileListPx - prev
+      // 显式高度让 scroll-view 真正裁剪溢出卡片并内部滚动（仅 max-height 在微信中不可靠，会画到按钮上）
+      this.setData({ fileListHeight: Math.max(0, this._fileListPx) })
+
       if (!this._scrollerH) {
         this._measure()
         this._scheduleMeasure(200)
         return
       }
       if (!this._contentEst) this._contentEst = this._contentH
-      const { windowWidth } = wx.getWindowInfo()
-      const rpxRatio = (windowWidth || 375) / 750
-      const estPx = Math.round(470 * rpxRatio)
-      this._contentEst += estPx
-      this._maxY = Math.max(0, this._contentEst - this._scrollerH + this._bottomPad)
-      this.setData({ scrollPadHeight: this._contentEst })
+      if (delta > 0) this._contentEst += delta
+      this._maxY = Math.max(0, this._contentEst - this._scrollerH + this._bottomPad + this._tabOverlayPx)
+      // 垫片置 0：容器自带底部 padding 且文件列表为有界滚动，不再触及微信高度上限。
+      // 之前设成 _contentEst（整份估算高）会在容器外加高近一屏，造成底部大量空白。
+      this.setData({ scrollPadHeight: 0 })
       if (this._y > this._maxY) this._snapBack()
     },
 
@@ -859,11 +879,17 @@ Component({
         }
         this._uploadTimers = remapTimers(this._uploadTimers || {})
         this._pollTimers = remapTimers(this._pollTimers || {})
-        const { windowWidth: ww } = wx.getWindowInfo()
+        const { windowWidth: ww, windowHeight: wh } = wx.getWindowInfo()
         const rpxR = (ww || 375) / 750
         const estPx = Math.round(470 * rpxR)
-        this._contentEst = Math.max(0, this._contentEst - estPx)
-        this.setData({ selectedFiles: files, badgeCount: files.length, scrollPadHeight: this._contentEst })
+        // 与 _bumpForNewFile 对称：按实际累计高度减少 contentEst
+        const listCapPx = Math.round((wh || 800) * 0.75)
+        if (!this._fileListPx) this._fileListPx = 0
+        const prev = this._fileListPx
+        this._fileListPx = Math.max(0, this._fileListPx - estPx)
+        const delta = this._fileListPx - prev
+        this._contentEst = Math.max(0, this._contentEst + delta)
+        this.setData({ selectedFiles: files, badgeCount: files.length, scrollPadHeight: 0, fileListHeight: Math.max(0, this._fileListPx) })
         if (!isLastFile) {
           this._prevFileCount = files.length
         }

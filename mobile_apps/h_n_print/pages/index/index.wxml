@@ -37,7 +37,8 @@
             <text wx:if="{{badgeCount > 0 || badgeExiting}}" class="section-header-badge {{badgeEntering ? 'entering' : ''}} {{badgeBouncing ? 'bouncing' : ''}} {{badgeExiting ? 'exiting' : ''}}">{{badgeCount || 1}}</text>
           </view>
 
-          <!-- File Cards -->
+          <!-- File Cards（有界原生滚动：避免卡片堆高撑破外层 transform GPU 层的微信布局上限）-->
+          <scroll-view class="file-list-scroll" scroll-y enhanced show-scrollbar="{{false}}" style="height: {{fileListHeight}}px;">
           <view
             wx:for="{{selectedFiles}}"
             wx:key="index"
@@ -134,6 +135,7 @@
               </view>
             </view>
           </view>
+          </scroll-view>
 
           <!-- Add file button -->
           <button class="add-file-btn {{btnPulse ? 'pulsing' : ''}}" bindtap="onChooseFile" hover-class="tap-active">
@@ -230,7 +232,7 @@
         </view>
 
       </view>
-      <!-- 垫片：在 container 外，强制撑开 scroll-content 总高度 -->
+      <!-- 垫片（scrollPadHeight 现恒为 0）：容器自带底部 padding，文件列表为有界滚动，无需额外撑高 -->
       <view style="height: {{scrollPadHeight}}px; width: 100%; pointer-events: none;"></view>
     </view>
   </view>
