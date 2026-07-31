@@ -351,8 +351,12 @@ Component({
 
       this._measureTimer = null  // 去抖测量句柄
 
-      // 底部额外滚动留白，防止内容贴边或被 tabBar 遮挡
+      // 底部额外滚动留白（内容与 tabBar 顶边之间的小间隙）
       this._bottomPad = 20
+      // 悬浮 tabBar 遮挡高度：bottom 12rpx + 高度 110rpx + 底部安全区（与 index 页一致）
+      const _wi = wx.getWindowInfo()
+      const _safeBottom = _wi && _wi.safeArea ? Math.max(0, _wi.windowHeight - _wi.safeArea.bottom) : 0
+      this._tabOverlayPx = Math.round((12 + 110) * ((_wi.windowWidth || 375) / 750)) + _safeBottom
 
       // 许可密钥倒计时 / 左滑 运行时状态
       this._keyCountdownTimer = null
@@ -422,7 +426,7 @@ Component({
         const ch = res[1].height || 0
         this._scrollerH = vp
         this._contentH = ch
-        this._maxY = Math.max(0, ch - vp + this._bottomPad)
+        this._maxY = Math.max(0, ch - vp + this._bottomPad + this._tabOverlayPx)
         // 内容变短导致当前超出新上界 → 平滑回弹归位（不跳变）
         if (this._y > this._maxY) {
           this._snapBack()

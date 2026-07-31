@@ -104,7 +104,7 @@
 
 .container {
   padding: 20rpx 32rpx;
-  padding-bottom: calc(140rpx + env(safe-area-inset-bottom));
+  padding-bottom: 48rpx;  /* 底部留白；tabBar 遮挡由滚动范围 _tabOverlayPx 显式处理，不再用大 padding 兜底 */
   box-sizing: border-box;
 }
 
@@ -1390,14 +1390,16 @@
   top: calc(100% + 6rpx);
   left: 0;
   min-width: 160rpx;
-  background-color: var(--bg-card);
+  background-color: var(--glass-heavy);   /* 半透明玻璃，配合模糊呈现质感（参考 tabBar） */
+  backdrop-filter: saturate(160%) blur(14px);
+  -webkit-backdrop-filter: saturate(160%) blur(14px);
   border-radius: var(--radius-sm);
   box-shadow: 0 4rpx 20rpx rgba(0, 0, 0, 0.12);
   z-index: 102;
   opacity: 0;
   transform: translateY(-8rpx);
   pointer-events: none;
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease, background-color 0.45s ease, box-shadow 0.45s ease;
   overflow: hidden;
 }
 
@@ -1411,6 +1413,7 @@
   padding: 18rpx 24rpx;
   font-size: 24rpx;
   color: var(--text-primary);
+  transition: color 0.35s ease, background-color 0.45s ease;
 }
 
 .page-size-option:active {

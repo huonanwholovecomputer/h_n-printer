@@ -117,14 +117,16 @@
   top: calc(100% + 6rpx);
   left: 0;
   min-width: 160rpx;
-  background: var(--glass-heavy);
+  background: var(--glass-heavy);   /* 半透明玻璃，配合模糊呈现质感（参考 tabBar） */
+  backdrop-filter: saturate(160%) blur(14px);
+  -webkit-backdrop-filter: saturate(160%) blur(14px);
   border-radius: var(--radius-sm);
   box-shadow: 0 4rpx 24rpx rgba(0, 0, 0, 0.12), var(--glass-rim);
   z-index: 100;
   opacity: 0;
   transform: translateY(-8rpx);
   pointer-events: none;
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease, background-color 0.45s ease, box-shadow 0.45s ease;
   overflow: hidden;
 }
 
@@ -138,6 +140,7 @@
   padding: 18rpx 24rpx;
   font-size: 24rpx;
   color: var(--text-primary);
+  transition: color 0.35s ease, background-color 0.45s ease;
 }
 
 .page-size-option:active {
