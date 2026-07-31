@@ -160,6 +160,7 @@ const DEFAULT_MEMBERS = [
 ];
 const DEFAULT_SCORE_CAP = 15;
 const DEFAULT_RATE = 0.05;
+const DEFAULT_SCORE_PASSWORD = '123456';   // 服务评分编辑的默认密码，可在设置中修改
 
 // 默认月份数据（首次使用的示例数据）
 const DEFAULT_MONTHS = {
@@ -190,39 +191,53 @@ const DEFAULT_MONTHS = {
   },
 };
 
-// === 本地文件（通过服务器 API 读写） ===
-var _localFilePath = '';
-
 async function _saveToServer(data) {
+  // 配置存云端：走 stats_server 的 /api/proxy/ 通道（自动附带 printer token）
   try {
-    var resp = await fetch('/api/local/data', {
+    var resp = await fetch('/api/proxy/finance/config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: data }),
     });
     var result = await resp.json();
-    if (result.success) {
-      _localFilePath = result.path || '';
-      return true;
-    }
-    return false;
+    return !!(result && result.success);
   } catch(e) {
     return false;
   }
 }
 
 async function _loadFromServer() {
+  // 返回 { ok:true, data } 或 { ok:false, message }；data 为 null 表示云端尚无配置
+  try {
+    var resp = await fetch('/api/proxy/finance/config');
+    var result = await resp.json();
+    if (result && result.success) return { ok: true, data: result.data };
+    return { ok: false, message: (result && result.message) || '获取配置失败' };
+  } catch(e) {
+    return { ok: false, message: String(e) };
+  }
+}
+
+// 一次性迁移用：仅当云端为空时读取旧的本地数据文件
+async function _loadFromLocalFile() {
   try {
     var resp = await fetch('/api/local/data');
     var result = await resp.json();
-    if (result.success) {
-      _localFilePath = result.path || '';
-      return result.data;
-    }
+    if (result && result.success && result.data) return result.data;
     return null;
   } catch(e) {
     return null;
   }
+}
+
+function showCloudBlocked(msg) {
+  var el = document.getElementById('cloudBlockOverlay');
+  var msgEl = document.getElementById('cloudBlockMsg');
+  if (msgEl) msgEl.textContent = msg || '收支清算需要连接云端才能使用';
+  if (el) el.style.display = 'flex';
+}
+function retryCloudLoad() {
+  location.reload();
 }
 
 function downloadJSON(data, filename) {
@@ -242,6 +257,7 @@ function saveData(data) {
 function migrateConfig(data) {
   if (!data.config) data.config = {};
   if (!data.config.scoreCap) data.config.scoreCap = DEFAULT_SCORE_CAP;
+  if (!data.config.scorePassword) data.config.scorePassword = DEFAULT_SCORE_PASSWORD;
   if (!data.config.members || data.config.members.length === 0) {
     data.config.members = JSON.parse(JSON.stringify(DEFAULT_MEMBERS));
   }
@@ -257,10 +273,11 @@ function MC(id) { var x = getMember(id); return x ? x.color : '#000'; }
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 // Global state
-var STORE = { config: { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) }, months: {} };
+var STORE = { config: { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, scorePassword: DEFAULT_SCORE_PASSWORD, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) }, months: {} };
 STORE = migrateConfig(STORE);
 if (!STORE.config) STORE.config = { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) };
 var currentKey = Object.keys(STORE.months).sort().pop() || null;
+var scoreUnlocked = false;   // 服务评分编辑是否已通过密码解锁（刷新后重置）
 
 // Cloud data state
 var _cloudData = null;
@@ -360,20 +377,16 @@ function switchTab(name) {
 }
 
 function save() {
-  _saveToServer(STORE);
+  _saveToServer(STORE).then(function(ok) {
+    if (!ok) toast('⚠️ 云端保存失败，数据未同步，请检查连接');
+  });
 }
 
 function updateStorageIndicator() {
   var pathEl = document.getElementById('storageFilePath');
   if (pathEl) {
-    if (_localFilePath) {
-      var shortPath = _localFilePath.replace(/^.*[\\/]/, '');
-      pathEl.textContent = '📄 ' + shortPath;
-      pathEl.title = _localFilePath;
-    } else {
-      pathEl.textContent = '';
-      pathEl.title = '';
-    }
+    pathEl.textContent = '☁ 云端';
+    pathEl.title = '配置存储于云端服务器';
   }
 }
 
@@ -540,6 +553,14 @@ function renderEntry() {
   h += '</div></div>';
 
   h += '<div class="section"><h2>⭐ 服务贡献评分（CEO 每月评估，单项上限 ' + scoreCap + ' 分）</h2>';
+  h += '<div style="margin:6px 0 2px">'
+    + (scoreUnlocked
+        ? '<button class="btn sm" onclick="toggleScoreLock()">🔓 锁定评分编辑</button>'
+        : '<button class="btn sm" onclick="toggleScoreLock()">🔒 解锁评分编辑</button>')
+    + ' <span style="color:var(--muted);font-size:0.85rem">'
+    + (scoreUnlocked ? '已解锁，可直接修改评分' : '修改评分需先输入密码解锁')
+    + '</span></div>';
+  var sLock = scoreUnlocked ? '' : ' disabled';
   members.forEach(function(mem) {
     var sc = (m.scores||{})[mem.id] || [];
     var capped = sc.reduce(function(s, x) { return s + Math.min(x.score||0, scoreCap); }, 0);
@@ -547,13 +568,13 @@ function renderEntry() {
     h += '<table><thead><tr><th>评分项目</th><th>得分</th><th></th></tr></thead><tbody id="st-' + mem.id + '">';
     sc.forEach(function(s, i) {
       var over = (s.score||0) > scoreCap;
-      h += '<tr><td class="l"><input value="' + esc(s.item) + '" onchange="updScore(\'' + mem.id + '\',' + i + ',\'item\',this.value)" style="width:200px"></td>';
-      h += '<td><input type="number" step="0.1" value="' + s.score + '" onchange="updScore(\'' + mem.id + '\',' + i + ',\'score\',+this.value)" style="width:80px;color:' + (over?'var(--neg)':'inherit') + '">';
+      h += '<tr><td class="l"><input value="' + esc(s.item) + '" onchange="updScore(\'' + mem.id + '\',' + i + ',\'item\',this.value)" style="width:200px"' + sLock + '></td>';
+      h += '<td><input type="number" step="0.1" value="' + s.score + '" onchange="updScore(\'' + mem.id + '\',' + i + ',\'score\',+this.value)" style="width:80px;color:' + (over?'var(--neg)':'inherit') + '"' + sLock + '>';
       if (over) h += '<span style="color:var(--neg);font-size:0.78rem"> ⚠超限</span>';
-      h += '</td><td><button class="btn danger sm" onclick="delScore(\'' + mem.id + '\',' + i + ')">✕</button></td></tr>';
+      h += '</td><td><button class="btn danger sm" onclick="delScore(\'' + mem.id + '\',' + i + ')"' + sLock + '>✕</button></td></tr>';
     });
     h += '</tbody></table>';
-    h += '<button class="btn sm" style="margin-top:4px" onclick="addScore(\'' + mem.id + '\')">+ 为' + mem.name + '添加评分项</button>';
+    h += '<button class="btn sm" style="margin-top:4px" onclick="addScore(\'' + mem.id + '\')"' + sLock + '>+ 为' + mem.name + '添加评分项</button>';
   });
   h += '</div>';
 
@@ -587,18 +608,44 @@ function updNote(val) {
   STORE.months[currentKey].note = val;
   save();
 }
+function getScorePassword() { return (STORE.config && STORE.config.scorePassword) || DEFAULT_SCORE_PASSWORD; }
+function scoreGuard() {
+  if (scoreUnlocked) return true;
+  toast('🔒 请先解锁服务评分编辑');
+  return false;
+}
+function toggleScoreLock() {
+  if (scoreUnlocked) {
+    scoreUnlocked = false;
+    toast('🔒 服务评分已锁定');
+    renderEntry();
+    return;
+  }
+  var pwd = prompt('请输入服务评分编辑密码：');
+  if (pwd === null) { renderEntry(); return; }   // 取消
+  if (pwd === getScorePassword()) {
+    scoreUnlocked = true;
+    toast('🔓 已解锁服务评分编辑');
+  } else {
+    toast('❌ 密码错误，无法解锁');
+  }
+  renderEntry();
+}
 function updScore(memId, idx, field, val) {
+  if (!scoreGuard()) return;
   if (!STORE.months[currentKey].scores) STORE.months[currentKey].scores = {};
   if (!STORE.months[currentKey].scores[memId]) STORE.months[currentKey].scores[memId] = [];
   STORE.months[currentKey].scores[memId][idx][field] = val;
   save();
 }
 function delScore(memId, idx) {
+  if (!scoreGuard()) return;
   STORE.months[currentKey].scores[memId].splice(idx, 1);
   save();
   renderEntry();
 }
 function addScore(memId) {
+  if (!scoreGuard()) return;
   if (!STORE.months[currentKey].scores) STORE.months[currentKey].scores = {};
   if (!STORE.months[currentKey].scores[memId]) STORE.months[currentKey].scores[memId] = [];
   STORE.months[currentKey].scores[memId].push({ item: '新服务项', score: 0 });
@@ -1292,7 +1339,7 @@ function importData(e) {
 }
 function resetData() {
   if (!confirm('⚠ 确定删除所有数据？建议先导出备份。')) return;
-  STORE = { config: { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) }, months: {} };
+  STORE = { config: { investRate: DEFAULT_RATE, scoreCap: DEFAULT_SCORE_CAP, scorePassword: DEFAULT_SCORE_PASSWORD, members: JSON.parse(JSON.stringify(DEFAULT_MEMBERS)) }, months: {} };
   save();
   currentKey = null;
   renderAll();
@@ -1312,6 +1359,12 @@ function renderSettings() {
   h += '<label>单项评分上限</label>';
   h += '<input type="number" min="1" max="100" step="1" value="' + scoreCap + '" onchange="updateScoreCap(+this.value)" style="width:100px">';
   h += '<span style="color:var(--muted);font-size:0.85rem">当前上限 ' + scoreCap + ' 分，修改后所有月份计算将即时生效</span>';
+  h += '</div>';
+  h += '<div class="settings-row">';
+  h += '<label>服务评分密码</label>';
+  h += '<input type="text" id="scorePasswordInput" value="' + esc(getScorePassword()) + '" style="width:120px" placeholder="默认 ' + DEFAULT_SCORE_PASSWORD + '">';
+  h += '<button class="btn green sm" onclick="updateScorePassword()">保存</button>';
+  h += '<span style="color:var(--muted);font-size:0.85rem">修改服务评分需先输入此密码解锁</span>';
   h += '</div></div>';
 
   h += '<div class="section"><h2>👥 成员管理</h2>';
@@ -1351,15 +1404,11 @@ function renderSettings() {
 
   el.innerHTML = h;
 
-  // Update file path display
+  // 存储位置显示（云端）
   var pathSpan = document.getElementById('settingsFilePath');
   if (pathSpan) {
-    if (_localFilePath) {
-      pathSpan.textContent = '📄 ' + _localFilePath.replace(/^.*[\\/]/, '');
-      pathSpan.title = _localFilePath;
-    } else {
-      pathSpan.textContent = '等待服务器响应...';
-    }
+    pathSpan.textContent = '☁ 云端服务器';
+    pathSpan.title = '收支清算配置存储于云端服务器，随 orders.db 每日备份';
   }
 }
 
@@ -1369,6 +1418,14 @@ function updateScoreCap(val) {
   save();
   renderDash();
   toast('✅ 评分上限已设为 ' + val + ' 分');
+}
+
+function updateScorePassword() {
+  var v = document.getElementById('scorePasswordInput').value;
+  if (!v || v.length < 4) { toast('密码至少 4 位'); return; }
+  STORE.config.scorePassword = v;
+  save();
+  toast('✅ 服务评分密码已更新');
 }
 
 function addMember() {
@@ -1448,18 +1505,42 @@ function renderAll() {
   });
 
   updateStorageIndicator();
-  _loadFromServer().then(function(data) {
-    if (data) {
-      STORE = migrateConfig(data);
+  _loadFromServer().then(function(res) {
+    if (!res.ok) {
+      // 无法连接云端 → 阻断使用（区别于打印工具的离线可用）
+      showCloudBlocked(res.message || '无法连接云端');
+      return;
+    }
+    if (res.data) {
+      STORE = migrateConfig(res.data);
       currentKey = Object.keys(STORE.months).sort().pop() || null;
       renderAll();
-      toast('✅ 已加载 ' + Object.keys(STORE.months).length + ' 个月数据 [本地文件]');
+      toast('✅ 已加载云端配置（' + Object.keys(STORE.months).length + ' 个月数据）');
     } else {
-      renderAll();
-      toast('ℹ️ 无数据文件，可在「设置」中导入或创建月份');
+      // 云端为空 → 首次打开：若本地旧文件有数据则自动迁移一次
+      _loadFromLocalFile().then(function(localData) {
+        if (localData) {
+          STORE = migrateConfig(localData);
+          currentKey = Object.keys(STORE.months).sort().pop() || null;
+          renderAll();
+          save();  // 同步到云端
+          toast('✅ 已从本地文件迁移到云端（' + Object.keys(STORE.months).length + ' 个月数据）');
+        } else {
+          renderAll();
+          toast('ℹ️ 云端暂无数据，可在「设置」中创建月份');
+        }
+      });
     }
   });
 })();
 </script>
+
+<!-- 离线阻断层：无法连接云端时全屏覆盖，禁止使用 -->
+<div id="cloudBlockOverlay" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;background:var(--bg);align-items:center;justify-content:center;flex-direction:column;gap:14px;text-align:center">
+  <div style="font-size:56px">☁️</div>
+  <h2 style="margin:0;color:var(--text)">无法连接云端</h2>
+  <p id="cloudBlockMsg" style="margin:0;color:var(--muted);max-width:360px;padding:0 24px">收支清算需要连接云端才能使用，请检查云端连接后重试。</p>
+  <button class="btn pri" onclick="retryCloudLoad()" style="margin-top:8px">🔄 重试</button>
+</div>
 </body>
 </html>
