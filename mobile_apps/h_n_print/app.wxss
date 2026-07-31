@@ -969,7 +969,7 @@ page {
 }
 
 .theme-dark .page-size-dropdown {
-  background: var(--glass-heavy);
+  background: rgba(44, 44, 46, 0.97);
   box-shadow: 0 4rpx 24rpx rgba(0, 0, 0, 0.4), var(--glass-rim);
 }
 

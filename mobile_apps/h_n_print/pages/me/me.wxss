@@ -1390,9 +1390,8 @@
   top: calc(100% + 6rpx);
   left: 0;
   min-width: 160rpx;
-  background-color: var(--glass-heavy);   /* 半透明玻璃，配合模糊呈现质感（参考 tabBar） */
-  backdrop-filter: saturate(160%) blur(14px);
-  -webkit-backdrop-filter: saturate(160%) blur(14px);
+  /* 近不透明背景；去掉 backdrop-filter —— 该元素位于 translateY 变换层内，微信对层内模糊采样错位（顶部浅/底部深） */
+  background-color: rgba(255, 255, 255, 0.96);
   border-radius: var(--radius-sm);
   box-shadow: 0 4rpx 20rpx rgba(0, 0, 0, 0.12);
   z-index: 102;

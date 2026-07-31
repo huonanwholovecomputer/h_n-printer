@@ -117,9 +117,7 @@
   top: calc(100% + 6rpx);
   left: 0;
   min-width: 160rpx;
-  background: var(--glass-heavy);   /* 半透明玻璃，配合模糊呈现质感（参考 tabBar） */
-  backdrop-filter: saturate(160%) blur(14px);
-  -webkit-backdrop-filter: saturate(160%) blur(14px);
+  background: rgba(255, 255, 255, 0.96);  /* 近不透明背景；去掉 backdrop-filter（变换层内模糊渲染不均） */
   border-radius: var(--radius-sm);
   box-shadow: 0 4rpx 24rpx rgba(0, 0, 0, 0.12), var(--glass-rim);
   z-index: 100;
