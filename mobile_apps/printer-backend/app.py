@@ -885,6 +885,17 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # 收支清算配置（单行 JSON blob，id 恒为 1；随 orders.db 一起被 backup.sh 备份）
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS finance_config (
+            id         INTEGER PRIMARY KEY,
+            data       TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -2780,6 +2791,58 @@ def reject_order():
 
     print(f"  [REJECT] 订单 #{order_id} 已被打印机打回")
     return jsonify({"success": True, "message": "订单已打回"})
+
+
+# ==================== 收支清算配置（云端存储） ====================
+
+
+@app.route("/api/finance/config", methods=["GET"])
+def get_finance_config():
+    """读取收支清算云端配置（需 printer token 认证）。data 为 null 表示尚未保存。"""
+    token = request.args.get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT data FROM finance_config WHERE id = 1").fetchone()
+    finally:
+        conn.close()
+    if row and row["data"]:
+        try:
+            return jsonify({"success": True, "data": json.loads(row["data"])})
+        except Exception:
+            return jsonify({"success": False, "message": "配置数据损坏"}), 500
+    return jsonify({"success": True, "data": None})
+
+
+@app.route("/api/finance/config", methods=["POST"])
+def save_finance_config():
+    """保存收支清算云端配置（需 printer token 认证）。body: {"data": {...完整配置}}"""
+    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    data = request.get_json(silent=True) or {}
+    payload = data.get("data", None)
+    if payload is None:
+        return jsonify({"success": False, "message": "缺少 data"}), 400
+    if isinstance(payload, dict):
+        payload.pop("_filepath", None)  # 清理内部字段
+    with db_lock:
+        conn = get_db()
+        try:
+            conn.execute(
+                "INSERT INTO finance_config (id, data, updated_at) VALUES (1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+                (json.dumps(payload, ensure_ascii=False),
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    return jsonify({"success": True, "message": "配置已保存"})
 
 
 @app.route("/api/abandon_order", methods=["POST"])
