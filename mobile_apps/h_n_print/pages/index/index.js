@@ -34,6 +34,13 @@ Component({
     autoPrintGlow: false,      // ⚡ 闪电发光特效
     glowPhase: '',             // 光晕阶段: ''（无）| 'striking'（爆发）| 'fading'（渐隐）| 'reset'（强制清除）
     glowStyle: '',             // 内联 text-shadow，JS 逐帧控制渐隐
+    // 无障碍打印预约（仅管理员）：now=立即 / at=指定时间 / countdown=倒计时
+    scheduleMode: 'now',
+    scheduleDays: ['今天', '明天', '后天', '大后天'],
+    scheduleDayIndex: 0,
+    scheduleTime: '',
+    countdownMin: 5,
+    countdownSec: 0,
     logoScale: 1,
     logoPadding: 40,
     scrollTop: 0,
@@ -56,6 +63,7 @@ Component({
     showDeliveryPicker: false,
     showUrgencyPicker: false,
     lastOrderNumber: '',
+    lastScheduleText: '',   // 无障碍打印预约成功提示文案（成功弹窗显示）
     badgeEntering: false,   // 圆点入场动画（首文件）
     badgeBouncing: false,   // 圆点弹跳动画（已有文件时新增）
     badgeExiting: false,    // 圆点退场动画（末文件删除）
@@ -1639,6 +1647,78 @@ Component({
       }
     },
 
+    // ==================== 无障碍打印预约（开始方式） ====================
+
+    onScheduleMode(e) {
+      const mode = (e.currentTarget.dataset.mode || 'now')
+      this.setData({ scheduleMode: mode })
+      // 高度变化 → 刷新滚动边界
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(400), 400)
+    },
+
+    onScheduleDayChange(e) {
+      this.setData({ scheduleDayIndex: e.detail.value })
+    },
+
+    onScheduleTimeChange(e) {
+      this.setData({ scheduleTime: e.detail.value || '' })
+    },
+
+    onCountdownMinInput(e) {
+      let v = parseInt(e.detail.value, 10)
+      if (isNaN(v) || v < 0) v = 0
+      if (v > 10079) v = 10079
+      this.setData({ countdownMin: v })
+    },
+
+    onCountdownSecInput(e) {
+      let v = parseInt(e.detail.value, 10)
+      if (isNaN(v) || v < 0) v = 0
+      if (v > 59) v = 59
+      this.setData({ countdownSec: v })
+    },
+
+    // 预约校验：返回错误文案（空串 = 通过）
+    _validateSchedule() {
+      if (!this.data.autoPrintEnabled) return ''
+      const { scheduleMode } = this.data
+      if (scheduleMode === 'at') {
+        const time = (this.data.scheduleTime || '').trim()
+        if (!time) return '请选择预约时间'
+        const m = /^(\d{1,2}):(\d{2})$/.exec(time)
+        if (!m) return '预约时间格式不正确'
+        const hh = parseInt(m[1], 10)
+        const mm = parseInt(m[2], 10)
+        if (hh > 23 || mm > 59) return '预约时间格式不正确'
+        const now = new Date()
+        const target = new Date(now.getFullYear(), now.getMonth(),
+          now.getDate() + this.data.scheduleDayIndex, hh, mm, 0, 0)
+        if (target.getTime() <= now.getTime()) return '预约时间已过，请重新选择'
+        return ''
+      }
+      if (scheduleMode === 'countdown') {
+        const min = parseInt(this.data.countdownMin, 10) || 0
+        const sec = parseInt(this.data.countdownSec, 10) || 0
+        if (min > 10079 || sec > 59) return '倒计时时长无效'
+        if (min === 0 && sec === 0) return '倒计时时长必须大于 0'
+        return ''
+      }
+      return ''
+    },
+
+    // 预约成功提示文案
+    _scheduleDisplayText() {
+      if (!this.data.autoPrintEnabled) return ''
+      if (this.data.scheduleMode === 'now') return '立即开始打印'
+      if (this.data.scheduleMode === 'at') {
+        return `${this.data.scheduleDays[this.data.scheduleDayIndex]} ${this.data.scheduleTime} 开始打印`
+      }
+      const min = parseInt(this.data.countdownMin, 10) || 0
+      const sec = parseInt(this.data.countdownSec, 10) || 0
+      return `${min} 分 ${sec} 秒后开始打印`
+    },
+
     onSubmit() {
       const { selectedFiles } = this.data
 
@@ -1704,6 +1784,13 @@ Component({
         }
       }
 
+      // 无障碍打印预约校验（指定时间已过 / 倒计时无效 → 拦截）
+      const scheduleErr = this._validateSchedule()
+      if (scheduleErr) {
+        wx.showToast({ title: scheduleErr, icon: 'none', duration: 2500 })
+        return
+      }
+
       this._doSubmit(false)
     },
 
@@ -1764,6 +1851,13 @@ Component({
           pickup_address: this.data.pickupAddress,
           skip_page_validation: skipPageValidation ? 1 : 0,
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
+          // 无障碍打印预约：now=立即 / at=指定时间（今天~大后天 + HH:MM）/ countdown=倒计时（分+秒）
+          schedule_mode: this.data.autoPrintEnabled ? this.data.scheduleMode : 'now',
+          schedule_day: this.data.autoPrintEnabled && this.data.scheduleMode === 'at' ? this.data.scheduleDayIndex : 0,
+          schedule_time: this.data.autoPrintEnabled && this.data.scheduleMode === 'at' ? this.data.scheduleTime : '',
+          countdown_seconds: this.data.autoPrintEnabled && this.data.scheduleMode === 'countdown'
+            ? (parseInt(this.data.countdownMin, 10) || 0) * 60 + (parseInt(this.data.countdownSec, 10) || 0)
+            : 0,
         },
         success: (submitRes) => {
           wx.hideLoading()
@@ -1784,6 +1878,7 @@ Component({
             submitting: false,
             showSuccessModal: true,
             lastOrderNumber: submitRes.data.order_number || '',
+            lastScheduleText: this._scheduleDisplayText(),
           })
           // 隐藏 tab 栏发丝线，让成功弹窗与 tab 栏融为一体
           try {

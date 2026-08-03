@@ -224,6 +224,38 @@
           </view>
         </view>
 
+        <!-- 无障碍打印开始方式（仅管理员，开关开启时显示） -->
+        <view wx:if="{{userRole === 'admin' && autoPrintEnabled}}" class="schedule-section {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.2s">
+          <view class="schedule-title">开始方式</view>
+          <view class="schedule-modes">
+            <view class="schedule-mode {{scheduleMode === 'now' ? 'active' : ''}}" data-mode="now" bindtap="onScheduleMode">立即开始</view>
+            <view class="schedule-mode {{scheduleMode === 'at' ? 'active' : ''}}" data-mode="at" bindtap="onScheduleMode">指定时间</view>
+            <view class="schedule-mode {{scheduleMode === 'countdown' ? 'active' : ''}}" data-mode="countdown" bindtap="onScheduleMode">倒计时</view>
+          </view>
+
+          <!-- 指定时间：日期（今天~大后天）+ 时间（精确到分） -->
+          <view wx:if="{{scheduleMode === 'at'}}" class="schedule-options">
+            <picker class="schedule-picker" mode="selector" range="{{scheduleDays}}" value="{{scheduleDayIndex}}" bindchange="onScheduleDayChange">
+              <view class="schedule-picker-value">{{scheduleDays[scheduleDayIndex]}}</view>
+            </picker>
+            <picker class="schedule-picker" mode="time" value="{{scheduleTime}}" bindchange="onScheduleTimeChange">
+              <view class="schedule-picker-value {{scheduleTime ? '' : 'placeholder'}}">{{scheduleTime || '选择时间'}}</view>
+            </picker>
+          </view>
+
+          <!-- 倒计时：分 + 秒 -->
+          <view wx:if="{{scheduleMode === 'countdown'}}" class="schedule-options">
+            <view class="countdown-input-wrap">
+              <input class="countdown-input" type="number" value="{{countdownMin}}" bindinput="onCountdownMinInput" />
+              <text class="countdown-unit">分</text>
+            </view>
+            <view class="countdown-input-wrap">
+              <input class="countdown-input" type="number" value="{{countdownSec}}" bindinput="onCountdownSecInput" />
+              <text class="countdown-unit">秒</text>
+            </view>
+          </view>
+        </view>
+
         <!-- Submit Button -->
         <view class="submit-area {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.2s">
           <button class="btn-primary" bindtap="onSubmit" hover-class="tap-active" loading="{{submitting}}" disabled="{{submitting}}">
@@ -258,7 +290,8 @@
     <view class="modal-icon-wrap">✓</view>
     <text class="title-medium" style="margin-bottom: 8rpx;">任务提交成功</text>
     <text wx:if="{{lastOrderNumber}}" class="order-number-modal">{{lastOrderNumber}}</text>
-    <text class="body-small">文件已上传，打印任务已创建</text>
+    <text wx:if="{{lastScheduleText}}" class="body-small schedule-success-text">{{lastScheduleText}}</text>
+    <text wx:else class="body-small">文件已上传，打印任务已创建</text>
     <view class="modal-buttons">
       <button class="btn-secondary modal-half-btn" bindtap="onCopyPrice" hover-class="tap-active">复制价格</button>
       <button class="btn-primary modal-half-btn" bindtap="onCopyDetailPrice" hover-class="tap-active">复制详细价格</button>

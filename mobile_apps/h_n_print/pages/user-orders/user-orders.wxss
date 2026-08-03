@@ -309,6 +309,9 @@
 .status-reserved  { background-color: #FFF8E1; color: #F57F17; }
 .status-rejected  { background-color: #FFF3E0; color: #E65100; }
 .status-canceled  { background-color: #F5F5F5; color: #9E9E9E; }
+.status-scheduled    { background-color: #FFF8E1; color: #F57F17; }
+.status-downloading  { background-color: #E3F2FD; color: #1565C0; }
+.status-waiting      { background-color: #FFF3E0; color: #E65100; }
 
 /* ── Detail (Expanded) ── */
 .order-card-detail {
@@ -449,6 +452,9 @@
 .file-status-mini.status-accepted { background-color: #E3F2FD; color: #1565C0; }
 .file-status-mini.status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
 .file-status-mini.status-rejected { background-color: #FFF3E0; color: #E65100; }
+.file-status-mini.status-scheduled   { background-color: #FFF8E1; color: #F57F17; }
+.file-status-mini.status-downloading { background-color: #E3F2FD; color: #1565C0; }
+.file-status-mini.status-waiting     { background-color: #FFF3E0; color: #E65100; }
 .file-status-mini.status-canceled { background-color: #F5F5F5; color: #9E9E9E; }
 
 /* Cancel button */

@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import math
+import re
 from datetime import datetime, timedelta
 from functools import wraps
 from urllib import request as urlrequest, parse as urlparse
@@ -473,6 +474,14 @@ def make_download_url(file_id):
     return f"{PUBLIC_BASE_URL}/api/download/{file_id}?t={token}"
 
 
+def _iso_to_ts(s):
+    """"%Y-%m-%d %H:%M:%S" → epoch 秒；解析失败返回 0"""
+    try:
+        return int(datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp())
+    except Exception:
+        return 0
+
+
 @app.route("/api/download/<file_id>")
 def download_file(file_id):
     """打印机客户端下载文件（用签名 token 验证）"""
@@ -782,6 +791,19 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # v19 迁移：无障碍打印预约形式（立即/指定时间/倒计时 → 折算为绝对时间 scheduled_at）
+    for col, col_type, default in [
+        ("schedule_mode", "TEXT", "'now'"),      # now | at | countdown
+        ("scheduled_at", "TEXT", "''"),          # 绝对时间 "%Y-%m-%d %H:%M:%S"，仅预约单有值
+        ("schedule_frozen", "INTEGER", "0"),     # 1 = 到点文件未就绪，已冻结暂停
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type} DEFAULT {default}")
+            conn.commit()
+            print(f"  已添加 orders.{col} 列")
+        except sqlite3.OperationalError:
+            pass
+
     # v5 迁移：订单文件子任务表（一次提交可包含多个文件，每个文件独立份数/状态）
     conn.execute(
         """
@@ -981,7 +1003,9 @@ def calculate_price(page_count, duplex):
 
 # 状态优先级：失败 > 打印中/排队中 > 已完成 > 被打回 > 已取消
 # 用于把多个子任务 (order_files) 的状态聚合为父订单 (orders) 的状态
-_STATUS_PRIORITY = {"failed": 8, "printing": 7, "accepted": 6, "offline_unknown": 5, "queued": 4, "sent": 3, "abandoned": 2, "rejected": 1, "canceled": 0}
+_STATUS_PRIORITY = {"failed": 9, "printing": 8, "waiting": 7, "accepted": 6,
+                    "downloading": 5, "offline_unknown": 5, "scheduled": 4, "queued": 4,
+                    "sent": 3, "abandoned": 2, "rejected": 1, "canceled": 0}
 
 
 def aggregate_order_status(conn, order_id):
@@ -1154,14 +1178,113 @@ def process_pending_orders():
         print(f"  [WAIT] 子任务 #{of_id}: 推送失败，保持排队")
 
 
-def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, page_range, client_id, auto_print=False):
-    """通过 SocketIO 推送子任务 (order_files) 到指定打印机客户端。
-    sub_task_id = order_files.id，推送后更新该子任务状态为 printing。
+def process_scheduled_orders():
+    """预约订单扫描（每 30s）：
+    - scheduled 子任务（阶段①文件尚未下发，如提交时打印机离线）→ 有在线客户端时下发文件（downloading）
+    - waiting 子任务且 scheduled_at 已到、未冻结 → 向拥有该文件的客户端发 start_print 兜底
+      （本地通常已按 scheduled_ts 自触发，此信号为幂等冗余，用于恢复/兜底）
+    """
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
+               of.copies, of.page_range, of.duplex, of.status AS of_status,
+               of.operator_client,
+               o.auto_print, o.schedule_mode, o.scheduled_at, o.schedule_frozen
+        FROM order_files of
+        JOIN orders o ON of.order_id = o.id
+        WHERE of.status IN ('scheduled', 'waiting')
+          AND o.schedule_mode != 'now'
+        ORDER BY of.created_at ASC
+        """
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return
 
-    关键顺序：先在数据库中把子任务标记为 printing（并登记 pushed_tasks），
-    再通过 SocketIO emit。这样即使 emit 之后客户端来不及回报，数据库状态
-    也是一致的；若数据库写失败（锁等），任务保持 queued 不会被推送，避免
-    出现"客户端已处理但数据库仍 queued"的幽灵任务。"""
+    active_clients = get_active_clients()
+    now = datetime.now()
+
+    for row in rows:
+        order_id = row["order_id"]
+
+        if row["of_status"] == "scheduled":
+            # 阶段①：文件下发
+            if not active_clients:
+                continue
+            file_id = row["file_id"]
+            if not file_id:
+                continue
+            conn = get_db()
+            frow = conn.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
+            conn.close()
+            if not frow or not os.path.exists(frow["path"]):
+                # 文件已被清理 → 标记失败
+                conn = get_db()
+                _retry_on_lock(
+                    conn.execute,
+                    "UPDATE order_files SET status = 'failed' WHERE id = ?",
+                    (row["of_id"],),
+                )
+                refresh_order_status(conn, order_id)
+                _retry_on_lock(conn.commit)
+                conn.close()
+                continue
+            push_print_task_to_client(row["of_id"], file_id, row["file_name"],
+                                      row["copies"], row["duplex"] or "on",
+                                      row["page_range"] or "", active_clients[0],
+                                      auto_print=True,
+                                      scheduled_download=True,
+                                      schedule_mode=row["schedule_mode"],
+                                      scheduled_at=row["scheduled_at"] or "",
+                                      schedule_frozen=row["schedule_frozen"])
+
+        elif row["of_status"] == "waiting":
+            # 阶段②兜底：到点且未冻结 → 发 start_print（本地通常已自触发，幂等）
+            if row["schedule_frozen"]:
+                continue
+            sat = row["scheduled_at"] or ""
+            if not sat:
+                continue
+            try:
+                target = datetime.strptime(sat, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if target > now:
+                continue
+            client_id = row["operator_client"] or (active_clients[0] if active_clients else None)
+            if not client_id:
+                continue
+            with printer_clients_lock:
+                info = printer_clients.get(client_id)
+                sid = info["sid"] if info else None
+            if not sid:
+                continue
+            try:
+                socketio.emit("start_print", {
+                    "order_id": order_id,
+                    "task_ids": [row["of_id"]],
+                    "scheduled_at": sat,
+                    "scheduled_ts": _iso_to_ts(sat),
+                }, to=sid)
+            except Exception as e:
+                print(f"  [FAIL] 预约单 #{row['of_id']} start_print 兜底推送失败: {e}")
+
+
+def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, page_range, client_id,
+                              auto_print=False, scheduled_download=False,
+                              schedule_mode="now", scheduled_at="", schedule_frozen=0):
+    """通过 SocketIO 推送子任务 (order_files) 到指定打印机客户端。
+    sub_task_id = order_files.id。
+
+    - 普通推送：子任务 queued → printing（登记 pushed_tasks，3 分钟超时兜底）。
+    - scheduled_download=True（预约单阶段①）：子任务 scheduled → downloading，仅下发文件
+      提前下载（把 scheduled_at 一并带给本地，本地到点自触发打印），不登记 pushed_tasks，
+      避免"提前下发文件"被 3 分钟打印超时误杀。
+
+    关键顺序：先在数据库中把子任务标记状态（并登记 pushed_tasks），再通过 SocketIO emit。
+    这样即使 emit 之后客户端来不及回报，数据库状态也是一致的；若数据库写失败（锁等），
+    任务保持原状态不会被推送，避免"客户端已处理但数据库仍旧状态"的幽灵任务。"""
     if not file_id:
         return False
 
@@ -1170,10 +1293,16 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
     with db_lock:
         conn = get_db_conn()
         try:
-            cur = conn.execute(
-                "UPDATE order_files SET status = 'printing', operator_client = ? WHERE id = ? AND status = 'queued'",
-                (client_id, sub_task_id),
-            )
+            if scheduled_download:
+                cur = conn.execute(
+                    "UPDATE order_files SET status = 'downloading', operator_client = ? WHERE id = ? AND status = 'scheduled'",
+                    (client_id, sub_task_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE order_files SET status = 'printing', operator_client = ? WHERE id = ? AND status = 'queued'",
+                    (client_id, sub_task_id),
+                )
             # cur.rowcount == 0 表示该任务已不是 queued（正被其他流程处理或已结束）→ 跳过
             if cur.rowcount == 0:
                 print(f"  [SKIP] 子任务 #{sub_task_id}: 非 queued 状态，跳过推送")
@@ -1192,11 +1321,13 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             conn.close()
 
     # 2. 登记推送等待反馈（必须在 emit 之前登记，避免回调先到导致漏清理）
-    with pushed_tasks_lock:
-        pushed_tasks[sub_task_id] = {   # key = order_files.id
-            "pushed_at": datetime.now(),
-            "client_id": client_id,
-        }
+    #    预约阶段①只下发文件不等待打印反馈，不登记（否则 3 分钟未打印会被超时误杀）
+    if not scheduled_download:
+        with pushed_tasks_lock:
+            pushed_tasks[sub_task_id] = {   # key = order_files.id
+                "pushed_at": datetime.now(),
+                "client_id": client_id,
+            }
 
     # 3. 取出客户端 sid 并 emit
     with printer_clients_lock:
@@ -1225,6 +1356,11 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
         "file_name": file_name,          # 原始文件名（含扩展名）
         "source_md5": "",               # 由后续代码填充
         "auto_print": auto_print,       # 无障碍打印：本地工具收到后自动建标签页并开始打印
+        # 预约打印（无障碍打印的预约形式）：阶段①先下发文件，本地到 scheduled_ts 再开始打印
+        "schedule_mode": schedule_mode,          # now | at | countdown
+        "scheduled_at": scheduled_at,            # 绝对时间 "%Y-%m-%d %H:%M:%S"
+        "scheduled_ts": _iso_to_ts(scheduled_at) if scheduled_at else 0,  # epoch 秒
+        "schedule_frozen": int(schedule_frozen or 0),
         "options": {
             "copies": copies,
             "duplex": duplex or "on",
@@ -1256,14 +1392,20 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             task_msg["source_md5"] = row["md5"]
 
     if not sid:
-        # 客户端刚断开：回滚为 queued，等下次扫描重试
+        # 客户端刚断开：预约单回退 scheduled，普通单回退 queued，等下次扫描重试
         with db_lock:
             conn = get_db_conn()
             try:
-                conn.execute(
-                    "UPDATE order_files SET status = 'queued' WHERE id = ? AND status = 'printing'",
-                    (sub_task_id,),
-                )
+                if scheduled_download:
+                    conn.execute(
+                        "UPDATE order_files SET status = 'scheduled' WHERE id = ? AND status = 'downloading'",
+                        (sub_task_id,),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE order_files SET status = 'queued' WHERE id = ? AND status = 'printing'",
+                        (sub_task_id,),
+                    )
                 if order_id:
                     refresh_order_status(conn, order_id)
                 conn.commit()
@@ -1272,8 +1414,9 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
                 raise
             finally:
                 conn.close()
-        with pushed_tasks_lock:
-            pushed_tasks.pop(sub_task_id, None)
+        if not scheduled_download:
+            with pushed_tasks_lock:
+                pushed_tasks.pop(sub_task_id, None)
         print(f"  [WAIT] 子任务 #{sub_task_id}: 客户端已离线，保持排队")
         return False
 
@@ -1283,14 +1426,20 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
         return True
     except Exception as e:
         print(f"  [FAIL] 子任务 #{sub_task_id}: 推送失败: {e}")
-        # emit 失败：回滚为 queued，清理登记
+        # emit 失败：预约单回退 scheduled，普通单回退 queued，清理登记
         with db_lock:
             conn = get_db_conn()
             try:
-                conn.execute(
-                    "UPDATE order_files SET status = 'queued' WHERE id = ? AND status = 'printing'",
-                    (sub_task_id,),
-                )
+                if scheduled_download:
+                    conn.execute(
+                        "UPDATE order_files SET status = 'scheduled' WHERE id = ? AND status = 'downloading'",
+                        (sub_task_id,),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE order_files SET status = 'queued' WHERE id = ? AND status = 'printing'",
+                        (sub_task_id,),
+                    )
                 if order_id:
                     refresh_order_status(conn, order_id)
                 conn.commit()
@@ -1299,8 +1448,9 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
                 raise
             finally:
                 conn.close()
-        with pushed_tasks_lock:
-            pushed_tasks.pop(sub_task_id, None)
+        if not scheduled_download:
+            with pushed_tasks_lock:
+                pushed_tasks.pop(sub_task_id, None)
         return False
 
 
@@ -1389,6 +1539,42 @@ def recover_orphaned_printing_tasks():
             print(f"[ORPHAN] 文件不存在，{len(fail_ids)} 个孤儿任务标记为 failed")
 
 
+def recover_stale_downloading():
+    """预约单兜底：downloading 子任务的领取客户端已不在线（如服务端重启漏了 disconnect
+    事件）→ 回退 scheduled，等 process_scheduled_orders 重新下发。基于客户端在线状态判断，
+    避免误伤慢速大文件下载。"""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, order_id, operator_client FROM order_files WHERE status = 'downloading'"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return
+
+    active = set(get_active_clients())
+    with db_lock:
+        conn2 = get_db_conn()
+        try:
+            conn2.execute("BEGIN IMMEDIATE")
+            changed = False
+            for r in rows:
+                if r["operator_client"] not in active:
+                    conn2.execute(
+                        "UPDATE order_files SET status = 'scheduled', operator_client = '' WHERE id = ?",
+                        (r["id"],),
+                    )
+                    refresh_order_status(conn2, r["order_id"])
+                    changed = True
+            conn2.commit()
+            if changed:
+                print(f"[RECOVER] {len(rows)} 个 downloading 子任务的客户端已不在线，回退 scheduled")
+        except Exception:
+            conn2.rollback()
+            raise
+        finally:
+            conn2.close()
+
+
 # ==================== SocketIO 事件 ====================
 
 
@@ -1474,6 +1660,22 @@ def on_disconnect(reason=None):
                         refresh_order_status(conn, r["order_id"])
                     print(f"[RECOVER] 客户端 {client_id} 断开，已回滚 {len(rows)} 个任务")
 
+                # 预约单：文件下载中的子任务回退 scheduled（文件未接收完，可重新下发）
+                dl_rows = conn.execute(
+                    "SELECT id, order_id FROM order_files WHERE status = 'downloading' AND operator_client = ?",
+                    (client_id,)
+                ).fetchall()
+                if dl_rows:
+                    dl_ids = [str(r["id"]) for r in dl_rows]
+                    dl_placeholders = ",".join("?" for _ in dl_rows)
+                    conn.execute(
+                        f"UPDATE order_files SET status = 'scheduled', operator_client = '' WHERE id IN ({dl_placeholders})",
+                        dl_ids
+                    )
+                    for r in dl_rows:
+                        refresh_order_status(conn, r["order_id"])
+                    print(f"[RECOVER] 客户端 {client_id} 断开，{len(dl_rows)} 个下载中子任务回退 scheduled")
+
                 # 已接受但未打印的任务：标记为"断线未知"
                 accepted_rows = conn.execute(
                     "SELECT id, order_id FROM order_files WHERE status = 'accepted' AND operator_client = ?",
@@ -1532,7 +1734,7 @@ def on_print_success(data):
 
     conn = get_db()
     conn.execute(
-        "UPDATE order_files SET status = 'sent' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown')",
+        "UPDATE order_files SET status = 'sent' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading')",
         (task_id,),
     )
     # 获取父订单 ID 并刷新聚合状态
@@ -1571,6 +1773,151 @@ def on_print_fail(data):
 
     with pushed_tasks_lock:
         pushed_tasks.pop(task_id, None)
+
+
+# ==================== 预约打印（无障碍打印的预约形式） ====================
+
+
+def _find_client_id_by_sid(sid):
+    """根据 SocketIO sid 反查 client_id（断线处理同款逻辑）"""
+    with printer_clients_lock:
+        for cid, info in printer_clients.items():
+            if info["sid"] == sid:
+                return cid
+    return None
+
+
+def _all_subtasks_ready(conn, order_id):
+    """该预约订单的所有子任务是否已全部就绪（waiting/sent 等，无 downloading/scheduled/failed）"""
+    rows = conn.execute(
+        "SELECT status FROM order_files WHERE order_id = ?", (order_id,)
+    ).fetchall()
+    if not rows:
+        return False
+    return all(r["status"] in ("waiting", "sent", "accepted", "offline_unknown") for r in rows)
+
+
+@socketio.on("file_ready")
+def on_file_ready(data):
+    """预约单阶段①文件下载完成：downloading → waiting。
+    若该订单之前被冻结（到点文件未就绪），且本任务补齐后全部就绪 → 解除冻结，
+    重设 scheduled_at = now + 30s 缓冲，并向本地发 start_print 让其按新目标倒计时/打印。"""
+    task_ids = data.get("task_ids") or data.get("task_id")
+    if isinstance(task_ids, int):
+        task_ids = [task_ids]
+    if not task_ids:
+        return
+    task_ids = [int(t) for t in task_ids]
+    order_id = data.get("order_id")
+
+    resume_target = None
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for tid in task_ids:
+                conn.execute(
+                    "UPDATE order_files SET status = 'waiting' WHERE id = ? AND status = 'downloading'",
+                    (tid,),
+                )
+                row = conn.execute("SELECT order_id FROM order_files WHERE id = ?", (tid,)).fetchone()
+                if row and row["order_id"]:
+                    refresh_order_status(conn, row["order_id"])
+            if order_id:
+                o = conn.execute(
+                    "SELECT schedule_mode, schedule_frozen FROM orders WHERE id = ?", (order_id,)
+                ).fetchone()
+                if o and o["schedule_mode"] != "now" and o["schedule_frozen"] and _all_subtasks_ready(conn, order_id):
+                    new_target = datetime.now() + timedelta(seconds=30)
+                    new_target_str = new_target.strftime("%Y-%m-%d %H:%M:%S")
+                    conn.execute(
+                        "UPDATE orders SET schedule_frozen = 0, scheduled_at = ? WHERE id = ?",
+                        (new_target_str, order_id),
+                    )
+                    resume_target = new_target_str
+                    print(f"  [RESUME] 订单 #{order_id} 冻结解除，重设 {new_target_str}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    if resume_target and order_id:
+        emit("start_print", {"order_id": order_id, "task_ids": task_ids,
+                             "scheduled_at": resume_target,
+                             "scheduled_ts": _iso_to_ts(resume_target)})
+    print(f"  [READY] 预约单文件就绪: {task_ids}")
+
+
+@socketio.on("download_delayed")
+def on_download_delayed(data):
+    """预约单到点文件未就绪 → 冻结订单（暂停倒计时）。
+    本地文件补齐后会重新发 file_ready，届时解除冻结并重设目标。"""
+    task_ids = data.get("task_ids") or data.get("task_id")
+    if isinstance(task_ids, int):
+        task_ids = [task_ids]
+    order_id = data.get("order_id")
+    if not order_id:
+        return
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            o = conn.execute(
+                "SELECT schedule_mode FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if o and o["schedule_mode"] != "now":
+                conn.execute(
+                    "UPDATE orders SET schedule_frozen = 1, scheduled_at = '' WHERE id = ?",
+                    (order_id,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    print(f"  [FREEZE] 订单 #{order_id} 到点文件未就绪，已冻结")
+    emit("download_delayed_ack", {"order_id": order_id, "frozen": 1})
+
+
+@socketio.on("start_printing")
+def on_start_printing(data):
+    """预约单本地工具到点开始打印：waiting/downloading → printing，并登记 pushed_tasks
+    启用 3 分钟超时兜底（与普通单一致）。断网时本地也可能直接打完后报 print_success，
+    那时走 print_success 的 waiting 兼容分支。"""
+    task_ids = data.get("task_ids") or data.get("task_id")
+    if isinstance(task_ids, int):
+        task_ids = [task_ids]
+    if not task_ids:
+        return
+    task_ids = [int(t) for t in task_ids]
+    client_id = _find_client_id_by_sid(request.sid)
+
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for tid in task_ids:
+                conn.execute(
+                    "UPDATE order_files SET status = 'printing', operator_client = ? WHERE id = ? AND status IN ('waiting', 'downloading')",
+                    (client_id or "", tid),
+                )
+                row = conn.execute("SELECT order_id FROM order_files WHERE id = ?", (tid,)).fetchone()
+                if row and row["order_id"]:
+                    refresh_order_status(conn, row["order_id"])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    with pushed_tasks_lock:
+        for tid in task_ids:
+            pushed_tasks[tid] = {"pushed_at": datetime.now(), "client_id": client_id or ""}
+    print(f"  [START] 预约单开始打印: {task_ids}")
 
 
 @socketio.on("page_count_result")
@@ -2094,6 +2441,35 @@ def submit_order():
     pickup_address = data.get("pickup_address", "")
     auto_print = int(data.get("auto_print", 0) or 0)  # 无障碍打印：提交后自动开始打印
 
+    # ---- 无障碍打印预约：立即/指定时间/倒计时 → 折算为绝对时间 scheduled_at ----
+    schedule_mode = (data.get("schedule_mode", "now") or "now").strip()
+    if schedule_mode not in ("now", "at", "countdown"):
+        schedule_mode = "now"
+    scheduled_at = ""
+    if schedule_mode == "at":
+        # 指定时间：日期（0=今天 1=明天 2=后天 3=大后天）+ HH:MM
+        schedule_day = int(data.get("schedule_day", 0) or 0)
+        schedule_time = (data.get("schedule_time", "") or "").strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})$", schedule_time)
+        if not m:
+            return jsonify({"success": False, "message": "请选择预约时间"}), 400
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if hh > 23 or mm > 59 or schedule_day not in (0, 1, 2, 3):
+            return jsonify({"success": False, "message": "预约时间格式不正确"}), 400
+        target = (datetime.now() + timedelta(days=schedule_day)).replace(
+            hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= datetime.now():
+            return jsonify({"success": False, "message": "预约时间已过，请重新选择"}), 400
+        scheduled_at = target.strftime("%Y-%m-%d %H:%M:%S")
+    elif schedule_mode == "countdown":
+        # 倒计时：___分___秒
+        countdown_seconds = int(data.get("countdown_seconds", 0) or 0)
+        if countdown_seconds <= 0:
+            return jsonify({"success": False, "message": "倒计时时长必须大于 0"}), 400
+        scheduled_at = (datetime.now() + timedelta(seconds=countdown_seconds)).strftime("%Y-%m-%d %H:%M:%S")
+    if schedule_mode != "now":
+        auto_print = 1  # 预约本质上是无障碍自动打印
+
     # ---- 兼容旧格式：单文件字段转为新格式数组 ----
     if files_input is None:
         file_id = data.get("file_id", "")
@@ -2135,15 +2511,17 @@ def submit_order():
                                    page_count, price_per_page, total_price, is_free,
                                    delivery_enabled, delivery_location, delivery_percentage,
                                    urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-                                   order_number, source, auto_print)
+                                   order_number, source, auto_print,
+                                   schedule_mode, scheduled_at, schedule_frozen)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?, ?, ?, 0)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              0,  # is_free 恒为 0 — 价格仅用于统计
              delivery_enabled, delivery_location, delivery_percentage,
              urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-             order_number, 1 if auto_print else 0),
+             order_number, 1 if auto_print else 0,
+             schedule_mode, scheduled_at),
             # is_free 恒为 0 — 价格仅用于统计，无免费策略
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -2196,8 +2574,9 @@ def submit_order():
             is_free_val = 0  # 价格仅用于统计，无免费策略
             per_copy_price = calculate_price(page_count, f_duplex)
             total_price = round(per_copy_price * f_copies, 2)  # 始终计算真实价格，is_free 控制是否收费
-            # 统一从 queued 开始，由 push_print_task_to_client 原子锁定为 printing
-            sub_status = "queued"
+            # 普通单从 queued 开始，由 push_print_task_to_client 原子锁定为 printing；
+            # 预约单从 scheduled 开始，阶段①下发文件时为 downloading（不进 queued，避免被普通链路误分发）
+            sub_status = "scheduled" if schedule_mode != "now" else "queued"
             reject_reason = ""
 
             # 若页数已确认，立即校验页码范围
@@ -2279,6 +2658,18 @@ def submit_order():
             client_id = active_clients[0]
             for st in sub_tasks:
                 if st["file_id"]:
+                    if schedule_mode != "now":
+                        # 预约单：阶段①先下发文件（downloading + 预约时间），本地到点再自动打印。
+                        # 推送失败则保持 scheduled，等 process_scheduled_orders 扫描重试。
+                        if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
+                                                      st["copies"], st.get("duplex", duplex),
+                                                      st.get("page_range", ""), client_id,
+                                                      auto_print=True,
+                                                      scheduled_download=True,
+                                                      schedule_mode=schedule_mode,
+                                                      scheduled_at=scheduled_at):
+                            pushed_count += 1
+                        continue
                     if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
                                                   st["copies"], st.get("duplex", duplex),
                                                   st.get("page_range", ""), client_id,
@@ -2443,7 +2834,8 @@ def get_orders():
         SELECT id, file_id, file, copies, status, created_at, openid, duplex,
                page_count, is_free, total_price, order_number,
                delivery_enabled, delivery_location, delivery_percentage,
-               urgency, urgency_price, cover_page, cover_page_price, pickup_address
+               urgency, urgency_price, cover_page, cover_page_price, pickup_address,
+               schedule_mode, scheduled_at, schedule_frozen
         FROM orders
         WHERE {where_clause}
         ORDER BY id DESC
@@ -2531,7 +2923,8 @@ def get_order_detail(order_id):
                o.page_count, o.is_free, o.total_price,
                o.delivery_enabled, o.delivery_location, o.delivery_percentage,
                o.urgency, o.urgency_price, o.cover_page, o.cover_page_price,
-               o.pickup_address
+               o.pickup_address,
+               o.schedule_mode, o.scheduled_at, o.schedule_frozen
         FROM orders o
         WHERE o.id = ? AND o.openid = ?
         """,
@@ -4131,6 +4524,49 @@ def admin_statistics_revenue():
     })
 
 
+@app.route("/api/admin/statistics/months", methods=["GET"])
+def admin_statistics_months():
+    """按月份统计订单/文件数与收益（printer token 鉴权），供收支清算云端模块自动列出月份。
+    收益口径沿用 revenue 接口：of.status='sent' 的 total_price 合计。
+    """
+    token = request.args.get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT strftime('%Y-%m', o.created_at) AS month,
+                      COUNT(DISTINCT o.id) AS order_count,
+                      COUNT(of.id) AS file_count,
+                      SUM(CASE WHEN of.status = 'sent' THEN of.total_price ELSE 0 END) AS revenue
+               FROM orders o
+               INNER JOIN order_files of ON o.id = of.order_id
+               WHERE o.created_at IS NOT NULL
+               GROUP BY month
+               ORDER BY month"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    months = []
+    for row in rows:
+        month = row["month"]
+        try:
+            y, m = month.split("-")
+            label = f"{int(y)}年{int(m)}月"
+        except Exception:
+            label = month
+        months.append({
+            "month": month,
+            "label": label,
+            "orders": row["order_count"] or 0,
+            "files": row["file_count"] or 0,
+            "revenue": round(row["revenue"] or 0.0, 2),
+        })
+    return jsonify({"success": True, "data": {"months": months}})
+
+
 def recover_stale_printing_tasks():
     """启动时清理孤立的 printing 子任务。
 
@@ -4245,13 +4681,15 @@ if __name__ == "__main__":
     print("数据库已初始化")
 
     scheduler.add_job(process_pending_orders, "interval", seconds=30, id="scan_orders")
+    scheduler.add_job(process_scheduled_orders, "interval", seconds=30, id="scan_scheduled")
     scheduler.add_job(check_printing_timeout, "interval", seconds=60, id="check_timeout")
     scheduler.add_job(cleanup_expired_license_keys, "interval", minutes=10, id="cleanup_licenses")
     scheduler.add_job(cleanup_expired_files, "interval", minutes=10, id="cleanup_files")
     scheduler.add_job(recover_orphaned_printing_tasks, "interval", minutes=2, id="recover_orphans")
+    scheduler.add_job(recover_stale_downloading, "interval", minutes=2, id="recover_stale_downloads")
     scheduler.add_job(cleanup_abandoned_reserved_orders, "interval", minutes=5, id="cleanup_reserved")
     scheduler.start()
-    print("定时扫描已启动（任务扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
+    print("定时扫描已启动（任务扫描每 30s，预约扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
 
     socketio.run(app, host="127.0.0.1", port=5000,
                  debug=True, use_reloader=False,

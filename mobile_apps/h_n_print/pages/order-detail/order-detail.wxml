@@ -22,6 +22,7 @@
       <!-- 状态标签 -->
       <view class="status-bar">
         <text class="status-tag status-{{order.status}}">{{statusMap[order.status] || order.status}}</text>
+        <text wx:if="{{order.scheduleText}}" class="schedule-detail-text">{{order.scheduleText}}</text>
       </view>
 
       <!-- 文件列表（多文件模式下每个文件一张卡片） -->

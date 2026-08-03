@@ -93,5 +93,5 @@ project.private.config.json
 财务报表/
 
 # 财务统计用户数据（含真实姓名/收支）
-local_print_tool/finance/打印项目数据.json
+local_print_tool/finance/print_data.json
 财务统计/

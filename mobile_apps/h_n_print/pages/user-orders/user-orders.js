@@ -44,6 +44,9 @@ Component({
       rejected: '被打回',
       canceled: '已取消',
       reserved: '已预留',
+      scheduled: '已预约',
+      downloading: '文件传输中',
+      waiting: '等待打印',
     },
   },
 

@@ -88,6 +88,11 @@ class CloudTask:
         self.cover_page: bool = bool(data.get("cover_page", False))
         self.cover_page_price: float = float(data.get("cover_page_price", 0.15) or 0.15)
         self.auto_print: bool = bool(data.get("auto_print", False))  # 无障碍打印
+        # 无障碍打印预约形式：now | at | countdown（'now' 即立即开始）
+        self.schedule_mode: str = data.get("schedule_mode", "now") or "now"
+        self.scheduled_at: str = data.get("scheduled_at", "") or ""     # 绝对时间 "%Y-%m-%d %H:%M:%S"
+        self.scheduled_ts: int = int(data.get("scheduled_ts", 0) or 0)  # epoch 秒，本地到点自触发
+        self.schedule_frozen: bool = bool(data.get("schedule_frozen", False))
 
     def to_dict(self) -> dict:
         return {
@@ -132,6 +137,7 @@ class CloudClient(QObject):
     connection_changed = Signal(bool)     # True=已连接, False=已断开
     status_message = Signal(str)          # 日志消息
     order_canceled = Signal(int, list)    # int=order_id, list=task_ids — 订单被用户取消
+    start_print = Signal(int, int, list)  # 预约单到点/解除冻结：order_id, scheduled_ts, task_ids
 
     def __init__(
         self,
@@ -287,22 +293,61 @@ class CloudClient(QObject):
         return task
 
     def report_success(self, task_id: int):
-        """上报打印成功到云端。"""
+        """上报打印成功到云端。断线时暂存离线队列，联网后补报。"""
         if self._sio and self._connected:
             try:
                 self._sio.emit("print_success", {"task_id": task_id})
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印成功")
             except Exception as e:
                 logger.warning(f"上报 print_success 失败: {e}")
+        else:
+            self._queue_status_sync(0, "sent", task_id=task_id)
 
     def report_fail(self, task_id: int, error: str):
-        """上报打印失败到云端。"""
+        """上报打印失败到云端。断线时暂存离线队列，联网后补报。"""
         if self._sio and self._connected:
             try:
                 self._sio.emit("print_fail", {"task_id": task_id, "error": error})
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印失败 — {error}")
             except Exception as e:
                 logger.warning(f"上报 print_fail 失败: {e}")
+        else:
+            self._queue_status_sync(0, "failed", task_id=task_id)
+
+    # ── 预约打印上报 ──
+
+    def _sio_emit(self, event: str, data: dict) -> bool:
+        """线程安全的 SocketIO 事件发送（断线静默返回 False）。"""
+        sio = self._sio
+        if sio is None or not self._connected:
+            return False
+        try:
+            sio.emit(event, data)
+            return True
+        except Exception as e:
+            logger.warning(f"emit {event} 失败: {e}")
+            return False
+
+    def report_file_ready(self, order_id: int, task_ids: list):
+        """预约单阶段①文件下载完成 → 后端 downloading→waiting（冻结时自动解除）。"""
+        if not order_id or not task_ids:
+            return
+        if self._sio_emit("file_ready", {"order_id": order_id, "task_ids": task_ids}):
+            self.status_message.emit(f"☁ 预约单 #{order_id} 文件就绪已上报")
+
+    def report_download_delayed(self, order_id: int, task_ids: list):
+        """预约单到点文件未就绪 → 后端冻结订单（暂停倒计时）。"""
+        if not order_id:
+            return
+        if self._sio_emit("download_delayed", {"order_id": order_id, "task_ids": task_ids}):
+            self.status_message.emit(f"☁ 预约单 #{order_id} 到点未就绪，已上报冻结")
+
+    def report_start_printing(self, order_id: int, task_ids: list):
+        """预约单到点开始打印 → 后端 waiting→printing（启用 3 分钟超时兜底）。"""
+        if not order_id or not task_ids:
+            return
+        if self._sio_emit("start_printing", {"order_id": order_id, "task_ids": task_ids}):
+            self.status_message.emit(f"☁ 预约单 #{order_id} 已到点开始打印")
 
     # ── 离线状态同步 ──
 
@@ -310,8 +355,8 @@ class CloudClient(QObject):
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
         return os.path.join(d, "status_queue.json")
 
-    def _queue_status_sync(self, order_id: int, status: str):
-        """离线时将状态变更暂存到本地队列。"""
+    def _queue_status_sync(self, order_id: int, status: str, task_id: int = 0):
+        """离线时将状态变更暂存到本地队列。task_id 供 sent/failed 回放时精确定位子任务。"""
         import json as _json
         path = self._status_queue_path()
         queue = []
@@ -321,7 +366,11 @@ class CloudClient(QObject):
                     queue = _json.load(f)
             except Exception:
                 queue = []
-        queue.append({"order_id": order_id, "status": status, "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+        item = {"order_id": order_id, "status": status,
+                "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        if task_id:
+            item["task_id"] = task_id
+        queue.append(item)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             _json.dump(queue, f, ensure_ascii=False, indent=2)
@@ -367,11 +416,12 @@ class CloudClient(QObject):
             status = item["status"]
             order_id = item["order_id"]
             if status in ("sent", "failed"):
-                # print_success/print_fail 通过 SocketIO 发送
+                # print_success/print_fail 通过 SocketIO 发送（task_id 优先，回退 order_id）
                 if self._sio and self._connected:
                     try:
+                        task_id = item.get("task_id") or order_id
                         self._sio.emit("print_success" if status == "sent" else "print_fail",
-                                      {"task_id": order_id})
+                                      {"task_id": task_id})
                     except Exception:
                         remaining.append(item)
                 else:
@@ -498,6 +548,19 @@ class CloudClient(QObject):
                 )
                 # 自动开始下载
                 self.accept_task(task.task_id)
+
+        @self._sio.on("start_print")
+        def _on_start_print(data):
+            """预约单到点 / 解除冻结：后端发来开始打印指令（含新的目标时间）。
+            本地通常已按 scheduled_ts 自触发，此信号用于冻结解除/兜底，GUI 侧幂等处理。"""
+            order_id = data.get("order_id")
+            task_ids = data.get("task_ids") or []
+            if isinstance(task_ids, int):
+                task_ids = [task_ids]
+            scheduled_ts = int(data.get("scheduled_ts", 0) or 0)
+            self.start_print.emit(order_id, scheduled_ts, [int(t) for t in task_ids])
+            self.status_message.emit(f"☁ 预约单 #{order_id} 收到开始打印指令"
+                                     + (f"（目标 {scheduled_ts}）" if scheduled_ts else ""))
 
         @self._sio.on("analyze_page_count")
         def _on_analyze_page_count(data):
@@ -644,6 +707,7 @@ class CloudClient(QObject):
                 self.status_message.emit(
                     f"☁ 缓存命中 #{task_id}: {task.file_name} (MD5={task.source_md5[:8]}...，跳过下载)"
                 )
+                self._report_file_ready_if_scheduled(task)
                 return
 
         try:
@@ -698,12 +762,22 @@ class CloudClient(QObject):
             self.status_message.emit(
                 f"☁ 下载完成 #{task_id}: {original_name} ({os.path.getsize(dest)} bytes)"
             )
+            self._report_file_ready_if_scheduled(task)
 
         except Exception as e:
             task.status = "error"
             task.error_message = str(e)
             self.task_updated.emit(task)
             self.status_message.emit(f"☁ 下载失败 #{task_id}: {e}")
+
+    def _report_file_ready_if_scheduled(self, task: CloudTask):
+        """预约单文件下载完成 → 上报 file_ready（后端 downloading→waiting，冻结时自动解除）。
+        断线时静默跳过，由本地冻结自恢复逻辑兜底。"""
+        if task.order_id and getattr(task, "schedule_mode", "now") != "now":
+            try:
+                self.report_file_ready(task.order_id, [task.task_id])
+            except Exception as e:
+                logger.warning(f"上报 file_ready 异常: {e}")
 
     # ── PDF 缓存（MD5 绑定，默认 7 天自动清理）──
 

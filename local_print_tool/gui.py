@@ -1405,6 +1405,24 @@ class MainWindow(QMainWindow):
         # 无障碍打印：按订单收集自动任务，防抖后批量创建标签页并自动开始打印
         self._auto_print_queue: dict[int, list[CloudTask]] = {}  # order_id → tasks
         self._auto_print_timers: dict[int, QTimer] = {}          # order_id → debounce timer
+        # 无障碍打印预约单（指定时间/倒计时）：到点才自动打印的状态机
+        # order_id → {
+        #   "target_ts": int,          # 预约起点 epoch（来自任务 scheduled_ts）
+        #   "ready": {},               # task_id → CloudTask（已下载完成）
+        #   "pending": {},             # task_id → CloudTask（已到达，下载中）
+        #   "timer": QTimer | None,    # 3s 防抖（到达/就绪静默后评估）
+        #   "print_timer": QTimer | None,  # 到点打印倒计时
+        #   "frozen": bool,            # 到点文件未就绪已冻结
+        #   "delayed_sent": bool,      # 已上报 download_delayed
+        #   "printed": bool,           # 已开始打印（防重）
+        #   "tab_key": str | None,     # 已创建的标签页
+        # }
+        self._scheduled_orders: dict[int, dict] = {}
+        self._cloud_connected: bool = False  # 云端连接状态（预约冻结自恢复判断用）
+        self._scheduled_check_timer = QTimer(self)
+        self._scheduled_check_timer.setInterval(1000)
+        self._scheduled_check_timer.timeout.connect(self._check_scheduled_timeouts)
+        self._scheduled_check_timer.start()
 
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
@@ -1462,6 +1480,7 @@ class MainWindow(QMainWindow):
         self._cloud_client.connection_changed.connect(self._on_cloud_connection_changed)
         self._cloud_client.status_message.connect(self._on_cloud_status_message)
         self._cloud_client.order_canceled.connect(self._on_cloud_order_canceled)
+        self._cloud_client.start_print.connect(self._on_cloud_start_print)
 
         # 初始化云端任务列表窗口（非模态，复用）
         self._cloud_task_window = CloudTaskListWindow(self)
@@ -1491,8 +1510,9 @@ class MainWindow(QMainWindow):
             )
             self._stats_server.start_in_thread()
 
-        url = self._stats_server.url
-        logger.info(f"打开收支清算页面: {url}")
+        # 附加启动令牌：收支清算 HTML 要求每次启动的随机 token 才能访问
+        url = f"{self._stats_server.url}/?token={self._stats_server.launch_token}"
+        logger.info(f"打开收支清算页面: {self._stats_server.url}")
         QDesktopServices.openUrl(QUrl(url))
 
     def _on_cloud_settings(self):
@@ -2674,9 +2694,10 @@ class MainWindow(QMainWindow):
 
     def _update_total_cost(self):
         """更新合计费用标签（含附加服务）。"""
+        jobs = self._get_current_jobs()
         base_total = 0.0
         all_known = True
-        for job in self._get_current_jobs():
+        for job in jobs:
             cost, _ = calc_cost(job.page_count, job.copies, job.duplex,
                                 self._config.simplex_price, self._config.duplex_price,
                                 job.page_range)
@@ -2688,6 +2709,17 @@ class MainWindow(QMainWindow):
         total = base_total + extra
         prefix = "≈ " if not all_known else ""
         self._total_label.setText(f"合计: {prefix}¥{total:.2f}")
+        # 标签页无文件时不支持复制价格/明细（复制冷却期内保持禁用）
+        if not jobs:
+            if self._copy_total_btn:
+                self._copy_total_btn.setEnabled(False)
+            if self._copy_detail_btn:
+                self._copy_detail_btn.setEnabled(False)
+        elif not (self._copy_total_timer and self._copy_total_timer.isActive()):
+            if self._copy_total_btn:
+                self._copy_total_btn.setEnabled(True)
+            if self._copy_detail_btn:
+                self._copy_detail_btn.setEnabled(True)
 
     def _on_table_double_click(self, row: int, col: int):
         """双击表格行 → 用默认程序打开文件。"""
@@ -3452,6 +3484,8 @@ class MainWindow(QMainWindow):
 
     def _on_copy_total(self):
         """复制合计金额到剪贴板（含订单号）。"""
+        if not self._get_current_jobs():
+            return  # 标签页无文件时不复制价格（首页费等附加费不构成独立价格）
         order_number = self._ensure_order_number()
         text = self._total_label.text()
         # 去掉"合计: "前缀和"≈ "前缀，保留 ¥ 符号
@@ -3473,15 +3507,16 @@ class MainWindow(QMainWindow):
             pass  # 金额无效时不复制
 
     def _reset_copy_button(self):
-        """恢复复制按钮为可点击状态。"""
+        """恢复复制按钮为可点击状态（无文件时保持禁用）。"""
         if self._copy_total_timer and self._copy_total_timer.isActive():
             self._copy_total_timer.stop()
+        has_jobs = bool(self._get_current_jobs())
         if self._copy_total_btn:
             self._copy_total_btn.setText("📋 复制")
-            self._copy_total_btn.setEnabled(True)
+            self._copy_total_btn.setEnabled(has_jobs)
         if self._copy_detail_btn:
             self._copy_detail_btn.setText("📋 复制计费明细")
-            self._copy_detail_btn.setEnabled(True)
+            self._copy_detail_btn.setEnabled(has_jobs)
 
     def _on_toggle_detail(self, checked: bool):
         """展开/收起计费明细复制按钮。"""
@@ -3872,7 +3907,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v3.1</h3>"
+            "<h3>HN 本地打印工具 v4.0</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -4096,9 +4131,14 @@ class MainWindow(QMainWindow):
         if task.task_id in self._processed_cloud_tasks:
             return  # 已处理过，跳过（防 SocketIO + HTTP 双通道重复）
         self._cloud_tasks[task.task_id] = task
+        is_scheduled = task.auto_print and getattr(task, "schedule_mode", "now") != "now"
         self._log(f"☁ 收到云端任务 #{task.task_id}: {task.file_name}"
-                  + (" ⚡无障碍" if task.auto_print else ""))
-        if task.status == "ready":
+                  + (" ⚡无障碍" if task.auto_print else "")
+                  + (" ⏰预约" if is_scheduled else ""))
+        if is_scheduled:
+            # 预约单：进入预约状态机（到点才自动打印）
+            self._register_scheduled_task(task)
+        elif task.status == "ready":
             if task.auto_print:
                 self._enqueue_auto_print_task(task)
             elif self._cloud_task_window:
@@ -4109,6 +4149,10 @@ class MainWindow(QMainWindow):
         if task.status == "ready" and task.task_id in self._processed_cloud_tasks:
             return  # 已处理过
         self._cloud_tasks[task.task_id] = task
+        # 预约单状态更新走预约状态机
+        if task.order_id in self._scheduled_orders:
+            self._update_scheduled_task(task)
+            return
         if task.status == "error":
             if task.task_id in self._processed_cloud_tasks:
                 # 任务已被用户打回/接受，迟到的下载失败不再上报后端，
@@ -4196,11 +4240,260 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"⚠ 无障碍打印：标签页 {self._current_tab} 无文件，跳过")
 
+    # ──────── 无障碍打印预约单（指定时间/倒计时 → 到点自动打印，冻结等待）────────
+
+    @staticmethod
+    def _fmt_sched(ts: int) -> str:
+        """epoch 秒 → "MM-DD HH:MM:SS" 本地时间（用于预约倒计时日志）。"""
+        try:
+            from datetime import datetime as _dt
+            return _dt.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
+        except Exception:
+            return str(ts)
+
+    def _register_scheduled_task(self, task: CloudTask):
+        """预约单任务到达：登记到状态机，按订单防抖后评估。"""
+        oid = task.order_id
+        if not oid:
+            self._log(f"⚠ 预约任务 #{task.task_id} 缺少 order_id，跳过")
+            return
+        st = self._scheduled_orders.setdefault(oid, {
+            "target_ts": 0, "ready": {}, "pending": {},
+            "timer": None, "print_timer": None,
+            "frozen": False, "delayed_sent": False, "printed": False,
+            "printed_ts": 0, "tab_key": None, "retry_count": 0,
+        })
+        if st["printed"]:
+            self._log(f"⏰ 预约单 #{oid} 已开始打印，迟到的文件 {task.file_name} 将不再自动打印")
+        if task.task_id not in st["pending"] and task.task_id not in st["ready"]:
+            st["pending"][task.task_id] = task
+        ts = getattr(task, "scheduled_ts", 0) or 0
+        if ts and (not st["target_ts"] or ts < st["target_ts"]):
+            st["target_ts"] = ts
+        self._log(f"⏰ 预约单 #{oid}: 收到文件 {task.file_name}"
+                  + (f"，目标 {self._fmt_sched(ts)}" if ts else ""))
+        self._restart_scheduled_debounce(oid)
+
+    def _update_scheduled_task(self, task: CloudTask):
+        """预约单任务状态更新（下载完成/出错）。"""
+        oid = task.order_id
+        st = self._scheduled_orders.get(oid)
+        if not st:
+            return
+        if task.status == "error":
+            self._processed_cloud_tasks.add(task.task_id)
+            st["pending"].pop(task.task_id, None)
+            st["ready"].pop(task.task_id, None)
+            self._log(f"⏰ 预约单 #{oid} 文件下载失败: {task.error_message}")
+            if self._cloud_client:
+                self._cloud_client.report_fail(task.task_id, f"下载失败: {task.error_message}")
+                self._cloud_client.reject_task(task.task_id)
+            self._cloud_tasks.pop(task.task_id, None)
+            self._cleanup_scheduled_order(oid, reason="文件下载失败")
+            return
+        if task.status == "ready":
+            st["pending"].pop(task.task_id, None)
+            st["ready"][task.task_id] = task
+            total = len(st["pending"]) + len(st["ready"])
+            self._log(f"⏰ 预约单 #{oid}: 文件 {task.file_name} 已就绪"
+                      + (f"（{len(st['ready'])}/{total}）" if st["pending"] else ""))
+            if not st["printed"]:
+                self._restart_scheduled_debounce(oid)
+
+    def _restart_scheduled_debounce(self, order_id: int):
+        """重启预约单 3s 防抖（新任务到达/就绪都会重置，静默后评估）。"""
+        st = self._scheduled_orders.get(order_id)
+        if not st:
+            return
+        old = st["timer"]
+        if old:
+            old.stop()
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.timeout.connect(lambda o=order_id: self._evaluate_scheduled_order(o))
+        t.start(3000)
+        st["timer"] = t
+
+    def _evaluate_scheduled_order(self, order_id: int):
+        """预约单评估：全部就绪才排入到点打印；到点未齐则冻结等待。"""
+        st = self._scheduled_orders.get(order_id)
+        if not st or st["printed"]:
+            return
+        now = int(time.time())
+        ready_tasks = list(st["ready"].values())
+        pending = st["pending"]
+
+        if pending:
+            # 仍有文件未下载完成 → 取消已排的打印，等待；到点则冻结
+            if st["print_timer"]:
+                st["print_timer"].stop()
+                st["print_timer"] = None
+            if st["target_ts"] and now >= st["target_ts"] and not st["frozen"] and not st["delayed_sent"]:
+                self._freeze_scheduled_order(order_id, pending)
+            return
+
+        # 全部就绪
+        if not ready_tasks:
+            return
+        if not st["tab_key"]:
+            # 首次全部就绪 → 创建标签页（后续新增文件追加）。
+            # 注意：预约单不走 accept_order（会误把父订单标成 accepted），
+            # 后端状态由 file_ready → waiting、start_printing → printing 驱动。
+            self._log(f"⏰ 预约单 #{order_id}: 全部 {len(ready_tasks)} 个文件就绪")
+            for t in ready_tasks:
+                self._processed_cloud_tasks.add(t.task_id)
+            self._add_cloud_tasks_to_new_tab(ready_tasks)
+            st["tab_key"] = self._current_tab
+
+        if st["frozen"]:
+            # 冻结已解除（文件补齐）：在线等后端 start_print 重设目标；断网则 30s 自恢复
+            if not self._cloud_connected and not st["print_timer"]:
+                self._log(f"⏰ 预约单 #{order_id}: 断网自恢复，30s 后开始打印")
+                self._start_scheduled_print_timer(order_id, now + 30)
+            return
+
+        # 未冻结 → 排入到点打印倒计时
+        target = st["target_ts"] or now
+        self._start_scheduled_print_timer(order_id, target)
+
+    def _freeze_scheduled_order(self, order_id: int, pending: dict):
+        """到点文件未就绪 → 本地冻结 + 上报后端（冻结等待，文件齐后继续）。"""
+        st = self._scheduled_orders.get(order_id)
+        if not st:
+            return
+        st["frozen"] = True
+        st["delayed_sent"] = True
+        self._log(f"⏰ 预约单 #{order_id}: 到点仍有 {len(pending)} 个文件未就绪，冻结等待")
+        if self._cloud_client:
+            self._cloud_client.report_download_delayed(order_id, list(pending.keys()))
+
+    def _check_scheduled_timeouts(self):
+        """每秒检查：
+        - 预约单到点仍有文件未下载完 → 冻结上报（不必等下载完成事件）
+        - 已打印完成的预约单保留 1 小时后清理（防迟到文件二次打印期间需保留状态）"""
+        now = int(time.time())
+        for order_id, st in list(self._scheduled_orders.items()):
+            if st["printed"]:
+                # 打印完成已超 1 小时 → 清理（迟到文件窗口已过）
+                if st["printed_ts"] and now - st["printed_ts"] > 3600:
+                    self._cleanup_scheduled_order(order_id)
+                continue
+            if not st["pending"]:
+                continue
+            if st["target_ts"] and now >= st["target_ts"] and not st["frozen"] and not st["delayed_sent"]:
+                self._freeze_scheduled_order(order_id, st["pending"])
+
+    def _start_scheduled_print_timer(self, order_id: int, target_ts: int):
+        """在 target_ts（已过则立即）触发预约单打印。"""
+        st = self._scheduled_orders.get(order_id)
+        if not st or st["printed"]:
+            return
+        old = st["print_timer"]
+        if old:
+            old.stop()
+        now = int(time.time())
+        delay = max(0, target_ts - now)
+        t = QTimer(self)
+        t.setSingleShot(True)
+        t.timeout.connect(lambda o=order_id: self._fire_scheduled_print(o))
+        if delay > 0:
+            t.start(delay * 1000)
+            self._log(f"⏰ 预约单 #{order_id}: 已排入 {self._fmt_sched(target_ts)} 自动打印")
+        else:
+            t.start(0)
+            self._log(f"⏰ 预约单 #{order_id}: 目标时间已过，立即打印")
+        st["print_timer"] = t
+
+    def _fire_scheduled_print(self, order_id: int):
+        """预约单到点：确认文件全部就绪后开始打印。打印机正忙则 10s 后重试，保证打出来。"""
+        st = self._scheduled_orders.get(order_id)
+        if not st or st["printed"]:
+            return
+        if st["pending"]:
+            # 到点仍有文件未就绪 → 冻结（正常情况下不会走到：就绪后才排入倒计时）
+            if not st["delayed_sent"]:
+                self._freeze_scheduled_order(order_id, st["pending"])
+            return
+        ready_tasks = list(st["ready"].values())
+        if not ready_tasks:
+            self._cleanup_scheduled_order(order_id, reason="无就绪文件")
+            return
+
+        # 确保标签页存在
+        if not st["tab_key"]:
+            for t in ready_tasks:
+                self._processed_cloud_tasks.add(t.task_id)
+            self._add_cloud_tasks_to_new_tab(ready_tasks)
+            st["tab_key"] = self._current_tab
+        else:
+            self._current_tab = st["tab_key"]
+
+        # 打印机正忙 → 10s 后重试（最多 60 次 ≈ 10 分钟），保证预约单不丢
+        if self._worker and self._worker.isRunning():
+            retry = st.get("retry_count", 0) + 1
+            st["retry_count"] = retry
+            if retry > 60:
+                self._log(f"⚠ 预约单 #{order_id}: 打印机持续忙碌，放弃自动打印，请手动在标签页打印")
+                return
+            self._log(f"⏰ 预约单 #{order_id}: 打印机正忙，10s 后重试（第 {retry} 次）")
+            old = st["print_timer"]
+            if old:
+                old.stop()
+            t = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(lambda o=order_id: self._fire_scheduled_print(o))
+            t.start(10000)
+            st["print_timer"] = t
+            return
+
+        st["printed"] = True
+        st["printed_ts"] = int(time.time())
+        self._log(f"⚡ 无障碍预约打印：订单 #{order_id} 共 {len(ready_tasks)} 个文件，开始打印")
+        jobs = self._get_current_jobs()
+        if jobs:
+            self._start_print_worker(list(jobs))
+        else:
+            self._log(f"⚠ 无障碍预约打印：标签页 {self._current_tab} 无文件，跳过")
+        if self._cloud_client:
+            self._cloud_client.report_start_printing(order_id, [t.task_id for t in ready_tasks])
+
+    def _on_cloud_start_print(self, order_id: int, scheduled_ts: int, task_ids: list):
+        """后端 start_print：到点兜底 / 冻结解除后重设目标。本地已自触发则幂等跳过。"""
+        if not order_id:
+            return
+        st = self._scheduled_orders.get(order_id)
+        if not st:
+            return
+        if st["printed"]:
+            return
+        if scheduled_ts:
+            st["target_ts"] = scheduled_ts
+        st["frozen"] = False
+        if st["pending"]:
+            # 仍有文件未就绪 → 继续等待（全部就绪后重新评估）
+            self._restart_scheduled_debounce(order_id)
+        else:
+            self._evaluate_scheduled_order(order_id)
+
+    def _cleanup_scheduled_order(self, order_id: int, reason: str = ""):
+        """清理预约单状态机（失败/取消/超时未使用）。已打印的订单保留状态防迟到文件二次打印。"""
+        st = self._scheduled_orders.pop(order_id, None)
+        if not st:
+            return
+        for t in (st["timer"], st["print_timer"]):
+            if t:
+                t.stop()
+        if reason:
+            self._log(f"⏰ 预约单 #{order_id} 已结束: {reason}")
+
     def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
         """云端订单被用户取消 → 通知任务列表窗口更新状态，若正在打印则立即取消。"""
         self._log(f"☁ 订单 #{order_id} 已被用户取消")
         if self._cloud_task_window:
             self._cloud_task_window.mark_canceled(order_id, task_ids)
+        # 预约单被取消 → 清理预约状态机（停掉到点倒计时）
+        if order_id in self._scheduled_orders:
+            self._cleanup_scheduled_order(order_id, reason="已被用户取消")
 
         # 检查当前打印的任务是否包含被取消的 task_id → 立即终止打印
         cancel_current_print = False
@@ -4246,6 +4539,7 @@ class MainWindow(QMainWindow):
 
     def _on_cloud_connection_changed(self, connected: bool):
         """云端连接状态改变。连线后同步本地离线订单到云端。"""
+        self._cloud_connected = connected
         self._update_cloud_status()
         if connected:
             self._sync_local_orders_to_cloud()

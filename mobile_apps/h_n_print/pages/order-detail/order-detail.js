@@ -19,6 +19,9 @@ Component({
       rejected: '被打回',
       canceled: '已取消',
       reserved: '已预留',
+      scheduled: '已预约',
+      downloading: '文件传输中',
+      waiting: '等待打印',
     },
   },
   lifetimes: {
@@ -73,6 +76,13 @@ Component({
               order.files.forEach(f => {
                 f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
               })
+            }
+            // 预约打印：显示预约开始时间
+            if (order.schedule_mode && order.schedule_mode !== 'now' && order.scheduled_at) {
+              const parts = String(order.scheduled_at).split(' ')
+              order.scheduleText = '⏰ 预约 ' + (parts[1] || order.scheduled_at) + ' 自动打印'
+            } else {
+              order.scheduleText = ''
             }
             this.setData({
               order: order,

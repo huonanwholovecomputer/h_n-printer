@@ -1,0 +1,1889 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>打印项目 · 收支清算</title>
+<style>
+/* 注册自定义颜色属性：主题切换时 header 渐变等可平滑过渡（Chromium/Safari/新 Firefox 支持） */
+@property --header-from { syntax: '<color>'; inherits: true; initial-value: #23244d; }
+@property --header-to   { syntax: '<color>'; inherits: true; initial-value: #3b2f7d; }
+
+/* ==================== 设计令牌 ==================== */
+:root {
+  --bg: #f3f4f8; --bg-soft: #eef0f5; --card: #ffffff; --card-2: #f8f9fc;
+  --text: #1b1d2a; --muted: #6b7280; --border: #e3e6ee; --border-strong: #d3d7e2;
+  --primary: #4f6ef7; --primary-strong: #3d5bf0; --primary-soft: #eef1ff;
+  --green: #16a34a; --orange: #f59e0b; --pos: #16a34a; --neg: #e11d48;
+  --shadow-sm: 0 1px 2px rgba(20,22,40,.06);
+  --shadow-md: 0 8px 26px rgba(20,22,40,.09);
+  --shadow-lg: 0 20px 55px rgba(20,22,40,.20);
+  --radius: 14px; --radius-sm: 9px;
+  --header-from: #23244d; --header-to: #3b2f7d;
+  color-scheme: light;
+}
+[data-theme="dark"] {
+  --bg: #0f1117; --bg-soft: #141722; --card: #1a1d29; --card-2: #202431;
+  --text: #e8eaf2; --muted: #9aa1b5; --border: #262b3b; --border-strong: #343b4f;
+  --primary: #6c86ff; --primary-strong: #8aa0ff; --primary-soft: rgba(108,134,255,.15);
+  --green: #34d399; --orange: #fbbf24; --pos: #34d399; --neg: #fb7185;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,.35);
+  --shadow-md: 0 8px 26px rgba(0,0,0,.40);
+  --shadow-lg: 0 20px 55px rgba(0,0,0,.55);
+  --header-from: #16182a; --header-to: #2a2450;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  font-family: 'Segoe UI','Microsoft YaHei',-apple-system,sans-serif;
+  background: var(--bg); color: var(--text);
+  font-size: 14px; line-height: 1.55;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ==================== 顶栏 ==================== */
+.app-header {
+  position: sticky; top: 0; z-index: 60;
+  background: linear-gradient(135deg, var(--header-from), var(--header-to));
+  color: #fff;
+  box-shadow: 0 4px 20px rgba(15,15,40,.25);
+}
+.header-inner {
+  max-width: 1180px; margin: 0 auto; padding: 12px 20px 0;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+.app-header h1 { font-size: 1.18rem; font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
+.app-header h1 .logo { font-size: 1.5rem; }
+.header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cloud-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 12px; border-radius: 999px; font-size: .78rem; font-weight: 600;
+  background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18);
+}
+.cloud-pill.ok { color: #b9f6ca; background: rgba(34,197,94,.18); border-color: rgba(34,197,94,.4); }
+.cloud-pill.bad { color: #ffb4c2; background: rgba(244,63,94,.18); border-color: rgba(244,63,94,.4); }
+.cloud-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.icon-btn {
+  background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.18);
+  color: #fff; width: 34px; height: 34px; border-radius: 9px; cursor: pointer;
+  font-size: 1rem; display: inline-flex; align-items: center; justify-content: center;
+  transition: transform .18s ease, background .2s ease;
+}
+.icon-btn:hover { transform: translateY(-1px) scale(1.05); background: rgba(255,255,255,.2); }
+.path-text { font-size: .74rem; color: rgba(255,255,255,.62); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ==================== Tab 导航 ==================== */
+.tab-nav {
+  max-width: 1180px; margin: 0 auto; padding: 8px 20px 10px;
+  display: flex; gap: 4px; overflow-x: auto;
+}
+.tab-nav button {
+  flex: none; display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 15px; border: none; border-radius: 10px;
+  background: transparent; color: rgba(255,255,255,.78); cursor: pointer;
+  font-size: .86rem; font-weight: 500; font-family: inherit; white-space: nowrap;
+  transition: background .2s ease, color .2s ease, transform .15s ease;
+}
+.tab-nav button:hover { background: rgba(255,255,255,.13); color: #fff; transform: translateY(-1px); }
+.tab-nav button.on { background: #fff; color: var(--header-from); font-weight: 700; box-shadow: 0 3px 12px rgba(0,0,0,.2); }
+.tab-nav button .ico { font-size: 1.02rem; }
+
+/* ==================== 主区域 ==================== */
+main { max-width: 1180px; margin: 0 auto; padding: 20px 20px 60px; }
+.tab { display: none; }
+.tab.on { display: block; }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* ==================== 卡片与区块 ==================== */
+.section {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 20px 22px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
+  transition: box-shadow .25s ease, transform .25s ease;
+}
+.section:hover { box-shadow: var(--shadow-md); }
+.section h2 { font-size: 1.02rem; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.section h2 .hint { font-weight: 400; font-size: .8rem; color: var(--muted); }
+
+.kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+.kpi-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px 18px; box-shadow: var(--shadow-sm); position: relative; overflow: hidden;
+}
+.kpi-card::before { content:''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; border-radius: 0 3px 3px 0; }
+.kpi-card.c-blue::before { background: var(--primary); }
+.kpi-card.c-green::before { background: var(--green); }
+.kpi-card.c-orange::before { background: var(--orange); }
+.kpi-card.c-red::before { background: var(--neg); }
+.kpi-card .kpi-ico { font-size: 1.2rem; }
+.kpi-card .num { font-size: 1.55rem; font-weight: 800; line-height: 1.25; letter-spacing: -.3px; }
+.kpi-card .lbl { font-size: .74rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: 3px; }
+.kpi-card .sub { font-size: .76rem; color: var(--muted); margin-top: 3px; }
+
+/* ==================== 表格 ==================== */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .86rem; }
+th, td { padding: 10px 14px; text-align: center; border-bottom: 1px solid var(--border); }
+th { background: var(--card-2); font-weight: 600; font-size: .8rem; color: var(--muted); }
+td.l { text-align: left; }
+tbody tr { transition: background .15s ease; }
+tbody tr:hover { background: var(--card-2); }
+.tfoot td { font-weight: 700; background: var(--card-2); border-top: 2px solid var(--border); }
+.pos { color: var(--pos); font-weight: 700; }
+.neg { color: var(--neg); font-weight: 700; }
+
+/* ==================== 按钮 / 表单 ==================== */
+.btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 8px 16px; border: 1px solid var(--border-strong); border-radius: 9px; cursor: pointer;
+  font-size: .85rem; font-weight: 500; font-family: inherit; background: var(--card); color: var(--text);
+  transition: all .18s ease; position: relative; overflow: hidden;
+}
+.btn:hover { border-color: var(--primary); color: var(--primary); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+.btn:active { transform: translateY(0); }
+.btn.pri { background: var(--primary); color: #fff; border-color: transparent; }
+.btn.pri:hover { background: var(--primary-strong); color: #fff; box-shadow: 0 6px 16px rgba(79,110,247,.35); }
+.btn.danger { color: var(--neg); border-color: rgba(225,29,72,.45); }
+.btn.danger:hover { background: rgba(225,29,72,.08); color: var(--neg); border-color: var(--neg); }
+.btn.green { background: var(--green); color: #fff; border-color: transparent; }
+.btn.green:hover { background: #0f9d50; color: #fff; box-shadow: 0 6px 16px rgba(22,163,74,.3); }
+.btn.sm { padding: 4px 11px; font-size: .78rem; border-radius: 7px; }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.btn.ghost:hover { color: var(--text); background: var(--card-2); }
+.btn:disabled { opacity: .45; cursor: not-allowed; transform: none !important; }
+
+.input, input[type=text], input[type=number], input[type=password], input[type=date], input[type=color], select {
+  padding: 8px 12px; border: 1px solid var(--border-strong); border-radius: 9px;
+  font-size: .88rem; font-family: inherit; background: var(--card); color: var(--text);
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+.input:focus, input:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+input[type=number] { width: 110px; }
+input[type=date] { width: 150px; }
+input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+input[type=range] { accent-color: var(--primary); }
+/* 滑块聚焦/拖动时不套用通用 input 聚焦的 box-shadow 方框 */
+input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-shadow: none; }
+
+.filter-bar {
+  display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap;
+  padding: 16px 18px; margin-bottom: 16px;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm);
+}
+.filter-bar .f-item label { display: block; font-size: .78rem; font-weight: 600; color: var(--muted); margin-bottom: 5px; }
+.status-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.status-dot.sent { background: #16a34a; } .status-dot.printing { background: #4f6ef7; }
+.status-dot.queued { background: #f59e0b; } .status-dot.failed { background: #dc2626; }
+.status-dot.canceled { background: #9ca3af; } .status-dot.offline_unknown { background: #8b5cf6; }
+.status-dot.rejected { background: #991b1b; } .status-dot.accepted { background: #6366f1; }
+.status-dot.abandoned { background: #d97706; } .status-dot.reserved { background: #a1a1aa; }
+
+/* ==================== 标签 ==================== */
+.tag { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .74rem; font-weight: 600; }
+.tag.g { background: rgba(22,163,74,.13); color: var(--pos); }
+.tag.r { background: rgba(225,29,72,.12); color: var(--neg); }
+.tag.b { background: rgba(79,110,247,.13); color: var(--primary); }
+.tag.y { background: rgba(245,158,11,.16); color: #b45309; }
+[data-theme="dark"] .tag.y { color: #fbbf24; }
+.tag.p { background: rgba(139,92,246,.15); color: #8b5cf6; }
+[data-theme="dark"] .tag.p { color: #a78bfa; }
+.member-tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: .82rem; font-weight: 600; color: #fff; box-shadow: var(--shadow-sm); }
+.member-del { cursor: pointer; opacity: .65; font-size: 1rem; transition: opacity .15s ease; }
+.member-del:hover { opacity: 1; }
+.unlock-badge { display: inline-flex; align-items: center; gap: 8px; background: rgba(22,163,74,.1); border: 1px solid rgba(22,163,74,.3); color: var(--pos); padding: 5px 12px; border-radius: 999px; font-size: .8rem; font-weight: 600; }
+.lock-bar {
+  display: flex; align-items: center; gap: 14px; justify-content: space-between; flex-wrap: wrap;
+  background: var(--primary-soft); border: 1px dashed var(--primary);
+  padding: 10px 16px; border-radius: 10px; margin-bottom: 14px; font-size: .85rem;
+}
+
+/* ==================== 转账指令 ==================== */
+.settle-box { background: var(--card-2); border: 2px solid var(--orange); border-radius: var(--radius); padding: 20px; margin-top: 18px; }
+.settle-box h2 { color: var(--orange); margin-bottom: 12px; }
+.transfer { display: flex; align-items: center; gap: 10px; padding: 9px 0; font-size: 1.02rem; }
+.transfer .arrow { font-size: 1.25rem; color: var(--muted); }
+.transfer .amount { font-weight: 800; font-size: 1.15rem; color: var(--pos); }
+
+/* ==================== 图表 ==================== */
+.chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+.chart-grid .section { margin-bottom: 0; }
+.chart-wrap { position: relative; width: 100%; height: 270px; }
+.chart-wrap.tall { height: 330px; }
+.chart-wrap canvas { width: 100% !important; height: 100% !important; }
+
+/* ==================== 模态框 ==================== */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 200; background: rgba(15,15,35,.5); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+  opacity: 0; transition: opacity .2s ease;
+}
+.modal-backdrop.in { opacity: 1; }
+.modal-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); width: 100%; max-width: 420px; padding: 22px;
+  transform: scale(.94) translateY(8px); transition: transform .22s cubic-bezier(.2,.9,.3,1.3);
+}
+.modal-backdrop.in .modal-card { transform: scale(1) translateY(0); }
+.modal-card h3 { font-size: 1.05rem; margin-bottom: 12px; }
+.modal-card .modal-body { margin-bottom: 18px; font-size: .9rem; }
+.modal-card .modal-body input, .modal-card .modal-body select { width: 100%; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+
+/* ==================== Toast ==================== */
+#toastWrap { position: fixed; bottom: 26px; right: 26px; z-index: 300; display: flex; flex-direction: column; gap: 10px; align-items: flex-end; }
+.toast {
+  background: var(--text); color: var(--bg); padding: 11px 20px; border-radius: 11px;
+  font-size: .85rem; font-weight: 500; box-shadow: var(--shadow-lg);
+  animation: toastIn .3s cubic-bezier(.2,.9,.3,1.2) both; max-width: 340px;
+}
+.toast.error { background: var(--neg); color: #fff; }
+.toast.success { background: var(--green); color: #fff; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(16px) scale(.92); } to { opacity: 1; transform: none; } }
+.toast.out { transition: all .3s ease; opacity: 0; transform: translateY(10px); }
+
+/* ==================== 空状态 / 骨架屏 ==================== */
+.empty { text-align: center; padding: 60px 20px; color: var(--muted); }
+.empty .ico { font-size: 3rem; margin-bottom: 8px; }
+.skeleton { background: linear-gradient(100deg, var(--card-2) 40%, var(--border) 50%, var(--card-2) 60%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; border-radius: 8px; }
+@keyframes shimmer { to { background-position: -200% 0; } }
+.loading-spin { display: inline-block; width: 18px; height: 18px; border: 2.5px solid var(--border-strong); border-top-color: var(--primary); border-radius: 50%; animation: spin .65s linear infinite; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ==================== 订单明细 ==================== */
+.order-row { cursor: pointer; }
+.order-row.expanded { background: var(--primary-soft); }
+.file-sub-row { background: var(--card-2); font-size: .8rem; }
+.file-sub-row td { padding: 6px 14px 6px 36px; color: var(--muted); }
+.expand-icon { display: inline-block; transition: transform .2s ease; font-size: .68rem; margin-right: 4px; color: var(--muted); }
+.order-row.expanded .expand-icon { transform: rotate(90deg); }
+.bound-badge { font-size: .7rem; padding: 1px 8px; border-radius: 999px; font-weight: 600; }
+.bound-badge.yes { background: rgba(22,163,74,.13); color: var(--pos); }
+.bound-badge.no { background: var(--card-2); color: var(--muted); }
+
+/* ==================== 设置行 ==================== */
+.settings-row { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.settings-row:last-child { border-bottom: none; }
+.settings-row label { min-width: 96px; font-weight: 600; font-size: .88rem; }
+
+/* ==================== 离线阻断层 ==================== */
+#blockOverlay {
+  position: fixed; inset: 0; z-index: 400; background: var(--bg);
+  display: none; align-items: center; justify-content: center; flex-direction: column; gap: 14px; text-align: center; padding: 24px;
+}
+#blockOverlay.show { display: flex; animation: fadeIn .3s ease; }
+#blockOverlay .ico { font-size: 56px; }
+#blockOverlay h2 { color: var(--text); }
+#blockOverlay p { color: var(--muted); max-width: 380px; }
+
+/* ==================== 响应式 ==================== */
+@media (max-width: 760px) {
+  .chart-grid { grid-template-columns: 1fr; }
+  .kpi-grid { grid-template-columns: 1fr 1fr; }
+  .header-inner { flex-direction: column; align-items: flex-start; }
+  .header-right { margin-left: 0; width: 100%; }
+}
+
+/* 主题切换瞬间：全页平滑渐变过渡（仅切换时启用，平时不生效以免影响悬停等微交互速度） */
+html.theme-switching, html.theme-switching *,
+html.theme-switching *::before, html.theme-switching *::after {
+  transition: background-color .5s ease, color .5s ease, border-color .5s ease,
+              box-shadow .5s ease, --header-from .5s ease, --header-to .5s ease !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
+}
+</style>
+<!-- Chart.js 本地优先，CDN 兜底 -->
+<script src="chart.umd.min.js"></script>
+<script>if (!window.Chart) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js'; document.head.appendChild(s); }</script>
+</head>
+<body>
+<header class="app-header">
+  <div class="header-inner">
+    <h1><span class="logo">🖨️</span> 打印项目 · 收支清算</h1>
+    <div class="header-right">
+      <span class="cloud-pill" id="cloudPill"><span class="dot"></span> 检测中…</span>
+      <button class="icon-btn" id="themeToggle" title="切换主题">🌙</button>
+      <span class="path-text" id="storageFilePath">☁ 云端</span>
+    </div>
+  </div>
+  <nav class="tab-nav" id="tabNav">
+    <button class="on" data-tab="dash"><span class="ico">📊</span>总览</button>
+    <button data-tab="entry"><span class="ico">📝</span>记账</button>
+    <button data-tab="cloud"><span class="ico">📡</span>云端</button>
+    <button data-tab="history"><span class="ico">📅</span>历史</button>
+    <button data-tab="settings"><span class="ico">⚙️</span>设置</button>
+    <button data-tab="about"><span class="ico">ℹ️</span>关于</button>
+  </nav>
+</header>
+
+<main>
+  <div class="tab on" id="tab-dash"></div>
+  <div class="tab" id="tab-entry"></div>
+  <div class="tab" id="tab-cloud"></div>
+  <div class="tab" id="tab-history"></div>
+  <div class="tab" id="tab-settings"></div>
+  <div class="tab" id="tab-about"></div>
+</main>
+
+<div id="toastWrap"></div>
+<div id="modalRoot"></div>
+
+<div id="blockOverlay">
+  <div class="ico">☁️</div>
+  <h2>无法连接云端</h2>
+  <p id="blockMsg">收支清算需要连接云端才能使用，请检查云端连接后重试。</p>
+  <button class="btn pri" id="blockRetry">🔄 重试</button>
+</div>
+
+<script>
+/* ==================== 启动令牌（由本地打印工具服务器注入） ==================== */
+var LAUNCH_TOKEN = '__LAUNCH_TOKEN__';
+function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type': 'application/json' }; }
+
+/* ==================== 常量 ==================== */
+var DEFAULT_MEMBERS = [
+  { id: 'hn', name: '成员A', color: '#4472C4' },
+  { id: 'yyx', name: '成员B', color: '#548235' },
+  { id: 'ych', name: '成员C', color: '#ED7D31' },
+];
+var DEFAULT_SCORE_CAP = 15;
+var DEFAULT_RATE = 0.05;
+var DEFAULT_PASSWORDS = { score: '123456', expense: '123456', income: '123456', settings: '123456' };
+var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', settings: '设置' };
+
+/* ==================== 存储层 ==================== */
+function _saveToServer(data) {
+  return fetch('/api/proxy/finance/config', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ data: data }) })
+    .then(function (r) { return r.json(); })
+    .then(function (res) { return !!(res && res.success); })
+    .catch(function () { return false; });
+}
+function _loadFromServer() {
+  return fetch('/api/proxy/finance/config', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) { return (res && res.success) ? { ok: true, data: res.data } : { ok: false, message: (res && res.message) || '获取配置失败' }; })
+    .catch(function (e) { return { ok: false, message: String(e) }; });
+}
+function _loadFromLocalFile() {
+  return fetch('/api/local/data', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) { return (res && res.success && res.data) ? res.data : null; })
+    .catch(function () { return null; });
+}
+
+/* ==================== 全局状态 ==================== */
+var STORE = migrateConfig(null);
+var currentKey = currentMonthKey();
+var currentTab = 'dash';
+var unlocked = { score: false, expense: false, income: false, settings: false };
+
+/* ==================== 数据模型 / 迁移 ==================== */
+function migrateConfig(data) {
+  if (!data) data = { config: {}, records: null, notes: null };
+  if (!data.config) data.config = {};
+  var c = data.config;
+  if (c.scoreCap == null) c.scoreCap = DEFAULT_SCORE_CAP;
+  if (c.investRate == null) c.investRate = DEFAULT_RATE;
+  if (!c.members || !c.members.length) c.members = JSON.parse(JSON.stringify(DEFAULT_MEMBERS));
+  if (!c.passwords) {
+    c.passwords = {};
+    if (c.scorePassword) c.passwords.score = c.scorePassword;
+    ['score', 'expense', 'income', 'settings'].forEach(function (k) { if (!c.passwords[k]) c.passwords[k] = DEFAULT_PASSWORDS[k]; });
+    delete c.scorePassword;
+  }
+  if (!c.memberBindings) c.memberBindings = [];
+  // 旧版 months 结构 → 日期流水
+  if (data.months && !data.records) {
+    var conv = convertMonths(data.months);
+    data.records = conv.records;
+    if (!data.notes) data.notes = conv.notes;
+    delete data.months;
+  }
+  if (!data.records) data.records = { expenses: [], income: [], scores: [] };
+  if (!data.notes) data.notes = {};
+  return data;
+}
+function convertMonths(months) {
+  var records = { expenses: [], income: [], scores: [] };
+  var notes = {};
+  Object.keys(months || {}).forEach(function (key) {
+    var m = months[key];
+    var mid = key + '-15';
+    (m.expenses || []).forEach(function (e) {
+      records.expenses.push({ id: uid(), date: mid, item: e.item || '', amount: +(e.amount || 0), payer: e.payer || '' });
+    });
+    var inc = m.income || {};
+    Object.keys(inc).forEach(function (mid2) {
+      var amt = +inc[mid2] || 0;
+      if (Math.abs(amt) > 0.0001) records.income.push({ id: uid(), date: mid, memberId: mid2, amount: amt });
+    });
+    var sc = m.scores || {};
+    Object.keys(sc).forEach(function (mid3) {
+      (sc[mid3] || []).forEach(function (s) {
+        records.scores.push({ id: uid(), date: mid, memberId: mid3, item: s.item || '', score: +(s.score || 0) });
+      });
+    });
+    if (m.note) notes[key] = m.note;
+  });
+  return { records: records, notes: notes };
+}
+function uid() { return 'r' + Date.now().toString(36) + Math.floor(Math.random() * 1e4).toString(36); }
+
+/* ==================== 数据访问助手 ==================== */
+function getMembers() { return STORE.config.members || DEFAULT_MEMBERS; }
+function getScoreCap() { return STORE.config.scoreCap || DEFAULT_SCORE_CAP; }
+function getRate() { return STORE.config.investRate != null ? STORE.config.investRate : DEFAULT_RATE; }
+function getMember(id) { var m = getMembers().find(function (x) { return x.id === id; }); return m; }
+function MN(id) { var m = getMember(id); return m ? m.name : id; }
+function MC(id) { var m = getMember(id); return m ? m.color : '#888'; }
+function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+function F(n) { return (n || 0).toFixed(2); }
+function RMB(n) { return '¥' + F(n); }
+function $(s) { return document.querySelector(s); }
+function $$(s) { return Array.prototype.slice.call(document.querySelectorAll(s)); }
+
+/* 月份工具 */
+function monthKeyOf(d) { return (d || '').slice(0, 7); }
+function currentMonthKey() { var n = new Date(); return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0'); }
+function todayStr() { var d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+function labelOf(key) { var p = String(key).split('-'); return (+p[0]) + '年' + (+p[1]) + '月'; }
+function allMonthKeys() {
+  var set = {};
+  ['expenses', 'income', 'scores'].forEach(function (k) {
+    (STORE.records[k] || []).forEach(function (r) { if (r.date) set[monthKeyOf(r.date)] = true; });
+  });
+  set[currentMonthKey()] = true;
+  return Object.keys(set).sort();
+}
+function defaultDateFor(key) {
+  var t = todayStr();
+  return monthKeyOf(t) === key ? t : key + '-15';
+}
+function monthFromRecords(key) {
+  var expenses = [], income = {}, scMap = {}, scores = {};
+  (STORE.records.expenses || []).forEach(function (r) { if (monthKeyOf(r.date) === key) expenses.push({ id: r.id, date: r.date, item: r.item, amount: r.amount, payer: r.payer }); });
+  (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === key) income[r.memberId] = (income[r.memberId] || 0) + (r.amount || 0); });
+  (STORE.records.scores || []).forEach(function (r) { if (monthKeyOf(r.date) === key) (scMap[r.memberId] = scMap[r.memberId] || []).push({ id: r.id, date: r.date, item: r.item, score: r.score }); });
+  scores = scMap;
+  return { key: key, label: labelOf(key), expenses: expenses, income: income, scores: scores, note: (STORE.notes || {})[key] || '' };
+}
+function monthRecordCount(key) {
+  var n = 0;
+  ['expenses', 'income', 'scores'].forEach(function (k) { (STORE.records[k] || []).forEach(function (r) { if (monthKeyOf(r.date) === key) n++; }); });
+  return n;
+}
+
+/* ==================== 结算算法（与 printer_config / 后端共享口径） ==================== */
+function calcMonth(m) {
+  var members = getMembers();
+  var rate = getRate();
+  var scoreCap = getScoreCap();
+  var exps = m.expenses || [];
+  var inc = m.income || {};
+  var scores = m.scores || {};
+  var totalExp = exps.reduce(function (s, e) { return s + (e.amount || 0); }, 0);
+  var perPerson = members.length > 0 ? totalExp / members.length : 0;
+  var totalInc = 0;
+  members.forEach(function (mem) { totalInc += inc[mem.id] || 0; });
+
+  var scoreTotals = {}, totalScore = 0;
+  members.forEach(function (mem) {
+    var items = scores[mem.id] || [];
+    scoreTotals[mem.id] = items.reduce(function (s, x) { return s + Math.min(x.score || 0, scoreCap); }, 0);
+    totalScore += scoreTotals[mem.id];
+  });
+
+  var paid = {};
+  members.forEach(function (m) { paid[m.id] = 0; });
+  exps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + (e.amount || 0); });
+
+  var investPool = totalInc * rate;
+  var servicePool = totalInc * (1 - rate);
+  var memberCount = members.length || 1;
+
+  var investReturn = {};
+  members.forEach(function (mem) { investReturn[mem.id] = investPool / memberCount; });
+
+  var serviceReturn = {};
+  members.forEach(function (mem) {
+    var ratio = totalScore > 0 ? scoreTotals[mem.id] / totalScore : 1 / memberCount;
+    serviceReturn[mem.id] = servicePool * ratio;
+  });
+
+  var redist = {};
+  members.forEach(function (mem) { redist[mem.id] = investReturn[mem.id] + serviceReturn[mem.id]; });
+
+  var net = {};
+  members.forEach(function (mem) {
+    net[mem.id] = redist[mem.id] - perPerson - (inc[mem.id] || 0) + (paid[mem.id] || 0);
+  });
+
+  var balances = members.map(function (m) { return { id: m.id, net: net[m.id] }; });
+  var payers = balances.filter(function (b) { return b.net < -0.005; }).sort(function (a, b) { return a.net - b.net; });
+  var receivers = balances.filter(function (b) { return b.net > 0.005; }).sort(function (a, b) { return a.net - b.net; });
+  var transfers = [];
+  var pi = 0, ri = 0;
+  var rem = {};
+  balances.forEach(function (b) { rem[b.id] = b.net; });
+  while (pi < payers.length && ri < receivers.length) {
+    var debt = Math.abs(rem[payers[pi].id]);
+    var credit = rem[receivers[ri].id];
+    var amt = Math.min(debt, credit);
+    if (amt > 0.005) transfers.push({ from: payers[pi].id, to: receivers[ri].id, amount: amt });
+    rem[payers[pi].id] += amt;
+    rem[receivers[ri].id] -= amt;
+    if (Math.abs(rem[payers[pi].id]) < 0.005) pi++;
+    if (Math.abs(rem[receivers[ri].id]) < 0.005) ri++;
+  }
+
+  return { rate: rate, totalExp: totalExp, perPerson: perPerson, totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
+           paid: paid, investPool: investPool, servicePool: servicePool, investReturn: investReturn, serviceReturn: serviceReturn,
+           redist: redist, net: net, transfers: transfers, members: members, memberCount: memberCount, scoreCap: scoreCap };
+}
+
+/* ==================== 保存 ==================== */
+var _saveTimer = null;
+function save() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(function () {
+    _saveToServer(STORE).then(function (ok) {
+      if (!ok) { toast('⚠️ 云端保存失败，请检查连接', 'error'); return; }
+      var ind = $('#storageFilePath');
+      if (ind) ind.textContent = '☁ 云端 · 已保存';
+    });
+  }, 250);
+}
+
+/* ==================== Toast ==================== */
+function toast(msg, type) {
+  var wrap = $('#toastWrap');
+  var el = document.createElement('div');
+  el.className = 'toast ' + (type || '');
+  el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(function () { el.classList.add('out'); setTimeout(function () { el.remove(); }, 320); }, 2200);
+}
+
+/* ==================== 模态框 ==================== */
+function openModal(opts) {
+  return new Promise(function (resolve) {
+    var root = $('#modalRoot');
+    var m = document.createElement('div');
+    m.className = 'modal-backdrop';
+    var h = '<div class="modal-card" role="dialog">';
+    h += '<h3>' + (opts.title || '') + '</h3>';
+    h += '<div class="modal-body">' + (opts.body || '') + '</div>';
+    h += '<div class="modal-actions">';
+    if (opts.cancelText) h += '<button class="btn ghost" data-act="cancel">' + (opts.cancelText || '取消') + '</button>';
+    h += '<button class="btn ' + (opts.danger ? 'danger' : 'pri') + '" data-act="ok">' + (opts.confirmText || '确定') + '</button>';
+    h += '</div></div>';
+    m.innerHTML = h;
+    root.appendChild(m);
+    var inputEl = null;
+    if (opts.input) {
+      inputEl = document.createElement('input');
+      inputEl.type = opts.input.type || 'text';
+      inputEl.placeholder = opts.input.placeholder || '';
+      m.querySelector('.modal-body').appendChild(inputEl);
+    }
+    requestAnimationFrame(function () { m.classList.add('in'); });
+    if (inputEl) setTimeout(function () { inputEl.focus(); }, 60);
+    function close(val) {
+      m.classList.remove('in');
+      setTimeout(function () { m.remove(); }, 190);
+      resolve(val);
+    }
+    m.addEventListener('click', function (e) { if (e.target === m) close(null); });
+    var okBtn = m.querySelector('[data-act=ok]');
+    var cancelBtn = m.querySelector('[data-act=cancel]');
+    okBtn.addEventListener('click', function () { close(inputEl ? inputEl.value : true); });
+    if (cancelBtn) cancelBtn.addEventListener('click', function () { close(null); });
+    if (inputEl) inputEl.addEventListener('keydown', function (e) { if (e.key === 'Enter') okBtn.click(); });
+  });
+}
+function openConfirm(message, confirmText) {
+  return openModal({ title: '⚠️ 确认操作', body: '<p style="margin:0;color:var(--muted)">' + esc(message) + '</p>', confirmText: confirmText || '确定', cancelText: '取消', danger: true });
+}
+
+/* ==================== 密码解锁 ==================== */
+function getPassword(key) { return (STORE.config.passwords || {})[key] || DEFAULT_PASSWORDS[key]; }
+function isUnlocked(key) { return !!unlocked[key]; }
+function requestPassword(key, label) {
+  return openModal({
+    title: '🔒 解锁' + label,
+    body: '<p style="margin:0 0 12px;color:var(--muted);font-size:.88rem">输入「' + label + '」密码以继续编辑</p>',
+    input: { type: 'password', placeholder: '请输入密码' },
+    confirmText: '解锁', cancelText: '取消'
+  }).then(function (pwd) {
+    if (pwd === null) return false;
+    if (pwd === getPassword(key)) { unlocked[key] = true; toast('🔓 已解锁' + label, 'success'); return true; }
+    toast('❌ 密码错误', 'error'); return false;
+  });
+}
+function unlockFlow(key, label) {
+  requestPassword(key, label).then(function (ok) { if (ok) renderCurrent(); });
+}
+function lockModule(key) { unlocked[key] = false; toast('🔒 ' + (MODULE_NAMES[key] || key) + ' 已锁定'); renderCurrent(); }
+function lockBarHTML(key) {
+  var name = MODULE_NAMES[key] || key;
+  if (unlocked[key]) return '<div class="unlock-badge">🔓 ' + name + ' 已解锁 <button class="btn sm" onclick="lockModule(\'' + key + '\')">锁定</button></div>';
+  return '<div class="lock-bar"><span>🔒 ' + name + ' 已锁定，修改需解锁</span><button class="btn pri sm" onclick="unlockFlow(\'' + key + '\',\'' + name + '\')">🔑 输入密码解锁</button></div>';
+}
+
+/* ==================== 主题 ==================== */
+/* 三模式：system 自动（跟随 Windows）/ light 浅色 / dark 深色，配置存 localStorage */
+var themeMode = localStorage.getItem('financeThemeMode') ||
+  (localStorage.getItem('financeTheme') === 'dark' ? 'dark' : 'system');
+var _mqDark = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+function effectiveTheme() {
+  if (themeMode === 'light') return 'light';
+  if (themeMode === 'dark') return 'dark';
+  return (_mqDark && _mqDark.matches) ? 'dark' : 'light';
+}
+var theme = effectiveTheme();
+var _themeAnimT = null;
+var _firstApply = true;
+function themeIcon() { return themeMode === 'system' ? '🖥️' : (theme === 'dark' ? '🌙' : '☀️'); }
+function applyTheme(t) {
+  var root = document.documentElement;
+  var btn = $('#themeToggle');
+  if (btn) {
+    btn.textContent = themeIcon();
+    btn.title = themeMode === 'system'
+      ? '跟随系统（当前' + (t === 'dark' ? '深色' : '浅色') + '），点击切换模式'
+      : (t === 'dark' ? '深色主题，点击切换模式' : '浅色主题，点击切换模式');
+  }
+  // 切换瞬间启用全页平滑渐变过渡类（首帧不触发，避免加载闪变）。
+  // 先加类 + 强制回流，再翻转 data-theme，保证过渡有正确的起始状态。
+  if (!_firstApply) {
+    root.classList.add('theme-switching');
+    void root.offsetWidth;
+  }
+  root.setAttribute('data-theme', t);
+  if (!_firstApply) {
+    clearTimeout(_themeAnimT);
+    _themeAnimT = setTimeout(function () { root.classList.remove('theme-switching'); }, 520);
+  }
+  _firstApply = false;
+}
+applyTheme(theme);
+function setThemeMode(mode) {
+  if (themeMode === mode) return;
+  themeMode = mode;
+  localStorage.setItem('financeThemeMode', mode);
+  theme = effectiveTheme();
+  applyTheme(theme);
+  if (currentTab === 'settings') renderSettings();
+}
+function cycleThemeMode() {
+  var order = ['system', 'light', 'dark'];
+  setThemeMode(order[(order.indexOf(themeMode) + 1) % 3]);
+}
+// 跟随系统：监听 Windows / 浏览器主题变化，自动跟随
+if (_mqDark && _mqDark.addEventListener) {
+  _mqDark.addEventListener('change', function () {
+    if (themeMode === 'system') { theme = effectiveTheme(); applyTheme(theme); }
+  });
+}
+
+/* ==================== 数字滚动 ==================== */
+function countUp(el, target, opts) {
+  var dur = (opts && opts.dur) || 850;
+  var dec = (opts && opts.dec) != null ? opts.dec : 2;
+  var fmt = (opts && opts.fmt) || function (n) { return n.toFixed(dec); };
+  var start = null;
+  function step(ts) {
+    if (!start) start = ts;
+    var p = Math.min((ts - start) / dur, 1);
+    var ease = 1 - Math.pow(1 - p, 3);
+    el.textContent = fmt(target * ease);
+    if (p < 1) requestAnimationFrame(step); else el.textContent = fmt(target);
+  }
+  requestAnimationFrame(step);
+}
+
+/* ==================== Tab 切换 ==================== */
+function animateTab(tabEl) {
+  if (!tabEl) return;
+  var kids = tabEl.children;
+  for (var i = 0; i < kids.length; i++) {
+    kids[i].style.animation = 'none';
+    void kids[i].offsetWidth;
+    kids[i].style.animation = 'fadeUp .45s ease both';
+    kids[i].style.animationDelay = (i * 0.05) + 's';
+  }
+}
+function switchTab(name) {
+  currentTab = name;
+  $$('.tab').forEach(function (p) { p.classList.remove('on'); });
+  $$('#tabNav button').forEach(function (b) { b.classList.remove('on'); });
+  var tab = $('#tab-' + name);
+  if (tab) tab.classList.add('on');
+  var btn = document.querySelector('#tabNav button[data-tab="' + name + '"]');
+  if (btn) btn.classList.add('on');
+  if (name === 'dash') renderDash();
+  else if (name === 'entry') renderEntry();
+  else if (name === 'cloud') { renderCloud(); ensureCloudMonths(); }
+  else if (name === 'history') renderHistory();
+  else if (name === 'settings') renderSettings();
+  else if (name === 'about') renderAbout();
+  animateTab(tab);
+}
+function renderCurrent() {
+  if (currentTab === 'dash') renderDash();
+  else if (currentTab === 'entry') renderEntry();
+  else if (currentTab === 'cloud') renderCloud();
+  else if (currentTab === 'history') renderHistory();
+  else if (currentTab === 'settings') renderSettings();
+  else if (currentTab === 'about') renderAbout();
+}
+function renderAll() { renderDash(); renderEntry(); renderCloud(); renderHistory(); renderSettings(); renderAbout(); }
+
+/* ==================== 月份选择器 ==================== */
+function monthSelectHTML(id, selected) {
+  var keys = allMonthKeys().slice().reverse();
+  var h = '<select id="' + id + '" class="month-select" onchange="onSelMonth(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.9rem">';
+  keys.forEach(function (k) {
+    h += '<option value="' + k + '"' + (k === selected ? ' selected' : '') + '>' + labelOf(k) + (k === currentMonthKey() ? '（本月）' : '') + '</option>';
+  });
+  h += '</select>';
+  return h;
+}
+function onSelMonth(val) { currentKey = val; renderCurrent(); }
+
+/* ==================== 云端状态 ==================== */
+function checkHealth() {
+  fetch('/api/health', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) { setCloudState(res && res.cloud); })
+    .catch(function () { setCloudState(false); });
+}
+var _cloudOnline = true;
+function setCloudState(online) {
+  _cloudOnline = !!online;
+  var pill = $('#cloudPill');
+  if (pill) {
+    pill.className = 'cloud-pill ' + (online ? 'ok' : 'bad');
+    pill.innerHTML = '<span class="dot"></span> ' + (online ? '云端已连接' : '云端离线');
+  }
+  var ov = $('#blockOverlay');
+  if (ov) ov.classList.toggle('show', !online);
+}
+function retryConnect() { checkHealth(); if (_cloudOnline) loadConfig(); }
+
+/* ==================== 云端数据（图表实例） ==================== */
+var _cloudCharts = {};
+function _destroyCloudCharts() {
+  Object.keys(_cloudCharts).forEach(function (k) { if (_cloudCharts[k]) { _cloudCharts[k].destroy(); delete _cloudCharts[k]; } });
+}
+var STATUS_LABELS = {
+  sent: '已完成', printing: '打印中', queued: '排队中', failed: '失败', canceled: '已取消',
+  rejected: '已拒绝', accepted: '已接单', abandoned: '已放弃', reserved: '已预留', offline_unknown: '离线未知'
+};
+var STATUS_CLASSES = { sent: 'g', printing: 'b', queued: 'y', failed: 'r', canceled: '', rejected: 'r', accepted: 'b', abandoned: '', reserved: 'y', offline_unknown: 'p' };
+function statusLabel(s) { return STATUS_LABELS[s] || s; }
+function statusClass(s) { return STATUS_CLASSES[s] || ''; }
+var CHART_COLORS = {
+  status: { sent: '#16a34a', printing: '#4f6ef7', queued: '#f59e0b', failed: '#e11d48', canceled: '#9ca3af', rejected: '#991b1b', accepted: '#6366f1', abandoned: '#d97706', offline_unknown: '#8b5cf6', reserved: '#a1a1aa' },
+  palette: ['#4f6ef7', '#34a853', '#f59e0b', '#8b5cf6', '#d97706', '#16a34a', '#e11d48', '#38bdf8', '#f472b6', '#a855f7', '#14b8a6', '#f97316']
+};
+function _statusColor(s) { return CHART_COLORS.status[s] || '#9ca3af'; }
+function _fmtDate(d) { return (d || '').substring(0, 10); }
+
+/* ==================== 云端月份 ==================== */
+var _cloudData = null, _cloudLoading = false, _cloudExpanded = {}, _cloudMonth = null;
+var _cloudMonthsCache = null, _cloudMonthsReady = false;
+var _cloudUserFilter = 'all', _cloudSourceFilter = 'all';
+
+function loadCloudMonths() {
+  // 优先走后端 /months 接口
+  return fetch('/api/proxy/admin/statistics/months', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res && res.success && res.data && res.data.months) {
+        _cloudMonthsCache = res.data.months.map(function (m) { return m.month; }).sort();
+        return true;
+      }
+      return fallbackCloudMonths();
+    })
+    .catch(function () { return fallbackCloudMonths(); });
+}
+function fallbackCloudMonths() {
+  // 后端未部署时：宽范围拉取订单，客户端归月
+  var end = todayStr();
+  return fetch('/api/proxy/admin/statistics/revenue?start_date=2000-01-01&end_date=' + end, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res && res.success && res.data && res.data.orders) {
+        var set = {};
+        res.data.orders.forEach(function (o) { if (o.created_at) set[monthKeyOf(o.created_at)] = true; });
+        _cloudMonthsCache = Object.keys(set).sort();
+        return true;
+      }
+      return false;
+    })
+    .catch(function () { return false; });
+}
+function ensureCloudMonths() {
+  if (_cloudMonthsReady) return Promise.resolve(true);
+  return loadCloudMonths().then(function (ok) {
+    _cloudMonthsReady = ok;
+    renderCloud();
+    return ok;
+  });
+}
+function cloudMonthKeys() {
+  var set = {};
+  (_cloudMonthsCache || []).forEach(function (m) { set[m] = true; });
+  allMonthKeys().forEach(function (m) { set[m] = true; });
+  return Object.keys(set).sort().reverse();
+}
+function monthRange(month) {
+  var p = month.split('-');
+  var y = +p[0], m = +p[1];
+  var last = new Date(y, m, 0).getDate();
+  return { start: month + '-01', end: month + '-' + String(last).padStart(2, '0') };
+}
+function selectedStatuses() {
+  // 状态固定为全量（已移除状态过滤 UI）；收益统计仍只计已完成(sent)，订单数/构成按全部状态展示
+  return ['sent', 'printing', 'queued', 'failed', 'canceled', 'rejected', 'accepted', 'abandoned', 'reserved', 'offline_unknown'];
+}
+function fetchCloudData(month) {
+  if (!month) { toast('请选择月份', 'error'); return; }
+  _cloudMonth = month;
+  var range = monthRange(month);
+  var statuses = selectedStatuses();
+  var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end) + '&status=' + encodeURIComponent(statuses.join(','));
+  _cloudLoading = true;
+  renderCloud();
+  fetch('/api/proxy/admin/statistics/revenue?' + params, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      _cloudLoading = false;
+      if (data.success) _cloudData = data.data;
+      else { _cloudData = null; toast('❌ ' + (data.message || '查询失败'), 'error'); }
+      renderCloud();
+    })
+    .catch(function (err) { _cloudLoading = false; _cloudData = null; toast('❌ 请求失败: ' + err.message, 'error'); renderCloud(); });
+}
+function onCloudMonthChange(val) { _cloudMonth = val; fetchCloudData(val); }
+function onCloudUserFilter(v) { _cloudUserFilter = v; renderCloud(); }
+function onCloudSourceFilter(v) { _cloudSourceFilter = v; renderCloud(); }
+function _toggleOrderExpand(oid) {
+  if (_cloudExpanded[oid]) delete _cloudExpanded[oid];
+  else _cloudExpanded[oid] = true;
+  renderCloud();
+}
+
+/* 成员映射 */
+function memberOfOpenid(oid) {
+  if (oid === 'local') return { local: true, name: '本地任务', color: '#548235' };
+  var b = (STORE.config.memberBindings || []).find(function (x) { return x.openid === oid; });
+  if (b) { var m = getMember(b.memberId); if (m) return { memberId: m.id, name: m.name, color: m.color, nickname: true }; }
+  return null;
+}
+function updateBinding(oid, memberId) {
+  var arr = (STORE.config.memberBindings || []).filter(function (x) { return x.openid !== oid; });
+  if (memberId) arr.push({ openid: oid, memberId: memberId });
+  STORE.config.memberBindings = arr;
+  save();
+  renderCurrent();
+}
+
+/* ==================== 图表渲染 ==================== */
+function chartTextColor() {
+  return getComputedStyle(document.body).getPropertyValue('--text').trim() || '#1b1d2a';
+}
+
+function _renderStatusDonut(canvasId, orderStatusCount, fileStatusCount) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var src = Object.keys(fileStatusCount).length > 0 ? fileStatusCount : orderStatusCount;
+  var sorted = Object.keys(src).sort(function (a, b) { return src[b] - src[a]; });
+  var labels = [], data = [], colors = [];
+  sorted.forEach(function (s) { labels.push(statusLabel(s)); data.push(src[s]); colors.push(_statusColor(s)); });
+  var total = data.reduce(function (a, b) { return a + b; }, 0);
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels: labels, datasets: [{ data: data, backgroundColor: colors, borderWidth: 2, borderColor: 'transparent' }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '58%',
+      plugins: {
+        legend: { position: 'right', labels: { font: { size: 11 }, padding: 10, boxWidth: 12, usePointStyle: true, color: chartTextColor() } },
+        tooltip: { callbacks: { label: function (c) { var pct = total > 0 ? (c.parsed / total * 100).toFixed(1) : 0; return c.label + ': ' + c.parsed + ' (' + pct + '%)'; } } }
+      },
+      animation: { animateRotate: true, duration: 1000, easing: 'easeOutQuart' }
+    }
+  });
+}
+function _renderSourceDonut(canvasId, rs) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var cloudVal = rs.cloud > 0 ? rs.cloud : (rs.cloud_orders || 0);
+  var localVal = rs.local > 0 ? rs.local : (rs.local_orders || 0);
+  var labels = ['☁ 云端 ' + RMB(rs.cloud || 0), '🖨 本地 ' + RMB(rs.local || 0)];
+  var data = [Math.max(cloudVal, 0.01), Math.max(localVal, 0.01)];
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels: labels, datasets: [{ data: data, backgroundColor: ['#4f6ef7', '#34a853'], borderWidth: 2, borderColor: 'transparent' }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '55%',
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } },
+        tooltip: { callbacks: { label: function (c) {
+          var detail = c.dataIndex === 0 ? '订单 ' + (rs.cloud_orders || 0) + ' · 文件 ' + (rs.cloud_files || 0) + ' · ' + (rs.cloud_pages || 0) + '页'
+            : '订单 ' + (rs.local_orders || 0) + ' · 文件 ' + (rs.local_files || 0) + ' · ' + (rs.local_pages || 0) + '页';
+          return c.label + ' — ' + detail;
+        } } }
+      },
+      animation: { animateRotate: true, duration: 1200, easing: 'easeOutBack' }
+    }
+  });
+}
+function _renderUserBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var sorted = byUser.slice().sort(function (a, b) { return b[field] - a[field]; });
+  var labels = sorted.map(function (u) { return u._memberName || u.nickname || (u.openid || '').substring(0, 8); });
+  var values = sorted.map(function (u) { return u[field]; });
+  var maxVal = Math.max.apply(null, values.concat([0])) || 1;
+  var barColors = sorted.map(function (u) { return barColorFn ? barColorFn(u, field, maxVal) : '#4f6ef7'; });
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: labels, datasets: [{ label: label, data: values, backgroundColor: barColors, borderRadius: 6 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: function (c2) { return label + ': ' + (field === 'revenue' ? RMB(c2.parsed.y) : c2.parsed.y + ' 单'); } } }
+      },
+      scales: {
+        y: { beginAtZero: true, max: maxVal * 1.25, grid: { color: 'rgba(120,130,160,.12)' } },
+        x: { grid: { display: false }, ticks: { maxRotation: 30, font: { size: 10 } } }
+      },
+      animation: { duration: 1000, easing: 'easeOutQuart' }
+    }
+  });
+}
+function _renderDailyTrend(canvasId, trend) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  if (trend.length === 0) return;
+  var labels = trend.map(function (t) { return t.date; });
+  var revData = trend.map(function (t) { return Math.round(t.revenue * 100) / 100; });
+  var countData = trend.map(function (t) { return t.count; });
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: '收益', data: revData, borderColor: '#4f6ef7', backgroundColor: 'rgba(79,110,247,.12)', fill: true, tension: .35, pointRadius: 4, pointHoverRadius: 7, yAxisID: 'y', borderWidth: 2.5 },
+        { label: '订单数', data: countData, borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,.08)', fill: true, tension: .35, pointRadius: 3, pointHoverRadius: 6, yAxisID: 'y1', borderWidth: 2, borderDash: [5, 3] }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { position: 'top', labels: { font: { size: 11 }, boxWidth: 14, padding: 10, usePointStyle: true, color: chartTextColor() } } },
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: '收益 (元)', font: { size: 10 } }, grid: { color: 'rgba(120,130,160,.1)' } },
+        y1: { position: 'right', beginAtZero: true, title: { display: true, text: '订单数', font: { size: 10 } }, grid: { display: false } },
+        x: { grid: { display: false }, ticks: { maxTicksLimit: 14, font: { size: 9 } } }
+      },
+      animation: { duration: 1200, easing: 'easeOutQuart' }
+    }
+  });
+}
+function _computeDailyTrend(orders) {
+  var map = {};
+  orders.forEach(function (o) {
+    var day = _fmtDate(o.created_at);
+    if (!map[day]) map[day] = { date: day, count: 0, revenue: 0, pages: 0, files: 0 };
+    map[day].count++;
+    map[day].revenue += o.revenue || 0;
+    map[day].pages += o.total_page_count || 0;
+    map[day].files += o.files_count || 0;
+  });
+  return Object.keys(map).sort().map(function (d) { return map[d]; });
+}
+function _countByStatus(orders) {
+  var map = {};
+  orders.forEach(function (o) { var s = o.status || 'unknown'; map[s] = (map[s] || 0) + 1; });
+  return map;
+}
+function _countFilesByStatus(orders) {
+  var map = {};
+  orders.forEach(function (o) { (o.files || []).forEach(function (f) { var s = f.status || 'unknown'; map[s] = (map[s] || 0) + 1; }); });
+  return map;
+}
+
+/* ==================== TAB: 总览 ==================== */
+function renderDash() {
+  var el = $('#tab-dash');
+  var keys = allMonthKeys();
+  if (!keys.includes(currentKey)) currentKey = keys[keys.length - 1] || currentMonthKey();
+  var m = monthFromRecords(currentKey);
+  var r = calcMonth(m);
+  var hasData = (m.expenses.length + (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + (STORE.records.scores || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length) > 0;
+
+  var h = '<div class="filter-bar" style="align-items:center">';
+  h += '<div class="f-item"><label>📅 结算月份</label>' + monthSelectHTML('dash-month', currentKey) + '</div>';
+  if (hasData) h += '<div class="f-item" style="margin-left:auto"><span class="tag b">' + m.label + '</span></div>';
+  h += '</div>';
+
+  if (!hasData) {
+    h += '<div class="section" style="text-align:center;padding:50px 20px"><div class="empty"><div class="ico">📭</div><h3>' + m.label + ' 暂无数据</h3><p style="margin-top:6px">切换到「记账」标签录入采购 / 代收 / 评分，数据将自动归入对应月份。</p><button class="btn pri" style="margin-top:16px" onclick="switchTab(\'entry\')">📝 去记账</button></div></div>';
+    el.innerHTML = h;
+    return;
+  }
+
+  // KPI
+  var totalPL = 0;
+  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPerson; });
+  h += '<div class="kpi-grid">';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">🧾</div><div class="num" data-count="' + r.totalExp + '" data-prefix="¥">0</div><div class="lbl">采购支出</div><div class="sub">人均 ' + RMB(r.perPerson) + '</div></div>';
+  h += '<div class="kpi-card c-green"><div class="kpi-ico">💵</div><div class="num" data-count="' + r.totalInc + '" data-prefix="¥">0</div><div class="lbl">代收总额</div><div class="sub">' + r.memberCount + ' 人均摊投资回报</div></div>';
+  h += '<div class="kpi-card ' + (totalPL >= 0 ? 'c-green' : 'c-red') + '"><div class="kpi-ico">📈</div><div class="num" data-count="' + totalPL + '" data-prefix="¥">0</div><div class="lbl">本月盈亏</div><div class="sub">' + (totalPL >= 0 ? '盈利' : '亏损') + '</div></div>';
+  h += '<div class="kpi-card c-orange"><div class="kpi-ico">⭐</div><div class="num">' + r.totalScore + '</div><div class="lbl">服务总分</div><div class="sub">上限 ' + r.scoreCap + ' 分/项</div></div>';
+  h += '</div>';
+
+  // 采购明细
+  h += '<div class="section"><h2>🧾 采购明细 <span class="hint">(' + r.memberCount + ' 人均摊)</span></h2><div class="table-wrap"><table><thead><tr><th class="l">项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
+  (m.expenses || []).forEach(function (e) {
+    h += '<tr><td class="l">' + esc(e.item) + '</td><td>' + RMB(e.amount) + '</td><td><span class="member-tag" style="background:' + MC(e.payer) + '">' + MN(e.payer) + '</span></td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalExp) + '</td><td>人均 ' + RMB(r.perPerson) + '</td></tr>';
+  h += '</tbody></table></div></div>';
+
+  // 收入分配
+  var rpct = (r.rate * 100).toFixed(1);
+  var spct = ((1 - r.rate) * 100).toFixed(1);
+  h += '<div class="section"><h2>💵 收入分配 <span class="hint">投资均分 <b>' + rpct + '%</b> | 服务按分 ' + spct + '% | 上限 ' + r.scoreCap + ' 分</span></h2>';
+  h += '<div class="table-wrap"><table><thead><tr><th></th><th>投资回报<br>（均分）</th><th>服务得分</th><th>服务占比</th><th>服务回报</th><th>应得收入</th><th>实际代收</th><th>差额</th></tr></thead><tbody>';
+  getMembers().forEach(function (mem) {
+    var svcRatio = r.totalScore > 0 ? r.scoreTotals[mem.id] / r.totalScore : 1 / r.memberCount;
+    var diff = r.redist[mem.id] - ((m.income || {})[mem.id] || 0);
+    h += '<tr>';
+    h += '<td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td>' + RMB(r.investReturn[mem.id]) + '</td>';
+    h += '<td>' + (r.scoreTotals[mem.id] || 0) + '</td>';
+    h += '<td>' + (svcRatio * 100).toFixed(1) + '%</td>';
+    h += '<td>' + RMB(r.serviceReturn[mem.id]) + '</td>';
+    h += '<td style="font-weight:700">' + RMB(r.redist[mem.id]) + '</td>';
+    h += '<td>' + RMB((m.income || {})[mem.id] || 0) + '</td>';
+    h += '<td class="' + (diff >= 0 ? 'pos' : 'neg') + '">' + (diff >= 0 ? '+' : '') + RMB(diff) + '</td>';
+    h += '</tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.investPool) + '</td><td>' + r.totalScore + '</td><td>100%</td><td>' + RMB(r.servicePool) + '</td><td>' + RMB(r.totalInc) + '</td><td>' + RMB(r.totalInc) + '</td><td>0</td></tr>';
+  h += '</tbody></table></div>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">差额 = 应得收入 − 实际代收（正=补足，负=分给别人）。投资/服务比例可在「设置」中调整。</div></div>';
+
+  // 经营损益
+  h += '<div class="section"><h2>📊 经营损益 <span class="hint">（本月每人实际赚/亏）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>应得收入</th><th>− 均摊支出</th><th>= 本月盈亏</th></tr></thead><tbody>';
+  getMembers().forEach(function (mem) {
+    var pl = r.redist[mem.id] - r.perPerson;
+    var tag = pl >= 0 ? '<span class="tag g">盈利</span>' : '<span class="tag r">亏损</span>';
+    h += '<tr><td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td>' + RMB(r.redist[mem.id]) + '</td>';
+    h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
+    h += '<td class="' + (pl >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (pl >= 0 ? '+' : '') + RMB(pl) + ' ' + tag + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>−' + RMB(r.totalExp) + '</td><td class="' + (totalPL >= 0 ? 'pos' : 'neg') + '">' + (totalPL >= 0 ? '+' : '') + RMB(totalPL) + '</td></tr>';
+  h += '</tbody></table></div></div>';
+
+  // 垫付清算
+  h += '<div class="section"><h2>💳 垫付清算 <span class="hint">（谁多垫了、谁少垫了）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>实际代付</th><th>− 应均摊</th><th>= 垫付差额</th></tr></thead><tbody>';
+  getMembers().forEach(function (mem) {
+    var adv = (r.paid[mem.id] || 0) - r.perPerson;
+    var tag2 = adv > 1 ? '<span class="tag g">多垫，应收</span>' : (adv < -1 ? '<span class="tag r">少垫，应付</span>' : '<span class="tag b">持平</span>');
+    h += '<tr><td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td class="pos">+' + RMB(r.paid[mem.id]) + '</td>';
+    h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
+    h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (adv >= 0 ? '+' : '') + RMB(adv) + ' ' + tag2 + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(r.totalExp) + '</td><td>−' + RMB(r.perPerson * r.memberCount) + '</td><td>0</td></tr>';
+  h += '</tbody></table></div></div>';
+
+  // 资金重分配
+  h += '<div class="settle-box"><h2>🔄 资金重分配 <span class="hint">（实际转账指令）</span></h2>';
+  h += '<div class="table-wrap"><table style="margin-bottom:14px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>= 应转出/入</th></tr></thead><tbody>';
+  getMembers().forEach(function (mem) {
+    var incomeAdj = r.redist[mem.id] - ((m.income || {})[mem.id] || 0);
+    var adv = (r.paid[mem.id] || 0) - r.perPerson;
+    var transfer = incomeAdj + adv;
+    h += '<tr><td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td class="' + (incomeAdj >= 0 ? 'pos' : 'neg') + '">' + (incomeAdj >= 0 ? '+' : '') + RMB(incomeAdj) + '</td>';
+    h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '">' + (adv >= 0 ? '+' : '') + RMB(adv) + '</td>';
+    h += '<td class="' + (transfer >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (transfer >= 0 ? '+' : '') + RMB(transfer) + '</td></tr>';
+  });
+  h += '</tbody></table></div>';
+  if (r.transfers.length > 0) {
+    h += '<div style="font-weight:700;margin-bottom:8px;color:var(--orange)">转账指令：</div>';
+    r.transfers.forEach(function (t) {
+      h += '<div class="transfer"><span class="member-tag" style="background:' + MC(t.from) + '">' + MN(t.from) + '</span>';
+      h += ' <span class="arrow">→</span> ';
+      h += '<span class="member-tag" style="background:' + MC(t.to) + '">' + MN(t.to) + '</span>';
+      h += ' <span class="amount">' + RMB(t.amount) + '</span></div>';
+    });
+  } else {
+    h += '<div style="color:var(--muted)">✅ 收支平衡，无需转账</div>';
+  }
+  h += '</div>';
+
+  el.innerHTML = h;
+  // KPI 数字滚动
+  $$('#tab-dash .num[data-count]').forEach(function (node) {
+    var target = parseFloat(node.getAttribute('data-count'));
+    var prefix = node.getAttribute('data-prefix') || '';
+    countUp(node, target, { dec: 2, fmt: function (n) { return prefix + n.toFixed(2); } });
+  });
+}
+
+function updateRate(val) {
+  STORE.config.investRate = val / 100;
+  save();
+  renderCurrent();
+}
+function onRateSlide(val) {
+  // 拖动过程中实时刷新右侧数值，不触发保存/重绘
+  var b = $('#rateValLive');
+  if (b) b.textContent = val + '%';
+  var s = $('#rateSvcLive');
+  if (s) s.textContent = '服务按分占比 ' + (100 - val) + '%';
+}
+
+/* ==================== TAB: 记账 ==================== */
+function renderEntry() {
+  var el = $('#tab-entry');
+  var members = getMembers();
+  var keys = allMonthKeys();
+  if (!keys.includes(currentKey)) currentKey = keys[keys.length - 1] || currentMonthKey();
+
+  var h = '<div class="filter-bar" style="align-items:center">';
+  h += '<div class="f-item"><label>📅 录入月份</label>' + monthSelectHTML('entry-month', currentKey) + '</div>';
+  h += '<div class="f-item" style="margin-left:auto"><span class="tag b">数据自动按日期归入对应月份</span></div>';
+  h += '</div>';
+
+  var m = monthFromRecords(currentKey);
+
+  /* ── 采购支出 ── */
+  h += '<div class="section"><h2>🧾 采购支出 <span class="hint">（谁垫付了什么，AA 均摊）</span>' + lockBadge('expense') + '</h2>';
+  h += lockBarHTML('expense');
+  var disabled = unlocked.expense ? '' : ' disabled';
+  h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">项目</th><th>金额（元）</th><th>代付人</th><th></th></tr></thead><tbody>';
+  m.expenses.forEach(function (e, i) {
+    h += '<tr>';
+    h += '<td><input type="date" value="' + esc(e.date) + '" onchange="updExp(\'' + e.id + '\',\'date\',this.value)"' + disabled + '></td>';
+    h += '<td class="l"><input value="' + esc(e.item) + '" onchange="updExp(\'' + e.id + '\',\'item\',this.value)" placeholder="项目名称" style="width:170px"' + disabled + '></td>';
+    h += '<td><input type="number" step="0.01" min="0" value="' + e.amount + '" onchange="updExp(\'' + e.id + '\',\'amount\',+this.value)"' + disabled + '></td>';
+    h += '<td><select onchange="updExp(\'' + e.id + '\',\'payer\',this.value)"' + disabled + '>';
+    members.forEach(function (x) { h += '<option value="' + x.id + '"' + (e.payer === x.id ? ' selected' : '') + '>' + x.name + '</option>'; });
+    h += '</select></td>';
+    h += '<td><button class="btn danger sm" onclick="delExp(\'' + e.id + '\')"' + disabled + '>✕</button></td>';
+    h += '</tr>';
+  });
+  if (!m.expenses.length) h += '<tr><td colspan="5" style="color:var(--muted)">暂无采购记录</td></tr>';
+  h += '</tbody></table></div>';
+  h += '<button class="btn sm" style="margin-top:10px" onclick="addExp()"' + disabled + '>+ 添加采购项</button>';
+  h += '</div>';
+
+  /* ── 代收收入 ── */
+  h += '<div class="section"><h2>💵 代收收入 <span class="hint">（手动填写，云端数据仅作核对参考）</span>' + lockBadge('income') + '</h2>';
+  h += lockBarHTML('income');
+  var dIncome = (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; });
+  var incSum = {};
+  dIncome.forEach(function (r) { incSum[r.memberId] = (incSum[r.memberId] || 0) + (r.amount || 0); });
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
+  members.forEach(function (mem) {
+    h += '<span class="member-tag" style="background:' + mem.color + '">' + mem.name + '  ' + RMB(incSum[mem.id] || 0) + '</span>';
+  });
+  h += '</div>';
+  var disabledI = unlocked.income ? '' : ' disabled';
+  h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th>成员</th><th>金额（元）</th><th></th></tr></thead><tbody>';
+  dIncome.forEach(function (r) {
+    h += '<tr>';
+    h += '<td><input type="date" value="' + esc(r.date) + '" onchange="updInc(\'' + r.id + '\',\'date\',this.value)"' + disabledI + '></td>';
+    h += '<td><select onchange="updInc(\'' + r.id + '\',\'memberId\',this.value)"' + disabledI + '>';
+    members.forEach(function (x) { h += '<option value="' + x.id + '"' + (r.memberId === x.id ? ' selected' : '') + '>' + x.name + '</option>'; });
+    h += '</select></td>';
+    h += '<td><input type="number" step="0.01" min="0" value="' + r.amount + '" onchange="updInc(\'' + r.id + '\',\'amount\',+this.value)"' + disabledI + '></td>';
+    h += '<td><button class="btn danger sm" onclick="delInc(\'' + r.id + '\')"' + disabledI + '>✕</button></td>';
+    h += '</tr>';
+  });
+  if (!dIncome.length) h += '<tr><td colspan="4" style="color:var(--muted)">暂无代收记录</td></tr>';
+  h += '</tbody></table></div>';
+  h += '<button class="btn sm" style="margin-top:10px" onclick="addInc()"' + disabledI + '>+ 添加代收记录</button>';
+  h += '</div>';
+
+  /* ── 服务评分 ── */
+  h += '<div class="section"><h2>⭐ 服务贡献评分 <span class="hint">（CEO 每月评估，单项上限 ' + getScoreCap() + ' 分）</span>' + lockBadge('score') + '</h2>';
+  h += lockBarHTML('score');
+  var disabledS = unlocked.score ? '' : ' disabled';
+  var scoreCap = getScoreCap();
+  members.forEach(function (mem) {
+    var sc = m.scores[mem.id] || [];
+    var capped = sc.reduce(function (s, x) { return s + Math.min(x.score || 0, scoreCap); }, 0);
+    h += '<h3 style="margin:16px 0 8px;display:flex;align-items:center;gap:8px;font-size:.95rem"><span class="member-tag" style="background:' + mem.color + '">' + mem.name + '</span> <span class="tag b">总分 ' + capped + '</span></h3>';
+    h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">评分项目</th><th>得分</th><th></th></tr></thead><tbody>';
+    sc.forEach(function (s) {
+      var over = (s.score || 0) > scoreCap;
+      h += '<tr>';
+      h += '<td><input type="date" value="' + esc(s.date) + '" onchange="updScore(\'' + s.id + '\',\'date\',this.value)"' + disabledS + '></td>';
+      h += '<td class="l"><input value="' + esc(s.item) + '" onchange="updScore(\'' + s.id + '\',\'item\',this.value)" placeholder="服务项目" style="width:200px"' + disabledS + '></td>';
+      h += '<td><input type="number" step="0.1" min="0" value="' + s.score + '" onchange="updScore(\'' + s.id + '\',\'score\',+this.value)" style="width:80px;color:' + (over ? 'var(--neg)' : 'inherit') + '"' + disabledS + '>' + (over ? '<span style="color:var(--neg);font-size:.75rem"> ⚠超限</span>' : '') + '</td>';
+      h += '<td><button class="btn danger sm" onclick="delScore(\'' + s.id + '\')"' + disabledS + '>✕</button></td>';
+      h += '</tr>';
+    });
+    if (!sc.length) h += '<tr><td colspan="4" style="color:var(--muted)">暂无评分项</td></tr>';
+    h += '</tbody></table></div>';
+    h += '<button class="btn sm" style="margin-top:6px" onclick="addScore(\'' + mem.id + '\')"' + disabledS + '>+ 为 ' + mem.name + ' 添加评分项</button>';
+  });
+  h += '</div>';
+
+  /* ── 备注 ── */
+  h += '<div class="section"><h2>📝 备注</h2><textarea onchange="updNote(this.value)" style="width:100%;height:64px;padding:10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-family:inherit;resize:vertical">' + esc(m.note || '') + '</textarea></div>';
+  h += '<div style="display:flex;gap:10px"><button class="btn pri" onclick="save();toast(\'✅ 已保存\',\'success\')">💾 保存</button><button class="btn" onclick="switchTab(\'dash\')">📊 查看结算</button></div>';
+
+  el.innerHTML = h;
+}
+function lockBadge(key) {
+  var name = MODULE_NAMES[key];
+  return unlocked[key] ? '<span class="unlock-badge" style="margin-left:auto">🔓 已解锁</span>' : '<span class="tag y" style="margin-left:auto">🔒 需密码</span>';
+}
+
+/* 记录增删改 */
+function saveAndToast() { save(); toast('✅ 已保存', 'success'); }
+function handleDateMove(r) {
+  // 编辑日期后若月份发生变化，重新定位当前月份并重绘（否则不重绘，避免输入焦点丢失）
+  var k = monthKeyOf(r.date);
+  if (k && k !== currentKey) { currentKey = k; renderEntry(); }
+}
+function addExp() {
+  if (!unlocked.expense) { toast('🔒 请先解锁采购支出', 'error'); return; }
+  var members = getMembers();
+  STORE.records.expenses.push({ id: uid(), date: defaultDateFor(currentKey), item: '新采购', amount: 0, payer: members.length ? members[0].id : '' });
+  save(); renderEntry();
+}
+function updExp(id, field, val) {
+  var r = STORE.records.expenses.find(function (x) { return x.id === id; });
+  if (!r) return;
+  r[field] = field === 'amount' ? (+val || 0) : val;
+  save(); handleDateMove(r);
+}
+function delExp(id) { STORE.records.expenses = STORE.records.expenses.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
+function addInc() {
+  if (!unlocked.income) { toast('🔒 请先解锁代收收入', 'error'); return; }
+  var members = getMembers();
+  STORE.records.income.push({ id: uid(), date: defaultDateFor(currentKey), memberId: members.length ? members[0].id : '', amount: 0 });
+  save(); renderEntry();
+}
+function updInc(id, field, val) {
+  var r = STORE.records.income.find(function (x) { return x.id === id; });
+  if (!r) return;
+  r[field] = field === 'amount' ? (+val || 0) : val;
+  save(); handleDateMove(r);
+}
+function delInc(id) { STORE.records.income = STORE.records.income.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
+function addScore(memberId) {
+  if (!unlocked.score) { toast('🔒 请先解锁服务评估', 'error'); return; }
+  STORE.records.scores.push({ id: uid(), date: defaultDateFor(currentKey), memberId: memberId, item: '新服务项', score: 0 });
+  save(); renderEntry();
+}
+function updScore(id, field, val) {
+  var r = STORE.records.scores.find(function (x) { return x.id === id; });
+  if (!r) return;
+  r[field] = field === 'score' ? (+val || 0) : val;
+  save(); handleDateMove(r);
+}
+function delScore(id) { STORE.records.scores = STORE.records.scores.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
+function updNote(val) {
+  STORE.notes[currentKey] = val;
+  save();
+}
+
+/* ==================== TAB: 云端 ==================== */
+function renderCloud() {
+  var el = $('#tab-cloud');
+  var keys = cloudMonthKeys();
+  if (!_cloudMonth || keys.length && !keys.includes(_cloudMonth)) _cloudMonth = keys[0] || currentMonthKey();
+  if (!_cloudMonth) _cloudMonth = currentMonthKey();
+
+  // 筛选条：云端月份（切换即自动查询）+ 手动刷新
+  var h = '<div class="filter-bar">';
+  h += '<div class="f-item"><label>📅 云端月份</label><select onchange="onCloudMonthChange(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.9rem">';
+  keys.forEach(function (k) { h += '<option value="' + k + '"' + (k === _cloudMonth ? ' selected' : '') + '>' + labelOf(k) + '</option>'; });
+  h += '</select></div>';
+  h += '<div class="f-item" style="margin-left:auto"><button class="btn" onclick="fetchCloudData(_cloudMonth)">🔄 刷新</button></div>';
+  h += '</div>';
+
+  if (_cloudLoading) {
+    _destroyCloudCharts();
+    h += '<div class="section" style="text-align:center;padding:46px"><span class="loading-spin"></span> <span style="margin-left:6px;color:var(--muted)">正在从云端获取数据…</span></div>';
+    el.innerHTML = h;
+    return;
+  }
+  if (!_cloudMonthsReady) {
+    h += '<div class="empty"><div class="ico">📡</div><h3>正在加载云端月份…</h3></div>';
+    el.innerHTML = h;
+    return;
+  }
+  if (!_cloudData && !_cloudLoading) {
+    fetchCloudData(_cloudMonth);   // 首次进入自动查询当前月份
+    return;
+  }
+  if (!_cloudData) {
+    _destroyCloudCharts();
+    h += '<div class="empty"><div class="ico">📡</div><h3>查询失败或无数据</h3><p>统计各成员及本地任务的订单数、盈利与订单构成，用于核对手动代收收入。</p><button class="btn pri" style="margin-top:14px" onclick="fetchCloudData(_cloudMonth)">🔍 重试查询</button></div>';
+    el.innerHTML = h;
+    return;
+  }
+
+  var rs = _cloudData.revenue_summary;
+  var orders = _cloudData.orders || [];
+  var byUser = (_cloudData.by_user || []).map(function (u) {
+    var mo = memberOfOpenid(u.openid);
+    u._memberName = mo ? mo.name : null;
+    u._memberColor = mo ? mo.color : null;
+    return u;
+  });
+  // 本地任务行
+  var localOrders = orders.filter(function (o) { return o.source === 'local'; });
+  if (localOrders.length) {
+    var loc = { openid: 'local', nickname: '本地订单', avatar_url: '', revenue: 0, order_count: localOrders.length, file_count: 0, total_pages: 0, _memberName: '本地任务', _memberColor: '#548235' };
+    localOrders.forEach(function (o) { loc.revenue += o.revenue || 0; loc.file_count += o.files_count || 0; loc.total_pages += o.total_page_count || 0; });
+    loc.revenue = Math.round(loc.revenue * 100) / 100;
+    byUser.push(loc);
+  }
+
+  var filteredOrders = orders;
+  if (_cloudUserFilter !== 'all') filteredOrders = filteredOrders.filter(function (o) { return o.openid === _cloudUserFilter; });
+  if (_cloudSourceFilter !== 'all') {
+    filteredOrders = filteredOrders.filter(function (o) { return o.source === _cloudSourceFilter; });
+    byUser = byUser.filter(function (u) { return _cloudSourceFilter === 'local' ? u.openid === 'local' : u.openid !== 'local'; });
+  }
+  var dailyTrend = _computeDailyTrend(filteredOrders);
+  var orderStatusCount = _countByStatus(filteredOrders);
+  var fileStatusCount = _countFilesByStatus(filteredOrders);
+
+  // KPI
+  h += '<div class="kpi-grid">';
+  h += '<div class="kpi-card c-green"><div class="kpi-ico">💰</div><div class="num" data-count="' + rs.total + '" data-prefix="¥">0</div><div class="lbl">总盈利（已完成）</div><div class="sub">' + labelOf(_cloudMonth) + '</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📦</div><div class="num">' + ((rs.cloud_orders || 0) + (rs.local_orders || 0)) + '</div><div class="lbl">总订单数</div><div class="sub">☁ ' + (rs.cloud_orders || 0) + ' · 🖨 ' + (rs.local_orders || 0) + '</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📄</div><div class="num">' + ((rs.cloud_files || 0) + (rs.local_files || 0)) + '</div><div class="lbl">总文件数</div><div class="sub">☁ ' + (rs.cloud_files || 0) + ' · 🖨 ' + (rs.local_files || 0) + '</div></div>';
+  h += '<div class="kpi-card c-orange"><div class="kpi-ico">📃</div><div class="num">' + (rs.total_pages || 0) + '</div><div class="lbl">总页数</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📊</div><div class="num">' + RMB(orders.length ? (rs.total / orders.length) : 0) + '</div><div class="lbl">均单收益</div></div>';
+  h += '</div>';
+
+  // 过滤行
+  h += '<div class="filter-bar">';
+  h += '<div class="f-item"><label>👤 按成员</label><select onchange="onCloudUserFilter(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.88rem"><option value="all">全部</option>';
+  var seen = {};
+  orders.forEach(function (o) { if (o.openid && o.openid !== 'local') { var mo = memberOfOpenid(o.openid); var k = mo ? mo.name : (o.nickname || o.openid); if (!seen[k]) { seen[k] = true; h += '<option value="' + esc(o.openid) + '"' + (_cloudUserFilter === o.openid ? ' selected' : '') + '>' + esc(k) + '</option>'; } } });
+  h += '</select></div>';
+  h += '<div class="f-item"><label>📦 按来源</label><select onchange="onCloudSourceFilter(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.88rem">';
+  h += '<option value="all"' + (_cloudSourceFilter === 'all' ? ' selected' : '') + '>全部来源</option>';
+  h += '<option value="cloud"' + (_cloudSourceFilter === 'cloud' ? ' selected' : '') + '>☁ 云端</option>';
+  h += '<option value="local"' + (_cloudSourceFilter === 'local' ? ' selected' : '') + '>🖨 本地</option>';
+  h += '</select></div>';
+  h += '</div>';
+
+  // 图表行1：状态分布 + 收益构成
+  h += '<div class="chart-grid">';
+  h += '<div class="section"><h2>🧩 订单状态分布</h2><div class="chart-wrap"><canvas id="cloud-chart-status"></canvas></div>';
+  h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;font-size:.76rem;color:var(--muted)">';
+  var allStatusKeys = Object.keys(orderStatusCount).sort(function (a, b) { return orderStatusCount[b] - orderStatusCount[a]; });
+  allStatusKeys.forEach(function (s) { h += '<span><span class="status-dot ' + s + '"></span> ' + statusLabel(s) + ' (' + (orderStatusCount[s] || 0) + ')</span>'; });
+  h += '</div></div>';
+  h += '<div class="section"><h2>💰 收益构成</h2><div class="chart-wrap"><canvas id="cloud-chart-source"></canvas></div>';
+  h += '<div style="text-align:center;font-size:.8rem;color:var(--muted);margin-top:6px">☁ 云端 ' + RMB(rs.cloud || 0) + ' (' + (rs.cloud_orders || 0) + '单) | 🖨 本地 ' + RMB(rs.local || 0) + ' (' + (rs.local_orders || 0) + '单)</div></div>';
+  h += '</div>';
+
+  // 图表行2：附加服务构成 + 单双面构成
+  var svcCounts = { 加急: 0, 派送: 0, 封面: 0 };
+  var fileDuplex = { 单面: 0, 双面: 0 };
+  filteredOrders.forEach(function (o) {
+    if (o.urgency && o.urgency !== '低') svcCounts['加急']++;
+    if (o.delivery_enabled) svcCounts['派送']++;
+    if (o.cover_page) svcCounts['封面']++;
+    (o.files || []).forEach(function (f) { if (f.duplex === 'off') fileDuplex['单面']++; else fileDuplex['双面']++; });
+  });
+  h += '<div class="chart-grid">';
+  h += '<div class="section"><h2>⚡ 附加服务构成 <span class="hint">（含该服务的订单数）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-svc"></canvas></div>';
+  h += '<div style="display:flex;gap:10px;justify-content:center;margin-top:6px;font-size:.8rem;color:var(--muted)">';
+  Object.keys(svcCounts).forEach(function (k) { h += '<span>' + k + ' ' + svcCounts[k] + '</span>'; });
+  h += '</div></div>';
+  h += '<div class="section"><h2>🖨 单双面构成 <span class="hint">（按文件数）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-duplex"></canvas></div></div>';
+  h += '</div>';
+
+  // 各用户排行
+  if (byUser.length > 0) {
+    h += '<div class="section chart-full"><h2>👥 成员 / 本地任务排行</h2><div class="chart-grid">';
+    h += '<div><h3 style="font-size:.85rem;margin:0 0 6px 4px;color:var(--muted)">💰 盈利</h3><div class="chart-wrap tall"><canvas id="cloud-chart-user-revenue"></canvas></div></div>';
+    h += '<div><h3 style="font-size:.85rem;margin:0 0 6px 4px;color:var(--muted)">📋 订单数</h3><div class="chart-wrap tall"><canvas id="cloud-chart-user-orders"></canvas></div></div>';
+    h += '</div></div>';
+  }
+
+  // 每日趋势
+  if (dailyTrend.length > 1) {
+    h += '<div class="section chart-full"><h2>📈 每日趋势 <span class="hint">— 收益（左轴）/ 订单数（右轴）</span></h2><div class="chart-wrap tall"><canvas id="cloud-chart-trend"></canvas></div></div>';
+  }
+
+  // 成员收益明细
+  if (byUser.length > 0) {
+    h += '<div class="section"><h2>👥 成员收益明细 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div class="table-wrap"><table><thead><tr><th>成员</th><th>盈利</th><th>占比</th><th>订单</th><th>文件</th><th>页数</th><th>均单收益</th></tr></thead><tbody>';
+    byUser.forEach(function (u) {
+      var pct = rs.total > 0 ? (u.revenue / rs.total * 100).toFixed(1) : 0;
+      var avgRev = u.order_count > 0 ? (u.revenue / u.order_count) : 0;
+      var isLocal = u.openid === 'local';
+      var mo = isLocal ? { name: '本地任务', color: '#548235' } : memberOfOpenid(u.openid);
+      var cell = '';
+      if (isLocal) {
+        cell = '<span class="member-tag" style="background:#548235">🖨 本地任务</span>';
+      } else if (mo) {
+        cell = '<span class="member-tag" style="background:' + mo.color + '">' + esc(mo.name) + '</span> <span style="font-size:.72rem;color:var(--muted)">' + esc(u.nickname || '') + '</span>';
+      } else {
+        var bOpts = '<option value="">未绑定</option>';
+        getMembers().forEach(function (mm) { bOpts += '<option value="' + mm.id + '">' + mm.name + '</option>'; });
+        cell = '<span style="font-size:.74rem;color:var(--muted)">' + esc(u.nickname || (u.openid || '').substring(0, 8) + '…') + '</span> ' +
+          '<span class="bound-badge no">未绑定</span> ' +
+          '<select onchange="updateBinding(\'' + esc(u.openid) + '\',this.value)" style="font-size:.76rem;padding:3px 6px">' + bOpts + '</select>';
+      }
+      h += '<tr><td class="l">' + cell + '</td><td class="pos" style="font-weight:700">' + RMB(u.revenue) + '</td><td><span class="tag b">' + pct + '%</span></td><td>' + u.order_count + '</td><td>' + u.file_count + '</td><td>' + (u.total_pages || 0) + '</td><td>' + RMB(avgRev) + '</td></tr>';
+    });
+    h += '</tbody></table></div></div>';
+  }
+
+  // 对账提示
+  var manual = {};
+  (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === _cloudMonth) manual[r.memberId] = (manual[r.memberId] || 0) + (r.amount || 0); });
+  var cloudByMember = {};
+  (_cloudData.by_user || []).forEach(function (u) {
+    var mo = memberOfOpenid(u.openid);
+    if (mo && mo.memberId) cloudByMember[mo.memberId] = (cloudByMember[mo.memberId] || 0) + (u.revenue || 0);
+  });
+  var hasManual = Object.keys(manual).length > 0;
+  if (hasManual || Object.keys(cloudByMember).length > 0) {
+    h += '<div class="section" style="background:var(--card-2)"><h2>🔍 云端 vs 手动代收 对账 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div class="table-wrap"><table><thead><tr><th>成员</th><th>云端已完成收费</th><th>手动代收录入</th><th>差额</th></tr></thead><tbody>';
+    var allIds = {};
+    Object.keys(manual).forEach(function (k) { allIds[k] = true; });
+    Object.keys(cloudByMember).forEach(function (k) { allIds[k] = true; });
+    Object.keys(allIds).forEach(function (mid) {
+      var cv = cloudByMember[mid] || 0, mv = manual[mid] || 0, diff = cv - mv;
+      h += '<tr><td style="font-weight:700;color:' + MC(mid) + '">' + MN(mid) + '</td><td class="pos">' + RMB(cv) + '</td><td>' + RMB(mv) + '</td><td class="' + (Math.abs(diff) > 0.01 ? (diff >= 0 ? 'pos' : 'neg') : '') + '">' + (diff === 0 ? '—' : (diff >= 0 ? '+' : '') + RMB(diff)) + '</td></tr>';
+    });
+    h += '</tbody></table></div><div style="margin-top:8px;font-size:.78rem;color:var(--muted)">差额 = 云端已完成收费 − 手动代收录入。正数说明还有未入账的收入。本地任务收益不计入成员对账。</div></div>';
+  }
+
+  // 订单明细
+  h += '<div class="section"><h2>📋 订单明细 <span class="hint">' + filteredOrders.length + ' 条，时间倒序' + (_cloudSourceFilter !== 'all' ? ' · 来源: ' + (_cloudSourceFilter === 'local' ? '🖨 本地' : '☁ 云端') : '') + '</span></h2>';
+  if (!filteredOrders.length) {
+    h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
+  } else {
+    h += '<div class="table-wrap"><table><thead><tr><th></th><th>订单号</th><th>来源</th><th>用户</th><th>状态</th><th>收益</th><th>文件</th><th>页数</th><th>类型</th><th>时间</th></tr></thead><tbody>';
+    filteredOrders.forEach(function (o) {
+      var isExp = !!_cloudExpanded[o.order_id];
+      var mo = o.openid === 'local' ? { name: '本地任务' } : memberOfOpenid(o.openid);
+      var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
+      h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '" onclick="_toggleOrderExpand(' + o.order_id + ')">';
+      h += '<td><span class="expand-icon">▶</span></td>';
+      h += '<td class="l" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
+      h += '<td>' + (o.source === 'local' ? '<span class="tag b">本地</span>' : '<span class="tag b">云端</span>') + '</td>';
+      h += '<td class="l">' + (mo && mo.color ? '<span class="member-tag" style="background:' + mo.color + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
+      h += '<td><span class="tag ' + statusClass(o.status) + '">' + statusLabel(o.status) + '</span></td>';
+      h += '<td class="pos" style="font-weight:700">' + RMB(o.revenue) + '</td>';
+      h += '<td>' + o.files_count + '</td>';
+      h += '<td>' + (o.total_page_count || 0) + '</td>';
+      h += '<td style="font-size:.78rem">' + (o.urgency && o.urgency !== '低' ? '⚡' + o.urgency : '') + (o.delivery_enabled ? ' 🚚' : '') + (o.cover_page ? ' 📄' : '') + '</td>';
+      h += '<td style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 16)) + '</td>';
+      h += '</tr>';
+      if (isExp && o.files && o.files.length) {
+        o.files.forEach(function (f) {
+          var fStatus = f.status || o.status;
+          h += '<tr class="file-sub-row">';
+          h += '<td></td>';
+          h += '<td class="l" colspan="2" style="padding-left:36px">📄 ' + esc(f.file_name) + '</td>';
+          h += '<td><span class="tag ' + statusClass(fStatus) + '">' + statusLabel(fStatus) + '</span></td>';
+          h += '<td class="pos">' + RMB(f.total_price) + '</td>';
+          h += '<td>' + f.copies + '份</td>';
+          h += '<td>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</td>';
+          h += '<td>' + (f.duplex === 'off' ? '单面' : '双面') + '</td>';
+          h += '<td colspan="2"></td>';
+          h += '</tr>';
+        });
+      }
+    });
+    h += '</tbody></table></div>';
+  }
+  h += '</div>';
+
+  h += '<div style="font-size:.76rem;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap">';
+  h += '<span>查询周期: ' + _cloudData.period.start + ' ~ ' + _cloudData.period.end + '</span>';
+  h += '<span>共 ' + orders.length + ' 笔订单 · ' + (rs.total_pages || 0) + ' 页 · 盈利 ' + RMB(rs.total) + '</span>';
+  h += '</div>';
+
+  el.innerHTML = h;
+  $$('#tab-cloud .num[data-count]').forEach(function (node) {
+    countUp(node, parseFloat(node.getAttribute('data-count')), { dec: 2, fmt: function (n) { return '¥' + n.toFixed(2); } });
+  });
+
+  _destroyCloudCharts();
+  setTimeout(function () {
+    _renderStatusDonut('cloud-chart-status', orderStatusCount, fileStatusCount);
+    _renderSourceDonut('cloud-chart-source', rs);
+    _renderServiceBar('cloud-chart-svc', svcCounts);
+    _renderDuplexDonut('cloud-chart-duplex', fileDuplex);
+    if (byUser.length > 0) {
+      _renderUserBar('cloud-chart-user-revenue', byUser, 'revenue', '盈利 (元)', null, function (u, f, mx) { var r = Math.max(.3, u[f] / mx); return 'rgb(' + Math.round(68 + (30 - 68) * r) + ',' + Math.round(110 + (70 - 110) * r) + ',' + Math.round(247 + (130 - 247) * r) + ')'; });
+      _renderUserBar('cloud-chart-user-orders', byUser, 'order_count', '订单数 (单)', null, function (u, f, mx) { var r = Math.max(.3, u[f] / mx); return 'rgb(' + Math.round(22 + (60 - 22) * r) + ',' + Math.round(163 + (80 - 163) * r) + ',' + Math.round(74 + (35 - 74) * r) + ')'; });
+    }
+    if (dailyTrend.length > 1) _renderDailyTrend('cloud-chart-trend', dailyTrend);
+  }, 60);
+}
+function _renderServiceBar(canvasId, svc) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var labels = Object.keys(svc), data = labels.map(function (k) { return svc[k]; });
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: labels, datasets: [{ label: '订单数', data: data, backgroundColor: ['#f59e0b', '#8b5cf6', '#e11d48'], borderRadius: 6 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: function (c) { return c.parsed.y + ' 单'; } } } },
+      scales: { y: { beginAtZero: true, grid: { color: 'rgba(120,130,160,.12)' } }, x: { grid: { display: false } } },
+      animation: { duration: 1000, easing: 'easeOutQuart' }
+    }
+  });
+}
+function _renderDuplexDonut(canvasId, dup) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var total = dup['单面'] + dup['双面'];
+  if (!total) return;
+  var ctx = canvas.getContext('2d');
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'doughnut',
+    data: { labels: ['单面', '双面'], datasets: [{ data: [dup['单面'], dup['双面']], backgroundColor: ['#38bdf8', '#a855f7'], borderWidth: 2, borderColor: 'transparent' }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, cutout: '55%',
+      plugins: { legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } } },
+      animation: { animateRotate: true, duration: 1200, easing: 'easeOutBack' }
+    }
+  });
+}
+
+/* ==================== TAB: 历史 ==================== */
+function renderHistory() {
+  var el = $('#tab-history');
+  var members = getMembers();
+  var keys = allMonthKeys().slice().reverse();
+  var h = '<div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">';
+  h += '<button class="btn pri" onclick="exportData()">📤 导出 JSON</button>';
+  h += '<button class="btn" onclick="document.getElementById(\'ifile\').click()">📥 导入 JSON</button>';
+  h += '<input type="file" id="ifile" accept=".json" style="display:none" onchange="importData(event)">';
+  h += '<button class="btn danger" onclick="resetData()">⚠ 重置</button></div>';
+
+  var list = keys.filter(function (k) { return monthRecordCount(k) > 0 || (STORE.notes || {})[k]; });
+  if (!list.length) {
+    h += '<div class="empty"><div class="ico">📅</div><h3>暂无历史记录</h3><p>在「记账」标签录入数据后自动生成月度记录。</p></div>';
+    el.innerHTML = h;
+    return;
+  }
+  h += '<div class="table-wrap"><table><thead><tr><th>月份</th><th>采购总额</th><th>人均</th><th>总收入</th>';
+  members.forEach(function (m) { h += '<th>' + m.name + ' 净额</th>'; });
+  h += '<th>备注</th><th></th></tr></thead><tbody>';
+  list.forEach(function (key) {
+    var m = monthFromRecords(key);
+    var r = calcMonth(m);
+    h += '<tr>';
+    h += '<td style="font-weight:700">' + m.label + '</td>';
+    h += '<td>' + RMB(r.totalExp) + '</td><td>' + RMB(r.perPerson) + '</td><td>' + RMB(r.totalInc) + '</td>';
+    members.forEach(function (mem) {
+      var net = r.redist[mem.id] - r.perPerson + (r.paid[mem.id] || 0);
+      h += '<td class="' + (net >= 0 ? 'pos' : 'neg') + '">' + (net >= 0 ? '+' : '') + RMB(net) + '</td>';
+    });
+    h += '<td style="max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.76rem">' + esc(m.note || '-') + '</td>';
+    h += '<td style="white-space:nowrap"><button class="btn sm" onclick="editMonth(\'' + key + '\')">编辑</button> <button class="btn danger sm" onclick="delMonth(\'' + key + '\')">删除</button></td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div>';
+  el.innerHTML = h;
+}
+function editMonth(key) { currentKey = key; switchTab('entry'); }
+function delMonth(key) {
+  openConfirm('确定删除「' + labelOf(key) + '」的所有采购 / 代收 / 评分数据？此操作不可恢复。', '删除').then(function (ok) {
+    if (!ok) return;
+    ['expenses', 'income', 'scores'].forEach(function (k) { STORE.records[k] = STORE.records[k].filter(function (r) { return monthKeyOf(r.date) !== key; }); });
+    delete STORE.notes[key];
+    save();
+    if (currentKey === key) currentKey = currentMonthKey();
+    renderAll();
+    toast('已删除 ' + labelOf(key), 'success');
+  });
+}
+function downloadJSON(data, filename) {
+  var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+}
+function exportData() { downloadJSON(STORE, '打印项目_清算备份_' + todayStr() + '.json'); toast('✅ 已导出', 'success'); }
+function importData(e) {
+  var file = e.target.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function (ev) {
+    try {
+      var data = JSON.parse(ev.target.result);
+      if (!data.records && !data.months) throw new Error('格式错误');
+      STORE = migrateConfig(data);
+      currentKey = currentMonthKey();
+      save();
+      renderAll();
+      toast('✅ 已导入 ' + allMonthKeys().length + ' 个月', 'success');
+    } catch (err) { toast('❌ 导入失败：' + err.message, 'error'); }
+  };
+  reader.readAsText(file);
+}
+function resetData() {
+  openConfirm('⚠ 确定删除所有数据？建议先导出备份。', '重置').then(function (ok) {
+    if (!ok) return;
+    STORE = migrateConfig(null);
+    currentKey = currentMonthKey();
+    unlocked = { score: false, expense: false, income: false, settings: false };
+    save();
+    renderAll();
+    toast('已重置，数据已清空');
+  });
+}
+
+/* ==================== TAB: 设置 ==================== */
+function renderSettings() {
+  var el = $('#tab-settings');
+  if (!unlocked.settings) {
+    el.innerHTML = '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">⚙️</div><h3>设置已锁定</h3><p style="margin-top:6px">修改密码、成员、绑定与结算参数需先解锁设置。</p><button class="btn pri" style="margin-top:16px" onclick="unlockFlow(\'settings\',\'设置\')">🔑 输入密码解锁</button></div></div>';
+    return;
+  }
+  var members = getMembers();
+  var scoreCap = getScoreCap();
+  var rate = Math.round(getRate() * 100);
+
+  var h = '';
+
+  // 密码管理
+  h += '<div class="section"><h2>🔐 敏感模块密码</h2>';
+  ['score', 'expense', 'income', 'settings'].forEach(function (k) {
+    h += '<div class="settings-row"><label>' + MODULE_NAMES[k] + ' 密码</label>';
+    h += '<input type="password" id="pwd-' + k + '" placeholder="输入新密码（至少 4 位）" style="width:200px" autocomplete="new-password">';
+    h += '<button class="btn green sm" onclick="updatePassword(\'' + k + '\')">保存</button>';
+    h += '<span style="color:var(--muted);font-size:.78rem">当前：' + (k === 'settings' ? '管理密码' : '编辑密码') + '</span>';
+    h += '</div>';
+  });
+  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码以明文保存于云端配置（受打印机令牌保护）。请牢记密码，遗忘后无法自助找回。</div></div>';
+
+  // 成员管理
+  h += '<div class="section"><h2>👥 成员管理</h2>';
+  h += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px">';
+  members.forEach(function (m) {
+    h += '<span class="member-tag" style="background:' + m.color + '">' + esc(m.name) + '<span class="member-del" onclick="removeMember(\'' + m.id + '\')" title="移除">✕</span></span>';
+  });
+  h += '</div>';
+  h += '<div class="settings-row"><label>添加成员</label>';
+  h += '<input type="text" id="newMemberName" placeholder="姓名" style="width:130px">';
+  h += '<input type="color" id="newMemberColor" value="#4472C4" style="width:38px;height:32px;padding:2px;border:1px solid var(--border-strong);border-radius:7px">';
+  h += '<button class="btn green sm" onclick="addMember()">+ 添加</button></div>';
+  h += '<div style="font-size:.78rem;color:var(--muted)">成员 ID 自动生成。删除成员不会删除已有记录（但不再参与后续计算）。</div></div>';
+
+  // 云端绑定
+  h += '<div class="section"><h2>🧑‍🤝‍🧑 云端成员绑定 <span class="hint">（openid → 成员）</span></h2>';
+  var binds = STORE.config.memberBindings || [];
+  if (binds.length) {
+    h += '<div class="table-wrap"><table><thead><tr><th>云端用户 openid</th><th>绑定成员</th><th></th></tr></thead><tbody>';
+    binds.forEach(function (b) {
+      h += '<tr><td style="font-family:monospace;font-size:.8rem" class="l">' + esc(b.openid) + '</td><td>';
+      h += '<select onchange="updateBinding(\'' + esc(b.openid) + '\',this.value)" style="font-size:.84rem;padding:4px 8px">';
+      h += '<option value="">未绑定</option>';
+      members.forEach(function (mm) { h += '<option value="' + mm.id + '"' + (b.memberId === mm.id ? ' selected' : '') + '>' + mm.name + '</option>'; });
+      h += '</select></td><td><button class="btn danger sm" onclick="updateBinding(\'' + esc(b.openid) + '\',\'\')">解绑</button></td></tr>';
+    });
+    h += '</tbody></table></div>';
+  } else {
+    h += '<div style="color:var(--muted);font-size:.85rem;margin-bottom:10px">暂无绑定。在「云端」模块的成员明细中，为未绑定用户选择成员即可完成绑定。</div>';
+  }
+  h += '<div class="settings-row"><label>手动绑定</label>';
+  h += '<input type="text" id="bindOpenid" placeholder="粘贴 openid" style="width:220px;font-family:monospace;font-size:.8rem">';
+  h += '<select id="bindMember" style="padding:8px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text)">';
+  members.forEach(function (mm) { h += '<option value="' + mm.id + '">' + mm.name + '</option>'; });
+  h += '</select>';
+  h += '<button class="btn green sm" onclick="manualBind()">绑定</button></div>';
+  h += '</div>';
+
+  // 结算参数
+  h += '<div class="section"><h2>⚖️ 结算参数</h2>';
+  h += '<div class="settings-row"><label>投资均分比例</label><input type="range" min="0" max="50" step="1" value="' + rate + '" oninput="onRateSlide(+this.value)" onchange="updateRate(+this.value)" style="width:180px"> <b id="rateValLive">' + rate + '%</b><span id="rateSvcLive" style="color:var(--muted);font-size:.78rem">服务按分占比 ' + (100 - rate) + '%</span></div>';
+  h += '<div class="settings-row"><label>评分单项上限</label><input type="number" min="1" max="100" step="1" value="' + scoreCap + '" onchange="updateScoreCap(+this.value)" style="width:90px"><span style="color:var(--muted);font-size:.78rem">修改后所有月份计算即时生效</span></div>';
+  h += '</div>';
+
+  // 外观
+  h += '<div class="section"><h2>🎨 外观</h2>';
+  h += '<div class="settings-row"><label>主题模式</label><select onchange="setThemeMode(this.value)" style="padding:8px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text)">';
+  h += '<option value="system"' + (themeMode === 'system' ? ' selected' : '') + '>🖥️ 自动（跟随系统）</option>';
+  h += '<option value="light"' + (themeMode === 'light' ? ' selected' : '') + '>☀️ 浅色</option>';
+  h += '<option value="dark"' + (themeMode === 'dark' ? ' selected' : '') + '>🌙 深色</option>';
+  h += '</select><span style="color:var(--muted);font-size:.78rem">自动模式识别 Windows 深色/浅色设置，配置保存在本机浏览器</span></div>';
+  h += '</div>';
+
+  // 数据管理
+  h += '<div class="section"><h2>💾 数据管理</h2>';
+  h += '<div class="settings-row"><label>备份</label><button class="btn sm" onclick="exportData()">📤 导出 JSON</button><button class="btn sm" onclick="document.getElementById(\'ifile-settings\').click()">📥 导入 JSON</button><input type="file" id="ifile-settings" accept=".json" style="display:none" onchange="importData(event)"></div>';
+  h += '<div class="settings-row"><label>危险操作</label><button class="btn danger sm" onclick="resetData()">⚠ 重置所有数据</button></div>';
+  h += '<div class="settings-row"><label>存储位置</label><span style="font-size:.84rem;color:var(--green);font-family:monospace">☁ 云端服务器（finance_config）</span></div>';
+  h += '</div>';
+
+  el.innerHTML = h;
+}
+function updatePassword(key) {
+  var input = $('#pwd-' + key);
+  if (!input) return;
+  var v = input.value.trim();
+  if (!v || v.length < 4) { toast('密码至少 4 位', 'error'); return; }
+  STORE.config.passwords[key] = v;
+  save();
+  input.value = '';
+  toast('✅ ' + MODULE_NAMES[key] + ' 密码已更新', 'success');
+}
+function updateScoreCap(val) {
+  if (val < 1) val = 1;
+  STORE.config.scoreCap = val;
+  save();
+  renderCurrent();
+  toast('✅ 评分上限已设为 ' + val + ' 分', 'success');
+}
+function addMember() {
+  var name = $('#newMemberName').value.trim();
+  if (!name) { toast('请输入姓名', 'error'); return; }
+  var members = getMembers();
+  members.push({ id: 'm' + Date.now().toString(36).slice(-4), name: name, color: $('#newMemberColor').value });
+  STORE.config.members = members;
+  save();
+  $('#newMemberName').value = '';
+  renderSettings();
+  toast('✅ 已添加成员：' + name, 'success');
+}
+function removeMember(mid) {
+  var members = getMembers();
+  var idx = members.findIndex(function (m) { return m.id === mid; });
+  if (idx === -1) return;
+  var name = members[idx].name;
+  openConfirm('确定移除成员「' + name + '」？已有记录不会丢失，但不再参与后续计算。', '移除').then(function (ok) {
+    if (!ok) return;
+    members.splice(idx, 1);
+    STORE.config.members = members;
+    save();
+    renderSettings();
+    toast('已移除：' + name);
+  });
+}
+function manualBind() {
+  var oid = $('#bindOpenid').value.trim();
+  if (!oid) { toast('请输入 openid', 'error'); return; }
+  var mid = $('#bindMember').value;
+  updateBinding(oid, mid);
+  $('#bindOpenid').value = '';
+  renderSettings();
+  toast('✅ 已绑定', 'success');
+}
+
+/* ==================== TAB: 关于 ==================== */
+function renderAbout() {
+  var el = $('#tab-about');
+  el.innerHTML =
+    '<div class="section" style="text-align:center;padding:46px 20px">' +
+    '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
+    '<h2 style="font-size:1.35rem;margin-bottom:6px">打印项目 · 收支清算</h2>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v3.0</div>' +
+    '<div style="max-width:460px;margin:0 auto;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
+    '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
+    '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
+    '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
+    '</div>' +
+    '</div>';
+}
+
+/* ==================== 初始化 ==================== */
+var _configLoaded = false;
+function loadConfig() {
+  _loadFromServer().then(function (res) {
+    if (!res.ok) { setCloudState(false); return; }
+    setCloudState(true);
+    var cloudData = res.data;
+    var hadCloud = !!cloudData;
+    if (cloudData) STORE = migrateConfig(cloudData);
+    // 无云端数据时尝试从本地旧文件一次性迁移
+    _loadFromLocalFile().then(function (localData) {
+      if (!hadCloud && localData) {
+        STORE = migrateConfig(localData);
+        save();
+        toast('✅ 已从本地文件迁移到云端', 'success');
+      }
+      // 旧版本地绑定迁移（仅当尚无云端绑定）
+      if (!(STORE.config.memberBindings || []).length) {
+        fetch('/api/local/bindings', { headers: apiHeaders() })
+          .then(function (r) { return r.json(); })
+          .then(function (bres) {
+            if (bres && bres.success && bres.bindings) {
+              var arr = [];
+              Object.keys(bres.bindings).forEach(function (oid) { var mid = bres.bindings[oid]; if (mid) arr.push({ openid: oid, memberId: mid }); });
+              if (arr.length) { STORE.config.memberBindings = arr; save(); }
+            }
+            finishLoad(hadCloud);
+          })
+          .catch(function () { finishLoad(hadCloud); });
+      } else {
+        finishLoad(hadCloud);
+      }
+    });
+  });
+}
+function finishLoad(hadCloud) {
+  var keys = allMonthKeys();
+  currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
+  // 云端月份预加载
+  loadCloudMonths().then(function () { _cloudMonthsReady = true; renderCloud(); });
+  renderAll();
+  checkHealth();
+  setInterval(checkHealth, 30000);
+  if (hadCloud) toast('✅ 已加载云端配置（' + monthRecordCount(currentKey) + ' 条当月记录）');
+  else toast('ℹ️ 欢迎使用，请在「记账」录入数据');
+}
+
+(function () {
+  // 导航
+  $$('#tabNav button').forEach(function (btn) {
+    btn.addEventListener('click', function () { switchTab(this.dataset.tab); });
+  });
+  $('#themeToggle').addEventListener('click', cycleThemeMode);
+  $('#blockRetry').addEventListener('click', retryConnect);
+  // 初始为 loading 骨架
+  renderAll();
+  loadConfig();
+})();
+</script>
+</body>
+</html>

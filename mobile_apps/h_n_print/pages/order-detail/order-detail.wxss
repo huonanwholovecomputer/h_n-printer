@@ -51,6 +51,10 @@ page {
 
 .status-bar {
   padding: 28rpx 28rpx 0;
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  flex-wrap: wrap;
 }
 
 .status-tag {
@@ -62,6 +66,16 @@ page {
   letter-spacing: 0.02em;
 }
 
+.schedule-detail-text {
+  display: inline-block;
+  font-size: 22rpx;
+  font-weight: 500;
+  color: #FF9500;
+  background: rgba(255, 149, 0, 0.1);
+  padding: 6rpx 20rpx;
+  border-radius: 20rpx;
+}
+
 .status-queued    { background-color: #FFF3E0; color: #E65100; }
 .status-printing  { background-color: #E3F2FD; color: #1565C0; }
 .status-sent      { background-color: #E8F5E9; color: #2E7D32; }
@@ -70,6 +84,9 @@ page {
 .status-reserved  { background-color: #FFF8E1; color: #F57F17; }
 .status-rejected  { background-color: #FFF3E0; color: #E65100; }
 .status-canceled  { background-color: var(--gray6); color: var(--gray); }
+.status-scheduled    { background-color: #FFF8E1; color: #F57F17; }
+.status-downloading  { background-color: #E3F2FD; color: #1565C0; }
+.status-waiting      { background-color: #FFF3E0; color: #E65100; }
 
 /* ── Info Groups ── */
 .info-group {
@@ -151,6 +168,9 @@ page {
 .status-tag-mini.status-sent     { background-color: #E8F5E9; color: #2E7D32; }
 .status-tag-mini.status-failed   { background-color: #FFEBEE; color: #C62828; }
 .status-tag-mini.status-canceled { background-color: var(--gray6); color: var(--gray); }
+.status-tag-mini.status-scheduled   { background-color: #FFF8E1; color: #F57F17; }
+.status-tag-mini.status-downloading { background-color: #E3F2FD; color: #1565C0; }
+.status-tag-mini.status-waiting     { background-color: #FFF3E0; color: #E65100; }
 
 .detail-file-meta {
   display: flex;
