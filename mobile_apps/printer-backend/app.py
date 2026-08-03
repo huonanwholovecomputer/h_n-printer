@@ -2855,14 +2855,14 @@ def submit_order():
         schedule_mode = "now"
     scheduled_at = ""
     if schedule_mode == "at":
-        # 指定时间：日期（0=今天 1=明天 2=后天 3=大后天）+ HH:MM
+        # 指定时间：日期（0=今天 1=明天 2=后天）+ HH:MM
         schedule_day = int(data.get("schedule_day", 0) or 0)
         schedule_time = (data.get("schedule_time", "") or "").strip()
         m = re.match(r"^(\d{1,2}):(\d{2})$", schedule_time)
         if not m:
             return jsonify({"success": False, "message": "请选择预约时间"}), 400
         hh, mm = int(m.group(1)), int(m.group(2))
-        if hh > 23 or mm > 59 or schedule_day not in (0, 1, 2, 3):
+        if hh > 23 or mm > 59 or schedule_day not in (0, 1, 2):
             return jsonify({"success": False, "message": "预约时间格式不正确"}), 400
         target = (datetime.now() + timedelta(days=schedule_day)).replace(
             hour=hh, minute=mm, second=0, microsecond=0)

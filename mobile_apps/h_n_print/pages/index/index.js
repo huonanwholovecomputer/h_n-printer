@@ -2,6 +2,9 @@
 const { CONFIG } = require('../../utils/config')
 const { request } = require('../../utils/request')
 
+// 时间滚轮（picker-view）：item 高 88rpx、可视区 440rpx 由 WXSS 定义
+// （picker-view 的贴合单元 = column 内 item 高度，无需 JS 参与几何计算）
+
 // 初始主题值：直接从 app.globalData 读取（同步、无延迟），绕过 storage 的异步写窗口
 // 避免首次创建组件时首帧使用过期值触发 CSS transition 闪烁
 function _initIsDark() {
@@ -37,8 +40,24 @@ Component({
     glowStyle: '',             // 内联 text-shadow，JS 逐帧控制渐隐
     // 无障碍打印预约（仅管理员）：now=立即 / at=指定时间 / countdown=倒计时
     scheduleMode: 'now',
-    scheduleDays: ['今天', '明天', '后天', '大后天'],
+    scheduleDays: ['今天', '明天', '后天'],   // 动态生成：今天(周一)/明天(周二)/后天(周三)
     scheduleDayIndex: 0,
+    scheduleVisible: false,    // 开始方式面板是否渲染（收起动画结束后卸载）
+    scheduleAnim: 'collapsed', // 展开/收起过渡状态：collapsed | expanded
+    scheduleOptionsVisible: false,    // 模式选项行（指定时间/倒计时）是否渲染（切换模式时收起动画结束后换行）
+    scheduleOptionsAnim: 'collapsed', // 选项行展开/收起过渡状态：collapsed | expanded
+    // 自定义玻璃选择弹窗（替代微信原生 picker：日期列表 + 时间双列滚轮）
+    showScheduleDayPicker: false,     // 日期选择弹窗
+    showScheduleTimePicker: false,    // 时间选择弹窗
+    hourItems: Array.from({ length: 24 }, (_, i) => String(i).padStart(2, '0')),
+    minuteItems: Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')),
+    hourWheelIndex: 8,                // 时滚轮选中索引（默认 08:00）
+    minuteWheelIndex: 0,
+    timeWheelValue: [8, 0],           // picker-view 选中索引数组（原生定位/贴合）
+    curHour: 0,                       // 打开弹窗时的当前时刻（今天裁剪已过时间用）
+    curMin: 0,
+    hourStart: 0,                     // 今天：小时列起始小时（curMin=59 时为 curHour+1）
+    minuteStart: 0,                   // 今天：当前小时的分钟列起始分钟（curMin+1）
     scheduleTime: '',
     countdownMin: 5,
     countdownSec: 0,
@@ -107,6 +126,7 @@ Component({
       this._initScrollEngine()
       this._uploadTimers = {}   // { index: intervalId } — 每个文件独立的进度条定时器
       this._pollTimers = {}     // { index: intervalId } — 页数轮询定时器
+      this._buildScheduleDays()
       this.doLogin()
     },
     detached() {
@@ -119,6 +139,8 @@ Component({
   },
   pageLifetimes: {
     show() {
+      // 跨天/切后台回来时刷新"今天(周X)"日期文案（scheduleDayIndex 保持有效）
+      this._buildScheduleDays()
       this.data.isDarkMode = getApp().globalData.isDarkMode
       // 防止 tab 切换时闪白/闪黑：先同步原生背景色
       const app = getApp()
@@ -1550,6 +1572,16 @@ Component({
       const turningOn = !this.data.autoPrintEnabled
       this.setData({ autoPrintEnabled: turningOn })
       if (turningOn) {
+        // 展开动画：先以 collapsed 初始态渲染，渲染完成后再切 expanded 触发 CSS 过渡
+        if (this._scheduleLeaveTimer) { clearTimeout(this._scheduleLeaveTimer); this._scheduleLeaveTimer = null }
+        // 选项行随面板整体展开（不单独播动画）：当前模式带选项则直接就位
+        this.setData({
+          scheduleVisible: true, scheduleAnim: 'collapsed',
+          scheduleOptionsVisible: this.data.scheduleMode !== 'now',
+          scheduleOptionsAnim: 'expanded',
+        }, () => {
+          this.setData({ scheduleAnim: 'expanded' })
+        })
         // ⚡ 闪电发光 + Canvas 绘制折线电流
         // glowPhase 三态：'' | 'striking' | 'fading' | 'reset'（强制清除）
         this.setData({
@@ -1565,10 +1597,30 @@ Component({
           }, 350)
         }, 30)
       } else {
+        // 收起动画：先切 collapsed 触发 CSS 过渡，动画结束后再卸载面板
+        // （快速重新打开时清掉卸载定时器，避免面板被误卸载）
+        this.setData({ scheduleAnim: 'collapsed', scheduleOptionsVisible: false, scheduleOptionsAnim: 'collapsed' })
+        if (this._scheduleOptionsTimer) { clearTimeout(this._scheduleOptionsTimer); this._scheduleOptionsTimer = null }
+        this._scheduleLeaveTimer = setTimeout(() => {
+          this.setData({ scheduleVisible: false })
+          this._scheduleLeaveTimer = null
+        }, 320)
         // 关闭开关时立即清除光晕
         this._clearGlowCompletely()
         this._stopBreathingGlow()
       }
+    },
+
+    // 生成"今天(周一)/明天(周二)/后天(周三)"日期选项（仅保留 3 天）
+    _buildScheduleDays() {
+      const weekNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+      const labels = ['今天', '明天', '后天']
+      const list = labels.map((label, i) => {
+        const d = new Date()
+        d.setDate(d.getDate() + i)
+        return `${label}(${weekNames[d.getDay()]})`
+      })
+      this.setData({ scheduleDays: list })
     },
 
     // JS 逐帧渐隐 text-shadow（保持与初始 glowStyle 相同的颜色/层数结构，仅缩放 alpha+blur）
@@ -1765,18 +1817,172 @@ Component({
 
     onScheduleMode(e) {
       const mode = (e.currentTarget.dataset.mode || 'now')
-      this.setData({ scheduleMode: mode })
-      // 高度变化 → 刷新滚动边界
-      this._scheduleMeasure()
-      setTimeout(() => this._scheduleMeasure(400), 400)
+      if (mode === this.data.scheduleMode) return  // 重复点击当前模式：无操作
+      const hadOptions = this.data.scheduleMode !== 'now'
+      const willHaveOptions = mode !== 'now'
+      const refresh = () => {
+        this._scheduleMeasure()
+        setTimeout(() => this._scheduleMeasure(400), 400)
+      }
+      if (hadOptions && willHaveOptions) {
+        // 收起旧选项行 → 切换模式 → 展开新选项行（两阶段，高度自然过渡）
+        this.setData({ scheduleOptionsAnim: 'collapsed' })
+        if (this._scheduleOptionsTimer) { clearTimeout(this._scheduleOptionsTimer); this._scheduleOptionsTimer = null }
+        this._scheduleOptionsTimer = setTimeout(() => {
+          this._scheduleOptionsTimer = null
+          this.setData({ scheduleMode: mode, scheduleOptionsVisible: true, scheduleOptionsAnim: 'collapsed' }, () => {
+            this.setData({ scheduleOptionsAnim: 'expanded' })
+          })
+          refresh()
+        }, 260)
+      } else if (hadOptions && !willHaveOptions) {
+        // 收起旧选项行 → 卸载（切到"立即开始"）
+        this.setData({ scheduleOptionsAnim: 'collapsed' })
+        if (this._scheduleOptionsTimer) { clearTimeout(this._scheduleOptionsTimer); this._scheduleOptionsTimer = null }
+        this._scheduleOptionsTimer = setTimeout(() => {
+          this._scheduleOptionsTimer = null
+          this.setData({ scheduleMode: mode, scheduleOptionsVisible: false, scheduleOptionsAnim: 'collapsed' })
+          refresh()
+        }, 260)
+      } else {
+        // 从"立即开始"切到带选项模式：直接展开
+        this.setData({ scheduleMode: mode, scheduleOptionsVisible: true, scheduleOptionsAnim: 'collapsed' }, () => {
+          this.setData({ scheduleOptionsAnim: 'expanded' })
+        })
+        refresh()
+      }
     },
 
-    onScheduleDayChange(e) {
-      this.setData({ scheduleDayIndex: e.detail.value })
+    // ── 自定义日期选择弹窗 ──
+
+    onOpenScheduleDayPicker() {
+      if (this.data.modalClosing) return
+      this.setData({ showScheduleDayPicker: true })
     },
 
-    onScheduleTimeChange(e) {
-      this.setData({ scheduleTime: e.detail.value || '' })
+    onSelectScheduleDay(e) {
+      if (this.data.modalClosing) return
+      // 先播退出动画再关闭（与取消按钮一致的 sheetSpringOut）
+      this.setData({
+        scheduleDayIndex: Number(e.currentTarget.dataset.index),
+        modalClosing: true,
+      })
+      setTimeout(() => {
+        this.setData({ showScheduleDayPicker: false, modalClosing: false })
+      }, 180)
+    },
+
+    onCloseScheduleDayPicker() {
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showScheduleDayPicker: false, modalClosing: false })
+      }, 180)
+    },
+
+    // ── 自定义时间选择弹窗（官方 picker-view 双列滚轮） ──
+
+    // 分钟列构建（数组元素即真实分钟字符串，索引仅用于 picker-view 定位）：
+    // 非今天 → 00-59 全量；今天 → 选中小时为当前小时时仅 curMin+1..59，未来小时全量
+    _buildMinuteItems(hourIndex, isToday, hourStart, minuteStart) {
+      const full = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0'))
+      if (!isToday) return full
+      if (hourStart + hourIndex > this.data.curHour) return full
+      return Array.from({ length: 59 - this.data.curMin }, (_, i) => String(minuteStart + i).padStart(2, '0'))
+    },
+
+    onOpenScheduleTimePicker() {
+      if (this.data.modalClosing) return
+      const now = new Date()
+      const curHour = now.getHours()
+      const curMin = now.getMinutes()
+      const isToday = this.data.scheduleDayIndex === 0
+      // 今天：已过时间直接删除（不渲染）→ 分钟从 curMin+1 起；
+      // curMin=59 时当前小时无可用分钟，小时列从 curHour+1 起
+      let hourStart = 0
+      let minuteStart = 0
+      if (isToday) {
+        minuteStart = curMin + 1
+        if (minuteStart > 59) {
+          minuteStart = 0
+          hourStart = curHour + 1
+          if (hourStart > 23) {
+            wx.showToast({ title: '今天已无可用时间，请选择明天', icon: 'none', duration: 2500 })
+            return
+          }
+        } else {
+          hourStart = curHour
+        }
+      }
+      const hourItems = Array.from({ length: 24 - hourStart }, (_, i) => String(hourStart + i).padStart(2, '0'))
+      // 初始选中：已有选择且仍可用则保留，否则最早可用（小时列第 0 项）
+      let hi = 0
+      let mi = 0
+      const t = (this.data.scheduleTime || '').match(/^(\d{1,2}):(\d{2})$/)
+      if (t) {
+        const selH = parseInt(t[1], 10)
+        const selM = parseInt(t[2], 10)
+        if (selH >= hourStart && selH <= 23 && selM <= 59) {
+          hi = selH - hourStart
+          const mStart = (isToday && selH === curHour) ? minuteStart : 0
+          if (selM >= mStart) mi = selM - mStart
+        }
+      }
+      const minuteItems = this._buildMinuteItems(hi, isToday, hourStart, minuteStart)
+      if (mi >= minuteItems.length) mi = 0
+      // value 由渲染层原生定位到选中项（系统 picker 同款引擎，精确居中）
+      this.setData({
+        showScheduleTimePicker: true,
+        hourItems,
+        minuteItems,
+        hourWheelIndex: hi,
+        minuteWheelIndex: mi,
+        timeWheelValue: [hi, mi],
+        curHour,
+        curMin,
+        hourStart,
+        minuteStart,
+      })
+    },
+
+    // picker-view 滚动变化：索引由组件原生给出（贴合后精确值）
+    // 今天：小时变化 → 分钟列按新小时重建，分钟重置为该小时第一个可用分钟（级联）
+    onTimeWheelChange(e) {
+      const v = (e.detail && e.detail.value) || []
+      if (v.length < 2) return
+      const hi = v[0]
+      const mi = v[1]
+      if (this.data.scheduleDayIndex === 0 && hi !== this.data.hourWheelIndex) {
+        const minuteItems = this._buildMinuteItems(hi, true, this.data.hourStart, this.data.minuteStart)
+        this.setData({
+          hourWheelIndex: hi,
+          minuteWheelIndex: 0,
+          minuteItems,
+          timeWheelValue: [hi, 0],
+        })
+        return
+      }
+      this.setData({ hourWheelIndex: hi, minuteWheelIndex: mi })
+    },
+
+    onConfirmScheduleTime() {
+      // 数组元素即真实时间字符串（已过时间已被裁剪，无需额外校验）
+      const hh = this.data.hourItems[this.data.hourWheelIndex]
+      const mm = this.data.minuteItems[this.data.minuteWheelIndex]
+      if (!hh || !mm) {
+        wx.showToast({ title: '请选择有效时间', icon: 'none', duration: 2000 })
+        return
+      }
+      this.setData({ scheduleTime: `${hh}:${mm}` })
+      this.onCloseScheduleTimePicker()
+    },
+
+    onCloseScheduleTimePicker() {
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showScheduleTimePicker: false, modalClosing: false })
+      }, 180)
     },
 
     onCountdownMinInput(e) {
@@ -1966,7 +2172,7 @@ Component({
           pickup_address: this.data.pickupAddress,
           skip_page_validation: skipPageValidation ? 1 : 0,
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
-          // 无障碍打印预约：now=立即 / at=指定时间（今天~大后天 + HH:MM）/ countdown=倒计时（分+秒）
+          // 无障碍打印预约：now=立即 / at=指定时间（今天~后天 + HH:MM）/ countdown=倒计时（分+秒）
           schedule_mode: this.data.autoPrintEnabled ? this.data.scheduleMode : 'now',
           schedule_day: this.data.autoPrintEnabled && this.data.scheduleMode === 'at' ? this.data.scheduleDayIndex : 0,
           schedule_time: this.data.autoPrintEnabled && this.data.scheduleMode === 'at' ? this.data.scheduleTime : '',

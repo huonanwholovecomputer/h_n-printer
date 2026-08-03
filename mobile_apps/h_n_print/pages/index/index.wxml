@@ -227,8 +227,8 @@
           </view>
         </view>
 
-        <!-- 无障碍打印开始方式（仅管理员，开关开启时显示） -->
-        <view wx:if="{{userRole === 'admin' && autoPrintEnabled}}" class="schedule-section {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.2s">
+        <!-- 无障碍打印开始方式（仅管理员，开关开启时展开 / 关闭时收起动画） -->
+        <view wx:if="{{userRole === 'admin' && scheduleVisible}}" class="schedule-section {{scheduleAnim}}">
           <view class="schedule-title">开始方式</view>
           <view class="schedule-modes">
             <view class="schedule-mode {{scheduleMode === 'now' ? 'active' : ''}}" data-mode="now" bindtap="onScheduleMode">立即开始</view>
@@ -236,26 +236,28 @@
             <view class="schedule-mode {{scheduleMode === 'countdown' ? 'active' : ''}}" data-mode="countdown" bindtap="onScheduleMode">倒计时</view>
           </view>
 
-          <!-- 指定时间：日期（今天~大后天）+ 时间（精确到分） -->
-          <view wx:if="{{scheduleMode === 'at'}}" class="schedule-options">
-            <picker class="schedule-picker" mode="selector" range="{{scheduleDays}}" value="{{scheduleDayIndex}}" bindchange="onScheduleDayChange">
-              <view class="schedule-picker-value">{{scheduleDays[scheduleDayIndex]}}</view>
-            </picker>
-            <picker class="schedule-picker" mode="time" value="{{scheduleTime}}" bindchange="onScheduleTimeChange">
-              <view class="schedule-picker-value {{scheduleTime ? '' : 'placeholder'}}">{{scheduleTime || '选择时间'}}</view>
-            </picker>
-          </view>
-
-          <!-- 倒计时：分 + 秒 -->
-          <view wx:if="{{scheduleMode === 'countdown'}}" class="schedule-options">
-            <view class="countdown-input-wrap">
-              <input class="countdown-input" type="number" value="{{countdownMin}}" bindinput="onCountdownMinInput" />
-              <text class="countdown-unit">分</text>
-            </view>
-            <view class="countdown-input-wrap">
-              <input class="countdown-input" type="number" value="{{countdownSec}}" bindinput="onCountdownSecInput" />
-              <text class="countdown-unit">秒</text>
-            </view>
+          <!-- 模式选项行：指定时间 / 倒计时（切换模式时平滑展开/收起） -->
+          <view wx:if="{{scheduleOptionsVisible}}" class="schedule-options {{scheduleOptionsAnim}}">
+            <block wx:if="{{scheduleMode === 'at'}}">
+              <!-- 指定时间：日期（今天~后天）+ 时间（精确到分）——自定义玻璃选择弹窗 -->
+              <view class="schedule-picker" bindtap="onOpenScheduleDayPicker">
+                <view class="schedule-picker-value">{{scheduleDays[scheduleDayIndex]}}</view>
+              </view>
+              <view class="schedule-picker" bindtap="onOpenScheduleTimePicker">
+                <view class="schedule-picker-value {{scheduleTime ? '' : 'placeholder'}}">{{scheduleTime || '选择时间'}}</view>
+              </view>
+            </block>
+            <block wx:elif="{{scheduleMode === 'countdown'}}">
+              <!-- 倒计时：分 + 秒 -->
+              <view class="countdown-input-wrap">
+                <input class="countdown-input" type="number" value="{{countdownMin}}" bindinput="onCountdownMinInput" />
+                <text class="countdown-unit">分</text>
+              </view>
+              <view class="countdown-input-wrap">
+                <input class="countdown-input" type="number" value="{{countdownSec}}" bindinput="onCountdownSecInput" />
+                <text class="countdown-unit">秒</text>
+              </view>
+            </block>
           </view>
         </view>
 
@@ -310,6 +312,55 @@
     <text class="body-small">请先出示管理员许可</text>
     <view class="modal-buttons">
       <button class="btn-primary" bindtap="onAccessDeniedConfirm" hover-class="tap-active">前往获取</button>
+    </view>
+  </view>
+</view>
+
+<!-- 自定义日期选择弹窗（玻璃风格，替代微信原生 picker） -->
+<view wx:if="{{showScheduleDayPicker}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" bindtap="onCloseScheduleDayPicker">
+  <view class="modal-sheet schedule-modal-sheet" catchtap="noop">
+    <view class="sheet-title">选择日期</view>
+    <view class="sheet-option-list">
+      <view wx:for="{{scheduleDays}}" wx:key="*this"
+            class="sheet-option {{index === scheduleDayIndex ? 'sheet-option-selected' : ''}}"
+            bindtap="onSelectScheduleDay" data-index="{{index}}">
+        <text>{{item}}</text>
+        <text wx:if="{{index === scheduleDayIndex}}" class="sheet-option-check">✓</text>
+      </view>
+    </view>
+    <view class="modal-buttons">
+      <button class="btn-secondary modal-half-btn" bindtap="onCloseScheduleDayPicker">取消</button>
+    </view>
+  </view>
+</view>
+
+<!-- 自定义时间选择弹窗（玻璃双列滚轮，替代微信原生 picker） -->
+<view wx:if="{{showScheduleTimePicker}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" bindtap="onCloseScheduleTimePicker">
+  <view class="modal-sheet schedule-modal-sheet" catchtap="noop">
+    <view class="sheet-title">选择时间</view>
+    <view class="time-wheel-row">
+      <!-- 官方 picker-view 滚轮（系统 picker 底层引擎）：贴合/惯性/边界全部原生，
+           value 指定选中索引，渲染层精确居中 → 零漂移、不过度滚动 -->
+      <picker-view class="time-picker-view" value="{{timeWheelValue}}" immediate-change
+                   mask-class="wheel-mask"
+                   indicator-style="background: rgba(255,149,0,0.10); box-shadow: inset 0 1rpx 0 rgba(255,149,0,0.35), inset 0 -1rpx 0 rgba(255,149,0,0.35); border-radius: 12rpx;"
+                   bindchange="onTimeWheelChange">
+        <!-- 动态列：今天已过的时间直接从数组中删除（小时列从当前小时起，
+             当前小时仅显示可用分钟；选中小时变化时分钟列级联重建） -->
+        <picker-view-column>
+          <view wx:for="{{hourItems}}" wx:key="*this"
+                class="wheel-item {{index === hourWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
+        </picker-view-column>
+        <picker-view-column>
+          <view wx:for="{{minuteItems}}" wx:key="*this"
+                class="wheel-item {{index === minuteWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
+        </picker-view-column>
+      </picker-view>
+      <text class="wheel-colon">:</text>
+    </view>
+    <view class="modal-buttons">
+      <button class="btn-secondary modal-half-btn" bindtap="onCloseScheduleTimePicker">取消</button>
+      <button class="btn-primary modal-half-btn" bindtap="onConfirmScheduleTime">确定</button>
     </view>
   </view>
 </view>
