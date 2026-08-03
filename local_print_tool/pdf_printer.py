@@ -15,6 +15,9 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+# P1-9: 标记 GDI 打印已中途出纸（StartPage 已执行）。带此前缀的失败消息不得再降级整单重打。
+MID_PRINT_MARKER = "[已出纸] "
+
 
 # ============================================================
 # PDF 信息读取
@@ -100,10 +103,43 @@ def get_pdf_info(pdf_path: str) -> dict:
         return {"page_count": page_count, "orientation": orientation}
 
     except ImportError:
-        logger.warning("PyPDF2 未安装，无法读取 PDF 信息")
-        return {"page_count": 0, "orientation": "unknown"}
+        logger.warning("PyPDF2 未安装，无法读取 PDF 信息，回退 fitz 统计页数")
+        return _get_pdf_info_via_fitz(pdf_path)
     except Exception as e:
-        logger.warning(f"读取 PDF 信息失败 ({pdf_path}): {e}")
+        # P2-13: PyPDF2 失败（如加密 PDF 页数读出 0）→ 回退 fitz 统计真实页数，进度条按真实页数
+        logger.warning(f"PyPDF2 读取 PDF 信息失败 ({pdf_path}): {e}，回退 fitz 统计页数")
+        return _get_pdf_info_via_fitz(pdf_path)
+
+
+def _get_pdf_info_via_fitz(pdf_path: str) -> dict:
+    """PyPDF2 失败（如加密 PDF）时，用 PyMuPDF(fitz) 回退统计页数。
+
+    多数加密 PDF fitz 可直接打开读取，页数统计比 PyPDF2 更可靠。
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        try:
+            page_count = len(doc)
+            has_portrait = False
+            has_landscape = False
+            for page in doc:
+                r = page.rect
+                if r.width > r.height:
+                    has_landscape = True
+                else:
+                    has_portrait = True
+            if has_landscape and has_portrait:
+                orientation = "mixed"
+            elif has_landscape:
+                orientation = "landscape"
+            else:
+                orientation = "portrait"
+            return {"page_count": page_count, "orientation": orientation}
+        finally:
+            doc.close()
+    except Exception as e2:
+        logger.warning(f"fitz 读取 PDF 信息也失败 ({pdf_path}): {e2}")
         return {"page_count": 0, "orientation": "unknown"}
 
 
@@ -204,6 +240,12 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
     解析用户输入的页码范围，返回 0-based 页码列表。
 
     输入示例: "1-5", "1,3,5-7", "1-5、7、9"
+
+    注意：拆分语义必须与 printer_config._parse_range_parts / _count_pages_in_range
+    保持同步（否则计费与实打不一致）：
+      - "23-4" 智能拆分为页码 {2, 3, 4}
+      - 超长区间 "1-9999" 先收窄到 [1, total_pages] 再迭代，防 range() 冻结
+      - 输入非空但全部无效 → 警告后仍打印全部（打印全部比不打印安全）
     """
     if not page_range or not page_range.strip():
         return list(range(total_pages))
@@ -221,12 +263,25 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
             try:
                 a, b = part.split("-", 1)
                 start, end = int(a), int(b)
-                if 1 <= start < end:
+                if start < end:
+                    # P1-3: 超长区间收窄后再迭代，避免 range() 冻结/耗尽内存
+                    start = max(start, 1)
+                    end = min(end, total_pages)
                     for p in range(start, end + 1):
                         if 1 <= p <= total_pages:
                             pages.add(p - 1)
+                elif start > end and len(a) > 1:
+                    # 智能拆分（与 printer_config 一致）: "23-4" → 页码 2 + 范围 3-4
+                    prefix = int(a[:-1])
+                    last = int(a[-1])
+                    if prefix < end:
+                        for p in range(last, end + 1):
+                            if 1 <= p <= total_pages:
+                                pages.add(p - 1)
+                        if 1 <= prefix <= total_pages:
+                            pages.add(prefix - 1)
                 else:
-                    skipped.append(part)  # start >= end 视为格式错误
+                    skipped.append(part)  # start >= end 且无法智能拆分 → 格式错误
             except ValueError:
                 skipped.append(part)
         else:
@@ -244,7 +299,8 @@ def _parse_page_range(page_range: str, total_pages: int) -> list[int]:
         print(f"[打印] ⚠ 页码范围无效/超限部分已忽略: {', '.join(skipped)}")
 
     if not pages:
-        logger.warning(f"页码范围解析后无有效页，退回全打印 (输入: '{page_range}', 总页数={total_pages})")
+        # P2-1: 输入非空但全部无效 → 不再静默回退，明确警告后仍打印全部
+        logger.warning(f"页码范围全部无效，退回全打印 (输入: '{page_range}', 总页数={total_pages})")
         print(f"[打印] ⚠ 页码范围解析后无有效页，将打印全部 {total_pages} 页")
         return list(range(total_pages))
     return sorted(pages)
@@ -312,6 +368,11 @@ def print_pdf(
     if not os.path.isfile(pdf_path):
         return False, f"PDF 文件不存在: {pdf_path}"
 
+    # P0-2: 统一页数校验 — 0 页 PDF 直接失败，不进入 GDI/Sumatra 任何分支（防空文件报成功漏打）
+    total_pages = count_pdf_pages(pdf_path)
+    if total_pages <= 0:
+        return False, f"PDF 无有效页面（页数为 0，文件为空、损坏或无法解析）: {pdf_path}"
+
     system = platform.system()
 
     # ── 打印参数总览 ──
@@ -333,6 +394,13 @@ def print_pdf(
             print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
         print(f"[打印] ✗ 方案1 失败: {msg}")
+
+        # P1-9: GDI 中途失败（已开始出纸，部分页已打印）→ 不再降级 Sumatra/循环整单重打，避免重复页
+        if msg.startswith(MID_PRINT_MARKER):
+            reason = msg[len(MID_PRINT_MARKER):]
+            logger.error(f"GDI 打印中途失败（部分页面已出纸），为防重复页不再降级整单重打: {reason}")
+            print(f"[打印] ✗ GDI 打印中途失败（部分页面已出纸），为避免重复页不再降级整单重打: {reason}")
+            return False, reason
 
         # 方案 2: SumatraPDF 降级
         sumatra = _find_sumatra_pdf()
@@ -386,6 +454,7 @@ def _print_pdf_native(
     doc = None
     hdc = None
     started = False
+    page_started = False  # P1-9: 是否已开始出纸（StartPage 已执行）
 
     try:
         doc = fitz.open(pdf_path)
@@ -433,7 +502,12 @@ def _print_pdf_native(
                 print(f"[GDI] ⚠ win32gui.ResetDC 失败（使用默认设置）: {e}")
                 logger.warning(f"GDI: win32gui.ResetDC 失败: {e}")
         else:
-            print(f"[GDI] ⚠ 未能获取 DEVMODE，使用打印机默认设置")
+            # P1-8: 获取 DEVMODE 失败 — 请求了双面则明确报错（不再静默默认设置）；仅单面时用默认设置继续
+            if duplex == "on":
+                print(f"[GDI] ✗ 获取 DEVMODE 失败，且请求了双面打印 — 中止以防双面不生效")
+                logger.error(f"GDI: 获取 DEVMODE 失败（duplex=on），中止打印: {printer}")
+                return False, f"获取打印机 DEVMODE 失败，无法保证双面设置: {printer}"
+            print(f"[GDI] ⚠ 未能获取 DEVMODE，使用打印机默认设置（单面打印不受影响）")
             logger.warning("GDI: 未能获取 DEVMODE，双面设置可能不生效")
 
         # 获取打印机可打印区域和分辨率
@@ -470,10 +544,33 @@ def _print_pdf_native(
         for copy_idx in range(copies):
             for page_idx in pages_to_print:
                 page_seq += 1
-                hdc.StartPage()
-
                 page = doc[page_idx]
-                mat = fitz.Matrix(dpi_x / 72.0, dpi_y / 72.0)
+
+                # P0-1: 渲染前估算像素总量 — 超 4 亿像素（约 32 位进程上限）自动降 DPI；
+                #       仍超限则拒绝该页（在 StartPage 之前检查，避免浪费纸张并可降级）
+                page_w_pts = page.rect.width
+                page_h_pts = page.rect.height
+                MAX_RENDER_PIXELS = 400_000_000
+                render_dpi_x = dpi_x
+                render_dpi_y = dpi_y
+                pixel_count = (page_w_pts * render_dpi_x / 72.0) * (page_h_pts * render_dpi_y / 72.0)
+                if pixel_count > MAX_RENDER_PIXELS:
+                    reduced_dpi = max(1, int((MAX_RENDER_PIXELS / (page_w_pts * page_h_pts)) ** 0.5 * 72.0))
+                    render_dpi_x = min(render_dpi_x, reduced_dpi)
+                    render_dpi_y = min(render_dpi_y, reduced_dpi)
+                    logger.warning(f"GDI: 页面过大 ({page_w_pts:.0f}x{page_h_pts:.0f}pt)，"
+                                   f"像素量 {int(pixel_count):,} > {MAX_RENDER_PIXELS:,}，渲染 DPI 由 {dpi_x} 自动降为 {render_dpi_x}")
+                    print(f"[GDI] ⚠ 页面过大，渲染 DPI 由 {dpi_x} 自动降为 {render_dpi_x}")
+                    if (page_w_pts * render_dpi_x / 72.0) * (page_h_pts * render_dpi_y / 72.0) > MAX_RENDER_PIXELS:
+                        raise RuntimeError(
+                            f"PDF 页面尺寸极端巨大（{page_w_pts:.0f}×{page_h_pts:.0f}pt），"
+                            f"即使降 DPI 至 {render_dpi_x} 像素量仍超 {MAX_RENDER_PIXELS:,}，已拒绝该页以防内存耗尽"
+                        )
+
+                hdc.StartPage()
+                page_started = True
+
+                mat = fitz.Matrix(render_dpi_x / 72.0, render_dpi_y / 72.0)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
 
                 img = Image.frombuffer(
@@ -487,6 +584,12 @@ def _print_pdf_native(
                 page_rect = page.rect  # PDF 点数 (1/72 inch)
                 page_w_device = int(page_rect.width * native_dpi_x / 72.0)
                 page_h_device = int(page_rect.height * native_dpi_y / 72.0)
+
+                # P2-3: 超出可打印区域的页面（如 A5 纸型）先等比缩放到可打印区域内再居中
+                scale = min(1.0, printable_w / max(1, page_w_device), printable_h / max(1, page_h_device))
+                if scale < 1.0:
+                    page_w_device = int(page_w_device * scale)
+                    page_h_device = int(page_h_device * scale)
 
                 x = (printable_w - page_w_device) // 2
                 y = (printable_h - page_h_device) // 2
@@ -529,7 +632,11 @@ def _print_pdf_native(
                 hdc.AbortDoc()
             except Exception:
                 pass
-        logger.warning(f"原生 GDI 打印失败: {e}")
+        if page_started:
+            # P1-9: 已开始出纸 → 标记中途失败，禁止上层降级整单重打（否则前 N 页已打印 + 整单重打 = 重复页）
+            logger.error(f"原生 GDI 打印中途失败（已开始出纸）: {e}")
+            return False, MID_PRINT_MARKER + str(e)
+        logger.warning(f"原生 GDI 打印失败（未开始出纸，允许降级）: {e}")
         return False, str(e)
     finally:
         if doc:
@@ -578,6 +685,8 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orien
             else:
                 devmode.Duplex = 1       # DMDUP_SIMPLEX
             new_duplex = devmode.Duplex
+            # P1-8: 显式置位 DM_DUPLEX，告知驱动 Duplex 字段已设置（否则驱动可能忽略双面设置）
+            devmode.Fields |= win32con.DM_DUPLEX
 
             # -- 方向设置 --
             old_orient = getattr(devmode, 'Orientation', 0)
@@ -585,9 +694,11 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orien
             if orientation == "landscape":
                 devmode.Orientation = win32con.DMORIENT_LANDSCAPE  # 2
                 dm_flags |= win32con.DM_ORIENTATION
+                devmode.Fields |= win32con.DM_ORIENTATION  # P1-8: 显式置位方向字段
             elif orientation == "portrait":
                 devmode.Orientation = win32con.DMORIENT_PORTRAIT   # 1
                 dm_flags |= win32con.DM_ORIENTATION
+                devmode.Fields |= win32con.DM_ORIENTATION  # P1-8: 显式置位方向字段
             new_orient = getattr(devmode, 'Orientation', 0)
 
             print(f"[DEVMODE] 打印机: {printer_name}")
@@ -598,6 +709,8 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orien
                         f"Orientation {old_orient}→{new_orient} (orientation='{orientation}')")
 
             # DocumentProperties 验证/合并 DEVMODE
+            # P1-8: DM_OUT_BUFFER 模式下驱动校验结果直接写回 devmode 缓冲，
+            # 返回/使用的正是 ResetDC 应采纳的校验后缓冲（返回值语义不丢弃）
             result = win32print.DocumentProperties(
                 0, handle, printer_name,
                 devmode, devmode,
@@ -605,10 +718,12 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orien
             )
             logger.info(f"DEVMODE: DocumentProperties 返回 {result} (正数=成功)")
             if result <= 0:
-                print(f"[DEVMODE] ⚠ DocumentProperties 验证返回 {result}（可能无效）")
+                print(f"[DEVMODE] ⚠ DocumentProperties 验证返回 {result}（可能无效，双面/方向设置可能未被驱动采纳）")
+                logger.warning(f"DEVMODE: DocumentProperties 校验失败 (result={result})")
             else:
-                print(f"[DEVMODE] ✓ DocumentProperties 验证通过")
+                print(f"[DEVMODE] ✓ DocumentProperties 验证通过，驱动已采纳 DEVMODE")
 
+            # 驱动校验后的 devmode 缓冲（DM_OUT_BUFFER 已就地写回），供 ResetDC 使用
             return devmode
         finally:
             win32print.ClosePrinter(handle)
@@ -660,6 +775,10 @@ def _print_via_sumatra(
 
     先通过 DEVMODE 配置打印机（双面/份数），确保打印机驱动不忽略参数。
     """
+    # P2-15: SumatraPDF 超时随页数放大（120s 起步，每页 2s，上限 600s）
+    total_pages = get_pdf_info(pdf_path).get("page_count", 0)
+    sumatra_timeout = min(max(120, total_pages * 2), 600)
+
     # 先配置打印机 DEVMODE，确保驱动层面参数正确
     if printer_name:
         try:
@@ -705,6 +824,8 @@ def _print_via_sumatra(
     if page_range:
         parsed = page_range.strip().replace("、", ",").replace("，", ",").replace(" ", "")
         if parsed:
+            # P2-8: `range=` 为非官方 print-settings 键，SumatraPDF 可能忽略而打印全部页 — 保守告警
+            logger.warning(f"SumatraPDF: '-print-settings range={parsed}' 为非官方键，驱动可能忽略而打印全部页")
             settings_parts.append(f"range={parsed}")
 
     cmd = [sumatra_path, "-print-to", printer_name or "default"]
@@ -728,7 +849,7 @@ def _print_via_sumatra(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=120,
+            timeout=sumatra_timeout,
             startupinfo=si,
         )
         print(f"[SumatraPDF] 退出码: {result.returncode}")
@@ -745,8 +866,8 @@ def _print_via_sumatra(
             logger.warning("SumatraPDF 虽然 rc=0 但输出了 stderr 警告")
         return True, "打印成功 (SumatraPDF)"
     except subprocess.TimeoutExpired:
-        print("[SumatraPDF] ✗ 超时 (120s)")
-        return False, "SumatraPDF 超时"
+        print(f"[SumatraPDF] ✗ 超时 ({sumatra_timeout}s)")
+        return False, f"SumatraPDF 超时 ({sumatra_timeout}s)"
     except FileNotFoundError:
         print("[SumatraPDF] ✗ 可执行文件未找到")
         return False, "SumatraPDF 未找到"

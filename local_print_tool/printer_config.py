@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 
@@ -353,12 +356,13 @@ class PrinterConfig:
             # 附加服务
             delivery_enabled=bool(data.get("delivery_enabled", False)),
             delivery_location=data.get("delivery_location", "1号楼北楼"),
-            delivery_percentages=data.get("delivery_percentages", data.get("delivery_locations", {
+            # dict 字段防 null：配置被手改/写坏为 null 时退回默认，避免后续 .get 崩溃
+            delivery_percentages=(data.get("delivery_percentages") or data.get("delivery_locations") or {
                 "1号楼北楼": 0.0, "1号楼南楼": 5.0,
                 "图书馆": 10.0, "教学楼E/F": 25.0, "女生宿舍": 10.0,
-            })),
+            }),
             urgency=data.get("urgency", "低"),
-            urgency_prices=data.get("urgency_prices", {
+            urgency_prices=(data.get("urgency_prices") or {
                 "低": 0.0, "中": 0.08, "高": 0.15,
             }),
             cover_page=bool(data.get("cover_page", False)),
@@ -377,10 +381,19 @@ class PrinterConfig:
         )
 
     def save(self, path: str) -> None:
-        """保存配置到 JSON 文件"""
+        """保存配置到 JSON 文件（同目录临时文件 + os.replace 原子替换，防写一半损坏）"""
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def load(cls, path: str) -> "PrinterConfig":
@@ -399,6 +412,13 @@ class PrinterConfig:
             return cls.from_dict(data)
         except (json.JSONDecodeError, OSError, ValueError) as e:
             logger.warning(f"加载配置失败 ({path}): {e}，将使用默认配置")
+            # 损坏文件改名保留为 .corrupt-{时间戳}（不删除，便于排查），下次启动自动重建
+            try:
+                backup_path = f"{path}.corrupt-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                shutil.move(path, backup_path)
+                logger.warning(f"已保留损坏配置为: {backup_path}")
+            except Exception as e2:
+                logger.warning(f"备份损坏配置失败: {e2}")
             return cls()
 
 

@@ -2,7 +2,7 @@
 converter.py — 通用文件转换器 UniversalConverter
 将所有可打印文件格式统一转换为 PDF，支持:
   - TXT / CSV  → reportlab
-  - 图片 (JPG/PNG/BMP/GIF/WEBP) → reportlab
+  - 图片 (JPG/PNG/BMP/GIF/WEBP/TIFF) → reportlab
   - Markdown    → markdown → HTML → pdfkit (wkhtmltopdf)
   - Office 文档 → LibreOffice 无头模式
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -192,6 +193,33 @@ def _copy_to_temp(file_path: str) -> str:
     return temp_path
 
 
+# CSV 单元格中的控制字符（\x00-\x08、\x0b、\x0c、\x0e-\x1f），reportlab Paragraph 会因此抛错
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _read_text_auto(file_path: str) -> str:
+    """自动探测编码读取文本文件：utf-8-sig（顺带剥离 BOM）→ gbk → latin-1(替换)。
+
+    解决 GBK/UTF-16/带 BOM 文本乱码问题；latin-1 兜底永不失败，无法解码的字节替换。
+    """
+    # 先 UTF-8（utf-8-sig 顺带剥离 BOM）
+    try:
+        with open(file_path, "r", encoding="utf-8-sig") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        pass
+    # GBK（常见中文编码）
+    try:
+        with open(file_path, "r", encoding="gbk") as f:
+            return f.read()
+    except UnicodeDecodeError:
+        pass
+    # 兜底：latin-1 可解码任意字节序列
+    logger.warning(f"文本编码探测失败（非 UTF-8/GBK），按 latin-1 读取并替换无法解码字符: {file_path}")
+    with open(file_path, "r", encoding="latin-1", errors="replace") as f:
+        return f.read()
+
+
 # ============================================================
 # 工具函数
 # ============================================================
@@ -365,10 +393,11 @@ def _detect_wps() -> bool:
         for prog_id in ["WPS.Application", "KWPS.Application"]:
             try:
                 wps = win32com.client.dynamic.Dispatch(prog_id)
-                try:
-                    wps.Quit()
-                except Exception:
-                    pass
+                if not _warm_wps_running:  # P1-6: 与 Word 路径对齐，不杀预热实例
+                    try:
+                        wps.Quit()
+                    except Exception:
+                        pass
                 _engine_cache["wps"] = True
                 _wps_progid = prog_id
                 logger.info(f"✓ 检测到 WPS Office (ProgID={prog_id})")
@@ -447,8 +476,8 @@ def _convert_via_word_com(file_path: str, output_pdf: str) -> None:
                     word.Quit()
             except Exception:
                 pass
-        # 仅当我们是首次初始化 COM 时才反初始化
-        if com_init is None:
+        # 仅当我们是首次初始化 COM（CoInitialize 返回 S_OK=0）时才反初始化
+        if com_init == 0:
             pythoncom.CoUninitialize()
         if os.path.isfile(temp_input):
             try:
@@ -466,13 +495,15 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
     import pythoncom
     import win32com.client
 
-    abs_input = os.path.abspath(file_path)
     abs_output = os.path.abspath(output_pdf)
 
     # 复用检测阶段缓存的 ProgID
     prog_id = _wps_progid
 
     logger.info(f"WPS COM: 开始转换 {os.path.basename(file_path)} (ProgID={prog_id})")
+
+    # P2-4: 与 Word 路径对齐 — 打开前先复制到临时副本，避免文件锁，finally 清理
+    temp_input = _copy_to_temp(file_path)
 
     com_init = pythoncom.CoInitialize()
 
@@ -486,7 +517,7 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
         except Exception:
             pass
 
-        doc = wps.Documents.Open(abs_input, ReadOnly=True)
+        doc = wps.Documents.Open(os.path.abspath(temp_input), ReadOnly=True)
 
         # WPS 兼容 Word ExportFormat 常量 (17 = PDF)
         doc.ExportAsFixedFormat(abs_output, ExportFormat=17)
@@ -494,7 +525,8 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
         doc.Close(SaveChanges=0)
         doc = None
 
-        wps.Quit()
+        if not _warm_wps_running:  # P1-6: 不杀预热线程维持的 WPS 实例
+            wps.Quit()
         wps = None
 
         logger.info(f"WPS COM → PDF 完成: {output_pdf}")
@@ -509,11 +541,18 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
                 pass
         if wps is not None:
             try:
-                wps.Quit()
+                if not _warm_wps_running:
+                    wps.Quit()
             except Exception:
                 pass
-        if com_init is None:
+        # P2-9: CoInitialize 返回 S_OK(0)，`is None` 恒 False 导致永不反初始化
+        if com_init == 0:
             pythoncom.CoUninitialize()
+        if os.path.isfile(temp_input):
+            try:
+                os.remove(temp_input)
+            except OSError:
+                pass
 
 
 # ============================================================
@@ -627,8 +666,9 @@ def _get_com_page_counts_batch(
                         except OSError:
                             pass
 
-            # 不要杀预热线程维持的 Word 进程
-            if not _warm_word_running or "Word" not in label:
+            # P1-6: 不要杀预热线程维持的进程 — 按实际引擎（label）分别对应各自预热变量
+            warm_running = _warm_word_running if label == "Word" else _warm_wps_running
+            if not warm_running:
                 try:
                     app.Quit()
                 except Exception:
@@ -639,12 +679,13 @@ def _get_com_page_counts_batch(
             remaining = list(file_paths)
         finally:
             if app is not None:
-                if not _warm_word_running or "Word" not in label:
+                warm_running = _warm_word_running if label == "Word" else _warm_wps_running
+                if not warm_running:
                     try:
                         app.Quit()
                     except Exception:
                         pass
-            if com_init is None:
+            if com_init == 0:  # P2-9: CoInitialize 返回 S_OK(0) 才算初始化成功，需配对 CoUninitialize
                 pythoncom.CoUninitialize()
 
         return remaining
@@ -706,7 +747,7 @@ def _get_word_page_count(file_path: str) -> int:
                     word.Quit()
             except Exception:
                 pass
-        if com_init is None:
+        if com_init == 0:  # P2-9: CoInitialize 返回 S_OK(0)，`is None` 恒 False 导致永不反初始化
             pythoncom.CoUninitialize()
         if os.path.isfile(temp_fp):
             try:
@@ -742,7 +783,8 @@ def _get_wps_page_count(file_path: str) -> int:
         page_count = doc.ComputeStatistics(2)
         doc.Close(SaveChanges=0)
         doc = None
-        wps.Quit()
+        if not _warm_wps_running:  # P1-6: 不杀预热线程维持的 WPS 实例
+            wps.Quit()
         wps = None
 
         logger.info(f"WPS COM 页数: {os.path.basename(file_path)} → {page_count} 页")
@@ -755,10 +797,11 @@ def _get_wps_page_count(file_path: str) -> int:
                 pass
         if wps is not None:
             try:
-                wps.Quit()
+                if not _warm_wps_running:
+                    wps.Quit()
             except Exception:
                 pass
-        if com_init is None:
+        if com_init == 0:  # P2-9: CoInitialize 返回 S_OK(0)，`is None` 恒 False 导致永不反初始化
             pythoncom.CoUninitialize()
 
 
@@ -777,9 +820,13 @@ def _convert_txt_to_pdf(file_path: str, output_pdf: str) -> None:
     # 注册中文字体
     _register_chinese_font()
 
-    # 读取文本内容
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
+    # 读取文本内容（自动探测编码：utf-8-sig → gbk → latin-1）
+    text = _read_text_auto(file_path)
+
+    # P0-2: 空文本 → 写一页占位，避免生成 0 页 PDF 报成功漏打
+    if not text or not text.strip():
+        logger.warning(f"TXT 文件为空，生成占位页: {file_path}")
+        text = "（空白文件）"
 
     c = canvas.Canvas(output_pdf, pagesize=A4)
     width, height = A4
@@ -810,7 +857,7 @@ def _convert_txt_to_pdf(file_path: str, output_pdf: str) -> None:
                     c.setFont(font_name, font_size)
                     y = height - margin_top
                 c.setFont(font_name, font_size)
-                c.drawString(margin_left, y, wline)
+                c.drawString(margin_left, y, _sanitize_non_ascii(wline))
                 y -= line_height
 
         if y < margin_bottom:
@@ -837,10 +884,9 @@ def _convert_csv_to_pdf(file_path: str, output_pdf: str) -> None:
     _register_chinese_font()
     font_name = _get_chinese_font_name()
 
-    # 读取 CSV
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-        reader = csv.reader(f)
-        rows = list(reader)
+    # 读取 CSV（自动探测编码：utf-8-sig 顺带解决 BOM 进首格问题）
+    reader = csv.reader(_read_text_auto(file_path).splitlines())
+    rows = list(reader)
 
     if not rows:
         # 空 CSV，写个占位
@@ -862,7 +908,11 @@ def _convert_csv_to_pdf(file_path: str, output_pdf: str) -> None:
 
     # 将每格包装为 Paragraph
     def cell(text: str) -> Paragraph:
-        return Paragraph(str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), style_normal)
+        # P2-11: 清洗控制字符，避免 reportlab Paragraph 抛错
+        clean = _CTRL_RE.sub(" ", str(text))
+        # P2-6: 无中文字体回退时替换非 ASCII，避免 UnicodeEncodeError
+        clean = _sanitize_non_ascii(clean)
+        return Paragraph(clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"), style_normal)
 
     table_data = [[cell(val) for val in row] for row in rows]
 
@@ -893,80 +943,152 @@ def _convert_csv_to_pdf(file_path: str, output_pdf: str) -> None:
 
 
 def _convert_image_to_pdf(file_path: str, output_pdf: str) -> None:
-    """图片 → PDF（reportlab，居中适应 A4）。"""
+    """图片 → PDF（reportlab，居中适应 A4）。多页图片（TIFF/GIF）每帧一页。"""
     from PIL import Image as PILImage
+    from PIL import ImageSequence
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import mm
 
     img = PILImage.open(file_path)
-    if img.mode not in ("RGB", "RGBA", "L"):
-        img = img.convert("RGB")
 
-    iw, ih = img.size
-    # 根据图片宽高选择页面方向：宽图用横版，最大化打印面积
-    if iw > ih:
-        page_w, page_h = landscape(A4)
-    else:
-        page_w, page_h = A4
+    # 单帧图片最多渲染 5,000 万像素（防止超大图片 OOM；比 PIL 默认保护更早拒绝，故无需禁用 PIL 保护）
+    MAX_IMAGE_PIXELS = 50_000_000
 
-    c = canvas.Canvas(output_pdf, pagesize=(page_w, page_h))
-    margin = 10 * mm
-    max_w = page_w - 2 * margin
-    max_h = page_h - 2 * margin
-
-    scale = min(max_w / iw, max_h / ih, 1.0)
-    draw_w = iw * scale
-    draw_h = ih * scale
-
-    x = (page_w - draw_w) / 2
-    y = (page_h - draw_h) / 2
-
-    # 保存临时图片用于嵌入
-    tmp_img_path = output_pdf + ".tmp.png"
+    c = None
+    tmp_img_path = None
+    page_num = 0
     try:
-        img.save(tmp_img_path)
-        c.drawImage(tmp_img_path, x, y, width=draw_w, height=draw_h)
-    finally:
-        if os.path.exists(tmp_img_path):
-            os.remove(tmp_img_path)
+        for frame in ImageSequence.Iterator(img):
+            # P1-7: 超大图片 OOM 保护 — 渲染前手动检查像素量，超限拒绝并抛明确错误
+            fw, fh = frame.size
+            if fw * fh > MAX_IMAGE_PIXELS:
+                raise RuntimeError(
+                    f"图片分辨率过大（{fw}×{fh} = {fw * fh:,} 像素，上限 {MAX_IMAGE_PIXELS:,} 像素），无法转换为 PDF: {file_path}"
+                )
 
-    c.save()
-    logger.info(f"图片 → PDF 完成: {output_pdf}")
+            # P2-12: 透明图片（RGBA/LA/带透明色板的 P）先合成到白底，避免打印黑底
+            if frame.mode in ("RGBA", "LA") or (frame.mode == "P" and "transparency" in frame.info):
+                rgba = frame.convert("RGBA")
+                background = PILImage.new("RGB", rgba.size, "white")
+                background.paste(rgba, mask=rgba.getchannel("A"))
+                frame = background
+            elif frame.mode not in ("RGB", "L"):
+                frame = frame.convert("RGB")
+
+            iw, ih = frame.size
+            # 根据图片宽高选择页面方向：宽图用横版，最大化打印面积
+            if iw > ih:
+                page_w, page_h = landscape(A4)
+            else:
+                page_w, page_h = A4
+
+            if c is None:
+                c = canvas.Canvas(output_pdf, pagesize=(page_w, page_h))
+            else:
+                c.setPageSize((page_w, page_h))
+
+            margin = 10 * mm
+            max_w = page_w - 2 * margin
+            max_h = page_h - 2 * margin
+
+            scale = min(max_w / iw, max_h / ih, 1.0)
+            draw_w = iw * scale
+            draw_h = ih * scale
+
+            x = (page_w - draw_w) / 2
+            y = (page_h - draw_h) / 2
+
+            # 保存临时图片用于嵌入（逐帧复用同一临时文件）
+            tmp_img_path = output_pdf + ".tmp.png"
+            frame.save(tmp_img_path)
+            c.drawImage(tmp_img_path, x, y, width=draw_w, height=draw_h)
+            c.showPage()  # 每帧一页
+            page_num += 1
+    finally:
+        img.close()
+        if tmp_img_path and os.path.exists(tmp_img_path):
+            try:
+                os.remove(tmp_img_path)
+            except OSError:
+                pass
+
+    if c is None or page_num == 0:
+        # 无法读取任何帧 → 兜底生成一页占位，避免 0 页 PDF 报成功漏打
+        logger.warning(f"图片无法读取任何帧，生成占位页: {file_path}")
+        c = canvas.Canvas(output_pdf, pagesize=A4)
+        c.drawString(100, 500, "(空白图片)")
+        c.save()
+    else:
+        c.save()
+    logger.info(f"图片 → PDF 完成: {output_pdf} ({page_num} 页)")
 
 
 def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content: bool = False) -> None:
-    """HTML 文件或内容 → PDF（pdfkit / wkhtmltopdf）。"""
-    wk_path = _find_wkhtmltopdf()
+    """HTML 文件或内容 → PDF（wkhtmltopdf 直接 subprocess 调用 + 90s 超时）。
 
-    if wk_path:
-        try:
-            import pdfkit
-        except ImportError:
-            raise RuntimeError(
-                "缺少 Python 包 pdfkit。请运行: pip install pdfkit\n"
-                f"(已检测到 wkhtmltopdf: {wk_path})"
-            )
-        options = {
-            "page-size": "A4",
-            "encoding": "UTF-8",
-            "enable-local-file-access": "",
-            "no-outline": None,
-            "margin-top": "10mm",
-            "margin-bottom": "10mm",
-            "margin-left": "10mm",
-            "margin-right": "10mm",
-        }
-        config = pdfkit.configuration(wkhtmltopdf=wk_path)
-        if is_content:
-            pdfkit.from_string(html_path_or_content, output_pdf, options=options, configuration=config)
-        else:
-            pdfkit.from_file(html_path_or_content, output_pdf, options=options, configuration=config)
-    else:
+    说明：pdfkit 不暴露 timeout 参数（其底层就是调用 wkhtmltopdf 可执行文件），
+    故改为直接 subprocess 调用，可加超时与限制 JS 执行时间的选项，避免页面 JS 挂死。
+    """
+    wk_path = _find_wkhtmltopdf()
+    if not wk_path:
         raise RuntimeError(
             "未找到 wkhtmltopdf。请安装后加入 PATH。\n"
             "下载地址: https://wkhtmltopdf.org/downloads.html"
         )
+
+    # 内容模式：先写入临时 HTML 文件再转换
+    temp_html: str | None = None
+    try:
+        if is_content:
+            fd, temp_html = tempfile.mkstemp(suffix=".html", prefix="_md_")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(html_path_or_content)
+            input_path = temp_html
+        else:
+            input_path = html_path_or_content
+
+        cmd = [
+            wk_path,
+            "--page-size", "A4",
+            "--encoding", "UTF-8",
+            "--enable-local-file-access",
+            "--no-outline",
+            "--margin-top", "10mm",
+            "--margin-bottom", "10mm",
+            "--margin-left", "10mm",
+            "--margin-right", "10mm",
+            # P1-4: 限制 JS 执行时间（最多 1000ms），避免无限脚本挂死；远程图片下载依赖整体 90s 超时
+            "--no-stop-slow-scripts",
+            "--javascript-delay", "1000",
+            input_path,
+            os.path.abspath(output_pdf),
+        ]
+        logger.info(f"执行 wkhtmltopdf: {' '.join(cmd[:5])}... (超时 90s)")
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"wkhtmltopdf 转换失败 (rc={result.returncode}): {result.stderr.strip()[:300]}"
+            )
+    except subprocess.TimeoutExpired:
+        # P1-4: 超时 → 抛明确错误，不再挂死
+        raise RuntimeError("wkhtmltopdf 转换超时（90 秒），已中止（页面 JS 可能无限执行）") from None
+    except FileNotFoundError:
+        raise RuntimeError(f"wkhtmltopdf 可执行文件未找到: {wk_path}") from None
+    finally:
+        if temp_html and os.path.isfile(temp_html):
+            try:
+                os.remove(temp_html)
+            except OSError:
+                pass
 
     logger.info(f"HTML → PDF 完成: {output_pdf}")
 
@@ -975,8 +1097,7 @@ def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
     """Markdown → HTML → PDF。"""
     import markdown
 
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-        md_text = f.read()
+    md_text = _read_text_auto(file_path)  # 与 TXT/CSV 一致的编码探测链（utf-8-sig → gbk → latin-1）
 
     # Markdown → HTML（包含基本样式）
     md_body = markdown.markdown(md_text, extensions=["tables", "fenced_code", "codehilite"])
@@ -1057,49 +1178,58 @@ def _convert_office_via_libreoffice(file_path: str, output_pdf: str) -> None:
             "下载地址: https://www.libreoffice.org/download/"
         )
 
-    output_dir = os.path.dirname(output_pdf) or tempfile.gettempdir()
     abs_input = os.path.abspath(file_path)
-    abs_output_dir = os.path.abspath(output_dir)
+
+    # P1-5: 每次调用使用独立输出子目录（唯一），避免并发转换同名 basename 互相覆盖
+    work_dir = tempfile.mkdtemp(prefix="hn_lo_")
+
+    # P2-5: 超时随文件大小放大（60s 起步，5s/MB，上限 600s）
+    file_size_mb = os.path.getsize(abs_input) / (1024 * 1024)
+    lo_timeout = min(max(60, int(file_size_mb * 5)), 600)
 
     cmd = [
         libreoffice,
         "--headless",
         "--convert-to", "pdf",
-        "--outdir", abs_output_dir,
+        "--outdir", work_dir,
         abs_input,
     ]
 
-    logger.info(f"执行 LibreOffice 转换: {' '.join(cmd)}")
+    logger.info(f"执行 LibreOffice 转换: {' '.join(cmd)} (超时 {lo_timeout}s)")
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("LibreOffice 转换超时（60 秒）")
-    except FileNotFoundError:
-        raise RuntimeError(f"LibreOffice 可执行文件未找到: {libreoffice}")
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=lo_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"LibreOffice 转换超时（{lo_timeout} 秒）")
+        except FileNotFoundError:
+            raise RuntimeError(f"LibreOffice 可执行文件未找到: {libreoffice}")
 
-    if result.returncode != 0:
-        raise RuntimeError(f"LibreOffice 转换失败 (rc={result.returncode}): {result.stderr}")
+        if result.returncode != 0:
+            raise RuntimeError(f"LibreOffice 转换失败 (rc={result.returncode}): {result.stderr}")
 
-    # LibreOffice 输出的 PDF 文件名 = 原始文件名（改扩展名 .pdf）
-    base_name = os.path.splitext(os.path.basename(file_path))[0]
-    generated_pdf = os.path.join(abs_output_dir, base_name + ".pdf")
+        # LibreOffice 输出的 PDF 文件名 = 原始文件名（改扩展名 .pdf）
+        base_name = os.path.splitext(os.path.basename(file_path))[0]
+        generated_pdf = os.path.join(work_dir, base_name + ".pdf")
 
-    if not os.path.isfile(generated_pdf):
-        raise RuntimeError(f"LibreOffice 未生成预期的 PDF: {generated_pdf}")
+        if not os.path.isfile(generated_pdf):
+            raise RuntimeError(f"LibreOffice 未生成预期的 PDF: {generated_pdf}")
 
-    # 如果输出路径与生成路径不同，移动/重命名
-    if os.path.abspath(generated_pdf) != os.path.abspath(output_pdf):
-        if os.path.exists(output_pdf):
-            os.remove(output_pdf)
-        shutil.move(generated_pdf, output_pdf)
+        # 如果输出路径与生成路径不同，移动/重命名
+        if os.path.abspath(generated_pdf) != os.path.abspath(output_pdf):
+            if os.path.exists(output_pdf):
+                os.remove(output_pdf)
+            shutil.move(generated_pdf, output_pdf)
 
-    logger.info(f"LibreOffice → PDF 完成: {output_pdf}")
+        logger.info(f"LibreOffice → PDF 完成: {output_pdf}")
+    finally:
+        # P1-5: 无论成功失败都清理本次独立输出目录
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ============================================================
@@ -1180,19 +1310,52 @@ def _get_chinese_font_name() -> str:
     return _chinese_font_name
 
 
+def _sanitize_non_ascii(text: str) -> str:
+    """无中文字体（Helvetica 回退）时，将非 ASCII 字符替换为 '□'。
+
+    避免 reportlab drawString/Paragraph 对 Helvetica(WinAnsi) 写中文时抛 UnicodeEncodeError；
+    已注册中文字体时原样返回。
+    """
+    if _chinese_font_name != "Helvetica":
+        return text
+    try:
+        text.encode("latin-1")
+        return text
+    except UnicodeEncodeError:
+        return "".join(ch if ord(ch) < 128 else "□" for ch in text)
+
+
 def _wrap_text_line(text: str, font_name: str, font_size: int, max_width: float,
                     canvas_obj) -> list[str]:
-    """将单行文本按宽度自动换行，返回分行列表。"""
+    """将单行文本按宽度自动换行，返回分行列表。
+
+    先按最长 120 字符切块处理：每次 stringWidth 测宽不超过 120 字符，
+    避免超长单词（如 URL）逐字符累加测宽导致 O(n²) 卡死；
+    块内仍按原逻辑逐字符断行，`current` 跨块延续，正常断词不受影响。
+    """
     result: list[str] = []
     current = ""
-    for ch in text:
-        test = current + ch
-        w = canvas_obj.stringWidth(test, font_name, font_size)
-        if w > max_width and current:
+    MAX_CHUNK = 120  # 单次测宽的最大字符数（超长词硬截断上限）
+
+    for chunk_start in range(0, len(text), MAX_CHUNK):
+        chunk = text[chunk_start:chunk_start + MAX_CHUNK]
+        # 快速路径：无未完成行且整块宽度不超限 → 直接成行（避免逐字符测宽）
+        if not current and canvas_obj.stringWidth(chunk, font_name, font_size) <= max_width:
+            result.append(chunk)
+            continue
+        for ch in chunk:
+            test = current + ch
+            w = canvas_obj.stringWidth(test, font_name, font_size)
+            if w > max_width and current:
+                result.append(current)
+                current = ch
+            else:
+                current = test
+        # 安全兜底：即使 stringWidth 异常返回 0，current 也不会无限增长
+        if len(current) >= MAX_CHUNK:
             result.append(current)
-            current = ch
-        else:
-            current = test
+            current = ""
+
     if current:
         result.append(current)
     return result if result else [""]
@@ -1220,8 +1383,8 @@ class UniversalConverter:
         # TXT / 文本类
         cm[".txt"] = _convert_txt_to_pdf
         cm[".csv"] = _convert_csv_to_pdf
-        # 图片类
-        for ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"):
+        # 图片类（TIFF 多帧每帧一页）
+        for ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"):
             cm[ext] = _convert_image_to_pdf
         # Office 文档
         for ext in (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"):

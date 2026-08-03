@@ -1,5 +1,6 @@
 // order-detail.js
 const { CONFIG } = require('../../utils/config')
+const { request } = require('../../utils/request')
 
 Component({
   data: {
@@ -37,6 +38,9 @@ Component({
         this.setData({ loading: false })
       }
     },
+    detached() {
+      this._stopPolling()
+    },
   },
   pageLifetimes: {
     show() {
@@ -48,13 +52,31 @@ Component({
         pageExit: '',
         isDarkMode: app.globalData.isDarkMode,
       })
+      this._startPolling()
     },
     hide() {
+      this._stopPolling()
       const forward = wx.getStorageSync('_navForward')
       this.setData({ pageExit: forward ? 'page-exit-left' : 'page-exit-right' })
     },
   },
   methods: {
+    // 订单状态轮询：每 10 秒静默刷新（对齐 user-orders 的轮询模式）
+    _startPolling() {
+      this._stopPolling()
+      const orderId = this.data.order && this.data.order.id
+      if (!orderId) return
+      this._pollTimer = setInterval(() => {
+        this.loadOrderDetail(orderId)
+      }, 10000)
+    },
+    _stopPolling() {
+      if (this._pollTimer) {
+        clearInterval(this._pollTimer)
+        this._pollTimer = null
+      }
+    },
+
     loadOrderDetail(orderId) {
       const token = wx.getStorageSync('token')
       if (!token) {
@@ -62,7 +84,7 @@ Component({
         return
       }
 
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/order/' + orderId,
         method: 'GET',
         header: {
@@ -112,7 +134,7 @@ Component({
           if (!modalRes.confirm) return
 
           wx.showLoading({ title: '取消中...' })
-          wx.request({
+          request({
             url: CONFIG.BASE_URL + '/api/cancel_order',
             method: 'POST',
             header: {
@@ -155,9 +177,13 @@ Component({
       // 携带多文件信息到首页
       wx.setStorageSync('reprintInfo', {
         files: files.map(f => ({
+          file_id: f.file_id || '',
           file_name: f.original_name || f.file_name,
           copies: f.copies,
           duplex: f.duplex || 'on',
+          page_range: f.page_range || '',
+          page_count: f.page_count || 0,
+          size: f.size || 0,
         })),
         duplex: order.duplex || 'on',
       })

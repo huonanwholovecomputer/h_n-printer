@@ -12,13 +12,14 @@ import sqlite3
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests as http_requests
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRY_COUNT = 5  # 超过此次数的离线记录不再重试
+OFFLINE_QUEUE_MAX = 5000  # 离线队列上限，超过时丢弃最旧记录
 
 
 class OfflineSync:
@@ -31,6 +32,7 @@ class OfflineSync:
         self._lock = threading.Lock()
         self._sync_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._sync_cycles = 0  # 同步调用计数，每 100 次清理一次旧记录
         self._init_db()
 
     # ── 数据库初始化 ──
@@ -69,6 +71,15 @@ class OfflineSync:
                    VALUES (?, ?, ?, ?, 0)""",
                 (order_number, json.dumps(files_data, ensure_ascii=False), total_price, created_at),
             )
+            # P2: 队列无上限保护 —— 超过 OFFLINE_QUEUE_MAX 条时丢弃最旧记录
+            cur = conn.execute(
+                "DELETE FROM offline_orders WHERE id NOT IN "
+                "(SELECT id FROM offline_orders ORDER BY id DESC LIMIT ?)",
+                (OFFLINE_QUEUE_MAX,),
+            )
+            if cur.rowcount > 0:
+                logger.warning(
+                    f"[OFFLINE] 离线队列超过 {OFFLINE_QUEUE_MAX} 条，已丢弃最旧 {cur.rowcount} 条")
             conn.commit()
             conn.close()
         logger.info(f"[OFFLINE] 任务已缓存: {order_number} ({len(files_data)} 个文件)")
@@ -159,7 +170,30 @@ class OfflineSync:
 
         if synced_count > 0:
             logger.info(f"[SYNC] 本次同步成功 {synced_count}/{len(rows)} 个任务")
+        # P2: 定期清理 synced=1 且创建超过 30 天的旧行（每 100 次调用清理一次）
+        self._sync_cycles += 1
+        if self._sync_cycles >= 100:
+            self._sync_cycles = 0
+            self._cleanup_old_synced_rows()
         return synced_count
+
+    def _cleanup_old_synced_rows(self):
+        """删除 synced=1 且创建时间超过 30 天的旧行，避免数据库无限增长。"""
+        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
+                cur = conn.execute(
+                    "DELETE FROM offline_orders WHERE synced = 1 AND created_at < ?",
+                    (cutoff,),
+                )
+                conn.commit()
+                n = cur.rowcount
+                conn.close()
+            if n > 0:
+                logger.info(f"[SYNC] 已清理 {n} 条超过 30 天的已同步记录")
+        except Exception as e:
+            logger.warning(f"[SYNC] 清理旧同步记录失败: {e}")
 
     # ── 后台定时同步 ──
 
@@ -167,6 +201,7 @@ class OfflineSync:
         """启动后台定时同步线程（守护线程，主程序退出时自动终止）。"""
         self._stop_event.clear()
         if self._sync_thread and self._sync_thread.is_alive():
+            logger.warning("[SYNC] 后台同步已在运行，忽略重复 start_background_sync 调用")
             return  # 已在运行
 
         def _loop():

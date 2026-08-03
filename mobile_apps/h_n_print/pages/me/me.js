@@ -1,5 +1,6 @@
 // me.js
 const { CONFIG } = require('../../utils/config')
+const { request } = require('../../utils/request')
 
 function _initIsDark() {
   try {
@@ -227,6 +228,9 @@ Component({
     },
     hide() {
       this._stopOrderPolling()
+      this._stopKeyPolling()        // 管理员密钥轮询随页面隐藏停止
+      this._stopCountdown()         // 密钥倒计时随页面隐藏停止
+      this._stopTempCountdown()     // 临时授权倒计时随页面隐藏停止
       // 重置入场动画类为隐藏态，确保下次 show 时框架首帧不可见，避免闪烁
       // pageExit 控制退出动画，pageSlide 控制入场/静止态，互不冲突
       this.setData({ pageSlide: 'page-init', pageExit: '' })
@@ -278,7 +282,7 @@ Component({
     _pollOrdersSilent() {
       const token = wx.getStorageSync('token')
       if (!token) return
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/orders',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -688,7 +692,7 @@ Component({
         return
       }
 
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/profile',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -918,7 +922,7 @@ Component({
       this.setData({ nickname })
       const token = wx.getStorageSync('token')
       if (!token) return
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/profile',
         method: 'POST',
         header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
@@ -941,7 +945,7 @@ Component({
         return
       }
 
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/me',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -1036,7 +1040,7 @@ Component({
       if (this.data.generating) return
 
       this.setData({ generating: true })
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/license/create',
         method: 'POST',
         header: {
@@ -1125,7 +1129,7 @@ Component({
     loadActiveKey(isInitial) {
       const token = wx.getStorageSync('token')
       if (!token) return
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/license/active',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -1317,7 +1321,7 @@ Component({
             ['activeKeys[' + idx + '].swipeX']: 0,
             ['activeKeys[' + idx + '].exiting']: true,
           })
-          wx.request({
+          request({
             url: CONFIG.BASE_URL + '/api/license/revoke',
             method: 'POST',
             header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
@@ -1369,7 +1373,7 @@ Component({
       if (!token) return
 
       wx.showLoading({ title: '获取订单详情...' })
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/order_price/' + k.order_id,
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -1394,7 +1398,11 @@ Component({
               success: () => wx.showToast({ title: '已复制结算详情', icon: 'success' })
             })
           } else {
-            wx.showToast({ title: (res.data && res.data.message) || '获取失败', icon: 'none' })
+            // 404 时后端提示"该订单不属于你"（管理员查他人订单）→ 改为通用提示
+            const msg = res.statusCode === 404
+              ? '无法获取该订单结算信息'
+              : ((res.data && res.data.message) || '获取失败')
+            wx.showToast({ title: msg, icon: 'none' })
           }
         },
         fail: () => { wx.hideLoading(); wx.showToast({ title: '网络错误', icon: 'none' }) }
@@ -1408,7 +1416,7 @@ Component({
       if (!k) return
       const token = wx.getStorageSync('token')
       if (!token) return
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/license/finish',
         method: 'POST',
         header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
@@ -1431,7 +1439,7 @@ Component({
       const token = wx.getStorageSync('token')
       if (!token) return
       this.setData({ adminsLoading: true })
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/admin/admins',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -1548,7 +1556,7 @@ Component({
       if (!token) return
       const that = this
       this._showConfirm('移除管理员', '确定要移除该管理员吗？', '移除', '#ff4d4f', function() {
-          wx.request({
+          request({
             url: CONFIG.BASE_URL + '/api/admin/remove_admin',
             method: 'POST',
             header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
@@ -1599,7 +1607,7 @@ Component({
       const token = wx.getStorageSync('token')
       if (!token) return
 
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/admin/storage',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -1642,6 +1650,7 @@ Component({
     },
 
     onSaveRetention() {
+      if (this.data.savingRetention) return   // 防连点
       const token = wx.getStorageSync('token')
       if (!token) return
 
@@ -1655,7 +1664,7 @@ Component({
       }
 
       this.setData({ savingRetention: true })
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/admin/storage',
         method: 'POST',
         header: {
@@ -1693,7 +1702,7 @@ Component({
         '#FF3B30',
         () => {
           this.setData({ deletingAllFiles: true })
-          wx.request({
+          request({
             url: CONFIG.BASE_URL + '/api/admin/storage',
             method: 'DELETE',
             header: { 'Authorization': 'Bearer ' + token },
@@ -1738,7 +1747,7 @@ Component({
     _pollAdminsSilent() {
       const token = wx.getStorageSync('token')
       if (!token) return
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/admin/admins',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -1819,7 +1828,7 @@ Component({
       }
 
       console.log('[loadLicensedUsers] 正在请求用户列表...')
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/admin/users',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -1891,7 +1900,7 @@ Component({
       if (!token) return
 
       this.setData({ redeeming: true })
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/license/redeem',
         method: 'POST',
         header: {
@@ -1932,7 +1941,7 @@ Component({
         this.setData({ loading: true })
       }
 
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/orders',
         method: 'GET',
         header: {
@@ -2112,7 +2121,7 @@ Component({
       if (!token) return
       this._showConfirm('确认取消', '确定要取消这个打印任务吗？', '取消订单', '#FF9500', () => {
         wx.showLoading({ title: '取消中...' })
-        wx.request({
+        request({
           url: CONFIG.BASE_URL + '/api/cancel_order',
           method: 'POST',
           header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },

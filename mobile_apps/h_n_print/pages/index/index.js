@@ -1,5 +1,6 @@
 // index.js
 const { CONFIG } = require('../../utils/config')
+const { request } = require('../../utils/request')
 
 // 初始主题值：直接从 app.globalData 读取（同步、无延迟），绕过 storage 的异步写窗口
 // 避免首次创建组件时首帧使用过期值触发 CSS transition 闪烁
@@ -128,6 +129,8 @@ Component({
         this._returningFromDialog = false
         this.loadPrinterStatus()
         this._startPrinterPolling()
+        this._restartPageCountPolls()
+        if (this.data.autoPrintEnabled) this._startBreathingGlow()
         this._scheduleMeasure()
         setTimeout(() => this._scheduleMeasure(300), 300)
         return
@@ -145,6 +148,8 @@ Component({
         })
         this.loadPrinterStatus()
         this._startPrinterPolling()
+        this._restartPageCountPolls()
+        if (this.data.autoPrintEnabled) this._startBreathingGlow()
         this._scheduleMeasure()
         setTimeout(() => this._scheduleMeasure(300), 300)
         return
@@ -180,6 +185,9 @@ Component({
       this.loadPrinterStatus()
       // 启动打印机状态轮询（30秒）
       this._startPrinterPolling()
+      // 页数轮询 + 无障碍打印呼吸光晕：页面重新可见时恢复
+      this._restartPageCountPolls()
+      if (this.data.autoPrintEnabled) this._startBreathingGlow()
       // 首次加载定价配置（与本地打印工具保持同步）
       if (!this.data.pricingLoaded) {
         this.loadPricing()
@@ -192,9 +200,7 @@ Component({
       const reprintInfo = wx.getStorageSync('reprintInfo')
       if (reprintInfo) {
         wx.removeStorageSync('reprintInfo')
-        this.setData({
-          duplex: reprintInfo.duplex || 'on',
-        })
+        this._restoreReprintFiles(reprintInfo)
       }
       // 同步 tabBar 选中态
       try {
@@ -224,6 +230,8 @@ Component({
       }
       if (this._readyTimer) { clearTimeout(this._readyTimer); this._readyTimer = null }
       this._stopPrinterPolling()
+      this._stopAllPollTimers()      // 页数轮询随页面隐藏停止，show 时按需恢复
+      this._stopBreathingGlow()      // 无障碍打印呼吸光晕定时器随页面隐藏停止
       // 重置入场动画类为隐藏态，确保下次 show 时框架首帧不可见，避免闪烁
       // pageExit 控制退出动画，pageSlide 控制入场/静止态，互不冲突
       this.setData({ pageSlide: 'page-init', pageExit: '' })
@@ -293,7 +301,7 @@ Component({
             console.error('wx.login 未返回 code')
             return
           }
-          wx.request({
+          request({
             url: CONFIG.BASE_URL + '/api/login',
             method: 'POST',
             header: { 'content-type': 'application/json' },
@@ -331,7 +339,7 @@ Component({
             wx.showToast({ title: '重新登录失败', icon: 'none' })
             return
           }
-          wx.request({
+          request({
             url: CONFIG.BASE_URL + '/api/login',
             method: 'POST',
             header: { 'content-type': 'application/json' },
@@ -360,7 +368,7 @@ Component({
     loadUserRole() {
       const token = wx.getStorageSync('token')
       if (!token) return
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/me',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -765,6 +773,16 @@ Component({
     // ==================== 多文件操作 ====================
 
     onChooseFile() {
+      // 访客拦截：需先兑换许可密钥再选择文件
+      if (this.data.userRole === 'guest') {
+        wx.showToast({ title: '请先兑换许可密钥后再选择文件', icon: 'none', duration: 2000 })
+        return
+      }
+      // 文件数上限：最多 20 个
+      if (this.data.selectedFiles.length >= 20) {
+        wx.showToast({ title: '最多 20 个文件', icon: 'none', duration: 2000 })
+        return
+      }
       this._choosingFile = true
       wx.chooseMessageFile({
         count: 1,
@@ -775,6 +793,16 @@ Component({
           const name = file.name || ''
           const sizeKB = Number(file.size) || 0
           const fileIndex = this.data.selectedFiles.length
+
+          // 50MB 上限预检（size 单位为字节）
+          if ((Number(file.size) || 0) > 50 * 1024 * 1024) {
+            wx.showToast({
+              title: '文件超过 50MB 限制',
+              icon: 'none',
+              duration: 2000
+            })
+            return  // 拒绝此文件，不添加到列表
+          }
 
           // 检测文件格式：图片 / 不支持格式（Excel/PPT/压缩包等）
           const ext = name.slice(name.lastIndexOf('.')).toLowerCase()
@@ -905,6 +933,63 @@ Component({
       }, 600)  // cardRemove 动画 0.55s + 50ms buffer
     },
 
+    // 重印恢复：把 storage 中的 files 重建为 selectedFiles（file_id 已存在的跳过上传，份数/页码/双面全部回填）
+    _restoreReprintFiles(reprintInfo) {
+      const imageExts = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
+      const source = reprintInfo.files || []
+      const files = source.map((f) => {
+        const name = f.file_name || '未知文件'
+        const ext = name.slice(name.lastIndexOf('.')).toLowerCase()
+        const isImage = imageExts.indexOf(ext) !== -1
+        const pageRange = f.page_range || ''
+        const hasFileId = !!f.file_id
+        return {
+          name: name,
+          size: Number(f.size) || 0,
+          path: '',
+          sizeDisplay: f.size ? (Number(f.size) / 1024).toFixed(1) : '',
+          fileId: hasFileId ? f.file_id : null,
+          uploading: false,
+          progress: hasFileId ? 100 : 0,
+          failed: !hasFileId,   // 无 file_id 无法补传，标记失败让用户移除
+          copies: Math.min(Math.max(Number(f.copies) || 1, 1), 99),
+          pageRange: pageRange,
+          rangeLines: pageRange
+            ? pageRange.split(',').filter(l => (l || '').trim()).map(v => ({ value: v.trim(), error: '' }))
+            : [{ value: '', error: '' }],
+          duplex: isImage ? 'off' : (f.duplex || 'on'),
+          entering: true,
+          removing: false,
+          excelWarning: false,
+          unsupportedFormat: false,
+          isImage: isImage,
+          pageCount: Number(f.page_count) || 0,
+          pageCountStatus: hasFileId ? (Number(f.page_count) > 0 ? 'confirmed' : 'analyzing') : '',
+        }
+      })
+      this.setData({
+        selectedFiles: files,
+        badgeCount: files.length,
+        duplex: reprintInfo.duplex || 'on',
+        scrollPadHeight: 0,
+      })
+      // 恢复文件列表显式高度（对齐 _bumpForNewFile 估算逻辑，随后 _measure 修正）
+      const { windowWidth, windowHeight } = wx.getWindowInfo()
+      const rpxR = (windowWidth || 375) / 750
+      const estPx = Math.round(470 * rpxR)
+      const listCapPx = Math.round((windowHeight || 800) * 0.75)
+      this._fileListPx = Math.min(listCapPx, files.length * estPx)
+      this.setData({ fileListHeight: Math.max(0, this._fileListPx) })
+      // 页数未知的文件重新启动页数轮询
+      files.forEach((f, i) => {
+        if (f.fileId && !f.isImage && !(f.pageCount > 0)) {
+          this._startPageCountPoll(i, f.fileId)
+        }
+      })
+      this._scheduleMeasure(400)
+      setTimeout(() => this._scheduleMeasure(850), 850)
+    },
+
     // ==================== 文件上传（每个文件独立进度条）====================
 
     startFileUpload(fileIndex, filePath) {
@@ -912,10 +997,11 @@ Component({
       this.stopFileUploadTimer(fileIndex)
 
       const key = 'selectedFiles[' + fileIndex + ']'
+      // 先登记 entry（timer/task 后续填充），再启动进度条定时器，避免声明前引用（TDZ）
       this._uploadTimers[fileIndex] = {
         realProgress: 0,
         timer: null,
-        task: task,
+        task: null,
       }
 
       // 每 0.5s 把显示进度向真实进度推进
@@ -1030,6 +1116,25 @@ Component({
           this._uploadTimers[fileIndex].realProgress = res.progress
         }
       })
+      this._uploadTimers[fileIndex].task = task
+    },
+
+    // 上传失败卡片"重试"：重置状态后重新上传
+    onRetryUpload(e) {
+      const index = e.currentTarget.dataset.index
+      const file = this.data.selectedFiles[index]
+      if (!file || file.uploading) return
+      if (!file.path) {
+        wx.showToast({ title: '文件路径已失效，请重新选择', icon: 'none' })
+        return
+      }
+      this.setData({
+        ['selectedFiles[' + index + '].uploading']: true,
+        ['selectedFiles[' + index + '].progress']: 0,
+        ['selectedFiles[' + index + '].fileId']: null,
+        ['selectedFiles[' + index + '].failed']: false,
+      })
+      this.startFileUpload(index, file.path)
     },
 
     stopFileUploadTimer(fileIndex) {
@@ -1060,9 +1165,19 @@ Component({
       })
     },
 
+    // 页面重新可见时恢复页数轮询（仅对已上传且仍缺页数的文件）
+    _restartPageCountPolls() {
+      const files = this.data.selectedFiles || []
+      files.forEach((f, i) => {
+        if (f && f.fileId && !f.isImage && !f.excelWarning && !f.unsupportedFormat && !(f.pageCount > 0)) {
+          this._startPageCountPoll(i, f.fileId)
+        }
+      })
+    },
+
     // ==================== 页数轮询（等待本地打印工具分析）====================
 
-    _MAX_POLL_ATTEMPTS: 60,   // 在线时 60 次 × 2s = 最多等 120 秒；离线时不计次，持续轮询
+    _MAX_POLL_ATTEMPTS: 60,   // 60 次 × 2s = 最多轮询 120 秒（在线/离线均计数，避免离线时无限轮询）
 
     _startPageCountPoll(fileIndex, fileId) {
       this._stopPageCountPoll(fileIndex)
@@ -1071,7 +1186,7 @@ Component({
 
       const poll = () => {
         const token = wx.getStorageSync('token') || ''
-        wx.request({
+        request({
           url: CONFIG.BASE_URL + '/api/file_page/' + fileId,
           method: 'GET',
           header: { 'Authorization': 'Bearer ' + token },
@@ -1099,26 +1214,24 @@ Component({
               if (files[fileIndex] && files[fileIndex].fileId === fileId) {
                 const currentStatus = files[fileIndex].pageCountStatus
                 if (!printerOnline) {
-                  // 打印机离线 → 显示黄色警告，不计入轮询次数（等待上线）
+                  // 打印机离线 → 显示黄色警告；离线同样计数，避免无限轮询
                   if (currentStatus !== 'offline') {
                     this.setData({
                       ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'offline',
                     })
                   }
-                  // 离线时重置计数器，打印机上线后重新计时
-                  attempts = 0
                 } else {
-                  // 打印机在线 → 显示分析中，正常计数
+                  // 打印机在线 → 显示分析中
                   if (currentStatus !== 'analyzing') {
                     this.setData({
                       ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'analyzing',
                     })
                   }
-                  attempts++
-                  if (attempts >= this._MAX_POLL_ATTEMPTS) {
-                    this._stopPageCountPoll(fileIndex)
-                    console.log('页数轮询超时: fileIndex=' + fileIndex)
-                  }
+                }
+                attempts++
+                if (attempts >= this._MAX_POLL_ATTEMPTS) {
+                  this._stopPageCountPoll(fileIndex)
+                  console.log('页数轮询超时: fileIndex=' + fileIndex)
                 }
               }
             }
@@ -1289,7 +1402,7 @@ Component({
     },
 
     loadPricing() {
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/pricing',
         method: 'GET',
         success: (res) => {
@@ -1321,7 +1434,7 @@ Component({
     // ==================== 表单操作 ====================
 
     loadPrinterStatus() {
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/printer_status',
         method: 'GET',
         success: (res) => {
@@ -1427,6 +1540,7 @@ Component({
     onCoverPagePriceInput(e) {
       let v = parseFloat(e.detail.value)
       if (isNaN(v) || v < 0) v = 0
+      if (v > 100) v = 100   // 首页费上限 100 元
       this.setData({ coverPagePrice: v })
     },
 
@@ -1691,10 +1805,7 @@ Component({
         const hh = parseInt(m[1], 10)
         const mm = parseInt(m[2], 10)
         if (hh > 23 || mm > 59) return '预约时间格式不正确'
-        const now = new Date()
-        const target = new Date(now.getFullYear(), now.getMonth(),
-          now.getDate() + this.data.scheduleDayIndex, hh, mm, 0, 0)
-        if (target.getTime() <= now.getTime()) return '预约时间已过，请重新选择'
+        // 客户端时钟不可信：不在此判断"预约时间已过"，由服务端校验，400 响应透传服务端 message
         return ''
       }
       if (scheduleMode === 'countdown') {
@@ -1796,6 +1907,7 @@ Component({
 
     // 确认强制提交（忽略页数未验证警告）
     onConfirmForceSubmit() {
+      if (this.data.modalClosing) return   // 防连点（对齐 onAccessDeniedConfirm）
       this.setData({ modalClosing: true })
       setTimeout(() => {
         this.setData({ showPageCountWarning: false, modalClosing: false })
@@ -1812,6 +1924,7 @@ Component({
     },
 
     _doSubmit(skipPageValidation) {
+      if (this.data.submitting) return   // 防连点：提交进行中直接忽略
       const { selectedFiles } = this.data
 
       this.setData({ submitting: true })
@@ -1830,7 +1943,7 @@ Component({
         }
       })
 
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/submit_order',
         method: 'POST',
         header: {
@@ -1838,6 +1951,8 @@ Component({
           'content-type': 'application/json'
         },
         data: {
+          // 幂等键：后端按 client_request_id 对同一用户 10 分钟内去重（防提交失败重试造成重复订单）
+          client_request_id: Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
           duplex: this.data.duplex,
           files: filesPayload,
           // v5: 附加服务参数
@@ -1890,7 +2005,8 @@ Component({
           wx.hideLoading()
           console.error('任务提交失败：', err)
           this.setData({ submitting: false })
-          wx.showToast({ title: '任务提交失败', icon: 'none', duration: 2000 })
+          // 网络失败时订单可能已创建成功（幂等键兜底），不引导立即重试
+          wx.showToast({ title: '提交结果未知，请到"我的订单"确认后重试', icon: 'none', duration: 2500 })
         }
       })
     },
@@ -1935,6 +2051,13 @@ Component({
       const d = this._lastOrderResult
       if (!d || !d.files) return
       const files = d.files
+      // 附加服务参数优先取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
+      const echo = d.data || {}
+      const deliveryEnabled = echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : this.data.deliveryEnabled
+      const deliveryPercent = echo.delivery_percentage != null ? Number(echo.delivery_percentage) : this.data.deliveryPercent
+      const urgencyPrice = echo.urgency_price != null ? Number(echo.urgency_price) : this.data.urgencyPrice
+      const coverPage = echo.cover_page != null ? !!Number(echo.cover_page) : this.data.coverPage
+      const coverPagePrice = echo.cover_page_price != null ? Number(echo.cover_page_price) : this.data.coverPagePrice
 
       let baseTotal = 0
       let allKnown = true
@@ -1945,11 +2068,11 @@ Component({
       })
 
       let total = baseTotal
-      if (this.data.deliveryEnabled) {
-        total += baseTotal * (this.data.deliveryPercent / 100)
+      if (deliveryEnabled) {
+        total += baseTotal * (deliveryPercent / 100)
       }
-      total += this.data.urgencyPrice
-      if (this.data.coverPage) total += this.data.coverPagePrice
+      total += urgencyPrice
+      if (coverPage) total += coverPagePrice
 
       const orderNumber = d.order_number || ''
       const prefix = allKnown ? '' : '≈ '
@@ -1967,6 +2090,15 @@ Component({
       if (!d || !d.files) return
       const files = d.files
       const orderNumber = d.order_number || ''
+      // 附加服务参数优先取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
+      const echo = d.data || {}
+      const deliveryEnabled = echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : this.data.deliveryEnabled
+      const deliveryLocation = echo.delivery_location != null ? echo.delivery_location : this.data.deliveryLocation
+      const deliveryPercent = echo.delivery_percentage != null ? Number(echo.delivery_percentage) : this.data.deliveryPercent
+      const urgency = echo.urgency != null ? echo.urgency : this.data.urgency
+      const urgencyPrice = echo.urgency_price != null ? Number(echo.urgency_price) : this.data.urgencyPrice
+      const coverPage = echo.cover_page != null ? !!Number(echo.cover_page) : this.data.coverPage
+      const coverPagePrice = echo.cover_page_price != null ? Number(echo.cover_page_price) : this.data.coverPagePrice
       const lines = ['计费明细']
       if (orderNumber) lines.push(orderNumber)
       lines.push('─'.repeat(14))
@@ -1994,9 +2126,9 @@ Component({
 
       // 派送
       itemNum++
-      if (this.data.deliveryEnabled) {
-        const loc = this.data.deliveryLocation
-        const pct = this.data.deliveryPercent
+      if (deliveryEnabled) {
+        const loc = deliveryLocation
+        const pct = deliveryPercent
         const deliveryCost = baseTotal * (pct / 100)
         if (pct > 0 && deliveryCost > 0) {
           lines.push(itemNum + '. 派送：是 | ' + loc + ' ' + pct.toFixed(1) + '% | ￥' + deliveryCost.toFixed(2))
@@ -2010,19 +2142,19 @@ Component({
 
       // 优先级
       itemNum++
-      const urgPrice = this.data.urgencyPrice
+      const urgPrice = urgencyPrice
       if (urgPrice > 0) {
-        lines.push(itemNum + '. 优先级：' + this.data.urgency + ' | ￥' + urgPrice.toFixed(2))
+        lines.push(itemNum + '. 优先级：' + urgency + ' | ￥' + urgPrice.toFixed(2))
         allParts.push(urgPrice.toFixed(2))
       } else {
-        lines.push(itemNum + '. 优先级：' + this.data.urgency + ' | ￥0')
+        lines.push(itemNum + '. 优先级：' + urgency + ' | ￥0')
       }
 
       // 首页
-      if (this.data.coverPage) {
+      if (coverPage) {
         itemNum++
-        lines.push(itemNum + '. 打印首页信息 | ' + this.data.coverPagePrice.toFixed(2))
-        allParts.push(this.data.coverPagePrice.toFixed(2))
+        lines.push(itemNum + '. 打印首页信息 | ' + coverPagePrice.toFixed(2))
+        allParts.push(coverPagePrice.toFixed(2))
       }
 
       // 合计

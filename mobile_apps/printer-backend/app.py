@@ -7,11 +7,13 @@ import socket
 import sqlite3
 import string
 import secrets
+import sys
 import threading
 import time
 import uuid
 import math
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
 from urllib import request as urlrequest, parse as urlparse
@@ -24,6 +26,8 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 try:
     from PIL import Image
     HAS_PIL = True
+    # 防解压炸弹（P0-2）：单张图片像素数上限 5000 万，超限抛 DecompressionBombError
+    Image.MAX_IMAGE_PIXELS = 50_000_000
 except ImportError:
     HAS_PIL = False
 
@@ -34,6 +38,10 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 DATABASE = "orders.db"
 USER_DATABASE = "users.db"
 UPLOAD_DIR = "uploads"
+# 注意（P0-2）：avatars/ 目录（用户头像）不参与保留期清理与缓存统计——用户数据不随
+# 打印文件过期删除是设计使然，但头像目前没有数量/大小配额与独立清理机制，长期运行
+# 可能持续占用磁盘（每次上传 ≤2MB，但无人回收）。如需要回收需另加独立策略（如
+# 按用户头像数量上限或未活跃时间清理）。
 AVATAR_DIR = os.path.join(UPLOAD_DIR, "avatars")
 MD5_INDEX_FILE = os.path.join(UPLOAD_DIR, "md5_index.json")
 RETENTION_CONFIG_FILE = os.path.join(UPLOAD_DIR, "retention_config.json")
@@ -53,6 +61,36 @@ EXT_DIR_MAP = {
 
 # -------- 全局数据库锁与独立连接（供后台线程和加锁事务使用）--------
 db_lock = threading.Lock()
+
+# -------- MD5 索引文件锁（P2-5）：load/save 均需持锁，防并发读写损坏索引 --------
+_md5_index_lock = threading.Lock()
+
+# -------- 内存限速器（P1-6）--------
+# 滑动窗口 {key: [timestamp, ...]}。注意：内存计数仅对单 worker 生效，
+# 生产环境多 worker / 多实例时需要在 nginx 层再加 IP 维度限速。
+_rate_limits = defaultdict(list)
+_rate_limits_lock = threading.Lock()
+
+
+def _rate_limit(key, max_count, window_seconds):
+    """滑动窗口限速：key 在 window_seconds 秒内最多 max_count 次，超限返回 False。"""
+    now = time.time()
+    with _rate_limits_lock:
+        ts_list = _rate_limits[key]
+        # 清理窗口外的旧时间戳（顺序追加，队头最旧）
+        while ts_list and ts_list[0] <= now - window_seconds:
+            ts_list.pop(0)
+        if len(ts_list) >= max_count:
+            return False
+        ts_list.append(now)
+        return True
+
+
+class OrderRejected(Exception):
+    """提交订单业务校验失败（返回 400）：在事务内抛出以中止并回滚。"""
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
 
 
 def get_db_conn():
@@ -84,20 +122,22 @@ def get_file_md5(file_path):
 def load_md5_index():
     """加载 MD5 索引文件，不存在则返回空字典。
     兼容两种格式：旧 {md5: rel_path} 和 新 {md5: {path, original_name, page_count, page_count_verified}}"""
-    if not os.path.exists(MD5_INDEX_FILE):
-        return {}
-    try:
-        with open(MD5_INDEX_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
+    with _md5_index_lock:
+        if not os.path.exists(MD5_INDEX_FILE):
+            return {}
+        try:
+            with open(MD5_INDEX_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
 
 
 def save_md5_index(index):
     """保存 MD5 索引到文件"""
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    with open(MD5_INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
+    with _md5_index_lock:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        with open(MD5_INDEX_FILE, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
 
 
 def _md5_entry_get(index, md5):
@@ -249,16 +289,20 @@ def cleanup_expired_files():
     ).fetchall()
 
     # 收集所有活跃订单引用的 file_id
-    active_statuses = ('queued', 'printing', 'accepted', 'reserved')
+    # （P2-3）补全遗漏状态：scheduled（预约待下发）/ waiting（文件就绪等打印）/
+    # downloading（文件下载中）——之前漏掉会误删预约单尚未打印所需的文件
+    active_statuses = ('queued', 'printing', 'accepted', 'reserved',
+                       'scheduled', 'waiting', 'downloading')
+    status_placeholders = ",".join("?" for _ in active_statuses)
     active_file_ids = set()
     for (fid,) in conn.execute(
-        "SELECT DISTINCT file_id FROM orders WHERE file_id IS NOT NULL AND status IN (?,?,?,?)",
+        f"SELECT DISTINCT file_id FROM orders WHERE file_id IS NOT NULL AND status IN ({status_placeholders})",
         active_statuses,
     ).fetchall():
         if fid:
             active_file_ids.add(fid)
     for (fid,) in conn.execute(
-        "SELECT DISTINCT file_id FROM order_files WHERE file_id IS NOT NULL AND status IN (?,?,?,?)",
+        f"SELECT DISTINCT file_id FROM order_files WHERE file_id IS NOT NULL AND status IN ({status_placeholders})",
         active_statuses,
     ).fetchall():
         if fid:
@@ -376,6 +420,15 @@ try:
 except ImportError:
     print("[INFO] 未找到 config.py，使用内部默认配置。复制 config.py.example → config.py 后可自定义。")
 
+# 安全策略（P2-7）：生产环境禁止使用内置默认 SECRET_KEY。
+# 仅开发模式（FLASK_ENV=development 或命令行带 --debug）才允许默认 key。
+_DEV_MODE = os.environ.get("FLASK_ENV") == "development" or "--debug" in " ".join(sys.argv)
+if SECRET_KEY == "fallback-dev-key-please-change-in-production" and not _DEV_MODE:
+    raise RuntimeError(
+        "SECRET_KEY 未配置：生产环境必须在 config.py 中设置 SECRET_KEY，"
+        "或设置 FLASK_ENV=development 以开发模式运行"
+    )
+
 
 def is_admin(openid):
     """判断给定 openid 是否为管理员"""
@@ -395,6 +448,9 @@ def compute_role(openid):
         if row["role"] == "user":
             return "user"
         # 临时授权：temp_until 未过期视为 user
+        # （P2-17）时区说明：temp_until/scheduled_at 等均为本地时间字符串（%Y-%m-%d %H:%M:%S），
+        # 依赖服务器系统时区；部署时必须把服务器时区设为中国时区（Asia/Shanghai），
+        # 否则预约到点/临时授权过期判定会偏移。不改存储格式（破坏性风险）。
         if row["temp_until"]:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if row["temp_until"] > now_str:
@@ -410,14 +466,37 @@ def get_avatar_url(openid, avatar_path):
     return f"{PUBLIC_BASE_URL}/api/avatar?openid={openid}&v={mtime}"
 
 
+_AVATAR_MAX_SIZE = 2 * 1024 * 1024  # 头像大小上限 2MB（P0-2）
+
+
+def _is_valid_avatar(stream):
+    """校验头像文件魔数（P0-2）：仅允许 jpeg/png/webp/gif 头，读前 8 字节。
+    读取后把流位置复位到 0，供后续 save 使用。"""
+    head = stream.read(8)
+    stream.seek(0)
+    if not head:
+        return False
+    if head.startswith(b"\xff\xd8\xff"):            # JPEG
+        return True
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):       # PNG
+        return True
+    if head[:4] == b"RIFF" and head[4:8] == b"WEBP":  # WebP (RIFF....WEBP)
+        return True
+    if head.startswith(b"GIF8"):                    # GIF87a / GIF89a
+        return True
+    return False
+
+
 def compress_avatar(file_path, max_size=200):
     """压缩头像：缩放到 max_size×max_size 以内，转 JPEG 质量 80。
-    返回压缩后的文件路径（可能不同于原路径，因为扩展名变为 .jpg）。"""
+    返回压缩后的文件路径（可能不同于原路径，因为扩展名变为 .jpg）；
+    无法处理（损坏/解压炸弹/非图片）时返回 None，由调用方删除已保存文件并拒绝（P0-2）。"""
     if not HAS_PIL:
         return file_path  # 没有 Pillow 就原样存储
 
     try:
         img = Image.open(file_path)
+        img.load()  # 提前完整解码，尽早暴露损坏文件/解压炸弹
         # 统一为 RGB（去掉透明通道）
         if img.mode in ('RGBA', 'P'):
             img = img.convert('RGB')
@@ -432,7 +511,7 @@ def compress_avatar(file_path, max_size=200):
         return jpg_path
     except Exception as e:
         print(f"[WARN] 头像压缩失败: {e}")
-        return file_path
+        return None
 
 
 # Token 签名器（依赖 SECRET_KEY，必须在配置加载之后初始化）
@@ -454,6 +533,7 @@ pushed_tasks_lock = threading.Lock()
 
 CLIENT_HEARTBEAT_TIMEOUT = 90    # 心跳超时秒数（超过此值视为离线）
 PRINT_FEEDBACK_TIMEOUT = 180     # 打印反馈超时秒数（3 分钟，断线回滚兜底）
+ACCEPT_WAIT_TIMEOUT = 600        # P1-8：推送后未被 accept 的任务（手动流程，等用户点击）超时放宽到 10 分钟
 
 def get_active_clients():
     """返回心跳未超时的客户端 ID 列表"""
@@ -482,6 +562,43 @@ def _iso_to_ts(s):
         return 0
 
 
+def _get_printer_token():
+    """获取打印机认证 token（P1-3）：优先 X-Printer-Token 请求头，回退 query 参数 ?token=（向后兼容）。
+    安全说明：
+    - query 传参会出现在 nginx 访问日志中，长期暴露有泄露风险，应优先走请求头；
+    - PRINTER_TOKEN 应定期轮换（修改 config.py 中 TOKEN 后重启后端生效）。"""
+    tok = request.headers.get("X-Printer-Token", "")
+    if not tok:
+        tok = request.args.get("token", "")
+    return tok
+
+
+def _get_pricing_config():
+    """读取 pricing.json（不缓存，供提交订单时按服务端配置重算附加费），失败返回空 dict。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+# 多打印机负载均衡（P2-12）：轮询选择客户端，避免总推给 active_clients[0] 造成负载不均
+_client_round_robin_idx = 0
+_client_round_robin_lock = threading.Lock()
+
+
+def _pick_client(active_clients):
+    """从活跃客户端列表中轮询选一个（多打印机负载均衡），列表为空返回 None。"""
+    global _client_round_robin_idx
+    if not active_clients:
+        return None
+    with _client_round_robin_lock:
+        idx = _client_round_robin_idx % len(active_clients)
+        _client_round_robin_idx += 1
+        return active_clients[idx]
+
+
 @app.route("/api/download/<file_id>")
 def download_file(file_id):
     """打印机客户端下载文件（用签名 token 验证）"""
@@ -504,42 +621,6 @@ def download_file(file_id):
 
 
 # ==================== 文件页数分析（统计基础）====================
-
-
-def _count_pages_via_libreoffice(file_path: str, ext: str) -> int:
-    """通过 LibreOffice 将文档转为临时 PDF，再用 pypdf 统计页数。
-    成功返回页数（≥1），失败返回 0 表示未知。"""
-    import subprocess
-    import tempfile
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = subprocess.run(
-                ["soffice", "--headless", "--convert-to", "pdf", "--outdir", tmpdir, file_path],
-                capture_output=True, text=True, timeout=15,
-            )
-            if result.returncode != 0:
-                stderr_tail = (result.stderr or "").strip()[-200:]
-                print(f"  [WARN] LibreOffice 转换失败 (rc={result.returncode}): {stderr_tail}")
-                return 0
-            # LibreOffice 输出的 PDF 文件名 = 原始 basename 改扩展名 .pdf
-            base = os.path.splitext(os.path.basename(file_path))[0]
-            for fname in os.listdir(tmpdir):
-                if fname.lower().endswith(".pdf"):
-                    pdf_path = os.path.join(tmpdir, fname)
-                    from pypdf import PdfReader
-                    reader = PdfReader(pdf_path)
-                    page_count = len(reader.pages)
-                    print(f"  [PAGE] {ext.upper()} {os.path.basename(file_path)}: {page_count} 页 (via LibreOffice)")
-                    return max(page_count, 1)
-            print(f"  [WARN] LibreOffice 未生成预期 PDF（base={base}），目录内容: {os.listdir(tmpdir)}")
-            return 0
-    except FileNotFoundError:
-        print(f"  [WARN] LibreOffice (soffice) 未安装，.{ext} 文件页数无法获取")
-    except subprocess.TimeoutExpired:
-        print(f"  [WARN] LibreOffice 转换超时 (15s)，.{ext} 文件页数未知")
-    except Exception as e:
-        print(f"  [WARN] LibreOffice 转换异常 ({e})，.{ext} 文件页数未知")
-    return 0
 
 
 def get_file_page_count(file_path, file_type=None):
@@ -907,6 +988,41 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # v20 迁移：order_files 添加 locked_at 列（任务被锁定/accept 的时刻，P0-1/P1-8）
+    # 用于：孤儿 printing 任务回收（按锁定时间而非创建时间，避免无限 push/回退循环）
+    #       与超时判定（accept 后按 accept 时刻起算反馈超时）。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(order_files)").fetchall()]
+        if "locked_at" not in cols:
+            conn.execute("ALTER TABLE order_files ADD COLUMN locked_at TEXT DEFAULT ''")
+            conn.commit()
+            print("  已添加 order_files.locked_at 列")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
+    # v21 迁移：files 添加 openid 列（文件归属校验，P2-10）
+    # 每个上传都会在 files 表新建一行（MD5 去重只复用磁盘文件），openid 记录归属者，
+    # 提交订单时校验 file_id 归属，防止跨用户引用他人文件。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(files)").fetchall()]
+        if "openid" not in cols:
+            conn.execute("ALTER TABLE files ADD COLUMN openid TEXT DEFAULT ''")
+            conn.commit()
+            print("  已添加 files.openid 列")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
+    # v22 迁移：orders 添加 client_request_id 列（提交幂等键，防双击/重试重复建单）
+    # 小程序每次提交生成唯一 ID，后端对同 openid + 同 ID 且 10 分钟内的订单去重返回。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+        if "client_request_id" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN client_request_id TEXT DEFAULT ''")
+            conn.commit()
+            print("  已添加 orders.client_request_id 列")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
     # 收支清算配置（单行 JSON blob，id 恒为 1；随 orders.db 一起被 backup.sh 备份）
     conn.execute(
         """
@@ -930,7 +1046,7 @@ def next_order_number():
     调用即分配，同时在数据库创建 reserved 状态占位记录，
     防止订单号被浪费。若后续未调用 /api/local_orders 提交，
     超时后由定时任务自动标记为 abandoned。"""
-    token = request.args.get("token", "")
+    token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     order_number = generate_order_number()
@@ -979,6 +1095,8 @@ def generate_order_number():
 
         with open(ORDER_COUNTER_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())  # P2-15：写盘并落盘，防断电/崩溃丢失已分配序号
 
     return f"HN{today}-{counter:04d}"
 
@@ -1073,10 +1191,11 @@ def fetch_and_lock_task(client_id):
                 conn.rollback()
                 return None
             task_id = row["id"]
-            # 锁定任务并记录领取者
+            # 锁定任务并记录领取者（locked_at = 锁定时刻，P0-1：孤儿回收/超时判定以它为准，
+            # 不再依赖 created_at，避免"任务被反复 push/回退导致 created_at 很旧被误回收"的循环）
             conn.execute(
-                "UPDATE order_files SET status = 'printing', operator_client = ? WHERE id = ?",
-                (client_id, task_id)
+                "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ?",
+                (client_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_id)
             )
             # 刷新父订单聚合状态
             parent_row = conn.execute(
@@ -1165,11 +1284,11 @@ def process_pending_orders():
             conn.close()
             continue
 
-        # 推送给打印机客户端
+        # 推送给打印机客户端（P2-12：轮询选择，多打印机负载均衡）
         active_clients = get_active_clients()
         if active_clients:
             pushed = push_print_task_to_client(of_id, file_id, file_name, copies, duplex,
-                                               page_range, active_clients[0],
+                                               page_range, _pick_client(active_clients),
                                                auto_print=bool(row["auto_print"]))
             if pushed:
                 continue
@@ -1232,7 +1351,7 @@ def process_scheduled_orders():
                 continue
             push_print_task_to_client(row["of_id"], file_id, row["file_name"],
                                       row["copies"], row["duplex"] or "on",
-                                      row["page_range"] or "", active_clients[0],
+                                      row["page_range"] or "", _pick_client(active_clients),
                                       auto_print=True,
                                       scheduled_download=True,
                                       schedule_mode=row["schedule_mode"],
@@ -1252,7 +1371,7 @@ def process_scheduled_orders():
                 continue
             if target > now:
                 continue
-            client_id = row["operator_client"] or (active_clients[0] if active_clients else None)
+            client_id = row["operator_client"] or _pick_client(active_clients)
             if not client_id:
                 continue
             with printer_clients_lock:
@@ -1293,15 +1412,16 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
     with db_lock:
         conn = get_db_conn()
         try:
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if scheduled_download:
                 cur = conn.execute(
-                    "UPDATE order_files SET status = 'downloading', operator_client = ? WHERE id = ? AND status = 'scheduled'",
-                    (client_id, sub_task_id),
+                    "UPDATE order_files SET status = 'downloading', operator_client = ?, locked_at = ? WHERE id = ? AND status = 'scheduled'",
+                    (client_id, now_str, sub_task_id),
                 )
             else:
                 cur = conn.execute(
-                    "UPDATE order_files SET status = 'printing', operator_client = ? WHERE id = ? AND status = 'queued'",
-                    (client_id, sub_task_id),
+                    "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ? AND status = 'queued'",
+                    (client_id, now_str, sub_task_id),
                 )
             # cur.rowcount == 0 表示该任务已不是 queued（正被其他流程处理或已结束）→ 跳过
             if cur.rowcount == 0:
@@ -1383,13 +1503,22 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             task_msg["cover_page"] = bool(o_row["cover_page"])
             task_msg["cover_page_price"] = float(o_row["cover_page_price"] or 0.15)
 
-    # 查询文件 MD5（供本地工具 PDF 缓存命中，避免重复下载）
+    # 查询文件 MD5（供本地工具 PDF 缓存命中，避免重复下载，P1-7）
     if file_id:
         conn = get_db()
-        row = conn.execute("SELECT md5 FROM files WHERE id = ?", (file_id,)).fetchone()
+        row = conn.execute("SELECT md5, path FROM files WHERE id = ?", (file_id,)).fetchone()
         conn.close()
         if row and row["md5"]:
             task_msg["source_md5"] = row["md5"]
+        elif row and row["path"]:
+            # 兜底：老记录 md5 列为空 → 从 MD5 索引按路径反查（load_md5_index 自带锁）
+            rel = os.path.relpath(row["path"], UPLOAD_DIR)
+            md5_index = load_md5_index()
+            for k, v in md5_index.items():
+                p = v if isinstance(v, str) else (v or {}).get("path", "")
+                if p == rel:
+                    task_msg["source_md5"] = k
+                    break
 
     if not sid:
         # 客户端刚断开：预约单回退 scheduled，普通单回退 queued，等下次扫描重试
@@ -1398,12 +1527,12 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             try:
                 if scheduled_download:
                     conn.execute(
-                        "UPDATE order_files SET status = 'scheduled' WHERE id = ? AND status = 'downloading'",
+                        "UPDATE order_files SET status = 'scheduled', locked_at = '' WHERE id = ? AND status = 'downloading'",
                         (sub_task_id,),
                     )
                 else:
                     conn.execute(
-                        "UPDATE order_files SET status = 'queued' WHERE id = ? AND status = 'printing'",
+                        "UPDATE order_files SET status = 'queued', locked_at = '' WHERE id = ? AND status = 'printing'",
                         (sub_task_id,),
                     )
                 if order_id:
@@ -1432,12 +1561,12 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             try:
                 if scheduled_download:
                     conn.execute(
-                        "UPDATE order_files SET status = 'scheduled' WHERE id = ? AND status = 'downloading'",
+                        "UPDATE order_files SET status = 'scheduled', locked_at = '' WHERE id = ? AND status = 'downloading'",
                         (sub_task_id,),
                     )
                 else:
                     conn.execute(
-                        "UPDATE order_files SET status = 'queued' WHERE id = ? AND status = 'printing'",
+                        "UPDATE order_files SET status = 'queued', locked_at = '' WHERE id = ? AND status = 'printing'",
                         (sub_task_id,),
                     )
                 if order_id:
@@ -1455,33 +1584,71 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
 
 
 def check_printing_timeout():
-    """检查超过超时时间未反馈的 printing 子任务 (order_files)，标记为失败并聚合父订单"""
+    """检查超过超时时间未反馈的 printing/accepted 子任务 (order_files)，标记为失败并聚合父订单。
+
+    P1-8 超时判定（按是否已被客户端 accept 区分，避免手动流程被 3 分钟误杀）：
+    - 未 accept（status='printing'，手动流程等用户点击）：pushed_at 起算 10 分钟（ACCEPT_WAIT_TIMEOUT）
+    - 已 accept（status='accepted'）：accept 时刻（locked_at，由 accept_order 刷新）起算 3 分钟
+      （PRINT_FEEDBACK_TIMEOUT）；locked_at 距今不足 3 分钟 → 跳过（仍在反馈窗口内）
+    """
     now = datetime.now()
     timeout_sub_tasks = []
 
+    # 1) 未 accept 的任务：pushed_at 起算 10 分钟
     with pushed_tasks_lock:
         for sub_task_id, info in list(pushed_tasks.items()):
-            if (now - info["pushed_at"]).total_seconds() > PRINT_FEEDBACK_TIMEOUT:
+            if (now - info["pushed_at"]).total_seconds() > ACCEPT_WAIT_TIMEOUT:
                 timeout_sub_tasks.append(sub_task_id)
                 del pushed_tasks[sub_task_id]
 
-    if not timeout_sub_tasks:
-        return
+    # 2) 已 accept 的任务：locked_at（accept 时刻）起算 3 分钟
+    conn = get_db()
+    try:
+        acc_rows = conn.execute(
+            "SELECT id, order_id, locked_at FROM order_files WHERE status = 'accepted'"
+        ).fetchall()
+        for r in acc_rows:
+            la = r["locked_at"] or ""
+            if not la:
+                continue  # 旧数据无 locked_at，不参与超时判定
+            try:
+                la_dt = datetime.strptime(la, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if (now - la_dt).total_seconds() > PRINT_FEEDBACK_TIMEOUT:
+                timeout_sub_tasks.append(r["id"])
 
-    print(f"\n[TIMEOUT] 超时检查: {len(timeout_sub_tasks)} 个子任务超时")
-    for sub_task_id in timeout_sub_tasks:
-        conn = get_db()
-        of_row = conn.execute(
-            "SELECT id, status, order_id FROM order_files WHERE id = ?", (sub_task_id,)
-        ).fetchone()
+        if not timeout_sub_tasks:
+            return
 
-        if of_row and of_row["status"] == "printing":
+        print(f"\n[TIMEOUT] 超时检查: {len(timeout_sub_tasks)} 个子任务超时")
+        for sub_task_id in timeout_sub_tasks:
+            of_row = conn.execute(
+                "SELECT id, status, order_id, locked_at FROM order_files WHERE id = ?", (sub_task_id,)
+            ).fetchone()
+
+            if not of_row or of_row["status"] not in ("printing", "accepted"):
+                if of_row:
+                    print(f"  [INFO] 子任务 #{sub_task_id}: 状态已变更为 {of_row['status']}，跳过")
+                continue
+            # 已 accept 但 locked_at 距今 < 3 分钟 → 刚 accept 不久，仍在反馈窗口内，跳过
+            la = of_row["locked_at"] or ""
+            if of_row["status"] == "accepted" and la:
+                try:
+                    la_dt = datetime.strptime(la, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    la_dt = None
+                if la_dt and (now - la_dt).total_seconds() < PRINT_FEEDBACK_TIMEOUT:
+                    print(f"  [INFO] 子任务 #{sub_task_id}: 刚被 accept，仍在反馈窗口内，跳过")
+                    continue
             print(f"  [FAIL] 子任务 #{sub_task_id}: 超时未反馈，标记为失败")
-            conn.execute("UPDATE order_files SET status = 'failed' WHERE id = ?", (sub_task_id,))
+            conn.execute(
+                "UPDATE order_files SET status = 'failed', locked_at = '' WHERE id = ?",
+                (sub_task_id,),
+            )
             refresh_order_status(conn, of_row["order_id"])
             conn.commit()
-        elif of_row and of_row["status"] != "printing":
-            print(f"  [INFO] 子任务 #{sub_task_id}: 状态已变更为 {of_row['status']}，跳过")
+    finally:
         conn.close()
 
 
@@ -1489,7 +1656,14 @@ def recover_orphaned_printing_tasks():
     """扫描超过 5 分钟仍处于 printing 的任务，检查文件是否存在：
     - 文件存在 → 回退为 queued（让其他打印机重试）
     - 文件不存在 → 标记为 failed（避免无限循环）
-    覆盖极端场景：服务器断电/客户端失联但未触发 disconnect 事件。"""
+    覆盖极端场景：服务器断电/客户端失联但未触发 disconnect 事件。
+
+    P0-1：判定基准从 created_at 改为 locked_at（任务被锁定的时刻）。
+    旧逻辑用 created_at，任务被"push → 客户端断线回滚 → 再 push"循环时会不断刷新
+    created_at 附近的锁定，但 created_at 是创建时间不会变——实际问题是 created_at 很久
+    的任务若被反复回退/重推，会立刻被回收造成无限循环；locked_at 只在锁定瞬间写入，
+    回退时清空（locked_at=''），新锁定重新写入，语义正确且兼容旧数据（'' 视为未锁定，
+    直接按超时处理）。"""
     cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
     with db_lock:
         conn = get_db_conn()
@@ -1497,7 +1671,7 @@ def recover_orphaned_printing_tasks():
             """SELECT of.id, of.order_id, of.file_id, f.path
                FROM order_files of
                LEFT JOIN files f ON of.file_id = f.id
-               WHERE of.status = 'printing' AND of.created_at < ?""",
+               WHERE of.status = 'printing' AND (of.locked_at = '' OR of.locked_at < ?)""",
             (cutoff_time,)
         ).fetchall()
         if not rows:
@@ -1516,13 +1690,13 @@ def recover_orphaned_printing_tasks():
         if reset_ids:
             placeholders = ",".join("?" for _ in reset_ids)
             conn.execute(
-                f"UPDATE order_files SET status = 'queued', operator_client = '' WHERE id IN ({placeholders})",
+                f"UPDATE order_files SET status = 'queued', operator_client = '', locked_at = '' WHERE id IN ({placeholders})",
                 [str(x) for x in reset_ids]
             )
         if fail_ids:
             placeholders = ",".join("?" for _ in fail_ids)
             conn.execute(
-                f"UPDATE order_files SET status = 'failed' WHERE id IN ({placeholders})",
+                f"UPDATE order_files SET status = 'failed', locked_at = '' WHERE id IN ({placeholders})",
                 [str(x) for x in fail_ids]
             )
 
@@ -1581,7 +1755,7 @@ def recover_stale_downloading():
 @socketio.on("connect")
 def on_connect(auth=None):
     """打印机客户端连接 -- 验证 URL 查询参数中的 token"""
-    token = request.args.get("token", "")
+    token = _get_printer_token()
     if not token and auth and isinstance(auth, dict):
         token = auth.get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
@@ -1590,8 +1764,19 @@ def on_connect(auth=None):
         disconnect()
         return False
 
-    client_id = request.args.get("client_id", request.sid)
+    # P1-2.3：client_id 来源校验（非空、长度合理），避免脏数据/异常连接污染 printer_clients
+    client_id = (request.args.get("client_id", request.sid) or "").strip()
+    if not client_id or len(client_id) > 64:
+        print(f"[WARN] 打印机客户端连接: client_id 非法，拒绝")
+        emit("auth_fail", {"message": "client_id 无效"})
+        disconnect()
+        return False
+
     with printer_clients_lock:
+        old = printer_clients.get(client_id)
+        if old and old["sid"] != request.sid:
+            # 同一 client_id 重复连接：优雅替换（旧连接断线回滚会按 sid 反查兜底），记录警告
+            print(f"[WARN] 打印机客户端 {client_id} 重复连接（旧 sid={old['sid']}），已替换为新连接")
         printer_clients[client_id] = {
             "sid": request.sid,
             "heartbeat": datetime.now(),
@@ -1652,8 +1837,9 @@ def on_disconnect(reason=None):
                 if rows:
                     ids = [str(r["id"]) for r in rows]
                     placeholders = ",".join("?" for _ in rows)
+                    # P0-1.4：回退 queued 时同时清空 locked_at，防止旧锁定时间被孤儿回收误判
                     conn.execute(
-                        f"UPDATE order_files SET status = 'queued', operator_client = '' WHERE id IN ({placeholders})",
+                        f"UPDATE order_files SET status = 'queued', operator_client = '', locked_at = '' WHERE id IN ({placeholders})",
                         ids
                     )
                     for r in rows:
@@ -1669,7 +1855,7 @@ def on_disconnect(reason=None):
                     dl_ids = [str(r["id"]) for r in dl_rows]
                     dl_placeholders = ",".join("?" for _ in dl_rows)
                     conn.execute(
-                        f"UPDATE order_files SET status = 'scheduled', operator_client = '' WHERE id IN ({dl_placeholders})",
+                        f"UPDATE order_files SET status = 'scheduled', operator_client = '', locked_at = '' WHERE id IN ({dl_placeholders})",
                         dl_ids
                     )
                     for r in dl_rows:
@@ -1723,6 +1909,12 @@ def on_ping():
     emit("pong")
 
 
+def _get_event_client_id():
+    """事件来源校验（P1-2）：用当前连接的 request.sid 反查 printer_clients 中的 client_id，
+    查不到（连接未注册/伪造 sid）返回 None。"""
+    return _find_client_id_by_sid(request.sid)
+
+
 @socketio.on("print_success")
 def on_print_success(data):
     """打印成功 -- 更新子任务状态为 sent，并聚合父订单状态"""
@@ -1730,15 +1922,35 @@ def on_print_success(data):
     if not task_id:
         return
 
-    task_id = int(task_id)
+    try:
+        task_id = int(task_id)
+    except (ValueError, TypeError):
+        print(f"  [WARN] print_success 收到非法 task_id: {task_id!r}，已忽略")
+        return
+
+    # 来源校验（P1-2）：仅该任务的领取客户端可回报成功
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] print_success 来自未注册连接（sid={request.sid}），已忽略")
+        return
 
     conn = get_db()
+    row = conn.execute(
+        "SELECT order_id, operator_client FROM order_files WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row and row["operator_client"] and row["operator_client"] != client_id:
+        print(f"  [WARN] print_success 子任务 #{task_id} 的 operator_client={row['operator_client']}"
+              f" 与当前连接 {client_id} 不符，已拒绝")
+        conn.close()
+        return
+
+    # P1-5：状态集加入 queued（断线回滚闭环：回滚后客户端回报成功也能收敛为 sent）；
+    # P0-1.4：完成时清空 locked_at
     conn.execute(
-        "UPDATE order_files SET status = 'sent' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading')",
+        "UPDATE order_files SET status = 'sent', locked_at = '' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued')",
         (task_id,),
     )
     # 获取父订单 ID 并刷新聚合状态
-    row = conn.execute("SELECT order_id FROM order_files WHERE id = ?", (task_id,)).fetchone()
     if row:
         refresh_order_status(conn, row["order_id"])
     conn.commit()
@@ -1759,13 +1971,34 @@ def on_print_fail(data):
     if not task_id:
         return
 
-    task_id = int(task_id)
+    try:
+        task_id = int(task_id)
+    except (ValueError, TypeError):
+        print(f"  [WARN] print_fail 收到非法 task_id: {task_id!r}，已忽略")
+        return
+
+    # 来源校验（P1-2）：仅该任务的领取客户端可回报失败
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] print_fail 来自未注册连接（sid={request.sid}），已忽略")
+        return
 
     print(f"  [FAIL] 子任务 #{task_id}: 客户端打印失败 ({error})，标记为失败")
     conn = get_db()
-    conn.execute("UPDATE order_files SET status = 'failed' WHERE id = ?", (task_id,))
+    row = conn.execute(
+        "SELECT order_id, operator_client FROM order_files WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row and row["operator_client"] and row["operator_client"] != client_id:
+        print(f"  [WARN] print_fail 子任务 #{task_id} 的 operator_client={row['operator_client']}"
+              f" 与当前连接 {client_id} 不符，已拒绝")
+        conn.close()
+        return
+    # P1-5：禁止 sent → failed 降级（已完成的任务不能被迟到的失败回报改状态）
+    conn.execute(
+        "UPDATE order_files SET status = 'failed', locked_at = '' WHERE id = ? AND status != 'sent'",
+        (task_id,),
+    )
     # 获取父订单 ID 并刷新聚合状态
-    row = conn.execute("SELECT order_id FROM order_files WHERE id = ?", (task_id,)).fetchone()
     if row:
         refresh_order_status(conn, row["order_id"])
     conn.commit()
@@ -1807,8 +2040,18 @@ def on_file_ready(data):
         task_ids = [task_ids]
     if not task_ids:
         return
-    task_ids = [int(t) for t in task_ids]
+    try:
+        task_ids = [int(t) for t in task_ids]
+    except (ValueError, TypeError):
+        print(f"  [WARN] file_ready 收到非法 task_ids: {task_ids!r}，已忽略")
+        return
     order_id = data.get("order_id")
+
+    # 来源校验（P1-2）：仅领取该下载任务的客户端可回报就绪
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] file_ready 来自未注册连接（sid={request.sid}），已忽略")
+        return
 
     resume_target = None
     with db_lock:
@@ -1816,6 +2059,14 @@ def on_file_ready(data):
         try:
             conn.execute("BEGIN IMMEDIATE")
             for tid in task_ids:
+                # 来源校验：operator_client 与当前连接不符的子任务拒绝处理
+                chk = conn.execute(
+                    "SELECT operator_client FROM order_files WHERE id = ?", (tid,)
+                ).fetchone()
+                if chk and chk["operator_client"] and chk["operator_client"] != client_id:
+                    print(f"  [WARN] file_ready 子任务 #{tid} 的 operator_client={chk['operator_client']}"
+                          f" 与当前连接 {client_id} 不符，跳过")
+                    continue
                 conn.execute(
                     "UPDATE order_files SET status = 'waiting' WHERE id = ? AND status = 'downloading'",
                     (tid,),
@@ -1860,6 +2111,22 @@ def on_download_delayed(data):
     order_id = data.get("order_id")
     if not order_id:
         return
+
+    # 来源校验（P1-2）：冻结操作必须来自该订单下载中任务的领取客户端
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] download_delayed 来自未注册连接（sid={request.sid}），已忽略")
+        return
+    conn_chk = get_db()
+    chk_rows = conn_chk.execute(
+        "SELECT operator_client FROM order_files WHERE order_id = ? AND status = 'downloading'",
+        (order_id,),
+    ).fetchall()
+    conn_chk.close()
+    if chk_rows and any(r["operator_client"] and r["operator_client"] != client_id for r in chk_rows):
+        print(f"  [WARN] download_delayed 订单 #{order_id} 的下载任务不属于当前连接 {client_id}，已拒绝")
+        return
+
     with db_lock:
         conn = get_db_conn()
         try:
@@ -1892,17 +2159,35 @@ def on_start_printing(data):
         task_ids = [task_ids]
     if not task_ids:
         return
-    task_ids = [int(t) for t in task_ids]
-    client_id = _find_client_id_by_sid(request.sid)
+    try:
+        task_ids = [int(t) for t in task_ids]
+    except (ValueError, TypeError):
+        print(f"  [WARN] start_printing 收到非法 task_ids: {task_ids!r}，已忽略")
+        return
+
+    # 来源校验（P1-2）：仅领取该预约下载任务的客户端可上报开始打印
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] start_printing 来自未注册连接（sid={request.sid}），已忽略")
+        return
 
     with db_lock:
         conn = get_db_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             for tid in task_ids:
+                # 来源校验：operator_client 与当前连接不符的子任务跳过
+                chk = conn.execute(
+                    "SELECT operator_client FROM order_files WHERE id = ?", (tid,)
+                ).fetchone()
+                if chk and chk["operator_client"] and chk["operator_client"] != client_id:
+                    print(f"  [WARN] start_printing 子任务 #{tid} 的 operator_client={chk['operator_client']}"
+                          f" 与当前连接 {client_id} 不符，跳过")
+                    continue
                 conn.execute(
-                    "UPDATE order_files SET status = 'printing', operator_client = ? WHERE id = ? AND status IN ('waiting', 'downloading')",
-                    (client_id or "", tid),
+                    "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ? AND status IN ('waiting', 'downloading')",
+                    (client_id, now_str, tid),
                 )
                 row = conn.execute("SELECT order_id FROM order_files WHERE id = ?", (tid,)).fetchone()
                 if row and row["order_id"]:
@@ -1916,7 +2201,7 @@ def on_start_printing(data):
 
     with pushed_tasks_lock:
         for tid in task_ids:
-            pushed_tasks[tid] = {"pushed_at": datetime.now(), "client_id": client_id or ""}
+            pushed_tasks[tid] = {"pushed_at": datetime.now(), "client_id": client_id}
     print(f"  [START] 预约单开始打印: {task_ids}")
 
 
@@ -1925,9 +2210,19 @@ def on_page_count_result(data):
     """本地打印工具回报文件页数分析结果。
     data: {file_id, page_count, orientation, success}"""
     file_id = data.get("file_id", "")
-    page_count = int(data.get("page_count", 0) or 0)
+    try:
+        page_count = int(data.get("page_count", 0) or 0)
+    except (ValueError, TypeError):
+        page_count = 0
     orientation = data.get("orientation", "")
     success = data.get("success", True)
+
+    # 来源校验（P1-2）：仅已注册的打印机客户端可回报页数（file_id 维度无法核对
+    # operator_client，因为页数分析是广播式领取的；至少保证连接合法）
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] page_count_result 来自未注册连接（sid={request.sid}），已忽略")
+        return
 
     if not file_id or page_count <= 0:
         print(f"  [PAGE] page_count_result 无效: file_id={file_id}, pages={page_count}")
@@ -1955,6 +2250,58 @@ def on_page_count_result(data):
 
     # 验证使用该文件的所有活跃子任务的页码范围是否超出总页数
     _validate_page_ranges_for_file(file_id, page_count)
+
+    # P2-1（docx 少计费）：页数修正后回溯更新引用该文件的子任务页数与价格、父订单总额
+    _recalc_prices_for_file(file_id, page_count)
+
+
+def _recalc_prices_for_file(file_id, page_count):
+    """页数回报后回溯修正子任务价格与父订单总额（P2-1）：
+    对引用该文件、状态未终结（非 sent/failed/canceled/rejected/abandoned）的子任务，
+    用新页数重算 total_price（calculate_price × copies），并重算父订单 total_price
+    （基础打印费 + 附加服务费，口径与 submit_order 一致），同时刷新聚合状态。"""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, order_id, copies, duplex FROM order_files"
+            " WHERE file_id = ? AND status NOT IN ('sent','failed','canceled','rejected','abandoned')",
+            (file_id,),
+        ).fetchall()
+        if not rows:
+            return
+        order_ids = set()
+        for r in rows:
+            per_copy = calculate_price(page_count, r["duplex"] or "on")
+            new_total = round(per_copy * (r["copies"] or 1), 2)
+            conn.execute(
+                "UPDATE order_files SET page_count = ?, total_price = ? WHERE id = ?",
+                (page_count, new_total, r["id"]),
+            )
+            order_ids.add(r["order_id"])
+        for oid in order_ids:
+            sub_sum = conn.execute(
+                "SELECT COALESCE(SUM(total_price), 0) FROM order_files WHERE order_id = ?",
+                (oid,),
+            ).fetchone()[0]
+            o = conn.execute(
+                "SELECT delivery_enabled, delivery_percentage, urgency_price, cover_page, cover_page_price"
+                " FROM orders WHERE id = ?",
+                (oid,),
+            ).fetchone()
+            if o:
+                delivery_fee = round(float(sub_sum) * (o["delivery_percentage"] or 0) / 100, 2) if o["delivery_enabled"] else 0
+                urgency_fee = float(o["urgency_price"] or 0)
+                cover_fee = round(float(o["cover_page_price"] or 0) * o["cover_page"], 2) if o["cover_page"] else 0
+                parent_total = round(float(sub_sum) + urgency_fee + cover_fee + delivery_fee, 2)
+                conn.execute("UPDATE orders SET total_price = ? WHERE id = ?", (parent_total, oid))
+            refresh_order_status(conn, oid)
+        conn.commit()
+        print(f"  [PRICE] 已回溯重算 {len(rows)} 个子任务的价格（页数修正为 {page_count} 页）")
+    except Exception as e:
+        print(f"  [WARN] 价格回溯重算失败: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
 
 
 def _parse_page_range_max(range_str: str) -> int:
@@ -2022,7 +2369,11 @@ def on_page_range_truncated(data):
     if not task_id:
         return
 
-    task_id = int(task_id)
+    try:
+        task_id = int(task_id)
+    except (ValueError, TypeError):
+        print(f"  [WARN] page_range_truncated 收到非法 task_id: {task_id!r}，已忽略")
+        return
     print(f"  [TRUNC] 子任务 #{task_id}: 页码范围被截断 {original} → {effective} (总 {total_pages} 页)")
 
     conn = get_db()
@@ -2061,7 +2412,7 @@ def request_page_analysis(file_id: str, file_name: str) -> bool:
         return False
 
     download_url = make_download_url(file_id)
-    client_id = active_clients[0]
+    client_id = _pick_client(active_clients)
 
     with printer_clients_lock:
         client_info = printer_clients.get(client_id)
@@ -2125,6 +2476,8 @@ def require_printer_access(f):
         role = compute_role(g.openid)
         if role not in ("admin", "user"):
             # 检查临时授权（temp_until > 当前时间）
+            # （P2-17）时区说明：temp_until 为服务器本地时间，依赖服务器时区，
+            # 部署时须配置为 Asia/Shanghai
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             conn = get_user_db()
             row = conn.execute(
@@ -2142,6 +2495,16 @@ def require_printer_access(f):
 # ==================== API 路由 ====================
 
 
+@app.before_request
+def limit_json_body():
+    """P2-11：JSON 请求体上限 1MB（全局 MAX_CONTENT_LENGTH=50MB 只防文件上传撑爆内存，
+    JSON 接口正常数据远小于 1MB，超大 JSON 多为异常请求）。multipart 文件上传不受影响。"""
+    if request.is_json:
+        cl = request.content_length or 0
+        if cl > 1024 * 1024:
+            return jsonify({"success": False, "message": "请求体过大"}), 413
+
+
 @app.route("/api/ping")
 def ping():
     return {"msg": "pong", "status": "ok"}
@@ -2149,9 +2512,9 @@ def ping():
 
 @app.route("/api/printer_status", methods=["GET"])
 def printer_status():
-    """返回打印机在线状态。"""
-    with printer_clients_lock:
-        online_count = len(printer_clients)
+    """返回打印机在线状态（P2-13：基于心跳统计 get_active_clients，剔除心跳超时的僵尸注册）。"""
+    active = get_active_clients()
+    online_count = len(active)
     return jsonify({
         "success": True,
         "online": online_count > 0,
@@ -2276,8 +2639,17 @@ def device_login():
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
 
     device_id = (data.get("device_id") or "").strip()
-    if not device_id or len(device_id) < 6:
-        return jsonify({"success": False, "message": "device_id 无效"}), 400
+
+    # 限速（P0-2.2 / P1-6）：每 IP / 每 device_id 每小时最多 20 次，防止无限建号刷库。
+    # 注意：内存计数仅单 worker 有效，nginx 层应再加 IP 维度限速。
+    ip = request.remote_addr or "unknown"
+    if not _rate_limit(f"device_login:ip:{ip}", 20, 3600) or \
+       not _rate_limit(f"device_login:dev:{device_id}", 20, 3600):
+        return jsonify({"success": False, "message": "注册过于频繁，请稍后再试"}), 429
+
+    # P0-2.2：device_id 最小长度从 6 提高到 10，降低穷举碰撞概率
+    if not device_id or len(device_id) < 10:
+        return jsonify({"success": False, "message": "device_id 无效（至少 10 位）"}), 400
 
     # 用 device_id 生成稳定的 openid
     openid = "dev_" + hashlib.sha256(device_id.encode()).hexdigest()[:24]
@@ -2307,6 +2679,10 @@ def device_login():
 @app.route("/api/upload", methods=["POST"])
 @require_printer_access
 def upload_file():
+    # 限速（P1-6）：每用户每分钟最多 20 次上传（单 worker 内存计数，nginx 层应再加 IP 限速）
+    if not _rate_limit(f"upload:{g.openid}", 20, 60):
+        return jsonify({"success": False, "message": "上传过于频繁，请稍后再试"}), 429
+
     if "file" not in request.files:
         return jsonify({"success": False, "message": "未找到上传文件"}), 400
 
@@ -2317,6 +2693,10 @@ def upload_file():
     file_id = uuid.uuid4().hex
     ext = os.path.splitext(f.filename)[1]  # 保留原始大小写
     ext_lower = ext.lower().lstrip(".")
+    # P2-9：扩展名白名单正则校验（1-8 位字母数字），非法 → 400（原实现会把非法扩展名
+    # 直接拼进路径导致 500 或目录穿越风险）
+    if not re.match(r"^[a-zA-Z0-9]{1,8}$", ext_lower):
+        return jsonify({"success": False, "message": "文件扩展名无效"}), 400
     saved_name = f"{file_id}{ext}"
 
     # 1. 先保存到 uploads/ 根目录作为临时文件
@@ -2386,16 +2766,16 @@ def upload_file():
     else:
         page_count = get_file_page_count(file_path, ext_lower)
 
-    # 6. 写入 files 表（含 page_count 缓存和 md5）
+    # 6. 写入 files 表（含 page_count 缓存、md5、openid 归属，P2-10）
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO files (id, original_name, saved_name, path, size, created_at, page_count, page_count_verified, md5)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO files (id, original_name, saved_name, path, size, created_at, page_count, page_count_verified, md5, openid)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (file_id, f.filename, saved_name, file_path, file_size,
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), page_count,
-         int(cached_page_verified), file_md5),
+         int(cached_page_verified), file_md5, g.openid),
     )
     conn.commit()
     conn.close()
@@ -2423,25 +2803,53 @@ def upload_file():
 @app.route("/api/submit_order", methods=["POST"])
 @require_printer_access
 def submit_order():
+    # 限速（P1-6）：每用户每分钟最多 20 次提交（单 worker 内存计数，nginx 层应再加 IP 限速）
+    if not _rate_limit(f"submit_order:{g.openid}", 20, 60):
+        return jsonify({"success": False, "message": "提交过于频繁，请稍后再试"}), 429
+
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
+
+    # 幂等键（P0-2）：客户端每次提交生成唯一 ID；同 openid + 同 ID 且 10 分钟内
+    # 已成功建单 → 直接返回原订单，防双击/网络重试造成重复订单。
+    client_request_id = (data.get("client_request_id", "") or "").strip()
 
     duplex = data.get("duplex", "on")  # 顶层 duplex 作为默认值（向后兼容）
     files_input = data.get("files", None)
 
     # ---- v5 新增：附加服务参数 ----
-    delivery_enabled = int(data.get("delivery_enabled", 0) or 0)
-    delivery_location = data.get("delivery_location", "")
-    delivery_percentage = float(data.get("delivery_percentage", 0) or 0)
-    urgency = data.get("urgency", "低")
-    urgency_price = float(data.get("urgency_price", 0) or 0)
-    cover_page = int(data.get("cover_page", 0) or 0)
-    cover_page_price = float(data.get("cover_page_price", 0.15) or 0)
-    pickup_address = data.get("pickup_address", "")
-    auto_print = int(data.get("auto_print", 0) or 0)  # 无障碍打印：提交后自动开始打印
+    # P1-4：全部做边界钳制（delivery/urgency/cover 均为非负金额或百分比），
+    # 非法类型（ValueError/TypeError）→ 400 明确错误。
+    try:
+        delivery_enabled = int(data.get("delivery_enabled", 0) or 0)
+        delivery_location = data.get("delivery_location", "")
+        delivery_percentage = max(0.0, min(100.0, float(data.get("delivery_percentage", 0) or 0)))
+        urgency = data.get("urgency", "低")
+        urgency_price = max(0.0, min(100.0, float(data.get("urgency_price", 0) or 0)))
+        cover_page = int(data.get("cover_page", 0) or 0)
+        cover_page_price = max(0.0, min(100.0, float(data.get("cover_page_price", 0.15) or 0)))
+        pickup_address = data.get("pickup_address", "")
+        auto_print = int(data.get("auto_print", 0) or 0)  # 无障碍打印：提交后自动开始打印
+    except (ValueError, TypeError):
+        return jsonify({"success": False, "message": "附加服务参数格式不正确"}), 400
+
+    # P1-4.7：服务端价格优先——pricing.json 中存在的配置项覆盖客户端金额字段
+    # （delivery 按地点百分比、urgency 按档位价、cover 按统一首页费），忽略客户端传入值。
+    pricing_cfg = _get_pricing_config()
+    if pricing_cfg:
+        if delivery_enabled and delivery_location in (pricing_cfg.get("delivery_percentages") or {}):
+            delivery_percentage = float(pricing_cfg["delivery_percentages"][delivery_location])
+        elif not delivery_enabled:
+            delivery_percentage = 0.0
+        if urgency in (pricing_cfg.get("urgency_prices") or {}):
+            urgency_price = float(pricing_cfg["urgency_prices"][urgency])
+        if cover_page and "cover_page_price" in pricing_cfg:
+            cover_page_price = float(pricing_cfg["cover_page_price"])
 
     # ---- 无障碍打印预约：立即/指定时间/倒计时 → 折算为绝对时间 scheduled_at ----
+    # （P2-17）scheduled_at 为服务器本地时间字符串，依赖服务器时区；
+    # 部署时必须将服务器时区设为 Asia/Shanghai，否则预约到点判定偏移。
     schedule_mode = (data.get("schedule_mode", "now") or "now").strip()
     if schedule_mode not in ("now", "at", "countdown"):
         schedule_mode = "now"
@@ -2463,9 +2871,13 @@ def submit_order():
         scheduled_at = target.strftime("%Y-%m-%d %H:%M:%S")
     elif schedule_mode == "countdown":
         # 倒计时：___分___秒
-        countdown_seconds = int(data.get("countdown_seconds", 0) or 0)
-        if countdown_seconds <= 0:
-            return jsonify({"success": False, "message": "倒计时时长必须大于 0"}), 400
+        # P1-4.5：范围 1 秒 ~ 7 天（604800），非法（含 0/负数/非数字）→ 400
+        try:
+            countdown_seconds = int(data.get("countdown_seconds", 0) or 0)
+        except (ValueError, TypeError):
+            return jsonify({"success": False, "message": "倒计时时长必须是数字"}), 400
+        if not (1 <= countdown_seconds <= 604800):
+            return jsonify({"success": False, "message": "倒计时时长必须在 1 秒到 7 天之间"}), 400
         scheduled_at = (datetime.now() + timedelta(seconds=countdown_seconds)).strftime("%Y-%m-%d %H:%M:%S")
     if schedule_mode != "now":
         auto_print = 1  # 预约本质上是无障碍自动打印
@@ -2495,6 +2907,30 @@ def submit_order():
 
     user_is_admin = (g.user_role == "admin")
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---- 幂等去重（P0-2）：同用户同 client_request_id 的订单 10 分钟内返回原单 ----
+    # 原单已取消则不拦（用户可能在取消后重新提交）。
+    if client_request_id:
+        dup_conn = get_db()
+        dup_row = dup_conn.execute(
+            """SELECT id, order_number, status FROM orders
+               WHERE openid = ? AND client_request_id = ? AND created_at > ?
+               ORDER BY id DESC LIMIT 1""",
+            (g.openid, client_request_id,
+             (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")),
+        ).fetchone()
+        dup_conn.close()
+        if dup_row and dup_row["status"] != "canceled":
+            # 构造与正常建单一致的响应（is_duplicate 标记供前端区分）
+            return jsonify({
+                "success": True,
+                "is_duplicate": True,
+                "message": "检测到重复提交，已返回原订单",
+                "order_id": dup_row["id"],
+                "order_number": dup_row["order_number"],
+                "data": data,
+            })
+
     order_number = generate_order_number()
 
     # ---- 检查打印机在线状态 ----
@@ -2512,16 +2948,18 @@ def submit_order():
                                    delivery_enabled, delivery_location, delivery_percentage,
                                    urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                                    order_number, source, auto_print,
-                                   schedule_mode, scheduled_at, schedule_frozen)
+                                   schedule_mode, scheduled_at, schedule_frozen,
+                                   client_request_id)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?, ?, ?, 0)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?, ?, ?, 0, ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              0,  # is_free 恒为 0 — 价格仅用于统计
              delivery_enabled, delivery_location, delivery_percentage,
              urgency, urgency_price, cover_page, cover_page_price, pickup_address,
              order_number, 1 if auto_print else 0,
-             schedule_mode, scheduled_at),
+             schedule_mode, scheduled_at,
+             client_request_id),
             # is_free 恒为 0 — 价格仅用于统计，无免费策略
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -2531,7 +2969,11 @@ def submit_order():
         for f in files_input:
             f_id = f.get("file_id", "") or ""
             f_name = f.get("file", f.get("file_name", ""))
-            f_copies = int(f.get("copies", 1))
+            # P1-4.4：份数钳制 1-999，非法类型 → 400（事务内抛异常回滚）
+            try:
+                f_copies = max(1, min(999, int(f.get("copies", 1))))
+            except (ValueError, TypeError):
+                raise OrderRejected("份数必须是 1-999 的整数")
             f_page_range = (f.get("page_range", "") or "").strip()
 
             # 计算页数与价格（优先从 files 表缓存读取）
@@ -2539,10 +2981,13 @@ def submit_order():
             page_count_verified = False
             if f_id:
                 frow = conn.execute(
-                    "SELECT path, original_name, page_count, page_count_verified FROM files WHERE id = ?",
+                    "SELECT path, original_name, page_count, page_count_verified, openid FROM files WHERE id = ?",
                     (f_id,),
                 ).fetchone()
                 if frow:
+                    # P2-10：文件归属校验（openid 为空 = 迁移前的旧记录，兼容放行）
+                    if frow["openid"] and frow["openid"] != g.openid:
+                        raise OrderRejected("文件归属校验失败，无权使用该文件")
                     cached = frow["page_count"] or 0
                     if cached > 0:
                         page_count = cached
@@ -2624,22 +3069,38 @@ def submit_order():
         new_status = aggregate_order_status(conn, order_id) or "queued"
         conn.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
 
-        # 若当前用户是临时授权用户，将订单关联到其许可密钥并清除临时授权
-        urow = user_conn.execute(
-            "SELECT temp_until FROM users WHERE openid = ?", (g.openid,),
-        ).fetchone()
-        if urow and urow["temp_until"] and not user_is_admin:
-            user_conn.execute(
-                "UPDATE license_keys SET order_id = ? WHERE used_by = ? AND order_id IS NULL ORDER BY id DESC LIMIT 1",
-                (order_id, g.openid),
-            )
-            user_conn.execute(
-                "UPDATE users SET temp_until = NULL WHERE openid = ?",
-                (g.openid,),
-            )
-            user_conn.commit()
+        # P2-4：临时授权原子消费（原"先查 temp_until 再清空"非原子，并发提交可重复消费）。
+        # 改为条件 UPDATE（temp_until 仍存在且未过期才生效），影响行数为 0 → 拒绝本单并回滚；
+        # 包在 db_lock 内，防止与兑换/其他提交交错。
+        if not user_is_admin:
+            urow = user_conn.execute(
+                "SELECT temp_until FROM users WHERE openid = ?", (g.openid,),
+            ).fetchone()
+            if urow and urow["temp_until"]:
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with db_lock:
+                    cur2 = user_conn.execute(
+                        "UPDATE users SET temp_until = NULL, updated_at = ? WHERE openid = ? AND temp_until IS NOT NULL AND temp_until > ?",
+                        (now_str, g.openid, now_str),
+                    )
+                if cur2.rowcount == 0:
+                    raise OrderRejected("临时授权已失效或被其他订单使用，请重新出示许可")
+                user_conn.execute(
+                    "UPDATE license_keys SET order_id = ? WHERE used_by = ? AND order_id IS NULL ORDER BY id DESC LIMIT 1",
+                    (order_id, g.openid),
+                )
+                user_conn.commit()
 
         conn.commit()
+    except OrderRejected as e:
+        conn.rollback()
+        try:
+            user_conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        user_conn.close()
+        return jsonify({"success": False, "message": e.message}), 400
     except Exception:
         conn.rollback()
         try:
@@ -2655,7 +3116,7 @@ def submit_order():
     if printer_online:
         active_clients = get_active_clients()
         if active_clients:
-            client_id = active_clients[0]
+            client_id = _pick_client(active_clients)  # P2-12：轮询选择，多打印机负载均衡
             for st in sub_tasks:
                 if st["file_id"]:
                     if schedule_mode != "now":
@@ -2695,7 +3156,11 @@ def submit_order():
     print(f"收到任务 (order_id={order_id}): {len(sub_tasks)} 个文件, "
           f"status={final_status}, pushed={pushed_count}/{len(sub_tasks)}, "
           f"openid={g.openid[:8]}...")
-    print(data)
+    # P1-3.2：不再全量回显请求体（含派送地址等隐私），只打印关键摘要
+    print(f"  [SUBMIT] openid={g.openid[:8]}..., files={len(sub_tasks)}, "
+          f"delivery_enabled={delivery_enabled}, delivery_location={delivery_location!r}, "
+          f"urgency={urgency!r}, cover_page={cover_page}, "
+          f"schedule_mode={schedule_mode}, scheduled_at={scheduled_at}")
 
     return jsonify({
         "success": True,
@@ -2713,7 +3178,7 @@ def submit_order():
 @app.route("/api/pull_queued_orders", methods=["GET"])
 def pull_queued_orders():
     """打印机客户端拉取排队中的子任务（原子取锁，每次返回一个任务，防止多打印机重复领取）"""
-    token = request.args.get("token", "")
+    token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
 
@@ -3064,7 +3529,12 @@ def get_order_price(order_id):
 @login_required
 def cancel_order():
     """取消任务（仅限 queued 或 printing 状态且属于当前用户）。
-    取消后通过 SocketIO 通知已连接的打印机客户端。"""
+    取消后通过 SocketIO 通知已连接的打印机客户端。
+
+    P2-2：整个"读状态 → 校验 → 更新"纳入 db_lock（BEGIN IMMEDIATE），
+    防止与 push/pull 并发时读到旧状态后覆盖对方写入。
+    允许取消 printing 任务存在"打印机已开始打印"的小窗口：客户端收到
+    order_canceled 事件后自行中止，可接受的窗口（现状即如此，保持并注明）。"""
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
@@ -3073,41 +3543,46 @@ def cancel_order():
     if not order_id:
         return jsonify({"success": False, "message": "缺少 order_id"}), 400
 
-    conn = get_db()
-    row = conn.execute(
-        "SELECT id, status, openid FROM orders WHERE id = ?",
-        (order_id,),
-    ).fetchone()
+    sub_tasks = []
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT id, status, openid FROM orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
 
-    if not row:
-        conn.close()
-        return jsonify({"success": False, "message": "任务不存在"}), 404
+            if not row:
+                return jsonify({"success": False, "message": "任务不存在"}), 404
 
-    if row["openid"] != g.openid:
-        conn.close()
-        return jsonify({"success": False, "message": "无权操作此任务"}), 403
+            if row["openid"] != g.openid:
+                return jsonify({"success": False, "message": "无权操作此任务"}), 403
 
-    if row["status"] not in ("queued", "printing"):
-        conn.close()
-        return jsonify({"success": False, "message": f"任务状态为 {row['status']}，无法取消"}), 400
+            if row["status"] not in ("queued", "printing"):
+                return jsonify({"success": False, "message": f"任务状态为 {row['status']}，无法取消"}), 400
 
-    # 查询被取消的子任务 ID 和已连接的打印机客户端
-    sub_tasks = conn.execute(
-        "SELECT id, operator_client FROM order_files WHERE order_id = ? AND status IN ('queued', 'printing')",
-        (order_id,),
-    ).fetchall()
+            # 查询被取消的子任务 ID 和已连接的打印机客户端
+            sub_tasks = conn.execute(
+                "SELECT id, operator_client FROM order_files WHERE order_id = ? AND status IN ('queued', 'printing')",
+                (order_id,),
+            ).fetchall()
 
-    # 取消父订单和所有子任务
-    conn.execute(
-        "UPDATE order_files SET status = 'canceled' WHERE order_id = ? AND status IN ('queued', 'printing')",
-        (order_id,),
-    )
-    conn.execute(
-        "UPDATE orders SET status = 'canceled' WHERE id = ?",
-        (order_id,),
-    )
-    conn.commit()
-    conn.close()
+            # 取消父订单和所有子任务（同时清空 locked_at）
+            conn.execute(
+                "UPDATE order_files SET status = 'canceled', locked_at = '' WHERE order_id = ? AND status IN ('queued', 'printing')",
+                (order_id,),
+            )
+            conn.execute(
+                "UPDATE orders SET status = 'canceled' WHERE id = ?",
+                (order_id,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     # 通过 SocketIO 通知已连接的打印机客户端
     task_ids = [t["id"] for t in sub_tasks]
@@ -3135,7 +3610,7 @@ def cancel_order():
 @app.route("/api/accept_order", methods=["POST"])
 def accept_order():
     """打印机确认接受订单（需 token 认证）。将状态从 printing 改为 accepted（终端状态）。"""
-    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
@@ -3143,9 +3618,12 @@ def accept_order():
     if not order_id:
         return jsonify({"success": False, "message": "缺少 order_id"}), 400
     conn = get_db()
+    # P1-8：accept 时刷新 locked_at（复用 P0-1 的 locked_at 列）——
+    # check_printing_timeout 对已 accept 任务按 accept 时刻起算 3 分钟反馈超时
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn.execute(
-        "UPDATE order_files SET status = 'accepted' WHERE order_id = ? AND status = 'printing'",
-        (order_id,),
+        "UPDATE order_files SET status = 'accepted', locked_at = ? WHERE order_id = ? AND status = 'printing'",
+        (now_str, order_id),
     )
     conn.execute(
         "UPDATE orders SET status = 'accepted' WHERE id = ?",
@@ -3160,7 +3638,7 @@ def accept_order():
 @app.route("/api/reject_order", methods=["POST"])
 def reject_order():
     """打印机打回订单（需 token 认证）。将订单状态设为 rejected。"""
-    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
 
@@ -3192,7 +3670,7 @@ def reject_order():
 @app.route("/api/finance/config", methods=["GET"])
 def get_finance_config():
     """读取收支清算云端配置（需 printer token 认证）。data 为 null 表示尚未保存。"""
-    token = request.args.get("token", "")
+    token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     conn = get_db()
@@ -3211,7 +3689,7 @@ def get_finance_config():
 @app.route("/api/finance/config", methods=["POST"])
 def save_finance_config():
     """保存收支清算云端配置（需 printer token 认证）。body: {"data": {...完整配置}}"""
-    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
@@ -3241,7 +3719,7 @@ def save_finance_config():
 @app.route("/api/abandon_order", methods=["POST"])
 def abandon_order():
     """打印机放弃已接受的订单（需 token 认证）。"""
-    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
@@ -3269,7 +3747,7 @@ def abandon_reserved_order():
     场景：用户在本地工具中点击"复制"获得了订单号但未点击"开始打印"，
     直接关闭窗口或删除标签页时调用，将 reserved 标记为 abandoned，
     同时补记价格（本地工具在获取订单号时已知文件/份数/双面配置）。"""
-    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
@@ -3307,7 +3785,7 @@ def abandon_reserved_order():
 @app.route("/api/local_orders", methods=["POST"])
 def local_orders():
     """本地打印工具上报本地打印任务。需 token 认证。"""
-    token = request.args.get("token", "") or (request.get_json(silent=True) or {}).get("token", "")
+    token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
 
@@ -3570,11 +4048,30 @@ def update_profile():
 
     avatar_path = None
     if avatar_file and avatar_file.filename:
+        # P0-2：大小校验（≤ 2MB），超限拒绝，避免头像填盘
+        avatar_file.seek(0, 2)
+        avatar_size = avatar_file.tell()
+        avatar_file.seek(0)
+        if avatar_size > _AVATAR_MAX_SIZE:
+            return jsonify({"success": False, "message": "头像文件不能超过 2MB"}), 400
+
+        # P0-2：魔数校验（jpeg/png/webp/gif），非图片文件直接拒绝
+        if not _is_valid_avatar(avatar_file.stream):
+            return jsonify({"success": False, "message": "头像文件格式不支持（仅支持 jpg/png/webp/gif）"}), 400
+
         ext = os.path.splitext(avatar_file.filename)[1] or ".jpg"
         saved_name = f"{g.openid}{ext}"
         file_path = os.path.join(AVATAR_DIR, saved_name)
         avatar_file.save(file_path)
         avatar_path = compress_avatar(file_path)
+        if not avatar_path:
+            # P0-2：PIL 打不开（损坏/解压炸弹等）→ 删除已保存文件并拒绝，不再原样保留
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except OSError:
+                pass
+            return jsonify({"success": False, "message": "头像文件无法处理，请更换图片"}), 400
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -3711,6 +4208,10 @@ def license_redeem():
     - temp 类型: 设置 users.temp_until = expires_at（临时打印权限）
     - admin 类型: 设置 users.role = 'admin'（永久管理员）
     """
+    # 限速（P1-6）：每用户每分钟最多 10 次兑换尝试（单 worker 内存计数，nginx 层应再加 IP 限速）
+    if not _rate_limit(f"license_redeem:{g.openid}", 10, 60):
+        return jsonify({"success": False, "message": "兑换过于频繁，请稍后再试"}), 429
+
     data = request.get_json() or {}
     raw_key = (data.get("key", "") or "").strip().upper()
     if len(raw_key) != 8:
@@ -4329,7 +4830,7 @@ def admin_statistics_revenue():
         status      - 订单状态筛选，逗号分隔，默认不含 canceled/rejected/abandoned/reserved
         token       - 打印机认证 token
     """
-    token = request.args.get("token", "")
+    token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
 
@@ -4529,7 +5030,7 @@ def admin_statistics_months():
     """按月份统计订单/文件数与收益（printer token 鉴权），供收支清算云端模块自动列出月份。
     收益口径沿用 revenue 接口：of.status='sent' 的 total_price 合计。
     """
-    token = request.args.get("token", "")
+    token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
 
@@ -4642,35 +5143,91 @@ if not _frontend_log.handlers:
     _frontend_log.addHandler(_fh)
 
 
+_FRONTEND_LOG_PATH = os.path.join(LOG_DIR, "frontend.log")
+_FRONTEND_LOG_MAX_BYTES = 50 * 1024 * 1024  # 超过 50MB 轮转（P1-6）
+
+
+def _write_frontend_log(level, message):
+    """写前端日志（手动追加 + 超 50MB 轮转）。
+    logging.FileHandler 在 Windows 上持有文件句柄，写期间无法重命名，故手动管理。"""
+    if os.path.exists(_FRONTEND_LOG_PATH) and os.path.getsize(_FRONTEND_LOG_PATH) > _FRONTEND_LOG_MAX_BYTES:
+        try:
+            if os.path.exists(_FRONTEND_LOG_PATH + ".1"):
+                os.remove(_FRONTEND_LOG_PATH + ".1")
+            os.rename(_FRONTEND_LOG_PATH, _FRONTEND_LOG_PATH + ".1")
+            print(f"[LOG] frontend.log 超过 {_FRONTEND_LOG_MAX_BYTES // (1024 * 1024)}MB，已轮转为 .1")
+        except OSError as e:
+            print(f"[LOG] 前端日志轮转失败: {e}")
+    try:
+        with open(_FRONTEND_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [{level.upper()}] {message}\n")
+    except OSError as e:
+        print(f"[LOG] 写前端日志失败: {e}")
+
+
 @app.route("/api/log/report", methods=["POST"])
 def log_report():
-    """前端上报错误/警告日志。"""
+    """前端上报错误/警告日志。
+    P1-6.2：新增鉴权（打印机 token 或登录态 Bearer）、每 IP 每分钟 30 条限速、
+    message 长度限制 4KB（超长截断）、frontend.log 超 50MB 自动轮转。"""
+    # 鉴权：打印机 token（X-Printer-Token / ?token=）或登录态（Bearer token）二选一
+    authorized = False
+    if PRINTER_TOKEN and _get_printer_token() == PRINTER_TOKEN:
+        authorized = True
+    else:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            try:
+                token_serializer.loads(auth[7:], max_age=TOKEN_MAX_AGE)
+                authorized = True
+            except Exception:
+                authorized = False
+    if not authorized:
+        return jsonify({"success": False, "message": "未授权"}), 403
+
+    # 限速（P1-6）：每 IP 每分钟最多 30 条（单 worker 内存计数，nginx 层应再加 IP 限速）
+    ip = request.remote_addr or "unknown"
+    if not _rate_limit(f"log_report:{ip}", 30, 60):
+        return jsonify({"success": False, "message": "请求过于频繁"}), 429
+
     data = request.get_json(silent=True) or {}
     level = data.get("level", "warning")
     message = data.get("message", "")
     if not message:
         return jsonify({"success": False, "message": "缺少日志内容"}), 400
+    if len(message) > 4096:
+        message = message[:4096]  # 截断而非拒绝，防止日志文件被撑爆
     if level in ("error", "critical"):
-        _frontend_log.error(message)
+        _write_frontend_log("error", message)
     else:
-        _frontend_log.warning(message)
+        _write_frontend_log("warning", message)
     return jsonify({"success": True})
 
 
 @app.route("/api/log/fetch", methods=["GET"])
 def log_fetch():
-    """本地打印工具拉取后端/前端日志（需 token 认证）。"""
-    token = request.args.get("token", "")
+    """本地打印工具拉取后端/前端日志（需 token 认证）。
+    P2-14：支持 ?tail=N 只返回末尾 N 行（默认 500，0 = 不返回内容，仅取大小）。"""
+    token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     log_type = request.args.get("type", "server")
     if log_type not in ("server", "frontend"):
         return jsonify({"success": False, "message": "type 只能为 server 或 frontend"}), 400
+    try:
+        tail = int(request.args.get("tail", "500"))
+    except (ValueError, TypeError):
+        tail = 500
+    tail = max(0, tail)
     log_path = os.path.join(LOG_DIR, f"{log_type}.log")
     if not os.path.exists(log_path):
         return jsonify({"success": True, "size": 0, "content": ""})
     with open(log_path, "r", encoding="utf-8") as f:
-        content = f.read()
+        lines = f.readlines()
+    if tail == 0:
+        content = ""
+    else:
+        content = "".join(lines[-tail:])
     return jsonify({"success": True, "size": len(content.encode("utf-8")), "content": content})
 
 
@@ -4691,6 +5248,8 @@ if __name__ == "__main__":
     scheduler.start()
     print("定时扫描已启动（任务扫描每 30s，预约扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
 
+    # P2-8：debug 直跑仅限开发（FLASK_DEBUG=1）；生产必须用 gunicorn（systemd 服务），
+    # 直跑模式是单进程开发服务器，不用于生产。
     socketio.run(app, host="127.0.0.1", port=5000,
-                 debug=True, use_reloader=False,
+                 debug=os.environ.get("FLASK_DEBUG") == "1", use_reloader=False,
                  allow_unsafe_werkzeug=True)

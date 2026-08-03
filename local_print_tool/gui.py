@@ -142,6 +142,32 @@ def _truncate_filename(filename: str, max_width: int = 52) -> str:
     return f"{truncated}...{suffix}"
 
 
+def _get_persistent_client_id() -> str:
+    """生成持久化客户端 ID：优先读工具目录下 .client_id 文件，不存在则生成并写入。
+
+    同机多实例共用 hostname 会导致云端 client_id 冲突（任务可能被错误派发/回滚），
+    因此追加一个随机后缀并持久化，重启后保持不变。
+    """
+    import socket as _socket
+    import uuid
+    hostname = _socket.gethostname()
+    id_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".client_id")
+    suffix = ""
+    try:
+        if os.path.isfile(id_file):
+            with open(id_file, "r", encoding="utf-8") as f:
+                suffix = f.read().strip()
+        if not suffix:
+            suffix = uuid.uuid4().hex[:10]
+            with open(id_file, "w", encoding="utf-8") as f:
+                f.write(suffix)
+    except Exception:
+        suffix = ""
+    if suffix:
+        return f"{hostname}-{suffix}"
+    return hostname
+
+
 def _enable_smooth_scroll(view: QAbstractScrollArea) -> None:
     """为可滚动区域启用平滑滚动：拦截滚轮事件并用动画过渡。"""
     class _SmoothFilter(QObject):
@@ -542,21 +568,28 @@ class PrintWorker(QThread):
 
     def run(self):
         """线程主函数：统一 PDF 打印流程（GDI 优先），精确到每面的进度条。"""
-        self._converter = get_converter()
-        task_count = len(self._jobs)
-        success_count = 0
-        fail_count = 0
+        try:
+            self._converter = get_converter()
+            task_count = len(self._jobs)
+            success_count = 0
+            fail_count = 0
 
-        # 预计算总面数（用于精确进度条）
-        job_sides: list[int] = []
-        for job in self._jobs:
-            sides = estimate_print_sides(
-                max(1, job.page_count), max(1, job.copies), job.duplex, job.page_range,
-            )
-            job_sides.append(sides)
-        total_sides = sum(job_sides)
-        if total_sides <= 0:
-            total_sides = 1
+            # 预计算总面数（用于精确进度条）
+            job_sides: list[int] = []
+            for job in self._jobs:
+                sides = estimate_print_sides(
+                    max(1, job.page_count), max(1, job.copies), job.duplex, job.page_range,
+                )
+                job_sides.append(sides)
+            total_sides = sum(job_sides)
+            if total_sides <= 0:
+                total_sides = 1
+        except Exception as e:
+            # 初始化/预估失败 → 发射失败信号，保证 all_finished 最终发出、UI 不卡死
+            self.log_message.emit(f"✗ 打印初始化失败: {e}")
+            self.error_occurred.emit(f"打印初始化失败: {e}")
+            self.all_finished.emit(0, len(self._jobs))
+            return
 
         self.progress.emit(0, total_sides, f"共 {task_count} 个任务, 预估 {total_sides} 面")
         self.log_message.emit(f"共 {task_count} 个任务待处理")
@@ -627,7 +660,11 @@ class PrintWorker(QThread):
         offset_sides = 0
         for idx, job in enumerate(self._jobs):
             if self._cancelled:
-                self.log_message.emit(f"[跳过] 第 {idx + 1} 个任务（已取消）")
+                # 取消：剩余任务按失败处理，保证 job_finished/all_finished 完整发射、UI 不卡死
+                for rest_idx in range(idx, len(self._jobs)):
+                    self.job_finished.emit(rest_idx, False, "已取消")
+                    fail_count += 1
+                self.log_message.emit(f"[取消] 已中止剩余 {len(self._jobs) - idx} 个任务")
                 break
 
             file_name = os.path.basename(job.file_path)
@@ -638,12 +675,18 @@ class PrintWorker(QThread):
             copies = max(1, job.copies)
             orient_info = f", 方向:{job.orientation}" if job.orientation else ""
             temp_pdf: Optional[str] = None
+            ok = False  # 本任务是否打印成功（except 路径保持 False）
 
             # 此任务的预估面数
             this_job_sides = job_sides[idx] if idx < len(job_sides) else 1
+            actual_sides = 0  # 本任务实际打印面数（失败/取消时按实际回退进度，避免进度条跳变）
 
             def _make_progress_callback(base_offset: int, total_all: int):
                 def _on_side(page_seq: int, _task_total: int):
+                    nonlocal actual_sides
+                    if self._cancelled:
+                        return  # 已取消：不再推进进度
+                    actual_sides = max(actual_sides, page_seq)
                     # page_seq 是此任务内部的当前面号（从1开始）
                     self.progress.emit(base_offset + page_seq, total_all,
                                        f"正在打印: {file_name} ({page_seq}/{this_job_sides}面)")
@@ -715,7 +758,11 @@ class PrintWorker(QThread):
                     except OSError as e:
                         self.log_message.emit(f"  → 清理临时 PDF 失败: {e}")
 
-            offset_sides += this_job_sides
+            if ok:
+                offset_sides += this_job_sides
+            else:
+                # 失败/取消：按实际打印面数回退，避免进度条凭空跳变
+                offset_sides += actual_sides
 
         self.progress.emit(total_sides, total_sides, "全部完成")
         self.all_finished.emit(success_count, fail_count)
@@ -729,7 +776,9 @@ class ConvertWorker(QThread):
     后台线程：将 Word 文件转为 PDF。
     不阻塞 UI，转换完成后通过信号返回结果。
     """
-    finished = Signal(int, str, int, str)  # (row, cached_pdf, page_count, orientation)
+    # (row, file_path, cached_pdf, page_count, orientation)
+    # file_path 用于回调按文件匹配行，避免多文件订单行号错位
+    finished = Signal(int, str, str, int, str)
 
     def __init__(self, row: int, file_path: str, engine: str, source_md5: str = ""):
         super().__init__()
@@ -737,6 +786,11 @@ class ConvertWorker(QThread):
         self._file_path = file_path
         self._engine = engine
         self._source_md5 = source_md5
+        self._cancelled = False
+
+    def cancel(self):
+        """协作式取消：置标志，run() 各阶段检查后优雅退出（替代 terminate 强杀）。"""
+        self._cancelled = True
 
     def run(self):
         from converter import _convert_via_word_com, _convert_via_wps_com, get_converter
@@ -748,6 +802,9 @@ class ConvertWorker(QThread):
         temp_pdf: str | None = None
         try:
             ext = os.path.splitext(self._file_path)[1].lower()
+            if self._cancelled:
+                self.finished.emit(self._row, self._file_path, "", 0, "")
+                return
             if ext in (".doc", ".docx") and self._engine != "libreoffice":
                 # 直接以 MD5 命名存入 pdf_cache（若无 MD5 则用临时文件）
                 if self._source_md5:
@@ -756,6 +813,9 @@ class ConvertWorker(QThread):
                     import tempfile as _tf
                     fd, temp_pdf = _tf.mkstemp(suffix=".pdf", prefix="_conv_")
                     os.close(fd)
+                if self._cancelled:
+                    self.finished.emit(self._row, self._file_path, "", 0, "")
+                    return
                 if self._engine == "wps":
                     _convert_via_wps_com(self._file_path, temp_pdf)
                 else:
@@ -775,14 +835,17 @@ class ConvertWorker(QThread):
                     converter = get_converter()
                     temp_pdf = converter.convert(self._file_path)
                 except Exception:
-                    self.finished.emit(self._row, "", 0, "")
+                    self.finished.emit(self._row, self._file_path, "", 0, "")
                     return
             else:
-                self.finished.emit(self._row, "", 0, "")
+                self.finished.emit(self._row, self._file_path, "", 0, "")
                 return
+        if self._cancelled:
+            self.finished.emit(self._row, self._file_path, "", 0, "")
+            return
 
         info = get_pdf_info(temp_pdf)
-        self.finished.emit(self._row, temp_pdf, info["page_count"], info["orientation"])
+        self.finished.emit(self._row, self._file_path, temp_pdf, info["page_count"], info["orientation"])
 
 
 def _cleanup_temp(path: str | None) -> None:
@@ -791,46 +854,6 @@ def _cleanup_temp(path: str | None) -> None:
             os.remove(path)
         except OSError:
             pass
-
-
-# ============================================================
-# 支持拖放添加文件的表格
-# ============================================================
-
-class DropTableWidget(QTableWidget):
-    """支持从资源管理器拖放文件到表格中。"""
-
-    filesDropped = Signal(list)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
-
-    def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        if urls:
-            files = []
-            for url in urls:
-                path = url.toLocalFile()
-                if path and os.path.isfile(path):
-                    files.append(path)
-            if files:
-                self.filesDropped.emit(files)
-            event.acceptProposedAction()
-        else:
-            event.ignore()
 
 
 # ============================================================
@@ -1393,8 +1416,12 @@ class MainWindow(QMainWindow):
             self._current_tab = next(iter(self._config.tabs.keys()))
         # 撤回备份（每个标签独立）
         self._cleared_jobs_backup: dict[str, list[PrintJob]] = {}
-        # 已处理的云端任务 ID（防重复弹窗）
-        self._processed_cloud_tasks: set[int] = set()
+        # 已处理的云端任务 ID（防重复弹窗；跨重启持久化，防重启后重复打印）
+        self._processed_cloud_tasks: set[int] = self._load_processed_tasks()
+        # 无障碍自动打印：打印机忙时暂存的重试队列（打印完成后自动补打）
+        self._auto_print_retry: list[dict] = []
+        # 打印机消失/改名提示只弹一次（避免每次刷新都弹窗）
+        self._printer_missing_warned: bool = False
 
         # ── 云端客户端 ──
         self._cloud_client: CloudClient | None = None
@@ -1463,8 +1490,8 @@ class MainWindow(QMainWindow):
 
     def _init_cloud_client(self):
         """初始化云打印客户端（根据配置决定是否自动连接）。"""
-        import socket
-        client_id = socket.gethostname()
+        # 持久化唯一 ID：同机多实例共用 hostname 会冲突，追加随机后缀并落盘
+        client_id = _get_persistent_client_id()
 
         self._cloud_client = CloudClient(
             api_url=self._config.cloud_api_url,
@@ -1479,6 +1506,7 @@ class MainWindow(QMainWindow):
         self._cloud_client.task_updated.connect(self._on_cloud_task_updated)
         self._cloud_client.connection_changed.connect(self._on_cloud_connection_changed)
         self._cloud_client.status_message.connect(self._on_cloud_status_message)
+        self._cloud_client.auth_failed.connect(self._on_cloud_auth_failed)
         self._cloud_client.order_canceled.connect(self._on_cloud_order_canceled)
         self._cloud_client.start_print.connect(self._on_cloud_start_print)
 
@@ -1799,19 +1827,6 @@ class MainWindow(QMainWindow):
             action.triggered.connect(self._on_theme_changed)
             group.addAction(action)
             menu.addAction(action)
-
-    def _log(self, msg: str):
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self._log_text.append(f"[{timestamp}] {msg}")
-        sb = self._log_text.verticalScrollBar()
-        sb.setValue(sb.maximum())
-
-    def _on_theme_changed(self):
-        action = self.sender()
-        if action:
-            mode = action.data()
-            self._theme_manager.set_mode(mode)
-            self._theme_manager.apply_to_app(QApplication.instance(), mode)
 
     def _setup_top_bar(self, root: QVBoxLayout):
         """顶部：打印机选择 + 保留 PDF 选项。"""
@@ -2185,8 +2200,10 @@ class MainWindow(QMainWindow):
         new_tabs = {}
         new_current = "1"
         new_idx = 1
+        key_map = {}
         for old_key in sorted_keys:
             new_key = str(new_idx)
+            key_map[old_key] = new_key
             new_tabs[new_key] = old_tabs[old_key]
             if old_key == old_current:
                 new_current = new_key
@@ -2194,6 +2211,11 @@ class MainWindow(QMainWindow):
         self._config.tabs = new_tabs
         self._current_tab = new_current
         self._config.active_tab = new_current
+        # 预约单状态机中的 tab_key 同步重映射（key 已重新编号）
+        for st in self._scheduled_orders.values():
+            old_key = st.get("tab_key")
+            if old_key and old_key in key_map:
+                st["tab_key"] = key_map[old_key]
 
     def _cleanup_empty_tabs(self, after_key: str | None = None):
         """删除空标签页。after_key 不为 None 时仅删除 key > after_key 的标签页。"""
@@ -2209,6 +2231,8 @@ class MainWindow(QMainWindow):
         for key in removed:
             del self._config.tabs[key]
             self._log(f"🗑 已删除空标签页 {key}")
+            # 预约单指向该标签页 → 联动清理状态机（防到点打印空标签页）
+            self._cleanup_scheduled_orders_for_tab(key, reason="标签页已删除")
         if removed:
             self._renumber_tabs()
             self._save_config()
@@ -2821,12 +2845,14 @@ class MainWindow(QMainWindow):
             job.duplex = "on" if self._edit_duplex.currentIndex() == 0 else "off"
             job.duplex_mode = "short-edge" if self._edit_duplex_mode.currentIndex() == 1 else "long-edge"
 
-        # 页码范围
-        ranges_str = ",".join(
-            inp.text().strip() for inp in self._edit_page_range._inputs
-            if inp.text().strip()
-        )
-        job.page_range = ranges_str
+        # 页码范围（RangeListWidget 仅校验通过才发 rangesChanged；
+        # 此处再校验一次，非法输入时不写入，保留原值，避免被其他控件联动覆盖）
+        if self._edit_page_range.is_valid():
+            ranges_str = ",".join(
+                inp.text().strip() for inp in self._edit_page_range._inputs
+                if inp.text().strip()
+            )
+            job.page_range = ranges_str
 
         # 引擎
         eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
@@ -3086,6 +3112,14 @@ class MainWindow(QMainWindow):
             idx = self._printer_combo.findText(current)
             if idx >= 0:
                 self._printer_combo.setCurrentIndex(idx)
+            elif not self._printer_missing_warned:
+                # 原打印机已不存在/改名 → 静默回退默认，仅提示一次（避免每次刷新都弹窗）
+                self._printer_missing_warned = True
+                self._log(f"⚠ 打印机「{current}」已不存在或改名，已回退到系统默认打印机")
+                QMessageBox.warning(
+                    self, "打印机不可用",
+                    f"打印机「{current}」已不存在或改名。\n已自动切换为系统默认打印机。",
+                )
 
     def _on_refresh_printers(self):
         """刷新打印机列表按钮回调。"""
@@ -3264,12 +3298,25 @@ class MainWindow(QMainWindow):
 
         # jobs 已通过表格实时维护并保存到 tabs 中
 
+    def _find_job_row_by_file_path(self, file_path: str) -> int | None:
+        """按 file_path 在当前标签页查找任务行号，找不到返回 None。"""
+        jobs = self._get_current_jobs()
+        for i, j in enumerate(jobs):
+            if j.file_path == file_path:
+                return i
+        return None
+
     def _start_convert_worker(self, row: int, file_path: str, engine: str):
-        """启动后台 PDF 转换线程。先检查 MD5 缓存，命中则跳过转换。"""
+        """启动后台 PDF 转换线程。先检查 MD5 缓存，命中则跳过转换。
+
+        MD5 一律从 file_path 计算（不再依赖 jobs[row].source_md5 ——
+        多文件订单并发转换时行号可能错位，会读到别的文件的 MD5）。
+        仅当任务上已有相同 file_path 的 source_md5 时复用，避免重复计算大文件。
+        """
         # 计算源文件 MD5 并检查 PDF 缓存
         source_md5 = ""
         jobs = self._get_current_jobs()
-        if row < len(jobs):
+        if row < len(jobs) and jobs[row].source_md5 and jobs[row].file_path == file_path:
             source_md5 = jobs[row].source_md5
         if not source_md5 and os.path.isfile(file_path):
             try:
@@ -3301,19 +3348,30 @@ class MainWindow(QMainWindow):
                 page_count = info.get("page_count", cached_meta.get("page_count", 0))
                 orientation = info.get("orientation", "")
                 self._log(f"📦 缓存命中: {os.path.basename(file_path)} → {page_count} 页 (MD5={source_md5[:8]}...)")
-                if row < len(jobs):
-                    jobs[row].source_md5 = source_md5
-                    jobs[row].cached_pdf = cached_pdf
-                    jobs[row].page_count = page_count
-                    jobs[row].orientation = orientation
+                # 按 file_path 匹配行回写（不依赖调用方传入的 row，防多文件订单行错位写错行）
+                match_row = self._find_job_row_by_file_path(file_path)
+                if match_row is not None:
+                    jobs = self._get_current_jobs()
+                    jobs[match_row].source_md5 = source_md5
+                    jobs[match_row].cached_pdf = cached_pdf
+                    jobs[match_row].page_count = page_count
+                    jobs[match_row].orientation = orientation
                     self._set_current_jobs(jobs)
-                    self._table.item(row, self.COL_PAGES).setText(str(page_count))
+                    self._table.item(match_row, self.COL_PAGES).setText(str(page_count))
                     ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
-                    self._table.item(row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
-                    self._recalc_row_cost(row)
+                    self._table.item(match_row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
+                    self._recalc_row_cost(match_row)
                     self._update_total_cost()
                 return  # 缓存命中，跳过转换
-        # 缓存未命中 → 启动转换线程
+        # 缓存未命中 → 启动转换线程（同 file_path 的旧 worker 先取消，防重复写缓存）
+        self._cancel_convert_worker_for_path(file_path)
+        worker = ConvertWorker(row, file_path, engine, source_md5)
+        worker.finished.connect(self._on_convert_finished)
+        self._convert_workers.append(worker)
+        worker.start()
+
+    def _cancel_convert_worker_for_path(self, file_path: str):
+        """取消并等待指定 file_path 的转换 worker（协作式取消，2s 超时后 terminate 兜底）。"""
         self._convert_workers = [w for w in self._convert_workers if w.isRunning()]
         for w in self._convert_workers:
             if getattr(w, '_file_path', '') == file_path:
@@ -3321,22 +3379,24 @@ class MainWindow(QMainWindow):
                     w.finished.disconnect()
                 except Exception:
                     pass
-                w.wait(100)
-        worker = ConvertWorker(row, file_path, engine, source_md5)
-        worker.finished.connect(self._on_convert_finished)
-        self._convert_workers.append(worker)
-        worker.start()
+                if w.isRunning():
+                    w.cancel()
+                    if not w.wait(2000):
+                        w.terminate()
+                        w.wait(100)
 
     def _cancel_all_convert_workers(self):
-        """终止所有正在进行的 PDF 转换线程。"""
+        """终止所有正在进行的 PDF 转换线程（协作式取消，2s 超时后 terminate 兜底）。"""
         for w in self._convert_workers:
             if w.isRunning():
                 try:
                     w.finished.disconnect()
                 except Exception:
                     pass
-                w.terminate()
-                w.wait(100)
+                w.cancel()
+                if not w.wait(2000):
+                    w.terminate()
+                    w.wait(100)
         self._convert_workers.clear()
 
     def _resolve_engine(self, job: PrintJob) -> str:
@@ -3438,12 +3498,11 @@ class MainWindow(QMainWindow):
                         pass
         if not replacements:
             return
-        # 替换所有本地号为云端号
+        # 替换所有本地号为云端号（job 为可变对象，就地修改即可）
         for key, tab in self._config.tabs.items():
             for job in tab.jobs:
                 if job.order_number in replacements:
                     job.order_number = replacements[job.order_number]
-            tab.jobs = jobs
         self._save_config()
         self._refresh_tab_display()
         self._log(f"📋 已同步 {len(replacements)} 个本地订单号到云端: {' '.join(replacements.values())}")
@@ -3634,7 +3693,7 @@ class MainWindow(QMainWindow):
             return
         self._cancel_undo_if_active()
         if getattr(self, '_loading_files', False):
-            logger.warning("上一批文件仍在处理中，忽略本次添加请求")
+            self._log("⏳ 正在加载文件，请稍候（上一批文件尚未处理完成）")
             return
         self._loading_files = True
         try:
@@ -3709,11 +3768,31 @@ class MainWindow(QMainWindow):
                 else:
                     self._cloud_client.report_fail(task_id, message)
 
-    def _start_print_worker(self, flat_jobs: list):
-        """用给定的任务列表启动打印 Worker。"""
+    def _start_print_worker(self, flat_jobs: list) -> bool:
+        """用给定的任务列表启动打印 Worker。返回 True=已启动，False=忙/被取消。"""
         if self._worker is not None and self._worker.isRunning():
             self._log("⚠️ 已有打印任务正在进行，不能重复启动")
-            return
+            return False
+
+        # 打印前校验页码范围：页数已知且范围非法 → 弹一次确认框（确认后按全部页打印）
+        invalid_warned = False
+        for j in flat_jobs:
+            if j.page_count > 0 and j.page_range and j.page_range.strip():
+                from printer_config import _parse_range_parts
+                if not _parse_range_parts(j.page_range, j.page_count):
+                    if not invalid_warned:
+                        invalid_warned = True
+                        reply = QMessageBox.question(
+                            self, "页码范围无效",
+                            f"文件「{j.display_name or os.path.basename(j.file_path)}」的页码范围无效。\n"
+                            f"将按全部页打印，是否继续？",
+                            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                        )
+                        if reply != QMessageBox.Yes:
+                            self._log("🛑 用户取消打印：页码范围无效")
+                            return False
+                    self._log(f"⚠ 文件「{j.display_name or os.path.basename(j.file_path)}」页码范围无效，将打印全部页")
+
         self._flat_jobs = flat_jobs
         self._sync_ui_to_config()
 
@@ -3744,7 +3823,17 @@ class MainWindow(QMainWindow):
                 "duplex": j.duplex,
                 "page_range": j.page_range,
             })
-        total_price = round(total, 2)
+        # 附加服务：与界面合计（_update_total_cost）口径一致，从标签页读设置
+        tab = self._config.tabs.get(self._current_tab)
+        tab_extra = tab.calc_extra_total(total, self._config) if tab else 0.0
+        total_price = round(total + tab_extra, 2)
+        extra_fields = {
+            "delivery_enabled": bool(tab.delivery_enabled) if tab else self._config.delivery_enabled,
+            "delivery_location": (tab.delivery_location if tab else self._config.delivery_location),
+            "urgency": (tab.urgency if tab else self._config.urgency),
+            "cover_page": bool(tab.cover_page) if tab else self._config.cover_page,
+            "cover_page_price": (tab.cover_page_price if tab else self._config.cover_page_price),
+        }
 
         # 获取订单号并上传：在线直接上报后端，离线暂存本地数据库
         # 注意：如果标签页已有订单号（用户之前点击了"复制"），则复用该订单号，
@@ -3774,6 +3863,8 @@ class MainWindow(QMainWindow):
                             "total_price": total_price,
                             "files": files_data,
                             "created_at": created_at,
+                            # 附加服务上报（与计费口径一致）
+                            **extra_fields,
                         },
                         timeout=10,
                     )
@@ -3814,6 +3905,8 @@ class MainWindow(QMainWindow):
                         "total_price": total_price,
                         "files": files_data,
                         "created_at": created_at,
+                        # 附加服务上报（与计费口径一致）
+                        **extra_fields,
                     },
                     timeout=10,
                 )
@@ -3855,15 +3948,17 @@ class MainWindow(QMainWindow):
         self._btn_start.setEnabled(False)
         self._progress_bar.setValue(0)
 
+        # 封面页配置：标签页有独立附加服务设置则读标签页，否则读全局（与计费/上传口径一致）
+        cover_page_enabled = bool(tab.cover_page) if tab else self._config.cover_page
         cover_page_config = {
             "simplex_price": self._config.simplex_price,
             "duplex_price": self._config.duplex_price,
-            "delivery_enabled": self._config.delivery_enabled,
-            "delivery_location": self._config.delivery_location,
+            "delivery_enabled": bool(tab.delivery_enabled) if tab else self._config.delivery_enabled,
+            "delivery_location": (tab.delivery_location if tab else self._config.delivery_location),
             "delivery_percentages": self._config.delivery_percentages,
-            "urgency": self._config.urgency,
+            "urgency": (tab.urgency if tab else self._config.urgency),
             "urgency_prices": self._config.urgency_prices,
-            "cover_page_price": self._config.cover_page_price,
+            "cover_page_price": (tab.cover_page_price if tab else self._config.cover_page_price),
             "pickup_address": self._config.pickup_address,
             "order_number": order_number,
             "created_at": created_at,
@@ -3875,7 +3970,7 @@ class MainWindow(QMainWindow):
             duplex_mode=self._config.duplex_mode,
             keep_temp_pdf=self._config.keep_temp_pdf,
             render_dpi=self._config.render_dpi,
-            cover_page=self._config.cover_page,
+            cover_page=cover_page_enabled,
             cover_page_config=cover_page_config,
         )
         worker.progress.connect(self._on_progress)
@@ -3884,6 +3979,7 @@ class MainWindow(QMainWindow):
         worker.all_finished.connect(self._on_all_finished)
         self._worker = worker
         worker.start()
+        return True
 
     def _on_all_finished(self, success_count: int, fail_count: int):
         """全部任务完成。标签页已固定，不允许再次打印或编辑。"""
@@ -3902,6 +3998,21 @@ class MainWindow(QMainWindow):
             )
         else:
             self._log(f"🔒 全部 {total} 个任务打印成功！标签页已锁定。")
+
+        # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单
+        if self._auto_print_retry:
+            item = self._auto_print_retry.pop(0)
+            tab_key = item.get("tab_key", "")
+            order_id = item.get("order_id", 0)
+            if tab_key in self._config.tabs and self._config.tabs[tab_key].jobs:
+                self._current_tab = tab_key
+                self._config.active_tab = tab_key
+                self._rebuild_table()
+                self._refresh_tab_display()
+                self._log(f"⚡ 打印机空闲，补打订单 #{order_id}（标签页 {tab_key}）")
+                self._start_print_worker(list(self._config.tabs[tab_key].jobs))
+            else:
+                self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key} 已无文件，跳过补打")
 
     def _on_about(self):
         """关于对话框。"""
@@ -4092,10 +4203,8 @@ class MainWindow(QMainWindow):
         """追加日志到界面文本框（自动滚动到底部）并写入文件。"""
         ts = datetime.now().strftime("%H:%M:%S")
         plain = f"[{ts}] {msg}"
-        # 写入界面（支持 HTML）
-        if "<span" in msg:
-            self._log_text.append(plain.replace(msg, msg))  # HTML 原样
-        self._log_text.append(f"[{ts}] {msg}")
+        # 写入界面（QSS 支持 HTML 彩色渲染，含/不含 <span> 都只追加一次）
+        self._log_text.append(plain)
         self._log_text.verticalScrollBar().setValue(
             self._log_text.verticalScrollBar().maximum()
         )
@@ -4125,6 +4234,40 @@ class MainWindow(QMainWindow):
         self._file_logger.error(f"[{tag}] {msg}")
 
     # ---- 云端任务处理 ----
+
+    def _processed_tasks_path(self) -> str:
+        """已处理任务 ID 集合的持久化文件路径（跨重启防重复打印）。"""
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".processed_tasks.json")
+
+    def _load_processed_tasks(self) -> set:
+        """启动时从磁盘加载已处理任务 ID 集合（进程崩溃/重启后不再重复打印）。"""
+        try:
+            with open(self._processed_tasks_path(), "r", encoding="utf-8") as f:
+                import json as _json
+                data = _json.load(f)
+            if isinstance(data, list):
+                return set(int(x) for x in data if str(x).isdigit())
+        except Exception:
+            pass
+        return set()
+
+    def _mark_processed_task(self, task_id: int):
+        """记录已处理任务 ID 并追加保存到磁盘（超过 10000 条截断保留最近）。"""
+        self._processed_cloud_tasks.add(task_id)
+        try:
+            items = list(self._processed_cloud_tasks)
+            if len(items) > 10000:
+                items = sorted(items)[-10000:]
+                self._processed_cloud_tasks = set(items)
+            with open(self._processed_tasks_path(), "w", encoding="utf-8") as f:
+                import json as _json
+                _json.dump(items, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _is_processed_task(self, task_id: int) -> bool:
+        """判断任务是否已处理（防 SocketIO + HTTP 双通道重复）。"""
+        return task_id in self._processed_cloud_tasks
 
     def _on_cloud_task_received(self, task: CloudTask):
         """收到新的云端打印任务 → 加入云端任务列表窗口（无障碍打印任务自动跳过窗口）。"""
@@ -4160,7 +4303,7 @@ class MainWindow(QMainWindow):
                 self._log(f"☁ 云端任务 #{task.task_id} 下载出错但已被处理，忽略上报: {task.error_message}")
                 self._cloud_tasks.pop(task.task_id, None)
                 return
-            self._processed_cloud_tasks.add(task.task_id)
+            self._mark_processed_task(task.task_id)
             self._log(f"☁ 云端任务 #{task.task_id} 出错: {task.error_message}")
             if self._cloud_client:
                 self._cloud_client.report_fail(task.task_id, f"下载失败: {task.error_message}")
@@ -4223,7 +4366,7 @@ class MainWindow(QMainWindow):
 
         # 标记为已处理（防重复）
         for t in ready_tasks:
-            self._processed_cloud_tasks.add(t.task_id)
+            self._mark_processed_task(t.task_id)
 
         # 自动创建标签页
         self._add_cloud_tasks_to_new_tab(ready_tasks)
@@ -4232,11 +4375,17 @@ class MainWindow(QMainWindow):
         if ready_tasks[0].order_id and self._cloud_client:
             self._cloud_client.accept_order_to_server(ready_tasks[0].order_id)
 
-        # 自动开始打印
+        # 自动开始打印（打印机忙时不静默丢弃 → 入重试队列，打印完成后自动补打）
         jobs = self._get_current_jobs()
         if jobs:
             self._log(f"⚡ 自动开始打印标签页 {self._current_tab}（{len(jobs)} 个文件）")
-            self._start_print_worker(list(jobs))
+            if not self._start_print_worker(list(jobs)):
+                self._auto_print_retry.append({
+                    "order_id": order_id,
+                    "tab_key": self._current_tab,
+                    "task_ids": [t.task_id for t in ready_tasks],
+                })
+                self._log(f"⚡ 打印机正忙，订单 #{order_id} 已加入重试队列（打印完成后自动补打）")
         else:
             self._log(f"⚠ 无障碍打印：标签页 {self._current_tab} 无文件，跳过")
 
@@ -4267,6 +4416,9 @@ class MainWindow(QMainWindow):
             self._log(f"⏰ 预约单 #{oid} 已开始打印，迟到的文件 {task.file_name} 将不再自动打印")
         if task.task_id not in st["pending"] and task.task_id not in st["ready"]:
             st["pending"][task.task_id] = task
+        # 注：目标时间取自任务 scheduled_ts（后端下发，本机 epoch 直接可比较）。
+        # 本机时钟偏差场景依赖服务端 start_print 到点兜底（_on_cloud_start_print 会重设 target_ts），
+        # 若后端后续提供服务器时间偏移接口，可在此换算 target_ts 后再使用。
         ts = getattr(task, "scheduled_ts", 0) or 0
         if ts and (not st["target_ts"] or ts < st["target_ts"]):
             st["target_ts"] = ts
@@ -4281,7 +4433,7 @@ class MainWindow(QMainWindow):
         if not st:
             return
         if task.status == "error":
-            self._processed_cloud_tasks.add(task.task_id)
+            self._mark_processed_task(task.task_id)
             st["pending"].pop(task.task_id, None)
             st["ready"].pop(task.task_id, None)
             self._log(f"⏰ 预约单 #{oid} 文件下载失败: {task.error_message}")
@@ -4341,7 +4493,7 @@ class MainWindow(QMainWindow):
             # 后端状态由 file_ready → waiting、start_printing → printing 驱动。
             self._log(f"⏰ 预约单 #{order_id}: 全部 {len(ready_tasks)} 个文件就绪")
             for t in ready_tasks:
-                self._processed_cloud_tasks.add(t.task_id)
+                self._mark_processed_task(t.task_id)
             self._add_cloud_tasks_to_new_tab(ready_tasks)
             st["tab_key"] = self._current_tab
 
@@ -4422,7 +4574,7 @@ class MainWindow(QMainWindow):
         # 确保标签页存在
         if not st["tab_key"]:
             for t in ready_tasks:
-                self._processed_cloud_tasks.add(t.task_id)
+                self._mark_processed_task(t.task_id)
             self._add_cloud_tasks_to_new_tab(ready_tasks)
             st["tab_key"] = self._current_tab
         else:
@@ -4433,7 +4585,12 @@ class MainWindow(QMainWindow):
             retry = st.get("retry_count", 0) + 1
             st["retry_count"] = retry
             if retry > 60:
+                # 重试超限：上报后端失败并清理状态机（不静默丢弃）
                 self._log(f"⚠ 预约单 #{order_id}: 打印机持续忙碌，放弃自动打印，请手动在标签页打印")
+                if self._cloud_client:
+                    for t in ready_tasks:
+                        self._cloud_client.report_fail(t.task_id, "打印机持续忙碌，预约打印重试超限")
+                self._cleanup_scheduled_order(order_id, reason="打印机持续忙碌，重试超限")
                 return
             self._log(f"⏰ 预约单 #{order_id}: 打印机正忙，10s 后重试（第 {retry} 次）")
             old = st["print_timer"]
@@ -4446,16 +4603,24 @@ class MainWindow(QMainWindow):
             st["print_timer"] = t
             return
 
-        st["printed"] = True
-        st["printed_ts"] = int(time.time())
         self._log(f"⚡ 无障碍预约打印：订单 #{order_id} 共 {len(ready_tasks)} 个文件，开始打印")
         jobs = self._get_current_jobs()
         if jobs:
-            self._start_print_worker(list(jobs))
+            if not self._start_print_worker(list(jobs)):
+                # 恰好此刻打印机变忙 → 不置 printed，10s 后重试（防丢失）
+                self._log(f"⏰ 预约单 #{order_id}: 打印机正忙，10s 后重试")
+                self._start_scheduled_print_timer(order_id, int(time.time()) + 10)
+                return
+            # 确认打印已启动后才置 printed（防假打印：忙时/空标签页不再标记成功）
+            st["printed"] = True
+            st["printed_ts"] = int(time.time())
+            if self._cloud_client:
+                self._cloud_client.report_start_printing(order_id, [t.task_id for t in ready_tasks])
         else:
-            self._log(f"⚠ 无障碍预约打印：标签页 {self._current_tab} 无文件，跳过")
-        if self._cloud_client:
-            self._cloud_client.report_start_printing(order_id, [t.task_id for t in ready_tasks])
+            # 标签页无文件（可能被清空/删除）→ 不置 printed、不上报，重置为待重试
+            self._log(f"⚠ 无障碍预约打印：标签页 {self._current_tab} 无文件，订单 #{order_id} 保持待重试")
+            st["retry_count"] = 0
+            self._start_scheduled_print_timer(order_id, int(time.time()) + 10)
 
     def _on_cloud_start_print(self, order_id: int, scheduled_ts: int, task_ids: list):
         """后端 start_print：到点兜底 / 冻结解除后重设目标。本地已自触发则幂等跳过。"""
@@ -4486,6 +4651,12 @@ class MainWindow(QMainWindow):
         if reason:
             self._log(f"⏰ 预约单 #{order_id} 已结束: {reason}")
 
+    def _cleanup_scheduled_orders_for_tab(self, tab_key: str, reason: str = "标签页已清空"):
+        """清空/删除标签页时，联动清理指向该标签页的预约单状态机条目。"""
+        for oid, st in list(self._scheduled_orders.items()):
+            if st.get("tab_key") == tab_key:
+                self._cleanup_scheduled_order(oid, reason=reason)
+
     def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
         """云端订单被用户取消 → 通知任务列表窗口更新状态，若正在打印则立即取消。"""
         self._log(f"☁ 订单 #{order_id} 已被用户取消")
@@ -4506,23 +4677,26 @@ class MainWindow(QMainWindow):
             self._log(f"☁ 订单 #{order_id} 正在打印，已自动取消")
             self._worker.cancel()
 
-        # 如果已添加到标签页中，弹出提示
+        # 如果已添加到标签页中，弹出提示（多任务合并为一次，避免弹窗堆叠）
+        cancel_hits = []
         for key, tab in list(self._config.tabs.items()):
             for job in tab.jobs:
                 if job.task_id in task_ids:
-                    QMessageBox.information(
-                        self, "任务已取消",
-                        f"标签页 {key} 中的任务「{job.display_name or os.path.basename(job.file_path)}」已被用户取消。\n"
-                        f"建议删除该标签页。",
-                    )
-                    break
+                    cancel_hits.append(f"标签页 {key}：「{job.display_name or os.path.basename(job.file_path)}」")
+        if cancel_hits:
+            shown = cancel_hits[:5]
+            more = f"\n...等共 {len(cancel_hits)} 个任务" if len(cancel_hits) > 5 else ""
+            QMessageBox.information(
+                self, "任务已取消",
+                "以下任务已被用户取消：\n" + "\n".join(shown) + more + "\n建议删除对应标签页。",
+            )
 
     def _on_cloud_order_accepted(self, tasks: list):
         """用户从云端任务列表窗口确认添加订单中的全部任务到同一个新标签页。"""
         if not tasks:
             return
         for task in tasks:
-            self._processed_cloud_tasks.add(task.task_id)
+            self._mark_processed_task(task.task_id)
         self._add_cloud_tasks_to_new_tab(tasks)
         # 通知后端：订单已接受
         if tasks[0].order_id and self._cloud_client:
@@ -4531,7 +4705,7 @@ class MainWindow(QMainWindow):
     def _on_cloud_order_rejected(self, tasks: list):
         """用户从云端任务列表窗口打回订单中的任务。"""
         for task in tasks:
-            self._processed_cloud_tasks.add(task.task_id)
+            self._mark_processed_task(task.task_id)
         if tasks and tasks[0].order_id and self._cloud_client:
             self._cloud_client.reject_order_to_server(tasks[0].order_id)
         for task in tasks:
@@ -4561,6 +4735,16 @@ class MainWindow(QMainWindow):
         """云端日志消息 → 写入界面日志。"""
         self._log(msg)
 
+    def _on_cloud_auth_failed(self, msg: str):
+        """云端认证失败 → 日志 + 弹窗提示（自动重试中，超过上限后停止）。"""
+        self._log(f"🚫 云端认证失败：{msg}")
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            self,
+            "云端认证失败",
+            f"{msg}\n\n工具将自动重试连接。若持续失败，请检查云端令牌（cloud_token）是否已更新。",
+        )
+
     def _on_cloud_pull(self):
         """手动拉取云端排队任务。"""
         if self._cloud_client:
@@ -4574,6 +4758,39 @@ class MainWindow(QMainWindow):
         # 关闭云端任务列表窗口
         if self._cloud_task_window and self._cloud_task_window.isVisible():
             self._cloud_task_window.close()
+
+        # 打印进行中 → 询问用户：等待完成 / 取消打印 / 继续打印
+        if self._worker is not None and self._worker.isRunning():
+            reply = QMessageBox.question(
+                self, "打印正在进行",
+                "当前仍有打印任务正在进行。\n\n"
+                "「是」= 等待打印完成后退出\n"
+                "「否」= 取消打印并退出\n"
+                "「取消」= 继续打印，不退出",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if reply == QMessageBox.No:
+                # 取消打印并退出：置取消标志 + 等待线程结束（5s 超时后 terminate 兜底）
+                self._log("🛑 用户选择取消打印并退出")
+                self._worker.cancel()
+                try:
+                    self._worker.all_finished.disconnect(self._on_all_finished)
+                except Exception:
+                    pass
+                if not self._worker.wait(5000):
+                    self._worker.terminate()
+                    self._worker.wait(100)
+                self._worker = None
+            else:
+                # 等待打印完成后再退出（轮询 + 处理事件，界面保持响应）
+                self._log("⏳ 正在等待打印完成，完成后自动退出...")
+                while self._worker is not None and self._worker.isRunning():
+                    QApplication.processEvents()
+                    time.sleep(0.05)
 
         # 检查所有标签页是否有未完成的文件
         total_files = 0
@@ -4655,7 +4872,12 @@ class MainWindow(QMainWindow):
         total = sum(calc_cost(j.page_count, j.copies, j.duplex,
                               self._config.simplex_price, self._config.duplex_price,
                               j.page_range)[0] for j in jobs)
-        lines.append(f"合计: ¥{total:.2f}")
+        # 与界面合计（_update_total_cost）口径一致：附加服务费（派送/加急/首页）
+        tab = self._config.tabs.get(self._current_tab)
+        extra = tab.calc_extra_total(total, self._config) if tab else 0.0
+        if extra > 0:
+            lines.append(f"附加服务费: ¥{extra:.2f}")
+        lines.append(f"合计: ¥{total + extra:.2f}")
         QApplication.clipboard().setText("\n".join(lines))
         if self._copy_detail_btn:
             self._copy_detail_btn.setText("✅ 已复制")
@@ -4665,39 +4887,58 @@ class MainWindow(QMainWindow):
 
     # ──────── 转换完成回调 ────────
 
-    def _on_convert_finished(self, row: int, cached_pdf: str, page_count: int, orientation: str):
-        """后台 PDF 转换完成 → 更新表格、缓存。"""
-        if row >= self._table.rowCount():
+    def _on_convert_finished(self, row: int, file_path: str, cached_pdf: str, page_count: int, orientation: str):
+        """后台 PDF 转换完成 → 按 file_path 匹配行并更新表格、缓存。
+
+        多文件订单并发转换时行号可能错位，统一按 file_path 找行：
+        row 处恰好匹配直接回写，否则扫描全部 job；找不到（文件已被删除）→ 丢弃结果只清理旧缓存。
+        """
+        # 按 file_path 匹配行
+        jobs = self._get_current_jobs()
+        target_row = None
+        if row < len(jobs) and jobs[row].file_path == file_path:
+            target_row = row
+        else:
+            for i, j in enumerate(jobs):
+                if j.file_path == file_path:
+                    target_row = i
+                    break
+        if target_row is None:
+            # 文件已被删除 → 丢弃转换结果，仅清理产生的缓存文件
+            if cached_pdf and os.path.isfile(cached_pdf):
+                try:
+                    os.remove(cached_pdf)
+                except OSError:
+                    pass
             return
         if not cached_pdf:
-            if row < self._table.rowCount():
-                self._table.item(row, self.COL_PAGES).setText("?")
+            if target_row < self._table.rowCount():
+                self._table.item(target_row, self.COL_PAGES).setText("?")
             return
 
         jobs = self._get_current_jobs()
-        if row < len(jobs):
-            old_pdf = jobs[row].cached_pdf
-            if old_pdf and os.path.isfile(old_pdf) and old_pdf != cached_pdf:
-                try:
-                    os.remove(old_pdf)
-                except OSError:
-                    pass
-            jobs[row].cached_pdf = cached_pdf
-            jobs[row].page_count = page_count
-            jobs[row].orientation = orientation
-            self._set_current_jobs(jobs)
+        old_pdf = jobs[target_row].cached_pdf
+        if old_pdf and os.path.isfile(old_pdf) and old_pdf != cached_pdf:
+            try:
+                os.remove(old_pdf)
+            except OSError:
+                pass
+        jobs[target_row].cached_pdf = cached_pdf
+        jobs[target_row].page_count = page_count
+        jobs[target_row].orientation = orientation
+        self._set_current_jobs(jobs)
 
-        if row < self._table.rowCount():
-            self._table.item(row, self.COL_PAGES).setText(str(page_count))
+        if target_row < self._table.rowCount():
+            self._table.item(target_row, self.COL_PAGES).setText(str(page_count))
             ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
             ori_text = ori_map.get(orientation, "")
-            self._table.item(row, self.COL_ORIENT).setText(ori_text)
-        self._recalc_row_cost(row)
+            self._table.item(target_row, self.COL_ORIENT).setText(ori_text)
+        self._recalc_row_cost(target_row)
         self._update_total_cost()
 
         # 转换完成后存入 MD5 缓存（供后续同文件复用，避免重复转换）
-        if cached_pdf and os.path.isfile(cached_pdf) and row < len(jobs):
-            job = jobs[row]
+        if cached_pdf and os.path.isfile(cached_pdf) and target_row < len(jobs):
+            job = jobs[target_row]
             # 如果没有 source_md5，从源文件计算
             if not job.source_md5 and job.file_path and os.path.isfile(job.file_path):
                 try:
@@ -4740,7 +4981,7 @@ class MainWindow(QMainWindow):
 
         # 转换完成后立刻保存副本到桌面
         if self._config.keep_temp_pdf and cached_pdf and os.path.isfile(cached_pdf):
-            file_path = jobs[row].file_path if row < len(jobs) else ""
+            file_path = jobs[target_row].file_path if target_row < len(jobs) else ""
             original_base = os.path.splitext(os.path.basename(file_path))[0] if file_path else "document"
             desktop = os.path.join(os.path.expanduser("~"), "Desktop")
             dest_name = f"[转换]{original_base}.pdf"
@@ -4779,14 +5020,9 @@ class MainWindow(QMainWindow):
 
         ext = os.path.splitext(task.local_path)[1].lower() if task.local_path else ""
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        # 仅使用任务自带的 source_md5（后端 MD5 索引提供），不再主线程计算大文件 MD5（防 UI 冻结）；
+        # 缺失时由 _start_convert_worker 在转换流程中计算
         source_md5 = getattr(task, 'source_md5', '') or ''
-
-        # 计算 MD5（如果 task 里没有）
-        if not source_md5 and task.local_path and os.path.isfile(task.local_path):
-            try:
-                source_md5 = self._cloud_client._compute_md5_file(task.local_path) if self._cloud_client else ""
-            except Exception:
-                source_md5 = ""
 
         page_count = 0; orientation = ""; cached_pdf = ""
         need_convert = False
@@ -4844,9 +5080,11 @@ class MainWindow(QMainWindow):
         )
         self._config.tabs[new_key].jobs.append(job)
 
-        # Word 文件：缓存未命中时才启动转换
+        # Word 文件：缓存未命中时才启动转换（传真实行号，job 已 append；
+        # 回调改为按 file_path 匹配，行号仅作快速路径提示）
         if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
-            self._start_convert_worker(0, task.local_path, engine)
+            row = len(self._config.tabs[new_key].jobs) - 1
+            self._start_convert_worker(row, task.local_path, engine)
 
         self._log(f"☁ 云端任务 #{task.task_id} 已添加到标签页 {new_key}")
         if self._cloud_client:
@@ -4883,6 +5121,8 @@ class MainWindow(QMainWindow):
                 self._cloud_client.abandon_order_to_server(job.task_id)
         self._cleared_jobs_backup[self._current_tab] = list(jobs)
         self._set_current_jobs([])
+        # 预约单指向该标签页 → 联动清理状态机（防到点打印空标签页/假打印）
+        self._cleanup_scheduled_orders_for_tab(self._current_tab, reason="标签页已清空")
         self._rebuild_table()
         self._update_total_cost()
         self._refresh_tab_display()
@@ -4925,6 +5165,10 @@ class MainWindow(QMainWindow):
                     self._cloud_client.abandon_order_to_server(job.order_id)
                 elif job.task_id > 0 and self._cloud_client:
                     self._cloud_client.abandon_order_to_server(job.task_id)
+        # 取消被移除文件的转换 worker（防完成后回调写回已删除行/残留缓存）
+        for row in rows:
+            if row < len(jobs):
+                self._cancel_convert_worker_for_path(jobs[row].file_path)
         for row in rows:
             if row < len(jobs):
                 self._cancel_undo_if_active()

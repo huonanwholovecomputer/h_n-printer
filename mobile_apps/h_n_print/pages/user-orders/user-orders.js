@@ -1,6 +1,7 @@
 // user-orders.js — 查看指定用户/来源的订单列表
 // 用于: 管理管理员点击、历史授权用户点击、本地打印任务
 const { CONFIG } = require('../../utils/config')
+const { request } = require('../../utils/request')
 
 Component({
   properties: {
@@ -121,7 +122,7 @@ Component({
       }
       if (this.data.viewOpenid) data.openid = this.data.viewOpenid
       if (this.data.sourceFilter) data.source = this.data.sourceFilter
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/orders',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -183,7 +184,7 @@ Component({
         data.source = source
       }
 
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/orders',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -291,7 +292,7 @@ Component({
         success: (modalRes) => {
           if (!modalRes.confirm) return
           wx.showLoading({ title: '取消中...' })
-          wx.request({
+          request({
             url: CONFIG.BASE_URL + '/api/cancel_order',
             method: 'POST',
             header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },

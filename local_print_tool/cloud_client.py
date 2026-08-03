@@ -17,11 +17,14 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
+import socket
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -36,6 +39,8 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 30
 RECONNECT_BASE_DELAY = 2
 RECONNECT_MAX_DELAY = 120
+STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃最旧条目
+MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
 
 def get_cached_pdf_path(source_md5: str) -> str | None:
@@ -69,7 +74,7 @@ class CloudTask:
         self.order_id: int | None = data.get("order_id")
         self.order_number: str = data.get("order_number", "")
         self.file_name: str = data.get("file_name", data.get("file", ""))
-        self.copies: int = int(options.get("copies", data.get("copies", 1)))
+        self.copies: int = int(options.get("copies", data.get("copies", 1)) or 0)  # P1: or 0 防御空值
         self.duplex: str = options.get("duplex", data.get("duplex", "on")) or "on"
         self.page_range: str = options.get("page_range", data.get("page_range", "")) or ""
         self.download_url: str = data.get("download_url", data.get("file_url", "")) or ""
@@ -138,6 +143,7 @@ class CloudClient(QObject):
     status_message = Signal(str)          # 日志消息
     order_canceled = Signal(int, list)    # int=order_id, list=task_ids — 订单被用户取消
     start_print = Signal(int, int, list)  # 预约单到点/解除冻结：order_id, scheduled_ts, task_ids
+    auth_failed = Signal(str)             # 认证失败（含消息），GUI 可连接此信号提示用户
 
     def __init__(
         self,
@@ -151,7 +157,28 @@ class CloudClient(QObject):
         self.api_url = api_url
         self.ws_url = ws_url
         self.token = token
-        self.client_id = client_id
+        # P0-1: 同机多实例 client_id 冲突兜底 —— GUI 旧逻辑传入的是机器名（socket.gethostname()），
+        # 同一台机器多开实例会共用同一 client_id 导致任务互抢。
+        # 此处生成持久化后缀（工具目录下 .client_id 文件），最终形如 "hostname-abcdef1234"。
+        if not client_id or client_id == socket.gethostname():
+            try:
+                suffix_file = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), ".client_id")
+                if os.path.exists(suffix_file):
+                    with open(suffix_file, "r", encoding="utf-8") as f:
+                        suffix = f.read().strip()
+                    if not suffix:
+                        raise ValueError("空后缀")
+                else:
+                    suffix = uuid.uuid4().hex[:10]
+                    with open(suffix_file, "w", encoding="utf-8") as f:
+                        f.write(suffix)
+                self.client_id = f"{socket.gethostname()}-{suffix}"
+            except Exception as e:
+                logger.warning(f"client_id 持久化失败，回退纯 hostname: {e}")
+                self.client_id = socket.gethostname()
+        else:
+            self.client_id = client_id
 
         # 内部状态
         self._sio: object | None = None
@@ -160,10 +187,17 @@ class CloudClient(QObject):
         self._connected = False
         self._heartbeat_timer: threading.Timer | None = None
         self._reconnect_count = 0
+        self._auth_fail_count = 0          # auth_fail 已发生次数（退避重连用）
+        self._auth_fail_stop = False       # auth_fail 达到最大重试次数后停止自动重连
+        self._stability_timer: threading.Timer | None = None  # 连接稳定 N 秒后清零退避计数
+        self._last_replay_attempt = 0.0    # status_queue 重放退避时间戳（60s 间隔）
+        self._replay_lock = threading.Lock()  # 重放退避门闩锁，防 GUI/后台线程并发重复重放
+        self._download_threads: list[threading.Thread] = []   # 记录下载线程，供 stop() join
 
         # 本地任务缓存
         self._pending_tasks: dict[int, CloudTask] = {}
-        self._download_lock = threading.Lock()
+        # P1: 下载并发上限 4（原 _download_lock 为死代码，从未使用）
+        self._download_semaphore = threading.BoundedSemaphore(4)
         self._cache_index_lock = threading.Lock()
         # 从本地持久化文件加载上次的保留时间（避免每次启动都从 7 天开始）
         self._load_retention()
@@ -173,9 +207,13 @@ class CloudClient(QObject):
     def start(self):
         """启动云客户端（后台线程）。"""
         if self._thread is not None and self._thread.is_alive():
-            logger.warning("CloudClient 已在运行")
+            logger.warning("CloudClient 已在运行，忽略重复 start() 调用")
             return
         self._stop_event.clear()
+        self._auth_fail_stop = False
+        self._auth_fail_count = 0
+        # P1: 启动时清理 %TEMP% 下超过 24h 的残留下载临时文件（崩溃遗留兜底）
+        self._cleanup_old_temp_files()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="cloud-client")
         self._thread.start()
         logger.info("CloudClient 已启动")
@@ -184,12 +222,20 @@ class CloudClient(QObject):
         """停止云客户端。"""
         self._stop_event.set()
         self._cancel_heartbeat()
+        self._cancel_backoff_reset()
         if self._sio:
             try:
                 self._sio.disconnect()
             except Exception:
                 pass
             self._sio = None
+        # P2: 设置停止事件后 join 主循环/下载线程（带超时，不无限等待）
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        for t in list(self._download_threads):
+            if t and t.is_alive():
+                t.join(timeout=1)
+        self._download_threads.clear()
         logger.info("CloudClient 已停止")
 
     def is_connected(self) -> bool:
@@ -211,6 +257,7 @@ class CloudClient(QObject):
         task.error_message = ""
         self.task_updated.emit(task)
         t = threading.Thread(target=self._download_file, args=(task,), daemon=True)
+        self._download_threads.append(t)
         t.start()
 
     def reject_task(self, task_id: int):
@@ -252,20 +299,10 @@ class CloudClient(QObject):
         if not self.api_url or not self.token:
             self._queue_status_sync(order_id, "accepted")
             return
-        self._try_status_sync(order_id, "accepted")
-        if not self.api_url or not self.token:
-            return
-        try:
-            resp = http_requests.post(
-                f"{self.api_url}/api/accept_order",
-                params={"token": self.token},
-                json={"order_id": order_id},
-                timeout=10,
-            )
-            if resp.ok:
-                self.status_message.emit(f"☁ 订单 #{order_id} 已确认接受")
-        except Exception as e:
-            self.status_message.emit(f"☁ 确认订单 #{order_id} 异常: {e}")
+        # P1: 仅由 _try_status_sync 发送一次（失败自动入离线队列），
+        # 原函数体中的第二次 POST /api/accept_order 属重复提交，已删除
+        if self._try_status_sync(order_id, "accepted"):
+            self.status_message.emit(f"☁ 订单 #{order_id} 已确认接受")
 
     def reject_order_to_server(self, order_id: int):
         """打回订单：调用后端 API，将订单状态设为 rejected。"""
@@ -293,26 +330,29 @@ class CloudClient(QObject):
         return task
 
     def report_success(self, task_id: int):
-        """上报打印成功到云端。断线时暂存离线队列，联网后补报。"""
+        """上报打印成功到云端。断线或发送失败时暂存离线队列，联网后补报。"""
         if self._sio and self._connected:
             try:
                 self._sio.emit("print_success", {"task_id": task_id})
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印成功")
+                return
             except Exception as e:
-                logger.warning(f"上报 print_success 失败: {e}")
-        else:
-            self._queue_status_sync(0, "sent", task_id=task_id)
+                # P0-4: 在线上报 emit 异常也走离线队列兜底，避免状态丢失
+                logger.warning(f"上报 print_success 失败，转入离线队列: {e}")
+        # python-socketio 的 emit 无确认回调，无法感知服务器是否收到，只能检测抛异常
+        self._queue_status_sync(0, "sent", task_id=task_id)
 
     def report_fail(self, task_id: int, error: str):
-        """上报打印失败到云端。断线时暂存离线队列，联网后补报。"""
+        """上报打印失败到云端。断线或发送失败时暂存离线队列，联网后补报。"""
         if self._sio and self._connected:
             try:
                 self._sio.emit("print_fail", {"task_id": task_id, "error": error})
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印失败 — {error}")
+                return
             except Exception as e:
-                logger.warning(f"上报 print_fail 失败: {e}")
-        else:
-            self._queue_status_sync(0, "failed", task_id=task_id)
+                # P0-4: 同 report_success，发送失败转入离线队列兜底
+                logger.warning(f"上报 print_fail 失败，转入离线队列: {e}")
+        self._queue_status_sync(0, "failed", task_id=task_id)
 
     # ── 预约打印上报 ──
 
@@ -355,6 +395,15 @@ class CloudClient(QObject):
         d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
         return os.path.join(d, "status_queue.json")
 
+    def _quarantine_status_queue(self, path: str):
+        """status_queue.json 损坏时改名保留（不静默清空），从空队列继续。"""
+        try:
+            corrupt = f"{path}.corrupt-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            os.replace(path, corrupt)
+            logger.error(f"status_queue.json 损坏，已改名保留为 {corrupt}，从空队列继续")
+        except OSError as e:
+            logger.error(f"status_queue.json 损坏且无法改名保留: {e}")
+
     def _queue_status_sync(self, order_id: int, status: str, task_id: int = 0):
         """离线时将状态变更暂存到本地队列。task_id 供 sent/failed 回放时精确定位子任务。"""
         import json as _json
@@ -364,25 +413,46 @@ class CloudClient(QObject):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     queue = _json.load(f)
+                if not isinstance(queue, list):
+                    raise ValueError("队列结构异常")
             except Exception:
+                # P0-3: 损坏文件改名保留，不从空队列静默覆盖
+                self._quarantine_status_queue(path)
                 queue = []
         item = {"order_id": order_id, "status": status,
                 "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
         if task_id:
             item["task_id"] = task_id
         queue.append(item)
+        # P2: 队列无上限保护 —— 超过 STATUS_QUEUE_MAX 条时丢弃最旧
+        if len(queue) > STATUS_QUEUE_MAX:
+            dropped = len(queue) - STATUS_QUEUE_MAX
+            queue = queue[dropped:]
+            logger.warning(f"status_queue 超过 {STATUS_QUEUE_MAX} 条，丢弃最旧 {dropped} 条")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            _json.dump(queue, f, ensure_ascii=False, indent=2)
+        # P0-3: tmp + os.replace 原子写，避免截断式写入损坏 JSON
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(queue, f, ensure_ascii=False, indent=2)
+                f.flush()
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            raise
         self.status_message.emit(f"☁ 状态同步已暂存: 订单 #{order_id} → {status}")
 
-    def _try_status_sync(self, order_id: int, status: str):
-        """尝试同步状态到后端，失败则加入离线队列。"""
+    def _try_status_sync(self, order_id: int, status: str) -> bool:
+        """尝试同步状态到后端，失败则加入离线队列。返回是否成功。"""
         endpoint_map = {"accepted": "accept_order", "abandoned": "abandon_order"}
         endpoint = endpoint_map.get(status, "")
         if not endpoint or not self.api_url:
             self._queue_status_sync(order_id, status)
-            return
+            return False
         try:
             resp = http_requests.post(
                 f"{self.api_url}/api/{endpoint}",
@@ -392,11 +462,22 @@ class CloudClient(QObject):
             )
             if not resp.ok:
                 self._queue_status_sync(order_id, status)
+                return False
+            return True
         except Exception:
             self._queue_status_sync(order_id, status)
+            return False
 
     def sync_pending_statuses(self):
         """联网后重放离线状态同步队列。"""
+        # P2: 重放退避 —— 距上次尝试不足 60s 时跳过（无论成败），
+        # 避免每次重连/连接恢复都立刻重放造成循环刷后端；
+        # 门闩加锁，防止 GUI（connection_changed 回调）与本模块连接线程并发重复重放
+        with self._replay_lock:
+            now = time.time()
+            if now - self._last_replay_attempt < 60:
+                return
+            self._last_replay_attempt = now
         import json as _json
         path = self._status_queue_path()
         if not os.path.exists(path):
@@ -404,7 +485,11 @@ class CloudClient(QObject):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 queue = _json.load(f)
+            if not isinstance(queue, list):
+                raise ValueError("队列结构异常")
         except Exception:
+            # P0-3: 损坏文件改名保留，不从空队列静默覆盖
+            self._quarantine_status_queue(path)
             queue = []
         if not queue:
             return
@@ -413,13 +498,21 @@ class CloudClient(QObject):
         for item in queue:
             endpoint_map = {"accepted": "accept_order", "abandoned": "abandon_order",
                           "sent": "print_success", "failed": "print_fail"}
-            status = item["status"]
-            order_id = item["order_id"]
+            status = item.get("status", "")
+            order_id = item.get("order_id", 0)
+            if status not in endpoint_map:
+                # P1: 未知状态/结构残缺的条目无法重放，直接丢弃，避免死循环
+                logger.warning(f"status_queue 发现未知状态条目，已丢弃: {item}")
+                continue
             if status in ("sent", "failed"):
-                # print_success/print_fail 通过 SocketIO 发送（task_id 优先，回退 order_id）
+                # P1: 无 task_id 的死条目（回退 order_id=0 会错报到错误任务）→ 清理丢弃
+                if not item.get("task_id"):
+                    logger.warning(f"status_queue 发现无 task_id 的死条目，已丢弃: {item}")
+                    continue
+                # print_success/print_fail 通过 SocketIO 发送（task_id 定位子任务）
                 if self._sio and self._connected:
                     try:
-                        task_id = item.get("task_id") or order_id
+                        task_id = item["task_id"]
                         self._sio.emit("print_success" if status == "sent" else "print_fail",
                                       {"task_id": task_id})
                     except Exception:
@@ -440,11 +533,25 @@ class CloudClient(QObject):
                 except Exception:
                     remaining.append(item)
         if remaining:
-            with open(path, "w", encoding="utf-8") as f:
-                _json.dump(remaining, f, ensure_ascii=False, indent=2)
+            # P0-3: 剩余条目原子写回
+            tmp = path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    _json.dump(remaining, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                os.replace(tmp, path)
+            except Exception:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
             self.status_message.emit(f"☁ {len(remaining)} 条状态同步失败，已重新暂存")
         else:
-            os.remove(path)
+            try:
+                os.remove(path)
+            except OSError:
+                logger.warning("删除已同步的 status_queue.json 失败")
             self.status_message.emit(f"☁ 离线状态同步完成 ({len(queue)} 条)")
 
     def report_page_range_truncated(self, task_id: int, original_range: str,
@@ -478,7 +585,12 @@ class CloudClient(QObject):
                 data = resp.json()
                 if data.get("success") and data.get("orders"):
                     for item in data["orders"]:
-                        task = CloudTask(item)
+                        try:
+                            task = CloudTask(item)
+                        except (TypeError, ValueError) as e:
+                            # P1: 单条数据解析失败不拖垮整个拉取
+                            logger.error(f"解析拉取的任务数据失败，已跳过: {e}")
+                            continue
                         if task.task_id not in self._pending_tasks:
                             self._pending_tasks[task.task_id] = task
                             self.task_received.emit(task)
@@ -488,21 +600,46 @@ class CloudClient(QObject):
                             # 自动开始下载
                             self.accept_task(task.task_id)
         except Exception as e:
-            logger.debug(f"HTTP 拉取排队任务失败: {e}")
+            # P2: 拉取失败不再是 debug 级别 —— 需在日志中可见
+            logger.warning(f"HTTP 拉取排队任务失败: {e}")
+
+    def _post_connect_sync(self):
+        """连接成功后的异步收尾（独立线程，不阻塞 socketio 读循环）：
+        先重放离线状态队列，再拉取排队任务（先重放后拉取保证状态一致）。"""
+        try:
+            self.sync_pending_statuses()
+        except Exception as e:
+            logger.warning(f"离线状态重放异常: {e}")
+        try:
+            self.pull_pending()
+        except Exception as e:
+            logger.warning(f"拉取排队任务异常: {e}")
 
     # ── 内部实现 ──
 
     def _run_loop(self):
         """后台主循环：连接 → 维持 → 重连。"""
         while not self._stop_event.is_set():
+            if self._auth_fail_stop:
+                # P1: auth_fail 达到最大重试次数，停止自动重连并保持提示（不再静默死亡）
+                self.status_message.emit(
+                    "☁ 认证失败已达最大重试次数，已停止自动重连（请检查 token 后重启工具）")
+                break
             try:
                 self._connect_and_wait()
             except Exception as e:
                 logger.warning(f"CloudClient 连接异常: {e}")
             if not self._stop_event.is_set():
-                delay = min(RECONNECT_BASE_DELAY * (2 ** self._reconnect_count), RECONNECT_MAX_DELAY)
+                if self._auth_fail_count > 0:
+                    # auth_fail 场景：重连间隔 10s 起、封顶 60s（带小抖动防同步重试）
+                    delay = min(
+                        10 * (2 ** (self._auth_fail_count - 1)) * (1 + random.random() * 0.3), 60)
+                else:
+                    # 普通断线：指数退避 + 随机抖动，避免多实例惊群同时重连
+                    delay = min(RECONNECT_BASE_DELAY * (2 ** self._reconnect_count)
+                                * (1 + random.random()), RECONNECT_MAX_DELAY)
                 self._reconnect_count += 1
-                self.status_message.emit(f"☁ {delay}s 后重连...")
+                self.status_message.emit(f"☁ {int(delay)}s 后重连...")
                 self._stop_event.wait(delay)
 
     def _connect_and_wait(self):
@@ -520,12 +657,15 @@ class CloudClient(QObject):
         @self._sio.on("connect")
         def _on_connect():
             self._connected = True
-            self._reconnect_count = 0
             self.connection_changed.emit(True)
             self.status_message.emit("☁ 已连接到云端服务器")
             self._start_heartbeat()
-            # 连接后拉取排队任务
-            self.pull_pending()
+            # P1: 连接稳定 10s 后才清零退避计数，避免"连上即断"循环中退避被反复重置
+            self._schedule_backoff_reset()
+            # P2: 同步的 pull_pending 有 10s 超时，会阻塞 socketio 读循环 → 独立线程执行；
+            # 线程内先重放离线状态队列、再拉取排队任务（先重放后拉取保证状态一致）
+            threading.Thread(target=self._post_connect_sync, daemon=True,
+                             name="cloud-post-connect").start()
             connect_event.set()
 
         @self._sio.on("disconnect")
@@ -534,11 +674,18 @@ class CloudClient(QObject):
             self.connection_changed.emit(False)
             self.status_message.emit("☁ 已断开云端连接")
             self._cancel_heartbeat()
+            self._cancel_backoff_reset()
             connect_event.set()
 
         @self._sio.on("print_task")
         def _on_print_task(data):
-            task = CloudTask(data)
+            try:
+                task = CloudTask(data)
+            except (TypeError, ValueError) as e:
+                # P1: 单条推送数据解析失败不崩溃，跳过该任务
+                logger.error(f"解析推送的任务数据失败，已跳过: {e}")
+                self.status_message.emit(f"☁ 收到无法解析的云任务，已跳过: {e}")
+                return
             if task.task_id not in self._pending_tasks:
                 self._pending_tasks[task.task_id] = task
                 self.task_received.emit(task)
@@ -639,8 +786,21 @@ class CloudClient(QObject):
         @self._sio.on("auth_fail")
         def _on_auth_fail(data):
             msg = data.get("message", "未知原因") if isinstance(data, dict) else str(data)
-            self.status_message.emit(f"☁ 认证失败: {msg}")
-            self._stop_event.set()
+            self._auth_fail_count += 1
+            logger.error(f"认证失败({self._auth_fail_count}/{MAX_AUTH_FAIL_RETRIES}): {msg}")
+            self.status_message.emit(
+                f"☁ 认证失败: {msg}（{self._auth_fail_count}/{MAX_AUTH_FAIL_RETRIES}，将按退避自动重连）")
+            self.auth_failed.emit(msg)
+            # P1: 不再 _stop_event.set() 静默停摆 —— 保持连接循环，
+            # 由 _run_loop 按 10s→60s 退避自动重连，达上限后停止并保持提示
+            if self._auth_fail_count >= MAX_AUTH_FAIL_RETRIES:
+                self._auth_fail_stop = True
+            # 服务端通常认证失败即断开；此处主动断开确保 _run_loop 进入退避重连
+            try:
+                if self._sio:
+                    self._sio.disconnect()
+            except Exception:
+                pass
 
         # 连接
         connect_url = f"{self.ws_url}?token={self.token}&client_id={self.client_id}"
@@ -682,11 +842,61 @@ class CloudClient(QObject):
             self._heartbeat_timer.cancel()
             self._heartbeat_timer = None
 
+    # ── 退避计数稳定性重置 ──
+
+    def _schedule_backoff_reset(self):
+        """连接稳定 10s 后才清零退避计数（防止连上即断时退避被反复重置）。"""
+        self._cancel_backoff_reset()
+        t = threading.Timer(10.0, self._reset_backoff_if_stable)
+        t.daemon = True
+        self._stability_timer = t
+        t.start()
+
+    def _reset_backoff_if_stable(self):
+        if self._connected:
+            self._reconnect_count = 0
+            logger.debug("连接已稳定 10s，退避计数已清零")
+        self._stability_timer = None
+
+    def _cancel_backoff_reset(self):
+        if self._stability_timer:
+            self._stability_timer.cancel()
+            self._stability_timer = None
+
+    # ── 临时文件清理 ──
+
+    def _cleanup_old_temp_files(self):
+        """启动时清理 %TEMP% 下残留超过 24h 的云端下载临时文件（hn_cloud_*/hn_analyze_*）。
+        正常路径由下载逻辑删除/保留；此方法只兜底进程崩溃等遗留场景。"""
+        cutoff = time.time() - 24 * 3600
+        try:
+            for name in os.listdir(tempfile.gettempdir()):
+                if name.startswith("hn_cloud_") or name.startswith("hn_analyze_"):
+                    p = os.path.join(tempfile.gettempdir(), name)
+                    try:
+                        if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                            os.remove(p)
+                            logger.info(f"已清理过期临时文件: {name}")
+                    except OSError:
+                        pass
+        except OSError as e:
+            logger.warning(f"清理旧临时文件失败: {e}")
+
     # ── 文件下载 ──
 
     def _download_file(self, task: CloudTask):
         """后台下载文件。成功则 task.local_path 有值，status='ready'。
-        若 source_md5 已在 PDF 缓存中，跳过下载直接使用缓存。"""
+        若 source_md5 已在 PDF 缓存中，跳过下载直接使用缓存。
+        P1: 下载并发上限由 _download_semaphore（BoundedSemaphore(4)）控制，
+        无空闲槽位时在后台线程内等待，不阻塞 GUI。"""
+        self._download_semaphore.acquire()
+        try:
+            self._download_file_inner(task)
+        finally:
+            self._download_semaphore.release()
+
+    def _download_file_inner(self, task: CloudTask):
+        """下载核心逻辑（MD5 校验重试、文件名净化、幽灵任务检查、失败清理）。"""
         task_id = task.task_id
         url = task.download_url
 
@@ -710,42 +920,78 @@ class CloudClient(QObject):
                 self._report_file_ready_if_scheduled(task)
                 return
 
+        dest: str = ""
+        # P0-2: 后端 pull/push payload 若提供 source_md5，下载完成后比对校验
+        # （后端需在 pull/push payload 中带上 source_md5 字段才能启用该校验）
+        expected_md5 = task.source_md5
         try:
             self.status_message.emit(f"☁ 开始下载 #{task_id}: {task.file_name}")
-            resp = http_requests.get(url, timeout=120, stream=True)
-            resp.raise_for_status()
+            for attempt in range(2):
+                if attempt > 0:
+                    self.status_message.emit(f"☁ MD5 校验失败，重新下载 #{task_id}（第 2 次尝试）")
+                resp = http_requests.get(url, timeout=120, stream=True)
+                resp.raise_for_status()
 
-            # 从 Content-Disposition 提取原始文件名
-            original_name = task.file_name
-            cd = resp.headers.get("Content-Disposition", "")
-            if "filename=" in cd:
-                m = re.search(r'filename[*]?=(?:UTF-8\'\')?(?:"([^"]+)"|([^;]+))', cd, re.I)
-                if m:
-                    original_name = m.group(1) or m.group(2)
+                # 从 Content-Disposition 提取原始文件名
+                original_name = task.file_name
+                cd = resp.headers.get("Content-Disposition", "")
+                if "filename=" in cd:
+                    m = re.search(r'filename[*]?=(?:UTF-8\'\')?(?:"([^"]+)"|([^;]+))', cd, re.I)
+                    if m:
+                        original_name = m.group(1) or m.group(2)
 
-            if not original_name:
-                original_name = f"cloud_task_{task_id}.dat"
+                if not original_name:
+                    original_name = f"cloud_task_{task_id}.dat"
+                # P1: 文件名净化 —— 只取 basename，Windows 非法字符与控制字符替换为 _
+                original_name = os.path.basename(original_name) or f"cloud_task_{task_id}.dat"
+                original_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", original_name)
 
-            dest = os.path.join(tempfile.gettempdir(), f"hn_cloud_{task_id}_{original_name}")
+                dest = os.path.join(tempfile.gettempdir(), f"hn_cloud_{task_id}_{original_name}")
 
-            total = int(resp.headers.get("content-length", 0))
-            downloaded = 0
+                total = int(resp.headers.get("content-length", 0))
+                downloaded = 0
 
-            md5_hasher = hashlib.md5()
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    f.write(chunk)
-                    md5_hasher.update(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        progress = int(downloaded / total * 100)
-                        if progress != task.download_progress:
-                            task.download_progress = progress
-                            self.task_updated.emit(task)
+                md5_hasher = hashlib.md5()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        f.write(chunk)
+                        md5_hasher.update(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            progress = int(downloaded / total * 100)
+                            if progress != task.download_progress:
+                                task.download_progress = progress
+                                self.task_updated.emit(task)
 
-            # 计算 MD5 存入任务（供后续缓存查找）
-            source_md5 = md5_hasher.hexdigest()
+                # 计算本地 MD5（校验通过后才写入 task，供后续缓存查找）
+                source_md5 = md5_hasher.hexdigest()
+                if expected_md5 and source_md5 != expected_md5:
+                    # P0-2: 与后端声明不一致 —— 删除半截文件，重试一次
+                    try:
+                        os.remove(dest)
+                    except OSError:
+                        pass
+                    if attempt == 0:
+                        logger.warning(
+                            f"任务 #{task_id} MD5 校验失败（期望 {expected_md5}，实际 {source_md5}），重试一次")
+                        task.download_progress = 0
+                        continue
+                    raise ValueError(
+                        f"MD5 校验失败: 期望 {expected_md5}，实际 {source_md5}（重试后仍不一致）")
+                break
+
             task.source_md5 = source_md5
+
+            # P1: 幽灵任务检查 —— 下载期间任务已被取消/打回（从 _pending_tasks 移除），
+            # 不再触发 GUI 回调，并删除临时文件
+            if task.task_id not in self._pending_tasks:
+                try:
+                    if os.path.isfile(dest):
+                        os.remove(dest)
+                except OSError:
+                    pass
+                logger.info(f"任务 #{task.task_id} 下载完成但已不在待处理列表（取消/打回），结果丢弃")
+                return
 
             # 若为 PDF 且缓存尚无，存入本地 PDF 缓存
             ext = os.path.splitext(original_name)[1].lower()
@@ -767,8 +1013,16 @@ class CloudClient(QObject):
         except Exception as e:
             task.status = "error"
             task.error_message = str(e)
+            # P1: 失败路径删除残留的半截文件；成功路径文件保留给打印用，
+            # 打印完成后由 GUI 侧负责删除（本文件无法感知打印完成时机）
+            if dest:
+                try:
+                    if os.path.isfile(dest):
+                        os.remove(dest)
+                except OSError:
+                    pass
             self.task_updated.emit(task)
-            self.status_message.emit(f"☁ 下载失败 #{task_id}: {e}")
+            self.status_message.emit(f"☁ 下载失败 #{task.task_id}: {e}")
 
     def _report_file_ready_if_scheduled(self, task: CloudTask):
         """预约单文件下载完成 → 上报 file_ready（后端 downloading→waiting，冻结时自动解除）。
@@ -864,9 +1118,26 @@ class CloudClient(QObject):
         return md5.hexdigest()
 
     def _get_cached_pdf(self, md5: str) -> tuple[str | None, dict | None]:
-        """查找指定 MD5 的缓存 PDF。返回 (pdf_path, metadata) 或 (None, None)。"""
+        """查找指定 MD5 的缓存 PDF。返回 (pdf_path, metadata) 或 (None, None)。
+        P0-2: 命中时校验文件头 %PDF，损坏则删除并返回 None（自愈）。"""
         pdf_path = os.path.join(self._cache_dir, f"{md5}.pdf")
         if os.path.isfile(pdf_path):
+            try:
+                with open(pdf_path, "rb") as f:
+                    header = f.read(5)
+                if not header.startswith(b"%PDF"):
+                    raise ValueError("损坏的 PDF 文件头")
+            except (OSError, ValueError) as e:
+                logger.warning(f"缓存 PDF 损坏，删除自愈: {pdf_path} ({e})")
+                try:
+                    os.remove(pdf_path)
+                except OSError:
+                    pass
+                index = self._load_cache_index()
+                if md5 in index:
+                    del index[md5]
+                    self._save_cache_index(index)
+                return None, None
             index = self._load_cache_index()
             meta = index.get(md5, {})
             return pdf_path, meta
@@ -891,8 +1162,11 @@ class CloudClient(QObject):
     def _save_pdf_to_cache(self, md5: str, pdf_path: str, original_name: str, source_ext: str, page_count: int = 0):
         """将 PDF 文件存入缓存并更新索引。"""
         dest = os.path.join(self._cache_dir, f"{md5}.pdf")
-        if not os.path.samefile(pdf_path, dest) if os.path.exists(dest) else True:
-            shutil.copy2(pdf_path, dest)
+        # P0-2: 原子写（tmp + os.replace），避免 copy2 截断式写入损坏缓存
+        if not os.path.exists(dest) or not os.path.samefile(pdf_path, dest):
+            tmp = dest + ".tmp"
+            shutil.copy2(pdf_path, tmp)
+            os.replace(tmp, dest)
         index = self._load_cache_index()
         index[md5] = {
             "original_name": original_name,

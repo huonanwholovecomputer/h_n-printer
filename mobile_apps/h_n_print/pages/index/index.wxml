@@ -65,7 +65,10 @@
                 </view>
               </block>
               <block wx:elif="{{item.failed}}">
-                <text class="status-label failed">上传失败</text>
+                <view class="file-retry-row">
+                  <text class="status-label failed">上传失败</text>
+                  <text class="file-retry-btn" bindtap="onRetryUpload" data-index="{{index}}" hover-class="tap-active" style="color:#FF9500; font-size:24rpx; margin-left:16rpx; padding:4rpx 16rpx; border:1rpx solid #FF9500; border-radius:8rpx;">重试</text>
+                </view>
               </block>
               <block wx:elif="{{item.fileId && item.excelWarning}}">
                 <text class="status-label warn">Excel 不支持自动打印，请联系管理员</text>
@@ -279,7 +282,7 @@
     <text class="body-small">页码范围可能超出文档实际页数。</text>
     <view class="modal-buttons">
       <button class="btn-secondary modal-half-btn" bindtap="onCancelForceSubmit" hover-class="tap-active">返回等待</button>
-      <button class="btn-primary modal-half-btn" style="background-color: #FF9500;" bindtap="onConfirmForceSubmit" hover-class="tap-active">继续提交</button>
+      <button class="btn-primary modal-half-btn" style="background-color: #FF9500;" bindtap="onConfirmForceSubmit" hover-class="tap-active" disabled="{{submitting}}">继续提交</button>
     </view>
   </view>
 </view>

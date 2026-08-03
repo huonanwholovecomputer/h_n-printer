@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
 <title>打印项目 · 收支清算</title>
 <style>
 /* 注册自定义颜色属性：主题切换时 header 渐变等可平滑过渡（Chromium/Safari/新 Firefox 支持） */
@@ -304,7 +305,7 @@ html.theme-switching *::before, html.theme-switching *::after {
 </style>
 <!-- Chart.js 本地优先，CDN 兜底 -->
 <script src="chart.umd.min.js"></script>
-<script>if (!window.Chart) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js'; document.head.appendChild(s); }</script>
+<script>if (!window.Chart) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js'; s.referrerPolicy='no-referrer'; document.head.appendChild(s); }</script>
 </head>
 <body>
 <header class="app-header">
@@ -348,6 +349,14 @@ html.theme-switching *::before, html.theme-switching *::after {
 <script>
 /* ==================== 启动令牌（由本地打印工具服务器注入） ==================== */
 var LAUNCH_TOKEN = '__LAUNCH_TOKEN__';
+(function () {
+  // 兼容 #token= 与 ?token= 两种传入：fragment 优先（浏览器不把 fragment 发给服务器，避免令牌进日志/Referer）
+  var m = (location.hash || '').match(/(?:^|[?&])token=([^&]+)/);
+  if (!m) m = (location.search || '').match(/(?:^|[?&])token=([^&]+)/);
+  if (m && m[1]) {
+    try { LAUNCH_TOKEN = decodeURIComponent(m[1]); } catch (e) { /* 非法编码则沿用注入值 */ }
+  }
+})();
 function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type': 'application/json' }; }
 
 /* ==================== 常量 ==================== */
@@ -358,15 +367,29 @@ var DEFAULT_MEMBERS = [
 ];
 var DEFAULT_SCORE_CAP = 15;
 var DEFAULT_RATE = 0.05;
-var DEFAULT_PASSWORDS = { score: '123456', expense: '123456', income: '123456', settings: '123456' };
+/* 默认密码存储 SHA-256 哈希（'123456' 的 sha256），不存明文 */
+var DEFAULT_PASSWORDS = { score: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', expense: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', income: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', settings: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92' };
 var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', settings: '设置' };
 
 /* ==================== 存储层 ==================== */
-function _saveToServer(data) {
-  return fetch('/api/proxy/finance/config', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ data: data }) })
+function _saveToServer(data, force) {
+  var clientVersion = (data.meta && typeof data.meta.version === 'number') ? data.meta.version : 0;
+  var payload = { data: data, client_version: clientVersion };
+  return fetch('/api/proxy/finance/config', { method: 'POST', headers: apiHeaders(), body: JSON.stringify(payload) })
     .then(function (r) { return r.json(); })
-    .then(function (res) { return !!(res && res.success); })
-    .catch(function () { return false; });
+    .then(function (res) {
+      if (!(res && res.success)) return { ok: false, message: (res && res.message) || '保存失败' };
+      var sv = res.server_version;
+      var conflict = false;
+      if (typeof sv === 'number') {
+        conflict = sv > clientVersion + 1;   // 期间有其他设备写入
+        data.meta.version = sv;              // 以服务器版本为准
+      } else {
+        data.meta.version = clientVersion + 1;  // 后端暂未实现：本地自增
+      }
+      return { ok: true, conflict: conflict, server_version: sv };
+    })
+    .catch(function (e) { return { ok: false, message: String(e) }; });
 }
 function _loadFromServer() {
   return fetch('/api/proxy/finance/config', { headers: apiHeaders() })
@@ -411,6 +434,29 @@ function migrateConfig(data) {
   }
   if (!data.records) data.records = { expenses: [], income: [], scores: [] };
   if (!data.notes) data.notes = {};
+  // 乐观锁版本号：多设备并发编辑冲突检测用
+  if (!data.meta || typeof data.meta.version !== 'number') data.meta = { version: 0 };
+  return data;
+}
+/* 导入数据净化：成员/记录 ID 白名单校验、名称文本化、颜色白名单（渲染层还会再转义，双保险） */
+function sanitizeStore(data) {
+  var arr = data && data.config && data.config.members;
+  if (Array.isArray(arr)) {
+    data.config.members = arr.filter(function (m) {
+      if (!safeId(m.id)) { console.warn('导入：跳过非法成员 ID', m.id); return false; }
+      m.id = safeId(m.id);
+      m.name = String(m.name || '');
+      m.color = sanitizeColor(m.color);
+      return true;
+    });
+  }
+  ['expenses', 'income', 'scores'].forEach(function (k) {
+    var recs = data && data.records && data.records[k];
+    if (Array.isArray(recs)) recs.forEach(function (r) {
+      var rid = safeId(r.id);
+      if (rid) r.id = rid; else { console.warn('导入：记录 ID 非法，已替换', r.id); r.id = uid(); }
+    });
+  });
   return data;
 }
 function convertMonths(months) {
@@ -447,8 +493,49 @@ function getMember(id) { var m = getMembers().find(function (x) { return x.id ==
 function MN(id) { var m = getMember(id); return m ? m.name : id; }
 function MC(id) { var m = getMember(id); return m ? m.color : '#888'; }
 function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+/* ID 白名单校验：仅允许字母/数字/下划线/连字符，防止注入内联事件；不匹配返回 '' 并 console.warn */
+function safeId(v) {
+  var s = String(v == null ? '' : v);
+  if (/^[A-Za-z0-9_-]+$/.test(s)) return s;
+  console.warn('非法 ID 已忽略:', s);
+  return '';
+}
+/* 颜色值白名单校验：仅允许 #hex(3-8位) 或 rgb()/rgba() 格式，防止注入 style 属性 */
+function sanitizeColor(c) {
+  var s = String(c || '').trim();
+  if (/^#[0-9a-fA-F]{3,8}$/.test(s)) return s;
+  if (/^rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\)$/i.test(s)) return s;
+  if (/^rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*(0|1|0?\.\d+)\s*\)$/i.test(s)) return s;
+  return '#888';
+}
+/* 金额精度：内部一律用「整数分」累加避免浮点误差，显示时 ÷100 保留两位 */
+function parseCents(n) { return Math.round((+n || 0) * 100); }
+function formatCents(c) { return ((+c || 0) / 100).toFixed(2); }
 function F(n) { return (n || 0).toFixed(2); }
-function RMB(n) { return '¥' + F(n); }
+function RMB(cents) { return '¥' + formatCents(cents); }
+/* ==================== 密码哈希（SHA-256，Web Crypto） ==================== */
+function _sha256Hex(str) {
+  if (window.crypto && crypto.subtle && crypto.subtle.digest) {
+    return crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)).then(function (buf) {
+      var bytes = new Uint8Array(buf), hex = '';
+      for (var i = 0; i < bytes.length; i++) hex += ('0' + bytes[i].toString(16)).slice(-2);
+      return hex;
+    });
+  }
+  // 兜底：不支持 Web Crypto 的旧浏览器用非加密哈希（至少避免明文存储）
+  var h = 5381, s = String(str);
+  for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return Promise.resolve('djb2:' + h.toString(16));
+}
+function hashPassword(pwd) { return _sha256Hex(String(pwd || '')); }
+/* 双模式校验：'sha256:' 前缀按哈希比对；其余按旧明文比对（兼容存量数据），新写入只存哈希 */
+function isPasswordValid(input, stored) {
+  stored = String(stored || '');
+  if (stored.indexOf('sha256:') === 0) {
+    return hashPassword(input).then(function (h) { return h === stored.slice(7); });
+  }
+  return Promise.resolve(input === stored);
+}
 function $(s) { return document.querySelector(s); }
 function $$(s) { return Array.prototype.slice.call(document.querySelectorAll(s)); }
 
@@ -483,7 +570,8 @@ function monthRecordCount(key) {
   return n;
 }
 
-/* ==================== 结算算法（与 printer_config / 后端共享口径） ==================== */
+/* ==================== 结算算法（与 printer_config / 后端共享口径） ====================
+   金额一律用「整数分」累加（parseCents 换算），避免浮点误差；返回结果均为分。 */
 function calcMonth(m) {
   var members = getMembers();
   var rate = getRate();
@@ -491,10 +579,10 @@ function calcMonth(m) {
   var exps = m.expenses || [];
   var inc = m.income || {};
   var scores = m.scores || {};
-  var totalExp = exps.reduce(function (s, e) { return s + (e.amount || 0); }, 0);
-  var perPerson = members.length > 0 ? totalExp / members.length : 0;
+  var totalExp = exps.reduce(function (s, e) { return s + parseCents(e.amount); }, 0);
+  var perPerson = members.length > 0 ? Math.round(totalExp / members.length) : 0;
   var totalInc = 0;
-  members.forEach(function (mem) { totalInc += inc[mem.id] || 0; });
+  members.forEach(function (mem) { totalInc += parseCents(inc[mem.id] || 0); });
 
   var scoreTotals = {}, totalScore = 0;
   members.forEach(function (mem) {
@@ -505,19 +593,19 @@ function calcMonth(m) {
 
   var paid = {};
   members.forEach(function (m) { paid[m.id] = 0; });
-  exps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + (e.amount || 0); });
+  exps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + parseCents(e.amount); });
 
-  var investPool = totalInc * rate;
-  var servicePool = totalInc * (1 - rate);
+  var investPool = Math.round(totalInc * rate);
+  var servicePool = totalInc - investPool;
   var memberCount = members.length || 1;
 
   var investReturn = {};
-  members.forEach(function (mem) { investReturn[mem.id] = investPool / memberCount; });
+  members.forEach(function (mem) { investReturn[mem.id] = Math.round(investPool / memberCount); });
 
   var serviceReturn = {};
   members.forEach(function (mem) {
     var ratio = totalScore > 0 ? scoreTotals[mem.id] / totalScore : 1 / memberCount;
-    serviceReturn[mem.id] = servicePool * ratio;
+    serviceReturn[mem.id] = Math.round(servicePool * ratio);
   });
 
   var redist = {};
@@ -525,12 +613,13 @@ function calcMonth(m) {
 
   var net = {};
   members.forEach(function (mem) {
-    net[mem.id] = redist[mem.id] - perPerson - (inc[mem.id] || 0) + (paid[mem.id] || 0);
+    net[mem.id] = redist[mem.id] - perPerson - parseCents(inc[mem.id] || 0) + (paid[mem.id] || 0);
   });
 
   var balances = members.map(function (m) { return { id: m.id, net: net[m.id] }; });
-  var payers = balances.filter(function (b) { return b.net < -0.005; }).sort(function (a, b) { return a.net - b.net; });
-  var receivers = balances.filter(function (b) { return b.net > 0.005; }).sort(function (a, b) { return a.net - b.net; });
+  // 转账阈值：1 分（整数分，≤ -1 分为欠款方，≥ 1 分为收款方）
+  var payers = balances.filter(function (b) { return b.net <= -1; }).sort(function (a, b) { return a.net - b.net; });
+  var receivers = balances.filter(function (b) { return b.net >= 1; }).sort(function (a, b) { return a.net - b.net; });
   var transfers = [];
   var pi = 0, ri = 0;
   var rem = {};
@@ -539,11 +628,11 @@ function calcMonth(m) {
     var debt = Math.abs(rem[payers[pi].id]);
     var credit = rem[receivers[ri].id];
     var amt = Math.min(debt, credit);
-    if (amt > 0.005) transfers.push({ from: payers[pi].id, to: receivers[ri].id, amount: amt });
+    if (amt >= 1) transfers.push({ from: payers[pi].id, to: receivers[ri].id, amount: amt });
     rem[payers[pi].id] += amt;
     rem[receivers[ri].id] -= amt;
-    if (Math.abs(rem[payers[pi].id]) < 0.005) pi++;
-    if (Math.abs(rem[receivers[ri].id]) < 0.005) ri++;
+    if (Math.abs(rem[payers[pi].id]) < 1) pi++;
+    if (Math.abs(rem[receivers[ri].id]) < 1) ri++;
   }
 
   return { rate: rate, totalExp: totalExp, perPerson: perPerson, totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
@@ -555,13 +644,27 @@ function calcMonth(m) {
 var _saveTimer = null;
 function save() {
   clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(function () {
-    _saveToServer(STORE).then(function (ok) {
-      if (!ok) { toast('⚠️ 云端保存失败，请检查连接', 'error'); return; }
-      var ind = $('#storageFilePath');
-      if (ind) ind.textContent = '☁ 云端 · 已保存';
-    });
-  }, 250);
+  _saveTimer = setTimeout(function () { _doSave(false); }, 250);
+}
+/* 保存请求携带 client_version，响应返回 server_version；
+   若 server_version > client_version + 1 说明期间有其他设备写入 → 弹冲突确认（覆盖则强制保存）。
+   后端暂未实现版本号时，前端本地自增 meta.version，等待后端配合。 */
+function _doSave(force) {
+  _saveToServer(STORE, force).then(function (r) {
+    if (!r.ok) {
+      // 云端不可达：暂存本地，联网后启动时自动重放
+      try { localStorage.setItem('finance_offline_pending', JSON.stringify(STORE)); } catch (e2) {}
+      toast('⚠️ 云端保存失败，已暂存本地，联网后自动同步', 'error');
+      return;
+    }
+    var ind = $('#storageFilePath');
+    if (ind) ind.textContent = '☁ 云端 · 已保存';
+    if (!force && r.conflict) {
+      openConfirm('云端数据已被其他设备修改（服务器 v' + r.server_version + '），是否覆盖？', '覆盖').then(function (ok) {
+        if (ok) _doSave(true);
+      });
+    }
+  });
 }
 
 /* ==================== Toast ==================== */
@@ -626,8 +729,10 @@ function requestPassword(key, label) {
     confirmText: '解锁', cancelText: '取消'
   }).then(function (pwd) {
     if (pwd === null) return false;
-    if (pwd === getPassword(key)) { unlocked[key] = true; toast('🔓 已解锁' + label, 'success'); return true; }
-    toast('❌ 密码错误', 'error'); return false;
+    return isPasswordValid(pwd, getPassword(key)).then(function (ok) {
+      if (ok) { unlocked[key] = true; toast('🔓 已解锁' + label, 'success'); return true; }
+      toast('❌ 密码错误', 'error'); return false;
+    });
   });
 }
 function unlockFlow(key, label) {
@@ -754,7 +859,7 @@ function monthSelectHTML(id, selected) {
   var keys = allMonthKeys().slice().reverse();
   var h = '<select id="' + id + '" class="month-select" onchange="onSelMonth(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.9rem">';
   keys.forEach(function (k) {
-    h += '<option value="' + k + '"' + (k === selected ? ' selected' : '') + '>' + labelOf(k) + (k === currentMonthKey() ? '（本月）' : '') + '</option>';
+    h += '<option value="' + esc(k) + '"' + (k === selected ? ' selected' : '') + '>' + labelOf(k) + (k === currentMonthKey() ? '（本月）' : '') + '</option>';
   });
   h += '</select>';
   return h;
@@ -893,11 +998,19 @@ function memberOfOpenid(oid) {
   return null;
 }
 function updateBinding(oid, memberId) {
-  var arr = (STORE.config.memberBindings || []).filter(function (x) { return x.openid !== oid; });
-  if (memberId) arr.push({ openid: oid, memberId: memberId });
-  STORE.config.memberBindings = arr;
-  save();
-  renderCurrent();
+  // 参数白名单校验（绑定属于设置级操作，改绑定需解锁设置）
+  oid = safeId(oid);
+  if (!oid) { toast('非法 openid', 'error'); return; }
+  if (memberId && !safeId(memberId)) { toast('非法成员 ID', 'error'); return; }
+  function doBind() {
+    var arr = (STORE.config.memberBindings || []).filter(function (x) { return x.openid !== oid; });
+    if (memberId) arr.push({ openid: oid, memberId: memberId });
+    STORE.config.memberBindings = arr;
+    save();
+    renderCurrent();
+  }
+  if (unlocked.settings) { doBind(); return; }
+  requestPassword('settings', '设置').then(function (ok) { if (ok) doBind(); });
 }
 
 /* ==================== 图表渲染 ==================== */
@@ -933,7 +1046,7 @@ function _renderSourceDonut(canvasId, rs) {
   var ctx = canvas.getContext('2d');
   var cloudVal = rs.cloud > 0 ? rs.cloud : (rs.cloud_orders || 0);
   var localVal = rs.local > 0 ? rs.local : (rs.local_orders || 0);
-  var labels = ['☁ 云端 ' + RMB(rs.cloud || 0), '🖨 本地 ' + RMB(rs.local || 0)];
+  var labels = ['☁ 云端 ' + RMB(parseCents(rs.cloud || 0)), '🖨 本地 ' + RMB(parseCents(rs.local || 0))];
   var data = [Math.max(cloudVal, 0.01), Math.max(localVal, 0.01)];
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'doughnut',
@@ -968,7 +1081,7 @@ function _renderUserBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
       responsive: true, maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: { label: function (c2) { return label + ': ' + (field === 'revenue' ? RMB(c2.parsed.y) : c2.parsed.y + ' 单'); } } }
+        tooltip: { callbacks: { label: function (c2) { return label + ': ' + (field === 'revenue' ? RMB(parseCents(c2.parsed.y)) : c2.parsed.y + ' 单'); } } }
       },
       scales: {
         y: { beginAtZero: true, max: maxVal * 1.25, grid: { color: 'rgba(120,130,160,.12)' } },
@@ -1051,7 +1164,7 @@ function renderDash() {
     return;
   }
 
-  // KPI
+  // KPI（data-count 为整数分，countUp 显示时 ÷100）
   var totalPL = 0;
   getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPerson; });
   h += '<div class="kpi-grid">';
@@ -1064,7 +1177,7 @@ function renderDash() {
   // 采购明细
   h += '<div class="section"><h2>🧾 采购明细 <span class="hint">(' + r.memberCount + ' 人均摊)</span></h2><div class="table-wrap"><table><thead><tr><th class="l">项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
   (m.expenses || []).forEach(function (e) {
-    h += '<tr><td class="l">' + esc(e.item) + '</td><td>' + RMB(e.amount) + '</td><td><span class="member-tag" style="background:' + MC(e.payer) + '">' + MN(e.payer) + '</span></td></tr>';
+    h += '<tr><td class="l">' + esc(e.item) + '</td><td>' + RMB(parseCents(e.amount)) + '</td><td><span class="member-tag" style="background:' + sanitizeColor(MC(e.payer)) + '">' + esc(MN(e.payer)) + '</span></td></tr>';
   });
   h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalExp) + '</td><td>人均 ' + RMB(r.perPerson) + '</td></tr>';
   h += '</tbody></table></div></div>';
@@ -1076,15 +1189,15 @@ function renderDash() {
   h += '<div class="table-wrap"><table><thead><tr><th></th><th>投资回报<br>（均分）</th><th>服务得分</th><th>服务占比</th><th>服务回报</th><th>应得收入</th><th>实际代收</th><th>差额</th></tr></thead><tbody>';
   getMembers().forEach(function (mem) {
     var svcRatio = r.totalScore > 0 ? r.scoreTotals[mem.id] / r.totalScore : 1 / r.memberCount;
-    var diff = r.redist[mem.id] - ((m.income || {})[mem.id] || 0);
+    var diff = r.redist[mem.id] - parseCents((m.income || {})[mem.id] || 0);
     h += '<tr>';
-    h += '<td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td>' + RMB(r.investReturn[mem.id]) + '</td>';
     h += '<td>' + (r.scoreTotals[mem.id] || 0) + '</td>';
     h += '<td>' + (svcRatio * 100).toFixed(1) + '%</td>';
     h += '<td>' + RMB(r.serviceReturn[mem.id]) + '</td>';
     h += '<td style="font-weight:700">' + RMB(r.redist[mem.id]) + '</td>';
-    h += '<td>' + RMB((m.income || {})[mem.id] || 0) + '</td>';
+    h += '<td>' + RMB(parseCents((m.income || {})[mem.id] || 0)) + '</td>';
     h += '<td class="' + (diff >= 0 ? 'pos' : 'neg') + '">' + (diff >= 0 ? '+' : '') + RMB(diff) + '</td>';
     h += '</tr>';
   });
@@ -1097,7 +1210,7 @@ function renderDash() {
   getMembers().forEach(function (mem) {
     var pl = r.redist[mem.id] - r.perPerson;
     var tag = pl >= 0 ? '<span class="tag g">盈利</span>' : '<span class="tag r">亏损</span>';
-    h += '<tr><td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td>' + RMB(r.redist[mem.id]) + '</td>';
     h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
     h += '<td class="' + (pl >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (pl >= 0 ? '+' : '') + RMB(pl) + ' ' + tag + '</td></tr>';
@@ -1110,7 +1223,7 @@ function renderDash() {
   getMembers().forEach(function (mem) {
     var adv = (r.paid[mem.id] || 0) - r.perPerson;
     var tag2 = adv > 1 ? '<span class="tag g">多垫，应收</span>' : (adv < -1 ? '<span class="tag r">少垫，应付</span>' : '<span class="tag b">持平</span>');
-    h += '<tr><td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td class="pos">+' + RMB(r.paid[mem.id]) + '</td>';
     h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
     h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (adv >= 0 ? '+' : '') + RMB(adv) + ' ' + tag2 + '</td></tr>';
@@ -1122,10 +1235,10 @@ function renderDash() {
   h += '<div class="settle-box"><h2>🔄 资金重分配 <span class="hint">（实际转账指令）</span></h2>';
   h += '<div class="table-wrap"><table style="margin-bottom:14px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>= 应转出/入</th></tr></thead><tbody>';
   getMembers().forEach(function (mem) {
-    var incomeAdj = r.redist[mem.id] - ((m.income || {})[mem.id] || 0);
+    var incomeAdj = r.redist[mem.id] - parseCents((m.income || {})[mem.id] || 0);
     var adv = (r.paid[mem.id] || 0) - r.perPerson;
     var transfer = incomeAdj + adv;
-    h += '<tr><td style="font-weight:700;color:' + MC(mem.id) + '">' + mem.name + '</td>';
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td class="' + (incomeAdj >= 0 ? 'pos' : 'neg') + '">' + (incomeAdj >= 0 ? '+' : '') + RMB(incomeAdj) + '</td>';
     h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '">' + (adv >= 0 ? '+' : '') + RMB(adv) + '</td>';
     h += '<td class="' + (transfer >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (transfer >= 0 ? '+' : '') + RMB(transfer) + '</td></tr>';
@@ -1134,9 +1247,9 @@ function renderDash() {
   if (r.transfers.length > 0) {
     h += '<div style="font-weight:700;margin-bottom:8px;color:var(--orange)">转账指令：</div>';
     r.transfers.forEach(function (t) {
-      h += '<div class="transfer"><span class="member-tag" style="background:' + MC(t.from) + '">' + MN(t.from) + '</span>';
+      h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
       h += ' <span class="arrow">→</span> ';
-      h += '<span class="member-tag" style="background:' + MC(t.to) + '">' + MN(t.to) + '</span>';
+      h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
       h += ' <span class="amount">' + RMB(t.amount) + '</span></div>';
     });
   } else {
@@ -1147,9 +1260,9 @@ function renderDash() {
   el.innerHTML = h;
   // KPI 数字滚动
   $$('#tab-dash .num[data-count]').forEach(function (node) {
-    var target = parseFloat(node.getAttribute('data-count'));
+    var target = parseFloat(node.getAttribute('data-count'));  // 整数分
     var prefix = node.getAttribute('data-prefix') || '';
-    countUp(node, target, { dec: 2, fmt: function (n) { return prefix + n.toFixed(2); } });
+    countUp(node, target, { dec: 2, fmt: function (n) { return prefix + (n / 100).toFixed(2); } });
   });
 }
 
@@ -1186,14 +1299,16 @@ function renderEntry() {
   var disabled = unlocked.expense ? '' : ' disabled';
   h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">项目</th><th>金额（元）</th><th>代付人</th><th></th></tr></thead><tbody>';
   m.expenses.forEach(function (e, i) {
+    var eid = safeId(e.id);
+    if (!eid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
     h += '<tr>';
-    h += '<td><input type="date" value="' + esc(e.date) + '" onchange="updExp(\'' + e.id + '\',\'date\',this.value)"' + disabled + '></td>';
-    h += '<td class="l"><input value="' + esc(e.item) + '" onchange="updExp(\'' + e.id + '\',\'item\',this.value)" placeholder="项目名称" style="width:170px"' + disabled + '></td>';
-    h += '<td><input type="number" step="0.01" min="0" value="' + e.amount + '" onchange="updExp(\'' + e.id + '\',\'amount\',+this.value)"' + disabled + '></td>';
-    h += '<td><select onchange="updExp(\'' + e.id + '\',\'payer\',this.value)"' + disabled + '>';
-    members.forEach(function (x) { h += '<option value="' + x.id + '"' + (e.payer === x.id ? ' selected' : '') + '>' + x.name + '</option>'; });
+    h += '<td><input type="date" value="' + esc(e.date) + '" onchange="updExp(\'' + eid + '\',\'date\',this.value)"' + disabled + '></td>';
+    h += '<td class="l"><input value="' + esc(e.item) + '" onchange="updExp(\'' + eid + '\',\'item\',this.value)" placeholder="项目名称" style="width:170px"' + disabled + '></td>';
+    h += '<td><input type="number" step="0.01" min="0" value="' + esc(e.amount) + '" onchange="updExp(\'' + eid + '\',\'amount\',+this.value)"' + disabled + '></td>';
+    h += '<td><select onchange="updExp(\'' + eid + '\',\'payer\',this.value)"' + disabled + '>';
+    members.forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (e.payer === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
     h += '</select></td>';
-    h += '<td><button class="btn danger sm" onclick="delExp(\'' + e.id + '\')"' + disabled + '>✕</button></td>';
+    h += '<td><button class="btn danger sm" onclick="delExp(\'' + eid + '\')"' + disabled + '>✕</button></td>';
     h += '</tr>';
   });
   if (!m.expenses.length) h += '<tr><td colspan="5" style="color:var(--muted)">暂无采购记录</td></tr>';
@@ -1206,22 +1321,24 @@ function renderEntry() {
   h += lockBarHTML('income');
   var dIncome = (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; });
   var incSum = {};
-  dIncome.forEach(function (r) { incSum[r.memberId] = (incSum[r.memberId] || 0) + (r.amount || 0); });
+  dIncome.forEach(function (r) { incSum[r.memberId] = (incSum[r.memberId] || 0) + parseCents(r.amount); });
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">';
   members.forEach(function (mem) {
-    h += '<span class="member-tag" style="background:' + mem.color + '">' + mem.name + '  ' + RMB(incSum[mem.id] || 0) + '</span>';
+    h += '<span class="member-tag" style="background:' + sanitizeColor(mem.color) + '">' + esc(mem.name) + '  ' + RMB(incSum[mem.id] || 0) + '</span>';
   });
   h += '</div>';
   var disabledI = unlocked.income ? '' : ' disabled';
   h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th>成员</th><th>金额（元）</th><th></th></tr></thead><tbody>';
   dIncome.forEach(function (r) {
+    var rid = safeId(r.id);
+    if (!rid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
     h += '<tr>';
-    h += '<td><input type="date" value="' + esc(r.date) + '" onchange="updInc(\'' + r.id + '\',\'date\',this.value)"' + disabledI + '></td>';
-    h += '<td><select onchange="updInc(\'' + r.id + '\',\'memberId\',this.value)"' + disabledI + '>';
-    members.forEach(function (x) { h += '<option value="' + x.id + '"' + (r.memberId === x.id ? ' selected' : '') + '>' + x.name + '</option>'; });
+    h += '<td><input type="date" value="' + esc(r.date) + '" onchange="updInc(\'' + rid + '\',\'date\',this.value)"' + disabledI + '></td>';
+    h += '<td><select onchange="updInc(\'' + rid + '\',\'memberId\',this.value)"' + disabledI + '>';
+    members.forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (r.memberId === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
     h += '</select></td>';
-    h += '<td><input type="number" step="0.01" min="0" value="' + r.amount + '" onchange="updInc(\'' + r.id + '\',\'amount\',+this.value)"' + disabledI + '></td>';
-    h += '<td><button class="btn danger sm" onclick="delInc(\'' + r.id + '\')"' + disabledI + '>✕</button></td>';
+    h += '<td><input type="number" step="0.01" min="0" value="' + esc(r.amount) + '" onchange="updInc(\'' + rid + '\',\'amount\',+this.value)"' + disabledI + '></td>';
+    h += '<td><button class="btn danger sm" onclick="delInc(\'' + rid + '\')"' + disabledI + '>✕</button></td>';
     h += '</tr>';
   });
   if (!dIncome.length) h += '<tr><td colspan="4" style="color:var(--muted)">暂无代收记录</td></tr>';
@@ -1235,22 +1352,26 @@ function renderEntry() {
   var disabledS = unlocked.score ? '' : ' disabled';
   var scoreCap = getScoreCap();
   members.forEach(function (mem) {
-    var sc = m.scores[mem.id] || [];
+    var memId = safeId(mem.id);
+    if (!memId) return;   // 非法成员 ID 跳过该成员区块（safeId 已 console.warn）
+    var sc = m.scores[memId] || [];
     var capped = sc.reduce(function (s, x) { return s + Math.min(x.score || 0, scoreCap); }, 0);
-    h += '<h3 style="margin:16px 0 8px;display:flex;align-items:center;gap:8px;font-size:.95rem"><span class="member-tag" style="background:' + mem.color + '">' + mem.name + '</span> <span class="tag b">总分 ' + capped + '</span></h3>';
+    h += '<h3 style="margin:16px 0 8px;display:flex;align-items:center;gap:8px;font-size:.95rem"><span class="member-tag" style="background:' + sanitizeColor(mem.color) + '">' + esc(mem.name) + '</span> <span class="tag b">总分 ' + capped + '</span></h3>';
     h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">评分项目</th><th>得分</th><th></th></tr></thead><tbody>';
     sc.forEach(function (s) {
+      var sid = safeId(s.id);
+      if (!sid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
       var over = (s.score || 0) > scoreCap;
       h += '<tr>';
-      h += '<td><input type="date" value="' + esc(s.date) + '" onchange="updScore(\'' + s.id + '\',\'date\',this.value)"' + disabledS + '></td>';
-      h += '<td class="l"><input value="' + esc(s.item) + '" onchange="updScore(\'' + s.id + '\',\'item\',this.value)" placeholder="服务项目" style="width:200px"' + disabledS + '></td>';
-      h += '<td><input type="number" step="0.1" min="0" value="' + s.score + '" onchange="updScore(\'' + s.id + '\',\'score\',+this.value)" style="width:80px;color:' + (over ? 'var(--neg)' : 'inherit') + '"' + disabledS + '>' + (over ? '<span style="color:var(--neg);font-size:.75rem"> ⚠超限</span>' : '') + '</td>';
-      h += '<td><button class="btn danger sm" onclick="delScore(\'' + s.id + '\')"' + disabledS + '>✕</button></td>';
+      h += '<td><input type="date" value="' + esc(s.date) + '" onchange="updScore(\'' + sid + '\',\'date\',this.value)"' + disabledS + '></td>';
+      h += '<td class="l"><input value="' + esc(s.item) + '" onchange="updScore(\'' + sid + '\',\'item\',this.value)" placeholder="服务项目" style="width:200px"' + disabledS + '></td>';
+      h += '<td><input type="number" step="0.1" min="0" value="' + esc(s.score) + '" onchange="updScore(\'' + sid + '\',\'score\',+this.value)" style="width:80px;color:' + (over ? 'var(--neg)' : 'inherit') + '"' + disabledS + '>' + (over ? '<span style="color:var(--neg);font-size:.75rem"> ⚠超限</span>' : '') + '</td>';
+      h += '<td><button class="btn danger sm" onclick="delScore(\'' + sid + '\')"' + disabledS + '>✕</button></td>';
       h += '</tr>';
     });
     if (!sc.length) h += '<tr><td colspan="4" style="color:var(--muted)">暂无评分项</td></tr>';
     h += '</tbody></table></div>';
-    h += '<button class="btn sm" style="margin-top:6px" onclick="addScore(\'' + mem.id + '\')"' + disabledS + '>+ 为 ' + mem.name + ' 添加评分项</button>';
+    h += '<button class="btn sm" style="margin-top:6px" onclick="addScore(\'' + memId + '\')"' + disabledS + '>+ 为 ' + esc(mem.name) + ' 添加评分项</button>';
   });
   h += '</div>';
 
@@ -1381,11 +1502,11 @@ function renderCloud() {
 
   // KPI
   h += '<div class="kpi-grid">';
-  h += '<div class="kpi-card c-green"><div class="kpi-ico">💰</div><div class="num" data-count="' + rs.total + '" data-prefix="¥">0</div><div class="lbl">总盈利（已完成）</div><div class="sub">' + labelOf(_cloudMonth) + '</div></div>';
+  h += '<div class="kpi-card c-green"><div class="kpi-ico">💰</div><div class="num" data-count="' + parseCents(rs.total) + '" data-prefix="¥">0</div><div class="lbl">总盈利（已完成）</div><div class="sub">' + labelOf(_cloudMonth) + '</div></div>';
   h += '<div class="kpi-card c-blue"><div class="kpi-ico">📦</div><div class="num">' + ((rs.cloud_orders || 0) + (rs.local_orders || 0)) + '</div><div class="lbl">总订单数</div><div class="sub">☁ ' + (rs.cloud_orders || 0) + ' · 🖨 ' + (rs.local_orders || 0) + '</div></div>';
   h += '<div class="kpi-card c-blue"><div class="kpi-ico">📄</div><div class="num">' + ((rs.cloud_files || 0) + (rs.local_files || 0)) + '</div><div class="lbl">总文件数</div><div class="sub">☁ ' + (rs.cloud_files || 0) + ' · 🖨 ' + (rs.local_files || 0) + '</div></div>';
   h += '<div class="kpi-card c-orange"><div class="kpi-ico">📃</div><div class="num">' + (rs.total_pages || 0) + '</div><div class="lbl">总页数</div></div>';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📊</div><div class="num">' + RMB(orders.length ? (rs.total / orders.length) : 0) + '</div><div class="lbl">均单收益</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📊</div><div class="num">' + RMB(parseCents(orders.length ? (rs.total / orders.length) : 0)) + '</div><div class="lbl">均单收益</div></div>';
   h += '</div>';
 
   // 过滤行
@@ -1406,10 +1527,10 @@ function renderCloud() {
   h += '<div class="section"><h2>🧩 订单状态分布</h2><div class="chart-wrap"><canvas id="cloud-chart-status"></canvas></div>';
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;font-size:.76rem;color:var(--muted)">';
   var allStatusKeys = Object.keys(orderStatusCount).sort(function (a, b) { return orderStatusCount[b] - orderStatusCount[a]; });
-  allStatusKeys.forEach(function (s) { h += '<span><span class="status-dot ' + s + '"></span> ' + statusLabel(s) + ' (' + (orderStatusCount[s] || 0) + ')</span>'; });
+  allStatusKeys.forEach(function (s) { h += '<span><span class="status-dot ' + esc(s) + '"></span> ' + esc(statusLabel(s)) + ' (' + (orderStatusCount[s] || 0) + ')</span>'; });
   h += '</div></div>';
   h += '<div class="section"><h2>💰 收益构成</h2><div class="chart-wrap"><canvas id="cloud-chart-source"></canvas></div>';
-  h += '<div style="text-align:center;font-size:.8rem;color:var(--muted);margin-top:6px">☁ 云端 ' + RMB(rs.cloud || 0) + ' (' + (rs.cloud_orders || 0) + '单) | 🖨 本地 ' + RMB(rs.local || 0) + ' (' + (rs.local_orders || 0) + '单)</div></div>';
+  h += '<div style="text-align:center;font-size:.8rem;color:var(--muted);margin-top:6px">☁ 云端 ' + RMB(parseCents(rs.cloud || 0)) + ' (' + (rs.cloud_orders || 0) + '单) | 🖨 本地 ' + RMB(parseCents(rs.local || 0)) + ' (' + (rs.local_orders || 0) + '单)</div></div>';
   h += '</div>';
 
   // 图表行2：附加服务构成 + 单双面构成
@@ -1454,26 +1575,27 @@ function renderCloud() {
       if (isLocal) {
         cell = '<span class="member-tag" style="background:#548235">🖨 本地任务</span>';
       } else if (mo) {
-        cell = '<span class="member-tag" style="background:' + mo.color + '">' + esc(mo.name) + '</span> <span style="font-size:.72rem;color:var(--muted)">' + esc(u.nickname || '') + '</span>';
+        cell = '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + '">' + esc(mo.name) + '</span> <span style="font-size:.72rem;color:var(--muted)">' + esc(u.nickname || '') + '</span>';
       } else {
+        var oidSafe = safeId(u.openid);
         var bOpts = '<option value="">未绑定</option>';
-        getMembers().forEach(function (mm) { bOpts += '<option value="' + mm.id + '">' + mm.name + '</option>'; });
+        getMembers().forEach(function (mm) { bOpts += '<option value="' + esc(mm.id) + '">' + esc(mm.name) + '</option>'; });
         cell = '<span style="font-size:.74rem;color:var(--muted)">' + esc(u.nickname || (u.openid || '').substring(0, 8) + '…') + '</span> ' +
           '<span class="bound-badge no">未绑定</span> ' +
-          '<select onchange="updateBinding(\'' + esc(u.openid) + '\',this.value)" style="font-size:.76rem;padding:3px 6px">' + bOpts + '</select>';
+          (oidSafe ? '<select onchange="updateBinding(\'' + oidSafe + '\',this.value)" style="font-size:.76rem;padding:3px 6px">' + bOpts + '</select>' : '');
       }
-      h += '<tr><td class="l">' + cell + '</td><td class="pos" style="font-weight:700">' + RMB(u.revenue) + '</td><td><span class="tag b">' + pct + '%</span></td><td>' + u.order_count + '</td><td>' + u.file_count + '</td><td>' + (u.total_pages || 0) + '</td><td>' + RMB(avgRev) + '</td></tr>';
+      h += '<tr><td class="l">' + cell + '</td><td class="pos" style="font-weight:700">' + RMB(parseCents(u.revenue)) + '</td><td><span class="tag b">' + pct + '%</span></td><td>' + u.order_count + '</td><td>' + u.file_count + '</td><td>' + (u.total_pages || 0) + '</td><td>' + RMB(parseCents(avgRev)) + '</td></tr>';
     });
     h += '</tbody></table></div></div>';
   }
 
   // 对账提示
   var manual = {};
-  (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === _cloudMonth) manual[r.memberId] = (manual[r.memberId] || 0) + (r.amount || 0); });
+  (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === _cloudMonth) manual[r.memberId] = (manual[r.memberId] || 0) + parseCents(r.amount); });
   var cloudByMember = {};
   (_cloudData.by_user || []).forEach(function (u) {
     var mo = memberOfOpenid(u.openid);
-    if (mo && mo.memberId) cloudByMember[mo.memberId] = (cloudByMember[mo.memberId] || 0) + (u.revenue || 0);
+    if (mo && mo.memberId) cloudByMember[mo.memberId] = (cloudByMember[mo.memberId] || 0) + parseCents(u.revenue);
   });
   var hasManual = Object.keys(manual).length > 0;
   if (hasManual || Object.keys(cloudByMember).length > 0) {
@@ -1482,8 +1604,8 @@ function renderCloud() {
     Object.keys(manual).forEach(function (k) { allIds[k] = true; });
     Object.keys(cloudByMember).forEach(function (k) { allIds[k] = true; });
     Object.keys(allIds).forEach(function (mid) {
-      var cv = cloudByMember[mid] || 0, mv = manual[mid] || 0, diff = cv - mv;
-      h += '<tr><td style="font-weight:700;color:' + MC(mid) + '">' + MN(mid) + '</td><td class="pos">' + RMB(cv) + '</td><td>' + RMB(mv) + '</td><td class="' + (Math.abs(diff) > 0.01 ? (diff >= 0 ? 'pos' : 'neg') : '') + '">' + (diff === 0 ? '—' : (diff >= 0 ? '+' : '') + RMB(diff)) + '</td></tr>';
+      var cv = cloudByMember[mid] || 0, mv = manual[mid] || 0, diff = cv - mv;   // 均为整数分
+      h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mid)) + '">' + esc(MN(mid)) + '</td><td class="pos">' + RMB(cv) + '</td><td>' + RMB(mv) + '</td><td class="' + (Math.abs(diff) > 1 ? (diff >= 0 ? 'pos' : 'neg') : '') + '">' + (diff === 0 ? '—' : (diff >= 0 ? '+' : '') + RMB(diff)) + '</td></tr>';
     });
     h += '</tbody></table></div><div style="margin-top:8px;font-size:.78rem;color:var(--muted)">差额 = 云端已完成收费 − 手动代收录入。正数说明还有未入账的收入。本地任务收益不计入成员对账。</div></div>';
   }
@@ -1498,16 +1620,17 @@ function renderCloud() {
       var isExp = !!_cloudExpanded[o.order_id];
       var mo = o.openid === 'local' ? { name: '本地任务' } : memberOfOpenid(o.openid);
       var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
-      h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '" onclick="_toggleOrderExpand(' + o.order_id + ')">';
+      var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
+      h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
       h += '<td><span class="expand-icon">▶</span></td>';
       h += '<td class="l" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
       h += '<td>' + (o.source === 'local' ? '<span class="tag b">本地</span>' : '<span class="tag b">云端</span>') + '</td>';
-      h += '<td class="l">' + (mo && mo.color ? '<span class="member-tag" style="background:' + mo.color + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
-      h += '<td><span class="tag ' + statusClass(o.status) + '">' + statusLabel(o.status) + '</span></td>';
-      h += '<td class="pos" style="font-weight:700">' + RMB(o.revenue) + '</td>';
+      h += '<td class="l">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
+      h += '<td><span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span></td>';
+      h += '<td class="pos" style="font-weight:700">' + RMB(parseCents(o.revenue)) + '</td>';
       h += '<td>' + o.files_count + '</td>';
       h += '<td>' + (o.total_page_count || 0) + '</td>';
-      h += '<td style="font-size:.78rem">' + (o.urgency && o.urgency !== '低' ? '⚡' + o.urgency : '') + (o.delivery_enabled ? ' 🚚' : '') + (o.cover_page ? ' 📄' : '') + '</td>';
+      h += '<td style="font-size:.78rem">' + (o.urgency && o.urgency !== '低' ? '⚡' + esc(o.urgency) : '') + (o.delivery_enabled ? ' 🚚' : '') + (o.cover_page ? ' 📄' : '') + '</td>';
       h += '<td style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 16)) + '</td>';
       h += '</tr>';
       if (isExp && o.files && o.files.length) {
@@ -1516,8 +1639,8 @@ function renderCloud() {
           h += '<tr class="file-sub-row">';
           h += '<td></td>';
           h += '<td class="l" colspan="2" style="padding-left:36px">📄 ' + esc(f.file_name) + '</td>';
-          h += '<td><span class="tag ' + statusClass(fStatus) + '">' + statusLabel(fStatus) + '</span></td>';
-          h += '<td class="pos">' + RMB(f.total_price) + '</td>';
+          h += '<td><span class="tag ' + esc(statusClass(fStatus)) + '">' + esc(statusLabel(fStatus)) + '</span></td>';
+          h += '<td class="pos">' + RMB(parseCents(f.total_price)) + '</td>';
           h += '<td>' + f.copies + '份</td>';
           h += '<td>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</td>';
           h += '<td>' + (f.duplex === 'off' ? '单面' : '双面') + '</td>';
@@ -1532,12 +1655,12 @@ function renderCloud() {
 
   h += '<div style="font-size:.76rem;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap">';
   h += '<span>查询周期: ' + _cloudData.period.start + ' ~ ' + _cloudData.period.end + '</span>';
-  h += '<span>共 ' + orders.length + ' 笔订单 · ' + (rs.total_pages || 0) + ' 页 · 盈利 ' + RMB(rs.total) + '</span>';
+  h += '<span>共 ' + orders.length + ' 笔订单 · ' + (rs.total_pages || 0) + ' 页 · 盈利 ' + RMB(parseCents(rs.total)) + '</span>';
   h += '</div>';
 
   el.innerHTML = h;
   $$('#tab-cloud .num[data-count]').forEach(function (node) {
-    countUp(node, parseFloat(node.getAttribute('data-count')), { dec: 2, fmt: function (n) { return '¥' + n.toFixed(2); } });
+    countUp(node, parseFloat(node.getAttribute('data-count')), { dec: 2, fmt: function (n) { return '¥' + (n / 100).toFixed(2); } });
   });
 
   _destroyCloudCharts();
@@ -1604,9 +1727,10 @@ function renderHistory() {
     return;
   }
   h += '<div class="table-wrap"><table><thead><tr><th>月份</th><th>采购总额</th><th>人均</th><th>总收入</th>';
-  members.forEach(function (m) { h += '<th>' + m.name + ' 净额</th>'; });
+  members.forEach(function (m) { h += '<th>' + esc(m.name) + ' 净额</th>'; });
   h += '<th>备注</th><th></th></tr></thead><tbody>';
   list.forEach(function (key) {
+    var keySafe = safeId(key);
     var m = monthFromRecords(key);
     var r = calcMonth(m);
     h += '<tr>';
@@ -1617,22 +1741,29 @@ function renderHistory() {
       h += '<td class="' + (net >= 0 ? 'pos' : 'neg') + '">' + (net >= 0 ? '+' : '') + RMB(net) + '</td>';
     });
     h += '<td style="max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.76rem">' + esc(m.note || '-') + '</td>';
-    h += '<td style="white-space:nowrap"><button class="btn sm" onclick="editMonth(\'' + key + '\')">编辑</button> <button class="btn danger sm" onclick="delMonth(\'' + key + '\')">删除</button></td>';
+    h += '<td style="white-space:nowrap">' + (keySafe ? '<button class="btn sm" onclick="editMonth(\'' + keySafe + '\')">编辑</button> <button class="btn danger sm" onclick="delMonth(\'' + keySafe + '\')">删除</button>' : '') + '</td>';
     h += '</tr>';
   });
   h += '</tbody></table></div>';
   el.innerHTML = h;
 }
 function editMonth(key) { currentKey = key; switchTab('entry'); }
+/* 危险操作统一前置：要求 settings 已解锁，未解锁则先弹密码框 */
+function confirmUnlockSettings(fn) {
+  if (unlocked.settings) { fn(); return; }
+  requestPassword('settings', '设置').then(function (ok) { if (ok) fn(); });
+}
 function delMonth(key) {
-  openConfirm('确定删除「' + labelOf(key) + '」的所有采购 / 代收 / 评分数据？此操作不可恢复。', '删除').then(function (ok) {
-    if (!ok) return;
-    ['expenses', 'income', 'scores'].forEach(function (k) { STORE.records[k] = STORE.records[k].filter(function (r) { return monthKeyOf(r.date) !== key; }); });
-    delete STORE.notes[key];
-    save();
-    if (currentKey === key) currentKey = currentMonthKey();
-    renderAll();
-    toast('已删除 ' + labelOf(key), 'success');
+  confirmUnlockSettings(function () {
+    openConfirm('确定删除「' + labelOf(key) + '」的所有采购 / 代收 / 评分数据？此操作不可恢复。', '删除').then(function (ok) {
+      if (!ok) return;
+      ['expenses', 'income', 'scores'].forEach(function (k) { STORE.records[k] = STORE.records[k].filter(function (r) { return monthKeyOf(r.date) !== key; }); });
+      delete STORE.notes[key];
+      save();
+      if (currentKey === key) currentKey = currentMonthKey();
+      renderAll();
+      toast('已删除 ' + labelOf(key), 'success');
+    });
   });
 }
 function downloadJSON(data, filename) {
@@ -1647,29 +1778,33 @@ function exportData() { downloadJSON(STORE, '打印项目_清算备份_' + today
 function importData(e) {
   var file = e.target.files[0];
   if (!file) return;
-  var reader = new FileReader();
-  reader.onload = function (ev) {
-    try {
-      var data = JSON.parse(ev.target.result);
-      if (!data.records && !data.months) throw new Error('格式错误');
-      STORE = migrateConfig(data);
-      currentKey = currentMonthKey();
-      save();
-      renderAll();
-      toast('✅ 已导入 ' + allMonthKeys().length + ' 个月', 'success');
-    } catch (err) { toast('❌ 导入失败：' + err.message, 'error'); }
-  };
-  reader.readAsText(file);
+  confirmUnlockSettings(function () {
+    var reader = new FileReader();
+    reader.onload = function (ev) {
+      try {
+        var data = JSON.parse(ev.target.result);
+        if (!data.records && !data.months) throw new Error('格式错误');
+        STORE = migrateConfig(sanitizeStore(data));   // 导入即净化 name/id/color
+        currentKey = currentMonthKey();
+        save();
+        renderAll();
+        toast('✅ 已导入 ' + allMonthKeys().length + ' 个月', 'success');
+      } catch (err) { toast('❌ 导入失败：' + err.message, 'error'); }
+    };
+    reader.readAsText(file);
+  });
 }
 function resetData() {
-  openConfirm('⚠ 确定删除所有数据？建议先导出备份。', '重置').then(function (ok) {
-    if (!ok) return;
-    STORE = migrateConfig(null);
-    currentKey = currentMonthKey();
-    unlocked = { score: false, expense: false, income: false, settings: false };
-    save();
-    renderAll();
-    toast('已重置，数据已清空');
+  confirmUnlockSettings(function () {
+    openConfirm('⚠ 确定删除所有数据？建议先导出备份。', '重置').then(function (ok) {
+      if (!ok) return;
+      STORE = migrateConfig(null);
+      currentKey = currentMonthKey();
+      unlocked = { score: false, expense: false, income: false, settings: false };
+      save();
+      renderAll();
+      toast('已重置，数据已清空');
+    });
   });
 }
 
@@ -1695,13 +1830,15 @@ function renderSettings() {
     h += '<span style="color:var(--muted);font-size:.78rem">当前：' + (k === 'settings' ? '管理密码' : '编辑密码') + '</span>';
     h += '</div>';
   });
-  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码以明文保存于云端配置（受打印机令牌保护）。请牢记密码，遗忘后无法自助找回。</div></div>';
+  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码以 SHA-256 哈希保存于云端配置（受打印机令牌保护）。请牢记密码，遗忘后无法自助找回。</div></div>';
 
   // 成员管理
   h += '<div class="section"><h2>👥 成员管理</h2>';
   h += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px">';
   members.forEach(function (m) {
-    h += '<span class="member-tag" style="background:' + m.color + '">' + esc(m.name) + '<span class="member-del" onclick="removeMember(\'' + m.id + '\')" title="移除">✕</span></span>';
+    var midS = safeId(m.id);
+    if (!midS) return;   // 非法成员 ID 跳过（safeId 已 console.warn）
+    h += '<span class="member-tag" style="background:' + sanitizeColor(m.color) + '">' + esc(m.name) + '<span class="member-del" onclick="removeMember(\'' + midS + '\')" title="移除">✕</span></span>';
   });
   h += '</div>';
   h += '<div class="settings-row"><label>添加成员</label>';
@@ -1716,11 +1853,13 @@ function renderSettings() {
   if (binds.length) {
     h += '<div class="table-wrap"><table><thead><tr><th>云端用户 openid</th><th>绑定成员</th><th></th></tr></thead><tbody>';
     binds.forEach(function (b) {
+      var boidS = safeId(b.openid);
+      if (!boidS) return;   // 非法 openid 跳过该行（safeId 已 console.warn）
       h += '<tr><td style="font-family:monospace;font-size:.8rem" class="l">' + esc(b.openid) + '</td><td>';
-      h += '<select onchange="updateBinding(\'' + esc(b.openid) + '\',this.value)" style="font-size:.84rem;padding:4px 8px">';
+      h += '<select onchange="updateBinding(\'' + boidS + '\',this.value)" style="font-size:.84rem;padding:4px 8px">';
       h += '<option value="">未绑定</option>';
-      members.forEach(function (mm) { h += '<option value="' + mm.id + '"' + (b.memberId === mm.id ? ' selected' : '') + '>' + mm.name + '</option>'; });
-      h += '</select></td><td><button class="btn danger sm" onclick="updateBinding(\'' + esc(b.openid) + '\',\'\')">解绑</button></td></tr>';
+      members.forEach(function (mm) { h += '<option value="' + esc(mm.id) + '"' + (b.memberId === mm.id ? ' selected' : '') + '>' + esc(mm.name) + '</option>'; });
+      h += '</select></td><td><button class="btn danger sm" onclick="updateBinding(\'' + boidS + '\',\'\')">解绑</button></td></tr>';
     });
     h += '</tbody></table></div>';
   } else {
@@ -1729,7 +1868,7 @@ function renderSettings() {
   h += '<div class="settings-row"><label>手动绑定</label>';
   h += '<input type="text" id="bindOpenid" placeholder="粘贴 openid" style="width:220px;font-family:monospace;font-size:.8rem">';
   h += '<select id="bindMember" style="padding:8px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text)">';
-  members.forEach(function (mm) { h += '<option value="' + mm.id + '">' + mm.name + '</option>'; });
+  members.forEach(function (mm) { h += '<option value="' + esc(mm.id) + '">' + esc(mm.name) + '</option>'; });
   h += '</select>';
   h += '<button class="btn green sm" onclick="manualBind()">绑定</button></div>';
   h += '</div>';
@@ -1763,10 +1902,13 @@ function updatePassword(key) {
   if (!input) return;
   var v = input.value.trim();
   if (!v || v.length < 4) { toast('密码至少 4 位', 'error'); return; }
-  STORE.config.passwords[key] = v;
-  save();
-  input.value = '';
-  toast('✅ ' + MODULE_NAMES[key] + ' 密码已更新', 'success');
+  // 只存 SHA-256 哈希，不再存明文（旧明文配置仍可校验，兼容迁移）
+  hashPassword(v).then(function (h) {
+    STORE.config.passwords[key] = 'sha256:' + h;
+    save();
+    input.value = '';
+    toast('✅ ' + MODULE_NAMES[key] + ' 密码已更新', 'success');
+  });
 }
 function updateScoreCap(val) {
   if (val < 1) val = 1;
@@ -1791,7 +1933,19 @@ function removeMember(mid) {
   var idx = members.findIndex(function (m) { return m.id === mid; });
   if (idx === -1) return;
   var name = members[idx].name;
-  openConfirm('确定移除成员「' + name + '」？已有记录不会丢失，但不再参与后续计算。', '移除').then(function (ok) {
+  // 删除前扫描该成员名下的垫付 / 代收记录，避免金额静默消失
+  var paidN = 0, paidC = 0, incN = 0, incC = 0;
+  (STORE.records.expenses || []).forEach(function (e) { if (e.payer === mid) { paidN++; paidC += parseCents(e.amount); } });
+  (STORE.records.income || []).forEach(function (r) { if (r.memberId === mid) { incN++; incC += parseCents(r.amount); } });
+  var msg = '确定移除成员「' + name + '」？';
+  if (paidN || incN) {
+    var parts = [];
+    if (paidN) parts.push(paidN + ' 条垫付（合计 ' + RMB(paidC) + ' 元）');
+    if (incN) parts.push(incN + ' 条代收（合计 ' + RMB(incC) + ' 元）');
+    msg += '该成员名下有 ' + parts.join('、') + '，删除后这些金额将从结算中消失。';
+  }
+  msg += '已有记录不会丢失，但不再参与后续计算。';
+  openConfirm(msg, '移除').then(function (ok) {
     if (!ok) return;
     members.splice(idx, 1);
     STORE.config.members = members;
@@ -1862,6 +2016,7 @@ function loadConfig() {
   });
 }
 function finishLoad(hadCloud) {
+  replayOfflinePending();   // 云端可达：重放上次离线暂存的未保存数据
   var keys = allMonthKeys();
   currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
   // 云端月份预加载
@@ -1871,6 +2026,17 @@ function finishLoad(hadCloud) {
   setInterval(checkHealth, 30000);
   if (hadCloud) toast('✅ 已加载云端配置（' + monthRecordCount(currentKey) + ' 条当月记录）');
   else toast('ℹ️ 欢迎使用，请在「记账」录入数据');
+}
+function replayOfflinePending() {
+  try {
+    var raw = localStorage.getItem('finance_offline_pending');
+    if (!raw) return;
+    var pending = JSON.parse(raw);
+    localStorage.removeItem('finance_offline_pending');
+    STORE = migrateConfig(sanitizeStore(pending));
+    save();
+    toast('🔄 已恢复本地暂存数据并重新保存', 'success');
+  } catch (e2) { /* 暂存数据损坏则直接丢弃 */ }
 }
 
 (function () {
