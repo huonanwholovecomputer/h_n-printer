@@ -49,6 +49,74 @@ RETENTION_CONFIG_FILE = os.path.join(UPLOAD_DIR, "retention_config.json")
 # 默认保留时间：7 天
 DEFAULT_RETENTION = {"days": 7, "hours": 0}
 
+# -------- 防滥用 / DDoS 防护阈值 --------
+# 管理员/超管可通过 /api/admin/security 查看和调整，持久化到 uploads/security_config.json，
+# 运行中保存立即生效（无需重启）。0 表示关闭对应检查。各项说明：
+#   - user_quota_mb           每用户累计文件配额（MB），超限拒绝上传（防存储型 DDoS）
+#   - disk_min_free_mb        磁盘剩余空间守卫（MB），低于阈值拒绝上传
+#   - queued_timeout_hours    排队子任务超时淘汰（小时），释放被 queued 订单钉住的磁盘文件
+#   - upload_rate_limit       每用户每分钟上传次数上限
+#   - submit_order_rate_limit 每用户每分钟提交订单次数上限
+#   - device_login_rate_limit 每 IP / 每设备每小时设备登录次数上限
+#   - redeem_rate_limit       每用户每分钟密钥兑换次数上限
+#   - log_report_rate_limit   每 IP 每分钟日志上报条数上限
+SECURITY_CONFIG_FILE = os.path.join(UPLOAD_DIR, "security_config.json")
+
+DEFAULT_SECURITY = {
+    "user_quota_mb": 2048,
+    "disk_min_free_mb": 5120,
+    "queued_timeout_hours": 24,
+    "upload_rate_limit": 20,
+    "submit_order_rate_limit": 20,
+    "device_login_rate_limit": 20,
+    "redeem_rate_limit": 10,
+    "log_report_rate_limit": 30,
+}
+
+# 每项允许范围 (min, max)，POST 保存时校验（0 是否允许见 DEFAULT_SECURITY 注释）
+SECURITY_RANGES = {
+    "user_quota_mb": (0, 102400),
+    "disk_min_free_mb": (0, 102400),
+    "queued_timeout_hours": (0, 720),
+    "upload_rate_limit": (1, 600),
+    "submit_order_rate_limit": (1, 600),
+    "device_login_rate_limit": (1, 600),
+    "redeem_rate_limit": (1, 600),
+    "log_report_rate_limit": (1, 600),
+}
+
+_SECURITY = dict(DEFAULT_SECURITY)
+
+
+def load_security_config():
+    """加载防滥用配置（文件缺失/损坏时回退默认值），返回配置副本。"""
+    global _SECURITY
+    cfg = dict(DEFAULT_SECURITY)
+    if os.path.exists(SECURITY_CONFIG_FILE):
+        try:
+            with open(SECURITY_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k in cfg:
+                if k in data and isinstance(data[k], (int, float)):
+                    cfg[k] = int(data[k])
+        except (json.JSONDecodeError, IOError):
+            pass
+    _SECURITY = cfg
+    return dict(cfg)
+
+
+def save_security_config(cfg):
+    """保存防滥用配置并立即更新内存副本（运行时生效，无需重启）。"""
+    global _SECURITY
+    _SECURITY = dict(cfg)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    with open(SECURITY_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(_SECURITY, f, ensure_ascii=False, indent=2)
+
+
+# 模块加载即读取已保存的配置（若无则用默认值）
+_SECURITY = load_security_config()
+
 # 已知扩展名 → 子目录映射
 EXT_DIR_MAP = {
     "pdf": "pdf", "doc": "doc", "docx": "docx", "xls": "xls", "xlsx": "xlsx",
@@ -70,6 +138,14 @@ _md5_index_lock = threading.Lock()
 # 生产环境多 worker / 多实例时需要在 nginx 层再加 IP 维度限速。
 _rate_limits = defaultdict(list)
 _rate_limits_lock = threading.Lock()
+
+# 页数分析惰性触发防抖：file_id → 最近一次主动推送时间戳
+# （前端 /api/file_page 轮询时，若打印机在线且文件未分析，可主动补推；
+#   30s 防抖避免每 2s 轮询刷爆分析请求，也避免补推 + 轮询双重推送）
+_last_page_analysis_push = {}
+_last_page_analysis_push_lock = threading.Lock()
+# 页数分析推送目标 sid 记录（file_id → sid），供取消分析时精确转发
+_analysis_push_sid = {}
 
 
 def _rate_limit(key, max_count, window_seconds):
@@ -268,25 +344,21 @@ def save_retention_config(cfg):
 
 
 def cleanup_expired_files():
-    """清理超过保留时间的文件（删磁盘文件，不删数据库记录）。
-    跳过仍在活跃订单中引用的文件（reserved/queued/printing/accepted），
-    防止清理掉尚未完成或崩溃后待恢复的打印任务所需文件。"""
+    """清理过期文件（删磁盘 + 清空路径）与幽灵文件记录。
+
+    - 过期文件：删磁盘文件、清空 files.path（保留记录，历史/引用完整性）
+    - 幽灵记录（path 已清空或物理文件缺失 + 未关联活跃订单）：直接删除 files 记录，
+      否则会污染页数分析补推——每次打印机上线重推已清理文件 → 下载 404 刷屏
+
+    跳过仍在活跃订单中引用的文件（reserved/queued/printing/accepted/scheduled/
+    waiting/downloading），防止清理掉尚未完成或崩溃后待恢复的打印任务所需文件。
+    幽灵清理不受保留期限制（物理已清理的记录无需等待过期）。"""
     cfg = load_retention_config()
     days = cfg.get("days", 0)
     hours = cfg.get("hours", 0)
-
-    # 0 天 0 小时 = 永不过期
-    if days == 0 and hours == 0:
-        return
-
-    cutoff = datetime.now() - timedelta(days=days, hours=hours)
-    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    no_retention = (days == 0 and hours == 0)
 
     conn = get_db()
-    rows = conn.execute(
-        "SELECT id, path FROM files WHERE created_at < ? AND path != ''",
-        (cutoff_str,),
-    ).fetchall()
 
     # 收集所有活跃订单引用的 file_id
     # （P2-3）补全遗漏状态：scheduled（预约待下发）/ waiting（文件就绪等打印）/
@@ -307,10 +379,35 @@ def cleanup_expired_files():
     ).fetchall():
         if fid:
             active_file_ids.add(fid)
-    conn.close()
 
     if active_file_ids:
         print(f"  [CLEANUP] 跳过 {len(active_file_ids)} 个活跃订单引用的文件")
+
+    # ---- 幽灵记录清理（不受保留期限制）----
+    ghost_ids = []
+    for (fid, fpath) in conn.execute("SELECT id, path FROM files").fetchall():
+        if fid in active_file_ids:
+            continue
+        if not fpath or not os.path.exists(fpath):
+            ghost_ids.append(fid)
+    if ghost_ids:
+        placeholders = ",".join("?" for _ in ghost_ids)
+        conn.execute(f"DELETE FROM files WHERE id IN ({placeholders})", ghost_ids)
+        conn.commit()
+        print(f"  [CLEANUP] 已删除 {len(ghost_ids)} 条幽灵文件记录（物理已清理，防止页数分析补推刷屏）")
+
+    # 0 天 0 小时 = 永不过期（幽灵清理已在上方完成）
+    if no_retention:
+        conn.close()
+        return
+
+    cutoff = datetime.now() - timedelta(days=days, hours=hours)
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+
+    rows = conn.execute(
+        "SELECT id, path FROM files WHERE created_at < ? AND path != ''",
+        (cutoff_str,),
+    ).fetchall()
 
     md5_index = load_md5_index()
     deleted_count = 0
@@ -344,13 +441,12 @@ def cleanup_expired_files():
             for k in keys_to_remove:
                 del md5_index[k]
 
-        # 清空 files 表中的路径（保留记录本身）
-        conn = get_db()
+        # 清空 files 表中的路径（保留记录本身，下轮清理时作为幽灵删除）
         conn.execute("UPDATE files SET path = '', size = 0 WHERE id = ?", (file_id,))
-        conn.commit()
-        conn.close()
-
         deleted_count += 1
+
+    conn.commit()
+    conn.close()
 
     if skipped_active > 0:
         print(f"  [CLEANUP] 已跳过 {skipped_active} 个活跃订单引用的过期文件")
@@ -534,6 +630,9 @@ pushed_tasks_lock = threading.Lock()
 CLIENT_HEARTBEAT_TIMEOUT = 90    # 心跳超时秒数（超过此值视为离线）
 PRINT_FEEDBACK_TIMEOUT = 180     # 打印反馈超时秒数（3 分钟，断线回滚兜底）
 ACCEPT_WAIT_TIMEOUT = 600        # P1-8：推送后未被 accept 的任务（手动流程，等用户点击）超时放宽到 10 分钟
+# 断线未知超时秒数（30 分钟）：客户端断线后任务置 offline_unknown，等待原客户端重连回报；
+# 超时仍未解决 → 保守标记 failed（方案 B：不重复打印，用户可手动重发）
+OFFLINE_UNKNOWN_TIMEOUT = 1800
 
 def get_active_clients():
     """返回心跳未超时的客户端 ID 列表"""
@@ -980,6 +1079,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # v18 迁移：order_files 添加 image_orientation 列（图片打印方向: auto/landscape/portrait）
+    try:
+        conn.execute("ALTER TABLE order_files ADD COLUMN image_orientation TEXT DEFAULT 'auto'")
+        conn.commit()
+        print("  已添加 order_files.image_orientation 列")
+    except sqlite3.OperationalError:
+        pass
+
     # v18 迁移：order_files 添加 reject_reason 列（打回原因）
     try:
         conn.execute("ALTER TABLE order_files ADD COLUMN reject_reason TEXT DEFAULT ''")
@@ -1174,6 +1281,39 @@ def refresh_order_status(conn, order_id):
     return new_status
 
 
+def expire_stale_queued_orders():
+    """防滥用：淘汰排队超过 queued_timeout_hours 的子任务（标记 failed 并刷新父订单状态）。
+    目的：释放被 queued 状态钉住的磁盘文件——cleanup_expired_files 会跳过活跃状态
+    （含 queued）引用的文件；若无打印机认领，攻击者可用排队订单让文件永驻服务器。
+    超时淘汰后状态变为 failed（非活跃状态），清理任务即可删除对应文件。"""
+    timeout_hours = _SECURITY["queued_timeout_hours"]
+    if timeout_hours <= 0:
+        return
+    cutoff = datetime.now() - timedelta(hours=timeout_hours)
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    with db_lock:
+        conn = get_db_conn()
+        rows = conn.execute(
+            "SELECT id, order_id FROM order_files WHERE status = 'queued' AND created_at < ?",
+            (cutoff_str,),
+        ).fetchall()
+        if not rows:
+            conn.close()
+            return
+        order_ids = set()
+        for r in rows:
+            conn.execute(
+                "UPDATE order_files SET status = 'failed', reject_reason = ? WHERE id = ?",
+                (f"排队超过 {timeout_hours} 小时未打印，已自动取消", r["id"]),
+            )
+            order_ids.add(r["order_id"])
+        for oid in order_ids:
+            refresh_order_status(conn, oid)
+        conn.commit()
+        conn.close()
+    print(f"[SECURITY] 已淘汰 {len(rows)} 个排队超时子任务（> {timeout_hours} 小时）")
+
+
 # ==================== 原子任务领取 ====================
 
 
@@ -1232,7 +1372,7 @@ def process_pending_orders():
     rows = conn.execute(
         """
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
-               of.copies, of.page_range, of.duplex, o.auto_print
+               of.copies, of.page_range, of.duplex, of.image_orientation, o.auto_print
         FROM order_files of
         JOIN orders o ON of.order_id = o.id
         WHERE of.status = 'queued'
@@ -1289,7 +1429,8 @@ def process_pending_orders():
         if active_clients:
             pushed = push_print_task_to_client(of_id, file_id, file_name, copies, duplex,
                                                page_range, _pick_client(active_clients),
-                                               auto_print=bool(row["auto_print"]))
+                                               auto_print=bool(row["auto_print"]),
+                                               image_orientation=row["image_orientation"] or "auto")
             if pushed:
                 continue
 
@@ -1308,7 +1449,7 @@ def process_scheduled_orders():
         """
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
                of.copies, of.page_range, of.duplex, of.status AS of_status,
-               of.operator_client,
+               of.operator_client, of.image_orientation,
                o.auto_print, o.schedule_mode, o.scheduled_at, o.schedule_frozen
         FROM order_files of
         JOIN orders o ON of.order_id = o.id
@@ -1356,7 +1497,8 @@ def process_scheduled_orders():
                                       scheduled_download=True,
                                       schedule_mode=row["schedule_mode"],
                                       scheduled_at=row["scheduled_at"] or "",
-                                      schedule_frozen=row["schedule_frozen"])
+                                      schedule_frozen=row["schedule_frozen"],
+                                      image_orientation=row["image_orientation"] or "auto")
 
         elif row["of_status"] == "waiting":
             # 阶段②兜底：到点且未冻结 → 发 start_print（本地通常已自触发，幂等）
@@ -1392,7 +1534,8 @@ def process_scheduled_orders():
 
 def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, page_range, client_id,
                               auto_print=False, scheduled_download=False,
-                              schedule_mode="now", scheduled_at="", schedule_frozen=0):
+                              schedule_mode="now", scheduled_at="", schedule_frozen=0,
+                              image_orientation="auto"):
     """通过 SocketIO 推送子任务 (order_files) 到指定打印机客户端。
     sub_task_id = order_files.id。
 
@@ -1485,6 +1628,7 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             "copies": copies,
             "duplex": duplex or "on",
             "page_range": page_range or "",
+            "image_orientation": image_orientation or "auto",
         },
     }
 
@@ -1617,6 +1761,30 @@ def check_printing_timeout():
                 continue
             if (now - la_dt).total_seconds() > PRINT_FEEDBACK_TIMEOUT:
                 timeout_sub_tasks.append(r["id"])
+
+        # 3) offline_unknown（断线未知）：客户端断线且未回报结果，超时后保守标记 failed
+        #    （方案 B：不自动重新入队，避免重复打印；用户可在订单列表看到失败后手动重发）
+        off_rows = conn.execute(
+            "SELECT id, order_id, locked_at FROM order_files WHERE status = 'offline_unknown'"
+        ).fetchall()
+        for r in off_rows:
+            la = r["locked_at"] or ""
+            if not la:
+                continue  # 无 accept 时刻，不参与超时判定
+            try:
+                la_dt = datetime.strptime(la, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if (now - la_dt).total_seconds() <= OFFLINE_UNKNOWN_TIMEOUT:
+                continue
+            print(f"  [FAIL] 子任务 #{r['id']}: 断线未知超过 {OFFLINE_UNKNOWN_TIMEOUT // 60} 分钟，标记为失败")
+            conn.execute(
+                "UPDATE order_files SET status = 'failed', locked_at = '',"
+                " reject_reason = '打印机断线，打印结果未知，已超时标记失败' WHERE id = ?",
+                (r["id"],),
+            )
+            refresh_order_status(conn, r["order_id"])
+            conn.commit()
 
         if not timeout_sub_tasks:
             return
@@ -1786,14 +1954,18 @@ def on_connect(auth=None):
     print(f"[LINK] 打印机客户端已连接: {client_id}")
 
     # 打印机上线后，重推之前因离线而未能送达的页数分析请求
-    # 仅推送属于活跃任务的文件（已被取消/打回/放弃的文件不再分析）
+    # LEFT JOIN 覆盖两类待分析文件：
+    #   ① 未关联任何订单的上传文件（"上传界面还在"，订单未提交）→ of.id IS NULL
+    #   ② 属于活跃任务的文件（queued/printing/accepted）
+    # 已取消/打回/完成的订单文件不再分析；page_count_verified=1 后自然不再命中。
     try:
         conn = get_db()
         pending = conn.execute(
             "SELECT DISTINCT f.id, f.original_name FROM files f"
-            " INNER JOIN order_files of ON f.id = of.file_id"
+            " LEFT JOIN order_files of ON f.id = of.file_id"
             " WHERE f.page_count = 0 AND f.page_count_verified = 0"
-            " AND of.status IN ('queued', 'printing', 'accepted')"
+            " AND f.path != ''"
+            " AND (of.id IS NULL OR of.status IN ('queued', 'printing', 'accepted'))"
             " LIMIT 20"
         ).fetchall()
         conn.close()
@@ -1805,7 +1977,7 @@ def on_connect(auth=None):
                 if request_page_analysis(row["id"], fname):
                     pushed += 1
         if pushed > 0:
-            print(f"  [PAGE] 打印机上线后重推 {pushed} 个待分析文档（仅活跃任务）")
+            print(f"  [PAGE] 打印机上线后重推 {pushed} 个待分析文档（含未提交订单的上传文件）")
     except Exception as e:
         print(f"  [PAGE] 重推待分析文档时出错: {e}")
 
@@ -1958,6 +2130,10 @@ def on_print_success(data):
 
     with pushed_tasks_lock:
         pushed_tasks.pop(task_id, None)
+
+    # 同步本地回报的实际打印配置（份数/双面/范围/页数）并重算价格
+    _sync_subtask_config(task_id, data.get("copies"), data.get("duplex"),
+                         data.get("page_range"), data.get("page_count"))
 
     print(f"  [OK] 子任务 #{task_id}: 客户端确认打印成功")
 
@@ -2233,6 +2409,14 @@ def on_page_count_result(data):
         "UPDATE files SET page_count = ?, page_count_verified = 1 WHERE id = ?",
         (page_count, file_id),
     )
+    if page_count == 1:
+        # 单页文件无法双面：用户在未知页数时可能选了双面 →
+        # 强制引用该文件的活跃子任务改为单面，后端显示与价格随之一致
+        conn.execute(
+            "UPDATE order_files SET duplex = 'off' WHERE file_id = ?"
+            " AND status IN ('queued', 'printing', 'accepted', 'waiting', 'downloading')",
+            (file_id,),
+        )
     # 同步更新 MD5 索引：下次同 MD5 文件上传直接复用页数，无需再次分析
     row = conn.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
     conn.commit()
@@ -2299,6 +2483,74 @@ def _recalc_prices_for_file(file_id, page_count):
         print(f"  [PRICE] 已回溯重算 {len(rows)} 个子任务的价格（页数修正为 {page_count} 页）")
     except Exception as e:
         print(f"  [WARN] 价格回溯重算失败: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def _sync_subtask_config(task_id, copies, duplex, page_range, page_count):
+    """本地回报实际打印配置后，同步 order_files 并重算子任务价格与父订单总额。
+    场景：用户在小程序选了份数/双面，本地打印工具可能在打印前修改（含单页强制单面），
+    打印成功回报时带上实际配置，后端据此更新记录与价格。"""
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id, order_id FROM order_files WHERE id = ?", (task_id,)).fetchone()
+        if not row:
+            conn.close()
+            return
+        set_parts = []
+        params = []
+        if copies is not None:
+            try:
+                c = int(copies)
+                if 1 <= c <= 999:
+                    set_parts.append("copies = ?"); params.append(c)
+            except (ValueError, TypeError):
+                pass
+        if duplex in ("on", "off"):
+            set_parts.append("duplex = ?"); params.append(duplex)
+        if page_range is not None:
+            set_parts.append("page_range = ?"); params.append(str(page_range)[:500])
+        if page_count is not None:
+            try:
+                pc = int(page_count)
+                if pc > 0:
+                    set_parts.append("page_count = ?"); params.append(pc)
+            except (ValueError, TypeError):
+                pass
+        if not set_parts:
+            conn.close()
+            return
+        params.append(task_id)
+        conn.execute(f"UPDATE order_files SET {', '.join(set_parts)} WHERE id = ?", params)
+        # 用更新后的值重算子任务价格
+        cur = conn.execute(
+            "SELECT page_count, copies, duplex FROM order_files WHERE id = ?", (task_id,)
+        ).fetchone()
+        if cur:
+            per_copy = calculate_price(cur["page_count"] or 1, cur["duplex"] or "on")
+            new_total = round(per_copy * (cur["copies"] or 1), 2)
+            conn.execute("UPDATE order_files SET total_price = ? WHERE id = ?", (new_total, task_id))
+            # 重算父订单总额（基础打印费 + 附加服务费，口径与 submit_order 一致）
+            oid = row["order_id"]
+            sub_sum = conn.execute(
+                "SELECT COALESCE(SUM(total_price), 0) FROM order_files WHERE order_id = ?", (oid,)
+            ).fetchone()[0]
+            o = conn.execute(
+                "SELECT delivery_enabled, delivery_percentage, urgency_price, cover_page, cover_page_price"
+                " FROM orders WHERE id = ?", (oid,)
+            ).fetchone()
+            if o:
+                delivery_fee = round(float(sub_sum) * (o["delivery_percentage"] or 0) / 100, 2) if o["delivery_enabled"] else 0
+                urgency_fee = float(o["urgency_price"] or 0)
+                cover_fee = round(float(o["cover_page_price"] or 0) * o["cover_page"], 2) if o["cover_page"] else 0
+                parent_total = round(float(sub_sum) + urgency_fee + cover_fee + delivery_fee, 2)
+                conn.execute("UPDATE orders SET total_price = ? WHERE id = ?", (parent_total, oid))
+            refresh_order_status(conn, oid)
+        conn.commit()
+        print(f"  [SYNC] 子任务 #{task_id} 实际打印配置已同步后端")
+    except Exception as e:
+        print(f"  [WARN] 子任务配置同步失败: {e}")
         conn.rollback()
     finally:
         conn.close()
@@ -2411,6 +2663,40 @@ def request_page_analysis(file_id: str, file_name: str) -> bool:
         print(f"  [PAGE] 无活跃打印客户端，跳过页数分析请求")
         return False
 
+    # 幽灵文件校验：物理文件已清理/路径已清空 → 跳过（下载必然 404，
+    # 避免打印机上线补推 / 前端轮询触发时反复推送已清理文件刷屏）
+    try:
+        conn = get_db()
+        prow = conn.execute(
+            "SELECT path, page_count, page_count_verified, md5 FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        conn.close()
+        if not prow or not prow["path"] or not os.path.isfile(prow["path"]):
+            print(f"  [PAGE] 文件已清理，跳过页数分析: {file_name} (file_id={file_id[:8]}...)")
+            return False
+        # 防御性自检：DB 已存验证页数 → 不再发起分析（各调用路径可能遗漏此判断，
+        # 例如 MD5 索引丢失但 files 表仍有验证值）
+        if prow["page_count_verified"] and (prow["page_count"] or 0) > 0:
+            print(f"  [PAGE] 页数已验证 ({prow['page_count']} 页)，跳过分析: {file_name}")
+            return False
+        file_md5 = prow["md5"] or ""
+    except Exception:
+        return False
+
+    # 统一去重（30s）：on_connect 补推 / 前端 file_page 轮询触发 / 上传共用此字典，
+    # 避免同一文件在短时间内被多个路径重复推送（"补推 + 轮询"双保险不能变成双推）。
+    # 幽灵校验在前（幽灵不占防抖槽）；有效推送记录时间戳。
+    with _last_page_analysis_push_lock:
+        last = _last_page_analysis_push.get(file_id, 0)
+        now = time.time()
+        if now - last < 30:
+            print(f"  [PAGE] 30s 内已推送过 {file_name}，跳过重复分析请求")
+            return False
+        _last_page_analysis_push[file_id] = now
+        if len(_last_page_analysis_push) > 5000:
+            _last_page_analysis_push.clear()   # 超限清空，防止字典无限增长
+
     download_url = make_download_url(file_id)
     client_id = _pick_client(active_clients)
 
@@ -2421,11 +2707,16 @@ def request_page_analysis(file_id: str, file_name: str) -> bool:
     if not sid:
         return False
 
+    # 记录推送目标 sid，供取消分析时精确转发（同一 file_id 重新推送会覆盖为最新 sid）
+    with _last_page_analysis_push_lock:
+        _analysis_push_sid[file_id] = sid
+
     try:
         socketio.emit("analyze_page_count", {
             "file_id": file_id,
             "file_name": file_name,
             "download_url": download_url,
+            "source_md5": file_md5,   # 本地可直接按 MD5 命中 PDF 缓存，无需下载文件
         }, to=sid)
         print(f"  [PAGE] 已推送页数分析请求: {file_name} (file_id={file_id[:8]}...) → {client_id}")
         return True
@@ -2540,20 +2831,58 @@ def get_pricing():
 @login_required
 def get_file_page(file_id):
     """查询文件的页数信息（供前端轮询本地工具分析结果）。
-    返回 page_count 和 page_count_verified 标志。"""
+    返回 page_count 和 page_count_verified 标志。
+
+    惰性触发：打印机在线但文件页数仍未知（上传时离线、补推遗漏）→ 主动补推分析请求
+    （去重由 request_page_analysis 内部统一 30s 防抖，与 on_connect 补推共享）。"""
     conn = get_db()
     row = conn.execute(
-        "SELECT page_count, page_count_verified FROM files WHERE id = ?", (file_id,)
+        "SELECT page_count, page_count_verified, original_name FROM files WHERE id = ?", (file_id,)
     ).fetchone()
     conn.close()
     if not row:
         return jsonify({"success": False, "message": "文件不存在"}), 404
+    printer_online = len(get_active_clients()) > 0
+    if (printer_online and not row["page_count_verified"] and (row["page_count"] or 0) <= 0):
+        fname = row["original_name"] or ""
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in (".doc", ".docx"):
+            # 统一防抖在 request_page_analysis 内部：30s 内已被补推/轮询推过则跳过
+            request_page_analysis(file_id, fname)
     return jsonify({
         "success": True,
         "page_count": row["page_count"] or 0,
         "verified": bool(row["page_count_verified"]),
-        "printer_online": len(get_active_clients()) > 0,
+        "printer_online": printer_online,
     })
+
+
+@app.route("/api/cancel_page_analysis", methods=["POST"])
+@login_required
+def cancel_page_analysis():
+    """取消页数分析（小程序删除文件 / 关闭页面时调用）。
+
+    对每个 file_id：清空 30s 防抖槽（避免取消后重新轮询被误拦），
+    并向曾接收该分析请求的打印机客户端转发 cancel_page_analysis 事件，
+    让本地工具中止正在进行的下载/转换。未记录目标时广播兜底。"""
+    data = request.get_json(silent=True) or {}
+    file_ids = data.get("file_ids", [])
+    if not isinstance(file_ids, list) or not file_ids:
+        return jsonify({"success": False, "message": "缺少 file_ids"}), 400
+
+    with _last_page_analysis_push_lock:
+        for fid in file_ids:
+            _last_page_analysis_push.pop(fid, None)      # 清防抖槽，允许立即重新发起
+            sid = _analysis_push_sid.pop(fid, None)
+            try:
+                if sid:
+                    socketio.emit("cancel_page_analysis", {"file_id": fid}, to=sid)
+                else:
+                    socketio.emit("cancel_page_analysis", {"file_id": fid})  # 广播兜底
+                print(f"  [PAGE] 已请求取消页数分析: {fid[:8]}... → sid={sid}")
+            except Exception as e:
+                print(f"  [WARN] 取消分析转发失败: {e}")
+    return jsonify({"success": True})
 
 
 @app.route("/api/login", methods=["POST"])
@@ -2640,11 +2969,12 @@ def device_login():
 
     device_id = (data.get("device_id") or "").strip()
 
-    # 限速（P0-2.2 / P1-6）：每 IP / 每 device_id 每小时最多 20 次，防止无限建号刷库。
-    # 注意：内存计数仅单 worker 有效，nginx 层应再加 IP 维度限速。
+    # 限速（P0-2.2 / P1-6 / 防滥用）：每 IP / 每 device_id 每小时登录次数上限（管理员可调），
+    # 防止无限建号刷库。注意：内存计数仅单 worker 有效，nginx 层应再加 IP 维度限速。
     ip = request.remote_addr or "unknown"
-    if not _rate_limit(f"device_login:ip:{ip}", 20, 3600) or \
-       not _rate_limit(f"device_login:dev:{device_id}", 20, 3600):
+    _dev_login_limit = _SECURITY["device_login_rate_limit"]
+    if not _rate_limit(f"device_login:ip:{ip}", _dev_login_limit, 3600) or \
+       not _rate_limit(f"device_login:dev:{device_id}", _dev_login_limit, 3600):
         return jsonify({"success": False, "message": "注册过于频繁，请稍后再试"}), 429
 
     # P0-2.2：device_id 最小长度从 6 提高到 10，降低穷举碰撞概率
@@ -2679,9 +3009,23 @@ def device_login():
 @app.route("/api/upload", methods=["POST"])
 @require_printer_access
 def upload_file():
-    # 限速（P1-6）：每用户每分钟最多 20 次上传（单 worker 内存计数，nginx 层应再加 IP 限速）
-    if not _rate_limit(f"upload:{g.openid}", 20, 60):
+    # 限速（P1-6 / 防滥用）：每用户每分钟最多上传次数（阈值管理员可调，单 worker 内存计数）
+    if not _rate_limit(f"upload:{g.openid}", _SECURITY["upload_rate_limit"], 60):
         return jsonify({"success": False, "message": "上传过于频繁，请稍后再试"}), 429
+
+    # 磁盘剩余空间守卫（防存储型 DDoS）：低于阈值直接拒绝，避免磁盘被写满
+    min_free_bytes = _SECURITY["disk_min_free_mb"] * 1024 * 1024
+    if min_free_bytes > 0:
+        try:
+            free_bytes = shutil.disk_usage(UPLOAD_DIR).free
+            if free_bytes < min_free_bytes:
+                return jsonify({
+                    "success": False,
+                    "message": "服务器存储空间不足，请稍后再试",
+                    "free_mb": round(free_bytes / (1024 * 1024), 1),
+                }), 503
+        except OSError:
+            pass  # 磁盘信息不可用时放行，交由配额兜底
 
     if "file" not in request.files:
         return jsonify({"success": False, "message": "未找到上传文件"}), 400
@@ -2703,6 +3047,28 @@ def upload_file():
     temp_path = os.path.join(UPLOAD_DIR, saved_name)
     f.save(temp_path)
     file_size = os.path.getsize(temp_path)
+
+    # 防滥用：每用户累计配额检查（含本次文件；超限拒绝并清理临时文件，防存储型 DDoS）。
+    # 注：MD5 复用文件也计入配额——同一文件被多个用户引用时各算一份，偏保守但更安全。
+    quota_bytes = _SECURITY["user_quota_mb"] * 1024 * 1024
+    if quota_bytes > 0:
+        conn = get_db()
+        used = conn.execute(
+            "SELECT COALESCE(SUM(size), 0) AS used FROM files WHERE openid = ? AND path != ''",
+            (g.openid,),
+        ).fetchone()["used"] or 0
+        conn.close()
+        if used + file_size > quota_bytes:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            return jsonify({
+                "success": False,
+                "message": "存储配额已满，请删除旧文件后再上传",
+                "quota_mb": _SECURITY["user_quota_mb"],
+                "used_mb": round(used / (1024 * 1024), 1),
+            }), 413
 
     # 2. 计算 MD5 并查重
     file_md5 = get_file_md5(temp_path)
@@ -2803,8 +3169,8 @@ def upload_file():
 @app.route("/api/submit_order", methods=["POST"])
 @require_printer_access
 def submit_order():
-    # 限速（P1-6）：每用户每分钟最多 20 次提交（单 worker 内存计数，nginx 层应再加 IP 限速）
-    if not _rate_limit(f"submit_order:{g.openid}", 20, 60):
+    # 限速（P1-6 / 防滥用）：每用户每分钟提交订单次数上限（管理员可调，单 worker 内存计数）
+    if not _rate_limit(f"submit_order:{g.openid}", _SECURITY["submit_order_rate_limit"], 60):
         return jsonify({"success": False, "message": "提交过于频繁，请稍后再试"}), 429
 
     data = request.get_json()
@@ -3032,12 +3398,16 @@ def submit_order():
                     reject_reason = f"页码范围超出文件总页数（填写 {max_page} 页，文件共 {page_count} 页）"
                     print(f"  [REJECT] 提交时打回: {f_name} range={f_page_range} 超出 {page_count} 页")
 
+            f_image_orientation = f.get("image_orientation", "auto") or "auto"
+            if f_image_orientation not in ("auto", "landscape", "portrait"):
+                f_image_orientation = "auto"
+
             conn.execute(
                 """INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,
-                                            page_range, price_per_page, total_price, is_free, status, created_at, duplex, reject_reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                            page_range, price_per_page, total_price, is_free, status, created_at, duplex, reject_reason, image_orientation)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (order_id, f_id or None, f_name, f_copies, page_count,
-                 f_page_range, 0, total_price, is_free_val, sub_status, created_at, f_duplex, reject_reason),
+                 f_page_range, 0, total_price, is_free_val, sub_status, created_at, f_duplex, reject_reason, f_image_orientation),
             )
             sub_task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             sub_tasks.append({
@@ -3047,6 +3417,7 @@ def submit_order():
                 "page_range": f_page_range,
                 "total_price": total_price, "status": sub_status,
                 "duplex": f_duplex,
+                "image_orientation": f_image_orientation,
                 "reject_reason": reject_reason,
             })
 
@@ -3128,13 +3499,15 @@ def submit_order():
                                                       auto_print=True,
                                                       scheduled_download=True,
                                                       schedule_mode=schedule_mode,
-                                                      scheduled_at=scheduled_at):
+                                                      scheduled_at=scheduled_at,
+                                                      image_orientation=st.get("image_orientation", "auto")):
                             pushed_count += 1
                         continue
                     if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
                                                   st["copies"], st.get("duplex", duplex),
                                                   st.get("page_range", ""), client_id,
-                                                  auto_print=bool(auto_print)):
+                                                  auto_print=bool(auto_print),
+                                                  image_orientation=st.get("image_orientation", "auto")):
                         pushed_count += 1
                     else:
                         # 推送失败 → 降级子任务和父订单
@@ -3190,6 +3563,7 @@ def pull_queued_orders():
 
     # 每文件 duplex 已存入 order_files 表，直接从 task 读取
     duplex = task.get("duplex", "on") or "on"
+    image_orientation = task.get("image_orientation", "auto") or "auto"
 
     # 构建与旧格式兼容的响应体（单元素数组）
     item = {
@@ -3205,11 +3579,13 @@ def pull_queued_orders():
         "status": task["status"],
         "created_at": task["created_at"],
         "duplex": duplex,
+        "image_orientation": image_orientation,
         "task_id": task["id"],               # 客户端用 task_id = order_files.id
         "options": {
             "copies": task["copies"],
             "duplex": duplex,
             "page_range": task.get("page_range", "") or "",
+            "image_orientation": image_orientation,
         },
         "delivery_enabled": bool(task.get("delivery_enabled", False)),
         "delivery_location": task.get("delivery_location", "") or "",
@@ -3406,7 +3782,7 @@ def get_order_detail(order_id):
     of_rows = conn.execute(
         """SELECT of.id, of.file_id, of.file_name, of.copies, of.page_count,
                   of.page_range, of.page_range_original, of.page_range_truncated,
-                  of.total_price, of.is_free, of.status, of.duplex
+                  of.total_price, of.is_free, of.status, of.duplex, of.image_orientation
            FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
         (order_id,),
     ).fetchall()
@@ -3727,17 +4103,22 @@ def abandon_order():
     if not order_id:
         return jsonify({"success": False, "message": "缺少 order_id"}), 400
     conn = get_db()
+    # 放弃非 sent 子任务：queued/printing/accepted/offline_unknown/waiting/downloading 常规状态，
+    # 以及 failed（任务可能已被自动超时判败，但用户显式放弃应覆盖为 abandoned）；
+    # 仅 sent（已打印完成）不触碰——避免误伤已完成打印的订单
     conn.execute(
-        "UPDATE order_files SET status = 'abandoned' WHERE order_id = ? AND status = 'accepted'",
-        (order_id,),
-    )
-    conn.execute(
-        "UPDATE orders SET status = 'abandoned' WHERE id = ?",
+        "UPDATE order_files SET status = 'abandoned' WHERE order_id = ?"
+        " AND status IN ('queued', 'printing', 'accepted', 'offline_unknown',"
+        "                'waiting', 'downloading', 'failed')",
         (order_id,),
     )
     conn.commit()
+    # 用聚合状态重算父订单（而非无条件覆盖为 abandoned）：
+    # 全部子任务 sent → 父订单保持 sent；被放弃的文件 → 父订单变为 abandoned
+    refresh_order_status(conn, order_id)
+    conn.commit()
     conn.close()
-    print(f"  [ABANDON] 订单 #{order_id} 已被放弃打印")
+    print(f"  [ABANDON] 订单 #{order_id} 放弃完成（非终态子任务→abandoned，父订单按聚合重算）")
     return jsonify({"success": True, "message": "订单已标记为放弃打印"})
 
 
@@ -4208,8 +4589,8 @@ def license_redeem():
     - temp 类型: 设置 users.temp_until = expires_at（临时打印权限）
     - admin 类型: 设置 users.role = 'admin'（永久管理员）
     """
-    # 限速（P1-6）：每用户每分钟最多 10 次兑换尝试（单 worker 内存计数，nginx 层应再加 IP 限速）
-    if not _rate_limit(f"license_redeem:{g.openid}", 10, 60):
+    # 限速（P1-6 / 防滥用）：每用户每分钟兑换次数上限（管理员可调，单 worker 内存计数）
+    if not _rate_limit(f"license_redeem:{g.openid}", _SECURITY["redeem_rate_limit"], 60):
         return jsonify({"success": False, "message": "兑换过于频繁，请稍后再试"}), 429
 
     data = request.get_json() or {}
@@ -4671,7 +5052,7 @@ def admin_storage():
                 continue
             for fname in files:
                 # 跳过配置文件
-                if fname in ("md5_index.json", "retention_config.json"):
+                if fname in ("md5_index.json", "retention_config.json", "security_config.json"):
                     continue
                 fpath = os.path.join(root, fname)
                 try:
@@ -4752,7 +5133,7 @@ def admin_storage():
             continue
         for fname in files:
             # 跳过配置文件
-            if fname in ("md5_index.json", "retention_config.json", "order_counter.json"):
+            if fname in ("md5_index.json", "retention_config.json", "order_counter.json", "security_config.json"):
                 continue
             fpath = os.path.join(root, fname)
             try:
@@ -4772,6 +5153,36 @@ def admin_storage():
         "retention_days": cfg["days"],
         "retention_hours": cfg["hours"],
     })
+
+
+@app.route("/api/admin/security", methods=["GET", "POST"])
+@login_required
+def admin_security():
+    """超管/管理员查看、调整防滥用（DDoS 防护）阈值。
+    与 /api/admin/storage 同款模式：GET 返回当前阈值，POST 校验并保存到 security_config.json，
+    保存后内存副本即时生效（限速/配额/磁盘守卫/排队超时均读取 _SECURITY）。"""
+    if compute_role(g.openid) != "admin":
+        return jsonify({"success": False, "message": "需要管理员权限"}), 403
+
+    if request.method == "POST":
+        data = request.get_json() or {}
+        cfg = dict(_SECURITY)
+        for key, (lo, hi) in SECURITY_RANGES.items():
+            if key not in data or data[key] is None:
+                continue
+            try:
+                v = int(data[key])
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": f"{key} 必须为整数"}), 400
+            if not (lo <= v <= hi):
+                return jsonify({"success": False, "message": f"{key} 范围: {lo}-{hi}"}), 400
+            cfg[key] = v
+        save_security_config(cfg)
+        return jsonify({"success": True, "message": "防滥用阈值已更新"})
+
+    # GET：返回当前阈值
+    cfg = dict(_SECURITY)
+    return jsonify({"success": True, **cfg})
 
 
 # ==================== 统计与报表接口 ====================
@@ -4948,7 +5359,7 @@ def admin_statistics_revenue():
         of_placeholders = ",".join("?" for _ in order_ids)
         of_rows = conn.execute(
             f"""SELECT id, order_id, file_name, copies, page_count, duplex,
-                       page_range, total_price, status, created_at
+                       page_range, total_price, status, created_at, image_orientation
                 FROM order_files
                 WHERE order_id IN ({of_placeholders})
                 ORDER BY order_id, id""",
@@ -4965,6 +5376,7 @@ def admin_statistics_revenue():
                 "page_count": of_row["page_count"] or 0,
                 "duplex": of_row["duplex"] or "on",
                 "page_range": of_row["page_range"] or "",
+                "image_orientation": of_row["image_orientation"] or "auto",
                 "total_price": round(of_row["total_price"] or 0.0, 2),
                 "status": of_row["status"],
                 "created_at": of_row["created_at"],
@@ -5185,9 +5597,9 @@ def log_report():
     if not authorized:
         return jsonify({"success": False, "message": "未授权"}), 403
 
-    # 限速（P1-6）：每 IP 每分钟最多 30 条（单 worker 内存计数，nginx 层应再加 IP 限速）
+    # 限速（P1-6 / 防滥用）：每 IP 每分钟日志上报条数上限（管理员可调，单 worker 内存计数）
     ip = request.remote_addr or "unknown"
-    if not _rate_limit(f"log_report:{ip}", 30, 60):
+    if not _rate_limit(f"log_report:{ip}", _SECURITY["log_report_rate_limit"], 60):
         return jsonify({"success": False, "message": "请求过于频繁"}), 429
 
     data = request.get_json(silent=True) or {}
@@ -5245,6 +5657,7 @@ if __name__ == "__main__":
     scheduler.add_job(recover_orphaned_printing_tasks, "interval", minutes=2, id="recover_orphans")
     scheduler.add_job(recover_stale_downloading, "interval", minutes=2, id="recover_stale_downloads")
     scheduler.add_job(cleanup_abandoned_reserved_orders, "interval", minutes=5, id="cleanup_reserved")
+    scheduler.add_job(expire_stale_queued_orders, "interval", minutes=10, id="expire_stale_queued")
     scheduler.start()
     print("定时扫描已启动（任务扫描每 30s，预约扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
 

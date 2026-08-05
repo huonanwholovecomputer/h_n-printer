@@ -17,20 +17,20 @@
       <view class="container">
 
         <!-- Logo + Status -->
-        <view class="header-area" style="padding-top: {{logoPadding}}rpx; padding-bottom: {{logoPadding}}rpx;">
+        <view class="header-area {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="padding-top: {{logoPadding}}rpx; padding-bottom: {{logoPadding}}rpx; animation-delay: 0.5s;">
           <view class="logo-wrap" style="transform: scale({{logoScale}}); transform-origin: center top;">
             <image class="logo" src="/images/HN_print.png" mode="widthFix" style="width: 320rpx;" />
           </view>
         </view>
 
         <!-- Printer Status -->
-        <view class="status-bar {{printerActive ? 'status-active' : 'status-inactive'}} {{pageReady ? 'card-entering' : 'card-preload'}}">
+        <view class="status-bar {{printerActive ? 'status-active' : 'status-inactive'}} {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="animation-delay: 0.6s">
           <view class="status-dot"></view>
           <text class="status-text">{{printerActive ? '打印机在线' : '打印机离线'}}</text>
         </view>
 
         <!-- File List Section -->
-        <view class="card file-section {{pageReady ? 'card-entering' : 'card-preload'}}">
+        <view class="card file-section {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="animation-delay: 0.7s">
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">打印文件</text>
@@ -71,7 +71,7 @@
                 </view>
               </block>
               <block wx:elif="{{item.fileId && item.excelWarning}}">
-                <text class="status-label warn">Excel 不支持自动打印，请联系管理员</text>
+                <text class="status-label warn">该文件类型不支持自动打印，请联系管理员</text>
               </block>
               <block wx:elif="{{item.fileId && item.unsupportedFormat}}">
                 <text class="status-label warn">该文件格式不支持自动打印，请联系管理员</text>
@@ -94,8 +94,8 @@
               </block>
             </view>
 
-            <!-- Per-file controls (uploaded only) -->
-            <view wx:if="{{item.fileId && !item.excelWarning && !item.unsupportedFormat}}" class="file-controls">
+            <!-- Per-file controls（上传中即显示，保证卡片高度按类型恒定；excel/不支持格式无控件区） -->
+            <view wx:if="{{!item.excelWarning && !item.unsupportedFormat}}" class="file-controls">
 
               <!-- Copies stepper -->
               <view class="control-row">
@@ -104,6 +104,17 @@
                   <view class="stepper-btn {{item.copies <= 1 ? 'stepper-disabled' : ''}}" bindtap="onFileCopiesMinus" data-index="{{index}}" hover-class="tap-active">−</view>
                   <input class="stepper-input" type="number" value="{{item.copies}}" disabled />
                   <view class="stepper-btn" bindtap="onFileCopiesPlus" data-index="{{index}}" hover-class="tap-active">+</view>
+                </view>
+              </view>
+
+              <!-- 图片方向（仅图片显示：自动/横向/竖向，对应本地工具三模式渲染） -->
+              <view wx:if="{{item.isImage}}" class="control-row">
+                <text class="control-label">方向</text>
+                <view class="img-ori-toggle">
+                  <view class="img-ori-slider {{item.imageOrientation === 'landscape' ? 'slider-landscape' : ''}} {{item.imageOrientation === 'portrait' ? 'slider-portrait' : ''}}"></view>
+                  <view class="img-ori-opt {{item.imageOrientation === 'auto' || !item.imageOrientation ? 'opt-active' : ''}}" bindtap="onFileImageOrientation" data-index="{{index}}" data-value="auto">自动</view>
+                  <view class="img-ori-opt {{item.imageOrientation === 'landscape' ? 'opt-active' : ''}}" bindtap="onFileImageOrientation" data-index="{{index}}" data-value="landscape">横向</view>
+                  <view class="img-ori-opt {{item.imageOrientation === 'portrait' ? 'opt-active' : ''}}" bindtap="onFileImageOrientation" data-index="{{index}}" data-value="portrait">竖向</view>
                 </view>
               </view>
 
@@ -127,13 +138,13 @@
                 </view>
               </view>
 
-              <!-- Duplex toggle（图片单页渲染，无双面概念 → 隐藏） -->
+              <!-- Duplex toggle（图片单页渲染 → 隐藏；单页文件无法双面 → 固定单面） -->
               <view wx:if="{{!item.isImage}}" class="control-row">
                 <text class="control-label">模式</text>
-                <view class="duplex-toggle">
-                  <view class="duplex-slider {{item.duplex === 'on' ? 'slider-right' : ''}}"></view>
-                  <view class="duplex-opt {{item.duplex === 'off' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="off">单面</view>
-                  <view class="duplex-opt {{item.duplex === 'on' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="on">双面</view>
+                <view class="duplex-toggle {{item.pageCount === 1 ? 'duplex-disabled' : ''}}">
+                  <view class="duplex-slider {{item.duplex === 'on' && item.pageCount !== 1 ? 'slider-right' : ''}}"></view>
+                  <view class="duplex-opt {{item.duplex === 'off' || item.pageCount === 1 ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="off">单面</view>
+                  <view class="duplex-opt {{item.duplex === 'on' && item.pageCount !== 1 ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="on">双面</view>
                 </view>
               </view>
             </view>
@@ -148,7 +159,7 @@
         </view>
 
         <!-- v5: 附加服务参数 -->
-        <view class="card ext-params-card {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.15s">
+        <view class="card ext-params-card {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="animation-delay: 0.8s">
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">附加服务</text>
@@ -213,7 +224,7 @@
         </view>
 
         <!-- 无障碍打印开关（仅管理员可见） -->
-        <view wx:if="{{userRole === 'admin'}}" class="auto-print-switch-row {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.18s">
+        <view wx:if="{{userRole === 'admin'}}" class="auto-print-switch-row {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="animation-delay: 0.9s">
           <view class="auto-print-label">
             <view class="lightning-burst {{autoPrintGlow ? 'striking' : ''}} {{glowPhase === 'fading' ? 'fading' : ''}} {{glowPhase === 'reset' ? 'reset' : ''}} {{autoPrintEnabled ? 'active' : ''}}">
               <canvas type="2d" id="boltCanvas" class="bolt-canvas"></canvas>
@@ -248,21 +259,19 @@
               </view>
             </block>
             <block wx:elif="{{scheduleMode === 'countdown'}}">
-              <!-- 倒计时：分 + 秒 -->
-              <view class="countdown-input-wrap">
-                <input class="countdown-input" type="number" value="{{countdownMin}}" bindinput="onCountdownMinInput" />
-                <text class="countdown-unit">分</text>
+              <!-- 倒计时：分 + 秒（点击弹出数字滚轮，复用"指定时间"同款选择方式） -->
+              <view class="schedule-picker" bindtap="onOpenScheduleCountdownPicker">
+                <view class="schedule-picker-value">{{countdownMin < 10 ? '0' + countdownMin : countdownMin}}<text class="countdown-unit">分</text></view>
               </view>
-              <view class="countdown-input-wrap">
-                <input class="countdown-input" type="number" value="{{countdownSec}}" bindinput="onCountdownSecInput" />
-                <text class="countdown-unit">秒</text>
+              <view class="schedule-picker" bindtap="onOpenScheduleCountdownPicker">
+                <view class="schedule-picker-value">{{countdownSec < 10 ? '0' + countdownSec : countdownSec}}<text class="countdown-unit">秒</text></view>
               </view>
             </block>
           </view>
         </view>
 
         <!-- Submit Button -->
-        <view class="submit-area {{pageReady ? 'card-entering' : 'card-preload'}}" style="animation-delay: 0.2s">
+        <view class="submit-area {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="animation-delay: 1.0s">
           <button class="btn-primary" bindtap="onSubmit" hover-class="tap-active" loading="{{submitting}}" disabled="{{submitting}}">
             提交打印任务
           </button>
@@ -285,6 +294,20 @@
     <view class="modal-buttons">
       <button class="btn-secondary modal-half-btn" bindtap="onCancelForceSubmit" hover-class="tap-active">返回等待</button>
       <button class="btn-primary modal-half-btn" style="background-color: #FF9500;" bindtap="onConfirmForceSubmit" hover-class="tap-active" disabled="{{submitting}}">继续提交</button>
+    </view>
+  </view>
+</view>
+
+<!-- 跳过不支持格式（Excel/PPT/CAD）确认弹窗 -->
+<view wx:if="{{showUnsupportedSkipModal}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}">
+  <view class="modal-sheet" catchtap="noop">
+    <view class="modal-icon-wrap" style="background-color: rgba(255, 149, 0, 0.1); color: #FF9500;">⚠</view>
+    <text class="title-medium" style="margin-bottom: 8rpx;">存在不支持的文件格式</text>
+    <text class="body-small" style="margin-bottom: 6rpx;">任务中存在 {{unsupportedSkipCount}} 个不支持的文件格式（Excel/PPT/CAD），</text>
+    <text class="body-small">提交时将自动跳过，仅打印其余文件。</text>
+    <view class="modal-buttons">
+      <button class="btn-secondary modal-half-btn" bindtap="onCancelSkipUnsupported" hover-class="tap-active">取消</button>
+      <button class="btn-primary modal-half-btn" bindtap="onConfirmSkipUnsupported" hover-class="tap-active" disabled="{{submitting}}">自动跳过并提交</button>
     </view>
   </view>
 </view>
@@ -361,6 +384,34 @@
     <view class="modal-buttons">
       <button class="btn-secondary modal-half-btn" bindtap="onCloseScheduleTimePicker">取消</button>
       <button class="btn-primary modal-half-btn" bindtap="onConfirmScheduleTime">确定</button>
+    </view>
+  </view>
+</view>
+
+<!-- 倒计时选择弹窗（玻璃双列滚轮：分 + 秒，复用指定时间同款滚轮引擎，范围 00-59） -->
+<view wx:if="{{showScheduleCountdownPicker}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" bindtap="onCloseScheduleCountdownPicker">
+  <view class="modal-sheet schedule-modal-sheet" catchtap="noop">
+    <view class="sheet-title">选择倒计时</view>
+    <view class="time-wheel-row">
+      <picker-view class="time-picker-view" value="{{countdownWheelValue}}" immediate-change
+                   mask-class="wheel-mask"
+                   indicator-style="background: rgba(255,149,0,0.10); box-shadow: inset 0 1rpx 0 rgba(255,149,0,0.35), inset 0 -1rpx 0 rgba(255,149,0,0.35); border-radius: 12rpx;"
+                   bindchange="onCountdownWheelChange">
+        <picker-view-column>
+          <view wx:for="{{countdownMinItems}}" wx:key="*this"
+                class="wheel-item {{index === countdownMinWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
+        </picker-view-column>
+        <picker-view-column>
+          <view wx:for="{{countdownSecItems}}" wx:key="*this"
+                class="wheel-item {{index === countdownSecWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
+        </picker-view-column>
+      </picker-view>
+      <text class="wheel-unit" style="left: 40%;">分</text>
+      <text class="wheel-unit" style="left: 90%;">秒</text>
+    </view>
+    <view class="modal-buttons">
+      <button class="btn-secondary modal-half-btn" bindtap="onCloseScheduleCountdownPicker">取消</button>
+      <button class="btn-primary modal-half-btn" bindtap="onConfirmScheduleCountdown">确定</button>
     </view>
   </view>
 </view>

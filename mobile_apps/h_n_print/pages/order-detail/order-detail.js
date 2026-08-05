@@ -181,6 +181,7 @@ Component({
           file_name: f.original_name || f.file_name,
           copies: f.copies,
           duplex: f.duplex || 'on',
+          image_orientation: f.image_orientation || 'auto',
           page_range: f.page_range || '',
           page_count: f.page_count || 0,
           size: f.size || 0,

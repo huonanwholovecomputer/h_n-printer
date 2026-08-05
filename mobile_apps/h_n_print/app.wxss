@@ -148,7 +148,16 @@ page {
 /* Scale-down on press (instant, no delay) */
 .tap-active {
   transform: scale(0.97);
-  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1);
+  /* 按下瞬时缩小（禁用过渡），松手后由各按钮基类的 transform transition 平滑恢复。
+     与 .stepper-hover 同理：避免 setData 重置 hover 状态导致缩小动画播放到一半被中断。 */
+  transition: none;
+}
+
+/* 生成密钥按钮按压缩放（原 wxml hover-class="generate-hover" 指向未定义类，
+   按下无任何反馈；补上与 tap-active 一致的"按下瞬时缩小"行为） */
+.generate-hover {
+  transform: scale(0.97);
+  transition: none;
 }
 
 /* Subtle highlight (for list items) */
@@ -220,20 +229,25 @@ page {
     padding-bottom: 20rpx;
   }
 }
+/* 统一入场：向上淡入（元素从下方滑入 + 淡入） */
 @keyframes cardFadeIn {
   from {
     opacity: 0;
-    transform: translateY(30rpx) scale(0.97);
+    transform: translateY(30rpx);
   }
   to {
     opacity: 1;
-    transform: translateY(0) scale(1);
+    transform: translateY(0);
   }
 }
 .card-entering {
   animation:
     cardExpand 0.35s 0.25s ease-out both,
     cardFadeIn 0.5s 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+/* 页面首次入场：仅向上淡入（去掉 cardExpand 的 max-height 占位展开，避免卡片"下滑"占位动画） */
+.card-entering-fade {
+  animation: cardFadeIn 0.5s 0.25s cubic-bezier(0.22, 0.61, 0.36, 1) both;
 }
 
 /* Card remove — fade out + collapse in one go */
@@ -302,16 +316,15 @@ page {
   padding: 4rpx 14rpx;
   border-radius: 20rpx;
 }
-/* Entrance — appear from nothing（延迟由 JS 层 badgeCount 统一控制） */
+/* Entrance — 向上淡入（与全页入场统一；延迟由 JS 层 badgeCount 控制） */
 .section-header-badge.entering {
-  animation: badgeEnter 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+  animation: badgeEnter 0.3s ease-out both;
   opacity: 0;
-  transform: scale(0);
+  transform: translateY(16rpx);
 }
 @keyframes badgeEnter {
-  0%   { transform: scale(0); opacity: 0; }
-  60%  { transform: scale(1.35); opacity: 1; }
-  100% { transform: scale(1); opacity: 1; }
+  from { opacity: 0; transform: translateY(16rpx); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 /* Bounce — already visible, just pulse */
 .section-header-badge.bouncing {
@@ -362,9 +375,9 @@ page {
     0 4rpx 16rpx rgba(0, 122, 255, 0.28),
     inset 0 2rpx 0 rgba(255, 255, 255, 0.40),
     inset 0 -1rpx 0 rgba(0, 0, 0, 0.08);
-  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
-              box-shadow 0.12s ease,
-              filter 0.12s ease;
+  transition: transform 0.06s cubic-bezier(0.4, 0, 0.2, 1),
+              box-shadow 0.06s ease,
+              filter 0.06s ease;
 }
 .btn-primary:active {
   transform: scale(0.97);
@@ -393,9 +406,9 @@ page {
   box-shadow:
     0 2rpx 8rpx rgba(0, 0, 0, 0.05),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.85);
-  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
-              background-color 0.12s ease,
-              box-shadow 0.12s ease;
+  transition: transform 0.06s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.06s ease,
+              box-shadow 0.06s ease;
 }
 .btn-secondary:active {
   transform: scale(0.97);
@@ -419,8 +432,8 @@ page {
   box-shadow:
     0 2rpx 8rpx rgba(0, 0, 0, 0.05),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.85);
-  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
-              background-color 0.12s ease;
+  transition: transform 0.06s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.06s ease;
 }
 .btn-destructive:active {
   transform: scale(0.97);
@@ -437,8 +450,8 @@ page {
   padding: 10rpx 28rpx;
   border: 1rpx solid rgba(0, 122, 255, 0.12);
   box-shadow: inset 0 1rpx 0 rgba(255, 255, 255, 0.7);
-  transition: transform 0.1s cubic-bezier(0.4, 0, 0.2, 1),
-              background-color 0.1s ease;
+  transition: transform 0.06s cubic-bezier(0.4, 0, 0.2, 1),
+              background-color 0.06s ease;
 }
 .btn-small:active {
   transform: scale(0.95);
@@ -592,7 +605,7 @@ page {
   line-height: 1;
   border: var(--glass-border-dark);
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  transition: transform 0.1s ease, background-color 0.1s ease, box-shadow 0.1s ease;
+  transition: transform 0.06s ease, background-color 0.06s ease, box-shadow 0.06s ease;
 }
 .stepper-btn:active {
   transform: scale(0.93);
@@ -603,6 +616,9 @@ page {
   transform: scale(0.9) !important;
   background: rgba(0, 0, 0, 0.04) !important;
   box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.04) !important;
+  /* 关键：按下时瞬时缩小（禁用过渡），松手后基类 transition 0.06s 平滑恢复。
+     解决"短按缩小动画只走一半就被打断"——缩小永远完整，反馈即时。 */
+  transition: none !important;
 }
 .stepper-btn.stepper-disabled {
   color: var(--gray3);
@@ -903,41 +919,18 @@ page {
 .theme-dark .badge-failed    { background-color: rgba(255, 235, 238, 0.25); }
 .theme-dark .badge-canceled  { background-color: rgba(245, 245, 245, 0.15); }
 
-/* 深色模式：订单/文件状态色（文字+背景，覆盖主标签与 mini 标签）。
-   组合选择器提高特异性，确保压过页面级 .file-status-mini/.status-tag-mini 单条规则。 */
-.theme-dark .status-queued,
-.theme-dark .file-status-mini.status-queued,
-.theme-dark .status-tag-mini.status-queued { background-color: rgba(255, 179, 77, 0.15); color: #FFB74D; }
-.theme-dark .status-printing,
-.theme-dark .file-status-mini.status-printing,
-.theme-dark .status-tag-mini.status-printing { background-color: rgba(100, 181, 246, 0.15); color: #64B5F6; }
-.theme-dark .status-accepted,
-.theme-dark .file-status-mini.status-accepted,
-.theme-dark .status-tag-mini.status-accepted { background-color: rgba(100, 181, 246, 0.15); color: #64B5F6; }
-.theme-dark .status-offline_unknown,
-.theme-dark .file-status-mini.status-offline_unknown,
-.theme-dark .status-tag-mini.status-offline_unknown { background-color: rgba(255, 213, 79, 0.15); color: #FFD54F; }
-.theme-dark .status-sent,
-.theme-dark .file-status-mini.status-sent,
-.theme-dark .status-tag-mini.status-sent { background-color: rgba(129, 199, 132, 0.15); color: #81C784; }
-.theme-dark .status-failed,
-.theme-dark .file-status-mini.status-failed,
-.theme-dark .status-tag-mini.status-failed { background-color: rgba(229, 115, 115, 0.15); color: #E57373; }
-.theme-dark .status-abandoned,
-.theme-dark .file-status-mini.status-abandoned,
-.theme-dark .status-tag-mini.status-abandoned { background-color: rgba(186, 104, 200, 0.15); color: #BA68C8; }
-.theme-dark .status-reserved,
-.theme-dark .file-status-mini.status-reserved,
-.theme-dark .status-tag-mini.status-reserved { background-color: rgba(255, 213, 79, 0.15); color: #FFD54F; }
-.theme-dark .status-rejected,
-.theme-dark .file-status-mini.status-rejected,
-.theme-dark .status-tag-mini.status-rejected { background-color: rgba(255, 179, 77, 0.15); color: #FFB74D; }
-.theme-dark .status-canceled,
-.theme-dark .file-status-mini.status-canceled,
-.theme-dark .status-tag-mini.status-canceled { background-color: rgba(174, 174, 178, 0.15); color: #AEAEB2; }
-.theme-dark .status-delivered,
-.theme-dark .file-status-mini.status-delivered,
-.theme-dark .status-tag-mini.status-delivered { background-color: rgba(129, 199, 132, 0.15); color: #81C784; }
+/* 深色模式：订单状态色（文字+背景） */
+.theme-dark .status-queued { background-color: rgba(255, 179, 77, 0.15); color: #FFB74D; }
+.theme-dark .status-printing { background-color: rgba(100, 181, 246, 0.15); color: #64B5F6; }
+.theme-dark .status-accepted { background-color: rgba(100, 181, 246, 0.15); color: #64B5F6; }
+.theme-dark .status-offline_unknown { background-color: rgba(255, 213, 79, 0.15); color: #FFD54F; }
+.theme-dark .status-sent { background-color: rgba(129, 199, 132, 0.15); color: #81C784; }
+.theme-dark .status-failed { background-color: rgba(229, 115, 115, 0.15); color: #E57373; }
+.theme-dark .status-abandoned { background-color: rgba(186, 104, 200, 0.15); color: #BA68C8; }
+.theme-dark .status-reserved { background-color: rgba(255, 213, 79, 0.15); color: #FFD54F; }
+.theme-dark .status-rejected { background-color: rgba(255, 179, 77, 0.15); color: #FFB74D; }
+.theme-dark .status-canceled { background-color: rgba(174, 174, 178, 0.15); color: #AEAEB2; }
+.theme-dark .status-delivered { background-color: rgba(129, 199, 132, 0.15); color: #81C784; }
 
 /* 深色模式：key drawer locked */
 .theme-dark .key-card-wrap.key-drawer-locked .key-card {
@@ -969,7 +962,9 @@ page {
 }
 
 .theme-dark .page-size-dropdown {
-  background: rgba(44, 44, 46, 0.97);
+  background: rgba(44, 44, 46, 0.72);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
   box-shadow: 0 4rpx 24rpx rgba(0, 0, 0, 0.4), var(--glass-rim);
 }
 

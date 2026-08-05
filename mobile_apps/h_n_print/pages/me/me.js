@@ -35,6 +35,8 @@ Component({
     ordersTotalPages: 0,
     pageOptions: [10, 20, 50, 100],
     showPageSizePicker: false,
+    pageSizeDropdownLeft: 0,   // 分页下拉 fixed 定位（viewport 坐标）
+    pageSizeDropdownTop: 0,
     statusMap: {
       queued: '排队中',
       printing: '待添加',
@@ -80,6 +82,10 @@ Component({
     retentionHours: 0,
     savingRetention: false,
     deletingAllFiles: false,
+    // 管理员：防滥用（DDoS 防护）阈值
+    securityConfig: null,
+    securityItems: [],
+    savingSecurity: false,
     // 超级管理员：管理员列表
     admins: [],
     adminsLoading: false,
@@ -163,6 +169,7 @@ Component({
           this.loadLicensedUsers()
           this.loadActiveKey(false)
           this.loadStorageStats()
+          this.loadSecurityConfig()
           if (this.data.isSuperAdmin) {
             this.loadAdmins()
           }
@@ -204,16 +211,23 @@ Component({
         this.setData({ pageSlide: animationClass })
       }, 80)  // >2帧，让原生组件（page-meta/navigation-bar）有足够时间完成桥接更新
 
-      this.loadUserRole()
-      this.loadOrders()
-      this.loadProfile()
-      const cachedRole = wx.getStorageSync('userRole')
-      if (cachedRole === 'admin') {
-        this.loadLicensedUsers()
-        this.loadActiveKey()
-        this.loadStorageStats()
-        if (this.data.isSuperAdmin) {
-          this.loadAdmins()
+      // 数据新鲜度守卫：60 秒内切回本页不重复全量拉取（切 tab 反复拉取会触发 Nginx hn_api 限流）。
+      // 入口动画、tab 同步、轮询照常；个别操作（提交/兑换/改配置）后对应处理器会主动刷新。
+      const _now = Date.now()
+      if (!this._lastDataLoad || (_now - this._lastDataLoad) > 60000) {
+        this._lastDataLoad = _now
+        this.loadUserRole()
+        this.loadOrders()
+        this.loadProfile()
+        const cachedRole = wx.getStorageSync('userRole')
+        if (cachedRole === 'admin') {
+          this.loadLicensedUsers()
+          this.loadActiveKey()
+          this.loadStorageStats()
+          this.loadSecurityConfig()
+          if (this.data.isSuperAdmin) {
+            this.loadAdmins()
+          }
         }
       }
       try {
@@ -272,12 +286,12 @@ Component({
       }, 280)
     },
 
-    // 订单状态轮询（静默增量更新，不触发全量渲染）
+    // 订单状态轮询（静默增量更新，不触发全量渲染）；15s 避免高频请求触发 Nginx 限流
     _startOrderPolling() {
       this._stopOrderPolling()
       this._orderPollTimer = setInterval(() => {
         this._pollOrdersSilent()
-      }, 5000)
+      }, 15000)
     },
     _pollOrdersSilent() {
       const token = wx.getStorageSync('token')
@@ -467,6 +481,8 @@ Component({
     onScrollerTouchStart(e) {
       const touches = e.touches || []
       this._points = touches.map((t) => ({ id: t.identifier, y: t.clientY }))
+      // 分页下拉为 fixed 定位，不随内容滚动：开始滚动即收起，避免错位
+      if (this.data.showPageSizePicker) this.setData({ showPageSizePicker: false })
 
       // 新增：方向锁定初始化
       if (touches.length > 0) {
@@ -971,6 +987,7 @@ Component({
             // 管理员加载存储统计 + 开启轮询（loadLicensedUsers 已在 show 中调用）
             if (role === 'admin') {
               this.loadStorageStats()
+              this.loadSecurityConfig()
               this._startKeyPolling()
               if (isSuper) {
                 this.loadAdmins()
@@ -1000,10 +1017,9 @@ Component({
       const v = this.data.licenseMinutes
       if (v > 1) {
         const next = v - 1
-        // 延迟更新避免 setData 重渲染打断 hover 动画
-        setTimeout(() => {
-          this.setData({ licenseMinutes: next, minusDisabled: next <= 1, plusDisabled: next >= 10 })
-        }, 120)
+        // 即时更新（与存储保留/防滥用步进器一致）；licenseMinutes 为平铺字段，
+        // setData 不会重建按钮节点，hover 动画不受影响，无需延迟
+        this.setData({ licenseMinutes: next, minusDisabled: next <= 1, plusDisabled: next >= 10 })
       }
     },
 
@@ -1011,9 +1027,7 @@ Component({
       const v = this.data.licenseMinutes
       if (v < 10) {
         const next = v + 1
-        setTimeout(() => {
-          this.setData({ licenseMinutes: next, minusDisabled: next <= 1, plusDisabled: next >= 10 })
-        }, 120)
+        this.setData({ licenseMinutes: next, minusDisabled: next <= 1, plusDisabled: next >= 10 })
       }
     },
 
@@ -1263,7 +1277,8 @@ Component({
       // 回弹动画结束后移除内联 transition，让 CSS 重新接管主题过渡
       setTimeout(() => {
         if (capturedIdx < this.data.activeKeys.length) {
-          this.setData({ ['activeKeys[' + capturedIdx + '].swipeTransition']: undefined })
+          // 注意：不能用 undefined（微信 setData 警告），用 null（同为假值，wxml 判断不受影响）
+          this.setData({ ['activeKeys[' + capturedIdx + '].swipeTransition']: null })
         }
       }, 300)
       this._swipeHorizontal = false
@@ -1317,9 +1332,12 @@ Component({
           const k2 = that.data.activeKeys[idx]
           if (!k2) return
           const isUsed2 = k2.status !== 'unused'
+          // 第一步：右滑收起删除按钮（0.25s）
           that.setData({
+            ['activeKeys[' + idx + '].swipeTransition']: true,
             ['activeKeys[' + idx + '].swipeX']: 0,
-            ['activeKeys[' + idx + '].exiting']: true,
+            ['activeKeys[' + idx + '].deleteOpacity']: 0,
+            ['activeKeys[' + idx + '].deleteQuickFade']: false,
           })
           request({
             url: CONFIG.BASE_URL + '/api/license/revoke',
@@ -1329,19 +1347,32 @@ Component({
             success: function(res) {
               if (res.data && res.data.success) {
                 wx.showToast({ title: isUsed2 ? '已删除' : '已作废', icon: 'success' })
+                // 第二步：右滑收起完成后播离场收起动画（keySlideOut 0.3s），再移除
                 setTimeout(function() {
-                  var keys = that.data.activeKeys.filter(function(_, i) { return i !== idx })
-                  that.setData({ activeKeys: keys })
-                  if (!keys.length) that._stopCountdown()
-                }, 350)
+                  that.setData({ ['activeKeys[' + idx + '].exiting']: true })
+                  setTimeout(function() {
+                    var keys = that.data.activeKeys.filter(function(_, i) { return i !== idx })
+                    that.setData({ activeKeys: keys })
+                    if (!keys.length) that._stopCountdown()
+                  }, 350)
+                }, 250)
               } else {
                 wx.showToast({ title: res.data.message || '操作失败', icon: 'none' })
-                that.setData({ ['activeKeys[' + idx + '].exiting']: false })
+                // 恢复：回到滑开状态（删除按钮可见，便于重试）
+                that.setData({
+                  ['activeKeys[' + idx + '].exiting']: false,
+                  ['activeKeys[' + idx + '].swipeX']: -that._deleteWidthPx,
+                  ['activeKeys[' + idx + '].deleteOpacity']: 1,
+                })
               }
             },
             fail: function() {
               wx.showToast({ title: '网络错误', icon: 'none' })
-              that.setData({ ['activeKeys[' + idx + '].exiting']: false })
+              that.setData({
+                ['activeKeys[' + idx + '].exiting']: false,
+                ['activeKeys[' + idx + '].swipeX']: -that._deleteWidthPx,
+                ['activeKeys[' + idx + '].deleteOpacity']: 1,
+              })
             }
           })
         }
@@ -1724,6 +1755,103 @@ Component({
       )
     },
 
+    // ---- 防滥用（DDoS 防护）阈值设置 ----
+    loadSecurityConfig() {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/security',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        success: (res) => {
+          if (res.statusCode === 200 && res.data && res.data.success) {
+            this.setData({ securityConfig: res.data })
+            this._syncSecurityItems(res.data)
+          }
+        },
+      })
+    },
+
+    _syncSecurityItems(cfg) {
+      const defs = [
+        { key: 'user_quota_mb', label: '每用户存储配额', unit: 'MB', min: 0, max: 102400, hint: '超限拒绝上传，0=不限' },
+        { key: 'disk_min_free_mb', label: '磁盘最低剩余', unit: 'MB', min: 0, max: 102400, hint: '低于则拒绝上传，0=不检查' },
+        { key: 'queued_timeout_hours', label: '排队订单超时', unit: '小时', min: 0, max: 720, hint: '超时自动取消，0=不过期' },
+        { key: 'upload_rate_limit', label: '上传频率上限', unit: '次/分', min: 1, max: 600, hint: '每用户每分钟' },
+        { key: 'submit_order_rate_limit', label: '提交频率上限', unit: '次/分', min: 1, max: 600, hint: '每用户每分钟' },
+        { key: 'device_login_rate_limit', label: '设备注册上限', unit: '次/时', min: 1, max: 600, hint: '每IP/每设备每小时' },
+        { key: 'redeem_rate_limit', label: '密钥兑换上限', unit: '次/分', min: 1, max: 600, hint: '每用户每分钟' },
+        { key: 'log_report_rate_limit', label: '日志上报上限', unit: '条/分', min: 1, max: 600, hint: '每IP每分钟' },
+      ]
+      this.setData({
+        securityItems: defs.map((d) => ({
+          ...d,
+          value: cfg[d.key] !== undefined && cfg[d.key] !== null ? Number(cfg[d.key]) : 0,
+        })),
+      })
+    },
+
+    _updateSecurityItem(key, fn) {
+      // 路径式 setData（关键修复）：只更新目标项的 value。
+      // 之前整体替换 securityItems 数组 → wx:for 整块重渲染 → 渲染层清掉
+      // 正在按下按钮的 hover 状态，按压缩放动画被重渲染打断（短按看不到缩小）。
+      // 与密钥分钟步进器（onLicenseMinutesMinus 平铺字段 setData）同理，
+      // diff 精确到单项，按钮节点路径不变、不被重建，动画得以正常播放。
+      const idx = this.data.securityItems.findIndex((it) => it.key === key)
+      if (idx < 0) return
+      const item = this.data.securityItems[idx]
+      let v = fn(item.value)
+      if (isNaN(v)) v = item.min
+      v = Math.max(item.min, Math.min(item.max, v))
+      this.setData({ [`securityItems[${idx}].value`]: v })
+    },
+
+    onSecurityMinus(e) {
+      const key = e.currentTarget.dataset.key
+      this._updateSecurityItem(key, (v) => Number(v) - 1)
+    },
+    onSecurityPlus(e) {
+      const key = e.currentTarget.dataset.key
+      this._updateSecurityItem(key, (v) => Number(v) + 1)
+    },
+    onSecurityInput(e) {
+      const key = e.currentTarget.dataset.key
+      this._updateSecurityItem(key, () => parseInt(e.detail.value, 10))
+    },
+
+    onSaveSecurity() {
+      if (this.data.savingSecurity) return   // 防连点
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      const payload = {}
+      for (const it of this.data.securityItems) {
+        payload[it.key] = it.value
+      }
+      this.setData({ savingSecurity: true })
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/security',
+        method: 'POST',
+        header: {
+          'Authorization': 'Bearer ' + token,
+          'content-type': 'application/json',
+        },
+        data: payload,
+        success: (res) => {
+          this.setData({ savingSecurity: false })
+          if (res.data && res.data.success) {
+            wx.showToast({ title: '防滥用阈值已更新', icon: 'success' })
+            this.loadSecurityConfig()
+          } else {
+            wx.showToast({ title: res.data.message || '保存失败', icon: 'none' })
+          }
+        },
+        fail: () => {
+          this.setData({ savingSecurity: false })
+          wx.showToast({ title: '网络错误', icon: 'none' })
+        },
+      })
+    },
+
     // 管理员许可密钥轮询：抽屉打开时每 5 秒刷新状态
     _startKeyPolling() {
       this._stopKeyPolling()
@@ -1733,7 +1861,7 @@ Component({
         if (this.data.isSuperAdmin) {
           this._pollAdminsSilent()
         }
-      }, 5000)
+      }, 15000)
     },
 
     _stopKeyPolling() {
@@ -2018,7 +2146,29 @@ Component({
     },
 
     onToggleOrdersPageSize() {
-      this.setData({ showPageSizePicker: !this.data.showPageSizePicker })
+      if (this.data.showPageSizePicker) {
+        this.setData({ showPageSizePicker: false })
+        return
+      }
+      // 计算选择器在视口中的位置，下拉以 fixed 坐标弹出（page-root 外，逃出变换层）
+      const q = this.createSelectorQuery()
+      q.select('.page-size-selector').boundingClientRect()
+      q.exec((res) => {
+        const rect = res && res[0]
+        if (!rect) {
+          this.setData({ showPageSizePicker: true })
+          return
+        }
+        const winH = (wx.getSystemInfoSync ? wx.getSystemInfoSync().windowHeight : 0) || 600
+        const dropH = 250   // 4 个选项的估算高度
+        const left = rect.left
+        const top = rect.top + rect.height + 3
+        this.setData({
+          pageSizeDropdownLeft: left,
+          pageSizeDropdownTop: (top + dropH > winH) ? Math.max(8, rect.top - dropH - 3) : top,
+          showPageSizePicker: true,
+        })
+      })
     },
 
     onSelectOrdersPageSize(e) {

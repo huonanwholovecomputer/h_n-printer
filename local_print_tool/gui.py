@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QSpinBox,
+    QSizePolicy,
     QPushButton,
     QProgressBar,
     QTextEdit,
@@ -72,7 +73,7 @@ from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, gene
 from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
-from cloud_client import CloudClient, CloudTask
+from cloud_client import CloudClient, CloudTask, pdf_cache_key
 from stats_server import StatsServer
 from offline_sync import OfflineSync
 
@@ -99,6 +100,35 @@ def _disable_combo_wheel(combo: QComboBox) -> None:
             return super().eventFilter(obj, event)
 
     combo.installEventFilter(_WheelBlocker(combo))
+
+
+def _soft_wrap_text(text: str) -> str:
+    """在长 token（路径/文件名）中插入零宽空格(U+200B)，让 QLabel wordWrap 可换行。
+    路径与云端临时文件名常为无空格长串，wordWrap 默认断不开会撑宽整个布局。"""
+    if not text:
+        return text
+    for sep in ("\\", "/", "_", "-"):
+        text = text.replace(sep, sep + "​")
+    return text
+
+
+def _format_engine_label(ext: str) -> str:
+    """返回某文件格式实际使用的 PDF 转换引擎名（参数面板灰色显示用）。"""
+    if ext in (".doc", ".docx"):
+        return "Word"
+    if ext == ".md":
+        return "markdown 库"
+    if ext in (".html", ".htm"):
+        return "wkhtmltopdf"
+    if ext in (".txt", ".csv"):
+        return "reportlab"
+    if ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"):
+        return "图片渲染"
+    if ext in (".xls", ".xlsx"):
+        return "LibreOffice"
+    if ext == ".pdf":
+        return "直接打印"
+    return "—"
 
 
 def _truncate_filename(filename: str, max_width: int = 52) -> str:
@@ -539,6 +569,9 @@ class PrintWorker(QThread):
     job_finished = Signal(int, bool, str)      # (job_index, success, message)
     all_finished = Signal(int, int)            # (success_count, fail_count)
     error_occurred = Signal(str)               # 全局错误
+    # 图片转换后缓存信号：worker 只写 PDF 文件，主线程补索引
+    # (source_md5, cached_path, name, ext, page_count, image_orientation)
+    pdf_cached = Signal(str, str, str, str, int, str)
 
     def __init__(
         self,
@@ -705,9 +738,30 @@ class PrintWorker(QThread):
                     self.log_message.emit(f"  → 使用缓存的 PDF")
                 else:
                     self.log_message.emit(f"  → 正在转换为 PDF...")
-                    temp_pdf = self._converter.convert(job.file_path)
+                    temp_pdf = self._converter.convert(
+                        job.file_path, image_orientation=getattr(job, 'image_orientation', 'auto'))
                     print_path = temp_pdf
                     self.log_message.emit(f"  → 转换完成: {os.path.basename(temp_pdf)}")
+
+                # 1.5 图片转换后写入方向缓存（方案A：同图同方向免重复下载/转换）。
+                # worker 只写 PDF 文件，索引由主线程补（meta 为空时 GUI 缓存命中不采纳）。
+                if temp_pdf and os.path.isfile(temp_pdf) and job.source_md5:
+                    _ext_i = os.path.splitext(job.file_path)[1].lower()
+                    if _ext_i in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"):
+                        try:
+                            _key = pdf_cache_key(job.source_md5, getattr(job, 'image_orientation', 'auto'))
+                            _cdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+                            os.makedirs(_cdir, exist_ok=True)
+                            _dest = os.path.join(_cdir, _key + ".pdf")
+                            if not os.path.exists(_dest):
+                                shutil.copy2(temp_pdf, _dest)
+                            _pg = get_pdf_info(temp_pdf).get("page_count", 0)
+                            self.pdf_cached.emit(
+                                job.source_md5, _dest,
+                                job.display_name or os.path.basename(job.file_path),
+                                _ext_i, _pg, getattr(job, 'image_orientation', 'auto'))
+                        except Exception:
+                            pass
 
                 # 2. 打印 PDF（传入进度回调）
                 self.log_message.emit(
@@ -715,6 +769,15 @@ class PrintWorker(QThread):
                 )
                 dm = job.duplex_mode or self._duplex_mode
                 effective_dpi = job.dpi if job.dpi > 0 else self._render_dpi
+                # 打印方向以实际 PDF 页面为准：图片转换/方向设置后 job.orientation 可能过时
+                # （EXIF 竖拍照片原始像素是横的；image_orientation 显式设置后 job.orientation 仍是旧值）
+                _pdf_ori = ""
+                try:
+                    if print_path and os.path.isfile(print_path):
+                        _pdf_ori = get_pdf_info(print_path).get("orientation", "")
+                except Exception:
+                    _pdf_ori = ""
+                eff_ori = _pdf_ori if _pdf_ori in ("portrait", "landscape") else (job.orientation or "")
                 ok, msg = print_pdf(
                     pdf_path=print_path,
                     printer_name=self._printer_name,
@@ -722,7 +785,7 @@ class PrintWorker(QThread):
                     duplex=job.duplex,
                     duplex_mode=dm,
                     page_range=job.page_range,
-                    orientation=job.orientation,
+                    orientation=eff_ori,
                     progress_callback=_make_progress_callback(offset_sides, total_sides),
                     dpi=effective_dpi,
                 )
@@ -2480,8 +2543,10 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            # 通知后端放弃该标签页中的云端任务 + 本地预留订单
+            # 通知后端放弃该标签页中未打印的云端任务 + 本地预留订单（已完成的跳过）
             for job in jobs:
+                if getattr(job, 'sent', False):
+                    continue
                 if job.order_id > 0 and self._cloud_client:
                     self._cloud_client.abandon_order_to_server(job.order_id)
                 elif job.task_id > 0 and self._cloud_client:
@@ -2511,10 +2576,12 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            # 通知后端放弃所有云端任务 + 本地预留订单
+            # 通知后端放弃所有未打印的云端任务 + 本地预留订单（已完成的跳过）
             all_abandoned = []
             for tab_entry in self._config.tabs.values():
                 for job in (tab_entry.jobs if tab_entry else []):
+                    if getattr(job, 'sent', False):
+                        continue
                     all_abandoned.append(job)
                     if job.order_id > 0 and self._cloud_client:
                         self._cloud_client.abandon_order_to_server(job.order_id)
@@ -2771,6 +2838,13 @@ class MainWindow(QMainWindow):
         job = jobs[row]
         self._sync_edit_enabled(True)
 
+        # 文件类型/页数判定（供下方同步与禁用逻辑共用）
+        ext = os.path.splitext(job.file_path)[1].lower() if job.file_path else ""
+        is_img = ext in self.IMAGE_EXTS
+        is_word = ext in (".doc", ".docx")
+        single_page = (job.page_count or 0) == 1
+        duplex_usable = (not is_img) and (not single_page)
+
         # 同步编辑控件
         self._edit_copies.blockSignals(True)
         self._edit_copies.setValue(job.copies)
@@ -2787,29 +2861,63 @@ class MainWindow(QMainWindow):
         self._edit_page_range.set_total_pages(job.page_count)
         self._edit_page_range.set_ranges(job.page_range)
 
-        eng_map = {"word": 0, "wps": 1, "libreoffice": 2}
-        self._edit_engine.blockSignals(True)
-        self._edit_engine.setCurrentIndex(eng_map.get(job.engine, 0))
-        self._edit_engine.blockSignals(False)
+        # PDF转换引擎：Word 显示可选引擎；其余格式显示实际转换引擎（灰色不可选）
+        if is_word:
+            eng_map = {"word": 0, "wps": 1, "libreoffice": 2}
+            self._edit_engine.blockSignals(True)
+            self._edit_engine.clear()
+            self._edit_engine.addItems(["Word", "WPS", "LibreOffice"])
+            self._edit_engine.setCurrentIndex(eng_map.get(job.engine, 0))
+            self._edit_engine.blockSignals(False)
+        else:
+            self._edit_engine.blockSignals(True)
+            self._edit_engine.clear()
+            self._edit_engine.addItems([_format_engine_label(ext)])
+            self._edit_engine.setCurrentIndex(0)
+            self._edit_engine.blockSignals(False)
 
         dpi_map = {0: 0, 200: 1, 300: 2, 400: 3, 600: 4}
         self._edit_dpi.blockSignals(True)
         self._edit_dpi.setCurrentIndex(dpi_map.get(job.dpi, 0))
         self._edit_dpi.blockSignals(False)
 
-        # 图片：双面/双面模式无意义 → 禁用并固定单面
-        is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
-        self._edit_duplex.setEnabled(not is_img)
-        self._edit_duplex_mode.setEnabled(not is_img)
-        if is_img:
+        # 按文件类型/页数控制参数可用性：
+        # 双面/双面模式 → 仅非图片且非单页可用（图片单页、无双面概念；单页文件无法双面）；
+        # 页码范围 → 仅非图片可用；
+        # PDF转换引擎 → 仅 Word(doc/docx) 可用（其余格式走各自转换路径或直接打印，引擎选择无意义）；
+        # 图片方向 → 仅图片可用
+        duplex_usable = (not is_img) and (not single_page)
+        self._label_duplex.setEnabled(duplex_usable)
+        self._edit_duplex.setEnabled(duplex_usable)
+        self._label_duplex_mode.setEnabled(duplex_usable)
+        self._edit_duplex_mode.setEnabled(duplex_usable)
+        self._label_range.setEnabled(not is_img)
+        self._edit_page_range.setEnabled(not is_img)
+        self._label_engine.setEnabled(is_word)
+        self._edit_engine.setEnabled(is_word)
+        if not duplex_usable:
             self._edit_duplex.blockSignals(True)
             self._edit_duplex.setCurrentIndex(1)  # 单面
             self._edit_duplex.blockSignals(False)
+        if is_img:
+            # 图片页码无意义 → 清空范围输入
+            self._edit_page_range.blockSignals(True)
+            self._edit_page_range.set_ranges("")
+            self._edit_page_range.blockSignals(False)
 
-        # 更新选中文件标签
+        # 图片方向（仅图片可用）：auto=自动 / landscape=横向 / portrait=竖向
+        img_ori_map = {"auto": 0, "landscape": 1, "portrait": 2}
+        self._edit_img_orientation.blockSignals(True)
+        self._edit_img_orientation.setCurrentIndex(img_ori_map.get(getattr(job, 'image_orientation', 'auto'), 0))
+        self._edit_img_orientation.blockSignals(False)
+        self._edit_img_orientation.setEnabled(is_img)
+        self._label_img_orientation.setEnabled(is_img)
+
+        # 更新选中文件标签（云端任务显示原始文件名；路径软换行避免长临时路径撑宽面板）
+        shown_name = job.display_name or os.path.basename(job.file_path)
         self._selected_file_label.setText(
-            f"📄 {os.path.basename(job.file_path)}\n"
-            f"路径: {job.file_path}"
+            f"📄 {_soft_wrap_text(shown_name)}\n"
+            f"路径: {_soft_wrap_text(job.file_path)}"
         )
 
     def _sync_edit_enabled(self, enabled: bool):
@@ -2837,13 +2945,22 @@ class MainWindow(QMainWindow):
 
         # 读取编辑控件值
         job.copies = self._edit_copies.value()
-        # 图片：双面无意义，固定单面（避免被禁用的双面控件残留值误写）
+        # 图片/单页文件：双面无意义，固定单面（避免被禁用的双面控件残留值误写）
         is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
-        if is_img:
+        single_page = (job.page_count or 0) == 1
+        if is_img or single_page:
             job.duplex = "off"
         else:
             job.duplex = "on" if self._edit_duplex.currentIndex() == 0 else "off"
             job.duplex_mode = "short-edge" if self._edit_duplex_mode.currentIndex() == 1 else "long-edge"
+
+        # 图片方向（仅图片可用）：方向变化后清掉已转换的缓存 PDF，打印时按新方向重渲染
+        if is_img:
+            new_ori = {0: "auto", 1: "landscape", 2: "portrait"}.get(
+                self._edit_img_orientation.currentIndex(), "auto")
+            if new_ori != getattr(job, 'image_orientation', 'auto'):
+                job.image_orientation = new_ori
+                job.cached_pdf = ""   # 旧方向 PDF 失效
 
         # 页码范围（RangeListWidget 仅校验通过才发 rangesChanged；
         # 此处再校验一次，非法输入时不写入，保留原值，避免被其他控件联动覆盖）
@@ -2854,9 +2971,11 @@ class MainWindow(QMainWindow):
             )
             job.page_range = ranges_str
 
-        # 引擎
-        eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
-        job.engine = eng_map.get(self._edit_engine.currentIndex(), "word")
+        # 引擎（仅 Word 文件有意义；其余格式引擎显示为转换方式，不写回 job.engine）
+        is_word = os.path.splitext(job.file_path)[1].lower() in (".doc", ".docx") if job.file_path else False
+        if is_word:
+            eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
+            job.engine = eng_map.get(self._edit_engine.currentIndex(), "word")
 
         # DPI
         dpi_map = {0: 0, 1: 200, 2: 300, 3: 400, 4: 600}
@@ -2931,8 +3050,8 @@ class MainWindow(QMainWindow):
         gl.addWidget(self._edit_copies)
 
         # 双面
-        label_duplex = QLabel("单/双面:")
-        gl.addWidget(label_duplex)
+        self._label_duplex = QLabel("单/双面:")
+        gl.addWidget(self._label_duplex)
         self._edit_duplex = QComboBox()
         self._edit_duplex.addItems(["双面打印", "单面打印"])
         _disable_combo_wheel(self._edit_duplex)
@@ -2940,8 +3059,8 @@ class MainWindow(QMainWindow):
         gl.addWidget(self._edit_duplex)
 
         # 双面模式（仅双面时可用）
-        label_duplex_mode = QLabel("双面模式:")
-        gl.addWidget(label_duplex_mode)
+        self._label_duplex_mode = QLabel("双面模式:")
+        gl.addWidget(self._label_duplex_mode)
         self._edit_duplex_mode = QComboBox()
         self._edit_duplex_mode.addItems(["长边翻转", "短边翻转"])
         _disable_combo_wheel(self._edit_duplex_mode)
@@ -2949,8 +3068,8 @@ class MainWindow(QMainWindow):
         gl.addWidget(self._edit_duplex_mode)
 
         # 页码范围
-        label_range = QLabel("页码范围:")
-        gl.addWidget(label_range)
+        self._label_range = QLabel("页码范围:")
+        gl.addWidget(self._label_range)
         self._edit_page_range = RangeListWidget()
         self._edit_page_range.rangesChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_page_range)
@@ -2975,16 +3094,26 @@ class MainWindow(QMainWindow):
         self._edit_dpi.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_dpi)
 
+        # 图片方向（仅图片文件可用）：auto=自动 / landscape=横向 / portrait=竖向
+        self._label_img_orientation = QLabel("图片方向:")
+        gl.addWidget(self._label_img_orientation)
+        self._edit_img_orientation = QComboBox()
+        self._edit_img_orientation.addItems(["自动方向", "横向", "竖向"])
+        _disable_combo_wheel(self._edit_img_orientation)
+        self._edit_img_orientation.currentIndexChanged.connect(self._auto_apply_edit)
+        gl.addWidget(self._edit_img_orientation)
+
         gl.addStretch()
 
         # 统一管理：无选中任务时全部禁用
         self._edit_widgets = [
             label_copies, self._edit_copies,
-            label_duplex, self._edit_duplex,
-            label_duplex_mode, self._edit_duplex_mode,
-            label_range, self._edit_page_range,
+            self._label_duplex, self._edit_duplex,
+            self._label_duplex_mode, self._edit_duplex_mode,
+            self._label_range, self._edit_page_range,
             self._label_engine, self._edit_engine,
             label_dpi, self._edit_dpi,
+            self._label_img_orientation, self._edit_img_orientation,
         ]
         for w in self._edit_widgets:
             w.setEnabled(False)
@@ -2995,6 +3124,8 @@ class MainWindow(QMainWindow):
         self._selected_file_label = QLabel("(未选中任务)")
         self._selected_file_label.setObjectName("selectedFileLabel")
         self._selected_file_label.setWordWrap(True)
+        # 水平尺寸策略 Ignored：不因内容（长路径）撑宽右侧面板，宽度由布局/视口决定
+        self._selected_file_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         scroll_layout.addWidget(self._selected_file_label)
 
         scroll_layout.addStretch()
@@ -3315,9 +3446,12 @@ class MainWindow(QMainWindow):
         """
         # 计算源文件 MD5 并检查 PDF 缓存
         source_md5 = ""
+        image_orientation = "auto"
         jobs = self._get_current_jobs()
         if row < len(jobs) and jobs[row].source_md5 and jobs[row].file_path == file_path:
             source_md5 = jobs[row].source_md5
+        if row < len(jobs) and jobs[row].file_path == file_path:
+            image_orientation = getattr(jobs[row], 'image_orientation', 'auto')
         if not source_md5 and os.path.isfile(file_path):
             try:
                 if self._cloud_client:
@@ -3331,14 +3465,14 @@ class MainWindow(QMainWindow):
                     source_md5 = m.hexdigest()
             except Exception:
                 source_md5 = ""
-        # 检查本地 PDF 缓存
+        # 检查本地 PDF 缓存（图片按方向后缀分开）
         if source_md5:
             if self._cloud_client:
-                cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(source_md5)
+                cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(source_md5, image_orientation)
             else:
                 # 离线：直接检查 pdf_cache 目录
                 cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
-                cached_pdf = os.path.join(cache_dir, f"{source_md5}.pdf")
+                cached_pdf = os.path.join(cache_dir, pdf_cache_key(source_md5, image_orientation) + ".pdf")
                 cached_meta = {}
                 if not os.path.isfile(cached_pdf):
                     cached_pdf = None
@@ -3585,7 +3719,7 @@ class MainWindow(QMainWindow):
 
     def _can_paste_files(self) -> bool:
         """检查剪贴板是否包含可粘贴的文件。"""
-        allowed = {".pdf", ".doc", ".docx", ".txt", ".md", ".html", ".htm",
+        allowed = {".pdf", ".doc", ".docx", ".txt", ".md",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         # 1. 来自文件管理器的 URL 列表
         mime = QApplication.clipboard().mimeData()
@@ -3608,7 +3742,7 @@ class MainWindow(QMainWindow):
 
     def _on_paste_files(self):
         """从剪贴板粘贴文件，支持文件管理器复制和纯文本路径。"""
-        allowed = {".pdf", ".doc", ".docx", ".txt", ".md", ".html", ".htm",
+        allowed = {".pdf", ".doc", ".docx", ".txt", ".md",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         files: list[str] = []
 
@@ -3639,7 +3773,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "粘贴", "剪贴板中没有可识别的文件。\n\n"
                                     "请先在文件管理器中复制文件(Ctrl+C)，再来粘贴。\n"
                                     "支持格式: PDF, Word(.doc/.docx), "
-                                    "文本(.txt/.md/.html), 图片(.jpg/.png/.bmp等)")
+                                    "文本(.txt/.md), 图片(.jpg/.png/.bmp等)")
 
     def _on_manage_locations(self):
         """打开地点管理对话框。"""
@@ -3668,7 +3802,7 @@ class MainWindow(QMainWindow):
     def _on_add_files(self):
         """通过文件对话框添加文件。"""
         file_filter = (
-            "所有支持格式 (*.pdf *.doc *.docx *.txt *.md *.html *.htm"
+            "所有支持格式 (*.pdf *.doc *.docx *.txt *.md"
             " *.jpg *.jpeg *.png *.bmp *.gif *.webp);;"
             "PDF (*.pdf);;"
             "Word 文档 (*.doc *.docx);;"
@@ -3730,9 +3864,22 @@ class MainWindow(QMainWindow):
         if self._can_paste_files():
             self._on_paste_files()
 
+    def _abandon_jobs(self, jobs):
+        """通知后端放弃未打印的云端任务（已完成的跳过）。"""
+        if not self._cloud_client:
+            return
+        for job in jobs:
+            if getattr(job, 'sent', False):
+                continue
+            if job.order_id > 0:
+                self._cloud_client.abandon_order_to_server(job.order_id)
+            elif job.task_id > 0:
+                self._cloud_client.abandon_order_to_server(job.task_id)
+
     def _on_undo_expired(self):
-        """撤回超时，清除当前标签页的备份。"""
-        self._cleared_jobs_backup.pop(self._current_tab, None)
+        """撤回超时 → 确认清空，通知后端放弃被清空的云端任务。"""
+        jobs = self._cleared_jobs_backup.pop(self._current_tab, [])
+        self._abandon_jobs(jobs)
         self._restore_clear_button()
 
     def _restore_clear_button(self):
@@ -3744,10 +3891,11 @@ class MainWindow(QMainWindow):
         self._btn_clear.style().polish(self._btn_clear)
 
     def _cancel_undo_if_active(self):
-        """新增任务时取消撤回状态，丢弃备份。"""
+        """新增任务时取消撤回状态 → 确认清空，通知后端放弃被清空的云端任务。"""
         if self._clear_undo_timer.isActive():
             self._clear_undo_timer.stop()
-        self._cleared_jobs_backup.pop(self._current_tab, None)
+        jobs = self._cleared_jobs_backup.pop(self._current_tab, [])
+        self._abandon_jobs(jobs)
         self._restore_clear_button()
 
     def _on_progress(self, current: int, total: int, status: str):
@@ -3756,15 +3904,35 @@ class MainWindow(QMainWindow):
         self._progress_bar.setValue(current)
         self._status_label.setText(status)
 
+    def _on_pdf_cached(self, md5: str, cached_path: str, name: str, ext: str, page_count: int, orientation: str):
+        """打印转换后的图片 PDF 补写缓存索引（文件已由 worker 写入，这里只补 meta，供后续缓存命中）。"""
+        if not self._cloud_client:
+            return
+        try:
+            # cached_path 即目标缓存文件路径，_save_pdf_to_cache 内 samefile 命中 → 跳过复制、只写索引
+            self._cloud_client._save_pdf_to_cache(md5, cached_path, name, ext, page_count, orientation)
+        except Exception as e:
+            self._log(f"  → 图片 PDF 缓存索引写入失败: {e}")
+
     def _on_job_finished(self, idx: int, success: bool, message: str):
-        """单个任务完成回调：上报云端（新 UI 无表格行操作）。"""
+        """单个任务完成回调：上报云端 + 标记完成（新 UI 无表格行操作）。"""
         flat_jobs = getattr(self, '_flat_jobs', [])
         if 0 <= idx < len(flat_jobs):
             job = flat_jobs[idx]
             task_id = getattr(job, 'task_id', 0)
+            if success:
+                # 打印成功 → 标记已完成并立即持久化，异常退出重载后仍保留，退出时不再放弃
+                job.sent = True
+                self._save_config()
             if task_id and self._cloud_client:
                 if success:
-                    self._cloud_client.report_success(task_id)
+                    # 上报实际打印配置（本地可能修改过份数/双面/范围/页数），后端同步 order_files
+                    self._cloud_client.report_success(task_id, {
+                        "copies": job.copies,
+                        "duplex": job.duplex,
+                        "page_range": job.page_range or "",
+                        "page_count": job.page_count or 0,
+                    })
                 else:
                     self._cloud_client.report_fail(task_id, message)
 
@@ -3977,6 +4145,7 @@ class MainWindow(QMainWindow):
         worker.log_message.connect(self._log)
         worker.job_finished.connect(self._on_job_finished)
         worker.all_finished.connect(self._on_all_finished)
+        worker.pdf_cached.connect(self._on_pdf_cached)
         self._worker = worker
         worker.start()
         return True
@@ -3999,7 +4168,7 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"🔒 全部 {total} 个任务打印成功！标签页已锁定。")
 
-        # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单
+        # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单（只打未完成的，已打的不重打）
         if self._auto_print_retry:
             item = self._auto_print_retry.pop(0)
             tab_key = item.get("tab_key", "")
@@ -4009,8 +4178,12 @@ class MainWindow(QMainWindow):
                 self._config.active_tab = tab_key
                 self._rebuild_table()
                 self._refresh_tab_display()
-                self._log(f"⚡ 打印机空闲，补打订单 #{order_id}（标签页 {tab_key}）")
-                self._start_print_worker(list(self._config.tabs[tab_key].jobs))
+                pending = [j for j in self._config.tabs[tab_key].jobs if not getattr(j, 'sent', False)]
+                if pending:
+                    self._log(f"⚡ 打印机空闲，补打订单 #{order_id}（标签页 {tab_key}，{len(pending)} 个未打印文件）")
+                    self._start_print_worker(pending)
+                else:
+                    self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key} 已全部打印完成，跳过补打")
             else:
                 self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key} 已无文件，跳过补打")
 
@@ -4375,8 +4548,9 @@ class MainWindow(QMainWindow):
         if ready_tasks[0].order_id and self._cloud_client:
             self._cloud_client.accept_order_to_server(ready_tasks[0].order_id)
 
-        # 自动开始打印（打印机忙时不静默丢弃 → 入重试队列，打印完成后自动补打）
-        jobs = self._get_current_jobs()
+        # 自动开始打印（打印机忙时不静默丢弃 → 入重试队列，打印完成后自动补打）。
+        # 只打印未完成（sent=False）的 job：追加到已有标签页时，已打印过的文件不重打
+        jobs = [j for j in self._get_current_jobs() if not getattr(j, 'sent', False)]
         if jobs:
             self._log(f"⚡ 自动开始打印标签页 {self._current_tab}（{len(jobs)} 个文件）")
             if not self._start_print_worker(list(jobs)):
@@ -4807,10 +4981,13 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 event.ignore()
                 return
-            # 用户确认退出 → 通知后端放弃已接受的云端任务 + 本地预留订单，然后清空
+            # 用户确认退出 → 通知后端放弃未打印的云端任务 + 本地预留订单，然后清空
+            # （已打印完成的 job 跳过，避免误放弃已完成订单）
             all_abandoned = []
             for key, tab in self._config.tabs.items():
                 for job in tab.jobs:
+                    if getattr(job, 'sent', False):
+                        continue  # 已打印完成，不放弃
                     all_abandoned.append(job)
                     if job.order_id > 0 and self._cloud_client:
                         self._cloud_client.abandon_order_to_server(job.order_id)
@@ -4820,6 +4997,16 @@ class MainWindow(QMainWindow):
                         # 本地预留订单（仅获取了订单号但未提交打印）→ 标记为放弃，并补记价格
                         price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
                         self._cloud_client.abandon_reserved_order(job.order_number, price)
+            # 已清空但撤回窗口未过的备份任务同样放弃（用户确认退出=确认清空）
+            for backup_jobs in self._cleared_jobs_backup.values():
+                for job in backup_jobs:
+                    if getattr(job, 'sent', False):
+                        continue
+                    all_abandoned.append(job)
+                    if job.order_id > 0 and self._cloud_client:
+                        self._cloud_client.abandon_order_to_server(job.order_id)
+                    elif job.task_id > 0 and self._cloud_client:
+                        self._cloud_client.abandon_order_to_server(job.task_id)
             self._config.tabs = {"1": TabSettings()}
             self._config.active_tab = "1"
             self._current_tab = "1"
@@ -4954,6 +5141,7 @@ class MainWindow(QMainWindow):
                             job.display_name or os.path.basename(job.file_path),
                             os.path.splitext(job.file_path)[1].lower(),
                             page_count,
+                            getattr(job, 'image_orientation', 'auto'),
                         )
                     except Exception as e:
                         self._log(f"  → MD5 缓存保存失败: {e}")
@@ -4993,14 +5181,35 @@ class MainWindow(QMainWindow):
                 self._log(f"  → 保存转换副本到桌面失败: {e}")
 
     def _add_cloud_tasks_to_new_tab(self, tasks: list):
-        """将同一订单的多个云端任务添加到同一个新标签页。"""
+        """将同一订单的多个云端任务添加到同一个新标签页，全部加入后再刷新显示。"""
         if not tasks:
             return
         for task in tasks:
             self._add_cloud_task_to_new_tab(task, is_first=(task == tasks[0]))
+        # 全部任务加入后再刷新表格/显示（而非只对第一个刷新）→ 确保所有文件可见
+        self._save_config()
+        self._rebuild_table()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+
+    def _find_tab_for_order(self, order_id) -> str | None:
+        """查找已包含指定云端订单任务的标签页 key；无则返回 None。
+        用于多文件订单：即使文件下载完成时间分散（超过防抖窗口），也追加到同一标签页。"""
+        if not order_id:
+            return None
+        for key, tab in self._config.tabs.items():
+            if any(getattr(j, 'order_id', 0) == order_id for j in tab.jobs):
+                return key
+        return None
 
     def _add_cloud_task_to_new_tab(self, task: CloudTask, is_first: bool = True):
-        """将云端任务添加到新的标签页并切换过去。is_first=False 时追加到当前标签页。"""
+        """将云端任务添加到标签页并切换过去。同一订单已有标签页 → 追加到该标签页（一个订单一个标签页）。"""
+        # 同一订单已有标签页 → 追加到它，而不是新建（防下载完成时间分散导致拆成多个标签页）
+        existing_key = self._find_tab_for_order(task.order_id)
+        if existing_key is not None:
+            self._current_tab = existing_key
+            self._config.active_tab = existing_key
+            is_first = False
         if is_first:
             tab_keys = self._sorted_tab_keys(self._config.tabs)
             last_num = self._safe_int_key(tab_keys[-1]) if tab_keys else 0
@@ -5027,9 +5236,10 @@ class MainWindow(QMainWindow):
         page_count = 0; orientation = ""; cached_pdf = ""
         need_convert = False
 
-        # 1. 检查 PDF 缓存（MD5 索引）
+        # 1. 检查 PDF 缓存（MD5 索引，图片按方向后缀分开）
         if source_md5 and self._cloud_client:
-            cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(source_md5)
+            cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
+                source_md5, getattr(task, 'image_orientation', 'auto'))
             if cached_pdf and cached_meta:
                 page_count = cached_meta.get("page_count", 0)
                 orientation = ""  # 缓存里可能没有 orientation，从 PDF 读取
@@ -5070,6 +5280,7 @@ class MainWindow(QMainWindow):
             page_range=task.page_range or "",
             page_count=page_count,
             orientation=orientation,
+            image_orientation=getattr(task, 'image_orientation', 'auto'),
             engine=engine,
             task_id=task.task_id,
             order_id=task.order_id or 0,
@@ -5090,12 +5301,6 @@ class MainWindow(QMainWindow):
         if self._cloud_client:
             self._cloud_client.accept_task(task.task_id)
 
-        if is_first:
-            self._save_config()
-            self._rebuild_table()
-            self._refresh_tab_display()
-            self._sync_edit_enabled(False)
-
     # ──────── 清空 / 撤回 / 移除 / 打印 ────────
 
     def _on_clear_list(self):
@@ -5113,12 +5318,8 @@ class MainWindow(QMainWindow):
         if not jobs:
             return
         self._cancel_all_convert_workers()
-        # 通知后端放弃已接受的云端任务
-        for job in jobs:
-            if job.order_id > 0 and self._cloud_client:
-                self._cloud_client.abandon_order_to_server(job.order_id)
-            elif job.task_id > 0 and self._cloud_client:
-                self._cloud_client.abandon_order_to_server(job.task_id)
+        # 不立即通知后端放弃：等撤回窗口(5s)过期或确认后才放弃，
+        # 避免用户在 5 秒内点"撤回"后订单已被后端标记为放弃
         self._cleared_jobs_backup[self._current_tab] = list(jobs)
         self._set_current_jobs([])
         # 预约单指向该标签页 → 联动清理状态机（防到点打印空标签页/假打印）
@@ -5157,10 +5358,12 @@ class MainWindow(QMainWindow):
         if not rows:
             return
         jobs = self._get_current_jobs()
-        # 通知后端放弃被移除的云端任务
+        # 通知后端放弃被移除的云端任务（已完成的跳过）
         for row in rows:
             if row < len(jobs):
                 job = jobs[row]
+                if getattr(job, 'sent', False):
+                    continue
                 if job.order_id > 0 and self._cloud_client:
                     self._cloud_client.abandon_order_to_server(job.order_id)
                 elif job.task_id > 0 and self._cloud_client:
@@ -5198,9 +5401,10 @@ class MainWindow(QMainWindow):
 
     def __add_files_to_table_impl(self, files, target_order_key=None):
         """添加文件到当前标签页的核心逻辑。"""
+        # HTML/HTM 已移除；表格(xls/xlsx)在前端标记为不支持类型，不再本地打印
         allowed_types = {
-            ".pdf", ".doc", ".docx", ".xls", ".xlsx",
-            ".txt", ".md", ".html", ".htm",
+            ".pdf", ".doc", ".docx",
+            ".txt", ".md",
             ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
         }
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}

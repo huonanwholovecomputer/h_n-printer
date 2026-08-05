@@ -50,13 +50,17 @@
   from { opacity: 0; transform: translateX(-260rpx); }
   to   { opacity: 1; transform: translateX(0); }
 }
-/* 首次加载淡入 */
+/* 首次加载：页面容器淡入（仅透明度，垂直移动由各元素"向上淡入"负责，避免双重位移） */
 .page-fade-in {
   animation: fadeIn 0.3s 0.08s ease both;
 }
 @keyframes fadeIn {
   from { opacity: 0; }
   to   { opacity: 1; }
+}
+/* 首次加载：延迟 0.5s 再播放入场动画，为界面加载预留时间，保证动画完整播放 */
+.page-fade-in.page-fade-in-delayed {
+  animation-delay: 0.5s;
 }
 
 /* 退出动画：左滑淡出 */
@@ -108,9 +112,9 @@
   width: 320rpx;
 }
 
-/* ── Entrance: non-list section (downward fade-in, no expand) ── */
+/* ── Entrance: non-list section (upward fade-in, no expand) ── */
 @keyframes sectionSlideIn {
-  from { opacity: 0; transform: translateY(-24rpx); }
+  from { opacity: 0; transform: translateY(24rpx); }
   to   { opacity: 1; transform: translateY(0); }
 }
 .section-entering {
@@ -162,7 +166,7 @@
   margin-bottom: 20rpx;
 }
 
-/* 文件卡片列表：显式高度驱动（index.js 按内容估算设置 fileListHeight，上限 ≈ 75vh / 3 个卡片）。
+/* 文件卡片列表：显式高度驱动（index.js 按每文件类型实测常量累加设置 fileListHeight，上限 ≈ 85vh / 3~4 个卡片）。
    scroll-view 需要显式高度才能真正裁剪溢出卡片并内部滚动；仅 max-height 在微信中会把溢出卡片
    画到下方元素上，导致与“添加文件”按钮重叠。 */
 .file-list-scroll {
@@ -468,6 +472,68 @@
   font-weight: 600;
 }
 
+/* 单页文件固定单面：整体灰化、禁点 */
+.duplex-toggle.duplex-disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+/* ── 图片方向三段开关（自动/横向/竖向，对应本地工具三模式渲染）── */
+.img-ori-toggle {
+  flex: 1;
+  position: relative;
+  display: flex;
+  border-radius: 14rpx;
+  overflow: hidden;
+  background-color: rgba(60, 60, 67, 0.08);
+  height: 56rpx;
+}
+
+.img-ori-slider {
+  position: absolute;
+  top: 3rpx;
+  left: 3rpx;
+  width: calc(33.33% - 3rpx);
+  height: calc(100% - 6rpx);
+  border-radius: 12rpx;
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.88) 0%,
+    rgba(0, 105, 220, 0.94) 100%);
+  box-shadow:
+    0 2rpx 8rpx rgba(0, 122, 255, 0.25),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.35);
+  transition: transform 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+  z-index: 0;
+}
+
+.img-ori-slider.slider-landscape {
+  transform: translateX(100%);
+}
+
+.img-ori-slider.slider-portrait {
+  transform: translateX(200%);
+}
+
+.img-ori-opt {
+  flex: 1;
+  position: relative;
+  z-index: 1;
+  text-align: center;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24rpx;
+  font-weight: 500;
+  color: var(--text-secondary);
+  transition: color 0.25s ease;
+}
+
+.img-ori-opt.opt-active {
+  color: #fff;
+  font-weight: 600;
+}
+
 /* ── Add File Button ── */
 .add-file-btn {
   width: 100%;
@@ -509,37 +575,18 @@
 }
 
 /* ── Submit ── */
-/* ── 无障碍打印开关（仅管理员可见，max-height 过渡避免按钮位置突变）── */
+/* ── 无障碍打印开关（仅管理员可见，入场由 card-entering-fade 向上淡入控制）── */
 .auto-print-switch-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  max-height: 0;
-  opacity: 0;
-  overflow: hidden;
-  margin-top: 0;
-  padding-top: 0;
-  padding-bottom: 0;
-  padding-left: 24rpx;
-  padding-right: 24rpx;
+  margin-top: 16rpx;
+  padding: 20rpx 24rpx;
   background: rgba(255, 149, 0, 0.06);
-  border: 0 solid rgba(255, 149, 0, 0.2);
+  border: 1rpx solid rgba(255, 149, 0, 0.2);   /* 与下方"开始方式"卡片统一为有边框形式 */
   border-radius: var(--radius-md);
-  transition: max-height 0.45s cubic-bezier(0.22, 0.61, 0.36, 1),
-              opacity 0.35s ease,
-              margin-top 0.45s cubic-bezier(0.22, 0.61, 0.36, 1),
-              padding-top 0.45s cubic-bezier(0.22, 0.61, 0.36, 1),
-              padding-bottom 0.45s cubic-bezier(0.22, 0.61, 0.36, 1),
-              border-width 0.45s cubic-bezier(0.22, 0.61, 0.36, 1);
-}
-
-.auto-print-switch-row.auto-print-visible {
-  max-height: 300rpx;
-  opacity: 1;
-  margin-top: 20rpx;
-  padding-top: 20rpx;
-  padding-bottom: 20rpx;
-  border-width: 1rpx;
+  box-sizing: border-box;
+  overflow: hidden;   /* 裁剪闪电 canvas 溢出部分 */
 }
 .auto-print-label {
   display: flex;
@@ -813,6 +860,17 @@ picker-view-column {
   pointer-events: none;
   z-index: 3;
 }
+/* 倒计时滚轮单位标签（分/秒）：垂直居中于各列数字右侧，不遮挡数字 */
+.wheel-unit {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 26rpx;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  pointer-events: none;
+  z-index: 3;
+}
 .schedule-picker {
   flex: 1;
   background: var(--gray6);
@@ -833,22 +891,6 @@ picker-view-column {
 .schedule-picker-value.placeholder {
   color: var(--text-tertiary);
   font-weight: 400;
-}
-.countdown-input-wrap {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  background: var(--gray6);
-  border-radius: var(--radius-sm);
-  padding: 0 20rpx;
-  height: 64rpx;
-}
-.countdown-input {
-  flex: 1;
-  font-size: 28rpx;
-  font-weight: 600;
-  color: var(--text-primary);
-  text-align: right;
 }
 .countdown-unit {
   font-size: 24rpx;
@@ -1042,8 +1084,8 @@ picker-view-column {
   animation: coverPriceOut 0.25s ease forwards;
 }
 @keyframes coverPriceIn {
-  from { opacity: 0; transform: translateX(-16rpx); }
-  to   { opacity: 1; transform: translateX(0); }
+  from { opacity: 0; transform: translateY(16rpx); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 @keyframes coverPriceOut {
   from { opacity: 1; transform: translateX(0); }

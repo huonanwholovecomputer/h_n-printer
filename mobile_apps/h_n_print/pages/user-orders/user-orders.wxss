@@ -368,8 +368,24 @@
 .detail-price-value {
   font-size: 28rpx;
   font-weight: 700;
-  color: var(--orange);
   font-family: var(--font-mono);
+}
+/* 合计价格跟随订单状态色（复用 status-* 主题色），去掉状态类的底色 */
+.detail-price-value.status-queued,
+.detail-price-value.status-printing,
+.detail-price-value.status-accepted,
+.detail-price-value.status-offline_unknown,
+.detail-price-value.status-sent,
+.detail-price-value.status-failed,
+.detail-price-value.status-abandoned,
+.detail-price-value.status-reserved,
+.detail-price-value.status-rejected,
+.detail-price-value.status-canceled,
+.detail-price-value.status-scheduled,
+.detail-price-value.status-downloading,
+.detail-price-value.status-waiting,
+.detail-price-value.status-delivered {
+  background-color: transparent;
 }
 
 /* File rows in detail */
@@ -437,25 +453,6 @@
   font-size: 18rpx;
   color: var(--orange);
 }
-
-.file-status-mini {
-  font-size: 18rpx;
-  padding: 2rpx 10rpx;
-  border-radius: 14rpx;
-  font-weight: 600;
-}
-
-.file-status-mini.status-queued   { background-color: #FFF3E0; color: #E65100; }
-.file-status-mini.status-printing { background-color: #E3F2FD; color: #1565C0; }
-.file-status-mini.status-sent     { background-color: #E8F5E9; color: #2E7D32; }
-.file-status-mini.status-failed   { background-color: #FFEBEE; color: #C62828; }
-.file-status-mini.status-accepted { background-color: #E3F2FD; color: #1565C0; }
-.file-status-mini.status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
-.file-status-mini.status-rejected { background-color: #FFF3E0; color: #E65100; }
-.file-status-mini.status-scheduled   { background-color: #FFF8E1; color: #F57F17; }
-.file-status-mini.status-downloading { background-color: #E3F2FD; color: #1565C0; }
-.file-status-mini.status-waiting     { background-color: #FFF3E0; color: #E65100; }
-.file-status-mini.status-canceled { background-color: #F5F5F5; color: #9E9E9E; }
 
 /* Cancel button */
 .detail-actions {

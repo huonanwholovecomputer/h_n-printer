@@ -31,12 +31,12 @@
         <view wx:for="{{order.files}}" wx:key="id" wx:if="{{order.files.length > 0}}" class="detail-file-card">
           <view class="detail-file-header">
             <text class="detail-file-name">{{item.original_name || item.file_name}}</text>
-            <text class="status-tag-mini status-{{item.status}}">{{statusMap[item.status] || item.status}}</text>
           </view>
           <view class="detail-file-meta">
             <text wx:if="{{item.file_type}}" class="detail-file-type">{{item.file_type}}</text>
             <text wx:if="{{item.sizeDisplay}}" class="detail-file-size">{{item.sizeDisplay}}</text>
             <text class="detail-file-copies">{{item.copies}} 份</text>
+            <text class="detail-file-copies">{{item.duplex === 'on' ? '双面' : '单面'}}</text>
           </view>
         </view>
       </view>
@@ -47,10 +47,6 @@
         <view class="info-item">
           <text class="info-label">合计份数</text>
           <text class="info-value">{{order.total_copies || order.copies}} 份</text>
-        </view>
-        <view class="info-item">
-          <text class="info-label">打印模式</text>
-          <text class="info-value">{{order.duplex === 'on' ? '双面' : '单面'}}</text>
         </view>
         <view class="info-item">
           <text class="info-label">提交时间</text>

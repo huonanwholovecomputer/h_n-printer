@@ -57,6 +57,10 @@ local_print_tool/crash_traceback.txt
 # PDF 缓存（运行时自动生成）
 local_print_tool/pdf_cache/
 
+# 运行时状态（机器相关，不提交）
+local_print_tool/.client_id
+local_print_tool/.processed_tasks.json
+
 # 部署脚本（含服务器 IP）
 更新后端服务.txt
 

@@ -195,6 +195,32 @@
       </view>
     </view>
 
+    <!-- 管理员：防滥用设置（DDoS 防护阈值） -->
+    <view class="security-section admin-collapsible {{userRole === 'admin' && securityConfig ? 'admin-expanded' : ''}}" style="animation-delay: 0.10s">
+      <view class="section-title">
+        <view class="section-bar"></view>
+        <text>防滥用设置</text>
+      </view>
+      <view class="storage-card">
+        <text class="retention-title">以下阈值保存后立即生效（0 表示关闭对应检查）</text>
+        <block wx:for="{{securityItems}}" wx:key="key">
+          <view class="security-row">
+            <view class="security-label-wrap">
+              <text class="security-label">{{item.label}}</text>
+              <text class="security-hint">{{item.hint}}</text>
+            </view>
+            <view class="security-stepper">
+              <view class="retention-stepper-btn {{item.value <= item.min ? 'stepper-disabled' : ''}}" catchtap="onSecurityMinus" data-key="{{item.key}}" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
+              <input class="retention-stepper-input security-input" type="number" value="{{item.value}}" data-key="{{item.key}}" bindinput="onSecurityInput" />
+              <view class="retention-stepper-btn {{item.value >= item.max ? 'stepper-disabled' : ''}}" catchtap="onSecurityPlus" data-key="{{item.key}}" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
+              <text class="retention-unit">{{item.unit}}</text>
+            </view>
+          </view>
+        </block>
+        <button class="retention-save-btn" bindtap="onSaveSecurity" loading="{{savingSecurity}}" disabled="{{savingSecurity}}" hover-class="tap-active">保存防滥用设置</button>
+      </view>
+    </view>
+
     <!-- 管理员：许可用户列表 -->
     <view class="users-section admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}" style="animation-delay: 0.12s">
       <view class="section-title">
@@ -296,13 +322,6 @@
         <view class="page-size-selector" bindtap="onToggleOrdersPageSize">
           <text class="page-size-text">{{ordersPerPage}}条/页</text>
           <text class="page-size-arrow {{showPageSizePicker ? 'arrow-up' : ''}}">▼</text>
-          <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}" wx:if="{{showPageSizePicker}}">
-            <view wx:for="{{pageOptions}}" wx:key="*this"
-                  class="page-size-option {{ordersPerPage === item ? 'option-active' : ''}}"
-                  catchtap="onSelectOrdersPageSize" data-size="{{item}}">
-              {{item}} 条/页
-            </view>
-          </view>
         </view>
         <view class="page-nav">
           <view class="page-btn {{ordersCurrentPage <= 1 ? 'page-btn-disabled' : ''}}"
@@ -335,7 +354,7 @@
           </view>
           <view wx:else class="order-card-meta">
             <text class="order-card-stat">📄 {{item.total_pages || (item.page_count * item.copies)}} 页</text>
-            <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份 · {{item.duplex === 'on' ? '双面' : '单面'}}</text>
+            <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份</text>
           </view>
           <view class="order-card-footer">
             <text class="order-created">{{item.created_at}}</text>
@@ -353,10 +372,6 @@
             <view class="detail-row">
               <text class="detail-label">提交时间</text>
               <text class="detail-value">{{item.created_at}}</text>
-            </view>
-            <view wx:if="{{!item.isExcel}}" class="detail-row">
-              <text class="detail-label">打印模式</text>
-              <text class="detail-value">{{item.duplex === 'on' ? '双面' : '单面'}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计页数</text>
@@ -381,8 +396,9 @@
               </view>
               <view class="detail-file-right">
                 <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
+                <text class="detail-file-range">{{f.duplex === 'on' ? '双面' : '单面'}}</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
-                <text wx:if="{{f.status === 'rejected' && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
+                <text wx:if="{{(f.status === 'rejected' || f.status === 'failed') && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
             </view>
           </view>
@@ -408,7 +424,7 @@
           <view class="detail-section">
             <view class="detail-row detail-price-row">
               <text class="detail-label">合计价格</text>
-              <text class="detail-value detail-price-value">¥{{item.totalPriceDisplay}}</text>
+              <text class="detail-price-value status-{{item.status}}">¥{{item.totalPriceDisplay}}</text>
             </view>
           </view>
 
@@ -454,6 +470,17 @@
       <button class="btn-secondary" bindtap="onChooseCustomNickname" hover-class="tap-active">✏️ 使用自定义昵称</button>
       <view class="modal-buttons">
         <button class="btn-secondary modal-half-btn" bindtap="onCancelNicknamePicker" hover-class="tap-active">取消</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- 分页下拉（page-root 外，position:fixed 逃出 translateY 变换层，保证 backdrop-filter 采样正常） -->
+  <view class="{{isDarkMode ? 'theme-dark' : ''}}">
+    <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}" wx:if="{{showPageSizePicker}}" style="left: {{pageSizeDropdownLeft}}px; top: {{pageSizeDropdownTop}}px;">
+      <view wx:for="{{pageOptions}}" wx:key="*this"
+            class="page-size-option {{ordersPerPage === item ? 'option-active' : ''}}"
+            catchtap="onSelectOrdersPageSize" data-size="{{item}}">
+        {{item}} 条/页
       </view>
     </view>
   </view>

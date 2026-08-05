@@ -270,7 +270,7 @@
   align-items: center;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   border-left: 6rpx solid var(--green);
-  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease;
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, transform 0.06s ease;
 }
 .role-btn:active {
   background-color: var(--gray6);
@@ -423,7 +423,7 @@
   box-shadow:
     0 2rpx 10rpx rgba(0, 122, 255, 0.2),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.3);
-  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
+  transition: transform 0.06s ease, box-shadow 0.06s ease, filter 0.06s ease;
 }
 .generate-btn:active {
   transform: scale(0.97);
@@ -479,7 +479,7 @@
   z-index: 0;
   box-shadow: inset 0 0 0 2rpx rgba(255,255,255,0.10),
               0 2rpx 8rpx rgba(232,48,43,0.25);
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, transform 0.06s ease;
 }
 /* 右滑归位时加速淡出 */
 .key-card-wrap.quick-fade .key-delete {
@@ -562,6 +562,8 @@
   padding: 10rpx 32rpx;
   margin: 0;
   border: none;
+  /* 按下由 tap-active 瞬时缩小，松手此过渡平滑恢复 */
+  transition: transform 0.06s ease;
 }
 .copy-btn:active {
   background-color: rgba(0, 122, 255, 0.15);
@@ -678,7 +680,7 @@
   box-shadow:
     0 2rpx 10rpx rgba(0, 122, 255, 0.2),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.3);
-  transition: transform 0.12s ease, filter 0.12s ease;
+  transition: transform 0.06s ease, filter 0.06s ease;
 }
 .redeem-btn:active {
   transform: scale(0.97);
@@ -778,9 +780,13 @@
   justify-content: center;
   line-height: 1;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
-  transition: transform 0.1s ease, background-color 0.1s ease, box-shadow 0.1s ease;
+  transition: transform 0.06s ease, background-color 0.06s ease, box-shadow 0.06s ease;
 }
 .retention-stepper-btn:active {
+  /* 经典短按问题修复：hover-class 在按下极短时来不及触发缩小过渡，
+     改用 :active 伪类即时缩小（按下即生效，无 hover 时机依赖）。
+     配合上方 transition: transform 0.06s 产生平滑缩放。 */
+  transform: scale(0.9);
   background: rgba(0, 0, 0, 0.06);
   box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.06);
 }
@@ -830,7 +836,7 @@
   box-shadow:
     0 2rpx 10rpx rgba(0, 122, 255, 0.2),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.3);
-  transition: transform 0.12s ease, box-shadow 0.12s ease, filter 0.12s ease;
+  transition: transform 0.06s ease, box-shadow 0.06s ease, filter 0.06s ease;
 }
 .retention-save-btn:active {
   transform: scale(0.97);
@@ -838,6 +844,58 @@
   box-shadow:
     0 1rpx 4rpx rgba(0, 122, 255, 0.15),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.35);
+}
+
+/* ---- 防滥用设置面板 ---- */
+.security-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12rpx;
+  margin-bottom: 20rpx;
+}
+
+.security-label-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.security-label {
+  font-size: 24rpx;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.security-hint {
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+  margin-top: 2rpx;
+}
+
+.security-stepper {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+/* 大数值（配额 MB 等）需要更宽输入框，容纳 6 位数（max 102400） */
+.security-input {
+  width: 108rpx;
+}
+
+/* 固定单位宽度：各条目单位长度不一（MB/小时/次/分/条/分/次/时），
+   若让单位按内容自适应宽度，每行 [−][数值][+] 步进器的总宽会随单位漂移，
+   导致加减按钮列左右错位。给单位固定宽后，每行步进器总宽一致，
+   加减按钮列严格对齐。
+   text-align: right：单位靠容器右缘（行尾）对齐，与 [+] 按钮拉开距离，
+   避免单位文字紧贴按钮；同时单位文本右缘整齐。 */
+.security-stepper .retention-unit {
+  width: 80rpx;
+  flex-shrink: 0;
+  text-align: right;
+  white-space: nowrap;
 }
 
 .delete-all-btn {
@@ -851,7 +909,7 @@
   padding: 14rpx 0;
   margin-top: 12rpx;
   box-shadow: none;
-  transition: transform 0.12s ease, background-color 0.12s ease;
+  transition: transform 0.06s ease, background-color 0.06s ease;
 }
 .delete-all-btn:active {
   transform: scale(0.97);
@@ -981,7 +1039,7 @@
   z-index: 0;
   box-shadow: inset 0 0 0 2rpx rgba(255, 255, 255, 0.10),
               0 2rpx 8rpx rgba(232, 48, 43, 0.25);
-  transition: opacity 0.15s ease;
+  transition: opacity 0.15s ease, transform 0.06s ease;
 }
 .admin-delete:active {
   background: linear-gradient(160deg, #E8302B 0%, #C82020 100%);
@@ -1065,7 +1123,7 @@
   overflow: hidden;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   border: 1rpx solid var(--separator);
-  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, transform 0.15s ease;
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, transform 0.06s ease;
 }
 
 .order-card:active {
@@ -1227,8 +1285,24 @@
 .detail-price-value {
   font-size: 28rpx;
   font-weight: 700;
-  color: var(--orange);
   font-family: var(--font-mono);
+}
+/* 合计价格跟随订单状态色（复用 status-* 主题色），去掉状态类的底色 */
+.detail-price-value.status-queued,
+.detail-price-value.status-printing,
+.detail-price-value.status-accepted,
+.detail-price-value.status-offline_unknown,
+.detail-price-value.status-sent,
+.detail-price-value.status-failed,
+.detail-price-value.status-abandoned,
+.detail-price-value.status-reserved,
+.detail-price-value.status-rejected,
+.detail-price-value.status-canceled,
+.detail-price-value.status-scheduled,
+.detail-price-value.status-downloading,
+.detail-price-value.status-waiting,
+.detail-price-value.status-delivered {
+  background-color: transparent;
 }
 
 /* File rows in detail */
@@ -1296,25 +1370,6 @@
   font-size: 18rpx;
   color: var(--orange);
 }
-
-.file-status-mini {
-  font-size: 18rpx;
-  padding: 2rpx 10rpx;
-  border-radius: 14rpx;
-  font-weight: 600;
-}
-.file-status-mini.status-queued   { background-color: #FFF3E0; color: #E65100; }
-.file-status-mini.status-printing { background-color: #E3F2FD; color: #1565C0; }
-.file-status-mini.status-sent     { background-color: #E8F5E9; color: #2E7D32; }
-.file-status-mini.status-failed   { background-color: #FFEBEE; color: #C62828; }
-.file-status-mini.status-accepted { background-color: #E3F2FD; color: #1565C0; }
-.file-status-mini.status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
-.file-status-mini.status-rejected { background-color: #FFF3E0; color: #E65100; }
-.file-status-mini.status-scheduled   { background-color: #FFF8E1; color: #F57F17; }
-.file-status-mini.status-downloading { background-color: #E3F2FD; color: #1565C0; }
-.file-status-mini.status-waiting     { background-color: #FFF3E0; color: #E65100; }
-.file-status-mini.status-rejected { background-color: #FFEBEE; color: #C62828; }
-.file-status-mini.status-canceled { background-color: var(--gray6); color: var(--gray); }
 
 /* Reject reason text */
 .file-reject-reason {
@@ -1392,15 +1447,15 @@
 }
 
 .page-size-dropdown {
-  position: absolute;
-  top: calc(100% + 6rpx);
-  left: 0;
+  position: fixed;
   min-width: 160rpx;
-  /* 近不透明背景；去掉 backdrop-filter —— 该元素位于 translateY 变换层内，微信对层内模糊采样错位（顶部浅/底部深） */
-  background-color: rgba(255, 255, 255, 0.96);
+  /* 已移至 page-root 外（fixed），逃出 translateY 变换层，backdrop-filter 可正常采样 */
+  background-color: rgba(255, 255, 255, 0.82);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
   border-radius: var(--radius-sm);
   box-shadow: 0 4rpx 20rpx rgba(0, 0, 0, 0.12);
-  z-index: 102;
+  z-index: 900;
   opacity: 0;
   transform: translateY(-8rpx);
   pointer-events: none;

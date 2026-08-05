@@ -942,10 +942,12 @@ def _convert_csv_to_pdf(file_path: str, output_pdf: str) -> None:
     logger.info(f"CSV → PDF 完成: {output_pdf}")
 
 
-def _convert_image_to_pdf(file_path: str, output_pdf: str) -> None:
-    """图片 → PDF（reportlab，居中适应 A4）。多页图片（TIFF/GIF）每帧一页。"""
+def _convert_image_to_pdf(file_path: str, output_pdf: str, orientation: str = "auto") -> None:
+    """图片 → PDF（reportlab，居中适应 A4）。多页图片（TIFF/GIF）每帧一页。
+
+    orientation: 'auto'（宽图横版 / 高图竖版，最大化打印面积）| 'landscape'（恒横版）| 'portrait'（恒竖版）"""
     from PIL import Image as PILImage
-    from PIL import ImageSequence
+    from PIL import ImageSequence, ImageOps
     from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import mm
@@ -960,6 +962,9 @@ def _convert_image_to_pdf(file_path: str, output_pdf: str) -> None:
     page_num = 0
     try:
         for frame in ImageSequence.Iterator(img):
+            # P3-?: 应用 EXIF 方向（手机竖拍照片原始像素是横的，靠 EXIF 旋转显示）。
+            # 不转置会横着渲染，且宽高判定/方向检测/缩放全部基于错误的原始尺寸
+            frame = ImageOps.exif_transpose(frame)
             # P1-7: 超大图片 OOM 保护 — 渲染前手动检查像素量，超限拒绝并抛明确错误
             fw, fh = frame.size
             if fw * fh > MAX_IMAGE_PIXELS:
@@ -977,11 +982,16 @@ def _convert_image_to_pdf(file_path: str, output_pdf: str) -> None:
                 frame = frame.convert("RGB")
 
             iw, ih = frame.size
-            # 根据图片宽高选择页面方向：宽图用横版，最大化打印面积
-            if iw > ih:
+            # 页面方向：auto=按宽高自动（宽图横版/高图竖版），landscape/portrait=固定方向
+            if orientation == "landscape":
                 page_w, page_h = landscape(A4)
-            else:
+            elif orientation == "portrait":
                 page_w, page_h = A4
+            else:
+                if iw > ih:
+                    page_w, page_h = landscape(A4)
+                else:
+                    page_w, page_h = A4
 
             if c is None:
                 c = canvas.Canvas(output_pdf, pagesize=(page_w, page_h))
@@ -1395,13 +1405,16 @@ class UniversalConverter:
         cm[".html"] = _convert_html_to_pdf
         cm[".htm"] = _convert_html_to_pdf
 
-    def convert(self, file_path: str, output_pdf: str | None = None) -> str:
+    def convert(self, file_path: str, output_pdf: str | None = None,
+                image_orientation: str = "auto") -> str:
         """
         将文件转换为 PDF。
 
         Args:
             file_path: 源文件路径（含扩展名）
             output_pdf: 输出 PDF 路径；若为 None 则自动生成临时文件
+            image_orientation: 图片方向（'auto' | 'landscape' | 'portrait'），
+                仅图片类生效；其余文件类型忽略。
 
         Returns:
             生成的 PDF 文件路径
@@ -1435,7 +1448,11 @@ class UniversalConverter:
 
         try:
             logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF")
-            convert_func(file_path, output_pdf)
+            # 图片方向可配置：把 image_orientation 传给图片渲染函数（其余类型忽略）
+            if convert_func is _convert_image_to_pdf:
+                convert_func(file_path, output_pdf, image_orientation)
+            else:
+                convert_func(file_path, output_pdf)
 
             if not os.path.isfile(output_pdf) or os.path.getsize(output_pdf) == 0:
                 raise RuntimeError(f"转换为 PDF 后文件为空或不存在: {output_pdf}")

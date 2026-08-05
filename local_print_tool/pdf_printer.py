@@ -26,11 +26,13 @@ MID_PRINT_MARKER = "[已出纸] "
 def get_image_info(image_path: str) -> dict:
     """
     读取图片尺寸信息，返回页数和方向。
-    单张图片始终为 1 页，方向由宽高比决定。
+    单张图片始终为 1 页，方向由宽高比决定（已应用 EXIF 方向，
+    避免手机竖拍照片因原始像素为横而被误判成横向）。
     """
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         img = Image.open(image_path)
+        img = ImageOps.exif_transpose(img)   # 应用 EXIF 旋转，拿到真实显示尺寸
         w, h = img.size
         orientation = "landscape" if w > h else "portrait"
         return {"page_count": 1, "orientation": orientation}

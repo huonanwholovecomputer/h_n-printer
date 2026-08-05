@@ -156,22 +156,6 @@ page {
   margin-right: 14rpx;
 }
 
-.status-tag-mini {
-  font-size: 18rpx;
-  padding: 4rpx 12rpx;
-  border-radius: 16rpx;
-  font-weight: 600;
-  flex-shrink: 0;
-}
-.status-tag-mini.status-queued   { background-color: #FFF3E0; color: #E65100; }
-.status-tag-mini.status-printing { background-color: #E3F2FD; color: #1565C0; }
-.status-tag-mini.status-sent     { background-color: #E8F5E9; color: #2E7D32; }
-.status-tag-mini.status-failed   { background-color: #FFEBEE; color: #C62828; }
-.status-tag-mini.status-canceled { background-color: var(--gray6); color: var(--gray); }
-.status-tag-mini.status-scheduled   { background-color: #FFF8E1; color: #F57F17; }
-.status-tag-mini.status-downloading { background-color: #E3F2FD; color: #1565C0; }
-.status-tag-mini.status-waiting     { background-color: #FFF3E0; color: #E65100; }
-
 .detail-file-meta {
   display: flex;
   align-items: center;

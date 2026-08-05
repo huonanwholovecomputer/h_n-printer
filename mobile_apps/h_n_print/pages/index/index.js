@@ -2,6 +2,23 @@
 const { CONFIG } = require('../../utils/config')
 const { request } = require('../../utils/request')
 
+// 文件卡片每类型高度（rpx，由 _probeCardHeights() 实测后硬编码；默认值为按 CSS 估算的占位）：
+//   image = 仅份数控件；word = 份数+范围+双面+页数分析条；excel = 无控件仅状态行
+// 配合「上传时即显示完整卡片」策略，卡片高度按类型恒定，故列表高度可同步求和计算、无需异步实测。
+const FILE_CARD_HEIGHT_RPX = {
+  image: 312.8,  // 实测(2026-08-05): _probeCardHeights() 探测值（含新增的方向控件行）
+  word: 447.1,   // 实测(2026-08-05): _probeCardHeights() 探测值（含页数分析条）
+  excel: 151.2,  // 实测(2026-08-05): 同上
+}
+// .file-card 底部间距 margin-bottom: 12rpx
+const FILE_CARD_GAP_RPX = 12
+
+function _fileCardTypeKey(file) {
+  if (file.excelWarning) return 'excel'
+  if (file.isImage) return 'image'
+  return 'word'
+}
+
 // 时间滚轮（picker-view）：item 高 88rpx、可视区 440rpx 由 WXSS 定义
 // （picker-view 的贴合单元 = column 内 item 高度，无需 JS 参与几何计算）
 
@@ -31,6 +48,8 @@ Component({
     showSuccessModal: false,
     showAccessDeniedModal: false,
     showPageCountWarning: false,   // 页数未验证警告弹窗
+    showUnsupportedSkipModal: false,  // 存在不支持格式（Excel/PPT/CAD）→ 确认自动跳过的弹窗
+    unsupportedSkipCount: 0,
     modalClosing: false,           // 弹窗关闭动画进行中
     userRole: '',
     submitting: false,
@@ -61,6 +80,13 @@ Component({
     scheduleTime: '',
     countdownMin: 5,
     countdownSec: 0,
+    // 倒计时选择弹窗（复用时间滚轮：分 + 秒，范围 00-59）
+    showScheduleCountdownPicker: false,
+    countdownMinItems: Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')),
+    countdownSecItems: Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')),
+    countdownMinWheelIndex: 5,
+    countdownSecWheelIndex: 0,
+    countdownWheelValue: [5, 0],
     logoScale: 1,
     logoPadding: 40,
     scrollTop: 0,
@@ -97,13 +123,13 @@ Component({
     isDarkMode: _initIsDark(),
     themeMode: _initThemeMode(),
     themeSwitching: false,       // 主题切换过渡中
-    entranceDelay: {           // 打印页元素入场延时（从上到下逐个递进）
-      logo: '0.00s',
-      statusBar: '0.06s',
-      fileSection: '0.12s',
-      extParams: '0.18s',
-      autoPrint: '0.24s',
-      submit: '0.30s',
+    entranceDelay: {           // 打印页元素入场延时（首次加载：基础 0.5s，从上到下逐个递增 0.1s）
+      logo: '0.5s',
+      statusBar: '0.6s',
+      fileSection: '0.7s',
+      extParams: '0.8s',
+      autoPrint: '0.9s',
+      submit: '1.0s',
     },
   },
   lifetimes: {
@@ -131,7 +157,9 @@ Component({
     },
     detached() {
       try { const r = getApp().globalData._pageRegistry; if (r) { const i = r.indexOf(this); if (i >= 0) r.splice(i, 1) } } catch(e) {}
+      this._cancelAllPendingPageAnalyses()   // 页面销毁（关闭小程序）→ 取消未确认文件的页数分析
       this._destroyScrollEngine()
+      if (this._fileListTween) { clearTimeout(this._fileListTween); this._fileListTween = null }
       this._stopAllUploadTimers()
       this._stopAllPollTimers()
       this._stopBreathingGlow()
@@ -190,7 +218,7 @@ Component({
       setTimeout(() => {
         let animationClass = ''
         if (isFirstLaunch) {
-          animationClass = 'page-fade-in'
+          animationClass = 'page-fade-in page-fade-in-delayed'   // 首次加载：延迟 0.5s 向上淡入
         } else if (tabFrom === 1) {
           animationClass = 'page-enter-left'
         } else {
@@ -214,9 +242,15 @@ Component({
       if (!this.data.pricingLoaded) {
         this.loadPricing()
       }
-      // 每次切回页面时重新检查角色（可能在"我"页面兑换了许可）
+      // 每次切回页面时重新检查角色（可能在"我"页面兑换了许可）。
+      // 守卫：从"我"页回来强制刷新（兑换可能发生），否则 60s 内不重复拉取
       if (wx.getStorageSync('token')) {
-        this.loadUserRole()
+        const _now = Date.now()
+        const cameFromMe = wx.getStorageSync('_tabFrom') === 1
+        if (cameFromMe || !this._lastRoleLoad || (_now - this._lastRoleLoad) > 60000) {
+          this._lastRoleLoad = _now
+          this.loadUserRole()
+        }
       }
       // 重印恢复：唯一消费点（来自"我"页或详情页写入的 reprintInfo）
       const reprintInfo = wx.getStorageSync('reprintInfo')
@@ -242,6 +276,8 @@ Component({
           this._entrancePlayed = true
           this._readyTimer = null
         }, 250)
+        // 入场动画（0.5s 延迟 + 卡片展开）全部结束后重新测量滚动边界
+        setTimeout(() => this._scheduleMeasure(100), 1200)
       }
     },
     hide() {
@@ -253,6 +289,7 @@ Component({
       if (this._readyTimer) { clearTimeout(this._readyTimer); this._readyTimer = null }
       this._stopPrinterPolling()
       this._stopAllPollTimers()      // 页数轮询随页面隐藏停止，show 时按需恢复
+      this._cancelAllPendingPageAnalyses()   // 页面隐藏（切后台/关闭小程序）→ 取消未确认文件的页数分析，避免本地白下载
       this._stopBreathingGlow()      // 无障碍打印呼吸光晕定时器随页面隐藏停止
       // 重置入场动画类为隐藏态，确保下次 show 时框架首帧不可见，避免闪烁
       // pageExit 控制退出动画，pageSlide 控制入场/静止态，互不冲突
@@ -304,9 +341,10 @@ Component({
 
     _startPrinterPolling() {
       this._stopPrinterPolling()
+      // 30s 轮询（设计意图，避免高频请求触发 Nginx hn_api 限流：60r/m + burst 150）
       this._printerPollTimer = setInterval(() => {
         this.loadPrinterStatus()
-      }, 5000)
+      }, 30000)
     },
     _stopPrinterPolling() {
       if (this._printerPollTimer) {
@@ -541,21 +579,107 @@ Component({
       })
     },
 
-    // 添加文件时立刻估算卡片高度并更新滚动边界，无需等待 cardExpand 动画完成
-    // 后续 _measure() 会修正为精确值
+    // "打印文件"卡片高度补间动画：随文件添加/删除平滑展开/收起
+    // （原生 enhanced scroll-view 的 height 样式不支持 CSS 过渡，用 JS 逐帧驱动 setData）
+    _animateFileListHeight(targetHeight, duration) {
+      if (this._fileListTween) {
+        clearTimeout(this._fileListTween)
+        this._fileListTween = null
+      }
+      const startHeight = this.data.fileListHeight || 0
+      const diff = targetHeight - startHeight
+      if (Math.abs(diff) < 1) {
+        this.setData({ fileListHeight: targetHeight })
+        return
+      }
+      const startTime = Date.now()
+      const tick = () => {
+        const elapsed = Date.now() - startTime
+        const t = Math.min(1, elapsed / duration)
+        const eased = 1 - Math.pow(1 - t, 3)   // easeOutCubic：先快后慢
+        this.setData({ fileListHeight: Math.max(0, Math.round(startHeight + diff * eased)) })
+        if (t < 1) {
+          this._fileListTween = setTimeout(tick, 24)
+        } else {
+          this._fileListTween = null
+        }
+      }
+      tick()
+    },
+
+    // 探测工具（一次性）：临时注入 图片/Word/Excel 三张「完整」卡片（fileId 已存在 → 控件/页数条全展开），
+    // 实测各自精确高度输出到控制台，用于替换上方 FILE_CARD_HEIGHT_RPX 的硬编码值。
+    // 调用：开发者工具控制台执行 getCurrentPages()[0]._probeCardHeights()
+    _probeCardHeights() {
+      const savedFiles = this.data.selectedFiles
+      const savedH = this.data.fileListHeight
+      const mk = (over) => Object.assign({
+        name: '', size: 0, path: '', sizeDisplay: '1.0', fileId: 0,
+        uploading: false, progress: 100, failed: false, copies: 1, pageRange: '',
+        rangeLines: [{ value: '', error: '' }], duplex: 'on', imageOrientation: 'auto',
+        entering: false, removing: false,
+        excelWarning: false, unsupportedFormat: false, isImage: false, pageCount: 1,
+        pageCountStatus: 'confirmed',
+      }, over)
+      const probes = [
+        mk({ name: '探测-图片.png', fileId: 990001, isImage: true, duplex: 'off', imageOrientation: 'landscape', pageCount: 1 }),
+        mk({ name: '探测-文档.docx', fileId: 990002, isImage: false, pageCount: 10, pageCountStatus: 'confirmed', copies: 3 }),
+        mk({ name: '探测-表格.xlsx', fileId: 990003, isImage: false, excelWarning: true, pageCount: 0, pageCountStatus: '' }),
+      ]
+      // 临时撑开列表高度，确保 3 张卡片完整渲染（0 高度容器可能不产出布局）
+      this.setData({ selectedFiles: probes, badgeCount: probes.length, fileListHeight: 600 }, () => {
+        setTimeout(() => {
+          const q = this.createSelectorQuery()
+          q.selectAll('.file-card').boundingClientRect()
+          q.exec((res) => {
+            const cards = (res && res[0]) || []
+            const { windowWidth } = wx.getWindowInfo()
+            const rpxRatio = (windowWidth || 375) / 750
+            const keys = ['image', 'word', 'excel']
+            const gapPx = +(FILE_CARD_GAP_RPX * rpxRatio).toFixed(1)
+            const heights = {}
+            let sumPx = 0
+            cards.forEach((c, i) => {
+              if (!c || !keys[i]) return
+              const px = Math.round(c.height)
+              const rpx = +(c.height / rpxRatio).toFixed(1)
+              heights[keys[i]] = { px, rpx }
+              sumPx += px + (i > 0 ? gapPx : 0)
+            })
+            console.log('[卡片高度探测] 原始(px)与换算(rpx):', JSON.stringify(heights, null, 2))
+            console.log('[卡片高度探测] 3卡合计含间距:', sumPx, 'px，卡片间距:', gapPx, 'px')
+            console.log('[卡片高度探测] 硬编码建议: FILE_CARD_HEIGHT_RPX =', JSON.stringify({
+              image: heights.image && heights.image.rpx,
+              word: heights.word && heights.word.rpx,
+              excel: heights.excel && heights.excel.rpx,
+            }))
+            // 恢复原列表
+            this.setData({ selectedFiles: savedFiles, badgeCount: savedFiles.length, fileListHeight: savedH })
+          })
+        }, 120)  // 等 setData 渲染稳定后再测量
+      })
+    },
+
+    // 添加文件时立刻计算列表高度并更新滚动边界，无需等待 cardExpand 动画完成。
+    // 高度按每文件类型实测常量累加（同步计算、零异步测量），上限仍锁定 85vh。
     _bumpForNewFile() {
       const { windowWidth, windowHeight } = wx.getWindowInfo()
       const rpxRatio = (windowWidth || 375) / 750
-      const estPx = Math.round(470 * rpxRatio)
-      // 文件列表为有界原生 scroll-view（显式高度驱动，上限 ≈ 75vh / 3 个卡片）。
+      // 文件列表为有界原生 scroll-view（显式高度驱动，上限 ≈ 85vh / 3~4 个卡片）。
       // 达到上限后新增文件只内部滚动、不再撑高页面，故 contentEst 不再增长。
-      const listCapPx = Math.round((windowHeight || 800) * 0.75)
+      const listCapPx = Math.round((windowHeight || 800) * 0.85)
+      const files = this.data.selectedFiles
+      let sumRpx = 0
+      files.forEach((f, i) => {
+        sumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+      })
       if (!this._fileListPx) this._fileListPx = 0
       const prev = this._fileListPx
-      this._fileListPx = Math.min(listCapPx, this._fileListPx + estPx)
+      this._fileListPx = Math.min(listCapPx, Math.round(sumRpx * rpxRatio))
       const delta = this._fileListPx - prev
-      // 显式高度让 scroll-view 真正裁剪溢出卡片并内部滚动（仅 max-height 在微信中不可靠，会画到按钮上）
-      this.setData({ fileListHeight: Math.max(0, this._fileListPx) })
+      // 显式高度让 scroll-view 真正裁剪溢出卡片并内部滚动（仅 max-height 在微信中不可靠，会画到按钮上）。
+      // 高度变化走补间动画，"打印文件"卡片随之平滑展开。
+      this._animateFileListHeight(Math.max(0, this._fileListPx), 350)
 
       if (!this._scrollerH) {
         this._measure()
@@ -830,12 +954,14 @@ Component({
           const ext = name.slice(name.lastIndexOf('.')).toLowerCase()
           const imageExts = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
           const isImage = imageExts.includes(ext)
-          const isExcel = ext === '.xls' || ext === '.xlsx'
+          // 不支持自动打印的类型（可添加显示，但无法打印，需联系管理员）：Excel/PPT/CAD
+          const unsupportedExts = ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf']
+          const isUnsupported = unsupportedExts.includes(ext)
 
-          // 不支持的文件格式：直接拒绝，不上传
-          const supportedExts = ['.pdf', '.doc', '.docx', '.txt', '.csv', '.md', '.html', '.htm',
+          // 可打印的支持格式（html/htm 已移除）
+          const supportedExts = ['.pdf', '.doc', '.docx', '.txt', '.csv', '.md',
             '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
-          if (!supportedExts.includes(ext) && !isExcel) {
+          if (!supportedExts.includes(ext) && !isUnsupported) {
             wx.showToast({
               title: `不支持 ${ext} 格式`,
               icon: 'none',
@@ -857,10 +983,11 @@ Component({
             pageRange: '',                        // 提交用，由 rangeLines 合并得出
             rangeLines: [{value: '', error: ''}],  // 多行输入，对齐本地工具 RangeListWidget
             duplex: isImage ? 'off' : 'on',  // 图片单页渲染，无双面概念 → 固定单面
+            imageOrientation: 'auto',   // 图片打印方向: auto=自动 / landscape=横向 / portrait=竖向
             entering: true,
             removing: false,
-            excelWarning: isExcel,
-            unsupportedFormat: false,   // 不支持格式已在选择时拦截，不会到达此处
+            excelWarning: isUnsupported,   // 不支持自动打印的类型（Excel/PPT/CAD）
+            unsupportedFormat: false,   // 未知格式已在选择时拦截，不会到达此处
             isImage: isImage,
             pageCount: 0,
             pageCountStatus: '',  // '' | 'analyzing' | 'confirmed' — 页数分析进度
@@ -901,6 +1028,11 @@ Component({
       const index = e.currentTarget.dataset.index
       this.stopFileUploadTimer(index)
       this._stopPageCountPoll(index)
+      // 删除已上传但页数未确认的文件 → 取消本地页数分析（避免白下载）
+      const removed = this.data.selectedFiles[index]
+      if (removed && removed.fileId && !(removed.pageCount > 0)) {
+        this._cancelPageAnalysis([removed.fileId])
+      }
       const isLastFile = this.data.selectedFiles.length === 1
       const newCount = this.data.selectedFiles.length - 1
 
@@ -923,6 +1055,21 @@ Component({
 
       // 触发 cardRemove 动画（0.55s 单段：淡出+收起），完成后移除
       this.setData({ ['selectedFiles[' + index + '].removing']: true })
+      // 收起动画：随卡片折叠同步平滑缩短"打印文件"卡片
+      // 目标 = min(上限, 其余卡片按类型实测高之和)：达到上限后删除文件时，
+      // 只要剩余内容仍占满/超出上限，外部高度就不应下降（避免容器矮于内容、截断剩余卡片）
+      const { windowWidth: rw, windowHeight: rh } = wx.getWindowInfo()
+      const rpxR = (rw || 375) / 750
+      const remCapPx = Math.round((rh || 800) * 0.85)
+      let remSumRpx = 0
+      let remCount = 0
+      this.data.selectedFiles.forEach((f, i) => {
+        if (i === index) return
+        remSumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (remCount > 0 ? FILE_CARD_GAP_RPX : 0)
+        remCount++
+      })
+      const remTarget = Math.min(remCapPx, Math.round(remSumRpx * rpxR))
+      this._animateFileListHeight(remTarget, 500)
       setTimeout(() => {
         const files = this.data.selectedFiles.slice()
         files.splice(index, 1)
@@ -939,19 +1086,26 @@ Component({
         this._pollTimers = remapTimers(this._pollTimers || {})
         const { windowWidth: ww, windowHeight: wh } = wx.getWindowInfo()
         const rpxR = (ww || 375) / 750
-        const estPx = Math.round(470 * rpxR)
-        // 与 _bumpForNewFile 对称：按实际累计高度减少 contentEst
-        const listCapPx = Math.round((wh || 800) * 0.75)
+        // 外部高度 = min(上限, 剩余卡片按类型实测高之和)：与 _bumpForNewFile 同规则，重算而非递减。
+        // 达到上限后删除文件时，剩余内容仍占满上限则高度保持不变，仅在低于上限时收敛到内容高
+        const listCapPx = Math.round((wh || 800) * 0.85)
+        let sumRpx = 0
+        files.forEach((f, i) => {
+          sumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+        })
         if (!this._fileListPx) this._fileListPx = 0
         const prev = this._fileListPx
-        this._fileListPx = Math.max(0, this._fileListPx - estPx)
+        this._fileListPx = Math.min(listCapPx, Math.round(sumRpx * rpxR))
         const delta = this._fileListPx - prev
         this._contentEst = Math.max(0, this._contentEst + delta)
-        this.setData({ selectedFiles: files, badgeCount: files.length, scrollPadHeight: 0, fileListHeight: Math.max(0, this._fileListPx) })
+        this.setData({ selectedFiles: files, badgeCount: files.length, scrollPadHeight: 0 })
+        // 高度随删除收敛到最新 _fileListPx（快速连删时以此为准做最终校正）
+        this._animateFileListHeight(Math.max(0, this._fileListPx), 250)
         if (!isLastFile) {
           this._prevFileCount = files.length
         }
-        this._scheduleMeasure()
+        // 高度收敛补间（250ms）结束后再测量，保证滚动边界精确
+        this._scheduleMeasure(300)
       }, 600)  // cardRemove 动画 0.55s + 50ms buffer
     },
 
@@ -980,9 +1134,10 @@ Component({
             ? pageRange.split(',').filter(l => (l || '').trim()).map(v => ({ value: v.trim(), error: '' }))
             : [{ value: '', error: '' }],
           duplex: isImage ? 'off' : (f.duplex || 'on'),
+          imageOrientation: isImage ? (f.image_orientation || 'auto') : 'auto',
           entering: true,
           removing: false,
-          excelWarning: false,
+          excelWarning: ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf'].indexOf(ext) !== -1,  // 与添加路径一致
           unsupportedFormat: false,
           isImage: isImage,
           pageCount: Number(f.page_count) || 0,
@@ -995,12 +1150,15 @@ Component({
         duplex: reprintInfo.duplex || 'on',
         scrollPadHeight: 0,
       })
-      // 恢复文件列表显式高度（对齐 _bumpForNewFile 估算逻辑，随后 _measure 修正）
+      // 恢复文件列表显式高度：按每文件类型实测高累加（与 _bumpForNewFile 同规则）
       const { windowWidth, windowHeight } = wx.getWindowInfo()
-      const rpxR = (windowWidth || 375) / 750
-      const estPx = Math.round(470 * rpxR)
-      const listCapPx = Math.round((windowHeight || 800) * 0.75)
-      this._fileListPx = Math.min(listCapPx, files.length * estPx)
+      const rpxRatio = (windowWidth || 375) / 750
+      const listCapPx = Math.round((windowHeight || 800) * 0.85)
+      let sumRpx = 0
+      files.forEach((f, i) => {
+        sumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+      })
+      this._fileListPx = Math.min(listCapPx, Math.round(sumRpx * rpxRatio))
       this.setData({ fileListHeight: Math.max(0, this._fileListPx) })
       // 页数未知的文件重新启动页数轮询
       files.forEach((f, i) => {
@@ -1187,6 +1345,28 @@ Component({
       })
     },
 
+    // 取消指定文件的页数分析（删除文件 / 页面隐藏 / 销毁时调用，尽力而为）
+    _cancelPageAnalysis(fileIds) {
+      const ids = (fileIds || []).filter(id => id)
+      if (!ids.length) return
+      const token = wx.getStorageSync('token') || ''
+      request({
+        url: CONFIG.BASE_URL + '/api/cancel_page_analysis',
+        method: 'POST',
+        header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
+        data: { file_ids: ids },
+        fail: () => { /* 取消是尽力而为，失败不影响主流程 */ }
+      })
+    },
+
+    // 收集列表中所有"已上传但页数未确认"的文件并取消其分析（关闭小程序/删除文件时避免本地白下载）
+    _cancelAllPendingPageAnalyses() {
+      const ids = (this.data.selectedFiles || [])
+        .filter(f => f && f.fileId && !(f.pageCount > 0))
+        .map(f => f.fileId)
+      if (ids.length) this._cancelPageAnalysis(ids)
+    },
+
     // 页面重新可见时恢复页数轮询（仅对已上传且仍缺页数的文件）
     _restartPageCountPolls() {
       const files = this.data.selectedFiles || []
@@ -1220,10 +1400,12 @@ Component({
                 // 页数已验证，更新文件数据并重新校验已有的页码范围
                 const files = this.data.selectedFiles
                 if (files[fileIndex] && files[fileIndex].fileId === fileId) {
-                  this.setData({
+                  const patch = {
                     ['selectedFiles[' + fileIndex + '].pageCount']: pc,
                     ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'confirmed',
-                  })
+                  }
+                  if (pc === 1) patch['selectedFiles[' + fileIndex + '].duplex'] = 'off'  // 单页固定单面
+                  this.setData(patch)
                   this._normalizeAndValidateRangeLines(fileIndex)
                 }
                 this._stopPageCountPoll(fileIndex)
@@ -1264,9 +1446,9 @@ Component({
         })
       }
 
-      // 立即发第一次，之后每 2 秒一次
+      // 立即发第一次，之后每 5 秒一次（原 2s 过于频繁，多个未验证文件会触发 Nginx 限流）
       poll()
-      this._pollTimers[fileIndex] = setInterval(poll, 2000)
+      this._pollTimers[fileIndex] = setInterval(poll, 5000)
     },
 
     _stopPageCountPoll(fileIndex) {
@@ -1473,8 +1655,19 @@ Component({
     onFileDuplexChange(e) {
       const index = e.currentTarget.dataset.index
       const value = e.currentTarget.dataset.value
-      if (this.data.selectedFiles[index] && (this.data.selectedFiles[index].excelWarning || this.data.selectedFiles[index].unsupportedFormat)) return
+      const f = this.data.selectedFiles[index]
+      if (!f || f.excelWarning || f.unsupportedFormat) return
+      if (f.pageCount === 1) return  // 单页文件无法双面，固定单面
       this.setData({ ['selectedFiles[' + index + '].duplex']: value })
+    },
+
+    // 图片打印方向（仅图片）：auto=自动 / landscape=横向 / portrait=竖向
+    onFileImageOrientation(e) {
+      const index = e.currentTarget.dataset.index
+      const value = e.currentTarget.dataset.value
+      const f = this.data.selectedFiles[index]
+      if (!f || !f.isImage) return
+      this.setData({ ['selectedFiles[' + index + '].imageOrientation']: value })
     },
 
     onDuplexChange(e) {
@@ -1985,18 +2178,47 @@ Component({
       }, 180)
     },
 
-    onCountdownMinInput(e) {
-      let v = parseInt(e.detail.value, 10)
-      if (isNaN(v) || v < 0) v = 0
-      if (v > 10079) v = 10079
-      this.setData({ countdownMin: v })
+    // ── 倒计时选择弹窗（分 + 秒，范围 00-59，复用"指定时间"同款滚轮引擎） ──
+
+    onOpenScheduleCountdownPicker() {
+      if (this.data.modalClosing) return
+      const mi = Math.min(Math.max(parseInt(this.data.countdownMin, 10) || 0, 0), 59)
+      const si = Math.min(Math.max(parseInt(this.data.countdownSec, 10) || 0, 0), 59)
+      this.setData({
+        showScheduleCountdownPicker: true,
+        countdownMinWheelIndex: mi,
+        countdownSecWheelIndex: si,
+        countdownWheelValue: [mi, si],
+      })
     },
 
-    onCountdownSecInput(e) {
-      let v = parseInt(e.detail.value, 10)
-      if (isNaN(v) || v < 0) v = 0
-      if (v > 59) v = 59
-      this.setData({ countdownSec: v })
+    onCountdownWheelChange(e) {
+      const v = (e.detail && e.detail.value) || []
+      if (v.length < 2) return
+      this.setData({
+        countdownMinWheelIndex: v[0],
+        countdownSecWheelIndex: v[1],
+        countdownWheelValue: [v[0], v[1]],
+      })
+    },
+
+    onConfirmScheduleCountdown() {
+      const mi = this.data.countdownMinWheelIndex
+      const si = this.data.countdownSecWheelIndex
+      if (mi == null || si == null) {
+        wx.showToast({ title: '请选择有效倒计时', icon: 'none', duration: 2000 })
+        return
+      }
+      this.setData({ countdownMin: mi, countdownSec: si })
+      this.onCloseScheduleCountdownPicker()
+    },
+
+    onCloseScheduleCountdownPicker() {
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showScheduleCountdownPicker: false, modalClosing: false })
+      }, 180)
     },
 
     // 预约校验：返回错误文案（空串 = 通过）
@@ -2017,7 +2239,7 @@ Component({
       if (scheduleMode === 'countdown') {
         const min = parseInt(this.data.countdownMin, 10) || 0
         const sec = parseInt(this.data.countdownSec, 10) || 0
-        if (min > 10079 || sec > 59) return '倒计时时长无效'
+        if (min > 59 || sec > 59) return '倒计时时长无效'
         if (min === 0 && sec === 0) return '倒计时时长必须大于 0'
         return ''
       }
@@ -2056,10 +2278,22 @@ Component({
         return
       }
 
-      // 检查是否有可打印的文件（排除 Excel 等不支持格式）
+      // 检查是否有可打印的文件（排除 Excel/PPT/CAD 等不支持格式）
       const printable = selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat)
+      const unsupportedCount = selectedFiles.length - printable.length
       if (printable.length === 0) {
-        wx.showToast({ title: '所选文件格式不支持打印', icon: 'none', duration: 2000 })
+        // 全部不支持 → 任务发起失败
+        wx.showModal({
+          title: '任务发起失败',
+          content: '所选文件均为不支持的文件格式（如 Excel/PPT/CAD），无法打印。请移除后重新选择，或联系管理员。',
+          showCancel: false,
+          confirmText: '知道了',
+        })
+        return
+      }
+      if (unsupportedCount > 0) {
+        // 部分不支持 → 提示将自动跳过
+        this.setData({ showUnsupportedSkipModal: true, unsupportedSkipCount: unsupportedCount })
         return
       }
 
@@ -2129,14 +2363,34 @@ Component({
       }, 200)
     },
 
+    // 确认跳过不支持格式（Excel/PPT/CAD），提交其余可打印文件
+    onConfirmSkipUnsupported() {
+      if (this.data.modalClosing) return
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showUnsupportedSkipModal: false, modalClosing: false })
+        this._doSubmit(false)
+      }, 200)
+    },
+
+    // 取消提交，返回修改选择
+    onCancelSkipUnsupported() {
+      this.setData({ modalClosing: true })
+      setTimeout(() => {
+        this.setData({ showUnsupportedSkipModal: false, modalClosing: false })
+      }, 200)
+    },
+
     _doSubmit(skipPageValidation) {
       if (this.data.submitting) return   // 防连点：提交进行中直接忽略
       const { selectedFiles } = this.data
+      // 提交时跳过不支持格式（Excel/PPT/CAD），仅提交可打印文件
+      const printableFiles = selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat)
 
       this.setData({ submitting: true })
       wx.showLoading({ title: '提交中...' })
 
-      const filesPayload = selectedFiles.map(f => {
+      const filesPayload = printableFiles.map(f => {
         // 从多行输入合并出 page_range（确保 blur 前的输入也不丢失）
         const lines = (f.rangeLines || []).filter(l => (l.value || '').trim() && !l.error)
         const range = lines.map(l => l.value.trim()).join(',')
@@ -2145,7 +2399,8 @@ Component({
           file: f.name,
           copies: Number(f.copies),
           page_range: range || f.pageRange || '',
-          duplex: f.duplex || 'on',
+          duplex: (f.isImage || f.pageCount === 1) ? 'off' : (f.duplex || 'on'),  // 图片/单页固定单面
+          image_orientation: f.isImage ? (f.imageOrientation || 'auto') : 'auto',
         }
       })
 
@@ -2201,6 +2456,9 @@ Component({
             lastOrderNumber: submitRes.data.order_number || '',
             lastScheduleText: this._scheduleDisplayText(),
           })
+          // 任务发起后自动收起"打印文件"列表（高度补间归零，返回初始状态）
+          this._fileListPx = 0
+          this._animateFileListHeight(0, 300)
           // 隐藏 tab 栏发丝线，让成功弹窗与 tab 栏融为一体
           try {
             const tabBar = this.getTabBar && this.getTabBar()

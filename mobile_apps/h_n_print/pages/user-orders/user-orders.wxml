@@ -73,7 +73,7 @@
           </view>
           <view wx:else class="order-card-meta">
             <text class="order-card-stat">📄 {{item.total_pages || (item.page_count * item.copies)}} 页</text>
-            <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份 · {{item.duplex === 'on' ? '双面' : '单面'}}</text>
+            <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份</text>
           </view>
           <view class="order-card-footer">
             <text class="order-created">{{item.created_at}}</text>
@@ -91,10 +91,6 @@
             <view class="detail-row">
               <text class="detail-label">提交时间</text>
               <text class="detail-value">{{item.created_at}}</text>
-            </view>
-            <view wx:if="{{!item.isExcel}}" class="detail-row">
-              <text class="detail-label">打印模式</text>
-              <text class="detail-value">{{item.duplex === 'on' ? '双面' : '单面'}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计页数</text>
@@ -119,6 +115,7 @@
               </view>
               <view class="detail-file-right">
                 <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
+                <text class="detail-file-range">{{f.duplex === 'on' ? '双面' : '单面'}}</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
               </view>
             </view>
@@ -145,7 +142,7 @@
           <view class="detail-section">
             <view class="detail-row detail-price-row">
               <text class="detail-label">合计价格</text>
-              <text class="detail-value detail-price-value">¥{{item.totalPriceDisplay}}</text>
+              <text class="detail-price-value status-{{item.status}}">¥{{item.totalPriceDisplay}}</text>
             </view>
           </view>
 

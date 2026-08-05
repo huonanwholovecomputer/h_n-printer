@@ -107,6 +107,12 @@ journalctl -u printer-backend -n 50 # 最近50条日志
 
 ## 7. 配置 Nginx
 
+> **注意（防滥用限速）**：`nginx-http.conf` / `nginx-https.conf` 已内置 IP 维度 `limit_req`
+> 限速（上传接口 30r/m、其余 /api/ 60r/m，Socket.IO 豁免）。**升级时若服务器上还是旧版配置，
+> 需要重新 `cp` 一份新版配置并 `nginx -t && systemctl reload nginx`**，否则限速不生效。
+> 共享出口 IP（学校/办公 NAT）场景若误杀，调大 rate/burst 或删除对应 `limit_req` 即可，
+> 后端每用户配额与排队超时淘汰仍是核心防线。
+
 ### 仅 HTTP（测试阶段）
 
 ```bash

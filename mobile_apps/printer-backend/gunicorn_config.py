@@ -61,6 +61,7 @@ def post_worker_init(worker):
         recover_stale_downloading,
         cleanup_abandoned_reserved_orders,
         recover_stale_printing_tasks,
+        expire_stale_queued_orders,
     )
 
     # 先执行数据库初始化/迁移（生产环境 Gunicorn 不会触发 __main__）
@@ -71,6 +72,12 @@ def post_worker_init(worker):
     # 进程重启后丢失；不重置的话上次进程的 printing 会永久卡住，直到 5 分钟孤儿回收）
     recover_stale_printing_tasks()
     print("[RECOVER] 启动时 printing 残留检查完成")
+
+    # 幽灵文件清理：物理已清理/路径已清空的 files 记录 → 删除。
+    # 存量幽灵若不清理，会在每次打印机上线补推页数分析时反复推送已清理文件（下载 404 刷屏）。
+    # cleanup_expired_files 内部含幽灵清理（不受保留期限制），启动时执行一次立即生效。
+    cleanup_expired_files()
+    print("[CLEANUP] 启动时幽灵文件记录清理完成")
 
     def _ensure_job(job_id, fn, **kwargs):
         """按 id 幂等注册：避免 reload / 直跑模式下重复添加"""
@@ -88,6 +95,8 @@ def post_worker_init(worker):
     _ensure_job("scan_scheduled", process_scheduled_orders, seconds=30)
     _ensure_job("recover_stale_downloads", recover_stale_downloading, minutes=2)
     _ensure_job("cleanup_reserved", cleanup_abandoned_reserved_orders, minutes=5)
+    # 防滥用：排队超时淘汰（阈值由 /api/admin/security 调整）
+    _ensure_job("expire_stale_queued", expire_stale_queued_orders, minutes=10)
 
     try:
         scheduler.start()

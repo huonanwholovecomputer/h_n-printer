@@ -43,13 +43,21 @@ STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃�
 MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
 
-def get_cached_pdf_path(source_md5: str) -> str | None:
+def pdf_cache_key(source_md5: str, image_orientation: str = "") -> str:
+    """PDF 缓存 key：图片显式方向（landscape/portrait）时加方向后缀，其余用纯 MD5（向后兼容既有缓存）。
+    图片不同方向渲染结果不同，必须分开缓存，否则改方向后仍命中旧方向 PDF。"""
+    if image_orientation in ("landscape", "portrait"):
+        return f"{source_md5}_{image_orientation}"
+    return source_md5
+
+
+def get_cached_pdf_path(source_md5: str, image_orientation: str = "") -> str | None:
     """模块级函数：检查 PDF 缓存（供 PrintWorker 使用）。
     返回缓存 PDF 路径，无缓存返回 None。"""
     if not source_md5:
         return None
     cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
-    pdf_path = os.path.join(cache_dir, f"{source_md5}.pdf")
+    pdf_path = os.path.join(cache_dir, pdf_cache_key(source_md5, image_orientation) + ".pdf")
     if os.path.isfile(pdf_path):
         return pdf_path
     return None
@@ -64,8 +72,11 @@ class CloudTask:
         "page_range", "download_url", "created_at",
         "local_path", "download_progress", "status",
         "error_message", "source_md5",
+        "image_orientation",
         "delivery_enabled", "delivery_location", "urgency", "cover_page", "cover_page_price",
         "auto_print",
+        # 无障碍打印预约（此前 __init__ 已赋值但这些字段漏在 __slots__ 之外 → 构造必报 AttributeError）
+        "schedule_mode", "scheduled_at", "scheduled_ts", "schedule_frozen",
     )
 
     def __init__(self, data: dict):
@@ -86,6 +97,8 @@ class CloudTask:
         self.status: str = "pending"  # pending | downloading | ready | accepted | rejected | error
         self.error_message: str = ""
         self.source_md5: str = data.get("source_md5", "") or ""  # 后端传来的文件 MD5，用于 PDF 缓存查找
+        # 图片打印方向（仅图片文件有意义）：auto | landscape | portrait
+        self.image_orientation: str = options.get("image_orientation", data.get("image_orientation", "auto")) or "auto"
         # 附加服务（来自前端订单配置，传递给本地标签页）
         self.delivery_enabled: bool = bool(data.get("delivery_enabled", False))
         self.delivery_location: str = data.get("delivery_location", "") or ""
@@ -115,6 +128,7 @@ class CloudTask:
             "status": self.status,
             "error_message": self.error_message,
             "source_md5": self.source_md5,
+            "image_orientation": self.image_orientation,
         }
 
 
@@ -198,6 +212,12 @@ class CloudClient(QObject):
         self._pending_tasks: dict[int, CloudTask] = {}
         # P1: 下载并发上限 4（原 _download_lock 为死代码，从未使用）
         self._download_semaphore = threading.BoundedSemaphore(4)
+        # 防滥用：页数分析并发上限 2（每个分析线程会下载完整文件并 COM 转换；
+        # 防批量上传大文件时分析线程无界堆积拖垮本机，与 _download_semaphore 独立计）
+        self._analyze_semaphore = threading.BoundedSemaphore(2)
+        # 页数分析取消标记：file_id → True（后端 cancel_page_analysis 事件置位，
+        # 分析线程在下载/转换各阶段检查后中止且不回报）
+        self._analysis_abort: dict[str, bool] = {}
         self._cache_index_lock = threading.Lock()
         # 从本地持久化文件加载上次的保留时间（避免每次启动都从 7 天开始）
         self._load_retention()
@@ -329,11 +349,15 @@ class CloudClient(QObject):
             task.status = "accepted"
         return task
 
-    def report_success(self, task_id: int):
-        """上报打印成功到云端。断线或发送失败时暂存离线队列，联网后补报。"""
+    def report_success(self, task_id: int, config: dict | None = None):
+        """上报打印成功到云端（可附带实际打印配置，供后端同步 order_files）。
+        断线或发送失败时暂存离线队列，联网后补报。"""
+        payload = {"task_id": task_id}
+        if config:
+            payload.update(config)
         if self._sio and self._connected:
             try:
-                self._sio.emit("print_success", {"task_id": task_id})
+                self._sio.emit("print_success", payload)
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印成功")
                 return
             except Exception as e:
@@ -587,8 +611,8 @@ class CloudClient(QObject):
                     for item in data["orders"]:
                         try:
                             task = CloudTask(item)
-                        except (TypeError, ValueError) as e:
-                            # P1: 单条数据解析失败不拖垮整个拉取
+                        except (TypeError, ValueError, AttributeError) as e:
+                            # P1: 单条数据解析失败不拖垮整个拉取（AttributeError 兜底 __slots__ 遗漏）
                             logger.error(f"解析拉取的任务数据失败，已跳过: {e}")
                             continue
                         if task.task_id not in self._pending_tasks:
@@ -681,8 +705,8 @@ class CloudClient(QObject):
         def _on_print_task(data):
             try:
                 task = CloudTask(data)
-            except (TypeError, ValueError) as e:
-                # P1: 单条推送数据解析失败不崩溃，跳过该任务
+            except (TypeError, ValueError, AttributeError) as e:
+                # P1: 单条推送数据解析失败不崩溃，跳过该任务（AttributeError 兜底 __slots__ 遗漏）
                 logger.error(f"解析推送的任务数据失败，已跳过: {e}")
                 self.status_message.emit(f"☁ 收到无法解析的云任务，已跳过: {e}")
                 return
@@ -714,14 +738,17 @@ class CloudClient(QObject):
             file_id = data.get("file_id", "")
             file_name = data.get("file_name", "")
             download_url = data.get("download_url", "")
+            source_md5 = data.get("source_md5", "") or ""  # 后端携带 MD5 → 本地可先查缓存免下载
             if file_id and download_url:
                 self.status_message.emit(f"☁ 收到页数分析请求: {file_name}")
-                t = threading.Thread(
-                    target=self._analyze_and_report_page_count,
-                    args=(file_id, download_url, file_name),
-                    daemon=True,
-                )
-                t.start()
+                self._spawn_analysis_thread(file_id, download_url, file_name, source_md5)
+
+        @self._sio.on("cancel_page_analysis")
+        def _on_cancel_page_analysis(data):
+            file_id = data.get("file_id", "")
+            if file_id:
+                self._analysis_abort[file_id] = True
+                self.status_message.emit(f"⛔ 已请求取消页数分析: {file_id[:8]}...")
 
         @self._sio.on("storage_config_updated")
         def _on_storage_config_updated(data):
@@ -906,9 +933,9 @@ class CloudClient(QObject):
             self.task_updated.emit(task)
             return
 
-        # 若后端已提供 source_md5 且本地 PDF 缓存已命中，跳过下载
+        # 若后端已提供 source_md5 且本地 PDF 缓存已命中，跳过下载（图片按方向后缀分开缓存）
         if task.source_md5:
-            cached_pdf, cached_meta = self._get_cached_pdf(task.source_md5)
+            cached_pdf, cached_meta = self._get_cached_pdf(task.source_md5, task.image_orientation)
             if cached_pdf:
                 task.local_path = cached_pdf
                 task.status = "ready"
@@ -1117,10 +1144,11 @@ class CloudClient(QObject):
                 md5.update(chunk)
         return md5.hexdigest()
 
-    def _get_cached_pdf(self, md5: str) -> tuple[str | None, dict | None]:
+    def _get_cached_pdf(self, md5: str, image_orientation: str = "") -> tuple[str | None, dict | None]:
         """查找指定 MD5 的缓存 PDF。返回 (pdf_path, metadata) 或 (None, None)。
-        P0-2: 命中时校验文件头 %PDF，损坏则删除并返回 None（自愈）。"""
-        pdf_path = os.path.join(self._cache_dir, f"{md5}.pdf")
+        图片按方向后缀分开缓存（landscape/portrait）。P0-2: 命中时校验文件头 %PDF。"""
+        key = pdf_cache_key(md5, image_orientation)
+        pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
         if os.path.isfile(pdf_path):
             try:
                 with open(pdf_path, "rb") as f:
@@ -1134,41 +1162,44 @@ class CloudClient(QObject):
                 except OSError:
                     pass
                 index = self._load_cache_index()
-                if md5 in index:
-                    del index[md5]
+                if key in index:
+                    del index[key]
                     self._save_cache_index(index)
                 return None, None
             index = self._load_cache_index()
-            meta = index.get(md5, {})
+            meta = index.get(key, {})
             return pdf_path, meta
         return None, None
 
-    def remove_cached_pdf(self, source_md5: str):
-        """删除指定 MD5 的缓存 PDF 及其索引条目（用于放弃订单时清理）。"""
+    def remove_cached_pdf(self, source_md5: str, image_orientation: str = ""):
+        """删除指定 MD5（可含方向后缀）的缓存 PDF 及其索引条目（用于放弃订单时清理）。"""
         if not source_md5:
             return
-        pdf_path = os.path.join(self._cache_dir, f"{source_md5}.pdf")
+        key = pdf_cache_key(source_md5, image_orientation)
+        pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
         if os.path.isfile(pdf_path):
             try:
                 os.remove(pdf_path)
             except OSError:
                 pass
         index = self._load_cache_index()
-        if source_md5 in index:
-            del index[source_md5]
+        if key in index:
+            del index[key]
             self._save_cache_index(index)
-            self.status_message.emit(f"📦 已清理缓存: MD5={source_md5[:8]}...")
+            self.status_message.emit(f"📦 已清理缓存: {key[:8]}...")
 
-    def _save_pdf_to_cache(self, md5: str, pdf_path: str, original_name: str, source_ext: str, page_count: int = 0):
-        """将 PDF 文件存入缓存并更新索引。"""
-        dest = os.path.join(self._cache_dir, f"{md5}.pdf")
+    def _save_pdf_to_cache(self, md5: str, pdf_path: str, original_name: str, source_ext: str,
+                           page_count: int = 0, image_orientation: str = ""):
+        """将 PDF 文件存入缓存并更新索引（图片按方向后缀分开缓存）。"""
+        key = pdf_cache_key(md5, image_orientation)
+        dest = os.path.join(self._cache_dir, f"{key}.pdf")
         # P0-2: 原子写（tmp + os.replace），避免 copy2 截断式写入损坏缓存
         if not os.path.exists(dest) or not os.path.samefile(pdf_path, dest):
             tmp = dest + ".tmp"
             shutil.copy2(pdf_path, tmp)
             os.replace(tmp, dest)
         index = self._load_cache_index()
-        index[md5] = {
+        index[key] = {
             "original_name": original_name,
             "source_ext": source_ext,
             "page_count": page_count,
@@ -1217,25 +1248,62 @@ class CloudClient(QObject):
 
     # ── 页数分析 ──
 
-    def _analyze_and_report_page_count(self, file_id: str, download_url: str, file_name: str):
-        """后台：下载 → MD5 查缓存 → 转换 PDF（如需） → 统计页数 → 回报后端。
-        PDF 缓存由 MD5 索引，同文件再次上传时直接复用缓存 PDF，避免重复转换。"""
+    def _spawn_analysis_thread(self, file_id: str, download_url: str, file_name: str, source_md5: str = ""):
+        """以受限并发启动一个页数分析线程（防滥用：防分析线程无界堆积拖垮本机）。
+        用独立信号量排队，等待者不占线程栈；超出的请求排队而非直接丢弃。"""
+        def _worker():
+            self._analyze_semaphore.acquire()
+            try:
+                self._analyze_and_report_page_count(file_id, download_url, file_name, source_md5)
+            finally:
+                self._analyze_semaphore.release()
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        self._download_threads.append(t)  # 纳入 stop() 的 join 管理
+
+    def _analyze_and_report_page_count(self, file_id: str, download_url: str, file_name: str,
+                                       source_md5: str = ""):
+        """后台：查缓存（后端 MD5 → 免下载） → 下载 → MD5 查缓存 → 转换 PDF → 统计页数 → 回报后端。
+        支持取消：cancel_page_analysis 事件置位 _analysis_abort[file_id]，下载/转换各阶段检查后中止且不回报。"""
         ext = os.path.splitext(file_name)[1].lower()
         temp_dl: str = ""
         temp_pdf: str | None = None
+        # 新一轮分析开始：清掉可能残留的取消标记（取消后同一 file_id 可能被重新发起）
+        self._analysis_abort.pop(file_id, None)
+
+        def _canceled() -> bool:
+            return bool(self._analysis_abort.get(file_id))
 
         try:
-            # 1. 下载文件到临时路径
+            # 0. 后端已带 MD5 → 先查 PDF 缓存，命中则跳过下载（本地按云端 MD5 直接命中）
+            if source_md5:
+                cached_pdf, cached_meta = self._get_cached_pdf(source_md5)
+                if cached_pdf and cached_meta:
+                    from pdf_printer import get_pdf_info
+                    info = get_pdf_info(cached_pdf)
+                    page_count = info.get("page_count", 0)
+                    if page_count > 0 and not _canceled():
+                        self.status_message.emit(
+                            f"📦 缓存命中(云端MD5): {file_name} → {page_count} 页，跳过下载")
+                        self._report_page_count(file_id, file_name, page_count, info.get("orientation", ""))
+                        return
+
+            # 1. 下载文件到临时路径（每块检查取消标记）
             self.status_message.emit(f"☁ 页数分析: 下载 {file_name} ...")
             temp_dl = os.path.join(tempfile.gettempdir(), f"hn_analyze_{file_id}{ext}")
             resp = http_requests.get(download_url, timeout=120, stream=True)
             resp.raise_for_status()
             with open(temp_dl, "wb") as wf:
                 for chunk in resp.iter_content(chunk_size=65536):
+                    if _canceled():
+                        self.status_message.emit(f"⛔ 页数分析已取消(下载中止): {file_name}")
+                        return
                     wf.write(chunk)
 
-            # 2. 计算源文件 MD5，查缓存
-            source_md5 = self._compute_md5_file(temp_dl)
+            # 2. 计算源文件 MD5（后端未带 MD5 时的兜底），查缓存
+            if not source_md5:
+                source_md5 = self._compute_md5_file(temp_dl)
             cached_pdf, cached_meta = self._get_cached_pdf(source_md5)
 
             if cached_pdf and cached_meta:
@@ -1245,12 +1313,14 @@ class CloudClient(QObject):
                 info = get_pdf_info(cached_pdf)
                 page_count = info.get("page_count", 0)
                 orientation = info.get("orientation", "")
-                if page_count > 0:
+                if page_count > 0 and not _canceled():
                     self._report_page_count(file_id, file_name, page_count, orientation)
                     return
 
             # 3. 确定是否需要转换（优先 Word/WPS COM，降级 LibreOffice 子进程）
             if ext in (".doc", ".docx"):
+                if _canceled():
+                    return
                 self.status_message.emit(f"☁ 页数分析: 转换 {file_name} → PDF ...")
                 try:
                     from converter import get_converter
@@ -1264,8 +1334,10 @@ class CloudClient(QObject):
                     info = get_pdf_info(temp_pdf)
                     page_count = info.get("page_count", 0)
                     self._save_pdf_to_cache(source_md5, temp_pdf, file_name, ext, page_count)
-                    if page_count > 0:
+                    if page_count > 0 and not _canceled():
                         self._report_page_count(file_id, file_name, page_count, info.get("orientation", ""))
+                    elif _canceled():
+                        self.status_message.emit(f"⛔ 页数分析已取消: {file_name}")
                     else:
                         self.status_message.emit(f"☁ 页数分析失败: 转换后无法读取 {file_name} 页数")
                 else:
@@ -1274,16 +1346,20 @@ class CloudClient(QObject):
                 from pdf_printer import get_pdf_info
                 info = get_pdf_info(temp_dl)
                 page_count = info.get("page_count", 0)
-                if page_count > 0:
+                if page_count > 0 and not _canceled():
                     self._report_page_count(file_id, file_name, page_count, info.get("orientation", ""))
                 else:
                     self.status_message.emit(f"☁ 页数分析失败: 无法读取 {file_name} 页数")
             else:
-                self._report_page_count(file_id, file_name, 1, "")
+                if not _canceled():
+                    self._report_page_count(file_id, file_name, 1, "")
 
         except Exception as e:
-            self.status_message.emit(f"☁ 页数分析失败 ({file_name}): {e}")
-            logger.warning(f"页数分析失败 ({file_name}): {e}")
+            if _canceled():
+                self.status_message.emit(f"⛔ 页数分析已取消: {file_name}")
+            else:
+                self.status_message.emit(f"☁ 页数分析失败 ({file_name}): {e}")
+                logger.warning(f"页数分析失败 ({file_name}): {e}")
 
         finally:
             for p in (temp_dl, temp_pdf):
@@ -1292,6 +1368,7 @@ class CloudClient(QObject):
                         os.remove(p)
                     except OSError:
                         pass
+            self._analysis_abort.pop(file_id, None)   # 分析结束清除取消标记
 
     @staticmethod
     def _convert_via_libreoffice(input_path: str) -> str | None:

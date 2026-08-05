@@ -54,7 +54,7 @@ body {
   box-shadow: 0 4px 20px rgba(15,15,40,.25);
 }
 .header-inner {
-  max-width: 1180px; margin: 0 auto; padding: 12px 20px 0;
+  max-width: 1180px; margin: 0 auto; padding: 12px 64px 0 20px;   /* 右侧预留悬浮主题按钮空间 */
   display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
 }
 .app-header h1 { font-size: 1.18rem; font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
@@ -181,11 +181,11 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 }
 .filter-bar .f-item label { display: block; font-size: .78rem; font-weight: 600; color: var(--muted); margin-bottom: 5px; }
 .status-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-.status-dot.sent { background: #16a34a; } .status-dot.printing { background: #4f6ef7; }
-.status-dot.queued { background: #f59e0b; } .status-dot.failed { background: #dc2626; }
-.status-dot.canceled { background: #9ca3af; } .status-dot.offline_unknown { background: #8b5cf6; }
-.status-dot.rejected { background: #991b1b; } .status-dot.accepted { background: #6366f1; }
-.status-dot.abandoned { background: #d97706; } .status-dot.reserved { background: #a1a1aa; }
+.status-dot.sent { background: #2E7D32; } .status-dot.printing { background: #1565C0; }
+.status-dot.queued { background: #E65100; } .status-dot.failed { background: #C62828; }
+.status-dot.canceled { background: #9E9E9E; } .status-dot.offline_unknown { background: #F57F17; }
+.status-dot.rejected { background: #E65100; } .status-dot.accepted { background: #1565C0; }
+.status-dot.abandoned { background: #7B1FA2; } .status-dot.reserved { background: #F57F17; }
 
 /* ==================== 标签 ==================== */
 .tag { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .74rem; font-weight: 600; }
@@ -196,6 +196,27 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 [data-theme="dark"] .tag.y { color: #fbbf24; }
 .tag.p { background: rgba(139,92,246,.15); color: #8b5cf6; }
 [data-theme="dark"] .tag.p { color: #a78bfa; }
+/* 订单状态标签配色：与微信小程序 status-* 完全一致（亮色=小程序亮色主题，深色=小程序暗色主题） */
+.tag.st-sent            { background: #E8F5E9; color: #2E7D32; }
+.tag.st-printing        { background: #E3F2FD; color: #1565C0; }
+.tag.st-accepted        { background: #E3F2FD; color: #1565C0; }
+.tag.st-queued          { background: #FFF3E0; color: #E65100; }
+.tag.st-failed          { background: #FFEBEE; color: #C62828; }
+.tag.st-canceled        { background: #F5F5F5; color: #9E9E9E; }
+.tag.st-rejected        { background: #FFF3E0; color: #E65100; }
+.tag.st-abandoned       { background: #F3E5F5; color: #7B1FA2; }
+.tag.st-reserved        { background: #FFF8E1; color: #F57F17; }
+.tag.st-offline_unknown { background: #FFF8E1; color: #F57F17; }
+[data-theme="dark"] .tag.st-sent            { background: rgba(129,199,132,.15); color: #81C784; }
+[data-theme="dark"] .tag.st-printing        { background: rgba(100,181,246,.15); color: #64B5F6; }
+[data-theme="dark"] .tag.st-accepted        { background: rgba(100,181,246,.15); color: #64B5F6; }
+[data-theme="dark"] .tag.st-queued          { background: rgba(255,179,77,.15); color: #FFB74D; }
+[data-theme="dark"] .tag.st-failed          { background: rgba(229,115,115,.15); color: #E57373; }
+[data-theme="dark"] .tag.st-canceled        { background: rgba(174,174,178,.15); color: #AEAEB2; }
+[data-theme="dark"] .tag.st-rejected        { background: rgba(255,179,77,.15); color: #FFB74D; }
+[data-theme="dark"] .tag.st-abandoned       { background: rgba(186,104,200,.15); color: #BA68C8; }
+[data-theme="dark"] .tag.st-reserved        { background: rgba(255,213,79,.15); color: #FFD54F; }
+[data-theme="dark"] .tag.st-offline_unknown { background: rgba(255,213,79,.15); color: #FFD54F; }
 .member-tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: .82rem; font-weight: 600; color: #fff; box-shadow: var(--shadow-sm); }
 .member-del { cursor: pointer; opacity: .65; font-size: 1rem; transition: opacity .15s ease; }
 .member-del:hover { opacity: 1; }
@@ -261,10 +282,26 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 /* ==================== 订单明细 ==================== */
 .order-row { cursor: pointer; }
 .order-row.expanded { background: var(--primary-soft); }
-.file-sub-row { background: var(--card-2); font-size: .8rem; }
-.file-sub-row td { padding: 6px 14px 6px 36px; color: var(--muted); }
+/* 展开容器：整块内容高度 0fr↔1fr 过渡，下方订单行随高度平滑下移/上移 */
+.file-expand-cell { padding: 0; border-bottom: none; }
+.file-expand.open .file-expand-cell { border-bottom: 1px solid var(--border); }
+.file-expand-body {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows .32s cubic-bezier(.4, 0, .2, 1);
+}
+.file-expand.open .file-expand-body { grid-template-rows: 1fr; }
+.file-expand-inner { min-height: 0; overflow: hidden; }
+/* 文件明细网格：文件名弹性占宽，信息列定宽 */
+.file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 78px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
+.file-grid .fn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+.file-grid.file-sub-head { font-size: .72rem; font-weight: 600; color: var(--muted); background: var(--card-2); border-top: 1px solid var(--border-strong); padding-top: 5px; padding-bottom: 5px; }
+.file-grid.file-sub-row { color: var(--muted); border-top: 1px dashed var(--border); }
 .expand-icon { display: inline-block; transition: transform .2s ease; font-size: .68rem; margin-right: 4px; color: var(--muted); }
 .order-row.expanded .expand-icon { transform: rotate(90deg); }
+/* 订单明细表：固定布局，列宽由表头决定，展开子行不重排列宽；min-width 保证窄窗口仍可横向滚动 */
+.order-table { table-layout: fixed; width: 100%; min-width: 960px; }
+.order-table .ell { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bound-badge { font-size: .7rem; padding: 1px 8px; border-radius: 999px; font-weight: 600; }
 .bound-badge.yes { background: rgba(22,163,74,.13); color: var(--pos); }
 .bound-badge.no { background: var(--card-2); color: var(--muted); }
@@ -299,9 +336,50 @@ html.theme-switching *::before, html.theme-switching *::after {
               box-shadow .5s ease, --header-from .5s ease, --header-to .5s ease !important;
 }
 
+/* ==================== 悬浮控件（右上主题 / 右下返回顶部，所有界面通用） ==================== */
+.floating-btn {
+  position: fixed; z-index: 90;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid rgba(127,127,127,.25);
+  background: rgba(255,255,255,.72);
+  color: var(--text);
+  backdrop-filter: blur(12px) saturate(160%);
+  -webkit-backdrop-filter: blur(12px) saturate(160%);
+  box-shadow: 0 4px 16px rgba(0,0,0,.15), inset 0 1px 0 rgba(255,255,255,.7);
+  cursor: pointer; user-select: none; font-family: inherit;
+  transition: transform .25s cubic-bezier(.34,1.56,.64,1), opacity .3s ease, background .3s ease, box-shadow .3s ease;
+}
+.floating-btn:hover { transform: translateY(-1px) scale(1.06); }
+.floating-btn:active { transform: scale(.86); }
+#themeToggle { top: 14px; right: 16px; width: 42px; height: 42px; border-radius: 21px; font-size: 1.15rem; }
+#backToTop {
+  right: 96px; bottom: 96px; width: 40px; height: 40px; border-radius: 20px;
+  opacity: 0; transform: scale(.8); pointer-events: none;
+}
+#backToTop.show { opacity: 1; transform: scale(1); pointer-events: auto; }
+[data-theme="dark"] .floating-btn {
+  background: rgba(26,26,28,.55); color: #e8eaf2;
+  box-shadow: 0 4px 16px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.12);
+}
+/* 返回顶部箭头：双短线拼成 ^ 形（与小程序一致） */
+.scroll-top-arrow { position: relative; width: 13px; height: 11px; }
+.scroll-top-arrow::before, .scroll-top-arrow::after {
+  content: ''; position: absolute; left: 50%; top: 0; width: 2.5px; height: 11px;
+  border-radius: 2px; background: currentColor; transform-origin: 50% 0%;
+}
+.scroll-top-arrow::before { transform: translateX(-50%) rotate(-35deg); }
+.scroll-top-arrow::after { transform: translateX(-50%) rotate(35deg); }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
 }
+
+/* ==================== 防误操作：禁用文字选择 / 元素拖动 ==================== */
+/* 整页禁止选中文字；输入框/下拉框/可编辑区保留选择，便于正常录入和粘贴 */
+body { user-select: none; -webkit-user-select: none; -moz-user-select: none; }
+input, textarea, select, [contenteditable="true"] { user-select: text; -webkit-user-select: text; -moz-user-select: text; }
+/* 图片/按钮等默认不可拖拽（页面暂无图片，此条仅作兜底） */
+img, button { -webkit-user-drag: none; }
 </style>
 <!-- Chart.js 本地优先，CDN 兜底 -->
 <script src="chart.umd.min.js"></script>
@@ -313,7 +391,6 @@ html.theme-switching *::before, html.theme-switching *::after {
     <h1><span class="logo">🖨️</span> 打印项目 · 收支清算</h1>
     <div class="header-right">
       <span class="cloud-pill" id="cloudPill"><span class="dot"></span> 检测中…</span>
-      <button class="icon-btn" id="themeToggle" title="切换主题">🌙</button>
       <span class="path-text" id="storageFilePath">☁ 云端</span>
     </div>
   </div>
@@ -335,6 +412,10 @@ html.theme-switching *::before, html.theme-switching *::after {
   <div class="tab" id="tab-settings"></div>
   <div class="tab" id="tab-about"></div>
 </main>
+
+<!-- 悬浮控件：右上角主题切换 + 右下角返回顶部（所有界面通用） -->
+<button class="floating-btn" id="themeToggle" title="切换主题">🌓</button>
+<button class="floating-btn" id="backToTop" title="返回顶部"><span class="scroll-top-arrow"></span></button>
 
 <div id="toastWrap"></div>
 <div id="modalRoot"></div>
@@ -358,6 +439,15 @@ var LAUNCH_TOKEN = '__LAUNCH_TOKEN__';
   }
 })();
 function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type': 'application/json' }; }
+
+/* ==================== 禁用右键菜单 ==================== */
+/* 阻止页面默认右键菜单，避免误触/误复制。输入框内保留右键（粘贴、拼写检查等仍可用）；Ctrl+C / Ctrl+V 不受影响。
+   若连输入框内的右键粘贴也要一并禁用，删掉下面 closest(...) 的判断即可。 */
+document.addEventListener('contextmenu', function (e) {
+  var el = e.target;
+  if (el && el.closest && el.closest('input, textarea, select, [contenteditable="true"]')) return;
+  e.preventDefault();
+});
 
 /* ==================== 常量 ==================== */
 var DEFAULT_MEMBERS = [
@@ -758,7 +848,7 @@ function effectiveTheme() {
 var theme = effectiveTheme();
 var _themeAnimT = null;
 var _firstApply = true;
-function themeIcon() { return themeMode === 'system' ? '🖥️' : (theme === 'dark' ? '🌙' : '☀️'); }
+function themeIcon() { return themeMode === 'system' ? '🌓' : (theme === 'dark' ? '🌙' : '☀️'); }
 function applyTheme(t) {
   var root = document.documentElement;
   var btn = $('#themeToggle');
@@ -892,14 +982,14 @@ function _destroyCloudCharts() {
   Object.keys(_cloudCharts).forEach(function (k) { if (_cloudCharts[k]) { _cloudCharts[k].destroy(); delete _cloudCharts[k]; } });
 }
 var STATUS_LABELS = {
-  sent: '已完成', printing: '打印中', queued: '排队中', failed: '失败', canceled: '已取消',
-  rejected: '已拒绝', accepted: '已接单', abandoned: '已放弃', reserved: '已预留', offline_unknown: '离线未知'
+  sent: '已完成', printing: '待添加', queued: '排队中', failed: '失败', canceled: '已取消',
+  rejected: '被打回', accepted: '已添加', abandoned: '放弃打印', reserved: '已预留', offline_unknown: '断线未知'
 };
-var STATUS_CLASSES = { sent: 'g', printing: 'b', queued: 'y', failed: 'r', canceled: '', rejected: 'r', accepted: 'b', abandoned: '', reserved: 'y', offline_unknown: 'p' };
+var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown' };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 function statusClass(s) { return STATUS_CLASSES[s] || ''; }
 var CHART_COLORS = {
-  status: { sent: '#16a34a', printing: '#4f6ef7', queued: '#f59e0b', failed: '#e11d48', canceled: '#9ca3af', rejected: '#991b1b', accepted: '#6366f1', abandoned: '#d97706', offline_unknown: '#8b5cf6', reserved: '#a1a1aa' },
+  status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', reserved: '#F57F17' },
   palette: ['#4f6ef7', '#34a853', '#f59e0b', '#8b5cf6', '#d97706', '#16a34a', '#e11d48', '#38bdf8', '#f472b6', '#a855f7', '#14b8a6', '#f97316']
 };
 function _statusColor(s) { return CHART_COLORS.status[s] || '#9ca3af'; }
@@ -985,9 +1075,16 @@ function onCloudMonthChange(val) { _cloudMonth = val; fetchCloudData(val); }
 function onCloudUserFilter(v) { _cloudUserFilter = v; renderCloud(); }
 function onCloudSourceFilter(v) { _cloudSourceFilter = v; renderCloud(); }
 function _toggleOrderExpand(oid) {
-  if (_cloudExpanded[oid]) delete _cloudExpanded[oid];
-  else _cloudExpanded[oid] = true;
-  renderCloud();
+  // 展开/收起仅切换 CSS class（grid 高度过渡），不重绘整表，避免已展开订单重播动画
+  var key = String(oid);
+  var orderRow = document.querySelector('tr.order-row[data-order="' + key + '"]');
+  if (!orderRow) return;
+  var isOpen = !!_cloudExpanded[key];
+  var expandRow = document.querySelector('tr.file-expand[data-suborder="' + key + '"]');
+  if (isOpen) delete _cloudExpanded[key];
+  else _cloudExpanded[key] = true;
+  orderRow.classList.toggle('expanded', !isOpen);
+  if (expandRow) expandRow.classList.toggle('open', !isOpen);
 }
 
 /* 成员映射 */
@@ -1018,20 +1115,21 @@ function chartTextColor() {
   return getComputedStyle(document.body).getPropertyValue('--text').trim() || '#1b1d2a';
 }
 
-function _renderStatusDonut(canvasId, orderStatusCount, fileStatusCount) {
+function _renderStatusDonut(canvasId, orderStatusCount) {
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
   var ctx = canvas.getContext('2d');
-  var src = Object.keys(fileStatusCount).length > 0 ? fileStatusCount : orderStatusCount;
+  var src = orderStatusCount;
   var sorted = Object.keys(src).sort(function (a, b) { return src[b] - src[a]; });
   var labels = [], data = [], colors = [];
   sorted.forEach(function (s) { labels.push(statusLabel(s)); data.push(src[s]); colors.push(_statusColor(s)); });
   var total = data.reduce(function (a, b) { return a + b; }, 0);
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'doughnut',
-    data: { labels: labels, datasets: [{ data: data, backgroundColor: colors, borderWidth: 2, borderColor: 'transparent' }] },
+    data: { labels: labels, datasets: [{ data: data, backgroundColor: colors, hoverBackgroundColor: colors.map(function (c) { return _mixToWhite(c, 0.15); }), hoverBorderColor: 'transparent', borderWidth: 2, borderColor: 'transparent', hoverOffset: 12 }] },
     options: {
       responsive: true, maintainAspectRatio: false, cutout: '58%',
+      layout: { padding: 24 },
       plugins: {
         legend: { position: 'right', labels: { font: { size: 11 }, padding: 10, boxWidth: 12, usePointStyle: true, color: chartTextColor() } },
         tooltip: { callbacks: { label: function (c) { var pct = total > 0 ? (c.parsed / total * 100).toFixed(1) : 0; return c.label + ': ' + c.parsed + ' (' + pct + '%)'; } } }
@@ -1050,9 +1148,10 @@ function _renderSourceDonut(canvasId, rs) {
   var data = [Math.max(cloudVal, 0.01), Math.max(localVal, 0.01)];
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'doughnut',
-    data: { labels: labels, datasets: [{ data: data, backgroundColor: ['#4f6ef7', '#34a853'], borderWidth: 2, borderColor: 'transparent' }] },
+    data: { labels: labels, datasets: [{ data: data, backgroundColor: ['#4f6ef7', '#34a853'], hoverBackgroundColor: ['#4f6ef7', '#34a853'].map(function (c) { return _mixToWhite(c, 0.15); }), hoverBorderColor: 'transparent', borderWidth: 2, borderColor: 'transparent', hoverOffset: 12 }] },
     options: {
       responsive: true, maintainAspectRatio: false, cutout: '55%',
+      layout: { padding: 24 },
       plugins: {
         legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } },
         tooltip: { callbacks: { label: function (c) {
@@ -1065,6 +1164,21 @@ function _renderSourceDonut(canvasId, rs) {
     }
   });
 }
+/* 颜色向白色混合生成高亮色，用于柱状图悬停放大效果 */
+function _mixToWhite(c, amt) {
+  var m = String(c).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  var r, g, b;
+  if (m) { r = +m[1]; g = +m[2]; b = +m[3]; }
+  else {
+    var h = String(c).replace('#', '');
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16);
+  }
+  r = Math.round(r + (255 - r) * amt);
+  g = Math.round(g + (255 - g) * amt);
+  b = Math.round(b + (255 - b) * amt);
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
 function _renderUserBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
@@ -1074,9 +1188,10 @@ function _renderUserBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
   var values = sorted.map(function (u) { return u[field]; });
   var maxVal = Math.max.apply(null, values.concat([0])) || 1;
   var barColors = sorted.map(function (u) { return barColorFn ? barColorFn(u, field, maxVal) : '#4f6ef7'; });
+  var barHover = barColors.map(function (c) { return _mixToWhite(c, 0.4); });
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'bar',
-    data: { labels: labels, datasets: [{ label: label, data: values, backgroundColor: barColors, borderRadius: 6 }] },
+    data: { labels: labels, datasets: [{ label: label, data: values, backgroundColor: barColors, hoverBackgroundColor: barHover, hoverBorderColor: barColors, hoverBorderWidth: 3, borderRadius: 6 }] },
     options: {
       responsive: true, maintainAspectRatio: false,
       plugins: {
@@ -1138,12 +1253,6 @@ function _countByStatus(orders) {
   orders.forEach(function (o) { var s = o.status || 'unknown'; map[s] = (map[s] || 0) + 1; });
   return map;
 }
-function _countFilesByStatus(orders) {
-  var map = {};
-  orders.forEach(function (o) { (o.files || []).forEach(function (f) { var s = f.status || 'unknown'; map[s] = (map[s] || 0) + 1; }); });
-  return map;
-}
-
 /* ==================== TAB: 总览 ==================== */
 function renderDash() {
   var el = $('#tab-dash');
@@ -1303,7 +1412,7 @@ function renderEntry() {
     if (!eid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
     h += '<tr>';
     h += '<td><input type="date" value="' + esc(e.date) + '" onchange="updExp(\'' + eid + '\',\'date\',this.value)"' + disabled + '></td>';
-    h += '<td class="l"><input value="' + esc(e.item) + '" onchange="updExp(\'' + eid + '\',\'item\',this.value)" placeholder="项目名称" style="width:170px"' + disabled + '></td>';
+    h += '<td class="l"><input type="text" value="' + esc(e.item) + '" onchange="updExp(\'' + eid + '\',\'item\',this.value)" placeholder="项目名称" style="width:300px"' + disabled + '></td>';
     h += '<td><input type="number" step="0.01" min="0" value="' + esc(e.amount) + '" onchange="updExp(\'' + eid + '\',\'amount\',+this.value)"' + disabled + '></td>';
     h += '<td><select onchange="updExp(\'' + eid + '\',\'payer\',this.value)"' + disabled + '>';
     members.forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (e.payer === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
@@ -1357,19 +1466,18 @@ function renderEntry() {
     var sc = m.scores[memId] || [];
     var capped = sc.reduce(function (s, x) { return s + Math.min(x.score || 0, scoreCap); }, 0);
     h += '<h3 style="margin:16px 0 8px;display:flex;align-items:center;gap:8px;font-size:.95rem"><span class="member-tag" style="background:' + sanitizeColor(mem.color) + '">' + esc(mem.name) + '</span> <span class="tag b">总分 ' + capped + '</span></h3>';
-    h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">评分项目</th><th>得分</th><th></th></tr></thead><tbody>';
+    h += '<div class="table-wrap"><table><thead><tr><th class="l">评分项目</th><th>得分</th><th></th></tr></thead><tbody>';
     sc.forEach(function (s) {
       var sid = safeId(s.id);
       if (!sid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
       var over = (s.score || 0) > scoreCap;
       h += '<tr>';
-      h += '<td><input type="date" value="' + esc(s.date) + '" onchange="updScore(\'' + sid + '\',\'date\',this.value)"' + disabledS + '></td>';
-      h += '<td class="l"><input value="' + esc(s.item) + '" onchange="updScore(\'' + sid + '\',\'item\',this.value)" placeholder="服务项目" style="width:200px"' + disabledS + '></td>';
+      h += '<td class="l"><input type="text" value="' + esc(s.item) + '" onchange="updScore(\'' + sid + '\',\'item\',this.value)" placeholder="服务项目" style="width:300px"' + disabledS + '></td>';
       h += '<td><input type="number" step="0.1" min="0" value="' + esc(s.score) + '" onchange="updScore(\'' + sid + '\',\'score\',+this.value)" style="width:80px;color:' + (over ? 'var(--neg)' : 'inherit') + '"' + disabledS + '>' + (over ? '<span style="color:var(--neg);font-size:.75rem"> ⚠超限</span>' : '') + '</td>';
       h += '<td><button class="btn danger sm" onclick="delScore(\'' + sid + '\')"' + disabledS + '>✕</button></td>';
       h += '</tr>';
     });
-    if (!sc.length) h += '<tr><td colspan="4" style="color:var(--muted)">暂无评分项</td></tr>';
+    if (!sc.length) h += '<tr><td colspan="3" style="color:var(--muted)">暂无评分项</td></tr>';
     h += '</tbody></table></div>';
     h += '<button class="btn sm" style="margin-top:6px" onclick="addScore(\'' + memId + '\')"' + disabledS + '>+ 为 ' + esc(mem.name) + ' 添加评分项</button>';
   });
@@ -1428,7 +1536,7 @@ function updScore(id, field, val) {
   var r = STORE.records.scores.find(function (x) { return x.id === id; });
   if (!r) return;
   r[field] = field === 'score' ? (+val || 0) : val;
-  save(); handleDateMove(r);
+  save();   // 日期列已移除，评分项归属月份固定，无需 handleDateMove 重绘（避免编辑失焦）
 }
 function delScore(id) { STORE.records.scores = STORE.records.scores.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
 function updNote(val) {
@@ -1498,7 +1606,6 @@ function renderCloud() {
   }
   var dailyTrend = _computeDailyTrend(filteredOrders);
   var orderStatusCount = _countByStatus(filteredOrders);
-  var fileStatusCount = _countFilesByStatus(filteredOrders);
 
   // KPI
   h += '<div class="kpi-grid">';
@@ -1615,38 +1722,40 @@ function renderCloud() {
   if (!filteredOrders.length) {
     h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
   } else {
-    h += '<div class="table-wrap"><table><thead><tr><th></th><th>订单号</th><th>来源</th><th>用户</th><th>状态</th><th>收益</th><th>文件</th><th>页数</th><th>类型</th><th>时间</th></tr></thead><tbody>';
+    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:70px">来源</th><th style="width:110px">用户</th><th style="width:88px">状态</th><th style="width:88px">收益</th><th style="width:70px">文件</th><th style="width:108px">页数</th><th style="width:114px">类型</th><th style="width:138px">时间</th></tr></thead><tbody>';
     filteredOrders.forEach(function (o) {
       var isExp = !!_cloudExpanded[o.order_id];
       var mo = o.openid === 'local' ? { name: '本地任务' } : memberOfOpenid(o.openid);
       var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
       var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
-      h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
+      var revColor = sanitizeColor(_statusColor(o.status));   // 收益金额配色跟随订单状态
+      // 收益列显示订单应有的金额（所有文件价格合计）；是否计入总收益由后端 rs.total（仅 sent）决定
+      var orderRev = (o.files || []).reduce(function (s, f) { return s + parseCents(f.total_price); }, 0);
+      h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
       h += '<td><span class="expand-icon">▶</span></td>';
-      h += '<td class="l" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
-      h += '<td>' + (o.source === 'local' ? '<span class="tag b">本地</span>' : '<span class="tag b">云端</span>') + '</td>';
-      h += '<td class="l">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
-      h += '<td><span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span></td>';
-      h += '<td class="pos" style="font-weight:700">' + RMB(parseCents(o.revenue)) + '</td>';
+      h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
+      h += '<td style="white-space:nowrap">' + (o.source === 'local' ? '<span class="tag b">本地</span>' : '<span class="tag b">云端</span>') + '</td>';
+      h += '<td class="l ell">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
+      h += '<td style="white-space:nowrap"><span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span></td>';
+      h += '<td style="font-weight:700;color:' + revColor + '">' + RMB(orderRev) + '</td>';
       h += '<td>' + o.files_count + '</td>';
       h += '<td>' + (o.total_page_count || 0) + '</td>';
       h += '<td style="font-size:.78rem">' + (o.urgency && o.urgency !== '低' ? '⚡' + esc(o.urgency) : '') + (o.delivery_enabled ? ' 🚚' : '') + (o.cover_page ? ' 📄' : '') + '</td>';
-      h += '<td style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 16)) + '</td>';
+      h += '<td class="ell" style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 16)) + '</td>';
       h += '</tr>';
-      if (isExp && o.files && o.files.length) {
+      if (o.files && o.files.length) {
+        h += '<tr class="file-expand' + (isExp ? ' open' : '') + '" data-suborder="' + oidS + '"><td colspan="10" class="file-expand-cell"><div class="file-expand-body"><div class="file-expand-inner">';
+        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>单/双面</span></div>';
         o.files.forEach(function (f) {
-          var fStatus = f.status || o.status;
-          h += '<tr class="file-sub-row">';
-          h += '<td></td>';
-          h += '<td class="l" colspan="2" style="padding-left:36px">📄 ' + esc(f.file_name) + '</td>';
-          h += '<td><span class="tag ' + esc(statusClass(fStatus)) + '">' + esc(statusLabel(fStatus)) + '</span></td>';
-          h += '<td class="pos">' + RMB(parseCents(f.total_price)) + '</td>';
-          h += '<td>' + f.copies + '份</td>';
-          h += '<td>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</td>';
-          h += '<td>' + (f.duplex === 'off' ? '单面' : '双面') + '</td>';
-          h += '<td colspan="2"></td>';
-          h += '</tr>';
+          h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + '">';
+          h += '<span class="fn">📄 ' + esc(f.file_name) + '</span>';
+          h += '<span style="font-weight:700;color:' + revColor + '">' + RMB(parseCents(f.total_price)) + '</span>';
+          h += '<span>' + f.copies + '份</span>';
+          h += '<span>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</span>';
+          h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
+          h += '</div>';
         });
+        h += '</div></div></td></tr>';
       }
     });
     h += '</tbody></table></div>';
@@ -1665,7 +1774,7 @@ function renderCloud() {
 
   _destroyCloudCharts();
   setTimeout(function () {
-    _renderStatusDonut('cloud-chart-status', orderStatusCount, fileStatusCount);
+    _renderStatusDonut('cloud-chart-status', orderStatusCount);
     _renderSourceDonut('cloud-chart-source', rs);
     _renderServiceBar('cloud-chart-svc', svcCounts);
     _renderDuplexDonut('cloud-chart-duplex', fileDuplex);
@@ -1681,9 +1790,10 @@ function _renderServiceBar(canvasId, svc) {
   if (!canvas) return;
   var ctx = canvas.getContext('2d');
   var labels = Object.keys(svc), data = labels.map(function (k) { return svc[k]; });
+  var svcColors = ['#f59e0b', '#8b5cf6', '#e11d48'];
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'bar',
-    data: { labels: labels, datasets: [{ label: '订单数', data: data, backgroundColor: ['#f59e0b', '#8b5cf6', '#e11d48'], borderRadius: 6 }] },
+    data: { labels: labels, datasets: [{ label: '订单数', data: data, backgroundColor: svcColors, hoverBackgroundColor: svcColors.map(function (c) { return _mixToWhite(c, 0.4); }), hoverBorderColor: svcColors, hoverBorderWidth: 3, borderRadius: 6 }] },
     options: {
       responsive: true, maintainAspectRatio: false,
       plugins: { legend: { display: false }, tooltip: { callbacks: { label: function (c) { return c.parsed.y + ' 单'; } } } },
@@ -1700,9 +1810,10 @@ function _renderDuplexDonut(canvasId, dup) {
   var ctx = canvas.getContext('2d');
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'doughnut',
-    data: { labels: ['单面', '双面'], datasets: [{ data: [dup['单面'], dup['双面']], backgroundColor: ['#38bdf8', '#a855f7'], borderWidth: 2, borderColor: 'transparent' }] },
+    data: { labels: ['单面', '双面'], datasets: [{ data: [dup['单面'], dup['双面']], backgroundColor: ['#38bdf8', '#a855f7'], hoverBackgroundColor: ['#38bdf8', '#a855f7'].map(function (c) { return _mixToWhite(c, 0.15); }), hoverBorderColor: 'transparent', borderWidth: 2, borderColor: 'transparent', hoverOffset: 12 }] },
     options: {
       responsive: true, maintainAspectRatio: false, cutout: '55%',
+      layout: { padding: 24 },
       plugins: { legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } } },
       animation: { animateRotate: true, duration: 1200, easing: 'easeOutBack' }
     }
@@ -1882,7 +1993,7 @@ function renderSettings() {
   // 外观
   h += '<div class="section"><h2>🎨 外观</h2>';
   h += '<div class="settings-row"><label>主题模式</label><select onchange="setThemeMode(this.value)" style="padding:8px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text)">';
-  h += '<option value="system"' + (themeMode === 'system' ? ' selected' : '') + '>🖥️ 自动（跟随系统）</option>';
+  h += '<option value="system"' + (themeMode === 'system' ? ' selected' : '') + '>🌓 自动（跟随系统）</option>';
   h += '<option value="light"' + (themeMode === 'light' ? ' selected' : '') + '>☀️ 浅色</option>';
   h += '<option value="dark"' + (themeMode === 'dark' ? ' selected' : '') + '>🌙 深色</option>';
   h += '</select><span style="color:var(--muted);font-size:.78rem">自动模式识别 Windows 深色/浅色设置，配置保存在本机浏览器</span></div>';
@@ -2045,6 +2156,12 @@ function replayOfflinePending() {
     btn.addEventListener('click', function () { switchTab(this.dataset.tab); });
   });
   $('#themeToggle').addEventListener('click', cycleThemeMode);
+  // 返回顶部：滚动超过 200px 显示，点击平滑回到顶部
+  var _backToTop = $('#backToTop');
+  function _updateBackToTop() { _backToTop.classList.toggle('show', (window.scrollY || document.documentElement.scrollTop) > 200); }
+  _updateBackToTop();
+  window.addEventListener('scroll', _updateBackToTop, { passive: true });
+  _backToTop.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
   $('#blockRetry').addEventListener('click', retryConnect);
   // 初始为 loading 骨架
   renderAll();
