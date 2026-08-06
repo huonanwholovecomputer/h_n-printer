@@ -197,27 +197,37 @@
 
     <!-- 管理员：防滥用设置（DDoS 防护阈值） -->
     <view class="security-section admin-collapsible {{userRole === 'admin' && securityConfig ? 'admin-expanded' : ''}}" style="animation-delay: 0.10s">
-      <view class="section-title">
-        <view class="section-bar"></view>
-        <text>防滥用设置</text>
-      </view>
-      <view class="storage-card">
-        <text class="retention-title">以下阈值保存后立即生效（0 表示关闭对应检查）</text>
-        <block wx:for="{{securityItems}}" wx:key="key">
-          <view class="security-row">
-            <view class="security-label-wrap">
-              <text class="security-label">{{item.label}}</text>
-              <text class="security-hint">{{item.hint}}</text>
-            </view>
-            <view class="security-stepper">
-              <view class="retention-stepper-btn {{item.value <= item.min ? 'stepper-disabled' : ''}}" catchtap="onSecurityMinus" data-key="{{item.key}}" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
-              <input class="retention-stepper-input security-input" type="number" value="{{item.value}}" data-key="{{item.key}}" bindinput="onSecurityInput" />
-              <view class="retention-stepper-btn {{item.value >= item.max ? 'stepper-disabled' : ''}}" catchtap="onSecurityPlus" data-key="{{item.key}}" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
-              <text class="retention-unit">{{item.unit}}</text>
-            </view>
+      <!-- 一级卡片：点击展开/收起所有设置项 -->
+      <view class="security-summary-card {{securityExpanded ? 'security-summary-active' : ''}}" bindtap="onToggleSecurity" hover-class="security-summary-pressing" hover-start-time="0" hover-stay-time="100">
+        <view class="security-summary-left">
+          <text class="security-summary-icon">🛡️</text>
+          <view class="security-summary-text">
+            <text class="security-summary-title">防滥用设置</text>
+            <text class="security-summary-desc">点击管理 DDoS 防护阈值</text>
           </view>
-        </block>
-        <button class="retention-save-btn" bindtap="onSaveSecurity" loading="{{savingSecurity}}" disabled="{{savingSecurity}}" hover-class="tap-active">保存防滥用设置</button>
+        </view>
+        <text class="security-summary-arrow {{securityExpanded ? 'arrow-up' : ''}}">›</text>
+      </view>
+      <!-- 二级设置面板 -->
+      <view class="security-detail {{securityExpanded ? 'security-detail-expanded' : ''}}">
+        <view class="storage-card security-detail-card">
+          <text class="retention-title">以下阈值保存后立即生效（0 表示关闭对应检查）</text>
+          <block wx:for="{{securityItems}}" wx:key="key">
+            <view class="security-row">
+              <view class="security-label-wrap">
+                <text class="security-label">{{item.label}}</text>
+                <text class="security-hint">{{item.hint}}</text>
+              </view>
+              <view class="security-stepper">
+                <view class="retention-stepper-btn {{item.value <= item.min ? 'stepper-disabled' : ''}}" catchtap="onSecurityMinus" data-key="{{item.key}}" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">−</view>
+                <input class="retention-stepper-input security-input" type="number" value="{{item.value}}" data-key="{{item.key}}" bindinput="onSecurityInput" />
+                <view class="retention-stepper-btn {{item.value >= item.max ? 'stepper-disabled' : ''}}" catchtap="onSecurityPlus" data-key="{{item.key}}" hover-class="stepper-hover" hover-start-time="0" hover-stay-time="80" hover-stop-propagation="true">+</view>
+                <text class="retention-unit">{{item.unit}}</text>
+              </view>
+            </view>
+          </block>
+          <button class="retention-save-btn" bindtap="onSaveSecurity" loading="{{savingSecurity}}" disabled="{{savingSecurity}}" hover-class="tap-active">保存防滥用设置</button>
+        </view>
       </view>
     </view>
 
@@ -245,7 +255,7 @@
 
     <!-- 管理员/超级管理员：历史授权用户 -->
     <view class="role-actions admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}" style="animation-delay: 0.14s">
-      <view class="role-btn user-btn" bindtap="onGoAuthorizedUsers" hover-class="tap-active">
+      <view class="role-btn user-btn" bindtap="onGoAuthorizedUsers" hover-class="role-btn-pressing" hover-start-time="0" hover-stay-time="100">
         <text class="role-btn-icon">👥</text>
         <text class="role-btn-text">历史授权用户</text>
         <text class="role-btn-arrow">›</text>
@@ -254,7 +264,7 @@
 
     <!-- 管理员/超级管理员：本地打印任务 -->
     <view class="role-actions admin-collapsible {{userRole === 'admin' || isSuperAdmin ? 'admin-expanded' : ''}}" style="animation-delay: 0.16s">
-      <view class="role-btn user-btn" bindtap="onGoLocalOrders" hover-class="tap-active">
+      <view class="role-btn user-btn" bindtap="onGoLocalOrders" hover-class="role-btn-pressing" hover-start-time="0" hover-stay-time="100">
         <text class="role-btn-icon">🖨️</text>
         <text class="role-btn-text">本地打印任务</text>
         <text class="role-btn-arrow">›</text>

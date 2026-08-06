@@ -41,8 +41,10 @@
 .page-root .range-line-input,
 .page-root .detail-file-row,
 .page-root .admin-card,
-.page-root .user-license-detail {
-  transition: background 0.45s ease, color 0.35s ease, border-color 0.45s ease, box-shadow 0.45s ease;
+.page-root .user-license-detail,
+.page-root .security-summary-card,
+.page-root .role-btn {
+  transition: background 0.45s ease, color 0.35s ease, border-color 0.45s ease, box-shadow 0.45s ease, transform 0.12s ease;
 }
 
 /* page-root 下所有文字自动获得颜色过渡（继承 CSS 变量变值后的渐变） */
@@ -270,10 +272,14 @@
   align-items: center;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   border-left: 6rpx solid var(--green);
-  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, transform 0.06s ease;
+  /* transform 短过渡保证按压回弹迅速；背景/边框/阴影由外层 .page-root .role-btn 控制。 */
+  transition: transform 0.12s ease, box-shadow 0.25s ease;
+  will-change: transform;
 }
-.role-btn:active {
+.role-btn-pressing {
+  transform: scale(0.96);
   background-color: var(--gray6);
+  transition: none;
 }
 
 .role-btn-icon {
@@ -846,7 +852,83 @@
     inset 0 1rpx 0 rgba(255, 255, 255, 0.35);
 }
 
-/* ---- 防滥用设置面板 ---- */
+/* ---- 防滥用设置：二级卡片 ---- */
+.security-summary-card {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 28rpx;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: 1rpx solid var(--separator);
+  /* transform 单独给短过渡，保证按压反馈迅速；
+     背景/边框/阴影的过渡由外层 .page-root .security-summary-card 统一控制。 */
+  transition: transform 0.12s ease, box-shadow 0.25s ease;
+  will-change: transform;
+}
+/* 使用专用 pressing 类替代通用 tap-active，把背景色和缩放都集中到 hover-class，
+   避免 :active 与 hover-class 触发时机不一致导致动画「闪」或短按不生效。 */
+.security-summary-pressing {
+  transform: scale(0.96);
+  background-color: var(--gray6);
+  transition: none;
+}
+.security-summary-active {
+  box-shadow: var(--glass-shadow-md), var(--glass-rim);
+}
+
+.security-summary-left {
+  display: flex;
+  align-items: center;
+  gap: 18rpx;
+}
+
+.security-summary-icon {
+  font-size: 36rpx;
+}
+
+.security-summary-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+
+.security-summary-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.security-summary-desc {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+}
+
+.security-summary-arrow {
+  font-size: 32rpx;
+  color: var(--text-quaternary);
+  transition: transform 0.25s ease;
+  display: inline-block;
+}
+
+.security-detail {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  margin-top: 0;
+  transition: max-height 0.3s ease, opacity 0.25s ease, margin-top 0.3s ease;
+}
+.security-detail-expanded {
+  max-height: 2200rpx;
+  opacity: 1;
+  margin-top: 16rpx;
+}
+
+.security-detail-card {
+  margin: 0;
+}
+
 .security-row {
   display: flex;
   align-items: center;
@@ -1545,7 +1627,8 @@
 }
 
 /* ═══════════════ Dark Mode ═══════════════ */
-.theme-dark .role-btn:active {
+.theme-dark .role-btn:active,
+.theme-dark .security-summary-pressing {
   background: rgba(255, 255, 255, 0.06);
 }
 .theme-dark .order-card:active {

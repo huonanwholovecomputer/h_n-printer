@@ -86,6 +86,7 @@ Component({
     securityConfig: null,
     securityItems: [],
     savingSecurity: false,
+    securityExpanded: false,
     // 超级管理员：管理员列表
     admins: [],
     adminsLoading: false,
@@ -1850,6 +1851,14 @@ Component({
           wx.showToast({ title: '网络错误', icon: 'none' })
         },
       })
+    },
+
+    // 展开/收起防滥用设置二级面板
+    onToggleSecurity() {
+      const expanded = !this.data.securityExpanded
+      this.setData({ securityExpanded: expanded })
+      // 等展开/收起动画（300ms）结束后再更新滚动边界，避免动画期间强制布局造成卡顿
+      setTimeout(() => this._scheduleMeasure(80), 320)
     },
 
     // 管理员许可密钥轮询：抽屉打开时每 5 秒刷新状态
