@@ -349,6 +349,103 @@
   line-height: 1.4;
 }
 
+/* 页数已知：范围网格摘要触发按钮 */
+.range-summary-trigger {
+  flex: 1;
+  min-width: 0;
+  height: 64rpx;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20rpx;
+  background: var(--bg-card);
+  border: 1rpx solid var(--gray4);
+  border-radius: var(--radius-sm);
+  transition: opacity 0.12s ease;
+}
+.range-summary-text {
+  font-size: 24rpx;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.range-summary-text.range-summary-all {
+  color: var(--text-tertiary);
+}
+.range-summary-arrow {
+  font-size: 30rpx;
+  color: var(--text-tertiary);
+  margin-left: 12rpx;
+  flex-shrink: 0;
+}
+
+/* 页数未知：黄色警告（页数确认后收起：淡出 + 上移，避免突变） */
+.range-unknown-warn {
+  font-size: 20rpx;
+  color: #FF9500;
+  line-height: 1.35;
+  margin-bottom: 8rpx;
+  overflow: hidden;
+  max-height: 56rpx;
+  opacity: 1;
+  transition: max-height 0.25s ease, opacity 0.25s ease,
+              margin-bottom 0.25s ease, transform 0.25s ease;
+}
+.range-unknown-warn.range-warn-collapsed {
+  max-height: 0;
+  opacity: 0;
+  margin-bottom: 0;
+  transform: translateY(-8rpx);
+}
+
+/* 范围多行输入：页数确认后收起(淡出+上移)，与黄色警告同步过渡。
+   max-height 由 WXML 内联按行数匹配（此处仅定义过渡与收起态） */
+.range-inputs-state {
+  overflow: hidden;
+  opacity: 1;
+  transition: max-height 0.25s ease, opacity 0.25s ease;
+}
+.range-inputs-state.state-collapsed {
+  max-height: 0 !important;  /* 覆盖内联 max-height */
+  opacity: 0;
+}
+
+/* 模式行：有效选择 1 页时收起(淡出+上移) */
+.mode-row {
+  max-height: 80rpx;
+  overflow: hidden;
+  opacity: 1;
+  transition: max-height 0.25s ease, opacity 0.25s ease, transform 0.25s ease;
+}
+.mode-row.mode-row-collapsed {
+  max-height: 0;
+  opacity: 0;
+  transform: translateY(-6rpx);
+}
+
+/* 状态区元素出现动画：仅透明度淡入（不影响几何 → 不干扰卡片高度探测） */
+@keyframes statusFadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.page-analysis-bar,
+.file-retry-row,
+.status-label.done,
+.status-label.warn,
+.range-summary-trigger {
+  animation: statusFadeIn 0.25s ease;
+}
+
+/* 新增范围行弹出动画 */
+.range-line-entering {
+  animation: rangeLineIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes rangeLineIn {
+  from { opacity: 0; transform: translateY(-10rpx) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
 /* ── 页数分析进度条 ── */
 .page-analysis-bar {
   display: flex;
@@ -802,6 +899,77 @@
 }
 .sheet-option-check {
   font-size: 26rpx;
+  font-weight: 700;
+}
+
+/* ── 页数网格选择弹窗（1..N 数字网格 + 全部/单页/双页一键） ── */
+.range-picker-sheet {
+  width: 600rpx;
+  padding-bottom: 32rpx;
+  max-height: 88vh;
+  overflow: hidden;
+}
+.range-picker-total {
+  font-size: 22rpx;
+  font-weight: 400;
+  color: var(--text-tertiary);
+  margin-left: 12rpx;
+}
+.range-picker-actions {
+  display: flex;
+  gap: 12rpx;
+  width: 100%;
+  margin-bottom: 20rpx;
+}
+.range-picker-action {
+  flex: 1;
+  text-align: center;
+  padding: 14rpx 0;
+  font-size: 24rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--gray6);
+  border-radius: var(--radius-sm);
+  border: 1rpx solid transparent;
+  transition: all 0.15s ease;
+}
+.range-picker-action:active {
+  opacity: 0.75;
+}
+.range-picker-action.active {
+  background: rgba(0, 122, 255, 0.12);
+  color: var(--blue);
+  border-color: rgba(0, 122, 255, 0.45);
+  font-weight: 600;
+}
+.range-picker-grid {
+  width: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12rpx;
+  max-height: 44vh;
+  overflow-y: auto;
+}
+.range-picker-cell {
+  width: calc((100% - 48rpx) / 5);   /* 每行 5 个，4 个 12rpx 间距 */
+  height: 96rpx;                     /* 与内容区宽度一致，保持方形 */
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: var(--glass-light);
+  border: var(--glass-border-dark);
+  border-radius: var(--radius-md);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  transition: all 0.12s ease;
+}
+.range-picker-cell.selected {
+  background: rgba(0, 122, 255, 0.16);
+  border-color: rgba(0, 122, 255, 0.55);
+  color: var(--blue);
   font-weight: 700;
 }
 

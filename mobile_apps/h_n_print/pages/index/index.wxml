@@ -118,33 +118,46 @@
                 </view>
               </view>
 
-              <!-- Page range — multi-line (hidden for images, aligns with local tool RangeListWidget) -->
-              <view wx:if="{{!item.isImage}}" class="control-row range-control-multi">
+              <!-- Page range（图片/整份1页隐藏；页数未知→警告+多行输入；页数已知→网格摘要按钮）
+                   黄色警告始终渲染：页数确认后收起(淡出+上移)过渡，避免突变 -->
+              <view wx:if="{{!item.isImage && item.pageCount !== 1}}" class="control-row range-control-multi">
                 <text class="control-label">范围</text>
                 <view class="range-lines-wrap">
-                  <view wx:for="{{item.rangeLines}}" wx:for-item="line" wx:for-index="li" wx:key="li" class="range-line-row">
-                    <input
-                      class="input-ios range-line-input {{line.error ? 'range-input-err' : ''}}"
-                      type="text"
-                      value="{{line.value}}"
-                      placeholder="{{li === 0 ? '如 1-5 或 7' : ''}}"
-                      bindinput="onRangeLineInput"
-                      bindblur="onRangeLineBlur"
-                      data-file-index="{{index}}"
-                      data-line-index="{{li}}"
-                    />
-                    <text wx:if="{{line.error}}" class="range-err-msg range-line-err">{{line.error}}</text>
+                  <view class="range-unknown-warn {{(item.pageCountStatus === 'confirmed' && item.pageCount > 0) ? 'range-warn-collapsed' : ''}}">⚠ 文档页数未知，若页数范围错误，该任务会直接记为"被打回"</view>
+                  <!-- 页数未知：多行输入（占位符随行号变化，新增行带弹出动画；页数确认后收起淡出）
+                       max-height 内联按行数匹配，保证收起过渡平滑 -->
+                  <view class="range-inputs-state {{(item.pageCountStatus === 'confirmed' && item.pageCount > 0) ? 'state-collapsed' : ''}}" style="max-height: {{(item.rangeLines.length) * 100 + 20}}rpx;">
+                    <view wx:for="{{item.rangeLines}}" wx:for-item="line" wx:for-index="li" wx:key="li" class="range-line-row {{line.entering ? 'range-line-entering' : ''}}">
+                      <input
+                        class="input-ios range-line-input {{line.error ? 'range-input-err' : ''}}"
+                        type="text"
+                        value="{{line.value}}"
+                        placeholder="请输入第{{li + 1}}个页面范围(如1-5或7)"
+                        bindinput="onRangeLineInput"
+                        bindblur="onRangeLineBlur"
+                        data-file-index="{{index}}"
+                        data-line-index="{{li}}"
+                      />
+                      <text wx:if="{{line.error}}" class="range-err-msg range-line-err">{{line.error}}</text>
+                    </view>
                   </view>
+                  <!-- 页数已知：点击弹数字网格选择 -->
+                  <block wx:if="{{item.pageCountStatus === 'confirmed' && item.pageCount > 0}}">
+                    <view class="range-summary-trigger" bindtap="onOpenRangePicker" data-index="{{index}}" hover-class="tap-active">
+                      <text class="range-summary-text {{item.pageRange ? '' : 'range-summary-all'}}">{{item.pageRange ? '已选 ' + item.pageRange : '全部页'}}</text>
+                      <text class="range-summary-arrow">›</text>
+                    </view>
+                  </block>
                 </view>
               </view>
 
-              <!-- Duplex toggle（图片单页渲染 → 隐藏；单页文件无法双面 → 固定单面） -->
-              <view wx:if="{{!item.isImage}}" class="control-row">
+              <!-- Duplex toggle（图片/整份1页隐藏；有效选择1页 → 模式行收起淡出，提交强制单面） -->
+              <view wx:if="{{!item.isImage && item.pageCount !== 1}}" class="control-row mode-row {{item.singlePage ? 'mode-row-collapsed' : ''}}">
                 <text class="control-label">模式</text>
-                <view class="duplex-toggle {{item.pageCount === 1 ? 'duplex-disabled' : ''}}">
-                  <view class="duplex-slider {{item.duplex === 'on' && item.pageCount !== 1 ? 'slider-right' : ''}}"></view>
-                  <view class="duplex-opt {{item.duplex === 'off' || item.pageCount === 1 ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="off">单面</view>
-                  <view class="duplex-opt {{item.duplex === 'on' && item.pageCount !== 1 ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="on">双面</view>
+                <view class="duplex-toggle">
+                  <view class="duplex-slider {{item.duplex === 'on' ? 'slider-right' : ''}}"></view>
+                  <view class="duplex-opt {{item.duplex === 'off' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="off">单面</view>
+                  <view class="duplex-opt {{item.duplex === 'on' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="on">双面</view>
                 </view>
               </view>
             </view>
@@ -412,6 +425,36 @@
     <view class="modal-buttons">
       <button class="btn-secondary modal-half-btn" bindtap="onCloseScheduleCountdownPicker">取消</button>
       <button class="btn-primary modal-half-btn" bindtap="onConfirmScheduleCountdown">确定</button>
+    </view>
+  </view>
+</view>
+
+<!-- 页数网格选择弹窗（玻璃风格：1..N 数字网格 + 全部/单页/双页一键） -->
+<view wx:if="{{showRangePicker}}" class="modal-mask {{rangePickerClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" bindtap="onCloseRangePicker">
+  <view class="modal-sheet schedule-modal-sheet range-picker-sheet" catchtap="noop">
+    <view class="sheet-title">选择页数<text class="range-picker-total">共 {{rangePickerTotal}} 页</text></view>
+
+    <!-- 一键选择：全部 / 单页(奇) / 双页(偶) -->
+    <view class="range-picker-actions">
+      <view class="range-picker-action {{rangePickerSelAll ? 'active' : ''}}" bindtap="onRangePickerAll" hover-class="tap-active">全部</view>
+      <view class="range-picker-action {{rangePickerSelOdd ? 'active' : ''}}" bindtap="onRangePickerOdd" hover-class="tap-active">单页</view>
+      <view class="range-picker-action {{rangePickerSelEven ? 'active' : ''}}" bindtap="onRangePickerEven" hover-class="tap-active">双页</view>
+    </view>
+
+    <!-- 数字网格（点击选中/取消） -->
+    <view class="range-picker-grid">
+      <view
+        wx:for="{{rangePickerPages}}"
+        wx:key="n"
+        class="range-picker-cell {{item.sel ? 'selected' : ''}}"
+        bindtap="onRangePickerCell"
+        data-n="{{item.n}}"
+      >{{item.n}}</view>
+    </view>
+
+    <view class="modal-buttons">
+      <button class="btn-secondary modal-half-btn" bindtap="onCloseRangePicker" hover-class="tap-active">取消</button>
+      <button class="btn-primary modal-half-btn" bindtap="onConfirmRangePicker" hover-class="tap-active">确定</button>
     </view>
   </view>
 </view>

@@ -3,20 +3,45 @@ const { CONFIG } = require('../../utils/config')
 const { request } = require('../../utils/request')
 
 // 文件卡片每类型高度（rpx，由 _probeCardHeights() 实测后硬编码；默认值为按 CSS 估算的占位）：
-//   image = 仅份数控件；word = 份数+范围+双面+页数分析条；excel = 无控件仅状态行
+//   image = 仅份数控件；word = 份数+范围+双面+页数分析条；
+//   word-single = 单页 Word/PDF 仅份数（范围/模式两行隐藏后收缩）；
+//   excel = 无控件仅状态行
 // 配合「上传时即显示完整卡片」策略，卡片高度按类型恒定，故列表高度可同步求和计算、无需异步实测。
+// 注意：单页文档的 word-single 高度是动态的——pageCount 异步确认=1 后由 _recalcFileListHeight() 重算列表高度。
 const FILE_CARD_HEIGHT_RPX = {
-  image: 312.8,  // 实测(2026-08-05): _probeCardHeights() 探测值（含新增的方向控件行）
-  word: 447.1,   // 实测(2026-08-05): _probeCardHeights() 探测值（含页数分析条）
-  excel: 151.2,  // 实测(2026-08-05): 同上
+  image: 312.8,           // 实测(2026-08-05): 仅份数+方向
+  'word-grid': 451.1,     // 估算(待探测): 页数已知→份数+范围(网格摘要按钮)+模式+页数条
+  'word-grid-single': 385.1, // 估算(待探测): 页数已知且单选→份数+范围(摘要按钮)，无模式
+  'word-text': 477.1,     // 估算(待探测): 页数未知→份数+范围(警告行+多行输入)+模式+页数条
+  'word-text-single': 411.1, // 估算(待探测): 页数未知且单选→份数+范围(警告行+输入)，无模式
+  'word-single': 311.0,   // 实测(2026-08-06): 整份1页→仅份数+页数条
+  excel: 151.2,           // 实测(2026-08-05): 仅状态行
 }
 // .file-card 底部间距 margin-bottom: 12rpx
 const FILE_CARD_GAP_RPX = 12
+// 文本模式(页数未知)下，每多一个范围行在基础高度上额外增加的高度(rpx)：输入框56 + 行间距4
+const RANGE_LINE_EXTRA_RPX = 60
 
 function _fileCardTypeKey(file) {
   if (file.excelWarning) return 'excel'
   if (file.isImage) return 'image'
-  return 'word'
+  // 整份 1 页：范围/模式两行均隐藏，卡片收缩为"仅份数"（word-single）
+  if (file.pageCount === 1) return 'word-single'
+  const single = !!file.singlePage   // 有效范围恰好选中 1 页 → 模式行隐藏
+  const known = file.pageCountStatus === 'confirmed' && file.pageCount > 0
+  if (known) return single ? 'word-grid-single' : 'word-grid'
+  return single ? 'word-text-single' : 'word-text'
+}
+
+// 文件卡片实际高度（rpx）：基础类型高度 + 文本模式每多一个范围行的增量。
+// 仅文本模式(页数未知)按行数累加；网格模式/整份1页/图片/Excel 的 rangeLines 不渲染为独立行，不计增量。
+function _fileCardHeightRpx(file) {
+  const base = FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(file)] || 0
+  const textMode = !file.excelWarning && !file.isImage && file.pageCount !== 1 &&
+    !(file.pageCountStatus === 'confirmed' && file.pageCount > 0)
+  if (!textMode) return base
+  const extra = (file.rangeLines || []).length - 1
+  return extra > 0 ? base + extra * RANGE_LINE_EXTRA_RPX : base
 }
 
 // 时间滚轮（picker-view）：item 高 88rpx、可视区 440rpx 由 WXSS 定义
@@ -123,6 +148,15 @@ Component({
     isDarkMode: _initIsDark(),
     themeMode: _initThemeMode(),
     themeSwitching: false,       // 主题切换过渡中
+    // 页数网格选择弹窗（页数已知时，范围控件点击弹出）
+    showRangePicker: false,        // 弹窗可见
+    rangePickerClosing: false,     // 弹窗关闭动画
+    rangePickerFileIndex: -1,      // 正在编辑的文件下标
+    rangePickerTotal: 0,           // 文档总页数
+    rangePickerPages: [],          // [{n, sel}] 1..N 网格数据
+    rangePickerSelAll: false,      // 一键"全部"选中态
+    rangePickerSelOdd: false,      // 一键"单页(奇)"选中态
+    rangePickerSelEven: false,     // 一键"双页(偶)"选中态
     entranceDelay: {           // 打印页元素入场延时（首次加载：基础 0.5s，从上到下逐个递增 0.1s）
       logo: '0.5s',
       statusBar: '0.6s',
@@ -607,8 +641,31 @@ Component({
       tick()
     },
 
-    // 探测工具（一次性）：临时注入 图片/Word/Excel 三张「完整」卡片（fileId 已存在 → 控件/页数条全展开），
-    // 实测各自精确高度输出到控制台，用于替换上方 FILE_CARD_HEIGHT_RPX 的硬编码值。
+    // 依据当前文件列表重算"打印文件"列表显式高度（动态卡片）。
+    // 触发点：pageCount 确认/文本↔网格模式切换/singlePage 判定变化/范围行增删等。
+    // 添加/删除/重印恢复路径已通过 _fileCardHeightRpx() 直接取到精确高度，无需额外调用。
+    _recalcFileListHeight() {
+      const { windowWidth, windowHeight } = wx.getWindowInfo()
+      const rpxR = (windowWidth || 375) / 750
+      const listCapPx = Math.round((windowHeight || 800) * 0.85)
+      const files = this.data.selectedFiles || []
+      let sumRpx = 0
+      files.forEach((f, i) => {
+        sumRpx += _fileCardHeightRpx(f) + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+      })
+      const target = Math.min(listCapPx, Math.round(sumRpx * rpxR))
+      const prev = this._fileListPx || 0
+      const delta = target - prev
+      this._fileListPx = target
+      // 滚动边界估算同步增减（收缩为负 delta），避免等待 _measure 前滚动范围残留偏大
+      if (delta !== 0 && this._contentEst) this._contentEst = Math.max(0, this._contentEst + delta)
+      this._animateFileListHeight(target, 350)
+      this._scheduleMeasure(400)
+    },
+
+    // 探测工具（一次性）：临时注入 图片/网格/网格单选/文本/文本单选/单页Word/Excel 七张「完整」卡片
+    // （fileId 已存在 → 控件/页数条全展开），实测各自精确高度输出到控制台，
+    // 用于替换上方 FILE_CARD_HEIGHT_RPX 的硬编码值。
     // 调用：开发者工具控制台执行 getCurrentPages()[0]._probeCardHeights()
     _probeCardHeights() {
       const savedFiles = this.data.selectedFiles
@@ -619,15 +676,22 @@ Component({
         rangeLines: [{ value: '', error: '' }], duplex: 'on', imageOrientation: 'auto',
         entering: false, removing: false,
         excelWarning: false, unsupportedFormat: false, isImage: false, pageCount: 1,
-        pageCountStatus: 'confirmed',
+        pageCountStatus: 'confirmed', singlePage: false,
       }, over)
       const probes = [
         mk({ name: '探测-图片.png', fileId: 990001, isImage: true, duplex: 'off', imageOrientation: 'landscape', pageCount: 1 }),
-        mk({ name: '探测-文档.docx', fileId: 990002, isImage: false, pageCount: 10, pageCountStatus: 'confirmed', copies: 3 }),
+        // 页数已知 → 网格模式
+        mk({ name: '探测-网格.docx', fileId: 990002, isImage: false, pageCount: 10, pageCountStatus: 'confirmed', copies: 3 }),
+        mk({ name: '探测-网格单选.docx', fileId: 990005, isImage: false, pageCount: 10, pageCountStatus: 'confirmed', pageRange: '5', rangeLines: [{ value: '5', error: '' }, { value: '', error: '' }], copies: 3, singlePage: true }),
+        // 页数未知 → 文本模式（警告+多行输入；仅测 1 行基准高，额外行由 RANGE_LINE_EXTRA_RPX 运行时累加）
+        mk({ name: '探测-文本.docx', fileId: 990006, isImage: false, pageCount: 0, pageCountStatus: 'analyzing', copies: 3 }),
+        mk({ name: '探测-文本单选.docx', fileId: 990007, isImage: false, pageCount: 0, pageCountStatus: 'analyzing', pageRange: '5', rangeLines: [{ value: '5', error: '' }], copies: 3, singlePage: true }),
+        // 整份 1 页
+        mk({ name: '探测-单页文档.docx', fileId: 990004, isImage: false, pageCount: 1, pageCountStatus: 'confirmed', duplex: 'off', copies: 3, singlePage: true }),
         mk({ name: '探测-表格.xlsx', fileId: 990003, isImage: false, excelWarning: true, pageCount: 0, pageCountStatus: '' }),
       ]
-      // 临时撑开列表高度，确保 3 张卡片完整渲染（0 高度容器可能不产出布局）
-      this.setData({ selectedFiles: probes, badgeCount: probes.length, fileListHeight: 600 }, () => {
+      // 临时撑开列表高度，确保 7 张卡片完整渲染（0 高度容器可能不产出布局）
+      this.setData({ selectedFiles: probes, badgeCount: probes.length, fileListHeight: 1600 }, () => {
         setTimeout(() => {
           const q = this.createSelectorQuery()
           q.selectAll('.file-card').boundingClientRect()
@@ -635,7 +699,7 @@ Component({
             const cards = (res && res[0]) || []
             const { windowWidth } = wx.getWindowInfo()
             const rpxRatio = (windowWidth || 375) / 750
-            const keys = ['image', 'word', 'excel']
+            const keys = ['image', 'word-grid', 'word-grid-single', 'word-text', 'word-text-single', 'word-single', 'excel']
             const gapPx = +(FILE_CARD_GAP_RPX * rpxRatio).toFixed(1)
             const heights = {}
             let sumPx = 0
@@ -647,10 +711,14 @@ Component({
               sumPx += px + (i > 0 ? gapPx : 0)
             })
             console.log('[卡片高度探测] 原始(px)与换算(rpx):', JSON.stringify(heights, null, 2))
-            console.log('[卡片高度探测] 3卡合计含间距:', sumPx, 'px，卡片间距:', gapPx, 'px')
+            console.log('[卡片高度探测] 7卡合计含间距:', sumPx, 'px，卡片间距:', gapPx, 'px')
             console.log('[卡片高度探测] 硬编码建议: FILE_CARD_HEIGHT_RPX =', JSON.stringify({
               image: heights.image && heights.image.rpx,
-              word: heights.word && heights.word.rpx,
+              'word-grid': heights['word-grid'] && heights['word-grid'].rpx,
+              'word-grid-single': heights['word-grid-single'] && heights['word-grid-single'].rpx,
+              'word-text': heights['word-text'] && heights['word-text'].rpx,
+              'word-text-single': heights['word-text-single'] && heights['word-text-single'].rpx,
+              'word-single': heights['word-single'] && heights['word-single'].rpx,
               excel: heights.excel && heights.excel.rpx,
             }))
             // 恢复原列表
@@ -671,7 +739,7 @@ Component({
       const files = this.data.selectedFiles
       let sumRpx = 0
       files.forEach((f, i) => {
-        sumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+        sumRpx += _fileCardHeightRpx(f) + (i > 0 ? FILE_CARD_GAP_RPX : 0)
       })
       if (!this._fileListPx) this._fileListPx = 0
       const prev = this._fileListPx
@@ -991,6 +1059,7 @@ Component({
             isImage: isImage,
             pageCount: 0,
             pageCountStatus: '',  // '' | 'analyzing' | 'confirmed' — 页数分析进度
+            singlePage: false,    // 有效选择恰好 1 页 → 模式行隐藏、提交强制单面
           }
           // 圆点动画和计数统一延迟 0.25s，与卡片入场同步
           const isFirstFile = fileIndex === 0
@@ -1065,7 +1134,7 @@ Component({
       let remCount = 0
       this.data.selectedFiles.forEach((f, i) => {
         if (i === index) return
-        remSumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (remCount > 0 ? FILE_CARD_GAP_RPX : 0)
+        remSumRpx += _fileCardHeightRpx(f) + (remCount > 0 ? FILE_CARD_GAP_RPX : 0)
         remCount++
       })
       const remTarget = Math.min(remCapPx, Math.round(remSumRpx * rpxR))
@@ -1091,7 +1160,7 @@ Component({
         const listCapPx = Math.round((wh || 800) * 0.85)
         let sumRpx = 0
         files.forEach((f, i) => {
-          sumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+          sumRpx += _fileCardHeightRpx(f) + (i > 0 ? FILE_CARD_GAP_RPX : 0)
         })
         if (!this._fileListPx) this._fileListPx = 0
         const prev = this._fileListPx
@@ -1119,7 +1188,7 @@ Component({
         const isImage = imageExts.indexOf(ext) !== -1
         const pageRange = f.page_range || ''
         const hasFileId = !!f.file_id
-        return {
+        const file = {
           name: name,
           size: Number(f.size) || 0,
           path: '',
@@ -1142,7 +1211,10 @@ Component({
           isImage: isImage,
           pageCount: Number(f.page_count) || 0,
           pageCountStatus: hasFileId ? (Number(f.page_count) > 0 ? 'confirmed' : 'analyzing') : '',
+          singlePage: false,
         }
+        file.singlePage = this._computeSinglePage(file)   // 有效选择恰好 1 页 → 模式行隐藏
+        return file
       })
       this.setData({
         selectedFiles: files,
@@ -1156,7 +1228,7 @@ Component({
       const listCapPx = Math.round((windowHeight || 800) * 0.85)
       let sumRpx = 0
       files.forEach((f, i) => {
-        sumRpx += FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(f)] + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+        sumRpx += _fileCardHeightRpx(f) + (i > 0 ? FILE_CARD_GAP_RPX : 0)
       })
       this._fileListPx = Math.min(listCapPx, Math.round(sumRpx * rpxRatio))
       this.setData({ fileListHeight: Math.max(0, this._fileListPx) })
@@ -1272,6 +1344,10 @@ Component({
             [key + '.pageCount']: pageCount,
             [key + '.pageCountStatus']: pageCountStatus,
           })
+          // 页数确认(PDF) → 文本↔网格模式可能切换、整份1页卡片收缩 → 同步 singlePage + 重算列表高度
+          if (file && !file.isImage) {
+            this._refreshSinglePage(fileIndex)
+          }
           // 页数未知时启动轮询（等待本地打印工具分析回报）
           if (pageCount <= 0 && file && !file.isImage) {
             this._startPageCountPoll(fileIndex, fileId)
@@ -1404,8 +1480,14 @@ Component({
                     ['selectedFiles[' + fileIndex + '].pageCount']: pc,
                     ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'confirmed',
                   }
-                  if (pc === 1) patch['selectedFiles[' + fileIndex + '].duplex'] = 'off'  // 单页固定单面
+                  if (pc === 1) {
+                    // 单页固定单面 + 范围行隐藏 → 清空历史范围输入，避免残留错误/旧页码
+                    patch['selectedFiles[' + fileIndex + '].duplex'] = 'off'
+                    patch['selectedFiles[' + fileIndex + '].rangeLines'] = [{ value: '', error: '' }]
+                    patch['selectedFiles[' + fileIndex + '].pageRange'] = ''
+                  }
                   this.setData(patch)
+                  // _normalizeAndValidateRangeLines 末尾会 _refreshSinglePage → 单页判定/文本↔网格切换均重算列表高度
                   this._normalizeAndValidateRangeLines(fileIndex)
                 }
                 this._stopPageCountPoll(fileIndex)
@@ -1524,12 +1606,21 @@ Component({
         ['selectedFiles[' + fileIndex + '].rangeLines[' + lineIndex + '].error']: '',
       })
 
-      // 如果在最后一行输入了内容，自动追加新空行
+      // 如果在最后一行输入了内容，自动追加新空行（带弹出动画 + 列表延伸）
       const lines = this.data.selectedFiles[fileIndex].rangeLines
       if (lineIndex === lines.length - 1 && value.trim()) {
-        const newLines = lines.concat([{value: '', error: ''}])
+        const newLines = lines.concat([{ value: '', error: '', entering: true }])
         this.setData({ ['selectedFiles[' + fileIndex + '].rangeLines']: newLines })
+        // 新增范围行 → 卡片/列表高度延伸（每行增量已计入 _fileCardHeightRpx）
+        this._recalcFileListHeight()
         this._scheduleMeasure(200)
+        // 弹出动画播完清除 entering 标记，避免同一条目下次渲染重复动画
+        setTimeout(() => {
+          const f = this.data.selectedFiles[fileIndex]
+          if (f && f.rangeLines && f.rangeLines.length === newLines.length) {
+            this.setData({ ['selectedFiles[' + fileIndex + '].rangeLines[' + (newLines.length - 1) + '].entering']: false })
+          }
+        }, 350)
       }
     },
 
@@ -1538,6 +1629,36 @@ Component({
       const file = this.data.selectedFiles[fileIndex]
       if (!file || file.excelWarning || file.unsupportedFormat || file.isImage) return
       this._normalizeAndValidateRangeLines(fileIndex)
+    },
+
+    // 有效选择是否恰好 1 页：整份 1 页，或有效范围解析出的页面集合只有 1 页。
+    // true → 模式(单双面)行隐藏、提交强制单面。
+    _computeSinglePage(file) {
+      if (!file) return false
+      if (file.isImage) return false   // 图片本无模式行，不参与
+      if (file.pageCount === 1) return true
+      const lines = file.rangeLines || []
+      const pages = new Set()
+      for (const line of lines) {
+        const v = (line.value || '').trim()
+        if (!v) continue
+        const parsed = this._parseSingleRange(v)
+        if (parsed) parsed.forEach(p => pages.add(p))
+      }
+      return pages.size === 1
+    },
+
+    // 同步 file.singlePage 并重算列表高度。
+    // 无论单页判定是否变化都要重算：页数确认(文本↔网格模式切换)同样会改变卡片类型高度；
+    // _recalcFileListHeight 目标不变时是 no-op，无副作用。
+    _refreshSinglePage(fileIndex) {
+      const file = this.data.selectedFiles[fileIndex]
+      if (!file) return
+      const singlePage = this._computeSinglePage(file)
+      if (file.singlePage !== singlePage) {
+        this.setData({ ['selectedFiles[' + fileIndex + '].singlePage']: singlePage })
+      }
+      this._recalcFileListHeight()
     },
 
     _normalizeAndValidateRangeLines(fileIndex) {
@@ -1603,6 +1724,118 @@ Component({
         ['selectedFiles[' + fileIndex + '].rangeLines']: newLines,
         ['selectedFiles[' + fileIndex + '].pageRange']: pageRange,
       })
+      this._refreshSinglePage(fileIndex)
+    },
+
+    // ==================== 页数网格选择弹窗（页数已知时替代文本输入） ====================
+
+    _isExactOddSet(selected, total) {
+      for (let n = 1; n <= total; n++) {
+        if (selected.has(n) !== (n % 2 === 1)) return false
+      }
+      return true
+    },
+    _isExactEvenSet(selected, total) {
+      for (let n = 1; n <= total; n++) {
+        if (selected.has(n) !== (n % 2 === 0)) return false
+      }
+      return true
+    },
+
+    // 点击范围摘要按钮 → 弹出页数网格
+    onOpenRangePicker(e) {
+      const fileIndex = e.currentTarget.dataset.index
+      const file = this.data.selectedFiles[fileIndex]
+      if (!file || !(file.pageCount > 0)) return
+      const total = file.pageCount
+      // 当前选中：从 rangeLines 解析有效页面（空 → 全部未选 = 全部页）
+      const selected = new Set()
+      for (const line of (file.rangeLines || [])) {
+        const v = (line.value || '').trim()
+        if (!v) continue
+        const parsed = this._parseSingleRange(v)
+        if (parsed) parsed.forEach(p => selected.add(p))
+      }
+      const pages = []
+      for (let n = 1; n <= total; n++) pages.push({ n, sel: selected.has(n) })
+      this.setData({
+        showRangePicker: true,
+        rangePickerFileIndex: fileIndex,
+        rangePickerTotal: total,
+        rangePickerPages: pages,
+        rangePickerSelAll: selected.size === total,
+        rangePickerSelOdd: this._isExactOddSet(selected, total),
+        rangePickerSelEven: this._isExactEvenSet(selected, total),
+      })
+    },
+
+    // 点击数字：切换选中
+    onRangePickerCell(e) {
+      const n = Number(e.currentTarget.dataset.n)
+      const pages = this.data.rangePickerPages.map(p => (p.n === n ? { n: p.n, sel: !p.sel } : p))
+      const total = this.data.rangePickerTotal
+      const selected = new Set(pages.filter(p => p.sel).map(p => p.n))
+      this.setData({
+        rangePickerPages: pages,
+        rangePickerSelAll: selected.size === total,
+        rangePickerSelOdd: this._isExactOddSet(selected, total),
+        rangePickerSelEven: this._isExactEvenSet(selected, total),
+      })
+    },
+
+    _rangePickerSelectBy(selFn) {
+      const total = this.data.rangePickerTotal
+      const pages = []
+      for (let n = 1; n <= total; n++) pages.push({ n, sel: selFn(n) })
+      const selected = new Set(pages.filter(p => p.sel).map(p => p.n))
+      this.setData({
+        rangePickerPages: pages,
+        rangePickerSelAll: selected.size === total,
+        rangePickerSelOdd: this._isExactOddSet(selected, total),
+        rangePickerSelEven: this._isExactEvenSet(selected, total),
+      })
+    },
+
+    onRangePickerAll() {
+      this._rangePickerSelectBy(() => true)
+    },
+    // 单页 = 奇数页
+    onRangePickerOdd() {
+      this._rangePickerSelectBy(n => n % 2 === 1)
+    },
+    // 双页 = 偶数页
+    onRangePickerEven() {
+      this._rangePickerSelectBy(n => n % 2 === 0)
+    },
+
+    // 确定：把网格选中写回 rangeLines + pageRange，并重算 singlePage/列表高度
+    onConfirmRangePicker() {
+      const fileIndex = this.data.rangePickerFileIndex
+      const file = this.data.selectedFiles[fileIndex]
+      if (fileIndex < 0 || !file) {
+        this.setData({ showRangePicker: false })
+        return
+      }
+      const selected = this.data.rangePickerPages
+        .filter(p => p.sel)
+        .map(p => p.n)
+        .sort((a, b) => a - b)
+      const newLines = selected.map(n => ({ value: String(n), error: '' }))
+      newLines.push({ value: '', error: '' })
+      const pageRange = selected.join(',')
+      this.setData({
+        ['selectedFiles[' + fileIndex + '].rangeLines']: newLines,
+        ['selectedFiles[' + fileIndex + '].pageRange']: pageRange,
+        showRangePicker: false,
+        rangePickerClosing: false,
+      })
+      // 单页判定变化（如只选 1 页）→ 模式行隐藏/显示 + 列表高度重算
+      this._refreshSinglePage(fileIndex)
+    },
+
+    onCloseRangePicker() {
+      this.setData({ rangePickerClosing: true })
+      setTimeout(() => this.setData({ showRangePicker: false, rangePickerClosing: false }), 200)
     },
 
     loadPricing() {
@@ -1657,7 +1890,7 @@ Component({
       const value = e.currentTarget.dataset.value
       const f = this.data.selectedFiles[index]
       if (!f || f.excelWarning || f.unsupportedFormat) return
-      if (f.pageCount === 1) return  // 单页文件无法双面，固定单面
+      if (f.pageCount === 1 || f.singlePage) return  // 整份1页/有效选择1页无法双面，固定单面
       this.setData({ ['selectedFiles[' + index + '].duplex']: value })
     },
 
@@ -2327,6 +2560,7 @@ Component({
       // 检查所有页码范围语法错误（多行输入模式）
       for (let i = 0; i < selectedFiles.length; i++) {
         const f = selectedFiles[i]
+        if (f.pageCount === 1) continue  // 单页文档：范围行已隐藏，忽略历史 rangeLines 错误
         const lines = f.rangeLines || []
         const hasError = lines.some(line => line.error)
         if (hasError) {
@@ -2398,8 +2632,9 @@ Component({
           file_id: f.fileId,
           file: f.name,
           copies: Number(f.copies),
-          page_range: range || f.pageRange || '',
-          duplex: (f.isImage || f.pageCount === 1) ? 'off' : (f.duplex || 'on'),  // 图片/单页固定单面
+          // 单页文档范围行已隐藏 → 置空=打印全部（即第 1 页）
+          page_range: (f.pageCount === 1) ? '' : (range || f.pageRange || ''),
+          duplex: (f.isImage || f.pageCount === 1 || f.singlePage) ? 'off' : (f.duplex || 'on'),  // 图片/整份1页/有效选择1页固定单面
           image_orientation: f.isImage ? (f.imageOrientation || 'auto') : 'auto',
         }
       })
