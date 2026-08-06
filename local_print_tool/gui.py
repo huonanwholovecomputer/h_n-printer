@@ -1470,6 +1470,26 @@ class MainWindow(QMainWindow):
             self._file_logger.addHandler(fh)
         self._file_logger.info("HN 本地打印工具启动")
 
+        # ── 启动清理：上次会话遗留的"已完成订单"标签页 ──
+        # 全部 job 均已打印成功（sent=True）的标签页在正常退出时已由 closeEvent 自动清理；
+        # 此处兜底覆盖进程崩溃/强杀场景，避免已完成订单越积越多。
+        tabs = self._config.tabs
+        if tabs:
+            kept_tabs = {}
+            removed_count = 0
+            for key, tab in tabs.items():
+                jobs = tab.jobs or []
+                if jobs and all(getattr(j, 'sent', False) for j in jobs):
+                    removed_count += 1
+                    continue  # 已完成订单 → 启动即清理
+                kept_tabs[key] = tab
+            if removed_count:
+                self._config.tabs = kept_tabs if kept_tabs else {"1": TabSettings()}
+                if self._config.active_tab not in self._config.tabs:
+                    self._config.active_tab = next(iter(self._config.tabs))
+                self._config.save(config_path)
+                self._file_logger.info("启动清理：已移除 %d 个已完成订单标签页", removed_count)
+
         # ── 标签页系统 ──
         # 确保 tabs 中至少有一个标签
         if not self._config.tabs:
@@ -4971,46 +4991,72 @@ class MainWindow(QMainWindow):
         for key, tab in self._config.tabs.items():
             total_files += len(tab.jobs)
 
-        if total_files > 0 and not self._all_printed:
-            reply = QMessageBox.question(
-                self, "存在未完成的任务",
-                f"当前共有 {total_files} 个文件分布在 {len(self._config.tabs)} 个标签页中尚未打印。\n\n"
-                "退出将清空全部标签页，确定退出吗？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        if total_files > 0:
+            # 全部订单是否均已打印完成（每个 job 均 sent=True）
+            all_completed = all(
+                getattr(job, 'sent', False)
+                for tab in self._config.tabs.values()
+                for job in tab.jobs
             )
-            if reply != QMessageBox.Yes:
-                event.ignore()
-                return
-            # 用户确认退出 → 通知后端放弃未打印的云端任务 + 本地预留订单，然后清空
-            # （已打印完成的 job 跳过，避免误放弃已完成订单）
-            all_abandoned = []
-            for key, tab in self._config.tabs.items():
-                for job in tab.jobs:
-                    if getattr(job, 'sent', False):
-                        continue  # 已打印完成，不放弃
-                    all_abandoned.append(job)
-                    if job.order_id > 0 and self._cloud_client:
-                        self._cloud_client.abandon_order_to_server(job.order_id)
-                    elif job.task_id > 0 and self._cloud_client:
-                        self._cloud_client.abandon_order_to_server(job.task_id)
-                    elif job.order_number and "-L" not in job.order_number and self._cloud_client:
-                        # 本地预留订单（仅获取了订单号但未提交打印）→ 标记为放弃，并补记价格
-                        price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
-                        self._cloud_client.abandon_reserved_order(job.order_number, price)
-            # 已清空但撤回窗口未过的备份任务同样放弃（用户确认退出=确认清空）
-            for backup_jobs in self._cleared_jobs_backup.values():
-                for job in backup_jobs:
-                    if getattr(job, 'sent', False):
-                        continue
-                    all_abandoned.append(job)
-                    if job.order_id > 0 and self._cloud_client:
-                        self._cloud_client.abandon_order_to_server(job.order_id)
-                    elif job.task_id > 0 and self._cloud_client:
-                        self._cloud_client.abandon_order_to_server(job.task_id)
-            self._config.tabs = {"1": TabSettings()}
-            self._config.active_tab = "1"
-            self._current_tab = "1"
-            self._cleanup_orphan_pdf_cache(all_abandoned)
+            if all_completed:
+                # 全部订单已完成 → 不阻挡关闭、无需确认，直接自动清理（含 PDF 缓存）
+                self._log("🗑 所有订单均已打印完成，退出时自动清理已完成订单")
+                cache_jobs = []
+                for tab in self._config.tabs.values():
+                    cache_jobs.extend(tab.jobs)
+                # 已清空但撤回窗口未过的备份任务：即使主标签页全部完成，未打印的云端任务仍需放弃
+                for backup_jobs in self._cleared_jobs_backup.values():
+                    for job in backup_jobs:
+                        if getattr(job, 'sent', False):
+                            continue
+                        if job.order_id > 0 and self._cloud_client:
+                            self._cloud_client.abandon_order_to_server(job.order_id)
+                        elif job.task_id > 0 and self._cloud_client:
+                            self._cloud_client.abandon_order_to_server(job.task_id)
+                self._config.tabs = {"1": TabSettings()}
+                self._config.active_tab = "1"
+                self._current_tab = "1"
+                self._cleanup_orphan_pdf_cache(cache_jobs)
+            else:
+                reply = QMessageBox.question(
+                    self, "存在未完成的任务",
+                    f"当前共有 {total_files} 个文件分布在 {len(self._config.tabs)} 个标签页中尚未打印。\n\n"
+                    "退出将清空全部标签页，确定退出吗？",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    event.ignore()
+                    return
+                # 用户确认退出 → 通知后端放弃未打印的云端任务 + 本地预留订单，然后清空
+                # （已打印完成的 job 跳过，避免误放弃已完成订单）
+                all_abandoned = []
+                for key, tab in self._config.tabs.items():
+                    for job in tab.jobs:
+                        if getattr(job, 'sent', False):
+                            continue  # 已打印完成，不放弃
+                        all_abandoned.append(job)
+                        if job.order_id > 0 and self._cloud_client:
+                            self._cloud_client.abandon_order_to_server(job.order_id)
+                        elif job.task_id > 0 and self._cloud_client:
+                            self._cloud_client.abandon_order_to_server(job.task_id)
+                        elif job.order_number and "-L" not in job.order_number and self._cloud_client:
+                            # 本地预留订单（仅获取了订单号但未提交打印）→ 标记为放弃，并补记价格
+                            price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
+                            self._cloud_client.abandon_reserved_order(job.order_number, price)
+                # 已清空但撤回窗口未过的备份任务同样放弃（用户确认退出=确认清空）
+                for backup_jobs in self._cleared_jobs_backup.values():
+                    for job in backup_jobs:
+                        if getattr(job, 'sent', False):
+                            continue
+                        all_abandoned.append(job)
+                        if job.order_id > 0 and self._cloud_client:
+                            self._cloud_client.abandon_order_to_server(job.order_id)
+                        elif job.task_id > 0 and self._cloud_client:
+                            self._cloud_client.abandon_order_to_server(job.task_id)
+                self._config.tabs = {"1": TabSettings()}
+                self._config.active_tab = "1"
+                self._current_tab = "1"
+                self._cleanup_orphan_pdf_cache(all_abandoned)
 
         try:
             # 删除所有空标签页并重新编号（确保下次启动从 1 开始）
