@@ -178,9 +178,10 @@
             <text class="section-header-title">附加服务</text>
           </view>
 
-          <!-- 打印首页 -->
+          <!-- 打印首页（普通用户必选，锁定开启） -->
           <view class="param-row">
             <text class="param-label">打印首页</text>
+            <text wx:if="{{userRole === 'user'}}" class="cover-required-tag">必选</text>
             <view class="ios-switch {{coverPage ? 'switch-on' : ''}}" bindtap="onToggleCoverPage">
               <view class="switch-thumb"></view>
             </view>
@@ -224,14 +225,6 @@
             <view wx:for="{{deliveryLocations}}" wx:key="*this" class="picker-option {{deliveryLocation === item ? 'picker-selected' : ''}}" bindtap="onSelectDeliveryLocation" data-loc="{{item}}">
               <text>{{item}}</text>
               <text class="picker-pct">{{deliveryPercentages[item]}}%</text>
-            </view>
-          </view>
-
-          <!-- 自取地址（未派送时显示，带展开/收起动画）-->
-          <view class="pickup-collapse {{!deliveryEnabled ? 'pickup-open' : ''}}">
-            <view class="param-row">
-              <text class="param-label">自取地址</text>
-              <input class="control-input" value="{{pickupAddress}}" bindinput="onPickupAddressInput" placeholder="如 1号楼202宿舍" />
             </view>
           </view>
         </view>

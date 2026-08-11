@@ -130,7 +130,6 @@ Component({
     coverPriceVisible: false,    // 首页价格标签是否可见（配合入场动画）
     coverPriceEntering: false,   // 首页价格入场动画
     coverPriceExiting: false,    // 首页价格退场动画
-    pickupAddress: '1号楼202宿舍',
     showDeliveryPicker: false,
     showUrgencyPicker: false,
     lastOrderNumber: '',
@@ -469,10 +468,23 @@ Component({
         success: (res) => {
           if (res.statusCode === 200 && res.data && res.data.success) {
             const role = res.data.role || 'guest'
-            this.setData({
-              userRole: role,
-            })
+            const wasCoverOn = this.data.coverPage
+            const updates = { userRole: role }
+            // 普通用户强制选中附加服务"打印首页"（不允许关闭）
+            if (role === 'user') {
+              updates.coverPage = true
+              if (!wasCoverOn) {
+                // 与 onToggleCoverPage 开启时一致：价格标签淡入
+                updates.coverPriceVisible = true
+                updates.coverPriceEntering = true
+                updates.coverPriceExiting = false
+              }
+            }
+            this.setData(updates)
             wx.setStorageSync('userRole', role)
+            if (role === 'user' && !wasCoverOn) {
+              setTimeout(() => this.setData({ coverPriceEntering: false }), 350)
+            }
             // 从服务端同步主题偏好（跨设备一致）
             const app = getApp()
             app.syncThemeFromServer(res.data.theme_mode)
@@ -1852,7 +1864,6 @@ Component({
               urgencyOptions: p.urgency_levels || this.data.urgencyOptions,
               urgencyPrices: p.urgency_prices || this.data.urgencyPrices,
               coverPagePrice: p.cover_page_price != null ? p.cover_page_price : this.data.coverPagePrice,
-              pickupAddress: p.pickup_address || this.data.pickupAddress,
             })
             // 刷新当前地点百分比显示
             const loc = this.data.deliveryLocation
@@ -1917,7 +1928,7 @@ Component({
         deliveryPercent: next ? (this.data.deliveryPercentages[loc] || 0) : 0,
         showDeliveryPicker: false,  // 切换派送时关闭展开的地点列表
       })
-      // 派送开关影响地点行 + 自取地址行，内容高度变化 → 刷新滚动边界
+      // 派送开关影响地点行，内容高度变化 → 刷新滚动边界
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(400), 400)
     },
@@ -1963,6 +1974,11 @@ Component({
     },
 
     onToggleCoverPage() {
+      // 普通用户强制开启"打印首页"，不允许手动关闭
+      if (this.data.userRole === 'user') {
+        wx.showToast({ title: '普通用户必须打印首页', icon: 'none' })
+        return
+      }
       const turningOn = !this.data.coverPage
       this.setData({ coverPage: turningOn })
       if (turningOn) {
@@ -1979,10 +1995,6 @@ Component({
       // 首页开关影响"首页费"行，内容高度变化 → 刷新滚动边界
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(400), 400)
-    },
-
-    onPickupAddressInput(e) {
-      this.setData({ pickupAddress: e.detail.value || '' })
     },
 
     onCoverPagePriceInput(e) {
@@ -2657,9 +2669,9 @@ Component({
           delivery_percentage: this.data.deliveryPercent,
           urgency: this.data.urgency,
           urgency_price: this.data.urgencyPrice,
-          cover_page: this.data.coverPage ? 1 : 0,
+          // 普通用户强制打印首页（双保险：即使界面状态异常也按 1 提交）
+          cover_page: (this.data.userRole === 'user' || this.data.coverPage) ? 1 : 0,
           cover_page_price: this.data.coverPagePrice,
-          pickup_address: this.data.pickupAddress,
           skip_page_validation: skipPageValidation ? 1 : 0,
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
           // 无障碍打印预约：now=立即 / at=指定时间（今天~后天 + HH:MM）/ countdown=倒计时（分+秒）
