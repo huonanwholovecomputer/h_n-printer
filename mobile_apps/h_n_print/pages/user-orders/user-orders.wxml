@@ -4,8 +4,68 @@
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
 
-<scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
+<scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}"
+             scroll-top="{{listScrollTop}}" scroll-with-animation="{{scrollWithAnimation}}">
   <view class="container">
+
+    <!-- 被查看用户卡片（管理入口跳转后显示，与“我”页面顶部卡片一致） -->
+    <view wx:if="{{userDetail}}" class="user-card-wrap">
+      <view class="user-card">
+        <view class="user-card-avatar">
+          <image wx:if="{{userDetail.avatar_url}}" class="user-card-avatar-img" src="{{userDetail.avatar_url}}" mode="aspectFill" />
+          <text wx:else class="user-card-avatar-char">{{userDetail.avatarChar}}</text>
+        </view>
+        <view class="user-card-info">
+          <text class="user-card-nickname">{{userDetail.nickname || '未知用户'}}</text>
+          <text class="user-card-role">{{userDetail.is_super ? '超级管理员' : (userDetail.role === 'admin' ? '管理员' : (userDetail.role === 'user' ? '普通用户' : '访客'))}}</text>
+        </view>
+        <!-- 许可密钥徽章：点击向下展开详情 -->
+        <view wx:if="{{userDetail.license_info}}" class="license-badge {{userDetail.role === 'admin' || userDetail.license_info.type === 'admin' ? 'license-badge-admin' : (userDetail.license_info.expired ? 'license-badge-expired' : 'license-badge-temp')}}"
+              bindtap="onToggleLicenseDetail" hover-class="tap-active">
+          <text class="license-badge-key">{{userDetail.license_info.key}}</text>
+          <text class="license-badge-validity">{{userDetail.role === 'admin' || userDetail.license_info.type === 'admin' ? '永久' : (userDetail.license_info.expired ? '已过期' : '临时授权')}}</text>
+        </view>
+      </view>
+      <!-- 许可密钥详情（展开态） -->
+      <view wx:if="{{userDetail.license_info}}" class="license-detail {{showLicenseDetail ? 'license-detail-expanded' : ''}}">
+        <view class="detail-divider"></view>
+        <view class="detail-row">
+          <text class="detail-label">当前状态</text>
+          <text class="detail-value {{userDetail.role === 'admin' || userDetail.license_info.type === 'admin' ? 'license-status-permanent' : (userDetail.license_info.expired ? 'license-status-expired' : 'license-status-ok')}}">{{userDetail.role === 'admin' || userDetail.license_info.type === 'admin' ? '永久' : (userDetail.license_info.expired ? '已过期' : '有效')}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">许可密钥</text>
+          <text class="detail-value license-key-value">{{userDetail.license_info.key}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">密钥类型</text>
+          <text class="detail-value">{{userDetail.license_info.type === 'admin' ? '管理员许可' : '临时许可'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">授权人</text>
+          <text class="detail-value">{{userDetail.license_info.creator_nickname || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">创建时间</text>
+          <text class="detail-value">{{userDetail.license_info.created_at || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">使用时间</text>
+          <text class="detail-value">{{userDetail.license_info.used_at || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">到期时间</text>
+          <text class="detail-value">{{userDetail.license_info.expires_at || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">有效时长</text>
+          <text class="detail-value">{{userDetail.license_info.validity_minutes ? userDetail.license_info.validity_minutes + ' 分钟' : '—'}}</text>
+        </view>
+      </view>
+    </view>
+
+    <!-- 订单区域（滚动定位锚点） -->
+    <view class="orders-section">
 
     <!-- 加载中 -->
     <view wx:if="{{loading}}" class="status-box">
@@ -102,6 +162,23 @@
             </view>
           </view>
 
+          <!-- 临时许可密钥（订单消费的密钥） -->
+          <view wx:if="{{item.license_info}}" class="detail-section">
+            <view class="detail-section-title">临时许可密钥</view>
+            <view class="detail-row">
+              <text class="detail-label">密钥</text>
+              <text class="detail-value license-key-value">{{item.license_info.key}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">使用时间</text>
+              <text class="detail-value">{{item.license_info.used_at || '—'}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">到期时间</text>
+              <text class="detail-value">{{item.license_info.expires_at || '—'}}</text>
+            </view>
+          </view>
+
           <!-- 文件列表 -->
           <view wx:if="{{item.files && item.files.length > 0}}" class="detail-section">
             <view class="detail-section-title">文件列表 ({{item.files.length}})</view>
@@ -174,6 +251,7 @@
       <view wx:if="{{currentPage >= totalPages && totalPages > 0}}" class="end-hint">
         <text class="end-hint-text">-- 没有更多内容啦 --</text>
       </view>
+    </view>
     </view>
   </view>
 </scroll-view>

@@ -12,6 +12,7 @@
 
 /* 深浅切换过渡：所有在深色模式下变色的元素 */
 .page-root,
+.page-root .user-card-wrap,
 .page-root .user-card,
 .page-root .license-card,
 .page-root .storage-card,
@@ -112,6 +113,25 @@
 
 /* ═══════════════ User Profile Card ═══════════════ */
 
+.user-card-wrap {
+  margin-bottom: 20rpx;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  border: 1rpx solid var(--separator);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  overflow: hidden;
+  transition: background-color 0.4s ease, border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+/* 卡片本身不再承担容器背景（容器统一圆角/边框/阴影） */
+.user-card-wrap .user-card {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  margin-bottom: 0;
+}
+
 .user-card {
   background: var(--bg-card);
   border-radius: var(--radius-lg);
@@ -207,6 +227,11 @@
   background: rgba(0, 122, 255, 0.08);
   border: 1rpx solid rgba(0, 122, 255, 0.25);
 }
+
+.license-badge-expired {
+  background: rgba(142, 142, 147, 0.10);
+  border: 1rpx solid rgba(142, 142, 147, 0.25);
+}
 .license-badge-key {
   font-family: var(--font-mono);
   font-size: 20rpx;
@@ -223,6 +248,55 @@
 }
 .license-badge-admin .license-badge-validity {
   color: var(--blue);
+}
+
+.license-badge-expired .license-badge-validity {
+  color: var(--text-quaternary);
+}
+
+/* ── 许可密钥详情（点击徽章向下展开）── */
+.license-detail {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  padding: 0 28rpx;
+  transition: max-height 0.32s ease, opacity 0.25s ease;
+}
+
+.license-detail-expanded {
+  max-height: 800rpx;
+  opacity: 1;
+  padding: 0 28rpx 24rpx;
+}
+
+.license-detail .detail-divider {
+  margin: 8rpx 0;
+}
+
+.license-detail .detail-row {
+  padding: 9rpx 0;
+}
+
+.license-key-value {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--blue);
+  letter-spacing: 1rpx;
+}
+
+.license-status-ok {
+  color: #2E7D32;
+  font-weight: 600;
+}
+
+.license-status-permanent {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.license-status-expired {
+  color: var(--red);
+  font-weight: 600;
 }
 
 /* ═══════════════ Section Headers ═══════════════ */
@@ -1180,6 +1254,38 @@
   border-radius: 10rpx;
   padding: 3rpx 12rpx;
   font-weight: 600;
+}
+
+/* ── 已临时授权的普通用户：卡片副信息 ── */
+.temp-user-sub {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  margin-top: 4rpx;
+}
+
+.temp-user-key {
+  font-family: var(--font-mono);
+  font-size: 18rpx;
+  color: var(--text-tertiary);
+  letter-spacing: 1rpx;
+}
+
+.temp-user-status {
+  font-size: 18rpx;
+  font-weight: 600;
+  padding: 2rpx 10rpx;
+  border-radius: 8rpx;
+}
+
+.temp-user-active {
+  color: #2E7D32;
+  background-color: rgba(46, 125, 50, 0.08);
+}
+
+.temp-user-expired {
+  color: #E65100;
+  background-color: rgba(230, 81, 0, 0.08);
 }
 
 /* ═══════════════ Order Cards ═══════════════ */

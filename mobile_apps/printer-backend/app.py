@@ -942,6 +942,31 @@ def init_db():
         print("  已添加 license_keys.order_id 列")
     except sqlite3.OperationalError:
         pass
+    # 密钥生命周期状态：unused → used → revoked/finished/archived。
+    # 已使用的密钥作为授权记录永久保留，绝不硬删；作废/结束只改状态。
+    try:
+        user_conn.execute("ALTER TABLE license_keys ADD COLUMN status TEXT DEFAULT 'used'")
+        user_conn.commit()
+        print("  已添加 license_keys.status 列")
+    except sqlite3.OperationalError:
+        pass
+    # 迁移纠偏：已使用（used_by 非空）的行保持 used，未使用的行标记 unused
+    user_conn.execute("UPDATE license_keys SET status = 'unused' WHERE used_by IS NULL")
+    user_conn.commit()
+
+    # 用户移除记录（被谁、何时移除；重新授权时清空，密钥记录仍保留）
+    try:
+        user_conn.execute("ALTER TABLE users ADD COLUMN removed_at TEXT DEFAULT NULL")
+        user_conn.commit()
+        print("  已添加 users.removed_at 列")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        user_conn.execute("ALTER TABLE users ADD COLUMN removed_by TEXT DEFAULT NULL")
+        user_conn.commit()
+        print("  已添加 users.removed_by 列")
+    except sqlite3.OperationalError:
+        pass
     user_conn.commit()
     user_conn.close()
 
@@ -3740,6 +3765,26 @@ def get_orders():
         order["copies"] = total_copies
         orders.append(order)
 
+    # 关联临时许可密钥：每个订单显示它消费的密钥（license_keys.order_id 单向关联）
+    license_map = {}
+    order_ids = [o["id"] for o in orders]
+    if order_ids:
+        user_conn = get_user_db()
+        try:
+            placeholders = ",".join("?" for _ in order_ids)
+            lrows = user_conn.execute(
+                f"""SELECT order_id, key, type, created_at, used_at, expires_at, status
+                    FROM license_keys
+                    WHERE order_id IN ({placeholders})""",
+                order_ids,
+            ).fetchall()
+            for lr in lrows:
+                license_map[lr["order_id"]] = dict(lr)
+        finally:
+            user_conn.close()
+    for o in orders:
+        o["license_info"] = license_map.get(o["id"]) or None
+
     conn.close()
     return jsonify({
         "success": True,
@@ -3847,6 +3892,17 @@ def get_order_detail(order_id):
         }]
         order["total_copies"] = order.get("copies", 1)
         order["total_pages"] = order.get("page_count", 1) * order.get("copies", 1)
+
+    # 关联临时许可密钥（每个订单消费的密钥）
+    user_conn = get_user_db()
+    try:
+        lrow = user_conn.execute(
+            "SELECT order_id, key, type, created_at, used_at, expires_at, status FROM license_keys WHERE order_id = ? LIMIT 1",
+            (order_id,),
+        ).fetchone()
+        order["license_info"] = dict(lrow) if lrow else None
+    finally:
+        user_conn.close()
 
     conn.close()
     return jsonify({"success": True, "order": order})
@@ -4259,20 +4315,30 @@ def get_me():
     if need_license:
         lk_row = conn.execute(
             """SELECT lk.key, lk.created_by, lk.expires_at, lk.type,
+                      lk.created_at, lk.used_at, lk.validity_minutes,
                       u.nickname AS creator_nickname
                FROM license_keys lk
                LEFT JOIN users u ON lk.created_by = u.openid
-               WHERE lk.used_by = ? AND lk.expires_at > ?
+               WHERE lk.used_by = ?
                ORDER BY lk.id DESC LIMIT 1""",
-            (g.openid, now_str),
+            (g.openid,),
         ).fetchone()
         if lk_row:
+            # 当前角色是管理员（永久授权）或密钥本身是 admin 类型 → 视为永久；
+            # 只有临时许可才按到期时间判断是否过期。
+            is_permanent = (role == "admin") or (lk_row["type"] == "admin")
             license_info = {
                 "key": lk_row["key"],
                 "type": lk_row["type"] or "temp",
                 "creator_openid": lk_row["created_by"],
                 "creator_nickname": lk_row["creator_nickname"] or "",
+                "created_at": lk_row["created_at"],
+                "used_at": lk_row["used_at"],
                 "expires_at": lk_row["expires_at"],
+                "validity_minutes": lk_row["validity_minutes"],
+                "expired": False if is_permanent else not (
+                    lk_row["expires_at"] and lk_row["expires_at"] > now_str
+                ),
             }
     conn.close()
     is_super = SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID
@@ -4326,24 +4392,24 @@ def update_theme():
 @app.route("/api/authorized_users", methods=["GET"])
 @login_required
 def authorized_users():
-    """管理员查看自己授权过的用户列表（含最近订单摘要）。"""
+    """管理员/超级管理员查看自己的“历史授权用户”：所有被本管理员授权过的用户
+    （管理员 + 临时用户，含已移除/已过期），每个用户附全部密钥记录（支持多次授权）。
+    """
     role = compute_role(g.openid)
     if role != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_user_db()
-    # 查询该管理员创建的所有已使用的密钥（去重用户），只查 users.db 中的表
     rows = conn.execute(
-        """SELECT DISTINCT lk.used_by, u.nickname, u.avatar_path
+        """SELECT DISTINCT lk.used_by AS openid
            FROM license_keys lk
-           LEFT JOIN users u ON lk.used_by = u.openid
            WHERE lk.created_by = ? AND lk.used_by IS NOT NULL""",
         (g.openid,),
     ).fetchall()
-    conn.close()
+    user_openids = [r["openid"] for r in rows]
 
     # 从 orders.db 批量查询每个用户的最近订单和订单数
-    user_openids = [r["used_by"] for r in rows]
     order_stats = {}
     if user_openids:
         orders_conn = get_db()
@@ -4367,20 +4433,242 @@ def authorized_users():
 
     users = []
     for r in rows:
-        openid = r["used_by"]
+        openid = r["openid"]
+        urow = conn.execute(
+            "SELECT nickname, avatar_path, role, temp_until, removed_at, removed_by FROM users WHERE openid = ?",
+            (openid,),
+        ).fetchone()
+        key_rows = conn.execute(
+            """SELECT key, type, created_at, used_at, expires_at, validity_minutes, order_id, status
+               FROM license_keys
+               WHERE created_by = ? AND used_by = ?
+               ORDER BY id DESC""",
+            (g.openid, openid),
+        ).fetchall()
+
+        cur_role = compute_role(openid)
+        removed = bool(urow and urow["removed_at"])
+        if removed:
+            status = "removed"
+        elif cur_role == "admin":
+            status = "permanent"
+        elif urow and urow["temp_until"] and urow["temp_until"] > now_str:
+            status = "active"
+        else:
+            status = "expired"
+
+        types = sorted({(k["type"] or "temp") for k in key_rows})
+        license_type = "admin" if "admin" in types else ("temp" if "temp" in types else "")
+        license_type_label = "both" if len(types) > 1 else license_type
+
+        records = [{
+            "key": k["key"],
+            "type": k["type"] or "temp",
+            "created_at": k["created_at"],
+            "used_at": k["used_at"],
+            "expires_at": k["expires_at"],
+            "validity_minutes": k["validity_minutes"],
+            "order_id": k["order_id"],
+            "status": k["status"],
+        } for k in key_rows]
+        latest_key = records[0] if records else None
+
         stats = order_stats.get(openid, {})
         users.append({
             "openid": openid,
             "openid_short": openid[:8] + "..." if openid else "",
-            "nickname": r["nickname"] or "",
-            "avatar_url": get_avatar_url(openid, r["avatar_path"] or ""),
+            "nickname": ((urow["nickname"] if urow and urow["nickname"] else "") or "未知用户"),
+            "avatar_url": get_avatar_url(openid, (urow["avatar_path"] if urow else "") or ""),
+            "role": cur_role,
+            "is_super": bool(SUPER_ADMIN_OPENID and openid == SUPER_ADMIN_OPENID),
+            "removed": removed,
+            "removed_at": (urow["removed_at"] if urow else None),
+            "removed_by": (urow["removed_by"] if urow else None),
+            "status": status,
+            "license_type": license_type_label,
+            "latest_key": latest_key,
+            "records": records,
             "last_order": stats.get("last_order", ""),
             "order_count": stats.get("order_count", 0),
         })
-    # 按最近订单时间降序排列
-    users.sort(key=lambda u: u["last_order"] or "", reverse=True)
+    conn.close()
+    # 按最近使用密钥时间降序排列
+    users.sort(key=lambda u: (u["latest_key"] or {}).get("used_at") or "", reverse=True)
 
     return jsonify({"success": True, "users": users, "count": len(users)})
+
+
+@app.route("/api/admin/temp_users", methods=["GET"])
+@login_required
+def admin_temp_users():
+    """“已临时授权的普通用户”：本管理员创建的临时密钥所授权、且未被移除的普通用户。
+    卡片仅用于展示 + 左滑移除（无跳转）。
+    """
+    if compute_role(g.openid) != "admin":
+        return jsonify({"success": False, "message": "仅限管理员操作"}), 403
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_user_db()
+    rows = conn.execute(
+        """SELECT DISTINCT lk.used_by AS openid
+           FROM license_keys lk
+           WHERE lk.created_by = ? AND lk.type = 'temp' AND lk.used_by IS NOT NULL""",
+        (g.openid,),
+    ).fetchall()
+
+    users = []
+    for r in rows:
+        openid = r["openid"]
+        urow = conn.execute(
+            "SELECT nickname, avatar_path, temp_until, removed_at, role FROM users WHERE openid = ?",
+            (openid,),
+        ).fetchone()
+        if not urow or urow["removed_at"]:
+            continue
+        if compute_role(openid) == "admin":
+            continue  # 已是管理员 → 显示在“管理管理员”，不在此模块
+        lrow = conn.execute(
+            """SELECT key, type, created_at, used_at, expires_at, order_id, status
+               FROM license_keys
+               WHERE used_by = ? AND type = 'temp'
+               ORDER BY id DESC LIMIT 1""",
+            (openid,),
+        ).fetchone()
+        active = bool(urow["temp_until"] and urow["temp_until"] > now_str)
+        users.append({
+            "openid": openid,
+            "openid_short": openid[:8] + "..." if openid else "",
+            "nickname": (urow["nickname"] or "") or "未知用户",
+            "avatar_url": get_avatar_url(openid, urow["avatar_path"] or ""),
+            "status": "active" if active else "expired",
+            "temp_until": urow["temp_until"],
+            "license_key": (lrow["key"] if lrow else ""),
+            "license_used_at": (lrow["used_at"] if lrow else ""),
+            "license_expires_at": (lrow["expires_at"] if lrow else ""),
+            "order_id": (lrow["order_id"] if lrow else None),
+        })
+    conn.close()
+    users.sort(key=lambda u: u["license_used_at"] or "", reverse=True)
+    return jsonify({"success": True, "users": users, "count": len(users)})
+
+
+@app.route("/api/admin/remove_user", methods=["POST"])
+@login_required
+def admin_remove_user():
+    """管理员/超级管理员手动移除“已临时授权的普通用户”：
+    清除其临时授权并记录移除信息（removed_at/removed_by），密钥记录保留。
+    普通管理员只能移除自己授权过的用户；超级管理员可移除任意用户。
+    """
+    if compute_role(g.openid) != "admin":
+        return jsonify({"success": False, "message": "仅限管理员操作"}), 403
+
+    data = request.get_json() or {}
+    target_openid = (data.get("openid", "") or "").strip()
+    if not target_openid:
+        return jsonify({"success": False, "message": "缺少 openid 参数"}), 400
+
+    if not (SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID):
+        conn = get_user_db()
+        try:
+            licensed = conn.execute(
+                "SELECT 1 FROM license_keys WHERE created_by = ? AND used_by = ? AND type = 'temp' LIMIT 1",
+                (g.openid, target_openid),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not licensed:
+            return jsonify({"success": False, "message": "无权移除该用户"}), 403
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_user_db()
+    try:
+        conn.execute(
+            "UPDATE users SET temp_until = NULL, removed_at = ?, removed_by = ?, updated_at = ? WHERE openid = ?",
+            (now_str, g.openid, now_str, target_openid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"管理员 {g.openid[:8]}... 移除了临时用户 {target_openid[:8]}...")
+    return jsonify({"success": True, "message": "已移除该用户"})
+
+
+@app.route("/api/admin/user_detail", methods=["GET"])
+@login_required
+def admin_user_detail():
+    """管理员/超级管理员查看指定用户的卡片信息（头像、昵称、角色、许可密钥详情）。
+    超级管理员可查任意用户；普通管理员只能查看自己授权过的用户（保护隐私）。
+    license_info 与 /api/me 一致：取该用户最近一条已使用的密钥（不限是否过期），
+    并附带创建时间/使用时间/有效期/是否过期等详细字段。
+    """
+    if compute_role(g.openid) != "admin":
+        return jsonify({"success": False, "message": "仅限管理员操作"}), 403
+
+    openid = (request.args.get("openid", "") or "").strip()
+    if not openid:
+        return jsonify({"success": False, "message": "缺少 openid 参数"}), 400
+
+    # 普通管理员只能查看自己创建密钥授权过的用户
+    if not (SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID):
+        conn = get_user_db()
+        try:
+            licensed = conn.execute(
+                "SELECT 1 FROM license_keys WHERE created_by = ? AND used_by = ? LIMIT 1",
+                (g.openid, openid),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not licensed:
+            return jsonify({"success": False, "message": "无权查看该用户"}), 403
+
+    conn = get_user_db()
+    try:
+        urow = conn.execute(
+            "SELECT nickname, avatar_path FROM users WHERE openid = ?", (openid,)
+        ).fetchone()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lk_row = conn.execute(
+            """SELECT lk.key, lk.type, lk.created_at, lk.used_at, lk.expires_at,
+                      lk.validity_minutes, lk.created_by,
+                      u2.nickname AS creator_nickname
+               FROM license_keys lk
+               LEFT JOIN users u2 ON lk.created_by = u2.openid
+               WHERE lk.used_by = ?
+               ORDER BY lk.id DESC LIMIT 1""",
+            (openid,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    target_role = compute_role(openid)
+    license_info = None
+    if lk_row:
+        # 用户当前是管理员（永久授权）或密钥本身是 admin 类型 → 视为永久；
+        # 只有临时许可才按到期时间判断是否过期。
+        is_permanent = (target_role == "admin") or (lk_row["type"] == "admin")
+        license_info = {
+            "key": lk_row["key"],
+            "type": lk_row["type"] or "temp",
+            "creator_openid": lk_row["created_by"],
+            "creator_nickname": lk_row["creator_nickname"] or "",
+            "created_at": lk_row["created_at"],
+            "used_at": lk_row["used_at"],
+            "expires_at": lk_row["expires_at"],
+            "validity_minutes": lk_row["validity_minutes"],
+            "expired": False if is_permanent else not (
+                lk_row["expires_at"] and lk_row["expires_at"] > now_str
+            ),
+        }
+
+    return jsonify({
+        "success": True,
+        "openid": openid,
+        "nickname": (urow["nickname"] if urow and urow["nickname"] else "") or "微信用户",
+        "avatar_url": get_avatar_url(openid, (urow["avatar_path"] if urow else "") or ""),
+        "role": target_role,
+        "is_super": bool(SUPER_ADMIN_OPENID and openid == SUPER_ADMIN_OPENID),
+        "license_info": license_info,
+    })
 
 
 # ==================== 用户资料接口 ====================
@@ -4547,12 +4835,12 @@ def license_create():
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_user_db()
-    # 生成唯一密钥（避免与数据库中未失效的密钥冲突）
+    # 生成唯一密钥（全量查重 + 数据库 UNIQUE 约束双保险，避免任何碰撞）
     for _ in range(20):
         license_key = ''.join(secrets.choice('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789') for _ in range(8))
         dup = conn.execute(
-            "SELECT id FROM license_keys WHERE key = ? AND expires_at > ?",
-            (license_key, now_str),
+            "SELECT id FROM license_keys WHERE key = ?",
+            (license_key,),
         ).fetchone()
         if not dup:
             break
@@ -4562,8 +4850,8 @@ def license_create():
     validity = max(1, min(10, validity))
     expires = now + timedelta(minutes=validity)
     conn.execute(
-        """INSERT INTO license_keys (key, created_by, validity_minutes, created_at, expires_at, type)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO license_keys (key, created_by, validity_minutes, created_at, expires_at, type, status)
+           VALUES (?, ?, ?, ?, ?, ?, 'unused')""",
         (license_key, g.openid, validity,
          now.strftime("%Y-%m-%d %H:%M:%S"),
          expires.strftime("%Y-%m-%d %H:%M:%S"),
@@ -4602,9 +4890,9 @@ def license_redeem():
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
     conn = get_user_db()
-    # 原子条件 UPDATE：仅当未使用且未过期才生效
+    # 原子条件 UPDATE：仅当未使用且未过期才生效；兑换后标记 status='used'（记录永久保留）
     conn.execute(
-        """UPDATE license_keys SET used_by = ?, used_at = ?
+        """UPDATE license_keys SET used_by = ?, used_at = ?, status = 'used'
            WHERE key = ? AND used_by IS NULL AND expires_at > ?""",
         (g.openid, now_str, raw_key, now_str),
     )
@@ -4630,10 +4918,10 @@ def license_redeem():
     # 根据密钥类型处理用户权限
     existing = conn.execute("SELECT openid FROM users WHERE openid = ?", (g.openid,)).fetchone()
     if key_type == "admin":
-        # admin 类型: 设为管理员，清除临时授权
+        # admin 类型: 设为管理员，清除临时授权；同时清除历史移除标记（重新授权）
         if existing:
             conn.execute(
-                "UPDATE users SET role = 'admin', temp_until = NULL, updated_at = ? WHERE openid = ?",
+                "UPDATE users SET role = 'admin', temp_until = NULL, removed_at = NULL, removed_by = NULL, updated_at = ? WHERE openid = ?",
                 (now_str, g.openid),
             )
         else:
@@ -4642,10 +4930,10 @@ def license_redeem():
                 (g.openid, now_str),
             )
     else:
-        # temp 类型: 设置临时授权截止时间
+        # temp 类型: 设置临时授权截止时间；同时清除历史移除标记（重新授权）
         if existing:
             conn.execute(
-                "UPDATE users SET temp_until = ?, updated_at = ? WHERE openid = ?",
+                "UPDATE users SET temp_until = ?, removed_at = NULL, removed_by = NULL, updated_at = ? WHERE openid = ?",
                 (expires_at, now_str, g.openid),
             )
         else:
@@ -4673,9 +4961,10 @@ def license_active():
     conn = get_user_db()
     try:
         rows = conn.execute(
-            """SELECT id, key, type, used_by, order_id, validity_minutes, created_at, expires_at
+            """SELECT id, key, type, used_by, order_id, validity_minutes, created_at, expires_at, status
                FROM license_keys
                WHERE created_by = ? AND expires_at > ?
+                 AND (status IS NULL OR status NOT IN ('revoked', 'archived', 'finished'))
                ORDER BY id DESC""",
             (g.openid, now_str),
         ).fetchall()
@@ -4783,16 +5072,17 @@ def license_revoke():
     target_key = (data.get("key", "") or "").strip().upper()
 
     conn = get_user_db()
+    # 只软作废“未使用”的密钥（status → revoked，行保留）。
+    # 已使用的密钥是授权记录，绝不删除/作废。
     if target_key:
-        # 删除指定密钥（只能删除自己创建的，已使用或未使用均可）
         conn.execute(
-            "DELETE FROM license_keys WHERE key = ? AND created_by = ?",
+            "UPDATE license_keys SET status = 'revoked' WHERE key = ? AND created_by = ? AND used_by IS NULL",
             (target_key, g.openid),
         )
     else:
-        # 兼容旧版：删除所有未使用的密钥
+        # 兼容旧版：作废所有未使用的密钥
         conn.execute(
-            "DELETE FROM license_keys WHERE created_by = ? AND used_by IS NULL",
+            "UPDATE license_keys SET status = 'revoked' WHERE created_by = ? AND used_by IS NULL",
             (g.openid,),
         )
     conn.commit()
@@ -4861,9 +5151,9 @@ def license_finish():
         finally:
             orders_conn.close()
 
-    # 删除该许可密钥（标记为已完成）
+    # 标记为已完成（status → finished，行保留作为授权记录，绝不硬删）
     conn.execute(
-        "DELETE FROM license_keys WHERE id = ?",
+        "UPDATE license_keys SET status = 'finished' WHERE id = ?",
         (lrow["id"],),
     )
     conn.commit()
@@ -4980,8 +5270,9 @@ def admin_admins_list():
 @app.route("/api/admin/remove_admin", methods=["POST"])
 @login_required
 def admin_remove_admin():
-    """超级管理员移除某个管理员（将其 role 改为 guest，清除 temp_until）。
+    """超级管理员移除某个管理员（将其 role 改为 guest，清除 temp_until，并记录移除信息）。
     不能移除超级管理员自己。
+    被移除的管理员会出现在超级管理员的“历史授权用户”中（状态=已移除）。
     """
     if not SUPER_ADMIN_OPENID or g.openid != SUPER_ADMIN_OPENID:
         return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
@@ -5006,9 +5297,24 @@ def admin_remove_admin():
         return jsonify({"success": False, "message": "用户不是管理员或不存在"}), 404
 
     conn.execute(
-        "UPDATE users SET role = 'guest', temp_until = NULL, updated_at = ? WHERE openid = ?",
-        (now_str, target_openid),
+        "UPDATE users SET role = 'guest', temp_until = NULL, removed_at = ?, removed_by = ?, updated_at = ? WHERE openid = ?",
+        (now_str, g.openid, now_str, target_openid),
     )
+    # 若该管理员没有任何 admin 类型密钥记录（历史硬删导致）→ 补一条归档记录，
+    # 保证“移除的管理员必进历史授权用户、授权记录不凭空消失”。
+    has_admin_key = conn.execute(
+        "SELECT 1 FROM license_keys WHERE used_by = ? AND type = 'admin' LIMIT 1",
+        (target_openid,),
+    ).fetchone()
+    if not has_admin_key:
+        import uuid
+        archive_key = 'ARCHIVED' + uuid.uuid4().hex[:6].upper()
+        conn.execute(
+            """INSERT INTO license_keys
+               (key, created_by, used_by, validity_minutes, created_at, expires_at, used_at, type, status)
+               VALUES (?, ?, ?, 0, ?, ?, ?, 'admin', 'archived')""",
+            (archive_key, g.openid, target_openid, now_str, now_str, now_str),
+        )
     conn.commit()
     conn.close()
 

@@ -25,24 +25,63 @@
       <view class="list-summary">
         <text class="summary-text">共 {{users.length}} 位授权用户</text>
       </view>
-      <view wx:for="{{users}}" wx:key="openid" class="user-card-item"
-            bindtap="onUserTap" data-openid="{{item.openid}}" data-nickname="{{item.nickname}}"
-            hover-class="tap-active">
-        <view class="user-avatar-circle">
-          <image wx:if="{{item.avatarUrl}}" class="user-avatar-img" src="{{item.avatarUrl}}" mode="aspectFill" />
-          <text wx:else class="user-avatar-char">{{item.avatarChar}}</text>
-        </view>
-        <view class="user-card-center">
-          <text class="user-card-name">{{item.nickname || '未知用户'}}</text>
-          <text class="user-card-id">ID: {{item.openid_short || item.openid}}</text>
-        </view>
-        <view class="user-card-right">
-          <view class="user-stat">
-            <text class="user-stat-num">{{item.order_count}}</text>
-            <text class="user-stat-label">个订单</text>
+      <view wx:for="{{users}}" wx:key="openid" class="user-card-item">
+        <!-- 卡片主体：点击跳转该用户订单页 -->
+        <view class="user-card-main" bindtap="onUserTap" data-openid="{{item.openid}}" data-nickname="{{item.nickname}}"
+              hover-class="tap-active">
+          <view class="user-avatar-circle">
+            <image wx:if="{{item.avatarUrl}}" class="user-avatar-img" src="{{item.avatarUrl}}" mode="aspectFill" />
+            <text wx:else class="user-avatar-char">{{item.avatarChar}}</text>
           </view>
-          <text class="user-card-last" wx:if="{{item.last_order}}">最近: {{item.last_order}}</text>
-          <text class="role-btn-arrow">›</text>
+          <view class="user-card-center">
+            <text class="user-card-name">{{item.nickname || '未知用户'}}</text>
+            <view class="user-card-tags">
+              <text class="key-type-tag {{item.license_type === 'admin' ? 'tag-admin' : (item.license_type === 'temp' ? 'tag-temp' : (item.license_type === 'both' ? 'tag-both' : ''))}}">{{item.licenseTypeLabel}}</text>
+              <text class="status-tag status-{{item.status}}">{{item.statusLabel}}</text>
+            </view>
+            <text class="user-card-id">ID: {{item.openid_short || item.openid}}</text>
+          </view>
+          <view class="user-card-right">
+            <view class="user-stat">
+              <text class="user-stat-num">{{item.order_count}}</text>
+              <text class="user-stat-label">个订单</text>
+            </view>
+            <text class="user-card-last" wx:if="{{item.last_order}}">最近: {{item.last_order}}</text>
+            <text class="role-btn-arrow">›</text>
+          </view>
+        </view>
+        <!-- 密钥记录展开开关 -->
+        <view class="records-toggle" bindtap="onToggleRecords" data-openid="{{item.openid}}" hover-class="tap-active">
+          <text class="records-toggle-text">密钥记录 ({{item.records.length}})</text>
+          <text class="records-toggle-arrow {{expandedUsers[item.openid] ? 'arrow-up' : ''}}">›</text>
+        </view>
+        <!-- 密钥记录列表（多次授权/移除后重新授权均可看到） -->
+        <view class="records-panel {{expandedUsers[item.openid] ? 'records-expanded' : ''}}">
+          <view class="detail-divider"></view>
+          <view wx:if="{{item.records.length === 0}}" class="records-empty">无密钥记录</view>
+          <view wx:for="{{item.records}}" wx:for-item="rec" wx:key="key" class="record-row">
+            <view class="record-head">
+              <text class="record-key">{{rec.key}}</text>
+              <text class="record-type {{rec.type === 'admin' ? 'tag-admin' : 'tag-temp'}}">{{rec.type === 'admin' ? '管理员许可' : '临时许可'}}</text>
+              <text class="record-status">{{keyStatusMap[rec.status] || rec.status}}</text>
+            </view>
+            <view class="record-line">
+              <text class="record-label">创建时间</text>
+              <text class="record-value">{{rec.created_at || '—'}}</text>
+            </view>
+            <view class="record-line">
+              <text class="record-label">使用时间</text>
+              <text class="record-value">{{rec.used_at || '—'}}</text>
+            </view>
+            <view class="record-line">
+              <text class="record-label">到期时间</text>
+              <text class="record-value">{{rec.expires_at || '—'}}</text>
+            </view>
+            <view class="record-line">
+              <text class="record-label">关联订单</text>
+              <text class="record-value">{{rec.order_id ? ('订单 #' + rec.order_id) : '空订单（有效期内未提交任务）'}}</text>
+            </view>
+          </view>
         </view>
       </view>
     </view>

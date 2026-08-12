@@ -26,6 +26,8 @@ Component({
     userRole: '',
     // 许可密钥详情（临时授权用户显示）
     licenseInfo: null,
+    // 许可密钥详情展开（点击卡片右侧徽章）
+    showLicenseDetail: false,
     orders: [],
     loading: true,
     // 分页
@@ -59,7 +61,12 @@ Component({
     generating: false,
     // 多密钥支持：所有活跃密钥以数组存储
     activeKeys: [],
-    licensedUsers: [],
+    // 已临时授权的普通用户（卡片 + 左滑移除）
+    tempUsers: [],
+    tempUsersLoading: false,
+    tempUserSwipeX: {},            // { openid: px }
+    tempUserSwipeTransition: {},   // { openid: bool }
+    tempUserDeleteOpacity: {},     // { openid: 0~1 }
     redeemKey: '',
     redeeming: false,
     // 临时授权倒计时
@@ -167,7 +174,7 @@ Component({
         this.loadProfile()
         const cachedRole = wx.getStorageSync('userRole')
         if (cachedRole === 'admin') {
-          this.loadLicensedUsers()
+          this.loadTempUsers()
           this.loadActiveKey(false)
           this.loadStorageStats()
           this.loadSecurityConfig()
@@ -222,7 +229,7 @@ Component({
         this.loadProfile()
         const cachedRole = wx.getStorageSync('userRole')
         if (cachedRole === 'admin') {
-          this.loadLicensedUsers()
+          this.loadTempUsers()
           this.loadActiveKey()
           this.loadStorageStats()
           this.loadSecurityConfig()
@@ -985,7 +992,7 @@ Component({
             app.syncThemeFromServer(res.data.theme_mode)
             // 角色切换会改变 wx:if 区块，内容高度变化显著 → 刷新滚动边界
             this._scheduleMeasure()
-            // 管理员加载存储统计 + 开启轮询（loadLicensedUsers 已在 show 中调用）
+            // 管理员加载存储统计 + 开启轮询（loadTempUsers 已在 show 中调用）
             if (role === 'admin') {
               this.loadStorageStats()
               this.loadSecurityConfig()
@@ -1010,6 +1017,14 @@ Component({
           console.error('[loadUserRole] 网络请求失败:', err)
         }
       })
+    },
+
+    // 点击卡片右侧许可密钥徽章：向下展开/收起详情
+    onToggleLicenseDetail() {
+      this.setData({ showLicenseDetail: !this.data.showLicenseDetail })
+      // 展开/收起改变内容高度 → 刷新自定义滚动引擎边界（动画结束后再测一次）
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(300), 320)
     },
 
     // ==================== 管理员：许可密钥 ====================
@@ -1213,6 +1228,9 @@ Component({
       const idx = e.currentTarget.dataset.idx
       const t = e.touches[0]
       if (!t || idx == null) return
+      // 已使用的密钥是授权记录，不可删除 → 不响应左滑
+      const k = this.data.activeKeys[idx]
+      if (!k || k.status !== 'unused') return
       this._keySwipeIdx = idx
       this._keySwipeStartX = t.clientX
       this._keySwipeStartY = t.clientY
@@ -1320,6 +1338,11 @@ Component({
       const idx = e.currentTarget.dataset.idx
       const k = this.data.activeKeys[idx]
       if (!k) return
+      // 已使用的密钥是授权记录，不可删除（记录永久保留）
+      if (k.status !== 'unused') {
+        wx.showToast({ title: '已使用密钥为授权记录，不可删除', icon: 'none' })
+        return
+      }
       const token = wx.getStorageSync('token')
       if (!token) return
       const isUsed = k.status !== 'unused'
@@ -1586,8 +1609,7 @@ Component({
       const openid = e.currentTarget.dataset.openid
       const token = wx.getStorageSync('token')
       if (!token) return
-      const that = this
-      this._showConfirm('移除管理员', '确定要移除该管理员吗？', '移除', '#ff4d4f', function() {
+      this._showConfirm('移除管理员', '确定要移除该管理员吗？', '移除', '#ff4d4f', () => {
           request({
             url: CONFIG.BASE_URL + '/api/admin/remove_admin',
             method: 'POST',
@@ -1957,31 +1979,149 @@ Component({
       }
     },
 
-    loadLicensedUsers() {
-      const token = wx.getStorageSync('token')
-      if (!token) {
-        console.log('[loadLicensedUsers] token 不存在，跳过')
-        return
-      }
+    // ==================== 已临时授权的普通用户 ====================
 
-      console.log('[loadLicensedUsers] 正在请求用户列表...')
+    loadTempUsers() {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      this.setData({ tempUsersLoading: true })
       request({
-        url: CONFIG.BASE_URL + '/api/admin/users',
+        url: CONFIG.BASE_URL + '/api/admin/temp_users',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
         success: (res) => {
-          console.log('[loadLicensedUsers] 响应:', res.statusCode, JSON.stringify(res.data))
+          this.setData({ tempUsersLoading: false })
           if (res.data && res.data.success) {
-            this.setData({ licensedUsers: res.data.users || [] })
-            console.log('[loadLicensedUsers] 加载到 ' + (res.data.users || []).length + ' 个用户')
+            const users = (res.data.users || []).map(u => ({
+              ...u,
+              avatarUrl: u.avatar_url ? u.avatar_url + '?t=' + Date.now() : '',
+              avatarChar: (u.nickname || '?')[0],
+            }))
+            this.setData({ tempUsers: users })
             this._scheduleMeasure()
-          } else {
-            console.error('[loadLicensedUsers] 接口返回失败:', res.data)
           }
         },
-        fail: (err) => {
-          console.error('[loadLicensedUsers] 请求失败:', err)
+        fail: () => {
+          this.setData({ tempUsersLoading: false })
         }
+      })
+    },
+
+    // 临时用户卡片左滑手势（仅移除，无点击跳转）
+    onTempUserTouchStart(e) {
+      const openid = e.currentTarget.dataset.openid
+      const t = e.touches[0]
+      if (!t) return
+      this._tempUserSwipeData = this._tempUserSwipeData || {}
+      this._tempUserSwipeData[openid] = {
+        startX: t.clientX,
+        startY: t.clientY,
+        lastX: t.clientX,
+        startCardX: this.data.tempUserSwipeX[openid] || 0,
+        horizontal: false,
+        moved: false,
+      }
+      const trans = { ...this.data.tempUserSwipeTransition }
+      trans[openid] = false
+      this.setData({ tempUserSwipeTransition: trans })
+    },
+
+    onTempUserTouchMove(e) {
+      const openid = e.currentTarget.dataset.openid
+      const sd = this._tempUserSwipeData && this._tempUserSwipeData[openid]
+      if (!sd) return
+      const t = e.touches[0]
+      if (!t) return
+      const dx = t.clientX - sd.startX
+      const dy = t.clientY - sd.startY
+      if (!sd.horizontal) {
+        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return
+        sd.moved = true
+        if (Math.abs(dx) > Math.abs(dy)) {
+          sd.horizontal = true
+          // 通知滚动引擎让出控制权
+          this._swipeHorizontal = true
+        } else {
+          return
+        }
+      }
+      sd.moved = true
+      const rawX = sd.startCardX + dx
+      const maxX = -this._adminDeleteWidthPx
+      const visualX = this._rubberBand(rawX, maxX, 0, 55)
+      sd.lastX = rawX
+      sd.lastVisualX = visualX
+      const swipeX = { ...this.data.tempUserSwipeX }
+      swipeX[openid] = visualX
+      const opacity = { ...this.data.tempUserDeleteOpacity }
+      opacity[openid] = rawX < 0 ? Math.min(1, Math.abs(rawX) / (this._adminDeleteWidthPx * 0.6)) : 0
+      this.setData({ tempUserSwipeX: swipeX, tempUserDeleteOpacity: opacity })
+    },
+
+    onTempUserTouchEnd(e) {
+      this._swipeHorizontal = false
+      const openid = e.currentTarget.dataset.openid
+      const sd = this._tempUserSwipeData && this._tempUserSwipeData[openid]
+      if (!sd) return
+      if (!sd.moved || !sd.horizontal) return  // 纯点击/垂直滚动：无跳转
+      const trans = { ...this.data.tempUserSwipeTransition }
+      trans[openid] = true
+      const maxX = -this._adminDeleteWidthPx
+      const rawX = sd.lastX
+      const target = rawX > 0 ? 0 : (rawX < maxX ? maxX : (rawX < maxX / 2 ? maxX : 0))
+      const opacity = { ...this.data.tempUserDeleteOpacity }
+      opacity[openid] = target === 0 ? 0 : 1
+      this.setData({ tempUserSwipeTransition: trans, tempUserDeleteOpacity: opacity })
+      wx.nextTick(() => {
+        const swipeX = { ...this.data.tempUserSwipeX }
+        swipeX[openid] = target
+        this.setData({ tempUserSwipeX: swipeX })
+        const capturedOpenid = openid
+        setTimeout(() => {
+          const cleanTrans = { ...this.data.tempUserSwipeTransition }
+          delete cleanTrans[capturedOpenid]
+          this.setData({ tempUserSwipeTransition: cleanTrans })
+        }, 300)
+      })
+    },
+
+    onRemoveTempUser(e) {
+      const openid = e.currentTarget.dataset.openid
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      this._showConfirm('移除用户', '确定要移除该临时授权用户吗？移除后其授权记录将保留在历史授权用户中。', '移除', '#ff4d4f', () => {
+        request({
+          url: CONFIG.BASE_URL + '/api/admin/remove_user',
+          method: 'POST',
+          header: { 'Authorization': 'Bearer ' + token, 'content-type': 'application/json' },
+          data: { openid: openid },
+          success: (res) => {
+            if (res.data && res.data.success) {
+              wx.showToast({ title: '已移除', icon: 'success' })
+              // 滑回收起 → 淡出 → 移除
+              const swipeX = { ...this.data.tempUserSwipeX }
+              swipeX[openid] = 0
+              const trans = { ...this.data.tempUserSwipeTransition }
+              trans[openid] = true
+              this.setData({ tempUserSwipeX: swipeX, tempUserSwipeTransition: trans })
+              setTimeout(() => {
+                const users = this.data.tempUsers.map(u =>
+                  u.openid === openid ? { ...u, _exiting: true } : u
+                )
+                this.setData({ tempUsers: users })
+                setTimeout(() => {
+                  this.setData({ tempUsers: this.data.tempUsers.filter(u => u.openid !== openid) })
+                  this._scheduleMeasure()
+                }, 350)
+              }, 180)
+            } else {
+              wx.showToast({ title: (res.data && res.data.message) || '移除失败', icon: 'none' })
+            }
+          },
+          fail: () => {
+            wx.showToast({ title: '网络错误', icon: 'none' })
+          }
+        })
       })
     },
 
@@ -2321,10 +2461,5 @@ Component({
       return '☀️'
     },
 
-    // ==================== 导航 ====================
-
-    onGoMyPerformance() {
-      this._navigateWithAnimation('/pages/my-performance/my-performance')
-    },
   },
 })

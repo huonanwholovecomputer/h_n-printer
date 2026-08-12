@@ -3,9 +3,6 @@ const { CONFIG } = require('./utils/config')
 
 App({
   onLaunch() {
-    const logs = wx.getStorageSync('logs') || []
-    logs.unshift(Date.now())
-    wx.setStorageSync('logs', logs)
     this.globalData._firstLaunch = true
 
     // 初始化主题：'auto' | 'light' | 'dark'

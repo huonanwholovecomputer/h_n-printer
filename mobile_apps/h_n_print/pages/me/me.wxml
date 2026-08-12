@@ -29,24 +29,63 @@
     <view class="scroll-content" style="transform: translateY({{-scrollTop}}px);">
       <view class="container">
 
-    <!-- 用户信息卡片 -->
-    <view class="user-card ">
-      <view class="avatar-btn" bindtap="onChooseAvatar" hover-class="avatar-hover">
-        <image class="avatar" src="{{avatarUrl || '/images/default-avatar.png'}}" mode="aspectFill"></image>
-      </view>
-      <view class="user-info">
-        <view class="nickname-row" bindtap="onTapNickname" hover-class="tap-active">
-          <text class="nickname-text">{{nickname || '点击设置昵称'}}</text>
-          <text class="nickname-edit-icon">✎</text>
+    <!-- 用户信息卡片（右侧许可密钥徽章可点击展开详情） -->
+    <view class="user-card-wrap">
+      <view class="user-card ">
+        <view class="avatar-btn" bindtap="onChooseAvatar" hover-class="avatar-hover">
+          <image class="avatar" src="{{avatarUrl || '/images/default-avatar.png'}}" mode="aspectFill"></image>
         </view>
-        <text class="uid">{{isSuperAdmin ? '超级管理员' : (userRole === 'admin' ? '管理员' : (userRole === 'user' ? '普通用户' : '访客'))}}</text>
-        <!-- 隐藏的原生 type="nickname" 输入，触发微信内置昵称自动填充 -->
-        <input class="hidden-nickname-input" type="nickname" focus="{{focusWechatNickname}}" bindinput="onHiddenNicknameInput" bindblur="onHiddenNicknameBlur" />
+        <view class="user-info">
+          <view class="nickname-row" bindtap="onTapNickname" hover-class="tap-active">
+            <text class="nickname-text">{{nickname || '点击设置昵称'}}</text>
+            <text class="nickname-edit-icon">✎</text>
+          </view>
+          <text class="uid">{{isSuperAdmin ? '超级管理员' : (userRole === 'admin' ? '管理员' : (userRole === 'user' ? '普通用户' : '访客'))}}</text>
+          <!-- 隐藏的原生 type="nickname" 输入，触发微信内置昵称自动填充 -->
+          <input class="hidden-nickname-input" type="nickname" focus="{{focusWechatNickname}}" bindinput="onHiddenNicknameInput" bindblur="onHiddenNicknameBlur" />
+        </view>
+        <!-- 许可密钥徽章（临时授权或通过密钥升级的管理员）：点击向下展开详情 -->
+        <view wx:if="{{licenseInfo}}" class="license-badge {{userRole === 'admin' || licenseInfo.type === 'admin' ? 'license-badge-admin' : (licenseInfo.expired ? 'license-badge-expired' : 'license-badge-temp')}}"
+              bindtap="onToggleLicenseDetail" hover-class="tap-active">
+          <text class="license-badge-key">{{licenseInfo.key}}</text>
+          <text class="license-badge-validity">{{userRole === 'admin' || licenseInfo.type === 'admin' ? '永久' : (licenseInfo.expired ? '已过期' : (tempCountdownText || '--'))}}</text>
+        </view>
       </view>
-      <!-- 许可密钥徽章（临时授权或通过密钥升级的管理员） -->
-      <view wx:if="{{licenseInfo}}" class="license-badge {{licenseInfo.type === 'admin' ? 'license-badge-admin' : 'license-badge-temp'}}">
-        <text class="license-badge-key">{{licenseInfo.key}}</text>
-        <text class="license-badge-validity">{{licenseInfo.type === 'admin' ? '永久' : (tempCountdownText || '--')}}</text>
+      <!-- 许可密钥详情（展开态：创建/使用/到期时间） -->
+      <view wx:if="{{licenseInfo}}" class="license-detail {{showLicenseDetail ? 'license-detail-expanded' : ''}}">
+        <view class="detail-divider"></view>
+        <view class="detail-row">
+          <text class="detail-label">当前状态</text>
+          <text class="detail-value {{userRole === 'admin' || licenseInfo.type === 'admin' ? 'license-status-permanent' : (licenseInfo.expired ? 'license-status-expired' : 'license-status-ok')}}">{{userRole === 'admin' || licenseInfo.type === 'admin' ? '永久' : (licenseInfo.expired ? '已过期' : '有效')}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">许可密钥</text>
+          <text class="detail-value license-key-value">{{licenseInfo.key}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">密钥类型</text>
+          <text class="detail-value">{{licenseInfo.type === 'admin' ? '管理员许可' : '临时许可'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">授权人</text>
+          <text class="detail-value">{{licenseInfo.creator_nickname || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">创建时间</text>
+          <text class="detail-value">{{licenseInfo.created_at || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">使用时间</text>
+          <text class="detail-value">{{licenseInfo.used_at || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">到期时间</text>
+          <text class="detail-value">{{licenseInfo.expires_at || '—'}}</text>
+        </view>
+        <view class="detail-row">
+          <text class="detail-label">有效时长</text>
+          <text class="detail-value">{{licenseInfo.validity_minutes ? licenseInfo.validity_minutes + ' 分钟' : '—'}}</text>
+        </view>
       </view>
     </view>
 
@@ -78,11 +117,11 @@
       <!-- 活跃密钥列表（与管理员卡片同构：扁平 wrap + 滑出删除） -->
       <view wx:for="{{activeKeys}}" wx:key="key"
             class="key-card-wrap {{item.entering ? 'key-entering' : ''}} {{item.exiting ? 'key-exiting' : ''}} {{item.deleteQuickFade ? 'quick-fade' : ''}} {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}} {{item.status !== 'unused' ? 'key-drawer-locked' : ''}}">
-        <!-- 右侧删除按钮（绝对定位，左滑时露出） -->
-        <view class="key-delete" catchtap="onRevokeKey" data-idx="{{index}}"
+        <!-- 右侧删除按钮（绝对定位，左滑时露出；已使用的密钥是授权记录，不可删除） -->
+        <view wx:if="{{item.status === 'unused'}}" class="key-delete" catchtap="onRevokeKey" data-idx="{{index}}"
               style="opacity: {{item.deleteOpacity}}">
           <text class="delete-icon">🗑</text>
-          <text>{{item.status === 'unused' ? '作废' : '删除'}}</text>
+          <text>作废</text>
         </view>
         <!-- 卡片本体：可左滑 -->
         <view class="key-card {{item.swipeTransition === false ? 'no-transition' : ''}}"
@@ -231,28 +270,6 @@
       </view>
     </view>
 
-    <!-- 管理员：许可用户列表 -->
-    <view class="users-section admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}" style="animation-delay: 0.12s">
-      <view class="section-title">
-        <view class="section-bar"></view>
-        <text>许可用户</text>
-        <text wx:if="{{licensedUsers.length > 0}}" class="order-count">{{licensedUsers.length}}</text>
-      </view>
-      <!-- 用户列表 -->
-      <view wx:for="{{licensedUsers}}" wx:key="openid" class="user-item">
-        <image class="user-avatar" src="{{item.avatar_url || '/images/default-avatar.png'}}" mode="aspectFill"></image>
-        <view class="user-detail">
-          <text class="user-nickname">{{item.nickname}}</text>
-          <text wx:if="{{item.license_key}}" class="user-license-key">密钥: {{item.license_key}}</text>
-          <text class="user-licensed-at">许可时间: {{item.licensed_at}}</text>
-        </view>
-      </view>
-      <!-- 空状态 -->
-      <view wx:if="{{licensedUsers.length === 0}}" class="license-card">
-        <text class="redeem-desc" style="text-align:center;margin:0;">暂无许可用户，生成密钥分享给他人即可</text>
-      </view>
-    </view>
-
     <!-- 管理员/超级管理员：历史授权用户 -->
     <view class="role-actions admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}" style="animation-delay: 0.14s">
       <view class="role-btn user-btn" bindtap="onGoAuthorizedUsers" hover-class="role-btn-pressing" hover-start-time="0" hover-stay-time="100">
@@ -300,6 +317,43 @@
           <view class="admin-info">
             <text class="admin-name">{{item.nickname}}</text>
             <text wx:if="{{item.is_super}}" class="admin-badge">超级管理员</text>
+          </view>
+        </view>
+      </view>
+    </view>
+
+    <!-- 管理员/超级管理员：已临时授权的普通用户（位于管理管理员下方；管理员同样位置） -->
+    <view wx:if="{{userRole === 'admin'}}" class="license-section" style="animation-delay: 0.20s">
+      <view class="section-title">
+        <view class="section-bar"></view>
+        <text>已临时授权的普通用户</text>
+        <text wx:if="{{tempUsers.length > 0}}" class="order-count">{{tempUsers.length}}</text>
+      </view>
+      <view wx:if="{{tempUsers.length === 0 && !tempUsersLoading}}" class="license-card">
+        <text class="redeem-desc" style="text-align:center;margin:0;">暂无已临时授权的普通用户</text>
+      </view>
+      <view wx:for="{{tempUsers}}" wx:key="openid" class="admin-card-wrap {{item._exiting ? 'admin-exiting' : ''}}">
+        <!-- 右侧删除按钮（左滑移除） -->
+        <view class="admin-delete" catchtap="onRemoveTempUser" data-openid="{{item.openid}}"
+              style="opacity: {{tempUserDeleteOpacity[item.openid] || 0}}">
+          <text class="delete-icon">🗑</text>
+          <text>移除</text>
+        </view>
+        <!-- 卡片本体：可左滑（仅移除，无点击跳转） -->
+        <view class="admin-card {{tempUserSwipeTransition[item.openid] === false ? 'no-transition' : ''}}"
+              style="transform: translateX({{tempUserSwipeX[item.openid] || 0}}px);{{tempUserSwipeTransition[item.openid] === false ? 'transition: none;' : (tempUserSwipeTransition[item.openid] === true ? 'transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);' : '')}}"
+              bindtouchstart="onTempUserTouchStart"
+              bindtouchmove="onTempUserTouchMove"
+              bindtouchend="onTempUserTouchEnd"
+              bindtouchcancel="onTempUserTouchEnd"
+              data-openid="{{item.openid}}">
+          <image class="admin-avatar" src="{{item.avatar_url || '/images/default-avatar.png'}}" mode="aspectFill" />
+          <view class="admin-info">
+            <text class="admin-name">{{item.nickname}}</text>
+            <view class="temp-user-sub">
+              <text class="temp-user-key">{{item.license_key}}</text>
+              <text class="temp-user-status {{item.status === 'active' ? 'temp-user-active' : 'temp-user-expired'}}">{{item.status === 'active' ? '授权中' : '已过期'}}</text>
+            </view>
           </view>
         </view>
       </view>
@@ -390,6 +444,23 @@
             <view class="detail-row">
               <text class="detail-label">合计份数</text>
               <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_copies || item.copies) + ' 份'}}</text>
+            </view>
+          </view>
+
+          <!-- 临时许可密钥（订单消费的密钥） -->
+          <view wx:if="{{item.license_info}}" class="detail-section">
+            <view class="detail-section-title">临时许可密钥</view>
+            <view class="detail-row">
+              <text class="detail-label">密钥</text>
+              <text class="detail-value license-key-value">{{item.license_info.key}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">使用时间</text>
+              <text class="detail-value">{{item.license_info.used_at || '—'}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">到期时间</text>
+              <text class="detail-value">{{item.license_info.expires_at || '—'}}</text>
             </view>
           </view>
 

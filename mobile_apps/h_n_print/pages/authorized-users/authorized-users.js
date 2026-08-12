@@ -1,5 +1,7 @@
 // pages/authorized-users/authorized-users.js
 // F10: 历史授权用户列表（管理员/超级管理员可见）
+// 展示所有被本管理员授权过的用户（管理员+临时用户，含已移除/已过期），
+// 卡片含密钥类型与当前状态，可展开查看该用户的全部密钥记录（多次授权）。
 const { CONFIG } = require('../../utils/config')
 
 Component({
@@ -9,6 +11,20 @@ Component({
     isDarkMode: wx.getStorageSync('isDarkMode') || false,
     users: [],
     loading: true,
+    expandedUsers: {},
+    statusMap: {
+      permanent: '永久管理员',
+      active: '临时授权中',
+      expired: '已过期',
+      removed: '已移除',
+    },
+    keyStatusMap: {
+      unused: '未使用',
+      used: '已使用',
+      revoked: '已作废',
+      finished: '已完成',
+      archived: '归档',
+    },
   },
 
   pageLifetimes: {
@@ -61,6 +77,10 @@ Component({
               avatarChar: (u.nickname || '?')[0],
               // 头像 URL 加时间戳防缓存，确保每次打开显示最新头像
               avatarUrl: u.avatar_url ? u.avatar_url + '?t=' + Date.now() : '',
+              licenseTypeLabel: u.license_type === 'admin' ? '管理员许可'
+                : u.license_type === 'temp' ? '临时许可'
+                : u.license_type === 'both' ? '管理员+临时' : '无密钥记录',
+              statusLabel: this.data.statusMap[u.status] || u.status,
             }))
             this.setData({ users })
           } else {
@@ -82,6 +102,18 @@ Component({
       this._navigateWithAnimation(
         `/pages/user-orders/user-orders?openid=${openid}&nickname=${encodeURIComponent(nickname)}`
       )
+    },
+
+    // 展开/收起该用户的全部密钥记录
+    onToggleRecords(e) {
+      const openid = e.currentTarget.dataset.openid
+      const expanded = { ...this.data.expandedUsers }
+      if (expanded[openid]) {
+        delete expanded[openid]
+      } else {
+        expanded[openid] = true
+      }
+      this.setData({ expandedUsers: expanded })
     },
   },
 })

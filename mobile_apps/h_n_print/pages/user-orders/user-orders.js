@@ -34,6 +34,14 @@ Component({
     // 展开状态
     expandedOrders: {},
 
+    // 被查看用户的卡片信息（从管理入口跳转后显示）
+    userDetail: null,
+    showLicenseDetail: false,
+
+    // 列表滚动控制（对齐“我”页面：切换页码/每页条数后自动滚动到列表顶部）
+    listScrollTop: 0,
+    scrollWithAnimation: false,
+
     statusMap: {
       queued: '排队中',
       printing: '待添加',
@@ -75,6 +83,9 @@ Component({
 
       // 直接传参，不依赖 this.data 是否就绪（对齐 authorized-users 的模式）
       this.loadOrders(openid, source)
+      if (openid) {
+        this.loadUserDetail(openid)
+      }
     },
   },
   pageLifetimes: {
@@ -224,6 +235,47 @@ Component({
       })
     },
 
+    // ==================== 被查看用户卡片 ====================
+
+    loadUserDetail(openid) {
+      const token = wx.getStorageSync('token')
+      if (!token || !openid) return
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/user_detail',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        data: { openid },
+        success: (res) => {
+          if (res.statusCode === 200 && res.data && res.data.success) {
+            const detail = res.data
+            detail.avatarChar = (detail.nickname || '?')[0]
+            // 头像 URL 加时间戳防缓存，确保显示最新头像
+            if (detail.avatar_url) {
+              detail.avatar_url = detail.avatar_url + '?t=' + Date.now()
+            }
+            this.setData({ userDetail: detail })
+          }
+        },
+        fail: () => {}
+      })
+    },
+
+    onToggleLicenseDetail() {
+      this.setData({ showLicenseDetail: !this.data.showLicenseDetail })
+    },
+
+    // 滚动到任务列表顶部（与“我”页面一致：切换页码/每页条数后自动回到列表顶部）
+    _scrollToOrdersSection() {
+      const q = this.createSelectorQuery()
+      q.select('.orders-section').boundingClientRect()
+      q.select('.scrollarea').boundingClientRect()
+      q.exec((res) => {
+        if (!res || !res[0] || !res[1]) return
+        const target = Math.max(0, res[0].top - res[1].top - 12)
+        this.setData({ listScrollTop: target, scrollWithAnimation: true })
+      })
+    },
+
     // ==================== 分页 ====================
 
     onPageChange(e) {
@@ -231,8 +283,7 @@ Component({
       if (page < 1 || page > this.data.totalPages || page === this.data.currentPage) return
       this.setData({ currentPage: page }, () => {
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
-        // 滚动回顶部
-        wx.pageScrollTo({ scrollTop: 0, duration: 200 })
+        this._scrollToOrdersSection()
       })
     },
 
@@ -240,7 +291,7 @@ Component({
       if (this.data.currentPage <= 1) return
       this.setData({ currentPage: this.data.currentPage - 1 }, () => {
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
-        wx.pageScrollTo({ scrollTop: 0, duration: 200 })
+        this._scrollToOrdersSection()
       })
     },
 
@@ -248,7 +299,7 @@ Component({
       if (this.data.currentPage >= this.data.totalPages) return
       this.setData({ currentPage: this.data.currentPage + 1 }, () => {
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
-        wx.pageScrollTo({ scrollTop: 0, duration: 200 })
+        this._scrollToOrdersSection()
       })
     },
 
@@ -265,6 +316,7 @@ Component({
         showPageSizePicker: false,
       }, () => {
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
+        this._scrollToOrdersSection()
       })
     },
 

@@ -75,17 +75,20 @@
 .user-card-item {
   background: var(--glass-regular);
   border-radius: var(--radius-lg);
-  padding: 24rpx 28rpx;
+  padding: 0 28rpx;
   margin-bottom: 12rpx;
   display: flex;
-  align-items: center;
+  flex-direction: column;
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   border: var(--glass-border-dark);
   transition: transform 0.12s ease;
+  overflow: hidden;
 }
 
-.user-card-item:active {
-  background: rgba(0, 0, 0, 0.04);
+.user-card-main {
+  display: flex;
+  align-items: center;
+  padding: 24rpx 0;
 }
 
 /* Avatar circle */
@@ -138,6 +141,42 @@
   font-family: var(--font-mono);
 }
 
+/* 密钥类型 + 状态标签 */
+.user-card-tags {
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  margin: 2rpx 0;
+}
+
+.key-type-tag,
+.status-tag {
+  font-size: 18rpx;
+  font-weight: 600;
+  padding: 3rpx 12rpx;
+  border-radius: 10rpx;
+}
+
+.tag-admin {
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+}
+
+.tag-temp {
+  color: #FF9500;
+  background-color: rgba(255, 149, 0, 0.10);
+}
+
+.tag-both {
+  color: #7B1FA2;
+  background-color: rgba(123, 31, 162, 0.08);
+}
+
+.status-permanent { color: #2E7D32; background-color: rgba(46, 125, 50, 0.08); }
+.status-active    { color: var(--blue); background-color: rgba(0, 122, 255, 0.08); }
+.status-expired   { color: #E65100; background-color: rgba(230, 81, 0, 0.08); }
+.status-removed   { color: var(--text-quaternary); background-color: rgba(142, 142, 147, 0.10); }
+
 /* Right stats */
 .user-card-right {
   flex-shrink: 0;
@@ -178,7 +217,106 @@
   margin-top: 2rpx;
 }
 
+/* ── 密钥记录展开 ── */
+.records-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14rpx 0;
+  border-top: 1rpx solid var(--separator);
+}
+
+.records-toggle-text {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+.records-toggle-arrow {
+  font-size: 28rpx;
+  color: var(--text-quaternary);
+  transition: transform 0.25s ease;
+  display: inline-block;
+}
+
+.records-toggle-arrow.arrow-up {
+  transform: rotate(90deg);
+  color: var(--blue);
+}
+
+.records-panel {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  transition: max-height 0.32s ease, opacity 0.25s ease;
+}
+
+.records-expanded {
+  max-height: 3000rpx;
+  opacity: 1;
+  padding-bottom: 8rpx;
+}
+
+.records-empty {
+  font-size: 22rpx;
+  color: var(--text-quaternary);
+  text-align: center;
+  padding: 20rpx 0;
+}
+
+.record-row {
+  background-color: var(--gray6);
+  border-radius: var(--radius-sm);
+  padding: 16rpx 18rpx;
+  margin-bottom: 12rpx;
+}
+
+.record-head {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  margin-bottom: 10rpx;
+}
+
+.record-key {
+  font-family: var(--font-mono);
+  font-size: 22rpx;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: 1rpx;
+}
+
+.record-type,
+.record-status {
+  font-size: 16rpx;
+  font-weight: 600;
+  padding: 2rpx 10rpx;
+  border-radius: 8rpx;
+}
+
+.record-status {
+  color: var(--text-tertiary);
+  background-color: rgba(142, 142, 147, 0.10);
+}
+
+.record-line {
+  display: flex;
+  justify-content: space-between;
+  padding: 3rpx 0;
+}
+
+.record-label {
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+}
+
+.record-value {
+  font-size: 20rpx;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
 /* ═══════════════ Dark Mode ═══════════════ */
-.theme-dark .user-card-item:active {
-  background: rgba(255, 255, 255, 0.04);
+.theme-dark .record-row {
+  background: var(--glass-regular);
 }

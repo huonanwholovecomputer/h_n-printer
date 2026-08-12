@@ -12,6 +12,169 @@
   box-sizing: border-box;
 }
 
+/* ═══════════════ User Card（被查看用户）═══════════════ */
+
+.user-card-wrap {
+  margin-bottom: 20rpx;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  border: 1rpx solid var(--separator);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  overflow: hidden;
+  transition: background-color 0.4s ease, border-color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.user-card {
+  display: flex;
+  align-items: center;
+  padding: 28rpx;
+}
+
+.user-card-avatar {
+  width: 96rpx;
+  height: 96rpx;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--blue), #40a9ff);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-right: 20rpx;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.user-card-avatar-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+}
+
+.user-card-avatar-char {
+  font-size: 36rpx;
+  font-weight: 700;
+  color: #fff;
+}
+
+.user-card-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6rpx;
+}
+
+.user-card-nickname {
+  font-size: 30rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-card-role {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+/* ── 许可密钥徽章（卡片右侧）── */
+.license-badge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 10rpx 16rpx;
+  border-radius: var(--radius-sm);
+  gap: 2rpx;
+  flex-shrink: 0;
+  margin-left: 12rpx;
+}
+
+.license-badge-temp {
+  background: rgba(255, 149, 0, 0.08);
+  border: 1rpx solid rgba(255, 149, 0, 0.25);
+}
+
+.license-badge-admin {
+  background: rgba(0, 122, 255, 0.08);
+  border: 1rpx solid rgba(0, 122, 255, 0.25);
+}
+
+.license-badge-expired {
+  background: rgba(142, 142, 147, 0.10);
+  border: 1rpx solid rgba(142, 142, 147, 0.25);
+}
+
+.license-badge-key {
+  font-family: var(--font-mono);
+  font-size: 20rpx;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: 2rpx;
+}
+
+.license-badge-validity {
+  font-size: 18rpx;
+  font-weight: 500;
+}
+
+.license-badge-temp .license-badge-validity {
+  color: #FF9500;
+}
+
+.license-badge-admin .license-badge-validity {
+  color: var(--blue);
+}
+
+.license-badge-expired .license-badge-validity {
+  color: var(--text-quaternary);
+}
+
+/* ── 许可密钥详情（点击徽章向下展开）── */
+.license-detail {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  padding: 0 28rpx;
+  transition: max-height 0.32s ease, opacity 0.25s ease;
+}
+
+.license-detail-expanded {
+  max-height: 800rpx;
+  opacity: 1;
+  padding: 0 28rpx 24rpx;
+}
+
+.license-detail .detail-divider {
+  margin: 8rpx 0;
+}
+
+.license-detail .detail-row {
+  padding: 9rpx 0;
+}
+
+.license-key-value {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--blue);
+  letter-spacing: 1rpx;
+}
+
+.license-status-ok {
+  color: #2E7D32;
+  font-weight: 600;
+}
+
+.license-status-permanent {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.license-status-expired {
+  color: var(--red);
+  font-weight: 600;
+}
+
 /* ── Status / Empty ── */
 .status-box {
   display: flex;
