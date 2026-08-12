@@ -11,6 +11,7 @@ Component({
     isDarkMode: wx.getStorageSync('isDarkMode') || false,
     users: [],
     loading: true,
+    loadError: '',
     expandedUsers: {},
     statusMap: {
       permanent: '永久管理员',
@@ -65,7 +66,7 @@ Component({
         wx.showToast({ title: '请先登录', icon: 'none' })
         return
       }
-      this.setData({ loading: true })
+      this.setData({ loading: true, loadError: '' })
       wx.request({
         url: CONFIG.BASE_URL + '/api/authorized_users',
         method: 'GET',
@@ -82,13 +83,14 @@ Component({
                 : u.license_type === 'both' ? '管理员+临时' : '无密钥记录',
               statusLabel: this.data.statusMap[u.status] || u.status,
             }))
-            this.setData({ users })
+            this.setData({ users, loadError: '' })
           } else {
-            wx.showToast({ title: res.data.message || '加载失败', icon: 'none' })
+            // 页面内状态提示（对齐 Android App）：不清空已加载列表
+            this.setData({ loadError: res.data.message || '加载失败' })
           }
         },
         fail: () => {
-          wx.showToast({ title: '网络错误', icon: 'none' })
+          this.setData({ loadError: '网络错误' })
         },
         complete: () => {
           this.setData({ loading: false })

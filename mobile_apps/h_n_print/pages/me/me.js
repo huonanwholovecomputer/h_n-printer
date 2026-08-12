@@ -30,6 +30,7 @@ Component({
     showLicenseDetail: false,
     orders: [],
     loading: true,
+    loadError: '',
     // 分页
     ordersCurrentPage: 1,
     ordersPerPage: 10,
@@ -1862,7 +1863,8 @@ Component({
         success: (res) => {
           this.setData({ savingSecurity: false })
           if (res.data && res.data.success) {
-            wx.showToast({ title: '防滥用阈值已更新', icon: 'success' })
+            // 用纯文字 toast：success 图标模式会截断 8 个汉字，漏掉末尾"新"字
+            wx.showToast({ title: '防滥用阈值已更新', icon: 'none', duration: 2000 })
             this.loadSecurityConfig()
           } else {
             wx.showToast({ title: res.data.message || '保存失败', icon: 'none' })
@@ -2206,13 +2208,14 @@ Component({
 
     // ==================== 任务列表 ====================
 
-    loadOrders() {
+    loadOrders(cb) {
       const token = wx.getStorageSync('token')
       if (!token) {
         this.setData({ loading: false })
         return
       }
 
+      this.setData({ loadError: '' })
       // 仅在列表为空时显示加载状态（首次加载），切换页面/条数时静默刷新
       if (this.data.orders.length === 0) {
         this.setData({ loading: true })
@@ -2246,23 +2249,30 @@ Component({
             this.setData({
               orders: newOrders,
               loading: false,
+              loadError: '',
               ordersTotal: total,
               ordersTotalPages: Math.ceil(total / this.data.ordersPerPage),
               expandedOrders: {},
               ordersAnimated: firstLoad,
+            }, () => {
+              this._scheduleMeasure()
+              if (typeof cb === 'function') cb()
             })
             if (firstLoad) {
               setTimeout(() => this.setData({ ordersAnimated: false }), newOrders.length * 60 + 500)
             }
           } else {
-            this.setData({ loading: false })
+            // 页面内状态提示（对齐 Android App）：不清空已加载列表
+            this.setData({ loading: false, loadError: res.data && res.data.message ? res.data.message : '加载失败' })
+            this._scheduleMeasure()
+            if (typeof cb === 'function') cb()
           }
-          this._scheduleMeasure()
         },
         fail: (err) => {
           console.error('[loadOrders] 网络请求失败:', err)
-          this.setData({ loading: false })
+          this.setData({ loading: false, loadError: '网络错误' })
           this._scheduleMeasure()
+          if (typeof cb === 'function') cb()
         }
       })
     },
@@ -2273,24 +2283,21 @@ Component({
       const page = parseInt(e.currentTarget.dataset.page, 10)
       if (page < 1 || page > this.data.ordersTotalPages || page === this.data.ordersCurrentPage) return
       this.setData({ ordersCurrentPage: page }, () => {
-        this.loadOrders()
-        this._scrollToOrdersSection()
+        this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
 
     onOrdersPrevPage() {
       if (this.data.ordersCurrentPage <= 1) return
       this.setData({ ordersCurrentPage: this.data.ordersCurrentPage - 1 }, () => {
-        this.loadOrders()
-        this._scrollToOrdersSection()
+        this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
 
     onOrdersNextPage() {
       if (this.data.ordersCurrentPage >= this.data.ordersTotalPages) return
       this.setData({ ordersCurrentPage: this.data.ordersCurrentPage + 1 }, () => {
-        this.loadOrders()
-        this._scrollToOrdersSection()
+        this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
 
@@ -2328,20 +2335,36 @@ Component({
         ordersCurrentPage: 1,
         showPageSizePicker: false,
       }, () => {
-        this.loadOrders()
-        this._scrollToOrdersSection()
+        this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
 
-    // 滚动到"我的打印任务"区域而非页面顶部
+    // 滚动到"我的打印任务"区域而非页面顶部。
+    // 在数据返回、按新内容重新测量后再滚：内容变矮导致当前位置超界时无动画归位，
+    // 避免 _measure 的 snapBack 回弹；内容不足一屏时不滚动。
     _scrollToOrdersSection() {
       const q = this.createSelectorQuery()
-      q.select('.orders-section').boundingClientRect()
       q.select('.scroller').boundingClientRect()
+      q.select('.scroll-content').boundingClientRect()
+      q.select('.orders-section').boundingClientRect()
       q.exec((res) => {
-        if (!res || !res[0] || !res[1]) return
-        const sectionTop = res[0].top - res[1].top + this._y
+        if (!res || !res[0] || !res[1] || !res[2]) return
+        const vp = res[0].height || 0
+        const ch = res[1].height || 0
+        this._scrollerH = vp
+        this._contentH = ch
+        this._maxY = Math.max(0, ch - vp + this._bottomPad + this._tabOverlayPx)
+        // 内容变短导致当前位置超出新边界：无动画归位（取消 _measure/snapBack 的回弹动画）
+        if (this._y > this._maxY) {
+          this._cancelSchedule()
+          this._y = this._maxY
+          this._applyY()
+        }
+        // 内容不足一屏：不滚动，保持原位
+        if (this._maxY <= 0) return
+        const sectionTop = res[2].top - res[0].top + this._y
         const target = Math.min(this._maxY, Math.max(this._minY, sectionTop - 20))
+        if (Math.abs(target - this._y) < 2) return
         this._animateScroll(target, 280)
       })
     },

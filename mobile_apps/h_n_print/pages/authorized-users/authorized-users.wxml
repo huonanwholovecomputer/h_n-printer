@@ -11,6 +11,11 @@
       <text class="status-text">加载中...</text>
     </view>
 
+    <!-- 加载失败 / 网络错误 -->
+    <view wx:elif="{{loadError}}" class="status-box">
+      <text class="status-text">{{loadError}}</text>
+    </view>
+
     <!-- 空状态 -->
     <view wx:elif="{{users.length === 0}}" class="empty-state">
       <view class="empty-illustration">

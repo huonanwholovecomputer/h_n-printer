@@ -22,6 +22,7 @@ Component({
 
     orders: [],
     loading: true,
+    loadError: '',
 
     // 分页
     currentPage: 1,
@@ -181,7 +182,7 @@ Component({
         return
       }
 
-      this.setData({ loading: true })
+      this.setData({ loading: true, loadError: '' })
       this._hasLoaded = true
 
       const data = {
@@ -220,17 +221,18 @@ Component({
             this.setData({
               orders: newOrders,
               loading: false,
+              loadError: '',
               totalOrders: total,
               totalPages: Math.ceil(total / this.data.perPage),
               expandedOrders: {},
             })
           } else {
-            this.setData({ loading: false })
+            // 页面内状态提示（对齐 Android App）：不清空已加载列表
+            this.setData({ loading: false, loadError: res.data && res.data.message ? res.data.message : '加载失败' })
           }
         },
         fail: () => {
-          wx.showToast({ title: '网络错误', icon: 'none' })
-          this.setData({ loading: false })
+          this.setData({ loading: false, loadError: '网络错误' })
         },
       })
     },
