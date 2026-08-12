@@ -11,164 +11,708 @@
 </head>
 <body>
 
-<!-- ===== Navigation Bar ===== -->
-<div class="nav-bar" id="navBar">
-  <div class="nav-inner">
-    <div class="nav-center" id="navTitle">提交打印</div>
+<div class="app-frame">
+
+  <!-- 背景遮罩层（深浅色渐变交叉淡入） -->
+  <div class="theme-bg-layer" id="themeBgLayer"></div>
+
+  <!-- ===== 导航栏（weui-navigation-bar 组件复刻） ===== -->
+  <div class="weui-navigation-bar" id="navBar">
+    <div class="weui-navigation-bar__inner android">
+      <div class="weui-navigation-bar__left">
+        <div class="weui-navigation-bar__buttons weui-navigation-bar__buttons_goback" id="navBack" style="display:none">
+          <div class="weui-navigation-bar__btn_goback_wrapper" aria-role="button" aria-label="返回">
+            <div class="weui-navigation-bar__button weui-navigation-bar__btn_goback"></div>
+          </div>
+        </div>
+      </div>
+      <div class="weui-navigation-bar__center"><text id="navTitle">提交打印</text></div>
+      <div class="weui-navigation-bar__right"></div>
+    </div>
   </div>
-</div>
 
-<!-- ===== Tab: Print (提交打印) ===== -->
-<div class="page" id="page-print">
-  <div class="scroller" id="scroller-print">
-    <div class="scroll-content" id="scrollContentPrint">
-      <div class="container">
+  <!-- ===== Tab: 提交打印 ===== -->
+  <div class="page-root page-fade-in" id="page-print">
+    <div class="scroller" id="scroller-print">
+      <div class="scroll-content" id="scrollContentPrint">
+        <div class="container">
 
-        <!-- Logo -->
-        <div class="header-area" id="headerArea">
-          <div class="logo-wrap" id="logoWrap">
-            <img class="logo" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='60'%3E%3Crect width='160' height='60' rx='14' fill='%23007AFF'/%3E%3Ctext x='80' y='38' text-anchor='middle' fill='white' font-size='24' font-weight='700' font-family='sans-serif'%3EHN 打印%3C/text%3E%3C/svg%3E" alt="HN Print">
-          </div>
-        </div>
+          <!-- Logo + 状态 -->
+          <view class="header-area card-preload" id="headerArea" style="animation-delay: 0.5s">
+            <view class="logo-wrap" id="logoWrap">
+              <img class="logo" id="logoImg" src="images/HN_print.png" alt="HN 打印">
+            </view>
+          </view>
 
-        <!-- Printer Status -->
-        <div class="status-bar" id="printerStatus">
-          <div class="status-dot offline"></div>
-          <span class="status-text" id="statusText">检查中…</span>
-        </div>
+          <view class="status-bar card-preload" id="printerStatus" style="animation-delay: 0.6s">
+            <view class="status-dot offline" id="statusDot"></view>
+            <text class="status-text" id="statusText">检查中…</text>
+          </view>
 
-        <!-- File List -->
-        <div class="card file-section">
-          <div class="section-header inline-header">
-            <div class="section-header-bar"></div>
-            <span class="section-header-title">打印文件</span>
-            <span class="section-header-badge" id="fileCount" style="display:none">0</span>
-          </div>
+          <!-- 打印文件 -->
+          <view class="card file-section card-preload" id="fileSection" style="animation-delay: 0.7s">
+            <view class="section-header inline-header">
+              <view class="section-header-bar"></view>
+              <text class="section-header-title">打印文件</text>
+              <text class="section-header-badge" id="fileCount" style="display:none">0</text>
+            </view>
 
-          <div id="fileList"></div>
+            <view class="file-list-scroll" id="fileListScroll">
+              <view id="fileList"></view>
+            </view>
 
-          <button class="add-file-btn" id="addFileBtn">
-            <span class="add-icon">+</span>
-            <span>选择打印文件</span>
-          </button>
-          <input type="file" id="fileInput" accept=".pdf,.doc,.docx,.txt,.md,.html,.htm,.jpg,.jpeg,.png,.bmp,.gif,.webp" style="display:none" multiple>
-        </div>
+            <button class="add-file-btn" id="addFileBtn">
+              <text class="add-icon">+</text>
+              <text id="addFileBtnText">选择打印文件</text>
+            </button>
+            <input type="file" id="fileInput"
+              accept=".pdf,.doc,.docx,.txt,.csv,.md,.jpg,.jpeg,.png,.bmp,.gif,.webp,.tiff,.tif,.xls,.xlsx,.ppt,.pptx,.dwg,.dxf"
+              style="display:none" multiple>
+          </view>
 
-        <!-- Submit -->
-        <div class="submit-area">
-          <button class="btn-primary" id="submitBtn">提交打印任务</button>
-        </div>
+          <!-- 附加服务 -->
+          <view class="card ext-params-card card-preload" id="extParamsCard" style="animation-delay: 0.8s">
+            <view class="section-header inline-header">
+              <view class="section-header-bar"></view>
+              <text class="section-header-title">附加服务</text>
+            </view>
+
+            <!-- 打印首页 -->
+            <view class="param-row">
+              <text class="param-label">打印首页</text>
+              <text class="cover-required-tag" id="coverRequiredTag" style="display:none">必选</text>
+              <view class="ios-switch" id="coverSwitch">
+                <view class="switch-thumb"></view>
+              </view>
+              <text class="cover-price-tag" id="coverPriceTag" style="display:none">¥0.10</text>
+            </view>
+
+            <!-- 优先级 -->
+            <view class="param-row">
+              <text class="param-label">优先级</text>
+              <view class="picker-trigger" id="urgencyTrigger">
+                <text id="urgencyValue">低</text>
+                <text class="picker-arrow">›</text>
+              </view>
+            </view>
+            <view class="picker-sheet" id="urgencyPicker"></view>
+
+            <!-- 派送 -->
+            <view class="param-row">
+              <text class="param-label">派送</text>
+              <view class="ios-switch" id="deliverySwitch">
+                <view class="switch-thumb"></view>
+              </view>
+            </view>
+            <view class="delivery-collapse" id="deliveryOptions" style="display:none">
+              <view class="param-row">
+                <text class="param-label">地点</text>
+                <view class="picker-trigger" id="deliveryTrigger">
+                  <text id="deliveryLocationValue">1号楼北楼</text>
+                  <text class="picker-arrow">›</text>
+                </view>
+              </view>
+              <view class="picker-sheet" id="deliveryPicker"></view>
+            </view>
+          </view>
+
+          <!-- 无障碍打印（仅管理员） -->
+          <view class="auto-print-switch-row card-preload" id="autoPrintSection" style="display:none;animation-delay:0.9s">
+            <view class="auto-print-label">
+              <view class="lightning-burst" id="lightningBurst">
+                <canvas class="bolt-canvas" id="boltCanvas"></canvas>
+                <text class="auto-print-icon" id="autoPrintIcon">⚡</text>
+              </view>
+              <view>
+                <text class="auto-print-title">无障碍打印</text>
+                <view class="auto-print-desc">提交后自动开始打印，无需手动确认</view>
+              </view>
+            </view>
+            <view class="ios-switch ios-switch-lg" id="autoPrintSwitch">
+              <view class="switch-thumb"></view>
+            </view>
+          </view>
+
+          <!-- 无障碍打印：开始方式 -->
+          <view class="schedule-section" id="schedulePanel" style="display:none">
+            <text class="schedule-title">开始方式</text>
+            <view class="schedule-modes">
+              <button class="schedule-mode active" data-schedule-mode="now">立即开始</button>
+              <button class="schedule-mode" data-schedule-mode="at">指定时间</button>
+              <button class="schedule-mode" data-schedule-mode="countdown">倒计时</button>
+            </view>
+            <view class="schedule-options" id="scheduleAtOptions" style="display:none">
+              <view class="schedule-picker" id="scheduleDayTrigger">
+                <text class="schedule-picker-value" id="scheduleDayValue">今天</text>
+              </view>
+              <view class="schedule-picker" id="scheduleTimeTrigger">
+                <text class="schedule-picker-value" id="scheduleTimeValue">选择时间</text>
+              </view>
+            </view>
+            <view class="schedule-options" id="scheduleCountdownOptions" style="display:none">
+              <view class="schedule-picker" id="scheduleCountdownMinTrigger">
+                <text class="schedule-picker-value"><text id="scheduleCountdownMinValue">05</text><text class="countdown-unit">分</text></text>
+              </view>
+              <view class="schedule-picker" id="scheduleCountdownSecTrigger">
+                <text class="schedule-picker-value"><text id="scheduleCountdownSecValue">00</text><text class="countdown-unit">秒</text></text>
+              </view>
+            </view>
+          </view>
+
+          <!-- 提交 -->
+          <view class="submit-area card-preload" id="submitArea" style="animation-delay: 1.0s">
+            <button class="btn-primary" id="submitBtn">提交打印任务</button>
+          </view>
       </div>
     </div>
   </div>
-</div>
+  </div>
 
-<!-- ===== Tab: Me (我) ===== -->
-<div class="page" id="page-me" style="display:none">
-  <div class="scroller" id="scroller-me">
-    <div class="scroll-content" id="scrollContentMe">
-      <div class="container">
+  <!-- ===== Tab: 我 ===== -->
+  <div class="page-root" id="page-me" style="display:none">
+    <div class="scroller" id="scroller-me">
+      <div class="scroll-content" id="scrollContentMe">
+        <div class="container">
 
-        <!-- Profile Card -->
-        <div class="user-card">
-          <div class="avatar-btn" id="avatarBtn">
-            <img class="avatar" id="avatarImg" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='108' height='108'%3E%3Ccircle cx='54' cy='54' r='54' fill='%23E5E5EA'/%3E%3Ccircle cx='54' cy='44' r='18' fill='%23C7C7CC'/%3E%3Cellipse cx='54' cy='80' rx='32' ry='22' fill='%23C7C7CC'/%3E%3C/svg%3E">
-          </div>
-          <div class="user-info">
-            <input class="nickname-input" id="nicknameInput" placeholder="点击输入昵称">
-            <span class="uid" id="roleLabel">访客</span>
-          </div>
-        </div>
+          <!-- 用户卡片 -->
+          <view class="user-card-wrap">
+            <view class="user-card">
+              <view class="avatar-btn" id="avatarBtn">
+                <svg class="avatar" id="avatarImg" viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="默认头像">
+                  <circle cx="54" cy="54" r="54" fill="#E5E5EA"/>
+                  <circle cx="54" cy="44" r="18" fill="#C7C7CC"/>
+                  <ellipse cx="54" cy="80" rx="32" ry="22" fill="#C7C7CC"/>
+                </svg>
+              </view>
+              <input type="file" id="avatarInput" accept="image/*" style="display:none">
+              <view class="user-info">
+                <view class="nickname-row" id="nicknameRow">
+                  <text class="nickname-text" id="nicknameText">点击设置昵称</text>
+                  <text class="nickname-edit-icon">✎</text>
+                </view>
+                <text class="uid" id="roleLabel">访客</text>
+              </view>
+              <view class="license-badge" id="licenseBadge" style="display:none">
+                <text class="license-badge-key" id="licenseBadgeKey"></text>
+                <text class="license-badge-validity" id="licenseBadgeValidity"></text>
+              </view>
+            </view>
 
-        <!-- Guest: Redeem Key -->
-        <div class="license-section" id="guestSection">
-          <div class="section-header">
-            <div class="section-header-bar"></div>
-            <span class="section-header-title">验证许可密钥</span>
-          </div>
-          <div class="license-card">
-            <span class="redeem-desc">请输入管理员提供的许可密钥</span>
-            <div class="redeem-input-row">
-              <input class="redeem-input" id="redeemInput" placeholder="8位密钥" maxlength="8">
+            <!-- 许可详情（在 user-card-wrap 内，展开时卡片向下延伸，对齐小程序） -->
+            <view class="license-detail" id="licenseDetail">
+              <view class="detail-divider"></view>
+              <view class="detail-row"><text class="detail-label">当前状态</text><text class="detail-value" id="licenseDetailStatus">—</text></view>
+              <view class="detail-row"><text class="detail-label">许可密钥</text><text class="detail-value license-key-value" id="licenseDetailKey">—</text></view>
+              <view class="detail-row"><text class="detail-label">密钥类型</text><text class="detail-value" id="licenseDetailType">—</text></view>
+              <view class="detail-row"><text class="detail-label">授权人</text><text class="detail-value" id="licenseDetailCreator">—</text></view>
+              <view class="detail-row"><text class="detail-label">创建时间</text><text class="detail-value" id="licenseDetailCreated">—</text></view>
+              <view class="detail-row"><text class="detail-label">使用时间</text><text class="detail-value" id="licenseDetailUsed">—</text></view>
+              <view class="detail-row"><text class="detail-label">到期时间</text><text class="detail-value" id="licenseDetailExpires">—</text></view>
+              <view class="detail-row"><text class="detail-label">有效时长</text><text class="detail-value" id="licenseDetailValidity">—</text></view>
+            </view>
+          </view>
+
+          <!-- 管理员区块（各子块用 admin-collapsible 展开/收起，对齐小程序入场动画） -->
+          <view id="adminSections">
+
+            <!-- 生成许可密钥 -->
+            <view class="license-section admin-collapsible" id="adminBlockKeys">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>生成许可密钥</text>
+                <text class="order-count" id="activeKeyCount" style="display:none">0</text>
+              </view>
+              <view class="license-card">
+                <text class="license-label">有效时间（分钟）</text>
+                <view class="stepper license-stepper">
+                  <view class="stepper-btn" id="licenseMinutesMinus" data-hover="stepper-hover">−</view>
+                  <input class="stepper-input" id="licenseMinutesValue" type="number" value="1" disabled>
+                  <view class="stepper-btn" id="licenseMinutesPlus" data-hover="stepper-hover">+</view>
+                </view>
+                <view class="key-type-row" id="keyTypeRow">
+                  <text class="key-type-label">密钥类型</text>
+                  <view class="key-type-toggle">
+                    <view class="key-type-slider" id="keyTypeSlider"></view>
+                    <view class="key-type-option opt-active" id="keyTypeTemp">临时许可</view>
+                    <view class="key-type-option" id="keyTypeAdmin">管理员许可</view>
+                  </view>
+                </view>
+                <button class="generate-btn" id="generateKeyBtn" data-hover="generate-hover">生成许可密钥</button>
+              </view>
+              <view id="activeKeys"></view>
+            </view>
+
+            <!-- 服务器存储 -->
+            <view class="storage-section admin-collapsible" id="adminBlockStorage">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>服务器存储</text>
+              </view>
+              <view class="storage-card">
+                <view class="storage-row"><text class="storage-label">📄 缓存文件</text><text class="storage-value" id="storageFiles">—</text></view>
+                <view class="storage-row"><text class="storage-label">💾 占用空间</text><text class="storage-value" id="storageSize">—</text></view>
+                <view class="storage-divider"></view>
+                <text class="retention-title">文件保留时间</text>
+                <text class="retention-forever-hint" id="retentionHint" style="display:none">当前为「永不过期」</text>
+                <view class="retention-row">
+                  <view class="retention-stepper">
+                    <view class="retention-stepper-btn" id="retentionDaysMinus" data-hover="stepper-hover">−</view>
+                    <input class="retention-stepper-input" id="retentionDaysValue" type="number" value="7" disabled>
+                    <view class="retention-stepper-btn" id="retentionDaysPlus" data-hover="stepper-hover">+</view>
+                  </view>
+                  <text class="retention-unit">天</text>
+                  <view class="retention-stepper">
+                    <view class="retention-stepper-btn" id="retentionHoursMinus" data-hover="stepper-hover">−</view>
+                    <input class="retention-stepper-input" id="retentionHoursValue" type="number" value="0" disabled>
+                    <view class="retention-stepper-btn" id="retentionHoursPlus" data-hover="stepper-hover">+</view>
+                  </view>
+                  <text class="retention-unit">小时</text>
+                </view>
+                <button class="retention-save-btn" id="saveRetentionBtn">保存设置</button>
+                <button class="delete-all-btn" id="deleteAllFilesBtn">⚠️ 删除全部缓存文件</button>
+              </view>
+            </view>
+
+            <!-- 防滥用设置 -->
+            <view class="security-section admin-collapsible" id="adminBlockSecurity">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>防滥用设置</text>
+              </view>
+              <view class="security-summary-card" id="securitySummary" data-hover="security-summary-pressing">
+                <view class="security-summary-left">
+                  <text class="security-summary-icon">🛡️</text>
+                  <view class="security-summary-text">
+                    <text class="security-summary-title">防滥用设置</text>
+                    <text class="security-summary-desc">点击管理 DDoS 防护阈值</text>
+                  </view>
+                </view>
+                <text class="security-summary-arrow" id="securityArrow">›</text>
+              </view>
+              <view class="security-detail" id="securityDetail">
+                <view class="storage-card security-detail-card">
+                  <text class="retention-title">以下阈值保存后立即生效（0 表示关闭对应检查）</text>
+                  <view id="securityItems"></view>
+                  <button class="retention-save-btn" id="saveSecurityBtn">保存防滥用设置</button>
+                </view>
+              </view>
+            </view>
+
+            <!-- 角色入口 -->
+            <view class="role-actions admin-collapsible" id="adminBlockRoles">
+              <button class="role-btn user-btn" id="btnAuthorizedUsers" data-hover="role-btn-pressing">
+                <text class="role-btn-icon">👥</text>
+                <text class="role-btn-text">历史授权用户</text>
+                <text class="role-btn-arrow">›</text>
+              </button>
+              <button class="role-btn user-btn" id="btnLocalOrders" data-hover="role-btn-pressing">
+                <text class="role-btn-icon">🖨️</text>
+                <text class="role-btn-text">本地打印任务</text>
+                <text class="role-btn-arrow">›</text>
+              </button>
+            </view>
+
+            <!-- 超级管理员：管理员列表 -->
+            <view class="license-section" id="adminsBlock">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>管理管理员</text>
+              </view>
+              <view id="adminList"></view>
+            </view>
+
+            <!-- 已临时授权的普通用户 -->
+            <view class="license-section" id="tempUsersBlock">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>已临时授权的普通用户</text>
+                <text class="order-count" id="tempUserCount" style="display:none">0</text>
+              </view>
+              <view id="tempUserList"></view>
+            </view>
+          </view>
+
+          <!-- 访客：验证许可密钥 -->
+          <view class="license-section" id="guestSection">
+            <view class="section-title">
+              <view class="section-bar"></view>
+              <text>验证许可密钥</text>
+            </view>
+            <view class="license-card">
+              <text class="redeem-desc">请输入管理员提供的许可密钥以获取打印权限</text>
+              <view class="redeem-input-row">
+                <input class="redeem-input" id="redeemInput" type="text" placeholder="请输入8位密钥" maxlength="8">
+                <button class="redeem-paste-btn" id="redeemPasteBtn">粘贴</button>
+              </view>
               <button class="redeem-btn" id="redeemBtn">验证</button>
-            </div>
-          </div>
-        </div>
+            </view>
+          </view>
 
-        <!-- User: Licensed -->
-        <div class="license-section" id="userSection" style="display:none">
-          <div class="license-card license-active">
-            <div class="license-status-header">
-              <span class="license-status-icon">✅</span>
-              <span class="license-status-text">已获得打印许可</span>
-            </div>
-            <span class="temp-countdown" id="tempCountdown"></span>
-          </div>
-        </div>
+          <!-- 普通用户：已获得打印许可（对齐小程序"打印许可"区块） -->
+          <view class="license-section" id="userLicenseSection" style="display:none">
+            <view class="section-title">
+              <view class="section-bar"></view>
+              <text>打印许可</text>
+            </view>
+            <view class="license-card user-license-card">
+              <view class="user-license-header">
+                <text class="license-status-icon">✅</text>
+                <text class="license-status-text">您已获得打印许可</text>
+              </view>
+              <view class="user-license-detail" id="userLicenseDetail" style="display:none">
+                <view class="license-detail-row">
+                  <text class="license-detail-label">许可密钥</text>
+                  <text class="license-detail-value license-key-value" id="userLicenseKey">—</text>
+                </view>
+                <view class="license-detail-row">
+                  <text class="license-detail-label">授权人</text>
+                  <text class="license-detail-value" id="userLicenseCreator">—</text>
+                </view>
+              </view>
+              <text class="temp-countdown" id="userLicenseCountdown"></text>
+            </view>
+          </view>
 
-        <!-- Orders -->
-        <div class="orders-section">
-          <div class="section-header">
-            <div class="section-header-bar"></div>
-            <span class="section-header-title">我的打印任务</span>
-            <span class="section-header-badge" id="orderCountBadge" style="display:none">0</span>
-          </div>
-          <div id="ordersLoading" class="status-box"><span class="status-text">加载中…</span></div>
-          <div id="ordersEmpty" class="empty-state" style="display:none">
-            <div class="empty-state-icon">📋</div>
-            <div class="empty-state-title">暂无任务</div>
-            <div class="empty-state-desc">快去打印你的第一份文件吧</div>
-          </div>
-          <div id="orderList"></div>
-          <div id="loadMoreWrap" class="load-more-wrap" style="display:none">
-            <button class="load-more-btn" id="loadMoreBtn">加载更多</button>
-          </div>
+          <!-- 我的打印任务 -->
+          <view class="orders-section">
+            <view class="section-title">
+              <view class="section-bar"></view>
+              <text>我的打印任务</text>
+              <text class="order-count" id="orderCountBadge" style="display:none">0</text>
+            </view>
+
+            <view class="orders-pagination-bar" id="ordersPager" style="display:none">
+              <view class="page-size-selector" id="ordersPageSize">
+                <text class="page-size-text" id="ordersPageSizeText">10条/页</text>
+                <text class="page-size-arrow" id="ordersPageSizeArrow">▼</text>
+                <view class="page-size-dropdown" id="pageSizePicker">
+                  <view class="page-size-option option-active" data-size="10">10 条/页</view>
+                  <view class="page-size-option" data-size="20">20 条/页</view>
+                  <view class="page-size-option" data-size="50">50 条/页</view>
+                  <view class="page-size-option" data-size="100">100 条/页</view>
+                </view>
+              </view>
+              <view class="page-nav">
+                <view class="page-btn" id="ordersPrev">‹</view>
+                <view class="page-numbers" id="ordersPageNumbers"></view>
+                <view class="page-btn" id="ordersNext">›</view>
+              </view>
+            </view>
+
+            <view id="orderList"></view>
+            <view class="empty-state" id="ordersEmpty" style="display:none">
+              <view class="empty-illustration"><text class="empty-icon">📋</text></view>
+              <text class="empty-title">暂无任务</text>
+              <text class="empty-desc">快去打印你的第一份文件吧</text>
+            </view>
+
+            <!-- 底部分页 + 结束提示（对齐小程序 me 页） -->
+            <view class="orders-pagination-bar pagination-bottom" id="ordersPagerBottom" style="display:none">
+              <view class="page-nav">
+                <view class="page-btn" id="ordersPrevBottom">‹</view>
+                <view class="page-numbers" id="ordersPageNumbersBottom"></view>
+                <view class="page-btn" id="ordersNextBottom">›</view>
+              </view>
+            </view>
+            <view class="end-hint" id="ordersEndHint" style="display:none">
+              <text class="end-hint-text">-- 没有更多内容啦 --</text>
+            </view>
+          </view>
+
+        </div>
+      </div>
+    </div>
+    <!-- 返回顶部 -->
+    <view class="scroll-top-btn" id="scrollTopBtn">
+      <view class="scroll-top-arrow">
+        <view class="arrow-bar arrow-left"></view>
+        <view class="arrow-bar arrow-right"></view>
+      </view>
+    </view>
+  </div>
+
+  <!-- ===== 子视图：历史授权用户 ===== -->
+  <div class="page-root view" id="view-authorized" style="display:none">
+    <div class="scroller">
+      <div class="scroll-content">
+        <div class="container">
+          <view id="authorizedUserList"></view>
         </div>
       </div>
     </div>
   </div>
-</div>
 
-<!-- ===== Tab Bar ===== -->
-<div class="tab-bar" id="tabBar">
-  <div class="tab-item active" data-tab="print">
-    <div class="tab-icon-wrap active">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="6" y="3" width="12" height="18" rx="2"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="12" y2="16"/></svg>
-    </div>
-    <span class="tab-text active">打印</span>
-  </div>
-  <div class="tab-item" data-tab="me">
-    <div class="tab-icon-wrap">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-7 8-7s8 3 8 7"/></svg>
-    </div>
-    <span class="tab-text">我</span>
-  </div>
-</div>
+  <!-- ===== 子视图：用户订单 / 本地打印任务 ===== -->
+  <div class="page-root view" id="view-user-orders" style="display:none">
+    <div class="scroller">
+      <div class="scroll-content">
+        <div class="container">
 
-<!-- ===== Modals ===== -->
-<div class="modal-mask" id="successModal" style="display:none">
-  <div class="modal-sheet">
-    <div class="modal-icon-wrap">✓</div>
-    <div class="title-medium" style="margin-bottom:8px">任务提交成功</div>
-    <div class="body-small">文件已上传，打印任务已创建</div>
-    <div class="modal-buttons">
-      <button class="btn-secondary" id="modalContinue">继续打印</button>
-      <button class="btn-primary" style="flex:1" id="modalViewOrders">查看任务</button>
-    </div>
-  </div>
-</div>
+          <!-- 被查看用户卡片（含许可密钥徽章，点击展开详情） -->
+          <view class="user-card-wrap" id="userOrdersUserCard" style="display:none">
+            <view class="user-card">
+              <view class="user-card-avatar">
+                <img class="user-card-avatar-img" id="uoAvatarImg" style="display:none" alt="">
+                <text class="user-card-avatar-char" id="uoAvatarChar"></text>
+              </view>
+              <view class="user-card-info">
+                <text class="user-card-nickname" id="uoNickname">—</text>
+                <text class="user-card-role" id="uoRole">—</text>
+              </view>
+              <view class="license-badge" id="uoLicenseBadge" style="display:none">
+                <text class="license-badge-key" id="uoLicenseKey"></text>
+                <text class="license-badge-validity" id="uoLicenseValidity"></text>
+              </view>
+            </view>
+            <view class="license-detail" id="uoLicenseDetail">
+              <view class="detail-divider"></view>
+              <view class="detail-row"><text class="detail-label">当前状态</text><text class="detail-value" id="uoLicenseStatus">—</text></view>
+              <view class="detail-row"><text class="detail-label">许可密钥</text><text class="detail-value license-key-value" id="uoLicenseKeyFull">—</text></view>
+              <view class="detail-row"><text class="detail-label">密钥类型</text><text class="detail-value" id="uoLicenseType">—</text></view>
+              <view class="detail-row"><text class="detail-label">授权人</text><text class="detail-value" id="uoLicenseCreator">—</text></view>
+              <view class="detail-row"><text class="detail-label">创建时间</text><text class="detail-value" id="uoLicenseCreated">—</text></view>
+              <view class="detail-row"><text class="detail-label">使用时间</text><text class="detail-value" id="uoLicenseUsed">—</text></view>
+              <view class="detail-row"><text class="detail-label">到期时间</text><text class="detail-value" id="uoLicenseExpires">—</text></view>
+              <view class="detail-row"><text class="detail-label">有效时长</text><text class="detail-value" id="uoLicenseValidityDetail">—</text></view>
+            </view>
+          </view>
 
-<div class="modal-mask" id="denyModal" style="display:none">
-  <div class="modal-sheet">
-    <div class="modal-icon-wrap" style="background:rgba(255,59,48,0.1);color:var(--red)">!</div>
-    <div class="title-medium" style="margin-bottom:8px">需要许可</div>
-    <div class="body-small">请先出示管理员许可</div>
-    <div class="modal-buttons">
-      <button class="btn-primary" id="denyGoMe">前往获取</button>
+          <view class="orders-section">
+            <view class="section-title">
+              <view class="section-bar"></view>
+              <text id="userOrdersTitle">订单列表</text>
+            </view>
+
+            <!-- 顶部：每页条数下拉 + 页码 -->
+            <view class="orders-pagination-bar" id="userOrdersPager" style="display:none">
+              <view class="pagination-bar pagination-top">
+                <view class="page-size-selector" id="uoPageSizeSelector">
+                  <text class="page-size-text" id="uoPageSizeText">10条/页</text>
+                  <text class="page-size-arrow" id="uoPageSizeArrow">▼</text>
+                  <view class="page-size-dropdown" id="uoPageSizeDropdown">
+                    <view class="page-size-option option-active" data-size="10">10 条/页</view>
+                    <view class="page-size-option" data-size="20">20 条/页</view>
+                    <view class="page-size-option" data-size="50">50 条/页</view>
+                    <view class="page-size-option" data-size="100">100 条/页</view>
+                  </view>
+                </view>
+                <view class="page-nav">
+                  <view class="page-btn" id="userOrdersPrev">‹</view>
+                  <view class="page-numbers" id="userOrdersPageNumbers"></view>
+                  <view class="page-btn" id="userOrdersNext">›</view>
+                </view>
+              </view>
+            </view>
+
+            <!-- 总览 -->
+            <view class="orders-summary" id="userOrdersSummary" style="display:none">
+              <text class="summary-text" id="userOrdersSummaryText"></text>
+            </view>
+
+            <view id="userOrdersList"></view>
+
+            <!-- 底部：页码 + 没有更多 -->
+            <view class="pagination-bar pagination-bottom" id="userOrdersPagerBottom" style="display:none">
+              <view class="page-nav">
+                <view class="page-btn" id="userOrdersPrevBottom">‹</view>
+                <view class="page-numbers" id="userOrdersPageNumbersBottom"></view>
+                <view class="page-btn" id="userOrdersNextBottom">›</view>
+              </view>
+            </view>
+            <view class="end-hint" id="userOrdersEndHint" style="display:none">
+              <text class="end-hint-text">-- 没有更多内容啦 --</text>
+            </view>
+          </view>
+        </div>
+      </div>
     </div>
   </div>
+
+  <!-- ===== Tab 栏（自定义 tabBar 复刻） ===== -->
+  <view class="tab-bar" id="tabBar">
+    <view class="tab-item" data-tab="print">
+      <view class="tab-icon-wrap icon-active">
+        <img class="tab-icon" src="images/tab/print.png" alt="打印">
+      </view>
+      <text class="tab-text text-active">打印</text>
+    </view>
+    <view class="tab-item" data-tab="me">
+      <view class="tab-icon-wrap">
+        <img class="tab-icon" src="images/tab/me.png" alt="我">
+      </view>
+      <text class="tab-text">我</text>
+    </view>
+  </view>
+
+  <!-- ===== 主题切换（我页右上角） ===== -->
+  <button class="theme-toggle-btn" id="themeToggle" data-hover="tp-pressing" style="display:none">🌓</button>
+
+  <!-- ===== 成功弹窗 ===== -->
+  <view class="modal-mask" id="successModal" style="display:none">
+    <view class="modal-sheet">
+      <view class="modal-icon-wrap">✓</view>
+      <text class="title-medium">任务提交成功</text>
+      <text class="order-number-modal" id="successOrderNumber"></text>
+      <text class="body-small schedule-success-text" id="successScheduleText" style="display:none"></text>
+      <text class="body-small" id="successDefaultText" style="display:none">文件已上传，打印任务已创建</text>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" id="copyPriceBtn">复制价格</button>
+        <button class="btn-primary modal-half-btn" id="copyDetailPriceBtn">复制详细价格</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 任务发起失败弹窗（全部文件均为不支持格式） ===== -->
+  <view class="modal-mask" id="failModal" style="display:none">
+    <view class="modal-sheet">
+      <view class="modal-icon-wrap warn">⚠</view>
+      <text class="title-medium">任务发起失败</text>
+      <text class="body-small">所选文件均为不支持的文件格式（如 Excel/PPT/CAD），无法打印。请移除后重新选择，或联系管理员。</text>
+      <view class="modal-buttons">
+        <button class="btn-primary" onclick="closeModal('failModal')">知道了</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 需要许可弹窗 ===== -->
+  <view class="modal-mask" id="denyModal" style="display:none">
+    <view class="modal-sheet">
+      <view class="modal-icon-wrap danger">!</view>
+      <text class="title-medium">需要许可</text>
+      <text class="body-small">请先出示管理员许可</text>
+      <view class="modal-buttons">
+        <button class="btn-primary" id="denyGoMe">前往获取</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 页数未验证警告 ===== -->
+  <view class="modal-mask" id="pageCountModal" style="display:none">
+    <view class="modal-sheet">
+      <view class="modal-icon-wrap warn">⚠</view>
+      <text class="title-medium">页数未经验证</text>
+      <text class="body-small">部分文档的页数尚未经本地打印工具确认，页码范围可能超出文档实际页数。</text>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" onclick="closeModal('pageCountModal')">返回等待</button>
+        <button class="btn-primary modal-half-btn" id="forceSubmitBtn">继续提交</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 跳过不支持格式 ===== -->
+  <view class="modal-mask" id="unsupportedModal" style="display:none">
+    <view class="modal-sheet">
+      <view class="modal-icon-wrap warn">⚠</view>
+      <text class="title-medium">存在不支持的文件格式</text>
+      <text class="body-small">任务中存在 <text id="unsupportedCount">0</text> 个不支持的文件格式（Excel/PPT/CAD），提交时将自动跳过，仅打印其余文件。</text>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" id="skipUnsupportedCancel">取消</button>
+        <button class="btn-primary modal-half-btn" id="skipUnsupportedOk">自动跳过并提交</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 通用确认弹窗 ===== -->
+  <view class="modal-mask" id="confirmModal" style="display:none">
+    <view class="modal-sheet">
+      <view class="modal-icon-wrap danger">!</view>
+      <text class="title-medium" id="confirmTitle">确认</text>
+      <text class="body-small" id="confirmContent"></text>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" id="confirmCancel">取消</button>
+        <button class="btn-primary modal-half-btn" id="confirmOk">确定</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 昵称输入弹窗 ===== -->
+  <view class="modal-mask" id="nicknameModal" style="display:none">
+    <view class="modal-sheet">
+      <text class="title-medium" style="margin-bottom:16px;">输入昵称</text>
+      <input class="input-ios" id="nicknameModalInput" type="text" placeholder="请输入昵称" maxlength="20" style="margin-bottom:24px;">
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" id="nicknameModalCancel">取消</button>
+        <button class="btn-primary modal-half-btn" id="nicknameModalSave">保存</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 页数网格选择 ===== -->
+  <view class="modal-mask" id="rangePickerModal" style="display:none">
+    <view class="modal-sheet schedule-modal-sheet range-picker-sheet">
+      <view class="sheet-title">选择页数<text class="range-picker-total" id="rangePickerTitle">共 0 页</text></view>
+      <view class="range-picker-actions">
+        <view class="range-picker-action" id="rangePickerAll">全部</view>
+        <view class="range-picker-action" id="rangePickerOdd">单页</view>
+        <view class="range-picker-action" id="rangePickerEven">双页</view>
+      </view>
+      <view class="range-picker-grid" id="rangePickerGrid"></view>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" onclick="closeModal('rangePickerModal')">取消</button>
+        <button class="btn-primary modal-half-btn" id="rangePickerOk">确定</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 预约：日期选择 ===== -->
+  <view class="modal-mask" id="scheduleDayModal" style="display:none">
+    <view class="modal-sheet schedule-modal-sheet">
+      <text class="sheet-title">选择日期</text>
+      <view class="sheet-option-list" id="dayPickerOptions"></view>
+      <view class="modal-buttons">
+        <button class="btn-secondary" onclick="closeModal('scheduleDayModal')">取消</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 预约：时间选择（滚轮） ===== -->
+  <view class="modal-mask" id="scheduleTimeModal" style="display:none">
+    <view class="modal-sheet schedule-modal-sheet">
+      <text class="sheet-title">选择时间</text>
+      <view class="time-wheel-row">
+        <view class="wheel-col hour-col" id="hourWheel">
+          <view class="wheel-viewport"><view class="wheel-items" id="hourItems"></view></view>
+        </view>
+        <text class="wheel-colon">:</text>
+        <view class="wheel-col minute-col" id="minuteWheel">
+          <view class="wheel-viewport"><view class="wheel-items" id="minuteItems"></view></view>
+        </view>
+      </view>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" id="scheduleTimeCancel">取消</button>
+        <button class="btn-primary modal-half-btn" id="scheduleTimeOk">确定</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 预约：倒计时选择（滚轮） ===== -->
+  <view class="modal-mask" id="scheduleCountdownModal" style="display:none">
+    <view class="modal-sheet schedule-modal-sheet">
+      <text class="sheet-title">选择倒计时</text>
+      <view class="time-wheel-row">
+        <view class="wheel-col" id="countdownMinuteWheel">
+          <view class="wheel-viewport"><view class="wheel-items" id="countdownMinuteItems"></view></view>
+        </view>
+        <text class="wheel-unit">分</text>
+        <view class="wheel-col" id="countdownSecondWheel">
+          <view class="wheel-viewport"><view class="wheel-items" id="countdownSecondItems"></view></view>
+        </view>
+        <text class="wheel-unit">秒</text>
+      </view>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" id="scheduleCountdownCancel">取消</button>
+        <button class="btn-primary modal-half-btn" id="scheduleCountdownOk">确定</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== Toast ===== -->
+  <view class="toast" id="toast"></view>
+
 </div>
 
 <script src="app.js"></script>
+<script src="print.js"></script>
+<script src="me.js"></script>
 </body>
 </html>

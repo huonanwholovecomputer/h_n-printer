@@ -1,0 +1,1736 @@
+/* HN Cloud Print — Android App 个人中心 / 订单 / 管理员（与小程序 me 页视觉对齐） */
+
+const DEFAULT_AVATAR = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='108' height='108'%3E%3Ccircle cx='54' cy='54' r='54' fill='%23E5E5EA'/%3E%3Ccircle cx='54' cy='44' r='18' fill='%23C7C7CC'/%3E%3Cellipse cx='54' cy='80' rx='32' ry='22' fill='%23C7C7CC'/%3E%3C/svg%3E";
+
+const SECURITY_DEFS = [
+  { key: 'user_quota_mb', label: '每用户存储配额', unit: 'MB', min: 0, max: 102400, hint: '超限拒绝上传，0=不限' },
+  { key: 'disk_min_free_mb', label: '磁盘最低剩余', unit: 'MB', min: 0, max: 102400, hint: '低于则拒绝上传，0=不检查' },
+  { key: 'queued_timeout_hours', label: '排队订单超时', unit: '小时', min: 0, max: 720, hint: '超时自动取消，0=不过期' },
+  { key: 'upload_rate_limit', label: '上传频率上限', unit: '次/分', min: 1, max: 600, hint: '每用户每分钟' },
+  { key: 'submit_order_rate_limit', label: '提交频率上限', unit: '次/分', min: 1, max: 600, hint: '每用户每分钟' },
+  { key: 'device_login_rate_limit', label: '设备注册上限', unit: '次/时', min: 1, max: 600, hint: '每IP/每设备每小时' },
+  { key: 'redeem_rate_limit', label: '密钥兑换上限', unit: '次/分', min: 1, max: 600, hint: '每用户每分钟' },
+  { key: 'log_report_rate_limit', label: '日志上报上限', unit: '条/分', min: 1, max: 600, hint: '每IP每分钟' },
+];
+
+const _adminLoadTimes = { keys: 0, tempUsers: 0, storage: 0, security: 0, admins: 0 };
+function loadIfStale(key, fn, ttl) {
+  const now = Date.now();
+  if (now - _adminLoadTimes[key] > (ttl || 30000)) { _adminLoadTimes[key] = now; fn(); }
+}
+
+const meState = {
+  orders: [],
+  ordersPage: 1,
+  ordersPerPage: 10,
+  ordersTotal: 0,
+  ordersTotalPages: 0,
+  ordersLoadError: false,
+  expandedOrders: {},
+  showLicenseDetail: false,
+  loadingOrders: false,
+  _lastDataLoad: 0,
+  _orderPollTimer: null,
+  _keyPollTimer: null,
+  _tempCountdownTimer: null,
+  activeKeys: [],
+  licenseMinutes: 1,
+  keyType: 'temp',
+  generating: false,
+  tempUsers: [],
+  admins: [],
+  storageStats: null,
+  retentionDays: 7,
+  retentionHours: 0,
+  savingRetention: false,
+  deletingAllFiles: false,
+  securityItems: [],
+  securityConfig: null,
+  savingSecurity: false,
+  securityExpanded: false,
+  authorizedUsers: [],
+  userOrdersView: { openid: '', nickname: '', source: '', orders: [], page: 1, perPage: 10, total: 0, totalPages: 0, expanded: {} },
+};
+
+/* ================= 初始化 / Tab 刷新 ================= */
+
+function initMePage() {
+  setupMeButtons();
+  refreshMeUI();
+  loadOrders();
+}
+
+function loadMeTab() {
+  refreshMeUI();
+  const now = Date.now();
+  if (!meState._lastDataLoad || (now - meState._lastDataLoad) > 60000) {
+    meState._lastDataLoad = now;
+    loadOrders();
+    if (state.role === 'admin') {
+      loadIfStale('keys', loadActiveKeys);
+      loadIfStale('tempUsers', loadTempUsers);
+      loadIfStale('storage', loadStorageStats);
+      loadIfStale('security', loadSecurityConfig);
+      if (state.isSuperAdmin) loadIfStale('admins', loadAdmins);
+    }
+  }
+  startOrderPolling();
+  startKeyPolling();
+  measureAll(150);
+}
+
+function refreshMeUI() {
+  const roleLabel = state.isSuperAdmin ? '超级管理员' : state.role === 'admin' ? '管理员' : state.role === 'user' ? '普通用户' : '访客';
+  document.getElementById('roleLabel').textContent = roleLabel;
+  const nickText = document.getElementById('nicknameText');
+  if (nickText) nickText.textContent = state.nickname || '点击设置昵称';
+  const avatar = document.getElementById('avatarImg');
+  if (state.avatarUrl) avatar.src = state.avatarUrl;
+  const badge = document.getElementById('licenseBadge');
+  const detail = document.getElementById('licenseDetail');
+  const li = state.licenseInfo;
+  if (li) {
+    badge.style.display = '';
+    const permanent = state.role === 'admin' || li.type === 'admin';
+    badge.classList.toggle('license-badge-admin', permanent);
+    badge.classList.toggle('license-badge-temp', !permanent && !li.expired);
+    badge.classList.toggle('license-badge-expired', !permanent && li.expired);
+    document.getElementById('licenseBadgeKey').textContent = li.key;
+    document.getElementById('licenseBadgeValidity').textContent =
+      permanent ? '永久' : (li.expired ? '已过期' : (formatTempRemain(li.expires_at) || '--'));
+    document.getElementById('licenseDetailStatus').textContent =
+      permanent ? '永久' : (li.expired ? '已过期' : '有效');
+    document.getElementById('licenseDetailKey').textContent = li.key || '—';
+    document.getElementById('licenseDetailType').textContent = li.type === 'admin' ? '管理员许可' : '临时许可';
+    document.getElementById('licenseDetailCreator').textContent = li.creator_nickname || '—';
+    document.getElementById('licenseDetailCreated').textContent = li.created_at || '—';
+    document.getElementById('licenseDetailUsed').textContent = li.used_at || '—';
+    document.getElementById('licenseDetailExpires').textContent = li.expires_at || '—';
+    document.getElementById('licenseDetailValidity').textContent = li.validity_minutes ? li.validity_minutes + ' 分钟' : '—';
+  } else {
+    badge.style.display = 'none';
+    detail.classList.remove('license-detail-expanded');
+    detail.style.maxHeight = '';
+    detail.style.opacity = '';
+    detail.style.padding = '';
+  }
+  document.getElementById('guestSection').style.display = state.role === 'guest' ? '' : 'none';
+  setAdminCollapsed(state.role === 'admin');
+  // 普通用户：打印许可卡片（对齐小程序）
+  const userLic = document.getElementById('userLicenseSection');
+  if (userLic) userLic.style.display = state.role === 'user' ? '' : 'none';
+  const userLicDetail = document.getElementById('userLicenseDetail');
+  if (state.role === 'user' && li) {
+    if (userLicDetail) userLicDetail.style.display = '';
+    document.getElementById('userLicenseKey').textContent = li.key || '—';
+    document.getElementById('userLicenseCreator').textContent = li.creator_nickname || '—';
+  } else if (userLicDetail) {
+    userLicDetail.style.display = 'none';
+  }
+  manageTempCountdown();
+  updateRoleActions();
+  if (state.role === 'admin') {
+    loadIfStale('keys', loadActiveKeys);
+    loadIfStale('tempUsers', loadTempUsers);
+    loadIfStale('storage', loadStorageStats);
+    loadIfStale('security', loadSecurityConfig);
+    if (state.isSuperAdmin) loadIfStale('admins', loadAdmins);
+  }
+  measureAll(150);
+}
+
+function updateRoleActions() {
+  const admin = state.role === 'admin';
+  document.getElementById('btnAuthorizedUsers').style.display = admin ? '' : 'none';
+  document.getElementById('btnLocalOrders').style.display = admin ? '' : 'none';
+  document.getElementById('adminsBlock').style.display = state.isSuperAdmin ? '' : 'none';
+  document.getElementById('tempUsersBlock').style.display = admin ? '' : 'none';
+  document.getElementById('keyTypeRow').style.display = state.isSuperAdmin ? '' : 'none';
+  updateKeyForm();
+}
+
+// 管理员区块展开/收起（对齐小程序 admin-collapsible 过渡）
+function setAdminCollapsed(expanded) {
+  ['adminBlockKeys', 'adminBlockStorage', 'adminBlockSecurity', 'adminBlockRoles'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle('admin-expanded', expanded);
+  });
+  measureAll(150);
+}
+
+// 许可密钥详情展开/收起（对齐小程序：license-detail-expanded 类 + CSS 过渡，纯类切换无延迟）
+function toggleLicenseDetail(detailId, open) {
+  const detail = document.getElementById(detailId);
+  if (!detail) return;
+  detail.classList.toggle('license-detail-expanded', open);
+  measureAll(150);
+}
+
+// 临时授权剩余时间（对齐小程序 tempCountdownText："剩余 X 分 XX 秒"）
+function formatTempRemain(str) {
+  if (!str) return '';
+  const t = new Date(String(str).replace(/-/g, '/')).getTime();
+  if (isNaN(t)) return str;
+  const remain = t - Date.now();
+  if (remain <= 0) return '已过期';
+  const m = Math.floor(remain / 60000);
+  const s = Math.floor((remain % 60000) / 1000);
+  return '剩余 ' + m + ' 分 ' + (s < 10 ? '0' + s : s) + ' 秒';
+}
+
+function updateTempCountdownTexts() {
+  const li = state.licenseInfo;
+  if (!li || state.role !== 'user' || li.type === 'admin') return;
+  const txt = formatTempRemain(li.expires_at);
+  const badgeVal = document.getElementById('licenseBadgeValidity');
+  if (badgeVal && li.type !== 'admin') badgeVal.textContent = li.expired ? '已过期' : (txt || '--');
+  const el = document.getElementById('userLicenseCountdown');
+  if (el) el.textContent = txt;
+}
+
+function manageTempCountdown() {
+  stopTempCountdown();
+  const li = state.licenseInfo;
+  if (state.role !== 'user' || !li || li.type === 'admin' || li.expired) return;
+  updateTempCountdownTexts();
+  meState._tempCountdownTimer = setInterval(updateTempCountdownTexts, 1000);
+}
+
+function stopTempCountdown() {
+  if (meState._tempCountdownTimer) {
+    clearInterval(meState._tempCountdownTimer);
+    meState._tempCountdownTimer = null;
+  }
+}
+
+/* ================= 控件 ================= */
+
+function setupMeButtons() {
+  document.getElementById('avatarBtn').addEventListener('click', () => document.getElementById('avatarInput').click());
+  document.getElementById('avatarInput').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file) uploadAvatar(file);
+    e.target.value = '';
+  });
+  document.getElementById('nicknameRow').addEventListener('click', openNicknameModal);
+  document.getElementById('nicknameModalCancel').addEventListener('click', () => closeModal('nicknameModal'));
+  document.getElementById('nicknameModalSave').addEventListener('click', saveNicknameFromModal);
+  document.getElementById('nicknameModalInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveNicknameFromModal();
+  });
+  document.getElementById('redeemBtn').addEventListener('click', redeemKey);
+  document.getElementById('redeemPasteBtn').addEventListener('click', pasteKey);
+  document.getElementById('licenseMinutesMinus').addEventListener('click', () => setLicenseMinutes(meState.licenseMinutes - 1));
+  document.getElementById('licenseMinutesPlus').addEventListener('click', () => setLicenseMinutes(meState.licenseMinutes + 1));
+  document.getElementById('keyTypeTemp').addEventListener('click', () => { meState.keyType = 'temp'; updateKeyForm(); });
+  document.getElementById('keyTypeAdmin').addEventListener('click', () => { meState.keyType = 'admin'; updateKeyForm(); });
+  document.getElementById('generateKeyBtn').addEventListener('click', generateKey);
+  document.getElementById('retentionDaysMinus').addEventListener('click', () => setRetention('days', meState.retentionDays - 1));
+  document.getElementById('retentionDaysPlus').addEventListener('click', () => setRetention('days', meState.retentionDays + 1));
+  document.getElementById('retentionHoursMinus').addEventListener('click', () => setRetention('hours', meState.retentionHours - 1));
+  document.getElementById('retentionHoursPlus').addEventListener('click', () => setRetention('hours', meState.retentionHours + 1));
+  document.getElementById('saveRetentionBtn').addEventListener('click', saveRetention);
+  document.getElementById('deleteAllFilesBtn').addEventListener('click', deleteAllFiles);
+  document.getElementById('saveSecurityBtn').addEventListener('click', saveSecurity);
+  document.getElementById('securitySummary').addEventListener('click', toggleSecurityExpanded);
+  document.getElementById('securityItems').addEventListener('click', (e) => {
+    const minus = e.target.closest('[data-sec-minus]');
+    const plus = e.target.closest('[data-sec-plus]');
+    if (minus) updateSecurityItem(parseInt(minus.dataset.secMinus, 10), -1);
+    if (plus) updateSecurityItem(parseInt(plus.dataset.secPlus, 10), 1);
+  });
+  document.getElementById('securityItems').addEventListener('change', (e) => {
+    const t = e.target;
+    if (t.dataset.secInput != null) {
+      const idx = parseInt(t.dataset.secInput, 10);
+      const it = meState.securityItems[idx];
+      if (!it) return;
+      let v = parseInt(t.value, 10);
+      if (isNaN(v)) v = it.min;
+      v = Math.max(it.min, Math.min(it.max, v));
+      it.value = v;
+      renderSecurityConfig();
+    }
+  });
+  document.getElementById('ordersPrev').addEventListener('click', () => changeOrdersPage(meState.ordersPage - 1));
+  document.getElementById('ordersNext').addEventListener('click', () => changeOrdersPage(meState.ordersPage + 1));
+  document.getElementById('ordersPrevBottom').addEventListener('click', () => changeOrdersPage(meState.ordersPage - 1));
+  document.getElementById('ordersNextBottom').addEventListener('click', () => changeOrdersPage(meState.ordersPage + 1));
+  document.getElementById('ordersPageNumbersBottom').addEventListener('click', (e) => {
+    const num = e.target.closest('[data-page-num]');
+    if (num && num.dataset.pageNum !== '...') changeOrdersPage(parseInt(num.dataset.pageNum, 10));
+  });
+  // "我的打印任务"条/页选择器：document 级委托，避免元素重建/绑定时机导致点击失效
+  document.addEventListener('click', (e) => {
+    const picker = document.getElementById('pageSizePicker');
+    const isOpen = picker && picker.classList.contains('dropdown-show');
+    const sel = e.target.closest('#ordersPageSize');
+    if (!sel) {
+      // 点击页面其他区域：收起下拉
+      if (isOpen) hidePageSizePicker();
+      return;
+    }
+    const opt = e.target.closest('[data-size]');
+    if (opt) { selectOrdersPageSize(parseInt(opt.dataset.size, 10)); return; }
+    togglePageSizePicker();
+  });
+  document.getElementById('orderList').addEventListener('click', (e) => {
+    const cancel = e.target.closest('[data-cancel-order]');
+    if (cancel) { e.stopPropagation(); cancelOrder(parseInt(cancel.dataset.cancelOrder, 10)); return; }
+    const card = e.target.closest('[data-order-id]');
+    if (card) toggleOrder(parseInt(card.dataset.orderId, 10));
+  });
+  document.getElementById('ordersPageNumbers').addEventListener('click', (e) => {
+    const num = e.target.closest('[data-page-num]');
+    if (num && num.dataset.pageNum !== '...') changeOrdersPage(parseInt(num.dataset.pageNum, 10));
+  });
+  document.getElementById('btnAuthorizedUsers').addEventListener('click', openAuthorizedUsers);
+  document.getElementById('btnLocalOrders').addEventListener('click', () => openUserOrdersView({ source: 'local', nickname: '本地打印任务' }));
+  document.getElementById('adminList').addEventListener('click', (e) => {
+    const rm = e.target.closest('[data-remove-admin]');
+    if (rm) { e.stopPropagation(); removeAdmin(rm.dataset.removeAdmin); return; }
+    // 对齐小程序：点击管理员卡片 → 打开该管理员的任务列表（顶部用户卡片 + 许可密钥徽章）
+    const card = e.target.closest('[data-admin-openid]');
+    if (card) {
+      // 左滑后松手会补发 click，用时间戳避免误跳转（对齐小程序"纯点击才跳转"）
+      if (card.dataset.swiped && Date.now() - Number(card.dataset.swiped) < 500) return;
+      openUserOrdersView({ openid: card.dataset.adminOpenid, nickname: card.dataset.adminNickname });
+    }
+  });
+  document.getElementById('tempUserList').addEventListener('click', (e) => {
+    const rm = e.target.closest('[data-remove-tempuser]');
+    if (rm) removeTempUser(rm.dataset.removeTempuser);
+  });
+  document.getElementById('activeKeys').addEventListener('click', (e) => {
+    const copy = e.target.closest('[data-copy-key]');
+    if (copy) copyKey(copy.dataset.copyKey);
+    const revoke = e.target.closest('[data-revoke-key]');
+    if (revoke) {
+      // 触摸已由 pointerup 处理（点击可能被浏览器吞掉），此处只防重复
+      if (revoke.dataset.tapHandled === '1') { delete revoke.dataset.tapHandled; return; }
+      revokeKey(revoke.dataset.revokeKey);
+    }
+    const confirmKey = e.target.closest('[data-confirm-key]');
+    if (confirmKey) confirmAdminKey(confirmKey.dataset.confirmKey);
+    const settle = e.target.closest('[data-settle]');
+    if (settle) settleOrder(settle.dataset.settle, settle.dataset.settleNickname);
+  });
+  // 触摸/笔直接触发作废：pointerup 一定触发，click 在触摸后可能被吞
+  document.getElementById('activeKeys').addEventListener('pointerup', (e) => {
+    if (e.pointerType === 'mouse') return;
+    const del = e.target.closest('[data-revoke-key]');
+    if (!del) return;
+    del.dataset.tapHandled = '1';
+    setTimeout(() => { delete del.dataset.tapHandled; }, 600);
+    // 延迟到合成 click 派发之后再弹窗：若立即弹窗，遮罩会盖住点击点，
+    // 随后的 click 落在遮罩上触发 closeModal，弹窗被秒关
+    setTimeout(() => revokeKey(del.dataset.revokeKey), 30);
+  });
+  document.getElementById('authorizedUserList').addEventListener('click', (e) => {
+    const toggle = e.target.closest('[data-toggle-records]');
+    if (toggle) { toggleAuthorizedUser(toggle.dataset.toggleRecords); return; }
+    const card = e.target.closest('[data-user-openid]');
+    if (card) openUserOrdersView({ openid: card.dataset.userOpenid, nickname: card.dataset.userNickname });
+  });
+  document.getElementById('userOrdersPrev').addEventListener('click', () => changeUserOrdersPage(meState.userOrdersView.page - 1));
+  document.getElementById('userOrdersNext').addEventListener('click', () => changeUserOrdersPage(meState.userOrdersView.page + 1));
+  document.getElementById('userOrdersPrevBottom').addEventListener('click', () => changeUserOrdersPage(meState.userOrdersView.page - 1));
+  document.getElementById('userOrdersNextBottom').addEventListener('click', () => changeUserOrdersPage(meState.userOrdersView.page + 1));
+  document.getElementById('userOrdersPageNumbers').addEventListener('click', (e) => {
+    const num = e.target.closest('[data-page-num]');
+    if (num && num.dataset.pageNum !== '...') changeUserOrdersPage(parseInt(num.dataset.pageNum, 10));
+  });
+  document.getElementById('userOrdersPageNumbersBottom').addEventListener('click', (e) => {
+    const num = e.target.closest('[data-page-num]');
+    if (num && num.dataset.pageNum !== '...') changeUserOrdersPage(parseInt(num.dataset.pageNum, 10));
+  });
+  document.getElementById('uoPageSizeSelector').addEventListener('click', (e) => {
+    const v = meState.userOrdersView;
+    const opt = e.target.closest('[data-size]');
+    if (opt) {
+      const size = parseInt(opt.dataset.size, 10);
+      if (size === v.perPage) return;
+      v.perPage = size;
+      v.page = 1;
+      v.showPageSizePicker = false;
+      syncUserOrdersPageSizePicker();
+      loadUserOrders().then(() => scrollUserOrdersToTop());
+      return;
+    }
+    v.showPageSizePicker = !v.showPageSizePicker;
+    syncUserOrdersPageSizePicker();
+  });
+  document.getElementById('userOrdersList').addEventListener('click', (e) => {
+    const cancel = e.target.closest('[data-cancel-order]');
+    if (cancel) { e.stopPropagation(); cancelOrder(parseInt(cancel.dataset.cancelOrder, 10)); return; }
+    const card = e.target.closest('[data-order-id]');
+    if (card) toggleUserOrdersOrder(parseInt(card.dataset.orderId, 10));
+  });
+  document.getElementById('scrollTopBtn').addEventListener('click', () => {
+    if (scrollEngines.me) scrollEngines.me.scrollTo(0, 300);
+  });
+  // 许可密钥徽章：document 级委托（对齐小程序：点击展开/收起密钥详情）
+  document.addEventListener('click', (e) => {
+    const badge = e.target.closest('#licenseBadge');
+    if (badge) {
+      meState.showLicenseDetail = !meState.showLicenseDetail;
+      toggleLicenseDetail('licenseDetail', meState.showLicenseDetail);
+      return;
+    }
+    const uoBadge = e.target.closest('#uoLicenseBadge');
+    if (uoBadge) {
+      const v = meState.userOrdersView;
+      v.showLicenseDetail = !v.showLicenseDetail;
+      toggleLicenseDetail('uoLicenseDetail', v.showLicenseDetail);
+    }
+  });
+}
+
+/* ================= 头像 / 昵称 ================= */
+
+function openNicknameModal() {
+  const input = document.getElementById('nicknameModalInput');
+  input.value = state.nickname || '';
+  openModal('nicknameModal');
+  setTimeout(() => input.focus(), 200);
+}
+
+function saveNicknameFromModal() {
+  const val = document.getElementById('nicknameModalInput').value.trim();
+  if (!val) { showToast('请输入昵称'); return; }
+  closeModal('nicknameModal');
+  if (state.token) saveNickname(val);
+  else {
+    state.nickname = val;
+    localStorage.setItem('hn_nickname', val);
+    refreshMeUI();
+  }
+}
+
+async function uploadAvatar(file) {
+  if (!state.token) { showToast('请先登录'); return; }
+  const fd = new FormData();
+  fd.append('avatar', file);
+  fd.append('nickname', state.nickname || '');
+  try {
+    const xhr = new XMLHttpRequest();
+    const result = await new Promise((resolve) => {
+      xhr.open('POST', BASE_URL + '/api/profile');
+      xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
+      xhr.onload = () => resolve({ status: xhr.status, data: (() => { try { return JSON.parse(xhr.responseText); } catch (e) { return null; } })() });
+      xhr.onerror = () => resolve({ status: 0, data: null });
+      xhr.send(fd);
+    });
+    if (result.data && result.data.success && result.data.avatar_url) {
+      state.avatarUrl = result.data.avatar_url;
+      localStorage.setItem('hn_avatar', state.avatarUrl);
+      document.getElementById('avatarImg').src = state.avatarUrl;
+      showToast('头像已更新');
+    } else showToast((result.data && result.data.message) || '上传失败');
+  } catch (e) { showToast('网络错误'); }
+}
+
+function saveNickname(nickname) {
+  state.nickname = nickname;
+  localStorage.setItem('hn_nickname', nickname);
+  // 立即刷新界面显示，避免等切页/会话刷新才更新
+  refreshMeUI();
+  api('/api/profile', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ nickname }),
+  }).catch(() => {});
+}
+
+/* ================= 许可密钥（访客兑换） ================= */
+
+function redeemKey() {
+  const key = document.getElementById('redeemInput').value.trim().toUpperCase();
+  if (key.length !== 8) { showToast('密钥为8位字符'); return; }
+  const btn = document.getElementById('redeemBtn');
+  btn.disabled = true;
+  btn.textContent = '验证中…';
+  api('/api/license/redeem', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  }).then(r => {
+    btn.disabled = false;
+    btn.textContent = '验证';
+    if (r.data && r.data.success) {
+      showToast('许可验证成功！');
+      document.getElementById('redeemInput').value = '';
+      refreshSession();
+      loadOrders();
+    } else showToast((r.data && r.data.message) || '密钥无效');
+  }).catch(() => { btn.disabled = false; btn.textContent = '验证'; showToast('网络错误'); });
+}
+
+function pasteKey() {
+  navigator.clipboard.readText().then(text => {
+    const t = (text || '').trim();
+    if (!t) { showToast('剪贴板为空'); return; }
+    const m = t.match(/[A-Za-z0-9]{8}/);
+    document.getElementById('redeemInput').value = m ? m[0].toUpperCase() : t.slice(0, 8).toUpperCase();
+  }).catch(() => showToast('无法读取剪贴板'));
+}
+
+/* ================= 订单 ================= */
+
+// 订单数据加工（价格/文件大小/isExcel），加载与轮询共用，保证"已送达"等判断不丢字段
+function normalizeOrder(o) {
+  o.totalPriceDisplay = Number(o.total_price || 0).toFixed(2);
+  if (o.files) {
+    o.files.forEach(f => {
+      f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : '';
+      const name = (f.original_name || f.file_name || '').toLowerCase();
+      f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx');
+    });
+    o.isExcel = o.files.length > 0 && o.files.every(f => f.isExcel);
+  }
+  return o;
+}
+
+async function loadOrders() {
+  if (!state.token) return;
+  meState.loadingOrders = true;
+  renderOrdersLoading();
+  try {
+    const r = await api('/api/orders?page=' + meState.ordersPage + '&per_page=' + meState.ordersPerPage);
+    meState.loadingOrders = false;
+    if (r.status === 200 && r.data && r.data.success) {
+      meState.ordersLoadError = false;
+      const orders = (r.data.orders || []).map(normalizeOrder);
+      meState.orders = orders;
+      meState.ordersTotal = r.data.total || 0;
+      meState.ordersTotalPages = Math.ceil(meState.ordersTotal / meState.ordersPerPage);
+      meState.expandedOrders = {};
+      renderOrders();
+    } else {
+      meState.ordersLoadError = true;
+      renderOrders();
+    }
+  } catch (e) {
+    meState.loadingOrders = false;
+    meState.ordersLoadError = true;
+    renderOrders();
+  }
+}
+
+function renderOrdersLoading() {
+  const list = document.getElementById('orderList');
+  if (meState.orders.length === 0 && meState.loadingOrders) {
+    list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
+  }
+}
+
+function orderStatusClass(status) {
+  return 'status-' + (status || 'queued');
+}
+
+function orderCardHTML(o, expanded, deliveredLabel) {
+  const status = ORDER_STATUS_MAP[o.status] || o.status;
+  let statusText = status;
+  let statusCls = orderStatusClass(o.status);
+  // 对齐小程序 me 页：Excel 订单 sent → 已送达（仅"我的打印任务"列表）
+  const isDelivered = deliveredLabel && o.isExcel && o.status === 'sent';
+  if (isDelivered) {
+    statusText = '已送达';
+    statusCls = 'status-delivered';
+  }
+  if (expanded === undefined) expanded = !!meState.expandedOrders[o.id];
+  // 详情区常驻渲染、用 detail-expanded 类切换（对齐小程序：展开/收起均有过渡动画）
+  let fileRows = '';
+  (o.files || []).forEach(f => {
+    fileRows += `
+      <view class="detail-file-row">
+        <view class="detail-file-info">
+          <text class="detail-file-name">${esc(f.original_name || f.file_name || '')}</text>
+          <view class="detail-file-tags">
+            ${f.file_type ? `<text class="file-type-tag">${esc(f.file_type)}</text>` : ''}
+            ${f.sizeDisplay ? `<text class="file-size-tag">${esc(f.sizeDisplay)}</text>` : ''}
+          </view>
+        </view>
+        <view class="detail-file-right">
+          <text class="detail-file-copies">${f.copies} 份 × ${f.page_count} 页</text>
+          <text class="detail-file-range">${f.duplex === 'on' ? '双面' : '单面'}</text>
+          ${f.page_range ? `<text class="detail-file-range">范围: ${esc(f.page_range)}</text>` : ''}
+          ${(f.status === 'rejected' || f.status === 'failed') && f.reject_reason ? `<text class="file-reject-reason">${esc(f.reject_reason)}</text>` : ''}
+        </view>
+      </view>`;
+  });
+  let licenseRows = '';
+  if (o.license_info) {
+    licenseRows = `
+      <view class="detail-section">
+        <view class="detail-section-title">临时许可密钥</view>
+        <view class="detail-row"><text class="detail-label">密钥</text><text class="detail-value license-key-value">${esc(o.license_info.key)}</text></view>
+        <view class="detail-row"><text class="detail-label">使用时间</text><text class="detail-value">${esc(o.license_info.used_at || '—')}</text></view>
+        <view class="detail-row"><text class="detail-label">到期时间</text><text class="detail-value">${esc(o.license_info.expires_at || '—')}</text></view>
+      </view>`;
+  }
+  let extRows = '';
+  if (o.urgency !== '低' || o.cover_page > 0 || o.delivery_enabled) {
+    extRows = '<view class="detail-section"><view class="detail-section-title">附加服务</view>';
+    if (o.urgency && o.urgency !== '低') {
+      extRows += `<view class="detail-row"><text class="detail-label">加急</text><text class="detail-value">${o.urgency === '高' ? '🚀 高' : '⚡ 中'}${Number(o.urgency_price) > 0 ? ' + ¥' + Number(o.urgency_price).toFixed(2) : ''}</text></view>`;
+    }
+    if (o.cover_page > 0) {
+      extRows += `<view class="detail-row"><text class="detail-label">首页</text><text class="detail-value">${o.cover_page} 页${Number(o.cover_page_price) > 0 ? ' · ¥' + Number(o.cover_page_price).toFixed(2) + '/页' : ''}</text></view>`;
+    }
+    if (o.delivery_enabled) {
+      extRows += `<view class="detail-row"><text class="detail-label">派送</text><text class="detail-value">${esc(o.delivery_location || '未指定地点')}${Number(o.delivery_percentage) > 0 ? ' · 加收 ' + Number(o.delivery_percentage) + '%' : ''}</text></view>`;
+    }
+    extRows += '</view>';
+  }
+  const detail = `
+    <view class="order-card-detail ${expanded ? 'detail-expanded' : ''}">
+      <view class="detail-divider"></view>
+      <view class="detail-section">
+        <view class="detail-section-title">打印信息</view>
+        <view class="detail-row"><text class="detail-label">提交时间</text><text class="detail-value">${esc(o.created_at || '')}</text></view>
+        <view class="detail-row"><text class="detail-label">合计页数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_pages || (o.page_count * o.copies)) + ' 页')}</text></view>
+        <view class="detail-row"><text class="detail-label">合计份数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_copies || o.copies) + ' 份')}</text></view>
+      </view>
+      ${licenseRows}
+      ${(o.files && o.files.length) ? `<view class="detail-section"><view class="detail-section-title">文件列表 (${o.files.length})</view>${fileRows}</view>` : ''}
+      ${extRows}
+      <view class="detail-section">
+        <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text><text class="detail-price-value status-${o.status || 'queued'}">¥${o.totalPriceDisplay || '0.00'}</text></view>
+      </view>
+      <view class="detail-actions">
+        ${(o.status === 'queued' || o.status === 'printing') ? `<button class="btn-cancel-sm" data-cancel-order="${o.id}">取消任务</button>` : ''}
+      </view>
+    </view>`;
+  return `
+    <view class="order-card ${expanded ? 'order-expanded' : ''}" data-order-id="${o.id}">
+      <view class="order-card-header">
+        <view class="order-card-main">
+          <text class="order-filename">${esc(o.order_number || ('#' + o.id))}</text>
+          <text class="order-status ${statusCls}">${esc(statusText)}</text>
+        </view>
+        <text class="order-number-label">${esc(o.file_summary || o.file || '')}</text>
+        <view class="order-card-meta">
+          <text class="order-card-stat">📄 ${o.isExcel ? '不适用' : ((o.total_pages || (o.page_count * o.copies)) + ' 页')}</text>
+          <text class="order-card-stat">📋 ${o.isExcel ? '不适用' : ((o.total_copies || o.copies) + ' 份')}</text>
+        </view>
+        <view class="order-card-footer">
+          <text class="order-created">${esc(o.created_at || '')}</text>
+          <text class="order-arrow ${expanded ? 'arrow-up' : ''}">›</text>
+        </view>
+      </view>
+      ${detail}
+    </view>`;
+}
+
+function renderOrders() {
+  const list = document.getElementById('orderList');
+  const empty = document.getElementById('ordersEmpty');
+  const badge = document.getElementById('orderCountBadge');
+  if (meState.loadingOrders && meState.orders.length === 0) list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
+  else if (meState.ordersLoadError && meState.orders.length === 0) { list.innerHTML = '<view class="status-box"><text class="status-text">网络错误</text></view>'; empty.style.display = 'none'; }
+  else if (meState.orders.length === 0) { list.innerHTML = ''; empty.style.display = ''; }
+  else { empty.style.display = 'none'; list.innerHTML = meState.orders.map(o => orderCardHTML(o, !!meState.expandedOrders[o.id], true)).join(''); }
+  badge.style.display = meState.orders.length ? '' : 'none';
+  badge.textContent = meState.ordersTotal;
+  const pager = document.getElementById('ordersPager');
+  // 选项为静态 HTML（与子视图一致），仅同步激活高亮
+  document.querySelectorAll('#pageSizePicker .page-size-option').forEach(opt => {
+    opt.classList.toggle('option-active', parseInt(opt.dataset.size, 10) === meState.ordersPerPage);
+  });
+  document.getElementById('ordersPageSizeText').textContent = meState.ordersPerPage + '条/页';
+  document.getElementById('ordersPageNumbers').innerHTML = buildPageNumbers();
+  document.getElementById('ordersPrev').classList.toggle('page-btn-disabled', meState.ordersPage <= 1);
+  document.getElementById('ordersNext').classList.toggle('page-btn-disabled', meState.ordersPage >= meState.ordersTotalPages);
+  pager.style.display = meState.ordersTotalPages > 0 ? '' : 'none';
+  // 底部分页 + 结束提示（对齐小程序 me 页）
+  const pagerBottom = document.getElementById('ordersPagerBottom');
+  if (pagerBottom) {
+    pagerBottom.style.display = meState.ordersTotalPages > 1 ? '' : 'none';
+    document.getElementById('ordersPageNumbersBottom').innerHTML = buildPageNumbers();
+    document.getElementById('ordersPrevBottom').classList.toggle('page-btn-disabled', meState.ordersPage <= 1);
+    document.getElementById('ordersNextBottom').classList.toggle('page-btn-disabled', meState.ordersPage >= meState.ordersTotalPages);
+  }
+  const endHint = document.getElementById('ordersEndHint');
+  if (endHint) {
+    endHint.style.display = (meState.ordersTotalPages > 0 && meState.ordersPage >= meState.ordersTotalPages && meState.orders.length > 0) ? '' : 'none';
+  }
+  measureAll(150);
+}
+
+function buildPageNumbers() {
+  const total = meState.ordersTotalPages;
+  const current = meState.ordersPage;
+  if (total <= 1) return '';
+  const pages = [];
+  if (total <= 7) { for (let i = 1; i <= total; i++) pages.push(i); }
+  else {
+    pages.push(1);
+    if (current > 3) pages.push('...');
+    for (let i = Math.max(2, current - 1); i <= Math.min(total - 1, current + 1); i++) pages.push(i);
+    if (current < total - 2) pages.push('...');
+    pages.push(total);
+  }
+  return pages.map(p => {
+    if (p === '...') return '<view class="page-ellipsis">…</view>';
+    return `<view class="page-num ${p === current ? 'page-num-active' : ''}" data-page-num="${p}">${p}</view>`;
+  }).join('');
+}
+
+function toggleOrder(id) {
+  if (meState.expandedOrders[id]) delete meState.expandedOrders[id];
+  else meState.expandedOrders[id] = true;
+  // 原地切换类名让 CSS 过渡播放（整表重绘会重建元素导致展开/收起突变）
+  const card = document.querySelector('#orderList [data-order-id="' + id + '"]');
+  if (card) {
+    const expanded = !!meState.expandedOrders[id];
+    card.classList.toggle('order-expanded', expanded);
+    const detail = card.querySelector('.order-card-detail');
+    if (detail) detail.classList.toggle('detail-expanded', expanded);
+    const arrow = card.querySelector('.order-arrow');
+    if (arrow) arrow.classList.toggle('arrow-up', expanded);
+  }
+  measureAll(150);
+}
+
+function changeOrdersPage(page) {
+  if (page < 1 || page > meState.ordersTotalPages || page === meState.ordersPage) return;
+  meState.ordersPage = page;
+  loadOrders();
+}
+
+let _pageSizePickerOpenedAt = 0;
+
+function togglePageSizePicker() {
+  try {
+    const picker = document.getElementById('pageSizePicker');
+    if (!picker) { showToast('分页下拉元素缺失'); return; }
+    const open = !picker.classList.contains('dropdown-show');
+    if (open) {
+      _pageSizePickerOpenedAt = Date.now();
+      // 内联定位兜底（显隐走 CSS 类，与子视图一致）
+      picker.style.position = 'absolute';
+      picker.style.top = 'calc(100% + 0.8cqw)';
+      picker.style.left = '0';
+      picker.style.zIndex = '100';
+      picker.classList.add('dropdown-show');
+    } else {
+      hidePageSizePicker();
+      return;
+    }
+    const arrow = document.getElementById('ordersPageSizeArrow');
+    if (arrow) arrow.classList.add('arrow-up');
+  } catch (err) {
+    showToast('分页下拉出错: ' + (err && err.message ? err.message : err));
+  }
+}
+
+// 统一收起：移除类并清空内联显隐（内联 opacity 优先级高于 CSS，不清会关不掉）
+function hidePageSizePicker() {
+  const picker = document.getElementById('pageSizePicker');
+  if (picker) picker.classList.remove('dropdown-show');
+  const arrow = document.getElementById('ordersPageSizeArrow');
+  if (arrow) arrow.classList.remove('arrow-up');
+}
+
+function selectOrdersPageSize(size) {
+  meState.ordersPerPage = size;
+  meState.ordersPage = 1;
+  hidePageSizePicker();
+  loadOrders().then(() => scrollToOrdersSection());
+}
+
+// 滚动开始即收起分页下拉（对齐小程序 onScrollerTouchStart，避免 fixed 下拉错位）
+function closePageSizePicker() {
+  const picker = document.getElementById('pageSizePicker');
+  if (!picker || !picker.classList.contains('dropdown-show')) return;
+  // 展开后短暂时间内不因滚动/回弹收起，防止模拟触摸的物理帧干扰（点击已不启动物理，此为双保险）
+  if (Date.now() - _pageSizePickerOpenedAt < 300) return;
+  hidePageSizePicker();
+}
+
+// 选择条数后滚动回"我的打印任务"区域顶部（对齐小程序 _scrollToOrdersSection）
+function scrollToOrdersSection() {
+  const engine = scrollEngines.me;
+  if (!engine) return;
+  const section = document.querySelector('#page-me .orders-section');
+  const content = document.getElementById('scrollContentMe');
+  if (!section || !content) return;
+  engine.measure(); // 用最新内容高度更新 maxY
+  // 内容变短导致当前位置超出新边界：直接无动画归位（避免 measure 内部的回弹动画）
+  if (engine.y > engine.maxY) {
+    engine.cancel();
+    engine.y = engine.maxY;
+    engine.applyY();
+  }
+  // 内容不足一屏（maxY <= 0）：不滚动，保持原位
+  if (engine.maxY <= 0) return;
+  const offset = section.getBoundingClientRect().top - content.getBoundingClientRect().top + engine.y;
+  const target = Math.min(Math.max(0, offset - 12), engine.maxY);
+  // 目标与当前位置接近时不滚动，避免无意义的跳动
+  if (Math.abs(target - engine.y) < 2) return;
+  engine.scrollTo(target, 280);
+}
+
+function cancelOrder(id) {
+  showConfirm('确认取消', '确定要取消这个打印任务吗？', '取消订单', '#FF9500', () => {
+    showToast('取消中...', 10000);
+    api('/api/cancel_order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order_id: String(id) }),
+    }).then(r => {
+      if (r.data && r.data.success) {
+        showToast('已取消');
+        loadOrders();
+        const uo = document.getElementById('view-user-orders');
+        if (uo && uo.style.display !== 'none') loadUserOrders();
+      } else showToast((r.data && r.data.message) || '取消失败');
+    }).catch(() => showToast('网络错误'));
+  });
+}
+
+function startOrderPolling() {
+  stopOrderPolling();
+  meState._orderPollTimer = setInterval(() => {
+    if (document.getElementById('page-me').style.display !== 'none') {
+      api('/api/orders?page=' + meState.ordersPage + '&per_page=' + meState.ordersPerPage).then(r => {
+        if (r.status === 200 && r.data && r.data.success) {
+          const orders = (r.data.orders || []).map(normalizeOrder);
+          meState.orders = orders;
+          meState.ordersTotal = r.data.total || 0;
+          meState.ordersTotalPages = Math.ceil(meState.ordersTotal / meState.ordersPerPage);
+          renderOrders();
+        }
+      }).catch(() => {});
+    }
+  }, 15000);
+}
+
+function stopOrderPolling() {
+  if (meState._orderPollTimer) { clearInterval(meState._orderPollTimer); meState._orderPollTimer = null; }
+}
+
+// 管理员许可密钥轮询（对齐小程序：me 页展示期间每 15s 刷新密钥状态 + 管理员列表）
+function startKeyPolling() {
+  stopKeyPolling();
+  meState._keyPollTimer = setInterval(() => {
+    const meVisible = document.getElementById('page-me') && document.getElementById('page-me').style.display !== 'none';
+    if (!meVisible || state.role !== 'admin') return;
+    loadActiveKeys();
+    if (state.isSuperAdmin) loadAdmins();
+  }, 15000);
+}
+
+function stopKeyPolling() {
+  if (meState._keyPollTimer) { clearInterval(meState._keyPollTimer); meState._keyPollTimer = null; }
+}
+
+/* ================= 管理员：密钥 ================= */
+
+function setLicenseMinutes(v) {
+  meState.licenseMinutes = Math.max(1, Math.min(10, v));
+  updateKeyForm();
+}
+
+function updateKeyForm() {
+  const valEl = document.getElementById('licenseMinutesValue');
+  if (valEl) valEl.value = meState.licenseMinutes;
+  document.getElementById('licenseMinutesMinus').classList.toggle('stepper-disabled', meState.licenseMinutes <= 1);
+  document.getElementById('licenseMinutesPlus').classList.toggle('stepper-disabled', meState.licenseMinutes >= 10);
+  document.getElementById('keyTypeTemp').classList.toggle('opt-active', meState.keyType === 'temp');
+  document.getElementById('keyTypeAdmin').classList.toggle('opt-active', meState.keyType === 'admin');
+  const slider = document.getElementById('keyTypeSlider');
+  if (slider) slider.classList.toggle('slider-right', meState.keyType === 'admin');
+}
+
+function generateKey() {
+  if (meState.generating) return;
+  meState.generating = true;
+  const btn = document.getElementById('generateKeyBtn');
+  btn.disabled = true;
+  btn.textContent = '生成中…';
+  api('/api/license/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ validity_minutes: meState.licenseMinutes, type: meState.keyType }),
+  }).then(r => {
+    meState.generating = false;
+    btn.disabled = false;
+    btn.textContent = '生成许可密钥';
+    if (r.data && r.data.success) { showToast('密钥已生成'); loadActiveKeys(); }
+    else showToast((r.data && r.data.message) || '生成失败');
+  }).catch(() => {
+    meState.generating = false;
+    btn.disabled = false;
+    btn.textContent = '生成许可密钥';
+    showToast('网络错误');
+  });
+}
+
+let _keysLoadedOnce = false;
+
+async function loadActiveKeys() {
+  if (!state.token || state.role !== 'admin') return;
+  try {
+    const r = await api('/api/license/active');
+    if (r.data && r.data.success) {
+      const prev = meState.activeKeys;
+      const prevByKey = new Map(prev.map(k => [k.key, k]));
+      const newKeys = r.data.keys || [];
+      const newSet = new Set(newKeys.map(k => k.key));
+      // 合并：保留本地动画状态；非首次加载出现的新 key → 播放入场动画
+      // （用显式 _keysLoadedOnce 而非"列表是否为空"，保证第一把生成的密钥也能播放入场）
+      const merged = newKeys.map(k => {
+        const old = prevByKey.get(k.key);
+        return {
+          ...k,
+          _entering: old ? !!old._entering : _keysLoadedOnce,
+          _exiting: old ? !!old._exiting : false,
+        };
+      });
+      // 服务端已移除的 key → 保留并标记离场，动画结束后再移除
+      const removed = prev.filter(o => !newSet.has(o.key) && !o._exiting);
+      for (const rk of removed) merged.push({ ...rk, _exiting: true });
+      meState.activeKeys = merged;
+      refreshKeyCountdowns();
+      renderActiveKeys();
+      startKeyCountdown();
+      if (removed.length) {
+        setTimeout(() => {
+          meState.activeKeys = meState.activeKeys.filter(k => !k._exiting);
+          renderActiveKeys();
+          if (!meState.activeKeys.length) stopKeyCountdown();
+        }, 350);
+      }
+      if (merged.some(k => k._entering)) {
+        setTimeout(() => {
+          meState.activeKeys.forEach(k => { k._entering = false; });
+          document.querySelectorAll('#activeKeys .key-card-wrap.key-entering').forEach(el => el.classList.remove('key-entering'));
+        }, 800);
+      }
+      _keysLoadedOnce = true;
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+let _keyCountdownTimer = null;
+function startKeyCountdown() {
+  stopKeyCountdown();
+  if (!meState.activeKeys.length) return;
+  _keyCountdownTimer = setInterval(() => {
+    refreshKeyCountdowns();
+    updateKeyCountdownTexts();
+  }, 1000);
+}
+function stopKeyCountdown() {
+  if (_keyCountdownTimer) { clearInterval(_keyCountdownTimer); _keyCountdownTimer = null; }
+}
+function refreshKeyCountdowns() {
+  const now = Date.now();
+  meState.activeKeys.forEach(k => {
+    const exp = new Date(String(k.expires_at || '').replace(/-/g, '/')).getTime();
+    k._expired = !isNaN(exp) && exp < now;
+    // 对齐小程序：右侧倒计时区对已使用密钥统一显示"已使用"（等待任务中仅出现在按钮区）
+    if (k.status !== 'unused') k._countdownText = '已使用';
+    else k._countdownText = k._expired ? '已过期' : formatRemain(k.expires_at);
+  });
+}
+
+// 倒计时只在原地更新文本（不整表重绘，避免清掉左滑绑定/展开状态）
+function updateKeyCountdownTexts() {
+  document.querySelectorAll('#activeKeys [data-key-swipe]').forEach(card => {
+    const k = meState.activeKeys.find(x => x.key === card.dataset.keySwipe);
+    if (!k) return;
+    const cd = card.querySelector('.key-countdown');
+    if (cd) {
+      cd.textContent = k._countdownText;
+      cd.classList.toggle('countdown-expired', !!k._expired);
+    }
+  });
+}
+
+function renderActiveKeys() {
+  const wrap = document.getElementById('activeKeys');
+  const count = document.getElementById('activeKeyCount');
+  count.style.display = meState.activeKeys.length ? '' : 'none';
+  count.textContent = meState.activeKeys.length;
+  if (!meState.activeKeys.length) {
+    wrap.innerHTML = '';
+    return;
+  }
+  wrap.innerHTML = meState.activeKeys.map(k => {
+    const locked = k.status !== 'unused';
+    const canCopy = k.status === 'unused' && !k._expired;
+    const canRevoke = k.status === 'unused';
+    const confirmBtn = k.status === 'used_waiting' && k.type === 'admin'
+      ? `<button class="copy-btn btn-confirm-admin" data-confirm-key="${escHtml(k.key)}">确认并关闭</button>` : '';
+    const waitingBtn = k.status === 'used_waiting' && k.type !== 'admin'
+      ? `<button class="copy-btn btn-waiting" disabled>等待任务中</button>` : '';
+    const settleBtn = k.order_id
+      ? `<button class="copy-btn" data-settle="${k.order_id}" data-settle-nickname="${escHtml(k.used_by_nickname || '用户')}">结算</button>` : '';
+    const deleteBtn = canRevoke
+      ? `<view class="key-delete" data-revoke-key="${escHtml(k.key)}" style="opacity:0"><text class="delete-icon">🗑</text><text>作废</text></view>` : '';
+    return `
+      <view class="key-card-wrap ${k._entering ? 'key-entering' : ''} ${k._exiting ? 'key-exiting' : ''} ${k._expired && k.status === 'unused' ? 'key-drawer-expired' : ''} ${locked ? 'key-drawer-locked' : ''}">
+        ${deleteBtn}
+        <view class="key-card" data-key-swipe="${escHtml(k.key)}">
+          <view class="key-row">
+            <view class="key-left">
+              <text class="key-label">${k.type === 'admin' ? '管理员密钥' : '许可密钥'}</text>
+              <text class="key-value">${esc(k.key)}</text>
+            </view>
+            <view class="key-right">
+              <text class="key-countdown ${k._expired ? 'countdown-expired' : ''}">${esc(k._countdownText)}</text>
+            </view>
+          </view>
+          ${k.used_by ? `<view class="key-user-info">
+            ${k.used_by_avatar_url ? `<img class="key-user-avatar" src="${escHtml(k.used_by_avatar_url)}">` : ''}
+            <text class="key-user-name">${esc(k.used_by_nickname || '用户')}</text>
+            ${settleBtn}
+          </view>` : ''}
+          <view class="key-actions">
+            ${canCopy ? `<button class="copy-btn" data-copy-key="${escHtml(k.key)}">复制</button>` : ''}
+            ${k.status === 'unused' && k._expired ? '<button class="copy-btn copy-btn-disabled">已过期</button>' : ''}
+            ${confirmBtn}
+            ${waitingBtn}
+          </view>
+        </view>
+      </view>`;
+  }).join('');
+  // 列表重建后旧绑定的元素已脱离文档，重新绑定到新元素
+  _swipeBindings = {};
+  // 绑定左滑作废
+  bindKeySwipes();
+}
+
+let _swipeBindings = {};
+function bindKeySwipes() {
+  document.querySelectorAll('[data-key-swipe]').forEach(card => {
+    const key = card.dataset.keySwipe;
+    const del = card.parentElement.querySelector('.key-delete');
+    if (!del) return;
+    if (_swipeBindings[key]) return;
+    _swipeBindings[key] = makeSwipeable(card, del, () => revokeKey(key));
+  });
+}
+
+// 通用左滑手势：露出右侧按钮，超过半程吸附展开（Pointer Events，鼠标/触摸通用）
+function makeSwipeable(card, deleteEl, onDelete) {
+  let startX = 0, startY = 0, lastRaw = 0, horizontal = false, startCardX = 0, pointerId = null;
+  // 以删除按钮实际宽度为准（CSS 18.67cqw ≈ 80px，不能写死）
+  // 延迟到首次触摸时测量：卡片可能在「我」页未显示时绑定，display:none 下 offsetWidth=0
+  let DELETE_W = deleteEl ? deleteEl.offsetWidth : 140;
+  const rubber = (raw, max, min, over) => {
+    if (raw > max) return max + over * (1 - Math.exp(-(raw - max) / (over * 1.6)));
+    if (raw < min) return min - over * (1 - Math.exp(-(min - raw) / (over * 1.6)));
+    return raw;
+  };
+  const getX = () => {
+    const m = /translateX\((-?[\d.]+)px\)/.exec(card.style.transform || '');
+    return m ? parseFloat(m[1]) : 0;
+  };
+  const apply = (x, opacity, transition) => {
+    card.style.transform = 'translateX(' + x + 'px)';
+    card.style.transition = transition ? 'transform 0.25s cubic-bezier(0.4,0,0.2,1)' : 'none';
+    if (deleteEl) deleteEl.style.opacity = opacity;
+  };
+  const onDown = (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (!DELETE_W) DELETE_W = deleteEl ? (deleteEl.offsetWidth || 140) : 140;
+    pointerId = e.pointerId;
+    startX = e.clientX; startY = e.clientY;
+    // 卡片可能已处于展开态：以当前位移为起点，右滑才能平滑归位
+    startCardX = getX();
+    lastRaw = startCardX;
+    horizontal = false;
+  };
+  const onMove = (e) => {
+    if (e.pointerId !== pointerId) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (!horizontal) {
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      if (Math.abs(dx) > Math.abs(dy)) {
+        horizontal = true;
+        gestureBus.horizontal = true;
+      }
+      else return;
+    }
+    const raw = startCardX + dx;
+    lastRaw = raw;
+    const visual = rubber(raw, 0, -DELETE_W, 40);
+    const opacity = raw < 0 ? Math.min(1, Math.abs(raw) / (DELETE_W * 0.6)) : 0;
+    apply(visual, opacity, false);
+  };
+  const onUp = () => {
+    if (pointerId == null) return;
+    pointerId = null;
+    gestureBus.horizontal = false;
+    if (!horizontal) return;
+    // 记录滑动时间戳：左滑后松手补发的 click 不再触发卡片点击行为
+    card.dataset.swiped = String(Date.now());
+    // 吸附判定用卡片绝对位移（展开态右滑也能正确计算），对齐小程序 onKeyTouchEnd
+    const raw = lastRaw;
+    const target = raw > 0 ? 0 : (raw < -DELETE_W ? -DELETE_W : (raw < -DELETE_W / 2 ? -DELETE_W : 0));
+    apply(target, target === 0 ? 0 : 1, true);
+    horizontal = false;
+  };
+  card.addEventListener('pointerdown', onDown);
+  card.addEventListener('pointermove', onMove);
+  card.addEventListener('pointerup', onUp);
+  card.addEventListener('pointercancel', onUp);
+  return { destroy() {
+    card.removeEventListener('pointerdown', onDown);
+    card.removeEventListener('pointermove', onMove);
+    card.removeEventListener('pointerup', onUp);
+    card.removeEventListener('pointercancel', onUp);
+  }};
+}
+
+function copyKey(key) {
+  const k = meState.activeKeys.find(x => x.key === key);
+  if (!k) return;
+  const text = '这是HN同学的打印机的使用许可密钥，剩余有效时间' + (k._countdownText || '') + '，请在有效期内填写到小程序的指定位置:\n密钥: ' + k.key;
+  copyText(text, '已复制到剪贴板');
+}
+
+function revokeKey(key) {
+  showConfirm('作废密钥', '确定作废此许可密钥？作废后他人将无法使用。', '作废', '#FF3B30', () => {
+    // 第一步：右滑收起删除按钮（对齐小程序，先收起再请求）
+    const card = document.querySelector('[data-key-swipe="' + key + '"]');
+    const wrap = card ? card.parentElement : null;
+    const del = card ? wrap.querySelector('.key-delete') : null;
+    if (card) {
+      card.style.transition = 'transform 0.25s cubic-bezier(0.4,0,0.2,1)';
+      card.style.transform = 'translateX(0)';
+      if (del) del.style.opacity = 0;
+    }
+    api('/api/license/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key }),
+    }).then(r => {
+      if (r.data && r.data.success) {
+        showToast('已作废');
+        // 第二步：收起完成后播离场动画（keySlideOut 0.3s），再移除
+        setTimeout(() => {
+          const k = meState.activeKeys.find(x => x.key === key);
+          if (k) k._exiting = true;
+          if (wrap) wrap.classList.add('key-exiting');
+          setTimeout(() => {
+            meState.activeKeys = meState.activeKeys.filter(x => x.key !== key);
+            renderActiveKeys();
+            if (!meState.activeKeys.length) stopKeyCountdown();
+          }, 350);
+        }, 250);
+      } else {
+        showToast((r.data && r.data.message) || '操作失败');
+        restoreKeySwipe(card, del);
+      }
+    }).catch(() => {
+      showToast('网络错误');
+      restoreKeySwipe(card, del);
+    });
+  });
+}
+
+// 作废失败：恢复卡片到滑开状态（删除按钮可见，便于重试）
+function restoreKeySwipe(card, del) {
+  if (!card) return;
+  const w = del ? (del.offsetWidth || 80) : 80;
+  card.style.transition = 'transform 0.25s cubic-bezier(0.4,0,0.2,1)';
+  card.style.transform = 'translateX(' + (-w) + 'px)';
+  if (del) del.style.opacity = 1;
+}
+
+function confirmAdminKey(key) {
+  api('/api/license/finish', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  }).then(r => {
+    if (r.data && r.data.success) { showToast('已确认'); loadActiveKeys(); }
+    else showToast((r.data && r.data.message) || '操作失败');
+  }).catch(() => showToast('网络错误'));
+}
+
+function settleOrder(orderId, nickname) {
+  api('/api/order_price/' + orderId).then(r => {
+    if (r.data && r.data.success) {
+      const d = r.data;
+      const files = d.files || [];
+      let text = '【打印任务结算】\n用户: ' + (nickname || '用户');
+      files.forEach((f, i) => {
+        const unitPrice = typeof f.per_copy_price === 'number' ? f.per_copy_price : 0;
+        const fileTotal = typeof f.total_price === 'number' ? f.total_price : 0;
+        text += '\n文件' + (i + 1) + ': ' + (f.file_name || '');
+        text += ' | ' + f.copies + '份 × ' + f.page_count + '页';
+        text += ' | 单价: ¥' + unitPrice.toFixed(2);
+        text += ' | 小计: ¥' + fileTotal.toFixed(2);
+      });
+      text += '\n总价: ¥' + (typeof d.total_price === 'number' ? d.total_price : 0).toFixed(2);
+      copyText(text, '已复制结算详情');
+    } else showToast((r.data && r.data.message) || '无法获取该订单结算信息');
+  }).catch(() => showToast('网络错误'));
+}
+
+/* ================= 管理员：存储 / 防滥用 ================= */
+
+async function loadStorageStats() {
+  if (!state.token || state.role !== 'admin') return;
+  try {
+    const r = await api('/api/admin/storage');
+    if (r.status === 200 && r.data && r.data.success) {
+      meState.storageStats = r.data;
+      meState.retentionDays = r.data.retention_days != null ? r.data.retention_days : 7;
+      meState.retentionHours = r.data.retention_hours != null ? r.data.retention_hours : 0;
+      renderStorageStats();
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+function renderStorageStats() {
+  const s = meState.storageStats;
+  if (!s) return;
+  document.getElementById('storageFiles').textContent = (s.total_files || 0) + ' 个';
+  document.getElementById('storageSize').textContent = s.total_size_display || '0 B';
+  document.getElementById('retentionDaysValue').value = meState.retentionDays;
+  document.getElementById('retentionHoursValue').value = meState.retentionHours;
+  document.getElementById('retentionHint').style.display = (meState.retentionDays === 0 && meState.retentionHours === 0) ? '' : 'none';
+  document.getElementById('retentionDaysMinus').classList.toggle('stepper-disabled', meState.retentionDays <= 0);
+  document.getElementById('retentionHoursMinus').classList.toggle('stepper-disabled', meState.retentionHours <= 0);
+  measureAll(150);
+}
+
+function setRetention(kind, v) {
+  if (kind === 'days') meState.retentionDays = Math.max(0, Math.min(365, v));
+  else meState.retentionHours = Math.max(0, Math.min(23, v));
+  renderStorageStats();
+}
+
+function saveRetention() {
+  if (meState.savingRetention) return;
+  if (meState.retentionDays === 0 && meState.retentionHours === 0) { /* 永不过期，允许 */ }
+  else if (meState.retentionDays === 0 && meState.retentionHours < 1) { showToast('至少保留1小时'); return; }
+  meState.savingRetention = true;
+  api('/api/admin/storage', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ retention_days: meState.retentionDays, retention_hours: meState.retentionHours }),
+  }).then(r => {
+    meState.savingRetention = false;
+    if (r.data && r.data.success) { showToast('已同步到服务器和本地工具'); loadStorageStats(); }
+    else showToast((r.data && r.data.message) || '保存失败');
+  }).catch(() => { meState.savingRetention = false; showToast('网络错误'); });
+}
+
+function deleteAllFiles() {
+  showConfirm('⚠️ 确认删除', '将删除服务器及本地打印工具的全部缓存文件（不包括用户头像），此操作不可撤销。确定继续？', '确认删除', '#FF3B30', () => {
+    meState.deletingAllFiles = true;
+    api('/api/admin/storage', { method: 'DELETE' }).then(r => {
+      meState.deletingAllFiles = false;
+      if (r.data && r.data.success) { showToast(r.data.message || '已删除'); loadStorageStats(); }
+      else showToast((r.data && r.data.message) || '删除失败');
+    }).catch(() => { meState.deletingAllFiles = false; showToast('网络错误'); });
+  });
+}
+
+async function loadSecurityConfig() {
+  if (!state.token || state.role !== 'admin') return;
+  try {
+    const r = await api('/api/admin/security');
+    if (r.status === 200 && r.data && r.data.success) {
+      meState.securityConfig = r.data;
+      meState.securityItems = SECURITY_DEFS.map(d => ({
+        ...d,
+        value: r.data[d.key] !== undefined && r.data[d.key] !== null ? Number(r.data[d.key]) : 0,
+      }));
+      renderSecurityConfig();
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+function renderSecurityConfig() {
+  document.getElementById('securityItems').innerHTML = meState.securityItems.map((it, i) => `
+    <view class="security-row">
+      <view class="security-label-wrap">
+        <text class="security-label">${esc(it.label)}</text>
+        <text class="security-hint">${esc(it.hint)}</text>
+      </view>
+      <view class="security-stepper">
+        <view class="retention-stepper-btn ${it.value <= it.min ? 'stepper-disabled' : ''}" data-sec-minus="${i}">−</view>
+        <input class="retention-stepper-input security-input" type="number" value="${it.value}" data-sec-input="${i}">
+        <view class="retention-stepper-btn ${it.value >= it.max ? 'stepper-disabled' : ''}" data-sec-plus="${i}">+</view>
+        <text class="retention-unit">${esc(it.unit)}</text>
+      </view>
+    </view>`).join('');
+}
+
+function toggleSecurityExpanded() {
+  meState.securityExpanded = !meState.securityExpanded;
+  document.getElementById('securitySummary').classList.toggle('security-summary-active', meState.securityExpanded);
+  document.getElementById('securityDetail').classList.toggle('security-detail-expanded', meState.securityExpanded);
+  document.getElementById('securityArrow').classList.toggle('arrow-up', meState.securityExpanded);
+  measureAll(200);
+}
+
+function updateSecurityItem(idx, delta) {
+  const it = meState.securityItems[idx];
+  if (!it) return;
+  it.value = Math.max(it.min, Math.min(it.max, it.value + delta));
+  renderSecurityConfig();
+}
+
+function saveSecurity() {
+  if (meState.savingSecurity) return;
+  const payload = {};
+  meState.securityItems.forEach(it => { payload[it.key] = it.value; });
+  meState.savingSecurity = true;
+  api('/api/admin/security', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(r => {
+    meState.savingSecurity = false;
+    if (r.data && r.data.success) { showToast('防滥用阈值已更新'); loadSecurityConfig(); }
+    else showToast((r.data && r.data.message) || '保存失败');
+  }).catch(() => { meState.savingSecurity = false; showToast('网络错误'); });
+}
+
+/* ================= 管理员：临时用户 / 管理员列表 ================= */
+
+async function loadTempUsers() {
+  if (!state.token || state.role !== 'admin') return;
+  try {
+    const r = await api('/api/admin/temp_users');
+    if (r.data && r.data.success) {
+      meState.tempUsers = r.data.users || [];
+      renderTempUsers();
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+function renderTempUsers() {
+  const wrap = document.getElementById('tempUserList');
+  const count = document.getElementById('tempUserCount');
+  count.style.display = meState.tempUsers.length ? '' : 'none';
+  count.textContent = meState.tempUsers.length;
+  if (!meState.tempUsers.length) {
+    wrap.innerHTML = '<view class="license-card"><text class="redeem-desc" style="text-align:center;margin:0;">暂无已临时授权的普通用户</text></view>';
+    return;
+  }
+  wrap.innerHTML = meState.tempUsers.map(u => `
+    <view class="admin-card-wrap">
+      <view class="admin-delete" data-remove-tempuser="${escHtml(u.openid)}" style="opacity:0">
+        <text class="delete-icon">🗑</text>
+        <text>移除</text>
+      </view>
+      <view class="admin-card">
+        <img class="admin-avatar" src="${u.avatar_url ? escHtml(u.avatar_url) : DEFAULT_AVATAR}">
+        <view class="admin-info">
+          <text class="admin-name">${esc(u.nickname || '用户')}</text>
+          <view class="temp-user-sub">
+            <text class="temp-user-key">${esc(u.license_key || '')}</text>
+            <text class="temp-user-status ${u.status === 'active' ? 'active' : 'expired'}">${u.status === 'active' ? '授权中' : '已过期'}</text>
+          </view>
+        </view>
+      </view>
+    </view>`).join('');
+  // 左滑移除（对齐小程序：滑动露出删除按钮）
+  wrap.querySelectorAll('.admin-card-wrap').forEach(wrapEl => {
+    const del = wrapEl.querySelector('.admin-delete');
+    const card = wrapEl.querySelector('.admin-card');
+    if (del && card) makeSwipeable(card, del, () => {});
+  });
+}
+
+function removeTempUser(openid) {
+  showConfirm('移除用户', '确定要移除该临时授权用户吗？移除后其授权记录将保留在历史授权用户中。', '移除', '#FF3B30', () => {
+    api('/api/admin/remove_user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ openid }),
+    }).then(r => {
+      if (r.data && r.data.success) { showToast('已移除'); loadTempUsers(); }
+      else showToast((r.data && r.data.message) || '移除失败');
+    }).catch(() => showToast('网络错误'));
+  });
+}
+
+async function loadAdmins() {
+  if (!state.token || !state.isSuperAdmin) return;
+  try {
+    const r = await api('/api/admin/admins?page=1&page_size=50');
+    if (r.data && r.data.success) {
+      meState.admins = r.data.admins || [];
+      renderAdmins();
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+function renderAdmins() {
+  const wrap = document.getElementById('adminList');
+  if (!meState.admins.length) {
+    wrap.innerHTML = '<view class="license-card"><text class="redeem-desc" style="text-align:center;margin:0;">暂无其他管理员</text></view>';
+    return;
+  }
+  wrap.innerHTML = meState.admins.map(a => `
+    <view class="admin-card-wrap">
+      ${!a.is_super ? `<view class="admin-delete" data-remove-admin="${escHtml(a.openid)}" style="opacity:0">
+        <text class="delete-icon">🗑</text>
+        <text>移除</text>
+      </view>` : ''}
+      <view class="admin-card" data-admin-openid="${escHtml(a.openid)}" data-admin-nickname="${escHtml(a.nickname || '')}">
+        <img class="admin-avatar" src="${a.avatar_url ? escHtml(a.avatar_url) : DEFAULT_AVATAR}">
+        <view class="admin-info">
+          <text class="admin-name">${esc(a.nickname || '用户')}</text>
+          ${a.is_super ? '<text class="admin-badge">超级管理员</text>' : ''}
+        </view>
+      </view>
+    </view>`).join('');
+  // 左滑移除（对齐小程序：滑动露出删除按钮；纯点击卡片跳转任务列表）
+  wrap.querySelectorAll('.admin-card-wrap').forEach(wrapEl => {
+    const del = wrapEl.querySelector('.admin-delete');
+    const card = wrapEl.querySelector('.admin-card');
+    if (del && card) makeSwipeable(card, del, () => {});
+  });
+}
+
+function removeAdmin(openid) {
+  showConfirm('移除管理员', '确定要移除该管理员吗？', '移除', '#FF3B30', () => {
+    api('/api/admin/remove_admin', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ openid }),
+    }).then(r => {
+      if (r.data && r.data.success) { showToast('已移除'); loadAdmins(); }
+      else showToast((r.data && r.data.message) || '移除失败');
+    }).catch(() => showToast('网络错误'));
+  });
+}
+
+/* ================= 子视图：历史授权用户 ================= */
+
+function openAuthorizedUsers() {
+  showView('view-authorized', '历史授权用户');
+  loadAuthorizedUsers();
+}
+
+async function loadAuthorizedUsers() {
+  const list = document.getElementById('authorizedUserList');
+  list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
+  try {
+    const r = await api('/api/authorized_users');
+    if (r.data && r.data.success) {
+      meState.authorizedUsers = (r.data.users || []).map(u => { u._expanded = false; return u; });
+      renderAuthorizedUsers();
+    } else list.innerHTML = '<view class="status-box"><text class="status-text">加载失败</text></view>';
+  } catch (e) {
+    list.innerHTML = '<view class="status-box"><text class="status-text">网络错误</text></view>';
+  }
+}
+
+function renderAuthorizedUsers() {
+  const list = document.getElementById('authorizedUserList');
+  if (!meState.authorizedUsers.length) {
+    list.innerHTML = `
+      <view class="empty-state">
+        <view class="empty-illustration"><text class="empty-icon">👥</text></view>
+        <text class="empty-title">暂无授权用户</text>
+        <text class="empty-desc">生成许可密钥分享给他人后，这里会显示授权记录</text>
+      </view>`;
+    return;
+  }
+  const statusMap = { permanent: '永久管理员', active: '临时授权中', expired: '已过期', removed: '已移除' };
+  const keyStatusMap = { unused: '未使用', used: '已使用', revoked: '已作废', finished: '已完成', archived: '归档' };
+  let html = `<view class="list-summary"><text class="summary-text">共 ${meState.authorizedUsers.length} 位授权用户</text></view>`;
+  html += '<view class="user-list">' + meState.authorizedUsers.map(u => {
+    const avatarChar = (u.nickname || '?')[0];
+    const avatarUrl = u.avatar_url ? escHtml(u.avatar_url) + '?t=' + Date.now() : '';
+    const licenseTypeLabel = u.license_type === 'admin' ? '管理员许可'
+      : u.license_type === 'temp' ? '临时许可'
+      : u.license_type === 'both' ? '管理员+临时' : '无密钥记录';
+    const typeCls = u.license_type === 'admin' ? 'tag-admin'
+      : u.license_type === 'temp' ? 'tag-temp'
+      : u.license_type === 'both' ? 'tag-both' : '';
+    const statusLabel = statusMap[u.status] || u.status;
+    const records = u.keys || [];
+    const recordRows = records.length ? records.map(k => `
+      <view class="record-row">
+        <view class="record-head">
+          <text class="record-key">${esc(k.key)}</text>
+          <text class="record-type ${k.type === 'admin' ? 'tag-admin' : 'tag-temp'}">${k.type === 'admin' ? '管理员许可' : '临时许可'}</text>
+          <text class="record-status">${esc(keyStatusMap[k.status] || k.status)}</text>
+        </view>
+        <view class="record-line"><text class="record-label">创建时间</text><text class="record-value">${esc(k.created_at || '—')}</text></view>
+        <view class="record-line"><text class="record-label">使用时间</text><text class="record-value">${esc(k.used_at || '—')}</text></view>
+        <view class="record-line"><text class="record-label">到期时间</text><text class="record-value">${esc(k.expires_at || '—')}</text></view>
+        <view class="record-line"><text class="record-label">关联订单</text><text class="record-value">${k.order_id ? ('订单 #' + k.order_id) : '空订单（有效期内未提交任务）'}</text></view>
+      </view>`).join('') : '<view class="records-empty">无密钥记录</view>';
+    return `
+      <view class="user-card-item">
+        <view class="user-card-main" data-user-openid="${escHtml(u.openid)}" data-user-nickname="${escHtml(u.nickname || '')}">
+          <view class="user-avatar-circle">
+            ${avatarUrl ? `<img class="user-avatar-img" src="${avatarUrl}" alt="头像">` : `<text class="user-avatar-char">${esc(avatarChar)}</text>`}
+          </view>
+          <view class="user-card-center">
+            <text class="user-card-name">${esc(u.nickname || '未知用户')}</text>
+            <view class="user-card-tags">
+              ${typeCls ? `<text class="key-type-tag ${typeCls}">${licenseTypeLabel}</text>` : ''}
+              <text class="status-tag status-${esc(u.status)}">${esc(statusLabel)}</text>
+            </view>
+            <text class="user-card-id">ID: ${esc(u.openid_short || u.openid)}</text>
+          </view>
+          <view class="user-card-right">
+            <view class="user-stat"><text class="user-stat-num">${u.order_count || 0}</text><text class="user-stat-label">个订单</text></view>
+            ${u.last_order ? `<text class="user-card-last">最近: ${esc(u.last_order)}</text>` : ''}
+            <text class="role-btn-arrow">›</text>
+          </view>
+        </view>
+        <view class="records-toggle" data-toggle-records="${escHtml(u.openid)}">
+          <text class="records-toggle-text">密钥记录 (${records.length})</text>
+          <text class="records-toggle-arrow ${u._expanded ? 'arrow-up' : ''}">›</text>
+        </view>
+        <view class="records-panel ${u._expanded ? 'records-expanded' : ''}">
+          <view class="detail-divider"></view>
+          ${recordRows}
+        </view>
+      </view>`;
+  }).join('') + '</view>';
+  list.innerHTML = html;
+}
+
+function toggleAuthorizedUser(openid) {
+  const u = meState.authorizedUsers.find(x => x.openid === openid);
+  if (u) { u._expanded = !u._expanded; renderAuthorizedUsers(); }
+}
+
+/* ================= 子视图：用户订单 / 本地任务 ================= */
+
+function openUserOrdersView(opts) {
+  opts = opts || {};
+  stopUserOrdersPolling();
+  meState.userOrdersView = {
+    openid: opts.openid || '',
+    nickname: opts.nickname || '',
+    source: opts.source || '',
+    orders: [],
+    page: 1, perPage: 10, total: 0, totalPages: 0, expanded: {},
+    userDetail: null, loading: true,
+    showLicenseDetail: false, showPageSizePicker: false,
+  };
+  const title = opts.source === 'local' ? '本地打印任务' : (opts.nickname ? opts.nickname + ' 的任务' : '订单列表');
+  document.getElementById('userOrdersTitle').textContent = title;
+  document.getElementById('userOrdersUserCard').style.display = 'none';
+  document.getElementById('uoLicenseDetail').classList.remove('license-detail-expanded');
+  document.getElementById('userOrdersPager').style.display = 'none';
+  document.getElementById('userOrdersPagerBottom').style.display = 'none';
+  document.getElementById('userOrdersSummary').style.display = 'none';
+  document.getElementById('userOrdersEndHint').style.display = 'none';
+  showView('view-user-orders', title);
+  loadUserOrders();
+}
+
+async function loadUserOrders(silent) {
+  const v = meState.userOrdersView;
+  const list = document.getElementById('userOrdersList');
+  if (!silent) {
+    v.loading = true;
+    list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
+  }
+  try {
+    let url = '/api/orders?page=' + v.page + '&per_page=' + v.perPage;
+    if (v.source === 'local') url += '&source=local';
+    else if (v.openid) url += '&openid=' + encodeURIComponent(v.openid);
+    const r = await api(url);
+    if (r.status === 200 && r.data && r.data.success) {
+      v.orders = (r.data.orders || []).map(normalizeOrder);
+      v.total = r.data.total || 0;
+      v.totalPages = Math.ceil(v.total / v.perPage);
+      if (v.page > v.totalPages && v.totalPages > 0) v.page = v.totalPages;
+      renderUserOrders();
+    } else if (!silent) list.innerHTML = '<view class="status-box"><text class="status-text">加载失败</text></view>';
+    if (v.openid && !v.userDetail) {
+      const d = await api('/api/admin/user_detail?openid=' + encodeURIComponent(v.openid)).catch(() => null);
+      if (d && d.data && d.data.success) {
+        v.userDetail = d.data;
+        renderUserOrdersUserCard();
+      }
+    }
+  } catch (e) {
+    if (!silent) list.innerHTML = '<view class="status-box"><text class="status-text">网络错误</text></view>';
+  }
+  v.loading = false;
+  startUserOrdersPolling();
+  measureAll(150);
+}
+
+function renderUserOrders() {
+  const v = meState.userOrdersView;
+  const list = document.getElementById('userOrdersList');
+  if (v.loading && !v.orders.length) {
+    list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
+  } else if (!v.orders.length) {
+    list.innerHTML = `
+      <view class="empty-state">
+        <view class="empty-illustration"><text class="empty-icon">📋</text></view>
+        <text class="empty-title">暂无任务</text>
+        <text class="empty-desc">${v.source === 'local' ? '还没有本地打印任务记录' : '该用户还没有发起过打印任务'}</text>
+      </view>`;
+  } else {
+    list.innerHTML = v.orders.map(o => orderCardHTML(o, !!v.expanded[o.id])).join('');
+  }
+  // 每页条数下拉
+  syncUserOrdersPageSizePicker();
+  // 页码（顶/底）
+  const nums = buildUserOrdersPageNumbers();
+  document.getElementById('userOrdersPageNumbers').innerHTML = nums;
+  document.getElementById('userOrdersPageNumbersBottom').innerHTML = nums;
+  document.getElementById('userOrdersPrev').classList.toggle('page-btn-disabled', v.page <= 1);
+  document.getElementById('userOrdersNext').classList.toggle('page-btn-disabled', v.page >= v.totalPages);
+  document.getElementById('userOrdersPrevBottom').classList.toggle('page-btn-disabled', v.page <= 1);
+  document.getElementById('userOrdersNextBottom').classList.toggle('page-btn-disabled', v.page >= v.totalPages);
+  document.getElementById('userOrdersPager').style.display = v.totalPages > 0 ? '' : 'none';
+  document.getElementById('userOrdersPagerBottom').style.display = v.totalPages > 1 ? '' : 'none';
+  // 总览
+  const summary = document.getElementById('userOrdersSummary');
+  if (v.total > 0) {
+    summary.style.display = '';
+    document.getElementById('userOrdersSummaryText').textContent = `共 ${v.total} 个订单，当前第 ${v.page}/${v.totalPages} 页`;
+  } else summary.style.display = 'none';
+  // 最后一页提示
+  document.getElementById('userOrdersEndHint').style.display = (v.totalPages > 0 && v.page >= v.totalPages) ? '' : 'none';
+  measureAll(150);
+}
+
+function syncUserOrdersPageSizePicker() {
+  const v = meState.userOrdersView;
+  document.getElementById('uoPageSizeText').textContent = v.perPage + '条/页';
+  document.getElementById('uoPageSizeDropdown').classList.toggle('dropdown-show', v.showPageSizePicker);
+  document.getElementById('uoPageSizeArrow').classList.toggle('arrow-up', v.showPageSizePicker);
+  document.querySelectorAll('#uoPageSizeDropdown .page-size-option').forEach(opt => {
+    opt.classList.toggle('option-active', parseInt(opt.dataset.size, 10) === v.perPage);
+  });
+}
+
+function renderUserOrdersUserCard() {
+  const v = meState.userOrdersView;
+  const d = v.userDetail;
+  const card = document.getElementById('userOrdersUserCard');
+  if (!d) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const img = document.getElementById('uoAvatarImg');
+  const char = document.getElementById('uoAvatarChar');
+  if (d.avatar_url) {
+    img.src = escHtml(d.avatar_url) + '?t=' + Date.now();
+    img.style.display = '';
+    char.style.display = 'none';
+  } else {
+    img.style.display = 'none';
+    char.style.display = '';
+    char.textContent = esc((d.nickname || '?')[0]);
+  }
+  document.getElementById('uoNickname').textContent = d.nickname || '未知用户';
+  document.getElementById('uoRole').textContent = d.is_super ? '超级管理员'
+    : d.role === 'admin' ? '管理员' : d.role === 'user' ? '普通用户' : '访客';
+  const li = d.license_info;
+  const badge = document.getElementById('uoLicenseBadge');
+  const detail = document.getElementById('uoLicenseDetail');
+  if (li) {
+    const permanent = d.role === 'admin' || li.type === 'admin';
+    badge.style.display = '';
+    badge.className = 'license-badge ' + (permanent ? 'license-badge-admin' : li.expired ? 'license-badge-expired' : 'license-badge-temp');
+    document.getElementById('uoLicenseKey').textContent = li.key;
+    document.getElementById('uoLicenseValidity').textContent = permanent ? '永久' : (li.expired ? '已过期' : '临时授权');
+    document.getElementById('uoLicenseStatus').textContent = permanent ? '永久' : (li.expired ? '已过期' : '有效');
+    document.getElementById('uoLicenseKeyFull').textContent = li.key || '—';
+    document.getElementById('uoLicenseType').textContent = li.type === 'admin' ? '管理员许可' : '临时许可';
+    document.getElementById('uoLicenseCreator').textContent = li.creator_nickname || '—';
+    document.getElementById('uoLicenseCreated').textContent = li.created_at || '—';
+    document.getElementById('uoLicenseUsed').textContent = li.used_at || '—';
+    document.getElementById('uoLicenseExpires').textContent = li.expires_at || '—';
+    document.getElementById('uoLicenseValidityDetail').textContent = li.validity_minutes ? li.validity_minutes + ' 分钟' : '—';
+  } else {
+    badge.style.display = 'none';
+    detail.classList.remove('license-detail-expanded');
+  }
+}
+
+function buildUserOrdersPageNumbers() {
+  const total = meState.userOrdersView.totalPages;
+  const current = meState.userOrdersView.page;
+  if (total <= 1) return '';
+  const pages = [];
+  if (total <= 7) { for (let i = 1; i <= total; i++) pages.push(i); }
+  else {
+    pages.push(1);
+    if (current > 3) pages.push('...');
+    for (let i = Math.max(2, current - 1); i <= Math.min(total - 1, current + 1); i++) pages.push(i);
+    if (current < total - 2) pages.push('...');
+    pages.push(total);
+  }
+  return pages.map(p => {
+    if (p === '...') return '<view class="page-ellipsis">…</view>';
+    return `<view class="page-num ${p === current ? 'page-num-active' : ''}" data-page-num="${p}">${p}</view>`;
+  }).join('');
+}
+
+function changeUserOrdersPage(page) {
+  const v = meState.userOrdersView;
+  if (page < 1 || page > v.totalPages || page === v.page) return;
+  v.page = page;
+  loadUserOrders();
+  const sc = document.querySelector('#view-user-orders .scroller');
+  if (sc) sc.scrollTop = 0;
+}
+
+function toggleUserOrdersOrder(id) {
+  const v = meState.userOrdersView;
+  if (v.expanded[id]) delete v.expanded[id];
+  else v.expanded[id] = true;
+  // 原地切换类名让 CSS 过渡播放（与"我的打印任务"一致）
+  const card = document.querySelector('#userOrdersList [data-order-id="' + id + '"]');
+  if (card) {
+    const expanded = !!v.expanded[id];
+    card.classList.toggle('order-expanded', expanded);
+    const detail = card.querySelector('.order-card-detail');
+    if (detail) detail.classList.toggle('detail-expanded', expanded);
+    const arrow = card.querySelector('.order-arrow');
+    if (arrow) arrow.classList.toggle('arrow-up', expanded);
+  }
+  measureAll(150);
+}
+
+// 选择条数后滚动回订单列表顶部（对齐小程序 _scrollToOrdersSection）
+function scrollUserOrdersToTop() {
+  const sc = document.querySelector('#view-user-orders .scroller');
+  const section = document.querySelector('#view-user-orders .orders-section');
+  if (!sc || !section) return;
+  // 内容不足一屏：不滚动，保持原位
+  if (sc.scrollHeight <= sc.clientHeight) return;
+  const top = section.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop;
+  sc.scrollTop = Math.max(0, top - 12);
+}
+
+let _userOrdersPollTimer = null;
+
+function startUserOrdersPolling() {
+  if (!meState.userOrdersView || _userOrdersPollTimer) return;
+  _userOrdersPollTimer = setInterval(() => {
+    const view = document.getElementById('view-user-orders');
+    if (!view || view.style.display === 'none') { stopUserOrdersPolling(); return; }
+    loadUserOrders(true);
+  }, 10000);
+}
+
+function stopUserOrdersPolling() {
+  if (_userOrdersPollTimer) {
+    clearInterval(_userOrdersPollTimer);
+    _userOrdersPollTimer = null;
+  }
+}
+
+/* ================= 启动 ================= */
+
+window.addEventListener('pagehide', () => { stopOrderPolling(); stopUserOrdersPolling(); stopKeyPolling(); stopTempCountdown(); });
