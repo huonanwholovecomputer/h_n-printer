@@ -21,6 +21,7 @@ from urllib import request as urlrequest, parse as urlparse
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, g, request, jsonify, send_file
 from flask_socketio import SocketIO, emit, disconnect, join_room
+from flask_cors import CORS
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 try:
@@ -33,6 +34,11 @@ except ImportError:
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 最大上传 50MB
+# HTTP CORS：桌面浏览器预览（file:// 或 localhost）与 Capacitor WebView（https://localhost）
+# 均需跨域访问 /api/*。认证走 Bearer token（非 Cookie），放行任意 Origin 无越权风险，
+# 与下方 SocketIO 的 cors_allowed_origins="*" 保持一致。只配此一层即可，nginx 不要再加
+# Access-Control-* 头，避免出现重复头。
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DATABASE = "orders.db"
@@ -1190,7 +1196,7 @@ def next_order_number():
         conn.execute(
             """INSERT INTO orders (file, copies, status, created_at, openid, order_number, source)
                VALUES (?, 1, 'reserved', ?, 'local', ?, 'local')""",
-            ("(等待打印)", created_at, order_number),
+            ("（预留位置）", created_at, order_number),
         )
         conn.commit()
     except Exception:
