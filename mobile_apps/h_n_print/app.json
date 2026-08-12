@@ -3,7 +3,8 @@
     "pages/index/index",
     "pages/me/me",
     "pages/authorized-users/authorized-users",
-    "pages/user-orders/user-orders"
+    "pages/user-orders/user-orders",
+    "pages/bind/bind"
   ],
   "window": {
     "navigationBarTextStyle": "black",

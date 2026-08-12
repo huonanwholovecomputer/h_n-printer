@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..', '..');
 const MP = (p) => resolve(ROOT, 'h_n_print', p);
-const APP = (p) => resolve(ROOT, 'android_app', p);
+const APP = (p) => resolve(ROOT, 'android_app', 'www', p);
 const OUT = process.argv[2] || resolve('C:/Users/Administrator/.codex/visualizations/2026/08/12/019ff495-9242-7a43-b9b1-45125c7cb2f9/ui-sync-report.md');
 
 const PAGES = [

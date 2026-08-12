@@ -36,6 +36,8 @@ Component({
     ordersPerPage: 10,
     ordersTotal: 0,
     ordersTotalPages: 0,
+    // 页码数组（预计算进 data，避免 WXML 内调用方法 + wx:key="*this" 在部分基础库下渲染失败）
+    ordersPageNumbers: [],
     pageOptions: [10, 20, 50, 100],
     showPageSizePicker: false,
     pageSizeDropdownLeft: 0,   // 分页下拉 fixed 定位（viewport 坐标）
@@ -70,6 +72,8 @@ Component({
     tempUserDeleteOpacity: {},     // { openid: 0~1 }
     redeemKey: '',
     redeeming: false,
+    // 账号绑定入口（管理功能在独立页面 pages/bind/bind，这里只显示已绑定设备数）
+    bindDeviceCount: 0,
     // 临时授权倒计时
     tempUntil: '',
     tempCountdownText: '',
@@ -206,6 +210,7 @@ Component({
         const tabFrom = wx.getStorageSync('_tabFrom')
         const returnFromSub = wx.getStorageSync('_meReturnFromSub')
         wx.removeStorageSync('_meReturnFromSub')
+        if (returnFromSub) this.loadBindDeviceCount()  // 从绑定管理页返回时刷新入口副标题
         const isFirstLaunch = (tabFrom == null || tabFrom === '')
         let animationClass = ''
         if (returnFromSub) {
@@ -228,6 +233,7 @@ Component({
         this.loadUserRole()
         this.loadOrders()
         this.loadProfile()
+        this.loadBindDeviceCount()
         const cachedRole = wx.getStorageSync('userRole')
         if (cachedRole === 'admin') {
           this.loadTempUsers()
@@ -1229,9 +1235,8 @@ Component({
       const idx = e.currentTarget.dataset.idx
       const t = e.touches[0]
       if (!t || idx == null) return
-      // 已使用的密钥是授权记录，不可删除 → 不响应左滑
       const k = this.data.activeKeys[idx]
-      if (!k || k.status !== 'unused') return
+      if (!k) return
       this._keySwipeIdx = idx
       this._keySwipeStartX = t.clientX
       this._keySwipeStartY = t.clientY
@@ -1339,11 +1344,6 @@ Component({
       const idx = e.currentTarget.dataset.idx
       const k = this.data.activeKeys[idx]
       if (!k) return
-      // 已使用的密钥是授权记录，不可删除（记录永久保留）
-      if (k.status !== 'unused') {
-        wx.showToast({ title: '已使用密钥为授权记录，不可删除', icon: 'none' })
-        return
-      }
       const token = wx.getStorageSync('token')
       if (!token) return
       const isUsed = k.status !== 'unused'
@@ -1414,6 +1414,28 @@ Component({
       wx.setClipboardData({
         data: text,
         success: () => wx.showToast({ title: '已复制到剪贴板', icon: 'success' })
+      })
+    },
+
+    // ==================== 账号绑定入口（管理功能在独立页面 pages/bind/bind） ====================
+
+    onGoBindPage() {
+      this._navigateWithAnimation('/pages/bind/bind')
+    },
+
+    // 拉取已绑定设备数，用于入口副标题展示
+    loadBindDeviceCount() {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      request({
+        url: CONFIG.BASE_URL + '/api/bind/devices',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        success: (res) => {
+          if (!res.data || !res.data.success) return
+          this.setData({ bindDeviceCount: (res.data.devices || []).length })
+        },
+        fail: () => {}
       })
     },
 
@@ -2255,6 +2277,7 @@ Component({
               expandedOrders: {},
               ordersAnimated: firstLoad,
             }, () => {
+              this._syncOrdersPageNumbers()
               this._scheduleMeasure()
               if (typeof cb === 'function') cb()
             })
@@ -2283,6 +2306,7 @@ Component({
       const page = parseInt(e.currentTarget.dataset.page, 10)
       if (page < 1 || page > this.data.ordersTotalPages || page === this.data.ordersCurrentPage) return
       this.setData({ ordersCurrentPage: page }, () => {
+        this._syncOrdersPageNumbers()
         this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
@@ -2290,6 +2314,7 @@ Component({
     onOrdersPrevPage() {
       if (this.data.ordersCurrentPage <= 1) return
       this.setData({ ordersCurrentPage: this.data.ordersCurrentPage - 1 }, () => {
+        this._syncOrdersPageNumbers()
         this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
@@ -2297,6 +2322,7 @@ Component({
     onOrdersNextPage() {
       if (this.data.ordersCurrentPage >= this.data.ordersTotalPages) return
       this.setData({ ordersCurrentPage: this.data.ordersCurrentPage + 1 }, () => {
+        this._syncOrdersPageNumbers()
         this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
@@ -2335,6 +2361,7 @@ Component({
         ordersCurrentPage: 1,
         showPageSizePicker: false,
       }, () => {
+        this._syncOrdersPageNumbers()
         this.loadOrders(() => this._scrollToOrdersSection())
       })
     },
@@ -2420,6 +2447,15 @@ Component({
       if (current < total - 2) pages.push('...')
       pages.push(total)
       return pages
+    },
+
+    // 将页码数组同步到 data（供 WXML wx:for 使用，规避方法调用绑定在部分基础库下的渲染问题）
+    _syncOrdersPageNumbers() {
+      const pages = this.getOrdersPageNumbers()
+      const prev = this.data.ordersPageNumbers || []
+      if (pages.length !== prev.length || pages.some((p, i) => p !== prev[i])) {
+        this.setData({ ordersPageNumbers: pages })
+      }
     },
 
     onOrderTap(e) {

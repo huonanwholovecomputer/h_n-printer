@@ -105,7 +105,7 @@
         <view class="page-nav">
           <view class="page-btn {{currentPage <= 1 ? 'page-btn-disabled' : ''}}"
                 bindtap="onPrevPage" hover-class="tap-active">‹</view>
-          <block wx:for="{{getPageNumbers()}}" wx:key="*this">
+          <block wx:for="{{pageNumbers}}" wx:key="index">
             <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
             <view wx:else
                   class="page-num {{currentPage === item ? 'page-num-active' : ''}}"
@@ -241,7 +241,7 @@
         <view class="page-nav">
           <view class="page-btn {{currentPage <= 1 ? 'page-btn-disabled' : ''}}"
                 bindtap="onPrevPage" hover-class="tap-active">‹</view>
-          <block wx:for="{{getPageNumbers()}}" wx:key="*this">
+          <block wx:for="{{pageNumbers}}" wx:key="index">
             <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
             <view wx:else
                   class="page-num {{currentPage === item ? 'page-num-active' : ''}}"

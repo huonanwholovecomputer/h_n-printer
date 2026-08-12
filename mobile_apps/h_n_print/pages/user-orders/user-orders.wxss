@@ -319,6 +319,8 @@
   display: flex;
   align-items: center;
   gap: 4rpx;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .page-btn, .page-num {

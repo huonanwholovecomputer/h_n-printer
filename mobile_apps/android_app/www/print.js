@@ -917,7 +917,13 @@ function renderExtParams() {
      </view>`).join('');
   document.getElementById('deliveryLocationValue').textContent = printState.deliveryLocation;
   document.getElementById('deliverySwitch').classList.toggle('switch-on', printState.deliveryEnabled);
-  document.getElementById('deliveryOptions').style.display = printState.deliveryEnabled ? '' : 'none';
+  // 派送地点列表的展开由 .delivery-collapse.delivery-open 控制（max-height 过渡），
+  // 只改 style.display 会被 max-height:0 继续折叠 —— 必须同步切换类名。
+  const deliveryOptions = document.getElementById('deliveryOptions');
+  if (deliveryOptions) {
+    deliveryOptions.classList.toggle('delivery-open', printState.deliveryEnabled);
+    deliveryOptions.style.display = '';
+  }
   updateCoverPrice();
   measureAll(150);
 }
@@ -1512,6 +1518,8 @@ function doSubmit(skipPageValidation) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       client_request_id: Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
+      // 发起端标记：APP（后端写入 orders.source，统计页区分下单渠道）
+      client: 'app',
       duplex: 'on',
       files: filesPayload,
       delivery_enabled: printState.deliveryEnabled ? 1 : 0,

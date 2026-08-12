@@ -1,0 +1,16 @@
+{
+  "name": "hn-cloud-print-android",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "sync": "cap sync android",
+    "build:apk": "cd android && gradlew.bat assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/android": "6.0.0",
+    "@capacitor/core": "6.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "6.0.0"
+  }
+}

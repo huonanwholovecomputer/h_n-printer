@@ -932,12 +932,6 @@ page {
 .theme-dark .status-canceled { background-color: rgba(174, 174, 178, 0.15); color: #AEAEB2; }
 .theme-dark .status-delivered { background-color: rgba(129, 199, 132, 0.15); color: #81C784; }
 
-/* 深色模式：key drawer locked */
-.theme-dark .key-card-wrap.key-drawer-locked .key-card {
-  background: var(--bg-card);
-  opacity: 0.55;
-}
-
 /* 深色模式：detail file row — glass */
 .theme-dark .detail-file-row {
   background: var(--glass-regular);

@@ -1,0 +1,251 @@
+/** bind.wxss — 账号绑定管理页（风格对齐 me / authorized-users） */
+
+.scrollarea {
+  height: 100vh;
+  background-color: var(--bg-primary);
+}
+
+.container {
+  padding: 20rpx 32rpx;
+  padding-bottom: calc(60rpx + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+}
+
+.bind-intro {
+  margin-bottom: 20rpx;
+}
+
+.bind-intro-text {
+  font-size: 24rpx;
+  line-height: 1.6;
+  color: var(--text-tertiary);
+}
+
+/* ── Status / Empty ── */
+.status-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 120rpx 0;
+}
+
+.status-text {
+  font-size: 26rpx;
+  color: var(--text-tertiary);
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 100rpx 0;
+}
+
+.empty-illustration {
+  margin-bottom: 24rpx;
+}
+
+.empty-icon {
+  font-size: 80rpx;
+}
+
+.empty-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 12rpx;
+}
+
+.empty-desc {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  text-align: center;
+  line-height: 1.6;
+  max-width: 480rpx;
+}
+
+/* ── Section / Card ── */
+.license-section {
+  margin-bottom: 20rpx;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  padding: 16rpx 0 16rpx 8rpx;
+  gap: 12rpx;
+}
+
+.section-bar {
+  width: 6rpx;
+  height: 26rpx;
+  background-color: var(--blue);
+  border-radius: 3rpx;
+}
+
+.section-title text:first-of-type {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.order-count {
+  margin-left: 10rpx;
+  font-size: 20rpx;
+  font-weight: 600;
+  color: #fff;
+  background-color: var(--blue);
+  padding: 3rpx 14rpx;
+  border-radius: 20rpx;
+}
+
+.license-card {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 28rpx;
+  text-align: left;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: 1rpx solid var(--separator);
+  transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, border-color 0.4s ease;
+}
+
+.redeem-desc {
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+  margin-bottom: 18rpx;
+  display: block;
+  line-height: 1.6;
+}
+
+.generate-btn {
+  width: 100%;
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.88) 0%,
+    rgba(0, 105, 220, 0.94) 100%);
+  color: #fff;
+  font-size: 26rpx;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  padding: 20rpx 0;
+  border: none;
+  box-shadow:
+    0 2rpx 10rpx rgba(0, 122, 255, 0.2),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.3);
+  transition: transform 0.06s ease, box-shadow 0.06s ease, filter 0.06s ease;
+}
+.generate-btn:active {
+  transform: scale(0.97);
+  filter: brightness(1.1);
+}
+.generate-btn[disabled] {
+  opacity: 0.4;
+}
+
+.copy-btn {
+  font-size: 22rpx;
+  font-weight: 500;
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+  border-radius: var(--radius-sm);
+  padding: 10rpx 32rpx;
+  margin: 0;
+  border: none;
+  transition: transform 0.06s ease;
+}
+.copy-btn:active {
+  background-color: rgba(0, 122, 255, 0.15);
+}
+
+.countdown-expired {
+  color: var(--text-quaternary) !important;
+}
+
+/* ── 绑定密钥展示 ── */
+.bind-key-box {
+  margin-top: 18rpx;
+  padding: 18rpx 20rpx;
+  border-radius: var(--radius-sm);
+  background-color: rgba(0, 122, 255, 0.06);
+  border: 1rpx solid rgba(0, 122, 255, 0.14);
+}
+.bind-key-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  margin-bottom: 14rpx;
+}
+.bind-key-value {
+  font-size: 40rpx;
+  font-weight: 700;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  letter-spacing: 6rpx;
+}
+.bind-key-countdown {
+  font-size: 26rpx;
+  font-weight: 600;
+  color: var(--orange);
+  font-family: var(--font-mono);
+}
+
+/* ── 已绑定设备列表 ── */
+.bind-device-list {
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1rpx solid var(--separator);
+}
+.bind-device-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 22rpx 24rpx;
+  background-color: var(--bg-card);
+  border-bottom: 1rpx solid var(--separator);
+}
+.bind-device-item:last-child {
+  border-bottom: none;
+}
+.bind-device-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+  min-width: 0;
+}
+.bind-device-name {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.bind-device-time {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+}
+.bind-device-actions {
+  display: flex;
+  align-items: center;
+  gap: 12rpx;
+  flex-shrink: 0;
+  margin-left: 16rpx;
+}
+.bind-device-btn {
+  flex-shrink: 0;
+  font-size: 24rpx;
+  padding: 10rpx 22rpx;
+  border-radius: var(--radius-sm);
+  transition: transform 0.06s ease, background-color 0.15s ease;
+}
+.bind-device-btn:active {
+  transform: scale(0.96);
+}
+.bind-device-rename {
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+}
+.bind-device-unbind {
+  color: var(--red);
+  background-color: rgba(255, 59, 48, 0.08);
+}

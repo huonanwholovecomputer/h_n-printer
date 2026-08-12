@@ -2661,6 +2661,8 @@ Component({
         data: {
           // 幂等键：后端按 client_request_id 对同一用户 10 分钟内去重（防提交失败重试造成重复订单）
           client_request_id: Date.now().toString(36) + Math.random().toString(36).slice(2, 10),
+          // 发起端标记：小程序（后端写入 orders.source，统计页区分下单渠道）
+          client: 'wechat',
           duplex: this.data.duplex,
           files: filesPayload,
           // v5: 附加服务参数

@@ -1,0 +1,64 @@
+<!--pages/bind/bind.wxml — 账号绑定管理（低频功能独立页面）-->
+<page-meta></page-meta>
+<navigation-bar title="账号绑定" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
+<view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
+<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
+
+<scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
+  <view class="container">
+    <view class="bind-intro">
+      <text class="bind-intro-text">生成一次性绑定密钥，在 APP 端「绑定微信账号」中填写。绑定后该 APP 将以本账号身份发起任务（权限与小程序一致），订单按 APP 来源统计。</text>
+    </view>
+
+    <!-- 生成绑定密钥 -->
+    <view class="license-section">
+      <view class="section-title">
+        <view class="section-bar"></view>
+        <text>生成绑定密钥</text>
+      </view>
+      <view class="license-card">
+        <text class="redeem-desc">密钥 10 分钟内有效、仅可使用一次；同一账号最多绑定 3 台设备。</text>
+        <button class="generate-btn" bindtap="onGenerateBindKey" loading="{{generatingBindKey}}" disabled="{{generatingBindKey}}">生成绑定密钥</button>
+        <view wx:if="{{bindKey}}" class="bind-key-box">
+          <view class="bind-key-row">
+            <text class="bind-key-value">{{bindKey}}</text>
+            <text class="bind-key-countdown {{bindKeyCountdownText === '已过期' ? 'countdown-expired' : ''}}">{{bindKeyCountdownText || '--:--'}}</text>
+          </view>
+          <button class="copy-btn" bindtap="onCopyBindKey" hover-class="tap-active">复制</button>
+        </view>
+      </view>
+    </view>
+
+    <!-- 已绑定设备 -->
+    <view class="license-section">
+      <view class="section-title">
+        <view class="section-bar"></view>
+        <text>已绑定设备</text>
+        <text wx:if="{{devices.length > 0}}" class="order-count">{{devices.length}}</text>
+      </view>
+      <view wx:if="{{loading && devices.length === 0}}" class="status-box">
+        <text class="status-text">加载中...</text>
+      </view>
+      <view wx:elif="{{devices.length === 0}}" class="empty-state">
+        <view class="empty-illustration">
+          <text class="empty-icon">📱</text>
+        </view>
+        <text class="empty-title">暂无绑定设备</text>
+        <text class="empty-desc">在 APP 端填写上方密钥后，设备会出现在这里</text>
+      </view>
+      <view wx:else class="bind-device-list">
+        <view wx:for="{{devices}}" wx:key="dev_openid" class="bind-device-item">
+          <view class="bind-device-info">
+            <text class="bind-device-name">{{item.nickname || '手机设备'}}</text>
+            <text class="bind-device-time">绑定于 {{item.used_at}}</text>
+          </view>
+          <view class="bind-device-actions">
+            <view class="bind-device-btn bind-device-rename" bindtap="onRenameDevice" data-dev-openid="{{item.dev_openid}}" data-nickname="{{item.nickname}}" hover-class="tap-active">重命名</view>
+            <view class="bind-device-btn bind-device-unbind" bindtap="onUnbindDevice" data-dev-openid="{{item.dev_openid}}" hover-class="tap-active">解除</view>
+          </view>
+        </view>
+      </view>
+    </view>
+  </view>
+</scroll-view>
+</view>

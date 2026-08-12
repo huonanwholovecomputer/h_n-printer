@@ -9,6 +9,8 @@ const BASE_URL = localStorage.getItem('hn_base_url') || DEFAULT_BASE_URL;
 const state = {
   token: localStorage.getItem('hn_token') || '',
   openid: localStorage.getItem('hn_openid') || '',
+  // 设备账号（dev_ 前缀）：绑定微信账号后 token 变成微信 openid，devOpenid 保留用于解绑回退
+  devOpenid: localStorage.getItem('hn_dev_openid') || '',
   role: localStorage.getItem('hn_role') || 'guest',
   isSuperAdmin: localStorage.getItem('hn_is_super') === '1',
   nickname: localStorage.getItem('hn_nickname') || '',
@@ -70,8 +72,17 @@ async function refreshToken() {
 function setAuth(token, openid) {
   state.token = token;
   state.openid = openid || '';
+  if (state.openid && state.openid.indexOf('dev_') === 0 && !state.devOpenid) {
+    state.devOpenid = state.openid;
+    localStorage.setItem('hn_dev_openid', state.openid);
+  }
   localStorage.setItem('hn_token', token);
   localStorage.setItem('hn_openid', state.openid);
+}
+
+// 是否已绑定微信账号：当前 token 是微信 openid，且与本地设备账号不同
+function isBound() {
+  return !!(state.devOpenid && state.openid && state.openid !== state.devOpenid);
 }
 
 async function ensureLogin() {
@@ -131,11 +142,24 @@ function effectiveDark(mode) {
   return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
+function applyNativeSafeArea() {
+  const b = window.AndroidBars;
+  if (!b) return;
+  document.documentElement.style.setProperty('--safe-top', (b.getStatusBarHeight() || 0) + 'px');
+  document.documentElement.style.setProperty('--safe-bottom', (b.getNavigationBarHeight() || 0) + 'px');
+}
+
+function syncNativeStatusBar(dark) {
+  const b = window.AndroidBars;
+  if (b && b.setDark) b.setDark(dark);
+}
+
 function applyTheme(mode, opts) {
   opts = opts || {};
   state.themeMode = mode;
   localStorage.setItem('hn_theme_mode', mode);
   const dark = effectiveDark(mode);
+  syncNativeStatusBar(dark);
   // 深色类同时挂到 body（变量级联）、背景层与所有 modal-mask
   document.body.classList.toggle('theme-dark', dark);
   document.body.classList.toggle('dark', dark);
@@ -845,7 +869,9 @@ function initApp() {
   positionThemeToggle();
   updateThemeToggleVisibility();
   window.addEventListener('resize', positionThemeToggle);
+  window.addEventListener('resize', applyNativeSafeArea);
   applyTheme(state.themeMode, { skipServer: true });
+  applyNativeSafeArea();
   if (window.matchMedia) {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
       if (state.themeMode === 'auto') applyTheme('auto', { skipServer: true });

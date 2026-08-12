@@ -986,12 +986,6 @@ body {
 .theme-dark .status-canceled { background-color: rgba(174, 174, 178, 0.15); color: #AEAEB2; }
 .theme-dark .status-delivered { background-color: rgba(129, 199, 132, 0.15); color: #81C784; }
 
-/* 深色模式：key drawer locked */
-.theme-dark .key-card-wrap.key-drawer-locked .key-card {
-  background: var(--bg-card);
-  opacity: 0.55;
-}
-
 /* 深色模式：detail file row — glass */
 .theme-dark .detail-file-row {
   background: var(--glass-regular);
@@ -3298,9 +3292,81 @@ picker-view-column {
   color: var(--text-primary);
 }
 
+.role-btn-text-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5333cqw;
+  min-width: 0;
+}
+.role-btn-text-wrap .role-btn-text {
+  flex: none;
+}
+.role-btn-desc {
+  font-size: 2.6667cqw;
+  color: var(--text-quaternary);
+  line-height: 1.4;
+}
+
 .role-btn-arrow {
   font-size: 4.2667cqw;
   color: var(--text-quaternary);
+}
+
+/* ── 账号绑定：已绑定设备列表 ── */
+.bind-device-list {
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  border: 1px solid var(--separator);
+}
+.bind-device-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2.6667cqw;
+  padding: 2.9333cqw 3.2cqw;
+  background-color: var(--bg-card);
+  border-bottom: 1px solid var(--separator);
+}
+.bind-device-item:last-child {
+  border-bottom: none;
+}
+.bind-device-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5333cqw;
+  min-width: 0;
+}
+.bind-device-name {
+  font-size: 3.7333cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.bind-device-time {
+  font-size: 2.9333cqw;
+  color: var(--text-quaternary);
+}
+.bind-device-actions {
+  display: flex;
+  align-items: center;
+  gap: 1.0667cqw;
+  flex-shrink: 0;
+  margin-left: 1.6cqw;
+}
+.bind-device-btn {
+  flex-shrink: 0;
+  font-size: 3.2cqw;
+  padding: 1.3333cqw 2.9333cqw;
+  border-radius: var(--radius-sm);
+  border: none;
+}
+.bind-device-rename {
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.08);
+}
+.bind-device-unbind {
+  color: var(--red);
+  background-color: rgba(255, 59, 48, 0.08);
 }
 
 /* ═══════════════ Cards (generic) ═══════════════ */
@@ -3595,13 +3661,8 @@ picker-view-column {
   background-color: rgba(52, 199, 89, 0.08) !important;
 }
 
-/* Expired / locked states */
+/* Expired state */
 .key-card-wrap.key-drawer-expired .key-value { color: var(--text-quaternary); }
-.key-card-wrap.key-drawer-locked .key-card {
-  background: var(--bg-card);
-  opacity: 0.55;
-}
-.key-card-wrap.key-drawer-locked .key-value { color: var(--gray); }
 
 /* User info in key drawer */
 .key-user-info {
@@ -4611,6 +4672,15 @@ picker-view-column {
   gap: 0.5333cqw;
 }
 
+/* 页码容器：页码为 <view>（块级），必须显式 flex 才会横向排布 */
+.page-numbers {
+  display: flex;
+  align-items: center;
+  gap: 0.5333cqw;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
 .page-btn, .page-num {
   min-width: 6.9333cqw;
   height: 6.9333cqw;
@@ -4877,10 +4947,7 @@ picker-view-column {
 }#view-authorized .tag-temp {
   color: #FF9500;
   background-color: rgba(255, 149, 0, 0.10);
-}#view-authorized .tag-both {
-  color: #7B1FA2;
-  background-color: rgba(123, 31, 162, 0.08);
-}#view-authorized .status-permanent { color: #2E7D32; background-color: rgba(46, 125, 50, 0.08); }#view-authorized .status-active { color: var(--blue); background-color: rgba(0, 122, 255, 0.08); }#view-authorized .status-expired { color: #E65100; background-color: rgba(230, 81, 0, 0.08); }#view-authorized .status-removed { color: var(--text-quaternary); background-color: rgba(142, 142, 147, 0.10); }
+}#view-authorized .status-active { color: var(--blue); background-color: rgba(0, 122, 255, 0.08); }#view-authorized .status-expired { color: #E65100; background-color: rgba(230, 81, 0, 0.08); }#view-authorized .status-removed { color: var(--text-quaternary); background-color: rgba(142, 142, 147, 0.10); }
 
 /* Right stats */
 .user-card-right {
@@ -5779,4 +5846,27 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   max-height: 106.6667cqw;
   opacity: 1;
   padding: 0 3.7333cqw 3.2000cqw;
+}
+
+/* Android 状态栏融合：优先用原生注入的安全区高度，iOS/WebView 用 env() 兜底 */
+.weui-navigation-bar__inner {
+  height: calc(var(--height) + var(--safe-top, env(safe-area-inset-top, 0px)));
+  padding-top: var(--safe-top, env(safe-area-inset-top, 0px));
+}
+.scroll-content {
+  padding-top: calc(48px + var(--safe-top, env(safe-area-inset-top, 0px)));
+}
+
+/* 底部安全区：Tab 栏、回到顶部按钮、滚动容器底部留白 */
+.tab-bar {
+  bottom: calc(1.6000cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)));
+}
+.scroll-top-btn {
+  bottom: calc(13.3333cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)) + 1.6000cqw);
+}
+.scrollarea {
+  padding-bottom: calc(8.0000cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)));
+}
+.theme-toggle-btn {
+  top: calc(var(--safe-top, env(safe-area-inset-top, 0px)) + 6px);
 }

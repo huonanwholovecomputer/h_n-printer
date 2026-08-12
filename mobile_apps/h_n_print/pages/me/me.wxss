@@ -665,13 +665,8 @@
   background-color: rgba(52, 199, 89, 0.08) !important;
 }
 
-/* Expired / locked states */
+/* Expired state */
 .key-card-wrap.key-drawer-expired .key-value { color: var(--text-quaternary); }
-.key-card-wrap.key-drawer-locked .key-card {
-  background: var(--bg-card);
-  opacity: 0.55;
-}
-.key-card-wrap.key-drawer-locked .key-value { color: var(--gray); }
 
 /* User info in key drawer */
 .key-user-info {
@@ -1679,6 +1674,8 @@
   display: flex;
   align-items: center;
   gap: 4rpx;
+  flex-wrap: wrap;
+  justify-content: center;
 }
 
 .page-btn, .page-num {
@@ -1811,5 +1808,23 @@
   box-shadow:
     0 2rpx 10rpx rgba(64, 156, 255, 0.35),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.25);
+}
+
+/* ==================== 账号绑定入口（管理功能在独立页面） ==================== */
+
+.role-btn-text-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+  min-width: 0;
+}
+.role-btn-text-wrap .role-btn-text {
+  flex: none;
+}
+.role-btn-desc {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  line-height: 1.4;
 }
 

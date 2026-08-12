@@ -116,12 +116,12 @@
 
       <!-- 活跃密钥列表（与管理员卡片同构：扁平 wrap + 滑出删除） -->
       <view wx:for="{{activeKeys}}" wx:key="key"
-            class="key-card-wrap {{item.entering ? 'key-entering' : ''}} {{item.exiting ? 'key-exiting' : ''}} {{item.deleteQuickFade ? 'quick-fade' : ''}} {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}} {{item.status !== 'unused' ? 'key-drawer-locked' : ''}}">
-        <!-- 右侧删除按钮（绝对定位，左滑时露出；已使用的密钥是授权记录，不可删除） -->
-        <view wx:if="{{item.status === 'unused'}}" class="key-delete" catchtap="onRevokeKey" data-idx="{{index}}"
+            class="key-card-wrap {{item.entering ? 'key-entering' : ''}} {{item.exiting ? 'key-exiting' : ''}} {{item.deleteQuickFade ? 'quick-fade' : ''}} {{item.expired && item.status === 'unused' ? 'key-drawer-expired' : ''}}">
+        <!-- 右侧删除按钮（绝对定位，左滑时露出；已使用密钥删除后归档，授权记录保留在历史授权用户中） -->
+        <view class="key-delete" catchtap="onRevokeKey" data-idx="{{index}}"
               style="opacity: {{item.deleteOpacity}}">
           <text class="delete-icon">🗑</text>
-          <text>作废</text>
+          <text>{{item.status === 'unused' ? '作废' : '删除'}}</text>
         </view>
         <!-- 卡片本体：可左滑 -->
         <view class="key-card {{item.swipeTransition === false ? 'no-transition' : ''}}"
@@ -152,6 +152,18 @@
             <button wx:elif="{{item.status === 'used_waiting' && item.type !== 'admin'}}" class="copy-btn btn-waiting" disabled>等待任务中</button>
           </view>
         </view>
+      </view>
+    </view>
+
+    <!-- 账号绑定入口（管理功能收进独立页面，不在首页常驻展示） -->
+    <view class="role-actions" style="animation-delay: 0.06s">
+      <view class="role-btn user-btn" bindtap="onGoBindPage" hover-class="role-btn-pressing" hover-start-time="0" hover-stay-time="100">
+        <text class="role-btn-icon">🔗</text>
+        <view class="role-btn-text-wrap">
+          <text class="role-btn-text">账号绑定（APP）</text>
+          <text class="role-btn-desc">{{bindDeviceCount > 0 ? '已绑定 ' + bindDeviceCount + ' 台设备' : '管理微信小程序与 APP 的账号绑定'}}</text>
+        </view>
+        <text class="role-btn-arrow">›</text>
       </view>
     </view>
 
@@ -395,7 +407,7 @@
         <view class="page-nav">
           <view class="page-btn {{ordersCurrentPage <= 1 ? 'page-btn-disabled' : ''}}"
                 bindtap="onOrdersPrevPage" hover-class="tap-active">‹</view>
-          <block wx:for="{{getOrdersPageNumbers()}}" wx:key="*this">
+          <block wx:for="{{ordersPageNumbers}}" wx:key="index">
             <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
             <view wx:else
                   class="page-num {{ordersCurrentPage === item ? 'page-num-active' : ''}}"
@@ -527,7 +539,7 @@
         <view class="page-nav">
           <view class="page-btn {{ordersCurrentPage <= 1 ? 'page-btn-disabled' : ''}}"
                 bindtap="onOrdersPrevPage" hover-class="tap-active">‹</view>
-          <block wx:for="{{getOrdersPageNumbers()}}" wx:key="*this">
+          <block wx:for="{{ordersPageNumbers}}" wx:key="index">
             <view wx:if="{{item === '...'}}" class="page-ellipsis">…</view>
             <view wx:else
                   class="page-num {{ordersCurrentPage === item ? 'page-num-active' : ''}}"

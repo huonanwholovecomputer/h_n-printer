@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 const require = createRequire(import.meta.url);
 const { chromium } = require('C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
 
-const APP_DIR = 'D:/打印机项目/mobile_apps/android_app';
+const APP_DIR = 'D:/打印机项目/mobile_apps/android_app/www';
 const SHOTS = 'C:/Users/Administrator/.codex/visualizations/2026/08/12/019ff495-9242-7a43-b9b1-45125c7cb2f9/shots';
 const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
 

@@ -14,7 +14,6 @@ Component({
     loadError: '',
     expandedUsers: {},
     statusMap: {
-      permanent: '永久管理员',
       active: '临时授权中',
       expired: '已过期',
       removed: '已移除',
@@ -73,16 +72,35 @@ Component({
         header: { 'Authorization': 'Bearer ' + token },
         success: (res) => {
           if (res.data && res.data.success) {
-            const users = (res.data.users || []).map(u => ({
-              ...u,
-              avatarChar: (u.nickname || '?')[0],
-              // 头像 URL 加时间戳防缓存，确保每次打开显示最新头像
-              avatarUrl: u.avatar_url ? u.avatar_url + '?t=' + Date.now() : '',
-              licenseTypeLabel: u.license_type === 'admin' ? '管理员许可'
-                : u.license_type === 'temp' ? '临时许可'
-                : u.license_type === 'both' ? '管理员+临时' : '无密钥记录',
-              statusLabel: this.data.statusMap[u.status] || u.status,
-            }))
+            const users = (res.data.users || []).map(u => {
+              const records = u.records || []
+              // 独立许可标签：按密钥类型去重（管理员在前），不合并成“管理员+临时”
+              const licenseTags = []
+              if (records.some(r => (r.type || 'temp') === 'admin')) {
+                licenseTags.push({ label: '管理员许可', cls: 'tag-admin' })
+              }
+              if (records.some(r => (r.type || 'temp') === 'temp')) {
+                licenseTags.push({ label: '临时许可', cls: 'tag-temp' })
+              }
+              if (!licenseTags.length) {
+                // 兜底：老数据无 records 时按 license_type 字段
+                if (u.license_type === 'admin' || u.license_type === 'both') {
+                  licenseTags.push({ label: '管理员许可', cls: 'tag-admin' })
+                }
+                if (u.license_type === 'temp' || u.license_type === 'both') {
+                  licenseTags.push({ label: '临时许可', cls: 'tag-temp' })
+                }
+              }
+              return {
+                ...u,
+                avatarChar: (u.nickname || '?')[0],
+                // 头像 URL 加时间戳防缓存，确保每次打开显示最新头像
+                avatarUrl: u.avatar_url ? u.avatar_url + '?t=' + Date.now() : '',
+                licenseTags,
+                // 永久管理员不再单独显示状态标签（许可类型标签已表达“管理员许可”）
+                statusLabel: u.status === 'permanent' ? '' : (this.data.statusMap[u.status] || u.status),
+              }
+            })
             this.setData({ users, loadError: '' })
           } else {
             // 页面内状态提示（对齐 Android App）：不清空已加载列表

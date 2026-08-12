@@ -973,6 +973,31 @@ def init_db():
         print("  已添加 users.removed_by 列")
     except sqlite3.OperationalError:
         pass
+
+    # 微信账号绑定：dev 设备账号 → 微信 openid（个人认证密钥绑定后写入）
+    try:
+        user_conn.execute("ALTER TABLE users ADD COLUMN bound_openid TEXT DEFAULT ''")
+        user_conn.commit()
+        print("  已添加 users.bound_openid 列")
+    except sqlite3.OperationalError:
+        pass
+
+    # 个人认证密钥表：微信账号生成 → APP 设备兑换，完成身份绑定。
+    # 与 license_keys 语义分离（授权 vs 身份），已使用的记录作为绑定历史永久保留。
+    user_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bind_keys (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            key        TEXT    UNIQUE NOT NULL,
+            created_by TEXT    NOT NULL,
+            created_at TEXT    NOT NULL,
+            expires_at TEXT    NOT NULL,
+            status     TEXT    NOT NULL DEFAULT 'unused',
+            used_by    TEXT    DEFAULT NULL,
+            used_at    TEXT    DEFAULT NULL
+        )
+        """
+    )
     user_conn.commit()
     user_conn.close()
 
@@ -1149,6 +1174,15 @@ def init_db():
             print("  已添加 files.openid 列")
     except sqlite3.OperationalError:
         pass  # 字段已存在
+
+    # v23 迁移：orders.source 语义升级 —— cloud/local → wechat/app/local（发起端标记）。
+    # 历史云端订单无法区分旧版 APP 还是小程序，统一按小程序（wechat）回填；
+    # 新提交由客户端显式携带 client 字段（wechat/app）。
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+    if "source" in cols:
+        conn.execute("UPDATE orders SET source = 'wechat' WHERE source = 'cloud'")
+        conn.commit()
+        print("  orders.source 已升级: cloud → wechat（历史云端订单按小程序计）")
 
     # v22 迁移：orders 添加 client_request_id 列（提交幂等键，防双击/重试重复建单）
     # 小程序每次提交生成唯一 ID，后端对同 openid + 同 ID 且 10 分钟内的订单去重返回。
@@ -3012,28 +3046,323 @@ def device_login():
     if not device_id or len(device_id) < 10:
         return jsonify({"success": False, "message": "device_id 无效（至少 10 位）"}), 400
 
-    # 用 device_id 生成稳定的 openid
-    openid = "dev_" + hashlib.sha256(device_id.encode()).hexdigest()[:24]
-    token = token_serializer.dumps(openid)
+    # 用 device_id 生成稳定的设备 openid
+    dev_openid = "dev_" + hashlib.sha256(device_id.encode()).hexdigest()[:24]
 
     conn = get_user_db()
-    existing = conn.execute("SELECT openid FROM users WHERE openid = ?", (openid,)).fetchone()
+    existing = conn.execute(
+        "SELECT openid, bound_openid FROM users WHERE openid = ?", (dev_openid,)
+    ).fetchone()
     if not existing:
         suffix = ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
         nickname = f"手机用户_{suffix}"
         conn.execute(
             "INSERT INTO users (openid, nickname, avatar_path, updated_at) VALUES (?, ?, '', ?)",
-            (openid, nickname, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            (dev_openid, nickname, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         conn.commit()
+        bound_openid = ""
+    else:
+        # 设备已绑定微信账号 → 直接签发微信账号的 token（同一账号身份、同一权限）
+        bound_openid = existing["bound_openid"] or ""
+
+    token_openid = bound_openid or dev_openid
+    token = token_serializer.dumps(token_openid)
     conn.close()
 
-    print(f"设备登录: device_id={device_id[:12]}..., openid={openid[:8]}...")
+    print(f"设备登录: device_id={device_id[:12]}..., openid={token_openid[:8]}..., bound={bool(bound_openid)}")
 
     return jsonify({
         "success": True,
         "token": token,
-        "openid": openid,
+        "openid": token_openid,
+        "bound": bool(bound_openid),
+    })
+
+
+# ==================== 微信账号绑定（个人认证密钥） ====================
+
+_BIND_KEY_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+_BIND_DEVICE_LIMIT = 3   # 每微信账号最多绑定的设备数
+_BIND_UNUSED_LIMIT = 3   # 每微信账号同时未使用的密钥数上限
+
+
+@app.route("/api/bind/create", methods=["POST"])
+@login_required
+def bind_key_create():
+    """任意登录用户生成个人认证密钥：在 APP 端填写后，设备账号绑定到当前微信账号。
+    密钥 1-10 分钟有效、一次性；已绑定设备数与未使用密钥数均有上限。
+    """
+    if g.openid.startswith("dev_"):
+        return jsonify({"success": False, "message": "请使用微信小程序生成绑定密钥"}), 400
+
+    # 限速（P1-6）：每用户每小时最多生成 5 个
+    if not _rate_limit(f"bind_create:{g.openid}", 5, 3600):
+        return jsonify({"success": False, "message": "生成过于频繁，请稍后再试"}), 429
+
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    data = request.get_json() or {}
+    validity = int(data.get("validity_minutes", 5))
+    validity = max(1, min(10, validity))
+    expires = now + timedelta(minutes=validity)
+
+    conn = get_user_db()
+    # 已绑定设备数上限（status='used' 的绑定密钥即绑定关系记录）
+    used_count = conn.execute(
+        "SELECT COUNT(*) FROM bind_keys WHERE created_by = ? AND status = 'used'",
+        (g.openid,),
+    ).fetchone()[0]
+    if used_count >= _BIND_DEVICE_LIMIT:
+        conn.close()
+        return jsonify({"success": False, "message": f"绑定设备已达上限（{_BIND_DEVICE_LIMIT} 台），请先解绑"}), 403
+    # 未使用密钥数上限
+    unused_count = conn.execute(
+        "SELECT COUNT(*) FROM bind_keys WHERE created_by = ? AND status = 'unused' AND expires_at > ?",
+        (g.openid, now_str),
+    ).fetchone()[0]
+    if unused_count >= _BIND_UNUSED_LIMIT:
+        conn.close()
+        return jsonify({"success": False, "message": "未使用密钥过多，请等待过期后再生成"}), 429
+
+    # 生成唯一密钥（全量查重 + UNIQUE 约束双保险）
+    bind_key = ""
+    for _ in range(20):
+        candidate = ''.join(secrets.choice(_BIND_KEY_ALPHABET) for _ in range(8))
+        dup = conn.execute("SELECT id FROM bind_keys WHERE key = ?", (candidate,)).fetchone()
+        if not dup:
+            bind_key = candidate
+            break
+    if not bind_key:
+        conn.close()
+        return jsonify({"success": False, "message": "生成失败，请重试"}), 500
+
+    conn.execute(
+        """INSERT INTO bind_keys (key, created_by, created_at, expires_at, status)
+           VALUES (?, ?, ?, ?, 'unused')""",
+        (bind_key, g.openid, now_str, expires.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"用户 {g.openid[:8]}... 生成个人认证密钥: {bind_key}, 有效期 {validity} 分钟")
+    return jsonify({
+        "success": True,
+        "key": bind_key,
+        "expires_at": expires.strftime("%Y-%m-%d %H:%M:%S"),
+        "validity_minutes": validity,
+    })
+
+
+@app.route("/api/bind/redeem", methods=["POST"])
+@login_required
+def bind_key_redeem():
+    """APP 设备账号兑换个人认证密钥：绑定到密钥创建者的微信账号。
+    - 仅 dev_ 设备账号可兑换（微信账号自身不可兑换）
+    - 兑换成功后设备账号的历史订单/文件迁移到微信账号，来源标记为 APP
+    - 返回微信账号的新 token，APP 切换到微信账号身份
+    """
+    if not g.openid.startswith("dev_"):
+        return jsonify({"success": False, "message": "请使用 APP 设备账号完成绑定"}), 400
+
+    if not _rate_limit(f"bind_redeem:{g.openid}", _SECURITY["redeem_rate_limit"], 60):
+        return jsonify({"success": False, "message": "兑换过于频繁，请稍后再试"}), 429
+
+    data = request.get_json() or {}
+    raw_key = (data.get("key", "") or "").strip().upper()
+    if len(raw_key) != 8:
+        return jsonify({"success": False, "message": "密钥格式不正确"}), 400
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    dev_openid = g.openid
+    conn = get_user_db()
+
+    # 设备账号不可重复绑定
+    dev_row = conn.execute(
+        "SELECT bound_openid FROM users WHERE openid = ?", (dev_openid,)
+    ).fetchone()
+    if dev_row and dev_row["bound_openid"]:
+        conn.close()
+        return jsonify({"success": False, "message": "该设备已绑定微信账号，请先解绑"}), 400
+
+    # 原子认领：仅未使用且未过期才生效
+    conn.execute(
+        """UPDATE bind_keys SET status = 'used', used_by = ?, used_at = ?
+           WHERE key = ? AND status = 'unused' AND expires_at > ?""",
+        (dev_openid, now_str, raw_key, now_str),
+    )
+    conn.commit()
+    if conn.total_changes == 0:
+        row = conn.execute(
+            "SELECT used_by, expires_at FROM bind_keys WHERE key = ?", (raw_key,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"success": False, "message": "密钥不存在"}), 404
+        if row["used_by"] is not None:
+            return jsonify({"success": False, "message": "密钥已被使用"}), 400
+        return jsonify({"success": False, "message": "密钥已过期"}), 400
+
+    key_row = conn.execute(
+        "SELECT created_by FROM bind_keys WHERE key = ?", (raw_key,)
+    ).fetchone()
+    wx_openid = key_row["created_by"] if key_row else ""
+
+    # 写入绑定关系
+    conn.execute(
+        "UPDATE users SET bound_openid = ? WHERE openid = ?",
+        (wx_openid, dev_openid),
+    )
+    conn.commit()
+    conn.close()
+
+    # 历史订单/文件迁移：dev 账号此前的订单并入微信账号（统计"同一用户"口径连续）。
+    # 先回填旧版 APP 订单来源为 app，再迁移归属。
+    orders_conn = get_db()
+    try:
+        orders_conn.execute(
+            "UPDATE orders SET source = 'app' WHERE openid = ? AND source = 'wechat'",
+            (dev_openid,),
+        )
+        orders_conn.execute(
+            "UPDATE orders SET openid = ? WHERE openid = ?", (wx_openid, dev_openid)
+        )
+        orders_conn.execute(
+            "UPDATE files SET openid = ? WHERE openid = ?", (wx_openid, dev_openid)
+        )
+        orders_conn.commit()
+    except Exception:
+        orders_conn.rollback()
+        raise
+    finally:
+        orders_conn.close()
+
+    # 返回微信账号 token，APP 切换身份
+    token = token_serializer.dumps(wx_openid)
+    profile_conn = get_user_db()
+    prow = profile_conn.execute(
+        "SELECT nickname FROM users WHERE openid = ?", (wx_openid,)
+    ).fetchone()
+    profile_conn.close()
+    nickname = (prow["nickname"] if prow else "") or ""
+
+    print(f"设备 {dev_openid[:10]}... 已绑定微信账号 {wx_openid[:8]}...（密钥 {raw_key}）")
+    return jsonify({
+        "success": True,
+        "message": "绑定成功，APP 已切换到微信账号身份",
+        "token": token,
+        "openid": wx_openid,
+        "dev_openid": dev_openid,
+        "nickname": nickname,
+        "role": compute_role(wx_openid),
+    })
+
+
+@app.route("/api/bind/devices", methods=["GET"])
+@login_required
+def bind_devices():
+    """查询当前微信账号已绑定的设备列表（含设备昵称、绑定时间、密钥）"""
+    conn = get_user_db()
+    rows = conn.execute(
+        """SELECT b.used_by AS dev_openid, b.used_at, b.key, u.nickname
+           FROM bind_keys b
+           LEFT JOIN users u ON b.used_by = u.openid
+           WHERE b.created_by = ? AND b.status = 'used'
+           ORDER BY b.used_at DESC""",
+        (g.openid,),
+    ).fetchall()
+    conn.close()
+    devices = [{
+        "dev_openid": r["dev_openid"] or "",
+        "nickname": r["nickname"] or "",
+        "key": r["key"],
+        "used_at": r["used_at"] or "",
+    } for r in rows]
+    return jsonify({"success": True, "devices": devices, "device_count": len(devices)})
+
+
+@app.route("/api/bind/rename", methods=["POST"])
+@login_required
+def bind_rename():
+    """小程序重命名已绑定设备：仅绑定关系中的微信账号可操作。
+    名称写入该 dev_ 账号的 users.nickname，作为设备在“已绑定设备”列表中的展示名。
+    body: { "dev_openid": "dev_...", "nickname": "办公室平板" }
+    """
+    data = request.get_json() or {}
+    dev_openid = (data.get("dev_openid", "") or "").strip()
+    nickname = (data.get("nickname", "") or "").strip()
+    if not dev_openid.startswith("dev_"):
+        return jsonify({"success": False, "message": "设备账号无效"}), 400
+    if not nickname:
+        return jsonify({"success": False, "message": "名称不能为空"}), 400
+    if len(nickname) > 20:
+        return jsonify({"success": False, "message": "名称最长 20 个字符"}), 400
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_user_db()
+    row = conn.execute(
+        "SELECT bound_openid FROM users WHERE openid = ?", (dev_openid,)
+    ).fetchone()
+    if not row or not row["bound_openid"]:
+        conn.close()
+        return jsonify({"success": False, "message": "该设备未绑定微信账号"}), 404
+    if g.openid != row["bound_openid"]:
+        conn.close()
+        return jsonify({"success": False, "message": "仅账号本人可重命名"}), 403
+
+    conn.execute(
+        "UPDATE users SET nickname = ?, updated_at = ? WHERE openid = ?",
+        (nickname, now_str, dev_openid),
+    )
+    conn.commit()
+    conn.close()
+
+    print(f"微信账号 {g.openid[:8]}... 重命名设备 {dev_openid[:10]}... → {nickname}")
+    return jsonify({"success": True, "nickname": nickname})
+
+
+@app.route("/api/bind/revoke", methods=["POST"])
+@login_required
+def bind_revoke():
+    """解除设备绑定：仅绑定关系中的微信账号可操作（小程序本人或已绑定的 APP）。
+    解绑后设备账号回退为独立 dev_ 账号；APP 侧可拿到新的 dev_ token 切换身份。
+    """
+    data = request.get_json() or {}
+    dev_openid = (data.get("dev_openid", "") or "").strip()
+    if not dev_openid.startswith("dev_"):
+        return jsonify({"success": False, "message": "设备账号无效"}), 400
+
+    conn = get_user_db()
+    row = conn.execute(
+        "SELECT bound_openid FROM users WHERE openid = ?", (dev_openid,)
+    ).fetchone()
+    if not row or not row["bound_openid"]:
+        conn.close()
+        return jsonify({"success": False, "message": "该设备未绑定微信账号"}), 404
+
+    wx_openid = row["bound_openid"]
+    if g.openid != wx_openid:
+        conn.close()
+        return jsonify({"success": False, "message": "仅账号本人可解除绑定"}), 403
+
+    conn.execute(
+        "UPDATE users SET bound_openid = '' WHERE openid = ?", (dev_openid,)
+    )
+    conn.execute(
+        """UPDATE bind_keys SET status = 'revoked'
+           WHERE created_by = ? AND used_by = ? AND status = 'used'""",
+        (wx_openid, dev_openid),
+    )
+    conn.commit()
+    conn.close()
+
+    dev_token = token_serializer.dumps(dev_openid)
+    print(f"微信账号 {wx_openid[:8]}... 已解绑设备 {dev_openid[:10]}...")
+    return jsonify({
+        "success": True,
+        "message": "已解除绑定",
+        "token": dev_token,
+        "openid": dev_openid,
     })
 
 
@@ -3208,6 +3537,12 @@ def submit_order():
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
 
+    # 发起端标记：小程序 / APP（写入 orders.source，供统计页区分下单渠道）。
+    # 绑定后 APP 与小程序共享 openid，必须依赖显式标记而非 openid 前缀。
+    client = (data.get("client", "wechat") or "wechat").strip().lower()
+    if client not in ("wechat", "app"):
+        client = "wechat"
+
     # 幂等键（P0-2）：客户端每次提交生成唯一 ID；同 openid + 同 ID 且 10 分钟内
     # 已成功建单 → 直接返回原订单，防双击/网络重试造成重复订单。
     client_request_id = (data.get("client_request_id", "") or "").strip()
@@ -3348,13 +3683,13 @@ def submit_order():
                                    schedule_mode, scheduled_at, schedule_frozen,
                                    client_request_id)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cloud', ?, ?, ?, 0, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              0,  # is_free 恒为 0 — 价格仅用于统计
              delivery_enabled, delivery_location, delivery_percentage,
              urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-             order_number, 1 if auto_print else 0,
+             order_number, client, 1 if auto_print else 0,
              schedule_mode, scheduled_at,
              client_request_id),
             # is_free 恒为 0 — 价格仅用于统计，无免费策略
@@ -3660,9 +3995,13 @@ def get_orders():
     # 构建查询条件
     source_clause = ""
     source_params = []
-    if source_filter in ("cloud", "local"):
+    if source_filter in ("wechat", "app", "local"):
         source_clause = " AND source = ?"
         source_params = [source_filter]
+    elif source_filter == "cloud":
+        # 兼容旧版统计页：cloud 语义已并入 wechat（历史云端订单统一按小程序计）
+        source_clause = " AND source = 'wechat'"
+        source_params = []
 
     if view_all:
         # 超级管理员查看全部订单
@@ -5067,9 +5406,11 @@ def license_active():
 @app.route("/api/license/revoke", methods=["POST"])
 @login_required
 def license_revoke():
-    """管理员作废指定的许可密钥（可删除未使用或已使用的密钥，删除已用密钥不影响授权）。
+    """管理员作废/归档指定的许可密钥（行保留，不影响已获得的授权）：
+    - 未使用密钥 → status='revoked'（作废，他人无法再使用）
+    - 已使用密钥 → status='archived'（从“活跃密钥”列表移除卡片，授权记录保留在历史授权用户中）
     body: { "key": "ABCD1234" }
-    不传 key 则删除所有未使用的密钥（兼容旧版）。
+    不传 key 则处理该管理员全部密钥（兼容旧版）。
     """
     if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
@@ -5078,23 +5419,26 @@ def license_revoke():
     target_key = (data.get("key", "") or "").strip().upper()
 
     conn = get_user_db()
-    # 只软作废“未使用”的密钥（status → revoked，行保留）。
-    # 已使用的密钥是授权记录，绝不删除/作废。
+    # 软处理，行永久保留：未使用 → revoked（作废）；已使用 → archived（归档，移出活跃列表）。
     if target_key:
         conn.execute(
-            "UPDATE license_keys SET status = 'revoked' WHERE key = ? AND created_by = ? AND used_by IS NULL",
+            """UPDATE license_keys
+               SET status = CASE WHEN used_by IS NULL THEN 'revoked' ELSE 'archived' END
+               WHERE key = ? AND created_by = ?""",
             (target_key, g.openid),
         )
     else:
-        # 兼容旧版：作废所有未使用的密钥
+        # 兼容旧版：处理该管理员全部密钥（未使用作废，已使用归档）
         conn.execute(
-            "UPDATE license_keys SET status = 'revoked' WHERE created_by = ? AND used_by IS NULL",
+            """UPDATE license_keys
+               SET status = CASE WHEN used_by IS NULL THEN 'revoked' ELSE 'archived' END
+               WHERE created_by = ?""",
             (g.openid,),
         )
     conn.commit()
     conn.close()
 
-    print(f"管理员 {g.openid[:8]}... 作废许可密钥: {target_key or '全部未使用'}")
+    print(f"管理员 {g.openid[:8]}... 作废/归档许可密钥: {target_key or '全部'}")
     return jsonify({"success": True})
 
 
@@ -5174,10 +5518,11 @@ def license_finish():
 
 
 def cleanup_expired_license_keys():
-    """清理已过期且未使用的许可密钥（超过 1 小时）"""
+    """清理已过期且未使用的许可密钥 / 个人认证密钥（超过 1 小时）"""
     cutoff = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_user_db()
     conn.execute("DELETE FROM license_keys WHERE used_by IS NULL AND expires_at < ?", (cutoff,))
+    conn.execute("DELETE FROM bind_keys WHERE status = 'unused' AND expires_at < ?", (cutoff,))
     conn.commit()
     conn.close()
 
@@ -5590,12 +5935,16 @@ def admin_statistics_revenue():
         params,
     ).fetchall()
 
-    revenue_summary = {"total": 0.0, "cloud": 0.0, "local": 0.0,
-                       "cloud_orders": 0, "local_orders": 0,
-                       "cloud_files": 0, "local_files": 0,
-                       "total_pages": 0, "cloud_pages": 0, "local_pages": 0}
+    revenue_summary = {"total": 0.0,
+                       "wechat": 0.0, "app": 0.0, "local": 0.0,
+                       "wechat_orders": 0, "app_orders": 0, "local_orders": 0,
+                       "wechat_files": 0, "app_files": 0, "local_files": 0,
+                       "total_pages": 0,
+                       "wechat_pages": 0, "app_pages": 0, "local_pages": 0}
     for row in summary_rows:
-        src = row["source"] or "cloud"
+        src = row["source"] or "wechat"
+        if src not in ("wechat", "app", "local"):
+            src = "wechat"
         rev = round(row["revenue"] or 0.0, 2)
         revenue_summary["total"] += rev
         revenue_summary[src] = rev
@@ -5611,7 +5960,9 @@ def admin_statistics_revenue():
                    COUNT(DISTINCT o.id) AS order_count,
                    COUNT(of.id) AS file_count,
                    SUM(of.page_count * of.copies) AS total_pages,
-                   SUM(CASE WHEN of.status = 'sent' THEN of.total_price ELSE 0 END) AS revenue
+                   SUM(CASE WHEN of.status = 'sent' THEN of.total_price ELSE 0 END) AS revenue,
+                   COUNT(DISTINCT CASE WHEN o.source = 'wechat' THEN o.id END) AS wechat_orders,
+                   COUNT(DISTINCT CASE WHEN o.source = 'app' THEN o.id END) AS app_orders
             FROM orders o
             INNER JOIN order_files of ON o.id = of.order_id
             WHERE o.created_at >= ? AND o.created_at <= ?
@@ -5648,6 +5999,8 @@ def admin_statistics_revenue():
             "avatar_url": prof.get("avatar_url", ""),
             "revenue": round(row["revenue"] or 0.0, 2),
             "order_count": row["order_count"] or 0,
+            "wechat_orders": row["wechat_orders"] or 0,
+            "app_orders": row["app_orders"] or 0,
             "file_count": row["file_count"] or 0,
             "total_pages": row["total_pages"] or 0,
         })
@@ -5718,7 +6071,7 @@ def admin_statistics_revenue():
         orders.append({
             "order_id": oid,
             "order_number": row["order_number"] or "",
-            "source": row["source"] or "cloud",
+            "source": row["source"] or "wechat",
             "openid": row["openid"] or "",
             "nickname": prof.get("nickname", ""),
             "avatar_url": prof.get("avatar_url", ""),

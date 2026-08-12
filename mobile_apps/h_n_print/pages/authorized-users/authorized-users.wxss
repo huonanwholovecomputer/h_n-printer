@@ -167,12 +167,6 @@
   background-color: rgba(255, 149, 0, 0.10);
 }
 
-.tag-both {
-  color: #7B1FA2;
-  background-color: rgba(123, 31, 162, 0.08);
-}
-
-.status-permanent { color: #2E7D32; background-color: rgba(46, 125, 50, 0.08); }
 .status-active    { color: var(--blue); background-color: rgba(0, 122, 255, 0.08); }
 .status-expired   { color: #E65100; background-color: rgba(230, 81, 0, 0.08); }
 .status-removed   { color: var(--text-quaternary); background-color: rgba(142, 142, 147, 0.10); }

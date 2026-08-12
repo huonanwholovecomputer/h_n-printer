@@ -1142,21 +1142,28 @@ function _renderSourceDonut(canvasId, rs) {
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
   var ctx = canvas.getContext('2d');
-  var cloudVal = rs.cloud > 0 ? rs.cloud : (rs.cloud_orders || 0);
-  var localVal = rs.local > 0 ? rs.local : (rs.local_orders || 0);
-  var labels = ['☁ 云端 ' + RMB(parseCents(rs.cloud || 0)), '🖨 本地 ' + RMB(parseCents(rs.local || 0))];
-  var data = [Math.max(cloudVal, 0.01), Math.max(localVal, 0.01)];
+  var segs = [
+    { key: 'wechat', label: '小程序', color: '#07C160' },
+    { key: 'app', label: '📱 APP', color: '#4F6EF7' },
+    { key: 'local', label: '🖨 本地', color: '#34A853' },
+  ];
+  var labels = segs.map(function (s) { return s.label + ' ' + RMB(parseCents(rs[s.key] || 0)); });
+  var data = segs.map(function (s) {
+    var v = (rs[s.key] || 0) > 0 ? (rs[s.key] || 0) : (rs[s.key + '_orders'] || 0);
+    return Math.max(v, 0.01);
+  });
+  var colors = segs.map(function (s) { return s.color; });
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'doughnut',
-    data: { labels: labels, datasets: [{ data: data, backgroundColor: ['#4f6ef7', '#34a853'], hoverBackgroundColor: ['#4f6ef7', '#34a853'].map(function (c) { return _mixToWhite(c, 0.15); }), hoverBorderColor: 'transparent', borderWidth: 2, borderColor: 'transparent', hoverOffset: 12 }] },
+    data: { labels: labels, datasets: [{ data: data, backgroundColor: colors, hoverBackgroundColor: colors.map(function (c) { return _mixToWhite(c, 0.15); }), hoverBorderColor: 'transparent', borderWidth: 2, borderColor: 'transparent', hoverOffset: 12 }] },
     options: {
       responsive: true, maintainAspectRatio: false, cutout: '55%',
       layout: { padding: 24 },
       plugins: {
         legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } },
         tooltip: { callbacks: { label: function (c) {
-          var detail = c.dataIndex === 0 ? '订单 ' + (rs.cloud_orders || 0) + ' · 文件 ' + (rs.cloud_files || 0) + ' · ' + (rs.cloud_pages || 0) + '页'
-            : '订单 ' + (rs.local_orders || 0) + ' · 文件 ' + (rs.local_files || 0) + ' · ' + (rs.local_pages || 0) + '页';
+          var s = segs[c.dataIndex];
+          var detail = '订单 ' + (rs[s.key + '_orders'] || 0) + ' · 文件 ' + (rs[s.key + '_files'] || 0) + ' · ' + (rs[s.key + '_pages'] || 0) + '页';
           return c.label + ' — ' + detail;
         } } }
       },
@@ -1204,6 +1211,69 @@ function _renderUserBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
       },
       animation: { duration: 1000, easing: 'easeOutQuart' }
     }
+  });
+}
+/* 用户下单渠道分布：横向堆积柱状图（每根柱子 = 一位成员，小程序/APP 两段不同颜色） */
+function _renderClientStackedBar(canvasId, byUser) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  var ctx = canvas.getContext('2d');
+  // 仅统计有下单记录的成员（排除本地任务伪行）
+  var users = (byUser || []).filter(function (u) {
+    return u.openid !== 'local' && ((u.wechat_orders || 0) + (u.app_orders || 0)) > 0;
+  });
+  if (!users.length) return;
+  users = users.slice().sort(function (a, b) {
+    return ((b.wechat_orders || 0) + (b.app_orders || 0)) - ((a.wechat_orders || 0) + (a.app_orders || 0));
+  });
+  var MAX_BARS = 12;
+  var labels = [], wechatData = [], appData = [];
+  function pushBar(name, w, a) { labels.push(name); wechatData.push(w); appData.push(a); }
+  users.slice(0, MAX_BARS - 1).forEach(function (u) {
+    pushBar(u._memberName || u.nickname || (u.openid || '').substring(0, 8), u.wechat_orders || 0, u.app_orders || 0);
+  });
+  if (users.length > MAX_BARS - 1) {
+    var restW = 0, restA = 0;
+    users.slice(MAX_BARS - 1).forEach(function (u) { restW += (u.wechat_orders || 0); restA += (u.app_orders || 0); });
+    pushBar('其他', restW, restA);
+  }
+  var totals = labels.map(function (_, i) { return wechatData[i] + appData[i]; });
+  var maxTotal = Math.max.apply(null, totals.concat([0])) || 1;
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [
+        { label: '小程序', data: wechatData, backgroundColor: '#07C160', hoverBackgroundColor: _mixToWhite('#07C160', 0.25), stack: 'client', borderRadius: 3 },
+        { label: 'APP', data: appData, backgroundColor: '#4F6EF7', hoverBackgroundColor: _mixToWhite('#4F6EF7', 0.25), stack: 'client', borderRadius: 3 },
+      ],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, usePointStyle: true, color: chartTextColor() } },
+        tooltip: {
+          callbacks: {
+            label: function (c) {
+              var total = totals[c.dataIndex] || 0;
+              var pct = total > 0 ? (c.parsed.x / total * 100).toFixed(1) : 0;
+              return c.dataset.label + ': ' + c.parsed.x + ' 单 (' + pct + '%)';
+            },
+            footer: function (items) {
+              var i = items.length ? items[0].dataIndex : -1;
+              if (i >= 0) return '合计 ' + (totals[i] || 0) + ' 单';
+              return '';
+            },
+          },
+        },
+      },
+      scales: {
+        x: { stacked: true, beginAtZero: true, max: maxTotal * 1.2, grid: { color: 'rgba(120,130,160,.12)' }, ticks: { precision: 0 } },
+        y: { stacked: true, grid: { display: false }, ticks: { font: { size: 10 } } },
+      },
+      animation: { duration: 1000, easing: 'easeOutQuart' },
+    },
   });
 }
 function _renderDailyTrend(canvasId, trend) {
@@ -1610,8 +1680,8 @@ function renderCloud() {
   // KPI
   h += '<div class="kpi-grid">';
   h += '<div class="kpi-card c-green"><div class="kpi-ico">💰</div><div class="num" data-count="' + parseCents(rs.total) + '" data-prefix="¥">0</div><div class="lbl">总盈利（已完成）</div><div class="sub">' + labelOf(_cloudMonth) + '</div></div>';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📦</div><div class="num">' + ((rs.cloud_orders || 0) + (rs.local_orders || 0)) + '</div><div class="lbl">总订单数</div><div class="sub">☁ ' + (rs.cloud_orders || 0) + ' · 🖨 ' + (rs.local_orders || 0) + '</div></div>';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📄</div><div class="num">' + ((rs.cloud_files || 0) + (rs.local_files || 0)) + '</div><div class="lbl">总文件数</div><div class="sub">☁ ' + (rs.cloud_files || 0) + ' · 🖨 ' + (rs.local_files || 0) + '</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📦</div><div class="num">' + ((rs.wechat_orders || 0) + (rs.app_orders || 0) + (rs.local_orders || 0)) + '</div><div class="lbl">总订单数</div><div class="sub">小程序 ' + (rs.wechat_orders || 0) + ' · APP ' + (rs.app_orders || 0) + ' · 🖨 ' + (rs.local_orders || 0) + '</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📄</div><div class="num">' + ((rs.wechat_files || 0) + (rs.app_files || 0) + (rs.local_files || 0)) + '</div><div class="lbl">总文件数</div><div class="sub">小程序 ' + (rs.wechat_files || 0) + ' · APP ' + (rs.app_files || 0) + ' · 🖨 ' + (rs.local_files || 0) + '</div></div>';
   h += '<div class="kpi-card c-orange"><div class="kpi-ico">📃</div><div class="num">' + (rs.total_pages || 0) + '</div><div class="lbl">总页数</div></div>';
   h += '<div class="kpi-card c-blue"><div class="kpi-ico">📊</div><div class="num">' + RMB(parseCents(orders.length ? (rs.total / orders.length) : 0)) + '</div><div class="lbl">均单收益</div></div>';
   h += '</div>';
@@ -1624,7 +1694,8 @@ function renderCloud() {
   h += '</select></div>';
   h += '<div class="f-item"><label>📦 按来源</label><select onchange="onCloudSourceFilter(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.88rem">';
   h += '<option value="all"' + (_cloudSourceFilter === 'all' ? ' selected' : '') + '>全部来源</option>';
-  h += '<option value="cloud"' + (_cloudSourceFilter === 'cloud' ? ' selected' : '') + '>☁ 云端</option>';
+  h += '<option value="wechat"' + (_cloudSourceFilter === 'wechat' ? ' selected' : '') + '>小程序</option>';
+  h += '<option value="app"' + (_cloudSourceFilter === 'app' ? ' selected' : '') + '>📱 APP</option>';
   h += '<option value="local"' + (_cloudSourceFilter === 'local' ? ' selected' : '') + '>🖨 本地</option>';
   h += '</select></div>';
   h += '</div>';
@@ -1637,7 +1708,7 @@ function renderCloud() {
   allStatusKeys.forEach(function (s) { h += '<span><span class="status-dot ' + esc(s) + '"></span> ' + esc(statusLabel(s)) + ' (' + (orderStatusCount[s] || 0) + ')</span>'; });
   h += '</div></div>';
   h += '<div class="section"><h2>💰 收益构成</h2><div class="chart-wrap"><canvas id="cloud-chart-source"></canvas></div>';
-  h += '<div style="text-align:center;font-size:.8rem;color:var(--muted);margin-top:6px">☁ 云端 ' + RMB(parseCents(rs.cloud || 0)) + ' (' + (rs.cloud_orders || 0) + '单) | 🖨 本地 ' + RMB(parseCents(rs.local || 0)) + ' (' + (rs.local_orders || 0) + '单)</div></div>';
+  h += '<div style="text-align:center;font-size:.8rem;color:var(--muted);margin-top:6px">小程序 ' + RMB(parseCents(rs.wechat || 0)) + ' (' + (rs.wechat_orders || 0) + '单) | 📱 APP ' + RMB(parseCents(rs.app || 0)) + ' (' + (rs.app_orders || 0) + '单) | 🖨 本地 ' + RMB(parseCents(rs.local || 0)) + ' (' + (rs.local_orders || 0) + '单)</div></div>';
   h += '</div>';
 
   // 图表行2：附加服务构成 + 单双面构成
@@ -1661,7 +1732,7 @@ function renderCloud() {
   if (byUser.length > 0) {
     h += '<div class="section chart-full"><h2>👥 成员 / 本地任务排行</h2><div class="chart-grid">';
     h += '<div><h3 style="font-size:.85rem;margin:0 0 6px 4px;color:var(--muted)">💰 盈利</h3><div class="chart-wrap tall"><canvas id="cloud-chart-user-revenue"></canvas></div></div>';
-    h += '<div><h3 style="font-size:.85rem;margin:0 0 6px 4px;color:var(--muted)">📋 订单数</h3><div class="chart-wrap tall"><canvas id="cloud-chart-user-orders"></canvas></div></div>';
+    h += '<div><h3 style="font-size:.85rem;margin:0 0 6px 4px;color:var(--muted)">📱 小程序 / APP 下单</h3><div class="chart-wrap tall"><canvas id="cloud-chart-client"></canvas></div></div>';
     h += '</div></div>';
   }
 
@@ -1672,7 +1743,7 @@ function renderCloud() {
 
   // 成员收益明细
   if (byUser.length > 0) {
-    h += '<div class="section"><h2>👥 成员收益明细 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div class="table-wrap"><table><thead><tr><th>成员</th><th>盈利</th><th>占比</th><th>订单</th><th>文件</th><th>页数</th><th>均单收益</th></tr></thead><tbody>';
+    h += '<div class="section"><h2>👥 成员收益明细 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div class="table-wrap"><table><thead><tr><th>成员</th><th>盈利</th><th>占比</th><th>订单</th><th>小程序</th><th>APP</th><th>文件</th><th>页数</th><th>均单收益</th></tr></thead><tbody>';
     byUser.forEach(function (u) {
       var pct = rs.total > 0 ? (u.revenue / rs.total * 100).toFixed(1) : 0;
       var avgRev = u.order_count > 0 ? (u.revenue / u.order_count) : 0;
@@ -1691,7 +1762,9 @@ function renderCloud() {
           '<span class="bound-badge no">未绑定</span> ' +
           (oidSafe ? '<select onchange="updateBinding(\'' + oidSafe + '\',this.value)" style="font-size:.76rem;padding:3px 6px">' + bOpts + '</select>' : '');
       }
-      h += '<tr><td class="l">' + cell + '</td><td class="pos" style="font-weight:700">' + RMB(parseCents(u.revenue)) + '</td><td><span class="tag b">' + pct + '%</span></td><td>' + u.order_count + '</td><td>' + u.file_count + '</td><td>' + (u.total_pages || 0) + '</td><td>' + RMB(parseCents(avgRev)) + '</td></tr>';
+      var wc = u.openid === 'local' ? '—' : (u.wechat_orders || 0);
+      var ac = u.openid === 'local' ? '—' : (u.app_orders || 0);
+      h += '<tr><td class="l">' + cell + '</td><td class="pos" style="font-weight:700">' + RMB(parseCents(u.revenue)) + '</td><td><span class="tag b">' + pct + '%</span></td><td>' + u.order_count + '</td><td>' + wc + '</td><td>' + ac + '</td><td>' + u.file_count + '</td><td>' + (u.total_pages || 0) + '</td><td>' + RMB(parseCents(avgRev)) + '</td></tr>';
     });
     h += '</tbody></table></div></div>';
   }
@@ -1718,13 +1791,14 @@ function renderCloud() {
   }
 
   // 订单明细
-  h += '<div class="section"><h2>📋 订单明细 <span class="hint">' + filteredOrders.length + ' 条，时间倒序' + (_cloudSourceFilter !== 'all' ? ' · 来源: ' + (_cloudSourceFilter === 'local' ? '🖨 本地' : '☁ 云端') : '') + '</span></h2>';
+  h += '<div class="section"><h2>📋 订单明细 <span class="hint">' + filteredOrders.length + ' 条，时间倒序' + (_cloudSourceFilter !== 'all' ? ' · 来源: ' + (_cloudSourceFilter === 'wechat' ? '小程序' : (_cloudSourceFilter === 'app' ? '📱 APP' : '🖨 本地')) : '') + '</span></h2>';
   if (!filteredOrders.length) {
     h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
   } else {
     h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:70px">来源</th><th style="width:110px">用户</th><th style="width:88px">状态</th><th style="width:88px">收益</th><th style="width:70px">文件</th><th style="width:108px">页数</th><th style="width:114px">类型</th><th style="width:138px">时间</th></tr></thead><tbody>';
     filteredOrders.forEach(function (o) {
       var isExp = !!_cloudExpanded[o.order_id];
+      var srcTxt = o.source === 'app' ? '📱 APP' : (o.source === 'local' ? '🖨 本地' : '小程序');
       var mo = o.openid === 'local' ? { name: '本地任务' } : memberOfOpenid(o.openid);
       var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
       var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
@@ -1734,7 +1808,7 @@ function renderCloud() {
       h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
       h += '<td><span class="expand-icon">▶</span></td>';
       h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
-      h += '<td style="white-space:nowrap">' + (o.source === 'local' ? '<span class="tag b">本地</span>' : '<span class="tag b">云端</span>') + '</td>';
+      h += '<td style="white-space:nowrap"><span class="tag b">' + srcTxt + '</span></td>';
       h += '<td class="l ell">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
       h += '<td style="white-space:nowrap"><span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span></td>';
       h += '<td style="font-weight:700;color:' + revColor + '">' + RMB(orderRev) + '</td>';
@@ -1780,7 +1854,7 @@ function renderCloud() {
     _renderDuplexDonut('cloud-chart-duplex', fileDuplex);
     if (byUser.length > 0) {
       _renderUserBar('cloud-chart-user-revenue', byUser, 'revenue', '盈利 (元)', null, function (u, f, mx) { var r = Math.max(.3, u[f] / mx); return 'rgb(' + Math.round(68 + (30 - 68) * r) + ',' + Math.round(110 + (70 - 110) * r) + ',' + Math.round(247 + (130 - 247) * r) + ')'; });
-      _renderUserBar('cloud-chart-user-orders', byUser, 'order_count', '订单数 (单)', null, function (u, f, mx) { var r = Math.max(.3, u[f] / mx); return 'rgb(' + Math.round(22 + (60 - 22) * r) + ',' + Math.round(163 + (80 - 163) * r) + ',' + Math.round(74 + (35 - 74) * r) + ')'; });
+      _renderClientStackedBar('cloud-chart-client', byUser);
     }
     if (dailyTrend.length > 1) _renderDailyTrend('cloud-chart-trend', dailyTrend);
   }, 60);

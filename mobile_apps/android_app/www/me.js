@@ -14,9 +14,29 @@ const SECURITY_DEFS = [
 ];
 
 const _adminLoadTimes = { keys: 0, tempUsers: 0, storage: 0, security: 0, admins: 0 };
+let _lastRoleForAdminLoad = null;
+
+// 角色进入 admin 时重置管理员模块加载时间戳：
+// 游客/普通用户直升管理员后，保证 5 个管理员模块立即重新拉取（而不是被 30s 防抖吞掉）。
+function adminLoadsNeedReset(role) {
+  if (role === 'admin' && _lastRoleForAdminLoad !== 'admin') {
+    Object.keys(_adminLoadTimes).forEach(k => { _adminLoadTimes[k] = 0; });
+  }
+  _lastRoleForAdminLoad = role;
+}
+
 function loadIfStale(key, fn, ttl) {
   const now = Date.now();
-  if (now - _adminLoadTimes[key] > (ttl || 30000)) { _adminLoadTimes[key] = now; fn(); }
+  if (now - _adminLoadTimes[key] > (ttl || 30000)) {
+    _adminLoadTimes[key] = now;
+    const p = fn();
+    // 拉取失败（返回 false 或抛错）时清空时间戳，下次刷新立即重试，
+    // 避免“首次失败后被防抖抑制，界面停留在 -- 直到重启 APP”。
+    if (p && typeof p.then === 'function') {
+      p.then(ok => { if (ok === false) _adminLoadTimes[key] = 0; })
+       .catch(() => { _adminLoadTimes[key] = 0; });
+    }
+  }
 }
 
 const meState = {
@@ -49,6 +69,7 @@ const meState = {
   savingSecurity: false,
   securityExpanded: false,
   authorizedUsers: [],
+  bindDevices: [],
   userOrdersView: { openid: '', nickname: '', source: '', orders: [], page: 1, perPage: 10, total: 0, totalPages: 0, expanded: {} },
 };
 
@@ -80,6 +101,7 @@ function loadMeTab() {
 }
 
 function refreshMeUI() {
+  adminLoadsNeedReset(state.role);
   const roleLabel = state.isSuperAdmin ? '超级管理员' : state.role === 'admin' ? '管理员' : state.role === 'user' ? '普通用户' : '访客';
   document.getElementById('roleLabel').textContent = roleLabel;
   const nickText = document.getElementById('nicknameText');
@@ -115,6 +137,9 @@ function refreshMeUI() {
     detail.style.padding = '';
   }
   document.getElementById('guestSection').style.display = state.role === 'guest' ? '' : 'none';
+  // 账号绑定入口副标题：已绑定显示微信昵称，未绑定提示去管理（管理界面在独立子视图）
+  const bindEntry = document.getElementById('bindEntryDesc');
+  if (bindEntry) bindEntry.textContent = isBound() ? ('已绑定微信账号：' + (state.nickname || '微信账号')) : '管理微信账号绑定';
   setAdminCollapsed(state.role === 'admin');
   // 普通用户：打印许可卡片（对齐小程序）
   const userLic = document.getElementById('userLicenseSection');
@@ -218,8 +243,16 @@ function setupMeButtons() {
   document.getElementById('nicknameModalInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') saveNicknameFromModal();
   });
+  document.getElementById('deviceRenameCancel').addEventListener('click', () => closeModal('deviceRenameModal'));
+  document.getElementById('deviceRenameSave').addEventListener('click', saveDeviceRename);
+  document.getElementById('deviceRenameInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveDeviceRename(); }
+  });
   document.getElementById('redeemBtn').addEventListener('click', redeemKey);
   document.getElementById('redeemPasteBtn').addEventListener('click', pasteKey);
+  document.getElementById('bindBtn').addEventListener('click', bindWechatAccount);
+  document.getElementById('bindPasteBtn').addEventListener('click', pasteBindKey);
+  document.getElementById('unbindBtn').addEventListener('click', unbindWechatAccount);
   document.getElementById('licenseMinutesMinus').addEventListener('click', () => setLicenseMinutes(meState.licenseMinutes - 1));
   document.getElementById('licenseMinutesPlus').addEventListener('click', () => setLicenseMinutes(meState.licenseMinutes + 1));
   document.getElementById('keyTypeTemp').addEventListener('click', () => { meState.keyType = 'temp'; updateKeyForm(); });
@@ -285,6 +318,7 @@ function setupMeButtons() {
     if (num && num.dataset.pageNum !== '...') changeOrdersPage(parseInt(num.dataset.pageNum, 10));
   });
   document.getElementById('btnAuthorizedUsers').addEventListener('click', openAuthorizedUsers);
+  document.getElementById('btnBindAccount').addEventListener('click', openBindView);
   document.getElementById('btnLocalOrders').addEventListener('click', () => openUserOrdersView({ source: 'local', nickname: '本地打印任务' }));
   document.getElementById('adminList').addEventListener('click', (e) => {
     const rm = e.target.closest('[data-remove-admin]');
@@ -473,6 +507,159 @@ function pasteKey() {
     const m = t.match(/[A-Za-z0-9]{8}/);
     document.getElementById('redeemInput').value = m ? m[0].toUpperCase() : t.slice(0, 8).toUpperCase();
   }).catch(() => showToast('无法读取剪贴板'));
+}
+
+/* ================= 微信账号绑定（个人认证密钥） ================= */
+
+function bindWechatAccount() {
+  const key = document.getElementById('bindInput').value.trim().toUpperCase();
+  if (key.length !== 8) { showToast('密钥为8位字符'); return; }
+  const btn = document.getElementById('bindBtn');
+  btn.disabled = true;
+  btn.textContent = '绑定中…';
+  api('/api/bind/redeem', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  }).then(r => {
+    btn.disabled = false;
+    btn.textContent = '绑定';
+    if (r.data && r.data.success) {
+      // 记录设备账号（升级/重装场景兜底：后端 redeem 返回 dev_openid）
+      if (r.data.dev_openid) {
+        state.devOpenid = r.data.dev_openid;
+        localStorage.setItem('hn_dev_openid', r.data.dev_openid);
+      }
+      setAuth(r.data.token, r.data.openid);
+      showToast('绑定成功');
+      document.getElementById('bindInput').value = '';
+      refreshSession();
+      loadOrders();
+      renderBindView();
+      loadBindDevices();
+    } else showToast((r.data && r.data.message) || '绑定失败');
+  }).catch(() => { btn.disabled = false; btn.textContent = '绑定'; showToast('网络错误'); });
+}
+
+function pasteBindKey() {
+  navigator.clipboard.readText().then(text => {
+    const t = (text || '').trim();
+    if (!t) { showToast('剪贴板为空'); return; }
+    const m = t.match(/[A-Za-z0-9]{8}/);
+    document.getElementById('bindInput').value = m ? m[0].toUpperCase() : t.slice(0, 8).toUpperCase();
+  }).catch(() => showToast('无法读取剪贴板'));
+}
+
+// 打开账号绑定子视图（管理功能独立窗口，不在「我」页常驻展示）
+function openBindView() {
+  showView('view-bind', '账号绑定');
+  renderBindView();
+  loadBindDevices();
+}
+
+function renderBindView() {
+  const bound = isBound();
+  const unboundCard = document.getElementById('bindUnboundCard');
+  const boundCard = document.getElementById('bindBoundCard');
+  if (unboundCard) unboundCard.style.display = bound ? 'none' : '';
+  if (boundCard) boundCard.style.display = bound ? '' : 'none';
+  const bindNick = document.getElementById('bindBoundNickname');
+  if (bindNick) bindNick.textContent = state.nickname || '微信账号';
+  const badge = document.getElementById('bindDeviceCountBadge');
+  const count = (meState.bindDevices || []).length;
+  if (badge) { badge.style.display = count > 0 ? '' : 'none'; badge.textContent = count; }
+  renderBindDeviceList();
+}
+
+function renderBindDeviceList() {
+  const list = document.getElementById('bindDeviceList');
+  if (!list) return;
+  const devices = meState.bindDevices || [];
+  if (!devices.length) {
+    list.innerHTML = '<view class="license-card"><text class="redeem-desc" style="text-align:center;margin:0;">暂无绑定设备</text></view>';
+    return;
+  }
+  list.innerHTML = devices.map(d => `
+    <view class="bind-device-item">
+      <view class="bind-device-info">
+        <text class="bind-device-name">${esc(d.nickname || '手机设备')}</text>
+        <text class="bind-device-time">绑定于 ${esc(d.used_at || '—')}</text>
+      </view>
+      <view class="bind-device-actions">
+        <button class="bind-device-btn bind-device-rename" data-rename-device="${escHtml(d.dev_openid)}" data-rename-nickname="${escHtml(d.nickname || '')}">重命名</button>
+        <button class="bind-device-btn bind-device-unbind" data-unbind-device="${escHtml(d.dev_openid)}">解除</button>
+      </view>
+    </view>`).join('');
+  list.querySelectorAll('[data-unbind-device]').forEach(btn => {
+    btn.addEventListener('click', () => unbindDevice(btn.dataset.unbindDevice));
+  });
+  list.querySelectorAll('[data-rename-device]').forEach(btn => {
+    btn.addEventListener('click', () => openDeviceRename(btn.dataset.renameDevice, btn.dataset.renameNickname));
+  });
+}
+
+async function loadBindDevices() {
+  if (!state.token) return;
+  try {
+    const r = await api('/api/bind/devices');
+    if (r.data && r.data.success) {
+      meState.bindDevices = r.data.devices || [];
+      renderBindView();
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+let _deviceRenameOpenid = '';
+function openDeviceRename(devOpenid, curName) {
+  _deviceRenameOpenid = devOpenid || '';
+  const input = document.getElementById('deviceRenameInput');
+  if (input) input.value = curName || '';
+  openModal('deviceRenameModal');
+}
+
+function saveDeviceRename() {
+  const nickname = document.getElementById('deviceRenameInput').value.trim();
+  if (!nickname) { showToast('名称不能为空'); return; }
+  const devOpenid = _deviceRenameOpenid;
+  if (!devOpenid) { closeModal('deviceRenameModal'); return; }
+  closeModal('deviceRenameModal');
+  api('/api/bind/rename', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dev_openid: devOpenid, nickname }),
+  }).then(r => {
+    if (r.data && r.data.success) {
+      showToast('已重命名');
+      loadBindDevices();
+    } else showToast((r.data && r.data.message) || '重命名失败');
+  }).catch(() => showToast('网络错误'));
+}
+
+function unbindDevice(devOpenid) {
+  if (!devOpenid) return;
+  showConfirm('解除绑定', '解除后该设备将回到独立的设备账号，已产生的订单仍保留在微信账号下。', '解除', '#FF3B30', () => {
+    api('/api/bind/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dev_openid: devOpenid }),
+    }).then(r => {
+      if (r.data && r.data.success) {
+        showToast('已解除绑定');
+        // 解绑的是本机：切换到返回的设备账号 token；解绑其他设备则保持当前身份
+        if (devOpenid === state.devOpenid && r.data.token && r.data.openid) {
+          setAuth(r.data.token, r.data.openid);
+          refreshSession();
+          loadOrders();
+        }
+        loadBindDevices();
+      } else showToast((r.data && r.data.message) || '解除失败');
+    }).catch(() => showToast('网络错误'));
+  });
+}
+
+function unbindWechatAccount() {
+  if (!state.devOpenid) { showToast('缺少设备标识，请在小程序中解除绑定'); return; }
+  unbindDevice(state.devOpenid);
 }
 
 /* ================= 订单 ================= */
@@ -910,8 +1097,10 @@ async function loadActiveKeys() {
         }, 800);
       }
       _keysLoadedOnce = true;
+      return true;
     }
   } catch (e) { /* 静默 */ }
+  return false;
 }
 
 let _keyCountdownTimer = null;
@@ -960,19 +1149,18 @@ function renderActiveKeys() {
     return;
   }
   wrap.innerHTML = meState.activeKeys.map(k => {
-    const locked = k.status !== 'unused';
     const canCopy = k.status === 'unused' && !k._expired;
-    const canRevoke = k.status === 'unused';
+    // 已使用密钥也可左滑删除（后端归档，授权记录保留在历史授权用户中）
+    const revokeLabel = k.status === 'unused' ? '作废' : '删除';
     const confirmBtn = k.status === 'used_waiting' && k.type === 'admin'
       ? `<button class="copy-btn btn-confirm-admin" data-confirm-key="${escHtml(k.key)}">确认并关闭</button>` : '';
     const waitingBtn = k.status === 'used_waiting' && k.type !== 'admin'
       ? `<button class="copy-btn btn-waiting" disabled>等待任务中</button>` : '';
     const settleBtn = k.order_id
       ? `<button class="copy-btn" data-settle="${k.order_id}" data-settle-nickname="${escHtml(k.used_by_nickname || '用户')}">结算</button>` : '';
-    const deleteBtn = canRevoke
-      ? `<view class="key-delete" data-revoke-key="${escHtml(k.key)}" style="opacity:0"><text class="delete-icon">🗑</text><text>作废</text></view>` : '';
+    const deleteBtn = `<view class="key-delete" data-revoke-key="${escHtml(k.key)}" style="opacity:0"><text class="delete-icon">🗑</text><text>${revokeLabel}</text></view>`;
     return `
-      <view class="key-card-wrap ${k._entering ? 'key-entering' : ''} ${k._exiting ? 'key-exiting' : ''} ${k._expired && k.status === 'unused' ? 'key-drawer-expired' : ''} ${locked ? 'key-drawer-locked' : ''}">
+      <view class="key-card-wrap ${k._entering ? 'key-entering' : ''} ${k._exiting ? 'key-exiting' : ''} ${k._expired && k.status === 'unused' ? 'key-drawer-expired' : ''}">
         ${deleteBtn}
         <view class="key-card" data-key-swipe="${escHtml(k.key)}">
           <view class="key-row">
@@ -1096,7 +1284,11 @@ function copyKey(key) {
 }
 
 function revokeKey(key) {
-  showConfirm('作废密钥', '确定作废此许可密钥？作废后他人将无法使用。', '作废', '#FF3B30', () => {
+  const k = meState.activeKeys.find(x => x.key === key);
+  const isUsed = !!(k && k.status !== 'unused');
+  showConfirm(isUsed ? '删除密钥' : '作废密钥',
+    isUsed ? '删除此密钥不会影响已获得的授权。' : '确定作废此许可密钥？作废后他人将无法使用。',
+    isUsed ? '删除' : '作废', '#FF3B30', () => {
     // 第一步：右滑收起删除按钮（对齐小程序，先收起再请求）
     const card = document.querySelector('[data-key-swipe="' + key + '"]');
     const wrap = card ? card.parentElement : null;
@@ -1112,7 +1304,7 @@ function revokeKey(key) {
       body: JSON.stringify({ key }),
     }).then(r => {
       if (r.data && r.data.success) {
-        showToast('已作废');
+        showToast(isUsed ? '已删除' : '已作废');
         // 第二步：收起完成后播离场动画（keySlideOut 0.3s），再移除
         setTimeout(() => {
           const k = meState.activeKeys.find(x => x.key === key);
@@ -1178,7 +1370,7 @@ function settleOrder(orderId, nickname) {
 /* ================= 管理员：存储 / 防滥用 ================= */
 
 async function loadStorageStats() {
-  if (!state.token || state.role !== 'admin') return;
+  if (!state.token || state.role !== 'admin') return false;
   try {
     const r = await api('/api/admin/storage');
     if (r.status === 200 && r.data && r.data.success) {
@@ -1186,8 +1378,25 @@ async function loadStorageStats() {
       meState.retentionDays = r.data.retention_days != null ? r.data.retention_days : 7;
       meState.retentionHours = r.data.retention_hours != null ? r.data.retention_hours : 0;
       renderStorageStats();
+      _storageRetryCount = 0;
+      return true;
     }
   } catch (e) { /* 静默 */ }
+  // 拉取失败：短时自动重试（覆盖刚升级时的抖动/限流），最多 3 次
+  scheduleStorageRetry();
+  return false;
+}
+
+let _storageRetryCount = 0;
+function scheduleStorageRetry() {
+  if (!state.token || state.role !== 'admin') return;
+  if (_storageRetryCount >= 3) { _storageRetryCount = 0; return; }
+  _storageRetryCount++;
+  const delay = [3000, 8000, 15000][_storageRetryCount - 1] || 15000;
+  setTimeout(() => {
+    if (!state.token || state.role !== 'admin') { _storageRetryCount = 0; return; }
+    loadStorageStats();
+  }, delay);
 }
 
 function renderStorageStats() {
@@ -1237,7 +1446,7 @@ function deleteAllFiles() {
 }
 
 async function loadSecurityConfig() {
-  if (!state.token || state.role !== 'admin') return;
+  if (!state.token || state.role !== 'admin') return false;
   try {
     const r = await api('/api/admin/security');
     if (r.status === 200 && r.data && r.data.success) {
@@ -1247,8 +1456,10 @@ async function loadSecurityConfig() {
         value: r.data[d.key] !== undefined && r.data[d.key] !== null ? Number(r.data[d.key]) : 0,
       }));
       renderSecurityConfig();
+      return true;
     }
   } catch (e) { /* 静默 */ }
+  return false;
 }
 
 function renderSecurityConfig() {
@@ -1301,14 +1512,16 @@ function saveSecurity() {
 /* ================= 管理员：临时用户 / 管理员列表 ================= */
 
 async function loadTempUsers() {
-  if (!state.token || state.role !== 'admin') return;
+  if (!state.token || state.role !== 'admin') return false;
   try {
     const r = await api('/api/admin/temp_users');
     if (r.data && r.data.success) {
       meState.tempUsers = r.data.users || [];
       renderTempUsers();
+      return true;
     }
   } catch (e) { /* 静默 */ }
+  return false;
 }
 
 function renderTempUsers() {
@@ -1359,14 +1572,16 @@ function removeTempUser(openid) {
 }
 
 async function loadAdmins() {
-  if (!state.token || !state.isSuperAdmin) return;
+  if (!state.token || !state.isSuperAdmin) return false;
   try {
     const r = await api('/api/admin/admins?page=1&page_size=50');
     if (r.data && r.data.success) {
       meState.admins = r.data.admins || [];
       renderAdmins();
+      return true;
     }
   } catch (e) { /* 静默 */ }
+  return false;
 }
 
 function renderAdmins() {
@@ -1442,20 +1657,29 @@ function renderAuthorizedUsers() {
       </view>`;
     return;
   }
-  const statusMap = { permanent: '永久管理员', active: '临时授权中', expired: '已过期', removed: '已移除' };
+  const statusMap = { active: '临时授权中', expired: '已过期', removed: '已移除' };
   const keyStatusMap = { unused: '未使用', used: '已使用', revoked: '已作废', finished: '已完成', archived: '归档' };
   let html = `<view class="list-summary"><text class="summary-text">共 ${meState.authorizedUsers.length} 位授权用户</text></view>`;
   html += '<view class="user-list">' + meState.authorizedUsers.map(u => {
     const avatarChar = (u.nickname || '?')[0];
     const avatarUrl = u.avatar_url ? escHtml(u.avatar_url) + '?t=' + Date.now() : '';
-    const licenseTypeLabel = u.license_type === 'admin' ? '管理员许可'
-      : u.license_type === 'temp' ? '临时许可'
-      : u.license_type === 'both' ? '管理员+临时' : '无密钥记录';
-    const typeCls = u.license_type === 'admin' ? 'tag-admin'
-      : u.license_type === 'temp' ? 'tag-temp'
-      : u.license_type === 'both' ? 'tag-both' : '';
-    const statusLabel = statusMap[u.status] || u.status;
-    const records = u.keys || [];
+    // 独立许可标签：按密钥类型去重（管理员在前），不合并成“管理员+临时”
+    const records = u.records || u.keys || [];
+    const typeSet = [];
+    if (records.some(k => (k.type || 'temp') === 'admin')) typeSet.push('admin');
+    if (records.some(k => (k.type || 'temp') === 'temp')) typeSet.push('temp');
+    if (!typeSet.length) {
+      // 兜底：老数据无 records 时按 license_type 字段
+      if (u.license_type === 'admin' || u.license_type === 'both') typeSet.push('admin');
+      if (u.license_type === 'temp' || u.license_type === 'both') typeSet.push('temp');
+    }
+    const licenseTagHtml = typeSet.map(t => {
+      const label = t === 'admin' ? '管理员许可' : '临时许可';
+      const cls = t === 'admin' ? 'tag-admin' : 'tag-temp';
+      return `<text class="key-type-tag ${cls}">${label}</text>`;
+    }).join('');
+    // 永久管理员不再单独显示状态标签（许可类型标签已表达“管理员许可”）
+    const statusLabel = u.status === 'permanent' ? '' : (statusMap[u.status] || u.status);
     const recordRows = records.length ? records.map(k => `
       <view class="record-row">
         <view class="record-head">
@@ -1477,8 +1701,8 @@ function renderAuthorizedUsers() {
           <view class="user-card-center">
             <text class="user-card-name">${esc(u.nickname || '未知用户')}</text>
             <view class="user-card-tags">
-              ${typeCls ? `<text class="key-type-tag ${typeCls}">${licenseTypeLabel}</text>` : ''}
-              <text class="status-tag status-${esc(u.status)}">${esc(statusLabel)}</text>
+              ${licenseTagHtml}
+              ${statusLabel ? `<text class="status-tag status-${esc(u.status)}">${esc(statusLabel)}</text>` : ''}
             </view>
             <text class="user-card-id">ID: ${esc(u.openid_short || u.openid)}</text>
           </view>

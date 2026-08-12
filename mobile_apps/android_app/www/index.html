@@ -104,7 +104,7 @@
                 <view class="switch-thumb"></view>
               </view>
             </view>
-            <view class="delivery-collapse" id="deliveryOptions" style="display:none">
+            <view class="delivery-collapse" id="deliveryOptions">
               <view class="param-row">
                 <text class="param-label">地点</text>
                 <view class="picker-trigger" id="deliveryTrigger">
@@ -240,6 +240,18 @@
                 <button class="generate-btn" id="generateKeyBtn" data-hover="generate-hover">生成许可密钥</button>
               </view>
               <view id="activeKeys"></view>
+            </view>
+
+            <!-- 账号绑定入口（管理功能收进独立子视图，不在首页常驻展示） -->
+            <view class="role-actions">
+              <button class="role-btn user-btn" id="btnBindAccount" data-hover="role-btn-pressing">
+                <text class="role-btn-icon">🔗</text>
+                <view class="role-btn-text-wrap">
+                  <text class="role-btn-text">账号绑定（APP）</text>
+                  <text class="role-btn-desc" id="bindEntryDesc">管理微信账号绑定</text>
+                </view>
+                <text class="role-btn-arrow">›</text>
+              </button>
             </view>
 
             <!-- 服务器存储 -->
@@ -442,6 +454,52 @@
     </div>
   </div>
 
+  <!-- ===== 子视图：账号绑定 ===== -->
+  <div class="page-root view" id="view-bind" style="display:none">
+    <div class="scroller">
+      <div class="scroll-content">
+        <div class="container">
+          <view class="license-section">
+            <view class="section-title">
+              <view class="section-bar"></view>
+              <text>绑定微信账号</text>
+            </view>
+            <view class="license-card" id="bindUnboundCard">
+              <text class="redeem-desc">输入小程序「我 → 账号绑定」中生成的 8 位绑定密钥，本 APP 将切换到该微信账号身份（权限一致，订单按 APP 来源统计）。</text>
+              <view class="redeem-input-row">
+                <input class="redeem-input" id="bindInput" type="text" placeholder="请输入8位绑定密钥" maxlength="8">
+                <button class="redeem-paste-btn" id="bindPasteBtn">粘贴</button>
+              </view>
+              <button class="redeem-btn" id="bindBtn">绑定</button>
+            </view>
+            <view class="license-card user-license-card" id="bindBoundCard" style="display:none">
+              <view class="user-license-header">
+                <text class="license-status-icon">🔗</text>
+                <text class="license-status-text">已绑定微信账号</text>
+              </view>
+              <view class="user-license-detail" id="bindBoundDetail" style="display:block">
+                <view class="license-detail-row">
+                  <text class="license-detail-label">账号</text>
+                  <text class="license-detail-value" id="bindBoundNickname">—</text>
+                </view>
+              </view>
+              <button class="redeem-btn" id="unbindBtn" style="margin-top:12px">解除绑定</button>
+            </view>
+          </view>
+
+          <view class="license-section">
+            <view class="section-title">
+              <view class="section-bar"></view>
+              <text>已绑定设备</text>
+              <text class="order-count" id="bindDeviceCountBadge" style="display:none">0</text>
+            </view>
+            <view id="bindDeviceList"></view>
+          </view>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ===== 子视图：用户订单 / 本地打印任务 ===== -->
   <div class="page-root view" id="view-user-orders" style="display:none">
     <div class="scroller">
@@ -633,6 +691,18 @@
       <view class="modal-buttons">
         <button class="btn-secondary modal-half-btn" id="nicknameModalCancel">取消</button>
         <button class="btn-primary modal-half-btn" id="nicknameModalSave">保存</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- ===== 设备重命名弹窗 ===== -->
+  <view class="modal-mask" id="deviceRenameModal" style="display:none">
+    <view class="modal-sheet">
+      <text class="title-medium" style="margin-bottom:16px;">重命名设备</text>
+      <input class="input-ios" id="deviceRenameInput" type="text" placeholder="输入设备名称（如：我的手机、办公室平板）" maxlength="20" style="margin-bottom:24px;">
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" id="deviceRenameCancel">取消</button>
+        <button class="btn-primary modal-half-btn" id="deviceRenameSave">保存</button>
       </view>
     </view>
   </view>

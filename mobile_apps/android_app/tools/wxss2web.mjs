@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(__dirname, '..', '..', 'h_n_print');
-const OUT = resolve(__dirname, '..', 'styles.css');
+const OUT = resolve(__dirname, '..', 'www', 'styles.css');
 
 const FILES = [
   ['app.wxss', '/* ========== app.wxss — 设计系统 / 基础组件 ========== */'],

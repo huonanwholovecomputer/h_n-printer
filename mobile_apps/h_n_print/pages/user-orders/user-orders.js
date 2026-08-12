@@ -29,6 +29,8 @@ Component({
     perPage: 10,
     totalOrders: 0,
     totalPages: 0,
+    // 页码数组（预计算进 data，避免 WXML 内调用方法 + wx:key="*this" 在部分基础库下渲染失败）
+    pageNumbers: [],
     pageOptions: [10, 20, 50, 100],
     showPageSizePicker: false,
 
@@ -225,6 +227,8 @@ Component({
               totalOrders: total,
               totalPages: Math.ceil(total / this.data.perPage),
               expandedOrders: {},
+            }, () => {
+              this._syncPageNumbers()
             })
           } else {
             // 页面内状态提示（对齐 Android App）：不清空已加载列表
@@ -284,6 +288,7 @@ Component({
       const page = parseInt(e.currentTarget.dataset.page, 10)
       if (page < 1 || page > this.data.totalPages || page === this.data.currentPage) return
       this.setData({ currentPage: page }, () => {
+        this._syncPageNumbers()
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
         this._scrollToOrdersSection()
       })
@@ -292,6 +297,7 @@ Component({
     onPrevPage() {
       if (this.data.currentPage <= 1) return
       this.setData({ currentPage: this.data.currentPage - 1 }, () => {
+        this._syncPageNumbers()
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
         this._scrollToOrdersSection()
       })
@@ -300,6 +306,7 @@ Component({
     onNextPage() {
       if (this.data.currentPage >= this.data.totalPages) return
       this.setData({ currentPage: this.data.currentPage + 1 }, () => {
+        this._syncPageNumbers()
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
         this._scrollToOrdersSection()
       })
@@ -317,6 +324,7 @@ Component({
         currentPage: 1,
         showPageSizePicker: false,
       }, () => {
+        this._syncPageNumbers()
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
         this._scrollToOrdersSection()
       })
@@ -388,6 +396,15 @@ Component({
       if (current < total - 2) pages.push('...')
       pages.push(total)
       return pages
+    },
+
+    // 将页码数组同步到 data（供 WXML wx:for 使用，规避方法调用绑定在部分基础库下的渲染问题）
+    _syncPageNumbers() {
+      const pages = this.getPageNumbers()
+      const prev = this.data.pageNumbers || []
+      if (pages.length !== prev.length || pages.some((p, i) => p !== prev[i])) {
+        this.setData({ pageNumbers: pages })
+      }
     },
   },
 })

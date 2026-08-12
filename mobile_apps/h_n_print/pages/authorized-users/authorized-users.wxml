@@ -41,8 +41,8 @@
           <view class="user-card-center">
             <text class="user-card-name">{{item.nickname || '未知用户'}}</text>
             <view class="user-card-tags">
-              <text class="key-type-tag {{item.license_type === 'admin' ? 'tag-admin' : (item.license_type === 'temp' ? 'tag-temp' : (item.license_type === 'both' ? 'tag-both' : ''))}}">{{item.licenseTypeLabel}}</text>
-              <text class="status-tag status-{{item.status}}">{{item.statusLabel}}</text>
+              <text wx:for="{{item.licenseTags}}" wx:key="label" wx:for-item="tag" class="key-type-tag {{tag.cls}}">{{tag.label}}</text>
+              <text wx:if="{{item.statusLabel}}" class="status-tag status-{{item.status}}">{{item.statusLabel}}</text>
             </view>
             <text class="user-card-id">ID: {{item.openid_short || item.openid}}</text>
           </view>
