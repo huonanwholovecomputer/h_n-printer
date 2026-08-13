@@ -112,9 +112,7 @@ Component({
     countdownMinWheelIndex: 5,
     countdownSecWheelIndex: 0,
     countdownWheelValue: [5, 0],
-    logoScale: 1,
-    logoPadding: 40,
-    scrollTop: 0,
+    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false },
     // v5: 附加服务参数（与本地打印工具对齐）
     deliveryEnabled: false,
     deliveryLocation: '1号楼北楼',
@@ -507,31 +505,14 @@ Component({
       }, 200)
     },
 
-    // ==================== 自定义橡皮筋滚动引擎 ====================
+    // ==================== WXS 滚动引擎（视图层直驱，0 setData） ====================
 
     _initScrollEngine() {
-      this._y = 0
-      this._minY = 0
-      this._maxY = 0
       this._scrollerH = 0
       this._contentH = 0
       this._contentEst = 0   // 估算累积高度，兜底微信容器上限
       this._fileListPx = 0   // 文件列表累计占用高度（有界 scroll-view，达到上限后不再增长）
-
-      this._trackId = null
-      this._lastY = 0
-      this._lastT = 0
-      this._moved = false
-      this._points = []
-
-      this._tick = null
-      this._vel = 0
-      this._inDecel = false
-      this._handoff = false
-
-      this._dampMax = 130
-      this._fric = 0.006
-      this._snapSpd = 0.32
+      this._maxY = 0
 
       this._measureTimer = null  // 去抖测量句柄
 
@@ -549,7 +530,6 @@ Component({
     },
 
     _destroyScrollEngine() {
-      this._cancelSchedule()
       if (this._measureTimer) {
         clearTimeout(this._measureTimer)
         this._measureTimer = null
@@ -565,6 +545,31 @@ Component({
         this._measure()
       }, delay || 100)
     },
+
+    // 推送滚动边界给 WXS 引擎（change:prop 观察器，低频同步，不逐帧走 setData）
+    _pushScrollConfig() {
+      const files = this.data.selectedFiles || []
+      let sumRpx = 0
+      files.forEach((f, i) => {
+        sumRpx += _fileCardHeightRpx(f) + (i > 0 ? FILE_CARD_GAP_RPX : 0)
+      })
+      const { windowWidth } = wx.getWindowInfo()
+      const contentPx = Math.round(sumRpx * ((windowWidth || 375) / 750))
+      // 内层文件列表是否真的可滚（内容高 > 可视高）：可滚时 WXS 让位给原生
+      const listOverflow = contentPx > (this.data.fileListHeight || 0) + 1
+      this.setData({
+        scrollConfig: {
+          minY: 0,
+          maxY: Math.round(this._maxY || 0),
+          scrollerH: this._scrollerH || 0,
+          contentH: this._contentH || 0,
+          listOverflow,
+        },
+      })
+    },
+
+    // WXS 分桶回调（每 100px 一次），供回顶按钮等阈值类 UI 使用；本页暂不消费
+    onWxsScroll() {},
 
     // 圆点清除计时器（badge 状态已在上层 setData 中同帧设置，这里只负责定时清除）
     _scheduleBadgeClear(entering) {
@@ -595,16 +600,6 @@ Component({
       }, 450)  // 动画 0.45s
     },
 
-    _schedule(fn) {
-      return setTimeout(fn, 16)
-    },
-    _cancelSchedule() {
-      if (this._tick) {
-        clearTimeout(this._tick)
-        this._tick = null
-      }
-    },
-
     _measure() {
       const q = this.createSelectorQuery()
       q.select('.scroller').boundingClientRect()
@@ -618,10 +613,7 @@ Component({
         if (ch > 0) this._contentEst = ch
         this._contentH = Math.max(ch, this._contentEst)
         this._maxY = Math.max(0, this._contentH - vp + this._bottomPad + this._tabOverlayPx)
-        if (this._y > this._maxY) {
-          // 不直接跳变，让 _snapBack() 从当前位置平滑回弹到新边界
-          this._snapBack()
-        }
+        this._pushScrollConfig()
       })
     },
 
@@ -772,228 +764,7 @@ Component({
       // 垫片置 0：容器自带底部 padding 且文件列表为有界滚动，不再触及微信高度上限。
       // 之前设成 _contentEst（整份估算高）会在容器外加高近一屏，造成底部大量空白。
       this.setData({ scrollPadHeight: 0 })
-      if (this._y > this._maxY) this._snapBack()
-    },
-
-    _applyY() {
-      const real = Math.max(0, Math.min(this._y, this._maxY))
-      const ratio = this._maxY > 0 ? Math.min(real / 400, 1) : 0
-      // transform: scale() 保持宽高比，每帧自然跟随滚动
-      const logoScale = +(1.0 - ratio * 0.7).toFixed(3)  // 1.0 → 0.3
-      const logoPadding = Math.round(40 - ratio * 32)
-      const patch = { scrollTop: this._renderY() }
-      if (logoScale !== this.data.logoScale) patch.logoScale = logoScale
-      if (logoPadding !== this.data.logoPadding) patch.logoPadding = logoPadding
-      this.setData(patch)
-    },
-
-    _dampShift(d) {
-      const max = this._dampMax
-      const sign = d >= 0 ? 1 : -1
-      return sign * max * (1 - Math.exp(-Math.abs(d) / (max * 1.6)))
-    },
-
-    _renderY() {
-      const y = this._y
-      if (y < this._minY) {
-        return this._minY - this._dampShift(this._minY - y)
-      }
-      if (y > this._maxY) {
-        return this._maxY + this._dampShift(y - this._maxY)
-      }
-      return y
-    },
-
-    onScrollerTouchStart(e) {
-      const touches = e.touches || []
-      this._points = touches.map((t) => ({ id: t.identifier, y: t.clientY }))
-
-      // 新增：方向锁定初始化
-      if (touches.length > 0) {
-        this._startX = touches[0].clientX
-        this._startY = touches[0].clientY
-        this._directionLocked = false
-        this._horizontalGesture = false
-      }
-
-      this._cancelSchedule()
-      this._inDecel = false
-      this._handoff = false
-
-      if (this._trackId === null) {
-        const p = this._points[0]
-        if (!p) return
-        this._trackId = p.id
-        this._lastY = p.y
-        this._lastT = Date.now()
-        this._vel = 0
-        this._moved = false
-      } else {
-        const cur = this._points.find((p) => p.id === this._trackId)
-        if (cur) {
-          this._lastY = cur.y
-          this._lastT = Date.now()
-        }
-      }
-    },
-
-    onScrollerTouchMove(e) {
-      const touches = e.touches || []
-      if (touches.length === 0) return
-      this._points = touches.map((t) => ({ id: t.identifier, y: t.clientY }))
-
-      // ---- 新增：方向锁定逻辑 ----
-      const touchDx = touches[0].clientX - this._startX
-      const touchDy = touches[0].clientY - this._startY
-
-      if (!this._directionLocked) {
-        if (Math.abs(touchDx) > 5 || Math.abs(touchDy) > 5) {
-          if (Math.abs(touchDx) > Math.abs(touchDy)) {
-            this._directionLocked = true
-            this._horizontalGesture = true
-            return
-          } else {
-            this._directionLocked = true
-            this._horizontalGesture = false
-          }
-        } else {
-          return
-        }
-      }
-
-      if (this._horizontalGesture) {
-        return
-      }
-
-      // ---- 原有垂直滚动逻辑 ----
-      if (this._trackId === null || !this._points.find((p) => p.id === this._trackId)) {
-        const p = this._points[0]
-        if (!p) return
-        this._trackId = p.id
-        this._lastY = p.y
-        this._lastT = Date.now()
-        this._handoff = true
-        return
-      }
-
-      const cur = this._points.find((p) => p.id === this._trackId)
-      if (!cur) return
-
-      const now = Date.now()
-      const dy = cur.y - this._lastY
-      const dt = Math.max(1, now - this._lastT)
-
-      if (Math.abs(dy) > 0.5) this._moved = true
-
-      this._y -= dy
-      const inst = -dy / dt
-      this._vel = this._vel * 0.6 + inst * 0.4
-
-      this._lastY = cur.y
-      this._lastT = now
-
-      this._applyY()
-    },
-
-    onScrollerTouchEnd(e) {
-      // 重置方向状态
-      this._horizontalGesture = false
-      this._directionLocked = false
-
-      const touches = e.touches || []
-      this._points = touches.map((t) => ({ id: t.identifier, y: t.clientY }))
-
-      const stillHasMain = this._points.find((p) => p.id === this._trackId)
-      if (stillHasMain) return
-
-      if (this._points.length > 0) {
-        this._trackId = null
-        this._handoff = true
-        return
-      }
-
-      this._trackId = null
-      this._handoff = false
-      this._startPhysics()
-    },
-
-    _startPhysics() {
-      this._cancelSchedule()
-      if (this._y < this._minY || this._y > this._maxY) {
-        this._vel = 0
-        this._snapBack()
-        return
-      }
-      if (Math.abs(this._vel) < 0.05) {
-        this._snapBack()
-        return
-      }
-      this._inDecel = true
-      this._lastT = Date.now()
-      const tick = () => {
-        if (!this._inDecel) return
-        const now = Date.now()
-        const dt = Math.max(1, now - this._lastT)
-        this._lastT = now
-
-        const decay = Math.exp(-this._fric * dt)
-        this._vel *= decay
-        this._y += this._vel * dt
-
-        if (this._y < this._minY) {
-          this._y = this._minY
-          this._vel = 0
-          this._inDecel = false
-          this._snapBack()
-          return
-        }
-        if (this._y > this._maxY) {
-          this._y = this._maxY
-          this._vel = 0
-          this._inDecel = false
-          this._snapBack()
-          return
-        }
-        if (Math.abs(this._vel) < 0.02) {
-          this._inDecel = false
-          this._applyY()
-          return
-        }
-        this._applyY()
-        this._tick = this._schedule(tick)
-      }
-      this._tick = this._schedule(tick)
-    },
-
-    _snapBack() {
-      this._cancelSchedule()
-      const tick = () => {
-        if (this._handoff) {
-          this._tick = null
-          return
-        }
-        const minY = this._minY
-        const maxY = this._maxY
-        let target = this._y
-        if (this._y < minY) target = minY
-        else if (this._y > maxY) target = maxY
-        else {
-          this._y = target
-          this._applyY()
-          this._tick = null
-          return
-        }
-        this._y += (target - this._y) * this._snapSpd
-        if (Math.abs(this._y - target) < 0.3) {
-          this._y = target
-          this._applyY()
-          this._tick = null
-          return
-        }
-        this._applyY()
-        this._tick = this._schedule(tick)
-      }
-      this._tick = this._schedule(tick)
+      this._pushScrollConfig()
     },
 
     // ==================== 多文件操作 ====================

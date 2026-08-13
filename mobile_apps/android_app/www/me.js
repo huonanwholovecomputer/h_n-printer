@@ -944,7 +944,7 @@ function scrollToOrdersSection() {
   const content = document.getElementById('scrollContentMe');
   if (!section || !content) return;
   engine.measure(); // 用最新内容高度更新 maxY
-  // 内容变短导致当前位置超出新边界：直接无动画归位（避免 measure 内部的回弹动画）
+  // 内容变短导致当前位置超出新边界：直接无动画归位
   if (engine.y > engine.maxY) {
     engine.cancel();
     engine.y = engine.maxY;
@@ -1905,8 +1905,7 @@ function changeUserOrdersPage(page) {
   if (page < 1 || page > v.totalPages || page === v.page) return;
   v.page = page;
   loadUserOrders();
-  const sc = document.querySelector('#view-user-orders .scroller');
-  if (sc) sc.scrollTop = 0;
+  if (scrollEngines.userOrders) scrollEngines.userOrders.scrollTo(0, 0); // 切页回顶部（直接定位）
 }
 
 function toggleUserOrdersOrder(id) {
@@ -1928,13 +1927,17 @@ function toggleUserOrdersOrder(id) {
 
 // 选择条数后滚动回订单列表顶部（对齐小程序 _scrollToOrdersSection）
 function scrollUserOrdersToTop() {
-  const sc = document.querySelector('#view-user-orders .scroller');
+  const engine = scrollEngines.userOrders;
   const section = document.querySelector('#view-user-orders .orders-section');
-  if (!sc || !section) return;
+  if (!engine || !section) return;
+  engine.measure(); // 用最新内容高度更新 maxY
   // 内容不足一屏：不滚动，保持原位
-  if (sc.scrollHeight <= sc.clientHeight) return;
-  const top = section.getBoundingClientRect().top - sc.getBoundingClientRect().top + sc.scrollTop;
-  sc.scrollTop = Math.max(0, top - 12);
+  if (engine.contentH <= engine.scrollerH) return;
+  const content = document.getElementById('scrollContentUserOrders');
+  const top = section.getBoundingClientRect().top - content.getBoundingClientRect().top + engine.y;
+  const target = Math.min(Math.max(0, top - 12), engine.maxY);
+  if (Math.abs(target - engine.y) < 2) return;
+  engine.scrollTo(target, 280);
 }
 
 let _userOrdersPollTimer = null;

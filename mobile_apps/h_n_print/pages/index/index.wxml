@@ -2,23 +2,27 @@
 <page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" page-style="--tab-highlight:{{isDarkMode ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.7)'}};--tab-bg:{{isDarkMode ? 'rgba(26,26,28,0.50)' : 'var(--glass-regular)'}};--tab-text:{{isDarkMode ? '#98989D' : '#8E8E93'}};--tab-text-active:{{isDarkMode ? '#409CFF' : '#007AFF'}}"></page-meta>
 <navigation-bar title="提交打印" back="{{false}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 
+<wxs module="scroll" src="../../utils/scroll.wxs"></wxs>
+
 <!-- theme-bg-layer 在 page-root 外，始终可见，确保淡入淡出间隙不露原生白色背景 -->
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}} {{themeSwitching ? 'theme-switching' : ''}}"></view>
 
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}} {{themeSwitching ? 'theme-switching' : ''}}">
   <view
     class="scroller"
-    bindtouchstart="onScrollerTouchStart"
-    bindtouchmove="onScrollerTouchMove"
-    bindtouchend="onScrollerTouchEnd"
-    bindtouchcancel="onScrollerTouchEnd"
+    prop="{{scrollConfig}}"
+    change:prop="{{scroll.onConfig}}"
+    bindtouchstart="{{scroll.touchstart}}"
+    bindtouchmove="{{scroll.touchmove}}"
+    bindtouchend="{{scroll.touchend}}"
+    bindtouchcancel="{{scroll.touchend}}"
   >
-    <view class="scroll-content" style="transform: translateY({{-scrollTop}}px);">
+    <view class="scroll-content">
       <view class="container">
 
         <!-- Logo + Status -->
-        <view class="header-area {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="padding-top: {{logoPadding}}rpx; padding-bottom: {{logoPadding}}rpx; animation-delay: 0.5s;">
-          <view class="logo-wrap" style="transform: scale({{logoScale}}); transform-origin: center top;">
+        <view class="header-area {{pageReady ? 'card-entering-fade' : 'card-preload'}}" style="animation-delay: 0.5s;">
+          <view class="logo-wrap" style="transform-origin: center top;">
             <image class="logo" src="/images/HN_print.png" mode="widthFix" style="width: 320rpx;" />
           </view>
         </view>

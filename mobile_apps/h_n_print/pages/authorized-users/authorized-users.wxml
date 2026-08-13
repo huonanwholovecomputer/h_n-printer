@@ -2,10 +2,20 @@
 <page-meta></page-meta>
 <navigation-bar title="历史授权用户" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
+<wxs module="scroll" src="../../utils/scroll.wxs"></wxs>
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
 
-<scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
-  <view class="container">
+<view class="scroller"
+      prop="{{scrollConfig}}"
+      change:prop="{{scroll.onConfig}}"
+      cmd="{{scrollCmd}}"
+      change:cmd="{{scroll.onCmd}}"
+      bindtouchstart="{{scroll.touchstart}}"
+      bindtouchmove="{{scroll.touchmove}}"
+      bindtouchend="{{scroll.touchend}}"
+      bindtouchcancel="{{scroll.touchend}}">
+  <view class="scroll-content">
+    <view class="container">
     <!-- 加载中 -->
     <view wx:if="{{loading}}" class="status-box">
       <text class="status-text">加载中...</text>
@@ -90,6 +100,7 @@
         </view>
       </view>
     </view>
+    </view>
   </view>
-</scroll-view>
+</view>
 </view>

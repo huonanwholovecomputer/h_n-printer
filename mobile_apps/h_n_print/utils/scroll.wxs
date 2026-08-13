@@ -1,0 +1,501 @@
+// WXS 版 FlingEngine：视图层直驱滚动（全程 0 setData）
+// 移植自 APP www/app.js 的 FlingEngine（真机调好手感的参数）：
+//   事件响应 + requestAnimationFrame 物理循环 + setStyle 全部在视图层完成，
+//   逻辑层只通过 scrollConfig（change:prop）低频同步滚动边界。
+// 注意：WXS 是 ES5 子集 —— 只能 var/function，状态全部放 getState()。
+
+var CFG = {
+  power: 0.9,               // 摩擦幂次 p：dv/dt = -k*|v|^p，越接近 1 低速段拖尾越长
+  friction: 0.0018,         // 摩擦系数 k（px/ms 量纲）
+  lowSpeedThreshold: 0.12,  // 低于该速度进入低速段（px/ms）
+  lowSpeedFactor: 0.6,      // 低速段摩擦乘数（越小低速溜得越久）
+  releaseWindowMs: 50,      // 抬手初速的最远采样窗口 ms
+  maxVelocity: 8,           // 单次甩动速度上限 px/ms
+  boost: true,              // 连续同向甩动速度叠加（模拟 Chromium Fling Booster）
+  boostMinSpeed: 0.35,      // 触发叠加的最低速度 px/ms
+  boostWindow: 300,         // 可叠加的时间窗口 ms
+  stopVelocity: 0.01,       // 低于此速度停止（px/ms）
+  rubberMax: 80,            // 惯性撞边的最大形变 px
+  edgeSpringOmega: 0.016,   // 弹簧自然角频率 rad/ms
+  edgeSpringDamping: 0.5,   // 压入段阻尼比（减震器）
+  edgeRecoverMsPerPx: 13,   // 恢复阶段时长 ms/px
+  edgeRecoverAccel: 0.25,   // 恢复段加速占比（短加速、长减速）
+  snapSpd: 0.4,             // 越界回弹速度
+  dampMax: 130              // 拖拽越界阻尼上限 px
+};
+
+function sign(v) {
+  if (v > 0) return 1;
+  if (v < 0) return -1;
+  return 0;
+}
+
+function ensureState(state) {
+  if (!state.inited) {
+    state.inited = true;
+    state.y = 0;
+    state.minY = 0;
+    state.maxY = 0;
+    state.scrollerH = 0;
+    state.contentH = 0;
+    state.vel = 0;
+    state.inDecel = false;
+    state.running = false;
+    state.trackId = -1;
+    state.lastY = 0;
+    state.lastT = 0;
+    state.moved = false;
+    state.samples = [];
+    state.startX = 0;
+    state.startY = 0;
+    state.dirLocked = false;
+    state.horizontal = false;
+    state.prevFlingVel = 0;
+    state.lastFlingT = 0;
+    state.spring = null;
+    state.nested = false;
+    state.listOverflow = false;
+    state.touching = false;
+    state.cbBucket = -1;
+    state.closePicker = false;
+  }
+}
+
+function dampShift(d) {
+  var max = CFG.dampMax;
+  var s = d >= 0 ? 1 : -1;
+  return s * max * (1 - Math.exp(-Math.abs(d) / (max * 1.6)));
+}
+
+// 拖拽/回弹渲染：越界形变按阻尼曲线压缩显示
+function renderY(state) {
+  var y = state.y;
+  if (y < state.minY) return state.minY - dampShift(state.minY - y);
+  if (y > state.maxY) return state.maxY + dampShift(y - state.maxY);
+  return y;
+}
+
+// 抬手速度采样：只保留最近 ~120ms，避免 Array.shift
+function pushSample(state, t, y) {
+  state.samples.push({ t: t, y: y });
+  var keep = [];
+  var n = state.samples.length;
+  for (var i = n - 1; i >= 0; i--) {
+    if (t - state.samples[i].t > 120) break;
+    keep.push(state.samples[i]);
+  }
+  var out = [];
+  for (var j = keep.length - 1; j >= 0; j--) out.push(keep[j]);
+  state.samples = out;
+}
+
+function estimateReleaseVel(state) {
+  var samples = state.samples;
+  if (!samples || samples.length < 2) return;
+  var last = samples[samples.length - 1];
+  var best = 0;
+  var start = samples.length - 1;
+  for (var i = samples.length - 1; i >= 0; i--) {
+    if (last.t - samples[i].t > CFG.releaseWindowMs) break;
+    start = i;
+  }
+  var spanWin = last.t - samples[start].t;
+  if (spanWin >= 8) best = -(last.y - samples[start].y) / spanWin;
+  var prev = samples[samples.length - 2];
+  var spanInst = last.t - prev.t;
+  if (spanInst >= 8) {
+    var inst = -(last.y - prev.y) / spanInst;
+    if (Math.abs(inst) > Math.abs(best)) best = inst;
+  }
+  if (Math.abs(best) > Math.abs(state.vel)) state.vel = best;
+  state.samples = [];
+}
+
+// 渲染：内容 transform + logo 缩放 + header 内边距（rpx），全部 setStyle 直写视图层
+// 内容用 2D translateY：微信对 will-change/translate3d 会预分配固定尺寸 GPU 层，
+// 文件列表高度动态变化时可能截断内容（index.wxss 旧注释记录过该坑），2D 无此问题。
+function applyRender(state, owner, rawY) {
+  var content = owner.selectComponent('.scroll-content');
+  if (content) {
+    content.setStyle({ transform: 'translateY(' + (-rawY) + 'px)' });
+  }
+  var real = state.maxY > 0 ? Math.min(Math.max(0, rawY), state.maxY) : 0;
+  var ratio = state.maxY > 0 ? Math.min(real / 400, 1) : 0;
+  var logo = owner.selectComponent('.logo-wrap');
+  if (logo) {
+    logo.setStyle({ transform: 'scale(' + (1 - ratio * 0.7) + ')' });
+  }
+  var header = owner.selectComponent('.header-area');
+  if (header) {
+    var pad = Math.round(40 - ratio * 32);
+    header.setStyle({ 'padding-top': pad + 'rpx', 'padding-bottom': pad + 'rpx' });
+  }
+  // 分桶节流通知逻辑层（每 100px 一次），供回顶按钮等阈值类 UI 使用
+  var bucket = Math.floor(real / 100);
+  if (bucket !== state.cbBucket) {
+    state.cbBucket = bucket;
+    owner.callMethod('onWxsScroll', { y: real, ratio: ratio });
+  }
+}
+
+// ---- 边界弹簧：两段式（真实弹簧积分压入 + 非对称 S 曲线恢复）----
+
+function startSpring(state, owner, target, dir, v0, x0) {
+  state.running = false;
+  state.inDecel = false;
+  state.vel = 0;
+  var vCap = CFG.rubberMax * CFG.edgeSpringOmega;
+  var initV = Math.max(0, Math.min(vCap, v0 || 0));
+  var givenX = Math.max(0, Math.min(CFG.rubberMax, x0 || 0));
+  if (givenX > 0) {
+    // 拖拽/滚动越界松手：直接从当前可见形变走 S 曲线恢复（无压入段）
+    state.spring = {
+      target: target,
+      dir: dir,
+      x: givenX,
+      xMax: givenX,
+      vx: 0,
+      compressing: false,
+      t0: getDate().getTime(),
+      durR: Math.min(640, Math.max(180, givenX * CFG.edgeRecoverMsPerPx))
+    };
+  } else if (initV < 0.02) {
+    state.y = target;
+    state.spring = null;
+    applyRender(state, owner, renderY(state));
+    return;
+  } else {
+    // 惯性撞击：弹簧积分压入，初速 = 到达边界的速度
+    state.spring = {
+      target: target,
+      dir: dir,
+      x: 0,
+      xMax: 0,
+      vx: initV,
+      compressing: true,
+      t0: getDate().getTime(),
+      durR: 0
+    };
+  }
+  state.y = target + dir * state.spring.x;
+  state.lastT = getDate().getTime();
+  state.running = true;
+  owner.requestAnimationFrame(function () { springTick(state, owner); });
+}
+
+function springTick(state, owner) {
+  if (!state.running || !state.spring) return;
+  var s = state.spring;
+  var now = getDate().getTime();
+  if (s.compressing) {
+    var dt = Math.min(32, Math.max(1, now - s.t0));
+    s.t0 = now;
+    var w = CFG.edgeSpringOmega;
+    var z = CFG.edgeSpringDamping;
+    // x'' = -w^2*x - 2*z*w*x'，速度连续，不会"猛地缩进去"
+    var a = -w * w * s.x - 2 * z * w * s.vx;
+    s.vx += a * dt;
+    s.x += s.vx * dt;
+    if (s.x >= CFG.rubberMax) {
+      s.x = CFG.rubberMax;
+      s.vx = 0;
+    }
+    if (s.vx <= 0) {
+      s.xMax = s.x;
+      s.compressing = false;
+      s.t0 = now;
+      s.durR = Math.min(640, Math.max(180, s.xMax * CFG.edgeRecoverMsPerPx));
+    }
+  } else {
+    // 非对称 S 曲线：前 edgeRecoverAccel 快速起速，后段长时间平滑减速到停
+    var p = Math.min(1, (now - s.t0) / s.durR);
+    var accel = CFG.edgeRecoverAccel;
+    var eased;
+    if (p < accel) {
+      var u = p / accel;
+      eased = accel * u * u * u;
+    } else {
+      var u2 = (p - accel) / (1 - accel);
+      eased = accel + (1 - accel) * (1 - Math.pow(1 - u2, 3));
+    }
+    s.x = s.xMax * (1 - eased);
+  }
+  state.y = s.target + s.dir * s.x;
+  applyRender(state, owner, state.y); // 越界形变 1:1 渲染
+  if (!s.compressing && (now - s.t0) >= s.durR) {
+    state.y = s.target;
+    state.spring = null;
+    state.running = false;
+    applyRender(state, owner, state.y);
+    return;
+  }
+  owner.requestAnimationFrame(function () { springTick(state, owner); });
+}
+
+// ---- 惯性（可调曲线：幂律摩擦 + 低速拖尾）----
+
+function startDecel(state, owner) {
+  state.inDecel = true;
+  state.running = true;
+  state.lastT = getDate().getTime();
+  owner.requestAnimationFrame(function () { decelTick(state, owner); });
+}
+
+function decelTick(state, owner) {
+  if (!state.running || !state.inDecel) return;
+  var now = getDate().getTime();
+  var dt = Math.max(1, now - state.lastT);
+  state.lastT = now;
+  var speed = Math.abs(state.vel);
+  var k = CFG.friction;
+  if (speed < CFG.lowSpeedThreshold) k *= CFG.lowSpeedFactor;
+  var decel = k * Math.pow(speed, CFG.power);
+  state.vel -= sign(state.vel) * decel * dt;
+  state.y += state.vel * dt;
+  if (state.y < state.minY) {
+    startSpring(state, owner, state.minY, -1, Math.abs(state.vel), 0);
+    return;
+  }
+  if (state.y > state.maxY) {
+    startSpring(state, owner, state.maxY, 1, Math.abs(state.vel), 0);
+    return;
+  }
+  if (Math.abs(state.vel) < CFG.stopVelocity) {
+    state.inDecel = false;
+    state.running = false;
+    applyRender(state, owner, state.y);
+    return;
+  }
+  applyRender(state, owner, state.y);
+  owner.requestAnimationFrame(function () { decelTick(state, owner); });
+}
+
+function snapBack(state, owner) {
+  state.running = false;
+  state.inDecel = false;
+  state.spring = null;
+  state.running = true;
+  owner.requestAnimationFrame(function () { snapTick(state, owner); });
+}
+
+function snapTick(state, owner) {
+  if (!state.running) return;
+  var target = state.y < state.minY ? state.minY : (state.y > state.maxY ? state.maxY : state.y);
+  if (target === state.y) {
+    state.running = false;
+    applyRender(state, owner, state.y);
+    return;
+  }
+  state.y += (target - state.y) * CFG.snapSpd;
+  if (Math.abs(state.y - target) < 0.3) {
+    state.y = target;
+    state.running = false;
+    applyRender(state, owner, state.y);
+    return;
+  }
+  applyRender(state, owner, renderY(state));
+  owner.requestAnimationFrame(function () { snapTick(state, owner); });
+}
+
+// ---- 程序化滚动（回顶 / 滚到指定区块），由逻辑层 scrollCmd 触发 ----
+
+function scrollTo(state, owner, targetY, duration) {
+  state.running = false;
+  state.inDecel = false;
+  state.spring = null;
+  var target = Math.max(state.minY, Math.min(targetY, state.maxY));
+  if (duration <= 0) {
+    state.y = target;
+    applyRender(state, owner, state.y);
+    return;
+  }
+  var startY = state.y;
+  var diff = target - startY;
+  if (Math.abs(diff) < 1) {
+    state.y = target;
+    applyRender(state, owner, state.y);
+    return;
+  }
+  var startT = getDate().getTime();
+  state.running = true;
+  owner.requestAnimationFrame(function () {
+    scrollTick(state, owner, startY, diff, startT, duration);
+  });
+}
+
+function scrollTick(state, owner, startY, diff, startT, duration) {
+  if (!state.running) return;
+  var p = Math.min(1, (getDate().getTime() - startT) / duration);
+  var eased = 1 - Math.pow(1 - p, 3); // easeOutCubic
+  state.y = startY + diff * eased;
+  applyRender(state, owner, state.y);
+  if (p < 1) {
+    owner.requestAnimationFrame(function () {
+      scrollTick(state, owner, startY, diff, startT, duration);
+    });
+  } else {
+    state.running = false;
+  }
+}
+
+function startPhysics(state, owner) {
+  estimateReleaseVel(state);
+  var maxV = CFG.maxVelocity;
+  state.vel = Math.max(-maxV, Math.min(maxV, state.vel));
+  var now = getDate().getTime();
+  if (CFG.boost && state.prevFlingVel !== 0 && sign(state.prevFlingVel) === sign(state.vel)
+      && Math.abs(state.prevFlingVel) >= CFG.boostMinSpeed && Math.abs(state.vel) >= CFG.boostMinSpeed
+      && now - state.lastFlingT <= CFG.boostWindow) {
+    state.vel += state.prevFlingVel;
+    state.vel = Math.max(-maxV, Math.min(maxV, state.vel));
+  }
+  state.prevFlingVel = state.vel;
+  state.lastFlingT = now;
+  if (state.y < state.minY) {
+    startSpring(state, owner, state.minY, -1, Math.abs(state.vel), dampShift(state.minY - state.y));
+    return;
+  }
+  if (state.y > state.maxY) {
+    startSpring(state, owner, state.maxY, 1, Math.abs(state.vel), dampShift(state.y - state.maxY));
+    return;
+  }
+  if (Math.abs(state.vel) < CFG.stopVelocity) {
+    snapBack(state, owner);
+    return;
+  }
+  startDecel(state, owner);
+}
+
+module.exports = {
+  // 逻辑层 setData(scrollConfig) → 视图层同步滚动边界（低频，不走每帧）
+  onConfig: function (newValue, oldValue, ownerInstance, instance) {
+    var state = ownerInstance.getState();
+    if (!state) return;
+    ensureState(state);
+    if (!newValue) return;
+    state.minY = newValue.minY || 0;
+    state.maxY = newValue.maxY || 0;
+    state.scrollerH = newValue.scrollerH || 0;
+    state.contentH = newValue.contentH || 0;
+    state.listOverflow = !!newValue.listOverflow;
+    state.closePicker = !!newValue.closePicker;
+    // 内容变短且当前不在交互/动画中 → 平滑回弹到新边界（不跳变）
+    if (state.y > state.maxY && !state.touching && !state.inDecel && !state.spring) {
+      var visual = dampShift(state.y - state.maxY);
+      startSpring(state, ownerInstance, state.maxY, 1, 0, visual);
+    } else {
+      applyRender(state, ownerInstance, renderY(state));
+    }
+  },
+  touchstart: function (event, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state) return;
+    ensureState(state);
+    var touches = event.touches || [];
+    if (touches.length === 0) return;
+    state.running = false;   // 停止一切惯性/回弹循环（下一次 rAF 自然退出）
+    state.inDecel = false;
+    state.spring = null;
+    state.dirLocked = false;
+    state.horizontal = false;
+    state.moved = false;
+    state.touching = true;
+    var t0 = touches[0];
+    state.trackId = t0.identifier;
+    state.lastY = t0.clientY;
+    state.lastT = getDate().getTime();
+    state.startX = t0.clientX;
+    state.startY = t0.clientY;
+    state.vel = 0;
+    state.samples = [{ t: state.lastT, y: t0.clientY }];
+    // me 页：触摸开始即收起 fixed 定位的分页下拉，避免滚动时错位
+    if (state.closePicker) {
+      ownerInstance.callMethod('onWxsTouchStart', {});
+    }
+    // 内层有界文件列表：触点落在其可视区内且列表确实可滚 → 让给原生
+    state.nested = false;
+    if (state.listOverflow) {
+      var list = ownerInstance.selectComponent('.file-list-scroll');
+      if (list) {
+        var rect = list.getBoundingClientRect();
+        if (rect && t0.clientY >= rect.top && t0.clientY <= rect.bottom) {
+          state.nested = true;
+        }
+      }
+    }
+  },
+  touchmove: function (event, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state || !state.inited) return true;
+    var touches = event.touches || [];
+    if (touches.length === 0) return true;
+    if (state.trackId < 0) return true;
+    var t0 = touches[0];
+    // 方向锁定：横向手势让出（左滑卡片/滑块等）
+    var dx = t0.clientX - state.startX;
+    var dy = t0.clientY - state.startY;
+    if (!state.dirLocked) {
+      if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+        state.dirLocked = true;
+        if (Math.abs(dx) > Math.abs(dy)) {
+          state.horizontal = true;
+          return true;
+        }
+      } else {
+        return true;
+      }
+    }
+    if (state.horizontal) return true;
+    if (state.nested) return true; // 内层原生滚动，外层不接管
+    var now = getDate().getTime();
+    var ddy = t0.clientY - state.lastY;
+    var dt = Math.max(1, now - state.lastT);
+    if (Math.abs(ddy) > 0.5) state.moved = true;
+    state.y -= ddy;
+    var inst = -ddy / dt;
+    state.vel = state.vel * 0.6 + inst * 0.4;
+    state.lastY = t0.clientY;
+    state.lastT = now;
+    pushSample(state, now, t0.clientY);
+    applyRender(state, ownerInstance, renderY(state));
+    return false; // preventDefault + stopPropagation
+  },
+  touchend: function (event, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state || !state.inited) return;
+    state.dirLocked = false;
+    state.horizontal = false;
+    state.touching = false;
+    var touches = event.touches || [];
+    if (touches.length > 0) {
+      state.trackId = -1; // 还有手指按住，等全部抬起再启动惯性
+      return;
+    }
+    state.trackId = -1;
+    state.nested = false;
+    startPhysics(state, ownerInstance);
+  },
+  onCmd: function (newValue, oldValue, ownerInstance, instance) {
+    var state = ownerInstance.getState();
+    if (!state) return;
+    ensureState(state);
+    if (!newValue) return;
+    var dur = newValue.dur || 280;
+    if (newValue.mode === 'section') {
+      // 滚到指定区块：内容坐标 = 区块可视位置 - 容器可视位置 + 当前滚动量
+      var scroller = ownerInstance.selectComponent('.scroller');
+      var section = ownerInstance.selectComponent(newValue.section);
+      if (scroller && section) {
+        var r1 = scroller.getBoundingClientRect();
+        var r2 = section.getBoundingClientRect();
+        if (r1 && r2) {
+          var offset = newValue.offset || 0;
+          var targetY = (r2.top - r1.top) + state.y + offset;
+          scrollTo(state, ownerInstance, targetY, dur);
+        }
+      }
+    } else if (newValue.mode === 'to') {
+      scrollTo(state, ownerInstance, newValue.y, dur);
+    }
+  }
+};

@@ -13,6 +13,8 @@ Component({
     loading: true,
     loadError: '',
     expandedUsers: {},
+    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false },
+    scrollCmd: null,
     statusMap: {
       active: '临时授权中',
       expired: '已过期',
@@ -37,6 +39,7 @@ Component({
         pageExit: '',
         isDarkMode: app.globalData.isDarkMode,
       })
+      this._scheduleMeasure()
     },
     hide() {
       const forward = wx.getStorageSync('_navForward')
@@ -48,11 +51,74 @@ Component({
     attached() {
       const app = getApp()
       this.setData({ isDarkMode: app.globalData.isDarkMode })
+      this._initScrollEngine()
       this.loadUsers()
+    },
+    detached() {
+      this._destroyScrollEngine()
     },
   },
 
   methods: {
+    // ==================== WXS 滚动引擎（视图层直驱，0 setData） ====================
+    _initScrollEngine() {
+      this._scrollerH = 0
+      this._contentH = 0
+      this._maxY = 0
+      this._bottomPad = 20
+      this._measureTimer = null
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(), 400)
+      setTimeout(() => this._scheduleMeasure(), 800)
+    },
+
+    _destroyScrollEngine() {
+      if (this._measureTimer) {
+        clearTimeout(this._measureTimer)
+        this._measureTimer = null
+      }
+    },
+
+    // 去抖测量：内容变化后延迟刷新滚动边界
+    _scheduleMeasure(delay) {
+      if (this._measureTimer) clearTimeout(this._measureTimer)
+      this._measureTimer = setTimeout(() => {
+        this._measureTimer = null
+        this._measure()
+      }, delay || 100)
+    },
+
+    _measure() {
+      const q = this.createSelectorQuery()
+      q.select('.scroller').boundingClientRect()
+      q.select('.scroll-content').boundingClientRect()
+      q.exec((res) => {
+        if (!res || !res[0] || !res[1]) return
+        const vp = res[0].height || 0
+        const ch = res[1].height || 0
+        this._scrollerH = vp
+        this._contentH = ch
+        this._maxY = Math.max(0, ch - vp + this._bottomPad)
+        this._pushScrollConfig()
+      })
+    },
+
+    // 推送滚动边界给 WXS 引擎（change:prop 观察器，低频同步，不逐帧走 setData）
+    _pushScrollConfig() {
+      this.setData({
+        scrollConfig: {
+          minY: 0,
+          maxY: Math.round(this._maxY || 0),
+          scrollerH: this._scrollerH || 0,
+          contentH: this._contentH || 0,
+          listOverflow: false,
+        },
+      })
+    },
+
+    // WXS 分桶回调（每 100px 一次），本页暂不消费
+    onWxsScroll() {},
+
     _navigateWithAnimation(url) {
       wx.setStorageSync('_navForward', '1')
       this.setData({ pageExit: 'page-exit-left' })
@@ -102,6 +168,7 @@ Component({
               }
             })
             this.setData({ users, loadError: '' })
+            this._scheduleMeasure(100)
           } else {
             // 页面内状态提示（对齐 Android App）：不清空已加载列表
             this.setData({ loadError: res.data.message || '加载失败' })
@@ -112,6 +179,7 @@ Component({
         },
         complete: () => {
           this.setData({ loading: false })
+          this._scheduleMeasure()
         },
       })
     },
@@ -134,6 +202,7 @@ Component({
         expanded[openid] = true
       }
       this.setData({ expandedUsers: expanded })
+      this._scheduleMeasure()
     },
   },
 })

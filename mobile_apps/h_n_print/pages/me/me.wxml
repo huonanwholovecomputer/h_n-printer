@@ -2,6 +2,8 @@
 <page-meta root-background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-top="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" background-color-bottom="{{isDarkMode ? '#1C1C1E' : '#F2F2F7'}}" page-style="--tab-highlight:{{isDarkMode ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.7)'}};--tab-bg:{{isDarkMode ? 'rgba(26,26,28,0.50)' : 'var(--glass-regular)'}};--tab-text:{{isDarkMode ? '#98989D' : '#8E8E93'}};--tab-text-active:{{isDarkMode ? '#409CFF' : '#007AFF'}}"></page-meta>
 <navigation-bar title="我" back="{{false}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 
+<wxs module="scroll" src="../../utils/scroll.wxs"></wxs>
+
 <!-- theme-bg-layer 在 page-root 外，始终可见，确保淡入淡出间隙不露原生白色背景 -->
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
 
@@ -12,7 +14,7 @@
 
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
   <!-- 返回顶部按钮（右下角） -->
-  <view class="scroll-top-btn {{scrollTop > 200 ? 'scroll-top-visible' : ''}}" bindtap="onScrollToTop" hover-class="tap-active">
+  <view class="scroll-top-btn {{showScrollTop ? 'scroll-top-visible' : ''}}" bindtap="onScrollToTop" hover-class="tap-active">
     <view class="scroll-top-arrow">
       <view class="arrow-bar arrow-left"></view>
       <view class="arrow-bar arrow-right"></view>
@@ -21,12 +23,16 @@
   <!-- 自定义滚动容器：负责橡皮筋回弹物理（与首页一致） -->
   <view
     class="scroller"
-    bindtouchstart="onScrollerTouchStart"
-    bindtouchmove="onScrollerTouchMove"
-    bindtouchend="onScrollerTouchEnd"
-    bindtouchcancel="onScrollerTouchEnd"
+    prop="{{scrollConfig}}"
+    change:prop="{{scroll.onConfig}}"
+    cmd="{{scrollCmd}}"
+    change:cmd="{{scroll.onCmd}}"
+    bindtouchstart="{{scroll.touchstart}}"
+    bindtouchmove="{{scroll.touchmove}}"
+    bindtouchend="{{scroll.touchend}}"
+    bindtouchcancel="{{scroll.touchend}}"
   >
-    <view class="scroll-content" style="transform: translateY({{-scrollTop}}px);">
+    <view class="scroll-content">
       <view class="container">
 
     <!-- 用户信息卡片（右侧许可密钥徽章可点击展开详情） -->

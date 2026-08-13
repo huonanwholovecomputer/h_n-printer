@@ -1,9 +1,17 @@
 /** user-orders.wxss — Apple-style order list page **/
 
-/* ── Root & Container ── */
-.scrollarea {
+/* ── Root & Container（WXS 自定义滚动，与 index/me 一致）── */
+.scroller {
+  flex: 1;
   height: 100vh;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
   background-color: var(--bg-primary);
+}
+
+.scroll-content {
+  /* 不加 will-change：微信会预分配固定尺寸 GPU 层，动态内容会被截断（与 index/me 一致） */
 }
 
 .container {

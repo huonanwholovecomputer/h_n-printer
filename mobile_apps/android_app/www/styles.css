@@ -6,7 +6,7 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; }
+html, body { height: 100%; overscroll-behavior: none; }
 view { display: block; }
 
 /* 手机框：桌面预览时约束为手机宽度；container-type 提供 cqw 缩放基准 */
@@ -819,12 +819,20 @@ body {
 
 .scroller {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
   position: relative;
   min-height: 0;
 }
 
-.scroll-content {
+/* JS 惯性引擎接管时：外层裁剪 + 禁用浏览器手势，内容走 transform（可调曲线原型） */
+.scroller.js-scroll {
+  overflow: hidden;
+  touch-action: none;
+}
+.js-scroll .scroll-content {
   will-change: transform;
 }
 
@@ -1601,7 +1609,10 @@ body {
 
 .scroller {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
   position: relative;
   min-height: 0;
 }
@@ -3019,7 +3030,10 @@ picker-view-column {
 
 .scroller {
   flex: 1;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
   position: relative;
   min-height: 0;
 }
@@ -5566,9 +5580,8 @@ picker-view-column {
 .theme-toggle-btn { position: absolute; }
 .toast { position: absolute; }
 
-/* scroller 允许原生滚动兜底（自定义引擎未接管时） */
+/* scroller 原生滚动（WebView 原生惯性，QQ/微信同款手感） */
 .scroller { overflow-y: auto; }
-.scroller.engine-active { overflow-y: hidden; }
 
 /* 桌面端滚动条更细 */
 .scroller::-webkit-scrollbar { width: 4px; }

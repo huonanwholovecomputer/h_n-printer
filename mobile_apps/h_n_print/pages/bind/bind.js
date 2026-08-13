@@ -16,6 +16,9 @@ Component({
     // 已绑定设备
     devices: [],
     loading: true,
+    // WXS 引擎：滚动边界 + 程序化滚动命令
+    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false },
+    scrollCmd: null,
   },
 
   pageLifetimes: {
@@ -30,6 +33,7 @@ Component({
       })
       this.loadDevices()
       if (this.data.bindKey) this._startBindCountdown()
+      this._scheduleMeasure()
     },
     hide() {
       const forward = wx.getStorageSync('_navForward')
@@ -42,11 +46,74 @@ Component({
     attached() {
       const app = getApp()
       this.setData({ isDarkMode: app.globalData.isDarkMode })
+      this._initScrollEngine()
       this.loadDevices()
+    },
+    detached() {
+      this._destroyScrollEngine()
     },
   },
 
   methods: {
+    // ==================== WXS 滚动引擎（视图层直驱，0 setData） ====================
+    _initScrollEngine() {
+      this._scrollerH = 0
+      this._contentH = 0
+      this._maxY = 0
+      this._bottomPad = 20
+      this._measureTimer = null
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(), 400)
+      setTimeout(() => this._scheduleMeasure(), 800)
+    },
+
+    _destroyScrollEngine() {
+      if (this._measureTimer) {
+        clearTimeout(this._measureTimer)
+        this._measureTimer = null
+      }
+    },
+
+    // 去抖测量：内容变化后延迟刷新滚动边界
+    _scheduleMeasure(delay) {
+      if (this._measureTimer) clearTimeout(this._measureTimer)
+      this._measureTimer = setTimeout(() => {
+        this._measureTimer = null
+        this._measure()
+      }, delay || 100)
+    },
+
+    _measure() {
+      const q = this.createSelectorQuery()
+      q.select('.scroller').boundingClientRect()
+      q.select('.scroll-content').boundingClientRect()
+      q.exec((res) => {
+        if (!res || !res[0] || !res[1]) return
+        const vp = res[0].height || 0
+        const ch = res[1].height || 0
+        this._scrollerH = vp
+        this._contentH = ch
+        this._maxY = Math.max(0, ch - vp + this._bottomPad)
+        this._pushScrollConfig()
+      })
+    },
+
+    // 推送滚动边界给 WXS 引擎（change:prop 观察器，低频同步，不逐帧走 setData）
+    _pushScrollConfig() {
+      this.setData({
+        scrollConfig: {
+          minY: 0,
+          maxY: Math.round(this._maxY || 0),
+          scrollerH: this._scrollerH || 0,
+          contentH: this._contentH || 0,
+          listOverflow: false,
+        },
+      })
+    },
+
+    // WXS 分桶回调（每 100px 一次），本页暂不消费
+    onWxsScroll() {},
+
     // 解析后端时间字符串 "YYYY-MM-DD HH:MM:SS" → 时间戳（按服务器本地时区）
     _parseServerTime(str) {
       if (!str) return 0
@@ -75,6 +142,7 @@ Component({
               bindKeyCountdownText: '',
             })
             this._startBindCountdown()
+            this._scheduleMeasure()
           } else {
             wx.showToast({ title: (res.data && res.data.message) || '生成失败', icon: 'none' })
           }
@@ -132,8 +200,12 @@ Component({
         success: (res) => {
           if (!res.data || !res.data.success) return
           this.setData({ devices: res.data.devices || [], loading: false })
+          this._scheduleMeasure(100)
         },
-        fail: () => this.setData({ loading: false })
+        fail: () => {
+          this.setData({ loading: false })
+          this._scheduleMeasure()
+        }
       })
     },
 

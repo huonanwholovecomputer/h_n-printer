@@ -84,8 +84,9 @@ Component({
     _keyCountdownTimer: null,
     // 管理员：许可密钥轮询定时器（内部状态，非响应式）
     _keyPollTimer: null,
-    // 内部滚动位置（驱动 scroll-content 的 translateY）
-    scrollTop: 0,
+    showScrollTop: false,   // 回顶按钮显隐（WXS 分桶回调驱动）
+    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false, closePicker: true },
+    scrollCmd: null,        // WXS 程序化滚动命令（回顶 / 滚到订单区）
     // 任务卡展开状态: { [orderId]: true }
     expandedOrders: {},
     // 管理员：服务器存储统计
@@ -137,9 +138,10 @@ Component({
       wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
       // 计算主题切换按钮位置：放在导航栏下方（导航栏 = statusBar + 内容区域）
       // iOS 导航栏内容高 44px，Android/devtools 高 48px（与 navigation-bar 组件逻辑一致）
-      const sysInfo = wx.getSystemInfoSync()
-      const sbh = sysInfo.statusBarHeight || 20
-      const isAndroid = sysInfo.platform === 'android' || sysInfo.platform === 'devtools'
+      const winInfo = wx.getWindowInfo()
+      const devInfo = wx.getDeviceInfo()
+      const sbh = winInfo.statusBarHeight || 20
+      const isAndroid = devInfo.platform === 'android' || devInfo.platform === 'devtools'
       const navContentH = isAndroid ? 48 : 44
       const btnTop = sbh + navContentH + 8  // +8px 间距
       this.data.navBarBtnTop = btnTop
@@ -359,31 +361,14 @@ Component({
         this._orderPollTimer = null
       }
     },
-    // ==================== 自定义橡皮筋滚动引擎 ====================
-    // 与首页 index.js 同构，去掉 Logo 联动；新增 _scheduleMeasure
-    // 以便在动态内容（任务/角色/许可用户）加载后刷新滚动上下界。
+    // ==================== WXS 滚动引擎（视图层直驱，0 setData） ====================
+    // 与首页共用 utils/scroll.wxs；本页只负责测量边界 + 低频推送 scrollConfig，
+    // 以及回顶/滚到订单区的 scrollCmd 指令。
 
     _initScrollEngine() {
-      this._y = 0
-      this._minY = 0
-      this._maxY = 0
       this._scrollerH = 0
       this._contentH = 0
-
-      this._trackId = null
-      this._lastY = 0
-      this._lastT = 0
-      this._moved = false
-      this._points = []
-
-      this._tick = null
-      this._vel = 0
-      this._inDecel = false
-      this._handoff = false
-
-      this._dampMax = 130
-      this._fric = 0.006
-      this._snapSpd = 0.32
+      this._maxY = 0
 
       this._measureTimer = null  // 去抖测量句柄
 
@@ -401,7 +386,7 @@ Component({
       this._keySwipeLastX = 0
       this._keySwipeStartCardX = 0  // 触摸开始时卡片的初始偏移
       this._keySwipeHorizontal = false   // 本次触摸是否已锁定为水平
-      this._swipeHorizontal = false      // 通知滚动引擎让出控制（卡片左滑中）
+      this._swipeHorizontal = false      // 卡片左滑中（WXS 引擎靠自身方向锁定让位，此标记保留给卡片自身）
       // 删除按钮宽度：140rpx → px（按实际屏幕宽度换算，取代硬编码）
       const { windowWidth } = wx.getWindowInfo()
       const rpxRatio = (windowWidth || 375) / 750
@@ -409,13 +394,12 @@ Component({
       this._adminDeleteWidthPx = Math.round(140 * rpxRatio)  // 管理员移除按钮
 
       // 初次测量（多次延迟以应对 swiper 布局稳定）
-      setTimeout(() => this._measure(), 60)
-      setTimeout(() => this._measure(), 400)
-      setTimeout(() => this._measure(), 800)
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(), 400)
+      setTimeout(() => this._scheduleMeasure(), 800)
     },
 
     _destroyScrollEngine() {
-      this._cancelSchedule()
       if (this._scrollAnimTimer) {
         clearTimeout(this._scrollAnimTimer)
         this._scrollAnimTimer = null
@@ -432,16 +416,6 @@ Component({
       this._stopKeyPolling()
     },
 
-    _schedule(fn) {
-      return setTimeout(fn, 16)
-    },
-    _cancelSchedule() {
-      if (this._tick) {
-        clearTimeout(this._tick)
-        this._tick = null
-      }
-    },
-
     // 去抖测量：动态内容变化时合并多次刷新请求
     // delay 可选，默认 100ms
     _scheduleMeasure(delay) {
@@ -450,6 +424,31 @@ Component({
         this._measureTimer = null
         this._measure()
       }, delay || 100)
+    },
+
+    // 推送滚动边界给 WXS 引擎（change:prop 观察器，低频同步，不逐帧走 setData）
+    _pushScrollConfig() {
+      this.setData({
+        scrollConfig: {
+          minY: 0,
+          maxY: Math.round(this._maxY || 0),
+          scrollerH: this._scrollerH || 0,
+          contentH: this._contentH || 0,
+          listOverflow: false,
+          closePicker: true,   // 触摸开始时通知逻辑层收起分页下拉
+        },
+      })
+    },
+
+    // WXS 分桶回调（每 100px 一次）：控制回顶按钮显隐
+    onWxsScroll({ y }) {
+      const show = y > 200
+      if (show !== this.data.showScrollTop) this.setData({ showScrollTop: show })
+    },
+
+    // WXS 触摸开始回调：收起 fixed 定位的分页下拉，避免滚动时错位
+    onWxsTouchStart() {
+      if (this.data.showPageSizePicker) this.setData({ showPageSizePicker: false })
     },
 
     _measure() {
@@ -463,249 +462,15 @@ Component({
         this._scrollerH = vp
         this._contentH = ch
         this._maxY = Math.max(0, ch - vp + this._bottomPad + this._tabOverlayPx)
-        // 内容变短导致当前超出新上界 → 平滑回弹归位（不跳变）
-        if (this._y > this._maxY) {
-          this._snapBack()
-        } else {
-          this._applyY()
-        }
+        this._pushScrollConfig()
       })
-    },
-
-    _applyY() {
-      this.setData({ scrollTop: this._renderY() })
-    },
-
-    _dampShift(d) {
-      const max = this._dampMax
-      const sign = d >= 0 ? 1 : -1
-      return sign * max * (1 - Math.exp(-Math.abs(d) / (max * 1.6)))
-    },
-
-    _renderY() {
-      const y = this._y
-      if (y < this._minY) {
-        return this._minY - this._dampShift(this._minY - y)
-      }
-      if (y > this._maxY) {
-        return this._maxY + this._dampShift(y - this._maxY)
-      }
-      return y
-    },
-
-    onScrollerTouchStart(e) {
-      const touches = e.touches || []
-      this._points = touches.map((t) => ({ id: t.identifier, y: t.clientY }))
-      // 分页下拉为 fixed 定位，不随内容滚动：开始滚动即收起，避免错位
-      if (this.data.showPageSizePicker) this.setData({ showPageSizePicker: false })
-
-      // 新增：方向锁定初始化
-      if (touches.length > 0) {
-        this._startX = touches[0].clientX
-        this._startY = touches[0].clientY
-        this._directionLocked = false
-        this._horizontalGesture = false
-      }
-
-      this._cancelSchedule()
-      this._inDecel = false
-      this._handoff = false
-
-      if (this._trackId === null) {
-        const p = this._points[0]
-        if (!p) return
-        this._trackId = p.id
-        this._lastY = p.y
-        this._lastT = Date.now()
-        this._vel = 0
-        this._moved = false
-      } else {
-        const cur = this._points.find((p) => p.id === this._trackId)
-        if (cur) {
-          this._lastY = cur.y
-          this._lastT = Date.now()
-        }
-      }
-    },
-
-    onScrollerTouchMove(e) {
-      // 许可密钥卡片正在左滑 → 滚动引擎让出控制，避免上下抖动
-      if (this._swipeHorizontal) return
-      const touches = e.touches || []
-      if (touches.length === 0) return
-      this._points = touches.map((t) => ({ id: t.identifier, y: t.clientY }))
-
-      // ---- 新增：方向锁定逻辑 ----
-      const touchDx = touches[0].clientX - this._startX
-      const touchDy = touches[0].clientY - this._startY
-
-      if (!this._directionLocked) {
-        if (Math.abs(touchDx) > 5 || Math.abs(touchDy) > 5) {
-          if (Math.abs(touchDx) > Math.abs(touchDy)) {
-            this._directionLocked = true
-            this._horizontalGesture = true
-            return
-          } else {
-            this._directionLocked = true
-            this._horizontalGesture = false
-          }
-        } else {
-          return
-        }
-      }
-
-      if (this._horizontalGesture) {
-        return
-      }
-
-      // ---- 原有垂直滚动逻辑 ----
-      if (this._trackId === null || !this._points.find((p) => p.id === this._trackId)) {
-        const p = this._points[0]
-        if (!p) return
-        this._trackId = p.id
-        this._lastY = p.y
-        this._lastT = Date.now()
-        this._handoff = true
-        return
-      }
-
-      const cur = this._points.find((p) => p.id === this._trackId)
-      if (!cur) return
-
-      const now = Date.now()
-      const dy = cur.y - this._lastY
-      const dt = Math.max(1, now - this._lastT)
-
-      if (Math.abs(dy) > 0.5) this._moved = true
-
-      this._y -= dy
-      const inst = -dy / dt
-      this._vel = this._vel * 0.6 + inst * 0.4
-
-      this._lastY = cur.y
-      this._lastT = now
-
-      this._applyY()
-    },
-
-    onScrollerTouchEnd(e) {
-      // 重置方向状态
-      this._horizontalGesture = false
-      this._directionLocked = false
-
-      const touches = e.touches || []
-      this._points = touches.map((t) => ({ id: t.identifier, y: t.clientY }))
-
-      const stillHasMain = this._points.find((p) => p.id === this._trackId)
-      if (stillHasMain) return
-
-      if (this._points.length > 0) {
-        this._trackId = null
-        this._handoff = true
-        return
-      }
-
-      this._trackId = null
-      this._handoff = false
-      this._startPhysics()
-    },
-
-    _startPhysics() {
-      this._cancelSchedule()
-      if (this._y < this._minY || this._y > this._maxY) {
-        this._vel = 0
-        this._snapBack()
-        return
-      }
-      if (Math.abs(this._vel) < 0.05) {
-        this._snapBack()
-        return
-      }
-      this._inDecel = true
-      this._lastT = Date.now()
-      const tick = () => {
-        if (!this._inDecel) return
-        const now = Date.now()
-        const dt = Math.max(1, now - this._lastT)
-        this._lastT = now
-
-        const decay = Math.exp(-this._fric * dt)
-        this._vel *= decay
-        this._y += this._vel * dt
-
-        if (this._y < this._minY) {
-          this._y = this._minY
-          this._vel = 0
-          this._inDecel = false
-          this._snapBack()
-          return
-        }
-        if (this._y > this._maxY) {
-          this._y = this._maxY
-          this._vel = 0
-          this._inDecel = false
-          this._snapBack()
-          return
-        }
-        if (Math.abs(this._vel) < 0.02) {
-          this._inDecel = false
-          this._applyY()
-          return
-        }
-        this._applyY()
-        this._tick = this._schedule(tick)
-      }
-      this._tick = this._schedule(tick)
-    },
-
-    _snapBack() {
-      this._cancelSchedule()
-      const tick = () => {
-        if (this._handoff) {
-          this._tick = null
-          return
-        }
-        const minY = this._minY
-        const maxY = this._maxY
-        let target = this._y
-        if (this._y < minY) target = minY
-        else if (this._y > maxY) target = maxY
-        else {
-          this._y = target
-          this._applyY()
-          this._tick = null
-          return
-        }
-        this._y += (target - this._y) * this._snapSpd
-        if (Math.abs(this._y - target) < 0.3) {
-          this._y = target
-          this._applyY()
-          this._tick = null
-          return
-        }
-        this._applyY()
-        this._tick = this._schedule(tick)
-      }
-      this._tick = this._schedule(tick)
     },
 
     noop() {},
 
     onScrollToTop() {
-      const target = this._minY
-      const tick = () => {
-        if (this._handoff) { this._tick = null; return }
-        this._y += (target - this._y) * 0.2
-        if (Math.abs(this._y - target) < 0.3) {
-          this._y = target
-          this._applyY()
-          this._tick = null
-          return
-        }
-        this._applyY()
-        this._tick = this._schedule(tick)
-      }
-      this._tick = this._schedule(tick)
+      // 交给 WXS 引擎做 easeOutCubic 平滑滚动（视图层 rAF）
+      this.setData({ scrollCmd: { mode: 'to', y: 0, dur: 300 } })
     },
 
     // ==================== 用户资料 ====================
@@ -2341,7 +2106,7 @@ Component({
           this.setData({ showPageSizePicker: true })
           return
         }
-        const winH = (wx.getSystemInfoSync ? wx.getSystemInfoSync().windowHeight : 0) || 600
+        const winH = (wx.getWindowInfo ? wx.getWindowInfo().windowHeight : 0) || 600
         const dropH = 250   // 4 个选项的估算高度
         const left = rect.left
         const top = rect.top + rect.height + 3
@@ -2367,53 +2132,9 @@ Component({
     },
 
     // 滚动到"我的打印任务"区域而非页面顶部。
-    // 在数据返回、按新内容重新测量后再滚：内容变矮导致当前位置超界时无动画归位，
-    // 避免 _measure 的 snapBack 回弹；内容不足一屏时不滚动。
+    // 由 WXS 引擎在视图层测量区块位置并动画（内容坐标 = 区块可视位置 - 容器可视位置 + 当前滚动量）。
     _scrollToOrdersSection() {
-      const q = this.createSelectorQuery()
-      q.select('.scroller').boundingClientRect()
-      q.select('.scroll-content').boundingClientRect()
-      q.select('.orders-section').boundingClientRect()
-      q.exec((res) => {
-        if (!res || !res[0] || !res[1] || !res[2]) return
-        const vp = res[0].height || 0
-        const ch = res[1].height || 0
-        this._scrollerH = vp
-        this._contentH = ch
-        this._maxY = Math.max(0, ch - vp + this._bottomPad + this._tabOverlayPx)
-        // 内容变短导致当前位置超出新边界：无动画归位（取消 _measure/snapBack 的回弹动画）
-        if (this._y > this._maxY) {
-          this._cancelSchedule()
-          this._y = this._maxY
-          this._applyY()
-        }
-        // 内容不足一屏：不滚动，保持原位
-        if (this._maxY <= 0) return
-        const sectionTop = res[2].top - res[0].top + this._y
-        const target = Math.min(this._maxY, Math.max(this._minY, sectionTop - 20))
-        if (Math.abs(target - this._y) < 2) return
-        this._animateScroll(target, 280)
-      })
-    },
-
-    // 平滑滚动到指定位置（ease-out 曲线）
-    _animateScroll(targetY, duration) {
-      this._cancelSchedule()
-      this._inDecel = false
-      const startY = this._y
-      const startT = Date.now()
-      const animate = () => {
-        const elapsed = Date.now() - startT
-        const p = Math.min(1, elapsed / duration)
-        // easeOutCubic: 1 - (1-p)^3
-        const eased = 1 - Math.pow(1 - p, 3)
-        this._y = startY + (targetY - startY) * eased
-        this._applyY()
-        if (p < 1) {
-          this._scrollAnimTimer = setTimeout(animate, 16)
-        }
-      }
-      animate()
+      this.setData({ scrollCmd: { mode: 'section', section: '.orders-section', offset: -20, dur: 280 } })
     },
 
     // 橡皮筋阻尼：允许越界滑动，阻力渐增，松手回弹

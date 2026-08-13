@@ -2,10 +2,20 @@
 <page-meta></page-meta>
 <navigation-bar title="账号绑定" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
+<wxs module="scroll" src="../../utils/scroll.wxs"></wxs>
 <view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
 
-<scroll-view class="scrollarea" scroll-y type="list" enhanced show-scrollbar="{{false}}">
-  <view class="container">
+<view class="scroller"
+      prop="{{scrollConfig}}"
+      change:prop="{{scroll.onConfig}}"
+      cmd="{{scrollCmd}}"
+      change:cmd="{{scroll.onCmd}}"
+      bindtouchstart="{{scroll.touchstart}}"
+      bindtouchmove="{{scroll.touchmove}}"
+      bindtouchend="{{scroll.touchend}}"
+      bindtouchcancel="{{scroll.touchend}}">
+  <view class="scroll-content">
+    <view class="container">
     <view class="bind-intro">
       <text class="bind-intro-text">生成一次性绑定密钥，在 APP 端「绑定微信账号」中填写。绑定后该 APP 将以本账号身份发起任务（权限与小程序一致），订单按 APP 来源统计。</text>
     </view>
@@ -59,6 +69,7 @@
         </view>
       </view>
     </view>
+    </view>
   </view>
-</scroll-view>
+</view>
 </view>

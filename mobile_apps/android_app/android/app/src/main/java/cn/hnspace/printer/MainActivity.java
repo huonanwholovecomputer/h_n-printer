@@ -2,6 +2,7 @@ package cn.hnspace.printer;
 
 import android.graphics.Color;
 import android.os.Bundle;
+import android.view.View;
 import android.view.Window;
 import android.webkit.JavascriptInterface;
 
@@ -21,6 +22,8 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         enableEdgeToEdge();
+        // 关闭 WebView 原生越界效果（边缘发光 / 整页拉伸），边界橡皮筋由前端 JS 统一实现
+        getBridge().getWebView().setOverScrollMode(View.OVER_SCROLL_NEVER);
     }
 
     private void enableEdgeToEdge() {

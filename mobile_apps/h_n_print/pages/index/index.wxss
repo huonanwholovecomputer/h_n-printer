@@ -100,12 +100,10 @@
 .header-area {
   text-align: center;
   padding: 32rpx 0;
-  transition: padding 0.06s linear;
 }
 
 .logo-wrap {
   display: inline-block;
-  transition: transform 0.06s linear;
 }
 
 .logo {

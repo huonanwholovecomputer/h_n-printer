@@ -41,9 +41,9 @@ Component({
     userDetail: null,
     showLicenseDetail: false,
 
-    // 列表滚动控制（对齐“我”页面：切换页码/每页条数后自动滚动到列表顶部）
-    listScrollTop: 0,
-    scrollWithAnimation: false,
+    // WXS 引擎：滚动边界 + 程序化滚动命令（对齐“我”页面）
+    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false },
+    scrollCmd: null,
 
     statusMap: {
       queued: '排队中',
@@ -66,6 +66,7 @@ Component({
     attached() {
       const app = getApp()
       this.setData({ isDarkMode: app.globalData.isDarkMode })
+      this._initScrollEngine()
       const openid = this.data.openid || ''
       const nickname = this.data.nickname ? decodeURIComponent(this.data.nickname) : ''
       const source = this.data.source || ''
@@ -90,6 +91,9 @@ Component({
         this.loadUserDetail(openid)
       }
     },
+    detached() {
+      this._destroyScrollEngine()
+    },
   },
   pageLifetimes: {
     show() {
@@ -105,6 +109,7 @@ Component({
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
       }
       this._startPolling()
+      this._scheduleMeasure()
     },
     hide() {
       this._stopPolling()
@@ -114,6 +119,65 @@ Component({
   },
 
   methods: {
+    // ==================== WXS 滚动引擎（视图层直驱，0 setData） ====================
+    _initScrollEngine() {
+      this._scrollerH = 0
+      this._contentH = 0
+      this._maxY = 0
+      this._bottomPad = 20
+      this._measureTimer = null
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(), 400)
+      setTimeout(() => this._scheduleMeasure(), 800)
+    },
+
+    _destroyScrollEngine() {
+      if (this._measureTimer) {
+        clearTimeout(this._measureTimer)
+        this._measureTimer = null
+      }
+    },
+
+    // 去抖测量：内容变化后延迟刷新滚动边界
+    _scheduleMeasure(delay) {
+      if (this._measureTimer) clearTimeout(this._measureTimer)
+      this._measureTimer = setTimeout(() => {
+        this._measureTimer = null
+        this._measure()
+      }, delay || 100)
+    },
+
+    _measure() {
+      const q = this.createSelectorQuery()
+      q.select('.scroller').boundingClientRect()
+      q.select('.scroll-content').boundingClientRect()
+      q.exec((res) => {
+        if (!res || !res[0] || !res[1]) return
+        const vp = res[0].height || 0
+        const ch = res[1].height || 0
+        this._scrollerH = vp
+        this._contentH = ch
+        this._maxY = Math.max(0, ch - vp + this._bottomPad)
+        this._pushScrollConfig()
+      })
+    },
+
+    // 推送滚动边界给 WXS 引擎（change:prop 观察器，低频同步，不逐帧走 setData）
+    _pushScrollConfig() {
+      this.setData({
+        scrollConfig: {
+          minY: 0,
+          maxY: Math.round(this._maxY || 0),
+          scrollerH: this._scrollerH || 0,
+          contentH: this._contentH || 0,
+          listOverflow: false,
+        },
+      })
+    },
+
+    // WXS 分桶回调（每 100px 一次），本页暂不消费
+    onWxsScroll() {},
+
     // 轮询：每 10 秒静默刷新，确保 reserved → abandoned 等后端状态变更可见
     _startPolling() {
       this._stopPolling()
@@ -229,14 +293,17 @@ Component({
               expandedOrders: {},
             }, () => {
               this._syncPageNumbers()
+              this._scheduleMeasure(100)
             })
           } else {
             // 页面内状态提示（对齐 Android App）：不清空已加载列表
             this.setData({ loading: false, loadError: res.data && res.data.message ? res.data.message : '加载失败' })
+            this._scheduleMeasure()
           }
         },
         fail: () => {
           this.setData({ loading: false, loadError: '网络错误' })
+          this._scheduleMeasure()
         },
       })
     },
@@ -271,15 +338,9 @@ Component({
     },
 
     // 滚动到任务列表顶部（与“我”页面一致：切换页码/每页条数后自动回到列表顶部）
+    // 由 WXS 引擎在视图层测量区块位置并动画（内容坐标 = 区块可视位置 - 容器可视位置 + 当前滚动量）
     _scrollToOrdersSection() {
-      const q = this.createSelectorQuery()
-      q.select('.orders-section').boundingClientRect()
-      q.select('.scrollarea').boundingClientRect()
-      q.exec((res) => {
-        if (!res || !res[0] || !res[1]) return
-        const target = Math.max(0, res[0].top - res[1].top - 12)
-        this.setData({ listScrollTop: target, scrollWithAnimation: true })
-      })
+      this.setData({ scrollCmd: { mode: 'section', section: '.orders-section', offset: -12, dur: 280 } })
     },
 
     // ==================== 分页 ====================
@@ -341,6 +402,7 @@ Component({
         expanded[orderId] = true
       }
       this.setData({ expandedOrders: expanded })
+      this._scheduleMeasure()
     },
 
     onDetailCancelOrder(e) {
