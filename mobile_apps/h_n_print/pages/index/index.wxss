@@ -547,6 +547,10 @@
   transform: translateX(100%);
 }
 
+.duplex-slider.dragging {
+  transition: none;
+}
+
 .duplex-opt {
   flex: 1;
   position: relative;
@@ -607,6 +611,10 @@
 
 .img-ori-slider.slider-portrait {
   transform: translateX(200%);
+}
+
+.img-ori-slider.dragging {
+  transition: none;
 }
 
 .img-ori-opt {
@@ -1199,7 +1207,7 @@ picker-view-column {
   border-radius: 28rpx;
 }
 .ios-switch.ios-switch-lg.switch-on .switch-thumb {
-  transform: translateX(47rpx) !important;
+  --sw-px: 47rpx;
 }
 
 .switch-thumb {
@@ -1209,6 +1217,7 @@ picker-view-column {
   width: 48rpx;
   height: 48rpx;
   border-radius: 24rpx;
+  transform: translateX(var(--sw-px, 0rpx));
   background: linear-gradient(180deg,
     rgba(255, 255, 255, 1) 0%,
     rgba(248, 248, 248, 0.95) 100%);
@@ -1219,7 +1228,11 @@ picker-view-column {
   transition: transform 0.4s cubic-bezier(0.22, 1.85, 0.48, 1);
 }
 .ios-switch.switch-on .switch-thumb {
-  transform: translateX(35rpx) !important;
+  --sw-px: 35rpx;
+}
+/* 拖动中禁用 transition，thumb 严格跟手 */
+.ios-switch.sw-dragging .switch-thumb {
+  transition: none !important;
 }
 
 /* 深色模式：开关轨道提亮（默认 rgba(60,60,67,0.18) 在深色背景上不可见） */

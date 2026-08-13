@@ -830,10 +830,62 @@ Component({
     },
 
     onSelectKeyType(e) {
-      const type = e.currentTarget.dataset.type
+      this._setKeyType(e.currentTarget.dataset.type)
+    },
+
+    _setKeyType(type) {
       if (type === 'admin' || type === 'temp') {
         this.setData({ keyType: type })
       }
+    },
+
+    // ==================== 密钥类型滑块拖动（与 index 页分段滑块一致） ====================
+    onSegTouchStart(e) {
+      const seg = e.currentTarget.dataset.seg
+      const idx = e.currentTarget.dataset.index
+      const t = e.touches[0]
+      if (!t) return
+      this._seg = { seg, idx, key: seg + '-' + idx, startX: t.clientX, startY: t.clientY, locked: false, lastP: undefined }
+      if (!this._segW) this._segW = {}
+      if (!this._segW[seg]) {
+        const q = this.createSelectorQuery()
+        q.selectAll('.key-type-toggle').boundingClientRect()
+        q.exec((res) => {
+          if (res && res[0]) this._segW[seg] = res[0].map(r => r.width || 0)
+        })
+      }
+    },
+
+    onSegTouchMove(e) {
+      const s = this._seg
+      if (!s) return
+      const t = e.touches[0]
+      if (!t) return
+      const dx = t.clientX - s.startX
+      const dy = t.clientY - s.startY
+      if (!s.locked) {
+        if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return
+        if (Math.abs(dy) > Math.abs(dx)) { s.locked = true; return }
+        s.locked = true
+      }
+      const widths = this._segW && this._segW[s.seg]
+      const w = widths && widths[s.idx]
+      if (!w) return
+      const segPx = w / 2
+      const cur = this.data.keyType === 'admin' ? 1 : 0
+      const p = Math.max(0, Math.min(1, cur + dx / segPx))
+      s.lastP = p
+      this.setData({ ['segDrag.' + s.key]: Math.round(p * 100) })
+    },
+
+    onSegTouchEnd() {
+      const s = this._seg
+      if (!s) return
+      this._seg = null
+      if (!s.locked || s.lastP === undefined) return
+      const target = Math.round(s.lastP)
+      this._setKeyType(target >= 1 ? 'admin' : 'temp')
+      this.setData({ ['segDrag.' + s.key]: -1 })
     },
 
     onGenerateKey() {

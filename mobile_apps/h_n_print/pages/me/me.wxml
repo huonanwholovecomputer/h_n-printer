@@ -111,8 +111,10 @@
         <!-- 超级管理员：许可密钥类型选择 -->
         <view wx:if="{{isSuperAdmin}}" class="key-type-row">
           <text class="key-type-label">密钥类型</text>
-          <view class="key-type-toggle">
-            <view class="key-type-slider {{keyType === 'admin' ? 'slider-right' : ''}}"></view>
+          <view class="key-type-toggle" data-seg="keytype" data-index="0"
+                bindtouchstart="onSegTouchStart" bindtouchmove="onSegTouchMove" bindtouchend="onSegTouchEnd" bindtouchcancel="onSegTouchEnd">
+            <view class="key-type-slider {{keyType === 'admin' ? 'slider-right' : ''}} {{segDrag['keytype-0'] >= 0 ? 'dragging' : ''}}"
+                  style="{{segDrag['keytype-0'] >= 0 ? ('transform: translateX(' + segDrag['keytype-0'] + '%);') : ''}}"></view>
             <view class="key-type-option {{keyType === 'temp' ? 'opt-active' : ''}}" bindtap="onSelectKeyType" data-type="temp" hover-class="tap-active">临时许可</view>
             <view class="key-type-option {{keyType === 'admin' ? 'opt-active' : ''}}" bindtap="onSelectKeyType" data-type="admin" hover-class="tap-active">管理员许可</view>
           </view>

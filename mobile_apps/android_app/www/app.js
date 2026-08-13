@@ -858,6 +858,24 @@ function hideView() {
   }
 }
 
+// Android 物理返回键（由 MainActivity.onBackPressed 经 evaluateJavascript 调用）：
+// 有弹窗 → 关弹窗；有子视图 → 返回"我"页；否则返回 false 由原生退出 App
+window.hnHandleBack = function () {
+  const visibleModal = [...document.querySelectorAll('.modal-mask')].find(m => m.style.display !== 'none');
+  if (visibleModal && visibleModal.id) {
+    if (visibleModal.id === 'confirmModal') _confirmCallback = null;
+    closeModal(visibleModal.id);
+    return true;
+  }
+  if (typeof closePageSizePicker === 'function') closePageSizePicker();
+  const subVisible = [...document.querySelectorAll('.view')].some(v => v.style.display !== 'none');
+  if (subVisible) {
+    hideView();
+    return true;
+  }
+  return false;
+};
+
 // 主题切换按钮仅"我"页使用（打印页/子视图隐藏，对齐小程序）
 function updateThemeToggleVisibility() {
   const toggle = document.getElementById('themeToggle');

@@ -467,6 +467,10 @@
   transform: translateX(100%);
 }
 
+.key-type-slider.dragging {
+  transition: none;
+}
+
 .key-type-option {
   width: 50%;
   position: relative;

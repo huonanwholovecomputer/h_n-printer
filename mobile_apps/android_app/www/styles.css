@@ -2732,7 +2732,7 @@ picker-view-column {
   border-radius: 3.7333cqw;
 }
 .ios-switch.ios-switch-lg.switch-on .switch-thumb {
-  transform: translateX(6.2667cqw) !important;
+  --sw-px: 6.2667cqw;
 }
 
 .switch-thumb {
@@ -2742,6 +2742,7 @@ picker-view-column {
   width: 6.4000cqw;
   height: 6.4000cqw;
   border-radius: 3.2000cqw;
+  transform: translateX(var(--sw-px, 0));
   background: linear-gradient(180deg,
     rgba(255, 255, 255, 1) 0%,
     rgba(248, 248, 248, 0.95) 100%);
@@ -2752,7 +2753,11 @@ picker-view-column {
   transition: transform 0.4s cubic-bezier(0.22, 1.85, 0.48, 1);
 }
 .ios-switch.switch-on .switch-thumb {
-  transform: translateX(4.6667cqw) !important;
+  --sw-px: 4.6667cqw;
+}
+/* 拖动中禁用 transition，thumb 严格跟手 */
+.ios-switch.sw-dragging .switch-thumb {
+  transition: none !important;
 }
 
 /* 深色模式：开关轨道提亮（默认 rgba(60,60,67,0.18) 在深色背景上不可见） */
@@ -3475,6 +3480,10 @@ picker-view-column {
 
 .key-type-slider.slider-right {
   transform: translateX(100%);
+}
+
+.key-type-slider.dragging {
+  transition: none;
 }
 
 .key-type-option {

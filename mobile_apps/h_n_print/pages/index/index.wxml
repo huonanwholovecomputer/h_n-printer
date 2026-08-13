@@ -114,8 +114,10 @@
               <!-- 图片方向（仅图片显示：自动/横向/竖向，对应本地工具三模式渲染） -->
               <view wx:if="{{item.isImage}}" class="control-row">
                 <text class="control-label">方向</text>
-                <view class="img-ori-toggle">
-                  <view class="img-ori-slider {{item.imageOrientation === 'landscape' ? 'slider-landscape' : ''}} {{item.imageOrientation === 'portrait' ? 'slider-portrait' : ''}}"></view>
+                <view class="img-ori-toggle" data-seg="ori" data-index="{{index}}"
+                      bindtouchstart="onSegTouchStart" bindtouchmove="onSegTouchMove" bindtouchend="onSegTouchEnd" bindtouchcancel="onSegTouchEnd">
+                  <view class="img-ori-slider {{item.imageOrientation === 'landscape' ? 'slider-landscape' : ''}} {{item.imageOrientation === 'portrait' ? 'slider-portrait' : ''}} {{segDrag['ori-' + index] >= 0 ? 'dragging' : ''}}"
+                        style="{{segDrag['ori-' + index] >= 0 ? ('transform: translateX(' + segDrag['ori-' + index] + '%);') : ''}}"></view>
                   <view class="img-ori-opt {{item.imageOrientation === 'auto' || !item.imageOrientation ? 'opt-active' : ''}}" bindtap="onFileImageOrientation" data-index="{{index}}" data-value="auto">自动</view>
                   <view class="img-ori-opt {{item.imageOrientation === 'landscape' ? 'opt-active' : ''}}" bindtap="onFileImageOrientation" data-index="{{index}}" data-value="landscape">横向</view>
                   <view class="img-ori-opt {{item.imageOrientation === 'portrait' ? 'opt-active' : ''}}" bindtap="onFileImageOrientation" data-index="{{index}}" data-value="portrait">竖向</view>
@@ -158,8 +160,10 @@
               <!-- Duplex toggle（图片/整份1页隐藏；有效选择1页 → 模式行收起淡出，提交强制单面） -->
               <view wx:if="{{!item.isImage && item.pageCount !== 1}}" class="control-row mode-row {{item.singlePage ? 'mode-row-collapsed' : ''}}">
                 <text class="control-label">模式</text>
-                <view class="duplex-toggle">
-                  <view class="duplex-slider {{item.duplex === 'on' ? 'slider-right' : ''}}"></view>
+                <view class="duplex-toggle" data-seg="duplex" data-index="{{index}}"
+                      bindtouchstart="onSegTouchStart" bindtouchmove="onSegTouchMove" bindtouchend="onSegTouchEnd" bindtouchcancel="onSegTouchEnd">
+                  <view class="duplex-slider {{item.duplex === 'on' ? 'slider-right' : ''}} {{segDrag['duplex-' + index] >= 0 ? 'dragging' : ''}}"
+                        style="{{segDrag['duplex-' + index] >= 0 ? ('transform: translateX(' + segDrag['duplex-' + index] + '%);') : ''}}"></view>
                   <view class="duplex-opt {{item.duplex === 'off' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="off">单面</view>
                   <view class="duplex-opt {{item.duplex === 'on' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="on">双面</view>
                 </view>
@@ -186,8 +190,9 @@
           <view class="param-row">
             <text class="param-label">打印首页</text>
             <text wx:if="{{userRole === 'user'}}" class="cover-required-tag">必选</text>
-            <view class="ios-switch {{coverPage ? 'switch-on' : ''}}" bindtap="onToggleCoverPage">
-              <view class="switch-thumb"></view>
+            <view class="ios-switch {{coverPage ? 'switch-on' : ''}} {{swDrag['cover'] >= 0 ? 'sw-dragging' : ''}}" data-sw="cover" bindtap="onToggleCoverPage"
+                  bindtouchstart="onSwTouchStart" bindtouchmove="onSwTouchMove" bindtouchend="onSwTouchEnd" bindtouchcancel="onSwTouchEnd">
+              <view class="switch-thumb" style="{{swDrag['cover'] >= 0 ? ('--sw-px:' + swDrag['cover'] + 'px;') : ''}}"></view>
             </view>
             <text wx:if="{{coverPriceVisible || coverPriceExiting}}" class="cover-price-tag {{coverPriceEntering ? 'entering' : ''}} {{coverPriceExiting ? 'exiting' : ''}}">¥{{coverPagePrice}}</text>
           </view>
@@ -210,8 +215,9 @@
           <!-- 派送开关 -->
           <view class="param-row">
             <text class="param-label">派送</text>
-            <view class="ios-switch {{deliveryEnabled ? 'switch-on' : ''}}" bindtap="onToggleDelivery">
-              <view class="switch-thumb"></view>
+            <view class="ios-switch {{deliveryEnabled ? 'switch-on' : ''}} {{swDrag['delivery'] >= 0 ? 'sw-dragging' : ''}}" data-sw="delivery" bindtap="onToggleDelivery"
+                  bindtouchstart="onSwTouchStart" bindtouchmove="onSwTouchMove" bindtouchend="onSwTouchEnd" bindtouchcancel="onSwTouchEnd">
+              <view class="switch-thumb" style="{{swDrag['delivery'] >= 0 ? ('--sw-px:' + swDrag['delivery'] + 'px;') : ''}}"></view>
             </view>
           </view>
 
@@ -243,8 +249,9 @@
             <text class="auto-print-title">无障碍打印</text>
             <text class="auto-print-desc">提交后自动开始打印，无需手动确认</text>
           </view>
-          <view class="ios-switch ios-switch-lg {{autoPrintEnabled ? 'switch-on' : ''}}" bindtap="onAutoPrintToggle">
-            <view class="switch-thumb"></view>
+          <view class="ios-switch ios-switch-lg {{autoPrintEnabled ? 'switch-on' : ''}} {{swDrag['autoPrint'] >= 0 ? 'sw-dragging' : ''}}" data-sw="autoPrint" bindtap="onAutoPrintToggle"
+                bindtouchstart="onSwTouchStart" bindtouchmove="onSwTouchMove" bindtouchend="onSwTouchEnd" bindtouchcancel="onSwTouchEnd">
+            <view class="switch-thumb" style="{{swDrag['autoPrint'] >= 0 ? ('--sw-px:' + swDrag['autoPrint'] + 'px;') : ''}}"></view>
           </view>
         </view>
 

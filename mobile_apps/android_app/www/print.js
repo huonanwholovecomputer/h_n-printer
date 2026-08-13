@@ -348,6 +348,68 @@ function bindToggleDrags() {
   });
 }
 
+// iOS 开关：按住拖动（thumb 跟手，松手过半吸附；纯点击仍走原 toggle）
+function bindSwitchDrags() {
+  const defs = [
+    { id: 'coverSwitch', getOn: () => printState.coverPage || state.role === 'user', toggle: toggleCoverPage },
+    { id: 'deliverySwitch', getOn: () => printState.deliveryEnabled, toggle: toggleDelivery },
+    { id: 'autoPrintSwitch', getOn: () => printState.autoPrintEnabled, toggle: toggleAutoPrint },
+  ];
+  defs.forEach(def => {
+    const el = document.getElementById(def.id);
+    if (!el) return;
+    const thumb = el.querySelector('.switch-thumb');
+    if (!thumb) return;
+    let pointerId = null, startX = 0, startY = 0, dragging = false, moved = false, startPx = 0, maxPx = 0;
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      pointerId = e.pointerId;
+      try { el.setPointerCapture(e.pointerId); } catch (err) { /* 兼容 */ }
+      startX = e.clientX; startY = e.clientY;
+      dragging = true; moved = false;
+      const r = el.getBoundingClientRect();
+      const tr = thumb.getBoundingClientRect();
+      const padLeft = parseFloat(getComputedStyle(thumb).left) || 0;
+      maxPx = Math.max(1, r.width - tr.width - padLeft * 2);
+      startPx = def.getOn() ? maxPx : 0;
+      thumb.style.setProperty('--sw-px', startPx + 'px');
+      el.classList.add('sw-dragging');
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!dragging || e.pointerId !== pointerId) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (!moved) {
+        if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+        if (Math.abs(dx) <= Math.abs(dy)) { // 纵向交给页面滚动
+          dragging = false;
+          el.classList.remove('sw-dragging');
+          thumb.style.removeProperty('--sw-px');
+          return;
+        }
+        moved = true;
+        gestureBus.horizontal = true;
+      }
+      const px = Math.max(0, Math.min(maxPx, startPx + dx));
+      thumb.style.setProperty('--sw-px', px + 'px');
+    });
+    const endDrag = (e) => {
+      if (!dragging) { pointerId = null; return; }
+      dragging = false; pointerId = null;
+      gestureBus.horizontal = false;
+      el.classList.remove('sw-dragging');
+      if (!moved) { thumb.style.removeProperty('--sw-px'); return; } // 纯点击
+      const px = parseFloat(thumb.style.getPropertyValue('--sw-px')) || startPx;
+      const on = px > maxPx / 2;
+      thumb.style.removeProperty('--sw-px');
+      el._dragHandled = Date.now();
+      if (on !== def.getOn()) def.toggle();
+    };
+    el.addEventListener('pointerup', endDrag);
+    el.addEventListener('pointercancel', endDrag);
+  });
+}
+
 // 文件列表显式高度（上限 85vh，内部滚动）——对齐小程序 scroll-view。
 // 高度用 350ms/500ms easeOutCubic 补间，而非瞬间跳变；
 // 动画中的卡片克隆测量"最终高度"，避免容器高度跟着展开/收起中间值跳动。
@@ -1723,11 +1785,19 @@ function setupPrintButtons() {
     }
   }, true);
 
-  document.getElementById('coverSwitch').addEventListener('click', toggleCoverPage);
+  const switchClick = (el, fn) => {
+    el.addEventListener('click', () => {
+      // 拖动结束后的 click 忽略（bindSwitchDrags 设置 _dragHandled）
+      if (el._dragHandled && Date.now() - el._dragHandled < 500) { el._dragHandled = 0; return; }
+      fn();
+    });
+  };
+  switchClick(document.getElementById('coverSwitch'), toggleCoverPage);
   document.getElementById('urgencyTrigger').addEventListener('click', toggleUrgencyPicker);
-  document.getElementById('deliverySwitch').addEventListener('click', toggleDelivery);
+  switchClick(document.getElementById('deliverySwitch'), toggleDelivery);
   document.getElementById('deliveryTrigger').addEventListener('click', toggleDeliveryPicker);
-  document.getElementById('autoPrintSwitch').addEventListener('click', toggleAutoPrint);
+  switchClick(document.getElementById('autoPrintSwitch'), toggleAutoPrint);
+  bindSwitchDrags();
   document.querySelectorAll('[data-schedule-mode]').forEach(el => {
     el.addEventListener('click', () => setScheduleMode(el.dataset.scheduleMode));
   });

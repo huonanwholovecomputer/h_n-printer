@@ -5,6 +5,7 @@ import android.os.Bundle;
 import android.view.View;
 import android.view.Window;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebView;
 
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
@@ -24,6 +25,26 @@ public class MainActivity extends BridgeActivity {
         enableEdgeToEdge();
         // 关闭 WebView 原生越界效果（边缘发光 / 整页拉伸），边界橡皮筋由前端 JS 统一实现
         getBridge().getWebView().setOverScrollMode(View.OVER_SCROLL_NEVER);
+    }
+
+    // Android 物理返回键：先询问前端是否在子界面/弹窗中。
+    // 前端 window.hnHandleBack() 返回 true = 已消费（正在返回"我"页/关弹窗），
+    // 返回 false = 不在子界面，退出 App。
+    @Override
+    public void onBackPressed() {
+        WebView webView = getBridge().getWebView();
+        if (webView != null) {
+            webView.evaluateJavascript(
+                "window.hnHandleBack ? window.hnHandleBack() : 'false'",
+                value -> {
+                    boolean handled = "true".equals(value);
+                    if (!handled) {
+                        runOnUiThread(MainActivity.this::finish);
+                    }
+                });
+        } else {
+            super.onBackPressed();
+        }
     }
 
     private void enableEdgeToEdge() {

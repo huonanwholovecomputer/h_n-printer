@@ -113,6 +113,9 @@ Component({
     countdownSecWheelIndex: 0,
     countdownWheelValue: [5, 0],
     scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false },
+    // 滑块拖动状态：segDrag = 分段滑块指示条位移百分比（>=0 拖动中），swDrag = 开关拇指位移 px（>=0 拖动中）
+    segDrag: {},
+    swDrag: {},
     // v5: 附加服务参数（与本地打印工具对齐）
     deliveryEnabled: false,
     deliveryLocation: '1号楼北楼',
@@ -1668,8 +1671,11 @@ Component({
     },
 
     onFileDuplexChange(e) {
-      const index = e.currentTarget.dataset.index
-      const value = e.currentTarget.dataset.value
+      this._setFileDuplex(e.currentTarget.dataset.index, e.currentTarget.dataset.value)
+    },
+
+    // 设置单个文件的单面/双面（点击与拖动共用；含固定单面校验）
+    _setFileDuplex(index, value) {
       const f = this.data.selectedFiles[index]
       if (!f || f.excelWarning || f.unsupportedFormat) return
       if (f.pageCount === 1 || f.singlePage) return  // 整份1页/有效选择1页无法双面，固定单面
@@ -1678,11 +1684,125 @@ Component({
 
     // 图片打印方向（仅图片）：auto=自动 / landscape=横向 / portrait=竖向
     onFileImageOrientation(e) {
-      const index = e.currentTarget.dataset.index
-      const value = e.currentTarget.dataset.value
+      this._setFileImageOrientation(e.currentTarget.dataset.index, e.currentTarget.dataset.value)
+    },
+
+    _setFileImageOrientation(index, value) {
       const f = this.data.selectedFiles[index]
       if (!f || !f.isImage) return
       this.setData({ ['selectedFiles[' + index + '].imageOrientation']: value })
+    },
+
+    // ==================== 滑块拖动（分段滑块 / iOS 开关） ====================
+    // 拖动状态存实例字段（不进 data）：this._seg / this._sw / this._segW
+    // 分段滑块跟手：指示条 translateX 百分比 = 当前档位 + 手指位移 / 段宽；
+    // iOS 开关跟手：thumb 位移 px（rpx 按屏宽换算），松手按过半吸附。
+
+    _segSel(seg) {
+      return seg === 'duplex' ? '.duplex-toggle' : (seg === 'ori' ? '.img-ori-toggle' : '.key-type-toggle')
+    },
+
+    onSegTouchStart(e) {
+      const seg = e.currentTarget.dataset.seg
+      const idx = e.currentTarget.dataset.index
+      const t = e.touches[0]
+      if (!t) return
+      this._seg = { seg, idx, key: seg + '-' + idx, startX: t.clientX, startY: t.clientY, locked: false, lastP: undefined }
+      // 测量该类型所有控件宽度（跟手用），缓存后不再重复测量
+      if (!this._segW) this._segW = {}
+      if (!this._segW[seg]) {
+        const q = this.createSelectorQuery()
+        q.selectAll(this._segSel(seg)).boundingClientRect()
+        q.exec((res) => {
+          if (res && res[0]) this._segW[seg] = res[0].map(r => r.width || 0)
+        })
+      }
+    },
+
+    onSegTouchMove(e) {
+      const s = this._seg
+      if (!s) return
+      const t = e.touches[0]
+      if (!t) return
+      const dx = t.clientX - s.startX
+      const dy = t.clientY - s.startY
+      if (!s.locked) {
+        if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return
+        if (Math.abs(dy) > Math.abs(dx)) { s.locked = true; return } // 垂直：交给页面滚动
+        s.locked = true
+      }
+      const widths = this._segW && this._segW[s.seg]
+      const w = widths && widths[s.idx]
+      if (!w) return
+      const segs = s.seg === 'ori' ? 3 : 2
+      const segPx = w / segs
+      const cur = this._segCurrent(s)
+      const p = Math.max(0, Math.min(segs - 1, cur + dx / segPx))
+      s.lastP = p
+      this.setData({ ['segDrag.' + s.key]: Math.round(p * 100) })
+    },
+
+    onSegTouchEnd() {
+      const s = this._seg
+      if (!s) return
+      this._seg = null
+      if (!s.locked || s.lastP === undefined) return
+      const target = Math.round(s.lastP) // 吸附到最近档位
+      const patch = { ['segDrag.' + s.key]: -1 } // -1 = 清除拖动态，class+transition 归位
+      if (s.seg === 'duplex') this._setFileDuplex(s.idx, target >= 1 ? 'on' : 'off')
+      else if (s.seg === 'ori') this._setFileImageOrientation(s.idx, target >= 2 ? 'portrait' : (target >= 1 ? 'landscape' : 'auto'))
+      else if (s.seg === 'keytype') this._setKeyType(target >= 1 ? 'admin' : 'temp')
+      this.setData(patch)
+    },
+
+    _segCurrent(s) {
+      const f = this.data.selectedFiles[s.idx]
+      if (s.seg === 'duplex') return f && f.duplex === 'on' ? 1 : 0
+      if (s.seg === 'ori') return f && f.imageOrientation === 'landscape' ? 1 : (f && f.imageOrientation === 'portrait' ? 2 : 0)
+      return this.data.keyType === 'admin' ? 1 : 0
+    },
+
+    onSwTouchStart(e) {
+      const key = e.currentTarget.dataset.sw
+      const t = e.touches[0]
+      if (!t) return
+      const on = key === 'cover' ? this.data.coverPage : (key === 'delivery' ? this.data.deliveryEnabled : this.data.autoPrintEnabled)
+      const ratio = (wx.getWindowInfo().windowWidth || 375) / 750
+      const maxPx = (key === 'autoPrint' ? 47 : 35) * ratio // 对应 wxss 中 switch-on 的 rpx 位移
+      this._sw = { key, startX: t.clientX, startY: t.clientY, locked: false, startPx: on ? maxPx : 0, maxPx, lastPx: undefined }
+    },
+
+    onSwTouchMove(e) {
+      const s = this._sw
+      if (!s) return
+      const t = e.touches[0]
+      if (!t) return
+      const dx = t.clientX - s.startX
+      const dy = t.clientY - s.startY
+      if (!s.locked) {
+        if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return
+        if (Math.abs(dy) > Math.abs(dx)) { s.locked = true; return }
+        s.locked = true
+      }
+      const px = Math.max(0, Math.min(s.maxPx, s.startPx + dx))
+      s.lastPx = px
+      this.setData({ ['swDrag.' + s.key]: Math.round(px) })
+    },
+
+    onSwTouchEnd() {
+      const s = this._sw
+      if (!s) return
+      this._sw = null
+      if (!s.locked || s.lastPx === undefined) return
+      const on = s.lastPx > s.maxPx / 2
+      const cur = s.key === 'cover' ? this.data.coverPage : (s.key === 'delivery' ? this.data.deliveryEnabled : this.data.autoPrintEnabled)
+      const patch = { ['swDrag.' + s.key]: -1 }
+      if (on !== cur) {
+        if (s.key === 'cover') this.onToggleCoverPage()
+        else if (s.key === 'delivery') this.onToggleDelivery()
+        else this.onAutoPrintToggle()
+      }
+      this.setData(patch)
     },
 
     onDuplexChange(e) {

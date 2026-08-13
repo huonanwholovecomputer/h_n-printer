@@ -255,8 +255,15 @@ function setupMeButtons() {
   document.getElementById('unbindBtn').addEventListener('click', unbindWechatAccount);
   document.getElementById('licenseMinutesMinus').addEventListener('click', () => setLicenseMinutes(meState.licenseMinutes - 1));
   document.getElementById('licenseMinutesPlus').addEventListener('click', () => setLicenseMinutes(meState.licenseMinutes + 1));
-  document.getElementById('keyTypeTemp').addEventListener('click', () => { meState.keyType = 'temp'; updateKeyForm(); });
-  document.getElementById('keyTypeAdmin').addEventListener('click', () => { meState.keyType = 'admin'; updateKeyForm(); });
+  const keyTypeClick = (type) => {
+    const toggle = document.querySelector('.key-type-toggle');
+    if (toggle && toggle._dragHandled && Date.now() - toggle._dragHandled < 500) { toggle._dragHandled = 0; return; }
+    meState.keyType = type;
+    updateKeyForm();
+  };
+  document.getElementById('keyTypeTemp').addEventListener('click', () => keyTypeClick('temp'));
+  document.getElementById('keyTypeAdmin').addEventListener('click', () => keyTypeClick('admin'));
+  bindKeyTypeDrag();
   document.getElementById('generateKeyBtn').addEventListener('click', generateKey);
   document.getElementById('retentionDaysMinus').addEventListener('click', () => setRetention('days', meState.retentionDays - 1));
   document.getElementById('retentionDaysPlus').addEventListener('click', () => setRetention('days', meState.retentionDays + 1));
@@ -1029,6 +1036,60 @@ function updateKeyForm() {
   document.getElementById('keyTypeAdmin').classList.toggle('opt-active', meState.keyType === 'admin');
   const slider = document.getElementById('keyTypeSlider');
   if (slider) slider.classList.toggle('slider-right', meState.keyType === 'admin');
+}
+
+// 密钥类型分段滑块：按住拖动（指示条跟手，松手吸附；纯点击仍走原切换）
+function bindKeyTypeDrag() {
+  const toggle = document.querySelector('.key-type-toggle');
+  if (!toggle || toggle._dragBound) return;
+  toggle._dragBound = true;
+  const slider = document.getElementById('keyTypeSlider');
+  if (!slider) return;
+  let pointerId = null, startX = 0, startY = 0, dragging = false, moved = false, startPx = 0, segPx = 0;
+  toggle.addEventListener('pointerdown', (e) => {
+    if (e.button !== undefined && e.button !== 0) return;
+    pointerId = e.pointerId;
+    try { toggle.setPointerCapture(e.pointerId); } catch (err) { /* 兼容 */ }
+    startX = e.clientX; startY = e.clientY;
+    dragging = true; moved = false;
+    const r = toggle.getBoundingClientRect();
+    segPx = r.width / 2;
+    startPx = (meState.keyType === 'admin' ? 1 : 0) * segPx;
+  });
+  toggle.addEventListener('pointermove', (e) => {
+    if (!dragging || e.pointerId !== pointerId) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (!moved) {
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      if (Math.abs(dx) <= Math.abs(dy)) { dragging = false; return; } // 纵向交给页面滚动
+      moved = true;
+      gestureBus.horizontal = true;
+    }
+    const r = toggle.getBoundingClientRect();
+    segPx = r.width / 2;
+    const offsetPx = Math.max(0, Math.min(r.width - segPx, startPx + dx));
+    slider.style.transition = 'none';
+    slider.style.transform = 'translateX(' + offsetPx + 'px)';
+  });
+  const endDrag = (e) => {
+    if (!dragging) { pointerId = null; return; }
+    dragging = false; pointerId = null;
+    gestureBus.horizontal = false;
+    if (!moved) return; // 纯点击
+    const r = toggle.getBoundingClientRect();
+    segPx = r.width / 2;
+    const offsetPx = parseFloat((/translateX\((-?[\d.]+)px\)/.exec(slider.style.transform || '') || [])[1] || '0');
+    const idx = Math.max(0, Math.min(1, Math.round(offsetPx / segPx)));
+    slider.style.transition = 'transform 0.3s cubic-bezier(0.34,1.56,0.64,1)';
+    slider.style.transform = 'translateX(' + (idx * segPx) + 'px)';
+    toggle._dragHandled = Date.now();
+    meState.keyType = idx === 1 ? 'admin' : 'temp';
+    updateKeyForm();
+    setTimeout(() => { if (slider.style.transform) slider.style.transform = ''; }, 320);
+  };
+  toggle.addEventListener('pointerup', endDrag);
+  toggle.addEventListener('pointercancel', endDrag);
 }
 
 function generateKey() {
