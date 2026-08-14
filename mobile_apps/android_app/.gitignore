@@ -2,3 +2,5 @@ node_modules/
 # 发布签名：keystore 与密码文件严禁提交（泄露可被冒签，丢失则无法升级）
 android/app/release.keystore
 android/app/keystore.properties
+# 发布签名备份压缩包（含 keystore 与密码，严禁提交）
+release.keystore和keystore.properties.zip
