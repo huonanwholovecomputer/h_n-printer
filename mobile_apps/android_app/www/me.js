@@ -108,8 +108,7 @@ function refreshMeUI() {
   document.getElementById('roleLabel').textContent = roleLabel;
   const nickText = document.getElementById('nicknameText');
   if (nickText) nickText.textContent = state.nickname || '点击设置昵称';
-  const avatar = document.getElementById('avatarImg');
-  if (state.avatarUrl) avatar.src = state.avatarUrl;
+  setAvatarImg(state.avatarUrl);
   const badge = document.getElementById('licenseBadge');
   const detail = document.getElementById('licenseDetail');
   const li = state.licenseInfo;
@@ -201,6 +200,8 @@ function toggleLicenseDetail(detailId, open) {
   if (!detail) return;
   detail.classList.toggle('license-detail-expanded', open);
   measureAll(150);
+  // 0.32s 过渡结束后再次测量（收起后内容变短，滚动边界收缩）
+  setTimeout(() => measureAll(320), 340);
 }
 
 // 临时授权剩余时间（对齐小程序 tempCountdownText："剩余 X 分 XX 秒"）
@@ -312,18 +313,25 @@ function setupMeButtons() {
     const num = e.target.closest('[data-page-num]');
     if (num && num.dataset.pageNum !== '...') changeOrdersPage(parseInt(num.dataset.pageNum, 10));
   });
-  // "我的打印任务"条/页选择器：document 级委托，避免元素重建/绑定时机导致点击失效
+  // 条/页下拉：document 级委托（下拉打开时被移到 body 末尾逃出变换层，触发器与选项分开处理）
   document.addEventListener('click', (e) => {
+    // 子视图（本地打印任务/用户订单）每页条数下拉
+    const uoOpt = e.target.closest('#uoPageSizeDropdown [data-size]');
+    if (uoOpt) { selectUoPageSize(parseInt(uoOpt.dataset.size, 10)); return; }
+    const uoSel = e.target.closest('#uoPageSizeSelector');
+    if (uoSel) { toggleUoPageSizePicker(); return; }
+    if (meState.userOrdersView && meState.userOrdersView.showPageSizePicker) closeUoPageSizePicker();
+    // "我的打印任务"每页条数下拉（下拉已移出 #ordersPageSize，选项按 id 定位）
     const picker = document.getElementById('pageSizePicker');
     const isOpen = picker && picker.classList.contains('dropdown-show');
+    const opt = e.target.closest('#pageSizePicker [data-size]');
+    if (opt) { selectOrdersPageSize(parseInt(opt.dataset.size, 10)); return; }
     const sel = e.target.closest('#ordersPageSize');
     if (!sel) {
       // 点击页面其他区域：收起下拉
       if (isOpen) hidePageSizePicker();
       return;
     }
-    const opt = e.target.closest('[data-size]');
-    if (opt) { selectOrdersPageSize(parseInt(opt.dataset.size, 10)); return; }
     togglePageSizePicker();
   });
   document.getElementById('orderList').addEventListener('click', (e) => {
@@ -380,6 +388,8 @@ function setupMeButtons() {
     setTimeout(() => revokeKey(del.dataset.revokeKey), 30);
   });
   document.getElementById('authorizedUserList').addEventListener('click', (e) => {
+    const orderToggle = e.target.closest('[data-key-order-toggle]');
+    if (orderToggle) { toggleRecordOrders(orderToggle.dataset.userOpenid, orderToggle.dataset.keyOrderToggle); return; }
     const toggle = e.target.closest('[data-toggle-records]');
     if (toggle) { toggleAuthorizedUser(toggle.dataset.toggleRecords); return; }
     const card = e.target.closest('[data-user-openid]');
@@ -397,22 +407,7 @@ function setupMeButtons() {
     const num = e.target.closest('[data-page-num]');
     if (num && num.dataset.pageNum !== '...') changeUserOrdersPage(parseInt(num.dataset.pageNum, 10));
   });
-  document.getElementById('uoPageSizeSelector').addEventListener('click', (e) => {
-    const v = meState.userOrdersView;
-    const opt = e.target.closest('[data-size]');
-    if (opt) {
-      const size = parseInt(opt.dataset.size, 10);
-      if (size === v.perPage) return;
-      v.perPage = size;
-      v.page = 1;
-      v.showPageSizePicker = false;
-      syncUserOrdersPageSizePicker();
-      loadUserOrders().then(() => scrollUserOrdersToTop());
-      return;
-    }
-    v.showPageSizePicker = !v.showPageSizePicker;
-    syncUserOrdersPageSizePicker();
-  });
+  // 子视图条/页下拉：触发器与选项均走 document 委托（见上方委托），此处不再重复绑定
   document.getElementById('userOrdersList').addEventListener('click', (e) => {
     const cancel = e.target.closest('[data-cancel-order]');
     if (cancel) { e.stopPropagation(); cancelOrder(parseInt(cancel.dataset.cancelOrder, 10)); return; }
@@ -440,6 +435,22 @@ function setupMeButtons() {
 }
 
 /* ================= 头像 / 昵称 ================= */
+
+// 默认头像（与 index.html 中内联 SVG data URI 一致，加载失败/无头像时兜底）
+const DEFAULT_AVATAR_SRC = "data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 108 108'%3E%3Ccircle cx='54' cy='54' r='54' fill='%23E5E5EA'/%3E%3Ccircle cx='54' cy='44' r='18' fill='%23C7C7CC'/%3E%3Cellipse cx='54' cy='80' rx='32' ry='22' fill='%23C7C7CC'/%3E%3C/svg%3E";
+
+// 统一头像设置入口：有头像显示真实图片（加时间戳防缓存），无头像回退默认图
+function setAvatarImg(url) {
+  const avatar = document.getElementById('avatarImg');
+  if (!avatar) return;
+  if (url) {
+    avatar.onerror = function () { this.onerror = null; this.src = DEFAULT_AVATAR_SRC; };
+    avatar.src = url + (url.indexOf('?') >= 0 ? '&t=' : '?t=') + Date.now();
+  } else {
+    avatar.onerror = null;
+    avatar.src = DEFAULT_AVATAR_SRC;
+  }
+}
 
 function openNicknameModal() {
   const input = document.getElementById('nicknameModalInput');
@@ -477,7 +488,7 @@ async function uploadAvatar(file) {
     if (result.data && result.data.success && result.data.avatar_url) {
       state.avatarUrl = result.data.avatar_url;
       localStorage.setItem('hn_avatar', state.avatarUrl);
-      document.getElementById('avatarImg').src = state.avatarUrl;
+      setAvatarImg(state.avatarUrl);
       showToast('头像已更新');
     } else showToast((result.data && result.data.message) || '上传失败');
   } catch (e) { showToast('网络错误'); }
@@ -880,7 +891,10 @@ function renderOrders() {
 function buildPageNumbers() {
   const total = meState.ordersTotalPages;
   const current = meState.ordersPage;
-  if (total <= 1) return '';
+  // 对齐小程序：仅 1 页时也显示当前页数字（高亮），避免分页栏只有 ‹ › 箭头
+  if (total <= 1) {
+    return '<view class="page-num page-num-active" data-page-num="1">1</view>';
+  }
   const pages = [];
   if (total <= 7) { for (let i = 1; i <= total; i++) pages.push(i); }
   else {
@@ -910,6 +924,9 @@ function toggleOrder(id) {
     if (arrow) arrow.classList.toggle('arrow-up', expanded);
   }
   measureAll(150);
+  // 详情展开/收起有 0.3s 动画，收起后内容变短需在动画结束后再次测量（对齐小程序 onOrderTap 双测量），
+  // 否则界面停留在旧滚动位置下方留白
+  setTimeout(() => measureAll(320), 340);
 }
 
 function changeOrdersPage(page) {
@@ -920,6 +937,19 @@ function changeOrdersPage(page) {
 
 let _pageSizePickerOpenedAt = 0;
 
+// 打开下拉：移到 body 末尾（逃出 scroll-content 的 translateY 变换层，
+// fixed 才真正相对视口、backdrop-filter 才能正常采样），按触发器视口坐标定位
+function openDropdownFixed(dropdown, triggerEl) {
+  if (!dropdown || !triggerEl) return;
+  if (dropdown.parentElement !== document.body) document.body.appendChild(dropdown);
+  const r = triggerEl.getBoundingClientRect();
+  dropdown.style.position = 'fixed';
+  dropdown.style.left = Math.max(8, Math.round(r.left)) + 'px';
+  dropdown.style.top = Math.round(r.bottom + 6) + 'px';
+  dropdown.style.zIndex = '2000';
+  dropdown.classList.add('dropdown-show');
+}
+
 function togglePageSizePicker() {
   try {
     const picker = document.getElementById('pageSizePicker');
@@ -927,12 +957,7 @@ function togglePageSizePicker() {
     const open = !picker.classList.contains('dropdown-show');
     if (open) {
       _pageSizePickerOpenedAt = Date.now();
-      // 内联定位兜底（显隐走 CSS 类，与子视图一致）
-      picker.style.position = 'absolute';
-      picker.style.top = 'calc(100% + 0.8cqw)';
-      picker.style.left = '0';
-      picker.style.zIndex = '100';
-      picker.classList.add('dropdown-show');
+      openDropdownFixed(picker, document.getElementById('ordersPageSize'));
     } else {
       hidePageSizePicker();
       return;
@@ -942,6 +967,34 @@ function togglePageSizePicker() {
   } catch (err) {
     showToast('分页下拉出错: ' + (err && err.message ? err.message : err));
   }
+}
+
+// 子视图（本地打印任务/用户订单）每页条数下拉：展开/收起/选择
+function toggleUoPageSizePicker() {
+  const v = meState.userOrdersView;
+  if (!v) return;
+  if (v.showPageSizePicker) { closeUoPageSizePicker(); return; }
+  v.showPageSizePicker = true;
+  openDropdownFixed(document.getElementById('uoPageSizeDropdown'), document.getElementById('uoPageSizeSelector'));
+  syncUserOrdersPageSizePicker();
+}
+
+function closeUoPageSizePicker() {
+  const v = meState.userOrdersView;
+  if (!v || !v.showPageSizePicker) return;
+  v.showPageSizePicker = false;
+  syncUserOrdersPageSizePicker();
+}
+
+function selectUoPageSize(size) {
+  const v = meState.userOrdersView;
+  if (!v) return;
+  if (size === v.perPage) { closeUoPageSizePicker(); return; }
+  v.perPage = size;
+  v.page = 1;
+  v.showPageSizePicker = false;
+  syncUserOrdersPageSizePicker();
+  loadUserOrders().then(() => scrollUserOrdersToTop());
 }
 
 // 统一收起：移除类并清空内联显隐（内联 opacity 优先级高于 CSS，不清会关不掉）
@@ -973,8 +1026,7 @@ function scrollToOrdersSection() {
   const engine = scrollEngines.me;
   if (!engine) return;
   const section = document.querySelector('#page-me .orders-section');
-  const content = document.getElementById('scrollContentMe');
-  if (!section || !content) return;
+  if (!section || !engine.el) return;
   engine.measure(); // 用最新内容高度更新 maxY
   // 内容变短导致当前位置超出新边界：直接无动画归位
   if (engine.y > engine.maxY) {
@@ -984,7 +1036,10 @@ function scrollToOrdersSection() {
   }
   // 内容不足一屏（maxY <= 0）：不滚动，保持原位
   if (engine.maxY <= 0) return;
-  const offset = section.getBoundingClientRect().top - content.getBoundingClientRect().top + engine.y;
+  // 对齐小程序 WXS：区块坐标 = 区块可视位置 - 容器(scroller)可视位置 + 当前滚动量。
+  // 注意必须用未被 transform 的 scroller 矩形，用被 translateY 的 scroll-content 会多出一个 +y，
+  // 导致目标位置随当前滚动位置漂移（点击任意条数选项都会继续向下滚出大量距离）
+  const offset = section.getBoundingClientRect().top - engine.el.getBoundingClientRect().top + engine.y;
   const target = Math.min(Math.max(0, offset - 20), engine.maxY);
   // 目标与当前位置接近时不滚动，避免无意义的跳动
   if (Math.abs(target - engine.y) < 1) return;
@@ -1590,13 +1645,25 @@ function toggleSecurityExpanded() {
   document.getElementById('securityDetail').classList.toggle('security-detail-expanded', meState.securityExpanded);
   document.getElementById('securityArrow').classList.toggle('arrow-up', meState.securityExpanded);
   measureAll(320);
+  // 0.3s 过渡结束后再次测量（收起后内容变短，界面自然上移对齐小程序）
+  setTimeout(() => measureAll(320), 340);
 }
 
 function updateSecurityItem(idx, delta) {
   const it = meState.securityItems[idx];
   if (!it) return;
   it.value = Math.max(it.min, Math.min(it.max, it.value + delta));
-  renderSecurityConfig();
+  // 原地更新数值与禁用态（不整表重绘）：重绘会销毁被按下的按钮，短按缩放动画无法播放
+  const rows = document.querySelectorAll('#securityItems .security-row');
+  const row = rows[idx];
+  if (row) {
+    const input = row.querySelector('.security-input');
+    if (input) input.value = it.value;
+    const minus = row.querySelector('[data-sec-minus]');
+    const plus = row.querySelector('[data-sec-plus]');
+    if (minus) minus.classList.toggle('stepper-disabled', it.value <= it.min);
+    if (plus) plus.classList.toggle('stepper-disabled', it.value >= it.max);
+  }
 }
 
 function saveSecurity() {
@@ -1777,7 +1844,15 @@ async function loadAuthorizedUsers() {
   try {
     const r = await api('/api/authorized_users');
     if (r.data && r.data.success) {
-      meState.authorizedUsers = (r.data.users || []).map(u => { u._expanded = false; return u; });
+      meState.authorizedUsers = (r.data.users || []).map(u => {
+        u._expanded = false;
+        // 管理员密钥的关联订单展开状态（按密钥 key 索引）+ 用户订单缓存
+        u._expandedKeyOrders = {};
+        u._ordersLoaded = false;
+        u._ordersLoading = false;
+        u._ordersCache = null;
+        return u;
+      });
       renderAuthorizedUsers();
     } else {
       list.innerHTML = '<view class="status-box"><text class="status-text">' + esc((r.data && r.data.message) || '加载失败') + '</text></view>';
@@ -1821,18 +1896,33 @@ function renderAuthorizedUsers() {
     }).join('');
     // 永久管理员不再单独显示状态标签（许可类型标签已表达“管理员许可”）
     const statusLabel = u.status === 'permanent' ? '' : (statusMap[u.status] || u.status);
-    const recordRows = records.length ? records.map(k => `
+    const recordRows = records.length ? records.map(k => {
+      const isAdminKey = (k.type || 'temp') === 'admin';
+      const keyOrdersOpen = !!(u._expandedKeyOrders && u._expandedKeyOrders[k.key]);
+      // 管理员密钥：不直接显示“关联订单是哪个”，改为显示数量 + 点击展开订单列表（对齐小程序）
+      const orderLine = isAdminKey ? `
+        <view class="record-line record-order-toggle" data-key-order-toggle="${escHtml(k.key)}" data-user-openid="${escHtml(u.openid)}">
+          <text class="record-label">关联订单</text>
+          <text class="record-value record-order-count">${u.order_count || 0} 个</text>
+          <text class="record-order-arrow ${keyOrdersOpen ? 'arrow-up' : ''}">›</text>
+        </view>
+        <view class="record-orders ${keyOrdersOpen ? 'record-orders-expanded' : ''}" data-key-orders="${escHtml(k.key)}">
+          <view class="record-orders-inner">${keyOrdersOpen ? renderRecordOrderContent(u) : ''}</view>
+        </view>` : `
+        <view class="record-line"><text class="record-label">关联订单</text><text class="record-value">${k.order_id ? ('订单 #' + k.order_id) : '空订单（有效期内未提交任务）'}</text></view>`;
+      return `
       <view class="record-row">
         <view class="record-head">
           <text class="record-key">${esc(k.key)}</text>
-          <text class="record-type ${k.type === 'admin' ? 'tag-admin' : 'tag-temp'}">${k.type === 'admin' ? '管理员许可' : '临时许可'}</text>
+          <text class="record-type ${isAdminKey ? 'tag-admin' : 'tag-temp'}">${isAdminKey ? '管理员许可' : '临时许可'}</text>
           <text class="record-status">${esc(keyStatusMap[k.status] || k.status)}</text>
         </view>
         <view class="record-line"><text class="record-label">创建时间</text><text class="record-value">${esc(k.created_at || '—')}</text></view>
         <view class="record-line"><text class="record-label">使用时间</text><text class="record-value">${esc(k.used_at || '—')}</text></view>
         <view class="record-line"><text class="record-label">到期时间</text><text class="record-value">${esc(k.expires_at || '—')}</text></view>
-        <view class="record-line"><text class="record-label">关联订单</text><text class="record-value">${k.order_id ? ('订单 #' + k.order_id) : '空订单（有效期内未提交任务）'}</text></view>
-      </view>`).join('') : '<view class="records-empty">无密钥记录</view>';
+        ${orderLine}
+      </view>`;
+    }).join('') : '<view class="records-empty">无密钥记录</view>';
     return `
       <view class="user-card-item">
         <view class="user-card-main" data-user-openid="${escHtml(u.openid)}" data-user-nickname="${escHtml(u.nickname || '')}">
@@ -1880,6 +1970,62 @@ function toggleAuthorizedUser(openid) {
     if (arrow) arrow.classList.toggle('arrow-up', u._expanded);
   }
   measureAll(150);
+  // 0.32s 过渡完成后再次测量：收起后内容变短，界面自然上移对齐小程序
+  setTimeout(() => measureAll(320), 340);
+}
+
+// 管理员密钥的“关联订单”展开内容（加载中 / 空 / 列表）
+function renderRecordOrderContent(u) {
+  if (u._ordersLoading) return '<text class="record-orders-status">加载中...</text>';
+  if (!u._ordersLoaded) return '<text class="record-orders-status">加载中...</text>';
+  const orders = u._ordersCache || [];
+  if (!orders.length) return '<text class="record-orders-status">暂无关联订单</text>';
+  return orders.map(o => `
+    <view class="record-order-item">
+      <text class="record-order-no">${esc(o.order_number || ('#' + o.id))}</text>
+      <text class="record-order-time">${esc(o.created_at || '')}</text>
+      <text class="record-order-status">${esc(ORDER_STATUS_MAP[o.status] || o.status || '')}</text>
+      <text class="record-order-price">¥${Number(o.total_price || 0).toFixed(2)}</text>
+    </view>`).join('');
+}
+
+// 管理员密钥：展开/收起关联订单列表（首次展开拉取该用户订单，缓存复用）
+async function toggleRecordOrders(openid, key) {
+  const u = meState.authorizedUsers.find(x => x.openid === openid);
+  if (!u) return;
+  if (!u._expandedKeyOrders) u._expandedKeyOrders = {};
+  const open = !u._expandedKeyOrders[key];
+  u._expandedKeyOrders[key] = open;
+  // 原地切换类名让 CSS max-height/opacity 下拉动画播放（对齐密钥记录面板）
+  const wrap = document.querySelector('#authorizedUserList [data-key-orders="' + CSS.escape(key) + '"]');
+  const arrow = document.querySelector('#authorizedUserList [data-key-order-toggle="' + CSS.escape(key) + '"] .record-order-arrow');
+  if (wrap) wrap.classList.toggle('record-orders-expanded', open);
+  if (arrow) arrow.classList.toggle('arrow-up', open);
+  if (open && !u._ordersLoaded && !u._ordersLoading) {
+    u._ordersLoading = true;
+    const inner = wrap ? wrap.querySelector('.record-orders-inner') : null;
+    if (inner) inner.innerHTML = '<text class="record-orders-status">加载中...</text>';
+    try {
+      const r = await api('/api/orders?openid=' + encodeURIComponent(openid) + '&per_page=50');
+      u._ordersLoaded = true;
+      u._ordersLoading = false;
+      u._ordersCache = (r.data && r.data.success) ? (r.data.orders || []) : [];
+      if (wrap && u._expandedKeyOrders[key]) {
+        const i2 = wrap.querySelector('.record-orders-inner');
+        if (i2) i2.innerHTML = renderRecordOrderContent(u);
+      }
+    } catch (e) {
+      u._ordersLoaded = true;
+      u._ordersLoading = false;
+      u._ordersCache = [];
+      if (wrap && u._expandedKeyOrders[key]) {
+        const i3 = wrap.querySelector('.record-orders-inner');
+        if (i3) i3.innerHTML = '<text class="record-orders-status">网络错误</text>';
+      }
+    }
+  }
+  measureAll(150);
+  setTimeout(() => measureAll(320), 340);
 }
 
 /* ================= 子视图：用户订单 / 本地任务 ================= */
@@ -2038,7 +2184,10 @@ function renderUserOrdersUserCard() {
 function buildUserOrdersPageNumbers() {
   const total = meState.userOrdersView.totalPages;
   const current = meState.userOrdersView.page;
-  if (total <= 1) return '';
+  // 对齐小程序：仅 1 页时也显示当前页数字（高亮），避免分页栏只有 ‹ › 箭头
+  if (total <= 1) {
+    return '<view class="page-num page-num-active" data-page-num="1">1</view>';
+  }
   const pages = [];
   if (total <= 7) { for (let i = 1; i <= total; i++) pages.push(i); }
   else {
@@ -2067,8 +2216,7 @@ function scrollUserOrdersToSection() {
   const engine = scrollEngines.userOrders;
   if (!engine) return;
   const section = document.querySelector('#view-user-orders .orders-section');
-  const content = document.getElementById('scrollContentUserOrders');
-  if (!section || !content) return;
+  if (!section || !engine.el) return;
   engine.measure();
   if (engine.y > engine.maxY) {
     engine.cancel();
@@ -2076,7 +2224,8 @@ function scrollUserOrdersToSection() {
     engine.applyY();
   }
   if (engine.maxY <= 0) return;
-  const offset = section.getBoundingClientRect().top - content.getBoundingClientRect().top + engine.y;
+  // 用未被 transform 的 scroller 矩形计算（对齐小程序 WXS 公式，避免 +y 漂移）
+  const offset = section.getBoundingClientRect().top - engine.el.getBoundingClientRect().top + engine.y;
   const target = Math.min(Math.max(0, offset - 12), engine.maxY);
   if (Math.abs(target - engine.y) < 1) return;
   engine.scrollTo(target, 280);
@@ -2097,18 +2246,20 @@ function toggleUserOrdersOrder(id) {
     if (arrow) arrow.classList.toggle('arrow-up', expanded);
   }
   measureAll(150);
+  // 收起动画（0.3s）结束后再次测量，内容变短时界面自然上移对齐小程序
+  setTimeout(() => measureAll(320), 340);
 }
 
 // 选择条数后滚动回订单列表顶部（对齐小程序 _scrollToOrdersSection）
 function scrollUserOrdersToTop() {
   const engine = scrollEngines.userOrders;
   const section = document.querySelector('#view-user-orders .orders-section');
-  if (!engine || !section) return;
+  if (!engine || !section || !engine.el) return;
   engine.measure(); // 用最新内容高度更新 maxY
   // 内容不足一屏：不滚动，保持原位
   if (engine.contentH <= engine.scrollerH) return;
-  const content = document.getElementById('scrollContentUserOrders');
-  const top = section.getBoundingClientRect().top - content.getBoundingClientRect().top + engine.y;
+  // 用未被 transform 的 scroller 矩形计算（对齐小程序 WXS 公式，避免 +y 漂移）
+  const top = section.getBoundingClientRect().top - engine.el.getBoundingClientRect().top + engine.y;
   const target = Math.min(Math.max(0, top - 12), engine.maxY);
   if (Math.abs(target - engine.y) < 2) return;
   engine.scrollTo(target, 280);

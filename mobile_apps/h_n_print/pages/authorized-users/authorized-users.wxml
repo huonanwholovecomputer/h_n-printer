@@ -92,9 +92,30 @@
               <text class="record-label">到期时间</text>
               <text class="record-value">{{rec.expires_at || '—'}}</text>
             </view>
-            <view class="record-line">
+            <!-- 管理员密钥：显示关联订单数量，点击展开订单列表（不直接显示是哪个订单）；
+                 临时密钥：保持单一关联订单展示 -->
+            <view wx:if="{{rec.type === 'admin'}}" class="record-line record-order-toggle" bindtap="onToggleRecordOrders"
+                  data-key="{{rec.key}}" data-openid="{{item.openid}}" hover-class="tap-active">
+              <text class="record-label">关联订单</text>
+              <text class="record-value record-order-count">{{item.order_count || 0}} 个</text>
+              <text class="record-order-arrow {{keyOrders[rec.key] && keyOrders[rec.key].expanded ? 'arrow-up' : ''}}">›</text>
+            </view>
+            <view wx:else class="record-line">
               <text class="record-label">关联订单</text>
               <text class="record-value">{{rec.order_id ? ('订单 #' + rec.order_id) : '空订单（有效期内未提交任务）'}}</text>
+            </view>
+            <!-- 管理员密钥：关联订单列表（外层最大高度 + 内层滚动） -->
+            <view wx:if="{{rec.type === 'admin'}}" class="record-orders {{keyOrders[rec.key] && keyOrders[rec.key].expanded ? 'record-orders-expanded' : ''}}">
+              <view wx:if="{{keyOrders[rec.key] && keyOrders[rec.key].loading}}" class="record-orders-status">加载中...</view>
+              <view wx:elif="{{keyOrders[rec.key] && keyOrders[rec.key].loaded && keyOrders[rec.key].orders.length === 0}}" class="record-orders-status">暂无关联订单</view>
+              <block wx:elif="{{keyOrders[rec.key] && keyOrders[rec.key].orders.length > 0}}">
+                <view wx:for="{{keyOrders[rec.key].orders}}" wx:for-item="od" wx:key="id" class="record-order-item">
+                  <text class="record-order-no">{{od.order_number || ('#' + od.id)}}</text>
+                  <text class="record-order-time">{{od.created_at}}</text>
+                  <text class="record-order-status">{{orderStatusMap[od.status] || od.status}}</text>
+                  <text class="record-order-price">¥{{od.total_price}}</text>
+                </view>
+              </block>
             </view>
           </view>
         </view>

@@ -639,7 +639,9 @@
 
 /* ── Add File Button ── */
 .add-file-btn {
-  width: 100%;
+  width: 375rpx;   /* 50% 屏幕宽度（750rpx 设计稿），显式固定避免微信 button 默认宽度限制导致宽度不一 */
+  margin-left: auto;
+  margin-right: auto;
   margin-top: 16rpx;   /* 与文件列表保持间距，避免紧贴/重叠 */
   background: var(--glass-light);
   color: var(--blue);
@@ -936,7 +938,9 @@
   color: var(--text-primary);
   background: var(--gray6);
   border-radius: var(--radius-sm);
-  border: 1rpx solid transparent;
+  /* 按钮外观：描边 + 轻阴影（此前 border 透明、无阴影，在白底弹窗上像纯文本） */
+  border: 1rpx solid var(--separator-strong);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   transition: all 0.15s ease;
 }
 .range-picker-action:active {
@@ -1081,6 +1085,13 @@ picker-view-column {
   padding: 16rpx 0;
 }
 
+/* 提交打印任务：50% 屏幕宽度（375rpx）居中（不对其他 btn-primary 生效，弹窗内按钮保持 flex 铺满） */
+.submit-area .btn-primary {
+  width: 375rpx;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 /* ── Success Modal ── */
 .order-number-modal {
   font-family: var(--font-mono);
@@ -1094,19 +1105,7 @@ picker-view-column {
   letter-spacing: 0.02em;
 }
 
-.modal-icon-wrap {
-  width: 100rpx;
-  height: 100rpx;
-  border-radius: 50rpx;
-  background-color: rgba(52, 199, 89, 0.1);
-  color: var(--green);
-  font-size: 52rpx;
-  font-weight: 300;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 20rpx;
-}
+/* .modal-icon-wrap 已移至 app.wxss 全局定义（me 等页面弹窗共用） */
 
 .modal-buttons {
   display: flex;

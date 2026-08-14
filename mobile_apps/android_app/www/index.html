@@ -178,11 +178,9 @@
           <view class="user-card-wrap">
             <view class="user-card">
               <view class="avatar-btn" id="avatarBtn">
-                <svg class="avatar" id="avatarImg" viewBox="0 0 108 108" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="默认头像">
-                  <circle cx="54" cy="54" r="54" fill="#E5E5EA"/>
-                  <circle cx="54" cy="44" r="18" fill="#C7C7CC"/>
-                  <ellipse cx="54" cy="80" rx="32" ry="22" fill="#C7C7CC"/>
-                </svg>
+                <!-- 默认头像用内联 SVG data URI；上传/绑定微信后由 JS 换成真实头像（<img> 才能显示） -->
+                <img class="avatar" id="avatarImg" alt="头像"
+                  src="data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 108 108'%3E%3Ccircle cx='54' cy='54' r='54' fill='%23E5E5EA'/%3E%3Ccircle cx='54' cy='44' r='18' fill='%23C7C7CC'/%3E%3Cellipse cx='54' cy='80' rx='32' ry='22' fill='%23C7C7CC'/%3E%3C/svg%3E">
               </view>
               <input type="file" id="avatarInput" accept="image/*" style="display:none">
               <view class="user-info">
@@ -499,7 +497,7 @@
               <text>已绑定设备</text>
               <text class="order-count" id="bindDeviceCountBadge" style="display:none">0</text>
             </view>
-            <view id="bindDeviceList"></view>
+            <view id="bindDeviceList" class="bind-device-list"></view>
           </view>
         </div>
       </div>
@@ -543,24 +541,22 @@
 
           <view class="orders-section">
 
-            <!-- 顶部：每页条数下拉 + 页码 -->
+            <!-- 顶部：每页条数下拉 + 页码（结构与"我的打印任务"一致） -->
             <view class="orders-pagination-bar" id="userOrdersPager" style="display:none">
-              <view class="pagination-bar pagination-top">
-                <view class="page-size-selector" id="uoPageSizeSelector">
-                  <text class="page-size-text" id="uoPageSizeText">10条/页</text>
-                  <text class="page-size-arrow" id="uoPageSizeArrow">▼</text>
-                  <view class="page-size-dropdown" id="uoPageSizeDropdown">
-                    <view class="page-size-option option-active" data-size="10">10 条/页</view>
-                    <view class="page-size-option" data-size="20">20 条/页</view>
-                    <view class="page-size-option" data-size="50">50 条/页</view>
-                    <view class="page-size-option" data-size="100">100 条/页</view>
-                  </view>
+              <view class="page-size-selector" id="uoPageSizeSelector">
+                <text class="page-size-text" id="uoPageSizeText">10条/页</text>
+                <text class="page-size-arrow" id="uoPageSizeArrow">▼</text>
+                <view class="page-size-dropdown" id="uoPageSizeDropdown">
+                  <view class="page-size-option option-active" data-size="10">10 条/页</view>
+                  <view class="page-size-option" data-size="20">20 条/页</view>
+                  <view class="page-size-option" data-size="50">50 条/页</view>
+                  <view class="page-size-option" data-size="100">100 条/页</view>
                 </view>
-                <view class="page-nav">
-                  <view class="page-btn" id="userOrdersPrev">‹</view>
-                  <view class="page-numbers" id="userOrdersPageNumbers"></view>
-                  <view class="page-btn" id="userOrdersNext">›</view>
-                </view>
+              </view>
+              <view class="page-nav">
+                <view class="page-btn" id="userOrdersPrev">‹</view>
+                <view class="page-numbers" id="userOrdersPageNumbers"></view>
+                <view class="page-btn" id="userOrdersNext">›</view>
               </view>
             </view>
 
@@ -572,7 +568,7 @@
             <view id="userOrdersList"></view>
 
             <!-- 底部：页码 + 没有更多 -->
-            <view class="pagination-bar pagination-bottom" id="userOrdersPagerBottom" style="display:none">
+            <view class="orders-pagination-bar pagination-bottom" id="userOrdersPagerBottom" style="display:none">
               <view class="page-nav">
                 <view class="page-btn" id="userOrdersPrevBottom">‹</view>
                 <view class="page-numbers" id="userOrdersPageNumbersBottom"></view>

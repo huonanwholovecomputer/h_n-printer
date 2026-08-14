@@ -50,15 +50,21 @@ npx cap init "HN 云打印" "cn.hnspace.printer" --web-dir=.
 npx cap add android
 ```
 
-### 3. 构建 APK
-```bash
-npx cap sync android
-npx cap open android
-# 在 Android Studio 中: Build > Build Bundle(s) / APK(s) > Build APK(s)
-```
+### 3. 一键构建 APK（推荐）
+> 脚本会自动执行 `cap sync android`（把最新 `www/` 复制进 APK 资产目录，避免打包旧版 Web 资源），并自动关闭 Capacitor 遥测（避免首次运行的交互询问卡住构建）。
+
+- **调试包**：`.\build-apk.ps1` → `android/app/build/outputs/apk/debug/app-debug.apk`
+- **发布包**（正式签名 + 混淆）：`.\build-release-apk.ps1` → `android/app/build/outputs/apk/release/app-release.apk`
 
 ### 4. 直接测试（无需构建 APK）
 直接用浏览器打开 `index.html` 即可预览（需后端可访问）。
+
+## 发布（Release）
+
+- **签名**：发布包使用正式 keystore `android/app/release.keystore`（配置在 `android/app/keystore.properties`，两者均已加入 `.gitignore` **不会提交**）。**请务必单独备份这两个文件**——丢失后已安装用户无法覆盖升级，泄露则可能被冒签。
+- **混淆**：release 已开启 `minifyEnabled`（体积约 -60%）；`proguard-rules.pro` 已保留 WebView 桥接类 `MainActivity$AndroidBarsBridge`（`window.AndroidBars`），混淆后不影响状态栏沉浸。
+- **版本号**：每次发布在 `android/app/build.gradle` 递增 `versionCode`（+1），并同步 `versionName`（如 1.0 → 1.1）。
+- **加固（可选）**：直接分发可考虑第三方加固（腾讯乐固 / 360 加固 / 爱加密）防反编译与二次打包。流程：用已签名的 `app-release.apk` 上传加固 → 下载加固包 → 真机回归测试（加固可能影响 WebView，必须复测核心流程）。
 
 ## API 对接
 

@@ -147,6 +147,8 @@ function applyNativeSafeArea() {
   if (!b) return;
   document.documentElement.style.setProperty('--safe-top', (b.getStatusBarHeight() || 0) + 'px');
   document.documentElement.style.setProperty('--safe-bottom', (b.getNavigationBarHeight() || 0) + 'px');
+  // 安全区注入后导航栏高度变化，主题按钮需重新定位（否则被导航栏盖住）
+  if (typeof positionThemeToggle === 'function') positionThemeToggle();
 }
 
 function syncNativeStatusBar(dark) {
@@ -713,7 +715,12 @@ function initScrollEngines() {
     const sc = document.getElementById(scId);
     const ct = document.getElementById(ctId);
     if (sc && ct && !scrollEngines[key]) {
-      scrollEngines[key] = new FlingEngine(sc, ct, {});
+      const opts = {};
+      if (key === 'userOrders') {
+        // 滚动即收起每页条数下拉（对齐"我的打印任务"的 closePageSizePicker，避免 fixed 下拉错位）
+        opts.onScroll = () => { if (typeof closeUoPageSizePicker === 'function') closeUoPageSizePicker(); };
+      }
+      scrollEngines[key] = new FlingEngine(sc, ct, opts);
     }
   });
 }
@@ -888,6 +895,8 @@ function updateThemeToggleVisibility() {
   const printVisible = document.getElementById('page-print').style.display !== 'none';
   const subVisible = [...document.querySelectorAll('.view')].some(v => v.style.display !== 'none');
   toggle.style.display = (printVisible || subVisible) ? 'none' : '';
+  // 显示时按最新导航栏高度重新定位（安全区高度可能延迟到达，避免被导航栏盖住）
+  if (toggle.style.display !== 'none' && typeof positionThemeToggle === 'function') positionThemeToggle();
 }
 
 /* ================= Toast / Modal ================= */
@@ -1102,12 +1111,14 @@ function initApp() {
     const pp = document.getElementById('page-print');
     if (pp) pp.classList.add('page-fade-in', 'page-fade-in-delayed');
   }, 80);
+  // 必须先注入原生安全区（--safe-top）再定位主题按钮：导航栏高度 = 48px + safe-top，
+  // 若先用 env() 兜底定位（safe-top=0），随后 --safe-top 注入使导航栏变高，会把按钮盖住。
+  applyNativeSafeArea();
   positionThemeToggle();
   updateThemeToggleVisibility();
   window.addEventListener('resize', positionThemeToggle);
   window.addEventListener('resize', applyNativeSafeArea);
   applyTheme(state.themeMode, { skipServer: true });
-  applyNativeSafeArea();
   if (window.matchMedia) {
     window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
       if (state.themeMode === 'auto') applyTheme('auto', { skipServer: true });

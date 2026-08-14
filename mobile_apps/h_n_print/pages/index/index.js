@@ -184,6 +184,8 @@ Component({
         themeMode: app.globalData.themeMode,
       })
       this._initScrollEngine()
+      this._measureSegWidths()   // 预缓存滑块宽度，保证首次拖动即可跟手
+      setTimeout(() => this._measureSegWidths(), 300)
       this._uploadTimers = {}   // { index: intervalId } — 每个文件独立的进度条定时器
       this._pollTimers = {}     // { index: intervalId } — 页数轮询定时器
       this._buildScheduleDays()
@@ -1706,6 +1708,20 @@ Component({
 
     _segSel(seg) {
       return seg === 'duplex' ? '.duplex-toggle' : (seg === 'ori' ? '.img-ori-toggle' : '.key-type-toggle')
+    },
+
+    // 预测量各分段滑块宽度并缓存：createSelectorQuery 是异步的，
+    // 若等第一次触摸时才测量，首次拖动的 onSegTouchMove 会因宽度未就绪而直接 return（拖动无反应）。
+    _measureSegWidths() {
+      if (!this._segW) this._segW = {}
+      const segs = ['duplex', 'ori']
+      segs.forEach(seg => {
+        const q = this.createSelectorQuery()
+        q.selectAll(this._segSel(seg)).boundingClientRect()
+        q.exec((res) => {
+          if (res && res[0] && res[0].length) this._segW[seg] = res[0].map(r => r.width || 0)
+        })
+      })
     },
 
     onSegTouchStart(e) {

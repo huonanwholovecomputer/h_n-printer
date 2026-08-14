@@ -548,6 +548,23 @@ page {
   font-size: 26rpx;
 }
 
+/* 弹窗顶部图标（圆圈 + ✓/⚠/!）。放全局 app.wxss：
+   各页面（index/me/authorized-users/user-orders）的确认弹窗都引用此类，
+   若只在 index.wxss 定义，me 等页面的弹窗会退化成裸符号（无圆圈） */
+.modal-icon-wrap {
+  width: 100rpx;
+  height: 100rpx;
+  border-radius: 50rpx;
+  background-color: rgba(52, 199, 89, 0.1);
+  color: var(--green);
+  font-size: 52rpx;
+  font-weight: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 20rpx;
+}
+
 @keyframes sheetSpringIn {
   from {
     opacity: 0;

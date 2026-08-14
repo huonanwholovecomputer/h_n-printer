@@ -2467,7 +2467,9 @@ body {
   color: var(--text-primary);
   background: var(--gray6);
   border-radius: var(--radius-sm);
-  border: 0.1333cqw solid transparent;
+  /* 按钮外观：描边 + 轻阴影（此前 border 透明、无阴影，在白底弹窗上像纯文本） */
+  border: 0.1333cqw solid var(--separator-strong);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   transition: all 0.15s ease;
 }
 .range-picker-action:active {
@@ -2565,16 +2567,14 @@ picker-view-column {
   pointer-events: none;
   z-index: 3;
 }
-/* 倒计时滚轮单位标签（分/秒）：垂直居中于各列数字右侧，不遮挡数字 */
+/* 倒计时滚轮单位标签（分/秒）：作为 flex 项自然排列在对应列右侧、垂直居中。
+   之前用 absolute + 静态定位，两个单位都会落到容器中心重叠在一起（小程序用 left:40%/90% 显式定位） */
 .wheel-unit {
-  position: absolute;
-  top: 50%;
-  transform: translate(-50%, -50%);
   font-size: 3.4667cqw;
   font-weight: 500;
   color: var(--text-tertiary);
   pointer-events: none;
-  z-index: 3;
+  flex-shrink: 0;
 }
 .schedule-picker {
   flex: 1;
@@ -3113,6 +3113,8 @@ picker-view-column {
   height: 14.4000cqw;
   border-radius: 7.2000cqw;
   background-color: var(--gray5);
+  /* 头像图片裁剪（img 元素），对齐小程序 image mode="aspectFill" */
+  object-fit: cover;
 }
 
 .user-info {
@@ -3339,10 +3341,13 @@ picker-view-column {
 }
 
 /* ── 账号绑定：已绑定设备列表 ── */
+/* 对齐全局卡片外观（license-card/storage-card 的玻璃卡片）：加底色 + 阴影 + 描边 */
 .bind-device-list {
   border-radius: var(--radius-lg);
   overflow: hidden;
-  border: 1px solid var(--separator);
+  border: 0.1333cqw solid var(--separator);
+  background: var(--bg-card);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
 }
 .bind-device-item {
   display: flex;
@@ -3350,7 +3355,7 @@ picker-view-column {
   justify-content: space-between;
   gap: 2.6667cqw;
   padding: 2.9333cqw 3.2cqw;
-  background-color: var(--bg-card);
+  background-color: transparent;
   border-bottom: 1px solid var(--separator);
 }
 .bind-device-item:last-child {
@@ -3702,6 +3707,16 @@ picker-view-column {
 .btn-confirm-admin {
   color: var(--green) !important;
   background-color: rgba(52, 199, 89, 0.08) !important;
+}
+
+/* 卡片底部操作区按钮（复制/已过期/等待任务中）：对齐小程序渲染效果。
+   微信 button 默认 184px 宽 + margin auto 水平居中，Web button 默认收缩到内容宽且被 flex-end 右对齐，
+   这里显式补宽并双 auto 边距，使外观与小程序的"较宽且居中"一致 */
+.key-actions .copy-btn {
+  width: 42.8000cqw;
+  margin-left: auto;
+  margin-right: auto;
+  flex-shrink: 0;
 }
 
 /* Expired state */
@@ -5046,9 +5061,12 @@ picker-view-column {
   opacity: 0;
   transition: max-height 0.32s ease, opacity 0.25s ease;
 }#view-authorized .records-expanded {
-  max-height: 400.0000cqw;
+  /* 密钥记录外层卡片高度上限（≈半屏），超出内部滚动——对齐小程序打印页"上传文件"卡片的外层最大高度+内层列表结构 */
+  max-height: 50vh;
   opacity: 1;
   padding-bottom: 1.0667cqw;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }#view-authorized .records-empty {
   font-size: 2.9333cqw;
   color: var(--text-quaternary);
@@ -5059,6 +5077,75 @@ picker-view-column {
   border-radius: var(--radius-sm);
   padding: 2.1333cqw 2.4000cqw;
   margin-bottom: 1.6000cqw;
+}#view-authorized .record-order-toggle {
+  cursor: pointer;
+  align-items: center;
+}#view-authorized .record-order-count {
+  color: var(--blue);
+  font-weight: 600;
+}#view-authorized .record-order-arrow {
+  font-size: 3.7333cqw;
+  color: var(--text-quaternary);
+  transition: transform 0.25s ease;
+  display: inline-block;
+  margin-left: 0.5333cqw;
+}#view-authorized .record-order-arrow.arrow-up {
+  transform: rotate(90deg);
+  color: var(--blue);
+}
+/* 管理员密钥关联订单列表：内层列表最大高度 + 内部滚动（外层 record-row 上限由 records-expanded 承担） */
+#view-authorized .record-orders {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  margin-top: 0;
+  transition: max-height 0.3s ease, opacity 0.25s ease, margin-top 0.3s ease;
+}#view-authorized .record-orders-expanded {
+  max-height: 53.3333cqw;
+  opacity: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  margin-top: 1.0667cqw;
+  padding: 1.0667cqw 1.3333cqw;
+  background-color: var(--bg-card);
+  border: 0.1333cqw solid var(--separator);
+  border-radius: var(--radius-sm);
+}#view-authorized .record-order-item {
+  display: flex;
+  align-items: center;
+  gap: 1.0667cqw;
+  font-size: 2.6667cqw;
+  padding: 0.8000cqw 0;
+  border-bottom: 0.0667cqw solid var(--separator);
+}#view-authorized .record-order-item:last-child {
+  border-bottom: none;
+}#view-authorized .record-order-no {
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 2.5333cqw;
+}#view-authorized .record-order-time {
+  color: var(--text-tertiary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}#view-authorized .record-order-status {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}#view-authorized .record-order-price {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}#view-authorized .record-orders-status {
+  display: block;
+  font-size: 2.6667cqw;
+  color: var(--text-quaternary);
+  text-align: center;
+  padding: 1.3333cqw 0;
 }#view-authorized .record-head {
   display: flex;
   align-items: center;
@@ -5303,14 +5390,15 @@ picker-view-column {
 }#view-user-orders .page-size-arrow.arrow-up {
   transform: rotate(180deg);
 }#view-user-orders .page-size-dropdown {
-  position: absolute;
-  top: calc(100% + 0.8000cqw);
-  left: 0;
+  /* 打开时由 JS 移到 body 末尾并用 fixed 视口坐标定位（逃出 scroll-content 变换层），
+     backdrop-filter 才能正常采样；背景改半透明让模糊可见 */
   min-width: 21.3333cqw;
-  background: rgba(255, 255, 255, 0.96);  /* 近不透明背景；去掉 backdrop-filter（变换层内模糊渲染不均） */
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
   border-radius: var(--radius-sm);
   box-shadow: 0 0.5333cqw 3.2000cqw rgba(0, 0, 0, 0.12), var(--glass-rim);
-  z-index: 100;
+  z-index: 2000;
   opacity: 0;
   transform: translateY(-1.0667cqw);
   pointer-events: none;
@@ -5491,21 +5579,23 @@ picker-view-column {
   font-weight: 700;
   font-family: var(--font-mono);
 }
-/* 合计价格跟随订单状态色（复用 status-* 主题色），去掉状态类的底色 */
-.detail-price-value.status-queued,
-.detail-price-value.status-printing,
-.detail-price-value.status-accepted,
-.detail-price-value.status-offline_unknown,
-.detail-price-value.status-sent,
-.detail-price-value.status-failed,
-.detail-price-value.status-abandoned,
-.detail-price-value.status-reserved,
-.detail-price-value.status-rejected,
-.detail-price-value.status-canceled,
-.detail-price-value.status-scheduled,
-.detail-price-value.status-downloading,
-.detail-price-value.status-waiting,
-.detail-price-value.status-delivered {
+/* 合计价格跟随订单状态色（复用 status-* 主题色），去掉状态类的底色。
+   #view-user-orders 前缀使特异性 (1,2,0) 压过上方 #view-user-orders .status-*(1,1,0) 的底色，
+   否则深色模式下金额会带浅色（近白）长方形底纹 */
+#view-user-orders .detail-price-value.status-queued,
+#view-user-orders .detail-price-value.status-printing,
+#view-user-orders .detail-price-value.status-accepted,
+#view-user-orders .detail-price-value.status-offline_unknown,
+#view-user-orders .detail-price-value.status-sent,
+#view-user-orders .detail-price-value.status-failed,
+#view-user-orders .detail-price-value.status-abandoned,
+#view-user-orders .detail-price-value.status-reserved,
+#view-user-orders .detail-price-value.status-rejected,
+#view-user-orders .detail-price-value.status-canceled,
+#view-user-orders .detail-price-value.status-scheduled,
+#view-user-orders .detail-price-value.status-downloading,
+#view-user-orders .detail-price-value.status-waiting,
+#view-user-orders .detail-price-value.status-delivered {
   background-color: transparent;
 }
 
@@ -5804,38 +5894,29 @@ button {
   margin-left: auto;
   margin-right: auto;
 }
-/* 其余主按钮对齐小程序 100% 通栏 */
+/* 主操作按钮：50% 宽度居中（对齐小程序，避免整卡片通栏过宽） */
 .generate-btn,
 .retention-save-btn,
-.delete-all-btn {
-  display: block;
-  width: 100%;
-}
-/* 提交打印任务：仅此按钮，避免影响弹窗内的 .btn-primary */
+.delete-all-btn,
 #submitBtn {
   display: block;
-  width: 100%;
+  width: 50%;
+  margin-left: auto;
+  margin-right: auto;
 }
 /* 历史授权用户 / 本地打印任务入口：button 默认居中，恢复左对齐（小程序为 view 默认左对齐） */
 .role-btn {
   text-align: left;
 }
-/* 子视图（本地打印任务/用户任务）每页条数下拉：深色模式适配。
-   生成文件的 #view-user-orders .page-size-dropdown 浅色背景优先级更高，这里用 body.theme-dark 前缀覆盖；
-   无 backdrop-filter（对齐小程序 5481bb1：变换层内模糊采样错位，改近不透明背景） */
+/* 子视图（本地打印任务/用户任务）每页条数下拉：深色模式适配（半透明 + 模糊，与浅色一致） */
 body.theme-dark #view-user-orders .page-size-dropdown {
-  background: rgba(44, 44, 46, 0.92);
+  background: rgba(44, 44, 46, 0.72);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
   box-shadow: 0 0.5333cqw 3.2000cqw rgba(0, 0, 0, 0.4), var(--glass-rim);
 }
-/* "我的打印任务"每页条数下拉：改为 absolute 相对选择器（与子视图一致），
-   避免 scroll-content 的 transform 破坏 position:fixed 导致下拉弹到视口外 */
-#ordersPageSize .page-size-dropdown {
-  position: absolute;
-  top: calc(100% + 0.8000cqw);
-  left: 0;
-  min-width: 21.3333cqw;
-  z-index: 100;
-}
+/* "我的打印任务"每页条数下拉：打开时由 JS 移到 body 末尾 + fixed 视口坐标定位
+   （逃出 scroll-content 变换层，backdrop-filter 才能正常采样），无需 absolute 兜底 */
 /* 密钥详情展开：修复生成文件里 user-orders 区无前缀 .license-detail(max-height:0) 排在
    .license-detail-expanded 之后导致展开态被覆盖的问题（内联 ID 特异性压过它） */
 #licenseDetail.license-detail-expanded,
@@ -5863,5 +5944,7 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   padding-bottom: calc(8.0000cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)));
 }
 .theme-toggle-btn {
-  top: calc(var(--safe-top, env(safe-area-inset-top, 0px)) + 6px);
+  /* 兜底：导航栏(48px 内容高 + 安全区)下方 + 8px 间距，对齐小程序 navBarBtnTop。
+     JS positionThemeToggle() 会在注入安全区后按真实导航栏底缘重定位，此为样式兜底 */
+  top: calc(var(--safe-top, env(safe-area-inset-top, 0px)) + 56px);
 }

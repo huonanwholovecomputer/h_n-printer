@@ -7,6 +7,9 @@ const UNSUPPORTED_EXTS = ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf'];
 const MAX_FILES = 20;
 const MAX_FILE_MB = 50;
 const MAX_POLL_ATTEMPTS = 60;
+// 大图压缩阈值与压缩后最长边（对齐小程序"相册选择压缩图"体验）
+const COMPRESS_IMAGE_THRESHOLD = 2 * 1024 * 1024; // 超过 2MB 的图片尝试压缩
+const COMPRESS_MAX_SIDE = 1600;                    // 压缩后最长边上限（px）
 
 const printState = {
   selectedFiles: [],
@@ -111,7 +114,8 @@ function setupFileInput() {
     }
     document.getElementById('fileInput').click();
   });
-  document.getElementById('fileInput').addEventListener('change', (e) => {
+  document.getElementById('fileInput').addEventListener('change', async (e) => {
+    let compressedCount = 0;
     for (const file of e.target.files) {
       if (printState.selectedFiles.length >= MAX_FILES) {
         showToast('最多 20 个文件');
@@ -131,9 +135,18 @@ function setupFileInput() {
         showToast('不支持 ' + ext + ' 格式');
         continue;
       }
+      // 大图自动压缩（对齐小程序"相册选择压缩图"体验）：超过 2MB 的图片先尝试 canvas 压缩，
+      // 压缩失败（无法解码等）回退原文件上传，不直接拦截。
+      // 注意局部变量不能叫 uploadFile（会遮蔽全局上传函数）
+      let fileToUpload = file;
+      let uploadSize = size;
+      if (isImage && size > COMPRESS_IMAGE_THRESHOLD) {
+        const cf = await compressImageFile(file);
+        if (cf) { fileToUpload = cf; uploadSize = cf.size; compressedCount++; }
+      }
       const fi = {
-        name, size, file,
-        sizeDisplay: (size / 1024).toFixed(1),
+        name, size: uploadSize, file: fileToUpload,
+        sizeDisplay: (uploadSize / 1024).toFixed(1),
         fileId: null, uploading: true, progress: 0, failed: false,
         copies: 1,
         rangeLines: [{ value: '', error: '' }],
@@ -149,8 +162,41 @@ function setupFileInput() {
       updateFileBadge(true);
       uploadFile(printState.selectedFiles.length - 1);
     }
+    if (compressedCount > 0) showToast(compressedCount + ' 张大图已自动压缩后上传');
     e.target.value = '';
   });
+}
+
+/* 大图压缩：canvas 缩放 + JPEG 渐进降质，目标 ≤ 2MB（对齐小程序压缩上传体验）。
+   返回新 File（.jpg）或 null（解码/压缩失败，回退原文件） */
+async function compressImageFile(file) {
+  try {
+    const bitmap = await createImageBitmap(file);
+    let { width, height } = bitmap;
+    const maxSide = Math.max(width, height);
+    if (maxSide > COMPRESS_MAX_SIDE) {
+      const ratio = COMPRESS_MAX_SIDE / maxSide;
+      width = Math.max(1, Math.round(width * ratio));
+      height = Math.max(1, Math.round(height * ratio));
+    }
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    if (bitmap.close) bitmap.close();
+    let quality = 0.85;
+    let blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', quality));
+    while (blob && blob.size > COMPRESS_IMAGE_THRESHOLD && quality > 0.4) {
+      quality -= 0.1;
+      blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', quality));
+    }
+    if (blob && blob.size < file.size) {
+      const newName = file.name.replace(/\.[^.]+$/, '') + '.jpg';
+      return new File([blob], newName, { type: 'image/jpeg', lastModified: Date.now() });
+    }
+  } catch (e) { /* 解码失败（如 TIFF）→ 回退原文件 */ }
+  return null;
 }
 
 /* ================= 文件列表渲染（小程序类名） ================= */
@@ -564,7 +610,14 @@ function setCopies(idx, val) {
   const v = parseInt(val, 10);
   if (isNaN(v)) return;
   f.copies = Math.max(1, Math.min(99, v));
-  renderFileList();
+  // 原地更新份数（不整表重绘）：整表重绘会销毁被按下的按钮，导致短按缩放动画播放不完整
+  const card = document.querySelectorAll('#fileList .file-card')[idx];
+  if (card) {
+    const input = card.querySelector('.stepper-input');
+    if (input) input.value = f.copies;
+    const minus = card.querySelector('[data-action="copies-minus"]');
+    if (minus) minus.classList.toggle('stepper-disabled', f.copies <= 1);
+  }
 }
 
 function setDuplex(idx, val) {
@@ -949,7 +1002,21 @@ function confirmRangePicker() {
   f.pageRange = selected.join(',');
   f.singlePage = computeSinglePage(f);
   closeModal('rangePickerModal');
-  renderFileList();
+  // 原地更新卡片摘要（不整表重绘）：重绘会重建全部元素，触发 statusFadeIn 入场动画，
+  // 导致"√已上传"/页数状态文字闪烁
+  const card = document.querySelectorAll('#fileList .file-card')[idx];
+  if (card) {
+    const summary = card.querySelector('.range-summary-text');
+    if (summary) {
+      summary.textContent = f.pageRange ? '已选 ' + f.pageRange : '全部页';
+      summary.classList.toggle('range-summary-all', !f.pageRange);
+    }
+    const modeRow = card.querySelector('.mode-row');
+    if (modeRow) modeRow.classList.toggle('mode-row-collapsed', !!f.singlePage);
+  }
+  measureAll(150);
+  // 卡片高度可能变化（模式行收起），过渡结束后再次测量（对齐小程序 _recalcFileListHeight）
+  setTimeout(() => measureAll(320), 340);
 }
 
 /* ================= 定价 / 附加服务 ================= */

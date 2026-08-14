@@ -27,6 +27,24 @@ Component({
       finished: '已完成',
       archived: '归档',
     },
+    // 管理员密钥的关联订单：{ [key]: { expanded, loading, loaded, orders } }
+    keyOrders: {},
+    // 订单状态文案（对齐 user-orders 页）
+    orderStatusMap: {
+      queued: '排队中',
+      printing: '待添加',
+      accepted: '已添加',
+      offline_unknown: '断线未知',
+      sent: '已完成',
+      failed: '失败',
+      abandoned: '放弃打印',
+      rejected: '被打回',
+      canceled: '已取消',
+      reserved: '已预留',
+      scheduled: '已预约',
+      downloading: '文件传输中',
+      waiting: '等待打印',
+    },
   },
 
   pageLifetimes: {
@@ -206,6 +224,51 @@ Component({
       }
       this.setData({ expandedUsers: expanded })
       this._scheduleMeasure()
+      // 密钥记录展开/收起有 0.32s 动画，收起后内容变短需再次测量（对齐 APP）
+      setTimeout(() => this._scheduleMeasure(300), 300)
+    },
+
+    // 管理员密钥：展开/收起关联订单列表（首次展开拉取该用户订单，缓存复用）
+    onToggleRecordOrders(e) {
+      const key = e.currentTarget.dataset.key
+      const openid = e.currentTarget.dataset.openid
+      const ko = { ...this.data.keyOrders }
+      const cur = ko[key] || { expanded: false, loading: false, loaded: false, orders: [] }
+      const expanded = !cur.expanded
+      ko[key] = { ...cur, expanded }
+      this.setData({ keyOrders: ko })
+      if (expanded && !cur.loaded && !cur.loading) {
+        this._loadKeyOrders(key, openid)
+      }
+      this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(300), 300)
+    },
+
+    _loadKeyOrders(key, openid) {
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      this.setData({ ['keyOrders.' + key + '.loading']: true })
+      wx.request({
+        url: CONFIG.BASE_URL + '/api/orders?openid=' + encodeURIComponent(openid) + '&per_page=50',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        success: (res) => {
+          const orders = (res.data && res.data.success) ? (res.data.orders || []) : []
+          this.setData({
+            ['keyOrders.' + key + '.loading']: false,
+            ['keyOrders.' + key + '.loaded']: true,
+            ['keyOrders.' + key + '.orders']: orders,
+          })
+          this._scheduleMeasure()
+        },
+        fail: () => {
+          this.setData({
+            ['keyOrders.' + key + '.loading']: false,
+            ['keyOrders.' + key + '.loaded']: true,
+            ['keyOrders.' + key + '.orders']: [],
+          })
+        },
+      })
     },
   },
 })

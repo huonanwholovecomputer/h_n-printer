@@ -210,7 +210,7 @@ npx cap sync android && npx cap open android
 # 开发预览：直接用浏览器打开 index.html
 ```
 
-后端地址默认见 `www/app.js` 的 `DEFAULT_BASE_URL`；本地调试可用 `localStorage.setItem('hn_base_url', 'https://你的地址')` 覆盖。一键构建 debug APK：`.\build-apk.ps1`。
+后端地址默认见 `www/app.js` 的 `DEFAULT_BASE_URL`；本地调试可用 `localStorage.setItem('hn_base_url', 'https://你的地址')` 覆盖。一键构建：`.\build-apk.ps1`（debug 包）；`.\build-release-apk.ps1`（发布包，正式签名 + 混淆，见 `android_app/README.md` 的「发布」章节）。
 
 ---
 
@@ -252,6 +252,8 @@ ssh root@YOUR_SERVER "journalctl -u printer-backend --since '5 minutes ago' --no
 | `mobile_apps/printer-backend/pricing.json` | 定价配置，供小程序 `/api/pricing` 接口读取 |
 | `mobile_apps/h_n_print/utils/config.js` | 小程序 API 地址 `BASE_URL` |
 | `mobile_apps/h_n_print/utils/config.local.js` | 本地地址覆盖，不提交 git |
+| `mobile_apps/android_app/android/app/release.keystore` | APP 发布签名 keystore，不提交 git（务必单独备份） |
+| `mobile_apps/android_app/android/app/keystore.properties` | 发布签名密码/别名配置，不提交 git |
 
 ---
 

@@ -254,9 +254,11 @@
 }
 
 .records-expanded {
-  max-height: 3000rpx;
+  /* 密钥记录外层卡片高度上限（≈半屏），超出内部滚动——对齐打印页"上传文件"卡片的外层最大高度+内层列表结构 */
+  max-height: 50vh;
   opacity: 1;
   padding-bottom: 8rpx;
+  overflow-y: auto;
 }
 
 .records-empty {
@@ -271,6 +273,100 @@
   border-radius: var(--radius-sm);
   padding: 16rpx 18rpx;
   margin-bottom: 12rpx;
+}
+
+/* 管理员密钥：关联订单数量 + 展开箭头 */
+.record-order-toggle {
+  align-items: center;
+  cursor: pointer;
+}
+
+.record-order-count {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+.record-order-arrow {
+  font-size: 28rpx;
+  color: var(--text-quaternary);
+  transition: transform 0.25s ease;
+  display: inline-block;
+  margin-left: 4rpx;
+}
+
+.record-order-arrow.arrow-up {
+  transform: rotate(90deg);
+  color: var(--blue);
+}
+
+/* 管理员密钥：关联订单列表（内层列表最大高度 + 内部滚动） */
+.record-orders {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  margin-top: 0;
+  transition: max-height 0.3s ease, opacity 0.25s ease, margin-top 0.3s ease;
+}
+
+.record-orders-expanded {
+  max-height: 400rpx;
+  opacity: 1;
+  overflow-y: auto;
+  margin-top: 8rpx;
+  padding: 8rpx 12rpx;
+  background-color: var(--bg-card);
+  border: 1rpx solid var(--separator);
+  border-radius: var(--radius-sm);
+}
+
+.record-order-item {
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  font-size: 20rpx;
+  padding: 6rpx 0;
+  border-bottom: 0.5rpx solid var(--separator);
+}
+
+.record-order-item:last-child {
+  border-bottom: none;
+}
+
+.record-order-no {
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 19rpx;
+}
+
+.record-order-time {
+  color: var(--text-tertiary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-order-status {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.record-order-price {
+  color: var(--text-primary);
+  font-weight: 600;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.record-orders-status {
+  display: block;
+  font-size: 20rpx;
+  color: var(--text-quaternary);
+  text-align: center;
+  padding: 10rpx 0;
 }
 
 .record-head {

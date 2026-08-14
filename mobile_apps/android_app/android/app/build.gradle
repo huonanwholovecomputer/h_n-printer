@@ -1,5 +1,14 @@
 apply plugin: 'com.android.application'
 
+// 发布签名配置：从 app/keystore.properties 读取（该文件不入 git）。
+// keystore 丢失/泄露需重签，会造成已装用户无法升级，请务必妥善备份！
+def keystorePropsFile = rootProject.file('app/keystore.properties')
+def keystoreProperties = new Properties()
+def hasReleaseSigning = keystorePropsFile.exists()
+if (hasReleaseSigning) {
+    keystoreProperties.load(new FileInputStream(keystorePropsFile))
+}
+
 android {
     namespace "cn.hnspace.printer"
     compileSdk rootProject.ext.compileSdkVersion
@@ -16,10 +25,26 @@ android {
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            if (hasReleaseSigning) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
     buildTypes {
         release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            // 正式发布签名（keystore.properties 存在时启用，否则构建报"未签名"）
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+            // 开启代码压缩混淆（Java/Capacitor 层；Web 资源本就不参与混淆）+ 移除无用的 Java 代码
+            minifyEnabled true
+            shrinkResources false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 }

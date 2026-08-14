@@ -151,6 +151,8 @@ Component({
         navBarBtnTop: btnTop,
       })
       this._initScrollEngine()
+      this._measureKeyTypeWidth()   // 预缓存密钥类型滑块宽度，首次拖动即可跟手
+      setTimeout(() => this._measureKeyTypeWidth(), 300)
       this.loadProfile()
       this.loadUserRole()
       this.loadOrders()
@@ -230,11 +232,13 @@ Component({
       // 数据新鲜度守卫：60 秒内切回本页不重复全量拉取（切 tab 反复拉取会触发 Nginx hn_api 限流）。
       // 入口动画、tab 同步、轮询照常；个别操作（提交/兑换/改配置）后对应处理器会主动刷新。
       const _now = Date.now()
+      // 个人资料（头像/昵称）每次 show 都刷新：APP 端绑定微信账号后可能在 APP 里修改头像/昵称，
+      // 小程序需及时同步（/api/profile 为轻量单查，不受全量守卫限制）
+      this.loadProfile()
       if (!this._lastDataLoad || (_now - this._lastDataLoad) > 60000) {
         this._lastDataLoad = _now
         this.loadUserRole()
         this.loadOrders()
-        this.loadProfile()
         this.loadBindDeviceCount()
         const cachedRole = wx.getStorageSync('userRole')
         if (cachedRole === 'admin') {
@@ -256,6 +260,9 @@ Component({
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(300), 300)
       this._startOrderPolling()
+      // 恢复密钥轮询：hide() 已 _stopKeyPolling()，而 60s 数据守卫可能跳过 loadUserRole（轮询只在其中启动），
+      // 不在这里恢复会导致切 tab 回来后密钥状态（已使用/已删除）不再与另一端同步
+      if (wx.getStorageSync('userRole') === 'admin') this._startKeyPolling()
     },
     hide() {
       this._stopOrderPolling()
@@ -840,6 +847,17 @@ Component({
     },
 
     // ==================== 密钥类型滑块拖动（与 index 页分段滑块一致） ====================
+    // 预测量 key-type-toggle 宽度并缓存：createSelectorQuery 异步，
+    // 首次触摸才测量会导致第一次拖动无跟手（宽度未就绪直接 return）。
+    _measureKeyTypeWidth() {
+      if (!this._segW) this._segW = {}
+      const q = this.createSelectorQuery()
+      q.selectAll('.key-type-toggle').boundingClientRect()
+      q.exec((res) => {
+        if (res && res[0] && res[0].length) this._segW['keytype'] = res[0].map(r => r.width || 0)
+      })
+    },
+
     onSegTouchStart(e) {
       const seg = e.currentTarget.dataset.seg
       const idx = e.currentTarget.dataset.index
@@ -848,11 +866,7 @@ Component({
       this._seg = { seg, idx, key: seg + '-' + idx, startX: t.clientX, startY: t.clientY, locked: false, lastP: undefined }
       if (!this._segW) this._segW = {}
       if (!this._segW[seg]) {
-        const q = this.createSelectorQuery()
-        q.selectAll('.key-type-toggle').boundingClientRect()
-        q.exec((res) => {
-          if (res && res[0]) this._segW[seg] = res[0].map(r => r.width || 0)
-        })
+        this._measureKeyTypeWidth()
       }
     },
 

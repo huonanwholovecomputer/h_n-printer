@@ -349,6 +349,58 @@ button {
 }
 /* 内联 SVG 头像：CSS 只设了宽度，补宽高比（logo 用真实图片，按自身比例自适应） */
 .avatar { aspect-ratio: 1 / 1; height: auto; }
+
+/* ========== 手动修复区（重新运行脚本后必须保留的 APP 独有修复） ========== */
+
+/* BUG3: 许可密钥卡片底部操作按钮对齐小程序渲染（微信 button 默认 184px 宽 + margin auto 居中，
+   Web button 默认收缩内容宽且 flex-end 右对齐） */
+.key-actions .copy-btn {
+  width: 42.8000cqw;
+  margin-left: auto;
+  margin-right: auto;
+  flex-shrink: 0;
+}
+
+/* BUG4: 历史授权用户/本地打印任务（#view-user-orders）金额去掉状态类底色，
+   #前缀特异性(1,2,0)压过 #view-user-orders .status-*(1,1,0)，深色模式不再出现白色底纹 */
+#view-user-orders .detail-price-value.status-queued,
+#view-user-orders .detail-price-value.status-printing,
+#view-user-orders .detail-price-value.status-accepted,
+#view-user-orders .detail-price-value.status-offline_unknown,
+#view-user-orders .detail-price-value.status-sent,
+#view-user-orders .detail-price-value.status-failed,
+#view-user-orders .detail-price-value.status-abandoned,
+#view-user-orders .detail-price-value.status-reserved,
+#view-user-orders .detail-price-value.status-rejected,
+#view-user-orders .detail-price-value.status-canceled,
+#view-user-orders .detail-price-value.status-scheduled,
+#view-user-orders .detail-price-value.status-downloading,
+#view-user-orders .detail-price-value.status-waiting,
+#view-user-orders .detail-price-value.status-delivered {
+  background-color: transparent;
+}
+
+/* BUG8: 倒计时滚轮单位标签（分/秒）改为 flex 流内排列（小程序用 left:40%/90% 显式定位，
+   Web 端没有对应内联样式，absolute 静态定位会让两个单位重叠在容器中心） */
+.wheel-unit {
+  position: static;
+  top: auto;
+  transform: none;
+  z-index: auto;
+  flex-shrink: 0;
+}
+
+/* BUG9: 账号绑定「已绑定设备」使用全局卡片外观（底色 + 阴影 + 描边） */
+.bind-device-list {
+  background: var(--bg-card);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+}
+.bind-device-item {
+  background-color: transparent;
+}
+
+/* BUG2: 头像 <img> 裁剪（对齐小程序 image mode="aspectFill"） */
+.avatar { object-fit: cover; }
 `;
 
 let all = WEB_BASE;
