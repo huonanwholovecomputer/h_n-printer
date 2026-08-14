@@ -32,7 +32,7 @@
   </div>
 
   <!-- ===== Tab: 提交打印 ===== -->
-  <div class="page-root page-fade-in" id="page-print">
+  <div class="page-root" id="page-print">
     <div class="scroller" id="scroller-print">
       <div class="scroll-content" id="scrollContentPrint">
         <div class="container">
@@ -46,7 +46,7 @@
 
           <view class="status-bar card-preload" id="printerStatus" style="animation-delay: 0.6s">
             <view class="status-dot offline" id="statusDot"></view>
-            <text class="status-text" id="statusText">检查中…</text>
+            <text class="status-text" id="statusText">打印机离线</text>
           </view>
 
           <!-- 打印文件 -->
@@ -310,13 +310,15 @@
               </view>
             </view>
 
-            <!-- 角色入口 -->
-            <view class="role-actions admin-collapsible" id="adminBlockRoles">
+            <!-- 角色入口（对齐小程序：两张独立卡片） -->
+            <view class="role-actions admin-collapsible" id="adminBlockAuth">
               <button class="role-btn user-btn" id="btnAuthorizedUsers" data-hover="role-btn-pressing">
                 <text class="role-btn-icon">👥</text>
                 <text class="role-btn-text">历史授权用户</text>
                 <text class="role-btn-arrow">›</text>
               </button>
+            </view>
+            <view class="role-actions admin-collapsible" id="adminBlockLocal">
               <button class="role-btn user-btn" id="btnLocalOrders" data-hover="role-btn-pressing">
                 <text class="role-btn-icon">🖨️</text>
                 <text class="role-btn-text">本地打印任务</text>
@@ -329,6 +331,7 @@
               <view class="section-title">
                 <view class="section-bar"></view>
                 <text>管理管理员</text>
+                <text class="order-count" id="adminCount" style="display:none">0</text>
               </view>
               <view id="adminList"></view>
             </view>
@@ -459,6 +462,9 @@
     <div class="scroller" id="scroller-bind">
       <div class="scroll-content" id="scrollContentBind">
         <div class="container">
+          <view class="bind-intro">
+            <text class="bind-intro-text">在微信小程序「我 → 账号绑定」中生成一次性绑定密钥并在此填写。绑定后本 APP 将以该微信账号身份发起任务（权限与小程序一致），订单按 APP 来源统计。</text>
+          </view>
           <view class="license-section">
             <view class="section-title">
               <view class="section-bar"></view>
@@ -536,10 +542,6 @@
           </view>
 
           <view class="orders-section">
-            <view class="section-title">
-              <view class="section-bar"></view>
-              <text id="userOrdersTitle">订单列表</text>
-            </view>
 
             <!-- 顶部：每页条数下拉 + 页码 -->
             <view class="orders-pagination-bar" id="userOrdersPager" style="display:none">

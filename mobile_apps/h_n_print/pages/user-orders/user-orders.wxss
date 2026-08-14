@@ -627,6 +627,17 @@
   color: var(--orange);
 }
 
+/* Reject reason text（与"我"页一致） */
+.file-reject-reason {
+  display: block;
+  font-size: 18rpx;
+  color: var(--red);
+  margin-top: 6rpx;
+  line-height: 1.4;
+  text-align: right;
+  word-break: break-all;
+}
+
 /* Cancel button */
 .detail-actions {
   margin-top: 8rpx;
@@ -674,4 +685,7 @@
 }
 .theme-dark .page-size-option.option-active {
   background: rgba(0, 122, 255, 0.12);
+}
+.theme-dark .page-size-dropdown {
+  background: rgba(44, 44, 46, 0.92);
 }

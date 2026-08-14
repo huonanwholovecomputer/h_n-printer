@@ -207,6 +207,8 @@ Component({
         data,
         success: (res) => {
           if (res.statusCode !== 200 || !res.data || !res.data.success) return
+          // 轮询成功即自愈：清除上次的加载失败提示（对齐 APP 轮询自恢复）
+          if (this.data.loadError) this.setData({ loadError: '' })
           const newOrders = (res.data.orders || [])
           // 格式化价格
           newOrders.forEach(order => {
@@ -290,7 +292,6 @@ Component({
               loadError: '',
               totalOrders: total,
               totalPages: Math.ceil(total / this.data.perPage),
-              expandedOrders: {},
             }, () => {
               this._syncPageNumbers()
               this._scheduleMeasure(100)
@@ -380,6 +381,11 @@ Component({
     onSelectPageSize(e) {
       const size = parseInt(e.currentTarget.dataset.size, 10)
       if (isNaN(size)) return
+      if (size === this.data.perPage) {
+        // 重复选择当前条数：只收起下拉，不重复请求（对齐 APP 防重）
+        this.setData({ showPageSizePicker: false })
+        return
+      }
       this.setData({
         perPage: size,
         currentPage: 1,
@@ -413,6 +419,8 @@ Component({
       wx.showModal({
         title: '确认取消',
         content: '确定要取消这个打印任务吗？',
+        confirmText: '取消订单',
+        confirmColor: '#FF9500',
         success: (modalRes) => {
           if (!modalRes.confirm) return
           wx.showLoading({ title: '取消中...' })

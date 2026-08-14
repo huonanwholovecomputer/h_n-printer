@@ -78,6 +78,11 @@ printer-local.db
 # 微信小程序本地配置覆盖（含真实服务器地址）
 mobile_apps/h_n_print/utils/config.local.js
 
+# AI 助手指导文档（含真实服务器 IP / SSH 密钥路径，仅本地参考，不进 git）
+AGENTS.md
+CLAUDE.md
+mobile_apps/AGENTS.md
+
 # 开发计划（仅本地参考）
 DEVELOPMENT_PLAN.md
 

@@ -102,8 +102,8 @@
         <view class="page-size-selector" bindtap="onTogglePageSizePicker">
           <text class="page-size-text">{{perPage}}条/页</text>
           <text class="page-size-arrow {{showPageSizePicker ? 'arrow-up' : ''}}">▼</text>
-          <!-- 下拉选项 -->
-          <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}" wx:if="{{showPageSizePicker}}">
+          <!-- 下拉选项（常驻节点切 class，0.2s 过渡双向生效；对齐 APP） -->
+          <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}">
             <view wx:for="{{pageOptions}}" wx:key="*this"
                   class="page-size-option {{perPage === item ? 'option-active' : ''}}"
                   catchtap="onSelectPageSize" data-size="{{item}}">
@@ -208,6 +208,7 @@
                 <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
                 <text class="detail-file-range">{{f.duplex === 'on' ? '双面' : '单面'}}</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
+                <text wx:if="{{(f.status === 'rejected' || f.status === 'failed') && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
             </view>
           </view>

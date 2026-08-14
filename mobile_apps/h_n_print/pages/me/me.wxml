@@ -100,6 +100,7 @@
       <view class="section-title">
         <view class="section-bar"></view>
         <text>生成许可密钥</text>
+        <text wx:if="{{activeKeys.length > 0}}" class="order-count">{{activeKeys.length}}</text>
       </view>
       <view class="license-card">
         <text class="license-label">有效时间（分钟）</text>
@@ -152,6 +153,7 @@
           <view wx:if="{{item.status !== 'unused'}}" class="key-user-info">
             <image wx:if="{{item.used_by_avatar_url}}" class="key-user-avatar" src="{{item.used_by_avatar_url}}" mode="aspectFill" />
             <text class="key-user-name">{{item.used_by_nickname}}</text>
+            <button wx:if="{{item.order_id}}" class="copy-btn key-settle-btn" bindtap="onEndPrintTask" data-idx="{{index}}" hover-class="tap-active">结算</button>
           </view>
           <view class="key-actions">
             <button wx:if="{{item.status === 'unused' && !item.expired}}" class="copy-btn" bindtap="onCopyKey" data-idx="{{index}}" hover-class="tap-active">复制</button>
@@ -582,7 +584,7 @@
 
   <!-- 分页下拉（page-root 外，position:fixed 逃出 translateY 变换层，保证 backdrop-filter 采样正常） -->
   <view class="{{isDarkMode ? 'theme-dark' : ''}}">
-    <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}" wx:if="{{showPageSizePicker}}" style="left: {{pageSizeDropdownLeft}}px; top: {{pageSizeDropdownTop}}px;">
+    <view class="page-size-dropdown {{showPageSizePicker ? 'dropdown-show' : ''}}" style="left: {{pageSizeDropdownLeft}}px; top: {{pageSizeDropdownTop}}px;">
       <view wx:for="{{pageOptions}}" wx:key="*this"
             class="page-size-option {{ordersPerPage === item ? 'option-active' : ''}}"
             catchtap="onSelectOrdersPageSize" data-size="{{item}}">

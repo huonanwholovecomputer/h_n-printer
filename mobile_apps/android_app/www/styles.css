@@ -3,6 +3,9 @@
 :root {
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* Tab 文字色（对齐小程序 page-meta 注入的 --tab-text/--tab-text-active） */
+  --tab-text: #8E8E93;
+  --tab-text-active: #007AFF;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -851,6 +854,9 @@ body {
   --text-secondary: #EBEBF5;
   --text-tertiary: #98989D;
   --text-quaternary: #636366;
+  /* Tab 文字色深色覆盖（对齐小程序 page-meta） */
+  --tab-text: #98989D;
+  --tab-text-active: #409CFF;
   --separator: rgba(84, 84, 88, 0.40);
   --separator-strong: rgba(84, 84, 88, 0.55);
   --shadow-sm: 0 0.1333cqw 0.5333cqw rgba(0, 0, 0, 0.2);
@@ -3363,7 +3369,7 @@ picker-view-column {
 }
 .bind-device-time {
   font-size: 2.9333cqw;
-  color: var(--text-quaternary);
+  color: var(--text-tertiary);
 }
 .bind-device-actions {
   display: flex;
@@ -3378,6 +3384,10 @@ picker-view-column {
   padding: 1.3333cqw 2.9333cqw;
   border-radius: var(--radius-sm);
   border: none;
+  transition: transform 0.06s ease;
+}
+.bind-device-btn:active {
+  transform: scale(0.96);
 }
 .bind-device-rename {
   color: var(--blue);
@@ -3386,6 +3396,16 @@ picker-view-column {
 .bind-device-unbind {
   color: var(--red);
   background-color: rgba(255, 59, 48, 0.08);
+}
+
+/* ── 绑定页顶部说明（对齐小程序 bind-intro） ── */
+.bind-intro {
+  margin-bottom: 2.6667cqw;
+}
+.bind-intro-text {
+  font-size: 3.2cqw;
+  line-height: 1.6;
+  color: var(--text-tertiary);
 }
 
 /* ═══════════════ Cards (generic) ═══════════════ */
@@ -3758,9 +3778,9 @@ picker-view-column {
   background-color: rgba(0, 122, 255, 0.08);
 }
 
-/* 验证按钮（输入框下方，居中，1/4屏幕宽） */
+/* 绑定按钮（输入框下方，通栏，对齐小程序生成按钮 100% 宽） */
 .redeem-btn {
-  width: 50%;
+  width: 100%;
   background: linear-gradient(180deg,
     rgba(0, 122, 255, 0.88) 0%,
     rgba(0, 105, 220, 0.94) 100%);
@@ -3769,7 +3789,6 @@ picker-view-column {
   font-weight: 600;
   border-radius: var(--radius-md);
   padding: 2.4000cqw 0;
-  margin: 0 auto;
   border: none;
   box-shadow:
     0 0.2667cqw 1.3333cqw rgba(0, 122, 255, 0.2),
@@ -5709,33 +5728,18 @@ button {
 .range-line-input {
   width: 100%;
 }
-/* 深色模式：模式/方向滑轨加亮，提升与卡片背景的区分度 */
-.theme-dark .duplex-toggle,
-.theme-dark .img-ori-toggle {
-  background-color: rgba(255, 255, 255, 0.18);
-}
 /* 模式/方向滑轨：纵向滚动交给页面，横向拖动交给滑块 */
 .duplex-toggle,
 .img-ori-toggle {
   touch-action: pan-y;
 }
 
-/* 开始方式卡片：标题更小；模式按钮与瓷块文字常规字重、居中 */
-.schedule-title {
-  font-size: 2.6667cqw;
-}
-.schedule-mode,
-.schedule-mode.active {
-  font-family: inherit;
-  font-weight: 300;
-  text-align: center;
-}
+/* 开始方式排版对齐小程序（标题 24rpx、按钮/瓷块 26rpx/500 见主样式段）；
+   仅保留 Web 适配：text 行内 → 块级占满才能居中 */
 .schedule-picker-value {
   display: block;
   width: 100%;
   font-family: inherit;
-  font-weight: 300;
-  text-align: center;
 }
 
 .nickname-input {
@@ -5751,17 +5755,7 @@ button {
 .key-card {
   touch-action: pan-y;
 }
-/* 导航栏悬浮：内容从导航栏下方滚过（真实毛玻璃采样）；滚动内容加同高顶部留白 */
-.weui-navigation-bar {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 900;
-}
-.scroll-content {
-  padding-top: calc(48px + env(safe-area-inset-top));
-}
+/* 导航栏恢复文档流内（对齐小程序：内容在导航栏下方滚动，不穿过导航栏） */
 /* 内层文件列表：显式高度 + 内部滚动裁剪（对齐小程序 scroll-view），
    否则卡片溢出画到外层卡片/添加按钮上 */
 .file-list-scroll {
@@ -5780,18 +5774,8 @@ button {
 .weui-navigation-bar__btn_goback_wrapper {
   margin: 0 -18px 0 -16px;
 }
-/* 顶部导航栏：与 Tab 栏同款毛玻璃材质（固定低透明底 + 模糊 + 内外描边，不随主题变化） */
-.weui-navigation-bar__inner,
-.theme-dark .weui-navigation-bar__inner {
-  background: rgba(255, 255, 255, 0.12);
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
-  box-shadow:
-    0 1.0667cqw 4.2667cqw rgba(0, 0, 0, 0.08),
-    inset 0 0.1333cqw 0 rgba(255, 255, 255, 0.20),
-    inset 0 -0.1333cqw 0 rgba(0, 0, 0, 0.04),
-    0 0 0 0.0667cqw rgba(0, 0, 0, 0.04);
-}
+/* 导航栏材质对齐小程序：浅色 rgba(255,255,255,0.84)+blur(24px)、
+   深色 rgba(28,28,30,0.88)（主样式段 885 行处已有深色规则，不再覆盖） */
 .detail-actions { display: flex; flex-direction: column; margin-top: 2.7cqw; }
 .empty-illustration {
   width: 16cqw; height: 16cqw;
@@ -5803,47 +5787,44 @@ button {
 .empty-title { font-size: 3.7cqw; font-weight: 600; margin-bottom: 1.1cqw; }
 .empty-desc { font-size: 3.2cqw; color: var(--text-tertiary); }
 .file-retry-btn {
-  font-size: 2.7cqw; font-weight: 500;
+  font-size: 3.2cqw; font-weight: 500;
   color: var(--orange);
   border: 0.1333cqw solid var(--orange);
-  border-radius: 1.6cqw;
-  padding: 0.8cqw 2.4cqw;
+  border-radius: 1.0667cqw;
+  padding: 0.5333cqw 2.1333cqw;
 }
 /* 内联 SVG 头像：CSS 只设了宽度，补宽高比（logo 用真实图片，按自身比例自适应） */
 .avatar { aspect-ratio: 1 / 1; height: auto; }
 
-/* ═══════════════ 主操作按钮：居中、约 3/5 宽度（对齐小程序视觉效果） ═══════════════
+/* ═══════════════ 主操作按钮 ═══════════════
    手动覆盖区：重新运行 wxss2web 生成 styles.css 后需保留此段 */
+/* 添加文件：保留 50% 居中（小程序因微信 button 宽度限制视觉同为 50%） */
 .add-file-btn {
   width: 50%;
   margin-left: auto;
   margin-right: auto;
 }
+/* 其余主按钮对齐小程序 100% 通栏 */
 .generate-btn,
 .retention-save-btn,
 .delete-all-btn {
   display: block;
-  width: 50%;
-  margin-left: auto;
-  margin-right: auto;
+  width: 100%;
 }
 /* 提交打印任务：仅此按钮，避免影响弹窗内的 .btn-primary */
 #submitBtn {
   display: block;
-  width: 50%;
-  margin-left: auto;
-  margin-right: auto;
+  width: 100%;
 }
 /* 历史授权用户 / 本地打印任务入口：button 默认居中，恢复左对齐（小程序为 view 默认左对齐） */
 .role-btn {
   text-align: left;
 }
 /* 子视图（本地打印任务/用户任务）每页条数下拉：深色模式适配。
-   生成文件的 #view-user-orders .page-size-dropdown 浅色背景优先级更高，这里用 body.theme-dark 前缀覆盖 */
+   生成文件的 #view-user-orders .page-size-dropdown 浅色背景优先级更高，这里用 body.theme-dark 前缀覆盖；
+   无 backdrop-filter（对齐小程序 5481bb1：变换层内模糊采样错位，改近不透明背景） */
 body.theme-dark #view-user-orders .page-size-dropdown {
   background: rgba(44, 44, 46, 0.92);
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
   box-shadow: 0 0.5333cqw 3.2000cqw rgba(0, 0, 0, 0.4), var(--glass-rim);
 }
 /* "我的打印任务"每页条数下拉：改为 absolute 相对选择器（与子视图一致），
@@ -5854,12 +5835,6 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   left: 0;
   min-width: 21.3333cqw;
   z-index: 100;
-}
-/* 下拉背景模糊度与 tab 栏对齐（saturate(180%) blur(14px)） */
-#ordersPageSize .page-size-dropdown,
-#view-user-orders .page-size-dropdown {
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
 }
 /* 密钥详情展开：修复生成文件里 user-orders 区无前缀 .license-detail(max-height:0) 排在
    .license-detail-expanded 之后导致展开态被覆盖的问题（内联 ID 特异性压过它） */
@@ -5875,9 +5850,7 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   height: calc(var(--height) + var(--safe-top, env(safe-area-inset-top, 0px)));
   padding-top: var(--safe-top, env(safe-area-inset-top, 0px));
 }
-.scroll-content {
-  padding-top: calc(48px + var(--safe-top, env(safe-area-inset-top, 0px)));
-}
+/* 注：导航栏已在文档流内，scroll-content 不再需要顶部补偿（对齐小程序） */
 
 /* 底部安全区：Tab 栏、回到顶部按钮、滚动容器底部留白 */
 .tab-bar {

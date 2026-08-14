@@ -695,6 +695,11 @@
   font-weight: 600;
 }
 
+/* 结算按钮：靠右对齐（仅已使用且关联订单的密钥显示） */
+.key-user-info .key-settle-btn {
+  margin-left: auto;
+}
+
 /* ═══════════════ Guest: Redeem Key ═══════════════ */
 
 .redeem-desc {

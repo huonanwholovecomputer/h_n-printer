@@ -262,7 +262,7 @@ class FlingEngine {
 
     this._debouncedMeasure = () => {
       if (this._measureTimer) clearTimeout(this._measureTimer);
-      this._measureTimer = setTimeout(() => { this._measureTimer = null; this.measure(); }, 120);
+      this._measureTimer = setTimeout(() => { this._measureTimer = null; this.measure(); }, 100);
     };
     this._bind();
     this.measure();
@@ -300,15 +300,20 @@ class FlingEngine {
     const ch = this.content.getBoundingClientRect().height || this.content.scrollHeight || 0;
     this.scrollerH = vp;
     this.contentH = ch;
-    const tabBar = document.getElementById('tabBar');
-    const tabOverlay = tabBar ? tabBar.getBoundingClientRect().height + 16 : 60;
+    // 底部留白对齐小程序：(12+110)rpx 按屏宽换算 + 底部安全区
+    const rpx = (this.el.clientWidth || 375) / 750;
+    let tabOverlay = Math.round(122 * rpx);
+    try {
+      const sb = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--safe-bottom'));
+      if (isFinite(sb)) tabOverlay += Math.round(sb);
+    } catch (e) { /* 忽略，安全区取 0 */ }
     this.maxY = Math.max(0, ch - vp + (this.opts.bottomPad || 20) + tabOverlay);
     if (this.y > this.maxY) this.snapBack();
   }
 
   scheduleMeasure(delay) {
     if (this._measureTimer) clearTimeout(this._measureTimer);
-    this._measureTimer = setTimeout(() => { this._measureTimer = null; this.measure(); }, delay || 120);
+    this._measureTimer = setTimeout(() => { this._measureTimer = null; this.measure(); }, delay || 100);
   }
 
   cancel() {
@@ -810,7 +815,7 @@ function showView(id, title) {
   document.getElementById('tabBar').style.display = 'none';
   document.getElementById('navBack').style.display = '';
   document.getElementById('navTitle').textContent = title || '';
-  // me 页离场动画（对齐小程序 page-exit-left），240ms 后切换子视图
+  // me 页离场动画（对齐小程序 page-exit-left + 280ms 导航延迟），280ms 后切换子视图
   const mePage = document.getElementById('page-me');
   mePage.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left');
   void mePage.offsetWidth;
@@ -823,7 +828,7 @@ function showView(id, title) {
     updateThemeToggleVisibility();
     measureAll();
     _viewTransition = false;
-  }, 240);
+  }, 280);
 }
 
 function hideView() {
@@ -831,7 +836,7 @@ function hideView() {
   _viewTransition = true;
   if (typeof closePageSizePicker === 'function') closePageSizePicker();
   document.getElementById('page-print').style.display = 'none';
-  // 当前子视图离场动画（对齐小程序 page-exit-right），240ms 后显示 me 页
+  // 当前子视图离场动画（对齐小程序 page-exit-right），280ms 后显示 me 页
   const currentView = [...document.querySelectorAll('.view')].find(v => v.style.display !== 'none');
   const mePage = document.getElementById('page-me');
   const finish = () => {
@@ -852,7 +857,7 @@ function hideView() {
     currentView.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left');
     void currentView.offsetWidth;
     currentView.classList.add('page-exit-right');
-    setTimeout(finish, 240);
+    setTimeout(finish, 280);
   } else {
     finish();
   }
@@ -913,7 +918,7 @@ function closeModal(id) {
   setTimeout(() => {
     el.style.display = 'none';
     el.classList.remove('modal-closing');
-  }, 180);
+  }, 200);
 }
 
 let _confirmCallback = null;
@@ -951,9 +956,11 @@ function formatRemain(str) {
   if (isNaN(t)) return str;
   const remain = t - Date.now();
   if (remain <= 0) return '已过期';
-  const m = Math.floor(remain / 60000);
-  const s = Math.floor((remain % 60000) / 1000);
-  return m + '分' + (s < 10 ? '0' : '') + s + '秒';
+  // 对齐小程序密钥倒计时格式 m:ss（Math.ceil 取整）
+  const totalSec = Math.ceil(remain / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return m + ':' + (s < 10 ? '0' + s : s);
 }
 
 async function copyText(text, successMsg) {
@@ -1046,9 +1053,11 @@ function setupPressFeedback() {
     '.btn-cancel-sm', '.page-btn', '.page-num', '.page-size-selector', '.page-size-option',
     '.sheet-option', '.schedule-mode', '.schedule-picker', '.picker-trigger', '.picker-option',
     '.range-picker-cell', '.range-picker-action', '.range-summary-trigger', '.file-retry-btn',
-    '.duplex-opt', '.img-ori-opt', '.key-type-option', '.license-badge', '.key-delete',
-    '.admin-delete-btn', '.stepper-btn', '.avatar-btn',
+    '.duplex-opt', '.img-ori-opt', '.key-type-option', '.license-badge',
+    '.admin-delete-btn', '.stepper-btn',
   ].join(',');
+  // 注：.key-delete / .avatar-btn 不在默认列表——对齐小程序仅用 CSS :active 反馈
+  //（key-delete scale 0.95、头像 opacity 0.7），避免与 JS tap-active(0.97) 冲突
   let pressedEl = null;
   const clear = () => {
     if (!pressedEl) return;
@@ -1088,6 +1097,11 @@ function initApp() {
   setupTabs();
   setupNav();
   setupPressFeedback();
+  // 首屏淡入：对齐小程序 page-fade-in-delayed（延迟 0.5s 向上淡入，仅首次加载；切 tab 用各自转场类）
+  setTimeout(() => {
+    const pp = document.getElementById('page-print');
+    if (pp) pp.classList.add('page-fade-in', 'page-fade-in-delayed');
+  }, 80);
   positionThemeToggle();
   updateThemeToggleVisibility();
   window.addEventListener('resize', positionThemeToggle);

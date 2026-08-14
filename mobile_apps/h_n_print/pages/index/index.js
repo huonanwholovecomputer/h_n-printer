@@ -784,80 +784,81 @@ Component({
         return
       }
       this._choosingFile = true
+      const remaining = 20 - this.data.selectedFiles.length
       wx.chooseMessageFile({
-        count: 1,
+        count: remaining,
         type: 'all',
         complete: () => { this._choosingFile = false },
         success: (res) => {
-          const file = res.tempFiles[0]
-          const name = file.name || ''
-          const sizeKB = Number(file.size) || 0
-          const fileIndex = this.data.selectedFiles.length
-
-          // 50MB 上限预检（size 单位为字节）
-          if ((Number(file.size) || 0) > 50 * 1024 * 1024) {
-            wx.showToast({
-              title: '文件超过 50MB 限制',
-              icon: 'none',
-              duration: 2000
-            })
-            return  // 拒绝此文件，不添加到列表
-          }
-
-          // 检测文件格式：图片 / 不支持格式（Excel/PPT/压缩包等）
-          const ext = name.slice(name.lastIndexOf('.')).toLowerCase()
+          const picked = (res.tempFiles || []).slice(0, remaining)
+          if (!picked.length) return
           const imageExts = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
-          const isImage = imageExts.includes(ext)
           // 不支持自动打印的类型（可添加显示，但无法打印，需联系管理员）：Excel/PPT/CAD
           const unsupportedExts = ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf']
-          const isUnsupported = unsupportedExts.includes(ext)
-
           // 可打印的支持格式（html/htm 已移除）
           const supportedExts = ['.pdf', '.doc', '.docx', '.txt', '.csv', '.md',
             '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
-          if (!supportedExts.includes(ext) && !isUnsupported) {
-            wx.showToast({
-              title: `不支持 ${ext} 格式`,
-              icon: 'none',
-              duration: 2000
-            })
-            return  // 拒绝此文件，不添加到列表
-          }
-
-          const newFile = {
-            name: name,
-            size: file.size,
-            path: file.path,
-            sizeDisplay: (sizeKB / 1024).toFixed(1),
-            fileId: null,
-            uploading: true,
-            progress: 0,
-            failed: false,
-            copies: 1,
-            pageRange: '',                        // 提交用，由 rangeLines 合并得出
-            rangeLines: [{value: '', error: ''}],  // 多行输入，对齐本地工具 RangeListWidget
-            duplex: isImage ? 'off' : 'on',  // 图片单页渲染，无双面概念 → 固定单面
-            imageOrientation: 'auto',   // 图片打印方向: auto=自动 / landscape=横向 / portrait=竖向
-            entering: true,
-            removing: false,
-            excelWarning: isUnsupported,   // 不支持自动打印的类型（Excel/PPT/CAD）
-            unsupportedFormat: false,   // 未知格式已在选择时拦截，不会到达此处
-            isImage: isImage,
-            pageCount: 0,
-            pageCountStatus: '',  // '' | 'analyzing' | 'confirmed' — 页数分析进度
-            singlePage: false,    // 有效选择恰好 1 页 → 模式行隐藏、提交强制单面
-          }
-          // 圆点动画和计数统一延迟 0.25s，与卡片入场同步
-          const isFirstFile = fileIndex === 0
-          const newCount = fileIndex + 1
-          this.setData({
-            ['selectedFiles[' + fileIndex + ']']: newFile,
-            badgeExiting: false
+          let oversizeCount = 0
+          let unknownCount = 0
+          const accepted = []
+          picked.forEach((file) => {
+            const name = file.name || ''
+            const ext = name.slice(name.lastIndexOf('.')).toLowerCase()
+            // 50MB 上限预检（size 单位为字节）
+            if ((Number(file.size) || 0) > 50 * 1024 * 1024) { oversizeCount++; return }
+            const isImage = imageExts.includes(ext)
+            const isUnsupported = unsupportedExts.includes(ext)
+            // 未知格式直接排除（不支持格式可添加显示，提交时自动跳过）
+            if (!supportedExts.includes(ext) && !isUnsupported) { unknownCount++; return }
+            accepted.push({ file, name, ext, isImage, isUnsupported })
           })
+          if (oversizeCount > 0 || unknownCount > 0) {
+            const parts = []
+            if (oversizeCount > 0) parts.push(oversizeCount + ' 个超过 50MB')
+            if (unknownCount > 0) parts.push(unknownCount + ' 个格式不支持')
+            wx.showToast({ title: '已跳过 ' + parts.join('、'), icon: 'none', duration: 2000 })
+          }
+          if (!accepted.length) return
+          const baseIndex = this.data.selectedFiles.length
+          const patches = { badgeExiting: false }
+          const uploads = []
+          accepted.forEach((item, i) => {
+            const file = item.file
+            const sizeKB = Number(file.size) || 0
+            const fileIndex = baseIndex + i
+            const newFile = {
+              name: item.name,
+              size: file.size,
+              path: file.path,
+              sizeDisplay: (sizeKB / 1024).toFixed(1),
+              fileId: null,
+              uploading: true,
+              progress: 0,
+              failed: false,
+              copies: 1,
+              pageRange: '',                        // 提交用，由 rangeLines 合并得出
+              rangeLines: [{value: '', error: ''}],  // 多行输入，对齐本地工具 RangeListWidget
+              duplex: item.isImage ? 'off' : 'on',  // 图片单页渲染，无双面概念 → 固定单面
+              imageOrientation: 'auto',   // 图片打印方向: auto=自动 / landscape=横向 / portrait=竖向
+              entering: true,
+              removing: false,
+              excelWarning: item.isUnsupported,   // 不支持自动打印的类型（Excel/PPT/CAD）
+              unsupportedFormat: false,   // 未知格式已在选择时拦截，不会到达此处
+              isImage: item.isImage,
+              pageCount: 0,
+              pageCountStatus: '',  // '' | 'analyzing' | 'confirmed' — 页数分析进度
+              singlePage: false,    // 有效选择恰好 1 页 → 模式行隐藏、提交强制单面
+            }
+            patches['selectedFiles[' + fileIndex + ']'] = newFile
+            uploads.push({ fileIndex, path: file.path })
+          })
+          this.setData(patches)
+          // 圆点动画和计数统一延迟 0.25s，与卡片入场同步
+          const isFirstFile = baseIndex === 0
           if (this._badgeCountTimer) clearTimeout(this._badgeCountTimer)
           this._badgeCountTimer = setTimeout(() => {
             this.setData({
-              badgeCount: newCount,
+              badgeCount: baseIndex + accepted.length,
               badgeEntering: isFirstFile,
               badgeBouncing: !isFirstFile
             })
@@ -865,13 +866,18 @@ Component({
           }, 250)
           if (isFirstFile) this._triggerBtnPulse()
           // 入场动画延迟 0.25s（等待微信文件选择器关闭）+ 动画 0.5s
-          setTimeout(() => {
-            this.setData({ ['selectedFiles[' + fileIndex + '].entering']: false })
-          }, 800)  // 250ms delay + 500ms animation + 50ms buffer
-          this._bumpForNewFile()                        // 立刻扩展滚动边界，不等动画
+          uploads.forEach((u) => {
+            setTimeout(() => {
+              if (this.data.selectedFiles[u.fileIndex]) {
+                this.setData({ ['selectedFiles[' + u.fileIndex + '].entering']: false })
+              }
+            }, 800)  // 250ms delay + 500ms animation + 50ms buffer
+          })
+          // 多文件一次重算列表高度（补间 350ms），内部同步扩展滚动边界估算
+          this._recalcFileListHeight()
           this._scheduleMeasure(400)
           setTimeout(() => this._scheduleMeasure(850), 850)  // 动画完成后修正为精确值
-          this.startFileUpload(fileIndex, file.path)
+          uploads.forEach((u) => this.startFileUpload(u.fileIndex, u.path))
         },
         fail: (err) => {
           console.log('选择文件失败', err)
@@ -1737,7 +1743,15 @@ Component({
       const segs = s.seg === 'ori' ? 3 : 2
       const segPx = w / segs
       const cur = this._segCurrent(s)
-      const p = Math.max(0, Math.min(segs - 1, cur + dx / segPx))
+      let p = Math.max(0, Math.min(segs - 1, cur + dx / segPx))
+      // 平滑磁力（对齐 APP 手感）：进入磁吸区（±40% 段宽）后向档位中心施加拉力，
+      // 越接近拉力越大（线性衰减），不瞬移；松手时才完全吸附
+      const nearest = Math.round(p)
+      const zone = 0.40
+      const dist = nearest - p
+      if (Math.abs(dist) < zone) {
+        p += dist * (1 - Math.abs(dist) / zone)
+      }
       s.lastP = p
       this.setData({ ['segDrag.' + s.key]: Math.round(p * 100) })
     },

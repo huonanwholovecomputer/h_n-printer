@@ -45,7 +45,7 @@ const meState = {
   ordersPerPage: 10,
   ordersTotal: 0,
   ordersTotalPages: 0,
-  ordersLoadError: false,
+  ordersLoadError: '',
   expandedOrders: {},
   showLicenseDetail: false,
   loadingOrders: false,
@@ -70,6 +70,7 @@ const meState = {
   securityExpanded: false,
   authorizedUsers: [],
   bindDevices: [],
+  bindDevicesLoading: false,
   userOrdersView: { openid: '', nickname: '', source: '', orders: [], page: 1, perPage: 10, total: 0, totalPages: 0, expanded: {} },
 };
 
@@ -87,6 +88,7 @@ function loadMeTab() {
   if (!meState._lastDataLoad || (now - meState._lastDataLoad) > 60000) {
     meState._lastDataLoad = now;
     loadOrders();
+    loadBindDevices();
     if (state.role === 'admin') {
       loadIfStale('keys', loadActiveKeys);
       loadIfStale('tempUsers', loadTempUsers);
@@ -137,10 +139,13 @@ function refreshMeUI() {
     detail.style.padding = '';
   }
   document.getElementById('guestSection').style.display = state.role === 'guest' ? '' : 'none';
-  // 账号绑定入口副标题：已绑定显示微信昵称，未绑定提示去管理（管理界面在独立子视图）
+  // 账号绑定入口副标题：与小程序同语义——显示已绑定设备数（管理界面在独立子视图）
   const bindEntry = document.getElementById('bindEntryDesc');
-  if (bindEntry) bindEntry.textContent = isBound() ? ('已绑定微信账号：' + (state.nickname || '微信账号')) : '管理微信账号绑定';
-  setAdminCollapsed(state.role === 'admin');
+  if (bindEntry) {
+    const bindCount = (meState.bindDevices || []).length;
+    bindEntry.textContent = bindCount > 0 ? ('已绑定 ' + bindCount + ' 台设备') : '管理微信小程序与 APP 的账号绑定';
+  }
+  updateAdminCollapsed();
   // 普通用户：打印许可卡片（对齐小程序）
   const userLic = document.getElementById('userLicenseSection');
   if (userLic) userLic.style.display = state.role === 'user' ? '' : 'none';
@@ -175,11 +180,18 @@ function updateRoleActions() {
 }
 
 // 管理员区块展开/收起（对齐小程序 admin-collapsible 过渡）
-function setAdminCollapsed(expanded) {
-  ['adminBlockKeys', 'adminBlockStorage', 'adminBlockSecurity', 'adminBlockRoles'].forEach(id => {
+// 存储/防滥用区块：数据到达后才展开（小程序 storageStats/securityConfig 到位才加 admin-expanded）
+function updateAdminCollapsed() {
+  const isAdmin = state.role === 'admin';
+  const setBlock = (id, on) => {
     const el = document.getElementById(id);
-    if (el) el.classList.toggle('admin-expanded', expanded);
-  });
+    if (el) el.classList.toggle('admin-expanded', on);
+  };
+  setBlock('adminBlockKeys', isAdmin);
+  setBlock('adminBlockStorage', isAdmin && !!meState.storageStats);
+  setBlock('adminBlockSecurity', isAdmin && !!meState.securityConfig);
+  setBlock('adminBlockAuth', isAdmin);
+  setBlock('adminBlockLocal', isAdmin || !!state.isSuperAdmin);
   measureAll(150);
 }
 
@@ -575,6 +587,11 @@ function renderBindView() {
   const badge = document.getElementById('bindDeviceCountBadge');
   const count = (meState.bindDevices || []).length;
   if (badge) { badge.style.display = count > 0 ? '' : 'none'; badge.textContent = count; }
+  // 同步「我」页入口副标题（与小程序同语义：已绑定 N 台设备）
+  const bindEntry = document.getElementById('bindEntryDesc');
+  if (bindEntry) {
+    bindEntry.textContent = count > 0 ? ('已绑定 ' + count + ' 台设备') : '管理微信小程序与 APP 的账号绑定';
+  }
   renderBindDeviceList();
 }
 
@@ -582,8 +599,12 @@ function renderBindDeviceList() {
   const list = document.getElementById('bindDeviceList');
   if (!list) return;
   const devices = meState.bindDevices || [];
+  if (meState.bindDevicesLoading && !devices.length) {
+    list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
+    return;
+  }
   if (!devices.length) {
-    list.innerHTML = '<view class="license-card"><text class="redeem-desc" style="text-align:center;margin:0;">暂无绑定设备</text></view>';
+    list.innerHTML = '<view class="empty-state"><view class="empty-illustration"><text class="empty-icon">📱</text></view><text class="empty-title">暂无绑定设备</text><text class="empty-desc">在微信小程序生成绑定密钥并填写后，设备会出现在这里</text></view>';
     return;
   }
   list.innerHTML = devices.map(d => `
@@ -607,13 +628,16 @@ function renderBindDeviceList() {
 
 async function loadBindDevices() {
   if (!state.token) return;
+  meState.bindDevicesLoading = true;
+  renderBindDeviceList();
   try {
     const r = await api('/api/bind/devices');
     if (r.data && r.data.success) {
       meState.bindDevices = r.data.devices || [];
-      renderBindView();
     }
   } catch (e) { /* 静默 */ }
+  meState.bindDevicesLoading = false;
+  renderBindView();
 }
 
 let _deviceRenameOpenid = '';
@@ -644,7 +668,7 @@ function saveDeviceRename() {
 
 function unbindDevice(devOpenid) {
   if (!devOpenid) return;
-  showConfirm('解除绑定', '解除后该设备将回到独立的设备账号，已产生的订单仍保留在微信账号下。', '解除', '#FF3B30', () => {
+  showConfirm('解除绑定', '解除后该 APP 将回到独立的设备账号：已产生的订单仍保留在微信账号下；解除期间的新订单记入设备账号，重新绑定后自动迁移。', '解除', '#FF3B30', () => {
     api('/api/bind/revoke', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -693,7 +717,7 @@ async function loadOrders() {
     const r = await api('/api/orders?page=' + meState.ordersPage + '&per_page=' + meState.ordersPerPage);
     meState.loadingOrders = false;
     if (r.status === 200 && r.data && r.data.success) {
-      meState.ordersLoadError = false;
+      meState.ordersLoadError = '';
       const orders = (r.data.orders || []).map(normalizeOrder);
       meState.orders = orders;
       meState.ordersTotal = r.data.total || 0;
@@ -701,12 +725,13 @@ async function loadOrders() {
       meState.expandedOrders = {};
       renderOrders();
     } else {
-      meState.ordersLoadError = true;
+      // 对齐小程序：优先展示后端返回的 message
+      meState.ordersLoadError = (r.data && r.data.message) || '加载失败';
       renderOrders();
     }
   } catch (e) {
     meState.loadingOrders = false;
-    meState.ordersLoadError = true;
+    meState.ordersLoadError = '网络错误';
     renderOrders();
   }
 }
@@ -822,7 +847,7 @@ function renderOrders() {
   const empty = document.getElementById('ordersEmpty');
   const badge = document.getElementById('orderCountBadge');
   if (meState.loadingOrders && meState.orders.length === 0) list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
-  else if (meState.ordersLoadError && meState.orders.length === 0) { list.innerHTML = '<view class="status-box"><text class="status-text">网络错误</text></view>'; empty.style.display = 'none'; }
+  else if (meState.ordersLoadError && meState.orders.length === 0) { list.innerHTML = '<view class="status-box"><text class="status-text">' + esc(meState.ordersLoadError) + '</text></view>'; empty.style.display = 'none'; }
   else if (meState.orders.length === 0) { list.innerHTML = ''; empty.style.display = ''; }
   else { empty.style.display = 'none'; list.innerHTML = meState.orders.map(o => orderCardHTML(o, !!meState.expandedOrders[o.id], true)).join(''); }
   badge.style.display = meState.orders.length ? '' : 'none';
@@ -960,9 +985,9 @@ function scrollToOrdersSection() {
   // 内容不足一屏（maxY <= 0）：不滚动，保持原位
   if (engine.maxY <= 0) return;
   const offset = section.getBoundingClientRect().top - content.getBoundingClientRect().top + engine.y;
-  const target = Math.min(Math.max(0, offset - 12), engine.maxY);
+  const target = Math.min(Math.max(0, offset - 20), engine.maxY);
   // 目标与当前位置接近时不滚动，避免无意义的跳动
-  if (Math.abs(target - engine.y) < 2) return;
+  if (Math.abs(target - engine.y) < 1) return;
   engine.scrollTo(target, 280);
 }
 
@@ -1260,16 +1285,21 @@ function bindKeySwipes() {
     const del = card.parentElement.querySelector('.key-delete');
     if (!del) return;
     if (_swipeBindings[key]) return;
-    _swipeBindings[key] = makeSwipeable(card, del, () => revokeKey(key));
+    // 密钥卡：延迟淡入（35% 起显）+ 右滑归位快速淡出（对齐小程序 onKeyTouchMove/End）
+    _swipeBindings[key] = makeSwipeable(card, del, () => revokeKey(key), { fadeMode: 'delayed', quickFade: true });
   });
 }
 
 // 通用左滑手势：露出右侧按钮，超过半程吸附展开（Pointer Events，鼠标/触摸通用）
-function makeSwipeable(card, deleteEl, onDelete) {
+// opts：{ deadZone, rubberOver, fadeMode: 'linear'|'delayed', quickFade } 用于逐卡对齐小程序参数
+function makeSwipeable(card, deleteEl, onDelete, opts) {
+  opts = opts || {};
   let startX = 0, startY = 0, lastRaw = 0, horizontal = false, startCardX = 0, pointerId = null;
   // 以删除按钮实际宽度为准（CSS 18.67cqw ≈ 80px，不能写死）
   // 延迟到首次触摸时测量：卡片可能在「我」页未显示时绑定，display:none 下 offsetWidth=0
   let DELETE_W = deleteEl ? deleteEl.offsetWidth : 140;
+  const deadZone = opts.deadZone != null ? opts.deadZone : 8;
+  const rubberOver = opts.rubberOver != null ? opts.rubberOver : 40;
   const rubber = (raw, max, min, over) => {
     if (raw > max) return max + over * (1 - Math.exp(-(raw - max) / (over * 1.6)));
     if (raw < min) return min - over * (1 - Math.exp(-(min - raw) / (over * 1.6)));
@@ -1278,6 +1308,17 @@ function makeSwipeable(card, deleteEl, onDelete) {
   const getX = () => {
     const m = /translateX\((-?[\d.]+)px\)/.exec(card.style.transform || '');
     return m ? parseFloat(m[1]) : 0;
+  };
+  const opacityOf = (raw) => {
+    if (raw >= 0) return 0;
+    const p = Math.abs(raw) / DELETE_W;
+    if (opts.fadeMode === 'delayed') return Math.min(1, Math.max(0, (p - 0.35) / 0.65));
+    return Math.min(1, p / 0.6);
+  };
+  const setQuickFade = (on) => {
+    if (!opts.quickFade || !deleteEl) return;
+    const wrap = deleteEl.parentElement;
+    if (wrap) wrap.classList.toggle('quick-fade', on);
   };
   const apply = (x, opacity, transition) => {
     card.style.transform = 'translateX(' + x + 'px)';
@@ -1299,7 +1340,7 @@ function makeSwipeable(card, deleteEl, onDelete) {
     const dx = e.clientX - startX;
     const dy = e.clientY - startY;
     if (!horizontal) {
-      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      if (Math.abs(dx) < deadZone && Math.abs(dy) < deadZone) return;
       if (Math.abs(dx) > Math.abs(dy)) {
         horizontal = true;
         gestureBus.horizontal = true;
@@ -1308,8 +1349,9 @@ function makeSwipeable(card, deleteEl, onDelete) {
     }
     const raw = startCardX + dx;
     lastRaw = raw;
-    const visual = rubber(raw, 0, -DELETE_W, 40);
-    const opacity = raw < 0 ? Math.min(1, Math.abs(raw) / (DELETE_W * 0.6)) : 0;
+    const visual = rubber(raw, 0, -DELETE_W, rubberOver);
+    const opacity = opacityOf(raw);
+    setQuickFade(raw >= 0);
     apply(visual, opacity, false);
   };
   const onUp = () => {
@@ -1322,6 +1364,7 @@ function makeSwipeable(card, deleteEl, onDelete) {
     // 吸附判定用卡片绝对位移（展开态右滑也能正确计算），对齐小程序 onKeyTouchEnd
     const raw = lastRaw;
     const target = raw > 0 ? 0 : (raw < -DELETE_W ? -DELETE_W : (raw < -DELETE_W / 2 ? -DELETE_W : 0));
+    setQuickFade(target === 0);
     apply(target, target === 0 ? 0 : 1, true);
     horizontal = false;
   };
@@ -1439,6 +1482,7 @@ async function loadStorageStats() {
       meState.retentionDays = r.data.retention_days != null ? r.data.retention_days : 7;
       meState.retentionHours = r.data.retention_hours != null ? r.data.retention_hours : 0;
       renderStorageStats();
+      updateAdminCollapsed(); // 数据到达 → 存储区块展开（对齐小程序）
       _storageRetryCount = 0;
       return true;
     }
@@ -1517,6 +1561,7 @@ async function loadSecurityConfig() {
         value: r.data[d.key] !== undefined && r.data[d.key] !== null ? Number(r.data[d.key]) : 0,
       }));
       renderSecurityConfig();
+      updateAdminCollapsed(); // 数据到达 → 防滥用区块展开（对齐小程序）
       return true;
     }
   } catch (e) { /* 静默 */ }
@@ -1544,7 +1589,7 @@ function toggleSecurityExpanded() {
   document.getElementById('securitySummary').classList.toggle('security-summary-active', meState.securityExpanded);
   document.getElementById('securityDetail').classList.toggle('security-detail-expanded', meState.securityExpanded);
   document.getElementById('securityArrow').classList.toggle('arrow-up', meState.securityExpanded);
-  measureAll(200);
+  measureAll(320);
 }
 
 function updateSecurityItem(idx, delta) {
@@ -1615,7 +1660,7 @@ function renderTempUsers() {
   wrap.querySelectorAll('.admin-card-wrap').forEach(wrapEl => {
     const del = wrapEl.querySelector('.admin-delete');
     const card = wrapEl.querySelector('.admin-card');
-    if (del && card) makeSwipeable(card, del, () => {});
+    if (del && card) makeSwipeable(card, del, () => {}, { rubberOver: 55 });
   });
 }
 
@@ -1626,10 +1671,25 @@ function removeTempUser(openid) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ openid }),
     }).then(r => {
-      if (r.data && r.data.success) { showToast('已移除'); loadTempUsers(); }
+      if (r.data && r.data.success) { showToast('已移除'); animateRemoveTempUser(openid); }
       else showToast((r.data && r.data.message) || '移除失败');
     }).catch(() => showToast('网络错误'));
   });
+}
+
+// 三段离场动画（对齐小程序 onRemoveTempUser）：滑回收起 → 上移淡出 → 移除重渲染
+function animateRemoveTempUser(openid) {
+  const del = document.querySelector('#tempUserList [data-remove-tempuser="' + CSS.escape(openid) + '"]');
+  const wrapEl = del ? del.parentElement : null;
+  const card = wrapEl ? wrapEl.querySelector('.admin-card') : null;
+  if (!card) { loadTempUsers(); return; }
+  card.style.transition = 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)';
+  card.style.transform = 'translateX(0px)';
+  if (del) del.style.opacity = '0';
+  setTimeout(() => {
+    wrapEl.classList.add('admin-exiting');
+    setTimeout(() => { loadTempUsers(); }, 350);
+  }, 180);
 }
 
 async function loadAdmins() {
@@ -1647,16 +1707,18 @@ async function loadAdmins() {
 
 function renderAdmins() {
   const wrap = document.getElementById('adminList');
+  const count = document.getElementById('adminCount');
+  if (count) { count.style.display = meState.admins.length ? '' : 'none'; count.textContent = meState.admins.length; }
   if (!meState.admins.length) {
     wrap.innerHTML = '<view class="license-card"><text class="redeem-desc" style="text-align:center;margin:0;">暂无其他管理员</text></view>';
     return;
   }
   wrap.innerHTML = meState.admins.map(a => `
     <view class="admin-card-wrap">
-      ${!a.is_super ? `<view class="admin-delete" data-remove-admin="${escHtml(a.openid)}" style="opacity:0">
+      <view class="admin-delete" data-remove-admin="${escHtml(a.openid)}" style="opacity:0">
         <text class="delete-icon">🗑</text>
         <text>移除</text>
-      </view>` : ''}
+      </view>
       <view class="admin-card" data-admin-openid="${escHtml(a.openid)}" data-admin-nickname="${escHtml(a.nickname || '')}">
         <img class="admin-avatar" src="${a.avatar_url ? escHtml(a.avatar_url) : DEFAULT_AVATAR}">
         <view class="admin-info">
@@ -1669,7 +1731,7 @@ function renderAdmins() {
   wrap.querySelectorAll('.admin-card-wrap').forEach(wrapEl => {
     const del = wrapEl.querySelector('.admin-delete');
     const card = wrapEl.querySelector('.admin-card');
-    if (del && card) makeSwipeable(card, del, () => {});
+    if (del && card) makeSwipeable(card, del, () => {}, { rubberOver: 55 });
   });
 }
 
@@ -1680,10 +1742,26 @@ function removeAdmin(openid) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ openid }),
     }).then(r => {
-      if (r.data && r.data.success) { showToast('已移除'); loadAdmins(); }
+      if (r.data && r.data.success) { showToast('已移除'); animateRemoveAdmin(openid); }
       else showToast((r.data && r.data.message) || '移除失败');
     }).catch(() => showToast('网络错误'));
   });
+}
+
+// 三段离场动画（对齐小程序 onRemoveAdmin）：
+// ① 0.25s 滑回收起删除按钮 → ② 180ms 后 adminSlideOut 上移淡出 0.3s → ③ 350ms 后真正移除并重渲染
+function animateRemoveAdmin(openid) {
+  const card = document.querySelector('#adminList [data-admin-openid="' + CSS.escape(openid) + '"]');
+  if (!card) { loadAdmins(); return; }
+  const wrapEl = card.parentElement;
+  const del = wrapEl.querySelector('.admin-delete');
+  card.style.transition = 'transform 0.25s cubic-bezier(0.4, 0, 0.2, 1)';
+  card.style.transform = 'translateX(0px)';
+  if (del) del.style.opacity = '0';
+  setTimeout(() => {
+    wrapEl.classList.add('admin-exiting');
+    setTimeout(() => { loadAdmins(); }, 350);
+  }, 180);
 }
 
 /* ================= 子视图：历史授权用户 ================= */
@@ -1701,7 +1779,9 @@ async function loadAuthorizedUsers() {
     if (r.data && r.data.success) {
       meState.authorizedUsers = (r.data.users || []).map(u => { u._expanded = false; return u; });
       renderAuthorizedUsers();
-    } else list.innerHTML = '<view class="status-box"><text class="status-text">加载失败</text></view>';
+    } else {
+      list.innerHTML = '<view class="status-box"><text class="status-text">' + esc((r.data && r.data.message) || '加载失败') + '</text></view>';
+    }
   } catch (e) {
     list.innerHTML = '<view class="status-box"><text class="status-text">网络错误</text></view>';
   }
@@ -1788,7 +1868,18 @@ function renderAuthorizedUsers() {
 
 function toggleAuthorizedUser(openid) {
   const u = meState.authorizedUsers.find(x => x.openid === openid);
-  if (u) { u._expanded = !u._expanded; renderAuthorizedUsers(); }
+  if (!u) return;
+  u._expanded = !u._expanded;
+  // 原地切换类名让 CSS max-height/opacity 过渡真实播放（对齐小程序 onToggleRecords，避免整表重建导致过渡失效）
+  const wrap = document.querySelector('#authorizedUserList [data-user-openid="' + CSS.escape(openid) + '"]');
+  const item = wrap ? wrap.parentElement : null;
+  if (item) {
+    const panel = item.querySelector('.records-panel');
+    const arrow = item.querySelector('.records-toggle-arrow');
+    if (panel) panel.classList.toggle('records-expanded', u._expanded);
+    if (arrow) arrow.classList.toggle('arrow-up', u._expanded);
+  }
+  measureAll(150);
 }
 
 /* ================= 子视图：用户订单 / 本地任务 ================= */
@@ -1806,7 +1897,7 @@ function openUserOrdersView(opts) {
     showLicenseDetail: false, showPageSizePicker: false,
   };
   const title = opts.source === 'local' ? '本地打印任务' : (opts.nickname ? opts.nickname + ' 的任务' : '订单列表');
-  document.getElementById('userOrdersTitle').textContent = title;
+  // 页内标题已移除（对齐小程序：标题由导航栏承载）
   document.getElementById('userOrdersUserCard').style.display = 'none';
   document.getElementById('uoLicenseDetail').classList.remove('license-detail-expanded');
   document.getElementById('userOrdersPager').style.display = 'none';
@@ -1835,7 +1926,9 @@ async function loadUserOrders(silent) {
       v.totalPages = Math.ceil(v.total / v.perPage);
       if (v.page > v.totalPages && v.totalPages > 0) v.page = v.totalPages;
       renderUserOrders();
-    } else if (!silent) list.innerHTML = '<view class="status-box"><text class="status-text">加载失败</text></view>';
+    } else if (!silent) {
+      list.innerHTML = '<view class="status-box"><text class="status-text">' + esc((r.data && r.data.message) || '加载失败') + '</text></view>';
+    }
     if (v.openid && !v.userDetail) {
       const d = await api('/api/admin/user_detail?openid=' + encodeURIComponent(v.openid)).catch(() => null);
       if (d && d.data && d.data.success) {
@@ -1966,7 +2059,27 @@ function changeUserOrdersPage(page) {
   if (page < 1 || page > v.totalPages || page === v.page) return;
   v.page = page;
   loadUserOrders();
-  if (scrollEngines.userOrders) scrollEngines.userOrders.scrollTo(0, 0); // 切页回顶部（直接定位）
+  scrollUserOrdersToSection(); // 切页回订单区顶部（对齐小程序 _scrollToOrdersSection，280ms 动画）
+}
+
+// 滚动到订单区域顶部（对齐小程序 user-orders 页：offset -12 / dur 280 / easeOutCubic）
+function scrollUserOrdersToSection() {
+  const engine = scrollEngines.userOrders;
+  if (!engine) return;
+  const section = document.querySelector('#view-user-orders .orders-section');
+  const content = document.getElementById('scrollContentUserOrders');
+  if (!section || !content) return;
+  engine.measure();
+  if (engine.y > engine.maxY) {
+    engine.cancel();
+    engine.y = engine.maxY;
+    engine.applyY();
+  }
+  if (engine.maxY <= 0) return;
+  const offset = section.getBoundingClientRect().top - content.getBoundingClientRect().top + engine.y;
+  const target = Math.min(Math.max(0, offset - 12), engine.maxY);
+  if (Math.abs(target - engine.y) < 1) return;
+  engine.scrollTo(target, 280);
 }
 
 function toggleUserOrdersOrder(id) {

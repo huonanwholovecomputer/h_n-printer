@@ -40,6 +40,8 @@ Component({
         isDarkMode: app.globalData.isDarkMode,
       })
       this._scheduleMeasure()
+      // 每次返回本页都静默刷新（对齐 APP：从订单页返回可能已移除用户/密钥状态变化）
+      if (this._hasLoaded) this.loadUsers()
     },
     hide() {
       const forward = wx.getStorageSync('_navForward')
@@ -131,6 +133,7 @@ Component({
         wx.showToast({ title: '请先登录', icon: 'none' })
         return
       }
+      this._hasLoaded = true
       this.setData({ loading: true, loadError: '' })
       wx.request({
         url: CONFIG.BASE_URL + '/api/authorized_users',

@@ -267,7 +267,7 @@ function renderFileList() {
       let changed = false;
       printState.selectedFiles.forEach(f => { if (f.entering) { f.entering = false; changed = true; } });
       if (changed) renderFileList();
-    }, 700);
+    }, 800);
   }
   recalcFileListHeight();
   bindToggleDrags();
@@ -367,10 +367,11 @@ function bindSwitchDrags() {
       try { el.setPointerCapture(e.pointerId); } catch (err) { /* 兼容 */ }
       startX = e.clientX; startY = e.clientY;
       dragging = true; moved = false;
-      const r = el.getBoundingClientRect();
-      const tr = thumb.getBoundingClientRect();
-      const padLeft = parseFloat(getComputedStyle(thumb).left) || 0;
-      maxPx = Math.max(1, r.width - tr.width - padLeft * 2);
+      // 拇指行程对齐小程序 rpx 常量（lg 开关 47rpx / 普通 35rpx，CSS --sw-px 同源），
+      // 避免实测宽度与 CSS 行程不一致导致拖满后 thumb 差几 rpx 不到位
+      const frame = document.querySelector('.app-frame');
+      const basis = (frame && frame.clientWidth) || 375;
+      maxPx = Math.max(1, Math.round((def.id === 'autoPrintSwitch' ? 47 : 35) * basis / 750));
       startPx = def.getOn() ? maxPx : 0;
       thumb.style.setProperty('--sw-px', startPx + 'px');
       el.classList.add('sw-dragging');
@@ -604,7 +605,11 @@ function setOrientation(idx, val) {
 
 function retryUpload(idx) {
   const f = printState.selectedFiles[idx];
-  if (!f || f.uploading || !f.file) return;
+  if (!f || f.uploading) return;
+  if (!f.file) {
+    showToast('文件路径已失效，请重新选择');
+    return;
+  }
   f.uploading = true;
   f.progress = 0;
   f.fileId = null;
@@ -990,19 +995,39 @@ function renderExtParams() {
   measureAll(150);
 }
 
-function updateCoverPrice() {
+let _coverPriceTimer = null;
+function updateCoverPrice(animate) {
   const tag = document.getElementById('coverPriceTag');
   const sw = document.getElementById('coverSwitch');
   const on = printState.coverPage || state.role === 'user';
   sw.classList.toggle('switch-on', on);
   tag.textContent = '¥' + Number(printState.coverPagePrice).toFixed(2);
-  tag.style.display = on ? '' : 'none';
+  clearTimeout(_coverPriceTimer);
+  if (animate === 'on') {
+    // 打开：价格标签淡入（对齐小程序 coverPriceIn 0.3s spring）
+    tag.style.display = '';
+    tag.classList.remove('exiting');
+    tag.classList.add('entering');
+    _coverPriceTimer = setTimeout(() => tag.classList.remove('entering'), 350);
+  } else if (animate === 'off') {
+    // 关闭：价格标签淡出（对齐小程序 coverPriceOut 0.25s），动画结束后隐藏
+    tag.classList.remove('entering');
+    tag.classList.add('exiting');
+    _coverPriceTimer = setTimeout(() => {
+      tag.classList.remove('exiting');
+      tag.style.display = 'none';
+    }, 300);
+  } else {
+    // 初始/参数渲染：无动画直接定位
+    tag.classList.remove('entering', 'exiting');
+    tag.style.display = on ? '' : 'none';
+  }
 }
 
 function toggleCoverPage() {
   if (state.role === 'user') { showToast('普通用户必须打印首页'); return; }
   printState.coverPage = !printState.coverPage;
-  updateCoverPrice();
+  updateCoverPrice(printState.coverPage ? 'on' : 'off');
 }
 
 function toggleUrgencyPicker() {
@@ -1049,7 +1074,7 @@ function toggleAutoPrint() {
     setTimeout(() => {
       burst.classList.remove('striking');
       fadeOutGlow();
-    }, 400);
+    }, 350);
   } else {
     // 关闭：清除全部光效
     burst.classList.remove('striking', 'active', 'reset');
