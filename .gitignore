@@ -53,6 +53,7 @@ local_print_tool/user_bindings.json
 # 日志（可能泄漏 token、路径等敏感信息）
 local_print_tool/logs/
 local_print_tool/crash_traceback.txt
+mobile_apps/printer-backend/logs/
 
 # PDF 缓存（运行时自动生成）
 local_print_tool/pdf_cache/
@@ -104,3 +105,6 @@ project.private.config.json
 # 财务统计用户数据（含真实姓名/收支）
 local_print_tool/finance/print_data.json
 财务统计/
+
+# 界面截图源目录（发布用截图请放入 docs/screenshots/）
+截图展示/

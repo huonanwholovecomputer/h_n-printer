@@ -40,6 +40,8 @@
 
 Windows 桌面应用：拖放文件 / Ctrl+V 粘贴，自动转换格式后静默打印。
 
+![本地打印工具主界面](docs/screenshots/local-print-tool.png)
+
 ### 打印管线
 
 ```
@@ -65,6 +67,8 @@ Windows 桌面应用：拖放文件 / Ctrl+V 粘贴，自动转换格式后静�
 - **离线同步**：离线订单暂存本地 SQLite，联网后自动上传，最多重试 5 次
 - **主题**：浅色 / 深色 / 跟随系统，写 `theme_settings.json`
 - **收支清算**：内置 `finance/settlement.html`，日期流水自动归月、分模块密码、多人均摊、云端成员维度统计
+
+![收支清算 · 云端数据展示](docs/screenshots/cloud-settlement.png)
 
 ### 外部依赖（Windows，需安装到系统）
 
@@ -103,6 +107,10 @@ python main.py
 ## 云打印系统（`mobile_apps/`）
 
 微信小程序 / Android App 提交打印任务 → Flask 后端存储分发 → Windows 本地工具自动打印。
+
+| 小程序 · 打印界面 | 小程序 · 我的（1） | 小程序 · 我的（2） |
+|---|---|---|
+| ![小程序打印界面](docs/screenshots/mini-program-print.png) | ![小程序我的1](docs/screenshots/mini-program-me-1.png) | ![小程序我的2](docs/screenshots/mini-program-me-2.png) |
 
 ```
 mobile_apps/
