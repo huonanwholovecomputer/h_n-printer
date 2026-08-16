@@ -25,6 +25,9 @@ class TabSettings:
     cover_page_price: float = 0.15
     urgency: str = "低"
     frozen: bool = False  # 打印后锁定，禁止任何编辑，仅允许删除标签页
+    # 订单归属（v24）：本标签页订单属于谁 + 是否管理员自行打印（非顾客订单）
+    owner_name: str = "霍楠"
+    is_admin_print: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +38,8 @@ class TabSettings:
             "cover_page_price": self.cover_page_price,
             "urgency": self.urgency,
             "frozen": self.frozen,
+            "owner_name": self.owner_name,
+            "is_admin_print": self.is_admin_print,
         }
 
     @classmethod
@@ -51,6 +56,8 @@ class TabSettings:
             cover_page_price=float(data.get("cover_page_price", 0.15)),
             urgency=data.get("urgency", "低"),
             frozen=bool(data.get("frozen", False)),
+            owner_name=(data.get("owner_name") or "霍楠").strip() or "霍楠",
+            is_admin_print=bool(data.get("is_admin_print", True)),
         )
 
     def calc_extra_total(self, base_total: float, config: "PrinterConfig") -> float:
@@ -295,6 +302,8 @@ class PrinterConfig:
     cover_page_price: float = 0.15          # 首页信息单价
     pickup_address: str = "1号楼202宿舍"    # 自取地址
     last_order_number: int = 0              # 订单号计数器
+    # 订单归属（v24）：管理员姓名列表，供标签页订单归属下拉选择
+    admin_names: list[str] = field(default_factory=lambda: ["霍楠"])
     # ---- 云端配置 ----
     cloud_enabled: bool = False             # 是否启用云端连接
     cloud_api_url: str = "https://your-server.com"   # 云端 API 地址（替换为你自己的服务器）
@@ -326,6 +335,7 @@ class PrinterConfig:
             "cover_page_price": self.cover_page_price,
             "pickup_address": self.pickup_address,
             "last_order_number": self.last_order_number,
+            "admin_names": self.admin_names,
             # 云端配置
             "cloud_enabled": self.cloud_enabled,
             "cloud_api_url": self.cloud_api_url,
@@ -375,6 +385,8 @@ class PrinterConfig:
             cover_page_price=float(data.get("cover_page_price", 0.15)),
             pickup_address=data.get("pickup_address", "1号楼202宿舍"),
             last_order_number=int(data.get("last_order_number", 0)),
+            # dict/list 字段防 null：被手改/写坏为 null 时退回默认
+            admin_names=[str(n).strip() for n in (data.get("admin_names") or ["霍楠"]) if str(n).strip()] or ["霍楠"],
             # 云端配置
             cloud_enabled=bool(data.get("cloud_enabled", False)),
             cloud_api_url=data.get("cloud_api_url", "https://your-server.com"),

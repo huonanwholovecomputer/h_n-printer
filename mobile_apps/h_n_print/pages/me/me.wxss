@@ -1380,6 +1380,19 @@
   white-space: nowrap;
 }
 
+/* v24.1：管理员自行打印订单徽标 */
+.order-self-print-badge {
+  font-size: 20rpx;
+  font-weight: 600;
+  padding: 4rpx 14rpx;
+  border-radius: 20rpx;
+  flex-shrink: 0;
+  white-space: nowrap;
+  background-color: rgba(30, 102, 245, 0.10);
+  color: #1e66f5;
+  margin-left: 8rpx;
+}
+
 .status-queued    { background-color: #FFF3E0; color: #E65100; }
 .status-printing  { background-color: #E3F2FD; color: #1565C0; }
 .status-accepted  { background-color: #E3F2FD; color: #1565C0; }

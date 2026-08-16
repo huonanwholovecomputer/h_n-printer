@@ -1,4 +1,4 @@
-# One-click debug APK build (JDK 17 + Android SDK in C:\Users\Administrator\android-tools)
+﻿# One-click debug APK build (JDK 17 + Android SDK in C:\Users\Administrator\android-tools)
 $ErrorActionPreference = 'Stop'
 $tools = 'C:\Users\Administrator\android-tools'
 $env:JAVA_HOME = "$tools\jdk-17.0.20+8"
@@ -29,6 +29,18 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $apk = Join-Path $PSScriptRoot 'android\app\build\outputs\apk\debug\app-debug.apk'
 if (Test-Path $apk) {
   Write-Host "BUILD OK: $apk"
+  # 复制为友好文件名：HN云打印_v{版本号}_debug.apk（版本号自动从 build.gradle 读取）
+  $gradleFile = Join-Path $PSScriptRoot 'android\app\build.gradle'
+  $version = ''
+  if (Test-Path $gradleFile) {
+    $m = [regex]::Match((Get-Content $gradleFile -Raw), 'versionName\s+"([^"]+)"')
+    if ($m.Success) { $version = $m.Groups[1].Value }
+  }
+  $distDir = Join-Path $PSScriptRoot 'dist'
+  New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+  $friendly = "HN云打印_v${version}_debug.apk"
+  Copy-Item $apk (Join-Path $distDir $friendly) -Force
+  Write-Host "COPIED : $(Join-Path $distDir $friendly)"
 } else {
   Write-Host 'Build finished but APK not found'
 }

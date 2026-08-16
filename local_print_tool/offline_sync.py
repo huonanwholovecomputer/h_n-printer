@@ -51,6 +51,12 @@ class OfflineSync:
                     retry_count  INTEGER DEFAULT 0
                 )
             """)
+            # v24：订单归属标记（旧库补列；缺失时按迁移规则默认 霍楠/管理员自行打印）
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(offline_orders)").fetchall()]
+            if "owner_name" not in cols:
+                conn.execute("ALTER TABLE offline_orders ADD COLUMN owner_name TEXT DEFAULT '霍楠'")
+            if "is_admin_print" not in cols:
+                conn.execute("ALTER TABLE offline_orders ADD COLUMN is_admin_print INTEGER DEFAULT 1")
             conn.commit()
             conn.close()
 
@@ -62,14 +68,18 @@ class OfflineSync:
         files_data: list[dict],
         total_price: float,
         created_at: str,
+        owner_name: str = "霍楠",
+        is_admin_print: bool = True,
     ) -> str:
         """将订单保存到本地数据库。返回保存的临时订单号。"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             conn.execute(
-                """INSERT INTO offline_orders (order_number, files_json, total_price, created_at, synced)
-                   VALUES (?, ?, ?, ?, 0)""",
-                (order_number, json.dumps(files_data, ensure_ascii=False), total_price, created_at),
+                """INSERT INTO offline_orders (order_number, files_json, total_price, created_at,
+                                               owner_name, is_admin_print, synced)
+                   VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                (order_number, json.dumps(files_data, ensure_ascii=False), total_price,
+                 created_at, owner_name or "霍楠", 1 if is_admin_print else 0),
             )
             # P2: 队列无上限保护 —— 超过 OFFLINE_QUEUE_MAX 条时丢弃最旧记录
             cur = conn.execute(
@@ -96,6 +106,8 @@ class OfflineSync:
         created_at: str,
         server_url: str,
         token: str,
+        owner_name: str = "霍楠",
+        is_admin_print: bool = True,
     ) -> bool:
         """尝试上传单个订单到服务器。返回 True 表示成功。"""
         try:
@@ -105,6 +117,9 @@ class OfflineSync:
                 "files": json.loads(files_json),
                 "total_price": total_price,
                 "created_at": created_at,
+                # 订单归属（v24）
+                "owner_name": owner_name or "霍楠",
+                "is_admin_print": bool(is_admin_print),
             }
             resp = http_requests.post(url, params={"token": token}, json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
@@ -135,7 +150,8 @@ class OfflineSync:
             conn = sqlite3.connect(self.db_path)
             rows = list(
                 conn.execute(
-                    """SELECT id, order_number, files_json, total_price, created_at
+                    """SELECT id, order_number, files_json, total_price, created_at,
+                              owner_name, is_admin_print
                        FROM offline_orders
                        WHERE synced = 0 AND retry_count < ?""",
                     (MAX_RETRY_COUNT,),
@@ -149,10 +165,11 @@ class OfflineSync:
         logger.info(f"[SYNC] 检测到 {len(rows)} 个待同步离线任务...")
         synced_count = 0
 
-        for db_id, order_number, files_json, total_price, created_at in rows:
+        for db_id, order_number, files_json, total_price, created_at, owner_name, is_admin_print in rows:
             success = self.upload_order(
                 db_id, order_number, files_json,
                 total_price, created_at, server_url, token,
+                owner_name or "霍楠", bool(is_admin_print),
             )
 
             with self._lock:

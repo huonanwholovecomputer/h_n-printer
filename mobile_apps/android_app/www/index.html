@@ -38,19 +38,19 @@
         <div class="container">
 
           <!-- Logo + 状态 -->
-          <view class="header-area card-preload" id="headerArea" style="animation-delay: 0.5s">
+          <view class="header-area enter-05" id="headerArea">
             <view class="logo-wrap" id="logoWrap">
               <img class="logo" id="logoImg" src="images/HN_print.png" alt="HN 打印">
             </view>
           </view>
 
-          <view class="status-bar card-preload" id="printerStatus" style="animation-delay: 0.6s">
+          <view class="status-bar enter-06" id="printerStatus">
             <view class="status-dot offline" id="statusDot"></view>
             <text class="status-text" id="statusText">打印机离线</text>
           </view>
 
           <!-- 打印文件 -->
-          <view class="card file-section card-preload" id="fileSection" style="animation-delay: 0.7s">
+          <view class="card file-section enter-07" id="fileSection">
             <view class="section-header inline-header">
               <view class="section-header-bar"></view>
               <text class="section-header-title">打印文件</text>
@@ -71,7 +71,7 @@
           </view>
 
           <!-- 附加服务 -->
-          <view class="card ext-params-card card-preload" id="extParamsCard" style="animation-delay: 0.8s">
+          <view class="card ext-params-card enter-08" id="extParamsCard">
             <view class="section-header inline-header">
               <view class="section-header-bar"></view>
               <text class="section-header-title">附加服务</text>
@@ -117,7 +117,7 @@
           </view>
 
           <!-- 无障碍打印（仅管理员） -->
-          <view class="auto-print-switch-row card-preload" id="autoPrintSection" style="display:none;animation-delay:0.9s">
+          <view class="auto-print-switch-row enter-09" id="autoPrintSection" style="display:none">
             <view class="auto-print-label">
               <view class="lightning-burst" id="lightningBurst">
                 <canvas class="bolt-canvas" id="boltCanvas"></canvas>
@@ -159,8 +159,22 @@
             </view>
           </view>
 
+          <!-- 管理员自行打印（仅管理员） -->
+          <view class="admin-print-switch-row enter-10" id="adminPrintSection" style="display:none">
+            <view class="admin-print-label">
+              <text class="admin-print-icon">🖨️</text>
+              <view>
+                <text class="admin-print-title">管理员自行打印</text>
+                <view class="admin-print-desc">自己的订单不计入收益，归属自己</view>
+              </view>
+            </view>
+            <view class="ios-switch ios-switch-lg admin-print-sw" id="adminPrintSwitch">
+              <view class="switch-thumb"></view>
+            </view>
+          </view>
+
           <!-- 提交 -->
-          <view class="submit-area card-preload" id="submitArea" style="animation-delay: 1.0s">
+          <view class="submit-area enter-11" id="submitArea">
             <button class="btn-primary" id="submitBtn">提交打印任务</button>
           </view>
       </div>
@@ -601,7 +615,7 @@
   </view>
 
   <!-- ===== 主题切换（我页右上角） ===== -->
-  <button class="theme-toggle-btn" id="themeToggle" data-hover="tp-pressing" style="display:none">🌓</button>
+  <button class="theme-toggle-btn" id="themeToggle" data-hover="tp-pressing" style="display:none"><span class="theme-toggle-icon">🌓</span></button>
 
   <!-- ===== 成功弹窗 ===== -->
   <view class="modal-mask" id="successModal" style="display:none">
@@ -610,6 +624,7 @@
       <text class="title-medium">任务提交成功</text>
       <text class="order-number-modal" id="successOrderNumber"></text>
       <text class="body-small schedule-success-text" id="successScheduleText" style="display:none"></text>
+      <text class="body-small admin-print-success-text" id="successAdminPrintText" style="display:none"></text>
       <text class="body-small" id="successDefaultText" style="display:none">文件已上传，打印任务已创建</text>
       <view class="modal-buttons">
         <button class="btn-secondary modal-half-btn" id="copyPriceBtn">复制价格</button>

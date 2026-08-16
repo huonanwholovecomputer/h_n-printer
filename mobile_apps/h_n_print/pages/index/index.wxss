@@ -785,6 +785,43 @@
   color: var(--text-secondary);
 }
 
+/* ── 管理员自行打印开关（仅管理员可见，蓝色主题区分于橙色无障碍打印）── */
+.admin-print-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16rpx;
+  padding: 20rpx 24rpx;
+  background: rgba(30, 102, 245, 0.06);
+  border: 1rpx solid rgba(30, 102, 245, 0.22);
+  border-radius: var(--radius-md);
+  box-sizing: border-box;
+}
+.admin-print-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+.admin-print-icon {
+  font-size: 32rpx;
+  line-height: 1;
+  margin-bottom: 2rpx;
+}
+.admin-print-title {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--blue);
+}
+.admin-print-desc {
+  font-size: 22rpx;
+  color: var(--text-secondary);
+}
+.admin-print-success-text {
+  margin-bottom: 12rpx;
+  color: var(--blue);
+  font-weight: 500;
+}
+
 /* ── 无障碍打印预约（开始方式：立即/指定时间/倒计时，仅管理员）── */
 /* 展开/收起动画：开关联动，max-height + opacity + transform 过渡（收起由 JS 在 320ms 后卸载面板） */
 .schedule-section {
@@ -1247,6 +1284,19 @@ picker-view-column {
   background: linear-gradient(180deg,
     rgba(255, 165, 10, 0.98) 0%,
     rgba(255, 135, 0, 0.95) 100%);
+}
+
+/* 管理员自行打印开关：加大尺寸 + 蓝色开启态（区别于无障碍打印的橙色） */
+.ios-switch.admin-print-sw.switch-on {
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.92) 0%,
+    rgba(0, 88, 214, 0.96) 100%);
+  box-shadow: inset 0 1rpx 2rpx rgba(0, 0, 0, 0.08);
+}
+.theme-dark .ios-switch.admin-print-sw.switch-on {
+  background: linear-gradient(180deg,
+    rgba(52, 132, 255, 0.96) 0%,
+    rgba(0, 102, 255, 0.95) 100%);
 }
 
 .cover-price-tag {

@@ -838,6 +838,7 @@ function orderCardHTML(o, expanded, deliveredLabel) {
         <view class="order-card-main">
           <text class="order-filename">${esc(o.order_number || ('#' + o.id))}</text>
           <text class="order-status ${statusCls}">${esc(statusText)}</text>
+          ${o.is_admin_print ? '<text class="order-self-print-badge">👤自打</text>' : ''}
         </view>
         <text class="order-number-label">${esc(o.file_summary || o.file || '')}</text>
         <view class="order-card-meta">

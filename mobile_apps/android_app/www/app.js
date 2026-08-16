@@ -172,7 +172,14 @@ function applyTheme(mode, opts) {
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute('content', dark ? '#1C1C1E' : '#F2F2F7');
   const toggle = document.getElementById('themeToggle');
-  if (toggle) toggle.textContent = { auto: '🌓', dark: '🌙', light: '☀️' }[mode] || '🌓';
+  const iconText = { auto: '🌓', dark: '🌙', light: '☀️' }[mode] || '🌓';
+  if (toggle) {
+    // 图标包在 .theme-toggle-icon 内层 span（承载 emoji 竖直居中的位移补偿），
+    // 若 span 不存在（极端情况下 DOM 被改写）则回退直接写按钮文本
+    const icon = toggle.querySelector('.theme-toggle-icon');
+    if (icon) icon.textContent = iconText;
+    else toggle.textContent = iconText;
+  }
   if (!opts.skipServer) syncThemeToServer();
   updateSessionUI();
 }
@@ -1106,11 +1113,8 @@ function initApp() {
   setupTabs();
   setupNav();
   setupPressFeedback();
-  // 首屏淡入：对齐小程序 page-fade-in-delayed（延迟 0.5s 向上淡入，仅首次加载；切 tab 用各自转场类）
-  setTimeout(() => {
-    const pp = document.getElementById('page-print');
-    if (pp) pp.classList.add('page-fade-in', 'page-fade-in-delayed');
-  }, 80);
+  // 首屏入场由打印页各卡片的 .enter-XX 动画驱动（0.5s 起逐 0.1s 递增），
+  // 不再叠加整页 page-fade-in-delayed，避免双重延迟导致出现顺序错乱
   // 必须先注入原生安全区（--safe-top）再定位主题按钮：导航栏高度 = 48px + safe-top，
   // 若先用 env() 兜底定位（safe-top=0），随后 --safe-top 注入使导航栏变高，会把按钮盖住。
   applyNativeSafeArea();

@@ -264,6 +264,45 @@ QComboBox:disabled {
     color: #9ca0b0;
 }
 
+/* ---------- 复选框 ---------- */
+QCheckBox {
+    background: transparent;
+    color: #4c4f69;
+    spacing: 6px;
+}
+QCheckBox:hover {
+    color: #6c6f85;
+}
+QCheckBox:disabled {
+    color: #9ca0b0;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #bcc0cc;
+    border-radius: 4px;
+    background-color: #e6e9ef;
+}
+QCheckBox::indicator:hover {
+    border-color: #1e66f5;
+}
+QCheckBox::indicator:checked {
+    background-color: #1e66f5;
+    border-color: #1e66f5;
+}
+QCheckBox::indicator:checked:hover {
+    background-color: #7287fd;
+    border-color: #7287fd;
+}
+QCheckBox::indicator:disabled {
+    border-color: #ccd0da;
+    background-color: #e6e9ef;
+}
+QCheckBox::indicator:checked:disabled {
+    background-color: #bcc0cc;
+    border-color: #bcc0cc;
+}
+
 /* ---------- 日志文本框 ---------- */
 QTextEdit#logTextEdit {
     background-color: #dce0e8;

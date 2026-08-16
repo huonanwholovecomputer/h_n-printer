@@ -27,6 +27,7 @@ const printState = {
   coverPagePrice: 0.10,
   autoPrintEnabled: false,
   autoPrintGlow: false,
+  adminPrintEnabled: false,  // 管理员自行打印（仅管理员可见）
   scheduleMode: 'now',
   scheduleDayIndex: 0,
   scheduleTime: '',
@@ -59,29 +60,23 @@ function onPrintTabShown() {
 
 let _printEntrancePlayed = false;
 
-// 页面就绪：移除 card-preload（opacity:0）并播放入场动画（对齐小程序 pageReady）
-// 仅首次启动触发；动画全部结束后清除动画类，避免切 tab（display:none → block）时重新播放
+// 页面就绪：入场动画已由各卡片 .enter-XX 类（animation 简写自带延迟 0.5~1.1s）驱动，
+// 无需 JS 干预；此函数保留仅作启动标记
 function pageReady() {
   if (_printEntrancePlayed) return;
   _printEntrancePlayed = true;
-  ['headerArea', 'printerStatus', 'fileSection', 'extParamsCard', 'autoPrintSection', 'submitArea'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el && el.classList.contains('card-preload')) {
-      setTimeout(() => {
-        el.classList.remove('card-preload');
-        el.classList.add('card-entering-fade');
-      }, 60);
-    }
-  });
-  // 末元素延迟 1.0s + 动画 0.5s + 余量，全部结束后清理
-  setTimeout(() => {
-    document.querySelectorAll('#page-print .card-entering-fade').forEach(el => el.classList.remove('card-entering-fade'));
-  }, 1800);
 }
 
 function scheduleMeasureSoon() {
   setTimeout(() => measureAll(), 80);
   setTimeout(() => measureAll(), 400);
+}
+
+// 管理员专属卡片显示：仅切换 display；入场动画由 .enter-XX 类的 animation 简写自带延迟驱动
+// （无障碍打印 0.9s / 管理员自行打印 1.0s），显示即按各自延迟播放
+function showAdminOnlySection(el) {
+  if (!el) return;
+  el.style.display = state.role === 'admin' ? '' : 'none';
 }
 
 function refreshPrintRoleUI() {
@@ -98,8 +93,10 @@ function refreshPrintRoleUI() {
     coverSw.classList.remove('locked');
     coverReq.style.display = 'none';
   }
-  const autoSec = document.getElementById('autoPrintSection');
-  if (autoSec) autoSec.style.display = state.role === 'admin' ? '' : 'none';
+  // 管理员专属卡片（无障碍打印 / 管理员自行打印）统一显示逻辑：
+  // 隐藏→显示时强制重启动画（各自内联 animation-delay 0.9s / 1.0s），保证出现顺序确定
+  showAdminOnlySection(document.getElementById('autoPrintSection'));
+  showAdminOnlySection(document.getElementById('adminPrintSection'));
   updateCoverPrice();
   updateScheduleUI();
 }
@@ -400,6 +397,7 @@ function bindSwitchDrags() {
     { id: 'coverSwitch', getOn: () => printState.coverPage || state.role === 'user', toggle: toggleCoverPage },
     { id: 'deliverySwitch', getOn: () => printState.deliveryEnabled, toggle: toggleDelivery },
     { id: 'autoPrintSwitch', getOn: () => printState.autoPrintEnabled, toggle: toggleAutoPrint },
+    { id: 'adminPrintSwitch', getOn: () => printState.adminPrintEnabled, toggle: toggleAdminPrint },
   ];
   defs.forEach(def => {
     const el = document.getElementById(def.id);
@@ -417,7 +415,7 @@ function bindSwitchDrags() {
       // 避免实测宽度与 CSS 行程不一致导致拖满后 thumb 差几 rpx 不到位
       const frame = document.querySelector('.app-frame');
       const basis = (frame && frame.clientWidth) || 375;
-      maxPx = Math.max(1, Math.round((def.id === 'autoPrintSwitch' ? 47 : 35) * basis / 750));
+      maxPx = Math.max(1, Math.round((def.id === 'autoPrintSwitch' || def.id === 'adminPrintSwitch' ? 47 : 35) * basis / 750));
       startPx = def.getOn() ? maxPx : 0;
       thumb.style.setProperty('--sw-px', startPx + 'px');
       el.classList.add('sw-dragging');
@@ -1099,6 +1097,9 @@ function toggleCoverPage() {
 
 function toggleUrgencyPicker() {
   document.getElementById('urgencyPicker').classList.toggle('picker-expanded');
+  // 展开/收起有 350ms 过渡，动画完成后重新测量滚动内容高度（对齐小程序 _scheduleMeasure）
+  measureAll(150);
+  setTimeout(() => measureAll(400), 400);
 }
 
 function selectUrgency(urg) {
@@ -1106,6 +1107,8 @@ function selectUrgency(urg) {
   printState.urgencyPrice = printState.urgencyPrices[urg] || 0;
   renderExtParams();
   document.getElementById('urgencyPicker').classList.remove('picker-expanded');
+  measureAll(150);
+  setTimeout(() => measureAll(400), 400);
 }
 
 function toggleDelivery() {
@@ -1117,6 +1120,9 @@ function toggleDelivery() {
 
 function toggleDeliveryPicker() {
   document.getElementById('deliveryPicker').classList.toggle('picker-expanded');
+  // 展开/收起有 350ms 过渡，动画完成后重新测量滚动内容高度（对齐小程序 _scheduleMeasure）
+  measureAll(150);
+  setTimeout(() => measureAll(400), 400);
 }
 
 function selectDeliveryLocation(loc) {
@@ -1124,6 +1130,8 @@ function selectDeliveryLocation(loc) {
   printState.deliveryPercent = printState.deliveryPercentages[loc] || 0;
   renderExtParams();
   document.getElementById('deliveryPicker').classList.remove('picker-expanded');
+  measureAll(150);
+  setTimeout(() => measureAll(400), 400);
 }
 
 /* ================= 无障碍打印 / 预约 ================= */
@@ -1150,6 +1158,13 @@ function toggleAutoPrint() {
     if (icon) icon.style.textShadow = '';
     clearBoltCanvas();
   }
+}
+
+// 管理员自行打印：自己的订单不计入收益，归属提交者（后端仅管理员角色生效）
+function toggleAdminPrint() {
+  printState.adminPrintEnabled = !printState.adminPrintEnabled;
+  const sw = document.getElementById('adminPrintSwitch');
+  if (sw) sw.classList.toggle('switch-on', printState.adminPrintEnabled);
 }
 
 let _scheduleOptionsTimer = null;
@@ -1685,6 +1700,8 @@ function doSubmit(skipPageValidation) {
       cover_page_price: printState.coverPagePrice,
       skip_page_validation: skipPageValidation ? 1 : 0,
       auto_print: printState.autoPrintEnabled ? 1 : 0,
+      // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
+      is_admin_print: (state.role === 'admin' && printState.adminPrintEnabled) ? 1 : 0,
       schedule_mode: printState.autoPrintEnabled ? printState.scheduleMode : 'now',
       schedule_day: printState.autoPrintEnabled && printState.scheduleMode === 'at' ? printState.scheduleDayIndex : 0,
       schedule_time: printState.autoPrintEnabled && printState.scheduleMode === 'at' ? printState.scheduleTime : '',
@@ -1701,8 +1718,11 @@ function doSubmit(skipPageValidation) {
       const st = scheduleDisplayText();
       const stEl = document.getElementById('successScheduleText');
       const defEl = document.getElementById('successDefaultText');
+      const apText = (state.role === 'admin' && printState.adminPrintEnabled) ? '已标记管理员自行打印，不计入收益' : '';
+      const apEl = document.getElementById('successAdminPrintText');
       if (stEl) { stEl.textContent = st; stEl.style.display = st ? '' : 'none'; }
-      if (defEl) defEl.style.display = st ? 'none' : '';
+      if (apEl) { apEl.textContent = apText; apEl.style.display = apText ? '' : 'none'; }
+      if (defEl) defEl.style.display = (st || apText) ? 'none' : '';
       openModal('successModal');
       // 对齐小程序：提交成功后先收起文件列表（保留数据），关闭弹窗时再清空
       const scroll = document.getElementById('fileListScroll');
@@ -1889,6 +1909,7 @@ function setupPrintButtons() {
   switchClick(document.getElementById('deliverySwitch'), toggleDelivery);
   document.getElementById('deliveryTrigger').addEventListener('click', toggleDeliveryPicker);
   switchClick(document.getElementById('autoPrintSwitch'), toggleAutoPrint);
+  switchClick(document.getElementById('adminPrintSwitch'), toggleAdminPrint);
   bindSwitchDrags();
   document.querySelectorAll('[data-schedule-mode]').forEach(el => {
     el.addEventListener('click', () => setScheduleMode(el.dataset.scheduleMode));

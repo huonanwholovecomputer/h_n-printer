@@ -21,6 +21,7 @@
   --shadow-md: 0 8px 26px rgba(20,22,40,.09);
   --shadow-lg: 0 20px 55px rgba(20,22,40,.20);
   --radius: 14px; --radius-sm: 9px;
+  --content-max: 1360px;   /* v5.1：宽屏内容宽度上限（居中布局），避免 100% 拉伸影响阅读；可在此调整 */
   --header-from: #23244d; --header-to: #3b2f7d;
   color-scheme: light;
 }
@@ -54,7 +55,7 @@ body {
   box-shadow: 0 4px 20px rgba(15,15,40,.25);
 }
 .header-inner {
-  max-width: 1180px; margin: 0 auto; padding: 12px 64px 0 20px;   /* 右侧预留悬浮主题按钮空间 */
+  max-width: var(--content-max); margin: 0 auto; padding: 12px 20px 0;   /* 宽屏居中后主题按钮不再悬停于内容右侧，恢复对称内边距 */
   display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
 }
 .app-header h1 { font-size: 1.18rem; font-weight: 700; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
@@ -76,10 +77,14 @@ body {
 }
 .icon-btn:hover { transform: translateY(-1px) scale(1.05); background: rgba(255,255,255,.2); }
 .path-text { font-size: .74rem; color: rgba(255,255,255,.62); max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 窗口较窄时（内容列贴近右上悬浮主题按钮，重叠临界约 1476px），重新为按钮预留右侧空间 */
+@media (max-width: 1475px) {
+  .header-inner { padding-right: 64px; }
+}
 
 /* ==================== Tab 导航 ==================== */
 .tab-nav {
-  max-width: 1180px; margin: 0 auto; padding: 8px 20px 10px;
+  max-width: var(--content-max); margin: 0 auto; padding: 8px 20px 10px;
   display: flex; gap: 4px; overflow-x: auto;
 }
 .tab-nav button {
@@ -94,7 +99,7 @@ body {
 .tab-nav button .ico { font-size: 1.02rem; }
 
 /* ==================== 主区域 ==================== */
-main { max-width: 1180px; margin: 0 auto; padding: 20px 20px 60px; }
+main { max-width: var(--content-max); margin: 0 auto; padding: 20px 20px 60px; }
 .tab { display: none; }
 .tab.on { display: block; }
 
@@ -186,6 +191,7 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .status-dot.canceled { background: #9E9E9E; } .status-dot.offline_unknown { background: #F57F17; }
 .status-dot.rejected { background: #E65100; } .status-dot.accepted { background: #1565C0; }
 .status-dot.abandoned { background: #7B1FA2; } .status-dot.reserved { background: #F57F17; }
+.status-dot.scheduled { background: #F57F17; } .status-dot.waiting { background: #00897B; } .status-dot.downloading { background: #1565C0; }
 
 /* ==================== 标签 ==================== */
 .tag { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .74rem; font-weight: 600; }
@@ -217,9 +223,20 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 [data-theme="dark"] .tag.st-abandoned       { background: rgba(186,104,200,.15); color: #BA68C8; }
 [data-theme="dark"] .tag.st-reserved        { background: rgba(255,213,79,.15); color: #FFD54F; }
 [data-theme="dark"] .tag.st-offline_unknown { background: rgba(255,213,79,.15); color: #FFD54F; }
+.tag.st-scheduled      { background: #FFF8E1; color: #F57F17; }
+.tag.st-waiting        { background: #E0F2F1; color: #00897B; }
+.tag.st-downloading    { background: #E3F2FD; color: #1565C0; }
+[data-theme="dark"] .tag.st-scheduled      { background: rgba(255,213,79,.15); color: #FFD54F; }
+[data-theme="dark"] .tag.st-waiting        { background: rgba(77,182,172,.15); color: #4DB6AC; }
+[data-theme="dark"] .tag.st-downloading    { background: rgba(100,181,246,.15); color: #64B5F6; }
 .member-tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: .82rem; font-weight: 600; color: #fff; box-shadow: var(--shadow-sm); }
 .member-del { cursor: pointer; opacity: .65; font-size: 1rem; transition: opacity .15s ease; }
 .member-del:hover { opacity: 1; }
+
+/* v24：管理员订单统计 —— 自打/接单比例条 */
+.ratio-bar { display: inline-flex; width: 90px; height: 10px; border-radius: 5px; overflow: hidden; background: rgba(127,127,127,.15); margin-right: 8px; vertical-align: -1px; }
+.ratio-bar .ratio-own { background: #007AFF; height: 100%; }
+.ratio-bar .ratio-acc { background: #FF9500; height: 100%; }
 .unlock-badge { display: inline-flex; align-items: center; gap: 8px; background: rgba(22,163,74,.1); border: 1px solid rgba(22,163,74,.3); color: var(--pos); padding: 5px 12px; border-radius: 999px; font-size: .8rem; font-weight: 600; }
 .lock-bar {
   display: flex; align-items: center; gap: 14px; justify-content: space-between; flex-wrap: wrap;
@@ -293,14 +310,16 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .file-expand.open .file-expand-body { grid-template-rows: 1fr; }
 .file-expand-inner { min-height: 0; overflow: hidden; }
 /* 文件明细网格：文件名弹性占宽，信息列定宽 */
-.file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 78px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
+.file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 78px 96px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
 .file-grid .fn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .file-grid.file-sub-head { font-size: .72rem; font-weight: 600; color: var(--muted); background: var(--card-2); border-top: 1px solid var(--border-strong); padding-top: 5px; padding-bottom: 5px; }
 .file-grid.file-sub-row { color: var(--muted); border-top: 1px dashed var(--border); }
 .expand-icon { display: inline-block; transition: transform .2s ease; font-size: .68rem; margin-right: 4px; color: var(--muted); }
 .order-row.expanded .expand-icon { transform: rotate(90deg); }
-/* 订单明细表：固定布局，列宽由表头决定，展开子行不重排列宽；min-width 保证窄窗口仍可横向滚动 */
-.order-table { table-layout: fixed; width: 100%; min-width: 960px; }
+/* 订单明细表：固定布局，列宽由表头决定，展开子行不重排列宽；min-width 保证窄窗口仍可横向滚动。
+   类型列 270px = 全量类型标签宽度（450px）的 60%（接单+自动+预约+加急+派送+封面+免费），
+   宽窗口时多余空间按比例放大各列，类型列只会更宽不会更窄。 */
+.order-table { table-layout: fixed; width: 100%; min-width: 1250px; }
 .order-table .ell { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bound-badge { font-size: .7rem; padding: 1px 8px; border-radius: 999px; font-weight: 600; }
 .bound-badge.yes { background: rgba(22,163,74,.13); color: var(--pos); }
@@ -320,6 +339,173 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 #blockOverlay .ico { font-size: 56px; }
 #blockOverlay h2 { color: var(--text); }
 #blockOverlay p { color: var(--muted); max-width: 380px; }
+
+/* ==================== 云端 v5：运营驾驶舱组件 ==================== */
+/* 对账/异常提示条：置顶通栏（有差额/未绑定用户时才渲染） */
+.alert-banner {
+  display: flex; align-items: center; gap: 14px;
+  background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.35);
+  border-left: 4px solid var(--orange); border-radius: var(--radius);
+  padding: 13px 18px; margin-bottom: 16px; box-shadow: var(--shadow-sm);
+}
+.alert-banner.danger { background: rgba(225,29,72,.08); border-color: rgba(225,29,72,.3); border-left-color: var(--neg); }
+.alert-banner .ico { font-size: 1.25rem; flex: none; }
+.alert-banner .msg { flex: 1; font-size: .88rem; }
+.alert-banner .msg b { color: var(--orange); }
+.alert-banner.danger .msg b { color: var(--neg); }
+.alert-banner .msg .sub { display: block; font-size: .74rem; color: var(--muted); margin-top: 2px; }
+.alert-banner button {
+  flex: none; padding: 6px 13px; border-radius: 8px; border: 1px solid var(--orange);
+  background: transparent; color: var(--orange); font-weight: 600; cursor: pointer;
+  font-size: .78rem; font-family: inherit; transition: all .18s ease;
+}
+.alert-banner button:hover { background: rgba(245,158,11,.12); }
+.alert-banner.danger button { border-color: var(--neg); color: var(--neg); }
+.alert-banner.danger button:hover { background: rgba(225,29,72,.1); }
+
+/* Hero KPI（4 卡）：迷你趋势线 / 环比徽标 / 半环仪表盘 */
+.hero-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
+.hero-card {
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 16px 18px; box-shadow: var(--shadow-sm); position: relative; overflow: hidden; min-height: 118px;
+}
+.hero-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; border-radius: 0 3px 3px 0; }
+.hero-card.c-green::before { background: var(--green); }
+.hero-card.c-blue::before { background: var(--primary); }
+.hero-card.c-orange::before { background: var(--orange); }
+.hero-card .top-row { display: flex; align-items: flex-start; justify-content: space-between; }
+.hero-card .ico { font-size: 1.15rem; }
+.hero-card .badge { font-size: .7rem; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.badge.up { color: var(--pos); background: rgba(22,163,74,.12); }
+.badge.down { color: var(--neg); background: rgba(225,29,72,.12); }
+.hero-card .num { font-size: 1.55rem; font-weight: 800; margin-top: 8px; letter-spacing: -.3px; line-height: 1.25; }
+.hero-card .lbl { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: 3px; }
+.hero-card .sub { font-size: .73rem; color: var(--muted); margin-top: 6px; }
+.gauge-wrap { position: relative; height: 88px; margin-top: 4px; }
+.gauge-wrap canvas { width: 100% !important; height: 100% !important; }
+.gauge-center { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); text-align: center; font-size: 1.3rem; font-weight: 800; color: var(--primary); }
+
+/* 订单漏斗（订单 → 文件 → 打印页 → 完成） */
+.funnel-strip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.f-step { display: flex; align-items: baseline; gap: 6px; }
+.f-step .fv { font-size: 1.12rem; font-weight: 800; color: var(--primary); }
+.f-step .fl { font-size: .76rem; color: var(--muted); }
+.f-arrow { color: var(--border-strong); font-size: 1rem; }
+.f-meta { margin-left: auto; font-size: .8rem; color: var(--pos); font-weight: 600; }
+
+/* 分段控制器（收益视角 / 运营视角） */
+.segmented { display: inline-flex; background: var(--card-2); border: 1px solid var(--border); border-radius: 999px; padding: 3px; margin-bottom: 14px; }
+.segmented button {
+  border: none; background: transparent; padding: 7px 16px; border-radius: 999px;
+  font-size: .82rem; font-weight: 600; color: var(--muted); cursor: pointer;
+  font-family: inherit; transition: all .18s ease; white-space: nowrap;
+}
+.segmented button:hover { color: var(--text); }
+.segmented button.on { background: var(--card); color: var(--primary); box-shadow: var(--shadow-sm); }
+
+/* 👥 成员排行榜（进度条卡片） */
+.rank-list { display: flex; flex-direction: column; gap: 10px; }
+.rank-row { display: grid; grid-template-columns: 30px 175px 1fr 108px 62px; align-items: center; gap: 12px; }
+.rank-medal { font-size: 1.02rem; text-align: center; }
+.rank-name { display: flex; align-items: center; gap: 6px; font-size: .84rem; font-weight: 600; min-width: 0; }
+.rank-name .rank-nick { font-size: .7rem; color: var(--muted); font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rank-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.rank-bar { height: 10px; border-radius: 999px; background: var(--card-2); overflow: hidden; }
+.rank-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--primary), var(--primary-strong)); transition: width .6s ease; }
+.rank-amt { text-align: right; font-weight: 700; font-size: .88rem; color: var(--pos); white-space: nowrap; }
+.rank-orders { text-align: right; font-size: .76rem; color: var(--muted); white-space: nowrap; }
+.rank-row.unbound { cursor: pointer; }
+.rank-row.unbound:hover .rank-name { color: var(--neg); }
+.rank-row.unbound .rank-fill { background: linear-gradient(90deg, var(--neg), #f87171); }
+.rank-row.unbound .rank-amt { color: var(--neg); }
+
+/* 趋势分析：区间切换工具栏（v5.2）+ v5.15 自绘日历组件 */
+.trend-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.trend-toolbar .segmented { margin-bottom: 0; }
+.trend-toolbar .trend-metrics { margin-left: auto; }
+.trend-dates { display: inline-flex; align-items: center; gap: 6px; }
+/* 日期字段：伪输入框，点击弹出日历 */
+.date-field {
+  display: inline-flex; align-items: center; gap: 5px; width: 124px;
+  padding: 5px 9px; border: 1px solid var(--border-strong); border-radius: 8px;
+  background: var(--card); color: var(--text); font-size: .78rem; cursor: pointer;
+  font-family: inherit; transition: border-color .18s ease, box-shadow .18s ease;
+}
+.date-field:hover { border-color: var(--primary); }
+.date-field.on { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+.date-field .cal-ico { font-size: .82rem; line-height: 1; }
+.date-field .df-txt { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.date-field .df-txt.placeholder { color: var(--muted); }
+/* 日历浮层 */
+.cal-pop {
+  position: fixed; z-index: 220; width: 254px;
+  background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow-lg); padding: 10px;
+  animation: calIn .18s ease both;
+}
+@keyframes calIn { from { opacity: 0; transform: translateY(-4px) scale(.97); } to { opacity: 1; transform: none; } }
+.cal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.cal-title { font-weight: 700; font-size: .85rem; }
+.cal-nav {
+  border: none; background: transparent; color: var(--muted); font-size: 1rem; cursor: pointer;
+  width: 26px; height: 26px; border-radius: 7px; font-family: inherit; line-height: 1;
+  transition: background .15s ease, color .15s ease;
+}
+.cal-nav:hover { background: var(--card-2); color: var(--text); }
+.cal-nav:disabled { opacity: .35; cursor: default; }
+.cal-nav:disabled:hover { background: transparent; color: var(--muted); }
+.cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
+.cal-dow { text-align: center; font-size: .68rem; color: var(--muted); padding: 3px 0; }
+.cal-day {
+  border: none; background: transparent; color: var(--text); font-size: .78rem; cursor: pointer;
+  height: 28px; border-radius: 8px; font-family: inherit; transition: background .12s ease;
+}
+.cal-day:hover { background: var(--primary-soft); }
+.cal-day.sel { background: var(--primary); color: #fff; font-weight: 700; }
+.cal-day.today { box-shadow: inset 0 0 0 1.5px var(--primary); }
+.cal-day.range { background: var(--primary-soft); color: var(--primary); }
+.cal-day.disabled { color: var(--border-strong); cursor: not-allowed; }
+.cal-day.disabled:hover { background: transparent; }
+.cal-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
+.cal-hint { font-size: .72rem; color: var(--muted); }
+.cal-close {
+  border: none; background: transparent; color: var(--muted); cursor: pointer;
+  font-size: .74rem; font-family: inherit; padding: 3px 8px; border-radius: 7px;
+  transition: background .15s ease, color .15s ease;
+}
+.cal-close:hover { background: var(--card-2); color: var(--text); }
+
+/* 每日趋势：指标切换 + 环形图中心文字 */
+.trend-metrics { margin-left: auto; display: inline-flex; background: var(--card-2); border: 1px solid var(--border); border-radius: 999px; padding: 2px; }
+.trend-metrics button {
+  border: none; background: transparent; padding: 4px 10px; border-radius: 999px;
+  font-size: .74rem; font-weight: 600; color: var(--muted); cursor: pointer; font-family: inherit; transition: all .18s ease;
+}
+.trend-metrics button.on { background: var(--card); color: var(--primary); box-shadow: var(--shadow-sm); }
+.donut-center { position: absolute; left: 0; right: 0; top: 44%; transform: translateY(-50%); text-align: center; pointer-events: none; }
+.donut-center .dc-num { font-size: 1.02rem; font-weight: 800; }
+.donut-center .dc-lbl { font-size: .66rem; color: var(--muted); }
+
+/* 订单明细：状态色条 */
+tr.st-bar td:first-child { position: relative; }
+tr.st-bar td:first-child::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; border-radius: 0 2px 2px 0; background: var(--row-stc, transparent); }
+/* v5.16：订单明细分页条（参考小程序/APP 打印任务分页） */
+.orders-pager { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 10px 0 4px; font-size: .78rem; color: var(--muted); }
+.orders-pager .pager-info { margin-right: auto; }
+.orders-pager .pager-btns { display: inline-flex; align-items: center; gap: 4px; }
+.orders-pager .page-btn {
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  min-width: 26px; height: 26px; padding: 0 6px; border-radius: 7px; cursor: pointer;
+  font-size: .78rem; font-family: inherit; line-height: 1; transition: all .15s ease;
+}
+.orders-pager .page-btn:hover:not(:disabled):not(.on) { background: var(--card-2); border-color: var(--border-strong); }
+.orders-pager .page-btn.on { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 700; }
+.orders-pager .page-btn:disabled { opacity: .35; cursor: default; }
+.orders-pager .page-ellipsis { padding: 0 2px; }
+.orders-pager .pager-size select { padding: 3px 6px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--card); color: var(--text); font-size: .78rem; }
+
+@media (max-width: 900px) { .hero-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 640px) { .rank-row { grid-template-columns: 26px 108px 1fr 88px 52px; gap: 8px; } }
 
 /* ==================== 响应式 ==================== */
 @media (max-width: 760px) {
@@ -865,6 +1051,8 @@ function applyTheme(t) {
     void root.offsetWidth;
   }
   root.setAttribute('data-theme', t);
+  // v5.8：主题翻转后同步刷新已创建图表的图例/刻度文字颜色（Chart.js 不感知 CSS 变量变化）
+  _refreshCloudChartTheme();
   if (!_firstApply) {
     clearTimeout(_themeAnimT);
     _themeAnimT = setTimeout(function () { root.classList.remove('theme-switching'); }, 520);
@@ -981,24 +1169,85 @@ var _cloudCharts = {};
 function _destroyCloudCharts() {
   Object.keys(_cloudCharts).forEach(function (k) { if (_cloudCharts[k]) { _cloudCharts[k].destroy(); delete _cloudCharts[k]; } });
 }
+/* v5.8：主题切换后刷新已创建图表的图例/刻度/轴标题文字颜色并重绘。
+   Chart.js 创建时只读一次 CSS 变量，切换主题后必须手动更新各实例的 labels.color。
+   注意：脚本早期（applyTheme 首帧）_cloudCharts 尚未初始化，需判空。 */
+function _refreshCloudChartTheme() {
+  if (!_cloudCharts) return;
+  var tc = chartTextColor();
+  Object.keys(_cloudCharts).forEach(function (k) {
+    var c = _cloudCharts[k];
+    if (!c || !c.options) return;
+    var o = c.options;
+    if (o.plugins && o.plugins.legend && o.plugins.legend.labels) o.plugins.legend.labels.color = tc;
+    var sc = o.scales;
+    if (sc) Object.keys(sc).forEach(function (sk) {
+      var s = sc[sk];
+      if (!s) return;
+      if (s.ticks) s.ticks.color = tc;
+      if (s.title) s.title.color = tc;
+    });
+    c.update('none');   // 无动画重绘（canvas 内容非 CSS 过渡对象）
+  });
+}
+/* v4.0：状态标签语义对齐 v5+ 父子订单模型（printing=打印机正在打印；accepted/reserved 为 v5 前旧状态，仅兼容历史数据） */
 var STATUS_LABELS = {
-  sent: '已完成', printing: '待添加', queued: '排队中', failed: '失败', canceled: '已取消',
-  rejected: '被打回', accepted: '已添加', abandoned: '放弃打印', reserved: '已预留', offline_unknown: '断线未知'
+  sent: '已完成', printing: '打印中', queued: '排队中', failed: '打印失败', canceled: '已取消',
+  rejected: '被打回', abandoned: '放弃打印', offline_unknown: '断线未知',
+  accepted: '已接收', reserved: '已预留',
+  scheduled: '已预约', waiting: '待打印', downloading: '下载中'
 };
-var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown' };
+var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown', scheduled: 'st-scheduled', waiting: 'st-waiting', downloading: 'st-downloading' };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 function statusClass(s) { return STATUS_CLASSES[s] || ''; }
 var CHART_COLORS = {
-  status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', reserved: '#F57F17' },
+  status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', reserved: '#F57F17', scheduled: '#F57F17', waiting: '#00897B', downloading: '#1565C0' },
   palette: ['#4f6ef7', '#34a853', '#f59e0b', '#8b5cf6', '#d97706', '#16a34a', '#e11d48', '#38bdf8', '#f472b6', '#a855f7', '#14b8a6', '#f97316']
 };
 function _statusColor(s) { return CHART_COLORS.status[s] || '#9ca3af'; }
 function _fmtDate(d) { return (d || '').substring(0, 10); }
+/* v5 通用小工具 */
+function prevMonthKey(month) { var p = String(month).split('-'); var y = +p[0], m = +p[1]; return m === 1 ? (y - 1) + '-12' : y + '-' + String(m - 1).padStart(2, '0'); }
+function fmtInt(n) { return String(n || 0).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function _shortDay(d) { var p = String(d || '').split('-'); return p.length === 3 ? (+p[1]) + '/' + (+p[2]) : d; }
+function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(name).trim(); }
 
 /* ==================== 云端月份 ==================== */
 var _cloudData = null, _cloudLoading = false, _cloudExpanded = {}, _cloudMonth = null;
 var _cloudMonthsCache = null, _cloudMonthsReady = false;
 var _cloudUserFilter = 'all', _cloudSourceFilter = 'all';
+var _cloudOwners = null, _cloudOwnersLoading = false;   // v24：管理员订单归属统计
+/* v5：运营驾驶舱状态 */
+var _cloudChartView = 'revenue';          // 'revenue' | 'ops' 图表分组
+var _cloudTrendMetric = 'revenue';        // 'revenue' | 'count' | 'pages' | 'files'
+var _cloudStatusFilter = 'all';           // 'all' | 'active' | 'abnormal' | 具体状态
+var _ordersPage = 1, _ordersPerPage = 20; // v5.16：订单明细分页（参考小程序/APP 打印任务分页）
+var _ORDERS_PAGE_OPTIONS = [10, 20, 50, 100];
+var _cloudCompare = null, _cloudCompareMonth = null, _cloudCompareLoading = false;  // 上月环比（懒加载+缓存）
+var _cloudDataFetchedAt = null;           // 最近一次成功同步时间
+/* v5.2：趋势区间（近7天 / 近30天 / 自定义；宽范围自动按月/按年聚合）
+   v5.6：移除「本月」维度 —— 趋势始终基于独立区间，默认近30天 */
+var _trendRange = { mode: '30d' };        // '7d' | '30d' | 'custom'
+var _trendCustom = { start: '', end: '' };  // 自定义起止（YYYY-MM-DD）
+var _trendData = null;                    // 当前区间原始响应（data）
+var _trendDataKey = null;                 // 当前区间缓存键
+var _trendLoading = false;
+var _trendCache = {};                     // 区间缓存：key(start_end) -> data
+/* 状态分组（v5）：进行中/待处理 / 异常 */
+var _ACTIVE_STATUS = { queued: 1, printing: 1, accepted: 1, reserved: 1, scheduled: 1, waiting: 1, downloading: 1 };
+var _ABNORMAL_STATUS = { failed: 1, rejected: 1, abandoned: 1, offline_unknown: 1 };
+function _statusGroups(st) {
+  st = st || {};
+  var done = st.sent || 0;
+  var printingNow = st.printing || 0;
+  var pending = (st.queued || 0) + (st.scheduled || 0) + (st.waiting || 0) + (st.downloading || 0) + (st.accepted || 0) + (st.reserved || 0);
+  var working = printingNow + pending;
+  var abnormal = (st.failed || 0) + (st.rejected || 0) + (st.abandoned || 0) + (st.offline_unknown || 0);
+  var canceled = st.canceled || 0;
+  var total = done + working + abnormal + canceled;
+  var rate = total > canceled ? Math.round(done / (total - canceled) * 100) : 0;
+  return { done: done, working: working, pending: pending, printingNow: printingNow, abnormal: abnormal, canceled: canceled, rate: rate };
+}
 
 function loadCloudMonths() {
   // 优先走后端 /months 接口
@@ -1051,7 +1300,8 @@ function monthRange(month) {
 }
 function selectedStatuses() {
   // 状态固定为全量（已移除状态过滤 UI）；收益统计仍只计已完成(sent)，订单数/构成按全部状态展示
-  return ['sent', 'printing', 'queued', 'failed', 'canceled', 'rejected', 'accepted', 'abandoned', 'reserved', 'offline_unknown'];
+  // v5：补入预约/待打印/下载中（scheduled/waiting/downloading），与后端父子订单模型对齐
+  return ['sent', 'printing', 'queued', 'failed', 'canceled', 'rejected', 'accepted', 'abandoned', 'reserved', 'offline_unknown', 'scheduled', 'waiting', 'downloading'];
 }
 function fetchCloudData(month) {
   if (!month) { toast('请选择月份', 'error'); return; }
@@ -1060,20 +1310,637 @@ function fetchCloudData(month) {
   var statuses = selectedStatuses();
   var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end) + '&status=' + encodeURIComponent(statuses.join(','));
   _cloudLoading = true;
+  _cloudDataFetchedAt = null;   // 旧数据作废，等新数据返回后再显示同步时间
   renderCloud();
   fetch('/api/proxy/admin/statistics/revenue?' + params, { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
     .then(function (data) {
       _cloudLoading = false;
-      if (data.success) _cloudData = data.data;
-      else { _cloudData = null; toast('❌ ' + (data.message || '查询失败'), 'error'); }
+      if (data.success) {
+        _cloudData = data.data;
+        _cloudDataFetchedAt = new Date().toTimeString().substring(0, 8);
+      } else { _cloudData = null; toast('❌ ' + (data.message || '查询失败'), 'error'); }
       renderCloud();
     })
     .catch(function (err) { _cloudLoading = false; _cloudData = null; toast('❌ 请求失败: ' + err.message, 'error'); renderCloud(); });
+  fetchCloudOwners(month);
+  fetchCloudCompare(month);   // 懒加载上月数据用于环比徽标
+  _trendCache = {};                        // v5.2：刷新时清空趋势区间缓存并按当前区间重拉
+  fetchTrendData(_trendRange.mode);
 }
-function onCloudMonthChange(val) { _cloudMonth = val; fetchCloudData(val); }
-function onCloudUserFilter(v) { _cloudUserFilter = v; renderCloud(); }
-function onCloudSourceFilter(v) { _cloudSourceFilter = v; renderCloud(); }
+
+// v24：管理员订单归属统计（自打 / 接单比例）
+function fetchCloudOwners(month) {
+  var range = monthRange(month);
+  var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end);
+  _cloudOwnersLoading = true;
+  fetch('/api/proxy/admin/statistics/owners?' + params, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      _cloudOwnersLoading = false;
+      if (data && data.success && data.data) _cloudOwners = data.data;
+      else _cloudOwners = null;
+      renderCloud();
+    })
+    .catch(function () { _cloudOwnersLoading = false; _cloudOwners = null; renderCloud(); });
+}
+
+/* v5：上月环比（懒加载 + 缓存，仅用于 KPI 徽标；不污染 _cloudData 主数据） */
+function fetchCloudCompare(month) {
+  var pm = prevMonthKey(month);
+  if (!pm) return;
+  if (_cloudCompareMonth === pm && _cloudCompare !== null) return;   // 已缓存
+  if (_cloudCompareMonth === pm && _cloudCompareLoading) return;     // 请求中
+  _cloudCompareMonth = pm;
+  _cloudCompareLoading = true;
+  var range = monthRange(pm);
+  var statuses = selectedStatuses();
+  var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end) + '&status=' + encodeURIComponent(statuses.join(','));
+  fetch('/api/proxy/admin/statistics/revenue?' + params, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      _cloudCompareLoading = false;
+      _cloudCompare = (data && data.success) ? data.data : null;
+      renderCloud();
+    })
+    .catch(function () { _cloudCompareLoading = false; _cloudCompare = null; renderCloud(); });
+}
+/* 已入账卡片的环比徽标：仅未启用成员/来源过滤时展示（保证口径一致）。
+   v5.1：改用前端 orders 聚合（排除自打），与 KPI 完全同口径，不依赖后端 revenue_summary。 */
+function _moMBadge() {
+  if (_cloudUserFilter !== 'all' || _cloudSourceFilter !== 'all') return '';
+  if (_cloudCompareLoading) return '<span class="badge" style="opacity:.5">…</span>';
+  if (!_cloudCompare || !_cloudData) return '';
+  var prev = _paidTotalCents(_cloudCompare.orders);
+  var cur = _paidTotalCents(_cloudData.orders);
+  if (prev <= 0) return '';
+  var pct = (cur - prev) / prev * 100;
+  var up = pct >= 0;
+  return '<span class="badge ' + (up ? 'up' : 'down') + '" title="较 ' + labelOf(prevMonthKey(_cloudMonth)) + '">' + (up ? '▲' : '▼') + ' ' + Math.abs(pct).toFixed(1) + '%</span>';
+}
+/* 对账数据（全量订单，不受成员/来源过滤影响）：与「云端 vs 手动代收」表格共用同一口径 */
+function _reconcileCloud(month, orders) {
+  var manual = {};
+  (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === month) manual[r.memberId] = (manual[r.memberId] || 0) + parseCents(r.amount); });
+  var cloudByMember = {}, unboundPaid = 0, unboundUsers = [], unboundN = 0;
+  _userAgg(orders || []).forEach(function (u) {
+    var mo = memberOfOpenid(u.openid);
+    if (mo && mo.memberId) cloudByMember[mo.memberId] = (cloudByMember[mo.memberId] || 0) + u.paid;
+    else if (u.openid !== 'local' && u.paid > 0) { unboundN++; unboundPaid += u.paid; if (u.nickname) unboundUsers.push(u.nickname); }
+  });
+  var diffTotal = 0, hasDiff = false;
+  Object.keys(cloudByMember).forEach(function (mid) {
+    var d = (cloudByMember[mid] || 0) - (manual[mid] || 0);
+    if (Math.abs(d) > 1) { hasDiff = true; diffTotal += d; }
+  });
+  Object.keys(manual).forEach(function (mid) {
+    if (!cloudByMember[mid]) { var d2 = -(manual[mid] || 0); if (Math.abs(d2) > 1) { hasDiff = true; diffTotal += d2; } }
+  });
+  return { manual: manual, cloudByMember: cloudByMember, unboundPaid: unboundPaid, unboundUsers: unboundUsers, unboundN: unboundN, hasDiff: hasDiff, diffTotal: diffTotal };
+}
+/* 趋势峰值标注文案（points 支持 day 的 date 或 month/year 的 label 字段） */
+function _trendPeak(points, metric) {
+  var vals = (points || []).map(function (t) {
+    return metric === 'revenue' ? (t.revenue || 0) : metric === 'count' ? (t.count || 0) : metric === 'pages' ? (t.pages || 0) : (t.files || 0);
+  });
+  var mx = Math.max.apply(null, vals.concat([0]));
+  if (mx <= 0) return '';
+  var idx = vals.indexOf(mx);
+  var lbl = points[idx].label || _shortDay(points[idx].date);
+  return metric === 'revenue' ? '峰值 ' + RMB(parseCents(mx)) + ' · ' + lbl : '峰值 ' + fmtInt(mx) + ' · ' + lbl;
+}
+/* 趋势区间 → 起止日期（7d/30d/60d/90d/1y 以今天为终点向前推） */
+function _trendRangeDates(mode) {
+  if (mode === '7d' || mode === '30d' || mode === '60d' || mode === '90d' || mode === '1y') {
+    var n = mode === '7d' ? 6 : mode === '30d' ? 29 : mode === '60d' ? 59 : mode === '90d' ? 89 : 364;
+    var d = new Date();
+    d.setDate(d.getDate() - n);
+    return {
+      start: d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'),
+      end: todayStr()
+    };
+  }
+  if (mode === 'custom') {
+    if (!_trendCustom.start || !_trendCustom.end) return null;
+    return { start: _trendCustom.start, end: _trendCustom.end };
+  }
+  return null;
+}
+/* 拉取趋势区间数据（独立于月份主数据，按区间缓存；成员/来源过滤在展示时应用）
+   v5.6：防重入（同区间请求中不重复发起）+ 防过期（区间已切换时丢弃旧响应） */
+function fetchTrendData(mode) {
+  var range = _trendRangeDates(mode);
+  if (!range) return;
+  var key = range.start + '_' + range.end;
+  if (_trendDataKey === key && (_trendData || _trendLoading)) return;   // 当前区间已有数据或请求中
+  if (_trendCache[key]) {                                        // 缓存命中
+    _trendData = _trendCache[key]; _trendDataKey = key; renderCloud(); return;
+  }
+  var reqKey = key;
+  _trendLoading = true;
+  _trendDataKey = key;
+  var statuses = selectedStatuses();
+  var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end) + '&status=' + encodeURIComponent(statuses.join(','));
+  fetch('/api/proxy/admin/statistics/revenue?' + params, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (_trendDataKey !== reqKey) return;                      // 区间已切换，丢弃过期响应
+      _trendLoading = false;
+      if (data && data.success && data.data) { _trendCache[key] = data.data; _trendData = data.data; }
+      else { _trendData = null; toast('❌ 趋势区间查询失败', 'error'); }
+      renderCloud();
+    })
+    .catch(function (err) {
+      if (_trendDataKey !== reqKey) return;
+      _trendLoading = false; _trendData = null; toast('❌ 趋势请求失败: ' + err.message, 'error'); renderCloud();
+    });
+}
+/* 区间切换（自定义：点击直接弹出日历选开始日期） */
+function onTrendRange(mode) {
+  if (mode === 'custom') {
+    var s = $('#trendRangeStart');
+    if (s) _calOpen('start', s);
+    return;
+  }
+  _trendRange = { mode: mode };
+  fetchTrendData(mode);
+}
+/* v5.14：自定义日期可选范围 —— 最早 = 最早有数据的月份 1 号（云端 + 本地月份并集），最晚 = 今天 */
+function _trendMinDate() {
+  var keys = cloudMonthKeys();
+  var earliest = keys.length ? keys[keys.length - 1] : currentMonthKey();   // keys 降序，最后一个最早
+  return earliest + '-01';
+}
+/* v5.15：自定义日期由自绘日历选择（选择即写入 _trendCustom），应用函数只做校验与请求 */
+function onTrendCustomApply() {
+  var sv = _trendCustom.start, ev = _trendCustom.end;
+  if (!sv || !ev) { toast('请选择起止日期', 'error'); return; }
+  if (sv > ev) { toast('起始日期不能晚于结束日期', 'error'); return; }
+  var minD = _trendMinDate(), maxD = todayStr();
+  if (sv < minD) { toast('起始日期不能早于 ' + minD + '（最早数据日期）', 'error'); return; }
+  if (ev > maxD) { toast('结束日期不能晚于今天', 'error'); return; }
+  _trendRange = { mode: 'custom' };
+  fetchTrendData('custom');
+}
+
+/* ==================== v5.15：自绘日历组件（趋势自定义日期） ====================
+   浮层挂在 body 下，独立于 renderCloud 重建；浅色/深色主题随 CSS 变量自动适配；
+   范围限制（最早数据月份 ~ 今天）直接在日历中禁用对应日期。 */
+var _cal = { open: false, mode: 'start', viewY: 0, viewM: 0, snap: null };
+function _calInit() {
+  var root = document.getElementById('trendCalRoot');
+  if (root) return root;
+  var div = document.createElement('div');
+  div.id = 'trendCalRoot';
+  div.className = 'cal-pop';
+  div.style.display = 'none';
+  document.body.appendChild(div);
+  div.addEventListener('click', function (e) {
+    /* 阻止事件继续冒泡到 document：日历内部的月切换/选日等会触发 _calRender 重建
+       innerHTML，导致被点击按钮从 DOM 中移除，document 层 div.contains(target) 变 false，
+       进而被当作「点击外部」而误关闭（bug）。此处直接截断冒泡，文档层关闭逻辑只负责真正的外部点击。 */
+    e.stopPropagation();
+    var t = e.target;
+    if (t.closest('.cal-nav')) { _calShift(+(t.getAttribute('data-dir') || 0)); return; }
+    if (t.closest('.cal-close')) { _calClose(); return; }
+    var day = t.closest('.cal-day');
+    if (day && !day.classList.contains('disabled')) _calPick(day.getAttribute('data-date'));
+  });
+  /* 点击日历外部或滚动页面时关闭 */
+  document.addEventListener('click', function (e) {
+    if (!_cal.open) return;
+    var el = e.target;
+    if (div.contains(el)) return;
+    if (el.closest && el.closest('.date-field')) return;
+    _calClose();
+  });
+  window.addEventListener('scroll', function () { if (_cal.open) _calClose(); }, { passive: true });
+  return div;
+}
+function _calOpen(mode, anchorEl) {
+  var root = _calInit();
+  var base = '';
+  if (mode === 'end' && _trendCustom.start) base = _trendCustom.start;
+  else base = _trendCustom.end || _trendCustom.start || todayStr();
+  _cal.mode = mode;
+  _cal.viewY = +base.slice(0, 4);
+  _cal.viewM = +base.slice(5, 7);
+  _cal.snap = { start: _trendCustom.start, end: _trendCustom.end };   // 取消时回滚
+  if (_cal.anchor) _cal.anchor.classList.remove('on');
+  _cal.anchor = anchorEl;
+  if (anchorEl) anchorEl.classList.add('on');
+  _calRender(root);
+  root.style.display = 'block';
+  /* 定位到触发元素下方，越界自动翻转/收拢 */
+  var r = anchorEl.getBoundingClientRect();
+  var pw = root.offsetWidth || 254;
+  var left = Math.min(Math.max(8, r.left), (window.innerWidth || 1200) - pw - 8);
+  var top = r.bottom + 6;
+  if (top + (root.offsetHeight || 300) > (window.innerHeight || 800)) top = r.top - (root.offsetHeight || 300) - 6;
+  root.style.left = left + 'px';
+  root.style.top = top + 'px';
+  _cal.open = true;
+}
+function _calClose(rollback) {
+  var root = document.getElementById('trendCalRoot');
+  if (root) {
+    root.style.display = 'none';
+    if (rollback && _cal.snap && !_trendCustom.end && _cal.mode === 'end') {
+      // 只选了开始未选结束就关闭 → 回滚本次选择
+      _trendCustom.start = _cal.snap.start;
+      _trendCustom.end = _cal.snap.end;
+      _syncTrendDateFields();
+    }
+  }
+  if (_cal.anchor) { _cal.anchor.classList.remove('on'); _cal.anchor = null; }
+  _cal.open = false;
+}
+function _calShift(dir) {
+  var ny = _cal.viewY, nm = _cal.viewM + dir;
+  if (nm < 1) { nm = 12; ny--; }
+  if (nm > 12) { nm = 1; ny++; }
+  /* 目标月份若所有日期都不可用（早于最早数据月份 / 晚于当前月份），禁止切换 */
+  var key = ny + '-' + String(nm).padStart(2, '0');
+  var minD = _trendMinDate(), maxD = todayStr();
+  if (key < minD.slice(0, 7) || key > maxD.slice(0, 7)) return;
+  _cal.viewY = ny; _cal.viewM = nm;
+  _calRender(_calInit());
+}
+function _calRender(root) {
+  var minD = _trendMinDate(), maxD = todayStr();
+  var y = _cal.viewY, m = _cal.viewM;
+  var cur = y + '-' + String(m).padStart(2, '0');        // 当前视图月份 YYYY-MM
+  var first = new Date(y, m - 1, 1);
+  var dow = (first.getDay() + 6) % 7;                      // 周一开头
+  var daysInMonth = new Date(y, m, 0).getDate();
+  var h = '<div class="cal-head">' +
+    '<button type="button" class="cal-nav"' + (cur <= minD.slice(0, 7) ? ' disabled' : '') + ' data-dir="-1">‹</button>' +
+    '<span class="cal-title">' + y + '年' + m + '月</span>' +
+    '<button type="button" class="cal-nav"' + (cur >= maxD.slice(0, 7) ? ' disabled' : '') + ' data-dir="1">›</button>' +
+    '</div>';
+  h += '<div class="cal-grid">';
+  ['一', '二', '三', '四', '五', '六', '日'].forEach(function (d) { h += '<span class="cal-dow">' + d + '</span>'; });
+  for (var i = 0; i < dow; i++) h += '<span></span>';
+  for (var d2 = 1; d2 <= daysInMonth; d2++) {
+    var ds = y + '-' + String(m).padStart(2, '0') + '-' + String(d2).padStart(2, '0');
+    var cls = 'cal-day';
+    if (ds < minD || ds > maxD) cls += ' disabled';
+    if (ds === _trendCustom.start || ds === _trendCustom.end) cls += ' sel';
+    if (ds === todayStr()) cls += ' today';
+    if (_trendCustom.start && _trendCustom.end && ds > _trendCustom.start && ds < _trendCustom.end) cls += ' range';
+    h += '<button type="button" class="' + cls + '" data-date="' + ds + '">' + d2 + '</button>';
+  }
+  h += '</div>';
+  var hint = _cal.mode === 'start' ? '选择开始日期' : '选择结束日期（≥ ' + (_trendCustom.start || '开始') + '）';
+  h += '<div class="cal-foot"><span class="cal-hint">' + hint + '</span><button type="button" class="cal-close">关闭</button></div>';
+  root.innerHTML = h;
+}
+function _calPick(ds) {
+  if (_cal.mode === 'start') {
+    _trendCustom.start = ds;
+    _trendCustom.end = '';
+    _cal.mode = 'end';
+    _cal.viewY = +ds.slice(0, 4);
+    _cal.viewM = +ds.slice(5, 7);
+    _calRender(_calInit());
+    _syncTrendDateFields();
+  } else {
+    if (ds < _trendCustom.start) { toast('结束日期不能早于开始日期', 'error'); return; }
+    _trendCustom.end = ds;
+    _calClose(false);
+    _syncTrendDateFields();
+    onTrendCustomApply();   // 选完结束日期自动应用
+  }
+}
+/* 同步工具栏两个日期字段的显示文本（不触发整页重渲染） */
+function _syncTrendDateFields() {
+  var s = $('#trendRangeStart'), e = $('#trendRangeEnd');
+  if (s) {
+    var t1 = s.querySelector('.df-txt');
+    if (t1) { t1.textContent = _trendCustom.start || '选择日期'; t1.classList.toggle('placeholder', !_trendCustom.start); }
+  }
+  if (e) {
+    var t2 = e.querySelector('.df-txt');
+    if (t2) { t2.textContent = _trendCustom.end || '选择日期'; t2.classList.toggle('placeholder', !_trendCustom.end); }
+  }
+}
+/* 粒度判定（v5.9）：≤60 天按日（柱状图，每天一柱）；>60 天切片（固定最多 90 片，平滑折线图，v5.16 由 60 片调整），
+   不再按月/年划分 —— 月度聚合会抹平月内波动，固定切片能保留更多变化趋势 */
+function _trendGranularity(start, end) {
+  var s = new Date(start), e = new Date(end);
+  if (isNaN(s) || isNaN(e) || e < s) return 'day';
+  var days = Math.round((e - s) / 86400000) + 1;
+  return days <= 60 ? 'day' : 'slice';
+}
+/* v5.9：时间轴切片 —— 将补全后的日序列均匀切成最多 maxSlices 片（每片聚合求和），
+   标签为片内日期范围（如 8/1~8/3），用于宽范围区间保留趋势细节 */
+function _sliceTrend(points, maxSlices) {
+  if (!points || points.length <= maxSlices) return points;
+  var K = maxSlices, out = [];
+  for (var i = 0; i < K; i++) {
+    var s = Math.floor(i * points.length / K);
+    var e = Math.floor((i + 1) * points.length / K);
+    if (e <= s) e = s + 1;
+    var slice = { count: 0, revenue: 0, pages: 0, files: 0, label: '' };
+    for (var j = s; j < e && j < points.length; j++) {
+      var p = points[j];
+      slice.count += p.count || 0;
+      slice.revenue += p.revenue || 0;
+      slice.pages += p.pages || 0;
+      slice.files += p.files || 0;
+    }
+    var first = points[s], last = points[Math.min(e, points.length) - 1];
+    slice.label = _shortDay(first.date) + (e - s > 1 ? '~' + _shortDay(last.date) : '');
+    out.push(slice);
+  }
+  return out;
+}
+/* v5.16：趋势图当前渲染状态 —— 从 _trendData 按当前成员/来源过滤、粒度判定、切片计算趋势点，
+   供整页渲染（renderCloud）与指标局部重绘（onCloudTrendMetric）共用，保证两处结果一致 */
+function _trendViewState() {
+  var gran = 'day', points = [];
+  if (_trendData) {
+    var trOrders = _trendData.orders || [];
+    if (_cloudUserFilter !== 'all') trOrders = trOrders.filter(function (o) { return o.openid === _cloudUserFilter; });
+    if (_cloudSourceFilter !== 'all') trOrders = trOrders.filter(function (o) { return o.source === _cloudSourceFilter; });
+    gran = _trendGranularity(_trendData.period.start, _trendData.period.end);
+    var dailyPts = [];
+    if (trOrders.length > 0) dailyPts = _fillTrendGaps(_computeDailyTrend(trOrders), _trendData.period.start, _trendData.period.end, 'day');
+    points = gran === 'day' ? dailyPts : _sliceTrend(dailyPts, 90);
+  }
+  return { gran: gran, points: points };
+}
+/* v5.16：趋势标题提示文案（区间 + 切片说明 + 峰值），整页渲染与局部重绘共用 */
+function _trendHintText() {
+  if (!_trendData) return '';
+  var rl = _trendRange.mode === '7d' ? '近7天' : _trendRange.mode === '30d' ? '近30天' : _trendRange.mode === '60d' ? '近60天' : _trendRange.mode === '90d' ? '近90天' : _trendRange.mode === '1y' ? '近1年' : '自定义';
+  var txt = rl + '（' + _trendData.period.start + ' ~ ' + _trendData.period.end + '）';
+  var tv = _trendViewState();
+  if (tv.gran === 'slice') txt += ' · 已按 90 片切片聚合展示';
+  if (tv.points.length > 0) txt += ' · ' + _trendPeak(tv.points, _cloudTrendMetric);
+  return txt;
+}
+/* 按 月/年 桶聚合（v5.9 起已由固定切片替代，保留函数以防回退；与 _computeDailyTrend 同字段） */
+function _trendByBucket(orders, granularity) {
+  var map = {};
+  (orders || []).forEach(function (o) {
+    var d = _fmtDate(o.created_at);
+    var key = granularity === 'month' ? d.slice(0, 7) : d.slice(0, 4);
+    if (!key) return;
+    var b = map[key];
+    if (!b) b = map[key] = { key: key, label: key, count: 0, revenue: 0, pages: 0, files: 0 };
+    b.count++;
+    b.revenue += o.is_admin_print ? 0 : (o.revenue || 0);   // v5.1：自打订单不计收益
+    b.pages += o.total_page_count || 0;
+    b.files += o.files_count || 0;
+  });
+  return Object.keys(map).sort().map(function (k) { return map[k]; });
+}
+/* 日期字符串 → 本地 Date（避免 new Date('YYYY-MM-DD') 的 UTC 解析时区偏移） */
+function _parseDate(s) { var p = String(s).split('-'); return new Date(+p[0], +p[1] - 1, +p[2] || 1); }
+/* v5.3：按区间补全时间轴 —— 收益/订单为 0 的天（月/年）也保留位置，避免 x 轴跳空 */
+function _fillTrendGaps(points, start, end, granularity) {
+  var map = {};
+  (points || []).forEach(function (p) { map[p.key || _fmtDate(p.date)] = p; });
+  var out = [], zero = { count: 0, revenue: 0, pages: 0, files: 0 };
+  if (granularity === 'day') {
+    var cur = _parseDate(start), last = _parseDate(end);
+    while (cur <= last) {
+      var key = cur.getFullYear() + '-' + String(cur.getMonth() + 1).padStart(2, '0') + '-' + String(cur.getDate()).padStart(2, '0');
+      var p = map[key];
+      out.push(p ? p : Object.assign({ date: key }, zero));
+      cur.setDate(cur.getDate() + 1);
+    }
+  } else if (granularity === 'month') {
+    var y = +String(start).slice(0, 4), mo = +String(start).slice(5, 7);
+    var ey = +String(end).slice(0, 4), emo = +String(end).slice(5, 7);
+    while (y < ey || (y === ey && mo <= emo)) {
+      var key2 = y + '-' + String(mo).padStart(2, '0');
+      var q = map[key2];
+      out.push(q ? q : Object.assign({ key: key2, label: key2 }, zero));
+      mo++; if (mo > 12) { mo = 1; y++; }
+    }
+  } else {
+    for (var yy = +String(start).slice(0, 4); yy <= +String(end).slice(0, 4); yy++) {
+      var key3 = String(yy);
+      var w = map[key3];
+      out.push(w ? w : Object.assign({ key: key3, label: key3 }, zero));
+    }
+  }
+  return out;
+}
+/* v5.4：趋势指标专属色板 —— 收益=绿（财务）/ 订单=蓝（主品牌）/ 页数=紫 / 文件=青；
+   任何位置出现同指标均用同色（主序列与辅助序列一致）；峰值用同色系实色/放大突出 */
+var _TREND_COLORS = {
+  revenue: { main: '#16a34a', label: '收益 (元)' },
+  count:   { main: '#4f6ef7', label: '订单数' },
+  pages:   { main: '#8b5cf6', label: '页数' },
+  files:   { main: '#14b8a6', label: '文件数' }
+};
+function _hexToRgba(hex, alpha) {
+  var h = String(hex).replace('#', '');
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  var r = parseInt(h.slice(0, 2), 16), g = parseInt(h.slice(2, 4), 16), b = parseInt(h.slice(4, 6), 16);
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
+}
+
+// v24：渲染管理员订单归属统计区块（表格 + 比例条 + 整体汇总）
+function renderOwnersSection() {
+  var h = '';
+  if (_cloudOwnersLoading) {
+    return '<div class="section"><h2>🧑‍💼 管理员订单统计 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div style="text-align:center;padding:18px"><span class="loading-spin"></span> <span style="margin-left:6px;color:var(--muted)">正在统计…</span></div></div>';
+  }
+  if (!_cloudOwners || !_cloudOwners.owners || !_cloudOwners.owners.length) {
+    return '<div class="section"><h2>🧑‍💼 管理员订单统计 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div class="empty" style="padding:16px"><p>本月暂无已归属的订单数据</p></div></div>';
+  }
+  var owners = _cloudOwners.owners || [];
+  var sum = _cloudOwners.summary || {};
+  var maxTotal = 1;
+  owners.forEach(function (o) { if ((o.own_orders + o.accepted_orders) > maxTotal) maxTotal = o.own_orders + o.accepted_orders; });
+  /* v5：按合计订单数降序排名（🥇🥈🥉） */
+  var sortedOwners = owners.slice().sort(function (a, b) {
+    return ((b.own_orders || 0) + (b.accepted_orders || 0)) - ((a.own_orders || 0) + (a.accepted_orders || 0));
+  });
+
+  h += '<div class="section"><h2>🧑‍💼 管理员订单统计 <span class="hint">' + labelOf(_cloudMonth) + ' · 自打=管理员自行打印 / 接单=顾客订单 · 按合计订单数排名</span></h2>';
+  h += '<div class="table-wrap"><table><thead><tr>';
+  h += '<th style="width:44px">#</th><th>管理员</th><th>自打订单</th><th>接单订单</th><th>合计</th><th>自打占比</th>';
+  h += '<th>文件<br><span style="font-weight:400;font-size:.72rem">自打/接单</span></th>';
+  h += '<th>页数<br><span style="font-weight:400;font-size:.72rem">自打/接单</span></th>';
+  h += '<th>金额（元）<br><span style="font-weight:400;font-size:.72rem">自打/接单</span></th>';
+  h += '</tr></thead><tbody>';
+  sortedOwners.forEach(function (o, idx) {
+    var own = o.own_orders || 0, acc = o.accepted_orders || 0, tot = own + acc;
+    var ratio = tot > 0 ? (own / tot * 100).toFixed(1) : '0.0';
+    var ownW = tot > 0 ? Math.max(2, Math.round(own / maxTotal * 100)) : 0;
+    var accW = tot > 0 ? Math.max(2, Math.round(acc / maxTotal * 100)) : 0;
+    var medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : idx === 2 ? '🥉' : String(idx + 1);
+    h += '<tr>';
+    h += '<td style="font-size:1rem">' + medal + '</td>';
+    h += '<td style="font-weight:700">' + esc(o.owner_name) + '</td>';
+    h += '<td class="pos">' + own + '</td><td>' + acc + '</td><td style="font-weight:700">' + tot + '</td>';
+    h += '<td><div class="ratio-bar"><div class="ratio-own" style="width:' + ownW + '%"></div><div class="ratio-acc" style="width:' + accW + '%"></div></div><span style="font-size:.78rem;color:var(--muted)">' + ratio + '%</span></td>';
+    h += '<td>' + (o.own_files || 0) + ' / ' + (o.accepted_files || 0) + '</td>';
+    h += '<td>' + (o.own_pages || 0) + ' / ' + (o.accepted_pages || 0) + '</td>';
+    h += '<td>' + RMB(parseCents(o.own_revenue || 0)) + ' / ' + RMB(parseCents(o.accepted_revenue || 0)) + '</td>';
+    h += '</tr>';
+  });
+  var sOwn = sum.own_orders || 0, sAcc = sum.accepted_orders || 0, sTot = sum.order_count || 0;
+  var sRatio = sTot > 0 ? (sOwn / sTot * 100).toFixed(1) : '0.0';
+  h += '<tr class="tfoot"><td></td><td>合计</td><td class="pos">' + sOwn + '</td><td>' + sAcc + '</td><td style="font-weight:700">' + sTot + '</td>';
+  h += '<td><span style="font-size:.78rem">' + sRatio + '%</span></td>';
+  h += '<td>' + (sum.own_files || 0) + ' / ' + (sum.accepted_files || 0) + '</td>';
+  h += '<td>' + (sum.own_pages || 0) + ' / ' + (sum.accepted_pages || 0) + '</td>';
+  h += '<td>' + RMB(parseCents(sum.own_revenue || 0)) + ' / ' + RMB(parseCents(sum.accepted_revenue || 0)) + '</td>';
+  h += '</tr>';
+  h += '</tbody></table></div>';
+  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">比例条：<span style="display:inline-block;width:10px;height:10px;background:var(--blue,#007AFF);border-radius:2px;vertical-align:-1px"></span> 自打 &nbsp;<span style="display:inline-block;width:10px;height:10px;background:var(--orange,#FF9500);border-radius:2px;vertical-align:-1px"></span> 接单（按占本月总订单数的比例绘制）。金额仅统计已完成（sent）订单。</div>';
+  h += '</div>';
+  return h;
+}
+function onCloudMonthChange(val) { _cloudMonth = val; _ordersPage = 1; fetchCloudData(val); }
+function onCloudUserFilter(v) { _cloudUserFilter = v; _ordersPage = 1; renderCloud(); }
+function onCloudSourceFilter(v) { _cloudSourceFilter = v; _ordersPage = 1; renderCloud(); }
+/* v5：视图/指标/状态筛选切换（数据已缓存，仅重渲染，不发请求） */
+function onCloudChartView(v) { _cloudChartView = v; renderCloud(); }
+/* v5.16：趋势指标切换 —— 只局部更新趋势图区域（按钮高亮 + 标题峰值 + 图表重绘），
+   不再整页重建 DOM，避免 KPI/环形/柱状等其他图表被一并销毁重绘（闪烁） */
+function onCloudTrendMetric(m) {
+  if (_cloudTrendMetric === m) return;
+  _cloudTrendMetric = m;
+  document.querySelectorAll('.trend-metrics button[data-metric]').forEach(function (b) {
+    var on2 = b.getAttribute('data-metric') === m;
+    b.classList.toggle('on', on2);
+    if (on2) { b.style.color = (_TREND_COLORS[m] || _TREND_COLORS.revenue).main; b.style.fontWeight = '700'; }
+    else { b.style.color = ''; b.style.fontWeight = ''; }
+  });
+  var hint = document.querySelector('#cloud-trend .hint');
+  if (hint) hint.textContent = _trendHintText();
+  var canvas = document.getElementById('cloud-chart-trend');
+  if (!canvas) return;                                  // 趋势区未渲染（加载中/空态）→ 无需重绘
+  if (_cloudCharts['cloud-chart-trend']) { _cloudCharts['cloud-chart-trend'].destroy(); delete _cloudCharts['cloud-chart-trend']; }
+  var tv = _trendViewState();
+  if (tv.points.length > 0) {
+    if (tv.gran === 'day') _renderBucketTrend('cloud-chart-trend', tv.points, m, 'day');
+    else _renderDailyTrend('cloud-chart-trend', tv.points, m);
+  }
+}
+/* v5.16：状态筛选改为局部刷新订单明细（回到第 1 页），不再整页重建 */
+function onCloudStatusFilter(v) { _cloudStatusFilter = v; _ordersPage = 1; _rerenderOrdersOnly(); }
+
+/* ==================== v4.0：云端金额口径（统一为「子任务」维度） ====================
+   已入账 paid        = 子任务 status='sent' 的金额合计（真正收到钱的）
+   应收未收 receivable = 其余未排除状态（queued/printing/offline_unknown）金额合计
+   不计 dropped       = canceled / abandoned / rejected / failed（失败单大概率不收费，
+                        仍可在订单明细状态列看到；不参与金额统计）
+   免费文件 free       = 文件级 is_free=1（不计金额，单独计数）
+   v5.1：自打订单（is_admin_print=1，管理员自行打印）不计入收益金额 ——
+         excludeSelf=true 时金额/待处理计数全部跳过；订单明细表展示时仍用原样金额。 */
+var _EXCLUDE_STATUS = { canceled: 1, abandoned: 1, rejected: 1, failed: 1 };
+function _orderMoney(o, excludeSelf) {
+  var m = { paid: 0, receivable: 0, free: 0, pendingFiles: 0 };
+  var isSelf = !!(excludeSelf && o && o.is_admin_print);
+  (o.files || []).forEach(function (f) {
+    if (f.is_free) m.free++;
+    if (isSelf) return;   // 自打订单：保留免费文件计数，金额不计入收益
+    var amt = parseCents(f.total_price);
+    if (f.status === 'sent') m.paid += amt;
+    else if (!_EXCLUDE_STATUS[f.status]) { m.receivable += amt; m.pendingFiles++; }
+  });
+  return m;
+}
+function _cloudAgg(orders) {
+  var a = { paid: 0, receivable: 0, free: 0, pendingFiles: 0, paidOrders: 0,
+            allFiles: 0, pages: 0, autoPrint: 0, scheduled: 0, delivery: 0, urgency: 0, cover: 0,
+            selfOrders: 0, orders: orders.length };
+  orders.forEach(function (o) {
+    var m = _orderMoney(o, true);   // v5.1：自打订单金额不计入收益
+    a.paid += m.paid; a.receivable += m.receivable; a.free += m.free; a.pendingFiles += m.pendingFiles;
+    if (m.paid > 0) a.paidOrders++;
+    a.allFiles += (o.files || []).length;
+    a.pages += o.total_page_count || 0;
+    if (o.is_admin_print) a.selfOrders++;
+    if (o.auto_print) a.autoPrint++;
+    if (o.schedule_mode && o.schedule_mode !== 'now') a.scheduled++;
+    if (o.delivery_enabled) a.delivery++;
+    if (o.urgency && o.urgency !== '低') a.urgency++;
+    if (o.cover_page) a.cover++;
+  });
+  return a;
+}
+/* 收益构成（按来源，全量订单口径）：返回「元」，结构与后端 revenue_summary 一致。
+   v5.1：自打订单金额不计入；金额按文件状态 paid（sent）计算，与 KPI 同口径。 */
+function _sourceAgg(orders) {
+  var rs = { total: 0, wechat: 0, app: 0, local: 0, wechat_orders: 0, app_orders: 0, local_orders: 0,
+             wechat_files: 0, app_files: 0, local_files: 0, wechat_pages: 0, app_pages: 0, local_pages: 0, total_pages: 0 };
+  (orders || []).forEach(function (o) {
+    var src = o.source || 'wechat';
+    if (src !== 'wechat' && src !== 'app' && src !== 'local') src = 'wechat';
+    rs[src + '_orders']++;
+    var nf = (o.files || []).length;
+    rs[src + '_files'] += nf;
+    var pg = o.total_page_count || 0;
+    rs[src + '_pages'] += pg;
+    rs.total_pages += pg;
+    var m = _orderMoney(o, true);
+    var yuan = Number((m.paid / 100).toFixed(2));
+    rs.total += yuan;
+    rs[src] += yuan;
+  });
+  return rs;
+}
+/* 已入账总额（分）：自打订单不计入，供环比徽标与 KPI 同口径 */
+function _paidTotalCents(orders) {
+  var t = 0;
+  (orders || []).forEach(function (o) { t += _orderMoney(o, true).paid; });
+  return t;
+}
+/* 成员维度聚合（按 openid），与 _cloudAgg 同一金额口径（v5.1：自打订单金额不计入） */
+function _userAgg(orders) {
+  var map = {};
+  orders.forEach(function (o) {
+    var key = o.openid || '';
+    var u = map[key];
+    if (!u) u = map[key] = { openid: key, nickname: o.nickname || '', avatar_url: o.avatar_url || '',
+                             orders: 0, paid: 0, receivable: 0, wechat: 0, app: 0, files: 0, pages: 0, free: 0, paidOrders: 0 };
+    u.orders++;
+    if (o.source === 'wechat') u.wechat++;
+    else if (o.source === 'app') u.app++;
+    var m = _orderMoney(o, true);
+    u.paid += m.paid; u.receivable += m.receivable; u.free += m.free;
+    if (m.paid > 0) u.paidOrders++;
+    u.files += (o.files || []).length;
+    u.pages += o.total_page_count || 0;
+  });
+  var arr = Object.keys(map).map(function (k) { return map[k]; });
+  arr.forEach(function (u) {
+    var mo = memberOfOpenid(u.openid);
+    u._memberName = mo ? mo.name : null;
+    u._memberColor = mo ? mo.color : null;
+  });
+  arr.sort(function (a, b) { return b.paid - a.paid; });
+  return arr;
+}
+/* 订单类型标签（自打/接单 + 附加服务 + 免费） */
+function _orderTypeTags(o, money) {
+  var t = '';
+  t += o.is_admin_print
+    ? '<span class="tag b" title="管理员自行打印的订单">👤自打</span> '
+    : '<span class="tag g" title="顾客下单，接单打印">🤝接单</span> ';
+  if (o.auto_print) t += '<span class="tag p" title="无障碍打印（自动打印）">⚡自动</span> ';
+  if (o.schedule_mode && o.schedule_mode !== 'now') t += '<span class="tag y" title="预约 ' + esc(o.scheduled_at || '') + ' 打印">⏰预约</span> ';
+  if (o.urgency && o.urgency !== '低') t += '<span class="tag r" title="加急费 ' + RMB(parseCents(o.urgency_price || 0)) + '">⚡' + esc(o.urgency) + '</span> ';
+  if (o.delivery_enabled) t += '<span class="tag y" title="派送费 ' + (o.delivery_percentage || 0) + '%">🚚派送</span> ';
+  if (o.cover_page) t += '<span class="tag p" title="封面费 ' + RMB(parseCents(o.cover_page_price || 0)) + '">📄封面</span> ';
+  if (money.free > 0) t += '<span class="tag g" title="含 ' + money.free + ' 个免费文件">🆓免费</span> ';
+  return t;
+}
+function _orderAddr(o) {
+  var parts = [];
+  if (o.delivery_location) parts.push('派送：' + o.delivery_location);
+  if (o.pickup_address) parts.push('取件：' + o.pickup_address);
+  return parts.join(' ／ ');
+}
 function _toggleOrderExpand(oid) {
   // 展开/收起仅切换 CSS class（grid 高度过渡），不重绘整表，避免已展开订单重播动画
   var key = String(oid);
@@ -1085,6 +1952,167 @@ function _toggleOrderExpand(oid) {
   else _cloudExpanded[key] = true;
   orderRow.classList.toggle('expanded', !isOpen);
   if (expandRow) expandRow.classList.toggle('open', !isOpen);
+}
+
+/* ==================== v5.16：订单明细分页（参考小程序/APP 打印任务分页） ====================
+   分页为纯前端切片（数据已整体缓存在 _cloudData.orders）；
+   翻页/改每页条数/状态筛选只局部重建 #cloud-orders 区块，不影响其他图表 */
+/* 云端订单按成员/来源过滤（renderCloud 与订单明细局部刷新共用） */
+function _cloudFilteredOrders() {
+  var orders = _cloudData ? (_cloudData.orders || []) : [];
+  if (_cloudUserFilter !== 'all') orders = orders.filter(function (o) { return o.openid === _cloudUserFilter; });
+  if (_cloudSourceFilter !== 'all') orders = orders.filter(function (o) { return o.source === _cloudSourceFilter; });
+  return orders;
+}
+/* 当前订单列表：成员/来源过滤后再按状态筛选（与 renderCloud 原逻辑一致） */
+function _currentOrderList() {
+  var list = _cloudFilteredOrders();
+  if (_cloudStatusFilter === 'active') list = list.filter(function (o) { return !!_ACTIVE_STATUS[o.status]; });
+  else if (_cloudStatusFilter === 'abnormal') list = list.filter(function (o) { return !!_ABNORMAL_STATUS[o.status]; });
+  else if (_cloudStatusFilter !== 'all') list = list.filter(function (o) { return o.status === _cloudStatusFilter; });
+  return list;
+}
+/* 页码数组（带省略号，参考小程序 getPageNumbers） */
+function _ordersPageNumbers(current, total) {
+  if (total <= 1) return [1];
+  var pages = [1];
+  if (current > 3) pages.push('...');
+  for (var i = Math.max(2, current - 1); i <= Math.min(total - 1, current + 1); i++) pages.push(i);
+  if (current < total - 2) pages.push('...');
+  pages.push(total);
+  return pages;
+}
+/* 分页条 HTML（top=带每页条数选择器；bottom=仅页码，仅多页时输出） */
+function _ordersPagerHTML(cur, totalPages, total, top) {
+  var h = '<div class="orders-pager">';
+  h += '<span class="pager-info">共 ' + total + ' 条 · 第 ' + cur + ' / ' + totalPages + ' 页</span>';
+  h += '<span class="pager-btns">';
+  h += '<button type="button" class="page-btn"' + (cur <= 1 ? ' disabled' : '') + ' onclick="onOrdersPrev()">‹</button>';
+  _ordersPageNumbers(cur, totalPages).forEach(function (n) {
+    if (n === '...') h += '<span class="page-ellipsis">…</span>';
+    else h += '<button type="button" class="page-btn' + (n === cur ? ' on' : '') + '" onclick="onOrdersPage(' + n + ')">' + n + '</button>';
+  });
+  h += '<button type="button" class="page-btn"' + (cur >= totalPages ? ' disabled' : '') + ' onclick="onOrdersNext()">›</button>';
+  h += '</span>';
+  if (top) {
+    h += '<label class="pager-size">每页 <select onchange="onOrdersPerPage(this.value)">';
+    _ORDERS_PAGE_OPTIONS.forEach(function (n) {
+      h += '<option value="' + n + '"' + (n === _ordersPerPage ? ' selected' : '') + '>' + n + ' 条</option>';
+    });
+    h += '</select></label>';
+  }
+  h += '</div>';
+  return h;
+}
+/* 订单明细完整区块（h2 + 状态筛选 + 分页 + 表格），renderCloud 与局部刷新共用 */
+function _renderOrderListHTML() {
+  var listOrders = _currentOrderList();
+  var total = listOrders.length;
+  var totalPages = Math.max(1, Math.ceil(total / _ordersPerPage));
+  if (_ordersPage > totalPages) _ordersPage = totalPages;
+  if (_ordersPage < 1) _ordersPage = 1;
+  var start = (_ordersPage - 1) * _ordersPerPage;
+  var pageOrders = listOrders.slice(start, start + _ordersPerPage);
+  var statusCount = _countByStatus(_cloudFilteredOrders());   // 筛选下拉计数（状态过滤前）
+
+  var h = '<div class="section" id="cloud-orders"><h2>📋 订单明细 <span class="hint">' + total + ' 条，时间倒序 · 自打订单金额仅展示、不计入收益' + (_cloudSourceFilter !== 'all' ? ' · 来源: ' + (_cloudSourceFilter === 'wechat' ? '小程序' : (_cloudSourceFilter === 'app' ? '📱 APP' : '🖨 本地')) : '') + '</span>';
+  h += '<span style="margin-left:auto"><select onchange="onCloudStatusFilter(this.value)" style="padding:6px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.8rem">';
+  h += '<option value="all"' + (_cloudStatusFilter === 'all' ? ' selected' : '') + '>全部状态</option>';
+  h += '<option value="active"' + (_cloudStatusFilter === 'active' ? ' selected' : '') + '>🟢 进行中/待处理</option>';
+  h += '<option value="abnormal"' + (_cloudStatusFilter === 'abnormal' ? ' selected' : '') + '>🔴 异常</option>';
+  Object.keys(statusCount).sort(function (a, b) { return statusCount[b] - statusCount[a]; }).forEach(function (s) {
+    h += '<option value="' + esc(s) + '"' + (_cloudStatusFilter === s ? ' selected' : '') + '>' + esc(statusLabel(s)) + ' (' + statusCount[s] + ')</option>';
+  });
+  h += '</select></span></h2>';
+  h += _ordersPagerHTML(_ordersPage, totalPages, total, true);
+  if (!pageOrders.length) {
+    h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
+  } else {
+    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:64px">来源</th><th style="width:104px">用户</th><th style="width:84px">状态</th><th style="width:88px">金额</th><th style="width:58px">文件</th><th style="width:96px">页数</th><th style="width:270px">类型</th><th style="width:132px">时间</th></tr></thead><tbody>';
+    pageOrders.forEach(function (o) {
+      var isExp = !!_cloudExpanded[o.order_id];
+      var srcTxt = o.source === 'app' ? '📱 APP' : (o.source === 'local' ? '🖨 本地' : '小程序');
+      // 本地订单已归属到具体管理员：用户列显示归属人（owner_name），不再笼统显示"本地任务"
+      var mo = o.openid === 'local'
+        ? (o.owner_name ? { name: o.owner_name } : { name: '本地任务' })
+        : memberOfOpenid(o.openid);
+      var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
+      var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
+      var revColor = sanitizeColor(_statusColor(o.status));   // 金额配色跟随订单状态
+      var money = _orderMoney(o);
+      var orderRev = money.paid + money.receivable;
+      var addr = _orderAddr(o);
+      h += '<tr class="order-row st-bar' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '" style="--row-stc:' + _statusColor(o.status) + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
+      h += '<td><span class="expand-icon">▶</span></td>';
+      h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
+      h += '<td style="white-space:nowrap"><span class="tag b">' + srcTxt + '</span></td>';
+      h += '<td class="l ell" title="' + esc(who) + (addr ? ' · ' + esc(addr) : '') + '">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
+      h += '<td style="white-space:nowrap"><span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span></td>';
+      h += '<td style="font-weight:700;color:' + revColor + '" title="应结 ' + RMB(orderRev) + ' · 已入账 ' + RMB(money.paid) + (money.receivable > 0 ? ' · 应收未收 ' + RMB(money.receivable) : '') + '">' + RMB(orderRev) + '</td>';
+      h += '<td>' + o.files_count + '</td>';
+      h += '<td>' + (o.total_page_count || 0) + '</td>';
+      h += '<td style="font-size:.76rem;line-height:1.9" title="' + esc(addr) + '">' + _orderTypeTags(o, money) + '</td>';
+      h += '<td class="ell" style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 16)) + '</td>';
+      h += '</tr>';
+      if (o.files && o.files.length) {
+        h += '<tr class="file-expand' + (isExp ? ' open' : '') + '" data-suborder="' + oidS + '"><td colspan="10" class="file-expand-cell"><div class="file-expand-body"><div class="file-expand-inner">';
+        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>单/双面</span><span>状态</span></div>';
+        o.files.forEach(function (f) {
+          h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + '">';
+          h += '<span class="fn">📄 ' + esc(f.file_name) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
+          h += '<span style="font-weight:700;color:' + revColor + '">' + RMB(parseCents(f.total_price)) + '</span>';
+          h += '<span>' + f.copies + '份</span>';
+          h += '<span>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</span>';
+          h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
+          h += '<span><span class="tag ' + esc(statusClass(f.status)) + '">' + esc(statusLabel(f.status)) + '</span></span>';
+          h += '</div>';
+        });
+        h += '</div></div></td></tr>';
+      }
+    });
+    h += '</tbody></table></div>';
+  }
+  if (totalPages > 1) h += _ordersPagerHTML(_ordersPage, totalPages, total, false);
+  h += '</div>';
+  return h;
+}
+/* 局部刷新订单明细区块（翻页/改每页条数/状态筛选），不影响其他图表 */
+function _rerenderOrdersOnly(scroll) {
+  var el = document.getElementById('cloud-orders');
+  if (!el || !_cloudData) return;
+  el.outerHTML = _renderOrderListHTML();
+  if (scroll) {
+    var target = document.getElementById('cloud-orders');
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+}
+/* 分页事件（参考小程序 onPageChange/onPrevPage/onNextPage/onSelectPageSize） */
+function onOrdersPage(p) {
+  p = parseInt(p, 10);
+  var list = _currentOrderList();
+  var totalPages = Math.max(1, Math.ceil(list.length / _ordersPerPage));
+  if (isNaN(p) || p < 1 || p > totalPages || p === _ordersPage) return;
+  _ordersPage = p;
+  _rerenderOrdersOnly(true);
+}
+function onOrdersPrev() {
+  if (_ordersPage <= 1) return;
+  _ordersPage--;
+  _rerenderOrdersOnly(true);
+}
+function onOrdersNext() {
+  var list = _currentOrderList();
+  var totalPages = Math.max(1, Math.ceil(list.length / _ordersPerPage));
+  if (_ordersPage >= totalPages) return;
+  _ordersPage++;
+  _rerenderOrdersOnly(true);
+}
+function onOrdersPerPage(v) {
+  var n = parseInt(v, 10);
+  if (isNaN(n) || n === _ordersPerPage) return;
+  _ordersPerPage = n;
+  _ordersPage = 1;
+  _rerenderOrdersOnly(true);
 }
 
 /* 成员映射 */
@@ -1131,7 +2159,7 @@ function _renderStatusDonut(canvasId, orderStatusCount) {
       responsive: true, maintainAspectRatio: false, cutout: '58%',
       layout: { padding: 24 },
       plugins: {
-        legend: { position: 'right', labels: { font: { size: 11 }, padding: 10, boxWidth: 12, usePointStyle: true, color: chartTextColor() } },
+        legend: { position: 'right', onClick: function () {}, labels: { font: { size: 11 }, padding: 10, boxWidth: 12, usePointStyle: true, color: chartTextColor() } },
         tooltip: { callbacks: { label: function (c) { var pct = total > 0 ? (c.parsed / total * 100).toFixed(1) : 0; return c.label + ': ' + c.parsed + ' (' + pct + '%)'; } } }
       },
       animation: { animateRotate: true, duration: 1000, easing: 'easeOutQuart' }
@@ -1147,12 +2175,16 @@ function _renderSourceDonut(canvasId, rs) {
     { key: 'app', label: '📱 APP', color: '#4F6EF7' },
     { key: 'local', label: '🖨 本地', color: '#34A853' },
   ];
-  var labels = segs.map(function (s) { return s.label + ' ' + RMB(parseCents(rs[s.key] || 0)); });
-  var data = segs.map(function (s) {
-    var v = (rs[s.key] || 0) > 0 ? (rs[s.key] || 0) : (rs[s.key + '_orders'] || 0);
-    return Math.max(v, 0.01);
+  // v4.0：统一按「已入账金额」口径绘图，收益为 0 的来源不画段（不再用订单数冒充金额）
+  var labels = [], data = [], colors = [];
+  segs.forEach(function (s) {
+    var v = parseCents(rs[s.key] || 0);
+    if (v <= 0) return;
+    labels.push(s.label + ' ' + RMB(v));
+    data.push(v);
+    colors.push(s.color);
   });
-  var colors = segs.map(function (s) { return s.color; });
+  if (!data.length) return;   // 本月无已入账收益，不画图（页面上方 KPI 已说明）
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'doughnut',
     data: { labels: labels, datasets: [{ data: data, backgroundColor: colors, hoverBackgroundColor: colors.map(function (c) { return _mixToWhite(c, 0.15); }), hoverBorderColor: 'transparent', borderWidth: 2, borderColor: 'transparent', hoverOffset: 12 }] },
@@ -1160,7 +2192,7 @@ function _renderSourceDonut(canvasId, rs) {
       responsive: true, maintainAspectRatio: false, cutout: '55%',
       layout: { padding: 24 },
       plugins: {
-        legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } },
+        legend: { position: 'bottom', onClick: function () {}, labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } },
         tooltip: { callbacks: { label: function (c) {
           var s = segs[c.dataIndex];
           var detail = '订单 ' + (rs[s.key + '_orders'] || 0) + ' · 文件 ' + (rs[s.key + '_files'] || 0) + ' · ' + (rs[s.key + '_pages'] || 0) + '页';
@@ -1186,10 +2218,27 @@ function _mixToWhite(c, amt) {
   b = Math.round(b + (255 - b) * amt);
   return 'rgb(' + r + ',' + g + ',' + b + ')';
 }
+/* 颜色向黑色混合（v5.11：浅色主题悬停时柱体变暗） */
+function _mixToBlack(c, amt) {
+  var m = String(c).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  var r, g, b;
+  if (m) { r = +m[1]; g = +m[2]; b = +m[3]; }
+  else {
+    var h = String(c).replace('#', '');
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    r = parseInt(h.slice(0, 2), 16); g = parseInt(h.slice(2, 4), 16); b = parseInt(h.slice(4, 6), 16);
+  }
+  r = Math.round(r * (1 - amt));
+  g = Math.round(g * (1 - amt));
+  b = Math.round(b * (1 - amt));
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
 function _renderUserBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
   var ctx = canvas.getContext('2d');
+  // 注意：金额字段（revenue/paid）传入的数据必须是「元」（Chart 直接画数值），
+  // tooltip 用 parseCents 还原为「分」显示 ¥xx.xx；若传整数分会把金额放大 100 倍。
   var sorted = byUser.slice().sort(function (a, b) { return b[field] - a[field]; });
   var labels = sorted.map(function (u) { return u._memberName || u.nickname || (u.openid || '').substring(0, 8); });
   var values = sorted.map(function (u) { return u[field]; });
@@ -1203,11 +2252,11 @@ function _renderUserBar(canvasId, byUser, field, label, fmtLabel, barColorFn) {
       responsive: true, maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
-        tooltip: { callbacks: { label: function (c2) { return label + ': ' + (field === 'revenue' ? RMB(parseCents(c2.parsed.y)) : c2.parsed.y + ' 单'); } } }
+        tooltip: { callbacks: { label: function (c2) { return label + ': ' + (field === 'revenue' || field === 'paid' ? RMB(parseCents(c2.parsed.y)) : c2.parsed.y + ' 单'); } } }
       },
       scales: {
-        y: { beginAtZero: true, max: maxVal * 1.25, grid: { color: 'rgba(120,130,160,.12)' } },
-        x: { grid: { display: false }, ticks: { maxRotation: 30, font: { size: 10 } } }
+        y: { beginAtZero: true, max: maxVal * 1.25, grid: { color: 'rgba(120,130,160,.12)' }, ticks: { color: chartTextColor() } },
+        x: { grid: { display: false }, ticks: { color: chartTextColor(), maxRotation: 30, font: { size: 10 } } }
       },
       animation: { duration: 1000, easing: 'easeOutQuart' }
     }
@@ -1220,21 +2269,21 @@ function _renderClientStackedBar(canvasId, byUser) {
   var ctx = canvas.getContext('2d');
   // 仅统计有下单记录的成员（排除本地任务伪行）
   var users = (byUser || []).filter(function (u) {
-    return u.openid !== 'local' && ((u.wechat_orders || 0) + (u.app_orders || 0)) > 0;
+    return u.openid !== 'local' && ((u.wechat_orders || u.wechat || 0) + (u.app_orders || u.app || 0)) > 0;
   });
   if (!users.length) return;
   users = users.slice().sort(function (a, b) {
-    return ((b.wechat_orders || 0) + (b.app_orders || 0)) - ((a.wechat_orders || 0) + (a.app_orders || 0));
+    return ((b.wechat_orders || b.wechat || 0) + (b.app_orders || b.app || 0)) - ((a.wechat_orders || a.wechat || 0) + (a.app_orders || a.app || 0));
   });
   var MAX_BARS = 12;
   var labels = [], wechatData = [], appData = [];
   function pushBar(name, w, a) { labels.push(name); wechatData.push(w); appData.push(a); }
   users.slice(0, MAX_BARS - 1).forEach(function (u) {
-    pushBar(u._memberName || u.nickname || (u.openid || '').substring(0, 8), u.wechat_orders || 0, u.app_orders || 0);
+    pushBar(u._memberName || u.nickname || (u.openid || '').substring(0, 8), u.wechat_orders || u.wechat || 0, u.app_orders || u.app || 0);
   });
   if (users.length > MAX_BARS - 1) {
     var restW = 0, restA = 0;
-    users.slice(MAX_BARS - 1).forEach(function (u) { restW += (u.wechat_orders || 0); restA += (u.app_orders || 0); });
+    users.slice(MAX_BARS - 1).forEach(function (u) { restW += (u.wechat_orders || u.wechat || 0); restA += (u.app_orders || u.app || 0); });
     pushBar('其他', restW, restA);
   }
   var totals = labels.map(function (_, i) { return wechatData[i] + appData[i]; });
@@ -1252,7 +2301,7 @@ function _renderClientStackedBar(canvasId, byUser) {
       indexAxis: 'y',
       responsive: true, maintainAspectRatio: false,
       plugins: {
-        legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, usePointStyle: true, color: chartTextColor() } },
+        legend: { position: 'bottom', onClick: function () {}, labels: { font: { size: 11 }, padding: 8, boxWidth: 12, usePointStyle: true, color: chartTextColor() } },
         tooltip: {
           callbacks: {
             label: function (c) {
@@ -1269,38 +2318,83 @@ function _renderClientStackedBar(canvasId, byUser) {
         },
       },
       scales: {
-        x: { stacked: true, beginAtZero: true, max: maxTotal * 1.2, grid: { color: 'rgba(120,130,160,.12)' }, ticks: { precision: 0 } },
-        y: { stacked: true, grid: { display: false }, ticks: { font: { size: 10 } } },
+        x: { stacked: true, beginAtZero: true, max: maxTotal * 1.2, grid: { color: 'rgba(120,130,160,.12)' }, ticks: { color: chartTextColor(), precision: 0 } },
+        y: { stacked: true, grid: { display: false }, ticks: { color: chartTextColor(), font: { size: 10 } } },
       },
       animation: { duration: 1000, easing: 'easeOutQuart' },
     },
   });
 }
-function _renderDailyTrend(canvasId, trend) {
+function _renderDailyTrend(canvasId, trend, metric) {
   var canvas = document.getElementById(canvasId);
-  if (!canvas) return;
+  if (!canvas || !trend.length) return;
   var ctx = canvas.getContext('2d');
-  if (trend.length === 0) return;
-  var labels = trend.map(function (t) { return t.date; });
-  var revData = trend.map(function (t) { return Math.round(t.revenue * 100) / 100; });
-  var countData = trend.map(function (t) { return t.count; });
+  /* v5.12：平滑折线图 —— 面积不透明实色填充、平时无数据点（不突出峰值点），悬停时显示选中点；
+            图例仅作标识，点击不切换数据集显隐 */
+  var tc = _TREND_COLORS[metric] || _TREND_COLORS.revenue;
+  var mainColor = tc.main;
+  var lineData = trend.map(function (t) {
+    return metric === 'revenue' ? Math.round((t.revenue || 0) * 100) / 100
+         : metric === 'count' ? (t.count || 0)
+         : metric === 'pages' ? (t.pages || 0) : (t.files || 0);
+  });
+  var radii = lineData.map(function () { return 0; });          // 平时不显示数据点
+  var hoverRadii = lineData.map(function () { return 5; });     // 悬停选中点
+  var datasets = [{
+    type: 'line', label: tc.label, data: lineData,
+    borderColor: mainColor, backgroundColor: mainColor, fill: true, tension: .35,   // v5.12：面积不透明实色填充（与柱体一致）
+    pointRadius: radii, pointHoverRadius: hoverRadii,
+    pointHoverBackgroundColor: mainColor, pointHoverBorderColor: '#ffffff', pointHoverBorderWidth: 2,
+    borderWidth: 2.5, yAxisID: 'y'
+  }];
   _cloudCharts[canvasId] = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: labels,
-      datasets: [
-        { label: '收益', data: revData, borderColor: '#4f6ef7', backgroundColor: 'rgba(79,110,247,.12)', fill: true, tension: .35, pointRadius: 4, pointHoverRadius: 7, yAxisID: 'y', borderWidth: 2.5 },
-        { label: '订单数', data: countData, borderColor: '#16a34a', backgroundColor: 'rgba(22,163,74,.08)', fill: true, tension: .35, pointRadius: 3, pointHoverRadius: 6, yAxisID: 'y1', borderWidth: 2, borderDash: [5, 3] }
-      ]
-    },
+    data: { labels: trend.map(function (t) { return t.label || _shortDay(t.date); }), datasets: datasets },
     options: {
       responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
-      plugins: { legend: { position: 'top', labels: { font: { size: 11 }, boxWidth: 14, padding: 10, usePointStyle: true, color: chartTextColor() } } },
+      plugins: { legend: { position: 'top', onClick: function () {}, labels: { font: { size: 11 }, boxWidth: 14, padding: 10, usePointStyle: true, color: chartTextColor() } } },
       scales: {
-        y: { position: 'left', beginAtZero: true, title: { display: true, text: '收益 (元)', font: { size: 10 } }, grid: { color: 'rgba(120,130,160,.1)' } },
-        y1: { position: 'right', beginAtZero: true, title: { display: true, text: '订单数', font: { size: 10 } }, grid: { display: false } },
-        x: { grid: { display: false }, ticks: { maxTicksLimit: 14, font: { size: 9 } } }
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: tc.label, font: { size: 10 }, color: chartTextColor() }, ticks: { color: chartTextColor() }, grid: { color: 'rgba(120,130,160,.1)' } },
+        x: { grid: { display: false }, ticks: { color: chartTextColor(), maxTicksLimit: 14, font: { size: 9 } } }
+      },
+      animation: { duration: 1200, easing: 'easeOutQuart' }
+    }
+  });
+}
+/* 通用柱状图（v5.9 起用于 ≤60 天的日粒度：每天一柱）：柱 = 当前指标
+   v5.10：所有柱统一指标色，不高亮峰值柱
+   v5.11：柱体不透明实色；悬停时深色模式加亮、浅色模式变暗（scriptable 动态读取当前主题） */
+function _renderBucketTrend(canvasId, points, metric, granularity) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas || !points || !points.length) return;
+  var ctx = canvas.getContext('2d');
+  var tc = _TREND_COLORS[metric] || _TREND_COLORS.revenue;
+  var mainColor = tc.main;
+  var lineData = points.map(function (p) {
+    return metric === 'revenue' ? Math.round((p.revenue || 0) * 100) / 100
+         : metric === 'count' ? (p.count || 0)
+         : metric === 'pages' ? (p.pages || 0) : (p.files || 0);
+  });
+  /* 柱体统一不透明实色 */
+  var barColors = lineData.map(function () { return mainColor; });
+  var datasets = [{
+    type: 'bar', label: tc.label, data: lineData,
+    backgroundColor: barColors,
+    /* hover：深色主题向白混合（加亮），浅色主题向黑混合（变暗）—— scriptable 每次渲染时求值，主题切换后自动正确 */
+    hoverBackgroundColor: function () {
+      return theme === 'dark' ? _mixToWhite(mainColor, 0.25) : _mixToBlack(mainColor, 0.15);
+    },
+    borderRadius: 5, yAxisID: 'y'
+  }];
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    data: { labels: points.map(function (p) { return p.label || _shortDay(p.date); }), datasets: datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { position: 'top', onClick: function () {}, labels: { font: { size: 11 }, boxWidth: 14, padding: 10, usePointStyle: true, color: chartTextColor() } } },
+      scales: {
+        y: { position: 'left', beginAtZero: true, title: { display: true, text: tc.label, font: { size: 10 }, color: chartTextColor() }, ticks: { color: chartTextColor() }, grid: { color: 'rgba(120,130,160,.1)' } },
+        x: { grid: { display: false }, ticks: { color: chartTextColor(), maxTicksLimit: 24, maxRotation: 60, minRotation: 0, font: { size: 9 } } }
       },
       animation: { duration: 1200, easing: 'easeOutQuart' }
     }
@@ -1312,7 +2406,7 @@ function _computeDailyTrend(orders) {
     var day = _fmtDate(o.created_at);
     if (!map[day]) map[day] = { date: day, count: 0, revenue: 0, pages: 0, files: 0 };
     map[day].count++;
-    map[day].revenue += o.revenue || 0;
+    map[day].revenue += o.is_admin_print ? 0 : (o.revenue || 0);   // v5.1：自打订单不计收益
     map[day].pages += o.total_page_count || 0;
     map[day].files += o.files_count || 0;
   });
@@ -1621,12 +2715,24 @@ function renderCloud() {
   if (!_cloudMonth || keys.length && !keys.includes(_cloudMonth)) _cloudMonth = keys[0] || currentMonthKey();
   if (!_cloudMonth) _cloudMonth = currentMonthKey();
 
-  // 筛选条：云端月份（切换即自动查询）+ 手动刷新
+  // 筛选条：云端月份（切换即自动查询）+ 成员/来源过滤 + 最后同步时间 + 手动刷新
   var h = '<div class="filter-bar">';
   h += '<div class="f-item"><label>📅 云端月份</label><select onchange="onCloudMonthChange(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.9rem">';
   keys.forEach(function (k) { h += '<option value="' + k + '"' + (k === _cloudMonth ? ' selected' : '') + '>' + labelOf(k) + '</option>'; });
   h += '</select></div>';
-  h += '<div class="f-item" style="margin-left:auto"><button class="btn" onclick="fetchCloudData(_cloudMonth)">🔄 刷新</button></div>';
+  h += '<div class="f-item"><label>👤 按成员</label><select onchange="onCloudUserFilter(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.88rem"><option value="all">全部</option>';
+  var seen = {};
+  (_cloudData && _cloudData.orders || []).forEach(function (o) { if (o.openid && o.openid !== 'local') { var mo = memberOfOpenid(o.openid); var k = mo ? mo.name : (o.nickname || o.openid); if (!seen[k]) { seen[k] = true; h += '<option value="' + esc(o.openid) + '"' + (_cloudUserFilter === o.openid ? ' selected' : '') + '>' + esc(k) + '</option>'; } } });
+  h += '</select></div>';
+  h += '<div class="f-item"><label>📦 按来源</label><select onchange="onCloudSourceFilter(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.88rem">';
+  h += '<option value="all"' + (_cloudSourceFilter === 'all' ? ' selected' : '') + '>全部来源</option>';
+  h += '<option value="wechat"' + (_cloudSourceFilter === 'wechat' ? ' selected' : '') + '>小程序</option>';
+  h += '<option value="app"' + (_cloudSourceFilter === 'app' ? ' selected' : '') + '>📱 APP</option>';
+  h += '<option value="local"' + (_cloudSourceFilter === 'local' ? ' selected' : '') + '>🖨 本地</option>';
+  h += '</select></div>';
+  h += '<div class="f-item" style="margin-left:auto;text-align:right"><label>&nbsp;</label><div style="display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap">';
+  if (_cloudDataFetchedAt) h += '<span style="font-size:.76rem;color:var(--muted)">☁ 最后同步 <b style="color:var(--text)">' + _cloudDataFetchedAt + '</b></span>';
+  h += '<button class="btn" onclick="fetchCloudData(_cloudMonth)">🔄 刷新</button></div></div>';
   h += '</div>';
 
   if (_cloudLoading) {
@@ -1651,108 +2757,211 @@ function renderCloud() {
     return;
   }
 
-  var rs = _cloudData.revenue_summary;
+  // 收益构成：v5.1 起由前端按 orders 聚合（排除自打），与 KPI 同口径，不再依赖后端 revenue_summary
   var orders = _cloudData.orders || [];
-  var byUser = (_cloudData.by_user || []).map(function (u) {
-    var mo = memberOfOpenid(u.openid);
-    u._memberName = mo ? mo.name : null;
-    u._memberColor = mo ? mo.color : null;
-    return u;
-  });
-  // 本地任务行
-  var localOrders = orders.filter(function (o) { return o.source === 'local'; });
-  if (localOrders.length) {
-    var loc = { openid: 'local', nickname: '本地订单', avatar_url: '', revenue: 0, order_count: localOrders.length, file_count: 0, total_pages: 0, _memberName: '本地任务', _memberColor: '#548235' };
-    localOrders.forEach(function (o) { loc.revenue += o.revenue || 0; loc.file_count += o.files_count || 0; loc.total_pages += o.total_page_count || 0; });
-    loc.revenue = Math.round(loc.revenue * 100) / 100;
-    byUser.push(loc);
-  }
+  var rs = _sourceAgg(orders);
+  // 注：本地任务不再注入"本地任务"伪行 —— 本地订单已归属到具体管理员（见「管理员订单统计」），
+  // 不再存在未知归属的本地订单。
 
-  var filteredOrders = orders;
-  if (_cloudUserFilter !== 'all') filteredOrders = filteredOrders.filter(function (o) { return o.openid === _cloudUserFilter; });
-  if (_cloudSourceFilter !== 'all') {
-    filteredOrders = filteredOrders.filter(function (o) { return o.source === _cloudSourceFilter; });
-    byUser = byUser.filter(function (u) { return _cloudSourceFilter === 'local' ? u.openid === 'local' : u.openid !== 'local'; });
-  }
-  var dailyTrend = _computeDailyTrend(filteredOrders);
+  var filteredOrders = _cloudFilteredOrders();   // v5.16：成员/来源过滤抽为共用函数（订单明细分页同源）
+  // v4.0：统一口径聚合（已入账 / 应收未收 / 免费 / 服务维度），展示一律用过滤后的 fagg / userAgg
+  var fagg = _cloudAgg(filteredOrders);   // 过滤后（KPI / 图表 / 明细）
+  var userAgg = _userAgg(filteredOrders); // 成员维度（过滤后）
   var orderStatusCount = _countByStatus(filteredOrders);
+  var st = orderStatusCount;
+  var sg = _statusGroups(st);                       // 完成/进行中/异常/取消 分组
+  var recon = _reconcileCloud(_cloudMonth, orders); // 对账数据（全量，不受过滤影响）
+  var isCurrentMonth = _cloudMonth === currentMonthKey();
 
-  // KPI
-  h += '<div class="kpi-grid">';
-  h += '<div class="kpi-card c-green"><div class="kpi-ico">💰</div><div class="num" data-count="' + parseCents(rs.total) + '" data-prefix="¥">0</div><div class="lbl">总盈利（已完成）</div><div class="sub">' + labelOf(_cloudMonth) + '</div></div>';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📦</div><div class="num">' + ((rs.wechat_orders || 0) + (rs.app_orders || 0) + (rs.local_orders || 0)) + '</div><div class="lbl">总订单数</div><div class="sub">小程序 ' + (rs.wechat_orders || 0) + ' · APP ' + (rs.app_orders || 0) + ' · 🖨 ' + (rs.local_orders || 0) + '</div></div>';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📄</div><div class="num">' + ((rs.wechat_files || 0) + (rs.app_files || 0) + (rs.local_files || 0)) + '</div><div class="lbl">总文件数</div><div class="sub">小程序 ' + (rs.wechat_files || 0) + ' · APP ' + (rs.app_files || 0) + ' · 🖨 ' + (rs.local_files || 0) + '</div></div>';
-  h += '<div class="kpi-card c-orange"><div class="kpi-ico">📃</div><div class="num">' + (rs.total_pages || 0) + '</div><div class="lbl">总页数</div></div>';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">📊</div><div class="num">' + RMB(parseCents(orders.length ? (rs.total / orders.length) : 0)) + '</div><div class="lbl">均单收益</div></div>';
+  // 今日速览（仅当月有意义；v5.1：自打订单不计入收益，订单数同理只算收益订单）
+  var todayPaid = 0, todayOrders = 0;
+  if (isCurrentMonth) {
+    var t = todayStr();
+    filteredOrders.forEach(function (o) {
+      if (_fmtDate(o.created_at) === t) {
+        if (o.is_admin_print) return;
+        todayOrders++;
+        todayPaid += _orderMoney(o, true).paid;
+      }
+    });
+  }
+  // 文件级已完成数（漏斗用）
+  var sentFiles = 0;
+  filteredOrders.forEach(function (o) { (o.files || []).forEach(function (f) { if (f.status === 'sent') sentFiles++; }); });
+
+  /* ---- v5：对账/异常提示条（置顶，有差额或未绑定用户时才渲染） ---- */
+  if (recon.hasDiff || recon.unboundPaid > 0) {
+    var bt = '';
+    if (recon.hasDiff) bt = '本月云端已入账比手动代收<b>' + (recon.diffTotal >= 0 ? '多' : '少') + ' ' + RMB(Math.abs(recon.diffTotal)) + '</b>';
+    if (recon.unboundPaid > 0) bt += (bt ? '，另有 ' : '') + '<b>' + recon.unboundN + ' 名未绑定用户</b>合计 <b>' + RMB(recon.unboundPaid) + '</b> 未计入对账';
+    h += '<div class="alert-banner' + (recon.hasDiff ? '' : ' danger') + '"><span class="ico">⚠️</span>';
+    h += '<div class="msg">' + bt + '<span class="sub">差额 = 云端已入账 − 手动代收录入 · 点击查看下方对账明细与成员绑定入口</span></div>';
+    h += '<button onclick="document.getElementById(\'cloud-recon\').scrollIntoView({behavior:\'smooth\'})">查看详情</button></div>';
+  }
+
+  /* ---- v5：Hero KPI（4 卡：迷你趋势线 / 环比徽标 / 半环仪表盘） ---- */
+  h += '<div class="hero-grid">';
+  h += '<div class="hero-card c-green"><div class="top-row"><span class="ico">💰</span>' + _moMBadge() + '</div>';
+  h += '<div class="num" data-count="' + fagg.paid + '" data-prefix="¥">0</div>';
+  h += '<div class="lbl">已入账收益</div>';
+  h += '<div class="sub">' + labelOf(_cloudMonth) + ' · 已完成 ' + fagg.paidOrders + ' 单' + (isCurrentMonth ? ' · 今日 ' + RMB(todayPaid) + '（' + todayOrders + ' 单）' : '') + '</div></div>';
+  h += '<div class="hero-card c-orange"><div class="top-row"><span class="ico">⏳</span></div>';
+  h += '<div class="num">' + RMB(fagg.receivable) + '</div>';
+  h += '<div class="lbl">应收未收</div>';
+  h += '<div class="sub">' + (fagg.receivable > 0 ? '● ' + fagg.pendingFiles + ' 个文件待处理' : '✅ 全部已结清') + '</div></div>';
+  h += '<div class="hero-card c-blue"><div class="gauge-wrap"><canvas id="cloud-gauge-rate"></canvas><div class="gauge-center">' + sg.rate + '%</div></div>';
+  h += '<div class="lbl" style="text-align:center">订单完成率</div>';
+  h += '<div class="sub" style="text-align:center">完成 ' + sg.done + ' · 进行中 ' + sg.working + ' · 异常 ' + sg.abnormal + (sg.canceled ? ' · 取消 ' + sg.canceled : '') + '</div></div>';
+  h += '<div class="hero-card c-blue"><div class="top-row"><span class="ico">📄</span></div>';
+  h += '<div class="num">' + fmtInt(fagg.pages || 0) + '</div>';
+  h += '<div class="lbl">总页数</div>';
+  h += '<div class="sub">' + fmtInt(fagg.allFiles) + ' 个文件 · ' + fmtInt(fagg.orders) + ' 单</div></div>';
   h += '</div>';
 
-  // 过滤行
-  h += '<div class="filter-bar">';
-  h += '<div class="f-item"><label>👤 按成员</label><select onchange="onCloudUserFilter(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.88rem"><option value="all">全部</option>';
-  var seen = {};
-  orders.forEach(function (o) { if (o.openid && o.openid !== 'local') { var mo = memberOfOpenid(o.openid); var k = mo ? mo.name : (o.nickname || o.openid); if (!seen[k]) { seen[k] = true; h += '<option value="' + esc(o.openid) + '"' + (_cloudUserFilter === o.openid ? ' selected' : '') + '>' + esc(k) + '</option>'; } } });
-  h += '</select></div>';
-  h += '<div class="f-item"><label>📦 按来源</label><select onchange="onCloudSourceFilter(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.88rem">';
-  h += '<option value="all"' + (_cloudSourceFilter === 'all' ? ' selected' : '') + '>全部来源</option>';
-  h += '<option value="wechat"' + (_cloudSourceFilter === 'wechat' ? ' selected' : '') + '>小程序</option>';
-  h += '<option value="app"' + (_cloudSourceFilter === 'app' ? ' selected' : '') + '>📱 APP</option>';
-  h += '<option value="local"' + (_cloudSourceFilter === 'local' ? ' selected' : '') + '>🖨 本地</option>';
-  h += '</select></div>';
+  /* ---- v5：订单漏斗（订单 → 文件 → 打印页 → 完成） ---- */
+  if (filteredOrders.length > 0) {
+    h += '<div class="section" style="padding:13px 20px"><div class="funnel-strip">';
+    h += '<div class="f-step"><span class="fv">' + fmtInt(fagg.orders) + '</span><span class="fl">📦 订单</span></div><span class="f-arrow">→</span>';
+    h += '<div class="f-step"><span class="fv">' + fmtInt(fagg.allFiles) + '</span><span class="fl">📄 文件</span></div><span class="f-arrow">→</span>';
+    h += '<div class="f-step"><span class="fv">' + fmtInt(fagg.pages || 0) + '</span><span class="fl">🖨 打印页</span></div><span class="f-arrow">→</span>';
+    h += '<div class="f-step"><span class="fv">' + fmtInt(sentFiles) + '</span><span class="fl">✅ 已完成文件</span></div>';
+    h += '<span class="f-meta">文件完成率 ' + (fagg.allFiles ? Math.round(sentFiles / fagg.allFiles * 100) : 0) + '%</span>';
+    h += '</div></div>';
+  }
+
+  /* ---- v5：图表分组（收益视角默认展开，运营视角默认折叠） ---- */
+  h += '<div class="segmented">';
+  h += '<button class="' + (_cloudChartView === 'revenue' ? 'on' : '') + '" onclick="onCloudChartView(\'revenue\')">💰 收益视角</button>';
+  h += '<button class="' + (_cloudChartView === 'ops' ? 'on' : '') + '" onclick="onCloudChartView(\'ops\')">⚙️ 运营视角</button>';
   h += '</div>';
 
-  // 图表行1：状态分布 + 收益构成
-  h += '<div class="chart-grid">';
+  h += '<div id="cloud-view-revenue" class="chart-grid"' + (_cloudChartView !== 'revenue' ? ' style="display:none"' : '') + '>';
   h += '<div class="section"><h2>🧩 订单状态分布</h2><div class="chart-wrap"><canvas id="cloud-chart-status"></canvas></div>';
   h += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;font-size:.76rem;color:var(--muted)">';
   var allStatusKeys = Object.keys(orderStatusCount).sort(function (a, b) { return orderStatusCount[b] - orderStatusCount[a]; });
   allStatusKeys.forEach(function (s) { h += '<span><span class="status-dot ' + esc(s) + '"></span> ' + esc(statusLabel(s)) + ' (' + (orderStatusCount[s] || 0) + ')</span>'; });
   h += '</div></div>';
-  h += '<div class="section"><h2>💰 收益构成</h2><div class="chart-wrap"><canvas id="cloud-chart-source"></canvas></div>';
+  h += '<div class="section"><h2>💰 收益构成 <span class="hint">自打订单不计入收益</span></h2><div class="chart-wrap"><canvas id="cloud-chart-source"></canvas><div class="donut-center"><div class="dc-num">' + RMB(parseCents(rs.total || 0)) + '</div><div class="dc-lbl">已入账合计</div></div></div>';
   h += '<div style="text-align:center;font-size:.8rem;color:var(--muted);margin-top:6px">小程序 ' + RMB(parseCents(rs.wechat || 0)) + ' (' + (rs.wechat_orders || 0) + '单) | 📱 APP ' + RMB(parseCents(rs.app || 0)) + ' (' + (rs.app_orders || 0) + '单) | 🖨 本地 ' + RMB(parseCents(rs.local || 0)) + ' (' + (rs.local_orders || 0) + '单)</div></div>';
   h += '</div>';
 
-  // 图表行2：附加服务构成 + 单双面构成
-  var svcCounts = { 加急: 0, 派送: 0, 封面: 0 };
+  var svcCounts = { 加急: fagg.urgency, 派送: fagg.delivery, 封面: fagg.cover, 自动打印: fagg.autoPrint, 预约: fagg.scheduled };
+  var svcRev = { 加急: 0, 派送: 0, 封面: 0, 自动打印: 0, 预约: 0 };   // 收益贡献（分）：加急费/封面费直计，派送按已入账×百分比估算
+  filteredOrders.forEach(function (o) {
+    if (o.is_admin_print) return;   // v5.1：自打订单的服务费不计入收益贡献
+    var m = _orderMoney(o, true);
+    if (o.urgency && o.urgency !== '低') svcRev['加急'] += parseCents(o.urgency_price || 0);
+    if (o.delivery_enabled) svcRev['派送'] += Math.round(m.paid * ((o.delivery_percentage || 0) / 100));
+    if (o.cover_page) svcRev['封面'] += parseCents(o.cover_page_price || 0);
+  });
   var fileDuplex = { 单面: 0, 双面: 0 };
   filteredOrders.forEach(function (o) {
-    if (o.urgency && o.urgency !== '低') svcCounts['加急']++;
-    if (o.delivery_enabled) svcCounts['派送']++;
-    if (o.cover_page) svcCounts['封面']++;
     (o.files || []).forEach(function (f) { if (f.duplex === 'off') fileDuplex['单面']++; else fileDuplex['双面']++; });
   });
-  h += '<div class="chart-grid">';
-  h += '<div class="section"><h2>⚡ 附加服务构成 <span class="hint">（含该服务的订单数）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-svc"></canvas></div>';
-  h += '<div style="display:flex;gap:10px;justify-content:center;margin-top:6px;font-size:.8rem;color:var(--muted)">';
-  Object.keys(svcCounts).forEach(function (k) { h += '<span>' + k + ' ' + svcCounts[k] + '</span>'; });
+  h += '<div id="cloud-view-ops" class="chart-grid"' + (_cloudChartView !== 'ops' ? ' style="display:none"' : '') + '>';
+  h += '<div class="section"><h2>⚡ 附加服务构成 <span class="hint">（含该服务的订单数 · 悬停看收益贡献）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-svc"></canvas></div>';
+  h += '<div style="display:flex;gap:10px;justify-content:center;margin-top:6px;font-size:.8rem;color:var(--muted);flex-wrap:wrap">';
+  Object.keys(svcCounts).forEach(function (k) { h += '<span>' + k + ' ' + svcCounts[k] + '单' + (svcRev[k] > 0 ? ' · ' + RMB(svcRev[k]) : '') + '</span>'; });
   h += '</div></div>';
   h += '<div class="section"><h2>🖨 单双面构成 <span class="hint">（按文件数）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-duplex"></canvas></div></div>';
   h += '</div>';
 
-  // 各用户排行
-  if (byUser.length > 0) {
-    h += '<div class="section chart-full"><h2>👥 成员 / 本地任务排行</h2><div class="chart-grid">';
-    h += '<div><h3 style="font-size:.85rem;margin:0 0 6px 4px;color:var(--muted)">💰 盈利</h3><div class="chart-wrap tall"><canvas id="cloud-chart-user-revenue"></canvas></div></div>';
-    h += '<div><h3 style="font-size:.85rem;margin:0 0 6px 4px;color:var(--muted)">📱 小程序 / APP 下单</h3><div class="chart-wrap tall"><canvas id="cloud-chart-client"></canvas></div></div>';
-    h += '</div></div>';
+  /* ---- v5.2：趋势分析（近7天 / 近30天 / 近60天 / 自定义；v5.9 起宽区间固定切片、v5.16 切片数 60→90） ---- */
+  if (!_trendData && !_trendLoading) fetchTrendData(_trendRange.mode);   // v5.6：首次进入自动加载当前区间
+  var trendPoints = [], trendGran = 'day', trendRangeDates = null;
+  if (_trendData) {
+    // v5.16：趋势点与标题文案统一走共用函数（与 onCloudTrendMetric 局部重绘同源）
+    trendRangeDates = { start: _trendData.period.start, end: _trendData.period.end };
+    var tv = _trendViewState();
+    trendGran = tv.gran;
+    trendPoints = tv.points;
+  }
+  {
+    h += '<div class="section chart-full" id="cloud-trend"><h2>📈 趋势分析 <span class="hint">' + _trendHintText() + '</span></h2>';
+    /* 区间工具栏：区间按钮 + 日期输入 + 指标切换 */
+    h += '<div class="trend-toolbar">';
+    h += '<span class="segmented">';
+    h += '<button class="' + (_trendRange.mode === '7d' ? 'on' : '') + '" onclick="onTrendRange(\'7d\')">近7天</button>';
+    h += '<button class="' + (_trendRange.mode === '30d' ? 'on' : '') + '" onclick="onTrendRange(\'30d\')">近30天</button>';
+    h += '<button class="' + (_trendRange.mode === '60d' ? 'on' : '') + '" onclick="onTrendRange(\'60d\')">近60天</button>';
+    h += '<button class="' + (_trendRange.mode === '90d' ? 'on' : '') + '" onclick="onTrendRange(\'90d\')">近90天</button>';
+    h += '<button class="' + (_trendRange.mode === '1y' ? 'on' : '') + '" onclick="onTrendRange(\'1y\')">近1年</button>';
+    h += '<button class="' + (_trendRange.mode === 'custom' ? 'on' : '') + '" onclick="onTrendRange(\'custom\')">自定义</button>';
+    h += '</span>';
+    var dStart = '', dEnd = '';
+    if (_trendRange.mode === 'custom' && _trendCustom.start && _trendCustom.end) { dStart = _trendCustom.start; dEnd = _trendCustom.end; }
+    else if (trendRangeDates) { dStart = trendRangeDates.start; dEnd = trendRangeDates.end; }
+    /* v5.15：自绘日历字段（点击弹出日历；可选范围在日历内直接禁用） */
+    var trendMin = _trendMinDate(), trendMax = todayStr();
+    var rangeTitle = '可查范围：' + trendMin + ' ~ ' + trendMax + '（点击选择日期）';
+    h += '<span class="trend-dates">';
+    h += '<span class="date-field" id="trendRangeStart" onclick="_calOpen(\'start\', this)" title="' + rangeTitle + '"><span class="cal-ico">📅</span><span class="df-txt' + (dStart ? '' : ' placeholder') + '">' + esc(dStart || '选择日期') + '</span></span>';
+    h += '<span style="color:var(--muted)">~</span>';
+    h += '<span class="date-field" id="trendRangeEnd" onclick="_calOpen(\'end\', this)" title="' + rangeTitle + '"><span class="cal-ico">📅</span><span class="df-txt' + (dEnd ? '' : ' placeholder') + '">' + esc(dEnd || '选择日期') + '</span></span>';
+    h += '</span>';
+    h += '<span class="trend-metrics">';
+    var trendMetricBtns = [['revenue', '💰收益'], ['count', '📦订单'], ['pages', '📄页数'], ['files', '🗂文件']];
+    trendMetricBtns.forEach(function (b) {
+      var on2 = _cloudTrendMetric === b[0];
+      h += '<button data-metric="' + b[0] + '" class="' + (on2 ? 'on' : '') + '" style="' + (on2 ? 'color:' + _TREND_COLORS[b[0]].main + ';font-weight:700' : '') + '" onclick="onCloudTrendMetric(\'' + b[0] + '\')">' + b[1] + '</button>';
+    });
+    h += '</span></div>';
+    if (_trendLoading) {
+      h += '<div style="text-align:center;padding:60px"><span class="loading-spin"></span> <span style="margin-left:6px;color:var(--muted)">正在加载 ' + (_trendRange.mode === 'custom' ? '自定义区间' : _trendRange.mode === '7d' ? '近7天' : _trendRange.mode === '60d' ? '近60天' : _trendRange.mode === '90d' ? '近90天' : _trendRange.mode === '1y' ? '近1年' : '近30天') + ' 数据…</span></div>';
+    } else if (!_trendData) {
+      h += '<div class="empty" style="padding:30px"><p>区间数据加载失败</p><button class="btn sm" style="margin-top:10px" onclick="onTrendRange(\'' + _trendRange.mode + '\')">🔍 重试</button></div>';
+    } else if (trendPoints.length === 0) {
+      h += '<div class="empty" style="padding:30px"><p>该区间暂无订单数据</p></div>';
+    } else {
+      h += '<div class="chart-wrap tall"><canvas id="cloud-chart-trend"></canvas></div>';
+    }
+    h += '</div>';
   }
 
-  // 每日趋势
-  if (dailyTrend.length > 1) {
-    h += '<div class="section chart-full"><h2>📈 每日趋势 <span class="hint">— 收益（左轴）/ 订单数（右轴）</span></h2><div class="chart-wrap tall"><canvas id="cloud-chart-trend"></canvas></div></div>';
+  /* ---- v5：成员排行榜（进度条卡片，替代原柱状图；未绑定用户合并为警示行） ---- */
+  if (userAgg.length > 0) {
+    var topN = [], unboundN = 0, unboundTotal = 0;
+    userAgg.forEach(function (u) {
+      var mo = memberOfOpenid(u.openid);
+      if (mo && mo.memberId) { if (u.paid > 0 && topN.length < 6) topN.push(u); }
+      else if (u.openid !== 'local' && u.paid > 0) { unboundN++; unboundTotal += u.paid; }
+    });
+    if (topN.length || unboundN) {
+      h += '<div class="section"><h2>👥 成员排行榜 <span class="hint">按已入账金额' + (topN.length ? ' · 前 ' + topN.length + ' 名' : '') + '</span></h2><div class="rank-list">';
+      var maxPaid = topN.length ? topN[0].paid : 1;
+      topN.forEach(function (u, i) {
+        var mo = memberOfOpenid(u.openid);
+        var medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : String(i + 1);
+        var w = Math.max(4, Math.round(u.paid / maxPaid * 100));
+        h += '<div class="rank-row">';
+        h += '<span class="rank-medal">' + medal + '</span>';
+        h += '<span class="rank-name"><span class="rank-dot" style="background:' + sanitizeColor(mo.color) + '"></span>' + esc(mo.name) + (u.nickname ? ' <span class="rank-nick">' + esc(u.nickname) + '</span>' : '') + '</span>';
+        h += '<span class="rank-bar"><span class="rank-fill" style="width:' + w + '%"></span></span>';
+        h += '<span class="rank-amt">' + RMB(u.paid) + '</span><span class="rank-orders">' + u.orders + ' 单</span>';
+        h += '</div>';
+      });
+      if (unboundN) {
+        h += '<div class="rank-row unbound" title="点击前往成员明细绑定" onclick="document.getElementById(\'cloud-member-detail\').scrollIntoView({behavior:\'smooth\'})">';
+        h += '<span class="rank-medal">⚠</span><span class="rank-name">未绑定用户（' + unboundN + ' 人）</span>';
+        h += '<span class="rank-bar"><span class="rank-fill" style="width:' + Math.max(4, Math.round(unboundTotal / maxPaid * 100)) + '%"></span></span>';
+        h += '<span class="rank-amt">' + RMB(unboundTotal) + '</span><span class="rank-orders">待绑定</span></div>';
+      }
+      h += '</div></div>';
+    }
   }
 
-  // 成员收益明细
-  if (byUser.length > 0) {
-    h += '<div class="section"><h2>👥 成员收益明细 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div class="table-wrap"><table><thead><tr><th>成员</th><th>盈利</th><th>占比</th><th>订单</th><th>小程序</th><th>APP</th><th>文件</th><th>页数</th><th>均单收益</th></tr></thead><tbody>';
-    byUser.forEach(function (u) {
-      var pct = rs.total > 0 ? (u.revenue / rs.total * 100).toFixed(1) : 0;
-      var avgRev = u.order_count > 0 ? (u.revenue / u.order_count) : 0;
-      var isLocal = u.openid === 'local';
-      var mo = isLocal ? { name: '本地任务', color: '#548235' } : memberOfOpenid(u.openid);
+  // v24：管理员订单归属统计（自打 / 接单，v5 加排名徽章）
+  h += renderOwnersSection();
+
+  // 成员收益明细（v4.0：已入账 / 应收未收 双列，均单按已完成订单计；未绑定用户在此下拉绑定）
+  if (userAgg.length > 0) {
+    h += '<div class="section" id="cloud-member-detail"><h2>👥 成员收益明细 <span class="hint">' + labelOf(_cloudMonth) + ' · 未绑定用户可在此下拉绑定</span></h2><div class="table-wrap"><table><thead><tr><th>成员</th><th>已入账</th><th>应收未收</th><th>占比</th><th>订单</th><th>小程序</th><th>APP</th><th>文件</th><th>页数</th><th>均单已入账</th></tr></thead><tbody>';
+    userAgg.forEach(function (u) {
+      var pct = fagg.paid > 0 ? (u.paid / fagg.paid * 100).toFixed(1) : 0;
+      var avgRev = u.paidOrders > 0 ? (u.paid / u.paidOrders) : 0;
+      var mo = memberOfOpenid(u.openid);
       var cell = '';
-      if (isLocal) {
-        cell = '<span class="member-tag" style="background:#548235">🖨 本地任务</span>';
-      } else if (mo) {
+      if (mo) {
         cell = '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + '">' + esc(mo.name) + '</span> <span style="font-size:.72rem;color:var(--muted)">' + esc(u.nickname || '') + '</span>';
       } else {
         var oidSafe = safeId(u.openid);
@@ -1762,83 +2971,37 @@ function renderCloud() {
           '<span class="bound-badge no">未绑定</span> ' +
           (oidSafe ? '<select onchange="updateBinding(\'' + oidSafe + '\',this.value)" style="font-size:.76rem;padding:3px 6px">' + bOpts + '</select>' : '');
       }
-      var wc = u.openid === 'local' ? '—' : (u.wechat_orders || 0);
-      var ac = u.openid === 'local' ? '—' : (u.app_orders || 0);
-      h += '<tr><td class="l">' + cell + '</td><td class="pos" style="font-weight:700">' + RMB(parseCents(u.revenue)) + '</td><td><span class="tag b">' + pct + '%</span></td><td>' + u.order_count + '</td><td>' + wc + '</td><td>' + ac + '</td><td>' + u.file_count + '</td><td>' + (u.total_pages || 0) + '</td><td>' + RMB(parseCents(avgRev)) + '</td></tr>';
+      h += '<tr><td class="l">' + cell + '</td><td class="pos" style="font-weight:700">' + RMB(u.paid) + '</td><td>' + (u.receivable > 0 ? RMB(u.receivable) : '—') + '</td><td><span class="tag b">' + pct + '%</span></td><td>' + u.orders + '</td><td>' + u.wechat + '</td><td>' + u.app + '</td><td>' + u.files + '</td><td>' + (u.pages || 0) + '</td><td>' + RMB(avgRev) + '</td></tr>';
     });
     h += '</tbody></table></div></div>';
   }
 
-  // 对账提示
-  var manual = {};
-  (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === _cloudMonth) manual[r.memberId] = (manual[r.memberId] || 0) + parseCents(r.amount); });
-  var cloudByMember = {};
-  (_cloudData.by_user || []).forEach(function (u) {
-    var mo = memberOfOpenid(u.openid);
-    if (mo && mo.memberId) cloudByMember[mo.memberId] = (cloudByMember[mo.memberId] || 0) + parseCents(u.revenue);
-  });
-  var hasManual = Object.keys(manual).length > 0;
-  if (hasManual || Object.keys(cloudByMember).length > 0) {
-    h += '<div class="section" style="background:var(--card-2)"><h2>🔍 云端 vs 手动代收 对账 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2><div class="table-wrap"><table><thead><tr><th>成员</th><th>云端已完成收费</th><th>手动代收录入</th><th>差额</th></tr></thead><tbody>';
+  // 对账明细（v5：与置顶提示条共用 _reconcileCloud 口径；作为提示条的展开详情）
+  var hasManual = Object.keys(recon.manual).length > 0;
+  if (hasManual || Object.keys(recon.cloudByMember).length > 0 || recon.unboundPaid > 0) {
+    h += '<div class="section" id="cloud-recon" style="background:var(--card-2)"><h2>🔍 云端 vs 手动代收 对账 <span class="hint">' + labelOf(_cloudMonth) + '</span></h2>';
     var allIds = {};
-    Object.keys(manual).forEach(function (k) { allIds[k] = true; });
-    Object.keys(cloudByMember).forEach(function (k) { allIds[k] = true; });
-    Object.keys(allIds).forEach(function (mid) {
-      var cv = cloudByMember[mid] || 0, mv = manual[mid] || 0, diff = cv - mv;   // 均为整数分
-      h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mid)) + '">' + esc(MN(mid)) + '</td><td class="pos">' + RMB(cv) + '</td><td>' + RMB(mv) + '</td><td class="' + (Math.abs(diff) > 1 ? (diff >= 0 ? 'pos' : 'neg') : '') + '">' + (diff === 0 ? '—' : (diff >= 0 ? '+' : '') + RMB(diff)) + '</td></tr>';
-    });
-    h += '</tbody></table></div><div style="margin-top:8px;font-size:.78rem;color:var(--muted)">差额 = 云端已完成收费 − 手动代收录入。正数说明还有未入账的收入。本地任务收益不计入成员对账。</div></div>';
+    Object.keys(recon.manual).forEach(function (k) { allIds[k] = true; });
+    Object.keys(recon.cloudByMember).forEach(function (k) { allIds[k] = true; });
+    if (Object.keys(allIds).length) {
+      h += '<div class="table-wrap"><table><thead><tr><th>成员</th><th>云端已入账</th><th>手动代收录入</th><th>差额</th></tr></thead><tbody>';
+      Object.keys(allIds).forEach(function (mid) {
+        var cv = recon.cloudByMember[mid] || 0, mv = recon.manual[mid] || 0, diff = cv - mv;   // 均为整数分
+        h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mid)) + '">' + esc(MN(mid)) + '</td><td class="pos">' + RMB(cv) + '</td><td>' + RMB(mv) + '</td><td class="' + (Math.abs(diff) > 1 ? (diff >= 0 ? 'pos' : 'neg') : '') + '">' + (diff === 0 ? '—' : (diff >= 0 ? '+' : '') + RMB(diff)) + '</td></tr>';
+      });
+      h += '</tbody></table></div>';
+    }
+    h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">差额 = 云端已入账 − 手动代收录入。正数说明还有未入账的收入。自打订单不计入云端已入账，本地任务收益不计入成员对账。' +
+      (recon.unboundPaid > 0 ? ' ⚠️ 另有 <b>' + RMB(recon.unboundPaid) + '</b> 来自未绑定成员的云端用户（' + esc(recon.unboundUsers.slice(0, 3).join('、')) + (recon.unboundUsers.length > 3 ? ' 等' : '') + '）未计入对账，可在下方成员明细中绑定。' : '') +
+      '</div></div>';
   }
 
-  // 订单明细
-  h += '<div class="section"><h2>📋 订单明细 <span class="hint">' + filteredOrders.length + ' 条，时间倒序' + (_cloudSourceFilter !== 'all' ? ' · 来源: ' + (_cloudSourceFilter === 'wechat' ? '小程序' : (_cloudSourceFilter === 'app' ? '📱 APP' : '🖨 本地')) : '') + '</span></h2>';
-  if (!filteredOrders.length) {
-    h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
-  } else {
-    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:70px">来源</th><th style="width:110px">用户</th><th style="width:88px">状态</th><th style="width:88px">收益</th><th style="width:70px">文件</th><th style="width:108px">页数</th><th style="width:114px">类型</th><th style="width:138px">时间</th></tr></thead><tbody>';
-    filteredOrders.forEach(function (o) {
-      var isExp = !!_cloudExpanded[o.order_id];
-      var srcTxt = o.source === 'app' ? '📱 APP' : (o.source === 'local' ? '🖨 本地' : '小程序');
-      var mo = o.openid === 'local' ? { name: '本地任务' } : memberOfOpenid(o.openid);
-      var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
-      var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
-      var revColor = sanitizeColor(_statusColor(o.status));   // 收益金额配色跟随订单状态
-      // 收益列显示订单应有的金额（所有文件价格合计）；是否计入总收益由后端 rs.total（仅 sent）决定
-      var orderRev = (o.files || []).reduce(function (s, f) { return s + parseCents(f.total_price); }, 0);
-      h += '<tr class="order-row' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
-      h += '<td><span class="expand-icon">▶</span></td>';
-      h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
-      h += '<td style="white-space:nowrap"><span class="tag b">' + srcTxt + '</span></td>';
-      h += '<td class="l ell">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
-      h += '<td style="white-space:nowrap"><span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span></td>';
-      h += '<td style="font-weight:700;color:' + revColor + '">' + RMB(orderRev) + '</td>';
-      h += '<td>' + o.files_count + '</td>';
-      h += '<td>' + (o.total_page_count || 0) + '</td>';
-      h += '<td style="font-size:.78rem">' + (o.urgency && o.urgency !== '低' ? '⚡' + esc(o.urgency) : '') + (o.delivery_enabled ? ' 🚚' : '') + (o.cover_page ? ' 📄' : '') + '</td>';
-      h += '<td class="ell" style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 16)) + '</td>';
-      h += '</tr>';
-      if (o.files && o.files.length) {
-        h += '<tr class="file-expand' + (isExp ? ' open' : '') + '" data-suborder="' + oidS + '"><td colspan="10" class="file-expand-cell"><div class="file-expand-body"><div class="file-expand-inner">';
-        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>单/双面</span></div>';
-        o.files.forEach(function (f) {
-          h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + '">';
-          h += '<span class="fn">📄 ' + esc(f.file_name) + '</span>';
-          h += '<span style="font-weight:700;color:' + revColor + '">' + RMB(parseCents(f.total_price)) + '</span>';
-          h += '<span>' + f.copies + '份</span>';
-          h += '<span>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</span>';
-          h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
-          h += '</div>';
-        });
-        h += '</div></div></td></tr>';
-      }
-    });
-    h += '</tbody></table></div>';
-  }
-  h += '</div>';
+  // 订单明细（v5.16：分页渲染 —— 状态筛选/页码/每页条数，翻页与筛选仅局部刷新本区块，不影响其他图表；展开行含文件级状态）
+  h += _renderOrderListHTML();
 
   h += '<div style="font-size:.76rem;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap">';
   h += '<span>查询周期: ' + _cloudData.period.start + ' ~ ' + _cloudData.period.end + '</span>';
-  h += '<span>共 ' + orders.length + ' 笔订单 · ' + (rs.total_pages || 0) + ' 页 · 盈利 ' + RMB(parseCents(rs.total)) + '</span>';
+  h += '<span>共 ' + filteredOrders.length + ' 笔订单（自打 ' + (fagg.selfOrders || 0) + ' 笔不计收益）· ' + (fagg.pages || 0) + ' 页 · 已入账 ' + RMB(fagg.paid) + '</span>';
   h += '</div>';
 
   el.innerHTML = h;
@@ -1848,30 +3011,51 @@ function renderCloud() {
 
   _destroyCloudCharts();
   setTimeout(function () {
-    _renderStatusDonut('cloud-chart-status', orderStatusCount);
-    _renderSourceDonut('cloud-chart-source', rs);
-    _renderServiceBar('cloud-chart-svc', svcCounts);
-    _renderDuplexDonut('cloud-chart-duplex', fileDuplex);
-    if (byUser.length > 0) {
-      _renderUserBar('cloud-chart-user-revenue', byUser, 'revenue', '盈利 (元)', null, function (u, f, mx) { var r = Math.max(.3, u[f] / mx); return 'rgb(' + Math.round(68 + (30 - 68) * r) + ',' + Math.round(110 + (70 - 110) * r) + ',' + Math.round(247 + (130 - 247) * r) + ')'; });
-      _renderClientStackedBar('cloud-chart-client', byUser);
+    // 防重入：若 60ms 内页面被再次渲染（如另一路接口先返回），上一轮图表可能尚未创建，
+    // 这里再销毁一次，避免 Chart.js「Canvas is already in use」
+    _destroyCloudCharts();
+    // Hero：完成率半环仪表盘
+    var gsegs = [];
+    if (sg.done) gsegs.push({ value: sg.done, color: cssVar('--green') || '#16a34a' });
+    if (sg.working) gsegs.push({ value: sg.working, color: cssVar('--primary') || '#4f6ef7' });
+    if (sg.abnormal) gsegs.push({ value: sg.abnormal, color: cssVar('--neg') || '#e11d48' });
+    if (sg.canceled) gsegs.push({ value: sg.canceled, color: '#9ca3af' });
+    if (!gsegs.length) gsegs.push({ value: 1, color: '#9ca3af' });
+    _renderGauge('cloud-gauge-rate', gsegs);
+    // 分组图表：仅创建当前可见视图（避免隐藏容器 0 尺寸渲染）
+    if (_cloudChartView === 'revenue') {
+      _renderStatusDonut('cloud-chart-status', orderStatusCount);
+      _renderSourceDonut('cloud-chart-source', rs);
+    } else {
+      _renderServiceBar('cloud-chart-svc', svcCounts, svcRev);
+      _renderDuplexDonut('cloud-chart-duplex', fileDuplex);
     }
-    if (dailyTrend.length > 1) _renderDailyTrend('cloud-chart-trend', dailyTrend);
+    // v5.9：≤60 天用柱状图（每天一柱）；>60 天用平滑折线图（90 片切片，v5.16 由 60 片调整）
+    if (trendPoints.length > 0) {
+      if (trendGran === 'day') _renderBucketTrend('cloud-chart-trend', trendPoints, _cloudTrendMetric, 'day');
+      else _renderDailyTrend('cloud-chart-trend', trendPoints, _cloudTrendMetric);
+    }
   }, 60);
 }
-function _renderServiceBar(canvasId, svc) {
+function _renderServiceBar(canvasId, svc, svcRev) {
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
   var ctx = canvas.getContext('2d');
   var labels = Object.keys(svc), data = labels.map(function (k) { return svc[k]; });
-  var svcColors = ['#f59e0b', '#8b5cf6', '#e11d48'];
+  var svcColors = ['#f59e0b', '#8b5cf6', '#e11d48', '#16a34a', '#f97316'];
   _cloudCharts[canvasId] = new Chart(ctx, {
     type: 'bar',
     data: { labels: labels, datasets: [{ label: '订单数', data: data, backgroundColor: svcColors, hoverBackgroundColor: svcColors.map(function (c) { return _mixToWhite(c, 0.4); }), hoverBorderColor: svcColors, hoverBorderWidth: 3, borderRadius: 6 }] },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: function (c) { return c.parsed.y + ' 单'; } } } },
-      scales: { y: { beginAtZero: true, grid: { color: 'rgba(120,130,160,.12)' } }, x: { grid: { display: false } } },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: function (c) {
+          var rev = (svcRev || {})[labels[c.dataIndex]] || 0;
+          return c.parsed.y + ' 单' + (rev > 0 ? ' · 收益贡献 ' + RMB(rev) : '');
+        } } }
+      },
+      scales: { y: { beginAtZero: true, grid: { color: 'rgba(120,130,160,.12)' }, ticks: { color: chartTextColor() } }, x: { grid: { display: false }, ticks: { color: chartTextColor() } } },
       animation: { duration: 1000, easing: 'easeOutQuart' }
     }
   });
@@ -1888,8 +3072,24 @@ function _renderDuplexDonut(canvasId, dup) {
     options: {
       responsive: true, maintainAspectRatio: false, cutout: '55%',
       layout: { padding: 24 },
-      plugins: { legend: { position: 'bottom', labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } } },
+      plugins: { legend: { position: 'bottom', onClick: function () {}, labels: { font: { size: 11 }, padding: 8, boxWidth: 12, color: chartTextColor() } } },
       animation: { animateRotate: true, duration: 1200, easing: 'easeOutBack' }
+    }
+  });
+}
+/* v5：订单完成率半环仪表盘（rotation -90 / circumference 180） */
+function _renderGauge(canvasId, segs) {
+  var canvas = document.getElementById(canvasId);
+  if (!canvas || !segs || !segs.length) return;
+  var ctx = canvas.getContext('2d');
+  _cloudCharts[canvasId] = new Chart(ctx, {
+    type: 'doughnut',
+    data: { datasets: [{ data: segs.map(function (s) { return s.value; }), backgroundColor: segs.map(function (s) { return s.color; }), borderWidth: 0, borderRadius: 4 }] },
+    options: {
+      rotation: -90, circumference: 180, cutout: '70%',
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+      animation: { animateRotate: true, duration: 1100, easing: 'easeOutQuart' }
     }
   });
 }
@@ -2156,10 +3356,28 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v3.0</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.16</div>' +
     '<div style="max-width:460px;margin:0 auto;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
+    '<p style="margin-top:10px">v4.0：云端展示重构 —— 统一「已入账」金额口径，订单明细补自打/接单、自动打印、预约、免费标记与文件级状态，附加服务新增自动打印/预约维度，对账提示未绑定成员的用户收益。</p>' +
+    '<p style="margin-top:10px">v5.0：云端运营驾驶舱 —— 对账/异常提示条置顶，Hero KPI 4 卡（迷你趋势线/环比徽标/完成率仪表盘），订单漏斗，收益/运营视角图表分组，异常监控卡与订单状态快捷筛选，成员排行榜进度条，每日趋势渐变面积图 + 峰值标注 + 指标切换，订单表状态色条与入账进度条，状态体系补全预约/待打印/下载中；宽屏内容限宽居中。</p>' +
+    '<p style="margin-top:10px">v5.1：收益口径 —— 自打订单（管理员自行打印）不计入已入账/应收未收/收益构成/趋势/排行榜等一切收益统计，订单数、页数等运营量与明细金额仍正常展示。</p>' +
+    '<p style="margin-top:10px">v5.2：趋势区间 —— 趋势分析支持近7天/近30天/自定义起止日期；宽范围（&gt;45 天）自动按月聚合、超 2 年自动按年聚合，避免横向渲染海量日点；区间数据独立缓存，随成员/来源过滤联动。</p>' +
+    '<p style="margin-top:10px">v5.3：0 值占位 —— 趋势图按区间补全时间轴，收益/订单为 0 的日期（月/年）保留位置并显示 0，不再跳空省略。</p>' +
+    '<p style="margin-top:10px">v5.4：指标配色 —— 趋势分析四指标专属颜色（收益绿/订单蓝/页数紫/文件青），峰值同色放大/实色突出，指标切换按钮高亮跟随指标色。</p>' +
+    '<p style="margin-top:10px">v5.5：单指标展示 —— 趋势图切换指标时仅显示当前指标对应数据，移除叠加的订单数辅助序列与双轴。</p>' +
+    '<p style="margin-top:10px">v5.6：移除「本月」维度 —— 趋势分析始终基于独立时间区间，默认近30天，首次进入自动加载。</p>' +
+    '<p style="margin-top:10px">v5.7：曲线细节 —— 日粒度曲线平时不显示数据点（仅峰值标注点常显），鼠标悬停到某天时显示该天的选中点；曲线与 x 轴围成的面积改为纯色填充。</p>' +
+    '<p style="margin-top:10px">v5.8：主题联动 —— 切换浅色/深色主题时，图表中的图例文字（可点击隐藏维度）、坐标轴刻度与轴标题颜色同步刷新，不再残留旧主题配色。</p>' +
+    '<p style="margin-top:10px">v5.9：趋势切片 —— 新增近60天区间；≤60 天用柱状图（每天一柱），&gt;60 天用平滑折线图；宽范围不再按月/年划分，改为时间轴均匀切片、固定最多 60 片，保留数据变化趋势。</p>' +
+    '<p style="margin-top:10px">v5.10：图表交互 —— 不再高亮/加亮最大值（柱状图所有柱同色、折线不突出峰值点，仅保留峰值文字标注）；图例仅作标识，点击不再切换数据集显隐。</p>' +
+    '<p style="margin-top:10px">v5.11：柱体样式 —— 趋势柱状图柱体改为不透明实色；鼠标悬停时深色模式柱体加亮、浅色模式柱体变暗，且随主题切换自动生效。</p>' +
+    '<p style="margin-top:10px">v5.12：折线填充 —— 平滑折线图与 x 轴围成的面积改为不透明实色填充（与柱体一致）。</p>' +
+    '<p style="margin-top:10px">v5.13：趋势区间扩充 —— 新增近90天、近1年快捷区间（&gt;60 天自动进入 60 片切片平滑折线展示）。</p>' +
+    '<p style="margin-top:10px">v5.14：自定义日期范围限制 —— 日期选择器禁止选择未来日期，最早可选日期限定为最早有数据的月份；提交时二次校验兜底。</p>' +
+    '<p style="margin-top:10px">v5.15：自绘日历组件 —— 自定义日期改用自研弹出日历（周一开头、选中/今天/区间高亮、范围外日期禁用、取消自动回滚），浅色/深色主题随 CSS 变量自动适配，选完起止日期自动应用。</p>' +
+    '<p style="margin-top:10px">v5.16：趋势切片 60→90 —— 宽区间（&gt;60 天）平滑折线图的切片数由 60 增至 90，细节更丰富；≤60 天仍为逐日柱状图；日历月份导航禁止切入全部日期不可用的月份；移除 Hero 卡片右下角迷你趋势线；趋势指标切换改为局部重绘（不再整页重建导致全部图表闪烁）；订单明细移除「入账进度/已入账」两列，分解信息并入金额列悬浮提示；订单明细新增分页（10/20/50/100 条每页，页码省略号导航，参考小程序/APP 打印任务分页），翻页/状态筛选只局部刷新订单区块；移除「⚠️ 需要处理」异常监控卡片（打印失败/放弃打印/查看异常订单入口），订单异常仍可在明细状态筛选中查看。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>';

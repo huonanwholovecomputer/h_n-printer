@@ -306,6 +306,15 @@ body {
 .card-entering-fade {
   animation: cardFadeIn 0.5s 0.25s cubic-bezier(0.22, 0.61, 0.36, 1) both;
 }
+/* 逐元素入场动画：延迟直接烘焙进 animation 简写（0.5s 时长 + 各自延迟），
+   避免独立 animation-delay 长属性与 .card-entering-fade 简写产生级联竞争 */
+.enter-05 { animation: cardFadeIn 0.5s 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-06 { animation: cardFadeIn 0.5s 0.6s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-07 { animation: cardFadeIn 0.5s 0.7s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-08 { animation: cardFadeIn 0.5s 0.8s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-09 { animation: cardFadeIn 0.5s 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-10 { animation: cardFadeIn 0.5s 1.0s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-11 { animation: cardFadeIn 0.5s 1.1s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
 
 /* Card remove — fade out + collapse in one go */
 @keyframes cardRemove {
@@ -1081,6 +1090,18 @@ body {
     0 0.5333cqw 2.1333cqw rgba(0, 0, 0, 0.40),
     inset 0 0.1333cqw 0 rgba(255, 255, 255, 0.12),
     0 0 0 0.0667cqw rgba(255, 255, 255, 0.08);
+}
+
+/* emoji 字形在系统 emoji 字体（Android Noto Color Emoji / 微软 Segoe UI Emoji）
+   的度量下整体偏向行盒下方 —— 用 translateY 上移补偿，使其在圆形按钮内竖直居中。
+   实测：内层 span + line-height:1 已消除大部分偏移，剩余字形偏移约 0.05em，取 -0.05em。
+   注意：必须放在内层 span 上，不能放按钮本身（按钮 transform 被按压缩放动画占用） */
+.theme-toggle-icon {
+  line-height: 1;
+  transform: translateY(-0.05em);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 /* ═══════════════ Scroll To Top Button ═══════════════ */
@@ -2314,6 +2335,42 @@ body {
   color: var(--text-secondary);
 }
 
+/* ── 管理员自行打印开关（仅管理员可见，蓝色主题区分于橙色无障碍打印）── */
+.admin-print-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 2.1333cqw;
+  padding: 2.6667cqw 3.2000cqw;
+  background: rgba(30, 102, 245, 0.06);
+  border: 0.1333cqw solid rgba(30, 102, 245, 0.22);
+  border-radius: var(--radius-md);
+  box-sizing: border-box;
+}
+.admin-print-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5333cqw;
+}
+.admin-print-icon {
+  font-size: 4.2667cqw;
+  line-height: 1;
+}
+.admin-print-title {
+  font-size: 3.7333cqw;
+  font-weight: 600;
+  color: var(--blue);
+}
+.admin-print-desc {
+  font-size: 2.9333cqw;
+  color: var(--text-secondary);
+}
+.admin-print-success-text {
+  margin-bottom: 1.6cqw;
+  color: var(--blue);
+  font-weight: 500;
+}
+
 /* ── 无障碍打印预约（开始方式：立即/指定时间/倒计时，仅管理员）── */
 /* 展开/收起动画：开关联动，max-height + opacity + transform 过渡（收起由 JS 在 320ms 后卸载面板） */
 .schedule-section {
@@ -2781,6 +2838,19 @@ picker-view-column {
     rgba(255, 135, 0, 0.95) 100%);
 }
 
+/* 管理员自行打印开关：加大尺寸 + 蓝色开启态（区别于无障碍打印的橙色） */
+.ios-switch.admin-print-sw.switch-on {
+  background: linear-gradient(180deg,
+    rgba(0, 122, 255, 0.92) 0%,
+    rgba(0, 88, 214, 0.96) 100%);
+  box-shadow: inset 0 0.1333cqw 0.2667cqw rgba(0, 0, 0, 0.08);
+}
+.theme-dark .ios-switch.admin-print-sw.switch-on {
+  background: linear-gradient(180deg,
+    rgba(52, 132, 255, 0.96) 0%,
+    rgba(0, 102, 255, 0.95) 100%);
+}
+
 .cover-price-tag {
   font-size: 3.2000cqw;
   color: var(--text-tertiary);
@@ -2821,7 +2891,9 @@ picker-view-column {
   transition: max-height 0.3s ease, opacity 0.25s ease;
 }
 .delivery-collapse.delivery-open {
-  max-height: 26.6667cqw;
+  /* 地点行 + 展开的地点下拉（picker-sheet 上限 66.6667cqw）都要容得下，
+     否则点击"地点"后下拉被 max-height 裁成一行半（v24.1 修复） */
+  max-height: 80cqw;
   opacity: 1;
 }
 
@@ -4416,6 +4488,19 @@ picker-view-column {
   border-radius: 2.6667cqw;
   flex-shrink: 0;
   white-space: nowrap;
+}
+
+/* v24.1：管理员自行打印订单徽标 */
+.order-self-print-badge {
+  font-size: 2.6667cqw;
+  font-weight: 600;
+  padding: 0.5333cqw 1.8667cqw;
+  border-radius: 2.6667cqw;
+  flex-shrink: 0;
+  white-space: nowrap;
+  background-color: rgba(30, 102, 245, 0.10);
+  color: #1e66f5;
+  margin-left: 1.0667cqw;
 }
 
 .status-queued    { background-color: #FFF3E0; color: #E65100; }

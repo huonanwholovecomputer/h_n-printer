@@ -79,6 +79,7 @@ Component({
     userRole: '',
     submitting: false,
     autoPrintEnabled: false,   // 无障碍打印开关（仅管理员可见）
+    adminPrintEnabled: false,  // 管理员自行打印开关（仅管理员可见）
     autoPrintGlow: false,      // ⚡ 闪电发光特效
     glowPhase: '',             // 光晕阶段: ''（无）| 'striking'（爆发）| 'fading'（渐隐）| 'reset'（强制清除）
     glowStyle: '',             // 内联 text-shadow，JS 逐帧控制渐隐
@@ -254,7 +255,7 @@ Component({
       setTimeout(() => {
         let animationClass = ''
         if (isFirstLaunch) {
-          animationClass = 'page-fade-in page-fade-in-delayed'   // 首次加载：延迟 0.5s 向上淡入
+          animationClass = 'page-fade-in'   // 首次加载：整页快速淡入（无 0.5s 集体延迟，卡片入场由 enter-XX 逐元素驱动）
         } else if (tabFrom === 1) {
           animationClass = 'page-enter-left'
         } else {
@@ -1796,9 +1797,11 @@ Component({
       const key = e.currentTarget.dataset.sw
       const t = e.touches[0]
       if (!t) return
-      const on = key === 'cover' ? this.data.coverPage : (key === 'delivery' ? this.data.deliveryEnabled : this.data.autoPrintEnabled)
+      const on = key === 'cover' ? this.data.coverPage
+        : (key === 'delivery' ? this.data.deliveryEnabled
+        : (key === 'adminPrint' ? this.data.adminPrintEnabled : this.data.autoPrintEnabled))
       const ratio = (wx.getWindowInfo().windowWidth || 375) / 750
-      const maxPx = (key === 'autoPrint' ? 47 : 35) * ratio // 对应 wxss 中 switch-on 的 rpx 位移
+      const maxPx = (key === 'autoPrint' || key === 'adminPrint' ? 47 : 35) * ratio // 对应 wxss 中 switch-on 的 rpx 位移
       this._sw = { key, startX: t.clientX, startY: t.clientY, locked: false, startPx: on ? maxPx : 0, maxPx, lastPx: undefined }
     },
 
@@ -1825,11 +1828,14 @@ Component({
       this._sw = null
       if (!s.locked || s.lastPx === undefined) return
       const on = s.lastPx > s.maxPx / 2
-      const cur = s.key === 'cover' ? this.data.coverPage : (s.key === 'delivery' ? this.data.deliveryEnabled : this.data.autoPrintEnabled)
+      const cur = s.key === 'cover' ? this.data.coverPage
+        : (s.key === 'delivery' ? this.data.deliveryEnabled
+        : (s.key === 'adminPrint' ? this.data.adminPrintEnabled : this.data.autoPrintEnabled))
       const patch = { ['swDrag.' + s.key]: -1 }
       if (on !== cur) {
         if (s.key === 'cover') this.onToggleCoverPage()
         else if (s.key === 'delivery') this.onToggleDelivery()
+        else if (s.key === 'adminPrint') this.onAdminPrintToggle()
         else this.onAutoPrintToggle()
       }
       this.setData(patch)
@@ -1968,6 +1974,11 @@ Component({
         this._clearGlowCompletely()
         this._stopBreathingGlow()
       }
+    },
+
+    onAdminPrintToggle() {
+      // 管理员自行打印：自己的订单不计入收益，归属提交者（后端仅管理员角色生效）
+      this.setData({ adminPrintEnabled: !this.data.adminPrintEnabled })
     },
 
     // 生成"今天(周一)/明天(周二)/后天(周三)"日期选项（仅保留 3 天）
@@ -2597,6 +2608,8 @@ Component({
           cover_page_price: this.data.coverPagePrice,
           skip_page_validation: skipPageValidation ? 1 : 0,
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
+          // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
+          is_admin_print: (this.data.userRole === 'admin' && this.data.adminPrintEnabled) ? 1 : 0,
           // 无障碍打印预约：now=立即 / at=指定时间（今天~后天 + HH:MM）/ countdown=倒计时（分+秒）
           schedule_mode: this.data.autoPrintEnabled ? this.data.scheduleMode : 'now',
           schedule_day: this.data.autoPrintEnabled && this.data.scheduleMode === 'at' ? this.data.scheduleDayIndex : 0,
@@ -2625,6 +2638,8 @@ Component({
             showSuccessModal: true,
             lastOrderNumber: submitRes.data.order_number || '',
             lastScheduleText: this._scheduleDisplayText(),
+            lastAdminPrintText: (this.data.userRole === 'admin' && this.data.adminPrintEnabled)
+              ? '已标记管理员自行打印，不计入收益' : '',
           })
           // 任务发起后自动收起"打印文件"列表（高度补间归零，返回初始状态）
           this._fileListPx = 0

@@ -38,7 +38,8 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 最大上传 50MB
 # 均需跨域访问 /api/*。认证走 Bearer token（非 Cookie），放行任意 Origin 无越权风险，
 # 与下方 SocketIO 的 cors_allowed_origins="*" 保持一致。只配此一层即可，nginx 不要再加
 # Access-Control-* 头，避免出现重复头。
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+# max_age=86400：浏览器缓存 OPTIONS 预检 1 天，避免每次刷新都重发预检导致 nginx 限流 503
+CORS(app, resources={r"/api/*": {"origins": "*"}}, max_age=86400)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 DATABASE = "orders.db"
@@ -1195,6 +1196,28 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
+    # v24 迁移：订单归属标记 —— 谁处理了这笔订单 + 是否为管理员自行打印。
+    #   owner_name     TEXT    归属管理员姓名（本地工具下拉选择；云端订单由打印机回报时盖章）
+    #   is_admin_print INTEGER 1=管理员自行打印（非顾客订单）；0=顾客订单（接单打印）
+    # 首次建列后一次性迁移：历史无标记订单全部记为管理员"霍楠"、管理员自行打印。
+    # 注意：迁移 UPDATE 必须放在 ALTER 成功的同一分支内执行（仅在首次建列时跑一次），
+    #       否则每次启动都会把新产生的未盖章云端订单（owner_name=''）错误地改记为霍楠自打。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+        if "owner_name" not in cols and "is_admin_print" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN owner_name TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE orders ADD COLUMN is_admin_print INTEGER DEFAULT 0")
+            conn.commit()
+            conn.execute(
+                "UPDATE orders SET owner_name = '霍楠', is_admin_print = 1 "
+                "WHERE owner_name IS NULL OR owner_name = ''"
+            )
+            conn.commit()
+            print("  已添加 orders.owner_name / orders.is_admin_print 列")
+            print("  历史无标记订单已迁移至管理员“霍楠”名下（管理员自行打印）")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
     # 收支清算配置（单行 JSON blob，id 恒为 1；随 orders.db 一起被 backup.sh 备份）
     conn.execute(
         """
@@ -1413,6 +1436,7 @@ def fetch_and_lock_task(client_id):
             full_task = conn.execute(
                 """SELECT of.*, o.order_number, o.delivery_enabled, o.delivery_location,
                           o.urgency, o.cover_page, o.cover_page_price, o.auto_print,
+                          o.owner_name, o.is_admin_print,
                           f.md5 as source_md5
                    FROM order_files of
                    LEFT JOIN orders o ON of.order_id = o.id
@@ -1701,7 +1725,7 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
     if order_id:
         conn2 = get_db()
         o_row = conn2.execute(
-            "SELECT delivery_enabled, delivery_location, urgency, cover_page, cover_page_price FROM orders WHERE id = ?",
+            "SELECT delivery_enabled, delivery_location, urgency, cover_page, cover_page_price, owner_name, is_admin_print FROM orders WHERE id = ?",
             (order_id,),
         ).fetchone()
         conn2.close()
@@ -1711,6 +1735,9 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             task_msg["urgency"] = o_row["urgency"] or "低"
             task_msg["cover_page"] = bool(o_row["cover_page"])
             task_msg["cover_page_price"] = float(o_row["cover_page_price"] or 0.15)
+            # v24.1：订单归属标记随任务下发，本地工具据此预勾选"管理员自行打印"
+            task_msg["owner_name"] = o_row["owner_name"] or ""
+            task_msg["is_admin_print"] = bool(o_row["is_admin_print"])
 
     # 查询文件 MD5（供本地工具 PDF 缓存命中，避免重复下载，P1-7）
     if file_id:
@@ -2190,6 +2217,22 @@ def on_print_success(data):
     # 获取父订单 ID 并刷新聚合状态
     if row:
         refresh_order_status(conn, row["order_id"])
+        # 归属标记：本地打印工具回报成功时附带操作管理员姓名（订单号右侧下拉选择）。
+        # 云端订单为顾客订单（is_admin_print 保持 0），仅盖章 owner_name；
+        # 若客户端显式上报 is_admin_print 则一并写入。
+        owner_name = (data.get("owner_name") or "").strip()
+        admin_print = data.get("is_admin_print")
+        if owner_name or admin_print is not None:
+            if owner_name and admin_print is not None:
+                conn.execute(
+                    "UPDATE orders SET owner_name = ?, is_admin_print = ? WHERE id = ?",
+                    (owner_name, 1 if admin_print else 0, row["order_id"]),
+                )
+            elif owner_name:
+                conn.execute(
+                    "UPDATE orders SET owner_name = ? WHERE id = ?",
+                    (owner_name, row["order_id"]),
+                )
     conn.commit()
     conn.close()
 
@@ -3638,6 +3681,23 @@ def submit_order():
         return jsonify({"success": False, "message": "files 字段必须是非空数组"}), 400
 
     user_is_admin = (g.user_role == "admin")
+    # v24.1：管理员自行打印标记（仅管理员可设置；非管理员一律强制 0，防止伪造）
+    admin_print = 1 if (user_is_admin and data.get("is_admin_print")) else 0
+    owner_name = ""
+    if admin_print:
+        owner_name = (data.get("owner_name") or "").strip()
+        if not owner_name:
+            # 默认归属 = 提交者昵称（users.nickname），与收支清算成员名单对齐
+            try:
+                _uconn = get_user_db()
+                _urow = _uconn.execute(
+                    "SELECT nickname FROM users WHERE openid = ?", (g.openid,)
+                ).fetchone()
+                _uconn.close()
+                if _urow and _urow["nickname"]:
+                    owner_name = str(_urow["nickname"]).strip()
+            except Exception:
+                pass
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ---- 幂等去重（P0-2）：同用户同 client_request_id 的订单 10 分钟内返回原单 ----
@@ -3681,9 +3741,9 @@ def submit_order():
                                    urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                                    order_number, source, auto_print,
                                    schedule_mode, scheduled_at, schedule_frozen,
-                                   client_request_id)
+                                   client_request_id, owner_name, is_admin_print)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              0,  # is_free 恒为 0 — 价格仅用于统计
@@ -3691,7 +3751,7 @@ def submit_order():
              urgency, urgency_price, cover_page, cover_page_price, pickup_address,
              order_number, client, 1 if auto_print else 0,
              schedule_mode, scheduled_at,
-             client_request_id),
+             client_request_id, owner_name, admin_print),
             # is_free 恒为 0 — 价格仅用于统计，无免费策略
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -3899,7 +3959,8 @@ def submit_order():
     print(f"  [SUBMIT] openid={g.openid[:8]}..., files={len(sub_tasks)}, "
           f"delivery_enabled={delivery_enabled}, delivery_location={delivery_location!r}, "
           f"urgency={urgency!r}, cover_page={cover_page}, "
-          f"schedule_mode={schedule_mode}, scheduled_at={scheduled_at}")
+          f"schedule_mode={schedule_mode}, scheduled_at={scheduled_at}, "
+          f"is_admin_print={admin_print}, owner_name={owner_name!r}")
 
     return jsonify({
         "success": True,
@@ -3959,6 +4020,8 @@ def pull_queued_orders():
         "cover_page": bool(task.get("cover_page", False)),
         "cover_page_price": float(task.get("cover_page_price", 0.15) or 0.15),
         "auto_print": bool(task.get("auto_print", False)),
+        "owner_name": task.get("owner_name", "") or "",
+        "is_admin_print": bool(task.get("is_admin_print", False)),
     }
     if task["file_id"]:
         item["download_url"] = make_download_url(task["file_id"])
@@ -4046,7 +4109,8 @@ def get_orders():
                page_count, is_free, total_price, order_number,
                delivery_enabled, delivery_location, delivery_percentage,
                urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-               schedule_mode, scheduled_at, schedule_frozen
+               schedule_mode, scheduled_at, schedule_frozen,
+               owner_name, is_admin_print
         FROM orders
         WHERE {where_clause}
         ORDER BY id DESC
@@ -4155,7 +4219,8 @@ def get_order_detail(order_id):
                o.delivery_enabled, o.delivery_location, o.delivery_percentage,
                o.urgency, o.urgency_price, o.cover_page, o.cover_page_price,
                o.pickup_address,
-               o.schedule_mode, o.scheduled_at, o.schedule_frozen
+               o.schedule_mode, o.scheduled_at, o.schedule_frozen,
+               o.owner_name, o.is_admin_print
         FROM orders o
         WHERE o.id = ? AND o.openid = ?
         """,
@@ -4576,6 +4641,11 @@ def local_orders():
     files = data.get("files", [])
     total_price = data.get("total_price", 0)
     created_at = data.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    # 订单归属标记（本地工具订单号右侧下拉 + 勾选框）
+    owner_name = (data.get("owner_name", "") or "").strip()
+    is_admin_print = data.get("is_admin_print")
+    if is_admin_print is not None:
+        is_admin_print = 1 if is_admin_print else 0
 
     if not order_number or not files:
         return jsonify({"success": False, "message": "缺少 order_number 或 files"}), 400
@@ -4604,15 +4674,22 @@ def local_orders():
                    WHERE id = ?""",
                 (order_file_label, total_price, created_at, order_id),
             )
+            # 归属标记：本地工具上报时随订单写入（缺失则按迁移规则默认 霍楠/管理员自行打印，
+            # 与历史无标记订单的处理保持一致）
+            conn.execute(
+                "UPDATE orders SET owner_name = ?, is_admin_print = ? WHERE id = ?",
+                (owner_name or "霍楠", is_admin_print if is_admin_print is not None else 1, order_id),
+            )
             # 清除旧子任务（如果有），重新插入
             conn.execute("DELETE FROM order_files WHERE order_id = ?", (order_id,))
         else:
             # 新插入（离线同步或直接调用场景）
             conn.execute(
                 """INSERT INTO orders (file, copies, status, created_at, openid, order_number,
-                                       total_price, source)
-                   VALUES (?, 1, 'sent', ?, 'local', ?, ?, 'local')""",
-                (order_file_label, created_at, order_number, total_price),
+                                       total_price, source, owner_name, is_admin_print)
+                   VALUES (?, 1, 'sent', ?, 'local', ?, ?, 'local', ?, ?)""",
+                (order_file_label, created_at, order_number, total_price,
+                 owner_name or "霍楠", is_admin_print if is_admin_print is not None else 1),
             )
             order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -5897,6 +5974,8 @@ def admin_statistics_revenue():
         end_date    - 结束日期 (YYYY-MM-DD)，必填
         status      - 订单状态筛选，逗号分隔，默认不含 canceled/rejected/abandoned/reserved
         token       - 打印机认证 token
+    金额口径: 已入账 = sent 子任务合计；自打订单（is_admin_print=1）不计入收益金额，
+              订单/文件/页数等运营量仍计入。
     """
     token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
@@ -5920,13 +5999,15 @@ def admin_statistics_revenue():
     params = [start_date + " 00:00:00", end_date + " 23:59:59"] + allowed_statuses
 
     # ── 汇总：按 source 分组统计收益和数量 ──
+    # v5.1：自打订单（is_admin_print=1，管理员自行打印）不计入收益金额，
+    #       其打印量（订单/文件/页数）仍计入运营维度。
     summary_rows = conn.execute(
         f"""SELECT o.source,
                    COUNT(DISTINCT o.id) AS order_count,
                    COUNT(of.id) AS file_count,
                    SUM(of.page_count * of.copies) AS total_pages,
-                   SUM(CASE WHEN of.status = 'sent' THEN of.total_price ELSE 0 END) AS revenue,
-                   SUM(of.total_price) AS total_price_all
+                   SUM(CASE WHEN of.status = 'sent' AND o.is_admin_print = 0 THEN of.total_price ELSE 0 END) AS revenue,
+                   SUM(CASE WHEN o.is_admin_print = 0 THEN of.total_price ELSE 0 END) AS total_price_all
             FROM orders o
             INNER JOIN order_files of ON o.id = of.order_id
             WHERE o.created_at >= ? AND o.created_at <= ?
@@ -5954,13 +6035,13 @@ def admin_statistics_revenue():
         revenue_summary["total_pages"] += (row["total_pages"] or 0)
     revenue_summary["total"] = round(revenue_summary["total"], 2)
 
-    # ── 按用户分组（仅云端订单，排除 openid='local'） ──
+    # ── 按用户分组（仅云端订单，排除 openid='local'；v5.1 自打订单同样不计收益） ──
     by_user_rows = conn.execute(
         f"""SELECT o.openid,
                    COUNT(DISTINCT o.id) AS order_count,
                    COUNT(of.id) AS file_count,
                    SUM(of.page_count * of.copies) AS total_pages,
-                   SUM(CASE WHEN of.status = 'sent' THEN of.total_price ELSE 0 END) AS revenue,
+                   SUM(CASE WHEN of.status = 'sent' AND o.is_admin_print = 0 THEN of.total_price ELSE 0 END) AS revenue,
                    COUNT(DISTINCT CASE WHEN o.source = 'wechat' THEN o.id END) AS wechat_orders,
                    COUNT(DISTINCT CASE WHEN o.source = 'app' THEN o.id END) AS app_orders
             FROM orders o
@@ -6006,15 +6087,23 @@ def admin_statistics_revenue():
         })
 
     # ── 订单明细（时间倒序） ──
+    # v25 重构：LEFT JOIN 保留无子任务的订单（如本地放弃单），子任务状态条件移入 ON；
+    #          补充附加服务/自动打印/预约/地址等字段供收支清算云端页展示。
     order_rows = conn.execute(
         f"""SELECT o.id, o.order_number, o.source, o.openid, o.status,
                    o.total_price, o.created_at, o.delivery_enabled,
-                   o.delivery_location, o.urgency, o.cover_page
+                   o.delivery_location, o.urgency, o.cover_page,
+                   o.owner_name, o.is_admin_print,
+                   o.auto_print, o.schedule_mode, o.scheduled_at,
+                   o.delivery_percentage, o.urgency_price, o.cover_page_price,
+                   o.pickup_address
             FROM orders o
+            LEFT JOIN order_files of ON o.id = of.order_id AND of.status IN ({status_placeholders})
             WHERE o.created_at >= ? AND o.created_at <= ?
               AND o.status IN ({status_placeholders})
+            GROUP BY o.id
             ORDER BY o.created_at DESC""",
-        params,
+        allowed_statuses + [start_date + " 00:00:00", end_date + " 23:59:59"] + allowed_statuses,
     ).fetchall()
 
     # 收集所有订单 ID 用于批量查询子文件
@@ -6024,7 +6113,7 @@ def admin_statistics_revenue():
         of_placeholders = ",".join("?" for _ in order_ids)
         of_rows = conn.execute(
             f"""SELECT id, order_id, file_name, copies, page_count, duplex,
-                       page_range, total_price, status, created_at, image_orientation
+                       page_range, total_price, status, created_at, image_orientation, is_free
                 FROM order_files
                 WHERE order_id IN ({of_placeholders})
                 ORDER BY order_id, id""",
@@ -6044,6 +6133,7 @@ def admin_statistics_revenue():
                 "image_orientation": of_row["image_orientation"] or "auto",
                 "total_price": round(of_row["total_price"] or 0.0, 2),
                 "status": of_row["status"],
+                "is_free": bool(of_row["is_free"]),
                 "created_at": of_row["created_at"],
             })
 
@@ -6068,6 +6158,24 @@ def admin_statistics_revenue():
     for row in order_rows:
         oid = row["id"]
         prof = all_profiles.get(row["openid"], {})
+        files = files_by_order.get(oid, [])
+        # 金额口径：已入账 = sent 子任务合计；应收未收 = 其余未排除状态（排队/打印中/断线未知）合计；
+        # 取消/放弃/打回/失败不计（失败单大概率不收费，仍可在明细状态列看到）。
+        # 文件级 is_free 免费文件不计入金额但单独计数。
+        # v5.1：自打订单（is_admin_print=1）不计入收益金额（明细文件单价仍原样展示）。
+        paid_revenue = 0.0
+        receivable = 0.0
+        free_files = 0
+        is_self_print = bool(row["is_admin_print"])
+        for f in files:
+            if f["is_free"]:
+                free_files += 1
+            if is_self_print:
+                continue
+            if f["status"] == "sent":
+                paid_revenue += f["total_price"]
+            elif f["status"] not in ("canceled", "abandoned", "rejected", "failed"):
+                receivable += f["total_price"]
         orders.append({
             "order_id": oid,
             "order_number": row["order_number"] or "",
@@ -6078,15 +6186,25 @@ def admin_statistics_revenue():
             "status": row["status"],
             "total_price": round(row["total_price"] or 0.0, 2),
             "created_at": row["created_at"],
+            "owner_name": row["owner_name"] or "",
+            "is_admin_print": bool(row["is_admin_print"]),
             "delivery_enabled": bool(row["delivery_enabled"]),
             "delivery_location": row["delivery_location"] or "",
+            "delivery_percentage": row["delivery_percentage"] or 0,
             "urgency": row["urgency"] or "低",
+            "urgency_price": row["urgency_price"] or 0,
             "cover_page": bool(row["cover_page"]),
-            "files_count": len(files_by_order.get(oid, [])),
-            "total_page_count": sum(f["page_count"] * f["copies"] for f in files_by_order.get(oid, [])),
-            "revenue": round(sum(f["total_price"] for f in files_by_order.get(oid, [])
-                                 if f["status"] == "sent"), 2),
-            "files": files_by_order.get(oid, []),
+            "cover_page_price": row["cover_page_price"] or 0,
+            "pickup_address": row["pickup_address"] or "",
+            "auto_print": bool(row["auto_print"]),
+            "schedule_mode": row["schedule_mode"] or "now",
+            "scheduled_at": row["scheduled_at"] or "",
+            "files_count": len(files),
+            "total_page_count": sum(f["page_count"] * f["copies"] for f in files),
+            "revenue": round(paid_revenue, 2),
+            "receivable": round(receivable, 2),
+            "free_files": free_files,
+            "files": files,
         })
 
     conn.close()
@@ -6098,6 +6216,98 @@ def admin_statistics_revenue():
             "revenue_summary": revenue_summary,
             "by_user": by_user,
             "orders": orders,
+        },
+    })
+
+
+@app.route("/api/admin/statistics/owners", methods=["GET"])
+def admin_statistics_owners():
+    """管理员订单归属统计（printer token 鉴权）。
+    按订单归属管理员（orders.owner_name）分组，拆分"管理员自己的订单"（is_admin_print=1）
+    与"接单打印的顾客订单"（is_admin_print=0），供本地打印工具收支清算页展示每位管理员的
+    自打/接单比例与整体明细。
+    参数: start_date / end_date / status（同 revenue 接口）
+    """
+    token = _get_printer_token()
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    start_date = request.args.get("start_date", "").strip()
+    end_date = request.args.get("end_date", "").strip()
+    if not start_date or not end_date:
+        return jsonify({"success": False, "message": "缺少 start_date 或 end_date 参数"}), 400
+
+    # 状态筛选（排除已取消/已拒绝/已放弃/已预留），口径与 revenue 接口一致
+    status_param = request.args.get("status", "").strip()
+    if status_param:
+        allowed_statuses = [s.strip() for s in status_param.split(",") if s.strip()]
+    else:
+        allowed_statuses = ["sent", "printing", "queued", "failed", "offline_unknown"]
+
+    conn = get_db()
+    status_placeholders = ",".join("?" for _ in allowed_statuses)
+    params = [start_date + " 00:00:00", end_date + " 23:59:59"] + allowed_statuses
+
+    # ── 按归属管理员分组（自打 / 接单两维度） ──
+    rows = conn.execute(
+        f"""SELECT o.owner_name,
+                   COUNT(DISTINCT o.id) AS order_count,
+                   COUNT(DISTINCT CASE WHEN o.is_admin_print = 1 THEN o.id END) AS own_orders,
+                   COUNT(DISTINCT CASE WHEN o.is_admin_print = 0 THEN o.id END) AS accepted_orders,
+                   COUNT(DISTINCT CASE WHEN o.is_admin_print = 1 THEN of.id END) AS own_files,
+                   COUNT(DISTINCT CASE WHEN o.is_admin_print = 0 THEN of.id END) AS accepted_files,
+                   SUM(CASE WHEN o.is_admin_print = 1 THEN of.page_count * of.copies ELSE 0 END) AS own_pages,
+                   SUM(CASE WHEN o.is_admin_print = 0 THEN of.page_count * of.copies ELSE 0 END) AS accepted_pages,
+                   SUM(CASE WHEN o.is_admin_print = 1 AND of.status = 'sent' THEN of.total_price ELSE 0 END) AS own_revenue,
+                   SUM(CASE WHEN o.is_admin_print = 0 AND of.status = 'sent' THEN of.total_price ELSE 0 END) AS accepted_revenue
+            FROM orders o
+            INNER JOIN order_files of ON o.id = of.order_id
+            WHERE o.created_at >= ? AND o.created_at <= ?
+              AND of.status IN ({status_placeholders})
+            GROUP BY o.owner_name
+            ORDER BY order_count DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+
+    owners = []
+    totals = {"order_count": 0,
+              "own_orders": 0, "accepted_orders": 0,
+              "own_files": 0, "accepted_files": 0,
+              "own_pages": 0, "accepted_pages": 0,
+              "own_revenue": 0.0, "accepted_revenue": 0.0}
+    for row in rows:
+        name = (row["owner_name"] or "").strip() or "未归属"
+        own = row["own_orders"] or 0
+        acc = row["accepted_orders"] or 0
+        own_rev = round(row["own_revenue"] or 0.0, 2)
+        acc_rev = round(row["accepted_revenue"] or 0.0, 2)
+        owners.append({
+            "owner_name": name,
+            "order_count": row["order_count"] or 0,
+            "own_orders": own,
+            "accepted_orders": acc,
+            "own_ratio": round(own / (own + acc), 4) if (own + acc) else 0,
+            "own_files": row["own_files"] or 0,
+            "accepted_files": row["accepted_files"] or 0,
+            "own_pages": row["own_pages"] or 0,
+            "accepted_pages": row["accepted_pages"] or 0,
+            "own_revenue": own_rev,
+            "accepted_revenue": acc_rev,
+        })
+        totals["order_count"] += row["order_count"] or 0
+        for k in ("own_orders", "accepted_orders", "own_files", "accepted_files",
+                  "own_pages", "accepted_pages"):
+            totals[k] += row[k] or 0
+        totals["own_revenue"] = round(totals["own_revenue"] + own_rev, 2)
+        totals["accepted_revenue"] = round(totals["accepted_revenue"] + acc_rev, 2)
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "period": {"start": start_date, "end": end_date},
+            "owners": owners,
+            "summary": totals,
         },
     })
 

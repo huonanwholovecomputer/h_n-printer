@@ -74,6 +74,7 @@ class CloudTask:
         "error_message", "source_md5",
         "image_orientation",
         "delivery_enabled", "delivery_location", "urgency", "cover_page", "cover_page_price",
+        "owner_name", "is_admin_print",
         "auto_print",
         # 无障碍打印预约（此前 __init__ 已赋值但这些字段漏在 __slots__ 之外 → 构造必报 AttributeError）
         "schedule_mode", "scheduled_at", "scheduled_ts", "schedule_frozen",
@@ -105,6 +106,9 @@ class CloudTask:
         self.urgency: str = data.get("urgency", "低") or "低"
         self.cover_page: bool = bool(data.get("cover_page", False))
         self.cover_page_price: float = float(data.get("cover_page_price", 0.15) or 0.15)
+        # v24.1：订单归属（管理员自行打印标记随任务下发，本地标签页预勾选）
+        self.owner_name: str = data.get("owner_name", "") or ""
+        self.is_admin_print: bool = bool(data.get("is_admin_print", False))
         self.auto_print: bool = bool(data.get("auto_print", False))  # 无障碍打印
         # 无障碍打印预约形式：now | at | countdown（'now' 即立即开始）
         self.schedule_mode: str = data.get("schedule_mode", "now") or "now"
@@ -129,6 +133,8 @@ class CloudTask:
             "error_message": self.error_message,
             "source_md5": self.source_md5,
             "image_orientation": self.image_orientation,
+            "owner_name": self.owner_name,
+            "is_admin_print": self.is_admin_print,
         }
 
 

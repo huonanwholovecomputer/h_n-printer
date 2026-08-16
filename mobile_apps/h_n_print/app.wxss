@@ -249,6 +249,15 @@ page {
 .card-entering-fade {
   animation: cardFadeIn 0.5s 0.25s cubic-bezier(0.22, 0.61, 0.36, 1) both;
 }
+/* 逐元素入场动画：延迟直接烘焙进 animation 简写（0.5s 时长 + 各自延迟），
+   避免独立 animation-delay 长属性与 .card-entering-fade 简写产生级联竞争 */
+.enter-05 { animation: cardFadeIn 0.5s 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-06 { animation: cardFadeIn 0.5s 0.6s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-07 { animation: cardFadeIn 0.5s 0.7s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-08 { animation: cardFadeIn 0.5s 0.8s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-09 { animation: cardFadeIn 0.5s 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-10 { animation: cardFadeIn 0.5s 1.0s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.enter-11 { animation: cardFadeIn 0.5s 1.1s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
 
 /* Card remove — fade out + collapse in one go */
 @keyframes cardRemove {
@@ -1030,6 +1039,13 @@ page {
     0 4rpx 16rpx rgba(0, 0, 0, 0.40),
     inset 0 1rpx 0 rgba(255, 255, 255, 0.12),
     0 0 0 0.5rpx rgba(255, 255, 255, 0.08);
+}
+
+/* emoji 字形在 emoji 字体度量下整体偏向行盒下方，
+   用 translateY 上移补偿，使其在圆形按钮内竖直居中（与 APP 端同一修复） */
+.theme-toggle-btn text {
+  line-height: 1;
+  transform: translateY(-0.05em);
 }
 
 /* ═══════════════ Scroll To Top Button ═══════════════ */

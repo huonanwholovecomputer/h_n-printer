@@ -33,6 +33,7 @@ from PySide6.QtGui import (
     QFont,
     QColor,
     QIcon,
+    QPainter,
     QShortcut,
     QKeySequence,
     QDesktopServices,
@@ -67,6 +68,9 @@ from PySide6.QtWidgets import (
     QAbstractScrollArea,
     QStatusBar,
     QStyleFactory,
+    QStyle,
+    QStyleOptionButton,
+    QCheckBox,
 )
 
 from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, generate_order_number
@@ -102,6 +106,23 @@ def _disable_combo_wheel(combo: QComboBox) -> None:
     combo.installEventFilter(_WheelBlocker(combo))
 
 
+class _OwnerComboRefreshFilter(QObject):
+    """归属下拉弹出时触发一次回调（用于从云端同步收支清算成员名单，保证选项一致）。
+    监听弹出视图 viewport 的 Show 事件 —— 无论点击下拉箭头还是编辑框都会先 Show。"""
+
+    def __init__(self, callback):
+        super().__init__()
+        self._callback = callback
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Show and self._callback:
+            try:
+                self._callback()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
+
 def _soft_wrap_text(text: str) -> str:
     """在长 token（路径/文件名）中插入零宽空格(U+200B)，让 QLabel wordWrap 可换行。
     路径与云端临时文件名常为无空格长串，wordWrap 默认断不开会撑宽整个布局。"""
@@ -110,6 +131,44 @@ def _soft_wrap_text(text: str) -> str:
     for sep in ("\\", "/", "_", "-"):
         text = text.replace(sep, sep + "​")
     return text
+
+
+class ThemedCheckBox(QCheckBox):
+    """主题适配复选框：方框由 QSS 绘制，勾选态的对勾由 paintEvent 直接用字符绘制。
+
+    免图片资源：勾选后叠加绘制 "✓"（U+2713）字符，颜色随主题（深色主题深色勾 / 浅色主题白色勾），
+    字体渲染与界面文字一致，任意 DPI 都清晰。
+    """
+
+    def __init__(self, text: str = "", parent: QWidget | None = None, theme_manager: ThemeManager | None = None):
+        super().__init__(text, parent)
+        self._theme_manager = theme_manager
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.isChecked():
+            return
+        opt = QStyleOptionButton()
+        self.initStyleOption(opt)
+        rect = self.style().subElementRect(QStyle.SE_CheckBoxIndicator, opt, self)
+        if rect.isEmpty():
+            return
+        dark = self._theme_manager is not None and self._theme_manager.effective_theme == MODE_DARK
+        if not self.isEnabled():
+            color = QColor("#6c7086") if dark else QColor("#9ca0b0")
+        else:
+            color = QColor("#1e1e2e") if dark else QColor("#ffffff")
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            f = QFont(self.font())
+            f.setPixelSize(max(8, int(rect.height() * 0.72)))
+            f.setBold(True)
+            painter.setFont(f)
+            painter.setPen(color)
+            painter.drawText(rect, Qt.AlignCenter, "✓")
+        finally:
+            painter.end()
 
 
 def _format_engine_label(ext: str) -> str:
@@ -1613,6 +1672,8 @@ class MainWindow(QMainWindow):
 
     def _on_open_finance(self):
         """打开收支清算页面。启动本地 HTTP 服务器，在浏览器中打开统计页面。"""
+        # 打开前先同步云端收支清算成员名单 → 归属下拉保持一致
+        self._refresh_owner_names_from_cloud()
         # 如果已启动则直接打开，否则先启动
         if self._stats_server is None:
             self._stats_server = StatsServer(
@@ -2190,6 +2251,26 @@ class MainWindow(QMainWindow):
         self._order_number_label = QLabel("📋 未分配订单号")
         self._order_number_label.setObjectName("orderNumberLabel")
         total_row.addWidget(self._order_number_label)
+        # 订单归属（v24）：订单号右侧 —— 归属管理员下拉 + 管理员自行打印勾选
+        self._owner_label = QLabel("归属")
+        self._owner_label.setObjectName("ownerLabel")
+        total_row.addWidget(self._owner_label)
+        self._owner_combo = QComboBox()
+        self._owner_combo.setObjectName("ownerCombo")
+        # 只允许从下拉选择（名单 = 收支清算成员管理中的成员），不允许直接输入
+        self._owner_combo.setEditable(False)
+        self._owner_combo.setFixedWidth(110)
+        self._owner_combo.setToolTip("这笔订单属于谁（从下拉选择，名单与收支清算成员管理一致）")
+        self._owner_combo.currentTextChanged.connect(self._on_owner_changed)
+        # 弹出下拉时同步云端收支清算成员名单（与「收支清算 → 成员管理」保持一致）
+        self._owner_combo_refresh_filter = _OwnerComboRefreshFilter(self._refresh_owner_names_from_cloud)
+        self._owner_combo.view().viewport().installEventFilter(self._owner_combo_refresh_filter)
+        total_row.addWidget(self._owner_combo)
+        self._admin_print_check = ThemedCheckBox("管理员自行打印", theme_manager=self._theme_manager)
+        self._admin_print_check.setObjectName("adminPrintCheck")
+        self._admin_print_check.setToolTip("勾选 = 这是管理员自己打印的订单，而不是顾客的订单")
+        self._admin_print_check.toggled.connect(self._on_admin_print_toggled)
+        total_row.addWidget(self._admin_print_check)
         total_row.addStretch()
         self._total_label = QLabel("合计: ¥0.00")
         self._total_label.setObjectName("totalCostLabel")
@@ -3315,6 +3396,10 @@ class MainWindow(QMainWindow):
             self._urgency_price_spin.setEnabled(False)
             self._cover_page_onoff_combo.setEnabled(False)
             self._cover_page_price_spin.setEnabled(False)
+            if hasattr(self, '_owner_combo') and self._owner_combo:
+                self._owner_combo.setEnabled(False)
+            if hasattr(self, '_admin_print_check') and self._admin_print_check:
+                self._admin_print_check.setEnabled(False)
             return
         self._delivery_onoff_combo.setEnabled(True)
         self._delivery_onoff_combo.blockSignals(True)
@@ -3346,6 +3431,105 @@ class MainWindow(QMainWindow):
         self._cover_page_price_spin.blockSignals(True)
         self._cover_page_price_spin.setValue(tab.cover_page_price)
         self._cover_page_price_spin.blockSignals(False)
+        # 订单归属（v24）：归属管理员下拉 + 管理员自行打印勾选
+        if hasattr(self, '_owner_combo') and self._owner_combo:
+            self._owner_combo.setEnabled(True)
+            self._update_owner_combo_items()
+        if hasattr(self, '_admin_print_check') and self._admin_print_check:
+            self._admin_print_check.setEnabled(True)
+            self._admin_print_check.blockSignals(True)
+            self._admin_print_check.setChecked(bool(tab.is_admin_print))
+            self._admin_print_check.blockSignals(False)
+
+    def _update_owner_combo_items(self):
+        """按 config.admin_names + 当前标签页归属人重建归属下拉项，尽量保持当前选中。
+        与「收支清算 → 成员管理」一致：cloud 成员名单通过 _refresh_owner_names_from_cloud 汇入 admin_names。"""
+        tab = self._config.tabs.get(self._current_tab)
+        tab_owner = (tab.owner_name if tab else "霍楠") or "霍楠"
+        names = list(self._config.admin_names or [])
+        if tab_owner and tab_owner not in names:
+            names.append(tab_owner)
+        cur = self._owner_combo.currentText()
+        if cur and cur not in names:
+            names.append(cur)
+        if [self._owner_combo.itemText(i) for i in range(self._owner_combo.count())] != names:
+            self._owner_combo.blockSignals(True)
+            self._owner_combo.clear()
+            self._owner_combo.addItems(names)
+            self._owner_combo.blockSignals(False)
+        if self._owner_combo.currentText() != tab_owner:
+            self._owner_combo.blockSignals(True)
+            self._owner_combo.setCurrentText(tab_owner)
+            self._owner_combo.blockSignals(False)
+
+    def _refresh_owner_names_from_cloud(self):
+        """从云端收支清算配置同步成员名单到归属下拉（成员管理里的成员名）。
+        仅合并新增名字，不覆盖已有选项；离线/失败时静默保留本地名单。"""
+        if not self._cloud_client or not self._cloud_client.is_connected():
+            return
+        if not self._cloud_client.api_url or not self._cloud_client.token:
+            return
+        try:
+            resp = http_requests.get(
+                f"{self._cloud_client.api_url}/api/finance/config",
+                params={"token": self._cloud_client.token},
+                timeout=4,
+            )
+            if not resp.ok:
+                return
+            data = resp.json()
+            if not data.get("success"):
+                return
+            cfg = data.get("data") or {}
+            members = (cfg.get("config") or {}).get("members") or []
+            names = []
+            for m in members:
+                n = str(m.get("name", "")).strip() if isinstance(m, dict) else ""
+                if n and n not in names:
+                    names.append(n)
+            if not names:
+                return
+            # 合并 + 修剪：名单 = 云端成员 ∪ 仍被标签页使用的名字。
+            # 云端成员名是权威来源，本地残留的过期名字（如历史脏数据）若未被任何标签页引用则剔除，
+            # 保证下拉与「收支清算 → 成员管理」完全一致。
+            used = set()
+            for t in self._config.tabs.values():
+                if getattr(t, 'owner_name', ''):
+                    used.add(t.owner_name)
+            base = list(self._config.admin_names or [])
+            merged = []
+            for n in names:
+                if n not in merged:
+                    merged.append(n)
+            for n in base:
+                if n not in merged and n in used:
+                    merged.append(n)
+            if merged != base:
+                self._config.admin_names = merged
+                self._save_config()
+            # 无论是否变化都刷新下拉（保持顺序/一致性）
+            if hasattr(self, '_owner_combo') and self._owner_combo:
+                self._update_owner_combo_items()
+        except Exception as e:
+            logger.debug(f"同步云端成员名单失败: {e}")
+
+    def _on_owner_changed(self, text: str):
+        """归属管理员变更 → 写入当前标签页（下拉只允许选择，选择即保存）。"""
+        if self._is_current_tab_frozen():
+            return
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            tab.owner_name = (text or "").strip() or "霍楠"
+        self._save_config()
+
+    def _on_admin_print_toggled(self, checked: bool):
+        """管理员自行打印勾选变更 → 写入当前标签页。"""
+        if self._is_current_tab_frozen():
+            return
+        tab = self._config.tabs.get(self._current_tab)
+        if tab:
+            tab.is_admin_print = bool(checked)
+        self._save_config()
 
     def _on_delivery_toggled(self):
         """派送开关变更 → 写入当前标签页。"""
@@ -3669,6 +3853,14 @@ class MainWindow(QMainWindow):
                     if j.order_number == new_num:
                         order_jobs.append(j)
             if order_jobs:
+                # 归属标记（v24）：取该订单所在标签页的归属设置
+                owner_name = "霍楠"
+                is_admin_print = True
+                for tab2 in self._config.tabs.values():
+                    if any(j.order_number == new_num for j in tab2.jobs):
+                        owner_name = (tab2.owner_name or "霍楠")
+                        is_admin_print = bool(tab2.is_admin_print)
+                        break
                 try:
                     http_requests.post(
                         f"{self._cloud_client.api_url}/api/local_orders",
@@ -3689,6 +3881,8 @@ class MainWindow(QMainWindow):
                                 "page_range": j.page_range,
                             } for j in order_jobs],
                             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "owner_name": owner_name,
+                            "is_admin_print": is_admin_print,
                         },
                         timeout=10,
                     )
@@ -3946,13 +4140,23 @@ class MainWindow(QMainWindow):
                 self._save_config()
             if task_id and self._cloud_client:
                 if success:
+                    # 归属标记（v24）：云端订单为顾客订单，由打印它的管理员盖章（订单号右侧下拉选择）
+                    owner_name = ""
+                    tab = self._config.tabs.get(self._current_tab)
+                    if tab:
+                        owner_name = (tab.owner_name or "").strip()
                     # 上报实际打印配置（本地可能修改过份数/双面/范围/页数），后端同步 order_files
-                    self._cloud_client.report_success(task_id, {
+                    report_cfg = {
                         "copies": job.copies,
                         "duplex": job.duplex,
                         "page_range": job.page_range or "",
                         "page_count": job.page_count or 0,
-                    })
+                    }
+                    if owner_name:
+                        report_cfg["owner_name"] = owner_name
+                    # v24.1：归属标记随打印回报（管理员可在机位勾选/取消），后端同步 orders
+                    report_cfg["is_admin_print"] = bool(tab.is_admin_print) if tab else False
+                    self._cloud_client.report_success(task_id, report_cfg)
                 else:
                     self._cloud_client.report_fail(task_id, message)
 
@@ -4051,6 +4255,9 @@ class MainWindow(QMainWindow):
                             "total_price": total_price,
                             "files": files_data,
                             "created_at": created_at,
+                            # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
+                            "owner_name": (tab.owner_name if tab else "霍楠"),
+                            "is_admin_print": bool(tab.is_admin_print) if tab else True,
                             # 附加服务上报（与计费口径一致）
                             **extra_fields,
                         },
@@ -4093,6 +4300,9 @@ class MainWindow(QMainWindow):
                         "total_price": total_price,
                         "files": files_data,
                         "created_at": created_at,
+                        # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
+                        "owner_name": (tab.owner_name if tab else "霍楠"),
+                        "is_admin_print": bool(tab.is_admin_print) if tab else True,
                         # 附加服务上报（与计费口径一致）
                         **extra_fields,
                     },
@@ -4116,6 +4326,8 @@ class MainWindow(QMainWindow):
                         files_data=files_data,
                         total_price=total_price,
                         created_at=created_at,
+                        owner_name=(tab.owner_name if tab else "霍楠"),
+                        is_admin_print=bool(tab.is_admin_print) if tab else True,
                     )
                     self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
                 except Exception as e:
@@ -4913,6 +5125,8 @@ class MainWindow(QMainWindow):
             self._sync_local_orders_to_cloud()
             if self._cloud_client:
                 self._cloud_client.sync_pending_statuses()
+            # 连线后同步云端收支清算成员名单 → 归属下拉保持一致
+            self._refresh_owner_names_from_cloud()
             # 连线后立即同步离线缓存的订单
             if self._offline_sync and self._cloud_client:
                 try:
@@ -5267,6 +5481,12 @@ class MainWindow(QMainWindow):
             tab_settings.urgency = task.urgency
             tab_settings.cover_page = task.cover_page
             tab_settings.cover_page_price = task.cover_page_price
+            # v24.1：云端订单若由管理员在前端标记"管理员自行打印"→ 预勾选并沿用归属人；
+            # 否则为顾客订单（不是管理员自行打印），归属人默认当前机位管理员
+            tab_settings.is_admin_print = bool(getattr(task, 'is_admin_print', False))
+            task_owner = (getattr(task, 'owner_name', '') or '').strip()
+            if task_owner:
+                tab_settings.owner_name = task_owner
             self._config.tabs[new_key] = tab_settings
             self._current_tab = new_key
             self._config.active_tab = new_key
