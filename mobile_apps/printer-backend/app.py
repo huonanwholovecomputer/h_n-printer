@@ -3122,7 +3122,12 @@ def wx_login():
 
 @app.route("/api/device_login", methods=["POST"])
 def device_login():
-    """Android/Web 设备登录：用 device_id 创建或恢复账号，无需微信。"""
+    """Android/Web 设备登录：用 device_id 换取设备 token，无需微信。
+
+    惰性注册（方案 A）：首次登录只签发 guest 级设备 token，**不**在 users 表建号，
+    避免"打开即建号"产生一堆从未使用的空账号。
+    真正使用（兑换授权密钥 /api/license/redeem）时才会在 users 表惰性创建账号。
+    """
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
@@ -3130,7 +3135,7 @@ def device_login():
     device_id = (data.get("device_id") or "").strip()
 
     # 限速（P0-2.2 / P1-6 / 防滥用）：每 IP / 每 device_id 每小时登录次数上限（管理员可调），
-    # 防止无限建号刷库。注意：内存计数仅单 worker 有效，nginx 层应再加 IP 维度限速。
+    # 防止无限刷 token 刷库。注意：内存计数仅单 worker 有效，nginx 层应再加 IP 维度限速。
     ip = request.remote_addr or "unknown"
     _dev_login_limit = _SECURITY["device_login_rate_limit"]
     if not _rate_limit(f"device_login:ip:{ip}", _dev_login_limit, 3600) or \
@@ -3148,30 +3153,29 @@ def device_login():
     existing = conn.execute(
         "SELECT openid, bound_openid FROM users WHERE openid = ?", (dev_openid,)
     ).fetchone()
-    if not existing:
-        suffix = ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
-        nickname = f"手机用户_{suffix}"
-        conn.execute(
-            "INSERT INTO users (openid, nickname, avatar_path, updated_at) VALUES (?, ?, '', ?)",
-            (dev_openid, nickname, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
-        conn.commit()
-        bound_openid = ""
-    else:
+
+    registered = bool(existing)      # users 表是否已有该设备账号
+    if existing:
         # 设备已绑定微信账号 → 直接签发微信账号的 token（同一账号身份、同一权限）
         bound_openid = existing["bound_openid"] or ""
+        token_openid = bound_openid or dev_openid
+    else:
+        # 惰性注册：不建号，签发 guest 级设备 token。compute_role 对不存在的 openid 返回 guest，
+        # 直到真正兑换授权密钥（/api/license/redeem）时才惰性建号。
+        bound_openid = ""
+        token_openid = dev_openid
 
-    token_openid = bound_openid or dev_openid
     token = token_serializer.dumps(token_openid)
     conn.close()
 
-    print(f"设备登录: device_id={device_id[:12]}..., openid={token_openid[:8]}..., bound={bool(bound_openid)}")
+    print(f"设备登录: device_id={device_id[:12]}..., openid={token_openid[:8]}..., bound={bool(bound_openid)}, registered={registered}")
 
     return jsonify({
         "success": True,
         "token": token,
         "openid": token_openid,
         "bound": bool(bound_openid),
+        "registered": registered,
     })
 
 
