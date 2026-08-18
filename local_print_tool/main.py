@@ -92,12 +92,19 @@ from theme_manager import ThemeManager
 def setup_logging():
     """配置日志系统。"""
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    logging.basicConfig(
+    # 打包(console=False)后 sys.stdout 可能为 None；有有效 stream 才设置，
+    # 否则用 logging 默认（stderr / lastResort），避免 basicConfig 以 None 做 stream 报错。
+    kw = dict(
         level=logging.INFO,
         format=fmt,
         datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
     )
+    try:
+        if sys.stdout is not None:  # type: ignore[comparison-overlap]
+            kw["stream"] = sys.stdout
+    except Exception:
+        pass
+    logging.basicConfig(**kw)
 
 
 def check_dependencies() -> list[str]:
@@ -134,6 +141,20 @@ def load_stylesheet(path: str) -> str:
 
 def main():
     """主函数。"""
+    # ── 强制 UTF-8 输出（打包后 Windows 默认 stdout/stderr 为 GBK，
+    #    日志含 ✓（U+2713）等字符时 logging.StreamHandler 会抛 UnicodeEncodeError，
+    #    导致打包版日志输出异常；开发运行 main.py 因（部分）终端/重定向为 UTF-8 而不复现） ──
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    # 供 logging 模块直达文件/恶意写路径，统一 UTF-8
+    try:
+        os.environ["PYTHONIOENCODING"] = "utf-8"
+    except Exception:
+        pass
+
     # ── 在 stderr 被劫持前保存原始 fd，用于异常追踪 ──
     _saved_stderr_fd = os.dup(2)
 

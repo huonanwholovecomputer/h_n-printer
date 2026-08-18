@@ -1605,6 +1605,14 @@ class MainWindow(QMainWindow):
         self._load_config_to_ui()
         self._init_cloud_client()
 
+        # ── 启动日志：让日志区启动即有内容 ──
+        # （打包版默认不内置服务器地址/令牌，未配云端时也明确提示用户，避免误以为日志功能异常）
+        if self._config.cloud_enabled and self._config.cloud_token:
+            self._log(f"☁ 云端已配置 {self._config.cloud_api_url}，正在连接...")
+        else:
+            self._log("ℹ 云端未配置（服务器地址/令牌为空）。请通过「文件 → 云端连接设置」填写后即可连接云端。")
+        self._log("✅ HN 本地打印工具已启动")
+
     # ---- 标签页 key 安全排序 ----
 
     @staticmethod
