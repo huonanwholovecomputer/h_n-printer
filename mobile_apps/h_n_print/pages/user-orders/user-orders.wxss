@@ -472,6 +472,19 @@
   white-space: nowrap;
 }
 
+/* v5.17：订单来源类型标签（云端 / 本地） */
+.order-source-tag {
+  font-size: 20rpx;
+  font-weight: 600;
+  padding: 4rpx 14rpx;
+  border-radius: 20rpx;
+  flex-shrink: 0;
+  white-space: nowrap;
+  margin-left: 8rpx;
+}
+.order-source-tag.tag-local { background-color: rgba(22, 163, 74, 0.12); color: #16a34a; }
+.order-source-tag.tag-cloud { background-color: rgba(0, 122, 255, 0.12); color: #007AFF; }
+
 .status-queued    { background-color: #FFF3E0; color: #E65100; }
 .status-printing  { background-color: #E3F2FD; color: #1565C0; }
 .status-accepted  { background-color: #E3F2FD; color: #1565C0; }

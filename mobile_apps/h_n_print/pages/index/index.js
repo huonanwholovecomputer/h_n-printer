@@ -63,6 +63,36 @@ function _initThemeMode() {
   } catch (e) {}
   return wx.getStorageSync('themeMode') || 'auto'
 }
+/* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
+   对齐本地 calc_cost / 后端 calculate_price 口径（含中文逗号、智能拆分 '23-4'） */
+function countPagesInRange(pageRange, total) {
+  if (!pageRange || !String(pageRange).trim()) return total
+  const pages = new Set()
+  String(pageRange).replace(/[、，；\s]/g, ',').split(',').forEach(part => {
+    part = (part || '').trim()
+    if (!part) return
+    if (part.indexOf('-') >= 0) {
+      const sp = part.split('-')
+      const a = parseInt(sp[0], 10), b = parseInt(sp[1], 10)
+      if (!isNaN(a) && !isNaN(b)) {
+        if (a < b) {
+          for (let p = a; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
+        } else if (a > b && String(a).length > 1) {
+          const prefix = parseInt(String(a).slice(0, -1), 10)
+          const last = parseInt(String(a).slice(-1), 10)
+          if (prefix < b) {
+            for (let p = last; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
+            if (prefix >= 1 && prefix <= total) pages.add(prefix)
+          }
+        }
+      }
+    } else {
+      const p = parseInt(part, 10)
+      if (!isNaN(p) && p >= 1 && p <= total) pages.add(p)
+    }
+  })
+  return pages.size || total
+}
 
 Component({
   data: {
@@ -164,8 +194,15 @@ Component({
       fileSection: '0.7s',
       extParams: '0.8s',
       autoPrint: '0.9s',
-      submit: '1.0s',
+      adminPrint: '1.0s',
+      submit: '1.1s',
     },
+    // 入场状态（JS 按页面加载时刻调度）：entered.x 到点置 true 播放；entranceDone 结束后清理类防切 tab 重放
+    entered: {
+      logo: false, statusBar: false, fileSection: false, extParams: false,
+      autoPrint: false, adminPrint: false, submit: false,
+    },
+    entranceDone: false,
   },
   lifetimes: {
     attached() {
@@ -305,16 +342,13 @@ Component({
       // 重新测量滚动引擎（因为 DOM 可能变化）
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(300), 300)
-      // 仅真实首次启动时触发入场动效（card-preload 保证卡片在动画触发前不可见）
+      // 仅真实首次启动时触发入场动效：JS 按页面加载时刻调度各卡片（0.5s 起逐 0.1s 递增）
       if (!this._entrancePlayed && isFirstLaunch) {
-        if (this._readyTimer) clearTimeout(this._readyTimer)
-        this._readyTimer = setTimeout(() => {
-          this.setData({ pageReady: true })
-          this._entrancePlayed = true
-          this._readyTimer = null
-        }, 250)
-        // 入场动画（0.5s 延迟 + 卡片展开）全部结束后重新测量滚动边界
+        this._entrancePlayed = true
+        this._scheduleEntrance()
+        // 入场动画全部结束后重新测量滚动边界
         setTimeout(() => this._scheduleMeasure(100), 1200)
+        setTimeout(() => this._scheduleMeasure(400), 1700)
       }
     },
     hide() {
@@ -1981,6 +2015,28 @@ Component({
       this.setData({ adminPrintEnabled: !this.data.adminPrintEnabled })
     },
 
+    // 打印页入场调度：锚定页面加载时刻，0.5s 起逐 0.1s 递增；结束后清理入场类（切 tab 不重放）
+    _scheduleEntrance() {
+      const steps = [
+        ['logo', 0.5],
+        ['statusBar', 0.6],
+        ['fileSection', 0.7],
+        ['extParams', 0.8],
+        ['autoPrint', 0.9],
+        ['adminPrint', 1.0],
+        ['submit', 1.1],
+      ]
+      steps.forEach(([key, at]) => {
+        setTimeout(() => {
+          this.setData({ ['entered.' + key]: true })
+        }, at * 1000)
+      })
+      // 最后一个槽位 1.1s + 动画 0.5s + 余量 → 清理入场类，防止页面隐藏/重显时动画重放
+      setTimeout(() => {
+        this.setData({ entranceDone: true })
+      }, 1800)
+    },
+
     // 生成"今天(周一)/明天(周二)/后天(周三)"日期选项（仅保留 3 天）
     _buildScheduleDays() {
       const weekNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
@@ -2662,14 +2718,15 @@ Component({
 
     // ---- 价格计算（复刻本地工具 calc_cost）----
 
-    _calcCost(pageCount, copies, duplex) {
+    _calcCost(pageCount, copies, duplex, pageRange) {
       const simplex = 0.2
       const duplexP = 0.3
       if (pageCount <= 0) return { cost: 0, formula: '?', known: false }
+      const effective = countPagesInRange(pageRange, pageCount)   // 有效打印页数（范围过滤后）
 
       if (duplex === 'on') {
-        const pairs = Math.floor(pageCount / 2)
-        const remainder = pageCount % 2
+        const pairs = Math.floor(effective / 2)
+        const remainder = effective % 2
         let cost, innerFormula
         if (remainder === 0) {
           cost = pairs * duplexP
@@ -2686,11 +2743,11 @@ Component({
           : innerFormula
         return { cost: Math.round(cost * copies * 100) / 100, formula, known: true }
       } else {
-        const innerFormula = pageCount + '张×' + simplex.toFixed(2)
+        const innerFormula = effective + '张×' + simplex.toFixed(2)
         const formula = copies > 1
           ? '(' + innerFormula + ')×' + copies + '份'
           : innerFormula
-        return { cost: Math.round(pageCount * simplex * copies * 100) / 100, formula, known: true }
+        return { cost: Math.round(effective * simplex * copies * 100) / 100, formula, known: true }
       }
     },
 
@@ -2711,7 +2768,7 @@ Component({
       let baseTotal = 0
       let allKnown = true
       files.forEach(f => {
-        const r = this._calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on')
+        const r = this._calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range)
         baseTotal += r.cost
         if (!r.known) allKnown = false
       })
@@ -2757,7 +2814,7 @@ Component({
 
       files.forEach(f => {
         itemNum++
-        const r = this._calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on')
+        const r = this._calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range)
         const name = f.file_name || '未知文件'
         const duplexLabel = f.duplex === 'on' ? '双面' : '单面'
         const rangeLabel = f.page_range ? f.page_range + '页' : '全部页'

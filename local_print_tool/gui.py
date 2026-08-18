@@ -73,7 +73,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, generate_order_number
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, generate_order_number
 from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
@@ -2943,7 +2943,8 @@ class MainWindow(QMainWindow):
         ext = os.path.splitext(job.file_path)[1].lower() if job.file_path else ""
         is_img = ext in self.IMAGE_EXTS
         is_word = ext in (".doc", ".docx")
-        single_page = (job.page_count or 0) == 1
+        # 单页判定：整份 1 页 或 页码范围有效页数恰好 1 页 → 双面打印物理上即单面输出
+        single_page = _count_pages_in_range(job.page_range or "", job.page_count or 0) == 1
         duplex_usable = (not is_img) and (not single_page)
 
         # 同步编辑控件
@@ -3047,8 +3048,9 @@ class MainWindow(QMainWindow):
         # 读取编辑控件值
         job.copies = self._edit_copies.value()
         # 图片/单页文件：双面无意义，固定单面（避免被禁用的双面控件残留值误写）
+        # 单页判定含范围选 1 页（多页文件手动选 1 页 → 双面物理上即单面输出）
         is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
-        single_page = (job.page_count or 0) == 1
+        single_page = _count_pages_in_range(job.page_range or "", job.page_count or 0) == 1
         if is_img or single_page:
             job.duplex = "off"
         else:
@@ -4146,9 +4148,11 @@ class MainWindow(QMainWindow):
                     if tab:
                         owner_name = (tab.owner_name or "").strip()
                     # 上报实际打印配置（本地可能修改过份数/双面/范围/页数），后端同步 order_files
+                    # 单双面标记与实际一致：有效打印页数=1 时（整份 1 页 / 范围恰好选 1 页）物理上即单面打印
+                    eff_pages = _count_pages_in_range(job.page_range or "", job.page_count or 0)
                     report_cfg = {
                         "copies": job.copies,
-                        "duplex": job.duplex,
+                        "duplex": job.duplex if eff_pages > 1 else "off",
                         "page_range": job.page_range or "",
                         "page_count": job.page_count or 0,
                     }
@@ -4212,7 +4216,8 @@ class MainWindow(QMainWindow):
                 "copies": j.copies,
                 "page_count": j.page_count,
                 "cost": round(cost, 2),
-                "duplex": j.duplex,
+                # 单双面标记与实际一致：有效打印页数=1（整份 1 页 / 范围恰好选 1 页）→ 单面
+                "duplex": j.duplex if _count_pages_in_range(j.page_range or "", j.page_count or 0) > 1 else "off",
                 "page_range": j.page_range,
             })
         # 附加服务：与界面合计（_update_total_cost）口径一致，从标签页读设置

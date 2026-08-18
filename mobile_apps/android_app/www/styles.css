@@ -306,15 +306,10 @@ body {
 .card-entering-fade {
   animation: cardFadeIn 0.5s 0.25s cubic-bezier(0.22, 0.61, 0.36, 1) both;
 }
-/* 逐元素入场动画：延迟直接烘焙进 animation 简写（0.5s 时长 + 各自延迟），
-   避免独立 animation-delay 长属性与 .card-entering-fade 简写产生级联竞争 */
-.enter-05 { animation: cardFadeIn 0.5s 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
-.enter-06 { animation: cardFadeIn 0.5s 0.6s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
-.enter-07 { animation: cardFadeIn 0.5s 0.7s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
-.enter-08 { animation: cardFadeIn 0.5s 0.8s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
-.enter-09 { animation: cardFadeIn 0.5s 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
-.enter-10 { animation: cardFadeIn 0.5s 1.0s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
-.enter-11 { animation: cardFadeIn 0.5s 1.1s cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+/* 入场动画（无延迟）：延迟由 JS 按页面加载时刻调度，到点才加此类 */
+.entrance-play {
+  animation: cardFadeIn 0.5s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+}
 
 /* Card remove — fade out + collapse in one go */
 @keyframes cardRemove {
@@ -4502,6 +4497,19 @@ picker-view-column {
   color: #1e66f5;
   margin-left: 1.0667cqw;
 }
+
+/* v5.17：订单来源类型标签（云端 / 本地） */
+.order-source-tag {
+  font-size: 2.6667cqw;
+  font-weight: 600;
+  padding: 0.5333cqw 1.8667cqw;
+  border-radius: 2.6667cqw;
+  flex-shrink: 0;
+  white-space: nowrap;
+  margin-left: 1.0667cqw;
+}
+.order-source-tag.tag-local { background-color: rgba(22, 163, 74, 0.12); color: #16a34a; }
+.order-source-tag.tag-cloud { background-color: rgba(0, 122, 255, 0.12); color: #007AFF; }
 
 .status-queued    { background-color: #FFF3E0; color: #E65100; }
 .status-printing  { background-color: #E3F2FD; color: #1565C0; }

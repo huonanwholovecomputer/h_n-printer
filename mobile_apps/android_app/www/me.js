@@ -531,7 +531,7 @@ function redeemKey() {
 }
 
 function pasteKey() {
-  navigator.clipboard.readText().then(text => {
+  readClipboard().then(text => {
     const t = (text || '').trim();
     if (!t) { showToast('剪贴板为空'); return; }
     const m = t.match(/[A-Za-z0-9]{8}/);
@@ -572,7 +572,7 @@ function bindWechatAccount() {
 }
 
 function pasteBindKey() {
-  navigator.clipboard.readText().then(text => {
+  readClipboard().then(text => {
     const t = (text || '').trim();
     if (!t) { showToast('剪贴板为空'); return; }
     const m = t.match(/[A-Za-z0-9]{8}/);
@@ -837,6 +837,9 @@ function orderCardHTML(o, expanded, deliveredLabel) {
       <view class="order-card-header">
         <view class="order-card-main">
           <text class="order-filename">${esc(o.order_number || ('#' + o.id))}</text>
+          ${o.source === 'local'
+            ? '<text class="order-source-tag tag-local">🖨 本地</text>'
+            : '<text class="order-source-tag tag-cloud">☁ 云端</text>'}
           <text class="order-status ${statusCls}">${esc(statusText)}</text>
           ${o.is_admin_print ? '<text class="order-self-print-badge">👤自打</text>' : ''}
         </view>

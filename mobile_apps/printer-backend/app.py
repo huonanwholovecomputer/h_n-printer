@@ -1298,17 +1298,20 @@ def generate_order_number():
 
 # ==================== 价格计算 ====================
 
-def calculate_price(page_count, duplex):
-    """根据页数和双面模式计算价格（单份文件，不含份数倍率）。
+def calculate_price(page_count, duplex, page_range=""):
+    """根据有效打印页数（范围过滤后）和双面模式计算价格（单份文件，不含份数倍率）。
     单面打印: 0.2 元/页
     双面打印: 0.3 元/张（每张纸可印两页，奇数页最后一张按单面 0.2 元计费）
-    """
+    page_range 为空 → 按整份页数计。"""
+    if page_count <= 0:
+        return 0.0
+    effective = _count_pages_in_range(page_range or "", page_count)
     if duplex == "on":
-        sheets = math.ceil(page_count / 2)
-        odd_pages = page_count % 2
+        sheets = math.ceil(effective / 2)
+        odd_pages = effective % 2
         price = (sheets - odd_pages) * 0.3 + odd_pages * 0.2
     else:
-        price = page_count * 0.2
+        price = effective * 0.2
     return round(price, 2)
 
 
@@ -2555,7 +2558,7 @@ def _recalc_prices_for_file(file_id, page_count):
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT id, order_id, copies, duplex FROM order_files"
+            "SELECT id, order_id, copies, duplex, page_range FROM order_files"
             " WHERE file_id = ? AND status NOT IN ('sent','failed','canceled','rejected','abandoned')",
             (file_id,),
         ).fetchall()
@@ -2563,7 +2566,7 @@ def _recalc_prices_for_file(file_id, page_count):
             return
         order_ids = set()
         for r in rows:
-            per_copy = calculate_price(page_count, r["duplex"] or "on")
+            per_copy = calculate_price(page_count, r["duplex"] or "on", r["page_range"] or "")
             new_total = round(per_copy * (r["copies"] or 1), 2)
             conn.execute(
                 "UPDATE order_files SET page_count = ?, total_price = ? WHERE id = ?",
@@ -2633,10 +2636,10 @@ def _sync_subtask_config(task_id, copies, duplex, page_range, page_count):
         conn.execute(f"UPDATE order_files SET {', '.join(set_parts)} WHERE id = ?", params)
         # 用更新后的值重算子任务价格
         cur = conn.execute(
-            "SELECT page_count, copies, duplex FROM order_files WHERE id = ?", (task_id,)
+            "SELECT page_count, copies, duplex, page_range FROM order_files WHERE id = ?", (task_id,)
         ).fetchone()
         if cur:
-            per_copy = calculate_price(cur["page_count"] or 1, cur["duplex"] or "on")
+            per_copy = calculate_price(cur["page_count"] or 1, cur["duplex"] or "on", cur["page_range"] or "")
             new_total = round(per_copy * (cur["copies"] or 1), 2)
             conn.execute("UPDATE order_files SET total_price = ? WHERE id = ?", (new_total, task_id))
             # 重算父订单总额（基础打印费 + 附加服务费，口径与 submit_order 一致）
@@ -2685,6 +2688,55 @@ def _parse_page_range_max(range_str: str) -> int:
             except ValueError:
                 pass
     return max_page
+
+
+def _parse_page_range_set(range_str: str, total_pages: int) -> set:
+    """解析页码范围字符串为页码集合（对齐本地 printer_config._parse_range_parts）。
+    支持 '1-5,7,9'、中文逗号/顿号分隔、智能拆分 '23-4' → {2,3,4}；越界部分忽略。"""
+    pages: set = set()
+    if not range_str or not range_str.strip():
+        return pages
+    raw = range_str.strip().replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            try:
+                a, b = part.split("-", 1)
+                start, end = int(a), int(b)
+                if start < end:
+                    for p in range(start, end + 1):
+                        if 1 <= p <= total_pages:
+                            pages.add(p)
+                elif start > end and len(a) > 1:
+                    # 智能拆分: "23-4" → 页码 2 + 范围 3-4
+                    prefix = int(a[:-1])
+                    last = int(a[-1])
+                    if prefix < end:
+                        for p in range(last, end + 1):
+                            if 1 <= p <= total_pages:
+                                pages.add(p)
+                        if 1 <= prefix <= total_pages:
+                            pages.add(prefix)
+            except ValueError:
+                pass
+        else:
+            try:
+                p = int(part)
+                if 1 <= p <= total_pages:
+                    pages.add(p)
+            except ValueError:
+                pass
+    return pages
+
+
+def _count_pages_in_range(page_range: str, total_pages: int) -> int:
+    """返回页码范围覆盖的有效打印页数；空范围返回总页数（与本地 calc_cost 同口径）。"""
+    if not page_range or not page_range.strip():
+        return total_pages
+    pages = _parse_page_range_set(page_range, total_pages)
+    return len(pages) if pages else total_pages
 
 
 def _validate_page_ranges_for_file(file_id: str, page_count: int):
@@ -3809,7 +3861,7 @@ def submit_order():
             f_duplex = f.get("duplex", duplex) or "on"
 
             is_free_val = 0  # 价格仅用于统计，无免费策略
-            per_copy_price = calculate_price(page_count, f_duplex)
+            per_copy_price = calculate_price(page_count, f_duplex, f_page_range)
             total_price = round(per_copy_price * f_copies, 2)  # 始终计算真实价格，is_free 控制是否收费
             # 普通单从 queued 开始，由 push_print_task_to_client 原子锁定为 printing；
             # 预约单从 scheduled 开始，阶段①下发文件时为 downloading（不进 queued，避免被普通链路误分发）
@@ -4110,7 +4162,7 @@ def get_orders():
                delivery_enabled, delivery_location, delivery_percentage,
                urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                schedule_mode, scheduled_at, schedule_frozen,
-               owner_name, is_admin_print
+               source, owner_name, is_admin_print
         FROM orders
         WHERE {where_clause}
         ORDER BY id DESC
@@ -4338,7 +4390,7 @@ def get_order_price(order_id):
 
     # 查询子任务价格明细
     of_rows = conn.execute(
-        """SELECT of.id, of.file_name, of.copies, of.page_count, of.duplex,
+        """SELECT of.id, of.file_name, of.copies, of.page_count, of.duplex, of.page_range,
                   of.total_price, of.is_free, of.status
            FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
         (order_id,),
@@ -4348,7 +4400,7 @@ def get_order_price(order_id):
     for of_row in of_rows:
         f = dict(of_row)
         # 附上单价明细（用于前端展示）
-        per_copy_price = calculate_price(f["page_count"], f.get("duplex", "on"))
+        per_copy_price = calculate_price(f["page_count"], f.get("duplex", "on"), f.get("page_range", ""))
         f["per_copy_price"] = per_copy_price
         f["unit"] = "元/张" if f.get("duplex") == "on" else "元/页"
         files.append(f)
@@ -5558,7 +5610,7 @@ def license_finish():
             if orow:
                 order = dict(orow)
                 of_rows = orders_conn.execute(
-                    """SELECT of.id, of.file_name, of.copies, of.page_count, of.duplex,
+                    """SELECT of.id, of.file_name, of.copies, of.page_count, of.duplex, of.page_range,
                               of.total_price, of.is_free, of.status
                        FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
                     (order_id,),
@@ -5566,7 +5618,7 @@ def license_finish():
                 files = []
                 for of_row in of_rows:
                     f = dict(of_row)
-                    f["per_copy_price"] = calculate_price(f["page_count"], f.get("duplex", "on"))
+                    f["per_copy_price"] = calculate_price(f["page_count"], f.get("duplex", "on"), f.get("page_range", ""))
                     f["unit"] = "元/张" if f.get("duplex") == "on" else "元/页"
                     files.append(f)
                 price_detail = {

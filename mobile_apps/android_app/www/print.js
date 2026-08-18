@@ -60,11 +60,44 @@ function onPrintTabShown() {
 
 let _printEntrancePlayed = false;
 
-// 页面就绪：入场动画已由各卡片 .enter-XX 类（animation 简写自带延迟 0.5~1.1s）驱动，
-// 无需 JS 干预；此函数保留仅作启动标记
+// 打印页入场调度表（锚定页面加载时刻，0.5s 起逐 0.1s 递增）
+const PRINT_ENTRANCE = [
+  ['headerArea', 0.5],
+  ['printerStatus', 0.6],
+  ['fileSection', 0.7],
+  ['extParamsCard', 0.8],
+  ['autoPrintSection', 0.9],
+  ['adminPrintSection', 1.0],
+  ['submitArea', 1.1],
+];
+
+// 播放单个卡片入场：到点且可见 → 加无延迟动画类；仍隐藏（角色未加载）→ 标记待播
+function playCardEntrance(el) {
+  if (!el || el._entranceDone) return;
+  if (el.style.display === 'none') { el._entrancePending = true; return; }
+  el._entranceDone = true;
+  el._entrancePending = false;
+  el.classList.remove('card-preload');
+  el.classList.add('entrance-play');
+}
+
+// 页面就绪：按页面加载时刻调度 7 张卡片入场；全部结束后清理入场类（切 tab 不重放）
 function pageReady() {
   if (_printEntrancePlayed) return;
   _printEntrancePlayed = true;
+  PRINT_ENTRANCE.forEach(([id, at]) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    setTimeout(() => playCardEntrance(el), at * 1000);
+  });
+  // 最后一个槽位 1.1s + 动画 0.5s + 余量 → 清理，避免隐藏/重显时动画重放
+  setTimeout(() => {
+    document.querySelectorAll('#page-print .card-preload, #page-print .entrance-play').forEach(el => {
+      el._entranceDone = true;
+      el._entrancePending = false;
+      el.classList.remove('card-preload', 'entrance-play');
+    });
+  }, 2200);
 }
 
 function scheduleMeasureSoon() {
@@ -72,11 +105,13 @@ function scheduleMeasureSoon() {
   setTimeout(() => measureAll(), 400);
 }
 
-// 管理员专属卡片显示：仅切换 display；入场动画由 .enter-XX 类的 animation 简写自带延迟驱动
-// （无障碍打印 0.9s / 管理员自行打印 1.0s），显示即按各自延迟播放
+// 管理员专属卡片显示：仅切换 display；若该卡片在预定入场时刻仍隐藏（角色未加载），
+// 显示时立即补播入场（无额外延迟）
 function showAdminOnlySection(el) {
   if (!el) return;
-  el.style.display = state.role === 'admin' ? '' : 'none';
+  const show = state.role === 'admin';
+  el.style.display = show ? '' : 'none';
+  if (show && el._entrancePending) playCardEntrance(el);
 }
 
 function refreshPrintRoleUI() {
@@ -94,7 +129,7 @@ function refreshPrintRoleUI() {
     coverReq.style.display = 'none';
   }
   // 管理员专属卡片（无障碍打印 / 管理员自行打印）统一显示逻辑：
-  // 隐藏→显示时强制重启动画（各自内联 animation-delay 0.9s / 1.0s），保证出现顺序确定
+  // 入场由 pageReady 按加载时刻调度；此处仅切换可见性并处理"到点仍隐藏"的补播
   showAdminOnlySection(document.getElementById('autoPrintSection'));
   showAdminOnlySection(document.getElementById('adminPrintSection'));
   updateCoverPrice();
@@ -1751,13 +1786,45 @@ function clearFilesAfterSuccess() {
 
 /* ================= 价格计算 / 复制 ================= */
 
-function calcCost(pageCount, copies, duplex) {
+/* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
+   对齐本地 calc_cost / 后端 calculate_price 口径（含中文逗号、智能拆分 '23-4'） */
+function countPagesInRange(pageRange, total) {
+  if (!pageRange || !String(pageRange).trim()) return total;
+  const pages = new Set();
+  String(pageRange).replace(/[、，；\s]/g, ',').split(',').forEach(part => {
+    part = (part || '').trim();
+    if (!part) return;
+    if (part.indexOf('-') >= 0) {
+      const sp = part.split('-');
+      const a = parseInt(sp[0], 10), b = parseInt(sp[1], 10);
+      if (!isNaN(a) && !isNaN(b)) {
+        if (a < b) {
+          for (let p = a; p <= b; p++) if (p >= 1 && p <= total) pages.add(p);
+        } else if (a > b && String(a).length > 1) {
+          const prefix = parseInt(String(a).slice(0, -1), 10);
+          const last = parseInt(String(a).slice(-1), 10);
+          if (prefix < b) {
+            for (let p = last; p <= b; p++) if (p >= 1 && p <= total) pages.add(p);
+            if (prefix >= 1 && prefix <= total) pages.add(prefix);
+          }
+        }
+      }
+    } else {
+      const p = parseInt(part, 10);
+      if (!isNaN(p) && p >= 1 && p <= total) pages.add(p);
+    }
+  });
+  return pages.size || total;
+}
+
+function calcCost(pageCount, copies, duplex, pageRange) {
   const simplex = 0.2;
   const duplexP = 0.3;
   if (!pageCount || pageCount <= 0) return { cost: 0, formula: '?', known: false };
+  const effective = countPagesInRange(pageRange, pageCount);   // 有效打印页数（范围过滤后）
   if (duplex === 'on') {
-    const pairs = Math.floor(pageCount / 2);
-    const remainder = pageCount % 2;
+    const pairs = Math.floor(effective / 2);
+    const remainder = effective % 2;
     let cost, innerFormula;
     if (remainder === 0) { cost = pairs * duplexP; innerFormula = pairs + '张×' + duplexP.toFixed(2); }
     else if (pairs === 0) { cost = remainder * simplex; innerFormula = remainder + '张×' + simplex.toFixed(2); }
@@ -1765,9 +1832,9 @@ function calcCost(pageCount, copies, duplex) {
     const formula = copies > 1 ? '(' + innerFormula + ')×' + copies + '份' : innerFormula;
     return { cost: Math.round(cost * copies * 100) / 100, formula, known: true };
   }
-  const innerFormula = pageCount + '张×' + simplex.toFixed(2);
+  const innerFormula = effective + '张×' + simplex.toFixed(2);
   const formula = copies > 1 ? '(' + innerFormula + ')×' + copies + '份' : innerFormula;
-  return { cost: Math.round(pageCount * simplex * copies * 100) / 100, formula, known: true };
+  return { cost: Math.round(effective * simplex * copies * 100) / 100, formula, known: true };
 }
 
 function orderEchoParams() {
@@ -1791,7 +1858,7 @@ function onCopyPrice() {
   let baseTotal = 0;
   let allKnown = true;
   d.files.forEach(f => {
-    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on');
+    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range);
     baseTotal += r.cost;
     if (!r.known) allKnown = false;
   });
@@ -1816,7 +1883,7 @@ function onCopyDetailPrice() {
   let itemNum = 0;
   d.files.forEach(f => {
     itemNum++;
-    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on');
+    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range);
     const name = f.file_name || '未知文件';
     const duplexLabel = f.duplex === 'on' ? '双面' : '单面';
     const rangeLabel = f.page_range ? f.page_range + '页' : '全部页';

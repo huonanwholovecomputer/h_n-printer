@@ -21,20 +21,20 @@
       <view class="container">
 
         <!-- Logo + Status -->
-        <view class="header-area enter-05">
+        <view class="header-area {{entranceDone ? '' : (entered.logo ? 'entrance-play' : 'card-preload')}}">
           <view class="logo-wrap" style="transform-origin: center top;">
             <image class="logo" src="/images/HN_print.png" mode="widthFix" style="width: 320rpx;" />
           </view>
         </view>
 
         <!-- Printer Status -->
-        <view class="status-bar enter-06 {{printerActive ? 'status-active' : 'status-inactive'}}">
+        <view class="status-bar {{entranceDone ? '' : (entered.statusBar ? 'entrance-play' : 'card-preload')}} {{printerActive ? 'status-active' : 'status-inactive'}}">
           <view class="status-dot"></view>
           <text class="status-text">{{printerActive ? '打印机在线' : '打印机离线'}}</text>
         </view>
 
         <!-- File List Section -->
-        <view class="card file-section enter-07">
+        <view class="card file-section {{entranceDone ? '' : (entered.fileSection ? 'entrance-play' : 'card-preload')}}">
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">打印文件</text>
@@ -180,7 +180,7 @@
         </view>
 
         <!-- v5: 附加服务参数 -->
-        <view class="card ext-params-card enter-08">
+        <view class="card ext-params-card {{entranceDone ? '' : (entered.extParams ? 'entrance-play' : 'card-preload')}}">
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">附加服务</text>
@@ -240,7 +240,7 @@
         </view>
 
         <!-- 无障碍打印开关（仅管理员可见） -->
-        <view wx:if="{{userRole === 'admin'}}" class="auto-print-switch-row enter-09">
+        <view wx:if="{{userRole === 'admin'}}" class="auto-print-switch-row {{entranceDone ? '' : (entered.autoPrint ? 'entrance-play' : 'card-preload')}}">
           <view class="auto-print-label">
             <view class="lightning-burst {{autoPrintGlow ? 'striking' : ''}} {{glowPhase === 'fading' ? 'fading' : ''}} {{glowPhase === 'reset' ? 'reset' : ''}} {{autoPrintEnabled ? 'active' : ''}}">
               <canvas type="2d" id="boltCanvas" class="bolt-canvas"></canvas>
@@ -288,7 +288,7 @@
         </view>
 
         <!-- 管理员自行打印开关（仅管理员可见） -->
-        <view wx:if="{{userRole === 'admin'}}" class="admin-print-switch-row enter-10">
+        <view wx:if="{{userRole === 'admin'}}" class="admin-print-switch-row {{entranceDone ? '' : (entered.adminPrint ? 'entrance-play' : 'card-preload')}}">
           <view class="admin-print-label">
             <text class="admin-print-icon">🖨️</text>
             <text class="admin-print-title">管理员自行打印</text>
@@ -301,7 +301,7 @@
         </view>
 
         <!-- Submit Button -->
-        <view class="submit-area enter-11">
+        <view class="submit-area {{entranceDone ? '' : (entered.submit ? 'entrance-play' : 'card-preload')}}">
           <button class="btn-primary" bindtap="onSubmit" hover-class="tap-active" loading="{{submitting}}" disabled="{{submitting}}">
             提交打印任务
           </button>

@@ -38,19 +38,19 @@
         <div class="container">
 
           <!-- Logo + 状态 -->
-          <view class="header-area enter-05" id="headerArea">
+          <view class="header-area card-preload" id="headerArea">
             <view class="logo-wrap" id="logoWrap">
               <img class="logo" id="logoImg" src="images/HN_print.png" alt="HN 打印">
             </view>
           </view>
 
-          <view class="status-bar enter-06" id="printerStatus">
+          <view class="status-bar card-preload" id="printerStatus">
             <view class="status-dot offline" id="statusDot"></view>
             <text class="status-text" id="statusText">打印机离线</text>
           </view>
 
           <!-- 打印文件 -->
-          <view class="card file-section enter-07" id="fileSection">
+          <view class="card file-section card-preload" id="fileSection">
             <view class="section-header inline-header">
               <view class="section-header-bar"></view>
               <text class="section-header-title">打印文件</text>
@@ -71,7 +71,7 @@
           </view>
 
           <!-- 附加服务 -->
-          <view class="card ext-params-card enter-08" id="extParamsCard">
+          <view class="card ext-params-card card-preload" id="extParamsCard">
             <view class="section-header inline-header">
               <view class="section-header-bar"></view>
               <text class="section-header-title">附加服务</text>
@@ -117,7 +117,7 @@
           </view>
 
           <!-- 无障碍打印（仅管理员） -->
-          <view class="auto-print-switch-row enter-09" id="autoPrintSection" style="display:none">
+          <view class="auto-print-switch-row card-preload" id="autoPrintSection" style="display:none">
             <view class="auto-print-label">
               <view class="lightning-burst" id="lightningBurst">
                 <canvas class="bolt-canvas" id="boltCanvas"></canvas>
@@ -160,7 +160,7 @@
           </view>
 
           <!-- 管理员自行打印（仅管理员） -->
-          <view class="admin-print-switch-row enter-10" id="adminPrintSection" style="display:none">
+          <view class="admin-print-switch-row card-preload" id="adminPrintSection" style="display:none">
             <view class="admin-print-label">
               <text class="admin-print-icon">🖨️</text>
               <view>
@@ -174,7 +174,7 @@
           </view>
 
           <!-- 提交 -->
-          <view class="submit-area enter-11" id="submitArea">
+          <view class="submit-area card-preload" id="submitArea">
             <button class="btn-primary" id="submitBtn">提交打印任务</button>
           </view>
       </div>

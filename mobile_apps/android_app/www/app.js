@@ -997,6 +997,39 @@ async function copyText(text, successMsg) {
   }
 }
 
+/* 剪贴板读取（授权码/密钥自动获取用）。Capacitor WebView 下 navigator.clipboard.readText 常因
+   非安全上下文 / clipboard-read 权限被拒，必须走多级降级：
+   ① 官方 Capacitor 剪贴板插件（原生，最可靠，若已装 @capacitor/clipboard）
+   ② navigator.clipboard.readText（现代浏览器 / 安全的 WebView）
+   ③ 隐藏 contenteditable + execCommand('paste')（老 WebView，依赖按钮点击带来的用户手势）
+   Promise<string>，取消/失败时 reject（调用方据此 toast「无法读取剪贴板」）。 */
+async function readClipboard() {
+  const cap = (typeof window !== 'undefined' && window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Clipboard);
+  if (cap && typeof cap.read === 'function') {
+    const r = await cap.read();
+    return (r && r.value) ? String(r.value) : '';
+  }
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    if (window.isSecureContext !== false) return await navigator.clipboard.readText().then(t => String(t || ''));
+  }
+  // 兜底：execCommand('paste') 需在用户手势回调内执行（按钮点击即是）
+  const el = document.createElement('div');
+  el.setAttribute('contenteditable', 'true');
+  el.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+  document.body.appendChild(el);
+  el.focus();
+  try {
+    const ok = document.execCommand('paste');
+    const text = ok ? (el.textContent || '') : '';
+    el.remove();
+    if (!ok) throw new Error('paste denied');
+    return text;
+  } catch (e) {
+    el.remove();
+    throw e;
+  }
+}
+
 const ORDER_STATUS_MAP = {
   queued: '排队中',
   printing: '待添加',

@@ -138,6 +138,7 @@
         <view class="order-card-header">
           <view class="order-card-main">
             <text class="order-filename">{{item.order_number || ('#' + item.id)}}</text>
+            <text class="order-source-tag {{item.source === 'local' ? 'tag-local' : 'tag-cloud'}}">{{item.source === 'local' ? '🖨 本地' : '☁ 云端'}}</text>
             <text class="order-status status-{{item.status}}">{{statusMap[item.status] || item.status}}</text>
           </view>
           <text class="order-number-label">{{item.file_summary || item.file}}</text>
