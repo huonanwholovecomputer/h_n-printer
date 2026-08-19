@@ -1246,14 +1246,27 @@ def next_order_number():
         return jsonify({"success": False, "message": "token 无效"}), 403
     order_number = generate_order_number()
 
+    # 预留即记归属（与 local_orders 上报口径一致）：先把当前归属者写进占位单，
+    # 这样即使预留后未打印上报（被标 abandoned），也不会留下 owner_name 为空的“无归属”残留。
+    # owner_name/is_admin_print 可选携带：支持界面上“选中哪个归属者默认就是哪个”的语义，
+    # 未携带时默认 霍楠 / 管理员自行打印（与 local_orders 的缺省值保持一致）。
+    owner_name = (request.args.get("owner_name") or request.form.get("owner_name") or "").strip()
+    is_admin_print_raw = request.args.get("is_admin_print") or request.form.get("is_admin_print")
+    if is_admin_print_raw is not None:
+        is_admin_print = 1 if str(is_admin_print_raw) not in ("", "0", "false", "False") else 0
+    else:
+        is_admin_print = 1  # 本地预留默认视为管理员自行打印
+    owner_name = owner_name or "霍楠"
+
     # 创建占位订单记录（状态 reserved），后续 /api/local_orders 会更新为 sent
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db()
     try:
         conn.execute(
-            """INSERT INTO orders (file, copies, status, created_at, openid, order_number, source)
-               VALUES (?, 1, 'reserved', ?, 'local', ?, 'local')""",
-            ("（预留位置）", created_at, order_number),
+            """INSERT INTO orders (file, copies, status, created_at, openid, order_number, source,
+                                   owner_name, is_admin_print)
+               VALUES (?, 1, 'reserved', ?, 'local', ?, 'local', ?, ?)""",
+            ("（预留位置）", created_at, order_number, owner_name, is_admin_print),
         )
         conn.commit()
     except Exception:
@@ -4661,21 +4674,31 @@ def abandon_reserved_order():
     conn = get_db()
     try:
         if total_price is not None:
+            # 已配置打印（工具放弃时已知文件/份数/双面 → 有金额）：保留为 abandoned 订单，
+            # 并补记归属（本地单口径：默认 霍楠 / 管理员自行打印），避免留下无归属记录
             cursor = conn.execute(
-                "UPDATE orders SET status = 'abandoned', total_price = ? WHERE order_number = ? AND status = 'reserved'",
+                """UPDATE orders SET status = 'abandoned', total_price = ?,
+                                     owner_name = COALESCE(NULLIF(owner_name, ''), '霍楠'),
+                                     is_admin_print = CASE WHEN is_admin_print = 0 THEN 1 ELSE is_admin_print END
+                   WHERE order_number = ? AND status = 'reserved'""",
                 (float(total_price), order_number),
             )
+            price_info = f"，价格 ¥{float(total_price):.2f}"
         else:
+            # 未配置的纯占位单（直接关闭/删除标签页）：无金额无归属，直接删除整行，不留残留
             cursor = conn.execute(
-                "UPDATE orders SET status = 'abandoned' WHERE order_number = ? AND status = 'reserved'",
+                """DELETE FROM orders WHERE order_number = ? AND status = 'reserved'
+                   AND file = '（预留位置）' AND total_price <= 0
+                   AND NOT EXISTS (SELECT 1 FROM order_files f WHERE f.order_id = orders.id)""",
                 (order_number,),
             )
+            price_info = ""
         count = cursor.rowcount
         if count > 0:
             conn.commit()
-            price_info = f"，价格 ¥{float(total_price):.2f}" if total_price is not None else ""
-            print(f"  [ABANDON] 预留订单 {order_number} 已被放弃打印{price_info}")
-        return jsonify({"success": True, "message": f"已标记 {count} 个预留订单为放弃"})
+            action = "清除（纯占位）" if total_price is None else "放弃打印" + price_info
+            print(f"  [ABANDON] 预留订单 {order_number} 已被{action}")
+        return jsonify({"success": True, "message": f"已处理 {count} 个预留订单"})
     except Exception as e:
         conn.rollback()
         return jsonify({"success": False, "message": str(e)}), 500
@@ -6443,23 +6466,39 @@ scheduler = BackgroundScheduler()
 
 
 def cleanup_abandoned_reserved_orders():
-    """将超过 30 分钟仍未提交的 reserved 占位订单标记为 abandoned。
+    """清理超过 30 分钟仍未提交的 reserved 占位订单。
     场景：用户在本地工具中点击了"复制"（分配了订单号）但从未点击"开始打印"，
-    或者获取订单号后离线了且从未同步成功。"""
+    或者获取订单号后离线了且从未同步成功。
+    纯占位单（未配置任何文件/子任务，file 仍为‘（预留位置）’、total_price=0）没有归属与金额，
+    直接删除整行，避免留下 owner_name 为空、统计口径外的“无归属 abandoned”残留订单。"""
     cutoff = (datetime.now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
     conn = get_db()
     try:
+        # 先删除纯占位单（从未配置文件/子任务，无金额）→ 不留无归属残留
         cursor = conn.execute(
-            "UPDATE orders SET status = 'abandoned' WHERE status = 'reserved' AND created_at < ?",
+            """DELETE FROM orders WHERE status = 'reserved'
+               AND created_at < ?
+               AND file = '（预留位置）'
+               AND total_price <= 0
+               AND NOT EXISTS (SELECT 1 FROM order_files f WHERE f.order_id = orders.id)""",
             (cutoff,),
         )
         count = cursor.rowcount
         if count > 0:
             conn.commit()
-            print(f"[CLEANUP] 已将 {count} 个超时 reserved 订单标记为 abandoned")
+            print(f"[CLEANUP] 已删除 {count} 个超时纯占位订单（无归属残留）")
+        # 剩余带配置的 reserved（理论极少）仍按原口径标记 abandoned
+        cursor2 = conn.execute(
+            "UPDATE orders SET status = 'abandoned' WHERE status = 'reserved' AND created_at < ?",
+            (cutoff,),
+        )
+        count2 = cursor2.rowcount
+        if count2 > 0:
+            conn.commit()
+            print(f"[CLEANUP] 已将 {count2} 个超时 reserved 订单标记为 abandoned")
     except Exception as e:
         conn.rollback()
-        print(f"[CLEANUP] 清理 abandoned 订单失败: {e}")
+        print(f"[CLEANUP] 清理 reserved 订单失败: {e}")
     finally:
         conn.close()
 

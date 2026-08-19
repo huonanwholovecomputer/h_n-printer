@@ -594,10 +594,9 @@ html.theme-switching *::before, html.theme-switching *::after {
   *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; }
 }
 
-/* ==================== 防误操作：禁用文字选择 / 元素拖动 ==================== */
-/* 整页禁止选中文字；输入框/下拉框/可编辑区保留选择，便于正常录入和粘贴 */
-body { user-select: none; -webkit-user-select: none; -moz-user-select: none; }
-input, textarea, select, [contenteditable="true"] { user-select: text; -webkit-user-select: text; -moz-user-select: text; }
+/* ==================== 防误操作：禁用元素拖动（文字选择已放开） ==================== */
+/* 允许整页选中文字（已解除禁用）；输入框/下拉框/可编辑区保留选择 */
+body { user-select: text; -webkit-user-select: text; -moz-user-select: text; }
 /* 图片/按钮等默认不可拖拽（页面暂无图片，此条仅作兜底） */
 img, button { -webkit-user-drag: none; }
 </style>
@@ -661,13 +660,13 @@ var LAUNCH_TOKEN = '__LAUNCH_TOKEN__';
 function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type': 'application/json' }; }
 
 /* ==================== 禁用右键菜单 ==================== */
-/* 阻止页面默认右键菜单，避免误触/误复制。输入框内保留右键（粘贴、拼写检查等仍可用）；Ctrl+C / Ctrl+V 不受影响。
-   若连输入框内的右键粘贴也要一并禁用，删掉下面 closest(...) 的判断即可。 */
-document.addEventListener('contextmenu', function (e) {
-  var el = e.target;
-  if (el && el.closest && el.closest('input, textarea, select, [contenteditable="true"]')) return;
-  e.preventDefault();
-});
+/* 右键菜单：已解除限制（不再拦截）。如需恢复，取消下面代码块注释即可。
+   原逻辑：阻止页面默认右键菜单，避免误触/误复制；输入框内保留右键（粘贴、拼写检查等仍可用）。 */
+// document.addEventListener('contextmenu', function (e) {
+//   var el = e.target;
+//   if (el && el.closest && el.closest('input, textarea, select, [contenteditable="true"]')) return;
+//   e.preventDefault();
+// });
 
 /* ==================== 常量 ==================== */
 var DEFAULT_MEMBERS = [
@@ -1542,8 +1541,10 @@ function _scopeSourcesLabel() {
 /* ---- 口径栏交互（成员/来源复选仅前端过滤，不发请求；切换时间口径才重新拉取） ---- */
 function onScopeTimeChange(v) {
   if (v === 'r:custom') {
-    if (_scopeTime.mode === 'custom') return;   // 已是自定义（用旁侧日期字段调整）
-    var anchor = document.getElementById('scopeTimeSel');
+    // 无论当前是否已是自定义，都弹出日历：(原 return 会把"再次选自定义日期"挡住，
+    // 且原生 select 重选同值不触发 onchange → 表现为点了没反应)
+    var anchor = document.getElementById('scopeTimeSel') ||
+                 document.getElementById('scopeRangeStart');
     if (anchor) _calOpen('start', anchor);      // 弹日历选开始日期，选完结束日期自动应用
     return;
   }
@@ -1675,7 +1676,9 @@ function _calInit() {
     if (!_cal.open) return;
     var el = e.target;
     if (div.contains(el)) return;
-    if (el.closest && el.closest('.date-field')) return;
+    // 豁免日期字段与「时间范围」下拉（二者都通过 onmousedown/onchange 触发日历，
+    // 松开左键产生的 click 不应把刚弹出的日历关掉——否则表现为"按住出现、松开消失"）
+    if (el.closest && (el.closest('.date-field') || el.closest('#scopeTimeSel'))) return;
     _calClose();
   });
   window.addEventListener('scroll', function () { if (_cal.open) _calClose(); }, { passive: true });

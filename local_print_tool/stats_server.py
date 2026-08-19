@@ -439,4 +439,18 @@ class StatsServer:
             self._server.shutdown()
             self._server = None
         self._running = False
+
+    def update_config(self, api_url: str = "", token: str = ""):
+        """云端配置变更后同步（不重启服务器）。
+
+        收支清算页可能在配置云端前就已启动 stats_server（当时 api_url 还是占位，
+        如 https://your-server.com），配置云端后 if 不复用旧值会把代理请求打到不存在的
+        占位域名 → SSLError（表现为首次配云端后打不开收支统计，重启后消失）。
+        此方法更新自身并重新注入 handler 类属性，下一次代理请求即用新配置。
+        """
+        self.api_url = api_url.rstrip("/") if api_url else ""
+        self.token = token
+        if self._server:   # 已在运行 → 同步 handler 类属性（每次请求读取）
+            _StatsHandler.api_url = self.api_url
+            _StatsHandler.token = self.token
         logger.info("统计服务器已停止")

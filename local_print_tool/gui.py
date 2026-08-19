@@ -1499,6 +1499,10 @@ class MainWindow(QMainWindow):
     # 图片扩展名（含 tiff/tif：小程序允许上传，本地工具需同样识别为图片 → 双面/页码范围无意义）
     IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
 
+    # 连线后同步的网络操作统一放到后台线程，避免阻塞 UI；结果/日志经信号回主线程
+    _cloudConnSyncLog = Signal(str)   # 后台同步网络 → 主线程 _log 的安全通道
+    _ownerComboRefreshed = Signal()   # 成员名单同步完成 → 主线程刷新归属下拉
+
     def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
         super().__init__()
         self._config_path = config_path
@@ -1660,6 +1664,10 @@ class MainWindow(QMainWindow):
         self._cloud_client.order_canceled.connect(self._on_cloud_order_canceled)
         self._cloud_client.start_print.connect(self._on_cloud_start_print)
 
+        # 连线后后台同步的信号 → 回主线程（日志写入 / 归属下拉刷新）
+        self._cloudConnSyncLog.connect(self._log)
+        self._ownerComboRefreshed.connect(self._on_owner_combo_refreshed)
+
         # 初始化云端任务列表窗口（非模态，复用）
         self._cloud_task_window = CloudTaskListWindow(self)
         self._cloud_task_window.order_accepted.connect(self._on_cloud_order_accepted)
@@ -1689,6 +1697,10 @@ class MainWindow(QMainWindow):
                 token=self._config.cloud_token,
             )
             self._stats_server.start_in_thread()
+        else:
+            # 已启动但配置可能已变更（如云端设置对话框保存后），同步一次代理目标，
+            # 避免仍旧占位地址导致 SSLError
+            self._stats_server.update_config(self._config.cloud_api_url, self._config.cloud_token)
 
         # 附加启动令牌：收支清算 HTML 要求每次启动的随机 token 才能访问
         url = f"{self._stats_server.url}/?token={self._stats_server.launch_token}"
@@ -1782,6 +1794,10 @@ class MainWindow(QMainWindow):
                 self._cloud_client.token = self._config.cloud_token
                 self._cloud_client.start()
                 self._update_cloud_status()
+            # 同步 stats_server（收支清算页代理）：若已启动，配置可能仍旧占位地址，
+            # 不同步会导致代理请求打到不存在的占位域名 → SSLError（重启后才恢复）。
+            if self._stats_server:
+                self._stats_server.update_config(self._config.cloud_api_url, self._config.cloud_token)
             self._log("☁ 云端配置已保存并写入磁盘，正在连接...")
 
     def _toggle_cloud_connection(self):
@@ -3474,7 +3490,19 @@ class MainWindow(QMainWindow):
 
     def _refresh_owner_names_from_cloud(self):
         """从云端收支清算配置同步成员名单到归属下拉（成员管理里的成员名）。
-        仅合并新增名字，不覆盖已有选项；离线/失败时静默保留本地名单。"""
+        仅合并新增名字，不覆盖已有选项；离线/失败时静默保留本地名单。
+        （主线程版本：网络请求 + 刷新下拉；网络部分本身可后台，见 net 版）"""
+        self._refresh_owner_names_from_cloud_net()
+        # 无论是否变化都刷新下拉（保持顺序/一致性）——必须主线程
+        if hasattr(self, '_owner_combo') and self._owner_combo:
+            try:
+                self._update_owner_combo_items()
+            except Exception:
+                pass
+
+    def _refresh_owner_names_from_cloud_net(self):
+        """成员名单拉取 + 合并 + 写盘（无 UI 操作，可在后台线程执行）。
+        返回是否单元格名单发生变化；主线程 UI 刷新由调用方负责。"""
         if not self._cloud_client or not self._cloud_client.is_connected():
             return
         if not self._cloud_client.api_url or not self._cloud_client.token:
@@ -3517,9 +3545,6 @@ class MainWindow(QMainWindow):
             if merged != base:
                 self._config.admin_names = merged
                 self._save_config()
-            # 无论是否变化都刷新下拉（保持顺序/一致性）
-            if hasattr(self, '_owner_combo') and self._owner_combo:
-                self._update_owner_combo_items()
         except Exception as e:
             logger.debug(f"同步云端成员名单失败: {e}")
 
@@ -3778,6 +3803,15 @@ class MainWindow(QMainWindow):
         available = get_available_engines()
         return available.get("word", False) or available.get("wps", False) or available.get("libreoffice", False)
 
+    def _current_owner_params(self) -> dict:
+        """当前标签页的归属参数（owner_name / is_admin_print），供预留/上报随请求传给后端。
+        与 local_orders 上报口径一致：默认 霍楠 / 管理员自行打印。"""
+        tab = self._config.tabs.get(self._current_tab)
+        return {
+            "owner_name": (tab.owner_name if tab else "霍楠"),
+            "is_admin_print": "1" if (bool(tab.is_admin_print) if tab else True) else "0",
+        }
+
     def _ensure_order_number(self) -> str:
         """确保当前标签页有订单号。连线时从后端获取，离线时生成本地临时号（L 前缀）。"""
         jobs = self._get_current_jobs()
@@ -3795,7 +3829,7 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.get(
                     f"{self._cloud_client.api_url}/api/next_order_number",
-                    params={"token": self._cloud_client.token},
+                    params={**{"token": self._cloud_client.token}, **self._current_owner_params()},
                     timeout=5,
                 )
                 if resp.ok:
@@ -3831,9 +3865,14 @@ class MainWindow(QMainWindow):
             for job in tab.jobs:
                 if job.order_number and "-L" in job.order_number and job.order_number not in replacements:
                     try:
+                        # 预留即带该 -L 订单所在标签页的归属，避免占位单无归属
                         resp = http_requests.get(
                             f"{self._cloud_client.api_url}/api/next_order_number",
-                            params={"token": self._cloud_client.token},
+                            params={
+                                "token": self._cloud_client.token,
+                                "owner_name": (tab.owner_name if tab else "霍楠"),
+                                "is_admin_print": "1" if (bool(tab.is_admin_print) if tab else True) else "0",
+                            },
                             timeout=5,
                         )
                         if resp.ok:
@@ -4284,11 +4323,12 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self._log(f"⚠️ 订单上报云端失败: {e}")
         elif online and self._cloud_client.api_url and self._cloud_client.token:
-            # 在线：从后端获取全局唯一订单号（同时后端创建 reserved 占位记录）
+            # 在线：从后端获取全局唯一订单号（同时后端创建 reserved 占位记录）——
+            # 预留即带当前标签页归属，避免上报失败时占位单无归属
             try:
                 resp = http_requests.get(
                     f"{self._cloud_client.api_url}/api/next_order_number",
-                    params={"token": self._cloud_client.token},
+                    params={**{"token": self._cloud_client.token}, **self._current_owner_params()},
                     timeout=5,
                 )
                 if resp.ok:
@@ -4436,7 +4476,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.1</h3>"
+            "<h3>HN 本地打印工具 v4.1.1</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -5131,16 +5171,36 @@ class MainWindow(QMainWindow):
             self._cloud_tasks.pop(task.task_id, None)
 
     def _on_cloud_connection_changed(self, connected: bool):
-        """云端连接状态改变。连线后同步本地离线订单到云端。"""
+        """云端连接状态改变。连线后的网络同步放到后台线程执行，避免阻塞 UI（主线程）。"""
         self._cloud_connected = connected
         self._update_cloud_status()
         if connected:
-            self._sync_local_orders_to_cloud()
+            threading.Thread(
+                target=self._conn_sync_worker,
+                daemon=True,
+                name="cloud-conn-sync",
+            ).start()
+
+    def _conn_sync_worker(self):
+        """后台线程：连线后同步（离线订单换号 / 状态 / 成员名单 / 离线上报）。
+        这些均为同步网络请求，放后台避免 UI 卡死；日志与 UI 刷新经信号回主线程。"""
+        try:
+            # 逐个 -L 离线订单换号（逐单同步 requests，最耗时）
+            try:
+                self._sync_local_orders_to_cloud()
+            except Exception as e:
+                logger.warning(f"同步本地订单号失败: {e}")
             if self._cloud_client:
-                self._cloud_client.sync_pending_statuses()
-            # 连线后同步云端收支清算成员名单 → 归属下拉保持一致
-            self._refresh_owner_names_from_cloud()
-            # 连线后立即同步离线缓存的订单
+                try:
+                    self._cloud_client.sync_pending_statuses()
+                except Exception as e:
+                    logger.warning(f"云端状态同步失败: {e}")
+            # 成员名单：只拉取+写配置（后台），UI 刷新经信号回主线程
+            try:
+                self._refresh_owner_names_from_cloud_net()
+            except Exception as e:
+                logger.debug(f"同步云端成员名单失败: {e}")
+            # 离线订单上报（同步网络）
             if self._offline_sync and self._cloud_client:
                 try:
                     count = self._offline_sync.sync_all_pending_orders(
@@ -5148,9 +5208,20 @@ class MainWindow(QMainWindow):
                         token=self._cloud_client.token,
                     )
                     if count > 0:
-                        self._log(f"📋 离线订单已同步: {count} 个任务已上报云端")
+                        self._cloudConnSyncLog.emit(f"📋 离线订单已同步: {count} 个任务已上报云端")
                 except Exception as e:
-                    self._log(f"⚠️ 离线订单同步失败: {e}")
+                    self._cloudConnSyncLog.emit(f"⚠️ 离线订单同步失败: {e}")
+        finally:
+            # 成员归属下拉刷新回主线程执行
+            self._ownerComboRefreshed.emit()
+
+    def _on_owner_combo_refreshed(self):
+        """（主线程）后台成员名单同步完成后，刷新归属下拉。"""
+        if hasattr(self, '_owner_combo') and self._owner_combo:
+            try:
+                self._update_owner_combo_items()
+            except Exception:
+                pass
 
     def _on_cloud_status_message(self, msg: str):
         """云端日志消息 → 写入界面日志。"""
