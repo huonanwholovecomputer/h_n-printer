@@ -915,6 +915,9 @@ function parseCents(n) { return Math.round((+n || 0) * 100); }
 function formatCents(c) { return ((+c || 0) / 100).toFixed(2); }
 function F(n) { return (n || 0).toFixed(2); }
 function RMB(cents) { return '¥' + formatCents(cents); }
+/* 本地化文案：本地模式下把可见文本中的「云端」统一替换为「本地」（本地模式复用云端驾驶舱渲染）。
+   参数为已拼好的 HTML 字符串，仅对用户可见文案生效；云端模式原样返回。 */
+function _lz(s) { return FINANCE_MODE === 'local' ? String(s).replace(/云端/g, '本地') : s; }
 /* ==================== 密码哈希（SHA-256，Web Crypto） ==================== */
 function _sha256Hex(str) {
   if (window.crypto && crypto.subtle && crypto.subtle.digest) {
@@ -2331,7 +2334,7 @@ function _renderOrderListHTML() {
   }
   if (totalPages > 1) h += _ordersPagerHTML(_ordersPage, totalPages, total, false);
   h += '</div>';
-  return h;
+  return _lz(h);
 }
 /* 局部刷新订单明细区块（翻页/改每页条数/状态筛选），不影响其他图表 */
 function _rerenderOrdersOnly(scroll) {
@@ -2997,7 +3000,7 @@ function renderEntry() {
   h += '<div class="section"><h2>📝 备注</h2><textarea onchange="updNote(this.value)" style="width:100%;height:64px;padding:10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-family:inherit;resize:vertical">' + esc(m.note || '') + '</textarea></div>';
   h += '<div style="display:flex;gap:10px"><button class="btn pri" onclick="save();toast(\'✅ 已保存\',\'success\')">💾 保存</button><button class="btn" onclick="switchTab(\'dash\')">📊 查看结算</button></div>';
 
-  el.innerHTML = h;
+  el.innerHTML = _lz(h);
 }
 function lockBadge(key) {
   var name = MODULE_NAMES[key];
@@ -3110,12 +3113,12 @@ function _renderCloudShared() {
   if (_cloudLoading) {
     _destroyCloudCharts();
     h += '<div class="section" style="text-align:center;padding:46px"><span class="loading-spin"></span> <span style="margin-left:6px;color:var(--muted)">正在' + (FINANCE_MODE === 'local' ? '读取本地订单' : '从云端获取数据') + '…</span></div>';
-    el.innerHTML = h;
+    el.innerHTML = _lz(h);
     return;
   }
   if (FINANCE_MODE !== 'local' && !_cloudMonthsReady) {
     h += '<div class="empty"><div class="ico">📡</div><h3>正在加载云端月份…</h3></div>';
-    el.innerHTML = h;
+    el.innerHTML = _lz(h);
     return;
   }
   if (!_cloudData) {
@@ -3123,7 +3126,7 @@ function _renderCloudShared() {
     if (rk && _scopeFailedKey !== rkKey) { (FINANCE_MODE === 'local' ? fetchLocalScopeData : fetchScopeData)(); return; }
     _destroyCloudCharts();
     h += '<div class="empty"><div class="ico">📡</div><h3>查询失败或无数据</h3><p>统计各成员及本地任务的订单数、盈利与订单构成，用于核对手动代收收入。</p><button class="btn pri" style="margin-top:14px" onclick="' + (FINANCE_MODE === 'local' ? 'fetchLocalScopeData(true)' : 'fetchScopeData(true)') + '">🔍 重试查询</button></div>';
-    el.innerHTML = h;
+    el.innerHTML = _lz(h);
     return;
   }
 
@@ -3291,7 +3294,7 @@ function _renderCloudShared() {
   h += '<span>共 ' + filteredOrders.length + ' 笔订单（自打 ' + (fagg.selfOrders || 0) + ' 笔不计收益）· ' + (fagg.pages || 0) + ' 页 · 云端收益记录 ' + RMB(fagg.record) + '</span>';
   h += '</div>';
 
-  el.innerHTML = h;
+  el.innerHTML = _lz(h);
   $$('#tab-cloud .num[data-count]').forEach(function (node) {
     countUp(node, parseFloat(node.getAttribute('data-count')), { dec: 2, fmt: function (n) { return '¥' + (n / 100).toFixed(2); } });
   });
@@ -3574,7 +3577,7 @@ function renderSettings() {
   h += '<div class="settings-row"><label>存储位置</label><span style="font-size:.84rem;color:var(--green);font-family:monospace">' + (FINANCE_MODE === 'local' ? '📁 本地文件（print_data.json）' : '☁ 云端服务器（finance_config）') + '</span></div>';
   h += '</div>';
 
-  el.innerHTML = h;
+  el.innerHTML = _lz(h);
 }
 function updatePassword(key) {
   var input = $('#pwd-' + key);
@@ -3646,7 +3649,7 @@ function manualBind() {
 /* ==================== TAB: 关于 ==================== */
 function renderAbout() {
   var el = $('#tab-about');
-  el.innerHTML =
+  el.innerHTML = _lz(
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
@@ -3678,7 +3681,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.20：统一口径栏 —— 顶部新增全局口径栏（时间 / 成员 / 来源），单选决定「看哪些数据」，指标 / 视角 / 状态 / 分页等「怎么展示」控件留在模块内部；KPI、趋势、图表、订单明细共用同一份筛选数据；「成员账目」合并展示（成员 / 免费打印 / 订单/云端收益记录 / 手动代收 / 差额），来源筛选不影响对账列，上月环比徽标（自然月口径）。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
-    '</div>';
+    '</div>');
 }
 
 /* ==================== 初始化 ==================== */

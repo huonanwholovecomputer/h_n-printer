@@ -256,5 +256,24 @@ class OfflineSync:
 
     @staticmethod
     def generate_local_order_number() -> str:
-        """生成本地临时订单号（离线时使用）。格式: LOCAL-YYYYMMDD-XXXXXXXX"""
-        return f"LOCAL-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:8]}"
+        """生成本地临时订单号（离线时使用）。格式: LOCAL-YYYYMMDD-序号（当天自增，便于阅读核对）。"""
+        day = datetime.now().strftime("%Y%m%d")
+        prefix = f"LOCAL-{day}-"
+        # 读取当天前缀下最大的「纯数字序号」——旧版 uuid 十六进制串（如 a1b2c3d4）不参与计数，
+        # 避免字符串排序被非数字串干扰导致序号回退/重复。
+        seq = 0
+        try:
+            db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "printer-local.db")
+            conn = sqlite3.connect(db)
+            rows = conn.execute(
+                "SELECT order_number FROM offline_orders WHERE order_number LIKE ?",
+                (prefix + "%",),
+            ).fetchall()
+            conn.close()
+            for (num,) in rows or []:
+                tail = str(num).rsplit("-", 1)[-1]
+                if tail.isdigit():
+                    seq = max(seq, int(tail))
+        except Exception:
+            seq = 0
+        return f"{prefix}{seq + 1:05d}"

@@ -404,7 +404,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                             "file_name": f.get("file_name", ""),
                             "copies": copies,
                             "page_count": page_count,
-                            "total_price": int(round(cost * 100)),   # 转为分（云端口径）
+                            "total_price": round(cost, 2),           # 元（与云端 revenue 的 total_price 单位一致）
                             "status": "sent",                        # 本地订单已打印完成
                             "is_free": is_free,
                         })
