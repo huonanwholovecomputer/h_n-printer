@@ -73,7 +73,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, generate_order_number
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, generate_order_number, DEFAULT_OWNER_NAME, DEFAULT_OWNER_NAMES
 from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
@@ -1502,6 +1502,7 @@ class MainWindow(QMainWindow):
     # 连线后同步的网络操作统一放到后台线程，避免阻塞 UI；结果/日志经信号回主线程
     _cloudConnSyncLog = Signal(str)   # 后台同步网络 → 主线程 _log 的安全通道
     _ownerComboRefreshed = Signal()   # 成员名单同步完成 → 主线程刷新归属下拉
+    _tabDisplayRefresh = Signal()     # 后台同步中换号完成后 → 主线程刷新标签页显示
 
     def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
         super().__init__()
@@ -1592,6 +1593,9 @@ class MainWindow(QMainWindow):
         # }
         self._scheduled_orders: dict[int, dict] = {}
         self._cloud_connected: bool = False  # 云端连接状态（预约冻结自恢复判断用）
+        # 成员名单刷新防抖：下拉反复 Show（用户快速点开/关闭）不并发叠加请求
+        self._owner_refresh_last_ts: float = 0.0
+        self._owner_refresh_inflight: bool = False
         self._scheduled_check_timer = QTimer(self)
         self._scheduled_check_timer.setInterval(1000)
         self._scheduled_check_timer.timeout.connect(self._check_scheduled_timeouts)
@@ -1611,10 +1615,12 @@ class MainWindow(QMainWindow):
 
         # ── 启动日志：让日志区启动即有内容 ──
         # （打包版默认不内置服务器地址/令牌，未配云端时也明确提示用户，避免误以为日志功能异常）
-        if self._config.cloud_enabled and self._config.cloud_token:
+        if not self._config.cloud_enabled:
+            self._log("ℹ 云端功能未启用：以本地模式运行，打印订单一律记入本地数据库。如需云端，请在「文件 → 云端连接设置」勾选「启用云端功能」。")
+        elif self._config.cloud_token:
             self._log(f"☁ 云端已配置 {self._config.cloud_api_url}，正在连接...")
         else:
-            self._log("ℹ 云端未配置（服务器地址/令牌为空）。请通过「文件 → 云端连接设置」填写后即可连接云端。")
+            self._log("ℹ 云端已启用但未配置令牌。请通过「文件 → 云端连接设置」填写服务器地址/令牌。")
         self._log("✅ HN 本地打印工具已启动")
 
     # ---- 标签页 key 安全排序 ----
@@ -1643,7 +1649,20 @@ class MainWindow(QMainWindow):
     # ---- 云端连接 ----
 
     def _init_cloud_client(self):
-        """初始化云打印客户端（根据配置决定是否自动连接）。"""
+        """初始化云打印客户端（根据配置决定是否自动连接）。
+
+        本地订单库（OfflineSync / SQLite）始终初始化——即便未启用云端，本地打印订单一律写入
+        本地订单库（供「本地订单统计」读取）。CloudClient 仅在启用云端功能时才创建。
+        """
+        # 初始化本地订单库（离线/本地模式订单都写这里，供本地订单统计）
+        self._offline_sync = OfflineSync()
+
+        if not self._config.cloud_enabled:
+            logger.info("云端功能未启用：以本地订单模式运行（CloudClient 不创建）")
+            self._cloud_client = None
+            self._cloud_task_window = None
+            return
+
         # 持久化唯一 ID：同机多实例共用 hostname 会冲突，追加随机后缀并落盘
         client_id = _get_persistent_client_id()
 
@@ -1664,9 +1683,10 @@ class MainWindow(QMainWindow):
         self._cloud_client.order_canceled.connect(self._on_cloud_order_canceled)
         self._cloud_client.start_print.connect(self._on_cloud_start_print)
 
-        # 连线后后台同步的信号 → 回主线程（日志写入 / 归属下拉刷新）
+        # 连线后后台同步的信号 → 回主线程（日志写入 / 归属下拉刷新 / 标签页显示刷新）
         self._cloudConnSyncLog.connect(self._log)
         self._ownerComboRefreshed.connect(self._on_owner_combo_refreshed)
+        self._tabDisplayRefresh.connect(self._on_refresh_tab_display_safe)
 
         # 初始化云端任务列表窗口（非模态，复用）
         self._cloud_task_window = CloudTaskListWindow(self)
@@ -1678,8 +1698,7 @@ class MainWindow(QMainWindow):
             self._cloud_client.start()
             self._update_cloud_status()
 
-        # 初始化离线同步引擎，启动后台定时同步
-        self._offline_sync = OfflineSync()
+        # 初始化离线同步引擎，启动后台定时同步（云端模式下自动把本地库订单定时上报）
         self._offline_sync.start_background_sync(
             server_url=self._config.cloud_api_url,
             token=self._config.cloud_token,
@@ -1687,24 +1706,32 @@ class MainWindow(QMainWindow):
         )
 
     def _on_open_finance(self):
-        """打开收支清算页面。启动本地 HTTP 服务器，在浏览器中打开统计页面。"""
-        # 打开前先同步云端收支清算成员名单 → 归属下拉保持一致
-        self._refresh_owner_names_from_cloud()
+        """打开收支清算页面：云端模式与本地模式共用同一个 settlement.html，
+        由 stats_server 注入 finance_mode 决定数据/配置的存储来源。
+        本地模式（cloud_enabled=False）：配置/数据存本地 print_data.json。
+        云端模式：存云端 finance/config；加载时若本地+云端都有真实数据则弹「合并」同步询问。"""
+        finance_mode = "cloud" if self._config.cloud_enabled else "local"
         # 如果已启动则直接打开，否则先启动
         if self._stats_server is None:
             self._stats_server = StatsServer(
                 api_url=self._config.cloud_api_url,
                 token=self._config.cloud_token,
+                finance_mode=finance_mode,
             )
             self._stats_server.start_in_thread()
         else:
-            # 已启动但配置可能已变更（如云端设置对话框保存后），同步一次代理目标，
-            # 避免仍旧占位地址导致 SSLError
+            # 已启动但配置可能已变更（如云端设置对话框保存后），同步一次代理目标与模式
             self._stats_server.update_config(self._config.cloud_api_url, self._config.cloud_token)
+            if self._config.cloud_enabled:
+                self._stats_server.finance_mode = "cloud"
+            else:
+                self._stats_server.finance_mode = "local"
 
-        # 附加启动令牌：收支清算 HTML 要求每次启动的随机 token 才能访问
-        url = f"{self._stats_server.url}/?token={self._stats_server.launch_token}"
-        logger.info(f"打开收支清算页面: {self._stats_server.url}")
+        # 附加启动令牌：settlement.html 要求每次启动的随机 token 才能访问；mode 显式传存储模式
+        url = (f"{self._stats_server.url}/settlement.html"
+               f"?token={self._stats_server.launch_token}&mode={finance_mode}")
+        mode_txt = "云端收支清算" if finance_mode == "cloud" else "本地收支清算"
+        logger.info(f"打开{mode_txt}页面: {self._stats_server.url}")
         QDesktopServices.openUrl(QUrl(url))
 
     def _on_cloud_settings(self):
@@ -1722,6 +1749,14 @@ class MainWindow(QMainWindow):
         title = QLabel("<b>☁ 云打印服务器连接设置</b>")
         layout.addWidget(title)
         layout.addWidget(QLabel("连接到你部署的后端服务器，接收小程序/APP 提交的打印任务。"))
+
+        layout.addSpacing(8)
+
+        # 云端总开关：关闭时禁用所有云端功能，程序以纯本地订单模式运行
+        cloud_switch = ThemedCheckBox("启用云端功能", theme_manager=self._theme_manager)
+        cloud_switch.setToolTip("关闭后将以纯本地模式运行（本地订单库记录打印，收支清算显示本地订单统计）。切换后需重启应用生效。")
+        cloud_switch.setChecked(bool(self._config.cloud_enabled))
+        layout.addWidget(cloud_switch)
 
         layout.addSpacing(8)
 
@@ -1774,11 +1809,12 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         if dlg.exec() == QDialog.Accepted:
-            # 保存配置到内存
+            # 保存配置到内存（云端开关以对话中的勾选为准）
+            old_enabled = bool(self._config.cloud_enabled)
             self._config.cloud_api_url = api_input.text().strip()
             self._config.cloud_ws_url = ws_input.text().strip()
             self._config.cloud_token = token_input.text().strip()
-            self._config.cloud_enabled = True
+            self._config.cloud_enabled = bool(cloud_switch.isChecked())
 
             # 立刻写入磁盘，防止程序崩溃丢失
             try:
@@ -1786,19 +1822,69 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"保存云端配置失败: {e}")
 
-            # 更新 CloudClient 并连接
-            if self._cloud_client:
-                self._cloud_client.stop()
-                self._cloud_client.api_url = self._config.cloud_api_url
-                self._cloud_client.ws_url = self._config.cloud_ws_url
-                self._cloud_client.token = self._config.cloud_token
-                self._cloud_client.start()
+            # 开关状态发生变化 → 云端 UI 与机制差异巨大，需重启应用重新装配界面
+            if old_enabled != self._config.cloud_enabled:
+                self._cloud_client and self._cloud_client.stop()
+                self._restart_for_cloud_switch(self._config.cloud_enabled)
+                return
+
+            # 开关未变化：仅更新连接（用户可能只是改了地址/token）
+            # 更新 CloudClient 并连接/停止
+            if self._config.cloud_enabled:
+                if self._cloud_client:
+                    self._cloud_client.stop()
+                    self._cloud_client.api_url = self._config.cloud_api_url
+                    self._cloud_client.ws_url = self._config.cloud_ws_url
+                    self._cloud_client.token = self._config.cloud_token
+                    self._cloud_client.start()
+                self._update_cloud_status()
+            else:
+                if self._cloud_client:
+                    self._cloud_client.stop()
                 self._update_cloud_status()
             # 同步 stats_server（收支清算页代理）：若已启动，配置可能仍旧占位地址，
             # 不同步会导致代理请求打到不存在的占位域名 → SSLError（重启后才恢复）。
             if self._stats_server:
                 self._stats_server.update_config(self._config.cloud_api_url, self._config.cloud_token)
-            self._log("☁ 云端配置已保存并写入磁盘，正在连接...")
+            self._log("☁ 云端配置已保存并写入磁盘" + ("，正在连接..." if self._config.cloud_enabled else "，云端已关闭"))
+
+    def _restart_for_cloud_switch(self, enabled: bool):
+        """云端总开关变化后：提示用户并重启应用，重新装配本地/云端 UI。"""
+        from PySide6.QtWidgets import QMessageBox
+        state_txt = "启用云端" if enabled else "关闭云端（切为本地模式）"
+        reply = QMessageBox.question(
+            self,
+            "需要重启生效",
+            f"{state_txt}需要重启应用才能生效。\n\n"
+            "重启会关闭当前窗口，本轮所有未打印的任务不会被自动保存（请先确认无需打印）。\n\n"
+            "是否立即重启？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._restart_app()
+        else:
+            # 不重启：配置已保存，下次启动生效
+            self._log(f"🔁 云端开关已保存，下次启动时生效（{state_txt}）")
+
+    def _restart_app(self):
+        """重启当前应用（自动重新装配 UI）。"""
+        import sys as _sys
+        try:
+            self._save_config()
+            if self._stats_server:
+                self._stats_server.stop()
+            if self._cloud_client:
+                self._cloud_client.stop()
+            python = _sys.executable
+            cmd = [python, os.path.abspath(_sys.argv[0])]
+            _sys.argv and cmd.extend(_sys.argv[1:])
+            # 用 subprocess 异步启动新实例，当前实例随后退出
+            import subprocess
+            subprocess.Popen(cmd, cwd=os.getcwd())
+        except Exception as e:
+            logger.warning(f"自动重启失败: {e}")
+        QApplication.quit()
 
     def _toggle_cloud_connection(self):
         """状态栏按钮：切换云端连接。"""
@@ -1819,20 +1905,25 @@ class MainWindow(QMainWindow):
     def _update_cloud_status(self):
         """更新状态栏的云端状态指示器。"""
         connected = self._cloud_client and self._cloud_client.is_connected()
-        if connected:
-            self._cloud_status_indicator.setText("☁ 已连接")
-            self._cloud_status_indicator.setObjectName("cloudStatusOn")
-            self._cloud_status_btn.setText("断开云端")
-        else:
-            self._cloud_status_indicator.setText("☁ 未连接")
-            self._cloud_status_indicator.setObjectName("cloudStatusOff")
-            self._cloud_status_btn.setText("连接云端")
-        # 收支清算入口：云端未连接时置灰（数据存云端，离线不可用）
+        if hasattr(self, "_cloud_status_indicator") and self._cloud_status_indicator:
+            # 云端功能启用状态下才存在指示器/按钮（本地模式不创建）
+            if connected:
+                self._cloud_status_indicator.setText("☁ 已连接")
+                self._cloud_status_indicator.setObjectName("cloudStatusOn")
+                self._cloud_status_btn.setText("断开云端")
+            else:
+                self._cloud_status_indicator.setText("☁ 未连接")
+                self._cloud_status_indicator.setObjectName("cloudStatusOff")
+                self._cloud_status_btn.setText("连接云端")
+            self._cloud_status_indicator.style().unpolish(self._cloud_status_indicator)
+            self._cloud_status_indicator.style().polish(self._cloud_status_indicator)
+        # 收支清算入口：云端未连接时置灰（数据存云端，离线不可用）；
+        # 本地模式下（未启用云端）始终可用（读本地订单库）。
         if hasattr(self, "_finance_action"):
-            self._finance_action.setEnabled(connected)
-        # 刷新样式
-        self._cloud_status_indicator.style().unpolish(self._cloud_status_indicator)
-        self._cloud_status_indicator.style().polish(self._cloud_status_indicator)
+            if self._config.cloud_enabled:
+                self._finance_action.setEnabled(connected)
+            else:
+                self._finance_action.setEnabled(True)
 
     # ---- UI 构建 ----
 
@@ -1896,14 +1987,18 @@ class MainWindow(QMainWindow):
 
         self._status_bar.addPermanentWidget(QLabel(" "))
 
-        self._cloud_status_indicator = QLabel("☁ 未连接")
-        self._cloud_status_indicator.setObjectName("cloudStatusOff")
-        self._status_bar.addPermanentWidget(self._cloud_status_indicator)
+        # 云端状态指示器/连接按钮：仅在启用云端功能时显示（本地模式不出现）
+        self._cloud_status_indicator = None
+        self._cloud_status_btn = None
+        if self._config.cloud_enabled:
+            self._cloud_status_indicator = QLabel("☁ 未连接")
+            self._cloud_status_indicator.setObjectName("cloudStatusOff")
+            self._status_bar.addPermanentWidget(self._cloud_status_indicator)
 
-        self._cloud_status_btn = QPushButton("连接云端")
-        self._cloud_status_btn.setFixedWidth(80)
-        self._cloud_status_btn.clicked.connect(self._toggle_cloud_connection)
-        self._status_bar.addPermanentWidget(self._cloud_status_btn)
+            self._cloud_status_btn = QPushButton("连接云端")
+            self._cloud_status_btn.setFixedWidth(80)
+            self._cloud_status_btn.clicked.connect(self._toggle_cloud_connection)
+            self._status_bar.addPermanentWidget(self._cloud_status_btn)
 
     def _setup_menu(self):
         """设置菜单栏。"""
@@ -1928,9 +2023,15 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        self._finance_action = QAction("📊 收支清算(&S)", self)
-        self._finance_action.triggered.connect(self._on_open_finance)
-        self._finance_action.setToolTip("收支清算数据存于云端，需连接云端后才能使用")
+        # 收支清算入口：启用云端 = 云端收支清算；关闭云端 = 收支统计（本地模式，读本地数据）
+        if self._config.cloud_enabled:
+            self._finance_action = QAction("📊 收支清算(&S)", self)
+            self._finance_action.triggered.connect(self._on_open_finance)
+            self._finance_action.setToolTip("收支清算数据存于云端，需连接云端后才能使用")
+        else:
+            self._finance_action = QAction("📊 收支统计(&S)", self)
+            self._finance_action.triggered.connect(self._on_open_finance)
+            self._finance_action.setToolTip("本地模式：收支统计，配置与数据存于本地（未连接云端）")
         file_menu.addAction(self._finance_action)
 
         file_menu.addSeparator()
@@ -3469,36 +3570,69 @@ class MainWindow(QMainWindow):
 
     def _update_owner_combo_items(self):
         """按 config.admin_names + 当前标签页归属人重建归属下拉项，尽量保持当前选中。
-        与「收支清算 → 成员管理」一致：cloud 成员名单通过 _refresh_owner_names_from_cloud 汇入 admin_names。"""
+        与「收支清算 → 成员管理」一致：cloud 成员名单通过 _refresh_owner_names_from_cloud 汇入 admin_names。
+        已连云端且拿到真实成员名单时，不再把占位默认名（张三/李四）塞回下拉或作为选中项。"""
         tab = self._config.tabs.get(self._current_tab)
-        tab_owner = (tab.owner_name if tab else "霍楠") or "霍楠"
+        tab_owner = (tab.owner_name if tab else DEFAULT_OWNER_NAME) or DEFAULT_OWNER_NAME
         names = list(self._config.admin_names or [])
-        if tab_owner and tab_owner not in names:
-            names.append(tab_owner)
+        connected_cloud = bool(
+            self._cloud_client and self._cloud_client.is_connected()
+            and self._cloud_client.api_url and self._cloud_client.token
+        )
+        has_real_members = any(n not in DEFAULT_OWNER_NAMES for n in names)
+        # 已连云端且名单是真实成员名单 → 占位默认名不再有效，回退到名单第一个真实成员；
+        # 否则正常保留当前标签页归属人（含未连接云端时的占位名）。
+        if connected_cloud and has_real_members and tab_owner in DEFAULT_OWNER_NAMES:
+            real = [n for n in names if n not in DEFAULT_OWNER_NAMES]
+            act_owner = real[0] if real else tab_owner
+        else:
+            act_owner = tab_owner
+        if act_owner and act_owner not in names:
+            names.append(act_owner)
         cur = self._owner_combo.currentText()
         if cur and cur not in names:
-            names.append(cur)
+            # 已连云端且名单是真实成员名单时，原占位选中项（张三/李四）不再保留回来
+            if not (connected_cloud and has_real_members and cur in DEFAULT_OWNER_NAMES):
+                names.append(cur)
         if [self._owner_combo.itemText(i) for i in range(self._owner_combo.count())] != names:
             self._owner_combo.blockSignals(True)
             self._owner_combo.clear()
             self._owner_combo.addItems(names)
             self._owner_combo.blockSignals(False)
-        if self._owner_combo.currentText() != tab_owner:
+        if self._owner_combo.currentText() != act_owner:
             self._owner_combo.blockSignals(True)
-            self._owner_combo.setCurrentText(tab_owner)
+            self._owner_combo.setCurrentText(act_owner)
             self._owner_combo.blockSignals(False)
 
     def _refresh_owner_names_from_cloud(self):
         """从云端收支清算配置同步成员名单到归属下拉（成员管理里的成员名）。
         仅合并新增名字，不覆盖已有选项；离线/失败时静默保留本地名单。
-        （主线程版本：网络请求 + 刷新下拉；网络部分本身可后台，见 net 版）"""
-        self._refresh_owner_names_from_cloud_net()
-        # 无论是否变化都刷新下拉（保持顺序/一致性）——必须主线程
-        if hasattr(self, '_owner_combo') and self._owner_combo:
-            try:
-                self._update_owner_combo_items()
-            except Exception:
-                pass
+        （主线程版：把同步网络请求放到后台线程，完成后经 _ownerComboRefreshed 信号回主线程刷新下拉，
+        避免在下拉弹出/打开收支清算时阻塞 UI。）"""
+        if not self._cloud_client or not self._cloud_client.is_connected():
+            return
+        if not self._cloud_client.api_url or not self._cloud_client.token:
+            return
+        # 防抖：上下两次请求至少间隔 2s，避免下拉反复 Show 触发并发叠加
+        now = time.monotonic()
+        if now - self._owner_refresh_last_ts < 2.0:
+            return
+        self._owner_refresh_last_ts = now
+        threading.Thread(
+            target=self._owner_refresh_net_thread,
+            daemon=True,
+            name="owner-name-sync",
+        ).start()
+
+    def _owner_refresh_net_thread(self):
+        """后台线程：拉取成员名单 + 合并 + 写盘 + 回主线程刷新下拉。"""
+        try:
+            self._refresh_owner_names_from_cloud_net()
+        except Exception as e:
+            logger.debug(f"同步云端成员名单失败: {e}")
+        finally:
+            # 无论是否变化都刷新下拉（保持顺序/一致性）——必须回主线程
+            self._ownerComboRefreshed.emit()
 
     def _refresh_owner_names_from_cloud_net(self):
         """成员名单拉取 + 合并 + 写盘（无 UI 操作，可在后台线程执行）。
@@ -3530,6 +3664,8 @@ class MainWindow(QMainWindow):
             # 合并 + 修剪：名单 = 云端成员 ∪ 仍被标签页使用的名字。
             # 云端成员名是权威来源，本地残留的过期名字（如历史脏数据）若未被任何标签页引用则剔除，
             # 保证下拉与「收支清算 → 成员管理」完全一致。
+            # 注意：占位默认名（张三/李四）即使仍被标签页使用（新标签页默认归属人）也不保留——
+            # 否则云端已有真实成员名单时，占位名还会因"标签页在用"被加回列表底部。
             used = set()
             for t in self._config.tabs.values():
                 if getattr(t, 'owner_name', ''):
@@ -3540,7 +3676,7 @@ class MainWindow(QMainWindow):
                 if n not in merged:
                     merged.append(n)
             for n in base:
-                if n not in merged and n in used:
+                if n not in merged and n in used and n not in DEFAULT_OWNER_NAMES:
                     merged.append(n)
             if merged != base:
                 self._config.admin_names = merged
@@ -3554,7 +3690,7 @@ class MainWindow(QMainWindow):
             return
         tab = self._config.tabs.get(self._current_tab)
         if tab:
-            tab.owner_name = (text or "").strip() or "霍楠"
+            tab.owner_name = (text or "").strip() or DEFAULT_OWNER_NAME
         self._save_config()
 
     def _on_admin_print_toggled(self, checked: bool):
@@ -3805,10 +3941,10 @@ class MainWindow(QMainWindow):
 
     def _current_owner_params(self) -> dict:
         """当前标签页的归属参数（owner_name / is_admin_print），供预留/上报随请求传给后端。
-        与 local_orders 上报口径一致：默认 霍楠 / 管理员自行打印。"""
+        与 local_orders 上报口径一致：默认占位名（张三）/ 管理员自行打印。"""
         tab = self._config.tabs.get(self._current_tab)
         return {
-            "owner_name": (tab.owner_name if tab else "霍楠"),
+            "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
             "is_admin_print": "1" if (bool(tab.is_admin_print) if tab else True) else "0",
         }
 
@@ -3870,7 +4006,7 @@ class MainWindow(QMainWindow):
                             f"{self._cloud_client.api_url}/api/next_order_number",
                             params={
                                 "token": self._cloud_client.token,
-                                "owner_name": (tab.owner_name if tab else "霍楠"),
+                                "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
                                 "is_admin_print": "1" if (bool(tab.is_admin_print) if tab else True) else "0",
                             },
                             timeout=5,
@@ -3891,8 +4027,9 @@ class MainWindow(QMainWindow):
                 if job.order_number in replacements:
                     job.order_number = replacements[job.order_number]
         self._save_config()
-        self._refresh_tab_display()
-        self._log(f"📋 已同步 {len(replacements)} 个本地订单号到云端: {' '.join(replacements.values())}")
+        # 后台线程内不直接操作 Qt 控件：换号刷新/日志经信号回主线程
+        self._tabDisplayRefresh.emit()
+        self._cloudConnSyncLog.emit(f"📋 已同步 {len(replacements)} 个本地订单号到云端: {' '.join(replacements.values())}")
         # 上报到后端
         for old_num, new_num in replacements.items():
             # 收集该订单号对应的所有任务
@@ -3903,11 +4040,11 @@ class MainWindow(QMainWindow):
                         order_jobs.append(j)
             if order_jobs:
                 # 归属标记（v24）：取该订单所在标签页的归属设置
-                owner_name = "霍楠"
+                owner_name = DEFAULT_OWNER_NAME
                 is_admin_print = True
                 for tab2 in self._config.tabs.values():
                     if any(j.order_number == new_num for j in tab2.jobs):
-                        owner_name = (tab2.owner_name or "霍楠")
+                        owner_name = (tab2.owner_name or DEFAULT_OWNER_NAME)
                         is_admin_print = bool(tab2.is_admin_print)
                         break
                 try:
@@ -4308,7 +4445,7 @@ class MainWindow(QMainWindow):
                             "files": files_data,
                             "created_at": created_at,
                             # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
-                            "owner_name": (tab.owner_name if tab else "霍楠"),
+                            "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
                             "is_admin_print": bool(tab.is_admin_print) if tab else True,
                             # 附加服务上报（与计费口径一致）
                             **extra_fields,
@@ -4354,7 +4491,7 @@ class MainWindow(QMainWindow):
                         "files": files_data,
                         "created_at": created_at,
                         # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
-                        "owner_name": (tab.owner_name if tab else "霍楠"),
+                        "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
                         "is_admin_print": bool(tab.is_admin_print) if tab else True,
                         # 附加服务上报（与计费口径一致）
                         **extra_fields,
@@ -4379,7 +4516,7 @@ class MainWindow(QMainWindow):
                         files_data=files_data,
                         total_price=total_price,
                         created_at=created_at,
-                        owner_name=(tab.owner_name if tab else "霍楠"),
+                        owner_name=(tab.owner_name if tab else DEFAULT_OWNER_NAME),
                         is_admin_print=bool(tab.is_admin_print) if tab else True,
                     )
                     self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
@@ -4476,7 +4613,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.1.1</h3>"
+            "<h3>HN 本地打印工具 v4.1.2</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -5182,10 +5319,19 @@ class MainWindow(QMainWindow):
             ).start()
 
     def _conn_sync_worker(self):
-        """后台线程：连线后同步（离线订单换号 / 状态 / 成员名单 / 离线上报）。
-        这些均为同步网络请求，放后台避免 UI 卡死；日志与 UI 刷新经信号回主线程。"""
+        """后台线程：连线后同步（成员名单 / 离线订单换号 / 状态 / 离线上报）。
+        这些均为同步网络请求，放后台避免 UI 卡死；日志与 UI 刷新经信号回主线程。
+        成员名单拉取放在最前，尽早更新归属下拉（占位名可尽快被真实名单替换），
+        不被耗时的离线订单换号拖在后面。"""
         try:
-            # 逐个 -L 离线订单换号（逐单同步 requests，最耗时）
+            # ① 成员名单：最先拉取+写配置（后台），UI 刷新经信号回主线程。
+            #    放最前：让归属下拉尽快替换掉占位名（张三/李四），不等慢的订单换号。
+            try:
+                self._refresh_owner_names_from_cloud_net()
+                self._ownerComboRefreshed.emit()   # 拉完立即刷新下拉
+            except Exception as e:
+                logger.debug(f"同步云端成员名单失败: {e}")
+            # ② 逐个 -L 离线订单换号（逐单同步 requests，最耗时，放最后）
             try:
                 self._sync_local_orders_to_cloud()
             except Exception as e:
@@ -5195,11 +5341,6 @@ class MainWindow(QMainWindow):
                     self._cloud_client.sync_pending_statuses()
                 except Exception as e:
                     logger.warning(f"云端状态同步失败: {e}")
-            # 成员名单：只拉取+写配置（后台），UI 刷新经信号回主线程
-            try:
-                self._refresh_owner_names_from_cloud_net()
-            except Exception as e:
-                logger.debug(f"同步云端成员名单失败: {e}")
             # 离线订单上报（同步网络）
             if self._offline_sync and self._cloud_client:
                 try:
@@ -5212,7 +5353,7 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self._cloudConnSyncLog.emit(f"⚠️ 离线订单同步失败: {e}")
         finally:
-            # 成员归属下拉刷新回主线程执行
+            # 成员归属下拉刷新回主线程执行（幂等：已刷过一次也无妨）
             self._ownerComboRefreshed.emit()
 
     def _on_owner_combo_refreshed(self):
@@ -5222,6 +5363,13 @@ class MainWindow(QMainWindow):
                 self._update_owner_combo_items()
             except Exception:
                 pass
+
+    def _on_refresh_tab_display_safe(self):
+        """（主线程）后台同步换号完成后，刷新标签页显示（必须回主线程操作控件）。"""
+        try:
+            self._refresh_tab_display()
+        except Exception:
+            pass
 
     def _on_cloud_status_message(self, msg: str):
         """云端日志消息 → 写入界面日志。"""

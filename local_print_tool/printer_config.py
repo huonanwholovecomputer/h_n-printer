@@ -15,6 +15,13 @@ from datetime import datetime
 from typing import Any
 
 
+# ---- 订单归属默认占位名 ----
+# 未连接云端 / 未配置成员名单时的通用占位姓名（避免把真实用户名硬编码为默认值）。
+# 连接云端后，_refresh_owner_names_from_cloud 会用真实成员名单替换掉这些占位名。
+DEFAULT_OWNER_NAME = "张三"            # 单个订单归属的默认占位名
+DEFAULT_OWNER_NAMES = ["张三", "李四"]  # 归属下拉初始占位成员（成员名单未同步时的默认项）
+
+
 @dataclass
 class TabSettings:
     """单个标签页的独立设置（v7+：附加服务从全局移入标签页）。"""
@@ -26,7 +33,7 @@ class TabSettings:
     urgency: str = "低"
     frozen: bool = False  # 打印后锁定，禁止任何编辑，仅允许删除标签页
     # 订单归属（v24）：本标签页订单属于谁 + 是否管理员自行打印（非顾客订单）
-    owner_name: str = "霍楠"
+    owner_name: str = DEFAULT_OWNER_NAME
     is_admin_print: bool = True
 
     def to_dict(self) -> dict:
@@ -56,7 +63,7 @@ class TabSettings:
             cover_page_price=float(data.get("cover_page_price", 0.15)),
             urgency=data.get("urgency", "低"),
             frozen=bool(data.get("frozen", False)),
-            owner_name=(data.get("owner_name") or "霍楠").strip() or "霍楠",
+            owner_name=(data.get("owner_name") or DEFAULT_OWNER_NAME).strip() or DEFAULT_OWNER_NAME,
             is_admin_print=bool(data.get("is_admin_print", True)),
         )
 
@@ -303,7 +310,7 @@ class PrinterConfig:
     pickup_address: str = "1号楼202宿舍"    # 自取地址
     last_order_number: int = 0              # 订单号计数器
     # 订单归属（v24）：管理员姓名列表，供标签页订单归属下拉选择
-    admin_names: list[str] = field(default_factory=lambda: ["霍楠"])
+    admin_names: list[str] = field(default_factory=lambda: list(DEFAULT_OWNER_NAMES))
     # ---- 云端配置 ----
     cloud_enabled: bool = False             # 是否启用云端连接
     cloud_api_url: str = "https://your-server.com"   # 云端 API 地址（替换为你自己的服务器）
@@ -386,7 +393,7 @@ class PrinterConfig:
             pickup_address=data.get("pickup_address", "1号楼202宿舍"),
             last_order_number=int(data.get("last_order_number", 0)),
             # dict/list 字段防 null：被手改/写坏为 null 时退回默认
-            admin_names=[str(n).strip() for n in (data.get("admin_names") or ["霍楠"]) if str(n).strip()] or ["霍楠"],
+            admin_names=[str(n).strip() for n in (data.get("admin_names") or list(DEFAULT_OWNER_NAMES)) if str(n).strip()] or list(DEFAULT_OWNER_NAMES),
             # 云端配置
             cloud_enabled=bool(data.get("cloud_enabled", False)),
             cloud_api_url=data.get("cloud_api_url", "https://your-server.com"),

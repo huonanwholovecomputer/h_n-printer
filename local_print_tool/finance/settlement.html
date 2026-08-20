@@ -649,6 +649,7 @@ img, button { -webkit-user-drag: none; }
 <script>
 /* ==================== 启动令牌（由本地打印工具服务器注入） ==================== */
 var LAUNCH_TOKEN = '__LAUNCH_TOKEN__';
+var FINANCE_MODE = '__FINANCE_MODE__';   // 'cloud' 或 'local'：收支清算数据/配置的存储来源
 (function () {
   // 兼容 #token= 与 ?token= 两种传入：fragment 优先（浏览器不把 fragment 发给服务器，避免令牌进日志/Referer）
   var m = (location.hash || '').match(/(?:^|[?&])token=([^&]+)/);
@@ -656,6 +657,14 @@ var LAUNCH_TOKEN = '__LAUNCH_TOKEN__';
   if (m && m[1]) {
     try { LAUNCH_TOKEN = decodeURIComponent(m[1]); } catch (e) { /* 非法编码则沿用注入值 */ }
   }
+  // 存储模式：优先从 URL 参数读（运行时切换也能体现），否则用服务器注入值
+  var mm = (location.hash || '').match(/(?:^|[?&])mode=([^&]+)/);
+  if (!mm) mm = (location.search || '').match(/(?:^|[?&])mode=([^&]+)/);
+  if (mm && mm[1]) {
+    var mv = decodeURIComponent(mm[1]);
+    if (mv === 'cloud' || mv === 'local') FINANCE_MODE = mv;
+  }
+  if (FINANCE_MODE !== 'cloud' && FINANCE_MODE !== 'local') FINANCE_MODE = 'cloud';
 })();
 function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type': 'application/json' }; }
 
@@ -670,9 +679,9 @@ function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type':
 
 /* ==================== 常量 ==================== */
 var DEFAULT_MEMBERS = [
-  { id: 'hn', name: '成员A', color: '#4472C4' },
-  { id: 'yyx', name: '成员B', color: '#548235' },
-  { id: 'ych', name: '成员C', color: '#ED7D31' },
+  { id: 'zs', name: '张三', color: '#4472C4' },
+  { id: 'ls', name: '李四', color: '#548235' },
+  { id: 'ww', name: '王五', color: '#ED7D31' },
 ];
 var DEFAULT_SCORE_CAP = 15;
 var DEFAULT_RATE = 0.05;
@@ -711,6 +720,90 @@ function _loadFromLocalFile() {
     .then(function (r) { return r.json(); })
     .then(function (res) { return (res && res.success && res.data) ? res.data : null; })
     .catch(function () { return null; });
+}
+function _saveToLocalFile(data) {
+  return fetch('/api/local/data', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ data: data }) })
+    .then(function (r) { return r.json(); })
+    .then(function (res) { return (res && res.success) ? { ok: true } : { ok: false, message: (res && res.message) || '保存失败' }; })
+    .catch(function (e) { return { ok: false, message: String(e) }; });
+}
+
+/* ==================== 有效数据判定（排除纯示例/默认空壳） ==================== */
+function hasRealData(store) {
+  if (!store) return false;
+  var recs = store.records;
+  if (recs) {
+    if ((recs.expenses || []).length) return true;
+    if ((recs.income || []).length) return true;
+    if ((recs.scores || []).length) return true;
+  }
+  if (store.notes && Object.keys(store.notes).length) return true;
+  var cfg = store.config || {};
+  // 成员名单与默认三人不一致（增删改过）→ 算真实数据
+  if (cfg.members && cfg.members.length) {
+    var defStr = JSON.stringify(DEFAULT_MEMBERS.map(function (m) { return m.name; }).sort());
+    var curStr = JSON.stringify(cfg.members.map(function (m) { return m.name; }).sort());
+    if (curStr !== defStr) return true;
+  }
+  // 配过 openid 绑定 → 算真实数据
+  if ((cfg.memberBindings || []).length) return true;
+  // 改过密码（任一不等于默认哈希）→ 算真实数据
+  if (cfg.passwords) {
+    var keys = Object.keys(cfg.passwords);
+    for (var i = 0; i < keys.length; i++) {
+      if ((cfg.passwords[keys[i]] || '') !== (DEFAULT_PASSWORDS[keys[i]] || '')) return true;
+    }
+  }
+  // 改过非默认设置
+  if (cfg.scoreCap != null && Number(cfg.scoreCap) !== DEFAULT_SCORE_CAP) return true;
+  if (cfg.investRate != null && Number(cfg.investRate) !== DEFAULT_RATE) return true;
+  return false;
+}
+
+/* 合并两份收支数据（安全合并）：流水/成员/绑定按 id 去重并集；设置取非默认值；
+   密码单向权威保护：云端已有内容则以云端密码为准（本地密码不覆盖），否则采用本地密码（首次部署）。
+   返回合并后的 STORE。 */
+function mergeStores(localStore, cloudStore) {
+  function unionById(a, b) {
+    var map = {};
+    (a || []).forEach(function (x) { if (x && x.id) map[x.id] = x; });
+    (b || []).forEach(function (x) { if (x && x.id) map[x.id] = x; });
+    return Object.keys(map).map(function (k) { return map[k]; });
+  }
+  var lc = localStore && localStore.config || {};
+  var cc = cloudStore && cloudStore.config || {};
+  var members = (function () {
+    var map = {};
+    (cc.members || []).concat(lc.members || []).forEach(function (m) { if (m && (m.id || m.name)) map[m.id || m.name] = m; });
+    return Object.keys(map).map(function (k) { return map[k]; });
+  })();
+  var bindings = (function () {
+    var map = {};
+    (cc.memberBindings || []).concat(lc.memberBindings || []).forEach(function (b) { if (b && (b.openid || b.memberId)) map[(b.openid||'')+'|'+(b.memberId||'')] = b; });
+    return Object.keys(map).map(function (k) { return map[k]; });
+  })();
+  // 密码单向权威：云端有内容 → 用云端密码；否则（云端空/首部署）→ 用本地密码
+  var cloudHasCfg = cloudStore && cloudStore.config && Object.keys(cloudStore.config).length > 0;
+  var passwords = cloudHasCfg && cc.passwords
+    ? JSON.parse(JSON.stringify(cc.passwords))
+    : JSON.parse(JSON.stringify(lc.passwords || {}));
+  var merged = {
+    config: {
+      members: members.length ? members : JSON.parse(JSON.stringify(DEFAULT_MEMBERS)),
+      passwords: passwords,
+      memberBindings: bindings,
+      scoreCap: (lc.scoreCap != null && lc.scoreCap !== DEFAULT_SCORE_CAP) ? lc.scoreCap : (cc.scoreCap != null ? cc.scoreCap : DEFAULT_SCORE_CAP),
+      investRate: (lc.investRate != null && lc.investRate !== DEFAULT_RATE) ? lc.investRate : (cc.investRate != null ? cc.investRate : DEFAULT_RATE),
+    },
+    records: {
+      expenses: unionById((localStore && localStore.records && localStore.records.expenses) || [], (cloudStore && cloudStore.records && cloudStore.records.expenses) || []),
+      income: unionById((localStore && localStore.records && localStore.records.income) || [], (cloudStore && cloudStore.records && cloudStore.records.income) || []),
+      scores: unionById((localStore && localStore.records && localStore.records.scores) || [], (cloudStore && cloudStore.records && cloudStore.records.scores) || []),
+    },
+    notes: Object.assign({}, (cloudStore && cloudStore.notes) || {}, (localStore && localStore.notes) || {}),
+    meta: { version: (cloudStore && cloudStore.meta && cloudStore.meta.version) || 0 },
+  };
+  return merged;
 }
 
 /* ==================== 全局状态 ==================== */
@@ -959,6 +1052,17 @@ function save() {
    若 server_version > client_version + 1 说明期间有其他设备写入 → 弹冲突确认（覆盖则强制保存）。
    后端暂未实现版本号时，前端本地自增 meta.version，等待后端配合。 */
 function _doSave(force) {
+  if (FINANCE_MODE === 'local') {
+    // 本地模式：配置/数据存本地 print_data.json
+    _saveToLocalFile(STORE).then(function (r) {
+      if (!r.ok) { toast('⚠️ 本地保存失败', 'error'); return; }
+      var ind = $('#storageFilePath');
+      if (ind) ind.textContent = '📁 本地 · 已保存';
+      // 本地无并发冲突，版本号自增
+      if (STORE.meta) STORE.meta.version = (STORE.meta.version || 0) + 1;
+    });
+    return;
+  }
   _saveToServer(STORE, force).then(function (r) {
     if (!r.ok) {
       // 云端不可达：暂存本地，联网后启动时自动重放
@@ -1149,7 +1253,7 @@ function switchTab(name) {
   if (btn) btn.classList.add('on');
   if (name === 'dash') renderDash();
   else if (name === 'entry') renderEntry();
-  else if (name === 'cloud') { renderCloud(); ensureCloudMonths(); }
+  else if (name === 'cloud') { if (FINANCE_MODE === 'local') renderCloud(); else { renderCloud(); ensureCloudMonths(); } }
   else if (name === 'history') renderHistory();
   else if (name === 'settings') renderSettings();
   else if (name === 'about') renderAbout();
@@ -1636,7 +1740,7 @@ function _renderScopeBar(keys) {
   }
   h += '</div></div>';
   h += _renderScopeDD('members');
-  h += _renderScopeDD('sources');
+  if (FINANCE_MODE !== 'local') h += _renderScopeDD('sources');   // 本地模式全部为本地订单，无来源可选
   h += '<div class="f-item" style="margin-left:auto;text-align:right"><label>&nbsp;</label><div style="display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap">';
   if (_cloudDataFetchedAt) h += '<span style="font-size:.76rem;color:var(--muted)">☁ 最后同步 <b style="color:var(--text)">' + _cloudDataFetchedAt + '</b></span>';
   h += '<button class="btn" onclick="fetchScopeData(true)">🔄 刷新</button></div></div>';
@@ -2951,7 +3055,49 @@ function updNote(val) {
 }
 
 /* ==================== TAB: 云端 ==================== */
+/* 本地模式：数据源切换为「本地订单库」(/api/local/orders)，返回与云端 revenue 同构结构，
+   因此下方 renderCloud 的全部图表/成员筛选/日期范围逻辑可完整复用；仅隐藏「来源」筛选。 */
+var _localOrdersReady = false;
+function fetchLocalScopeData(force) {
+  var range = _scopeRange();
+  if (!range) { toast('请选择起止日期', 'error'); return; }
+  if (force) { _scopeCache = {}; _scopeFailedKey = null; }
+  var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end);
+  _cloudLoading = true;
+  _cloudDataFetchedAt = null;
+  renderCloud();
+  fetch('/api/local/orders?' + params, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      _cloudLoading = false;
+      if (data && data.success && data.data) {
+        _cloudData = data.data;
+        _scopeCache[_scopeRangeKey()] = data.data;
+        _scopeFailedKey = null;
+        _cloudDataFetchedAt = new Date().toTimeString().substring(0, 8);
+      } else { _cloudData = null; _scopeFailedKey = _scopeRangeKey(); }
+      renderCloud();
+    })
+    .catch(function () { _cloudLoading = false; _cloudData = null; _scopeFailedKey = _scopeRangeKey(); renderCloud(); });
+}
+function _scopeRangeKey() { var r = _scopeRange(); return r ? (r.start + '_' + r.end) : ''; }
+
+/* 本地模式：进入 tab-cloud 时复用云端驾驶舱渲染，数据源为本地订单库；
+   本地无「云端月份」接口，故直接置就绪并走 shared 渲染。 */
+function _renderLocalCloud() {
+  _cloudMonthsReady = true;
+  _renderCloudShared();
+}
+
 function renderCloud() {
+  // 本地模式：复用云端驾驶舱布局，数据源为本地订单库
+  if (FINANCE_MODE === 'local') {
+    _renderLocalCloud();
+    return;
+  }
+  _renderCloudShared();
+}
+function _renderCloudShared() {
   var el = $('#tab-cloud');
   var keys = cloudMonthKeys();
   var cm = currentMonthKey();
@@ -2963,20 +3109,20 @@ function renderCloud() {
 
   if (_cloudLoading) {
     _destroyCloudCharts();
-    h += '<div class="section" style="text-align:center;padding:46px"><span class="loading-spin"></span> <span style="margin-left:6px;color:var(--muted)">正在从云端获取数据…</span></div>';
+    h += '<div class="section" style="text-align:center;padding:46px"><span class="loading-spin"></span> <span style="margin-left:6px;color:var(--muted)">正在' + (FINANCE_MODE === 'local' ? '读取本地订单' : '从云端获取数据') + '…</span></div>';
     el.innerHTML = h;
     return;
   }
-  if (!_cloudMonthsReady) {
+  if (FINANCE_MODE !== 'local' && !_cloudMonthsReady) {
     h += '<div class="empty"><div class="ico">📡</div><h3>正在加载云端月份…</h3></div>';
     el.innerHTML = h;
     return;
   }
   if (!_cloudData) {
     var rk = _scopeRange(), rkKey = rk ? (rk.start + '_' + rk.end) : '';
-    if (rk && _scopeFailedKey !== rkKey) { fetchScopeData(); return; }   // 首次进入/切换口径自动查询（失败过则落地错误态，不死循环重拉）
+    if (rk && _scopeFailedKey !== rkKey) { (FINANCE_MODE === 'local' ? fetchLocalScopeData : fetchScopeData)(); return; }
     _destroyCloudCharts();
-    h += '<div class="empty"><div class="ico">📡</div><h3>查询失败或无数据</h3><p>统计各成员及本地任务的订单数、盈利与订单构成，用于核对手动代收收入。</p><button class="btn pri" style="margin-top:14px" onclick="fetchScopeData(true)">🔍 重试查询</button></div>';
+    h += '<div class="empty"><div class="ico">📡</div><h3>查询失败或无数据</h3><p>统计各成员及本地任务的订单数、盈利与订单构成，用于核对手动代收收入。</p><button class="btn pri" style="margin-top:14px" onclick="' + (FINANCE_MODE === 'local' ? 'fetchLocalScopeData(true)' : 'fetchScopeData(true)') + '">🔍 重试查询</button></div>';
     el.innerHTML = h;
     return;
   }
@@ -3378,31 +3524,33 @@ function renderSettings() {
   h += '<button class="btn green sm" onclick="addMember()">+ 添加</button></div>';
   h += '<div style="font-size:.78rem;color:var(--muted)">成员 ID 自动生成。删除成员不会删除已有记录（但不再参与后续计算）。</div></div>';
 
-  // 云端绑定
-  h += '<div class="section"><h2>🧑‍🤝‍🧑 云端成员绑定 <span class="hint">（openid → 成员）</span></h2>';
-  var binds = STORE.config.memberBindings || [];
-  if (binds.length) {
-    h += '<div class="table-wrap"><table><thead><tr><th>云端用户 openid</th><th>绑定成员</th><th></th></tr></thead><tbody>';
-    binds.forEach(function (b) {
-      var boidS = safeId(b.openid);
-      if (!boidS) return;   // 非法 openid 跳过该行（safeId 已 console.warn）
-      h += '<tr><td style="font-family:monospace;font-size:.8rem" class="l">' + esc(b.openid) + '</td><td>';
-      h += '<select onchange="updateBinding(\'' + boidS + '\',this.value)" style="font-size:.84rem;padding:4px 8px">';
-      h += '<option value="">未绑定</option>';
-      members.forEach(function (mm) { h += '<option value="' + esc(mm.id) + '"' + (b.memberId === mm.id ? ' selected' : '') + '>' + esc(mm.name) + '</option>'; });
-      h += '</select></td><td><button class="btn danger sm" onclick="updateBinding(\'' + boidS + '\',\'\')">解绑</button></td></tr>';
-    });
-    h += '</tbody></table></div>';
-  } else {
-    h += '<div style="color:var(--muted);font-size:.85rem;margin-bottom:10px">暂无绑定。在「云端」模块的成员明细中，为未绑定用户选择成员即可完成绑定。</div>';
+  // 云端绑定（仅在云端模式显示；本地模式无 openid 用户，不需要绑定）
+  if (FINANCE_MODE !== 'local') {
+    h += '<div class="section"><h2>🧑‍🤝‍🧑 云端成员绑定 <span class="hint">（openid → 成员）</span></h2>';
+    var binds = STORE.config.memberBindings || [];
+    if (binds.length) {
+      h += '<div class="table-wrap"><table><thead><tr><th>云端用户 openid</th><th>绑定成员</th><th></th></tr></thead><tbody>';
+      binds.forEach(function (b) {
+        var boidS = safeId(b.openid);
+        if (!boidS) return;   // 非法 openid 跳过该行（safeId 已 console.warn）
+        h += '<tr><td style="font-family:monospace;font-size:.8rem" class="l">' + esc(b.openid) + '</td><td>';
+        h += '<select onchange="updateBinding(\'' + boidS + '\',this.value)" style="font-size:.84rem;padding:4px 8px">';
+        h += '<option value="">未绑定</option>';
+        members.forEach(function (mm) { h += '<option value="' + esc(mm.id) + '"' + (b.memberId === mm.id ? ' selected' : '') + '>' + esc(mm.name) + '</option>'; });
+        h += '</select></td><td><button class="btn danger sm" onclick="updateBinding(\'' + boidS + '\',\'\')">解绑</button></td></tr>';
+      });
+      h += '</tbody></table></div>';
+    } else {
+      h += '<div style="color:var(--muted);font-size:.85rem;margin-bottom:10px">暂无绑定。在「云端」模块的成员明细中，为未绑定用户选择成员即可完成绑定。</div>';
+    }
+    h += '<div class="settings-row"><label>手动绑定</label>';
+    h += '<input type="text" id="bindOpenid" placeholder="粘贴 openid" style="width:220px;font-family:monospace;font-size:.8rem">';
+    h += '<select id="bindMember" style="padding:8px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text)">';
+    members.forEach(function (mm) { h += '<option value="' + esc(mm.id) + '">' + esc(mm.name) + '</option>'; });
+    h += '</select>';
+    h += '<button class="btn green sm" onclick="manualBind()">绑定</button></div>';
+    h += '</div>';
   }
-  h += '<div class="settings-row"><label>手动绑定</label>';
-  h += '<input type="text" id="bindOpenid" placeholder="粘贴 openid" style="width:220px;font-family:monospace;font-size:.8rem">';
-  h += '<select id="bindMember" style="padding:8px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text)">';
-  members.forEach(function (mm) { h += '<option value="' + esc(mm.id) + '">' + esc(mm.name) + '</option>'; });
-  h += '</select>';
-  h += '<button class="btn green sm" onclick="manualBind()">绑定</button></div>';
-  h += '</div>';
 
   // 结算参数
   h += '<div class="section"><h2>⚖️ 结算参数</h2>';
@@ -3423,7 +3571,7 @@ function renderSettings() {
   h += '<div class="section"><h2>💾 数据管理</h2>';
   h += '<div class="settings-row"><label>备份</label><button class="btn sm" onclick="exportData()">📤 导出 JSON</button><button class="btn sm" onclick="document.getElementById(\'ifile-settings\').click()">📥 导入 JSON</button><input type="file" id="ifile-settings" accept=".json" style="display:none" onchange="importData(event)"></div>';
   h += '<div class="settings-row"><label>危险操作</label><button class="btn danger sm" onclick="resetData()">⚠ 重置所有数据</button></div>';
-  h += '<div class="settings-row"><label>存储位置</label><span style="font-size:.84rem;color:var(--green);font-family:monospace">☁ 云端服务器（finance_config）</span></div>';
+  h += '<div class="settings-row"><label>存储位置</label><span style="font-size:.84rem;color:var(--green);font-family:monospace">' + (FINANCE_MODE === 'local' ? '📁 本地文件（print_data.json）' : '☁ 云端服务器（finance_config）') + '</span></div>';
   h += '</div>';
 
   el.innerHTML = h;
@@ -3536,15 +3684,56 @@ function renderAbout() {
 /* ==================== 初始化 ==================== */
 var _configLoaded = false;
 function loadConfig() {
+  if (FINANCE_MODE === 'local') {
+    // 本地模式：不查云端，直接读本地 print_data.json；无本地数据则用空 STORE
+    _loadFromLocalFile().then(function (localData) {
+      if (localData) STORE = migrateConfig(localData);
+      else STORE = migrateConfig(null);
+      finishLocalLoad();
+    });
+    return;
+  }
+  // 云端模式：先拉云端，再比对本地，决定是否合并同步
   _loadFromServer().then(function (res) {
     if (!res.ok) { setCloudState(false); return; }
     setCloudState(true);
     var cloudData = res.data;
     var hadCloud = !!cloudData;
     if (cloudData) STORE = migrateConfig(cloudData);
-    // 无云端数据时尝试从本地旧文件一次性迁移
+    else STORE = migrateConfig(null);
+    // 拉本地，判断是否两者都有真实数据 → 弹「合并」询问
     _loadFromLocalFile().then(function (localData) {
-      if (!hadCloud && localData) {
+      if (localData) localData = migrateConfig(localData);
+      var localReal = hasRealData(localData);
+      var cloudReal = hasRealData(cloudData);
+      if (localReal && cloudReal && localData) {
+        // 两边都有真实数据 → 询问合并（安全合并；密码单向权威保护）
+        openConfirm(
+          '检测到本地与云端均存在收支数据（本地为离线期间产生，云端为多人共用）。\n\n' +
+          '为避免数据丢失，将执行「安全合并」：\n' +
+          '· 流水/成员/绑定按记录合并（去重）\n' +
+          '· 密码以云端为权威（本地无法覆盖云端密码）\n\n' +
+          '是否合并并上传云端？',
+          '合并'
+        ).then(function (ok) {
+          if (ok) {
+            STORE = mergeStores(localData, cloudData || localData);
+            // 合并结果写回本地 + 云端
+            _saveToServer(STORE, true).then(function (sr) {
+              if (sr.ok) toast('✅ 已安全合并本地与云端数据并上传', 'success');
+              else toast('⚠️ 合并结果已保留，云端保存失败', 'error');
+            });
+            _saveToLocalFile(STORE);
+            finishLoad(true);
+          } else {
+            // 用户取消合并：以云端为准（云端是多人共用权威）
+            finishLoad(true);
+          }
+        });
+        return;
+      }
+      // 无云端真实数据但本地有 → 本地一次性迁移到云端
+      if (!cloudReal && localReal && localData) {
         STORE = migrateConfig(localData);
         save();
         toast('✅ 已从本地文件迁移到云端', 'success');
@@ -3567,6 +3756,29 @@ function loadConfig() {
       }
     });
   });
+}
+function finishLocalLoad() {
+  replayOfflinePending();   // 本地模式同样重放暂存
+  var keys = allMonthKeys();
+  currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
+  renderAll();
+  // 本地模式：cloud tab 走本地订单库，无需 loadCloudMonths
+  _localOrdersReady = false;
+  renderCloud();
+  setCloudStateLocal();     // 本地模式云端徽标固定显示"本地模式"
+  if (hasRealData(STORE)) toast('✅ 已加载本地收支数据（' + monthRecordCount(currentKey) + ' 条当月记录）');
+  else toast('ℹ️ 欢迎使用，请在「记账」录入数据（本地模式）');
+}
+function setCloudStateLocal() {
+  var pill = $('#cloudPill');
+  if (pill) {
+    pill.className = 'cloud-pill ok';
+    pill.innerHTML = '<span class="dot"></span> 本地模式';
+  }
+  var ind = $('#storageFilePath');
+  if (ind) ind.textContent = '📁 本地';
+  var ov = $('#blockOverlay');
+  if (ov) ov.classList.remove('show');
 }
 function finishLoad(hadCloud) {
   replayOfflinePending();   // 云端可达：重放上次离线暂存的未保存数据
@@ -3597,6 +3809,11 @@ function replayOfflinePending() {
   $$('#tabNav button').forEach(function (btn) {
     btn.addEventListener('click', function () { switchTab(this.dataset.tab); });
   });
+  // 本地模式：把「云端」页按钮改名为「本地订单」
+  if (FINANCE_MODE === 'local') {
+    var _cloudBtn = document.querySelector('#tabNav button[data-tab="cloud"]');
+    if (_cloudBtn) _cloudBtn.innerHTML = '<span class="ico">📡</span>本地订单';
+  }
   $('#themeToggle').addEventListener('click', cycleThemeMode);
   // 返回顶部：滚动超过 200px 显示，点击平滑回到顶部
   var _backToTop = $('#backToTop');

@@ -504,6 +504,9 @@ SUPER_ADMIN_OPENID = None
 PRINTER_TOKEN = None
 PRINTER_NAME = ""
 
+# 订单归属默认占位名（未显式指定归属时使用通用占位，避免把真实用户名硬编码为默认值）
+DEFAULT_OWNER_NAME = "张三"
+
 try:
     import config
     WECHAT_APPID = getattr(config, "WECHAT_APPID", WECHAT_APPID)
@@ -1249,14 +1252,14 @@ def next_order_number():
     # 预留即记归属（与 local_orders 上报口径一致）：先把当前归属者写进占位单，
     # 这样即使预留后未打印上报（被标 abandoned），也不会留下 owner_name 为空的“无归属”残留。
     # owner_name/is_admin_print 可选携带：支持界面上“选中哪个归属者默认就是哪个”的语义，
-    # 未携带时默认 霍楠 / 管理员自行打印（与 local_orders 的缺省值保持一致）。
+    # 未携带时默认使用占位名 / 管理员自行打印（与 local_orders 的缺省值保持一致）。
     owner_name = (request.args.get("owner_name") or request.form.get("owner_name") or "").strip()
     is_admin_print_raw = request.args.get("is_admin_print") or request.form.get("is_admin_print")
     if is_admin_print_raw is not None:
         is_admin_print = 1 if str(is_admin_print_raw) not in ("", "0", "false", "False") else 0
     else:
         is_admin_print = 1  # 本地预留默认视为管理员自行打印
-    owner_name = owner_name or "霍楠"
+    owner_name = owner_name or DEFAULT_OWNER_NAME
 
     # 创建占位订单记录（状态 reserved），后续 /api/local_orders 会更新为 sent
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4675,10 +4678,10 @@ def abandon_reserved_order():
     try:
         if total_price is not None:
             # 已配置打印（工具放弃时已知文件/份数/双面 → 有金额）：保留为 abandoned 订单，
-            # 并补记归属（本地单口径：默认 霍楠 / 管理员自行打印），避免留下无归属记录
+            # 并补记归属（本地单口径：默认占位名 / 管理员自行打印），避免留下无归属记录
             cursor = conn.execute(
                 """UPDATE orders SET status = 'abandoned', total_price = ?,
-                                     owner_name = COALESCE(NULLIF(owner_name, ''), '霍楠'),
+                                     owner_name = COALESCE(NULLIF(owner_name, ''), DEFAULT_OWNER_NAME),
                                      is_admin_print = CASE WHEN is_admin_print = 0 THEN 1 ELSE is_admin_print END
                    WHERE order_number = ? AND status = 'reserved'""",
                 (float(total_price), order_number),
@@ -4753,11 +4756,11 @@ def local_orders():
                    WHERE id = ?""",
                 (order_file_label, total_price, created_at, order_id),
             )
-            # 归属标记：本地工具上报时随订单写入（缺失则按迁移规则默认 霍楠/管理员自行打印，
+            # 归属标记：本地工具上报时随订单写入（缺失则默认占位名/管理员自行打印，
             # 与历史无标记订单的处理保持一致）
             conn.execute(
                 "UPDATE orders SET owner_name = ?, is_admin_print = ? WHERE id = ?",
-                (owner_name or "霍楠", is_admin_print if is_admin_print is not None else 1, order_id),
+                (owner_name or DEFAULT_OWNER_NAME, is_admin_print if is_admin_print is not None else 1, order_id),
             )
             # 清除旧子任务（如果有），重新插入
             conn.execute("DELETE FROM order_files WHERE order_id = ?", (order_id,))
@@ -4768,7 +4771,7 @@ def local_orders():
                                        total_price, source, owner_name, is_admin_print)
                    VALUES (?, 1, 'sent', ?, 'local', ?, ?, 'local', ?, ?)""",
                 (order_file_label, created_at, order_number, total_price,
-                 owner_name or "霍楠", is_admin_print if is_admin_print is not None else 1),
+                 owner_name or DEFAULT_OWNER_NAME, is_admin_print if is_admin_print is not None else 1),
             )
             order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 

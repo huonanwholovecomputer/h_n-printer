@@ -29,6 +29,8 @@ else:
 _BINDINGS_FILE = os.path.join(os.path.dirname(__file__), "user_bindings.json")
 # 默认数据文件（用户收支数据）
 _DEFAULT_DATA_FILE = os.path.join(os.path.dirname(__file__), "finance", "print_data.json")
+# 本地订单库（OfflineSync 写入的 SQLite，供「本地订单统计」页读取）
+_LOCAL_DB_FILE = os.path.join(os.path.dirname(__file__), "printer-local.db")
 
 # 本地文件读写锁（数据文件与绑定文件各自一把，跨线程串行化）
 _DATA_FILE_LOCK = threading.Lock()
@@ -96,6 +98,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
     api_url: str = ""
     token: str = ""
     launch_token: str = ""  # 启动令牌：仅本地打印工具启动时附带，每次启动随机
+    finance_mode: str = "cloud"  # 'cloud' 或 'local'：收支清算数据/配置的存储来源
 
     def __init__(self, *args, **kwargs):
         # 设置静态文件根目录
@@ -175,6 +178,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/data":
             return self._handle_get_data()
 
+        # 本地订单统计（读本地订单库 SQLite）
+        if path == "/api/local/orders":
+            return self._handle_local_orders(parsed.query)
+
         # 默认：静态文件
         return self._serve_static(path)
 
@@ -206,12 +213,13 @@ class _StatsHandler(SimpleHTTPRequestHandler):
     def _serve_static(self, path: str):
         """提供静态文件，根路径默认返回 settlement.html。
         HTML 入口要求启动令牌（?token=），并将 __LAUNCH_TOKEN__ 替换为本次启动的真实令牌。
+        __FINANCE_MODE__ 替换为当前存储模式（cloud/local）。
         公共库文件（chart.umd.min.js）豁免令牌；其余静态文件（含数据文件 print_data.json）一律校验令牌。"""
         serve_html = (path in ("", "/", "/settlement.html"))
         if serve_html:
             if not self._check_launch_token(allow_query=True):
                 return self._serve_403_page()
-            return self._serve_injected_html()
+            return self._serve_injected_html("settlement.html")
         if path in _PUBLIC_STATIC_FILES:
             self.path = path
             return super().do_GET()
@@ -221,9 +229,9 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         self.path = path
         return super().do_GET()
 
-    def _serve_injected_html(self):
-        """读取 settlement.html 并注入本次启动令牌。"""
-        html_path = os.path.join(_STATIC_DIR, "settlement.html")
+    def _serve_injected_html(self, name: str = "settlement.html"):
+        """读取指定 HTML 并注入启动令牌与存储模式。"""
+        html_path = os.path.join(_STATIC_DIR, name)
         try:
             with open(html_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -231,6 +239,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             logger.error(f"读取页面失败: {e}")
             return self._send_json({"success": False, "message": f"读取页面失败: {e}"}, 500)
         content = content.replace("__LAUNCH_TOKEN__", self.launch_token)
+        content = content.replace("__FINANCE_MODE__", self.finance_mode)
         body = content.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -345,6 +354,89 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                 return
         self._send_json({"success": True, "data": data, "exists": True})
 
+    def _handle_local_orders(self, query: str = ""):
+        """读取「本地订单库」SQLite（offline_orders 表），返回与云端 revenue 同构的订单结构。
+        供本地模式的「收支清算 → 云端」驾驶舱复用云端渲染（仅数据源为本地）。
+        金额一律用「整数分」（与云端口径一致）；本地订单视为已打印完成（status='sent'）。
+        支持 start_date/end_date/owner 过滤。"""
+        import sqlite3 as _sqlite
+        orders = []
+        try:
+            qs = urllib.parse.parse_qs(query)
+            owner = (qs.get("owner", [""])[0] or "").strip()
+            start_date = (qs.get("start_date", [""])[0] or "").strip()
+            end_date = (qs.get("end_date", [""])[0] or "").strip()
+            with _DATA_FILE_LOCK:
+                conn = _sqlite.connect(_LOCAL_DB_FILE)
+                sql = ("SELECT id, order_number, files_json, total_price, created_at, "
+                       "owner_name, is_admin_print, synced FROM offline_orders")
+                conds, args = [], []
+                if owner:
+                    conds.append("owner_name = ?")
+                    args.append(owner)
+                if start_date:
+                    conds.append("created_at >= ?")
+                    args.append(start_date + " 00:00:00")
+                if end_date:
+                    conds.append("created_at <= ?")
+                    args.append(end_date + " 23:59:59")
+                if conds:
+                    sql += " WHERE " + " AND ".join(conds)
+                sql += " ORDER BY created_at DESC, id DESC"
+                rows = conn.execute(sql, args).fetchall()
+                conn.close()
+            for (dbid, order_number, files_json, total_price, created_at,
+                    owner_name, is_admin_print, synced) in rows:
+                files = []
+                total_page_count = 0
+                try:
+                    fdata = json.loads(files_json) if files_json else []
+                    for f in fdata or []:
+                        if not isinstance(f, dict):
+                            continue
+                        seq = f.get("seq") or f.get("id") or ("f%d" % len(files))
+                        copies = int(f.get("copies", 1) or 1)
+                        page_count = int(f.get("page_count", 0) or 0)
+                        cost = float(f.get("cost", 0) or 0)          # 元
+                        is_free = bool(f.get("is_free", False))
+                        files.append({
+                            "id": seq,
+                            "file_name": f.get("file_name", ""),
+                            "copies": copies,
+                            "page_count": page_count,
+                            "total_price": int(round(cost * 100)),   # 转为分（云端口径）
+                            "status": "sent",                        # 本地订单已打印完成
+                            "is_free": is_free,
+                        })
+                        total_page_count += page_count * copies
+                except Exception:
+                    files = []
+                orders.append({
+                    "order_id": dbid,
+                    "order_number": order_number,
+                    "created_at": created_at or "",
+                    "total_page_count": total_page_count,
+                    "owner_name": owner_name or "",
+                    "is_admin_print": bool(is_admin_print),
+                    "source": "local",
+                    "openid": "local",
+                    "nickname": owner_name or "",
+                    # 本地订单无附加服务/计划字段 → 全置默认
+                    "auto_print": False,
+                    "schedule_mode": None,
+                    "delivery_enabled": False,
+                    "urgency": "低",
+                    "cover_page": False,
+                    "status": "sent",
+                    "files": files,
+                })
+        except Exception as e:
+            logger.error(f"读取本地订单库失败: {type(e).__name__}")
+            self._send_json({"success": False, "message": f"读取失败: {type(e).__name__}"}, 500)
+            return
+        # 顶层结构与云端 revenue 一致（前端 renderCloud 只消费 orders）
+        self._send_json({"success": True, "data": {"orders": orders}})
+
     def _handle_post_data(self):
         """写入本地数据文件：路径固定为默认数据文件（不支持客户端指定路径），
         加线程锁并以「临时文件 + os.replace」原子写入，避免并发写与写半损坏。"""
@@ -372,10 +464,12 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 class StatsServer:
     """统计 HTTP 服务器（后台线程）"""
 
-    def __init__(self, api_url: str = "", token: str = "", port: int = 0, data_file: str = ""):
+    def __init__(self, api_url: str = "", token: str = "", port: int = 0, data_file: str = "",
+                 finance_mode: str = "cloud"):
         self.api_url = api_url.rstrip("/") if api_url else ""
         self.token = token
         self.data_file = data_file or _DEFAULT_DATA_FILE
+        self.finance_mode = finance_mode if finance_mode in ("cloud", "local") else "cloud"
         self._port = port
         self._launch_token = secrets.token_hex(16)  # 每次启动随机，仅本地打印工具持有
         self._server: ThreadingHTTPServer | None = None
@@ -401,6 +495,7 @@ class StatsServer:
         _StatsHandler.token = self.token
         _StatsHandler._data_file = self.data_file
         _StatsHandler.launch_token = self._launch_token
+        _StatsHandler.finance_mode = self.finance_mode
 
         # 多线程 HTTP 服务器：避免单请求（如慢代理）阻塞其他请求
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _StatsHandler)
