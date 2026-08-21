@@ -15,11 +15,14 @@ from datetime import datetime
 from typing import Any
 
 
-# ---- 订单归属默认占位名 ----
-# 未连接云端 / 未配置成员名单时的通用占位姓名（避免把真实用户名硬编码为默认值）。
-# 连接云端后，_refresh_owner_names_from_cloud 会用真实成员名单替换掉这些占位名。
-DEFAULT_OWNER_NAME = "张三"            # 单个订单归属的默认占位名
-DEFAULT_OWNER_NAMES = ["张三", "李四"]  # 归属下拉初始占位成员（成员名单未同步时的默认项）
+# ---- 订单归属默认占位名（仅遗留兼容） ----
+# v4.2：归属名单不再预置占位姓名。成员名单一律来自收支统计的成员管理
+# （云端模式=云端 finance_config 成员；本地模式=本地 print_data.json 成员），
+# 无成员时归属下拉显示「(无成员)」并禁止创建订单。
+# 以下常量仅用于旧配置/旧数据库回读时的兜底，不再作为任何默认值。
+DEFAULT_OWNER_NAME = "张三"                       # 单个订单归属的遗留兜底名
+DEFAULT_OWNER_NAMES = ["张三", "李四"]            # 旧版归属下拉初始占位成员
+PLACEHOLDER_OWNER_NAMES = ("张三", "李四", "王五")  # 占位名集合：清洗旧数据时剔除
 
 
 @dataclass
@@ -33,7 +36,7 @@ class TabSettings:
     urgency: str = "低"
     frozen: bool = False  # 打印后锁定，禁止任何编辑，仅允许删除标签页
     # 订单归属（v24）：本标签页订单属于谁 + 是否管理员自行打印（非顾客订单）
-    owner_name: str = DEFAULT_OWNER_NAME
+    owner_name: str = ""          # 空 = 尚未选择成员（成员名单为空时禁止创建订单）
     is_admin_print: bool = True
 
     def to_dict(self) -> dict:
@@ -63,7 +66,7 @@ class TabSettings:
             cover_page_price=float(data.get("cover_page_price", 0.15)),
             urgency=data.get("urgency", "低"),
             frozen=bool(data.get("frozen", False)),
-            owner_name=(data.get("owner_name") or DEFAULT_OWNER_NAME).strip() or DEFAULT_OWNER_NAME,
+            owner_name=(data.get("owner_name") or "").strip(),
             is_admin_print=bool(data.get("is_admin_print", True)),
         )
 
@@ -310,7 +313,8 @@ class PrinterConfig:
     pickup_address: str = "1号楼202宿舍"    # 自取地址
     last_order_number: int = 0              # 订单号计数器
     # 订单归属（v24）：管理员姓名列表，供标签页订单归属下拉选择
-    admin_names: list[str] = field(default_factory=lambda: list(DEFAULT_OWNER_NAMES))
+    # v4.2：不再预置占位名；成员名单由收支统计成员管理同步（云端/本地），空列表=无成员
+    admin_names: list[str] = field(default_factory=list)
     # ---- 云端配置 ----
     cloud_enabled: bool = False             # 是否启用云端连接
     cloud_api_url: str = "https://your-server.com"   # 云端 API 地址（替换为你自己的服务器）
@@ -393,7 +397,8 @@ class PrinterConfig:
             pickup_address=data.get("pickup_address", "1号楼202宿舍"),
             last_order_number=int(data.get("last_order_number", 0)),
             # dict/list 字段防 null：被手改/写坏为 null 时退回默认
-            admin_names=[str(n).strip() for n in (data.get("admin_names") or list(DEFAULT_OWNER_NAMES)) if str(n).strip()] or list(DEFAULT_OWNER_NAMES),
+            # v4.2：admin_names 默认空列表（无成员），占位名不再预置
+            admin_names=[str(n).strip() for n in (data.get("admin_names") or []) if str(n).strip()],
             # 云端配置
             cloud_enabled=bool(data.get("cloud_enabled", False)),
             cloud_api_url=data.get("cloud_api_url", "https://your-server.com"),

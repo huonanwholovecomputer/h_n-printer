@@ -5,6 +5,7 @@ HN 本地打印工具 — 支持浅色/深色双主题
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -73,12 +74,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, generate_order_number, DEFAULT_OWNER_NAME, DEFAULT_OWNER_NAMES
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES
 from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 from cloud_client import CloudClient, CloudTask, pdf_cache_key
-from stats_server import StatsServer
+from stats_server import StatsServer, load_local_data_file, clear_local_data_files
 from offline_sync import OfflineSync
 
 logger = logging.getLogger(__name__)
@@ -1698,18 +1699,23 @@ class MainWindow(QMainWindow):
             self._cloud_client.start()
             self._update_cloud_status()
 
-        # 初始化离线同步引擎，启动后台定时同步（云端模式下自动把本地库订单定时上报）
-        self._offline_sync.start_background_sync(
-            server_url=self._config.cloud_api_url,
-            token=self._config.cloud_token,
-            interval=60,
-        )
+        # 初始化离线同步引擎，启动后台定时同步（仅云端模式下自动把本地库订单定时上报；
+        # 本地模式不启动——否则残留的旧云端 token 会把本地订单纯本地订单静默上传到旧云端）
+        if self._config.cloud_enabled and self._config.cloud_token:
+            self._offline_sync.start_background_sync(
+                server_url=self._config.cloud_api_url,
+                token=self._config.cloud_token,
+                interval=60,
+            )
+        else:
+            logger.info("云端功能未启用或未配置令牌：不启动后台订单同步")
 
-    def _on_open_finance(self):
+    def _on_open_finance(self, tab: str = ""):
         """打开收支清算页面：云端模式与本地模式共用同一个 settlement.html，
         由 stats_server 注入 finance_mode 决定数据/配置的存储来源。
         本地模式（cloud_enabled=False）：配置/数据存本地 print_data.json。
-        云端模式：存云端 finance/config；加载时若本地+云端都有真实数据则弹「合并」同步询问。"""
+        云端模式：存云端 finance/config；加载时若本地+云端都有真实数据则弹「合并」同步询问。
+        tab 可选：'settings' 深链到「设置」标签（无成员引导用）。"""
         finance_mode = "cloud" if self._config.cloud_enabled else "local"
         # 如果已启动则直接打开，否则先启动
         if self._stats_server is None:
@@ -1730,6 +1736,8 @@ class MainWindow(QMainWindow):
         # 附加启动令牌：settlement.html 要求每次启动的随机 token 才能访问；mode 显式传存储模式
         url = (f"{self._stats_server.url}/settlement.html"
                f"?token={self._stats_server.launch_token}&mode={finance_mode}")
+        if isinstance(tab, str) and tab in ("settings",):
+            url += "&tab=settings"
         mode_txt = "云端收支清算" if finance_mode == "cloud" else "本地收支清算"
         logger.info(f"打开{mode_txt}页面: {self._stats_server.url}")
         QDesktopServices.openUrl(QUrl(url))
@@ -1824,6 +1832,17 @@ class MainWindow(QMainWindow):
 
             # 开关状态发生变化 → 云端 UI 与机制差异巨大，需重启应用重新装配界面
             if old_enabled != self._config.cloud_enabled:
+                if not self._config.cloud_enabled:
+                    # 关闭云端：确认 → 冲刷未同步订单（此时云端仍连接，可换号/上报）→ 清空缓存数据
+                    if not self._confirm_cloud_off_and_wipe():
+                        # 用户取消关闭：恢复旧开关状态（配置已写盘，这里改回内存+写盘）
+                        self._config.cloud_enabled = True
+                        try:
+                            self._config.save(self._config_path)
+                        except Exception:
+                            pass
+                        self._log("❌ 已取消关闭云端")
+                        return
                 self._cloud_client and self._cloud_client.stop()
                 self._restart_for_cloud_switch(self._config.cloud_enabled)
                 return
@@ -1866,6 +1885,78 @@ class MainWindow(QMainWindow):
         else:
             # 不重启：配置已保存，下次启动生效
             self._log(f"🔁 云端开关已保存，下次启动时生效（{state_txt}）")
+
+    def _confirm_cloud_off_and_wipe(self) -> bool:
+        """关闭云端前的确认与清理。返回 True 表示继续关闭（云端缓存数据已清空）。"""
+        from PySide6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self,
+            "关闭云端功能",
+            "关闭云端功能后，本机将清空云端缓存数据（成员名单、收支数据、已同步订单），转为纯本地模式。\n\n"
+            "机器配置（打印机、价格、派送地点）会保留；未同步订单会先尝试上传云端。\n\n"
+            "是否继续关闭？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return False
+        self._flush_pending_orders_before_cloud_off()
+        self._wipe_cloud_cached_data()
+        return True
+
+    def _flush_pending_orders_before_cloud_off(self):
+        """关闭云端前尽力冲刷未同步订单（不中断流程，仅记录日志）。
+        此时云端仍连接：先处理待换号单（-L / 遗留 LOCAL-*），再上报其余待同步单。"""
+        if not self._offline_sync:
+            return
+        # ① 待换号单 → 换正式号并上报（云端仍连接时才能换号）
+        if self._cloud_client and self._cloud_client.is_connected():
+            try:
+                self._sync_local_orders_to_cloud()
+            except Exception as e:
+                self._log(f"⚠️ 关闭云端前换号同步失败: {e}")
+        # ② 其余待同步单 → 直接上报
+        pending = self._offline_sync.pending_count()
+        if pending > 0:
+            if self._cloud_client and self._cloud_client.api_url and self._cloud_client.token:
+                try:
+                    n = self._offline_sync.sync_all_pending_orders(
+                        server_url=self._cloud_client.api_url,
+                        token=self._cloud_client.token,
+                    )
+                    if n > 0:
+                        self._log(f"📋 关闭云端前已上传 {n} 条未同步订单")
+                except Exception as e:
+                    self._log(f"⚠️ 关闭云端前同步失败: {e}")
+        remain = self._offline_sync.count_unsynced()
+        if remain > 0:
+            self._log(f"⚠️ 仍有 {remain} 条未同步订单，将随云端缓存数据一并清空（云端不可达或上传失败）")
+
+    def _wipe_cloud_cached_data(self):
+        """关闭云端时清空本机云端缓存数据：
+        成员名单、收支数据文件、openid 绑定、本地订单库、标签页归属与订单号。
+        机器配置（打印机/价格/派送地点）与文件队列保留。"""
+        logger.info("开始清空云端缓存数据（关闭云端功能）")
+        # 1. 成员名单（归属下拉回到「(无成员)」）
+        self._config.admin_names = []
+        # 2. 标签页归属与订单号（保留文件队列与打印设置；订单号下次打印重新分配）
+        for tab in self._config.tabs.values():
+            tab.owner_name = ""
+            for job in tab.jobs:
+                job.order_number = ""
+        try:
+            self._config.save(self._config_path)
+        except Exception as e:
+            logger.warning(f"保存配置失败: {e}")
+        # 3. 本地订单库（已尽力冲刷；残留记录随清空移除）
+        if self._offline_sync:
+            self._offline_sync.clear_all()
+        # 4. 收支数据文件 + openid 绑定文件
+        try:
+            clear_local_data_files()
+        except Exception as e:
+            logger.warning(f"删除收支数据文件失败: {e}")
+        self._log("🧹 已清空本机云端缓存数据（成员名单/收支数据/本地订单库），下次启动以纯本地模式运行")
 
     def _restart_app(self):
         """重启当前应用（自动重新装配 UI）。"""
@@ -2387,7 +2478,9 @@ class MainWindow(QMainWindow):
         self._owner_combo.setFixedWidth(110)
         self._owner_combo.setToolTip("这笔订单属于谁（从下拉选择，名单与收支清算成员管理一致）")
         self._owner_combo.currentTextChanged.connect(self._on_owner_changed)
-        # 弹出下拉时同步云端收支清算成员名单（与「收支清算 → 成员管理」保持一致）
+        # 无成员时下拉只有「(无成员)」一项：用户点击该项（含再次点击当前项）→ 弹添加成员引导
+        self._owner_combo.activated.connect(self._on_owner_activated)
+        # 弹出下拉时同步收支清算成员名单（与「收支清算 → 成员管理」保持一致）
         self._owner_combo_refresh_filter = _OwnerComboRefreshFilter(self._refresh_owner_names_from_cloud)
         self._owner_combo.view().viewport().installEventFilter(self._owner_combo_refresh_filter)
         total_row.addWidget(self._owner_combo)
@@ -3457,6 +3550,12 @@ class MainWindow(QMainWindow):
         if tab:
             self._sync_tab_settings_to_ui(tab)
 
+        # v4.2：成员名单初始化 —— 本地模式立即从本地收支数据读取（云端模式等连接后由 _conn_sync_worker 刷新）
+        if not self._config.cloud_enabled:
+            self._refresh_owner_names_from_local()
+            if hasattr(self, '_owner_combo') and self._owner_combo:
+                self._update_owner_combo_items()
+
     def _refresh_printer_list(self):
         """刷新下拉列表中的系统打印机。"""
         current = self._printer_combo.currentText().strip()
@@ -3561,58 +3660,79 @@ class MainWindow(QMainWindow):
         # 订单归属（v24）：归属管理员下拉 + 管理员自行打印勾选
         if hasattr(self, '_owner_combo') and self._owner_combo:
             self._owner_combo.setEnabled(True)
-            self._update_owner_combo_items()
+            self._update_owner_combo_items()   # 内部同步 admin_print_check 启用态（无成员时禁用）
         if hasattr(self, '_admin_print_check') and self._admin_print_check:
-            self._admin_print_check.setEnabled(True)
             self._admin_print_check.blockSignals(True)
             self._admin_print_check.setChecked(bool(tab.is_admin_print))
             self._admin_print_check.blockSignals(False)
 
+    def _member_names(self) -> list[str]:
+        """真实成员名单（剔除旧版占位名 张三/李四/王五）。归属下拉与建单校验共用。"""
+        return [n for n in (self._config.admin_names or []) if n and n not in PLACEHOLDER_OWNER_NAMES]
+
+    def _has_members(self) -> bool:
+        """是否有可用成员（无成员时禁止创建订单）。"""
+        return bool(self._member_names())
+
+    def _show_no_member_hint(self):
+        """无成员提示：引导到「文件 → 收支统计 → 设置」添加成员。"""
+        from PySide6.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setWindowTitle("暂无成员")
+        msg.setIcon(QMessageBox.Information)
+        msg.setText("当前没有可用成员，无法创建订单。\n\n请先在「文件 → 收支统计 → 设置」中添加一个成员。")
+        go_btn = msg.addButton("去添加成员", QMessageBox.AcceptRole)
+        msg.addButton("知道了", QMessageBox.RejectRole)
+        msg.exec()
+        if msg.clickedButton() is go_btn:
+            self._on_open_finance("settings")
+
+    def _on_owner_activated(self, index: int):
+        """归属下拉项被用户点击（含再次点击当前项）：无成员时弹添加成员引导。"""
+        if self._owner_combo and self._owner_combo.itemText(index) == "(无成员)":
+            self._show_no_member_hint()
+
     def _update_owner_combo_items(self):
-        """按 config.admin_names + 当前标签页归属人重建归属下拉项，尽量保持当前选中。
-        与「收支清算 → 成员管理」一致：cloud 成员名单通过 _refresh_owner_names_from_cloud 汇入 admin_names。
-        已连云端且拿到真实成员名单时，不再把占位默认名（张三/李四）塞回下拉或作为选中项。"""
+        """按成员名单重建归属下拉，尽量保持当前选中。
+        成员名单来源：云端模式 = 云端收支配置成员（_refresh_owner_names_from_cloud）；
+        本地模式 = 本地 print_data.json 成员（_refresh_owner_names_from_local）。
+        无成员时下拉仅显示「(无成员)」，且禁止创建订单（复制/开始打印会弹提示）。"""
         tab = self._config.tabs.get(self._current_tab)
-        tab_owner = (tab.owner_name if tab else DEFAULT_OWNER_NAME) or DEFAULT_OWNER_NAME
-        names = list(self._config.admin_names or [])
-        connected_cloud = bool(
-            self._cloud_client and self._cloud_client.is_connected()
-            and self._cloud_client.api_url and self._cloud_client.token
-        )
-        has_real_members = any(n not in DEFAULT_OWNER_NAMES for n in names)
-        # 已连云端且名单是真实成员名单 → 占位默认名不再有效，回退到名单第一个真实成员；
-        # 否则正常保留当前标签页归属人（含未连接云端时的占位名）。
-        if connected_cloud and has_real_members and tab_owner in DEFAULT_OWNER_NAMES:
-            real = [n for n in names if n not in DEFAULT_OWNER_NAMES]
-            act_owner = real[0] if real else tab_owner
+        names = self._member_names()
+        tab_owner = (tab.owner_name if tab else "") or ""
+        if names:
+            # 有成员：标签页归属为空/占位名/已不在名单 → 自动落到第一个真实成员（写回标签页，保证建单归属非空）
+            if (not tab_owner) or tab_owner in PLACEHOLDER_OWNER_NAMES or tab_owner not in names:
+                act_owner = names[0]
+            else:
+                act_owner = tab_owner
+            combo_items = names
         else:
-            act_owner = tab_owner
-        if act_owner and act_owner not in names:
-            names.append(act_owner)
-        cur = self._owner_combo.currentText()
-        if cur and cur not in names:
-            # 已连云端且名单是真实成员名单时，原占位选中项（张三/李四）不再保留回来
-            if not (connected_cloud and has_real_members and cur in DEFAULT_OWNER_NAMES):
-                names.append(cur)
-        if [self._owner_combo.itemText(i) for i in range(self._owner_combo.count())] != names:
+            act_owner = "(无成员)"
+            combo_items = ["(无成员)"]
+        if [self._owner_combo.itemText(i) for i in range(self._owner_combo.count())] != combo_items:
             self._owner_combo.blockSignals(True)
             self._owner_combo.clear()
-            self._owner_combo.addItems(names)
+            self._owner_combo.addItems(combo_items)
             self._owner_combo.blockSignals(False)
         if self._owner_combo.currentText() != act_owner:
             self._owner_combo.blockSignals(True)
             self._owner_combo.setCurrentText(act_owner)
             self._owner_combo.blockSignals(False)
+        # 写回标签页归属（真实成员；无成员时置空）
+        if tab:
+            new_owner = act_owner if act_owner != "(无成员)" else ""
+            if tab.owner_name != new_owner:
+                tab.owner_name = new_owner
+                self._save_config()
+        # 无成员时「管理员自行打印」无意义，禁用
+        if hasattr(self, '_admin_print_check') and self._admin_print_check:
+            self._admin_print_check.setEnabled(bool(names))
 
     def _refresh_owner_names_from_cloud(self):
-        """从云端收支清算配置同步成员名单到归属下拉（成员管理里的成员名）。
-        仅合并新增名字，不覆盖已有选项；离线/失败时静默保留本地名单。
-        （主线程版：把同步网络请求放到后台线程，完成后经 _ownerComboRefreshed 信号回主线程刷新下拉，
-        避免在下拉弹出/打开收支清算时阻塞 UI。）"""
-        if not self._cloud_client or not self._cloud_client.is_connected():
-            return
-        if not self._cloud_client.api_url or not self._cloud_client.token:
-            return
+        """归属下拉弹出时同步成员名单（统一入口）：
+        云端已连接 → 后台拉云端成员；否则（本地模式/云端未连）→ 后台读本地 print_data.json 成员。
+        完成后经 _ownerComboRefreshed 信号回主线程刷新下拉，避免阻塞 UI。"""
         # 防抖：上下两次请求至少间隔 2s，避免下拉反复 Show 触发并发叠加
         now = time.monotonic()
         if now - self._owner_refresh_last_ts < 2.0:
@@ -3624,19 +3744,60 @@ class MainWindow(QMainWindow):
             name="owner-name-sync",
         ).start()
 
+    def changeEvent(self, event):
+        """窗口激活（用户从收支统计页切回）→ 重新同步成员名单。
+        保证归属下拉严格跟随收支统计的成员管理：删掉成员后切回 GUI 即刷新为「(无成员)」。
+        仅触发后台刷新（有防抖），不阻塞 UI。"""
+        if event.type() == QEvent.WindowActivate:
+            try:
+                self._refresh_owner_names_from_cloud()
+            except Exception:
+                pass
+        super().changeEvent(event)
+
     def _owner_refresh_net_thread(self):
-        """后台线程：拉取成员名单 + 合并 + 写盘 + 回主线程刷新下拉。"""
+        """后台线程：拉取成员名单（云端或本地）+ 合并 + 写盘 + 回主线程刷新下拉。"""
         try:
-            self._refresh_owner_names_from_cloud_net()
+            cloud_ok = bool(
+                self._cloud_client and self._cloud_client.is_connected()
+                and self._cloud_client.api_url and self._cloud_client.token
+            )
+            if cloud_ok:
+                self._refresh_owner_names_from_cloud_net()
+            else:
+                self._refresh_owner_names_from_local()
         except Exception as e:
-            logger.debug(f"同步云端成员名单失败: {e}")
+            logger.debug(f"同步成员名单失败: {e}")
         finally:
             # 无论是否变化都刷新下拉（保持顺序/一致性）——必须回主线程
             self._ownerComboRefreshed.emit()
 
+    def _refresh_owner_names_from_local(self):
+        """本地模式：从本地 print_data.json 读成员名单，严格采用（清洗占位名）。
+        收支统计成员管理是唯一权威来源：成员被删除后，归属下拉立即不再显示该名字
+        （不保留"标签页仍引用的旧名字"，标签页归属会在 _update_owner_combo_items 中被重置）。
+        无 UI 操作，可在后台线程执行；UI 刷新由调用方经 _ownerComboRefreshed 信号。"""
+        try:
+            data = load_local_data_file()
+            names = []
+            if data:
+                for m in (data.get("config") or {}).get("members") or []:
+                    n = str(m.get("name", "")).strip() if isinstance(m, dict) else ""
+                    if n and n not in names and n not in PLACEHOLDER_OWNER_NAMES:
+                        names.append(n)
+            base = list(self._config.admin_names or [])
+            merged = list(names)   # 严格 = 收支统计成员名单（不并入任何其他来源的名字）
+            if merged != base:
+                self._config.admin_names = merged
+                self._save_config()
+        except Exception as e:
+            logger.debug(f"同步本地成员名单失败: {e}")
+
     def _refresh_owner_names_from_cloud_net(self):
-        """成员名单拉取 + 合并 + 写盘（无 UI 操作，可在后台线程执行）。
-        返回是否单元格名单发生变化；主线程 UI 刷新由调用方负责。"""
+        """云端成员名单拉取 + 写盘（无 UI 操作，可在后台线程执行）。
+        收支统计成员管理是唯一权威来源，归属下拉严格按云端成员名单渲染：
+        · 云端尚未保存收支配置（CEO 首次部署，data 为 null）→ 回退本地成员名单；
+        · 云端配置已存在 → 严格采用云端成员（云端为空 = 无成员，本地/标签页旧名字不保留）。"""
         if not self._cloud_client or not self._cloud_client.is_connected():
             return
         if not self._cloud_client.api_url or not self._cloud_client.token:
@@ -3652,32 +3813,23 @@ class MainWindow(QMainWindow):
             data = resp.json()
             if not data.get("success"):
                 return
-            cfg = data.get("data") or {}
-            members = (cfg.get("config") or {}).get("members") or []
+            raw = data.get("data")
+            if raw is None:
+                # 云端尚未保存收支配置（CEO 首次部署、收支数据未迁移）→ 回退本地成员名单
+                self._refresh_owner_names_from_local()
+                return
+            if isinstance(raw, dict):
+                cfg = raw.get("config") or {}
+            else:
+                cfg = {}
+            members = cfg.get("members") or []
             names = []
             for m in members:
                 n = str(m.get("name", "")).strip() if isinstance(m, dict) else ""
-                if n and n not in names:
+                if n and n not in names and n not in PLACEHOLDER_OWNER_NAMES:
                     names.append(n)
-            if not names:
-                return
-            # 合并 + 修剪：名单 = 云端成员 ∪ 仍被标签页使用的名字。
-            # 云端成员名是权威来源，本地残留的过期名字（如历史脏数据）若未被任何标签页引用则剔除，
-            # 保证下拉与「收支清算 → 成员管理」完全一致。
-            # 注意：占位默认名（张三/李四）即使仍被标签页使用（新标签页默认归属人）也不保留——
-            # 否则云端已有真实成员名单时，占位名还会因"标签页在用"被加回列表底部。
-            used = set()
-            for t in self._config.tabs.values():
-                if getattr(t, 'owner_name', ''):
-                    used.add(t.owner_name)
             base = list(self._config.admin_names or [])
-            merged = []
-            for n in names:
-                if n not in merged:
-                    merged.append(n)
-            for n in base:
-                if n not in merged and n in used and n not in DEFAULT_OWNER_NAMES:
-                    merged.append(n)
+            merged = list(names)   # 严格 = 云端收支配置成员（云端为空 → 空名单，即「(无成员)」）
             if merged != base:
                 self._config.admin_names = merged
                 self._save_config()
@@ -3685,12 +3837,15 @@ class MainWindow(QMainWindow):
             logger.debug(f"同步云端成员名单失败: {e}")
 
     def _on_owner_changed(self, text: str):
-        """归属管理员变更 → 写入当前标签页（下拉只允许选择，选择即保存）。"""
+        """归属成员变更 → 写入当前标签页（下拉只允许选择，选择即保存）。
+        「(无成员)」仅展示，不写入标签页（写空归属）；点击引导见 _on_owner_activated。"""
         if self._is_current_tab_frozen():
+            return
+        if text == "(无成员)":
             return
         tab = self._config.tabs.get(self._current_tab)
         if tab:
-            tab.owner_name = (text or "").strip() or DEFAULT_OWNER_NAME
+            tab.owner_name = (text or "").strip()
         self._save_config()
 
     def _on_admin_print_toggled(self, checked: bool):
@@ -3941,15 +4096,22 @@ class MainWindow(QMainWindow):
 
     def _current_owner_params(self) -> dict:
         """当前标签页的归属参数（owner_name / is_admin_print），供预留/上报随请求传给后端。
-        与 local_orders 上报口径一致：默认占位名（张三）/ 管理员自行打印。"""
+        建单前已校验存在成员（_has_members），owner_name 恒为真实成员；空值兜底由后端处理。"""
         tab = self._config.tabs.get(self._current_tab)
         return {
-            "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
+            "owner_name": (tab.owner_name if tab else "") or "",
             "is_admin_print": "1" if (bool(tab.is_admin_print) if tab else True) else "0",
         }
 
+    def _generate_local_order_number_l(self) -> str:
+        """生成本地临时订单号 HN{date}-L{seq:04d}（离线/云端取号失败时使用，连线后自动换正式号）。"""
+        from datetime import date
+        today = date.today().strftime("%Y%m%d")
+        self._config.last_order_number += 1
+        return f"HN{today}-L{self._config.last_order_number:04d}"
+
     def _ensure_order_number(self) -> str:
-        """确保当前标签页有订单号。连线时从后端获取，离线时生成本地临时号（L 前缀）。"""
+        """确保当前标签页有订单号。连线时从后端获取，离线时生成本地临时号（-L 前缀）。"""
         jobs = self._get_current_jobs()
         if not jobs:
             return ""
@@ -3980,11 +4142,8 @@ class MainWindow(QMainWindow):
                             return order_number
             except Exception:
                 pass
-        # 离线：生成本地临时号
-        from datetime import date
-        today = date.today().strftime("%Y%m%d")
-        self._config.last_order_number += 1
-        order_number = f"HN{today}-L{self._config.last_order_number:04d}"
+        # 离线：生成本地临时号（统一 -L 格式，连线后自动换正式号）
+        order_number = self._generate_local_order_number_l()
         for j in jobs:
             j.order_number = order_number
         self._set_current_jobs(jobs)
@@ -3993,32 +4152,54 @@ class MainWindow(QMainWindow):
         return order_number
 
     def _sync_local_orders_to_cloud(self):
-        """连线后：将所有本地临时订单号（L 前缀）同步到云端，替换为云端正式订单号。"""
+        """连线后：将所有本地临时订单号（-L / 遗留 LOCAL-*）同步为云端正式订单号并上报。
+        覆盖两处来源：① 标签页 jobs（当前/历史队列）；② 本地离线库 offline_orders
+        （含标签页已清理的孤儿单）。换号后在离线库同步改名并标记已同步，防止 OfflineSync
+        以旧号重复上传；随后用新号走 /api/local_orders 上报（reserved → sent）。"""
         if not self._cloud_client or not self._cloud_client.is_connected():
             return
-        replacements = {}  # old_number → new_number
+        if not (self._cloud_client.api_url and self._cloud_client.token):
+            return
+        candidates: dict[str, dict] = {}  # old_number → {"owner_name", "is_admin_print"}
+        # ① 标签页 jobs
         for key, tab in self._config.tabs.items():
             for job in tab.jobs:
-                if job.order_number and "-L" in job.order_number and job.order_number not in replacements:
-                    try:
-                        # 预留即带该 -L 订单所在标签页的归属，避免占位单无归属
-                        resp = http_requests.get(
-                            f"{self._cloud_client.api_url}/api/next_order_number",
-                            params={
-                                "token": self._cloud_client.token,
-                                "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
-                                "is_admin_print": "1" if (bool(tab.is_admin_print) if tab else True) else "0",
-                            },
-                            timeout=5,
-                        )
-                        if resp.ok:
-                            data = resp.json()
-                            if data.get("success"):
-                                new_num = data.get("order_number", "")
-                                if new_num:
-                                    replacements[job.order_number] = new_num
-                    except Exception:
-                        pass
+                num = job.order_number or ""
+                if num and (("-L" in num) or num.startswith("LOCAL-")) and num not in candidates:
+                    candidates[num] = {
+                        "owner_name": (tab.owner_name or ""),
+                        "is_admin_print": bool(tab.is_admin_print),
+                    }
+        # ② 本地离线库（含标签页已清理的孤儿单）
+        if self._offline_sync:
+            for row in (self._offline_sync.list_pending_orders(like="%-L%")
+                        + self._offline_sync.list_pending_orders(like="LOCAL-%")):
+                num = row[1] or ""
+                if num and num not in candidates:
+                    candidates[num] = {
+                        "owner_name": (row[5] or ""),
+                        "is_admin_print": bool(row[6]),
+                    }
+        if not candidates:
+            return
+        replacements = {}  # old_number → new_number
+        for old_num, meta in candidates.items():
+            try:
+                resp = http_requests.get(
+                    f"{self._cloud_client.api_url}/api/next_order_number",
+                    params={
+                        "token": self._cloud_client.token,
+                        "owner_name": meta["owner_name"] or DEFAULT_OWNER_NAME,
+                        "is_admin_print": "1" if meta["is_admin_print"] else "0",
+                    },
+                    timeout=5,
+                )
+                if resp.ok and resp.json().get("success"):
+                    new_num = resp.json().get("order_number", "")
+                    if new_num:
+                        replacements[old_num] = new_num
+            except Exception:
+                pass
         if not replacements:
             return
         # 替换所有本地号为云端号（job 为可变对象，就地修改即可）
@@ -4027,56 +4208,93 @@ class MainWindow(QMainWindow):
                 if job.order_number in replacements:
                     job.order_number = replacements[job.order_number]
         self._save_config()
+        # 离线库同步改名（保持待同步；孤儿单靠它找到新号）
+        if self._offline_sync:
+            for old_num, new_num in replacements.items():
+                self._offline_sync.rename_order_number(old_num, new_num)
         # 后台线程内不直接操作 Qt 控件：换号刷新/日志经信号回主线程
         self._tabDisplayRefresh.emit()
         self._cloudConnSyncLog.emit(f"📋 已同步 {len(replacements)} 个本地订单号到云端: {' '.join(replacements.values())}")
-        # 上报到后端
+        # 上报到后端（新号 → reserved 占位更新为 sent）
         for old_num, new_num in replacements.items():
-            # 收集该订单号对应的所有任务
-            order_jobs = []
-            for tab2 in self._config.tabs.values():
-                for j in tab2.jobs:
-                    if j.order_number == new_num:
-                        order_jobs.append(j)
-            if order_jobs:
-                # 归属标记（v24）：取该订单所在标签页的归属设置
-                owner_name = DEFAULT_OWNER_NAME
-                is_admin_print = True
+            meta = candidates[old_num]
+            try:
+                order_jobs = []
                 for tab2 in self._config.tabs.values():
-                    if any(j.order_number == new_num for j in tab2.jobs):
-                        owner_name = (tab2.owner_name or DEFAULT_OWNER_NAME)
-                        is_admin_print = bool(tab2.is_admin_print)
-                        break
-                try:
-                    http_requests.post(
+                    for j in tab2.jobs:
+                        if j.order_number == new_num:
+                            order_jobs.append(j)
+                payload = None
+                if order_jobs:
+                    payload = {
+                        "order_number": new_num,
+                        "total_price": sum(calc_cost(j.page_count, j.copies, j.duplex,
+                            self._config.simplex_price, self._config.duplex_price,
+                            j.page_range)[0] for j in order_jobs),
+                        "files": [{
+                            "file_name": j.display_name or os.path.basename(j.file_path),
+                            "copies": j.copies,
+                            "page_count": j.page_count,
+                            "cost": calc_cost(j.page_count, j.copies, j.duplex,
+                                self._config.simplex_price, self._config.duplex_price,
+                                j.page_range)[0],
+                            "duplex": j.duplex,
+                            "page_range": j.page_range,
+                        } for j in order_jobs],
+                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                elif self._offline_sync:
+                    # 孤儿单：标签页已清理，从离线库行构造 payload
+                    row = self._offline_sync.find_pending_by_number(new_num)
+                    if row:
+                        payload = self._build_files_payload_from_db_row(row)
+                if payload:
+                    payload["owner_name"] = meta["owner_name"] or DEFAULT_OWNER_NAME
+                    payload["is_admin_print"] = meta["is_admin_print"]
+                    resp = http_requests.post(
                         f"{self._cloud_client.api_url}/api/local_orders",
                         params={"token": self._cloud_client.token},
-                        json={
-                            "order_number": new_num,
-                            "total_price": sum(calc_cost(j.page_count, j.copies, j.duplex,
-                                self._config.simplex_price, self._config.duplex_price,
-                                j.page_range)[0] for j in order_jobs),
-                            "files": [{
-                                "file_name": j.display_name or os.path.basename(j.file_path),
-                                "copies": j.copies,
-                                "page_count": j.page_count,
-                                "cost": calc_cost(j.page_count, j.copies, j.duplex,
-                                    self._config.simplex_price, self._config.duplex_price,
-                                    j.page_range)[0],
-                                "duplex": j.duplex,
-                                "page_range": j.page_range,
-                            } for j in order_jobs],
-                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "owner_name": owner_name,
-                            "is_admin_print": is_admin_print,
-                        },
+                        json=payload,
                         timeout=10,
                     )
-                except Exception:
-                    pass
+                    if resp.ok and resp.json().get("success"):
+                        if self._offline_sync:
+                            self._offline_sync.mark_synced(new_num)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _build_files_payload_from_db_row(row) -> dict:
+        """把离线库行（id, order_number, files_json, total_price, created_at, owner_name, is_admin_print）
+        构造成 /api/local_orders 的 payload（孤儿单换号上报用）。"""
+        dbid, num, files_json, total_price, created_at, owner_name, is_admin_print = row
+        files = []
+        try:
+            for f in json.loads(files_json) or []:
+                if not isinstance(f, dict):
+                    continue
+                files.append({
+                    "file_name": f.get("file_name", ""),
+                    "copies": int(f.get("copies", 1) or 1),
+                    "page_count": int(f.get("page_count", 0) or 0),
+                    "cost": float(f.get("cost", 0) or 0),
+                    "duplex": f.get("duplex", "on"),
+                    "page_range": f.get("page_range", ""),
+                })
+        except Exception:
+            files = []
+        return {
+            "order_number": num,
+            "total_price": float(total_price or 0),
+            "files": files,
+            "created_at": created_at or "",
+        }
 
     def _on_copy_total(self):
-        """复制合计金额到剪贴板（含订单号）。"""
+        """复制合计金额到剪贴板（含订单号）。无成员时禁止创建订单。"""
+        if not self._has_members():
+            self._show_no_member_hint()
+            return
         if not self._get_current_jobs():
             return  # 标签页无文件时不复制价格（首页费等附加费不构成独立价格）
         order_number = self._ensure_order_number()
@@ -4350,6 +4568,10 @@ class MainWindow(QMainWindow):
 
     def _start_print_worker(self, flat_jobs: list) -> bool:
         """用给定的任务列表启动打印 Worker。返回 True=已启动，False=忙/被取消。"""
+        if not self._has_members():
+            # 无成员禁止创建订单（订单必须归属某个成员）
+            self._show_no_member_hint()
+            return False
         if self._worker is not None and self._worker.isRunning():
             self._log("⚠️ 已有打印任务正在进行，不能重复启动")
             return False
@@ -4476,9 +4698,8 @@ class MainWindow(QMainWindow):
                 self._log(f"⚠️ 获取云端订单号失败: {e}")
 
             if not order_number:
-                # 获取订单号失败，回退到本地计数器
-                order_number, next_num = generate_order_number(self._config.last_order_number)
-                self._config.last_order_number = next_num
+                # 获取订单号失败，回退到本地临时号（-L，连线后自动换正式号）
+                order_number = self._generate_local_order_number_l()
 
             # 上传订单信息到后端（将 reserved 占位更新为 sent）
             try:
@@ -4506,8 +4727,9 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._log(f"⚠️ 订单上报云端失败: {e}")
         else:
-            # 离线：生成本地临时订单号，暂存到本地数据库
-            order_number = OfflineSync.generate_local_order_number()
+            # 离线：统一生成本地临时订单号（HN{date}-L{seq}），暂存到本地数据库，
+            # 联网后由 _sync_local_orders_to_cloud 换正式号并上报
+            order_number = self._generate_local_order_number_l()
             self._log(f"📋 离线模式：已生成本地订单号 {order_number}")
             if self._offline_sync:
                 try:
@@ -4516,7 +4738,7 @@ class MainWindow(QMainWindow):
                         files_data=files_data,
                         total_price=total_price,
                         created_at=created_at,
-                        owner_name=(tab.owner_name if tab else DEFAULT_OWNER_NAME),
+                        owner_name=(tab.owner_name if tab else ""),
                         is_admin_print=bool(tab.is_admin_print) if tab else True,
                     )
                     self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
@@ -5291,6 +5513,10 @@ class MainWindow(QMainWindow):
         """用户从云端任务列表窗口确认添加订单中的全部任务到同一个新标签页。"""
         if not tasks:
             return
+        if not self._has_members():
+            # 云端订单同样需要归属成员（谁打印的），无成员时禁止接收
+            self._show_no_member_hint()
+            return
         for task in tasks:
             self._mark_processed_task(task.task_id)
         self._add_cloud_tasks_to_new_tab(tasks)
@@ -5352,6 +5578,15 @@ class MainWindow(QMainWindow):
                         self._cloudConnSyncLog.emit(f"📋 离线订单已同步: {count} 个任务已上报云端")
                 except Exception as e:
                     self._cloudConnSyncLog.emit(f"⚠️ 离线订单同步失败: {e}")
+            # ③ 全部订单已上云 → 清空本地订单库副本（数据改为云端储存；重试耗尽的行保留防丢）
+            if self._offline_sync:
+                try:
+                    if self._offline_sync.count_unsynced() == 0:
+                        cleared = self._offline_sync.clear_all()
+                        if cleared > 0:
+                            self._cloudConnSyncLog.emit(f"📋 本地订单已全部上云，清空本地 {cleared} 条订单记录")
+                except Exception as e:
+                    logger.debug(f"清理本地订单库失败: {e}")
         finally:
             # 成员归属下拉刷新回主线程执行（幂等：已刷过一次也无妨）
             self._ownerComboRefreshed.emit()
@@ -5528,7 +5763,10 @@ class MainWindow(QMainWindow):
     # ──────── 复制详情 ────────
 
     def _on_copy_detail(self):
-        """复制当前标签页的计费明细到剪贴板（含订单号）。"""
+        """复制当前标签页的计费明细到剪贴板（含订单号）。无成员时禁止创建订单。"""
+        if not self._has_members():
+            self._show_no_member_hint()
+            return
         jobs = self._get_current_jobs()
         if not jobs:
             return

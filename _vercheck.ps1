@@ -1,0 +1,1 @@
+Get-ChildItem -Path 'dist' -Directory | ForEach-Object { $exe = Get-ChildItem -Path $_.FullName -Filter '*.exe' -File | Select-Object -First 1; if ($exe) { [PSCustomObject]@{ Exe=$exe.Name; FileVer=$exe.VersionInfo.FileVersion; ProdVer=$exe.VersionInfo.ProductVersion } } } | Format-Table -AutoSize

@@ -678,11 +678,10 @@ function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type':
 // });
 
 /* ==================== 常量 ==================== */
-var DEFAULT_MEMBERS = [
-  { id: 'zs', name: '张三', color: '#4472C4' },
-  { id: 'ls', name: '李四', color: '#548235' },
-  { id: 'ww', name: '王五', color: '#ED7D31' },
-];
+/* v4.2：不再预置示例成员（张三/李四/王五）。成员名单由用户在「设置 → 成员管理」添加，
+   订单归属下拉与收支统计共享该名单；无成员时页面显示空态引导，且本地打印工具禁止创建订单。 */
+var DEFAULT_MEMBERS = [];
+var PLACEHOLDER_MEMBER_NAMES = ['张三', '李四', '王五'];
 var DEFAULT_SCORE_CAP = 15;
 var DEFAULT_RATE = 0.05;
 /* 默认密码存储 SHA-256 哈希（'123456' 的 sha256），不存明文 */
@@ -739,12 +738,8 @@ function hasRealData(store) {
   }
   if (store.notes && Object.keys(store.notes).length) return true;
   var cfg = store.config || {};
-  // 成员名单与默认三人不一致（增删改过）→ 算真实数据
-  if (cfg.members && cfg.members.length) {
-    var defStr = JSON.stringify(DEFAULT_MEMBERS.map(function (m) { return m.name; }).sort());
-    var curStr = JSON.stringify(cfg.members.map(function (m) { return m.name; }).sort());
-    if (curStr !== defStr) return true;
-  }
+  // 成员名单非空（用户配置过任意成员）→ 算真实数据（v4.2 起不再有默认示例成员）
+  if (cfg.members && cfg.members.length) return true;
   // 配过 openid 绑定 → 算真实数据
   if ((cfg.memberBindings || []).length) return true;
   // 改过密码（任一不等于默认哈希）→ 算真实数据
@@ -760,8 +755,12 @@ function hasRealData(store) {
   return false;
 }
 
-/* 合并两份收支数据（安全合并）：流水/成员/绑定按 id 去重并集；设置取非默认值；
-   密码单向权威保护：云端已有内容则以云端密码为准（本地密码不覆盖），否则采用本地密码（首次部署）。
+/* 合并两份收支数据（安全合并）：
+   · 流水（采购/代收）与绑定按 id 去重并集；设置取非默认值；
+   · 密码单向权威：云端已有配置则以云端密码为准（本地密码不覆盖），否则采用本地密码（首次部署）；
+   · 服务评分单向权威：云端已有配置则只取云端评分（CEO 每月评估，成员本地评分不允许覆盖/混入），
+     否则（首次部署）采用本地评分；
+   · 成员云端优先：云端成员全保留，本地仅并入「云端不存在且非示例占位名」的成员。
    返回合并后的 STORE。 */
 function mergeStores(localStore, cloudStore) {
   function unionById(a, b) {
@@ -772,9 +771,20 @@ function mergeStores(localStore, cloudStore) {
   }
   var lc = localStore && localStore.config || {};
   var cc = cloudStore && cloudStore.config || {};
+  // 成员：云端优先 + 丢弃示例占位名（张三/李四/王五，含旧版本地默认三人）
   var members = (function () {
     var map = {};
-    (cc.members || []).concat(lc.members || []).forEach(function (m) { if (m && (m.id || m.name)) map[m.id || m.name] = m; });
+    (cc.members || []).forEach(function (m) {
+      if (!m || !(m.id || m.name)) return;
+      if (PLACEHOLDER_MEMBER_NAMES.indexOf(m.name) >= 0) return;
+      map[m.id || m.name] = m;
+    });
+    (lc.members || []).forEach(function (m) {
+      if (!m || !(m.id || m.name)) return;
+      if (PLACEHOLDER_MEMBER_NAMES.indexOf(m.name) >= 0) return;
+      var key = m.id || m.name;
+      if (!map[key]) map[key] = m;
+    });
     return Object.keys(map).map(function (k) { return map[k]; });
   })();
   var bindings = (function () {
@@ -782,14 +792,21 @@ function mergeStores(localStore, cloudStore) {
     (cc.memberBindings || []).concat(lc.memberBindings || []).forEach(function (b) { if (b && (b.openid || b.memberId)) map[(b.openid||'')+'|'+(b.memberId||'')] = b; });
     return Object.keys(map).map(function (k) { return map[k]; });
   })();
-  // 密码单向权威：云端有内容 → 用云端密码；否则（云端空/首部署）→ 用本地密码
+  // 云端是否已有配置（含首次部署后的空壳）——决定密码/评分/成员的权威方向
   var cloudHasCfg = cloudStore && cloudStore.config && Object.keys(cloudStore.config).length > 0;
+  // 密码单向权威：云端有配置 → 用云端密码；否则（云端空/首部署）→ 用本地密码
   var passwords = cloudHasCfg && cc.passwords
     ? JSON.parse(JSON.stringify(cc.passwords))
     : JSON.parse(JSON.stringify(lc.passwords || {}));
+  // 服务评分单向权威：云端有配置 → 只取云端评分（本地评分不合并、不覆盖）
+  var cloudScores = (cloudStore && cloudStore.records && cloudStore.records.scores) || [];
+  var localScores = (localStore && localStore.records && localStore.records.scores) || [];
+  var scores = cloudHasCfg
+    ? JSON.parse(JSON.stringify(cloudScores))
+    : JSON.parse(JSON.stringify(localScores));
   var merged = {
     config: {
-      members: members.length ? members : JSON.parse(JSON.stringify(DEFAULT_MEMBERS)),
+      members: members,
       passwords: passwords,
       memberBindings: bindings,
       scoreCap: (lc.scoreCap != null && lc.scoreCap !== DEFAULT_SCORE_CAP) ? lc.scoreCap : (cc.scoreCap != null ? cc.scoreCap : DEFAULT_SCORE_CAP),
@@ -798,7 +815,7 @@ function mergeStores(localStore, cloudStore) {
     records: {
       expenses: unionById((localStore && localStore.records && localStore.records.expenses) || [], (cloudStore && cloudStore.records && cloudStore.records.expenses) || []),
       income: unionById((localStore && localStore.records && localStore.records.income) || [], (cloudStore && cloudStore.records && cloudStore.records.income) || []),
-      scores: unionById((localStore && localStore.records && localStore.records.scores) || [], (cloudStore && cloudStore.records && cloudStore.records.scores) || []),
+      scores: scores,
     },
     notes: Object.assign({}, (cloudStore && cloudStore.notes) || {}, (localStore && localStore.notes) || {}),
     meta: { version: (cloudStore && cloudStore.meta && cloudStore.meta.version) || 0 },
@@ -2775,6 +2792,16 @@ function renderDash() {
   var r = calcMonth(m);
   var hasData = (m.expenses.length + (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + (STORE.records.scores || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length) > 0;
 
+  // v4.2：无成员空态 —— 引导到「设置」添加成员（订单归属/收支结算的前提）
+  if (!getMembers().length) {
+    var hEmpty = '<div class="filter-bar" style="align-items:center">';
+    hEmpty += '<div class="f-item"><label>📅 结算月份</label>' + monthSelectHTML('dash-month', currentKey) + '</div>';
+    hEmpty += '</div>';
+    hEmpty += '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">👥</div><h3>暂无成员</h3><p style="margin-top:6px">请先在「设置」中添加成员，成员将用于订单归属与收支结算，添加后本地打印工具的归属下拉会同步显示。</p><button class="btn pri" style="margin-top:16px" onclick="switchTab(\'settings\')">⚙️ 去设置添加成员</button></div></div>';
+    el.innerHTML = hEmpty;
+    return;
+  }
+
   var h = '<div class="filter-bar" style="align-items:center">';
   h += '<div class="f-item"><label>📅 结算月份</label>' + monthSelectHTML('dash-month', currentKey) + '</div>';
   if (hasData) h += '<div class="f-item" style="margin-left:auto"><span class="tag b">' + m.label + '</span></div>';
@@ -2915,6 +2942,16 @@ function renderEntry() {
 
   var m = monthFromRecords(currentKey);
 
+  // v4.2：无成员空态 —— 采购/代收/评分都需要成员归属
+  if (!members.length) {
+    var hEmpty2 = '<div class="filter-bar" style="align-items:center">';
+    hEmpty2 += '<div class="f-item"><label>📅 录入月份</label>' + monthSelectHTML('entry-month', currentKey) + '</div>';
+    hEmpty2 += '</div>';
+    hEmpty2 += '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">👥</div><h3>暂无成员</h3><p style="margin-top:6px">采购、代收与评分都需要归属成员。请先在「设置」中添加成员。</p><button class="btn pri" style="margin-top:16px" onclick="switchTab(\'settings\')">⚙️ 去设置添加成员</button></div></div>';
+    el.innerHTML = hEmpty2;
+    return;
+  }
+
   /* ── 采购支出 ── */
   h += '<div class="section"><h2>🧾 采购支出 <span class="hint">（谁垫付了什么，AA 均摊）</span>' + lockBadge('expense') + '</h2>';
   h += lockBarHTML('expense');
@@ -3017,6 +3054,7 @@ function handleDateMove(r) {
 function addExp() {
   if (!unlocked.expense) { toast('🔒 请先解锁采购支出', 'error'); return; }
   var members = getMembers();
+  if (!members.length) { toast('👥 请先在「设置」中添加成员', 'error'); return; }
   STORE.records.expenses.push({ id: uid(), date: defaultDateFor(currentKey), item: '新采购', amount: 0, payer: members.length ? members[0].id : '' });
   save(); renderEntry();
 }
@@ -3030,6 +3068,7 @@ function delExp(id) { STORE.records.expenses = STORE.records.expenses.filter(fun
 function addInc() {
   if (!unlocked.income) { toast('🔒 请先解锁代收收入', 'error'); return; }
   var members = getMembers();
+  if (!members.length) { toast('👥 请先在「设置」中添加成员', 'error'); return; }
   STORE.records.income.push({ id: uid(), date: defaultDateFor(currentKey), memberId: members.length ? members[0].id : '', amount: 0 });
   save(); renderEntry();
 }
@@ -3042,6 +3081,7 @@ function updInc(id, field, val) {
 function delInc(id) { STORE.records.income = STORE.records.income.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
 function addScore(memberId) {
   if (!unlocked.score) { toast('🔒 请先解锁服务评估', 'error'); return; }
+  if (!getMembers().length) { toast('👥 请先在「设置」中添加成员', 'error'); return; }
   STORE.records.scores.push({ id: uid(), date: defaultDateFor(currentKey), memberId: memberId, item: '新服务项', score: 0 });
   save(); renderEntry();
 }
@@ -3514,6 +3554,9 @@ function renderSettings() {
 
   // 成员管理
   h += '<div class="section"><h2>👥 成员管理</h2>';
+  if (!members.length) {
+    h += '<div style="color:var(--muted);font-size:.85rem;margin-bottom:12px">暂无成员。请先添加成员 —— 成员名单会同步到本地打印工具的「归属」下拉，无成员时无法创建订单。</div>';
+  }
   h += '<div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px">';
   members.forEach(function (m) {
     var midS = safeId(m.id);
@@ -3710,12 +3753,12 @@ function loadConfig() {
       var localReal = hasRealData(localData);
       var cloudReal = hasRealData(cloudData);
       if (localReal && cloudReal && localData) {
-        // 两边都有真实数据 → 询问合并（安全合并；密码单向权威保护）
+        // 两边都有真实数据 → 询问合并（安全合并；密码/评分单向权威保护）
         openConfirm(
           '检测到本地与云端均存在收支数据（本地为离线期间产生，云端为多人共用）。\n\n' +
           '为避免数据丢失，将执行「安全合并」：\n' +
-          '· 流水/成员/绑定按记录合并（去重）\n' +
-          '· 密码以云端为权威（本地无法覆盖云端密码）\n\n' +
+          '· 订单/流水/成员按记录合并（去重；示例占位名不并入）\n' +
+          '· 密码与服务评分以云端为权威（本地无法覆盖云端密码与评分）\n\n' +
           '是否合并并上传云端？',
           '合并'
         ).then(function (ok) {
@@ -3735,11 +3778,18 @@ function loadConfig() {
         });
         return;
       }
-      // 无云端真实数据但本地有 → 本地一次性迁移到云端
+      // 无云端真实数据但本地有 → 本地一次性迁移到云端（CEO 首次部署）
       if (!cloudReal && localReal && localData) {
         STORE = migrateConfig(localData);
         save();
-        toast('✅ 已从本地文件迁移到云端', 'success');
+        // CEO 首次部署：数据已上云，清空本地副本（成员/密码/评分/流水以云端为准）
+        fetch('/api/local/data', { method: 'DELETE', headers: apiHeaders() })
+          .then(function (r) {
+            toast('✅ 已从本地文件迁移到云端，本地数据副本已清空', 'success');
+          })
+          .catch(function () {
+            toast('✅ 已从本地文件迁移到云端（本地副本清理失败，可在「设置 → 数据管理」重置）', 'success');
+          });
       }
       // 旧版本地绑定迁移（仅当尚无云端绑定）
       if (!(STORE.config.memberBindings || []).length) {
@@ -3825,6 +3875,10 @@ function replayOfflinePending() {
   window.addEventListener('scroll', _updateBackToTop, { passive: true });
   _backToTop.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
   $('#blockRetry').addEventListener('click', retryConnect);
+  // 深链：?tab=settings 直接切到「设置」标签（本地打印工具「去添加成员」引导用）
+  var _urlTab = null;
+  try { _urlTab = new URLSearchParams(window.location.search).get('tab'); } catch (e3) {}
+  if (_urlTab === 'settings') switchTab('settings');
   // 初始为 loading 骨架
   renderAll();
   loadConfig();

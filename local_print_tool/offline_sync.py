@@ -70,7 +70,7 @@ class OfflineSync:
         files_data: list[dict],
         total_price: float,
         created_at: str,
-        owner_name: str = DEFAULT_OWNER_NAME,
+        owner_name: str = "",
         is_admin_print: bool = True,
     ) -> str:
         """将订单保存到本地数据库。返回保存的临时订单号。"""
@@ -150,12 +150,17 @@ class OfflineSync:
         rows = []
         with self._lock:
             conn = sqlite3.connect(self.db_path)
+            # 跳过待换号的本地临时订单号（含 "-L" 或 "LOCAL-" 前缀）：
+            # 这类订单由 gui._sync_local_orders_to_cloud 在连线时统一换正式号并上报，
+            # 若在此处直接上传会污染云端订单号（HN…-L / LOCAL-* 残留），并可能产生重复单。
             rows = list(
                 conn.execute(
                     """SELECT id, order_number, files_json, total_price, created_at,
                               owner_name, is_admin_print
                        FROM offline_orders
-                       WHERE synced = 0 AND retry_count < ?""",
+                       WHERE synced = 0 AND retry_count < ?
+                         AND order_number NOT LIKE '%-L%'
+                         AND order_number NOT LIKE 'LOCAL-%'""",
                     (MAX_RETRY_COUNT,),
                 ).fetchall()
             )
@@ -254,9 +259,107 @@ class OfflineSync:
             conn.close()
             return row[0] if row else 0
 
+    def count_unsynced(self) -> int:
+        """返回所有未同步记录数（含重试耗尽的行；清空本地库前的安全校验用）。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT COUNT(*) FROM offline_orders WHERE synced = 0",
+            ).fetchone()
+            conn.close()
+            return row[0] if row else 0
+
+    def list_pending_orders(self, like: str = "") -> list:
+        """列出待同步的离线订单行（可按 order_number LIKE 过滤），供换号流程使用。
+        返回行元组: (id, order_number, files_json, total_price, created_at, owner_name, is_admin_print)。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            if like:
+                rows = list(conn.execute(
+                    """SELECT id, order_number, files_json, total_price, created_at,
+                              owner_name, is_admin_print
+                       FROM offline_orders
+                       WHERE synced = 0 AND retry_count < ? AND order_number LIKE ?""",
+                    (MAX_RETRY_COUNT, like),
+                ).fetchall())
+            else:
+                rows = list(conn.execute(
+                    """SELECT id, order_number, files_json, total_price, created_at,
+                              owner_name, is_admin_print
+                       FROM offline_orders
+                       WHERE synced = 0 AND retry_count < ?""",
+                    (MAX_RETRY_COUNT,),
+                ).fetchall())
+            conn.close()
+            return rows
+
+    def find_pending_by_number(self, order_number: str):
+        """按订单号查找待同步行（换号后用于孤儿单上报）。返回行元组或 None。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                """SELECT id, order_number, files_json, total_price, created_at,
+                          owner_name, is_admin_print
+                   FROM offline_orders WHERE order_number = ? AND synced = 0""",
+                (order_number,),
+            ).fetchone()
+            conn.close()
+        return row
+
+    def rename_order_number(self, old_number: str, new_number: str) -> int:
+        """换号流程：把离线库中旧号的待同步行改为新号（保持待同步，随后统一上报）。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "UPDATE offline_orders SET order_number = ? WHERE order_number = ? AND synced = 0",
+                (new_number, old_number),
+            )
+            conn.commit()
+            n = cur.rowcount
+            conn.close()
+        return n
+
+    def mark_synced(self, order_number: str) -> None:
+        """把指定订单号的待同步行标记为已同步（换号流程上报成功后调用）。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "UPDATE offline_orders SET synced = 1 WHERE order_number = ? AND synced = 0",
+                (order_number,),
+            )
+            conn.commit()
+            conn.close()
+
+    def clear_all(self) -> int:
+        """清空本地订单库全部记录（关闭云端 / 订单已全部上云时调用）。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute("DELETE FROM offline_orders")
+            conn.commit()
+            n = cur.rowcount
+            conn.close()
+        if n > 0:
+            logger.info(f"[OFFLINE] 已清空本地订单库 {n} 条记录")
+        return n
+
+    def clear_synced(self) -> int:
+        """删除已同步（synced=1）的记录（订单已上云，本地不再留存副本）。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute("DELETE FROM offline_orders WHERE synced = 1")
+            conn.commit()
+            n = cur.rowcount
+            conn.close()
+        if n > 0:
+            logger.info(f"[OFFLINE] 已清理 {n} 条已同步记录")
+        return n
+
     @staticmethod
     def generate_local_order_number() -> str:
-        """生成本地临时订单号（离线时使用）。格式: LOCAL-YYYYMMDD-序号（当天自增，便于阅读核对）。"""
+        """生成本地临时订单号（离线时使用）。格式: LOCAL-YYYYMMDD-序号（当天自增，便于阅读核对）。
+
+        已废弃（v4.2）：离线订单号统一为 gui 的 HN{date}-L{seq}（连线后自动换正式号），
+        此函数仅保留给遗留数据的读取/兼容，不再由新代码调用。"""
         day = datetime.now().strftime("%Y%m%d")
         prefix = f"LOCAL-{day}-"
         # 读取当天前缀下最大的「纯数字序号」——旧版 uuid 十六进制串（如 a1b2c3d4）不参与计数，

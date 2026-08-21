@@ -74,6 +74,31 @@ def _strip_token_from_query(query: str) -> str:
     return urllib.parse.urlencode(qs)
 
 
+def load_local_data_file() -> dict | None:
+    """读取本地收支数据文件（print_data.json），供 GUI 归属下拉同步成员名单。
+    文件不存在或内容损坏时返回 None。与 HTTP 读写共用 _DATA_FILE_LOCK。"""
+    with _DATA_FILE_LOCK:
+        if not os.path.exists(_DEFAULT_DATA_FILE):
+            return None
+        try:
+            with open(_DEFAULT_DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+
+def clear_local_data_files() -> None:
+    """删除本地收支数据文件与 openid 绑定文件（关闭云端 / CEO 迁移完成时调用）。"""
+    with _DATA_FILE_LOCK, _BINDINGS_FILE_LOCK:
+        for p in (_DEFAULT_DATA_FILE, _BINDINGS_FILE):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
+
+
 def _extract_proxy_body(resp) -> dict:
     """只透传 {success, message, data} 白名单字段；非 JSON 响应统一转通用错误。"""
     try:
@@ -206,6 +231,20 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             return self._handle_post_data()
 
         # 未知
+        self._send_json({"success": False, "message": "未找到"}, 404)
+
+    def do_DELETE(self):
+        """删除本地数据（启动令牌门校验后路由到本地数据删除）。"""
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        if not self._check_launch_token():
+            return self._send_json({"success": False, "message": "未授权：请通过本地打印工具打开收支清算"}, 403)
+
+        # 本地数据删除（CEO 迁移到云端 / 关闭云端清空缓存时由页面调用）
+        if path == "/api/local/data":
+            return self._handle_delete_data()
+
         self._send_json({"success": False, "message": "未找到"}, 404)
 
     # ── 静态文件 ──
@@ -353,6 +392,20 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                 self._send_json({"success": False, "message": f"读取失败: {type(e).__name__}"}, 500)
                 return
         self._send_json({"success": True, "data": data, "exists": True})
+
+    def _handle_delete_data(self):
+        """删除本地数据文件（CEO 迁移到云端 / 关闭云端清空缓存时由页面调用）。"""
+        with _DATA_FILE_LOCK:
+            try:
+                tmp_file = _DEFAULT_DATA_FILE + ".tmp"
+                for p in (_DEFAULT_DATA_FILE, tmp_file):
+                    if os.path.exists(p):
+                        os.remove(p)
+            except Exception as e:
+                logger.error(f"删除本地数据文件失败: {type(e).__name__}")
+                self._send_json({"success": False, "message": f"删除失败: {type(e).__name__}"}, 500)
+                return
+        self._send_json({"success": True, "message": "本地数据已清空"})
 
     def _handle_local_orders(self, query: str = ""):
         """读取「本地订单库」SQLite（offline_orders 表），返回与云端 revenue 同构的订单结构。
