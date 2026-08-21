@@ -1288,50 +1288,63 @@ body {
   pointer-events: none;
 }
 
+/* 平铺推拉转场：动画期间两页都脱离流式布局、并排铺满内容区（一个抽出、一个推入，互不重叠）。
+   top 由 JS 按导航栏实测高度设置；过渡结束后移除该类恢复流式布局。 */
+.page-push {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+}
+
 /* ═══════════════ Page Transition Animations ═══════════════ */
-/* 所有页面共享：tab 切换 + 子页面导航统一使用 */
+/* 所有页面共享：tab 切换 + 子页面导航统一使用
+   平铺推拉转场：旧页抽出（滑出屏幕外）、新页从对面推入（屏幕外 → 0），
+   动画期间两页并排铺满内容区、互不重叠（配合 .page-push 类）。
+   滑动统一用强 Ease-Out cubic-bezier(0.16, 1, 0.3, 1)（先快后慢）：
+   入场 0.48s，退出 0.32s */
 .page-fade-in {
-  animation: pageFadeIn 0.3s 0.01s ease both;
+  animation: pageFadeIn 0.5s ease-out both;
 }
 @keyframes pageFadeIn {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
 
-/* 入场：从右滑入 */
+/* 入场：从右推入（强 Ease-Out） */
 .page-enter-right {
-  animation: pageEnterRight 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: pageEnterRight 0.48s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageEnterRight {
-  from { opacity: 0; transform: translateX(34.6667cqw); }
+  from { opacity: 0; transform: translateX(100%); }
   to   { opacity: 1; transform: translateX(0); }
 }
 
-/* 入场：从左滑入 */
+/* 入场：从左推入（强 Ease-Out） */
 .page-enter-left {
-  animation: pageEnterLeft 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: pageEnterLeft 0.48s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageEnterLeft {
-  from { opacity: 0; transform: translateX(-34.6667cqw); }
+  from { opacity: 0; transform: translateX(-100%); }
   to   { opacity: 1; transform: translateX(0); }
 }
 
-/* 退出：左滑淡出 */
+/* 退出：向左抽出（强 Ease-Out） */
 .page-exit-left {
-  animation: pageExitLeft 0.22s ease-in both;
+  animation: pageExitLeft 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageExitLeft {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(-34.6667cqw); }
+  to   { opacity: 0; transform: translateX(-100%); }
 }
 
-/* 退出：右滑淡出 */
+/* 退出：向右抽出（强 Ease-Out） */
 .page-exit-right {
-  animation: pageExitRight 0.22s ease-in both;
+  animation: pageExitRight 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageExitRight {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(34.6667cqw); }
+  to   { opacity: 0; transform: translateX(100%); }
 }
 
 /* Card preload — invisible until card-entering animation triggers */
@@ -1592,17 +1605,17 @@ body {
   pointer-events: none;
 }
 
-/* 入场：从左滑入 + 淡入 */
+/* 入场：从左滑入 + 淡入（强 Ease-Out：先快后慢） */
 .page-enter-left {
-  animation: enterLeft 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: enterLeft 0.48s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes enterLeft {
-  from { opacity: 0; transform: translateX(-34.6667cqw); }
+  from { opacity: 0; transform: translateX(-100%); }
   to   { opacity: 1; transform: translateX(0); }
 }
 /* 首次加载：页面容器淡入（仅透明度，垂直移动由各元素"向上淡入"负责，避免双重位移） */
 .page-fade-in {
-  animation: fadeIn 0.3s 0.08s ease both;
+  animation: fadeIn 0.5s ease-out both;
 }
 @keyframes fadeIn {
   from { opacity: 0; }
@@ -1613,20 +1626,20 @@ body {
   animation-delay: 0.5s;
 }
 
-/* 退出动画：左滑淡出 */
+/* 退出动画：左滑淡出（强 Ease-Out：先快后慢） */
 .page-exit-left {
-  animation: exitLeft 0.22s ease-in both;
+  animation: exitLeft 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitLeft {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(-34.6667cqw); }
+  to   { opacity: 0; transform: translateX(-100%); }
 }
 .page-exit-right {
-  animation: exitRight 0.22s ease-in both;
+  animation: exitRight 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitRight {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(34.6667cqw); }
+  to   { opacity: 0; transform: translateX(100%); }
 }
 
 .scroller {
@@ -3074,36 +3087,36 @@ picker-view-column {
   pointer-events: none;
 }
 
-/* 入场：从右滑入 + 淡入 */
+/* 入场：从右滑入 + 淡入（强 Ease-Out：先快后慢） */
 .page-enter-right {
-  animation: enterRight 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: enterRight 0.48s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes enterRight {
-  from { opacity: 0; transform: translateX(34.6667cqw); }
+  from { opacity: 0; transform: translateX(100%); }
   to   { opacity: 1; transform: translateX(0); }
 }
 .page-fade-in {
-  animation: fadeIn 0.3s 0.01s ease both;
+  animation: fadeIn 0.5s ease-out both;
 }
 @keyframes fadeIn {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
 
-/* 退出动画 */
+/* 退出动画（强 Ease-Out：先快后慢） */
 .page-exit-left {
-  animation: exitLeft 0.22s ease-in both;
+  animation: exitLeft 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitLeft {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(-34.6667cqw); }
+  to   { opacity: 0; transform: translateX(-100%); }
 }
 .page-exit-right {
-  animation: exitRight 0.22s ease-in both;
+  animation: exitRight 0.32s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitRight {
   from { opacity: 1; transform: translateX(0); }
-  to   { opacity: 0; transform: translateX(34.6667cqw); }
+  to   { opacity: 0; transform: translateX(100%); }
 }
 
 .scroller {

@@ -61,32 +61,32 @@
   pointer-events: none;
 }
 
-/* 入场：从右滑入 + 淡入 */
+/* 入场：从右滑入 + 淡入（强 Ease-Out：先快后慢） */
 .page-enter-right {
-  animation: enterRight 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: enterRight 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes enterRight {
   from { opacity: 0; transform: translateX(260rpx); }
   to   { opacity: 1; transform: translateX(0); }
 }
 .page-fade-in {
-  animation: fadeIn 0.3s 0.01s ease both;
+  animation: fadeIn 0.25s ease-out both;
 }
 @keyframes fadeIn {
   from { opacity: 0; }
   to   { opacity: 1; }
 }
 
-/* 退出动画 */
+/* 退出动画（强 Ease-Out：先快后慢） */
 .page-exit-left {
-  animation: exitLeft 0.22s ease-in both;
+  animation: exitLeft 0.16s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitLeft {
   from { opacity: 1; transform: translateX(0); }
   to   { opacity: 0; transform: translateX(-260rpx); }
 }
 .page-exit-right {
-  animation: exitRight 0.22s ease-in both;
+  animation: exitRight 0.16s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitRight {
   from { opacity: 1; transform: translateX(0); }

@@ -743,18 +743,17 @@ function measureAll(delay) {
 
 /* ================= Tab / 视图栈 / 页面转场 ================= */
 
-function animatePageIn(el, cls) {
-  if (!el) return;
-  el.classList.remove('page-fade-in', 'page-enter-right', 'page-enter-left', 'page-exit-left', 'page-exit-right');
-  void el.offsetWidth; // 强制 reflow 重启动画
-  el.classList.add(cls || 'page-fade-in');
+// 交叉转场用：导航栏实测高度（入场页绝对定位时从导航栏下方开始，避免盖住导航栏）
+function navBarHeight() {
+  const el = document.getElementById('navBar');
+  return (el && el.offsetHeight) || 48;
 }
 
 let currentTab = 'print';
 let _tabSwitching = false;
 let _viewTransition = false;
 
-// 小程序同款 tab 切换：当前页横向滑出（240ms），新页从对面滑入
+// tab 切换：平铺推拉转场 —— 两页并排铺满内容区，旧页抽出、新页从对面推入，互不重叠
 function switchTab(tab) {
   if (tab === currentTab || _tabSwitching) return;
   _tabSwitching = true;
@@ -788,20 +787,32 @@ function switchTab(tab) {
   const exitCls = exiting === printPage ? 'page-exit-left' : 'page-exit-right';
   const enterCls = entering === mePage ? 'page-enter-right' : 'page-enter-left';
 
-  exiting.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left');
+  // 标题立即切换（交叉过渡期间导航栏属于全局 UI，不随页面动画延迟）
+  document.getElementById('navTitle').textContent = tab === 'print' ? '提交打印' : '我';
+  document.getElementById('navBack').style.display = 'none';
+  document.getElementById('tabBar').style.display = '';
+
+  // 平铺推拉转场：两页都脱离流式布局并排铺满内容区（page-push），
+  // 旧页向左/右抽出（滑出屏幕外）、新页从对面推入（屏幕外 → 0），全程不重叠
+  const navH = navBarHeight() + 'px';
+  entering.style.display = '';
+  entering.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
+  entering.style.top = navH;
+  void entering.offsetWidth;
+  entering.classList.add('page-push', enterCls);
+
+  exiting.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
+  exiting.style.top = navH;
   void exiting.offsetWidth;
-  exiting.classList.add(exitCls);
+  exiting.classList.add('page-push', exitCls);
 
   setTimeout(() => {
     exiting.style.display = 'none';
-    entering.style.display = '';
-    entering.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left');
-    void entering.offsetWidth;
-    entering.classList.add(enterCls);
+    exiting.classList.remove('page-push', exitCls);
+    exiting.style.top = '';
+    entering.classList.remove('page-push', enterCls);
+    entering.style.top = '';
 
-    document.getElementById('navTitle').textContent = tab === 'print' ? '提交打印' : '我';
-    document.getElementById('navBack').style.display = 'none';
-    document.getElementById('tabBar').style.display = '';
     hideViews();
     currentTab = tab;
     _tabSwitching = false;
@@ -809,7 +820,7 @@ function switchTab(tab) {
     if (tab === 'me' && typeof loadMeTab === 'function') loadMeTab();
     if (tab === 'print' && typeof onPrintTabShown === 'function') onPrintTabShown();
     measureAll();
-  }, 240);
+  }, 480);
 }
 
 function switchToMe() {
@@ -829,20 +840,31 @@ function showView(id, title) {
   document.getElementById('tabBar').style.display = 'none';
   document.getElementById('navBack').style.display = '';
   document.getElementById('navTitle').textContent = title || '';
-  // me 页离场动画（对齐小程序 page-exit-left + 280ms 导航延迟），280ms 后切换子视图
+  // 平铺推拉转场：子视图与 me 页并排铺满内容区，me 页向左抽出、子视图从右推入，互不重叠
+  hideViews();  // 先清掉可能残留的其他子视图
+  const navH = navBarHeight() + 'px';
   const mePage = document.getElementById('page-me');
-  mePage.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left');
+  const v = document.getElementById(id);
+  if (v) {
+    v.style.display = '';
+    v.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
+    v.style.top = navH;
+    void v.offsetWidth;
+    v.classList.add('page-push', 'page-enter-right');
+  }
+  mePage.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
+  mePage.style.top = navH;
   void mePage.offsetWidth;
-  mePage.classList.add('page-exit-left');
+  mePage.classList.add('page-push', 'page-exit-left');
   setTimeout(() => {
     mePage.style.display = 'none';
-    hideViews();
-    const v = document.getElementById(id);
-    if (v) { v.style.display = ''; animatePageIn(v, 'page-enter-right'); }
+    mePage.classList.remove('page-push', 'page-exit-left');
+    mePage.style.top = '';
+    if (v) { v.classList.remove('page-push', 'page-enter-right'); v.style.top = ''; }
     updateThemeToggleVisibility();
     measureAll();
     _viewTransition = false;
-  }, 280);
+  }, 480);
 }
 
 function hideView() {
@@ -850,13 +872,14 @@ function hideView() {
   _viewTransition = true;
   if (typeof closePageSizePicker === 'function') closePageSizePicker();
   document.getElementById('page-print').style.display = 'none';
-  // 当前子视图离场动画（对齐小程序 page-exit-right），280ms 后显示 me 页
+  // 平铺推拉转场：me 页与子视图并排铺满内容区，子视图向右抽出、me 页从左推入，互不重叠
   const currentView = [...document.querySelectorAll('.view')].find(v => v.style.display !== 'none');
   const mePage = document.getElementById('page-me');
   const finish = () => {
-    hideViews();
-    mePage.style.display = '';
-    animatePageIn(mePage, 'page-enter-left');
+    if (currentView) currentView.style.display = 'none';
+    if (currentView) { currentView.classList.remove('page-push', 'page-exit-right'); currentView.style.top = ''; }
+    mePage.classList.remove('page-push', 'page-enter-left');
+    mePage.style.top = '';
     document.getElementById('navTitle').textContent = '我';
     document.getElementById('navBack').style.display = 'none';
     document.getElementById('tabBar').style.display = '';
@@ -868,11 +891,25 @@ function hideView() {
     _viewTransition = false;
   };
   if (currentView) {
-    currentView.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left');
+    // 标题立即切换（导航栏属于全局 UI）
+    document.getElementById('navTitle').textContent = '我';
+    const navH = navBarHeight() + 'px';
+    mePage.style.display = '';
+    mePage.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
+    mePage.style.top = navH;
+    void mePage.offsetWidth;
+    mePage.classList.add('page-push', 'page-enter-left');
+    currentView.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
+    currentView.style.top = navH;
     void currentView.offsetWidth;
-    currentView.classList.add('page-exit-right');
-    setTimeout(finish, 280);
+    currentView.classList.add('page-push', 'page-exit-right');
+    setTimeout(finish, 480);
   } else {
+    // 防御分支：无可见子视图，直接恢复 me 页（无动画）
+    document.getElementById('navTitle').textContent = '我';
+    mePage.style.display = '';
+    mePage.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
+    mePage.style.top = '';
     finish();
   }
 }

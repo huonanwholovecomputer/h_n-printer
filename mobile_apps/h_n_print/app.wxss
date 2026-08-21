@@ -1233,9 +1233,12 @@ page {
 }
 
 /* ═══════════════ Page Transition Animations ═══════════════ */
-/* 所有页面共享：tab 切换 + 子页面导航统一使用 */
+/* 所有页面共享：tab 切换 + 子页面导航统一使用
+   滑动统一用强 Ease-Out cubic-bezier(0.16, 1, 0.3, 1)（先快后慢）：
+   入场 0.24s（去掉了 0.06s 延迟，both 填充使首帧即从 opacity 0 起播），
+   退出 0.16s（淡出后接淡入的处理方式不变，仅提速 + 换曲线）。 */
 .page-fade-in {
-  animation: pageFadeIn 0.3s 0.01s ease both;
+  animation: pageFadeIn 0.25s ease-out both;
 }
 @keyframes pageFadeIn {
   from { opacity: 0; }
@@ -1244,7 +1247,7 @@ page {
 
 /* 入场：从右滑入 */
 .page-enter-right {
-  animation: pageEnterRight 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: pageEnterRight 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageEnterRight {
   from { opacity: 0; transform: translateX(260rpx); }
@@ -1253,7 +1256,7 @@ page {
 
 /* 入场：从左滑入 */
 .page-enter-left {
-  animation: pageEnterLeft 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: pageEnterLeft 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageEnterLeft {
   from { opacity: 0; transform: translateX(-260rpx); }
@@ -1262,7 +1265,7 @@ page {
 
 /* 退出：左滑淡出 */
 .page-exit-left {
-  animation: pageExitLeft 0.22s ease-in both;
+  animation: pageExitLeft 0.16s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageExitLeft {
   from { opacity: 1; transform: translateX(0); }
@@ -1271,7 +1274,7 @@ page {
 
 /* 退出：右滑淡出 */
 .page-exit-right {
-  animation: pageExitRight 0.22s ease-in both;
+  animation: pageExitRight 0.16s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes pageExitRight {
   from { opacity: 1; transform: translateX(0); }

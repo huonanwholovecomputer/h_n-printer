@@ -42,9 +42,9 @@
   pointer-events: none;
 }
 
-/* 入场：从左滑入 + 淡入 */
+/* 入场：从左滑入 + 淡入（强 Ease-Out：先快后慢） */
 .page-enter-left {
-  animation: enterLeft 0.3s 0.06s cubic-bezier(0.22, 0.61, 0.36, 1) both;
+  animation: enterLeft 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes enterLeft {
   from { opacity: 0; transform: translateX(-260rpx); }
@@ -52,7 +52,7 @@
 }
 /* 首次加载：页面容器淡入（仅透明度，垂直移动由各元素"向上淡入"负责，避免双重位移） */
 .page-fade-in {
-  animation: fadeIn 0.3s 0.08s ease both;
+  animation: fadeIn 0.25s ease-out both;
 }
 @keyframes fadeIn {
   from { opacity: 0; }
@@ -63,16 +63,16 @@
   animation-delay: 0.5s;
 }
 
-/* 退出动画：左滑淡出 */
+/* 退出动画：左滑淡出（强 Ease-Out：先快后慢） */
 .page-exit-left {
-  animation: exitLeft 0.22s ease-in both;
+  animation: exitLeft 0.16s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitLeft {
   from { opacity: 1; transform: translateX(0); }
   to   { opacity: 0; transform: translateX(-260rpx); }
 }
 .page-exit-right {
-  animation: exitRight 0.22s ease-in both;
+  animation: exitRight 0.16s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes exitRight {
   from { opacity: 1; transform: translateX(0); }

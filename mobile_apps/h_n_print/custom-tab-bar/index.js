@@ -46,7 +46,7 @@ Component({
       const patch = { selected: index }
       this.data.list.forEach((item, i) => { if (item.active !== (i === index)) patch[`list[${i}].active`] = (i === index) })
       this.setData(patch)
-      setTimeout(() => { wx.switchTab({ url: "/" + target.pagePath }) }, 240)
+      setTimeout(() => { wx.switchTab({ url: "/" + target.pagePath }) }, 200)
     },
   },
 })

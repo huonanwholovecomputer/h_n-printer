@@ -24,10 +24,9 @@ Component({
   pageLifetimes: {
     show() {
       const app = getApp()
-      const forward = wx.getStorageSync('_navForward')
       wx.removeStorageSync('_navForward')
       this.setData({
-        pageSlide: forward ? 'page-enter-right' : 'page-enter-left',
+        pageSlide: 'page-fade-in',   // 进入位移由系统 push 动画负责，这里只做纯淡入，避免双重位移
         pageExit: '',
         isDarkMode: app.globalData.isDarkMode,
       })
@@ -36,8 +35,7 @@ Component({
       this._scheduleMeasure()
     },
     hide() {
-      const forward = wx.getStorageSync('_navForward')
-      this.setData({ pageExit: forward ? 'page-exit-left' : 'page-exit-right' })
+      // 返回由系统 navigateBack 动画负责交叉过渡，不再播自定义退出动画
       this._stopBindCountdown()
     },
   },

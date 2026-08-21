@@ -218,7 +218,8 @@ Component({
         const isFirstLaunch = (tabFrom == null || tabFrom === '')
         let animationClass = ''
         if (returnFromSub) {
-          animationClass = 'page-enter-left'
+          // 系统 navigateBack 动画已负责位移（与子页面退出交叉），这里只做纯淡入，避免双重位移
+          animationClass = 'page-fade-in'
         } else if (isFirstLaunch) {
           animationClass = 'page-fade-in'
         } else if (tabFrom === 0) {
@@ -295,19 +296,17 @@ Component({
       return true
     },
 
-    // 带退出动画的子页面导航（防连点锁）
+    // 带系统 push 动画的子页面导航（防连点锁）：
+    // 不再播自定义退出动画，直接 navigateTo，系统动画天然让新页滑入与旧页离开重叠（交叉过渡）
     _navigateWithAnimation(url) {
       if (this._navigating) return
       this._navigating = true
-      this.setData({ pageExit: 'page-exit-left' })
       wx.setStorageSync('_navForward', '1')
       wx.setStorageSync('_meReturnFromSub', '1')
-      setTimeout(() => {
-        wx.navigateTo({
-          url,
-          complete: () => { this._navigating = false }
-        })
-      }, 280)
+      wx.navigateTo({
+        url,
+        complete: () => { this._navigating = false }
+      })
     },
 
     // 订单状态轮询（静默增量更新，不触发全量渲染）；15s 避免高频请求触发 Nginx 限流
