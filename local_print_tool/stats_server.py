@@ -100,7 +100,9 @@ def clear_local_data_files() -> None:
 
 
 def _extract_proxy_body(resp) -> dict:
-    """只透传 {success, message, data} 白名单字段；非 JSON 响应统一转通用错误。"""
+    """只透传 {success, message, data} 白名单字段；非 JSON 响应统一转通用错误。
+    额外透传 pricing（/api/pricing 返回顶层 pricing 而非 data 包装，
+    供收支清算设置页的「打印价格」区块读写服务器定价配置）。"""
     try:
         data = resp.json()
     except Exception:
@@ -113,6 +115,8 @@ def _extract_proxy_body(resp) -> dict:
         out["message"] = msg
     if "data" in data:
         out["data"] = data["data"]
+    if "pricing" in data:
+        out["pricing"] = data["pricing"]
     return out
 
 

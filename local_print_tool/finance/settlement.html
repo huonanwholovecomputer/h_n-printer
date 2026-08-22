@@ -279,8 +279,10 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 }
 
 /* ==================== 转账指令 ==================== */
-.settle-box { background: var(--card-2); border: 2px solid var(--orange); border-radius: var(--radius); padding: 20px; margin-top: 18px; }
+.settle-box { background: var(--card); border: 2px solid var(--orange); border-radius: var(--radius); padding: 20px; margin-top: 18px; }
 .settle-box h2 { color: var(--orange); margin-bottom: 12px; }
+/* 资金重分配表格横线加深（卡片背景与普通卡片一致，避免横线被亮背景淹没） */
+.settle-box table th, .settle-box table td { border-bottom: 1px solid var(--border-strong); }
 .transfer { display: flex; align-items: center; gap: 10px; padding: 9px 0; font-size: 1.02rem; }
 .transfer .arrow { font-size: 1.25rem; color: var(--muted); }
 .transfer .amount { font-weight: 800; font-size: 1.15rem; color: var(--pos); }
@@ -687,6 +689,15 @@ var DEFAULT_RATE = 0.05;
 /* 默认密码存储 SHA-256 哈希（'123456' 的 sha256），不存明文 */
 var DEFAULT_PASSWORDS = { score: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', expense: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', income: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', settings: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92' };
 var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', settings: '设置' };
+/* 打印价格默认值（本地模式初始化 / 字段兜底用）。
+   云端模式下价格以服务器 pricing.json 为权威（/api/pricing），本常量仅作本地模式默认。 */
+var DEFAULT_PRICING = {
+  simplex_price: 0.2,
+  duplex_price: 0.3,
+  cover_page_price: 0.15,
+  delivery_percentages: { '1号楼北楼': 0, '1号楼南楼': 5, '图书馆': 15, '教学楼E/F': 20, '女生宿舍': 10 },
+  urgency_prices: { '低': 0, '中': 0.08, '高': 0.15 }
+};
 
 /* ==================== 存储层 ==================== */
 function _saveToServer(data, force) {
@@ -752,6 +763,12 @@ function hasRealData(store) {
   // 改过非默认设置
   if (cfg.scoreCap != null && Number(cfg.scoreCap) !== DEFAULT_SCORE_CAP) return true;
   if (cfg.investRate != null && Number(cfg.investRate) !== DEFAULT_RATE) return true;
+  // 改过打印价格（本地模式）
+  if (cfg.pricing) {
+    if (Number(cfg.pricing.simplex_price) !== DEFAULT_PRICING.simplex_price) return true;
+    if (Number(cfg.pricing.duplex_price) !== DEFAULT_PRICING.duplex_price) return true;
+    if (Number(cfg.pricing.cover_page_price) !== DEFAULT_PRICING.cover_page_price) return true;
+  }
   return false;
 }
 
@@ -811,6 +828,10 @@ function mergeStores(localStore, cloudStore) {
       memberBindings: bindings,
       scoreCap: (lc.scoreCap != null && lc.scoreCap !== DEFAULT_SCORE_CAP) ? lc.scoreCap : (cc.scoreCap != null ? cc.scoreCap : DEFAULT_SCORE_CAP),
       investRate: (lc.investRate != null && lc.investRate !== DEFAULT_RATE) ? lc.investRate : (cc.investRate != null ? cc.investRate : DEFAULT_RATE),
+      // 打印价格云端权威：云端已有配置用云端，否则用本地（首次部署迁移）
+      pricing: cloudHasCfg && cc.pricing
+        ? JSON.parse(JSON.stringify(cc.pricing))
+        : JSON.parse(JSON.stringify(lc.pricing || {})),
     },
     records: {
       expenses: unionById((localStore && localStore.records && localStore.records.expenses) || [], (cloudStore && cloudStore.records && cloudStore.records.expenses) || []),
@@ -844,6 +865,17 @@ function migrateConfig(data) {
     delete c.scorePassword;
   }
   if (!c.memberBindings) c.memberBindings = [];
+  // 打印价格（本地模式存储；云端模式以服务器 pricing.json 为权威，不在 STORE 维护）
+  if (!c.pricing || typeof c.pricing !== 'object') {
+    c.pricing = JSON.parse(JSON.stringify(DEFAULT_PRICING));
+  } else {
+    var _p = c.pricing;
+    if (_p.simplex_price == null) _p.simplex_price = DEFAULT_PRICING.simplex_price;
+    if (_p.duplex_price == null) _p.duplex_price = DEFAULT_PRICING.duplex_price;
+    if (_p.cover_page_price == null) _p.cover_page_price = DEFAULT_PRICING.cover_page_price;
+    if (!_p.delivery_percentages || typeof _p.delivery_percentages !== 'object') _p.delivery_percentages = JSON.parse(JSON.stringify(DEFAULT_PRICING.delivery_percentages));
+    if (!_p.urgency_prices || typeof _p.urgency_prices !== 'object') _p.urgency_prices = JSON.parse(JSON.stringify(DEFAULT_PRICING.urgency_prices));
+  }
   // 旧版 months 结构 → 日期流水
   if (data.months && !data.records) {
     var conv = convertMonths(data.months);
@@ -2081,13 +2113,29 @@ var _EXCLUDE_STATUS = { canceled: 1, abandoned: 1, rejected: 1, failed: 1 };
 function _orderMoney(o, excludeSelf) {
   var m = { paid: 0, receivable: 0, record: 0, free: 0, pendingFiles: 0 };
   var isSelf = !!(excludeSelf && o && o.is_admin_print);
+  var fileSum = 0;
   (o.files || []).forEach(function (f) {
     if (f.is_free) m.free++;
     if (isSelf) return;   // 自打订单：保留免费文件计数，金额不计入收益
     var amt = parseCents(f.total_price);
+    fileSum += amt;
     if (f.status === 'sent') m.paid += amt;
     else if (!_EXCLUDE_STATUS[f.status]) { m.receivable += amt; m.pendingFiles++; }
   });
+  // 订单级附加服务费（派送/加急/首页费）= 父订单 total_price − 文件费合计。
+  // 仅当订单存在「有效文件」（非取消/放弃/打回/失败）时计入，且按有效文件状态整体归入
+  // 已入账（全部 sent）/ 应收未收（有未 sent）；自打订单金额不计；附加费不增加"待处理文件数"。
+  if (!isSelf && (o.files || []).length) {
+    var extra = parseCents(o.total_price || 0) - fileSum;
+    if (extra > 0) {
+      var activeFiles = (o.files || []).filter(function (f) { return f.status === 'sent' || !_EXCLUDE_STATUS[f.status]; });
+      if (activeFiles.length) {
+        var allSent = activeFiles.every(function (f) { return f.status === 'sent'; });
+        if (allSent) m.paid += extra;
+        else m.receivable += extra;
+      }
+    }
+  }
   m.record = m.paid + m.receivable;   // 云端收益记录 = 已入账 + 应收未收（合并口径）
   return m;
 }
@@ -2315,7 +2363,11 @@ function _renderOrderListHTML() {
         : memberOfOpenid(o.openid);
       var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
       var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
-      var revColor = sanitizeColor(_statusColor(o.status));   // 金额配色跟随订单状态
+      // 金额配色：自打订单且已完成（sent）→ 与「自打」标记同色（蓝色主题色 var(--primary)）；
+      // 其他状态（放弃/失败等）→ 以该状态的颜色为准
+      var revColor = (o.is_admin_print && o.status === 'sent')
+        ? 'var(--primary)'
+        : sanitizeColor(_statusColor(o.status));
       var money = _orderMoney(o);
       var orderRev = money.record;   // 云端收益记录（已入账+应收未收 合并口径）
       var addr = _orderAddr(o);
@@ -3598,19 +3650,20 @@ function renderSettings() {
     h += '</div>';
   }
 
+  // 打印价格（云端模式以服务器 pricing.json 为权威，本地模式存 print_data.json）
+  h += '<div class="section"><h2>🖨️ 打印价格 <span class="hint">' + (FINANCE_MODE === 'local' ? '本地配置（print_data.json）' : '云端配置（pricing.json，小程序 / 后端计价 / 本地打印共用）') + '</span></h2>';
+  h += '<div class="settings-row"><label>单面价（元/页）</label><input type="number" id="pricingSimplex" step="0.01" min="0.01" value="' + (FINANCE_MODE === 'local' ? (STORE.config.pricing.simplex_price || 0.2) : '') + '" placeholder="0.20" style="width:90px"></div>';
+  h += '<div class="settings-row"><label>双面价（元/张）</label><input type="number" id="pricingDuplex" step="0.01" min="0.01" value="' + (FINANCE_MODE === 'local' ? (STORE.config.pricing.duplex_price || 0.3) : '') + '" placeholder="0.30" style="width:90px"></div>';
+  h += '<div class="settings-row"><label>首页费（元/单）</label><input type="number" id="pricingCover" step="0.01" min="0" value="' + (FINANCE_MODE === 'local' ? (STORE.config.pricing.cover_page_price || 0) : '') + '" placeholder="0.10" style="width:90px"></div>';
+  h += '<div class="settings-row" style="align-items:flex-start"><label style="padding-top:6px">派送地点百分比</label><div id="pricingDeliveryList" style="flex:1;display:flex;flex-direction:column;gap:6px">' + (FINANCE_MODE === 'local' ? pricingRowsHTML('dp', STORE.config.pricing.delivery_percentages || {}, '百分比', _pricingDpKeys, true) : '<span style="color:var(--muted);font-size:.82rem">加载中…</span>') + '</div></div>';
+  h += '<div class="settings-row" style="align-items:flex-start"><label style="padding-top:6px">优先级加急价</label><div id="pricingUrgencyList" style="flex:1;display:flex;flex-direction:column;gap:6px">' + (FINANCE_MODE === 'local' ? pricingRowsHTML('up', STORE.config.pricing.urgency_prices || {}, '元', _pricingUpKeys, false) : '<span style="color:var(--muted);font-size:.82rem">加载中…</span>') + '</div></div>';
+  h += '<div class="settings-row"><label></label><button class="btn pri sm" onclick="savePricing()">💾 保存价格</button><span style="color:var(--muted);font-size:.78rem">修改后前端计费、后端计价与本地打印首页即时生效（云端模式）</span></div>';
+  h += '</div>';
+
   // 结算参数
   h += '<div class="section"><h2>⚖️ 结算参数</h2>';
   h += '<div class="settings-row"><label>投资均分比例</label><input type="range" min="0" max="50" step="1" value="' + rate + '" oninput="onRateSlide(+this.value)" onchange="updateRate(+this.value)" style="width:180px"> <b id="rateValLive">' + rate + '%</b><span id="rateSvcLive" style="color:var(--muted);font-size:.78rem">服务按分占比 ' + (100 - rate) + '%</span></div>';
   h += '<div class="settings-row"><label>评分单项上限</label><input type="number" min="1" max="100" step="1" value="' + scoreCap + '" onchange="updateScoreCap(+this.value)" style="width:90px"><span style="color:var(--muted);font-size:.78rem">修改后所有月份计算即时生效</span></div>';
-  h += '</div>';
-
-  // 外观
-  h += '<div class="section"><h2>🎨 外观</h2>';
-  h += '<div class="settings-row"><label>主题模式</label><select onchange="setThemeMode(this.value)" style="padding:8px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text)">';
-  h += '<option value="system"' + (themeMode === 'system' ? ' selected' : '') + '>🌓 自动（跟随系统）</option>';
-  h += '<option value="light"' + (themeMode === 'light' ? ' selected' : '') + '>☀️ 浅色</option>';
-  h += '<option value="dark"' + (themeMode === 'dark' ? ' selected' : '') + '>🌙 深色</option>';
-  h += '</select><span style="color:var(--muted);font-size:.78rem">自动模式识别 Windows 深色/浅色设置，配置保存在本机浏览器</span></div>';
   h += '</div>';
 
   // 数据管理
@@ -3621,6 +3674,131 @@ function renderSettings() {
   h += '</div>';
 
   el.innerHTML = _lz(h);
+  // DOM 就绪后再异步填充云端价格表单
+  if (FINANCE_MODE !== 'local') loadCloudPricingForm();
+}
+/* ==================== 打印价格（收支统计设置 → 全局定价） ====================
+   云端模式：读写服务器 pricing.json（/api/proxy/pricing，printer token 鉴权），
+             小程序/APP 计费显示、后端订单计价、本地打印首页全部共用这一份价格。
+   本地模式：存 STORE.config.pricing（print_data.json），仅影响本地打印工具。 */
+var _pricingDpKeys = [], _pricingUpKeys = [];
+var _cloudPricing = null;
+/* 优先级档位业务顺序（低→中→高）；渲染加急价列表时强制按此排序，不依赖数据键顺序 */
+var URGENCY_ORDER = ['低', '中', '高'];
+function pricingRowsHTML(prefix, dict, unit, keyArr, editable) {
+  var h = '', i = 0;
+  keyArr.length = 0;
+  var keys = Object.keys(dict || {});
+  if (prefix === 'up') {
+    // 优先级加急价：按 低→中→高 顺序展示；未知档位按字典序排最后
+    keys = keys.slice().sort(function (a, b) {
+      var ia = URGENCY_ORDER.indexOf(a), ib = URGENCY_ORDER.indexOf(b);
+      if (ia >= 0 && ib >= 0) return ia - ib;
+      if (ia >= 0) return -1;
+      if (ib >= 0) return 1;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+  }
+  keys.forEach(function (k) {
+    keyArr.push(k);
+    h += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
+         '<span style="min-width:110px;font-size:.85rem;color:var(--text)">' + esc(k) + '</span>' +
+         '<input type="number" id="' + prefix + i + '" step="0.01" min="0" max="100" value="' + (+dict[k] || 0) + '" style="width:80px">' +
+         '<span style="font-size:.78rem;color:var(--muted)">' + unit + '</span>' +
+         (editable ? '<button class="btn danger sm" style="padding:2px 8px" onclick="removePricingRow(\'' + prefix + '\',' + i + ')">✕</button>' : '') +
+         '</div>';
+    i++;
+  });
+  if (editable) {
+    h += '<div style="margin-top:6px"><button class="btn sm" onclick="addPricingRow(\'' + prefix + '\')">➕ 添加地点</button></div>';
+  }
+  return h || '<span style="color:var(--muted);font-size:.82rem">无</span>';
+}
+function addPricingRow(prefix) {
+  var name = prompt('输入新地点名称：', '新地点');
+  if (!name || !name.trim()) return;
+  name = name.trim();
+  if (_pricingDpKeys.indexOf(name) >= 0) { toast('该地点已存在', 'error'); return; }
+  _pricingDpKeys.push(name);
+  renderPricingList('dp');
+  toast('已添加「' + name + '」，点击「保存价格」生效', 'success');
+}
+function removePricingRow(prefix, idx) {
+  var keys = prefix === 'dp' ? _pricingDpKeys : _pricingUpKeys;
+  if (idx < 0 || idx >= keys.length) return;
+  var name = keys[idx];
+  if (!confirm('确定删除地点「' + name + '」吗？')) return;
+  keys.splice(idx, 1);
+  renderPricingList(prefix);
+  toast('已删除「' + name + '」，点击「保存价格」生效', 'success');
+}
+function renderPricingList(prefix) {
+  var keys = prefix === 'dp' ? _pricingDpKeys : _pricingUpKeys;
+  var vals = {};
+  keys.forEach(function (k, i) {
+    var el = document.getElementById(prefix + i);
+    vals[k] = el ? (+el.value || 0) : 0;
+  });
+  var el = document.getElementById(prefix === 'dp' ? 'pricingDeliveryList' : 'pricingUrgencyList');
+  if (el) el.innerHTML = pricingRowsHTML(prefix, vals, prefix === 'dp' ? '百分比' : '元', keys, prefix === 'dp');
+}
+function loadCloudPricingForm() {
+  if (_cloudPricing) { fillPricingForm(_cloudPricing); return; }
+  fetch('/api/proxy/pricing', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!(res && res.success)) return;
+      _cloudPricing = res.pricing || {};
+      fillPricingForm(_cloudPricing);
+    })
+    .catch(function () {});
+}
+function fillPricingForm(p) {
+  var el = document.getElementById('pricingSimplex');
+  if (el) el.value = (p.simplex_price != null) ? p.simplex_price : '';
+  el = document.getElementById('pricingDuplex');
+  if (el) el.value = (p.duplex_price != null) ? p.duplex_price : '';
+  el = document.getElementById('pricingCover');
+  if (el) el.value = (p.cover_page_price != null) ? p.cover_page_price : '';
+  var dl = document.getElementById('pricingDeliveryList');
+  if (dl) dl.innerHTML = pricingRowsHTML('dp', p.delivery_percentages || {}, '百分比', _pricingDpKeys, true);
+  var ul = document.getElementById('pricingUrgencyList');
+  if (ul) ul.innerHTML = pricingRowsHTML('up', p.urgency_prices || {}, '元', _pricingUpKeys, false);
+}
+function collectPricingForm() {
+  var p = { simplex_price: 0, duplex_price: 0, cover_page_price: 0, delivery_percentages: {}, urgency_prices: {} };
+  var e = document.getElementById('pricingSimplex'); if (e) p.simplex_price = +e.value || 0;
+  e = document.getElementById('pricingDuplex'); if (e) p.duplex_price = +e.value || 0;
+  e = document.getElementById('pricingCover'); if (e) p.cover_page_price = +e.value || 0;
+  _pricingDpKeys.forEach(function (k, i) {
+    e = document.getElementById('dp' + i);
+    p.delivery_percentages[k] = e ? (+e.value || 0) : 0;
+  });
+  _pricingUpKeys.forEach(function (k, i) {
+    e = document.getElementById('up' + i);
+    p.urgency_prices[k] = e ? (+e.value || 0) : 0;
+  });
+  return p;
+}
+function savePricing() {
+  var p = collectPricingForm();
+  if (!(p.simplex_price > 0) || !(p.duplex_price > 0)) { toast('单面价 / 双面价必须大于 0', 'error'); return; }
+  if (FINANCE_MODE === 'local') {
+    STORE.config.pricing = p;
+    save();
+    renderSettings();
+    toast('✅ 打印价格已保存（本地 print_data.json）', 'success');
+    return;
+  }
+  fetch('/api/proxy/pricing', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ pricing: p }) })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res && res.success) {
+        _cloudPricing = res.pricing || p;
+        toast('✅ 打印价格已保存到云端，全端生效', 'success');
+      } else toast('❌ ' + ((res && res.message) || '保存失败'), 'error');
+    })
+    .catch(function () { toast('❌ 网络错误', 'error'); });
 }
 function updatePassword(key) {
   var input = $('#pwd-' + key);
@@ -3696,7 +3874,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.20</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.21</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -3722,6 +3900,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.18：趋势区间 —— 新增「本月」并与顶部云端月份绑定（切换月份自动跟随）；移除「本周」「近7天」快捷区间；趋势分析卡片置顶展示；成员收益明细 / 排行榜按归属成员合并（本地订单并入归属管理员行，本地/云端不再分行）。</p>' +
     '<p style="margin-top:10px">v5.19：云端页精简 —— 移除订单漏斗与成员排行榜；「管理员订单统计」与「成员收益明细」合并精简为「🧾 成员订单数量统计」（编号 / 成员 / 免费打印 / 订单总数四列，管理员与普通用户统一口径，不再请求后端 owners 统计）。</p>' +
     '<p style="margin-top:10px">v5.20：统一口径栏 —— 顶部新增全局口径栏（时间 / 成员 / 来源），单选决定「看哪些数据」，指标 / 视角 / 状态 / 分页等「怎么展示」控件留在模块内部；KPI、趋势、图表、订单明细共用同一份筛选数据；「成员账目」合并展示（成员 / 免费打印 / 订单/云端收益记录 / 手动代收 / 差额），来源筛选不影响对账列，上月环比徽标（自然月口径）。</p>' +
+    '<p style="margin-top:10px">v5.21：打印价格统一管理 + 收益口径修正 —— 设置页新增「打印价格」区块（单双面价 / 派送地点百分比 / 优先级加急价 / 首页费：云端模式写服务器 pricing.json 全端生效，本地模式存 print_data.json；支持添加 / 删除派送地点，密码保护）；收益统计计入订单级附加服务费（派送 / 加急 / 首页，按订单有效文件状态归入已入账或应收未收，放弃 / 取消 / 打回 / 失败订单不计）；订单明细金额配色：自打且已完成订单金额用蓝色与「自打」标记一致；设置页移除「外观」主题板块（右上角主题切换保留）；优先级加急价按 低 → 中 → 高 顺序展示。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

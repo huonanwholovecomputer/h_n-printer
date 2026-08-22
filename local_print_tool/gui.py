@@ -89,6 +89,19 @@ logger = logging.getLogger(__name__)
 # 辅助工具
 # ============================================================
 
+# 优先级档位业务顺序（低→中→高）：主界面下拉与价格同步统一按此排序，
+# 不依赖接口/配置文件的键顺序（后端 jsonify 会按 Unicode 排序，如 中→低→高）。
+URGENCY_ORDER = ("低", "中", "高")
+
+
+def _sort_urgency_keys(keys) -> list:
+    """把优先级档位键按 低→中→高 排序；未知档位按原顺序追加在后。"""
+    keys = list(keys)
+    known = [k for k in URGENCY_ORDER if k in keys]
+    rest = [k for k in keys if k not in URGENCY_ORDER]
+    return known + rest
+
+
 def _disable_combo_wheel(combo: QComboBox) -> None:
     """禁止 QComboBox 响应鼠标滚轮事件，改为转发给父 QScrollArea 实现滚动。"""
     class _WheelBlocker(QObject):
@@ -980,118 +993,6 @@ def _cleanup_temp(path: str | None) -> None:
 
 
 # ============================================================
-# 地点管理对话框
-# ============================================================
-
-class LocationManagerDialog(QDialog):
-    """管理派送地点及百分比。"""
-
-    def __init__(self, locations: dict[str, float], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("管理派送地点")
-        self.setMinimumSize(400, 300)
-        self.resize(450, 350)
-        self._locations = dict(locations)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-
-        # 表格：地点名称 | 百分比
-        self._table = QTableWidget(0, 2)
-        self._table.setHorizontalHeaderLabels(["地点名称", "百分比"])
-        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)
-        self._table.setColumnWidth(1, 80)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self._table.setContextMenuPolicy(Qt.CustomContextMenu)
-        self._table.customContextMenuRequested.connect(self._on_context_menu)
-        layout.addWidget(self._table)
-
-        # 添加按钮 — 置于表格下方（参考文件列表样式）
-        btn_add = QPushButton("📂 添加地点")
-        btn_add.clicked.connect(self._on_add)
-        layout.addWidget(btn_add)
-
-        # 确定 / 取消
-        bottom = QHBoxLayout()
-        bottom.addStretch()
-        btn_ok = QPushButton("确定")
-        btn_ok.clicked.connect(self._on_ok)
-        bottom.addWidget(btn_ok)
-        btn_cancel = QPushButton("取消")
-        btn_cancel.clicked.connect(self.reject)
-        bottom.addWidget(btn_cancel)
-        layout.addLayout(bottom)
-
-        self._populate_table()
-
-    def _populate_table(self):
-        self._table.setRowCount(0)
-        for name, pct in self._locations.items():
-            self._add_row(name, pct)
-
-    def _add_row(self, name: str = "", pct: float = 0.0):
-        row = self._table.rowCount()
-        self._table.insertRow(row)
-
-        name_item = QTableWidgetItem(name)
-        self._table.setItem(row, 0, name_item)
-
-        pct_spin = QDoubleSpinBox()
-        pct_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        pct_spin.setRange(0.0, 100.0)
-        pct_spin.setDecimals(0)
-        pct_spin.setSingleStep(1)
-        pct_spin.setSuffix("%")
-        pct_spin.setValue(pct)
-        pct_spin.setMaximumWidth(70)
-        self._table.setCellWidget(row, 1, pct_spin)
-
-    def _on_add(self):
-        self._add_row("新地点", 0.0)
-        row = self._table.rowCount() - 1
-        self._table.selectRow(row)
-        self._table.editItem(self._table.item(row, 0))
-        self._table.scrollToBottom()
-
-    def _on_context_menu(self, pos):
-        """右键菜单：删除选中地点。"""
-        item = self._table.itemAt(pos)
-        if item is None:
-            return
-        row = item.row()
-        self._table.selectRow(row)
-        name = self._table.item(row, 0).text()
-
-        menu = QMenu(self)
-        del_action = menu.addAction(f"删除「{name}」")
-        action = menu.exec(self._table.viewport().mapToGlobal(pos))
-        if action == del_action:
-            reply = QMessageBox.question(self, "确认删除", f"确定要删除地点「{name}」吗？")
-            if reply == QMessageBox.Yes:
-                self._table.removeRow(row)
-
-    def _on_ok(self):
-        new_locations: dict[str, float] = {}
-        for row in range(self._table.rowCount()):
-            name = self._table.item(row, 0).text().strip()
-            if not name:
-                continue
-            pct_widget = self._table.cellWidget(row, 1)
-            pct = pct_widget.value() if pct_widget else 0.0
-            new_locations[name] = pct
-        if not new_locations:
-            QMessageBox.warning(self, "提示", "至少需要保留一个地点。")
-            return
-        self._locations = new_locations
-        self.accept()
-
-    def get_locations(self) -> dict[str, float]:
-        return self._locations
-
-
 # ============================================================
 # DropTableWidget — 支持拖放文件
 # ============================================================
@@ -1504,6 +1405,7 @@ class MainWindow(QMainWindow):
     _cloudConnSyncLog = Signal(str)   # 后台同步网络 → 主线程 _log 的安全通道
     _ownerComboRefreshed = Signal()   # 成员名单同步完成 → 主线程刷新归属下拉
     _tabDisplayRefresh = Signal()     # 后台同步中换号完成后 → 主线程刷新标签页显示
+    _pricingSynced = Signal()         # 打印价格同步完成（可能来自后台线程）→ 主线程刷新 UI
 
     def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
         super().__init__()
@@ -1688,6 +1590,7 @@ class MainWindow(QMainWindow):
         self._cloudConnSyncLog.connect(self._log)
         self._ownerComboRefreshed.connect(self._on_owner_combo_refreshed)
         self._tabDisplayRefresh.connect(self._on_refresh_tab_display_safe)
+        self._pricingSynced.connect(self._on_pricing_synced)
 
         # 初始化云端任务列表窗口（非模态，复用）
         self._cloud_task_window = CloudTaskListWindow(self)
@@ -1698,6 +1601,10 @@ class MainWindow(QMainWindow):
         if self._config.cloud_enabled and self._config.cloud_token:
             self._cloud_client.start()
             self._update_cloud_status()
+
+        # 启动后同步打印价格：云端模式读 /api/pricing，本地模式读收支统计本地配置。
+        # 价格统一在「收支统计 → 设置」维护，主界面不再提供价格编辑入口。
+        QTimer.singleShot(800, self._sync_pricing)
 
         # 初始化离线同步引擎，启动后台定时同步（仅云端模式下自动把本地库订单定时上报；
         # 本地模式不启动——否则残留的旧云端 token 会把本地订单纯本地订单静默上传到旧云端）
@@ -1769,19 +1676,19 @@ class MainWindow(QMainWindow):
         layout.addSpacing(8)
 
         # API 地址
-        layout.addWidget(QLabel("API 地址:"))
+        layout.addWidget(QLabel("API 地址："))
         api_input = QLineEdit(self._config.cloud_api_url)
         api_input.setPlaceholderText("https://your-server.com")
         layout.addWidget(api_input)
 
         # WebSocket 地址
-        layout.addWidget(QLabel("WebSocket 地址:"))
+        layout.addWidget(QLabel("WebSocket 地址："))
         ws_input = QLineEdit(self._config.cloud_ws_url)
         ws_input.setPlaceholderText("wss://your-server.com")
         layout.addWidget(ws_input)
 
         # Token
-        layout.addWidget(QLabel("认证 Token:"))
+        layout.addWidget(QLabel("认证 Token："))
         token_input = QLineEdit(self._config.cloud_token)
         token_input.setPlaceholderText("打印机认证 token")
         token_input.setEchoMode(QLineEdit.Password)
@@ -2108,10 +2015,6 @@ class MainWindow(QMainWindow):
         cloud_action.triggered.connect(self._on_cloud_settings)
         file_menu.addAction(cloud_action)
 
-        locations_action = QAction("地点(&L)", self)
-        locations_action.triggered.connect(self._on_manage_locations)
-        file_menu.addAction(locations_action)
-
         file_menu.addSeparator()
 
         # 收支清算入口：启用云端 = 云端收支清算；关闭云端 = 收支统计（本地模式，读本地数据）
@@ -2192,7 +2095,7 @@ class MainWindow(QMainWindow):
         """顶部：打印机选择 + 保留 PDF 选项。"""
         layout = QHBoxLayout()
 
-        layout.addWidget(QLabel("打印机:"))
+        layout.addWidget(QLabel("打印机："))
 
         self._printer_combo = QComboBox()
         self._printer_combo.setMinimumWidth(200)
@@ -2206,7 +2109,7 @@ class MainWindow(QMainWindow):
         btn_refresh.clicked.connect(self._on_refresh_printers)
         layout.addWidget(btn_refresh)
 
-        layout.addWidget(QLabel("保存转换副本到桌面:"))
+        layout.addWidget(QLabel("保存转换副本到桌面："))
 
         self._keep_temp_check = QComboBox()
         self._keep_temp_check.addItems(["否", "是"])
@@ -2215,33 +2118,19 @@ class MainWindow(QMainWindow):
         _disable_combo_wheel(self._keep_temp_check)
         layout.addWidget(self._keep_temp_check)
 
-        layout.addWidget(QLabel("  单面:"))
+        layout.addWidget(QLabel("  单面："))
 
-        self._simplex_price_spin = QDoubleSpinBox()
-        self._simplex_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self._simplex_price_spin.setRange(0.01, 99.99)
-        self._simplex_price_spin.setDecimals(2)
-        self._simplex_price_spin.setSingleStep(0.01)
-        self._simplex_price_spin.setValue(self._config.simplex_price)
-        self._simplex_price_spin.setFixedWidth(60)
-        self._simplex_price_spin.valueChanged.connect(self._on_price_changed)
-        layout.addWidget(self._simplex_price_spin)
-        layout.addWidget(QLabel("元/张"))
+        self._simplex_price_label = QLabel(f"{self._config.simplex_price:.2f} 元/张")
+        self._simplex_price_label.setObjectName("readonlyPrice")
+        layout.addWidget(self._simplex_price_label)
 
-        layout.addWidget(QLabel(" 双面:"))
+        layout.addWidget(QLabel("  双面："))
 
-        self._duplex_price_spin = QDoubleSpinBox()
-        self._duplex_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self._duplex_price_spin.setRange(0.01, 99.99)
-        self._duplex_price_spin.setDecimals(2)
-        self._duplex_price_spin.setSingleStep(0.01)
-        self._duplex_price_spin.setValue(self._config.duplex_price)
-        self._duplex_price_spin.setFixedWidth(60)
-        self._duplex_price_spin.valueChanged.connect(self._on_price_changed)
-        layout.addWidget(self._duplex_price_spin)
-        layout.addWidget(QLabel("元/张"))
+        self._duplex_price_label = QLabel(f"{self._config.duplex_price:.2f} 元/张")
+        self._duplex_price_label.setObjectName("readonlyPrice")
+        layout.addWidget(self._duplex_price_label)
 
-        layout.addWidget(QLabel(" DPI:"))
+        layout.addWidget(QLabel(" DPI："))
 
         self._render_dpi_combo = QComboBox()
         self._render_dpi_combo.addItems(["高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
@@ -2276,30 +2165,20 @@ class MainWindow(QMainWindow):
         _disable_combo_wheel(self._delivery_location_combo)
         self._delivery_location_combo.currentIndexChanged.connect(self._on_delivery_location_changed)
 
-        # 派送百分比
-        self._delivery_percent_spin = QDoubleSpinBox()
-        self._delivery_percent_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self._delivery_percent_spin.setRange(0.0, 100.0)
-        self._delivery_percent_spin.setDecimals(0)
-        self._delivery_percent_spin.setSingleStep(1)
-        self._delivery_percent_spin.setSuffix("%")
-        self._delivery_percent_spin.setFixedWidth(60)
-        self._delivery_percent_spin.valueChanged.connect(self._on_delivery_percent_changed)
+        # 派送百分比（只读，价格统一在「收支统计 → 设置」维护）
+        self._delivery_percent_label = QLabel("0%")
+        self._delivery_percent_label.setObjectName("readonlyPrice")
+        self._delivery_percent_label.setFixedWidth(44)
 
-        # 优先程度
+        # 优先程度（档位按业务顺序 低→中→高）
         self._urgency_combo = QComboBox()
-        self._urgency_combo.addItems(list(self._config.urgency_prices.keys()))
+        self._urgency_combo.addItems(_sort_urgency_keys(self._config.urgency_prices.keys()))
         _disable_combo_wheel(self._urgency_combo)
         self._urgency_combo.currentIndexChanged.connect(self._on_urgency_changed)
 
-        # 优先级价格
-        self._urgency_price_spin = QDoubleSpinBox()
-        self._urgency_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self._urgency_price_spin.setRange(0.0, 99.99)
-        self._urgency_price_spin.setDecimals(2)
-        self._urgency_price_spin.setSingleStep(0.01)
-        self._urgency_price_spin.setFixedWidth(60)
-        self._urgency_price_spin.valueChanged.connect(self._on_urgency_price_changed)
+        # 优先级价格（只读）
+        self._urgency_price_label = QLabel("0.00 元")
+        self._urgency_price_label.setObjectName("readonlyPrice")
 
         # 首页开关
         self._cover_page_onoff_combo = QComboBox()
@@ -2307,22 +2186,16 @@ class MainWindow(QMainWindow):
         _disable_combo_wheel(self._cover_page_onoff_combo)
         self._cover_page_onoff_combo.currentIndexChanged.connect(self._on_cover_page_toggled)
 
-        # 首页价格
-        self._cover_page_price_spin = QDoubleSpinBox()
-        self._cover_page_price_spin.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        self._cover_page_price_spin.setRange(0.0, 99.99)
-        self._cover_page_price_spin.setDecimals(2)
-        self._cover_page_price_spin.setSingleStep(0.01)
-        self._cover_page_price_spin.setValue(self._config.cover_page_price)
-        self._cover_page_price_spin.setFixedWidth(60)
-        self._cover_page_price_spin.valueChanged.connect(self._on_price_changed)
+        # 首页价格（只读）
+        self._cover_page_price_label = QLabel(f"{self._config.cover_page_price:.2f} 元")
+        self._cover_page_price_label.setObjectName("readonlyPrice")
 
         # —— 派送/地点居左 + 优先级居右 + 首页居右 ——
 
         # Group 1: 派送（居左，最小宽度）
         g1 = QHBoxLayout()
         g1.setSpacing(2)
-        g1.addWidget(QLabel("派送:"))
+        g1.addWidget(QLabel("派送："))
         g1.addWidget(self._delivery_onoff_combo)
         row2.addLayout(g1)
 
@@ -2331,9 +2204,10 @@ class MainWindow(QMainWindow):
         # Group 2: 地点（居左，平分剩余空间）
         g2 = QHBoxLayout()
         g2.setSpacing(2)
-        g2.addWidget(QLabel("地点:"))
+        g2.addWidget(QLabel("地点："))
         g2.addWidget(self._delivery_location_combo)
-        g2.addWidget(self._delivery_percent_spin)
+        g2.addSpacing(8)   # 数字与下拉框隔开一个字符
+        g2.addWidget(self._delivery_percent_label)
         g2.addStretch()
         row2.addLayout(g2, 1)
 
@@ -2341,10 +2215,10 @@ class MainWindow(QMainWindow):
         g3 = QHBoxLayout()
         g3.setSpacing(2)
         g3.addStretch()
-        g3.addWidget(QLabel("优先级:"))
+        g3.addWidget(QLabel("优先级："))
         g3.addWidget(self._urgency_combo)
-        g3.addWidget(self._urgency_price_spin)
-        g3.addWidget(QLabel("元"))
+        g3.addSpacing(8)   # 数字与下拉框隔开一个字符
+        g3.addWidget(self._urgency_price_label)
         row2.addLayout(g3, 1)
 
         row2.addSpacing(12)
@@ -2353,15 +2227,14 @@ class MainWindow(QMainWindow):
         g4 = QHBoxLayout()
         g4.setSpacing(2)
         g4.addStretch()
-        g4.addWidget(QLabel("首页:"))
+        g4.addWidget(QLabel("首页："))
         g4.addWidget(self._cover_page_onoff_combo)
-        g4.addWidget(self._cover_page_price_spin)
-        g4.addWidget(QLabel("元"))
+        g4.addSpacing(8)   # 数字与下拉框隔开一个字符
+        g4.addWidget(self._cover_page_price_label)
         row2.addLayout(g4)
 
-        # 初始状态：派送=否时禁用地点和百分比
+        # 初始状态：派送=否时禁用地点
         self._delivery_location_combo.setEnabled(False)
-        self._delivery_percent_spin.setEnabled(False)
 
         root.addLayout(row2)
 
@@ -2369,9 +2242,8 @@ class MainWindow(QMainWindow):
         def _normalize_spin_heights():
             combo_h = self._printer_combo.height()
             if combo_h > 0:
-                for sp in (self._simplex_price_spin, self._duplex_price_spin,
-                           self._delivery_percent_spin, self._urgency_price_spin,
-                           self._cover_page_price_spin):
+                for sp in (self._render_dpi_combo, self._delivery_onoff_combo,
+                           self._urgency_combo, self._cover_page_onoff_combo):
                     sp.setFixedHeight(combo_h)
         QTimer.singleShot(0, _normalize_spin_heights)
 
@@ -2490,7 +2362,7 @@ class MainWindow(QMainWindow):
         self._admin_print_check.toggled.connect(self._on_admin_print_toggled)
         total_row.addWidget(self._admin_print_check)
         total_row.addStretch()
-        self._total_label = QLabel("合计: ¥0.00")
+        self._total_label = QLabel("合计：¥0.00")
         self._total_label.setObjectName("totalCostLabel")
         self._total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         total_row.addWidget(self._total_label)
@@ -3364,14 +3236,14 @@ class MainWindow(QMainWindow):
         gl.setSpacing(10)
 
         # 份数
-        label_copies = QLabel("份数:")
+        label_copies = QLabel("份数：")
         gl.addWidget(label_copies)
         self._edit_copies = CounterWidget(1, 99)
         self._edit_copies.valueChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_copies)
 
         # 双面
-        self._label_duplex = QLabel("单/双面:")
+        self._label_duplex = QLabel("单/双面：")
         gl.addWidget(self._label_duplex)
         self._edit_duplex = QComboBox()
         self._edit_duplex.addItems(["双面打印", "单面打印"])
@@ -3380,7 +3252,7 @@ class MainWindow(QMainWindow):
         gl.addWidget(self._edit_duplex)
 
         # 双面模式（仅双面时可用）
-        self._label_duplex_mode = QLabel("双面模式:")
+        self._label_duplex_mode = QLabel("双面模式：")
         gl.addWidget(self._label_duplex_mode)
         self._edit_duplex_mode = QComboBox()
         self._edit_duplex_mode.addItems(["长边翻转", "短边翻转"])
@@ -3389,14 +3261,14 @@ class MainWindow(QMainWindow):
         gl.addWidget(self._edit_duplex_mode)
 
         # 页码范围
-        self._label_range = QLabel("页码范围:")
+        self._label_range = QLabel("页码范围：")
         gl.addWidget(self._label_range)
         self._edit_page_range = RangeListWidget()
         self._edit_page_range.rangesChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_page_range)
 
         # 打印引擎
-        self._label_engine = QLabel("PDF转换引擎:")
+        self._label_engine = QLabel("PDF转换引擎：")
         gl.addWidget(self._label_engine)
         self._edit_engine = QComboBox()
         self._edit_engine.addItems(["Word", "WPS", "LibreOffice"])
@@ -3407,7 +3279,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._refresh_engine_availability)
 
         # 渲染质量（逐文件）
-        label_dpi = QLabel("DPI:")
+        label_dpi = QLabel("DPI：")
         gl.addWidget(label_dpi)
         self._edit_dpi = QComboBox()
         self._edit_dpi.addItems(["跟随全局(默认)", "高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
@@ -3416,7 +3288,7 @@ class MainWindow(QMainWindow):
         gl.addWidget(self._edit_dpi)
 
         # 图片方向（仅图片文件可用）：auto=自动 / landscape=横向 / portrait=竖向
-        self._label_img_orientation = QLabel("图片方向:")
+        self._label_img_orientation = QLabel("图片方向：")
         gl.addWidget(self._label_img_orientation)
         self._edit_img_orientation = QComboBox()
         self._edit_img_orientation.addItems(["自动方向", "横向", "竖向"])
@@ -3505,33 +3377,23 @@ class MainWindow(QMainWindow):
             self._delivery_location_combo.setCurrentIndex(idx)
         self._delivery_location_combo.blockSignals(False)
 
-        self._delivery_percent_spin.blockSignals(True)
-        self._delivery_percent_spin.setValue(
-            self._config.delivery_percentages.get(self._config.delivery_location, 0.0))
-        self._delivery_percent_spin.blockSignals(False)
-
         delivery_on = self._config.delivery_enabled
         self._delivery_location_combo.setEnabled(delivery_on)
-        self._delivery_percent_spin.setEnabled(delivery_on)
+        self._delivery_percent_label.setText(
+            f"{self._config.delivery_percentages.get(self._config.delivery_location, 0.0):.0f}%")
 
         self._urgency_combo.blockSignals(True)
         self._urgency_combo.setCurrentText(self._config.urgency)
         self._urgency_combo.blockSignals(False)
 
-        self._urgency_price_spin.blockSignals(True)
         urgency_price = 0.0 if self._config.urgency == "低" else self._config.urgency_prices.get(self._config.urgency, 0.0)
-        self._urgency_price_spin.setValue(urgency_price)
-        self._urgency_price_spin.setEnabled(self._config.urgency != "低")
-        self._urgency_price_spin.blockSignals(False)
+        self._urgency_price_label.setText(f"{urgency_price:.2f} 元")
 
         self._cover_page_onoff_combo.blockSignals(True)
         self._cover_page_onoff_combo.setCurrentIndex(1 if self._config.cover_page else 0)
         self._cover_page_onoff_combo.blockSignals(False)
 
-        self._cover_page_price_spin.blockSignals(True)
-        self._cover_page_price_spin.setValue(self._config.cover_page_price)
-        self._cover_page_price_spin.setEnabled(self._config.cover_page)
-        self._cover_page_price_spin.blockSignals(False)
+        self._cover_page_price_label.setText(f"{self._config.cover_page_price:.2f} 元")
 
         self._rebuild_table()
         # 刷新订单号显示（初始加载时 _refresh_tab_display 中 hasattr 跳过了）
@@ -3585,17 +3447,131 @@ class MainWindow(QMainWindow):
         self._log("已刷新打印机列表")
 
     def _on_price_changed(self):
-        """单价/附加服务变更 → 重算当前标签页所有费用并保存。"""
-        self._config.simplex_price = self._simplex_price_spin.value()
-        self._config.duplex_price = self._duplex_price_spin.value()
-        # 首页价格写回当前标签页
-        tab = self._config.tabs.get(self._current_tab)
-        if tab and hasattr(self, '_cover_page_price_spin'):
-            tab.cover_page_price = self._cover_page_price_spin.value()
+        """附加服务开关/选择变更 → 刷新只读价格显示并重算费用（价格本身不可在主界面编辑）。"""
+        self._update_price_labels()
         for row in range(self._table.rowCount()):
             self._recalc_row_cost(row)
         self._update_total_cost()
         self._save_config()
+
+    def _update_price_labels(self):
+        """刷新主界面只读价格标签。价格由 _sync_pricing 从云端 /api/pricing 或本地配置同步，
+        主界面不再提供价格编辑入口（统一在「收支统计 → 设置」维护）。"""
+        if hasattr(self, '_simplex_price_label') and self._simplex_price_label:
+            self._simplex_price_label.setText(f"{self._config.simplex_price:.2f} 元/张")
+        if hasattr(self, '_duplex_price_label') and self._duplex_price_label:
+            self._duplex_price_label.setText(f"{self._config.duplex_price:.2f} 元/张")
+        if hasattr(self, '_delivery_percent_label') and self._delivery_percent_label:
+            loc = self._delivery_location_combo.currentText() if hasattr(self, '_delivery_location_combo') else self._config.delivery_location
+            self._delivery_percent_label.setText(f"{self._config.delivery_percentages.get(loc, 0.0):.0f}%")
+        if hasattr(self, '_urgency_price_label') and self._urgency_price_label:
+            level = self._urgency_combo.currentText() if hasattr(self, '_urgency_combo') else self._config.urgency
+            price = 0.0 if level == "低" else self._config.urgency_prices.get(level, 0.0)
+            self._urgency_price_label.setText(f"{price:.2f} 元")
+        if hasattr(self, '_cover_page_price_label') and self._cover_page_price_label:
+            self._cover_page_price_label.setText(f"{self._config.cover_page_price:.2f} 元")
+
+    def _sync_pricing(self, from_thread: bool = False):
+        """从价格权威源同步打印价格到 self._config（含本地标签页的首页价）。
+
+        - 云端模式（cloud_enabled）：读取服务器 pricing.json（/api/pricing 无需鉴权），
+          小程序/APP 计费显示、后端计价、本地打印首页共用同一份价格。
+        - 本地模式：读取收支统计本地配置 print_data.json 的 config.pricing
+          （在「收支统计 → 设置」中维护）。
+
+        同步失败/字段缺失时保留现有 print_config.json 缓存值，不打断启动。
+        from_thread=True 表示在后台线程调用（如连线同步），仅更新配置并保存，
+        UI 刷新经 _pricingSynced 信号回主线程。"""
+        try:
+            new_pricing: dict | None = None
+            if self._config.cloud_enabled and self._cloud_client and self._cloud_client.api_url:
+                try:
+                    resp = http_requests.get(f"{self._cloud_client.api_url}/api/pricing", timeout=8)
+                    data = resp.json() if resp.ok else {}
+                    if data.get("success") and isinstance(data.get("pricing"), dict):
+                        new_pricing = data["pricing"]
+                except Exception:
+                    pass
+            else:
+                # 本地模式：读收支统计本地配置（价格在「收支统计 → 设置」中维护）
+                local = load_local_data_file()
+                if local and isinstance(local.get("config"), dict):
+                    p = local["config"].get("pricing")
+                    if isinstance(p, dict):
+                        new_pricing = p
+            if not new_pricing:
+                return
+
+            changed = False
+            sp = new_pricing.get("simplex_price")
+            if isinstance(sp, (int, float)) and sp > 0:
+                if abs(self._config.simplex_price - float(sp)) > 1e-9:
+                    changed = True
+                self._config.simplex_price = float(sp)
+            dp = new_pricing.get("duplex_price")
+            if isinstance(dp, (int, float)) and dp > 0:
+                if abs(self._config.duplex_price - float(dp)) > 1e-9:
+                    changed = True
+                self._config.duplex_price = float(dp)
+            cp = new_pricing.get("cover_page_price")
+            if isinstance(cp, (int, float)):
+                if abs(self._config.cover_page_price - float(cp)) > 1e-9:
+                    changed = True
+                self._config.cover_page_price = float(cp)
+            pct_map = new_pricing.get("delivery_percentages")
+            if isinstance(pct_map, dict) and pct_map:
+                clean_pct = {str(k): float(v) for k, v in pct_map.items()}
+                if self._config.delivery_percentages != clean_pct:
+                    changed = True
+                self._config.delivery_percentages = clean_pct
+            up_map = new_pricing.get("urgency_prices")
+            if isinstance(up_map, dict) and up_map:
+                clean_up = {str(k): float(v) for k, v in up_map.items()}
+                # 按业务顺序重排（低→中→高），保证主界面优先级下拉顺序稳定
+                clean_up = {k: clean_up[k] for k in _sort_urgency_keys(list(clean_up.keys()))}
+                if self._config.urgency_prices != clean_up:
+                    changed = True
+                self._config.urgency_prices = clean_up
+            # 本地标签页（无云端订单）的首页价跟随全局价格；云端订单标签页保留任务下发值
+            for tab in self._config.tabs.values():
+                if not any(getattr(j, 'order_id', 0) for j in tab.jobs):
+                    if abs((tab.cover_page_price or 0) - self._config.cover_page_price) > 1e-9:
+                        changed = True
+                        tab.cover_page_price = self._config.cover_page_price
+            if changed:
+                self._save_config()
+            if from_thread:
+                self._pricingSynced.emit()
+            else:
+                self._on_pricing_synced()
+        except Exception as e:
+            logger.debug(f"同步打印价格失败: {e}")
+
+    def _on_pricing_synced(self):
+        """（主线程）价格同步完成后刷新只读价格标签、地点/优先级下拉与标签页显示。"""
+        try:
+            if hasattr(self, '_delivery_location_combo') and self._delivery_location_combo:
+                self._delivery_location_combo.blockSignals(True)
+                self._delivery_location_combo.clear()
+                self._delivery_location_combo.addItems(list(self._config.delivery_percentages.keys()))
+                idx = self._delivery_location_combo.findText(self._config.delivery_location)
+                if idx >= 0:
+                    self._delivery_location_combo.setCurrentIndex(idx)
+                self._delivery_location_combo.blockSignals(False)
+            if hasattr(self, '_urgency_combo') and self._urgency_combo:
+                # 优先级下拉按 低→中→高 重建，尽量保持当前选中
+                new_items = _sort_urgency_keys(list(self._config.urgency_prices.keys()))
+                cur = self._urgency_combo.currentText()
+                if [self._urgency_combo.itemText(i) for i in range(self._urgency_combo.count())] != new_items:
+                    self._urgency_combo.blockSignals(True)
+                    self._urgency_combo.clear()
+                    self._urgency_combo.addItems(new_items)
+                    self._urgency_combo.setCurrentIndex(new_items.index(cur) if cur in new_items else 0)
+                    self._urgency_combo.blockSignals(False)
+            self._update_price_labels()
+            self._refresh_tab_display()
+        except Exception as e:
+            logger.debug(f"刷新价格显示失败: {e}")
 
     def _on_keep_temp_changed(self):
         """保存转换副本设置变更 → 实时同步到 config。"""
@@ -3617,11 +3593,9 @@ class MainWindow(QMainWindow):
         if tab.frozen:
             self._delivery_onoff_combo.setEnabled(False)
             self._delivery_location_combo.setEnabled(False)
-            self._delivery_percent_spin.setEnabled(False)
+            self._delivery_location_combo.setEnabled(False)
             self._urgency_combo.setEnabled(False)
-            self._urgency_price_spin.setEnabled(False)
             self._cover_page_onoff_combo.setEnabled(False)
-            self._cover_page_price_spin.setEnabled(False)
             if hasattr(self, '_owner_combo') and self._owner_combo:
                 self._owner_combo.setEnabled(False)
             if hasattr(self, '_admin_print_check') and self._admin_print_check:
@@ -3632,31 +3606,22 @@ class MainWindow(QMainWindow):
         self._delivery_onoff_combo.setCurrentIndex(1 if tab.delivery_enabled else 0)
         self._delivery_onoff_combo.blockSignals(False)
         self._delivery_location_combo.setEnabled(tab.delivery_enabled)
-        self._delivery_percent_spin.setEnabled(tab.delivery_enabled)
         if tab.delivery_location:
             idx = self._delivery_location_combo.findText(tab.delivery_location)
             if idx >= 0:
                 self._delivery_location_combo.setCurrentIndex(idx)
-        if tab.delivery_enabled:
-            pct = self._config.delivery_percentages.get(tab.delivery_location, 0.0)
-            self._delivery_percent_spin.blockSignals(True)
-            self._delivery_percent_spin.setValue(pct)
-            self._delivery_percent_spin.blockSignals(False)
+        pct = self._config.delivery_percentages.get(tab.delivery_location, 0.0)
+        self._delivery_percent_label.setText(f"{pct:.0f}%")
         self._urgency_combo.blockSignals(True)
         self._urgency_combo.setCurrentText(tab.urgency)
         self._urgency_combo.blockSignals(False)
         is_low = (tab.urgency == "低")
-        self._urgency_price_spin.setEnabled(not is_low)
-        self._urgency_price_spin.blockSignals(True)
-        self._urgency_price_spin.setValue(0.0 if is_low else self._config.urgency_prices.get(tab.urgency, 0.0))
-        self._urgency_price_spin.blockSignals(False)
+        self._urgency_price_label.setText(
+            f"{0.0 if is_low else self._config.urgency_prices.get(tab.urgency, 0.0):.2f} 元")
         self._cover_page_onoff_combo.blockSignals(True)
         self._cover_page_onoff_combo.setCurrentIndex(1 if tab.cover_page else 0)
         self._cover_page_onoff_combo.blockSignals(False)
-        self._cover_page_price_spin.setEnabled(tab.cover_page)
-        self._cover_page_price_spin.blockSignals(True)
-        self._cover_page_price_spin.setValue(tab.cover_page_price)
-        self._cover_page_price_spin.blockSignals(False)
+        self._cover_page_price_label.setText(f"{tab.cover_page_price:.2f} 元")
         # 订单归属（v24）：归属管理员下拉 + 管理员自行打印勾选
         if hasattr(self, '_owner_combo') and self._owner_combo:
             self._owner_combo.setEnabled(True)
@@ -3866,13 +3831,6 @@ class MainWindow(QMainWindow):
         if tab:
             tab.delivery_enabled = enabled
         self._delivery_location_combo.setEnabled(enabled)
-        self._delivery_percent_spin.setEnabled(enabled)
-        if enabled:
-            loc = self._delivery_location_combo.currentText()
-            pct = self._config.delivery_percentages.get(loc, 0.0)
-            self._delivery_percent_spin.blockSignals(True)
-            self._delivery_percent_spin.setValue(pct)
-            self._delivery_percent_spin.blockSignals(False)
         self._save_config()
         self._on_price_changed()
 
@@ -3884,12 +3842,11 @@ class MainWindow(QMainWindow):
         tab = self._config.tabs.get(self._current_tab)
         if tab:
             tab.cover_page = enabled
-        self._cover_page_price_spin.setEnabled(enabled)
         self._save_config()
         self._on_price_changed()
 
     def _on_delivery_location_changed(self):
-        """派送地点变更 → 更新百分比 spinbox 并写入当前标签页。"""
+        """派送地点变更 → 更新只读百分比显示并写入当前标签页。"""
         if self._is_current_tab_frozen():
             return
         loc = self._delivery_location_combo.currentText()
@@ -3897,21 +3854,12 @@ class MainWindow(QMainWindow):
         if tab:
             tab.delivery_location = loc
         pct = self._config.delivery_percentages.get(loc, 0.0)
-        self._delivery_percent_spin.blockSignals(True)
-        self._delivery_percent_spin.setValue(pct)
-        self._delivery_percent_spin.blockSignals(False)
-        self._save_config()
-        self._on_price_changed()
-
-    def _on_delivery_percent_changed(self):
-        """派送百分比编辑 → 回写全局百分比表（所有标签页共享）。"""
-        loc = self._delivery_location_combo.currentText()
-        self._config.delivery_percentages[loc] = self._delivery_percent_spin.value()
+        self._delivery_percent_label.setText(f"{pct:.0f}%")
         self._save_config()
         self._on_price_changed()
 
     def _on_urgency_changed(self):
-        """优先级变更 → 写入当前标签页。"低"时锁定为 0.00 并禁用。"""
+        """优先级变更 → 写入当前标签页。"低"时价格显示 0.00。"""
         if self._is_current_tab_frozen():
             return
         level = self._urgency_combo.currentText()
@@ -3919,18 +3867,8 @@ class MainWindow(QMainWindow):
         if tab:
             tab.urgency = level
         is_low = (level == "低")
-        self._urgency_price_spin.setEnabled(not is_low)
         price = 0.0 if is_low else self._config.urgency_prices.get(level, 0.0)
-        self._urgency_price_spin.blockSignals(True)
-        self._urgency_price_spin.setValue(price)
-        self._urgency_price_spin.blockSignals(False)
-        self._save_config()
-        self._on_price_changed()
-
-    def _on_urgency_price_changed(self):
-        """紧急价格编辑 → 回写全局紧急价格表。"""
-        level = self._urgency_combo.currentText()
-        self._config.urgency_prices[level] = self._urgency_price_spin.value()
+        self._urgency_price_label.setText(f"{price:.2f} 元")
         self._save_config()
         self._on_price_changed()
 
@@ -3941,21 +3879,19 @@ class MainWindow(QMainWindow):
 
         self._config.keep_temp_pdf = (self._keep_temp_check.currentIndex() == 1)
 
-        self._config.simplex_price = self._simplex_price_spin.value()
-        self._config.duplex_price = self._duplex_price_spin.value()
-
+        # 价格（单双面/派送百分比/加急/首页费）统一在「收支统计 → 设置」维护，
+        # 由 _sync_pricing 同步到 self._config，主界面不提供价格编辑入口。
         dpi_values = [200, 300, 400, 600]
         idx = self._render_dpi_combo.currentIndex()
         self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
 
         self._config.last_dir = self._last_dir
 
-        # 附加服务
+        # 附加服务（订单属性选择，价格本身不在此编辑）
         self._config.delivery_enabled = (self._delivery_onoff_combo.currentIndex() == 1)
         self._config.delivery_location = self._delivery_location_combo.currentText()
         self._config.urgency = self._urgency_combo.currentText()
         self._config.cover_page = (self._cover_page_onoff_combo.currentIndex() == 1)
-        self._config.cover_page_price = self._cover_page_price_spin.value()
 
         # jobs 已通过表格实时维护并保存到 tabs 中
 
@@ -4393,30 +4329,6 @@ class MainWindow(QMainWindow):
                                     "支持格式: PDF, Word(.doc/.docx), "
                                     "文本(.txt/.md), 图片(.jpg/.png/.bmp等)")
 
-    def _on_manage_locations(self):
-        """打开地点管理对话框。"""
-        dlg = LocationManagerDialog(self._config.delivery_percentages, self)
-        if dlg.exec() == QDialog.Accepted:
-            new_locs = dlg.get_locations()
-            self._config.delivery_percentages = new_locs
-            # 如果当前选中的地点已被删除，改为第一个
-            if self._config.delivery_location not in new_locs:
-                self._config.delivery_location = next(iter(new_locs))
-            # 刷新地点下拉框
-            self._delivery_location_combo.blockSignals(True)
-            self._delivery_location_combo.clear()
-            self._delivery_location_combo.addItems(list(new_locs.keys()))
-            idx = self._delivery_location_combo.findText(self._config.delivery_location)
-            if idx >= 0:
-                self._delivery_location_combo.setCurrentIndex(idx)
-            self._delivery_location_combo.blockSignals(False)
-            # 更新百分比显示
-            pct = new_locs.get(self._config.delivery_location, 0.0)
-            self._delivery_percent_spin.blockSignals(True)
-            self._delivery_percent_spin.setValue(pct)
-            self._delivery_percent_spin.blockSignals(False)
-            self._on_price_changed()
-
     def _on_add_files(self):
         """通过文件对话框添加文件。"""
         file_filter = (
@@ -4835,7 +4747,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.1.2</h3>"
+            "<h3>HN 本地打印工具 v4.2.0</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -5004,7 +4916,7 @@ class MainWindow(QMainWindow):
             "<table cellspacing='8'>"
             "<tr><td><b>Ctrl+C</b></td><td>复制合计金额</td></tr>"
             "<tr><td><b>Ctrl+Shift+C</b></td><td>复制计费明细</td></tr>"
-            "<tr><td><b>Delete</b> / <b>Ctrl+D</b></td><td>删除选中任务</td></tr>"
+            "<tr><td><b>Delete</b> / <b>Ctrl+D</b></td><td>删除选中文件</td></tr>"
             "<tr><td><b>Ctrl+V</b></td><td>粘贴文件</td></tr>"
             "</table>"
         )
@@ -5588,6 +5500,11 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     logger.debug(f"清理本地订单库失败: {e}")
         finally:
+            # 价格同步（云端模式以服务器 pricing.json 为权威，连线后拉最新）
+            try:
+                self._sync_pricing(from_thread=True)
+            except Exception:
+                pass
             # 成员归属下拉刷新回主线程执行（幂等：已刷过一次也无妨）
             self._ownerComboRefreshed.emit()
 

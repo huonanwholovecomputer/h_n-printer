@@ -1316,19 +1316,35 @@ def generate_order_number():
 
 def calculate_price(page_count, duplex, page_range=""):
     """根据有效打印页数（范围过滤后）和双面模式计算价格（单份文件，不含份数倍率）。
-    单面打印: 0.2 元/页
-    双面打印: 0.3 元/张（每张纸可印两页，奇数页最后一张按单面 0.2 元计费）
+    单面打印: simplex_price 元/页（默认 0.2）
+    双面打印: duplex_price 元/张（默认 0.3，每张纸可印两页，奇数页最后一张按单面价计费）
+    价格来源 pricing.json（与 /api/pricing、前端计费显示、本地打印工具一致，
+    在「收支统计 → 设置」中统一维护）；读取失败回退默认 0.2/0.3。
     page_range 为空 → 按整份页数计。"""
     if page_count <= 0:
         return 0.0
+    simplex_price, duplex_price = _load_paper_prices()
     effective = _count_pages_in_range(page_range or "", page_count)
     if duplex == "on":
         sheets = math.ceil(effective / 2)
         odd_pages = effective % 2
-        price = (sheets - odd_pages) * 0.3 + odd_pages * 0.2
+        price = (sheets - odd_pages) * duplex_price + odd_pages * simplex_price
     else:
-        price = effective * 0.2
+        price = effective * simplex_price
     return round(price, 2)
+
+
+def _load_paper_prices() -> tuple[float, float]:
+    """读取 pricing.json 的单双面价格，失败/非法回退默认 0.2/0.3。"""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing.json")
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        sp = float(cfg.get("simplex_price", 0.2) or 0.2)
+        dp = float(cfg.get("duplex_price", 0.3) or 0.3)
+        return (sp if sp > 0 else 0.2), (dp if dp > 0 else 0.3)
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return 0.2, 0.3
 
 
 # ==================== 订单状态聚合 ====================
@@ -3003,6 +3019,84 @@ def get_pricing():
         return jsonify({"success": False, "message": f"定价配置不可用: {e}"}), 500
 
 
+@app.route("/api/pricing", methods=["POST"])
+def save_pricing():
+    """更新打印定价配置（pricing.json，需 printer token 认证）。
+    价格权威源：小程序/APP 计费显示、后端订单计价（calculate_price / submit_order）、
+    本地打印工具打印首页全部从 pricing.json 读取，因此统一在此处维护。
+    body: { "pricing": { ...完整 pricing.json 结构... } }（兼容直接传 pricing 对象）
+    """
+    token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    data = request.get_json(silent=True) or {}
+    payload = data.get("pricing", data)
+    if not isinstance(payload, dict):
+        return jsonify({"success": False, "message": "缺少 pricing"}), 400
+
+    pricing_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing.json")
+    # 读取现有配置作为缺失字段的兜底（允许部分更新）
+    try:
+        with open(pricing_path, "r", encoding="utf-8") as f:
+            current = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        current = {}
+
+    merged = dict(current)
+
+    # P1-4：边界钳制 + 类型校验，非法值直接 400 拒绝（不写盘）。
+    # 选择性合并：标量字段按 payload 覆盖；delivery_percentages / urgency_prices 为空 dict
+    # 时视为未修改（保留现有），防御前端误传空表清空服务器配置。
+    try:
+        for _k in ("simplex_price", "duplex_price", "cover_page_price", "pickup_address"):
+            if _k in payload:
+                merged[_k] = payload[_k]
+        merged["simplex_price"] = max(0.01, min(99.99, float(merged.get("simplex_price", 0.2))))
+        merged["duplex_price"] = max(0.01, min(99.99, float(merged.get("duplex_price", 0.3))))
+        merged["cover_page_price"] = max(0.0, min(99.99, float(merged.get("cover_page_price", 0.1))))
+        merged["pickup_address"] = str(merged.get("pickup_address", "") or "")[:100]
+        dp = payload.get("delivery_percentages")
+        if dp is not None and not isinstance(dp, dict):
+            return jsonify({"success": False, "message": "delivery_percentages 格式不正确"}), 400
+        if dp:
+            merged["delivery_percentages"] = {
+                str(k): max(0.0, min(100.0, float(v))) for k, v in dp.items()
+            }
+        merged["delivery_locations"] = [str(x) for x in (merged.get("delivery_locations") or list(merged.get("delivery_percentages", {}).keys()))]
+        up = payload.get("urgency_prices")
+        if up is not None and not isinstance(up, dict):
+            return jsonify({"success": False, "message": "urgency_prices 格式不正确"}), 400
+        if up:
+            ordered_up = {str(k): max(0.0, min(99.99, float(v))) for k, v in up.items()}
+            # 按档位业务顺序重排（低→中→高），未知档位按原顺序追加在后
+            sorted_up = {lvl: ordered_up[lvl] for lvl in ("低", "中", "高") if lvl in ordered_up}
+            for _k, _v in ordered_up.items():
+                if _k not in sorted_up:
+                    sorted_up[_k] = _v
+            merged["urgency_prices"] = sorted_up
+        merged["urgency_levels"] = [str(x) for x in (merged.get("urgency_levels") or list(merged.get("urgency_prices", {}).keys()))]
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "定价参数格式不正确"}), 400
+
+    # 原子写盘：先写临时文件再替换，避免进程中断留下半个 pricing.json
+    tmp_path = pricing_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, pricing_path)
+    except OSError:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return jsonify({"success": False, "message": "定价配置写入失败"}), 500
+
+    print(f"定价配置已更新: 单面={merged['simplex_price']} 双面={merged['duplex_price']} "
+          f"首页费={merged['cover_page_price']} 派送地点={len(merged['delivery_percentages'])} 个")
+    return jsonify({"success": True, "message": "定价配置已更新", "pricing": merged})
+
+
 @app.route("/api/file_page/<file_id>", methods=["GET"])
 @login_required
 def get_file_page(file_id):
@@ -3292,11 +3386,17 @@ def bind_key_redeem():
     dev_openid = g.openid
     conn = get_user_db()
 
-    # 设备账号不可重复绑定
+    # 设备账号不可重复绑定（users.bound_openid 或 bind_keys 历史记录任一命中即已绑定；
+    # 兼容早期 bug 只把绑定写入 bind_keys 的脏数据，避免重复绑定产生多条 used 记录）
     dev_row = conn.execute(
         "SELECT bound_openid FROM users WHERE openid = ?", (dev_openid,)
     ).fetchone()
     if dev_row and dev_row["bound_openid"]:
+        conn.close()
+        return jsonify({"success": False, "message": "该设备已绑定微信账号，请先解绑"}), 400
+    if conn.execute(
+        "SELECT id FROM bind_keys WHERE used_by = ? AND status = 'used'", (dev_openid,)
+    ).fetchone():
         conn.close()
         return jsonify({"success": False, "message": "该设备已绑定微信账号，请先解绑"}), 400
 
@@ -3323,10 +3423,23 @@ def bind_key_redeem():
     ).fetchone()
     wx_openid = key_row["created_by"] if key_row else ""
 
-    # 写入绑定关系
+    # 写入绑定关系。注意 /api/device_login 是惰性注册：设备从未兑换授权密钥/更新资料时，
+    # users 表没有该 dev 账号的行，直接 UPDATE 会静默影响 0 行——绑定关系只落在 bind_keys，
+    # 导致解绑/重命名时查 users.bound_openid 为空、报"该设备未绑定微信账号"。
+    # 因此先补齐 users 行，再写 bound_openid。
+    if not conn.execute(
+        "SELECT openid FROM users WHERE openid = ?", (dev_openid,)
+    ).fetchone():
+        dev_nickname = "device_" + ''.join(
+            secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8)
+        )
+        conn.execute(
+            "INSERT INTO users (openid, nickname, avatar_path, updated_at) VALUES (?, ?, '', ?)",
+            (dev_openid, dev_nickname, now_str),
+        )
     conn.execute(
-        "UPDATE users SET bound_openid = ? WHERE openid = ?",
-        (wx_openid, dev_openid),
+        "UPDATE users SET bound_openid = ?, updated_at = ? WHERE openid = ?",
+        (wx_openid, now_str, dev_openid),
     )
     conn.commit()
     conn.close()
@@ -3419,16 +3532,35 @@ def bind_rename():
         "SELECT bound_openid FROM users WHERE openid = ?", (dev_openid,)
     ).fetchone()
     if not row or not row["bound_openid"]:
-        conn.close()
-        return jsonify({"success": False, "message": "该设备未绑定微信账号"}), 404
-    if g.openid != row["bound_openid"]:
+        # 兜底：兼容早期绑定只写入 bind_keys 的脏数据（users 行缺失或 bound_openid 为空），
+        # 与解绑逻辑一致，以 bind_keys 中 status='used' 的记录作为绑定关系判据。
+        bk = conn.execute(
+            "SELECT created_by FROM bind_keys WHERE used_by = ? AND status = 'used' "
+            "ORDER BY used_at DESC LIMIT 1",
+            (dev_openid,),
+        ).fetchone()
+        if not bk:
+            conn.close()
+            return jsonify({"success": False, "message": "该设备未绑定微信账号"}), 404
+        bound_wx = bk["created_by"]
+    else:
+        bound_wx = row["bound_openid"]
+    if g.openid != bound_wx:
         conn.close()
         return jsonify({"success": False, "message": "仅账号本人可重命名"}), 403
 
-    conn.execute(
-        "UPDATE users SET nickname = ?, updated_at = ? WHERE openid = ?",
-        (nickname, now_str, dev_openid),
-    )
+    # 写入昵称；设备从未建号时先补齐 users 行（bound_openid 一并写入，保持两处绑定关系一致）
+    if not row:
+        conn.execute(
+            "INSERT INTO users (openid, nickname, avatar_path, bound_openid, updated_at) "
+            "VALUES (?, ?, '', ?, ?)",
+            (dev_openid, nickname, bound_wx, now_str),
+        )
+    else:
+        conn.execute(
+            "UPDATE users SET nickname = ?, updated_at = ? WHERE openid = ?",
+            (nickname, now_str, dev_openid),
+        )
     conn.commit()
     conn.close()
 
@@ -3452,10 +3584,20 @@ def bind_revoke():
         "SELECT bound_openid FROM users WHERE openid = ?", (dev_openid,)
     ).fetchone()
     if not row or not row["bound_openid"]:
-        conn.close()
-        return jsonify({"success": False, "message": "该设备未绑定微信账号"}), 404
-
-    wx_openid = row["bound_openid"]
+        # 兜底：兼容早期绑定只写入 bind_keys 的脏数据（设备从未建号，或建号晚于绑定导致
+        # users.bound_openid 为空），以 bind_keys 中 status='used' 的记录作为绑定关系判据，
+        # 保证已绑定设备始终可解绑。
+        bk = conn.execute(
+            "SELECT created_by FROM bind_keys WHERE used_by = ? AND status = 'used' "
+            "ORDER BY used_at DESC LIMIT 1",
+            (dev_openid,),
+        ).fetchone()
+        if not bk:
+            conn.close()
+            return jsonify({"success": False, "message": "该设备未绑定微信账号"}), 404
+        wx_openid = bk["created_by"]
+    else:
+        wx_openid = row["bound_openid"]
     if g.openid != wx_openid:
         conn.close()
         return jsonify({"success": False, "message": "仅账号本人可解除绑定"}), 403
@@ -6080,93 +6222,16 @@ def admin_statistics_revenue():
     status_placeholders = ",".join("?" for _ in allowed_statuses)
     params = [start_date + " 00:00:00", end_date + " 23:59:59"] + allowed_statuses
 
-    # ── 汇总：按 source 分组统计收益和数量 ──
-    # v5.1：自打订单（is_admin_print=1，管理员自行打印）不计入收益金额，
-    #       其打印量（订单/文件/页数）仍计入运营维度。
-    summary_rows = conn.execute(
-        f"""SELECT o.source,
-                   COUNT(DISTINCT o.id) AS order_count,
-                   COUNT(of.id) AS file_count,
-                   SUM(of.page_count * of.copies) AS total_pages,
-                   SUM(CASE WHEN of.status = 'sent' AND o.is_admin_print = 0 THEN of.total_price ELSE 0 END) AS revenue,
-                   SUM(CASE WHEN o.is_admin_print = 0 THEN of.total_price ELSE 0 END) AS total_price_all
-            FROM orders o
-            INNER JOIN order_files of ON o.id = of.order_id
-            WHERE o.created_at >= ? AND o.created_at <= ?
-              AND of.status IN ({status_placeholders})
-            GROUP BY o.source""",
-        params,
-    ).fetchall()
-
+    # ── 汇总 / 按用户分组在订单明细构建后由 Python 统一聚合 ──
+    # 金额口径 = 文件费（按子任务状态归入已入账/应收未收）+ 订单级附加服务费
+    # （派送/加急/首页费，按订单有效文件状态归入）。自打订单金额不计。
     revenue_summary = {"total": 0.0,
                        "wechat": 0.0, "app": 0.0, "local": 0.0,
                        "wechat_orders": 0, "app_orders": 0, "local_orders": 0,
                        "wechat_files": 0, "app_files": 0, "local_files": 0,
                        "total_pages": 0,
                        "wechat_pages": 0, "app_pages": 0, "local_pages": 0}
-    for row in summary_rows:
-        src = row["source"] or "wechat"
-        if src not in ("wechat", "app", "local"):
-            src = "wechat"
-        rev = round(row["revenue"] or 0.0, 2)
-        revenue_summary["total"] += rev
-        revenue_summary[src] = rev
-        revenue_summary[f"{src}_orders"] = row["order_count"] or 0
-        revenue_summary[f"{src}_files"] = row["file_count"] or 0
-        revenue_summary[f"{src}_pages"] = row["total_pages"] or 0
-        revenue_summary["total_pages"] += (row["total_pages"] or 0)
-    revenue_summary["total"] = round(revenue_summary["total"], 2)
-
-    # ── 按用户分组（仅云端订单，排除 openid='local'；v5.1 自打订单同样不计收益） ──
-    by_user_rows = conn.execute(
-        f"""SELECT o.openid,
-                   COUNT(DISTINCT o.id) AS order_count,
-                   COUNT(of.id) AS file_count,
-                   SUM(of.page_count * of.copies) AS total_pages,
-                   SUM(CASE WHEN of.status = 'sent' AND o.is_admin_print = 0 THEN of.total_price ELSE 0 END) AS revenue,
-                   COUNT(DISTINCT CASE WHEN o.source = 'wechat' THEN o.id END) AS wechat_orders,
-                   COUNT(DISTINCT CASE WHEN o.source = 'app' THEN o.id END) AS app_orders
-            FROM orders o
-            INNER JOIN order_files of ON o.id = of.order_id
-            WHERE o.created_at >= ? AND o.created_at <= ?
-              AND o.openid != 'local'
-              AND of.status IN ({status_placeholders})
-            GROUP BY o.openid
-            ORDER BY revenue DESC""",
-        params,
-    ).fetchall()
-
-    # 批量查询用户昵称和头像
-    user_openids = [r["openid"] for r in by_user_rows]
-    user_profiles = {}
-    if user_openids:
-        user_conn = get_user_db()
-        placeholders = ",".join("?" for _ in user_openids)
-        prof_rows = user_conn.execute(
-            f"SELECT openid, nickname, avatar_path FROM users WHERE openid IN ({placeholders})",
-            user_openids,
-        ).fetchall()
-        for pr in prof_rows:
-            user_profiles[pr["openid"]] = {
-                "nickname": pr["nickname"] or "",
-                "avatar_url": get_avatar_url(pr["openid"], pr["avatar_path"] or ""),
-            }
-        user_conn.close()
-
     by_user = []
-    for row in by_user_rows:
-        prof = user_profiles.get(row["openid"], {})
-        by_user.append({
-            "openid": row["openid"],
-            "nickname": prof.get("nickname", ""),
-            "avatar_url": prof.get("avatar_url", ""),
-            "revenue": round(row["revenue"] or 0.0, 2),
-            "order_count": row["order_count"] or 0,
-            "wechat_orders": row["wechat_orders"] or 0,
-            "app_orders": row["app_orders"] or 0,
-            "file_count": row["file_count"] or 0,
-            "total_pages": row["total_pages"] or 0,
-        })
 
     # ── 订单明细（时间倒序） ──
     # v25 重构：LEFT JOIN 保留无子任务的订单（如本地放弃单），子任务状态条件移入 ON；
@@ -6219,6 +6284,18 @@ def admin_statistics_revenue():
                 "created_at": of_row["created_at"],
             })
 
+    # 全部子任务费用合计（含被排除状态；订单级附加服务费 = 父订单 total_price − 全部子任务费）
+    all_file_sum = {}
+    if order_ids:
+        all_sum_rows = conn.execute(
+            f"""SELECT order_id, SUM(total_price) AS file_sum
+                FROM order_files
+                WHERE order_id IN ({of_placeholders})
+                GROUP BY order_id""",
+            order_ids,
+        ).fetchall()
+        all_file_sum = {r["order_id"]: (r["file_sum"] or 0.0) for r in all_sum_rows}
+
     # 批量查昵称和头像
     all_openids = list(set(r["openid"] for r in order_rows if r["openid"] and r["openid"] != "local"))
     all_profiles = {}
@@ -6258,6 +6335,17 @@ def admin_statistics_revenue():
                 paid_revenue += f["total_price"]
             elif f["status"] not in ("canceled", "abandoned", "rejected", "failed"):
                 receivable += f["total_price"]
+        # 订单级附加服务费（派送/加急/首页费）= 父订单 total_price − 全部子任务费。
+        # 仅当订单存在「有效文件」（非取消/放弃/打回/失败）时计入，且按有效文件状态整体
+        # 归入已入账（全部 sent）/ 应收未收（有未 sent）；自打订单 / 无有效文件（如整单放弃）不计。
+        extra_fee = max(0.0, (row["total_price"] or 0.0) - all_file_sum.get(oid, 0.0))
+        if extra_fee > 0 and not is_self_print and files:
+            active_files = [f for f in files if f["status"] == "sent" or f["status"] not in ("canceled", "abandoned", "rejected", "failed")]
+            if active_files:
+                if all(f["status"] == "sent" for f in active_files):
+                    paid_revenue += extra_fee
+                else:
+                    receivable += extra_fee
         orders.append({
             "order_id": oid,
             "order_number": row["order_number"] or "",
@@ -6288,6 +6376,50 @@ def admin_statistics_revenue():
             "free_files": free_files,
             "files": files,
         })
+
+    # ── 基于订单明细统一聚合：按来源汇总 + 按用户分组 ──
+    # 金额 = 已入账 + 应收未收（v5.17 合并口径，含订单级附加服务费）；自打订单金额已在上方剔除。
+    for o in orders:
+        src = o["source"] if o["source"] in ("wechat", "app", "local") else "wechat"
+        rev = o["revenue"] + o["receivable"]
+        revenue_summary["total"] += rev
+        revenue_summary[src] += rev
+        revenue_summary[f"{src}_orders"] += 1
+        revenue_summary[f"{src}_files"] += o["files_count"]
+        revenue_summary[f"{src}_pages"] += o["total_page_count"]
+        revenue_summary["total_pages"] += o["total_page_count"]
+    for _k in ("total", "wechat", "app", "local"):
+        revenue_summary[_k] = round(revenue_summary[_k], 2)
+
+    by_user_map = {}
+    for o in orders:
+        if not o["openid"] or o["openid"] == "local":
+            continue
+        key = o["openid"]
+        u = by_user_map.get(key)
+        if u is None:
+            u = by_user_map[key] = {
+                "openid": key,
+                "nickname": o["nickname"],
+                "avatar_url": o["avatar_url"],
+                "revenue": 0.0,
+                "order_count": 0,
+                "wechat_orders": 0,
+                "app_orders": 0,
+                "file_count": 0,
+                "total_pages": 0,
+            }
+        u["revenue"] += o["revenue"] + o["receivable"]
+        u["order_count"] += 1
+        if o["source"] == "wechat":
+            u["wechat_orders"] += 1
+        elif o["source"] == "app":
+            u["app_orders"] += 1
+        u["file_count"] += o["files_count"]
+        u["total_pages"] += o["total_page_count"]
+    by_user = sorted(by_user_map.values(), key=lambda u: u["revenue"], reverse=True)
+    for u in by_user:
+        u["revenue"] = round(u["revenue"], 2)
 
     conn.close()
 
