@@ -109,3 +109,4 @@ local_print_tool/finance/print_data.json
 # 界面截图源目录（发布用截图请放入 docs/screenshots/）
 截图展示/
 local_print_tool/build_release.log
+local_print_tool/build_debug.log
