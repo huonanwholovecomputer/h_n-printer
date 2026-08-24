@@ -41,8 +41,15 @@ QMenu::item {
     padding: 6px 28px 6px 12px;
     border-radius: 4px;
 }
+QMenu::item:disabled {
+    color: #6c7086;
+}
 QMenu::item:selected {
     background-color: #45475a;
+}
+QMenu::item:selected:disabled {
+    background-color: transparent;
+    color: #6c7086;
 }
 QMenu::separator {
     height: 1px;

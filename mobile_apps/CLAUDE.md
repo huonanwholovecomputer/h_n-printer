@@ -15,18 +15,19 @@ HN 云打印 — 微信小程序云打印系统，两个组件协作：
 
 ## 后端架构 (`printer-backend/app.py`)
 
-单文件 Flask 应用 (约 5700 行)，核心子系统：
+单文件 Flask 应用 (约 7100 行)，核心子系统：
 
-- **数据库**: SQLite (WAL 模式)，3 张主表 — `files`(MD5去重), `orders`(父订单), `order_files`(子任务，v5引入，支持一单多文件)。`users` 表存头像/昵称/角色。`license_keys` 表存临时许可密钥。
-- **父子订单模型**: `orders` 是聚合容器，`order_files` 是实际打印子任务。每个子任务有独立的 `copies`, `page_range`, `duplex`, `status`。父订单状态通过 `aggregate_order_status()` 从子任务聚合（优先级: failed > printing > queued > sent > canceled）。
-- **任务分发**: 双通道 — ① SocketIO `print_task` 事件实时推送（`push_print_task_to_client`）② HTTP `GET /api/pull_queued_orders` 供客户端主动拉取（`fetch_and_lock_task` 原子取锁防重复）。两种方式都先将子任务标记为 `printing` 再推送/返回。
+- **数据库**: SQLite (WAL 模式)，主表 — `files`(MD5去重), `orders`(父订单), `order_files`(子任务，v5引入，支持一单多文件), `finance_config`(收支清算云端配置)。`users` 表存头像/昵称/角色/`bound_openid`(APP 设备账号绑定微信)。`license_keys` 表存临时许可密钥。
+- **父子订单模型**: `orders` 是聚合容器，`order_files` 是实际打印子任务。每个子任务有独立的 `copies`, `page_range`, `duplex`, `image_orientation`, `status`。父订单状态通过 `aggregate_order_status()` 从子任务聚合（优先级: failed > printing > queued > sent > canceled）。
+- **任务分发**: 双通道 — ① SocketIO `print_task` 事件实时推送（`push_print_task_to_client`）② HTTP `GET /api/pull_queued_orders` 供客户端主动拉取（`fetch_and_lock_task` 原子取锁防重复）。两种方式都先将子任务标记为 `printing` 再推送/返回。**接单唯一接管（2026-11）**：多设备共连时两条通道都只发给「启用接单」的设备——`printer_claim.json` 持久化唯一接管者，`get_active_printer_client()` 判定在线接管者，页数分析/预约下发同样只走接单设备。
+- **设备注册表与授权**: `devices.json` 记录每台设备的 `device_name`/`owner_name`(授权页绑定成员)/首末次在线时间；`GET /api/printer/devices` 展示全部设备（计算机名/在线/所有者/是否接单），`POST /api/printer/claim|release|bind_owner` 管理接管与所有者绑定。推送 payload 附带 `bound_owner_name`（从 `finance_config.memberBindings` 反查下单 openid 的绑定成员），本地工具据此设置订单标签页归属。
 - **角色体系**: `compute_role(openid)` → super_admin / admin / user / guest。admin 创建限时许可密钥(temp 1-10分钟或 admin 永久)，guest 兑换后获得临时 `temp_until`。提交订单时消费临时授权(`temp_until` 清空，关联 `license_keys.order_id`)。
 - **文件存储**: 按扩展名分子目录 (`pdf/`, `docx/`, `png/` 等)，MD5 索引文件 (`uploads/md5_index.json`) 去重。可配置保留时间，APScheduler 定时清理过期文件。
 - **定时任务** (APScheduler): `process_pending_orders`(30s), `check_printing_timeout`(60s), `cleanup_expired_files`(10min), `recover_orphaned_printing_tasks`(2min), `cleanup_expired_license_keys`(10min)。
 - **断线恢复**: 客户端 disconnect 时回滚其名下所有 `printing` 子任务→`queued`。启动/定时扫描回收超过 5 分钟的孤儿 `printing` 任务。
 - **认证**: `login_required` 装饰器验证 Bearer token (itsdangerous 签名, 7天有效)。`require_printer_access` 额外检查非 guest 角色。
 
-关键配置从 `printer-backend/config.py` 加载 (需手动创建，含 WECHAT_APPID/SECRET_KEY/TOKEN/ADMIN_OPENIDS 等)。
+关键配置从 `printer-backend/config.py` 加载 (需手动创建，含 WECHAT_APPID/SECRET_KEY/TOKEN/ADMIN_OPENIDS 等)。`/api/admin/statistics/revenue` 订单明细的 `nickname` 实时查 `users` 表（APP 设备绑定微信后订单 openid 迁移为微信 openid → 昵称即微信昵称，修改昵称自动同步）。
 
 ## 微信小程序 (`h_n_print/`)
 

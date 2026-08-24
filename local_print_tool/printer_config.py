@@ -23,6 +23,9 @@ from typing import Any
 DEFAULT_OWNER_NAME = "张三"                       # 单个订单归属的遗留兜底名
 DEFAULT_OWNER_NAMES = ["张三", "李四"]            # 旧版归属下拉初始占位成员
 PLACEHOLDER_OWNER_NAMES = ("张三", "李四", "王五")  # 占位名集合：清洗旧数据时剔除
+# v5.25：未绑定成员（未在收支统计中绑定）的普通用户云端订单，本地标签页归属固定显示此名。
+# 它不是真实成员（不计入结算/成员账目），仅作为「未绑定顾客订单」的归属标记。
+FALLBACK_OWNER_NAME = "普通用户"
 
 
 @dataclass
@@ -321,6 +324,11 @@ class PrinterConfig:
     cloud_ws_url: str = "wss://your-server.com"     # WebSocket 地址（替换为你自己的服务器）
     cloud_token: str = ""                   # 打印机客户端认证 token
     cloud_auto_accept: bool = False         # 是否自动接受云端任务（false=手动确认）
+    # v5.22：启用接单（多设备共连服务器时，仅启用接单的设备接收订单；同一时间唯一接管者）
+    cloud_take_orders: bool = False         # 是否启用接单（保存后由云端设置对话框同步到后端）
+    # v5.23：本设备所有者（收支清算「授权」页绑定的成员姓名，由后端 printer_state 推送同步缓存）。
+    # 新建标签页时作为默认订单归属者；未绑定/离线时为空串，回退现有「落到第一个成员」逻辑。
+    cloud_owner_name: str = ""
     # ---- 标签页任务（v6+）----
     # 每个标签页独立存储任务列表，key 为 "1", "2", "3" ...
     # 兼容旧格式：如果 JSON 中没有 "tabs" 键但有 "jobs"，自动迁移为 {"1": jobs}
@@ -353,6 +361,8 @@ class PrinterConfig:
             "cloud_ws_url": self.cloud_ws_url,
             "cloud_token": self.cloud_token,
             "cloud_auto_accept": self.cloud_auto_accept,
+            "cloud_take_orders": self.cloud_take_orders,
+            "cloud_owner_name": self.cloud_owner_name,
             # 标签页任务（每标签含独立附加服务设置）
             "tabs": {k: v.to_dict() for k, v in self.tabs.items()},
             "active_tab": self.active_tab,
@@ -405,6 +415,8 @@ class PrinterConfig:
             cloud_ws_url=data.get("cloud_ws_url", "wss://your-server.com"),
             cloud_token=data.get("cloud_token", ""),
             cloud_auto_accept=bool(data.get("cloud_auto_accept", False)),
+            cloud_take_orders=bool(data.get("cloud_take_orders", False)),
+            cloud_owner_name=(data.get("cloud_owner_name") or "").strip(),
             # 标签页任务
             tabs=tabs,
             active_tab=data.get("active_tab", "1"),

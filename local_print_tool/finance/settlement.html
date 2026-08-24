@@ -621,6 +621,7 @@ img, button { -webkit-user-drag: none; }
     <button data-tab="cloud"><span class="ico">📡</span>云端</button>
     <button data-tab="history"><span class="ico">📅</span>历史</button>
     <button data-tab="settings"><span class="ico">⚙️</span>设置</button>
+    <button data-tab="auth"><span class="ico">🔐</span>授权</button>
     <button data-tab="about"><span class="ico">ℹ️</span>关于</button>
   </nav>
 </header>
@@ -631,6 +632,7 @@ img, button { -webkit-user-drag: none; }
   <div class="tab" id="tab-cloud"></div>
   <div class="tab" id="tab-history"></div>
   <div class="tab" id="tab-settings"></div>
+  <div class="tab" id="tab-auth"></div>
   <div class="tab" id="tab-about"></div>
 </main>
 
@@ -687,8 +689,8 @@ var PLACEHOLDER_MEMBER_NAMES = ['张三', '李四', '王五'];
 var DEFAULT_SCORE_CAP = 15;
 var DEFAULT_RATE = 0.05;
 /* 默认密码存储 SHA-256 哈希（'123456' 的 sha256），不存明文 */
-var DEFAULT_PASSWORDS = { score: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', expense: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', income: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', settings: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92' };
-var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', settings: '设置' };
+var DEFAULT_PASSWORDS = { score: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', expense: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', income: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', settings: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', auth: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92' };
+var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', settings: '设置', auth: '设备授权' };
 /* 打印价格默认值（本地模式初始化 / 字段兜底用）。
    云端模式下价格以服务器 pricing.json 为权威（/api/pricing），本常量仅作本地模式默认。 */
 var DEFAULT_PRICING = {
@@ -848,7 +850,7 @@ function mergeStores(localStore, cloudStore) {
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
-var unlocked = { score: false, expense: false, income: false, settings: false };
+var unlocked = { score: false, expense: false, income: false, settings: false, auth: false };
 
 /* ==================== 数据模型 / 迁移 ==================== */
 function migrateConfig(data) {
@@ -861,9 +863,11 @@ function migrateConfig(data) {
   if (!c.passwords) {
     c.passwords = {};
     if (c.scorePassword) c.passwords.score = c.scorePassword;
-    ['score', 'expense', 'income', 'settings'].forEach(function (k) { if (!c.passwords[k]) c.passwords[k] = DEFAULT_PASSWORDS[k]; });
+    ['score', 'expense', 'income', 'settings', 'auth'].forEach(function (k) { if (!c.passwords[k]) c.passwords[k] = DEFAULT_PASSWORDS[k]; });
     delete c.scorePassword;
   }
+  // 兼容旧配置：授权模块密码缺失时补默认（2026-11）
+  if (!c.passwords.auth) c.passwords.auth = DEFAULT_PASSWORDS.auth;
   if (!c.memberBindings) c.memberBindings = [];
   // 打印价格（本地模式存储；云端模式以服务器 pricing.json 为权威，不在 STORE 维护）
   if (!c.pricing || typeof c.pricing !== 'object') {
@@ -1308,6 +1312,7 @@ function switchTab(name) {
   else if (name === 'cloud') { if (FINANCE_MODE === 'local') renderCloud(); else { renderCloud(); ensureCloudMonths(); } }
   else if (name === 'history') renderHistory();
   else if (name === 'settings') renderSettings();
+  else if (name === 'auth') renderAuth();
   else if (name === 'about') renderAbout();
   animateTab(tab);
 }
@@ -1317,9 +1322,10 @@ function renderCurrent() {
   else if (currentTab === 'cloud') renderCloud();
   else if (currentTab === 'history') renderHistory();
   else if (currentTab === 'settings') renderSettings();
+  else if (currentTab === 'auth') renderAuth();
   else if (currentTab === 'about') renderAbout();
 }
-function renderAll() { renderDash(); renderEntry(); renderCloud(); renderHistory(); renderSettings(); renderAbout(); }
+function renderAll() { renderDash(); renderEntry(); renderCloud(); renderHistory(); renderSettings(); renderAuth(); renderAbout(); }
 
 /* ==================== 月份选择器 ==================== */
 function monthSelectHTML(id, selected) {
@@ -2361,7 +2367,11 @@ function _renderOrderListHTML() {
       var mo = o.openid === 'local'
         ? (o.owner_name ? (memberOfName(o.owner_name) || { name: o.owner_name }) : { name: '本地任务' })
         : memberOfOpenid(o.openid);
-      var who = mo ? mo.name : (o.nickname || (o.openid || '').substring(0, 8) + '…');
+      // v5.25：云端订单用户列显示「发起订单用户的昵称」（绑定微信后即微信小程序昵称，
+      // 后端实时查 users 表，修改昵称自动同步）；昵称为空时回退绑定成员名 / openid 缩写
+      var who = o.openid === 'local'
+        ? (mo ? mo.name : '本地任务')
+        : (o.nickname || (mo ? mo.name : (o.openid || '').substring(0, 8) + '…'));
       var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
       // 金额配色：自打订单且已完成（sent）→ 与「自打」标记同色（蓝色主题色 var(--primary)）；
       // 其他状态（放弃/失败等）→ 以该状态的颜色为准
@@ -3595,7 +3605,7 @@ function renderSettings() {
 
   // 密码管理
   h += '<div class="section"><h2>🔐 敏感模块密码</h2>';
-  ['score', 'expense', 'income', 'settings'].forEach(function (k) {
+  ['score', 'expense', 'income', 'settings', 'auth'].forEach(function (k) {
     h += '<div class="settings-row"><label>' + MODULE_NAMES[k] + ' 密码</label>';
     h += '<input type="password" id="pwd-' + k + '" placeholder="输入新密码（至少 4 位）" style="width:200px" autocomplete="new-password">';
     h += '<button class="btn green sm" onclick="updatePassword(\'' + k + '\')">保存</button>';
@@ -3867,6 +3877,124 @@ function manualBind() {
   toast('✅ 已绑定', 'success');
 }
 
+/* ==================== TAB: 授权（2026-11） ====================
+   多设备共连云服务器时的设备授权管理：
+   1. 本设备所有者 —— 从成员列表选择，绑定到后端设备注册表（计算机名 → 成员姓名）；
+   2. 云端设备列表 —— 所有连接过云服务器的设备：计算机名称 / 在线状态 / 所有者 / 是否接单。
+   独立密码保护（密码 key = 'auth'，默认与其它模块一致，可在「设置」中修改）。 */
+function renderAuth() {
+  var el = $('#tab-auth');
+  if (FINANCE_MODE === 'local') {
+    el.innerHTML = '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">🔐</div><h3>授权模块仅云端模式可用</h3><p style="margin-top:6px">当前为本地模式。启用云端功能后，可在本模块绑定本设备所有者，并查看所有连接云服务器的设备。</p></div></div>';
+    return;
+  }
+  if (!unlocked.auth) {
+    el.innerHTML = '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">🔐</div><h3>授权模块已锁定</h3><p style="margin-top:6px">绑定设备所有者、查看在线设备需先解锁授权模块（独立密码）。</p><button class="btn pri" style="margin-top:16px" onclick="unlockFlow(\'auth\',\'设备授权\')">🔑 输入密码解锁</button></div></div>';
+    return;
+  }
+  var members = getMembers();
+  var h = '';
+  h += '<div class="section"><h2>💻 本设备 <span class="hint">（本机信息，来自本地打印工具 · 所有者从成员列表选择）</span></h2>';
+  h += '<div id="auth-local-device" style="color:var(--muted)">加载中…</div></div>';
+  h += '<div class="section"><h2>📡 云端设备列表 <span class="hint">（连接过云服务器的所有设备 · 在线状态实时）</span></h2>';
+  h += '<div id="auth-devices" style="color:var(--muted)">加载中…</div></div>';
+  el.innerHTML = h;
+  loadAuthData(members);
+}
+
+function loadAuthData(members) {
+  // ── 本设备信息 + 所有者绑定（所有者以后端设备注册表为准）──
+  Promise.all([
+    fetch('/api/local/device', { headers: apiHeaders() }).then(function (r) { return r.json(); }),
+    fetch('/api/proxy/printer/devices', { headers: apiHeaders() }).then(function (r) { return r.json(); }).catch(function () { return null; })
+  ]).then(function (results) {
+    var box = $('#auth-local-device');
+    if (!box) return;
+    var dev = results[0] && results[0].device;
+    if (!dev || !dev.client_id) { box.innerHTML = '<span style="color:var(--muted)">无法获取本机设备信息</span>'; return; }
+    // 从后端设备列表反查本机所有者（若列表拉取失败则显示未绑定）
+    // 兼容两种响应形态：顶层 devices（/api/printer/devices）或 data.devices 包装
+    var currentOwner = '';
+    var devList = results[1] && (results[1].devices || (results[1].data && results[1].data.devices));
+    if (Array.isArray(devList)) {
+      devList.forEach(function (d) { if (d.client_id === dev.client_id) currentOwner = d.owner_name || ''; });
+    }
+    var h = '<div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-bottom:10px">';
+    h += '<div><span style="color:var(--muted);font-size:.8rem">计算机名称</span><div style="font-weight:700">' + esc(dev.device_name || dev.client_id) + '</div></div>';
+    h += '<div><span style="color:var(--muted);font-size:.8rem">设备 ID</span><div style="font-family:monospace;font-size:.78rem">' + esc(dev.client_id) + '</div></div>';
+    h += '<div><span style="color:var(--muted);font-size:.8rem">接单状态</span><div>' + (dev.take_orders ? '<span class="tag g">接单中</span>' : '<span class="tag">未接单</span>') + '</div></div>';
+    h += '</div>';
+    h += '<div class="settings-row"><label>本设备所有者</label>';
+    if (!members.length) {
+      h += '<select id="authOwnerSel" disabled><option value="">（暂无成员，请先在「设置」添加）</option></select>';
+    } else {
+      h += '<select id="authOwnerSel">';
+      h += '<option value="">（未绑定）</option>';
+      members.forEach(function (m) { h += '<option value="' + esc(m.name) + '"' + (m.name === currentOwner ? ' selected' : '') + '>' + esc(m.name) + '</option>'; });
+      h += '</select>';
+    }
+    h += '<button class="btn green sm" onclick="saveAuthOwner()">💾 保存</button>';
+    h += '<span style="color:var(--muted);font-size:.78rem">' + (currentOwner ? '当前所有者：' + esc(currentOwner) : '未绑定所有者') + '</span>';
+    h += '</div>';
+    box.innerHTML = h;
+  }).catch(function () { var b = $('#auth-local-device'); if (b) b.innerHTML = '<span style="color:var(--muted)">本机信息获取失败</span>'; });
+
+  // ── 云端设备列表（经 stats_server 代理，携带打印机 token）──
+  fetch('/api/proxy/printer/devices', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      var box = $('#auth-devices');
+      if (!box) return;
+      if (!res || !res.success) {
+        box.innerHTML = '<span style="color:var(--muted)">' + esc((res && res.message) || '设备列表获取失败（云端未连接？）') + '</span>';
+        return;
+      }
+      var list = res.devices || (res.data && res.data.devices) || [];
+      if (!list.length) {
+        box.innerHTML = '<span style="color:var(--muted)">暂无设备记录（本地打印工具连接云端后自动登记）</span>';
+        return;
+      }
+      var h = '<div class="table-wrap"><table><thead><tr><th class="l">计算机名称</th><th>在线状态</th><th>所有者</th><th>接单</th></tr></thead><tbody>';
+      list.forEach(function (d) {
+        h += '<tr><td class="l">' + esc(d.device_name) +
+             '<div style="font-family:monospace;font-size:.72rem;color:var(--muted)">' + esc(d.client_id) + '</div></td>';
+        h += '<td>' + (d.online ? '<span class="tag g">🟢 在线</span>' : '<span class="tag">⚫ 离线</span>') + '</td>';
+        h += '<td>' + (d.owner_name ? esc(d.owner_name) : '<span style="color:var(--muted)">未绑定</span>') + '</td>';
+        h += '<td>' + (d.is_active ? '<span class="tag g">接单中</span>' : '<span style="color:var(--muted)">—</span>') + '</td></tr>';
+      });
+      h += '</tbody></table></div>';
+      h += '<div style="margin-top:10px"><button class="btn sm" onclick="loadAuthData(getMembers())">🔄 刷新</button><span style="color:var(--muted);font-size:.78rem;margin-left:10px">每 15 秒自动刷新</span></div>';
+      box.innerHTML = h;
+    })
+    .catch(function () { var b = $('#auth-devices'); if (b) b.innerHTML = '<span style="color:var(--muted)">设备列表获取失败</span>'; });
+}
+
+function saveAuthOwner() {
+  var sel = $('#authOwnerSel');
+  if (!sel) { toast('请先在「设置」中添加成员', 'error'); return; }
+  var owner = sel.value.trim();
+  fetch('/api/local/device', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      var dev = res && res.device;
+      if (!dev || !dev.client_id) { toast('无法获取本机设备 ID', 'error'); return null; }
+      return fetch('/api/proxy/printer/bind_owner', {
+        method: 'POST', headers: apiHeaders(),
+        body: JSON.stringify({ client_id: dev.client_id, owner_name: owner })
+      }).then(function (r) { return r.json(); });
+    })
+    .then(function (res) {
+      if (!res) return;
+      if (res && res.success) { toast('✅ 本设备所有者已保存', 'success'); loadAuthData(getMembers()); }
+      else toast('❌ ' + ((res && res.message) || '保存失败'), 'error');
+    })
+    .catch(function () { toast('❌ 网络错误', 'error'); });
+}
+/* 授权页设备列表自动刷新（仅当前处于授权页且已解锁时执行，避免后台空转） */
+setInterval(function () {
+  if (currentTab === 'auth' && unlocked.auth && FINANCE_MODE !== 'local') loadAuthData(getMembers());
+}, 15000);
+
 /* ==================== TAB: 关于 ==================== */
 function renderAbout() {
   var el = $('#tab-about');
@@ -3874,7 +4002,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.21</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.22</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -3901,6 +4029,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.19：云端页精简 —— 移除订单漏斗与成员排行榜；「管理员订单统计」与「成员收益明细」合并精简为「🧾 成员订单数量统计」（编号 / 成员 / 免费打印 / 订单总数四列，管理员与普通用户统一口径，不再请求后端 owners 统计）。</p>' +
     '<p style="margin-top:10px">v5.20：统一口径栏 —— 顶部新增全局口径栏（时间 / 成员 / 来源），单选决定「看哪些数据」，指标 / 视角 / 状态 / 分页等「怎么展示」控件留在模块内部；KPI、趋势、图表、订单明细共用同一份筛选数据；「成员账目」合并展示（成员 / 免费打印 / 订单/云端收益记录 / 手动代收 / 差额），来源筛选不影响对账列，上月环比徽标（自然月口径）。</p>' +
     '<p style="margin-top:10px">v5.21：打印价格统一管理 + 收益口径修正 —— 设置页新增「打印价格」区块（单双面价 / 派送地点百分比 / 优先级加急价 / 首页费：云端模式写服务器 pricing.json 全端生效，本地模式存 print_data.json；支持添加 / 删除派送地点，密码保护）；收益统计计入订单级附加服务费（派送 / 加急 / 首页，按订单有效文件状态归入已入账或应收未收，放弃 / 取消 / 打回 / 失败订单不计）；订单明细金额配色：自打且已完成订单金额用蓝色与「自打」标记一致；设置页移除「外观」主题板块（右上角主题切换保留）；优先级加急价按 低 → 中 → 高 顺序展示。</p>' +
+    '<p style="margin-top:10px">v5.22：设备授权 + 多设备接单 —— 新增「🔐 授权」标签页（独立密码保护）：① 本设备所有者从成员列表绑定，绑定后本地打印工具新建标签页默认归属该所有者、默认关闭「管理员自行打印」；② 云端设备列表展示所有连接过云服务器的设备（计算机名称 / 在线状态 / 所有者 / 是否接单，每 15 秒自动刷新，绑定后即时广播生效）。多设备共连服务器时仅「启用接单」的设备接收订单（同一时间唯一接管者，被其他设备占用时提示接管者名称与所有者）；订单明细「用户」列改为显示下单用户昵称（绑定微信小程序/APP 后优先微信小程序昵称，修改昵称实时同步）；修复授权页设备列表/所有者刷新被代理过滤的问题。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
@@ -4041,10 +4170,12 @@ function replayOfflinePending() {
   $$('#tabNav button').forEach(function (btn) {
     btn.addEventListener('click', function () { switchTab(this.dataset.tab); });
   });
-  // 本地模式：把「云端」页按钮改名为「本地订单」
+  // 本地模式：把「云端」页按钮改名为「本地订单」；「授权」模块仅云端模式可用 → 隐藏入口
   if (FINANCE_MODE === 'local') {
     var _cloudBtn = document.querySelector('#tabNav button[data-tab="cloud"]');
     if (_cloudBtn) _cloudBtn.innerHTML = '<span class="ico">📡</span>本地订单';
+    var _authBtn = document.querySelector('#tabNav button[data-tab="auth"]');
+    if (_authBtn) _authBtn.style.display = 'none';
   }
   $('#themeToggle').addEventListener('click', cycleThemeMode);
   // 返回顶部：滚动超过 200px 显示，点击平滑回到顶部
@@ -4054,10 +4185,11 @@ function replayOfflinePending() {
   window.addEventListener('scroll', _updateBackToTop, { passive: true });
   _backToTop.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
   $('#blockRetry').addEventListener('click', retryConnect);
-  // 深链：?tab=settings 直接切到「设置」标签（本地打印工具「去添加成员」引导用）
+  // 深链：?tab=settings / ?tab=auth 直接切到对应标签（本地打印工具引导用）
   var _urlTab = null;
   try { _urlTab = new URLSearchParams(window.location.search).get('tab'); } catch (e3) {}
   if (_urlTab === 'settings') switchTab('settings');
+  else if (_urlTab === 'auth') switchTab('auth');
   // 初始为 loading 骨架
   renderAll();
   loadConfig();

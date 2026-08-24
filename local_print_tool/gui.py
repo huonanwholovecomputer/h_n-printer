@@ -74,7 +74,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME
 from converter import get_converter, UniversalConverter
 from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
@@ -1451,7 +1451,7 @@ class MainWindow(QMainWindow):
                     continue  # 已完成订单 → 启动即清理
                 kept_tabs[key] = tab
             if removed_count:
-                self._config.tabs = kept_tabs if kept_tabs else {"1": TabSettings()}
+                self._config.tabs = kept_tabs if kept_tabs else {"1": self._make_new_tab()}
                 if self._config.active_tab not in self._config.tabs:
                     self._config.active_tab = next(iter(self._config.tabs))
                 self._config.save(config_path)
@@ -1460,7 +1460,7 @@ class MainWindow(QMainWindow):
         # ── 标签页系统 ──
         # 确保 tabs 中至少有一个标签
         if not self._config.tabs:
-            self._config.tabs = {"1": TabSettings()}
+            self._config.tabs = {"1": self._make_new_tab()}
         self._current_tab = self._config.active_tab or "1"
         if self._current_tab not in self._config.tabs:
             self._current_tab = next(iter(self._config.tabs.keys()))
@@ -1470,6 +1470,9 @@ class MainWindow(QMainWindow):
         self._processed_cloud_tasks: set[int] = self._load_processed_tasks()
         # 无障碍自动打印：打印机忙时暂存的重试队列（打印完成后自动补打）
         self._auto_print_retry: list[dict] = []
+        # 无障碍后台打印：当前打印批次所属的标签页 key（后台创建时不切换前台；
+        # 打印启动/回报/冻结据此定位标签页，空 = 前台标签页）
+        self._printing_tab_key: str = ""
         # 打印机消失/改名提示只弹一次（避免每次刷新都弹窗）
         self._printer_missing_warned: bool = False
 
@@ -1496,6 +1499,8 @@ class MainWindow(QMainWindow):
         # }
         self._scheduled_orders: dict[int, dict] = {}
         self._cloud_connected: bool = False  # 云端连接状态（预约冻结自恢复判断用）
+        # 接单状态缓存（后端 printer_state 推送）：is_active/active_owner_name/active_device_name
+        self._cloud_printer_state_cache: dict = {}
         # 成员名单刷新防抖：下拉反复 Show（用户快速点开/关闭）不并发叠加请求
         self._owner_refresh_last_ts: float = 0.0
         self._owner_refresh_inflight: bool = False
@@ -1585,6 +1590,10 @@ class MainWindow(QMainWindow):
         self._cloud_client.auth_failed.connect(self._on_cloud_auth_failed)
         self._cloud_client.order_canceled.connect(self._on_cloud_order_canceled)
         self._cloud_client.start_print.connect(self._on_cloud_start_print)
+        # 接单状态（2026-11）：后端推送 → 本机是否接管/接管者是谁；后台线程 → 主线程 UI
+        self._cloud_client.printer_state.connect(self._on_cloud_printer_state)
+        # 接单配置：本机是否启用接单（仅接管者可接收订单；连上后自动向后端续接单）
+        self._cloud_client.take_orders = bool(self._config.cloud_take_orders)
 
         # 连线后后台同步的信号 → 回主线程（日志写入 / 归属下拉刷新 / 标签页显示刷新）
         self._cloudConnSyncLog.connect(self._log)
@@ -1624,12 +1633,20 @@ class MainWindow(QMainWindow):
         云端模式：存云端 finance/config；加载时若本地+云端都有真实数据则弹「合并」同步询问。
         tab 可选：'settings' 深链到「设置」标签（无成员引导用）。"""
         finance_mode = "cloud" if self._config.cloud_enabled else "local"
+        # 2026-11：本机设备信息注入 stats_server，供收支清算「授权」页展示本设备/绑定所有者
+        import socket as _socket
+        device_name = _socket.gethostname()[:64]
+        client_id = self._cloud_client.client_id if self._cloud_client else _get_persistent_client_id()
+        take_orders = bool(self._config.cloud_take_orders)
         # 如果已启动则直接打开，否则先启动
         if self._stats_server is None:
             self._stats_server = StatsServer(
                 api_url=self._config.cloud_api_url,
                 token=self._config.cloud_token,
                 finance_mode=finance_mode,
+                device_name=device_name,
+                client_id=client_id,
+                take_orders=take_orders,
             )
             self._stats_server.start_in_thread()
         else:
@@ -1643,8 +1660,8 @@ class MainWindow(QMainWindow):
         # 附加启动令牌：settlement.html 要求每次启动的随机 token 才能访问；mode 显式传存储模式
         url = (f"{self._stats_server.url}/settlement.html"
                f"?token={self._stats_server.launch_token}&mode={finance_mode}")
-        if isinstance(tab, str) and tab in ("settings",):
-            url += "&tab=settings"
+        if isinstance(tab, str) and tab in ("settings", "auth"):
+            url += f"&tab={tab}"
         mode_txt = "云端收支清算" if finance_mode == "cloud" else "本地收支清算"
         logger.info(f"打开{mode_txt}页面: {self._stats_server.url}")
         QDesktopServices.openUrl(QUrl(url))
@@ -1673,7 +1690,22 @@ class MainWindow(QMainWindow):
         cloud_switch.setChecked(bool(self._config.cloud_enabled))
         layout.addWidget(cloud_switch)
 
-        layout.addSpacing(8)
+        layout.addSpacing(4)
+
+        # 接单开关（2026-11）：多设备共连服务器时，仅启用接单的设备接收订单（唯一接管者）
+        take_orders_switch = ThemedCheckBox("启用接单（接收云端订单）", theme_manager=self._theme_manager)
+        take_orders_switch.setToolTip(
+            "只有开启本选项的设备才能接收小程序/APP 的订单并执行打印。\n"
+            "同一时间仅允许一台设备启用；若已有其他在线设备启用，将提示打印机已被该设备接管，无法启用。")
+        take_orders_switch.setChecked(bool(self._config.cloud_take_orders))
+        layout.addWidget(take_orders_switch)
+        # 当前接管者提示（来自后端 printer_state 推送缓存；后台刷新见下方线程）
+        claim_hint = QLabel("")
+        claim_hint.setWordWrap(True)
+        claim_hint.setStyleSheet("color: #8a8f98; font-size: 12px;")
+        layout.addWidget(claim_hint)
+
+        layout.addSpacing(4)
 
         # API 地址
         layout.addWidget(QLabel("API 地址："))
@@ -1723,6 +1755,46 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(btn_row)
 
+        # 打开时填充当前接管者提示（缓存 + 后台刷新一次，不阻塞对话框）
+        def _fill_claim_hint():
+            st = getattr(self, "_cloud_printer_state_cache", {}) or {}
+            if st.get("is_active"):
+                claim_hint.setText("✅ 本机正在接单（可接收云端订单）")
+            elif st.get("active_client_id"):
+                holder = st.get("active_device_name") or st.get("active_client_id", "")
+                owner = st.get("active_owner_name", "")
+                claim_hint.setText(
+                    f"当前接单设备：{holder}" + (f"（所有者：{owner}）" if owner else "") + "；本机未接单"
+                )
+            else:
+                claim_hint.setText("当前无设备启用接单")
+
+        _fill_claim_hint()
+
+        if self._cloud_client and self._cloud_client.is_connected():
+            def _refresh_claim_hint():
+                try:
+                    data = self._cloud_client.get_printer_devices()
+                    if not data:
+                        return
+                    active_cid = data.get("active_client_id", "")
+                    holder_name, holder_owner = "", ""
+                    for d in data.get("devices", []):
+                        if d.get("client_id") == active_cid:
+                            holder_name = d.get("device_name", "")
+                            holder_owner = d.get("owner_name", "")
+                            break
+                    self._cloud_printer_state_cache = {
+                        "active_client_id": active_cid,
+                        "active_device_name": holder_name,
+                        "active_owner_name": holder_owner,
+                        "is_active": bool(active_cid) and self._cloud_client.client_id == active_cid,
+                    }
+                    QTimer.singleShot(0, _fill_claim_hint)
+                except Exception:
+                    pass
+            threading.Thread(target=_refresh_claim_hint, daemon=True).start()
+
         if dlg.exec() == QDialog.Accepted:
             # 保存配置到内存（云端开关以对话中的勾选为准）
             old_enabled = bool(self._config.cloud_enabled)
@@ -1768,6 +1840,25 @@ class MainWindow(QMainWindow):
                 if self._cloud_client:
                     self._cloud_client.stop()
                 self._update_cloud_status()
+
+            # 接单开关同步后端（唯一接管者，2026-11）：
+            # 启用被拒（已有其他在线设备接管）→ 弹窗提示并保持关闭
+            new_take = bool(take_orders_switch.isChecked()) and bool(cloud_switch.isChecked())
+            if self._config.cloud_enabled and self._config.cloud_token and self._cloud_client:
+                if new_take and not self._config.cloud_take_orders:
+                    ok, msg, _extra = self._cloud_client.claim_printer()
+                    if not ok:
+                        from PySide6.QtWidgets import QMessageBox
+                        QMessageBox.warning(self, "无法启用接单", msg)
+                        new_take = False
+                elif not new_take and self._config.cloud_take_orders:
+                    self._cloud_client.release_printer()
+            if self._config.cloud_take_orders != new_take:
+                self._config.cloud_take_orders = new_take
+                try:
+                    self._config.save(self._config_path)
+                except Exception as e:
+                    logger.warning(f"保存接单配置失败: {e}")
             # 同步 stats_server（收支清算页代理）：若已启动，配置可能仍旧占位地址，
             # 不同步会导致代理请求打到不存在的占位域名 → SSLError（重启后才恢复）。
             if self._stats_server:
@@ -1846,6 +1937,8 @@ class MainWindow(QMainWindow):
         logger.info("开始清空云端缓存数据（关闭云端功能）")
         # 1. 成员名单（归属下拉回到「(无成员)」）
         self._config.admin_names = []
+        # 1.5 本设备所有者缓存清空（转本地模式后不再使用云端绑定）
+        self._config.cloud_owner_name = ""
         # 2. 标签页归属与订单号（保留文件队列与打印设置；订单号下次打印重新分配）
         for tab in self._config.tabs.values():
             tab.owner_name = ""
@@ -1906,7 +1999,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_cloud_status_indicator") and self._cloud_status_indicator:
             # 云端功能启用状态下才存在指示器/按钮（本地模式不创建）
             if connected:
-                self._cloud_status_indicator.setText("☁ 已连接")
+                if self._cloud_client and self._cloud_client.take_orders:
+                    # 接单中（2026-11）：本机为唯一接管者，可接收云端订单
+                    self._cloud_status_indicator.setText("☁ 接单中")
+                else:
+                    self._cloud_status_indicator.setText("☁ 已连接")
                 self._cloud_status_indicator.setObjectName("cloudStatusOn")
                 self._cloud_status_btn.setText("断开云端")
             else:
@@ -2399,7 +2496,7 @@ class MainWindow(QMainWindow):
         """切换标签页。delta: -1 上一页, +1 下一页（若已在最后一页则新建）。"""
         tab_keys = self._sorted_tab_keys(self._config.tabs)
         if not tab_keys:
-            self._config.tabs = {"1": TabSettings()}
+            self._config.tabs = {"1": self._make_new_tab()}
             tab_keys = ["1"]
 
         try:
@@ -2418,7 +2515,7 @@ class MainWindow(QMainWindow):
             # 在最后一页点 + → 新建标签
             last_num = self._safe_int_key(tab_keys[-1]) if tab_keys else 0
             new_key = str(last_num + 1)
-            self._config.tabs[new_key] = TabSettings()
+            self._config.tabs[new_key] = self._make_new_tab()
             self._current_tab = new_key
             self._config.active_tab = new_key
             self._save_config()
@@ -2548,6 +2645,12 @@ class MainWindow(QMainWindow):
     def _get_current_jobs(self) -> list[PrintJob]:
         """返回当前标签页的任务列表。"""
         tab = self._config.tabs.get(self._current_tab)
+        return tab.jobs if tab else []
+
+    def _tab_jobs(self, key: str = "") -> list[PrintJob]:
+        """返回指定标签页的任务列表（key 空 = 当前前台标签页）。
+        2026-12：无障碍后台打印时，转换/打印回调按目标标签页定位，不再依赖前台切换。"""
+        tab = self._config.tabs.get(key or self._current_tab)
         return tab.jobs if tab else []
 
     def _is_current_tab_frozen(self) -> bool:
@@ -2781,7 +2884,7 @@ class MainWindow(QMainWindow):
                     elif job.order_number and "-L" not in job.order_number and self._cloud_client:
                         price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
                         self._cloud_client.abandon_reserved_order(job.order_number, price)
-            self._config.tabs = {"1": TabSettings()}
+            self._config.tabs = {"1": self._make_new_tab()}
             self._current_tab = "1"
             self._config.active_tab = "1"
             self._cleanup_orphan_pdf_cache(all_abandoned)
@@ -3182,17 +3285,20 @@ class MainWindow(QMainWindow):
     def _on_table_context_menu(self, pos):
         """表格右键菜单。"""
         menu = QMenu(self)
+        # 标签页已固定（订单锁定）：除只读操作外一律禁用（删除标签页走标签页管理器）
+        frozen = self._is_current_tab_frozen()
         # 检查是否点击在有效行上
         item = self._table.itemAt(pos)
         if item is not None:
             row = item.row()
             # 选中该行
             self._table.selectRow(row)
-            # 移除选中
+            # 移除选中（标签页已固定时禁用）
             remove_action = menu.addAction("🗑 移除选中")
+            remove_action.setEnabled(not frozen)
             remove_action.triggered.connect(self._on_remove_selected)
             menu.addSeparator()
-            # 打开文件位置
+            # 打开文件位置（只读，始终可用）
             name_item = self._table.item(row, self.COL_FILE)
             if name_item:
                 fp = name_item.data(Qt.UserRole)
@@ -3202,9 +3308,9 @@ class MainWindow(QMainWindow):
                 ))
                 menu.addSeparator()
 
-        # 粘贴
+        # 粘贴（标签页已固定时禁用）
         paste_action = menu.addAction("📋 粘贴")
-        paste_action.setEnabled(self._can_paste_files())
+        paste_action.setEnabled(self._can_paste_files() and not frozen)
         paste_action.triggered.connect(self._on_paste_files)
 
         menu.exec(self._table.viewport().mapToGlobal(pos))
@@ -3585,14 +3691,32 @@ class MainWindow(QMainWindow):
 
     # ---- 附加服务信号处理（每标签页独立）----
 
+    def _is_cloud_order_tab(self, tab=None) -> bool:
+        """当前/指定标签页是否为云端订单标签页（含 order_id>0 的云端任务）。
+        云端订单的属性（归属/自打/附加服务）来自下单方，本地不允许调整（2026-12）。"""
+        if tab is None:
+            tab = self._config.tabs.get(self._current_tab)
+        if not tab:
+            return False
+        return any(getattr(j, 'order_id', 0) > 0 for j in (tab.jobs or []))
+
+    def _is_tab_editable(self, tab=None) -> bool:
+        """标签页的订单属性（归属/自打/附加服务）是否可修改：未冻结 且 非云端订单。"""
+        if tab is None:
+            tab = self._config.tabs.get(self._current_tab)
+        if not tab:
+            return True
+        return not tab.frozen and not self._is_cloud_order_tab(tab)
+
     def _sync_tab_settings_to_ui(self, tab):
-        """将标签页的附加服务设置同步到 UI 控件。"""
+        """将标签页的附加服务设置同步到 UI 控件。
+        冻结 或 云端订单标签页 → 归属/自打/附加服务全部锁定（云端订单属性来自下单方，
+        本地不可调整；普通用户订单的「管理员自行打印」因此固定为灰色）。"""
         if not tab or not hasattr(self, '_delivery_onoff_combo'):
             return
-        # 冻结时禁用所有附加服务控件
-        if tab.frozen:
+        cloud_locked = self._is_cloud_order_tab(tab)
+        if tab.frozen or cloud_locked:
             self._delivery_onoff_combo.setEnabled(False)
-            self._delivery_location_combo.setEnabled(False)
             self._delivery_location_combo.setEnabled(False)
             self._urgency_combo.setEnabled(False)
             self._cover_page_onoff_combo.setEnabled(False)
@@ -3600,12 +3724,20 @@ class MainWindow(QMainWindow):
                 self._owner_combo.setEnabled(False)
             if hasattr(self, '_admin_print_check') and self._admin_print_check:
                 self._admin_print_check.setEnabled(False)
+            if cloud_locked:
+                # 云端订单（未冻结）：展示订单下发值（只读），而非残留上一个标签页的值
+                self._apply_tab_settings_values(tab, editable=False)
             return
-        self._delivery_onoff_combo.setEnabled(True)
+        self._apply_tab_settings_values(tab, editable=True)
+
+    def _apply_tab_settings_values(self, tab, editable: bool = True):
+        """同步标签页附加服务/归属/自打的值到控件（云端订单只读展示也走这里）。"""
         self._delivery_onoff_combo.blockSignals(True)
         self._delivery_onoff_combo.setCurrentIndex(1 if tab.delivery_enabled else 0)
         self._delivery_onoff_combo.blockSignals(False)
-        self._delivery_location_combo.setEnabled(tab.delivery_enabled)
+        if editable:
+            self._delivery_onoff_combo.setEnabled(True)
+        self._delivery_location_combo.setEnabled(bool(tab.delivery_enabled) and editable)
         if tab.delivery_location:
             idx = self._delivery_location_combo.findText(tab.delivery_location)
             if idx >= 0:
@@ -3615,25 +3747,59 @@ class MainWindow(QMainWindow):
         self._urgency_combo.blockSignals(True)
         self._urgency_combo.setCurrentText(tab.urgency)
         self._urgency_combo.blockSignals(False)
+        if editable:
+            self._urgency_combo.setEnabled(True)
         is_low = (tab.urgency == "低")
         self._urgency_price_label.setText(
             f"{0.0 if is_low else self._config.urgency_prices.get(tab.urgency, 0.0):.2f} 元")
         self._cover_page_onoff_combo.blockSignals(True)
         self._cover_page_onoff_combo.setCurrentIndex(1 if tab.cover_page else 0)
         self._cover_page_onoff_combo.blockSignals(False)
+        if editable:
+            self._cover_page_onoff_combo.setEnabled(True)
         self._cover_page_price_label.setText(f"{tab.cover_page_price:.2f} 元")
         # 订单归属（v24）：归属管理员下拉 + 管理员自行打印勾选
         if hasattr(self, '_owner_combo') and self._owner_combo:
-            self._owner_combo.setEnabled(True)
+            if editable:
+                self._owner_combo.setEnabled(True)
             self._update_owner_combo_items()   # 内部同步 admin_print_check 启用态（无成员时禁用）
+            if not editable:
+                # _update_owner_combo_items 可能按成员名单重新启用 → 云端订单恢复锁定
+                self._owner_combo.setEnabled(False)
         if hasattr(self, '_admin_print_check') and self._admin_print_check:
             self._admin_print_check.blockSignals(True)
             self._admin_print_check.setChecked(bool(tab.is_admin_print))
             self._admin_print_check.blockSignals(False)
+            if not editable:
+                self._admin_print_check.setEnabled(False)
 
     def _member_names(self) -> list[str]:
         """真实成员名单（剔除旧版占位名 张三/李四/王五）。归属下拉与建单校验共用。"""
         return [n for n in (self._config.admin_names or []) if n and n not in PLACEHOLDER_OWNER_NAMES]
+
+    # ---- 本设备所有者（2026-12：收支清算「授权」页绑定的成员姓名）----
+
+    def _get_device_owner_name(self) -> str:
+        """本设备所有者姓名：优先实时缓存（后端 printer_state 推送），回退本地配置缓存。
+        未绑定/离线/本地模式返回空串（新建标签页时由 _update_owner_combo_items 兜底到第一个成员）。"""
+        st = getattr(self, "_cloud_printer_state_cache", None) or {}
+        name = (st.get("owner_name") or "").strip()
+        if not name:
+            client = getattr(self, "_cloud_client", None)
+            if client is not None:
+                name = ((getattr(client, "last_printer_state", None) or {}).get("owner_name") or "").strip()
+        if not name:
+            name = (getattr(self._config, "cloud_owner_name", "") or "").strip()
+        return name
+
+    def _make_new_tab(self) -> "TabSettings":
+        """新建标签页的默认设置（2026-12）：
+        · 订单归属者默认 = 本设备所有者（授权页绑定；未绑定时为空，由归属下拉兜底到第一个成员）；
+        · 默认关闭「管理员自行打印」（is_admin_print=False）→ 新订单按顾客订单计费。"""
+        tab = TabSettings()
+        tab.owner_name = self._get_device_owner_name()
+        tab.is_admin_print = False
+        return tab
 
     def _has_members(self) -> bool:
         """是否有可用成员（无成员时禁止创建订单）。"""
@@ -3665,13 +3831,22 @@ class MainWindow(QMainWindow):
         tab = self._config.tabs.get(self._current_tab)
         names = self._member_names()
         tab_owner = (tab.owner_name if tab else "") or ""
-        if names:
-            # 有成员：标签页归属为空/占位名/已不在名单 → 自动落到第一个真实成员（写回标签页，保证建单归属非空）
-            if (not tab_owner) or tab_owner in PLACEHOLDER_OWNER_NAMES or tab_owner not in names:
-                act_owner = names[0]
+        # v5.25：未绑定顾客订单的固定归属「普通用户」——即使不在成员名单也作为合法候选，
+        # 保证标签页归属不被「落到第一个成员」的兜底覆盖
+        candidates = list(names)
+        if tab_owner == FALLBACK_OWNER_NAME and FALLBACK_OWNER_NAME not in candidates:
+            candidates.append(FALLBACK_OWNER_NAME)
+        # v5.26：云端订单标签页的归属来自下单方（绑定成员/普通用户）→ 即使暂不在成员名单
+        # （名单尚未同步）也保留，不被「落到第一个成员」覆盖
+        if tab and self._is_cloud_order_tab(tab) and tab_owner and tab_owner not in candidates:
+            candidates.append(tab_owner)
+        if candidates:
+            # 有候选：标签页归属为空/占位名/已不在候选 → 自动落到第一个真实成员（写回标签页，保证建单归属非空）
+            if (not tab_owner) or tab_owner in PLACEHOLDER_OWNER_NAMES or tab_owner not in candidates:
+                act_owner = candidates[0]
             else:
                 act_owner = tab_owner
-            combo_items = names
+            combo_items = candidates
         else:
             act_owner = "(无成员)"
             combo_items = ["(无成员)"]
@@ -3804,7 +3979,7 @@ class MainWindow(QMainWindow):
     def _on_owner_changed(self, text: str):
         """归属成员变更 → 写入当前标签页（下拉只允许选择，选择即保存）。
         「(无成员)」仅展示，不写入标签页（写空归属）；点击引导见 _on_owner_activated。"""
-        if self._is_current_tab_frozen():
+        if not self._is_tab_editable():
             return
         if text == "(无成员)":
             return
@@ -3815,7 +3990,7 @@ class MainWindow(QMainWindow):
 
     def _on_admin_print_toggled(self, checked: bool):
         """管理员自行打印勾选变更 → 写入当前标签页。"""
-        if self._is_current_tab_frozen():
+        if not self._is_tab_editable():
             return
         tab = self._config.tabs.get(self._current_tab)
         if tab:
@@ -3824,7 +3999,7 @@ class MainWindow(QMainWindow):
 
     def _on_delivery_toggled(self):
         """派送开关变更 → 写入当前标签页。"""
-        if self._is_current_tab_frozen():
+        if not self._is_tab_editable():
             return
         enabled = (self._delivery_onoff_combo.currentIndex() == 1)
         tab = self._config.tabs.get(self._current_tab)
@@ -3836,7 +4011,7 @@ class MainWindow(QMainWindow):
 
     def _on_cover_page_toggled(self):
         """首页开关变更 → 写入当前标签页。"""
-        if self._is_current_tab_frozen():
+        if not self._is_tab_editable():
             return
         enabled = (self._cover_page_onoff_combo.currentIndex() == 1)
         tab = self._config.tabs.get(self._current_tab)
@@ -3847,7 +4022,7 @@ class MainWindow(QMainWindow):
 
     def _on_delivery_location_changed(self):
         """派送地点变更 → 更新只读百分比显示并写入当前标签页。"""
-        if self._is_current_tab_frozen():
+        if not self._is_tab_editable():
             return
         loc = self._delivery_location_combo.currentText()
         tab = self._config.tabs.get(self._current_tab)
@@ -3860,7 +4035,7 @@ class MainWindow(QMainWindow):
 
     def _on_urgency_changed(self):
         """优先级变更 → 写入当前标签页。"低"时价格显示 0.00。"""
-        if self._is_current_tab_frozen():
+        if not self._is_tab_editable():
             return
         level = self._urgency_combo.currentText()
         tab = self._config.tabs.get(self._current_tab)
@@ -3903,17 +4078,17 @@ class MainWindow(QMainWindow):
                 return i
         return None
 
-    def _start_convert_worker(self, row: int, file_path: str, engine: str):
+    def _start_convert_worker(self, row: int, file_path: str, engine: str, tab_key: str = ""):
         """启动后台 PDF 转换线程。先检查 MD5 缓存，命中则跳过转换。
 
         MD5 一律从 file_path 计算（不再依赖 jobs[row].source_md5 ——
         多文件订单并发转换时行号可能错位，会读到别的文件的 MD5）。
         仅当任务上已有相同 file_path 的 source_md5 时复用，避免重复计算大文件。
-        """
+        tab_key（2026-12）：目标标签页（无障碍后台创建时定位 job；空 = 当前前台标签页）。"""
         # 计算源文件 MD5 并检查 PDF 缓存
         source_md5 = ""
         image_orientation = "auto"
-        jobs = self._get_current_jobs()
+        jobs = self._tab_jobs(tab_key)
         if row < len(jobs) and jobs[row].source_md5 and jobs[row].file_path == file_path:
             source_md5 = jobs[row].source_md5
         if row < len(jobs) and jobs[row].file_path == file_path:
@@ -3948,25 +4123,32 @@ class MainWindow(QMainWindow):
                 page_count = info.get("page_count", cached_meta.get("page_count", 0))
                 orientation = info.get("orientation", "")
                 self._log(f"📦 缓存命中: {os.path.basename(file_path)} → {page_count} 页 (MD5={source_md5[:8]}...)")
-                # 按 file_path 匹配行回写（不依赖调用方传入的 row，防多文件订单行错位写错行）
-                match_row = self._find_job_row_by_file_path(file_path)
+                # 按 file_path 在目标标签页匹配行回写（不依赖调用方传入的 row，防多文件订单行错位写错行）
+                jobs = self._tab_jobs(tab_key)
+                match_row = None
+                for i, j in enumerate(jobs):
+                    if j.file_path == file_path:
+                        match_row = i
+                        break
                 if match_row is not None:
-                    jobs = self._get_current_jobs()
                     jobs[match_row].source_md5 = source_md5
                     jobs[match_row].cached_pdf = cached_pdf
                     jobs[match_row].page_count = page_count
                     jobs[match_row].orientation = orientation
-                    self._set_current_jobs(jobs)
-                    self._table.item(match_row, self.COL_PAGES).setText(str(page_count))
-                    ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
-                    self._table.item(match_row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
-                    self._recalc_row_cost(match_row)
-                    self._update_total_cost()
-                return  # 缓存命中，跳过转换
+                    self._save_config()
+                    # 仅当目标标签页是当前前台标签页时更新表格（后台标签页表格不可见）
+                    if not tab_key or tab_key == self._current_tab:
+                        self._table.item(match_row, self.COL_PAGES).setText(str(page_count))
+                        ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+                        self._table.item(match_row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
+                        self._recalc_row_cost(match_row)
+                        self._update_total_cost()
+                return
         # 缓存未命中 → 启动转换线程（同 file_path 的旧 worker 先取消，防重复写缓存）
         self._cancel_convert_worker_for_path(file_path)
         worker = ConvertWorker(row, file_path, engine, source_md5)
-        worker.finished.connect(self._on_convert_finished)
+        worker.finished.connect(
+            lambda r, fp, pdf, pc, ori, tk=tab_key: self._on_convert_finished(r, fp, pdf, pc, ori, tk))
         self._convert_workers.append(worker)
         worker.start()
 
@@ -4456,9 +4638,11 @@ class MainWindow(QMainWindow):
                 self._save_config()
             if task_id and self._cloud_client:
                 if success:
-                    # 归属标记（v24）：云端订单为顾客订单，由打印它的管理员盖章（订单号右侧下拉选择）
+                    # 归属标记（v24）：云端订单为顾客订单，由打印它的管理员盖章（订单号右侧下拉选择）。
+                    # 2026-12：后台打印（无障碍）时 _printing_tab_key 指向实际标签页，不用前台标签页
                     owner_name = ""
-                    tab = self._config.tabs.get(self._current_tab)
+                    tab = self._config.tabs.get(
+                        getattr(self, "_printing_tab_key", "") or self._current_tab)
                     if tab:
                         owner_name = (tab.owner_name or "").strip()
                     # 上报实际打印配置（本地可能修改过份数/双面/范围/页数），后端同步 order_files
@@ -4478,8 +4662,9 @@ class MainWindow(QMainWindow):
                 else:
                     self._cloud_client.report_fail(task_id, message)
 
-    def _start_print_worker(self, flat_jobs: list) -> bool:
-        """用给定的任务列表启动打印 Worker。返回 True=已启动，False=忙/被取消。"""
+    def _start_print_worker(self, flat_jobs: list, tab_key: str | None = None) -> bool:
+        """用给定的任务列表启动打印 Worker。返回 True=已启动，False=忙/被取消。
+        tab_key：打印批次所属标签页（2026-12 无障碍后台打印用，默认当前前台标签页）。"""
         if not self._has_members():
             # 无成员禁止创建订单（订单必须归属某个成员）
             self._show_no_member_hint()
@@ -4509,14 +4694,17 @@ class MainWindow(QMainWindow):
 
         self._flat_jobs = flat_jobs
         self._sync_ui_to_config()
+        # 打印批次所属标签页：默认前台；无障碍后台打印时显式指定（冻结/附加服务/回报据此定位）
+        target_key = tab_key or self._current_tab
+        self._printing_tab_key = target_key
 
         # 立即冻结标签页 — 一旦开始打印，订单即已固定，不允许任何编辑
-        tab = self._config.tabs.get(self._current_tab)
+        tab = self._config.tabs.get(target_key)
         if tab:
             tab.frozen = True
         self._save_config()
         self._refresh_tab_display()
-        self._log(f"🔒 标签页 {self._current_tab} 已固定，打印完成后不可编辑")
+        self._log(f"🔒 标签页 {target_key} 已固定，打印完成后不可编辑")
 
         from datetime import datetime
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4538,8 +4726,8 @@ class MainWindow(QMainWindow):
                 "duplex": j.duplex if _count_pages_in_range(j.page_range or "", j.page_count or 0) > 1 else "off",
                 "page_range": j.page_range,
             })
-        # 附加服务：与界面合计（_update_total_cost）口径一致，从标签页读设置
-        tab = self._config.tabs.get(self._current_tab)
+        # 附加服务：与界面合计（_update_total_cost）口径一致，从标签页读设置（后台打印读目标标签页）
+        tab = self._config.tabs.get(target_key)
         tab_extra = tab.calc_extra_total(total, self._config) if tab else 0.0
         total_price = round(total + tab_extra, 2)
         extra_fields = {
@@ -4710,6 +4898,8 @@ class MainWindow(QMainWindow):
         """全部任务完成。标签页已固定，不允许再次打印或编辑。"""
         self._worker = None
         self._all_printed = (fail_count == 0)
+        # 打印批次结束：清除后台打印上下文（下次打印回到前台标签页语义）
+        self._printing_tab_key = ""
 
         total = success_count + fail_count
         status = "✅ 全部成功" if fail_count == 0 else f"⚠️ 成功 {success_count} / 失败 {fail_count}"
@@ -4725,19 +4915,16 @@ class MainWindow(QMainWindow):
             self._log(f"🔒 全部 {total} 个任务打印成功！标签页已锁定。")
 
         # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单（只打未完成的，已打的不重打）
+        # 2026-12：补打保持后台（不切换前台标签页），与无障碍订单「后台创建标签页」一致
         if self._auto_print_retry:
             item = self._auto_print_retry.pop(0)
             tab_key = item.get("tab_key", "")
             order_id = item.get("order_id", 0)
             if tab_key in self._config.tabs and self._config.tabs[tab_key].jobs:
-                self._current_tab = tab_key
-                self._config.active_tab = tab_key
-                self._rebuild_table()
-                self._refresh_tab_display()
                 pending = [j for j in self._config.tabs[tab_key].jobs if not getattr(j, 'sent', False)]
                 if pending:
                     self._log(f"⚡ 打印机空闲，补打订单 #{order_id}（标签页 {tab_key}，{len(pending)} 个未打印文件）")
-                    self._start_print_worker(pending)
+                    self._start_print_worker(pending, tab_key=tab_key)
                 else:
                     self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key} 已全部打印完成，跳过补打")
             else:
@@ -4747,9 +4934,17 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.2.0</h3>"
+            "<h3>HN 本地打印工具 v4.3.0</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
+            "<hr>"
+            "<p><b>v4.3 更新：</b></p>"
+            "<p>· 多设备接单唯一接管：云端设置新增「启用接单」，仅接单设备接收订单，被占用时提示接管者</p>"
+            "<p>· 设备授权：收支清算「授权」页绑定本设备所有者，新建标签页默认归属该所有者、默认关闭「管理员自行打印」</p>"
+            "<p>· 云端订单归属：绑定用户按绑定成员显示，未绑定普通用户显示「普通用户」</p>"
+            "<p>· 云端订单标签页锁定归属/自打/附加服务（来自下单方，本地不可改）</p>"
+            "<p>· 无障碍订单后台创建标签页，不打断当前操作</p>"
+            "<p>· 收支清算菜单禁用时灰显；冻结标签页右键菜单同步禁用</p>"
             "<hr>"
             "<p>核心流程：文件 → PDF → Windows 原生 GDI 打印</p>"
             "<p>外部工具（可选）：LibreOffice | wkhtmltopdf | SumatraPDF</p>"
@@ -5097,8 +5292,11 @@ class MainWindow(QMainWindow):
         for t in ready_tasks:
             self._mark_processed_task(t.task_id)
 
-        # 自动创建标签页
-        self._add_cloud_tasks_to_new_tab(ready_tasks)
+        # 自动创建标签页（2026-12：后台创建，不切换当前标签页；返回目标标签页 key）
+        tab_key = self._add_cloud_tasks_to_new_tab(ready_tasks, switch_tab=False)
+        if not tab_key:
+            self._log(f"⚠ 无障碍打印：订单 #{order_id} 未能创建标签页，跳过")
+            return
 
         # 通知后端已接受
         if ready_tasks[0].order_id and self._cloud_client:
@@ -5106,18 +5304,18 @@ class MainWindow(QMainWindow):
 
         # 自动开始打印（打印机忙时不静默丢弃 → 入重试队列，打印完成后自动补打）。
         # 只打印未完成（sent=False）的 job：追加到已有标签页时，已打印过的文件不重打
-        jobs = [j for j in self._get_current_jobs() if not getattr(j, 'sent', False)]
+        jobs = [j for j in self._tab_jobs(tab_key) if not getattr(j, 'sent', False)]
         if jobs:
-            self._log(f"⚡ 自动开始打印标签页 {self._current_tab}（{len(jobs)} 个文件）")
-            if not self._start_print_worker(list(jobs)):
+            self._log(f"⚡ 自动开始打印标签页 {tab_key}（{len(jobs)} 个文件）")
+            if not self._start_print_worker(list(jobs), tab_key=tab_key):
                 self._auto_print_retry.append({
                     "order_id": order_id,
-                    "tab_key": self._current_tab,
+                    "tab_key": tab_key,
                     "task_ids": [t.task_id for t in ready_tasks],
                 })
                 self._log(f"⚡ 打印机正忙，订单 #{order_id} 已加入重试队列（打印完成后自动补打）")
         else:
-            self._log(f"⚠ 无障碍打印：标签页 {self._current_tab} 无文件，跳过")
+            self._log(f"⚠ 无障碍打印：标签页 {tab_key} 无文件，跳过")
 
     # ──────── 无障碍打印预约单（指定时间/倒计时 → 到点自动打印，冻结等待）────────
 
@@ -5218,14 +5416,13 @@ class MainWindow(QMainWindow):
         if not ready_tasks:
             return
         if not st["tab_key"]:
-            # 首次全部就绪 → 创建标签页（后续新增文件追加）。
+            # 首次全部就绪 → 创建标签页（后续新增文件追加；2026-12 后台创建，不切换前台）。
             # 注意：预约单不走 accept_order（会误把父订单标成 accepted），
             # 后端状态由 file_ready → waiting、start_printing → printing 驱动。
             self._log(f"⏰ 预约单 #{order_id}: 全部 {len(ready_tasks)} 个文件就绪")
             for t in ready_tasks:
                 self._mark_processed_task(t.task_id)
-            self._add_cloud_tasks_to_new_tab(ready_tasks)
-            st["tab_key"] = self._current_tab
+            st["tab_key"] = self._add_cloud_tasks_to_new_tab(ready_tasks, switch_tab=False)
 
         if st["frozen"]:
             # 冻结已解除（文件补齐）：在线等后端 start_print 重设目标；断网则 30s 自恢复
@@ -5301,14 +5498,11 @@ class MainWindow(QMainWindow):
             self._cleanup_scheduled_order(order_id, reason="无就绪文件")
             return
 
-        # 确保标签页存在
+        # 确保标签页存在（2026-12：后台创建/定位，不切换当前标签页）
         if not st["tab_key"]:
             for t in ready_tasks:
                 self._mark_processed_task(t.task_id)
-            self._add_cloud_tasks_to_new_tab(ready_tasks)
-            st["tab_key"] = self._current_tab
-        else:
-            self._current_tab = st["tab_key"]
+            st["tab_key"] = self._add_cloud_tasks_to_new_tab(ready_tasks, switch_tab=False)
 
         # 打印机正忙 → 10s 后重试（最多 60 次 ≈ 10 分钟），保证预约单不丢
         if self._worker and self._worker.isRunning():
@@ -5334,9 +5528,9 @@ class MainWindow(QMainWindow):
             return
 
         self._log(f"⚡ 无障碍预约打印：订单 #{order_id} 共 {len(ready_tasks)} 个文件，开始打印")
-        jobs = self._get_current_jobs()
+        jobs = [j for j in self._tab_jobs(st["tab_key"]) if not getattr(j, 'sent', False)]
         if jobs:
-            if not self._start_print_worker(list(jobs)):
+            if not self._start_print_worker(list(jobs), tab_key=st["tab_key"]):
                 # 恰好此刻打印机变忙 → 不置 printed，10s 后重试（防丢失）
                 self._log(f"⏰ 预约单 #{order_id}: 打印机正忙，10s 后重试")
                 self._start_scheduled_print_timer(order_id, int(time.time()) + 10)
@@ -5348,7 +5542,7 @@ class MainWindow(QMainWindow):
                 self._cloud_client.report_start_printing(order_id, [t.task_id for t in ready_tasks])
         else:
             # 标签页无文件（可能被清空/删除）→ 不置 printed、不上报，重置为待重试
-            self._log(f"⚠ 无障碍预约打印：标签页 {self._current_tab} 无文件，订单 #{order_id} 保持待重试")
+            self._log(f"⚠ 无障碍预约打印：标签页 {st['tab_key']} 无文件，订单 #{order_id} 保持待重试")
             st["retry_count"] = 0
             self._start_scheduled_print_timer(order_id, int(time.time()) + 10)
 
@@ -5455,6 +5649,35 @@ class MainWindow(QMainWindow):
                 daemon=True,
                 name="cloud-conn-sync",
             ).start()
+
+    def _on_cloud_printer_state(self, state: dict):
+        """（主线程）后端接单状态推送（PySide6 自动排队到主线程）。
+        - 自动续接单被拒（重启/重连时接管者已被其他在线设备占用）→ 弹窗提示并复位配置；
+        - 正常状态更新缓存，并把本机所有者（owner_name）持久化到配置——
+          新建标签页时作为默认订单归属者（2026-12）。"""
+        if not isinstance(state, dict):
+            return
+        self._cloud_printer_state_cache = state
+        # 本机所有者同步（授权页绑定后后端广播，本机立即生效，无需重启工具）
+        owner = (state.get("owner_name") or "").strip()
+        if owner and owner != (getattr(self._config, "cloud_owner_name", "") or "").strip():
+            self._config.cloud_owner_name = owner
+            try:
+                self._config.save(self._config_path)
+            except Exception:
+                pass
+        if state.get("take_orders_rejected"):
+            msg = state.get("message", "打印机已被其他设备接管")
+            self._log(f"☁ 接单续期失败：{msg}")
+            self._config.cloud_take_orders = False
+            try:
+                self._config.save(self._config_path)
+            except Exception:
+                pass
+            if self._cloud_client:
+                self._cloud_client.take_orders = False
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "无法启用接单", f"{msg}\n\n本机「启用接单」已自动关闭。")
 
     def _conn_sync_worker(self):
         """后台线程：连线后同步（成员名单 / 离线订单换号 / 状态 / 离线上报）。
@@ -5611,7 +5834,7 @@ class MainWindow(QMainWindow):
                             self._cloud_client.abandon_order_to_server(job.order_id)
                         elif job.task_id > 0 and self._cloud_client:
                             self._cloud_client.abandon_order_to_server(job.task_id)
-                self._config.tabs = {"1": TabSettings()}
+                self._config.tabs = {"1": self._make_new_tab()}
                 self._config.active_tab = "1"
                 self._current_tab = "1"
                 self._cleanup_orphan_pdf_cache(cache_jobs)
@@ -5651,7 +5874,7 @@ class MainWindow(QMainWindow):
                             self._cloud_client.abandon_order_to_server(job.order_id)
                         elif job.task_id > 0 and self._cloud_client:
                             self._cloud_client.abandon_order_to_server(job.task_id)
-                self._config.tabs = {"1": TabSettings()}
+                self._config.tabs = {"1": self._make_new_tab()}
                 self._config.active_tab = "1"
                 self._current_tab = "1"
                 self._cleanup_orphan_pdf_cache(all_abandoned)
@@ -5721,14 +5944,15 @@ class MainWindow(QMainWindow):
 
     # ──────── 转换完成回调 ────────
 
-    def _on_convert_finished(self, row: int, file_path: str, cached_pdf: str, page_count: int, orientation: str):
-        """后台 PDF 转换完成 → 按 file_path 匹配行并更新表格、缓存。
+    def _on_convert_finished(self, row: int, file_path: str, cached_pdf: str, page_count: int,
+                             orientation: str, tab_key: str = ""):
+        """后台 PDF 转换完成 → 按 file_path 匹配行并更新标签页数据、表格。
 
         多文件订单并发转换时行号可能错位，统一按 file_path 找行：
         row 处恰好匹配直接回写，否则扫描全部 job；找不到（文件已被删除）→ 丢弃结果只清理旧缓存。
-        """
+        tab_key（2026-12）：目标标签页（无障碍后台创建时定位；空 = 当前前台标签页）。"""
         # 按 file_path 匹配行
-        jobs = self._get_current_jobs()
+        jobs = self._tab_jobs(tab_key)
         target_row = None
         if row < len(jobs) and jobs[row].file_path == file_path:
             target_row = row
@@ -5746,11 +5970,11 @@ class MainWindow(QMainWindow):
                     pass
             return
         if not cached_pdf:
-            if target_row < self._table.rowCount():
+            if (not tab_key or tab_key == self._current_tab) and target_row < self._table.rowCount():
                 self._table.item(target_row, self.COL_PAGES).setText("?")
             return
 
-        jobs = self._get_current_jobs()
+        jobs = self._tab_jobs(tab_key)
         old_pdf = jobs[target_row].cached_pdf
         if old_pdf and os.path.isfile(old_pdf) and old_pdf != cached_pdf:
             try:
@@ -5760,15 +5984,18 @@ class MainWindow(QMainWindow):
         jobs[target_row].cached_pdf = cached_pdf
         jobs[target_row].page_count = page_count
         jobs[target_row].orientation = orientation
-        self._set_current_jobs(jobs)
+        self._save_config()
 
-        if target_row < self._table.rowCount():
-            self._table.item(target_row, self.COL_PAGES).setText(str(page_count))
-            ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
-            ori_text = ori_map.get(orientation, "")
-            self._table.item(target_row, self.COL_ORIENT).setText(ori_text)
-        self._recalc_row_cost(target_row)
-        self._update_total_cost()
+        # 仅当目标标签页是当前前台标签页时才更新表格（后台标签页表格不可见）
+        if not tab_key or tab_key == self._current_tab:
+            self._set_current_jobs(jobs)
+            if target_row < self._table.rowCount():
+                self._table.item(target_row, self.COL_PAGES).setText(str(page_count))
+                ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
+                ori_text = ori_map.get(orientation, "")
+                self._table.item(target_row, self.COL_ORIENT).setText(ori_text)
+            self._recalc_row_cost(target_row)
+            self._update_total_cost()
 
         # 转换完成后存入 MD5 缓存（供后续同文件复用，避免重复转换）
         if cached_pdf and os.path.isfile(cached_pdf) and target_row < len(jobs):
@@ -5827,17 +6054,22 @@ class MainWindow(QMainWindow):
             except OSError as e:
                 self._log(f"  → 保存转换副本到桌面失败: {e}")
 
-    def _add_cloud_tasks_to_new_tab(self, tasks: list):
-        """将同一订单的多个云端任务添加到同一个新标签页，全部加入后再刷新显示。"""
+    def _add_cloud_tasks_to_new_tab(self, tasks: list, switch_tab: bool = True) -> str | None:
+        """将同一订单的多个云端任务添加到同一个新标签页，全部加入后再刷新显示。
+        switch_tab=False（无障碍自动打印）：在后台创建/追加，不切换当前标签页。
+        返回目标标签页 key（供后台打印定位 jobs；tasks 为空返回 None）。"""
         if not tasks:
-            return
+            return None
+        target_key = None
         for task in tasks:
-            self._add_cloud_task_to_new_tab(task, is_first=(task == tasks[0]))
+            target_key = self._add_cloud_task_to_new_tab(task, is_first=(task == tasks[0]),
+                                                         switch_tab=switch_tab)
         # 全部任务加入后再刷新表格/显示（而非只对第一个刷新）→ 确保所有文件可见
         self._save_config()
         self._rebuild_table()
         self._refresh_tab_display()
         self._sync_edit_enabled(False)
+        return target_key
 
     def _find_tab_for_order(self, order_id) -> str | None:
         """查找已包含指定云端订单任务的标签页 key；无则返回 None。
@@ -5849,13 +6081,17 @@ class MainWindow(QMainWindow):
                 return key
         return None
 
-    def _add_cloud_task_to_new_tab(self, task: CloudTask, is_first: bool = True):
-        """将云端任务添加到标签页并切换过去。同一订单已有标签页 → 追加到该标签页（一个订单一个标签页）。"""
+    def _add_cloud_task_to_new_tab(self, task: CloudTask, is_first: bool = True,
+                                   switch_tab: bool = True) -> str:
+        """将云端任务添加到标签页并（默认）切换过去。同一订单已有标签页 → 追加到该标签页。
+        switch_tab=False（2026-12 无障碍自动打印）：后台创建/追加，不切换当前标签页。
+        返回目标标签页 key。"""
         # 同一订单已有标签页 → 追加到它，而不是新建（防下载完成时间分散导致拆成多个标签页）
         existing_key = self._find_tab_for_order(task.order_id)
         if existing_key is not None:
-            self._current_tab = existing_key
-            self._config.active_tab = existing_key
+            if switch_tab:
+                self._current_tab = existing_key
+                self._config.active_tab = existing_key
             is_first = False
         if is_first:
             tab_keys = self._sorted_tab_keys(self._config.tabs)
@@ -5869,16 +6105,24 @@ class MainWindow(QMainWindow):
             tab_settings.cover_page = task.cover_page
             tab_settings.cover_page_price = task.cover_page_price
             # v24.1：云端订单若由管理员在前端标记"管理员自行打印"→ 预勾选并沿用归属人；
-            # 否则为顾客订单（不是管理员自行打印），归属人默认当前机位管理员
+            # 否则为顾客订单（不是管理员自行打印），归属人默认当前机位管理员。
+            # v5.24：顾客订单标签页归属 = 下单用户绑定的成员名（bound_owner_name，后端反查
+            # 收支清算成员绑定），不再回退到「第一个成员」；管理员自打订单沿用 task.owner_name。
+            # v5.25：未绑定成员的普通用户订单 → 归属固定显示「普通用户」（非真实成员）。
             tab_settings.is_admin_print = bool(getattr(task, 'is_admin_print', False))
-            task_owner = (getattr(task, 'owner_name', '') or '').strip()
+            task_owner = (getattr(task, 'bound_owner_name', '')
+                          or getattr(task, 'owner_name', '') or '').strip()
             if task_owner:
                 tab_settings.owner_name = task_owner
+            elif not tab_settings.is_admin_print:
+                tab_settings.owner_name = FALLBACK_OWNER_NAME
             self._config.tabs[new_key] = tab_settings
-            self._current_tab = new_key
-            self._config.active_tab = new_key
+            if switch_tab:
+                self._current_tab = new_key
+                self._config.active_tab = new_key
         else:
-            new_key = self._current_tab
+            # 追加到已存在的订单标签页（switch_tab=False 时 _current_tab 未切换，须显式用 existing_key）
+            new_key = existing_key if existing_key is not None else self._current_tab
 
         ext = os.path.splitext(task.local_path)[1].lower() if task.local_path else ""
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
@@ -5945,14 +6189,15 @@ class MainWindow(QMainWindow):
         self._config.tabs[new_key].jobs.append(job)
 
         # Word 文件：缓存未命中时才启动转换（传真实行号，job 已 append；
-        # 回调改为按 file_path 匹配，行号仅作快速路径提示）
+        # 回调改为按 file_path 匹配，行号仅作快速路径提示；tab_key 定位目标标签页）
         if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
             row = len(self._config.tabs[new_key].jobs) - 1
-            self._start_convert_worker(row, task.local_path, engine)
+            self._start_convert_worker(row, task.local_path, engine, tab_key=new_key)
 
         self._log(f"☁ 云端任务 #{task.task_id} 已添加到标签页 {new_key}")
         if self._cloud_client:
             self._cloud_client.accept_task(task.task_id)
+        return new_key
 
     # ──────── 清空 / 撤回 / 移除 / 打印 ────────
 

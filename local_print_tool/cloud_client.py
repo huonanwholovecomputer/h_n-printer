@@ -27,6 +27,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import quote
 
 import requests as http_requests
 
@@ -75,6 +76,8 @@ class CloudTask:
         "image_orientation",
         "delivery_enabled", "delivery_location", "urgency", "cover_page", "cover_page_price",
         "owner_name", "is_admin_print",
+        # 2026-12：顾客订单标签页归属 = 下单用户绑定的成员名（后端从收支清算成员绑定反查）
+        "bound_owner_name",
         "auto_print",
         # 无障碍打印预约（此前 __init__ 已赋值但这些字段漏在 __slots__ 之外 → 构造必报 AttributeError）
         "schedule_mode", "scheduled_at", "scheduled_ts", "schedule_frozen",
@@ -109,6 +112,8 @@ class CloudTask:
         # v24.1：订单归属（管理员自行打印标记随任务下发，本地标签页预勾选）
         self.owner_name: str = data.get("owner_name", "") or ""
         self.is_admin_print: bool = bool(data.get("is_admin_print", False))
+        # v5.24：顾客订单标签页的默认归属 = 下单用户绑定的成员名（后端反查成员绑定表）
+        self.bound_owner_name: str = data.get("bound_owner_name", "") or ""
         self.auto_print: bool = bool(data.get("auto_print", False))  # 无障碍打印
         # 无障碍打印预约形式：now | at | countdown（'now' 即立即开始）
         self.schedule_mode: str = data.get("schedule_mode", "now") or "now"
@@ -135,6 +140,7 @@ class CloudTask:
             "image_orientation": self.image_orientation,
             "owner_name": self.owner_name,
             "is_admin_print": self.is_admin_print,
+            "bound_owner_name": self.bound_owner_name,
         }
 
 
@@ -164,6 +170,7 @@ class CloudClient(QObject):
     order_canceled = Signal(int, list)    # int=order_id, list=task_ids — 订单被用户取消
     start_print = Signal(int, int, list)  # 预约单到点/解除冻结：order_id, scheduled_ts, task_ids
     auth_failed = Signal(str)             # 认证失败（含消息），GUI 可连接此信号提示用户
+    printer_state = Signal(object)        # 接单状态 dict（is_active/active_owner_name/...）— 2026-11
 
     def __init__(
         self,
@@ -171,12 +178,15 @@ class CloudClient(QObject):
         ws_url: str = "",
         token: str = "",
         client_id: str = "",
+        device_name: str = "",
         parent=None,
     ):
         super().__init__(parent)
         self.api_url = api_url
         self.ws_url = ws_url
         self.token = token
+        # 设备（计算机）名称：随连接上报后端，用于设备注册表与「打印机已被 XXX 接管」提示
+        self.device_name: str = (device_name or socket.gethostname()).strip()[:64]
         # P0-1: 同机多实例 client_id 冲突兜底 —— GUI 旧逻辑传入的是机器名（socket.gethostname()），
         # 同一台机器多开实例会共用同一 client_id 导致任务互抢。
         # 此处生成持久化后缀（工具目录下 .client_id 文件），最终形如 "hostname-abcdef1234"。
@@ -227,6 +237,12 @@ class CloudClient(QObject):
         self._cache_index_lock = threading.Lock()
         # 从本地持久化文件加载上次的保留时间（避免每次启动都从 7 天开始）
         self._load_retention()
+        # 接单状态（2026-11）：True = 本机启用接单（唯一接管者，由 GUI 配置并同步后端）。
+        # 连上后若本机配置为接单 → 自动向后端 claim（重启/断线重连后自动续接单）；
+        # 被其他在线设备占用时 claim 被拒 → take_orders 复位为 False 并通知 GUI 弹窗。
+        self.take_orders: bool = False
+        # 最近一次后端下发的接单状态（printer_state 事件），GUI 可据此展示接管者
+        self.last_printer_state: dict = {}
 
     # ── 公共 API ──
 
@@ -633,13 +649,123 @@ class CloudClient(QObject):
             # P2: 拉取失败不再是 debug 级别 —— 需在日志中可见
             logger.warning(f"HTTP 拉取排队任务失败: {e}")
 
+    # ── 接单接管（2026-11：多设备共连时仅启用接单的设备接收订单）──
+
+    def claim_printer(self, owner_name: str = "") -> tuple[bool, str, dict]:
+        """启用接单：请求后端将本机设为唯一接管者。
+        返回 (成功?, 消息, 附加信息 dict)。被其他在线设备占用时成功=False，
+        消息含「打印机已被 XXX 接管」，附加信息含 holder_name/holder_owner 供弹窗展示。"""
+        if not self.api_url or not self.token:
+            return False, "云端未配置，无法启用接单", {}
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/printer/claim",
+                params={"token": self.token},
+                json={"client_id": self.client_id, "device_name": self.device_name,
+                      "owner_name": owner_name or ""},
+                timeout=10,
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if resp.ok and data.get("success"):
+                self.take_orders = True
+                self.status_message.emit(f"☁ 接单已启用（本机为唯一接单设备）")
+                return True, data.get("message", "接单已启用"), data
+            msg = data.get("message", "") if isinstance(data, dict) else ""
+            return False, msg or f"接单启用失败（HTTP {resp.status_code}）", data or {}
+        except Exception as e:
+            return False, f"接单启用失败: {e}", {}
+
+    def release_printer(self) -> tuple[bool, str]:
+        """关闭接单：释放本机的接管者身份。"""
+        if not self.api_url or not self.token:
+            return False, "云端未配置"
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/printer/release",
+                params={"token": self.token},
+                json={"client_id": self.client_id},
+                timeout=10,
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if resp.ok and data.get("success"):
+                self.take_orders = False
+                self.status_message.emit("☁ 接单已关闭")
+                return True, data.get("message", "接单已关闭")
+            return False, (data.get("message", "") if isinstance(data, dict) else "") or "关闭接单失败"
+        except Exception as e:
+            return False, f"关闭接单失败: {e}"
+
+    def get_printer_devices(self) -> dict:
+        """拉取设备列表（计算机名/在线状态/所有者/是否接单），失败返回空 dict。"""
+        if not self.api_url or not self.token:
+            return {}
+        try:
+            resp = http_requests.get(
+                f"{self.api_url}/api/printer/devices",
+                params={"token": self.token},
+                timeout=10,
+            )
+            if resp.ok:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("success"):
+                    return data
+            return {}
+        except Exception as e:
+            logger.warning(f"拉取设备列表失败: {e}")
+            return {}
+
+    def bind_owner(self, owner_name: str) -> tuple[bool, str]:
+        """绑定本设备所有者（收支成员姓名）。"""
+        if not self.api_url or not self.token:
+            return False, "云端未配置"
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/printer/bind_owner",
+                params={"token": self.token},
+                json={"client_id": self.client_id, "owner_name": owner_name or ""},
+                timeout=10,
+            )
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            if resp.ok and data.get("success"):
+                return True, data.get("message", "所有者已保存")
+            return False, (data.get("message", "") if isinstance(data, dict) else "") or "保存失败"
+        except Exception as e:
+            return False, f"保存失败: {e}"
+
     def _post_connect_sync(self):
         """连接成功后的异步收尾（独立线程，不阻塞 socketio 读循环）：
-        先重放离线状态队列，再拉取排队任务（先重放后拉取保证状态一致）。"""
+        先重放离线状态队列，再拉取排队任务（先重放后拉取保证状态一致）。
+        2026-11：若本机配置了接单 → 自动向后端续接单（重启/重连后保持接管身份）。"""
         try:
             self.sync_pending_statuses()
         except Exception as e:
             logger.warning(f"离线状态重放异常: {e}")
+        # 接单续期：本机配置为接单时，连接后自动 claim（接管者掉线期间被他人接管会被拒，
+        # 此时复位 take_orders 并通知 GUI 弹窗提示「打印机已被 XXX 接管」）
+        if getattr(self, "take_orders", False):
+            try:
+                ok, msg, extra = self.claim_printer()
+                if not ok:
+                    self.take_orders = False
+                    self.status_message.emit(f"☁ 接单续期失败: {msg}")
+                    self.printer_state.emit({
+                        "is_active": False,
+                        "take_orders_rejected": True,
+                        "message": msg,
+                        "holder_name": extra.get("holder_name", "") if isinstance(extra, dict) else "",
+                        "holder_owner": extra.get("holder_owner", "") if isinstance(extra, dict) else "",
+                    })
+            except Exception as e:
+                logger.warning(f"接单续期异常: {e}")
         try:
             self.pull_pending()
         except Exception as e:
@@ -812,6 +938,24 @@ class CloudClient(QObject):
             for tid in task_ids:
                 self._pending_tasks.pop(tid, None)
 
+        @self._sio.on("printer_state")
+        def _on_printer_state(data):
+            """后端下发接单状态：本机是否接管、当前接管者（计算机名/所有者）。"""
+            try:
+                payload = dict(data or {})
+            except Exception:
+                payload = {}
+            self.last_printer_state = payload
+            self.printer_state.emit(payload)
+            if payload.get("is_active"):
+                self.status_message.emit("☁ 本机为当前接单设备（可接收云端订单）")
+            elif payload.get("active_client_id"):
+                holder = payload.get("active_device_name") or payload.get("active_client_id", "")
+                owner = payload.get("active_owner_name", "")
+                self.status_message.emit(
+                    f"☁ 当前接单设备: {holder}" + (f"（所有者：{owner}）" if owner else "")
+                    + "，本机未接单")
+
         @self._sio.on("pong")
         def _on_pong():
             pass
@@ -836,7 +980,8 @@ class CloudClient(QObject):
                 pass
 
         # 连接
-        connect_url = f"{self.ws_url}?token={self.token}&client_id={self.client_id}"
+        connect_url = (f"{self.ws_url}?token={self.token}&client_id={self.client_id}"
+                       f"&device_name={quote(self.device_name)}")
         self.status_message.emit(f"☁ 正在连接 {self.ws_url} ...")
         try:
             self._sio.connect(connect_url, wait_timeout=10)

@@ -102,7 +102,10 @@ def clear_local_data_files() -> None:
 def _extract_proxy_body(resp) -> dict:
     """只透传 {success, message, data} 白名单字段；非 JSON 响应统一转通用错误。
     额外透传 pricing（/api/pricing 返回顶层 pricing 而非 data 包装，
-    供收支清算设置页的「打印价格」区块读写服务器定价配置）。"""
+    供收支清算设置页的「打印价格」区块读写服务器定价配置）。
+    额外透传 devices / active_client_id / active_owner_name（/api/printer/devices 返回顶层
+    设备列表，供收支清算「授权」页展示设备与所有者——2026-11 修复：此前被白名单剥掉
+    导致授权页设备列表空白、绑定后所有者不刷新）。"""
     try:
         data = resp.json()
     except Exception:
@@ -117,6 +120,12 @@ def _extract_proxy_body(resp) -> dict:
         out["data"] = data["data"]
     if "pricing" in data:
         out["pricing"] = data["pricing"]
+    if "devices" in data:
+        out["devices"] = data["devices"]
+    if "active_client_id" in data:
+        out["active_client_id"] = data["active_client_id"]
+    if "active_owner_name" in data:
+        out["active_owner_name"] = data["active_owner_name"]
     return out
 
 
@@ -128,6 +137,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
     token: str = ""
     launch_token: str = ""  # 启动令牌：仅本地打印工具启动时附带，每次启动随机
     finance_mode: str = "cloud"  # 'cloud' 或 'local'：收支清算数据/配置的存储来源
+    # 本机设备信息（2026-11：收支清算「授权」页展示本设备/绑定所有者）
+    device_name: str = ""
+    client_id: str = ""
+    take_orders: bool = False
 
     def __init__(self, *args, **kwargs):
         # 设置静态文件根目录
@@ -202,6 +215,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         # 本地绑定读取
         if path == "/api/local/bindings":
             return self._handle_get_bindings()
+
+        # 本机设备信息（收支清算「授权」页）
+        if path == "/api/local/device":
+            return self._handle_get_device()
 
         # 本地数据加载
         if path == "/api/local/data":
@@ -371,6 +388,34 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         data = load_bindings()
         self._send_json({"success": True, "bindings": data})
 
+    def _handle_get_device(self):
+        """返回本机设备信息（client_id / 计算机名 / 是否接单），供收支清算「授权」页使用。
+        take_orders 实时向后端确认（本机是否为当前接单设备），与设备列表的 is_active 同源，
+        避免「授权页显示未接单、设备列表显示接单中」的不一致（2026-12 修复：
+        此前为打开页面时的本地快照，云端设置里启用接单后不会同步）。"""
+        client_id = getattr(self, "client_id", "") or ""
+        device_name = getattr(self, "device_name", "") or ""
+        take_orders = bool(getattr(self, "take_orders", False))
+        # 实时接单状态：云端模式且配置了 api_url 时，向后端 /api/printer_status 确认本机是否接管
+        if client_id and getattr(self, "api_url", ""):
+            try:
+                resp = http_requests.get(
+                    f"{self.api_url}/api/printer_status",
+                    params={"token": getattr(self, "token", "")},
+                    timeout=6,
+                )
+                if resp.ok:
+                    data = resp.json()
+                    active_cid = (data.get("active_client_id") or "") if isinstance(data, dict) else ""
+                    take_orders = bool(active_cid) and active_cid == client_id
+            except Exception:
+                pass  # 离线/异常 → 回退本地快照
+        self._send_json({"success": True, "device": {
+            "client_id": client_id,
+            "device_name": device_name,
+            "take_orders": take_orders,
+        }})
+
     def _handle_post_bindings(self):
         try:
             body = json.loads(self._read_body())
@@ -522,11 +567,16 @@ class StatsServer:
     """统计 HTTP 服务器（后台线程）"""
 
     def __init__(self, api_url: str = "", token: str = "", port: int = 0, data_file: str = "",
-                 finance_mode: str = "cloud"):
+                 finance_mode: str = "cloud", device_name: str = "", client_id: str = "",
+                 take_orders: bool = False):
         self.api_url = api_url.rstrip("/") if api_url else ""
         self.token = token
         self.data_file = data_file or _DEFAULT_DATA_FILE
         self.finance_mode = finance_mode if finance_mode in ("cloud", "local") else "cloud"
+        # 本机设备信息（收支清算「授权」页展示）
+        self.device_name = (device_name or "").strip()[:64]
+        self.client_id = (client_id or "").strip()
+        self.take_orders = bool(take_orders)
         self._port = port
         self._launch_token = secrets.token_hex(16)  # 每次启动随机，仅本地打印工具持有
         self._server: ThreadingHTTPServer | None = None
@@ -553,6 +603,9 @@ class StatsServer:
         _StatsHandler._data_file = self.data_file
         _StatsHandler.launch_token = self._launch_token
         _StatsHandler.finance_mode = self.finance_mode
+        _StatsHandler.device_name = self.device_name
+        _StatsHandler.client_id = self.client_id
+        _StatsHandler.take_orders = self.take_orders
 
         # 多线程 HTTP 服务器：避免单请求（如慢代理）阻塞其他请求
         self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _StatsHandler)
