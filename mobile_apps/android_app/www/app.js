@@ -232,6 +232,8 @@ const FLING = {
   edgeRecoverAccel: 0.25, // 恢复段加速占比（0~1）：越小加速越短、减速越长
   snapSpd: 0.4,        // 越界回弹速度（越大越快）
   dampMax: 130,        // 拖拽越界阻尼上限 px
+  settleOmega: 0.012,  // 内容变短收尾：跟随弹簧角频率 rad/ms
+  settleDamping: 0.9,  // 内容变短收尾：阻尼比（接近临界，快速到位无过冲）
 };
 
 class FlingEngine {
@@ -317,7 +319,13 @@ class FlingEngine {
       if (isFinite(sb)) tabOverlay += Math.round(sb);
     } catch (e) { /* 忽略，安全区取 0 */ }
     this.maxY = Math.max(0, ch - vp + (this.opts.bottomPad || 20) + tabOverlay);
-    if (this.y > this.maxY) this.snapBack();
+    // 内容变短（收起卡片等）：单段 S 曲线平滑收到新底部；
+    // 触摸/惯性中不动（松手由弹簧收尾）；内容重新变长时中止进行中的收尾弹簧
+    if (this.y > this.maxY && this._trackId === null && !this.inDecel) {
+      this._settleShrink();
+    } else if (this._spring && this._spring.settle) {
+      this.cancel();
+    }
   }
 
   scheduleMeasure(delay) {
@@ -539,52 +547,92 @@ class FlingEngine {
     }
     this.y = target + dir * this._spring.x; // 拖拽模式从当前形变起步，无跳变
     this._lastT = Date.now();
-    const tick = () => {
-      if (!this._spring || this._destroyed) return;
-      const s = this._spring;
-      const now = Date.now();
-      if (s.compressing) {
-        const dt = Math.min(32, Math.max(1, now - s.t0));
+    this.tick = requestAnimationFrame(() => this._springTick());
+  }
+
+  _springTick() {
+    if (!this._spring || this._spring.settle || this._destroyed) return;
+    const s = this._spring;
+    const now = Date.now();
+    if (s.compressing) {
+      const dt = Math.min(32, Math.max(1, now - s.t0));
+      s.t0 = now;
+      const w = FLING.edgeSpringOmega;
+      const z = FLING.edgeSpringDamping;
+      // 弹簧阻力：x'' = -ω²x - 2ζωx'，初速 = 到达边界的速度
+      const a = -w * w * s.x - 2 * z * w * s.vx;
+      s.vx += a * dt;
+      s.x += s.vx * dt;
+      if (s.x >= FLING.rubberMax) { s.x = FLING.rubberMax; s.vx = 0; }
+      // 压到最深（速度反向）→ 进入 S 曲线恢复
+      if (s.vx <= 0) {
+        s.xMax = s.x;
+        s.compressing = false;
         s.t0 = now;
-        const w = FLING.edgeSpringOmega;
-        const z = FLING.edgeSpringDamping;
-        // 弹簧阻力：x'' = -ω²x - 2ζωx'，初速 = 到达边界的速度
-        const a = -w * w * s.x - 2 * z * w * s.vx;
-        s.vx += a * dt;
-        s.x += s.vx * dt;
-        if (s.x >= FLING.rubberMax) { s.x = FLING.rubberMax; s.vx = 0; }
-        // 压到最深（速度反向）→ 进入 S 曲线恢复
-        if (s.vx <= 0) {
-          s.xMax = s.x;
-          s.compressing = false;
-          s.t0 = now;
-          s.durR = Math.min(640, Math.max(180, s.xMax * FLING.edgeRecoverMsPerPx));
-        }
+        s.durR = Math.min(640, Math.max(180, s.xMax * FLING.edgeRecoverMsPerPx));
+      }
+    } else {
+      // 目标实时钳制到当前边界：内容变短（收尾弹簧）期间 maxY 持续缩小，
+      // 弹簧目标跟着走 → 单段平滑移动，不会停在旧目标上
+      s.target = Math.max(this.minY, Math.min(s.target, this.maxY));
+      const p = Math.min(1, (now - s.t0) / s.durR);
+      // 不对称 S 曲线：前 edgeRecoverAccel 快速起速，后段长时间平滑减速到停
+      const accel = FLING.edgeRecoverAccel;
+      let eased;
+      if (p < accel) {
+        const u = p / accel;
+        eased = accel * u * u * u; // 短加速（easeInCubic 接续）
       } else {
-        const p = Math.min(1, (now - s.t0) / s.durR);
-        // 不对称 S 曲线：前 edgeRecoverAccel 快速起速，后段长时间平滑减速到停
-        const accel = FLING.edgeRecoverAccel;
-        let eased;
-        if (p < accel) {
-          const u = p / accel;
-          eased = accel * u * u * u; // 短加速（easeInCubic 接续）
-        } else {
-          const u = (p - accel) / (1 - accel);
-          eased = accel + (1 - accel) * (1 - Math.pow(1 - u, 3)); // 长减速（easeOutCubic）
-        }
-        s.x = s.xMax * (1 - eased);
+        const u = (p - accel) / (1 - accel);
+        eased = accel + (1 - accel) * (1 - Math.pow(1 - u, 3)); // 长减速（easeOutCubic）
       }
-      this.y = s.target + s.dir * s.x;
-      this._applyRender(this.y); // 越界形变 1:1 渲染，不被拖拽阻尼压缩
-      if (!s.compressing && (now - s.t0) >= s.durR) {
-        this.y = s.target;
-        this._spring = null;
-        this.applyY();
-        return;
-      }
-      this.tick = requestAnimationFrame(tick);
-    };
-    this.tick = requestAnimationFrame(tick);
+      s.x = s.xMax * (1 - eased);
+    }
+    this.y = s.target + s.dir * s.x;
+    this._applyRender(this.y); // 越界形变 1:1 渲染，不被拖拽阻尼压缩
+    if (!s.compressing && (now - s.t0) >= s.durR) {
+      this.y = Math.min(this.y, this.maxY); // 防御：动画期间 maxY 可能已更新
+      this._spring = null;
+      this.applyY();
+      return;
+    }
+    this.tick = requestAnimationFrame(() => this._springTick());
+  }
+
+  // 内容变短（收起卡片等）：阻尼弹簧实时跟随 maxY 平滑收到新底部。
+  // 弹簧对位置/速度积分（无离散跳变）→ 无论何时收起（静止/滚动中/弹回中）
+  // 都不会闪现，也不会两段式移动；中间重测只更新 maxY，弹簧自行跟随。
+  _settleShrink() {
+    if (this._spring && this._spring.settle) return; // 已在收尾跟随
+    this.cancel();
+    this.inDecel = false;
+    this.vel = 0;
+    this._spring = { settle: true, vel: 0, lastT: Date.now() };
+    this.tick = requestAnimationFrame(() => this._settleTick());
+  }
+
+  _settleTick() {
+    if (!this._spring || !this._spring.settle || this._destroyed) return;
+    const s = this._spring;
+    const now = Date.now();
+    const dt = Math.min(32, Math.max(1, now - s.lastT));
+    s.lastT = now;
+    const target = this.maxY; // 目标实时读取（内容持续变短 → 弹簧持续跟随）
+    const w = FLING.settleOmega;
+    const z = FLING.settleDamping;
+    const a = -w * w * (this.y - target) - 2 * z * w * s.vel;
+    s.vel += a * dt;
+    this.y += s.vel * dt;
+    // 渲染原始坐标（对齐小程序 settleTick / 弹回弹簧）：收尾期间 y 始终 > maxY，
+    // 若走 applyY() 的 renderY 阻尼压缩，首帧会相对上一帧原始渲染瞬间跳变 → 闪现
+    this._applyRender(this.y);
+    if (Math.abs(this.y - target) < 0.5 && Math.abs(s.vel) < 0.02) {
+      this.y = target;
+      this._spring = null;
+      this._applyRender(this.y);
+      return;
+    }
+    this.tick = requestAnimationFrame(() => this._settleTick());
   }
 
   snapBack() {

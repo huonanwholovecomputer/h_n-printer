@@ -407,6 +407,10 @@ Component({
       }
       this.setData({ expandedOrders: expanded })
       this._scheduleMeasure()
+      // 详情展开/收起有 0.3s max-height 动画：过渡中途先跟一版（缩小白屏窗口），
+      // 动画结束后再测最终值（引擎收到变小的 maxY 会平滑滚动到新边界，不跳变）
+      setTimeout(() => this._scheduleMeasure(150), 150)
+      setTimeout(() => this._scheduleMeasure(300), 320)
     },
 
     onDetailCancelOrder(e) {

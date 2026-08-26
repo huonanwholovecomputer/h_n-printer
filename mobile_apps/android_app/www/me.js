@@ -2017,6 +2017,9 @@ async function toggleRecordOrders(openid, key) {
       if (wrap && u._expandedKeyOrders[key]) {
         const i2 = wrap.querySelector('.record-orders-inner');
         if (i2) i2.innerHTML = renderRecordOrderContent(u);
+        // 异步渲染后才开始展开动画 → 动画结束后重测滚动边界（收起时避免底部空白）
+        measureAll(150);
+        setTimeout(() => measureAll(320), 340);
       }
     } catch (e) {
       u._ordersLoaded = true;
@@ -2029,6 +2032,7 @@ async function toggleRecordOrders(openid, key) {
     }
   }
   measureAll(150);
+  setTimeout(() => measureAll(220), 220);
   setTimeout(() => measureAll(320), 340);
 }
 
@@ -2250,7 +2254,8 @@ function toggleUserOrdersOrder(id) {
     if (arrow) arrow.classList.toggle('arrow-up', expanded);
   }
   measureAll(150);
-  // 收起动画（0.3s）结束后再次测量，内容变短时界面自然上移对齐小程序
+  // 收起动画（0.3s）期间/结束后多次重测：中途先跟一版缩小白屏窗口，结束后测最终值
+  setTimeout(() => measureAll(220), 220);
   setTimeout(() => measureAll(320), 340);
 }
 

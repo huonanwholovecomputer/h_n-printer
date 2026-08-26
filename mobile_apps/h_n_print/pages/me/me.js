@@ -2254,8 +2254,9 @@ Component({
         expanded[orderId] = true
       }
       this.setData({ expandedOrders: expanded })
-      // 详情展开/收起有 250ms 动画，测量需等动画完成
+      // 详情展开/收起有 250ms 动画：过渡中途先跟一版，动画结束后再测最终值
       this._scheduleMeasure()
+      setTimeout(() => this._scheduleMeasure(120), 120)
       setTimeout(() => this._scheduleMeasure(300), 300)
     },
 

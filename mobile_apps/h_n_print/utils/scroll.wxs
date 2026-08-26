@@ -21,7 +21,9 @@ var CFG = {
   edgeRecoverMsPerPx: 13,   // 恢复阶段时长 ms/px
   edgeRecoverAccel: 0.25,   // 恢复段加速占比（短加速、长减速）
   snapSpd: 0.4,             // 越界回弹速度
-  dampMax: 130              // 拖拽越界阻尼上限 px
+  dampMax: 130,             // 拖拽越界阻尼上限 px
+  settleOmega: 0.012,       // 内容变短收尾：跟随弹簧角频率 rad/ms
+  settleDamping: 0.9        // 内容变短收尾：阻尼比（接近临界，快速到位无过冲）
 };
 
 function sign(v) {
@@ -184,7 +186,7 @@ function startSpring(state, owner, target, dir, v0, x0) {
 }
 
 function springTick(state, owner) {
-  if (!state.running || !state.spring) return;
+  if (!state.running || !state.spring || state.spring.settle) return;
   var s = state.spring;
   var now = getDate().getTime();
   if (s.compressing) {
@@ -220,16 +222,57 @@ function springTick(state, owner) {
     }
     s.x = s.xMax * (1 - eased);
   }
+  // 目标实时钳制到当前边界：内容变短（收尾弹簧）期间 maxY 会持续缩小，
+  // 弹簧目标跟着走 → 单段平滑移动，不会停在旧目标上
+  s.target = Math.max(state.minY, Math.min(s.target, state.maxY));
   state.y = s.target + s.dir * s.x;
   applyRender(state, owner, state.y); // 越界形变 1:1 渲染
   if (!s.compressing && (now - s.t0) >= s.durR) {
-    state.y = s.target;
+    // 防御：动画期间 maxY 可能已被更新（内容变短），旧目标会停在越界处 → 钳制到当前边界
+    state.y = Math.min(state.y, state.maxY);
     state.spring = null;
     state.running = false;
     applyRender(state, owner, state.y);
     return;
   }
   owner.requestAnimationFrame(function () { springTick(state, owner); });
+}
+
+// ---- 内容变短收尾：阻尼弹簧实时跟随 maxY ----
+// 对位置/速度做积分，目标每帧直接读当前 maxY：
+// 目标持续变化只会改变加速度（位置与速度连续），任何时刻都不会出现离散跳变/闪现，
+// 中间重测只更新 maxY，弹簧自行平滑收敛到新底部（单段移动，无两段式）。
+
+function startSettleFollow(state, owner) {
+  state.running = false;
+  state.inDecel = false;
+  state.vel = 0;
+  state.spring = { settle: true, vel: 0, lastT: getDate().getTime() };
+  state.running = true;
+  owner.requestAnimationFrame(function () { settleTick(state, owner); });
+}
+
+function settleTick(state, owner) {
+  if (!state.running || !state.spring || !state.spring.settle) return;
+  var s = state.spring;
+  var now = getDate().getTime();
+  var dt = Math.min(32, Math.max(1, now - s.lastT));
+  s.lastT = now;
+  var target = state.maxY; // 目标实时读取（内容持续变短 → 弹簧持续跟随）
+  var w = CFG.settleOmega;
+  var z = CFG.settleDamping;
+  var a = -w * w * (state.y - target) - 2 * z * w * s.vel;
+  s.vel += a * dt;
+  state.y += s.vel * dt;
+  applyRender(state, owner, state.y);
+  if (Math.abs(state.y - target) < 0.5 && Math.abs(s.vel) < 0.02) {
+    state.y = target;
+    state.spring = null;
+    state.running = false;
+    applyRender(state, owner, state.y);
+    return;
+  }
+  owner.requestAnimationFrame(function () { settleTick(state, owner); });
 }
 
 // ---- 惯性（可调曲线：幂律摩擦 + 低速拖尾）----
@@ -379,11 +422,24 @@ module.exports = {
     state.contentH = newValue.contentH || 0;
     state.listOverflow = !!newValue.listOverflow;
     state.closePicker = !!newValue.closePicker;
-    // 内容变短且当前不在交互/动画中 → 平滑回弹到新边界（不跳变）
-    if (state.y > state.maxY && !state.touching && !state.inDecel && !state.spring) {
-      var visual = dampShift(state.y - state.maxY);
-      startSpring(state, ownerInstance, state.maxY, 1, 0, visual);
+    // 内容变短（maxY 减小）：阻尼弹簧实时跟随目标，平滑收到新底部。
+    // 弹簧对位置/速度积分（无离散跳变）→ 无论何时收起（静止/滚动中/弹回中）
+    // 都不会闪现，也不会出现两段式移动；中间重测只更新 maxY，弹簧自行跟随。
+    if (state.y > state.maxY) {
+      if (!state.touching && !state.inDecel) {
+        if (!(state.spring && state.spring.settle)) {
+          startSettleFollow(state, ownerInstance);
+        }
+      } else {
+        // 触摸/惯性中：只钳制渲染（renderY 带阻尼），松手后由 snapBack/弹簧收尾
+        applyRender(state, ownerInstance, renderY(state));
+      }
     } else {
+      // 内容重新变长：中止进行中的收尾弹簧（否则会继续向旧目标移动）
+      if (state.spring && state.spring.settle) {
+        state.spring = null;
+        state.running = false;
+      }
       applyRender(state, ownerInstance, renderY(state));
     }
   },

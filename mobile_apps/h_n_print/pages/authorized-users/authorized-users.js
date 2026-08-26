@@ -239,6 +239,8 @@ Component({
         this._loadKeyOrders(key, openid)
       }
       this._scheduleMeasure()
+      // 0.32s max-height 动画：过渡中途先跟一版，动画结束后再测最终值
+      setTimeout(() => this._scheduleMeasure(150), 150)
       setTimeout(() => this._scheduleMeasure(300), 300)
     },
 
@@ -258,6 +260,9 @@ Component({
             ['keyOrders.' + key + '.orders']: orders,
           })
           this._scheduleMeasure()
+          // 异步渲染后关联订单列表才开始展开动画（0.32s）：中途 + 结束后各测一次
+          setTimeout(() => this._scheduleMeasure(150), 150)
+          setTimeout(() => this._scheduleMeasure(300), 300)
         },
         fail: () => {
           this.setData({
