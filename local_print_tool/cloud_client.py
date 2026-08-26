@@ -108,7 +108,7 @@ class CloudTask:
         self.delivery_location: str = data.get("delivery_location", "") or ""
         self.urgency: str = data.get("urgency", "低") or "低"
         self.cover_page: bool = bool(data.get("cover_page", False))
-        self.cover_page_price: float = float(data.get("cover_page_price", 0.15) or 0.15)
+        self.cover_page_price: float = float(data.get("cover_page_price", 0.10) or 0.10)
         # v24.1：订单归属（管理员自行打印标记随任务下发，本地标签页预勾选）
         self.owner_name: str = data.get("owner_name", "") or ""
         self.is_admin_print: bool = bool(data.get("is_admin_print", False))
@@ -189,19 +189,40 @@ class CloudClient(QObject):
         self.device_name: str = (device_name or socket.gethostname()).strip()[:64]
         # P0-1: 同机多实例 client_id 冲突兜底 —— GUI 旧逻辑传入的是机器名（socket.gethostname()），
         # 同一台机器多开实例会共用同一 client_id 导致任务互抢。
-        # 此处生成持久化后缀（工具目录下 .client_id 文件），最终形如 "hostname-abcdef1234"。
+        # 此处生成持久化后缀（优先 %APPDATA%\HN打印工具\.client_id，升级覆盖安装不丢失；
+        # 兼容旧版应用目录 .client_id 并迁移），最终形如 "hostname-abcdef1234"。
         if not client_id or client_id == socket.gethostname():
             try:
-                suffix_file = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), ".client_id")
-                if os.path.exists(suffix_file):
-                    with open(suffix_file, "r", encoding="utf-8") as f:
-                        suffix = f.read().strip()
-                    if not suffix:
-                        raise ValueError("空后缀")
-                else:
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+                user_dir = os.path.join(os.environ.get("APPDATA", ""), "HN打印工具") if os.environ.get("APPDATA") else ""
+                user_file = os.path.join(user_dir, ".client_id") if user_dir else ""
+                app_file = os.path.join(app_dir, ".client_id")
+                suffix = ""
+                for candidate in (user_file, app_file):
+                    if not candidate:
+                        continue
+                    try:
+                        if os.path.isfile(candidate):
+                            with open(candidate, "r", encoding="utf-8") as f:
+                                s = f.read().strip()
+                            if s:
+                                suffix = s
+                                break
+                    except OSError:
+                        continue
+                if not suffix:
                     suffix = uuid.uuid4().hex[:10]
-                    with open(suffix_file, "w", encoding="utf-8") as f:
+                written = False
+                if user_dir:
+                    try:
+                        os.makedirs(user_dir, exist_ok=True)
+                        with open(user_file, "w", encoding="utf-8") as f:
+                            f.write(suffix)
+                        written = True
+                    except OSError:
+                        pass
+                if not written:
+                    with open(app_file, "w", encoding="utf-8") as f:
                         f.write(suffix)
                 self.client_id = f"{socket.gethostname()}-{suffix}"
             except Exception as e:
@@ -413,6 +434,20 @@ class CloudClient(QObject):
         except Exception as e:
             logger.warning(f"emit {event} 失败: {e}")
             return False
+
+    def _read_local_log_tail(self, max_bytes: int = 200 * 1024) -> str:
+        """读取本机日志文件（logs/local_tool.log）尾部，供云端日志收集回报。
+        从倒数 max_bytes 字节处开始，跳过可能截断的半行再读取；失败返回空串。"""
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "local_tool.log")
+        try:
+            size = os.path.getsize(log_path)
+            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                if size > max_bytes:
+                    f.seek(size - max_bytes)
+                    f.readline()  # 丢弃半行，保证从完整行开始
+                return f.read()[-max_bytes:]
+        except OSError:
+            return ""
 
     def report_file_ready(self, order_id: int, task_ids: list):
         """预约单阶段①文件下载完成 → 后端 downloading→waiting（冻结时自动解除）。"""
@@ -955,6 +990,18 @@ class CloudClient(QObject):
                 self.status_message.emit(
                     f"☁ 当前接单设备: {holder}" + (f"（所有者：{owner}）" if owner else "")
                     + "，本机未接单")
+
+        @self._sio.on("request_log")
+        def _on_request_log(data):
+            """后端收集在线设备日志：读取本机日志尾部并回报（logs 事件）。"""
+            try:
+                request_id = int((data or {}).get("request_id", 0) or 0)
+                max_bytes = int((data or {}).get("max_bytes", 0) or 0)
+            except (TypeError, ValueError):
+                request_id, max_bytes = 0, 0
+            content = self._read_local_log_tail(max_bytes or 200 * 1024)
+            if self._sio_emit("logs", {"request_id": request_id, "content": content}):
+                self.status_message.emit(f"📋 已回报本机日志（云端日志收集, {len(content)} 字节）")
 
         @self._sio.on("pong")
         def _on_pong():

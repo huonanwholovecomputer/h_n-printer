@@ -236,6 +236,11 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 [data-theme="dark"] .tag.y { color: #fbbf24; }
 .tag.p { background: rgba(139,92,246,.15); color: #8b5cf6; }
 [data-theme="dark"] .tag.p { color: #a78bfa; }
+/* 订单类型固定槽位网格（v5.23）：相同/同类标签在不同订单间竖直对齐——
+   单行 7 槽：自打/接单 | 自动 | 预约 | 免费 | 派送 | 加急 | 封面。
+   每个槽位固定宽度，无标签时留空占位，保证跨行对齐。 */
+.type-grid { display: grid; grid-template-columns: repeat(7, 58px); gap: 4px; }
+.type-cell { display: flex; align-items: center; justify-content: center; min-height: 22px; }
 /* 订单状态标签配色：与微信小程序 status-* 完全一致（亮色=小程序亮色主题，深色=小程序暗色主题） */
 .tag.st-sent            { background: #E8F5E9; color: #2E7D32; }
 .tag.st-printing        { background: #E3F2FD; color: #1565C0; }
@@ -696,7 +701,7 @@ var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '�
 var DEFAULT_PRICING = {
   simplex_price: 0.2,
   duplex_price: 0.3,
-  cover_page_price: 0.15,
+  cover_page_price: 0.10,
   delivery_percentages: { '1号楼北楼': 0, '1号楼南楼': 5, '图书馆': 15, '教学楼E/F': 20, '女生宿舍': 10 },
   urgency_prices: { '低': 0, '中': 0.08, '高': 0.15 }
 };
@@ -2228,19 +2233,33 @@ function _userAgg(orders) {
   arr.sort(function (a, b) { return b.record - a.record; });
   return arr;
 }
-/* 订单类型标签（自打/接单 + 附加服务 + 免费） */
+/* 订单类型标签（自打/接单 + 附加服务 + 免费）—— 固定槽位网格，同类标签跨行竖直对齐 */
 function _orderTypeTags(o, money) {
-  var t = '';
-  t += o.is_admin_print
-    ? '<span class="tag b" title="管理员自行打印的订单">👤自打</span> '
-    : '<span class="tag g" title="顾客下单，接单打印">🤝接单</span> ';
-  if (o.auto_print) t += '<span class="tag p" title="无障碍打印（自动打印）">⚡自动</span> ';
-  if (o.schedule_mode && o.schedule_mode !== 'now') t += '<span class="tag y" title="预约 ' + esc(o.scheduled_at || '') + ' 打印">⏰预约</span> ';
-  if (o.urgency && o.urgency !== '低') t += '<span class="tag r" title="加急费 ' + RMB(parseCents(o.urgency_price || 0)) + '">⚡' + esc(o.urgency) + '</span> ';
-  if (o.delivery_enabled) t += '<span class="tag y" title="派送费 ' + (o.delivery_percentage || 0) + '%">🚚派送</span> ';
-  if (o.cover_page) t += '<span class="tag p" title="封面费 ' + RMB(parseCents(o.cover_page_price || 0)) + '">📄封面</span> ';
-  if (money.free > 0) t += '<span class="tag g" title="含 ' + money.free + ' 个免费文件">🆓免费</span> ';
-  return t;
+  var h = '<span class="type-grid">';
+  // 槽1：自打 / 接单（互斥，恒占位 → 跨订单恒对齐）
+  h += '<span class="type-cell">' + (o.is_admin_print
+    ? '<span class="tag b" title="管理员自行打印的订单">👤自打</span>'
+    : '<span class="tag g" title="顾客下单，接单打印">🤝接单</span>') + '</span>';
+  // 槽2：自动
+  h += '<span class="type-cell">' + (o.auto_print
+    ? '<span class="tag p" title="无障碍打印（自动打印）">⚡自动</span>' : '') + '</span>';
+  // 槽3：预约
+  h += '<span class="type-cell">' + (o.schedule_mode && o.schedule_mode !== 'now'
+    ? '<span class="tag y" title="预约 ' + esc(o.scheduled_at || '') + ' 打印">⏰预约</span>' : '') + '</span>';
+  // 槽4：免费
+  h += '<span class="type-cell">' + (money.free > 0
+    ? '<span class="tag g" title="含 ' + money.free + ' 个免费文件">🆓免费</span>' : '') + '</span>';
+  // 第 2 行：派送
+  h += '<span class="type-cell">' + (o.delivery_enabled
+    ? '<span class="tag y" title="派送费 ' + (o.delivery_percentage || 0) + '%">🚚派送</span>' : '') + '</span>';
+  // 加急
+  h += '<span class="type-cell">' + (o.urgency && o.urgency !== '低'
+    ? '<span class="tag r" title="加急费 ' + RMB(parseCents(o.urgency_price || 0)) + '">⚡' + esc(o.urgency) + '</span>' : '') + '</span>';
+  // 封面
+  h += '<span class="type-cell">' + (o.cover_page
+    ? '<span class="tag p" title="封面费 ' + RMB(parseCents(o.cover_page_price || 0)) + '">📄封面</span>' : '') + '</span>';
+  h += '</span>';
+  return h;
 }
 function _orderAddr(o) {
   var parts = [];
@@ -2356,7 +2375,7 @@ function _renderOrderListHTML() {
   if (!pageOrders.length) {
     h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
   } else {
-    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:64px">来源</th><th style="width:104px">用户</th><th style="width:84px">状态</th><th style="width:88px">金额</th><th style="width:58px">文件</th><th style="width:96px">页数</th><th style="width:270px">类型</th><th style="width:132px">时间</th></tr></thead><tbody>';
+    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:64px">来源</th><th style="width:104px">用户</th><th style="width:84px">状态</th><th style="width:88px">金额</th><th style="width:58px">文件</th><th style="width:96px">页数</th><th style="width:432px">类型</th><th style="width:132px">时间</th></tr></thead><tbody>';
     pageOrders.forEach(function (o) {
       var isExp = !!_cloudExpanded[o.order_id];
       var srcTxt = o.source === 'app' ? 'APP' : (o.source === 'local' ? '本地' : '小程序');
@@ -2486,7 +2505,11 @@ function chartTextColor() {
 }
 
 /* 饼状图引线标签：从扇区内部一点出发 → 弧外折点 → 水平短段到文字（指示块属性，替代图例）。
-   文字紧邻折点放置，超出画布边缘时自动回缩锚定边缘，引线尽可能短。 */
+   文字紧邻折点放置，超出画布边缘时自动回缩锚定边缘，引线尽可能短。
+   防重叠处理（v4.4 修复）：
+   · 过小扇区（弧角 < MIN_ARC）跳过标注，避免多状态时小扇区文字互相重叠（tooltip 仍可查明细）；
+   · 同侧标签按 y 排序做碰撞检测：垂直间距不足时向下错开，放不下则隐藏；
+   · 引线水平段只画到文字近边前 2px，杜绝「引线压在文字上」的叠字问题。 */
 var _leaderLabelPlugin = {
   id: 'leaderLabels',
   afterDatasetsDraw: function (chart) {
@@ -2502,12 +2525,24 @@ var _leaderLabelPlugin = {
     ctx.save();
     ctx.font = '600 12px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif';
     ctx.textBaseline = 'middle';
+
+    var MIN_ARC = 0.09;   // 弧度：小于该弧角的扇区不画标签（≈5.2°，约 1.4%）。
+                          // 足够低让 1%+ 的孤立小扇区也能标注；拥挤场景由下方碰撞检测错开/隐藏兜底
+    var LABEL_GAP = 16;   // 同侧标签最小垂直间距（px）
+    var EDGE = 12;        // 上下留边
+
+    // ── 第 1 步：收集候选标签（跳过过小扇区）──
+    var items = [];
     arcs.forEach(function (arc, i) {
       if (!arc || typeof arc.startAngle !== 'number') return;
-      var mid = arc.startAngle + (arc.endAngle - arc.startAngle) / 2;
+      var span = arc.endAngle - arc.startAngle;
+      if (span < MIN_ARC) return;
+      var mid = arc.startAngle + span / 2;
       var cx = arc.x, cy = arc.y;
       var inner = arc.innerRadius, outer = arc.outerRadius;
-      var col = bgs[i] || '#888';
+      // 标注文字/线段颜色：取扇区色的「加深」色阶，与扇区填充色区分开——
+      // 保留「标签→扇区」的色彩关联，同时避免文字/线段与扇区颜色完全重合（统一压暗 20%）
+      var col = _mixToBlack(bgs[i] || '#888', 0.20);
       var cosM = Math.cos(mid), sinM = Math.sin(mid);
       var right = cosM >= 0;
       // 起点：扇区内部（环厚中点，指示该块）
@@ -2516,30 +2551,71 @@ var _leaderLabelPlugin = {
       // 折点：弧外一点
       var bx = cx + cosM * (outer + 6), by = cy + sinM * (outer + 6);
       // 上下留边，避免垂直方向文字出界
-      by = Math.max(12, Math.min(h - 12, by));
-      // 文字锚点：紧邻折点水平放置；超出画布边缘时回缩锚定边缘
+      by = Math.max(EDGE, Math.min(h - EDGE, by));
       var txt = labels[i] || '';
+      // v4.4：超长标签截断加省略号（悬停 tooltip 可看全文），防止文字溢出画布
+      var MAX_TW = Math.max(110, Math.floor(w * 0.32));
       var tw = ctx.measureText(txt).width;
+      if (tw > MAX_TW) {
+        while (txt.length > 1 && ctx.measureText(txt + '…').width > MAX_TW) {
+          txt = txt.slice(0, -1);
+        }
+        txt += '…';
+        tw = ctx.measureText(txt).width;
+      }
+      items.push({ right: right, sx: sx, sy: sy, bx: bx, by: by, txt: txt, tw: tw, col: col, hidden: false });
+    });
+    if (!items.length) { ctx.restore(); return; }
+
+    // ── 第 2 步：同侧标签碰撞检测 —— 按 y 排序，间距不足向下错开，放不下则隐藏 ──
+    var sides = { true: [], false: [] };
+    items.forEach(function (it) { sides[it.right].push(it); });
+    [true, false].forEach(function (isRight) {
+      var arr = sides[isRight];
+      if (!arr.length) return;
+      arr.sort(function (a, b) { return a.by - b.by; });
+      var prevBy = -Infinity;
+      arr.forEach(function (it) {
+        if (!it.hidden && it.by - prevBy < LABEL_GAP) {
+          var newBy = prevBy + LABEL_GAP;
+          if (newBy <= h - EDGE) it.by = newBy;   // 向下错开，引线随之弯曲指向新位置
+          else it.hidden = true;                   // 已无空间 → 隐藏该标注
+        }
+        if (!it.hidden) prevBy = it.by;
+      });
+    });
+
+    // ── 第 3 步：绘制（水平段只到文字近边前 2px，避免压字）──
+    items.forEach(function (it) {
+      if (it.hidden) return;
+      var bx = it.bx, by = it.by;
       var lx, align;
-      if (right) {
-        if (bx + 8 + tw <= w - 4) { lx = bx + 8; align = 'left'; }
+      if (it.right) {
+        if (bx + 8 + it.tw <= w - 4) { lx = bx + 8; align = 'left'; }
         else { lx = w - 8; align = 'right'; }
       } else {
-        if (bx - 8 - tw >= 4) { lx = bx - 8; align = 'right'; }
+        if (bx - 8 - it.tw >= 4) { lx = bx - 8; align = 'right'; }
         else { lx = 8; align = 'left'; }
       }
-      // 折线：内部起点 → 折点 → 水平短段
-      ctx.strokeStyle = col;
+      // 文字近边（水平段终点，线只画到文字前 2px，不压字）：
+      // 文字在折点右侧 → 近边=文字左缘；文字在折点左侧 → 近边=文字右缘
+      // v4.4：水平安全钳制 —— 文字左右缘绝不越出画布（超长标签已省略号截断，此处兜底）
+      var tl = (align === 'left') ? (lx + 4) : (lx - 4 - it.tw);
+      if (tl < 4) { align = 'left'; lx = 8; tl = 12; }
+      else if (tl + it.tw > w - 4) { align = 'right'; lx = w - 8; tl = w - 12 - it.tw; }
+      var textNear = it.right ? tl : (tl + it.tw);
+      // 折线：内部起点 → 折点 → 水平段（止于文字近边前 2px）
+      ctx.strokeStyle = it.col;
       ctx.lineWidth = 1.4;
       ctx.beginPath();
-      ctx.moveTo(sx, sy);
+      ctx.moveTo(it.sx, it.sy);
       ctx.lineTo(bx, by);
-      ctx.lineTo(lx, by);
+      ctx.lineTo(textNear - 2, by);
       ctx.stroke();
       // 文字
-      ctx.fillStyle = col;
+      ctx.fillStyle = it.col;
       ctx.textAlign = align;
-      ctx.fillText(txt, align === 'left' ? lx + 4 : lx - 4, by);
+      ctx.fillText(it.txt, align === 'left' ? lx + 4 : lx - 4, by);
     });
     ctx.restore();
   }
@@ -3954,13 +4030,14 @@ function loadAuthData(members) {
         box.innerHTML = '<span style="color:var(--muted)">暂无设备记录（本地打印工具连接云端后自动登记）</span>';
         return;
       }
-      var h = '<div class="table-wrap"><table><thead><tr><th class="l">计算机名称</th><th>在线状态</th><th>所有者</th><th>接单</th></tr></thead><tbody>';
+      var h = '<div class="table-wrap"><table><thead><tr><th class="l">计算机名称</th><th>在线状态</th><th>所有者</th><th>接单</th><th>操作</th></tr></thead><tbody>';
       list.forEach(function (d) {
         h += '<tr><td class="l">' + esc(d.device_name) +
              '<div style="font-family:monospace;font-size:.72rem;color:var(--muted)">' + esc(d.client_id) + '</div></td>';
         h += '<td>' + (d.online ? '<span class="tag g">🟢 在线</span>' : '<span class="tag">⚫ 离线</span>') + '</td>';
         h += '<td>' + (d.owner_name ? esc(d.owner_name) : '<span style="color:var(--muted)">未绑定</span>') + '</td>';
-        h += '<td>' + (d.is_active ? '<span class="tag g">接单中</span>' : '<span style="color:var(--muted)">—</span>') + '</td></tr>';
+        h += '<td>' + (d.is_active ? '<span class="tag g">接单中</span>' : '<span style="color:var(--muted)">—</span>') + '</td>';
+        h += '<td><button class="btn danger sm" onclick="deleteDevice(\'' + esc(d.client_id) + '\')">🗑 删除</button></td></tr>';
       });
       h += '</tbody></table></div>';
       h += '<div style="margin-top:10px"><button class="btn sm" onclick="loadAuthData(getMembers())">🔄 刷新</button><span style="color:var(--muted);font-size:.78rem;margin-left:10px">每 15 秒自动刷新</span></div>';
@@ -3990,6 +4067,23 @@ function saveAuthOwner() {
     })
     .catch(function () { toast('❌ 网络错误', 'error'); });
 }
+/* 删除设备注册表中的一台设备（清理软件升级产生的同机旧 ID 等历史遗留）。
+   经 stats_server 代理调用后端 /api/printer/devices/delete（携带打印机 token）。 */
+function deleteDevice(clientId) {
+  if (!clientId) return;
+  openConfirm('确定删除该设备吗？删除后离线设备不会自动恢复（在线设备下次连接会重新登记）；若该设备是当前「接单」设备，接单状态将一并清空。', '删除').then(function (ok) {
+    if (!ok) return;
+    fetch('/api/proxy/printer/devices/delete', {
+      method: 'POST', headers: apiHeaders(),
+      body: JSON.stringify({ client_id: clientId })
+    }).then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (res && res.success) { toast('✅ 设备已删除', 'success'); loadAuthData(getMembers()); }
+        else toast('❌ ' + ((res && res.message) || '删除失败'), 'error');
+      })
+      .catch(function () { toast('❌ 网络错误', 'error'); });
+  });
+}
 /* 授权页设备列表自动刷新（仅当前处于授权页且已解锁时执行，避免后台空转） */
 setInterval(function () {
   if (currentTab === 'auth' && unlocked.auth && FINANCE_MODE !== 'local') loadAuthData(getMembers());
@@ -4002,7 +4096,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.22</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.23</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -4030,6 +4124,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.20：统一口径栏 —— 顶部新增全局口径栏（时间 / 成员 / 来源），单选决定「看哪些数据」，指标 / 视角 / 状态 / 分页等「怎么展示」控件留在模块内部；KPI、趋势、图表、订单明细共用同一份筛选数据；「成员账目」合并展示（成员 / 免费打印 / 订单/云端收益记录 / 手动代收 / 差额），来源筛选不影响对账列，上月环比徽标（自然月口径）。</p>' +
     '<p style="margin-top:10px">v5.21：打印价格统一管理 + 收益口径修正 —— 设置页新增「打印价格」区块（单双面价 / 派送地点百分比 / 优先级加急价 / 首页费：云端模式写服务器 pricing.json 全端生效，本地模式存 print_data.json；支持添加 / 删除派送地点，密码保护）；收益统计计入订单级附加服务费（派送 / 加急 / 首页，按订单有效文件状态归入已入账或应收未收，放弃 / 取消 / 打回 / 失败订单不计）；订单明细金额配色：自打且已完成订单金额用蓝色与「自打」标记一致；设置页移除「外观」主题板块（右上角主题切换保留）；优先级加急价按 低 → 中 → 高 顺序展示。</p>' +
     '<p style="margin-top:10px">v5.22：设备授权 + 多设备接单 —— 新增「🔐 授权」标签页（独立密码保护）：① 本设备所有者从成员列表绑定，绑定后本地打印工具新建标签页默认归属该所有者、默认关闭「管理员自行打印」；② 云端设备列表展示所有连接过云服务器的设备（计算机名称 / 在线状态 / 所有者 / 是否接单，每 15 秒自动刷新，绑定后即时广播生效）。多设备共连服务器时仅「启用接单」的设备接收订单（同一时间唯一接管者，被其他设备占用时提示接管者名称与所有者）；订单明细「用户」列改为显示下单用户昵称（绑定微信小程序/APP 后优先微信小程序昵称，修改昵称实时同步）；修复授权页设备列表/所有者刷新被代理过滤的问题。</p>' +
+    '<p style="margin-top:10px">v5.23：设备删除 + 图表与价格修正 —— ① 授权页云端设备列表新增「🗑 删除」按钮（清理软件升级产生的同机旧 ID 与历史遗留设备；删除当前接单设备时自动清空接管记录）；② 饼状图引线标签防重叠：过小扇区跳过标注、同侧标签碰撞检测自动错开/隐藏、引线水平段只画到文字近边前 2px（不再压字）；③ 打印价格：本地模式首页费默认值统一为 0.10（与云端 pricing.json 一致）。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

@@ -396,6 +396,18 @@ def cleanup_expired_files():
     if active_file_ids:
         print(f"  [CLEANUP] 跳过 {len(active_file_ids)} 个活跃订单引用的文件")
 
+    # v4.4 修复：MD5 去重复用会让多个 files 行共享同一物理文件（上传时复用 existing_path）。
+    # 收集活跃行引用的全部物理路径——即使某行已过期且非活跃，只要其物理路径仍被其他活跃行
+    # 引用，删除时必须跳过；否则排队/打印中订单的文件会被提前删掉（下载 404，如订单 failed）。
+    active_paths = set()
+    if active_file_ids:
+        _ph = ",".join("?" for _ in active_file_ids)
+        for (_p,) in conn.execute(
+            f"SELECT path FROM files WHERE id IN ({_ph}) AND path != ''", list(active_file_ids)
+        ).fetchall():
+            if _p:
+                active_paths.add(os.path.normpath(_p))
+
     # ---- 幽灵记录清理（不受保留期限制）----
     ghost_ids = []
     for (fid, fpath) in conn.execute("SELECT id, path FROM files").fetchall():
@@ -432,6 +444,11 @@ def cleanup_expired_files():
 
         # 跳过活跃订单引用的文件
         if file_id in active_file_ids:
+            skipped_active += 1
+            continue
+
+        # v4.4：共享物理文件保护——本行过期且非活跃，但物理路径仍被其他活跃行引用 → 跳过删除
+        if file_path and os.path.normpath(file_path) in active_paths:
             skipped_active += 1
             continue
 
@@ -1194,7 +1211,7 @@ def init_db():
         ("urgency", "TEXT", "'低'"),
         ("urgency_price", "REAL", "0"),
         ("cover_page", "INTEGER", "0"),
-        ("cover_page_price", "REAL", "0.15"),
+        ("cover_page_price", "REAL", "0.10"),
         ("pickup_address", "TEXT", "''"),
     ]:
         try:
@@ -1950,7 +1967,7 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             task_msg["delivery_location"] = o_row["delivery_location"] or ""
             task_msg["urgency"] = o_row["urgency"] or "低"
             task_msg["cover_page"] = bool(o_row["cover_page"])
-            task_msg["cover_page_price"] = float(o_row["cover_page_price"] or 0.15)
+            task_msg["cover_page_price"] = float(o_row["cover_page_price"] or 0.10)
             # v24.1：订单归属标记随任务下发，本地工具据此预勾选"管理员自行打印"
             task_msg["owner_name"] = o_row["owner_name"] or ""
             task_msg["is_admin_print"] = bool(o_row["is_admin_print"])
@@ -3029,6 +3046,29 @@ def on_page_range_truncated(data):
     conn.close()
 
 
+# ── 在线设备日志收集（日志管理页发起：后端下发 request_log → 各在线设备回报本机日志）──
+_collect_logs_lock = threading.Lock()
+_collect_logs: dict = {}      # client_id → 设备回报的日志内容
+_collect_request_id = 0       # 区分多次收集请求，防旧回报串台
+_COLLECT_LOG_MAX_BYTES = 200 * 1024  # 每台设备最多回报 200KB 尾部日志
+
+
+@socketio.on("logs")
+def on_device_logs(data):
+    """在线设备回报日志（配合 /api/log/collect_all 下发的 request_log 事件）。"""
+    client_id = _find_client_id_by_sid(request.sid)
+    if not client_id:
+        return
+    if not isinstance(data, dict):
+        return
+    # 仅接受本次收集请求（request_id 匹配）的回报，防上一轮迟到的回报串台
+    with _collect_logs_lock:
+        if data.get("request_id") != _collect_request_id:
+            return
+        content = str(data.get("content", "") or "")
+        _collect_logs[client_id] = content[:_COLLECT_LOG_MAX_BYTES]
+
+
 # ==================== 页面分析请求（推送到本地打印工具）====================
 
 
@@ -3312,7 +3352,7 @@ def get_file_page(file_id):
     （去重由 request_page_analysis 内部统一 30s 防抖，与 on_connect 补推共享）。"""
     conn = get_db()
     row = conn.execute(
-        "SELECT page_count, page_count_verified, original_name FROM files WHERE id = ?", (file_id,)
+        "SELECT page_count, page_count_verified, original_name, path FROM files WHERE id = ?", (file_id,)
     ).fetchone()
     conn.close()
     if not row:
@@ -3324,6 +3364,24 @@ def get_file_page(file_id):
         if ext in (".doc", ".docx"):
             # 统一防抖在 request_page_analysis 内部：30s 内已被补推/轮询推过则跳过
             request_page_analysis(file_id, fname)
+    # v4.4：PDF 等后端可直接数页的类型，若历史/异常导致页数缺失，轮询时服务端补数——
+    # 不依赖本地打印工具（本地工具离线也不影响这类文件确认页数）
+    if (row["page_count"] or 0) <= 0 and not row["page_count_verified"]:
+        ext = os.path.splitext(row["original_name"] or "")[1].lower()
+        if ext and ext not in (".doc", ".docx"):
+            fpath = os.path.join(UPLOAD_DIR, row["path"]) if row.get("path") else ""
+            if fpath and os.path.exists(fpath):
+                new_count = get_file_page_count(fpath, ext.lstrip("."))
+                if new_count > 0:
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE files SET page_count = ?, page_count_verified = 1 WHERE id = ?",
+                        (new_count, file_id),
+                    )
+                    conn.commit()
+                    conn.close()
+                    row["page_count"] = new_count
+                    row["page_count_verified"] = True
     return jsonify({
         "success": True,
         "page_count": row["page_count"] or 0,
@@ -4022,7 +4080,7 @@ def submit_order():
         urgency = data.get("urgency", "低")
         urgency_price = max(0.0, min(100.0, float(data.get("urgency_price", 0) or 0)))
         cover_page = int(data.get("cover_page", 0) or 0)
-        cover_page_price = max(0.0, min(100.0, float(data.get("cover_page_price", 0.15) or 0)))
+        cover_page_price = max(0.0, min(100.0, float(data.get("cover_page_price", 0.10) or 0)))
         pickup_address = data.get("pickup_address", "")
         auto_print = int(data.get("auto_print", 0) or 0)  # 无障碍打印：提交后自动开始打印
     except (ValueError, TypeError):
@@ -4446,7 +4504,7 @@ def pull_queued_orders():
         "delivery_location": task.get("delivery_location", "") or "",
         "urgency": task.get("urgency", "低") or "低",
         "cover_page": bool(task.get("cover_page", False)),
-        "cover_page_price": float(task.get("cover_page_price", 0.15) or 0.15),
+        "cover_page_price": float(task.get("cover_page_price", 0.10) or 0.10),
         "auto_print": bool(task.get("auto_print", False)),
         "owner_name": task.get("owner_name", "") or "",
         "is_admin_print": bool(task.get("is_admin_print", False)),
@@ -4602,6 +4660,40 @@ def printer_bind_owner():
     return jsonify({"success": True, "message": "所有者已保存"})
 
 
+@app.route("/api/printer/devices/delete", methods=["POST"])
+def printer_devices_delete():
+    """删除设备注册表中的一台设备（清理历史遗留 / 重复 client_id，如软件升级后产生的新 ID）。
+    若删除的是当前「接单」设备则同时清空接管记录；在线设备下次连接会自动重新登记。"""
+    token = _get_printer_token()
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()
+    if not client_id or len(client_id) > 64:
+        return jsonify({"success": False, "message": "client_id 无效"}), 400
+
+    devices = load_devices()
+    existed = client_id in devices
+    devices.pop(client_id, None)
+    save_devices(devices)
+
+    cleared_claim = False
+    with _claim_lock:
+        claim = _load_claim_impl()
+        if claim.get("active_client_id") == client_id:
+            claim.pop("active_client_id", None)
+            claim.pop("owner_name", None)
+            _save_claim_impl(claim)
+            cleared_claim = True
+
+    if not existed and not cleared_claim:
+        return jsonify({"success": False, "message": "设备不存在"}), 404
+
+    broadcast_printer_state()
+    print(f"[DEV] 已删除设备 {client_id}（接单接管{'已清空' if cleared_claim else '未受影响'}）")
+    return jsonify({"success": True, "message": "设备已删除"})
+
+
 @app.route("/api/orders", methods=["GET"])
 @login_required
 def get_orders():
@@ -4635,6 +4727,24 @@ def get_orders():
         source_clause = " AND source = 'wechat'"
         source_params = []
 
+    def _user_orders_clause(uid: str):
+        """构造「某用户的任务列表」查询条件。
+
+        默认按 openid=uid 过滤；若该 openid 在收支清算成员绑定表中绑定了成员，
+        则额外并入本地打印工具创建的、归属该成员的本地订单
+        （openid='local' AND source='local' AND owner_name=成员名）——
+        使「历史授权用户 / 管理管理员 / 我的订单」的任务列表能看到名下本地打印的订单
+        （v4.4 修复：此前本地订单 openid='local' 永远匹配不到具体用户）。
+        带 source 过滤时保持原语义（只在指定来源内查询），不做并入。"""
+        base = "openid = ?"
+        p = [uid]
+        if not source_filter:
+            bound = _get_bound_owner_name(uid)
+            if bound:
+                base = "(openid = ? OR (source = 'local' AND owner_name = ?))"
+                p = [uid, bound]
+        return base + source_clause, p + source_params
+
     if view_all:
         # 超级管理员查看全部订单
         where_clause = "1 = 1" + source_clause
@@ -4645,8 +4755,7 @@ def get_orders():
         params = []
     elif is_super and target_openid:
         # 超级管理员查看指定用户
-        where_clause = "openid = ?" + source_clause
-        params = [target_openid] + source_params
+        where_clause, params = _user_orders_clause(target_openid)
     elif role == "admin" and target_openid:
         # 管理员查看指定用户：需验证该用户是否由本管理员授权
         user_conn = get_user_db()
@@ -4658,12 +4767,10 @@ def get_orders():
         if not auth_row:
             conn.close()
             return jsonify({"success": False, "message": "无权查看该用户的订单"}), 403
-        where_clause = "openid = ?" + source_clause
-        params = [target_openid] + source_params
+        where_clause, params = _user_orders_clause(target_openid)
     else:
-        # 默认：所有角色只看自己的订单
-        where_clause = "openid = ?" + source_clause
-        params = [g.openid] + source_params
+        # 默认：所有角色只看自己的订单（含归属自己绑定成员的本地订单）
+        where_clause, params = _user_orders_clause(g.openid)
 
     # 查询总数
     total = conn.execute(
@@ -5429,6 +5536,34 @@ def authorized_users():
                     "last_order": lr["last_order"] or "",
                     "order_count": lr["order_count"] or 0,
                 }
+            # v4.4：并入归属本地订单 —— 用户绑定收支成员后，该成员名下的本地打印订单
+            # （source='local', owner_name=成员名）计入该用户的关联订单数与最近订单时间，
+            # 与任务列表 /api/orders?openid= 的归并口径保持一致。
+            bound_map = {}  # openid → 绑定的成员名
+            for oid in user_openids:
+                b = _get_bound_owner_name(oid)
+                if b:
+                    bound_map[oid] = b
+            if bound_map:
+                names = sorted(set(bound_map.values()))
+                ph = ",".join("?" for _ in names)
+                local_rows = orders_conn.execute(
+                    f"""SELECT owner_name, MAX(created_at) AS last_order, COUNT(*) AS order_count
+                        FROM orders
+                        WHERE source = 'local' AND owner_name IN ({ph})
+                        GROUP BY owner_name""",
+                    names,
+                ).fetchall()
+                local_by_name = {r["owner_name"]: r for r in local_rows}
+                for oid, bname in bound_map.items():
+                    lr = local_by_name.get(bname)
+                    if not lr:
+                        continue
+                    st = order_stats.setdefault(oid, {"last_order": "", "order_count": 0})
+                    st["order_count"] += lr["order_count"] or 0
+                    lo = lr["last_order"] or ""
+                    if lo and (not st["last_order"] or lo > st["last_order"]):
+                        st["last_order"] = lo
         finally:
             orders_conn.close()
 
@@ -7101,6 +7236,77 @@ def log_fetch():
     else:
         content = "".join(lines[-tail:])
     return jsonify({"success": True, "size": len(content.encode("utf-8")), "content": content})
+
+
+@app.route("/api/log/collect_all", methods=["POST"])
+def log_collect_all():
+    """收集所有在线打印设备的日志（本地打印工具「日志管理」页发起，需打印机 token）。
+
+    向所有在线客户端 SocketIO 推送 request_log（附本次 request_id），等待各设备
+    回报本机日志尾部（logs/local_tool.log 末尾 200KB）；超时未回报的设备标记 error。
+    body: {"timeout": 秒（2-20，默认 8）}
+    response: {"success": true, "logs": [{client_id, device_name, online, content | error}]}
+    """
+    global _collect_request_id
+    token = _get_printer_token()
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        timeout = max(2, min(20, int(data.get("timeout", 8) or 8)))
+    except (ValueError, TypeError):
+        timeout = 8
+
+    active = get_active_clients()
+    if not active:
+        return jsonify({"success": True, "logs": []})
+
+    with _collect_logs_lock:
+        _collect_request_id += 1
+        request_id = _collect_request_id
+        _collect_logs.clear()
+
+    # 向所有在线打印机客户端下发收集指令
+    for cid in active:
+        with printer_clients_lock:
+            info = printer_clients.get(cid)
+            sid = info["sid"] if info else None
+        if sid:
+            try:
+                socketio.emit("request_log", {"request_id": request_id, "max_bytes": _COLLECT_LOG_MAX_BYTES}, to=sid)
+            except Exception as e:
+                print(f"  [LOG] 下发 request_log 到 {cid} 失败: {e}")
+
+    # 等待各设备回报（轮询；eventlet 下 sleep 让出协程，socketio 事件可并发处理）
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _collect_logs_lock:
+            received = set(_collect_logs.keys())
+        if received >= set(active):
+            break
+        time.sleep(0.2)
+
+    with _collect_logs_lock:
+        collected = dict(_collect_logs)
+
+    devices = load_devices()
+    logs = []
+    for cid in active:
+        entry = devices.get(cid) or {}
+        item = {
+            "client_id": cid,
+            "device_name": entry.get("device_name", "") or cid,
+            "online": True,
+        }
+        content = collected.get(cid)
+        if content is None:
+            item["error"] = "超时未回报"
+        else:
+            item["content"] = content
+        logs.append(item)
+    collected_count = sum(1 for l in logs if "content" in l)
+    print(f"[LOG] 在线设备日志收集完成: {collected_count}/{len(logs)} 台回报（timeout={timeout}s）")
+    return jsonify({"success": True, "logs": logs, "collected": collected_count})
 
 
 # ==================== 启动 ====================

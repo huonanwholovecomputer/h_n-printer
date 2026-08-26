@@ -235,7 +235,7 @@
           <view class="detail-section">
             <view class="detail-row detail-price-row">
               <text class="detail-label">合计价格</text>
-              <text class="detail-price-value status-{{item.status}}">¥{{item.totalPriceDisplay}}</text>
+              <text class="detail-price-value status-{{item.status}}{{item.is_admin_print && item.status === 'sent' ? ' is-self-sent' : ''}}">¥{{item.totalPriceDisplay}}</text>
             </view>
           </view>
 

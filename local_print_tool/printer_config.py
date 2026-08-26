@@ -35,7 +35,7 @@ class TabSettings:
     delivery_enabled: bool = False
     delivery_location: str = ""
     cover_page: bool = False
-    cover_page_price: float = 0.15
+    cover_page_price: float = 0.10
     urgency: str = "低"
     frozen: bool = False  # 打印后锁定，禁止任何编辑，仅允许删除标签页
     # 订单归属（v24）：本标签页订单属于谁 + 是否管理员自行打印（非顾客订单）
@@ -66,7 +66,7 @@ class TabSettings:
             delivery_enabled=bool(data.get("delivery_enabled", False)),
             delivery_location=data.get("delivery_location", ""),
             cover_page=bool(data.get("cover_page", False)),
-            cover_page_price=float(data.get("cover_page_price", 0.15)),
+            cover_page_price=float(data.get("cover_page_price", 0.10)),
             urgency=data.get("urgency", "低"),
             frozen=bool(data.get("frozen", False)),
             owner_name=(data.get("owner_name") or "").strip(),
@@ -312,7 +312,7 @@ class PrinterConfig:
         "高": 0.15,
     })
     cover_page: bool = False                # 是否打印首页信息
-    cover_page_price: float = 0.15          # 首页信息单价
+    cover_page_price: float = 0.10          # 首页信息单价
     pickup_address: str = "1号楼202宿舍"    # 自取地址
     last_order_number: int = 0              # 订单号计数器
     # 订单归属（v24）：管理员姓名列表，供标签页订单归属下拉选择
@@ -403,7 +403,7 @@ class PrinterConfig:
                 "低": 0.0, "中": 0.08, "高": 0.15,
             }),
             cover_page=bool(data.get("cover_page", False)),
-            cover_page_price=float(data.get("cover_page_price", 0.15)),
+            cover_page_price=float(data.get("cover_page_price", 0.10)),
             pickup_address=data.get("pickup_address", "1号楼202宿舍"),
             last_order_number=int(data.get("last_order_number", 0)),
             # dict/list 字段防 null：被手改/写坏为 null 时退回默认

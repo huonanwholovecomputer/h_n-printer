@@ -826,7 +826,7 @@ function orderCardHTML(o, expanded, deliveredLabel) {
       ${(o.files && o.files.length) ? `<view class="detail-section"><view class="detail-section-title">文件列表 (${o.files.length})</view>${fileRows}</view>` : ''}
       ${extRows}
       <view class="detail-section">
-        <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text><text class="detail-price-value status-${o.status || 'queued'}">¥${o.totalPriceDisplay || '0.00'}</text></view>
+        <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text><text class="detail-price-value status-${o.status || 'queued'}${(o.is_admin_print && o.status === 'sent') ? ' is-self-sent' : ''}">¥${o.totalPriceDisplay || '0.00'}</text></view>
       </view>
       <view class="detail-actions">
         ${(o.status === 'queued' || o.status === 'printing') ? `<button class="btn-cancel-sm" data-cancel-order="${o.id}">取消任务</button>` : ''}

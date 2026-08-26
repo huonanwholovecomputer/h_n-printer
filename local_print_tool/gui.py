@@ -25,6 +25,7 @@ from PySide6.QtCore import (
     QTimer,
     QObject,
     QEvent,
+    QEventLoop,
     QPropertyAnimation,
     QEasingCurve,
     QUrl,
@@ -246,7 +247,10 @@ def _truncate_filename(filename: str, max_width: int = 52) -> str:
 
 
 def _get_persistent_client_id() -> str:
-    """生成持久化客户端 ID：优先读工具目录下 .client_id 文件，不存在则生成并写入。
+    """生成持久化客户端 ID：优先用户级目录（%APPDATA%\\HN打印工具），
+    升级/覆盖安装应用目录时不丢失 .client_id，避免同一台机器每次升级生成新 ID
+    （否则收支清算「授权」页会堆积同机旧设备，如 DESKTOP-xxx-aaaa 与 DESKTOP-xxx-bbbb 并存）。
+    兼容旧版：应用目录已存在的 .client_id 优先复用并迁移到用户级目录（升级后 ID 保持不变）。
 
     同机多实例共用 hostname 会导致云端 client_id 冲突（任务可能被错误派发/回滚），
     因此追加一个随机后缀并持久化，重启后保持不变。
@@ -254,21 +258,43 @@ def _get_persistent_client_id() -> str:
     import socket as _socket
     import uuid
     hostname = _socket.gethostname()
-    id_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".client_id")
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    user_dir = os.path.join(os.environ.get("APPDATA", ""), "HN打印工具") if os.environ.get("APPDATA") else ""
+    user_file = os.path.join(user_dir, ".client_id") if user_dir else ""
+    app_file = os.path.join(app_dir, ".client_id")
     suffix = ""
-    try:
-        if os.path.isfile(id_file):
-            with open(id_file, "r", encoding="utf-8") as f:
-                suffix = f.read().strip()
-        if not suffix:
-            suffix = uuid.uuid4().hex[:10]
-            with open(id_file, "w", encoding="utf-8") as f:
+    # 读取：用户级优先，其次旧版应用目录（读到即迁移）
+    for candidate in (user_file, app_file):
+        if not candidate:
+            continue
+        try:
+            if os.path.isfile(candidate):
+                with open(candidate, "r", encoding="utf-8") as f:
+                    s = f.read().strip()
+                if s:
+                    suffix = s
+                    break
+        except OSError:
+            continue
+    if not suffix:
+        suffix = uuid.uuid4().hex[:10]
+    # 写入：用户级优先（升级不丢）；失败退回应用目录
+    written = False
+    if user_dir:
+        try:
+            os.makedirs(user_dir, exist_ok=True)
+            with open(user_file, "w", encoding="utf-8") as f:
                 f.write(suffix)
-    except Exception:
-        suffix = ""
-    if suffix:
-        return f"{hostname}-{suffix}"
-    return hostname
+            written = True
+        except OSError:
+            pass
+    if not written:
+        try:
+            with open(app_file, "w", encoding="utf-8") as f:
+                f.write(suffix)
+        except OSError:
+            pass
+    return f"{hostname}-{suffix}" if suffix else hostname
 
 
 def _enable_smooth_scroll(view: QAbstractScrollArea) -> None:
@@ -725,7 +751,7 @@ class PrintWorker(QThread):
                 config.urgency = cfg_dict.get("urgency", "低")
                 config.urgency_prices = cfg_dict.get("urgency_prices", {})
                 config.cover_page = True
-                config.cover_page_price = cfg_dict.get("cover_page_price", 0.15)
+                config.cover_page_price = cfg_dict.get("cover_page_price", 0.10)
                 config.pickup_address = cfg_dict.get("pickup_address", "")
 
                 ok = generate_cover_page_pdf(
@@ -1508,6 +1534,21 @@ class MainWindow(QMainWindow):
         self._scheduled_check_timer.setInterval(1000)
         self._scheduled_check_timer.timeout.connect(self._check_scheduled_timeouts)
         self._scheduled_check_timer.start()
+        # 单实例置前通知：新实例启动时经命名事件通知本实例，把窗口置于前台（500ms 轮询）
+        from single_instance import get_front_event, check_front_request
+        self._front_event = get_front_event()
+        if self._front_event:
+            self._front_timer = QTimer(self)
+            self._front_timer.timeout.connect(self._on_bring_to_front_request)
+            self._front_timer.start(500)
+        # 价格周期校验：借每秒定时器节流（每 300s 一次），与云端 pricing.json / 本地配置比对，
+        # 网络请求在后台线程执行（_sync_pricing(from_thread=True)），不卡界面
+        self._pricing_check_counter: int = 0
+        self._pricing_changed_flag: bool = False  # _sync_pricing 发现价格变化 → 主线程打日志
+        # 打印启动守卫：取号/上报期间禁止再次触发开始打印（防止 processEvents 等待窗口内的重入）
+        self._print_starting: bool = False
+        # 窗口关闭守卫：打印启动的 processEvents 等待期间窗口可能被关闭，置位后中止后续流程
+        self._closing: bool = False
 
         self.setWindowTitle("HN 本地打印工具")
         # 设置窗口图标
@@ -1613,7 +1654,9 @@ class MainWindow(QMainWindow):
 
         # 启动后同步打印价格：云端模式读 /api/pricing，本地模式读收支统计本地配置。
         # 价格统一在「收支统计 → 设置」维护，主界面不再提供价格编辑入口。
-        QTimer.singleShot(800, self._sync_pricing)
+        # 启动后后台同步打印价格（避免主线程 8s 网络超时冻结界面，阻塞云端信号处理）
+        QTimer.singleShot(800, lambda: threading.Thread(
+            target=self._sync_pricing, kwargs={"from_thread": True}, daemon=True).start())
 
         # 初始化离线同步引擎，启动后台定时同步（仅云端模式下自动把本地库订单定时上报；
         # 本地模式不启动——否则残留的旧云端 token 会把本地订单纯本地订单静默上传到旧云端）
@@ -3646,6 +3689,8 @@ class MainWindow(QMainWindow):
                         tab.cover_page_price = self._config.cover_page_price
             if changed:
                 self._save_config()
+                # 标记价格变化，由主线程 _on_pricing_synced 打日志（此处可能在后台线程执行，不能直接 _log）
+                self._pricing_changed_flag = True
             if from_thread:
                 self._pricingSynced.emit()
             else:
@@ -3676,6 +3721,12 @@ class MainWindow(QMainWindow):
                     self._urgency_combo.blockSignals(False)
             self._update_price_labels()
             self._refresh_tab_display()
+            if getattr(self, '_pricing_changed_flag', False):
+                self._pricing_changed_flag = False
+                source = "云端" if self._config.cloud_enabled else "本地"
+                self._log(f"🔄 价格已与{source}配置同步: "
+                          f"单面 {self._config.simplex_price:.2f} | 双面 {self._config.duplex_price:.2f} | "
+                          f"首页费 {self._config.cover_page_price:.2f}")
         except Exception as e:
             logger.debug(f"刷新价格显示失败: {e}")
 
@@ -4239,27 +4290,44 @@ class MainWindow(QMainWindow):
         # 已固定的标签页不再申请新订单号
         if self._is_current_tab_frozen():
             return ""
-        # 尝试从后端获取
+        # 尝试从后端获取（网络放后台线程 + processEvents 保活事件循环，
+        # 避免同步 GET 冻结主线程导致云端推送/下载完成等信号延迟处理）
         online = self._cloud_client and self._cloud_client.is_connected()
         if online and self._cloud_client.api_url and self._cloud_client.token:
-            try:
-                resp = http_requests.get(
-                    f"{self._cloud_client.api_url}/api/next_order_number",
-                    params={**{"token": self._cloud_client.token}, **self._current_owner_params()},
-                    timeout=5,
-                )
-                if resp.ok:
-                    data = resp.json()
-                    if data.get("success"):
-                        order_number = data.get("order_number", "")
-                        if order_number:
-                            for j in jobs: j.order_number = order_number
-                            self._set_current_jobs(jobs)
-                            self._refresh_tab_display()
-                            self._log(f"📋 已分配订单号: {order_number}")
-                            return order_number
-            except Exception:
-                pass
+            tab_key = self._current_tab
+            result: dict = {}
+
+            def _net():
+                try:
+                    resp = http_requests.get(
+                        f"{self._cloud_client.api_url}/api/next_order_number",
+                        params={**{"token": self._cloud_client.token}, **self._current_owner_params()},
+                        timeout=5,
+                    )
+                    if resp.ok:
+                        data = resp.json()
+                        result["order_number"] = data.get("order_number", "") if data.get("success") else ""
+                    else:
+                        result["order_number"] = ""
+                except Exception:
+                    result["order_number"] = ""
+
+            threading.Thread(target=_net, daemon=True).start()
+            deadline = time.time() + 6
+            while "order_number" not in result and time.time() < deadline:
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                time.sleep(0.02)
+            order_number = result.get("order_number", "")
+            if self._closing:
+                return ""  # 等待期间窗口被关闭，中止
+            if order_number:
+                # 等待期间用户可能已切换标签页：仅当仍在原标签页时才写回
+                if self._current_tab == tab_key:
+                    for j in jobs: j.order_number = order_number
+                    self._set_current_jobs(jobs)
+                    self._refresh_tab_display()
+                    self._log(f"📋 已分配订单号: {order_number}")
+                return order_number
         # 离线：生成本地临时号（统一 -L 格式，连线后自动换正式号）
         order_number = self._generate_local_order_number_l()
         for j in jobs:
@@ -4672,6 +4740,9 @@ class MainWindow(QMainWindow):
         if self._worker is not None and self._worker.isRunning():
             self._log("⚠️ 已有打印任务正在进行，不能重复启动")
             return False
+        if self._print_starting:
+            self._log("⏳ 正在获取订单号/上报订单，请稍候…")
+            return False
 
         # 打印前校验页码范围：页数已知且范围非法 → 弹一次确认框（确认后按全部页打印）
         invalid_warned = False
@@ -4705,6 +4776,8 @@ class MainWindow(QMainWindow):
         self._save_config()
         self._refresh_tab_display()
         self._log(f"🔒 标签页 {target_key} 已固定，打印完成后不可编辑")
+        # 立即禁用「开始打印」按钮：取号/上报的等待窗口内用户也能看到打印已开始
+        self._btn_start.setEnabled(False)
 
         from datetime import datetime
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4741,109 +4814,15 @@ class MainWindow(QMainWindow):
         # 获取订单号并上传：在线直接上报后端，离线暂存本地数据库
         # 注意：如果标签页已有订单号（用户之前点击了"复制"），则复用该订单号，
         # 避免重复调用 /api/next_order_number 导致订单号浪费。
+        # 网络操作放后台线程 + processEvents 保活事件循环，期间云端推送/下载完成信号不被冻结。
         online = self._cloud_client and self._cloud_client.is_connected()
-        order_number = ""
-        uploaded = False
-        existing_order = ""
-        for j in flat_jobs:
-            if j.order_number:
-                existing_order = j.order_number
-                break
-
-        if existing_order:
-            # 复用已有的订单号（来自之前的"复制"操作）
-            order_number = existing_order
-            self._log(f"📋 复用已有订单号: {order_number}")
-
-            # 在线时直接上传（离线时等待同步）
-            if online and self._cloud_client.api_url and self._cloud_client.token:
-                try:
-                    resp = http_requests.post(
-                        f"{self._cloud_client.api_url}/api/local_orders",
-                        params={"token": self._cloud_client.token},
-                        json={
-                            "order_number": order_number,
-                            "total_price": total_price,
-                            "files": files_data,
-                            "created_at": created_at,
-                            # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
-                            "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
-                            "is_admin_print": bool(tab.is_admin_print) if tab else True,
-                            # 附加服务上报（与计费口径一致）
-                            **extra_fields,
-                        },
-                        timeout=10,
-                    )
-                    if resp.ok and resp.json().get("success"):
-                        self._log(f"📋 订单已上报云端: {order_number} ({len(files_data)} 个文件)")
-                        uploaded = True
-                    else:
-                        self._log(f"⚠️ 订单上报云端失败: {resp.text[:200] if resp.text else '无响应'}")
-                except Exception as e:
-                    self._log(f"⚠️ 订单上报云端失败: {e}")
-        elif online and self._cloud_client.api_url and self._cloud_client.token:
-            # 在线：从后端获取全局唯一订单号（同时后端创建 reserved 占位记录）——
-            # 预留即带当前标签页归属，避免上报失败时占位单无归属
-            try:
-                resp = http_requests.get(
-                    f"{self._cloud_client.api_url}/api/next_order_number",
-                    params={**{"token": self._cloud_client.token}, **self._current_owner_params()},
-                    timeout=5,
-                )
-                if resp.ok:
-                    data = resp.json()
-                    if data.get("success"):
-                        order_number = data.get("order_number", "")
-            except Exception as e:
-                self._log(f"⚠️ 获取云端订单号失败: {e}")
-
-            if not order_number:
-                # 获取订单号失败，回退到本地临时号（-L，连线后自动换正式号）
-                order_number = self._generate_local_order_number_l()
-
-            # 上传订单信息到后端（将 reserved 占位更新为 sent）
-            try:
-                resp = http_requests.post(
-                    f"{self._cloud_client.api_url}/api/local_orders",
-                    params={"token": self._cloud_client.token},
-                    json={
-                        "order_number": order_number,
-                        "total_price": total_price,
-                        "files": files_data,
-                        "created_at": created_at,
-                        # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
-                        "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
-                        "is_admin_print": bool(tab.is_admin_print) if tab else True,
-                        # 附加服务上报（与计费口径一致）
-                        **extra_fields,
-                    },
-                    timeout=10,
-                )
-                if resp.ok and resp.json().get("success"):
-                    self._log(f"📋 订单已上报云端: {order_number} ({len(files_data)} 个文件)")
-                    uploaded = True
-                else:
-                    self._log(f"⚠️ 订单上报云端失败: {resp.text[:200] if resp.text else '无响应'}")
-            except Exception as e:
-                self._log(f"⚠️ 订单上报云端失败: {e}")
-        else:
-            # 离线：统一生成本地临时订单号（HN{date}-L{seq}），暂存到本地数据库，
-            # 联网后由 _sync_local_orders_to_cloud 换正式号并上报
-            order_number = self._generate_local_order_number_l()
-            self._log(f"📋 离线模式：已生成本地订单号 {order_number}")
-            if self._offline_sync:
-                try:
-                    self._offline_sync.save_order_offline(
-                        order_number=order_number,
-                        files_data=files_data,
-                        total_price=total_price,
-                        created_at=created_at,
-                        owner_name=(tab.owner_name if tab else ""),
-                        is_admin_print=bool(tab.is_admin_print) if tab else True,
-                    )
-                    self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
-                except Exception as e:
-                    self._log(f"⚠️ 离线缓存失败: {e}")
+        order_number, uploaded = self._acquire_order_number_and_upload(
+            flat_jobs, files_data, total_price, extra_fields, tab, created_at, online,
+        )
+        if self._closing:
+            # 取号/上报等待期间窗口被关闭（closeEvent 已清理）→ 中止本次打印启动
+            self._log("⚠️ 窗口已关闭，已取消本次打印启动")
+            return False
 
         # 将订单号写回 jobs（重要：确保封面页等后续流程能读到订单号）
         for j in flat_jobs:
@@ -4894,6 +4873,138 @@ class MainWindow(QMainWindow):
         worker.start()
         return True
 
+    def _acquire_order_number_and_upload(
+        self, flat_jobs, files_data, total_price, extra_fields, tab, created_at, online,
+    ) -> tuple[str, bool]:
+        """获取订单号并上报云端（打印启动前）。
+
+        网络请求（GET 取号 / POST 上报）放后台线程执行，主线程用
+        QApplication.processEvents 保活事件循环（沿用 closeEvent 的等待模式），
+        期间界面不冻结、云端推送/下载完成等信号正常处理。
+        返回 (order_number, uploaded)。
+        """
+        existing_order = ""
+        for j in flat_jobs:
+            if j.order_number:
+                existing_order = j.order_number
+                break
+
+        # 离线/未配置云端：无网络，本地临时号 + 本地库缓存（快速，主线程直接执行）
+        if not online or not self._cloud_client or not (self._cloud_client.api_url and self._cloud_client.token):
+            order_number = existing_order or self._generate_local_order_number_l()
+            if not existing_order:
+                self._log(f"📋 离线模式：已生成本地订单号 {order_number}")
+                if self._offline_sync:
+                    try:
+                        self._offline_sync.save_order_offline(
+                            order_number=order_number,
+                            files_data=files_data,
+                            total_price=total_price,
+                            created_at=created_at,
+                            owner_name=(tab.owner_name if tab else ""),
+                            is_admin_print=bool(tab.is_admin_print) if tab else True,
+                        )
+                        self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
+                    except Exception as e:
+                        self._log(f"⚠️ 离线缓存失败: {e}")
+            return order_number, False
+
+        self._print_starting = True
+        try:
+            result: dict = {}
+
+            def _net():
+                try:
+                    result.update(self._acquire_order_number_and_upload_net(
+                        existing_order, files_data, total_price, extra_fields, tab, created_at))
+                except Exception as e:
+                    result["order_number"] = ""
+                    result["uploaded"] = False
+                    self._cloudConnSyncLog.emit(f"⚠️ 订单号获取/上报异常: {e}")
+
+            threading.Thread(target=_net, daemon=True).start()
+            deadline = time.time() + 30
+            while "order_number" not in result and time.time() < deadline:
+                QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                time.sleep(0.02)
+            if self._closing:
+                # 等待期间窗口被关闭（closeEvent 已清理标签页）→ 中止，不再启动打印
+                return "", False
+            if "order_number" not in result:
+                # 超时兜底：本地临时号，连线后自动换正式号
+                self._log("⚠️ 订单号获取超时，改用本地临时号")
+                result["order_number"] = self._generate_local_order_number_l()
+            return result.get("order_number") or "", bool(result.get("uploaded", False))
+        finally:
+            self._print_starting = False
+
+    def _acquire_order_number_and_upload_net(
+        self, existing_order, files_data, total_price, extra_fields, tab, created_at,
+    ) -> dict:
+        """后台线程：云端取号 + 订单上报（网络部分）。
+
+        不直接操作 GUI：日志经 _cloudConnSyncLog 信号回主线程。
+        仅在线路径使用（离线路径由 _acquire_order_number_and_upload 主线程处理）。
+        """
+        client = self._cloud_client
+        api_url = client.api_url if client else ""
+        token = client.token if client else ""
+        order_number = ""
+        uploaded = False
+
+        def _upload(num: str) -> bool:
+            try:
+                resp = http_requests.post(
+                    f"{api_url}/api/local_orders",
+                    params={"token": token},
+                    json={
+                        "order_number": num,
+                        "total_price": total_price,
+                        "files": files_data,
+                        "created_at": created_at,
+                        # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
+                        "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
+                        "is_admin_print": bool(tab.is_admin_print) if tab else True,
+                        # 附加服务上报（与计费口径一致）
+                        **extra_fields,
+                    },
+                    timeout=10,
+                )
+                if resp.ok and resp.json().get("success"):
+                    self._cloudConnSyncLog.emit(f"📋 订单已上报云端: {num} ({len(files_data)} 个文件)")
+                    return True
+                self._cloudConnSyncLog.emit(f"⚠️ 订单上报云端失败: {resp.text[:200] if resp.text else '无响应'}")
+            except Exception as e:
+                self._cloudConnSyncLog.emit(f"⚠️ 订单上报云端失败: {e}")
+            return False
+
+        if existing_order:
+            # 复用已有的订单号（来自之前的"复制"操作），在线时直接上传
+            self._cloudConnSyncLog.emit(f"📋 复用已有订单号: {existing_order}")
+            return {"order_number": existing_order, "uploaded": _upload(existing_order)}
+
+        # 在线：从后端获取全局唯一订单号（同时后端创建 reserved 占位记录）——
+        # 预留即带当前标签页归属，避免上报失败时占位单无归属
+        try:
+            resp = http_requests.get(
+                f"{api_url}/api/next_order_number",
+                params={**{"token": token}, **self._current_owner_params()},
+                timeout=5,
+            )
+            if resp.ok:
+                data = resp.json()
+                if data.get("success"):
+                    order_number = data.get("order_number", "")
+        except Exception as e:
+            logger.warning(f"获取云端订单号失败: {e}")
+
+        if not order_number:
+            # 获取订单号失败，回退到本地临时号（-L，连线后自动换正式号）
+            order_number = self._generate_local_order_number_l()
+
+        # 上传订单信息到后端（将 reserved 占位更新为 sent）
+        return {"order_number": order_number, "uploaded": _upload(order_number)}
+
     def _on_all_finished(self, success_count: int, fail_count: int):
         """全部任务完成。标签页已固定，不允许再次打印或编辑。"""
         self._worker = None
@@ -4934,17 +5045,9 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.3.0</h3>"
+            "<h3>HN 本地打印工具 v4.4.0</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
-            "<hr>"
-            "<p><b>v4.3 更新：</b></p>"
-            "<p>· 多设备接单唯一接管：云端设置新增「启用接单」，仅接单设备接收订单，被占用时提示接管者</p>"
-            "<p>· 设备授权：收支清算「授权」页绑定本设备所有者，新建标签页默认归属该所有者、默认关闭「管理员自行打印」</p>"
-            "<p>· 云端订单归属：绑定用户按绑定成员显示，未绑定普通用户显示「普通用户」</p>"
-            "<p>· 云端订单标签页锁定归属/自打/附加服务（来自下单方，本地不可改）</p>"
-            "<p>· 无障碍订单后台创建标签页，不打断当前操作</p>"
-            "<p>· 收支清算菜单禁用时灰显；冻结标签页右键菜单同步禁用</p>"
             "<hr>"
             "<p>核心流程：文件 → PDF → Windows 原生 GDI 打印</p>"
             "<p>外部工具（可选）：LibreOffice | wkhtmltopdf | SumatraPDF</p>"
@@ -5040,6 +5143,12 @@ class MainWindow(QMainWindow):
         fetch_btn.clicked.connect(lambda: self._fetch_remote_logs(status_label))
         layout.addWidget(fetch_btn)
 
+        # 收集在线设备日志按钮
+        collect_btn = QPushButton("📥 收集所有在线设备日志")
+        collect_btn.setToolTip("向后端请求：向所有在线打印设备下发收集指令，各设备回报本机 local_tool.log 尾部日志（每台最多 200KB）")
+        collect_btn.clicked.connect(lambda: self._collect_device_logs(status_label))
+        layout.addWidget(collect_btn)
+
         layout.addWidget(QLabel("<hr>"))
 
         # 本地日志操作
@@ -5060,48 +5169,155 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _fetch_remote_logs(self, status_label: QLabel):
-        """从后端拉取 server.log 和 frontend.log。"""
+        """从后端拉取 server.log 和 frontend.log（网络放后台线程，界面保持响应）。"""
         if not self._cloud_client or not self._cloud_client.api_url or not self._cloud_client.token:
             status_label.setText("⚠ 云端未连接，无法拉取")
             return
         status_label.setText("⏳ 正在拉取...")
-        QApplication.processEvents()
+        result: dict = {}
 
-        results = []
-        for log_type in ("server", "frontend"):
+        def _net():
             try:
-                resp = http_requests.get(
-                    f"{self._cloud_client.api_url}/api/log/fetch",
-                    params={"token": self._cloud_client.token, "type": log_type},
-                    timeout=15,
-                )
-                if resp.ok:
-                    data = resp.json()
-                    content = data.get("content", "")
-                    size = data.get("size", 0)
-                    if size > 0 and content:
-                        dest = os.path.join(self._log_dir, f"remote_{log_type}.log")
-                        with open(dest, "w", encoding="utf-8") as f:
-                            f.write(content)
-                    results.append(f"{log_type}: {size} 字节")
-                else:
-                    results.append(f"{log_type}: 请求失败")
+                results = []
+                api_url = self._cloud_client.api_url
+                token = self._cloud_client.token
+                for log_type in ("server", "frontend"):
+                    try:
+                        resp = http_requests.get(
+                            f"{api_url}/api/log/fetch",
+                            params={"token": token, "type": log_type},
+                            timeout=15,
+                        )
+                        if resp.ok:
+                            data = resp.json()
+                            content = data.get("content", "")
+                            size = data.get("size", 0)
+                            if size > 0 and content:
+                                dest = os.path.join(self._log_dir, f"remote_{log_type}.log")
+                                with open(dest, "w", encoding="utf-8") as f:
+                                    f.write(content)
+                            results.append(f"{log_type}: {size} 字节")
+                        else:
+                            results.append(f"{log_type}: 请求失败")
+                    except Exception as e:
+                        results.append(f"{log_type}: 异常({e})")
+                result["text"] = "✓ 拉取完成: " + " | ".join(results)
             except Exception as e:
-                results.append(f"{log_type}: 异常({e})")
+                result["text"] = f"✗ 拉取异常: {e}"
 
-        status_label.setText("✓ 拉取完成: " + " | ".join(results))
+        threading.Thread(target=_net, daemon=True).start()
+        deadline = time.time() + 35
+        while "text" not in result and time.time() < deadline:
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            time.sleep(0.02)
+        try:
+            status_label.setText(result.get("text", "✗ 拉取超时"))
+        except RuntimeError:
+            pass  # 等待期间对话框已关闭，标签已销毁
+
+    def _collect_device_logs(self, status_label: QLabel):
+        """收集所有在线打印设备的日志。
+
+        经后端 /api/log/collect_all（printer token）：后端向所有在线客户端推送
+        request_log，各设备回报本机日志尾部，后端聚合后返回。网络放后台线程，
+        期间 processEvents 保活事件循环（不阻塞云端信号）。"""
+        if not self._cloud_client or not self._cloud_client.api_url or not self._cloud_client.token:
+            status_label.setText("⚠ 云端未连接，无法收集")
+            return
+        status_label.setText("⏳ 正在收集在线设备日志（最多等待 12 秒）...")
+        result: dict = {}
+
+        def _net():
+            try:
+                resp = http_requests.post(
+                    f"{self._cloud_client.api_url}/api/log/collect_all",
+                    params={"token": self._cloud_client.token},
+                    json={"timeout": 10},
+                    timeout=25,
+                )
+                result["resp"] = resp
+            except Exception as e:
+                result["error"] = str(e)
+
+        threading.Thread(target=_net, daemon=True).start()
+        deadline = time.time() + 30
+        while ("resp" not in result and "error" not in result) and time.time() < deadline:
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            time.sleep(0.02)
+        if "error" in result:
+            status_label.setText(f"✗ 收集失败: {result['error']}")
+            return
+        resp = result.get("resp")
+        try:
+            data = resp.json() if resp is not None else {}
+        except Exception:
+            data = {}
+        if not (data and data.get("success")):
+            msg = (data.get("message") if isinstance(data, dict) else "") or (
+                f"HTTP {resp.status_code}" if resp is not None else "无响应")
+            status_label.setText(f"✗ 收集失败: {msg}")
+            return
+        logs = data.get("logs") or []
+        self._show_collected_logs(logs)
+        ok_count = sum(1 for l in logs if l.get("content"))
+        status_label.setText(f"✓ 已收集 {ok_count}/{len(logs)} 台在线设备的日志")
+
+    def _show_collected_logs(self, logs: list):
+        """弹窗展示收集到的各在线设备日志（每台设备一段：设备名 + 状态 + 内容）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("📋 在线设备日志")
+        dlg.resize(780, 580)
+        layout = QVBoxLayout(dlg)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setLineWrapMode(QTextEdit.NoWrap)
+        layout.addWidget(text)
+        btn_row = QHBoxLayout()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        if not logs:
+            text.setPlainText("当前没有在线设备（或全部设备超时未回报）。")
+        else:
+            parts = []
+            for l in logs:
+                name = l.get("device_name") or l.get("client_id") or "未知设备"
+                cid = l.get("client_id", "")
+                status = "🟢 在线" if l.get("online") else "⚫ 离线"
+                header = f"========== {name} [{status}] {cid} =========="
+                content = l.get("content") or ""
+                if not content:
+                    content = l.get("error") or "（无日志内容）"
+                parts.append(header + "\n" + content)
+            text.setPlainText("\n\n".join(parts))
+        dlg.exec()
 
     def _clear_local_logs(self, status_label: QLabel):
-        """清空本地日志文件。"""
-        removed = 0
+        """清空本地日志文件。
+
+        local_tool.log 正被 FileHandler 占用：Windows 下 Python 默认共享模式不含
+        FILE_SHARE_DELETE，直接 os.remove 会抛 PermissionError（此前异常被静默吞掉，
+        表现为「清空无效」）。改为截断为 0 字节——被占用句柄同样允许截断，
+        后续日志 append 写入自动落在新文件末尾。"""
+        cleared = 0
+        failed = 0
         for fname in os.listdir(self._log_dir):
-            if fname.endswith(".log"):
-                try:
-                    os.remove(os.path.join(self._log_dir, fname))
-                    removed += 1
-                except OSError:
+            if not fname.endswith(".log"):
+                continue
+            fpath = os.path.join(self._log_dir, fname)
+            try:
+                with open(fpath, "w", encoding="utf-8"):
                     pass
-        status_label.setText(f"✓ 已清空 {removed} 个本地日志文件")
+                cleared += 1
+            except OSError:
+                failed += 1
+        msg = f"✓ 已清空 {cleared} 个本地日志文件"
+        if failed:
+            msg += f"（{failed} 个失败）"
+        status_label.setText(msg)
         self._log("📋 已清空本地日志")
 
     def _on_shortcuts(self):
@@ -5446,6 +5662,19 @@ class MainWindow(QMainWindow):
         if self._cloud_client:
             self._cloud_client.report_download_delayed(order_id, list(pending.keys()))
 
+    def _on_bring_to_front_request(self):
+        """单实例：收到新实例启动的通知 → 恢复窗口并置于前台。"""
+        from single_instance import check_front_request
+        if not check_front_request(self._front_event):
+            return
+        # 恢复最小化状态 + 置顶激活（Windows 前台锁由本进程自身线程触发，可正常抢前台）
+        if self.isMinimized():
+            self.showNormal()
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.raise_()
+        self.activateWindow()
+        self._log("🪟 检测到重复启动，已将本窗口置于前台")
+
     def _check_scheduled_timeouts(self):
         """每秒检查：
         - 预约单到点仍有文件未下载完 → 冻结上报（不必等下载完成事件）
@@ -5461,6 +5690,17 @@ class MainWindow(QMainWindow):
                 continue
             if st["target_ts"] and now >= st["target_ts"] and not st["frozen"] and not st["delayed_sent"]:
                 self._freeze_scheduled_order(order_id, st["pending"])
+
+        # 价格周期校验（节流 300s）：云端/本地配置可能被改，定时拉取保证单价始终一致
+        self._pricing_check_counter += 1
+        if self._pricing_check_counter >= 300:
+            self._pricing_check_counter = 0
+            try:
+                threading.Thread(
+                    target=self._sync_pricing, kwargs={"from_thread": True}, daemon=True
+                ).start()
+            except Exception:
+                pass
 
     def _start_scheduled_print_timer(self, order_id: int, target_ts: int):
         """在 target_ts（已过则立即）触发预约单打印。"""
@@ -5770,6 +6010,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭窗口时检查未完成任务，确认后保存并退出。"""
+        self._closing = True  # 打印启动等待（processEvents）期间检测到关窗 → 中止启动流程
         # 关闭云端任务列表窗口
         if self._cloud_task_window and self._cloud_task_window.isVisible():
             self._cloud_task_window.close()
@@ -5787,6 +6028,7 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.Cancel:
                 event.ignore()
+                self._closing = False  # 用户选择不退出，恢复打印启动流程
                 return
             if reply == QMessageBox.No:
                 # 取消打印并退出：置取消标志 + 等待线程结束（5s 超时后 terminate 兜底）
@@ -5847,6 +6089,7 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     event.ignore()
+                    self._closing = False  # 用户选择不退出，恢复打印启动流程
                     return
                 # 用户确认退出 → 通知后端放弃未打印的云端任务 + 本地预留订单，然后清空
                 # （已打印完成的 job 跳过，避免误放弃已完成订单）

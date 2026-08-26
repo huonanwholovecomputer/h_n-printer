@@ -547,6 +547,7 @@ page {
 }
 .modal-half-btn {
   flex: 1;
+  min-width: 0;   /* 强制两按钮严格等宽（50%），长文案不被 min-content 撑宽 */
   width: auto;
   padding: 22rpx 0;
   font-size: 26rpx;

@@ -1528,6 +1528,9 @@
 .detail-price-value.status-delivered {
   background-color: transparent;
 }
+/* v4.4：自打订单已完成（sent）→ 金额用「自打」标记同色（蓝），自打不计入收益，避免绿色误导；
+   其他状态（失败/等待/放弃等）仍用状态色突出 */
+.detail-price-value.is-self-sent { color: #1e66f5 !important; }
 
 /* File rows in detail */
 .detail-file-row {

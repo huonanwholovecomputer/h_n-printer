@@ -187,6 +187,12 @@ def main():
     setup_logging()
     logger = logging.getLogger("main")
 
+    # ── 单实例锁：已有实例在运行时，通知其将窗口置于前台，本实例直接退出 ──
+    from single_instance import acquire
+    if not acquire():
+        logger.info("程序已在运行：已通知既有实例将窗口置于前台，本实例退出")
+        return
+
     # 切换到脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)

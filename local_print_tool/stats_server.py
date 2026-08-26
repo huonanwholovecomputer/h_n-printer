@@ -17,8 +17,43 @@ import urllib.parse
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 import requests as http_requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+# ── 云端代理连接池（连接复用 + 自动重试）──
+# 收支清算页的代理请求走共享 Session：keep-alive 复用 TCP 连接，配合重试适配器
+# 消化校园/宿舍 NAT 等网络的瞬时连接波动（ConnectTimeout/ReadTimeout）——
+# 服务器本身健康时也偶发建连失败，重试后可自动恢复，页面不再表现为「突然断连」。
+# 超时拆分为 (connect, read)：建连 5s（正常建连 <1s，超过说明链路异常，快速失败重试），
+# 读取 15s（放宽容灾/聚合类大响应）。重试仅针对建连/读取瞬断与 502/503/504。
+_PROXY_TIMEOUT = (5, 15)
+
+_proxy_session = None
+_proxy_session_lock = threading.Lock()
+
+
+def _get_proxy_session():
+    """懒创建共享 requests.Session（线程安全，供 ThreadingHTTPServer 多线程复用）。"""
+    global _proxy_session
+    if _proxy_session is None:
+        with _proxy_session_lock:
+            if _proxy_session is None:
+                s = http_requests.Session()
+                retry = Retry(
+                    total=3,                       # 1 次原始 + 最多 2 次重试
+                    connect=3,                     # 建连失败重试（瞬时网络波动的直接对策）
+                    read=1,                        # 读取超时重试 1 次
+                    backoff_factor=0.3,            # 重试间隔 0.3s / 0.6s / 1.2s
+                    status_forcelist=(502, 503, 504),
+                    # 允许重试 POST：收支清算经代理的写接口（配置保存/绑定等）均幂等
+                    allowed_methods=frozenset(["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"]),
+                )
+                s.mount("http://", HTTPAdapter(max_retries=retry))
+                s.mount("https://", HTTPAdapter(max_retries=retry))
+                _proxy_session = s
+    return _proxy_session
 
 # 静态文件根目录（支持 PyInstaller 打包和开发环境）
 if getattr(sys, "frozen", False):
@@ -333,7 +368,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             self._send_json({"success": True, "cloud": False, "message": "未配置云端地址"})
             return
         try:
-            resp = http_requests.get(f"{self.api_url}/api/ping", timeout=8)
+            resp = _get_proxy_session().get(f"{self.api_url}/api/ping", timeout=_PROXY_TIMEOUT)
             if resp.status_code == 200:
                 self._send_json({"success": True, "cloud": True})
             else:
@@ -355,7 +390,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             url += f"?token={self.token}"
 
         try:
-            resp = http_requests.get(url, timeout=8)
+            resp = _get_proxy_session().get(url, timeout=_PROXY_TIMEOUT)
             self._send_json(_extract_proxy_body(resp), resp.status_code)
         except Exception as e:
             # 不拼接完整 URL / str(e)：其中可能包含 token 查询参数
@@ -374,8 +409,8 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 
         try:
             body = self._read_body()
-            resp = http_requests.post(url, data=body, timeout=8,
-                                      headers={"Content-Type": "application/json"})
+            resp = _get_proxy_session().post(url, data=body, timeout=_PROXY_TIMEOUT,
+                                             headers={"Content-Type": "application/json"})
             self._send_json(_extract_proxy_body(resp), resp.status_code)
         except Exception as e:
             # 不拼接完整 URL / str(e)：其中可能包含 token 查询参数
@@ -399,10 +434,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         # 实时接单状态：云端模式且配置了 api_url 时，向后端 /api/printer_status 确认本机是否接管
         if client_id and getattr(self, "api_url", ""):
             try:
-                resp = http_requests.get(
+                resp = _get_proxy_session().get(
                     f"{self.api_url}/api/printer_status",
                     params={"token": getattr(self, "token", "")},
-                    timeout=6,
+                    timeout=_PROXY_TIMEOUT,
                 )
                 if resp.ok:
                     data = resp.json()
@@ -644,6 +679,7 @@ class StatsServer:
             self._server.shutdown()
             self._server = None
         self._running = False
+        logger.info("统计服务器已停止")
 
     def update_config(self, api_url: str = "", token: str = ""):
         """云端配置变更后同步（不重启服务器）。
@@ -658,4 +694,5 @@ class StatsServer:
         if self._server:   # 已在运行 → 同步 handler 类属性（每次请求读取）
             _StatsHandler.api_url = self.api_url
             _StatsHandler.token = self.token
-        logger.info("统计服务器已停止")
+        # 注意：这里只更新配置，服务器保持运行（切勿误以为已停止）
+        logger.info("统计服务器配置已更新（服务器保持运行）")

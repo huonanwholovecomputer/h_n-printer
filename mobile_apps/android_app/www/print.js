@@ -24,6 +24,8 @@ const printState = {
   urgencyPrices: { '低': 0, '中': 0.08, '高': 0.15 },
   urgencyPrice: 0,
   coverPage: false,
+  simplexPrice: 0.2,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
+  duplexPrice: 0.3,    // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
   coverPagePrice: 0.10,
   autoPrintEnabled: false,
   autoPrintGlow: false,
@@ -47,6 +49,8 @@ function initPrintPage() {
   setupFileInput();
   setupPrintButtons();
   loadPricing();
+  // 每 5 分钟顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
+  setInterval(loadPricing, 5 * 60 * 1000);
   refreshPrintRoleUI();
   buildScheduleDays();
   scheduleMeasureSoon();
@@ -827,7 +831,11 @@ function startPageCountPoll(idx, fileId) {
           stopPageCountPoll(idx);
           return;
         }
-        f.pageCountStatus = r.data.printer_online ? 'analyzing' : 'offline';
+        // v4.4：仅 doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告；
+        // PDF 等后端可直接数页的类型保持「等待中」，后端未返回时正常等待即可
+        const fext = (f.name || '').includes('.') ? f.name.split('.').pop().toLowerCase() : '';
+        const needLocal = fext === 'doc' || fext === 'docx';
+        f.pageCountStatus = (r.data.printer_online || !needLocal) ? 'analyzing' : 'offline';
         attempts++;
         if (attempts >= MAX_POLL_ATTEMPTS) stopPageCountPoll(idx);
         renderFileList();
@@ -1059,6 +1067,8 @@ async function loadPricing() {
     const r = await api('/api/pricing');
     if (r.status === 200 && r.data && r.data.success) {
       const p = r.data.pricing;
+      if (p.simplex_price != null) printState.simplexPrice = p.simplex_price;
+      if (p.duplex_price != null) printState.duplexPrice = p.duplex_price;
       if (p.delivery_locations) printState.deliveryLocations = p.delivery_locations;
       if (p.delivery_percentages) printState.deliveryPercentages = p.delivery_percentages;
       if (p.urgency_levels) printState.urgencyOptions = p.urgency_levels;
@@ -1818,8 +1828,9 @@ function countPagesInRange(pageRange, total) {
 }
 
 function calcCost(pageCount, copies, duplex, pageRange) {
-  const simplex = 0.2;
-  const duplexP = 0.3;
+  // 单价取云端 pricing.json 同步值（loadPricing 刷新），本地兜底 0.2/0.3
+  const simplex = printState.simplexPrice || 0.2;
+  const duplexP = printState.duplexPrice || 0.3;
   if (!pageCount || pageCount <= 0) return { cost: 0, formula: '?', known: false };
   const effective = countPagesInRange(pageRange, pageCount);   // 有效打印页数（范围过滤后）
   if (duplex === 'on') {
@@ -1843,11 +1854,16 @@ function orderEchoParams() {
   return {
     deliveryEnabled: echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : printState.deliveryEnabled,
     deliveryLocation: echo.delivery_location != null ? echo.delivery_location : printState.deliveryLocation,
-    deliveryPercent: echo.delivery_percentage != null ? Number(echo.delivery_percentage) : printState.deliveryPercent,
+    // 金额一律取云端定价配置（loadPricing 同步自 /api/pricing），不采用提交回显
+    deliveryPercent: (echo.delivery_location != null && printState.deliveryPercentages[echo.delivery_location] != null)
+      ? printState.deliveryPercentages[echo.delivery_location]
+      : printState.deliveryPercent,
     urgency: echo.urgency != null ? echo.urgency : printState.urgency,
-    urgencyPrice: echo.urgency_price != null ? Number(echo.urgency_price) : printState.urgencyPrice,
+    urgencyPrice: (echo.urgency != null && printState.urgencyPrices[echo.urgency] != null)
+      ? printState.urgencyPrices[echo.urgency]
+      : printState.urgencyPrice,
     coverPage: echo.cover_page != null ? !!Number(echo.cover_page) : printState.coverPage,
-    coverPagePrice: echo.cover_page_price != null ? Number(echo.cover_page_price) : printState.coverPagePrice,
+    coverPagePrice: printState.coverPagePrice,
   };
 }
 

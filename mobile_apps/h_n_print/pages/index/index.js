@@ -158,6 +158,8 @@ Component({
     urgencyPrices: { '低': 0, '中': 0.08, '高': 0.15 },
     urgencyPrice: 0,
     coverPage: false,
+    simplexPrice: 0.2,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
+    duplexPrice: 0.3,    // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
     coverPagePrice: 0.10,  // 与本地打印工具 print_config.json 保持一致
     coverPriceVisible: false,    // 首页价格标签是否可见（配合入场动画）
     coverPriceEntering: false,   // 首页价格入场动画
@@ -415,6 +417,8 @@ Component({
       // 30s 轮询（设计意图，避免高频请求触发 Nginx hn_api 限流：60r/m + burst 150）
       this._printerPollTimer = setInterval(() => {
         this.loadPrinterStatus()
+        // 借轮询顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
+        this.loadPricing()
       }, 30000)
     },
     _stopPrinterPolling() {
@@ -1328,7 +1332,12 @@ Component({
               const files = this.data.selectedFiles
               if (files[fileIndex] && files[fileIndex].fileId === fileId) {
                 const currentStatus = files[fileIndex].pageCountStatus
-                if (!printerOnline) {
+                // v4.4：仅 doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告；
+                // PDF 等后端可直接数页的类型保持「等待中」，后端未返回时正常等待即可
+                const fname = files[fileIndex].name || ''
+                const fext = fname.indexOf('.') >= 0 ? fname.split('.').pop().toLowerCase() : ''
+                const needLocal = fext === 'doc' || fext === 'docx'
+                if (!printerOnline && needLocal) {
                   // 打印机离线 → 显示黄色警告；离线同样计数，避免无限轮询
                   if (currentStatus !== 'offline') {
                     this.setData({
@@ -1336,7 +1345,7 @@ Component({
                     })
                   }
                 } else {
-                  // 打印机在线 → 显示分析中
+                  // 打印机在线（或文件不依赖本地分析）→ 显示等待中
                   if (currentStatus !== 'analyzing') {
                     this.setData({
                       ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'analyzing',
@@ -1676,6 +1685,8 @@ Component({
             const p = res.data.pricing
             this.setData({
               pricingLoaded: true,
+              simplexPrice: p.simplex_price != null ? p.simplex_price : this.data.simplexPrice,
+              duplexPrice: p.duplex_price != null ? p.duplex_price : this.data.duplexPrice,
               deliveryLocations: p.delivery_locations || this.data.deliveryLocations,
               deliveryPercentages: p.delivery_percentages || this.data.deliveryPercentages,
               urgencyOptions: p.urgency_levels || this.data.urgencyOptions,
@@ -1958,12 +1969,7 @@ Component({
       setTimeout(() => this._scheduleMeasure(400), 400)
     },
 
-    onCoverPagePriceInput(e) {
-      let v = parseFloat(e.detail.value)
-      if (isNaN(v) || v < 0) v = 0
-      if (v > 100) v = 100   // 首页费上限 100 元
-      this.setData({ coverPagePrice: v })
-    },
+    // 首页价格由 /api/pricing 云端配置决定（loadPricing 同步），本地不提供编辑入口
 
     // ==================== 提交任务 ====================
 
@@ -2719,8 +2725,9 @@ Component({
     // ---- 价格计算（复刻本地工具 calc_cost）----
 
     _calcCost(pageCount, copies, duplex, pageRange) {
-      const simplex = 0.2
-      const duplexP = 0.3
+      // 单价取云端 pricing.json 同步值（loadPricing 刷新），本地兜底 0.2/0.3
+      const simplex = this.data.simplexPrice || 0.2
+      const duplexP = this.data.duplexPrice || 0.3
       if (pageCount <= 0) return { cost: 0, formula: '?', known: false }
       const effective = countPagesInRange(pageRange, pageCount)   // 有效打印页数（范围过滤后）
 
@@ -2757,13 +2764,20 @@ Component({
       const d = this._lastOrderResult
       if (!d || !d.files) return
       const files = d.files
-      // 附加服务参数优先取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
+      // 开关/选项取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
       const echo = d.data || {}
       const deliveryEnabled = echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : this.data.deliveryEnabled
-      const deliveryPercent = echo.delivery_percentage != null ? Number(echo.delivery_percentage) : this.data.deliveryPercent
-      const urgencyPrice = echo.urgency_price != null ? Number(echo.urgency_price) : this.data.urgencyPrice
+      // 金额一律取云端定价配置（loadPricing 同步自 /api/pricing，随轮询刷新），不采用提交回显
+      const deliveryLocation = echo.delivery_location != null ? echo.delivery_location : this.data.deliveryLocation
+      const deliveryPercent = (this.data.deliveryPercentages[deliveryLocation] != null)
+        ? this.data.deliveryPercentages[deliveryLocation]
+        : this.data.deliveryPercent
+      const urgency = echo.urgency != null ? echo.urgency : this.data.urgency
+      const urgencyPrice = (this.data.urgencyPrices[urgency] != null)
+        ? this.data.urgencyPrices[urgency]
+        : this.data.urgencyPrice
       const coverPage = echo.cover_page != null ? !!Number(echo.cover_page) : this.data.coverPage
-      const coverPagePrice = echo.cover_page_price != null ? Number(echo.cover_page_price) : this.data.coverPagePrice
+      const coverPagePrice = this.data.coverPagePrice
 
       let baseTotal = 0
       let allKnown = true
@@ -2796,15 +2810,20 @@ Component({
       if (!d || !d.files) return
       const files = d.files
       const orderNumber = d.order_number || ''
-      // 附加服务参数优先取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
+      // 开关/选项取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
       const echo = d.data || {}
       const deliveryEnabled = echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : this.data.deliveryEnabled
       const deliveryLocation = echo.delivery_location != null ? echo.delivery_location : this.data.deliveryLocation
-      const deliveryPercent = echo.delivery_percentage != null ? Number(echo.delivery_percentage) : this.data.deliveryPercent
+      // 金额一律取云端定价配置（loadPricing 同步自 /api/pricing，随轮询刷新），不采用提交回显
+      const deliveryPercent = (this.data.deliveryPercentages[deliveryLocation] != null)
+        ? this.data.deliveryPercentages[deliveryLocation]
+        : this.data.deliveryPercent
       const urgency = echo.urgency != null ? echo.urgency : this.data.urgency
-      const urgencyPrice = echo.urgency_price != null ? Number(echo.urgency_price) : this.data.urgencyPrice
+      const urgencyPrice = (this.data.urgencyPrices[urgency] != null)
+        ? this.data.urgencyPrices[urgency]
+        : this.data.urgencyPrice
       const coverPage = echo.cover_page != null ? !!Number(echo.cover_page) : this.data.coverPage
-      const coverPagePrice = echo.cover_page_price != null ? Number(echo.cover_page_price) : this.data.coverPagePrice
+      const coverPagePrice = this.data.coverPagePrice
       const lines = ['计费明细']
       if (orderNumber) lines.push(orderNumber)
       lines.push('─'.repeat(14))
