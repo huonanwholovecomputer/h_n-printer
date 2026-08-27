@@ -41,6 +41,8 @@ class TabSettings:
     # 订单归属（v24）：本标签页订单属于谁 + 是否管理员自行打印（非顾客订单）
     owner_name: str = ""          # 空 = 尚未选择成员（成员名单为空时禁止创建订单）
     is_admin_print: bool = True
+    # 订单备注（v4.6）：标签页（订单）级，不依赖选中任务；云端订单注入后端 remark
+    remark: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -53,6 +55,7 @@ class TabSettings:
             "frozen": self.frozen,
             "owner_name": self.owner_name,
             "is_admin_print": self.is_admin_print,
+            "remark": self.remark,
         }
 
     @classmethod
@@ -71,6 +74,7 @@ class TabSettings:
             frozen=bool(data.get("frozen", False)),
             owner_name=(data.get("owner_name") or "").strip(),
             is_admin_print=bool(data.get("is_admin_print", True)),
+            remark=str(data.get("remark", "") or ""),
         )
 
     def calc_extra_total(self, base_total: float, config: "PrinterConfig") -> float:
@@ -106,6 +110,7 @@ class PrintJob:
     source_md5: str = ""     # 源文件 MD5，用于 PDF 缓存查找
     display_name: str = ""   # 显示用的文件名（云端任务用原始文件名，本地任务为空则用 file_path 的 basename）
     order_number: str = ""   # 订单号（云端的来自后端，本地的在复制时生成）
+    remark: str = ""         # 订单/任务备注（云端订单来自后端 remark；本地任务可自行填写，≤100 字）
     sent: bool = False       # 是否已打印完成（成功回报后置位，退出时不再放弃；持久化以扛异常退出重载）
 
     def to_dict(self) -> dict[str, Any]:
@@ -124,6 +129,7 @@ class PrintJob:
             "task_id": self.task_id,
             "order_id": self.order_id,
             "order_number": self.order_number,
+            "remark": self.remark,
             "sent": self.sent,
             # cached_pdf 不持久化，每次启动重新生成
         }
@@ -146,6 +152,7 @@ class PrintJob:
             sent=bool(data.get("sent", False)),
             order_id=int(data.get("order_id", 0)),
             order_number=data.get("order_number", ""),
+            remark=str(data.get("remark", "") or ""),
         )
 
 
@@ -481,6 +488,7 @@ def generate_cover_page_pdf(
     首页包含:
       - 标题 & 订单号
       - 发起时间 / 实际执行时间
+      - 订单备注（有才显示）
       - 文件清单（文件名、份数、单双面、页数）
       - 费用明细（纸张费、派送费、加急费、首页费）
       - 总金额
@@ -602,6 +610,19 @@ def generate_cover_page_pdf(
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
     ]))
     story.append(time_table)
+
+    # ── 备注（订单备注，有才显示；同订单多文件共享同一备注，取首个非空）──
+    remark_text = ""
+    for _job in jobs:
+        if getattr(_job, "remark", "").strip():
+            remark_text = _job.remark.strip()
+            break
+    if remark_text:
+        # 转义 HTML 特殊字符（Paragraph 支持标记，防 <>& 报错），换行转 <br/>
+        _esc = remark_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        story.append(Paragraph("📝 备注", section_style))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#e0e0e0")))
+        story.append(Paragraph(_esc.replace("\n", "<br/>"), body_style))
 
     # ── 文件清单 ──
     story.append(Paragraph("📄 文件清单", section_style))

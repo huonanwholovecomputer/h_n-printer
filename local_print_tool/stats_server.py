@@ -60,12 +60,14 @@ if getattr(sys, "frozen", False):
     _STATIC_DIR = os.path.join(sys._MEIPASS, "finance")
 else:
     _STATIC_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "finance"))
+# 用户数据统一存 %APPDATA%\HN打印工具（与程序目录解耦，自更新不丢数据）
+import paths as _paths
 # 绑定配置文件
-_BINDINGS_FILE = os.path.join(os.path.dirname(__file__), "user_bindings.json")
+_BINDINGS_FILE = _paths.bindings_path()
 # 默认数据文件（用户收支数据）
-_DEFAULT_DATA_FILE = os.path.join(os.path.dirname(__file__), "finance", "print_data.json")
+_DEFAULT_DATA_FILE = _paths.finance_data_path()
 # 本地订单库（OfflineSync 写入的 SQLite，供「本地订单统计」页读取）
-_LOCAL_DB_FILE = os.path.join(os.path.dirname(__file__), "printer-local.db")
+_LOCAL_DB_FILE = _paths.local_db_path()
 
 # 本地文件读写锁（数据文件与绑定文件各自一把，跨线程串行化）
 _DATA_FILE_LOCK = threading.Lock()

@@ -2725,6 +2725,64 @@ picker-view-column {
   margin-bottom: 2.6667cqw;
 }
 
+/* ── 备注卡（第三个卡片，与打印文件/附加服务同级）── */
+.remark-card {
+  margin-bottom: 2.6667cqw;
+}
+
+.remark-count {
+  margin-left: auto;
+  font-size: 2.9333cqw;
+  color: var(--text-tertiary);
+}
+.remark-count.remark-over {
+  color: #FF3B30;
+}
+
+.remark-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 16cqw;
+  padding: 2.1333cqw 0 1.0667cqw;
+  font-size: 3.6cqw;
+  line-height: 1.6;
+  color: var(--text-primary);
+  background: transparent;
+  border: none;
+  resize: none;
+  outline: none;
+  font-family: inherit;
+  /* 高度随行数平滑变化（JS 按 scrollHeight 设置，transition 过渡）；
+     内容超出高度时允许内部滚动查看（勿设 overflow:hidden，否则触摸滚动失效） */
+  transition: height 0.25s ease;
+}
+.remark-textarea::placeholder {
+  color: var(--text-tertiary);
+}
+
+/* 订单卡片详情：备注（灰色背景与文件列表 --gray6 一致，突出文字内容；保留换行） */
+.remark-block {
+  width: 100%;
+}
+.remark-text {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  background-color: var(--gray6);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-weight: 400;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+/* 深色模式：与文件列表一致（glass 材质） */
+.theme-dark .remark-text {
+  background: var(--glass-regular);
+}
+
 .param-row {
   display: flex;
   align-items: center;
@@ -3069,6 +3127,7 @@ picker-view-column {
 .page-root .control-input,
 .page-root .range-line-input,
 .page-root .detail-file-row,
+.page-root .remark-text,
 .page-root .admin-card,
 .page-root .user-license-detail,
 .page-root .security-summary-card,

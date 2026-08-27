@@ -1187,6 +1187,41 @@ picker-view-column {
   color: var(--text-tertiary);
 }
 
+/* ── 备注卡（第三个卡片，与打印文件/附加服务同级）── */
+.remark-card {
+  margin-bottom: 20rpx;
+}
+
+.remark-count {
+  margin-left: auto;
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+}
+.remark-count.remark-over {
+  color: #FF3B30;
+}
+
+/* 备注输入区：高度由 JS 估算驱动（textarea 自身设高度，随行数平滑过渡；内容极限超出可内部滚动） */
+.remark-box {
+  overflow: hidden;
+}
+
+.remark-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 120rpx;
+  padding: 16rpx 0 8rpx;
+  font-size: 27rpx;
+  line-height: 1.6;
+  color: var(--text-primary);
+  /* 高度由 style 直接控制（含 transition），内容超出时原生内部滚动 */
+  transition: height 0.25s ease;
+}
+
+.remark-placeholder {
+  color: var(--text-tertiary);
+}
+
 .control-input {
   flex: 1;
   height: 56rpx;

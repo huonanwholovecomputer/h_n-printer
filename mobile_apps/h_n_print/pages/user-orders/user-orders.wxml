@@ -231,6 +231,14 @@
             </view>
           </view>
 
+          <!-- 备注 -->
+          <view wx:if="{{item.remark}}" class="detail-section">
+            <view class="detail-section-title">备注</view>
+            <view class="detail-row remark-row">
+              <text class="detail-value remark-text">{{item.remark}}</text>
+            </view>
+          </view>
+
           <!-- 价格 -->
           <view class="detail-section">
             <view class="detail-row detail-price-row">
@@ -239,9 +247,10 @@
             </view>
           </view>
 
-          <!-- 操作按钮 -->
+          <!-- 操作按钮（仅本人订单可取消，且含预约单到点前：scheduled/downloading/waiting）
+               后端 openid 校验：管理员查看他人订单时隐藏按钮，避免"点了报无权操作" -->
           <view class="detail-actions">
-            <button wx:if="{{item.status === 'queued' || item.status === 'printing'}}"
+            <button wx:if="{{item.openid === selfOpenid && (item.status === 'queued' || item.status === 'printing' || item.status === 'waiting' || item.status === 'downloading' || item.status === 'scheduled')}}"
                     class="btn-cancel-sm" catchtap="onDetailCancelOrder" data-id="{{item.id}}">取消任务</button>
           </view>
         </view>

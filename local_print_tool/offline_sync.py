@@ -29,7 +29,8 @@ class OfflineSync:
 
     def __init__(self, db_path: str = ""):
         if not db_path:
-            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "printer-local.db")
+            import paths as _paths
+            db_path = _paths.local_db_path()
         self.db_path = db_path
         self._lock = threading.Lock()
         self._sync_thread: threading.Thread | None = None
@@ -59,6 +60,8 @@ class OfflineSync:
                 conn.execute(f"ALTER TABLE offline_orders ADD COLUMN owner_name TEXT DEFAULT '{DEFAULT_OWNER_NAME}'")
             if "is_admin_print" not in cols:
                 conn.execute("ALTER TABLE offline_orders ADD COLUMN is_admin_print INTEGER DEFAULT 1")
+            if "remark" not in cols:
+                conn.execute("ALTER TABLE offline_orders ADD COLUMN remark TEXT DEFAULT ''")
             conn.commit()
             conn.close()
 
@@ -72,16 +75,18 @@ class OfflineSync:
         created_at: str,
         owner_name: str = "",
         is_admin_print: bool = True,
+        remark: str = "",
     ) -> str:
         """将订单保存到本地数据库。返回保存的临时订单号。"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             conn.execute(
                 """INSERT INTO offline_orders (order_number, files_json, total_price, created_at,
-                                               owner_name, is_admin_print, synced)
-                   VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                                               owner_name, is_admin_print, remark, synced)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
                 (order_number, json.dumps(files_data, ensure_ascii=False), total_price,
-                 created_at, owner_name or DEFAULT_OWNER_NAME, 1 if is_admin_print else 0),
+                 created_at, owner_name or DEFAULT_OWNER_NAME, 1 if is_admin_print else 0,
+                 str(remark or "")[:100]),
             )
             # P2: 队列无上限保护 —— 超过 OFFLINE_QUEUE_MAX 条时丢弃最旧记录
             cur = conn.execute(
@@ -110,6 +115,7 @@ class OfflineSync:
         token: str,
         owner_name: str = DEFAULT_OWNER_NAME,
         is_admin_print: bool = True,
+        remark: str = "",
     ) -> bool:
         """尝试上传单个订单到服务器。返回 True 表示成功。"""
         try:
@@ -122,6 +128,8 @@ class OfflineSync:
                 # 订单归属（v24）
                 "owner_name": owner_name or DEFAULT_OWNER_NAME,
                 "is_admin_print": bool(is_admin_print),
+                # 备注（离线打印的订单重连后补报，不丢）
+                "remark": str(remark or "")[:100],
             }
             resp = http_requests.post(url, params={"token": token}, json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
@@ -156,7 +164,7 @@ class OfflineSync:
             rows = list(
                 conn.execute(
                     """SELECT id, order_number, files_json, total_price, created_at,
-                              owner_name, is_admin_print
+                              owner_name, is_admin_print, remark
                        FROM offline_orders
                        WHERE synced = 0 AND retry_count < ?
                          AND order_number NOT LIKE '%-L%'
@@ -172,11 +180,11 @@ class OfflineSync:
         logger.info(f"[SYNC] 检测到 {len(rows)} 个待同步离线任务...")
         synced_count = 0
 
-        for db_id, order_number, files_json, total_price, created_at, owner_name, is_admin_print in rows:
+        for db_id, order_number, files_json, total_price, created_at, owner_name, is_admin_print, remark in rows:
             success = self.upload_order(
                 db_id, order_number, files_json,
                 total_price, created_at, server_url, token,
-                owner_name or DEFAULT_OWNER_NAME, bool(is_admin_print),
+                owner_name or DEFAULT_OWNER_NAME, bool(is_admin_print), remark,
             )
 
             with self._lock:
@@ -271,13 +279,13 @@ class OfflineSync:
 
     def list_pending_orders(self, like: str = "") -> list:
         """列出待同步的离线订单行（可按 order_number LIKE 过滤），供换号流程使用。
-        返回行元组: (id, order_number, files_json, total_price, created_at, owner_name, is_admin_print)。"""
+        返回行元组: (id, order_number, files_json, total_price, created_at, owner_name, is_admin_print, remark)。"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             if like:
                 rows = list(conn.execute(
                     """SELECT id, order_number, files_json, total_price, created_at,
-                              owner_name, is_admin_print
+                              owner_name, is_admin_print, remark
                        FROM offline_orders
                        WHERE synced = 0 AND retry_count < ? AND order_number LIKE ?""",
                     (MAX_RETRY_COUNT, like),
@@ -285,7 +293,7 @@ class OfflineSync:
             else:
                 rows = list(conn.execute(
                     """SELECT id, order_number, files_json, total_price, created_at,
-                              owner_name, is_admin_print
+                              owner_name, is_admin_print, remark
                        FROM offline_orders
                        WHERE synced = 0 AND retry_count < ?""",
                     (MAX_RETRY_COUNT,),
@@ -299,7 +307,7 @@ class OfflineSync:
             conn = sqlite3.connect(self.db_path)
             row = conn.execute(
                 """SELECT id, order_number, files_json, total_price, created_at,
-                          owner_name, is_admin_print
+                          owner_name, is_admin_print, remark
                    FROM offline_orders WHERE order_number = ? AND synced = 0""",
                 (order_number,),
             ).fetchone()
@@ -366,7 +374,8 @@ class OfflineSync:
         # 避免字符串排序被非数字串干扰导致序号回退/重复。
         seq = 0
         try:
-            db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "printer-local.db")
+            import paths as _paths
+            db = _paths.local_db_path()
             conn = sqlite3.connect(db)
             rows = conn.execute(
                 "SELECT order_number FROM offline_orders WHERE order_number LIKE ?",

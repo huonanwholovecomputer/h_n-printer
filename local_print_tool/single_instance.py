@@ -48,27 +48,37 @@ _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.GetLastError.restype = wintypes.DWORD
 
 
-def acquire() -> bool:
+def acquire(retries: int = 15, retry_delay: float = 0.2) -> bool:
     """获取单实例锁。
+
+    retries/retry_delay：检测到已有实例时短时重试（默认 15×0.2s=3s）。
+    覆盖"自动重启"场景：旧实例刚 Popen 新实例后退出，互斥体释放有极短延迟，
+    若新实例立即 acquire 会误判"已在运行"而退出（表现为云端开关重启只关闭不启动）。
+    重试期间旧实例退出 → 重试成功取得锁；旧实例正常运行 → 重试超时后通知置前并退出。
 
     Returns:
         True  = 本实例是唯一实例（互斥体已持有，继续启动）
         False = 已有实例在运行（已通知其将窗口置于前台），调用方应立即退出
     """
     global _mutex_handle, _front_event
-    h = _kernel32.CreateMutexW(None, False, _MUTEX_NAME)
-    if not h:
-        # 创建失败（权限/系统异常）→ 放行，避免把用户锁在门外
+    for attempt in range(retries + 1):
+        h = _kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+        if not h:
+            # 创建失败（权限/系统异常）→ 放行，避免把用户锁在门外
+            return True
+        if _kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            _kernel32.CloseHandle(h)
+            if attempt < retries:
+                time.sleep(retry_delay)
+                continue
+            _notify_front()
+            return False
+        # 第一个实例：持有互斥体句柄，保持锁
+        _mutex_handle = h
+        # 创建置前通知事件（自动复位）；若已存在（上次实例残留）则复用，无碍
+        _front_event = _kernel32.CreateEventW(None, False, False, _EVENT_NAME)
         return True
-    if _kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-        _kernel32.CloseHandle(h)
-        _notify_front()
-        return False
-    # 第一个实例：持有互斥体句柄，保持锁
-    _mutex_handle = h
-    # 创建置前通知事件（自动复位）；若已存在（上次实例残留）则复用，无碍
-    _front_event = _kernel32.CreateEventW(None, False, False, _EVENT_NAME)
-    return True
+    return False  # 不可达
 
 
 def _notify_front() -> None:

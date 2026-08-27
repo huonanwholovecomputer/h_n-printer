@@ -530,6 +530,14 @@
             </view>
           </view>
 
+          <!-- 备注（灰色背景与文件列表一致，突出文字内容） -->
+          <view wx:if="{{item.remark}}" class="detail-section">
+            <view class="detail-section-title">备注</view>
+            <view class="detail-row remark-row">
+              <text class="detail-value remark-text">{{item.remark}}</text>
+            </view>
+          </view>
+
           <!-- 价格 -->
           <view class="detail-section">
             <view class="detail-row detail-price-row">
@@ -538,9 +546,9 @@
             </view>
           </view>
 
-          <!-- 操作按钮 -->
+          <!-- 操作按钮（含预约单到点前：scheduled/downloading/waiting 也可取消） -->
           <view class="detail-actions">
-            <button wx:if="{{item.status === 'queued' || item.status === 'printing'}}"
+            <button wx:if="{{item.status === 'queued' || item.status === 'printing' || item.status === 'waiting' || item.status === 'downloading' || item.status === 'scheduled'}}"
                     class="btn-cancel-sm" catchtap="onDetailCancelOrder" data-id="{{item.id}}">取消任务</button>
           </view>
         </view>

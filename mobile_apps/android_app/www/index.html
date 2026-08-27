@@ -116,6 +116,17 @@
             </view>
           </view>
 
+          <!-- 备注（第三个卡片，与打印文件/附加服务同级；高度随行数自适应） -->
+          <view class="card remark-card card-preload" id="remarkCard">
+            <view class="section-header inline-header">
+              <view class="section-header-bar"></view>
+              <text class="section-header-title">备注</text>
+              <text class="remark-count" id="remarkCount">0/100</text>
+            </view>
+            <textarea class="remark-textarea" id="remarkInput" maxlength="100"
+                      placeholder="给订单添加备注（选填，最多 100 字）"></textarea>
+          </view>
+
           <!-- 无障碍打印（仅管理员） -->
           <view class="auto-print-switch-row card-preload" id="autoPrintSection" style="display:none">
             <view class="auto-print-label">

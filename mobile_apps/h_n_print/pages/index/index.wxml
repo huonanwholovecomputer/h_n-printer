@@ -239,6 +239,20 @@
           </view>
         </view>
 
+        <!-- 备注（第三个卡片，与打印文件/附加服务同级；高度随行数平滑变化） -->
+        <view class="card remark-card {{entranceDone ? '' : (entered.remark ? 'entrance-play' : 'card-preload')}}">
+          <view class="section-header inline-header">
+            <view class="section-header-bar"></view>
+            <text class="section-header-title">备注</text>
+            <text class="remark-count {{remark.length > 100 ? 'remark-over' : ''}}">{{remark.length}}/100</text>
+          </view>
+          <view class="remark-box">
+            <textarea class="remark-textarea" style="height: {{remarkBoxHeight}}rpx;" value="{{remark}}"
+                      bindinput="onRemarkInput" maxlength="100"
+                      placeholder="给订单添加备注（选填，最多 100 字）" placeholder-class="remark-placeholder"></textarea>
+          </view>
+        </view>
+
         <!-- 无障碍打印开关（仅管理员可见） -->
         <view wx:if="{{userRole === 'admin'}}" class="auto-print-switch-row {{entranceDone ? '' : (entered.autoPrint ? 'entrance-play' : 'card-preload')}}">
           <view class="auto-print-label">

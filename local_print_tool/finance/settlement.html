@@ -351,6 +351,18 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .file-expand.open .file-expand-body { grid-template-rows: 1fr; }
 .file-expand-inner { min-height: 0; overflow: hidden; }
 /* 文件明细网格：文件名弹性占宽，信息列定宽 */
+/* 备注行：背景与文件列表表头一致（--card-2 灰底），不用主题蓝 */
+.order-remark {
+  margin: 6px 0;
+  padding: 8px 12px;
+  background: var(--card-2);
+  border-radius: 4px;
+  font-size: .78rem;
+  line-height: 1.7;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 .file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 78px 96px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
 .file-grid .fn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .file-grid.file-sub-head { font-size: .72rem; font-weight: 600; color: var(--muted); background: var(--card-2); border-top: 1px solid var(--border-strong); padding-top: 5px; padding-bottom: 5px; }
@@ -1390,12 +1402,13 @@ function _refreshCloudChartTheme() {
     c.update('none');   // 无动画重绘（canvas 内容非 CSS 过渡对象）
   });
 }
-/* v4.0：状态标签语义对齐 v5+ 父子订单模型（printing=打印机正在打印；accepted/reserved 为 v5 前旧状态，仅兼容历史数据） */
+/* v4.0：状态标签语义对齐移动端（小程序/APP statusMap），保证收支结算与移动端显示完全一致；
+   printing=云端任务等待打印机确认添加；accepted/reserved 为 v5 前旧状态，仅兼容历史数据 */
 var STATUS_LABELS = {
-  sent: '已完成', printing: '打印中', queued: '排队中', failed: '打印失败', canceled: '已取消',
+  sent: '已完成', printing: '待添加', queued: '排队中', failed: '失败', canceled: '已取消',
   rejected: '被打回', abandoned: '放弃打印', offline_unknown: '断线未知',
-  accepted: '已接收', reserved: '已预留',
-  scheduled: '已预约', waiting: '待打印', downloading: '下载中'
+  accepted: '已添加', reserved: '已预留',
+  scheduled: '已预约', waiting: '等待打印', downloading: '文件传输中'
 };
 var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown', scheduled: 'st-scheduled', waiting: 'st-waiting', downloading: 'st-downloading' };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
@@ -2414,9 +2427,12 @@ function _renderOrderListHTML() {
       h += '</tr>';
       if (o.files && o.files.length) {
         h += '<tr class="file-expand' + (isExp ? ' open' : '') + '" data-suborder="' + oidS + '"><td colspan="10" class="file-expand-cell"><div class="file-expand-body"><div class="file-expand-inner">';
+        if (o.remark) {
+          h += '<div class="order-remark" title="订单备注">📝 备注：' + esc(o.remark) + '</div>';
+        }
         h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>单/双面</span><span>状态</span></div>';
         o.files.forEach(function (f) {
-          h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + '">';
+          h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + (f.reject_reason ? ' · ' + esc(f.reject_reason) : '') + '">';
           h += '<span class="fn">📄 ' + esc(f.file_name) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
           h += '<span style="font-weight:700;color:' + revColor + '">' + RMB(parseCents(f.total_price)) + '</span>';
           h += '<span>' + f.copies + '份</span>';

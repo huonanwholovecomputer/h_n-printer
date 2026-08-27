@@ -57,7 +57,8 @@ def get_cached_pdf_path(source_md5: str, image_orientation: str = "") -> str | N
     返回缓存 PDF 路径，无缓存返回 None。"""
     if not source_md5:
         return None
-    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+    import paths as _paths
+    cache_dir = _paths.pdf_cache_dir()
     pdf_path = os.path.join(cache_dir, pdf_cache_key(source_md5, image_orientation) + ".pdf")
     if os.path.isfile(pdf_path):
         return pdf_path
@@ -357,15 +358,36 @@ class CloudClient(QObject):
         except Exception:
             pass  # 离线时静默跳过，后端定时任务兜底
 
-    def accept_order_to_server(self, order_id: int):
-        """确认接受订单：调用后端 API。失败时加入同步队列。"""
+    def accept_order_to_server(self, order_id: int) -> str:
+        """确认接受订单：调用后端 API。
+        返回三态：
+        - 'ok'       后端接受成功
+        - 'canceled' 业务拒绝（订单已被用户取消等，重放也不会成功，不入离线队列）
+        - 'offline'  网络失败/离线，已加入离线队列，联网后重放
+        P2-9：accept 前由后端权威校验订单是否仍有效（canceled → 409），
+        本地据此撤回已添加的标签页，避免打印已取消订单。"""
         if not self.api_url or not self.token:
             self._queue_status_sync(order_id, "accepted")
-            return
-        # P1: 仅由 _try_status_sync 发送一次（失败自动入离线队列），
-        # 原函数体中的第二次 POST /api/accept_order 属重复提交，已删除
-        if self._try_status_sync(order_id, "accepted"):
+            return "offline"
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/accept_order",
+                params={"token": self.token},
+                json={"order_id": order_id},
+                timeout=10,
+            )
+        except Exception:
+            self._queue_status_sync(order_id, "accepted")
+            return "offline"
+        if resp.ok:
             self.status_message.emit(f"☁ 订单 #{order_id} 已确认接受")
+            return "ok"
+        if 400 <= resp.status_code < 500:
+            # 业务拒绝（如订单已取消）：不入离线队列，按不可接受处理
+            self.status_message.emit(f"☁ 订单 #{order_id} 接受被拒绝: {(resp.text or '')[:120]}")
+            return "canceled"
+        self._queue_status_sync(order_id, "accepted")
+        return "offline"
 
     def reject_order_to_server(self, order_id: int):
         """打回订单：调用后端 API，将订单状态设为 rejected。"""
@@ -473,7 +495,8 @@ class CloudClient(QObject):
     # ── 离线状态同步 ──
 
     def _status_queue_path(self) -> str:
-        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+        import paths as _paths
+        d = _paths.pdf_cache_dir()
         return os.path.join(d, "status_queue.json")
 
     def _quarantine_status_queue(self, path: str):
@@ -542,6 +565,11 @@ class CloudClient(QObject):
                 timeout=10,
             )
             if not resp.ok:
+                if 400 <= resp.status_code < 500:
+                    # 业务拒绝（如订单已取消）：不入队重放——重放也不会成功，避免死循环
+                    logger.warning(f"状态同步 {status} 订单 #{order_id} 被业务拒绝"
+                                   f" ({resp.status_code})，丢弃该条目")
+                    return False
                 self._queue_status_sync(order_id, status)
                 return False
             return True
@@ -610,6 +638,11 @@ class CloudClient(QObject):
                         timeout=10,
                     )
                     if not resp.ok:
+                        if 400 <= resp.status_code < 500:
+                            # 业务拒绝（如订单已取消）：丢弃，不反复重放
+                            logger.warning(f"离线状态同步 {status} 订单 #{order_id} 被业务拒绝"
+                                           f" ({resp.status_code})，丢弃该条目")
+                            continue
                         remaining.append(item)
                 except Exception:
                     remaining.append(item)
@@ -1293,9 +1326,9 @@ class CloudClient(QObject):
     def _cache_dir(self) -> str:
         if self._CACHE_DIR:
             return self._CACHE_DIR
-        # 放在 local_print_tool 目录下
-        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
-        os.makedirs(d, exist_ok=True)
+        # 缓存目录统一在 %APPDATA%\HN打印工具\pdf_cache（可重建，安装覆盖不丢数据）
+        import paths as _paths
+        d = _paths.pdf_cache_dir()
         self._CACHE_DIR = d
         return d
 

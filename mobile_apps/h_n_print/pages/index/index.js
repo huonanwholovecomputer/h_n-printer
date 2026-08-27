@@ -158,6 +158,8 @@ Component({
     urgencyPrices: { '低': 0, '中': 0.08, '高': 0.15 },
     urgencyPrice: 0,
     coverPage: false,
+    // 订单备注（选填，≤100 字）
+    remark: '',
     simplexPrice: 0.2,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
     duplexPrice: 0.3,    // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
     coverPagePrice: 0.10,  // 与本地打印工具 print_config.json 保持一致
@@ -202,9 +204,11 @@ Component({
     // 入场状态（JS 按页面加载时刻调度）：entered.x 到点置 true 播放；entranceDone 结束后清理类防切 tab 重放
     entered: {
       logo: false, statusBar: false, fileSection: false, extParams: false,
-      autoPrint: false, adminPrint: false, submit: false,
+      remark: false, autoPrint: false, adminPrint: false, submit: false,
     },
     entranceDone: false,
+    // 备注卡片高度（rpx）：随 textarea 行数平滑变化（外层 view transition）
+    remarkBoxHeight: 120,
   },
   lifetimes: {
     attached() {
@@ -2028,6 +2032,7 @@ Component({
         ['statusBar', 0.6],
         ['fileSection', 0.7],
         ['extParams', 0.8],
+        ['remark', 0.85],
         ['autoPrint', 0.9],
         ['adminPrint', 1.0],
         ['submit', 1.1],
@@ -2497,6 +2502,35 @@ Component({
       return `${min} 分 ${sec} 秒后开始打印`
     },
 
+    // 估算备注文本行数（不依赖 textarea 可见行数——固定高度时 bindlinechange 返回可见行数，
+    // 超过后不再增长导致卡片不延伸；此处按内容宽度/字号换算折行行数，宁大勿小）
+    _estimateRemarkLines(text) {
+      if (!text) return 1
+      try {
+        const winW = wx.getSystemInfoSync().windowWidth  // px
+        // 内容区约 690rpx 宽（卡片内边距后），字号 27rpx；每行字数取保守值（约 20 字/行），
+        // 保证 100 字（最多 ~5 行）时卡片高度足够、内容全部可见，无需滚动
+        const contentW = winW * (690 / 750)
+        const charW = winW * (34 / 750)   // 字宽按 34rpx 估（比实际 27rpx 保守 → 行数偏多 → 高度宁大勿小）
+        const perLine = Math.max(8, Math.floor(contentW / charW))
+        let lines = 0
+        for (const seg of String(text).split('\n')) {
+          lines += Math.max(1, Math.ceil(Math.max(1, seg.length) / perLine))
+        }
+        return lines
+      } catch (e) {
+        return Math.ceil(String(text).length / 20)
+      }
+    },
+
+    onRemarkInput(e) {
+      // 订单备注：≤100 字 + 卡片高度随行数平滑变化（估算行数 → textarea 高度 transition）
+      const remark = String(e.detail.value || '').slice(0, 100)
+      const lines = this._estimateRemarkLines(remark)
+      const h = Math.max(120, Math.min(360, lines * 43 + 20))
+      this.setData({ remark, remarkBoxHeight: h })
+    },
+
     onSubmit() {
       const { selectedFiles } = this.data
 
@@ -2668,6 +2702,7 @@ Component({
           // 普通用户强制打印首页（双保险：即使界面状态异常也按 1 提交）
           cover_page: (this.data.userRole === 'user' || this.data.coverPage) ? 1 : 0,
           cover_page_price: this.data.coverPagePrice,
+          remark: this.data.remark || '',
           skip_page_validation: skipPageValidation ? 1 : 0,
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
           // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）

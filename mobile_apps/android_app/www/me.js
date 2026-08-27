@@ -758,7 +758,7 @@ function orderStatusClass(status) {
   return 'status-' + (status || 'queued');
 }
 
-function orderCardHTML(o, expanded, deliveredLabel) {
+function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
   const status = ORDER_STATUS_MAP[o.status] || o.status;
   let statusText = status;
   let statusCls = orderStatusClass(o.status);
@@ -769,6 +769,11 @@ function orderCardHTML(o, expanded, deliveredLabel) {
     statusCls = 'status-delivered';
   }
   if (expanded === undefined) expanded = !!meState.expandedOrders[o.id];
+  // 取消按钮：默认可取消（本人订单视图）；user-orders 视图仅本人订单显示。
+  // 含预约单到点前（scheduled/downloading/waiting），与后端 cancel_order 允许的状态一致
+  const canCancel = allowCancel !== false
+    && (o.status === 'queued' || o.status === 'printing' || o.status === 'waiting'
+        || o.status === 'downloading' || o.status === 'scheduled');
   // 详情区常驻渲染、用 detail-expanded 类切换（对齐小程序：展开/收起均有过渡动画）
   let fileRows = '';
   (o.files || []).forEach(f => {
@@ -813,6 +818,12 @@ function orderCardHTML(o, expanded, deliveredLabel) {
     }
     extRows += '</view>';
   }
+  // 备注（与附加服务同级展示；空备注不显示；灰色背景与文件列表一致）
+  let remarkRows = '';
+  if (o.remark) {
+    remarkRows = `<view class="detail-section"><view class="detail-section-title">备注</view>
+      <view class="remark-block"><text class="remark-text">${esc(o.remark)}</text></view></view>`;
+  }
   const detail = `
     <view class="order-card-detail ${expanded ? 'detail-expanded' : ''}">
       <view class="detail-divider"></view>
@@ -825,11 +836,12 @@ function orderCardHTML(o, expanded, deliveredLabel) {
       ${licenseRows}
       ${(o.files && o.files.length) ? `<view class="detail-section"><view class="detail-section-title">文件列表 (${o.files.length})</view>${fileRows}</view>` : ''}
       ${extRows}
+      ${remarkRows}
       <view class="detail-section">
         <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text><text class="detail-price-value status-${o.status || 'queued'}${(o.is_admin_print && o.status === 'sent') ? ' is-self-sent' : ''}">¥${o.totalPriceDisplay || '0.00'}</text></view>
       </view>
       <view class="detail-actions">
-        ${(o.status === 'queued' || o.status === 'printing') ? `<button class="btn-cancel-sm" data-cancel-order="${o.id}">取消任务</button>` : ''}
+        ${canCancel ? `<button class="btn-cancel-sm" data-cancel-order="${o.id}">取消任务</button>` : ''}
       </view>
     </view>`;
   return `
@@ -1050,8 +1062,12 @@ function scrollToOrdersSection() {
   engine.scrollTo(target, 280);
 }
 
+// 取消订单请求进行中（防重复提交：确认框关闭后 loading toast 期间连点会并发两个取消请求）
+let _cancellingOrder = false;
 function cancelOrder(id) {
   showConfirm('确认取消', '确定要取消这个打印任务吗？', '取消订单', '#FF9500', () => {
+    if (_cancellingOrder) return;
+    _cancellingOrder = true;
     showToast('取消中...', 10000);
     api('/api/cancel_order', {
       method: 'POST',
@@ -1064,7 +1080,8 @@ function cancelOrder(id) {
         const uo = document.getElementById('view-user-orders');
         if (uo && uo.style.display !== 'none') loadUserOrders();
       } else showToast((r.data && r.data.message) || '取消失败');
-    }).catch(() => showToast('网络错误'));
+    }).catch(() => showToast('网络错误'))
+      .finally(() => { _cancellingOrder = false; });
   });
 }
 
@@ -2111,7 +2128,7 @@ function renderUserOrders() {
         <text class="empty-desc">${v.source === 'local' ? '还没有本地打印任务记录' : '该用户还没有发起过打印任务'}</text>
       </view>`;
   } else {
-    list.innerHTML = v.orders.map(o => orderCardHTML(o, !!v.expanded[o.id])).join('');
+    list.innerHTML = v.orders.map(o => orderCardHTML(o, !!v.expanded[o.id], undefined, o.openid === state.openid)).join('');
   }
   // 每页条数下拉
   syncUserOrdersPageSizePicker();

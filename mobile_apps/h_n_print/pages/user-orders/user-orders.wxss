@@ -588,6 +588,33 @@
   margin-bottom: 8rpx;
 }
 
+/* 备注块：灰色背景与文件列表一致（--gray6），突出文字内容 */
+.remark-row {
+  display: block;
+}
+.remark-text {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background-color: var(--gray6);
+  border-radius: var(--radius-sm);
+  padding: 16rpx 18rpx;
+  font-size: 24rpx;
+  font-weight: 400;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+/* 深色模式：与文件列表一致（glass 材质） */
+.theme-dark .remark-text {
+  background: var(--glass-regular);
+}
+/* 主题切换过渡：与 me 页白名单一致，备注背景随主题平滑渐变 */
+.page-root .remark-text {
+  transition: background 0.45s ease, color 0.35s ease, border-color 0.45s ease, box-shadow 0.45s ease;
+}
+
 .detail-file-info {
   flex: 1;
   min-width: 0;

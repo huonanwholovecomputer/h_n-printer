@@ -17,6 +17,9 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, qInstallMessageHandler, QtMsgType
 
+# 用户数据目录管理（%APPDATA%\HN打印工具）
+import paths
+
 
 # ═══════════════════════════════════════════════════════════════
 # stderr 过滤器 — 在文件描述符层面拦截 C 库的 fprintf(stderr, ...)
@@ -193,9 +196,16 @@ def main():
         logger.info("程序已在运行：已通知既有实例将窗口置于前台，本实例退出")
         return
 
-    # 切换到脚本所在目录
+    # 切换到脚本所在目录（打包版为 exe 目录；安装版为 C:\Program Files\h_n printer）
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
+
+    # 用户数据统一迁移到 %APPDATA%\HN打印工具（旧版绿色版数据在程序目录 → 复制迁移，
+    # 幂等；安装版/新版数据已在数据目录则跳过）。必须在读配置前执行。
+    try:
+        paths.migrate_legacy_data(script_dir)
+    except Exception as e:
+        logger.warning(f"用户数据目录迁移失败（将按新目录空配置启动）: {e}")
 
     # 检查依赖
     missing = check_dependencies()
@@ -218,9 +228,8 @@ def main():
     dark_qss = load_stylesheet(dark_qss_path)
     light_qss = load_stylesheet(light_qss_path)
 
-    # 初始化主题管理器
-    theme_settings_path = os.path.join(script_dir, "theme_settings.json")
-    theme_manager = ThemeManager(theme_settings_path)
+    # 初始化主题管理器（主题设置存 %APPDATA%\HN打印工具）
+    theme_manager = ThemeManager(paths.theme_settings_path())
     theme_manager.init(app, dark_qss, light_qss)
 
     if dark_qss and light_qss:
@@ -238,8 +247,8 @@ def main():
             f"程序可能部分功能无法使用。"
         )
 
-    # 配置路径
-    config_path = os.path.join(script_dir, "print_config.json")
+    # 配置路径（%APPDATA%\HN打印工具\print_config.json；迁移逻辑见上方 migrate_legacy_data）
+    config_path = paths.config_path()
 
     # 启动主窗口（UI 优先显示，其他检查放入后台）
     from gui import MainWindow

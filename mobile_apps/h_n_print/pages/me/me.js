@@ -31,6 +31,8 @@ Component({
     orders: [],
     loading: true,
     loadError: '',
+    // 取消订单请求进行中（防重复提交：loading 无 mask 时快速连点会并发发两个取消请求）
+    isCanceling: false,
     // 分页
     ordersCurrentPage: 1,
     ordersPerPage: 10,
@@ -2263,9 +2265,10 @@ Component({
     onDetailCancelOrder(e) {
       const orderId = e.currentTarget.dataset.id
       const token = wx.getStorageSync('token')
-      if (!token) return
+      if (!token || this.data.isCanceling) return
       this._showConfirm('确认取消', '确定要取消这个打印任务吗？', '取消订单', '#FF9500', () => {
-        wx.showLoading({ title: '取消中...' })
+        this.setData({ isCanceling: true })
+        wx.showLoading({ title: '取消中...', mask: true })
         request({
           url: CONFIG.BASE_URL + '/api/cancel_order',
           method: 'POST',
@@ -2283,7 +2286,8 @@ Component({
           fail: () => {
             wx.hideLoading()
             wx.showToast({ title: '网络错误', icon: 'none' })
-          }
+          },
+          complete: () => this.setData({ isCanceling: false }),
         })
       })
     },

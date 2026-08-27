@@ -662,7 +662,7 @@ pushed_tasks_lock = threading.Lock()
 
 CLIENT_HEARTBEAT_TIMEOUT = 90    # 心跳超时秒数（超过此值视为离线）
 PRINT_FEEDBACK_TIMEOUT = 180     # 打印反馈超时秒数（3 分钟，断线回滚兜底）
-ACCEPT_WAIT_TIMEOUT = 600        # P1-8：推送后未被 accept 的任务（手动流程，等用户点击）超时放宽到 10 分钟
+ACCEPT_WAIT_TIMEOUT = 600        # 推送后未被 accept 的任务（打印机端等待用户确认）：超过该时长停止计时，但不判失败（任务保持等待，由孤儿回收+重推兜底）
 # 断线未知超时秒数（30 分钟）：客户端断线后任务置 offline_unknown，等待原客户端重连回报；
 # 超时仍未解决 → 保守标记 failed（方案 B：不重复打印，用户可手动重发）
 OFFLINE_UNKNOWN_TIMEOUT = 1800
@@ -1091,6 +1091,14 @@ def init_db():
             print(f"  已删除旧字段: {col}")
         except sqlite3.OperationalError:
             pass  # 字段不存在或 SQLite 版本不支持，忽略
+
+    # v20 迁移：订单备注（用户提交时填写，≤100 字）
+    try:
+        conn.execute("ALTER TABLE orders ADD COLUMN remark TEXT DEFAULT ''")
+        conn.commit()
+        print("  已添加 orders.remark 列")
+    except sqlite3.OperationalError:
+        pass
 
     # ============ 用户数据库 (users.db) ============
     # 用户表
@@ -1573,7 +1581,11 @@ def aggregate_order_status(conn, order_id):
     if all(s == "rejected" for s in statuses):
         return "rejected"
     if all(s in ("sent", "accepted", "offline_unknown", "abandoned", "canceled", "rejected") for s in statuses):
-        # 混合终态：有 sent 优先，有 offline_unknown 次之
+        # 混合终态：用户主动取消优先于已完成——
+        # 已取消订单即使有部分文件在取消前已打印完成，父订单仍显示"已取消"
+        #（否则取消后迟到的 print_success 会把聚合状态刷回 sent，用户看到"已完成"）
+        if any(s == "canceled" for s in statuses):
+            return "canceled"
         if any(s == "sent" for s in statuses):
             return "sent"
         if any(s == "offline_unknown" for s in statuses):
@@ -1669,7 +1681,7 @@ def fetch_and_lock_task(client_id):
             full_task = conn.execute(
                 """SELECT of.*, o.order_number, o.delivery_enabled, o.delivery_location,
                           o.urgency, o.cover_page, o.cover_page_price, o.auto_print,
-                          o.owner_name, o.is_admin_print, o.openid,
+                          o.owner_name, o.is_admin_print, o.openid, o.remark,
                           f.md5 as source_md5
                    FROM order_files of
                    LEFT JOIN orders o ON of.order_id = o.id
@@ -1740,7 +1752,7 @@ def process_pending_orders():
             conn = get_db()
             _retry_on_lock(
                 conn.execute,
-                "UPDATE order_files SET status = 'failed' WHERE id = ?",
+                "UPDATE order_files SET status = 'failed' WHERE id = ? AND status = 'queued'",
                 (of_id,),
             )
             refresh_order_status(conn, order_id)
@@ -1777,6 +1789,7 @@ def process_scheduled_orders():
         JOIN orders o ON of.order_id = o.id
         WHERE of.status IN ('scheduled', 'waiting')
           AND o.schedule_mode != 'now'
+          AND o.status != 'canceled'   -- 已取消订单的子任务不再下发/兜底（P2-9）
         ORDER BY of.created_at ASC
         """
     ).fetchall()
@@ -1805,7 +1818,7 @@ def process_scheduled_orders():
                 conn = get_db()
                 _retry_on_lock(
                     conn.execute,
-                    "UPDATE order_files SET status = 'failed' WHERE id = ?",
+                    "UPDATE order_files SET status = 'failed' WHERE id = ? AND status = 'scheduled'",
                     (row["of_id"],),
                 )
                 refresh_order_status(conn, order_id)
@@ -1958,7 +1971,7 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
     if order_id:
         conn2 = get_db()
         o_row = conn2.execute(
-            "SELECT delivery_enabled, delivery_location, urgency, cover_page, cover_page_price, owner_name, is_admin_print, openid FROM orders WHERE id = ?",
+            "SELECT delivery_enabled, delivery_location, urgency, cover_page, cover_page_price, owner_name, is_admin_print, openid, remark FROM orders WHERE id = ?",
             (order_id,),
         ).fetchone()
         conn2.close()
@@ -1968,6 +1981,8 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             task_msg["urgency"] = o_row["urgency"] or "低"
             task_msg["cover_page"] = bool(o_row["cover_page"])
             task_msg["cover_page_price"] = float(o_row["cover_page_price"] or 0.10)
+            # 订单备注（本地工具展示）
+            task_msg["remark"] = o_row["remark"] or ""
             # v24.1：订单归属标记随任务下发，本地工具据此预勾选"管理员自行打印"
             task_msg["owner_name"] = o_row["owner_name"] or ""
             task_msg["is_admin_print"] = bool(o_row["is_admin_print"])
@@ -2058,19 +2073,24 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
 def check_printing_timeout():
     """检查超过超时时间未反馈的 printing/accepted 子任务 (order_files)，标记为失败并聚合父订单。
 
-    P1-8 超时判定（按是否已被客户端 accept 区分，避免手动流程被 3 分钟误杀）：
-    - 未 accept（status='printing'，手动流程等用户点击）：pushed_at 起算 10 分钟（ACCEPT_WAIT_TIMEOUT）
+    P1-8 超时判定（按是否已被客户端 accept 区分）：
+    - 未 accept（status='printing'，打印机端窗口等待用户确认）：**不再判失败**——
+      订单提交后一直未确认是常见场景（打印机端管理员未处理/忙），超时仅清 pushed_tasks
+      计时条目；任务保持 printing，由 recover_orphaned_printing_tasks 5 分钟回退 queued 后
+      重新推送，直到打印机确认/打回/用户取消（或排队超 queued_timeout_hours 被淘汰）。
     - 已 accept（status='accepted'）：accept 时刻（locked_at，由 accept_order 刷新）起算 3 分钟
-      （PRINT_FEEDBACK_TIMEOUT）；locked_at 距今不足 3 分钟 → 跳过（仍在反馈窗口内）
+      （PRINT_FEEDBACK_TIMEOUT）；locked_at 距今不足 3 分钟 → 跳过（仍在反馈窗口内）。
     """
     now = datetime.now()
     timeout_sub_tasks = []
 
-    # 1) 未 accept 的任务：pushed_at 起算 10 分钟
+    # 1) 未 accept 的任务：等待打印机确认，不判失败；仅清理 pushed_tasks 计时条目
+    #    （条目只用于"推送后多久未反馈"计时，不清理会随进程一直累积）
     with pushed_tasks_lock:
         for sub_task_id, info in list(pushed_tasks.items()):
             if (now - info["pushed_at"]).total_seconds() > ACCEPT_WAIT_TIMEOUT:
-                timeout_sub_tasks.append(sub_task_id)
+                print(f"  [WAIT] 子任务 #{sub_task_id}: 推送后 {ACCEPT_WAIT_TIMEOUT // 60} 分钟未被打印机确认，"
+                      f"停止计时，保持等待（不判失败）")
                 del pushed_tasks[sub_task_id]
 
     # 2) 已 accept 的任务：locked_at（accept 时刻）起算 3 分钟
@@ -2123,13 +2143,13 @@ def check_printing_timeout():
                 "SELECT id, status, order_id, locked_at FROM order_files WHERE id = ?", (sub_task_id,)
             ).fetchone()
 
-            if not of_row or of_row["status"] not in ("printing", "accepted"):
+            if not of_row or of_row["status"] != "accepted":
                 if of_row:
                     print(f"  [INFO] 子任务 #{sub_task_id}: 状态已变更为 {of_row['status']}，跳过")
                 continue
             # 已 accept 但 locked_at 距今 < 3 分钟 → 刚 accept 不久，仍在反馈窗口内，跳过
             la = of_row["locked_at"] or ""
-            if of_row["status"] == "accepted" and la:
+            if la:
                 try:
                     la_dt = datetime.strptime(la, "%Y-%m-%d %H:%M:%S")
                 except ValueError:
@@ -2137,9 +2157,10 @@ def check_printing_timeout():
                 if la_dt and (now - la_dt).total_seconds() < PRINT_FEEDBACK_TIMEOUT:
                     print(f"  [INFO] 子任务 #{sub_task_id}: 刚被 accept，仍在反馈窗口内，跳过")
                     continue
-            print(f"  [FAIL] 子任务 #{sub_task_id}: 超时未反馈，标记为失败")
+            print(f"  [FAIL] 子任务 #{sub_task_id}: 已确认但超时未反馈，标记为失败")
             conn.execute(
-                "UPDATE order_files SET status = 'failed', locked_at = '' WHERE id = ?",
+                "UPDATE order_files SET status = 'failed', locked_at = '',"
+                " reject_reason = '打印机已确认但超时未反馈打印结果' WHERE id = ? AND status = 'accepted'",
                 (sub_task_id,),
             )
             refresh_order_status(conn, of_row["order_id"])
@@ -2192,7 +2213,8 @@ def recover_orphaned_printing_tasks():
         if fail_ids:
             placeholders = ",".join("?" for _ in fail_ids)
             conn.execute(
-                f"UPDATE order_files SET status = 'failed', locked_at = '' WHERE id IN ({placeholders})",
+                f"UPDATE order_files SET status = 'failed', locked_at = '',"
+                f" reject_reason = '打印机异常，任务文件已被清理，无法打印' WHERE id IN ({placeholders})",
                 [str(x) for x in fail_ids]
             )
 
@@ -2229,8 +2251,9 @@ def recover_stale_downloading():
             changed = False
             for r in rows:
                 if r["operator_client"] not in active:
+                    # 状态守卫：SELECT 在锁外读取，防止与 cancel 竞态把已取消子任务翻回 scheduled
                     conn2.execute(
-                        "UPDATE order_files SET status = 'scheduled', operator_client = '' WHERE id = ?",
+                        "UPDATE order_files SET status = 'scheduled', operator_client = '' WHERE id = ? AND status = 'downloading'",
                         (r["id"],),
                     )
                     refresh_order_status(conn2, r["order_id"])
@@ -2349,7 +2372,7 @@ def on_disconnect(reason=None):
                     placeholders = ",".join("?" for _ in rows)
                     # P0-1.4：回退 queued 时同时清空 locked_at，防止旧锁定时间被孤儿回收误判
                     conn.execute(
-                        f"UPDATE order_files SET status = 'queued', operator_client = '', locked_at = '' WHERE id IN ({placeholders})",
+                        f"UPDATE order_files SET status = 'queued', operator_client = '', locked_at = '' WHERE id IN ({placeholders}) AND status = 'printing'",
                         ids
                     )
                     for r in rows:
@@ -2365,7 +2388,7 @@ def on_disconnect(reason=None):
                     dl_ids = [str(r["id"]) for r in dl_rows]
                     dl_placeholders = ",".join("?" for _ in dl_rows)
                     conn.execute(
-                        f"UPDATE order_files SET status = 'scheduled', operator_client = '', locked_at = '' WHERE id IN ({dl_placeholders})",
+                        f"UPDATE order_files SET status = 'scheduled', operator_client = '', locked_at = '' WHERE id IN ({dl_placeholders}) AND status = 'downloading'",
                         dl_ids
                     )
                     for r in dl_rows:
@@ -2381,7 +2404,7 @@ def on_disconnect(reason=None):
                     a_ids = [str(r["id"]) for r in accepted_rows]
                     a_placeholders = ",".join("?" for _ in accepted_rows)
                     conn.execute(
-                        f"UPDATE order_files SET status = 'offline_unknown' WHERE id IN ({a_placeholders})",
+                        f"UPDATE order_files SET status = 'offline_unknown' WHERE id IN ({a_placeholders}) AND status = 'accepted'",
                         a_ids
                     )
                     for r in accepted_rows:
@@ -2529,10 +2552,15 @@ def on_print_fail(data):
               f" 与当前连接 {client_id} 不符，已拒绝")
         conn.close()
         return
-    # P1-5：禁止 sent → failed 降级（已完成的任务不能被迟到的失败回报改状态）
+    # P1-5：禁止 sent → failed 降级（已完成的任务不能被迟到的失败回报改状态）；
+    # 同时排除 canceled——用户已取消的任务不能被迟到的失败回报覆盖成 failed
+    #（与 print_success 的状态白名单对称；否则取消正在打印的订单时，本地工具对
+    #  剩余任务回报的"已取消"失败会把 canceled 覆盖成 failed，父订单显示"打印失败"）
+    # 失败原因写入 reject_reason（移动端订单详情/收支结算可展示）
     conn.execute(
-        "UPDATE order_files SET status = 'failed', locked_at = '' WHERE id = ? AND status != 'sent'",
-        (task_id,),
+        "UPDATE order_files SET status = 'failed', locked_at = '', reject_reason = ? WHERE id = ?"
+        " AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued')",
+        (("打印失败: " + str(error))[:200], task_id),
     )
     # 获取父订单 ID 并刷新聚合状态
     if row:
@@ -2603,13 +2631,23 @@ def on_file_ready(data):
                     print(f"  [WARN] file_ready 子任务 #{tid} 的 operator_client={chk['operator_client']}"
                           f" 与当前连接 {client_id} 不符，跳过")
                     continue
+                row = conn.execute(
+                    "SELECT order_id FROM order_files WHERE id = ? AND status = 'downloading'", (tid,)
+                ).fetchone()
+                if not row:
+                    continue
+                # 父订单已取消 → 迟到的下载完成不恢复为 waiting，直接保持 canceled（防已取消订单复活）
+                o = conn.execute(
+                    "SELECT status FROM orders WHERE id = ?", (row["order_id"],)
+                ).fetchone()
+                if o and o["status"] == "canceled":
+                    print(f"  [SKIP] file_ready 子任务 #{tid}: 父订单已取消，保持 canceled")
+                    continue
                 conn.execute(
                     "UPDATE order_files SET status = 'waiting' WHERE id = ? AND status = 'downloading'",
                     (tid,),
                 )
-                row = conn.execute("SELECT order_id FROM order_files WHERE id = ?", (tid,)).fetchone()
-                if row and row["order_id"]:
-                    refresh_order_status(conn, row["order_id"])
+                refresh_order_status(conn, row["order_id"])
             if order_id:
                 o = conn.execute(
                     "SELECT schedule_mode, schedule_frozen FROM orders WHERE id = ?", (order_id,)
@@ -2668,9 +2706,10 @@ def on_download_delayed(data):
         try:
             conn.execute("BEGIN IMMEDIATE")
             o = conn.execute(
-                "SELECT schedule_mode FROM orders WHERE id = ?", (order_id,)
+                "SELECT schedule_mode, status FROM orders WHERE id = ?", (order_id,)
             ).fetchone()
-            if o and o["schedule_mode"] != "now":
+            # 父订单已取消 → 不再冻结（子任务已取消，无需续排）
+            if o and o["schedule_mode"] != "now" and o["status"] != "canceled":
                 conn.execute(
                     "UPDATE orders SET schedule_frozen = 1, scheduled_at = '' WHERE id = ?",
                     (order_id,),
@@ -2721,13 +2760,23 @@ def on_start_printing(data):
                     print(f"  [WARN] start_printing 子任务 #{tid} 的 operator_client={chk['operator_client']}"
                           f" 与当前连接 {client_id} 不符，跳过")
                     continue
+                row = conn.execute(
+                    "SELECT order_id FROM order_files WHERE id = ? AND status IN ('waiting', 'downloading')", (tid,)
+                ).fetchone()
+                if not row:
+                    continue
+                # 父订单已取消 → 不再开始打印（防已取消订单复活）
+                o = conn.execute(
+                    "SELECT status FROM orders WHERE id = ?", (row["order_id"],)
+                ).fetchone()
+                if o and o["status"] == "canceled":
+                    print(f"  [SKIP] start_printing 子任务 #{tid}: 父订单已取消，跳过")
+                    continue
                 conn.execute(
                     "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ? AND status IN ('waiting', 'downloading')",
                     (client_id, now_str, tid),
                 )
-                row = conn.execute("SELECT order_id FROM order_files WHERE id = ?", (tid,)).fetchone()
-                if row and row["order_id"]:
-                    refresh_order_status(conn, row["order_id"])
+                refresh_order_status(conn, row["order_id"])
             conn.commit()
         except Exception:
             conn.rollback()
@@ -4083,6 +4132,8 @@ def submit_order():
         cover_page_price = max(0.0, min(100.0, float(data.get("cover_page_price", 0.10) or 0)))
         pickup_address = data.get("pickup_address", "")
         auto_print = int(data.get("auto_print", 0) or 0)  # 无障碍打印：提交后自动开始打印
+        # 订单备注：≤100 字，多余截断
+        remark = str(data.get("remark", "") or "").strip()[:100]
     except (ValueError, TypeError):
         return jsonify({"success": False, "message": "附加服务参数格式不正确"}), 400
 
@@ -4218,9 +4269,9 @@ def submit_order():
                                    urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                                    order_number, source, auto_print,
                                    schedule_mode, scheduled_at, schedule_frozen,
-                                   client_request_id, owner_name, is_admin_print)
+                                   client_request_id, owner_name, is_admin_print, remark)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              0,  # is_free 恒为 0 — 价格仅用于统计
@@ -4228,7 +4279,7 @@ def submit_order():
              urgency, urgency_price, cover_page, cover_page_price, pickup_address,
              order_number, client, 1 if auto_print else 0,
              schedule_mode, scheduled_at,
-             client_request_id, owner_name, admin_print),
+             client_request_id, owner_name, admin_print, remark),
             # is_free 恒为 0 — 价格仅用于统计，无免费策略
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -4505,6 +4556,7 @@ def pull_queued_orders():
         "urgency": task.get("urgency", "低") or "低",
         "cover_page": bool(task.get("cover_page", False)),
         "cover_page_price": float(task.get("cover_page_price", 0.10) or 0.10),
+        "remark": task.get("remark", "") or "",
         "auto_print": bool(task.get("auto_print", False)),
         "owner_name": task.get("owner_name", "") or "",
         "is_admin_print": bool(task.get("is_admin_print", False)),
@@ -4786,7 +4838,7 @@ def get_orders():
                delivery_enabled, delivery_location, delivery_percentage,
                urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                schedule_mode, scheduled_at, schedule_frozen,
-               source, owner_name, is_admin_print
+               source, owner_name, is_admin_print, remark
         FROM orders
         WHERE {where_clause}
         ORDER BY id DESC
@@ -4896,7 +4948,7 @@ def get_order_detail(order_id):
                o.urgency, o.urgency_price, o.cover_page, o.cover_page_price,
                o.pickup_address,
                o.schedule_mode, o.scheduled_at, o.schedule_frozen,
-               o.owner_name, o.is_admin_print
+               o.owner_name, o.is_admin_print, o.remark
         FROM orders o
         WHERE o.id = ? AND o.openid = ?
         """,
@@ -5046,13 +5098,18 @@ def get_order_price(order_id):
 @app.route("/api/cancel_order", methods=["POST"])
 @login_required
 def cancel_order():
-    """取消任务（仅限 queued 或 printing 状态且属于当前用户）。
+    """取消任务（限 queued/printing/waiting/downloading/scheduled 状态且属于当前用户）。
     取消后通过 SocketIO 通知已连接的打印机客户端。
 
     P2-2：整个"读状态 → 校验 → 更新"纳入 db_lock（BEGIN IMMEDIATE），
     防止与 push/pull 并发时读到旧状态后覆盖对方写入。
     允许取消 printing 任务存在"打印机已开始打印"的小窗口：客户端收到
-    order_canceled 事件后自行中止，可接受的窗口（现状即如此，保持并注明）。"""
+    order_canceled 事件后自行中止，可接受的窗口（现状即如此，保持并注明）。
+
+    P2-9：允许取消预约单（scheduled/downloading/waiting）——用户预约了打印，
+    到点前应能反悔；且取消时一次性把所有未终结子任务（含预约单的
+    scheduled/downloading/waiting）置为 canceled，避免取消不完整导致
+    process_scheduled_orders 把已取消订单的文件重新下发/打印。"""
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
@@ -5077,18 +5134,23 @@ def cancel_order():
             if row["openid"] != g.openid:
                 return jsonify({"success": False, "message": "无权操作此任务"}), 403
 
-            if row["status"] not in ("queued", "printing"):
+            if row["status"] not in ("queued", "printing", "waiting", "downloading", "scheduled"):
                 return jsonify({"success": False, "message": f"任务状态为 {row['status']}，无法取消"}), 400
 
-            # 查询被取消的子任务 ID 和已连接的打印机客户端
+            # 查询被取消的子任务 ID 和已连接的打印机客户端。
+            # 覆盖预约单的 scheduled/downloading/waiting（到点前也允许取消）
             sub_tasks = conn.execute(
-                "SELECT id, operator_client FROM order_files WHERE order_id = ? AND status IN ('queued', 'printing')",
+                "SELECT id, operator_client FROM order_files WHERE order_id = ?"
+                " AND status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')",
                 (order_id,),
             ).fetchall()
 
-            # 取消父订单和所有子任务（同时清空 locked_at）
+            # 取消父订单和所有未终结子任务（同时清空 locked_at）。
+            # 一次性覆盖 queued/printing/waiting/downloading/scheduled 等全部非终态，
+            # 避免取消不完整导致已取消订单被 process_scheduled_orders 重新下发/卡死。
             conn.execute(
-                "UPDATE order_files SET status = 'canceled', locked_at = '' WHERE order_id = ? AND status IN ('queued', 'printing')",
+                "UPDATE order_files SET status = 'canceled', locked_at = '' WHERE order_id = ?"
+                " AND status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')",
                 (order_id,),
             )
             conn.execute(
@@ -5127,7 +5189,11 @@ def cancel_order():
 
 @app.route("/api/accept_order", methods=["POST"])
 def accept_order():
-    """打印机确认接受订单（需 token 认证）。将状态从 printing 改为 accepted（终端状态）。"""
+    """打印机确认接受订单（需 token 认证）。将状态从 printing 改为 accepted（终端状态）。
+
+    P2-9：订单已被用户取消 → 拒绝接受（409）。原先父订单被无条件翻成 accepted，
+    已取消订单在窗口期被"添加"会把 canceled 污染成 accepted，且本地会打印已取消订单。
+    改为 db_lock 原子校验 + 仅当确有子任务被接受时才更新父订单。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
@@ -5135,27 +5201,46 @@ def accept_order():
     order_id = data.get("order_id", "") or request.args.get("order_id", "")
     if not order_id:
         return jsonify({"success": False, "message": "缺少 order_id"}), 400
-    conn = get_db()
     # P1-8：accept 时刷新 locked_at（复用 P0-1 的 locked_at 列）——
     # check_printing_timeout 对已 accept 任务按 accept 时刻起算 3 分钟反馈超时
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn.execute(
-        "UPDATE order_files SET status = 'accepted', locked_at = ? WHERE order_id = ? AND status = 'printing'",
-        (now_str, order_id),
-    )
-    conn.execute(
-        "UPDATE orders SET status = 'accepted' WHERE id = ?",
-        (order_id,),
-    )
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            o = conn.execute(
+                "SELECT status FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not o:
+                return jsonify({"success": False, "message": "任务不存在"}), 404
+            if o["status"] == "canceled":
+                print(f"  [SKIP] accept 订单 #{order_id}: 已被用户取消，拒绝接受")
+                return jsonify({"success": False, "message": "订单已被取消，无法接受"}), 409
+            cur = conn.execute(
+                "UPDATE order_files SET status = 'accepted', locked_at = ? WHERE order_id = ? AND status = 'printing'",
+                (now_str, order_id),
+            )
+            if cur.rowcount > 0:
+                conn.execute(
+                    "UPDATE orders SET status = 'accepted' WHERE id = ?",
+                    (order_id,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     print(f"  [ACCEPT] 订单 #{order_id} 已被打印机接受")
     return jsonify({"success": True, "message": "订单已接受"})
 
 
 @app.route("/api/reject_order", methods=["POST"])
 def reject_order():
-    """打印机打回订单（需 token 认证）。将订单状态设为 rejected。"""
+    """打印机打回订单（需 token 认证）。将订单状态设为 rejected。
+
+    P2-9：已取消订单不允许打回（409），避免 canceled 被覆盖成 rejected；
+    且仅当确有子任务被打回时才更新父订单（防空转污染）。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
@@ -5165,18 +5250,34 @@ def reject_order():
     if not order_id:
         return jsonify({"success": False, "message": "缺少 order_id"}), 400
 
-    conn = get_db()
-    # 将子任务和父订单都设为 rejected
-    conn.execute(
-        "UPDATE order_files SET status = 'rejected' WHERE order_id = ? AND status IN ('queued', 'printing')",
-        (order_id,),
-    )
-    conn.execute(
-        "UPDATE orders SET status = 'rejected' WHERE id = ?",
-        (order_id,),
-    )
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            o = conn.execute(
+                "SELECT status FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not o:
+                return jsonify({"success": False, "message": "任务不存在"}), 404
+            if o["status"] == "canceled":
+                print(f"  [SKIP] reject 订单 #{order_id}: 已被用户取消，拒绝打回")
+                return jsonify({"success": False, "message": "订单已被取消，无法打回"}), 409
+            # 将子任务和父订单都设为 rejected
+            cur = conn.execute(
+                "UPDATE order_files SET status = 'rejected' WHERE order_id = ? AND status IN ('queued', 'printing')",
+                (order_id,),
+            )
+            if cur.rowcount > 0:
+                conn.execute(
+                    "UPDATE orders SET status = 'rejected' WHERE id = ?",
+                    (order_id,),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     print(f"  [REJECT] 订单 #{order_id} 已被打印机打回")
     return jsonify({"success": True, "message": "订单已打回"})
@@ -5285,10 +5386,10 @@ def abandon_reserved_order():
             # 并补记归属（本地单口径：默认占位名 / 管理员自行打印），避免留下无归属记录
             cursor = conn.execute(
                 """UPDATE orders SET status = 'abandoned', total_price = ?,
-                                     owner_name = COALESCE(NULLIF(owner_name, ''), DEFAULT_OWNER_NAME),
+                                     owner_name = COALESCE(NULLIF(owner_name, ''), ?),
                                      is_admin_print = CASE WHEN is_admin_print = 0 THEN 1 ELSE is_admin_print END
                    WHERE order_number = ? AND status = 'reserved'""",
-                (float(total_price), order_number),
+                (float(total_price), DEFAULT_OWNER_NAME, order_number),
             )
             price_info = f"，价格 ¥{float(total_price):.2f}"
         else:
@@ -5305,6 +5406,15 @@ def abandon_reserved_order():
             conn.commit()
             action = "清除（纯占位）" if total_price is None else "放弃打印" + price_info
             print(f"  [ABANDON] 预留订单 {order_number} 已被{action}")
+        if total_price is not None:
+            # 预留单的子任务同步置 abandoned（无条件：父订单可能已被放弃，残留 reserved
+            # 子任务会让结算/列表的实时聚合把 abandoned 回退成 reserved）
+            conn.execute(
+                "UPDATE order_files SET status = 'abandoned'"
+                " WHERE order_id IN (SELECT id FROM orders WHERE order_number = ?) AND status = 'reserved'",
+                (order_number,),
+            )
+            conn.commit()
         return jsonify({"success": True, "message": f"已处理 {count} 个预留订单"})
     except Exception as e:
         conn.rollback()
@@ -5317,7 +5427,12 @@ def abandon_reserved_order():
 
 @app.route("/api/local_orders", methods=["POST"])
 def local_orders():
-    """本地打印工具上报本地打印任务。需 token 认证。"""
+    """本地打印工具上报本地打印任务。需 token 认证。
+
+    v4.6：支持预留上报——本地工具点击「复制价格」后先以 status='reserved' 上报完整
+    订单信息（文件明细 + 备注 + 价格），使"已预留"订单在后端非空占位；打印完成再以
+    status='sent' 覆盖（或断线重连按本地是否已打印选择状态）。两次上报都会删旧插新
+    覆盖文件明细与备注，保证后端信息与本地一致。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
@@ -5332,6 +5447,12 @@ def local_orders():
     is_admin_print = data.get("is_admin_print")
     if is_admin_print is not None:
         is_admin_print = 1 if is_admin_print else 0
+    # 上报状态：'sent'（打印完成）/ 'reserved'（预留占位，复制价格后未打印）
+    status = data.get("status", "sent")
+    if status not in ("sent", "reserved"):
+        status = "sent"
+    # 订单备注（≤100 字）
+    remark = str(data.get("remark", "") or "")[:100]
 
     if not order_number or not files:
         return jsonify({"success": False, "message": "缺少 order_number 或 files"}), 400
@@ -5348,17 +5469,17 @@ def local_orders():
         if existing:
             order_id = existing["id"]
             old_status = existing["status"]
-            # 如果已经是 sent/accepted 等终态 → 幂等跳过
+            # 如果已经是 sent/accepted 等终态 → 幂等跳过（预留上报不覆盖已完成的订单）
             if old_status in ("sent", "accepted"):
                 conn.close()
                 return jsonify({"success": True, "message": "订单已存在，跳过同步", "order_id": order_id})
 
-            # 更新占位记录为正式订单（reserved / abandoned → sent）
+            # 更新占位记录为正式订单（reserved 占位 → reserved 完整 或 sent），并覆盖备注
             conn.execute(
-                """UPDATE orders SET file = ?, total_price = ?, status = 'sent',
-                                     created_at = ?, source = 'local'
+                """UPDATE orders SET file = ?, total_price = ?, status = ?,
+                                     created_at = ?, source = 'local', remark = ?
                    WHERE id = ?""",
-                (order_file_label, total_price, created_at, order_id),
+                (order_file_label, total_price, status, created_at, remark, order_id),
             )
             # 归属标记：本地工具上报时随订单写入（缺失则默认占位名/管理员自行打印，
             # 与历史无标记订单的处理保持一致）
@@ -5372,21 +5493,25 @@ def local_orders():
             # 新插入（离线同步或直接调用场景）
             conn.execute(
                 """INSERT INTO orders (file, copies, status, created_at, openid, order_number,
-                                       total_price, source, owner_name, is_admin_print)
-                   VALUES (?, 1, 'sent', ?, 'local', ?, ?, 'local', ?, ?)""",
-                (order_file_label, created_at, order_number, total_price,
-                 owner_name or DEFAULT_OWNER_NAME, is_admin_print if is_admin_print is not None else 1),
+                                       total_price, source, owner_name, is_admin_print, remark)
+                   VALUES (?, 1, ?, ?, 'local', ?, ?, 'local', ?, ?, ?)""",
+                (order_file_label, status, created_at, order_number, total_price,
+                 owner_name or DEFAULT_OWNER_NAME, is_admin_print if is_admin_print is not None else 1,
+                 remark),
             )
             order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
+        # 子任务状态：预留单用 'reserved'（不进 queued 推送链路，聚合也不污染为 sent），
+        # 打印完成上报用 'sent'
+        sub_status = "reserved" if status == "reserved" else "sent"
         for f_info in files:
             conn.execute(
                 """INSERT INTO order_files (order_id, file_name, copies, page_count,
                                             total_price, status, duplex, created_at, page_range)
-                   VALUES (?, ?, ?, ?, ?, 'sent', ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (order_id, f_info.get("file_name", ""), f_info.get("copies", 1),
                  f_info.get("page_count", 0), f_info.get("cost", 0),
-                 f_info.get("duplex", "on"), created_at, f_info.get("page_range", "")),
+                 sub_status, f_info.get("duplex", "on"), created_at, f_info.get("page_range", "")),
             )
         conn.commit()
         return jsonify({"success": True, "order_id": order_id})
@@ -6733,7 +6858,7 @@ def admin_statistics_revenue():
                    o.owner_name, o.is_admin_print,
                    o.auto_print, o.schedule_mode, o.scheduled_at,
                    o.delivery_percentage, o.urgency_price, o.cover_page_price,
-                   o.pickup_address
+                   o.pickup_address, o.remark
             FROM orders o
             LEFT JOIN order_files of ON o.id = of.order_id AND of.status IN ({status_placeholders})
             WHERE o.created_at >= ? AND o.created_at <= ?
@@ -6750,7 +6875,8 @@ def admin_statistics_revenue():
         of_placeholders = ",".join("?" for _ in order_ids)
         of_rows = conn.execute(
             f"""SELECT id, order_id, file_name, copies, page_count, duplex,
-                       page_range, total_price, status, created_at, image_orientation, is_free
+                       page_range, total_price, status, created_at, image_orientation, is_free,
+                       reject_reason
                 FROM order_files
                 WHERE order_id IN ({of_placeholders})
                 ORDER BY order_id, id""",
@@ -6772,6 +6898,7 @@ def admin_statistics_revenue():
                 "status": of_row["status"],
                 "is_free": bool(of_row["is_free"]),
                 "created_at": of_row["created_at"],
+                "reject_reason": of_row["reject_reason"] or "",
             })
 
     # 全部子任务费用合计（含被排除状态；订单级附加服务费 = 父订单 total_price − 全部子任务费）
@@ -6808,6 +6935,9 @@ def admin_statistics_revenue():
         oid = row["id"]
         prof = all_profiles.get(row["openid"], {})
         files = files_by_order.get(oid, [])
+        # 状态与移动端完全一致：用子任务实时聚合（orders.status 存储值可能滞后，
+        # 如任务推送后回退 queued 未刷新父订单），聚合逻辑与 /api/orders 相同。
+        agg_status = aggregate_order_status(conn, oid) or row["status"]
         # 金额口径：已入账 = sent 子任务合计；应收未收 = 其余未排除状态（排队/打印中/断线未知）合计；
         # 取消/放弃/打回/失败不计（失败单大概率不收费，仍可在明细状态列看到）。
         # 文件级 is_free 免费文件不计入金额但单独计数。
@@ -6843,7 +6973,7 @@ def admin_statistics_revenue():
             "openid": row["openid"] or "",
             "nickname": prof.get("nickname", ""),
             "avatar_url": prof.get("avatar_url", ""),
-            "status": row["status"],
+            "status": agg_status,
             "total_price": round(row["total_price"] or 0.0, 2),
             "created_at": row["created_at"],
             "owner_name": row["owner_name"] or "",
@@ -6856,6 +6986,7 @@ def admin_statistics_revenue():
             "cover_page": bool(row["cover_page"]),
             "cover_page_price": row["cover_page_price"] or 0,
             "pickup_address": row["pickup_address"] or "",
+            "remark": row["remark"] or "",
             "auto_print": bool(row["auto_print"]),
             "schedule_mode": row["schedule_mode"] or "now",
             "scheduled_at": row["scheduled_at"] or "",
@@ -7112,15 +7243,21 @@ def cleanup_abandoned_reserved_orders():
         if count > 0:
             conn.commit()
             print(f"[CLEANUP] 已删除 {count} 个超时纯占位订单（无归属残留）")
-        # 剩余带配置的 reserved（理论极少）仍按原口径标记 abandoned
+        # 剩余带配置的 reserved（含复制价格后完整预留的订单）标记 abandoned，子任务同步置 abandoned
         cursor2 = conn.execute(
             "UPDATE orders SET status = 'abandoned' WHERE status = 'reserved' AND created_at < ?",
             (cutoff,),
         )
         count2 = cursor2.rowcount
         if count2 > 0:
+            conn.execute(
+                "UPDATE order_files SET status = 'abandoned'"
+                " WHERE order_id IN (SELECT id FROM orders WHERE status = 'abandoned'"
+                "   AND created_at < ?) AND status NOT IN ('sent', 'failed', 'canceled')",
+                (cutoff,),
+            )
             conn.commit()
-            print(f"[CLEANUP] 已将 {count2} 个超时 reserved 订单标记为 abandoned")
+            print(f"[CLEANUP] 已将 {count2} 个超时 reserved 订单标记为 abandoned（含子任务）")
     except Exception as e:
         conn.rollback()
         print(f"[CLEANUP] 清理 reserved 订单失败: {e}")

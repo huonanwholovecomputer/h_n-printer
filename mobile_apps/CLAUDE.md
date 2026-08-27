@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-HN 云打印 — 微信小程序云打印系统，两个组件协作：
+HN 云打印 — 微信小程序云打印系统，三个组件协作：
 
 | 组件 | 目录 | 技术栈 |
 |---|---|---|
 | 微信小程序前端 | `h_n_print/` | 微信原生框架 (Component 模式, 自定义 tabBar) |
+| Android App | `android_app/` | Capacitor WebView（页面逻辑与小程序同源，`www/` 即前端源码） |
 | 后端 API 服务 | `printer-backend/` | Flask + Flask-SocketIO + SQLite + APScheduler |
 
 **数据流**: 用户小程序上传文件 → 后端存储(MD5去重) → SocketIO 实时推送/HTTP 拉取 → Windows 客户端下载渲染 → GDI 直打打印机
@@ -51,6 +52,30 @@ HN 云打印 — 微信小程序云打印系统，两个组件协作：
 **`singlePage` 派生判定**（有效选择恰好 1 页）：`_computeSinglePage()` → `file.singlePage`。整份 1 页或范围恰好选中 1 页 → 模式行隐藏、提交强制单面。由 `_refreshSinglePage()` 同步并重算列表高度。
 
 **范围控件三态**：页数已知 → 摘要按钮点击弹数字网格选择器（`onOpenRangePicker`，含全部/单页=奇数/双页=偶数一键，`onConfirmRangePicker` 回写 `rangeLines`+`pageRange`）；页数未知 → 黄色警告 + 多行文本输入（占位符随行号变化、新增行带弹出动画）；整份 1 页 → 整行隐藏。
+
+## Android App (`android_app/`)
+
+Capacitor WebView 封装，无需微信登录（设备账号 `dev_` 前缀 + 可绑定微信）。**页面逻辑与小程序同源，`www/` 即前端源码**（浏览器直接打开 `www/index.html` 即可开发预览）；`android/` 是 Capacitor 生成的原生壳，`npx cap sync android` 把 `www/` 复制进 `android/app/src/main/assets/public/` 后由 Gradle 打包。
+
+### APP 打包流程（必须先走脚本，勿手动 gradlew）
+
+```powershell
+# Release（签名 + 混淆）：
+cd mobile_apps/android_app
+powershell -ExecutionPolicy Bypass -File .\build-release-apk.ps1
+# 产物：dist\HN云打印_v{versionName}.apk（脚本自动从 build.gradle 读版本号命名）
+
+# Debug：
+powershell -ExecutionPolicy Bypass -File .\build-apk.ps1
+# 产物：dist\HN云打印_v{versionName}_debug.apk
+```
+
+关键要点（脚本已内置，直接跑即可）：
+- **必须先 `cap sync android`**：脚本内部执行（`build-release-apk.ps1`/`build-apk.ps1` 开头），把最新 `www/` 同步进 `android/app/src/main/assets/public/`。**只跑 `gradlew assembleRelease` 而跳过 sync，APK 会打包上次 sync 的旧 web 资源**（改过 `www/*.js` 后忘 sync 是经典翻车点）。
+- JDK 17 + Android SDK 固定路径：`C:\Users\Administrator\android-tools\jdk-17.0.20+8`（JAVA_HOME）与 `...\sdk`（ANDROID_HOME）；系统默认 java 是 SPSS 的 JRE 1.8，**不可用**。
+- Release 签名：`android/app/keystore.properties` + `release.keystore`（不入 git，缺失时 release 构建直接报错）。
+- **版本号**：`android/app/build.gradle` 的 `versionName`（用户可见，如 `1.1.7`）与 `versionCode`（内部编号）。**升级必须两者同步递增**（versionCode 不增则已装用户无法覆盖安装）。
+- 基础 API 地址在 `www/app.js` 的 `DEFAULT_BASE_URL`（默认 `https://hn-space.cn`），可被 localStorage `hn_base_url` 覆盖。
 
 ## 部署
 

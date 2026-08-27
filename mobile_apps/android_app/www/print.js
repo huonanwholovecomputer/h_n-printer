@@ -24,6 +24,7 @@ const printState = {
   urgencyPrices: { '低': 0, '中': 0.08, '高': 0.15 },
   urgencyPrice: 0,
   coverPage: false,
+  remark: '',               // 订单备注（选填，≤100 字）
   simplexPrice: 0.2,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
   duplexPrice: 0.3,    // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
   coverPagePrice: 0.10,
@@ -70,6 +71,7 @@ const PRINT_ENTRANCE = [
   ['printerStatus', 0.6],
   ['fileSection', 0.7],
   ['extParamsCard', 0.8],
+  ['remarkCard', 0.85],
   ['autoPrintSection', 0.9],
   ['adminPrintSection', 1.0],
   ['submitArea', 1.1],
@@ -1743,6 +1745,7 @@ function doSubmit(skipPageValidation) {
       urgency_price: printState.urgencyPrice,
       cover_page: (state.role === 'user' || printState.coverPage) ? 1 : 0,
       cover_page_price: printState.coverPagePrice,
+      remark: printState.remark || '',
       skip_page_validation: skipPageValidation ? 1 : 0,
       auto_print: printState.autoPrintEnabled ? 1 : 0,
       // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
@@ -1864,6 +1867,7 @@ function orderEchoParams() {
       : printState.urgencyPrice,
     coverPage: echo.cover_page != null ? !!Number(echo.cover_page) : printState.coverPage,
     coverPagePrice: printState.coverPagePrice,
+    remark: printState.remark || '',
   };
 }
 
@@ -1991,6 +1995,24 @@ function setupPrintButtons() {
   document.getElementById('urgencyTrigger').addEventListener('click', toggleUrgencyPicker);
   switchClick(document.getElementById('deliverySwitch'), toggleDelivery);
   document.getElementById('deliveryTrigger').addEventListener('click', toggleDeliveryPicker);
+  // 备注输入（≤100 字 + 计数 + 高度随行数平滑变化）
+  const remarkInput = document.getElementById('remarkInput');
+  const remarkCount = document.getElementById('remarkCount');
+  if (remarkInput) {
+    const resizeRemark = () => {
+      // 用 scrollHeight 精确取内容高度（56~180px 封顶），CSS transition 平滑过渡
+      remarkInput.style.height = 'auto';
+      remarkInput.style.height = Math.min(180, Math.max(56, remarkInput.scrollHeight)) + 'px';
+    };
+    remarkInput.addEventListener('input', () => {
+      printState.remark = (remarkInput.value || '').slice(0, 100);
+      remarkInput.value = printState.remark;
+      if (remarkCount) remarkCount.textContent = printState.remark.length + '/100';
+      resizeRemark();
+    });
+    // 初始高度（有回显备注时）
+    resizeRemark();
+  }
   switchClick(document.getElementById('autoPrintSwitch'), toggleAutoPrint);
   switchClick(document.getElementById('adminPrintSwitch'), toggleAdminPrint);
   bindSwitchDrags();

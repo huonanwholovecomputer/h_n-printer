@@ -110,3 +110,28 @@ local_print_tool/finance/print_data.json
 截图展示/
 local_print_tool/build_release.log
 local_print_tool/build_debug.log
+
+# ====== Sensitive / private files (added 2026-08-27) ======
+
+# COS / cloud credentials
+.cos_secret
+.cos.conf
+
+# Android signing (release keystore - never commit)
+**/keystore.properties
+**/*.keystore
+**/*.jks
+
+# Backend runtime files
+mobile_apps/printer-backend/uploads/
+mobile_apps/printer-backend/printer_claim.json
+mobile_apps/printer-backend/devices.json
+mobile_apps/printer-backend/order_counter.json
+
+# Backup files (may contain secrets)
+*.bak
+*.bak-*
+*.bak.*
+
+# 发布流程（含真实服务器 IP / COS 地址 / 密钥配置，仅本地参考）
+local_print_tool/发布流程.md

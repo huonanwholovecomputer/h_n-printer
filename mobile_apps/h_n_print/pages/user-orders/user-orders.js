@@ -19,10 +19,13 @@ Component({
     viewOpenid: '',       // 查看指定用户的 openid（为空则只看 source）
     viewNickname: '',
     sourceFilter: '',     // 'local' 表示本地打印任务，'' 表示云端任务
+    selfOpenid: '',       // 当前登录用户 openid（取消按钮仅本人订单显示）
 
     orders: [],
     loading: true,
     loadError: '',
+    // 取消订单请求进行中（防重复提交）
+    isCanceling: false,
 
     // 分页
     currentPage: 1,
@@ -83,6 +86,7 @@ Component({
         viewNickname: nickname,
         sourceFilter: source,
         pageTitle: title,
+        selfOpenid: wx.getStorageSync('openid') || (app.globalData && app.globalData.openid) || '',
       })
 
       // 直接传参，不依赖 this.data 是否就绪（对齐 authorized-users 的模式）
@@ -416,7 +420,7 @@ Component({
     onDetailCancelOrder(e) {
       const orderId = e.currentTarget.dataset.id
       const token = wx.getStorageSync('token')
-      if (!token) return
+      if (!token || this.data.isCanceling) return
 
       wx.showModal({
         title: '确认取消',
@@ -425,7 +429,8 @@ Component({
         confirmColor: '#FF9500',
         success: (modalRes) => {
           if (!modalRes.confirm) return
-          wx.showLoading({ title: '取消中...' })
+          this.setData({ isCanceling: true })
+          wx.showLoading({ title: '取消中...', mask: true })
           request({
             url: CONFIG.BASE_URL + '/api/cancel_order',
             method: 'POST',
@@ -444,6 +449,7 @@ Component({
               wx.hideLoading()
               wx.showToast({ title: '网络错误', icon: 'none' })
             },
+            complete: () => this.setData({ isCanceling: false }),
           })
         },
       })

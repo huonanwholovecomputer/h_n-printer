@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QTextEdit,
+    QPlainTextEdit,
     QDialog,
     QFileDialog,
     QMessageBox,
@@ -84,6 +85,9 @@ from stats_server import StatsServer, load_local_data_file, clear_local_data_fil
 from offline_sync import OfflineSync
 
 logger = logging.getLogger(__name__)
+
+# 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
+APP_VERSION = "4.5.0"
 
 
 # ============================================================
@@ -1432,6 +1436,8 @@ class MainWindow(QMainWindow):
     _ownerComboRefreshed = Signal()   # 成员名单同步完成 → 主线程刷新归属下拉
     _tabDisplayRefresh = Signal()     # 后台同步中换号完成后 → 主线程刷新标签页显示
     _pricingSynced = Signal()         # 打印价格同步完成（可能来自后台线程）→ 主线程刷新 UI
+    _updateCheckDone = Signal(object) # 自更新后台线程 → 主线程结果 (kind, manifest, manual)
+    _updateProgress = Signal(int, int) # 更新下载进度（已下载, 总大小）→ 主线程进度弹窗
 
     def __init__(self, config_path: str = "print_config.json", theme_manager: ThemeManager | None = None):
         super().__init__()
@@ -1446,7 +1452,9 @@ class MainWindow(QMainWindow):
         self._all_printed = False  # 是否已完成全部打印
 
         # ── 文件日志 ──
-        self._log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+        # 日志目录统一在 %APPDATA%\HN打印工具\logs（安装覆盖不丢日志）
+        import paths as _paths
+        self._log_dir = _paths.logs_dir()
         os.makedirs(self._log_dir, exist_ok=True)
         self._file_logger = logging.getLogger("hn_local_tool")
         self._file_logger.setLevel(logging.DEBUG)
@@ -1524,6 +1532,9 @@ class MainWindow(QMainWindow):
         #   "tab_key": str | None,     # 已创建的标签页
         # }
         self._scheduled_orders: dict[int, dict] = {}
+        # 本会话被用户取消的订单 ID（P2-9）：push 与 cancel 并发时 socket 事件可能乱序，
+        # 迟到的 print_task 不得重新注册预约状态机/自动打印队列，防止打印已取消订单
+        self._cloud_canceled_orders: set[int] = set()
         self._cloud_connected: bool = False  # 云端连接状态（预约冻结自恢复判断用）
         # 接单状态缓存（后端 printer_state 推送）：is_active/active_owner_name/active_device_name
         self._cloud_printer_state_cache: dict = {}
@@ -1550,7 +1561,7 @@ class MainWindow(QMainWindow):
         # 窗口关闭守卫：打印启动的 processEvents 等待期间窗口可能被关闭，置位后中止后续流程
         self._closing: bool = False
 
-        self.setWindowTitle("HN 本地打印工具")
+        self.setWindowTitle(f"HN 本地打印工具 v{APP_VERSION}")
         # 设置窗口图标
         icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "HN_printer.png")
         if os.path.isfile(icon_path):
@@ -1571,6 +1582,11 @@ class MainWindow(QMainWindow):
         else:
             self._log("ℹ 云端已启用但未配置令牌。请通过「文件 → 云端连接设置」填写服务器地址/令牌。")
         self._log("✅ HN 本地打印工具已启动")
+
+        # ── 自更新：启动 4 秒后后台检查更新（不阻塞 UI，发现新版本才弹窗）──
+        self._update_checking: bool = False
+        self._updateCheckDone.connect(self._on_update_check_result)
+        QTimer.singleShot(4000, lambda: self._start_update_check(manual=False))
 
     # ---- 标签页 key 安全排序 ----
 
@@ -2002,20 +2018,46 @@ class MainWindow(QMainWindow):
         self._log("🧹 已清空本机云端缓存数据（成员名单/收支数据/本地订单库），下次启动以纯本地模式运行")
 
     def _restart_app(self):
-        """重启当前应用（自动重新装配 UI）。"""
+        """重启当前应用（自动重新装配 UI）。
+
+        用看门狗 cmd：等本进程完全退出（释放单实例互斥体）后再启动新实例，
+        避免原 Popen+quit 的时序竞争——新实例启动时旧进程尚未退出，
+        会被 single_instance.acquire 误判为"已在运行"而退出，
+        表现为"云端开关确认后只关闭、不自动启动"。"""
         import sys as _sys
+        import tempfile
         try:
             self._save_config()
             if self._stats_server:
                 self._stats_server.stop()
             if self._cloud_client:
                 self._cloud_client.stop()
+            pid = os.getpid()
             python = _sys.executable
-            cmd = [python, os.path.abspath(_sys.argv[0])]
-            _sys.argv and cmd.extend(_sys.argv[1:])
-            # 用 subprocess 异步启动新实例，当前实例随后退出
-            import subprocess
-            subprocess.Popen(cmd, cwd=os.getcwd())
+            args = [_sys.argv[0]] + list(_sys.argv[1:])
+            launch = '"{}"'.format(python) + "".join(
+                ' "{}"'.format(str(a).replace('"', '\\"')) for a in args)
+            cmd_path = os.path.join(tempfile.gettempdir(), "hn_restart.cmd")
+            lines = [
+                "@echo off",
+                "set n=0",
+                ":wait",
+                'tasklist /FI "PID eq {pid}" | findstr "{pid}" >nul'.format(pid=pid),
+                "if errorlevel 1 goto start",
+                "set /a n+=1",
+                "if %n% gtr 120 goto start",
+                "ping -n 2 127.0.0.1 >nul",
+                "goto wait",
+                ":start",
+                'start "" {launch}'.format(launch=launch),
+                "ping -n 2 127.0.0.1 >nul",
+                'del "%~f0"',
+            ]
+            with open(cmd_path, "w", encoding="gbk", errors="replace") as f:
+                f.write("\r\n".join(lines) + "\r\n")
+            # 最小化窗口运行看门狗（SW_SHOWMINNOACTIVE=7），当前实例随后退出
+            import ctypes
+            ctypes.windll.shell32.ShellExecuteW(None, "open", cmd_path, None, None, 7)
         except Exception as e:
             logger.warning(f"自动重启失败: {e}")
         QApplication.quit()
@@ -2192,6 +2234,10 @@ class MainWindow(QMainWindow):
         log_action.triggered.connect(self._on_show_log_manager)
         help_menu.addAction(log_action)
         help_menu.addSeparator()
+        self._update_action = QAction("检查更新(&U)", self)
+        self._update_action.triggered.connect(lambda: self._start_update_check(manual=True))
+        help_menu.addAction(self._update_action)
+        help_menu.addSeparator()
         about_action = QAction("关于(&A)", self)
         about_action.triggered.connect(self._on_about)
         help_menu.addAction(about_action)
@@ -2213,6 +2259,165 @@ class MainWindow(QMainWindow):
         self._shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self)
         self._shortcut_paste.setContext(Qt.ApplicationShortcut)
         self._shortcut_paste.activated.connect(self._on_shortcut_paste)
+
+    # ---- 自更新（检查 / 下载 / 触发静默安装）----
+
+    def _set_update_menu_state(self, busy: bool, label: str = ""):
+        """更新相关菜单项状态：检查/下载期间禁用，防重复触发。"""
+        action = getattr(self, '_update_action', None)
+        if action is None:
+            return
+        action.setEnabled(not busy)
+        action.setText(label if busy else "检查更新(&U)")
+
+    def _start_update_check(self, manual: bool = False):
+        """启动检查更新（后台线程，结果经 _updateCheckDone 信号回主线程）。"""
+        if self._update_checking:
+            return
+        self._update_checking = True
+        self._set_update_menu_state(True, "检查更新中...")
+        if manual:
+            self._log("☁ 正在检查更新...")
+        threading.Thread(target=self._update_check_worker, args=(manual,), daemon=True).start()
+
+    def _update_check_worker(self, manual: bool):
+        try:
+            from updater import fetch_update_info, compare_versions
+            manifest = fetch_update_info()
+            if manifest and compare_versions(APP_VERSION, manifest.get("version", "")):
+                self._updateCheckDone.emit(("available", manifest, manual))
+            elif manual:
+                self._updateCheckDone.emit(("latest", None, manual))
+            else:
+                self._updateCheckDone.emit(("none", None, manual))
+        except Exception:
+            self._updateCheckDone.emit(("error", None, manual))
+
+    def _on_update_check_result(self, result):
+        kind, manifest, manual = result
+        self._update_checking = False
+        if kind in ("ready", "download_fail"):
+            self._on_update_ready(result)
+            return
+        # 检查结束（无更新/有更新待确认）→ 恢复菜单项
+        self._set_update_menu_state(False)
+        if kind == "available":
+            version = manifest.get("version", "")
+            notes = (manifest.get("notes") or "").strip()
+            msg = f"发现新版本 v{version}（当前 v{APP_VERSION}）"
+            if notes:
+                msg += f"\n\n更新说明：\n{notes}"
+            msg += "\n\n是否立即下载并更新？（更新过程需退出程序，配置数据不会丢失）"
+            reply = QMessageBox.question(self, "发现新版本", msg,
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply == QMessageBox.Yes:
+                self._perform_update(manifest)
+        elif kind == "latest" and manual:
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}")
+        elif kind == "error" and manual:
+            QMessageBox.warning(self, "检查更新", "检查更新失败，请检查网络连接后重试")
+
+    def _perform_update(self, manifest: dict):
+        """用户确认更新：检查打印状态 → 弹出下载进度窗口 → 后台下载 → 生成 update.cmd → 退出主程序。"""
+        if self._worker and self._worker.isRunning():
+            reply = QMessageBox.question(
+                self, "正在打印",
+                "当前有打印任务正在进行。\n更新需要退出程序，建议先完成打印。\n\n仍要立即更新吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+        self._log(f"☁ 开始下载更新安装包 v{manifest.get('version', '')}...")
+        self._set_update_menu_state(True, "更新下载中...")
+        # 下载进度弹窗（可取消）
+        from PySide6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog("正在连接服务器...", "取消", 0, 100, self)
+        dlg.setWindowTitle("正在下载更新")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumWidth(360)
+        dlg.show()
+        self._update_dlg = dlg
+        self._update_cancelled = False
+        self._updateProgress.connect(self._on_update_progress)
+        dlg.canceled.connect(self._on_update_download_cancel)
+        threading.Thread(target=self._update_download_worker, args=(manifest,), daemon=True).start()
+
+    def _on_update_progress(self, downloaded: int, total: int):
+        """主线程：更新下载进度弹窗。"""
+        dlg = getattr(self, '_update_dlg', None)
+        if not dlg:
+            return
+        if total > 0:
+            dlg.setMaximum(total)
+            dlg.setValue(downloaded)
+            dlg.setLabelText(
+                f"正在下载更新… {downloaded / 1048576:.1f} / {total / 1048576:.1f} MB")
+        else:
+            dlg.setMaximum(0)  # 未知总大小 → 忙碌态
+
+    def _on_update_download_cancel(self):
+        """用户取消下载 → 通知后台线程中止（回调返回 False 抛 UpdateCancelled）。"""
+        self._update_cancelled = True
+        self._log("☁ 已取消更新下载")
+
+    def _update_download_worker(self, manifest: dict):
+        """后台：下载安装包（带进度回调）→ MD5 校验 → 写 update.cmd → 最小化运行。"""
+        try:
+            from updater import prepare_update, write_update_cmd, _run_cmd_minimized
+            import sys as _sys
+
+            def _progress(downloaded: int, total: int):
+                # 回调在下载线程：经信号回主线程更新弹窗；返回 False 表示用户取消
+                self._updateProgress.emit(int(downloaded), int(total))
+                return not getattr(self, '_update_cancelled', False)
+
+            result = prepare_update(manifest, APP_VERSION, progress_cb=_progress)
+            if not result:
+                self._updateCheckDone.emit(("download_fail", None, False))
+                return
+            setup_path, exe_path = result
+            cmd_path = os.path.join(os.path.dirname(setup_path), "update.cmd")
+            # 启动新程序的完整命令：
+            # - 打包版：直接 start exe（无参数，避免命令行编码问题）
+            # - 源码版：cd 到脚本目录后 start python + 相对文件名（main.py 无空格无中文，
+            #   避开"本环境 python argv 中文乱码"与 start 参数解析问题）
+            if getattr(_sys, "frozen", False):
+                start_cmd = f'start "" "{exe_path}"'
+            else:
+                script_dir = os.path.dirname(os.path.abspath(_sys.argv[0]))
+                argv0 = os.path.basename(_sys.argv[0]) or "main.py"
+                start_cmd = (
+                    f'cd /d "{script_dir}" & start "" "{exe_path}" "{argv0}"')
+            if not write_update_cmd(setup_path, exe_path, cmd_path, start_cmd=start_cmd):
+                self._updateCheckDone.emit(("download_fail", None, False))
+                return
+            if not _run_cmd_minimized(cmd_path):
+                self._updateCheckDone.emit(("download_fail", None, False))
+                return
+            self._updateCheckDone.emit(("ready", manifest, False))
+        except Exception as e:
+            logger.error(f"更新准备失败: {e}")
+            self._updateCheckDone.emit(("download_fail", None, False))
+
+    def _on_update_ready(self, result):
+        kind, manifest, _manual = result
+        # 恢复更新菜单项（下载/安装流程结束）
+        self._set_update_menu_state(False)
+        # 关闭下载进度弹窗
+        dlg = getattr(self, '_update_dlg', None)
+        if dlg is not None:
+            dlg.close()
+            self._update_dlg = None
+        if kind == "ready":
+            self._log(f"☁ 更新安装包已就绪 v{manifest.get('version', '')}，即将退出并自动安装...")
+            self.close()  # update.cmd 轮询到进程退出后执行静默安装并启动新版本
+        elif kind == "download_fail":
+            if getattr(self, '_update_cancelled', False):
+                QMessageBox.information(self, "更新已取消", "更新下载已取消。")
+            else:
+                QMessageBox.warning(self, "更新失败", "下载或准备更新安装包失败，请稍后重试。")
 
     def _setup_theme_menu(self, menu):
         """构建主题切换子菜单（单选模式）。"""
@@ -2684,6 +2889,9 @@ class MainWindow(QMainWindow):
                     order_num = j.order_number
                     break
             self._order_number_label.setText(f"📋 {order_num}" if order_num else "📋 未分配订单号")
+
+        # 备注框：随标签页刷新加载订单备注（首个非空）；冻结时锁定编辑
+        self._load_remark_editor(tab)
 
     def _get_current_jobs(self) -> list[PrintJob]:
         """返回当前标签页的任务列表。"""
@@ -3267,6 +3475,46 @@ class MainWindow(QMainWindow):
         if not enabled:
             self._selected_file_label.setText("(未选中任务)")
 
+    def _on_remark_edited(self):
+        """备注编辑 → 写入当前标签页（订单级）并保存（≤100 字）。
+        不依赖选中任务、不依赖是否有文件；冻结（打印后固定）标签页锁定。
+        同时同步到该标签页全部 job.remark（封面页/上报按 job 读取的兼容层）。"""
+        if self._is_current_tab_frozen():
+            return
+        text = self._edit_remark.toPlainText()[:100]
+        if self._edit_remark.toPlainText() != text:
+            self._edit_remark.blockSignals(True)
+            self._edit_remark.setPlainText(text)
+            self._edit_remark.blockSignals(False)
+        tab = self._config.tabs.get(self._current_tab)
+        if not tab:
+            return
+        if tab.remark != text:
+            tab.remark = text
+        # 同步到 job（封面/上报读取 job.remark 的兼容层）
+        changed = any(getattr(j, 'remark', '') != text for j in tab.jobs)
+        if changed:
+            for j in tab.jobs:
+                j.remark = text
+        if tab.remark != text or changed:
+            self._save_config()
+
+    def _load_remark_editor(self, tab=None):
+        """加载当前标签页备注到编辑框（标签页级字段）；冻结时锁定编辑。
+        标签页切换 / 云端任务到达 / 打印完成冻结时调用。
+        备注区高度由垂直分隔条（v_splitter）拖拽控制，不在此处做固定高度自适应。"""
+        if not hasattr(self, '_edit_remark'):
+            return
+        tab = tab if tab is not None else self._config.tabs.get(self._current_tab)
+        is_frozen = tab.frozen if tab else False
+        self._label_remark.setEnabled(not is_frozen)
+        self._edit_remark.setEnabled(not is_frozen)
+        remark = tab.remark if tab else ""
+        if self._edit_remark.toPlainText() != remark:
+            self._edit_remark.blockSignals(True)
+            self._edit_remark.setPlainText(remark)
+            self._edit_remark.blockSignals(False)
+
     def _auto_apply_edit(self):
         """编辑面板参数变更 → 自动应用到当前选中行并保存。"""
         if self._is_current_tab_frozen():
@@ -3472,7 +3720,38 @@ class MainWindow(QMainWindow):
 
         scroll_layout.addStretch()
         scroll.setWidget(scroll_content)
-        layout.addWidget(scroll, 1)
+
+        # ── 备注：右侧面板下半部分常驻区域，与上方任务参数用垂直分隔条隔开（高度可拖拽调节）──
+        remark_gb = QGroupBox("备注")
+        remark_gl = QVBoxLayout(remark_gb)
+        remark_gl.setContentsMargins(8, 8, 8, 8)
+        self._label_remark = QLabel("订单备注（选填，最多 100 字；云端订单自动同步）")
+        self._label_remark.setObjectName("sectionHint")
+        remark_gl.addWidget(self._label_remark)
+        self._edit_remark = QPlainTextEdit()
+        self._edit_remark.setPlaceholderText("给该订单添加备注（最多 100 字）")
+        # 宽度修复：QPlainTextEdit 默认 sizeHint 有较大的最小宽度，会把右侧面板强制撑宽；
+        # 设最小宽度 0 + 水平 Ignored（宽度完全由面板布局决定，与 selected_file_label 同策略）
+        self._edit_remark.setMinimumWidth(0)
+        self._edit_remark.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self._edit_remark.textChanged.connect(self._on_remark_edited)
+        remark_gl.addWidget(self._edit_remark, 1)
+
+        # 垂直分隔条：上方任务参数（可滚动） + 下方备注（常驻），高度由用户拖拽调节
+        v_splitter = QSplitter(Qt.Vertical)
+        v_splitter.addWidget(scroll)
+        v_splitter.addWidget(remark_gb)
+        v_splitter.setStretchFactor(0, 1)
+        v_splitter.setStretchFactor(1, 0)
+        v_splitter.setCollapsible(1, False)  # 备注区不可折叠（常驻）
+        v_splitter.setSizes([580, 60])       # 初始：参数区占满，备注区约两行（≈60px），可拖拽调高
+        layout.addWidget(v_splitter, 1)
+
+        # 最小宽度限制：右侧面板受内部控件 minimumSizeHint 累积影响，会把水平 splitter
+        # 撑得比期望宽（左侧文件表格被压缩）。显式把容器最小宽度压到其当前最小尺寸提示的
+        # 一半（保证内容可用前提下，面板更窄、表格获得更多空间）。
+        _hint_w = container.minimumSizeHint().width()
+        container.setMinimumWidth(max(100, _hint_w // 2))
 
         return container
 
@@ -4412,8 +4691,15 @@ class MainWindow(QMainWindow):
                             order_jobs.append(j)
                 payload = None
                 if order_jobs:
+                    # 备注取所属标签页（订单级）
+                    _remark = next((t2.remark for t2 in self._config.tabs.values()
+                                    if t2.remark and any(j.order_number == new_num for j in t2.jobs)), '')
                     payload = {
                         "order_number": new_num,
+                        # v4.6：按本地是否已打印决定上报状态——仅复制价格未打印 → reserved（非空占位）；
+                        # 已打印完成 → sent（覆盖）。避免"离线复制价格未打印"被重连误标为已完成。
+                        "status": "sent" if any(getattr(j, 'sent', False) for j in order_jobs) else "reserved",
+                        "remark": _remark,
                         "total_price": sum(calc_cost(j.page_count, j.copies, j.duplex,
                             self._config.simplex_price, self._config.duplex_price,
                             j.page_range)[0] for j in order_jobs),
@@ -4451,9 +4737,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _build_files_payload_from_db_row(row) -> dict:
-        """把离线库行（id, order_number, files_json, total_price, created_at, owner_name, is_admin_print）
+        """把离线库行（id, order_number, files_json, total_price, created_at, owner_name, is_admin_print, remark）
         构造成 /api/local_orders 的 payload（孤儿单换号上报用）。"""
-        dbid, num, files_json, total_price, created_at, owner_name, is_admin_print = row
+        dbid, num, files_json, total_price, created_at, owner_name, is_admin_print, remark = row
         files = []
         try:
             for f in json.loads(files_json) or []:
@@ -4471,19 +4757,90 @@ class MainWindow(QMainWindow):
             files = []
         return {
             "order_number": num,
+            # 离线库行均为打印启动时缓存（已完成打印）→ 上报 sent；备注一并携带
+            "status": "sent",
+            "remark": str(remark or "")[:100],
             "total_price": float(total_price or 0),
             "files": files,
             "created_at": created_at or "",
         }
+
+    def _upload_reserved_order(self, order_number: str):
+        """后台线程：以 reserved 状态上报当前标签页完整订单信息（文件明细 + 备注 + 价格 + 归属）。
+
+        v4.6：复制价格后即把订单同步到后端，"已预留"不再是空占位；后续添加/修改文件
+        再次复制价格会覆盖（后端按 order_number 删旧插新），保证后端信息与本地一致。"""
+        jobs = self._get_current_jobs()
+        tab = self._config.tabs.get(self._current_tab)
+        client = self._cloud_client
+        if not jobs or not tab or not client:
+            return
+        files_data = []
+        total = 0.0
+        for j in jobs:
+            cost = calc_cost(j.page_count, j.copies, j.duplex,
+                self._config.simplex_price, self._config.duplex_price,
+                j.page_range)[0]
+            total += cost
+            files_data.append({
+                "file_name": j.display_name or os.path.basename(j.file_path),
+                "copies": j.copies,
+                "page_count": j.page_count,
+                "cost": round(cost, 2),
+                "duplex": j.duplex if _count_pages_in_range(j.page_range or "", j.page_count or 0) > 1 else "off",
+                "page_range": j.page_range,
+            })
+        tab_extra = tab.calc_extra_total(total, self._config) if tab else 0.0
+        total_price = round(total + tab_extra, 2)
+        remark = (tab.remark or '')
+        payload = {
+            "order_number": order_number,
+            "status": "reserved",
+            "total_price": total_price,
+            "files": files_data,
+            "owner_name": (tab.owner_name or ""),
+            "is_admin_print": bool(tab.is_admin_print),
+            "remark": remark,
+            "delivery_enabled": bool(tab.delivery_enabled),
+            "delivery_location": tab.delivery_location or "",
+            "urgency": tab.urgency or "低",
+            "cover_page": bool(tab.cover_page),
+            "cover_page_price": (tab.cover_page_price if tab else self._config.cover_page_price),
+        }
+        api_url = client.api_url or ""
+        token = client.token or ""
+
+        def _net():
+            try:
+                resp = http_requests.post(
+                    f"{api_url}/api/local_orders",
+                    params={"token": token},
+                    json=payload, timeout=10,
+                )
+                if resp.ok and resp.json().get("success"):
+                    self._cloudConnSyncLog.emit(
+                        f"📋 预留订单已同步云端: {order_number} ({len(files_data)} 个文件)")
+                else:
+                    self._cloudConnSyncLog.emit(
+                        f"⚠️ 预留订单同步失败: {resp.text[:120] if resp.text else '无响应'}")
+            except Exception as e:
+                self._cloudConnSyncLog.emit(f"⚠️ 预留订单同步失败: {e}")
+
+        threading.Thread(target=_net, daemon=True).start()
 
     def _on_copy_total(self):
         """复制合计金额到剪贴板（含订单号）。无成员时禁止创建订单。"""
         if not self._has_members():
             self._show_no_member_hint()
             return
-        if not self._get_current_jobs():
+        jobs = self._get_current_jobs()
+        if not jobs:
             return  # 标签页无文件时不复制价格（首页费等附加费不构成独立价格）
         order_number = self._ensure_order_number()
+        # v4.6：预留完整上报——复制价格后即把文件明细 + 备注 + 价格同步到后端（reserved 非空占位）。
+        # 后续添加/修改文件再次复制价格会覆盖；离线时仅本地 -L 号，重连后由换号流程补报。
+        if order_number and self._cloud_client and self._cloud_client.is_connected():
+            self._upload_reserved_order(order_number)
         text = self._total_label.text()
         # 去掉"合计: "前缀和"≈ "前缀，保留 ¥ 符号
         amount = text.replace("合计: ", "").replace("≈ ", "").strip()
@@ -4903,6 +5260,7 @@ class MainWindow(QMainWindow):
                             created_at=created_at,
                             owner_name=(tab.owner_name if tab else ""),
                             is_admin_print=bool(tab.is_admin_print) if tab else True,
+                            remark=(tab.remark if tab else ''),
                         )
                         self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
                     except Exception as e:
@@ -4959,12 +5317,15 @@ class MainWindow(QMainWindow):
                     params={"token": token},
                     json={
                         "order_number": num,
+                        "status": "sent",
                         "total_price": total_price,
                         "files": files_data,
                         "created_at": created_at,
                         # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
                         "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
                         "is_admin_print": bool(tab.is_admin_print) if tab else True,
+                        # 订单备注（标签页级，覆盖后端）
+                        "remark": (tab.remark if tab else ''),
                         # 附加服务上报（与计费口径一致）
                         **extra_fields,
                     },
@@ -5045,7 +5406,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.4.0</h3>"
+            "<h3>HN 本地打印工具 v4.5.0</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -5413,6 +5774,9 @@ class MainWindow(QMainWindow):
         """收到新的云端打印任务 → 加入云端任务列表窗口（无障碍打印任务自动跳过窗口）。"""
         if task.task_id in self._processed_cloud_tasks:
             return  # 已处理过，跳过（防 SocketIO + HTTP 双通道重复）
+        if task.order_id and task.order_id in self._cloud_canceled_orders:
+            self._log(f"☁ 忽略已取消订单 #{task.order_id} 的迟到任务 #{task.task_id}（{task.file_name}）")
+            return  # 订单已被用户取消（push 与 cancel 并发/乱序），不再注册/打印
         self._cloud_tasks[task.task_id] = task
         is_scheduled = task.auto_print and getattr(task, "schedule_mode", "now") != "now"
         self._log(f"☁ 收到云端任务 #{task.task_id}: {task.file_name}"
@@ -5431,6 +5795,9 @@ class MainWindow(QMainWindow):
         """云端任务状态更新 → 就绪时加入窗口（或自动处理无障碍打印），出错时通知服务器标记失败。"""
         if task.status == "ready" and task.task_id in self._processed_cloud_tasks:
             return  # 已处理过
+        if task.order_id and task.order_id in self._cloud_canceled_orders:
+            self._cloud_tasks.pop(task.task_id, None)
+            return  # 订单已被取消：迟到的下载完成/出错不再入列或上报
         self._cloud_tasks[task.task_id] = task
         # 预约单状态更新走预约状态机
         if task.order_id in self._scheduled_orders:
@@ -5514,9 +5881,24 @@ class MainWindow(QMainWindow):
             self._log(f"⚠ 无障碍打印：订单 #{order_id} 未能创建标签页，跳过")
             return
 
-        # 通知后端已接受
+        # 通知后端已接受（后端权威校验订单是否仍有效；已取消 → 409 拒绝）
         if ready_tasks[0].order_id and self._cloud_client:
-            self._cloud_client.accept_order_to_server(ready_tasks[0].order_id)
+            result = self._cloud_client.accept_order_to_server(ready_tasks[0].order_id)
+            if result == "canceled":
+                # 订单已被用户取消（cancel 通知尚未到达本机，处于通知窗口期）：
+                # 撤回该订单已加入标签页的任务，跳过自动打印
+                oid = ready_tasks[0].order_id
+                self._log(f"⚡ 订单 #{oid} 已被取消，撤回标签页 {tab_key}，跳过自动打印")
+                tab = self._config.tabs.get(tab_key)
+                if tab is not None:
+                    keep = [j for j in tab.jobs if getattr(j, 'order_id', 0) != oid]
+                    if len(keep) != len(tab.jobs):
+                        tab.jobs = keep
+                        self._save_config()
+                        self._rebuild_table()
+                        self._refresh_tab_display()
+                        self._sync_edit_enabled(False)
+                return
 
         # 自动开始打印（打印机忙时不静默丢弃 → 入重试队列，打印完成后自动补打）。
         # 只打印未完成（sent=False）的 job：追加到已有标签页时，已打印过的文件不重打
@@ -5549,6 +5931,9 @@ class MainWindow(QMainWindow):
         oid = task.order_id
         if not oid:
             self._log(f"⚠ 预约任务 #{task.task_id} 缺少 order_id，跳过")
+            return
+        if oid in self._cloud_canceled_orders:
+            self._log(f"⏰ 预约单 #{oid} 已被用户取消，忽略迟到文件 {task.file_name}")
             return
         st = self._scheduled_orders.setdefault(oid, {
             "target_ts": 0, "ready": {}, "pending": {},
@@ -5824,6 +6209,7 @@ class MainWindow(QMainWindow):
     def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
         """云端订单被用户取消 → 通知任务列表窗口更新状态，若正在打印则立即取消。"""
         self._log(f"☁ 订单 #{order_id} 已被用户取消")
+        self._cloud_canceled_orders.add(order_id)  # 拒收该订单迟到的 print_task/状态更新（防乱序复活）
         if self._cloud_task_window:
             self._cloud_task_window.mark_canceled(order_id, task_ids)
         # 预约单被取消 → 清理预约状态机（停掉到点倒计时）
@@ -5865,10 +6251,28 @@ class MainWindow(QMainWindow):
             return
         for task in tasks:
             self._mark_processed_task(task.task_id)
-        self._add_cloud_tasks_to_new_tab(tasks)
-        # 通知后端：订单已接受
+        tab_key = self._add_cloud_tasks_to_new_tab(tasks)
+        # 通知后端：订单已接受（后端权威校验订单是否仍有效；已取消 → 409 拒绝）
         if tasks[0].order_id and self._cloud_client:
-            self._cloud_client.accept_order_to_server(tasks[0].order_id)
+            result = self._cloud_client.accept_order_to_server(tasks[0].order_id)
+            if result == "canceled" and tab_key:
+                # 订单已被用户取消（cancel 通知尚未到达本机，添加发生在通知窗口期）：
+                # 撤回该订单已加入标签页的任务，防止打印已取消订单
+                oid = tasks[0].order_id
+                self._log(f"☁ 订单 #{oid} 已被取消，撤回标签页 {tab_key} 中该订单的任务")
+                tab = self._config.tabs.get(tab_key)
+                if tab is not None:
+                    keep = [j for j in tab.jobs if getattr(j, 'order_id', 0) != oid]
+                    if len(keep) != len(tab.jobs):
+                        tab.jobs = keep
+                        self._save_config()
+                        self._rebuild_table()
+                        self._refresh_tab_display()
+                        self._sync_edit_enabled(False)
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self, "订单已取消",
+                    f"订单 #{oid} 已被用户取消，无法添加，已撤回相关任务。")
 
     def _on_cloud_order_rejected(self, tasks: list):
         """用户从云端任务列表窗口打回订单中的任务。"""
@@ -6347,6 +6751,8 @@ class MainWindow(QMainWindow):
             tab_settings.urgency = task.urgency
             tab_settings.cover_page = task.cover_page
             tab_settings.cover_page_price = task.cover_page_price
+            # v4.6：云端订单备注 → 标签页级备注（编辑面板显示，可修改后覆盖上报）
+            tab_settings.remark = getattr(task, 'remark', '') or ''
             # v24.1：云端订单若由管理员在前端标记"管理员自行打印"→ 预勾选并沿用归属人；
             # 否则为顾客订单（不是管理员自行打印），归属人默认当前机位管理员。
             # v5.24：顾客订单标签页归属 = 下单用户绑定的成员名（bound_owner_name，后端反查
@@ -6427,6 +6833,7 @@ class MainWindow(QMainWindow):
             source_md5=source_md5,
             display_name=task.file_name,  # 使用后端返回的原始文件名
             order_number=task.order_number,  # 云端订单号
+            remark=getattr(task, 'remark', '') or '',  # 云端订单备注
             cached_pdf=cached_pdf,        # 使用缓存的 PDF（如有）
         )
         self._config.tabs[new_key].jobs.append(job)

@@ -355,13 +355,14 @@ QScrollArea {
 }
 
 /* ---------- 滚动条 ---------- */
+/* 深色模式：滑块（handle）较亮、滑轨（track）较暗但贴近背景（#1e1e2e），差别小而可辨 */
 QScrollBar:vertical {
-    background: #181825;
+    background: #1a1a29;
     width: 5px;
     border-radius: 3px;
 }
 QScrollBar::handle:vertical {
-    background: #45475a;
+    background: #7a84a0;
     border-radius: 3px;
     min-height: 30px;
 }
@@ -373,12 +374,12 @@ QScrollBar::sub-line:vertical {
     height: 0;
 }
 QScrollBar:horizontal {
-    background: #181825;
+    background: #1a1a29;
     height: 5px;
     border-radius: 3px;
 }
 QScrollBar::handle:horizontal {
-    background: #45475a;
+    background: #7a84a0;
     border-radius: 3px;
     min-width: 30px;
 }
