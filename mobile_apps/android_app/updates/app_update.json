@@ -1,0 +1,8 @@
+{
+  "version": "1.1.8",
+  "versionCode": 9,
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/hn-cloud-print_v1.1.8.apk",
+  "md5": "469f07ccd8057c25185cd182730b5f5a",
+  "notes": "v1.1.8：新增在线更新（自动检查新版本，COS 加速下载 APK 覆盖安装）。",
+  "force": false
+}

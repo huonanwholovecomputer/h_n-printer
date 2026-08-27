@@ -346,6 +346,8 @@ function setupMeButtons() {
   });
   document.getElementById('btnAuthorizedUsers').addEventListener('click', openAuthorizedUsers);
   document.getElementById('btnBindAccount').addEventListener('click', openBindView);
+  const btnCheckUpdate = document.getElementById('btnCheckUpdate');
+  if (btnCheckUpdate) btnCheckUpdate.addEventListener('click', () => checkAppUpdate(true));
   document.getElementById('btnLocalOrders').addEventListener('click', () => openUserOrdersView({ source: 'local', nickname: '本地打印任务' }));
   document.getElementById('adminList').addEventListener('click', (e) => {
     const rm = e.target.closest('[data-remove-admin]');

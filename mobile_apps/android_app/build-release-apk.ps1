@@ -27,19 +27,22 @@ if (-not (Test-Path $ks)) {
 }
 
 Set-Location (Join-Path $PSScriptRoot 'android')
-# 2>&1: 合并 stderr（javac 警告等）到 stdout，避免 PowerShell 将外部程序 stderr 视为终止错误
-& .\gradlew.bat assembleRelease 2>&1
+# cmd /c 包裹：gradle 的 stderr 输出（javac note 等）在 PS 5.1 + $ErrorActionPreference='Stop'
+# 下会被当成 NativeCommandError 中断脚本；cmd 重定向后 $LASTEXITCODE 仍反映 gradlew 退出码。
+cmd /c "gradlew.bat assembleRelease 2>&1"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $apk = Join-Path $PSScriptRoot 'android\app\build\outputs\apk\release\app-release.apk'
 if (Test-Path $apk) {
   Write-Host "BUILD OK: $apk"
   # 复制为友好文件名：HN云打印_v{版本号}.apk（版本号自动从 build.gradle 读取）
-  $gradleFile = Join-Path $PSScriptRoot 'android\app\build.gradle'
   $version = ''
-  if (Test-Path $gradleFile) {
-    $m = [regex]::Match((Get-Content $gradleFile -Raw), 'versionName\s+"([^"]+)"')
+  try {
+    $gradleFile = Join-Path -Path $PSScriptRoot -ChildPath 'android\app\build.gradle'
+    $m = [regex]::Match((Get-Content $gradleFile -Raw -ErrorAction Stop), 'versionName\s+"([^"]+)"')
     if ($m.Success) { $version = $m.Groups[1].Value }
+  } catch {
+    Write-Warning "read versionName from build.gradle failed: $($_.Exception.Message)"
   }
   $distDir = Join-Path $PSScriptRoot 'dist'
   New-Item -ItemType Directory -Force -Path $distDir | Out-Null
