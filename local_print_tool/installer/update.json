@@ -1,6 +1,6 @@
 {
-  "version": "4.5.2",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.2.exe",
-  "md5": "fb8d25b774535ac7543733f48ef04fbe",
-  "notes": "v4.5.2：修复云端日志收集（日志迁移到 %APPDATA% 后收集仍读程序目录导致回报为空）；docx 转换引擎按最后编辑者选择（WPS 编辑的文档用 WPS 引擎渲染，避免 WPS 特殊布局被 Word 渲染错位），PDF 缓存按转换引擎隔离（不再复用旧引擎的错误 PDF）。"
+  "version": "4.5.3",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.3.exe",
+  "md5": "661967566c5d703efa7afb1fda1b589f",
+  "notes": "v4.5.3：更新安装包复用——UAC 拒绝/安装失败时保留已下载的安装包，下次检查更新直接复用不再重新下载；更新目录自动清理旧版本残留（最多保留当前目标版本，安装成功后自动删除，防止堆积）。"
 }

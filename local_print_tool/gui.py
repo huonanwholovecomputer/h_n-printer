@@ -87,7 +87,7 @@ from offline_sync import OfflineSync
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.2"
+APP_VERSION = "4.5.3"
 
 
 # ============================================================
@@ -5419,7 +5419,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.5.2</h3>"
+            "<h3>HN 本地打印工具 v4.5.3</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"

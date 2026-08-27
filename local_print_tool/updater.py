@@ -63,14 +63,58 @@ def compare_versions(current: str, latest: str) -> bool:
     return _parts(latest) > _parts(current)
 
 
+def _cleanup_stale_setups(dest_dir: str, keep_fname: str) -> None:
+    """清理更新目录中的旧安装包残留（防堆积）。
+
+    保留当前目标文件 keep_fname，删除目录下其他 .exe / .part / .tmp
+    （旧版本残留、下载半截文件）。这样更新目录中最多只有一个目标安装包：
+    安装成功后被 update.cmd 删除；UAC 拒绝/安装失败时保留，下次检查更新直接复用。"""
+    try:
+        for name in os.listdir(dest_dir):
+            if name == keep_fname:
+                continue
+            if name.lower().endswith((".exe", ".part", ".tmp")):
+                try:
+                    os.remove(os.path.join(dest_dir, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
 def download_setup(url: str, expected_md5: str, dest_dir: str,
                    progress_cb=None) -> str | None:
     """下载安装包到 dest_dir 并校验 MD5。返回文件路径，失败/取消返回 None。
+
+    本地已有同目标文件且 MD5 匹配时直接复用（不重复下载）——UAC 拒绝/安装失败后
+    安装包被保留，下次检查更新可直接使用，无需重新下载。
     progress_cb(downloaded, total) 在下载循环中回调（跨线程安全：由调用方负责信号转发）；
     回调返回 False 表示用户取消（抛 UpdateCancelled 中止并清理半截文件）。"""
     os.makedirs(dest_dir, exist_ok=True)
     fname = os.path.basename(url.split("?")[0]) or "setup.exe"
     dest = os.path.join(dest_dir, fname)
+    # 清理旧安装包残留（只保留当前目标版本，防堆积）
+    _cleanup_stale_setups(dest_dir, fname)
+    # 本地复用：目标文件已存在且 MD5 匹配 → 跳过下载
+    if os.path.isfile(dest):
+        try:
+            hasher = hashlib.md5()
+            with open(dest, "rb") as f:
+                for chunk in iter(lambda: f.read(DOWNLOAD_CHUNK), b""):
+                    hasher.update(chunk)
+            actual = hasher.hexdigest()
+            if not expected_md5 or actual.lower() == expected_md5.lower():
+                logger.info(f"复用本地已下载的安装包: {dest}")
+                if progress_cb:
+                    try:
+                        progress_cb(os.path.getsize(dest), os.path.getsize(dest))  # 进度直接 100%
+                    except Exception:
+                        pass
+                return dest
+            logger.warning(
+                f"本地安装包 MD5 不匹配（期望 {expected_md5}，实际 {actual}），重新下载")
+        except OSError as e:
+            logger.warning(f"读取本地安装包失败，重新下载: {e}")
     tmp = dest + ".part"
     try:
         req = urllib.request.Request(
@@ -149,9 +193,15 @@ def write_update_cmd(setup_path: str, exe_path: str, cmd_path: str,
         "goto wait",
         ":install",
         install_line,
+        "if errorlevel 1 goto install_failed",
         start_cmd,
         "ping -n 2 127.0.0.1 >nul",
         f'del /q "{setup_path}"',
+        "goto done",
+        ":install_failed",
+        "rem 安装失败（如 UAC 拒绝）：保留安装包供下次检查更新复用，不删除；重新启动程序",
+        start_cmd,
+        ":done",
         "del \"%~f0\"",
     ]
     try:
