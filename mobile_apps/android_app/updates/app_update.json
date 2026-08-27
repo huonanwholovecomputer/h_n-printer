@@ -1,8 +1,8 @@
 {
   "version": "1.1.9",
   "versionCode": 10,
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/hn-cloud-print_v1.1.9.apk",
+  "url": "https://hn-space.cn/updates/hn-cloud-print_v1.1.9.apk",
   "md5": "1c91310bc24d952e8e305f9195279211",
-  "notes": "v1.1.9：修复剪贴板读取（接入 @capacitor/clipboard 原生插件，游客粘贴许可密钥不再报「无法读取剪贴板」）；修复检查更新（服务器 /updates/ 已加 CORS 头）。",
+  "notes": "v1.1.9：修复剪贴板读取（接入 @capacitor/clipboard 原生插件，游客粘贴许可密钥不再报「无法读取剪贴板」）；修复检查更新（服务器 /updates/ 已加 CORS 头）；安装包改由服务器分发（COS 默认域名禁止分发 APK）。",
   "force": false
 }
