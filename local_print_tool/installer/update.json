@@ -1,6 +1,6 @@
 {
-  "version": "4.5.0",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.0.exe",
-  "md5": "89907c83af61a55047eeed5f481081ec",
-  "notes": "v4.5.0：新增订单备注（移动端/本地工具/收支结算全链路）；预留订单完整上报与覆盖；修复云端开关重启失效、取消订单健壮性、结算状态与移动端一致；界面优化（备注常驻面板、滚动条配色）；更新下载进度弹窗、更新期间禁用检查菜单、修复更新后启动（update.cmd 参数）。"
+  "version": "4.5.1",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.1.exe",
+  "md5": "55ae8000ec0732222403298cf6f63e55",
+  "notes": "v4.5.1：优化单实例锁检测（重复启动更快提示）；修复更新安装到错误目录（/DIR 显式指定当前安装位置，自定义安装路径也可正确自更新）。"
 }
