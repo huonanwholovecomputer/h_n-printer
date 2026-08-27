@@ -120,14 +120,22 @@ def download_setup(url: str, expected_md5: str, dest_dir: str,
 
 
 def write_update_cmd(setup_path: str, exe_path: str, cmd_path: str,
-                     start_cmd: str = "") -> bool:
+                     start_cmd: str = "", install_dir: str = "") -> bool:
     """生成 update.cmd：轮询等待主程序退出 → 静默安装 → 启动新版本 → 清理临时文件。
     cmd 按本地代码页（GBK）解析，文件用 gbk 编码写，避免中文路径乱码。
     start_cmd：启动新程序的完整命令（可含 cd /d + 参数）；为空时默认
-    `start "" "{exe_path}"`（打包版直接启动 exe）。"""
+    `start "" "{exe_path}"`（打包版直接启动 exe）。
+    install_dir：显式指定安装目录（/DIR），默认空 = 用安装包编译时的 DefaultDirName。
+    **关键**：必须传当前程序所在目录——否则发布者修改默认安装位置后，已装旧位置的
+    用户更新会把新版装到新默认目录，而启动命令仍指向旧位置，导致"更新无效"。"""
     exe_name = os.path.basename(exe_path)
     if not start_cmd:
         start_cmd = f'start "" "{exe_path}"'
+    if install_dir:
+        install_line = (f'"{setup_path}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'
+                        f' /DIR="{install_dir}"')
+    else:
+        install_line = f'"{setup_path}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-'
     lines = [
         "@echo off",
         "rem HN print tool self-update",
@@ -140,7 +148,7 @@ def write_update_cmd(setup_path: str, exe_path: str, cmd_path: str,
         "ping -n 2 127.0.0.1 >nul",
         "goto wait",
         ":install",
-        f'"{setup_path}" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-',
+        install_line,
         start_cmd,
         "ping -n 2 127.0.0.1 >nul",
         f'del /q "{setup_path}"',

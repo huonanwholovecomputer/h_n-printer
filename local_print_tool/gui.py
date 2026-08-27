@@ -87,7 +87,7 @@ from offline_sync import OfflineSync
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.5.1"
 
 
 # ============================================================
@@ -2379,18 +2379,21 @@ class MainWindow(QMainWindow):
                 return
             setup_path, exe_path = result
             cmd_path = os.path.join(os.path.dirname(setup_path), "update.cmd")
-            # 启动新程序的完整命令：
-            # - 打包版：直接 start exe（无参数，避免命令行编码问题）
-            # - 源码版：cd 到脚本目录后 start python + 相对文件名（main.py 无空格无中文，
-            #   避开"本环境 python argv 中文乱码"与 start 参数解析问题）
+            # 启动新程序的完整命令 + 显式安装目录：
+            # - 打包版：/DIR 指向当前程序目录（保证更新永远装到当前安装位置，
+            #   无论发布者是否修改默认安装路径，已装用户都能原地升级）；启动即当前 exe
+            # - 源码版：不装安装包到当前目录，保持安装包默认位置；启动用 cd /d + 相对文件名
             if getattr(_sys, "frozen", False):
+                install_dir = os.path.dirname(exe_path)
                 start_cmd = f'start "" "{exe_path}"'
             else:
+                install_dir = ""
                 script_dir = os.path.dirname(os.path.abspath(_sys.argv[0]))
                 argv0 = os.path.basename(_sys.argv[0]) or "main.py"
                 start_cmd = (
                     f'cd /d "{script_dir}" & start "" "{exe_path}" "{argv0}"')
-            if not write_update_cmd(setup_path, exe_path, cmd_path, start_cmd=start_cmd):
+            if not write_update_cmd(setup_path, exe_path, cmd_path,
+                                    start_cmd=start_cmd, install_dir=install_dir):
                 self._updateCheckDone.emit(("download_fail", None, False))
                 return
             if not _run_cmd_minimized(cmd_path):
@@ -5406,7 +5409,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.5.0</h3>"
+            "<h3>HN 本地打印工具 v4.5.1</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"

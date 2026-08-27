@@ -48,13 +48,14 @@ _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.GetLastError.restype = wintypes.DWORD
 
 
-def acquire(retries: int = 15, retry_delay: float = 0.2) -> bool:
+def acquire(retries: int = 3, retry_delay: float = 0.15) -> bool:
     """获取单实例锁。
 
-    retries/retry_delay：检测到已有实例时短时重试（默认 15×0.2s=3s）。
-    覆盖"自动重启"场景：旧实例刚 Popen 新实例后退出，互斥体释放有极短延迟，
-    若新实例立即 acquire 会误判"已在运行"而退出（表现为云端开关重启只关闭不启动）。
-    重试期间旧实例退出 → 重试成功取得锁；旧实例正常运行 → 重试超时后通知置前并退出。
+    retries/retry_delay：检测到已有实例时的短重试（默认 3×0.15s≈0.45s）。
+    重试仅用于防极端竞态（自动重启的看门狗已保证旧进程 PID 消失后才启动新实例，
+    互斥体随进程退出由内核自动释放，正常情况首次 acquire 即成功）；
+    若旧实例正常运行，0.45s 内即判定"已在运行"→ 通知既有实例置前并退出，
+    避免用户双击第二个实例时长时间无响应。
 
     Returns:
         True  = 本实例是唯一实例（互斥体已持有，继续启动）
