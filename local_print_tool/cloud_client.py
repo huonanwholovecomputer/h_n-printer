@@ -44,12 +44,16 @@ STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃�
 MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
 
-def pdf_cache_key(source_md5: str, image_orientation: str = "") -> str:
-    """PDF 缓存 key：图片显式方向（landscape/portrait）时加方向后缀，其余用纯 MD5（向后兼容既有缓存）。
-    图片不同方向渲染结果不同，必须分开缓存，否则改方向后仍命中旧方向 PDF。"""
+def pdf_cache_key(source_md5: str, image_orientation: str = "", engine: str = "") -> str:
+    """PDF 缓存 key：图片显式方向（landscape/portrait）时加方向后缀；docx 转换引擎
+    （word/wps）不同渲染结果不同，必须按引擎分开缓存，否则改引擎后仍命中旧引擎 PDF
+    （WPS 特殊布局被 Word 引擎转换的错误 PDF 会被永久复用）。其余用纯 MD5（向后兼容既有缓存）。"""
+    parts = source_md5
     if image_orientation in ("landscape", "portrait"):
-        return f"{source_md5}_{image_orientation}"
-    return source_md5
+        parts = f"{parts}_{image_orientation}"
+    if engine in ("word", "wps"):
+        parts = f"{parts}_e{engine}"
+    return parts
 
 
 def get_cached_pdf_path(source_md5: str, image_orientation: str = "") -> str | None:
@@ -458,9 +462,11 @@ class CloudClient(QObject):
             return False
 
     def _read_local_log_tail(self, max_bytes: int = 200 * 1024) -> str:
-        """读取本机日志文件（logs/local_tool.log）尾部，供云端日志收集回报。
+        """读取本机日志文件（%APPDATA%\\HN打印工具\\logs\\local_tool.log）尾部，供云端日志收集回报。
+        v4.5 起日志统一存用户数据目录（paths.logs_dir()），与程序安装目录解耦；
         从倒数 max_bytes 字节处开始，跳过可能截断的半行再读取；失败返回空串。"""
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "local_tool.log")
+        import paths as _paths
+        log_path = os.path.join(_paths.logs_dir(), "local_tool.log")
         try:
             size = os.path.getsize(log_path)
             with open(log_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1164,19 +1170,23 @@ class CloudClient(QObject):
             self.task_updated.emit(task)
             return
 
-        # 若后端已提供 source_md5 且本地 PDF 缓存已命中，跳过下载（图片按方向后缀分开缓存）
+        # 若后端已提供 source_md5 且本地 PDF 缓存已命中，跳过下载（图片按方向后缀分开缓存）。
+        # docx 除外：转换引擎取决于文档内容（last editor），未下载无法确定 → 一律下载后判断，
+        # 避免命中旧引擎（如 Word 渲染 WPS 特殊布局）的错误缓存。
         if task.source_md5:
-            cached_pdf, cached_meta = self._get_cached_pdf(task.source_md5, task.image_orientation)
-            if cached_pdf:
-                task.local_path = cached_pdf
-                task.status = "ready"
-                task.download_progress = 100
-                self.task_updated.emit(task)
-                self.status_message.emit(
-                    f"☁ 缓存命中 #{task_id}: {task.file_name} (MD5={task.source_md5[:8]}...，跳过下载)"
-                )
-                self._report_file_ready_if_scheduled(task)
-                return
+            _dl_ext = os.path.splitext(task.file_name)[1].lower()
+            if _dl_ext != ".docx":
+                cached_pdf, cached_meta = self._get_cached_pdf(task.source_md5, task.image_orientation)
+                if cached_pdf:
+                    task.local_path = cached_pdf
+                    task.status = "ready"
+                    task.download_progress = 100
+                    self.task_updated.emit(task)
+                    self.status_message.emit(
+                        f"☁ 缓存命中 #{task_id}: {task.file_name} (MD5={task.source_md5[:8]}...，跳过下载)"
+                    )
+                    self._report_file_ready_if_scheduled(task)
+                    return
 
         dest: str = ""
         # P0-2: 后端 pull/push payload 若提供 source_md5，下载完成后比对校验
@@ -1375,10 +1385,11 @@ class CloudClient(QObject):
                 md5.update(chunk)
         return md5.hexdigest()
 
-    def _get_cached_pdf(self, md5: str, image_orientation: str = "") -> tuple[str | None, dict | None]:
+    def _get_cached_pdf(self, md5: str, image_orientation: str = "", engine: str = "") -> tuple[str | None, dict | None]:
         """查找指定 MD5 的缓存 PDF。返回 (pdf_path, metadata) 或 (None, None)。
-        图片按方向后缀分开缓存（landscape/portrait）。P0-2: 命中时校验文件头 %PDF。"""
-        key = pdf_cache_key(md5, image_orientation)
+        图片按方向后缀分开缓存（landscape/portrait）；docx 按转换引擎分开缓存（word/wps），
+        避免引擎变更后仍命中旧引擎的错误 PDF。P0-2: 命中时校验文件头 %PDF。"""
+        key = pdf_cache_key(md5, image_orientation, engine)
         pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
         if os.path.isfile(pdf_path):
             try:
@@ -1402,11 +1413,11 @@ class CloudClient(QObject):
             return pdf_path, meta
         return None, None
 
-    def remove_cached_pdf(self, source_md5: str, image_orientation: str = ""):
-        """删除指定 MD5（可含方向后缀）的缓存 PDF 及其索引条目（用于放弃订单时清理）。"""
+    def remove_cached_pdf(self, source_md5: str, image_orientation: str = "", engine: str = ""):
+        """删除指定 MD5（可含方向/引擎后缀）的缓存 PDF 及其索引条目（用于放弃订单时清理）。"""
         if not source_md5:
             return
-        key = pdf_cache_key(source_md5, image_orientation)
+        key = pdf_cache_key(source_md5, image_orientation, engine)
         pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
         if os.path.isfile(pdf_path):
             try:
@@ -1420,9 +1431,9 @@ class CloudClient(QObject):
             self.status_message.emit(f"📦 已清理缓存: {key[:8]}...")
 
     def _save_pdf_to_cache(self, md5: str, pdf_path: str, original_name: str, source_ext: str,
-                           page_count: int = 0, image_orientation: str = ""):
-        """将 PDF 文件存入缓存并更新索引（图片按方向后缀分开缓存）。"""
-        key = pdf_cache_key(md5, image_orientation)
+                           page_count: int = 0, image_orientation: str = "", engine: str = ""):
+        """将 PDF 文件存入缓存并更新索引（图片按方向后缀、docx 按转换引擎分开缓存）。"""
+        key = pdf_cache_key(md5, image_orientation, engine)
         dest = os.path.join(self._cache_dir, f"{key}.pdf")
         # P0-2: 原子写（tmp + os.replace），避免 copy2 截断式写入损坏缓存
         if not os.path.exists(dest) or not os.path.samefile(pdf_path, dest):
@@ -1434,6 +1445,7 @@ class CloudClient(QObject):
             "original_name": original_name,
             "source_ext": source_ext,
             "page_count": page_count,
+            "engine": engine,
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._save_cache_index(index)

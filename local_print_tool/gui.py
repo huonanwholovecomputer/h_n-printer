@@ -87,7 +87,7 @@ from offline_sync import OfflineSync
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.1"
+APP_VERSION = "4.5.2"
 
 
 # ============================================================
@@ -853,7 +853,8 @@ class PrintWorker(QThread):
                     if _ext_i in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"):
                         try:
                             _key = pdf_cache_key(job.source_md5, getattr(job, 'image_orientation', 'auto'))
-                            _cdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+                            import paths as _paths
+                            _cdir = _paths.pdf_cache_dir()
                             os.makedirs(_cdir, exist_ok=True)
                             _dest = os.path.join(_cdir, _key + ".pdf")
                             if not os.path.exists(_dest):
@@ -961,9 +962,10 @@ class ConvertWorker(QThread):
     def run(self):
         from converter import _convert_via_word_com, _convert_via_wps_com, get_converter
         from pdf_printer import get_pdf_info
+        import paths as _paths
 
-        # PDF 缓存目录（与 cloud_client.py 共用）
-        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+        # PDF 缓存目录（与 cloud_client.py 共用 %APPDATA%\HN打印工具\pdf_cache）
+        cache_dir = _paths.pdf_cache_dir()
         os.makedirs(cache_dir, exist_ok=True)
         temp_pdf: str | None = None
         try:
@@ -972,9 +974,12 @@ class ConvertWorker(QThread):
                 self.finished.emit(self._row, self._file_path, "", 0, "")
                 return
             if ext in (".doc", ".docx") and self._engine != "libreoffice":
-                # 直接以 MD5 命名存入 pdf_cache（若无 MD5 则用临时文件）
+                # 直接以 MD5 命名存入 pdf_cache（docx 缓存 key 含引擎后缀，防止 WPS 文档
+                # 被 Word 引擎转换的错误 PDF 被复用；若无 MD5 则用临时文件）
                 if self._source_md5:
-                    temp_pdf = os.path.join(cache_dir, f"{self._source_md5}.pdf")
+                    _eng_key = self._engine if (ext == ".docx" and self._engine in ("word", "wps")) else ""
+                    temp_pdf = os.path.join(
+                        cache_dir, pdf_cache_key(self._source_md5, "", _eng_key) + ".pdf")
                 else:
                     import tempfile as _tf
                     fd, temp_pdf = _tf.mkstemp(suffix=".pdf", prefix="_conv_")
@@ -4439,14 +4444,19 @@ class MainWindow(QMainWindow):
                     source_md5 = m.hexdigest()
             except Exception:
                 source_md5 = ""
-        # 检查本地 PDF 缓存（图片按方向后缀分开）
+        # 检查本地 PDF 缓存（图片按方向后缀、docx 按转换引擎分开）
         if source_md5:
+            _cache_engine = engine if (os.path.splitext(file_path)[1].lower() == ".docx"
+                                       and engine in ("word", "wps")) else ""
             if self._cloud_client:
-                cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(source_md5, image_orientation)
+                cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
+                    source_md5, image_orientation, _cache_engine)
             else:
                 # 离线：直接检查 pdf_cache 目录
-                cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
-                cached_pdf = os.path.join(cache_dir, pdf_cache_key(source_md5, image_orientation) + ".pdf")
+                import paths as _paths
+                cache_dir = _paths.pdf_cache_dir()
+                cached_pdf = os.path.join(
+                    cache_dir, pdf_cache_key(source_md5, image_orientation, _cache_engine) + ".pdf")
                 cached_meta = {}
                 if not os.path.isfile(cached_pdf):
                     cached_pdf = None
@@ -5409,7 +5419,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.5.1</h3>"
+            "<h3>HN 本地打印工具 v4.5.2</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -6656,8 +6666,10 @@ class MainWindow(QMainWindow):
                     job.source_md5 = self._cloud_client._compute_md5_file(job.file_path) if self._cloud_client else ""
                 except Exception:
                     pass
-            # 存入 MD5 缓存索引
+            # 存入 MD5 缓存索引（docx 按转换引擎分开缓存，避免 WPS 文档被 Word 渲染的错误 PDF 被复用）
             if job.source_md5:
+                _cache_engine = getattr(job, 'engine', '')
+                _cache_engine = _cache_engine if _cache_engine in ("word", "wps") else ""
                 if self._cloud_client:
                     try:
                         self._cloud_client._save_pdf_to_cache(
@@ -6666,6 +6678,7 @@ class MainWindow(QMainWindow):
                             os.path.splitext(job.file_path)[1].lower(),
                             page_count,
                             getattr(job, 'image_orientation', 'auto'),
+                            _cache_engine,
                         )
                     except Exception as e:
                         self._log(f"  → MD5 缓存保存失败: {e}")
@@ -6673,16 +6686,18 @@ class MainWindow(QMainWindow):
                     # 离线：直接更新 pdf_cache/index.json
                     try:
                         import json as _json
-                        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_cache")
+                        import paths as _paths
+                        cache_dir = _paths.pdf_cache_dir()
                         idx_path = os.path.join(cache_dir, "index.json")
                         idx = {}
                         if os.path.exists(idx_path):
                             with open(idx_path, "r", encoding="utf-8") as _f:
                                 idx = _json.load(_f)
-                        idx[job.source_md5] = {
+                        idx[pdf_cache_key(job.source_md5, getattr(job, 'image_orientation', 'auto'), _cache_engine)] = {
                             "original_name": job.display_name or os.path.basename(job.file_path),
                             "source_ext": os.path.splitext(job.file_path)[1].lower(),
                             "page_count": page_count,
+                            "engine": _cache_engine,
                             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         }
                         with open(idx_path, "w", encoding="utf-8") as _f:
@@ -6785,10 +6800,24 @@ class MainWindow(QMainWindow):
         page_count = 0; orientation = ""; cached_pdf = ""
         need_convert = False
 
-        # 1. 检查 PDF 缓存（MD5 索引，图片按方向后缀分开）
+        # 0. 先确定 docx 转换引擎（缓存 key 需按引擎隔离，必须在查缓存之前计算；
+        #    WPS 编辑的文档必须用 WPS 引擎渲染，避免 WPS 特殊布局被 Word 渲染出错）
+        engine = "word"
+        cache_engine = ""
+        if ext in (".doc", ".docx") and task.local_path:
+            from converter import _read_docx_last_editor, get_available_engines
+            available = get_available_engines()
+            editor = _read_docx_last_editor(task.local_path) if ext == ".docx" else None
+            preferred = "wps" if editor == "wps" else "word"
+            for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
+                if available.get(eng, False): engine = eng; break
+            if ext == ".docx":
+                cache_engine = engine if engine in ("word", "wps") else ""
+
+        # 1. 检查 PDF 缓存（MD5 索引；图片按方向、docx 按转换引擎分开缓存）
         if source_md5 and self._cloud_client:
             cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
-                source_md5, getattr(task, 'image_orientation', 'auto'))
+                source_md5, getattr(task, 'image_orientation', 'auto'), cache_engine)
             if cached_pdf and cached_meta:
                 page_count = cached_meta.get("page_count", 0)
                 orientation = ""  # 缓存里可能没有 orientation，从 PDF 读取
@@ -6797,7 +6826,8 @@ class MainWindow(QMainWindow):
                     _info = _gpi(cached_pdf)
                     page_count = _info.get("page_count", page_count)
                     orientation = _info.get("orientation", "")
-                self._log(f"📦 缓存命中: {task.file_name} → {page_count} 页 (MD5={source_md5[:8]}...)")
+                self._log(f"📦 缓存命中: {task.file_name} → {page_count} 页 (MD5={source_md5[:8]}...)"
+                          + (f", 引擎={cache_engine}" if cache_engine else ""))
                 cached_pdf = cached_pdf  # 直接使用缓存的 PDF
 
         # 2. 未命中缓存 → 从本地文件获取信息
@@ -6808,15 +6838,6 @@ class MainWindow(QMainWindow):
                 info = get_image_info(task.local_path); page_count = info["page_count"]; orientation = info["orientation"]
             elif ext == ".docx":
                 orientation = get_docx_orientation(task.local_path)
-
-        engine = "word"
-        if ext in (".doc", ".docx") and task.local_path:
-            from converter import _read_docx_last_editor, get_available_engines
-            available = get_available_engines()
-            editor = _read_docx_last_editor(task.local_path) if ext == ".docx" else None
-            preferred = "wps" if editor == "wps" else "word"
-            for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
-                if available.get(eng, False): engine = eng; break
 
         is_image = ext in image_exts
         duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"

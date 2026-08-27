@@ -562,7 +562,8 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
 def _read_docx_last_editor(file_path: str) -> str | None:
     """
     读取 .docx 文档最后编辑者。
-    从 ZIP 内部 docProps/app.xml 的 <Application> 标签获取。
+    优先从 ZIP 内部 docProps/app.xml 的 <Application> 标签获取（WPS 保存时通常含 "WPS"）；
+    未命中时再查 docProps/core.xml 的 lastModifiedBy/creator（部分 WPS 兼容保存仅在此留痕）。
 
     Returns:
         "wps"  — 最后被 WPS 编辑
@@ -577,20 +578,37 @@ def _read_docx_last_editor(file_path: str) -> str | None:
         import zipfile
         import xml.etree.ElementTree as ET
 
-        with zipfile.ZipFile(file_path, 'r') as z:
-            if 'docProps/app.xml' not in z.namelist():
+        def _judge(text: str | None) -> str | None:
+            if not text:
                 return None
-            with z.open('docProps/app.xml') as f:
-                ns = '{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}'
-                tree = ET.parse(f)
-                app = tree.find(f'{ns}Application')
-                if app is None or not app.text:
-                    return None
-                text = app.text.upper()
-                if "WPS" in text:
-                    return "wps"
-                if "MICROSOFT" in text or "WORD" in text:
-                    return "word"
+            t = text.upper()
+            if "WPS" in t:
+                return "wps"
+            if "MICROSOFT" in t or "WORD" in t:
+                return "word"
+            return None
+
+        with zipfile.ZipFile(file_path, 'r') as z:
+            # 1) docProps/app.xml 的 <Application>（主要来源）
+            if 'docProps/app.xml' in z.namelist():
+                with z.open('docProps/app.xml') as f:
+                    ns = '{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}'
+                    tree = ET.parse(f)
+                    app = tree.find(f'{ns}Application')
+                    r = _judge(app.text if app is not None else None)
+                    if r:
+                        return r
+            # 2) docProps/core.xml 的 lastModifiedBy / creator（WPS 兼容保存兜底）
+            if 'docProps/core.xml' in z.namelist():
+                with z.open('docProps/core.xml') as f:
+                    ns_cp = '{http://schemas.openxmlformats.org/package/2006/metadata/core-properties}'
+                    ns_dc = '{http://purl.org/dc/elements/1.1/}'
+                    tree = ET.parse(f)
+                    for tag in (f'{ns_cp}lastModifiedBy', f'{ns_dc}creator'):
+                        el = tree.find(tag)
+                        r = _judge(el.text if el is not None else None)
+                        if r:
+                            return r
         return None
     except Exception:
         return None
@@ -1140,9 +1158,13 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
     Office 文档 → PDF（多引擎智能降级）。
 
     Word 文档 (.doc/.docx):
-      1. Microsoft Word COM  →  最佳布局保真度
-      2. WPS Office COM      →  中文排版兼容性好
-      3. LibreOffice 无头模式 →  兜底
+      .docx 按最后编辑者决定首选引擎（WPS 编辑 → WPS 优先，Word/未知 → Word 优先）：
+      WPS 的特殊布局（公式/文本框/域等）用 Word 引擎渲染会错位，必须用 WPS 自身引擎；
+      首选引擎不可用时依次降级。
+      1. 首选引擎（Word 或 WPS COM）
+      2. 另一 COM 引擎
+      3. LibreOffice 无头模式 → 兜底
+    .doc（老格式，无 last-editor 元数据）: Word → WPS → LibreOffice
 
     其他 Office 格式 (.xls/.xlsx/.ppt/.pptx):
       → LibreOffice 无头模式
@@ -1151,23 +1173,29 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
 
     # Word 文档：多引擎降级
     if ext in (".doc", ".docx"):
-        # ── 引擎 1: Microsoft Word ──
-        if _detect_word():
-            try:
-                logger.info(f"引擎选择: Microsoft Word COM ({os.path.basename(file_path)})")
-                _convert_via_word_com(file_path, output_pdf)
-                return
-            except Exception as e:
-                logger.warning(f"Microsoft Word 转换失败，降级到下一引擎: {e}")
+        # docx 优先用最后编辑它的引擎渲染（WPS 特殊布局须用 WPS，Word 渲染会错位）
+        preferred = "word"
+        if ext == ".docx":
+            last_editor = _read_docx_last_editor(file_path)
+            if last_editor == "wps":
+                preferred = "wps"
 
-        # ── 引擎 2: WPS Office ──
-        if _detect_wps():
-            try:
-                logger.info(f"引擎选择: WPS Office COM ({os.path.basename(file_path)})")
-                _convert_via_wps_com(file_path, output_pdf)
-                return
-            except Exception as e:
-                logger.warning(f"WPS Office 转换失败，降级到下一引擎: {e}")
+        engines_order = [preferred] + [e for e in ("word", "wps") if e != preferred]
+        for eng in engines_order:
+            if eng == "word" and _detect_word():
+                try:
+                    logger.info(f"引擎选择: Microsoft Word COM ({os.path.basename(file_path)})")
+                    _convert_via_word_com(file_path, output_pdf)
+                    return
+                except Exception as e:
+                    logger.warning(f"Microsoft Word 转换失败，降级到下一引擎: {e}")
+            elif eng == "wps" and _detect_wps():
+                try:
+                    logger.info(f"引擎选择: WPS Office COM ({os.path.basename(file_path)})")
+                    _convert_via_wps_com(file_path, output_pdf)
+                    return
+                except Exception as e:
+                    logger.warning(f"WPS Office 转换失败，降级到下一引擎: {e}")
 
         # ── 引擎 3: LibreOffice ──
         logger.info(f"引擎选择: LibreOffice (降级) ({os.path.basename(file_path)})")
