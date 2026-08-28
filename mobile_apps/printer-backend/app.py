@@ -740,15 +740,32 @@ def get_device_owner(client_id: str) -> str:
 
 
 def _load_claim_impl() -> dict:
-    """读取接单接管状态（无锁实现，供持锁调用方在 _claim_lock 内使用）。"""
+    """读取接单设备集合（无锁实现，供持锁调用方在 _claim_lock 内使用）。
+    新格式: {"claiming_devices": {client_id: {"claimed_at": ..., "owner_name": ...}}}
+    兼容旧格式: {"active_client_id": "xxx", ...} → 读取时自动归一化为 claiming_devices。"""
     if not os.path.exists(CLAIM_FILE):
         return {}
     try:
         with open(CLAIM_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, IOError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    # 旧格式（唯一接管者）→ 新格式（多设备集合）
+    if "claiming_devices" not in data:
+        old = data.get("active_client_id", "")
+        devices = {}
+        if old:
+            devices[old] = {
+                "claimed_at": data.get("claimed_at", ""),
+                "owner_name": data.get("owner_name", ""),
+            }
+        return {"claiming_devices": devices}
+    devices = data.get("claiming_devices")
+    if not isinstance(devices, dict):
+        devices = {}
+    return {"claiming_devices": devices}
 
 
 def load_claim() -> dict:
@@ -774,38 +791,66 @@ def save_claim(data: dict) -> None:
         _save_claim_impl(data)
 
 
-def get_active_printer_client():
-    """返回当前「启用接单」且在线的打印机 client_id；无则 None。
-    接单是任务分发的唯一目标：只有它会被推送/允许拉取订单。"""
+def get_claiming_devices() -> dict:
+    """返回所有启用接单的设备集合 {client_id: {"claimed_at", "owner_name"}}。"""
     claim = load_claim()
-    cid = claim.get("active_client_id", "")
-    if not cid:
-        return None
-    if cid in get_active_clients():
-        return cid
+    devices = claim.get("claiming_devices") or {}
+    return devices
+
+
+def get_claiming_device_ids() -> list:
+    """返回所有启用接单的设备 client_id 列表。"""
+    return list(get_claiming_devices().keys())
+
+
+def is_claiming(client_id: str) -> bool:
+    """指定设备是否已启用接单。"""
+    return bool(client_id) and client_id in get_claiming_devices()
+
+
+def get_active_printer_client():
+    """返回当前「启用接单」且在线的打印机 client_id（取第一个在线接单设备）；无则 None。
+    多设备接单模式下仅作兼容用途（页数分析/预约兜底等需要「任一接单设备」的场景）；
+    指定设备分发请用 get_claiming_devices + is_claiming。"""
+    online = set(get_active_clients())
+    for cid in get_claiming_device_ids():
+        if cid in online:
+            return cid
     return None
 
 
 def is_printer_available() -> bool:
-    """是否有一台「启用接单」的在线打印机（小程序/APP 提交订单时的可用性判断）。"""
-    return get_active_printer_client() is not None
+    """是否有「启用接单」的打印机（含离线设备——离线时任务排队等其上线，提交仍被接受）。"""
+    return len(get_claiming_device_ids()) > 0
+
+
+def device_display_label(client_id: str) -> str:
+    """设备展示名：「{所有者}的设备 | {client_id}」，如「姚懿祥的设备 | DESKTOP-EJGEB1V-a6c1a1365e」。
+    未绑定所有者 → 直接显示 client_id。"""
+    if not client_id:
+        return ""
+    entry = get_device_entry(client_id)
+    owner = entry.get("owner_name", "") or ""
+    if owner:
+        return f"{owner}的设备 | {client_id}"
+    return client_id
 
 
 def _printer_state_payload(client_id: str) -> dict:
-    """构造发给某设备的接单状态 payload（本机是否接管、当前接管者是谁、本机所有者）。
-    2026-12：附带本机 owner_name/device_name —— 本地工具据此设置新建标签页的默认订单归属者。"""
-    claim = load_claim()
-    active_cid = claim.get("active_client_id", "")
-    holder = get_device_entry(active_cid)
+    """构造发给某设备的接单状态 payload（本机是否启用接单、全部接单设备、本机所有者）。
+    2026-12：多设备接单 —— claiming_devices 为全部启用接单设备，is_active 表示本机是否在其中。"""
+    claiming = get_claiming_devices()
     mine = get_device_entry(client_id)
     return {
-        "active_client_id": active_cid,
-        "active_owner_name": claim.get("owner_name", "") or holder.get("owner_name", ""),
-        "active_device_name": holder.get("device_name", active_cid) if active_cid else "",
-        "is_active": bool(active_cid) and active_cid == client_id,
+        "claiming_devices": {cid: (entry.get("owner_name", "") or "") for cid, entry in claiming.items()},
+        "is_active": client_id in claiming,
         # 本机设备信息：owner_name = 本机绑定的所有者（授权页绑定），新建标签页默认归属者用
         "owner_name": mine.get("owner_name", "") or "",
         "device_name": mine.get("device_name", "") or client_id,
+        # 兼容旧字段（旧版本地工具读取 active_client_id 判断「唯一接管者」）
+        "active_client_id": client_id if client_id in claiming else "",
+        "active_owner_name": (claiming.get(client_id) or {}).get("owner_name", ""),
+        "active_device_name": mine.get("device_name", "") if client_id in claiming else "",
     }
 
 
@@ -1427,6 +1472,58 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
+    # v26 迁移：orders 添加 print_started_at 列（订单实际开始打印的时刻）。
+    # 用于对比「发起订单」与「订单开始打印」的时间差（数据传输/文件转换/队列等待/延迟自动打印所致）。
+    # 本地工具只发 start_printing 信号不带时间，后端收到即用**服务器时钟**幂等写入（仅首次，不覆盖），
+    # 与 created_at 同一时钟源 → 差值无漂移，等待时长由 calc_wait_seconds() 统一下发 wait_seconds。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+        if "print_started_at" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN print_started_at TEXT DEFAULT ''")
+            conn.commit()
+            print("  已添加 orders.print_started_at 列")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
+    # v27 迁移：多设备接单 —— orders 记录「目标设备」(target_client) 与「实际接收设备」(received_client)。
+    #   · target_client：移动端提交时指定的可接单设备（空 = 未指定，由任一接单设备接收）
+    #   · received_client：任务实际被哪台设备推送/拉取/打印（首次写入，幂等）
+    #   存量订单没有接收设备记录，统一回填为历史打印机「姚懿祥的设备（DESKTOP-EJGEB1V-a6c1a1365e）」。
+    LEGACY_PRINTER_CLIENT = "DESKTOP-EJGEB1V-a6c1a1365e"
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+        added = False
+        if "received_client" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN received_client TEXT DEFAULT ''")
+            added = True
+        if "target_client" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN target_client TEXT DEFAULT ''")
+            added = True
+        if added:
+            # 存量订单统一归属历史打印机（迁移时刻一次性回填；此后新订单由接收流程写入）
+            conn.execute(
+                "UPDATE orders SET received_client = ? WHERE received_client = ''",
+                (LEGACY_PRINTER_CLIENT,),
+            )
+            conn.commit()
+            print("  已添加 orders.received_client / orders.target_client 列，存量订单归属历史打印机")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
+    # 确保历史打印机在设备注册表中（owner=姚懿祥），供「接单设备」列展示
+    try:
+        _dev = load_devices()
+        if LEGACY_PRINTER_CLIENT not in _dev or not _dev[LEGACY_PRINTER_CLIENT].get("owner_name", ""):
+            entry = _dev.get(LEGACY_PRINTER_CLIENT) or {}
+            entry["device_name"] = entry.get("device_name", "") or "DESKTOP-EJGEB1V"
+            entry["owner_name"] = entry.get("owner_name", "") or "姚懿祥"
+            entry["last_seen"] = entry.get("last_seen", "")
+            _dev[LEGACY_PRINTER_CLIENT] = entry
+            save_devices(_dev)
+            print("  设备注册表已补录历史打印机（姚懿祥）")
+    except Exception:
+        pass
+
     # 收支清算配置（单行 JSON blob，id 恒为 1；随 orders.db 一起被 backup.sh 备份）
     conn.execute(
         """
@@ -1614,6 +1711,26 @@ def refresh_order_status(conn, order_id):
     return new_status
 
 
+def calc_wait_seconds(created_at, print_started_at):
+    """计算「下单 → 实际开始打印」的等待秒数（后端权威时钟）。
+
+    created_at（下单时）与 print_started_at（收到 start_printing 时）两端都由服务器写入，
+    故差值不存在跨设备时钟漂移；本地工具只发信号、不上报时间，杜绝客户端时钟不准导致
+    等待时长失真（甚至为负）的问题。
+
+    返回 int 秒数；任一端缺失、格式异常或结果为负（脏数据）→ None。
+    """
+    if not created_at or not print_started_at:
+        return None
+    try:
+        t0 = datetime.strptime(str(created_at)[:19], "%Y-%m-%d %H:%M:%S")
+        t1 = datetime.strptime(str(print_started_at)[:19], "%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return None
+    delta = int((t1 - t0).total_seconds())
+    return delta if delta >= 0 else None
+
+
 def expire_stale_queued_orders():
     """防滥用：淘汰排队超过 queued_timeout_hours 的子任务（标记 failed 并刷新父订单状态）。
     目的：释放被 queued 状态钉住的磁盘文件——cleanup_expired_files 会跳过活跃状态
@@ -1652,13 +1769,20 @@ def expire_stale_queued_orders():
 
 def fetch_and_lock_task(client_id):
     """原子化地获取一个 queued 任务并立即锁定为 printing，返回完整任务字典或 None。
-    使用全局 db_lock 确保多台打印机并发拉取时不会重复分配同一任务。"""
+    使用全局 db_lock 确保多台打印机并发拉取时不会重复分配同一任务。
+    2026-12：多设备接单 —— 只拉取「指定给本设备」的任务（target_client=本机），
+    以及「未指定目标」的任务（仅启用接单的设备可拉取，其他设备不参与分配）。"""
     with db_lock:
         conn = get_db_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT id FROM order_files WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1"
+                """SELECT of.id FROM order_files of
+                   JOIN orders o ON of.order_id = o.id
+                   WHERE of.status = 'queued'
+                     AND (o.target_client = ? OR (o.target_client = '' AND ? = 1))
+                   ORDER BY of.created_at ASC LIMIT 1""",
+                (client_id, 1 if is_claiming(client_id) else 0),
             ).fetchone()
             if not row:
                 conn.rollback()
@@ -1676,6 +1800,11 @@ def fetch_and_lock_task(client_id):
             ).fetchone()
             if parent_row:
                 refresh_order_status(conn, parent_row["order_id"])
+                # 记录实际接收设备（首次写入，幂等）
+                conn.execute(
+                    "UPDATE orders SET received_client = COALESCE(NULLIF(received_client, ''), ?) WHERE id = ?",
+                    (client_id, parent_row["order_id"]),
+                )
             conn.commit()
             # 重新查询完整数据返回（含父订单信息 + 文件 MD5）
             full_task = conn.execute(
@@ -1701,12 +1830,15 @@ def fetch_and_lock_task(client_id):
 
 
 def process_pending_orders():
-    """扫描排队中的子任务（order_files）：当打印机客户端上线时，推送排队任务"""
+    """扫描排队中的子任务（order_files）：当目标打印机客户端上线时，推送排队任务。
+    2026-12：多设备接单 —— 订单指定了目标设备（target_client）则只发往该设备，
+    未指定则发往任一在线接单设备；目标设备离线 → 保持排队等其上线。"""
     conn = get_db()
     rows = conn.execute(
         """
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
-               of.copies, of.page_range, of.duplex, of.image_orientation, o.auto_print
+               of.copies, of.page_range, of.duplex, of.image_orientation,
+               o.auto_print, o.target_client
         FROM order_files of
         JOIN orders o ON of.order_id = o.id
         WHERE of.status = 'queued'
@@ -1719,13 +1851,13 @@ def process_pending_orders():
         return
 
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    active_clients = get_active_clients()
-    active_printer = get_active_printer_client()  # 接单唯一目标：仅启用接单的在线设备可接收
-    print(f"\n[{now_str}] 扫描到 {len(rows)} 个排队子任务, {len(active_clients)} 个活跃客户端"
-          f"{', 接单设备: ' + active_printer if active_printer else ''}")
+    online = set(get_active_clients())
+    claiming_ids = get_claiming_device_ids()
+    print(f"\n[{now_str}] 扫描到 {len(rows)} 个排队子任务, {len(online)} 个活跃客户端, "
+          f"{len(claiming_ids)} 台可接单设备")
 
-    if not active_printer:
-        print(f"  无启用接单的在线打印机，订单保持排队（等待接单设备上线）")
+    if not claiming_ids:
+        print("  无启用接单的打印机，订单保持排队（等待接单设备上线）")
         return
 
     for row in rows:
@@ -1736,6 +1868,19 @@ def process_pending_orders():
         copies = row["copies"]
         page_range = row["page_range"] or ""
         duplex = row["duplex"]
+        target_client = row["target_client"] or ""
+
+        # 确定目标设备：指定设备 → 仅该设备（须在接单集合且在线）；未指定 → 任一在线接单设备
+        if target_client:
+            if target_client not in claiming_ids or target_client not in online:
+                print(f"  [WAIT] 子任务 #{of_id}: 目标设备 {target_client} 未在线/未接单，保持排队")
+                continue
+            dest_client = target_client
+        else:
+            dest_client = next((c for c in claiming_ids if c in online), None)
+            if not dest_client:
+                print(f"  [WAIT] 子任务 #{of_id}: 无在线接单设备，保持排队")
+                continue
 
         # 查找文件路径
         file_path = None
@@ -1760,9 +1905,8 @@ def process_pending_orders():
             conn.close()
             continue
 
-        # 推送给接单设备（唯一接管者；接管者掉线则订单保持排队）
         pushed = push_print_task_to_client(of_id, file_id, file_name, copies, duplex,
-                                           page_range, active_printer,
+                                           page_range, dest_client,
                                            auto_print=bool(row["auto_print"]),
                                            image_orientation=row["image_orientation"] or "auto")
         if pushed:
@@ -1784,7 +1928,8 @@ def process_scheduled_orders():
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
                of.copies, of.page_range, of.duplex, of.status AS of_status,
                of.operator_client, of.image_orientation,
-               o.auto_print, o.schedule_mode, o.scheduled_at, o.schedule_frozen
+               o.auto_print, o.schedule_mode, o.scheduled_at, o.schedule_frozen,
+               o.target_client
         FROM order_files of
         JOIN orders o ON of.order_id = o.id
         WHERE of.status IN ('scheduled', 'waiting')
@@ -1797,15 +1942,26 @@ def process_scheduled_orders():
     if not rows:
         return
 
-    active_printer = get_active_printer_client()  # 预约单文件只下发到接单设备
+    active_printer = get_active_printer_client()  # 兜底：未指定目标时任一在线接单设备
+    online = set(get_active_clients())
     now = datetime.now()
 
     for row in rows:
         order_id = row["order_id"]
 
+        # 确定下发目标设备：指定目标 → 该设备（须在线）；未指定 → 任一在线接单设备
+        dest_client = row["target_client"] or ""
+        if dest_client:
+            if dest_client not in online:
+                continue
+        else:
+            dest_client = active_printer
+            if not dest_client:
+                continue
+
         if row["of_status"] == "scheduled":
-            # 阶段①：文件下发（仅接单设备可接收；无接单设备则保持 scheduled 等待）
-            if not active_printer:
+            # 阶段①：文件下发（下发到目标设备/任一在线接单设备；无可用设备则保持 scheduled 等待）
+            if not dest_client:
                 continue
             file_id = row["file_id"]
             if not file_id:
@@ -1827,7 +1983,7 @@ def process_scheduled_orders():
                 continue
             push_print_task_to_client(row["of_id"], file_id, row["file_name"],
                                       row["copies"], row["duplex"] or "on",
-                                      row["page_range"] or "", active_printer,
+                                      row["page_range"] or "", dest_client,
                                       auto_print=True,
                                       scheduled_download=True,
                                       schedule_mode=row["schedule_mode"],
@@ -1911,6 +2067,11 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             if order_row:
                 order_id = order_row["order_id"]
                 refresh_order_status(conn, order_id)
+                # 记录实际接收设备（首次写入，幂等）
+                conn.execute(
+                    "UPDATE orders SET received_client = COALESCE(NULLIF(received_client, ''), ?) WHERE id = ?",
+                    (client_id, order_id),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -2728,9 +2889,14 @@ def on_download_delayed(data):
 
 @socketio.on("start_printing")
 def on_start_printing(data):
-    """预约单本地工具到点开始打印：waiting/downloading → printing，并登记 pushed_tasks
+    """本地工具开始打印：记录订单实际开始打印的时刻（print_started_at，幂等写入），
+    并驱动预约单 waiting/downloading → printing，登记 pushed_tasks
     启用 3 分钟超时兜底（与普通单一致）。断网时本地也可能直接打完后报 print_success，
-    那时走 print_success 的 waiting 兼容分支。"""
+    那时走 print_success 的 waiting 兼容分支。
+
+    print_started_at 一律取**服务器时钟**（收到本事件的时刻），不接受客户端上报的时间：
+    客户端时钟可能不准，且与 created_at（服务器时钟）跨设备相减会得出错误的等待时长。
+    等待时长由后端用 calc_wait_seconds() 统一计算后下发 wait_seconds 字段。"""
     task_ids = data.get("task_ids") or data.get("task_id")
     if isinstance(task_ids, int):
         task_ids = [task_ids]
@@ -2753,6 +2919,7 @@ def on_start_printing(data):
         try:
             conn.execute("BEGIN IMMEDIATE")
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            started_at = now_str  # 服务器时钟为唯一权威时间源
             for tid in task_ids:
                 # 来源校验：operator_client 与当前连接不符的子任务跳过
                 chk = conn.execute(
@@ -2763,7 +2930,7 @@ def on_start_printing(data):
                           f" 与当前连接 {client_id} 不符，跳过")
                     continue
                 row = conn.execute(
-                    "SELECT order_id FROM order_files WHERE id = ? AND status IN ('waiting', 'downloading')", (tid,)
+                    "SELECT order_id FROM order_files WHERE id = ?", (tid,)
                 ).fetchone()
                 if not row:
                     continue
@@ -2774,6 +2941,12 @@ def on_start_printing(data):
                 if o and o["status"] == "canceled":
                     print(f"  [SKIP] start_printing 子任务 #{tid}: 父订单已取消，跳过")
                     continue
+                # 记录实际开始打印时刻（幂等：仅首次，不覆盖早于本次上报的开始时间）
+                conn.execute(
+                    "UPDATE orders SET print_started_at = ? WHERE id = ?"
+                    " AND (print_started_at IS NULL OR print_started_at = '')",
+                    (started_at, row["order_id"]),
+                )
                 conn.execute(
                     "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ? AND status IN ('waiting', 'downloading')",
                     (client_id, now_str, tid),
@@ -2789,7 +2962,7 @@ def on_start_printing(data):
     with pushed_tasks_lock:
         for tid in task_ids:
             pushed_tasks[tid] = {"pushed_at": datetime.now(), "client_id": client_id}
-    print(f"  [START] 预约单开始打印: {task_ids}")
+    print(f"  [START] 本地工具开始打印: {task_ids}")
 
 
 @socketio.on("page_count_result")
@@ -3286,20 +3459,23 @@ def ping():
 @app.route("/api/printer_status", methods=["GET"])
 def printer_status():
     """返回打印机在线状态（P2-13：基于心跳统计 get_active_clients，剔除心跳超时的僵尸注册）。
-    2026-11：新增接单设备信息 —— active_client_id/active_owner_name 为「启用接单」的当前设备。"""
+    2026-12：多设备接单 —— claiming_count 为启用接单的设备数（含离线），
+    take_orders_online 表示是否有在线接单设备。"""
     active = get_active_clients()
     online_count = len(active)
-    active_printer = get_active_printer_client()
+    claiming_ids = get_claiming_device_ids()
+    online_claiming = [c for c in claiming_ids if c in set(active)]
     return jsonify({
         "success": True,
         "online": online_count > 0,
         "active": online_count > 0,
         "count": online_count,
         "client_count": online_count,
-        # 接单设备（唯一接收订单者）
-        "take_orders_online": active_printer is not None,
-        "active_client_id": active_printer or "",
-        "active_owner_name": get_device_owner(active_printer) if active_printer else "",
+        # 接单设备（多设备集合）
+        "take_orders_online": len(online_claiming) > 0,
+        "claiming_count": len(claiming_ids),
+        "active_client_id": online_claiming[0] if online_claiming else "",
+        "active_owner_name": get_device_owner(online_claiming[0]) if online_claiming else "",
     })
 
 
@@ -4255,8 +4431,12 @@ def submit_order():
 
     order_number = generate_order_number()
 
-    # ---- 检查打印机在线状态 ----
-    printer_online = is_printer_available()  # 2026-11：接单设备在线才算打印机可用
+    # ---- 目标设备（多设备接单）与打印机状态 ----
+    # 2026-12：移动端提交时选择「可接单设备」作为目标；未指定/目标未启用接单 → 回退为任一接单设备接收
+    target_client_id = (data.get("target_client_id") or "").strip()
+    if target_client_id and not is_claiming(target_client_id):
+        target_client_id = ""
+    printer_online = is_printer_available()  # 有启用接单的设备（含离线：离线设备被指定时任务排队等其上线）
 
     # ---- 事务：插 1 条 orders + N 条 order_files ----
     conn = get_db()
@@ -4271,9 +4451,9 @@ def submit_order():
                                    urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                                    order_number, source, auto_print,
                                    schedule_mode, scheduled_at, schedule_frozen,
-                                   client_request_id, owner_name, is_admin_print, remark)
+                                   client_request_id, owner_name, is_admin_print, remark, target_client)
                VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
             (files_input[0].get("file_id") or None, first_file_name, 0,
              created_at, g.openid, duplex,
              0,  # is_free 恒为 0 — 价格仅用于统计
@@ -4281,7 +4461,7 @@ def submit_order():
              urgency, urgency_price, cover_page, cover_page_price, pickup_address,
              order_number, client, 1 if auto_print else 0,
              schedule_mode, scheduled_at,
-             client_request_id, owner_name, admin_print, remark),
+             client_request_id, owner_name, admin_print, remark, target_client_id),
             # is_free 恒为 0 — 价格仅用于统计，无免费策略
         )
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -4439,40 +4619,43 @@ def submit_order():
         raise
 
     # ---- 推送（事务外，避免长事务） ----
-    # 2026-11：仅推送给「启用接单」的设备（唯一接管者），杜绝多设备同时接收
+    # 2026-12：多设备接单 —— 指定了目标设备则只发往该设备（离线则保持 queued，等其上线后由
+    # process_pending_orders 推送）；未指定目标 → 任一在线接单设备。
     pushed_count = 0
-    if printer_online:
+    if target_client_id:
+        client_id = target_client_id if target_client_id in get_active_clients() else None
+    else:
         client_id = get_active_printer_client()
-        if client_id:
-            for st in sub_tasks:
-                if st["file_id"]:
-                    if schedule_mode != "now":
-                        # 预约单：阶段①先下发文件（downloading + 预约时间），本地到点再自动打印。
-                        # 推送失败则保持 scheduled，等 process_scheduled_orders 扫描重试。
-                        if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
-                                                      st["copies"], st.get("duplex", duplex),
-                                                      st.get("page_range", ""), client_id,
-                                                      auto_print=True,
-                                                      scheduled_download=True,
-                                                      schedule_mode=schedule_mode,
-                                                      scheduled_at=scheduled_at,
-                                                      image_orientation=st.get("image_orientation", "auto")):
-                            pushed_count += 1
-                        continue
+    if client_id:
+        for st in sub_tasks:
+            if st["file_id"]:
+                if schedule_mode != "now":
+                    # 预约单：阶段①先下发文件（downloading + 预约时间），本地到点再自动打印。
+                    # 推送失败则保持 scheduled，等 process_scheduled_orders 扫描重试。
                     if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
                                                   st["copies"], st.get("duplex", duplex),
                                                   st.get("page_range", ""), client_id,
-                                                  auto_print=bool(auto_print),
+                                                  auto_print=True,
+                                                  scheduled_download=True,
+                                                  schedule_mode=schedule_mode,
+                                                  scheduled_at=scheduled_at,
                                                   image_orientation=st.get("image_orientation", "auto")):
                         pushed_count += 1
-                    else:
-                        # 推送失败 → 降级子任务和父订单
-                        conn = get_db()
-                        conn.execute("UPDATE order_files SET status = 'queued' WHERE id = ?", (st["id"],))
-                        st["status"] = "queued"
-                        refresh_order_status(conn, order_id)
-                        conn.commit()
-                        conn.close()
+                    continue
+                if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
+                                              st["copies"], st.get("duplex", duplex),
+                                              st.get("page_range", ""), client_id,
+                                              auto_print=bool(auto_print),
+                                              image_orientation=st.get("image_orientation", "auto")):
+                    pushed_count += 1
+                else:
+                    # 推送失败 → 降级子任务和父订单
+                    conn = get_db()
+                    conn.execute("UPDATE order_files SET status = 'queued' WHERE id = ?", (st["id"],))
+                    st["status"] = "queued"
+                    refresh_order_status(conn, order_id)
+                    conn.commit()
+                    conn.close()
 
     conn.close()
 
@@ -4586,10 +4769,9 @@ def pull_queued_orders():
 
 @app.route("/api/printer/claim", methods=["POST"])
 def printer_claim():
-    """启用接单（唯一接管者）。
-    若当前已有其他「在线」设备接管 → 返回 409 语义（success=false + 接管者信息），
-    由本地打印工具弹窗提示「打印机已被 XXX 接管，无法启用接单」。
-    接管者离线时允许新设备接管（防止旧设备崩溃后打印机永久无人接单）。"""
+    """启用接单（加入可接单设备集合，多设备可同时启用）。
+    2026-12 重构：不再是「唯一接管者」独占，勾选接单的设备都会进入可接单设备列表，
+    移动端提交订单时选择目标设备；任务只会发往目标设备（未指定目标时取任一在线接单设备）。"""
     token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
@@ -4603,54 +4785,40 @@ def printer_claim():
 
     with _claim_lock:
         claim = _load_claim_impl()
-        current = claim.get("active_client_id", "")
-        if current and current != client_id and current in get_active_clients():
-            # 已有其他在线设备接管 → 拒绝，并返回接管者信息供前端弹窗
-            holder = get_device_entry(current)
-            owner = claim.get("owner_name", "") or holder.get("owner_name", "")
-            holder_name = holder.get("device_name", "") or current
-            msg = f"打印机已被 {holder_name} 接管"
-            if owner:
-                msg += f"（所有者：{owner}）"
-            msg += "，无法启用接单。如需接管，请先在该设备上关闭接单。"
-            print(f"[CLAIM] 设备 {client_id} 尝试启用接单被拒：当前由 {holder_name}({current}) 接管")
-            return jsonify({
-                "success": False, "message": msg,
-                "holder_client_id": current, "holder_name": holder_name,
-                "holder_owner": owner,
-            })
-        # 无接管者 / 接管者已离线 / 本机已是接管者 → 接管成功（幂等）
-        claim["active_client_id"] = client_id
-        claim["claimed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        claim["owner_name"] = get_device_owner(client_id)  # 以绑定所有者为准
+        devices = claim.get("claiming_devices")
+        if not isinstance(devices, dict):
+            devices = {}
+        devices[client_id] = {
+            "claimed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "owner_name": get_device_owner(client_id),  # 以绑定所有者为准
+        }
+        claim["claiming_devices"] = devices
         _save_claim_impl(claim)
     broadcast_printer_state()
-    print(f"[CLAIM] 设备 {client_id} 已启用接单")
+    print(f"[CLAIM] 设备 {client_id} 已启用接单（当前共 {len(devices)} 台可接单设备）")
     return jsonify({"success": True, "message": "接单已启用", "active": True,
-                    "active_owner_name": claim["owner_name"]})
+                    "claiming_count": len(devices)})
 
 
 @app.route("/api/printer/release", methods=["POST"])
 def printer_release():
-    """关闭接单（仅接管者自身可释放）。"""
+    """关闭接单（从可接单设备集合移除本机）。"""
     token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
-    claim = load_claim()
-    if claim.get("active_client_id") == client_id:
-        with _claim_lock:
-            claim = _load_claim_impl()
-            if claim.get("active_client_id") == client_id:
-                claim.pop("active_client_id", None)
-                claim.pop("claimed_at", None)
-                claim.pop("owner_name", None)
-                _save_claim_impl(claim)
-        broadcast_printer_state()
-        print(f"[CLAIM] 设备 {client_id} 已关闭接单")
-        return jsonify({"success": True, "message": "接单已关闭"})
-    return jsonify({"success": True, "message": "当前设备未接管打印机"})
+    with _claim_lock:
+        claim = _load_claim_impl()
+        devices = claim.get("claiming_devices")
+        if isinstance(devices, dict) and client_id in devices:
+            devices.pop(client_id, None)
+            claim["claiming_devices"] = devices
+            _save_claim_impl(claim)
+            broadcast_printer_state()
+            print(f"[CLAIM] 设备 {client_id} 已关闭接单（剩余 {len(devices)} 台可接单设备）")
+            return jsonify({"success": True, "message": "接单已关闭"})
+    return jsonify({"success": True, "message": "当前设备未启用接单"})
 
 
 @app.route("/api/printer/devices", methods=["GET"])
@@ -4663,8 +4831,6 @@ def printer_devices():
 
     online_set = set(get_active_clients())
     devices = load_devices()
-    claim = load_claim()
-    active_cid = claim.get("active_client_id", "")
     result = []
     for cid, entry in devices.items():
         result.append({
@@ -4674,16 +4840,36 @@ def printer_devices():
             "owner_name": entry.get("owner_name", "") or "",
             "first_seen": entry.get("first_seen", ""),
             "last_seen": entry.get("last_seen", ""),
-            "is_active": cid == active_cid,
+            "is_active": is_claiming(cid),
         })
     # 在线设备排前，其余按计算机名排序
     result.sort(key=lambda d: (not d["online"], d["device_name"].lower()))
     return jsonify({
         "success": True,
         "devices": result,
-        "active_client_id": active_cid,
-        "active_owner_name": claim.get("owner_name", "") or get_device_owner(active_cid),
+        "claiming_count": len(get_claiming_device_ids()),
     })
+
+
+@app.route("/api/claiming_devices", methods=["GET"])
+def claiming_devices():
+    """返回全部启用接单的设备列表（含在线状态；离线设备也允许被选择发送任务，任务排队等其上线）。
+    供移动端任务发起界面选择目标设备（公开接口，与 printer_status 一致）。"""
+    online_set = set(get_active_clients())
+    claiming = get_claiming_devices()
+    result = []
+    for cid, entry in claiming.items():
+        dev = get_device_entry(cid)
+        result.append({
+            "client_id": cid,
+            "device_name": dev.get("device_name", "") or cid,
+            "owner_name": dev.get("owner_name", "") or "",
+            "online": cid in online_set,
+            "label": device_display_label(cid),
+        })
+    # 在线设备排前，其余按 client_id 排序
+    result.sort(key=lambda d: (not d["online"], d["client_id"].lower()))
+    return jsonify({"success": True, "devices": result})
 
 
 @app.route("/api/printer/bind_owner", methods=["POST"])
@@ -4842,7 +5028,8 @@ def get_orders():
                delivery_enabled, delivery_location, delivery_percentage,
                urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                schedule_mode, scheduled_at, schedule_frozen,
-               source, owner_name, is_admin_print, remark
+               source, owner_name, is_admin_print, remark, print_started_at,
+               received_client, target_client
         FROM orders
         WHERE {where_clause}
         ORDER BY id DESC
@@ -4854,6 +5041,8 @@ def get_orders():
     orders = []
     for o_row in orders_rows:
         order = dict(o_row)
+        # 接单设备展示名（{所有者}的设备（{client_id}））；空值显示 — 
+        order["received_label"] = device_display_label(order.get("received_client", ""))
         oid = order["id"]
 
         # 查询子任务
@@ -4904,6 +5093,8 @@ def get_orders():
         # 向前端保持一致：旧字段仍保留（兼容性），但语义标注为聚合值
         order["file"] = file_summary
         order["copies"] = total_copies
+        # 等待时长（下单 → 开始打印）：后端用服务器时钟统一计算，前端不再自行相减
+        order["wait_seconds"] = calc_wait_seconds(order.get("created_at"), order.get("print_started_at"))
         orders.append(order)
 
     # 关联临时许可密钥：每个订单显示它消费的密钥（license_keys.order_id 单向关联）
@@ -4952,7 +5143,8 @@ def get_order_detail(order_id):
                o.urgency, o.urgency_price, o.cover_page, o.cover_page_price,
                o.pickup_address,
                o.schedule_mode, o.scheduled_at, o.schedule_frozen,
-               o.owner_name, o.is_admin_print, o.remark
+               o.owner_name, o.is_admin_print, o.remark, o.print_started_at,
+               o.received_client, o.target_client
         FROM orders o
         WHERE o.id = ? AND o.openid = ?
         """,
@@ -4964,6 +5156,8 @@ def get_order_detail(order_id):
         return jsonify({"success": False, "message": "任务不存在或无权访问"}), 404
 
     order = dict(row)
+    # 接单设备展示名（{所有者}的设备（{client_id}））；空值显示 — 
+    order["received_label"] = device_display_label(order.get("received_client", ""))
 
     # 查询子任务
     of_rows = conn.execute(
@@ -5045,6 +5239,7 @@ def get_order_detail(order_id):
         order["license_info"] = dict(lrow) if lrow else None
     finally:
         user_conn.close()
+    order["wait_seconds"] = calc_wait_seconds(order.get("created_at"), order.get("print_started_at"))
 
     conn.close()
     return jsonify({"success": True, "order": order})
@@ -5457,6 +5652,8 @@ def local_orders():
         status = "sent"
     # 订单备注（≤100 字）
     remark = str(data.get("remark", "") or "")[:100]
+    # 接收设备（多设备接单）：本地工具上报本机 client_id，用于记录订单「接单设备」
+    report_client_id = (data.get("client_id") or "").strip()
 
     if not order_number or not files:
         return jsonify({"success": False, "message": "缺少 order_number 或 files"}), 400
@@ -5504,6 +5701,23 @@ def local_orders():
                  remark),
             )
             order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # 本地订单的开始打印时间（print_started_at）：sent 上报发生在打印启动那一刻，
+        # 由服务器时钟写入（与 created_at 同源，等待时长才可信）。幂等——仅首次写入，
+        # 重打/重复上报不覆盖；reserved 预留上报（复制价格时刻）不写。
+        if status == "sent":
+            conn.execute(
+                """UPDATE orders SET print_started_at =
+                       COALESCE(NULLIF(print_started_at, ''), ?)
+                   WHERE id = ?""",
+                (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), order_id),
+            )
+            # 记录接收设备（首次写入，幂等；本地直接打印的订单归属本机）
+            if report_client_id:
+                conn.execute(
+                    "UPDATE orders SET received_client = COALESCE(NULLIF(received_client, ''), ?) WHERE id = ?",
+                    (report_client_id, order_id),
+                )
 
         # 子任务状态：预留单用 'reserved'（不进 queued 推送链路，聚合也不污染为 sent），
         # 打印完成上报用 'sent'
@@ -6862,7 +7076,8 @@ def admin_statistics_revenue():
                    o.owner_name, o.is_admin_print,
                    o.auto_print, o.schedule_mode, o.scheduled_at,
                    o.delivery_percentage, o.urgency_price, o.cover_page_price,
-                   o.pickup_address, o.remark
+                   o.pickup_address, o.remark, o.print_started_at,
+                   o.received_client, o.target_client
             FROM orders o
             LEFT JOIN order_files of ON o.id = of.order_id AND of.status IN ({status_placeholders})
             WHERE o.created_at >= ? AND o.created_at <= ?
@@ -6994,6 +7209,11 @@ def admin_statistics_revenue():
             "auto_print": bool(row["auto_print"]),
             "schedule_mode": row["schedule_mode"] or "now",
             "scheduled_at": row["scheduled_at"] or "",
+            "print_started_at": row["print_started_at"] or "",
+            "wait_seconds": calc_wait_seconds(row["created_at"], row["print_started_at"]),
+            # 接单设备展示名（{所有者}的设备（{client_id}））；空值显示 —
+            "received_client": row["received_client"] or "",
+            "received_label": device_display_label(row["received_client"] or ""),
             "files_count": len(files),
             "total_page_count": sum(f["page_count"] * f["copies"] for f in files),
             "revenue": round(paid_revenue, 2),

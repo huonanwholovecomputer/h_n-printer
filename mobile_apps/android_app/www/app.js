@@ -854,6 +854,9 @@ function switchTab(tab) {
   void exiting.offsetWidth;
   exiting.classList.add('page-push', exitCls);
 
+  // 主题按钮随 tab 切换同步播放滑入/滑出动画（与页面转场同时开始）
+  updateThemeToggleVisibility(tab);
+
   setTimeout(() => {
     exiting.style.display = 'none';
     exiting.classList.remove('page-push', exitCls);
@@ -980,15 +983,42 @@ window.hnHandleBack = function () {
   return false;
 };
 
-// 主题切换按钮仅"我"页使用（打印页/子视图隐藏，对齐小程序）
-function updateThemeToggleVisibility() {
+// 主题切换按钮仅"我"页使用（打印页/子视图隐藏，对齐小程序）。
+// 显隐带过渡动画：显示从右向左滑入淡入（theme-show），隐藏向右滑出淡出（theme-hide），
+// 动画结束后才真正 display:none（避免直接消失）。
+// targetTab 参数：tab 切换转场开始时即按目标页判定（与页面动画同步播放），
+// 不传则按当前页面 display 状态判定（子视图等场景）。
+function updateThemeToggleVisibility(targetTab) {
   const toggle = document.getElementById('themeToggle');
   if (!toggle) return;
-  const printVisible = document.getElementById('page-print').style.display !== 'none';
-  const subVisible = [...document.querySelectorAll('.view')].some(v => v.style.display !== 'none');
-  toggle.style.display = (printVisible || subVisible) ? 'none' : '';
-  // 显示时按最新导航栏高度重新定位（安全区高度可能延迟到达，避免被导航栏盖住）
-  if (toggle.style.display !== 'none' && typeof positionThemeToggle === 'function') positionThemeToggle();
+  let shouldShow;
+  if (targetTab) {
+    shouldShow = targetTab === 'me';
+  } else {
+    const printVisible = document.getElementById('page-print').style.display !== 'none';
+    const subVisible = [...document.querySelectorAll('.view')].some(v => v.style.display !== 'none');
+    shouldShow = !(printVisible || subVisible);
+  }
+  if (shouldShow) {
+    if (!toggle._themeShown) {
+      toggle._themeShown = true;
+      toggle.classList.remove('theme-hide');
+      toggle.style.display = '';
+      void toggle.offsetWidth;   // 重启动画
+      toggle.classList.add('theme-show');
+      // 显示时按最新导航栏高度重新定位（安全区高度可能延迟到达，避免被导航栏盖住）
+      if (typeof positionThemeToggle === 'function') positionThemeToggle();
+    }
+  } else {
+    if (toggle._themeShown) {
+      toggle._themeShown = false;
+      toggle.classList.remove('theme-show');
+      void toggle.offsetWidth;
+      toggle.classList.add('theme-hide');
+      const el = toggle;
+      setTimeout(() => { if (!el._themeShown) el.style.display = 'none'; }, 300);
+    }
+  }
 }
 
 /* ================= Toast / Modal ================= */
@@ -1163,6 +1193,53 @@ async function checkPrinterStatus() {
   }
 }
 
+/* ================= 可接单设备（2026-12 多设备接单） ================= */
+
+let claimingDevices = [];      // 可接单设备列表 {client_id, label, online, ...}
+let selectedDeviceId = '';     // 当前选中的目标设备（提交订单时随 target_client_id 上报）
+
+async function loadClaimingDevices() {
+  try {
+    const r = await api('/api/claiming_devices');
+    const devices = (r.data && r.data.success && r.data.devices) ? r.data.devices : [];
+    claimingDevices = devices;
+    // 保持用户已选设备；否则默认选第一个在线设备（无在线则第一个）
+    if (!devices.some(d => d.client_id === selectedDeviceId)) {
+      const onlineOne = devices.find(d => d.online);
+      selectedDeviceId = onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : '');
+    }
+    renderDeviceList();
+  } catch (e) { /* 静默失败，保留上次列表 */ }
+}
+
+function renderDeviceList() {
+  const card = document.getElementById('deviceSelectCard');
+  const list = document.getElementById('deviceList');
+  if (!card || !list) return;
+  if (!claimingDevices.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  // 入场动画：设备卡片已加入 PRINT_ENTRANCE 调度（0.15s）。
+  // 数据早于调度到达 → 不主动播放（_entrancePending 尚未置位），等 0.15s 调度统一触发，
+  // 避免与 logo 同时出现；数据晚于调度 → _entrancePending 已置位，显示时立即补播。
+  if (typeof playCardEntrance === 'function' && card._entrancePending) playCardEntrance(card);
+  list.innerHTML = claimingDevices.map(d =>
+    `<view class="device-item ${selectedDeviceId === d.client_id ? 'device-item-on' : ''}" data-id="${esc(d.client_id)}" data-hover="device-hover">
+      <view class="device-dot ${d.online ? 'device-dot-on' : 'device-dot-off'}"></view>
+      <text class="device-label">${esc(d.label || d.client_id)}</text>
+      <text class="device-state ${d.online ? 'device-state-on' : 'device-state-off'}">${d.online ? '在线' : '离线'}</text>
+    </view>`
+  ).join('');
+}
+
+// 设备选择（事件委托）
+document.addEventListener('click', function (e) {
+  const item = e.target.closest ? e.target.closest('.device-item') : null;
+  if (item && item.dataset && item.dataset.id) {
+    selectedDeviceId = item.dataset.id;
+    renderDeviceList();
+  }
+});
+
 /* ================= 初始化 ================= */
 
 function setupNav() {
@@ -1248,7 +1325,8 @@ function initApp() {
   }
   initScrollEngines();
   checkPrinterStatus();
-  setInterval(checkPrinterStatus, 30000);
+  loadClaimingDevices();
+  setInterval(() => { checkPrinterStatus(); loadClaimingDevices(); }, 30000);
   ensureLogin().then(() => refreshSession()).finally(() => {
     if (typeof initPrintPage === 'function') initPrintPage();
     if (typeof initMePage === 'function') initMePage();

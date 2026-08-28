@@ -1,6 +1,6 @@
 {
-  "version": "4.5.4",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.4.exe",
-  "md5": "be4ccbf44d488a9d26d0e9ec5799b719",
-  "notes": "v4.5.4：云端任务列表新增「成员 / 来源 / 备注」列（成员=下单用户绑定成员，来源=小程序/APP/本地，备注=订单备注全文，悬停查看）；后端推送与拉取通道同步下发 source 字段。"
+  "version": "4.5.7",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.7.exe",
+  "md5": "2ae505411fd95e2a140e123f9a365678",
+  "notes": "v4.5.7：收支清算关于页更新（v5.24）——多设备接单、接单设备列/比例饼图、时间精确到秒、口径栏滚动收起、开始打印列等本轮全部改动说明。"
 }

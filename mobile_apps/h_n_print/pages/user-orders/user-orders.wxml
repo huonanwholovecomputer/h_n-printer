@@ -164,8 +164,16 @@
           <view class="detail-section">
             <view class="detail-section-title">打印信息</view>
             <view class="detail-row">
+              <text class="detail-label">接单设备</text>
+              <text class="detail-value">{{item.received_label || '—'}}</text>
+            </view>
+            <view class="detail-row">
               <text class="detail-label">提交时间</text>
               <text class="detail-value">{{item.created_at}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">开始打印</text>
+              <text class="detail-value">{{item.print_started_at || '—'}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计页数</text>

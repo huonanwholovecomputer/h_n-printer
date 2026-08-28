@@ -17,6 +17,7 @@ venv/
 
 # 内部工具目录
 .codegraph/
+.workbuddy/
 
 # 大型安装包 - 需用户手动下载安装
 *.msi

@@ -1037,11 +1037,23 @@ page {
     0 0 0 0.5rpx rgba(255, 255, 255, 0.08);
 }
 
-/* emoji 字形在 emoji 字体度量下整体偏向行盒下方，
-   用 translateY 上移补偿，使其在圆形按钮内竖直居中（与 APP 端同一修复） */
+/* emoji 字形在 emoji 字体度量下整体偏向行盒上方，
+   用 translateY 下移补偿，使其在圆形按钮内竖直居中（实测偏上 → 正值下移） */
 .theme-toggle-btn text {
   line-height: 1;
-  transform: translateY(-0.05em);
+  transform: translateY(0.05em);
+}
+
+/* 切换 tab 时主题按钮过渡（与 APP 一致）：显示从右向左滑入淡入、隐藏向右滑出淡出 */
+.theme-toggle-btn.theme-show { animation: themeToggleIn 0.3s cubic-bezier(0.22, 0.61, 0.36, 1); }
+.theme-toggle-btn.theme-hide { animation: themeToggleOut 0.3s ease forwards; }
+@keyframes themeToggleIn {
+  from { opacity: 0; transform: translateX(24rpx); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes themeToggleOut {
+  from { opacity: 1; transform: translateX(0); }
+  to   { opacity: 0; transform: translateX(24rpx); }
 }
 
 /* ═══════════════ Scroll To Top Button ═══════════════ */

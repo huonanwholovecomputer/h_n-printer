@@ -266,6 +266,8 @@ Component({
       // 恢复密钥轮询：hide() 已 _stopKeyPolling()，而 60s 数据守卫可能跳过 loadUserRole（轮询只在其中启动），
       // 不在这里恢复会导致切 tab 回来后密钥状态（已使用/已删除）不再与另一端同步
       if (wx.getStorageSync('userRole') === 'admin') this._startKeyPolling()
+      // 主题按钮淡入（从右向左滑入，与页面入场同步；类交替变化触发动画重播）
+      this.setData({ themeBtnAnim: 'theme-show' })
     },
     hide() {
       this._stopOrderPolling()
@@ -295,6 +297,8 @@ Component({
         return false
       }
       this.setData({ pageExit: direction === 'left' ? 'page-exit-left' : 'page-exit-right' })
+      // 主题按钮向右滑出淡出（与页面退出动画同步）
+      this.setData({ themeBtnAnim: 'theme-hide' })
       return true
     },
 
@@ -348,6 +352,14 @@ Component({
                   }
                 }
               }
+            }
+            // 开始打印时间随轮询增量更新：订单开始打印后无需切换 tab 即显示
+            if ((n.print_started_at || '') !== (o.print_started_at || '')) {
+              updates['orders[' + i + '].print_started_at'] = n.print_started_at || ''
+            }
+            // 接单设备随轮询增量更新（订单被设备接收后无需切换 tab 即显示）
+            if ((n.received_label || '') !== (o.received_label || '')) {
+              updates['orders[' + i + '].received_label'] = n.received_label || ''
             }
           }
           if (changed) {

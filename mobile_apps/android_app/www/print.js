@@ -65,16 +65,18 @@ function onPrintTabShown() {
 
 let _printEntrancePlayed = false;
 
-// 打印页入场调度表（锚定页面加载时刻，0.5s 起逐 0.1s 递增）
+// 打印页入场调度表（锚定页面加载时刻，0s 起逐 0.1s 递增。
+// 小程序端为等待元素加载额外加了 0.5s 起步延迟，APP 无此问题 → 已取消。）
 const PRINT_ENTRANCE = [
-  ['headerArea', 0.5],
-  ['printerStatus', 0.6],
-  ['fileSection', 0.7],
-  ['extParamsCard', 0.8],
-  ['remarkCard', 0.85],
-  ['autoPrintSection', 0.9],
-  ['adminPrintSection', 1.0],
-  ['submitArea', 1.1],
+  ['headerArea', 0],
+  ['printerStatus', 0.1],
+  ['deviceSelectCard', 0.15],   // 可接单设备：位于状态栏与文件区之间
+  ['fileSection', 0.2],
+  ['extParamsCard', 0.3],
+  ['remarkCard', 0.35],
+  ['autoPrintSection', 0.4],
+  ['adminPrintSection', 0.5],
+  ['submitArea', 0.6],
 ];
 
 // 播放单个卡片入场：到点且可见 → 加无延迟动画类；仍隐藏（角色未加载）→ 标记待播
@@ -85,6 +87,13 @@ function playCardEntrance(el) {
   el._entrancePending = false;
   el.classList.remove('card-preload');
   el.classList.add('entrance-play');
+  // 播放结束立即移除动画类：entrance-play 是 CSS animation，残留类会在
+  // 切 tab 重显（display:none→block）时重播动画 → 入场动画只允许启动时播放一次。
+  const done = () => {
+    el.classList.remove('entrance-play');
+    el.removeEventListener('animationend', done);
+  };
+  el.addEventListener('animationend', done);
 }
 
 // 页面就绪：按页面加载时刻调度 7 张卡片入场；全部结束后清理入场类（切 tab 不重放）
@@ -96,9 +105,11 @@ function pageReady() {
     if (!el) return;
     setTimeout(() => playCardEntrance(el), at * 1000);
   });
-  // 最后一个槽位 1.1s + 动画 0.5s + 余量 → 清理，避免隐藏/重显时动画重放
+  // 最后一个槽位 0.6s + 动画 0.5s + 余量 → 清理，避免隐藏/重显时动画重放
   setTimeout(() => {
     document.querySelectorAll('#page-print .card-preload, #page-print .entrance-play').forEach(el => {
+      // 设备卡片数据异步到达（可能晚于清理时刻）：保留待播状态，由 renderDeviceList 显示时补播
+      if (el.id === 'deviceSelectCard') return;
       el._entranceDone = true;
       el._entrancePending = false;
       el.classList.remove('card-preload', 'entrance-play');
@@ -1747,6 +1758,8 @@ function doSubmit(skipPageValidation) {
       cover_page_price: printState.coverPagePrice,
       remark: printState.remark || '',
       skip_page_validation: skipPageValidation ? 1 : 0,
+      // 目标设备（多设备接单）：用户选择的接单设备，订单只发往该设备
+      target_client_id: (typeof selectedDeviceId !== 'undefined') ? (selectedDeviceId || '') : '',
       auto_print: printState.autoPrintEnabled ? 1 : 0,
       // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
       is_admin_print: (state.role === 'admin' && printState.adminPrintEnabled) ? 1 : 0,

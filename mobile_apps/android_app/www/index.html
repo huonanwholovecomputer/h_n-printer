@@ -49,6 +49,15 @@
             <text class="status-text" id="statusText">打印机离线</text>
           </view>
 
+          <!-- 可接单设备选择（2026-12 多设备接单：选择向哪台设备发送打印任务；离线设备也允许选择，任务排队等其上线） -->
+          <view class="card device-select-card card-preload" id="deviceSelectCard" style="display:none">
+            <view class="section-header inline-header">
+              <view class="section-header-bar"></view>
+              <text class="section-header-title">选择接单设备</text>
+            </view>
+            <view class="device-list" id="deviceList"></view>
+          </view>
+
           <!-- 打印文件 -->
           <view class="card file-section card-preload" id="fileSection">
             <view class="section-header inline-header">

@@ -831,7 +831,9 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
       <view class="detail-divider"></view>
       <view class="detail-section">
         <view class="detail-section-title">打印信息</view>
+        <view class="detail-row"><text class="detail-label">接单设备</text><text class="detail-value">${o.received_label ? esc(o.received_label) : '—'}</text></view>
         <view class="detail-row"><text class="detail-label">提交时间</text><text class="detail-value">${esc(o.created_at || '')}</text></view>
+        <view class="detail-row"><text class="detail-label">开始打印</text><text class="detail-value">${o.print_started_at ? esc(o.print_started_at) : '—'}</text></view>
         <view class="detail-row"><text class="detail-label">合计页数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_pages || (o.page_count * o.copies)) + ' 页')}</text></view>
         <view class="detail-row"><text class="detail-label">合计份数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_copies || o.copies) + ' 份')}</text></view>
       </view>
@@ -1373,7 +1375,7 @@ function bindKeySwipes() {
 function makeSwipeable(card, deleteEl, onDelete, opts) {
   opts = opts || {};
   let startX = 0, startY = 0, lastRaw = 0, horizontal = false, startCardX = 0, pointerId = null;
-  // 以删除按钮实际宽度为准（CSS 18.67cqw ≈ 80px，不能写死）
+  // 以删除按钮实际宽度为准（CSS 16.803cqw ≈ 80px，不能写死）
   // 延迟到首次触摸时测量：卡片可能在「我」页未显示时绑定，display:none 下 offsetWidth=0
   let DELETE_W = deleteEl ? deleteEl.offsetWidth : 140;
   const deadZone = opts.deadZone != null ? opts.deadZone : 8;

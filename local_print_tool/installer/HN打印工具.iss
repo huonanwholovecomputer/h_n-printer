@@ -1,5 +1,6 @@
 ; HN打印工具 一体化安装包（Inno Setup 7）
-; 构建：..\build_installer.ps1  或  ISCC.exe /DMyAppVersion=4.4.1 HN打印工具.iss
+; 构建：python ..\build_installer.py（推荐，自动从 gui.py 读 APP_VERSION 传入）
+;   或  ISCC.exe /DMyAppVersion=4.5.7 HN打印工具.iss
 ; 输出：..\dist\h_n-printer_setup_{版本}.exe
 ;
 ; ⚠ 必须排除所有用户数据文件（Excludes 列表）——否则会把开发机的
@@ -8,7 +9,7 @@
 ; 安装目录用英文 C:\Program Files\h_n printer（避免中文路径兼容问题）。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "4.4.1"
+  #define MyAppVersion "4.5.7"
 #endif
 
 [Setup]

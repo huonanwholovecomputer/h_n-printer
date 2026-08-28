@@ -225,6 +225,14 @@ Component({
             if (newOrders[i].status !== oldOrders[i].status) {
               updates['orders[' + i + '].status'] = newOrders[i].status
             }
+            // 开始打印时间随轮询增量更新：订单开始打印后无需切换 tab 即显示
+            if ((newOrders[i].print_started_at || '') !== (oldOrders[i].print_started_at || '')) {
+              updates['orders[' + i + '].print_started_at'] = newOrders[i].print_started_at || ''
+            }
+            // 接单设备随轮询增量更新（订单被设备接收后无需切换 tab 即显示）
+            if ((newOrders[i].received_label || '') !== (oldOrders[i].received_label || '')) {
+              updates['orders[' + i + '].received_label'] = newOrders[i].received_label || ''
+            }
             // 同步子文件状态
             if (newOrders[i].files && oldOrders[i].files) {
               for (let j = 0; j < Math.min(newOrders[i].files.length, oldOrders[i].files.length); j++) {

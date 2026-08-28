@@ -100,6 +100,9 @@ Component({
     selectedFiles: [],
     duplex: 'on',
     printerActive: false,
+    // 可接单设备（2026-12 多设备接单）：全部启用接单的设备 + 当前选中的目标设备
+    claimingDevices: [],
+    selectedDeviceId: '',
     showSuccessModal: false,
     showAccessDeniedModal: false,
     showPageCountWarning: false,   // 页数未验证警告弹窗
@@ -258,6 +261,7 @@ Component({
       if (this._returningFromDialog) {
         this._returningFromDialog = false
         this.loadPrinterStatus()
+        this.loadClaimingDevices()
         this._startPrinterPolling()
         this._restartPageCountPolls()
         if (this.data.autoPrintEnabled) this._startBreathingGlow()
@@ -277,6 +281,7 @@ Component({
           themeMode: app.globalData.themeMode,
         })
         this.loadPrinterStatus()
+        this.loadClaimingDevices()
         this._startPrinterPolling()
         this._restartPageCountPolls()
         if (this.data.autoPrintEnabled) this._startBreathingGlow()
@@ -313,6 +318,7 @@ Component({
       }
 
       this.loadPrinterStatus()
+      this.loadClaimingDevices()
       // 启动打印机状态轮询（30秒）
       this._startPrinterPolling()
       // 页数轮询 + 无障碍打印呼吸光晕：页面重新可见时恢复
@@ -421,6 +427,7 @@ Component({
       // 30s 轮询（设计意图，避免高频请求触发 Nginx hn_api 限流：60r/m + burst 150）
       this._printerPollTimer = setInterval(() => {
         this.loadPrinterStatus()
+        this.loadClaimingDevices()
         // 借轮询顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
         this.loadPricing()
       }, 30000)
@@ -1728,6 +1735,31 @@ Component({
       })
     },
 
+    // 可接单设备列表（多设备接单）：全部启用接单的设备（含离线），默认选中第一个在线设备
+    loadClaimingDevices() {
+      request({
+        url: CONFIG.BASE_URL + '/api/claiming_devices',
+        method: 'GET',
+        success: (res) => {
+          if (!res.data || !res.data.success) return
+          const devices = res.data.devices || []
+          let selected = this.data.selectedDeviceId
+          // 保持用户已选设备（若仍在列表中）；否则默认选第一个在线设备（无在线则第一个）
+          if (!devices.some(d => d.client_id === selected)) {
+            const onlineOne = devices.find(d => d.online)
+            selected = onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : '')
+          }
+          this.setData({ claimingDevices: devices, selectedDeviceId: selected })
+        },
+        fail: () => {}
+      })
+    },
+
+    onSelectDevice(e) {
+      const id = e.currentTarget.dataset.id
+      if (id) this.setData({ selectedDeviceId: id })
+    },
+
     onFileDuplexChange(e) {
       this._setFileDuplex(e.currentTarget.dataset.index, e.currentTarget.dataset.value)
     },
@@ -2704,6 +2736,8 @@ Component({
           cover_page_price: this.data.coverPagePrice,
           remark: this.data.remark || '',
           skip_page_validation: skipPageValidation ? 1 : 0,
+          // 目标设备（多设备接单）：用户选择的接单设备，订单只发往该设备
+          target_client_id: this.data.selectedDeviceId || '',
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
           // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
           is_admin_print: (this.data.userRole === 'admin' && this.data.adminPrintEnabled) ? 1 : 0,

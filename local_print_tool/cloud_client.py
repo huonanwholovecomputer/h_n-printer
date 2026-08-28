@@ -497,11 +497,15 @@ class CloudClient(QObject):
             self.status_message.emit(f"☁ 预约单 #{order_id} 到点未就绪，已上报冻结")
 
     def report_start_printing(self, order_id: int, task_ids: list):
-        """预约单到点开始打印 → 后端 waiting→printing（启用 3 分钟超时兜底）。"""
+        """本地工具开始打印 → 后端记录订单 print_started_at（幂等，仅首次）。
+
+        只发信号、不带时间：本机时钟可能不准，且与 created_at（服务器时钟）跨设备相减
+        会得出错误的等待时长。时间戳由后端在收到本事件时用服务器时钟写入，
+        等待时长也由后端 calc_wait_seconds() 统一下发。"""
         if not order_id or not task_ids:
             return
         if self._sio_emit("start_printing", {"order_id": order_id, "task_ids": task_ids}):
-            self.status_message.emit(f"☁ 预约单 #{order_id} 已到点开始打印")
+            self.status_message.emit(f"☁ 订单 #{order_id} 已上报开始打印")
 
     # ── 离线状态同步 ──
 
@@ -750,7 +754,7 @@ class CloudClient(QObject):
                 data = {}
             if resp.ok and data.get("success"):
                 self.take_orders = True
-                self.status_message.emit(f"☁ 接单已启用（本机为唯一接单设备）")
+                self.status_message.emit("☁ 接单已启用（本机已加入可接单设备）")
                 return True, data.get("message", "接单已启用"), data
             msg = data.get("message", "") if isinstance(data, dict) else ""
             return False, msg or f"接单启用失败（HTTP {resp.status_code}）", data or {}
@@ -1019,7 +1023,8 @@ class CloudClient(QObject):
 
         @self._sio.on("printer_state")
         def _on_printer_state(data):
-            """后端下发接单状态：本机是否接管、当前接管者（计算机名/所有者）。"""
+            """后端下发接单状态：本机是否启用接单、全部可接单设备、本机所有者。
+            2026-12：多设备接单 —— 不再有「唯一接管者」，多台设备可同时启用接单。"""
             try:
                 payload = dict(data or {})
             except Exception:
@@ -1027,13 +1032,11 @@ class CloudClient(QObject):
             self.last_printer_state = payload
             self.printer_state.emit(payload)
             if payload.get("is_active"):
-                self.status_message.emit("☁ 本机为当前接单设备（可接收云端订单）")
-            elif payload.get("active_client_id"):
-                holder = payload.get("active_device_name") or payload.get("active_client_id", "")
-                owner = payload.get("active_owner_name", "")
-                self.status_message.emit(
-                    f"☁ 当前接单设备: {holder}" + (f"（所有者：{owner}）" if owner else "")
-                    + "，本机未接单")
+                self.status_message.emit("☁ 本机已启用接单（可接收云端订单）")
+            else:
+                claiming = payload.get("claiming_devices") or {}
+                if claiming:
+                    self.status_message.emit(f"☁ 当前有 {len(claiming)} 台设备启用接单，本机未接单")
 
         @self._sio.on("request_log")
         def _on_request_log(data):

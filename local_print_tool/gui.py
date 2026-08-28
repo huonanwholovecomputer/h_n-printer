@@ -87,7 +87,7 @@ from offline_sync import OfflineSync
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.4"
+APP_VERSION = "4.5.7"
 
 
 # ============================================================
@@ -1305,19 +1305,17 @@ class CloudTaskListWindow(QDialog):
     # ── 单订单操作 ──
 
     def _on_accept_order(self, tasks: list):
-        """确认添加某订单的全部文件。"""
+        """确认添加某订单的全部文件 → 直接从列表移除（用户已接管，无需保留「已添加」行）。"""
         oid = tasks[0].order_id or tasks[0].task_id
-        if oid in self._pending_orders:
-            self._pending_orders[oid]["status"] = "accepted"
+        self._pending_orders.pop(oid, None)
         self.order_accepted.emit(tasks)
         self._rebuild_table()
         self._check_auto_close()
 
     def _on_reject_order(self, tasks: list):
-        """打回某订单的全部文件。"""
+        """打回某订单的全部文件 → 直接从列表移除。"""
         oid = tasks[0].order_id or tasks[0].task_id
-        if oid in self._pending_orders:
-            self._pending_orders[oid]["status"] = "rejected"
+        self._pending_orders.pop(oid, None)
         self.order_rejected.emit(tasks)
         self._rebuild_table()
         self._check_auto_close()
@@ -1335,7 +1333,7 @@ class CloudTaskListWindow(QDialog):
         if reply != QMessageBox.Yes:
             return
         for oid, entry in pending_orders:
-            entry["status"] = "accepted"
+            self._pending_orders.pop(oid, None)
             self.order_accepted.emit(entry["tasks"])
         self._rebuild_table()
         self._check_auto_close()
@@ -1351,7 +1349,7 @@ class CloudTaskListWindow(QDialog):
         if reply != QMessageBox.Yes:
             return
         for oid, entry in pending_orders:
-            entry["status"] = "rejected"
+            self._pending_orders.pop(oid, None)
             self.order_rejected.emit(entry["tasks"])
         self._rebuild_table()
         self._check_auto_close()
@@ -1782,14 +1780,15 @@ class MainWindow(QMainWindow):
 
         layout.addSpacing(4)
 
-        # 接单开关（2026-11）：多设备共连服务器时，仅启用接单的设备接收订单（唯一接管者）
+        # 接单开关（2026-12）：多设备可同时启用接单，勾选后本机进入「可接单设备」列表，
+        # 移动端提交订单时选择向哪台设备发送
         take_orders_switch = ThemedCheckBox("启用接单（接收云端订单）", theme_manager=self._theme_manager)
         take_orders_switch.setToolTip(
-            "只有开启本选项的设备才能接收小程序/APP 的订单并执行打印。\n"
-            "同一时间仅允许一台设备启用；若已有其他在线设备启用，将提示打印机已被该设备接管，无法启用。")
+            "勾选后本机进入「可接单设备」列表，移动端提交订单时可选择向本机发送打印任务。\n"
+            "多台设备可同时启用接单；未指定目标设备的订单由任一在线接单设备接收。")
         take_orders_switch.setChecked(bool(self._config.cloud_take_orders))
         layout.addWidget(take_orders_switch)
-        # 当前接管者提示（来自后端 printer_state 推送缓存；后台刷新见下方线程）
+        # 当前接单状态提示（来自后端 printer_state 推送缓存；后台刷新见下方线程）
         claim_hint = QLabel("")
         claim_hint.setWordWrap(True)
         claim_hint.setStyleSheet("color: #8a8f98; font-size: 12px;")
@@ -1845,19 +1844,17 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(btn_row)
 
-        # 打开时填充当前接管者提示（缓存 + 后台刷新一次，不阻塞对话框）
+        # 打开时填充当前接单状态提示（缓存 + 后台刷新一次，不阻塞对话框）
         def _fill_claim_hint():
             st = getattr(self, "_cloud_printer_state_cache", {}) or {}
             if st.get("is_active"):
-                claim_hint.setText("✅ 本机正在接单（可接收云端订单）")
-            elif st.get("active_client_id"):
-                holder = st.get("active_device_name") or st.get("active_client_id", "")
-                owner = st.get("active_owner_name", "")
-                claim_hint.setText(
-                    f"当前接单设备：{holder}" + (f"（所有者：{owner}）" if owner else "") + "；本机未接单"
-                )
+                claim_hint.setText("✅ 本机已启用接单（可接收云端订单）")
             else:
-                claim_hint.setText("当前无设备启用接单")
+                cnt = st.get("claiming_count", 0)
+                if cnt > 0:
+                    claim_hint.setText(f"当前有 {cnt} 台设备启用接单；本机未启用")
+                else:
+                    claim_hint.setText("当前无设备启用接单")
 
         _fill_claim_hint()
 
@@ -1867,18 +1864,10 @@ class MainWindow(QMainWindow):
                     data = self._cloud_client.get_printer_devices()
                     if not data:
                         return
-                    active_cid = data.get("active_client_id", "")
-                    holder_name, holder_owner = "", ""
-                    for d in data.get("devices", []):
-                        if d.get("client_id") == active_cid:
-                            holder_name = d.get("device_name", "")
-                            holder_owner = d.get("owner_name", "")
-                            break
+                    claiming_count = sum(1 for d in data.get("devices", []) if d.get("is_active"))
                     self._cloud_printer_state_cache = {
-                        "active_client_id": active_cid,
-                        "active_device_name": holder_name,
-                        "active_owner_name": holder_owner,
-                        "is_active": bool(active_cid) and self._cloud_client.client_id == active_cid,
+                        "claiming_count": claiming_count,
+                        "is_active": bool(self._cloud_client.take_orders),
                     }
                     QTimer.singleShot(0, _fill_claim_hint)
                 except Exception:
@@ -1931,8 +1920,7 @@ class MainWindow(QMainWindow):
                     self._cloud_client.stop()
                 self._update_cloud_status()
 
-            # 接单开关同步后端（唯一接管者，2026-11）：
-            # 启用被拒（已有其他在线设备接管）→ 弹窗提示并保持关闭
+            # 接单开关同步后端（多设备可同时启用，2026-12）：勾选 → 加入可接单设备列表
             new_take = bool(take_orders_switch.isChecked()) and bool(cloud_switch.isChecked())
             if self._config.cloud_enabled and self._config.cloud_token and self._cloud_client:
                 if new_take and not self._config.cloud_take_orders:
@@ -2116,7 +2104,7 @@ class MainWindow(QMainWindow):
             # 云端功能启用状态下才存在指示器/按钮（本地模式不创建）
             if connected:
                 if self._cloud_client and self._cloud_client.take_orders:
-                    # 接单中（2026-11）：本机为唯一接管者，可接收云端订单
+                    # 接单中（2026-12）：本机已启用接单，可接收云端订单
                     self._cloud_status_indicator.setText("☁ 接单中")
                 else:
                     self._cloud_status_indicator.setText("☁ 已连接")
@@ -3534,15 +3522,21 @@ class MainWindow(QMainWindow):
             self._save_config()
 
     def _load_remark_editor(self, tab=None):
-        """加载当前标签页备注到编辑框（标签页级字段）；冻结时锁定编辑。
+        """加载当前标签页备注到编辑框（标签页级字段）；冻结或云端订单时锁定编辑。
         标签页切换 / 云端任务到达 / 打印完成冻结时调用。
         备注区高度由垂直分隔条（v_splitter）拖拽控制，不在此处做固定高度自适应。"""
         if not hasattr(self, '_edit_remark'):
             return
         tab = tab if tab is not None else self._config.tabs.get(self._current_tab)
         is_frozen = tab.frozen if tab else False
-        self._label_remark.setEnabled(not is_frozen)
-        self._edit_remark.setEnabled(not is_frozen)
+        # 云端订单的备注来自下单方：任务添加到标签页后即锁定只读，不允许本地修改
+        is_cloud = self._is_cloud_order_tab(tab)
+        locked = is_frozen or is_cloud
+        self._label_remark.setEnabled(not locked)
+        self._label_remark.setText(
+            "订单备注（选填，最多 100 字；云端订单自动同步）" if not is_cloud
+            else "云端订单备注（来自下单方，只读）")
+        self._edit_remark.setEnabled(not locked)
         remark = tab.remark if tab else ""
         if self._edit_remark.toPlainText() != remark:
             self._edit_remark.blockSignals(True)
@@ -4840,6 +4834,8 @@ class MainWindow(QMainWindow):
             "owner_name": (tab.owner_name or ""),
             "is_admin_print": bool(tab.is_admin_print),
             "remark": remark,
+            # 接收设备（多设备接单）：本机 client_id，后端据此记录订单「接单设备」
+            "client_id": client.client_id,
             "delivery_enabled": bool(tab.delivery_enabled),
             "delivery_location": tab.delivery_location or "",
             "urgency": tab.urgency or "低",
@@ -5267,6 +5263,20 @@ class MainWindow(QMainWindow):
         worker.pdf_cached.connect(self._on_pdf_cached)
         self._worker = worker
         worker.start()
+
+        # 上报"开始打印"信号：打印批次实际启动 → 后端用服务器时钟记录 print_started_at（幂等，仅首次）。
+        # 覆盖手动 / 无障碍自动 / 预约三类云端订单（task_id≠0）。
+        # 只发信号不带时间戳——本机时钟可能不准，跨设备相减会得出错误的等待时长；
+        # 时间由后端统一写入，等待时长由后端 calc_wait_seconds() 下发 wait_seconds。
+        cloud_tasks: dict[int, list[int]] = {}
+        for j in flat_jobs:
+            tid = getattr(j, 'task_id', 0)
+            oid = getattr(j, 'order_id', 0)
+            if tid and oid:
+                cloud_tasks.setdefault(oid, []).append(tid)
+        if cloud_tasks and self._cloud_client:
+            for oid, tids in cloud_tasks.items():
+                self._cloud_client.report_start_printing(oid, tids)
         return True
 
     def _acquire_order_number_and_upload(
@@ -5360,6 +5370,8 @@ class MainWindow(QMainWindow):
                         "total_price": total_price,
                         "files": files_data,
                         "created_at": created_at,
+                        # 接收设备（多设备接单）：本机 client_id，后端据此记录订单「接单设备」
+                        "client_id": client.client_id,
                         # 订单归属（v24）：谁处理了这笔订单 + 是否管理员自行打印
                         "owner_name": (tab.owner_name if tab else DEFAULT_OWNER_NAME),
                         "is_admin_print": bool(tab.is_admin_print) if tab else True,
@@ -5445,7 +5457,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.5.4</h3>"
+            f"<h3>HN 本地打印工具 v{APP_VERSION}</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"
@@ -6202,8 +6214,6 @@ class MainWindow(QMainWindow):
             # 确认打印已启动后才置 printed（防假打印：忙时/空标签页不再标记成功）
             st["printed"] = True
             st["printed_ts"] = int(time.time())
-            if self._cloud_client:
-                self._cloud_client.report_start_printing(order_id, [t.task_id for t in ready_tasks])
         else:
             # 标签页无文件（可能被清空/删除）→ 不置 printed、不上报，重置为待重试
             self._log(f"⚠ 无障碍预约打印：标签页 {st['tab_key']} 无文件，订单 #{order_id} 保持待重试")
@@ -6335,7 +6345,8 @@ class MainWindow(QMainWindow):
 
     def _on_cloud_printer_state(self, state: dict):
         """（主线程）后端接单状态推送（PySide6 自动排队到主线程）。
-        - 自动续接单被拒（重启/重连时接管者已被其他在线设备占用）→ 弹窗提示并复位配置；
+        - 2026-12 多设备接单：不再有「唯一接管者被占用」，claim 总是成功；
+          此分支保留兼容旧后端（take_orders_rejected）与正常状态缓存；
         - 正常状态更新缓存，并把本机所有者（owner_name）持久化到配置——
           新建标签页时作为默认订单归属者（2026-12）。"""
         if not isinstance(state, dict):

@@ -159,6 +159,57 @@
 .status-active .status-text { color: var(--green); }
 .status-inactive .status-text { color: var(--gray); }
 
+/* ── 可接单设备选择（2026-12 多设备接单） ── */
+.device-select-card {
+  margin-bottom: 20rpx;
+}
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+}
+.device-item {
+  display: flex;
+  align-items: center;
+  gap: 12rpx;
+  padding: 16rpx 18rpx;
+  border: 1rpx solid var(--gray4);
+  border-radius: 16rpx;
+  background: var(--bg-card);
+  /* transform 过渡必须放基类：按下（hover-class）瞬时缩小，松手后由它平滑弹回（完整动画） */
+  transition: transform 0.12s cubic-bezier(0.4, 0, 0.2, 1),
+              border-color .15s ease, background .15s ease;
+}
+.device-item-on {
+  border-color: var(--blue);
+  background: rgba(0, 122, 255, .08);
+}
+.device-dot {
+  width: 14rpx;
+  height: 14rpx;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.device-dot-on { background-color: var(--green); }
+.device-dot-off { background-color: var(--gray3); }
+.device-label {
+  flex: 1;
+  font-size: 25rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.device-state { font-size: 22rpx; flex-shrink: 0; }
+.device-state-on { color: var(--green); }
+.device-state-off { color: var(--gray); }
+/* 设备选项按下反馈：微微缩小 0.98（瞬时生效，松手后由基类 transform 过渡平滑弹回） */
+.device-hover {
+  transform: scale(0.98);
+  transition: none;
+}
+
 /* ── File Section ── */
 .file-section {
   margin-bottom: 20rpx;

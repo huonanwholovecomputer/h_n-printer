@@ -317,6 +317,12 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             if not self._check_launch_token(allow_query=True):
                 return self._serve_403_page()
             return self._serve_injected_html("settlement.html")
+        if path == "/favicon.ico":
+            # 浏览器默认请求 favicon，走令牌门会 403（控制台红字）。返回 204 消除噪音。
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path in _PUBLIC_STATIC_FILES:
             self.path = path
             return super().do_GET()
@@ -340,6 +346,11 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         body = content.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        # 禁止缓存：settlement.html 每次启动注入随机 token，且开发迭代频繁，
+        # 浏览器缓存旧 HTML 会导致「改了不生效/功能缺失」（如滚动收起失效）
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)

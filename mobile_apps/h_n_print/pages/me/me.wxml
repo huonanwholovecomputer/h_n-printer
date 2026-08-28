@@ -8,7 +8,7 @@
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
 
 <!-- 深色模式切换按钮（page-root 外，避免与原生 type="nickname" 输入层冲突） -->
-<view class="theme-toggle-btn {{isDarkMode ? 'theme-dark' : ''}}" style="top: {{navBarBtnTop}}px;" bindtap="onToggleTheme" hover-class="tp-pressing" hover-stay-time="0">
+<view class="theme-toggle-btn {{isDarkMode ? 'theme-dark' : ''}} {{themeBtnAnim}}" style="top: {{navBarBtnTop}}px;" bindtap="onToggleTheme" hover-class="tp-pressing" hover-stay-time="0">
   <text>{{themeMode === 'auto' ? '🌓' : (themeMode === 'dark' ? '🌙' : '☀️')}}</text>
 </view>
 
@@ -463,8 +463,16 @@
           <view class="detail-section">
             <view class="detail-section-title">打印信息</view>
             <view class="detail-row">
+              <text class="detail-label">接单设备</text>
+              <text class="detail-value">{{item.received_label || '—'}}</text>
+            </view>
+            <view class="detail-row">
               <text class="detail-label">提交时间</text>
               <text class="detail-value">{{item.created_at}}</text>
+            </view>
+            <view class="detail-row">
+              <text class="detail-label">开始打印</text>
+              <text class="detail-value">{{item.print_started_at || '—'}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计页数</text>

@@ -33,6 +33,30 @@
           <text class="status-text">{{printerActive ? '打印机在线' : '打印机离线'}}</text>
         </view>
 
+        <!-- 可接单设备选择（2026-12 多设备接单：选择向哪台设备发送打印任务；离线设备也允许选择，任务排队等其上线） -->
+        <view wx:if="{{claimingDevices.length > 0}}" class="card device-select-card {{entranceDone ? '' : (entered.statusBar ? 'entrance-play' : 'card-preload')}}">
+          <view class="section-header inline-header">
+            <view class="section-header-bar"></view>
+            <text class="section-header-title">选择接单设备</text>
+          </view>
+          <view class="device-list">
+            <view
+              wx:for="{{claimingDevices}}"
+              wx:key="client_id"
+              class="device-item {{selectedDeviceId === item.client_id ? 'device-item-on' : ''}}"
+              bindtap="onSelectDevice"
+              data-id="{{item.client_id}}"
+              hover-class="device-hover"
+              hover-start-time="0"
+              hover-stay-time="80"
+            >
+              <view class="device-dot {{item.online ? 'device-dot-on' : 'device-dot-off'}}"></view>
+              <text class="device-label">{{item.label}}</text>
+              <text class="device-state {{item.online ? 'device-state-on' : 'device-state-off'}}">{{item.online ? '在线' : '离线'}}</text>
+            </view>
+          </view>
+        </view>
+
         <!-- File List Section -->
         <view class="card file-section {{entranceDone ? '' : (entered.fileSection ? 'entrance-play' : 'card-preload')}}">
           <view class="section-header inline-header">
