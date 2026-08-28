@@ -87,7 +87,7 @@ from offline_sync import OfflineSync
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.3"
+APP_VERSION = "4.5.4"
 
 
 # ============================================================
@@ -1083,7 +1083,7 @@ class CloudTaskListWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("☁ 云端任务列表")
-        self.setMinimumWidth(600)
+        self.setMinimumWidth(820)
         self.setMinimumHeight(380)
         self.setModal(False)
         self.setAttribute(Qt.WA_DeleteOnClose, False)
@@ -1138,11 +1138,12 @@ class CloudTaskListWindow(QDialog):
         self._countdown_timer.setInterval(1000)
         self._countdown_timer.timeout.connect(self._update_countdown)
 
-        # ── 表格：订单号 | 文件数 | 总页数 | 状态 | 操作 ──
+        # ── 表格：订单号 | 文件数 | 总页数 | 成员 | 来源 | 备注 | 状态 | 操作 ──
         from PySide6.QtWidgets import QTableWidget as _QTW, QTableWidgetItem as _QTWI
         self._table = _QTW()
-        self._table.setColumnCount(5)
-        self._table.setHorizontalHeaderLabels(["订单号", "文件数", "总页数", "状态", "操作"])
+        self._table.setColumnCount(8)
+        self._table.setHorizontalHeaderLabels(
+            ["订单号", "文件数", "总页数", "成员", "来源", "备注", "状态", "操作"])
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1153,7 +1154,10 @@ class CloudTaskListWindow(QDialog):
         hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(4, QHeaderView.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.Stretch)   # 备注列自适应撑开
+        hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(7, QHeaderView.ResizeToContents)
         layout.addWidget(self._table, 1)
 
         # ── 按钮行 ──
@@ -1236,12 +1240,34 @@ class CloudTaskListWindow(QDialog):
             # 总页数（暂无精确数据，显示 "—"）
             self._table.setItem(row, 2, _QTWI("—"))
 
+            # 成员（顾客订单 = 下单用户绑定的成员名；管理员自行打印 = 归属人）
+            first_task = tasks[0] if tasks else None
+            member = ""
+            if first_task is not None:
+                member = (getattr(first_task, 'bound_owner_name', '') or ''
+                          or getattr(first_task, 'owner_name', '') or '')
+            self._table.setItem(row, 3, _QTWI(member or "—"))
+
+            # 来源（wechat/app/local）
+            src = (getattr(first_task, 'source', '') or '') if first_task is not None else ''
+            src_text = {"wechat": "小程序", "app": "APP", "local": "本地"}.get(src, src or "—")
+            self._table.setItem(row, 4, _QTWI(src_text))
+
+            # 备注（截断显示，悬停显示全文）
+            remark = (getattr(first_task, 'remark', '') or '').strip() if first_task is not None else ""
+            if remark:
+                remark_item = _QTWI(remark if len(remark) <= 16 else remark[:16] + "…")
+                remark_item.setToolTip(remark)
+            else:
+                remark_item = _QTWI("—")
+            self._table.setItem(row, 5, remark_item)
+
             # 状态
             status_text = {"pending": "待确认", "canceled": "已取消", "accepted": "已添加", "rejected": "已打回"}
             status_item = _QTWI(status_text.get(status, status))
             if status == "canceled":
                 status_item.setForeground(QColor("#999"))
-            self._table.setItem(row, 3, status_item)
+            self._table.setItem(row, 6, status_item)
 
             # 操作按钮
             if status == "pending":
@@ -1262,15 +1288,15 @@ class CloudTaskListWindow(QDialog):
                 reject_btn.clicked.connect(lambda checked=False, ts=tasks: self._on_reject_order(ts))
                 btn_layout.addWidget(reject_btn)
 
-                self._table.setCellWidget(row, 4, btn_widget)
+                self._table.setCellWidget(row, 7, btn_widget)
             elif status == "canceled":
                 info_btn = QPushButton("✕ 已取消")
                 info_btn.setFixedSize(80, 26)
                 info_btn.setStyleSheet("font-size:11px; padding:0;")
                 info_btn.setEnabled(False)
-                self._table.setCellWidget(row, 4, info_btn)
+                self._table.setCellWidget(row, 7, info_btn)
             else:
-                self._table.setItem(row, 4, _QTWI("—"))
+                self._table.setItem(row, 7, _QTWI("—"))
 
         has_pending = any(e["status"] == "pending" for e in self._pending_orders.values())
         self._accept_all_btn.setEnabled(has_pending)
@@ -5419,7 +5445,7 @@ class MainWindow(QMainWindow):
         """关于对话框。"""
         QMessageBox.about(
             self, "关于 HN 本地打印工具",
-            "<h3>HN 本地打印工具 v4.5.3</h3>"
+            "<h3>HN 本地打印工具 v4.5.4</h3>"
             "<p>本地文件一键打印工具，支持多种文件格式。</p>"
             "<p>支持拖放添加、自动计费、浅色/深色主题切换。</p>"
             "<hr>"

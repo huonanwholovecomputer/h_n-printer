@@ -83,6 +83,8 @@ class CloudTask:
         "owner_name", "is_admin_print",
         # 2026-12：顾客订单标签页归属 = 下单用户绑定的成员名（后端从收支清算成员绑定反查）
         "bound_owner_name",
+        # 订单备注与来源（本地工具云端任务列表展示：成员/来源/备注列）
+        "remark", "source",
         "auto_print",
         # 无障碍打印预约（此前 __init__ 已赋值但这些字段漏在 __slots__ 之外 → 构造必报 AttributeError）
         "schedule_mode", "scheduled_at", "scheduled_ts", "schedule_frozen",
@@ -119,6 +121,9 @@ class CloudTask:
         self.is_admin_print: bool = bool(data.get("is_admin_print", False))
         # v5.24：顾客订单标签页的默认归属 = 下单用户绑定的成员名（后端反查成员绑定表）
         self.bound_owner_name: str = data.get("bound_owner_name", "") or ""
+        # 订单备注（提交时填写的附加说明）与来源（wechat/app/local），供云端任务列表展示
+        self.remark: str = data.get("remark", "") or ""
+        self.source: str = data.get("source", "") or ""
         self.auto_print: bool = bool(data.get("auto_print", False))  # 无障碍打印
         # 无障碍打印预约形式：now | at | countdown（'now' 即立即开始）
         self.schedule_mode: str = data.get("schedule_mode", "now") or "now"

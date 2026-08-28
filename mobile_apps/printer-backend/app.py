@@ -1681,7 +1681,7 @@ def fetch_and_lock_task(client_id):
             full_task = conn.execute(
                 """SELECT of.*, o.order_number, o.delivery_enabled, o.delivery_location,
                           o.urgency, o.cover_page, o.cover_page_price, o.auto_print,
-                          o.owner_name, o.is_admin_print, o.openid, o.remark,
+                          o.owner_name, o.is_admin_print, o.openid, o.remark, o.source,
                           f.md5 as source_md5
                    FROM order_files of
                    LEFT JOIN orders o ON of.order_id = o.id
@@ -1971,7 +1971,7 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
     if order_id:
         conn2 = get_db()
         o_row = conn2.execute(
-            "SELECT delivery_enabled, delivery_location, urgency, cover_page, cover_page_price, owner_name, is_admin_print, openid, remark FROM orders WHERE id = ?",
+            "SELECT delivery_enabled, delivery_location, urgency, cover_page, cover_page_price, owner_name, is_admin_print, openid, remark, source FROM orders WHERE id = ?",
             (order_id,),
         ).fetchone()
         conn2.close()
@@ -1989,6 +1989,8 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             # 2026-12：顾客订单的标签页归属 = 下单用户绑定的成员名（收支清算成员绑定）。
             # 管理员自行打印订单沿用 orders.owner_name（提交者昵称/前端指定）。
             task_msg["bound_owner_name"] = _get_bound_owner_name(o_row["openid"] or "")
+            # 订单来源（wechat/app/local），本地工具云端任务列表展示
+            task_msg["source"] = o_row["source"] or "wechat"
 
     # 查询文件 MD5（供本地工具 PDF 缓存命中，避免重复下载，P1-7）
     if file_id:
@@ -4562,6 +4564,8 @@ def pull_queued_orders():
         "is_admin_print": bool(task.get("is_admin_print", False)),
         # 2026-12：顾客订单标签页归属 = 下单用户绑定的成员名（与 push 通道一致）
         "bound_owner_name": _get_bound_owner_name(task.get("openid") or ""),
+        # 订单来源（wechat/app/local），本地工具云端任务列表展示
+        "source": task.get("source", "") or "wechat",
     }
     if task["file_id"]:
         item["download_url"] = make_download_url(task["file_id"])

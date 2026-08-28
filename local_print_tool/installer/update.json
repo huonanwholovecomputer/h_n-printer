@@ -1,6 +1,6 @@
 {
-  "version": "4.5.3",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.3.exe",
-  "md5": "661967566c5d703efa7afb1fda1b589f",
-  "notes": "v4.5.3：更新安装包复用——UAC 拒绝/安装失败时保留已下载的安装包，下次检查更新直接复用不再重新下载；更新目录自动清理旧版本残留（最多保留当前目标版本，安装成功后自动删除，防止堆积）。"
+  "version": "4.5.4",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.4.exe",
+  "md5": "be4ccbf44d488a9d26d0e9ec5799b719",
+  "notes": "v4.5.4：云端任务列表新增「成员 / 来源 / 备注」列（成员=下单用户绑定成员，来源=小程序/APP/本地，备注=订单备注全文，悬停查看）；后端推送与拉取通道同步下发 source 字段。"
 }
