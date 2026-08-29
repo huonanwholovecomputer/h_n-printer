@@ -1,6 +1,6 @@
 {
-  "version": "4.5.7",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.7.exe",
-  "md5": "2ae505411fd95e2a140e123f9a365678",
-  "notes": "v4.5.7：收支清算关于页更新（v5.24）——多设备接单、接单设备列/比例饼图、时间精确到秒、口径栏滚动收起、开始打印列等本轮全部改动说明。"
+  "version": "4.5.8",
+  "url": "https://hn-space.cn/updates/h_n-printer_setup_4.5.8.exe",
+  "md5": "b4e82e4837c66008886d61c40be6c2ba",
+  "notes": "v4.5.8：收支清算关于页更新（v5.25）——口径栏改为普通固定卡片（移除吸顶悬浮与滚动收起）、刷新记住所在标签页、消除刷新时总览选中态闪烁。"
 }

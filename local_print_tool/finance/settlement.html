@@ -187,21 +187,9 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 
 /* ==================== 云端 · 全局口径栏（v6.0） ==================== */
 .scope-bar {
-  position: sticky; top: 0; z-index: 40;
   padding: 14px 18px 10px; margin-bottom: 16px;
-  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-md);
-  /* 收起动画只依赖 transform + opacity 两个可平滑过渡属性。
-     注意：不要用 visibility 控制显隐——它是离散属性，hidden 会立即生效，
-     导致 transform/opacity 的过渡动画根本来不及显示（看起来「直接消失」）。
-     translateY(-120%) 把元素移出视口后天然不可见、不接收鼠标事件。 */
-  transition: transform .35s ease, opacity .35s ease;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm);
 }
-/* 滚动到订单明细时收起：整体上滑出视口 + 淡出，避免 sticky 悬浮栏遮挡表格。
-   布局占位保留，滚动回上方自动滑回。JS 走内联样式，此规则仅作后备。 */
-.scope-bar.collapsed { transform: translateY(-120%); opacity: 0; }
-/* 收起动画期间禁子元素过渡：.btn/.dd-btn 自带 transition，会与父级位移叠加，
-   造成「刷新按钮比卡片其他元素延迟消失」的错位。口径栏内 hover 过渡优先级低，直接禁用。 */
-.scope-bar * { transition: none !important; }
 .scope-row { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
 .scope-row .f-item > label { display: block; font-size: .78rem; font-weight: 600; color: var(--muted); margin-bottom: 5px; }
 .scope-summary {
@@ -669,6 +657,35 @@ img, button { -webkit-user-drag: none; }
   <div class="tab" id="tab-auth"></div>
   <div class="tab" id="tab-about"></div>
 </main>
+
+<script>
+/* 首帧绘制前恢复 tab 选中态（防闪）：默认 HTML 写死「收支清算」选中，
+   若上次/深链指向其他 tab，这里在浏览器绘出首帧之前同步搬移 on 类，
+   避免「先闪一下总览选中再切换」。只改类名不渲染内容——内容仍由
+   页面尾部的 switchTab(window.__initialTab) 统一走正常初始化。 */
+(function () {
+  var tab = null;
+  try { tab = new URLSearchParams(location.search).get('tab'); } catch (e) {}
+  var fromUrl = tab === 'settings' || tab === 'auth';
+  if (!fromUrl) {
+    try { tab = sessionStorage.getItem('finance_last_tab'); } catch (e2) {}
+  }
+  var valid = ['dash', 'entry', 'cloud', 'history', 'settings', 'auth', 'about'];
+  if (!tab || valid.indexOf(tab) === -1) tab = 'dash';
+  // FINANCE_MODE 此时还没赋值，这里按同样规则解析一次（仅用于本地模式隐藏授权入口的判定）
+  var mode = '__FINANCE_MODE__';
+  try {
+    var mm = (location.hash || '').match(/(?:^|[?&])mode=([^&]+)/) || (location.search || '').match(/(?:^|[?&])mode=([^&]+)/);
+    if (mm && mm[1]) { var mv = decodeURIComponent(mm[1]); if (mv === 'cloud' || mv === 'local') mode = mv; }
+  } catch (e3) {}
+  if (mode !== 'cloud' && mode !== 'local') mode = 'cloud';
+  if (mode === 'local' && tab === 'auth') tab = 'dash';
+  window.__initialTab = tab;
+  document.querySelectorAll('.tab, #tabNav button').forEach(function (el) { el.classList.remove('on'); });
+  var t = document.getElementById('tab-' + tab); if (t) t.classList.add('on');
+  var b = document.querySelector('#tabNav button[data-tab="' + tab + '"]'); if (b) b.classList.add('on');
+})();
+</script>
 
 <!-- 悬浮控件：右上角主题切换 + 右下角返回顶部（所有界面通用） -->
 <button class="floating-btn" id="themeToggle" title="切换主题">🌓</button>
@@ -1335,6 +1352,7 @@ function animateTab(tabEl) {
 }
 function switchTab(name) {
   currentTab = name;
+  try { sessionStorage.setItem('finance_last_tab', name); } catch (e0) { /* 隐私模式等不可用时静默降级 */ }
   $$('.tab').forEach(function (p) { p.classList.remove('on'); });
   $$('#tabNav button').forEach(function (b) { b.classList.remove('on'); });
   var tab = $('#tab-' + name);
@@ -1685,19 +1703,14 @@ function onScopeCustomApply() {
 
 /* ==================== v6.0：全局口径栏（时间/成员多选/来源多选） ==================== */
 function jsStr(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
-/* 口径栏吸顶由 CSS 承担：.scope-bar { position: sticky; top: 0 } ——
-   顶部导航（.app-header）为普通文档流元素，顺着鼠标滚轮自然滚动收起/展开，
-   导航滚出后口径栏自然贴到视口顶，无需 JS 动态偏移。 */
-/* 滚动到元素，减去吸顶的口径栏高度（及导航仍可见时的高度），避免目标被浮动元素遮挡。
+/* 滚动到元素，减去导航仍可见时的高度，避免目标被遮挡。
    导航随滚动自然滚出，取其「当前可见高度」（getBoundingClientRect 底边，滚出后为 0）。 */
 function _scrollToOffset(id) {
   var el = document.getElementById(id);
   if (!el) return;
   var header = document.querySelector('.app-header');
-  var scope = document.getElementById('scopeBar');
   var headerVis = header ? Math.max(0, Math.round(header.getBoundingClientRect().top + header.offsetHeight)) : 0;
-  var offset = headerVis + (scope ? scope.offsetHeight : 0) + 10;
-  var top = el.getBoundingClientRect().top + (window.scrollY || document.documentElement.scrollTop) - offset;
+  var top = el.getBoundingClientRect().top + (window.scrollY || document.documentElement.scrollTop) - headerVis - 10;
   window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
 }
 /* 成员筛选可选项：成员（含管理员）恒在 + 当前数据中出现的未绑定云端用户/未匹配本地归属人 */
@@ -1844,56 +1857,6 @@ function _renderScopeBar(keys) {
   h += '</div></div>';
   return h;
 }
-
-/* 滚动到订单明细时自动收起口径栏（sticky 悬浮栏不遮挡表格，滚到订单明细即整体滑出视口）。
-   触发条件：订单明细卡片顶部（相对视口）进入悬浮栏底部参考线以内。
-   参考线用 bar.offsetHeight（sticky 贴顶时悬浮栏底部 = 其高度）——transform 不影响布局高度，
-   收起后参考线不变，不会因悬浮栏已移出视口而误判展开（无抖动）。
-   滞回：收起阈值 +8px、展开阈值 +48px，避免临界点反复切换。 */
-/* 滚动到订单明细时收起口径栏（触发式 + CSS 过渡平滑动画）：
-   - 收起：订单明细卡片顶部（视口内 y）≤ 悬浮栏底部参考线 + 8px → 上滑淡出（0.35s 平滑）
-   - 展开：向上滚回参考线以上 120px（滞回，防临界抖动）→ 滑回
-   只改 transform/opacity（两者都有 CSS transition）；不设 visibility/pointer-events——
-   translateY(-120%) 移出视口后天然不可见不可交互，且 visibility 是离散属性会立即生效、
-   让过渡动画显示不出来（表现为「直接消失」）。
-   与 tab 栏的关系：.app-header（含 tab 栏）是普通文档流，随滚动自然滚出视口；
-   口径栏 sticky top:0 贴视口顶——触发只取决于订单明细卡片相对视口的 y 坐标。 */
-var _scopeBarCollapsed = false;
-function _updateScopeBarCollapse() {
-  var bar = document.getElementById('scopeBar');
-  var card = document.getElementById('cloud-orders');
-  // 悬浮栏不可见（display:none / 未渲染）时跳过评估
-  if (!bar || !card || bar.offsetHeight <= 0) return;
-  var ref = bar.offsetHeight;                                // 悬浮栏贴顶时的底部参考线（视口内 y）
-  var cardTop = card.getBoundingClientRect().top;            // 订单明细卡片顶部（视口内 y）
-  // 以 DOM 实际状态为准（不要用变量残留判断）：renderCloud 会重建整个 #tab-cloud，
-  // 新悬浮栏总是展开态，若用变量残留判断（上一轮收起过 → 变量 true）会导致
-  // 「want===true===变量」直接 return、永远不再设置收起样式 → 卡片不再上移。
-  var curCollapsed = bar.style.transform.indexOf('translateY') !== -1;
-  var want;
-  if (!curCollapsed) {
-    want = cardTop <= ref + 8;                               // 未收起：卡片顶部进入参考线 → 收起
-  } else {
-    want = cardTop > ref + 120 ? false : true;               // 已收起：滚回参考线上方 120px → 展开
-  }
-  if (want === curCollapsed) return;
-  console.log('[scope-bar] 切换: ref=' + ref + ' cardTop=' + cardTop.toFixed(1) + ' cur=' + curCollapsed + ' want=' + want);
-  _scopeBarCollapsed = want;
-  bar.style.transform = want ? 'translateY(-120%)' : '';
-  bar.style.opacity = want ? '0' : '';
-}
-/* 诊断：控制台执行 window.__scopeDebug() 输出当前状态并手动评估一次 */
-window.__scopeDebug = function () {
-  var bar = document.getElementById('scopeBar');
-  var card = document.getElementById('cloud-orders');
-  console.log('[scope-bar] debug: bar=' + (bar ? bar.offsetHeight : 'null')
-    + ' card=' + (card ? card.getBoundingClientRect().top.toFixed(1) : 'null')
-    + ' transform="' + (bar ? bar.style.transform : '') + '"');
-  _updateScopeBarCollapse();
-};
-/* capture 捕获阶段监听：无论滚动发生在 window 还是任意内部滚动容器都能触发 */
-document.addEventListener('scroll', _updateScopeBarCollapse, { passive: true, capture: true });
-window.addEventListener('resize', _updateScopeBarCollapse, { passive: true });
 
 /* ==================== v5.15：自绘日历组件（趋势自定义日期） ====================
    浮层挂在 body 下，独立于 renderCloud 重建；浅色/深色主题随 CSS 变量自动适配；
@@ -2543,8 +2506,7 @@ function _rerenderOrdersOnly(scroll) {
   var el = document.getElementById('cloud-orders');
   if (!el || !_cloudData) return;
   el.outerHTML = _renderOrderListHTML();
-  _updateScopeBarCollapse();   // 局部刷新后重新评估收起状态
-  if (scroll) _scrollToOffset('cloud-orders');   // 考虑吸顶 header+口径栏，避免目标被浮动条遮挡
+  if (scroll) _scrollToOffset('cloud-orders');
 }
 /* 分页事件（参考小程序 onPageChange/onPrevPage/onNextPage/onSelectPageSize） */
 function onOrdersPage(p) {
@@ -3421,7 +3383,7 @@ function _renderCloudShared() {
   if (!_scopeTime.month) _scopeTime.month = cm;
   if (_scopeTime.mode === 'month' && keys.length && !keys.includes(_scopeTime.month)) _scopeTime.month = keys[0];
 
-  var h = _renderScopeBar(keys);   // v6.0：全局口径栏（时间/成员/来源 唯一筛选入口，吸顶）
+  var h = _renderScopeBar(keys);   // v6.0：全局口径栏（时间/成员/来源 唯一筛选入口，普通文档流卡片）
 
   if (_cloudLoading) {
     _destroyCloudCharts();
@@ -3617,7 +3579,6 @@ function _renderCloudShared() {
   h += '</div>';
 
   el.innerHTML = _lz(h);
-  _updateScopeBarCollapse();   // 渲染后立即评估（若已滚到订单明细处则收起口径栏）
   $$('#tab-cloud .num[data-count]').forEach(function (node) {
     countUp(node, parseFloat(node.getAttribute('data-count')), { dec: 2, fmt: function (n) { return '¥' + (n / 100).toFixed(2); } });
   });
@@ -4242,7 +4203,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.24</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.25</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -4272,6 +4233,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.22：设备授权 + 多设备接单 —— 新增「🔐 授权」标签页（独立密码保护）：① 本设备所有者从成员列表绑定，绑定后本地打印工具新建标签页默认归属该所有者、默认关闭「管理员自行打印」；② 云端设备列表展示所有连接过云服务器的设备（计算机名称 / 在线状态 / 所有者 / 是否接单，每 15 秒自动刷新，绑定后即时广播生效）。多设备共连服务器时仅「启用接单」的设备接收订单（同一时间唯一接管者，被其他设备占用时提示接管者名称与所有者）；订单明细「用户」列改为显示下单用户昵称（绑定微信小程序/APP 后优先微信小程序昵称，修改昵称实时同步）；修复授权页设备列表/所有者刷新被代理过滤的问题。</p>' +
     '<p style="margin-top:10px">v5.23：设备删除 + 图表与价格修正 —— ① 授权页云端设备列表新增「🗑 删除」按钮（清理软件升级产生的同机旧 ID 与历史遗留设备；删除当前接单设备时自动清空接管记录）；② 饼状图引线标签防重叠：过小扇区跳过标注、同侧标签碰撞检测自动错开/隐藏、引线水平段只画到文字近边前 2px（不再压字）；③ 打印价格：本地模式首页费默认值统一为 0.10（与云端 pricing.json 一致）。</p>' +
     '<p style="margin-top:10px">v5.24：多设备接单 + 时间到秒 —— ① 「启用接单」重构为可接单设备列表（多台设备可同时启用），订单记录实际接单设备；订单明细新增「接单设备」列（{所有者}的设备 | {设备}，历史订单归属姚懿祥的设备）；② 运营视角新增「接单设备比例」饼图（按订单数，悬停看收益）；③ 订单明细「时间」「开始打印」精确到秒；④ 口径栏滚动收起：滚动到订单明细附近时口径栏平滑上滑淡出、向上滚动自动滑回；⑤ 订单明细新增「开始打印」列（悬停展示下单→开始打印的等待时长）。</p>' +
+    '<p style="margin-top:10px">v5.25：界面细节优化 —— ① 口径栏改为普通固定卡片：移除吸顶悬浮与滚动收起动画，不再遮挡订单明细；② 刷新记住所在标签页：F5 刷新后停留在原 tab（新开会话仍从收支清算开始）；③ 消除刷新时「收支清算」选中态闪烁：tab 恢复提前到首帧绘制前同步完成。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
@@ -4427,11 +4389,9 @@ function replayOfflinePending() {
   window.addEventListener('scroll', _updateBackToTop, { passive: true });
   _backToTop.addEventListener('click', function () { window.scrollTo({ top: 0, behavior: 'smooth' }); });
   $('#blockRetry').addEventListener('click', retryConnect);
-  // 深链：?tab=settings / ?tab=auth 直接切到对应标签（本地打印工具引导用）
-  var _urlTab = null;
-  try { _urlTab = new URLSearchParams(window.location.search).get('tab'); } catch (e3) {}
-  if (_urlTab === 'settings') switchTab('settings');
-  else if (_urlTab === 'auth') switchTab('auth');
+  // 初始 tab 早在 <main> 后的防闪脚本里已定（深链 > 上次 tab > 总览，存 window.__initialTab），
+  // 此处选中态已就位，switchTab 只补走正常初始化（currentTab/渲染/动画），不会产生视觉跳变
+  switchTab(window.__initialTab || 'dash');
   // 初始为 loading 骨架
   renderAll();
   loadConfig();
