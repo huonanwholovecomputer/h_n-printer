@@ -117,9 +117,9 @@ python main.py
 
 微信小程序 / Android App 提交打印任务 → Flask 后端存储分发 → Windows 本地工具自动打印。
 
-| 小程序 · 打印界面 | 小程序 · 我的（1） | 小程序 · 我的（2） |
-|---|---|---|
-| ![小程序打印界面](docs/screenshots/mini-program-print.png) | ![小程序我的1](docs/screenshots/mini-program-me-1.png) | ![小程序我的2](docs/screenshots/mini-program-me-2.png) |
+| 小程序 · 打印界面 | 小程序 · 我的 |
+|---|---|
+| ![小程序打印界面](docs/screenshots/mini-program-print.jpg) | ![小程序我的](docs/screenshots/mini-program-me.jpg) |
 
 ```
 mobile_apps/
