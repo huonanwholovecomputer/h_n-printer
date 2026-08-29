@@ -25,6 +25,8 @@
 │   ├── cloud_client.py          # 云端任务接收（SocketIO + HTTP 双通道）
 │   ├── offline_sync.py          # 离线订单暂存与自动上传
 │   ├── single_instance.py       # 单实例锁（重复启动时置前既有窗口）
+│   ├── paths.py                 # 用户数据目录管理（%APPDATA%）+ 旧版数据迁移
+│   ├── updater.py               # 自更新（检查 / 下载 / MD5 校验 / 静默安装）
 │   ├── stats_server.py          # 内置 HTTP 服务器（收支清算页 + API 代理）
 │   ├── finance/settlement.html  # 收支清算页面
 │   └── theme_manager.py         # 浅色/深色/跟随系统主题
@@ -32,7 +34,6 @@
 │   ├── h_n_print/               # 微信小程序（原生框架）
 │   ├── android_app/             # Android App（Capacitor WebView，无需微信）
 │   └── printer-backend/         # Flask + Flask-SocketIO + SQLite 后端
-└── 放弃的项目（已重启）.7z       # 已废弃的早期版本备份归档，不再维护
 ```
 
 ---
@@ -96,12 +97,30 @@ python main.py
 
 ### 打包发布
 
-两个 PyInstaller `.spec` 文件：
+正式发布走一体化构建脚本（PyInstaller API 调用 + Inno Setup 7 一步完成，规避中文 argv 传参问题）：
+
+```bash
+cd local_print_tool
+python build_installer.py            # 产出 dist/h_n-printer_setup_{版本}.exe
+python build_installer.py --skip-pyinstaller   # dist 已是最新时跳过重打包
+```
+
+发布流程：
+
+1. **版本号两处同步递增**：`gui.py` 的 `APP_VERSION` + `version_info.txt`
+2. **构建**：`python build_installer.py`（依赖 Inno Setup 7 的 ISCC.exe，脚本自动探测安装路径）
+3. **MD5 填入** `installer/update.json`（`version` / `url` / `md5` / `notes`）
+4. **分发到服务器**：安装包与 `update.json` 上传到服务器 `/home/printer-backend/updates/`（nginx 静态直链），用户端启动 4 秒后或「帮助 → 检查更新」自动升级
+5. 自更新链路由 `updater.py` 完成：检查版本 → 下载到 `%TEMP%` → **MD5 校验** → `update.cmd` 静默安装 → 重启新版本
+
+两个 PyInstaller `.spec` 文件仍在（`build_installer.py` 内部以 API 方式调用）：
 
 - `HN打印工具.spec` — Release 打包（无控制台）
 - `HN打印工具_debug.spec` — Debug 打包（带控制台，用于现场排查崩溃）
 
 构建输出在 `local_print_tool/dist/` 与 `local_print_tool/build/`。
+
+**用户数据与程序目录解耦**：所有运行时数据（`print_config.json` / `theme_settings.json` / 收支数据 / 日志 / PDF 缓存等）统一存 `%APPDATA%\HN打印工具\`（`paths.py`，旧版绿色版数据启动时自动迁移），覆盖安装 / 卸载重装不丢配置。注意 `installer/HN打印工具.iss` 的 `Excludes` 必须排除全部用户数据文件，否则会把开发机的服务器地址与打印机 token 打进安装包。
 
 ### 已完成订单自动清理
 
@@ -267,8 +286,8 @@ ssh root@YOUR_SERVER "journalctl -u printer-backend --since '5 minutes ago' --no
 
 | 文件 | 说明 |
 |------|------|
-| `local_print_tool/print_config.json` | 本地工具配置（打印机、价格、任务列表），自动生成，不提交 git |
-| `local_print_tool/theme_settings.json` | 主题设置，自动生成，不提交 git |
+| `%APPDATA%\HN打印工具\print_config.json` | 本地工具配置（打印机、价格、任务列表），运行时自动生成（v4.5 起存用户数据目录，不随程序目录） |
+| `%APPDATA%\HN打印工具\theme_settings.json` | 主题设置，运行时自动生成 |
 | `mobile_apps/printer-backend/config.py` | 后端配置（需手动创建），含 `WECHAT_APPID`/`SECRET_KEY`/`ADMIN_OPENIDS` 等，不提交 git |
 | `mobile_apps/printer-backend/pricing.json` | 定价配置，供小程序 `/api/pricing` 接口读取 |
 | `mobile_apps/h_n_print/utils/config.js` | 小程序 API 地址 `BASE_URL` |
@@ -280,8 +299,8 @@ ssh root@YOUR_SERVER "journalctl -u printer-backend --since '5 minutes ago' --no
 
 ## 调试辅助
 
-- `local_print_tool/crash_traceback.txt` — 记录未捕获异常的完整 traceback，打包后崩溃时优先查看
-- 日志输出到 `local_print_tool/logs/local_tool.log`；「日志管理」可拉取后端日志、收集所有在线设备日志
+- `%APPDATA%\HN打印工具\logs\crash_traceback.txt` — 记录未捕获异常的完整 traceback，打包后崩溃时优先查看
+- 日志输出到 `%APPDATA%\HN打印工具\logs\local_tool.log`；「日志管理」可拉取后端日志、收集所有在线设备日志
 - `HN打印工具_debug.spec` — Debug 打包（带控制台，用于现场排查崩溃）
 
 ---

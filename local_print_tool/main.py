@@ -164,7 +164,11 @@ def main():
     # ── 安装 excepthook：traceback 写文件 + 打印到控制台 ──
     def _debug_excepthook(etype, value, tb):
         import traceback, datetime as _dt
-        crash_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_traceback.txt")
+        # 写入用户数据目录（安装版程序目录不可写）；paths 不可用时回退程序目录
+        try:
+            crash_log = os.path.join(paths.logs_dir(), "crash_traceback.txt")
+        except Exception:
+            crash_log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crash_traceback.txt")
         lines = []
         lines.append(f"\n=== CRASH at {_dt.datetime.now()} ===\n")
         lines.extend(traceback.format_exception(etype, value, tb))
