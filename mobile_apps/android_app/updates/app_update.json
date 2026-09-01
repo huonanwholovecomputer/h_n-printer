@@ -1,8 +1,8 @@
 {
-  "version": "1.1.9",
-  "versionCode": 10,
-  "url": "https://hn-space.cn/updates/hn-cloud-print_v1.1.9.apk",
-  "md5": "1c91310bc24d952e8e305f9195279211",
-  "notes": "v1.1.9：修复剪贴板读取（接入 @capacitor/clipboard 原生插件，游客粘贴许可密钥不再报「无法读取剪贴板」）；修复检查更新（服务器 /updates/ 已加 CORS 头）；安装包改由服务器分发（COS 默认域名禁止分发 APK）。",
+  "version": "1.1.20",
+  "versionCode": 21,
+  "url": "https://hn-space.cn/updates/hn-cloud-print_v1.1.20.apk",
+  "md5": "8db3c2acdd5202089654c35467fbbbe9",
+  "notes": "v1.1.20：修复订单提交后「备注」卡片内容未清空（成功弹窗关闭时与文件列表同步复位，输入框高度/字数计数一并还原）；小程序端同步修复。",
   "force": false
 }

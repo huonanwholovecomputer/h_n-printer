@@ -2973,6 +2973,9 @@ Component({
           selectedFiles: [],
           badgeCount: 0,
           scrollPadHeight: 0,
+          // 订单发起后清空备注（与文件列表同步复位，textarea 高度回到单行）
+          remark: '',
+          remarkBoxHeight: 120,
         })
         this._contentEst = 0
         // 恢复 tab 栏发丝线

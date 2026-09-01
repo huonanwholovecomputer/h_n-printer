@@ -1802,6 +1802,15 @@ function doSubmit(skipPageValidation) {
 // 成功弹窗关闭时清空文件列表（对齐小程序 onCloseModal）
 function clearFilesAfterSuccess() {
   printState.selectedFiles = [];
+  // 订单发起后清空备注（与文件列表同步复位，输入框高度/计数回到初始状态）
+  printState.remark = '';
+  const remarkInput = document.getElementById('remarkInput');
+  const remarkCount = document.getElementById('remarkCount');
+  if (remarkInput) {
+    remarkInput.value = '';
+    remarkInput.style.height = '';
+    if (remarkCount) remarkCount.textContent = '0/100';
+  }
   Object.keys(printState._pollTimers).forEach(k => stopPageCountPoll(Number(k)));
   Object.keys(printState._uploadTimers).forEach(k => stopUploadTimer(Number(k)));
   const scroll = document.getElementById('fileListScroll');
