@@ -368,7 +368,7 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
   white-space: pre-wrap;
   word-break: break-all;
 }
-.file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 78px 96px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
+.file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 78px 72px 96px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
 .file-grid .fn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .file-grid.file-sub-head { font-size: .72rem; font-weight: 600; color: var(--muted); background: var(--card-2); border-top: 1px solid var(--border-strong); padding-top: 5px; padding-bottom: 5px; }
 .file-grid.file-sub-row { color: var(--muted); border-top: 1px dashed var(--border); }
@@ -431,6 +431,7 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .hero-card.c-green::before { background: var(--green); }
 .hero-card.c-blue::before { background: var(--primary); }
 .hero-card.c-orange::before { background: var(--orange); }
+.hero-card.c-purple::before { background: #8b5cf6; }
 .hero-card .top-row { display: flex; align-items: flex-start; justify-content: space-between; }
 .hero-card .ico { font-size: 1.15rem; }
 .hero-card .badge { font-size: .7rem; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
@@ -1674,7 +1675,7 @@ function _reconcileScope(range, ordersNoSrc) {
 /* 趋势峰值标注文案（points 支持 day 的 date 或 month/year 的 label 字段） */
 function _trendPeak(points, metric) {
   var vals = (points || []).map(function (t) {
-    return metric === 'revenue' ? (t.revenue || 0) : metric === 'count' ? (t.count || 0) : metric === 'pages' ? (t.pages || 0) : (t.files || 0);
+    return metric === 'revenue' ? (t.revenue || 0) : metric === 'count' ? (t.count || 0) : metric === 'pages' ? (t.pages || 0) : metric === 'sheets' ? (t.sheets || 0) : (t.files || 0);
   });
   var mx = Math.max.apply(null, vals.concat([0]));
   if (mx <= 0) return '';
@@ -2018,13 +2019,14 @@ function _sliceTrend(points, maxSlices) {
     var s = Math.floor(i * points.length / K);
     var e = Math.floor((i + 1) * points.length / K);
     if (e <= s) e = s + 1;
-    var slice = { count: 0, revenue: 0, pages: 0, files: 0, label: '' };
+    var slice = { count: 0, revenue: 0, pages: 0, files: 0, sheets: 0, label: '' };
     for (var j = s; j < e && j < points.length; j++) {
       var p = points[j];
       slice.count += p.count || 0;
       slice.revenue += p.revenue || 0;
       slice.pages += p.pages || 0;
       slice.files += p.files || 0;
+      slice.sheets += p.sheets || 0;
     }
     var first = points[s], last = points[Math.min(e, points.length) - 1];
     slice.label = _shortDay(first.date) + (e - s > 1 ? '~' + _shortDay(last.date) : '');
@@ -2070,11 +2072,12 @@ function _trendByBucket(orders, granularity) {
     var key = granularity === 'month' ? d.slice(0, 7) : d.slice(0, 4);
     if (!key) return;
     var b = map[key];
-    if (!b) b = map[key] = { key: key, label: key, count: 0, revenue: 0, pages: 0, files: 0 };
+    if (!b) b = map[key] = { key: key, label: key, count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 };
     b.count++;
     b.revenue += o.is_admin_print ? 0 : ((o.revenue || 0) + (o.receivable || 0));   // v5.1 自打不计；v5.17 含待处理（应收未收并入）
     b.pages += o.total_page_count || 0;
     b.files += o.files_count || 0;
+    b.sheets += _orderSheets(o).total;
   });
   return Object.keys(map).sort().map(function (k) { return map[k]; });
 }
@@ -2084,7 +2087,7 @@ function _parseDate(s) { var p = String(s).split('-'); return new Date(+p[0], +p
 function _fillTrendGaps(points, start, end, granularity) {
   var map = {};
   (points || []).forEach(function (p) { map[p.key || _fmtDate(p.date)] = p; });
-  var out = [], zero = { count: 0, revenue: 0, pages: 0, files: 0 };
+  var out = [], zero = { count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 };
   if (granularity === 'day') {
     var cur = _parseDate(start), last = _parseDate(end);
     while (cur <= last) {
@@ -2117,7 +2120,8 @@ var _TREND_COLORS = {
   revenue: { main: '#16a34a', label: '收益 (元)' },
   count:   { main: '#4f6ef7', label: '订单数' },
   pages:   { main: '#8b5cf6', label: '页数' },
-  files:   { main: '#14b8a6', label: '文件数' }
+  files:   { main: '#14b8a6', label: '文件数' },
+  sheets:  { main: '#f97316', label: '纸张(张)' }
 };
 function _hexToRgba(hex, alpha) {
   var h = String(hex).replace('#', '');
@@ -2193,9 +2197,28 @@ function _orderMoney(o, excludeSelf) {
   m.record = m.paid + m.receivable;   // 云端收益记录 = 已入账 + 应收未收（合并口径）
   return m;
 }
+/* 纸张张数统计（v6.2）：单面每页用 1 张纸，双面每张纸印 2 页（奇数页最后一张仍占 1 张纸）；
+   × 份数。与后端 calculate_price 的纸张模型一致（双面 0.3 元/张，每张两页；奇数页最后一张按单面价但同样占一张纸）。
+   页码范围按完整 page_count 折算（与「总页数」total_page_count 口径一致）。 */
+function _fileSheets(f) {
+  var pg = f.page_count || 0;
+  if (pg <= 0) return 0;
+  var per = (f.duplex === 'off') ? 1 : 2;   // 缺省按双面（与后端 order_files.duplex 默认 'on' 一致）
+  return Math.ceil(pg / per) * (f.copies || 1);
+}
+function _orderSheets(o) {
+  var s = { total: 0, single: 0, duplex: 0 };
+  (o.files || []).forEach(function (f) {
+    var sh = _fileSheets(f);
+    s.total += sh;
+    if ((f.duplex || 'on') === 'on') s.duplex += sh; else s.single += sh;
+  });
+  return s;
+}
 function _cloudAgg(orders) {
   var a = { paid: 0, receivable: 0, record: 0, free: 0, pendingFiles: 0, recordOrders: 0,
-            allFiles: 0, pages: 0, autoPrint: 0, scheduled: 0, delivery: 0, urgency: 0, cover: 0,
+            allFiles: 0, pages: 0, sheets: 0, singleSheets: 0, duplexSheets: 0,
+            autoPrint: 0, scheduled: 0, delivery: 0, urgency: 0, cover: 0,
             selfOrders: 0, orders: orders.length };
   orders.forEach(function (o) {
     var m = _orderMoney(o, true);   // v5.1：自打订单金额不计入收益
@@ -2203,6 +2226,8 @@ function _cloudAgg(orders) {
     if (m.record > 0) a.recordOrders++;
     a.allFiles += (o.files || []).length;
     a.pages += o.total_page_count || 0;
+    var sh = _orderSheets(o);
+    a.sheets += sh.total; a.singleSheets += sh.single; a.duplexSheets += sh.duplex;
     if (o.is_admin_print) a.selfOrders++;
     if (o.auto_print) a.autoPrint++;
     if (o.schedule_mode && o.schedule_mode !== 'now') a.scheduled++;
@@ -2481,7 +2506,7 @@ function _renderOrderListHTML() {
         if (o.remark) {
           h += '<div class="order-remark" title="订单备注">📝 备注：' + esc(o.remark) + '</div>';
         }
-        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>单/双面</span><span>状态</span></div>';
+        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>单/双面</span><span>张数</span><span>状态</span></div>';
         o.files.forEach(function (f) {
           h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + (f.reject_reason ? ' · ' + esc(f.reject_reason) : '') + '">';
           h += '<span class="fn">📄 ' + esc(f.file_name) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
@@ -2489,6 +2514,7 @@ function _renderOrderListHTML() {
           h += '<span>' + f.copies + '份</span>';
           h += '<span>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</span>';
           h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
+          h += '<span>' + _fileSheets(f) + '张</span>';
           h += '<span><span class="tag ' + esc(statusClass(f.status)) + '">' + esc(statusLabel(f.status)) + '</span></span>';
           h += '</div>';
         });
@@ -2937,7 +2963,7 @@ function _renderDailyTrend(canvasId, trend, metric) {
   var lineData = trend.map(function (t) {
     return metric === 'revenue' ? Math.round((t.revenue || 0) * 100) / 100
          : metric === 'count' ? (t.count || 0)
-         : metric === 'pages' ? (t.pages || 0) : (t.files || 0);
+         : metric === 'pages' ? (t.pages || 0) : metric === 'sheets' ? (t.sheets || 0) : (t.files || 0);
   });
   var radii = lineData.map(function () { return 0; });          // 平时不显示数据点
   var hoverRadii = lineData.map(function () { return 5; });     // 悬停选中点
@@ -2974,7 +3000,7 @@ function _renderBucketTrend(canvasId, points, metric, granularity) {
   var lineData = points.map(function (p) {
     return metric === 'revenue' ? Math.round((p.revenue || 0) * 100) / 100
          : metric === 'count' ? (p.count || 0)
-         : metric === 'pages' ? (p.pages || 0) : (p.files || 0);
+         : metric === 'pages' ? (p.pages || 0) : metric === 'sheets' ? (p.sheets || 0) : (p.files || 0);
   });
   /* 柱体统一不透明实色 */
   var barColors = lineData.map(function () { return mainColor; });
@@ -3005,11 +3031,12 @@ function _computeDailyTrend(orders) {
   var map = {};
   orders.forEach(function (o) {
     var day = _fmtDate(o.created_at);
-    if (!map[day]) map[day] = { date: day, count: 0, revenue: 0, pages: 0, files: 0 };
+    if (!map[day]) map[day] = { date: day, count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 };
     map[day].count++;
     map[day].revenue += o.is_admin_print ? 0 : ((o.revenue || 0) + (o.receivable || 0));   // v5.1 自打不计；v5.17 含待处理（应收未收并入）
     map[day].pages += o.total_page_count || 0;
     map[day].files += o.files_count || 0;
+    map[day].sheets += _orderSheets(o).total;
   });
   return Object.keys(map).sort().map(function (d) { return map[d]; });
 }
@@ -3456,12 +3483,16 @@ function _renderCloudShared() {
   h += '<div class="num">' + fmtInt(fagg.pages || 0) + '</div>';
   h += '<div class="lbl">总页数</div>';
   h += '<div class="sub">' + fmtInt(fagg.allFiles) + ' 个文件 · ' + fmtInt(fagg.orders) + ' 单</div></div>';
+  h += '<div class="hero-card c-purple"><div class="top-row"><span class="ico">🖨</span></div>';
+  h += '<div class="num">' + fmtInt(fagg.sheets || 0) + '</div>';
+  h += '<div class="lbl">纸张张数</div>';
+  h += '<div class="sub">' + fmtInt(fagg.singleSheets || 0) + ' 张单面 · ' + fmtInt(fagg.duplexSheets || 0) + ' 张双面</div></div>';
   h += '</div>';
 
   /* ---- 趋势分析（v6.0：与全页同一口径，不再独立拉数；指标切换为模块内局部控件） ---- */
   h += '<div class="section chart-full" id="cloud-trend"><h2 style="font-size:1.3rem;font-weight:800;color:var(--text)">📈 趋势分析 <span class="hint">' + _trendHintText() + '</span></h2>';
   h += '<div class="trend-toolbar"><span class="trend-metrics">';
-  var trendMetricBtns = [['revenue', '💰收益'], ['count', '📦订单'], ['pages', '📄页数'], ['files', '🗂文件']];
+  var trendMetricBtns = [['revenue', '💰收益'], ['count', '📦订单'], ['pages', '📄页数'], ['files', '🗂文件'], ['sheets', '🖨纸张']];
   trendMetricBtns.forEach(function (b) {
     var on2 = _cloudTrendMetric === b[0];
     h += '<button data-metric="' + b[0] + '" class="' + (on2 ? 'on' : '') + '" style="' + (on2 ? 'color:' + _TREND_COLORS[b[0]].main + ';font-weight:700' : '') + '" onclick="onCloudTrendMetric(\'' + b[0] + '\')">' + b[1] + '</button>';
@@ -3496,9 +3527,12 @@ function _renderCloudShared() {
     if (o.delivery_enabled) svcRev['派送'] += Math.round(m.record * ((o.delivery_percentage || 0) / 100));
     if (o.cover_page) svcRev['封面'] += parseCents(o.cover_page_price || 0);
   });
-  var fileDuplex = { 单面: 0, 双面: 0 };
+  var fileDuplex = { 单面: 0, 双面: 0 };   // v6.2：按实际纸张张数统计（此前误按文件数计数，标签却显示「张」）
   filteredOrders.forEach(function (o) {
-    (o.files || []).forEach(function (f) { if (f.duplex === 'off') fileDuplex['单面']++; else fileDuplex['双面']++; });
+    (o.files || []).forEach(function (f) {
+      var sh = _fileSheets(f);
+      if (f.duplex === 'off') fileDuplex['单面'] += sh; else fileDuplex['双面'] += sh;
+    });
   });
   // 接单设备比例（2026-12 多设备接单）：按订单数统计，悬停看收益
   var deviceAgg = {};   // received_label → {orders, revenue}
@@ -3510,7 +3544,7 @@ function _renderCloudShared() {
   });
   h += '<div id="cloud-view-ops" class="chart-grid"' + (_cloudChartView !== 'ops' ? ' style="display:none"' : '') + '>';
   h += '<div class="section"><h2>⚡ 附加服务构成 <span class="hint">（含该服务的订单数 · 悬停看收益贡献）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-svc"></canvas></div></div>';
-  h += '<div class="section"><h2>🖨 单双面构成 <span class="hint">（按文件数）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-duplex"></canvas></div></div>';
+  h += '<div class="section"><h2>🖨 单双面构成 <span class="hint">（按纸张张数）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-duplex"></canvas></div></div>';
   h += '<div class="section"><h2>🖨️ 接单设备比例 <span class="hint">（按订单数 · 悬停看收益）</span></h2><div class="chart-wrap"><canvas id="cloud-chart-device"></canvas></div></div>';
   h += '</div>';
 
@@ -3575,7 +3609,7 @@ function _renderCloudShared() {
 
   h += '<div style="font-size:.76rem;color:var(--muted);display:flex;justify-content:space-between;flex-wrap:wrap">';
   h += '<span>查询周期: ' + range.start + ' ~ ' + range.end + '</span>';
-  h += '<span>共 ' + filteredOrders.length + ' 笔订单（自打 ' + (fagg.selfOrders || 0) + ' 笔不计收益）· ' + (fagg.pages || 0) + ' 页 · 云端收益记录 ' + RMB(fagg.record) + '</span>';
+  h += '<span>共 ' + filteredOrders.length + ' 笔订单（自打 ' + (fagg.selfOrders || 0) + ' 笔不计收益）· ' + (fagg.pages || 0) + ' 页 · ' + (fagg.sheets || 0) + ' 张纸 · 云端收益记录 ' + RMB(fagg.record) + '</span>';
   h += '</div>';
 
   el.innerHTML = _lz(h);
@@ -4203,7 +4237,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v5.25</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v6.2</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -4234,6 +4268,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.23：设备删除 + 图表与价格修正 —— ① 授权页云端设备列表新增「🗑 删除」按钮（清理软件升级产生的同机旧 ID 与历史遗留设备；删除当前接单设备时自动清空接管记录）；② 饼状图引线标签防重叠：过小扇区跳过标注、同侧标签碰撞检测自动错开/隐藏、引线水平段只画到文字近边前 2px（不再压字）；③ 打印价格：本地模式首页费默认值统一为 0.10（与云端 pricing.json 一致）。</p>' +
     '<p style="margin-top:10px">v5.24：多设备接单 + 时间到秒 —— ① 「启用接单」重构为可接单设备列表（多台设备可同时启用），订单记录实际接单设备；订单明细新增「接单设备」列（{所有者}的设备 | {设备}，历史订单归属姚懿祥的设备）；② 运营视角新增「接单设备比例」饼图（按订单数，悬停看收益）；③ 订单明细「时间」「开始打印」精确到秒；④ 口径栏滚动收起：滚动到订单明细附近时口径栏平滑上滑淡出、向上滚动自动滑回；⑤ 订单明细新增「开始打印」列（悬停展示下单→开始打印的等待时长）。</p>' +
     '<p style="margin-top:10px">v5.25：界面细节优化 —— ① 口径栏改为普通固定卡片：移除吸顶悬浮与滚动收起动画，不再遮挡订单明细；② 刷新记住所在标签页：F5 刷新后停留在原 tab（新开会话仍从收支清算开始）；③ 消除刷新时「收支清算」选中态闪烁：tab 恢复提前到首帧绘制前同步完成。</p>' +
+    '<p style="margin-top:10px">v6.2：纸张张数统计 —— ① Hero KPI 新增「纸张张数」卡（单面每页 1 张、双面每张 2 页，奇数页最后一张仍占 1 张，含份数），副行显示单面/双面张数拆分；② 趋势分析新增「纸张」第五指标（≤60 天自动渲染为逐日柱状图，>60 天为切片折线；专属橙色，峰值/提示同步）；③ 修复「单双面构成」饼图此前按文件数计数却标注「张」的模糊统计，改为按实际纸张张数；④ 订单明细文件级新增「张数」列（含份数的实际用纸量）；⑤ 汇总行补充「· X 张纸」。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
