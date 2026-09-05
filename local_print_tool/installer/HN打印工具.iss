@@ -17,6 +17,13 @@ AppId={{6F2C8A91-4D7E-4B2A-9E3C-1F0D5B8A7C66}
 AppName=HN打印工具
 AppVersion={#MyAppVersion}
 AppPublisher=HN-Print
+; 版本元数据：AppVersion 只影响"产品版本"；"文件版本"须用 VersionInfoVersion 显式设置，
+; 否则安装包属性里"文件版本"会显示 0.0.0.0（此前版本一直如此，2026-09 修正）。
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoCopyright=Copyright (C) HN-Print
+VersionInfoCompany=HN-Print
+VersionInfoProductName=HN打印工具
+VersionInfoProductVersion={#MyAppVersion}
 DefaultDirName={autopf}\h_n printer
 DefaultGroupName=HN打印工具
 UninstallDisplayIcon={app}\HN打印工具.exe
