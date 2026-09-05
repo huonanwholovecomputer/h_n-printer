@@ -16,7 +16,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 排除与打印无关的大型数据科学/ML 依赖（2026-09 体积排查）：
+    # 根因：pymupdf.table → pandas → networkx/scipy → torch 级联，加上 numpy/llvmlite 等，把安装包从 110MB 撑到 231MB。
+    # 已核实安全：应用自身与保留依赖(PySide6/PyMuPDF/PyPDF2/reportlab/python-docx/requests)均不 import numpy；
+    #   pymupdf 仅在 to_pandas() 内惰性用 pandas（本工具不做表格提取）；engineio/socketio 对 aiohttp 为 try 保护导入（同步客户端走 requests）。
+    excludes=['torch', 'tensorflow', 'jax', 'onnx', 'onnxruntime',
+              'scipy', 'pandas', 'numpy',
+              'networkx', 'numba', 'llvmlite',
+              'matplotlib', 'sympy', 'mpmath', 'ml_dtypes', 'contourpy',
+              'aiohttp', 'yarl', 'multidict', 'frozenlist', 'aiosignal', 'propcache',
+              'pydantic', 'pydantic_core', 'openpyxl', 'fsspec', 'tqdm'],
     noarchive=False,
     optimize=0,
 )
