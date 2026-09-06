@@ -17,6 +17,53 @@ function _initThemeMode() {
   return wx.getStorageSync('themeMode') || 'auto'
 }
 
+/* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
+   口径对齐后端 _count_pages_in_range（含中文逗号、智能拆分 '23-4'）。 */
+function _countRangePages(rangeStr, total) {
+  if (!rangeStr || !String(rangeStr).trim()) return total
+  const pages = new Set()
+  String(rangeStr).replace(/[、，；\s]/g, ',').split(',').forEach(part => {
+    part = (part || '').trim()
+    if (!part) return
+    if (part.indexOf('-') >= 0) {
+      const sp = part.split('-')
+      const a = parseInt(sp[0], 10), b = parseInt(sp[1], 10)
+      if (!isNaN(a) && !isNaN(b)) {
+        if (a < b) {
+          for (let p = a; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
+        } else if (a > b && String(a).length > 1) {
+          const prefix = parseInt(String(a).slice(0, -1), 10)
+          const last = parseInt(String(a).slice(-1), 10)
+          if (prefix < b) {
+            for (let p = last; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
+            if (prefix >= 1 && prefix <= total) pages.add(prefix)
+          }
+        }
+      }
+    } else {
+      const p = parseInt(part, 10)
+      if (!isNaN(p) && p >= 1 && p <= total) pages.add(p)
+    }
+  })
+  return pages.size || total
+}
+
+/* 文件张数/有效页数预处理（后端已返回 effective_pages/sheets/total_sheets 时直接复用；
+   字段缺失（旧后端）时前端兜底计算）：
+   - effectivePages: 每份有效打印页数（范围过滤后）
+   - totalSheets:    文件合计张数（含份数；单面每页 1 张、双面每 2 页 1 张，奇数页最后一张仍占 1 张）
+   - pagesLine:      展示用「份 × 页」文本（页数取所选范围有效页数） */
+function _enrichFileStat(f) {
+  const pc = Number(f.page_count) || 0
+  const copies = Number(f.copies) || 1
+  const eff = typeof f.effective_pages === 'number' ? f.effective_pages : _countRangePages(f.page_range, pc)
+  const perSheets = typeof f.sheets === 'number' ? f.sheets : (f.duplex === 'off' ? eff : Math.ceil(eff / 2))
+  f.effectivePages = eff
+  f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies)
+  f.pagesLine = copies + ' 份 × ' + eff + ' 页'
+  return f
+}
+
 Component({
   data: {
     nickname: '',
@@ -1310,7 +1357,9 @@ Component({
               const unitPrice = (typeof f.per_copy_price === 'number') ? f.per_copy_price : 0
               const fileTotal = (typeof f.total_price === 'number') ? f.total_price : 0
               text += '\n文件' + (i + 1) + ': ' + f.file_name
-              text += ' | ' + f.copies + '份 × ' + f.page_count + '页'
+              const _eff = typeof f.effective_pages === 'number' ? f.effective_pages : f.page_count
+              const _sh = typeof f.total_sheets === 'number' ? f.total_sheets : 0
+              text += ' | ' + f.copies + '份 × ' + _eff + '页' + (f.page_range ? '（选' + f.page_range + '）' : '') + ' | ' + _sh + '张'
               text += ' | 单价: ¥' + unitPrice.toFixed(2)
               text += ' | 小计: ¥' + fileTotal.toFixed(2)
             })
@@ -2105,8 +2154,16 @@ Component({
                   f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
                   const name = (f.original_name || f.file_name || '').toLowerCase()
                   f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx')
+                  _enrichFileStat(f)
                 })
                 order.isExcel = order.files.length > 0 && order.files.every(f => f.isExcel)
+                // 合计张数（后端 total_sheets 优先，缺失时按文件张数求和兜底）
+                const totalSheets = typeof order.total_sheets === 'number'
+                  ? order.total_sheets
+                  : order.files.reduce((s, f) => s + (f.totalSheets || 0), 0)
+                order.totalSheetsDisplay = String(totalSheets)
+              } else {
+                order.totalSheetsDisplay = '0'
               }
             })
 

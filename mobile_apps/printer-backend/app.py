@@ -3212,6 +3212,23 @@ def _count_pages_in_range(page_range: str, total_pages: int) -> int:
     return len(pages) if pages else total_pages
 
 
+def _file_range_stats(page_count, copies, duplex, page_range=""):
+    """文件页数/纸张统计（口径与 calculate_price 一致，张数模型对齐本地工具 _fileSheets）：
+    - effective_pages: 每份有效打印页数（页码范围过滤后，空范围 = 整份）
+    - sheets:          每份纸张张数（单面每页 1 张；双面每 2 页 1 张，奇数页最后一张仍占 1 张）
+    - total_pages:     文件合计页数 = 有效页数 × 份数
+    - total_sheets:    文件合计张数 = 每份张数 × 份数
+    """
+    eff = _count_pages_in_range(page_range or "", page_count)
+    sheets = math.ceil(eff / 2) if duplex == "on" else eff
+    return {
+        "effective_pages": eff,
+        "sheets": sheets,
+        "total_pages": eff * copies,
+        "total_sheets": sheets * copies,
+    }
+
+
 def _validate_page_ranges_for_file(file_id: str, page_count: int):
     """检查使用指定文件的所有活跃子任务，若页码范围超出总页数则自动打回。"""
     conn = get_db()
@@ -5057,8 +5074,20 @@ def get_orders():
 
         if of_rows:
             files = [dict(r) for r in of_rows]
-            total_copies = sum(f["copies"] for f in files)
-            total_pages = sum(f["page_count"] * f["copies"] for f in files)
+            total_copies = 0
+            total_pages = 0
+            total_sheets = 0
+            for f in files:
+                # 有效页数/张数按页码范围折算（v1.1.21：指定页面选择时合计页数取所选页，不再用整份页数）
+                st = _file_range_stats(f["page_count"] or 0, f["copies"] or 1,
+                                       f["duplex"] or "on", f["page_range"] or "")
+                f["effective_pages"] = st["effective_pages"]   # 每份有效打印页数（范围过滤后）
+                f["sheets"] = st["sheets"]                     # 每份纸张张数
+                f["total_pages"] = st["total_pages"]           # 文件合计页数（有效页数 × 份数）
+                f["total_sheets"] = st["total_sheets"]         # 文件合计张数（每份张数 × 份数）
+                total_copies += f["copies"] or 1
+                total_pages += st["total_pages"]
+                total_sheets += st["total_sheets"]
             # 文件名摘要
             names = [f["file_name"] for f in files]
             if len(names) == 1:
@@ -5068,27 +5097,36 @@ def get_orders():
             # 用聚合状态覆盖父订单的旧状态
             order["status"] = aggregate_order_status(conn, oid) or order["status"]
         else:
-            # 旧数据降级：没有 order_files → 用 orders 自身字段构造
+            # 旧数据降级：没有 order_files → 用 orders 自身字段构造（无 page_range，按整份口径）
+            legacy_copies = order.get("copies", 1) or 1
+            legacy_st = _file_range_stats(order.get("page_count", 1) or 0, legacy_copies,
+                                          order.get("duplex", "on"), "")
             order_file = {
                 "file_id": order.get("file_id"),
                 "file_name": order.get("file", "未知文件"),
-                "copies": order.get("copies", 1),
+                "copies": legacy_copies,
                 "page_count": order.get("page_count", 1),
                 "page_range": "",
                 "total_price": order.get("total_price", 0),
                 "is_free": order.get("is_free", 0),
                 "status": order["status"],
                 "duplex": order.get("duplex", "on"),
+                "effective_pages": legacy_st["effective_pages"],
+                "sheets": legacy_st["sheets"],
+                "total_pages": legacy_st["total_pages"],
+                "total_sheets": legacy_st["total_sheets"],
             }
             files = [order_file]
-            total_copies = order.get("copies", 1)
-            total_pages = order.get("page_count", 1) * total_copies
+            total_copies = legacy_copies
+            total_pages = legacy_st["total_pages"]
+            total_sheets = legacy_st["total_sheets"]
             names = [order["file"]]
             file_summary = order["file"]
 
         order["files"] = files
         order["total_copies"] = total_copies
         order["total_pages"] = total_pages
+        order["total_sheets"] = total_sheets
         order["file_summary"] = file_summary
         # 向前端保持一致：旧字段仍保留（兼容性），但语义标注为聚合值
         order["file"] = file_summary
@@ -5194,11 +5232,24 @@ def get_order_detail(order_id):
 
             files.append(f)
 
-        total_copies = sum(f["copies"] for f in files)
-        total_pages = sum(f["page_count"] * f["copies"] for f in files)
+        total_copies = 0
+        total_pages = 0
+        total_sheets = 0
+        for f in files:
+            # 有效页数/张数按页码范围折算（合计页数取所选页，不再用整份页数）
+            st = _file_range_stats(f["page_count"] or 0, f["copies"] or 1,
+                                   f["duplex"] or "on", f["page_range"] or "")
+            f["effective_pages"] = st["effective_pages"]
+            f["sheets"] = st["sheets"]
+            f["total_pages"] = st["total_pages"]
+            f["total_sheets"] = st["total_sheets"]
+            total_copies += f["copies"] or 1
+            total_pages += st["total_pages"]
+            total_sheets += st["total_sheets"]
         order["files"] = files
         order["total_copies"] = total_copies
         order["total_pages"] = total_pages
+        order["total_sheets"] = total_sheets
         # 用聚合状态
         order["status"] = aggregate_order_status(conn, order_id) or order["status"]
     else:
@@ -5211,12 +5262,15 @@ def get_order_detail(order_id):
         file_type = "未知"
         ext = os.path.splitext(original_name or order["file"])[1]
         file_type = ext.lstrip(".").upper() if ext else "未知"
+        legacy_copies = order.get("copies", 1) or 1
+        legacy_st = _file_range_stats(order.get("page_count", 1) or 0, legacy_copies,
+                                      order.get("duplex", "on"), "")
         order["files"] = [{
             "id": None,
             "file_id": order.get("file_id"),
             "file_name": order.get("file", "未知文件"),
             "original_name": original_name,
-            "copies": order.get("copies", 1),
+            "copies": legacy_copies,
             "page_count": order.get("page_count", 1),
             "total_price": order.get("total_price", 0),
             "is_free": order.get("is_free", 0),
@@ -5225,9 +5279,14 @@ def get_order_detail(order_id):
             "size": frow["size"] if frow else 0,
             "file_type": file_type,
             "duplex": order.get("duplex", "on"),
+            "effective_pages": legacy_st["effective_pages"],
+            "sheets": legacy_st["sheets"],
+            "total_pages": legacy_st["total_pages"],
+            "total_sheets": legacy_st["total_sheets"],
         }]
-        order["total_copies"] = order.get("copies", 1)
-        order["total_pages"] = order.get("page_count", 1) * order.get("copies", 1)
+        order["total_copies"] = legacy_copies
+        order["total_pages"] = legacy_st["total_pages"]
+        order["total_sheets"] = legacy_st["total_sheets"]
 
     # 关联临时许可密钥（每个订单消费的密钥）
     user_conn = get_user_db()
@@ -5277,6 +5336,13 @@ def get_order_price(order_id):
         # 附上单价明细（用于前端展示）
         per_copy_price = calculate_price(f["page_count"], f.get("duplex", "on"), f.get("page_range", ""))
         f["per_copy_price"] = per_copy_price
+        # 附上有效页数/张数（供结算文案等展示，含页码范围折算）
+        st = _file_range_stats(f["page_count"] or 0, f["copies"] or 1,
+                               f.get("duplex", "on"), f.get("page_range", "") or "")
+        f["effective_pages"] = st["effective_pages"]
+        f["sheets"] = st["sheets"]
+        f["total_pages"] = st["total_pages"]
+        f["total_sheets"] = st["total_sheets"]
         f["unit"] = "元/张" if f.get("duplex") == "on" else "元/页"
         files.append(f)
 

@@ -3,6 +3,52 @@
 const { CONFIG } = require('../../utils/config')
 const { request } = require('../../utils/request')
 
+/* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
+   口径对齐后端 _count_pages_in_range（含中文逗号、智能拆分 '23-4'）。 */
+function _countRangePages(rangeStr, total) {
+  if (!rangeStr || !String(rangeStr).trim()) return total
+  const pages = new Set()
+  String(rangeStr).replace(/[、，；\s]/g, ',').split(',').forEach(part => {
+    part = (part || '').trim()
+    if (!part) return
+    if (part.indexOf('-') >= 0) {
+      const sp = part.split('-')
+      const a = parseInt(sp[0], 10), b = parseInt(sp[1], 10)
+      if (!isNaN(a) && !isNaN(b)) {
+        if (a < b) {
+          for (let p = a; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
+        } else if (a > b && String(a).length > 1) {
+          const prefix = parseInt(String(a).slice(0, -1), 10)
+          const last = parseInt(String(a).slice(-1), 10)
+          if (prefix < b) {
+            for (let p = last; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
+            if (prefix >= 1 && prefix <= total) pages.add(prefix)
+          }
+        }
+      }
+    } else {
+      const p = parseInt(part, 10)
+      if (!isNaN(p) && p >= 1 && p <= total) pages.add(p)
+    }
+  })
+  return pages.size || total
+}
+
+/* 文件张数/有效页数预处理（后端已返回时直接复用，缺失时前端兜底计算）：
+   - effectivePages: 每份有效打印页数（范围过滤后）
+   - totalSheets:    文件合计张数（含份数；单面每页 1 张、双面每 2 页 1 张，奇数页最后一张仍占 1 张）
+   - pagesLine:      展示用「份 × 页」文本（页数取所选范围有效页数） */
+function _enrichFileStat(f) {
+  const pc = Number(f.page_count) || 0
+  const copies = Number(f.copies) || 1
+  const eff = typeof f.effective_pages === 'number' ? f.effective_pages : _countRangePages(f.page_range, pc)
+  const perSheets = typeof f.sheets === 'number' ? f.sheets : (f.duplex === 'off' ? eff : Math.ceil(eff / 2))
+  f.effectivePages = eff
+  f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies)
+  f.pagesLine = copies + ' 份 × ' + eff + ' 页'
+  return f
+}
+
 Component({
   properties: {
     openid:    { type: String, value: '' },
@@ -290,8 +336,15 @@ Component({
                   f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
                   const name = (f.original_name || f.file_name || '').toLowerCase()
                   f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx')
+                  _enrichFileStat(f)
                 })
                 order.isExcel = order.files.length > 0 && order.files.every(f => f.isExcel)
+                const totalSheets = typeof order.total_sheets === 'number'
+                  ? order.total_sheets
+                  : order.files.reduce((s, f) => s + (f.totalSheets || 0), 0)
+                order.totalSheetsDisplay = String(totalSheets)
+              } else {
+                order.totalSheetsDisplay = '0'
               }
             })
 

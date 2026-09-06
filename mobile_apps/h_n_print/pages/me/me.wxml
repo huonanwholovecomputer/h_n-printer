@@ -444,10 +444,12 @@
           <view wx:if="{{item.isExcel}}" class="order-card-meta">
             <text class="order-card-stat">📄 不适用</text>
             <text class="order-card-stat">📋 不适用</text>
+            <text class="order-card-stat">🖨 不适用</text>
           </view>
           <view wx:else class="order-card-meta">
             <text class="order-card-stat">📄 {{item.total_pages || (item.page_count * item.copies)}} 页</text>
             <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份</text>
+            <text class="order-card-stat">🖨 {{item.totalSheetsDisplay}} 张</text>
           </view>
           <view class="order-card-footer">
             <text class="order-created">{{item.created_at}}</text>
@@ -482,6 +484,10 @@
               <text class="detail-label">合计份数</text>
               <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_copies || item.copies) + ' 份'}}</text>
             </view>
+            <view class="detail-row">
+              <text class="detail-label">合计张数</text>
+              <text class="detail-value">{{item.isExcel ? '不适用' : item.totalSheetsDisplay + ' 张'}}</text>
+            </view>
           </view>
 
           <!-- 临时许可密钥（订单消费的密钥） -->
@@ -513,7 +519,7 @@
                 </view>
               </view>
               <view class="detail-file-right">
-                <text class="detail-file-copies">{{f.copies}} 份 × {{f.page_count}} 页</text>
+                <text class="detail-file-copies">{{f.pagesLine}} | {{f.totalSheets}} 张</text>
                 <text class="detail-file-range">{{f.duplex === 'on' ? '双面' : '单面'}}</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
                 <text wx:if="{{(f.status === 'rejected' || f.status === 'failed') && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>

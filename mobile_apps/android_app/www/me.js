@@ -716,8 +716,23 @@ function normalizeOrder(o) {
       f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : '';
       const name = (f.original_name || f.file_name || '').toLowerCase();
       f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx');
+      // 有效页数/张数（后端字段优先，缺失时前端兜底）：
+      // 有效页 = 页码范围过滤后页数；张数 = 单面每页 1 张、双面每 2 页 1 张（奇数页最后一张仍占 1 张）
+      const pc = Number(f.page_count) || 0;
+      const copies = Number(f.copies) || 1;
+      const eff = typeof f.effective_pages === 'number' ? f.effective_pages : countPagesInRange(f.page_range, pc);
+      const perSheets = typeof f.sheets === 'number' ? f.sheets : (f.duplex === 'off' ? eff : Math.ceil(eff / 2));
+      f.effectivePages = eff;
+      f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies);
+      f.pagesLine = copies + ' 份 × ' + eff + ' 页';
     });
     o.isExcel = o.files.length > 0 && o.files.every(f => f.isExcel);
+    const totalSheets = typeof o.total_sheets === 'number'
+      ? o.total_sheets
+      : o.files.reduce((s, f) => s + (f.totalSheets || 0), 0);
+    o.totalSheetsDisplay = String(totalSheets);
+  } else {
+    o.totalSheetsDisplay = '0';
   }
   return o;
 }
@@ -789,7 +804,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
           </view>
         </view>
         <view class="detail-file-right">
-          <text class="detail-file-copies">${f.copies} 份 × ${f.page_count} 页</text>
+          <text class="detail-file-copies">${f.pagesLine} | ${f.totalSheets} 张</text>
           <text class="detail-file-range">${f.duplex === 'on' ? '双面' : '单面'}</text>
           ${f.page_range ? `<text class="detail-file-range">范围: ${esc(f.page_range)}</text>` : ''}
           ${(f.status === 'rejected' || f.status === 'failed') && f.reject_reason ? `<text class="file-reject-reason">${esc(f.reject_reason)}</text>` : ''}
@@ -836,6 +851,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
         <view class="detail-row"><text class="detail-label">开始打印</text><text class="detail-value">${o.print_started_at ? esc(o.print_started_at) : '—'}</text></view>
         <view class="detail-row"><text class="detail-label">合计页数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_pages || (o.page_count * o.copies)) + ' 页')}</text></view>
         <view class="detail-row"><text class="detail-label">合计份数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_copies || o.copies) + ' 份')}</text></view>
+        <view class="detail-row"><text class="detail-label">合计张数</text><text class="detail-value">${o.isExcel ? '不适用' : (o.totalSheetsDisplay + ' 张')}</text></view>
       </view>
       ${licenseRows}
       ${(o.files && o.files.length) ? `<view class="detail-section"><view class="detail-section-title">文件列表 (${o.files.length})</view>${fileRows}</view>` : ''}
@@ -863,6 +879,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
         <view class="order-card-meta">
           <text class="order-card-stat">📄 ${o.isExcel ? '不适用' : ((o.total_pages || (o.page_count * o.copies)) + ' 页')}</text>
           <text class="order-card-stat">📋 ${o.isExcel ? '不适用' : ((o.total_copies || o.copies) + ' 份')}</text>
+          <text class="order-card-stat">🖨 ${o.isExcel ? '不适用' : (o.totalSheetsDisplay + ' 张')}</text>
         </view>
         <view class="order-card-footer">
           <text class="order-created">${esc(o.created_at || '')}</text>
@@ -1541,7 +1558,9 @@ function settleOrder(orderId, nickname) {
         const unitPrice = typeof f.per_copy_price === 'number' ? f.per_copy_price : 0;
         const fileTotal = typeof f.total_price === 'number' ? f.total_price : 0;
         text += '\n文件' + (i + 1) + ': ' + (f.file_name || '');
-        text += ' | ' + f.copies + '份 × ' + f.page_count + '页';
+        const _eff = typeof f.effective_pages === 'number' ? f.effective_pages : f.page_count;
+        const _sh = typeof f.total_sheets === 'number' ? f.total_sheets : 0;
+        text += ' | ' + f.copies + '份 × ' + _eff + '页' + (f.page_range ? '（选' + f.page_range + '）' : '') + ' | ' + _sh + '张';
         text += ' | 单价: ¥' + unitPrice.toFixed(2);
         text += ' | 小计: ¥' + fileTotal.toFixed(2);
       });
