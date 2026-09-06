@@ -136,9 +136,9 @@ python build_installer.py --skip-pyinstaller   # dist 已是最新时跳过重�
 
 微信小程序 / Android App 提交打印任务 → Flask 后端存储分发 → Windows 本地工具自动打印。
 
-| 小程序 · 打印界面 | 小程序 · 我的 |
+| 小程序 / APP · 打印界面 | 小程序 / APP · 我的 |
 |---|---|
-| ![小程序打印界面](docs/screenshots/mini-program-print.jpg) | ![小程序我的](docs/screenshots/mini-program-me.jpg) |
+| ![小程序/APP 打印界面](docs/screenshots/mini-program-print.jpg) | ![小程序/APP 我的](docs/screenshots/mini-program-me.jpg) |
 
 ```
 mobile_apps/
