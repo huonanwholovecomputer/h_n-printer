@@ -1,6 +1,6 @@
 {
-  "version": "4.5.12",
-  "url": "https://hn-space.cn/updates/h_n-printer_setup_4.5.12.exe",
-  "md5": "680f50f3f2db268126e8ad8f09e66828",
-  "notes": "v4.5.12：修复安装包 setup 壳属性里的文件版本显示 0.0.0.0（补齐 VersionInfoVersion 元数据，现显示 4.5.12.0）；功能无变化，仍含收支清算纸张张数统计与安装包瘦身。"
+  "version": "4.5.13",
+  "url": "https://hn-space.cn/updates/h_n-printer_setup_4.5.13.exe",
+  "md5": "f17f8ce32ce16fad3a7a9c0ea185d9d6",
+  "notes": "v4.5.13：收支清算云端订单明细新增「张数」列 —— ① 订单行「页数」右侧新增「张数」，显示该订单消耗的纸张总张数（悬停查看单面/双面拆分）；② 展开的文件子列表「张数」列移至「页数」右侧，与订单行列序一致，仍显示该文件消耗的纸张张数（含份数）。"
 }

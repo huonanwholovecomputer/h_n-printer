@@ -368,7 +368,7 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
   white-space: pre-wrap;
   word-break: break-all;
 }
-.file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 78px 72px 96px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
+.file-grid { display: grid; grid-template-columns: minmax(0, 1fr) 72px 64px 104px 72px 78px 96px; gap: 10px; align-items: center; padding: 6px 14px; font-size: .8rem; }
 .file-grid .fn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
 .file-grid.file-sub-head { font-size: .72rem; font-weight: 600; color: var(--muted); background: var(--card-2); border-top: 1px solid var(--border-strong); padding-top: 5px; padding-bottom: 5px; }
 .file-grid.file-sub-row { color: var(--muted); border-top: 1px dashed var(--border); }
@@ -2456,7 +2456,7 @@ function _renderOrderListHTML() {
   if (!pageOrders.length) {
     h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
   } else {
-    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:64px">来源</th><th style="width:104px">用户</th><th style="width:84px">状态</th><th style="width:88px">金额</th><th style="width:58px">文件</th><th style="width:96px">页数</th><th style="width:432px">类型</th><th style="width:132px">时间</th><th style="width:132px">开始打印</th><th style="width:200px">接单设备</th></tr></thead><tbody>';
+    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:64px">来源</th><th style="width:104px">用户</th><th style="width:84px">状态</th><th style="width:88px">金额</th><th style="width:58px">文件</th><th style="width:96px">页数</th><th style="width:88px">张数</th><th style="width:432px">类型</th><th style="width:132px">时间</th><th style="width:132px">开始打印</th><th style="width:200px">接单设备</th></tr></thead><tbody>';
     pageOrders.forEach(function (o) {
       var isExp = !!_cloudExpanded[o.order_id];
       var srcTxt = o.source === 'app' ? 'APP' : (o.source === 'local' ? '本地' : '小程序');
@@ -2490,6 +2490,8 @@ function _renderOrderListHTML() {
       h += '<td style="font-weight:700;color:' + revColor + '" title="云端收益记录 ' + RMB(orderRev) + (money.pendingFiles > 0 ? ' · ' + money.pendingFiles + ' 个文件待处理' : '') + '">' + RMB(orderRev) + '</td>';
       h += '<td>' + o.files_count + '</td>';
       h += '<td>' + (o.total_page_count || 0) + '</td>';
+      var _osheets = _orderSheets(o);
+      h += '<td title="单面 ' + _osheets.single + ' 张 · 双面 ' + _osheets.duplex + ' 张">' + (_osheets.total || 0) + '</td>';
       h += '<td style="font-size:.76rem;line-height:1.9" title="' + esc(addr) + '">' + _orderTypeTags(o, money) + '</td>';
       h += '<td class="ell" style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 19)) + '</td>';
       // 开始打印：无则显示 —；有则显示时间，悬停展示后端计算的等待时长
@@ -2502,19 +2504,19 @@ function _renderOrderListHTML() {
         (o.received_label ? esc(o.received_label) : '—') + '</td>';
       h += '</tr>';
       if (o.files && o.files.length) {
-        h += '<tr class="file-expand' + (isExp ? ' open' : '') + '" data-suborder="' + oidS + '"><td colspan="12" class="file-expand-cell"><div class="file-expand-body"><div class="file-expand-inner">';
+        h += '<tr class="file-expand' + (isExp ? ' open' : '') + '" data-suborder="' + oidS + '"><td colspan="13" class="file-expand-cell"><div class="file-expand-body"><div class="file-expand-inner">';
         if (o.remark) {
           h += '<div class="order-remark" title="订单备注">📝 备注：' + esc(o.remark) + '</div>';
         }
-        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>单/双面</span><span>张数</span><span>状态</span></div>';
+        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>张数</span><span>单/双面</span><span>状态</span></div>';
         o.files.forEach(function (f) {
           h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + (f.reject_reason ? ' · ' + esc(f.reject_reason) : '') + '">';
           h += '<span class="fn">📄 ' + esc(f.file_name) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
           h += '<span style="font-weight:700;color:' + revColor + '">' + RMB(parseCents(f.total_price)) + '</span>';
           h += '<span>' + f.copies + '份</span>';
           h += '<span>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</span>';
-          h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
           h += '<span>' + _fileSheets(f) + '张</span>';
+          h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
           h += '<span><span class="tag ' + esc(statusClass(f.status)) + '">' + esc(statusLabel(f.status)) + '</span></span>';
           h += '</div>';
         });
@@ -4237,7 +4239,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v6.2</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v6.3</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -4269,6 +4271,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.24：多设备接单 + 时间到秒 —— ① 「启用接单」重构为可接单设备列表（多台设备可同时启用），订单记录实际接单设备；订单明细新增「接单设备」列（{所有者}的设备 | {设备}，历史订单归属姚懿祥的设备）；② 运营视角新增「接单设备比例」饼图（按订单数，悬停看收益）；③ 订单明细「时间」「开始打印」精确到秒；④ 口径栏滚动收起：滚动到订单明细附近时口径栏平滑上滑淡出、向上滚动自动滑回；⑤ 订单明细新增「开始打印」列（悬停展示下单→开始打印的等待时长）。</p>' +
     '<p style="margin-top:10px">v5.25：界面细节优化 —— ① 口径栏改为普通固定卡片：移除吸顶悬浮与滚动收起动画，不再遮挡订单明细；② 刷新记住所在标签页：F5 刷新后停留在原 tab（新开会话仍从收支清算开始）；③ 消除刷新时「收支清算」选中态闪烁：tab 恢复提前到首帧绘制前同步完成。</p>' +
     '<p style="margin-top:10px">v6.2：纸张张数统计 —— ① Hero KPI 新增「纸张张数」卡（单面每页 1 张、双面每张 2 页，奇数页最后一张仍占 1 张，含份数），副行显示单面/双面张数拆分；② 趋势分析新增「纸张」第五指标（≤60 天自动渲染为逐日柱状图，>60 天为切片折线；专属橙色，峰值/提示同步）；③ 修复「单双面构成」饼图此前按文件数计数却标注「张」的模糊统计，改为按实际纸张张数；④ 订单明细文件级新增「张数」列（含份数的实际用纸量）；⑤ 汇总行补充「· X 张纸」。</p>' +
+    '<p style="margin-top:10px">v6.3：张数列补全 —— ① 订单明细订单行「页数」右侧新增「张数」列，显示该订单消耗的纸张总张数（悬停看单面/双面拆分）；② 展开的文件子列表「张数」列移至「页数」右侧，与订单行列序一致，仍显示该文件消耗的纸张张数（含份数）。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
