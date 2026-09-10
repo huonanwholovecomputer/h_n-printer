@@ -109,9 +109,11 @@ python build_installer.py --skip-pyinstaller   # dist 已是最新时跳过重�
 
 1. **版本号两处同步递增**：`gui.py` 的 `APP_VERSION` + `version_info.txt`
 2. **构建**：`python build_installer.py`（依赖 Inno Setup 7 的 ISCC.exe，脚本自动探测安装路径）
-3. **MD5 填入** `installer/update.json`（`version` / `url` / `md5` / `notes`）
-4. **分发到服务器**：安装包与 `update.json` 上传到服务器 `/home/printer-backend/updates/`（nginx 静态直链），用户端启动 4 秒后或「帮助 → 检查更新」自动升级
+3. **MD5 填入** `installer/update.json`（`version` / `url` / `md5` / `notes`），`url` 指向 COS 对象地址
+4. **分发**：安装包 exe 上传**腾讯云 COS**（`hn-printer-updates-1324480550`，公有读；exe 不受 COS 默认域名限制，仅 APK/IPA 被禁）→ 仅 `update.json` 上传服务器 `/home/printer-backend/updates/`（nginx 静态，客户端先取清单再按 `url` 从 COS 高速下载）
 5. 自更新链路由 `updater.py` 完成：检查版本 → 下载到 `%TEMP%` → **MD5 校验** → `update.cmd` 静默安装 → 重启新版本
+
+详细发布步骤见 `local_print_tool/发布流程.md`。
 
 两个 PyInstaller `.spec` 文件仍在（`build_installer.py` 内部以 API 方式调用）：
 
