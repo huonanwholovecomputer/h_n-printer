@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""针对「页码范围含空格」分歧的最小可读复现（用四端真实实现）"""
+"""回归守卫：页码范围「含空格」时四端必须同口径（用四端真实实现比对）
+
+历史 bug：后端把空白**删除**（"1 - 3"→1-3，3 页），前端把空白**替换成逗号**
+（→"1,-,3"，只认第 1、3 两页），导致前端显示价低于后端实收（3 页双面 1 份：¥0.40 vs ¥0.70）。
+已于 1.1.24 修复：两份前端改为与后端逐字对齐（空白删除 + 严格整数 + 段内只切一刀）。
+
+用法：python tests/verify_range_space_divergence.py      # exit 0 = 四端一致
+"""
 import io, json, os, shutil, subprocess, sys, tempfile
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -42,19 +49,34 @@ process.stdout.write(JSON.stringify(cases.map(([pc,copies,duplex,pr])=>({
 }))));
 ''')
 
-cases = [[3, 1, "on", "1 - 3"], [3, 1, "on", "1-3"], [5, 2, "off", "1 - 3"], [2, 1, "on", "1 - 3"], [10, 1, "on", "2 - 4"]]
+cases = [[3, 1, "on", "1 - 3"], [3, 1, "on", "1-3"], [5, 2, "off", "1 - 3"], [2, 1, "on", "1 - 3"],
+         [10, 1, "on", "2 - 4"], [3, 1, "on", "3a"], [10, 1, "on", "1-2-3"], [10, 1, "on", "1 3"],
+         [10, 2, "off", "1、3、5-7"], [10, 1, "on", "1-999999999"]]
 cf = os.path.join(tmp, "c.json")
 open(cf, "w", encoding="utf-8").write(json.dumps(cases))
-r = subprocess.run(["node", probe, PRINT_JS, INDEX_JS, cf], capture_output=True, text=True, encoding="utf-8")
+r = subprocess.run(["node", probe, PRINT_JS, INDEX_JS, cf], capture_output=True, text=True,
+                   encoding="utf-8", timeout=60)
 js = json.loads(r.stdout)
 
-print("页码范围 | 总页数 | 份数 | 双面 ‖ 后端/本地 有效页数→金额 ‖ APP 有效页数→金额 ‖ 小程序")
-print("-" * 108)
+print("页码范围 | 总页数 | 份数 | 双面 ‖ 后端/本地     ‖ APP            ‖ 小程序")
+print("-" * 92)
+fails = []
 for (pc, copies, duplex, pr), j in zip(cases, js):
     be_p = backend._count_pages_in_range(pr, pc)
     be_c = round(backend.calculate_price(pc, duplex, pr) * copies, 2)
-    lo_c, _ = local_cfg.calc_cost(pc, copies, duplex, 0.3, 0.4, pr)
-    mark = "  ← 不一致" if (be_c != j["ac"] or j["ac"] != j["mc"]) else ""
-    print(f"{pr!r:10s} | {pc:6d} | {copies:4d} | {duplex:4s} ‖ {be_p}页 → ¥{be_c:.2f} ‖ {j['ap']}页 → ¥{j['ac']:.2f} ‖ {j['mp']}页 → ¥{j['mc']:.2f}{mark}")
+    same = (be_c == j["ac"] == j["mc"]) and (be_p == j["ap"] == j["mp"])
+    if not same:
+        fails.append((pr, pc, copies, duplex, be_p, be_c, j["ap"], j["ac"], j["mp"], j["mc"]))
+    print(f"{pr!r:14s} | {pc:6d} | {copies:4d} | {duplex:4s} ‖ {be_p}页 → ¥{be_c:.2f}"
+          f" ‖ {j['ap']}页 → ¥{j['ac']:.2f} ‖ {j['mp']}页 → ¥{j['mc']:.2f}"
+          + ("" if same else "   ← 不一致"))
 
 shutil.rmtree(tmp, ignore_errors=True)
+print("\n" + "=" * 62)
+if fails:
+    print(f"[FAIL] 四端仍不一致 {len(fails)} 组：")
+    for f in fails:
+        print(f"   {f}")
+    sys.exit(1)
+print("[PASS] 四端在含空格/严格整数/超长区间等输入上完全一致 ✅")
+

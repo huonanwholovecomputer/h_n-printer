@@ -177,7 +177,9 @@ const feFn = new Function('baseTotal', 'p', expr.join('\n') + '\nreturn total;')
 
 const fees = JSON.parse(fs.readFileSync(process.argv[7], 'utf8')).map(([base, pct, urg, cover]) => {
   const p = { deliveryEnabled: pct > 0, deliveryPercent: pct, urgencyPrice: urg, coverPage: !!cover, coverPagePrice: 0.10 };
-  const raw = feFn(base, p);
+  // 在 print.js 的沙箱里求值：这样 pyRound2 等文件内函数才能解析到
+  vm.runInContext('__feTotal = function (baseTotal, p) {\n' + expr.join('\n') + '\nreturn total;\n};', A);
+  const raw = callA(`__feTotal(${base}, ${JSON.stringify(p)})`);
   return [Number(raw.toFixed(2)), raw];
 });
 
@@ -188,7 +190,15 @@ probe_path = os.path.join(tmp, "probe.js")
 open(probe_path, "w", encoding="utf-8").write(PROBE)
 
 RANGES = ["", "1", "1-3", "2-5", "1,3,5", "1、3、5-7", "23-4", "5-3", "1-9999",
-          "abc", "0", "-5", "5-", "1；3", "1 - 3", " 1 - 3 ", "1 -3", "1- 3", "1 3"]
+          "abc", "0", "-5", "5-", "1；3", "1 - 3", " 1 - 3 ", "1 -3", "1- 3", "1 3",
+          # 对抗性输入：parseInt 宽容 / split 多切 / 中文标点 / 空段 / 符号
+          "3a", "1-2-3", "1-2-3-4", "a-3", "3-", "-", "--", ",,", "1,,3", "  ",
+          "1、", "、1", "1；；3", "01-03", "+3", "3.5", "1-3,", ",1-3",
+          "1 -  3 , 5"]
+# 刻意排除、并已单独验证「不可达」的输入（见文末 F 段）：
+#   · "０１" 全角数字 —— Python int() 认，JS 严格 ASCII 不认；但前端行校验 parseSingleRange
+#     用 parseInt，同样不认全角 → 该行被判非法 → 根本进不了 pageRange
+#   · "1-999999999" 超长区间 —— 后端/本地是**全区间遍历**（未先收窄）会卡死，见 F 段
 MATRIX = [[pc, copies, duplex, pr]
           for pc in (1, 2, 3, 4, 5, 6, 9, 10, 23)
           for copies in (1, 2, 3, 5)
@@ -339,6 +349,86 @@ else:
                 "两者都不算错，但对账时容易被误读为不一致。")
     else:
         check("张数口径一致", True)
+
+shutil.rmtree(tmp, ignore_errors=True)
+
+# ============================================================
+# F) 不可达输入 / 超长区间耗时
+# ============================================================
+print("\n=== F) 排除在矩阵外的输入是否真的不可达 ===")
+
+
+def timeit(fn, arg, repeat=1):
+    import time
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        fn(arg, 10)
+    return time.perf_counter() - t0
+
+
+# F1 全角数字：Python int() 认，前端行校验 parseInt 不认 → 进不了 pageRange
+be_full = backend._count_pages_in_range("０１", 10)
+node_probe = os.path.join(tmp, "reach.js")
+open(node_probe, "w", encoding="utf-8").write(r'''
+const fs = require('fs'), vm = require('vm');
+const EL = () => ({ innerHTML:'',textContent:'',value:'',style:{},dataset:{},
+  classList:{add(){},remove(){},toggle(){},contains(){return false}},querySelector:()=>null,
+  querySelectorAll:()=>[],appendChild(){},addEventListener(){},getBoundingClientRect:()=>({height:0}),
+  parentNode:null,children:[] });
+const B = { console:{log(){},warn(){},error(){}}, JSON, Math, Date, Object, Array, String, Number,
+  Boolean, Error, Promise, Set, Map, parseInt, parseFloat, isNaN, setTimeout, clearTimeout,
+  setInterval, clearInterval, DataView, ArrayBuffer, BigInt, FormData: class { append() {} },
+  localStorage:{getItem:()=>null}, navigator:{userAgent:'n'} };
+const s = Object.assign({}, B, { XMLHttpRequest: class { constructor(){this.upload={}} open(){} setRequestHeader(){} abort(){} send(){} },
+  state:{token:''}, BASE_URL:'', api:()=>Promise.resolve({}), ensureLogin:()=>Promise.resolve(true),
+  showToast(){}, openModal(){}, closeModal(){}, esc:x=>String(x==null?'':x), escHtml:x=>String(x==null?'':x),
+  sanitizeColor:c=>c, measureAll(){}, scheduleMeasureSoon(){}, renderPricing(){}, getApp:()=>({globalData:{}}) });
+s.window = s; s.globalThis = s;
+s.document = { getElementById:()=>EL(), querySelector:()=>null, querySelectorAll:()=>[],
+  createElement:()=>EL(), addEventListener(){}, body:EL() };
+vm.createContext(s);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), s, { filename: 'print.js' });
+const out = {};
+// 行校验 parseSingleRange 对全角数字的判定（null = 拒绝，该行不会进 pageRange）
+out.fullWidthLineRejected = vm.runInContext("parseSingleRange('０１') === null", s);
+// countPagesInRange（已收窄）对超长区间的耗时：应恒定
+out.countLongRange = vm.runInContext("[1-999999999, 1-9999999999].map(r => { const t=Date.now(); countPagesInRange(r, 10); return Date.now()-t; })", s);
+// 行校验 parseSingleRange 对超长区间的耗时（未收窄 → 线性增长）
+const mk = (n) => vm.runInContext(`(() => { const t=Date.now(); parseSingleRange('1-${'9'.repeat(String(n).length)}'); return Date.now()-t; })()`, s);
+out.parseSingle_1e4 = vm.runInContext("(()=>{const t=Date.now();parseSingleRange('1-10000');return Date.now()-t})()", s);
+out.parseSingle_1e6 = vm.runInContext("(()=>{const t=Date.now();parseSingleRange('1-1000000');return Date.now()-t})()", s);
+process.stdout.write(JSON.stringify(out));
+''')
+r3 = subprocess.run(["node", node_probe, PRINT_JS], capture_output=True, text=True, encoding="utf-8")
+info = json.loads(r3.stdout) if r3.returncode == 0 else {}
+print(f"  全角 '０１'：后端 int() 认成 {be_full} 页；前端行校验 parseSingleRange 拒绝 = {info.get('fullWidthLineRejected')}")
+check("全角数字输入在前端行校验处即被拒绝（不可达，故矩阵中排除）",
+      info.get("fullWidthLineRejected") is True)
+if info.get("fullWidthLineRejected"):
+    finding("全角数字的解析口径两端不同，但**不可达**（已在行校验处拒绝）",
+            f"Python int('０１')={be_full}，JS 严格 ASCII 数字不认 → 若只看 countPagesInRange 会以为两端不一致；"
+            "实际前端 parseSingleRange 用 parseInt，同样不认全角，该行被判非法、不会写进 pageRange。")
+
+# F2 超长区间：后端/本地未收窄就全区间遍历
+t_be_1e5 = timeit(lambda a, t: backend._count_pages_in_range(a, t), "1-100000")
+t_be_1e6 = timeit(lambda a, t: backend._count_pages_in_range(a, t), "1-1000000")
+t_lo_1e6 = timeit(lambda a, t: local_cfg._count_pages_in_range(a, t), "1-1000000")
+proj_1e9 = t_be_1e6 * 1000          # 1e9 / 1e6 = 1000 倍（线性）
+print(f"  后端 _count_pages_in_range：1e5={t_be_1e5*1000:.1f}ms, 1e6={t_be_1e6*1000:.1f}ms（线性）"
+      f" → 1e9 区间约 {proj_1e9:.0f}s")
+print(f"  本地 _count_pages_in_range：1e6={t_lo_1e6*1000:.1f}ms → 1e9 约 {t_lo_1e6*1000:.0f}s")
+print(f"  前端 countPagesInRange（本轮已收窄）对 1e9 / 1e10 区间耗时: {info.get('countLongRange')} ms")
+print(f"  前端行校验 parseSingleRange（未收窄、Set 无上限）：1e4={info.get('parseSingle_1e4')}ms, "
+      f"1e6={info.get('parseSingle_1e6')}ms → 1e9 约 {info.get('parseSingle_1e6', 0)*1000/1000:.0f}s 且内存爆掉")
+if proj_1e9 > 1.0:
+    finding("超长页码范围会让后端/本地工具 CPU 长时间占满（前端行校验同病）",
+            f"后端 `_parse_page_range_set` 与本地 `_parse_range_parts` 都是 `for p in range(start, end+1)` "
+            f"全区间遍历、遍历中才过滤 1<=p<=total_pages（实测 1e6 区间 {t_be_1e6*1000:.1f}ms，"
+            f"按线性外推 1e9 区间约 {proj_1e9:.0f}s）→ 已登录用户提交 page_range='1-999999999' "
+            f"即可让 /api/orders 长时间占用一个 gunicorn worker，并发的几个请求就能拖垮服务。"
+            f"前端 `parseSingleRange` 同病且把页号塞进无上限 Set（1e6 用 {info.get('parseSingle_1e6')}ms），"
+            f"用户手输超长区间会卡死自己的界面。修法与本轮 `countPagesInRange` 一致："
+            f"先把 start/end 收窄到 [1, total] 再迭代 —— 结果集合完全不变，纯防卡死。")
 
 shutil.rmtree(tmp, ignore_errors=True)
 

@@ -63,32 +63,86 @@ function _initThemeMode() {
   } catch (e) {}
   return wx.getStorageSync('themeMode') || 'auto'
 }
+/* 与 Python `round(x, 2)` **同口径**的取整（后端算派送费用的就是它）。
+
+   ⚠ 不要用 `Math.round(x*100)/100` 或 `x.toFixed(2)` 代替：当真值恰好落在 .xx5 边界、
+   而 double 的落点偏向另一侧时，它们会与 Python 的 round 差 1 分。
+   实测（tests/_pick_js_rounding.py，线上定价下 1020 组可达输入）：
+     Math.round(x*100)/100 → 63 组不一致；toFixed(2) → 6 组；本实现 → 0 组。
+   原理：按 IEEE754 把 double 拆成 mant×2^exp（BigInt 精确整数），
+   精确算出 x 的十进制展开后再做「半偶」进位，复刻 Python round 的语义。 */
+function pyRound2(x) {
+  if (!isFinite(x) || x === 0) return 0
+  if (typeof BigInt === 'undefined' || typeof DataView === 'undefined') {
+    // 极旧内核兜底：精度略差（上述 6/1020 组可能差 1 分），失败也不阻断主流程
+    return Number(x.toFixed(2))
+  }
+  const neg = x < 0
+  const ax = neg ? -x : x
+  const buf = new DataView(new ArrayBuffer(8))
+  buf.setFloat64(0, ax)
+  const hi = buf.getBigUint64(0)
+  const expBits = Number((hi >> 52n) & 0x7ffn)
+  let mant = hi & 0xfffffffffffffn
+  let exp
+  if (expBits === 0) { exp = -1074 } else { mant |= 0x10000000000000n; exp = expBits - 1075 }
+  let num = mant
+  let den = 1n
+  if (exp >= 0) { num <<= BigInt(exp) } else { den <<= BigInt(-exp) }
+  num *= 100n                       // 目标：精确到「分」
+  let q = num / den
+  const rem = num % den
+  const twice = rem * 2n
+  if (twice > den || (twice === den && (q % 2n) === 1n)) q += 1n   // 半偶进位
+  const cents = Number(q)
+  return (neg ? -cents : cents) / 100
+}
+
+/* 对齐 Python `int()`：允许前后空白，其余必须是十进制整数；否则返回 null。 */
+function _rangeInt(s) {
+  const t = String(s).trim()
+  if (!/^[+-]?[0-9]+$/.test(t)) return null
+  const v = Number(t)
+  return Number.isSafeInteger(v) ? v : null
+}
+
 /* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
-   对齐本地 calc_cost / 后端 calculate_price 口径（含中文逗号、智能拆分 '23-4'） */
+
+   ⚠ 必须与后端 `_count_pages_in_range` / 本地 `_parse_range_parts` **严格同口径**，
+   否则「提交前显示价」与「提交后实收价」会对不上。旧实现有三处偏差：
+     1. 把空白替换成逗号（后端是**删除**）→ "1 - 3" 前端只认到第 1、3 两页，
+        后端按 1-3 三页计费（实测 3 页双面 1 份：前端显示 ¥0.40 vs 后端实收 ¥0.70）；
+     2. 用 parseInt 解析（后端 int() 严格）→ "3a" 前端认成第 3 页，
+        后端判非法 → 整段无效 → 退回**全份**计费；
+     3. 段内 '-' 用 split('-') 全切（后端 split('-', 1) 只切一刀）→ "1-2-3" 前端认成 1-2。
+   非空但全部无效 → 返回 total（后端同样退回全打印），保证与实收一致。 */
 function countPagesInRange(pageRange, total) {
   if (!pageRange || !String(pageRange).trim()) return total
   const pages = new Set()
-  String(pageRange).replace(/[、，；\s]/g, ',').split(',').forEach(part => {
-    part = (part || '').trim()
+  String(pageRange).replace(/ /g, '').replace(/[、，；]/g, ',').split(',').forEach(rawPart => {
+    const part = (rawPart || '').trim()
     if (!part) return
-    if (part.indexOf('-') >= 0) {
-      const sp = part.split('-')
-      const a = parseInt(sp[0], 10), b = parseInt(sp[1], 10)
-      if (!isNaN(a) && !isNaN(b)) {
-        if (a < b) {
-          for (let p = a; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
-        } else if (a > b && String(a).length > 1) {
-          const prefix = parseInt(String(a).slice(0, -1), 10)
-          const last = parseInt(String(a).slice(-1), 10)
-          if (prefix < b) {
-            for (let p = last; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
-            if (prefix >= 1 && prefix <= total) pages.add(prefix)
-          }
+    const dash = part.indexOf('-')
+    if (dash >= 0) {
+      const a = part.slice(0, dash)
+      const b = part.slice(dash + 1)     // 只切一刀，对齐后端 split('-', 1)
+      const start = _rangeInt(a)
+      const end = _rangeInt(b)
+      if (start === null || end === null) return
+      if (start < end) {
+        // 收窄迭代区间：结果与「全区间遍历 + 逐个过滤」完全一致，但防超长范围（如 1-999999999）卡死
+        for (let p = Math.max(1, start); p <= Math.min(end, total); p++) pages.add(p)
+      } else if (start > end && a.trim().length > 1) {
+        const prefix = _rangeInt(a.trim().slice(0, -1))
+        const last = _rangeInt(a.trim().slice(-1))
+        if (prefix !== null && last !== null && prefix < end) {
+          for (let p = Math.max(last, 1); p <= Math.min(end, total); p++) pages.add(p)
+          if (prefix >= 1 && prefix <= total) pages.add(prefix)
         }
       }
     } else {
-      const p = parseInt(part, 10)
-      if (!isNaN(p) && p >= 1 && p <= total) pages.add(p)
+      const n = _rangeInt(part)
+      if (n !== null && n >= 1 && n <= total) pages.add(n)
     }
   })
   return pages.size || total
@@ -2911,7 +2965,10 @@ Component({
 
       let total = baseTotal
       if (deliveryEnabled) {
-        total += baseTotal * (deliveryPercent / 100)
+        // 派送费与后端同口径：先按 Python round 取整到分再相加
+        // （后端 app.py submit_order 里就是 round(base * pct / 100, 2)），
+        // 否则「提交前显示价」会比实收价高/低 1 分。
+        total += pyRound2(baseTotal * deliveryPercent / 100)
       }
       total += urgencyPrice
       if (coverPage) total += coverPagePrice
@@ -2976,7 +3033,7 @@ Component({
       if (deliveryEnabled) {
         const loc = deliveryLocation
         const pct = deliveryPercent
-        const deliveryCost = baseTotal * (pct / 100)
+        const deliveryCost = pyRound2(baseTotal * pct / 100)   // 与后端同口径取整到分
         if (pct > 0 && deliveryCost > 0) {
           lines.push(itemNum + '. 派送：是 | ' + loc + ' ' + pct.toFixed(1) + '% | ￥' + deliveryCost.toFixed(2))
           allParts.push(deliveryCost.toFixed(2))

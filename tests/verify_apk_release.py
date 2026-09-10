@@ -93,16 +93,22 @@ check("APK 内 web 资源与 www/ 逐字节一致（cap sync 已生效）",
       not mismatch and not missing,
       f"不一致: {mismatch[:5]} 缺失: {missing[:5]}")
 
-# 针对本轮审计修复的显式标记（防止"资源一致但源文件本身是旧版"的误判）
+# 针对已知修复的显式标记（防止"资源一致但源文件本身是旧版"的误判）
 if "print.js" in packed:
     js = z.read(packed["print.js"]).decode("utf-8", "replace")
     for marker, label in (
-        ("function fileAlive(f)", "🔴6 文件身份判定 fileAlive"),
-        ("f._uploadTimer = entry", "🔴6 计时器绑定文件对象"),
-        ("function fileIndexOf(f)", "🔴6 异步回调现算下标"),
+        ("function fileAlive(f)", "文件身份判定 fileAlive（审计 🔴6）"),
+        ("f._uploadTimer = entry", "计时器绑定文件对象（审计 🔴6）"),
+        ("function fileIndexOf(f)", "异步回调现算下标（审计 🔴6）"),
+        ("function pyRound2(x)", "Python 同口径取整 pyRound2（派送费 1 分差）"),
+        ("replace(/ /g, '').replace(/[、，；]/g, ',')", "页码范围与后端同口径（空格删除+严格整数）"),
     ):
         check(f"APK 内 print.js 含 {label}", marker in js)
     check("APK 内 print.js 已移除旧的索引计时器表", "_uploadTimers" not in js)
+    check("APK 内 print.js 已移除旧的派送费写法",
+          "baseTotal * (p.deliveryPercent / 100)" not in js)
+    check("APK 内 print.js 已移除旧的空白→逗号替换",
+          "replace(/[、，；\\s]/g, ',')" not in js)
 
 print("\n" + "=" * 52)
 print("APK 校验:", "全部通过 ✅" if ok_all else "存在失败 ❌")
