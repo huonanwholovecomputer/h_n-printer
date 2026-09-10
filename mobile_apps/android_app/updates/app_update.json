@@ -1,7 +1,7 @@
 {
   "version": "1.1.24",
   "versionCode": 25,
-  "url": "https://hn-space.cn/updates/hn-cloud-print_v1.1.24.apk",
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.24.apk",
   "md5": "b3bc745764cfe001a652fb09dd584fe4",
   "notes": "v1.1.24：① 上传中删除前面的文件后，它的上传结果不再被写到后面那张卡片上（原先会出现「文件名与实际打印内容不符、按另一个文件的页数计价」）；② 页码范围里带空格时（如「1 - 3」）显示的页数与金额不再偏低，与提交后实收金额一致；③ 选择带派送费的地点时，提交前显示的总价不再与实收差 1 分。",
   "force": false

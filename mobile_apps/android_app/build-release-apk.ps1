@@ -35,7 +35,9 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $apk = Join-Path $PSScriptRoot 'android\app\build\outputs\apk\release\app-release.apk'
 if (Test-Path $apk) {
   Write-Host "BUILD OK: $apk"
-  # 复制为友好文件名：HN云打印_v{版本号}.apk（版本号自动从 build.gradle 读取）
+  # 复制为友好文件名：h_n-printer_android_v{版本号}.apk（版本号自动从 build.gradle 读取）
+  # 命名约定（2026-09 起）：与桌面端 h_n-printer_setup_{版本}.exe 同一风格 —— 英文 + 下划线，
+  # 避免中文名在 scp / COS / 浏览器下载时被转码，也便于和服务器以及 COS 桶里的对象名一致。
   $version = ''
   try {
     $gradleFile = Join-Path -Path $PSScriptRoot -ChildPath 'android\app\build.gradle'
@@ -46,9 +48,10 @@ if (Test-Path $apk) {
   }
   $distDir = Join-Path $PSScriptRoot 'dist'
   New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-  $friendly = "HN云打印_v${version}.apk"
+  $friendly = "h_n-printer_android_v${version}.apk"
   Copy-Item $apk (Join-Path $distDir $friendly) -Force
   Write-Host "COPIED : $(Join-Path $distDir $friendly)"
+  Write-Host "提示：上传到服务器 /updates/ 时保持同名，app_update.json 的 url 也用这个名字"
 } else {
   Write-Host 'Build finished but release APK not found'
 }

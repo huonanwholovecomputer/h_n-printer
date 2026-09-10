@@ -63,12 +63,19 @@ Capacitor WebView 封装，无需微信登录（设备账号 `dev_` 前缀 + 可
 # Release（签名 + 混淆）：
 cd mobile_apps/android_app
 powershell -ExecutionPolicy Bypass -File .\build-release-apk.ps1
-# 产物：dist\HN云打印_v{versionName}.apk（脚本自动从 build.gradle 读版本号命名）
+# 产物：dist\h_n-printer_android_v{versionName}.apk（脚本自动从 build.gradle 读版本号命名）
 
 # Debug：
 powershell -ExecutionPolicy Bypass -File .\build-apk.ps1
-# 产物：dist\HN云打印_v{versionName}_debug.apk
+# 产物：dist\h_n-printer_android_v{versionName}_debug.apk
 ```
+
+APK 命名约定（2026-09 起）：**`h_n-printer_android_v{版本}.apk`**，与桌面端 `h_n-printer_setup_{版本}.exe`
+同一风格（英文 + 下划线，避免中文名在 scp / COS / 浏览器下载时被转码）。
+**上传服务器 `/updates/` 时保持同名**，`app_update.json` 的 `url` 也用这个名字。
+注意 `www/updater.js` 里 `const fileName = 'hn-cloud-print_v' + version + '.apk'` 只是**APP 本地下载到
+缓存时用的临时名**（与 URL 无关、用户看不到），无需随发版改名。
+上传前用 `python tests/verify_apk_release.py` 校验（APK 内 web 资源与 `www/` 逐字节一致 + 打印待填清单值）。
 
 关键要点（脚本已内置，直接跑即可）：
 - **必须先 `cap sync android`**：脚本内部执行（`build-release-apk.ps1`/`build-apk.ps1` 开头），把最新 `www/` 同步进 `android/app/src/main/assets/public/`。**只跑 `gradlew assembleRelease` 而跳过 sync，APK 会打包上次 sync 的旧 web 资源**（改过 `www/*.js` 后忘 sync 是经典翻车点）。

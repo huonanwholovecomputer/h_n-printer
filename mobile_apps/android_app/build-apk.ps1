@@ -29,7 +29,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $apk = Join-Path $PSScriptRoot 'android\app\build\outputs\apk\debug\app-debug.apk'
 if (Test-Path $apk) {
   Write-Host "BUILD OK: $apk"
-  # 复制为友好文件名：HN云打印_v{版本号}_debug.apk（版本号自动从 build.gradle 读取）
+  # 复制为友好文件名：h_n-printer_android_v{版本号}_debug.apk（与 Release 同一命名约定）
   $gradleFile = Join-Path $PSScriptRoot 'android\app\build.gradle'
   $version = ''
   if (Test-Path $gradleFile) {
@@ -38,7 +38,7 @@ if (Test-Path $apk) {
   }
   $distDir = Join-Path $PSScriptRoot 'dist'
   New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-  $friendly = "HN云打印_v${version}_debug.apk"
+  $friendly = "h_n-printer_android_v${version}_debug.apk"
   Copy-Item $apk (Join-Path $distDir $friendly) -Force
   Write-Host "COPIED : $(Join-Path $distDir $friendly)"
 } else {
