@@ -83,11 +83,12 @@ from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE
 from cloud_client import CloudClient, CloudTask, pdf_cache_key
 from stats_server import StatsServer, load_local_data_file, clear_local_data_files
 from offline_sync import OfflineSync
+import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼容，详见 staging.py）
 
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.13"
+APP_VERSION = "4.5.14"
 
 
 # ============================================================
@@ -1524,6 +1525,14 @@ class MainWindow(QMainWindow):
                 self._config.save(config_path)
                 self._file_logger.info("启动清理：已移除 %d 个已完成订单标签页", removed_count)
 
+        # ── 启动迁移：旧版遗留在 %TEMP% 的云端任务文件 → 暂存目录 ──
+        # 必须早于 CloudClient.start()（它会清掉 %TEMP% 下 24h 以上的 hn_cloud_*，
+        # 那正是"列表里还有任务、文件却没了"的旧隐患）
+        try:
+            self._adopt_legacy_cloud_files()
+        except Exception as e:
+            self._file_logger.warning("接管旧版云端临时文件失败: %s", e)
+
         # ── 标签页系统 ──
         # 确保 tabs 中至少有一个标签
         if not self._config.tabs:
@@ -1615,6 +1624,17 @@ class MainWindow(QMainWindow):
         else:
             self._log("ℹ 云端已启用但未配置令牌。请通过「文件 → 云端连接设置」填写服务器地址/令牌。")
         self._log("✅ HN 本地打印工具已启动")
+
+        # ── 启动清理：上次会话遗留的暂存副本（工作副本） ──
+        # 正常退出时已按引用清空；此处兜底覆盖崩溃/强杀遗留（副本较新时留 10 分钟宽限，
+        # 避免误删刚复制好、还挂在崩溃前配置里的副本）
+        try:
+            _n, _bytes = staging.cache_size()
+            if _n:
+                self._file_logger.info("暂存副本目录：%d 个文件 / %.1f MB", _n, _bytes / 1048576)
+            self._sweep_staged_files("启动清理", min_age_seconds=600)
+        except Exception as e:
+            logger.warning(f"启动清理暂存副本失败: {e}")
 
         # ── 自更新：启动 4 秒后后台检查更新（不阻塞 UI，发现新版本才弹窗）──
         self._update_checking: bool = False
@@ -3215,6 +3235,7 @@ class MainWindow(QMainWindow):
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
             self._log(f"已删除标签页 {key}")
+            self._sweep_staged_files("删除标签页")
             _rebuild_dialog_table()
 
         def _delete_all_tabs():
@@ -3252,6 +3273,7 @@ class MainWindow(QMainWindow):
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
             self._log("已清空全部标签页")
+            self._sweep_staged_files("清空全部标签页")
             _rebuild_dialog_table()
 
         def _cleanup_empty_in_dialog():
@@ -3296,6 +3318,7 @@ class MainWindow(QMainWindow):
             self._rebuild_table()
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
+            self._sweep_staged_files("删除已完成订单")
             _rebuild_dialog_table()
 
         cleanup_empty_btn = QPushButton("🗑 删除空标签页")
@@ -3342,7 +3365,12 @@ class MainWindow(QMainWindow):
         display = job.display_name or os.path.basename(job.file_path)
         name_item = QTableWidgetItem(display)
         name_item.setData(Qt.UserRole, job.file_path)  # 存储完整路径
-        name_item.setToolTip(job.file_path)
+        _tip = job.file_path
+        _src = getattr(job, 'source_path', '')
+        if _src and _src != job.file_path:
+            # 列表任务用的是暂存副本（原件删掉/移动也不影响打印）→ 提示里给原件路径
+            _tip = f"{_src}\n（打印使用暂存副本，原件删除/移动不影响打印）"
+        name_item.setToolTip(_tip)
         self._table.setItem(row, self.COL_FILE, name_item)
 
         copies_item = QTableWidgetItem(str(job.copies))
@@ -3465,11 +3493,25 @@ class MainWindow(QMainWindow):
             if self._copy_detail_btn:
                 self._copy_detail_btn.setEnabled(True)
 
+    def _job_user_path(self, row: int, default: str = "") -> str:
+        """返回该行任务对应的「用户可见路径」：优先原件（source_path），否则列表使用的路径。
+        列表任务用的是暂存副本，双击打开/打开文件位置都应指向用户自己那份文件。"""
+        try:
+            jobs = self._get_current_jobs()
+            if 0 <= row < len(jobs):
+                src = getattr(jobs[row], 'source_path', '') or ''
+                if src and os.path.isfile(src):
+                    return src
+                return jobs[row].file_path or default
+        except Exception:
+            pass
+        return default
+
     def _on_table_double_click(self, row: int, col: int):
-        """双击表格行 → 用默认程序打开文件。"""
+        """双击表格行 → 用默认程序打开文件（优先原件，而非暂存副本）。"""
         name_item = self._table.item(row, self.COL_FILE)
         if name_item:
-            file_path = name_item.data(Qt.UserRole)
+            file_path = self._job_user_path(row, name_item.data(Qt.UserRole) or "")
             if file_path and os.path.isfile(file_path):
                 os.startfile(file_path)
 
@@ -3568,10 +3610,12 @@ class MainWindow(QMainWindow):
         self._label_img_orientation.setEnabled(is_img)
 
         # 更新选中文件标签（云端任务显示原始文件名；路径软换行避免长临时路径撑宽面板）
+        # 本地任务用暂存副本打印 → 路径显示用户原件，便于核对
         shown_name = job.display_name or os.path.basename(job.file_path)
+        shown_path = getattr(job, 'source_path', '') or job.file_path
         self._selected_file_label.setText(
             f"📄 {_soft_wrap_text(shown_name)}\n"
-            f"路径: {_soft_wrap_text(job.file_path)}"
+            f"路径: {_soft_wrap_text(shown_path)}"
         )
 
     def _sync_edit_enabled(self, enabled: bool):
@@ -3706,7 +3750,7 @@ class MainWindow(QMainWindow):
             # 打开文件位置（只读，始终可用）
             name_item = self._table.item(row, self.COL_FILE)
             if name_item:
-                fp = name_item.data(Qt.UserRole)
+                fp = self._job_user_path(row, name_item.data(Qt.UserRole) or "")
                 open_action = menu.addAction("📂 打开文件位置")
                 open_action.triggered.connect(lambda checked=False, p=fp: (
                     os.startfile(os.path.dirname(p)) if p and os.path.isfile(p) else None
@@ -5136,11 +5180,127 @@ class MainWindow(QMainWindow):
             elif job.task_id > 0:
                 self._cloud_client.abandon_order_to_server(job.task_id)
 
+    # ──────── 暂存副本（工作副本）引用与清理 ────────
+    # 添加文件时每个原件都会复制一份到 %APPDATA%\HN打印工具\file_cache（staging.py），
+    # 云端任务的下载文件也落在这里（cloud_<task_id>\），只要还有任务引用副本就不能删；
+    # 任务被移除/清空/打印完成后由下面两个方法回收。
+
+    def _cloud_kept_paths(self) -> list[str]:
+        """尚未变成列表任务、但仍需要文件的云端任务路径（下载中/待确认/预约待打印）。
+
+        云端文件下载完成到用户点「接受」之间不挂在任何 job 上，如果这段时间触发清理
+        （用户移除任务/清空列表/退出）就会把刚下好的文件删掉 → 接受后打印报文件不存在。
+        这里把这些「半路任务」的文件路径一并算作引用。"""
+        paths: list[str] = []
+        for task in (getattr(self, '_cloud_tasks', None) or {}).values():
+            p = getattr(task, 'local_path', '') or ''
+            if p:
+                paths.append(p)
+        client = getattr(self, '_cloud_client', None)
+        if client is not None:
+            try:
+                for task in client.get_pending_tasks():
+                    p = getattr(task, 'local_path', '') or ''
+                    if p:
+                        paths.append(p)
+            except Exception:
+                pass
+        # 预约单状态机：ready/pending 里的任务可能已从 _cloud_tasks 摘除，文件仍要用
+        for entry in (getattr(self, '_scheduled_orders', None) or {}).values():
+            if not isinstance(entry, dict):
+                continue
+            for key in ("ready", "pending"):
+                for task in (entry.get(key) or {}).values():
+                    p = getattr(task, 'local_path', '') or ''
+                    if p:
+                        paths.append(p)
+        return paths
+
+    def _staged_reference_paths(self) -> set[str]:
+        """收集仍被引用的暂存副本路径：全部标签页任务 + 撤回备份 + 打印批次 + 未落地的云端任务。"""
+        refs: list[str] = []
+        for tab in self._config.tabs.values():
+            for job in (tab.jobs or []):
+                if getattr(job, 'file_path', ''):
+                    refs.append(job.file_path)
+        for jobs in self._cleared_jobs_backup.values():
+            for job in (jobs or []):
+                if getattr(job, 'file_path', ''):
+                    refs.append(job.file_path)
+        for job in (getattr(self, '_flat_jobs', None) or []):
+            if getattr(job, 'file_path', ''):
+                refs.append(job.file_path)
+        worker = getattr(self, '_worker', None)
+        for job in (getattr(worker, '_jobs', None) or []):
+            if getattr(job, 'file_path', ''):
+                refs.append(job.file_path)
+        refs.extend(self._cloud_kept_paths())
+        out = set()
+        for p in refs:
+            try:
+                out.add(os.path.normcase(os.path.abspath(p)))
+            except (OSError, ValueError):
+                continue
+        return out
+
+    def _adopt_legacy_cloud_files(self) -> int:
+        """把旧版本遗留在 %TEMP%\\hn_cloud_* 的云端任务文件收进暂存目录。
+
+        旧版下载到系统临时目录：临时目录被清理、或旧版「启动清理 24h 以上 hn_cloud_*」
+        都会删掉仍在列表里的任务文件 → 打印报文件不存在。升级后首次启动把这些文件复制
+        一份到暂存目录并改指副本（必须早于 CloudClient.start() 的旧临时文件清理）。"""
+        adopted = 0
+        try:
+            temp_root = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+        except Exception:
+            return 0
+        for tab in self._config.tabs.values():
+            for job in (tab.jobs or []):
+                fp = getattr(job, 'file_path', '') or ''
+                if not fp or staging.is_staged(fp):
+                    continue
+                try:
+                    norm = os.path.normcase(os.path.abspath(fp))
+                except (OSError, ValueError):
+                    continue
+                if not norm.startswith(temp_root + os.sep):
+                    continue
+                if not os.path.basename(fp).startswith("hn_cloud_"):
+                    continue
+                if not os.path.isfile(fp):
+                    continue
+                new_path = staging.stage_file(fp)
+                if new_path and new_path != fp and os.path.isfile(new_path):
+                    job.file_path = new_path
+                    adopted += 1
+        if adopted:
+            try:
+                self._config.save(self._config_path)
+            except Exception as e:
+                logger.warning(f"接管旧版云端临时文件后保存配置失败: {e}")
+            self._file_logger.info("已接管 %d 个旧版云端临时文件到暂存目录", adopted)
+        return adopted
+
+    def _sweep_staged_files(self, reason: str = "", min_age_seconds: float = 0.0) -> int:
+        """清理不再被任何任务引用的暂存副本，返回删除数量。"""
+        try:
+            removed = staging.sweep(self._staged_reference_paths(),
+                                    min_age_seconds=min_age_seconds)
+        except Exception as e:
+            logger.warning(f"清理暂存副本失败: {e}")
+            return 0
+        if removed:
+            self._log(f"🧹 已清理 {removed} 个暂存文件副本" + (f"（{reason}）" if reason else ""))
+        return removed
+
     def _on_undo_expired(self):
         """撤回超时 → 确认清空，通知后端放弃被清空的云端任务。"""
         jobs = self._cleared_jobs_backup.pop(self._current_tab, [])
         self._abandon_jobs(jobs)
         self._restore_clear_button()
+        if jobs:
+            # 撤回窗口已过 = 清空确认 → 这些任务的暂存副本可以回收
+            self._sweep_staged_files("清空已确认")
 
     def _restore_clear_button(self):
         """恢复清空按钮正常样式。"""
@@ -5157,6 +5317,9 @@ class MainWindow(QMainWindow):
         jobs = self._cleared_jobs_backup.pop(self._current_tab, [])
         self._abandon_jobs(jobs)
         self._restore_clear_button()
+        if jobs:
+            # 撤回已取消 = 清空确认 → 回收这些任务的暂存副本
+            self._sweep_staged_files("清空已确认")
 
     def _on_progress(self, current: int, total: int, status: str):
         """更新进度条。"""
@@ -5223,6 +5386,22 @@ class MainWindow(QMainWindow):
         if self._print_starting:
             self._log("⏳ 正在获取订单号/上报订单，请稍候…")
             return False
+
+        # 打印前兜底：暂存副本若被外部清理（磁盘清理/杀软/手工删 %APPDATA%），
+        # 从用户原件（source_path）重建副本；两者都没了才交给 Worker 报「文件不存在」
+        for j in flat_jobs:
+            _fp = getattr(j, 'file_path', '') or ''
+            if not _fp or os.path.isfile(_fp):
+                continue
+            _src = getattr(j, 'source_path', '') or ''
+            if _src and os.path.isfile(_src):
+                _new = staging.stage_file(_src)
+                if _new and os.path.isfile(_new):
+                    j.file_path = _new
+                    self._log(f"♻ 暂存副本缺失，已从原文件重建: {os.path.basename(_src)}")
+                    continue
+            self._log(f"⚠ 文件不可用（原件与暂存副本均缺失）: "
+                      f"{j.display_name or os.path.basename(_fp) or _fp}")
 
         # 打印前校验页码范围：页数已知且范围非法 → 弹一次确认框（确认后按全部页打印）
         invalid_warned = False
@@ -6704,6 +6883,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"自动保存配置失败: {e}")
 
+        # 退出时清理暂存副本（工作副本）：此时标签页已清空/重建，配置里不再引用任何副本；
+        # 仍在打印的批次由 _staged_reference_paths 兜住（打印线程已在上方停止/等待）
+        try:
+            # 先结束还在跑的转换线程，避免它们继续读即将被清理的暂存副本
+            self._cancel_all_convert_workers()
+            self._sweep_staged_files("退出清理")
+        except Exception as e:
+            logger.warning(f"退出清理暂存副本失败: {e}")
+
         # 断开云端连接
         if self._cloud_client:
             self._cloud_client.stop()
@@ -7108,6 +7296,8 @@ class MainWindow(QMainWindow):
         self._update_total_cost()
         self._refresh_tab_display()
         self._sync_edit_enabled(False)
+        # 被移除任务的暂存副本已无人引用 → 立即回收（仍被其他标签页/打印批次引用的会保留）
+        self._sweep_staged_files("移除任务")
 
     def _on_start_print(self):
         """开始打印当前标签页的所有文件。"""
@@ -7127,7 +7317,14 @@ class MainWindow(QMainWindow):
     # ──────── 添加文件核心实现 ────────
 
     def __add_files_to_table_impl(self, files, target_order_key=None):
-        """添加文件到当前标签页的核心逻辑。"""
+        """添加文件到当前标签页的核心逻辑。
+
+        2026-12 兼容性修复（压缩包拖拽）：每个文件先复制一份「工作副本」到本地暂存目录
+        （staging.stage_file），列表任务只用副本路径。从压缩包直接拖出来的文件位于解压
+        软件的临时目录（%TEMP%\\Rar$DIa0.123\\...），解压软件退出/临时目录被清理后原文件
+        就没了，原先要等到打印时才报「文件不存在」。原件路径记录在 job.source_path
+        （界面显示与双击打开仍用原件）；副本的回收见 _sweep_staged_files()。
+        """
         # HTML/HTM 已移除；表格(xls/xlsx)在前端标记为不支持类型，不再本地打印
         allowed_types = {
             ".pdf", ".doc", ".docx",
@@ -7139,28 +7336,48 @@ class MainWindow(QMainWindow):
         self._cancel_undo_if_active()
         jobs = self._get_current_jobs()
         rows_before = len(jobs)
-        existing_paths = {j.file_path for j in jobs}
+        existing_paths = {j.file_path for j in jobs if j.file_path}
+        # 原件路径（含副本已在列表里的情况）：同一文件重复添加仍按原逻辑跳过
+        existing_sources = {
+            os.path.normcase(os.path.abspath(j.source_path))
+            for j in jobs if getattr(j, "source_path", "")
+        }
+        staged_count = 0
 
         for f in files:
-            # 跳过已存在的文件
-            if f in existing_paths:
+            if not f:
                 continue
-            ext = os.path.splitext(f)[1].lower()
+            src = os.path.abspath(f)
+            if not os.path.isfile(src):
+                self._log(f"⚠ 已跳过不存在的文件: {f}")
+                continue
+            src_key = os.path.normcase(src)
+            if src in existing_paths or src_key in existing_sources:
+                continue  # 已在列表中
+            ext = os.path.splitext(src)[1].lower()
             if ext not in allowed_types:
                 continue
-            existing_paths.add(f)
+            # 关键：复制工作副本（原件之后被删/临时目录被系统清理都不影响打印）
+            work_path = staging.stage_file(src)
+            if work_path != src:
+                staged_count += 1
+            if work_path in existing_paths:
+                continue
+            existing_paths.add(work_path)
+            existing_sources.add(src_key)
+
             page_count = 0; orientation = ""
             if ext == ".pdf":
-                info = get_pdf_info(f); page_count = info["page_count"]; orientation = info["orientation"]
+                info = get_pdf_info(work_path); page_count = info["page_count"]; orientation = info["orientation"]
             elif ext == ".docx":
-                orientation = get_docx_orientation(f)
+                orientation = get_docx_orientation(work_path)
             elif ext in image_exts:
-                info = get_image_info(f); page_count = info["page_count"]; orientation = info["orientation"]
+                info = get_image_info(work_path); page_count = info["page_count"]; orientation = info["orientation"]
             engine = "word"
             if ext in (".doc", ".docx"):
                 from converter import _read_docx_last_editor, get_available_engines
                 available = get_available_engines()
-                editor = _read_docx_last_editor(f) if ext == ".docx" else None
+                editor = _read_docx_last_editor(work_path) if ext == ".docx" else None
                 preferred = "wps" if editor == "wps" else "word"
                 for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
                     if available.get(eng, False): engine = eng; break
@@ -7168,7 +7385,8 @@ class MainWindow(QMainWindow):
             duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
 
             job = PrintJob(
-                file_path=f, copies=1,
+                file_path=work_path, copies=1,
+                source_path=src,  # 用户原件路径（显示/打开文件用；副本丢失时按此重建）
                 duplex="off" if is_image else "on",
                 duplex_mode=duplex_mode,
                 page_count=page_count, orientation=orientation, engine=engine,
@@ -7179,7 +7397,10 @@ class MainWindow(QMainWindow):
             self._set_current_jobs(jobs)
             self._rebuild_table()
             self._refresh_tab_display()
-            self._log(f"标签页 {self._current_tab}: 已添加 {len(jobs) - rows_before} 个文件")
+            _msg = f"标签页 {self._current_tab}: 已添加 {len(jobs) - rows_before} 个文件"
+            if staged_count:
+                _msg += f"（{staged_count} 个已复制到暂存副本，原件删除/移动不影响打印）"
+            self._log(_msg)
             for i, job in enumerate(jobs):
                 ext = os.path.splitext(job.file_path)[1].lower()
                 if ext != ".pdf":

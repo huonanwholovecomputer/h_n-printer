@@ -108,6 +108,7 @@ class PrintJob:
     task_id: int = 0         # 云端任务子任务 ID (order_files.id)，0=本地任务
     order_id: int = 0        # 云端父订单 ID (orders.id)，0=本地任务
     source_md5: str = ""     # 源文件 MD5，用于 PDF 缓存查找
+    source_path: str = ""    # 用户原始文件路径（file_path 为暂存副本时记录原件，见 staging.py）
     display_name: str = ""   # 显示用的文件名（云端任务用原始文件名，本地任务为空则用 file_path 的 basename）
     order_number: str = ""   # 订单号（云端的来自后端，本地的在复制时生成）
     remark: str = ""         # 订单/任务备注（云端订单来自后端 remark；本地任务可自行填写，≤100 字）
@@ -116,6 +117,7 @@ class PrintJob:
     def to_dict(self) -> dict[str, Any]:
         return {
             "file_path": self.file_path,
+            "source_path": self.source_path,
             "copies": self.copies,
             "duplex": self.duplex,
             "duplex_mode": self.duplex_mode,
@@ -138,6 +140,7 @@ class PrintJob:
     def from_dict(cls, data: dict[str, Any]) -> "PrintJob":
         return cls(
             file_path=data.get("file_path", ""),
+            source_path=data.get("source_path", ""),
             copies=int(data.get("copies", 1)),
             duplex=data.get("duplex", "on"),
             duplex_mode=data.get("duplex_mode", ""),

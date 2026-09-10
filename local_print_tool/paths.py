@@ -9,6 +9,7 @@ paths.py — 用户数据目录统一管理（自更新配套）
 （幂等：目标已存在则跳过，源文件保留兜底不删除）。
 
 pdf_cache 属于可重建缓存（丢了只是首次转换变慢），不做全量迁移，避免启动卡顿。
+file_cache（添加文件的暂存副本，见 staging.py）同理不迁移：副本本身按引用随用随建。
 """
 
 from __future__ import annotations
@@ -65,6 +66,17 @@ def logs_dir() -> str:
 def pdf_cache_dir() -> str:
     """PDF 转换缓存（可重建；旧版程序目录的缓存不迁移，按需重建）"""
     d = os.path.join(get_app_data_dir(), "pdf_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def file_cache_dir() -> str:
+    """添加文件的「工作副本」暂存目录（staging.py 管理）。
+
+    从压缩包直接拖出来的文件位于解压软件的临时目录，原文件随时可能消失；
+    入列表前复制一份到这里，列表任务只使用副本（详见 staging.py）。
+    刻意不用 %TEMP%：系统清理 %TEMP% 正是要规避的问题之一。"""
+    d = os.path.join(get_app_data_dir(), "file_cache")
     os.makedirs(d, exist_ok=True)
     return d
 

@@ -33,6 +33,8 @@ import requests as http_requests
 
 from PySide6.QtCore import QObject, Signal
 
+import staging  # 云端下载文件落到暂存目录（%APPDATA%，抗临时目录清理；见 staging.py）
+
 logger = logging.getLogger(__name__)
 
 # ---------- 常量 ----------
@@ -1153,8 +1155,11 @@ class CloudClient(QObject):
     # ── 临时文件清理 ──
 
     def _cleanup_old_temp_files(self):
-        """启动时清理 %TEMP% 下残留超过 24h 的云端下载临时文件（hn_cloud_*/hn_analyze_*）。
-        正常路径由下载逻辑删除/保留；此方法只兜底进程崩溃等遗留场景。"""
+        """清理 %TEMP% 下残留超过 24h 的旧版临时文件（hn_cloud_*/hn_analyze_*）。
+
+        2026-12 起云端任务下载文件已改存暂存目录（%APPDATA%\\HN打印工具\\file_cache，
+        见 staging.py），不再受临时目录清理影响；此方法只用于回收**旧版本遗留在 %TEMP%
+        的下载文件**以及页数分析的临时文件（hn_analyze_*，用完即删，此处为崩溃兜底）。"""
         cutoff = time.time() - 24 * 3600
         try:
             for name in os.listdir(tempfile.gettempdir()):
@@ -1237,7 +1242,22 @@ class CloudClient(QObject):
                 original_name = os.path.basename(original_name) or f"cloud_task_{task_id}.dat"
                 original_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", original_name)
 
-                dest = os.path.join(tempfile.gettempdir(), f"hn_cloud_{task_id}_{original_name}")
+                # 下载到程序暂存目录（%APPDATA%\HN打印工具\file_cache\cloud_<task_id>\）：
+                # 不再用 %TEMP% —— 临时目录被磁盘清理/安全软件清理或重启后文件会消失，
+                # 而预约打印可能数小时后才到点；暂存目录里的文件同样受 GUI 按引用清理保护。
+                dest = ""
+                try:
+                    cand = staging.cloud_download_path(task_id, original_name)
+                    if staging.ensure_dir_for(cand):
+                        dest = cand
+                    else:
+                        logger.warning("暂存子目录不可用，回退下载到系统临时目录")
+                except Exception as e:
+                    logger.warning(f"暂存目录不可用，回退下载到系统临时目录: {e}")
+                if not dest:
+                    dest = os.path.join(tempfile.gettempdir(), f"hn_cloud_{task_id}_{original_name}")
+                # 标记「使用中」：下载/写缓存期间即使触发暂存清扫也不删（防刚下好就被清掉）
+                staging.reserve(dest)
 
                 total = int(resp.headers.get("content-length", 0))
                 downloaded = 0
@@ -1305,7 +1325,7 @@ class CloudClient(QObject):
             task.status = "error"
             task.error_message = str(e)
             # P1: 失败路径删除残留的半截文件；成功路径文件保留给打印用，
-            # 打印完成后由 GUI 侧负责删除（本文件无法感知打印完成时机）
+            # 打印完成后由 GUI 侧的按引用清扫（_sweep_staged_files）负责回收
             if dest:
                 try:
                     if os.path.isfile(dest):
@@ -1314,6 +1334,9 @@ class CloudClient(QObject):
                     pass
             self.task_updated.emit(task)
             self.status_message.emit(f"☁ 下载失败 #{task.task_id}: {e}")
+        finally:
+            # 下载结束（成功已挂到 task.local_path / 失败已删除）→ 解除「使用中」标记
+            staging.unreserve(dest)
 
     def _report_file_ready_if_scheduled(self, task: CloudTask):
         """预约单文件下载完成 → 上报 file_ready（后端 downloading→waiting，冻结时自动解除）。
