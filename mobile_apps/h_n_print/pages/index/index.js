@@ -233,8 +233,9 @@ Component({
       this._initScrollEngine()
       this._measureSegWidths()   // 预缓存滑块宽度，保证首次拖动即可跟手
       setTimeout(() => this._measureSegWidths(), 300)
-      this._uploadTimers = {}   // { index: intervalId } — 每个文件独立的进度条定时器
-      this._pollTimers = {}     // { index: intervalId } — 页数轮询定时器
+      this._uploadTimers = {}   // { fileUid: entry } — 每个文件独立的进度条定时器（键=文件稳定 uid）
+      this._pollTimers = {}     // { fileUid: intervalId } — 页数轮询定时器（键=文件稳定 uid）
+      this._fileUidSeq = 0      // 文件稳定身份自增序列（见 _fileUid / _fileIndexByUid）
       this._buildScheduleDays()
       this.doLogin()
     },
@@ -879,6 +880,7 @@ Component({
             const sizeKB = Number(file.size) || 0
             const fileIndex = baseIndex + i
             const newFile = {
+              _uid: this._nextFileUid(),   // 稳定身份：异步回调按它反查下标，不用闭包里的旧索引
               name: item.name,
               size: file.size,
               path: file.path,
@@ -902,7 +904,7 @@ Component({
               singlePage: false,    // 有效选择恰好 1 页 → 模式行隐藏、提交强制单面
             }
             patches['selectedFiles[' + fileIndex + ']'] = newFile
-            uploads.push({ fileIndex, path: file.path })
+            uploads.push({ fileUid: newFile._uid, path: file.path })
           })
           this.setData(patches)
           // 圆点动画和计数统一延迟 0.25s，与卡片入场同步
@@ -929,7 +931,7 @@ Component({
           this._recalcFileListHeight()
           this._scheduleMeasure(400)
           setTimeout(() => this._scheduleMeasure(850), 850)  // 动画完成后修正为精确值
-          uploads.forEach((u) => this.startFileUpload(u.fileIndex, u.path))
+          uploads.forEach((u) => this.startFileUpload(u.fileUid, u.path))
         },
         fail: (err) => {
           console.log('选择文件失败', err)
@@ -939,10 +941,12 @@ Component({
 
     onRemoveFile(e) {
       const index = e.currentTarget.dataset.index
-      this.stopFileUploadTimer(index)
-      this._stopPageCountPoll(index)
-      // 删除已上传但页数未确认的文件 → 取消本地页数分析（避免白下载）
+      // 计时器/轮询以文件 uid 为键（不再随索引重映射）→ 删除前按该文件的 uid 精确停掉
       const removed = this.data.selectedFiles[index]
+      const removedUid = this._fileUid(removed)
+      this.stopFileUploadTimer(removedUid)
+      this._stopPageCountPoll(removedUid)
+      // 删除已上传但页数未确认的文件 → 取消本地页数分析（避免白下载）
       if (removed && removed.fileId && !(removed.pageCount > 0)) {
         this._cancelPageAnalysis([removed.fileId])
       }
@@ -986,17 +990,9 @@ Component({
       setTimeout(() => {
         const files = this.data.selectedFiles.slice()
         files.splice(index, 1)
-        const remapTimers = (timersObj) => {
-          const newTimers = {}
-          const oldKeys = Object.keys(timersObj).map(Number)
-          oldKeys.forEach((k) => {
-            if (k > index) newTimers[k - 1] = timersObj[k]
-            else if (k < index) newTimers[k] = timersObj[k]
-          })
-          return newTimers
-        }
-        this._uploadTimers = remapTimers(this._uploadTimers || {})
-        this._pollTimers = remapTimers(this._pollTimers || {})
+        // 计时器/轮询键是文件 uid（与下标无关），删除元素后**无需重映射** ——
+        // 旧实现按索引 remap 只修了一半：setData 回调路径仍用闭包里的旧索引，
+        // 于是「上传中删除前面的文件」会把 B 的结果写进 C 的卡片。现按 uid 定位，天然免疫。
         const { windowWidth: ww, windowHeight: wh } = wx.getWindowInfo()
         const rpxR = (ww || 375) / 750
         // 外部高度 = min(上限, 剩余卡片按类型实测高之和)：与 _bumpForNewFile 同规则，重算而非递减。
@@ -1033,6 +1029,7 @@ Component({
         const pageRange = f.page_range || ''
         const hasFileId = !!f.file_id
         const file = {
+          _uid: this._nextFileUid(),   // 稳定身份（重印恢复路径同样按 uid 定位轮询/上传）
           name: name,
           size: Number(f.size) || 0,
           path: '',
@@ -1076,42 +1073,76 @@ Component({
       })
       this._fileListPx = Math.min(listCapPx, Math.round(sumRpx * rpxRatio))
       this.setData({ fileListHeight: Math.max(0, this._fileListPx) })
-      // 页数未知的文件重新启动页数轮询
-      files.forEach((f, i) => {
+      // 页数未知的文件重新启动页数轮询（按 uid 起，删除/挪位后自动失效）
+      files.forEach((f) => {
         if (f.fileId && !f.isImage && !(f.pageCount > 0)) {
-          this._startPageCountPoll(i, f.fileId)
+          this._startPageCountPoll(this._fileUid(f), f.fileId)
         }
       })
       this._scheduleMeasure(400)
       setTimeout(() => this._scheduleMeasure(850), 850)
     },
 
+    // ==================== 文件稳定身份（异步回调定位）====================
+    /* P1（审计 2026-12）：上传/轮询的异步回调此前用**索引**写回 setData，
+       而 onRemoveFile 会 splice 掉元素、其后元素全部前移 —— 「上传中删除前面的文件」
+       会让 B 文件的上传结果（file_id/页数）写进 C 的 setData 路径，
+       提交时文件名与 file_id 错配：打印的是另一个文件的内容、按另一个文件的页数计价。
+       原有的 timer remap 只修了定时器一半（setData 路径仍用闭包旧索引），且漏了 restore 路径。
+       现统一改为：每个文件携带稳定 `_uid`，异步回调**每次现算下标**，
+       文件已不在列表中则丢弃结果；计时器也一律以 uid 为键（索引变动天然不影响）。 */
+
+    /** 取（必要时惰性分配）文件对象的稳定 uid。 */
+    _fileUid(f) {
+      if (!f) return -1
+      if (!f._uid) f._uid = this._nextFileUid()
+      return f._uid
+    },
+
+    _nextFileUid() {
+      this._fileUidSeq = (this._fileUidSeq || 0) + 1
+      return this._fileUidSeq
+    },
+
+    /** 按 uid 现算当前下标；文件已删除返回 -1（此后一律丢弃迟到结果）。 */
+    _fileIndexByUid(uid) {
+      const files = this.data.selectedFiles || []
+      for (let i = 0; i < files.length; i++) {
+        if (files[i] && files[i]._uid === uid) return i
+      }
+      return -1
+    },
+
     // ==================== 文件上传（每个文件独立进度条）====================
 
-    startFileUpload(fileIndex, filePath) {
+    startFileUpload(fileUid, filePath) {
       const token = wx.getStorageSync('token') || ''
-      this.stopFileUploadTimer(fileIndex)
+      this.stopFileUploadTimer(fileUid)
 
-      const key = 'selectedFiles[' + fileIndex + ']'
+      // 每次写回前现算下标（文件可能在 await/回调期间被删除或前后挪位）
+      const keyFor = () => {
+        const i = this._fileIndexByUid(fileUid)
+        return i >= 0 ? 'selectedFiles[' + i + ']' : ''
+      }
       // 先登记 entry（timer/task 后续填充），再启动进度条定时器，避免声明前引用（TDZ）
-      this._uploadTimers[fileIndex] = {
+      this._uploadTimers[fileUid] = {
         realProgress: 0,
         timer: null,
         task: null,
       }
 
       // 每 0.5s 把显示进度向真实进度推进
-      this._uploadTimers[fileIndex].timer = setInterval(() => {
-        const entry = this._uploadTimers[fileIndex]
+      this._uploadTimers[fileUid].timer = setInterval(() => {
+        const entry = this._uploadTimers[fileUid]
         if (!entry || !entry.realProgress) return  // 上传已被取消
+        const idx = this._fileIndexByUid(fileUid)
+        if (idx < 0) { this.stopFileUploadTimer(fileUid); return }  // 文件已删除 → 自停
         const real = entry.realProgress
-        const files = this.data.selectedFiles
-        if (!files[fileIndex]) return
-        const shown = files[fileIndex].progress
+        const shown = this.data.selectedFiles[idx].progress
         if (shown >= real) return
         const next = shown + Math.max(1, (real - shown) * 0.5)
         this.setData({
-          [key + '.progress']: Math.round(Math.min(next, real))
+          ['selectedFiles[' + idx + '].progress']: Math.round(Math.min(next, real))
         })
       }, 500)
 
@@ -1121,19 +1152,25 @@ Component({
         name: 'file',
         header: { 'Authorization': 'Bearer ' + token },
         success: (uploadRes) => {
-          const entry = this._uploadTimers[fileIndex]
+          const entry = this._uploadTimers[fileUid]
           if (!entry || entry.cancelled) return  // 上传已被取消
+          // 文件已被删除 → 结果整份丢弃（绝不落到别的文件卡片上）
+          if (this._fileIndexByUid(fileUid) < 0) {
+            this.stopFileUploadTimer(fileUid)
+            return
+          }
           if (uploadRes.statusCode === 401) {
-            this.stopFileUploadTimer(fileIndex)
-            this.setData({ [key + '.uploading']: false })
+            this.stopFileUploadTimer(fileUid)
+            this.setData({ [keyFor() + '.uploading']: false })
             this.doLoginAndRetry(() => {
+              if (this._fileIndexByUid(fileUid) < 0) return
               this.setData({
-                [key + '.uploading']: true,
-                [key + '.progress']: 0,
-                [key + '.fileId']: null,
-                [key + '.failed']: false,
+                [keyFor() + '.uploading']: true,
+                [keyFor() + '.progress']: 0,
+                [keyFor() + '.fileId']: null,
+                [keyFor() + '.failed']: false,
               })
-              this.startFileUpload(fileIndex, filePath)
+              this.startFileUpload(fileUid, filePath)
             })
             return
           }
@@ -1162,17 +1199,20 @@ Component({
           }
 
           if (!fileId) {
-            this.stopFileUploadTimer(fileIndex)
-            this.setData({ [key + '.uploading']: false, [key + '.failed']: true })
+            this.stopFileUploadTimer(fileUid)
+            this.setData({ [keyFor() + '.uploading']: false, [keyFor() + '.failed']: true })
             wx.showToast({ title: errMsg, icon: 'none', duration: 2500 })
             return
           }
 
-          console.log('文件上传成功，返回 ID:', fileId, '页数:', pageCount, 'index:', fileIndex)
-          this._uploadTimers[fileIndex].realProgress = 100
-          this.stopFileUploadTimer(fileIndex)
+          const currentIndex = this._fileIndexByUid(fileUid)
+          if (currentIndex < 0) { this.stopFileUploadTimer(fileUid); return }  // 兜底：已删除
+          const key = 'selectedFiles[' + currentIndex + ']'
+          console.log('文件上传成功，返回 ID:', fileId, '页数:', pageCount, 'uid:', fileUid, 'index:', currentIndex)
+          this._uploadTimers[fileUid].realProgress = 100
+          this.stopFileUploadTimer(fileUid)
           // 图片固定 1 页，覆盖后端返回值（确保一致性）
-          const file = this.data.selectedFiles[fileIndex]
+          const file = this.data.selectedFiles[currentIndex]
           if (file && file.isImage) pageCount = 1
 
           // 判断页数状态：PDF 直接确认，doc/docx 进入分析中
@@ -1190,33 +1230,34 @@ Component({
           })
           // 页数确认(PDF) → 文本↔网格模式可能切换、整份1页卡片收缩 → 同步 singlePage + 重算列表高度
           if (file && !file.isImage) {
-            this._refreshSinglePage(fileIndex)
+            this._refreshSinglePage(currentIndex)
           }
           // 页数未知时启动轮询（等待本地打印工具分析回报）
           if (pageCount <= 0 && file && !file.isImage) {
-            this._startPageCountPoll(fileIndex, fileId)
+            this._startPageCountPoll(fileUid, fileId)
           }
           // DOM 从"上传中+进度条"切换为"已上传+份数+打印范围"，需更长延迟等渲染稳定
           this._scheduleMeasure(200)
           setTimeout(() => this._scheduleMeasure(450), 450)
         },
         fail: (err) => {
-          const entry2 = this._uploadTimers[fileIndex]
+          const entry2 = this._uploadTimers[fileUid]
           if (entry2 && entry2.cancelled) return  // 上传已被取消（abort 也会触发 fail）
           console.error('文件上传失败:', err)
-          this.stopFileUploadTimer(fileIndex)
-          this.setData({ [key + '.uploading']: false, [key + '.failed']: true })
+          this.stopFileUploadTimer(fileUid)
+          if (this._fileIndexByUid(fileUid) < 0) return  // 已删除 → 不写任何卡片
+          this.setData({ [keyFor() + '.uploading']: false, [keyFor() + '.failed']: true })
           this._scheduleMeasure()
           wx.showToast({ title: '文件上传失败', icon: 'none', duration: 2000 })
         }
       })
 
       task.onProgressUpdate((res) => {
-        if (typeof res.progress === 'number') {
-          this._uploadTimers[fileIndex].realProgress = res.progress
+        if (typeof res.progress === 'number' && this._uploadTimers[fileUid]) {
+          this._uploadTimers[fileUid].realProgress = res.progress
         }
       })
-      this._uploadTimers[fileIndex].task = task
+      this._uploadTimers[fileUid].task = task
     },
 
     // 上传失败卡片"重试"：重置状态后重新上传
@@ -1234,11 +1275,11 @@ Component({
         ['selectedFiles[' + index + '].fileId']: null,
         ['selectedFiles[' + index + '].failed']: false,
       })
-      this.startFileUpload(index, file.path)
+      this.startFileUpload(this._fileUid(file), file.path)
     },
 
-    stopFileUploadTimer(fileIndex) {
-      const entry = this._uploadTimers && this._uploadTimers[fileIndex]
+    stopFileUploadTimer(fileUid) {
+      const entry = this._uploadTimers && this._uploadTimers[fileUid]
       if (!entry) return
       entry.cancelled = true
       if (entry.timer) {
@@ -1253,6 +1294,7 @@ Component({
 
     _stopAllUploadTimers() {
       if (!this._uploadTimers) return
+      // 键是文件 uid（数字），直接用，勿再 Number() 转型丢失语义
       Object.keys(this._uploadTimers).forEach((k) => {
         this.stopFileUploadTimer(Number(k))
       })
@@ -1290,9 +1332,9 @@ Component({
     // 页面重新可见时恢复页数轮询（仅对已上传且仍缺页数的文件）
     _restartPageCountPolls() {
       const files = this.data.selectedFiles || []
-      files.forEach((f, i) => {
+      files.forEach((f) => {
         if (f && f.fileId && !f.isImage && !f.excelWarning && !f.unsupportedFormat && !(f.pageCount > 0)) {
-          this._startPageCountPoll(i, f.fileId)
+          this._startPageCountPoll(this._fileUid(f), f.fileId)
         }
       })
     },
@@ -1301,10 +1343,19 @@ Component({
 
     _MAX_POLL_ATTEMPTS: 60,   // 60 次 × 2s = 最多轮询 120 秒（在线/离线均计数，避免离线时无限轮询）
 
-    _startPageCountPoll(fileIndex, fileId) {
-      this._stopPageCountPoll(fileIndex)
+    _startPageCountPoll(fileUid, fileId) {
+      this._stopPageCountPoll(fileUid)
       if (!fileId) return
       let attempts = 0
+
+      // 现算下标：轮询期间文件可能被删除或前后挪位 → 一律按 uid 定位，
+      // 文件已不在列表（或已被重新上传、fileId 已变）就停轮询并丢弃结果。
+      const locate = () => {
+        const i = this._fileIndexByUid(fileUid)
+        if (i < 0) return -1
+        const f = this.data.selectedFiles[i]
+        return (f && f.fileId === fileId) ? i : -1
+      }
 
       const poll = () => {
         const token = wx.getStorageSync('token') || ''
@@ -1313,6 +1364,8 @@ Component({
           method: 'GET',
           header: { 'Authorization': 'Bearer ' + token },
           success: (res) => {
+            const fileIndex = locate()
+            if (fileIndex < 0) { this._stopPageCountPoll(fileUid); return }
             if (res.statusCode === 200 && res.data && res.data.success) {
               const pc = res.data.page_count || 0
               const verified = res.data.verified || false
@@ -1334,8 +1387,8 @@ Component({
                   // _normalizeAndValidateRangeLines 末尾会 _refreshSinglePage → 单页判定/文本↔网格切换均重算列表高度
                   this._normalizeAndValidateRangeLines(fileIndex)
                 }
-                this._stopPageCountPoll(fileIndex)
-                console.log('页数轮询成功: fileIndex=' + fileIndex + ', pages=' + pc)
+                this._stopPageCountPoll(fileUid)
+                console.log('页数轮询成功: uid=' + fileUid + ', pages=' + pc)
                 return
               }
               // 页数未验证 → 检查打印机是否在线
@@ -1365,8 +1418,8 @@ Component({
                 }
                 attempts++
                 if (attempts >= this._MAX_POLL_ATTEMPTS) {
-                  this._stopPageCountPoll(fileIndex)
-                  console.log('页数轮询超时: fileIndex=' + fileIndex)
+                  this._stopPageCountPoll(fileUid)
+                  console.log('页数轮询超时: uid=' + fileUid)
                 }
               }
             }
@@ -1379,13 +1432,13 @@ Component({
 
       // 立即发第一次，之后每 5 秒一次（原 2s 过于频繁，多个未验证文件会触发 Nginx 限流）
       poll()
-      this._pollTimers[fileIndex] = setInterval(poll, 5000)
+      this._pollTimers[fileUid] = setInterval(poll, 5000)
     },
 
-    _stopPageCountPoll(fileIndex) {
-      if (this._pollTimers && this._pollTimers[fileIndex]) {
-        clearInterval(this._pollTimers[fileIndex])
-        delete this._pollTimers[fileIndex]
+    _stopPageCountPoll(fileUid) {
+      if (this._pollTimers && this._pollTimers[fileUid]) {
+        clearInterval(this._pollTimers[fileUid])
+        delete this._pollTimers[fileUid]
       }
     },
 

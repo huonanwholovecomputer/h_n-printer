@@ -996,14 +996,29 @@ class CloudClient(QObject):
             self.status_message.emit(f"📦 收到清空指令: {msg}")
             removed = 0
             index = self._load_cache_index()
-            for md5 in list(index.keys()):
-                pdf_path = os.path.join(self._cache_dir, f"{md5}.pdf")
+            for key in list(index.keys()):
+                # P1（审计 2026-12）：索引 key 就是缓存文件名主体，可能带
+                # `_landscape`/`_portrait`/`_eword`/`_ewps` 后缀；旧代码按纯 md5 拼名，
+                # 带后缀条目的文件永远匹配不上 → "清空缓存"实际清不掉。
+                pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
                 if os.path.isfile(pdf_path):
                     try:
                         os.remove(pdf_path)
                         removed += 1
                     except OSError:
                         pass
+            # 回收无索引孤儿文件（索引已整份删除，剩下的 .pdf 必然无人引用）
+            try:
+                for name in os.listdir(self._cache_dir):
+                    if not name.lower().endswith(".pdf"):
+                        continue
+                    try:
+                        os.remove(os.path.join(self._cache_dir, name))
+                        removed += 1
+                    except OSError:
+                        pass
+            except OSError:
+                pass
             if os.path.exists(self._cache_index_path()):
                 try:
                     os.remove(self._cache_index_path())
@@ -1461,24 +1476,46 @@ class CloudClient(QObject):
         self._schedule_cache_cleanup()
 
     def _cleanup_pdf_cache(self):
-        """清理过期的缓存 PDF（超过保留小时数）。"""
+        """清理过期的缓存 PDF（超过保留小时数）+ 回收无索引孤儿文件。"""
         if self._CACHE_RETENTION_HOURS <= 0:
             return  # 0 = 永不过期
         cutoff = datetime.now() - timedelta(hours=self._CACHE_RETENTION_HOURS)
         index = self._load_cache_index()
         removed = 0
-        for md5, meta in list(index.items()):
+        live_keys: set[str] = set()
+        for key, meta in list(index.items()):
             created_str = meta.get("created_at", "")
             try:
                 created = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S")
+                # P1（审计 2026-12）：索引 key（可能含 _landscape/_eword 等后缀）就是
+                # 文件名主体，旧代码按纯 md5 拼名 → 带后缀条目永不过期清理，缓存无限膨胀。
                 if created < cutoff:
-                    pdf_path = os.path.join(self._cache_dir, f"{md5}.pdf")
+                    pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
                     if os.path.isfile(pdf_path):
                         os.remove(pdf_path)
-                    del index[md5]
+                    del index[key]
                     removed += 1
+                else:
+                    live_keys.add(f"{key}.pdf")
             except (ValueError, OSError):
                 pass
+        # 孤儿回收：磁盘上存在、索引里却没有的 .pdf（历史 key 失配残留 / 崩溃半途产物）。
+        # 仅回收早于 cutoff 的（避免误删"刚写完文件、索引尚未落盘"的竞态窗口）。
+        cutoff_ts = cutoff.timestamp()
+        try:
+            for name in os.listdir(self._cache_dir):
+                if not name.lower().endswith(".pdf") or name in live_keys:
+                    continue
+                full = os.path.join(self._cache_dir, name)
+                try:
+                    if os.path.getmtime(full) < cutoff_ts:
+                        os.remove(full)
+                        removed += 1
+                        logger.info(f"回收无索引孤儿缓存: {name}")
+                except OSError:
+                    pass
+        except OSError:
+            pass
         if removed > 0:
             self._save_cache_index(index)
             self.status_message.emit(f"📦 已清理 {removed} 个过期缓存 PDF")

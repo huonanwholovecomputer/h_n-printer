@@ -23,6 +23,21 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 
+def _com_uninitialize_quietly() -> None:
+    """反初始化当前线程的 COM（吞掉异常，绝不影响主流程）。
+
+    P1（审计 2026-12）：pywin32 的 `pythoncom.CoInitialize()` **返回 None**，
+    不是 S_OK(0)。因此历史写法 `if com_init == 0: CoUninitialize()` 的条件恒为 False，
+    所有正常路径永不反初始化（当前靠避免重复初始化不崩，属巧合）。
+    统一改为无条件配对，与 `start_word_warmup` 的 finally 写法一致。
+    """
+    try:
+        import pythoncom
+        pythoncom.CoUninitialize()
+    except Exception as e:  # 重复反初始化 / 未初始化 → 忽略
+        logger.debug(f"CoUninitialize 忽略异常: {e}")
+
+
 # ============================================================
 # 多引擎转换缓存
 # ============================================================
@@ -431,8 +446,8 @@ def _convert_via_word_com(file_path: str, output_pdf: str) -> None:
 
     logger.info(f"Word COM: 开始转换 {os.path.basename(file_path)}")
 
-    # COM 线程初始化（仅在首次初始化时才 CoUninitialize）
-    com_init = pythoncom.CoInitialize()
+    # COM 线程初始化（finally 中无条件配对 _com_uninitialize_quietly）
+    pythoncom.CoInitialize()  # P1: 返回值恒为 None，finally 里无条件配对反初始化
 
     word = None
     doc = None
@@ -476,9 +491,8 @@ def _convert_via_word_com(file_path: str, output_pdf: str) -> None:
                     word.Quit()
             except Exception:
                 pass
-        # 仅当我们是首次初始化 COM（CoInitialize 返回 S_OK=0）时才反初始化
-        if com_init == 0:
-            pythoncom.CoUninitialize()
+        # P1: 无条件配对反初始化（CoInitialize 返回 None，比较 0 的旧写法恒不成立）
+        _com_uninitialize_quietly()
         if os.path.isfile(temp_input):
             try:
                 os.remove(temp_input)
@@ -505,7 +519,7 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
     # P2-4: 与 Word 路径对齐 — 打开前先复制到临时副本，避免文件锁，finally 清理
     temp_input = _copy_to_temp(file_path)
 
-    com_init = pythoncom.CoInitialize()
+    pythoncom.CoInitialize()  # P1: 返回值恒为 None，finally 里无条件配对反初始化
 
     wps = None
     doc = None
@@ -545,9 +559,8 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
                     wps.Quit()
             except Exception:
                 pass
-        # P2-9: CoInitialize 返回 S_OK(0)，`is None` 恒 False 导致永不反初始化
-        if com_init == 0:
-            pythoncom.CoUninitialize()
+        # P1: 无条件配对反初始化（CoInitialize 返回 None，`== 0` 恒 False）
+        _com_uninitialize_quietly()
         if os.path.isfile(temp_input):
             try:
                 os.remove(temp_input)
@@ -644,7 +657,7 @@ def _get_com_page_counts_batch(
         import win32com.client
 
         remaining: list[str] = []
-        com_init = pythoncom.CoInitialize()
+        pythoncom.CoInitialize()  # P1: 返回值恒为 None，finally 里无条件配对反初始化
 
         app = None
         try:
@@ -703,8 +716,8 @@ def _get_com_page_counts_batch(
                         app.Quit()
                     except Exception:
                         pass
-            if com_init == 0:  # P2-9: CoInitialize 返回 S_OK(0) 才算初始化成功，需配对 CoUninitialize
-                pythoncom.CoUninitialize()
+            # P1: 无条件配对反初始化（CoInitialize 返回 None，`== 0` 恒 False）
+            _com_uninitialize_quietly()
 
         return remaining
 
@@ -731,7 +744,7 @@ def _get_word_page_count(file_path: str) -> int:
     import win32com.client
 
     temp_fp = _copy_to_temp(file_path)
-    com_init = pythoncom.CoInitialize()
+    pythoncom.CoInitialize()  # P1: 返回值恒为 None，finally 里无条件配对反初始化
     word = None
     doc = None
     try:
@@ -765,8 +778,8 @@ def _get_word_page_count(file_path: str) -> int:
                     word.Quit()
             except Exception:
                 pass
-        if com_init == 0:  # P2-9: CoInitialize 返回 S_OK(0)，`is None` 恒 False 导致永不反初始化
-            pythoncom.CoUninitialize()
+        # P1: 无条件配对反初始化（CoInitialize 返回 None，`== 0` 恒 False）
+        _com_uninitialize_quietly()
         if os.path.isfile(temp_fp):
             try:
                 os.remove(temp_fp)
@@ -785,7 +798,7 @@ def _get_wps_page_count(file_path: str) -> int:
     abs_input = os.path.abspath(file_path)
     prog_id = _wps_progid
 
-    com_init = pythoncom.CoInitialize()
+    pythoncom.CoInitialize()  # P1: 返回值恒为 None，finally 里无条件配对反初始化
     wps = None
     doc = None
     try:
@@ -819,8 +832,8 @@ def _get_wps_page_count(file_path: str) -> int:
                     wps.Quit()
             except Exception:
                 pass
-        if com_init == 0:  # P2-9: CoInitialize 返回 S_OK(0)，`is None` 恒 False 导致永不反初始化
-            pythoncom.CoUninitialize()
+        # P1: 无条件配对反初始化（CoInitialize 返回 None，`== 0` 恒 False）
+        _com_uninitialize_quietly()
 
 
 # ============================================================

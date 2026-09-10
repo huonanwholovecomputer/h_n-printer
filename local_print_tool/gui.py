@@ -1472,6 +1472,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._config_path = config_path
         self._config = PrinterConfig.load(config_path)
+        # P1（审计 2026-12）：配置落盘锁。后台线程（价格同步/成员名单同步/本地订单上传）
+        # 与主线程会并发写同一份 print_config.json，save() 的 tmp+os.replace 只保证
+        # 单次写不撕裂，不保证并发调用不互相覆盖，故在此串行化。
+        self._config_save_lock = threading.Lock()
         self._worker: Optional[PrintWorker] = None
         self._pending_jobs: list[PrintJob] = []
         self._theme_manager = theme_manager
@@ -2301,9 +2305,21 @@ class MainWindow(QMainWindow):
 
     def _update_check_worker(self, manual: bool):
         try:
-            from updater import fetch_update_info, compare_versions
+            from updater import fetch_update_info, compare_versions, VersionFormatError
             manifest = fetch_update_info()
-            if manifest and compare_versions(APP_VERSION, manifest.get("version", "")):
+            if not manifest:
+                if manual:
+                    self._updateCheckDone.emit(("latest", None, manual))
+                else:
+                    self._updateCheckDone.emit(("none", None, manual))
+                return
+            try:
+                newer = compare_versions(APP_VERSION, manifest.get("version", ""))
+            except VersionFormatError as e:
+                # 版本号含非数字段（如 "4.5.13a"）：显式报错，绝不静默当作"无更新"
+                self._updateCheckDone.emit(("manifest_error", str(e), manual))
+                return
+            if newer:
                 self._updateCheckDone.emit(("available", manifest, manual))
             elif manual:
                 self._updateCheckDone.emit(("latest", None, manual))
@@ -2333,6 +2349,16 @@ class MainWindow(QMainWindow):
                 self._perform_update(manifest)
         elif kind == "latest" and manual:
             QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}")
+        elif kind == "manifest_error":
+            # 版本号含非数字段 → 显式报错。旧实现会把非数字段归零，导致此类版本
+            # 永远判定为"不更新"，发布者无从察觉（静默失效）。
+            detail = manifest if isinstance(manifest, str) else str(manifest)
+            self._log(f"⚠ 更新清单版本号格式非法，已跳过本次更新：{detail}")
+            if manual:
+                QMessageBox.warning(
+                    self, "检查更新",
+                    f"更新清单版本号格式非法，已拒绝本次更新：\n{detail}\n\n"
+                    "版本号只允许纯数字点分段（如 4.5.14），请联系发布者修正。")
         elif kind == "error" and manual:
             QMessageBox.warning(self, "检查更新", "检查更新失败，请检查网络连接后重试")
 
@@ -2837,6 +2863,44 @@ class MainWindow(QMainWindow):
             old_key = st.get("tab_key")
             if old_key and old_key in key_map:
                 st["tab_key"] = key_map[old_key]
+        # P1（审计 2026-12）：自动打印重试队列的 tab_key 也必须同步重映射。
+        # 原实现漏了这一处 —— 队列里残留旧 key，标签页删除/重编号后旧 key 可能
+        # 恰好对上**另一个**标签页，补打时会把别的订单的文件打出来（计费错误）。
+        self._remap_auto_print_retry(key_map)
+
+    def _remap_auto_print_retry(self, key_map: dict) -> None:
+        """标签页重编号后同步重映射 `_auto_print_retry` 队列中的 tab_key。
+
+        映射不到的（标签页已被删除）置空，补打时按 order_id 反查标签页兜底，
+        **绝不保留旧 key 去撞别的标签页**。
+        """
+        for item in self._auto_print_retry:
+            old_key = item.get("tab_key")
+            if not old_key:
+                continue
+            item["tab_key"] = key_map.get(old_key, "")
+
+    def _drop_auto_print_retry_for_tab(self, tab_key: str) -> None:
+        """标签页被删除/清空 → 丢弃指向它的补打队列项（防按旧 key 打到别的订单）。"""
+        if not tab_key:
+            return
+        before = len(self._auto_print_retry)
+        self._auto_print_retry[:] = [
+            it for it in self._auto_print_retry if it.get("tab_key") != tab_key
+        ]
+        dropped = before - len(self._auto_print_retry)
+        if dropped:
+            self._log(f"🗑 已丢弃 {dropped} 条指向已删除标签页 {tab_key} 的补打队列项")
+
+    def _find_tab_key_by_order_id(self, order_id: int) -> str:
+        """按订单号反查当前标签页 key（标签页重编号/删除后定位补打目标用）。"""
+        if not order_id:
+            return ""
+        for key, tab in self._config.tabs.items():
+            for job in (tab.jobs or []):
+                if getattr(job, "order_id", 0) == order_id:
+                    return key
+        return ""
 
     def _cleanup_empty_tabs(self, after_key: str | None = None):
         """删除空标签页。after_key 不为 None 时仅删除 key > after_key 的标签页。"""
@@ -2854,6 +2918,7 @@ class MainWindow(QMainWindow):
             self._log(f"🗑 已删除空标签页 {key}")
             # 预约单指向该标签页 → 联动清理状态机（防到点打印空标签页）
             self._cleanup_scheduled_orders_for_tab(key, reason="标签页已删除")
+            self._drop_auto_print_retry_for_tab(key)
         if removed:
             self._renumber_tabs()
             self._save_config()
@@ -2941,11 +3006,32 @@ class MainWindow(QMainWindow):
         """获取标签页设置对象。"""
         return self._config.tabs.get(key)
 
-    def _save_config(self):
-        """实时保存配置到 JSON 文件。"""
+    def _is_gui_thread(self) -> bool:
+        """当前是否运行在 GUI 主线程（QObject.thread() 即该对象的归属线程）。"""
         try:
-            self._sync_ui_to_config()
-            self._config.save(self._config_path)
+            return QThread.currentThread() is self.thread()
+        except Exception:
+            return True  # 判定失败时按主线程处理（保持旧行为，不丢 UI 同步）
+
+    def _save_config(self, sync_ui: bool | None = None):
+        """实时保存配置到 JSON 文件。
+
+        sync_ui：是否先把 UI 控件状态同步回 config。默认 None = 自动判定，
+        **仅当在 GUI 主线程调用时**才读控件。
+
+        P1（审计 2026-12）：价格同步线程（_sync_pricing）、成员名单同步、
+        本地订单上传等**后台线程**此前也直接调用本方法，而 _sync_ui_to_config()
+        会读 `QComboBox.currentData()` 等 QWidget —— 从非 GUI 线程调用 QWidget
+        方法属未定义行为（间歇性崩溃源），且与主线程并发写配置文件存在竞态。
+        后台线程请传 sync_ui=False（纯 config 落盘），仅主线程可读控件。
+        """
+        try:
+            if sync_ui is None:
+                sync_ui = self._is_gui_thread()
+            if sync_ui:
+                self._sync_ui_to_config()
+            with self._config_save_lock:
+                self._config.save(self._config_path)
         except Exception as e:
             logger.warning(f"自动保存配置失败: {e}")
 
@@ -3995,7 +4081,8 @@ class MainWindow(QMainWindow):
                         changed = True
                         tab.cover_page_price = self._config.cover_page_price
             if changed:
-                self._save_config()
+                # from_thread=True 时本方法跑在价格同步后台线程 → 显式禁止读 UI 控件
+                self._save_config(sync_ui=not from_thread)
                 # 标记价格变化，由主线程 _on_pricing_synced 打日志（此处可能在后台线程执行，不能直接 _log）
                 self._pricing_changed_flag = True
             if from_thread:
@@ -4287,7 +4374,7 @@ class MainWindow(QMainWindow):
             merged = list(names)   # 严格 = 收支统计成员名单（不并入任何其他来源的名字）
             if merged != base:
                 self._config.admin_names = merged
-                self._save_config()
+                self._save_config(sync_ui=False)   # 后台线程（owner-name-sync）→ 不读 UI 控件
         except Exception as e:
             logger.debug(f"同步本地成员名单失败: {e}")
 
@@ -4330,7 +4417,7 @@ class MainWindow(QMainWindow):
             merged = list(names)   # 严格 = 云端收支配置成员（云端为空 → 空名单，即「(无成员)」）
             if merged != base:
                 self._config.admin_names = merged
-                self._save_config()
+                self._save_config(sync_ui=False)   # 后台线程（owner-name-sync）→ 不读 UI 控件
         except Exception as e:
             logger.debug(f"同步云端成员名单失败: {e}")
 
@@ -4705,7 +4792,8 @@ class MainWindow(QMainWindow):
             for job in tab.jobs:
                 if job.order_number in replacements:
                     job.order_number = replacements[job.order_number]
-        self._save_config()
+        # 本地订单号换云端号（本方法在后台线程执行）→ 不读 UI 控件
+        self._save_config(sync_ui=False)
         # 离线库同步改名（保持待同步；孤儿单靠它找到新号）
         if self._offline_sync:
             for old_num, new_num in replacements.items():
@@ -5443,15 +5531,24 @@ class MainWindow(QMainWindow):
             item = self._auto_print_retry.pop(0)
             tab_key = item.get("tab_key", "")
             order_id = item.get("order_id", 0)
-            if tab_key in self._config.tabs and self._config.tabs[tab_key].jobs:
-                pending = [j for j in self._config.tabs[tab_key].jobs if not getattr(j, 'sent', False)]
+            tab = self._config.tabs.get(tab_key) if tab_key else None
+            if tab is None and order_id:
+                # P1（审计 2026-12）：tab_key 可能因标签页重编号/删除而失效 ——
+                # 按订单号反查真正的标签页兜底，绝不按旧 key 猜（否则会打错订单）。
+                found = self._find_tab_key_by_order_id(order_id)
+                if found:
+                    tab_key = found
+                    tab = self._config.tabs[found]
+                    self._log(f"⚡ 补打订单 #{order_id}: 标签页已重编号，按订单号定位到标签页 {tab_key}")
+            if tab is not None and tab.jobs:
+                pending = [j for j in tab.jobs if not getattr(j, 'sent', False)]
                 if pending:
                     self._log(f"⚡ 打印机空闲，补打订单 #{order_id}（标签页 {tab_key}，{len(pending)} 个未打印文件）")
                     self._start_print_worker(pending, tab_key=tab_key)
                 else:
                     self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key} 已全部打印完成，跳过补打")
             else:
-                self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key} 已无文件，跳过补打")
+                self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key or '(已删除)'} 已无文件，跳过补打")
 
     def _on_about(self):
         """关于对话框。"""
@@ -6187,9 +6284,8 @@ class MainWindow(QMainWindow):
             if retry > 60:
                 # 重试超限：上报后端失败并清理状态机（不静默丢弃）
                 self._log(f"⚠ 预约单 #{order_id}: 打印机持续忙碌，放弃自动打印，请手动在标签页打印")
-                if self._cloud_client:
-                    for t in ready_tasks:
-                        self._cloud_client.report_fail(t.task_id, "打印机持续忙碌，预约打印重试超限")
+                self._report_scheduled_failure(
+                    order_id, ready_tasks, "打印机持续忙碌，预约打印重试超限")
                 self._cleanup_scheduled_order(order_id, reason="打印机持续忙碌，重试超限")
                 return
             self._log(f"⏰ 预约单 #{order_id}: 打印机正忙，10s 后重试（第 {retry} 次）")
@@ -6215,10 +6311,32 @@ class MainWindow(QMainWindow):
             st["printed"] = True
             st["printed_ts"] = int(time.time())
         else:
-            # 标签页无文件（可能被清空/删除）→ 不置 printed、不上报，重置为待重试
-            self._log(f"⚠ 无障碍预约打印：标签页 {st['tab_key']} 无文件，订单 #{order_id} 保持待重试")
-            st["retry_count"] = 0
+            # 标签页无文件（可能被清空/删除，或已被手动打完）→ 不置 printed、不上报。
+            # P1（审计 2026-12）：原实现把 retry_count 重置为 0 —— 直接绕过 60 次上限，
+            # 每 10 秒空转**永不停**，订单既不打印也不上报，永久卡死在状态机里。
+            # 改为与「打印机忙」共用同一重试计数与上限，超限上报失败并结束状态机。
+            retry = st.get("retry_count", 0) + 1
+            st["retry_count"] = retry
+            if retry > 60:
+                self._log(f"⚠ 预约单 #{order_id}: 标签页 {st['tab_key']} 持续无待打印文件，"
+                          f"放弃自动打印并上报失败（已重试 {retry - 1} 次）")
+                self._report_scheduled_failure(
+                    order_id, ready_tasks, "预约打印：标签页持续无待打印文件")
+                self._cleanup_scheduled_order(order_id, reason="标签页持续无文件，重试超限")
+                return
+            self._log(f"⚠ 无障碍预约打印：标签页 {st['tab_key']} 无文件，"
+                      f"订单 #{order_id} 保持待重试（第 {retry} 次）")
             self._start_scheduled_print_timer(order_id, int(time.time()) + 10)
+
+    def _report_scheduled_failure(self, order_id: int, tasks: list, reason: str):
+        """预约单放弃自动打印时统一上报后端失败（绝不静默丢弃）。"""
+        if not self._cloud_client:
+            return
+        for t in tasks or []:
+            try:
+                self._cloud_client.report_fail(t.task_id, reason)
+            except Exception as e:
+                logger.warning(f"预约单 #{order_id} 失败上报异常 (task={getattr(t, 'task_id', '?')}): {e}")
 
     def _on_cloud_start_print(self, order_id: int, scheduled_ts: int, task_ids: list):
         """后端 start_print：到点兜底 / 冻结解除后重设目标。本地已自触发则幂等跳过。"""

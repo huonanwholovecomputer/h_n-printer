@@ -38,11 +38,28 @@ const printState = {
   countdownSec: 0,
   submitting: false,
   _lastOrderResult: null,
-  _pollTimers: {},
-  _uploadTimers: {},
   _fileListPx: 0,
   _wheelValues: { hour: 0, minute: 0, minuteValue: -1, cdMin: 5, cdSec: 0 },
 };
+
+/* ================= 文件身份 / 计时器归属 =================
+   P1（审计 2026-12）：上传/轮询计时器与异步回调一律绑定**文件对象**（`f._uploadTimer`
+   / `f._pollTimer`），不再用 `selectedFiles[idx]` 索引表。
+   旧实现以索引为键，而 removeFile 用 splice 删除元素、后续元素全部前移，于是：
+     · 上传进度/轮询计时器按旧下标停 → 停到别人的、把自己的留成野定时器；
+     · `refreshSinglePage(idx)` / `startPageCountPoll(idx, …)` 按旧下标重查
+       `selectedFiles[idx]` → 作用到**别的文件**上；页数轮询还会因 fileId 不匹配
+       在首次回调即自停，该文件页数永远停在「分析中」。
+   （注：`onload` 闭包持有的是文件**对象引用**，故 fileId/页数本身不会错写 ——
+     实测见 tests/audit_2026_12/verify_frontend_legacy.js。）
+   现统一为：文件携带稳定 `_uid`，异步回调用 `fileIndexOf(f)` 现算下标，
+   文件已被删除则整份丢弃结果。 */
+let _fileUidSeq = 0;
+function _nextFileUid() { _fileUidSeq += 1; return _fileUidSeq; }
+/** 文件对象 → 当前下标（已删除返回 -1）。异步回调必须用它现算，绝不复用闭包里的旧下标。 */
+function fileIndexOf(f) { return f ? printState.selectedFiles.indexOf(f) : -1; }
+/** 文件是否仍在列表中（删除后迟到的异步结果一律丢弃）。 */
+function fileAlive(f) { return fileIndexOf(f) >= 0; }
 
 /* ================= 初始化 ================= */
 
@@ -194,6 +211,7 @@ function setupFileInput() {
         if (cf) { fileToUpload = cf; uploadSize = cf.size; compressedCount++; }
       }
       const fi = {
+        _uid: _nextFileUid(),   // 稳定身份：异步回调按它/对象本身定位，不用索引
         name, size: uploadSize, file: fileToUpload,
         sizeDisplay: (uploadSize / 1024).toFixed(1),
         fileId: null, uploading: true, progress: 0, failed: false,
@@ -634,8 +652,10 @@ function triggerBtnPulse() {
 function removeFile(idx) {
   const f = printState.selectedFiles[idx];
   if (!f) return;
-  stopUploadTimer(idx);
-  stopPageCountPoll(idx);
+  // 计时器按文件对象停（不再是索引表）——删除中间文件后索引会整体前移，
+  // 按索引停会停到别人的计时器、把自己的计时器留成野定时器。
+  stopUploadTimer(f);
+  stopPageCountPoll(f);
   if (f.fileId && !(f.pageCount > 0)) {
     api('/api/cancel_page_analysis', {
       method: 'POST',
@@ -647,9 +667,8 @@ function removeFile(idx) {
   updateFileBadge(false); // 对齐小程序：删除时立即更新徽章（卡片退场动画并行）
   renderFileList();
   setTimeout(() => {
-    printState.selectedFiles.splice(idx, 1);
-    delete printState._uploadTimers[idx];
-    delete printState._pollTimers[idx];
+    const i = fileIndexOf(f);
+    if (i >= 0) printState.selectedFiles.splice(i, 1);  // 现算下标，防止期间又删了别的文件
     renderFileList();
   }, 500);
 }
@@ -720,29 +739,32 @@ function retryUpload(idx) {
   f.pageCount = 0;
   f.pageCountStatus = '';
   renderFileList();
-  uploadFile(idx);
+  uploadFile(fileIndexOf(f));
 }
 
 /* ================= 上传 ================= */
 
+/** 上传（以**文件对象**为身份，索引只在调用瞬间用于定位）。
+    P1（审计 2026-12）：所有异步回调（进度定时器 / onload / onerror）只操作闭包捕获的
+    文件对象 `f`，需要下标时用 fileIndexOf(f) 现算；文件已被删除则丢弃结果。
+    旧实现用 `selectedFiles[idx]` 重新取，删掉中间文件后 idx 已指向另一个文件。 */
 function uploadFile(idx) {
   const f = printState.selectedFiles[idx];
   if (!f || !f.file) return;
   if (!state.token) {
-    ensureLogin().then(ok => { if (ok) uploadFile(idx); });
+    ensureLogin().then(ok => { if (ok && fileAlive(f)) uploadFile(fileIndexOf(f)); });
     return;
   }
-  stopUploadTimer(idx);
+  stopUploadTimer(f);
   const entry = { realProgress: 0, xhr: null, timer: null };
-  printState._uploadTimers[idx] = entry;
+  f._uploadTimer = entry;
   entry.timer = setInterval(() => {
-    const cur = printState._uploadTimers[idx];
+    if (!fileAlive(f)) { stopUploadTimer(f); return; }   // 已删除 → 自停，不留野定时器
+    const cur = f._uploadTimer;
     if (!cur || !cur.realProgress) return;
-    const file = printState.selectedFiles[idx];
-    if (!file) return;
-    if (file.progress >= cur.realProgress) return;
-    const next = file.progress + Math.max(1, (cur.realProgress - file.progress) * 0.5);
-    file.progress = Math.round(Math.min(next, cur.realProgress));
+    if (f.progress >= cur.realProgress) return;
+    const next = f.progress + Math.max(1, (cur.realProgress - f.progress) * 0.5);
+    f.progress = Math.round(Math.min(next, cur.realProgress));
     renderFileList();
   }, 500);
   const xhr = new XMLHttpRequest();
@@ -758,17 +780,18 @@ function uploadFile(idx) {
     // 先保存响应，再停计时器（stopUploadTimer 会 abort xhr，abort 后 status/responseText 被清空）
     const status = xhr.status;
     const responseText = xhr.responseText;
-    stopUploadTimer(idx);
+    stopUploadTimer(f);
+    if (!fileAlive(f)) return;   // 上传期间该文件已被删除 → 结果丢弃，绝不写到别的卡片上
     if (status === 401) {
       f.uploading = false;
       renderFileList();
       ensureLogin().then(ok => {
-        if (ok) {
+        if (ok && fileAlive(f)) {
           f.uploading = true;
           f.progress = 0;
           renderFileList();
-          uploadFile(idx);
-        } else showToast('登录失败，请检查网络连接');
+          uploadFile(fileIndexOf(f));
+        } else if (!ok) showToast('登录失败，请检查网络连接');
       });
       return;
     }
@@ -796,12 +819,13 @@ function uploadFile(idx) {
     f.failed = false;
     f.pageCount = pageCount;
     f.pageCountStatus = (!f.isImage) ? (pageCount > 0 ? 'confirmed' : 'analyzing') : '';
-    if (!f.isImage) refreshSinglePage(idx);
-    if (!f.isImage && pageCount <= 0) startPageCountPoll(idx, fileId);
+    if (!f.isImage) refreshSinglePage(fileIndexOf(f));
+    if (!f.isImage && pageCount <= 0) startPageCountPoll(f, fileId);
     renderFileList();
   };
   xhr.onerror = () => {
-    stopUploadTimer(idx);
+    stopUploadTimer(f);
+    if (!fileAlive(f)) return;
     f.uploading = false;
     f.failed = true;
     renderFileList();
@@ -810,24 +834,26 @@ function uploadFile(idx) {
   xhr.send(fd);
 }
 
-function stopUploadTimer(idx) {
-  const entry = printState._uploadTimers[idx];
+function stopUploadTimer(f) {
+  const entry = f && f._uploadTimer;
   if (!entry) return;
   if (entry.timer) { clearInterval(entry.timer); entry.timer = null; }
   if (entry.xhr) { try { entry.xhr.abort(); } catch (e) { /* ok */ } entry.xhr = null; }
+  f._uploadTimer = null;
 }
 
 /* ================= 页码分析轮询 ================= */
 
-function startPageCountPoll(idx, fileId) {
-  stopPageCountPoll(idx);
-  if (!fileId) return;
+function startPageCountPoll(f, fileId) {
+  stopPageCountPoll(f);
+  if (!f || !fileId) return;
   let attempts = 0;
   const poll = async () => {
+    if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return; }
     try {
       const r = await api('/api/file_page/' + fileId);
-      const f = printState.selectedFiles[idx];
-      if (!f || f.fileId !== fileId) { stopPageCountPoll(idx); return; }
+      // await 期间文件可能被删除 / 被重新上传（fileId 变了）→ 丢弃本次结果
+      if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return; }
       if (r.status === 200 && r.data && r.data.success) {
         const pc = r.data.page_count || 0;
         const verified = !!r.data.verified;
@@ -840,8 +866,8 @@ function startPageCountPoll(idx, fileId) {
             f.pageRange = '';
           }
           // smooth：输入行/警告原地收起（过渡动画），摘要淡入，延时重绘
-          normalizeAndValidateRangeLines(idx, true);
-          stopPageCountPoll(idx);
+          normalizeAndValidateRangeLines(fileIndexOf(f), true);
+          stopPageCountPoll(f);
           return;
         }
         // v4.4：仅 doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告；
@@ -850,19 +876,19 @@ function startPageCountPoll(idx, fileId) {
         const needLocal = fext === 'doc' || fext === 'docx';
         f.pageCountStatus = (r.data.printer_online || !needLocal) ? 'analyzing' : 'offline';
         attempts++;
-        if (attempts >= MAX_POLL_ATTEMPTS) stopPageCountPoll(idx);
+        if (attempts >= MAX_POLL_ATTEMPTS) stopPageCountPoll(f);
         renderFileList();
       }
     } catch (e) { /* 网络错误继续轮询 */ }
   };
   poll();
-  printState._pollTimers[idx] = setInterval(poll, 5000);
+  f._pollTimer = setInterval(poll, 5000);
 }
 
-function stopPageCountPoll(idx) {
-  if (printState._pollTimers[idx]) {
-    clearInterval(printState._pollTimers[idx]);
-    delete printState._pollTimers[idx];
+function stopPageCountPoll(f) {
+  if (f && f._pollTimer) {
+    clearInterval(f._pollTimer);
+    f._pollTimer = null;
   }
 }
 
@@ -1801,6 +1827,8 @@ function doSubmit(skipPageValidation) {
 
 // 成功弹窗关闭时清空文件列表（对齐小程序 onCloseModal）
 function clearFilesAfterSuccess() {
+  // 计时器按文件对象停（旧实现遍历索引表，与文件对象已解耦 → 会漏停/错停）
+  printState.selectedFiles.forEach(f => { stopPageCountPoll(f); stopUploadTimer(f); });
   printState.selectedFiles = [];
   // 订单发起后清空备注（与文件列表同步复位，输入框高度/计数回到初始状态）
   printState.remark = '';
@@ -1811,8 +1839,6 @@ function clearFilesAfterSuccess() {
     remarkInput.style.height = '';
     if (remarkCount) remarkCount.textContent = '0/100';
   }
-  Object.keys(printState._pollTimers).forEach(k => stopPageCountPoll(Number(k)));
-  Object.keys(printState._uploadTimers).forEach(k => stopUploadTimer(Number(k)));
   const scroll = document.getElementById('fileListScroll');
   if (scroll) scroll.style.height = '';
   renderFileList();

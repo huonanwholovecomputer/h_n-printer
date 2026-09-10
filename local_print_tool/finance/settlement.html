@@ -1024,22 +1024,32 @@ function RMB(cents) { return '¥' + formatCents(cents); }
    参数为已拼好的 HTML 字符串，仅对用户可见文案生效；云端模式原样返回。 */
 function _lz(s) { return FINANCE_MODE === 'local' ? String(s).replace(/云端/g, '本地') : s; }
 /* ==================== 密码哈希（SHA-256，Web Crypto） ==================== */
+/* P1（审计 2026-12）：不支持 Web Crypto 时**禁用密码功能**，不再降级到弱哈希。
+   旧实现退化为 32 位 djb2 —— 碰撞极易构造；更糟的是：一旦在这种环境下设过密码，
+   存入的 'djb2:...' 在后续正常分支（只认 'sha256:' / 明文）永远校验不通过，
+   等于把模块永久锁死。拒绝服务优于弱保护。 */
+var CRYPTO_UNAVAILABLE_MSG =
+  '当前运行环境不支持 Web Crypto（SHA-256），密码功能已禁用。' +
+  '请用现代浏览器内核或经 127.0.0.1 访问本页。';
+function cryptoAvailable() {
+  return !!(window.crypto && window.crypto.subtle && window.crypto.subtle.digest
+            && typeof TextEncoder === 'function');
+}
 function _sha256Hex(str) {
-  if (window.crypto && crypto.subtle && crypto.subtle.digest) {
-    return crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)).then(function (buf) {
-      var bytes = new Uint8Array(buf), hex = '';
-      for (var i = 0; i < bytes.length; i++) hex += ('0' + bytes[i].toString(16)).slice(-2);
-      return hex;
-    });
+  if (!cryptoAvailable()) {
+    return Promise.reject(new Error(CRYPTO_UNAVAILABLE_MSG));
   }
-  // 兜底：不支持 Web Crypto 的旧浏览器用非加密哈希（至少避免明文存储）
-  var h = 5381, s = String(str);
-  for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
-  return Promise.resolve('djb2:' + h.toString(16));
+  return window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)).then(function (buf) {
+    var bytes = new Uint8Array(buf), hex = '';
+    for (var i = 0; i < bytes.length; i++) hex += ('0' + bytes[i].toString(16)).slice(-2);
+    return hex;
+  });
 }
 function hashPassword(pwd) { return _sha256Hex(String(pwd || '')); }
-/* 双模式校验：'sha256:' 前缀按哈希比对；其余按旧明文比对（兼容存量数据），新写入只存哈希 */
+/* 双模式校验：'sha256:' 前缀按哈希比对；其余按旧明文比对（兼容存量数据），新写入只存哈希。
+   无 Web Crypto → 一律 reject（不做任何降级比对，避免"看起来能用"的假象）。 */
 function isPasswordValid(input, stored) {
+  if (!cryptoAvailable()) return Promise.reject(new Error(CRYPTO_UNAVAILABLE_MSG));
   stored = String(stored || '');
   if (stored.indexOf('sha256:') === 0) {
     return hashPassword(input).then(function (h) { return h === stored.slice(7); });
@@ -1253,6 +1263,10 @@ function requestPassword(key, label) {
     return isPasswordValid(pwd, getPassword(key)).then(function (ok) {
       if (ok) { unlocked[key] = true; toast('🔓 已解锁' + label, 'success'); return true; }
       toast('❌ 密码错误', 'error'); return false;
+    }).catch(function (e) {
+      // 无 Web Crypto → 密码功能已禁用（不再降级到弱哈希校验）
+      toast('❌ ' + (e && e.message ? e.message : '密码校验失败'), 'error');
+      return false;
     });
   });
 }
@@ -4040,6 +4054,9 @@ function updatePassword(key) {
     save();
     input.value = '';
     toast('✅ ' + MODULE_NAMES[key] + ' 密码已更新', 'success');
+  }).catch(function (e) {
+    // 无 Web Crypto → 拒绝写入（写入 djb2 会让后续正常分支永远解不开锁）
+    toast('❌ ' + (e && e.message ? e.message : '密码保存失败'), 'error');
   });
 }
 function updateScoreCap(val) {
@@ -4180,7 +4197,14 @@ function loadAuthData(members) {
         h += '<td>' + (d.online ? '<span class="tag g">🟢 在线</span>' : '<span class="tag">⚫ 离线</span>') + '</td>';
         h += '<td>' + (d.owner_name ? esc(d.owner_name) : '<span style="color:var(--muted)">未绑定</span>') + '</td>';
         h += '<td>' + (d.is_active ? '<span class="tag g">接单中</span>' : '<span style="color:var(--muted)">—</span>') + '</td>';
-        h += '<td><button class="btn danger sm" onclick="deleteDevice(\'' + esc(d.client_id) + '\')">🗑 删除</button></td></tr>';
+        // P1（审计 2026-12）：client_id 由客户端自报，禁止拼进内联 onclick。
+        // esc() 是 HTML 实体转义，拼进内联 JS 字符串时 &#39; 会被 HTML 解码回 ' ——
+        // 恰好闭合字符串，等于把注入点交给 devices.json 的写入方。
+        // 改用 safeId() 白名单 + data-client-id + 事件委托（本页订单行同款范式）。
+        var cidSafe = safeId(d.client_id);
+        h += '<td><button class="btn danger sm" data-device-delete="' + esc(cidSafe) + '"' +
+             (cidSafe ? '' : ' disabled title="设备 ID 含非法字符，已禁用删除"') +
+             '>🗑 删除</button></td></tr>';
       });
       h += '</tbody></table></div>';
       h += '<div style="margin-top:10px"><button class="btn sm" onclick="loadAuthData(getMembers())">🔄 刷新</button><span style="color:var(--muted);font-size:.78rem;margin-left:10px">每 15 秒自动刷新</span></div>';
@@ -4210,6 +4234,18 @@ function saveAuthOwner() {
     })
     .catch(function () { toast('❌ 网络错误', 'error'); });
 }
+/* 授权页设备删除按钮：事件委托（按钮由 innerHTML 反复重建，绑在 document 上最稳）。
+   委托读取的是 safeId() 白名单过滤后的 data-client-id，不再有内联事件注入面。 */
+document.addEventListener('click', function (e) {
+  var t = e.target;
+  var btn = (t && t.closest) ? t.closest('[data-device-delete]') : null;
+  if (!btn) return;
+  e.preventDefault();
+  var cid = safeId(btn.getAttribute('data-device-delete'));
+  if (!cid) { toast('❌ 设备 ID 非法，已拒绝操作', 'error'); return; }
+  deleteDevice(cid);
+});
+
 /* 删除设备注册表中的一台设备（清理软件升级产生的同机旧 ID 等历史遗留）。
    经 stats_server 代理调用后端 /api/printer/devices/delete（携带打印机 token）。 */
 function deleteDevice(clientId) {

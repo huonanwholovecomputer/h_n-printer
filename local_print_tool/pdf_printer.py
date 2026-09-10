@@ -762,6 +762,63 @@ def _find_sumatra_pdf() -> str | None:
     return shutil.which("SumatraPDF.exe")
 
 
+def _sumatra_page_tokens(pages: list[int]) -> str:
+    """0-based 页码列表 → SumatraPDF 页码范围 token（1-based，连续段压缩）。
+
+    例: [0,1,2,4] → "1-3,5"；[2] → "3"；[] → ""。
+    使用解析后的页码（而非用户原始输入）拼串，保证输出一定是官方语法。
+    """
+    if not pages:
+        return ""
+    nums = sorted({p + 1 for p in pages if p >= 0})
+    if not nums:
+        return ""
+    parts: list[str] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(f"{start}-{prev}" if prev > start else f"{start}")
+        start = prev = n
+    parts.append(f"{start}-{prev}" if prev > start else f"{start}")
+    return ",".join(parts)
+
+
+def build_sumatra_print_settings(
+    copies: int = 1,
+    duplex: str = "off",
+    duplex_mode: str = "long-edge",
+    page_range: str = "",
+    total_pages: int = 0,
+) -> str:
+    """按 SumatraPDF 官方 `-print-settings` 语法拼装设置串。
+
+    官方 token（https://www.sumatrapdfreader.org/docs/Command-line-arguments）：
+      · 份数：`3x`（**不是** `copies=3`）
+      · 双面：`duplex` / `duplexshort` / `duplexlong` / `simplex`（**不是** `duplex=long`）
+      · 页码范围：与上述 token 混排的**裸页码**，如 `1-3,5,10-8,odd`（**不是** `range=1-5`）
+    非法 token 会被 SumatraPDF 忽略（份数/页码/双面全部失效，改为按 PDF 内嵌默认值打印整份），
+    或用做未知文件路径导致整条命令失败——故此处只输出官方 token。
+
+    份数恒显式给出（含 `1x`）：PDF 的 ViewerPreferences 可能内嵌 NumCopies，
+    不显式覆盖就会出现「设 1 份却印 N 份」。若某版本不认 `1x`，SumatraPDF 返回非 0，
+    调用方会降级到方案 3（应用层循环），仍能正确出纸。
+    """
+    parts: list[str] = []
+    if total_pages > 0 and page_range and page_range.strip():
+        tokens = _sumatra_page_tokens(_parse_page_range(page_range, total_pages))
+        if tokens:
+            parts.append(tokens)
+    parts.append(f"{max(1, int(copies))}x")
+    if duplex == "on":
+        parts.append("duplexshort" if duplex_mode == "short-edge" else "duplexlong")
+    else:
+        # 显式 simplex：同时覆盖 PDF 内嵌的 Duplex 默认值
+        parts.append("simplex")
+    return ",".join(parts)
+
+
 def _print_via_sumatra(
     sumatra_path: str,
     pdf_path: str,
@@ -775,18 +832,17 @@ def _print_via_sumatra(
 ) -> tuple[bool, str]:
     """使用 SumatraPDF 命令行进行静默打印。
 
-    先通过 DEVMODE 配置打印机（双面/份数），确保打印机驱动不忽略参数。
+    份数/双面/页码范围全部经 `-print-settings` 官方 token 传递。
+    **不再**先去改打印机的全局 DEVMODE：那是系统级默认设置的写入，
+    会污染用户在 Windows 里配置的打印机偏好，且对 SumatraPDF 本身没有约束力
+    （SumatraPDF 用自己提交的 DEVMODE，不读刚写进去的全局值）。
+
+    `orientation` 参数保留仅为签名兼容、此处**刻意不使用**：SumatraPDF 对
+    「页宽 > 页高」的页面已默认旋转 90° 适配纸张，再传 `landscape` token 会二次旋转。
     """
     # P2-15: SumatraPDF 超时随页数放大（120s 起步，每页 2s，上限 600s）
     total_pages = get_pdf_info(pdf_path).get("page_count", 0)
     sumatra_timeout = min(max(120, total_pages * 2), 600)
-
-    # 先配置打印机 DEVMODE，确保驱动层面参数正确
-    if printer_name:
-        try:
-            _get_printer_devmode(printer_name, duplex, duplex_mode, orientation)
-        except Exception as e:
-            logger.warning(f"SumatraPDF 前 DEVMODE 配置失败: {e}")
 
     # 单数页 + 双面 + 多份 → 逐份打印，确保副本独立
     if duplex == "on" and copies > 1:
@@ -810,30 +866,16 @@ def _print_via_sumatra(
                         progress_callback(i + 1, copies)
                 return True, f"SumatraPDF 逐份打印完成 ({copies} 份)"
 
-    settings_parts: list[str] = []
+    settings = build_sumatra_print_settings(
+        copies=copies, duplex=duplex, duplex_mode=duplex_mode,
+        page_range=page_range, total_pages=total_pages,
+    )
 
-    if copies > 1:
-        settings_parts.append(f"copies={copies}")
+    # -silent：抑制 SumatraPDF 自身的错误弹窗——模态框会阻塞子进程直到超时
+    cmd = [sumatra_path, "-print-to", printer_name or "default", "-silent"]
 
-    if duplex == "on":
-        if duplex_mode == "short-edge":
-            settings_parts.append("duplex=short")
-        else:
-            settings_parts.append("duplex=long")
-    else:
-        settings_parts.append("duplex=simplex")
-
-    if page_range:
-        parsed = page_range.strip().replace("、", ",").replace("，", ",").replace(" ", "")
-        if parsed:
-            # P2-8: `range=` 为非官方 print-settings 键，SumatraPDF 可能忽略而打印全部页 — 保守告警
-            logger.warning(f"SumatraPDF: '-print-settings range={parsed}' 为非官方键，驱动可能忽略而打印全部页")
-            settings_parts.append(f"range={parsed}")
-
-    cmd = [sumatra_path, "-print-to", printer_name or "default"]
-
-    if settings_parts:
-        cmd += ["-print-settings", ",".join(settings_parts)]
+    if settings:
+        cmd += ["-print-settings", settings]
 
     cmd.append(os.path.abspath(pdf_path))
 

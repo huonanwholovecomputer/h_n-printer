@@ -3610,10 +3610,15 @@ def get_file_page(file_id):
             request_page_analysis(file_id, fname)
     # v4.4：PDF 等后端可直接数页的类型，若历史/异常导致页数缺失，轮询时服务端补数——
     # 不依赖本地打印工具（本地工具离线也不影响这类文件确认页数）
-    if (row["page_count"] or 0) <= 0 and not row["page_count_verified"]:
+    # P1: sqlite3.Row 既没有 .get()（AttributeError），也不支持字段赋值（TypeError）——
+    # v13 迁移前历史 files 行 page_count=0 时本接口连环 500。统一改用局部变量。
+    page_count = row["page_count"] or 0
+    verified = bool(row["page_count_verified"])
+    if page_count <= 0 and not verified:
         ext = os.path.splitext(row["original_name"] or "")[1].lower()
         if ext and ext not in (".doc", ".docx"):
-            fpath = os.path.join(UPLOAD_DIR, row["path"]) if row.get("path") else ""
+            rel_path = row["path"] or ""
+            fpath = os.path.join(UPLOAD_DIR, rel_path) if rel_path else ""
             if fpath and os.path.exists(fpath):
                 new_count = get_file_page_count(fpath, ext.lstrip("."))
                 if new_count > 0:
@@ -3624,12 +3629,12 @@ def get_file_page(file_id):
                     )
                     conn.commit()
                     conn.close()
-                    row["page_count"] = new_count
-                    row["page_count_verified"] = True
+                    page_count = new_count
+                    verified = True
     return jsonify({
         "success": True,
-        "page_count": row["page_count"] or 0,
-        "verified": bool(row["page_count_verified"]),
+        "page_count": page_count,
+        "verified": verified,
         "printer_online": printer_online,
     })
 
@@ -4609,10 +4614,20 @@ def submit_order():
                     )
                 if cur2.rowcount == 0:
                     raise OrderRejected("临时授权已失效或被其他订单使用，请重新出示许可")
-                user_conn.execute(
-                    "UPDATE license_keys SET order_id = ? WHERE used_by = ? AND order_id IS NULL ORDER BY id DESC LIMIT 1",
+                # P1: 标准 SQLite 构建未开 SQLITE_ENABLE_UPDATE_DELETE_LIMIT，
+                # `UPDATE ... ORDER BY ... LIMIT` 直接 OperationalError（临时授权用户下单必 500）。
+                # 改为子查询定位唯一目标行，语义等价且全平台可用。
+                cur3 = user_conn.execute(
+                    "UPDATE license_keys SET order_id = ? WHERE id = ("
+                    "  SELECT id FROM license_keys"
+                    "  WHERE used_by = ? AND order_id IS NULL"
+                    "  ORDER BY id DESC LIMIT 1)",
                     (order_id, g.openid),
                 )
+                if cur3.rowcount == 0:
+                    # 授权已被消费但找不到对应密钥记录（历史数据）：不阻断下单，仅记录
+                    app.logger.warning(
+                        f"临时授权已消费但未匹配到 license_keys 记录: openid={g.openid}, order_id={order_id}")
                 user_conn.commit()
 
         conn.commit()
@@ -4907,10 +4922,17 @@ def printer_bind_owner():
     devices[client_id] = entry
     save_devices(devices)
     # 该设备正是当前接管者 → 同步接单记录中的所有者名（claim 消息用）
+    # P1: _load_claim_impl 始终归一化为 {"claiming_devices": {...}}，旧键 active_client_id
+    # 永不存在（原先的判断恒 False = 死代码）。
     with _claim_lock:
         claim = _load_claim_impl()
-        if claim.get("active_client_id") == client_id:
-            claim["owner_name"] = owner_name
+        claiming = claim.get("claiming_devices")
+        if isinstance(claiming, dict) and client_id in claiming:
+            entry_claim = claiming.get(client_id)
+            if not isinstance(entry_claim, dict):
+                entry_claim = {}
+            entry_claim["owner_name"] = owner_name
+            claiming[client_id] = entry_claim
             _save_claim_impl(claim)
     # 2026-12：绑定后总是广播接单状态（含各设备自己的 owner_name），
     # 使本地工具无需重启即可立即用新所有者作为新建标签页的默认归属者
@@ -4937,11 +4959,14 @@ def printer_devices_delete():
     save_devices(devices)
 
     cleared_claim = False
+    # P1: 接管记录已归一化为 claiming_devices 字典，必须按 client_id 查该字典；
+    # 原 `claim.get("active_client_id")` 恒为 None → 删设备永不清接管记录，
+    # 被删设备留在接单列表里，移动端仍可选中导致任务永久排队。
     with _claim_lock:
         claim = _load_claim_impl()
-        if claim.get("active_client_id") == client_id:
-            claim.pop("active_client_id", None)
-            claim.pop("owner_name", None)
+        claiming = claim.get("claiming_devices")
+        if isinstance(claiming, dict) and client_id in claiming:
+            claiming.pop(client_id, None)
             _save_claim_impl(claim)
             cleared_claim = True
 

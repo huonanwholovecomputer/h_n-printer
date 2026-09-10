@@ -20,7 +20,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import urllib.request
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +31,38 @@ FETCH_TIMEOUT = 10
 DOWNLOAD_CHUNK = 65536
 _WAIT_MAX_LOOPS = 60  # update.cmd 轮询等待主程序退出上限（约 2 分钟）
 
+# P1（审计 2026-12）：安装包下载只允许 HTTPS。
+# 旧实现直接把清单里的 url 交给 urlopen —— `http://` 明文可被中间人替换安装包，
+# `file://` 更可直接把本机任意文件当安装包静默执行（供应链高危）。
+# 当前清单 url 恰好是 HTTPS COS，属"配置侥幸安全"，必须由代码强制。
+ALLOWED_DOWNLOAD_SCHEMES = ("https",)
+
 
 class UpdateCancelled(Exception):
     """用户取消下载。"""
 
 
+class VersionFormatError(ValueError):
+    """版本号含非数字段（如 "4.5.13a"）。"""
+
+
+def validate_download_url(url: str) -> str:
+    """校验安装包下载地址；非 HTTPS / 空地址抛 ValueError。返回规范化后的 url。"""
+    raw = str(url or "").strip()
+    if not raw:
+        raise ValueError("下载地址为空")
+    scheme = urlsplit(raw).scheme.lower()
+    if scheme not in ALLOWED_DOWNLOAD_SCHEMES:
+        raise ValueError(
+            f"拒绝非 HTTPS 下载地址（scheme={scheme or '空'}）: {raw[:120]}")
+    return raw
+
+
 def fetch_update_info(timeout: int = FETCH_TIMEOUT) -> dict | None:
-    """拉取更新清单。网络失败/格式错误返回 None（静默，不打扰用户）。"""
+    """拉取更新清单。网络失败/格式错误返回 None（静默，不打扰用户）。
+
+    清单里的 url 必须为 HTTPS，否则整份清单作废并记 ERROR 日志
+    （宁可不更新，也不从明文/本地文件路径安装）。"""
     try:
         req = urllib.request.Request(
             UPDATE_MANIFEST_URL, headers={"User-Agent": "HN-Print-Updater/1.0"})
@@ -44,23 +71,49 @@ def fetch_update_info(timeout: int = FETCH_TIMEOUT) -> dict | None:
         if not isinstance(data, dict) or not data.get("version"):
             logger.warning(f"更新清单格式异常: {data!r}")
             return None
+        try:
+            data["url"] = validate_download_url(data.get("url", ""))
+        except ValueError as e:
+            logger.error(f"更新清单下载地址非法，拒绝该清单: {e}")
+            return None
+        if not (data.get("md5") or "").strip():
+            logger.warning("更新清单缺少 md5 字段，仅依赖 HTTPS 传输完整性")
         return data
     except Exception as e:
         logger.info(f"检查更新失败（忽略）: {e}")
         return None
 
 
+_VERSION_SEG_RE = re.compile(r"^[0-9]+$")
+
+
+def parse_version(v: str) -> list[int]:
+    """解析点分数字版本号。任一段非纯数字（如 "13a"）→ 抛 VersionFormatError。
+
+    P1（审计 2026-12）：非数字段**报错**而不是静默归零——旧实现把
+    `"4.5.13a"` 归零成 `[4,5,0]`，反而小于 `"4.5.13"`，于是带后缀的 hotfix
+    版本所有用户永远收不到更新（静默失效，最难排查）。
+    """
+    segs = str(v).strip().split(".")
+    out: list[int] = []
+    for seg in segs:
+        if not _VERSION_SEG_RE.match(seg):
+            raise VersionFormatError(f"版本号含非数字段: {v!r}（段 {seg!r}）")
+        out.append(int(seg))
+    return out
+
+
 def compare_versions(current: str, latest: str) -> bool:
-    """latest > current 返回 True。按 . 分段数字比较（4.4.10 > 4.4.9）。"""
-    def _parts(v: str):
-        out = []
-        for seg in str(v).strip().split("."):
-            try:
-                out.append(int(seg))
-            except ValueError:
-                out.append(0)
-        return out
-    return _parts(latest) > _parts(current)
+    """latest > current 返回 True。按 . 分段数字比较（4.4.10 > 4.4.9）。
+
+    任一侧版本号格式非法 → 抛 VersionFormatError，由调用方显式提示
+    （不允许"静默当作无更新"）。
+    """
+    try:
+        return parse_version(latest) > parse_version(current)
+    except VersionFormatError:
+        logger.error(f"版本号格式非法，无法比较: current={current!r}, latest={latest!r}")
+        raise
 
 
 def _cleanup_stale_setups(dest_dir: str, keep_fname: str) -> None:
@@ -89,7 +142,15 @@ def download_setup(url: str, expected_md5: str, dest_dir: str,
     本地已有同目标文件且 MD5 匹配时直接复用（不重复下载）——UAC 拒绝/安装失败后
     安装包被保留，下次检查更新可直接使用，无需重新下载。
     progress_cb(downloaded, total) 在下载循环中回调（跨线程安全：由调用方负责信号转发）；
-    回调返回 False 表示用户取消（抛 UpdateCancelled 中止并清理半截文件）。"""
+    回调返回 False 表示用户取消（抛 UpdateCancelled 中止并清理半截文件）。
+
+    url 必须是 HTTPS：`http://` 会被中间人替换安装包，`file://` 等于把本机
+    任意文件当安装包执行，一律拒绝并返回 None。"""
+    try:
+        url = validate_download_url(url)
+    except ValueError as e:
+        logger.error(f"安装包下载地址非法，拒绝下载: {e}")
+        return None
     os.makedirs(dest_dir, exist_ok=True)
     fname = os.path.basename(url.split("?")[0]) or "setup.exe"
     dest = os.path.join(dest_dir, fname)
