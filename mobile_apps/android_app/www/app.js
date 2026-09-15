@@ -156,21 +156,20 @@ function syncNativeStatusBar(dark) {
   if (b && b.setDark) b.setDark(dark);
 }
 
+/* 主题切换动画：优先用 View Transitions（浏览器把切换前后各截一张整页快照，
+   在合成线程做交叉淡入，动画成本与 DOM 元素数量无关）；不支持时回退逐元素 CSS 过渡。 */
+let _themeFirstApply = true;
+let _themeSchemeT = null;
+const _mqReduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+function prefersReducedMotion() { return !!(_mqReduce && _mqReduce.matches); }
+function setColorScheme(dark) { document.documentElement.style.colorScheme = dark ? 'dark' : 'light'; }
+
 function applyTheme(mode, opts) {
   opts = opts || {};
   state.themeMode = mode;
   localStorage.setItem('hn_theme_mode', mode);
   const dark = effectiveDark(mode);
   syncNativeStatusBar(dark);
-  // 深色类同时挂到 body（变量级联）、背景层与所有 modal-mask
-  document.body.classList.toggle('theme-dark', dark);
-  document.body.classList.toggle('dark', dark);
-  const bg = document.getElementById('themeBgLayer');
-  if (bg) bg.classList.toggle('bg-dark', dark);
-  document.querySelectorAll('.modal-mask').forEach(m => m.classList.toggle('theme-dark', dark));
-  document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute('content', dark ? '#1C1C1E' : '#F2F2F7');
   const toggle = document.getElementById('themeToggle');
   const iconText = { auto: '🌓', dark: '🌙', light: '☀️' }[mode] || '🌓';
   if (toggle) {
@@ -180,6 +179,42 @@ function applyTheme(mode, opts) {
     if (icon) icon.textContent = iconText;
     else toggle.textContent = iconText;
   }
+  const root = document.documentElement;
+  function commitContent() {
+    // 深色类同时挂到 body（变量级联）、背景层与所有 modal-mask
+    document.body.classList.toggle('theme-dark', dark);
+    document.body.classList.toggle('dark', dark);
+    const bg = document.getElementById('themeBgLayer');
+    if (bg) bg.classList.toggle('bg-dark', dark);
+    document.querySelectorAll('.modal-mask').forEach(m => m.classList.toggle('theme-dark', dark));
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', dark ? '#1C1C1E' : '#F2F2F7');
+  }
+
+  if (_themeFirstApply || prefersReducedMotion()) {
+    // 首帧不动画（避免加载闪变）；用户偏好减少动效时直接切换。
+    commitContent();
+    setColorScheme(dark);
+  } else if (document.startViewTransition) {
+    // 快照期间禁用逐元素过渡：否则新快照会截到过渡起始值（颜色还没变），交叉淡入看不到变化。
+    root.classList.add('theme-vt');
+    const vt = document.startViewTransition(function () {
+      commitContent();
+      setColorScheme(dark);
+    });
+    const done = function () { root.classList.remove('theme-vt'); };
+    if (vt && vt.finished && vt.finished.finally) vt.finished.finally(done);
+    else setTimeout(done, 1000);
+  } else {
+    // 降级：先冻结当前 color-scheme。Chromium 在 color-scheme 变化时会重启后代 color 过渡
+    // （动画 currentTime 反复归零），使文字颜色被拖到约 900ms、而背景 ~480ms 就到位。
+    root.style.colorScheme = getComputedStyle(root).colorScheme;
+    commitContent();
+    clearTimeout(_themeSchemeT);
+    _themeSchemeT = setTimeout(function () { setColorScheme(dark); }, 520);
+  }
+  _themeFirstApply = false;
+
   if (!opts.skipServer) syncThemeToServer();
   updateSessionUI();
 }

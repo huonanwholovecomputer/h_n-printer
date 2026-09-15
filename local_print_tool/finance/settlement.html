@@ -574,11 +574,19 @@ tr.st-bar td:first-child::before { content: ''; position: absolute; left: 0; top
   .header-right { margin-left: 0; width: 100%; }
 }
 
-/* 主题切换瞬间：全页平滑渐变过渡（仅切换时启用，平时不生效以免影响悬停等微交互速度） */
+/* 主题切换瞬间：全页平滑渐变过渡（仅切换时启用，平时不生效以免影响悬停等微交互速度）。
+   这是 View Transitions 不可用时的降级路径——颜色属性走主线程、元素多时会掉帧，
+   故时长压到 .24s（感知更利落），并去掉最贵的 box-shadow 动画（每帧重模糊）。 */
 html.theme-switching, html.theme-switching *,
 html.theme-switching *::before, html.theme-switching *::after {
-  transition: background-color .5s ease, color .5s ease, border-color .5s ease,
-              box-shadow .5s ease, --header-from .5s ease, --header-to .5s ease !important;
+  transition: background-color .24s ease, color .24s ease, border-color .24s ease,
+              --header-from .24s ease, --header-to .24s ease !important;
+}
+/* View Transitions（首选路径）：整页快照走合成线程交叉淡入，元素数量无关。
+   默认时长 250ms 略快，这里统一到 .3s 并给出去程/回程一致的缓动。 */
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: .3s; animation-timing-function: ease; }
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
 }
 
 /* ==================== 悬浮控件（右上主题 / 右下返回顶部，所有界面通用） ==================== */
@@ -1293,6 +1301,8 @@ function effectiveTheme() {
 var theme = effectiveTheme();
 var _themeAnimT = null;
 var _firstApply = true;
+var _mqReduce = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+function _prefersReduced() { return !!(_mqReduce && _mqReduce.matches); }
 function themeIcon() { return themeMode === 'system' ? '🌓' : (theme === 'dark' ? '🌙' : '☀️'); }
 function applyTheme(t) {
   var root = document.documentElement;
@@ -1303,18 +1313,33 @@ function applyTheme(t) {
       ? '跟随系统（当前' + (t === 'dark' ? '深色' : '浅色') + '），点击切换模式'
       : (t === 'dark' ? '深色主题，点击切换模式' : '浅色主题，点击切换模式');
   }
-  // 切换瞬间启用全页平滑渐变过渡类（首帧不触发，避免加载闪变）。
-  // 先加类 + 强制回流，再翻转 data-theme，保证过渡有正确的起始状态。
-  if (!_firstApply) {
-    root.classList.add('theme-switching');
-    void root.offsetWidth;
+  function commit() {
+    root.setAttribute('data-theme', t);
+    // v5.8：主题翻转后同步刷新已创建图表的图例/刻度文字颜色（Chart.js 不感知 CSS 变量变化）
+    _refreshCloudChartTheme();
   }
-  root.setAttribute('data-theme', t);
-  // v5.8：主题翻转后同步刷新已创建图表的图例/刻度文字颜色（Chart.js 不感知 CSS 变量变化）
-  _refreshCloudChartTheme();
-  if (!_firstApply) {
+  if (_firstApply || _prefersReduced()) {
+    // 首帧不动画（避免加载闪变）；用户偏好减少动效时直接切换。
+    commit();
+  } else if (document.startViewTransition) {
+    // 首选：浏览器把切换前后各截一张整页快照，在合成线程做交叉淡入，
+    // 动画成本与 DOM 元素数量无关（元素再多也不掉帧）。Chrome/Edge 111+。
+    // 快照方案下无需逐元素过渡，color-scheme 拖尾问题也一并消失。
+    document.startViewTransition(commit);
+  } else {
+    // 降级：逐元素过渡（颜色类属性走主线程，元素多时可能掉帧）。
+    // 先加类 + 强制回流，再翻转 data-theme，保证过渡有正确的起始状态。
+    // 冻结 color-scheme：Chromium 在 color-scheme 变化时会重启后代 color 过渡
+    // （动画 currentTime 反复归零），使文字颜色被拖到约 900ms、而背景 ~480ms 就到位。
+    root.classList.add('theme-switching');
+    root.style.colorScheme = getComputedStyle(root).colorScheme;
+    void root.offsetWidth;
+    commit();
     clearTimeout(_themeAnimT);
-    _themeAnimT = setTimeout(function () { root.classList.remove('theme-switching'); }, 520);
+    _themeAnimT = setTimeout(function () {
+      root.classList.remove('theme-switching');
+      root.style.colorScheme = '';
+    }, 360);
   }
   _firstApply = false;
 }

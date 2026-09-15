@@ -1613,6 +1613,16 @@ body {
   transition: none !important;
 }
 
+/* View Transitions（首选路径）：整页快照走合成线程交叉淡入，与元素数量无关。
+   快照抓取期间禁用逐元素过渡，保证“新”快照截到的是终值而非过渡起始值。 */
+html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after {
+  transition: none !important;
+}
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: .3s; animation-timing-function: ease; }
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+}
+
 /* 初始隐藏态：防止页面首次渲染时闪烁 */
 .page-init {
   opacity: 0;
