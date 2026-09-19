@@ -2648,8 +2648,16 @@ def on_print_success(data):
 
     # P1-5：状态集加入 queued（断线回滚闭环：回滚后客户端回报成功也能收敛为 sent）；
     # P0-1.4：完成时清空 locked_at
+    # 2026-09：状态集加入 failed —— check_printing_timeout 的 3 分钟反馈窗口对缺纸/卡纸这类
+    # 物理中断太短，任务被误判 failed 后，迟到的成功回报原本被白名单挡掉（静默丢弃，订单永久失败）。
+    # abandoned/canceled 仍不在列：用户显式放弃/取消的意图优先于迟到回报。
+    # reject_reason 只在从 failed 恢复时清（提交时写入的页码范围提示需保留）。
     conn.execute(
-        "UPDATE order_files SET status = 'sent', locked_at = '' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued')",
+        "UPDATE order_files SET reject_reason = '' WHERE id = ? AND status = 'failed'",
+        (task_id,),
+    )
+    conn.execute(
+        "UPDATE order_files SET status = 'sent', locked_at = '' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued', 'failed')",
         (task_id,),
     )
     # 获取父订单 ID 并刷新聚合状态
@@ -2717,8 +2725,10 @@ def on_print_fail(data):
         return
     # P1-5：禁止 sent → failed 降级（已完成的任务不能被迟到的失败回报改状态）；
     # 同时排除 canceled——用户已取消的任务不能被迟到的失败回报覆盖成 failed
-    #（与 print_success 的状态白名单对称；否则取消正在打印的订单时，本地工具对
-    #  剩余任务回报的"已取消"失败会把 canceled 覆盖成 failed，父订单显示"打印失败"）
+    #（否则取消正在打印的订单时，本地工具对剩余任务回报的"已取消"失败会把 canceled
+    #  覆盖成 failed，父订单显示"打印失败"）。
+    # 列表与 print_success 不完全对称：那边额外含 failed（迟到成功可把超时误判救回），
+    # 这边不含 failed——本就是 failed，重复写入只会白白覆盖 reject_reason。
     # 失败原因写入 reject_reason（移动端订单详情/收支结算可展示）
     conn.execute(
         "UPDATE order_files SET status = 'failed', locked_at = '', reject_reason = ? WHERE id = ?"
