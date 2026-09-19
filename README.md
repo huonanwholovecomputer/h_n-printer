@@ -42,7 +42,7 @@
 
 Windows 桌面应用：拖放文件 / Ctrl+V 粘贴，自动转换格式后静默打印。
 
-![本地打印工具主界面](docs/screenshots/local-print-tool.jpg)
+![本地打印工具主界面](docs/screenshots/local-print-tool.png)
 
 ### 打印管线
 
