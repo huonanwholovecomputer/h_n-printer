@@ -88,7 +88,7 @@ import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.16"
+APP_VERSION = "4.5.17"
 
 
 # ============================================================
