@@ -457,6 +457,9 @@ Component({
             patch.selectedFiles = []
             patch.badgeCount = 0
             patch.scrollPadHeight = 0
+            // 订单发起后清空备注（与 onCloseModal 对齐：走 tabBar 离开也要复位）
+            patch.remark = ''
+            patch.remarkBoxHeight = 120
             this._contentEst = 0
           }
           this.setData(patch)
