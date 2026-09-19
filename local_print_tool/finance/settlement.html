@@ -290,6 +290,9 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .transfer { display: flex; align-items: center; gap: 10px; padding: 9px 0; font-size: 1.02rem; }
 .transfer .arrow { font-size: 1.25rem; color: var(--muted); }
 .transfer .amount { font-weight: 800; font-size: 1.15rem; color: var(--pos); }
+/* 实际转账卡片：与上面橙色「建议转账」区分开（蓝色=真实数据） */
+.settle-box-real { border-color: var(--primary); }
+.settle-box-real h2 { color: var(--primary); }
 
 /* ==================== 图表 ==================== */
 .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
@@ -633,9 +636,20 @@ body { user-select: text; -webkit-user-select: text; -moz-user-select: text; }
 /* 图片/按钮等默认不可拖拽（页面暂无图片，此条仅作兜底） */
 img, button { -webkit-user-drag: none; }
 </style>
-<!-- Chart.js 本地优先，CDN 兜底 -->
-<script src="chart.umd.min.js"></script>
-<script>if (!window.Chart) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js'; s.referrerPolicy='no-referrer'; document.head.appendChild(s); }</script>
+<script>
+/* 首帧前定主题（防闪）：判定规则必须与页面尾部 effectiveTheme()/applyTheme() 一致。
+   主题原先只在文档最末尾的主脚本里设置，浏览器在此之前已按 :root 的浅色 token 画过一帧，
+   慢盘/冷启动时会看到「先亮一下再变暗」。与 <main> 后面那段 tab 防闪脚本同理。 */
+(function () {
+  try {
+    var mode = localStorage.getItem('financeThemeMode') ||
+      (localStorage.getItem('financeTheme') === 'dark' ? 'dark' : 'system');
+    var dark = mode === 'dark' || (mode !== 'light' && window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+  } catch (e) { /* 隐私模式等 localStorage 不可用时，交给尾部脚本兜底 */ }
+})();
+</script>
 </head>
 <body>
 <header class="app-header">
@@ -710,6 +724,12 @@ img, button { -webkit-user-drag: none; }
   <button class="btn pri" id="blockRetry">🔄 重试</button>
 </div>
 
+<!-- Chart.js 本地优先，CDN 兜底。它是同步阻塞脚本，且页面里 15 处 new Chart()
+     都没有 typeof 防护（必须保证主脚本执行时 Chart 已就绪），所以只能挪位置、
+     不能改 async：放到静态骨架之后、主脚本之前，别让它拖住首帧。 -->
+<script src="chart.umd.min.js"></script>
+<script>if (!window.Chart) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js'; s.referrerPolicy='no-referrer'; document.head.appendChild(s); }</script>
+
 <script>
 /* ==================== 启动令牌（由本地打印工具服务器注入） ==================== */
 var LAUNCH_TOKEN = '__LAUNCH_TOKEN__';
@@ -749,8 +769,11 @@ var PLACEHOLDER_MEMBER_NAMES = ['张三', '李四', '王五'];
 var DEFAULT_SCORE_CAP = 15;
 var DEFAULT_RATE = 0.05;
 /* 默认密码存储 SHA-256 哈希（'123456' 的 sha256），不存明文 */
-var DEFAULT_PASSWORDS = { score: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', expense: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', income: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', settings: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92', auth: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92' };
-var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', settings: '设置', auth: '设备授权' };
+var _PW_123456 = 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92';
+var DEFAULT_PASSWORDS = { score: _PW_123456, expense: _PW_123456, income: _PW_123456, settings: _PW_123456, auth: _PW_123456, transfer: _PW_123456 };
+/* PASSWORD_KEYS：需要独立密码的模块清单（迁移补默认值 / 设置页密码管理共用同一份顺序） */
+var PASSWORD_KEYS = ['score', 'expense', 'income', 'transfer', 'settings', 'auth'];
+var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', transfer: '实际转账', settings: '设置', auth: '设备授权' };
 /* 打印价格默认值（本地模式初始化 / 字段兜底用）。
    云端模式下价格以服务器 pricing.json 为权威（/api/pricing），本常量仅作本地模式默认。 */
 var DEFAULT_PRICING = {
@@ -899,6 +922,7 @@ function mergeStores(localStore, cloudStore) {
       expenses: unionById((localStore && localStore.records && localStore.records.expenses) || [], (cloudStore && cloudStore.records && cloudStore.records.expenses) || []),
       income: unionById((localStore && localStore.records && localStore.records.income) || [], (cloudStore && cloudStore.records && cloudStore.records.income) || []),
       scores: scores,
+      transfers: unionById((localStore && localStore.records && localStore.records.transfers) || [], (cloudStore && cloudStore.records && cloudStore.records.transfers) || []),
     },
     notes: Object.assign({}, (cloudStore && cloudStore.notes) || {}, (localStore && localStore.notes) || {}),
     meta: { version: (cloudStore && cloudStore.meta && cloudStore.meta.version) || 0 },
@@ -910,7 +934,7 @@ function mergeStores(localStore, cloudStore) {
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
-var unlocked = { score: false, expense: false, income: false, settings: false, auth: false };
+var unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false };
 
 /* ==================== 数据模型 / 迁移 ==================== */
 function migrateConfig(data) {
@@ -923,11 +947,10 @@ function migrateConfig(data) {
   if (!c.passwords) {
     c.passwords = {};
     if (c.scorePassword) c.passwords.score = c.scorePassword;
-    ['score', 'expense', 'income', 'settings', 'auth'].forEach(function (k) { if (!c.passwords[k]) c.passwords[k] = DEFAULT_PASSWORDS[k]; });
     delete c.scorePassword;
   }
-  // 兼容旧配置：授权模块密码缺失时补默认（2026-11）
-  if (!c.passwords.auth) c.passwords.auth = DEFAULT_PASSWORDS.auth;
+  // 兼容旧配置：授权 / 实际转账等后加模块的密码缺失时补默认（老数据不会出现「无密码可用」）
+  PASSWORD_KEYS.forEach(function (k) { if (!c.passwords[k]) c.passwords[k] = DEFAULT_PASSWORDS[k]; });
   if (!c.memberBindings) c.memberBindings = [];
   // 打印价格（本地模式存储；云端模式以服务器 pricing.json 为权威，不在 STORE 维护）
   if (!c.pricing || typeof c.pricing !== 'object') {
@@ -947,7 +970,14 @@ function migrateConfig(data) {
     if (!data.notes) data.notes = conv.notes;
     delete data.months;
   }
-  if (!data.records) data.records = { expenses: [], income: [], scores: [] };
+  if (!data.records) data.records = { expenses: [], income: [], scores: [], transfers: [] };
+  if (!Array.isArray(data.records.transfers)) data.records.transfers = [];
+  /* 实际转账早期版本存 date（按日归月），后改为直接绑定结算月份 month ——
+     迁移时按原月份键搬过去，避免结算被搬到下个月。 */
+  data.records.transfers.forEach(function (t) {
+    if (t && !isMonthKey(t.month) && t.date) t.month = monthKeyOf(t.date);
+    if (t) delete t.date;
+  });
   if (!data.notes) data.notes = {};
   // 乐观锁版本号：多设备并发编辑冲突检测用
   if (!data.meta || typeof data.meta.version !== 'number') data.meta = { version: 0 };
@@ -972,6 +1002,19 @@ function sanitizeStore(data) {
       if (rid) r.id = rid; else { console.warn('导入：记录 ID 非法，已替换', r.id); r.id = uid(); }
     });
   });
+  /* 实际转账：付款人/收款人必须是白名单 ID（避免导入数据把任意字符串塞进内联事件），
+     月份必须是合法 'YYYY-MM'，金额归一为两位小数；自转自的报废记录直接丢弃。 */
+  if (data && data.records && Array.isArray(data.records.transfers)) {
+    data.records.transfers = data.records.transfers.filter(function (t) {
+      t.from = safeId(t.from); t.to = safeId(t.to);
+      t.month = isMonthKey(t.month) ? t.month : monthKeyOf(t.date);
+      t.amount = Math.round((+t.amount || 0) * 100) / 100;
+      t.note = String(t.note == null ? '' : t.note);
+      delete t.date;
+      if (!t.from || !t.to || t.from === t.to || !isMonthKey(t.month)) { console.warn('导入：跳过非法转账记录', t.id); return false; }
+      return true;
+    });
+  }
   return data;
 }
 function convertMonths(months) {
@@ -1077,24 +1120,32 @@ function allMonthKeys() {
   ['expenses', 'income', 'scores'].forEach(function (k) {
     (STORE.records[k] || []).forEach(function (r) { if (r.date) set[monthKeyOf(r.date)] = true; });
   });
+  // 实际转账存的是 month（无 date），单独收一遍
+  (STORE.records.transfers || []).forEach(function (r) { if (isMonthKey(r.month)) set[r.month] = true; });
   set[currentMonthKey()] = true;
   return Object.keys(set).sort();
 }
+/* 月份键校验：'YYYY-MM'，且月份在 1-12。用于实际转账（无日期，直接存月份）的合法性与净化。 */
+function isMonthKey(v) { return /^\d{4}-(0[1-9]|1[0-2])$/.test(String(v || '')); }
 function defaultDateFor(key) {
   var t = todayStr();
   return monthKeyOf(t) === key ? t : key + '-15';
 }
 function monthFromRecords(key) {
-  var expenses = [], income = {}, scMap = {}, scores = {};
+  var expenses = [], income = {}, scMap = {}, scores = {}, transfers = [];
   (STORE.records.expenses || []).forEach(function (r) { if (monthKeyOf(r.date) === key) expenses.push({ id: r.id, date: r.date, item: r.item, amount: r.amount, payer: r.payer }); });
   (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === key) income[r.memberId] = (income[r.memberId] || 0) + (r.amount || 0); });
   (STORE.records.scores || []).forEach(function (r) { if (monthKeyOf(r.date) === key) (scMap[r.memberId] = scMap[r.memberId] || []).push({ id: r.id, date: r.date, item: r.item, score: r.score }); });
+  /* 实际转账按「结算月份」归属，不存日期：转账常常在下个月才付，但它是**这个月**的账，
+     让付款时间决定归属会把结算搬到下个月（旧版按 date 归月的 bug）。 */
+  (STORE.records.transfers || []).forEach(function (r) { if (r.month === key) transfers.push({ id: r.id, month: r.month, from: r.from, to: r.to, amount: r.amount, note: r.note || '' }); });
   scores = scMap;
-  return { key: key, label: labelOf(key), expenses: expenses, income: income, scores: scores, note: (STORE.notes || {})[key] || '' };
+  return { key: key, label: labelOf(key), expenses: expenses, income: income, scores: scores, transfers: transfers, note: (STORE.notes || {})[key] || '' };
 }
 function monthRecordCount(key) {
   var n = 0;
   ['expenses', 'income', 'scores'].forEach(function (k) { (STORE.records[k] || []).forEach(function (r) { if (monthKeyOf(r.date) === key) n++; }); });
+  (STORE.records.transfers || []).forEach(function (r) { if (r.month === key) n++; });
   return n;
 }
 
@@ -1163,9 +1214,38 @@ function calcMonth(m) {
     if (Math.abs(rem[receivers[ri].id]) < 1) ri++;
   }
 
+  /* ── 实际转账（现金口径，v6.4） ────────────────────────────────────
+     与上面「建议转账指令」不同：这是真的转了多少。决定「谁实际吃亏」。
+     m.transfers 由 monthFromRecords 按「结算月份」筛出（记录只存 month，不存日期）。
+     只统计收付双方都还在成员名单里的记录（成员被删除后其历史转账不再影响结算）。 */
+  var known = {};
+  members.forEach(function (m) { known[m.id] = true; });
+  var sent = {}, recv = {};
+  members.forEach(function (m) { sent[m.id] = 0; recv[m.id] = 0; });
+  var transferTotal = 0;
+  (m.transfers || []).forEach(function (t) {
+    if (!known[t.from] || !known[t.to] || t.from === t.to) return;
+    var amt = parseCents(t.amount);
+    if (amt === 0) return;
+    sent[t.from] += amt;
+    recv[t.to] += amt;
+    transferTotal += amt;
+  });
+
+  /* 实际盈亏 = 代收 + 实收转账 − 垫付 − 实付转账。
+     全部结清时它正好等于 redist − perPerson（账目盈亏）；
+     没结清时差额 = net −（实收 − 实付）= 还没结清的金额，正数=别人还欠他。 */
+  var actualNet = {}, actualPL = {}, settleGap = {};
+  members.forEach(function (mem) {
+    actualNet[mem.id] = recv[mem.id] - sent[mem.id];
+    actualPL[mem.id] = parseCents(inc[mem.id] || 0) - (paid[mem.id] || 0) + actualNet[mem.id];
+    settleGap[mem.id] = net[mem.id] - actualNet[mem.id];   // 正=仍应收，负=已超付
+  });
+
   return { rate: rate, totalExp: totalExp, perPerson: perPerson, totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
            paid: paid, investPool: investPool, servicePool: servicePool, investReturn: investReturn, serviceReturn: serviceReturn,
-           redist: redist, net: net, transfers: transfers, members: members, memberCount: memberCount, scoreCap: scoreCap };
+           redist: redist, net: net, transfers: transfers, members: members, memberCount: memberCount, scoreCap: scoreCap,
+           sent: sent, recv: recv, transferTotal: transferTotal, actualNet: actualNet, actualPL: actualPL, settleGap: settleGap };
 }
 
 /* ==================== 保存 ==================== */
@@ -3093,7 +3173,7 @@ function renderDash() {
   if (!keys.includes(currentKey)) currentKey = keys[keys.length - 1] || currentMonthKey();
   var m = monthFromRecords(currentKey);
   var r = calcMonth(m);
-  var hasData = (m.expenses.length + (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + (STORE.records.scores || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length) > 0;
+  var hasData = (m.expenses.length + (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + (STORE.records.scores || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + m.transfers.length) > 0;
 
   // v4.2：无成员空态 —— 引导到「设置」添加成员（订单归属/收支结算的前提）
   if (!getMembers().length) {
@@ -3184,7 +3264,7 @@ function renderDash() {
   h += '</tbody></table></div></div>';
 
   // 资金重分配
-  h += '<div class="settle-box"><h2>🔄 资金重分配 <span class="hint">（实际转账指令）</span></h2>';
+  h += '<div class="settle-box"><h2>🔄 资金重分配 <span class="hint">（建议转账指令 · 按账面算，不代表真的转了）</span></h2>';
   h += '<div class="table-wrap"><table style="margin-bottom:14px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>= 应转出/入</th></tr></thead><tbody>';
   getMembers().forEach(function (mem) {
     var incomeAdj = r.redist[mem.id] - parseCents((m.income || {})[mem.id] || 0);
@@ -3209,6 +3289,42 @@ function renderDash() {
   }
   h += '</div>';
 
+  /* ── 实际转账（独立密码，v6.4） ── */
+  h += '<div class="settle-box settle-box-real"><h2>💸 实际转账 <span class="hint">（' + esc(m.label) + ' 归属 · 真正转了多少钱 · 决定谁实际吃亏）</span>' + lockBadge('transfer') + '</h2>';
+  h += lockBarHTML('transfer');
+  var dT = unlocked.transfer ? '' : ' disabled';
+  // 建议 vs 实际 差额（一眼看出谁还没转够）—— 独立成块，改金额时就地刷新
+  h += '<div id="dashTransferGaps">' + transferGapChipsHTML(m, r, dT) + '</div>';
+  // 无日期列：转账归属当前「结算月份」，不按付款时间归月（转账常在下月才付，仍算本月的账）
+  h += '<div class="table-wrap"><table><thead><tr><th>付款人</th><th></th><th>收款人</th><th>金额（元）</th><th class="l">备注</th><th></th></tr></thead><tbody>';
+  (m.transfers || []).forEach(function (t) {
+    var tid = safeId(t.id);
+    if (!tid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
+    h += '<tr>';
+    h += '<td><select onchange="updTransfer(\'' + tid + '\',\'from\',this.value)"' + dT + '>';
+    getMembers().forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (t.from === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
+    h += '</select></td>';
+    h += '<td class="arrow" style="color:var(--muted);padding:0 4px">→</td>';
+    h += '<td><select onchange="updTransfer(\'' + tid + '\',\'to\',this.value)"' + dT + '>';
+    getMembers().forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (t.to === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
+    h += '</select></td>';
+    h += '<td><input type="number" step="0.01" min="0" value="' + esc(t.amount) + '" onchange="updTransfer(\'' + tid + '\',\'amount\',+this.value)"' + dT + '></td>';
+    h += '<td class="l"><input type="text" value="' + esc(t.note) + '" onchange="updTransfer(\'' + tid + '\',\'note\',this.value)" placeholder="备注（选填）" style="width:180px"' + dT + '></td>';
+    h += '<td><button class="btn danger sm" onclick="delTransfer(\'' + tid + '\')"' + dT + '>✕</button></td>';
+    h += '</tr>';
+  });
+  if (!(m.transfers || []).length) h += '<tr><td colspan="6" style="color:var(--muted)">' + esc(m.label) + ' 暂无实际转账记录 —— 上面的「应转出/入」只是账面数字，录入实际转账后才能看出谁真的垫了钱。</td></tr>';
+  if ((m.transfers || []).length) {
+    h += '<tr class="tfoot"><td colspan="3">实际转账合计</td><td id="dashTransferTotal">' + RMB(r.transferTotal) + '</td><td colspan="2"></td></tr>';
+  }
+  h += '</tbody></table></div>';
+  h += '<button class="btn sm" style="margin-top:10px" onclick="addTransfer()"' + dT + '>+ 添加转账记录</button>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">记录<b>真实发生</b>的转账，金额归属当前结算月份（' + esc(m.label) + '）—— 钱即使下个月才转，也还算这个月的结算，不随付款时间跑到下个月。<br>每改一行，下面的「实际盈亏」与上面的「已转 / 还差」会立即重算（不刷新整表，避免输入框失焦）。</div>';
+  h += '</div>';
+
+  /* ── 实际盈亏（现金口径） ── */
+  h += '<div id="dashRealPL">' + realPLSectionHTML(m, r, totalPL) + '</div>';
+
   el.innerHTML = h;
   // KPI 数字滚动
   $$('#tab-dash .num[data-count]').forEach(function (node) {
@@ -3216,6 +3332,71 @@ function renderDash() {
     var prefix = node.getAttribute('data-prefix') || '';
     countUp(node, target, { dec: 2, fmt: function (n) { return prefix + (n / 100).toFixed(2); } });
   });
+}
+
+/* 建议转账 vs 实际已转（渲染 + 就地刷新共用） */
+function transferGapChipsHTML(m, r, disabledAttr) {
+  var h = '';
+  if (!r.transfers.length) return '<div style="color:var(--muted);margin-bottom:12px">本月收支平衡，无建议转账。</div>';
+  var pending = 0;
+  h += '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px">';
+  r.transfers.forEach(function (t) {
+    var done = 0;
+    (m.transfers || []).forEach(function (x) { if (x.from === t.from && x.to === t.to) done += parseCents(x.amount); });
+    var left = t.amount - done;
+    if (left > 1) pending++;
+    h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
+    h += '<span class="arrow" style="color:var(--muted)">→</span>';
+    h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
+    h += '<span style="font-size:.86rem">建议 ' + RMB(t.amount) + ' · 已转 <b>' + RMB(done) + '</b></span>';
+    h += (left > 1 ? '<span class="tag y">还差 ' + RMB(left) + '</span>' : '<span class="tag g">已结清</span>') + '<span style="width:12px"></span>';
+  });
+  h += '</div>';
+  if (pending) h += '<button class="btn sm" style="margin-bottom:12px" onclick="fillSuggestedTransfers()"' + (disabledAttr || '') + '>⚡ 按建议一键填入</button>';
+  return h;
+}
+/* 实际盈亏（现金口径）区块。金额为 0 时不带正负号，避免出现「−¥0.00」「+¥0.00」这类看着像 bug 的显示。 */
+function realPLSectionHTML(m, r, totalPL) {
+  var totalActual = 0;
+  getMembers().forEach(function (mem) { totalActual += r.actualPL[mem.id]; });
+  var signed = function (c) { return (c > 0 ? '+' : '') + RMB(c); };
+  var spend = function (c) { return (c > 0 ? '−' : '') + RMB(c); };
+  var h = '<div class="section"><h2>💰 实际盈亏 <span class="hint">（现金口径：代收 + 实收转账 − 垫付 − 实付转账）</span></h2>';
+  h += '<div class="table-wrap"><table><thead><tr><th></th><th>代收</th><th>+ 实收转账</th><th>− 垫付</th><th>− 实付转账</th><th>= 实际盈亏</th><th>应得盈亏</th><th>差额（未结清）</th></tr></thead><tbody>';
+  getMembers().forEach(function (mem) {
+    var aPL = r.actualPL[mem.id];
+    var nPL = r.redist[mem.id] - r.perPerson;
+    var gap = r.settleGap[mem.id];
+    var tag3 = gap > 1 ? '<span class="tag g">还应收 ' + RMB(gap) + '</span>' : (gap < -1 ? '<span class="tag r">已超付 ' + RMB(-gap) + '</span>' : '<span class="tag b">已结清</span>');
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
+    h += '<td>' + RMB(parseCents((m.income || {})[mem.id] || 0)) + '</td>';
+    h += '<td class="pos">' + signed(r.recv[mem.id]) + '</td>';
+    h += '<td class="neg">' + spend(r.paid[mem.id] || 0) + '</td>';
+    h += '<td class="neg">' + spend(r.sent[mem.id]) + '</td>';
+    h += '<td class="' + (aPL >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + signed(aPL) + '</td>';
+    h += '<td style="color:var(--muted)">' + signed(nPL) + '</td>';
+    h += '<td>' + tag3 + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>' + signed(r.transferTotal) + '</td><td>' + spend(r.totalExp) + '</td><td>' + spend(r.transferTotal) + '</td>';
+  h += '<td class="' + (totalActual >= 0 ? 'pos' : 'neg') + '">' + signed(totalActual) + '</td><td>' + signed(totalPL) + '</td><td>0</td></tr>';
+  h += '</tbody></table></div>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">实际盈亏 = 这个月他<b>真正</b>拿到的钱减真正掏出去的钱（转账是成员内部的钱，合计为 0，不影响团队总盈亏）。<br>全部结清时「实际盈亏」= 「应得盈亏」；没结清时差额就是<b>还没到位的钱</b> —— 差额为正的人被欠着，团队亏损实际由他垫着。</div></div>';
+  return h;
+}
+/* 只重绘两个派生区块（转出/入 状态条 + 实际盈亏表），不整体重绘 ——
+   整体重绘会重建转账记录行的输入框，正在编辑的金额框会失焦。 */
+function _refreshDashSummary() {
+  if (currentTab !== 'dash') return;
+  var m = monthFromRecords(currentKey);
+  var r = calcMonth(m);
+  var totalPL = 0;
+  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPerson; });
+  var g = $('#dashTransferGaps');
+  if (g) g.innerHTML = transferGapChipsHTML(m, r, unlocked.transfer ? '' : ' disabled');
+  var p = $('#dashRealPL');
+  if (p) p.innerHTML = realPLSectionHTML(m, r, totalPL);
+  var t = $('#dashTransferTotal');
+  if (t) t.textContent = RMB(r.transferTotal);
 }
 
 function updateRate(val) {
@@ -3395,6 +3576,68 @@ function updScore(id, field, val) {
   save();   // 日期列已移除，评分项归属月份固定，无需 handleDateMove 重绘（避免编辑失焦）
 }
 function delScore(id) { STORE.records.scores = STORE.records.scores.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
+
+/* ==================== 实际转账 CRUD ====================
+   记录真实发生的成员间转账（决定现金口径的实际盈亏）。
+   记录绑定「结算月份」month 而非日期：转账常在下个月才付，但那仍是本月的账，
+   让付款时间决定归属会把结算搬到下个月。跨月补记 → 切到对应结算月份再录。
+   改值后只刷新派生区块（_refreshDashSummary），不整表重绘 —— 整表重绘会让下拉框/输入框
+   重建并失焦到下一行，无法连续修改多行。 */
+function addTransfer() {
+  if (!unlocked.transfer) { toast('🔒 请先解锁实际转账', 'error'); return; }
+  var members = getMembers();
+  if (members.length < 2) { toast('👥 至少需要 2 名成员才能记录转账', 'error'); return; }
+  var m = monthFromRecords(currentKey);
+  // 默认填第一条还没结清的建议转账，省去手填
+  var from = members[0].id, to = members[1].id, amount = 0;
+  var r = calcMonth(m);
+  for (var i = 0; i < r.transfers.length; i++) {
+    var t = r.transfers[i], done = 0;
+    m.transfers.forEach(function (x) { if (x.from === t.from && x.to === t.to) done += parseCents(x.amount); });
+    if (t.amount - done > 1) { from = t.from; to = t.to; amount = (t.amount - done) / 100; break; }
+  }
+  STORE.records.transfers.push({ id: uid(), month: currentKey, from: from, to: to, amount: amount, note: '' });
+  save(); renderDash();
+}
+function updTransfer(id, field, val) {
+  if (!unlocked.transfer) { toast('🔒 请先解锁实际转账', 'error'); renderDash(); return; }
+  var r = (STORE.records.transfers || []).find(function (x) { return x.id === id; });
+  if (!r) return;
+  if (field === 'amount') r.amount = Math.max(0, +val || 0);
+  else if (field === 'from' || field === 'to') {
+    if (val === r[field]) return;
+    // 改成一端=另一端会产生自转账（无意义，且会让合计口径失真）→ 拒绝并还原
+    if (val === (field === 'from' ? r.to : r.from)) { toast('❌ 付款人与收款人不能是同一人', 'error'); renderDash(); return; }
+    r[field] = val;
+  } else r[field] = val;
+  save();
+  // 只刷新派生区块（#dashTransferGaps / #dashRealPL / 合计单元格 都不含正在编辑的输入框，不会失焦）
+  _refreshDashSummary();
+}
+function delTransfer(id) {
+  if (!unlocked.transfer) { toast('🔒 请先解锁实际转账', 'error'); return; }
+  STORE.records.transfers = (STORE.records.transfers || []).filter(function (x) { return x.id !== id; });
+  save(); renderDash();
+}
+/* 一键套用建议转账指令：只补「还没转够」的部分，已转够的不重复添加。
+   同一条建议路径若已有记录则累加到最上面那条（保持记录简洁）。 */
+function fillSuggestedTransfers() {
+  if (!unlocked.transfer) { toast('🔒 请先解锁实际转账', 'error'); return; }
+  var m = monthFromRecords(currentKey);
+  var r = calcMonth(m);
+  var added = 0;
+  r.transfers.forEach(function (t) {
+    var done = 0;
+    m.transfers.forEach(function (x) { if (x.from === t.from && x.to === t.to) done += parseCents(x.amount); });
+    var left = t.amount - done;
+    if (left <= 1) return;
+    STORE.records.transfers.push({ id: uid(), month: currentKey, from: t.from, to: t.to, amount: left / 100, note: '按建议填入' });
+    added++;
+  });
+  if (!added) { toast('✅ 建议转账均已结清，无需填入'); return; }
+  save(); renderDash();
+  toast('⚡ 已填入 ' + added + ' 条建议转账，可按实际情况修改金额', 'success');
+}
 function updNote(val) {
   STORE.notes[currentKey] = val;
   save();
@@ -3767,7 +4010,7 @@ function renderHistory() {
     return;
   }
   h += '<div class="table-wrap"><table><thead><tr><th>月份</th><th>采购总额</th><th>人均</th><th>总收入</th>';
-  members.forEach(function (m) { h += '<th>' + esc(m.name) + ' 净额</th>'; });
+  members.forEach(function (m) { h += '<th>' + esc(m.name) + ' 实际盈亏</th>'; });
   h += '<th>备注</th><th></th></tr></thead><tbody>';
   list.forEach(function (key) {
     var keySafe = safeId(key);
@@ -3777,14 +4020,20 @@ function renderHistory() {
     h += '<td style="font-weight:700">' + m.label + '</td>';
     h += '<td>' + RMB(r.totalExp) + '</td><td>' + RMB(r.perPerson) + '</td><td>' + RMB(r.totalInc) + '</td>';
     members.forEach(function (mem) {
-      var net = r.redist[mem.id] - r.perPerson + (r.paid[mem.id] || 0);
-      h += '<td class="' + (net >= 0 ? 'pos' : 'neg') + '">' + (net >= 0 ? '+' : '') + RMB(net) + '</td>';
+      // 实际盈亏（现金口径）：代收 + 实收转账 − 垫付 − 实付转账。全结清时等于应得盈亏。
+      var aPL = r.actualPL[mem.id];
+      var nPL = r.redist[mem.id] - r.perPerson;
+      h += '<td class="' + (aPL >= 0 ? 'pos' : 'neg') + '" style="white-space:nowrap">';
+      h += '<div style="font-weight:800">' + (aPL >= 0 ? '+' : '') + RMB(aPL) + '</div>';
+      h += '<div style="font-size:.72rem;font-weight:400;color:var(--muted)" title="应得盈亏 = 应得收入 − 均摊支出（账面口径，与转账是否发生无关）">应 ' + (nPL >= 0 ? '+' : '') + RMB(nPL) + '</div>';
+      h += '</td>';
     });
     h += '<td style="max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.76rem">' + esc(m.note || '-') + '</td>';
     h += '<td style="white-space:nowrap">' + (keySafe ? '<button class="btn sm" onclick="editMonth(\'' + keySafe + '\')">编辑</button> <button class="btn danger sm" onclick="delMonth(\'' + keySafe + '\')">删除</button>' : '') + '</td>';
     h += '</tr>';
   });
   h += '</tbody></table></div>';
+  h += '<div style="margin-top:10px;font-size:.8rem;color:var(--muted)">「实际盈亏」= 该成员当月真正拿到手的钱（代收 + 实收转账 − 垫付 − 实付转账），取决于「收支清算」里录入的<b>实际转账</b>；小字「应 …」是账面应得盈亏。<br>两者不一致说明还有人没转够钱 —— 团队总盈亏不变，但亏损实际由<b>还没收到钱的人</b>垫着。要补录转账请到「收支清算」标签页。</div>';
   el.innerHTML = h;
 }
 function editMonth(key) { currentKey = key; switchTab('entry'); }
@@ -3840,7 +4089,7 @@ function resetData() {
       if (!ok) return;
       STORE = migrateConfig(null);
       currentKey = currentMonthKey();
-      unlocked = { score: false, expense: false, income: false, settings: false };
+      unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false };
       save();
       renderAll();
       toast('已重置，数据已清空');
@@ -3863,7 +4112,7 @@ function renderSettings() {
 
   // 密码管理
   h += '<div class="section"><h2>🔐 敏感模块密码</h2>';
-  ['score', 'expense', 'income', 'settings', 'auth'].forEach(function (k) {
+  PASSWORD_KEYS.forEach(function (k) {
     h += '<div class="settings-row"><label>' + MODULE_NAMES[k] + ' 密码</label>';
     h += '<input type="password" id="pwd-' + k + '" placeholder="输入新密码（至少 4 位）" style="width:200px" autocomplete="new-password">';
     h += '<button class="btn green sm" onclick="updatePassword(\'' + k + '\')">保存</button>';
@@ -4329,10 +4578,11 @@ function renderAbout() {
     '<p style="margin-top:10px">v5.21：打印价格统一管理 + 收益口径修正 —— 设置页新增「打印价格」区块（单双面价 / 派送地点百分比 / 优先级加急价 / 首页费：云端模式写服务器 pricing.json 全端生效，本地模式存 print_data.json；支持添加 / 删除派送地点，密码保护）；收益统计计入订单级附加服务费（派送 / 加急 / 首页，按订单有效文件状态归入已入账或应收未收，放弃 / 取消 / 打回 / 失败订单不计）；订单明细金额配色：自打且已完成订单金额用蓝色与「自打」标记一致；设置页移除「外观」主题板块（右上角主题切换保留）；优先级加急价按 低 → 中 → 高 顺序展示。</p>' +
     '<p style="margin-top:10px">v5.22：设备授权 + 多设备接单 —— 新增「🔐 授权」标签页（独立密码保护）：① 本设备所有者从成员列表绑定，绑定后本地打印工具新建标签页默认归属该所有者、默认关闭「管理员自行打印」；② 云端设备列表展示所有连接过云服务器的设备（计算机名称 / 在线状态 / 所有者 / 是否接单，每 15 秒自动刷新，绑定后即时广播生效）。多设备共连服务器时仅「启用接单」的设备接收订单（同一时间唯一接管者，被其他设备占用时提示接管者名称与所有者）；订单明细「用户」列改为显示下单用户昵称（绑定微信小程序/APP 后优先微信小程序昵称，修改昵称实时同步）；修复授权页设备列表/所有者刷新被代理过滤的问题。</p>' +
     '<p style="margin-top:10px">v5.23：设备删除 + 图表与价格修正 —— ① 授权页云端设备列表新增「🗑 删除」按钮（清理软件升级产生的同机旧 ID 与历史遗留设备；删除当前接单设备时自动清空接管记录）；② 饼状图引线标签防重叠：过小扇区跳过标注、同侧标签碰撞检测自动错开/隐藏、引线水平段只画到文字近边前 2px（不再压字）；③ 打印价格：本地模式首页费默认值统一为 0.10（与云端 pricing.json 一致）。</p>' +
-    '<p style="margin-top:10px">v5.24：多设备接单 + 时间到秒 —— ① 「启用接单」重构为可接单设备列表（多台设备可同时启用），订单记录实际接单设备；订单明细新增「接单设备」列（{所有者}的设备 | {设备}，历史订单归属姚懿祥的设备）；② 运营视角新增「接单设备比例」饼图（按订单数，悬停看收益）；③ 订单明细「时间」「开始打印」精确到秒；④ 口径栏滚动收起：滚动到订单明细附近时口径栏平滑上滑淡出、向上滚动自动滑回；⑤ 订单明细新增「开始打印」列（悬停展示下单→开始打印的等待时长）。</p>' +
+    '<p style="margin-top:10px">v5.24：多设备接单 + 时间到秒 —— ① 「启用接单」重构为可接单设备列表（多台设备可同时启用），订单记录实际接单设备；订单明细新增「接单设备」列（{所有者}的设备 | {设备}，历史订单统一归入历史设备）；② 运营视角新增「接单设备比例」饼图（按订单数，悬停看收益）；③ 订单明细「时间」「开始打印」精确到秒；④ 口径栏滚动收起：滚动到订单明细附近时口径栏平滑上滑淡出、向上滚动自动滑回；⑤ 订单明细新增「开始打印」列（悬停展示下单→开始打印的等待时长）。</p>' +
     '<p style="margin-top:10px">v5.25：界面细节优化 —— ① 口径栏改为普通固定卡片：移除吸顶悬浮与滚动收起动画，不再遮挡订单明细；② 刷新记住所在标签页：F5 刷新后停留在原 tab（新开会话仍从收支清算开始）；③ 消除刷新时「收支清算」选中态闪烁：tab 恢复提前到首帧绘制前同步完成。</p>' +
     '<p style="margin-top:10px">v6.2：纸张张数统计 —— ① Hero KPI 新增「纸张张数」卡（单面每页 1 张、双面每张 2 页，奇数页最后一张仍占 1 张，含份数），副行显示单面/双面张数拆分；② 趋势分析新增「纸张」第五指标（≤60 天自动渲染为逐日柱状图，>60 天为切片折线；专属橙色，峰值/提示同步）；③ 修复「单双面构成」饼图此前按文件数计数却标注「张」的模糊统计，改为按实际纸张张数；④ 订单明细文件级新增「张数」列（含份数的实际用纸量）；⑤ 汇总行补充「· X 张纸」。</p>' +
     '<p style="margin-top:10px">v6.3：张数列补全 —— ① 订单明细订单行「页数」右侧新增「张数」列，显示该订单消耗的纸张总张数（悬停看单面/双面拆分）；② 展开的文件子列表「张数」列移至「页数」右侧，与订单行列序一致，仍显示该文件消耗的纸张张数（含份数）。</p>' +
+    '<p style="margin-top:10px">v6.4：实际转账 + 实际盈亏 —— 原「经营损益 / 历史记录净额」只算账面该赚该亏，「资金重分配」里的转账指令也只是建议，钱有没有真的转并不影响显示，导致垫钱的人反被记成盈利（例：某月一人垫付 1125.77、代收仅 101.80，账面记他 +862.36，实际亏 1023.97）。现新增：① 「💸 实际转账」区块（独立密码，默认需在设置页另行设置），可一键套用建议转账指令、逐条增删改（付款人 / 收款人 / 金额 / 备注），并实时显示每条建议的「已转 / 还差」；转账<b>不记日期、直接归属当前结算月份</b>（钱即使下个月才转，也还是这个月的结算，不会随付款时间跑到下个月），跨月补记请切到对应结算月份再录；② 「💰 实际盈亏」表按现金口径（代收 + 实收转账 − 垫付 − 实付转账）列出每人真正拿到手多少钱、与应得盈亏差多少，差额即「还没到位的钱」；③ 「历史记录」各成员列改为显示当月实际盈亏（小字标注应得盈亏），与实际转账联动。转账是成员内部的钱，团队总盈亏不受影响，变的是亏损实际由谁垫着。原有「资金重分配」改称「建议转账指令」以示区别。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

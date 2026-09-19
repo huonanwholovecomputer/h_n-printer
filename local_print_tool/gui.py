@@ -88,7 +88,7 @@ import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.15"
+APP_VERSION = "4.5.16"
 
 
 # ============================================================
@@ -175,9 +175,9 @@ class ThemedCheckBox(QCheckBox):
             return
         dark = self._theme_manager is not None and self._theme_manager.effective_theme == MODE_DARK
         if not self.isEnabled():
-            color = QColor("#6c7086") if dark else QColor("#9ca0b0")
+            color = QColor("#6e6e6e") if dark else QColor("#9ca0b0")
         else:
-            color = QColor("#1e1e2e") if dark else QColor("#ffffff")
+            color = QColor("#ffffff")
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
