@@ -1,0 +1,393 @@
+{
+  "L001": {
+    "needs_attention": false
+  },
+  "L002": {
+    "needs_attention": false
+  },
+  "L003": {
+    "needs_attention": false
+  },
+  "L004": {
+    "needs_attention": false
+  },
+  "L005": {
+    "needs_attention": false
+  },
+  "L006": {
+    "needs_attention": false
+  },
+  "L007": {
+    "needs_attention": false
+  },
+  "L008": {
+    "needs_attention": false
+  },
+  "L009": {
+    "borderline": true,
+    "needs_attention": false,
+    "note": "this machine is not the claim holder while another is - a config state, not a fault"
+  },
+  "L010": {
+    "needs_attention": false
+  },
+  "L011": {
+    "needs_attention": false
+  },
+  "L012": {
+    "borderline": true,
+    "needs_attention": false,
+    "note": "cloud cache wiped - destructive but deliberate"
+  },
+  "L013": {
+    "needs_attention": false
+  },
+  "L014": {
+    "needs_attention": false
+  },
+  "L015": {
+    "needs_attention": false
+  },
+  "L016": {
+    "borderline": true,
+    "needs_attention": false,
+    "note": "a reconnect is scheduled - a symptom, but the retry is expected and self-healing"
+  },
+  "L017": {
+    "borderline": true,
+    "needs_attention": false,
+    "note": "same as L009, different device string"
+  },
+  "L018": {
+    "needs_attention": false
+  },
+  "L019": {
+    "needs_attention": false
+  },
+  "L020": {
+    "needs_attention": false
+  },
+  "L021": {
+    "needs_attention": false
+  },
+  "L022": {
+    "needs_attention": false
+  },
+  "L023": {
+    "needs_attention": false
+  },
+  "L024": {
+    "needs_attention": false
+  },
+  "L025": {
+    "needs_attention": false
+  },
+  "L026": {
+    "needs_attention": false
+  },
+  "L027": {
+    "needs_attention": false
+  },
+  "L028": {
+    "needs_attention": false
+  },
+  "L029": {
+    "needs_attention": false
+  },
+  "L030": {
+    "needs_attention": false
+  },
+  "L031": {
+    "needs_attention": false
+  },
+  "L032": {
+    "needs_attention": false
+  },
+  "L033": {
+    "needs_attention": false
+  },
+  "L034": {
+    "needs_attention": false
+  },
+  "L035": {
+    "needs_attention": false
+  },
+  "L036": {
+    "needs_attention": false
+  },
+  "L037": {
+    "needs_attention": false
+  },
+  "L038": {
+    "needs_attention": false
+  },
+  "L039": {
+    "needs_attention": false
+  },
+  "L040": {
+    "needs_attention": false
+  },
+  "L041": {
+    "needs_attention": false
+  },
+  "L042": {
+    "needs_attention": false
+  },
+  "L043": {
+    "needs_attention": false
+  },
+  "L044": {
+    "needs_attention": false
+  },
+  "L045": {
+    "borderline": true,
+    "needs_attention": false,
+    "note": "update download cancelled - deliberate user action"
+  },
+  "L046": {
+    "needs_attention": false
+  },
+  "L047": {
+    "needs_attention": false
+  },
+  "L048": {
+    "needs_attention": false
+  },
+  "L049": {
+    "needs_attention": false
+  },
+  "L050": {
+    "needs_attention": false
+  },
+  "L051": {
+    "needs_attention": false
+  },
+  "L052": {
+    "needs_attention": false
+  },
+  "L053": {
+    "needs_attention": false
+  },
+  "L054": {
+    "needs_attention": false
+  },
+  "L055": {
+    "needs_attention": false
+  },
+  "L056": {
+    "needs_attention": false
+  },
+  "L057": {
+    "needs_attention": false
+  },
+  "L058": {
+    "needs_attention": false
+  },
+  "L059": {
+    "needs_attention": false
+  },
+  "L060": {
+    "needs_attention": false
+  },
+  "L061": {
+    "needs_attention": false
+  },
+  "L062": {
+    "needs_attention": false
+  },
+  "L063": {
+    "needs_attention": false
+  },
+  "L064": {
+    "needs_attention": false
+  },
+  "L065": {
+    "needs_attention": false
+  },
+  "L066": {
+    "needs_attention": false
+  },
+  "L067": {
+    "needs_attention": false
+  },
+  "L068": {
+    "needs_attention": false
+  },
+  "L069": {
+    "needs_attention": false
+  },
+  "L070": {
+    "needs_attention": false
+  },
+  "L071": {
+    "needs_attention": false
+  },
+  "L072": {
+    "needs_attention": false
+  },
+  "L073": {
+    "needs_attention": false
+  },
+  "L074": {
+    "needs_attention": false
+  },
+  "L075": {
+    "needs_attention": false
+  },
+  "L076": {
+    "needs_attention": false
+  },
+  "L077": {
+    "needs_attention": false
+  },
+  "L078": {
+    "needs_attention": false
+  },
+  "L079": {
+    "needs_attention": false
+  },
+  "L080": {
+    "needs_attention": false
+  },
+  "L081": {
+    "needs_attention": true,
+    "note": "connect failed after retries (socket.io, hn-space.cn)"
+  },
+  "L082": {
+    "needs_attention": true,
+    "note": "connect failed after retries, 16 occurrences"
+  },
+  "L083": {
+    "needs_attention": false
+  },
+  "L084": {
+    "needs_attention": false
+  },
+  "L085": {
+    "needs_attention": true,
+    "note": "claim renewal failed - this machine cannot take cloud orders"
+  },
+  "L086": {
+    "needs_attention": true,
+    "note": "claim renewal failed - variant wording"
+  },
+  "L087": {
+    "needs_attention": false
+  },
+  "L088": {
+    "needs_attention": false
+  },
+  "L089": {
+    "needs_attention": false
+  },
+  "L090": {
+    "needs_attention": false
+  },
+  "L091": {
+    "needs_attention": false
+  },
+  "L092": {
+    "needs_attention": false
+  },
+  "L093": {
+    "needs_attention": false
+  },
+  "L094": {
+    "needs_attention": false
+  },
+  "L095": {
+    "needs_attention": false
+  },
+  "L096": {
+    "needs_attention": true,
+    "note": "cache hit reports 0 pages for a real PDF - wrong page count reaches pricing/printing"
+  },
+  "L097": {
+    "needs_attention": false
+  },
+  "L098": {
+    "needs_attention": false
+  },
+  "L099": {
+    "needs_attention": false
+  },
+  "L100": {
+    "needs_attention": false
+  },
+  "L101": {
+    "needs_attention": false
+  },
+  "L102": {
+    "needs_attention": true,
+    "note": "cache hit reports 0 pages for a real PDF"
+  },
+  "L103": {
+    "needs_attention": false
+  },
+  "L104": {
+    "needs_attention": false
+  },
+  "L105": {
+    "needs_attention": false
+  },
+  "L106": {
+    "needs_attention": false
+  },
+  "L107": {
+    "needs_attention": false
+  },
+  "L108": {
+    "needs_attention": false
+  },
+  "L109": {
+    "needs_attention": false
+  },
+  "L110": {
+    "needs_attention": false
+  },
+  "L111": {
+    "needs_attention": false
+  },
+  "L112": {
+    "needs_attention": false
+  },
+  "L113": {
+    "needs_attention": false
+  },
+  "L114": {
+    "needs_attention": false
+  },
+  "L115": {
+    "needs_attention": false
+  },
+  "L116": {
+    "needs_attention": false
+  },
+  "L117": {
+    "needs_attention": false
+  },
+  "L118": {
+    "needs_attention": false
+  },
+  "L119": {
+    "needs_attention": false
+  },
+  "L120": {
+    "needs_attention": false
+  },
+  "L121": {
+    "needs_attention": false
+  },
+  "L122": {
+    "needs_attention": false
+  },
+  "L123": {
+    "needs_attention": false
+  },
+  "L124": {
+    "needs_attention": false
+  },
+  "L125": {
+    "needs_attention": false
+  }
+}

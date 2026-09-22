@@ -1,0 +1,475 @@
+{
+  "L001": {
+    "needs_attention": false,
+    "from": "v1 L001"
+  },
+  "L002": {
+    "needs_attention": false,
+    "from": "v1 L002"
+  },
+  "L003": {
+    "needs_attention": false,
+    "from": "v1 L003"
+  },
+  "L004": {
+    "needs_attention": false,
+    "from": "v1 L004"
+  },
+  "L005": {
+    "needs_attention": false,
+    "from": "v1 L005"
+  },
+  "L006": {
+    "needs_attention": false,
+    "from": "v1 L006"
+  },
+  "L007": {
+    "needs_attention": false,
+    "from": "v1 L007"
+  },
+  "L008": {
+    "needs_attention": false,
+    "from": "v1 L008"
+  },
+  "L009": {
+    "needs_attention": false,
+    "from": "v1 L009,L017",
+    "borderline": true,
+    "note": "v1 L009: this machine is not the claim holder while another is - a config state, not a fault | v1 L017: same as L009, different device string"
+  },
+  "L010": {
+    "needs_attention": false,
+    "from": "v1 L010"
+  },
+  "L011": {
+    "needs_attention": false,
+    "from": "v1 L011"
+  },
+  "L012": {
+    "needs_attention": false,
+    "from": "v1 L012",
+    "borderline": true,
+    "note": "v1 L012: cloud cache wiped - destructive but deliberate"
+  },
+  "L013": {
+    "needs_attention": false,
+    "from": "v1 L013"
+  },
+  "L014": {
+    "needs_attention": false,
+    "from": "v1 L014"
+  },
+  "L015": {
+    "needs_attention": false,
+    "from": "v1 L015"
+  },
+  "L016": {
+    "needs_attention": false,
+    "from": "v1 L016",
+    "borderline": true,
+    "note": "v1 L016: a reconnect is scheduled - a symptom, but the retry is expected and self-healing"
+  },
+  "L017": {
+    "needs_attention": false,
+    "from": "v1 L018"
+  },
+  "L018": {
+    "needs_attention": false,
+    "from": "v1 L019"
+  },
+  "L019": {
+    "needs_attention": false,
+    "from": "v1 L020,L034,L111,L122"
+  },
+  "L020": {
+    "needs_attention": false,
+    "from": "v1 L021"
+  },
+  "L021": {
+    "needs_attention": false,
+    "from": "v1 L022"
+  },
+  "L022": {
+    "needs_attention": false,
+    "from": "v1 L023"
+  },
+  "L023": {
+    "needs_attention": false,
+    "from": "v1 L024"
+  },
+  "L024": {
+    "needs_attention": false,
+    "from": "v1 L025"
+  },
+  "L025": {
+    "needs_attention": false,
+    "from": "v1 L026"
+  },
+  "L026": {
+    "needs_attention": false,
+    "from": "v1 L027,L123"
+  },
+  "L027": {
+    "needs_attention": false,
+    "from": "v1 L028"
+  },
+  "L028": {
+    "needs_attention": false,
+    "from": "v1 L029"
+  },
+  "L029": {
+    "needs_attention": false,
+    "from": "v1 L030"
+  },
+  "L030": {
+    "needs_attention": false,
+    "from": "v1 L031"
+  },
+  "L031": {
+    "needs_attention": false,
+    "from": "v1 L032"
+  },
+  "L032": {
+    "needs_attention": false,
+    "from": "v1 L033"
+  },
+  "L033": {
+    "needs_attention": false,
+    "from": "v1 L035,L037,L069,L070,L078,L103,L104,L125"
+  },
+  "L034": {
+    "needs_attention": false,
+    "from": "v1 L036"
+  },
+  "L035": {
+    "needs_attention": false,
+    "from": "v1 L038"
+  },
+  "L036": {
+    "needs_attention": false,
+    "from": "v1 L039"
+  },
+  "L037": {
+    "needs_attention": false,
+    "from": "v1 L040"
+  },
+  "L038": {
+    "needs_attention": false,
+    "from": "v1 L041"
+  },
+  "L039": {
+    "needs_attention": false,
+    "from": "v1 L042"
+  },
+  "L040": {
+    "needs_attention": false,
+    "from": "v1 L043"
+  },
+  "L041": {
+    "needs_attention": false,
+    "from": "v1 L044"
+  },
+  "L042": {
+    "needs_attention": false,
+    "from": "v1 L045",
+    "borderline": true,
+    "note": "v1 L045: update download cancelled - deliberate user action"
+  },
+  "L043": {
+    "needs_attention": false,
+    "from": "v1 L046"
+  },
+  "L044": {
+    "needs_attention": false,
+    "borderline": true,
+    "note": "uploads an empty log. Printing and cloud orders are untouched, so this is not a shop fault — but a diagnostic that delivers nothing is either harmless or the sign of a log that is not being written, and v1 hid this line behind a sibling reading 4810 字节.",
+    "from": "v2"
+  },
+  "L045": {
+    "needs_attention": false,
+    "note": "routine size for the same upload",
+    "from": "v2"
+  },
+  "L046": {
+    "needs_attention": false,
+    "note": "routine size for the same upload",
+    "from": "v2"
+  },
+  "L047": {
+    "needs_attention": false,
+    "note": "routine size for the same upload",
+    "from": "v2"
+  },
+  "L048": {
+    "needs_attention": false,
+    "from": "v1 L047"
+  },
+  "L049": {
+    "needs_attention": false,
+    "from": "v1 L048"
+  },
+  "L050": {
+    "needs_attention": false,
+    "from": "v1 L049"
+  },
+  "L051": {
+    "needs_attention": false,
+    "from": "v1 L050"
+  },
+  "L052": {
+    "needs_attention": false,
+    "from": "v1 L051"
+  },
+  "L053": {
+    "needs_attention": false,
+    "from": "v1 L052,L071"
+  },
+  "L054": {
+    "needs_attention": false,
+    "from": "v1 L053,L072"
+  },
+  "L055": {
+    "needs_attention": false,
+    "from": "v1 L054,L073"
+  },
+  "L056": {
+    "needs_attention": false,
+    "from": "v1 L055"
+  },
+  "L057": {
+    "needs_attention": false,
+    "from": "v1 L056"
+  },
+  "L058": {
+    "needs_attention": false,
+    "note": "a finished download; the byte size separates it from its siblings, nothing more",
+    "from": "v2"
+  },
+  "L059": {
+    "needs_attention": false,
+    "from": "v1 L057"
+  },
+  "L060": {
+    "needs_attention": false,
+    "from": "v1 L058"
+  },
+  "L061": {
+    "needs_attention": false,
+    "from": "v1 L059"
+  },
+  "L062": {
+    "needs_attention": false,
+    "from": "v1 L060"
+  },
+  "L063": {
+    "needs_attention": false,
+    "from": "v1 L061,L075"
+  },
+  "L064": {
+    "needs_attention": false,
+    "from": "v1 L062"
+  },
+  "L065": {
+    "needs_attention": false,
+    "from": "v1 L063,L067,L076"
+  },
+  "L066": {
+    "needs_attention": false,
+    "from": "v1 L064,L068,L077"
+  },
+  "L067": {
+    "needs_attention": false,
+    "from": "v1 L065"
+  },
+  "L068": {
+    "needs_attention": false,
+    "from": "v1 L066"
+  },
+  "L069": {
+    "needs_attention": false,
+    "from": "v1 L074"
+  },
+  "L070": {
+    "needs_attention": false,
+    "from": "v1 L079"
+  },
+  "L071": {
+    "needs_attention": false,
+    "from": "v1 L080"
+  },
+  "L072": {
+    "needs_attention": true,
+    "from": "v1 L081",
+    "note": "v1 L081: connect failed after retries (socket.io, hn-space.cn)"
+  },
+  "L073": {
+    "needs_attention": true,
+    "from": "v1 L082",
+    "note": "v1 L082: connect failed after retries, 16 occurrences"
+  },
+  "L074": {
+    "needs_attention": false,
+    "from": "v1 L083"
+  },
+  "L075": {
+    "needs_attention": false,
+    "from": "v1 L084"
+  },
+  "L076": {
+    "needs_attention": true,
+    "from": "v1 L085",
+    "note": "v1 L085: claim renewal failed - this machine cannot take cloud orders"
+  },
+  "L077": {
+    "needs_attention": true,
+    "from": "v1 L086",
+    "note": "v1 L086: claim renewal failed - variant wording"
+  },
+  "L078": {
+    "needs_attention": false,
+    "from": "v1 L087"
+  },
+  "L079": {
+    "needs_attention": false,
+    "from": "v1 L088"
+  },
+  "L080": {
+    "needs_attention": false,
+    "from": "v1 L089"
+  },
+  "L081": {
+    "needs_attention": false,
+    "from": "v1 L090"
+  },
+  "L082": {
+    "needs_attention": false,
+    "from": "v1 L091,L097"
+  },
+  "L083": {
+    "needs_attention": false,
+    "from": "v1 L092"
+  },
+  "L084": {
+    "needs_attention": false,
+    "from": "v1 L093,L099"
+  },
+  "L085": {
+    "needs_attention": false,
+    "from": "v1 L094,L100"
+  },
+  "L086": {
+    "needs_attention": false,
+    "from": "v1 L095"
+  },
+  "L087": {
+    "needs_attention": true,
+    "from": "v1 L096,L102",
+    "note": "v1 L096: cache hit reports 0 pages for a real PDF - wrong page count reaches pricing/printing | v1 L102: cache hit reports 0 pages for a real PDF"
+  },
+  "L088": {
+    "needs_attention": false,
+    "from": "v1 L098"
+  },
+  "L089": {
+    "needs_attention": false,
+    "from": "v1 L101"
+  },
+  "L090": {
+    "needs_attention": false,
+    "note": "staging-directory statistics",
+    "from": "v2"
+  },
+  "L091": {
+    "needs_attention": false,
+    "note": "staged copies reclaimed on exit; the count differs from its sibling, the event does not",
+    "from": "v2"
+  },
+  "L092": {
+    "needs_attention": false,
+    "note": "files added to a tab; the file count is what separates this from its siblings",
+    "from": "v2"
+  },
+  "L093": {
+    "needs_attention": false,
+    "note": "files added to a tab; a different count of the same routine",
+    "from": "v2"
+  },
+  "L094": {
+    "needs_attention": false,
+    "from": "v1 L105"
+  },
+  "L095": {
+    "needs_attention": false,
+    "from": "v1 L106"
+  },
+  "L096": {
+    "needs_attention": false,
+    "from": "v1 L107"
+  },
+  "L097": {
+    "needs_attention": false,
+    "note": "staged copies reclaimed on exit; a different count of the same routine",
+    "from": "v2"
+  },
+  "L098": {
+    "needs_attention": false,
+    "from": "v1 L108"
+  },
+  "L099": {
+    "needs_attention": false,
+    "from": "v1 L109"
+  },
+  "L100": {
+    "needs_attention": false,
+    "from": "v1 L110"
+  },
+  "L101": {
+    "needs_attention": false,
+    "from": "v1 L112"
+  },
+  "L102": {
+    "needs_attention": false,
+    "from": "v1 L113"
+  },
+  "L103": {
+    "needs_attention": false,
+    "from": "v1 L114"
+  },
+  "L104": {
+    "needs_attention": false,
+    "from": "v1 L115"
+  },
+  "L105": {
+    "needs_attention": false,
+    "from": "v1 L116"
+  },
+  "L106": {
+    "needs_attention": false,
+    "from": "v1 L117"
+  },
+  "L107": {
+    "needs_attention": false,
+    "from": "v1 L118"
+  },
+  "L108": {
+    "needs_attention": false,
+    "from": "v1 L119"
+  },
+  "L109": {
+    "needs_attention": false,
+    "from": "v1 L120"
+  },
+  "L110": {
+    "needs_attention": false,
+    "from": "v1 L121"
+  },
+  "L111": {
+    "needs_attention": false,
+    "note": "a finished print; the sheet count separates it from its siblings",
+    "from": "v2"
+  },
+  "L112": {
+    "needs_attention": false,
+    "from": "v1 L124"
+  }
+}

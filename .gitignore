@@ -136,3 +136,6 @@ mobile_apps/printer-backend/order_counter.json
 
 # 发布流程（含真实服务器 IP / COS 地址 / 密钥配置，仅本地参考）
 local_print_tool/发布流程.md
+# 日志分诊工具的本地产物（judgments 含真实日志文本、cache 含请求缓存）
+local_print_tool/tools/out/
+local_print_tool/tools/__pycache__/

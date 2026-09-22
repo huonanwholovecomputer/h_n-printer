@@ -1,0 +1,50 @@
+{
+  "_comment": "Hand judgments for the events the v1 corpus could not distinguish — it merged each of these with a sibling, keeping whichever came first as the representative, so no v1 label covers them. Keyed by the masked line text rather than by id, so it survives a fixture regeneration. relabel.py requires an entry here for every event it cannot inherit, and fails if one is missing.",
+  "labels": {
+    "📋 已回报本机日志（云端日志收集, 0 字节）": {
+      "needs_attention": false,
+      "borderline": true,
+      "note": "uploads an empty log. Printing and cloud orders are untouched, so this is not a shop fault — but a diagnostic that delivers nothing is either harmless or the sign of a log that is not being written, and v1 hid this line behind a sibling reading 4810 字节."
+    },
+    "📋 已回报本机日志（云端日志收集, 27486 字节）": {
+      "needs_attention": false,
+      "note": "routine size for the same upload"
+    },
+    "📋 已回报本机日志（云端日志收集, 29053 字节）": {
+      "needs_attention": false,
+      "note": "routine size for the same upload"
+    },
+    "📋 已回报本机日志（云端日志收集, 29671 字节）": {
+      "needs_attention": false,
+      "note": "routine size for the same upload"
+    },
+    "☁ 下载完成 #<N>: <FILE>.jpg (753704 bytes)": {
+      "needs_attention": false,
+      "note": "a finished download; the byte size separates it from its siblings, nothing more"
+    },
+    "暂存副本目录：2 个文件 / 0.3 MB": {
+      "needs_attention": false,
+      "note": "staging-directory statistics"
+    },
+    "🧹 已清理 3 个暂存文件副本（退出清理）": {
+      "needs_attention": false,
+      "note": "staged copies reclaimed on exit; the count differs from its sibling, the event does not"
+    },
+    "🧹 已清理 2 个暂存文件副本（退出清理）": {
+      "needs_attention": false,
+      "note": "staged copies reclaimed on exit; a different count of the same routine"
+    },
+    "标签页 <N>: 已添加 3 个文件（3 个已复制到暂存副本，原件删除/移动不影响打印）": {
+      "needs_attention": false,
+      "note": "files added to a tab; the file count is what separates this from its siblings"
+    },
+    "标签页 <N>: 已添加 2 个文件（2 个已复制到暂存副本，原件删除/移动不影响打印）": {
+      "needs_attention": false,
+      "note": "files added to a tab; a different count of the same routine"
+    },
+    "✓ 打印成功 (GDI, 3 面, 1 份)": {
+      "needs_attention": false,
+      "note": "a finished print; the sheet count separates it from its siblings"
+    }
+  }
+}
