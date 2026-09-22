@@ -1505,6 +1505,20 @@ class MainWindow(QMainWindow):
             self._file_logger.addHandler(fh)
         self._file_logger.info("HN 本地打印工具启动")
 
+        # ── 云端直连自检 ──
+        # 本机若开着 Clash/mihomo 之类代理（HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 或系统代理），
+        # 打印工具的云端流量会默认走代理：代理节点/规则异常时表现为「TCP 连上但收不到数据」，
+        # 长连接还会在代理重载配置时被掐掉（长期挂后台尤其明显）。此处把云端主机登记进
+        # 本进程 NO_PROXY 直连，并留一行日志便于事后判断断连是不是代理造成的。
+        try:
+            import net_direct
+            net_direct.ensure_direct(self._config.cloud_api_url, self._config.cloud_ws_url)
+            info = net_direct.describe(self._config.cloud_api_url)
+            if info:
+                self._file_logger.info("☁ 云端直连: " + info)
+        except Exception as e:
+            self._file_logger.warning(f"云端直连自检失败（不影响启动）: {e}")
+
         # ── 启动清理：上次会话遗留的"已完成订单"标签页 ──
         # 全部 job 均已打印成功（sent=True）的标签页在正常退出时已由 closeEvent 自动清理；
         # 此处兜底覆盖进程崩溃/强杀场景，避免已完成订单越积越多。

@@ -24,6 +24,8 @@ import re
 import urllib.request
 from urllib.parse import urlsplit
 
+import net_direct  # 更新流量也走云端直连（见 net_direct.py）
+
 logger = logging.getLogger(__name__)
 
 UPDATE_MANIFEST_URL = "https://hn-space.cn/updates/update.json"
@@ -64,6 +66,7 @@ def fetch_update_info(timeout: int = FETCH_TIMEOUT) -> dict | None:
     清单里的 url 必须为 HTTPS，否则整份清单作废并记 ERROR 日志
     （宁可不更新，也不从明文/本地文件路径安装）。"""
     try:
+        net_direct.ensure_direct(UPDATE_MANIFEST_URL)
         req = urllib.request.Request(
             UPDATE_MANIFEST_URL, headers={"User-Agent": "HN-Print-Updater/1.0"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -152,6 +155,7 @@ def download_setup(url: str, expected_md5: str, dest_dir: str,
         logger.error(f"安装包下载地址非法，拒绝下载: {e}")
         return None
     os.makedirs(dest_dir, exist_ok=True)
+    net_direct.ensure_direct(url)  # 安装包可能托管在 COS 等其它域名，同样绕开代理
     fname = os.path.basename(url.split("?")[0]) or "setup.exe"
     dest = os.path.join(dest_dir, fname)
     # 清理旧安装包残留（只保留当前目标版本，防堆积）

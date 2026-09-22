@@ -34,6 +34,7 @@ import requests as http_requests
 from PySide6.QtCore import QObject, Signal
 
 import staging  # 云端下载文件落到暂存目录（%APPDATA%，抗临时目录清理；见 staging.py）
+import net_direct  # 云端直连：绕开系统/环境代理（代理异常会让长连接卡死；见 net_direct.py）
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,11 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 30
 RECONNECT_BASE_DELAY = 2
 RECONNECT_MAX_DELAY = 120
+# 建连超时：engineio 的 request_timeout 默认仅 5s，握手 GET 与 polling POST 都用它，
+# 校园网/代理抖动时很容易整轮失败（日志里的 Read timed out / SSL EOF / 连接超时都属此类），
+# 放宽到 20s 让「慢但通」的链路能连上；namespace 等待须 ≥ 它，否则会被自己掐断。
+CONNECT_REQUEST_TIMEOUT = 20
+CONNECT_WAIT_TIMEOUT = 25
 STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃最旧条目
 MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
@@ -197,6 +203,8 @@ class CloudClient(QObject):
         self.api_url = api_url
         self.ws_url = ws_url
         self.token = token
+        # 云端直连：构造时就登记，保证后续任何 HTTP（价格同步/成员名单等）都不过代理
+        net_direct.ensure_direct(api_url, ws_url)
         # 设备（计算机）名称：随连接上报后端，用于设备注册表与「打印机已被 XXX 接管」提示
         self.device_name: str = (device_name or socket.gethostname()).strip()[:64]
         # P0-1: 同机多实例 client_id 冲突兜底 —— GUI 旧逻辑传入的是机器名（socket.gethostname()），
@@ -298,12 +306,7 @@ class CloudClient(QObject):
         self._stop_event.set()
         self._cancel_heartbeat()
         self._cancel_backoff_reset()
-        if self._sio:
-            try:
-                self._sio.disconnect()
-            except Exception:
-                pass
-            self._sio = None
+        self._release_sio()
         # P2: 设置停止事件后 join 主循环/下载线程（带超时，不无限等待）
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
@@ -312,6 +315,23 @@ class CloudClient(QObject):
                 t.join(timeout=1)
         self._download_threads.clear()
         logger.info("CloudClient 已停止")
+
+    def _release_sio(self):
+        """断开并丢弃当前 socketio 客户端。
+
+        建连失败（尤其 namespace 握手超时）时旧代码直接丢引用，留下一个仍连着的
+        websocket + 收发线程；反复重连会不断堆积。统一在此断开。
+        先 disconnect 再清引用：保证 disconnect 回调照常生效（退出时的
+        「已断开云端连接」与 _connected=False 都来自它）。"""
+        sio = self._sio
+        if sio is None:
+            return
+        try:
+            sio.disconnect()
+        except Exception:
+            pass
+        if self._sio is sio:   # 期间没有被换成新连接
+            self._sio = None
 
     def is_connected(self) -> bool:
         return self._connected
@@ -880,23 +900,34 @@ class CloudClient(QObject):
                     delay = min(RECONNECT_BASE_DELAY * (2 ** self._reconnect_count)
                                 * (1 + random.random()), RECONNECT_MAX_DELAY)
                 self._reconnect_count += 1
-                self.status_message.emit(f"☁ {int(delay)}s 后重连...")
+                self.status_message.emit(
+                    f"☁ {int(delay)}s 后重连（第 {self._reconnect_count} 次）...")
                 self._stop_event.wait(delay)
 
     def _connect_and_wait(self):
         """建立 SocketIO 连接并阻塞等待，直到断开或停止。"""
         import socketio as socketio_lib
 
-        self._sio = socketio_lib.Client(
+        # 云端直连：把云端主机名并入本进程 NO_PROXY，避免云端长连接被系统/环境代理
+        # 掐死（每次建连都调，兼顾用户在设置里改了云端地址的情况；幂等）
+        net_direct.ensure_direct(self.api_url, self.ws_url)
+        # 上一轮若留下活着的 transport（如 namespace 握手失败）先断开，避免堆积
+        self._release_sio()
+
+        sio = socketio_lib.Client(
             reconnection=False,
             logger=False,
             engineio_logger=False,
+            request_timeout=CONNECT_REQUEST_TIMEOUT,
         )
+        self._sio = sio
 
         connect_event = threading.Event()
 
-        @self._sio.on("connect")
+        @sio.on("connect")
         def _on_connect():
+            if self._sio is not sio:
+                return  # 旧连接的迟到回调，忽略（否则会把新连接的状态改坏）
             self._connected = True
             self.connection_changed.emit(True)
             self.status_message.emit("☁ 已连接到云端服务器")
@@ -909,8 +940,10 @@ class CloudClient(QObject):
                              name="cloud-post-connect").start()
             connect_event.set()
 
-        @self._sio.on("disconnect")
+        @sio.on("disconnect")
         def _on_disconnect():
+            if self._sio is not sio:
+                return  # 旧连接的迟到回调，忽略
             self._connected = False
             self.connection_changed.emit(False)
             self.status_message.emit("☁ 已断开云端连接")
@@ -918,7 +951,7 @@ class CloudClient(QObject):
             self._cancel_backoff_reset()
             connect_event.set()
 
-        @self._sio.on("print_task")
+        @sio.on("print_task")
         def _on_print_task(data):
             try:
                 task = CloudTask(data)
@@ -937,7 +970,7 @@ class CloudClient(QObject):
                 # 自动开始下载
                 self.accept_task(task.task_id)
 
-        @self._sio.on("start_print")
+        @sio.on("start_print")
         def _on_start_print(data):
             """预约单到点 / 解除冻结：后端发来开始打印指令（含新的目标时间）。
             本地通常已按 scheduled_ts 自触发，此信号用于冻结解除/兜底，GUI 侧幂等处理。"""
@@ -950,7 +983,7 @@ class CloudClient(QObject):
             self.status_message.emit(f"☁ 预约单 #{order_id} 收到开始打印指令"
                                      + (f"（目标 {scheduled_ts}）" if scheduled_ts else ""))
 
-        @self._sio.on("analyze_page_count")
+        @sio.on("analyze_page_count")
         def _on_analyze_page_count(data):
             file_id = data.get("file_id", "")
             file_name = data.get("file_name", "")
@@ -960,14 +993,14 @@ class CloudClient(QObject):
                 self.status_message.emit(f"☁ 收到页数分析请求: {file_name}")
                 self._spawn_analysis_thread(file_id, download_url, file_name, source_md5)
 
-        @self._sio.on("cancel_page_analysis")
+        @sio.on("cancel_page_analysis")
         def _on_cancel_page_analysis(data):
             file_id = data.get("file_id", "")
             if file_id:
                 self._analysis_abort[file_id] = True
                 self.status_message.emit(f"⛔ 已请求取消页数分析: {file_id[:8]}...")
 
-        @self._sio.on("storage_config_updated")
+        @sio.on("storage_config_updated")
         def _on_storage_config_updated(data):
             """后端推送：储存保留时间已更新 → 同步到本地缓存（小时级精度）。
             仅当与本地持久化值不同时记录日志，避免每次重连都刷屏。"""
@@ -991,7 +1024,7 @@ class CloudClient(QObject):
                 # 立即按新规则清理
                 self._cleanup_pdf_cache()
 
-        @self._sio.on("clear_local_cache")
+        @sio.on("clear_local_cache")
         def _on_clear_local_cache(data):
             """后端推送：管理员清空了服务器缓存 → 同步清空本地 PDF 缓存"""
             msg = data.get("message", "管理员清空缓存") if isinstance(data, dict) else str(data)
@@ -1028,7 +1061,7 @@ class CloudClient(QObject):
                     pass
             self.status_message.emit(f"📦 已清空本地 PDF 缓存 ({removed} 个文件)")
 
-        @self._sio.on("order_canceled")
+        @sio.on("order_canceled")
         def _on_order_canceled(data):
             order_id = int(data.get("order_id", 0)) if isinstance(data, dict) else 0
             task_ids = data.get("task_ids", []) if isinstance(data, dict) else []
@@ -1038,7 +1071,7 @@ class CloudClient(QObject):
             for tid in task_ids:
                 self._pending_tasks.pop(tid, None)
 
-        @self._sio.on("printer_state")
+        @sio.on("printer_state")
         def _on_printer_state(data):
             """后端下发接单状态：本机是否启用接单、全部可接单设备、本机所有者。
             2026-12：多设备接单 —— 不再有「唯一接管者」，多台设备可同时启用接单。"""
@@ -1055,7 +1088,7 @@ class CloudClient(QObject):
                 if claiming:
                     self.status_message.emit(f"☁ 当前有 {len(claiming)} 台设备启用接单，本机未接单")
 
-        @self._sio.on("request_log")
+        @sio.on("request_log")
         def _on_request_log(data):
             """后端收集在线设备日志：读取本机日志尾部并回报（logs 事件）。"""
             try:
@@ -1067,12 +1100,14 @@ class CloudClient(QObject):
             if self._sio_emit("logs", {"request_id": request_id, "content": content}):
                 self.status_message.emit(f"📋 已回报本机日志（云端日志收集, {len(content)} 字节）")
 
-        @self._sio.on("pong")
+        @sio.on("pong")
         def _on_pong():
             pass
 
-        @self._sio.on("auth_fail")
+        @sio.on("auth_fail")
         def _on_auth_fail(data):
+            if self._sio is not sio:
+                return  # 旧连接的迟到回调，忽略（否则会掐断当前连接）
             msg = data.get("message", "未知原因") if isinstance(data, dict) else str(data)
             self._auth_fail_count += 1
             logger.error(f"认证失败({self._auth_fail_count}/{MAX_AUTH_FAIL_RETRIES}): {msg}")
@@ -1085,8 +1120,7 @@ class CloudClient(QObject):
                 self._auth_fail_stop = True
             # 服务端通常认证失败即断开；此处主动断开确保 _run_loop 进入退避重连
             try:
-                if self._sio:
-                    self._sio.disconnect()
+                sio.disconnect()
             except Exception:
                 pass
 
@@ -1095,9 +1129,11 @@ class CloudClient(QObject):
                        f"&device_name={quote(self.device_name)}")
         self.status_message.emit(f"☁ 正在连接 {self.ws_url} ...")
         try:
-            self._sio.connect(connect_url, wait_timeout=10)
+            sio.connect(connect_url, wait_timeout=CONNECT_WAIT_TIMEOUT)
         except Exception as e:
             self.status_message.emit(f"☁ 连接失败: {e}")
+            # 失败时 engineio 可能已建立 transport（如 namespace 握手超时）→ 断开再重试
+            self._release_sio()
             return
 
         # 阻塞等待断开

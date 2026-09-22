@@ -630,6 +630,10 @@ class StatsServer:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._running = False
+        # 收支清算页的云端代理请求同样绕开系统/环境代理（见 net_direct.py）
+        if self.api_url:
+            import net_direct
+            net_direct.ensure_direct(self.api_url)
 
     @property
     def port(self) -> int:
