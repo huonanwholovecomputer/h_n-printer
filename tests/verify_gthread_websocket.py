@@ -66,51 +66,61 @@ time.sleep(3.0)
 import requests                     # noqa: E402
 import socketio as socketio_lib     # noqa: E402
 
-got = {}
-c = socketio_lib.Client(reconnection=False, request_timeout=20)
 
+def run_case(transports, label):
+    """跑一遍连接场景，返回 {检查项: bool}。"""
+    got = {}
+    c = socketio_lib.Client(reconnection=False, request_timeout=20)
 
-@c.on("printer_state")
-def _ps(data):
-    got["printer_state"] = data
+    @c.on("printer_state")
+    def _ps(data):
+        got["printer_state"] = data
 
+    @c.on("print_task")
+    def _pt(data):
+        got["print_task"] = data
 
-@c.on("print_task")
-def _pt(data):
-    got["print_task"] = data
+    @c.on("pong")
+    def _po():
+        got["pong"] = True
 
+    def wait(key, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline and not got.get(key):
+            time.sleep(0.1)
 
-@c.on("pong")
-def _po():
-    got["pong"] = True
+    res = {}
+    try:
+        c.connect(f"http://127.0.0.1:{port}", transports=transports, wait_timeout=20)
+        res[f"[{label}] 连接建立"] = bool(c.connected)
+        res[f"[{label}] 传输方式 = {transports[0]}"] = c.transport() == transports[0]
+        wait("printer_state", 3)
+        res[f"[{label}] connect 时的服务端推送（printer_state）"] = (
+            got.get("printer_state", {}).get("is_active") is True)
+
+        c.emit("ping")
+        wait("pong", 5)
+        res[f"[{label}] 客户端→服务端→客户端往返（ping/pong）"] = bool(got.get("pong"))
+
+        r = requests.get(f"http://127.0.0.1:{port}/push", timeout=5)
+        wait("print_task", 5)
+        res[f"[{label}] 后台线程主动推送（print_task, 打印任务同款路径）"] = (
+            r.ok and got.get("print_task", {}).get("task_id") == 4242)
+    finally:
+        try:
+            c.disconnect()
+        except Exception:
+            pass
+    return res
 
 
 res = {}
 try:
-    c.connect(f"http://127.0.0.1:{port}", transports=["websocket"], wait_timeout=20)
-    res["websocket 连接建立"] = bool(c.connected)
-    res["传输方式 = websocket"] = c.transport() == "websocket"
-    res["connect 时的服务端推送（printer_state）"] = got.get("printer_state", {}).get("is_active") is True
-
-    c.emit("ping")
-    for _ in range(50):
-        if got.get("pong"):
-            break
-        time.sleep(0.1)
-    res["客户端→服务端→客户端往返（ping/pong）"] = bool(got.get("pong"))
-
-    r = requests.get(f"http://127.0.0.1:{port}/push", timeout=5)
-    for _ in range(50):
-        if got.get("print_task"):
-            break
-        time.sleep(0.1)
-    res["后台线程主动推送（print_task, 打印任务同款路径）"] = (
-        r.ok and got.get("print_task", {}).get("task_id") == 4242)
+    # ① websocket：客户端握手升级后的常态（打印任务推送走这条）
+    res.update(run_case(["websocket"], "websocket"))
+    # ② polling：握手阶段/升级前的路径，老客户端也会先走它
+    res.update(run_case(["polling"], "polling"))
 finally:
-    try:
-        c.disconnect()
-    except Exception:
-        pass
     g.terminate()
     try:
         g.wait(timeout=5)
