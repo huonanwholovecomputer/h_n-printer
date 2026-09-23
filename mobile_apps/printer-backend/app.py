@@ -680,6 +680,33 @@ def get_active_clients():
     return active
 
 
+def touch_printer_heartbeat(client_id, sid=None):
+    """刷新设备心跳 —— HTTP 通道同样保活，让「双通道」真正互为备份。
+
+    设备「在线」只看 printer_clients 里的 heartbeat（CLIENT_HEARTBEAT_TIMEOUT=90s），
+    而过去只有 socketio 的 connect/ping 会写它。socket 掉线但网络正常时（本机代理、
+    握手超时、服务端重建连接），HTTP 拉单本身是通的，设备却已被判离线 →
+    /api/pull_queued_orders 里的 get_active_printer_client() 返回 None，永远拉不到任务，
+    订单只能干等客户端重连。
+
+    sid=None 表示该设备此刻没有 socket 连接：所有 emit 路径都有 `if sid` 守卫，
+    push_print_task_to_client 取不到 sid 会把子任务回滚成 queued（[WAIT] 日志）等下一次
+    HTTP 拉取，不会误广播、也不会把任务卡在 printing。"""
+    now = datetime.now()
+    with printer_clients_lock:
+        info = printer_clients.get(client_id)
+        if info is None:
+            printer_clients[client_id] = {
+                "sid": sid,
+                "heartbeat": now,
+                "connected_at": now,
+            }
+        else:
+            info["heartbeat"] = now
+            if sid:                       # 别用 None 覆盖已存在的真实 sid
+                info["sid"] = sid
+
+
 # ==================== 打印机设备注册表 + 接单接管（多设备唯一接管者） ====================
 # 需求背景：多台设备可同时连接同一台服务器，但只有「启用接单」的那一台能接收订单。
 #   · devices.json 持久化每台设备的计算机名 / 所有者 / 首末次在线时间（跨重启保留）；
@@ -4741,6 +4768,9 @@ def pull_queued_orders():
     client_id = request.args.get("client_id", "") or socket.gethostname()
     # 登记设备（HTTP 拉取路径的连接也纳入设备注册表，供收支清算「授权」页展示）
     register_device(client_id, request.args.get("device_name", "") or client_id)
+    # HTTP 通道心跳：socket 掉线但仍能 HTTP 拉单时保持「在线」（否则下面 get_active_printer_client
+    # 判本机离线 → 永远返回空，双通道实为单通道）。必须在 get_active_printer_client() 之前刷新。
+    touch_printer_heartbeat(client_id)
 
     active_printer = get_active_printer_client()
     if not active_printer or client_id != active_printer:

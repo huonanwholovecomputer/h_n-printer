@@ -20,7 +20,7 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
 
 - **数据库**: SQLite (WAL 模式)，主表 — `files`(MD5去重), `orders`(父订单), `order_files`(子任务，v5引入，支持一单多文件), `finance_config`(收支清算云端配置)。`users` 表存头像/昵称/角色/`bound_openid`(APP 设备账号绑定微信)。`license_keys` 表存临时许可密钥。
 - **父子订单模型**: `orders` 是聚合容器，`order_files` 是实际打印子任务。每个子任务有独立的 `copies`, `page_range`, `duplex`, `image_orientation`, `status`。父订单状态通过 `aggregate_order_status()` 从子任务聚合（优先级: failed > printing > queued > sent > canceled）。
-- **任务分发**: 双通道 — ① SocketIO `print_task` 事件实时推送（`push_print_task_to_client`）② HTTP `GET /api/pull_queued_orders` 供客户端主动拉取（`fetch_and_lock_task` 原子取锁防重复）。两种方式都先将子任务标记为 `printing` 再推送/返回。**接单唯一接管（2026-11）**：多设备共连时两条通道都只发给「启用接单」的设备——`printer_claim.json` 持久化唯一接管者，`get_active_printer_client()` 判定在线接管者，页数分析/预约下发同样只走接单设备。
+- **任务分发**: 双通道 — ① SocketIO `print_task` 事件实时推送（`push_print_task_to_client`）② HTTP `GET /api/pull_queued_orders` 供客户端主动拉取（`fetch_and_lock_task` 原子取锁防重复）。两种方式都先将子任务标记为 `printing` 再推送/返回。**两通道独立保活（2026-09）**：设备「在线」= `printer_clients[client_id]["heartbeat"]` 在 90s 内（`CLIENT_HEARTBEAT_TIMEOUT`），`/api/pull_queued_orders` 入口也调 `touch_printer_heartbeat(client_id)` —— 否则 socket 掉线但网络正常时（本机代理掐断长连接、握手超时）设备被判离线，HTTP 拉单永远返回空，「双通道」实为单通道。HTTP 建的条目 `sid=None`：`push_print_task_to_client` 取不到 sid 会把子任务回滚 `queued`（`[WAIT]` 日志）等下次 HTTP 拉取，其余 emit 路径都有 `if sid` 守卫，不会误广播。**接单唯一接管（2026-11）**：多设备共连时两条通道都只发给「启用接单」的设备——`printer_claim.json` 持久化唯一接管者，`get_active_printer_client()` 判定在线接管者，页数分析/预约下发同样只走接单设备。
 - **设备注册表与授权**: `devices.json` 记录每台设备的 `device_name`/`owner_name`(授权页绑定成员)/首末次在线时间；`GET /api/printer/devices` 展示全部设备（计算机名/在线/所有者/是否接单），`POST /api/printer/claim|release|bind_owner` 管理接管与所有者绑定，`POST /api/printer/devices/delete` 删除设备（清理升级产生的历史遗留 ID，删除接单设备时自动清空接管）。推送 payload 附带 `bound_owner_name`（从 `finance_config.memberBindings` 反查下单 openid 的绑定成员），本地工具据此设置订单标签页归属。
 - **在线设备日志收集**: `POST /api/log/collect_all`（printer token）向所有在线客户端推送 SocketIO `request_log`，客户端回报本机日志（`logs` 事件，request_id 防串台，每台上限 200KB，超时标记 error）；配合本地工具「日志管理」一键收集。
 - **角色体系**: `compute_role(openid)` → super_admin / admin / user / guest。admin 创建限时许可密钥(temp 1-10分钟或 admin 永久)，guest 兑换后获得临时 `temp_until`。提交订单时消费临时授权(`temp_until` 清空，关联 `license_keys.order_id`)。
@@ -93,7 +93,7 @@ cd /opt/printer-backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp config.py.example config.py  # 填写微信/服务器配置
-systemctl start printer-backend  # gunicorn + eventlet
+systemctl start printer-backend  # gunicorn + gthread（workers=1 + threads=16）
 
 # Nginx 反向代理 (含 WebSocket 升级)
 cp nginx-http.conf /etc/nginx/sites-available/printer-backend
@@ -118,7 +118,7 @@ bash backup.sh  # crontab 每天凌晨3点
 | `printer-backend/app.py` | 全部后端逻辑（路由/SocketIO/数据库/定时任务） |
 | `printer-backend/config.py` | 后端配置（需手动创建，不提交 git） |
 | `printer-backend/DEPLOY.md` | 部署指南 |
-| `printer-backend/gunicorn_config.py` | Gunicorn + eventlet 配置 |
+| `printer-backend/gunicorn_config.py` | Gunicorn 配置（gthread worker，与 app.py 的 async_mode="threading" 匹配） |
 | `printer-backend/nginx-http.conf` | Nginx 反向代理配置模板 |
 | `printer-backend/backup.sh` | 数据库备份脚本 |
 | `h_n_print/app.json` | 小程序页面/窗口/tabBar 注册 |

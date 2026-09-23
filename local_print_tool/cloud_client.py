@@ -48,6 +48,9 @@ RECONNECT_MAX_DELAY = 120
 # 放宽到 20s 让「慢但通」的链路能连上；namespace 等待须 ≥ 它，否则会被自己掐断。
 CONNECT_REQUEST_TIMEOUT = 20
 CONNECT_WAIT_TIMEOUT = 25
+# 断线期间 HTTP 兜底拉单间隔。必须小于服务端 CLIENT_HEARTBEAT_TIMEOUT（90s）——
+# 设备「在线」只看服务端心跳，间隔大于它就会在两次轮询之间被判离线。
+PULL_FALLBACK_INTERVAL = 45
 STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃最旧条目
 MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
@@ -255,6 +258,7 @@ class CloudClient(QObject):
         self._sio: object | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._pull_thread: threading.Thread | None = None
         self._connected = False
         self._heartbeat_timer: threading.Timer | None = None
         self._reconnect_count = 0
@@ -269,6 +273,8 @@ class CloudClient(QObject):
         self._pending_tasks: dict[int, CloudTask] = {}
         # P1: 下载并发上限 4（原 _download_lock 为死代码，从未使用）
         self._download_semaphore = threading.BoundedSemaphore(4)
+        # HTTP 兜底拉单：串行化自身调用（网络卡住时 pull_pending 最长 10s，防止叠加线程）
+        self._pull_lock = threading.Lock()
         # 防滥用：页数分析并发上限 2（每个分析线程会下载完整文件并 COM 转换；
         # 防批量上传大文件时分析线程无界堆积拖垮本机，与 _download_semaphore 独立计）
         self._analyze_semaphore = threading.BoundedSemaphore(2)
@@ -299,6 +305,12 @@ class CloudClient(QObject):
         self._cleanup_old_temp_files()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="cloud-client")
         self._thread.start()
+        # HTTP 兜底拉单线程：socket 掉线但网络正常时仍能保持服务端心跳并领走排队订单。
+        # stop()→start()（改云端设置）时旧线程可能还没退出，故按存活判断，不重复起。
+        if self._pull_thread is None or not self._pull_thread.is_alive():
+            self._pull_thread = threading.Thread(
+                target=self._pull_fallback_loop, daemon=True, name="cloud-pull-fallback")
+            self._pull_thread.start()
         logger.info("CloudClient 已启动")
 
     def stop(self):
@@ -722,8 +734,11 @@ class CloudClient(QObject):
             except Exception as e:
                 logger.warning(f"回报 page_range_truncated 失败: {e}")
 
-    def pull_pending(self):
-        """HTTP 拉取云端排队任务（作为 SocketIO 推送的补充）。"""
+    def pull_pending(self, quiet: bool = False):
+        """HTTP 拉取云端排队任务（作为 SocketIO 推送的补充）。
+
+        quiet=True 时不打失败警告：断线兜底每 PULL_FALLBACK_INTERVAL 一次，长断网期间
+        失败刷屏没有意义（socket 重连循环已在报网络状态）。"""
         if not self.api_url or not self.token:
             return
         try:
@@ -752,7 +767,33 @@ class CloudClient(QObject):
                             self.accept_task(task.task_id)
         except Exception as e:
             # P2: 拉取失败不再是 debug 级别 —— 需在日志中可见
-            logger.warning(f"HTTP 拉取排队任务失败: {e}")
+            if quiet:
+                logger.debug(f"HTTP 兜底拉取失败: {e}")
+            else:
+                logger.warning(f"HTTP 拉取排队任务失败: {e}")
+
+    def _pull_fallback_loop(self):
+        """断线期间的 HTTP 兜底拉单。
+
+        服务端设备的「在线」只由 socketio 心跳维持（本机 30s ping / 服务端 90s 超时），
+        而 /api/pull_queued_orders 又被同一心跳门控 —— socket 掉线但网络正常时（本机代理
+        掐断长连接、namespace 握手超时、服务端连接重建），工具会彻底隐身：服务端把订单
+        排队等它上线，它却在等 socket 恢复。这里在未连接时主动走 HTTP 保活 + 领单，
+        让「双通道」名副其实。socket 正常时不发这个请求（推送与连线拉取已覆盖）。"""
+        while not self._stop_event.is_set():
+            self._stop_event.wait(PULL_FALLBACK_INTERVAL)
+            if self._stop_event.is_set():
+                break
+            if self._connected or not self.api_url or not self.token:
+                continue
+            if not self._pull_lock.acquire(blocking=False):
+                continue          # 上一轮还没回来（网络卡住），不叠加
+            try:
+                self.pull_pending(quiet=True)
+            except Exception as e:  # pull_pending 内部已兜底，这里只防意外
+                logger.debug(f"HTTP 兜底拉取异常: {e}")
+            finally:
+                self._pull_lock.release()
 
     # ── 接单接管（2026-11：多设备共连时仅启用接单的设备接收订单）──
 
