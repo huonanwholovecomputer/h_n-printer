@@ -113,6 +113,21 @@ if "print.js" in packed:
           "replace(/[、，；\\s]/g, ',')" not in js)
     check("APK 内 onCopyPrice 已挂页数校验（未计算完成不复制，改提示）",
           "if (guard.invalid) { showAlert(" in js)
+    check("APK 内 print.js 含复制价格页数拦截清单（checkPriceFiles/applyPageCountToOrder）",
+          "function checkPriceFiles(files)" in js and "function applyPageCountToOrder(fileId, pageCount)" in js)
+
+# 嵌套滚动接力（2026-10）：外层 scroller 的 touch-action 必须是 pan-y，
+# 且内层列表仍是原生滚动容器（touch-action: none 会让内层彻底滚不动）
+if "app.js" in packed:
+    app_js = z.read(packed["app.js"]).decode("utf-8", "replace")
+    check("APK 内 app.js 启用 pan-y 滚动接力",
+          "this.el.style.touchAction = 'pan-y'" in app_js and "this.el.style.touchAction = 'none'" not in app_js)
+    check("APK 内 FlingEngine 含双向嵌套滚动接力（_nestedEl + 交还内层）",
+          "_nestedEl" in app_js and "交还内层" in app_js)
+if "styles.css" in packed:
+    css = z.read(packed["styles.css"]).decode("utf-8", "replace")
+    check("APK 内 styles.css 的 .scroller.js-scroll 为 touch-action: pan-y",
+          ".scroller.js-scroll" in css and "touch-action: pan-y" in css)
 
 print("\n" + "=" * 52)
 print("APK 校验:", "全部通过 ✅" if ok_all else "存在失败 ❌")

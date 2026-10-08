@@ -1,8 +1,8 @@
 {
-  "version": "1.1.26",
-  "versionCode": 27,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.26.apk",
-  "md5": "bd840b51eff90127b0b4f62789e702d0",
-  "notes": "v1.1.26：修复「复制价格」金额错误——接管设备离线、或页数尚未返回就提交时，含 Word / md 等需本地转换的文件不再允许复制价格，改为提示「页数未完成计算，价格计算无效」（原先会按 1 页的估算值复制出偏低的价格）；页数返回后自动恢复可复制，金额与实收一致。",
+  "version": "1.1.27",
+  "versionCode": 28,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.27.apk",
+  "md5": "425d6c07f110dd1ddf09c6ecc01d903e",
+  "notes": "v1.1.27：修复文件列表滚动卡死——文件较多时列表可内部滚动，滚到列表顶部/底部后手指继续拖动不再「卡在列表里」，滚动会顺畅交给整页（反向拖动也会交还列表）；同时恢复 APP 内时间滚轮选择器的滚动手感。",
   "force": false
 }
