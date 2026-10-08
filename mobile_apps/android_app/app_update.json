@@ -1,8 +1,8 @@
 {
-  "version": "1.1.25",
-  "versionCode": 26,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.25.apk",
-  "md5": "775b41c4b8932d9f8ec96344d05f3441",
-  "notes": "v1.1.25：优化深浅色主题切换，切换更顺滑、大幅减少卡顿；并修复深色模式下文字颜色渐变比背景慢导致的拖尾。",
+  "version": "1.1.26",
+  "versionCode": 27,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.26.apk",
+  "md5": "bd840b51eff90127b0b4f62789e702d0",
+  "notes": "v1.1.26：修复「复制价格」金额错误——接管设备离线、或页数尚未返回就提交时，含 Word / md 等需本地转换的文件不再允许复制价格，改为提示「页数未完成计算，价格计算无效」（原先会按 1 页的估算值复制出偏低的价格）；页数返回后自动恢复可复制，金额与实收一致。",
   "force": false
 }
