@@ -73,12 +73,14 @@
             wx:key="index"
             class="file-card {{item.entering ? 'card-entering' : ''}} {{item.removing ? 'card-removing' : ''}}"
           >
-            <!-- Header: name + remove -->
+            <!-- Header: name + preview + remove -->
             <view class="file-card-top">
-              <view class="file-name-area">
+              <view class="file-name-area" bindtap="onPreviewFile" data-index="{{index}}">
                 <text class="file-name">{{item.name}}</text>
                 <text class="file-size">{{item.sizeDisplay}} KB</text>
               </view>
+              <!-- 预览：图片/PDF/Word/Excel 走微信原生能力，txt/csv/md 本地读取自绘（零后端依赖） -->
+              <view class="file-preview-btn" bindtap="onPreviewFile" data-index="{{index}}" hover-class="tap-active">预览</view>
               <view class="file-remove" bindtap="onRemoveFile" data-index="{{index}}" hover-class="tap-active">✕</view>
             </view>
 
@@ -378,6 +380,20 @@
       <button class="btn-secondary modal-half-btn" bindtap="onCancelSkipUnsupported" hover-class="tap-active">取消</button>
       <button class="btn-primary modal-half-btn" bindtap="onConfirmSkipUnsupported" hover-class="tap-active" disabled="{{submitting}}">自动跳过并提交</button>
     </view>
+  </view>
+</view>
+
+<!-- 文件预览（文本类：txt/csv/md 本地读取后自绘；图片/PDF/Word/Excel 走微信原生能力，不经过本层） -->
+<view wx:if="{{showPreview}}" class="preview-mask {{isDarkMode ? 'theme-dark' : ''}}" bindtap="onClosePreview">
+  <view class="preview-sheet" catchtap="noop">
+    <view class="preview-header">
+      <text class="preview-title">{{previewName}}</text>
+      <view class="preview-close" bindtap="onClosePreview" hover-class="tap-active">✕</view>
+    </view>
+    <scroll-view class="preview-body" scroll-y>
+      <text class="preview-text" user-select="true">{{previewText}}</text>
+    </scroll-view>
+    <text wx:if="{{previewTruncated}}" class="preview-truncated">文件较大，仅预览前面部分内容</text>
   </view>
 </view>
 

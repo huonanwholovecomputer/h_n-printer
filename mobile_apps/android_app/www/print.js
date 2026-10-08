@@ -365,10 +365,11 @@ function renderFileList() {
   container.innerHTML = printState.selectedFiles.map((f, i) => `
     <view class="file-card ${f.entering ? 'card-entering' : ''} ${f.removing ? 'card-removing' : ''}">
       <view class="file-card-top">
-        <view class="file-name-area">
+        <view class="file-name-area" data-action="preview">
           <text class="file-name">${esc(f.name)}</text>
           <text class="file-size">${f.sizeDisplay} KB</text>
         </view>
+        <view class="file-preview-btn" data-action="preview">预览</view>
         <view class="file-remove" data-action="remove">✕</view>
       </view>
       <view class="file-status-area">${fileCardStatusHTML(f)}</view>
@@ -2144,6 +2145,86 @@ function onCopyDetailPrice() {
   copyText(lines.join('\n'), '已复制详细价格');
 }
 
+/* ================= 文件预览（与小程序同口径，零后端依赖）=================
+   一律用内存里的 File 对象（f.file，选择文件时保留），不向服务器取：
+     · 图片            → 遮罩层内 <img>（objectURL，关闭时 revoke）
+     · txt / csv / md  → FileReader / File.text() 读文本 → 遮罩层内等宽 <pre>
+     · PDF / Word/Excel→ WebView 无原生渲染能力（需原生桥或打包 pdf.js），提示改用系统应用打开
+   大文件保护与小程序一致：文本类超过 PREVIEW_MAX_BYTES 不读；预览最多 PREVIEW_MAX_CHARS 字符。 */
+const PREVIEW_TEXT_EXTS = ['txt', 'csv', 'md'];
+const PREVIEW_IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'bmp', 'gif', 'webp', 'tiff', 'tif'];
+const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+const PREVIEW_MAX_CHARS = 20000;
+
+let _previewObjectUrl = '';
+
+function readFileText(file, onDone, onFail) {
+  if (typeof file.text === 'function') {
+    file.text().then(onDone).catch(onFail);
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => onDone(String(reader.result == null ? '' : reader.result));
+  reader.onerror = onFail;
+  reader.readAsText(file);
+}
+
+function previewFile(idx) {
+  const f = printState.selectedFiles[idx];
+  if (!f) return;
+  if (!f.file) {
+    // 重印恢复的云端订单文件只有 fileId、本机无副本（零后端依赖方案不取远程文件）
+    showToast(f.fileId ? '该文件来自云端订单，暂不支持预览' : '文件已失效，请重新选择', 2500);
+    return;
+  }
+  const ext = extLowerOf(f.name);
+  if (f.isImage || PREVIEW_IMAGE_EXTS.indexOf(ext) !== -1) {
+    closePreviewBody();
+    const url = URL.createObjectURL(f.file);
+    _previewObjectUrl = url;
+    openPreview(f.name, `<img class="preview-image" src="${url}" alt="">`);
+    return;
+  }
+  if (PREVIEW_TEXT_EXTS.indexOf(ext) !== -1) {
+    if ((Number(f.size) || 0) > PREVIEW_MAX_BYTES) { showToast('文件较大，暂不支持预览', 2500); return; }
+    readFileText(f.file, (text) => {
+      let truncated = false;
+      let body = String(text || '');
+      if (body.length > PREVIEW_MAX_CHARS) { body = body.slice(0, PREVIEW_MAX_CHARS); truncated = true; }
+      openPreview(f.name, `<pre class="preview-text">${escHtml(body || '（空文件）')}</pre>`);
+      const tip = document.getElementById('previewTruncated');
+      if (tip) tip.style.display = truncated ? '' : 'none';
+    }, () => showToast('读取失败，无法预览'));
+    return;
+  }
+  showToast('APP 内暂不支持预览该格式（PDF/Word 请用系统应用打开）', 3000);
+}
+
+function openPreview(name, bodyHtml) {
+  const title = document.getElementById('previewTitle');
+  const body = document.getElementById('previewBody');
+  const tip = document.getElementById('previewTruncated');
+  if (title) title.textContent = name || '文件预览';
+  if (body) body.innerHTML = bodyHtml || '';
+  if (tip) tip.style.display = 'none';
+  openModal('previewMask');
+}
+
+function closePreviewBody() {
+  if (_previewObjectUrl) {
+    try { URL.revokeObjectURL(_previewObjectUrl); } catch (e) { /* 忽略 */ }
+    _previewObjectUrl = '';
+  }
+  const body = document.getElementById('previewBody');
+  if (body) body.innerHTML = '';
+}
+
+/* 关闭预览（点 ✕）：清理由 closeModal('previewMask') 统一处理（见 app.js），
+   这样点遮罩关闭（.modal-mask 统一处理器）与点 ✕ 关闭是同一条路径 */
+function closePreview() {
+  closeModal('previewMask');
+}
+
 /* ================= 事件绑定 ================= */
 
 function setupPrintButtons() {
@@ -2160,6 +2241,7 @@ function setupPrintButtons() {
     const action = el.dataset.action;
     const f = printState.selectedFiles[idx];
     if (action === 'remove') removeFile(idx);
+    else if (action === 'preview') previewFile(idx);
     else if (action === 'retry') retryUpload(idx);
     else if (action === 'copies-minus') setCopies(idx, f.copies - 1);
     else if (action === 'copies-plus') setCopies(idx, f.copies + 1);

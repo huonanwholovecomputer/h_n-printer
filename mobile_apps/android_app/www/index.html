@@ -717,6 +717,18 @@
     </view>
   </view>
 
+  <!-- ===== 文件预览（txt/csv/md 与图片：本机文件页内预览；PDF/Word 需系统应用） ===== -->
+  <view class="modal-mask preview-mask" id="previewMask" style="display:none">
+    <view class="preview-sheet">
+      <view class="preview-header">
+        <text class="preview-title" id="previewTitle"></text>
+        <view class="preview-close" id="previewClose" onclick="closePreview()">✕</view>
+      </view>
+      <view class="preview-body" id="previewBody"></view>
+      <text class="preview-truncated" id="previewTruncated" style="display:none">文件较大，仅预览前面部分内容</text>
+    </view>
+  </view>
+
   <!-- ===== 通用确认弹窗 ===== -->
   <view class="modal-mask" id="confirmModal" style="display:none">
     <view class="modal-sheet">

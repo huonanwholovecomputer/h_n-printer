@@ -169,6 +169,19 @@ function _extLower(name) {
   return i >= 0 ? n.slice(i + 1).toLowerCase() : ''
 }
 
+/* ---- 文件预览（零后端依赖）------------------------------------------------------
+
+   一律使用「用户本机选中的临时文件」（selectedFiles[i].path），不向服务器取：
+     · 图片                     → wx.previewImage（原生缩放 / 左右滑）
+     · PDF / Word / Excel 等    → wx.openDocument（微信内置文档预览，无需转换）
+     · txt / csv / md           → 微信无原生文本预览 → 本地读文本后在本页预览层自绘
+   大文件保护：文本类超过 PREVIEW_MAX_BYTES 不读（50MB 上限的文件读进内存会崩），
+   预览层最多渲染 PREVIEW_MAX_CHARS 个字符（setData 成本）。 */
+const PREVIEW_TEXT_EXTS = ['txt', 'csv', 'md']
+const PREVIEW_DOC_TYPES = { pdf: 'pdf', doc: 'doc', docx: 'docx', xls: 'xls', xlsx: 'xlsx', ppt: 'ppt', pptx: 'pptx' }
+const PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+const PREVIEW_MAX_CHARS = 20000
+
 Component({
   data: {
     // 多文件列表：每项 { name, size, path, fileId, uploading, progress, failed, copies }
@@ -179,6 +192,11 @@ Component({
     claimingDevices: [],
     selectedDeviceId: '',
     showSuccessModal: false,
+    // 文件预览层（仅文本类 txt/csv/md 用；图片/PDF/Word 走微信原生能力）
+    showPreview: false,
+    previewName: '',
+    previewText: '',
+    previewTruncated: false,
     // 成功弹窗内的价格提示：页数未完成计算（Word/md 等需本地转换的类型）时非空 → 价格无效，禁止复制
     priceInvalidHint: '',
     showAccessDeniedModal: false,
@@ -3221,6 +3239,102 @@ Component({
         data: lines.join('\n'),
         success: () => wx.showToast({ title: '已复制详细价格', icon: 'success' })
       })
+    },
+
+    // ==================== 文件预览（零后端依赖）====================
+
+    // 预览入口：按类型分派。一律用本机临时文件（item.path），不向服务器取文件。
+    onPreviewFile(e) {
+      const index = e.currentTarget.dataset.index
+      const f = this.data.selectedFiles[index]
+      if (!f) return
+      if (!f.path) {
+        // 重印恢复的云端订单文件只有 fileId、本机无副本（零后端依赖方案不取远程文件）
+        wx.showToast({
+          title: f.fileId ? '该文件来自云端订单，暂不支持预览' : '文件已失效，请重新选择',
+          icon: 'none',
+          duration: 2500,
+        })
+        return
+      }
+      const ext = _extLower(f.name)
+      if (f.isImage) {
+        wx.previewImage({
+          urls: [f.path],
+          current: f.path,
+          fail: () => wx.showToast({ title: '图片预览失败', icon: 'none' }),
+        })
+        return
+      }
+      if (PREVIEW_TEXT_EXTS.indexOf(ext) !== -1) {
+        this._previewTextFile(f)
+        return
+      }
+      this._previewByNativeDocument(f, f.path, ext, false)
+    },
+
+    // txt/csv/md：本地读文本 → 本页预览层（超大文件不读，避免把 50MB 文本读进内存）
+    _previewTextFile(f) {
+      if ((Number(f.size) || 0) > PREVIEW_MAX_BYTES) {
+        wx.showToast({ title: '文件较大，暂不支持预览', icon: 'none', duration: 2500 })
+        return
+      }
+      wx.showLoading({ title: '读取中...' })
+      wx.getFileSystemManager().readFile({
+        filePath: f.path,
+        encoding: 'utf8',
+        success: (res) => {
+          wx.hideLoading()
+          let text = String(res.data == null ? '' : res.data)
+          let truncated = false
+          if (text.length > PREVIEW_MAX_CHARS) {
+            text = text.slice(0, PREVIEW_MAX_CHARS)
+            truncated = true
+          }
+          this.setData({
+            showPreview: true,
+            previewName: f.name,
+            previewText: text || '（空文件）',
+            previewTruncated: truncated,
+          })
+        },
+        fail: () => {
+          wx.hideLoading()
+          wx.showToast({ title: '读取失败，无法预览', icon: 'none' })
+        },
+      })
+    },
+
+    // PDF / Word / Excel：微信内置文档预览；个别机型不认 chooseMessageFile 的临时路径 →
+    // 复制到用户目录再试一次，两次都失败才提示
+    _previewByNativeDocument(f, path, ext, retried) {
+      const fileType = PREVIEW_DOC_TYPES[ext] || ''
+      wx.openDocument({
+        filePath: path,
+        fileType: fileType || undefined,
+        showMenu: true,
+        fail: () => {
+          if (retried) {
+            wx.showToast({ title: '该文件暂不支持预览', icon: 'none' })
+            return
+          }
+          const dest = wx.env.USER_DATA_PATH + '/preview_' + f._uid + (ext ? '.' + ext : '')
+          try {
+            wx.getFileSystemManager().copyFile({
+              srcPath: path,
+              destPath: dest,
+              success: () => this._previewByNativeDocument(f, dest, ext, true),
+              fail: () => wx.showToast({ title: '该文件暂不支持预览', icon: 'none' }),
+            })
+          } catch (err) {
+            wx.showToast({ title: '该文件暂不支持预览', icon: 'none' })
+          }
+        },
+      })
+    },
+
+    onClosePreview() {
+      this.setData({ showPreview: false, previewName: '', previewText: '', previewTruncated: false })
     },
 
     onCloseModal() {

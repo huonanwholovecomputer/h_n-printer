@@ -1106,6 +1106,8 @@ function closeModal(id) {
   if (!el) return;
   // 成功弹窗关闭时清空文件列表（对齐小程序 onCloseModal：收起列表→关闭弹窗→清空数据）
   if (id === 'successModal' && typeof clearFilesAfterSuccess === 'function') clearFilesAfterSuccess();
+  // 文件预览关闭时回收 objectURL / 清空内容（点遮罩与点 ✕ 都走这里）
+  if (id === 'previewMask' && typeof closePreviewBody === 'function') closePreviewBody();
   el.classList.add('modal-closing');
   setTimeout(() => {
     el.style.display = 'none';

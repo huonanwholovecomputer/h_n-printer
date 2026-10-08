@@ -6181,3 +6181,108 @@ body.theme-dark #view-user-orders .page-size-dropdown {
      JS positionThemeToggle() 会在注入安全区后按真实导航栏底缘重定位，此为样式兜底 */
   top: calc(var(--safe-top, env(safe-area-inset-top, 0px)) + 56px);
 }
+
+/* ── 文件预览（对齐小程序 index.wxss 同名段，rpx→cqw 按 750 设计稿换算）──────────
+   卡片头部的「预览」入口（不新增行、不改变卡片高度）；文本类预览层：遮罩 + 底部大抽屉。 */
+.file-preview-btn {
+  flex-shrink: 0;
+  margin-left: 1.6cqw;
+  padding: 1.0667cqw 2.1333cqw;
+  border-radius: 2.6667cqw;
+  background: var(--glass-light);
+  color: var(--blue);
+  font-size: 2.6667cqw;
+  line-height: 1;
+  border: var(--glass-border-dark);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.06s ease, background-color 0.15s ease;
+}
+.file-preview-btn:active {
+  transform: scale(0.94);
+  background-color: rgba(0, 122, 255, 0.12);
+}
+
+.preview-mask {
+  /* 覆盖 .modal-mask 的居中布局：预览是从底部弹出的大抽屉 */
+  align-items: flex-end;
+  justify-content: center;
+}
+.preview-sheet {
+  width: 100%;
+  height: 84vh;
+  box-sizing: border-box;
+  padding: 3.2cqw 4.2667cqw calc(3.2cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)));
+  background: var(--glass-regular);
+  border-radius: 4.2667cqw 4.2667cqw 0 0;
+  display: flex;
+  flex-direction: column;
+  animation: previewSheetIn 0.28s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+@keyframes previewSheetIn {
+  from { transform: translateY(6.4cqw); opacity: 0.5; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 2.1333cqw;
+  border-bottom: 0.5px solid var(--separator);
+}
+.preview-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 3.7333cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview-close {
+  flex-shrink: 0;
+  margin-left: 2.1333cqw;
+  width: 6.4cqw;
+  height: 6.4cqw;
+  border-radius: 3.2cqw;
+  background: var(--glass-light);
+  color: var(--text-secondary);
+  font-size: 3.2cqw;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.preview-close:active {
+  transform: scale(0.92);
+  background: var(--glass-border-dark);
+}
+.preview-body {
+  flex: 1;
+  min-height: 0;
+  margin-top: 2.1333cqw;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+}
+.preview-image {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+}
+.preview-text {
+  margin: 0;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 2.9333cqw;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.preview-truncated {
+  padding-top: 1.6cqw;
+  font-size: 2.6667cqw;
+  color: var(--text-tertiary);
+  text-align: center;
+}

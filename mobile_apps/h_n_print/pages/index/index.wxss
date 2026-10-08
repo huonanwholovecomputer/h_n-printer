@@ -1553,3 +1553,113 @@ picker-view-column {
 .theme-dark .param-row {
   border-bottom-color: rgba(84, 84, 88, 0.30);
 }
+
+/* ── 文件预览 ──────────────────────────────────────────────
+   卡片头部的「预览」入口（不新增行、不改变卡片高度，保持"每类型恒定高度"前提）；
+   文本类（txt/csv/md）预览层：全屏遮罩 + 底部大抽屉 + 可滚动的等宽文本。 */
+.file-preview-btn {
+  flex-shrink: 0;
+  margin-left: 12rpx;
+  padding: 8rpx 16rpx;
+  border-radius: 20rpx;
+  background: var(--glass-light);
+  color: var(--blue);
+  font-size: 20rpx;
+  line-height: 1;
+  border: var(--glass-border-dark);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.06s ease, background-color 0.15s ease;
+}
+.file-preview-btn:active {
+  transform: scale(0.94);
+  background-color: rgba(0, 122, 255, 0.12);
+}
+
+.preview-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3000;
+  background-color: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  animation: previewMaskIn 0.2s ease;
+}
+@keyframes previewMaskIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.preview-sheet {
+  width: 100%;
+  height: 84vh;
+  box-sizing: border-box;
+  padding: 24rpx 32rpx calc(24rpx + env(safe-area-inset-bottom));
+  background: var(--glass-regular);
+  border-radius: 32rpx 32rpx 0 0;
+  display: flex;
+  flex-direction: column;
+  animation: previewSheetIn 0.28s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+@keyframes previewSheetIn {
+  from { transform: translateY(48rpx); opacity: 0.5; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 16rpx;
+  border-bottom: 0.5px solid var(--separator);
+}
+.preview-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.preview-close {
+  flex-shrink: 0;
+  margin-left: 16rpx;
+  width: 48rpx;
+  height: 48rpx;
+  border-radius: 24rpx;
+  background: var(--glass-light);
+  color: var(--text-secondary);
+  font-size: 24rpx;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.preview-close:active {
+  transform: scale(0.92);
+  background: var(--glass-border-dark);
+}
+.preview-body {
+  flex: 1;
+  min-height: 0;
+  margin-top: 16rpx;
+}
+.preview-text {
+  display: block;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 22rpx;
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.preview-truncated {
+  padding-top: 12rpx;
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+  text-align: center;
+}

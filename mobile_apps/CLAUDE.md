@@ -124,6 +124,21 @@ bash backup.sh  # crontab 每天凌晨3点
 - 页数在提交后才回报 → 轮询成功处调 `_applyPageCountToOrder` / `applyPageCountToOrder` 写回提交快照（`_lastOrderResult.files`），拦下自动解除、提示消失（后端 `page_count_result` → `_recalc_prices_for_file` 已回溯重算订单价，此时复制到的就是实收价）。
 - 验收：`node tests/verify_copy_price_page_guard.js`（真实源码 + 桩环境：离线 Word、md、在线未返回、已验证放行、PDF/图片、混合订单、页数回报后解除）。
 
+## 文件预览（两端同口径，零后端依赖）
+
+预览一律用**用户本机选中的文件**：小程序 `selectedFiles[i].path`（`chooseMessageFile` 临时文件）、APP `selectedFiles[i].file`（内存 File 对象），**不向服务器取**，因此没有新增后端接口（`/api/download/<file_id>` 只认打印机签名 token，用户端拿不到；重印恢复的云端订单文件 `path=''`/`file=null`，预览层提示「该文件来自云端订单，暂不支持预览」）。
+
+| 类型 | 小程序 | APP（WebView） |
+|---|---|---|
+| 图片 | `wx.previewImage`（原生缩放/左右滑） | `URL.createObjectURL(f.file)` → 预览层 `<img>`（关闭时 revoke） |
+| PDF / Word / Excel | `wx.openDocument`（微信内置文档预览，无需转换）；失败（个别机型不认临时路径）→ `copyFile` 到 `wx.env.USER_DATA_PATH` 再试一次 | ❌ WebView 无原生渲染能力 → 明确提示「APP 内暂不支持预览该格式（PDF/Word 请用系统应用打开）」。要支持需原生桥 Intent 或打包 pdf.js（Word 还得先转 PDF） |
+| txt / csv / md | `getFileSystemManager().readFile(utf8)` → 预览层 `<text>`（`white-space: pre-wrap`） | `File.text()`/FileReader → 预览层 `<pre>`（内容 `escHtml` 转义） |
+
+- 入口：卡片头部名称区可点 + 右侧「预览」小胶囊（`.file-preview-btn`，**在既有 header 行内、不新增行**，不破坏「每类型卡片恒定高度」前提）。
+- 大文件保护：文本类 > `PREVIEW_MAX_BYTES`(2MB) 直接提示不读；预览最多 `PREVIEW_MAX_CHARS`(20000) 字符并显示「仅预览前面部分内容」。
+- APP 预览层复用 `.modal-mask`（点遮罩关闭），`closeModal('previewMask')` 里统一回收 objectURL/清空内容。
+- 验收：`node tests/verify_file_preview.js`（两端真实源码 + 桩环境：分派、openDocument 失败重试、截断、大文件、云端订单文案、objectURL 回收 + 接线核对）。
+
 ## 关键文件索引
 
 | 文件 | 作用 |
