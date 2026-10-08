@@ -115,6 +115,18 @@ if "print.js" in packed:
           "if (guard.invalid) { showAlert(" in js)
     check("APK 内 print.js 含复制价格页数拦截清单（checkPriceFiles/applyPageCountToOrder）",
           "function checkPriceFiles(files)" in js and "function applyPageCountToOrder(fileId, pageCount)" in js)
+    # 文件预览（2026-10）：卡片入口 + 分派 + objectURL 回收
+    check("APK 内 print.js 含文件预览（入口/文本读取/objectURL 回收）",
+          "function previewFile(idx)" in js and "function readFileText(file, onDone, onFail)" in js
+          and "function closePreviewBody()" in js and "PREVIEW_MAX_CHARS = 20000" in js)
+    check("APK 内 print.js 卡片渲染出预览入口",
+          'class="file-preview-btn" data-action="preview"' in js)
+
+# 预览层 markup（2026-10）
+if "index.html" in packed:
+    html = z.read(packed["index.html"]).decode("utf-8", "replace")
+    check("APK 内 index.html 含预览层 markup",
+          all(k in html for k in ('id="previewMask"', 'id="previewBody"', 'id="previewTitle"', 'id="previewTruncated"')))
 
 # 嵌套滚动接力（2026-10）：外层 scroller 的 touch-action 必须是 pan-y，
 # 且内层列表仍是原生滚动容器（touch-action: none 会让内层彻底滚不动）
@@ -128,6 +140,9 @@ if "styles.css" in packed:
     css = z.read(packed["styles.css"]).decode("utf-8", "replace")
     check("APK 内 styles.css 的 .scroller.js-scroll 为 touch-action: pan-y",
           ".scroller.js-scroll" in css and "touch-action: pan-y" in css)
+    check("APK 内 styles.css 含预览层样式且层叠高于悬浮 tabBar",
+          ".preview-sheet {" in css and ".preview-text {" in css
+          and ".preview-mask {" in css and "z-index: 10000;" in css)
 
 print("\n" + "=" * 52)
 print("APK 校验:", "全部通过 ✅" if ok_all else "存在失败 ❌")

@@ -1,8 +1,8 @@
 {
-  "version": "1.1.27",
-  "versionCode": 28,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.27.apk",
-  "md5": "425d6c07f110dd1ddf09c6ecc01d903e",
-  "notes": "v1.1.27：修复文件列表滚动卡死——文件较多时列表可内部滚动，滚到列表顶部/底部后手指继续拖动不再「卡在列表里」，滚动会顺畅交给整页（反向拖动也会交还列表）；同时恢复 APP 内时间滚轮选择器的滚动手感。",
+  "version": "1.1.28",
+  "versionCode": 29,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.28.apk",
+  "md5": "213907527bdbda4ecc5698bcb86def92",
+  "notes": "v1.1.28：新增文件预览——文件卡片上点「预览」即可查看内容（图片页内查看、txt/csv/md 直接页内阅读，超过 2MB 的文件暂不预览）；PDF/Word 等格式 APP 内暂不支持，建议用系统应用打开。另修复文件列表滚动卡死：文件较多时滚到列表顶部/底部后，滚动会顺畅交给整页（反向拖动也会交还列表）。",
   "force": false
 }
