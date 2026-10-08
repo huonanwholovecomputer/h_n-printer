@@ -244,21 +244,52 @@ const trunc = await page.evaluate(() => ({
 check('⑤超长文本：截断到 20000 字符并弹出截断提示', trunc.len === 20000 && trunc.tip, `${trunc.len} 字符 tip=${trunc.tip}`);
 await page.screenshot({ path: join(SHOTS, '04-超长文本截断.png') });
 
-/* 6) PDF/Word 在 APP 内的明确提示（WebView 无原生渲染能力） */
-await page.evaluate(() => closePreview());
+/* 6) 上传进度只更新两个节点，不整表重渲染（否则 card-entering 入场动画每 500ms 重播） */
+const progress = await page.evaluate(() => {
+  const f = {
+    _uid: 99, name: '上传中.pdf', size: 4096, file: null, fileId: null, uploading: true, progress: 10,
+    failed: false, copies: 1, pageRange: '', rangeLines: [{ value: '', error: '' }], duplex: 'on',
+    imageOrientation: 'auto', entering: true, removing: false, excelWarning: false,
+    unsupportedFormat: false, isImage: false, pageCount: 0, pageCountStatus: '', singlePage: false,
+    sizeDisplay: '4.0',
+  };
+  printState.selectedFiles = [f];
+  renderFileList();
+  const card0 = document.querySelector('#fileList .file-card');
+  const anim0 = card0 && card0.getAnimations ? card0.getAnimations().length : 0;
+  f.progress = 55;
+  updateUploadProgressDOM(f);
+  const card1 = document.querySelector('#fileList .file-card');
+  return {
+    sameNode: card0 === card1,
+    pct: card1.querySelector('.upload-pct').textContent,
+    width: card1.querySelector('.progress-fill').style.width,
+    animations: anim0,
+  };
+});
+check('⑥上传进度只改进度节点：卡片 DOM 未被重建（入场动画不会重播）',
+  progress.sameNode === true && progress.pct === '55%' && progress.width === '55%',
+  JSON.stringify(progress));
+check('⑥上传中卡片确实在播入场动画（card-entering，说明"重建即重播"并非空谈）',
+  progress.animations > 0, 'animations=' + progress.animations);
+
+/* 7) PDF/Word 在 APP 内的明确提示（WebView 无原生渲染能力） */await page.evaluate(() => closePreview());
 await page.waitForTimeout(300);
 const unsupported = await page.evaluate(() => {
+  printState.selectedFiles[0].name = '报告.docx';
+  printState.selectedFiles[0].file = new File(['x'], '报告.docx');
+  printState.selectedFiles[0].isImage = false;
   const before = document.getElementById('toast') ? document.getElementById('toast').textContent : '';
-  previewFile(2);
+  previewFile(0);
   const el = document.getElementById('toast');
   return { before, after: el ? el.textContent : '', maskVisible: getComputedStyle(document.getElementById('previewMask')).display !== 'none' };
 });
-check('⑥Word：不打开预览层，toast 明确提示不支持',
+check('⑦Word：不打开预览层，toast 明确提示不支持',
   !unsupported.maskVisible && /暂不支持预览/.test(unsupported.after), unsupported.after);
 
 await browser.close();
 server.close();
-check('⑦全程未触碰生产/外部网络（BASE_URL 已隔离到本地桩）',
+check('⑧全程未触碰生产/外部网络（BASE_URL 已隔离到本地桩）',
   foreign.length === 0, foreign.slice(0, 3).join(', '));
 console.log('\n' + '='.repeat(52));
 console.log('文件预览渲染验收:', failures === 0 ? '全部通过 ✅' : `存在 ${failures} 项失败 ❌`);

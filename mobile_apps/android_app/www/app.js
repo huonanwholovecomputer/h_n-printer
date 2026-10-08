@@ -328,6 +328,7 @@ class FlingEngine {
     this.el.style.touchAction = '';
     this.el.removeEventListener('touchstart', this._hTs);
     this.el.removeEventListener('touchmove', this._hTm);
+    this.el.removeEventListener('touchmove', this._hTmPassive);
     this.el.removeEventListener('touchend', this._hTe);
     this.el.removeEventListener('touchcancel', this._hTe);
     this.el.removeEventListener('wheel', this._hW);
@@ -336,13 +337,35 @@ class FlingEngine {
   _bind() {
     this._hTs = (e) => this.onTouchStart(e);
     this._hTm = (e) => this.onTouchMove(e);
+    this._hTmPassive = (e) => this.onTouchMovePassive(e);
     this._hTe = (e) => this.onTouchEnd(e);
     this._hW = (e) => this.onWheel(e);
+    this._passiveNested = false;
     this.el.addEventListener('touchstart', this._hTs, { passive: true });
     this.el.addEventListener('touchmove', this._hTm, { passive: false });
     this.el.addEventListener('touchend', this._hTe, { passive: true });
     this.el.addEventListener('touchcancel', this._hTe, { passive: true });
     this.el.addEventListener('wheel', this._hW, { passive: false });
+  }
+
+  /**
+   * 内层原生滚动期间把 touchmove 切成 passive。
+   * 原因：祖先上只要挂着**非 passive** 的 touchmove，浏览器就必须为每个 touchmove 等 JS，
+   * 内层滚动只能走主线程（合成器快路径被禁掉）—— 本应用 DOM 重（blur/渐变/阴影），
+   * 于是「手指滑到文件列表区域特别卡」。起手在内层滚动容器时换 passive，浏览器即可
+   * 用合成器线程滚内层（丝滑）；引擎在被动回调里仍能按 scrollTop 判边界、驱动外层，
+   * 只是不能 preventDefault —— 而边界处内层本来就滚不动，本就无需 cancel。
+   */
+  _usePassiveNested(enable) {
+    if (!!enable === !!this._passiveNested) return;
+    this._passiveNested = !!enable;
+    if (enable) {
+      this.el.removeEventListener('touchmove', this._hTm);
+      this.el.addEventListener('touchmove', this._hTmPassive, { passive: true });
+    } else {
+      this.el.removeEventListener('touchmove', this._hTmPassive);
+      this.el.addEventListener('touchmove', this._hTm, { passive: false });
+    }
   }
 
   measure() {
@@ -385,6 +408,8 @@ class FlingEngine {
     this._nestedScroll = nestedEl;
     // 本手势起于内层：外层滚到边界后反向拖拽时交还内层（双向接力）
     this._nestedEl = nestedEl;
+    // 起手在内层且内层真能滚 → 本手势改用 passive touchmove（内层走合成器线程，不卡）
+    this._usePassiveNested(!!nestedEl && (nestedEl.scrollHeight - nestedEl.clientHeight) > 1);
     const touches = e.touches || [];
     if (touches.length > 0) {
       this._startX = touches[0].clientX;
@@ -406,6 +431,16 @@ class FlingEngine {
   }
 
   onTouchMove(e) {
+    this._handleTouchMove(e, true);
+  }
+
+  /* 内层原生滚动用的被动版本：同样判边界、同样能驱动外层，只是不能 preventDefault
+     （边界处内层已滚不动，本就不需要 cancel；若强行调用还会被浏览器告警） */
+  onTouchMovePassive(e) {
+    this._handleTouchMove(e, false);
+  }
+
+  _handleTouchMove(e, canPrevent) {
     if (gestureBus.horizontal) return; // 左滑卡片 / 滑块让出
     if (this._trackId === null) return;
     const touches = e.touches || [];
@@ -455,7 +490,7 @@ class FlingEngine {
         }
       }
     }
-    e.preventDefault();
+    if (canPrevent) e.preventDefault();   // passive 版本不能调（浏览器会忽略并告警）
     const dt = Math.max(1, now - this._lastT);
     if (Math.abs(ddy) > 0.5) this._moved = true;
     this.y -= ddy;
@@ -479,6 +514,7 @@ class FlingEngine {
     this._trackId = null;
     this._nestedScroll = null;
     this._nestedEl = null;
+    this._usePassiveNested(false);   // 手势结束恢复非 passive 监听（外层惯性仍需 preventDefault）
     this.startPhysics();
   }
 

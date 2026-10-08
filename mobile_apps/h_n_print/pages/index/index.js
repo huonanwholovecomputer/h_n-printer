@@ -670,10 +670,12 @@ Component({
       this._fileListPx = 0   // 文件列表累计占用高度（有界 scroll-view，达到上限后不再增长）
       this._maxY = 0
 
-      // 内层文件列表边界状态（供 WXS 判断「是否该把滚动让回外层」）+ 其内容高（px，算 maxScroll 用）
+      // 内层文件列表边界状态（供 WXS 判断「是否该把滚动让回外层」）
+      //   _fileListContentPx = 卡片高度常量累加（估算）；_fileListRealPx = 滚动事件里的真实 scrollHeight（权威）
       this._listAtTop = true
       this._listAtBottom = false
       this._fileListContentPx = 0
+      this._fileListRealPx = 0
 
       this._measureTimer = null  // 去抖测量句柄
 
@@ -718,7 +720,14 @@ Component({
       const contentPx = Math.round(sumRpx * ((windowWidth || 375) / 750))
       // 内层文件列表是否真的可滚（内容高 > 可视高）：可滚时 WXS 让位给原生
       const listOverflow = contentPx > (this.data.fileListHeight || 0) + 1
-      this._fileListContentPx = contentPx   // 供 _refreshListEdges 算 maxScroll（内层内容高）
+      this._fileListContentPx = contentPx   // 常量估值（仅在拿不到真实 scrollHeight 时兜底）
+      if (!listOverflow) {
+        // 列表不可滚（内容没超过可视高，或文件被删空）→ 两个方向都视为"贴边"，
+        // WXS 会立刻把滚动交给外层；同时作废上次实测内容高，避免残留旧值
+        this._listAtTop = true
+        this._listAtBottom = true
+        this._fileListRealPx = 0
+      }
       this.setData({
         scrollConfig: {
           minY: 0,
@@ -736,15 +745,21 @@ Component({
 
     // 内层文件列表滚动：同步「贴顶/贴底」状态到 WXS 引擎（仅在翻转时 setData，滚动过程几乎零开销）
     onFileListScroll(e) {
-      this._refreshListEdges(e && e.detail ? e.detail.scrollTop : 0)
+      const d = (e && e.detail) || {}
+      // 必须用滚动事件里的真实 scrollHeight 判定是否到底 —— 卡片高度常量是**估算值**
+      // （实测比真实渲染高 4~7%），拿常量算 maxScroll 会永远差一截，atBottom 恒为 false
+      // → 内层滚到底后外层永远不接管（"滑动列表带不动页面"的根因）。
+      this._refreshListEdges(d.scrollTop, d.scrollHeight)
     },
 
     // 依据内层列表当前 scrollTop 刷新贴边状态；变化时才推 scrollConfig。
-    // maxScroll = 内层内容高 - 列表可视高（列表高度为显式 fileListHeight，内容高用卡片高度累加值）
-    _refreshListEdges(scrollTop) {
+    // realContentH：滚动事件给的权威内容高（缺失/为 0 时退回上次实测值，再退回常量估值）
+    _refreshListEdges(scrollTop, realContentH) {
       const top = Math.max(0, Number(scrollTop) || 0)
       const viewH = this.data.fileListHeight || 0
-      const contentPx = this._fileListContentPx || 0
+      const real = Number(realContentH) || 0
+      if (real > 0) this._fileListRealPx = real
+      const contentPx = this._fileListRealPx || this._fileListContentPx || 0
       const maxScroll = Math.max(0, contentPx - viewH)
       const atTop = top <= 0.5
       const atBottom = contentPx > 0 && viewH > 0 && top >= maxScroll - 0.5
@@ -1054,10 +1069,13 @@ Component({
           }, 250)
           if (isFirstFile) this._triggerBtnPulse()
           // 入场动画延迟 0.25s（等待微信文件选择器关闭）+ 动画 0.5s
+          // 按 uid 清除（不能按索引：期间可能删过文件、索引已前移 → 会漏清导致卡片永久带
+          // card-entering，之后任何一次列表重排都会重播入场动画）
           uploads.forEach((u) => {
             setTimeout(() => {
-              if (this.data.selectedFiles[u.fileIndex]) {
-                this.setData({ ['selectedFiles[' + u.fileIndex + '].entering']: false })
+              const idx = this._fileIndexByUid(u.fileUid)
+              if (idx >= 0) {
+                this.setData({ ['selectedFiles[' + idx + '].entering']: false })
               }
             }, 800)  // 250ms delay + 500ms animation + 50ms buffer
           })
@@ -1213,6 +1231,15 @@ Component({
           this._startPageCountPoll(this._fileUid(f), f.fileId)
         }
       })
+      // 入场动画播完按 uid 清除（此前恢复路径从不清 entering：卡片永久带 card-entering，
+      // 之后删除任一卡片、节点重排时会重播入场动画）
+      files.forEach((f) => {
+        const uid = this._fileUid(f)
+        setTimeout(() => {
+          const idx = this._fileIndexByUid(uid)
+          if (idx >= 0) this.setData({ ['selectedFiles[' + idx + '].entering']: false })
+        }, 800)
+      })
       this._scheduleMeasure(400)
       setTimeout(() => this._scheduleMeasure(850), 850)
     },
@@ -1285,6 +1312,9 @@ Component({
         filePath: filePath,
         name: 'file',
         header: { 'Authorization': 'Bearer ' + token },
+        // 带上当前选中的接单设备：Word/md 上传后要由某台设备下载+转 PDF 才能数页，
+        // 优先让用户选的那台做（它才是订单的接管设备）；为空/离线时后端退回订单目标/任一在线接单设备
+        formData: { target_client_id: this.data.selectedDeviceId || '' },
         success: (uploadRes) => {
           const entry = this._uploadTimers[fileUid]
           if (!entry || entry.cancelled) return  // 上传已被取消
@@ -1493,8 +1523,11 @@ Component({
 
       const poll = () => {
         const token = wx.getStorageSync('token') || ''
+        // 每次轮询都带上当前选中的接单设备：由它做页数分析（用户中途换设备也能跟上）
+        const prefer = this.data.selectedDeviceId || ''
         request({
-          url: CONFIG.BASE_URL + '/api/file_page/' + fileId,
+          url: CONFIG.BASE_URL + '/api/file_page/' + fileId +
+            (prefer ? '?target_client_id=' + encodeURIComponent(prefer) : ''),
           method: 'GET',
           header: { 'Authorization': 'Bearer ' + token },
           success: (res) => {

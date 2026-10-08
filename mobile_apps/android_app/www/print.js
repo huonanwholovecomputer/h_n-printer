@@ -360,6 +360,19 @@ function fileControlsHTML(f) {
   return html;
 }
 
+/* 上传进度只改这两个节点，不整表重渲染：
+   innerHTML 重建会让 card-entering 的入场动画每 500ms 重播一次（上传中卡片反复"展开淡入"），
+   也白白重建整棵卡片 DOM（滚动时更卡）。节点还没渲染出来时退回整表渲染。 */
+function updateUploadProgressDOM(f) {
+  const idx = fileIndexOf(f);
+  const card = document.querySelectorAll('#fileList .file-card')[idx];
+  const pct = card && card.querySelector('.upload-pct');
+  const fill = card && card.querySelector('.progress-fill');
+  if (!pct || !fill) { renderFileList(); return; }
+  pct.textContent = f.progress + '%';
+  fill.style.width = f.progress + '%';
+}
+
 function renderFileList() {
   const container = document.getElementById('fileList');
   container.innerHTML = printState.selectedFiles.map((f, i) => `
@@ -766,7 +779,7 @@ function uploadFile(idx) {
     if (f.progress >= cur.realProgress) return;
     const next = f.progress + Math.max(1, (cur.realProgress - f.progress) * 0.5);
     f.progress = Math.round(Math.min(next, cur.realProgress));
-    renderFileList();
+    updateUploadProgressDOM(f);
   }, 500);
   const xhr = new XMLHttpRequest();
   entry.xhr = xhr;
@@ -774,6 +787,9 @@ function uploadFile(idx) {
   xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
   const fd = new FormData();
   fd.append('file', f.file);
+  // 带上当前选中的接单设备：Word/md 上传后要由某台设备下载+转 PDF 才能数页，
+  // 优先让用户选的那台做（它才是订单的接管设备）；为空/离线时后端退回订单目标/任一在线接单设备
+  fd.append('target_client_id', (typeof selectedDeviceId !== 'undefined' && selectedDeviceId) ? selectedDeviceId : '');
   xhr.upload.onprogress = (e) => {
     if (e.lengthComputable) entry.realProgress = Math.round(e.loaded / e.total * 100);
   };
@@ -852,7 +868,9 @@ function startPageCountPoll(f, fileId) {
   const poll = async () => {
     if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return; }
     try {
-      const r = await api('/api/file_page/' + fileId);
+      // 每次轮询都带上当前选中的接单设备：由它做页数分析（用户中途换设备也能跟上）
+      const prefer = (typeof selectedDeviceId !== 'undefined' && selectedDeviceId) ? selectedDeviceId : '';
+      const r = await api('/api/file_page/' + fileId + (prefer ? '?target_client_id=' + encodeURIComponent(prefer) : ''));
       // await 期间文件可能被删除 / 被重新上传（fileId 变了）→ 丢弃本次结果
       if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return; }
       if (r.status === 200 && r.data && r.data.success) {

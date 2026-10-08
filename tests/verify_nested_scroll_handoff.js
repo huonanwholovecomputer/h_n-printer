@@ -37,6 +37,24 @@ function check(name, cond, detail) {
 }
 function section(t) { console.log('\n================ ' + t + ' ================'); }
 
+/* setData 路径写入（'a[1].b' → data.a[1].b = v），供小程序页面桩使用 */
+function setByPath(obj, key, val) {
+  const m = key.match(/^([A-Za-z0-9_$]+)((\[\d+\]|\.[A-Za-z0-9_$]+)*)$/);
+  if (!m) { obj[key] = val; return; }
+  const parts = m[2].match(/\[\d+\]|\.[A-Za-z0-9_$]+/g) || [];
+  if (!parts.length) { obj[m[1]] = val; return; }
+  let cur = obj[m[1]];
+  if (cur === undefined || cur === null) { obj[m[1]] = cur = {}; }
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    const isLast = i === parts.length - 1;
+    const k = p[0] === '[' ? Number(p.slice(1, -1)) : p.slice(1);
+    if (isLast) { cur[k] = val; return; }
+    cur = cur[k];
+    if (cur === undefined || cur === null) throw new Error('bad path ' + key);
+  }
+}
+
 /* ============================================================
    一、小程序 WXS 滚动引擎（真实 utils/scroll.wxs）
    ============================================================ */
@@ -203,7 +221,9 @@ function loadFlingEngine() {
 function fakeEl(over) {
   const el = {
     style: {}, dataset: {}, classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
-    addEventListener() {}, removeEventListener() {},
+    _listeners: {},
+    addEventListener(type, fn, opts) { this._listeners[type] = { fn, passive: !!(opts && opts.passive) }; },
+    removeEventListener(type) { delete this._listeners[type]; },
     getBoundingClientRect: () => ({ height: 600, top: 0, left: 0, right: 375, bottom: 600 }),
     clientWidth: 375, scrollHeight: 1800, clientHeight: 300, scrollTop: 0,
   };
@@ -219,8 +239,11 @@ function appTouch(engine, type, clientY, target) {
     _prevented: false,
   };
   if (type === 'touchstart') engine.onTouchStart(ev);
-  else if (type === 'touchmove') engine.onTouchMove(ev);
-  else engine.onTouchEnd(ev);
+  else if (type === 'touchmove') {
+    // 真实环境里被动监听命中时走 onTouchMovePassive（引擎按当前耗时切换过监听）
+    if (engine._passiveNested) engine.onTouchMovePassive(ev);
+    else engine.onTouchMove(ev);
+  } else engine.onTouchEnd(ev);
   return ev;
 }
 
@@ -256,11 +279,12 @@ function runFlingTests() {
   check('①内层未贴底：不 preventDefault（交原生）', ev._prevented === false);
   check('①内层未贴底：外层位移 0', g.y === 0, 'y=' + g.y);
 
-  /* ② 内层贴底 → 外层接管 */
+  /* ② 内层贴底 → 外层接管（本手势起于内层可滚列表 → 走 passive，故不调 preventDefault；
+        边界处内层本就滚不动、祖先也不可滚，原生无动作，不冲突） */
   inner.scrollTop = 1500;                                      // maxTop = 1800-300 = 1500
   ev = appTouch(g, 'touchmove', 260, innerTarget(inner));
-  check('②内层贴底：外层接管并 preventDefault', ev._prevented === true, 'prevented=' + ev._prevented);
-  check('②外层按本次增量位移 20px', Math.round(g.y) === 20, 'y=' + g.y);
+  check('②内层贴底：外层接管（passive 手势无需 preventDefault）',
+        ev._prevented === false && Math.round(g.y) === 20, `y=${g.y} prevented=${ev._prevented}`);
   ev = appTouch(g, 'touchmove', 200, innerTarget(inner));
   check('②接管后持续跟手（+60px）', Math.round(g.y) === 80, 'y=' + g.y);
   appTouch(g, 'touchend', 200, innerTarget(inner));
@@ -272,7 +296,7 @@ function runFlingTests() {
   appTouch(g, 'touchstart', 300, innerTarget(inner3));
   ev = appTouch(g, 'touchmove', 320, innerTarget(inner3));
   check('③内层贴顶 + 手指下滑：外层接管并向上滚 20px',
-        ev._prevented === true && Math.round(g.y) === 280, 'y=' + g.y);
+        Math.round(g.y) === 280, 'y=' + g.y);
   appTouch(g, 'touchend', 320, innerTarget(inner3));
 
   /* ④ 反向接力：外层到顶 + 手指下滑 + 内层未贴顶 → 交还内层 */
@@ -303,10 +327,179 @@ function runFlingTests() {
   ev = appTouch(g, 'touchmove', 280, outerTarget);
   check('⑥列表外起手：外层直接跟手 20px', ev._prevented === true && Math.round(g.y) === 20, 'y=' + g.y);
   appTouch(g, 'touchend', 280, outerTarget);
+
+  /* ⑦ 卡顿修复：起手在内层可滚动列表 → 本手势改用 passive touchmove
+     （祖先挂着非 passive touchmove 会让内层滚动只能走主线程 → 滑到列表区域很卡） */
+  ({ g } = mkEngine());
+  const inner7 = fakeEl({ scrollTop: 0, scrollHeight: 1800, clientHeight: 300 });
+  check('⑦初始为非 passive touchmove 监听',
+        !!g.el._listeners.touchmove && g.el._listeners.touchmove.passive === false,
+        JSON.stringify(g.el._listeners.touchmove));
+  appTouch(g, 'touchstart', 300, innerTarget(inner7));
+  check('⑦起手在内层可滚列表：切成 passive 监听',
+        g._passiveNested === true && !!g.el._listeners.touchmove
+        && g.el._listeners.touchmove.passive === true,
+        JSON.stringify(g.el._listeners.touchmove));
+  ev = appTouch(g, 'touchmove', 280, innerTarget(inner7));   // 内层还能滚 → 让原生
+  check('⑦passive 模式下内层能滚时不动外层、也不调 preventDefault',
+        g.y === 0 && ev._prevented === false, 'y=' + g.y);
+  inner7.scrollTop = 1500;                                   // 内层到底
+  ev = appTouch(g, 'touchmove', 260, innerTarget(inner7));
+  check('⑦passive 模式下内层到底：外层仍被驱动（边界处原生无动作，无需 cancel）',
+        Math.round(g.y) === 20 && ev._prevented === false, 'y=' + g.y);
+  appTouch(g, 'touchend', 260, innerTarget(inner7));
+  check('⑦手势结束恢复非 passive 监听',
+        g._passiveNested === false && g.el._listeners.touchmove.passive === false,
+        JSON.stringify(g.el._listeners.touchmove));
+
+  /* ⑧ 起手在内层但内层不可滚（内容不足）→ 保持非 passive（外层全权接管） */
+  ({ g } = mkEngine());
+  const inner8 = fakeEl({ scrollTop: 0, scrollHeight: 300, clientHeight: 300 });
+  appTouch(g, 'touchstart', 300, innerTarget(inner8));
+  check('⑧内层不可滚：不切 passive（外层直接用非 passive 全权接管）',
+        g._passiveNested === false && g.el._listeners.touchmove.passive === false);
+  ev = appTouch(g, 'touchmove', 280, innerTarget(inner8));
+  check('⑧内层不可滚：外层跟手且 preventDefault 生效',
+        ev._prevented === true && Math.round(g.y) === 20, 'y=' + g.y);
+  appTouch(g, 'touchend', 280, innerTarget(inner8));
 }
 
 /* ============================================================
-   三、接线核对（逻辑层/模板/样式的配套改动）
+   三、小程序「内层是否到底」的判定（真实 index.js）
+   ============================================================ */
+function loadMiniProgramPage() {
+  const src = fs.readFileSync(MP_JS, 'utf8');
+  let pageConfig = null;
+  const sandbox = {
+    console: { log() {}, warn: console.warn, error: console.error },
+    JSON, Math, Date, Object, Array, String, Number, Boolean, Error, Promise, Set, Map,
+    parseInt, parseFloat, isNaN,
+    setTimeout, clearTimeout, setInterval, clearInterval,
+    require: (p) => {
+      if (p.indexOf('utils/config') >= 0) return { CONFIG: { BASE_URL: 'https://example.test' } };
+      if (p.indexOf('utils/request') >= 0) return { request: () => {} };
+      throw new Error('unexpected require: ' + p);
+    },
+    Page: (cfg) => { pageConfig = cfg; },
+    Component: (cfg) => { pageConfig = cfg; },
+    getApp: () => ({ globalData: { isDarkMode: false, themeMode: 'light' } }),
+    wx: {
+      getStorageSync: () => '', setStorageSync() {}, removeStorageSync() {},
+      setBackgroundColor() {}, switchTab() {}, showToast() {}, showLoading() {}, hideLoading() {},
+      getWindowInfo: () => ({ windowWidth: 375, windowHeight: 800 }),
+      getSystemInfoSync: () => ({ windowWidth: 375, windowHeight: 800, platform: 'devtools' }),
+      createSelectorQuery: () => ({
+        select: () => ({ boundingClientRect() { return this; }, scrollOffset() { return this; } }),
+        selectAll: () => ({ boundingClientRect() { return this; } }),
+        in: function () { return this; }, exec(cb) { cb && cb([[], null, { scrollTop: 0 }]); },
+      }),
+      nextTick: (fn) => setTimeout(fn, 0),
+      uploadFile: () => ({ abort() {}, onProgressUpdate() {} }),
+      chooseMessageFile: () => {},
+    },
+  };
+  sandbox.global = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox, { filename: 'index.js' });
+  const page = Object.assign({}, pageConfig, pageConfig.methods);
+  page.data = JSON.parse(JSON.stringify(pageConfig.data || {}));
+  page.setData = function (patch, cb) {
+    Object.keys(patch || {}).forEach(k => setByPath(this.data, k, patch[k]));
+    if (cb) cb();
+  };
+  page._scheduleMeasure = () => {};
+  page.getTabBar = () => null;
+  return page;
+}
+
+function runMiniProgramEdgeTests() {
+  section('小程序 index.js（真实代码）：内层贴边判定');
+  const page = loadMiniProgramPage();
+
+  /* 5 张 image 卡：常量估值 312.8rpx/张（实测仅 290.3），估值内容高 > 真实 → 列表可滚且被 85vh 封顶 */
+  const mkFile = (i) => ({
+    _uid: i + 1, name: 'p' + i + '.png', size: 2048, path: '/tmp/p' + i + '.png', sizeDisplay: '2.0',
+    fileId: 'F' + i, uploading: false, progress: 100, failed: false, copies: 1, pageRange: '',
+    rangeLines: [{ value: '', error: '' }], duplex: 'off', imageOrientation: 'auto',
+    entering: false, removing: false, excelWarning: false, unsupportedFormat: false,
+    isImage: true, pageCount: 1, pageCountStatus: '', singlePage: true,
+  });
+  page.data.selectedFiles = [0, 1, 2, 3, 4].map(mkFile);
+  page._fileListPx = 0;
+  page._recalcFileListHeight();
+  // 结束高度补间（真实使用中用户滚动前动画已播完）：直接落到位再推配置
+  const settleHeight = () => {
+    if (page._fileListTween) { clearTimeout(page._fileListTween); page._fileListTween = null }
+    page.data.fileListHeight = page._fileListPx;
+    page._pushScrollConfig();
+  };
+  settleHeight();
+
+  const viewH = page.data.fileListHeight;
+  const estContent = page._fileListContentPx;
+  const estMax = Math.max(0, estContent - viewH);
+  check('列表可滚（估值内容高 > 可视高）', page.data.scrollConfig.listOverflow === true,
+        `contentPx=${estContent} viewH=${viewH}`);
+  check('估值 maxScroll > 0（说明确实用到了内容高估值）', estMax > 10, 'estMax=' + estMax);
+
+  /* 真实内容高比估值小 7%（实测偏差）→ 真实 maxScroll 明显小于估值 maxScroll */
+  const realContent = Math.round(estContent * 0.93);
+  const realMax = Math.max(0, realContent - viewH);
+  check('真实 maxScroll 比估值小（正是"滚到底也判不出到底"的根因）', realMax < estMax - 5,
+        `realMax=${realMax} estMax=${estMax}`);
+
+  /* ① 修复后：滚到真实底部（带真实 scrollHeight）→ 判定到底，并把 listAtBottom 推给 WXS */
+  page._listAtTop = true;
+  page._listAtBottom = false;
+  page.onFileListScroll({ detail: { scrollTop: realMax, scrollHeight: realContent, scrollWidth: 0 } });
+  check('①滚到真实底部（用 scrollHeight 判定）→ listAtBottom=true',
+        page._listAtBottom === true, `listAtBottom=${page._listAtBottom} scrollTop=${realMax}`);
+  check('①scrollConfig 已同步 listAtBottom=true（WXS 据此把滚动交给外层）',
+        page.data.scrollConfig.listAtBottom === true);
+
+  /* ② 反证：不带真实 scrollHeight（退回常量估值）时，同一 scrollTop 判不出到底 —— 旧实现的 bug */
+  page._listAtTop = true;
+  page._listAtBottom = false;
+  page._fileListRealPx = 0;
+  page.onFileListScroll({ detail: { scrollTop: realMax, scrollHeight: 0, scrollWidth: 0 } });
+  check('②反证：只用常量估值 → 同一位置 listAtBottom 仍为 false（旧行为，接力失效）',
+        page._listAtBottom === false, 'estMax=' + estMax + ' scrollTop=' + realMax);
+
+  /* ③ 反过来：滚到顶部（scrollTop=0）→ listAtTop=true，用于"外层到顶交还内层" */
+  page._listAtTop = false;
+  page._listAtBottom = true;
+  page.onFileListScroll({ detail: { scrollTop: 0, scrollHeight: realContent } });
+  check('③滚到顶部 → listAtTop=true / listAtBottom=false',
+        page._listAtTop === true && page._listAtBottom === false);
+
+  /* ④ 把推出来的 config 喂给真实 WXS 引擎：内层贴底后继续上滑 → 外层接管 */
+  page.onFileListScroll({ detail: { scrollTop: realMax, scrollHeight: realContent } });  // 回到"贴底"状态
+  check('④喂 WXS 前配置确为 listAtBottom=true', page.data.scrollConfig.listAtBottom === true);
+  const engine = loadWxsEngine();
+  const owner = makeWxsOwner(engine, Object.assign({}, page.data.scrollConfig, {
+    minY: 0, maxY: 600, scrollerH: 800, contentH: 1400,
+  }));
+  const st = owner.getState();
+  wxsTouch(engine, owner, 'touchstart', 300);
+  const ret = wxsTouch(engine, owner, 'touchmove', 270);
+  check('④端到端：配置带 listAtBottom=true → 内层触点起手也能让外层接管',
+        ret === false && st.y > 0, `ret=${ret} y=${st.y}`);
+  wxsTouch(engine, owner, 'touchend', 270);
+
+  /* ⑤ 列表不可滚（只 1 个文件）→ 两个方向都视为贴边，WXS 立刻把滚动交给外层 */
+  page.data.selectedFiles = [mkFile(0)];
+  page._fileListPx = 0;
+  page._recalcFileListHeight();
+  settleHeight();
+  check('⑤内容不足一屏：listOverflow=false 且 listAtTop/listAtBottom 都为 true',
+        page.data.scrollConfig.listOverflow === false
+        && page.data.scrollConfig.listAtTop === true && page.data.scrollConfig.listAtBottom === true,
+        JSON.stringify({ overflow: page.data.scrollConfig.listOverflow, top: page.data.scrollConfig.listAtTop, bottom: page.data.scrollConfig.listAtBottom }));
+}
+
+/* ============================================================
+   四、接线核对（逻辑层/模板/样式的配套改动）
    ============================================================ */
 function runWiringChecks() {
   section('接线核对（小程序逻辑层 + 两端 touch-action）');
@@ -323,6 +516,11 @@ function runWiringChecks() {
         /onFileListScroll\(e\) \{/.test(mpJs) && /_refreshListEdges\(/.test(mpJs));
   check('小程序：_measure 同步查询内层 scrollOffset（内容增减后边界不失效）',
         /\.file-list-scroll'\)\.scrollOffset\(\)/.test(mpJs));
+  check('小程序：贴边判定用滚动事件的真实 scrollHeight（不再只靠常量估值）',
+        /_refreshListEdges\(d\.scrollTop, d\.scrollHeight\)/.test(mpJs)
+        && /this\._fileListRealPx = real/.test(mpJs));
+  check('小程序：内容不足一屏时两边都置贴边（外层立即接管）',
+        /if \(!listOverflow\) \{[\s\S]{0,200}this\._listAtBottom = true/.test(mpJs));
   check('小程序：初始 config/state 带边界字段',
         /listOverflow: false, listAtTop: true, listAtBottom: false/.test(mpJs)
         && /state\.listAtTop = true;/.test(fs.readFileSync(WXS, 'utf8')));
@@ -340,6 +538,7 @@ function runWiringChecks() {
 /* ============================================================ */
 runWxsTests();
 runFlingTests();
+runMiniProgramEdgeTests();
 runWiringChecks();
 console.log('\n' + '='.repeat(52));
 console.log('嵌套滚动接力验收:', failures === 0 ? '全部通过 ✅' : `存在 ${failures} 项失败 ❌`);

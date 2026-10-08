@@ -5987,6 +5987,7 @@ picker-view-column {
   scroll-snap-type: y mandatory;
   scrollbar-width: none;
   -ms-overflow-style: none;
+  will-change: transform;   /* 同上：独立合成层，滚轮选择器滚动不重绘外层 */
 }
 .wheel-viewport::-webkit-scrollbar { display: none; }
 .wheel-items { padding: 21.12cqw 0; }
@@ -6085,6 +6086,9 @@ button {
   overflow-y: auto;
   scrollbar-width: none;
   -ms-overflow-style: none;
+  /* 独立合成层：内层滚动/回弹不再重绘外层那个被 JS transform 驱动的大层，
+     否则滚动时每帧都要重绘整页（滑动到列表区域卡顿的第二个来源） */
+  will-change: transform;
 }
 .file-list-scroll::-webkit-scrollbar {
   display: none;

@@ -70,7 +70,7 @@
           <scroll-view class="file-list-scroll" scroll-y enhanced show-scrollbar="{{false}}" style="height: {{fileListHeight}}px;" bindscroll="onFileListScroll">
           <view
             wx:for="{{selectedFiles}}"
-            wx:key="index"
+            wx:key="_uid"
             class="file-card {{item.entering ? 'card-entering' : ''}} {{item.removing ? 'card-removing' : ''}}"
           >
             <!-- Header: name + preview + remove -->

@@ -2525,7 +2525,8 @@ def on_connect(auth=None):
             fname = row["original_name"] or ""
             ext = os.path.splitext(fname)[1].lower()
             if ext in (".doc", ".docx"):
-                if request_page_analysis(row["id"], fname):
+                # 刚上线的这台优先分析自己的待分析文件（它才是这些订单的接管设备）
+                if request_page_analysis(row["id"], fname, prefer_client=client_id):
                     pushed += 1
         if pushed > 0:
             print(f"  [PAGE] 打印机上线后重推 {pushed} 个待分析文档（含未提交订单的上传文件）")
@@ -3366,11 +3367,51 @@ def _notify_clients(event: str, data: dict):
                 print(f"  [NOTIFY] 推送 {event} 到 {client_id} 失败: {e}")
 
 
-def request_page_analysis(file_id: str, file_name: str) -> bool:
-    """请求本地打印工具下载文件并分析页数。成功推送返回 True。"""
-    client_id = get_active_printer_client()  # 页数分析只发给接单设备（它将负责打印）
+def _resolve_analysis_client(prefer_client: str, file_id: str) -> tuple:
+    """选「由哪台设备做页数分析」。返回 (client_id, 依据说明)，都不满足返回 ("", 原因)。
+
+    页数分析要把整个文件下载到那台机器上、用 Word/WPS 转 PDF 才能数页（并把 PDF 存进
+    它的本地缓存），所以"发给谁"是有成本的，不能随便挑第一台在线设备。优先级：
+      ① 调用方指定（前端当前选中的接单设备 / 刚刚上线的设备）；
+      ② 该文件**活跃订单**的目标设备（orders.target_client）——谁接这单谁分析；
+      ③ 兜底：任一在线接单设备（文件与订单无关时，早点拿到页数对用户更有价值）。
+    仅考虑「在线 + 启用接单」的设备；目标设备离线 → 返回空，等它上线由 on_connect 补推。"""
+    online = set(get_active_clients())
+    claiming = get_claiming_device_ids()
+
+    def _usable(cid):
+        return bool(cid) and cid in claiming and cid in online
+
+    if _usable(prefer_client):
+        return prefer_client, "调用方指定"
+    try:
+        conn = get_db()
+        row = conn.execute(
+            "SELECT o.target_client FROM order_files of JOIN orders o ON of.order_id = o.id"
+            " WHERE of.file_id = ? AND o.target_client != ''"
+            " AND of.status IN ('scheduled', 'downloading', 'waiting', 'queued', 'printing', 'accepted')"
+            " ORDER BY of.id DESC LIMIT 1",
+            (file_id,),
+        ).fetchone()
+        conn.close()
+        if row and _usable(row["target_client"]):
+            return row["target_client"], "订单目标设备"
+    except Exception:
+        pass
+    for cid in claiming:
+        if cid in online:
+            return cid, "任一在线接单设备"
+    return "", "无在线接单设备"
+
+
+def request_page_analysis(file_id: str, file_name: str, prefer_client: str = "") -> bool:
+    """请求本地打印工具下载文件并分析页数。成功推送返回 True。
+
+    prefer_client：优先由哪台设备分析（前端当前选中的接单设备 / 刚上线的设备）；
+    为空时按 _resolve_analysis_client 的优先级（订单目标设备 → 任一在线接单设备）选。"""
+    client_id, why = _resolve_analysis_client(prefer_client or "", file_id)
     if not client_id:
-        print(f"  [PAGE] 无启用接单的在线打印机，跳过页数分析请求")
+        print(f"  [PAGE] {why}，跳过页数分析请求: {file_name} (file_id={file_id[:8]}...)")
         return False
 
     # 幽灵文件校验：物理文件已清理/路径已清空 → 跳过（下载必然 404，
@@ -3393,6 +3434,8 @@ def request_page_analysis(file_id: str, file_name: str) -> bool:
         file_md5 = prow["md5"] or ""
     except Exception:
         return False
+
+    print(f"  [PAGE] 分析设备: {client_id}（{why}）→ {file_name}")
 
     # 统一去重（30s）：on_connect 补推 / 前端 file_page 轮询触发 / 上传共用此字典，
     # 避免同一文件在短时间内被多个路径重复推送（"补推 + 轮询"双保险不能变成双推）。
@@ -3643,8 +3686,11 @@ def get_file_page(file_id):
         fname = row["original_name"] or ""
         ext = os.path.splitext(fname)[1].lower()
         if ext in (".doc", ".docx"):
+            # 前端把当前选中的接单设备带上来 → 优先由它分析（用户选了哪台就哪台下载/转换）；
+            # 目标设备离线时 _resolve_analysis_client 会退回订单目标/任一在线接单设备
+            prefer_client = (request.args.get("target_client_id", "") or "").strip()[:64]
             # 统一防抖在 request_page_analysis 内部：30s 内已被补推/轮询推过则跳过
-            request_page_analysis(file_id, fname)
+            request_page_analysis(file_id, fname, prefer_client=prefer_client)
     # v4.4：PDF 等后端可直接数页的类型，若历史/异常导致页数缺失，轮询时服务端补数——
     # 不依赖本地打印工具（本地工具离线也不影响这类文件确认页数）
     # P1: sqlite3.Row 既没有 .get()（AttributeError），也不支持字段赋值（TypeError）——
@@ -4314,8 +4360,10 @@ def upload_file():
 
     # 对需要本地工具分析的文档格式，请求直连的打印客户端下载并分析页数
     # 但若同 MD5 已有验证页数，跳过分析
+    # prefer：前端当前选中的接单设备（用户选了哪台就哪台分析；离线则退回订单目标/任一在线接单设备）
     if page_count == 0 and ext_lower in ("doc", "docx") and not cached_page_verified:
-        request_page_analysis(file_id, f.filename)
+        prefer_client = (request.form.get("target_client_id", "") or "").strip()[:64]
+        request_page_analysis(file_id, f.filename, prefer_client=prefer_client)
 
     print(f"文件上传: {f.filename} -> {file_path} (id={file_id}, pages={page_count}, reused={reused})")
 

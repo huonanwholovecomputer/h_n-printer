@@ -37,8 +37,12 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
 - **自定义滚动引擎**: index 和 me 页面都实现了手写的橡皮筋物理滚动（`_initScrollEngine` / `_startPhysics` / `_snapBack`），通过 `translateY` 驱动，含惯性衰减、阻尼过拉、方向锁定。非原生 scroll-view。小程序侧实现在 **WXS**（`utils/scroll.wxs`，视图层 rAF+setStyle，0 setData），APP 侧是同构的 JS `FlingEngine`（`www/app.js`）。
 - **嵌套滚动接力（内层文件列表 ↔ 外层页面）**: 首页文件列表是**有界 scroll-view**（内容高 > 列表高时可内部滚动），手势落到列表内时默认让位原生；滚到列表**贴顶/贴底**后，必须把滚动交给外层页面接管，否则手指一直被列表吞掉、整页滚不动；反向（外层已到边界、手指反向拖）再交还内层。两端同口径：
   - 小程序：逻辑层 `bindscroll` → `_refreshListEdges`（仅贴边状态翻转时 setData）→ `scrollConfig.listAtTop/listAtBottom` → WXS `touchmove` 据此决定让原生 / 外层接管。`.scroller` 只驱动 transform，列表为原生滚动；`_measure` 额外 `scrollOffset()` 同步边界，避免内容增减后状态失效。
+    ⚠ **必须用滚动事件里的真实 `scrollHeight` 判定是否到底**：`FILE_CARD_HEIGHT_RPX` 是**估算常量**（Chromium 实测比真实渲染高 4~7%），拿它算 `maxScroll` 会恒大于真实值 → `atBottom` 永远为 false → 内层滚到底后外层永不接管（"滑动列表带不动页面"的真实根因）。`_fileListRealPx` 缓存实测值，取不到才退回常量估值；`listOverflow=false`（内容不足一屏）时两边直接置贴边。
   - APP：`FlingEngine.onTouchMove` 读内层元素**实时** `scrollTop` 判定；`.scroller.js-scroll` 的 `touch-action` 必须是 **`pan-y`** 而非 `none` —— `touch-action` 取"元素 + 祖先交集"，祖先写 `none` 会让内层真滚动容器彻底滚不动（手势既滚不了列表也滚不了页面），引擎靠每帧 `preventDefault` 在自己接管的范围内取消原生滚动。
-  - 验收：`node tests/verify_nested_scroll_handoff.js`（加载真实 `scroll.wxs` 与从 `app.js` 抽取的真实 `FlingEngine` 类，逐帧喂手势断言双向接力）。
+    ⚠ **起手在内层可滚动容器时必须把 `touchmove` 切成 passive**（`FlingEngine._usePassiveNested`，touchend 恢复）：祖先挂着非 passive 的 `touchmove` 会让浏览器无法把内层滚动交给合成器线程（每帧等 JS），表现为"滑到文件列表区域特别卡"。被动回调里仍按 `scrollTop` 判边界并驱动外层，只是不 `preventDefault`（边界处内层本就滚不动、祖先也不可滚，无冲突）。`.file-list-scroll` / `.wheel-viewport` 另加 `will-change: transform` 独立合成层，滚动不重绘外层那个被 transform 驱动的大层。
+  - 验收：`node tests/verify_nested_scroll_handoff.js`（加载真实 `scroll.wxs`、真实 `index.js` 与从 `app.js` 抽取的真实 `FlingEngine`：双向接力、真实 scrollHeight 判定 + 常量估值反证、passive 切换/恢复）。
+- **文件卡片列表 key 与入场动画**: `wx:for` 的 `wx:key` 必须是稳定身份 **`_uid`**（不是 `index`）—— 用 index 时删中间卡片后，被删那张的节点会被就地复用给上移的卡片，节点 class 从 `card-removing`（cardRemove）变成 `card-entering`（cardExpand/cardFadeIn）→ animation-name 变化 → **入场动画重播**（"删除后下方卡片挪上来又播了一次入场"）。同时 `entering` 必须可靠清除：添加路径按 uid 清（不能按索引，删除后索引已前移）、重印恢复路径也要清（旧实现从不清 → 卡片永久挂 `card-entering`）。APP 侧对应问题是"整表 `innerHTML` 重渲染会让 `card-entering` 重播"：上传进度改为只更新 `.upload-pct`/`.progress-fill` 两个节点（`updateUploadProgressDOM`），不再每 500ms 重建卡片 DOM。
+  - 验收：`node tests/verify_file_card_lifecycle.js`。
 - **自定义 tabBar**: `custom-tab-bar/` 组件。
 - **多文件上传**: 每个文件独立进度条（`wx.uploadFile` + `onProgressUpdate`），支持上传中移除。
 - **API 地址**: `utils/config.js` 中的 `BASE_URL`，部署时修改。
@@ -123,6 +127,20 @@ bash backup.sh  # crontab 每天凌晨3点
 - 前端在小程序 `pages/index/index.js`（`_checkPriceFiles` / `_isFilePriceReliable`）与 APP `www/print.js`（`checkPriceFiles` / `isFilePriceReliable`）两处同口径校验「复制价格 / 复制详细价格」：只要有一个文件不可信 → **不写剪贴板**，弹「需打印的文件中包含X类型，且页数未完成计算，价格计算无效」；接管设备离线时文案额外点明离线。成功弹窗内也同步亮出该提示。
 - 页数在提交后才回报 → 轮询成功处调 `_applyPageCountToOrder` / `applyPageCountToOrder` 写回提交快照（`_lastOrderResult.files`），拦下自动解除、提示消失（后端 `page_count_result` → `_recalc_prices_for_file` 已回溯重算订单价，此时复制到的就是实收价）。
 - 验收：`node tests/verify_copy_price_page_guard.js`（真实源码 + 桩环境：离线 Word、md、在线未返回、已验证放行、PDF/图片、混合订单、页数回报后解除）。
+
+### 页数分析的设备归属（谁下载 / 转 PDF / 数页）
+
+页数分析要把**整份文件**下载到某台机器、用 Word/WPS 转 PDF 才能数页，所以"发给谁"有成本，不能随便挑第一台在线设备（线上反馈：选了离线设备 A，Word 被在线设备 B 拿去转换）。`request_page_analysis(file_id, file_name, prefer_client)` 的优先级：
+
+1. **调用方指定**：前端当前选中的接单设备（`/api/upload` 的表单字段 `target_client_id`、`/api/file_page/<id>?target_client_id=`）；`on_connect` 补推时传的是**刚上线的设备**（谁上线谁分析自己的待分析文件）。
+2. **该文件活跃订单的目标设备**（`order_files` ⋈ `orders.target_client`）—— 谁接这单谁分析。
+3. **兜底**：任一在线接单设备（文件与订单无关、或指定设备离线时；早点拿到页数对用户更有价值）。无在线接单设备 → 不推送，等设备上线由 `on_connect` 补推。
+
+相关事实（`tests/verify_analysis_routing.py` 全部钉住）：
+
+- **打印任务严格按订单目标设备分发**：`process_pending_orders` 里目标设备未在线/未接单 → 保持 `queued` 等它上线，**绝不推给其它在线设备**（不会"被在线设备抢打"）。
+- **页数是文件级的**（`files.page_count` + MD5 索引，`page_count_verified`），任何设备分析出来全站复用；离线设备上线后拿到的是服务端页码，打印时按需从云端下载 + 本地转 PDF（各机独立缓存，源文件 MD5 命中则跳过下载；分析请求的 `source_md5` 也让它能直接命中自己的缓存）。
+- 分析请求是**按需下载**、临时的：本地工具下载到 `%TEMP%\hn_analyze_*` 用完即删，只留下它自己转换出的 PDF 缓存（不构成"文件被搬走/接管"）。
 
 ## 文件预览（两端同口径，零后端依赖）
 
