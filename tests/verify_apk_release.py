@@ -121,6 +121,9 @@ if "print.js" in packed:
           and "function closePreviewBody()" in js and "PREVIEW_MAX_CHARS = 20000" in js)
     check("APK 内 print.js 卡片渲染出预览入口",
           'class="file-preview-btn" data-action="preview"' in js)
+    # 上传进度只改进度节点（2026-10）：整表重渲染会让 card-entering 每 500ms 重播一次入场动画
+    check("APK 内 print.js 上传进度不整表重渲染（updateUploadProgressDOM）",
+          "function updateUploadProgressDOM(f)" in js and "updateUploadProgressDOM(f);" in js)
 
 # 预览层 markup（2026-10）
 if "index.html" in packed:
@@ -136,6 +139,11 @@ if "app.js" in packed:
           "this.el.style.touchAction = 'pan-y'" in app_js and "this.el.style.touchAction = 'none'" not in app_js)
     check("APK 内 FlingEngine 含双向嵌套滚动接力（_nestedEl + 交还内层）",
           "_nestedEl" in app_js and "交还内层" in app_js)
+    # 卡顿修复（2026-10）：起手在内层可滚容器时把 touchmove 切成 passive
+    # （祖先挂非 passive touchmove 会让内层滚动只能走主线程 → 滑到列表区域卡）
+    check("APK 内 FlingEngine 内层手势切 passive 监听（_usePassiveNested）",
+          "_usePassiveNested(enable)" in app_js and "onTouchMovePassive(e)" in app_js
+          and "passive: true" in app_js and "this._usePassiveNested(false)" in app_js)
 if "styles.css" in packed:
     css = z.read(packed["styles.css"]).decode("utf-8", "replace")
     check("APK 内 styles.css 的 .scroller.js-scroll 为 touch-action: pan-y",
@@ -143,6 +151,8 @@ if "styles.css" in packed:
     check("APK 内 styles.css 含预览层样式且层叠高于悬浮 tabBar",
           ".preview-sheet {" in css and ".preview-text {" in css
           and ".preview-mask {" in css and "z-index: 10000;" in css)
+    check("APK 内 styles.css 内层列表为独立合成层（will-change: transform）",
+          ".file-list-scroll {" in css and "will-change: transform;" in css)
 
 print("\n" + "=" * 52)
 print("APK 校验:", "全部通过 ✅" if ok_all else "存在失败 ❌")
