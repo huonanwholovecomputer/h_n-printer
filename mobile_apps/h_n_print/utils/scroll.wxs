@@ -56,7 +56,10 @@ function ensureState(state) {
     state.lastFlingT = 0;
     state.spring = null;
     state.nested = false;
+    state.nestedAllowed = false;
     state.listOverflow = false;
+    state.listAtTop = true;
+    state.listAtBottom = false;
     state.touching = false;
     state.cbBucket = -1;
     state.closePicker = false;
@@ -421,6 +424,9 @@ module.exports = {
     state.scrollerH = newValue.scrollerH || 0;
     state.contentH = newValue.contentH || 0;
     state.listOverflow = !!newValue.listOverflow;
+    // 内层列表贴边状态（逻辑层 bindscroll 同步）：null/undefined 时保持原值，避免误判成"贴边"导致抢滚
+    if (newValue.listAtTop !== undefined) state.listAtTop = !!newValue.listAtTop;
+    if (newValue.listAtBottom !== undefined) state.listAtBottom = !!newValue.listAtBottom;
     state.closePicker = !!newValue.closePicker;
     // 内容变短（maxY 减小）：阻尼弹簧实时跟随目标，平滑收到新底部。
     // 弹簧对位置/速度积分（无离散跳变）→ 无论何时收起（静止/滚动中/弹回中）
@@ -470,12 +476,15 @@ module.exports = {
     }
     // 内层有界文件列表：触点落在其可视区内且列表确实可滚 → 让给原生
     state.nested = false;
+    state.nestedAllowed = false;
     if (state.listOverflow) {
       var list = ownerInstance.selectComponent('.file-list-scroll');
       if (list) {
         var rect = list.getBoundingClientRect();
         if (rect && t0.clientY >= rect.top && t0.clientY <= rect.bottom) {
           state.nested = true;
+          // 记住"本手势起于内层列表"：外层滚到边界后反向拖拽时要能交还内层（双向滚动接力）
+          state.nestedAllowed = true;
         }
       }
     }
@@ -502,10 +511,36 @@ module.exports = {
       }
     }
     if (state.horizontal) return true;
-    if (state.nested) return true; // 内层原生滚动，外层不接管
     var now = getDate().getTime();
     var ddy = t0.clientY - state.lastY;
     var dt = Math.max(1, now - state.lastT);
+    // ---- 嵌套滚动接力（内层文件列表 ↔ 外层页面）----
+    // ddy < 0：手指上滑（内容上移，外层 y 增大 / 内层滚到底）
+    // ddy > 0：手指下滑（内容下移，外层 y 减小 / 内层滚到顶）
+    // 判据全部来自逻辑层同步的贴边状态与当前 y，不需要内层 scrollTop（WXS 读不到）。
+    if (state.nested) {
+      if (ddy === 0) { state.lastY = t0.clientY; state.lastT = now; return true; }
+      // 内层还能往手势方向滚 → 继续让给原生
+      var innerCanGo = ddy < 0 ? !state.listAtBottom : !state.listAtTop;
+      if (innerCanGo) {
+        state.lastY = t0.clientY;
+        state.lastT = now;
+        return true;
+      }
+      state.nested = false; // 内层已贴边 → 外层接管（同一次手势内无缝续滚，不再卡在列表里）
+    } else if (state.nestedAllowed && ddy !== 0) {
+      // 反向接力：外层已到边界、且手势方向回到内层能滚的方向 → 交还内层
+      var outerBlocked = ddy > 0
+        ? state.y <= state.minY + 0.5
+        : (state.maxY > 0 && state.y >= state.maxY - 0.5);
+      var innerCanReturn = ddy > 0 ? !state.listAtTop : !state.listAtBottom;
+      if (outerBlocked && innerCanReturn) {
+        state.nested = true;
+        state.lastY = t0.clientY;
+        state.lastT = now;
+        return true;
+      }
+    }
     if (Math.abs(ddy) > 0.5) state.moved = true;
     state.y -= ddy;
     var inst = -ddy / dt;
@@ -529,6 +564,7 @@ module.exports = {
     }
     state.trackId = -1;
     state.nested = false;
+    state.nestedAllowed = false;
     startPhysics(state, ownerInstance);
   },
   onCmd: function (newValue, oldValue, ownerInstance, instance) {

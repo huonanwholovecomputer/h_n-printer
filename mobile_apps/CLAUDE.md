@@ -34,7 +34,11 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
 ## 微信小程序 (`h_n_print/`)
 
 - **页面**: `pages/index/index`(首页，文件选择+上传+提交), `pages/me/me`(个人中心，订单列表+许可密钥+管理员面板), `pages/order-detail/order-detail`, `pages/my-performance/my-performance`(月度统计), `pages/authorized-users/authorized-users`(历史授权用户列表，管理员/超管可见), `pages/user-orders/user-orders`(按 openid/来源查看订单列表，含分页与状态过滤，供管理员查看某用户/本地任务的打印记录)
-- **自定义滚动引擎**: index 和 me 页面都实现了手写的橡皮筋物理滚动（`_initScrollEngine` / `_startPhysics` / `_snapBack`），通过 `translateY` 驱动，含惯性衰减、阻尼过拉、方向锁定。非原生 scroll-view。
+- **自定义滚动引擎**: index 和 me 页面都实现了手写的橡皮筋物理滚动（`_initScrollEngine` / `_startPhysics` / `_snapBack`），通过 `translateY` 驱动，含惯性衰减、阻尼过拉、方向锁定。非原生 scroll-view。小程序侧实现在 **WXS**（`utils/scroll.wxs`，视图层 rAF+setStyle，0 setData），APP 侧是同构的 JS `FlingEngine`（`www/app.js`）。
+- **嵌套滚动接力（内层文件列表 ↔ 外层页面）**: 首页文件列表是**有界 scroll-view**（内容高 > 列表高时可内部滚动），手势落到列表内时默认让位原生；滚到列表**贴顶/贴底**后，必须把滚动交给外层页面接管，否则手指一直被列表吞掉、整页滚不动；反向（外层已到边界、手指反向拖）再交还内层。两端同口径：
+  - 小程序：逻辑层 `bindscroll` → `_refreshListEdges`（仅贴边状态翻转时 setData）→ `scrollConfig.listAtTop/listAtBottom` → WXS `touchmove` 据此决定让原生 / 外层接管。`.scroller` 只驱动 transform，列表为原生滚动；`_measure` 额外 `scrollOffset()` 同步边界，避免内容增减后状态失效。
+  - APP：`FlingEngine.onTouchMove` 读内层元素**实时** `scrollTop` 判定；`.scroller.js-scroll` 的 `touch-action` 必须是 **`pan-y`** 而非 `none` —— `touch-action` 取"元素 + 祖先交集"，祖先写 `none` 会让内层真滚动容器彻底滚不动（手势既滚不了列表也滚不了页面），引擎靠每帧 `preventDefault` 在自己接管的范围内取消原生滚动。
+  - 验收：`node tests/verify_nested_scroll_handoff.js`（加载真实 `scroll.wxs` 与从 `app.js` 抽取的真实 `FlingEngine` 类，逐帧喂手势断言双向接力）。
 - **自定义 tabBar**: `custom-tab-bar/` 组件。
 - **多文件上传**: 每个文件独立进度条（`wx.uploadFile` + `onProgressUpdate`），支持上传中移除。
 - **API 地址**: `utils/config.js` 中的 `BASE_URL`，部署时修改。

@@ -66,7 +66,8 @@
           </view>
 
           <!-- File Cards（有界原生滚动：避免卡片堆高撑破外层 transform GPU 层的微信布局上限）-->
-          <scroll-view class="file-list-scroll" scroll-y enhanced show-scrollbar="{{false}}" style="height: {{fileListHeight}}px;">
+          <!-- bindscroll：把内层列表的边界状态（贴顶/贴底）同步给 WXS 引擎，用于「内层滚到边 → 外层接管」的滚动接力 -->
+          <scroll-view class="file-list-scroll" scroll-y enhanced show-scrollbar="{{false}}" style="height: {{fileListHeight}}px;" bindscroll="onFileListScroll">
           <view
             wx:for="{{selectedFiles}}"
             wx:key="index"

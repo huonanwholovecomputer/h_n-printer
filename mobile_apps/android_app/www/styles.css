@@ -835,10 +835,15 @@ body {
   min-height: 0;
 }
 
-/* JS 惯性引擎接管时：外层裁剪 + 禁用浏览器手势，内容走 transform（可调曲线原型） */
+/* JS 惯性引擎接管时：外层裁剪，内容走 transform（可调曲线原型）。
+   touch-action 必须是 pan-y 而不是 none：外层引擎虽然自己驱动 transform，
+   但内层 .file-list-scroll / .wheel-viewport 是**真滚动容器**，需要浏览器原生纵向滚动
+   （引擎在它们的边界处按事件 preventDefault 接管外层 —— 见 FlingEngine.onTouchMove 的
+   嵌套滚动分支）。touch-action 按"元素 + 祖先交集"生效，祖先写 none 会让内层彻底滚不动，
+   手势既滚不了列表也滚不了页面，卡死在内层。 */
 .scroller.js-scroll {
   overflow: hidden;
-  touch-action: none;
+  touch-action: pan-y;
 }
 .js-scroll .scroll-content {
   will-change: transform;

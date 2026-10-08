@@ -306,9 +306,10 @@ function runMiniProgram() {
   page._fileUidSeq = 0;
   page.createSelectorQuery = () => ({
     selectAll: () => ({ boundingClientRect() { return this; } }),
-    select: () => ({ boundingClientRect() { return this; } }),
+    // scrollOffset：_measure 用它同步内层文件列表的滚动位置（嵌套滚动接力），桩需与真实 API 对齐
+    select: () => ({ boundingClientRect() { return this; }, scrollOffset() { return this; } }),
     in: function () { return this; },
-    exec(cb) { cb && cb([[], null]); },
+    exec(cb) { cb && cb([[], null, { scrollTop: 0 }]); },
   });
   page.animate = (sel, kf, dur, cb) => { if (cb) cb(); };
   page.getTabBar = () => null;

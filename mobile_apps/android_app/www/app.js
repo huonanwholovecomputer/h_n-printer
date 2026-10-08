@@ -294,6 +294,7 @@ class FlingEngine {
     this._directionLocked = false;
     this._horizontalGesture = false;
     this._nestedScroll = null;
+    this._nestedEl = null;   // 本手势起于哪个内层滚动容器（外层到边界后交还内层用）
     this._wheelTimer = null;
     this._measureTimer = null;
     this._prevFlingVel = 0;
@@ -301,10 +302,13 @@ class FlingEngine {
     this._spring = null; // 边界弹簧状态 { target, dir, x, vx, xMax, compressing, t0, durR }
     this._destroyed = false;
 
-    // 接管滚动：外层裁剪 + 禁用浏览器手势，内容用 transform 驱动
+    // 接管滚动：外层裁剪 + 内容用 transform 驱动。
+    // touch-action 用 pan-y（不是 none）：内层 .file-list-scroll 等真滚动容器需要浏览器
+    // 原生纵向滚动才能滚（touch-action 取"元素+祖先"交集，祖先 none 会让内层完全滚不动，
+    // 手势卡死在内层）；引擎在自己接管的每一帧 preventDefault 取消原生滚动。
     this.el.classList.add('js-scroll');
     this.el.style.overflow = 'hidden';
-    this.el.style.touchAction = 'none';
+    this.el.style.touchAction = 'pan-y';
 
     this._debouncedMeasure = () => {
       if (this._measureTimer) clearTimeout(this._measureTimer);
@@ -376,8 +380,11 @@ class FlingEngine {
   // ---- 触摸拖动 ----
 
   onTouchStart(e) {
-    // 内层可滚动列表（文件列表 / 滚轮选择器）：能滚时交给原生
-    this._nestedScroll = (e.target && e.target.closest && e.target.closest('.file-list-scroll, .wheel-viewport')) || null;
+    // 内层可滚动列表（文件列表 / 滚轮选择器）：能滚时交给原生（同小程序 WXS 的口径）
+    const nestedEl = (e.target && e.target.closest && e.target.closest('.file-list-scroll, .wheel-viewport')) || null;
+    this._nestedScroll = nestedEl;
+    // 本手势起于内层：外层滚到边界后反向拖拽时交还内层（双向接力）
+    this._nestedEl = nestedEl;
     const touches = e.touches || [];
     if (touches.length > 0) {
       this._startX = touches[0].clientX;
@@ -418,18 +425,35 @@ class FlingEngine {
     const cur = touches[0];
     const now = Date.now();
     const ddy = cur.clientY - this._lastY;
-    // 嵌套滚动：内层列表可继续滚时让给原生，到边界后引擎接管外层
-    if (this._nestedScroll) {
-      const el = this._nestedScroll;
-      const maxTop = el.scrollHeight - el.clientHeight;
-      const canScrollDown = ddy < 0 && el.scrollTop < maxTop - 0.5;
-      const canScrollUp = ddy > 0 && el.scrollTop > 0.5;
-      if (canScrollDown || canScrollUp) {
-        this._lastY = cur.clientY;
-        this._lastT = now;
-        return;
+    // 嵌套滚动接力（与小程序 WXS scroll.wxs 同口径）：
+    // ddy < 0 手指上滑（外层 y 增大 / 内层滚到底）；ddy > 0 手指下滑（外层 y 减小 / 内层滚到顶）。
+    // 内层还能往手势方向滚 → 让原生滚；贴边 → 引擎接管外层；外层到边界反向 → 再交还内层。
+    // 只在真正位移（>=0.5px）时判定：ddy≈0 的重复事件不能当成"贴边"，否则列表滚到一半就被抢走。
+    if (Math.abs(ddy) >= 0.5) {
+      if (this._nestedScroll) {
+        const el = this._nestedScroll;
+        const maxTop = el.scrollHeight - el.clientHeight;
+        const innerCanGo = ddy < 0 ? el.scrollTop < maxTop - 0.5 : el.scrollTop > 0.5;
+        if (innerCanGo) {
+          this._lastY = cur.clientY;
+          this._lastT = now;
+          return;
+        }
+        this._nestedScroll = null; // 内层到边界 → 引擎接管
+      } else if (this._nestedEl) {
+        const el = this._nestedEl;
+        const outerBlocked = ddy > 0
+          ? this.y <= this.minY + 0.5
+          : (this.maxY > 0 && this.y >= this.maxY - 0.5);
+        const maxTop = el.scrollHeight - el.clientHeight;
+        const innerCanReturn = ddy > 0 ? el.scrollTop > 0.5 : el.scrollTop < maxTop - 0.5;
+        if (outerBlocked && innerCanReturn) {
+          this._nestedScroll = el; // 交还内层（本帧不 preventDefault → 原生继续滚）
+          this._lastY = cur.clientY;
+          this._lastT = now;
+          return;
+        }
       }
-      this._nestedScroll = null; // 内层到边界 → 引擎接管
     }
     e.preventDefault();
     const dt = Math.max(1, now - this._lastT);
@@ -453,6 +477,8 @@ class FlingEngine {
     const touches = e.touches || [];
     if (touches.length > 0) { this._trackId = null; return; } // 还有手指按住，等全部抬起再启动惯性
     this._trackId = null;
+    this._nestedScroll = null;
+    this._nestedEl = null;
     this.startPhysics();
   }
 

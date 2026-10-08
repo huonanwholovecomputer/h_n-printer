@@ -223,7 +223,9 @@ Component({
     countdownMinWheelIndex: 5,
     countdownSecWheelIndex: 0,
     countdownWheelValue: [5, 0],
-    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false },
+    // listAtTop/listAtBottom：内层文件列表是否已贴顶/贴底（bindscroll 同步）——
+    // WXS 引擎据此实现「内层滚到边界 → 外层接管」的滚动接力，避免手势卡死在列表里
+    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false, listAtTop: true, listAtBottom: false },
     // 滑块拖动状态：segDrag = 分段滑块指示条位移百分比（>=0 拖动中），swDrag = 开关拇指位移 px（>=0 拖动中）
     segDrag: {},
     swDrag: {},
@@ -650,6 +652,11 @@ Component({
       this._fileListPx = 0   // 文件列表累计占用高度（有界 scroll-view，达到上限后不再增长）
       this._maxY = 0
 
+      // 内层文件列表边界状态（供 WXS 判断「是否该把滚动让回外层」）+ 其内容高（px，算 maxScroll 用）
+      this._listAtTop = true
+      this._listAtBottom = false
+      this._fileListContentPx = 0
+
       this._measureTimer = null  // 去抖测量句柄
 
       // 底部额外滚动留白（提交按钮与 tabBar 顶边之间的小间隙）
@@ -693,6 +700,7 @@ Component({
       const contentPx = Math.round(sumRpx * ((windowWidth || 375) / 750))
       // 内层文件列表是否真的可滚（内容高 > 可视高）：可滚时 WXS 让位给原生
       const listOverflow = contentPx > (this.data.fileListHeight || 0) + 1
+      this._fileListContentPx = contentPx   // 供 _refreshListEdges 算 maxScroll（内层内容高）
       this.setData({
         scrollConfig: {
           minY: 0,
@@ -700,8 +708,32 @@ Component({
           scrollerH: this._scrollerH || 0,
           contentH: this._contentH || 0,
           listOverflow,
+          // 内层列表是否贴顶/贴底：贴边后继续同向拖拽 → WXS 把滚动交给外层；
+          // 反向回到外层边界 → 再交还内层（双向滚动接力）
+          listAtTop: !!this._listAtTop,
+          listAtBottom: !!this._listAtBottom,
         },
       })
+    },
+
+    // 内层文件列表滚动：同步「贴顶/贴底」状态到 WXS 引擎（仅在翻转时 setData，滚动过程几乎零开销）
+    onFileListScroll(e) {
+      this._refreshListEdges(e && e.detail ? e.detail.scrollTop : 0)
+    },
+
+    // 依据内层列表当前 scrollTop 刷新贴边状态；变化时才推 scrollConfig。
+    // maxScroll = 内层内容高 - 列表可视高（列表高度为显式 fileListHeight，内容高用卡片高度累加值）
+    _refreshListEdges(scrollTop) {
+      const top = Math.max(0, Number(scrollTop) || 0)
+      const viewH = this.data.fileListHeight || 0
+      const contentPx = this._fileListContentPx || 0
+      const maxScroll = Math.max(0, contentPx - viewH)
+      const atTop = top <= 0.5
+      const atBottom = contentPx > 0 && viewH > 0 && top >= maxScroll - 0.5
+      if (atTop === this._listAtTop && atBottom === this._listAtBottom) return
+      this._listAtTop = atTop
+      this._listAtBottom = atBottom
+      this._pushScrollConfig()
     },
 
     // WXS 分桶回调（每 100px 一次），供回顶按钮等阈值类 UI 使用；本页暂不消费
@@ -740,6 +772,8 @@ Component({
       const q = this.createSelectorQuery()
       q.select('.scroller').boundingClientRect()
       q.select('.scroll-content').boundingClientRect()
+      // 内层列表当前滚动位置：内容增减/列表高度变化后同步贴边状态（bindscroll 不一定会再触发）
+      q.select('.file-list-scroll').scrollOffset()
       q.exec((res) => {
         if (!res || !res[0] || !res[1]) return
         const vp = res[0].height || 0
@@ -750,6 +784,8 @@ Component({
         this._contentH = Math.max(ch, this._contentEst)
         this._maxY = Math.max(0, this._contentH - vp + this._bottomPad + this._tabOverlayPx)
         this._pushScrollConfig()
+        const listOffset = res[2] || {}
+        if (typeof listOffset.scrollTop === 'number') this._refreshListEdges(listOffset.scrollTop)
       })
     },
 
