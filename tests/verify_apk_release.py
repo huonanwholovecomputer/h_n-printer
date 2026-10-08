@@ -153,6 +153,10 @@ if "styles.css" in packed:
           and ".preview-mask {" in css and "z-index: 10000;" in css)
     check("APK 内 styles.css 内层列表为独立合成层（will-change: transform）",
           ".file-list-scroll {" in css and "will-change: transform;" in css)
+    # 深色模式滑轨（2026-10）：分段控件轨道底色 rgba(60,60,67,0.08) 在深色卡片上完全同色
+    check("APK 内 styles.css 深色滑轨有独立覆盖（内凹轨道）",
+          ".theme-dark .duplex-toggle," in css and ".theme-dark .img-ori-toggle {" in css
+          and "rgba(0, 0, 0, 0.24)" in css)
 
 print("\n" + "=" * 52)
 print("APK 校验:", "全部通过 ✅" if ok_all else "存在失败 ❌")
