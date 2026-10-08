@@ -6205,9 +6205,11 @@ body.theme-dark #view-user-orders .page-size-dropdown {
 }
 
 .preview-mask {
-  /* 覆盖 .modal-mask 的居中布局：预览是从底部弹出的大抽屉 */
+  /* 覆盖 .modal-mask 的居中布局：预览是从底部弹出的大抽屉；
+     同时压过悬浮 tabBar（.tab-bar z-index: 9999，否则抽屉底部被 tabBar 遮住正文） */
   align-items: flex-end;
   justify-content: center;
+  z-index: 10000;
 }
 .preview-sheet {
   width: 100%;

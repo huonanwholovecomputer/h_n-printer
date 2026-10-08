@@ -135,9 +135,12 @@ bash backup.sh  # crontab 每天凌晨3点
 | txt / csv / md | `getFileSystemManager().readFile(utf8)` → 预览层 `<text>`（`white-space: pre-wrap`） | `File.text()`/FileReader → 预览层 `<pre>`（内容 `escHtml` 转义） |
 
 - 入口：卡片头部名称区可点 + 右侧「预览」小胶囊（`.file-preview-btn`，**在既有 header 行内、不新增行**，不破坏「每类型卡片恒定高度」前提）。
+- 层叠：预览遮罩 `z-index: 10000`，**必须高于悬浮 tabBar**（`.tab-bar`/`custom-tab-bar` 都是 9999）——否则底部抽屉正文被 tabBar 盖住（渲染验收脚本已把这条钉住）。
 - 大文件保护：文本类 > `PREVIEW_MAX_BYTES`(2MB) 直接提示不读；预览最多 `PREVIEW_MAX_CHARS`(20000) 字符并显示「仅预览前面部分内容」。
 - APP 预览层复用 `.modal-mask`（点遮罩关闭），`closeModal('previewMask')` 里统一回收 objectURL/清空内容。
-- 验收：`node tests/verify_file_preview.js`（两端真实源码 + 桩环境：分派、openDocument 失败重试、截断、大文件、云端订单文案、objectURL 回收 + 接线核对）。
+- 验收：`node tests/verify_file_preview.js`（两端真实源码 + 桩环境：分派、openDocument 失败重试、截断、大文件、云端订单文案、objectURL 回收 + 接线核对）；
+  `node tests/verify_preview_render.mjs`（Playwright + 真实 `index.html`：截图到 `截图展示/文件预览/`、断言 header 行高不变、层叠顺序、图片真解码、截断提示）。
+  ⚠ 该脚本**必须先把 `BASE_URL` 覆盖到本地桩**（`addInitScript` 写 `localStorage.hn_base_url` + `page.route('**/api/**')` 兜底）——app 的 `DEFAULT_BASE_URL` 是线上域名，不覆盖会打到生产接口（脚本最后一项断言全程无外部请求）。
 
 ## 关键文件索引
 

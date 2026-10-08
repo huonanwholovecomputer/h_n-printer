@@ -1583,7 +1583,9 @@ picker-view-column {
   left: 0;
   right: 0;
   bottom: 0;
-  z-index: 3000;
+  /* 必须高于悬浮 tabBar（custom-tab-bar z-index: 9999）：预览是全屏遮罩，
+     低于它时抽屉底部会被 tabBar 盖住、正文被遮挡 */
+  z-index: 10000;
   background-color: rgba(0, 0, 0, 0.45);
   display: flex;
   align-items: flex-end;
