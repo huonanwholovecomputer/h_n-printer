@@ -658,6 +658,8 @@
       <text class="body-small schedule-success-text" id="successScheduleText" style="display:none"></text>
       <text class="body-small admin-print-success-text" id="successAdminPrintText" style="display:none"></text>
       <text class="body-small" id="successDefaultText" style="display:none">文件已上传，打印任务已创建</text>
+      <!-- 页数未完成计算（Word/md 等需本地转换的类型，接管设备离线时等不到）→ 价格无效 -->
+      <text class="body-small price-invalid-hint" id="successPriceHint" style="display:none"></text>
       <view class="modal-buttons">
         <button class="btn-secondary modal-half-btn" id="copyPriceBtn">复制价格</button>
         <button class="btn-primary modal-half-btn" id="copyDetailPriceBtn">复制详细价格</button>

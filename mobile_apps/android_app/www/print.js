@@ -867,6 +867,9 @@ function startPageCountPoll(f, fileId) {
           }
           // smooth：输入行/警告原地收起（过渡动画），摘要淡入，延时重绘
           normalizeAndValidateRangeLines(fileIndexOf(f), true);
+          // 提交后才返回的页数 → 同步进提交结果快照：成功弹窗里的「复制价格」
+          // 取的就是它（否则页数永远停在提交时刻的估算值，价格无效）
+          applyPageCountToOrder(fileId, pc);
           stopPageCountPoll(f);
           return;
         }
@@ -1810,6 +1813,9 @@ function doSubmit(skipPageValidation) {
       if (stEl) { stEl.textContent = st; stEl.style.display = st ? '' : 'none'; }
       if (apEl) { apEl.textContent = apText; apEl.style.display = apText ? '' : 'none'; }
       if (defEl) defEl.style.display = (st || apText) ? 'none' : '';
+      // 页数未完成计算（Word/md 等需本地转换的类型，接管设备离线时等不到）
+      // → 弹窗内先亮出提示：此时价格无效，点「复制价格」会被拦下
+      refreshPriceInvalidHint();
       openModal('successModal');
       // 对齐小程序：提交成功后先收起文件列表（保留数据），关闭弹窗时再清空
       const scroll = document.getElementById('fileListScroll');
@@ -1841,11 +1847,102 @@ function clearFilesAfterSuccess() {
   }
   const scroll = document.getElementById('fileListScroll');
   if (scroll) scroll.style.height = '';
+  // 价格提示随成功弹窗一起复位（下次提交重新判定）
+  const hintEl = document.getElementById('successPriceHint');
+  if (hintEl) { hintEl.textContent = ''; hintEl.style.display = 'none'; }
   renderFileList();
   updateFileBadge(false);
 }
 
 /* ================= 价格计算 / 复制 ================= */
+
+/* ---- 页数可信度：复制价格的前置校验（与小程序同口径）-------------------------
+
+   后端只对 PDF 能自己数页（pypdf）；Word / Markdown / TXT / CSV 都必须由**本地打印
+   工具**转换后才是真实页数，上传/提交时后端只能按 1 页兜底估算：
+     · Word（doc/docx）：上传时 page_count=0（等本地工具回报），提交订单时后端取不到
+       页数 → 按 1 页算价（app.py submit_order 的 `or 1`）；
+     · md / txt / csv：上传时被 get_file_page_count 直接按 1 页写入。
+   于是接管设备离线（等不到页数回报）时，这类文件的页数是假值，价格比实收少算。
+   对策：「复制价格 / 复制详细价格」前校验——只要有一个文件页数不可信就拒绝复制并提示。
+   可信判据：page_count > 0 且（PDF/图片由后端直接数页 → 可信；上述类型必须
+   page_count_verified=1，即本地打印工具转换回报过）。 */
+const PAGE_COUNT_LOCAL_EXTS = ['doc', 'docx', 'md', 'txt', 'csv'];
+const PAGE_COUNT_LOCAL_TYPE_LABELS = { doc: 'Word', docx: 'Word', md: 'Markdown', txt: 'TXT', csv: 'CSV' };
+
+/** 取小写扩展名（不含点）；无扩展名返回 ''。 */
+function extLowerOf(name) {
+  const n = String(name == null ? '' : name);
+  const i = n.lastIndexOf('.');
+  return i >= 0 ? n.slice(i + 1).toLowerCase() : '';
+}
+
+/** 单个文件页数是否可信（判据见上）。 */
+function isFilePriceReliable(f) {
+  const pc = Number(f && f.page_count) || 0;
+  if (pc <= 0) return false;
+  const needLocal = PAGE_COUNT_LOCAL_EXTS.indexOf(extLowerOf(f.file_name)) !== -1;
+  return needLocal ? !!f.page_count_verified : true;
+}
+
+/** 目标接管设备在线状态：true=离线 / false=在线 / null=未知（设备列表未加载时不猜）。 */
+function targetDeviceOfflineState() {
+  const devices = (typeof claimingDevices !== 'undefined' && claimingDevices) ? claimingDevices : [];
+  const id = (typeof selectedDeviceId !== 'undefined') ? selectedDeviceId : '';
+  if (id) {
+    const hit = devices.filter(d => d && d.client_id === id)[0];
+    if (hit) return hit.online === false;
+  }
+  if (devices.length) return !devices.some(d => d && d.online);
+  return null;
+}
+
+/**
+ * 复制价格前的页数校验：返回 {invalid, message}。
+ * invalid=true → 至少一个文件页数未计算完成（Word/md 等需本地转换的类型未回报页数，
+ * 接管设备离线时永远等不到）→ 价格无效，禁止复制。
+ */
+function checkPriceFiles(files) {
+  const badTypes = [];
+  const badNames = [];
+  (files || []).forEach(f => {
+    if (!f || isFilePriceReliable(f)) return;
+    badNames.push(f.file_name || '未知文件');
+    const label = PAGE_COUNT_LOCAL_TYPE_LABELS[extLowerOf(f.file_name)];
+    if (label && badTypes.indexOf(label) === -1) badTypes.push(label);
+  });
+  if (!badNames.length) return { invalid: false, message: '' };
+  const what = badTypes.length ? ('包含' + badTypes.join('、') + '类型') : ('包含「' + badNames[0] + '」');
+  const offline = targetDeviceOfflineState() === true;
+  const message = '需打印的文件中' + what + '，且页数未完成计算，价格计算无效。'
+    + (offline
+        ? '接管设备当前离线，请等设备上线并完成转换后再复制价格。'
+        : '请等本地打印工具完成转换、页数返回后再复制价格。');
+  return { invalid: true, message };
+}
+
+/** 页数在提交后才返回 → 同步进提交结果快照，使「复制价格」取到真实页数。 */
+function applyPageCountToOrder(fileId, pageCount) {
+  const d = printState._lastOrderResult;
+  if (!d || !d.files || !fileId || !(pageCount > 0)) return;
+  d.files.forEach(f => {
+    if (f && f.file_id === fileId) {
+      f.page_count = pageCount;
+      f.page_count_verified = true;
+    }
+  });
+  refreshPriceInvalidHint();
+}
+
+/** 刷新成功弹窗内的价格提示（隐藏 = 页数齐全，可正常复制价格）。 */
+function refreshPriceInvalidHint() {
+  const el = document.getElementById('successPriceHint');
+  if (!el) return;
+  const d = printState._lastOrderResult;
+  const msg = (d && d.files) ? checkPriceFiles(d.files).message : '';
+  el.textContent = msg ? ('⚠ ' + msg) : '';
+  el.style.display = msg ? '' : 'none';
+}
 
 /* 与 Python `round(x, 2)` **同口径**的取整（后端算派送费用的就是它）。
 
@@ -1976,6 +2073,9 @@ function orderEchoParams() {
 function onCopyPrice() {
   const d = printState._lastOrderResult;
   if (!d || !d.files) return;
+  // 页数未完成计算（Word/md 等）→ 价格无效：不复制、只提示
+  const guard = checkPriceFiles(d.files);
+  if (guard.invalid) { showAlert('价格暂不可复制', guard.message, '知道了'); return; }
   const p = orderEchoParams();
   let baseTotal = 0;
   let allKnown = true;
@@ -1999,6 +2099,9 @@ function onCopyPrice() {
 function onCopyDetailPrice() {
   const d = printState._lastOrderResult;
   if (!d || !d.files) return;
+  // 与「复制价格」同口径：页数未完成计算 → 明细里的金额同样是错的，不复制、只提示
+  const guard = checkPriceFiles(d.files);
+  if (guard.invalid) { showAlert('价格暂不可复制', guard.message, '知道了'); return; }
   const p = orderEchoParams();
   const lines = ['计费明细'];
   if (d.order_number) lines.push(d.order_number);

@@ -1091,10 +1091,25 @@ let _confirmCallback = null;
 function showConfirm(title, content, confirmText, confirmColor, cb) {
   document.getElementById('confirmTitle').textContent = title;
   document.getElementById('confirmContent').textContent = content;
+  // showAlert 会隐藏取消按钮 → 普通确认弹窗恢复双按钮
+  document.getElementById('confirmCancel').style.display = '';
   const btn = document.getElementById('confirmOk');
   btn.textContent = confirmText || '确定';
   btn.style.background = confirmColor || '#FF3B30';
   _confirmCallback = cb;
+  openModal('confirmModal');
+}
+
+/* 单按钮提示弹窗（对齐小程序 wx.showModal({showCancel:false})）：
+   复用 confirmModal，隐藏「取消」并让「知道了」占满整行。 */
+function showAlert(title, content, okText) {
+  document.getElementById('confirmTitle').textContent = title;
+  document.getElementById('confirmContent').textContent = content;
+  document.getElementById('confirmCancel').style.display = 'none';
+  const btn = document.getElementById('confirmOk');
+  btn.textContent = okText || '知道了';
+  btn.style.background = '#007AFF';
+  _confirmCallback = null;
   openModal('confirmModal');
 }
 

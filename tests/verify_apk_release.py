@@ -102,6 +102,8 @@ if "print.js" in packed:
         ("function fileIndexOf(f)", "异步回调现算下标（审计 🔴6）"),
         ("function pyRound2(x)", "Python 同口径取整 pyRound2（派送费 1 分差）"),
         ("replace(/ /g, '').replace(/[、，；]/g, ',')", "页码范围与后端同口径（空格删除+严格整数）"),
+        ("function checkPriceFiles(files)", "复制价格页数拦截 checkPriceFiles（页数未计算完成 → 价格无效）"),
+        ("function applyPageCountToOrder(fileId, pageCount)", "页数回报后同步提交快照（拦下自动解除）"),
     ):
         check(f"APK 内 print.js 含 {label}", marker in js)
     check("APK 内 print.js 已移除旧的索引计时器表", "_uploadTimers" not in js)
@@ -109,6 +111,8 @@ if "print.js" in packed:
           "baseTotal * (p.deliveryPercent / 100)" not in js)
     check("APK 内 print.js 已移除旧的空白→逗号替换",
           "replace(/[、，；\\s]/g, ',')" not in js)
+    check("APK 内 onCopyPrice 已挂页数校验（未计算完成不复制，改提示）",
+          "if (guard.invalid) { showAlert(" in js)
 
 print("\n" + "=" * 52)
 print("APK 校验:", "全部通过 ✅" if ok_all else "存在失败 ❌")

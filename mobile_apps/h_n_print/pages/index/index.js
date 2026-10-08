@@ -148,6 +148,27 @@ function countPagesInRange(pageRange, total) {
   return pages.size || total
 }
 
+/* ---- 页数可信度：复制价格的前置校验 -------------------------------------------
+
+   后端只对 PDF 能自己数页（pypdf）；Word / Markdown / TXT / CSV 都必须由**本地打印
+   工具**转换后才是真实页数，上传/提交时后端只能按 1 页兜底估算：
+     · Word（doc/docx）：上传时 files.page_count=0（等本地工具回报），提交订单时后端
+       取不到页数 → 按 1 页算价（app.py submit_order 的 `or 1`）；
+     · md / txt / csv：上传时被 get_file_page_count 直接按 1 页写入。
+   于是接管设备离线（等不到页数回报）时，这类文件的页数是**假值**，价格算出来比实收少。
+   对策：「复制价格 / 复制详细价格」前校验——只要有一个文件页数不可信就拒绝复制并提示。
+   可信判据：page_count > 0 且（PDF/图片由后端直接数页 → 可信；上述类型必须
+   page_count_verified=1，即本地打印工具转换回报过）。 */
+const PAGE_COUNT_LOCAL_EXTS = ['doc', 'docx', 'md', 'txt', 'csv']
+const PAGE_COUNT_LOCAL_TYPE_LABELS = { doc: 'Word', docx: 'Word', md: 'Markdown', txt: 'TXT', csv: 'CSV' }
+
+/* 取小写扩展名（不含点）；无扩展名返回 ''。 */
+function _extLower(name) {
+  const n = String(name == null ? '' : name)
+  const i = n.lastIndexOf('.')
+  return i >= 0 ? n.slice(i + 1).toLowerCase() : ''
+}
+
 Component({
   data: {
     // 多文件列表：每项 { name, size, path, fileId, uploading, progress, failed, copies }
@@ -158,6 +179,8 @@ Component({
     claimingDevices: [],
     selectedDeviceId: '',
     showSuccessModal: false,
+    // 成功弹窗内的价格提示：页数未完成计算（Word/md 等需本地转换的类型）时非空 → 价格无效，禁止复制
+    priceInvalidHint: '',
     showAccessDeniedModal: false,
     showPageCountWarning: false,   // 页数未验证警告弹窗
     showUnsupportedSkipModal: false,  // 存在不支持格式（Excel/PPT/CAD）→ 确认自动跳过的弹窗
@@ -1444,6 +1467,9 @@ Component({
                   // _normalizeAndValidateRangeLines 末尾会 _refreshSinglePage → 单页判定/文本↔网格切换均重算列表高度
                   this._normalizeAndValidateRangeLines(fileIndex)
                 }
+                // 提交后才返回的页数 → 同步进提交结果快照：成功弹窗里的「复制价格」
+                // 取的就是它（否则页数永远停在提交时刻的估算值，价格无效）
+                this._applyPageCountToOrder(fileId, pc)
                 this._stopPageCountPoll(fileUid)
                 console.log('页数轮询成功: uid=' + fileUid + ', pages=' + pc)
                 return
@@ -2878,6 +2904,9 @@ Component({
             submitting: false,
             showSuccessModal: true,
             lastOrderNumber: submitRes.data.order_number || '',
+            // 页数未完成计算（Word/md 等需本地转换的类型，接管设备离线时等不到）
+            // → 弹窗内先亮出提示：此时价格无效，点「复制价格」会被拦下
+            priceInvalidHint: this._checkPriceFiles(submitRes.data.files).message,
             lastScheduleText: this._scheduleDisplayText(),
             lastAdminPrintText: (this.data.userRole === 'admin' && this.data.adminPrintEnabled)
               ? '已标记管理员自行打印，不计入收益' : '',
@@ -2937,12 +2966,91 @@ Component({
       }
     },
 
+    // ---- 页数是否可信 / 价格是否可复制 ----
+
+    // 单个文件页数是否可信：page_count > 0，且（PDF/图片后端直接数页 → 可信；
+    // Word/md/txt/csv 必须经本地打印工具转换回报过 → page_count_verified=1 才可信）
+    _isFilePriceReliable(f) {
+      const pc = Number(f && f.page_count) || 0
+      if (pc <= 0) return false
+      const needLocal = PAGE_COUNT_LOCAL_EXTS.indexOf(_extLower(f.file_name)) !== -1
+      return needLocal ? !!f.page_count_verified : true
+    },
+
+    // 目标接管设备在线状态：true=离线 / false=在线 / null=未知（设备列表未加载时不猜）
+    _targetDeviceOfflineState() {
+      const devices = this.data.claimingDevices || []
+      const id = this.data.selectedDeviceId
+      if (id) {
+        const hit = devices.filter(d => d && d.client_id === id)[0]
+        if (hit) return hit.online === false
+      }
+      if (devices.length) return !devices.some(d => d && d.online)
+      return null
+    },
+
+    // 复制价格前的页数校验：返回 { invalid, message }。
+    // invalid=true → 至少一个文件页数未计算完成（Word/md 等需本地转换的类型未回报
+    // 页数，接管设备离线时永远等不到）→ 价格无效，禁止复制。
+    _checkPriceFiles(files) {
+      const badTypes = []
+      const badNames = []
+      ;(files || []).forEach(f => {
+        if (!f || this._isFilePriceReliable(f)) return
+        badNames.push(f.file_name || '未知文件')
+        const label = PAGE_COUNT_LOCAL_TYPE_LABELS[_extLower(f.file_name)]
+        if (label && badTypes.indexOf(label) === -1) badTypes.push(label)
+      })
+      if (!badNames.length) return { invalid: false, message: '' }
+      const what = badTypes.length ? ('包含' + badTypes.join('、') + '类型') : ('包含「' + badNames[0] + '」')
+      const offline = this._targetDeviceOfflineState() === true
+      const message = '需打印的文件中' + what + '，且页数未完成计算，价格计算无效。'
+        + (offline
+            ? '接管设备当前离线，请等设备上线并完成转换后再复制价格。'
+            : '请等本地打印工具完成转换、页数返回后再复制价格。')
+      return { invalid: true, message }
+    },
+
+    // 页数在提交后才返回 → 同步进提交结果快照，使「复制价格」取到真实页数、
+    // 并刷新成功弹窗里的价格提示（页数齐了提示自动消失）
+    _applyPageCountToOrder(fileId, pageCount) {
+      const d = this._lastOrderResult
+      if (!d || !d.files || !fileId || !(pageCount > 0)) return
+      d.files.forEach(f => {
+        if (f && f.file_id === fileId) {
+          f.page_count = pageCount
+          f.page_count_verified = true
+        }
+      })
+      this._refreshPriceInvalidHint()
+    },
+
+    // 刷新成功弹窗内的价格提示（空串 = 页数齐全，可正常复制价格）
+    _refreshPriceInvalidHint() {
+      const d = this._lastOrderResult
+      if (!d || !d.files || !this.data.showSuccessModal) return
+      this.setData({ priceInvalidHint: this._checkPriceFiles(d.files).message })
+    },
+
+    // 价格无效时的提示（弹窗，避免长文案被 toast 截断）
+    _warnPriceInvalid(message) {
+      wx.showModal({
+        title: '价格暂不可复制',
+        content: message,
+        showCancel: false,
+        confirmText: '知道了',
+      })
+    },
+
     // ---- 复制价格（简略：仅金额，对齐本地工具 Ctrl+C）----
 
     onCopyPrice() {
       const d = this._lastOrderResult
       if (!d || !d.files) return
       const files = d.files
+      // 页数未完成计算（Word/md 等）→ 价格无效：不复制、只提示
+      const guard = this._checkPriceFiles(files)
+      if (guard.invalid) { this._warnPriceInvalid(guard.message); return }
       // 开关/选项取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
       const echo = d.data || {}
       const deliveryEnabled = echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : this.data.deliveryEnabled
@@ -2991,6 +3099,9 @@ Component({
       const d = this._lastOrderResult
       if (!d || !d.files) return
       const files = d.files
+      // 与「复制价格」同口径：页数未完成计算 → 明细里的金额同样是错的，不复制、只提示
+      const guard = this._checkPriceFiles(files)
+      if (guard.invalid) { this._warnPriceInvalid(guard.message); return }
       const orderNumber = d.order_number || ''
       // 开关/选项取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
       const echo = d.data || {}
@@ -3083,6 +3194,7 @@ Component({
         this.setData({
           showSuccessModal: false,
           modalClosing: false,
+          priceInvalidHint: '',
           selectedFiles: [],
           badgeCount: 0,
           scrollPadHeight: 0,

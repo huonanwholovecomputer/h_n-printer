@@ -389,6 +389,8 @@
     <text wx:if="{{lastScheduleText}}" class="body-small schedule-success-text">{{lastScheduleText}}</text>
     <text wx:elif="{{lastAdminPrintText}}" class="body-small admin-print-success-text">{{lastAdminPrintText}}</text>
     <text wx:else class="body-small">文件已上传，打印任务已创建</text>
+    <!-- 页数未完成计算（Word/md 等需本地转换的类型，接管设备离线时等不到）→ 价格无效 -->
+    <text wx:if="{{priceInvalidHint}}" class="body-small price-invalid-hint">⚠ {{priceInvalidHint}}</text>
     <view class="modal-buttons">
       <button class="btn-secondary modal-half-btn" bindtap="onCopyPrice" hover-class="tap-active">复制价格</button>
       <button class="btn-primary modal-half-btn" bindtap="onCopyDetailPrice" hover-class="tap-active">复制详细价格</button>

@@ -111,6 +111,15 @@ bash backup.sh  # crontab 每天凌晨3点
 - 价格以 `pricing.json` 为权威（首页费默认 0.10），小程序/APP 经 `/api/pricing` 同步单价（不再硬编码单价）；提交时服务端按 pricing.json 覆盖客户端金额字段（P1-4.7）
 - 管理员提交的订单 `is_free=1`，不计费
 
+### 复制价格的前置校验（页数未计算完成 → 价格无效，禁止复制）
+
+后端只对 PDF 能自己数页（pypdf）；**Word(doc/docx) / md / txt / csv** 必须由本地打印工具转换后才有真实页数，上传/提交时后端只能按 1 页兜底（`submit_order` 里的 `or 1`、`get_file_page_count` 的默认 1 页）。因此接管设备离线（等不到页数回报）或设备在线但转换/页数尚未返回就提交时，这类文件的页数是假值、算出来的价比实收少。
+
+- 判据：`page_count > 0` 且（PDF/图片 → 可信；doc/docx/md/txt/csv → 必须 `page_count_verified=1`，即本地工具转换回报过）。
+- 前端在小程序 `pages/index/index.js`（`_checkPriceFiles` / `_isFilePriceReliable`）与 APP `www/print.js`（`checkPriceFiles` / `isFilePriceReliable`）两处同口径校验「复制价格 / 复制详细价格」：只要有一个文件不可信 → **不写剪贴板**，弹「需打印的文件中包含X类型，且页数未完成计算，价格计算无效」；接管设备离线时文案额外点明离线。成功弹窗内也同步亮出该提示。
+- 页数在提交后才回报 → 轮询成功处调 `_applyPageCountToOrder` / `applyPageCountToOrder` 写回提交快照（`_lastOrderResult.files`），拦下自动解除、提示消失（后端 `page_count_result` → `_recalc_prices_for_file` 已回溯重算订单价，此时复制到的就是实收价）。
+- 验收：`node tests/verify_copy_price_page_guard.js`（真实源码 + 桩环境：离线 Word、md、在线未返回、已验证放行、PDF/图片、混合订单、页数回报后解除）。
+
 ## 关键文件索引
 
 | 文件 | 作用 |

@@ -2431,6 +2431,12 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
   color: var(--blue);
   font-weight: 500;
 }
+/* 成功弹窗：页数未完成计算 → 价格无效提示（Word/md 等需本地转换的类型） */
+.price-invalid-hint {
+  margin-top: 0.96cqw;
+  color: #FF9500;
+  font-weight: 500;
+}
 
 /* ── 无障碍打印预约（开始方式：立即/指定时间/倒计时，仅管理员）── */
 /* 展开/收起动画：开关联动，max-height + opacity + transform 过渡（收起由 JS 在 320ms 后卸载面板） */
