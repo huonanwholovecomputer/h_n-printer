@@ -204,6 +204,8 @@
 .device-state { font-size: 22rpx; flex-shrink: 0; }
 .device-state-on { color: var(--green); }
 .device-state-off { color: var(--gray); }
+/* 该设备已确认不支持自动双面（双面需人工翻纸；无人在场时不能打双面） */
+.device-state-manual { color: #e67e22; margin-right: 12rpx; }
 /* 设备选项按下反馈：微微缩小 0.98（瞬时生效，松手后由基类 transform 过渡平滑弹回） */
 .device-hover {
   transform: scale(0.98);

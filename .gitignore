@@ -18,6 +18,7 @@ venv/
 # 内部工具目录
 .codegraph/
 .workbuddy/
+.mnemon/
 
 # 大型安装包 - 需用户手动下载安装
 *.msi
@@ -55,6 +56,9 @@ local_print_tool/user_bindings.json
 local_print_tool/logs/
 local_print_tool/crash_traceback.txt
 mobile_apps/printer-backend/logs/
+# 「日志管理 → 收集全部在线设备日志」导出的汇总文件（含真实 printer token / 设备 ID / 成员姓名）
+*收集的在线设备日志*.txt
+*在线设备日志*.txt
 
 # PDF 缓存（运行时自动生成）
 local_print_tool/pdf_cache/

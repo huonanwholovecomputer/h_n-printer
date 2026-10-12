@@ -1340,6 +1340,7 @@ function renderDeviceList() {
     `<view class="device-item ${selectedDeviceId === d.client_id ? 'device-item-on' : ''}" data-id="${esc(d.client_id)}" data-hover="device-hover">
       <view class="device-dot ${d.online ? 'device-dot-on' : 'device-dot-off'}"></view>
       <text class="device-label">${esc(d.label || d.client_id)}</text>
+      ${d.auto_duplex === false ? '<text class="device-state device-state-manual">🖐 需人工翻纸</text>' : ''}
       <text class="device-state ${d.online ? 'device-state-on' : 'device-state-off'}">${d.online ? '在线' : '离线'}</text>
     </view>`
   ).join('');
@@ -1351,6 +1352,8 @@ document.addEventListener('click', function (e) {
   if (item && item.dataset && item.dataset.id) {
     selectedDeviceId = item.dataset.id;
     renderDeviceList();
+    // 目标设备变化 → 让打印页重新评估「双面 × 无人值守」互斥（print.js 里实现）
+    if (typeof onTargetDeviceChanged === 'function') onTargetDeviceChanged();
   }
 });
 

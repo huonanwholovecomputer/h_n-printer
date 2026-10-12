@@ -1,0 +1,625 @@
+# -*- coding: utf-8 -*-
+"""打印侧双面适配验收：能力探测 / 渲染序列 / 不再"静默单面却报成功"
+
+（不需要真打印机）
+
+三件必须钉住的事：
+
+  ① **渲染序列是唯一真相**：常规路径（份数 × 页码 + 奇数页双面多份的空白分隔页）与
+     手动双面路径（pages_override 精确序列，含 None 空白占位页）都要按计划逐面出纸。
+     做法：注入**假 win32ui DC + 假 fitz 页 + 假 PIL 绘图**，记录每次 StartPage/EndPage
+     之间到底画了哪一页 —— 不依赖任何真实设备，也能断言"纸上的顺序"。
+  ② **驱动拒绝双面 → 必须失败**：无自动双面的驱动会在 DocumentProperties 合并时把
+     Duplex 悄悄改回 1(SIMPLEX)。此时继续打只会单面出纸，而客户端仍按双面计费
+     （实测：Print to PDF / WPS PDF / Adobe PDF 三个队列都会被改回 1）。
+     所以要求：① `_get_printer_devmode` 回读实际值；② 请求双面但驱动改回 → 返回失败；
+     ③ `print_pdf` 预检发现"high 置信度不支持"直接拒打；④ 这个失败**不得降级**到
+     Sumatra/循环兜底（那两条同样依赖驱动，降级过去只会换个地方静默单面）。
+  ③ 日志必须报驱动校验后的**实际值**，不能拿请求值冒充已生效。
+
+用法: python tests/verify_duplex_probe.py   （exit 0 = 全部通过）
+"""
+import io
+import os
+import sys
+import types
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_TOOL = os.path.join(REPO, "local_print_tool")
+sys.path.insert(0, LOCAL_TOOL)
+
+import win32con  # noqa: E402  （真实常量模块：DM_DUPLEX / LOGPIXELSX 等）
+import fitz as real_fitz  # noqa: E402  （真实 fitz：造真 PDF / 数页；假 fitz 只在假 DC 测试里临时顶上）
+import pdf_printer as pp  # noqa: E402
+import PIL  # noqa: E402
+import PIL.Image  # noqa: E402  （显式导入，PIL.Image 才是 PIL 的属性）
+
+try:
+    import PIL.ImageWin  # noqa: E402
+except ImportError:  # 非 Windows
+    pass
+
+ok_all = True
+
+
+def check(name, cond, detail=""):
+    global ok_all
+    if not cond:
+        ok_all = False
+    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f"  -- {detail}" if detail else ""))
+
+
+# ============================================================
+# 假打印机环境：假 DC + 假页 + 假绘图，记录"每一面画了什么"
+# ============================================================
+class Rec:
+    def __init__(self):
+        self.pages = []          # 按出纸顺序记录每一面的内容："p<页号>" / "blank"
+        self.current = None
+        self.startdoc = 0
+        self.enddoc = 0
+        self.abort = 0
+        self.in_page = False
+
+
+class FakePixmap:
+    def __init__(self, w, h):
+        self.width, self.height = w, h
+        self.samples = b"\x00" * (w * h * 3)
+        self.stride = w * 3
+
+
+class FakeRect:
+    def __init__(self, w, h):
+        self.width, self.height = w, h
+
+
+class FakePage:
+    def __init__(self, idx, rec):
+        self.idx, self.rec = idx, rec
+        self.rect = FakeRect(595.0, 842.0)     # A4 pt
+
+    def get_pixmap(self, matrix=None, alpha=False):
+        self.rec.current = f"p{self.idx}"
+        return FakePixmap(100, 140)
+
+
+class FakeDoc:
+    def __init__(self, n, rec):
+        self.pages = [FakePage(i, rec) for i in range(n)]
+        self.rec = rec
+
+    def __len__(self):
+        return len(self.pages)
+
+    def __getitem__(self, i):
+        return self.pages[i]
+
+    def close(self):
+        pass
+
+
+class FakeDC:
+    def __init__(self, rec):
+        self.rec = rec
+        self.printer = ""
+
+    def CreatePrinterDC(self, name):
+        self.printer = name
+
+    def GetHandleOutput(self):
+        return 12345
+
+    def GetDeviceCaps(self, which):
+        return {win32con.LOGPIXELSX: 300, win32con.LOGPIXELSY: 300,
+                win32con.HORZRES: 2480, win32con.VERTRES: 3508}[which]
+
+    def StartDoc(self, title):
+        self.rec.startdoc += 1
+
+    def StartPage(self):
+        self.rec.in_page = True
+
+    def EndPage(self):
+        self.rec.in_page = False
+
+    def EndDoc(self):
+        self.rec.enddoc += 1
+
+    def AbortDoc(self):
+        self.rec.abort += 1
+
+    def DeleteDC(self):
+        pass
+
+
+class FakeDevMode:
+    def __init__(self):
+        self.Duplex = 1
+        self.Fields = 0
+        self.Orientation = 1
+
+
+def install_fakes(rec, *, n_pages=6, driver_reverts=True, dm_readable=True,
+                  openprinter_log=None, dm_log=None, dump=""):
+    """注入假模块；返回 restore 回调。
+
+    driver_reverts=True 模拟"没有双面器"的驱动：DocumentProperties 合并时把 Duplex 改回 1。
+    openprinter_log / dm_log 分别记录 OpenPrinter / DocumentProperties 调用次数（查缓存用）。
+    """
+    saved = {k: sys.modules.get(k) for k in ("win32print", "win32ui", "fitz", "PIL.Image", "PIL.ImageWin")}
+    saved_pil_image, saved_pil_imagewin = PIL.Image, getattr(PIL, "ImageWin", None)
+
+    # ---- 假 win32print ----
+    wpr = types.ModuleType("win32print")
+
+    def _open(name):
+        if openprinter_log is not None:
+            openprinter_log.append(name)
+        return f"h:{name}"
+
+    def _getprinter(handle, level):
+        dm = FakeDevMode() if dm_readable else None
+        return {"pDevMode": dm, "pDriverName": "Fake Driver", "pPortName": "FAKE001"}
+
+    def _document_properties(hwnd, handle, name, out, inp, flags):
+        if dm_log is not None:
+            dm_log.append(name)
+        # 模拟驱动的合并校验：无自动双面能力的驱动会把 Duplex 归一化回 SIMPLEX
+        if driver_reverts and getattr(inp, "Duplex", 1) in (2, 3):
+            inp.Duplex = 1
+        return 1
+
+    wpr.OpenPrinter = _open
+    wpr.GetPrinter = _getprinter
+    wpr.DocumentProperties = _document_properties
+    wpr.ClosePrinter = lambda h: None
+    wpr.GetDefaultPrinter = lambda: "Fake Printer"
+    wpr.DeviceCapabilities = lambda dev, port, cap: (0 if driver_reverts else 1)
+
+    # ---- 假 win32ui ----
+    wui = types.ModuleType("win32ui")
+    wui.CreateDC = lambda: FakeDC(rec)
+
+    # ---- 假 fitz ----
+    fm = types.ModuleType("fitz")
+
+    class _Matrix:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    fm.Matrix = _Matrix
+    fm.open = lambda path: FakeDoc(n_pages, rec)
+
+    # ---- 假 PIL.Image / PIL.ImageWin ----
+    class _FakeImg:
+        """假位图：只记录类别与是否被 transpose 旋转过（用于验证 180° 补偿真的发生）。"""
+
+        def __init__(self, kind, size=None, rotated=0):
+            self.kind, self.size, self.rotated = kind, size, rotated
+
+        def transpose(self, code):
+            if code != "ROT180":
+                raise AssertionError(f"pdf_printer 传了非 180° 的 transpose code: {code!r}")
+            return _FakeImg(self.kind, self.size, (self.rotated + 180) % 360)
+
+    pim = types.ModuleType("PIL.Image")
+    pim.Transpose = types.SimpleNamespace(ROTATE_180="ROT180")   # 模拟 Pillow ≥10 的常量位置
+    pim.frombuffer = lambda mode, size, samples, raw, rgb, stride, x: _FakeImg("IMAGE", size)
+    pim.new = lambda mode, size, color: _FakeImg("BLANK", size)
+    piw = types.ModuleType("PIL.ImageWin")
+
+    class _Dib:
+        def __init__(self, img):
+            self.img = img
+
+        def draw(self, hdc, rect):
+            if not rec.in_page:
+                raise AssertionError("draw 发生在 StartPage 之外")
+            if getattr(self.img, "kind", "?") == "BLANK":
+                rec.pages.append("blank")
+            else:
+                rec.pages.append(rec.current + ("(rot180)" if self.img.rotated else ""))
+
+    piw.Dib = _Dib
+
+    sys.modules["win32print"] = wpr
+    sys.modules["win32ui"] = wui
+    sys.modules["fitz"] = fm
+    sys.modules["PIL.Image"] = pim
+    sys.modules["PIL.ImageWin"] = piw
+    PIL.Image, PIL.ImageWin = pim, piw
+
+    def restore():
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        PIL.Image, PIL.ImageWin = saved_pil_image, saved_pil_imagewin
+
+    return restore
+
+
+# ============================================================
+# ① 常规渲染序列（行为与历史一致：份数 × 页码 + 奇数页双面多份的空白分隔页）
+# ============================================================
+print("\n=== ① 常规路径渲染序列（假 DC，无打印机）===")
+rec = Rec()
+restore = install_fakes(rec, n_pages=6, driver_reverts=False)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "off", "long-edge", "", 1, "portrait")
+finally:
+    restore()
+check("单面 6 页 1 份：按顺序逐面出纸",
+      ok and rec.pages == ["p0", "p1", "p2", "p3", "p4", "p5"], f"ok={ok} pages={rec.pages}")
+check("StartDoc/EndDoc 成对", rec.startdoc == 1 and rec.enddoc == 1 and rec.abort == 0)
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=6, driver_reverts=False)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "on", "long-edge", "", 2, "portrait")
+finally:
+    restore()
+check("双面 6 页 2 份（偶数页、无分隔页）：两份顺序拼接",
+      ok and rec.pages == ["p0", "p1", "p2", "p3", "p4", "p5"] * 2, f"{rec.pages}")
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=3, driver_reverts=False)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "on", "long-edge", "", 2, "portrait")
+finally:
+    restore()
+check("★ 奇数页(3) + 双面 + 2 份 → 副本间插一张空白分隔页（历史行为不变）",
+      ok and rec.pages == ["p0", "p1", "p2", "blank", "p0", "p1", "p2"], f"{rec.pages}")
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=6, driver_reverts=False)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "off", "long-edge", "2-4", 1, "portrait")
+finally:
+    restore()
+check("页码范围只打选中页", ok and rec.pages == ["p1", "p2", "p3"], f"{rec.pages}")
+
+# ============================================================
+# ② pages_override（手动双面两趟的精确序列，含空白占位页）
+# ============================================================
+print("\n=== ② 手动双面：pages_override 精确序列 ===")
+rec = Rec()
+restore = install_fakes(rec, n_pages=5, driver_reverts=False)
+try:
+    # 5 页手动双面第 1 趟（偶数面约定）= 2 4 〔空白〕（1-based → 0-based: 1,3,None）
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "off", "long-edge", "",
+                                   1, "portrait", None, 0, [1, 3, None])
+finally:
+    restore()
+check("★ 第 1 趟按给定序列出纸（含空白占位页，不是跳过）",
+      ok and rec.pages == ["p1", "p3", "blank"], f"{rec.pages}")
+check("成功消息报实际面数", ok and "3 面" in msg, f"{msg}")
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=5, driver_reverts=False)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "off", "long-edge", "",
+                                   1, "portrait", None, 0, [4, 2, 0])
+finally:
+    restore()
+check("★ 第 2 趟逆序序列（5 3 1 → 0-based 4,2,0）", ok and rec.pages == ["p4", "p2", "p0"], f"{rec.pages}")
+
+check("build_render_sequence 常规路径与 _print_pdf_native 一致",
+      pp.build_render_sequence([0, 1, 2], 2, "on") == [0, 1, 2, None, 0, 1, 2],
+      f"{pp.build_render_sequence([0, 1, 2], 2, 'on')}")
+check("build_render_sequence 手动路径原样返回 override",
+      pp.build_render_sequence([0, 1, 2], 3, "off", [1, None, 0]) == [1, None, 0])
+
+# ============================================================
+# ②b 手动双面第 2 趟的 180° 补偿
+#     （HP LaserJet 1020 实机实测：不补偿时第 2 趟那一面整体"上下颠倒"）
+# ============================================================
+print("\n=== ②b 第 2 趟 180° 旋转补偿（实机发现）===")
+import manual_duplex as md  # noqa: E402
+
+plan5 = md.plan_single([1, 2, 3, 4, 5])
+tmp5 = os.path.join(os.environ.get("TEMP", "."), "hn_duplex_probe_rot.pdf")
+_d5 = real_fitz.open()
+for _ in range(5):
+    _d5.new_page()
+_d5.save(tmp5)
+_d5.close()
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=5, driver_reverts=False)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "off", "long-edge", "",
+                                   1, "portrait", None, 0, [1, 3, None], True)
+finally:
+    restore()
+check("★ rotate_180=True：内容页被旋转 180°，空白占位页不受影响",
+      ok and rec.pages == ["p1(rot180)", "p3(rot180)", "blank"], f"{rec.pages}")
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=5, driver_reverts=False)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "off", "long-edge", "",
+                                   1, "portrait", None, 0, [1, 3, None])
+finally:
+    restore()
+check("rotate_180 默认关闭（常规打印路径行为不变）",
+      ok and rec.pages == ["p1", "p3", "blank"], f"{rec.pages}")
+
+# print_plan_pass：第 1 趟不转、第 2 趟转 —— 这条规则只允许存在一个地方
+# （默认约定 = odd：第 1 趟 = 1 3 5，第 2 趟 = 〔空白〕 4 2）
+plan5 = md.plan_single([1, 2, 3, 4, 5])
+rec = Rec()
+restore = install_fakes(rec, n_pages=5, driver_reverts=False)
+try:
+    ok, msg = pp.print_plan_pass(plan5, tmp5, "Fake Printer", 1)
+finally:
+    restore()
+check("★ print_plan_pass(第 1 趟)：不旋转，序列 = 1 3 5（odd 默认）",
+      ok and rec.pages == ["p0", "p2", "p4"], f"ok={ok} {rec.pages}")
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=5, driver_reverts=False)
+try:
+    ok, msg = pp.print_plan_pass(plan5, tmp5, "Fake Printer", 2)
+finally:
+    restore()
+check("★ print_plan_pass(第 2 趟)：逆序 + 全部旋转 180°，且开头的空白占位页仍要送纸",
+      ok and rec.pages == ["blank", "p3(rot180)", "p1(rot180)"], f"ok={ok} {rec.pages}")
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=5, driver_reverts=False)
+try:
+    ok, msg = pp.print_plan_pass(plan5, tmp5, "Fake Printer", 2, second_rotate_180=False)
+finally:
+    restore()
+check("print_plan_pass(第 2 趟, second_rotate_180=False)：不旋转（短边/其它机型）",
+      ok and rec.pages == ["blank", "p3", "p1"], f"{rec.pages}")
+
+if os.path.isfile(tmp5):
+    os.remove(tmp5)
+
+# ============================================================
+# ③ 驱动拒绝双面 → 必须失败，不得静默单面出纸
+# ============================================================
+print("\n=== ③ 驱动拒绝双面（无自动双面的机器）===")
+rec = Rec()
+restore = install_fakes(rec, n_pages=4, driver_reverts=True)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "on", "long-edge", "", 1, "portrait")
+finally:
+    restore()
+check("★ 请求双面但驱动改回单面 → 返回失败（不是成功）", ok is False, f"ok={ok} msg={msg}")
+check("★ 失败带终止标记（禁止降级到 Sumatra/循环）",
+      msg.startswith(pp.DUPLEX_UNSUPPORTED_MARKER), f"{msg}")
+check("★ 一个面都没出纸（在 StartDoc 之前就拦住）",
+      rec.pages == [] and rec.startdoc == 0, f"pages={rec.pages} startdoc={rec.startdoc}")
+
+rec = Rec()
+restore = install_fakes(rec, n_pages=4, driver_reverts=True)
+try:
+    ok, msg = pp._print_pdf_native("dummy.pdf", "Fake Printer", "off", "long-edge", "", 1, "portrait")
+finally:
+    restore()
+check("同一台机器打**单面**照常工作（失败只针对双面请求）",
+      ok and rec.pages == ["p0", "p1", "p2", "p3"], f"ok={ok} pages={rec.pages}")
+
+# print_pdf 预检：high 置信度"不支持" → 直接拒打，连 GDI 都不试
+print("\n=== ④ print_pdf 预检拒绝（high 置信度不支持）===")
+import fitz as real_fitz  # noqa: E402  真实 fitz：造一个真 PDF 给 count_pdf_pages 读
+tmp_pdf = os.path.join(os.environ.get("TEMP", "."), "hn_duplex_probe_test.pdf")
+_d = real_fitz.open()
+for _ in range(3):
+    _d.new_page()
+_d.save(tmp_pdf)
+_d.close()
+
+calls = []
+saved_native, saved_probe = pp._print_pdf_native, pp.get_printer_duplex_support
+pp._print_pdf_native = lambda *a, **kw: (calls.append("native"), (True, "stub"))[1]
+try:
+    pp.get_printer_duplex_support = lambda *a, **kw: {
+        "auto_duplex": False, "confidence": "high", "printer": "HP LaserJet 1020",
+        "detail": "无自动双面（能力位=0 且驱动把 Duplex 改回单面）"}
+    ok, msg = pp.print_pdf(tmp_pdf, "HP LaserJet 1020", duplex="on")
+    check("★ 预检发现不支持自动双面 → 拒绝双面打印",
+          ok is False and "不支持自动双面" in msg, f"ok={ok} msg={msg}")
+    check("★ 拒绝发生在打印之前（GDI 未被调用，没浪费纸）", calls == [], f"{calls}")
+    check("报错文案给出出路（改单面 / 走手动双面）",
+          "单面" in msg and "手动双面" in msg, f"{msg}")
+
+    # 判不准（None）→ 不拦，照常打（避免误伤探测失败的机型）
+    calls.clear()
+    pp.get_printer_duplex_support = lambda *a, **kw: {
+        "auto_duplex": None, "confidence": "low", "printer": "X", "detail": "判不出来"}
+    ok, msg = pp.print_pdf(tmp_pdf, "X", duplex="on")
+    check("能力判不准时不拦（照常提交，只记日志）", ok is True and calls == ["native"], f"ok={ok} {calls}")
+
+    # 支持双面 → 正常走 GDI
+    calls.clear()
+    pp.get_printer_duplex_support = lambda *a, **kw: {
+        "auto_duplex": True, "confidence": "medium", "printer": "HP M232", "detail": "ok"}
+    ok, msg = pp.print_pdf(tmp_pdf, "HP M232", duplex="on")
+    check("探测为支持 → 正常打印", ok is True and calls == ["native"], f"ok={ok} {calls}")
+finally:
+    pp._print_pdf_native, pp.get_printer_duplex_support = saved_native, saved_probe
+    if os.path.isfile(tmp_pdf):
+        os.remove(tmp_pdf)
+
+# ============================================================
+# ⑤ 手动双面每一趟**禁止**降级到 Sumatra（它只认整份 PDF，会把整份文件再打一遍）
+# ============================================================
+print("\n=== ⑤ pages_override 的降级策略 ===")
+import fitz as real_fitz2  # noqa: E402
+tmp_pdf2 = os.path.join(os.environ.get("TEMP", "."), "hn_duplex_probe_loop.pdf")
+_d2 = real_fitz2.open()
+for _ in range(3):
+    _d2.new_page()
+_d2.save(tmp_pdf2)
+_d2.close()
+
+saved = (pp._print_pdf_native, pp._find_sumatra_pdf, pp._print_via_loop)
+seen = {"sumatra": 0, "loop": 0, "native": 0}
+try:
+    pp._print_pdf_native = lambda *a, **kw: (seen.__setitem__("native", seen["native"] + 1),
+                                             (False, "boom"))[1]
+
+    def _fake_sumatra():
+        seen["sumatra"] += 1
+        return "C:/fake/SumatraPDF.exe"
+
+    pp._find_sumatra_pdf = _fake_sumatra
+
+    def _fake_loop(*a, **kw):
+        seen["loop"] += 1
+        return True, "loop-ok"
+
+    pp._print_via_loop = _fake_loop
+
+    # 常规路径：GDI 失败 → 允许降级（Sumatra 会被尝试）
+    seen.update({"sumatra": 0, "loop": 0, "native": 0})
+    ok, msg = pp.print_pdf(tmp_pdf2, "Fake Printer", duplex="off")
+    check("常规路径 GDI 失败仍会尝试 Sumatra 降级（历史行为不变）",
+          seen["sumatra"] == 1, f"{seen}")
+
+    # 手动双面一趟：绝不降级到 Sumatra，只走应用层循环（序列一致）
+    seen.update({"sumatra": 0, "loop": 0, "native": 0})
+    ok, msg = pp.print_pdf(tmp_pdf2, "Fake Printer", duplex="off", pages_override=[1, None, 0])
+    check("★ 手动双面一趟（pages_override）失败时**不**降级 Sumatra（否则整份重打）",
+          seen["sumatra"] == 0, f"{seen}")
+    check("★ 且会走应用层循环兜底（序列原样透传）", seen["loop"] == 1 and ok is True, f"{seen}")
+
+    # 循环兜底必须把 override 传给 GDI（否则"每次都打全部页"）
+    seen.update({"sumatra": 0, "loop": 0, "native": 0})
+    pp._print_via_loop = saved[2]          # 恢复真函数，让真正的 _print_via_loop 去调 native
+    caught = {}
+
+    def _capture(*a, **kw):
+        caught["override"] = a[9] if len(a) > 9 else kw.get("pages_override")
+        return True, "ok"
+
+    pp._print_pdf_native = _capture
+    pp._print_via_loop("x.pdf", "P", "off", "long-edge", "", 1, "", None, 0, [2, None])
+    check("★ 循环兜底把 pages_override 透传给 GDI", caught.get("override") == [2, None],
+          f"{caught}")
+finally:
+    pp._print_pdf_native, pp._find_sumatra_pdf, pp._print_via_loop = saved
+    if os.path.isfile(tmp_pdf2):
+        os.remove(tmp_pdf2)
+
+# ============================================================
+# ⑥ 能力探测：本机真实打印机（有就用，没有就跳过）
+# ============================================================
+print("\n=== ⑥ 能力探测（本机真实队列，交叉核对）===")
+try:
+    import win32print as real_wpr
+    pp._DUPLEX_CAP_CACHE.clear()
+    flags = real_wpr.PRINTER_ENUM_LOCAL | real_wpr.PRINTER_ENUM_CONNECTIONS
+    rows = real_wpr.EnumPrinters(flags, None, 2)
+    checked = no_duplex = dup = 0
+    for info in rows:
+        name, port = info["pPrinterName"], info.get("pPortName", "")
+        try:
+            raw = real_wpr.DeviceCapabilities(name, port, pp.DC_DUPLEX)
+            dc = raw[0] if isinstance(raw, (tuple, list)) else raw
+        except Exception:
+            continue
+        v = pp.get_printer_duplex_support(name, refresh=True)
+        checked += 1
+        # 能力位=0 的队列必须被判为"不支持"，且置信度不能低于 medium
+        if dc == 0:
+            no_duplex += 1
+            check(f"能力位=0 的队列判为不支持: {name[:34]}",
+                  v["auto_duplex"] is False and v["confidence"] in ("high", "medium"),
+                  f"auto={v['auto_duplex']}/{v['confidence']} dc={v['dc_duplex']} acc={v['dm_accepted']}")
+        elif dc == 1:
+            dup += 1
+            check(f"能力位=1 且驱动接受 → 判为支持但只给 medium（须人工确认）: {name[:34]}",
+                  v["auto_duplex"] is True and v["confidence"] == "medium",
+                  f"auto={v['auto_duplex']}/{v['confidence']}")
+    print(f"  本机 {checked} 个队列（无自动双面 {no_duplex} 个 / 声明支持 {dup} 个）")
+    if checked == 0:
+        print("  （本机没有可探测的队列，跳过）")
+
+    # 缓存：第二次直接命中，不再跑 DocumentProperties 探测（OpenPrinter 仍要调用 —— 它的
+    # 作用就是读 driver/port 以确认缓存键仍然有效，比重复探测便宜得多）
+    pp._DUPLEX_CAP_CACHE.clear()
+    log, dmlog = [], []
+    restore = install_fakes(Rec(), n_pages=2, driver_reverts=False,
+                            openprinter_log=log, dm_log=dmlog)
+    try:
+        pp.get_printer_duplex_support("Cache Probe", refresh=True)
+        n1, d1 = len(log), len(dmlog)
+        pp.get_printer_duplex_support("Cache Probe")
+        n2, d2 = len(log), len(dmlog)
+    finally:
+        restore()
+    check("能力结果缓存：第二次不再重复探测（DocumentProperties 只跑一次）",
+          d1 == 1 and d2 == 1, f"探测次数 {d1} → {d2}（OpenPrinter {n1} → {n2}）")
+
+    # 假驱动"拒绝双面"时的判定：能力位=0 且被改回 → high 且不支持
+    pp._DUPLEX_CAP_CACHE.clear()
+    restore = install_fakes(Rec(), n_pages=2, driver_reverts=True)
+    try:
+        v = pp.get_printer_duplex_support("Reverting Printer", refresh=True)
+    finally:
+        restore()
+    check("★ 能力位=0 且驱动改回单面 → auto_duplex=False / confidence=high",
+          v["auto_duplex"] is False and v["confidence"] == "high" and v["dm_accepted"] is False,
+          f"{v['auto_duplex']}/{v['confidence']}/{v['dm_accepted']}")
+
+    # 假驱动"声明支持且接受" → True 但只给 medium（HP 1018/1020/1022 的虚报风险）
+    pp._DUPLEX_CAP_CACHE.clear()
+    restore = install_fakes(Rec(), n_pages=2, driver_reverts=False)
+    try:
+        v = pp.get_printer_duplex_support("Claiming Printer", refresh=True)
+    finally:
+        restore()
+    check("★ 能力位=1 且驱动接受 → True 但 confidence=medium（提示需实机确认）",
+          v["auto_duplex"] is True and v["confidence"] == "medium", f"{v['auto_duplex']}/{v['confidence']}")
+
+    # 拿不到 DEVMODE → 不能谎报高置信度（能力位说支持，但没验证过）
+    pp._DUPLEX_CAP_CACHE.clear()
+    restore = install_fakes(Rec(), n_pages=2, driver_reverts=False, dm_readable=False)
+    try:
+        v = pp.get_printer_duplex_support("NoDevmode Printer", refresh=True)
+    finally:
+        restore()
+    check("DEVMODE 取不到时不谎报高置信度（支持但低置信，交由人工确认）",
+          v["auto_duplex"] is True and v["confidence"] in ("medium", "low")
+          and v["dm_accepted"] is None, f"{v['auto_duplex']}/{v['confidence']}/{v['dm_accepted']}")
+except ImportError:
+    print("  （无 pywin32，跳过真实队列探测）")
+
+# ============================================================
+# ⑦ 静态接线：日志说真话 + 终止标记不被绕过
+# ============================================================
+print("\n=== ⑦ 静态接线 ===")
+src = open(os.path.join(LOCAL_TOOL, "pdf_printer.py"), encoding="utf-8").read()
+check("★ 日志报驱动实际值（旧的『请求值冒充已生效』写法已消失）",
+      "→ 驱动实际=" in src and '双面模式={desc}")' not in src)
+check("_get_printer_devmode 返回 (devmode, applied) 且调用方解包",
+      "return devmode, applied_duplex" in src and "devmode, applied_duplex = _get_printer_devmode(" in src)
+check("_get_printer_devmode 仍在 GDI 主路径被调用（审计约定：出现次数 >= 2）",
+      src.count("_get_printer_devmode(") >= 2, f"count={src.count('_get_printer_devmode(')}")
+check("DUPLEX_UNSUPPORTED_MARKER 在 _print_via_loop 里原样上抛",
+      "if msg.startswith(DUPLEX_UNSUPPORTED_MARKER):" in src)
+check("Sumatra 路径仍不被用于终止型双面失败（print_pdf 提前返回）",
+      src.count("msg.startswith(DUPLEX_UNSUPPORTED_MARKER)") >= 2,
+      f"count={src.count('msg.startswith(DUPLEX_UNSUPPORTED_MARKER)')}")
+check("★ pages_override 时禁用 Sumatra 降级（源码级）",
+      "sumatra = None if pages_override is not None else _find_sumatra_pdf()" in src)
+check("★ pages_override 透传到 _print_via_loop 与 _print_pdf_native",
+      "pages_override, rotate_180)" in src and src.count("pages_override") >= 8,
+      f"count={src.count('pages_override')}")
+check("★ 第 2 趟旋转规则只在 print_plan_pass 一处定义",
+      "def print_plan_pass(" in src and "rotate_180=(which == 2 and second_rotate_180)" in src)
+check("180° 旋转用无损 transpose（不是会被重采样的 rotate）",
+      "img.transpose(_rot180)" in src and "Image.Transpose" in src)
+
+print("\n" + "=" * 56)
+print("打印侧双面适配验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")
+sys.exit(0 if ok_all else 1)

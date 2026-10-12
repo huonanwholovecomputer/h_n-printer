@@ -52,6 +52,8 @@
             >
               <view class="device-dot {{item.online ? 'device-dot-on' : 'device-dot-off'}}"></view>
               <text class="device-label">{{item.label}}</text>
+              <!-- 该设备已确认不支持自动双面：双面需人工翻纸，无人值守不可用（2026-10） -->
+              <text wx:if="{{item.auto_duplex === false}}" class="device-state device-state-manual">🖐 需人工翻纸</text>
               <text class="device-state {{item.online ? 'device-state-on' : 'device-state-off'}}">{{item.online ? '在线' : '离线'}}</text>
             </view>
           </view>

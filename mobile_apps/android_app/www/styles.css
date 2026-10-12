@@ -1794,6 +1794,8 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
 .device-state { font-size: 2.64cqw; flex-shrink: 0; }
 .device-state-on { color: var(--green); }
 .device-state-off { color: var(--gray); }
+/* 该设备已确认不支持自动双面（双面需人工翻纸；无人在场时不能打双面） */
+.device-state-manual { color: #e67e22; margin-right: 1.4cqw; }
 
 /* ── File Section ── */
 .file-section {

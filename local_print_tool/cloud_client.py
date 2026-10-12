@@ -381,15 +381,24 @@ class CloudClient(QObject):
             return
         self._try_status_sync(order_id, "abandoned")
 
-    def abandon_reserved_order(self, order_number: str, total_price: float = 0.0):
+    def abandon_reserved_order(self, order_number: str, total_price: float = 0.0,
+                               owner_name: str = "", is_admin_print=None):
         """放弃本地预留订单（仅获取了订单号但未提交打印）。
-        调用后端 /api/abandon_reserved_order，将 reserved → abandoned，并补记价格。"""
+        调用后端 /api/abandon_reserved_order，将 reserved → abandoned，并补记价格。
+
+        owner_name / is_admin_print：把标签页的归属与「管理员自行打印」一起上报。
+        不上报时后端只能按历史缺省补记（占位名 + 自打），会把「接单打印」的顾客订单
+        误盖章成「自打」——类型列、结算收益分类、管理员订单统计都按这个字段区分。"""
         if not self.api_url or not self.token or not order_number:
             return
         try:
             payload = {"order_number": order_number}
             if total_price > 0:
                 payload["total_price"] = round(total_price, 2)
+            if owner_name:
+                payload["owner_name"] = owner_name
+            if is_admin_print is not None:
+                payload["is_admin_print"] = bool(is_admin_print)
             resp = http_requests.post(
                 f"{self.api_url}/api/abandon_reserved_order",
                 params={"token": self.token},

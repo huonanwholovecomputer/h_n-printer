@@ -2316,6 +2316,19 @@ function _orderMoney(o, excludeSelf) {
   m.record = m.paid + m.receivable;   // 云端收益记录 = 已入账 + 应收未收（合并口径）
   return m;
 }
+/* 订单名义金额（展示口径，v6.5）：放弃/取消/打回/失败的整单金额不再显示为 ¥0.00。
+   金额列显示订单本身金额（父订单 total_price，含派送/加急/首页等附加服务费）；
+   total_price 缺失或为 0 时退回「全部子任务费合计」（后端放弃预留单时会补记 total_price，
+   历史数据/异常数据兜底）。本函数只服务订单明细「金额」列展示，
+   收益统计一律走 _orderMoney().record，不受任何影响。 */
+function _orderNominalAmount(o) {
+  if (!o) return 0;
+  var cents = parseCents(o.total_price);
+  if (cents > 0) return cents;
+  var sum = 0;
+  (o.files || []).forEach(function (f) { sum += parseCents(f.total_price); });
+  return sum;
+}
 /* 纸张张数统计（v6.2）：单面每页用 1 张纸，双面每张纸印 2 页（奇数页最后一张仍占 1 张纸）；
    × 份数。与后端 calculate_price 的纸张模型一致（双面 0.3 元/张，每张两页；奇数页最后一张按单面价但同样占一张纸）。
    页码范围按完整 page_count 折算（与「总页数」total_page_count 口径一致）。 */
@@ -2562,7 +2575,7 @@ function _renderOrderListHTML() {
   var pageOrders = listOrders.slice(start, start + _ordersPerPage);
   var statusCount = _countByStatus(_cloudFilteredOrders());   // 筛选下拉计数（状态过滤前）
 
-  var h = '<div class="section" id="cloud-orders"><h2>📋 订单明细 <span class="hint">' + total + ' 条，时间倒序 · 自打订单金额仅展示、不计入收益</span>';
+  var h = '<div class="section" id="cloud-orders"><h2>📋 订单明细 <span class="hint">' + total + ' 条，时间倒序 · 自打/放弃/取消/打回/失败订单金额仅展示、不计入收益 · 带 <b>*</b> 的金额含未计入收益的部分</span>';
   h += '<span style="margin-left:auto"><select onchange="onCloudStatusFilter(this.value)" style="padding:6px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.8rem">';
   h += '<option value="all"' + (_cloudStatusFilter === 'all' ? ' selected' : '') + '>全部状态</option>';
   h += '<option value="active"' + (_cloudStatusFilter === 'active' ? ' selected' : '') + '>🟢 进行中/待处理</option>';
@@ -2598,7 +2611,37 @@ function _renderOrderListHTML() {
         ? 'var(--primary)'
         : sanitizeColor(_statusColor(o.status));
       var money = _orderMoney(o);
-      var orderRev = money.record;   // 云端收益记录（已入账+应收未收 合并口径）
+      var orderRev = money.record;   // 云端收益记录（已入账+应收未收 合并口径）—— 统计口径
+      // v6.5：金额列统一为「订单金额」展示口径，收益统计仍只用 orderRev（口径完全不变）。
+      // 三种「展示金额 ≠ 计入收益」的情形都不再清零：
+      //   ① 整单被排除（放弃/取消/打回/失败）→ 显示订单金额，颜色取该状态的状态色（放弃=紫）；
+      //   ② 混合单（同一订单既有已打印完成、又有被放弃/打回的文件）→ 显示整单金额，末尾标 * 提示；
+      //   ③ 历史老订单（v5 之前无 order_files 明细）→ 显示父订单 total_price。
+      var _exclOrder = !!_EXCLUDE_STATUS[o.status];
+      var _hasFiles = (o.files || []).length > 0;
+      var _exclFiles = (o.files || []).filter(function (f) { return !!_EXCLUDE_STATUS[f.status]; }).length;
+      var showAmt = _orderNominalAmount(o);        // 展示口径：订单本身金额
+      var _partial = !_exclOrder && showAmt !== orderRev;   // 展示金额 ≠ 收益记录
+      // 悬停提示按「差异原因」分别措辞（不能一律说成「含被放弃的文件」，否则
+      // 自打订单、父子金额口径不一致的订单都会被误述）
+      var _tipParts = [];
+      if (_exclOrder) {
+        _tipParts.push('订单金额 ' + RMB(showAmt),
+                       statusLabel(o.status) + '，不计入收益');
+      } else if (_partial) {
+        _tipParts.push('订单金额 ' + RMB(showAmt));
+        _tipParts.push(o.is_admin_print ? '自打订单仅展示、不计入收益' : '计入收益 ' + RMB(orderRev));
+        if (!_hasFiles) _tipParts.push('该订单无文件明细，未计入收益统计');
+        else if (_exclFiles > 0) _tipParts.push('含 ' + _exclFiles + ' 个不计入收益的文件（放弃/取消/打回/失败）');
+        else _tipParts.push('文件级与订单级金额不一致，收益按文件级合计');
+      } else if (o.is_admin_print) {
+        _tipParts.push('订单金额 ' + RMB(showAmt), '自打订单仅展示、不计入收益');
+        if (money.pendingFiles > 0) _tipParts.push(money.pendingFiles + ' 个文件待处理');
+      } else {
+        _tipParts.push('云端收益记录 ' + RMB(orderRev));
+        if (money.pendingFiles > 0) _tipParts.push(money.pendingFiles + ' 个文件待处理');
+      }
+      var _amtTip = _tipParts.join(' · ');
       var addr = _orderAddr(o);
       h += '<tr class="order-row st-bar' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '" style="--row-stc:' + _statusColor(o.status) + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
       h += '<td><span class="expand-icon">▶</span></td>';
@@ -2606,7 +2649,8 @@ function _renderOrderListHTML() {
       h += '<td style="white-space:nowrap"><span class="' + srcCls + '">' + srcTxt + '</span></td>';
       h += '<td class="l ell" title="' + esc(who) + (addr ? ' · ' + esc(addr) : '') + '">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
       h += '<td style="white-space:nowrap"><span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span></td>';
-      h += '<td style="font-weight:700;color:' + revColor + '" title="云端收益记录 ' + RMB(orderRev) + (money.pendingFiles > 0 ? ' · ' + money.pendingFiles + ' 个文件待处理' : '') + '">' + RMB(orderRev) + '</td>';
+      h += '<td style="font-weight:700;color:' + revColor + '" title="' + _amtTip + '">' + RMB(showAmt) +
+        (_partial ? '<span style="color:var(--muted);font-weight:400">*</span>' : '') + '</td>';
       h += '<td>' + o.files_count + '</td>';
       h += '<td>' + (o.total_page_count || 0) + '</td>';
       var _osheets = _orderSheets(o);
@@ -4390,7 +4434,8 @@ function manualBind() {
 /* ==================== TAB: 授权（2026-11） ====================
    多设备共连云服务器时的设备授权管理：
    1. 本设备所有者 —— 从成员列表选择，绑定到后端设备注册表（计算机名 → 成员姓名）；
-   2. 云端设备列表 —— 所有连接过云服务器的设备：计算机名称 / 在线状态 / 所有者 / 是否接单。
+   2. 云端设备列表 —— 所有连接过云服务器的设备：计算机名称 / 在线状态 / 所有者 / 是否接单 /
+      自动双面能力（v6.6：三态人工标注，决定该设备能否无人值守打双面）。
    独立密码保护（密码 key = 'auth'，默认与其它模块一致，可在「设置」中修改）。 */
 function renderAuth() {
   var el = $('#tab-auth');
@@ -4406,7 +4451,7 @@ function renderAuth() {
   var h = '';
   h += '<div class="section"><h2>💻 本设备 <span class="hint">（本机信息，来自本地打印工具 · 所有者从成员列表选择）</span></h2>';
   h += '<div id="auth-local-device" style="color:var(--muted)">加载中…</div></div>';
-  h += '<div class="section"><h2>📡 云端设备列表 <span class="hint">（连接过云服务器的所有设备 · 在线状态实时）</span></h2>';
+  h += '<div class="section"><h2>📡 云端设备列表 <span class="hint">（连接过云服务器的所有设备 · 在线状态实时 · 可标注自动双面能力）</span></h2>';
   h += '<div id="auth-devices" style="color:var(--muted)">加载中…</div></div>';
   el.innerHTML = h;
   loadAuthData(members);
@@ -4422,18 +4467,27 @@ function loadAuthData(members) {
     if (!box) return;
     var dev = results[0] && results[0].device;
     if (!dev || !dev.client_id) { box.innerHTML = '<span style="color:var(--muted)">无法获取本机设备信息</span>'; return; }
-    // 从后端设备列表反查本机所有者（若列表拉取失败则显示未绑定）
+    // 从后端设备列表反查本机所有者与自动双面能力（若列表拉取失败则显示未绑定/未确认）
     // 兼容两种响应形态：顶层 devices（/api/printer/devices）或 data.devices 包装
     var currentOwner = '';
+    var myCap = null;
     var devList = results[1] && (results[1].devices || (results[1].data && results[1].data.devices));
     if (Array.isArray(devList)) {
-      devList.forEach(function (d) { if (d.client_id === dev.client_id) currentOwner = d.owner_name || ''; });
+      devList.forEach(function (d) {
+        if (d.client_id === dev.client_id) { currentOwner = d.owner_name || ''; myCap = d; }
+      });
     }
     var h = '<div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-bottom:10px">';
     h += '<div><span style="color:var(--muted);font-size:.8rem">计算机名称</span><div style="font-weight:700">' + esc(dev.device_name || dev.client_id) + '</div></div>';
     h += '<div><span style="color:var(--muted);font-size:.8rem">设备 ID</span><div style="font-family:monospace;font-size:.78rem">' + esc(dev.client_id) + '</div></div>';
     h += '<div><span style="color:var(--muted);font-size:.8rem">接单状态</span><div>' + (dev.take_orders ? '<span class="tag g">接单中</span>' : '<span class="tag">未接单</span>') + '</div></div>';
+    h += '<div><span style="color:var(--muted);font-size:.8rem">自动双面</span><div>' + capTextHtml(myCap) +
+         (myCap && myCap.printer_name ? '<span style="color:var(--muted);font-size:.72rem;margin-left:6px">' + esc(myCap.printer_name) + '</span>' : '') +
+         '</div></div>';
     h += '</div>';
+    if (myCap && myCap.auto_duplex === false) {
+      h += '<div class="hint" style="margin-bottom:10px">⚠ 本机已标注为<b>不支持自动双面</b>：双面订单需人工翻纸，无人值守（无障碍）打印双面不可用 —— 可在下方「云端设备列表」里改回。</div>';
+    }
     h += '<div class="settings-row"><label>本设备所有者</label>';
     if (!members.length) {
       h += '<select id="authOwnerSel" disabled><option value="">（暂无成员，请先在「设置」添加）</option></select>';
@@ -4464,13 +4518,18 @@ function loadAuthData(members) {
         box.innerHTML = '<span style="color:var(--muted)">暂无设备记录（本地打印工具连接云端后自动登记）</span>';
         return;
       }
-      var h = '<div class="table-wrap"><table><thead><tr><th class="l">计算机名称</th><th>在线状态</th><th>所有者</th><th>接单</th><th>操作</th></tr></thead><tbody>';
+      var h = '<div class="table-wrap"><table><thead><tr><th class="l">计算机名称</th><th>在线状态</th><th>所有者</th><th>接单</th><th>自动双面</th><th>操作</th></tr></thead><tbody>';
       list.forEach(function (d) {
         h += '<tr><td class="l">' + esc(d.device_name) +
              '<div style="font-family:monospace;font-size:.72rem;color:var(--muted)">' + esc(d.client_id) + '</div></td>';
         h += '<td>' + (d.online ? '<span class="tag g">🟢 在线</span>' : '<span class="tag">⚫ 离线</span>') + '</td>';
         h += '<td>' + (d.owner_name ? esc(d.owner_name) : '<span style="color:var(--muted)">未绑定</span>') + '</td>';
-        h += '<td>' + (d.is_active ? '<span class="tag g">接单中</span>' : '<span style="color:var(--muted)">—</span>') + '</td>';
+        h += '<td>' + (d.is_active
+              ? (d.online ? '<span class="tag g">接单中</span>'
+                          : '<span class="tag" title="该设备已离线，但接单记录还留着（僵尸记录）。'
+                            + '点右侧「🗑 删除」可一并清空，否则它会一直显示为接单中。">接单中（离线）</span>')
+              : '<span style="color:var(--muted)">—</span>') + '</td>';
+        h += '<td>' + capCellHtml(d) + '</td>';
         // P1（审计 2026-12）：client_id 由客户端自报，禁止拼进内联 onclick。
         // esc() 是 HTML 实体转义，拼进内联 JS 字符串时 &#39; 会被 HTML 解码回 ' ——
         // 恰好闭合字符串，等于把注入点交给 devices.json 的写入方。
@@ -4481,7 +4540,24 @@ function loadAuthData(members) {
              '>🗑 删除</button></td></tr>';
       });
       h += '</tbody></table></div>';
-      h += '<div style="margin-top:10px"><button class="btn sm" onclick="loadAuthData(getMembers())">🔄 刷新</button><span style="color:var(--muted);font-size:.78rem;margin-left:10px">每 15 秒自动刷新</span></div>';
+      // 被隐藏的测试设备（联调/冒烟脚本注册的 debug-* 等）：默认不占表格，只给一行提示 + 一键清理。
+      // 后端每 30 分钟也会自己清掉其中"离线"的那部分，这里只是让人能立刻处理。
+      // 另有"无主 + 离线"的陌生设备（云主机上的临时客户端等）：单独一个按钮，须人工判断。
+      var hidden = res.hidden_test_devices || 0;
+      var gray = list.filter(function (d) { return !d.online && !d.owner_name; }).length;
+      h += '<div style="margin-top:10px"><button class="btn sm" onclick="loadAuthData(getMembers())">🔄 刷新</button>';
+      if (hidden > 0) {
+        h += '<button class="btn sm" style="margin-left:8px" onclick="cleanupTestDevices()">🧹 清理测试设备（' + hidden + '）</button>';
+      }
+      if (gray > 0) {
+        h += '<button class="btn sm" style="margin-left:8px" onclick="cleanupUnboundDevices()">🧹 清理无主离线设备（' + gray + '）</button>';
+      }
+      h += '<span style="color:var(--muted);font-size:.78rem;margin-left:10px">每 15 秒自动刷新' +
+           (hidden > 0 ? ' · 测试设备已隐藏，后端每 30 分钟自动清理离线的那部分' : '') +
+           (gray > 0 ? ' · 无主且离线的设备若不是自己的机器，可一键清理（在线/已绑定/盖过章的都会跳过）' : '') +
+           '</span>';
+      h += '</div>';
+      h += '<div class="hint" style="margin-top:10px">「自动双面」= 该设备能否<b>无人值守</b>打印双面：选「不支持（需人工翻纸）」后，双面订单在这台机器上要人工翻纸、无障碍打印（无人值守）不可用。人工结论优先于本地打印工具的自动探测，且不会被探测覆盖（旧机型如 HP LaserJet 1018/1020/1022 的驱动会把「手动双面」也报成双面能力，必须人工确认）。</div>';
       box.innerHTML = h;
     })
     .catch(function () { var b = $('#auth-devices'); if (b) b.innerHTML = '<span style="color:var(--muted)">设备列表获取失败</span>'; });
@@ -4537,6 +4613,122 @@ function deleteDevice(clientId) {
       .catch(function () { toast('❌ 网络错误', 'error'); });
   });
 }
+
+/* 批量清理设备：先 dry-run 拿清单 → 弹窗确认 → 再显式传 dry_run:false 真删（两段式）。
+   extraBody 决定范围：
+     {}                                    → 测试/联调设备（debug-* 等，安全）
+     {include_offline_unbound:true, min_offline_days:0} → 无主且离线的陌生设备（含刚连过的）
+   后端默认 dry_run=true（防误点），且一律跳过在线设备、跳过人工盖过章的设备。 */
+function runDeviceCleanup(extraBody, label) {
+  fetch('/api/proxy/printer/devices/cleanup', {
+    method: 'POST', headers: apiHeaders(),
+    body: JSON.stringify(Object.assign({ dry_run: true }, extraBody || {}))
+  }).then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!res || !res.success) { toast('❌ ' + ((res && res.message) || '查询失败'), 'error'); return null; }
+      var ids = res.client_ids || [];
+      if (!ids.length) { toast('✅ 没有需要清理的' + label, 'success'); return null; }
+      var preview = ids.slice(0, 10).map(function (x) { return esc(x); }).join('<br>');
+      var more = ids.length > 10 ? '<br>…（共 ' + ids.length + ' 台）' : '';
+      var skipped = (res.skipped_online || []).length;
+      return openConfirm(
+        '将清理 <b>' + ids.length + '</b> 台' + label +
+        (skipped ? '（另有 ' + skipped + ' 台在线已跳过）' : '') +
+        '：<br><span style="font-family:monospace;font-size:.75rem">' + preview + more + '</span>',
+        '清理'
+      ).then(function (ok) {
+        if (!ok) return null;
+        return fetch('/api/proxy/printer/devices/cleanup', {
+          method: 'POST', headers: apiHeaders(),
+          body: JSON.stringify(Object.assign({ dry_run: false }, extraBody || {}))
+        }).then(function (r2) { return r2.json(); });
+      });
+    })
+    .then(function (res2) {
+      if (!res2) return;
+      if (res2.success) { toast('✅ ' + (res2.message || '已清理'), 'success'); loadAuthData(getMembers()); }
+      else toast('❌ ' + (res2.message || '清理失败'), 'error');
+    })
+    .catch(function () { toast('❌ 网络错误', 'error'); });
+}
+
+/* 测试设备（联调/冒烟脚本注册的 debug-* / socketio-debug-* 等）。 */
+function cleanupTestDevices() { return runDeviceCleanup({}, '测试设备'); }
+
+/* 无主且离线的陌生设备（含今天才连过一次的）—— 例如云主机上的临时客户端。
+   后端会跳过：在线设备、已绑定所有者的设备、人工盖过「自动双面」章的设备。 */
+function cleanupUnboundDevices() {
+  return runDeviceCleanup({ include_offline_unbound: true, min_offline_days: 0 },
+                          '无主离线设备');
+}
+
+/* ── 设备「自动双面」能力（v6.6）────────────────────────────────────────────
+   三态：true=支持自动双面 / false=不支持（需人工翻纸） / null=未确认。
+   后端解析优先级「人工盖章 > 本地工具自动探测 > 未确认」，且人工结论不会被探测覆盖
+   （旧机型驱动的 DC_DUPLEX 会把「手动双面」也算成双面能力，必须人能盖章）。
+   点选下拉 → 写后端 /api/printer/capability（source=manual）→ 立即广播给本地工具。 */
+
+/* 能力文案（本设备信息区用；传设备对象，缺失按未确认）。 */
+function capTextHtml(d) {
+  var v = d ? d.auto_duplex : null;
+  if (v === true) return '<span class="tag g">✅ 支持自动双面</span>';
+  if (v === false) return '<span class="tag r">🖐 不支持（需人工翻纸）</span>';
+  return '<span class="tag">未确认</span>';
+}
+
+/* 能力单元格（云端设备列表用）：三态下拉 + 来源标记 + 「探测与人工不一致」提示。 */
+function capCellHtml(d) {
+  var v = (typeof d.auto_duplex === 'boolean') ? d.auto_duplex : null;
+  var src = d.capability_source || 'unknown';
+  var cidSafe = safeId(d.client_id);
+  var title = d.printer_name ? ('当前打印队列：' + d.printer_name) : '该设备尚未上报打印队列名';
+  var h = '<select data-device-cap="' + esc(cidSafe) + '"' + (cidSafe ? '' : ' disabled') +
+          ' title="' + esc(title) + '" style="max-width:170px">' +
+          '<option value=""' + (v === null ? ' selected' : '') + '>未确认</option>' +
+          '<option value="1"' + (v === true ? ' selected' : '') + '>✅ 支持自动双面</option>' +
+          '<option value="0"' + (v === false ? ' selected' : '') + '>🖐 不支持（需人工翻纸）</option>' +
+          '</select>';
+  if (src === 'manual') {
+    h += ' <span class="tag b" title="' + esc(d.capability_verified_by ? ('人工确认：' + d.capability_verified_by) : '人工确认') + '">人工</span>';
+  } else if (src === 'probe') {
+    h += ' <span class="tag" title="由本地打印工具自动探测上报">探测</span>';
+  }
+  // 人工与探测结论不一致时露出来，便于事后核对（尤其是"驱动虚报支持"的老机型）
+  if (src === 'manual' && typeof d.capability_probe === 'boolean' && d.capability_probe !== v) {
+    h += '<div style="font-size:.7rem;color:var(--muted)">探测结果：' + (d.capability_probe ? '支持' : '不支持') + '（已被人工结论覆盖）</div>';
+  }
+  return h;
+}
+
+/* 保存人工结论。autoDuplex: true / false / null（null = 清除人工结论、回到自动探测）。 */
+function saveDeviceCapability(clientId, autoDuplex) {
+  if (!clientId) { toast('❌ 设备 ID 非法，已拒绝操作', 'error'); return; }
+  fetch('/api/proxy/printer/capability', {
+    method: 'POST', headers: apiHeaders(),
+    body: JSON.stringify({ client_id: clientId, source: 'manual', auto_duplex: autoDuplex })
+  }).then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res && res.success) {
+        var msg = autoDuplex === false ? '✅ 已标注「不支持自动双面」：双面订单需人工翻纸，无障碍打印不可用'
+                : (autoDuplex === true ? '✅ 已标注「支持自动双面」' : '✅ 已清除人工结论（回到自动探测结果）');
+        toast(msg, 'success');
+        loadAuthData(getMembers());
+      } else {
+        toast('❌ ' + ((res && res.message) || '保存失败'), 'error');
+        loadAuthData(getMembers());   // 失败也回读一次，避免下拉停在未保存的状态
+      }
+    })
+    .catch(function () { toast('❌ 网络错误', 'error'); loadAuthData(getMembers()); });
+}
+/* 授权页「自动双面」下拉：事件委托（下拉由 innerHTML 反复重建，绑在 document 上最稳）。
+   本页还有别的 select（成员/模块/月份等）也冒泡 change，必须用 data-device-cap 过滤。 */
+document.addEventListener('change', function (e) {
+  var t = e.target;
+  if (!t || !t.getAttribute || t.getAttribute('data-device-cap') === null) return;
+  var cid = safeId(t.getAttribute('data-device-cap'));
+  if (!cid) { toast('❌ 设备 ID 非法，已拒绝操作', 'error'); return; }
+  saveDeviceCapability(cid, t.value === '' ? null : (t.value === '1'));
+});
 /* 授权页设备列表自动刷新（仅当前处于授权页且已解锁时执行，避免后台空转） */
 setInterval(function () {
   if (currentTab === 'auth' && unlocked.auth && FINANCE_MODE !== 'local') loadAuthData(getMembers());
@@ -4549,7 +4741,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v6.3</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v6.7</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -4583,6 +4775,9 @@ function renderAbout() {
     '<p style="margin-top:10px">v6.2：纸张张数统计 —— ① Hero KPI 新增「纸张张数」卡（单面每页 1 张、双面每张 2 页，奇数页最后一张仍占 1 张，含份数），副行显示单面/双面张数拆分；② 趋势分析新增「纸张」第五指标（≤60 天自动渲染为逐日柱状图，>60 天为切片折线；专属橙色，峰值/提示同步）；③ 修复「单双面构成」饼图此前按文件数计数却标注「张」的模糊统计，改为按实际纸张张数；④ 订单明细文件级新增「张数」列（含份数的实际用纸量）；⑤ 汇总行补充「· X 张纸」。</p>' +
     '<p style="margin-top:10px">v6.3：张数列补全 —— ① 订单明细订单行「页数」右侧新增「张数」列，显示该订单消耗的纸张总张数（悬停看单面/双面拆分）；② 展开的文件子列表「张数」列移至「页数」右侧，与订单行列序一致，仍显示该文件消耗的纸张张数（含份数）。</p>' +
     '<p style="margin-top:10px">v6.4：实际转账 + 实际盈亏 —— 原「经营损益 / 历史记录净额」只算账面该赚该亏，「资金重分配」里的转账指令也只是建议，钱有没有真的转并不影响显示，导致垫钱的人反被记成盈利（例：某月一人垫付 1125.77、代收仅 101.80，账面记他 +862.36，实际亏 1023.97）。现新增：① 「💸 实际转账」区块（独立密码，默认需在设置页另行设置），可一键套用建议转账指令、逐条增删改（付款人 / 收款人 / 金额 / 备注），并实时显示每条建议的「已转 / 还差」；转账<b>不记日期、直接归属当前结算月份</b>（钱即使下个月才转，也还是这个月的结算，不会随付款时间跑到下个月），跨月补记请切到对应结算月份再录；② 「💰 实际盈亏」表按现金口径（代收 + 实收转账 − 垫付 − 实付转账）列出每人真正拿到手多少钱、与应得盈亏差多少，差额即「还没到位的钱」；③ 「历史记录」各成员列改为显示当月实际盈亏（小字标注应得盈亏），与实际转账联动。转账是成员内部的钱，团队总盈亏不受影响，变的是亏损实际由谁垫着。原有「资金重分配」改称「建议转账指令」以示区别。</p>' +
+    '<p style="margin-top:10px">v6.5：订单明细金额列改为「订单金额」展示口径（不再清零）—— 此前该列直接用收益记录口径（放弃/取消/打回/失败一律剔除），于是整单被放弃时显示 ¥0.00，与展开后的文件级金额（如 ¥1.20 / ¥0.80）自相矛盾。现统一为：① 整单被排除（放弃/取消/打回/失败）→ 显示订单本身金额（父订单 total_price，缺失时退回子任务费合计），颜色取该状态的状态色（放弃=紫），悬停提示「订单金额 ¥X · 放弃打印，不计入收益」；② 混合单（同一订单既有已打印完成、又有被放弃/打回的文件）→ 显示整单金额、末尾标 <b>*</b>，悬停提示「订单金额 ¥X · 计入收益 ¥Y · 含 N 个不计入收益的文件」；③ 历史老订单（v5 之前无 order_files 明细）→ 显示父订单 total_price（不再是 ¥0.00），悬停提示注明该单无文件明细、未计入收益统计。<b>收益统计口径完全不变</b>（仍按 sent + 待处理 计入，放弃/取消/打回/失败一律剔除），订单明细标题的说明同步为「自打/放弃/取消/打回/失败订单金额仅展示、不计入收益 · 带 * 的金额含未计入收益的部分」。</p>' +
+    '<p style="margin-top:10px">v6.6：设备自动双面能力标注 —— ① 「🔐 授权」页云端设备列表新增「自动双面」列（三态下拉：✅ 支持自动双面 / 🖐 不支持（需人工翻纸）/ 未确认），可直接标注每一台设备；② 能力解析优先级为「人工标注 &gt; 本地打印工具自动探测 &gt; 未确认」，人工结论<b>不会被后续探测覆盖</b>（旧机型如 HP LaserJet 1018/1020/1022 有手动双面功能，驱动的双面能力位会虚报"支持"，只有人能盖章）；③ 后端 <b>/api/claiming_devices</b> 与 <b>/api/printer/devices</b> 下发 <b>auto_duplex</b>（true/false/null）与来源标记，本地工具 <b>printer_state</b> 同步本机能力 —— 这解决"现场有旧机型不支持自动双面、程序却一律按支持自动双面提交任务，结果静默打成单面还收双面的钱"的问题；禁用无障碍打印等下游动作由移动端/服务端在各自环节实施。</p>' +
+    '<p style="margin-top:10px">v6.7：测试设备不再堆在授权页 —— 联调/冒烟脚本每次运行都会以固定前缀（<b>debug-*</b> / <b>socketio-debug-*</b> / <b>deploy-check*</b> / <b>wscheck-*</b> 等）注册设备，历史上直连生产，攒出了 48 台"测试设备"、还留着僵尸「接单中」记录。现改为：① 后端识别这些 id 并在设备列表中<b>默认隐藏</b>（列表下方提示数量），不再占满一屏；② 新增 <b>POST /api/printer/devices/cleanup</b>（默认 dry_run，只列不删；一律跳过在线设备）与授权页「🧹 清理测试设备」按钮（先预览清单再确认）；③ 后端每 30 分钟自动清掉<b>离线</b>的测试设备，并同步清空它们的接单记录（否则 get_active_printer_client() 可能挑到一台永远不会干活的机器）；④ 另加「🧹 清理无主离线设备」按钮（针对云主机上的临时客户端等陌生设备：<b>在线、已绑定所有者、人工盖过「自动双面」章的设备都会跳过</b>，先预览再确认）；⑤ 离线却仍挂着接单记录的设备显示为「接单中（离线）」并提示可删除清空。真机再连会自动重新登记，删除是幂等的。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

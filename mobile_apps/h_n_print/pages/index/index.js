@@ -1980,7 +1980,36 @@ Component({
 
     onSelectDevice(e) {
       const id = e.currentTarget.dataset.id
-      if (id) this.setData({ selectedDeviceId: id })
+      if (!id) return
+      // 切到"不支持自动双面"的设备时：若已开着无障碍且存在双面文件 → 关掉无障碍并说明原因。
+      // 为什么不改文件的双面：双面是客户已付费的意图，改的是「无人值守」这个执行方式。
+      if (this.data.autoPrintEnabled && this._targetNeedsManualFlip(id) && this._hasDuplexFile()) {
+        this.setData({ selectedDeviceId: id }, () => {
+          this.onAutoPrintToggle()   // 当前是开启状态 → 走完整的关闭动画与状态清理
+        })
+        wx.showToast({
+          title: '该设备不支持自动双面，已关闭「无障碍打印」：双面需人工开始并翻纸',
+          icon: 'none', duration: 3200,
+        })
+        return
+      }
+      this.setData({ selectedDeviceId: id })
+    },
+
+    // 目标设备是否「已确认不支持自动双面」（auto_duplex === false → 双面必须人工翻纸）。
+    // 移动端据此做「双面 × 无人值守」互斥：那张表无人值守只会打完第 1 趟就停下等人。
+    // 未确认(null)一律按"不拦"处理（老客户端接入时设备常常还没被标注）。
+    _targetNeedsManualFlip(id) {
+      const cid = (id === undefined || id === null || id === '') ? this.data.selectedDeviceId : id
+      const dev = (this.data.claimingDevices || []).find(d => d && d.client_id === cid)
+      return !!(dev && dev.auto_duplex === false)
+    },
+
+    // 本单是否存在"真的会双面打印"的文件（口径与提交时一致：图片/整份1页/有效选1页固定单面）
+    _hasDuplexFile() {
+      return (this.data.selectedFiles || []).some(f => f
+        && !f.isImage && !f.excelWarning && !f.unsupportedFormat
+        && f.pageCount !== 1 && !f.singlePage && (f.duplex || 'on') === 'on')
     },
 
     onFileDuplexChange(e) {
@@ -1992,6 +2021,14 @@ Component({
       const f = this.data.selectedFiles[index]
       if (!f || f.excelWarning || f.unsupportedFormat) return
       if (f.pageCount === 1 || f.singlePage) return  // 整份1页/有效选择1页无法双面，固定单面
+      // 无障碍打印下不能选双面（目标设备不支持自动双面）：无人值守只会打出半成品等人翻纸
+      if (value === 'on' && this.data.autoPrintEnabled && this._targetNeedsManualFlip()) {
+        wx.showToast({
+          title: '该设备不支持自动双面：无人值守只能单面；需双面请先关闭「无障碍打印」',
+          icon: 'none', duration: 3200,
+        })
+        return
+      }
       this.setData({ ['selectedFiles[' + index + '].duplex']: value })
     },
 
@@ -2234,6 +2271,14 @@ Component({
 
     onAutoPrintToggle() {
       const turningOn = !this.data.autoPrintEnabled
+      // 开启前先拦：目标设备不支持自动双面 + 本单有双面文件 → 无人值守只会卡在半成品
+      if (turningOn && this._targetNeedsManualFlip() && this._hasDuplexFile()) {
+        wx.showToast({
+          title: '当前有双面文件，而该设备需人工翻纸：请改为单面，或保持手动开始打印',
+          icon: 'none', duration: 3200,
+        })
+        return
+      }
       this.setData({ autoPrintEnabled: turningOn })
       if (turningOn) {
         // 展开动画：先以 collapsed 初始态渲染，渲染完成后再切 expanded 触发 CSS 过渡
@@ -2806,11 +2851,20 @@ Component({
         return
       }
 
+      // 提交兜底：无障碍打印 + 双面文件 + 不支持自动双面的设备 → 无人值守必然卡住。
+      // 界面上三个入口都已拦（开关/双面/切设备），这里是最后一道（后端同样会 409 拦下）。
+      if (this.data.autoPrintEnabled && this._targetNeedsManualFlip() && this._hasDuplexFile()) {
+        wx.showToast({
+          title: '目标设备不支持自动双面：请关闭「无障碍打印」，或把双面文件改为单面',
+          icon: 'none', duration: 3200,
+        })
+        return
+      }
+
       // 检查是否有可打印的文件（排除 Excel/PPT/CAD 等不支持格式）
       const printable = selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat)
       const unsupportedCount = selectedFiles.length - printable.length
-      if (printable.length === 0) {
-        // 全部不支持 → 任务发起失败
+      if (printable.length === 0) {        // 全部不支持 → 任务发起失败
         wx.showModal({
           title: '任务发起失败',
           content: '所选文件均为不支持的文件格式（如 Excel/PPT/CAD），无法打印。请移除后重新选择，或联系管理员。',
@@ -3229,9 +3283,9 @@ Component({
         }
       })
 
-      // 派送
-      itemNum++
+      // 派送：未勾选 → 整行不出现（编号也不占位，避免出现「3. 派送：否」这种没选的附加服务）
       if (deliveryEnabled) {
+        itemNum++
         const loc = deliveryLocation
         const pct = deliveryPercent
         const deliveryCost = pyRound2(baseTotal * pct / 100)   // 与后端同口径取整到分
@@ -3241,8 +3295,6 @@ Component({
         } else {
           lines.push(itemNum + '. 派送：是 | ' + loc + '免费')
         }
-      } else {
-        lines.push(itemNum + '. 派送：否')
       }
 
       // 优先级
@@ -3255,7 +3307,7 @@ Component({
         lines.push(itemNum + '. 优先级：' + urgency + ' | ￥0')
       }
 
-      // 首页
+      // 首页：未勾选 → 整行不出现
       if (coverPage) {
         itemNum++
         lines.push(itemNum + '. 打印首页信息 | ' + coverPagePrice.toFixed(2))

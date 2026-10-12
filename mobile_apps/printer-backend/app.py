@@ -59,6 +59,53 @@ DEVICES_FILE = "devices.json"
 # printer_claim.json: { active_client_id, owner_name, claimed_at } — 当前启用「接单」的设备
 CLAIM_FILE = "printer_claim.json"
 
+# ── 测试/联调设备的识别（2026-10）─────────────────────────────────────────────
+# 联调与部署冒烟脚本会以固定前缀注册设备。历史上它们直连生产，把 48 台 debug-* /
+# socketio-debug-* 灌进了生产 devices.json，授权页一屏全是"测试设备"、还留着僵尸接单记录。
+# 真机的 client_id 形态是 "<计算机名>-<8~12 位十六进制>"，下面这些是脚本自造的名字，不会撞车。
+# 识别出来后：① 列表接口默认隐藏（附 hidden_test_devices 计数，页面可提示）；
+# ② 定时任务把**离线**的它们连同接单记录一起清掉（在线的不动，避免打断正在跑的机器）；
+# ③ 授权页有「清理测试设备」按钮（先 dry-run 预览再确认）。
+TEST_DEVICE_PREFIXES = (
+    "debug-", "socketio-debug", "deploy-check", "wscheck-",
+    "fallback-", "staging-", "test-device", "pc-test", "PRODTEST",
+)
+TEST_DEVICE_IDS = {"debug", "test"}
+
+
+def is_test_device_id(client_id: str) -> bool:
+    """是否像测试/联调脚本注册的设备（只认明确前缀，避免误伤真机）。"""
+    cid = (client_id or "").strip()
+    if not cid:
+        return False
+    return cid in TEST_DEVICE_IDS or cid.startswith(TEST_DEVICE_PREFIXES)
+
+
+def _delete_devices(client_ids, reason: str = "") -> list[str]:
+    """批量删除设备并清掉它们的接单记录（返回真正删掉的 id 列表）。"""
+    ids = [c for c in dict.fromkeys(client_ids or []) if c]
+    if not ids:
+        return []
+    devices = load_devices()
+    removed = [c for c in ids if devices.pop(c, None) is not None]
+    if removed:
+        save_devices(devices)
+    cleared = []
+    with _claim_lock:
+        claim = _load_claim_impl()
+        claiming = claim.get("claiming_devices")
+        if isinstance(claiming, dict):
+            for c in ids:
+                if claiming.pop(c, None) is not None:
+                    cleared.append(c)
+            if cleared:
+                _save_claim_impl(claim)
+    if removed or cleared:
+        broadcast_printer_state()
+        print(f"[DEV] 清理设备 {len(removed)} 台（{reason}）"
+              f"{f'，同时清空 {len(cleared)} 条接单记录' if cleared else ''}: {removed[:8]}")
+    return removed
+
 # 默认保留时间：7 天
 DEFAULT_RETENTION = {"days": 7, "hours": 0}
 
@@ -740,8 +787,11 @@ def save_devices(data: dict) -> None:
             print(f"  [DEV] 保存设备注册表失败: {e}")
 
 
-def register_device(client_id: str, device_name: str = "") -> None:
-    """登记设备上线（连接/心跳/领取时调用）：记录计算机名与在线时间。"""
+def register_device(client_id: str, device_name: str = "", printer: dict | None = None) -> None:
+    """登记设备上线（连接/心跳/领取时调用）：记录计算机名与在线时间。
+
+    printer：可选的能力上报（见 _printer_probe_from_request / _merge_printer_probe），
+    只写探测字段、保留人工盖章字段；不传则完全不动已有能力记录。"""
     if not client_id:
         return
     devices = load_devices()
@@ -750,6 +800,8 @@ def register_device(client_id: str, device_name: str = "") -> None:
     entry["device_name"] = (device_name or entry.get("device_name", "") or client_id)[:64]
     entry["first_seen"] = entry.get("first_seen", now_str)
     entry["last_seen"] = now_str
+    if printer:
+        entry["printer"] = _merge_printer_probe(entry.get("printer"), printer)
     devices[client_id] = entry
     save_devices(devices)
 
@@ -764,6 +816,198 @@ def get_device_entry(client_id: str) -> dict:
 def get_device_owner(client_id: str) -> str:
     """读取设备绑定的所有者姓名（未绑定返回空串）。"""
     return (get_device_entry(client_id) or {}).get("owner_name", "") or ""
+
+
+# ── 打印机能力：自动双面（2026-10）──────────────────────────────────────────
+# 需求背景：现场有「不支持自动双面、只有手动双面」的旧机型（HP LaserJet 1018/1020/1022），
+# 它们靠驱动弹「双面打印说明」框指挥用户翻纸，机器本身没有双面器。程序过去一律假设
+# 「打印机支持自动双面」，在这种机器上会**静默打成单面却报成功**（客户付双面的钱、店里
+# 出双倍纸）。所以能力必须显式收集、随设备上报、并让下游（移动端禁用无障碍打印）能看到。
+#
+# 判定分两层，且**人工盖章优先、不可被自动探测覆盖**：
+#   · probe_*  —— 本地打印工具探测上报（DeviceCapabilities(DC_DUPLEX) + DEVMODE 合并回读
+#                 是否被驱动改回 SIMPLEX），下一次探测可以刷新它；
+#   · manual_* —— 人工确认的结论（授权页「自动双面」下拉 / 本地工具勾选），只有再人工改
+#                 才会变。**刻意不让探测覆盖人工**：这类 HP 驱动会把「手动双面」也算进双面
+#                 能力（DC_DUPLEX 可能报 1），"有没有双面器"这个事实只有人能盖章确认。
+# 解析优先级 manual > probe > unknown（不设"设备名/驱动名预设库"作为判据：队列名用户可改、
+# 驱动名随版本变，预设只能当提示，放在本地工具侧，不进服务端判定链路）。
+
+def _as_bool_or_none(value):
+    """归一化三态布尔：True/False/None（未知）。接受 bool / 0/1 / "1"/"0"/"true"/"false"/""。"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def _mutate_device(client_id: str, fn) -> bool:
+    """对单台设备做一次读-改-写（设备未登记返回 False）。fn(entry, now_str) 就地修改 entry。"""
+    if not client_id:
+        return False
+    devices = load_devices()
+    entry = devices.get(client_id)
+    if not isinstance(entry, dict):
+        return False
+    fn(entry, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    devices[client_id] = entry
+    save_devices(devices)
+    return True
+
+
+def _merge_printer_probe(current: dict | None, incoming: dict) -> dict:
+    """把一次自动探测上报并入 printer 子对象。
+
+    **只写探测字段（queue/driver/port/probe_*），manual_* 人工字段原样保留** —— 这是
+    「人工盖章不可被探测覆盖」这条规则的实现处。incoming 里没有 "auto_duplex" 键时
+    不动探测结论（只补打印机名等描述信息）。"""
+    p = dict(current or {})
+    for key in ("queue", "driver", "port"):
+        val = str(incoming.get(key) or "").strip()[:120]
+        if val:
+            p[key] = val
+    if "auto_duplex" in incoming:
+        p["probe_auto_duplex"] = _as_bool_or_none(incoming.get("auto_duplex"))
+        p["probe_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return p
+
+
+def set_device_probe(client_id: str, incoming: dict) -> bool:
+    """写入自动探测结果（本地工具上报；不触碰人工盖章字段）。"""
+    return _mutate_device(
+        client_id,
+        lambda entry, _now: entry.__setitem__(
+            "printer", _merge_printer_probe(entry.get("printer"), incoming)),
+    )
+
+
+def set_device_manual_capability(client_id: str, auto_duplex, by: str = "") -> bool:
+    """人工确认设备能否自动双面（True/False；None = 清除人工结论、回到自动探测结果）。"""
+    def _mut(entry: dict, now_str: str):
+        p = dict(entry.get("printer") or {})
+        verdict = _as_bool_or_none(auto_duplex)
+        if verdict is None:
+            for key in ("manual_auto_duplex", "manual_by", "manual_at"):
+                p.pop(key, None)
+        else:
+            p["manual_auto_duplex"] = verdict
+            p["manual_by"] = str(by or "").strip()[:30]
+            p["manual_at"] = now_str
+        entry["printer"] = p
+
+    return _mutate_device(client_id, _mut)
+
+
+def get_device_capability(client_id: str) -> dict:
+    """解析一台设备的自动双面能力（人工 > 探测 > 未知）。
+
+    Returns:
+        {
+            "auto_duplex": True|False|None,   # None = 未确认
+            "source": "manual"|"probe"|"unknown",
+                manual  = 人工盖章的结论；
+                probe   = 结论来自自动探测（含"探测过但没得出 True/False"这种情况，
+                          此时 auto_duplex 仍为 None——UI 可据此显示"探测过、未确认"）；
+                unknown = 既没人工盖章、也没探测上报过（老客户端）。
+            "printer_name"/"printer_driver"/"printer_port": str,   # 本地工具上报的描述信息
+            "verified_by"/"verified_at": str, # 人工确认者与时间
+            "probe_auto_duplex"/"probe_at": ...,  # 原始探测值（UI 可用于显示"探测与人工不一致"）
+        }
+    """
+    printer = (get_device_entry(client_id) or {}).get("printer") or {}
+    manual = printer.get("manual_auto_duplex")
+    manual = manual if isinstance(manual, bool) else None
+    probe = printer.get("probe_auto_duplex")
+    probe = probe if isinstance(probe, bool) else None
+    # probe_at 只在"上报里带了 auto_duplex 键"时才写 → 它存在就说明探测过（哪怕结论是未确认）
+    probed = bool(printer.get("probe_at")) or probe is not None
+    if manual is not None:
+        auto, source = manual, "manual"
+    elif probe is not None:
+        auto, source = probe, "probe"
+    elif probed:
+        auto, source = None, "probe"
+    else:
+        auto, source = None, "unknown"
+    return {
+        "auto_duplex": auto,
+        "source": source,
+        "printer_name": printer.get("queue", "") or "",
+        "printer_driver": printer.get("driver", "") or "",
+        "printer_port": printer.get("port", "") or "",
+        "verified_by": printer.get("manual_by", "") or "",
+        "verified_at": printer.get("manual_at", "") or "",
+        "probe_auto_duplex": probe,
+        "probe_at": printer.get("probe_at", "") or "",
+    }
+
+
+def _device_capability_fields(client_id: str) -> dict:
+    """设备相关的各类 payload 共用的能力字段（列表接口 / 接单状态都用同一套键名）。"""
+    cap = get_device_capability(client_id)
+    return {
+        "auto_duplex": cap["auto_duplex"],           # true / false / null(未确认)
+        "capability_source": cap["source"],          # manual / probe / unknown
+        "printer_name": cap["printer_name"],
+        "capability_verified_by": cap["verified_by"],
+        "capability_probe": cap["probe_auto_duplex"],
+    }
+
+
+def _device_needs_manual_flip(client_id: str) -> bool:
+    """该设备是否**已确认不支持自动双面**（双面必须人工翻纸）。
+
+    只认解析结果 `auto_duplex is False`（人工盖章或本地工具探测得到的高置信结论）；
+    `None`（未确认，老客户端/没标注）与 `True` 一律返回 False —— 阶段①的取舍：**未确认按现状放行**，
+    否则所有还没被标注的设备都会突然不能下单。"""
+    return get_device_capability(client_id).get("auto_duplex") is False
+
+
+def check_auto_print_duplex_conflict(auto_print, target_client_id: str,
+                                     has_duplex: bool) -> str:
+    """「无障碍打印 + 双面文件 + 目标设备不支持自动双面」的冲突校验。
+
+    返回 "" = 放行；非空 = 给用户看的原因（调用方原样回给前端）。
+
+    为什么必须拦：目标设备不支持自动双面时，双面要**人工翻纸**；无障碍/预约是无人值守，
+    本地工具打完第 1 趟就会停下等人（挂起并给标签页标 ⏸），订单等于卡死在那里 ——
+    让用户在下单时就得到提示，比事后在现场发现好得多。
+    单面文件 + 无障碍是允许的（那台机器完全可以无人值守打单面）✔。"""
+    if not auto_print or not has_duplex or not target_client_id:
+        return ""
+    if not _device_needs_manual_flip(target_client_id):
+        return ""
+    return ("目标设备不支持自动双面：双面文件需要人工翻纸，无法无人值守打印。"
+            "请关闭「无障碍打印」改为手动开始打印，或把文件改为单面。")
+
+
+def _printer_probe_from_request() -> dict | None:
+    """从连接/心跳请求的 query 里取本地工具上报的打印机能力。
+
+    参数名：printer_name（打印队列）/ printer_driver / printer_port / auto_duplex。
+    **老版本地工具不带这些参数 → 返回 None**，注册表里的能力保持原状（解析为 unknown），
+    不会因为一次旧客户端连接就把已确认的能力抹掉。"""
+    args = request.args
+    if not any(k in args for k in ("auto_duplex", "printer_name", "printer_driver", "printer_port")):
+        return None
+    probe: dict = {}
+    if "auto_duplex" in args:
+        probe["auto_duplex"] = args.get("auto_duplex")
+    for key, arg in (("queue", "printer_name"),
+                     ("driver", "printer_driver"),
+                     ("port", "printer_port")):
+        val = (args.get(arg) or "").strip()
+        if val:
+            probe[key] = val
+    return probe or None
 
 
 def _load_claim_impl() -> dict:
@@ -865,7 +1109,8 @@ def device_display_label(client_id: str) -> str:
 
 def _printer_state_payload(client_id: str) -> dict:
     """构造发给某设备的接单状态 payload（本机是否启用接单、全部接单设备、本机所有者）。
-    2026-12：多设备接单 —— claiming_devices 为全部启用接单设备，is_active 表示本机是否在其中。"""
+    2026-12：多设备接单 —— claiming_devices 为全部启用接单设备，is_active 表示本机是否在其中。
+    2026-10：附带本机自动双面能力（本地工具据此调整双面 UI / 提示"需人工翻纸"）。"""
     claiming = get_claiming_devices()
     mine = get_device_entry(client_id)
     return {
@@ -878,6 +1123,8 @@ def _printer_state_payload(client_id: str) -> dict:
         "active_client_id": client_id if client_id in claiming else "",
         "active_owner_name": (claiming.get(client_id) or {}).get("owner_name", ""),
         "active_device_name": mine.get("device_name", "") if client_id in claiming else "",
+        # 本机自动双面能力（服务端为准：人工盖章 > 自动探测 > 未确认）
+        **_device_capability_fields(client_id),
     }
 
 
@@ -2482,8 +2729,9 @@ def on_connect(auth=None):
         return False
 
     # 设备注册：计算机名随连接参数上报（本地工具 hostname），写入设备注册表（跨重启保留）
+    # printer= 可选能力上报（打印队列 / 驱动 / 端口 / 是否自动双面）；老客户端不带则为 None
     device_name = (request.args.get("device_name", "") or "").strip()[:64]
-    register_device(client_id, device_name)
+    register_device(client_id, device_name, printer=_printer_probe_from_request())
 
     with printer_clients_lock:
         old = printer_clients.get(client_id)
@@ -4545,6 +4793,17 @@ def submit_order():
         target_client_id = ""
     printer_online = is_printer_available()  # 有启用接单的设备（含离线：离线设备被指定时任务排队等其上线）
 
+    # ---- 无障碍打印 × 自动双面 冲突校验（2026-10）----
+    # 目标设备已确认不支持自动双面时，双面要人工翻纸，无人值守必然卡住（本地工具会挂起等翻纸）。
+    # 在**建单之前**拦下，前端直接展示 message；未确认/支持自动双面的设备一律放行（零回归）。
+    has_duplex_file = any(
+        str(f.get("duplex", duplex) or "on").strip().lower() == "on" for f in files_input)
+    conflict = check_auto_print_duplex_conflict(auto_print, target_client_id, has_duplex_file)
+    if conflict:
+        return jsonify({"success": False,
+                        "code": "auto_print_duplex_conflict",
+                        "message": conflict}), 409
+
     # ---- 事务：插 1 条 orders + N 条 order_files ----
     conn = get_db()
     user_conn = get_user_db()
@@ -4815,7 +5074,9 @@ def pull_queued_orders():
 
     client_id = request.args.get("client_id", "") or socket.gethostname()
     # 登记设备（HTTP 拉取路径的连接也纳入设备注册表，供收支清算「授权」页展示）
-    register_device(client_id, request.args.get("device_name", "") or client_id)
+    # 能力上报同 socket 连接：HTTP 心跳顺带刷新打印机信息（老客户端不带 → None，不改动旧记录）
+    register_device(client_id, request.args.get("device_name", "") or client_id,
+                    printer=_printer_probe_from_request())
     # HTTP 通道心跳：socket 掉线但仍能 HTTP 拉单时保持「在线」（否则下面 get_active_printer_client
     # 判本机离线 → 永远返回空，双通道实为单通道）。必须在 get_active_printer_client() 之前刷新。
     touch_printer_heartbeat(client_id)
@@ -4943,7 +5204,7 @@ def printer_release():
 
 @app.route("/api/printer/devices", methods=["GET"])
 def printer_devices():
-    """返回连接过云服务器的全部设备：计算机名称、在线状态、所有者、是否接单。
+    """返回连接过云服务器的全部设备：计算机名称、在线状态、所有者、是否接单、自动双面能力。
     供收支清算「授权」页展示（打印机 token 鉴权，本地打印工具经 stats_server 代理调用）。"""
     token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
@@ -4952,7 +5213,12 @@ def printer_devices():
     online_set = set(get_active_clients())
     devices = load_devices()
     result = []
+    hidden_test = 0
     for cid, entry in devices.items():
+        if is_test_device_id(cid):
+            # 测试/联调设备默认不展示（否则授权页一屏全是 debug-*），只回计数供页面提示
+            hidden_test += 1
+            continue
         result.append({
             "client_id": cid,
             "device_name": entry.get("device_name", "") or cid,
@@ -4961,6 +5227,8 @@ def printer_devices():
             "first_seen": entry.get("first_seen", ""),
             "last_seen": entry.get("last_seen", ""),
             "is_active": is_claiming(cid),
+            # 自动双面能力（三态；授权页据此标注"需人工翻纸"）
+            **_device_capability_fields(cid),
         })
     # 在线设备排前，其余按计算机名排序
     result.sort(key=lambda d: (not d["online"], d["device_name"].lower()))
@@ -4968,13 +5236,81 @@ def printer_devices():
         "success": True,
         "devices": result,
         "claiming_count": len(get_claiming_device_ids()),
+        # 被隐藏的测试设备数（页面据此提示「已隐藏 N 台测试设备」+ 一键清理）
+        "hidden_test_devices": hidden_test,
     })
+
+
+@app.route("/api/printer/capability", methods=["POST"])
+def printer_capability():
+    """写入设备的「自动双面」能力（printer token 鉴权）。
+
+    body: {"client_id": "...", "auto_duplex": true|false|null,
+           "source": "manual"(默认) | "probe",
+           "printer_name"/"printer_driver"/"printer_port": 可选描述信息,
+           "by": 可选（人工确认者，如成员姓名）}
+
+    · source=manual —— 人工盖章（授权页「自动双面」下拉）。优先于自动探测，且只有再人工改
+      才会变；auto_duplex=null 表示清除人工结论、回到自动探测结果。
+    · source=probe —— 本地打印工具探测上报，只写探测字段，不覆盖人工结论。
+
+    下游执行（2026-10 起已落地，不只是"记录"）：
+      · **服务端兜底**：`submit_order` 里 `check_auto_print_duplex_conflict` —— 目标设备
+        `auto_duplex is False` 且本单有双面文件时，无障碍/预约提交直接 409 拦下并给出可执行提示；
+      · **移动端**（小程序/APP）：双面 × 无人值守互斥 —— 选双面、开无障碍、切换设备三个入口都拦，
+        切换设备时自动关掉无障碍（不静默改单面），设备列表标「🖐 需人工翻纸」；
+      · 阶段①口径：只有**已确认**（auto_duplex is False）才生效，未确认(null)一律放行，
+        避免还没标注的设备突然不能下单。
+    """
+    token = _get_printer_token()
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()[:64]
+    if not client_id:
+        return jsonify({"success": False, "message": "client_id 不能为空"}), 400
+    if client_id not in load_devices():
+        return jsonify({"success": False,
+                        "message": "设备未登记（该设备需先连接过云服务器）"}), 404
+
+    source = (data.get("source") or "manual").strip().lower()
+    if source not in ("manual", "probe"):
+        return jsonify({"success": False, "message": "source 只能是 manual 或 probe"}), 400
+
+    if source == "probe":
+        probe = {}
+        if "auto_duplex" in data:
+            probe["auto_duplex"] = data.get("auto_duplex")
+        for key, field in (("queue", "printer_name"), ("driver", "printer_driver"),
+                           ("port", "printer_port")):
+            val = str(data.get(field) or "").strip()
+            if val:
+                probe[key] = val
+        if not probe:
+            return jsonify({"success": False, "message": "没有任何可写入的探测字段"}), 400
+        ok = set_device_probe(client_id, probe)
+    else:
+        ok = set_device_manual_capability(client_id, data.get("auto_duplex"),
+                                          by=data.get("by") or "")
+    if not ok:
+        return jsonify({"success": False, "message": "设备不存在或写入失败"}), 404
+
+    cap = get_device_capability(client_id)
+    label = {True: "支持自动双面", False: "不支持（需人工翻纸）", None: "未确认"}[cap["auto_duplex"]]
+    print(f"[DEV] 设备 {client_id} 自动双面能力已更新（{source}）: {label}"
+          + (f" @ {cap['printer_name']}" if cap["printer_name"] else ""))
+    # 让本地工具（printer_state）与其它在线设备立刻看到新能力
+    broadcast_printer_state()
+    return jsonify({"success": True, "capability": cap})
 
 
 @app.route("/api/claiming_devices", methods=["GET"])
 def claiming_devices():
     """返回全部启用接单的设备列表（含在线状态；离线设备也允许被选择发送任务，任务排队等其上线）。
-    供移动端任务发起界面选择目标设备（公开接口，与 printer_status 一致）。"""
+    供移动端任务发起界面选择目标设备（公开接口，与 printer_status 一致）。
+    2026-10：附带 auto_duplex 三态能力 —— 移动端据此禁用「不支持自动双面」设备的无障碍打印
+    （null=未确认，按安全侧处理），双面文件在该设备上需人工翻纸。"""
     online_set = set(get_active_clients())
     claiming = get_claiming_devices()
     result = []
@@ -4986,6 +5322,8 @@ def claiming_devices():
             "owner_name": dev.get("owner_name", "") or "",
             "online": cid in online_set,
             "label": device_display_label(cid),
+            # 自动双面能力（三态；移动端无障碍打印的判定依据之一）
+            **_device_capability_fields(cid),
         })
     # 在线设备排前，其余按 client_id 排序
     result.sort(key=lambda d: (not d["online"], d["client_id"].lower()))
@@ -5064,6 +5402,91 @@ def printer_devices_delete():
     broadcast_printer_state()
     print(f"[DEV] 已删除设备 {client_id}（接单接管{'已清空' if cleared_claim else '未受影响'}）")
     return jsonify({"success": True, "message": "设备已删除"})
+
+
+@app.route("/api/printer/devices/cleanup", methods=["POST"])
+def printer_devices_cleanup():
+    """批量清理测试设备 / 长期离线的无主设备（printer token 鉴权）。
+
+    授权页「🧹 清理测试设备」按钮调它。body（字段都可省）:
+      {"dry_run": true|false,               # true=只列出将删的 id，不真删 —— **默认 true** 防误点
+       "include_offline_unbound": bool,     # 额外清理"长期离线 + 从未绑定所有者"的设备
+       "min_offline_days": int}             # 上面的"长期"阈值，默认 7 天
+
+    默认只清「测试设备 id」且**离线**的：在线设备正在跑，删了它会重登但会打断当前接单/打印，
+    所以一律跳过并回报。删除同时清掉这些 id 的接单记录 —— 否则僵尸「接单中」会一直挂在
+    授权页，且 get_active_printer_client() 可能挑到一台永远不会干活的机器。"""
+    token = _get_printer_token()
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    data = request.get_json(silent=True) or {}
+    dry_run = bool(data.get("dry_run", True))
+    include_unbound = bool(data.get("include_offline_unbound", False))
+    try:
+        min_days = max(0, int(data.get("min_offline_days", 7)))
+    except (TypeError, ValueError):
+        min_days = 7
+
+    online = set(get_active_clients())
+    devices = load_devices()
+    cutoff = datetime.now() - timedelta(days=min_days)
+    targets, skipped_online = [], []
+    for cid, entry in devices.items():
+        is_test = is_test_device_id(cid)
+        if is_test:
+            if cid in online:
+                skipped_online.append(cid)      # 在线的不动（可能正在跑测试/接单）
+            else:
+                targets.append(cid)
+        elif include_unbound:
+            if cid in online or (entry.get("owner_name") or "").strip():
+                continue
+            # 人工盖过章的设备一律不碰：那是一条人工结论（例如"这台 1020 不支持自动双面"），
+            # 删掉就得让人重新确认一遍。只有探测/描述信息的，丢了无所谓。
+            if isinstance((entry.get("printer") or {}).get("manual_auto_duplex"), bool):
+                continue
+            seen = _seen_dt(entry.get("last_seen", ""))
+            if seen is not None and seen < cutoff:
+                targets.append(cid)
+
+    if dry_run:
+        return jsonify({
+            "success": True, "dry_run": True, "count": len(targets),
+            "client_ids": targets[:200], "skipped_online": skipped_online[:50],
+            "message": f"将清理 {len(targets)} 台（在线跳过 {len(skipped_online)} 台）",
+        })
+
+    removed = _delete_devices(targets, reason="授权页批量清理")
+    return jsonify({
+        "success": True, "dry_run": False, "removed": len(removed),
+        "client_ids": removed[:200], "skipped_online": skipped_online[:50],
+        "message": f"已清理 {len(removed)} 台测试/无主设备",
+    })
+
+
+def _seen_dt(value) -> datetime | None:
+    """解析 devices.json 里的时间串（容错：拿不到就 None，调用方按"不满足条件"处理）。"""
+    try:
+        return datetime.strptime(str(value or "").strip(), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def purge_test_devices() -> int:
+    """定时清理：把**离线**的测试设备连僵尸接单记录一起删掉（在线的一律不动）。
+
+    为什么必须自动清：联调/冒烟脚本每次运行都可能注册新 client_id，人不会记得去授权页点删除，
+    攒起来就是几十台"测试设备"（2026-10 现场：48 台）。删除是幂等的 —— 真机再连会自动重登，
+    而测试设备本就该消失。返回删除台数。"""
+    try:
+        devices = load_devices()
+        online = set(get_active_clients())
+        targets = [cid for cid in devices if is_test_device_id(cid) and cid not in online]
+        return len(_delete_devices(targets, reason="定时清理测试设备"))
+    except Exception as e:
+        print(f"[DEV] 清理测试设备异常: {e}")
+        return 0
 
 
 @app.route("/api/orders", methods=["GET"])
@@ -5757,17 +6180,27 @@ def abandon_reserved_order():
     if not order_number:
         return jsonify({"success": False, "message": "缺少 order_number"}), 400
     total_price = data.get("total_price", None)
+    # 归属 / 「管理员自行打印」标记：新版本地工具会随放弃请求一起上报（与预留上报同口径）。
+    # 未携带时（旧版工具）才回退到历史缺省——补记占位名并视为「管理员自行打印」，
+    # 否则会把「接单打印」的顾客订单误盖章成自打（类型列/结算收益分类/管理员订单统计
+    # 都按 is_admin_print 区分，实测 2026-10-08 HN20261008-0025/0026 就是这样被误标的）。
+    owner_name_in = (data.get("owner_name") or "").strip()
+    is_admin_print_in = data.get("is_admin_print")
+    if is_admin_print_in is not None:
+        is_admin_print_in = 1 if is_admin_print_in else 0
     conn = get_db()
     try:
         if total_price is not None:
             # 已配置打印（工具放弃时已知文件/份数/双面 → 有金额）：保留为 abandoned 订单，
-            # 并补记归属（本地单口径：默认占位名 / 管理员自行打印），避免留下无归属记录
+            # 并补记归属（工具已上报则以其为准；未上报才用缺省占位名 / 管理员自行打印）
             cursor = conn.execute(
                 """UPDATE orders SET status = 'abandoned', total_price = ?,
-                                     owner_name = COALESCE(NULLIF(owner_name, ''), ?),
-                                     is_admin_print = CASE WHEN is_admin_print = 0 THEN 1 ELSE is_admin_print END
+                                     owner_name = COALESCE(NULLIF(?, ''), NULLIF(owner_name, ''), ?),
+                                     is_admin_print = COALESCE(?,
+                                         CASE WHEN is_admin_print = 0 THEN 1 ELSE is_admin_print END)
                    WHERE order_number = ? AND status = 'reserved'""",
-                (float(total_price), DEFAULT_OWNER_NAME, order_number),
+                (float(total_price), owner_name_in, DEFAULT_OWNER_NAME,
+                 is_admin_print_in, order_number),
             )
             price_info = f"，价格 ¥{float(total_price):.2f}"
         else:
@@ -7864,6 +8297,8 @@ if __name__ == "__main__":
     scheduler.add_job(recover_stale_downloading, "interval", minutes=2, id="recover_stale_downloads")
     scheduler.add_job(cleanup_abandoned_reserved_orders, "interval", minutes=5, id="cleanup_reserved")
     scheduler.add_job(expire_stale_queued_orders, "interval", minutes=10, id="expire_stale_queued")
+    # 测试设备（联调/冒烟脚本注册的 debug-* 等）离线后自动清掉，避免授权页越积越多
+    scheduler.add_job(purge_test_devices, "interval", minutes=30, id="purge_test_devices")
     scheduler.start()
     print("定时扫描已启动（任务扫描每 30s，预约扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
 

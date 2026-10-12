@@ -251,6 +251,32 @@ async function runMiniProgram() {
   check('⑨页数回报后可复制，金额按 9 页双面（¥1.90）',
         calls.clipboard.length === 1 && calls.clipboard[0].indexOf('¥1.90') >= 0 && calls.modal.length === 0,
         calls.clipboard[0] || '(未复制)');
+
+  /* --- ⑩ 复制详细价格：未勾选的附加服务（派送/首页）整行不出现，且不占编号 --- */
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  page._lastOrderResult.data = { delivery_enabled: 0, urgency: '低', cover_page: 0 };
+  page.onCopyDetailPrice();
+  const plain = calls.clipboard[0] || '';
+  check('⑩未勾选派送：明细无「派送」行', plain.indexOf('派送') < 0, plain);
+  check('⑩未勾选首页：明细无「首页」行', plain.indexOf('首页') < 0, plain);
+  check('⑩编号无空洞（优先级接在第 1 项文件后，为 2.）',
+        /(^|\n)2\. 优先级：低/.test(plain), plain);
+  check('⑩合计仍按文件费（¥1.10）', plain.indexOf('￥1.10') >= 0, plain);
+
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  page.data.deliveryPercentages = { 'A校': 10 };
+  page.data.deliveryLocation = 'A校';
+  page.data.coverPagePrice = 0.1;
+  page._lastOrderResult.data = { delivery_enabled: 1, delivery_location: 'A校', urgency: '低', cover_page: 1 };
+  page.onCopyDetailPrice();
+  const full = calls.clipboard[0] || '';
+  check('⑩勾选派送：出现派送行且取该地点百分比（10% → ￥0.11）',
+        /(^|\n)2\. 派送：是 \| A校 10\.0% \| ￥0\.11/.test(full), full);
+  check('⑩勾选首页：出现首页行且为第 4 项（派送2/优先级3/首页4）',
+        /(^|\n)3\. 优先级：低/.test(full) && /(^|\n)4\. 打印首页信息 \| 0\.10/.test(full), full);
+  check('⑩合计=文件1.10+派送0.11+首页0.10=￥1.31', full.indexOf('￥1.31') >= 0, full);
 }
 
 /* ============================================================
@@ -474,6 +500,32 @@ async function runAndroid() {
   check('⑨页数回报后可复制，金额按 9 页双面（¥1.90）',
         calls.clipboard.length === 1 && calls.clipboard[0].indexOf('¥1.90') >= 0 && calls.alert.length === 0,
         calls.clipboard[0] || '(未复制)');
+
+  /* --- ⑩ 复制详细价格：未勾选的附加服务（派送/首页）整行不出现，且不占编号 --- */
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  run('onCopyDetailPrice();');
+  const plain = calls.clipboard[0] || '';
+  check('⑩未勾选派送：明细无「派送」行', plain.indexOf('派送') < 0, plain);
+  check('⑩未勾选首页：明细无「首页」行', plain.indexOf('首页') < 0, plain);
+  check('⑩编号无空洞（优先级接在第 1 项文件后，为 2.）',
+        /(^|\n)2\. 优先级：低/.test(plain), plain);
+  check('⑩合计仍按文件费（¥1.10）', plain.indexOf('￥1.10') >= 0, plain);
+
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  run(`
+    printState.deliveryPercentages = { 'A校': 10 };
+    printState.deliveryLocation = 'A校';
+    printState._lastOrderResult.data = { delivery_enabled: 1, delivery_location: 'A校', urgency: '低', cover_page: 1 };
+  `);
+  run('onCopyDetailPrice();');
+  const full = calls.clipboard[0] || '';
+  check('⑩勾选派送：出现派送行且取该地点百分比（10% → ￥0.11）',
+        /(^|\n)2\. 派送：是 \| A校 10\.0% \| ￥0\.11/.test(full), full);
+  check('⑩勾选首页：出现首页行且为第 4 项（派送2/优先级3/首页4）',
+        /(^|\n)3\. 优先级：低/.test(full) && /(^|\n)4\. 打印首页信息 \| 0\.10/.test(full), full);
+  check('⑩合计=文件1.10+派送0.11+首页0.10=￥1.31', full.indexOf('￥1.31') >= 0, full);
 }
 
 /* ============================================================

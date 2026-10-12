@@ -76,9 +76,12 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile
 from converter import get_converter, UniversalConverter
-from pdf_printer import print_pdf, list_system_printers, get_pdf_info, get_docx_orientation, get_image_info, estimate_print_sides
+from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
+                         get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
+                         print_plan_pass, wait_for_output, count_pdf_pages)
+import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 from cloud_client import CloudClient, CloudTask, pdf_cache_key
 from stats_server import StatsServer, load_local_data_file, clear_local_data_files
@@ -656,9 +659,159 @@ class RangeListWidget(QWidget):
             return None
 
 
+class ManualDuplexDialog(QDialog):
+    """手动双面**常驻**提示窗（对齐 HP 官方工具：打印一开始就在，而不是打完才弹）。
+
+    HP 驱动的手动双面向导从打印开始就常驻在屏幕上，操作员不必等弹窗、也不会被突然弹出的
+    窗口打断；我们照做，用状态机切换同一个窗口：
+      ① 批次开始 → 窗口出现：「正在打印第 1 趟」（继续按钮禁用）
+      ② 第 1 趟出纸 → 「可翻纸」：按钮启用 + 倒计时 + 出纸张数提示
+      ③ 点了继续 → 「正在打印第 2 趟」（按钮禁用，防重复点）
+      ④ 批次结束 → 自动收起
+    **关窗 = 跳过**（绝不因为关窗就擅自把第 2 趟打了）。
+    """
+
+    continue_requested = Signal()   # 操作员确认已翻纸 → 继续第 2 趟
+    skip_requested = Signal()       # 操作员跳过本任务（或超时/关窗）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("手动双面打印")
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        self.setMinimumWidth(600)
+        self._mode = "idle"
+        self._left = 0
+
+        lay = QVBoxLayout(self)
+        self._title = QLabel("手动双面打印（本机无自动双面器）")
+        _f = self._title.font()
+        _f.setPointSize(_f.pointSize() + 1)
+        _f.setBold(True)
+        self._title.setFont(_f)
+        lay.addWidget(self._title)
+
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        _sf = self._status.font()
+        _sf.setBold(True)
+        self._status.setFont(_sf)
+        lay.addWidget(self._status)
+
+        self._detail = QLabel("")
+        self._detail.setWordWrap(True)
+        self._detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self._detail)
+
+        self._countdown = QLabel("")
+        self._countdown.setStyleSheet("color: #e67e22;")
+        lay.addWidget(self._countdown)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self._btn_go = QPushButton("▶ 继续打第 2 趟")
+        self._btn_go.setEnabled(False)
+        self._btn_go.clicked.connect(self._on_go)
+        self._btn_skip = QPushButton("⏭ 跳过本任务")
+        self._btn_skip.clicked.connect(self._on_skip)
+        row.addWidget(self._btn_go)
+        row.addWidget(self._btn_skip)
+        lay.addLayout(row)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    # ── 状态切换（全部由 worker 信号 / 本窗按钮驱动）──
+
+    def announce(self, text: str):
+        """批次开始：窗口先立起来（常驻），此时还不能翻纸。"""
+        self._timer.stop()
+        self._mode = "pass1"
+        self._status.setText("① 正在打印第 1 趟…（程序自己分两趟，中途只需要翻一次纸）")
+        self._detail.setText(text)
+        self._countdown.setText("")
+        self._btn_go.setText("▶ 继续打第 2 趟（等第 1 趟打完）")
+        self._btn_go.setEnabled(False)
+        self._btn_skip.setText("⏭ 跳过本任务")
+        self._btn_skip.setEnabled(True)
+
+    def set_flippable(self, text: str, timeout_sec: int):
+        """第 1 趟已出纸：按钮启用 + 开始倒计时（超时按跳过）。"""
+        self._mode = "flip"
+        self._status.setText("② 第 1 趟已打完 —— 请翻纸，然后点「继续打第 2 趟」")
+        self._detail.setText(text)
+        self._btn_go.setText("▶ 继续打第 2 趟")
+        self._btn_go.setEnabled(True)
+        self._left = max(1, int(timeout_sec))
+        self._tick()
+        self._timer.start(1000)
+
+    def finish(self, text: str = ""):
+        """批次结束：收起窗口（稍候自动关，避免一直盖在屏幕上）。"""
+        self._timer.stop()
+        self._mode = "done"
+        self._status.setText(text or "手动双面批次已结束")
+        self._countdown.setText("")
+        self._btn_go.setEnabled(False)
+        self._btn_skip.setText("关闭")
+        self._btn_skip.setEnabled(True)
+        QTimer.singleShot(1500, self.close)
+
+    def _tick(self):
+        if self._mode != "flip":
+            return
+        self._left -= 1
+        if self._left <= 0:
+            self._timer.stop()
+            self._countdown.setText("⏳ 长时间无人确认 → 按「跳过本任务」处理")
+            self._on_skip()
+            return
+        self._countdown.setText(
+            f"⏳ 还有 {self._left // 60} 分 {self._left % 60} 秒（超时按跳过处理）")
+
+    def _on_go(self):
+        if self._mode != "flip":
+            return
+        self._timer.stop()
+        self._mode = "pass2"
+        self._status.setText("③ 正在打印第 2 趟…（请勿再动纸叠）")
+        self._countdown.setText("")
+        self._btn_go.setText("第 2 趟打印中…")
+        self._btn_go.setEnabled(False)
+        self.continue_requested.emit()
+
+    def _on_skip(self):
+        if self._mode == "skipped":
+            return
+        if self._mode == "done":      # 结束态下这个按钮就是"关闭"
+            self.close()
+            return
+        # 注意：**第 1 趟还没打完时点跳过也要上报**（预置答案）—— worker 走到"等翻纸"那一步时
+        # 会立刻收到 False 而不必等到超时（事件在批次开始时已清空，见 _print_manual_batch）。
+        self._timer.stop()
+        self._mode = "skipped"
+        self._status.setText("⏭ 已跳过：第 1 趟打出的纸是半成品，请人工处理")
+        self._btn_go.setEnabled(False)
+        self._btn_skip.setEnabled(False)
+        self.skip_requested.emit()
+
+    def closeEvent(self, ev):
+        # 还没确认就关窗 → 视为跳过（不能让关窗把第 2 趟放过去）
+        if self._mode == "flip":
+            self._on_skip()
+        super().closeEvent(ev)
+
+
 # ============================================================
 # 打印工作线程
 # ============================================================
+
+class _DeferManualDuplex(Exception):
+    """内部控制流：本任务要并入手动双面批次，**不在这里打印/收尾**。
+
+    为什么用异常：任务准备（转换/缓存）的代码在 try 块里，而 `continue` 会连带跑 finally
+    的临时文件清理（批次合并还需要那份 PDF）。用这个哨兵跳出 try 最省事、也最不容易改坏
+    原有的转换/缓存/出错分支。"""
+
 
 class PrintWorker(QThread):
     """
@@ -676,6 +829,13 @@ class PrintWorker(QThread):
     # 图片转换后缓存信号：worker 只写 PDF 文件，主线程补索引
     # (source_md5, cached_path, name, ext, page_count, image_orientation)
     pdf_cached = Signal(str, str, str, str, int, str)
+    # 手动双面：第 1 趟打完 → 请求主线程弹「请翻纸」提示（(说明文字, 超时秒)）。
+    # 主线程用 worker.confirm_flip(True/False) 回执；worker 在此期间阻塞等待。
+    flip_required = Signal(str, int)
+    # 手动双面常驻窗：批次开始就发一次（主线程立刻显示窗口，而不是打完才弹一堆东西出来），
+    # 批次结束（成功/失败/跳过）再发一次让主线程收尾关闭。
+    duplex_announce = Signal(str)
+    duplex_finished = Signal(str)
 
     def __init__(
         self,
@@ -686,6 +846,7 @@ class PrintWorker(QThread):
         render_dpi: int = 400,
         cover_page: bool = False,
         cover_page_config: dict | None = None,
+        manual_duplex_profile: PrinterProfile | None = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -698,10 +859,211 @@ class PrintWorker(QThread):
         self._cover_page_config = cover_page_config or {}
         self._converter: Optional[UniversalConverter] = None
         self._cancelled = False
+        # 手动双面（无自动双面器的机型）：档案来自 print_config.json 的 printer_profiles，
+        # 人工确认过 auto_duplex=False 且 manual_duplex=True 才启用；否则一切照旧（驱动双面）。
+        self._manual_profile = manual_duplex_profile
+        # 翻纸回执：worker 发信号 → 主线程弹窗 → confirm_flip() 置事件
+        self._flip_event = threading.Event()
+        self._flip_continue = False
+
+    # 翻纸提示的超时（秒）：主线程的弹窗自带倒计时，这里只多留一点余量兜底，
+    # 保证 GUI 万一没响应时 worker 也不会永久挂住。
+    FLIP_TIMEOUT_SEC = 600
+    FLIP_GRACE_SEC = 30
 
     def cancel(self):
         self._cancelled = True
         self.log_message.emit("[取消] 用户取消了打印任务")
+        # 正在等翻纸回执时也要立刻放行，否则取消后还卡在等事件上
+        self._flip_event.set()
+
+    def confirm_flip(self, cont: bool) -> None:
+        """主线程回执：是否继续打第 2 趟（线程安全；可被主线程任意时刻调用）。"""
+        self._flip_continue = bool(cont)
+        self._flip_event.set()
+
+    def _uses_manual_duplex(self, job: PrintJob) -> bool:
+        """该任务是否要走"程序自己分两趟 + 人工翻纸"。"""
+        p = self._manual_profile
+        return bool(job.duplex == "on" and p is not None
+                    and p.auto_duplex is False and p.manual_duplex)
+
+    def _ask_operator_to_flip(self, plan) -> bool:
+        """请操作员翻纸：发信号 → 等主线程回执。超时/取消/跳过都返回 False。"""
+        if self._cancelled:
+            return False
+        first_pages = " ".join("空白" if p is None else str(p) for p in plan.pass_pages(1))
+        second_pages = " ".join("空白" if p is None else str(p) for p in plan.pass_pages(2))
+        text = (
+            f"第 1 趟已完成：出纸槽里应有 {plan.sheet_count} 张纸"
+            f"（本趟打的是 {first_pages}）—— 数够再点继续。\n\n"
+            "请按下面三步操作（原文来自 HP 驱动「双面打印说明」弹窗）：\n"
+            "  1. 不改变方向，从出纸槽中取出纸叠。不要丢弃空白页面。\n"
+            "  2. 保持相同方向，将纸叠插入纸盘 2，使已打印面朝下。\n"
+            "     （不要翻面、不要重排）\n"
+            f"  3. 点「继续打第 2 趟」——随后打印 {second_pages}。"
+        )
+        self._flip_continue = False
+        self.log_message.emit(f"⏸ 等待人工翻纸（最多 {self.FLIP_TIMEOUT_SEC // 60} 分钟）…")
+        self.flip_required.emit(text, self.FLIP_TIMEOUT_SEC)
+        # 事件在批次开始时已清空（_print_manual_batch）；这里不能再 clear ——
+        # 否则操作员在第 1 趟打印期间就点了「跳过」的预置答案会被抹掉，白等 10 分钟。
+        if not self._flip_event.wait(self.FLIP_TIMEOUT_SEC + self.FLIP_GRACE_SEC):
+            self.log_message.emit("⚠ 翻纸提示长时间无人确认，按「跳过本任务」处理")
+            return False
+        if self._cancelled:
+            return False
+        return bool(self._flip_continue)
+
+    def _print_one_job(self, print_path: str, job: PrintJob, copies: int, orientation: str,
+                       dpi: int, job_progress) -> tuple[bool, str]:
+        """打一个任务（**一次提交**）：支持自动双面的机器走驱动双面，其余走单面。
+
+        手动双面的任务不会走到这里：它们在 run() 里被"并入手动双面批次"，由
+        `_print_manual_batch` 一次性打完（**整批只翻一次纸**）。"""
+        return print_pdf(
+            pdf_path=print_path,
+            printer_name=self._printer_name,
+            copies=copies,
+            duplex=job.duplex,
+            duplex_mode=job.duplex_mode or self._duplex_mode,
+            page_range=job.page_range,
+            orientation=orientation,
+            progress_callback=job_progress,
+            dpi=dpi,
+        )
+
+    def _rotate_for_job(self, job: PrintJob) -> bool:
+        """本任务第 2 趟要不要旋转 180°：纸路径实测值 × 装订方向（长边补偿/短边不补偿）。"""
+        p = self._manual_profile
+        return manual_duplex.rotate_second_for(
+            p.second_rotate_180 if p else True,
+            job.duplex_mode or self._duplex_mode,
+        )
+
+    def _cleanup_temp_pdf(self, job: PrintJob, temp_pdf: Optional[str]) -> None:
+        """清理转换出的临时 PDF（keep_temp_pdf 时先复制一份到桌面）。缓存的 PDF 不删。"""
+        if not temp_pdf or not os.path.isfile(temp_pdf):
+            return
+        if self._keep_temp_pdf:
+            original_base = os.path.splitext(os.path.basename(job.file_path))[0]
+            dest_path = os.path.join(os.path.expanduser("~"), "Desktop", f"[转换]{original_base}.pdf")
+            try:
+                shutil.copy2(temp_pdf, dest_path)
+                self.log_message.emit(f"  → 转换副本已保存到桌面: {os.path.basename(dest_path)}")
+            except OSError as e:
+                self.log_message.emit(f"  → 保存转换副本到桌面失败: {e}")
+        try:
+            os.remove(temp_pdf)
+        except OSError as e:
+            self.log_message.emit(f"  → 清理临时 PDF 失败: {e}")
+
+    @staticmethod
+    def _fmt_pages(seq) -> str:
+        return " ".join("〔空白〕" if x is None else str(x) for x in seq)
+
+    def _duplex_announce_text(self, items, plan, rotate: bool) -> str:
+        names = "、".join((j.display_name or os.path.basename(j.file_path)) for _i, j, _p, _t in items)
+        return (
+            f"本批 {len(items)} 个文件需手动双面：{names}\n"
+            f"共 {plan.sheet_count} 张纸 —— 程序自己分两趟打（全程单面），中途只需翻一次纸。\n\n"
+            f"第 1 趟（现在打）：{self._fmt_pages(plan.pass_pages(1))}\n"
+            f"第 2 趟（翻纸后打）：{self._fmt_pages(plan.pass_pages(2))}\n"
+            f"（第 2 趟内容{'旋转 180° 补偿' if rotate else '不旋转'}）"
+        )
+
+    def _print_manual_batch(self, items, rotate: bool, base_offset: int,
+                            total_sides: int) -> tuple[bool, str, int]:
+        """把若干个"需手动双面"的文件合并成**一批**：一次翻纸、两趟打完。
+
+        items: [(idx, job, print_path, temp_pdf)]（同批的 rotate 必须一致，调用方已分好组）
+        返回 (ok, msg, 物理面数)；物理面数用于推进进度条。
+        """
+        import pdf_printer as _pp
+        p = self._manual_profile
+        # 本批的翻纸回执从头清空：这样"第 1 趟还在打时操作员就点了跳过"的预置答案能生效
+        self._flip_continue = False
+        self._flip_event.clear()
+        merged = os.path.join(tempfile.gettempdir(),
+                              f"hn_duplex_batch_{os.getpid()}_{int(time.time() * 1000)}.pdf")
+        try:
+            ok, mmsg = _pp.merge_pdfs([it[2] for it in items], merged)
+            if not ok:
+                return False, f"手动双面批次：{mmsg}", 0
+
+            # 合并后的页码是**同一份文档**的连续页码：每个文件按自己的页码范围取页，再整体偏移
+            file_plans, off = [], 0
+            for _idx, job, path, _t in items:
+                n = count_pdf_pages(path)
+                if n <= 0:
+                    n = max(1, job.page_count)
+                sel = [i + 1 for i in _pp._parse_page_range(job.page_range, n)]
+                if not sel:
+                    sel = list(range(1, n + 1))
+                label = job.display_name or os.path.basename(job.file_path) or f"#{_idx + 1}"
+                for c in range(max(1, job.copies)):
+                    file_plans.append(manual_duplex.FilePlan(
+                        f"{label}（第{c + 1}份）" if job.copies > 1 else label,
+                        [off + x for x in sel], True))
+                off += n
+
+            plan = manual_duplex.plan_passes(file_plans, copies=1, first=p.first,
+                                             reverse_second=p.reverse_second)
+            n1 = len(plan.first_pass)
+            self.log_message.emit(
+                f"  → 手动双面批次：{len(items)} 个文件 → {plan.sheet_count} 张纸，"
+                f"**一次翻纸**打两趟（{p.first}/{'逆序' if p.reverse_second else '正序'}/"
+                f"{'180°补偿' if rotate else '不旋转'}）")
+            self.log_message.emit(f"     第 1 趟: {self._fmt_pages(plan.pass_pages(1))}")
+            self.log_message.emit(f"     第 2 趟: {self._fmt_pages(plan.pass_pages(2))}")
+            self.duplex_announce.emit(self._duplex_announce_text(items, plan, rotate))
+
+            def _cb(base: int, slots):
+                def _on_side(cur: int, _total: int):
+                    lbl, _pg = slots[cur - 1] if 0 < cur <= len(slots) else ("", None)
+                    self.progress.emit(base + cur, total_sides,
+                                       f"正在打印: {lbl} ({cur}/{len(slots)}面)")
+                return _on_side
+
+            map1 = [(s.label, s.page) for s in plan.first_pass]
+            map2 = [(s.label, s.page) for s in plan.second_pass]
+
+            ok1, msg1 = print_plan_pass(plan, merged, self._printer_name, 1,
+                                        second_rotate_180=rotate,
+                                        progress_callback=_cb(base_offset, map1))
+            if not ok1:
+                return False, f"手动双面第 1 趟失败: {msg1}", n1
+            if self._cancelled:
+                return False, "已取消", n1
+
+            w = wait_for_output(self._printer_name, pages=n1)
+            self.log_message.emit(
+                f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
+                f"出纸槽里应有 {plan.sheet_count} 张纸，请数够再翻")
+
+            if not self._ask_operator_to_flip(plan):
+                if self._cancelled:
+                    return False, f"已取消（第 1 趟已打出 {plan.sheet_count} 张纸，纸叠是半成品）", n1
+                return False, (f"手动双面未完成：第 1 趟已打出（{plan.sheet_count} 张纸、"
+                               f"{self._fmt_pages(plan.pass_pages(1))}），第 2 趟未打印 —— "
+                               f"纸叠是半成品，请人工处理"), n1
+
+            ok2, msg2 = print_plan_pass(plan, merged, self._printer_name, 2,
+                                        second_rotate_180=rotate,
+                                        progress_callback=_cb(base_offset + n1, map2))
+            if not ok2:
+                return False, f"手动双面第 2 趟失败: {msg2}（第 1 趟已打出）", plan.total_sides
+            return True, (f"手动双面完成（{len(items)} 个文件 / {plan.sheet_count} 张纸 / 2 趟，"
+                          f"只翻一次纸）"), plan.total_sides
+        finally:
+            self.duplex_finished.emit("手动双面批次结束")
+            try:
+                if os.path.isfile(merged):
+                    os.remove(merged)
+            except OSError:
+                pass
+            for _idx, job, _path, temp_pdf in items:
+                self._cleanup_temp_pdf(job, temp_pdf)
 
     def run(self):
         """线程主函数：统一 PDF 打印流程（GDI 优先），精确到每面的进度条。"""
@@ -714,9 +1076,22 @@ class PrintWorker(QThread):
             # 预计算总面数（用于精确进度条）
             job_sides: list[int] = []
             for job in self._jobs:
-                sides = estimate_print_sides(
-                    max(1, job.page_count), max(1, job.copies), job.duplex, job.page_range,
-                )
+                # page_count 未知（云端任务/未分析）时，PDF 就**现数**一遍：
+                # 否则手动双面的面数会按 1 页估，进度分母偏小 → 进度条冲过 100%。
+                n_pages = max(1, job.page_count)
+                if job.page_count <= 0 and (job.file_path or "").lower().endswith(".pdf"):
+                    try:
+                        n_pages = max(1, count_pdf_pages(job.file_path))
+                    except Exception:
+                        n_pages = 1
+                if self._uses_manual_duplex(job):
+                    # 手动双面不插副本分隔页，面数与 estimate_print_sides 不同（会超 100%）
+                    sides = estimate_manual_duplex_sides(
+                        n_pages, max(1, job.copies), job.page_range)
+                else:
+                    sides = estimate_print_sides(
+                        n_pages, max(1, job.copies), job.duplex, job.page_range,
+                    )
                 job_sides.append(sides)
             total_sides = sum(job_sides)
             if total_sides <= 0:
@@ -795,6 +1170,8 @@ class PrintWorker(QThread):
                         pass
 
         offset_sides = 0
+        # 手动双面任务不在此循环里打印：先做好 PDF，循环结束后**整批一次翻纸**打完（见下）
+        deferred: list[tuple[int, PrintJob, str, Optional[str]]] = []
         for idx, job in enumerate(self._jobs):
             if self._cancelled:
                 # 取消：剩余任务按失败处理，保证 job_finished/all_finished 完整发射、UI 不卡死
@@ -813,6 +1190,7 @@ class PrintWorker(QThread):
             orient_info = f", 方向:{job.orientation}" if job.orientation else ""
             temp_pdf: Optional[str] = None
             ok = False  # 本任务是否打印成功（except 路径保持 False）
+            defer = self._uses_manual_duplex(job)   # 需手动双面 → 并批，稍后统一两趟
 
             # 此任务的预估面数
             this_job_sides = job_sides[idx] if idx < len(job_sides) else 1
@@ -869,10 +1247,15 @@ class PrintWorker(QThread):
                             pass
 
                 # 2. 打印 PDF（传入进度回调）
+                # 手动双面：不在这里打 —— 并入批次，等本批所有文件都准备好后**一次翻纸**打完
+                if defer:
+                    deferred.append((idx, job, print_path, temp_pdf))
+                    self.log_message.emit(
+                        f"  ⏳ 已并入手动双面批次（本批第 {len(deferred)} 个文件）")
+                    raise _DeferManualDuplex()
                 self.log_message.emit(
                     f"  → 正在打印 (份数:{copies}, 双面:{job.duplex}{orient_info})..."
                 )
-                dm = job.duplex_mode or self._duplex_mode
                 effective_dpi = job.dpi if job.dpi > 0 else self._render_dpi
                 # 打印方向以实际 PDF 页面为准：图片转换/方向设置后 job.orientation 可能过时
                 # （EXIF 竖拍照片原始像素是横的；image_orientation 显式设置后 job.orientation 仍是旧值）
@@ -883,16 +1266,9 @@ class PrintWorker(QThread):
                 except Exception:
                     _pdf_ori = ""
                 eff_ori = _pdf_ori if _pdf_ori in ("portrait", "landscape") else (job.orientation or "")
-                ok, msg = print_pdf(
-                    pdf_path=print_path,
-                    printer_name=self._printer_name,
-                    copies=copies,
-                    duplex=job.duplex,
-                    duplex_mode=dm,
-                    page_range=job.page_range,
-                    orientation=eff_ori,
-                    progress_callback=_make_progress_callback(offset_sides, total_sides),
-                    dpi=effective_dpi,
+                ok, msg = self._print_one_job(
+                    print_path, job, copies, eff_ori, effective_dpi,
+                    _make_progress_callback(offset_sides, total_sides),
                 )
                 if ok:
                     self.log_message.emit(f"  ✓ {msg}")
@@ -903,6 +1279,8 @@ class PrintWorker(QThread):
 
                 self.job_finished.emit(idx, ok, msg)
 
+            except _DeferManualDuplex:
+                pass   # 已并入手动双面批次：打印与临时文件清理都在批次里做（不在此收尾）
             except Exception as e:
                 self.log_message.emit(f"  ✗ 错误: {e}")
                 fail_count += 1
@@ -910,27 +1288,46 @@ class PrintWorker(QThread):
 
             finally:
                 # 3. 清理临时 PDF（缓存的 PDF 不删，下次打印复用）
-                if temp_pdf and os.path.isfile(temp_pdf):
-                    if self._keep_temp_pdf:
-                        original_base = os.path.splitext(os.path.basename(job.file_path))[0]
-                        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-                        dest_name = f"[转换]{original_base}.pdf"
-                        dest_path = os.path.join(desktop, dest_name)
-                        try:
-                            shutil.copy2(temp_pdf, dest_path)
-                            self.log_message.emit(f"  → 转换副本已保存到桌面: {dest_name}")
-                        except OSError as e:
-                            self.log_message.emit(f"  → 保存转换副本到桌面失败: {e}")
-                    try:
-                        os.remove(temp_pdf)
-                    except OSError as e:
-                        self.log_message.emit(f"  → 清理临时 PDF 失败: {e}")
+                #    并批的任务还不能删 —— 批次合并要用这份 PDF，由批次结束时统一清理
+                if not defer:
+                    self._cleanup_temp_pdf(job, temp_pdf)
 
             if ok:
                 offset_sides += this_job_sides
             else:
                 # 失败/取消：按实际打印面数回退，避免进度条凭空跳变
                 offset_sides += actual_sides
+
+        # ── 手动双面批次：把本次打印里所有"需手动双面"的文件合并成**一次翻纸**打完 ──
+        if deferred:
+            if self._cancelled:
+                for _idx, job, _p, temp_pdf in deferred:
+                    self.job_finished.emit(_idx, False, "已取消")
+                    fail_count += 1
+                    self._cleanup_temp_pdf(job, temp_pdf)
+            else:
+                # 按装订方向分组：同批必须用同一个旋转补偿（长边补偿 180°、短边不补偿）。
+                # 一般整批同向 → 一批一次翻纸；长短边混排才拆成两批（翻两次，并记日志）。
+                groups: dict[bool, list] = {}
+                for it in deferred:
+                    groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
+                if len(groups) > 1:
+                    self.log_message.emit(f"⚠ 本批存在两种装订方向，将分 {len(groups)} 次翻纸")
+                for rotate, items in groups.items():
+                    self.log_message.emit(
+                        f"▶ 手动双面批次：{len(items)} 个文件，"
+                        f"{'长边（第 2 趟内容旋转 180°）' if rotate else '短边（第 2 趟内容不旋转）'}"
+                        f" —— 整批只翻一次纸")
+                    ok_b, msg_b, sides_b = self._print_manual_batch(
+                        items, rotate, offset_sides, total_sides)
+                    for _idx, _job, _p, _t in items:
+                        self.job_finished.emit(_idx, ok_b, msg_b)
+                        if ok_b:
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    self.log_message.emit(f"  {'✓' if ok_b else '✗'} {msg_b}")
+                    offset_sides += sides_b
 
         self.progress.emit(total_sides, total_sides, "全部完成")
         self.all_finished.emit(success_count, fail_count)
@@ -2964,22 +3361,55 @@ class MainWindow(QMainWindow):
             return
         self._cleanup_empty_tabs()
 
+    def _update_duplex_label(self):
+        """按当前打印机档案标注双面选项：不支持自动双面时写明「手动翻纸」。
+
+        只在**人工确认过**（档案 auto_duplex=False + manual_duplex=True）时才改文案 —— 能力
+        未确认的机器保持原样，避免凭空吓唬用户（未确认时走驱动双面，与旧版行为一致）。"""
+        if not hasattr(self, '_edit_duplex'):
+            return
+        try:
+            prof = self._printer_profile()
+        except Exception:
+            return
+        manual = (prof.auto_duplex is False and prof.manual_duplex)
+        want = "双面（手动翻纸）" if manual else "双面打印"
+        if self._edit_duplex.itemText(0) != want:
+            self._edit_duplex.setItemText(0, want)
+        if hasattr(self, '_edit_duplex_hint'):
+            if manual:
+                self._edit_duplex_hint.setText("← 本机无自动双面：程序分两趟打，中途会弹窗提示翻纸")
+            else:
+                self._edit_duplex_hint.setText("")
+            self._edit_duplex_hint.setVisible(manual)
+
     def _refresh_tab_display(self):
         """刷新标签页数字显示和按钮状态。"""
         tab = self._config.tabs.get(self._current_tab)
         is_frozen = tab.frozen if tab else False
+        needs_flip = bool(getattr(tab, "manual_duplex_pending", False)) if tab else False
 
-        # 锁定状态下标签显示为 🔒N
+        # 锁定状态下标签显示为 🔒N；含双面需人工翻纸的显示 ⏸（不能无人值守自动开打）
         if is_frozen:
             self._tab_label.setText(f"🔒{self._current_tab}")
             self._tab_label.setFixedWidth(52)  # 锁图标需要更宽
+        elif needs_flip:
+            self._tab_label.setText(f"⏸{self._current_tab}")
+            self._tab_label.setFixedWidth(44)
         else:
             self._tab_label.setText(self._current_tab)
             self._tab_label.setFixedWidth(36)
 
         if hasattr(self, '_tab_scope_label') and self._tab_scope_label:
-            prefix = "🔒 " if is_frozen else "📑 "
-            self._tab_scope_label.setText(f"{prefix}标签页 {self._current_tab}")
+            prefix = "🔒 " if is_frozen else ("⏸ " if needs_flip else "📑 ")
+            suffix = "（含双面：需人工翻纸）" if needs_flip else ""
+            self._tab_scope_label.setText(f"{prefix}标签页 {self._current_tab}{suffix}")
+            if needs_flip and not is_frozen:
+                self._tab_scope_label.setToolTip(
+                    "本标签页有双面文件，而当前打印机不支持自动双面：\n"
+                    "无障碍/预约打印不会自动开始，需要人工点「开始打印」并在中途翻纸。")
+            else:
+                self._tab_scope_label.setToolTip("")
 
         tab_keys = self._sorted_tab_keys(self._config.tabs)
         try:
@@ -3013,6 +3443,9 @@ class MainWindow(QMainWindow):
 
         # 备注框：随标签页刷新加载订单备注（首个非空）；冻结时锁定编辑
         self._load_remark_editor(tab)
+
+        # 打印机能力标注（双面是否=手动翻纸）随标签页/打印机变化同步
+        self._update_duplex_label()
 
     def _get_current_jobs(self) -> list[PrintJob]:
         """返回当前标签页的任务列表。"""
@@ -3239,8 +3672,14 @@ class MainWindow(QMainWindow):
                 elif job.task_id > 0 and self._cloud_client:
                     self._cloud_client.abandon_order_to_server(job.task_id)
                 elif job.order_number and "-L" not in job.order_number and self._cloud_client:
-                    price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
-                    self._cloud_client.abandon_reserved_order(job.order_number, price)
+                    # 归属/自打标记随放弃请求一起上报：否则后端只能按缺省值补记，
+                    # 会把「接单打印」的订单误盖章成「自打」（类型列与收益分类都按此字段）
+                    # 金额传**整单合计**（不是本文件的价）：后端只认第一次命中的那笔，
+                    # 逐文件上报会让订单额变成第一个文件的价
+                    self._cloud_client.abandon_reserved_order(
+                        job.order_number, self._tab_total_price(tab_entry),
+                        owner_name=(tab_entry.owner_name if tab_entry else ""),
+                        is_admin_print=(bool(tab_entry.is_admin_print) if tab_entry else None))
             del self._config.tabs[key]
             self._cleanup_orphan_pdf_cache(jobs)
             self._renumber_tabs()
@@ -3276,8 +3715,11 @@ class MainWindow(QMainWindow):
                     elif job.task_id > 0 and self._cloud_client:
                         self._cloud_client.abandon_order_to_server(job.task_id)
                     elif job.order_number and "-L" not in job.order_number and self._cloud_client:
-                        price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
-                        self._cloud_client.abandon_reserved_order(job.order_number, price)
+                        # 金额传整单合计 + 归属/自打标记（理由同「删除标签页」处）
+                        self._cloud_client.abandon_reserved_order(
+                            job.order_number, self._tab_total_price(tab_entry),
+                            owner_name=(tab_entry.owner_name if tab_entry else ""),
+                            is_admin_print=(bool(tab_entry.is_admin_print) if tab_entry else None))
             self._config.tabs = {"1": self._make_new_tab()}
             self._current_tab = "1"
             self._config.active_tab = "1"
@@ -3819,6 +4261,11 @@ class MainWindow(QMainWindow):
         _disable_combo_wheel(self._edit_duplex)
         self._edit_duplex.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_duplex)
+        # 打印机不支持自动双面时的提示（文案随打印机档案变，见 _update_duplex_label）
+        self._edit_duplex_hint = QLabel("")
+        self._edit_duplex_hint.setStyleSheet("color: #e67e22;")
+        self._edit_duplex_hint.setVisible(False)
+        gl.addWidget(self._edit_duplex_hint)
 
         # 双面模式（仅双面时可用）
         self._label_duplex_mode = QLabel("双面模式：")
@@ -4944,6 +5391,28 @@ class MainWindow(QMainWindow):
             "created_at": created_at or "",
         }
 
+    def _tab_total_price(self, tab) -> float:
+        """标签页全部任务的合计金额（含附加服务费），按本机配置单价计算。
+
+        放弃预留单时补记的必须是**整单金额**：早先是「每个文件各上报一次」，
+        后端只认第一次命中的那笔 → 订单额被写成第一个文件的价
+        （实测 HN20261011-0001 订单额 ¥6.30、文件合计 ¥7.40）。
+        单价必须显式传：calc_cost 的默认单价是历史遗留值 0.2/0.3。
+        """
+        if not tab:
+            return 0.0
+        total = 0.0
+        for j in (getattr(tab, "jobs", None) or []):
+            cost, _ = calc_cost(j.page_count, j.copies, j.duplex,
+                                self._config.simplex_price, self._config.duplex_price,
+                                j.page_range or "")
+            total += cost
+        try:
+            total += tab.calc_extra_total(total, self._config) or 0.0
+        except Exception:
+            pass
+        return round(total, 2)
+
     def _upload_reserved_order(self, order_number: str):
         """后台线程：以 reserved 状态上报当前标签页完整订单信息（文件明细 + 备注 + 价格 + 归属）。
 
@@ -5387,6 +5856,92 @@ class MainWindow(QMainWindow):
                 else:
                     self._cloud_client.report_fail(task_id, message)
 
+    # ──────── 手动双面（无自动双面器的机型：程序自己分两趟 + 人工翻纸）────────
+
+    def _printer_profile(self) -> PrinterProfile:
+        """当前打印队列的档案（print_config.json 的 printer_profiles；没登记返回默认/未确认）。"""
+        return self._config.get_profile(self._config.printer_name)
+
+    def _manual_flip_required_for(self, jobs) -> bool:
+        """这批任务是否"必须人工翻纸"：本机不支持自动双面 **且** 含双面文件。
+
+        用于拦住无人值守路径（无障碍自动打印 / 预约到点）——那种场景没人翻纸，
+        自动开打只会打出半成品（只印了第 1 趟）或静默单面。"""
+        prof = self._printer_profile()
+        if not (prof.auto_duplex is False and prof.manual_duplex):
+            return False
+        return any((getattr(j, "duplex", "off") or "off") == "on" for j in jobs)
+
+    def _hold_for_manual_duplex(self, jobs, tab_key: str, reason: str) -> bool:
+        """无人值守路径（无障碍自动打印/预约到点）遇到"需人工翻纸"的订单 → 挂起。
+
+        返回 True = 已挂起（调用方必须直接 return，不要再去启动打印）。
+        为什么不静默改单面：顾客按双面付了钱，改单面是少收费 + 多费纸；
+        为什么不入重试队列：重试也没有人翻纸，只会每 10s 空转。改为在标签页亮 ⏸ 标记，
+        订单保持未打印（不回报失败），等人工点「开始打印」。"""
+        if not self._manual_flip_required_for(jobs):
+            return False
+        tab = self._config.tabs.get(tab_key)
+        if tab is not None:
+            tab.manual_duplex_pending = True
+            self._save_config()
+        self._log(f"⏸ {reason}：含双面文件，而当前打印机「{self._config.printer_name}」"
+                  f"不支持自动双面（需人工翻纸）—— 已挂起，请人工点「开始打印」"
+                  f"（第 1 趟打完后会弹窗提示翻纸）")
+        self._refresh_tab_display()
+        return True
+
+    # ── 手动双面常驻翻纸窗（对齐 HP 官方：打印一开始就在，不是打完才弹）──
+
+    def _ensure_duplex_dialog(self) -> ManualDuplexDialog:
+        dlg = getattr(self, "_duplex_dialog", None)
+        if dlg is None:
+            dlg = ManualDuplexDialog(self)
+            dlg.continue_requested.connect(self._on_duplex_continue)
+            dlg.skip_requested.connect(self._on_duplex_skip)
+            self._duplex_dialog = dlg
+        return dlg
+
+    def _show_duplex_dialog(self, dlg: ManualDuplexDialog):
+        """把常驻窗立到最前：置顶 + 抢焦点 + 任务栏闪烁（否则操作员注意不到打印机在等着）。"""
+        try:
+            if dlg.isMinimized():
+                dlg.showNormal()
+            else:
+                dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
+            QApplication.alert(self, 0)          # 任务栏闪烁，叫回操作员
+        except Exception:
+            pass
+
+    def _on_duplex_announce(self, text: str):
+        """批次开始 → 常驻窗立刻出现（此后状态都在同一个窗口里切换，不再"等弹窗"）。"""
+        dlg = self._ensure_duplex_dialog()
+        dlg.announce(text)
+        self._show_duplex_dialog(dlg)
+
+    def _on_duplex_finished(self, text: str):
+        dlg = getattr(self, "_duplex_dialog", None)
+        if dlg is not None:
+            dlg.finish(text)
+
+    def _on_flip_required(self, text: str, timeout_sec: int):
+        """Worker 打完第 1 趟 → 常驻窗切到"可翻纸"（启用按钮 + 倒计时）。"""
+        dlg = self._ensure_duplex_dialog()
+        dlg.set_flippable(text, timeout_sec)
+        self._show_duplex_dialog(dlg)
+
+    def _on_duplex_continue(self):
+        if self._worker is not None:
+            self._worker.confirm_flip(True)
+        self._log("▶ 已确认翻纸，继续打第 2 趟")
+
+    def _on_duplex_skip(self):
+        if self._worker is not None:
+            self._worker.confirm_flip(False)
+        self._log("⏭ 已选择跳过：第 1 趟的纸是半成品，请人工处理")
+
     def _start_print_worker(self, flat_jobs: list, tab_key: str | None = None) -> bool:
         """用给定的任务列表启动打印 Worker。返回 True=已启动，False=忙/被取消。
         tab_key：打印批次所属标签页（2026-12 无障碍后台打印用，默认当前前台标签页）。"""
@@ -5536,14 +6091,24 @@ class MainWindow(QMainWindow):
             render_dpi=self._config.render_dpi,
             cover_page=cover_page_enabled,
             cover_page_config=cover_page_config,
+            manual_duplex_profile=self._printer_profile(),
         )
         worker.progress.connect(self._on_progress)
         worker.log_message.connect(self._log)
         worker.job_finished.connect(self._on_job_finished)
         worker.all_finished.connect(self._on_all_finished)
         worker.pdf_cached.connect(self._on_pdf_cached)
+        worker.flip_required.connect(self._on_flip_required)
+        worker.duplex_announce.connect(self._on_duplex_announce)
+        worker.duplex_finished.connect(self._on_duplex_finished)
         self._worker = worker
         worker.start()
+
+        # 人工已开始打印 → 清掉"需人工翻纸"挂起标记（⏸ 标记由自动打印挂起时置位）
+        if tab is not None and getattr(tab, "manual_duplex_pending", False):
+            tab.manual_duplex_pending = False
+            self._save_config()
+            self._refresh_tab_display()
 
         # 上报"开始打印"信号：打印批次实际启动 → 后端用服务器时钟记录 print_started_at（幂等，仅首次）。
         # 覆盖手动 / 无障碍自动 / 预约三类云端订单（task_id≠0）。
@@ -6244,6 +6809,9 @@ class MainWindow(QMainWindow):
         # 自动开始打印（打印机忙时不静默丢弃 → 入重试队列，打印完成后自动补打）。
         # 只打印未完成（sent=False）的 job：追加到已有标签页时，已打印过的文件不重打
         jobs = [j for j in self._tab_jobs(tab_key) if not getattr(j, 'sent', False)]
+        if jobs and self._hold_for_manual_duplex(jobs, tab_key, f"无障碍打印订单 #{order_id}"):
+            # 不支持自动双面 + 含双面文件 → 挂起等人工（不进重试队列：重试也没人翻纸）
+            return
         if jobs:
             self._log(f"⚡ 自动开始打印标签页 {tab_key}（{len(jobs)} 个文件）")
             if not self._start_print_worker(list(jobs), tab_key=tab_key):
@@ -6494,6 +7062,13 @@ class MainWindow(QMainWindow):
 
         self._log(f"⚡ 无障碍预约打印：订单 #{order_id} 共 {len(ready_tasks)} 个文件，开始打印")
         jobs = [j for j in self._tab_jobs(st["tab_key"]) if not getattr(j, 'sent', False)]
+        if jobs and self._hold_for_manual_duplex(jobs, st["tab_key"],
+                                                 f"预约打印订单 #{order_id}"):
+            # 不支持自动双面 + 含双面文件 → 挂起等人工（重试没意义：需要人翻纸）。
+            # 不置 printed、不上报失败：订单保持待打印，等人工点「开始打印」。
+            self._log(f"⏰ 预约单 #{order_id}: 已挂起等人工翻纸（不会再自动重试）")
+            self._cleanup_scheduled_order(order_id, reason="需人工翻纸，转为人工打印")
+            return
         if jobs:
             if not self._start_print_worker(list(jobs), tab_key=st["tab_key"]):
                 # 恰好此刻打印机变忙 → 不置 printed，10s 后重试（防丢失）
@@ -6870,8 +7445,11 @@ class MainWindow(QMainWindow):
                             self._cloud_client.abandon_order_to_server(job.task_id)
                         elif job.order_number and "-L" not in job.order_number and self._cloud_client:
                             # 本地预留订单（仅获取了订单号但未提交打印）→ 标记为放弃，并补记价格
-                            price, _ = calc_cost(job.page_count, job.copies, job.duplex, page_range=job.page_range or "")
-                            self._cloud_client.abandon_reserved_order(job.order_number, price)
+                            # 金额传整单合计（不是本文件的价）+ 归属/自打标记
+                            self._cloud_client.abandon_reserved_order(
+                                job.order_number, self._tab_total_price(tab),
+                                owner_name=(tab.owner_name if tab else ""),
+                                is_admin_print=(bool(tab.is_admin_print) if tab else None))
                 # 已清空但撤回窗口未过的备份任务同样放弃（用户确认退出=确认清空）
                 for backup_jobs in self._cleared_jobs_backup.values():
                     for job in backup_jobs:
@@ -6928,6 +7506,12 @@ class MainWindow(QMainWindow):
         if not jobs:
             return
         order_number = self._ensure_order_number()
+        # v4.6 同口径（与「复制」`_on_copy_total` 一致）：复制计费明细也算"确认下单"，
+        # 同样把文件明细 + 备注 + 价格 + 附加服务同步到后端（reserved 非空占位）。
+        # 缺这一步会出现：只点「复制计费明细」不点「复制」时，云端订单还是旧数据/空占位
+        # （钉住：tests/verify_copy_reserved_sync.py）。
+        if order_number and self._cloud_client and self._cloud_client.is_connected():
+            self._upload_reserved_order(order_number)
         lines = []
         if order_number:
             lines.append(f"订单号: {order_number}")

@@ -41,6 +41,9 @@ class TabSettings:
     # 订单归属（v24）：本标签页订单属于谁 + 是否管理员自行打印（非顾客订单）
     owner_name: str = ""          # 空 = 尚未选择成员（成员名单为空时禁止创建订单）
     is_admin_print: bool = True
+    # 2026-10：本标签页有"双面 + 本机不支持自动双面"的文件，**不能无人值守自动开打**
+    # （无障碍/预约打印遇到它时挂起等人，标签页显示 ⏸）。人工开始打印后清除。
+    manual_duplex_pending: bool = False
     # 订单备注（v4.6）：标签页（订单）级，不依赖选中任务；云端订单注入后端 remark
     remark: str = ""
 
@@ -55,6 +58,7 @@ class TabSettings:
             "frozen": self.frozen,
             "owner_name": self.owner_name,
             "is_admin_print": self.is_admin_print,
+            "manual_duplex_pending": self.manual_duplex_pending,
             "remark": self.remark,
         }
 
@@ -74,6 +78,7 @@ class TabSettings:
             frozen=bool(data.get("frozen", False)),
             owner_name=(data.get("owner_name") or "").strip(),
             is_admin_print=bool(data.get("is_admin_print", True)),
+            manual_duplex_pending=_bool_or_default(data.get("manual_duplex_pending"), False),
             remark=str(data.get("remark", "") or ""),
         )
 
@@ -272,6 +277,138 @@ def generate_order_number(last_number: int) -> "tuple[str, int]":
     return f"HN{today}-{next_num:04d}", next_num
 
 
+def _bool_or_default(value, default: bool) -> bool:
+    """三态布尔容错：只认 bool 与 0/1，其余（None/字符串/缺键）一律回落 default。
+
+    为什么不用 `bool(value)`：本模块的 reverse_second / second_rotate_180 默认是 **True**，
+    而 `bool(None)` 是 False —— 配置被写坏成 null 时会把"逆序/180°补偿"静默改成"正序/不旋转"，
+    直接印出错页/倒置页。危险默认值必须回落，不能靠 bool() 的巧合。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return default
+
+
+@dataclass
+class PrinterProfile:
+    """单台打印机的**能力 + 手动双面实测参数**（按打印队列名索引，存在 print_config.json）。
+
+    为什么要有它：双面能力与纸路径是**具体机型**的属性，而同一台电脑可能装多台打印机；
+    2026-10 HP LaserJet 1020 实机实测证明了三点（都写进这里的默认值）：
+      · 它的驱动 `DC_DUPLEX=1` 且接受 `Duplex=2` —— **自动探测会虚报支持**（那"双面能力"
+        其实来自驱动的手动双面功能），所以必须有"人工确认"这一层，且**人工结论不被探测覆盖**；
+      · "整叠不改变方向搬回"⇒ 第 2 趟必须逆序（reverse_second=True）；
+      · 纸路径把第 2 趟的内容整体转了 180°，必须补偿（second_rotate_180=True），
+        否则第 2 面的文字倒置；
+      · 取 first="odd"：成品叠最上面是第 1 页（first="even" 观感反过来，配对同样正确）。
+
+    键是**打印队列名**：队列改名会被当成新机器重新校准 —— 可接受（总比把两台机器的参数混在一起好）。
+    """
+
+    auto_duplex: bool | None = None       # True=支持自动双面 / False=不支持 / None=未确认
+    capability_source: str = ""           # "manual"(人工确认) | "probe"(自动探测) | ""
+    manual_duplex: bool = False           # 是否走"程序自己分两趟 + 人工翻纸"
+    first: str = "odd"                    # 第 1 趟打哪一面：'odd'（默认）| 'even'（镜像）
+    reverse_second: bool = True           # 第 2 趟逆序（整叠原样放回）
+    second_rotate_180: bool = True        # 第 2 趟内容旋转 180°（补偿纸路径翻转）
+    verified_at: str = ""                 # 实机校准完成时间（空 = 没校准过）
+    verified_by: str = ""                 # 校准/确认者（成员姓名）
+    note: str = ""
+
+    _FIELDS = ("auto_duplex", "capability_source", "manual_duplex", "first",
+               "reverse_second", "second_rotate_180", "verified_at", "verified_by", "note")
+
+    def to_dict(self) -> dict:
+        return {k: getattr(self, k) for k in self._FIELDS}
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "PrinterProfile":
+        d = data or {}
+        first = str(d.get("first", "odd")).lower()
+        return cls(
+            auto_duplex=(d.get("auto_duplex") if isinstance(d.get("auto_duplex"), bool) else None),
+            capability_source=str(d.get("capability_source", "") or ""),
+            manual_duplex=_bool_or_default(d.get("manual_duplex"), False),
+            first=(first if first in ("odd", "even") else "odd"),
+            reverse_second=_bool_or_default(d.get("reverse_second"), True),
+            second_rotate_180=_bool_or_default(d.get("second_rotate_180"), True),
+            verified_at=str(d.get("verified_at", "") or ""),
+            verified_by=str(d.get("verified_by", "") or ""),
+            note=str(d.get("note", "") or ""),
+        )
+
+    def apply(self, **fields) -> "PrinterProfile":
+        """只更新给定字段（未知字段名直接报错，避免拼错键却静默无效）。"""
+        unknown = [k for k in fields if k not in self._FIELDS]
+        if unknown:
+            raise ValueError(f"PrinterProfile 没有这些字段: {unknown}")
+        for k, v in fields.items():
+            setattr(self, k, v)
+        return self
+
+    def apply_probe(self, auto_duplex: bool | None, note: str = "") -> bool:
+        """写入**自动探测**结论；已人工确认过的不覆盖（返回 False）。
+
+        与后端 devices.json 的能力规则保持一致：manual > probe > unknown。"""
+        if self.capability_source == "manual":
+            return False
+        self.auto_duplex = auto_duplex
+        self.capability_source = "probe"
+        if note:
+            self.note = note
+        return True
+
+    @property
+    def is_verified(self) -> bool:
+        """是否做过实机校准（有校准时间 = 人工盖过章）。"""
+        return bool(self.verified_at)
+
+    @property
+    def needs_manual_duplex(self) -> bool:
+        """是否必须走手动双面（人工确认不支持自动双面）。未确认(None)不算——交给上层提示。"""
+        return self.auto_duplex is False
+
+    def summary(self) -> str:
+        cap = {True: "支持自动双面", False: "不支持自动双面（需人工翻纸）", None: "能力未确认"}[
+            self.auto_duplex if isinstance(self.auto_duplex, bool) else None]
+        src = {"manual": " · 人工确认", "probe": " · 自动探测"}.get(self.capability_source, "")
+        if self.auto_duplex is False:
+            cap += (f" · 手动双面: {self.first}/"
+                    f"{'逆序' if self.reverse_second else '正序'}/"
+                    f"{'180°补偿' if self.second_rotate_180 else '不旋转'}")
+        if self.verified_at:
+            cap += f" · 校准于 {self.verified_at}" + (f"（{self.verified_by}）" if self.verified_by else "")
+        else:
+            cap += " · 未校准"
+        return cap + src
+
+
+def _default_config_path() -> str:
+    """用户配置路径（延迟导入 paths，避免模块级依赖顺序问题）。"""
+    from paths import config_path
+    return config_path()
+
+
+def update_user_printer_profile(printer_name: str, path: str = "", **fields) -> PrinterProfile:
+    """读-改-写**用户配置**里某台打印机的档案（校准工具 / GUI 共用入口）。
+
+    path 传空串 → 用 paths.config_path()（%APPDATA%\\HN打印工具\\print_config.json）。
+    遇到未知字段名会抛 ValueError（宁可在调用点炸，也别静默不生效）。
+    """
+    path = path or _default_config_path()
+    cfg = PrinterConfig.load(path)
+    prof = cfg.update_profile(printer_name, **fields)
+    cfg.save(path)
+    return prof
+
+
+def load_user_printer_profile(printer_name: str = "", path: str = "") -> PrinterProfile:
+    """读取某台打印机的档案（读不到返回默认档案，不写盘）。"""
+    return PrinterConfig.load(path or _default_config_path()).get_profile(printer_name)
+
+
 @dataclass
 class PrinterConfig:
     """
@@ -344,6 +481,26 @@ class PrinterConfig:
     # 兼容旧格式：如果 JSON 中没有 "tabs" 键但有 "jobs"，自动迁移为 {"1": jobs}
     tabs: dict[str, TabSettings] = field(default_factory=lambda: {"1": TabSettings()})
     active_tab: str = "1"
+    # ---- 打印机档案（按打印队列名）----
+    # 能力（是否自动双面）+ 手动双面的实机校准参数。空 = 该队列没记录（能力视为未确认）。
+    # 由 tools/print_duplex_calibration.py / GUI 写入；见 PrinterProfile 的说明。
+    printer_profiles: dict[str, PrinterProfile] = field(default_factory=dict)
+
+    def get_profile(self, printer_name: str = "") -> PrinterProfile:
+        """取某台打印机的档案（缺省用 self.printer_name）；没有则返回默认档案（不落盘）。"""
+        key = (printer_name or self.printer_name or "").strip()
+        prof = self.printer_profiles.get(key)
+        return prof if isinstance(prof, PrinterProfile) else PrinterProfile()
+
+    def update_profile(self, printer_name: str = "", **fields) -> PrinterProfile:
+        """就地更新某台打印机的档案并返回它（**不落盘**，由调用方决定何时 save）。"""
+        key = (printer_name or self.printer_name or "").strip()
+        if not key:
+            raise ValueError("需要打印机队列名（或先设置 config.printer_name）")
+        prof = self.get_profile(key)
+        prof.apply(**fields)
+        self.printer_profiles[key] = prof
+        return prof
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -376,6 +533,8 @@ class PrinterConfig:
             # 标签页任务（每标签含独立附加服务设置）
             "tabs": {k: v.to_dict() for k, v in self.tabs.items()},
             "active_tab": self.active_tab,
+            # 打印机档案（能力 + 手动双面校准参数，按队列名）
+            "printer_profiles": {k: v.to_dict() for k, v in self.printer_profiles.items()},
         }
 
     @classmethod
@@ -430,6 +589,10 @@ class PrinterConfig:
             # 标签页任务
             tabs=tabs,
             active_tab=data.get("active_tab", "1"),
+            # 打印机档案（老配置没有这个键 → 空 dict，能力视为未确认；坏值当空处理）
+            printer_profiles={str(k): PrinterProfile.from_dict(v)
+                              for k, v in (data.get("printer_profiles") or {}).items()
+                              if isinstance(v, dict)},
         )
 
     def save(self, path: str) -> None:
