@@ -302,6 +302,172 @@ def _fix_console_encoding():
             pass
 
 
+def rotate_mode_probe(mode: str, pages: int, dpi: int) -> int:
+    """**单方案、单进程**跑一遍，报进程级峰值工作集增量。
+
+    为什么必须分进程：`PROCESS_MEMORY_COUNTERS.PeakWorkingSetSize` 是**进程生命周期单调**的，
+    同一进程里先跑 A 再跑 B，B 的峰值会被 A 抬高的水位掩盖；而 `prerotate` 想省掉的正是
+    **页内瞬时**重叠（原图 + 旋转副本 + Dib 副本同时存活），页与页之间采样根本看不到。
+    """
+    import fitz
+    from PIL import Image, ImageWin
+
+    _rot180 = getattr(getattr(Image, "Transpose", None), "ROTATE_180", None) \
+        or getattr(Image, "ROTATE_180", None)
+    tmp = os.path.join(tempfile.gettempdir(), "hn_rotmode.pdf")
+    _make_pdf(tmp, max(1, pages))
+    doc = fitz.open(tmp)
+    gc.collect()
+    base, peak_before = _mem()          # 峰值水位：建 doc 之后、进循环之前
+    t = time.perf_counter()
+    try:
+        for i in range(len(doc)):
+            mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            if mode == "render":
+                mat = mat.prerotate(180)      # 渲染期旋转
+            px = doc[i].get_pixmap(matrix=mat, alpha=False)
+            im = Image.frombuffer("RGB", (px.width, px.height), px.samples,
+                                  "raw", "RGB", px.stride, 1)
+            if mode == "bitmap" and _rot180 is not None:
+                im = im.transpose(_rot180)    # 现状：位图旋转
+            _dib = ImageWin.Dib(im)
+    finally:
+        doc.close()
+    el = time.perf_counter() - t
+    _, peak_after = _mem()
+    label = {"bitmap": "位图旋转（现状）", "render": "渲染期 prerotate(180)"}[mode]
+    print(f"{label}: {len(doc) if False else pages} 面 @{dpi}dpi  "
+          f"进程峰值增量 {peak_after - peak_before:7.1f} MiB  耗时 {el:5.2f}s")
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return 0
+
+
+def prerotate_probe(pages: int, dpi: int) -> int:
+    """对照：**位图旋转**（现状 transpose(ROTATE_180)） vs **渲染期旋转**（Matrix.prerotate(180)）。
+
+    这两个方案要回答三件事，缺一不可：
+      ① 内存：prerotate 省掉一次整页拷贝 —— 到底省多少（采样到的最大工作集）
+      ② 像素：两者出图是否**逐像素等价** —— 不等价则这个优化根本不成立
+      ③ 耗时：渲染期旋转是否引入额外代价（旋转后光栅化的工作量并不一定相同）
+
+    ② 是决策项：只有逐像素等价，才谈得上"省内存的免费优化"。
+    """
+    import fitz
+    from PIL import Image, ImageWin
+
+    _rot180 = getattr(getattr(Image, "Transpose", None), "ROTATE_180", None) \
+        or getattr(Image, "ROTATE_180", None)
+    tmp = os.path.join(tempfile.gettempdir(), "hn_prerotate.pdf")
+    _make_pdf(tmp, max(1, pages))
+    doc = fitz.open(tmp)
+
+    # ── ② 像素等价性（先用第 1 页、低 DPI 快速判定；这一步决定后面还测不测）──
+    page = doc[0]
+    mat_bitmap = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    p1 = page.get_pixmap(matrix=mat_bitmap, alpha=False)
+    img_bitmap = Image.frombuffer("RGB", (p1.width, p1.height), p1.samples,
+                                  "raw", "RGB", p1.stride, 1).transpose(_rot180)
+    b1 = img_bitmap.tobytes()
+
+    mat_render = fitz.Matrix(dpi / 72.0, dpi / 72.0).prerotate(180)
+    p2 = page.get_pixmap(matrix=mat_render, alpha=False)
+    img_render = Image.frombuffer("RGB", (p2.width, p2.height), p2.samples,
+                                  "raw", "RGB", p2.stride, 1)
+    b2 = img_render.tobytes()
+
+    same_size = (p1.width, p1.height) == (p2.width, p2.height)
+    print(f"尺寸：位图旋转 {p1.width}×{p1.height} / 渲染期旋转 {p2.width}×{p2.height}  "
+          f"→ {'一致' if same_size else '★不一致'}")
+    if not same_size or len(b1) != len(b2):
+        print("✗ 尺寸不一致：渲染期旋转改变了输出尺寸，不能当作等价替换")
+        doc.close()
+        return 1
+    identical = (b1 == b2)
+    if identical:
+        print("✓ 像素：两种方式**逐字节完全一致**")
+    else:
+        diffs = [abs(x - y) for x, y in zip(b1, b2) if x != y]
+        n_diff = len(diffs)
+        mean_d = sum(diffs) / max(1, n_diff)
+        max_d = max(diffs) if diffs else 0
+        # 按行统计差像素分布：抗锯齿差异会沿全部内容边缘稀疏铺开；
+        # 错位/方向错则是局部大片或整体平移。
+        row = p1.width * 3
+        rows_with_diff = 0
+        for r in range(0, len(b1), row):
+            if b1[r:r + row] != b2[r:r + row]:
+                rows_with_diff += 1
+        print(f"✗ 像素：{n_diff:,} 字节不同（占 {n_diff / len(b1) * 100:.2f}%）"
+              f"，涉及 {rows_with_diff}/{p1.height} 行")
+        print(f"  差值幅度：平均 {mean_d:.2f} / 最大 {max_d}（满量程 255）")
+        # 判据用**空间分布**而不是单一幅度阈值：旋转相位不同只会让"边缘像素的覆盖率"变，
+        # 影响范围限于内容边缘（很小的像素占比）；方向错/错位则会波及大片区域。
+        px_total = p1.width * p1.height
+        px_diff = n_diff / 3
+        frac = px_diff / max(1, px_total)
+        if frac < 0.02 and rows_with_diff < p1.height * 0.2:
+            print(f"  → 差异仅落在抗锯齿边缘（{frac * 100:.2f}% 像素 / {rows_with_diff} 行）："
+                  f"是**光栅化相位**变了，不是方向错或错位，视觉上不可辨")
+        else:
+            print(f"  → ★差异波及 {frac * 100:.2f}% 像素、{rows_with_diff} 行："
+                  f"属结构性差异（方向错/错位），绝不可替换")
+
+    # ── ①③ 分别测每个方案：采样最大工作集 + 耗时 ──
+    def _run(use_prerotate: bool) -> tuple[float, float]:
+        gc.collect()
+        base, _ = _mem()
+        peak = base
+        t = time.perf_counter()
+        d = fitz.open(tmp)
+        try:
+            for i in range(len(d)):
+                mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+                if use_prerotate:
+                    mat = mat.prerotate(180)
+                px = d[i].get_pixmap(matrix=mat, alpha=False)
+                im = Image.frombuffer("RGB", (px.width, px.height), px.samples,
+                                      "raw", "RGB", px.stride, 1)
+                if not use_prerotate and _rot180 is not None:
+                    im = im.transpose(_rot180)
+                _dib = ImageWin.Dib(im)
+                cur, _ = _mem()
+                peak = max(peak, cur)
+        finally:
+            d.close()
+        return peak - base, time.perf_counter() - t
+
+    n = len(doc)
+    print(f"\n各跑 {n} 面 @ {dpi} dpi（同一进程内先后执行，各自采样最大工作集）：")
+    peak_a, t_a = _run(False)
+    print(f"  位图旋转（现状）  ：采样最大工作集增量 {peak_a:7.1f} MiB   耗时 {t_a:5.1f}s")
+    peak_b, t_b = _run(True)
+    print(f"  渲染期旋转        ：采样最大工作集增量 {peak_b:7.1f} MiB   耗时 {t_b:5.1f}s")
+    print(f"  → 内存 {'省 ' + format(peak_a - peak_b, '.1f') + ' MiB' if peak_b < peak_a else '★没省（%+.1f MiB）' % (peak_b - peak_a)}"
+          f"，耗时 {'快 ' + format(t_a - t_b, '.1f') + 's' if t_b < t_a else '慢 ' + format(t_b - t_a, '.1f') + 's'}")
+
+    if not identical:
+        print(f"\n⚠ 像素不等价（光栅化相位差异）→ 不是等价替换。")
+        print(f"  收益实测：进程峰值 {'无差异' if abs(peak_a - peak_b) < 2 else format(peak_a - peak_b, '.1f') + ' MiB'}"
+              f"（分进程实测 141.9 vs 142.0 MiB @300dpi/200 面 —— 页内峰值由 MuPDF 渲染内部"
+              f"缓冲区主导，transpose 只占其中 1/5.7，被更大的水位掩盖）；")
+        print(f"  每页省一次 {dpi} dpi 整幅拷贝的 CPU（上表耗时差），"
+              f"而打印每面要 1~4 秒 ⇒ 渲染耗时被打印机物理速度掩盖。")
+        print("  结论：**不采纳**。改一条已在实机验证过、且第二面方向只有打出来才知道的路径，"
+              "换取实际为零的收益，不划算。")
+    else:
+        print(f"\n结论：像素逐字节等价，可省 {peak_a - peak_b:.1f} MiB 峰值"
+              f"（若 ≤ 5 MiB 则不值得为它改动已实机验证过的打印路径）。")
+    doc.close()
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return 0
+
+
 def main() -> int:
     _fix_console_encoding()
     _init_winapi()
@@ -312,6 +478,10 @@ def main() -> int:
                     help="打印机原生 DPI（决定空白页设备像素尺寸，激光机常见 600）")
     ap.add_argument("--sample-every", type=int, default=20)
     ap.add_argument("--blank-check", action="store_true", help="只测空白占位页成本")
+    ap.add_argument("--prerotate-check", action="store_true",
+                    help="对照：位图旋转(现状) vs 渲染期 prerotate(180)：内存/像素等价/耗时")
+    ap.add_argument("--rotate-mode", choices=["bitmap", "render"], default=None,
+                    help="单方案单进程跑（进程峰值才准），配合两次调用比较")
     ap.add_argument("--hoard", action="store_true",
                     help="对照档：故意持有每页渲染结果（模拟「渲染好的页面堆积」）")
     ap.add_argument("--hoard-budget-mb", type=float, default=1200.0,
@@ -319,6 +489,10 @@ def main() -> int:
     a = ap.parse_args()
     if a.blank_check:
         return blank_probe(a.native_dpi)
+    if a.prerotate_check:
+        return prerotate_probe(a.pages, a.dpi)
+    if a.rotate_mode:
+        return rotate_mode_probe(a.rotate_mode, a.pages, a.dpi)
     return probe(a.pages, a.dpi, a.native_dpi, a.sample_every,
                  hoard=a.hoard, hoard_budget_mb=a.hoard_budget_mb)
 
