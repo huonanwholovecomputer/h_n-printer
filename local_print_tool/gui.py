@@ -781,14 +781,35 @@ class ManualDuplexDialog(QDialog):
         self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done))
         self._pass1.setStyleSheet(f"color: {self.pass1_color(elapsed, self._pass1_est)};")
 
-    def _pass1_freeze(self):
-        """第 1 趟出纸 → 冻结计时（保留最终用时，供操作员核对）；重复调用无副作用。"""
+    def freeze_pass1(self, seconds: float | None = None):
+        """冻结第 1 趟计时。传 seconds 时用**程序实测的权威值**（worker 报的），
+        不传就用界面自己的时钟兜底（信号没到的异常路径，例如第 1 趟失败/取消）。
+
+        为什么要以实测为准：界面时钟会受主线程卡顿、窗口动画、我们自己的静置余量影响；
+        程序实测（第 1 趟开打 → 纸出完）才是"这台打印机真正花的时间"，两者不一致时
+        以实测为准，并把差值记下来（主线程卡顿/时序异常的证据）。"""
         if self._pass1_done:
             return
         self._pass1_done = True
-        self._pass1_final = self._t0.elapsed() / 1000.0
         self._pass1_timer.stop()
+        local = self._t0.elapsed() / 1000.0
+        try:
+            authoritative = float(seconds) if seconds is not None else None
+        except (TypeError, ValueError):
+            authoritative = None
+        if authoritative is not None and authoritative >= 0:
+            if abs(local - authoritative) > 5.0:
+                self._pass1_hint.setText(
+                    f"{self._pass1_hint.text()}\n（界面计时与程序实测差 {abs(local - authoritative):.0f} 秒，"
+                    f"以程序实测 {format_duration(authoritative)} 为准）".strip())
+            self._pass1_final = authoritative
+        else:
+            self._pass1_final = local
         self._pass1_tick()
+
+    def _pass1_freeze(self):
+        """内部用：界面时钟兜底冻结（保留最终用时，供操作员核对）；重复调用无副作用。"""
+        self.freeze_pass1(None)
 
     # ── 状态切换（全部由 worker 信号 / 本窗按钮驱动）──
 
@@ -1174,12 +1195,16 @@ class PrintWorker(QThread):
             self.log_message.emit(
                 f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
                 f"出纸槽里应有 {plan.sheet_count} 张纸，请数够再翻")
-            # 第 1 趟实测 → 档案自动学习（扣掉我们自己加的静置余量，只算打印机真正花的时间）
+            # 第 1 趟实测 = **权威时刻**：起点在第 1 趟开打前、终点在"纸出完"（下一行才开始等人翻纸），
+            # 所以操作员按不按「继续」都不影响它，不会越等越长。扣掉我们自己加的静置余量
+            # （那段是保守等待，不是打印机花的时间）。异常样本由 add_speed_sample 内部丢弃。
             _elapsed1 = time.perf_counter() - _t_pass1 - float(w.get("margin_seconds", 0.0) or 0.0)
-            if _elapsed1 > 0.5:
+            if _elapsed1 > 0:
                 _est1 = self._estimate_first_pass(n1)
                 self.log_message.emit(
                     f"  ⏱ 第 1 趟实测 {_elapsed1:.1f}s（{n1} 张，预估 {_est1:.1f}s）—— 已记入速度样本")
+                # 一个信号两个用途：① 主线程写档案自动学习；② 常驻窗按这个权威值冻结计时
+                # （界面自己那个时钟只做兜底：信号没到（异常路径）时它照样能冻结）
                 self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
 
             if not self._ask_operator_to_flip(plan):
@@ -6077,10 +6102,19 @@ class MainWindow(QMainWindow):
         self._show_duplex_dialog(dlg)
 
     def _on_duplex_speed_sample(self, sheets: int, seconds: float):
-        """第 1 趟实测 → 写进本机打印队列档案（自动学习"启动开销 + 每张耗时"）。
+        """第 1 趟**实测**（程序侧权威值，与操作员按不按按钮无关）→ 两用：
 
-        为什么自动学而不是只靠标定：真实作业本来就是最好的样本（真实纸型/内容/温度），
-        零额外用纸；标定只是把"刚装好还没样本"这段提前补上。"""
+        ① 常驻窗按它冻结计时（界面时钟只做兜底）；
+        ② 写进本机打印队列档案自动学习（真实作业就是最好的样本，零额外用纸；
+           异常样本由 add_speed_sample 内部丢弃）。"""
+        # ① 先用权威值冻结窗口计时（信号按发射顺序先于此处的 flip_required，所以窗口最终显示的就是它）
+        try:
+            dlg = getattr(self, "_duplex_dialog", None)
+            if dlg is not None and not dlg._pass1_done:
+                dlg.freeze_pass1(seconds)
+        except Exception:
+            pass
+        # ② 学习
         try:
             prof = self._printer_profile()
             if not prof.add_speed_sample(sheets, seconds):

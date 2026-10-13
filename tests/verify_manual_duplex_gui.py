@@ -602,6 +602,40 @@ check("★ 第 1 趟实测被回报（自动学习样本：张数 + 秒数）",
 check("实测与预估一起写进日志（现场可核对）",
       any("第 1 趟实测" in m and "预估" in m for m in _rec9.logs))
 
+# ── 关键：实测**与操作员按不按「继续」无关**（第 1 趟出纸就采样，不等翻纸回执）──
+_rec9b = Rec()
+_w9b = gui.PrintWorker(jobs=[make_job(PDF3)], printer_name="Fake Print", duplex_mode="long-edge",
+                       keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=MANUAL)
+_w9b.log_message.connect(_rec9b.logs.append)
+_w9b.duplex_speed_sample.connect(lambda n, sec: _rec9b.samples.append((n, sec)))
+_flip9_seen = threading.Event()
+_w9b.flip_required.connect(lambda text, sec: _flip9_seen.set())   # 只记录，**不回执**（模拟人不在）
+_restore9 = patched(_rec9b)
+gui.wait_for_output = _wait_zero
+_w9b.start()
+try:
+    _dl9 = time.time() + 30
+    while not _flip9_seen.is_set() and time.time() < _dl9:
+        _app.processEvents()
+        time.sleep(0.02)
+    check("★ 操作员一直不按「继续」，第 1 趟实测照样已经记下来了（等待时间不计入）",
+          _flip9_seen.is_set() and len(_rec9b.samples) == 1 and _rec9b.samples[0][1] < 30,
+          f"samples={_rec9b.samples}")
+    _t_more = _rec9b.samples[0][1] if _rec9b.samples else 0
+    time.sleep(1.2)
+    _app.processEvents()
+    check("★ 干等 1.2 秒也不会把样本拖长（采样点在第 1 趟出纸，不在翻纸回执）",
+          len(_rec9b.samples) == 1 and _rec9b.samples[0][1] == _t_more,
+          f"{_rec9b.samples}")
+    _w9b.confirm_flip(False)
+    _dl9b = time.time() + 30
+    while _w9b.isRunning() and time.time() < _dl9b:
+        _app.processEvents()
+        time.sleep(0.02)
+    _w9b.wait(20000)
+finally:
+    _restore9()
+
 _dlg9 = gui.ManualDuplexDialog()
 _dlg9.announce("说明文本", sheets=10, estimate_sec=43.0)
 _dlg9.set_speed_hint("启动 ≈8s + 每张 ≈3.5s · 基于最近 2 次实测")
@@ -629,6 +663,19 @@ check("翻纸确认倒计时仍在（两个计时器互不干扰）", "还有" i
 _dlg9.announce("第二批", sheets=3, estimate_sec=18.5)
 check("新批次复位重新计时",
       not _dlg9._pass1_done and "已用" in _dlg9._pass1.text() and _dlg9._pass1_timer.isActive())
+# 权威值冻结：worker 实测（程序侧）优先于界面时钟
+_dlg9.freeze_pass1(42.0)
+check("★ 窗口按**程序实测的权威值**冻结（不是界面自己数的），且换算成最终用时",
+      _dlg9._pass1_done and abs(_dlg9._pass1_final - 42.0) < 0.01
+      and "用时 00:42" in _dlg9._pass1.text(), _dlg9._pass1.text())
+_dlg9.announce("第三批", sheets=3, estimate_sec=18.5)
+_dlg9.freeze_pass1(None)
+check("没有权威值时退回界面时钟兜底（照样能冻结）",
+      _dlg9._pass1_done and _dlg9._pass1_final >= 0.0)
+_dlg9.announce("第四批", sheets=3, estimate_sec=18.5)
+_dlg9.set_flippable("翻纸说明", 600)
+check("先冻结过就不会被后来的 set_flippable 覆盖（幂等）",
+      _dlg9._pass1_done and not _dlg9._pass1_timer.isActive())
 _dlg9.finish("批次结束")
 check("收尾把计时器停掉", not _dlg9._pass1_timer.isActive())
 
@@ -641,8 +688,9 @@ _learn_cfg.save(_cfg9)
 
 
 class _LearnWin:
-    def __init__(self, cfg, path):
+    def __init__(self, cfg, path, dialog=None):
         self._config, self._path, self.logs = cfg, path, []
+        self._duplex_dialog = dialog
 
     def _printer_profile(self):
         return self._config.get_profile(self._config.printer_name)
@@ -652,6 +700,22 @@ class _LearnWin:
 
     def _log(self, msg):
         self.logs.append(msg)
+
+
+# 主线程收到"权威实测"后：先用它冻结窗口计时，再写档案
+_cfg9b = os.path.join(_SANDBOX, "learn_cfg2.json")
+_learn_cfg2 = gui.PrinterConfig()
+_learn_cfg2.printer_name = "Fake Print"
+_learn_cfg2.save(_cfg9b)
+_dlg_learn = gui.ManualDuplexDialog()
+_dlg_learn.announce("学习用", sheets=10, estimate_sec=43.0)
+_lw_dlg = _LearnWin(_learn_cfg2, _cfg9b, dialog=_dlg_learn)
+gui.MainWindow._on_duplex_speed_sample(_lw_dlg, 10, 43.0)
+check("★ 主线程拿实测值冻结窗口计时（界面时钟只兜底），显示的就是程序实测",
+      _dlg_learn._pass1_done and abs(_dlg_learn._pass1_final - 43.0) < 0.01
+      and "用时 00:43" in _dlg_learn._pass1.text(), _dlg_learn._pass1.text())
+check("同一笔实测也写进了档案（一个信号两用）",
+      gui.PrinterConfig.load(_cfg9b).get_profile("Fake Print").speed_samples == [[10, 43.0]])
 
 
 _lw = _LearnWin(_learn_cfg, _cfg9)
