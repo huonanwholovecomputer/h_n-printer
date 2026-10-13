@@ -225,7 +225,41 @@ def main() -> int:
                          "会跑手动双面校准的机器通常就是没有双面器的）")
     ap.add_argument("--dry-run", action="store_true", help="只打印方案，不碰打印机")
     ap.add_argument("--keep-pdf", action="store_true", help="保留生成的校准 PDF 以便检查")
+    ap.add_argument("--speed", action="store_true",
+                    help="两点测速标定：打 1 张 + 10 张空白页（单面，不需要翻纸），"
+                         "测出「启动开销 + 每张纸耗时」写进档案（翻纸窗的预计耗时用它）")
+    ap.add_argument("--speed-pages", default="1,10",
+                    help="--speed 的两点页数（默认 1,10）")
     args = ap.parse_args()
+
+    # ── 只做测速标定（与双面页序校准互不干扰，可单独跑）──
+    if args.speed:
+        if not args.printer:
+            print("✗ --speed 必须给出打印队列名（真打）。")
+            return 2
+        try:
+            small, large = (int(x) for x in str(args.speed_pages).split(","))
+        except ValueError:
+            print("✗ --speed-pages 格式应为「小,大」，例如 1,10")
+            return 2
+        import pdf_printer as _pp
+        from printer_config import load_user_printer_profile, update_user_printer_profile
+        print(f"测速标定：{args.printer} —— 打 {small} 张 + {large} 张空白页（单面，共 {small + large} 张纸）")
+        ok, msg, samples = _pp.measure_print_speed_two_point(
+            args.printer, small=small, large=large, on_log=lambda m: print(m))
+        if not ok:
+            print(f"✗ {msg}")
+            return 1
+        prof = load_user_printer_profile(args.printer)
+        for n, sec in samples:
+            prof.add_speed_sample(n, sec)
+        update_user_printer_profile(args.printer, speed_samples=prof.speed_samples)
+        a, b = prof.speed_fit()
+        print(f"✓ {msg}")
+        print(f"  写入档案：启动 ≈{a:.1f}s + 每张 ≈{b:.1f}s（{prof.speed_summary()}）")
+        for n in (1, 5, 10, 20):
+            print(f"    预估：{n} 张 → {prof.estimate_first_pass(n):.0f}s")
+        return 0
 
     # ── 参数来源：CLI 优先 > 该队列已校准档案 > 内置默认 ──
     # 让档案真正生效：同一台机器再校准/复测时不必每次重复敲参数。

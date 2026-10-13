@@ -26,6 +26,7 @@ from PySide6.QtCore import (
     QObject,
     QEvent,
     QEventLoop,
+    QElapsedTimer,
     QPropertyAnimation,
     QEasingCurve,
     QUrl,
@@ -76,7 +77,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration
 from converter import get_converter, UniversalConverter
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
@@ -697,6 +698,22 @@ class ManualDuplexDialog(QDialog):
         self._status.setFont(_sf)
         lay.addWidget(self._status)
 
+        # 第 1 趟计时器（2026-10）：从窗口出现开始正计时，和"预计耗时"比：
+        # 绿=在预估内（含 30 秒宽容带）／黄=超出 30 秒以上／红=超出 1 分钟以上。
+        # 实时变色本身就是预警 —— 打一半就变红通常意味着缺纸/卡纸/打印机离线。
+        self._pass1 = QLabel("")
+        _pf = self._pass1.font()
+        _pf.setBold(True)
+        _pf.setPointSize(_pf.pointSize() + 2)
+        self._pass1.setFont(_pf)
+        self._pass1.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(self._pass1)
+
+        self._pass1_hint = QLabel("")
+        self._pass1_hint.setStyleSheet("font-size: 11px;")
+        self._pass1_hint.setWordWrap(True)
+        lay.addWidget(self._pass1_hint)
+
         self._detail = QLabel("")
         self._detail.setWordWrap(True)
         self._detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -720,10 +737,63 @@ class ManualDuplexDialog(QDialog):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
+        # 第 1 趟计时器（与上面那个"翻纸确认倒计时"是两个独立计时器，别混）
+        self._t0 = QElapsedTimer()
+        self._pass1_sheets = 0
+        self._pass1_est = 0.0
+        self._pass1_final = 0.0
+        self._pass1_done = False       # 用显式标志，别拿 0.0 当"还没冻结"（0 秒也是合法结果）
+        self._pass1_timer = QTimer(self)
+        self._pass1_timer.timeout.connect(self._pass1_tick)
+
+    # ── 第 1 趟计时/预估 ──
+
+    PASS1_GREEN = "#27ae60"      # 在预估内（含宽容带）
+    PASS1_YELLOW = "#e67e22"     # 超出预估 30 秒以上
+    PASS1_RED = "#e74c3c"        # 超出预估 1 分钟以上
+    PASS1_GRACE_SEC = 30         # 宽容带：冷机首张出纸波动可达 10~20 秒，30 秒内不报警
+
+    @staticmethod
+    def pass1_color(elapsed: float, estimate: float) -> str:
+        """计时器颜色：绿=在预估内(+30s 宽容带) / 黄=超出 30 秒以上 / 红=超出 1 分钟以上。"""
+        if estimate <= 0:
+            return ManualDuplexDialog.PASS1_GREEN
+        delta = float(elapsed) - float(estimate)
+        if delta <= ManualDuplexDialog.PASS1_GRACE_SEC:
+            return ManualDuplexDialog.PASS1_GREEN
+        if delta <= 60:
+            return ManualDuplexDialog.PASS1_YELLOW
+        return ManualDuplexDialog.PASS1_RED
+
+    def _pass1_text(self, elapsed: float, *, final: bool = False) -> str:
+        est = getattr(self, "_pass1_est", 0.0)
+        head = f"⏱ 第 1 趟{'用时' if final else '已用'} {format_duration(elapsed)}"
+        if est > 0:
+            head += f" / 预计 {format_duration(est)}"
+        if est > 0 and elapsed > est:
+            over = int(elapsed - est)
+            head += f"（超出 {over} 秒）"
+        return head
+
+    def _pass1_tick(self):
+        """每 0.5 秒刷新；第 1 趟已冻结（_pass1_done）就停在那里，不再继续走。"""
+        elapsed = self._pass1_final if self._pass1_done else (self._t0.elapsed() / 1000.0)
+        self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done))
+        self._pass1.setStyleSheet(f"color: {self.pass1_color(elapsed, self._pass1_est)};")
+
+    def _pass1_freeze(self):
+        """第 1 趟出纸 → 冻结计时（保留最终用时，供操作员核对）；重复调用无副作用。"""
+        if self._pass1_done:
+            return
+        self._pass1_done = True
+        self._pass1_final = self._t0.elapsed() / 1000.0
+        self._pass1_timer.stop()
+        self._pass1_tick()
+
     # ── 状态切换（全部由 worker 信号 / 本窗按钮驱动）──
 
-    def announce(self, text: str):
-        """批次开始：窗口先立起来（常驻），此时还不能翻纸。"""
+    def announce(self, text: str, sheets: int = 0, estimate_sec: float = 0.0):
+        """批次开始：窗口先立起来（常驻），此时还不能翻纸；第 1 趟计时从这一刻起。"""
         self._timer.stop()
         self._mode = "pass1"
         self._status.setText("① 正在打印第 1 趟…（程序自己分两趟，中途只需要翻一次纸）")
@@ -733,9 +803,23 @@ class ManualDuplexDialog(QDialog):
         self._btn_go.setEnabled(False)
         self._btn_skip.setText("⏭ 跳过本任务")
         self._btn_skip.setEnabled(True)
+        # 第 1 趟计时/预估：操作员看到的"窗口出现"就是计时起点
+        self._pass1_sheets = int(sheets or 0)
+        self._pass1_est = float(estimate_sec or 0.0)
+        self._pass1_final = 0.0
+        self._pass1_done = False
+        self._t0.restart()
+        self._pass1_tick()
+        self._pass1_timer.start(500)
+
+    def set_speed_hint(self, text: str):
+        """预估依据（"启动 ≈8s + 每张 ≈3.5s · 基于最近 N 次实测"）——鼠标悬停/小字显示。"""
+        self._pass1_hint.setText(text or "")
+        self._pass1.setToolTip(text or "")
 
     def set_flippable(self, text: str, timeout_sec: int):
-        """第 1 趟已出纸：按钮启用 + 开始倒计时（超时按跳过）。"""
+        """第 1 趟已出纸：冻结计时（保留最终用时）+ 按钮启用 + 开始倒计时。"""
+        self._pass1_freeze()
         self._mode = "flip"
         self._status.setText("② 第 1 趟已打完 —— 请翻纸，然后点「继续打第 2 趟」")
         self._detail.setText(text)
@@ -748,6 +832,9 @@ class ManualDuplexDialog(QDialog):
     def finish(self, text: str = ""):
         """批次结束：收起窗口（稍候自动关，避免一直盖在屏幕上）。"""
         self._timer.stop()
+        if self._pass1_timer.isActive() and not self._pass1_done:
+            self._pass1_freeze()      # 异常路径（第 1 趟失败/取消）也要留下最终用时
+        self._pass1_timer.stop()
         self._mode = "done"
         self._status.setText(text or "手动双面批次已结束")
         self._countdown.setText("")
@@ -801,6 +888,32 @@ class ManualDuplexDialog(QDialog):
         super().closeEvent(ev)
 
 
+class SpeedCalibrationWorker(QThread):
+    """打印速度两点标定：打 1 张 + 10 张**空白页**（单面，不需要翻纸）→ 交给档案拟合。
+
+    为什么走独立线程：两趟加起来常有一两分钟，主线程不能卡（否则界面假死、翻纸窗也不刷新）。
+    空白页只费纸不费碳粉，所以标定成本就是 11 张纸。"""
+
+    log = Signal(str)
+    done = Signal(bool, str, list)      # (ok, msg, samples=[(张数, 秒数), ...])
+
+    def __init__(self, printer_name: str, small: int = 1, large: int = 10, parent=None):
+        super().__init__(parent)
+        self._printer = printer_name
+        self._small = small
+        self._large = large
+
+    def run(self):
+        try:
+            from pdf_printer import measure_print_speed_two_point
+            ok, msg, samples = measure_print_speed_two_point(
+                self._printer, small=self._small, large=self._large,
+                on_log=lambda m: self.log.emit(m))
+            self.done.emit(bool(ok), msg, samples or [])
+        except Exception as e:
+            self.done.emit(False, f"测速异常：{type(e).__name__}: {e}", [])
+
+
 # ============================================================
 # 打印工作线程
 # ============================================================
@@ -836,6 +949,11 @@ class PrintWorker(QThread):
     # 批次结束（成功/失败/跳过）再发一次让主线程收尾关闭。
     duplex_announce = Signal(str)
     duplex_finished = Signal(str)
+    # 第 1 趟的「张数 + 预计秒数」（2026-10）：常驻窗据此显示计时器并按超时变色。
+    duplex_plan = Signal(int, float)
+    # 第 1 趟**实测**（张数, 秒数）→ 主线程写进该打印队列的档案，自动学习出纸速度
+    # （T(n) ≈ a + b·n 的 a/b），下次预估更准。零额外用纸。
+    duplex_speed_sample = Signal(int, float)
 
     def __init__(
         self,
@@ -887,6 +1005,18 @@ class PrintWorker(QThread):
         p = self._manual_profile
         return bool(job.duplex == "on" and p is not None
                     and p.auto_duplex is False and p.manual_duplex)
+
+    def _estimate_first_pass(self, sheets: int) -> float:
+        """第 1 趟预估秒数（档案里实测样本 → a + b·n；没样本就是保守默认值）。
+
+        sheets 用**槽位数**（含空白占位页）：空白页也要走纸，不能不算。"""
+        p = self._manual_profile
+        if p is None:
+            return 0.0
+        try:
+            return float(p.estimate_first_pass(sheets))
+        except Exception:
+            return 0.0
 
     def _ask_operator_to_flip(self, plan) -> bool:
         """请操作员翻纸：发信号 → 等主线程回执。超时/取消/跳过都返回 False。"""
@@ -1018,6 +1148,7 @@ class PrintWorker(QThread):
                 f"{'180°补偿' if rotate else '不旋转'}）")
             self.log_message.emit(f"     第 1 趟: {self._fmt_pages(plan.pass_pages(1))}")
             self.log_message.emit(f"     第 2 趟: {self._fmt_pages(plan.pass_pages(2))}")
+            self.duplex_plan.emit(plan.sheet_count, self._estimate_first_pass(plan.sheet_count))
             self.duplex_announce.emit(self._duplex_announce_text(items, plan, rotate))
 
             def _cb(base: int, slots):
@@ -1030,6 +1161,7 @@ class PrintWorker(QThread):
             map1 = [(s.label, s.page) for s in plan.first_pass]
             map2 = [(s.label, s.page) for s in plan.second_pass]
 
+            _t_pass1 = time.perf_counter()
             ok1, msg1 = print_plan_pass(plan, merged, self._printer_name, 1,
                                         second_rotate_180=rotate,
                                         progress_callback=_cb(base_offset, map1))
@@ -1042,6 +1174,13 @@ class PrintWorker(QThread):
             self.log_message.emit(
                 f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
                 f"出纸槽里应有 {plan.sheet_count} 张纸，请数够再翻")
+            # 第 1 趟实测 → 档案自动学习（扣掉我们自己加的静置余量，只算打印机真正花的时间）
+            _elapsed1 = time.perf_counter() - _t_pass1 - float(w.get("margin_seconds", 0.0) or 0.0)
+            if _elapsed1 > 0.5:
+                _est1 = self._estimate_first_pass(n1)
+                self.log_message.emit(
+                    f"  ⏱ 第 1 趟实测 {_elapsed1:.1f}s（{n1} 张，预估 {_est1:.1f}s）—— 已记入速度样本")
+                self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
 
             if not self._ask_operator_to_flip(plan):
                 if self._cancelled:
@@ -2689,6 +2828,11 @@ class MainWindow(QMainWindow):
         log_action = QAction("日志(&L)", self)
         log_action.triggered.connect(self._on_show_log_manager)
         help_menu.addAction(log_action)
+        speed_action = QAction("打印速度校准…", self)
+        speed_action.setToolTip("打 1 张 + 10 张空白页，测出「启动开销 + 每张纸耗时」"
+                                "（翻纸窗的第 1 趟预计耗时用它）")
+        speed_action.triggered.connect(self._on_calibrate_speed)
+        help_menu.addAction(speed_action)
         help_menu.addSeparator()
         self._update_action = QAction("检查更新(&U)", self)
         self._update_action.triggered.connect(lambda: self._start_update_check(manual=True))
@@ -5917,11 +6061,92 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _on_duplex_plan(self, sheets: int, estimate_sec: float):
+        """批次开始播报「第 1 趟几张纸 / 预计多久」——常驻窗据此计时并按超时变色。"""
+        self._duplex_plan_info = (int(sheets or 0), float(estimate_sec or 0.0))
+
     def _on_duplex_announce(self, text: str):
         """批次开始 → 常驻窗立刻出现（此后状态都在同一个窗口里切换，不再"等弹窗"）。"""
         dlg = self._ensure_duplex_dialog()
-        dlg.announce(text)
+        sheets, est = getattr(self, "_duplex_plan_info", (0, 0.0))
+        dlg.announce(text, sheets=sheets, estimate_sec=est)
+        try:
+            dlg.set_speed_hint(self._printer_profile().speed_summary())
+        except Exception:
+            pass
         self._show_duplex_dialog(dlg)
+
+    def _on_duplex_speed_sample(self, sheets: int, seconds: float):
+        """第 1 趟实测 → 写进本机打印队列档案（自动学习"启动开销 + 每张耗时"）。
+
+        为什么自动学而不是只靠标定：真实作业本来就是最好的样本（真实纸型/内容/温度），
+        零额外用纸；标定只是把"刚装好还没样本"这段提前补上。"""
+        try:
+            prof = self._printer_profile()
+            if not prof.add_speed_sample(sheets, seconds):
+                return
+            self._config.update_profile(self._config.printer_name,
+                                        speed_samples=prof.speed_samples)
+            self._save_config()
+            a, b = prof.speed_fit()
+            self._log(f"  📈 已记入速度样本（第 {len(prof.speed_samples)} 条）："
+                      f"启动 ≈{a:.0f}s + 每张 ≈{b:.1f}s")
+        except Exception as e:
+            self._log(f"⚠ 速度样本写入失败（不影响打印）：{type(e).__name__}: {e}")
+
+    def _on_calibrate_speed(self):
+        """帮助 → 打印速度校准：打 1 张 + 10 张空白页自动计时，写进本机档案。
+
+        预估平时靠"每次真实打印自动采样"越用越准，但刚装好时没有样本；两点标定把这件事提前
+        （11 张纸、单面、不需要人翻纸，远程也能做）。"""
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "打印机正忙",
+                                    "当前有打印任务在进行，请等它结束后再测速。")
+            return
+        cur = getattr(self, "_speed_cal_worker", None)
+        if cur is not None and cur.isRunning():
+            QMessageBox.information(self, "测速进行中", "上一次测速还没结束，请稍候。")
+            return
+        queue = self._config.printer_name or "(系统默认打印机)"
+        reply = QMessageBox.question(
+            self, "打印速度校准",
+            f"将对「{queue}」打印 <b>1 张 + 10 张空白页</b>（单面，共 11 张纸；"
+            f"空白页不费碳粉，也不需要翻纸）。\n\n"
+            f"用来测出「启动开销 + 每张纸耗时」，之后翻纸窗就能显示第 1 趟的预计耗时。\n"
+            f"请确认纸盒有纸，然后点「开始」。",
+            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+        if reply != QMessageBox.Ok:
+            return
+        w = SpeedCalibrationWorker(self._config.printer_name)
+        w.log.connect(self._log)
+        w.done.connect(self._on_speed_calibration_done)
+        self._speed_cal_worker = w
+        self._log(f"🕐 开始测速：{queue} —— 打 1 张 + 10 张空白页（单面）")
+        w.start()
+
+    def _on_speed_calibration_done(self, ok: bool, msg: str, samples: list):
+        try:
+            if ok and samples:
+                prof = self._printer_profile()
+                for item in samples:
+                    try:
+                        prof.add_speed_sample(int(item[0]), float(item[1]))
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                self._config.update_profile(self._config.printer_name,
+                                            speed_samples=prof.speed_samples)
+                self._save_config()
+                a, b = prof.speed_fit()
+                self._log(f"🕐 测速完成：启动 ≈{a:.0f}s + 每张 ≈{b:.1f}s（{prof.speed_summary()}）")
+                QMessageBox.information(
+                    self, "测速完成",
+                    f"{msg}\n\n得到：启动 ≈{a:.0f} 秒 + 每张 ≈{b:.1f} 秒\n"
+                    f"已写进「{self._config.printer_name}」的档案，翻纸窗按它预估第 1 趟耗时。")
+            else:
+                self._log(f"⚠ 测速失败：{msg}")
+                QMessageBox.warning(self, "测速失败", msg or "未取得有效数据，请重试。")
+        finally:
+            self._speed_cal_worker = None
 
     def _on_duplex_finished(self, text: str):
         dlg = getattr(self, "_duplex_dialog", None)
@@ -6103,6 +6328,8 @@ class MainWindow(QMainWindow):
         worker.flip_required.connect(self._on_flip_required)
         worker.duplex_announce.connect(self._on_duplex_announce)
         worker.duplex_finished.connect(self._on_duplex_finished)
+        worker.duplex_plan.connect(self._on_duplex_plan)
+        worker.duplex_speed_sample.connect(self._on_duplex_speed_sample)
         self._worker = worker
         worker.start()
 

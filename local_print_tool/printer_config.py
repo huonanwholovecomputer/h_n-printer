@@ -291,6 +291,81 @@ def _bool_or_default(value, default: bool) -> bool:
     return default
 
 
+# ── 第 1 趟耗时预估（两参数线性模型 T(n) ≈ a + b·n）────────────────────────────
+# 翻纸窗要显示"第 1 趟已经打了多久 / 预计多久"，超时变色当预警（缺纸/卡纸/打印机睡了）。
+# a = 唤醒 + 首页出纸的固定开销；b = 每张纸走纸+成像。真实打印每次自动采样（零额外用纸），
+# 越用越准；样本不足时退化为"仅识别斜率"，仍比"总时长 ÷ 页数"稳（见 fit_print_speed）。
+DEFAULT_STARTUP_SEC = 8.0     # 唤醒 + 首页出纸（冷机可能多 10~20s，颜色阈值留了 30s 宽容带）
+DEFAULT_PER_PAGE_SEC = 3.5    # 每张纸走纸+成像
+SPEED_SAMPLES_MAX = 20        # 档案里最多保留这么多样本（越近越能代表当前状态）
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def format_duration(seconds: float) -> str:
+    """耗时 → 'MM:SS'；满 1 小时 → 'H:MM:SS'。负数/非法值 → '00:00'。"""
+    try:
+        s = int(max(0.0, float(seconds)))
+    except (TypeError, ValueError):
+        s = 0
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+
+def _coerce_speed_samples(value) -> list:
+    """容错解析速度样本：旧档案没这字段 / 手工改坏 / null 都要能活（坏项丢掉，不炸）。"""
+    out: list = []
+    for item in (value if isinstance(value, (list, tuple)) else []):
+        try:
+            n, t = int(item[0]), float(item[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 1 <= n <= 10000 and 0.5 < t <= 3600:
+            out.append([n, round(t, 1)])
+    return out[-SPEED_SAMPLES_MAX:]
+
+
+def fit_print_speed(samples) -> tuple[float, float]:
+    """[(张数, 秒数), ...] → (a 启动开销, b 每张纸耗时)，供 T(n) ≈ a + b·n 预估。
+
+    为什么是两参数：打印机出纸不是匀速的 —— **唤醒 + 首页出纸**是固定开销，之后每张纸才是
+    线性成本。只按"总时长 ÷ 页数"算斜率的话，打 1 页会低估（固定开销被摊薄到 10 页上）、
+    打 50 页会高估（固定开销被重复计入 50 次）。
+
+    样本 ≥2 种页数 → 最小二乘拟合两点；只有一种页数 → 启动取默认值、只识别斜率（中位数抗离群）；
+    没样本 → 全用默认值。结果钳制在合理区间，避免卡纸/操作员中途离开这类异常把预估带飞。"""
+    pts: list[tuple[float, float]] = []
+    for s in (samples if isinstance(samples, (list, tuple)) else []):
+        try:
+            n, t = float(s[0]), float(s[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if n >= 1 and t > 0.5:
+            pts.append((n, t))
+    if not pts:
+        return DEFAULT_STARTUP_SEC, DEFAULT_PER_PAGE_SEC
+
+    a, b = DEFAULT_STARTUP_SEC, DEFAULT_PER_PAGE_SEC
+    if len({round(n) for n, _ in pts}) >= 2:
+        k = len(pts)
+        sx = sum(n for n, _ in pts)
+        sy = sum(t for _, t in pts)
+        sxx = sum(n * n for n, _ in pts)
+        sxy = sum(n * t for n, t in pts)
+        den = k * sxx - sx * sx
+        if abs(den) > 1e-9:
+            b = (k * sxy - sx * sy) / den
+            a = (sy - b * sx) / k
+    else:
+        n0 = float(next(iter({round(n) for n, _ in pts})))
+        med = sorted(t for _, t in pts)[len(pts) // 2]
+        b = (med - DEFAULT_STARTUP_SEC) / max(1.0, n0)
+    return _clamp(a, 0.0, 120.0), _clamp(b, 0.2, 60.0)
+
+
 @dataclass
 class PrinterProfile:
     """单台打印机的**能力 + 手动双面实测参数**（按打印队列名索引，存在 print_config.json）。
@@ -316,9 +391,13 @@ class PrinterProfile:
     verified_at: str = ""                 # 实机校准完成时间（空 = 没校准过）
     verified_by: str = ""                 # 校准/确认者（成员姓名）
     note: str = ""
+    # 第 1 趟耗时样本 [[张数, 秒数], ...]：每次真实打印自动采样（零额外用纸），
+    # 供翻纸窗显示"预计多久 / 超时变色"，见 fit_print_speed。
+    speed_samples: list = field(default_factory=list)
 
     _FIELDS = ("auto_duplex", "capability_source", "manual_duplex", "first",
-               "reverse_second", "second_rotate_180", "verified_at", "verified_by", "note")
+               "reverse_second", "second_rotate_180", "verified_at", "verified_by", "note",
+               "speed_samples")
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self._FIELDS}
@@ -337,6 +416,7 @@ class PrinterProfile:
             verified_at=str(d.get("verified_at", "") or ""),
             verified_by=str(d.get("verified_by", "") or ""),
             note=str(d.get("note", "") or ""),
+            speed_samples=_coerce_speed_samples(d.get("speed_samples")),
         )
 
     def apply(self, **fields) -> "PrinterProfile":
@@ -384,9 +464,38 @@ class PrinterProfile:
             cap += " · 未校准"
         return cap + src
 
+    # ── 第 1 趟耗时预估（两参数线性模型，现场反馈：翻纸窗要显示"打了多久 / 预计多久"）──
+
+    def speed_fit(self) -> tuple[float, float]:
+        """本机档案的 (启动开销 a, 每张纸耗时 b)；无样本时给保守默认值。"""
+        return fit_print_speed(self.speed_samples)
+
+    def estimate_first_pass(self, sheets: int) -> float:
+        """第 1 趟预估秒数。sheets = 第 1 趟**槽位数**（含空白占位页：空白页也要走纸）。"""
+        a, b = self.speed_fit()
+        return max(1.0, a + b * max(0, int(sheets or 0)))
+
+    def add_speed_sample(self, sheets: int, seconds: float) -> bool:
+        """记一笔第 1 趟实测（真实打印自动采样 / 测速校准）。异常样本直接丢弃。"""
+        try:
+            n, t = int(sheets), float(seconds)
+        except (TypeError, ValueError):
+            return False
+        if n < 1 or t <= 0.5 or t > 3600:
+            return False
+        self.speed_samples = (list(self.speed_samples or []) + [[n, round(t, 1)]])[-SPEED_SAMPLES_MAX:]
+        return True
+
+    def speed_summary(self) -> str:
+        """给 UI 显示预估可信度用的一句话。"""
+        a, b = self.speed_fit()
+        n = len(self.speed_samples or [])
+        base = f"启动 ≈{a:.0f}s + 每张 ≈{b:.1f}s"
+        return (f"{base} · 基于最近 {n} 次实测" if n
+                else f"{base}（出厂默认值，尚无实测样本）")
+
 
 def _default_config_path() -> str:
-    """用户配置路径（延迟导入 paths，避免模块级依赖顺序问题）。"""
     from paths import config_path
     return config_path()
 

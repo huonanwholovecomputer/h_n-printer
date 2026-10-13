@@ -169,6 +169,56 @@ check("写档案不影响配置文件里的其它字段（tabs/admin_names 等�
       {"tabs", "active_tab", "cloud_enabled", "admin_names", "printer_profiles"})
 
 # ============================================================
+# ⑦ 第 1 趟耗时预估（两参数模型：a 启动开销 + b 每张纸）
+# ============================================================
+print("\n=== ⑦ 第 1 趟耗时预估 ===")
+check("时长格式：MM:SS；满 1 小时才带小时",
+      pc.format_duration(0) == "00:00" and pc.format_duration(65) == "01:05"
+      and pc.format_duration(3599) == "59:59" and pc.format_duration(3600) == "1:00:00"
+      and pc.format_duration(3725) == "1:02:05")
+check("时长格式：负数/非法值不炸（返回 00:00）",
+      pc.format_duration(-5) == "00:00" and pc.format_duration(None) == "00:00"
+      and pc.format_duration("x") == "00:00")
+
+check("无样本 → 用出厂默认 a/b（不至于显示「预估 0 秒」）",
+      pc.fit_print_speed(None) == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC)
+      and pc.fit_print_speed("junk") == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC))
+check("★ 两点标定能还原 a/b（这正是「启动开销 + 斜率」两参数的意义）",
+      [round(v, 1) for v in pc.fit_print_speed([[1, 11.5], [10, 43.0]])] == [8.0, 3.5])
+check("★ 只有一种页数时：启动取默认、只识别斜率（而不是把固定开销摊进斜率）",
+      [round(v, 1) for v in pc.fit_print_speed([[10, 43.0]])] == [8.0, 3.5])
+check("异常样本被钳制（卡纸/操作员中途离开不会把预估带飞）",
+      pc.fit_print_speed([[10, 99999.0]])[1] <= 60.0
+      and pc.fit_print_speed([[1, 0.1]]) == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC))
+
+p = pc.PrinterProfile(auto_duplex=False, manual_duplex=True, capability_source="manual")
+est10 = p.estimate_first_pass(10)
+check("没有样本时也能给预估（默认 8s + 3.5s×10 = 43s）", 42.0 <= est10 <= 44.0, f"{est10:.1f}")
+check("★ 空白占位页也算（sheets 是槽位数）",
+      p.estimate_first_pass(5) < p.estimate_first_pass(6) < p.estimate_first_pass(7))
+check("预估依据能显示给用户（基于最近 N 次 / 出厂默认）",
+      "尚无实测样本" in p.speed_summary())
+p.add_speed_sample(10, 43.0)
+p.add_speed_sample(1, 11.5)
+check("样本入库后 speed_summary 标注来源",
+      "基于最近 2 次实测" in p.speed_summary() and len(p.speed_samples) == 2)
+check("★ 记样本会丢弃明显异常值（≤0.5s / >1h / 张数<1）",
+      p.add_speed_sample(3, 0.2) is False and p.add_speed_sample(3, 7200) is False
+      and p.add_speed_sample(0, 12) is False and len(p.speed_samples) == 2)
+_q = pc.PrinterProfile()
+for _i in range(30):
+    _q.add_speed_sample(5, 20.0 + _i)
+check("样本条数有上限（只留最近 N 条，反映当前状态）",
+      len(_q.speed_samples) == pc.SPEED_SAMPLES_MAX and _q.speed_samples[-1][1] == 49.0,
+      f"{len(_q.speed_samples)} 条，最后一条 {_q.speed_samples[-1]}")
+check("★ 档案序列化往返保留样本（重启后预估不丢）",
+      pc.PrinterProfile.from_dict(p.to_dict()).speed_samples == p.speed_samples)
+check("旧档案没有 speed_samples 字段 / 被手工改坏 → 一律回空，不影响其它字段",
+      pc.PrinterProfile.from_dict({"auto_duplex": False, "manual_duplex": True}).speed_samples == []
+      and pc.PrinterProfile.from_dict({"speed_samples": [["x"], None, [3, 12.0]]}).speed_samples
+      == [[3, 12.0]])
+
+# ============================================================
 # ⑥ 静态接线：校准工具会落盘，且参数与档案字段一一对应
 # ============================================================
 print("\n=== ⑥ 静态接线 ===")
@@ -190,6 +240,9 @@ check("★ 重跑校准优先用已校准档案（CLI > 档案 > 内置默认）
       and "if prof.is_verified:" in tool)
 check("--forward / --reverse 互斥（避免同时给正序与逆序）",
       "add_mutually_exclusive_group()" in tool)
+check("★ 校准工具有 --speed（两点测速，走 pdf_printer.measure_print_speed_two_point）",
+      '"--speed"' in tool and "measure_print_speed_two_point(" in tool
+      and "add_speed_sample(" in tool and "speed_samples=prof.speed_samples" in tool)
 
 print("\n" + "=" * 56)
 print("打印机档案验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

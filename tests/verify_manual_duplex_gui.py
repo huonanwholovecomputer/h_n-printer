@@ -97,6 +97,8 @@ class Rec:
         self.progress = []
         self.finished = []
         self.plan_labels = []    # [{sheets:[(标签,a,b)], slots:{纸序:标签}}]
+        self.plan = []           # [(第 1 趟张数, 预估秒数)] —— 批次开始播报
+        self.samples = []        # [(第 1 趟张数, 实测秒数)] —— 自动学习样本
 
 
 def patched(rec):
@@ -556,6 +558,142 @@ check("★ 手动「开始打印」也走同一道门（全文件只此一处构
       and "worker = PrintWorker(" in _start_fn and "self._worker = worker" in _start_fn
       and "worker.start()" in _start_fn
       and "self._start_print_worker(list(jobs))" in src)
+
+# ============================================================
+# ⑨ 第 1 趟计时器 / 预估变色 / 自动学习 / 测速校准（全程桩，无真打印）
+# ============================================================
+print("\n=== ⑨ 常驻窗第 1 趟计时器与预估 ===")
+
+
+def _wait_zero(printer, pages=0, **kw):
+    """桩：把"静置余量"报成 0（默认真桩报 2s），并真的睡 0.6s —— 这样第 1 趟的
+    实测耗时 >0.5s，才留得下速度样本（否则会被 add_speed_sample 当异常丢掉）。"""
+    time.sleep(0.6)
+    return {"drained": True, "queue_seconds": 0.6, "margin_seconds": 0.0,
+            "peak_jobs": 0, "detail": ""}
+
+
+def run_worker_zero_margin(jobs, profile, flip_answer=True):
+    rec = Rec()
+    w = gui.PrintWorker(jobs=jobs, printer_name="Fake Print", duplex_mode="long-edge",
+                        keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=profile)
+    w.log_message.connect(rec.logs.append)
+    w.duplex_plan.connect(lambda n, est: rec.plan.append((n, est)))
+    w.duplex_speed_sample.connect(lambda n, sec: rec.samples.append((n, sec)))
+    w.flip_required.connect(
+        lambda text, sec: (rec.flip.append(text), w.confirm_flip(flip_answer)))
+    restore = patched(rec)
+    gui.wait_for_output = _wait_zero
+    try:
+        w.run()
+    finally:
+        restore()
+    return rec
+
+
+_rec9 = run_worker_zero_margin([make_job(PDF3)], MANUAL)
+# 3 页 PDF → **2 张纸**（1|2、3|空白）：预估/采样都按"张数"算，不是页数
+check("★ 批次开始播报「第 1 趟几张 + 预计秒数」（常驻窗据此计时/变色）",
+      len(_rec9.plan) == 1 and _rec9.plan[0][0] == 2 and _rec9.plan[0][1] > 0,
+      f"{_rec9.plan}")
+check("★ 第 1 趟实测被回报（自动学习样本：张数 + 秒数）",
+      len(_rec9.samples) == 1 and _rec9.samples[0][0] == 2 and _rec9.samples[0][1] >= 0.5,
+      f"{_rec9.samples}")
+check("实测与预估一起写进日志（现场可核对）",
+      any("第 1 趟实测" in m and "预估" in m for m in _rec9.logs))
+
+_dlg9 = gui.ManualDuplexDialog()
+_dlg9.announce("说明文本", sheets=10, estimate_sec=43.0)
+_dlg9.set_speed_hint("启动 ≈8s + 每张 ≈3.5s · 基于最近 2 次实测")
+check("窗口一出现就开始正计时：显示「已用 … / 预计 …」且为绿色",
+      "已用" in _dlg9._pass1.text() and "预计 00:43" in _dlg9._pass1.text()
+      and gui.ManualDuplexDialog.PASS1_GREEN in _dlg9._pass1.styleSheet(),
+      _dlg9._pass1.text())
+check("提示里说明预估依据（基于最近 N 次实测）",
+      "基于最近 2 次实测" in _dlg9._pass1_hint.text())
+check("★ 颜色阈值：在预估内(+30s 宽容带)绿 / 超出 30 秒黄 / 超出 1 分钟红",
+      gui.ManualDuplexDialog.pass1_color(43.0, 43.0) == gui.ManualDuplexDialog.PASS1_GREEN
+      and gui.ManualDuplexDialog.pass1_color(73.0, 43.0) == gui.ManualDuplexDialog.PASS1_GREEN
+      and gui.ManualDuplexDialog.pass1_color(74.0, 43.0) == gui.ManualDuplexDialog.PASS1_YELLOW
+      and gui.ManualDuplexDialog.pass1_color(103.0, 43.0) == gui.ManualDuplexDialog.PASS1_YELLOW
+      and gui.ManualDuplexDialog.pass1_color(104.0, 43.0) == gui.ManualDuplexDialog.PASS1_RED)
+_dlg9.set_flippable("翻纸说明", 600)
+check("★ 第 1 趟出纸 → 冻结成「用时」（0 秒也是合法结果，不能拿 0.0 当「未完成」）",
+      _dlg9._pass1_done and "用时" in _dlg9._pass1.text() and not _dlg9._pass1_timer.isActive(),
+      _dlg9._pass1.text())
+_frozen_text = _dlg9._pass1.text()
+_dlg9._pass1_tick()
+check("冻结后再 tick 也不会继续走", _dlg9._pass1.text() == _frozen_text)
+check("翻纸确认倒计时仍在（两个计时器互不干扰）", "还有" in _dlg9._countdown.text(),
+      _dlg9._countdown.text())
+_dlg9.announce("第二批", sheets=3, estimate_sec=18.5)
+check("新批次复位重新计时",
+      not _dlg9._pass1_done and "已用" in _dlg9._pass1.text() and _dlg9._pass1_timer.isActive())
+_dlg9.finish("批次结束")
+check("收尾把计时器停掉", not _dlg9._pass1_timer.isActive())
+
+# ── 自动学习落盘（真的写 print_config.json 副本，跑完读回来核对）──
+print("\n=== ⑨b 实测样本自动学习并落盘 ===")
+_cfg9 = os.path.join(_SANDBOX, "learn_cfg.json")
+_learn_cfg = gui.PrinterConfig()
+_learn_cfg.printer_name = "Fake Print"
+_learn_cfg.save(_cfg9)
+
+
+class _LearnWin:
+    def __init__(self, cfg, path):
+        self._config, self._path, self.logs = cfg, path, []
+
+    def _printer_profile(self):
+        return self._config.get_profile(self._config.printer_name)
+
+    def _save_config(self):
+        self._config.save(self._path)
+
+    def _log(self, msg):
+        self.logs.append(msg)
+
+
+_lw = _LearnWin(_learn_cfg, _cfg9)
+gui.MainWindow._on_duplex_speed_sample(_lw, 10, 43.0)
+gui.MainWindow._on_duplex_speed_sample(_lw, 1, 11.5)
+gui.MainWindow._on_duplex_speed_sample(_lw, 1, 0.1)      # 异常样本：必须被丢弃
+_reloaded = gui.PrinterConfig.load(_cfg9).get_profile("Fake Print")
+check("★ 第 1 趟实测写进档案并落盘（重启后预估不丢）",
+      [s[0] for s in _reloaded.speed_samples] == [10, 1]
+      and [round(v, 1) for v in _reloaded.speed_fit()] == [8.0, 3.5],
+      f"{_reloaded.speed_samples} → {[round(v, 2) for v in _reloaded.speed_fit()]}")
+check("异常样本（0.1 秒）被丢弃，档案里只有 2 条", len(_reloaded.speed_samples) == 2)
+check("学习结果有日志反馈", any("速度样本" in m for m in _lw.logs))
+check("★ 另一种打印机（不同队列名）不会串到本机档案",
+      gui.PrinterConfig.load(_cfg9).get_profile("另一台打印机").speed_samples == [])
+
+# ── 测速校准线程（打 1 张 + 10 张；桩掉真实打印函数，不发一个任务到打印机）──
+print("\n=== ⑨c 测速校准（两点标定）===")
+import pdf_printer as _ppmod  # noqa: E402
+_orig_two = _ppmod.measure_print_speed_two_point
+_orig_one = _ppmod.measure_print_speed
+try:
+    _ppmod.measure_print_speed_two_point = (
+        lambda printer, small=1, large=10, dpi=300, on_log=None:
+        (True, "标定完成：1 张 11.5s / 10 张 43.0s", [[1, 11.5], [10, 43.0]]))
+    _cw = gui.SpeedCalibrationWorker("Fake Print")
+    _got9 = []
+    _cw.done.connect(lambda ok, msg, samples: _got9.append((ok, msg, samples)))
+    _cw.run()
+    check("★ 标定线程把两点样本回传（走的是 pdf_printer 的测速函数）",
+          len(_got9) == 1 and _got9[0][0] is True and _got9[0][2] == [[1, 11.5], [10, 43.0]],
+          f"{_got9}")
+    _ppmod.measure_print_speed = (
+        lambda printer, pages=1, **kw: (True, "桩", 40.0 if pages == 1 else 30.0))
+    # 用**真的** two_point（上一段把模块属性换成了桩，这里显式用原函数）：
+    # 它内部按模块全局名调 measure_print_speed，所以上面那行替换才生效
+    _ok9, _msg9, _ = _orig_two("Fake Print")
+    check("★ 异常结果（1 张比 10 张还慢 → 卡纸/缺纸/首份没打）判失败，不写进档案",
+          _ok9 is False and "异常" in _msg9, _msg9)
+finally:
+    _ppmod.measure_print_speed_two_point = _orig_two
+    _ppmod.measure_print_speed = _orig_one
 
 # ============================================================
 # ⑦ 静态接线

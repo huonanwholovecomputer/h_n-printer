@@ -11,6 +11,7 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Optional
@@ -591,6 +592,80 @@ def merge_pdfs(paths: list[str], out_path: str) -> tuple[bool, str]:
             pass
         return False, f"合并 PDF 失败: {type(e).__name__}: {e}"
     return True, f"已合并 {len(paths)} 份 PDF → {os.path.basename(out_path)}"
+
+
+def measure_print_speed(printer_name: str = "", pages: int = 10, *,
+                        dpi: int = 300, on_log: Callable[[str], None] | None = None
+                        ) -> tuple[bool, str, float]:
+    """打 N 张**空白页**（单面）并计时 → (ok, msg, 秒)。给"第 1 趟耗时预估"做冷启动标定。
+
+    为什么能这么测：空白页**只费纸不费碳粉**，而且走单面 ⇒ **不需要人翻纸**（远程也能标定）。
+    两点标定（打 1 页 + 打 10 页）就能定出 T(n) ≈ a + b·n 的 a、b，比"总时长 ÷ 页数"准得多
+    （见 printer_config.fit_print_speed）。
+
+    计时口径与"真实打印自动采样"**保持一致**：扣掉 wait_for_output 里我们额外加的
+    "队列排空静置余量"（那段是我们自己的保守等待，不是打印机的耗时）。
+    """
+    def _log(msg: str):
+        if on_log:
+            try:
+                on_log(msg)
+            except Exception:
+                pass
+
+    n = max(1, int(pages or 1))
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"hn_speed_{n}_{os.getpid()}_{int(time.time() * 1000)}.pdf")
+    try:
+        import fitz
+        doc = fitz.open()
+        for _ in range(n):
+            doc.new_page()
+        doc.save(tmp)
+        doc.close()
+    except Exception as e:
+        return False, f"生成测速用空白 PDF 失败: {type(e).__name__}: {e}", 0.0
+
+    try:
+        _log(f"  → 测速：正在打印 {n} 张空白页（单面）…")
+        t0 = time.perf_counter()
+        ok, msg = print_pdf(pdf_path=tmp, printer_name=printer_name, copies=1, duplex="off",
+                            duplex_mode="long-edge", page_range="", dpi=dpi)
+        if not ok:
+            return False, msg, 0.0
+        w = wait_for_output(printer_name, pages=n)
+        elapsed = time.perf_counter() - t0 - float(w.get("margin_seconds", 0.0) or 0.0)
+        elapsed = max(0.0, elapsed)
+        _log(f"  → 测速：{n} 张用时 {elapsed:.1f}s"
+             f"（队列排空 {w.get('queue_seconds', 0)}s，已扣掉余量 {w.get('margin_seconds', 0)}s）")
+        return True, f"{n} 张空白页用时 {elapsed:.1f}s", elapsed
+    finally:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def measure_print_speed_two_point(printer_name: str = "", *, small: int = 1, large: int = 10,
+                                  dpi: int = 300,
+                                  on_log: Callable[[str], None] | None = None
+                                  ) -> tuple[bool, str, list]:
+    """两点标定：打 small 张 + large 张 → 返回 [(张数, 秒数), ...]（交给档案做拟合）。
+
+    选 1 与 10：1 张几乎就是"启动开销 a"，10 张再给出斜率；两点共 11 张纸。
+    """
+    samples: list = []
+    for n in (max(1, int(small)), max(2, int(large))):
+        ok, msg, sec = measure_print_speed(printer_name, n, dpi=dpi, on_log=on_log)
+        if not ok:
+            return False, f"测速失败（{n} 张）：{msg}", samples
+        samples.append([n, round(sec, 1)])
+    s_small, s_large = samples[0][1], samples[-1][1]
+    if s_large <= s_small:
+        return False, (f"测速结果异常（{small} 张 {s_small}s ≥ {large} 张 {s_large}s，"
+                       f"可能卡纸/缺纸或第一份没打），请重试"), samples
+    return True, f"标定完成：{small} 张 {s_small}s / {large} 张 {s_large}s", samples
 
 
 def print_pdf(
