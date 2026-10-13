@@ -22,6 +22,7 @@ import io
 import os
 import sys
 import tempfile
+import threading
 import time
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace",
@@ -437,6 +438,124 @@ dlg5.continue_requested.connect(lambda: evts5.append("go"))
 dlg5.announce("x")
 dlg5._on_go()
 check("第 1 趟期间点「继续」无效（按钮本来就禁用）", evts5 == [], f"{evts5}")
+
+# ============================================================
+# ⑧ 翻纸间隙的并发保护（第 1 趟打完 → 操作员确认之间，别的任务不能插进来）
+# ============================================================
+print("\n=== ⑧ 翻纸间隙的并发保护 ===")
+src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+
+
+class _BusyWin:
+    """只够走到 _start_print_worker 的"忙"判定（不是真主窗口）。"""
+
+    def __init__(self, worker):
+        self._worker = worker
+        self._print_starting = False
+        self.logs = []
+
+    def _has_members(self):
+        return True
+
+    def _log(self, msg):
+        self.logs.append(msg)
+
+
+class _FinWin:
+    """只够跑 _on_all_finished 的替身：记录"清 worker"与"补打"的先后顺序。"""
+
+    def __init__(self, worker, retry_item, tab_jobs):
+        self._worker = worker
+        self._auto_print_retry = [retry_item]
+        self._all_printed = False
+        self._printing_tab_key = "0"
+        self.calls = []
+
+        class _Label:
+            def setText(self, _t):
+                pass
+
+        self._status_label = _Label()
+
+        class _Tab:
+            jobs = tab_jobs
+
+        self._config = type("C", (), {"tabs": {"0": _Tab()}})()
+
+    def _log(self, msg):
+        pass
+
+    def _start_print_worker(self, jobs, tab_key=None):
+        # 记录"补打开始时 worker 已经置空"——证明门是先开的，补打不是插队
+        self.calls.append(("start_retry", self._worker is None))
+
+    def _find_tab_key_by_order_id(self, _oid):
+        return ""
+
+
+# 真 worker 停在"等翻纸"：只记录提示、不回执（不 confirm）→ 线程阻塞在 _flip_event.wait()。
+# 必须用 QThread.start()（生产就是这样起的）：isRunning() 只对 QThread 自身有效；
+# 换普通线程跑 run() 的话 isRunning() 恒 False，测不到"门关着"这件事。
+# 跨线程发信号是排队投递 → 主线程要 processEvents() 才收得到。
+_rec = Rec()
+_w = gui.PrintWorker(jobs=[make_job(PDF5)], printer_name="Fake Print", duplex_mode="long-edge",
+                     keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=MANUAL)
+_w.duplex_announce.connect(_rec.announce.append)
+_w.log_message.connect(_rec.logs.append)
+flip_seen = threading.Event()
+_w.flip_required.connect(lambda text, sec: (flip_seen.set(), _rec.flip.append(text)))
+_restore = patched(_rec)
+_w.start()
+try:
+    _deadline = time.time() + 30
+    while not flip_seen.is_set() and time.time() < _deadline:
+        _app.processEvents()
+        time.sleep(0.02)
+    check("翻纸提示已发出（worker 进入等待）", flip_seen.is_set(), f"logs={_rec.logs[-2:]}")
+    check("★ 等翻纸期间 worker 线程**仍然活着**（isRunning=True）—— 这是「门关着」的根据",
+          _w.isRunning() is True)
+    check("★ 等翻纸期间只打了第 1 趟：第 2 趟必须等确认",
+          len(_rec.plan_pass) == 1 and _rec.plan_pass[0][0] == 1, f"{[p[0] for p in _rec.plan_pass]}")
+    check("★ 翻纸提示里明确警告「别插单」（第 2 趟要接着这叠纸打）",
+          "不要让别的打印任务插进来" in (_rec.flip[0] if _rec.flip else ""), "")
+    _fake = _BusyWin(_w)
+    check("★ 此时点「开始打印」被拒（_start_print_worker → False + 忙碌日志，不会真的开打）",
+          gui.MainWindow._start_print_worker(_fake, [make_job(PDF5)]) is False
+          and any("已有打印任务正在进行" in m for m in _fake.logs), f"{_fake.logs}")
+    _w.confirm_flip(True)
+    _fin_deadline = time.time() + 60
+    while _w.isRunning() and time.time() < _fin_deadline:
+        _app.processEvents()
+        time.sleep(0.02)
+    _w.wait(30000)
+    _app.processEvents()
+finally:
+    _restore()
+check("★ 确认翻纸后第 2 趟才发出，且线程退出（门才重新打开）",
+      len(_rec.plan_pass) == 2 and _rec.plan_pass[1][0] == 2 and _w.isRunning() is False,
+      f"{[p[0] for p in _rec.plan_pass]}")
+_fin = _FinWin(_w, {"order_id": 7, "tab_key": "0", "task_ids": []}, [make_job(PDF3)])
+gui.MainWindow._on_all_finished(_fin, 1, 0)
+check("★ 批次结束才置空 _worker 并补打排队订单（顺序：先开门 → 再补打）",
+      _fin._worker is None and _fin.calls == [("start_retry", True)] and _fin._auto_print_retry == [],
+      f"{_fin.calls}")
+
+# ── 两条自动启动路径遇忙必须"排队/重试"，绝不插队 ──
+check("★ 无障碍自动打印：打印机忙 → 入 _auto_print_retry（不插队，批次结束后补打）",
+      "self._auto_print_retry.append({" in src
+      and "if not self._start_print_worker(list(jobs), tab_key=tab_key):" in src)
+check("★ 预约打印：打印机忙 → 10 秒后重试（不插队、不丢单、不计入失败上限）",
+      "打印机正忙，10s 后重试" in src
+      and "_start_scheduled_print_timer(order_id, int(time.time()) + 10)" in src)
+check("★ 补打队列只在 _on_all_finished 里出队（全代码仅此一处 pop）",
+      src.count("self._auto_print_retry.pop(0)") == 1
+      and "self._worker = None" in src.split("def _on_all_finished")[1][:400])
+_start_fn = src.split("def _start_print_worker")[1].split("\n    def ")[0]
+check("★ 手动「开始打印」也走同一道门（全文件只此一处构造+启动 PrintWorker）",
+      src.count("worker = PrintWorker(") == 1
+      and "worker = PrintWorker(" in _start_fn and "self._worker = worker" in _start_fn
+      and "worker.start()" in _start_fn
+      and "self._start_print_worker(list(jobs))" in src)
 
 # ============================================================
 # ⑦ 静态接线

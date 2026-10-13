@@ -901,7 +901,9 @@ class PrintWorker(QThread):
             "  1. 不改变方向，从出纸槽中取出纸叠。不要丢弃空白页面。\n"
             "  2. 保持相同方向，将纸叠插入纸盘 2，使已打印面朝下。\n"
             "     （不要翻面、不要重排）\n"
-            f"  3. 点「继续打第 2 趟」——随后打印 {second_pages}。"
+            f"  3. 点「继续打第 2 趟」——随后打印 {second_pages}。\n\n"
+            "⚠ 翻纸期间不要让别的打印任务插进来（其它程序的手动打印、本工具别的任务都算）：\n"
+            "   第 2 趟要接着这叠纸打，中间插单就会串页。"
         )
         self._flip_continue = False
         self.log_message.emit(f"⏸ 等待人工翻纸（最多 {self.FLIP_TIMEOUT_SEC // 60} 分钟）…")
