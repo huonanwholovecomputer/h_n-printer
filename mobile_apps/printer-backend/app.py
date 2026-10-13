@@ -13,6 +13,7 @@ import time
 import uuid
 import math
 import re
+import urllib.parse
 from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
@@ -1226,6 +1227,26 @@ def _pick_client(active_clients):
         return active_clients[idx]
 
 
+def _content_disposition(name: str) -> str:
+    """构造**对中文安全**的 Content-Disposition（打印机客户端下载文件用）。
+
+    为什么不用 `send_file(download_name=<中文名>)`：Werkzeug 遇到非 ASCII 名会把 ASCII
+    兜底写成 `encode("ascii", "ignore")` 的结果 —— 纯中文名直接退化成 `.pdf`（主名被吃光，
+    只剩扩展名），真名只留在 `filename*=UTF-8''` 里。老客户端只读第一个 `filename=`，
+    于是把文件落成 `.pdf`（点开头 ⇒ os.path.splitext 认为没有扩展名）→ 类型判定为空 →
+    **中文文件名的云端订单必然打印失败**（线上 2026-10：#1004~#1007）。
+
+    这里保证：ASCII 兜底**一定有主名**（中文名 → `download.pdf`），真名照旧放 filename*。
+    这样即使客户端是旧版（只认 filename=），最多是文件名变通用，不会再打出"不支持的类型"。"""
+    raw = str(name or "").strip() or "download"
+    stem, ext = os.path.splitext(raw)
+    ascii_stem = re.sub(r"[^A-Za-z0-9._-]", "", stem)[:60].strip("._-") or "download"
+    ascii_ext = re.sub(r"[^A-Za-z0-9.]", "", ext)
+    ascii_name = (ascii_stem + ascii_ext) or "download"
+    quoted = urllib.parse.quote(raw, safe="")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted}'
+
+
 @app.route("/api/download/<file_id>")
 def download_file(file_id):
     """打印机客户端下载文件（用签名 token 验证）"""
@@ -1244,7 +1265,10 @@ def download_file(file_id):
     if not row or not os.path.exists(row["path"]):
         return jsonify({"success": False, "message": "文件不存在"}), 404
 
-    return send_file(row["path"], download_name=row["original_name"], as_attachment=True)
+    resp = send_file(row["path"], as_attachment=False)
+    resp.headers["Content-Disposition"] = _content_disposition(
+        row["original_name"] or os.path.basename(row["path"]))
+    return resp
 
 
 # ==================== 文件页数分析（统计基础）====================

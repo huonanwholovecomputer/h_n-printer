@@ -620,6 +620,54 @@ check("★ 第 2 趟旋转规则只在 print_plan_pass 一处定义",
 check("180° 旋转用无损 transpose（不是会被重采样的 rotate）",
       "img.transpose(_rot180)" in src and "Image.Transpose" in src)
 
+# ── 空白占位页：禁止按打印机原生 DPI 的**设备像素**开整页位图 ──
+# 旧写法按 printable_w × printable_h（设备像素，非 PDF 点数）开整页 RGB 图，600dpi 的 A4
+# 上 ≈ 99.6 MiB/张，比内容页还贵；手动双面第 2 趟 / 校准序列里空白页可以很多。
+# 现改为复用一个 8×8 白 DIB。
+#
+# ⚠ 负向检查（"旧写法已消失"）必须先把**整行注释**剔掉：实现文件里会复述旧写法做说明
+#   （例如注释里写着"旧值 400_000_000…"），直接把注释当代码会让检查假失败。
+code_src = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+check("★ 空白占位页不再按设备像素开整页位图（旧写法已消失）",
+      "Image.new(\"RGB\", (printable_w, printable_h)" not in code_src
+      and "Image.new(\"RGB\", (8, 8), \"white\")" in code_src)
+check("★ 空白占位页复用一个 DIB（不是每张新建）",
+      "if blank_dib is None:" in code_src and code_src.count('blank_dib.draw(') == 1)
+check("★ 空白占位页仍走 Dib.draw（与内容页同一条 StretchDIBits 路径，不引入新 GDI 调用）",
+      code_src.count("dib.draw(") >= 2)
+
+# ── 单页渲染像素上限：必须按进程位宽分档（旧硬编码值对 32 位等于无保护）──
+try:
+    import pdf_printer as _pp_mod
+    _mp = _pp_mod.max_render_pixels()
+    check("★ MAX_RENDER_PIXELS 由 max_render_pixels() 按位宽推导（不再是硬编码值）",
+          "MAX_RENDER_PIXELS = max_render_pixels()" in code_src
+          and "MAX_RENDER_PIXELS = 400_000_000" not in code_src)
+    check("★ 像素上限落在合理区间（10 Mpx ~ 200 Mpx）",
+          10_000_000 <= _mp <= 200_000_000, f"{_mp:,}")
+    # 换算回单页位图字节数：必须显著小于旧值（400 Mpx × 3B = 1.14 GiB 单缓冲）
+    _bytes = _mp * 3
+    check("★ 单页位图上限显著小于旧的 1.14 GiB（实测瞬时系数 5.7×）",
+          _bytes < 400 * 1024 * 1024, f"{_bytes / 1024 / 1024:.0f} MiB")
+    check("★ 32 位分档存在且更保守（源码按 sys.maxsize 分流）",
+          "sys.maxsize > 2 ** 32" in code_src and "300 * 1024 * 1024" in code_src)
+    check("★ 上限已提到模块级（不再在逐页循环里重新赋值）",
+          code_src.count("MAX_RENDER_PIXELS") >= 3)
+except Exception as e:  # pragma: no cover
+    check(f"读取 pdf_printer.max_render_pixels() 失败: {e}", False)
+
+# ── M1：逐页渲染的中间物（pix/img/dib）绝不能被攒起来 ──
+# verify_render_memory.py 是**复刻**那 4 行来测内存形状的，它测的不是真循环；
+# 若有人在真循环里把位图存进列表/字段，探针不会发现。用静态检查把这条钉死。
+for _name in ("pix", "img", "dib", "blank_dib"):
+    check(f"★ 打印循环不持有 {_name}（未被 append / 存进 self.）",
+          f".append({_name})" not in code_src
+          and f"self._{_name}" not in code_src
+          and f"self.{_name}" not in code_src)
+check("★ 中间物在每次迭代内重新赋值（作用域出循环即被引用计数回收）",
+      "pix = page.get_pixmap(" in code_src and "img = Image.frombuffer(" in code_src
+      and "dib = ImageWin.Dib(img)" in code_src)
+
 print("\n" + "=" * 56)
 print("打印侧双面适配验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")
 sys.exit(0 if ok_all else 1)

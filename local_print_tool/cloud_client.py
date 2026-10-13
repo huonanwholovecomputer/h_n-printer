@@ -24,6 +24,7 @@ import socket
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -78,6 +79,51 @@ def get_cached_pdf_path(source_md5: str, image_orientation: str = "") -> str | N
     if os.path.isfile(pdf_path):
         return pdf_path
     return None
+
+
+def _header_filename(content_disposition: str) -> str:
+    """从 Content-Disposition 取文件名：**优先 RFC 5987 的 `filename*=`**（percent-encoded
+    UTF-8），回退 `filename="..."` / `filename=...`。
+
+    为什么要先看 filename*：Flask/Werkzeug 的 `send_file(download_name=<中文名>)` 会把
+    **非 ASCII 名走 ASCII 兜底**（`encode("ascii", "ignore")`），于是头长这样：
+        attachment; filename=.pdf; filename*=UTF-8''%E4%B8%89%E9%A1%B5...pdf
+    纯中文名在 `filename=` 里被吃光、只剩 `.pdf`，真名只在 `filename*=` 里。只读第一个
+    `filename=` 的实现会拿到 `.pdf`（点开头被 os.path.splitext 当成"没扩展名" → 类型判定
+    为空 → 打印失败），线上 2026-10 中文名云端订单全中招（#1004~#1007）。"""
+    cd = str(content_disposition or "")
+    if not cd:
+        return ""
+    m = re.search(r"filename\*\s*=\s*(?:([\w-]+)'([\w-]*)')?([^;]+)", cd, re.I)
+    if m:
+        raw = (m.group(3) or "").strip().strip('"')
+        try:
+            return urllib.parse.unquote(raw, encoding=(m.group(1) or "utf-8"), errors="replace")
+        except Exception:
+            return urllib.parse.unquote(raw)
+    m = re.search(r'filename\s*=\s*(?:"([^"]*)"|([^;]+))', cd, re.I)
+    return ((m.group(1) or m.group(2) or "").strip() if m else "")
+
+
+def resolve_download_name(task_file_name: str, content_disposition: str = "",
+                          task_id: int = 0) -> str:
+    """决定云端任务下载后的**落盘文件名**（纯函数，便于验收）。
+
+    优先级：**任务自带的名字**（推送 payload 里本来就是对的） > 响应头。
+    再用 basename + 非法字符净化；最后保证"主名不为空"——形如 `.pdf` 的点开头名字会被
+    `os.path.splitext` 当成没有扩展名，必须补一个安全主名，否则下游类型判定失败。"""
+    name = str(task_file_name or "").strip()
+    if not name:
+        name = _header_filename(content_disposition)
+    name = os.path.basename(name.replace("\\", "/")).strip()
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip()
+    base = f"cloud_task_{task_id}" if task_id else "cloud_task"
+    if not name:
+        return base + ".dat"
+    if name.startswith("."):
+        rest = name[1:]
+        return f"{base}.{rest}" if rest else base + ".dat"
+    return name
 
 
 # ---------- CloudTask 数据结构 ----------
@@ -1314,19 +1360,14 @@ class CloudClient(QObject):
                 resp = http_requests.get(url, timeout=120, stream=True)
                 resp.raise_for_status()
 
-                # 从 Content-Disposition 提取原始文件名
-                original_name = task.file_name
-                cd = resp.headers.get("Content-Disposition", "")
-                if "filename=" in cd:
-                    m = re.search(r'filename[*]?=(?:UTF-8\'\')?(?:"([^"]+)"|([^;]+))', cd, re.I)
-                    if m:
-                        original_name = m.group(1) or m.group(2)
-
+                # 文件名：**优先用任务自带的名字**（推送 payload 里就是对的），响应头只在
+                # 任务名叫不出来时兜底。别再无条件改用响应头：Flask 对非 ASCII 名只给
+                # ASCII 兜底（中文被吃光、只剩 ".pdf"），而真名在 filename*= 里 ——
+                # 老写法无条件取第一个 filename=，于是中文名云端订单必然打成"不支持的文件类型"。
+                original_name = resolve_download_name(
+                    task.file_name, resp.headers.get("Content-Disposition", ""), task_id)
                 if not original_name:
                     original_name = f"cloud_task_{task_id}.dat"
-                # P1: 文件名净化 —— 只取 basename，Windows 非法字符与控制字符替换为 _
-                original_name = os.path.basename(original_name) or f"cloud_task_{task_id}.dat"
-                original_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", original_name)
 
                 # 下载到程序暂存目录（%APPDATA%\HN打印工具\file_cache\cloud_<task_id>\）：
                 # 不再用 %TEMP% —— 临时目录被磁盘清理/安全软件清理或重启后文件会消失，

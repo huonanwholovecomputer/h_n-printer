@@ -198,6 +198,20 @@ def get_available_engines() -> dict[str, bool]:
     }
 
 
+def ext_of(file_path: str) -> str:
+    """取扩展名（小写，含点）。**点开头的名字特判**：
+
+    `os.path.splitext(".pdf")` 认为"这是隐藏文件、没有扩展名"（返回 ('.pdf', '')）——
+    可上游真把文件落成 `.pdf` 时，那就是个 PDF。老写法会让类型判定得到空字符串 →
+    报「不支持的文件类型:  (文件: ....pdf)」（线上 2026-10 中文名云端订单事故的最后一环：
+    响应头只剩 `.pdf`，即使落到了盘上也照样打不出来）。"""
+    base = os.path.basename(str(file_path or ""))
+    ext = os.path.splitext(base)[1].lower()
+    if not ext and base.startswith(".") and len(base) > 1 and "." not in base[1:]:
+        ext = base.lower()
+    return ext
+
+
 def _copy_to_temp(file_path: str) -> str:
     """将文件复制到临时目录，返回临时路径。用于 COM 安全操作。"""
     ext = os.path.splitext(file_path)[1]
@@ -583,7 +597,7 @@ def _read_docx_last_editor(file_path: str) -> str | None:
         "word" — 最后被 Microsoft Word 编辑
         None   — 无法判断（标签缺失、非 .docx 文件、读取失败）
     """
-    ext = os.path.splitext(file_path)[1].lower()
+    ext = ext_of(file_path)
     if ext != ".docx":
         return None
 
@@ -1182,7 +1196,7 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
     其他 Office 格式 (.xls/.xlsx/.ppt/.pptx):
       → LibreOffice 无头模式
     """
-    ext = os.path.splitext(file_path)[1].lower()
+    ext = ext_of(file_path)
 
     # Word 文档：多引擎降级
     if ext in (".doc", ".docx"):
@@ -1468,7 +1482,7 @@ class UniversalConverter:
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"文件不存在: {file_path}")
 
-        ext = os.path.splitext(file_path)[1].lower()
+        ext = ext_of(file_path)
 
         # PDF 无需转换
         if ext == ".pdf":

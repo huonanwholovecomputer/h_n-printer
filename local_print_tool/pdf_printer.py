@@ -25,6 +25,30 @@ MID_PRINT_MARKER = "[已出纸] "
 # 那些路径同样依赖驱动，只会静默单面出纸，等于把"没双面却报成功"换个地方重演。
 DUPLEX_UNSUPPORTED_MARKER = "[双面不可用] "
 
+# 单页渲染的像素上限 —— 按**进程位宽**分档，防止极端尺寸的页面把内存打爆。
+#
+# 旧值 400_000_000 的注释写"约 32 位进程上限"，但这个数经不起换算：400 Mpx × 3 字节(RGB,
+# alpha=False) = 1.14 GiB **单**缓冲；而单页流水线的实测瞬时系数是 5.7×（pixmap +
+# transpose 副本 + ImageWin.Dib 副本 + 分配器抖动，见 tests/verify_render_memory.py），
+# 即 ≈ 6.5 GiB —— 对 32 位进程（用户地址空间仅 2 GiB）等于**没有保护**。
+#
+# 现在按"可接受的瞬时峰值"反推像素上限：
+#   · 64 位：预算 ≈1.5 GiB 瞬时 → 约 94 Mpx
+#     （A2@400dpi=62Mpx 仍全分辨率；A0@400dpi=248Mpx 会被降 DPI —— 降 DPI 远好于 OOM）
+#   · 32 位：预算 ≈300 MiB 瞬时 → 约 18 Mpx
+#     （A4@400dpi=15.5Mpx 恰好全分辨率；A3@400dpi=31Mpx 降 DPI）
+RENDER_TRANSIENT_FACTOR = 5.7      # 实测：单页流水线峰值 ≈ 5.7 个单页位图
+_PIXEL_BYTES_RGB = 3               # alpha=False → RGB，3 字节/像素
+
+
+def max_render_pixels() -> int:
+    """按当前进程位宽给出单页渲染像素上限（超过 → 自动降 DPI；仍超 → 拒绝该页）。"""
+    budget = (1536 * 1024 * 1024) if sys.maxsize > 2 ** 32 else (300 * 1024 * 1024)
+    return max(1_000_000, int(budget / (RENDER_TRANSIENT_FACTOR * _PIXEL_BYTES_RGB)))
+
+
+MAX_RENDER_PIXELS = max_render_pixels()
+
 
 # ============================================================
 # PDF 信息读取
@@ -981,6 +1005,12 @@ def _print_pdf_native(
             print(f"[GDI] ⚙ 奇数页({len(pages_to_print)}页) + 双面 + 多份({copies}份) → 副本间插入空白分隔页")
 
         page_seq = 0
+        # 空白占位页复用的极小白色 DIB（懒创建，8×8 拉伸到整页）。
+        # 旧实现是每张空白页都按 printable_w × printable_h 新建一张**整页** RGB 位图，而
+        # printable_* 取的是打印机原生 DPI 的**设备像素**（600 dpi 的 A4 ≈ 99.6 MiB/张，实测），
+        # 比内容页还贵 4 倍。手动双面第 2 趟 / 校准序列里空白占位页可以很多，纯属浪费。
+        # 填充结果与源尺寸无关（走的是内容页同一条 StretchDIBits 路径，驱动本就在放大）。
+        blank_dib = None
         for page_idx in render_seq:
             page_seq += 1
 
@@ -988,8 +1018,8 @@ def _print_pdf_native(
             if page_idx is None:
                 hdc.StartPage()
                 page_started = True
-                blank_img = Image.new("RGB", (printable_w, printable_h), "white")
-                blank_dib = ImageWin.Dib(blank_img)
+                if blank_dib is None:
+                    blank_dib = ImageWin.Dib(Image.new("RGB", (8, 8), "white"))
                 blank_dib.draw(hdc.GetHandleOutput(), (0, 0, printable_w, printable_h))
                 hdc.EndPage()
                 print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (空白占位页)")
@@ -999,11 +1029,10 @@ def _print_pdf_native(
 
             page = doc[page_idx]
 
-            # P0-1: 渲染前估算像素总量 — 超 4 亿像素（约 32 位进程上限）自动降 DPI；
-            #       仍超限则拒绝该页（在 StartPage 之前检查，避免浪费纸张并可降级）
+            # P0-1: 渲染前估算像素总量 — 超上限（按进程位宽分档，见模块顶部 MAX_RENDER_PIXELS）
+            #       自动降 DPI；仍超限则拒绝该页（在 StartPage 之前检查，避免浪费纸张并可降级）
             page_w_pts = page.rect.width
             page_h_pts = page.rect.height
-            MAX_RENDER_PIXELS = 400_000_000
             render_dpi_x = dpi_x
             render_dpi_y = dpi_y
             pixel_count = (page_w_pts * render_dpi_x / 72.0) * (page_h_pts * render_dpi_y / 72.0)

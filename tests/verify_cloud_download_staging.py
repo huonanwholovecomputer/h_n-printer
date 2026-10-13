@@ -91,6 +91,48 @@ with open(task.local_path, "rb") as f:
 check("下载结束后解除「使用中」标记", staging._reserved_snapshot() == set(),
       str(staging._reserved_snapshot()))
 
+print("=== 1b. 文件名解析：中文名不能被响应头的 ASCII 兜底吃掉（2026-10 线上事故）===")
+# 线上实测的响应头长这样（Flask/Werkzeug 对非 ASCII 名做 encode("ascii","ignore") 兜底）：
+#   attachment; filename=.pdf; filename*=UTF-8''%E4%B8%89....pdf
+# 主名被吃光、只剩扩展名；老写法只读第一个 filename= → 落盘成 ".pdf" → os.path.splitext 认为
+# "没有扩展名" → 类型判定为空 → 打印失败（#1004~#1007 就是这么炸的）。
+WERK_CD = ("attachment; filename=.pdf; "
+           "filename*=UTF-8''%E4%B8%89%E9%A1%B5%E6%96%87%E6%A1%A3%E6%B5%8B%E8%AF%95.pdf")
+check("★ 任务自带中文名 → 用任务名（响应头的 ASCII 兜底不参与）",
+      cc.resolve_download_name("三页文档测试.pdf", WERK_CD, 1006) == "三页文档测试.pdf",
+      cc.resolve_download_name("三页文档测试.pdf", WERK_CD, 1006))
+check("★ 任务名缺失时才用响应头，且优先 filename*（percent-decoded UTF-8）",
+      cc.resolve_download_name("", WERK_CD, 1006) == "三页文档测试.pdf",
+      cc.resolve_download_name("", WERK_CD, 1006))
+check("响应头只有引号字符串也能解析",
+      cc.resolve_download_name("", 'attachment; filename="云端订单.pdf"', 7) == "云端订单.pdf")
+check("★ 只剩 \".pdf\" 时补安全主名（点开头名会让 splitext 认为没扩展名）",
+      cc.resolve_download_name("", "attachment; filename=.pdf", 9) == "cloud_task_9.pdf"
+      and cc.resolve_download_name("", "", 9) == "cloud_task_9.dat")
+check("路径穿越/非法字符被压平（安全）",
+      cc.resolve_download_name("..\\..\\evil.pdf", "", 3) == "evil.pdf"
+      and cc.resolve_download_name("a<b>c|d.pdf", "", 4) == "a_b_c_d.pdf")
+check("ASCII 名不受影响", cc.resolve_download_name("tmp_abc.pdf", WERK_CD, 5) == "tmp_abc.pdf")
+
+# 端到端：同样的响应头走完整下载流程，落盘名必须是中文原名
+task1b = CloudTask({"task_id": 4248, "order_id": 7, "file_name": "三页文档测试.pdf",
+                    "download_url": "http://example.invalid/f1b"})
+client._pending_tasks[4248] = task1b
+cc.http_requests.get = lambda url, **kw: _FakeResp(
+    [b"%PDF-1.4 cn " * 40], headers={"Content-Disposition": WERK_CD})
+client._download_file_inner(task1b)
+check("★ 端到端：落盘文件名仍是中文原名（不再变成 .pdf）",
+      task1b.status == "ready" and os.path.basename(task1b.local_path) == "三页文档测试.pdf",
+      f"{task1b.status} / {os.path.basename(task1b.local_path or '')}")
+check("★ 下游类型判定认得它（converter.ext_of 不再返回空）",
+      __import__("converter").ext_of(task1b.local_path) == ".pdf",
+      __import__("converter").ext_of(task1b.local_path or ""))
+check("★ 即使名字真成了 \".pdf\"，类型判定也能认出来（最后一环兜底）",
+      __import__("converter").ext_of(os.path.join(_SANDBOX, ".pdf")) == ".pdf")
+# 收尾：只清掉本节下载的那个文件（保留第 1 节的状态，后面几节的清扫计数才不受影响）
+check("本节收尾只清自己的产物",
+      staging.sweep({task.local_path}) == 1 and os.path.isfile(task.local_path))
+
 print("=== 2. 待确认（未挂到列表任务）期间不被清扫误删 ===")
 check("被任务引用 → 清扫保留", staging.sweep({task.local_path}) == 0
       and os.path.isfile(task.local_path))
