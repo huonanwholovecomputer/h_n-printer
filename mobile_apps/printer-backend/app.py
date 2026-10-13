@@ -958,6 +958,7 @@ def _device_capability_fields(client_id: str) -> dict:
         "capability_source": cap["source"],          # manual / probe / unknown
         "printer_name": cap["printer_name"],
         "capability_verified_by": cap["verified_by"],
+        "capability_verified_at": cap["verified_at"],
         "capability_probe": cap["probe_auto_duplex"],
     }
 

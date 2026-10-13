@@ -263,6 +263,9 @@ check("/api/printer/devices（授权页）带 auto_duplex/capability_source/prin
       f"{byd2.get(CID_OLD, {}).get('auto_duplex')}/{byd2.get(CID_OLD, {}).get('capability_verified_by')}")
 r = client.get("/api/printer/devices")
 check("/api/printer/devices 无 token → 403", r.status_code == 403, f"status={r.status_code}")
+check("★ 下发标注时间（授权页「👤 人工标注」悬停显示 谁 · 何时）",
+      bool(byd2.get(CID_OLD, {}).get("capability_verified_at")),
+      f"{byd2.get(CID_OLD, {}).get('capability_verified_at')}")
 
 state = backend._printer_state_payload(CID_OLD)
 check("printer_state 带本机能力（本地工具据此调整双面 UI/提示）",
@@ -355,6 +358,21 @@ check("授权页保存走 stats_server 代理 /api/proxy/printer/capability",
       "/api/proxy/printer/capability" in html and "function saveDeviceCapability" in html)
 check("授权页表格新增「自动双面」列 + 语义说明",
       "<th>自动双面</th>" in html and "不支持（需人工翻纸）" in html)
+
+# ── 来源标签的措辞 / 可读性 / 标注人（2026-10 现场反馈：「✅ 支持自动双面」旁边也挂「人工」被误读）──
+check("★ 来源标签改叫「👤 人工标注」/「🔍 探测」（说的是结论谁定的，不是「要人工翻纸」）",
+      "👤 人工标注" in html and "🔍 探测" in html and ">人工</span>" not in html)
+check("★ 下拉放宽到 220px（170px 时「🖐 不支持（需人工翻纸）」被截断成「不支持（需人工」）",
+      "max-width:220px" in html and "max-width:170px" not in html)
+check("★ 保存人工结论时一并上报标注人（本页无登录身份 → 取该设备绑定的所有者）",
+      "auto_duplex: autoDuplex, by: by" in html and "var by = dev.owner_name || ''" in html)
+check("★ 设备列表渲染时缓存这一份（保存时据此取所有者），整体替换避免旧条目残留",
+      "_devicesById = {};" in html and "_devicesById[d.client_id] = d;" in html)
+check("★ 标签悬停显示「谁 · 何时」+ 说明优先于探测；未记录标注人时明确说",
+      "人工标注：' + d.capability_verified_by" in html
+      and "capability_verified_at" in html
+      and "人工标注（未记录标注人）" in html
+      and "优先于自动探测，且不会被探测覆盖" in html)
 
 print("\n" + "=" * 56)
 print("设备自动双面能力验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

@@ -4518,6 +4518,9 @@ function loadAuthData(members) {
         box.innerHTML = '<span style="color:var(--muted)">暂无设备记录（本地打印工具连接云端后自动登记）</span>';
         return;
       }
+      // 缓存当前这一份（每次重渲染整体替换，避免旧设备残留）：保存人工结论时要取设备所有者当标注人
+      _devicesById = {};
+      list.forEach(function (d) { if (d && d.client_id) _devicesById[d.client_id] = d; });
       var h = '<div class="table-wrap"><table><thead><tr><th class="l">计算机名称</th><th>在线状态</th><th>所有者</th><th>接单</th><th>自动双面</th><th>操作</th></tr></thead><tbody>';
       list.forEach(function (d) {
         h += '<tr><td class="l">' + esc(d.device_name) +
@@ -4683,15 +4686,19 @@ function capCellHtml(d) {
   var cidSafe = safeId(d.client_id);
   var title = d.printer_name ? ('当前打印队列：' + d.printer_name) : '该设备尚未上报打印队列名';
   var h = '<select data-device-cap="' + esc(cidSafe) + '"' + (cidSafe ? '' : ' disabled') +
-          ' title="' + esc(title) + '" style="max-width:170px">' +
+          ' title="' + esc(title) + '" style="max-width:220px">' +
           '<option value=""' + (v === null ? ' selected' : '') + '>未确认</option>' +
           '<option value="1"' + (v === true ? ' selected' : '') + '>✅ 支持自动双面</option>' +
           '<option value="0"' + (v === false ? ' selected' : '') + '>🖐 不支持（需人工翻纸）</option>' +
           '</select>';
+  // 来源标签：说的是"这条结论谁定的"，不是结论本身 —— 文案带「标注」二字，避免被读成
+  // "这台机器要人工翻纸"（曾把「✅ 支持自动双面」旁边的「人工」误读成这样）。
   if (src === 'manual') {
-    h += ' <span class="tag b" title="' + esc(d.capability_verified_by ? ('人工确认：' + d.capability_verified_by) : '人工确认') + '">人工</span>';
+    var who = d.capability_verified_by ? ('人工标注：' + d.capability_verified_by) : '人工标注（未记录标注人）';
+    if (d.capability_verified_at) who += ' · ' + d.capability_verified_at;
+    h += ' <span class="tag b" title="' + esc(who + '（优先于自动探测，且不会被探测覆盖）') + '">👤 人工标注</span>';
   } else if (src === 'probe') {
-    h += ' <span class="tag" title="由本地打印工具自动探测上报">探测</span>';
+    h += ' <span class="tag" title="由本地打印工具自动探测上报">🔍 探测</span>';
   }
   // 人工与探测结论不一致时露出来，便于事后核对（尤其是"驱动虚报支持"的老机型）
   if (src === 'manual' && typeof d.capability_probe === 'boolean' && d.capability_probe !== v) {
@@ -4700,17 +4707,22 @@ function capCellHtml(d) {
   return h;
 }
 
-/* 保存人工结论。autoDuplex: true / false / null（null = 清除人工结论、回到自动探测）。 */
+/* 保存人工结论。autoDuplex: true / false / null（null = 清除人工结论、回到自动探测）。
+   一起上报 by（标注人）：本页没有登录身份，用**该设备绑定的所有者**作为确认者 ——
+   设备的打印机能力最终是机主确认的；未绑定所有者时留空，前端会显示"未记录标注人"。 */
 function saveDeviceCapability(clientId, autoDuplex) {
   if (!clientId) { toast('❌ 设备 ID 非法，已拒绝操作', 'error'); return; }
+  var dev = _devicesById[clientId] || {};
+  var by = dev.owner_name || '';
   fetch('/api/proxy/printer/capability', {
     method: 'POST', headers: apiHeaders(),
-    body: JSON.stringify({ client_id: clientId, source: 'manual', auto_duplex: autoDuplex })
+    body: JSON.stringify({ client_id: clientId, source: 'manual', auto_duplex: autoDuplex, by: by })
   }).then(function (r) { return r.json(); })
     .then(function (res) {
       if (res && res.success) {
         var msg = autoDuplex === false ? '✅ 已标注「不支持自动双面」：双面订单需人工翻纸，无障碍打印不可用'
                 : (autoDuplex === true ? '✅ 已标注「支持自动双面」' : '✅ 已清除人工结论（回到自动探测结果）');
+        if (by) msg += '（' + by + '）';
         toast(msg, 'success');
         loadAuthData(getMembers());
       } else {
@@ -4720,6 +4732,8 @@ function saveDeviceCapability(clientId, autoDuplex) {
     })
     .catch(function () { toast('❌ 网络错误', 'error'); loadAuthData(getMembers()); });
 }
+/* 设备列表缓存（当前渲染的这一份）：保存人工结论时取「设备所有者」当标注人 */
+var _devicesById = {};
 /* 授权页「自动双面」下拉：事件委托（下拉由 innerHTML 反复重建，绑在 document 上最稳）。
    本页还有别的 select（成员/模块/月份等）也冒泡 change，必须用 data-device-cap 过滤。 */
 document.addEventListener('change', function (e) {
