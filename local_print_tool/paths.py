@@ -81,6 +81,18 @@ def file_cache_dir() -> str:
     return d
 
 
+def duplex_stack_dir() -> str:
+    """手动双面「攒批模式」的批次目录根（duplex_stack.py 管理）。
+
+    刻意**不放在 file_cache 里**：staging.sweep() 会把 file_cache 下所有子目录里
+    "没被任务引用"的文件删掉，而攒批期间各单的第 1 趟 PDF 必须活到第 2 趟打完
+    （见 gui._staged_reference_paths 的引用口径与 duplex_stack.discard_batch 的清理）。
+    """
+    d = os.path.join(get_app_data_dir(), "duplex_stack")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 # ── 旧版数据迁移（绿色版/程序目录 → %APPDATA%）──
 
 

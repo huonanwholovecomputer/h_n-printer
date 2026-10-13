@@ -3276,6 +3276,75 @@ def on_start_printing(data):
     print(f"  [START] 本地工具开始打印: {task_ids}")
 
 
+@socketio.on("print_keepalive")
+def on_print_keepalive(data):
+    """打印中保活：刷新仍在打印中的子任务的 locked_at，避免被超时机制误判。
+
+    为什么需要（2026-10，手动双面/攒批模式）：
+      · check_printing_timeout 对**已 accept** 的子任务按 locked_at 起算
+        PRINT_FEEDBACK_TIMEOUT（3 分钟）判失败 —— 无自动双面器的机型（HP LaserJet 1020）
+        一次作业要分两趟 + 人工翻纸，攒批模式下更要把多个订单的第 1 趟先堆起来再统一打
+        第 2 趟，从 accept 到 print_success 轻易超过 3 分钟 → 顾客会看到「打印失败」。
+      · recover_orphaned_printing_tasks 会把 locked_at 超过 5 分钟的孤儿 printing 任务
+        回退 queued 重推 → 正在打印的任务被**重复打印**。
+    两者都以 locked_at 为时间基准，所以本地工具在作业进行中每 60 秒发一次本事件把
+    locked_at 往后刷即可；作业真正结束（print_success/print_fail）后停止发送，
+    超时机制照常兜底（进程崩溃/断线时不再有保活，3 分钟后仍会被判失败，不会永远挂住）。
+
+    data: {task_ids: [id, ...]}；来源必须是持有该子任务的接单设备。
+    """
+    task_ids = (data or {}).get("task_ids") or (data or {}).get("task_id")
+    if isinstance(task_ids, int):
+        task_ids = [task_ids]
+    if not task_ids:
+        return
+    try:
+        task_ids = [int(t) for t in task_ids]
+    except (ValueError, TypeError):
+        print(f"  [WARN] print_keepalive 收到非法 task_ids: {task_ids!r}，已忽略")
+        return
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] print_keepalive 来自未注册连接（sid={request.sid}），已忽略")
+        return
+
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    refreshed = 0
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for tid in task_ids:
+                chk = conn.execute(
+                    "SELECT operator_client, status FROM order_files WHERE id = ?", (tid,)
+                ).fetchone()
+                if not chk:
+                    continue
+                if chk["status"] not in ("printing", "accepted"):
+                    continue  # 已终结（sent/failed/取消）不再保活
+                if chk["operator_client"] and chk["operator_client"] != client_id:
+                    continue  # 不是本机在打的任务，别替别人续命
+                cur = conn.execute(
+                    "UPDATE order_files SET locked_at = ? WHERE id = ?"
+                    " AND status IN ('printing', 'accepted')",
+                    (now_str, tid),
+                )
+                refreshed += cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    if refreshed:
+        print(f"  [KEEPALIVE] {client_id} 保活 {refreshed} 个子任务（刷新 locked_at）")
+    try:
+        socketio.emit("print_keepalive_ack", {"task_ids": task_ids, "refreshed": refreshed},
+                      to=request.sid)
+    except Exception:
+        pass
+
+
 @socketio.on("page_count_result")
 def on_page_count_result(data):
     """本地打印工具回报文件页数分析结果。

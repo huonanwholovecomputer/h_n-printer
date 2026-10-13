@@ -328,6 +328,20 @@ def _coerce_speed_samples(value) -> list:
     return out[-SPEED_SAMPLES_MAX:]
 
 
+def _coerce_stack_capacity(value) -> int:
+    """攒批出纸槽容量阈值容错（缺键/坏值 → duplex_stack 的默认值）。
+
+    阈值语义与 clamp 边界只在 duplex_stack 里定义一处，这里不复制常量。"""
+    import duplex_stack
+    return duplex_stack.clamp_capacity(value)
+
+
+def _coerce_stack_warn(value) -> int:
+    """攒批第 2 趟等待预警阈值容错（只预警、不自动跳过）。"""
+    import duplex_stack
+    return duplex_stack.clamp_warn_after(value)
+
+
 def fit_print_speed(samples) -> tuple[float, float]:
     """[(张数, 秒数), ...] → (a 启动开销, b 每张纸耗时)，供 T(n) ≈ a + b·n 预估。
 
@@ -394,10 +408,17 @@ class PrinterProfile:
     # 第 1 趟耗时样本 [[张数, 秒数], ...]：每次真实打印自动采样（零额外用纸），
     # 供翻纸窗显示"预计多久 / 超时变色"，见 fit_print_speed。
     speed_samples: list = field(default_factory=list)
+    # ── 攒批模式（多任务合并翻纸）的机型参数（2026-10）──
+    # 出纸槽能堆多少张纸：HP LaserJet 1020 规格 up to 100 张（face down），
+    # 默认 90 留安全余量。到阈值就禁止再收新单入叠（见 duplex_stack.DuplexStack.admit）。
+    stack_capacity: int = 90
+    # 第 2 趟等待多久开始变红预警（秒）。只预警、**不自动跳过**
+    # （第 2 趟要人把纸叠搬回进纸盒，程序不可能自动补）。
+    stack_warn_after_sec: int = 1800
 
     _FIELDS = ("auto_duplex", "capability_source", "manual_duplex", "first",
                "reverse_second", "second_rotate_180", "verified_at", "verified_by", "note",
-               "speed_samples")
+               "speed_samples", "stack_capacity", "stack_warn_after_sec")
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self._FIELDS}
@@ -417,6 +438,8 @@ class PrinterProfile:
             verified_by=str(d.get("verified_by", "") or ""),
             note=str(d.get("note", "") or ""),
             speed_samples=_coerce_speed_samples(d.get("speed_samples")),
+            stack_capacity=_coerce_stack_capacity(d.get("stack_capacity")),
+            stack_warn_after_sec=_coerce_stack_warn(d.get("stack_warn_after_sec")),
         )
 
     def apply(self, **fields) -> "PrinterProfile":
@@ -594,6 +617,11 @@ class PrinterConfig:
     # 能力（是否自动双面）+ 手动双面的实机校准参数。空 = 该队列没记录（能力视为未确认）。
     # 由 tools/print_duplex_calibration.py / GUI 写入；见 PrinterProfile 的说明。
     printer_profiles: dict[str, PrinterProfile] = field(default_factory=dict)
+    # ---- 攒批模式（多任务合并翻纸，2026-10）----
+    # 主界面常驻开关：开启后「需手动双面」的打印请求不再各自翻一次纸，而是把第 1 趟
+    # 连续打进同一叠（出纸槽），人工一次性确认后统一打第 2 趟。见 duplex_stack.py。
+    # 攒批期间其余打印请求（单面订单/自动打印/测速）一律排队——插进纸叠会串页。
+    duplex_stack_mode: bool = False
 
     def get_profile(self, printer_name: str = "") -> PrinterProfile:
         """取某台打印机的档案（缺省用 self.printer_name）；没有则返回默认档案（不落盘）。"""
@@ -644,6 +672,8 @@ class PrinterConfig:
             "active_tab": self.active_tab,
             # 打印机档案（能力 + 手动双面校准参数，按队列名）
             "printer_profiles": {k: v.to_dict() for k, v in self.printer_profiles.items()},
+            # 攒批模式开关（多任务合并翻纸）
+            "duplex_stack_mode": self.duplex_stack_mode,
         }
 
     @classmethod
@@ -702,6 +732,8 @@ class PrinterConfig:
             printer_profiles={str(k): PrinterProfile.from_dict(v)
                               for k, v in (data.get("printer_profiles") or {}).items()
                               if isinstance(v, dict)},
+            # 攒批模式开关（老配置没有这个键 → 关，零回归）
+            duplex_stack_mode=_bool_or_default(data.get("duplex_stack_mode"), False),
         )
 
     def save(self, path: str) -> None:

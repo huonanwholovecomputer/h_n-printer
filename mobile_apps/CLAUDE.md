@@ -27,6 +27,7 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
 - **文件存储**: 按扩展名分子目录 (`pdf/`, `docx/`, `png/` 等)，MD5 索引文件 (`uploads/md5_index.json`) 去重。可配置保留时间，APScheduler 定时清理过期文件。
 - **定时任务** (APScheduler): `process_pending_orders`(30s), `check_printing_timeout`(60s), `cleanup_expired_files`(10min), `recover_orphaned_printing_tasks`(2min), `cleanup_expired_license_keys`(10min)。
 - **断线恢复**: 客户端 disconnect 时回滚其名下所有 `printing` 子任务→`queued`。启动/定时扫描回收超过 5 分钟的孤儿 `printing` 任务。
+- **打印中保活（2026-10，`print_keepalive` 事件）**: `check_printing_timeout` 对**已 accept** 的子任务按 `locked_at` 起算 `PRINT_FEEDBACK_TIMEOUT`（3 分钟）判失败、`recover_orphaned_printing_tasks` 又把 `locked_at` 超 5 分钟的 `printing` 回退 `queued` 重推；而手动双面（无自动双面器机型，如 HP LaserJet 1020）与**攒批模式**（多任务合并翻纸）一次作业要分两趟 + 人工翻纸，从 accept 到 `print_success` 轻易超过 3 分钟 → 顾客会先看到「打印失败」。本地工具在作业进行中每 60 秒发一次 `print_keepalive`（`{task_ids:[...]}`）刷新这些子任务的 `locked_at`；作业真正结束后停止发送，超时机制照常兜底（进程崩溃/断线时不再有保活）。处理器校验 `operator_client`，**不替别的设备在打的任务续命**，且只刷新 `printing`/`accepted` 两个状态的行。
 - **认证**: `login_required` 装饰器验证 Bearer token (itsdangerous 签名, 7天有效)。`require_printer_access` 额外检查非 guest 角色。
 
 关键配置从 `printer-backend/config.py` 加载 (需手动创建，含 WECHAT_APPID/SECRET_KEY/TOKEN/ADMIN_OPENIDS 等)。`/api/admin/statistics/revenue` 订单明细的 `nickname` 实时查 `users` 表（APP 设备绑定微信后订单 openid 迁移为微信 openid → 昵称即微信昵称，修改昵称自动同步）。

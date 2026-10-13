@@ -462,6 +462,16 @@ class _BusyWin:
     def _log(self, msg):
         self.logs.append(msg)
 
+    # 攒批模式闸门（2026-10）：用**真实**闸门函数（它只会用到上面那两个桩：
+    # 未开攒批 + 没有纸叠 → 直接放行到"忙"判定）。
+    _stack_gate = gui.MainWindow._stack_gate
+
+    def _stack_mode_on(self):
+        return False
+
+    def _stack_open_for_business(self):
+        return False
+
 
 class _FinWin:
     """只够跑 _on_all_finished 的替身：记录"清 worker"与"补打"的先后顺序。"""
@@ -490,6 +500,11 @@ class _FinWin:
     def _start_print_worker(self, jobs, tab_key=None):
         # 记录"补打开始时 worker 已经置空"——证明门是先开的，补打不是插队
         self.calls.append(("start_retry", self._worker is None))
+
+    def _drain_stack_wait_queue(self):
+        # 攒批排队放行（2026-10）：本替身没有纸叠/排队请求，实际不会放行任何东西。
+        # 不记进 calls —— 那个列表专门用来钉「先开门 → 再补打」的先后顺序。
+        pass
 
     def _find_tab_key_by_order_id(self, _oid):
         return ""
@@ -777,9 +792,10 @@ check("★ 并批的临时 PDF 不在循环 finally 里删掉（批次还要用�
       "if not defer:\n                    self._cleanup_temp_pdf(job, temp_pdf)" in src)
 check("批次结束发收尾信号（常驻窗据此关闭）", "self.duplex_finished.emit(" in src)
 check("worker 启动时把打印机档案传进去", "manual_duplex_profile=self._printer_profile()" in src)
-check("常驻窗三信号都接到主线程",
+check("常驻窗三信号都接到主线程（announce 在攒批模式下分流到 _on_stack_announce）",
       "worker.flip_required.connect(self._on_flip_required)" in src
-      and "worker.duplex_announce.connect(self._on_duplex_announce)" in src
+      and "worker.duplex_announce.connect(" in src
+      and "self._on_stack_announce if stack_entry else self._on_duplex_announce" in src
       and "worker.duplex_finished.connect(self._on_duplex_finished)" in src)
 check("★ 常驻窗：置顶 + 抢焦点 + 任务栏闪烁",
       "dlg.raise_()" in src and "dlg.activateWindow()" in src

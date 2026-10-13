@@ -596,6 +596,30 @@ class CloudClient(QObject):
         if self._sio_emit("start_printing", {"order_id": order_id, "task_ids": task_ids}):
             self.status_message.emit(f"☁ 订单 #{order_id} 已上报开始打印")
 
+    def report_keepalive(self, task_ids: list) -> bool:
+        """打印中保活：刷新后端 locked_at，避免超时机制把**仍在打印**的订单判失败。
+
+        为什么需要：`check_printing_timeout` 对已 accept 的子任务按 locked_at 起算
+        `PRINT_FEEDBACK_TIMEOUT`（3 分钟）判失败，`recover_orphaned_printing_tasks`
+        又把 locked_at 超 5 分钟的 printing 任务回退 queued 重推（→ 重复打印）。
+        而手动双面（HP LaserJet 1020 这类无自动双面器的机型）一次作业要分两趟 + 人工翻纸，
+        攒批模式下更要把多个订单的第 1 趟先堆成一叠再统一打第 2 趟 —— 从 accept 到
+        print_success 轻易超过 3 分钟。作业进行中每 60 秒保活一次即可。
+
+        **故意不写状态栏/日志**：每分钟刷一行会把日志刷爆，成功与否只看返回值。
+        """
+        ids: list[int] = []
+        for t in (task_ids or []):
+            try:
+                tid = int(t)
+            except (TypeError, ValueError):
+                continue
+            if tid > 0:
+                ids.append(tid)
+        if not ids:
+            return False
+        return self._sio_emit("print_keepalive", {"task_ids": ids})
+
     # ── 离线状态同步 ──
 
     def _status_queue_path(self) -> str:
