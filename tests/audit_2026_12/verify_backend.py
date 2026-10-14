@@ -11,6 +11,15 @@ import sys
 import tempfile
 import traceback
 
+# 控制台编码兜底：断言名里的 🔴/✅ 在 GBK 控制台下会抛 UnicodeEncodeError，
+# 结果是**整个脚本 exit 1 且零断言执行** —— 这个脚本是上一轮 3 个后端 🔴 的
+# 唯一守卫，空的守卫比没有守卫更危险。必须在任何 print 之前重建流编码。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # 老 Python / 被重定向的非标准流
+        pass
+
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = os.path.join(REPO, "mobile_apps", "printer-backend")
 

@@ -13,8 +13,10 @@ WebSocket 连接、往返事件、**服务端后台线程主动推送**是否都
     /home/printer-backend/venv/bin/python tests/verify_gthread_websocket.py
 """
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -53,14 +55,16 @@ if __name__ == "__main__":
     socketio.run(app, host="127.0.0.1", port=5099)
 '''
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-open(os.path.join(HERE, "ws_check_app.py"), "w").write(APP_SRC)
+# 生成物放系统临时目录：原先写在 tests/ 下会留下 ws_check_app.py（仓库脏 + 其
+# `socketio.run(port=5099)` 会被全量 runner 当普通脚本跑起来 → 挂死整轮）。
+WORK = tempfile.mkdtemp(prefix="hn_ws_check_")
+open(os.path.join(WORK, "ws_check_app.py"), "w").write(APP_SRC)
 
 port = 5099
 g = subprocess.Popen(
     [sys.executable, "-m", "gunicorn", "-k", "gthread", "--threads", "4",
      "-w", "1", "-b", f"127.0.0.1:{port}", "--log-level", "warning", "ws_check_app:app"],
-    cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 time.sleep(3.0)
 
 import requests                     # noqa: E402
@@ -126,6 +130,7 @@ finally:
         g.wait(timeout=5)
     except Exception:
         g.kill()
+    shutil.rmtree(WORK, ignore_errors=True)
 
 for k, v in res.items():
     print(f"[{'PASS' if v else 'FAIL'}] {k}")

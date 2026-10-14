@@ -632,7 +632,13 @@ okH = win2._start_print_worker([jobH], tab_key="1")
 check("★ 攒批关闭 → 双面请求走原路径（stack_mode=False，不进叠）",
       okH and started_workers[-1] is not None
       and started_workers[-1]._stack_mode is False, f"ok={okH}")
-started_workers[-1]._stack_pending_ctx = None
+# 审计 2026-10：这里原先写成 `started_workers[-1]._stack_pending_ctx = None` ——
+# 赋给了**桩 worker**，而 `_stack_pending_ctx` 是 MainWindow 的属性（gui.py:2536）
+# ⇒ 该赋值等于没写，只在桩上挂了个没人读的字段，回归抓不到。清理对象改为 win2 并补断言。
+win2._stack_pending_ctx = {}
+check("★ 非攒批路径不残留待处理上下文（_stack_pending_ctx 已清空）",
+      not win2._stack_pending_ctx,
+      f"ctx={win2._stack_pending_ctx!r}")
 win2._config.duplex_stack_mode = True
 
 # 3.12 离开攒批（关掉开关）但纸叠还在 → 别的请求仍要排队

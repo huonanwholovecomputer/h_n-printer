@@ -16,7 +16,15 @@ import sys
 import urllib.error
 import urllib.request
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# 控制台编码兜底（stdout + stderr 都要）：断言名里的 emoji 在 GBK 控制台下
+# 会抛 UnicodeEncodeError，使脚本 exit 1 却零断言执行。reconfigure 比替换
+# sys.stdout 更稳（不影响 buffer 语义，且能覆盖 stderr）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        break
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_DIR = os.path.join(REPO, "mobile_apps", "android_app")

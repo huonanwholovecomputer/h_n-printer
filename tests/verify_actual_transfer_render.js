@@ -10,7 +10,11 @@
  * exit 0 = 全部通过。
  */
 const fs = require('fs'), vm = require('vm');
-const html = fs.readFileSync(process.argv[2], 'utf8');
+// 缺省指向仓库内的结算页：不传参也能被聚合 runner（tests/run_all.py）直接跑。
+// 与 verify_abandoned_order_amount.js 的写法保持一致。
+const html = fs.readFileSync(
+  process.argv[2] || require('path').join(__dirname, '..', 'local_print_tool', 'finance', 'settlement.html'),
+  'utf8');
 const scripts = [...html.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
 const js = scripts.join('\n;\n');
 
