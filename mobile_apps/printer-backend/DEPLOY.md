@@ -60,6 +60,18 @@ mkdir -p /opt/printer-backend/backups
 chown -R www-data:www-data /opt/printer-backend
 ```
 
+> ⚠ **勿直出上传目录（uploads/）** —— 不要在 nginx 里加
+> `location /uploads/ { alias /opt/printer-backend/uploads/; }`。
+> 该目录下既有顾客上传的原始文档，也有几个**文件名固定、无需爆破**的服务端元数据：
+> `md5_index.json`（md5 → 原始文件名 + 相对路径 + 页数）、`security_config.json`、
+> `retention_config.json`、`order_counter.json`、`avatars/`。nginx `alias` 完全不鉴权，
+> 加了这一条就等于对外开放一个「任意文件读取 + 全体顾客文件名索引泄露」入口 ——
+> `curl https://你的域名/uploads/md5_index.json` 一条命令即可命中。
+> `nginx-http.conf` / `nginx-https.conf` **已刻意不含该 location**（原配置有，现已删除），
+> 升级时也**别加回来**；确需内部重定向才用 `internal;`。
+> 文件下发一律走后端鉴权路由（`/api/file/<id>` 带归属校验、`/api/avatar?openid=…`）。
+> 守护脚本：`python tests/verify_nginx_uploads.py`。
+
 ---
 
 ## 5. 测试 Gunicorn
