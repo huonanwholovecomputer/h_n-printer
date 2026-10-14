@@ -335,6 +335,9 @@ import cloud_client as cc
 
 class _StubCC:
     _cleanup_pdf_cache = cc.CloudClient._cleanup_pdf_cache
+    # 🔴-A7 起 _cleanup_pdf_cache 会调用它清理「非 docx 却带引擎后缀」的脏条目；
+    # 存根也要借用同一实现（只 stub 索引读写，复用真实清理逻辑）。
+    _purge_stale_engine_entries = cc.CloudClient._purge_stale_engine_entries
 
     def __init__(self, cache_dir, hours, index):
         self._cache_dir = cache_dir

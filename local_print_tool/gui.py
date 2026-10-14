@@ -85,7 +85,7 @@ from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx
 import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 import duplex_stack  # 攒批模式（多任务合并翻纸）的纸叠账本（纯逻辑，见 duplex_stack.py）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
-from cloud_client import CloudClient, CloudTask, pdf_cache_key
+from cloud_client import CloudClient, CloudTask, cache_engine_for, pdf_cache_key
 from stats_server import StatsServer, load_local_data_file, clear_local_data_files
 from offline_sync import OfflineSync
 import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼容，详见 staging.py）
@@ -1960,7 +1960,8 @@ class ConvertWorker(QThread):
                 # 直接以 MD5 命名存入 pdf_cache（docx 缓存 key 含引擎后缀，防止 WPS 文档
                 # 被 Word 引擎转换的错误 PDF 被复用；若无 MD5 则用临时文件）
                 if self._source_md5:
-                    _eng_key = self._engine if (ext == ".docx" and self._engine in ("word", "wps")) else ""
+                    # 引擎后缀判定统一走 cache_engine_for（与读侧/索引侧同一口径）
+                    _eng_key = cache_engine_for(self._file_path, self._engine)
                     temp_pdf = os.path.join(
                         cache_dir, pdf_cache_key(self._source_md5, "", _eng_key) + ".pdf")
                 else:
@@ -5764,8 +5765,8 @@ class MainWindow(QMainWindow):
                 source_md5 = ""
         # 检查本地 PDF 缓存（图片按方向后缀、docx 按转换引擎分开）
         if source_md5:
-            _cache_engine = engine if (os.path.splitext(file_path)[1].lower() == ".docx"
-                                       and engine in ("word", "wps")) else ""
+            # 引擎后缀判定统一走 cache_engine_for（写/读/打印三侧同一口径）
+            _cache_engine = cache_engine_for(file_path, engine)
             if self._cloud_client:
                 cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
                     source_md5, image_orientation, _cache_engine)
@@ -9098,8 +9099,9 @@ class MainWindow(QMainWindow):
                     pass
             # 存入 MD5 缓存索引（docx 按转换引擎分开缓存，避免 WPS 文档被 Word 渲染的错误 PDF 被复用）
             if job.source_md5:
-                _cache_engine = getattr(job, 'engine', '')
-                _cache_engine = _cache_engine if _cache_engine in ("word", "wps") else ""
+                # 写侧判定必须与读侧同一口径（原先只看 engine：图片/PDF/TXT 的 job.engine
+                # 默认就是 "word" ⇒ 写成 _eword 后缀，而读侧只按 .docx 加后缀 ⇒ 永不命中）
+                _cache_engine = cache_engine_for(job.file_path, getattr(job, 'engine', ''))
                 if self._cloud_client:
                     try:
                         self._cloud_client._save_pdf_to_cache(
@@ -9241,8 +9243,8 @@ class MainWindow(QMainWindow):
             preferred = "wps" if editor == "wps" else "word"
             for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
                 if available.get(eng, False): engine = eng; break
-            if ext == ".docx":
-                cache_engine = engine if engine in ("word", "wps") else ""
+            # 引擎后缀判定统一走 cache_engine_for（仅 .docx + word/wps 才加后缀）
+            cache_engine = cache_engine_for(task.file_name, engine)
 
         # 1. 检查 PDF 缓存（MD5 索引；图片按方向、docx 按转换引擎分开缓存）
         if source_md5 and self._cloud_client:
@@ -9488,9 +9490,10 @@ class MainWindow(QMainWindow):
             if staged_count:
                 _msg += f"（{staged_count} 个已复制到暂存副本，原件删除/移动不影响打印）"
             self._log(_msg)
+            # 只为**本次新增**的行启动预转换（rows_before 之前的行上次已处理过）。
+            # 原先遍历整个 jobs ⇒ 添加第 N 个文件时把前 N-1 个全部重新渲染一遍（O(n²)，
+            # 现场：7 个图片渲染 18+ 次、首个文件 50 秒内被渲染 4 次）。
             for i, job in enumerate(jobs):
                 ext = os.path.splitext(job.file_path)[1].lower()
                 if ext != ".pdf":
-                    # 所有非 PDF 文件都在添加时预转换为 PDF 并缓存（图片/TXT/Word 等）
-                    # 这样崩溃恢复后即使源文件不可用，缓存 PDF 仍可用于打印
                     self._start_convert_worker(i, job.file_path, job.engine)

@@ -56,14 +56,42 @@ STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃�
 MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
 
+_CACHE_ENGINE_SUFFIXABLE = ("word", "wps")
+
+
+def cache_engine_for(source_ext_or_path: str, engine: str) -> str:
+    """缓存 key 的引擎后缀判定 —— 写侧 / 读侧 / 打印侧的**唯一**口径。
+
+    规则：**仅 `.docx` 且引擎 ∈ {word, wps}** 才返回引擎名（key 里加 `_e{engine}`），
+    其余一律返回 ""。理由：docx 的渲染结果随引擎变化（WPS 特殊布局被 Word 渲染会出错），
+    必须按引擎隔离缓存；而非 docx 文件的渲染与引擎无关，加后缀只会让同一个文件在写侧与
+    读侧算出不同的键。
+
+    这个函数存在的意义就是**杜绝判定漂移**：原先三处各写各的 ——
+    写侧 `gui.py::_start_convert_worker` 只看 `job.engine`，读侧与打印侧却还看扩展名，
+    而 `job.engine` 对图片/PDF/TXT 默认就是 "word"
+    ⇒ 写 `{md5}_eword.pdf`、读 `{md5}.pdf`，本地拖入的文件缓存**永不命中**
+    （每次都要重新转换），云端下载的（无后缀）却能命中 —— 正好解释"云端不反复转换、
+    本地拖入才反复转换"的分裂现象。
+
+    参数可传路径或裸扩展名（`".docx"` / `"a.docx"` / `"D:/x/a.docx"` 均可）。
+    """
+    s = str(source_ext_or_path or "")
+    ext = s.lower() if s.startswith(".") else os.path.splitext(s)[1].lower()
+    return engine if (ext == ".docx" and engine in _CACHE_ENGINE_SUFFIXABLE) else ""
+
+
 def pdf_cache_key(source_md5: str, image_orientation: str = "", engine: str = "") -> str:
     """PDF 缓存 key：图片显式方向（landscape/portrait）时加方向后缀；docx 转换引擎
     （word/wps）不同渲染结果不同，必须按引擎分开缓存，否则改引擎后仍命中旧引擎 PDF
-    （WPS 特殊布局被 Word 引擎转换的错误 PDF 会被永久复用）。其余用纯 MD5（向后兼容既有缓存）。"""
+    （WPS 特殊布局被 Word 引擎转换的错误 PDF 会被永久复用）。其余用纯 MD5（向后兼容既有缓存）。
+
+    ⚠ 本函数**盲信**传入的 engine —— 调用方必须先用 cache_engine_for() 归一，
+    否则会重演"写侧 _eword / 读侧无后缀、缓存永不命中"。"""
     parts = source_md5
     if image_orientation in ("landscape", "portrait"):
         parts = f"{parts}_{image_orientation}"
-    if engine in ("word", "wps"):
+    if engine in _CACHE_ENGINE_SUFFIXABLE:
         parts = f"{parts}_e{engine}"
     return parts
 
@@ -1616,6 +1644,28 @@ class CloudClient(QObject):
                 md5.update(chunk)
         return md5.hexdigest()
 
+    @staticmethod
+    def _infer_cache_engine(path: str, ext: str) -> str:
+        """页数分析路径推断缓存用的引擎后缀（与 GUI 侧 cache_engine_for 同一规则）。
+
+        仅 `.docx` 才可能非空：读 docx 的 last editor → 优先同名引擎，取其可用者。
+        非 docx、读不出 editor、或 word/wps 都不可用 → 返回 ""（等于不按引擎隔离，
+        与 GUI 侧 engine="libreoffice" 时的结果一致）。
+        """
+        if ext != ".docx" or not path:
+            return ""
+        try:
+            from converter import _read_docx_last_editor, get_available_engines
+            editor = _read_docx_last_editor(path)
+            available = get_available_engines()
+            preferred = "wps" if editor == "wps" else "word"
+            for eng in [preferred] + [e for e in _CACHE_ENGINE_SUFFIXABLE if e != preferred]:
+                if available.get(eng, False):
+                    return eng
+        except Exception:
+            pass
+        return ""
+
     def _get_cached_pdf(self, md5: str, image_orientation: str = "", engine: str = "") -> tuple[str | None, dict | None]:
         """查找指定 MD5 的缓存 PDF。返回 (pdf_path, metadata) 或 (None, None)。
         图片按方向后缀分开缓存（landscape/portrait）；docx 按转换引擎分开缓存（word/wps），
@@ -1683,12 +1733,39 @@ class CloudClient(QObject):
         self.status_message.emit(f"📦 PDF 已缓存: {original_name} (MD5={md5[:8]}...)")
         self._schedule_cache_cleanup()
 
+    def _purge_stale_engine_entries(self, index: dict) -> int:
+        """清理「非 docx 却带了 _eword/_ewps 引擎后缀」的历史脏条目（🔴-A7 的产物）。
+
+        这些条目是写侧判定漂移时写下的：读侧只对 .docx 加引擎后缀 ⇒ 永远查不到它们，
+        纯占空间。与保留时长无关（命中即删），故不放在过期循环里。
+        """
+        removed = 0
+        for key, meta in list(index.items()):
+            if not isinstance(meta, dict):
+                continue
+            src_ext = str(meta.get("source_ext", "")).lower()
+            if src_ext and src_ext != ".docx" and key.endswith(("_eword", "_ewps")):
+                pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
+                try:
+                    if os.path.isfile(pdf_path):
+                        os.remove(pdf_path)
+                except OSError:
+                    pass
+                del index[key]
+                removed += 1
+                logger.info(f"清理引擎后缀脏缓存（非 docx）: {key}")
+        return removed
+
     def _cleanup_pdf_cache(self):
         """清理过期的缓存 PDF（超过保留小时数）+ 回收无索引孤儿文件。"""
-        if self._CACHE_RETENTION_HOURS <= 0:
-            return  # 0 = 永不过期
-        cutoff = datetime.now() - timedelta(hours=self._CACHE_RETENTION_HOURS)
         index = self._load_cache_index()
+        stale_removed = self._purge_stale_engine_entries(index)
+        if self._CACHE_RETENTION_HOURS <= 0:
+            # 0 = 永不过期：过期清理跳过，但脏条目（上面）仍要落盘
+            if stale_removed:
+                self._save_cache_index(index)
+            return
+        cutoff = datetime.now() - timedelta(hours=self._CACHE_RETENTION_HOURS)
         removed = 0
         live_keys: set[str] = set()
         for key, meta in list(index.items()):
@@ -1724,9 +1801,12 @@ class CloudClient(QObject):
                     pass
         except OSError:
             pass
+        if removed > 0 or stale_removed > 0:
+            self._save_cache_index(index)   # 过期条目与脏条目一次落盘
         if removed > 0:
-            self._save_cache_index(index)
             self.status_message.emit(f"📦 已清理 {removed} 个过期缓存 PDF")
+        if stale_removed > 0:
+            logger.info(f"清理引擎后缀脏缓存 {stale_removed} 条（非 docx 带 _eword/_ewps）")
 
     _cache_cleanup_scheduled = False
 
@@ -1773,7 +1853,9 @@ class CloudClient(QObject):
 
         try:
             # 0. 后端已带 MD5 → 先查 PDF 缓存，命中则跳过下载（本地按云端 MD5 直接命中）
-            if source_md5:
+            #    docx 除外：转换引擎取决于文档内容（last editor），未下载无法确定 ⇒ 一律
+            #    下载后判断（与 _download_file_inner 同一设计，避免命中错引擎的缓存）。
+            if source_md5 and ext != ".docx":
                 cached_pdf, cached_meta = self._get_cached_pdf(source_md5)
                 if cached_pdf and cached_meta:
                     from pdf_printer import get_pdf_info
@@ -1800,7 +1882,11 @@ class CloudClient(QObject):
             # 2. 计算源文件 MD5（后端未带 MD5 时的兜底），查缓存
             if not source_md5:
                 source_md5 = self._compute_md5_file(temp_dl)
-            cached_pdf, cached_meta = self._get_cached_pdf(source_md5)
+            # docx 的缓存按引擎隔离（与 GUI 侧同一口径 cache_engine_for）：此处从文件内容
+            # 推断引擎，非 docx / 推断不出则 ""。原先一律按无后缀查 ⇒ 永远命中不了打印侧
+            # 写的 _e{engine} 条目（每次分析都白跑一次完整转换）。
+            _eng = self._infer_cache_engine(temp_dl, ext)
+            cached_pdf, cached_meta = self._get_cached_pdf(source_md5, "", _eng)
 
             if cached_pdf and cached_meta:
                 # 缓存命中：直接统计页数
@@ -1829,7 +1915,11 @@ class CloudClient(QObject):
                     from pdf_printer import get_pdf_info
                     info = get_pdf_info(temp_pdf)
                     page_count = info.get("page_count", 0)
-                    self._save_pdf_to_cache(source_md5, temp_pdf, file_name, ext, page_count)
+                    # docx 不在此写缓存：渲染随引擎变化，而分析路径拿不到 converter 实际
+                    # 用的引擎 ⇒ 写进去可能带错引擎身份。打印侧本就按引擎 key 读取，读不到
+                    # 无后缀条目，故不写零损失（避免留下"引擎不明"的缓存被别的路径复用）。
+                    if ext != ".docx":
+                        self._save_pdf_to_cache(source_md5, temp_pdf, file_name, ext, page_count)
                     if page_count > 0 and not _canceled():
                         self._report_page_count(file_id, file_name, page_count, info.get("orientation", ""))
                     elif _canceled():
