@@ -487,6 +487,9 @@ class _FinWin:
         self._all_printed = False
         self._printing_tab_key = "0"
         self.calls = []
+        # 🔴-B4-3：`_on_all_finished` 的补打改成"确认能启动才出队"，
+        # 所以替身要能表达启动结果（默认成功；失败路径见 verify_auto_print_batching.py 场景 4）
+        self.start_result = True
 
         class _Label:
             def setText(self, _t):
@@ -505,6 +508,7 @@ class _FinWin:
     def _start_print_worker(self, jobs, tab_key=None):
         # 记录"补打开始时 worker 已经置空"——证明门是先开的，补打不是插队
         self.calls.append(("start_retry", self._worker is None))
+        return self.start_result
 
     def _drain_stack_wait_queue(self):
         # 攒批排队放行（2026-10）：本替身没有纸叠/排队请求，实际不会放行任何东西。
@@ -569,9 +573,16 @@ check("★ 无障碍自动打印：打印机忙 → 入 _auto_print_retry（不�
 check("★ 预约打印：打印机忙 → 10 秒后重试（不插队、不丢单、不计入失败上限）",
       "打印机正忙，10s 后重试" in src
       and "_start_scheduled_print_timer(order_id, int(time.time()) + 10)" in src)
-check("★ 补打队列只在 _on_all_finished 里出队（全代码仅此一处 pop）",
-      src.count("self._auto_print_retry.pop(0)") == 1
-      and "self._worker = None" in src.split("def _on_all_finished")[1][:400])
+# 🔴-B4-3 之后 `_on_all_finished` 内部有 3 个出队点（启动成功 / 已全打完 / 标签页已删除），
+# 所以"全局仅 1 处 pop"这个计数代理已过期。真正要钉的不变量是：
+# 「**没有任何**出队点落在 `_on_all_finished` 之外」—— 别处出队 = 有别的代码路径偷偷丢单。
+_body_fin = src.split("def _on_all_finished", 1)[1].split("\n    def ", 1)[0]
+_pop_all = src.count("self._auto_print_retry.pop(0)")
+_pop_in = _body_fin.count("self._auto_print_retry.pop(0)")
+check("★ 补打队列只在 _on_all_finished 里出队（函数外零出队点 ⇒ 无静默丢单路径）",
+      _pop_in >= 1 and _pop_all == _pop_in
+      and "self._worker = None" in _body_fin[:400],
+      f"函数内 {_pop_in} 处 / 全局 {_pop_all} 处")
 _start_fn = src.split("def _start_print_worker")[1].split("\n    def ")[0]
 check("★ 手动「开始打印」也走同一道门（全文件只此一处构造+启动 PrintWorker）",
       src.count("worker = PrintWorker(") == 1

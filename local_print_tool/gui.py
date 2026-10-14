@@ -101,6 +101,13 @@ APP_VERSION = "4.5.18"
 # 提为模块级常量便于验收脚本把它临时调成 0（否则测试要真等 30 秒）。
 SCHEDULED_SELF_HEAL_S = 30
 
+# 无障碍自动打印的防抖窗口（毫秒）。同一订单的文件是**逐个下载完成**推送的，间隔可达数秒；
+# 原来的 3000ms 会被"击穿"——每批先到的文件立即被当成整单处理并把队列 pop 清空
+# （🔴-B4-2 现场实测：订单 #535 的 11 个文件分 7 批打印、同一订单号被上报 4 次）。
+# 这是客户端能做的缓解；**根治**需后端在 push/accept 响应里下发订单级 file_count，
+# 由客户端按"已到 / 总数"判定整单到齐（见 docs/修复计划_2026-10.md 批次 E）。
+AUTO_PRINT_DEBOUNCE_MS = 8000
+
 
 # ============================================================
 # 辅助工具
@@ -2548,6 +2555,11 @@ class MainWindow(QMainWindow):
         self._processed_cloud_tasks: set[int] = self._load_processed_tasks()
         # 无障碍自动打印：打印机忙时暂存的重试队列（打印完成后自动补打）
         self._auto_print_retry: list[dict] = []
+        # 已进入无障碍队列的 task_id（🔴-B4-1 幂等守卫）：`_processed_cloud_tasks` 只在
+        # **真正处理后**才写，"下载完成 → 防抖到期"之间存在数秒窗口，期间任何重复
+        # task_updated(ready)（SocketIO 重推 / HTTP 兜底 / 状态队列重放）都会再次入队并
+        # **反复重置防抖**（订单可能永远等不到处理）。处理完成时从这里移除。
+        self._enqueued_cloud_tasks: set[int] = set()
         # ── 攒批模式（多任务合并翻纸，2026-10）──
         # 一叠正在累积的手动双面第 1 趟纸张（见 duplex_stack.py）。开关落在
         # config.duplex_stack_mode；本对象只在内存里，清单另存 %APPDATA%\...\duplex_stack\<batch>\。
@@ -7808,7 +7820,7 @@ class MainWindow(QMainWindow):
         # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单（只打未完成的，已打的不重打）
         # 2026-12：补打保持后台（不切换前台标签页），与无障碍订单「后台创建标签页」一致
         if self._auto_print_retry:
-            item = self._auto_print_retry.pop(0)
+            item = self._auto_print_retry[0]     # 先看队首：确认能启动才出队（防启动失败静默丢单）
             tab_key = item.get("tab_key", "")
             order_id = item.get("order_id", 0)
             tab = self._config.tabs.get(tab_key) if tab_key else None
@@ -7824,10 +7836,18 @@ class MainWindow(QMainWindow):
                 pending = [j for j in tab.jobs if not getattr(j, 'sent', False)]
                 if pending:
                     self._log(f"⚡ 打印机空闲，补打订单 #{order_id}（标签页 {tab_key}，{len(pending)} 个未打印文件）")
-                    self._start_print_worker(pending, tab_key=tab_key)
+                    if self._start_print_worker(pending, tab_key=tab_key):
+                        self._auto_print_retry.pop(0)
+                    else:
+                        # 🔴-B4-3：旧写法"先 pop 再启动"，启动失败（刚好又忙 / 正在取号）
+                        # 就**静默丢单**，订单永远不打也不上报。改为留在队首，下次补打再试。
+                        self._log(f"⚠ 补打订单 #{order_id} 本次未能启动（打印机忙/取号中），"
+                                  f"保留在重试队列等待下次")
                 else:
+                    self._auto_print_retry.pop(0)
                     self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key} 已全部打印完成，跳过补打")
             else:
+                self._auto_print_retry.pop(0)
                 self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key or '(已删除)'} 已无文件，跳过补打")
 
         # 打印机空闲了 → 放行攒批期间被挡住的排队请求（纸叠已打完时才会真的开打）
@@ -8258,9 +8278,11 @@ class MainWindow(QMainWindow):
                 self._cloud_client.report_fail(task.task_id, f"下载失败: {task.error_message}")
                 self._cloud_client.reject_task(task.task_id)
             self._cloud_tasks.pop(task.task_id, None)
-            # 无障碍打印任务出错：从队列中移除
+            # 无障碍打印任务出错：从队列中移除（并解除这些任务的"已入队"守卫，
+            # 否则同一 task_id 重新推送 ready 时会被幂等守卫误拦、再也打不出来）
             if task.auto_print and task.order_id:
-                self._auto_print_queue.pop(task.order_id, None)
+                for _t in self._auto_print_queue.pop(task.order_id, []):
+                    self._enqueued_cloud_tasks.discard(_t.task_id)
                 t = self._auto_print_timers.pop(task.order_id, None)
                 if t:
                     t.stop()
@@ -8279,29 +8301,37 @@ class MainWindow(QMainWindow):
         if not task.order_id:
             self._log(f"⚠ 无障碍任务 #{task.task_id} 缺少 order_id，跳过")
             return
+        # 🔴-B4-1 幂等守卫（必须在**重置防抖之前**）：重复的 ready 事件不得再入队，
+        # 更不得反复重置防抖。`_processed_cloud_tasks` 覆盖"已处理完"，
+        # `_enqueued_cloud_tasks` 覆盖"已入队但还没处理"这段窗口（数秒）。
+        if (task.task_id in self._processed_cloud_tasks
+                or task.task_id in self._enqueued_cloud_tasks):
+            return
         oid = task.order_id
+        self._enqueued_cloud_tasks.add(task.task_id)
         if oid not in self._auto_print_queue:
             self._auto_print_queue[oid] = []
-        # 避免重复添加同一个 task_id
-        if not any(t.task_id == task.task_id for t in self._auto_print_queue[oid]):
-            self._auto_print_queue[oid].append(task)
-            self._log(f"⚡ 无障碍任务 #{task.task_id} 已加入队列（订单 #{oid}，"
-                      f"共 {len(self._auto_print_queue[oid])} 个文件）")
+        self._auto_print_queue[oid].append(task)
+        self._log(f"⚡ 无障碍任务 #{task.task_id} 已加入队列（订单 #{oid}，"
+                  f"共 {len(self._auto_print_queue[oid])} 个文件）")
 
-        # 停止旧定时器，重新启动 3 秒防抖（同一订单的后续文件会重置计时）
-        old_timer = self._auto_print_timers.pop(oid, None)
-        if old_timer:
-            old_timer.stop()
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda o=oid: self._process_auto_print_order(o))
-        timer.start(3000)
-        self._auto_print_timers[oid] = timer
+        # 同一订单的后续文件只**延长**同一只定时器（旧写法每次 new QTimer(self) 后
+        # 只 stop 旧实例、不回收 ⇒ 既泄漏又让"重置防抖"语义含糊）。
+        timer = self._auto_print_timers.get(oid)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda o=oid: self._process_auto_print_order(o))
+            self._auto_print_timers[oid] = timer
+        timer.start(AUTO_PRINT_DEBOUNCE_MS)
 
     def _process_auto_print_order(self, order_id: int):
         """防抖定时器触发：收集该订单全部就绪任务，创建标签页并自动开始打印。"""
         tasks = self._auto_print_queue.pop(order_id, [])
         self._auto_print_timers.pop(order_id, None)
+        # 出队即解除"已入队"守卫，随后由 _processed_cloud_tasks 接管（见 _enqueue_auto_print_task）
+        for t in tasks:
+            self._enqueued_cloud_tasks.discard(t.task_id)
         if not tasks:
             return
 
@@ -8359,12 +8389,27 @@ class MainWindow(QMainWindow):
         if jobs:
             self._log(f"⚡ 自动开始打印标签页 {tab_key}（{len(jobs)} 个文件）")
             if not self._start_print_worker(list(jobs), tab_key=tab_key):
-                self._auto_print_retry.append({
-                    "order_id": order_id,
-                    "tab_key": tab_key,
-                    "task_ids": [t.task_id for t in ready_tasks],
-                })
-                self._log(f"⚡ 打印机正忙，订单 #{order_id} 已加入重试队列（打印完成后自动补打）")
+                # 🔴-B4-3：`jobs` 是"标签页里所有未 sent 的文件"（含上一批已进重试队列的）。
+                # 旧写法无条件 append ⇒ 同一订单会出现多条条目、task_ids 互相重叠 ⇒
+                # 补打时同一 task_id 被打两次（现场：#1062 上报"打印成功"两次）。
+                # 改为按 order_id 合并：同一订单在重试队列里只保留一条，task_ids 取并集。
+                tids = [t.task_id for t in ready_tasks]
+                for it in self._auto_print_retry:
+                    if it.get("order_id") == order_id:
+                        for tid in tids:
+                            if tid not in it["task_ids"]:
+                                it["task_ids"].append(tid)
+                        it["tab_key"] = tab_key
+                        self._log(f"⚡ 打印机正忙，订单 #{order_id} 已在重试队列中，"
+                                  f"本批文件已并入（共 {len(it['task_ids'])} 个文件）")
+                        break
+                else:
+                    self._auto_print_retry.append({
+                        "order_id": order_id,
+                        "tab_key": tab_key,
+                        "task_ids": tids,
+                    })
+                    self._log(f"⚡ 打印机正忙，订单 #{order_id} 已加入重试队列（打印完成后自动补打）")
         else:
             self._log(f"⚠ 无障碍打印：标签页 {tab_key} 无文件，跳过")
 
