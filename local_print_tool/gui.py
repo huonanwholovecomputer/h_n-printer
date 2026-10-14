@@ -2559,6 +2559,9 @@ class MainWindow(QMainWindow):
         # [{"jobs": [...], "tab_key": str, "reason": str}]
         self._stack_wait: list[dict] = []
         self._stack_flush_worker: DuplexFlushWorker | None = None
+        # 第 2 趟开始那一刻的整叠快照（_on_stack_flush 冻结 → _on_stack_flush_done 按它收尾）：
+        # 防止第 2 趟期间混进新单后被一起当成品 report_success（🔴-3 的第二道防线）
+        self._stack_flush_snapshot: list = []
         self._stack_pending_ctx: dict = {}   # 正在打第 1 趟的那一单的上下文（见 _start_stack_entry）
         # 打印中保活：作业进行中每 60 秒刷新后端 locked_at（见 _tick_keepalive）
         self._keepalive_timer = QTimer(self)
@@ -6732,6 +6735,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "打印机正忙",
                                     "当前有打印任务在进行，请等它结束后再测速。")
             return
+        if self._stack_open_for_business():
+            # 🔴-3 旁路之三：测速会打出 11 张纸（1 张 + 10 张空白页），插进未完成的
+            # 攒批纸叠会让整叠第 2 趟的逆序配对整体错位。本函数原先零 `_stack_*` 引用，
+            # 是「出纸槽独占」唯一没设防的打印入口。
+            QMessageBox.information(
+                self, "攒批未完成",
+                "出纸槽里还有未完成的手动双面纸叠（第 2 趟还没打）。\n\n"
+                "测速会打出 11 张纸，插进这一叠会让整叠的逆序配对报废。\n"
+                "请先处理完纸叠（打完第 2 趟 / 放弃整叠）再测速。")
+            self._log("🕐 测速被拒：出纸槽里有未完成的手动双面纸叠")
+            return
         cur = getattr(self, "_speed_cal_worker", None)
         if cur is not None and cur.isRunning():
             QMessageBox.information(self, "测速进行中", "上一次测速还没结束，请稍候。")
@@ -7165,6 +7179,9 @@ class MainWindow(QMainWindow):
                   f"{self._stack.total_sheets} 张纸（"
                   f"{'长边旋转 180° 补偿' if self._stack.rotate else '短边不旋转'}）")
         dlg = self._ensure_duplex_dialog()
+        # 冻结本次要收尾的整叠：第 2 趟期间即使有别的 entry 混进 _stack.entries，
+        # 也不会被 _on_stack_flush_done 当成成品一起收尾（半成品当成品 = 白收钱 + 账目错）
+        self._stack_flush_snapshot = list(self._stack.entries)
         w = DuplexFlushWorker(self._stack, bdir, self._config.printer_name,
                               dpi=self._config.render_dpi)
         w.progress.connect(self._on_progress)
@@ -7178,7 +7195,10 @@ class MainWindow(QMainWindow):
         """整叠第 2 趟结束（成功/失败）→ 统一收尾所有单的任务。"""
         try:
             self._stack_flush_worker = None
-            entries = list(self._stack.entries)
+            # 用第 2 趟开始时的快照收尾（而非当下的 _stack.entries）：第 2 趟期间混进来的
+            # 新单只打了第 1 趟，绝不能按成品 report_success（🔴-3 的第二道防线）
+            entries = list(self._stack_flush_snapshot or self._stack.entries)
+            self._stack_flush_snapshot = []
             if ok:
                 self._log(f"✅ {msg}")
             else:
@@ -7221,6 +7241,7 @@ class MainWindow(QMainWindow):
         self._finish_stack_entries(entries, False,
                                    "攒批被人工放弃（只打了第 1 趟，纸是半成品）")
         self._stack.clear()
+        self._stack_flush_snapshot = []
         duplex_stack.discard_batch(bdir)
         self._sync_stack_button()
         dlg = getattr(self, "_duplex_dialog", None)
@@ -7355,13 +7376,24 @@ class MainWindow(QMainWindow):
     def _stack_gate(self, flat_jobs: list, tab_key: str | None) -> str:
         """攒批模式的入口分流：返回 "normal"（照旧打印）/ "parked"（已排队）/ "entry"（作为新单入叠）。
 
-        ① 攒批开启 + 本请求含需手动双面的文件 → 试图入叠（容量/装订方向由账本判定）；
-        ② 其余请求：**只要纸叠非空**（或正在打整叠第 2 趟）就排队 —— 出纸槽被独占，
-           任何别的输出插进去都会让整叠第 2 趟的逆序错位串页（铁律①）。
+        ① **整叠第 2 趟已开始**（flush worker 存在）→ 出纸槽与进纸盒都被整叠独占，
+           任何请求（含手动双面）一律排队 —— 插进去会让逆序配对报废，且
+           `_on_stack_flush_done` 的 entries 快照会把这单连在一起当成品收尾（铁律①②）；
+        ② 攒批开启 + 本请求含需手动双面的文件 → 试图入叠（容量/装订方向由账本判定）；
+        ③ 其余请求：**只要纸叠非空**就排队 —— 出纸槽被独占，任何别的输出插进去都会
+           让整叠第 2 趟的逆序错位串页（铁律①）。
         """
         jobs = list(flat_jobs or [])
         if not jobs:
             return "normal"
+        # ① 第 2 趟已开始（在飞 / 待收尾）：整叠已被搬回进纸盒或正在翻面打印。
+        #    ⚠ 不能把整个 `_stack_open_for_business()` 判断提到这里 —— 它包含"纸叠里
+        #    已堆着第 1 趟的纸"这个**多单攒批的正常中间态**，提前会让攒批永远只能收 1 单。
+        if self._stack_flush_worker is not None:
+            self._park_print_request(
+                jobs, tab_key,
+                "整叠第 2 趟正在打（或待收尾）——出纸槽与进纸盒都被这一叠独占")
+            return "parked"
         if self._stack_mode_on() and any(self._uses_manual_duplex_job(j) for j in jobs):
             ok, reason, _sheets, _unknown = self._admit_stack_entry(jobs)
             if ok:
@@ -7395,6 +7427,12 @@ class MainWindow(QMainWindow):
 
         if self._worker is not None and self._worker.isRunning():
             self._log("⚠️ 已有打印任务正在进行，不能重复启动")
+            return False
+        if self._stack_flush_worker is not None and self._stack_flush_worker.isRunning():
+            # 攒批第 2 趟打的是**整叠第 1 趟的输出**，与新单共用同一台打印机；
+            # 旧实现只看 self._worker（第 2 趟用的是 _stack_flush_worker）⇒ 新单会与
+            # 整叠第 2 趟并发塞进打印机，页序全乱（🔴-3 旁路之二）。
+            self._log("⚠️ 整叠第 2 趟正在打印，不能启动新的打印任务")
             return False
         if self._print_starting:
             self._log("⏳ 正在获取订单号/上报订单，请稍候…")

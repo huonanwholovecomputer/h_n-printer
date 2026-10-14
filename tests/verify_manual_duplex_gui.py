@@ -451,6 +451,11 @@ src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
 class _BusyWin:
     """只够走到 _start_print_worker 的"忙"判定（不是真主窗口）。"""
 
+    # 🔴-3（B1）：真实 `_stack_gate` / `_start_print_worker` 都会读 `_stack_flush_worker`
+    # 判断"整叠第 2 趟是否在打"。本桩表示"没有第 2 趟在飞"。
+    # （教训：借用真实方法的桩，在真实方法新增被读属性时要同步补上。）
+    _stack_flush_worker = None
+
     def __init__(self, worker):
         self._worker = worker
         self._print_starting = False
