@@ -73,11 +73,11 @@ class TabSettings:
             delivery_enabled=bool(data.get("delivery_enabled", False)),
             delivery_location=data.get("delivery_location", ""),
             cover_page=bool(data.get("cover_page", False)),
-            cover_page_price=float(data.get("cover_page_price", 0.10)),
+            cover_page_price=_num_or_default(data.get("cover_page_price"), 0.10, float),
             urgency=data.get("urgency", "低"),
             frozen=bool(data.get("frozen", False)),
             owner_name=(data.get("owner_name") or "").strip(),
-            is_admin_print=bool(data.get("is_admin_print", True)),
+            is_admin_print=_bool_or_default(data.get("is_admin_print"), True),
             manual_duplex_pending=_bool_or_default(data.get("manual_duplex_pending"), False),
             remark=str(data.get("remark", "") or ""),
         )
@@ -146,19 +146,19 @@ class PrintJob:
         return cls(
             file_path=data.get("file_path", ""),
             source_path=data.get("source_path", ""),
-            copies=int(data.get("copies", 1)),
+            copies=_num_or_default(data.get("copies"), 1, int),
             duplex=data.get("duplex", "on"),
             duplex_mode=data.get("duplex_mode", ""),
             page_range=data.get("page_range", ""),
-            page_count=int(data.get("page_count", 0)),
+            page_count=_num_or_default(data.get("page_count"), 0, int),
             orientation=data.get("orientation", ""),
             image_orientation=data.get("image_orientation", "auto"),
             engine=data.get("engine", "word"),
-            dpi=int(data.get("dpi", 0)),
+            dpi=_num_or_default(data.get("dpi"), 0, int),
             display_name=data.get("display_name", ""),
-            task_id=int(data.get("task_id", 0)),
+            task_id=_num_or_default(data.get("task_id"), 0, int),
             sent=bool(data.get("sent", False)),
-            order_id=int(data.get("order_id", 0)),
+            order_id=_num_or_default(data.get("order_id"), 0, int),
             order_number=data.get("order_number", ""),
             remark=str(data.get("remark", "") or ""),
         )
@@ -291,6 +291,35 @@ def _bool_or_default(value, default: bool) -> bool:
         return value
     if isinstance(value, (int, float)) and value in (0, 1):
         return bool(value)
+    return default
+
+
+def _num_or_default(value, default, cast):
+    """数值字段归一：None / 非数值 / 结构不符一律回落 default。
+
+    为什么需要：`data.get("cover_page_price", 0.10)` 在**键存在但值为 null** 时返回
+    None（不会取默认），`float(None)` 抛 TypeError；根节点被写成数组时 `data.get`
+    抛 AttributeError —— 两者都不在 load() 原来的捕获列表里 ⇒ 配置被手改/写坏一个
+    值就让程序**启动即崩**（load 是 MainWindow.__init__ 第一条语句）。
+    逐字段归一到默认，比"整份配置作废（改名 .corrupt 后重建）"代价小得多：
+    坏一个价格只丢那个价格，其余设置全部保留。
+    """
+    if value is None:
+        return default
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _dict_or_default(value, default: dict):
+    """dict 字段归一：**非空 dict** 才采用，其余（None/空/字符串/列表）回落 default。
+
+    保留原 `a or b or {默认}` 的 falsy 语义，同时挡掉"值是列表/字符串"时的
+    AttributeError（`[1,2].get(...)`）—— 与 _num_or_default 同一个防护面。
+    """
+    if isinstance(value, dict) and value:
+        return value
     return default
 
 
@@ -681,9 +710,9 @@ class PrinterConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PrinterConfig":
-        # 兼容旧格式：无 "tabs" 键但有 "jobs" 时自动迁移
+        # 兼容旧格式：无 "tabs" 键（或该键不是对象，配置被写坏）时自动迁移 jobs 列表
         tabs_data = data.get("tabs")
-        if tabs_data is None:
+        if not isinstance(tabs_data, dict):
             jobs_data = data.get("jobs", [])
             jobs = [PrintJob.from_dict(j) for j in jobs_data] if isinstance(jobs_data, list) else []
             tabs = {"1": TabSettings(jobs=jobs)}
@@ -696,27 +725,26 @@ class PrinterConfig:
         return cls(
             printer_name=data.get("printer_name", ""),
             duplex_mode=data.get("duplex_mode", "long-edge"),
-            render_dpi=int(data.get("render_dpi", 400)),
+            render_dpi=_num_or_default(data.get("render_dpi"), 400, int),
             keep_temp_pdf=bool(data.get("keep_temp_pdf", False)),
-            simplex_price=float(data.get("simplex_price", 0.2)),
-            duplex_price=float(data.get("duplex_price", 0.3)),
+            simplex_price=_num_or_default(data.get("simplex_price"), 0.2, float),
+            duplex_price=_num_or_default(data.get("duplex_price"), 0.3, float),
             last_dir=data.get("last_dir", ""),
             # 附加服务
             delivery_enabled=bool(data.get("delivery_enabled", False)),
             delivery_location=data.get("delivery_location", "1号楼北楼"),
-            # dict 字段防 null：配置被手改/写坏为 null 时退回默认，避免后续 .get 崩溃
-            delivery_percentages=(data.get("delivery_percentages") or data.get("delivery_locations") or {
-                "1号楼北楼": 0.0, "1号楼南楼": 5.0,
-                "图书馆": 10.0, "教学楼E/F": 25.0, "女生宿舍": 10.0,
-            }),
+            # dict 字段防 null/防类型错：配置被手改/写坏时退回默认，避免后续 .get 崩溃
+            delivery_percentages=_dict_or_default(
+                data.get("delivery_percentages") or data.get("delivery_locations"),
+                {"1号楼北楼": 0.0, "1号楼南楼": 5.0,
+                 "图书馆": 10.0, "教学楼E/F": 25.0, "女生宿舍": 10.0}),
             urgency=data.get("urgency", "低"),
-            urgency_prices=(data.get("urgency_prices") or {
-                "低": 0.0, "中": 0.08, "高": 0.15,
-            }),
+            urgency_prices=_dict_or_default(data.get("urgency_prices"),
+                                            {"低": 0.0, "中": 0.08, "高": 0.15}),
             cover_page=bool(data.get("cover_page", False)),
-            cover_page_price=float(data.get("cover_page_price", 0.10)),
+            cover_page_price=_num_or_default(data.get("cover_page_price"), 0.10, float),
             pickup_address=data.get("pickup_address", "1号楼202宿舍"),
-            last_order_number=int(data.get("last_order_number", 0)),
+            last_order_number=_num_or_default(data.get("last_order_number"), 0, int),
             # dict/list 字段防 null：被手改/写坏为 null 时退回默认
             # v4.2：admin_names 默认空列表（无成员），占位名不再预置
             admin_names=[str(n).strip() for n in (data.get("admin_names") or []) if str(n).strip()],
@@ -733,7 +761,7 @@ class PrinterConfig:
             active_tab=data.get("active_tab", "1"),
             # 打印机档案（老配置没有这个键 → 空 dict，能力视为未确认；坏值当空处理）
             printer_profiles={str(k): PrinterProfile.from_dict(v)
-                              for k, v in (data.get("printer_profiles") or {}).items()
+                              for k, v in _dict_or_default(data.get("printer_profiles"), {}).items()
                               if isinstance(v, dict)},
             # 攒批模式开关（老配置没有这个键 → 关，零回归）
             duplex_stack_mode=_bool_or_default(data.get("duplex_stack_mode"), False),
@@ -769,7 +797,7 @@ class PrinterConfig:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return cls.from_dict(data)
-        except (json.JSONDecodeError, OSError, ValueError) as e:
+        except (json.JSONDecodeError, OSError, ValueError, TypeError, AttributeError) as e:
             logger.warning(f"加载配置失败 ({path}): {e}，将使用默认配置")
             # 损坏文件改名保留为 .corrupt-{时间戳}（不删除，便于排查），下次启动自动重建
             try:
