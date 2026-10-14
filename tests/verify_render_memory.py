@@ -1,23 +1,30 @@
 """verify_render_memory.py — 逐页渲染打印管线的内存/GDI 句柄安全验收探针。
 
-用途两条：
-  ① 证明（或推翻）"逐页渲染 + 立即释放"的管线在长任务下**内存不随页数增长**
-     —— 逐页 RSS 采样 + 峰值对比，任何"渲染结果堆积"都会表现为单调上升。
-  ② 量化单页位图成本、空白占位页成本、以及 GDI 句柄是否随页数累积
-     —— 设备端"跨订单积单、一次打几百面"的模型必须先过这一关。
+**（2026-10-14 重写）** 本脚本原先"只复刻 pdf_printer.print_plan_pass 里逐页那几行"来测内存形状
+—— 它测的**不是真循环**：把真循环改成"把每面渲染结果存进列表"（`_keep_img.append(rendered_im)`），
+这个探针照样 exit 0（审查报告 D1-🔴12 已实测）。现在改为**驱动真实的 `print_plan_pass`**：
 
-它**不出纸**：只复刻 pdf_printer.print_plan_pass 里逐页那几行的内存行为
-（get_pixmap → Image.frombuffer → transpose → ImageWin.Dib），不调用任何打印 API。
-因此可以在任何机器上跑，包括装了 Microsoft Print to PDF 的开发机。
+  · 用 `manual_duplex.plan_single()` 造**真实** PrintPlan，走 `print_plan_pass` → `print_pdf`
+    → `_print_pdf_native` 的真逐页循环；
+  · 只把 **win32 的"打印机 DC / 文档生命周期"换掉**（伪 `win32print`/`win32ui`），句柄指向一个
+    **真实的内存 DC**（`gdi32.CreateCompatibleDC`）⇒ `ImageWin.Dib.draw` 走的仍是真正的
+    StretchDIBits（内存→内存），**不出纸、不碰任何打印机队列**；
+  · PyMuPDF 渲染、PIL 位图、Dib 分配**全是真的** —— 内存/GDI 形状才是被测对象的真形状。
 
-    python tests/verify_render_memory.py                       # 默认 200 页 @300dpi
-    python tests/verify_render_memory.py --pages 1000 --dpi 400
-    python tests/verify_render_memory.py --blank-check         # 空白占位页：旧 vs 现实现
+判定（退出码 0 = 通过）：
+  ① 真实管线逐面 RSS 漂移 < 3 个单页位图（允许分配器抖动，不允许累积）；
+  ② GDI 句柄增量 ≤ 5（Dib 未释放会随页数涨，Windows 上限 10000 先耗尽）；
+  ③ **内建反证**：把真实循环里的渲染结果改成"被循环外容器持有"（等价于审查员的变异），
+     漂移判据**必须报红** —— 否则它就是"永远为绿的假守卫"。这一条是本脚本的存在理由。
 
-判定标准（脚本退出码 0 = 通过）：
-  · 末段 RSS 相对首段 RSS 的增量 < 3 个单页位图（允许分配器抖动，不允许累积）
-  · GDI 句柄增量 ≤ 单页流水线瞬时并发数（约 2~3）
-  · --blank-check：空白页成本必须与张数无关（现实现复用一个 8×8 白 DIB）
+用法：
+    python tests/verify_render_memory.py                    # ①+②+③（默认 200 面 @300dpi）
+    python tests/verify_render_memory.py --pages 600 --dpi 400
+    python tests/verify_render_memory.py --no-self-check    # 跳过反证与第二趟，仅调参用
+    python tests/verify_render_memory.py --hoard            # 只跑"持有即堆积"测量档（量化后果）
+
+历史测量档（不参与默认判定，用于已决策的比较）：
+    --blank-check / --prerotate-check / --rotate-mode {bitmap,render}
 
 背景数字（RGB 3 字节/像素，A4 = 8.27×11.69 inch）：
     200dpi → 1654×2339   ≈ 11.6 MiB/页
@@ -32,12 +39,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import gc
+import io
 import os
 import sys
 import tempfile
 import time
+import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "local_print_tool"))
 
@@ -120,127 +130,260 @@ def _make_pdf(path: str, pages: int) -> None:
     doc.close()
 
 
-# ── 主流程：复刻 pdf_printer 的逐页内存行为 ──
+# ============================================================
+# 伪 DC 层：只替换 win32 的"设备/文档"接口，fitz 与 PIL 全用真的
+# ============================================================
 
-def probe(pages: int, dpi: int, native_dpi: int, sample_every: int,
-          hoard: bool = False, hoard_budget_mb: float = 1200.0) -> int:
+class _Rec:
+    def __init__(self):
+        self.startdoc = 0
+        self.enddoc = 0
+        self.abort = 0
+        self.pages = 0
+        self.printer = ""
+
+
+class _FakeDC:
+    """伪打印机 DC。
+
+    句柄不是一个瞎编的整数，而是一个**真实的内存 DC**（`gdi32.CreateCompatibleDC`）：
+    `ImageWin.Dib.draw(hdc, ...)` 于是走的仍是真正的 `StretchDIBits`（内存→内存），
+    只把"目标表面"从打印机换成 1×1 默认位图 ⇒ GDI 直接裁剪，不出纸、不产生打印任务。
+    """
+
+    def __init__(self, rec: _Rec, hdc: int, native_dpi: int):
+        self._rec, self._hdc, self._dpi = rec, hdc, native_dpi
+
+    def CreatePrinterDC(self, name):
+        self._rec.printer = name
+
+    def GetHandleOutput(self):
+        return self._hdc
+
+    def GetDeviceCaps(self, which):
+        # win32con：LOGPIXELSX=88 / LOGPIXELSY=90 / HORZRES=8 / VERTRES=10
+        return {88: self._dpi, 90: self._dpi,
+                8: int(8.27 * self._dpi), 10: int(11.69 * self._dpi)}[which]
+
+    def StartDoc(self, title):
+        self._rec.startdoc += 1
+
+    def StartPage(self):
+        self._rec.pages += 1
+
+    def EndPage(self):
+        pass
+
+    def EndDoc(self):
+        self._rec.enddoc += 1
+
+    def AbortDoc(self):
+        self._rec.abort += 1
+
+    def DeleteDC(self):
+        pass
+
+
+@contextlib.contextmanager
+def _fake_print_env(native_dpi: int):
+    """注入伪 win32print / win32ui；yield (rec, hdc)。
+
+    刻意**不提供** `win32print.OpenPrinter`：`_get_printer_devmode` 走它自己的 except 兜底
+    （返回 None），本脚本走的是"手动双面/校准"路径（duplex='off' + pages_override），
+    DEVMODE 拿不到是允许的（不打印机的单面路径），且这条分支本身由 verify_duplex_probe.py 覆盖。
+    """
+    saved = {k: sys.modules.get(k) for k in ("win32print", "win32ui")}
+    rec = _Rec()
+    gdi = ctypes.WinDLL("gdi32", use_last_error=True)
+    gdi.CreateCompatibleDC.restype = ctypes.c_void_p
+    gdi.CreateCompatibleDC.argtypes = [ctypes.c_void_p]
+    gdi.DeleteDC.argtypes = [ctypes.c_void_p]
+    hdc = gdi.CreateCompatibleDC(None)
+
+    wpr = types.ModuleType("win32print")
+    wpr.GetDefaultPrinter = lambda: "HN-MEMPROBE(无设备)"
+    wui = types.ModuleType("win32ui")
+    wui.CreateDC = lambda: _FakeDC(rec, hdc, native_dpi)
+    sys.modules["win32print"] = wpr
+    sys.modules["win32ui"] = wui
+    try:
+        yield rec, hdc
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        gdi.DeleteDC(hdc)
+
+
+@contextlib.contextmanager
+def _retaining_dib():
+    """**变异**：让真实逐页循环里每一面的渲染结果都被循环外的容器持有。
+
+    与审查员对 `pdf_printer.py` 做的改动（`_keep_img.append(rendered_im)`）**等价** ——
+    `Dib(img)` 是循环里每一面必然要走的构造点，把它的入参（渲染结果）扣下来，
+    就复现了"渲染好的页面堆积"。
+    """
+    from PIL import ImageWin
+    orig = ImageWin.Dib
+    held: list = []
+
+    class _Leaky:
+        def __init__(self, img, *a, **kw):
+            held.append(img)                     # ← 泄漏点
+            self._inner = orig(img, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    ImageWin.Dib = _Leaky
+    try:
+        yield held
+    finally:
+        ImageWin.Dib = orig
+        held.clear()
+
+
+# ============================================================
+# 主流程：驱动**真实** print_plan_pass，逐面采样
+# ============================================================
+
+def real_pipeline_probe(pages: int, dpi: int, native_dpi: int, sample_every: int,
+                        which: int = 1, retain: bool = False,
+                        label: str = "") -> tuple[int, dict]:
+    """跑真实 `print_plan_pass` 一趟，返回 (退出码, 结果字典)。
+
+    retain=True 走变异档（见 `_retaining_dib`）：此时**期望**看到漂移，
+    看不到漂移同样算失败 —— 说明判据不灵，它是假守卫。
+    """
     import fitz
-    from PIL import Image, ImageWin
+    from PIL import Image          # noqa: F401  （真实 renderer 会用到）
+    import manual_duplex as md
+    import pdf_printer as pp
 
-    _rot180 = getattr(getattr(Image, "Transpose", None), "ROTATE_180", None) \
-        or getattr(Image, "ROTATE_180", None)
-
+    tag = label or (f"第{which}趟" + ("（变异：持有渲染结果）" if retain else ""))
     tmp = os.path.join(tempfile.gettempdir(), "hn_memprobe.pdf")
     _make_pdf(tmp, pages)
-    print(f"探测文件: {tmp}  ({pages} 页, {os.path.getsize(tmp) / MB:.1f} MB)")
+    print(f"\n=== {tag} ===\n探测文件: {tmp}  ({pages} 页, {os.path.getsize(tmp) / MB:.1f} MB)")
+    print(f"参数: 渲染 {dpi} dpi, 打印机原生 {native_dpi} dpi, 逐面序列来自 print_plan_pass(which={which})")
 
-    gc.collect()
-    base_rss, base_peak = _mem()
-    base_gdi = _gdi()
-    print(f"基线: 工作集 {base_rss:.1f} MB / 峰值 {base_peak:.1f} MB / GDI {base_gdi}")
-    print(f"参数: 渲染 {dpi} dpi, 打印机原生 {native_dpi} dpi\n")
-
+    # 单页位图字节数：循环外单独渲染第 0 页量一次（不进入被测循环，不影响漂移判据）
     doc = fitz.open(tmp)
+    _mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    _px = doc[0].get_pixmap(matrix=_mat, alpha=False)
+    page_bytes = _px.height * _px.stride
+    del _px
+    doc.close()
+    print(f"单页位图: ≈ {page_bytes / MB:.1f} MiB（阈值 = 3 个单页位图 = {3 * page_bytes / MB:.1f} MiB）")
+
+    plan = md.plan_single(list(range(1, pages + 1)))
+    seq = plan.pass_page_indices(which)
+    blanks = sum(1 for p in seq if p is None)
+    print(f"本次逐面序列: {len(seq)} 面（含 {blanks} 个空白占位页）")
+
     samples: list[tuple[int, float, int]] = []
-    hoarded: list = []          # --hoard：故意持有渲染结果，模拟"渲染好的页面堆积"
-    hoard_mb = 0.0
-    hoard_stopped = False
-    t0 = time.perf_counter()
-    page_bytes = 0
-    try:
-        for seq in range(len(doc)):
-            page = doc[seq]
+    base_rss = base_peak = 0.0
+    base_gdi = end_gdi = 0
+    elapsed = 0.0
+    ok_run = False
+    run_msg = ""
+    caught = ""
+    rec = None
 
-            # ▼▼ 与 pdf_printer.print_plan_pass 逐页段落一致的 4 行 ▼▼
-            mat = fitz.Matrix(dpi / 72.0, dpi / 72.0)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = Image.frombuffer("RGB", (pix.width, pix.height),
-                                   pix.samples, "raw", "RGB", pix.stride, 1)
-            if _rot180 is not None:
-                img = img.transpose(_rot180)
-            dib = ImageWin.Dib(img)
-            # ▲▲ 官方此处是 dib.draw(打印机DC, ...) + StartPage/EndPage ▲▲
+    with _fake_print_env(native_dpi) as (rec, _hdc):
+        gc.collect()
+        base_rss, base_peak = _mem()
+        base_gdi = _gdi()
+        print(f"基线: 工作集 {base_rss:.1f} MB / 峰值 {base_peak:.1f} MB / GDI {base_gdi}")
 
-            if seq == 0:
-                page_bytes = pix.height * pix.stride
-                print(f"单页位图: {pix.width}×{pix.height}, stride={pix.stride}, "
-                      f"≈ {page_bytes / MB:.1f} MiB")
+        total_sides = len(seq)
 
-            if hoard and not hoard_stopped:
-                # 持有引用 = 拒绝释放；到达预算上限就停手，避免把测试机打爆
-                hoarded.append(pix)
-                hoard_mb += page_bytes / MB
-                if hoard_mb > hoard_budget_mb:
-                    hoard_stopped = True
-                    print(f"  ⚠ 堆积已达 {hoard_mb:.0f} MiB（预算 {hoard_budget_mb:.0f} MiB），"
-                          f"停止堆积以保护测试机；{pages} 页全堆积预计需 "
-                          f"{page_bytes / MB * pages / 1024:.1f} GiB")
+        def cb(cur, total):
+            if cur % sample_every == 0 or cur == total:
+                r, _ = _mem()
+                samples.append((cur, r, _gdi()))
 
-            # 出循环作用域 → CPython 引用计数立即回收（无需 gc.collect，保持与官方一致）
-            if (seq + 1) % sample_every == 0 or seq == len(doc) - 1:
-                rss, peak = _mem()
-                samples.append((seq + 1, rss, _gdi()))
-                print(f"  第 {seq + 1:>5} 面  工作集 {rss:>8.1f} MB  峰值 {peak:>8.1f} MB  GDI {samples[-1][2]}")
-    finally:
-        doc.close()
+        ctx = _retaining_dib() if retain else contextlib.nullcontext()
+        t0 = time.perf_counter()
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            try:
+                with ctx:
+                    ok_run, run_msg = pp.print_plan_pass(
+                        plan, tmp, printer_name="", which=which,
+                        second_rotate_180=True, progress_callback=cb, dpi=dpi)
+            finally:
+                caught = buf.getvalue()
+        elapsed = time.perf_counter() - t0
+        end_rss, end_peak = _mem()
+        end_gdi = _gdi()
 
-    elapsed = time.perf_counter() - t0
-    end_rss, end_peak = _mem()
-    end_gdi = _gdi()
+    for cur, r, g in samples:
+        print(f"  第 {cur:>5} 面  工作集 {r:>8.1f} MB  GDI {g}")
 
-    # ── 判定：取末 20% 采样的均值 vs 首 20% 的均值（避开前几页的分配器预热）──
     n = max(1, len(samples) // 5)
-    head = sum(s[1] for s in samples[:n]) / n
-    tail = sum(s[1] for s in samples[-n:]) / n
+    head = sum(s[1] for s in samples[:n]) / n if samples else 0.0
+    tail = sum(s[1] for s in samples[-n:]) / n if samples else 0.0
     drift = tail - head
     gdi_delta = end_gdi - base_gdi
+    pb = page_bytes / MB
 
-    print("\n" + "=" * 68)
-    print(f"耗时 {elapsed:.1f}s（{pages / max(elapsed, 1e-6):.1f} 页/秒）")
+    print(f"真实管线: ok={ok_run} msg={run_msg!r}  "
+          f"（StartDoc {rec.startdoc if rec else '?'} / StartPage {rec.pages if rec else '?'} / "
+          f"EndDoc {rec.enddoc if rec else '?'} / AbortDoc {rec.abort if rec else '?'}）")
+    print(f"耗时 {elapsed:.1f}s（{len(seq) / max(elapsed, 1e-6):.1f} 面/秒）")
     print(f"首段工作集均值 {head:.1f} MB → 末段 {tail:.1f} MB  漂移 {drift:+.1f} MB "
-          f"（= {drift / max(page_bytes / MB, 1e-6):+.2f} 个单页位图）")
-    print(f"进程峰值工作集 {end_peak:.1f} MB（基线 {base_peak:.1f} MB）")
+          f"（= {drift / max(pb, 1e-6):+.2f} 个单页位图）")
+    # 采样到的最大工作集：等价于"页内瞬时重叠"在采样分辨率下的上界（首帧已含渲染器预热）
+    first_rss = samples[0][1]
+    max_rss = max(s[1] for s in samples)
+    print(f"采样最大工作集 {max_rss:.1f} MB（本档首帧 {first_rss:.1f} MB，"
+          f"Δ{max_rss - first_rss:+.1f} MB = {(max_rss - first_rss) / max(pb, 1e-6):+.2f} 个单页位图）")
+    print(f"进程峰值工作集 {end_peak:.1f} MB（自进程启动单调递增，**跨档不可比**；"
+          f"首档可比：基线 {base_peak:.1f} MB → {end_peak:.1f} MB，"
+          f"≈ {(end_peak - base_peak) / max(pb, 1e-6):.1f} 个单页位图）")
     print(f"GDI 句柄 {base_gdi} → {end_gdi}（Δ{gdi_delta:+d}）")
-    if hoard:
-        print(f"对照档：故意持有渲染结果 {len(hoarded)} 面 ≈ {hoard_mb:.0f} MiB")
-    print(f"单页流水线瞬时峰值 ≈ {(end_peak - base_peak) / max(page_bytes / MB, 1e-6):.1f} 个单页位图")
 
-    ok = True
-    if hoard:
-        # 对照档的判定反过来：就是要看到线性增长，用来量化"堆积"的后果
-        if drift > 3 * (page_bytes / MB):
-            print(f"✓ 对照档如预期：持有引用后内存线性增长 {drift:+.0f} MiB "
-                  f"（这就是「渲染好的页面堆积」的真实后果）")
+    res = {"ok_run": ok_run, "msg": run_msg, "drift": drift, "page_bytes": page_bytes,
+           "gdi_delta": gdi_delta, "samples": len(samples), "elapsed": elapsed,
+           "caught": caught, "rec": rec}
+
+    rc = 0
+    # ⓪ 前提：真实管线必须真的跑起来了（否则后面所有"没漂移"都是假绿）
+    if not ok_run or "打印成功 (GDI" not in (run_msg or ""):
+        print("✗ 真实 print_plan_pass 未成功返回 —— 探针前提不成立，判失败")
+        print("  （最后 15 行真实输出：" + "\n   ".join(caught.strip().splitlines()[-15:]) + "）")
+        res["rc"] = 1
+        return 1, res
+    if not samples:
+        print("✗ 一帧采样都没有 —— progress_callback 没被调用，说明测的不是真循环")
+        res["rc"] = 1
+        return 1, res
+
+    if retain:
+        if drift > 3 * pb:
+            print(f"✓ 反证成立：持有渲染结果后内存线性增长 {drift:+.0f} MiB "
+                  f"（{pages} 面全堆积预计需 {pb * pages / 1024:.1f} GiB）")
         else:
-            print(f"✗ 对照档没有观察到增长（{drift:+.1f} MiB）—— 堆积预算太小，"
-                  f"提高 --hoard-budget-mb 重测")
-            ok = False
-        print(f"→ 结论：官方管线本身 O(1)；一旦自己持有渲染结果，{pages} 页需 "
-              f"{page_bytes / MB * pages / 1024:.1f} GiB，必崩")
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        return 0 if ok else 1
-
-    if drift > 3 * (page_bytes / MB):
-        print(f"✗ 内存随页数增长（漂移超过 3 个单页位图）→ 存在堆积/未释放")
-        ok = False
+            print(f"✗ 反证失败：变异后漂移只有 {drift:+.1f} MiB（阈值 {3 * pb:.1f}）"
+                  f" —— 内存判据是**假守卫**，测不出「渲染结果被攒起来」")
+            rc = 1
     else:
-        print(f"✓ 内存不随页数增长：管线是 O(1) 的，长任务安全")
+        if drift > 3 * pb:
+            print(f"✗ 内存随页数增长（漂移 {drift:+.1f} MB 超过 3 个单页位图）→ 存在堆积/未释放")
+            rc = 1
+        else:
+            print("✓ 内存不随页数增长：真实管线是 O(1) 的，长任务安全")
 
     if pages >= 100 and gdi_delta > 5:
         print(f"✗ GDI 句柄随页数累积（Δ{gdi_delta}）→ ImageWin.Dib 未释放，"
               f"Windows 上限 10000 个会先耗尽")
-        ok = False
+        rc = 1
     else:
-        print(f"✓ GDI 句柄无累积")
+        print(f"✓ GDI 句柄无累积（Δ{gdi_delta}）")
 
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
-    return 0 if ok else 1
+    res["rc"] = rc
+    return rc, res
 
 
 def blank_probe(native_dpi: int, count: int = 20) -> int:
@@ -336,7 +479,7 @@ def rotate_mode_probe(mode: str, pages: int, dpi: int) -> int:
     el = time.perf_counter() - t
     _, peak_after = _mem()
     label = {"bitmap": "位图旋转（现状）", "render": "渲染期 prerotate(180)"}[mode]
-    print(f"{label}: {len(doc) if False else pages} 面 @{dpi}dpi  "
+    print(f"{label}: {pages} 面 @{dpi}dpi  "
           f"进程峰值增量 {peak_after - peak_before:7.1f} MiB  耗时 {el:5.2f}s")
     try:
         os.remove(tmp)
@@ -476,25 +619,72 @@ def main() -> int:
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--native-dpi", type=int, default=600,
                     help="打印机原生 DPI（决定空白页设备像素尺寸，激光机常见 600）")
-    ap.add_argument("--sample-every", type=int, default=20)
+    ap.add_argument("--sample-every", type=int, default=10)
+    ap.add_argument("--no-self-check", action="store_true",
+                    help="跳过第二趟与内建反证（只做单趟 O(1) 判定；调参用）")
     ap.add_argument("--blank-check", action="store_true", help="只测空白占位页成本")
     ap.add_argument("--prerotate-check", action="store_true",
                     help="对照：位图旋转(现状) vs 渲染期 prerotate(180)：内存/像素等价/耗时")
     ap.add_argument("--rotate-mode", choices=["bitmap", "render"], default=None,
                     help="单方案单进程跑（进程峰值才准），配合两次调用比较")
     ap.add_argument("--hoard", action="store_true",
-                    help="对照档：故意持有每页渲染结果（模拟「渲染好的页面堆积」）")
-    ap.add_argument("--hoard-budget-mb", type=float, default=1200.0,
-                    help="堆积预算上限 MiB，超过即停止堆积以保护测试机")
+                    help="只跑「持有渲染结果」测量档（真实管线 + 变异），量化堆积的后果")
     a = ap.parse_args()
+
+    if sys.platform != "win32":
+        print("非 Windows：GDI 路径不适用，跳过（本机无打印子系统）")
+        return 0
     if a.blank_check:
         return blank_probe(a.native_dpi)
     if a.prerotate_check:
         return prerotate_probe(a.pages, a.dpi)
     if a.rotate_mode:
         return rotate_mode_probe(a.rotate_mode, a.pages, a.dpi)
-    return probe(a.pages, a.dpi, a.native_dpi, a.sample_every,
-                 hoard=a.hoard, hoard_budget_mb=a.hoard_budget_mb)
+
+    rcs: list[int] = []
+
+    if a.hoard:
+        # 测量档：故意持有渲染结果，量化后果（此档**期望**看到增长）
+        rc, _ = real_pipeline_probe(a.pages, a.dpi, a.native_dpi, a.sample_every,
+                                    which=1, retain=True, label="测量档：持有每面渲染结果")
+        print(f"\n→ 结论：真实管线本身 O(1)；一旦自己持有渲染结果，"
+              f"{a.pages} 面需 {_mem()[1] / 1024:.1f} GiB 量级，必崩")
+        return rc
+
+    print("=" * 68)
+    print("第 1 趟（which=1）—— 真实 print_plan_pass 主判定")
+    print("=" * 68)
+    rc1, _ = real_pipeline_probe(a.pages, a.dpi, a.native_dpi, a.sample_every, which=1)
+    rcs.append(rc1)
+
+    if not a.no_self_check:
+        # 第 2 趟：走 rotate_180 补偿分支（第 2 面的 180° 补偿只在这一处定义）；
+        # 用**奇数**页数，顺带覆盖"空白占位页复用同一个 8×8 DIB"的真实循环路径。
+        p2 = 61 if a.pages >= 61 else (a.pages | 1)
+        print("\n" + "=" * 68)
+        print(f"第 2 趟（which=2，rotate_180 补偿 + {p2} 面的奇数页空白占位页）")
+        print("=" * 68)
+        rc2, _ = real_pipeline_probe(p2, a.dpi, a.native_dpi, 10, which=2)
+        rcs.append(rc2)
+
+        # 内建反证：变异后漂移判据必须报红。
+        # 页数不能太小：漂移判据取"末 20% 采样 − 首 20% 采样"，首段里已经有几面被持有，
+        # 页数太少会让"首段基线"抬得太高而漏判（实测 12 页 only 2.67 个单页位图，差一点就假绿）。
+        print("\n" + "=" * 68)
+        print("内建反证（变异：让真实循环持有每面渲染结果 —— 判据必须报红）")
+        print("=" * 68)
+        rc3, res3 = real_pipeline_probe(60, 200, a.native_dpi, 3, which=1, retain=True,
+                                        label="反证档：真实管线 + 持有渲染结果")
+        rcs.append(rc3)
+
+    print("\n" + "=" * 68)
+    bad = [r for r in rcs if r != 0]
+    if bad:
+        print(f"逐页渲染内存/GDI 验收: 存在失败 ❌（{len(bad)}/{len(rcs)} 档）")
+    else:
+        print(f"逐页渲染内存/GDI 验收: 全部通过 ✅（{len(rcs)} 档："
+              + "、".join(["主判定", "第2趟", "反证"][:len(rcs)]) + "）")
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":

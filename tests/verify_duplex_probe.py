@@ -19,6 +19,7 @@
 
 用法: python tests/verify_duplex_probe.py   （exit 0 = 全部通过）
 """
+import ast
 import io
 import os
 import sys
@@ -657,13 +658,159 @@ except Exception as e:  # pragma: no cover
     check(f"读取 pdf_printer.max_render_pixels() 失败: {e}", False)
 
 # ── M1：逐页渲染的中间物（pix/img/dib）绝不能被攒起来 ──
-# verify_render_memory.py 是**复刻**那 4 行来测内存形状的，它测的不是真循环；
-# 若有人在真循环里把位图存进列表/字段，探针不会发现。用静态检查把这条钉死。
-for _name in ("pix", "img", "dib", "blank_dib"):
-    check(f"★ 打印循环不持有 {_name}（未被 append / 存进 self.）",
-          f".append({_name})" not in code_src
-          and f"self._{_name}" not in code_src
-          and f"self.{_name}" not in code_src)
+# 【2026-10-14 重写】旧版是**字面子串**检查（`.append(pix)` / `self._pix`）—— 审查员实测：
+# 把真循环改成 `_keep_img.append(rendered_im)`（200 面 @300dpi ≈ 5.0 GiB 常驻）后，
+# 它**照样 exit 0**：变量名一换就漏。现在改为 **AST 审计**，从**赋值形态**反推"渲染中间物"
+# （谁是被 get_pixmap / frombuffer / transpose / ImageWin.Dib / Image.new 赋出来的），
+# 再查它们有没有"逃逸"出循环（进容器 / 进 self / 进下标 / 被 return）。
+#
+# 动态侧由 verify_render_memory.py 驱动真实 print_plan_pass 度量；两边一静一动，互为补充。
+_RENDER_FACTORIES = {"get_pixmap", "frombuffer", "transpose", "Dib", "new", "copy",
+                     "convert", "crop", "resize", "rotate", "tobytes"}
+_CONTAINER_METHODS = {"append", "extend", "insert", "add", "update", "appendleft",
+                      "appendleft_all", "push", "put"}
+_ASSIGN_NODES = (ast.Assign, ast.AnnAssign, ast.AugAssign)
+
+
+def _root_name(node):
+    """属性链的根名：self._a.b → 'self'；_keep.img → '_keep'；其它 → None。"""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _names_in(node):
+    """表达式里出现的全部裸名字（不含属性名）。"""
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} if node is not None else set()
+
+
+def _targets_of(node):
+    t = getattr(node, "targets", None)
+    if t is None:
+        t = [node.target]
+    return [x for x in t if isinstance(x, (ast.Name, ast.Attribute, ast.Subscript))]
+
+
+def _factory_name(call):
+    f = call.func
+    if isinstance(f, ast.Name):
+        return f.id
+    if isinstance(f, ast.Attribute):
+        return f.attr
+    return ""
+
+
+def audit_render_intermediates(src_text):
+    """审计真实逐页循环：渲染中间物不得被循环外的容器/属性持有。返回违规描述列表。"""
+    viols = []
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError as e:
+        return [f"源码无法解析为 AST（{e}）—— 审计失效"]
+
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "_print_pdf_native"), None)
+    if fn is None:
+        return ["未找到 _print_pdf_native（函数被改名/删除 ⇒ 审计目标消失）"]
+    loop = next((n for n in ast.walk(fn)
+                 if isinstance(n, ast.For) and isinstance(n.iter, ast.Name)
+                 and n.iter.id == "render_seq"), None)
+    if loop is None:
+        return ["未找到 `for … in render_seq:` 逐面循环（渲染序列来源变了 ⇒ 审计目标消失）"]
+
+    # ① 从赋值形态反推"渲染中间物"（不依赖变量名；链式传播：rendered = img）
+    inter = set()
+    for _ in range(4):
+        for node in ast.walk(fn):
+            if not isinstance(node, _ASSIGN_NODES):
+                continue
+            v = node.value
+            is_factory = isinstance(v, ast.Call) and _factory_name(v) in _RENDER_FACTORIES
+            is_chain = isinstance(v, ast.Name) and v.id in inter
+            if is_factory or is_chain:
+                for t in _targets_of(node):
+                    if isinstance(t, ast.Name):
+                        inter.add(t.id)
+    if not inter:
+        return ["识别不出任何渲染中间物（get_pixmap/frombuffer/Dib 的赋值形态变了 ⇒ 审计失效）"]
+
+    # "循环体内的变量" = 循环里被**普通赋值**绑定过的名字（+已在其中绑定过的 `+=` 目标）。
+    # 注意不能把 `+=` 的目标直接算进来：`_imgs += [img]`（_imgs 在循环外建）本身就在循环里，
+    # 若把它当"循环局部名"就会漏掉这一类累加逃逸 —— AST 对拍用例会当场抓到。
+    _plain = {t.id for n in ast.walk(loop) if isinstance(n, (ast.Assign, ast.AnnAssign))
+              for t in _targets_of(n) if isinstance(t, ast.Name)}
+    _aug = {t.id for n in ast.walk(loop) if isinstance(n, ast.AugAssign)
+            for t in _targets_of(n) if isinstance(t, ast.Name)}
+    bound_in_loop = _plain | (_aug & _plain)
+
+    # 注：**不**单独检查"中间物在循环外绑定" —— 把 Dib 建在循环外复用是合法优化（与
+    # blank_dib 同源），真正要拦的是"把渲染结果攒起来"，那一定表现为下面三类**存储**逃逸。
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr in _CONTAINER_METHODS:
+            recv = _root_name(node.func.value)
+            for a in node.args:
+                for nm in sorted(_names_in(a) & inter):
+                    if recv and recv in bound_in_loop:
+                        continue          # 每次迭代自建的局部容器，不是泄漏
+                    viols.append(f"`{recv or '?'}.{node.func.attr}({nm})` 把渲染中间物攒进容器"
+                                 f"（第 {node.lineno} 行）")
+        if isinstance(node, _ASSIGN_NODES):
+            names_in_val = _names_in(node.value) & inter
+            if names_in_val:
+                for t in _targets_of(node):
+                    if isinstance(t, (ast.Attribute, ast.Subscript)):
+                        where = ast.unparse(t) if hasattr(ast, "unparse") else "<target>"
+                        for nm in sorted(names_in_val):
+                            viols.append(f"`{where} = …{nm}…` 把渲染中间物存进属性/下标"
+                                         f"（第 {node.lineno} 行）")
+                    elif isinstance(t, ast.Name) and t.id not in bound_in_loop:
+                        # 目标名不在循环体内绑定 ⇒ 是循环外/模块级变量（如 `_imgs += [img]`）
+                        for nm in sorted(names_in_val):
+                            viols.append(f"`{t.id} = …{nm}…` 把渲染中间物累加进逐面循环外的变量"
+                                         f"（第 {node.lineno} 行）")
+        if isinstance(node, ast.Return) and node.value is not None:
+            for nm in sorted(_names_in(node.value) & inter):
+                viols.append(f"`return …{nm}…` 把渲染中间物带出函数（第 {node.lineno} 行）")
+
+    return viols
+
+
+_cur_viols = audit_render_intermediates(src)
+check("★ AST 审计：真实逐页循环不持有渲染中间物（pix/img/dib/blank_dib 及其改名变体）",
+      not _cur_viols, "；".join(_cur_viols[:3]))
+
+# ── AST 审计器**自带对拍**：喂进 6 种"逃逸"变体，每一种都必须被抓到 ──
+# 没有一个的话，扫描器就可能是"永远为绿"的假守卫（正是 D1-🔴12 的教训）。
+_ANCHOR = "            dib = ImageWin.Dib(img)\n"
+check("对拍夹具锚点唯一（能定位到真实循环里的 Dib 构造点）", src.count(_ANCHOR) == 1)
+_MUTATIONS = {
+    "审查员原变异（改名 + append 到模块级列表）":
+        "_keep_img = []\n" + src.replace(_ANCHOR, _ANCHOR + "            _keep_img.append(img)\n"),
+    "改名后 append（rendered_im）":
+        src.replace(_ANCHOR, "            rendered_im = ImageWin.Dib(img)\n"
+                             "            _hold.append(rendered_im)\n"),
+    "攒进 self._cache":
+        src.replace(_ANCHOR, _ANCHOR + "            self._cache.append(pix)\n"),
+    "存进字典下标":
+        src.replace(_ANCHOR, _ANCHOR + '            _holder["img"] = img\n'),
+    "augassign 累加列表":
+        src.replace(_ANCHOR, _ANCHOR + "            _imgs += [img]\n"),
+    "extend 列表实参（绕过 append 名字）":
+        src.replace(_ANCHOR, _ANCHOR + "            _cv.imgs.extend([pix])\n"),
+}
+for _label, _mut in _MUTATIONS.items():
+    _v = audit_render_intermediates(_mut)
+    check(f"★ AST 对拍：变异「{_label}」必须被判违规", bool(_v),
+          "" if _v else "审计器漏过了这一种逃逸形态 —— 它是假守卫")
+check("★ AST 对拍：合法写法不误报（真实源码 / 只加一行 print(img.size)）",
+      not audit_render_intermediates(src)
+      and not audit_render_intermediates(src.replace("        hdc.EndDoc()",
+                                                     "        print(img.size)\n        hdc.EndDoc()")))
+check("★ AST 审计对「函数被改名」也报违规（防审计目标消失后空转）",
+      bool(audit_render_intermediates(src.replace("def _print_pdf_native(",
+                                                  "def _print_pdf_nativeX("))))
+
 check("★ 中间物在每次迭代内重新赋值（作用域出循环即被引用计数回收）",
       "pix = page.get_pixmap(" in code_src and "img = Image.frombuffer(" in code_src
       and "dib = ImageWin.Dib(img)" in code_src)
