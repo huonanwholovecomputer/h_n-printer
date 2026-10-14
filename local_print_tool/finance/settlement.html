@@ -995,11 +995,29 @@ function sanitizeStore(data) {
       return true;
     });
   }
+  /* 🔴-F3：四条卫生规则此前只生效两条（成员 id/color 与转账）。这里补齐流水的：
+     ① 日期必须合法（挡住"幽灵月份"）；② 归属成员必须在名单里
+     （挡住"被人均摊却无人承接"，与 calcMonth 的 🔴-F2 同源）；③ 金额/分值归一到数值。
+     与转账一致：非法记录整条丢弃并 console.warn，不静默改写。 */
+  var memberWhitelist = {};
+  if (data && data.config && Array.isArray(data.config.members)) {
+    data.config.members.forEach(function (mm) { memberWhitelist[mm.id] = true; });
+  }
+  var OWNER_KEY = { expenses: 'payer', income: 'memberId', scores: 'memberId' };
   ['expenses', 'income', 'scores'].forEach(function (k) {
     var recs = data && data.records && data.records[k];
-    if (Array.isArray(recs)) recs.forEach(function (r) {
+    if (!Array.isArray(recs)) return;
+    data.records[k] = recs.filter(function (r) {
       var rid = safeId(r.id);
       if (rid) r.id = rid; else { console.warn('导入：记录 ID 非法，已替换', r.id); r.id = uid(); }
+      if (!isDateStr(r.date)) { console.warn('导入：跳过日期非法记录（避免生成幽灵月份）', r.id, r.date); return false; }
+      r.date = normDateStr(r.date);   // '2026-6-5' → '2026-06-05'（否则 monthKeyOf 截出 '2026-6-'）
+      var owner = safeId(r[OWNER_KEY[k]]);
+      if (!owner || !memberWhitelist[owner]) { console.warn('导入：跳过非成员的流水记录', r.id, owner); return false; }
+      r[OWNER_KEY[k]] = owner;
+      if (k === 'scores') r.score = +r.score || 0;
+      else r.amount = Math.round((+r.amount || 0) * 100) / 100;
+      return true;
     });
   });
   /* 实际转账：付款人/收款人必须是白名单 ID（避免导入数据把任意字符串塞进内联事件），
@@ -1012,6 +1030,10 @@ function sanitizeStore(data) {
       t.note = String(t.note == null ? '' : t.note);
       delete t.date;
       if (!t.from || !t.to || t.from === t.to || !isMonthKey(t.month)) { console.warn('导入：跳过非法转账记录', t.id); return false; }
+      /* 🔴-F3：另外两条 —— 0 元转账在结算里本就被忽略，留着只制造噪音；
+         收付方不是当前成员的钱永远到不了账，留着会让实际盈亏与建议转账对不上。 */
+      if (t.amount === 0) { console.warn('导入：跳过 0 元转账记录', t.id); return false; }
+      if (!memberWhitelist[t.from] || !memberWhitelist[t.to]) { console.warn('导入：跳过非成员的转账记录', t.id); return false; }
       return true;
     });
   }
@@ -1118,7 +1140,15 @@ function labelOf(key) { var p = String(key).split('-'); return (+p[0]) + '年' +
 function allMonthKeys() {
   var set = {};
   ['expenses', 'income', 'scores'].forEach(function (k) {
-    (STORE.records[k] || []).forEach(function (r) { if (r.date) set[monthKeyOf(r.date)] = true; });
+    (STORE.records[k] || []).forEach(function (r) {
+      /* 🔴-F3：只收**合法月份键**。旧写法 `if (r.date) set[monthKeyOf(r.date)] = true` 把
+         date 前 7 个字符直接当月键 ⇒ 'unknown' → 'unknow'、'' 之外的任何脏值都会冒出一个
+         label = 'NaN年NaN月' 的幽灵月份（下拉里能选中、点进去全空）。这里兜住**所有**
+         载入路径（导入 / 云端拉取 / 本地文件），不只是 sanitizeStore。 */
+      var mk = monthKeyOf(r.date);
+      if (isMonthKey(mk)) set[mk] = true;
+      else if (r.date) console.warn('跳过无法归入任何月份的记录', r.id, r.date);
+    });
   });
   // 实际转账存的是 month（无 date），单独收一遍
   (STORE.records.transfers || []).forEach(function (r) { if (isMonthKey(r.month)) set[r.month] = true; });
@@ -1127,6 +1157,20 @@ function allMonthKeys() {
 }
 /* 月份键校验：'YYYY-MM'，且月份在 1-12。用于实际转账（无日期，直接存月份）的合法性与净化。 */
 function isMonthKey(v) { return /^\d{4}-(0[1-9]|1[0-2])$/.test(String(v || '')); }
+/* 严格日期校验（🔴-F3）：必须是真实存在的日期，返回规范化后的 'YYYY-MM-DD'；非法返回 ''。
+   两个作用：① 挡住 'unknown' 这类值被 monthKeyOf 截成 'unknow' ⇒ 月份列表里冒出
+   label = 'NaN年NaN月' 的幽灵月；② 把 '2026-6-5' 这种宽松写法补零成 '2026-06-05'，
+   否则 monthKeyOf 会截出 '2026-6-' 这个既不是日期也不是月份的键。 */
+function normDateStr(v) {
+  var m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(v == null ? '' : v));
+  if (!m) return '';
+  var y = +m[1], mo = +m[2], d = +m[3];
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return '';
+  var dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return '';
+  return y + '-' + String(mo).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+}
+function isDateStr(v) { return normDateStr(v) !== ''; }
 function defaultDateFor(key) {
   var t = todayStr();
   return monthKeyOf(t) === key ? t : key + '-15';
@@ -1189,7 +1233,19 @@ function calcMonth(m) {
   var exps = m.expenses || [];
   var inc = m.income || {};
   var scores = m.scores || {};
-  var totalExp = exps.reduce(function (s, e) { return s + parseCents(e.amount); }, 0);
+  var known = {};
+  members.forEach(function (mem) { known[mem.id] = true; });
+  /* 🔴-F2：只把「付款人仍是当前成员」的采购计入结算。旧写法 totalExp 含全部记录，
+     而 paid[] 写给一个**没有行**的幽灵成员 ⇒ 这笔钱被按人数均摊、却无人承接：
+     实测 2 人 + 一笔已删成员垫付 ¥100 → Σ实际盈亏 ¥0.00 vs 团队盈亏 −¥100.00，
+     差整整 100 元；Σpaid ≠ totalExp 也让 🔴-C1 的 Σnet == 0 不成立。
+     处置与 transfers 一致（非成员记录不进结算），但**不静默**：另汇总 orphanPayerExp，
+     由「采购明细」显式标注「未纳入结算」，避免钱凭空消失。 */
+  var settledExps = exps.filter(function (e) { return known[e.payer]; });
+  var orphanPayerExp = exps.reduce(function (s, e) {
+    return known[e.payer] ? s : s + parseCents(e.amount);
+  }, 0);
+  var totalExp = settledExps.reduce(function (s, e) { return s + parseCents(e.amount); }, 0);
   var perPerson = members.length > 0 ? Math.round(totalExp / members.length) : 0;
   var totalInc = 0;
   members.forEach(function (mem) { totalInc += parseCents(inc[mem.id] || 0); });
@@ -1203,7 +1259,7 @@ function calcMonth(m) {
 
   var paid = {};
   members.forEach(function (m) { paid[m.id] = 0; });
-  exps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + parseCents(e.amount); });
+  settledExps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + parseCents(e.amount); });
 
   var investPool = Math.round(totalInc * rate);
   var servicePool = totalInc - investPool;
@@ -1249,8 +1305,7 @@ function calcMonth(m) {
      与上面「建议转账指令」不同：这是真的转了多少。决定「谁实际吃亏」。
      m.transfers 由 monthFromRecords 按「结算月份」筛出（记录只存 month，不存日期）。
      只统计收付双方都还在成员名单里的记录（成员被删除后其历史转账不再影响结算）。 */
-  var known = {};
-  members.forEach(function (m) { known[m.id] = true; });
+  /* known（成员白名单）已在函数开头构造 —— 采购结算也要用（🔴-F2） */
   var sent = {}, recv = {};
   members.forEach(function (m) { sent[m.id] = 0; recv[m.id] = 0; });
   var transferTotal = 0;
@@ -1275,7 +1330,7 @@ function calcMonth(m) {
 
   return { rate: rate, totalExp: totalExp, perPerson: perPerson, perPersonShare: perPersonShare,
            totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
-           paid: paid, investPool: investPool, servicePool: servicePool, investReturn: investReturn, serviceReturn: serviceReturn,
+           paid: paid, orphanPayerExp: orphanPayerExp, investPool: investPool, servicePool: servicePool, investReturn: investReturn, serviceReturn: serviceReturn,
            redist: redist, net: net, transfers: transfers, members: members, memberCount: memberCount, scoreCap: scoreCap,
            sent: sent, recv: recv, transferTotal: transferTotal, actualNet: actualNet, actualPL: actualPL, settleGap: settleGap };
 }
@@ -1789,7 +1844,10 @@ function fetchCloudCompare(month) {
     .catch(function () { _cloudCompareLoading = false; _cloudCompare = null; renderCloud(); });
 }
 /* 云端收益记录卡片的环比徽标：仅自然月口径且未启用成员/来源筛选时展示（保证口径一致）。
-   前端 orders 聚合（排除自打），与 KPI 完全同口径，不依赖后端 revenue_summary。 */
+   前端 orders 聚合（排除自打），与 KPI 完全同口径，不依赖后端 revenue_summary。
+   🔴-F7（2026-10）：**趋势图的「收益」曾是唯一例外** —— 它读后端逐单下发的
+   o.revenue + o.receivable，与 KPI / 环比徽标 / 收益构成（都走 _orderMoney().record）
+   不同源，同一页于是出现两个「收益」。现已统一为 _orderMoney(o, true).record / 100（元）。 */
 function _moMBadge() {
   if (_scopeTime.mode !== 'month' || _scopeMembers || _scopeSources) return '';
   if (_cloudCompareLoading) return '<span class="badge" style="opacity:.5">…</span>';
@@ -2225,7 +2283,7 @@ function _trendByBucket(orders, granularity) {
     var b = map[key];
     if (!b) b = map[key] = { key: key, label: key, count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 };
     b.count++;
-    b.revenue += o.is_admin_print ? 0 : ((o.revenue || 0) + (o.receivable || 0));   // v5.1 自打不计；v5.17 含待处理（应收未收并入）
+    b.revenue += _orderMoney(o, true).record / 100;   // 🔴-F7：与 KPI 同一函数同一口径（record 为分，趋势图单位为元；自打在 _orderMoney 内已排除）。本函数已由切片替代、保留防回退
     b.pages += o.total_page_count || 0;
     b.files += o.files_count || 0;
     b.sheets += _orderSheets(o).total;
@@ -3230,7 +3288,7 @@ function _computeDailyTrend(orders) {
     var day = _fmtDate(o.created_at);
     if (!map[day]) map[day] = { date: day, count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 };
     map[day].count++;
-    map[day].revenue += o.is_admin_print ? 0 : ((o.revenue || 0) + (o.receivable || 0));   // v5.1 自打不计；v5.17 含待处理（应收未收并入）
+    map[day].revenue += _orderMoney(o, true).record / 100;   // 🔴-F7：不再读后端逐单下发的 o.revenue/o.receivable —— 那是页面里唯一与 KPI 不同源的「收益」
     map[day].pages += o.total_page_count || 0;
     map[day].files += o.files_count || 0;
     map[day].sheets += _orderSheets(o).total;
@@ -3284,9 +3342,16 @@ function renderDash() {
 
   // 采购明细
   h += '<div class="section"><h2>🧾 采购明细 <span class="hint">(' + r.memberCount + ' 人均摊)</span></h2><div class="table-wrap"><table><thead><tr><th class="l">项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
+  var _expMemberSet = {};
+  getMembers().forEach(function (mem) { _expMemberSet[mem.id] = true; });
   (m.expenses || []).forEach(function (e) {
-    h += '<tr><td class="l">' + esc(e.item) + '</td><td>' + RMB(parseCents(e.amount)) + '</td><td><span class="member-tag" style="background:' + sanitizeColor(MC(e.payer)) + '">' + esc(MN(e.payer)) + '</span></td></tr>';
+    // 🔴-F2：付款人已不在成员名单 → 这笔钱不进均摊（进了就会被 N 人分摊却无人承接）
+    var orphan = !_expMemberSet[e.payer];
+    h += '<tr' + (orphan ? ' style="opacity:.55"' : '') + '><td class="l">' + esc(e.item) + '</td><td>' + RMB(parseCents(e.amount)) + '</td><td><span class="member-tag" style="background:' + sanitizeColor(MC(e.payer)) + '">' + esc(MN(e.payer)) + '</span>' + (orphan ? ' <span class="tag b">未纳入结算</span>' : '') + '</td></tr>';
   });
+  if (r.orphanPayerExp > 0) {
+    h += '<tr><td class="l" style="color:var(--muted)">其中：已删除成员垫付</td><td style="color:var(--muted)">' + RMB(r.orphanPayerExp) + '</td><td style="color:var(--muted)">无人可收，不计入均摊</td></tr>';
+  }
   h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalExp) + '</td><td>人均 ' + RMB(r.perPerson) + '</td></tr>';
   h += '</tbody></table></div></div>';
 
@@ -4125,14 +4190,23 @@ function confirmUnlockSettings(fn) {
 }
 function delMonth(key) {
   confirmUnlockSettings(function () {
-    openConfirm('确定删除「' + labelOf(key) + '」的所有采购 / 代收 / 评分数据？此操作不可恢复。', '删除').then(function (ok) {
+    openConfirm('确定删除「' + labelOf(key) + '」的所有采购 / 代收 / 评分数据，以及该月归属的实际转账（🔴-F8）？此操作不可恢复。', '删除').then(function (ok) {
       if (!ok) return;
       ['expenses', 'income', 'scores'].forEach(function (k) { STORE.records[k] = STORE.records[k].filter(function (r) { return monthKeyOf(r.date) !== key; }); });
+      /* 🔴-F8：实际转账按「结算月份」归属（记录只存 month，没有 date）。漏删它这个月就
+         永远删不掉：allMonthKeys 会继续收集到该月，残留转账还继续决定实际盈亏
+         （成员觉得"删了还在"，对账也永远差这笔钱）。 */
+      var droppedTransfers = 0;
+      STORE.records.transfers = (STORE.records.transfers || []).filter(function (t) {
+        if (t.month !== key) return true;
+        droppedTransfers++;
+        return false;
+      });
       delete STORE.notes[key];
       save();
       if (currentKey === key) currentKey = currentMonthKey();
       renderAll();
-      toast('已删除 ' + labelOf(key), 'success');
+      toast('已删除 ' + labelOf(key) + (droppedTransfers ? '（含 ' + droppedTransfers + ' 笔实际转账）' : ''), 'success');
     });
   });
 }
