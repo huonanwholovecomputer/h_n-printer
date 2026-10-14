@@ -1151,6 +1151,37 @@ function monthRecordCount(key) {
 
 /* ==================== 结算算法（与 printer_config / 后端共享口径） ====================
    金额一律用「整数分」累加（parseCents 换算），避免浮点误差；返回结果均为分。 */
+
+/* 整数分分摊：按权重把 pool 分给 members，**Σ 恒等于 pool**（🔴-C1，2026-10）。
+   用「最大余数法」：先各自 floor，余下的分按小数部分从大到小各补 1 分，同值按成员
+   列表顺序（稳定可复现）。等权时等价于「按成员顺序给前 N 人各 +1 分」。
+   旧写法在三处各自 Math.round —— 那是"每人独立四舍五入"，Σ 必然漂移：
+   3 人 ¥1.00 采购 → 每人 34 分、Σ = 102 分；三个池子同理。于是 Σnet ≠ 0，
+   项目声明的「全额结清时 实际盈亏 == 应得盈亏」永久不成立（实测 maxGap = 2 分，
+   建议转账全部照做后仍有残差）。 */
+function apportionCents(pool, weights, members) {
+  var out = {};
+  var n = members.length;
+  if (n <= 0) return out;
+  var totalW = 0;
+  weights.forEach(function (w) { totalW += w; });
+  var sumFloor = 0;
+  var fracs = [];
+  members.forEach(function (mem, i) {
+    var w = totalW > 0 ? weights[i] : 1;
+    var exact = totalW > 0 ? pool * w / totalW : pool / n;
+    var f = Math.floor(exact);
+    out[mem.id] = f;
+    sumFloor += f;
+    fracs.push({ id: mem.id, frac: exact - f, i: i });
+  });
+  /* floor(x) ≤ x ⇒ Σfloor ≤ Σexact = pool ⇒ 0 ≤ left < n，补分循环次数恒有界 */
+  var left = pool - sumFloor;
+  fracs.sort(function (a, b) { return (b.frac - a.frac) || (a.i - b.i); });
+  for (var k = 0; k < left; k++) out[fracs[k].id] += 1;
+  return out;
+}
+
 function calcMonth(m) {
   var members = getMembers();
   var rate = getRate();
@@ -1178,21 +1209,21 @@ function calcMonth(m) {
   var servicePool = totalInc - investPool;
   var memberCount = members.length || 1;
 
-  var investReturn = {};
-  members.forEach(function (mem) { investReturn[mem.id] = Math.round(investPool / memberCount); });
-
-  var serviceReturn = {};
-  members.forEach(function (mem) {
-    var ratio = totalScore > 0 ? scoreTotals[mem.id] / totalScore : 1 / memberCount;
-    serviceReturn[mem.id] = Math.round(servicePool * ratio);
-  });
+  /* 三处分摊一律走 apportionCents：Σ每人应摊 == totalExp、Σ投资回报 == investPool、
+     Σ服务回报 == servicePool ⇒ Σnet == Σredist − totalExp − totalInc + totalExp == 0。
+     服务池按分值加权（等权时 → 均分），替掉原来的「各自 Math.round」。 */
+  var perPersonShare = apportionCents(totalExp, members.map(function () { return 1; }), members);
+  var investReturn = apportionCents(investPool, members.map(function () { return 1; }), members);
+  var serviceReturn = apportionCents(servicePool, members.map(function (mem) {
+    return totalScore > 0 ? (scoreTotals[mem.id] || 0) : 1;
+  }), members);
 
   var redist = {};
   members.forEach(function (mem) { redist[mem.id] = investReturn[mem.id] + serviceReturn[mem.id]; });
 
   var net = {};
   members.forEach(function (mem) {
-    net[mem.id] = redist[mem.id] - perPerson - parseCents(inc[mem.id] || 0) + (paid[mem.id] || 0);
+    net[mem.id] = redist[mem.id] - perPersonShare[mem.id] - parseCents(inc[mem.id] || 0) + (paid[mem.id] || 0);
   });
 
   var balances = members.map(function (m) { return { id: m.id, net: net[m.id] }; });
@@ -1233,7 +1264,7 @@ function calcMonth(m) {
   });
 
   /* 实际盈亏 = 代收 + 实收转账 − 垫付 − 实付转账。
-     全部结清时它正好等于 redist − perPerson（账目盈亏）；
+     全部结清时它正好等于 redist − 每人应摊（账目盈亏）；
      没结清时差额 = net −（实收 − 实付）= 还没结清的金额，正数=别人还欠他。 */
   var actualNet = {}, actualPL = {}, settleGap = {};
   members.forEach(function (mem) {
@@ -1242,7 +1273,8 @@ function calcMonth(m) {
     settleGap[mem.id] = net[mem.id] - actualNet[mem.id];   // 正=仍应收，负=已超付
   });
 
-  return { rate: rate, totalExp: totalExp, perPerson: perPerson, totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
+  return { rate: rate, totalExp: totalExp, perPerson: perPerson, perPersonShare: perPersonShare,
+           totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
            paid: paid, investPool: investPool, servicePool: servicePool, investReturn: investReturn, serviceReturn: serviceReturn,
            redist: redist, net: net, transfers: transfers, members: members, memberCount: memberCount, scoreCap: scoreCap,
            sent: sent, recv: recv, transferTotal: transferTotal, actualNet: actualNet, actualPL: actualPL, settleGap: settleGap };
@@ -3242,7 +3274,7 @@ function renderDash() {
 
   // KPI（data-count 为整数分，countUp 显示时 ÷100）
   var totalPL = 0;
-  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPerson; });
+  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPersonShare[mem.id]; });
   h += '<div class="kpi-grid">';
   h += '<div class="kpi-card c-blue"><div class="kpi-ico">🧾</div><div class="num" data-count="' + r.totalExp + '" data-prefix="¥">0</div><div class="lbl">采购支出</div><div class="sub">人均 ' + RMB(r.perPerson) + '</div></div>';
   h += '<div class="kpi-card c-green"><div class="kpi-ico">💵</div><div class="num" data-count="' + r.totalInc + '" data-prefix="¥">0</div><div class="lbl">代收总额</div><div class="sub">' + r.memberCount + ' 人均摊投资回报</div></div>';
@@ -3284,11 +3316,11 @@ function renderDash() {
   // 经营损益
   h += '<div class="section"><h2>📊 经营损益 <span class="hint">（本月每人实际赚/亏）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>应得收入</th><th>− 均摊支出</th><th>= 本月盈亏</th></tr></thead><tbody>';
   getMembers().forEach(function (mem) {
-    var pl = r.redist[mem.id] - r.perPerson;
+    var pl = r.redist[mem.id] - r.perPersonShare[mem.id];
     var tag = pl >= 0 ? '<span class="tag g">盈利</span>' : '<span class="tag r">亏损</span>';
     h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td>' + RMB(r.redist[mem.id]) + '</td>';
-    h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
+    h += '<td class="neg">−' + RMB(r.perPersonShare[mem.id]) + '</td>';
     h += '<td class="' + (pl >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (pl >= 0 ? '+' : '') + RMB(pl) + ' ' + tag + '</td></tr>';
   });
   h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>−' + RMB(r.totalExp) + '</td><td class="' + (totalPL >= 0 ? 'pos' : 'neg') + '">' + (totalPL >= 0 ? '+' : '') + RMB(totalPL) + '</td></tr>';
@@ -3296,15 +3328,18 @@ function renderDash() {
 
   // 垫付清算
   h += '<div class="section"><h2>💳 垫付清算 <span class="hint">（谁多垫了、谁少垫了）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>实际代付</th><th>− 应均摊</th><th>= 垫付差额</th></tr></thead><tbody>';
+  var advSum = 0;   // 合计行的「垫付差额」改为**逐行求和** —— 旧写法硬编码 0，
+                    // 取整余数一出现（每人应摊不再相等）就与上面几列自相矛盾。
   getMembers().forEach(function (mem) {
-    var adv = (r.paid[mem.id] || 0) - r.perPerson;
+    var adv = (r.paid[mem.id] || 0) - r.perPersonShare[mem.id];
+    advSum += adv;
     var tag2 = adv > 1 ? '<span class="tag g">多垫，应收</span>' : (adv < -1 ? '<span class="tag r">少垫，应付</span>' : '<span class="tag b">持平</span>');
     h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td class="pos">+' + RMB(r.paid[mem.id]) + '</td>';
-    h += '<td class="neg">−' + RMB(r.perPerson) + '</td>';
+    h += '<td class="neg">−' + RMB(r.perPersonShare[mem.id]) + '</td>';
     h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (adv >= 0 ? '+' : '') + RMB(adv) + ' ' + tag2 + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(r.totalExp) + '</td><td>−' + RMB(r.perPerson * r.memberCount) + '</td><td>0</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(r.totalExp) + '</td><td>−' + RMB(r.totalExp) + '</td><td>' + (advSum > 0 ? '+' : '') + RMB(advSum) + '</td></tr>';
   h += '</tbody></table></div></div>';
 
   // 资金重分配
@@ -3312,7 +3347,7 @@ function renderDash() {
   h += '<div class="table-wrap"><table style="margin-bottom:14px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>= 应转出/入</th></tr></thead><tbody>';
   getMembers().forEach(function (mem) {
     var incomeAdj = r.redist[mem.id] - parseCents((m.income || {})[mem.id] || 0);
-    var adv = (r.paid[mem.id] || 0) - r.perPerson;
+    var adv = (r.paid[mem.id] || 0) - r.perPersonShare[mem.id];
     var transfer = incomeAdj + adv;
     h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td class="' + (incomeAdj >= 0 ? 'pos' : 'neg') + '">' + (incomeAdj >= 0 ? '+' : '') + RMB(incomeAdj) + '</td>';
@@ -3407,10 +3442,12 @@ function realPLSectionHTML(m, r, totalPL) {
   var spend = function (c) { return (c > 0 ? '−' : '') + RMB(c); };
   var h = '<div class="section"><h2>💰 实际盈亏 <span class="hint">（现金口径：代收 + 实收转账 − 垫付 − 实付转账）</span></h2>';
   h += '<div class="table-wrap"><table><thead><tr><th></th><th>代收</th><th>+ 实收转账</th><th>− 垫付</th><th>− 实付转账</th><th>= 实际盈亏</th><th>应得盈亏</th><th>差额（未结清）</th></tr></thead><tbody>';
+  var gapSum = 0;   // 合计行的「差额（未结清）」改为**逐行求和**（旧写法硬编码 0）
   getMembers().forEach(function (mem) {
     var aPL = r.actualPL[mem.id];
-    var nPL = r.redist[mem.id] - r.perPerson;
+    var nPL = r.redist[mem.id] - r.perPersonShare[mem.id];
     var gap = r.settleGap[mem.id];
+    gapSum += gap;
     var tag3 = gap > 1 ? '<span class="tag g">还应收 ' + RMB(gap) + '</span>' : (gap < -1 ? '<span class="tag r">已超付 ' + RMB(-gap) + '</span>' : '<span class="tag b">已结清</span>');
     h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td>' + RMB(parseCents((m.income || {})[mem.id] || 0)) + '</td>';
@@ -3422,7 +3459,7 @@ function realPLSectionHTML(m, r, totalPL) {
     h += '<td>' + tag3 + '</td></tr>';
   });
   h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>' + signed(r.transferTotal) + '</td><td>' + spend(r.totalExp) + '</td><td>' + spend(r.transferTotal) + '</td>';
-  h += '<td class="' + (totalActual >= 0 ? 'pos' : 'neg') + '">' + signed(totalActual) + '</td><td>' + signed(totalPL) + '</td><td>0</td></tr>';
+  h += '<td class="' + (totalActual >= 0 ? 'pos' : 'neg') + '">' + signed(totalActual) + '</td><td>' + signed(totalPL) + '</td><td>' + signed(gapSum) + '</td></tr>';
   h += '</tbody></table></div>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">实际盈亏 = 这个月他<b>真正</b>拿到的钱减真正掏出去的钱（转账是成员内部的钱，合计为 0，不影响团队总盈亏）。<br>全部结清时「实际盈亏」= 「应得盈亏」；没结清时差额就是<b>还没到位的钱</b> —— 差额为正的人被欠着，团队亏损实际由他垫着。</div></div>';
   return h;
@@ -3434,7 +3471,7 @@ function _refreshDashSummary() {
   var m = monthFromRecords(currentKey);
   var r = calcMonth(m);
   var totalPL = 0;
-  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPerson; });
+  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPersonShare[mem.id]; });
   var g = $('#dashTransferGaps');
   if (g) g.innerHTML = transferGapChipsHTML(m, r, unlocked.transfer ? '' : ' disabled');
   var p = $('#dashRealPL');
@@ -4066,7 +4103,7 @@ function renderHistory() {
     members.forEach(function (mem) {
       // 实际盈亏（现金口径）：代收 + 实收转账 − 垫付 − 实付转账。全结清时等于应得盈亏。
       var aPL = r.actualPL[mem.id];
-      var nPL = r.redist[mem.id] - r.perPerson;
+      var nPL = r.redist[mem.id] - r.perPersonShare[mem.id];
       h += '<td class="' + (aPL >= 0 ? 'pos' : 'neg') + '" style="white-space:nowrap">';
       h += '<div style="font-weight:800">' + (aPL >= 0 ? '+' : '') + RMB(aPL) + '</div>';
       h += '<div style="font-size:.72rem;font-weight:400;color:var(--muted)" title="应得盈亏 = 应得收入 − 均摊支出（账面口径，与转账是否发生无关）">应 ' + (nPL >= 0 ? '+' : '') + RMB(nPL) + '</div>';

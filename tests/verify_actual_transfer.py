@@ -114,6 +114,29 @@ check("历史表用 actualPL 并附应得盈亏小字",
       "var aPL = r.actualPL[mem.id];" in src and "应 ' + (nPL >= 0 ? '+' : '') + RMB(nPL)" in src)
 check("历史表下方有口径说明", "团队总盈亏不变" in src)
 
+print("\n--- 取整余数承接（🔴-C1）---")
+check("apportionCents 用最大余数法（先 floor，剩余分按小数部分补）",
+      "function apportionCents(pool, weights, members) {" in src
+      and "out[mem.id] = f;" in src
+      and "for (var k = 0; k < left; k++) out[fracs[k].id] += 1;" in src)
+check("三个池子分摊都走 apportionCents，不再各自 Math.round",
+      src.count("apportionCents(") == 4          # 1 处定义 + 3 处调用
+      and "investReturn[mem.id] = Math.round(investPool / memberCount)" not in src
+      and "serviceReturn[mem.id] = Math.round(servicePool * ratio);" not in src
+      and "var investPool = Math.round(totalInc * rate);" in src)   # 池子自身的取整保留（只此一次）
+check("净额改用「每人应摊」，不再用标量 perPerson",
+      "net[mem.id] = redist[mem.id] - perPersonShare[mem.id]" in src
+      and "r.redist[mem.id] - r.perPerson;" not in src
+      and "redist[mem.id] - perPerson -" not in src)
+check("合计行「垫付差额」改为逐行求和（不再硬编码 0 / 人均×人数）",
+      "advSum += adv;" in src and "RMB(r.perPerson * r.memberCount)" not in src)
+check("合计行「差额（未结清）」改为逐行求和（不再硬编码 0）",
+      "gapSum += gap;" in src and "signed(gapSum)" in src)
+check("perPerson 仅剩「人均」展示用途（3 处），不再参与逐人计算",
+      len(re.findall(r"r\.perPerson(?!Share)", src)) == 3
+      and src.count("RMB(r.perPerson)") == 3
+      and src.count("r.perPersonShare") == 9)
+
 # ---------- 3) 函数级行为验证 ----------
 print("\n--- calcMonth 行为（Node VM 内实测真实函数）---")
 harness = r"""
@@ -235,7 +258,7 @@ const eq = (a, b) => Math.abs(a - b) < 1e-9;
     { id: 't2', month: JUNE, from: MC, to: MA, amount: 188.00, note: '' },
   ], sb);
   const m = r.members;
-  const pl = (id) => r.redist[id] - r.perPerson;
+  const pl = (id) => r.redist[id] - r.perPersonShare[id];
   results.push(['B 全额转账后 实际盈亏 == 应得盈亏（三人全部）',
     m.every(x => eq(r.actualPL[x.id], pl(x.id))),
     m.map(x => yuan(r.actualPL[x.id]) + '/' + yuan(pl(x.id))).join(' ')]);
@@ -377,6 +400,69 @@ const eq = (a, b) => Math.abs(a - b) < 1e-9;
     sb3.STORE = clean;
     return sb3.allMonthKeys().includes('2026-06');
   })()]);
+}
+
+// ── 场景 G：取整余数**非零**（🔴-C1）──────────────────────────────────
+// 上面所有夹具的取整余数恰好都是 0（1317.87/3 整除、5% 与分值比例也都整除），
+// 所以「全额结清 ⇒ 差额为 0」这条恒等式**恰好测不到缺陷**。这里专门构造余数：
+// 3 人 / 采购 100 分（100÷3 余 1）/ 代收 105 分（投资池 5 分，5÷3 余 2）/
+// 服务分各 1（服务池 100 分，100÷3 余 1）—— 三个池子的余数全非零。
+{
+  const sb = makeSandbox();
+  sb.STORE = {
+    config: { investRate: 0.05, scoreCap: 15, passwords: {}, members: [
+      { id: MA, name: '成员A', color: '#4472C4' },
+      { id: MB, name: '成员B', color: '#548235' },
+      { id: MC, name: '成员C', color: '#ED7D31' } ] },
+    records: {
+      expenses: [{ id: 'e1', date: JUNE + '-03', item: 'A4纸', amount: 1.00, payer: MA }],
+      income: [{ id: 'i1', date: JUNE + '-05', memberId: MA, amount: 1.05 }],
+      scores: [
+        { id: 's1', date: JUNE + '-05', memberId: MA, item: '打印', score: 1 },
+        { id: 's2', date: JUNE + '-05', memberId: MB, item: '打印', score: 1 },
+        { id: 's3', date: JUNE + '-05', memberId: MC, item: '打印', score: 1 } ],
+      transfers: [],
+    },
+    notes: {}, meta: { version: 0 },
+  };
+  const ids = [MA, MB, MC];
+  const sum = (o) => ids.reduce((s, id) => s + o[id], 0);
+  const r = sb.calcMonth(sb.monthFromRecords(JUNE));
+
+  results.push(['G 每人应摊之和 == 采购总额（余数 1 分有人承接：34/33/33）',
+    sum(r.perPersonShare) === r.totalExp && r.perPersonShare[MA] === 34
+    && r.perPersonShare[MB] === 33 && r.perPersonShare[MC] === 33,
+    ids.map(id => r.perPersonShare[id]).join(' / ')]);
+  results.push(['G 投资回报之和 == 投资池（5 分 → 2/2/1，旧写法 2/2/2 = 6 分）',
+    sum(r.investReturn) === r.investPool && r.investReturn[MA] === 2
+    && r.investReturn[MB] === 2 && r.investReturn[MC] === 1,
+    ids.map(id => r.investReturn[id]).join(' / ') + ' 合计 ' + sum(r.investReturn)]);
+  results.push(['G 服务回报之和 == 服务池（100 分 → 34/33/33，旧写法 33/33/33 = 99 分）',
+    sum(r.serviceReturn) === r.servicePool && r.serviceReturn[MA] === 34
+    && r.serviceReturn[MB] === 33 && r.serviceReturn[MC] === 33,
+    ids.map(id => r.serviceReturn[id]).join(' / ') + ' 合计 ' + sum(r.serviceReturn)]);
+  results.push(['G Σ应得收入 == 代收总额（再分配是内部转移，不凭空生钱）',
+    sum(r.redist) === r.totalInc, String(sum(r.redist)) + ' vs ' + r.totalInc]);
+  results.push(['G Σ应转出/入 == 0（余数无人承接时这里会漂 1 分）',
+    sum(r.net) === 0, ids.map(id => yuan(r.net[id])).join(' / ')]);
+  results.push(['G 「人均」展示值仍是四舍五入的 0.33（展示与逐人分摊解耦）',
+    r.perPerson === 33, String(r.perPerson)]);
+
+  // 关键断言：把**建议**转账全部照做之后，每人差额必须真的归零。
+  // 旧代码 Σnet = 1 ⇒ 贪心匹配后 mc 还差 1 分 ⇒ 这里必红。
+  const suggested = r.transfers.map((t, i) =>
+    ({ id: 'g' + i, month: JUNE, from: t.from, to: t.to, amount: t.amount / 100, note: '' }));
+  sb.STORE.records.transfers = suggested;
+  const r2 = sb.calcMonth(sb.monthFromRecords(JUNE));
+  results.push(['G ★ 照做全部建议转账后 三人差额全为 0（真·全额结清）',
+    ids.every(id => r2.settleGap[id] === 0),
+    ids.map(id => id + ':' + r2.settleGap[id]).join(' / ') + '  建议 ' + suggested.length + ' 笔']);
+  results.push(['G ★ 全额结清后 实际盈亏 == 应得盈亏（逐人）',
+    ids.every(id => r2.actualPL[id] === r2.redist[id] - r2.perPersonShare[id]),
+    ids.map(id => yuan(r2.actualPL[id]) + '/' + yuan(r2.redist[id] - r2.perPersonShare[id])).join(' ')]);
+  results.push(['G ★ Σ实际盈亏 == 代收 − 采购（内部转账不改变团队总账）',
+    ids.reduce((s, id) => s + r2.actualPL[id], 0) === r2.totalInc - r2.totalExp,
+    yuan(ids.reduce((s, id) => s + r2.actualPL[id], 0)) + ' vs ' + yuan(r2.totalInc - r2.totalExp)]);
 }
 
 let fails = 0;

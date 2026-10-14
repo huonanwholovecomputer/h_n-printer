@@ -209,4 +209,42 @@ const BS = String.fromCharCode(39);  // 单引号（渲染出的 HTML 里是普�
 chk('锁定态转账输入框 disabled', locked.includes('updTransfer(' + BS + 't1' + BS + ',' + BS + 'amount' + BS + ',+this.value)" disabled'));
 chk('锁定态删除按钮 disabled', locked.includes('delTransfer(' + BS + 't1' + BS + ')" disabled'));
 
+// 场景 5（🔴-C1 渲染层）：取整余数非零 —— 渲染必须用「每人应摊」而不是四舍五入的标量。
+// 上面场景 1 的夹具 1317.87÷3 / 5% / 分值比例**恰好都整除**，所以渲染层也测不到该缺陷。
+console.log('--- 余数非零（3 人 / 采购 ¥1.00 / 代收 ¥1.05 / 服务分各 1）---');
+vm.runInContext(`
+  unlocked.transfer = true;
+  STORE = {
+    config: { investRate: 0.05, scoreCap: 15, passwords: {}, members: [
+      { id:'ma', name:'成员A', color:'#4472C4' },
+      { id:'mb', name:'成员B', color:'#548235' },
+      { id:'mc', name:'成员C', color:'#ED7D31' } ] },
+    records: {
+      expenses: [ { id:'e1', date:'2026-06-03', item:'A4纸', amount:1.00, payer:'ma' } ],
+      income:   [ { id:'i1', date:'2026-06-05', memberId:'ma', amount:1.05 } ],
+      scores: [
+        { id:'s1', date:'2026-06-05', memberId:'ma', item:'打印', score:1 },
+        { id:'s2', date:'2026-06-05', memberId:'mb', item:'打印', score:1 },
+        { id:'s3', date:'2026-06-05', memberId:'mc', item:'打印', score:1 } ],
+      transfers: []
+    },
+    notes: {}, meta: { version: 0 }
+  };
+  currentKey = '2026-06';
+  renderDash();
+`, sandbox);
+const rim = els['#tab-dash'].innerHTML || '';
+chk('经营损益逐行用「每人应摊」34/33/33（不是标量 33 ×3）',
+    rim.includes('−¥0.34') && (rim.match(/−¥0\.33/g) || []).length >= 2,
+    '未找到 −¥0.34 / −¥0.33');
+chk('垫付差额 成员A +¥0.66（= 垫付 1.00 − 应摊 0.34）', rim.includes('+¥0.66'));
+chk('垫付清算合计行「应均摊」= 采购总额 −¥1.00（旧写法 人均×人数 = −¥0.99）',
+    rim.includes('<td>+¥1.00</td><td>−¥1.00</td>'));
+chk('垫付清算合计行「差额」改为求和 ¥0.00（旧写法硬编码 0）',
+    rim.includes('<td>+¥1.00</td><td>−¥1.00</td><td>¥0.00</td>'));
+chk('实际盈亏合计行「差额（未结清）」改为求和 ¥0.00（旧写法硬编码 0）',
+    rim.includes('+¥0.05</td><td>¥0.00</td></tr>'));
+chk('「人均」展示仍是四舍五入的 ¥0.33（展示与逐人分摊解耦，不制造新的口径漂移）',
+    rim.includes('<td>合计</td><td>¥1.00</td><td>人均 ¥0.33</td>'));
+
 process.exit(bad ? 1 : 0);
