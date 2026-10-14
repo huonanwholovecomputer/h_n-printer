@@ -266,8 +266,11 @@ Component({
     coverPage: false,
     // 订单备注（选填，≤100 字）
     remark: '',
-    simplexPrice: 0.2,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
-    duplexPrice: 0.3,    // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
+    // 兜底单价（🔴-C3）：**必须与后端 printer-backend/pricing.json 逐值一致**。
+    // 旧值是 0.2 / 0.3（比权威的 0.3 / 0.4 低 33%/25%）—— /api/pricing 拉不到时
+    //「复制价格」写进剪贴板的就是低于实收的金额。pricingLoaded 也从"只写不读"改为真读。
+    simplexPrice: 0.3,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
+    duplexPrice: 0.4,    // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
     coverPagePrice: 0.10,  // 与本地打印工具 print_config.json 保持一致
     coverPriceVisible: false,    // 首页价格标签是否可见（配合入场动画）
     coverPriceEntering: false,   // 首页价格入场动画
@@ -3087,9 +3090,9 @@ Component({
     // ---- 价格计算（复刻本地工具 calc_cost）----
 
     _calcCost(pageCount, copies, duplex, pageRange) {
-      // 单价取云端 pricing.json 同步值（loadPricing 刷新），本地兜底 0.2/0.3
-      const simplex = this.data.simplexPrice || 0.2
-      const duplexP = this.data.duplexPrice || 0.3
+      // 单价取云端 pricing.json 同步值（loadPricing 刷新）；未同步时用与 pricing.json 一致的兜底值
+      const simplex = this.data.simplexPrice || 0.3
+      const duplexP = this.data.duplexPrice || 0.4
       if (pageCount <= 0) return { cost: 0, formula: '?', known: false }
       const effective = countPagesInRange(pageRange, pageCount)   // 有效打印页数（范围过滤后）
 
@@ -3196,6 +3199,12 @@ Component({
       })
     },
 
+    /* 复制价格的提示文案（🔴-C3）：未与云端同步过定价时如实告知 —— 金额用的是
+       内置兜底单价，可能与实收价不同。 */
+    _priceCopyToast(base) {
+      return this.data.pricingLoaded ? base : base + '（未同步云端定价，按内置兜底单价计算）'
+    },
+
     // ---- 复制价格（简略：仅金额，对齐本地工具 Ctrl+C）----
 
     onCopyPrice() {
@@ -3243,7 +3252,7 @@ Component({
       const amount = (orderNumber ? orderNumber + ' ' : '') + prefix + '¥' + total.toFixed(2)
       wx.setClipboardData({
         data: amount,
-        success: () => wx.showToast({ title: '已复制价格', icon: 'success' })
+        success: () => wx.showToast({ title: this._priceCopyToast('已复制价格'), icon: 'success' })
       })
     },
 
@@ -3335,7 +3344,7 @@ Component({
 
       wx.setClipboardData({
         data: lines.join('\n'),
-        success: () => wx.showToast({ title: '已复制详细价格', icon: 'success' })
+        success: () => wx.showToast({ title: this._priceCopyToast('已复制详细价格'), icon: 'success' })
       })
     },
 

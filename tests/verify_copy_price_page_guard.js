@@ -26,6 +26,7 @@ const vm = require('vm');
 const REPO = path.resolve(__dirname, '..');
 const MP_INDEX = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'index', 'index.js');
 const ANDROID_PRINT = path.join(REPO, 'mobile_apps', 'android_app', 'www', 'print.js');
+const PRICING_FILE = path.join(REPO, 'mobile_apps', 'printer-backend', 'pricing.json');
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -33,6 +34,41 @@ function check(name, cond, detail) {
   console.log(`[${cond ? 'PASS' : 'FAIL'}] ${name}` + (detail ? '  -- ' + detail : ''));
 }
 function section(title) { console.log('\n================ ' + title + ' ================'); }
+
+/* ============================================================
+   四、兜底单价与权威定价一致（🔴-C3）
+   ============================================================ */
+function checkFallbackPricing() {
+  section('兜底单价与权威定价一致（C3）');
+
+  const pricing = JSON.parse(fs.readFileSync(PRICING_FILE, 'utf8'));
+  const appSrc = fs.readFileSync(ANDROID_PRINT, 'utf8');
+  const mpSrc = fs.readFileSync(MP_INDEX, 'utf8');
+  const num = (src, re) => { const m = src.match(re); return m ? Number(m[1]) : null; };
+
+  const aS = num(appSrc, /const FALLBACK_SIMPLEX_PRICE = ([0-9.]+);/);
+  const aD = num(appSrc, /const FALLBACK_DUPLEX_PRICE = ([0-9.]+);/);
+  const aC = num(appSrc, /const FALLBACK_COVER_PAGE_PRICE = ([0-9.]+);/);
+  const mS = num(mpSrc, /\n\s*simplexPrice: ([0-9.]+),/);
+  const mD = num(mpSrc, /\n\s*duplexPrice: ([0-9.]+),/);
+
+  check('APP 兜底单价 == pricing.json（逐值）',
+        aS === pricing.simplex_price && aD === pricing.duplex_price && aC === pricing.cover_page_price,
+        `app=${aS}/${aD}/${aC}  权威=${pricing.simplex_price}/${pricing.duplex_price}/${pricing.cover_page_price}`);
+  check('小程序 兜底单价 == pricing.json（逐值）',
+        mS === pricing.simplex_price && mD === pricing.duplex_price,
+        `mp=${mS}/${mD}  权威=${pricing.simplex_price}/${pricing.duplex_price}`);
+  check('APP 不再各处各写一份字面量（统一走常量）',
+        appSrc.indexOf('simplexPrice: FALLBACK_SIMPLEX_PRICE') >= 0
+        && appSrc.indexOf('|| FALLBACK_SIMPLEX_PRICE') >= 0
+        && appSrc.indexOf('|| FALLBACK_DUPLEX_PRICE') >= 0);
+  check('两个前端均无残留的 0.2 / 0.3 兜底单价',
+        !/simplexPrice\s*(?::\s*|\|\|\s*)0\.2/.test(appSrc) && !/duplexPrice\s*(?::\s*|\|\|\s*)0\.3/.test(appSrc)
+        && !/simplexPrice\s*(?::\s*|\|\|\s*)0\.2/.test(mpSrc) && !/duplexPrice\s*(?::\s*|\|\|\s*)0\.3/.test(mpSrc));
+  check('pricingLoaded 由「只写不读」变为真读（两前端各有一处判断）',
+        /function priceCopyToast\(/.test(appSrc) && appSrc.indexOf('printState.pricingLoaded ?') >= 0
+        && /_priceCopyToast\(/.test(mpSrc) && mpSrc.indexOf('this.data.pricingLoaded ?') >= 0);
+}
 
 /* ============================================================
    一、微信小程序（pages/index/index.js）
@@ -277,6 +313,22 @@ async function runMiniProgram() {
   check('⑩勾选首页：出现首页行且为第 4 项（派送2/优先级3/首页4）',
         /(^|\n)3\. 优先级：低/.test(full) && /(^|\n)4\. 打印首页信息 \| 0\.10/.test(full), full);
   check('⑩合计=文件1.10+派送0.11+首页0.10=￥1.31', full.indexOf('￥1.31') >= 0, full);
+
+  /* --- ⑪ 🔴-C3：pricingLoaded 真读 —— 未同步云端定价时提示如实说明用的是兜底单价 --- */
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  page.data.pricingLoaded = false;
+  page.onCopyPrice();
+  check('⑪未同步定价：复制提示带「未同步云端定价」说明',
+        calls.toast.length === 1 && /未同步云端定价/.test(calls.toast[0]), JSON.stringify(calls.toast));
+  reset();
+  page.data.pricingLoaded = true;
+  page.onCopyPrice();
+  check('⑪已同步定价：提示回到普通文案',
+        calls.toast.length === 1 && calls.toast[0] === '已复制价格', JSON.stringify(calls.toast));
+  check('⑪源码自带兜底价 == 权威价（冷启动即可信）',
+        pageConfig.data.simplexPrice === 0.3 && pageConfig.data.duplexPrice === 0.4,
+        `${pageConfig.data.simplexPrice}/${pageConfig.data.duplexPrice}`);
 }
 
 /* ============================================================
@@ -328,7 +380,7 @@ async function runAndroid() {
   sandbox.showConfirm = () => {};
   sandbox.openModal = () => {};
   sandbox.closeModal = () => {};
-  sandbox.copyText = (text) => calls.clipboard.push(text);
+  sandbox.copyText = (text, msg) => { calls.clipboard.push(text); calls.toast.push(msg); };
   sandbox.renderFileList = () => {};
   sandbox.renderPricing = () => {};
   sandbox.getApp = () => ({ globalData: {} });
@@ -364,6 +416,12 @@ async function runAndroid() {
   const run = (code) => vm.runInContext(code, sandbox);
   const last = (arr) => arr[arr.length - 1];
   const reset = () => { calls.clipboard.length = 0; calls.alert.length = 0; calls.toast.length = 0; };
+  /* 🔴-C3：先取一份"源码自带的兜底价"（任何 setOrder 覆盖之前）——
+     冷启动 /api/pricing 拉不到时，用户看到/复制出去的就是这几个值。 */
+  const srcDefaults = run('({ simplex: printState.simplexPrice, duplex: printState.duplexPrice, loaded: printState.pricingLoaded })');
+  check('⑫源码自带兜底价 == 权威价，且 pricingLoaded 初始为 false',
+        srcDefaults.simplex === 0.3 && srcDefaults.duplex === 0.4 && srcDefaults.loaded === false,
+        JSON.stringify(srcDefaults));
 
   const setOrder = (files, opts) => {
     run(`
@@ -526,6 +584,27 @@ async function runAndroid() {
   check('⑩勾选首页：出现首页行且为第 4 项（派送2/优先级3/首页4）',
         /(^|\n)3\. 优先级：低/.test(full) && /(^|\n)4\. 打印首页信息 \| 0\.10/.test(full), full);
   check('⑩合计=文件1.10+派送0.11+首页0.10=￥1.31', full.indexOf('￥1.31') >= 0, full);
+
+  /* --- ⑬ 🔴-C3：兜底单价真的参与计价（旧兜底 0.2/0.3 会低算 33%/25%） --- */
+  reset();
+  run('printState.simplexPrice = 0; printState.duplexPrice = 0;');   // 模拟"从未同步过"
+  const single = run('calcCost(4, 1, "off", "")');
+  const dbl = run('calcCost(4, 1, "on", "")');
+  check('⑬单面 4 页兜底计价 = 4×0.30 = ¥1.20（旧兜底 0.20 → ¥0.80）',
+        Math.abs(single.cost - 1.20) < 1e-9, String(single.cost));
+  check('⑬双面 4 页兜底计价 = 2×0.40 = ¥0.80（旧兜底 0.30 → ¥0.60）',
+        Math.abs(dbl.cost - 0.80) < 1e-9, String(dbl.cost));
+
+  /* --- ⑭ 🔴-C3：pricingLoaded 真读 —— 未同步时提示如实说明用的是兜底单价 --- */
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  run('printState.pricingLoaded = false; onCopyPrice();');
+  check('⑭未同步定价：复制提示带「未同步云端定价」说明',
+        calls.toast.length === 1 && /未同步云端定价/.test(calls.toast[0]), JSON.stringify(calls.toast));
+  reset();
+  run('printState.pricingLoaded = true; onCopyPrice();');
+  check('⑭已同步定价：提示回到普通文案',
+        calls.toast.length === 1 && calls.toast[0] === '已复制价格', JSON.stringify(calls.toast));
 }
 
 /* ============================================================
@@ -580,6 +659,7 @@ function setByPath(obj, key, val) {
 /* ============================================================ */
 (async () => {
   checkWiring();
+  checkFallbackPricing();
   await runMiniProgram();
   await runAndroid();
   console.log('\n' + '='.repeat(52));

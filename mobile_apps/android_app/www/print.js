@@ -7,6 +7,16 @@ const UNSUPPORTED_EXTS = ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf'];
 const MAX_FILES = 20;
 const MAX_FILE_MB = 50;
 const MAX_POLL_ATTEMPTS = 60;
+
+/* 兜底单价（🔴-C3）：**必须与后端 `printer-backend/pricing.json` 逐值一致**。
+   /api/pricing 拿不到时就用它计价。旧值是 0.2 / 0.3（比权威低 33%/25%）——
+   冷启动拉取失败时「复制价格」写进剪贴板的是**低于实收**的金额（提交时后端覆盖，
+   不会多收/少收，但用户照这个数字转钱就会少给）。`pricingLoaded` 也从"只写不读"
+   改为真读：未与云端同步过时，复制结果会明确提示按内置兜底单价计算。 */
+const FALLBACK_SIMPLEX_PRICE = 0.3;
+const FALLBACK_DUPLEX_PRICE = 0.4;
+const FALLBACK_COVER_PAGE_PRICE = 0.1;
+
 // 大图压缩阈值与压缩后最长边（对齐小程序"相册选择压缩图"体验）
 const COMPRESS_IMAGE_THRESHOLD = 2 * 1024 * 1024; // 超过 2MB 的图片尝试压缩
 const COMPRESS_MAX_SIDE = 1600;                    // 压缩后最长边上限（px）
@@ -25,9 +35,9 @@ const printState = {
   urgencyPrice: 0,
   coverPage: false,
   remark: '',               // 订单备注（选填，≤100 字）
-  simplexPrice: 0.2,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
-  duplexPrice: 0.3,    // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
-  coverPagePrice: 0.10,
+  simplexPrice: FALLBACK_SIMPLEX_PRICE,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
+  duplexPrice: FALLBACK_DUPLEX_PRICE,     // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
+  coverPagePrice: FALLBACK_COVER_PAGE_PRICE,
   autoPrintEnabled: false,
   autoPrintGlow: false,
   adminPrintEnabled: false,  // 管理员自行打印（仅管理员可见）
@@ -2106,9 +2116,9 @@ function countPagesInRange(pageRange, total) {
 }
 
 function calcCost(pageCount, copies, duplex, pageRange) {
-  // 单价取云端 pricing.json 同步值（loadPricing 刷新），本地兜底 0.2/0.3
-  const simplex = printState.simplexPrice || 0.2;
-  const duplexP = printState.duplexPrice || 0.3;
+  // 单价取云端 pricing.json 同步值（loadPricing 刷新）；未同步时用与 pricing.json 一致的兜底值
+  const simplex = printState.simplexPrice || FALLBACK_SIMPLEX_PRICE;
+  const duplexP = printState.duplexPrice || FALLBACK_DUPLEX_PRICE;
   if (!pageCount || pageCount <= 0) return { cost: 0, formula: '?', known: false };
   const effective = countPagesInRange(pageRange, pageCount);   // 有效打印页数（范围过滤后）
   if (duplex === 'on') {
@@ -2146,6 +2156,12 @@ function orderEchoParams() {
   };
 }
 
+/* 复制价格 / 复制详细价格的提示文案（🔴-C3）：未与云端同步过定价时如实告知 ——
+   金额用的是内置兜底单价，可能与实收价不同。 */
+function priceCopyToast(base) {
+  return printState.pricingLoaded ? base : base + '（未同步云端定价，按内置兜底单价计算）';
+}
+
 function onCopyPrice() {
   const d = printState._lastOrderResult;
   if (!d || !d.files) return;
@@ -2169,7 +2185,7 @@ function onCopyPrice() {
   if (p.coverPage) total += p.coverPagePrice;
   const prefix = allKnown ? '' : '≈ ';
   const amount = ((d.order_number || '') + ' ').trim() + prefix + '¥' + total.toFixed(2);
-  copyText(amount, '已复制价格');
+  copyText(amount, priceCopyToast('已复制价格'));
 }
 
 function onCopyDetailPrice() {
@@ -2218,7 +2234,7 @@ function onCopyDetailPrice() {
   const totalSum = allParts.reduce((s, x) => s + parseFloat(x), 0);
   lines.push('─'.repeat(14));
   lines.push('💰合计: ' + (allParts.join('+') || '0') + '=￥' + totalSum.toFixed(2));
-  copyText(lines.join('\n'), '已复制详细价格');
+  copyText(lines.join('\n'), priceCopyToast('已复制详细价格'));
 }
 
 /* ================= 文件预览（与小程序同口径，零后端依赖）=================
