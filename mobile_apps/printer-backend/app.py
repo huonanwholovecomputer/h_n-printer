@@ -6016,8 +6016,12 @@ def get_order_price(order_id):
         files.append(f)
 
     # 汇总
-    total_files_price = sum(f.get("total_price", 0) for f in files)
+    # 🔴-C4：总价一律取**订单级** orders.total_price —— 它由 submit_order 建单时写成
+    # 「文件小计 + 加急费 + 首页费 + 派送费」，页数被修正时的整单重算路径也维持同一口径。
+    # 原实现用 order_files 小计相加，三类附加费全丢，而前端把本字段直接当「结算总价」
+    # 复制给顾客（me.js「打印任务结算」）⇒ 只要勾了首页（默认 ¥0.10）就必现少收。
     all_free = all(f.get("is_free", 0) for f in files)
+    total_price = round(float(order.get("total_price") or 0), 2)
 
     conn.close()
     return jsonify({
@@ -6025,7 +6029,7 @@ def get_order_price(order_id):
         "order_id": int(order_id),
         "is_free": bool(all_free),
         "files": files,
-        "total_price": total_files_price,
+        "total_price": total_price,
     })
 
 
@@ -7374,7 +7378,9 @@ def license_finish():
                 price_detail = {
                     "order_id": order["id"],
                     "is_free": bool(order.get("is_free", 0)),
-                    "total_price": sum(f.get("total_price", 0) for f in files),
+                    # 🔴-C4：与 /api/order_price 同口径 —— 订单级总价（含加急/首页/派送附加费），
+                    # 不再用 order_files 小计相加（那会漏掉附加费，管理员结算金额偏低）
+                    "total_price": round(float(order.get("total_price") or 0), 2),
                     "files": files,
                 }
         finally:
