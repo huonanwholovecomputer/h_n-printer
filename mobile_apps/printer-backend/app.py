@@ -5154,14 +5154,17 @@ def submit_order():
                                               auto_print=bool(auto_print),
                                               image_orientation=st.get("image_orientation", "auto")):
                     pushed_count += 1
-                else:
-                    # 推送失败 → 降级子任务和父订单
-                    conn = get_db()
-                    conn.execute("UPDATE order_files SET status = 'queued' WHERE id = ?", (st["id"],))
-                    st["status"] = "queued"
-                    refresh_order_status(conn, order_id)
-                    conn.commit()
-                    conn.close()
+                # 🔴-11：此处原有 `UPDATE order_files SET status='queued' WHERE id=?` 的失败
+                # 回滚，已删除 —— push_print_task_to_client 对每种失败路径都自带**带状态守卫**
+                # 的回滚（只改 printing/downloading 的行），这里属于重复且有害的第二次回滚：
+                #  · 任务刚被判 rejected（页数越界）→ 被改回 queued ⇒ 30 秒后照常推送 ⇒
+                #    越界文件被真实打印，顾客在订单详情看到「排队中」而不是「被打回」；
+                #  · 任务已被**另一条推送路径**（process_pending_orders / 打印机上线重推）
+                #    领取为 printing → 被改回 queued ⇒ 重复打印。本段推送在事务外，与那些
+                #    路径存在真实并发窗口（该函数正是靠 `AND status='queued'` 的 rowcount
+                #    为 0 来识别这种竞争的）。
+                # 失败原因里唯一"状态未变"的情形（rowcount==0 已非 queued / file_id 为空）
+                # 本就不需要回滚。响应体的聚合状态取自 orders 表（下方 final_status）。
 
     conn.close()
 
