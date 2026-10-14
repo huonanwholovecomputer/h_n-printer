@@ -3545,7 +3545,14 @@ def _parse_page_range_max(range_str: str) -> int:
 
 def _parse_page_range_set(range_str: str, total_pages: int) -> set:
     """解析页码范围字符串为页码集合（对齐本地 printer_config._parse_range_parts）。
-    支持 '1-5,7,9'、中文逗号/顿号分隔、智能拆分 '23-4' → {2,3,4}；越界部分忽略。"""
+    支持 '1-5,7,9'、中文逗号/顿号分隔、智能拆分 '23-4' → {2,3,4}；越界部分忽略。
+
+    P0（2026-10 审查 🔴-1）：迭代前先把区间收窄到 [1, total_pages]。**结果集合完全不变**
+    （原先"全区间遍历 + 逐个过滤"），但不再为 "1-999999999" 建十亿个 int —— 实测
+    1e7 区间 = 198ms，线性外推 1e9 ≈ 20s/次，而 `workers=1/threads=16` 下单个已登录
+    请求即可占满线程并（配合 INSERT 持有的 SQLite 写锁）拖垮全站。
+    同款写法见 local_print_tool/pdf_printer.py:299-305（其 docstring 要求"两处同步"）。
+    """
     pages: set = set()
     if not range_str or not range_str.strip():
         return pages
@@ -3559,17 +3566,15 @@ def _parse_page_range_set(range_str: str, total_pages: int) -> set:
                 a, b = part.split("-", 1)
                 start, end = int(a), int(b)
                 if start < end:
-                    for p in range(start, end + 1):
-                        if 1 <= p <= total_pages:
-                            pages.add(p)
+                    for p in range(max(start, 1), min(end, total_pages) + 1):
+                        pages.add(p)
                 elif start > end and len(a) > 1:
                     # 智能拆分: "23-4" → 页码 2 + 范围 3-4
                     prefix = int(a[:-1])
                     last = int(a[-1])
                     if prefix < end:
-                        for p in range(last, end + 1):
-                            if 1 <= p <= total_pages:
-                                pages.add(p)
+                        for p in range(max(last, 1), min(end, total_pages) + 1):
+                            pages.add(p)
                         if 1 <= prefix <= total_pages:
                             pages.add(prefix)
             except ValueError:

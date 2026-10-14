@@ -431,6 +431,14 @@ class CounterWidget(QWidget):
 # 动态页码范围输入组件
 # ============================================================
 
+# 页码范围一行输入的**跨度上限**（仅在总页数未知时用于兜底）。
+# 为什么需要：`_parse_range` 原先用 `set(range(start, end + 1))` 且**完全无上限**，
+# 手输 "1-999999999" 会直接申请 30+ GB（表 + int 对象）→ MemoryError / 界面卡死
+# （2026-10 审查 🔴-1）。跨度是"页码"不是"循环次数"——1 万页以上的一行输入在真实
+# 文档里不存在，超过即按上限截断（只影响集合内容，不影响"格式是否合法"的判定）。
+_RANGE_SPAN_CAP = 10000
+
+
 class RangeListWidget(QWidget):
     """
     多行页码范围输入：每行一个范围，自动增减行，检测重叠和超限。
@@ -519,7 +527,7 @@ class RangeListWidget(QWidget):
             t = inp.text().strip()
             if not t:
                 continue
-            pages = self._parse_range(t)
+            pages = self._parse_range(t, self._total_pages)
             key = min(pages) if pages else 10 ** 9  # 解析失败排末尾
             entries.append((key, t))
         if len(entries) <= 1:
@@ -550,7 +558,7 @@ class RangeListWidget(QWidget):
             t = inp.text().strip()
             if not t:
                 continue
-            pages = self._parse_range(t)
+            pages = self._parse_range(t, self._total_pages)
             key = min(pages) if pages else 10 ** 9
             entries.append((key, t))
         # 排序
@@ -615,7 +623,7 @@ class RangeListWidget(QWidget):
             t = inp.text().strip()
             if not t:
                 continue
-            pages = self._parse_range(t)
+            pages = self._parse_range(t, self._total_pages)
             if pages is None:
                 self._mark_invalid(inp)
                 has_error = True
@@ -643,8 +651,15 @@ class RangeListWidget(QWidget):
         inp.style().polish(inp)
 
     @staticmethod
-    def _parse_range(text: str) -> set[int] | None:
-        """解析单个范围字符串（如 "1-5"、"7"），start > end 视为格式错误。"""
+    def _parse_range(text: str, total_pages: int = 0) -> set[int] | None:
+        """解析单个范围字符串（如 "1-5"、"7"），start > end 视为格式错误。
+
+        P0（2026-10 审查 🔴-1）：迭代前先收窄区间再建集合。
+          · total_pages > 0：收窄到 [1, total_pages]；越界时额外塞一个哨兵
+            `total_pages + 1`，让调用方 `max(pages) > total_pages` 的「超限」判据
+            与改前**完全一致**（合法输入得到的集合与改前逐元素相同）。
+          · total_pages == 0（页数未知）：按 `_RANGE_SPAN_CAP` 截断，只防内存炸弹。
+        """
         text = text.strip()
         if not text:
             return None
@@ -653,7 +668,12 @@ class RangeListWidget(QWidget):
                 a, b = text.split("-", 1)
                 start, end = int(a), int(b)
                 if 1 <= start < end:
-                    return set(range(start, end + 1))
+                    if total_pages > 0:
+                        pages = set(range(start, min(end, total_pages) + 1))
+                        if end > total_pages:
+                            pages.add(total_pages + 1)   # 越界哨兵
+                        return pages
+                    return set(range(start, min(end, start + _RANGE_SPAN_CAP - 1) + 1))
                 return None
             else:
                 v = int(text)

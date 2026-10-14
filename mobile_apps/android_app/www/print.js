@@ -921,7 +921,13 @@ function stopPageCountPoll(f) {
 
 /* ================= 页码范围 ================= */
 
-function parseSingleRange(text) {
+/* 页码范围一行输入允许的跨度上限（仅在总页数未知时兜底）。
+ * 为什么需要：原先 `for (let p = start; p <= end; p++)` 完全无上限，
+ * 手输 "1-999999999" 会循环 10 亿次并往 Set 里塞 10 亿个元素（内存爆 + 界面卡死）。
+ * 上限取 1 万，同时保证 Math.max(...pages) 展开不会触到 V8 的参数个数上限（约 6.5 万）。 */
+const RANGE_SPAN_CAP = 10000;
+
+function parseSingleRange(text, total) {
   text = (text || '').trim();
   if (!text) return null;
   if (text.indexOf('-') !== -1) {
@@ -932,7 +938,12 @@ function parseSingleRange(text) {
     if (isNaN(start) || isNaN(end)) return null;
     if (start >= 1 && start < end) {
       const pages = new Set();
-      for (let p = start; p <= end; p++) pages.add(p);
+      const t = total || 0;
+      // 收窄迭代区间：结果与「全区间遍历 + 逐个过滤」完全一致，但不再空转
+      // （2026-10 审查 🔴-1：实测 1e6 区间 = 115ms ⇒ 1e9 ≈ 115 秒 + 内存爆）
+      const hi = t > 0 ? Math.min(end, t) : Math.min(end, start + RANGE_SPAN_CAP - 1);
+      for (let p = start; p <= hi; p++) pages.add(p);
+      if (t > 0 && end > t) pages.add(t + 1);   // 越界哨兵：保住「超出总页数」判据
       return pages;
     }
     return null;
@@ -950,7 +961,7 @@ function computeSinglePage(f) {
   for (const line of (f.rangeLines || [])) {
     const v = (line.value || '').trim();
     if (!v) continue;
-    const parsed = parseSingleRange(v);
+    const parsed = parseSingleRange(v, f.pageCount || 0);
     if (parsed) parsed.forEach(p => pages.add(p));
   }
   return pages.size === 1;
@@ -983,7 +994,7 @@ function normalizeAndValidateRangeLines(idx, smooth) {
   for (const line of lines) {
     const v = (line.value || '').trim();
     if (!v) continue;
-    const pages = parseSingleRange(v);
+    const pages = parseSingleRange(v, maxPages);
     if (pages) entries.push({ value: v, pages, error: '' });
     else entries.push({ value: v, pages: null, error: '格式错误（应为 1-5 或 7）' });
   }
@@ -1057,7 +1068,7 @@ function openRangePicker(idx) {
   for (const line of (f.rangeLines || [])) {
     const v = (line.value || '').trim();
     if (!v) continue;
-    const parsed = parseSingleRange(v);
+    const parsed = parseSingleRange(v, total);
     if (parsed) parsed.forEach(p => selected.add(p));
   }
   rangePicker.fileIndex = idx;

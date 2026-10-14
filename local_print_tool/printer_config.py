@@ -165,7 +165,12 @@ class PrintJob:
 
 
 def _parse_range_parts(raw: str, total_pages: int) -> set[int]:
-    """将页码范围字符串解析为页码集合，支持智能拆分 '23-4' → {2,3,4}。"""
+    """将页码范围字符串解析为页码集合，支持智能拆分 '23-4' → {2,3,4}。
+
+    P0（2026-10 审查 🔴-1）：迭代前先把区间收窄到 [1, total_pages]。**结果集合完全不变**
+    （原先"全区间遍历 + 逐个过滤"），但此函数在**主线程**经 calc_cost 调用，超长区间
+    （如手输 1-999999999）原样会卡界面约 20 秒。同款写法见 pdf_printer._parse_page_range。
+    """
     import logging
     logger = logging.getLogger(__name__)
 
@@ -180,17 +185,15 @@ def _parse_range_parts(raw: str, total_pages: int) -> set[int]:
                 a, b = part.split("-", 1)
                 start, end = int(a), int(b)
                 if start < end:
-                    for p in range(start, end + 1):
-                        if 1 <= p <= total_pages:
-                            pages.add(p)
+                    for p in range(max(start, 1), min(end, total_pages) + 1):
+                        pages.add(p)
                 elif start > end and len(a) > 1:
                     # 智能拆分: "23-4" → 页码 2 + 范围 3-4
                     prefix = int(a[:-1])
                     last = int(a[-1])
                     if prefix < end:
-                        for p in range(last, end + 1):
-                            if 1 <= p <= total_pages:
-                                pages.add(p)
+                        for p in range(max(last, 1), min(end, total_pages) + 1):
+                            pages.add(p)
                         if 1 <= prefix <= total_pages:
                             pages.add(prefix)
                 else:

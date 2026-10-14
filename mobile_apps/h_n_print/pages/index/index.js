@@ -106,6 +106,12 @@ function _rangeInt(s) {
   return Number.isSafeInteger(v) ? v : null
 }
 
+/* 页码范围一行输入允许的跨度上限（仅在总页数未知时兜底）。
+ * 为什么需要：`_parseSingleRange` 原先 `for (let p = start; p <= end; p++)` 完全无上限，
+ * 手输 "1-999999999" 会循环 10 亿次并往 Set 里塞 10 亿个元素（内存爆 + 界面卡死）。
+ * 上限取 1 万，同时保证 Math.max(...pages) 展开不会触到 V8 的参数个数上限（约 6.5 万）。 */
+const RANGE_SPAN_CAP = 10000
+
 /* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
 
    ⚠ 必须与后端 `_count_pages_in_range` / 本地 `_parse_range_parts` **严格同口径**，
@@ -1643,8 +1649,12 @@ Component({
 
     // ---- 页码范围 — 多行输入（对齐本地工具 RangeListWidget）----
 
-    _parseSingleRange(text) {
+    _parseSingleRange(text, total) {
       // 匹配 gui.py RangeListWidget._parse_range
+      // 2026-10 审查 🔴-1：迭代前先收窄区间再建集合（原先无上限 → 内存爆）。
+      //   total > 0：收窄到 [1, total]；越界时塞哨兵 total+1，保住下游
+      //              `Math.max(...pages) > maxPages` 的「超出总页数」判据。
+      //   total == 0（页数未知）：按 RANGE_SPAN_CAP 截断，只防内存炸弹。
       text = (text || '').trim()
       if (!text) return null
       if (text.indexOf('-') !== -1) {
@@ -1655,7 +1665,10 @@ Component({
         if (isNaN(start) || isNaN(end)) return null
         if (start >= 1 && start < end) {
           const pages = new Set()
-          for (let p = start; p <= end; p++) pages.add(p)
+          const t = total || 0
+          const hi = t > 0 ? Math.min(end, t) : Math.min(end, start + RANGE_SPAN_CAP - 1)
+          for (let p = start; p <= hi; p++) pages.add(p)
+          if (t > 0 && end > t) pages.add(t + 1)   // 越界哨兵
           return pages
         }
         return null
@@ -1714,7 +1727,7 @@ Component({
       for (const line of lines) {
         const v = (line.value || '').trim()
         if (!v) continue
-        const parsed = this._parseSingleRange(v)
+        const parsed = this._parseSingleRange(v, file.pageCount || 0)
         if (parsed) parsed.forEach(p => pages.add(p))
       }
       return pages.size === 1
@@ -1744,7 +1757,7 @@ Component({
       for (const line of lines) {
         const v = (line.value || '').trim()
         if (!v) continue
-        const pages = this._parseSingleRange(v)
+        const pages = this._parseSingleRange(v, maxPages)
         if (pages) {
           entries.push({ value: v, pages, error: '' })
         } else {
@@ -1825,7 +1838,7 @@ Component({
       for (const line of (file.rangeLines || [])) {
         const v = (line.value || '').trim()
         if (!v) continue
-        const parsed = this._parseSingleRange(v)
+        const parsed = this._parseSingleRange(v, total)
         if (parsed) parsed.forEach(p => selected.add(p))
       }
       const pages = []
