@@ -313,6 +313,11 @@ class CloudClient(QObject):
         self._stability_timer: threading.Timer | None = None  # 连接稳定 N 秒后清零退避计数
         self._last_replay_attempt = 0.0    # status_queue 重放退避时间戳（60s 间隔）
         self._replay_lock = threading.Lock()  # 重放退避门闩锁，防 GUI/后台线程并发重复重放
+        # status_queue.json 读-改-写锁：_queue_status_sync 由 GUI 线程调用、
+        # sync_pending_statuses 由连接线程调用，两者都是「整文件覆盖写」——
+        # 并发时会互相吞掉对方的条目（丢一次状态上报 ⇒ 后端订单状态卡住 ⇒ 重推打印）。
+        # 所有对 status_queue.json 的读写都必须经此锁（RLock：同线程可重入）。
+        self._status_queue_lock = threading.RLock()
         self._download_threads: list[threading.Thread] = []   # 记录下载线程，供 stop() join
 
         # 本地任务缓存
@@ -636,31 +641,39 @@ class CloudClient(QObject):
         except OSError as e:
             logger.error(f"status_queue.json 损坏且无法改名保留: {e}")
 
-    def _queue_status_sync(self, order_id: int, status: str, task_id: int = 0):
-        """离线时将状态变更暂存到本地队列。task_id 供 sent/failed 回放时精确定位子任务。"""
+    def _read_status_queue_locked(self) -> list:
+        """读取 status_queue.json。**调用方必须持有 _status_queue_lock。**
+
+        文件缺失返回 []；结构损坏则改名保留（不静默清空）后返回 []。
+        """
         import json as _json
         path = self._status_queue_path()
-        queue = []
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                queue = _json.load(f)
+            if not isinstance(queue, list):
+                raise ValueError("队列结构异常")
+            return queue
+        except Exception:
+            # P0-3: 损坏文件改名保留，不从空队列静默覆盖
+            self._quarantine_status_queue(path)
+            return []
+
+    def _write_status_queue_locked(self, queue: list) -> None:
+        """原子写 status_queue.json（tmp + os.replace）。**调用方必须持有 _status_queue_lock。**
+
+        空队列直接删除文件（与重放完成后的既有行为一致）。
+        """
+        import json as _json
+        path = self._status_queue_path()
+        if not queue:
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    queue = _json.load(f)
-                if not isinstance(queue, list):
-                    raise ValueError("队列结构异常")
-            except Exception:
-                # P0-3: 损坏文件改名保留，不从空队列静默覆盖
-                self._quarantine_status_queue(path)
-                queue = []
-        item = {"order_id": order_id, "status": status,
-                "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-        if task_id:
-            item["task_id"] = task_id
-        queue.append(item)
-        # P2: 队列无上限保护 —— 超过 STATUS_QUEUE_MAX 条时丢弃最旧
-        if len(queue) > STATUS_QUEUE_MAX:
-            dropped = len(queue) - STATUS_QUEUE_MAX
-            queue = queue[dropped:]
-            logger.warning(f"status_queue 超过 {STATUS_QUEUE_MAX} 条，丢弃最旧 {dropped} 条")
+                os.remove(path)
+            except OSError:
+                logger.warning("删除已同步的 status_queue.json 失败")
+            return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # P0-3: tmp + os.replace 原子写，避免截断式写入损坏 JSON
         tmp = path + ".tmp"
@@ -676,6 +689,36 @@ class CloudClient(QObject):
                 except OSError:
                     pass
             raise
+
+    @staticmethod
+    def _status_item_key(item: dict):
+        """条目身份标识：优先 qid；历史条目（无 qid）退化为四元组。
+
+        用于重放写回时按条目剔除，替代"整文件覆盖"（后者会吞掉并发追加）。
+        """
+        return item.get("qid") or (
+            item.get("order_id"), item.get("status"),
+            item.get("task_id"), item.get("queued_at"))
+
+    def _queue_status_sync(self, order_id: int, status: str, task_id: int = 0):
+        """离线时将状态变更暂存到本地队列。task_id 供 sent/failed 回放时精确定位子任务。
+
+        🔴-2 联动：整个「读-追加-写」在 _status_queue_lock 内完成。原实现无锁，
+        与 sync_pending_statuses 的整文件覆盖写并发时会互相吞掉条目。
+        """
+        item = {"order_id": order_id, "status": status,
+                "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        if task_id:
+            item["task_id"] = task_id
+        with self._status_queue_lock:
+            queue = self._read_status_queue_locked()
+            queue.append(item)
+            # P2: 队列无上限保护 —— 超过 STATUS_QUEUE_MAX 条时丢弃最旧
+            if len(queue) > STATUS_QUEUE_MAX:
+                dropped = len(queue) - STATUS_QUEUE_MAX
+                queue = queue[dropped:]
+                logger.warning(f"status_queue 超过 {STATUS_QUEUE_MAX} 条，丢弃最旧 {dropped} 条")
+            self._write_status_queue_locked(queue)
         self.status_message.emit(f"☁ 状态同步已暂存: 订单 #{order_id} → {status}")
 
     def _try_status_sync(self, order_id: int, status: str) -> bool:
@@ -715,23 +758,13 @@ class CloudClient(QObject):
             if now - self._last_replay_attempt < 60:
                 return
             self._last_replay_attempt = now
-        import json as _json
-        path = self._status_queue_path()
-        if not os.path.exists(path):
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                queue = _json.load(f)
-            if not isinstance(queue, list):
-                raise ValueError("队列结构异常")
-        except Exception:
-            # P0-3: 损坏文件改名保留，不从空队列静默覆盖
-            self._quarantine_status_queue(path)
-            queue = []
+        with self._status_queue_lock:
+            queue = self._read_status_queue_locked()
         if not queue:
             return
         self.status_message.emit(f"☁ 正在同步 {len(queue)} 条离线状态...")
         remaining = []
+        settled = set()          # 已终结（上报成功 / 业务拒绝丢弃）的条目身份
         for item in queue:
             endpoint_map = {"accepted": "accept_order", "abandoned": "abandon_order",
                           "sent": "print_success", "failed": "print_fail"}
@@ -740,11 +773,13 @@ class CloudClient(QObject):
             if status not in endpoint_map:
                 # P1: 未知状态/结构残缺的条目无法重放，直接丢弃，避免死循环
                 logger.warning(f"status_queue 发现未知状态条目，已丢弃: {item}")
+                settled.add(self._status_item_key(item))
                 continue
             if status in ("sent", "failed"):
                 # P1: 无 task_id 的死条目（回退 order_id=0 会错报到错误任务）→ 清理丢弃
                 if not item.get("task_id"):
                     logger.warning(f"status_queue 发现无 task_id 的死条目，已丢弃: {item}")
+                    settled.add(self._status_item_key(item))
                     continue
                 # print_success/print_fail 通过 SocketIO 发送（task_id 定位子任务）
                 if self._sio and self._connected:
@@ -752,6 +787,7 @@ class CloudClient(QObject):
                         task_id = item["task_id"]
                         self._sio.emit("print_success" if status == "sent" else "print_fail",
                                       {"task_id": task_id})
+                        settled.add(self._status_item_key(item))
                     except Exception:
                         remaining.append(item)
                 else:
@@ -770,30 +806,28 @@ class CloudClient(QObject):
                             # 业务拒绝（如订单已取消）：丢弃，不反复重放
                             logger.warning(f"离线状态同步 {status} 订单 #{order_id} 被业务拒绝"
                                            f" ({resp.status_code})，丢弃该条目")
+                            settled.add(self._status_item_key(item))
                             continue
                         remaining.append(item)
+                    else:
+                        settled.add(self._status_item_key(item))
                 except Exception:
                     remaining.append(item)
+        # P0-3 强化：网络重放段**不持锁**（单条 10s 超时，持锁会阻塞 GUI 线程的
+        # _queue_status_sync）；写回时在锁内以磁盘为准重读，按条目身份剔除已终结项。
+        # 原实现直接覆盖写 remaining，会把重放期间并发追加的条目一并吞掉（丢上报）。
+        with self._status_queue_lock:
+            disk = self._read_status_queue_locked()
+            merged = [it for it in disk if self._status_item_key(it) not in settled]
+            present = {self._status_item_key(it) for it in merged}
+            for it in remaining:
+                # 磁盘上已被并发整文件覆盖写吃掉的本轮条目（极罕见）补回，保证不丢
+                if self._status_item_key(it) not in present:
+                    merged.append(it)
+            self._write_status_queue_locked(merged)
         if remaining:
-            # P0-3: 剩余条目原子写回
-            tmp = path + ".tmp"
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    _json.dump(remaining, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                os.replace(tmp, path)
-            except Exception:
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
             self.status_message.emit(f"☁ {len(remaining)} 条状态同步失败，已重新暂存")
         else:
-            try:
-                os.remove(path)
-            except OSError:
-                logger.warning("删除已同步的 status_queue.json 失败")
             self.status_message.emit(f"☁ 离线状态同步完成 ({len(queue)} 条)")
 
     def report_page_range_truncated(self, task_id: int, original_range: str,

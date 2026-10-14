@@ -2820,8 +2820,36 @@ def on_connect(auth=None):
 
 @socketio.on("disconnect")
 def on_disconnect(reason=None):
-    """打印机客户端断开 — 立即回滚其名下所有 printing 任务为 queued"""
+    """打印机客户端断开 — 立即回滚其名下所有 printing 任务为 queued
+
+    🔴-2：同一 client_id 快速重连（sid A → B）后，旧连接 A 的 disconnect 不得影响
+    B。判据是本连接是否仍是 printer_clients 中该 client_id 的当前 sid（连接时按
+    sid 替换，见 on_connect:2761-2770）。若已被替换则**整体跳过回滚与注销**：
+    回滚 SQL 只按 operator_client 过滤，而 operator_client 存的就是 client_id，
+    无法区分 A/B 两条连接 ⇒ 旧连接断开会把 B 正在打印的任务误翻回 queued
+    （随后 30 秒照常推送 ⇒ 重复打印），并把 B 的注册记录一并删掉。
+    """
     client_id = request.args.get("client_id")
+    sid = request.sid
+
+    # 先判定本连接是否已被同 client_id 的新连接取代
+    replaced = False
+    with printer_clients_lock:
+        if client_id and client_id in printer_clients:
+            if printer_clients[client_id]["sid"] != sid:
+                replaced = True
+        elif not client_id:
+            # disconnect 事件可能不带查询参数 → 按 sid 反查兜底（原逻辑位置）
+            for _cid, info in printer_clients.items():
+                if info["sid"] == sid:
+                    client_id = _cid
+                    break
+
+    if replaced:
+        # 旧连接：不碰注册表（B 才是当前连接）、不回滚任何任务
+        print(f"[LINK] 打印机客户端旧连接断开（已被同 client_id 的新连接取代）: {client_id}")
+        return
+
     if client_id:
         with db_lock:
             conn = get_db_conn()
@@ -2882,14 +2910,17 @@ def on_disconnect(reason=None):
             finally:
                 conn.close()
 
-    # 清理客户端注册信息
+    # 清理客户端注册信息（🔴-2：只注销"属于本连接"的那条记录）
     with printer_clients_lock:
         if client_id and client_id in printer_clients:
-            del printer_clients[client_id]
+            if printer_clients[client_id]["sid"] == sid:
+                del printer_clients[client_id]
+            # sid 不匹配 ⇒ 已被新连接取代，保留新连接（replaced 分支已提前 return，
+            # 此处守卫用于防止将来 on_connect 的替换逻辑变更后退化）
         else:
             # 兜底：通过 sid 反向查找（client_id 可能不在 request.args 中）
             for cid, info in list(printer_clients.items()):
-                if info["sid"] == request.sid:
+                if info["sid"] == sid:
                     del printer_clients[cid]
                     break
     # 更新设备最后在线时间（注册表保留离线记录，供收支清算「授权」页展示）
