@@ -100,8 +100,11 @@ def migrate_legacy_data(script_dir: str) -> None:
     """把旧版程序目录中的用户数据复制到 %APPDATA%\\HN打印工具。
     幂等：目标已存在则跳过（新数据优先）；源文件保留兜底（不删除）。"""
     app_data = get_app_data_dir()
+    # .processed_tasks.json = 云端任务「已处理」集合（跨重启防重复打印）。
+    # 旧版写在程序目录：装到 C:\Program Files 时该目录不可写 ⇒ 集合无法持久化 ⇒
+    # 重启后同一批任务被重复打印（🔴-6）。一并迁移到数据根目录。
     for rel in ("print_config.json", "theme_settings.json", "user_bindings.json",
-                "printer-local.db"):
+                "printer-local.db", ".processed_tasks.json"):
         _migrate_file(os.path.join(script_dir, rel), os.path.join(app_data, rel))
     # finance/print_data.json（旧版放程序目录/finance 下，新位置在数据根目录）
     _migrate_file(os.path.join(script_dir, "finance", "print_data.json"),

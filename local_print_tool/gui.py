@@ -8082,8 +8082,15 @@ class MainWindow(QMainWindow):
     # ---- 云端任务处理 ----
 
     def _processed_tasks_path(self) -> str:
-        """已处理任务 ID 集合的持久化文件路径（跨重启防重复打印）。"""
-        return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".processed_tasks.json")
+        """已处理任务 ID 集合的持久化文件路径（跨重启防重复打印）。
+
+        🔴-6：必须落在用户数据目录（%APPDATA%\\HN打印工具），不能放程序目录 ——
+        装到 C:\\Program Files 后程序目录不可写，写失败会让"已处理"集合无法持久化：
+        重启后同一批云端任务会被**重复打印**（顾客白付一次钱），且失败被静默吞掉。
+        旧版写在程序目录的同名文件由 paths.migrate_legacy_data 一次性复制过来
+        （幂等：目标已存在则跳过；源文件保留兜底）。
+        """
+        return os.path.join(paths.get_app_data_dir(), ".processed_tasks.json")
 
     def _load_processed_tasks(self) -> set:
         """启动时从磁盘加载已处理任务 ID 集合（进程崩溃/重启后不再重复打印）。"""
@@ -8093,8 +8100,11 @@ class MainWindow(QMainWindow):
                 data = _json.load(f)
             if isinstance(data, list):
                 return set(int(x) for x in data if str(x).isdigit())
-        except Exception:
-            pass
+        except FileNotFoundError:
+            pass                      # 首次运行没有该文件是正常情况，不刷日志
+        except Exception as e:
+            # 不静默：读失败 ⇒ 以空集合启动 ⇒ 可能重复打印历史任务，必须留痕
+            logger.warning(f"已处理任务集合读取失败（按空集合启动，可能重复打印已处理任务）: {e}")
         return set()
 
     def _mark_processed_task(self, task_id: int):
@@ -8108,8 +8118,9 @@ class MainWindow(QMainWindow):
             with open(self._processed_tasks_path(), "w", encoding="utf-8") as f:
                 import json as _json
                 _json.dump(items, f, ensure_ascii=False)
-        except Exception:
-            pass
+        except Exception as e:
+            # 🔴-6：不能静默 —— 写失败 ⇒ 集合无法持久化 ⇒ 重启后这批任务被重复打印
+            logger.error(f"已处理任务集合保存失败（重启后可能重复打印该批任务）: {e}")
 
     def _is_processed_task(self, task_id: int) -> bool:
         """判断任务是否已处理（防 SocketIO + HTTP 双通道重复）。"""
