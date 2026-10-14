@@ -54,13 +54,18 @@ cfg = open(CONFIG, encoding="utf-8").read()
 print("=== A. 静态接线 ===")
 # A1 每个「预留放弃」调用点都必须传**整单合计**（不是本文件的价）
 #    历史 bug：循环里逐文件 calc_cost 上报 → 后端只认第一次命中 → 订单额 = 第一个文件的价
+#    v4.5.18（🔴-B2）：三个标签页删除/清空入口（删除单个 / 清空全部 / 删除已完成）的
+#    放弃逻辑已收敛为公共方法 `_abandon_tab_jobs`，调用点由 3 处变为 2 处
+#    （公共方法 + 退出清理 closeEvent）。语义等价，断言改为「每个调用点都满足」。
 sites = [m.start() for m in re.finditer(r"abandon_reserved_order\(", gui)]
-chk("gui.py 有 3 个预留放弃调用点", len(sites) == 3, "实际 %d 处" % len(sites))
+chk("gui.py 预留放弃调用点 ≥2（三处标签页入口已合并为 _abandon_tab_jobs）",
+    len(sites) >= 2, "实际 %d 处" % len(sites))
 tabtotal = 0
 for pos in sites:
     if "self._tab_total_price(" in gui[pos:pos + 400]:
         tabtotal += 1
-chk("3 个调用点都传整单合计 _tab_total_price(…)", tabtotal == 3, "只有 %d 处" % tabtotal)
+chk("每个调用点都传整单合计 _tab_total_price(…)", tabtotal == len(sites),
+    "只有 %d/%d 处" % (tabtotal, len(sites)))
 chk("_tab_total_price 用本机配置单价（不落 calc_cost 的 0.2/0.3 默认值）",
     re.search(r"def _tab_total_price\(self, tab\)[\s\S]{0,1500}?self\._config\.simplex_price,"
               r" self\._config\.duplex_price", gui) is not None)
@@ -73,10 +78,11 @@ chk("已无「逐文件上报金额」的旧写法（放弃调用点之前不再
 chk("calc_cost 的默认单价确为历史遗留 0.2/0.3（说明必须显式传）",
     re.search(r"simplex_price: float = 0\.2,\s*\n\s*duplex_price: float = 0\.3", cfg) is not None)
 
-# A2 三个调用点都上报归属/自打
+# A2 每个调用点都上报归属/自打
 sends = re.findall(r"abandon_reserved_order\(\s*\n?\s*job\.order_number, self\._tab_total_price\("
                    r"[^)]*\),\s*\n?\s*owner_name=", gui)
-chk("3 个调用点都上报 owner_name/is_admin_print", len(sends) == 3, "实际 %d 处" % len(sends))
+chk("每个调用点都上报 owner_name/is_admin_print", len(sends) == len(sites),
+    "实际 %d 处（调用点 %d）" % (len(sends), len(sites)))
 
 # A3 cloud_client 支持并携带这两个字段
 chk("abandon_reserved_order 签名含 owner_name/is_admin_print",

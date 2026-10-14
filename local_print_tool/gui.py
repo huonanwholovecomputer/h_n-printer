@@ -96,6 +96,11 @@ logger = logging.getLogger(__name__)
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
 APP_VERSION = "4.5.18"
 
+# 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
+# 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
+# 提为模块级常量便于验收脚本把它临时调成 0（否则测试要真等 30 秒）。
+SCHEDULED_SELF_HEAL_S = 30
+
 
 # ============================================================
 # 辅助工具
@@ -4036,6 +4041,96 @@ class MainWindow(QMainWindow):
             self._save_config()
             self._refresh_tab_display()
 
+    def _abandon_tab_jobs(self, tab_entry) -> list:
+        """通知后端放弃该标签页中**未打印**的云端任务/本地预留订单，返回其全部 jobs。
+
+        归属/自打标记随放弃请求一起上报：否则后端只能按缺省值补记，会把「接单打印」
+        的订单误盖章成「自打」（类型列与收益分类都按此字段）。金额传**整单合计**
+        （不是本文件的价）：后端只认第一次命中的那笔，逐文件上报会让订单额变成
+        第一个文件的价。
+        """
+        jobs = list(getattr(tab_entry, "jobs", None) or [])
+        if not jobs or not self._cloud_client:
+            return jobs
+        for job in jobs:
+            if getattr(job, 'sent', False):
+                continue
+            if job.order_id > 0:
+                self._cloud_client.abandon_order_to_server(job.order_id)
+            elif job.task_id > 0:
+                self._cloud_client.abandon_order_to_server(job.task_id)
+            elif job.order_number and "-L" not in job.order_number:
+                self._cloud_client.abandon_reserved_order(
+                    job.order_number, self._tab_total_price(tab_entry),
+                    owner_name=(tab_entry.owner_name or ""),
+                    is_admin_print=bool(tab_entry.is_admin_print))
+        return jobs
+
+    def _remove_tabs(self, keys, reason: str = "删除标签页") -> list:
+        """删除一批标签页（**一次**重编号，避免逐个删除导致 key 漂移），
+        并做全部联动清理：后端放弃通知 / 预约单状态机 / 补打队列 / 孤儿 PDF 缓存。
+        返回**实际删除**的 key 列表（按输入顺序）。
+
+        🔴-B2：原「标签页管理」对话框里的三个删除入口只做了
+        `del self._config.tabs[key]` + `_renumber_tabs()`，漏了 `_scheduled_orders`
+        与 `_auto_print_retry` 的联动清理。被删标签页的 key 不在重编号的 key_map 里
+        ⇒ 预约单 `st["tab_key"]` 保留旧值，而重编号后该数字 key 已被**另一个**标签页
+        接管 ⇒ 到点会把那个订单的文件打出来，并把归属/计费挂到别人的标签页快照上
+        （白费纸 + 账目串单）。
+
+        联动清理必须在 `_renumber_tabs()` **之前**（否则旧 key 已被新标签页占用）。
+        UI 刷新由调用方负责。
+        """
+        removed_keys = []
+        all_jobs = []
+        for key in list(keys):
+            tab_entry = self._config.tabs.get(key)
+            if tab_entry is None:
+                continue
+            all_jobs.extend(self._abandon_tab_jobs(tab_entry))
+            del self._config.tabs[key]
+            removed_keys.append(key)
+        if not removed_keys:
+            return []
+        for key in removed_keys:
+            self._cleanup_scheduled_orders_for_tab(key, reason="标签页已删除")
+            self._drop_auto_print_retry_for_tab(key)
+        self._cleanup_orphan_pdf_cache(all_jobs)
+        self._renumber_tabs()
+        self._save_config()
+        self._log(f"🗑 已删除标签页 {'、'.join(removed_keys)}（{reason}）")
+        return removed_keys
+
+    def _clear_all_tabs(self, reason: str = "清空全部标签页") -> None:
+        """清空全部标签页并重置为单个空标签页（含预约单/补打队列联动清理）。
+
+        同 `_remove_tabs`：原实现只重置了 `_config.tabs`，`_scheduled_orders` /
+        `_auto_print_retry` 里残留的旧 key 会被重置后的「1」号标签页接管 ⇒ 到点
+        自动打印时打到**另一个**订单。必须先清掉全部旧 key 的联动项再重置。
+        """
+        self._remove_tabs(list(self._config.tabs.keys()), reason=reason)
+        self._config.tabs = {"1": self._make_new_tab()}
+        self._current_tab = "1"
+        self._config.active_tab = "1"
+        self._save_config()
+
+    def _scheduled_tab_still_owns(self, order_id: int, tab_key: str) -> bool:
+        """预约单的 `tab_key` 是否仍指向**该订单自己的**标签页。
+
+        🔴-B2 兜底：标签页重编号后，数字 key 可能被另一个标签页接管
+        （`st["tab_key"]` 残留旧值），此时按 tab_key 直接取 jobs 会把**别的订单**
+        的文件打印出来。消费前必须校验归属。
+        """
+        if not tab_key:
+            return False
+        tab = self._config.tabs.get(tab_key)
+        if tab is None:
+            return False
+        for job in (tab.jobs or []):
+            if getattr(job, "order_id", 0) == order_id:
+                return True
+        return False
+
     def _on_cleanup_empty_tabs(self):
         """F4: 点击"删除空标签页"按钮。"""
         if not self._has_empty_tabs_except_current():
@@ -4344,31 +4439,12 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            # 通知后端放弃该标签页中未打印的云端任务 + 本地预留订单（已完成的跳过）
-            for job in jobs:
-                if getattr(job, 'sent', False):
-                    continue
-                if job.order_id > 0 and self._cloud_client:
-                    self._cloud_client.abandon_order_to_server(job.order_id)
-                elif job.task_id > 0 and self._cloud_client:
-                    self._cloud_client.abandon_order_to_server(job.task_id)
-                elif job.order_number and "-L" not in job.order_number and self._cloud_client:
-                    # 归属/自打标记随放弃请求一起上报：否则后端只能按缺省值补记，
-                    # 会把「接单打印」的订单误盖章成「自打」（类型列与收益分类都按此字段）
-                    # 金额传**整单合计**（不是本文件的价）：后端只认第一次命中的那笔，
-                    # 逐文件上报会让订单额变成第一个文件的价
-                    self._cloud_client.abandon_reserved_order(
-                        job.order_number, self._tab_total_price(tab_entry),
-                        owner_name=(tab_entry.owner_name if tab_entry else ""),
-                        is_admin_print=(bool(tab_entry.is_admin_print) if tab_entry else None))
-            del self._config.tabs[key]
-            self._cleanup_orphan_pdf_cache(jobs)
-            self._renumber_tabs()
-            self._save_config()
+            # 删除 + 全部联动清理（后端放弃通知 / 预约单 / 补打队列 / 孤儿缓存）
+            if not self._remove_tabs([key], reason="删除标签页"):
+                return
             self._rebuild_table()
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
-            self._log(f"已删除标签页 {key}")
             self._sweep_staged_files("删除标签页")
             _rebuild_dialog_table()
 
@@ -4384,32 +4460,11 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return
-            # 通知后端放弃所有未打印的云端任务 + 本地预留订单（已完成的跳过）
-            all_abandoned = []
-            for tab_entry in self._config.tabs.values():
-                for job in (tab_entry.jobs if tab_entry else []):
-                    if getattr(job, 'sent', False):
-                        continue
-                    all_abandoned.append(job)
-                    if job.order_id > 0 and self._cloud_client:
-                        self._cloud_client.abandon_order_to_server(job.order_id)
-                    elif job.task_id > 0 and self._cloud_client:
-                        self._cloud_client.abandon_order_to_server(job.task_id)
-                    elif job.order_number and "-L" not in job.order_number and self._cloud_client:
-                        # 金额传整单合计 + 归属/自打标记（理由同「删除标签页」处）
-                        self._cloud_client.abandon_reserved_order(
-                            job.order_number, self._tab_total_price(tab_entry),
-                            owner_name=(tab_entry.owner_name if tab_entry else ""),
-                            is_admin_print=(bool(tab_entry.is_admin_print) if tab_entry else None))
-            self._config.tabs = {"1": self._make_new_tab()}
-            self._current_tab = "1"
-            self._config.active_tab = "1"
-            self._cleanup_orphan_pdf_cache(all_abandoned)
-            self._save_config()
+            # 清空全部 + 全部联动清理（后端放弃通知 / 预约单 / 补打队列 / 孤儿缓存）
+            self._clear_all_tabs("清空全部标签页")
             self._rebuild_table()
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
-            self._log("已清空全部标签页")
             self._sweep_staged_files("清空全部标签页")
             _rebuild_dialog_table()
 
@@ -4424,11 +4479,7 @@ class MainWindow(QMainWindow):
                     removed.append(key)
             if not removed:
                 return
-            for key in removed:
-                del self._config.tabs[key]
-                self._log(f"🗑 已删除空标签页 {key}")
-            self._renumber_tabs()
-            self._save_config()
+            self._remove_tabs(removed, reason="删除空标签页")
             self._rebuild_table()
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
@@ -4447,11 +4498,7 @@ class MainWindow(QMainWindow):
             )
             if reply != QMessageBox.Yes:
                 return
-            for key in frozen_keys:
-                del self._config.tabs[key]
-                self._log(f"🗑 已删除已完成标签页 {key}")
-            self._renumber_tabs()
-            self._save_config()
+            self._remove_tabs(frozen_keys, reason="删除已完成订单")
             self._rebuild_table()
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
@@ -8384,6 +8431,11 @@ class MainWindow(QMainWindow):
         # 全部就绪
         if not ready_tasks:
             return
+        # 🔴-B2 兜底：tab_key 指向的标签页已被删除、或被重编号后的**另一个**标签页接管
+        # → 丢弃旧 key（否则会把别的订单的文件当本单打印），按 ready 重建标签页。
+        if st["tab_key"] and not self._scheduled_tab_still_owns(order_id, st["tab_key"]):
+            self._log(f"⚠ 预约单 #{order_id}: 标签页 {st['tab_key']} 已失效，重新建立标签页")
+            st["tab_key"] = None
         if not st["tab_key"]:
             # 首次全部就绪 → 创建标签页（后续新增文件追加；2026-12 后台创建，不切换前台）。
             # 注意：预约单不走 accept_order（会误把父订单标成 accepted），
@@ -8394,10 +8446,20 @@ class MainWindow(QMainWindow):
             st["tab_key"] = self._add_cloud_tasks_to_new_tab(ready_tasks, switch_tab=False)
 
         if st["frozen"]:
-            # 冻结已解除（文件补齐）：在线等后端 start_print 重设目标；断网则 30s 自恢复
-            if not self._cloud_connected and not st["print_timer"]:
-                self._log(f"⏰ 预约单 #{order_id}: 断网自恢复，30s 后开始打印")
-                self._start_scheduled_print_timer(order_id, now + 30)
+            # 文件已全部就绪但仍在冻结：正常路径等后端 start_print 重设目标并解冻。
+            # 🔴-B3：后端只在 file_ready 那一瞬清 schedule_frozen（且要求"同一刻全部就绪"），
+            # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** —— 订单文件已齐，
+            # 却每秒被跳过、永不打印。因此无论在线/离线都要排本地自恢复定时器：
+            # 到点仍未被后端解冻 → 按已齐文件自行解冻打印（并留日志，不静默）。
+            if not st["print_timer"]:
+                if self._cloud_connected:
+                    self._log(f"⏰ 预约单 #{order_id}: 文件已齐但仍冻结，"
+                              f"{SCHEDULED_SELF_HEAL_S}s 后本地自恢复打印")
+                else:
+                    self._log(f"⏰ 预约单 #{order_id}: 断网自恢复，"
+                              f"{SCHEDULED_SELF_HEAL_S}s 后开始打印")
+                self._start_scheduled_print_timer(
+                    order_id, now + SCHEDULED_SELF_HEAL_S)
             return
 
         # 未冻结 → 排入到点打印倒计时
@@ -8440,6 +8502,14 @@ class MainWindow(QMainWindow):
                     self._cleanup_scheduled_order(order_id)
                 continue
             if not st["pending"]:
+                # 🔴-B3 兜底：冻结且文件已齐 —— 原来这里直接 continue，一旦错过那一次
+                # debounce 评估（`_evaluate_scheduled_order` 的 frozen 分支）就**永久冻死**。
+                # 每秒检查时补排本地自恢复定时器（`not st["print_timer"]` 保证只排一次）。
+                if st["frozen"] and st["ready"] and not st["print_timer"]:
+                    self._log(f"⏰ 预约单 #{order_id}: 冻结中且文件已齐，"
+                              f"{SCHEDULED_SELF_HEAL_S}s 后本地自恢复打印")
+                    self._start_scheduled_print_timer(
+                        order_id, now + SCHEDULED_SELF_HEAL_S)
                 continue
             if st["target_ts"] and now >= st["target_ts"] and not st["frozen"] and not st["delayed_sent"]:
                 self._freeze_scheduled_order(order_id, st["pending"])
@@ -8491,7 +8561,18 @@ class MainWindow(QMainWindow):
             self._cleanup_scheduled_order(order_id, reason="无就绪文件")
             return
 
+        # 🔴-B3：本地自恢复触发（后端始终未发 start_print 解冻）→ 自行解冻并打印。
+        # 走到这里 pending 必为空（上面已判），文件齐全，打印是完整的。
+        if st["frozen"]:
+            st["frozen"] = False
+            self._log(f"⏰ 预约单 #{order_id}: 后端未解冻，本地自恢复打印（文件已全部就绪）")
+
         # 确保标签页存在（2026-12：后台创建/定位，不切换当前标签页）
+        # 🔴-B2 兜底：同 _evaluate_scheduled_order —— tab_key 失效即丢弃重建，
+        # 绝不按残留的旧 key 去取 jobs（那会把别的订单的文件打印出来）。
+        if st["tab_key"] and not self._scheduled_tab_still_owns(order_id, st["tab_key"]):
+            self._log(f"⚠ 预约单 #{order_id}: 标签页 {st['tab_key']} 已失效，重新建立标签页")
+            st["tab_key"] = None
         if not st["tab_key"]:
             for t in ready_tasks:
                 self._mark_processed_task(t.task_id)
