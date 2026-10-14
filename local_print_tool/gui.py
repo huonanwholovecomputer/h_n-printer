@@ -9493,7 +9493,10 @@ class MainWindow(QMainWindow):
             # 只为**本次新增**的行启动预转换（rows_before 之前的行上次已处理过）。
             # 原先遍历整个 jobs ⇒ 添加第 N 个文件时把前 N-1 个全部重新渲染一遍（O(n²)，
             # 现场：7 个图片渲染 18+ 次、首个文件 50 秒内被渲染 4 次）。
-            for i, job in enumerate(jobs):
+            for i in range(rows_before, len(jobs)):
+                job = jobs[i]
                 ext = os.path.splitext(job.file_path)[1].lower()
                 if ext != ".pdf":
+                    # 所有非 PDF 文件都在添加时预转换为 PDF 并缓存（图片/TXT/Word 等）
+                    # 这样崩溃恢复后即使源文件不可用，缓存 PDF 仍可用于打印
                     self._start_convert_worker(i, job.file_path, job.engine)
