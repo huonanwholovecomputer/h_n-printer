@@ -1919,28 +1919,49 @@ class PrintWorker(QThread):
                     fail_count += 1
                     self._cleanup_temp_pdf(job, temp_pdf)
             else:
-                # 按装订方向分组：同批必须用同一个旋转补偿（长边补偿 180°、短边不补偿）。
-                # 一般整批同向 → 一批一次翻纸；长短边混排才拆成两批（翻两次，并记日志）。
-                groups: dict[bool, list] = {}
-                for it in deferred:
-                    groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
-                if len(groups) > 1:
-                    self.log_message.emit(f"⚠ 本批存在两种装订方向，将分 {len(groups)} 次翻纸")
-                for rotate, items in groups.items():
-                    self.log_message.emit(
-                        f"▶ 手动双面批次：{len(items)} 个文件，"
-                        f"{'长边（第 2 趟内容旋转 180°）' if rotate else '短边（第 2 趟内容不旋转）'}"
-                        f" —— 整批只翻一次纸")
-                    ok_b, msg_b, sides_b = self._print_manual_batch(
-                        items, rotate, offset_sides, total_sides)
-                    for _idx, _job, _p, _t in items:
-                        self.job_finished.emit(_idx, ok_b, msg_b)
-                        if ok_b:
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                    self.log_message.emit(f"  {'✓' if ok_b else '✗'} {msg_b}")
-                    offset_sides += sides_b
+                # 已发过 job_finished 的任务号：异常兜底时只补发**没报过的**，避免重复回报
+                # （重复回报会让主线程把同一个任务结算两次）。
+                reported: set[int] = set()
+                try:
+                    # 按装订方向分组：同批必须用同一个旋转补偿（长边补偿 180°、短边不补偿）。
+                    # 一般整批同向 → 一批一次翻纸；长短边混排才拆成两批（翻两次，并记日志）。
+                    groups: dict[bool, list] = {}
+                    for it in deferred:
+                        groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
+                    if len(groups) > 1:
+                        self.log_message.emit(
+                            f"⚠ 本批存在两种装订方向，将分 {len(groups)} 次翻纸")
+                    for rotate, items in groups.items():
+                        self.log_message.emit(
+                            f"▶ 手动双面批次：{len(items)} 个文件，"
+                            f"{'长边（第 2 趟内容旋转 180°）' if rotate else '短边（第 2 趟内容不旋转）'}"
+                            f" —— 整批只翻一次纸")
+                        ok_b, msg_b, sides_b = self._print_manual_batch(
+                            items, rotate, offset_sides, total_sides)
+                        for _idx, _job, _p, _t in items:
+                            self.job_finished.emit(_idx, ok_b, msg_b)
+                            reported.add(_idx)
+                            if ok_b:
+                                success_count += 1
+                            else:
+                                fail_count += 1
+                        self.log_message.emit(f"  {'✓' if ok_b else '✗'} {msg_b}")
+                        offset_sides += sides_b
+                except Exception as e:
+                    # ── **总兜底**：异常绝不能逃出 run() ──
+                    # 逃出去之后 job_finished / all_finished 一个都不发，主线程收不到收尾
+                    # 信号 ⇒ 标签页永久停在"打印中"（用户只能重启工具），而日志里只剩
+                    # traceback、没有可读原因。宁可整批判失败，也要把信号发全。
+                    emsg = f"手动双面批次异常：{type(e).__name__}: {e}"
+                    self.log_message.emit(f"  ✗ {emsg}")
+                    for _idx, _job, _p, temp_pdf in deferred:
+                        if _idx in reported:
+                            continue
+                        reported.add(_idx)
+                        fail_count += 1
+                        self.job_finished.emit(_idx, False, emsg)
+                        # 兜底清理（批次自己的 finally 已经清过；这里防"还没进批次就炸"）
+                        self._cleanup_temp_pdf(_job, temp_pdf)
 
         self.progress.emit(total_sides, total_sides, "全部完成")
         self.all_finished.emit(success_count, fail_count)

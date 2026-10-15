@@ -42,6 +42,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 _app = QApplication.instance() or QApplication([])
 
 import gui  # noqa: E402
+import pdf_printer  # noqa: E402
 from printer_config import PrinterConfig, PrintJob, PrinterProfile  # noqa: E402
 
 ok_all = True
@@ -99,11 +100,25 @@ class Rec:
         self.plan_labels = []    # [{sheets:[(标签,a,b)], slots:{纸序:标签}}]
         self.plan = []           # [(第 1 趟张数, 预估秒数)] —— 批次开始播报
         self.samples = []        # [(第 1 趟张数, 实测秒数)] —— 自动学习样本
+        self.all_finished = []   # [(成功数, 失败数)]
+        self.raised = None       # worker.run() 逃出来的异常（None = 干净退出）
 
 
-def patched(rec):
+def patched(rec, fail_merge_at=None):
     orig = {n: getattr(gui, n) for n in
             ("print_pdf", "print_plan_pass", "wait_for_output", "get_converter")}
+    orig_merge = pdf_printer.merge_pdfs
+    _calls = {"n": 0}
+
+    def _merge(pdfs, out):
+        # 批次合并是**真的**在合并（测试素材是真 PDF）；fail_merge_at 用来模拟
+        # "合并/写盘炸了"（磁盘满、文件被占），验证并批路径的总兜底。
+        _calls["n"] += 1
+        if fail_merge_at is not None and _calls["n"] == fail_merge_at:
+            raise RuntimeError("桩：合并 PDF 时炸了")
+        return orig_merge(pdfs, out)
+
+    pdf_printer.merge_pdfs = _merge
 
     def _print_pdf(**kw):
         rec.print_pdf.append(kw)
@@ -139,6 +154,7 @@ def patched(rec):
     def restore():
         for k, v in orig.items():
             setattr(gui, k, v)
+        pdf_printer.merge_pdfs = orig_merge
     return restore
 
 
@@ -148,7 +164,7 @@ def make_job(path, duplex="on", copies=1, mode="long-edge", name=""):
 
 
 def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
-               cover=False):
+               cover=False, fail_merge_at=None):
     rec = Rec()
     w = gui.PrintWorker(jobs=jobs, printer_name="Fake Print", duplex_mode="long-edge",
                         keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=profile,
@@ -161,6 +177,7 @@ def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
     w.log_message.connect(rec.logs.append)
     w.progress.connect(lambda c, t, s: rec.progress.append((c, t, s)))
     w.job_finished.connect(lambda i, ok, msg: rec.finished.append((i, ok, msg)))
+    w.all_finished.connect(lambda a, b: rec.all_finished.append((a, b)))
     w.duplex_announce.connect(rec.announce.append)
     w.duplex_finished.connect(lambda _t: setattr(rec, "finished_evt", rec.finished_evt + 1))
     if on_announce is not None:
@@ -168,10 +185,12 @@ def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
     if flip_answer is not None:
         w.flip_required.connect(
             lambda text, sec: (rec.flip.append(text), w.confirm_flip(flip_answer)))
-    restore = patched(rec)
+    restore = patched(rec, fail_merge_at=fail_merge_at)
     t0 = time.time()
     try:
         w.run()
+    except BaseException as e:          # 异常逃出 run() 本身就是被测行为，不能让它炸掉脚本
+        rec.raised = e
     finally:
         restore()
     rec.elapsed = time.time() - t0
@@ -343,6 +362,31 @@ check("★ 首页 + 手动双面：翻纸文案要含首页那张（本批 3 + �
 check("★ 首页 + 手动双面：文案明确「首页那张不要一起搬」（否则首页留在纸盘里被当白纸用掉）",
       "下面 1 张" in rec_cov.flip[0] and "只取出最上面 3 张" in rec_cov.flip[0],
       f"{rec_cov.flip[0][:220]}…")
+
+# ── ①i 并批路径的总兜底：批次里抛异常也必须把信号发全（否则标签页永久 🔒）──
+# run() 的并批段落原先没有 except（`_print_manual_batch` 只有 try/finally）：
+# 异常一旦逃出 run()，job_finished / all_finished 一个都不发，主线程收不到收尾信号，
+# 标签页会一直停在"打印中"（用户只能重启工具），日志里也只剩 traceback、没有可读原因。
+rec_bad = run_worker([make_job(PDF5, name="A.docx")], MANUAL, fail_merge_at=1)
+check("★ 并批异常：绝不允许逃出 run()（逃出去就没人发收尾信号了）",
+      rec_bad.raised is None, f"{rec_bad.raised!r}")
+check("★ 并批异常：任务收到失败回报 + all_finished 报 (0,1)（标签页不会永久 🔒）",
+      len(rec_bad.finished) == 1 and rec_bad.finished[0][:2] == (0, False)
+      and rec_bad.all_finished == [(0, 1)],
+      f"{rec_bad.finished} {rec_bad.all_finished}")
+check("★ 并批异常：日志里有一条可读失败原因（不只 traceback）",
+      any("手动双面批次异常" in m for m in rec_bad.logs),
+      f"{[m for m in rec_bad.logs if '异常' in m]}")
+
+# 第 2 批才炸：已成功的第 1 批不能重复回报，失败也只报一次
+rec_bad2 = run_worker([make_job(PDF5, mode="long-edge", name="L.docx"),
+                       make_job(PDF3, mode="short-edge", name="S.docx")],
+                      MANUAL, fail_merge_at=2)
+check("★ 并批异常·第 2 批才炸：成功的那批照常回报，失败只报一次、不重复",
+      rec_bad2.raised is None
+      and [(i, ok) for i, ok, _m in rec_bad2.finished] == [(0, True), (1, False)]
+      and rec_bad2.all_finished == [(1, 1)],
+      f"{rec_bad2.finished} {rec_bad2.all_finished}")
 
 # ============================================================
 # ② 跳过（第 1 趟出纸后）→ 第 2 趟绝不打
