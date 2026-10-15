@@ -224,13 +224,53 @@ def _copy_to_temp(file_path: str) -> str:
 
 # CSV 单元格中的控制字符（\x00-\x08、\x0b、\x0c、\x0e-\x1f），reportlab Paragraph 会因此抛错
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# 文本文件的 BOM 表（**长 BOM 必须排在前**：UTF-32LE 的 BOM 以 UTF-16LE 的 BOM
+#   「\xff\xfe」为前缀，先判短的会让 UTF-32 被半路截胡、读出 \x00 打头的乱码）。
+_TEXT_BOMS = (
+    (b"\xff\xfe\x00\x00", "utf-32"),   # UTF-32 LE
+    (b"\x00\x00\xfe\xff", "utf-32"),   # UTF-32 BE
+    (b"\xff\xfe", "utf-16"),           # UTF-16 LE
+    (b"\xfe\xff", "utf-16"),           # UTF-16 BE
+)
 
 
 def _read_text_auto(file_path: str) -> str:
-    """自动探测编码读取文本文件：utf-8-sig（顺带剥离 BOM）→ gbk → latin-1(替换)。
+    """自动探测编码读取文本文件：BOM（UTF-16/32）→ utf-8-sig → gbk → latin-1(替换)。
 
     解决 GBK/UTF-16/带 BOM 文本乱码问题；latin-1 兜底永不失败，无法解码的字节替换。
+    无 BOM 的 UTF-16 另按「原始字节里的 NUL 分布」识别（见 ②）。
     """
+    # ① 先嗅探原始字节决定编码，**必须在编码链之前**：UTF-16/32 的文件若走 utf-8/gbk，
+    #    只会解出带 NUL 的乱码（带 BOM 的会落进 latin-1 兜底并打个警告，**无 BOM 的
+    #    连警告都没有** —— utf-8 解码器认为那些字节全都合法）。按长→短匹配 BOM，
+    #    UTF-32 才不会被 UTF-16 截胡。
+    try:
+        with open(file_path, "rb") as f:
+            raw = f.read(8192)
+    except OSError:
+        raw = b""
+    enc = None
+    for bom, _e in _TEXT_BOMS:
+        if raw.startswith(bom):
+            enc = _e
+            break
+    # ② 无 BOM 的 UTF-16：看整段字节里 NUL 的分布（UTF-16 的 ASCII 字符 = 字符 + \x00）。
+    #    小端把 \x00 放在**奇数位**、大端放在偶数位；用切片 + bytes.count（C 层，够快）。
+    #    ⚠ 已知未覆盖：**纯中文且无 BOM** 的 UTF-16（整段没有一个 \x00，此处判不出来，
+    #    会退到 latin-1 乱码）—— 现实里这类文件几乎都带 BOM（记事本 / Excel 导出均带）。
+    if enc is None and b"\x00" in raw:
+        odd = raw[1::2].count(0)
+        even = raw[0::2].count(0)
+        pairs = len(raw) // 2
+        if pairs and (odd * 2 > pairs or even * 2 > pairs):
+            enc = "utf-16-le" if odd >= even else "utf-16-be"
+    # ③ 按选定的编码用**文本模式**读（保留通用换行转换，与历史行为一致）
+    if enc:
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            pass
     # 先 UTF-8（utf-8-sig 顺带剥离 BOM）
     try:
         with open(file_path, "r", encoding="utf-8-sig") as f:

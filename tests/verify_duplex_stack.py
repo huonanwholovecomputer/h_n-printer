@@ -352,6 +352,34 @@ try:
     st_no_entry = ds.DuplexStack.from_dict({"rotate": "yes", "reverse_second": "x"})
     check("没有单时 rotate 为 None（未定方向）",
           st_no_entry.rotate is None and st_no_entry.reverse_second is True)
+
+    # StackEntry.rotate 的三态容错（D5：这里原先写的是 bool(d.get("rotate", True))）：
+    # 清单被写坏成 null / "" 时 bool() 给 False，而 rotate 的**危险默认值是 True**
+    # ——False 意味着整叠第 2 趟不做 180° 补偿，每张纸背面整体倒置，且**静默无提示**。
+    # 同文件的 _bool_or 正是为这类三态布尔写的（reverse_second 已用它），此处必须一致。
+    _e_null = ds.StackEntry.from_dict({"rotate": None})
+    _e_empty = ds.StackEntry.from_dict({"rotate": ""})
+    _e_str = ds.StackEntry.from_dict({"rotate": "no"})
+    _e_miss = ds.StackEntry.from_dict({})
+    _e_zero = ds.StackEntry.from_dict({"rotate": 0})
+    _e_one = ds.StackEntry.from_dict({"rotate": 1})
+    _e_false = ds.StackEntry.from_dict({"rotate": False})
+    check("StackEntry.rotate 三态容错：null/空串/非 0-1 回落 True（危险默认值），"
+          "bool 与 0/1 照常认",
+          _e_null.rotate is True and _e_empty.rotate is True and _e_str.rotate is True
+          and _e_miss.rotate is True and _e_zero.rotate is False
+          and _e_one.rotate is True and _e_false.rotate is False,
+          "null=%s 空串=%s str=%s 缺=%s 0=%s 1=%s False=%s"
+          % (_e_null.rotate, _e_empty.rotate, _e_str.rotate, _e_miss.rotate,
+             _e_zero.rotate, _e_one.rotate, _e_false.rotate))
+
+    # 端到端：坏 rotate 会把整叠方向也带偏（StackState.from_dict 取第一单的 rotate 定方向）
+    _st_null = ds.DuplexStack.from_dict({
+        "entries": [{"seq": 1, "rotate": None,
+                     "file_plans": [{"label": "A", "pages": [1, 2]}]}]})
+    check("清单里 rotate 被写坏成 null -> 整叠方向仍取 True（否则第 2 趟背面全倒置）",
+          _st_null.rotate is True and _st_null.entries[0].rotate is True,
+          "st.rotate=%r entry.rotate=%r" % (_st_null.rotate, _st_null.entries[0].rotate))
     check("坏页数的文件计划整条丢弃（宁可存疑也不留半截页序）",
           st_bad.entries[0].file_plans == [],
           f"{st_bad.entries[0].file_plans}")

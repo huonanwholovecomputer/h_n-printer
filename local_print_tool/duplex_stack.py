@@ -224,7 +224,10 @@ class StackEntry:
             page_count=int(d.get("page_count", 0) or 0),
             sheet_count=int(d.get("sheet_count", 0) or 0),
             state=str(d.get("state", STATE_PRINTING) or STATE_PRINTING),
-            rotate=bool(d.get("rotate", True)),
+            # 三态布尔：坏值（null / "" / 其它）必须回落 True —— 这是**危险默认值**。
+            #   False 意味着整叠第 2 趟不做 180° 补偿、每张纸背面整体倒置，而且静默无提示。
+            #   用 bool() 会让 null 静默变成 False（与同文件 reverse_second 的规则也不一致）。
+            rotate=_bool_or(d.get("rotate"), True),
             created_at=str(d.get("created_at", "") or ""),
             pdf=str(d.get("pdf", "") or ""),
             file_plans=plans,
