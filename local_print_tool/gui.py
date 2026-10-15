@@ -1170,6 +1170,12 @@ class PrintWorker(QThread):
         # 翻纸回执：worker 发信号 → 主线程弹窗 → confirm_flip() 置事件
         self._flip_event = threading.Event()
         self._flip_continue = False
+        # 出纸槽张数台账（本轮打印累计）：手动双面**批次之前**的直打作业（单面文件、
+        # 首页）会先落在托盘里、压在本批下面。翻纸文案必须把它算进去，否则操作员照
+        # "应有 N 张"永远数不够（判据失效），或者照"取出纸叠"把**整叠**搬进纸盘 2 ——
+        # 多出来的纸就留在纸盘里、被后续作业当白纸用掉（文件静默丢失，零日志零报错）。
+        # 现场：2026-10-15 订单 HN20261015-0008（照片先直打 + 申请书手动双面）。
+        self._tray_sheets = 0
 
     # 翻纸提示的超时（秒）：主线程的弹窗自带倒计时，这里只多留一点余量兜底，
     # 保证 GUI 万一没响应时 worker 也不会永久挂住。
@@ -1205,22 +1211,40 @@ class PrintWorker(QThread):
         except Exception:
             return 0.0
 
-    def _ask_operator_to_flip(self, plan) -> bool:
-        """请操作员翻纸：发信号 → 等主线程回执。超时/取消/跳过都返回 False。"""
+    def _ask_operator_to_flip(self, plan, tray_foreign: int = 0) -> bool:
+        """请操作员翻纸：发信号 → 等主线程回执。超时/取消/跳过都返回 False。
+
+        tray_foreign：本轮打印在**本批之前**已落进出纸槽、还压在本批下面的张数
+        （直打的单面文件 / 首页 / 上一批）。>0 时文案必须把"槽里总数"与"只翻最上面
+        N 张"说清楚 —— 否则操作员照"从出纸槽中取出纸叠"整叠搬进纸盘 2，多出来的纸
+        就永远出不来了（被后续作业当白纸用掉，且全程无任何日志）。
+        """
         if self._cancelled:
             return False
         first_pages = " ".join("空白" if p is None else str(p) for p in plan.pass_pages(1))
         second_pages = " ".join("空白" if p is None else str(p) for p in plan.pass_pages(2))
+        n = int(plan.sheet_count)
+        foreign = max(0, int(tray_foreign or 0))
+        if foreign <= 0:
+            # 出纸槽里只有本批的纸 —— 保持原文案（最常见的情形，一个字都不改）
+            head = (f"第 1 趟已完成：出纸槽里应有 {n} 张纸"
+                    f"（本趟打的是 {first_pages}）—— 数够再点继续。\n\n")
+            step1 = "  1. 不改变方向，从出纸槽中取出纸叠。不要丢弃空白页面。\n"
+        else:
+            head = (f"第 1 趟已完成：出纸槽里共应有 {n + foreign} 张纸 —— 最上面 {n} 张是"
+                    f"本批的（本趟打的是 {first_pages}），下面 {foreign} 张是本次一起打出的"
+                    f"其它文件，**不属于本批、不要一起搬走**。\n\n")
+            step1 = (f"  1. 不改变方向，从出纸槽中**只取出最上面 {n} 张**"
+                     f"（下面那 {foreign} 张留在出纸槽里）。不要丢弃空白页面。\n")
         text = (
-            f"第 1 趟已完成：出纸槽里应有 {plan.sheet_count} 张纸"
-            f"（本趟打的是 {first_pages}）—— 数够再点继续。\n\n"
-            "请按下面三步操作（原文来自 HP 驱动「双面打印说明」弹窗）：\n"
-            "  1. 不改变方向，从出纸槽中取出纸叠。不要丢弃空白页面。\n"
-            "  2. 保持相同方向，将纸叠插入纸盘 2，使已打印面朝下。\n"
-            "     （不要翻面、不要重排）\n"
-            f"  3. 点「继续打第 2 趟」——随后打印 {second_pages}。\n\n"
-            "⚠ 翻纸期间不要让别的打印任务插进来（其它程序的手动打印、本工具别的任务都算）：\n"
-            "   第 2 趟要接着这叠纸打，中间插单就会串页。"
+            head
+            + "请按下面三步操作（原文来自 HP 驱动「双面打印说明」弹窗）：\n"
+            + step1
+            + "  2. 保持相同方向，将纸叠插入纸盘 2，使已打印面朝下。\n"
+            + "     （不要翻面、不要重排）\n"
+            + f"  3. 点「继续打第 2 趟」——随后打印 {second_pages}。\n\n"
+            + "⚠ 翻纸期间不要让别的打印任务插进来（其它程序的手动打印、本工具别的任务都算）：\n"
+            + "   第 2 趟要接着这叠纸打，中间插单就会串页。"
         )
         self._flip_continue = False
         self.log_message.emit(f"⏸ 等待人工翻纸（最多 {self.FLIP_TIMEOUT_SEC // 60} 分钟）…")
@@ -1260,6 +1284,36 @@ class PrintWorker(QThread):
             job.duplex_mode or self._duplex_mode,
         )
 
+    def _sheets_of_job(self, job: PrintJob, copies: int, print_path: str = "") -> int:
+        """本任务会往出纸槽里放几张纸（台账用：翻纸文案要说清"槽里共几张"）。
+
+        单面 n 页 = n 张；双面 n 页 = ceil(n/2) 张 —— 但**只有驱动真的替我们双面时**
+        才算半张：本机档案明确 auto_duplex=False 时驱动不会双面，每页还是各占一张纸，
+        照 ceil 算会**少算**。能力未知（没有档案）时按"会双面"算 —— 宁可少报
+        （操作员数到的只多不少），也不要多报（多报会让"数够再翻"永远数不够）。
+
+        页数未知（云端任务还没分析出来）时**现数一遍实际打印的那个 PDF**，与 run()
+        预估进度用的口径一致 —— 否则会按 1 页估，台账少算、文案又把人带偏。
+        """
+        n_pages = max(1, int(job.page_count or 0))
+        if job.page_count <= 0:
+            for _p in (print_path, job.file_path, job.cached_pdf):
+                try:
+                    if _p and os.path.isfile(_p) and str(_p).lower().endswith(".pdf"):
+                        n_pages = max(1, count_pdf_pages(_p))
+                        break
+                except Exception:
+                    pass
+        try:
+            n_sel = _count_pages_in_range(job.page_range or "", n_pages) or n_pages
+        except Exception:
+            n_sel = n_pages
+        p = self._manual_profile
+        driver_duplex = bool(p is None or p.auto_duplex)
+        return duplex_stack.sheets_for(
+            n_sel, (job.duplex or "off") == "on" and driver_duplex,
+            max(1, int(copies or 1)))
+
     def _cleanup_temp_pdf(self, job: PrintJob, temp_pdf: Optional[str]) -> None:
         """清理转换出的临时 PDF（keep_temp_pdf 时先复制一份到桌面）。缓存的 PDF 不删。"""
         if not temp_pdf or not os.path.isfile(temp_pdf):
@@ -1281,14 +1335,22 @@ class PrintWorker(QThread):
     def _fmt_pages(seq) -> str:
         return " ".join("〔空白〕" if x is None else str(x) for x in seq)
 
-    def _duplex_announce_text(self, items, plan, rotate: bool) -> str:
+    def _duplex_announce_text(self, items, plan, rotate: bool, tray_foreign: int = 0) -> str:
         names = "、".join((j.display_name or os.path.basename(j.file_path)) for _i, j, _p, _t in items)
+        foreign = max(0, int(tray_foreign or 0))
+        warn = ""
+        if foreign > 0:
+            # 常驻窗在第 1 趟**打印期间**就显示 → 操作员能提前知道槽里还有别的纸
+            warn = ("\n⚠ 出纸槽里已经压着本次一起打出的 "
+                    f"{foreign} 张纸（单面文件/首页，不属于本批）：翻纸时**只取本批的 "
+                    f"{plan.sheet_count} 张**（在最上面），别把下面的一起搬进纸盘 2。")
         return (
             f"本批 {len(items)} 个文件需手动双面：{names}\n"
             f"共 {plan.sheet_count} 张纸 —— 程序自己分两趟打（全程单面），中途只需翻一次纸。\n\n"
             f"第 1 趟（现在打）：{self._fmt_pages(plan.pass_pages(1))}\n"
             f"第 2 趟（翻纸后打）：{self._fmt_pages(plan.pass_pages(2))}\n"
             f"（第 2 趟内容{'旋转 180° 补偿' if rotate else '不旋转'}）"
+            + warn
         )
 
     def _print_manual_batch(self, items, rotate: bool, base_offset: int,
@@ -1329,6 +1391,9 @@ class PrintWorker(QThread):
             plan = manual_duplex.plan_passes(file_plans, copies=1, first=p.first,
                                              reverse_second=p.reverse_second)
             n1 = len(plan.first_pass)
+            # 本轮**本批之前**已经落在出纸槽里、还压在本批下面的张数（直打的单面文件 /
+            # 首页 / 上一批）。翻纸文案与"取出哪几张"都要靠它 —— 见 _ask_operator_to_flip。
+            tray_foreign = max(0, int(getattr(self, "_tray_sheets", 0) or 0))
             self.log_message.emit(
                 f"  → 手动双面批次：{len(items)} 个文件 → {plan.sheet_count} 张纸，"
                 f"**一次翻纸**打两趟（{p.first}/{'逆序' if p.reverse_second else '正序'}/"
@@ -1336,7 +1401,8 @@ class PrintWorker(QThread):
             self.log_message.emit(f"     第 1 趟: {self._fmt_pages(plan.pass_pages(1))}")
             self.log_message.emit(f"     第 2 趟: {self._fmt_pages(plan.pass_pages(2))}")
             self.duplex_plan.emit(plan.sheet_count, self._estimate_first_pass(plan.sheet_count))
-            self.duplex_announce.emit(self._duplex_announce_text(items, plan, rotate))
+            self.duplex_announce.emit(
+                self._duplex_announce_text(items, plan, rotate, tray_foreign))
 
             def _cb(base: int, slots):
                 def _on_side(cur: int, _total: int):
@@ -1354,13 +1420,22 @@ class PrintWorker(QThread):
                                         progress_callback=_cb(base_offset, map1))
             if not ok1:
                 return False, f"手动双面第 1 趟失败: {msg1}", n1
+            # 第 1 趟的纸已经压进出纸槽了：台账往前推 —— 下一批（长短边混排拆出的第 2 批）
+            # 翻纸时就该把这一批的纸算成"槽里已有的"
+            self._tray_sheets = tray_foreign + plan.sheet_count
             if self._cancelled:
                 return False, "已取消", n1
 
             w = wait_for_output(self._printer_name, pages=n1)
-            self.log_message.emit(
-                f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
-                f"出纸槽里应有 {plan.sheet_count} 张纸，请数够再翻")
+            if tray_foreign > 0:
+                self.log_message.emit(
+                    f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
+                    f"出纸槽里共应有 {plan.sheet_count + tray_foreign} 张纸 —— 最上面 "
+                    f"{plan.sheet_count} 张是本批的，下面 {tray_foreign} 张不要动")
+            else:
+                self.log_message.emit(
+                    f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
+                    f"出纸槽里应有 {plan.sheet_count} 张纸，请数够再翻")
             # 第 1 趟实测 = **权威时刻**：起点在第 1 趟开打前、终点在"纸出完"（下一行才开始等人翻纸），
             # 所以操作员按不按「继续」都不影响它，不会越等越长。扣掉我们自己加的静置余量
             # （那段是保守等待，不是打印机花的时间）。异常样本由 add_speed_sample 内部丢弃。
@@ -1373,7 +1448,7 @@ class PrintWorker(QThread):
                 # （界面自己那个时钟只做兜底：信号没到（异常路径）时它照样能冻结）
                 self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
 
-            if not self._ask_operator_to_flip(plan):
+            if not self._ask_operator_to_flip(plan, tray_foreign):
                 if self._cancelled:
                     return False, f"已取消（第 1 趟已打出 {plan.sheet_count} 张纸，纸叠是半成品）", n1
                 return False, (f"手动双面未完成：第 1 趟已打出（{plan.sheet_count} 张纸、"
@@ -1552,6 +1627,8 @@ class PrintWorker(QThread):
 
     def run(self):
         """线程主函数：统一 PDF 打印流程（GDI 优先），精确到每面的进度条。"""
+        # 本轮打印的出纸槽台账归零（批次之前的直打作业会往上累加，见 _sheets_of_job）
+        self._tray_sheets = 0
         try:
             self._converter = get_converter()
             task_count = len(self._jobs)
@@ -1656,6 +1733,8 @@ class PrintWorker(QThread):
                         )
                         if cover_ok:
                             self.log_message.emit(f"  ✓ 首页: {cover_msg}")
+                            # 首页也是单独一张纸、压在随后那个手动双面批次下面
+                            self._tray_sheets += 1
                         else:
                             self.log_message.emit(f"  ✗ 首页打印失败: {cover_msg}")
                 else:
@@ -1776,6 +1855,9 @@ class PrintWorker(QThread):
                 if ok:
                     self.log_message.emit(f"  ✓ {msg}")
                     success_count += 1
+                    # 这份纸已经落在出纸槽里了 → 记进台账：后面的手动双面批次翻纸时要靠它
+                    # 算清"槽里到底有几张"（算少了操作员就会把不属于本批的纸一起搬走）
+                    self._tray_sheets += self._sheets_of_job(job, copies, print_path)
                 else:
                     self.log_message.emit(f"  ✗ 打印失败: {msg}")
                     fail_count += 1

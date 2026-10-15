@@ -147,10 +147,14 @@ def make_job(path, duplex="on", copies=1, mode="long-edge", name=""):
                     page_range="", page_count=0, display_name=name or os.path.basename(path))
 
 
-def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None):
+def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
+               cover=False):
     rec = Rec()
     w = gui.PrintWorker(jobs=jobs, printer_name="Fake Print", duplex_mode="long-edge",
-                        keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=profile)
+                        keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=profile,
+                        cover_page=cover,
+                        cover_page_config={"order_number": "HN20261015-0008",
+                                           "created_at": "2026-10-15 21:51:00"})
     if timeout is not None:
         w.FLIP_TIMEOUT_SEC = timeout
         w.FLIP_GRACE_SEC = 0
@@ -289,8 +293,56 @@ check("混排：单面文件照旧一次提交（走驱动/单面路径）",
 check("混排：三个任务都有完成回报", sorted(i for i, _ok, _m in rec.finished) == [0, 1, 2],
       f"{rec.finished}")
 check("混排：双面批次的页序只含两个双面文件（5+1=6 页 → 4 张纸）",
-      rec.plan_pass[0][3] == [1, 3, 5, 6] and "应有 4 张纸" in rec.flip[0],
+      rec.plan_pass[0][3] == [1, 3, 5, 6],
       f"{rec.plan_pass[0][3]}")
+
+# ── 翻纸文案的"槽里几张"必须算上批次**之前**已直打的单面文件（2026-10-15 生产故障）──
+# 现场订单 HN20261015-0008：JPG（1 页横向、duplex=off）单独直打 + docx（3 页、手动双面）
+# 进批次。翻纸窗只报本批的 2 张，而槽里实际有 3 张；操作员照"从出纸槽中取出纸叠"把
+# **整叠**搬进纸盘 2 ⇒ 多出来那张留在纸盘里、被后续作业当白纸用掉 —— 文件静默丢失。
+# （spooler 硬证据：PrintService/Operational 的 842 显示照片那个作业 21:51:29 入队、
+#   21:51:49 已交打印处理器，而批次第 1 趟的翻纸窗 21:52:09 才弹。）
+check("★ 混排·翻纸文案要报槽里的**总数** 7 张（本批 4 + 之前直打的单面 3）",
+      "7 张" in rec.flip[0], f"{rec.flip[0][:100]}…")
+check("★ 混排·并指明本批是「最上面 4 张」、另外 3 张别一起搬（一起搬就丢纸）",
+      "最上面" in rec.flip[0] and "4 张" in rec.flip[0] and "3 张" in rec.flip[0],
+      f"{rec.flip[0][:180]}…")
+check("★ 混排·旧的裸断言「出纸槽里应有 4 张纸」必须消失（现场就是被它带偏的）",
+      "出纸槽里应有 4 张纸" not in rec.flip[0])
+check("★ 混排·日志同样报槽里共 7 张", "共应有 7 张纸" in "".join(rec.logs),
+      f"{[m for m in rec.logs if '出纸槽' in m]}")
+check("★ 混排·常驻窗（批次开始就显示）也预告槽里已有 3 张",
+      bool(rec.announce) and "3 张" in rec.announce[0], f"{rec.announce[:1]}")
+
+# 纯批次（本轮没有任何直打的单面文件）→ 文案保持原样，不引入多余警告（零回归）
+rec_pure = run_worker([make_job(PDF5, name="A.docx"), make_job(PDF3, name="B.docx")], MANUAL)
+check("★ 纯批次：文案仍是「出纸槽里应有 5 张纸」原样（5 页→3 张 + 3 页→2 张）",
+      "出纸槽里应有 5 张纸" in rec_pure.flip[0] and "最上面" not in rec_pure.flip[0],
+      f"{rec_pure.flip[0][:80]}…")
+
+# 装订方向混排 → 拆两批；第 2 批翻纸时第 1 批的纸也还在槽里，同样必须算进去
+rec_grp = run_worker([make_job(PDF5, mode="long-edge", name="L.docx"),
+                      make_job(PDF3, mode="short-edge", name="S.docx")], MANUAL)
+check("★ 装订方向混排 → 拆两批、翻两次纸", len(rec_grp.flip) == 2, f"{len(rec_grp.flip)}")
+check("第 1 批翻纸时槽里是空的 → 保持原文案",
+      "出纸槽里应有 3 张纸" in rec_grp.flip[0] and "最上面" not in rec_grp.flip[0],
+      f"{rec_grp.flip[0][:80]}…")
+check("★ 第 2 批翻纸：本批 2 张 + 第 1 批已出的 3 张 = 5 张，且只翻最上面 2 张",
+      "5 张" in rec_grp.flip[1] and "最上面 2 张" in rec_grp.flip[1],
+      f"{rec_grp.flip[1][:180]}…")
+
+# 首页（封面页）：非攒批时它同样是"单独打一张再进批次"⇒ 同一机制。
+# docs/审查报告_2026-10/findings_B_gui_print.md:183 记的就是这条，且此前**只有攒批那条有守卫**。
+rec_cov = run_worker([make_job(PDF5, name="A.docx")], MANUAL, cover=True)
+check("首页（封面页）确实单独打了一张（非攒批路径）",
+      len(rec_cov.print_pdf) == 1 and rec_cov.print_pdf[0]["duplex"] == "off",
+      f"{[(c.get('duplex')) for c in rec_cov.print_pdf]}")
+check("★ 首页 + 手动双面：翻纸文案要含首页那张（本批 3 + 首页 1 = 共 4 张）",
+      "共应有 4 张纸" in rec_cov.flip[0] and "最上面 3 张" in rec_cov.flip[0],
+      f"{rec_cov.flip[0][:180]}…")
+check("★ 首页 + 手动双面：文案明确「首页那张不要一起搬」（否则首页留在纸盘里被当白纸用掉）",
+      "下面 1 张" in rec_cov.flip[0] and "只取出最上面 3 张" in rec_cov.flip[0],
+      f"{rec_cov.flip[0][:220]}…")
 
 # ============================================================
 # ② 跳过（第 1 趟出纸后）→ 第 2 趟绝不打
