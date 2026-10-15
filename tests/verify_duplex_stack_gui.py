@@ -790,8 +790,16 @@ check("云客户端：report_keepalive 发 print_keepalive（不写状态栏，�
 check("后端：print_keepalive 事件刷新 locked_at 且只认 printing/accepted",
       "def on_print_keepalive" in APP and "print_keepalive" in APP
       and "SET locked_at = ?" in APP and "'printing', 'accepted'" in APP)
-check("后端：保活不替别的设备续命（校验 operator_client）",
-      "不是本机在打的任务" in APP)
+# ⚠ 判据要取**语义**不要取字面：原判据 grep 日志文案「不是本机在打的任务」，
+#   D3 把该处理器改成统一归属判定 `_subtask_ownership()` 后文案随之改写 ⇒ 立刻**假红**
+#   （守卫抓着的是措辞而非校验本身）。改为：抽 `on_print_keepalive` 函数体，断言里面
+#   **确实做了归属校验**（统一判定 or 显式 operator_client 比对）。
+_kp = re.search(r"(?ms)^def on_print_keepalive\(.*?(?=^def |\Z)", APP)
+_kp_body = _kp.group(0) if _kp else ""
+check("后端：保活不替别的设备续命（keepalive 里有归属校验）",
+      bool(_kp_body) and ("_subtask_ownership(" in _kp_body
+                          or re.search(r"operator_client\s*!=\s*client_id", _kp_body) is not None),
+      "on_print_keepalive 函数体里没找到归属校验")
 check("配置：duplex_stack_mode 落盘并回读",
       '"duplex_stack_mode": self.duplex_stack_mode' in PC
       and 'duplex_stack_mode=_bool_or_default(' in PC)

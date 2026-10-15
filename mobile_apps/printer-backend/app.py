@@ -205,8 +205,15 @@ _rate_limits_lock = threading.Lock()
 #   30s 防抖避免每 2s 轮询刷爆分析请求，也避免补推 + 轮询双重推送）
 _last_page_analysis_push = {}
 _last_page_analysis_push_lock = threading.Lock()
-# 页数分析推送目标 sid 记录（file_id → sid），供取消分析时精确转发
+# 页数分析推送目标记录（file_id → {"sid": …, "client_id": …}）：
+#   · sid       供取消分析时精确转发（to=sid）
+#   · client_id 供 page_count_result 的**归属判定**（🔴-D3）——sid 会随重连变化，
+#     设备分析到一半断线重连后仍应能回报，故判据取 client_id
 _analysis_push_sid = {}
+
+# 回报页数的上限（🔴-D3）：页数是计费输入（calculate_price × 份数 + 父订单回溯重算），
+# 离谱数值会炸掉价格。真机最大作业量远低于此值（A3 图纸/合订本量级也在千页内）。
+MAX_REPORTED_PAGES = 20000
 
 
 def _rate_limit(key, max_count, window_seconds):
@@ -1809,6 +1816,28 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
+    # v28 迁移：order_files 添加 last_operator_client 列（**上次**领取该子任务的设备）。
+    #   背景（🔴-D3）：事件处理器的归属校验写成「operator_client 为空即放行」，而
+    #   operator_client 会被**断线回滚**（on_disconnect）与**孤儿回收**
+    #   （recover_orphaned_printing_tasks）清空 —— 清空后任何持全局 printer token 的设备
+    #   都能把别人的任务标成功/判失败、或抢占。operator_client 一清空就丢失了归属信息，
+    #   所以另立一列专门记「上次是谁在打」，**回滚/回收都不清空**，供归属判定兜底。
+    #   与 operator_client 的区别：operator_client = 当前领取者（可被清空）；
+    #   last_operator_client = 最后一次领取者（只被新的领取动作覆盖）。
+    #   存量行照抄当前 operator_client（此刻它就是"上次领取者"）。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(order_files)").fetchall()]
+        if "last_operator_client" not in cols:
+            conn.execute("ALTER TABLE order_files ADD COLUMN last_operator_client TEXT DEFAULT ''")
+            conn.execute(
+                "UPDATE order_files SET last_operator_client = operator_client"
+                " WHERE operator_client != '' AND last_operator_client = ''"
+            )
+            conn.commit()
+            print("  已添加 order_files.last_operator_client 列（归属判定兜底，回滚不清空）")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
     # 确保历史打印机在设备注册表中（owner=姚懿祥），供「接单设备」列展示
     try:
         _dev = load_devices()
@@ -2090,8 +2119,8 @@ def fetch_and_lock_task(client_id):
             # 锁定任务并记录领取者（locked_at = 锁定时刻，P0-1：孤儿回收/超时判定以它为准，
             # 不再依赖 created_at，避免"任务被反复 push/回退导致 created_at 很旧被误回收"的循环）
             conn.execute(
-                "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ?",
-                (client_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), task_id)
+                "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ?, last_operator_client = ? WHERE id = ?",
+                (client_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), client_id, task_id)
             )
             # 刷新父订单聚合状态
             parent_row = conn.execute(
@@ -2348,13 +2377,13 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if scheduled_download:
                 cur = conn.execute(
-                    "UPDATE order_files SET status = 'downloading', operator_client = ?, locked_at = ? WHERE id = ? AND status = 'scheduled'",
-                    (client_id, now_str, sub_task_id),
+                    "UPDATE order_files SET status = 'downloading', operator_client = ?, locked_at = ?, last_operator_client = ? WHERE id = ? AND status = 'scheduled'",
+                    (client_id, now_str, client_id, sub_task_id),
                 )
             else:
                 cur = conn.execute(
-                    "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ? AND status = 'queued'",
-                    (client_id, now_str, sub_task_id),
+                    "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ?, last_operator_client = ? WHERE id = ? AND status = 'queued'",
+                    (client_id, now_str, client_id, sub_task_id),
                 )
             # cur.rowcount == 0 表示该任务已不是 queued（正被其他流程处理或已结束）→ 跳过
             if cur.rowcount == 0:
@@ -2943,6 +2972,47 @@ def on_ping():
     emit("pong")
 
 
+def _subtask_ownership(task_id, client_id, conn=None):
+    """🔴-D3 子任务归属判定（全部打印机事件的唯一判据）。
+
+    返回 (ok, info)：info 含 order_id / status / owner / basis，供调用方打精确日志。
+
+    规则（**fail-closed**）：
+      ① 有当前领取者（operator_client 非空）→ 必须与来源连接一致；
+      ② 无当前领取者 → 用 last_operator_client（**回滚/孤儿回收都不清空**）兜底 ——
+         它覆盖真实且常见的路径：设备打印到一半断线（任务被回滚成 queued 且
+         operator_client 被清空），设备恢复后从离线队列补报 print_success；
+      ③ 两条都没有（从未领取过）⇒ 归属不可确定，**拒绝**。
+         修前这里是"放行"，于是任意持全局 printer token 的设备猜个自增 id 就能改写
+         别人的任务（标成功/判失败/抢占/冻结/续命）。
+
+    为什么不用 pushed_tasks 兜底：它是内存计时器，ACCEPT_WAIT_TIMEOUT 之后条目即被删，
+    而离线补报可能远晚于它 —— 用它会拒掉合法补报（重复打印）。
+    """
+    q = ("SELECT order_id, status, operator_client, last_operator_client"
+         " FROM order_files WHERE id = ?")
+    if conn is not None:
+        row = conn.execute(q, (task_id,)).fetchone()
+    else:
+        c = get_db()
+        try:
+            row = c.execute(q, (task_id,)).fetchone()
+        finally:
+            c.close()
+    if not row:
+        return False, {"order_id": None, "status": "", "owner": "", "basis": "任务不存在"}
+    claimed = (row["operator_client"] or "").strip()
+    last = (row["last_operator_client"] or "").strip()
+    if claimed:
+        ok, owner, basis = (claimed == client_id), claimed, "当前领取者"
+    elif last:
+        ok, owner, basis = (last == client_id), last, "上次领取者"
+    else:
+        ok, owner, basis = False, "", "无归属记录"
+    return ok, {"order_id": row["order_id"], "status": row["status"],
+                "owner": owner, "basis": basis}
+
+
 def _get_event_client_id():
     """事件来源校验（P1-2）：用当前连接的 request.sid 反查 printer_clients 中的 client_id，
     查不到（连接未注册/伪造 sid）返回 None。"""
@@ -2968,13 +3038,17 @@ def on_print_success(data):
         print(f"  [WARN] print_success 来自未注册连接（sid={request.sid}），已忽略")
         return
 
+    # 来源校验（P1-2 + 🔴-D3）：仅该任务的归属设备可回报成功。
+    # 修前写法是 `if row and row["operator_client"] and row["operator_client"] != client_id`
+    # —— operator_client 被断线回滚清空后**完全放行**，任何注册设备都能把别人的任务标 sent。
     conn = get_db()
     row = conn.execute(
         "SELECT order_id, operator_client FROM order_files WHERE id = ?", (task_id,)
     ).fetchone()
-    if row and row["operator_client"] and row["operator_client"] != client_id:
-        print(f"  [WARN] print_success 子任务 #{task_id} 的 operator_client={row['operator_client']}"
-              f" 与当前连接 {client_id} 不符，已拒绝")
+    ok, own = _subtask_ownership(task_id, client_id, conn=conn)
+    if not ok:
+        print(f"  [WARN] print_success 子任务 #{task_id} 归属校验不过"
+              f"（{own['basis']}={own['owner'] or '<空>'}，来源 {client_id}），已拒绝")
         conn.close()
         return
 
@@ -3050,9 +3124,11 @@ def on_print_fail(data):
     row = conn.execute(
         "SELECT order_id, operator_client FROM order_files WHERE id = ?", (task_id,)
     ).fetchone()
-    if row and row["operator_client"] and row["operator_client"] != client_id:
-        print(f"  [WARN] print_fail 子任务 #{task_id} 的 operator_client={row['operator_client']}"
-              f" 与当前连接 {client_id} 不符，已拒绝")
+    # 来源校验（🔴-D3）：同 print_success，统一走 _subtask_ownership（空领取者不再放行）
+    ok, own = _subtask_ownership(task_id, client_id, conn=conn)
+    if not ok:
+        print(f"  [WARN] print_fail 子任务 #{task_id} 归属校验不过"
+              f"（{own['basis']}={own['owner'] or '<空>'}，来源 {client_id}），已拒绝")
         conn.close()
         return
     # P1-5：禁止 sent → failed 降级（已完成的任务不能被迟到的失败回报改状态）；
@@ -3128,13 +3204,11 @@ def on_file_ready(data):
         try:
             conn.execute("BEGIN IMMEDIATE")
             for tid in task_ids:
-                # 来源校验：operator_client 与当前连接不符的子任务拒绝处理
-                chk = conn.execute(
-                    "SELECT operator_client FROM order_files WHERE id = ?", (tid,)
-                ).fetchone()
-                if chk and chk["operator_client"] and chk["operator_client"] != client_id:
-                    print(f"  [WARN] file_ready 子任务 #{tid} 的 operator_client={chk['operator_client']}"
-                          f" 与当前连接 {client_id} 不符，跳过")
+                # 来源校验（🔴-D3）：统一归属判定（空领取者不再放行）
+                ok, own = _subtask_ownership(tid, client_id, conn=conn)
+                if not ok:
+                    print(f"  [WARN] file_ready 子任务 #{tid} 归属校验不过"
+                          f"（{own['basis']}={own['owner'] or '<空>'}，来源 {client_id}），跳过")
                     continue
                 row = conn.execute(
                     "SELECT order_id FROM order_files WHERE id = ? AND status = 'downloading'", (tid,)
@@ -3198,12 +3272,32 @@ def on_download_delayed(data):
         return
     conn_chk = get_db()
     chk_rows = conn_chk.execute(
-        "SELECT operator_client FROM order_files WHERE order_id = ? AND status = 'downloading'",
+        "SELECT id FROM order_files WHERE order_id = ? AND status = 'downloading'",
         (order_id,),
     ).fetchall()
+    # 来源校验（🔴-D3）：订单里所有"下载中"的子任务都必须归属本机（任一不符 ⇒ 整体拒绝）；
+    # 一条都没有时（例如下载中的任务已被回滚成 scheduled）退到订单维度：本机必须曾经领取过
+    # 该订单的某个活跃子任务 —— 否则"从没碰过这个订单的设备"可以随手把它冻结。
+    bad_basis = ""
+    for _r in chk_rows:
+        _ok, _own = _subtask_ownership(_r["id"], client_id, conn=conn_chk)
+        if not _ok:
+            bad_basis = f"子任务 #{_r['id']} {_own['basis']}={_own['owner'] or '<空>'}"
+            break
+    if not bad_basis and not chk_rows:
+        act_rows = conn_chk.execute(
+            "SELECT id FROM order_files WHERE order_id = ?"
+            " AND status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')",
+            (order_id,),
+        ).fetchall()
+        owned = any(_subtask_ownership(_r["id"], client_id, conn=conn_chk)[0]
+                    for _r in act_rows)
+        if not act_rows or not owned:
+            bad_basis = "订单无可归属的活跃子任务"
     conn_chk.close()
-    if chk_rows and any(r["operator_client"] and r["operator_client"] != client_id for r in chk_rows):
-        print(f"  [WARN] download_delayed 订单 #{order_id} 的下载任务不属于当前连接 {client_id}，已拒绝")
+    if bad_basis:
+        print(f"  [WARN] download_delayed 订单 #{order_id} 归属校验不过"
+              f"（{bad_basis}，来源 {client_id}），已拒绝")
         return
 
     with db_lock:
@@ -3263,13 +3357,11 @@ def on_start_printing(data):
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             started_at = now_str  # 服务器时钟为唯一权威时间源
             for tid in task_ids:
-                # 来源校验：operator_client 与当前连接不符的子任务跳过
-                chk = conn.execute(
-                    "SELECT operator_client FROM order_files WHERE id = ?", (tid,)
-                ).fetchone()
-                if chk and chk["operator_client"] and chk["operator_client"] != client_id:
-                    print(f"  [WARN] start_printing 子任务 #{tid} 的 operator_client={chk['operator_client']}"
-                          f" 与当前连接 {client_id} 不符，跳过")
+                # 来源校验（🔴-D3）：统一归属判定（空领取者不再放行，防抢占别人的任务）
+                ok, own = _subtask_ownership(tid, client_id, conn=conn)
+                if not ok:
+                    print(f"  [WARN] start_printing 子任务 #{tid} 归属校验不过"
+                          f"（{own['basis']}={own['owner'] or '<空>'}，来源 {client_id}），跳过")
                     continue
                 row = conn.execute(
                     "SELECT order_id FROM order_files WHERE id = ?", (tid,)
@@ -3290,8 +3382,8 @@ def on_start_printing(data):
                     (started_at, row["order_id"]),
                 )
                 conn.execute(
-                    "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ? WHERE id = ? AND status IN ('waiting', 'downloading')",
-                    (client_id, now_str, tid),
+                    "UPDATE order_files SET status = 'printing', operator_client = ?, locked_at = ?, last_operator_client = ? WHERE id = ? AND status IN ('waiting', 'downloading')",
+                    (client_id, now_str, client_id, tid),
                 )
                 refresh_order_status(conn, row["order_id"])
             conn.commit()
@@ -3346,15 +3438,12 @@ def on_print_keepalive(data):
         try:
             conn.execute("BEGIN IMMEDIATE")
             for tid in task_ids:
-                chk = conn.execute(
-                    "SELECT operator_client, status FROM order_files WHERE id = ?", (tid,)
-                ).fetchone()
-                if not chk:
+                # 来源校验（🔴-D3）：统一归属判定 + 状态守卫（不是本机在打的别替它续命）
+                ok, own = _subtask_ownership(tid, client_id, conn=conn)
+                if not ok:
                     continue
-                if chk["status"] not in ("printing", "accepted"):
+                if own["status"] not in ("printing", "accepted"):
                     continue  # 已终结（sent/failed/取消）不再保活
-                if chk["operator_client"] and chk["operator_client"] != client_id:
-                    continue  # 不是本机在打的任务，别替别人续命
                 cur = conn.execute(
                     "UPDATE order_files SET locked_at = ? WHERE id = ?"
                     " AND status IN ('printing', 'accepted')",
@@ -3388,15 +3477,29 @@ def on_page_count_result(data):
     orientation = data.get("orientation", "")
     success = data.get("success", True)
 
-    # 来源校验（P1-2）：仅已注册的打印机客户端可回报页数（file_id 维度无法核对
-    # operator_client，因为页数分析是广播式领取的；至少保证连接合法）
+    # 来源校验（P1-2 + 🔴-D3）：只有**被请求做这次分析的那台设备**可以回报。
+    # 判据取 client_id 而不是 sid：sid 会随重连变化，设备分析到一半断线重连后
+    # 仍应能回报（用 sid 会把合法回报挡掉，页数永远停在"分析中"）。
     client_id = _get_event_client_id()
     if not client_id:
         print(f"  [WARN] page_count_result 来自未注册连接（sid={request.sid}），已忽略")
         return
 
+    with _last_page_analysis_push_lock:
+        _asked = _analysis_push_sid.get(file_id) or {}
+    _asked_cid = _asked.get("client_id") if isinstance(_asked, dict) else ""
+    if not _asked_cid or _asked_cid != client_id:
+        print(f"  [WARN] page_count_result 文件 {file_id[:8]}... 的分析请求发给"
+              f" {_asked_cid or '<无记录>'}，来源却是 {client_id}，已拒绝")
+        return
+
     if not file_id or page_count <= 0:
         print(f"  [PAGE] page_count_result 无效: file_id={file_id}, pages={page_count}")
+        return
+    # 🔴-D3：页数上限。页数是**计费输入**（calculate_price × 份数，还会回溯重算父订单总额），
+    # 离谱的数值会直接炸掉价格并使回溯重算扫过所有引用该文件的子任务。
+    if page_count > MAX_REPORTED_PAGES:
+        print(f"  [PAGE] page_count_result 页数离谱（{page_count} > {MAX_REPORTED_PAGES}），已拒绝")
         return
 
     conn = get_db()
@@ -3692,15 +3795,36 @@ def on_page_range_truncated(data):
     except (ValueError, TypeError):
         print(f"  [WARN] page_range_truncated 收到非法 task_id: {task_id!r}，已忽略")
         return
-    print(f"  [TRUNC] 子任务 #{task_id}: 页码范围被截断 {original} → {effective} (总 {total_pages} 页)")
 
+    # 来源校验（🔴-D3）：本区段此前是唯一**既无来源校验、又无状态守卫、又无长度上限**的
+    # 事件处理器 —— 任意注册设备都能把它人的 page_range 改写成任意（超长）字符串，
+    # 也就是把 🔴-1 的毒串投进别人的订单记录。三样一起补：
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] page_range_truncated 来自未注册连接（sid={request.sid}），已忽略")
+        return
     conn = get_db()
-    conn.execute(
-        "UPDATE order_files SET page_range_original = ?, page_range_truncated = 1, page_range = ? WHERE id = ?",
-        (original, effective, task_id),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        ok, own = _subtask_ownership(task_id, client_id, conn=conn)
+        if not ok:
+            print(f"  [WARN] page_range_truncated 子任务 #{task_id} 归属校验不过"
+                  f"（{own['basis']}={own['owner'] or '<空>'}，来源 {client_id}），已拒绝")
+            return
+        # 状态守卫：已终结/已取消的任务不再接受改写（记录已定，改写只会污染对账）
+        if own["status"] in ("canceled", "rejected", "abandoned", "sent"):
+            print(f"  [SKIP] page_range_truncated 子任务 #{task_id} 状态为 {own['status']}，不再改写")
+            return
+        # 长度上限：与同文件 _sync_subtask_config 的写路径同款（那边的 page_range 也是 [:500]）
+        original = str(original or "")[:500]
+        effective = str(effective or "")[:500]
+        print(f"  [TRUNC] 子任务 #{task_id}: 页码范围被截断 {original} → {effective} (总 {total_pages} 页)")
+        conn.execute(
+            "UPDATE order_files SET page_range_original = ?, page_range_truncated = 1, page_range = ? WHERE id = ?",
+            (original, effective, task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ── 在线设备日志收集（日志管理页发起：后端下发 request_log → 各在线设备回报本机日志）──
@@ -3837,9 +3961,10 @@ def request_page_analysis(file_id: str, file_name: str, prefer_client: str = "")
     if not sid:
         return False
 
-    # 记录推送目标 sid，供取消分析时精确转发（同一 file_id 重新推送会覆盖为最新 sid）
+    # 记录推送目标，供取消分析时精确转发、以及 page_count_result 的归属判定（🔴-D3）
+    # （同一 file_id 重新推送会覆盖为最新目标）
     with _last_page_analysis_push_lock:
-        _analysis_push_sid[file_id] = sid
+        _analysis_push_sid[file_id] = {"sid": sid, "client_id": client_id}
 
     try:
         socketio.emit("analyze_page_count", {
@@ -4116,7 +4241,9 @@ def cancel_page_analysis():
     with _last_page_analysis_push_lock:
         for fid in file_ids:
             _last_page_analysis_push.pop(fid, None)      # 清防抖槽，允许立即重新发起
-            sid = _analysis_push_sid.pop(fid, None)
+            _entry = _analysis_push_sid.pop(fid, None)
+            # 兼容两种形态：🔴-D3 起存的是 {"sid","client_id"}，旧形态是纯 sid 字符串
+            sid = _entry.get("sid") if isinstance(_entry, dict) else _entry
             try:
                 if sid:
                     socketio.emit("cancel_page_analysis", {"file_id": fid}, to=sid)
