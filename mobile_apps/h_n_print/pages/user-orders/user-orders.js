@@ -2,37 +2,8 @@
 // 用于: 管理管理员点击、历史授权用户点击、本地打印任务
 const { CONFIG } = require('../../utils/config')
 const { request } = require('../../utils/request')
-
-/* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
-   口径对齐后端 _count_pages_in_range（含中文逗号、智能拆分 '23-4'）。 */
-function _countRangePages(rangeStr, total) {
-  if (!rangeStr || !String(rangeStr).trim()) return total
-  const pages = new Set()
-  String(rangeStr).replace(/[、，；\s]/g, ',').split(',').forEach(part => {
-    part = (part || '').trim()
-    if (!part) return
-    if (part.indexOf('-') >= 0) {
-      const sp = part.split('-')
-      const a = parseInt(sp[0], 10), b = parseInt(sp[1], 10)
-      if (!isNaN(a) && !isNaN(b)) {
-        if (a < b) {
-          for (let p = a; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
-        } else if (a > b && String(a).length > 1) {
-          const prefix = parseInt(String(a).slice(0, -1), 10)
-          const last = parseInt(String(a).slice(-1), 10)
-          if (prefix < b) {
-            for (let p = last; p <= b; p++) if (p >= 1 && p <= total) pages.add(p)
-            if (prefix >= 1 && prefix <= total) pages.add(prefix)
-          }
-        }
-      }
-    } else {
-      const p = parseInt(part, 10)
-      if (!isNaN(p) && p >= 1 && p <= total) pages.add(p)
-    }
-  })
-  return pages.size || total
-}
+// 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
+const { countPagesInRange } = require('../../utils/pages')
 
 /* 文件张数/有效页数预处理（后端已返回时直接复用，缺失时前端兜底计算）：
    - effectivePages: 每份有效打印页数（范围过滤后）
@@ -41,7 +12,7 @@ function _countRangePages(rangeStr, total) {
 function _enrichFileStat(f) {
   const pc = Number(f.page_count) || 0
   const copies = Number(f.copies) || 1
-  const eff = typeof f.effective_pages === 'number' ? f.effective_pages : _countRangePages(f.page_range, pc)
+  const eff = typeof f.effective_pages === 'number' ? f.effective_pages : countPagesInRange(f.page_range, pc)
   const perSheets = typeof f.sheets === 'number' ? f.sheets : (f.duplex === 'off' ? eff : Math.ceil(eff / 2))
   f.effectivePages = eff
   f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies)

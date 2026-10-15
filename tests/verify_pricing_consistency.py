@@ -91,6 +91,19 @@ def local_impl(pc, copies, duplex, prange, sp, dp):
 PROBE = r'''
 const fs = require('fs');
 const vm = require('vm');
+const nodePath = require('path');
+
+// utils/pages.js（页码范围口径的唯一实现）—— index.js 现在 require 它，
+// 垫片必须**真的把它装进来**，否则 countPagesInRange 是 undefined（存根要跟着实现同步）。
+const PAGES_PATH = nodePath.resolve(nodePath.dirname(process.argv[3]), '..', '..', 'utils', 'pages.js');
+let PAGES_EXPORTS = {};
+try {
+  const _m = { exports: {} };
+  new Function('module', 'exports', fs.readFileSync(PAGES_PATH, 'utf8'))(_m, _m.exports);
+  PAGES_EXPORTS = _m.exports;
+} catch (e) {
+  process.stderr.write('⚠ 未能加载 ' + PAGES_PATH + '：' + e.message + '\n');
+}
 
 const EL = () => ({
   innerHTML: '', textContent: '', value: '', style: {}, dataset: {},
@@ -130,7 +143,8 @@ function android(sp, dp) {
 function mp(sp, dp) {
   let cfg = null;
   const sandbox = Object.assign({}, BASE, {
-    require: (p) => (p.indexOf('utils/config') >= 0 ? { CONFIG: { BASE_URL: '' } } : { request: () => {} }),
+    require: (p) => (p.indexOf('utils/pages') >= 0 ? PAGES_EXPORTS
+      : (p.indexOf('utils/config') >= 0 ? { CONFIG: { BASE_URL: '' } } : { request: () => {} })),
     Page: (c) => { cfg = c; }, Component: (c) => { cfg = c; },
     getApp: () => ({ globalData: { isDarkMode: false, themeMode: 'light', _pageRegistry: [] } }),
     wx: {

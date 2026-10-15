@@ -19,6 +19,23 @@ const path = require('path');
 const vm = require('vm');
 
 const REPO = path.resolve(__dirname, '..');
+
+// utils/pages.js —— 小程序「页码范围 → 有效页数」的**唯一实现**（index.js 现在 require 它）。
+// 这里必须**真的把它装进来**：垫片只认 utils/config / utils/request 时，
+// require('../../utils/pages') 会落到下面的 throw ⇒ 脚本**假红**（存根没跟上实现）。
+const __PAGES_EXPORTS = (() => {
+  // **失败关闭**：读不到文件、或没导出 countPagesInRange，就直接抛。
+  // （若这里静默返回 {}，pages.js 被改坏时本脚本可能悄悄变绿 = 守卫失去意义。）
+  const _src = fs.readFileSync(
+    path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'pages.js'), 'utf8');
+  const _m = { exports: {} };
+  new Function('module', 'exports', _src)(_m, _m.exports);
+  if (typeof _m.exports.countPagesInRange !== 'function') {
+    throw new Error('utils/pages.js 未导出 countPagesInRange（垫片拿不到口径，不能静默放行）');
+  }
+  return _m.exports;
+})();
+
 const MP_INDEX = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'index', 'index.js');
 const MP_WXML = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'index', 'index.wxml');
 const MP_WXSS = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'index', 'index.wxss');
@@ -69,6 +86,7 @@ function runMiniProgram() {
     parseInt, parseFloat, isNaN,
     setTimeout, clearTimeout, setInterval, clearInterval,
     require: (p) => {
+      if (p.indexOf('utils/pages') >= 0) return __PAGES_EXPORTS;
       if (p.indexOf('utils/config') >= 0) return { CONFIG: { BASE_URL: 'https://example.test' } };
       if (p.indexOf('utils/request') >= 0) return { request: () => {} };
       throw new Error('unexpected require: ' + p);
