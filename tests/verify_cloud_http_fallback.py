@@ -74,9 +74,21 @@ check("兜底调用带 quiet=True（长断网不刷屏）", calls and all(calls)
       str(calls))
 
 client._connected = True
+# 置 True 之后先放掉 2 个间隔，让「已经过了判断点、正在 sleep/拉单」的那一轮跑完。
+# 竞态说明（2026-10-15 修，此前的 `len(calls) == n_offline` 是**随机红**）：
+#   循环体是「先判 _connected、再拉单」，置位时刻若正好落在 wait(0.05) 或
+#   pull_pending(sleep 0.02) 里，本轮会照旧发出一次 —— 这是**正常收尾**，不是缺陷。
+#   机器跑全量套件被占满时该窗口被放大，于是断言的计数偶尔多 1（实测 `5 → 6`，
+#   单独跑则 `6 → 6`）。真实 PULL_FALLBACK_INTERVAL 是 45s，一次在途拉单无害，
+#   服务端也幂等 —— 所以判据应该是「**置位后不再有新的调用**」，而不是"一次都没有"。
 time.sleep(0.3)
+n_at_quiet = len(calls)
+time.sleep(0.3)                      # 第二个窗口：此时在途那一次必然已完成
 check("socket 正常时不再发 HTTP 请求（避免与推送/连线拉取重复）",
-      len(calls) == n_offline, f"{n_offline} → {len(calls)}")
+      len(calls) == n_at_quiet, f"置位后 {n_at_quiet} → {len(calls)}（断开期共 {n_offline} 次）")
+check("socket 正常后至多只多出 1 次在途拉单（不得持续轮询）",
+      len(calls) - n_offline <= 1,
+      f"{n_offline} → {len(calls)}")
 
 client._stop_event.set()
 th.join(timeout=2)
