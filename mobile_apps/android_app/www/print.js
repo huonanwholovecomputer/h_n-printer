@@ -7,6 +7,10 @@ const UNSUPPORTED_EXTS = ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf'];
 const MAX_FILES = 20;
 const MAX_FILE_MB = 50;
 const MAX_POLL_ATTEMPTS = 60;
+// 上传超时上限（D5 最后一条）：给大文件 + 慢网留足时间，但"连上却收不到数据"时必须能退出来。
+// 常量放在**本文件**（唯一使用者）：它是词法作用域，跨文件依赖 app.js 会让"单独加载本文件"的
+// 守卫拿不到（历史守卫就是单独跑 print.js 的）——每个文件自带自己的超时常量，不需要垫片。
+const UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 /* 兜底单价（🔴-C3）：**必须与后端 `printer-backend/pricing.json` 逐值一致**。
    /api/pricing 拿不到时就用它计价。旧值是 0.2 / 0.3（比权威低 33%/25%）——

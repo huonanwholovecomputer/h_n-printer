@@ -30,8 +30,8 @@ let _refreshing = null;
 // （弱网、校园网抖动、代理异常）会**永久挂起** —— 界面停在加载态，既不报错也不重试。
 // 用 AbortController 设默认上限；需要长耗时的调用可传 opts.timeoutMs 覆盖（传 0 表示不限）。
 const API_TIMEOUT_MS = 20000;
-// 文件上传走 XMLHttpRequest（有进度条），单独给一个宽松上限（大文件 + 慢网）
-const UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+// 注：文件上传走 XMLHttpRequest（在 print.js），它的超时常量由 print.js 自己定义
+// （`UPLOAD_TIMEOUT_MS`）—— 两个文件各自的超时上限都在使用它的文件里，不跨文件依赖词法作用域。
 
 async function api(path, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});

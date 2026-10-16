@@ -160,8 +160,9 @@ function loadApp(fetchImpl) {
       /xhr\.ontimeout[\s\S]{0,220}stopUploadTimer\(f\)/.test(code)
       && /xhr\.ontimeout[\s\S]{0,260}f\.uploading\s*=\s*false/.test(code));
     const appSrc = fs.readFileSync(APP_JS, 'utf8');
-    check('UPLOAD_TIMEOUT_MS 常量在 app.js 里定义（上传上限的唯一来源）',
-      /const\s+UPLOAD_TIMEOUT_MS\s*=/.test(appSrc));
+    check('UPLOAD_TIMEOUT_MS 常量定义在 print.js 自己（不跨文件依赖词法作用域）',
+      /const\s+UPLOAD_TIMEOUT_MS\s*=/.test(code)
+      && !/const\s+UPLOAD_TIMEOUT_MS\s*=/.test(appSrc));
   }
 
   console.log('\n' + (failures ? `存在失败项 ❌ (${failures})` : '全部通过 ✅'));
