@@ -65,12 +65,9 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 # 远程开关）⇒ 登记过渡项；**2026-10-16 已重打 1.1.35（versionCode 36），verify_apk_release
 # 与 verify_apk_published 均转绿 ⇒ 该项已删除**。
 # 2026-10（攒批只对「需人工翻纸」的机型）：再改 www/app.js（徽标/开关只对 auto_duplex === false
-# 的设备渲染）⇒ APK 内 web 资源与 www/ 暂时不一致，**待重打 1.1.36 并过 verify_apk_release.py
-# + verify_apk_published.py 后必须删掉本条**。
-EXPECTED_RED: dict[str, str] = {
-    "verify_apk_release.py": "APK 待重打 1.1.36（www/app.js 的攒批适用性判据已改，"
-                             "旧包 1.1.35 内的 web 资源与 www/ 不一致）",
-}
+# 的设备渲染）⇒ 登记过渡项；**同日已重打 1.1.36（versionCode 37）并通过 verify_apk_release.py +
+# verify_apk_published.py（线上清单/大小/md5 全部一致）⇒ 该项已删除**。
+EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}
