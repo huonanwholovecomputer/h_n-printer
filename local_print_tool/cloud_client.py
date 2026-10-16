@@ -1424,7 +1424,17 @@ class CloudClient(QObject):
             if _dl_ext != ".docx":
                 cached_pdf, cached_meta = self._get_cached_pdf(task.source_md5, task.image_orientation)
                 if cached_pdf:
-                    task.local_path = cached_pdf
+                    # D5 第 9 条：共享缓存会被保留期清理/放弃订单删掉 ⇒ 先复制成任务自持的
+                    # 暂存副本再挂上去（复制失败才回退共享缓存本体，功能不退化）。
+                    owned = self._materialize_cached_file(task, cached_pdf, cached_meta)
+                    task.local_path = owned or cached_pdf
+                    if owned:
+                        # 已挂到任务上（按引用清扫即保护），解除「使用中」标记；
+                        # 顺序不能反：先挂引用再解除，否则中间窗口可能被清扫删掉。
+                        try:
+                            staging.unreserve(owned)
+                        except Exception:
+                            pass
                     task.status = "ready"
                     task.download_progress = 100
                     self.task_updated.emit(task)
@@ -1665,6 +1675,56 @@ class CloudClient(QObject):
         except Exception:
             pass
         return ""
+
+    def _materialize_cached_file(self, task, cached_pdf: str, cached_meta: dict | None) -> str | None:
+        """把缓存命中的**共享** PDF 复制成**任务自持**的暂存文件；成功返回副本路径并保持
+        `staging.reserve`（调用方挂到 `task.local_path` 后必须 `staging.unreserve`），
+        失败返回 None 让调用方回退共享缓存本体。
+
+        为什么要复制（D5 第 9 条）：`pdf_cache\<key>.pdf` 是**跨任务共享**的（key = MD5 +
+        方向/引擎后缀），而删它的路径有三条 —— `_cleanup_pdf_cache()`（保留期到期 / 无索引
+        孤儿回收）、`remove_cached_pdf()`（放弃订单时的清理），以及用户在收支清算页把保留
+        时间调小。GUI 的按引用清扫只保护 `file_cache\cloud_<task_id>\` 下的文件，**不覆盖
+        pdf_cache**。旧写法直接把 `task.local_path` 指向共享缓存 ⇒ 任务还挂在列表上（预约单
+        要等数小时才到点）时文件被清掉，点打印报「文件不存在」。复制后与下载路径同源同口径
+        （受按引用清扫保护、完成/放弃时统一回收），共享缓存照旧跨任务复用。
+
+        复制失败（磁盘满 / 暂存目录不可用）只降级为旧行为，功能不因暂存而不可用。"""
+        if not cached_pdf or not os.path.isfile(cached_pdf):
+            return None
+        try:
+            name = (cached_meta or {}).get("original_name", "") or ""
+        except AttributeError:
+            name = ""
+        if not name:
+            name = task.file_name or f"cloud_task_{task.task_id}.pdf"
+        if os.path.splitext(name)[1].lower() != ".pdf":
+            name = os.path.splitext(name)[0] + ".pdf"   # 缓存里存的永远是 PDF
+        dest = ""
+        try:
+            dest = staging.cloud_download_path(task.task_id, name)
+            if not staging.ensure_dir_for(dest):
+                logger.warning("缓存命中但暂存目录不可用 → 回退直接引用共享缓存（有被清理风险）")
+                return None
+            staging.reserve(dest)
+            try:
+                same = (os.path.isfile(dest)
+                        and os.path.getsize(dest) == os.path.getsize(cached_pdf))
+            except OSError:
+                same = False
+            if not same:               # 已有同尺寸副本就不再抄一次（幂等，省 I/O）
+                tmp = dest + ".tmp"
+                shutil.copy2(cached_pdf, tmp)
+                os.replace(tmp, dest)  # 原子落地，避免半截文件被挂到任务上
+            return dest
+        except Exception as e:
+            logger.warning(f"缓存命中但复制到暂存目录失败 → 回退直接引用共享缓存: {e}")
+            if dest:
+                try:
+                    staging.unreserve(dest)
+                except Exception:
+                    pass
+            return None
 
     def _get_cached_pdf(self, md5: str, image_orientation: str = "", engine: str = "") -> tuple[str | None, dict | None]:
         """查找指定 MD5 的缓存 PDF。返回 (pdf_path, metadata) 或 (None, None)。

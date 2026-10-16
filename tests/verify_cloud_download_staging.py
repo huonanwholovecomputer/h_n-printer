@@ -237,7 +237,83 @@ try:
 except OSError:
     pass
 
-print("=== 8. 收尾 ===")
+print("=== 8. 缓存命中：复制成任务自持副本（共享缓存被清不再波及待打任务）===")
+# 缺陷（D5 第 9 条）：缓存命中时旧写法把 task.local_path 直接指向
+# `pdf_cache\<key>.pdf`（**跨任务共享**），而三条清理路径都会删它，GUI 的按引用清扫
+# 只保护 `file_cache\cloud_<task_id>\` —— 任务还挂在列表上（预约单要等数小时）时文件
+# 被清掉，点打印报「文件不存在」。
+_cache_client = _make_client()
+_cache_client._download_semaphore = __import__("threading").BoundedSemaphore(4)
+_shared_src = os.path.join(_SANDBOX, "shared_src.pdf")
+_shared_payload = b"%PDF-1.4 shared cache " * 40
+with open(_shared_src, "wb") as f:
+    f.write(_shared_payload)
+_cache_client._save_pdf_to_cache("md5cache009", _shared_src, "共享缓存.pdf", ".pdf")
+_shared_path = os.path.join(_cache_client._cache_dir, cc.pdf_cache_key("md5cache009") + ".pdf")
+check("前提：共享缓存文件已就位", os.path.isfile(_shared_path), _shared_path)
+
+task7 = CloudTask({"task_id": 4250, "order_id": 7, "file_name": "共享缓存.pdf",
+                   "download_url": "http://example.invalid/f7", "source_md5": "md5cache009"})
+_cache_client._pending_tasks[4250] = task7
+cc.http_requests.get = lambda url, **kw: (_ for _ in ()).throw(RuntimeError("缓存命中不应发起网络请求"))
+_cache_client._download_file_inner(task7)
+check("★ 缓存命中后 local_path 是任务自持副本（不再是 pdf_cache 里的共享文件）",
+      task7.status == "ready" and task7.local_path != _shared_path
+      and staging.is_staged(task7.local_path), f"{task7.status} {task7.local_path}")
+check("副本按 task_id 分目录（cloud_4250）",
+      os.path.basename(os.path.dirname(task7.local_path)) == "cloud_4250",
+      os.path.dirname(task7.local_path))
+check("副本内容完整且保留原文件名",
+      open(task7.local_path, "rb").read() == _shared_payload
+      and os.path.basename(task7.local_path) == "共享缓存.pdf")
+check("命中后不留「使用中」标记（已经挂到任务上，由引用保护）",
+      staging._reserved_snapshot() == set(), str(staging._reserved_snapshot()))
+# 判别式：同一次清扫里，无引用的副本必须被回收、被任务引用的副本必须留下。
+_decoy_dir = os.path.join(paths.file_cache_dir(), "cloud_9999")
+os.makedirs(_decoy_dir, exist_ok=True)
+_decoy = os.path.join(_decoy_dir, "decoy.pdf")
+with open(_decoy, "wb") as f:
+    f.write(b"%PDF-1.4 decoy")
+_removed = staging.sweep({task7.local_path})
+check("副本被任务引用 → 按引用清扫保留它（同批无引用的副本被回收）",
+      os.path.isfile(task7.local_path) and not os.path.isfile(_decoy) and _removed >= 1,
+      f"removed={_removed} 引用副本还在={os.path.isfile(task7.local_path)} "
+      f"无引用副本还在={os.path.isfile(_decoy)}")
+
+# 关键回归：共享缓存真的被清理（保留期到期）后，待打任务的文件必须还在
+_cache_client._CACHE_RETENTION_HOURS = 1
+_idx = _cache_client._load_cache_index()
+_idx[cc.pdf_cache_key("md5cache009")]["created_at"] = "2020-01-01 00:00:00"
+_cache_client._save_cache_index(_idx)
+_cache_client._cleanup_pdf_cache()
+check("缓存清理确实删掉了共享缓存本体（制造出改前会丢文件的现场）",
+      not os.path.isfile(_shared_path), _shared_path)
+check("★ 共享缓存被清后任务文件仍可读（改前这里就是打印报「文件不存在」）",
+      os.path.isfile(task7.local_path)
+      and open(task7.local_path, "rb").read()[:5] == b"%PDF-")
+
+print("=== 8b. 暂存目录不可用 → 回退共享缓存本体（功能不退化）===")
+_shared2 = os.path.join(_SANDBOX, "shared2.pdf")
+with open(_shared2, "wb") as f:
+    f.write(b"%PDF-1.4 second " * 20)
+_cache_client._save_pdf_to_cache("md5cache010", _shared2, "回退缓存.pdf", ".pdf")
+_shared2_path = os.path.join(_cache_client._cache_dir, cc.pdf_cache_key("md5cache010") + ".pdf")
+task8 = CloudTask({"task_id": 4251, "order_id": 7, "file_name": "回退缓存.pdf",
+                   "download_url": "http://example.invalid/f8", "source_md5": "md5cache010"})
+_cache_client._pending_tasks[4251] = task8
+_orig_ensure = staging.ensure_dir_for
+staging.ensure_dir_for = lambda p: False
+try:
+    _cache_client._download_file_inner(task8)
+finally:
+    staging.ensure_dir_for = _orig_ensure
+check("暂存不可用 → 回退直指共享缓存（旧行为，不报错、仍可打印）",
+      task8.status == "ready" and task8.local_path == _shared2_path,
+      f"{task8.status} {task8.local_path}")
+check("回退路径不留「使用中」标记", staging._reserved_snapshot() == set(),
+      str(staging._reserved_snapshot()))
+
+print("=== 9. 收尾 ===")
 staging.sweep(set())
 check("暂存目录无残留", staging.cache_size()[0] == 0, str(staging.cache_size()))
 
