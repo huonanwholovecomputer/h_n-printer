@@ -5341,11 +5341,16 @@ def pull_queued_orders():
     # 判本机离线 → 永远返回空，双通道实为单通道）。必须在 get_active_printer_client() 之前刷新。
     touch_printer_heartbeat(client_id)
 
-    active_printer = get_active_printer_client()
-    if not active_printer or client_id != active_printer:
-        # 本机未接管打印机（或无接管设备）→ 不分配任何任务
+    # 2026-10（D5 修复）：原判据是「client_id == get_active_printer_client()」，而后者只返回
+    # **第一台**在线接单设备 ⇒ 多台接单设备时其余设备**永远** take_orders=False：第二台在
+    # socket 掉线、靠 HTTP 兜底拉单时拉不到**指定给自己**的任务（"双通道独立保活"要兜的
+    # 场景被废掉）。正确判据是「本机是**启用接单**的设备」—— 本机在线由上面
+    # touch_printer_heartbeat() 保证；"能拿到哪一个任务"由 fetch_and_lock_task 内的
+    # target_client 过滤决定（本机为目标 或 未指定目标且本机接单），因此绝不会抢别人的单。
+    if not is_claiming(client_id):
         return jsonify({"success": True, "orders": [], "count": 0,
-                        "take_orders": False, "active_client_id": active_printer or ""})
+                        "take_orders": False,
+                        "active_client_id": get_active_printer_client() or ""})
 
     task = fetch_and_lock_task(client_id)
     if not task:
@@ -5398,6 +5403,7 @@ def pull_queued_orders():
         "success": True,
         "orders": [item],
         "count": 1,
+        "take_orders": True,   # 与「无任务/未接单」两支对齐（客户端不读，仅接口一致性）
     })
 
 

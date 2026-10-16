@@ -194,6 +194,104 @@ cid, why = backend._resolve_analysis_client("A", FILE_ID)
 check("A 上线时按 prefer=A 解析：A 在线且接单 → A 自己分析（on_connect 传的就是刚上线设备）",
       cid == "A" and why == "调用方指定", f"{cid} / {why}")
 
+# ==================== ⑤ HTTP 拉单：不再只认「第一台」在线接单设备 ====================
+# 缺陷（D5 第 5 条）：pull_queued_orders 原先判 `client_id == get_active_printer_client()`，
+# 而后者只返回**第一台**在线接单设备 ⇒ 其余接单设备永远 take_orders=False。第二台在 socket
+# 掉线、靠 HTTP 兜底拉单时拉不到**指定给自己**的任务 —— 正是「双通道独立保活」要兜的场景。
+print("\n=== ⑤ HTTP 拉单：任意在线接单设备都能拉（旧判据是一票否决）===")
+
+# 桩升级：在线集合可能含**未接单**设备（C）；is_claiming 走真实的 get_claiming_devices。
+backend.get_active_clients = lambda: list(ONLINE)
+backend.get_claiming_devices = lambda: {c: {} for c in CLAIMING}
+backend.PRINTER_TOKEN = "tok-routing-d5"
+
+# 清掉前面小节留下的排队任务，避免干扰计数
+_conn = backend.get_db()
+_conn.execute("DELETE FROM order_files")
+_conn.execute("DELETE FROM orders")
+_conn.commit()
+_conn.close()
+
+
+def _mk_order(target, number):
+    """造一张订单 + 一条 queued 子任务，target_client = target（'' = 未指定目标）。"""
+    conn = backend.get_db()
+    conn.execute(
+        "INSERT INTO orders (file, copies, status, created_at, openid, duplex, page_count,"
+        " price_per_page, total_price, is_free, target_client, order_number)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("报告.docx", 1, "queued", datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+         "openid_test", "on", 0, 0.3, 0, 0, target, number),
+    )
+    oid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,"
+        " price_per_page, total_price, is_free, status, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (oid, FILE_ID, "报告.docx", 1, 0, 0.3, 0, 0, "queued",
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    of_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    return of_id
+
+
+OF_B = _mk_order("B", "HN-TEST-0002")     # 指定给**第二台**接单设备
+OF_A = _mk_order("A", "HN-TEST-0003")
+OF_FREE = _mk_order("", "HN-TEST-0004")   # 未指定目标
+
+_http = backend.app.test_client()
+
+
+def _pull(cid):
+    r = _http.get("/api/pull_queued_orders?token=tok-routing-d5&client_id=" + cid)
+    j = None
+    try:
+        j = r.get_json() or {}
+    except Exception:
+        j = {}
+    return r.status_code, j
+
+
+_set_online(["A", "B", "C"])              # C 在线但**未启用接单**
+
+st, j = _pull("A")
+got = [o["id"] for o in (j.get("orders") or [])]
+check("A（第一台在线接单设备）拉到指定给自己的任务", st == 200 and got == [OF_A],
+      f"status={st} got={got} 期望=[{OF_A}]")
+
+st, j = _pull("B")
+got_b = [o["id"] for o in (j.get("orders") or [])]
+check("★ B（**第二台**在线接单设备）也能拉到指定给自己的任务"
+      "（改前 take_orders=False、永远拉不到）",
+      st == 200 and got_b == [OF_B], f"status={st} got={got_b} take_orders={j.get('take_orders')}")
+
+st, j = _pull("C")
+check("未启用接单的在线设备 C：take_orders=False 且不分配任务（不越权）",
+      st == 200 and (j.get("orders") or []) == [] and j.get("take_orders") is False,
+      f"status={st} take_orders={j.get('take_orders')} body={j}")
+
+st, j = _pull("A")
+got2 = [o["id"] for o in (j.get("orders") or [])]
+check("未指定目标（target_client=''）的任务：接单设备可拉（A 再拉拿到它）",
+      got2 == [OF_FREE], f"got={got2}")
+
+st, j = _pull("B")
+check("任务都被领走 → 200 + count 0 + take_orders 仍为 True（不再被误判「未接管」）",
+      st == 200 and (j.get("orders") or []) == [] and j.get("take_orders") is True,
+      f"status={st} take_orders={j.get('take_orders')} body={j}")
+
+# 未指定目标的任务不能固定发给「第一台」：退回 queued 后由 B 拉走
+_conn = backend.get_db()
+_conn.execute("UPDATE order_files SET status='queued', operator_client='',"
+              " last_operator_client='' WHERE id=?", (OF_FREE,))
+_conn.commit()
+_conn.close()
+st, j = _pull("B")
+got3 = [o["id"] for o in (j.get("orders") or [])]
+check("未指定目标的任务同样能被第二台设备拉走（不固定发给第一台）", got3 == [OF_FREE], f"got={got3}")
+
 print("\n" + "=" * 52)
 print("页数分析/打印归属验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")
 shutil.rmtree(tmp, ignore_errors=True)
