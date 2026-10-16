@@ -49,12 +49,9 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 # 「已知预期红」：**不是**回归，而是"源码已改、产物待重建"的过渡状态。
 # 判据必须是具体断言 + 明确的解除条件；脚本一旦转绿会提示删除本条，
 # 以免长期掩盖真回归。`--strict` 下仍按失败计。
-EXPECTED_RED: dict[str, str] = {
-    "verify_apk_release.py":
-        "www/print.js 已改（🔴-1 页码区间夹紧），APK 尚未重新打包 ⇒ "
-        "「APK 内 web 资源与 www/ 逐字节一致」必然失败。"
-        "解除条件：执行 gradlew assembleRelease + cap sync（发版步骤 E2）后删除本条。",
-}
+# 2026-10-16：APK 已重打为 1.1.32（versionCode 33）并通过 verify_apk_release.py ⇒
+# 原先 verify_apk_release.py 那条过渡项**已删除**（留着会长期掩盖真回归）。
+EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}
