@@ -1220,6 +1220,39 @@ def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
     logger.info(f"Markdown → PDF 完成: {output_pdf}")
 
 
+def _pdf_product_ok(path: str) -> bool:
+    """转换产物是否**真的**是一份能用的 PDF：存在、非空、且以 `%PDF` 开头。
+
+    为什么需要（D5 第 4 条）：Word/WPS 的 COM 导出会**静默成功** —— `ExportAsFixedFormat`
+    正常返回、不抛异常，但产物可能是 0 字节、半截文件，或压根不是 PDF（写成了别的格式）。
+    降级链原先只看"函数没抛异常"就 `return`，而真正的产物校验在**链外**
+    （`UniversalConverter.convert_to_pdf` 末尾）⇒ 这类情况 LibreOffice 兜底永远轮不到，
+    用户拿到一个打不开的文件（甚至被当成"转换成功"去打印）。
+
+    判定口径与链外**保持同一份实现**（链内外各写一套迟早漂移）：四种转换引擎的产物都是
+    真 PDF，多要一个 `%PDF` 头不会误伤。"""
+    try:
+        if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return False
+        with open(path, "rb") as f:
+            return f.read(5).startswith(b"%PDF")
+    except OSError:
+        return False
+
+
+def _discard_invalid_pdf(path: str) -> None:
+    """丢弃被判定为无效的产物（COM 静默成功留下的 0 字节/非 PDF 残次品）。
+
+    必须在降级到下一引擎**之前**删掉：否则半截文件留在原位，下一引擎可能"看到已存在"
+    而不覆盖，或最终被当成转换结果交出去。失败只记日志，不影响降级流程。"""
+    try:
+        if path and os.path.isfile(path):
+            os.remove(path)
+            logger.warning(f"已丢弃无效的转换产物: {path}")
+    except OSError as e:
+        logger.warning(f"丢弃无效产物失败（忽略）: {path} ({e})")
+
+
 def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
     """
     Office 文档 → PDF（多引擎智能降级）。
@@ -1253,14 +1286,23 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
                 try:
                     logger.info(f"引擎选择: Microsoft Word COM ({os.path.basename(file_path)})")
                     _convert_via_word_com(file_path, output_pdf)
-                    return
+                    if _pdf_product_ok(output_pdf):
+                        return
+                    # COM「静默成功」：没抛异常但产物是空的/不是 PDF ⇒ 丢掉残次品继续降级
+                    logger.warning(
+                        "Microsoft Word 报告成功但产物无效（空 / 非 PDF），降级到下一引擎")
+                    _discard_invalid_pdf(output_pdf)
                 except Exception as e:
                     logger.warning(f"Microsoft Word 转换失败，降级到下一引擎: {e}")
             elif eng == "wps" and _detect_wps():
                 try:
                     logger.info(f"引擎选择: WPS Office COM ({os.path.basename(file_path)})")
                     _convert_via_wps_com(file_path, output_pdf)
-                    return
+                    if _pdf_product_ok(output_pdf):
+                        return
+                    logger.warning(
+                        "WPS Office 报告成功但产物无效（空 / 非 PDF），降级到下一引擎")
+                    _discard_invalid_pdf(output_pdf)
                 except Exception as e:
                     logger.warning(f"WPS Office 转换失败，降级到下一引擎: {e}")
 
@@ -1549,8 +1591,9 @@ class UniversalConverter:
             else:
                 convert_func(file_path, output_pdf)
 
-            if not os.path.isfile(output_pdf) or os.path.getsize(output_pdf) == 0:
-                raise RuntimeError(f"转换为 PDF 后文件为空或不存在: {output_pdf}")
+            # 口径与降级链内部**同一份实现**（_pdf_product_ok）：存在 + 非空 + %PDF 头
+            if not _pdf_product_ok(output_pdf):
+                raise RuntimeError(f"转换为 PDF 后产物无效（空 / 不存在 / 非 PDF）: {output_pdf}")
 
             return output_pdf
         except Exception:
