@@ -41,6 +41,11 @@ ENV_REQUIRED: dict[str, str] = {
     "measure_card_heights.mjs": "需 Playwright / 真实浏览器",
     "verify_dark_rail_contrast.mjs": "需 Playwright / 真实浏览器",
     "verify_preview_render.mjs": "需 Playwright / 真实浏览器",
+    "verify_trend_hourly_render.mjs": "需 Playwright / 真实浏览器（本机已装："
+                                      "C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/"
+                                      "dependencies/node/node_modules/playwright；--all 或直接 node 可跑）",
+    "verify_order_table_columns.mjs": "需 Playwright / 真实浏览器（订单明细列宽只能靠真实布局量；"
+                                      "同上，--all 或直接 node 可跑）",
 }
 
 # 非验收脚本（工具/选型/测量），不参与 PASS 计数

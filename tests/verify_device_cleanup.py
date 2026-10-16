@@ -243,8 +243,8 @@ check("两个按钮共用同一套两段式（先 dry_run 预览、确认后才�
       "function runDeviceCleanup(" in html
       and "Object.assign({ dry_run: true }, extraBody || {})" in html
       and "Object.assign({ dry_run: false }, extraBody || {})" in html)
-check("授权页版本记录已写 v6.7", "v6.7：测试设备不再堆在授权页" in html
-      and ">v6.7</div>" in html)
+check("授权页版本记录已写 v6.7（并已随版本号递增到 v6.9）", "v6.7：测试设备不再堆在授权页" in html
+      and ">v6.9</div>" in html)
 check("离线却挂着接单记录时显示「接单中（离线）」并提示可删除清空",
       "接单中（离线）" in html and "僵尸记录" in html)
 

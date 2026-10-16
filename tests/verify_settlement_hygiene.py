@@ -299,6 +299,9 @@ const sum = (o, ids) => ids.reduce((s, id) => s + (o[id] || 0), 0);
   const sb = makeSandbox();
   vm.runInContext(mExcl[0], sb);
   vm.runInContext(fnBody('_orderMoney'), sb);
+  /* v6.8：日趋势与逐时趋势共用同一累加/建桶函数（收益口径唯一落点），故先把它们装进沙箱 */
+  vm.runInContext(fnBody('_trendEmptyBucket'), sb);
+  vm.runInContext(fnBody('_trendAccumulate'), sb);
   vm.runInContext(fnBody('_computeDailyTrend'), sb);
   vm.runInContext(fnBody('_trendByBucket'), sb);
   // 只服务 pages/sheets 两列，与「收益」口径无关

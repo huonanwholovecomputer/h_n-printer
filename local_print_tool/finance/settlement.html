@@ -236,9 +236,12 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .tag.p { background: rgba(139,92,246,.15); color: #8b5cf6; }
 [data-theme="dark"] .tag.p { color: #a78bfa; }
 /* 订单类型固定槽位网格（v5.23）：相同/同类标签在不同订单间竖直对齐——
-   单行 7 槽：自打/接单 | 自动 | 预约 | 免费 | 派送 | 加急 | 封面。
-   每个槽位固定宽度，无标签时留空占位，保证跨行对齐。 */
-.type-grid { display: grid; grid-template-columns: repeat(7, 58px); gap: 4px; }
+   槽序：自打/接单 | 自动 | 预约 | 免费 | 派送 | 加急 | 封面。
+   每个槽位固定宽度，无标签时留空占位，保证跨行对齐。
+   v6.9：槽位数不再恒为 7 —— 全表无人使用的槽整列移除（_typeSlotsUsed / _orderTypeTags），
+   因此 grid-template-columns 与列宽由 JS 按实际槽位内联给出（常量见 TYPE_SLOT_W / TYPE_SLOT_GAP），
+   此处只留布局骨架。 */
+.type-grid { display: grid; }
 .type-cell { display: flex; align-items: center; justify-content: center; min-height: 22px; }
 /* 订单状态标签配色：与微信小程序 status-* 完全一致（亮色=小程序亮色主题，深色=小程序暗色主题） */
 .tag.st-sent            { background: #E8F5E9; color: #2E7D32; }
@@ -377,10 +380,11 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .file-grid.file-sub-row { color: var(--muted); border-top: 1px dashed var(--border); }
 .expand-icon { display: inline-block; transition: transform .2s ease; font-size: .68rem; margin-right: 4px; color: var(--muted); }
 .order-row.expanded .expand-icon { transform: rotate(90deg); }
-/* 订单明细表：固定布局，列宽由表头决定，展开子行不重排列宽；min-width 保证窄窗口仍可横向滚动。
-   类型列 270px = 全量类型标签宽度（450px）的 60%（接单+自动+预约+加急+派送+封面+免费），
-   宽窗口时多余空间按比例放大各列，类型列只会更宽不会更窄。 */
-.order-table { table-layout: fixed; width: 100%; min-width: 1582px; }
+/* 订单明细表：固定布局，列宽由表头决定，展开子行不重排列宽。
+   v6.9：「类型」列按实际用到的槽位数缩窄，腾出的宽度补给「时间 / 开始打印 / 接单设备」，
+   列宽与 min-width 全部由 _orderColWidths() 在渲染时内联给出（下表 min-width 仅作 JS 未执行时的兜底）。
+   min-width = 各列宽之和：窗口比它窄时 .table-wrap 横向滚动，比它宽时多余空间按列宽比例摊到各列。 */
+.order-table { table-layout: fixed; width: 100%; min-width: 1518px; }
 .order-table .ell { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bound-badge { font-size: .7rem; padding: 1px 8px; border-radius: 999px; font-weight: 600; }
 .bound-badge.yes { background: rgba(22,163,74,.13); color: var(--pos); }
@@ -1135,7 +1139,8 @@ function $$(s) { return Array.prototype.slice.call(document.querySelectorAll(s))
 /* 月份工具 */
 function monthKeyOf(d) { return (d || '').slice(0, 7); }
 function currentMonthKey() { var n = new Date(); return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0'); }
-function todayStr() { var d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+function ymd(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+function todayStr() { return ymd(new Date()); }
 function labelOf(key) { var p = String(key).split('-'); return (+p[0]) + '年' + (+p[1]) + '月'; }
 function allMonthKeys() {
   var set = {};
@@ -1673,9 +1678,13 @@ function cssVar(name) { return getComputedStyle(document.body).getPropertyValue(
    指标切换、视角切换、状态筛选、分页等「展示方式」控件保留在各模块内部（局部控件）。 */
 var _cloudData = null, _cloudLoading = false, _cloudExpanded = {};
 var _cloudMonthsCache = null, _cloudMonthsReady = false;
-/* 时间口径：mode='month'（指定自然月，按月结算工作流）| '30d' | '90d' | '1y' | 'custom'（自定义起止） */
+/* 时间口径：mode='month'（指定自然月，按月结算工作流）| 'day'（单日 day='YYYY-MM-DD'：今天 / 点柱状图下钻 / 自定义单日）
+   | '7d' | '30d' | '90d' | '1y' | 'custom'（自定义起止） */
 var _scopeTime = { mode: 'month', month: null, start: '', end: '' };
 var _scopeCustom = { start: '', end: '' };  // 自定义起止（自绘日历写入，YYYY-MM-DD）
+/* v6.8：单日下钻 —— 点趋势柱状图进入该日「逐时」视图；此处记住下钻前的口径，供「← 返回区间」一键回到原区间。
+   任何手动切换时间口径都会清空它（手动换口径 = 放弃返回点）。 */
+var _trendDrillPrev = null;
 var _scopeMembers = null;   // null=全部成员；否则 { 'member:<id>' / 'openid:<oid>' / 'local:<name>' : true }
 var _scopeSources = null;   // null=全部来源；否则 { wechat / app / local : true } 子集（空集=无匹配）
 var _scopeCache = {};       // 口径缓存：key(start_end) -> data（手动刷新时清空）
@@ -1760,18 +1769,18 @@ function selectedStatuses() {
   // v5：补入预约/待打印/下载中（scheduled/waiting/downloading），与后端父子订单模型对齐
   return ['sent', 'printing', 'queued', 'failed', 'canceled', 'rejected', 'accepted', 'abandoned', 'reserved', 'offline_unknown', 'scheduled', 'waiting', 'downloading'];
 }
-/* 时间口径 → 起止日期（month=指定自然月；30d/90d/1y 以今天为终点向前推；custom=自定义起止） */
+/* 快捷区间 → 向前推的天数（含今天） */
+var _SPAN_DAYS = { '7d': 6, '30d': 29, '90d': 89, '1y': 364 };
+/* 时间口径 → 起止日期（month=指定自然月；day=单日（今天 / 点柱状图下钻 / 自定义单日）；
+   7d/30d/90d/1y 以今天为终点向前推；custom=自定义起止） */
 function _scopeRange() {
   var t = _scopeTime;
   if (t.mode === 'month') return monthRange(t.month || currentMonthKey());
-  if (t.mode === '30d' || t.mode === '90d' || t.mode === '1y') {
-    var n = t.mode === '30d' ? 29 : t.mode === '90d' ? 89 : 364;
+  if (t.mode === 'day') { var day = t.day || todayStr(); return { start: day, end: day }; }
+  if (_SPAN_DAYS[t.mode] !== undefined) {
     var d = new Date();
-    d.setDate(d.getDate() - n);
-    return {
-      start: d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'),
-      end: todayStr()
-    };
+    d.setDate(d.getDate() - _SPAN_DAYS[t.mode]);
+    return { start: ymd(d), end: todayStr() };
   }
   if (t.mode === 'custom' && t.start && t.end) return { start: t.start, end: t.end };
   return null;
@@ -1779,9 +1788,12 @@ function _scopeRange() {
 function _scopeTimeLabel() {
   var t = _scopeTime;
   if (t.mode === 'month') return labelOf(t.month || currentMonthKey());
+  if (t.mode === 'day') { var d = t.day || todayStr(); return d === todayStr() ? '今天' : d; }
+  if (t.mode === '7d') return '近7天';
   if (t.mode === '30d') return '近30天';
   if (t.mode === '90d') return '近90天';
   if (t.mode === '1y') return '近1年';
+  if (t.mode === 'custom' && t.start && t.start === t.end) return t.start === todayStr() ? '今天' : t.start;
   return '自定义区间';
 }
 /* 口径唯一数据源：按当前时间口径拉取（成员/来源筛选为前端过滤，不触发请求；趋势与全页共用本数据）。
@@ -1907,8 +1919,9 @@ function onScopeCustomApply() {
   if (sv < minD) { toast('起始日期不能早于 ' + minD + '（最早数据日期）', 'error'); return; }
   if (ev > maxD) { toast('结束日期不能晚于今天', 'error'); return; }
   _scopeTime = { mode: 'custom', month: _scopeTime.month, start: sv, end: ev };
+  _trendDrillPrev = null;
   _ordersPage = 1;
-  fetchScopeData();
+  _fetchScope();
 }
 
 /* ==================== v6.0：全局口径栏（时间/成员多选/来源多选） ==================== */
@@ -1959,6 +1972,11 @@ function _scopeSourcesLabel() {
   return arr.length ? arr.join('·') : '已选 0 个来源';
 }
 /* ---- 口径栏交互（成员/来源复选仅前端过滤，不发请求；切换时间口径才重新拉取） ---- */
+/* 口径取数分派：云端走 revenue 代理，本地模式走本地订单库（两者返回同构结构）。
+   时间口径的每一次切换都必须经过这里 —— 本地模式下直接调 fetchScopeData 会打到云端代理。 */
+function _fetchScope(force) {
+  return FINANCE_MODE === 'local' ? fetchLocalScopeData(force) : fetchScopeData(force);
+}
 function onScopeTimeChange(v) {
   if (v === 'r:custom') {
     // 无论当前是否已是自定义，都弹出日历：(原 return 会把"再次选自定义日期"挡住，
@@ -1968,10 +1986,13 @@ function onScopeTimeChange(v) {
     if (anchor) _calOpen('start', anchor);      // 弹日历选开始日期，选完结束日期自动应用
     return;
   }
-  if (v.indexOf('m:') === 0) _scopeTime = { mode: 'month', month: v.slice(2), start: '', end: '' };
+  _trendDrillPrev = null;   // 手动切换时间口径 = 放弃「返回下钻前区间」的返回点
+  if (v === 'r:today') _scopeTime = { mode: 'day', day: todayStr(), month: _scopeTime.month, start: '', end: '' };
+  else if (v === 'r:day') _scopeTime = { mode: 'day', day: _scopeTime.day || todayStr(), month: _scopeTime.month, start: '', end: '' };
+  else if (v.indexOf('m:') === 0) _scopeTime = { mode: 'month', month: v.slice(2), start: '', end: '' };
   else _scopeTime = { mode: v.slice(2), month: _scopeTime.month, start: '', end: '' };
   _ordersPage = 1;
-  fetchScopeData();
+  _fetchScope();
 }
 function onScopeDD(which) {
   _ddOpen = _ddOpen === which ? null : which;
@@ -2043,7 +2064,10 @@ function _renderScopeBar(keys) {
   h += '<optgroup label="按月结算">';
   keys.forEach(function (k) { h += '<option value="m:' + k + '"' + (t.mode === 'month' && t.month === k ? ' selected' : '') + '>' + labelOf(k) + '</option>'; });
   h += '</optgroup><optgroup label="任意区间">';
-  [['30d', '近30天'], ['90d', '近90天'], ['1y', '近1年']].forEach(function (r) {
+  var _dayv = t.mode === 'day' ? (t.day || todayStr()) : '';
+  h += '<option value="r:today"' + (_dayv === todayStr() ? ' selected' : '') + '>今天</option>';
+  if (_dayv && _dayv !== todayStr()) h += '<option value="r:day" selected>' + esc('单日 ' + _dayv) + '</option>';
+  [['7d', '近7天'], ['30d', '近30天'], ['90d', '近90天'], ['1y', '近1年']].forEach(function (r) {
     h += '<option value="r:' + r[0] + '"' + (t.mode === r[0] ? ' selected' : '') + '>' + r[1] + '</option>';
   });
   h += '<option value="r:custom"' + (t.mode === 'custom' ? ' selected' : '') + '>' + (t.mode === 'custom' && t.start ? esc('自定义 ' + t.start + ' ~ ' + t.end) : '自定义日期…') + '</option>';
@@ -2059,10 +2083,10 @@ function _renderScopeBar(keys) {
   if (FINANCE_MODE !== 'local') h += _renderScopeDD('sources');   // 本地模式全部为本地订单，无来源可选
   h += '<div class="f-item" style="margin-left:auto;text-align:right"><label>&nbsp;</label><div style="display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap">';
   if (_cloudDataFetchedAt) h += '<span style="font-size:.76rem;color:var(--muted)">☁ 最后同步 <b style="color:var(--text)">' + _cloudDataFetchedAt + '</b></span>';
-  h += '<button class="btn" onclick="fetchScopeData(true)">🔄 刷新</button></div></div>';
+  h += '<button class="btn" onclick="_fetchScope(true)">🔄 刷新</button></div></div>';
   h += '</div>';
   /* 口径摘要行：滚动到任何位置，抬头即知「现在看的是什么」 */
-  h += '<div class="scope-summary">📌 当前口径：<b>' + (range ? esc(range.start) + ' ~ ' + esc(range.end) : '未选择') + '</b><span>·</span><span>' + esc(_scopeMembersLabel()) + '</span><span>·</span><span>' + esc(_scopeSourcesLabel()) + '</span>';
+  h += '<div class="scope-summary">📌 当前口径：<b>' + (range ? (range.start === range.end ? esc(range.start) + '（单日 · 逐时）' : esc(range.start) + ' ~ ' + esc(range.end)) : '未选择') + '</b><span>·</span><span>' + esc(_scopeMembersLabel()) + '</span><span>·</span><span>' + esc(_scopeSourcesLabel()) + '</span>';
   if (_cloudData) h += '<span>·</span><span><b>' + _cloudFilteredOrders().length + '</b> 单</span>';
   h += '</div></div>';
   return h;
@@ -2212,11 +2236,13 @@ function _syncScopeDateFields() {
   }
 }
 /* 粒度判定（v5.9）：≤60 天按日（柱状图，每天一柱）；>60 天切片（固定最多 90 片，平滑折线图，v5.16 由 60 片调整），
-   不再按月/年划分 —— 月度聚合会抹平月内波动，固定切片能保留更多变化趋势 */
+   不再按月/年划分 —— 月度聚合会抹平月内波动，固定切片能保留更多变化趋势；
+   v6.8：**单日**（起止同一天，含「今天」/点柱状图下钻）→ 'hour'（00:00~23:00 每小时一柱，对齐 DeepSeek 开放平台） */
 function _trendGranularity(start, end) {
   var s = new Date(start), e = new Date(end);
   if (isNaN(s) || isNaN(e) || e < s) return 'day';
   var days = Math.round((e - s) / 86400000) + 1;
+  if (days <= 1) return 'hour';
   return days <= 60 ? 'day' : 'slice';
 }
 /* v5.9：时间轴切片 —— 将补全后的日序列均匀切成最多 maxSlices 片（每片聚合求和），
@@ -2245,7 +2271,8 @@ function _sliceTrend(points, maxSlices) {
 }
 /* v6.0：趋势图当前渲染状态 —— 与全页同一口径（同一批全局过滤后的订单，不再独立拉数），
    粒度判定 + 切片；供整页渲染（renderCloud）与指标局部重绘（onCloudTrendMetric）共用，保证两处结果一致。
-   口径终点在未来时（当月尚未过完）终点取今天，不补全未来零值。 */
+   口径终点在未来时（当月尚未过完）终点取今天，不补全未来零值。
+   v6.8：单日口径（gran='hour'）不走切片 —— 直接给 24 个整点桶（空小时补 0 保留位置）。 */
 function _trendViewState() {
   var gran = 'day', points = [];
   if (_cloudData) {
@@ -2254,23 +2281,34 @@ function _trendViewState() {
       var end = r.end > todayStr() ? todayStr() : r.end;
       var trOrders = _cloudFilteredOrders();
       gran = _trendGranularity(r.start, end);
-      var dailyPts = [];
-      if (trOrders.length > 0) dailyPts = _fillTrendGaps(_computeDailyTrend(trOrders), r.start, end, 'day');
-      points = gran === 'day' ? dailyPts : _sliceTrend(dailyPts, 90);
+      if (gran === 'hour') {
+        points = _computeHourlyTrend(trOrders, r.start);   // 单日：始终 24 柱（当天没单也留轴，便于逐时对照）
+      } else {
+        var dailyPts = [];
+        if (trOrders.length > 0) dailyPts = _fillTrendGaps(_computeDailyTrend(trOrders), r.start, end, 'day');
+        points = gran === 'day' ? dailyPts : _sliceTrend(dailyPts, 90);
+      }
     }
   }
   return { gran: gran, points: points };
 }
-/* 趋势标题提示文案（口径 + 切片说明 + 峰值），整页渲染与局部重绘共用 */
+/* 趋势标题提示文案（口径 + 切片说明 + 峰值 + 下钻提示），整页渲染与局部重绘共用 */
 function _trendHintText() {
   if (!_cloudData) return '';
   var r = _scopeRange();
   if (!r) return '';
   var end = r.end > todayStr() ? todayStr() : r.end;
-  var txt = _scopeTimeLabel() + '（' + r.start + ' ~ ' + end + '）';
   var tv = _trendViewState();
+  var txt;
+  if (tv.gran === 'hour') {
+    var lbl = _scopeTimeLabel();   // 单日：'今天' 需要补日期，已是日期则不再重复
+    txt = (lbl === r.start ? lbl : lbl + '（' + r.start + '）') + ' · 逐时（00:00~23:00 每小时一柱）';
+  } else {
+    txt = _scopeTimeLabel() + '（' + r.start + ' ~ ' + end + '）';
+  }
   if (tv.gran === 'slice') txt += ' · 已按 90 片切片聚合展示';
   if (tv.points.length > 0) txt += ' · ' + _trendPeak(tv.points, _cloudTrendMetric);
+  if (tv.gran === 'day') txt += ' · 点击柱状图可下钻到当天逐时';
   return txt;
 }
 /* 按 月/年 桶聚合（v5.9 起已由固定切片替代，保留函数以防回退；与 _computeDailyTrend 同字段） */
@@ -2359,12 +2397,42 @@ function onCloudTrendMetric(m) {
   if (_cloudCharts['cloud-chart-trend']) { _cloudCharts['cloud-chart-trend'].destroy(); delete _cloudCharts['cloud-chart-trend']; }
   var tv = _trendViewState();
   if (tv.points.length > 0) {
-    if (tv.gran === 'day') _renderBucketTrend('cloud-chart-trend', tv.points, m, 'day');
-    else _renderDailyTrend('cloud-chart-trend', tv.points, m);
+    if (tv.gran === 'slice') _renderDailyTrend('cloud-chart-trend', tv.points, m);
+    else _renderBucketTrend('cloud-chart-trend', tv.points, m, tv.gran);   // 'day'（可下钻）/ 'hour'（逐时）
   }
 }
 /* v5.16：状态筛选改为局部刷新订单明细（回到第 1 页），不再整页重建 */
 function onCloudStatusFilter(v) { _cloudStatusFilter = v; _ordersPage = 1; _rerenderOrdersOnly(); }
+
+/* ==================== v6.8：趋势下钻（单日逐时） ====================
+   交互与 DeepSeek 开放平台一致：点趋势柱状图的某一天 → 时间口径切到「该日」，趋势图变成
+   00:00~23:00 每小时一柱。下钻不改展示方式、只改口径 —— KPI / 成员账目 / 订单明细跟着同一天
+   走（全页单一口径），因此这里复用正常的口径切换链路（fetchScopeData），不新增数据通道。
+   下钻前的口径存进 _trendDrillPrev，趋势卡片出现「← 返回区间」一键回到原区间。 */
+function _snapshotScope() {
+  return { mode: _scopeTime.mode, month: _scopeTime.month, start: _scopeTime.start || '', end: _scopeTime.end || '', day: _scopeTime.day || '' };
+}
+function _restoreScope(s) {
+  _scopeTime = { mode: s.mode, month: s.month, start: s.start || '', end: s.end || '', day: s.day || '' };
+  if (s.mode === 'custom') _scopeCustom = { start: s.start || '', end: s.end || '' };
+}
+function drillTrendDay(day) {
+  if (!day) return;
+  var cur = _scopeRange();
+  if (_scopeTime.mode === 'day' && cur && cur.start === day) return;   // 已在该日，不重复请求
+  if (_scopeTime.mode !== 'day') _trendDrillPrev = _snapshotScope();
+  _restoreScope({ mode: 'day', month: _scopeTime.month, day: day, start: '', end: '' });
+  _ordersPage = 1;
+  _fetchScope();
+}
+function undoTrendDrill() {
+  if (!_trendDrillPrev) return;
+  var prev = _trendDrillPrev;
+  _trendDrillPrev = null;
+  _restoreScope(prev);
+  _ordersPage = 1;
+  _fetchScope();
+}
 
 /* ==================== v5.17：云端收益记录口径（统一为「子任务」维度） ====================
    云端收益记录 record  = 子任务非排除状态的金额合计 —— 原「已入账（sent）+ 应收未收（待处理）」
@@ -2537,32 +2605,128 @@ function _fmtWaitSeconds(s) {
   return mm ? (hh + ' 小时 ' + mm + ' 分') : (hh + ' 小时');
 }
 
-function _orderTypeTags(o, money) {
-  var h = '<span class="type-grid">';
-  // 槽1：自打 / 接单（互斥，恒占位 → 跨订单恒对齐）
-  h += '<span class="type-cell">' + (o.is_admin_print
-    ? '<span class="tag b" title="管理员自行打印的订单">👤自打</span>'
-    : '<span class="tag g" title="顾客下单，接单打印">🤝接单</span>') + '</span>';
-  // 槽2：自动
-  h += '<span class="type-cell">' + (o.auto_print
-    ? '<span class="tag p" title="无障碍打印（自动打印）">⚡自动</span>' : '') + '</span>';
-  // 槽3：预约
-  h += '<span class="type-cell">' + (o.schedule_mode && o.schedule_mode !== 'now'
-    ? '<span class="tag y" title="预约 ' + esc(o.scheduled_at || '') + ' 打印">⏰预约</span>' : '') + '</span>';
-  // 槽4：免费
-  h += '<span class="type-cell">' + (money.free > 0
-    ? '<span class="tag g" title="含 ' + money.free + ' 个免费文件">🆓免费</span>' : '') + '</span>';
-  // 第 2 行：派送
-  h += '<span class="type-cell">' + (o.delivery_enabled
-    ? '<span class="tag y" title="派送费 ' + (o.delivery_percentage || 0) + '%">🚚派送</span>' : '') + '</span>';
-  // 加急
-  h += '<span class="type-cell">' + (o.urgency && o.urgency !== '低'
-    ? '<span class="tag r" title="加急费 ' + RMB(parseCents(o.urgency_price || 0)) + '">⚡' + esc(o.urgency) + '</span>' : '') + '</span>';
-  // 封面
-  h += '<span class="type-cell">' + (o.cover_page
-    ? '<span class="tag p" title="封面费 ' + RMB(parseCents(o.cover_page_price || 0)) + '">📄封面</span>' : '') + '</span>';
-  h += '</span>';
-  return h;
+/* ==================== v6.9：订单明细「类型」列 —— 按用到的槽位动态取列 ====================
+   类型列原先是 7 个固定槽（自打/接单 | 自动 | 预约 | 免费 | 派送 | 加急 | 封面）恒占 432px，
+   而实际一个月往往只用到第 1~2 槽 —— 整列大段是空槽，右侧「时间 / 开始打印 / 接单设备」
+   反被挤到截断（时间/开始打印 需要 139px 只给 132px，接单设备 需要 280px 只给 200px）。
+   现改为：
+     · **当前页**（页面上真正渲染的那批订单，见 _typeSlotsUsed 的调用点）无人使用的槽整列移除 ——
+       所见即所得：这一页没有任何订单用的服务就不再占宽度；（代价是翻页 / 改「每页条数」会按新一页
+       的内容重新排列宽，这是刻意的 —— 判据始终是眼睛看到的那批订单，而不是选中的整段时间轴。）
+       剩下的槽仍是固定宽度，同页内跨订单竖直对齐不受影响；
+     · 类型列按实际槽位数缩窄，腾出的宽度按优先级补给 时间 → 开始打印 → 接单设备
+       （各自到「完整显示」目标宽即止）；补不完的余量交给 min-width —— 表格整体变窄、
+       不留空白，也不让类型列虚胖回去。 */
+var TYPE_SLOT_W = 58;      // 单槽宽度（与旧 .type-grid repeat(7,58px) 一致）
+var TYPE_SLOT_GAP = 4;     // 槽间距
+var TYPE_COL_PAD = 30;     // td 左右 padding 28 + 2px 取整余量
+var TYPE_COL_BASE = 432;   // 旧硬编码的 7 槽列宽 —— 只作「腾出多少宽度」的基准
+/* 槽位定义（唯一真相：占用判定与标签渲染同出一源，避免两处口径漂移）。
+   key 决定标签怎么画（_typeSlotTag），on(o,m) 决定该订单是否占用本槽；
+   槽 1（自打/接单）互斥且恒占位 —— 每个订单必占它，作为跨订单对齐的基准。 */
+var TYPE_SLOTS = [
+  { key: 'mode',  on: function () { return true; } },
+  { key: 'auto',  on: function (o) { return !!o.auto_print; } },
+  { key: 'sched', on: function (o) { return !!(o.schedule_mode && o.schedule_mode !== 'now'); } },
+  { key: 'free',  on: function (o, m) { return m.free > 0; } },
+  { key: 'deliv', on: function (o) { return !!o.delivery_enabled; } },
+  { key: 'urg',   on: function (o) { return !!(o.urgency && o.urgency !== '低'); } },
+  { key: 'cover', on: function (o) { return !!o.cover_page; } },
+];
+/* 哪些槽位被这批订单用到（false → 整列移除）。**只传当前页渲染的那批订单**
+   （别传整个筛选结果：否则某一页已无人使用的服务仍会白占一列宽度）；免费槽依赖
+   _orderMoney().free，故逐单算一次，7 个槽全部命中即提前收工。 */
+function _typeSlotsUsed(orders) {
+  var used = TYPE_SLOTS.map(function () { return false; });
+  var left = used.length;
+  (orders || []).forEach(function (o) {
+    if (!left) return;
+    var m = _orderMoney(o);
+    TYPE_SLOTS.forEach(function (s, i) {
+      if (!used[i] && s.on(o, m)) { used[i] = true; left--; }
+    });
+  });
+  return used;
+}
+function _typeSlotsCount(used) {
+  var n = 0;
+  for (var i = 0; i < TYPE_SLOTS.length; i++) if (!used || used[i]) n++;
+  return n;
+}
+/* n 槽时的类型列宽（border-box）：网格宽 + td 左右 padding + 取整余量。
+   7 槽 = 460（旧的 432 装不下 430 的网格，会把「封面」标签溢出压到「时间」列的 padding 上，顺势修正）。 */
+function _typeColWidth(n) {
+  if (n <= 0) return 0;
+  return TYPE_SLOT_W * n + TYPE_SLOT_GAP * (n - 1) + TYPE_COL_PAD;
+}
+/* 右侧三列的宽度：min = 旧硬编码宽（7 槽全用时保持原样），full = 完整显示所需宽（浏览器实测）：
+   「YYYY-MM-DD HH:MM:SS」文字 111px + padding 28 → 139，取 146 留字体/缩放余量；
+   接单设备「{所有者}的设备 | {client_id}」实测 3 字所有者 252px + padding 28 = 280，
+   取 320 覆盖 4 字所有者与略长的计算机名（再长仍靠 title 悬停 + 省略号兜底）。 */
+var ORDER_COL_TIME = { min: 132, full: 146 };
+var ORDER_COL_PRINT = { min: 132, full: 146 };
+var ORDER_COL_DEVICE = { min: 200, full: 320 };
+/* 类型列以外的固定列 [表头文字, 宽度] —— 顺序必须与订单行 <td> 的输出顺序一致：
+   展开 / 订单号 / 来源 / 用户 / 状态 / 金额 / 文件 / 页数 / 张数（这 9 列之后才是动态的 4 列）。 */
+var ORDER_FIXED_COLS = [
+  ['', 34], ['订单号', 140], ['来源', 64], ['用户', 104], ['状态', 84],
+  ['金额', 88], ['文件', 58], ['页数', 96], ['张数', 88]
+];
+var ORDER_FIXED_W = ORDER_FIXED_COLS.reduce(function (a, c) { return a + c[1]; }, 0);
+/* 列宽分配（唯一真相）：类型列按槽位数取宽，腾出的宽度按 时间 → 开始打印 → 接单设备 依次补齐，
+   补不完的余量记为 slack（渲染时用它收窄表 min-width，不给任何列留空白）。 */
+function _orderColWidths(used) {
+  var type = _typeColWidth(_typeSlotsCount(used));
+  var pool = Math.max(0, TYPE_COL_BASE - type);   // 7 槽全用时为 0
+  var time = ORDER_COL_TIME.min, print = ORDER_COL_PRINT.min, device = ORDER_COL_DEVICE.min;
+  var add = Math.min(pool, ORDER_COL_TIME.full - time);   time += add; pool -= add;
+  add = Math.min(pool, ORDER_COL_PRINT.full - print);     print += add; pool -= add;
+  add = Math.min(pool, ORDER_COL_DEVICE.full - device);   device += add; pool -= add;
+  return { type: type, time: time, print: print, device: device, slack: pool,
+           minWidth: ORDER_FIXED_W + type + time + print + device };
+}
+/* 单槽标签：key → HTML（空串 = 该订单未使用此服务，留空槽占位以保证跨订单对齐） */
+function _typeSlotTag(key, o, money) {
+  if (key === 'mode') {
+    return o.is_admin_print
+      ? '<span class="tag b" title="管理员自行打印的订单">👤自打</span>'
+      : '<span class="tag g" title="顾客下单，接单打印">🤝接单</span>';
+  }
+  if (key === 'auto') {
+    return o.auto_print
+      ? '<span class="tag p" title="无障碍打印（自动打印）">⚡自动</span>' : '';
+  }
+  if (key === 'sched') {
+    return (o.schedule_mode && o.schedule_mode !== 'now')
+      ? '<span class="tag y" title="预约 ' + esc(o.scheduled_at || '') + ' 打印">⏰预约</span>' : '';
+  }
+  if (key === 'free') {
+    return money.free > 0
+      ? '<span class="tag g" title="含 ' + money.free + ' 个免费文件">🆓免费</span>' : '';
+  }
+  if (key === 'deliv') {
+    return o.delivery_enabled
+      ? '<span class="tag y" title="派送费 ' + (o.delivery_percentage || 0) + '%">🚚派送</span>' : '';
+  }
+  if (key === 'urg') {
+    return (o.urgency && o.urgency !== '低')
+      ? '<span class="tag r" title="加急费 ' + RMB(parseCents(o.urgency_price || 0)) + '">⚡' + esc(o.urgency) + '</span>' : '';
+  }
+  if (key === 'cover') {
+    return o.cover_page
+      ? '<span class="tag p" title="封面费 ' + RMB(parseCents(o.cover_page_price || 0)) + '">📄封面</span>' : '';
+  }
+  return '';
+}
+/* used = _typeSlotsUsed() 的结果：false 的槽整列不渲染（该服务全表无人使用） */
+function _orderTypeTags(o, money, used) {
+  var cells = '';
+  TYPE_SLOTS.forEach(function (s, i) {
+    if (used && !used[i]) return;
+    cells += '<span class="type-cell">' + _typeSlotTag(s.key, o, money) + '</span>';
+  });
+  var n = _typeSlotsCount(used);
+  return '<span class="type-grid" style="grid-template-columns:repeat(' + n + ',' + TYPE_SLOT_W + 'px);gap:' + TYPE_SLOT_GAP + 'px">' + cells + '</span>';
 }
 function _orderAddr(o) {
   var parts = [];
@@ -2664,6 +2828,11 @@ function _renderOrderListHTML() {
   var start = (_ordersPage - 1) * _ordersPerPage;
   var pageOrders = listOrders.slice(start, start + _ordersPerPage);
   var statusCount = _countByStatus(_cloudFilteredOrders());   // 筛选下拉计数（状态过滤前）
+  /* v6.9：类型列只用「当前页真正渲染的这批订单」用到的槽 —— 所见即所得（翻页/改每页条数时
+     按新一页的内容重排列宽，判据永远是眼睛看到的那批订单，而不是选中的整段时间轴）；
+     腾出的宽度由 _orderColWidths() 补给 时间/开始打印/接单设备（见该函数说明） */
+  var typeUsed = _typeSlotsUsed(pageOrders);
+  var colW = _orderColWidths(typeUsed);
 
   var h = '<div class="section" id="cloud-orders"><h2>📋 订单明细 <span class="hint">' + total + ' 条，时间倒序 · 自打/放弃/取消/打回/失败订单金额仅展示、不计入收益 · 带 <b>*</b> 的金额含未计入收益的部分</span>';
   h += '<span style="margin-left:auto"><select onchange="onCloudStatusFilter(this.value)" style="padding:6px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.8rem">';
@@ -2678,7 +2847,13 @@ function _renderOrderListHTML() {
   if (!pageOrders.length) {
     h += '<div class="empty" style="padding:20px"><p>无匹配订单</p></div>';
   } else {
-    h += '<div class="table-wrap"><table class="order-table"><thead><tr><th style="width:34px"></th><th style="width:140px">订单号</th><th style="width:64px">来源</th><th style="width:104px">用户</th><th style="width:84px">状态</th><th style="width:88px">金额</th><th style="width:58px">文件</th><th style="width:96px">页数</th><th style="width:88px">张数</th><th style="width:432px">类型</th><th style="width:132px">时间</th><th style="width:132px">开始打印</th><th style="width:200px">接单设备</th></tr></thead><tbody>';
+    /* 表头由 ORDER_FIXED_COLS（固定 9 列）+ 动态 4 列拼出，列宽即表格的唯一真相 */
+    var hcols = ORDER_FIXED_COLS.map(function (c) {
+      return '<th style="width:' + c[1] + 'px">' + c[0] + '</th>';
+    }).join('');
+    hcols += '<th style="width:' + colW.type + 'px">类型</th><th style="width:' + colW.time + 'px">时间</th>' +
+             '<th style="width:' + colW.print + 'px">开始打印</th><th style="width:' + colW.device + 'px">接单设备</th>';
+    h += '<div class="table-wrap"><table class="order-table" style="min-width:' + colW.minWidth + 'px"><thead><tr>' + hcols + '</tr></thead><tbody>';
     pageOrders.forEach(function (o) {
       var isExp = !!_cloudExpanded[o.order_id];
       var srcTxt = o.source === 'app' ? 'APP' : (o.source === 'local' ? '本地' : '小程序');
@@ -2745,7 +2920,7 @@ function _renderOrderListHTML() {
       h += '<td>' + (o.total_page_count || 0) + '</td>';
       var _osheets = _orderSheets(o);
       h += '<td title="单面 ' + _osheets.single + ' 张 · 双面 ' + _osheets.duplex + ' 张">' + (_osheets.total || 0) + '</td>';
-      h += '<td style="font-size:.76rem;line-height:1.9" title="' + esc(addr) + '">' + _orderTypeTags(o, money) + '</td>';
+      h += '<td style="font-size:.76rem;line-height:1.9" title="' + esc(addr) + '">' + _orderTypeTags(o, money, typeUsed) + '</td>';
       h += '<td class="ell" style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 19)) + '</td>';
       // 开始打印：无则显示 —；有则显示时间，悬停展示后端计算的等待时长
       var _waitTxt = _fmtWaitSeconds(o.wait_seconds);
@@ -3245,13 +3420,17 @@ function _renderDailyTrend(canvasId, trend, metric) {
 }
 /* 通用柱状图（v5.9 起用于 ≤60 天的日粒度：每天一柱）：柱 = 当前指标
    v5.10：所有柱统一指标色，不高亮峰值柱
-   v5.11：柱体不透明实色；悬停时深色模式加亮、浅色模式变暗（scriptable 动态读取当前主题） */
+   v5.11：柱体不透明实色；悬停时深色模式加亮、浅色模式变暗（scriptable 动态读取当前主题）
+   v6.8：granularity='day' → 每根柱可点（下钻到该日逐时）；'hour' → 逐时柱（00:00~23:00），
+         x 轴刻度减半显示、悬停标题补上日期，点柱不再下钻（已经是一天的明细） */
 function _renderBucketTrend(canvasId, points, metric, granularity) {
   var canvas = document.getElementById(canvasId);
   if (!canvas || !points || !points.length) return;
   var ctx = canvas.getContext('2d');
   var tc = _TREND_COLORS[metric] || _TREND_COLORS.revenue;
   var mainColor = tc.main;
+  var hourly = granularity === 'hour';
+  var drillable = granularity === 'day';
   var lineData = points.map(function (p) {
     return metric === 'revenue' ? Math.round((p.revenue || 0) * 100) / 100
          : metric === 'count' ? (p.count || 0)
@@ -3273,27 +3452,83 @@ function _renderBucketTrend(canvasId, points, metric, granularity) {
     options: {
       responsive: true, maintainAspectRatio: false,
       interaction: { mode: 'index', intersect: false },
-      plugins: { legend: { position: 'top', onClick: function () {}, labels: { font: { size: 11 }, boxWidth: 14, padding: 10, usePointStyle: true, color: chartTextColor() } } },
+      /* 点柱下钻（仅日粒度）：命中哪根柱就切到那天（Chart.js 的 activeElements[0].index == 数据下标） */
+      onClick: function (evt, els) {
+        if (!drillable || !els || !els.length) return;
+        var p = points[els[0].index];
+        if (!p || !p.date) return;
+        /* 不能在这里同步重建：本回调正跑在 Chart.js 的 _eventHandler 内部，
+           同步 destroy（切口径 → renderCloud → _destroyCloudCharts）会让它随后
+           notifyPlugins('afterEvent') 打到已销毁图表的 legend 上（TypeError: …'handleEvent'）。
+           推迟到下个宏任务，等这次事件派发彻底收尾再切口径。 */
+        setTimeout(function () { drillTrendDay(p.date); }, 0);
+      },
+      onHover: function (evt, els) {
+        var el = evt && evt.native && evt.native.target;
+        if (el && el.style) el.style.cursor = (drillable && els && els.length) ? 'pointer' : 'default';
+      },
+      plugins: {
+        legend: { position: 'top', onClick: function () {}, labels: { font: { size: 11 }, boxWidth: 14, padding: 10, usePointStyle: true, color: chartTextColor() } },
+        tooltip: {
+          callbacks: {
+            /* 逐时视图：标题补上日期（默认标题只有 'HH:00'，看不出是哪天） */
+            title: function (items) {
+              if (!items || !items.length) return '';
+              var p = points[items[0].dataIndex];
+              return (!hourly || !p || !p.date) ? items[0].label : (_shortDay(p.date) + ' ' + items[0].label);
+            }
+          }
+        }
+      },
       scales: {
         y: { position: 'left', beginAtZero: true, title: { display: true, text: tc.label, font: { size: 10 }, color: chartTextColor() }, ticks: { color: chartTextColor() }, grid: { color: 'rgba(120,130,160,.1)' } },
-        x: { grid: { display: false }, ticks: { color: chartTextColor(), maxTicksLimit: 24, maxRotation: 60, minRotation: 0, font: { size: 9 } } }
+        x: { grid: { display: false }, ticks: { color: chartTextColor(), maxTicksLimit: hourly ? 12 : 24, maxRotation: hourly ? 0 : 60, minRotation: 0, font: { size: 9 } } }
       },
       animation: { duration: 1200, easing: 'easeOutQuart' }
     }
   });
 }
+/* ==================== v6.8：趋势桶（日 / 逐时 共用同一累加与同一字段） ====================
+   收益唯一口径落点：一律 _orderMoney(o, true).record（分）→ 元。日趋势与逐时趋势共用本函数，
+   保证「同一天看月视图、看日视图」的收益数字严格一致（也保证与 KPI 同源）。 */
+function _trendEmptyBucket(extra) {
+  return Object.assign({ count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 }, extra || {});
+}
+function _trendAccumulate(b, o) {
+  b.count++;
+  b.revenue += _orderMoney(o, true).record / 100;   // 🔴-F7：不读后端逐单下发的 o.revenue/o.receivable（那是页里唯一与 KPI 不同源的「收益」）
+  b.pages += o.total_page_count || 0;
+  b.files += o.files_count || 0;
+  b.sheets += _orderSheets(o).total;
+  return b;
+}
 function _computeDailyTrend(orders) {
   var map = {};
   orders.forEach(function (o) {
     var day = _fmtDate(o.created_at);
-    if (!map[day]) map[day] = { date: day, count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 };
-    map[day].count++;
-    map[day].revenue += _orderMoney(o, true).record / 100;   // 🔴-F7：不再读后端逐单下发的 o.revenue/o.receivable —— 那是页面里唯一与 KPI 不同源的「收益」
-    map[day].pages += o.total_page_count || 0;
-    map[day].files += o.files_count || 0;
-    map[day].sheets += _orderSheets(o).total;
+    if (!map[day]) map[day] = _trendEmptyBucket({ date: day });
+    _trendAccumulate(map[day], o);
   });
   return Object.keys(map).sort().map(function (d) { return map[d]; });
+}
+/* 时间戳 → 小时（0~23）。created_at 形如 'YYYY-MM-DD HH:MM:SS'；只有日期没有时间的老数据返回 null，
+   会被逐时视图跳过（其金额仍出现在月/日口径的柱里，不会被算到 00:00 上造成假峰值）。 */
+function _hourOf(dt) {
+  var m = /^\d{4}-\d{2}-\d{2}[ T](\d{2})/.exec(String(dt || ''));
+  return m ? (+m[1]) : null;
+}
+/* v6.8：单日逐时 —— 固定 24 个整点桶（00:00~23:00 每小时一柱），没有订单的小时补 0 保留位置，
+   这样「今天」点进来就能看到完整一天的营业节奏（与 DeepSeek 开放平台的按小时视图一致）。 */
+function _computeHourlyTrend(orders, day) {
+  var slots = [];
+  for (var h = 0; h < 24; h++) slots.push(_trendEmptyBucket({ date: day, hour: h, label: String(h).padStart(2, '0') + ':00' }));
+  (orders || []).forEach(function (o) {
+    if (_fmtDate(o.created_at) !== day) return;
+    var hh = _hourOf(o.created_at);
+    if (hh === null || hh < 0 || hh > 23) return;
+    _trendAccumulate(slots[hh], o);
+  });
+  return slots;
 }
 function _countByStatus(orders) {
   var map = {};
@@ -3921,7 +4156,9 @@ function _renderCloudShared() {
 
   /* ---- 趋势分析（v6.0：与全页同一口径，不再独立拉数；指标切换为模块内局部控件） ---- */
   h += '<div class="section chart-full" id="cloud-trend"><h2 style="font-size:1.3rem;font-weight:800;color:var(--text)">📈 趋势分析 <span class="hint">' + _trendHintText() + '</span></h2>';
-  h += '<div class="trend-toolbar"><span class="trend-metrics">';
+  h += '<div class="trend-toolbar">';
+  if (_trendDrillPrev) h += '<button type="button" class="btn" onclick="undoTrendDrill()" title="回到下钻前的区间">← 返回区间</button>';
+  h += '<span class="trend-metrics">';
   var trendMetricBtns = [['revenue', '💰收益'], ['count', '📦订单'], ['pages', '📄页数'], ['files', '🗂文件'], ['sheets', '🖨纸张']];
   trendMetricBtns.forEach(function (b) {
     var on2 = _cloudTrendMetric === b[0];
@@ -4062,10 +4299,10 @@ function _renderCloudShared() {
       _renderDuplexDonut('cloud-chart-duplex', fileDuplex);
       _renderDeviceDonut('cloud-chart-device', deviceAgg);
     }
-    // ≤60 天用柱状图（每天一柱）；>60 天用平滑折线图（90 片切片）
+    // ≤60 天用柱状图（每天一柱）；单日（今天 / 下钻 / 自定义单日）用逐时柱状图；>60 天用平滑折线图（90 片切片）
     if (tv.points.length > 0) {
-      if (tv.gran === 'day') _renderBucketTrend('cloud-chart-trend', tv.points, _cloudTrendMetric, 'day');
-      else _renderDailyTrend('cloud-chart-trend', tv.points, _cloudTrendMetric);
+      if (tv.gran === 'slice') _renderDailyTrend('cloud-chart-trend', tv.points, _cloudTrendMetric);
+      else _renderBucketTrend('cloud-chart-trend', tv.points, _cloudTrendMetric, tv.gran);
     }
   }, 60);
 }
@@ -4866,7 +5103,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v6.7</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v6.9</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -4903,6 +5140,8 @@ function renderAbout() {
     '<p style="margin-top:10px">v6.5：订单明细金额列改为「订单金额」展示口径（不再清零）—— 此前该列直接用收益记录口径（放弃/取消/打回/失败一律剔除），于是整单被放弃时显示 ¥0.00，与展开后的文件级金额（如 ¥1.20 / ¥0.80）自相矛盾。现统一为：① 整单被排除（放弃/取消/打回/失败）→ 显示订单本身金额（父订单 total_price，缺失时退回子任务费合计），颜色取该状态的状态色（放弃=紫），悬停提示「订单金额 ¥X · 放弃打印，不计入收益」；② 混合单（同一订单既有已打印完成、又有被放弃/打回的文件）→ 显示整单金额、末尾标 <b>*</b>，悬停提示「订单金额 ¥X · 计入收益 ¥Y · 含 N 个不计入收益的文件」；③ 历史老订单（v5 之前无 order_files 明细）→ 显示父订单 total_price（不再是 ¥0.00），悬停提示注明该单无文件明细、未计入收益统计。<b>收益统计口径完全不变</b>（仍按 sent + 待处理 计入，放弃/取消/打回/失败一律剔除），订单明细标题的说明同步为「自打/放弃/取消/打回/失败订单金额仅展示、不计入收益 · 带 * 的金额含未计入收益的部分」。</p>' +
     '<p style="margin-top:10px">v6.6：设备自动双面能力标注 —— ① 「🔐 授权」页云端设备列表新增「自动双面」列（三态下拉：✅ 支持自动双面 / 🖐 不支持（需人工翻纸）/ 未确认），可直接标注每一台设备；② 能力解析优先级为「人工标注 &gt; 本地打印工具自动探测 &gt; 未确认」，人工结论<b>不会被后续探测覆盖</b>（旧机型如 HP LaserJet 1018/1020/1022 有手动双面功能，驱动的双面能力位会虚报"支持"，只有人能盖章）；③ 后端 <b>/api/claiming_devices</b> 与 <b>/api/printer/devices</b> 下发 <b>auto_duplex</b>（true/false/null）与来源标记，本地工具 <b>printer_state</b> 同步本机能力 —— 这解决"现场有旧机型不支持自动双面、程序却一律按支持自动双面提交任务，结果静默打成单面还收双面的钱"的问题；禁用无障碍打印等下游动作由移动端/服务端在各自环节实施。</p>' +
     '<p style="margin-top:10px">v6.7：测试设备不再堆在授权页 —— 联调/冒烟脚本每次运行都会以固定前缀（<b>debug-*</b> / <b>socketio-debug-*</b> / <b>deploy-check*</b> / <b>wscheck-*</b> 等）注册设备，历史上直连生产，攒出了 48 台"测试设备"、还留着僵尸「接单中」记录。现改为：① 后端识别这些 id 并在设备列表中<b>默认隐藏</b>（列表下方提示数量），不再占满一屏；② 新增 <b>POST /api/printer/devices/cleanup</b>（默认 dry_run，只列不删；一律跳过在线设备）与授权页「🧹 清理测试设备」按钮（先预览清单再确认）；③ 后端每 30 分钟自动清掉<b>离线</b>的测试设备，并同步清空它们的接单记录（否则 get_active_printer_client() 可能挑到一台永远不会干活的机器）；④ 另加「🧹 清理无主离线设备」按钮（针对云主机上的临时客户端等陌生设备：<b>在线、已绑定所有者、人工盖过「自动双面」章的设备都会跳过</b>，先预览再确认）；⑤ 离线却仍挂着接单记录的设备显示为「接单中（离线）」并提示可删除清空。真机再连会自动重新登记，删除是幂等的。</p>' +
+    '<p style="margin-top:10px">v6.8：趋势下钻 + 单日逐时 —— ① 趋势柱状图<b>可点击</b>：点某一天的柱子即切到那天，趋势图变为 <b>00:00~23:00 每小时一柱</b>（没单的小时也留 0 柱，一天节奏一眼看清，与 DeepSeek 开放平台的按小时视图一致），KPI / 成员账目 / 订单明细同页跟着切到那一天（全页单一口径）；趋势卡片出现「← 返回区间」一键回到下钻前的区间（手动切换时间范围则不再显示返回点）。② 时间范围新增「<b>今天</b>」与「<b>近7天</b>」快捷区间；「今天」以及任何单日口径（下钻的某天、自定义起止选到同一天）一律走逐时视图，日粒度柱状图标题提示「点击柱状图可下钻到当天逐时」。③ 收益口径不变：逐时柱与日柱共用同一累加函数（收益一律 <b>_orderMoney().record</b>，与 KPI 严格同源），逐时合计 == 当天日柱。</p>' +
+    '<p style="margin-top:10px">v6.9：订单明细「类型」列按需取列 —— 类型列原先恒占 7 个固定槽（自打/接单 | 自动 | 预约 | 免费 | 派送 | 加急 | 封面、共 432px），而实际一个月常常只用到第 1~2 槽，整列大段是空槽，右侧「时间 / 开始打印 / 接单设备」反被挤到截断（时间与开始打印需要 139px 只分到 132px、接单设备需要 280px 只分到 200px）。现改为：① <b>当前页无人使用的槽整列移除</b>（判据是页面上真正渲染的那批订单 —— 所见即所得；翻页或改「每页条数」会按新一页的内容重新排列宽，不会出现「这一页根本没人用、却还白占一列」），同页内剩余槽仍是固定宽度 —— 跨订单竖直对齐不受影响；② 类型列随实际槽位数缩窄，腾出的宽度按 <b>时间 → 开始打印 → 接单设备</b> 的优先级补齐到「完整显示」所需宽度（146 / 146 / 320px）；③ 补不完的余量交给表 min-width —— 表格整体变窄、不再横向留白，也不让类型列虚胖回去；④ 顺手修正 7 槽全用时 430px 的网格塞进 404px 内容盒、「封面」标签溢出压到「时间」列的问题（该情形类型列宽 460px）。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
