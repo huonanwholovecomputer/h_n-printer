@@ -7792,6 +7792,33 @@ def admin_remove_admin():
 # ==================== 管理员：存储统计 ====================
 
 
+def _storage_live_subtasks():
+    """返回「还在等文件」的子任务（status, 个数）与几个订单号样本。
+
+    D5 第 8 条：/api/admin/storage 的 DELETE 会把 UPLOAD_DIR 里的文件删光并清空
+    `files.path`，却不检查有没有**在飞/预约**的子任务 —— 预约单的文件到点前一直躺在服务器上，
+    清空后到点必然「文件不存在」，订单永久打不出来（旧实现连二次确认都没有）。
+    判据取**白名单式排除**（只把明确已终结的状态排除），未知状态一律算"还在等"，宁可拦住也不误删。
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT status, COUNT(*) AS n FROM order_files
+               WHERE status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')
+               GROUP BY status ORDER BY n DESC"""
+        ).fetchall()
+        samples = [r[0] for r in conn.execute(
+            """SELECT DISTINCT o.order_number FROM order_files of
+               JOIN orders o ON of.order_id = o.id
+               WHERE of.status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')
+                 AND o.order_number != ''
+               ORDER BY of.id DESC LIMIT 5"""
+        ).fetchall()]
+        return [dict(r) for r in rows], samples
+    finally:
+        conn.close()
+
+
 def _format_size(size_bytes):
     """将字节数格式化为人类可读的字符串"""
     if size_bytes < 1024:
@@ -7813,6 +7840,25 @@ def admin_storage():
 
     # ---- DELETE: 删除全部缓存文件 ----
     if request.method == "DELETE":
+        # D5 第 8 条：删之前先看有没有"还在等文件"的子任务（预约单/排队单）。
+        # 默认**拒绝**（409）并把风险如实报出来；确实要清就显式带 ?force=1（第二道确认）。
+        _force = (request.args.get("force", "") or "").strip().lower() in ("1", "true", "yes")
+        _live_rows, _live_samples = _storage_live_subtasks()
+        _live_total = sum(r["n"] for r in _live_rows)
+        if _live_total and not _force:
+            _detail = "、".join(f"{r['status']} {r['n']} 个" for r in _live_rows)
+            _sample_txt = f"（例如订单 {'、'.join(_live_samples)}）" if _live_samples else ""
+            return jsonify({
+                "success": False,
+                "code": "storage_in_use",
+                "message": (f"有 {_live_total} 个子任务尚未完成（{_detail}）{_sample_txt}，"
+                            "它们的文件还在服务器上：现在清空会让这些订单（如预约单）到点打不出来。"
+                            "请先等它们打完/取消，或显式带 ?force=1 强制清空。"),
+                "live_tasks": _live_total,
+                "live_by_status": {r["status"]: r["n"] for r in _live_rows},
+                "samples": _live_samples,
+            }), 409
+
         deleted_count = 0
         deleted_size = 0
 
@@ -7851,11 +7897,16 @@ def admin_storage():
         })
 
         print(f"  [DELETE-ALL] 已删除 {deleted_count} 个文件, 释放 {_format_size(deleted_size)}")
+        if _live_total and _force:
+            print(f"  [DELETE-ALL] ⚠ 强制清空：波及 {_live_total} 个未完成子任务"
+                  f"（{ {r['status']: r['n'] for r in _live_rows} }）")
         return jsonify({
             "success": True,
-            "message": f"已删除 {deleted_count} 个文件",
+            "message": f"已删除 {deleted_count} 个文件"
+                       + (f"（强制清空，波及 {_live_total} 个未完成子任务）" if _live_total else ""),
             "deleted_count": deleted_count,
             "deleted_size_display": _format_size(deleted_size),
+            "live_tasks_deleted": _live_total,
         })
 
     # ---- POST: 设置保留时间 ----
@@ -7965,8 +8016,25 @@ def admin_security():
 @login_required
 def statistics_my():
     """当前登录用户查看自己的月度打印统计（基于 order_files 聚合）"""
-    year = request.args.get("year", str(datetime.now().year))
-    month = request.args.get("month", str(datetime.now().month))
+    _now = datetime.now()
+    year = request.args.get("year", str(_now.year))
+    month = request.args.get("month", str(_now.month))
+    # D5：参数来自 query，**必须校验**后再用。原实现把 year/month 原样塞进 SQL 比较，
+    # 末尾又 int(year)/int(month) ⇒ 任意已登录用户 GET ?year=abc 就能拿到 500。
+    # 这里显式收敛（年份 1970..2100、月份 1..12；允许 "7" 这种不带前导零的写法并归一），
+    # 非法值直接 400 —— 不静默回落到本月：那会给用户看**错月份**的统计，比报错更糟。
+    try:
+        _year_int = int(str(year).strip())
+        if not (1970 <= _year_int <= 2100):
+            raise ValueError
+        _month_int = int(str(month).strip())
+        if not (1 <= _month_int <= 12):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"success": False,
+                        "message": "参数非法：year 需为 1970-2100、month 需为 1-12"}), 400
+    year = f"{_year_int:04d}"
+    month = f"{_month_int:02d}"
 
     conn = get_db()
     row = conn.execute(
@@ -7995,8 +8063,8 @@ def statistics_my():
 
     return jsonify({
         "success": True,
-        "year": int(year),
-        "month": int(month),
+        "year": _year_int,
+        "month": _month_int,
         "stats": {
             "total_pages": total_pages,
             "total_orders": total_orders,
