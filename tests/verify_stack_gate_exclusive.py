@@ -72,6 +72,12 @@ class _Prof:
     first = ""
 
 
+class _AutoProf(_Prof):
+    """支持自动双面的机型：一次成型，**不需要攒批**（2026-10 用户要求不给入口）。"""
+    auto_duplex = True
+    manual_duplex = False
+
+
 class _Sig:
     def connect(self, *a, **kw):
         pass
@@ -102,10 +108,10 @@ class _StubSpeedWorker:
 gui.SpeedCalibrationWorker = _StubSpeedWorker
 
 
-def new_win(stack_mode=True):
+def new_win(stack_mode=True, prof=None):
     w = gui.MainWindow(config_path=paths.config_path())
     w._cloud_client = None
-    w._printer_profile = lambda: _Prof()
+    w._printer_profile = lambda: (prof or _Prof())
     w._config.duplex_stack_mode = stack_mode
     w._stack = ds.DuplexStack(capacity=90, printer_name="Fake Print")
     w._stack.rotate = True
@@ -218,7 +224,43 @@ check("纸叠非空 + 关闭攒批 → 单面请求仍排 parked",
       win7._stack_gate([gui.PrintJob(file_path="x.pdf", duplex="off", page_count=2)], "1")
       == "parked")
 
-for w in (win, win2, win3, win4, win5, win6, win7):
+print("\n=== 7. 攒批只对「需人工翻纸」的机型开放（自动双面的机器没有这个功能）===")
+_win2_hidden_before = win2._chk_stack_mode.isHidden()
+win2._sync_stack_button()
+check("对照：需人工翻纸的机型 → 攒批复选框可见且勾着（判据不是恒隐藏）",
+      win2._chk_stack_mode.isHidden() is False and win2._chk_stack_mode.isChecked() is True,
+      f"hidden={win2._chk_stack_mode.isHidden()}（原 {_win2_hidden_before}）"
+      f" checked={win2._chk_stack_mode.isChecked()}")
+
+win8 = new_win(stack_mode=True, prof=_AutoProf())
+check("★ 自动双面的机型：配置开着也不生效（_stack_mode_on() 为 False）",
+      win8._stack_mode_on() is False, f"{win8._stack_mode_on()}")
+win8._sync_stack_button()
+check("★ 自动双面的机型：攒批入口整体收起（复选框隐藏 + 显示态归零、底部入口隐藏）",
+      win8._chk_stack_mode.isHidden() is True and win8._chk_stack_mode.isChecked() is False
+      and win8._btn_stack.isHidden() is True,
+      f"chk hidden={win8._chk_stack_mode.isHidden()} checked={win8._chk_stack_mode.isChecked()}"
+      f" btn hidden={win8._btn_stack.isHidden()}")
+
+win8._log_lines = []
+_orig_log8 = win8._log
+win8._log = lambda m: (win8._log_lines.append(m), _orig_log8(m))[1]
+win8._on_stack_mode_toggled(True)      # 复选框已隐藏，真人点不到；这里直接调，验兜底
+check("★ 就算被点到：不落盘、复选框回滚为未勾，并说明「不需要攒批」",
+      win8._config.duplex_stack_mode is True and win8._chk_stack_mode.isChecked() is False
+      and any("不需要攒批" in m for m in win8._log_lines), "; ".join(win8._log_lines[-2:]))
+
+win8._on_remote_stack_mode(True, "admin")
+check("★ 移动端下发开启：设备端自查拒掉（配置不变、日志说明「不需要攒批」）",
+      win8._config.duplex_stack_mode is True
+      and any("不需要攒批" in m for m in win8._log_lines), "; ".join(win8._log_lines[-3:]))
+
+win8._stack.entries = [entry(1, 2)]
+_g8 = win8._stack_gate([make_job(808)], "1")
+check("★ 自动双面的机型不进攒批路径（闸门不会把它收成「攒批单」）",
+      _g8 != "entry", f"实为 {_g8!r}")
+
+for w in (win, win2, win3, win4, win5, win6, win7, win8):
     w._refresh_engine_availability = lambda *a, **kw: None
     try:
         w.close()

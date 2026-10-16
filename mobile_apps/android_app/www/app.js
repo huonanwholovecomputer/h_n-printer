@@ -1373,8 +1373,11 @@ function renderDeviceList() {
 }
 
 // 攒批模式状态徽标（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
-// null（该设备从未上报，状态未知）→ 不渲染该徽标
+// null（该设备从未上报，状态未知）→ 不渲染该徽标。
+// ⚠ 攒批只对「需人工翻纸」的机型（auto_duplex === false）渲染 —— 自动双面的机器一次成型，
+// 多任务合并翻纸纯属多余；能力未确认的也不给入口（2026-10 用户要求，三端同一条判据）。
 function stackBadgeHtml(d) {
+  if (!d || d.auto_duplex !== false) return '';
   if (d.stack_mode === true) return '<text class="device-state device-state-stack">🖐 攒批中</text>';
   if (d.stack_mode === false) return '<text class="device-state device-state-stack-off">攒批未开</text>';
   return '';
@@ -1385,18 +1388,20 @@ function isAdminRole() {
   return state.role === 'admin' || state.role === 'super_admin';
 }
 
-// 攒批模式远程开关：仅 admin/super_admin 渲染（普通用户看不到可点控件，也不留空壳）；
-// 离线 / 服务端判「当前不可切换」/ 请求中 → 灰显禁用，点击只弹提示不请求
+// 攒批模式远程开关：只对**需人工翻纸**的机型渲染，且仅 admin/super_admin（普通用户看不到可点
+// 控件，也不留空壳）；离线 / 服务端判「当前不可切换」/ 请求中 → 灰显禁用，点击只弹提示不请求
 function stackToggleBtnHtml(d) {
+  if (!d || d.auto_duplex !== false) return '';
   if (!isAdminRole()) return '';
   const disabled = d.online === false || d.stack_can_toggle === false || stackTogglingId === d.client_id;
   const label = d.stack_mode === true ? '关闭攒批' : '开启攒批';
   return `<view class="device-stack-btn${disabled ? ' device-stack-btn-disabled' : ''}" data-id="${esc(d.client_id)}">${label}</view>`;
 }
 
-// 攒批模式（多任务合并翻纸）远程开关：开启需「当前未开攒批 + 打印机空闲」，关闭需「当前已开攒批 +
-// 打印机空闲」；繁忙（正在打印 / 等人工翻纸打第二趟 / 有排队待打的请求）由服务端判定
-// （stack_can_toggle / stack_reason），前端只做前置提示 + 请求转发，不复刻这套判定。
+// 攒批模式（多任务合并翻纸）远程开关：只对「需人工翻纸」的机型（auto_duplex === false）开放；
+// 开启需「当前未开攒批 + 打印机空闲」，关闭需「当前已开攒批 + 打印机空闲」；繁忙（正在打印 /
+// 等人工翻纸打第二趟 / 有排队待打的请求）由服务端判定（stack_can_toggle / stack_reason），
+// 前端只做前置提示 + 请求转发，不复刻这套判定。
 // 该接口一律 HTTP 200，按 body 的 success 判断（失败时 message 即拦截原因）。
 async function toggleStackMode(clientId) {
   // 兜底：普通用户/游客即使状态异常也不放行
@@ -1406,6 +1411,11 @@ async function toggleStackMode(clientId) {
   const idx = claimingDevices.findIndex(d => d.client_id === clientId);
   if (idx < 0) return;
   const d = claimingDevices[idx];
+  // 兜底：该机型不需要攒批（支持自动双面 / 能力未确认）—— 就算状态异常也不放行
+  if (d.auto_duplex !== false) {
+    showToast('该设备支持自动双面（或双面能力未确认），不需要攒批模式', 2500);
+    return;
+  }
   if (d.online === false) { showToast('设备离线，无法远程切换', 2000); return; }
   if (d.stack_can_toggle === false) { showToast(d.stack_reason || '当前无法切换攒批模式', 2500); return; }
   const enable = d.stack_mode !== true;

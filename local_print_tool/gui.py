@@ -3794,6 +3794,8 @@ class MainWindow(QMainWindow):
         self._printer_combo = QComboBox()
         self._printer_combo.setMinimumWidth(200)
         _disable_combo_wheel(self._printer_combo)
+        # 换选打印机 → 攒批入口的显隐/生效性随能力立刻变（2026-10：自动双面的机器不显示攒批）
+        self._printer_combo.currentIndexChanged.connect(self._on_printer_selection_changed)
         layout.addWidget(self._printer_combo, 1)
 
         btn_refresh = QPushButton("🔄")
@@ -5619,6 +5621,8 @@ class MainWindow(QMainWindow):
         # 只对「无自动双面器、需人工翻纸」的机型有意义（HP LaserJet 1020 等）：
         # 开启后需手动双面的打印请求不再各自翻一次纸，第 1 趟连续打进同一叠，
         # 人工点一次「开始第 2 趟」把整叠打完。攒批期间其余打印请求一律排队。
+        # ⚠ **这项只对需人工翻纸的机型显示**（_sync_stack_button 按 _stack_applicable 显隐）：
+        #    自动双面的机器一次成型，合并翻纸纯属多余，能力未确认的也不给入口（2026-10 用户要求）。
         # 复选框一律用 ThemedCheckBox：QSS 只画方框底色，勾选态的「✓」由
         # ThemedCheckBox.paintEvent 自己绘制。用原生 QCheckBox 会只剩一块**实心方块**
         # （没有对号），与「管理员自行打印/启用云端功能/启用接单」的观感不一致。
@@ -5626,7 +5630,8 @@ class MainWindow(QMainWindow):
         self._chk_stack_mode.setToolTip(
             "多任务合并翻纸：把连续多个打印任务的第 1 趟先堆进出纸槽，"
             "最后统一翻一次纸打完整个纸叠。\n"
-            "仅对「无自动双面器、需人工翻纸」的打印机有意义。\n"
+            "只对「无自动双面器、需人工翻纸」的打印机显示 —— 自动双面的机器一次成型、"
+            "不需要攒批，这一项会隐藏。\n"
             "攒批期间出纸槽被这一叠独占，其它打印请求会排队等这一叠打完。")
         self._chk_stack_mode.toggled.connect(self._on_stack_mode_toggled)
         layout.addWidget(self._chk_stack_mode)
@@ -5735,27 +5740,53 @@ class MainWindow(QMainWindow):
                 self._update_owner_combo_items()
 
     def _refresh_printer_list(self):
-        """刷新下拉列表中的系统打印机。"""
+        """刷新下拉列表中的系统打印机。
+
+        重建期间**屏蔽信号**：clear()/addItem() 时"当前项"只是中间态，会让攒批入口闪一下；
+        更要紧的是顶栏的 currentIndexChanged 现在会同步 config.printer_name，而
+        _load_config_to_ui 紧接着还要拿 config 里存的名字 setCurrentText —— 中间态回写会把
+        用户存的打印机名清成空串（随后静默回退系统默认打印机）。
+        """
         current = self._printer_combo.currentText().strip()
-        self._printer_combo.clear()
-        # 空选项 = 系统默认打印机
-        self._printer_combo.addItem("（系统默认打印机）", "")
-        printers = list_system_printers()
-        for name in printers:
-            self._printer_combo.addItem(name, name)
-        # 如果当前有选中的打印机，尝试恢复
-        if current:
-            idx = self._printer_combo.findText(current)
-            if idx >= 0:
-                self._printer_combo.setCurrentIndex(idx)
-            elif not self._printer_missing_warned:
-                # 原打印机已不存在/改名 → 静默回退默认，仅提示一次（避免每次刷新都弹窗）
-                self._printer_missing_warned = True
-                self._log(f"⚠ 打印机「{current}」已不存在或改名，已回退到系统默认打印机")
-                QMessageBox.warning(
-                    self, "打印机不可用",
-                    f"打印机「{current}」已不存在或改名。\n已自动切换为系统默认打印机。",
-                )
+        self._printer_combo.blockSignals(True)
+        try:
+            self._printer_combo.clear()
+            # 空选项 = 系统默认打印机
+            self._printer_combo.addItem("（系统默认打印机）", "")
+            printers = list_system_printers()
+            for name in printers:
+                self._printer_combo.addItem(name, name)
+            # 如果当前有选中的打印机，尝试恢复
+            if current:
+                idx = self._printer_combo.findText(current)
+                if idx >= 0:
+                    self._printer_combo.setCurrentIndex(idx)
+                elif not self._printer_missing_warned:
+                    # 原打印机已不存在/改名 → 静默回退默认，仅提示一次（避免每次刷新都弹窗）
+                    self._printer_missing_warned = True
+                    self._log(f"⚠ 打印机「{current}」已不存在或改名，已回退到系统默认打印机")
+                    QMessageBox.warning(
+                        self, "打印机不可用",
+                        f"打印机「{current}」已不存在或改名。\n已自动切换为系统默认打印机。",
+                    )
+        finally:
+            self._printer_combo.blockSignals(False)
+        # 列表重建/回退后重新评估攒批入口（换到自动双面的队列就该收起来）
+        self._sync_stack_button()
+
+    def _on_printer_selection_changed(self, _index: int = 0):
+        """顶栏换选打印机 → 攒批入口的显隐与生效性立刻跟着变（2026-10 用户要求）。
+
+        攒批只对「不支持自动双面、双面需人工翻纸」的机型开放 ⇒ 换成自动双面的队列要马上收起来，
+        不能等下一次刷新。这里只把选择同步进内存（落盘仍走 _save_config 的唯一入口，
+        与 _sync_ui_to_config 从下拉框读 printer_name 是同一口径）。
+        """
+        try:
+            data = self._printer_combo.currentData()
+            self._config.printer_name = data if data else ""
+        except Exception as e:
+            logger.debug(f"切换打印机时同步选择失败: {e}")
+        self._sync_stack_button()
 
     def _on_refresh_printers(self):
         """刷新打印机列表按钮回调。"""
@@ -7373,8 +7404,37 @@ class MainWindow(QMainWindow):
     #    否则后端与本地都会把半成品当成品（正确性 + 结算都错）。收尾统一在 _finish_stack_entries。
     # ③ **超时不自动跳过**：第 2 趟必须人把整叠搬回进纸盒才可能打；超时只变红预警。
 
+    def _stack_applicable(self) -> bool:
+        """攒批模式对**当前打印机**是否适用：只对「不支持自动双面、双面需人工翻纸」的机型开放。
+
+        自动双面的机器一次成型，多任务合并翻纸纯属多余 ⇒ 这类机型**不显示攒批入口**、也不接受
+        开启（2026-10 用户要求）。判据 = 档案 auto_duplex is False（等价于 PrinterProfile.
+        needs_manual_duplex；这里按属性直取，兼容验收脚本里那种只有 auto_duplex/manual_duplex
+        两个属性的轻量桩）。与移动端设备列表同口径 —— 那边也只给 auto_duplex === false 的设备
+        渲染攒批徽标与远程开关，服务端 _stack_needs_manual_flip 再拦一次。
+        """
+        try:
+            return getattr(self._printer_profile(), "auto_duplex", None) is False
+        except Exception as e:      # 定时器/半初始化的验收环境都要能安全调用
+            logger.debug(f"攒批适用性判定失败（按不适用处理）: {e}")
+            return False
+
     def _stack_mode_on(self) -> bool:
-        return bool(getattr(self._config, "duplex_stack_mode", False))
+        """攒批模式**当前是否真的生效**：配置开着 + 当前打印机确实需要攒批。
+
+        配置里的 duplex_stack_mode 只是用户的偏好（换回需人工翻纸的老机型时自动恢复），
+        自动双面的机器上它既不显示也不生效（2026-10 用户要求）。
+        """
+        return bool(getattr(self._config, "duplex_stack_mode", False)) and self._stack_applicable()
+
+    def _set_stack_checkbox(self, checked: bool):
+        """同步/回滚攒批复选框的显示态（屏蔽信号，避免再触发一次切换）。"""
+        chk = getattr(self, "_chk_stack_mode", None)
+        if chk is None:
+            return
+        chk.blockSignals(True)
+        chk.setChecked(bool(checked))
+        chk.blockSignals(False)
 
     # ── 攒批模式：忙闲判定 + 云端上报 + 远程控制（2026-10）────────────────────────
     # 移动端可以看/改本机的「🖐 攒批模式」，硬前提是**打印机空闲**。
@@ -7431,8 +7491,17 @@ class MainWindow(QMainWindow):
             logger.debug(f"攒批状态心跳失败: {e}")
 
     def _on_remote_stack_mode(self, enable: bool, by: str = ""):
-        """（主线程）移动端下发的攒批模式切换。执行前**再自查一次**忙闲（防服务端镜像过期）。"""
+        """（主线程）移动端下发的攒批模式切换。执行前**再自查一次**适用性与忙闲。
+
+        适用性与服务端 `_stack_needs_manual_flip` 同口径：只对「不支持自动双面、需人工翻纸」的
+        机型放行 —— 服务端镜像可能过期（用户刚把打印机换成自动双面的那台），设备端必须自己再拦一次。
+        """
         want = bool(enable)
+        if want and not self._stack_applicable():
+            self._log("📱 移动端请求开启「🖐 攒批模式」被拒："
+                      "当前打印机支持自动双面（或双面能力未确认），不需要攒批")
+            self._report_stack_state("当前打印机支持自动双面（或能力未确认），不需要攒批模式")
+            return
         busy = self._stack_busy_reason()
         if busy:
             self._log(f"📱 移动端请求{'开启' if want else '关闭'}「🖐 攒批模式」被拒："
@@ -7463,30 +7532,51 @@ class MainWindow(QMainWindow):
                         and self._stack_flush_worker.isRunning()))
 
     def _sync_stack_button(self):
-        """刷新底部「🖐 攒批」入口：有纸叠在等第 2 趟时显示张数。"""
+        """刷新攒批控件的显隐/显示态（换打印机、开关切换、纸叠变化都要调）。
+
+        · 复选框：**只对「不支持自动双面、需人工翻纸」的机型显示** —— 自动双面的机器不需要攒批
+          （隐藏时显示态归零；配置里的偏好留着，换回需翻纸的机型自动恢复）；
+        · 底部入口：有纸叠在等第 2 趟时显示张数，否则只在攒批模式生效时显示。
+        """
+        applicable = self._stack_applicable()
+        chk = getattr(self, "_chk_stack_mode", None)
+        if chk is not None:
+            chk.setVisible(applicable)
+            self._set_stack_checkbox(self._stack_mode_on())
         btn = getattr(self, "_btn_stack", None)
         if btn is None:
             return
-        if self._stack.entries:
-            btn.setText(f"🖐 攒批 {self._stack.total_sheets}张/{self._stack.count}单")
+        stack = getattr(self, "_stack", None)
+        entries = bool(getattr(stack, "entries", None)) if stack is not None else False
+        if entries:
+            btn.setText(f"🖐 攒批 {stack.total_sheets}张/{stack.count}单")
             btn.setVisible(True)
         else:
             btn.setText("🖐 攒批")
             btn.setVisible(bool(self._stack_mode_on()))
 
     def _on_stack_mode_toggled(self, checked: bool):
-        """本地勾选框：先过**忙闲闸门**（与移动端同一口径），再真正切换（2026-10）。"""
+        """本地勾选框：先过**适用性**与**忙闲**两道闸门，再真正切换（2026-10）。
+
+        适用性 = 当前打印机确实需要攒批（不支持自动双面）；不适用时复选框本就不显示，
+        真被点到也只提示、绝不回写（与移动端下发、服务端 _stack_needs_manual_flip 同口径）。
+        """
         want = bool(checked)
+        if want and not self._stack_applicable():
+            self._set_stack_checkbox(False)
+            msg = (f"当前打印机「{self._config.printer_name or '（系统默认打印机）'}」"
+                   f"支持自动双面（或双面能力未确认），不需要攒批模式。\n\n"
+                   f"攒批（多任务合并翻纸）只对「无自动双面器、双面需人工翻纸」的机型有意义。")
+            self._log("⚠ 该打印机支持自动双面（或能力未确认）—— 不需要攒批模式")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "攒批模式", msg)
+            return
         if want == self._stack_mode_on():
             return
         busy = self._stack_busy_reason()
         if busy:
             # 回滚勾选（不触发信号）并提示原因 —— 与移动端下发同口径的拦截
-            chk = getattr(self, "_chk_stack_mode", None)
-            if chk is not None:
-                chk.blockSignals(True)
-                chk.setChecked(self._stack_mode_on())
-                chk.blockSignals(False)
+            self._set_stack_checkbox(self._stack_mode_on())
             verb = "开启" if want else "关闭"
             self._log(f"⚠ 打印机正忙（{busy}）—— 空闲后才能{verb}「🖐 攒批模式」")
             from PySide6.QtWidgets import QMessageBox
@@ -7496,23 +7586,22 @@ class MainWindow(QMainWindow):
         self._apply_stack_mode(want, source="本地")
 
     def _apply_stack_mode(self, enable: bool, source: str = "本地"):
-        """真正切换攒批模式（本地勾选框与移动端指令共用）：落盘 + 同步 UI + 上报云端。"""
+        """真正切换攒批模式（本地勾选框与移动端指令共用）：落盘 + 同步 UI + 上报云端。
+
+        调用方已保证 `_stack_applicable()`（当前机型确实需要攒批）—— 本方法只管落盘与显示。
+        """
         enable = bool(enable)
         self._config.duplex_stack_mode = enable
         self._save_config()
-        chk = getattr(self, "_chk_stack_mode", None)
-        if chk is not None and chk.isChecked() != enable:
-            chk.blockSignals(True)
-            chk.setChecked(enable)
-            chk.blockSignals(False)
+        self._set_stack_checkbox(enable)
         if enable:
             self._log("🖐 攒批模式已开启：需手动双面的打印请求不再各自翻纸，"
                       "第 1 趟连续堆进出纸槽，人工一次性确认后打整叠第 2 趟")
             prof = self._printer_profile()
-            if not (prof.auto_duplex is False and prof.manual_duplex):
-                self._log(f"⚠ 当前打印机「{self._config.printer_name}」未确认为"
-                          f"「不支持自动双面、需人工翻纸」——攒批模式对它不生效"
-                          f"（普通打印照旧；请先用实机校准/授权页确认能力）")
+            if not getattr(prof, "manual_duplex", False):
+                self._log(f"⚠ 打印机「{self._config.printer_name}」已确认不支持自动双面，"
+                          f"但还没有手动双面档案（两趟页序）——攒批对它暂不生效"
+                          f"（普通打印照旧；请先用实机校准建好该队列的手动双面参数）")
             self._log(f"   出纸槽容量阈值 {self._stack.capacity} 张，"
                       f"第 2 趟等待 {self._stack.warn_after_sec // 60} 分钟后变红预警（不自动跳过）")
         else:

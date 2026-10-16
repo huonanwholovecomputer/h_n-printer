@@ -741,13 +741,34 @@ def _set_stack_state(client_id: str, mode, busy: bool, note: str = ""):
         }
 
 
+def _stack_needs_manual_flip(client_id: str) -> bool:
+    """该设备的机型**是否需要攒批**：没有自动双面器、双面必须人工翻纸才有意义。
+
+    自动双面的机器一次成型，多任务合并翻纸纯属多余 ⇒ 这类设备不提供攒批入口、也不接受远程
+    开启（2026-10 用户要求）。只认「已确认不支持自动双面」（auto_duplex is False）；支持(true)
+    与未确认(null) 都算"不需要攒批" —— 这不是拿能力去拦单（那种拦单已按要求全面放开，见
+    tests/verify_duplex_capability.py ⑥），只是不给攒批这个功能。
+
+    ⚠ 别与当年用于 409 拦单的那个同名旧函数（已按要求移除）混为一谈，那个不许再加回来；
+    本函数只服务攒批模式的准入。注意：源码里**不要**再出现那三个旧标识符 —— 验收脚本
+    tests/verify_duplex_capability.py ⑥ 是按字符串钉住"拦截确已移除"的。
+    """
+    return get_device_capability(client_id).get("auto_duplex") is False
+
+
 def _stack_toggle_problem(client_id: str, enable=None) -> str:
     """远程切换攒批模式的前置校验：返回 "" = 允许；非空 = 给用户看的原因。
 
     enable=None 时只判"状态本身可不可操作"（供 /api/claiming_devices 算 stack_can_toggle）。
-    前提（与本地工具侧同口径）：**空闲** + 状态与目标相反 —— 忙（正在打印 / 等待人工翻纸打
-    第二趟 / 有排队待打的请求）时一律不许改动攒批模式。
+    前提（与本地工具侧同口径）：
+      · 该机型**确实需要攒批**（不支持自动双面、双面需人工翻纸）—— 自动双面/未确认的设备
+        在设备列表里根本不渲染攒批开关（2026-10 用户要求，见 _stack_needs_manual_flip）；
+      · **空闲** + 状态与目标相反 —— 忙（正在打印 / 等待人工翻纸打第二趟 / 有排队待打的请求）
+        时一律不许改动攒批模式。
     """
+    if not _stack_needs_manual_flip(client_id):
+        return ("该设备支持自动双面（或双面能力未确认），不需要攒批模式 —— "
+                "攒批只对「无自动双面器、需人工翻纸」的机型有意义")
     st = _stack_state_of(client_id)
     if st["mode"] is None:
         return "该设备尚未上报攒批状态（旧版客户端或刚接入），暂不能远程切换"
@@ -5645,6 +5666,8 @@ def printer_stack_mode():
 
     body: {"client_id": "...", "enable": true|false}
     前提（与本地工具侧同口径，缺一不可）：
+      · 该设备**确实需要攒批**（不支持自动双面、双面需人工翻纸）—— 自动双面 / 能力未确认的
+        设备在移动端根本不渲染这个开关，服务端这里再拦一次（见 _stack_needs_manual_flip）；
       · 开启：该设备当前**未开**攒批 + **空闲**；
       · 关闭：该设备当前**已开**攒批 + **空闲**；
       · 忙（正在打印 / 等待人工翻纸打第二趟 / 有排队待打的请求）时一律拦下并给原因。
@@ -5789,8 +5812,10 @@ def claiming_devices():
         online = cid in online_set
         st = _stack_state_of(cid)
         # 攒批模式（2026-10）：给移动端展示「🖐 攒批中 / 攒批未开 / 未知」+ 管理员远程开关。
-        # stack_can_toggle 由服务端先算一遍（在线 + 已上报 + 空闲 + 状态可反向），移动端据此
-        # 置灰/提示；真正切换时 /api/printer/stack_mode 还会再校验一次（并让设备端自查）。
+        # stack_can_toggle 由服务端先算一遍（该机型需要攒批 + 在线 + 已上报 + 空闲 + 状态可反向），
+        # 移动端据此置灰/提示；真正切换时 /api/printer/stack_mode 还会再校验一次（并让设备端自查）。
+        # ⚠ 攒批只对「不支持自动双面、需人工翻纸」的机型有意义：auto_duplex 为 true/未确认的设备
+        #    在移动端**整个攒批区块都不渲染**（两边同一条判据：auto_duplex === false）。
         result.append({
             "client_id": cid,
             "device_name": dev.get("device_name", "") or cid,

@@ -1956,7 +1956,9 @@ Component({
       this.setData({ selectedDeviceId: id })
     },
 
-    // 攒批模式（多任务合并翻纸）远程开关：仅管理员/超管可点（界面同样只对二者渲染）。
+    // 攒批模式（多任务合并翻纸）远程开关：仅管理员/超管可点（界面同样只对二者渲染），
+    // 且**只对「需人工翻纸」的机型**（auto_duplex === false）—— 自动双面的机器一次成型，
+    // 攒批纯属多余（界面整个攒批区块都不渲染，这里是兜底）。
     // 准入由服务端判定 —— 开启需「当前未开攒批 + 打印机空闲」，关闭需「当前已开攒批 + 打印机空闲」；
     // 繁忙（正在打印 / 等人工翻纸打第二趟 / 有排队待打的请求）时服务端给出 stack_can_toggle=false
     // 与 stack_reason，此处只做前置提示 + 请求转发，不在前端复刻这套判定。
@@ -1969,6 +1971,11 @@ Component({
       const index = e.currentTarget.dataset.index
       const device = (this.data.claimingDevices || [])[index]
       if (!device || !device.client_id) return
+      // 兜底：该机型不需要攒批（支持自动双面 / 能力未确认）—— 就算状态异常也不放行
+      if (device.auto_duplex !== false) {
+        this._showStackTip('该设备支持自动双面（或双面能力未确认），不需要攒批模式')
+        return
+      }
       if (device.online === false) {
         wx.showToast({ title: '设备离线，无法远程切换', icon: 'none', duration: 2000 })
         return

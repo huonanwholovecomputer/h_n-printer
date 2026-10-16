@@ -6,6 +6,10 @@
   · **仅管理员/超管**能从移动端开启/关闭它；
   · 前提（两侧同口径）：开启 = 当前未开 + 空闲；关闭 = 当前已开 + 空闲。
     忙（正在打印 / 等待人工翻纸打第二趟 / 有排队待打的请求）时，**移动端与本地工具两侧都拦**。
+  · **适用性前提**（2026-10 用户要求）：攒批（多任务合并翻纸）只对「无自动双面器、双面需人工
+    翻纸」的机型有意义 —— 支持自动双面 / 能力未确认的设备**不渲染开关、也不接受远程开启**。
+    三端同一条判据：服务端 `_stack_needs_manual_flip`（auto_duplex is False）、本地工具
+    `_stack_applicable`（档案 auto_duplex is False）、移动端 `auto_duplex === false`。
 
 本脚本钉住的代码事实：
   ① 服务端忙闲闸门 `_stack_toggle_problem`（纯函数，各组合）；
@@ -65,6 +69,9 @@ USER_TOKEN = backend.token_serializer.dumps(USER_OID)
 backend.register_device(CID, "DESKTOP-STACK")
 backend.get_claiming_devices = lambda: {CID: {"claimed_at": "", "owner_name": "张三"}}
 backend.get_claiming_device_ids = lambda: [CID]
+# 攒批只对「无自动双面器、需人工翻纸」的机型开放（2026-10 用户要求）⇒ 主用例先给该设备
+# 盖上「不支持自动双面」的人工结论；「支持自动双面 / 能力未确认」的用例在 ①/②/③ 里单独验。
+backend.set_device_manual_capability(CID, False, "测试")
 
 
 def _online(flag=True):
@@ -149,6 +156,21 @@ backend._set_stack_state(CID, True, False)
 check("已开 + 空闲 + 要关闭 → 放行", gate(CID, False) == "", gate(CID, False))
 check("已开 + 空闲 + 要开启 → 拦（已经是开启）", "已经是开启" in gate(CID, True), gate(CID, True))
 
+# ==================== ①.1 适用性前提：只有「需人工翻纸」的机型才给攒批（2026-10 用户要求）===
+print("\n=== ①.1 攒批只对「不支持自动双面、需人工翻纸」的机型开放 ===")
+backend._set_stack_state(CID, False, False)          # 状态本身"空闲 + 未开"（正好是放行的组合）
+backend.set_device_manual_capability(CID, True, "测试")      # 人工盖章：支持自动双面
+check("★ 支持自动双面的设备 → 拦下，且原因说明「不需要攒批」（不是忙）",
+      gate(CID, True) != "" and "不需要攒批" in gate(CID, True), gate(CID, True))
+check("★ 支持自动双面的设备 → 关闭方向同样拦（这个功能对它整体不适用）",
+      "不需要攒批" in gate(CID, False), gate(CID, False))
+backend.set_device_manual_capability(CID, None, "")          # 清除人工结论 → 无探测 → 未确认
+check("★ 能力未确认（既没盖章也没探测上报）→ 也不给攒批入口",
+      "不需要攒批" in gate(CID, True), gate(CID, True))
+backend.set_device_manual_capability(CID, False, "测试")     # 恢复「需人工翻纸」
+check("★ 恢复「不支持自动双面」→ 闸门回到忙闲判定（空闲 + 未开 + 要开启 = 放行）",
+      gate(CID, True) == "", gate(CID, True))
+
 # ==================== ② /api/claiming_devices 下发 ====================
 print("\n=== ② /api/claiming_devices 下发攒批状态 ===")
 
@@ -180,6 +202,19 @@ check("★ 设备离线 → can_toggle=False / reason=设备离线",
       d.get("stack_can_toggle") is False and d.get("stack_reason") == "设备离线",
       d.get("stack_reason"))
 
+# 适用性前提也体现在下发字段里：支持自动双面的设备 can_toggle=False（移动端据此连区块都不渲染）
+_online(True)
+backend.set_device_manual_capability(CID, True, "测试")
+backend._set_stack_state(CID, False, False)
+d = _dev()
+check("★ 支持自动双面的设备 → stack_can_toggle=False 且 reason 说明「不需要攒批」",
+      d.get("stack_can_toggle") is False and "不需要攒批" in (d.get("stack_reason") or ""),
+      d.get("stack_reason"))
+backend.set_device_manual_capability(CID, False, "测试")
+d = _dev()
+check("恢复「需人工翻纸」+ 空闲 → can_toggle 重新为 True（判据不是恒假）",
+      d.get("stack_can_toggle") is True and not d.get("stack_reason"), d.get("stack_reason"))
+
 # ==================== ③ POST /api/printer/stack_mode ====================
 print("\n=== ③ POST /api/printer/stack_mode ===")
 _online(True)
@@ -193,6 +228,22 @@ check("★ 非管理员（user 角色）→ 拒绝，且不下发指令",
       and not [s for s in fake.sent if s["event"] == "set_stack_mode"], j.get("message"))
 j = (post({"client_id": CID}).get_json() or {})
 check("参数不完整（缺 enable）→ success=False", j.get("success") is False, j.get("message"))
+
+# ★ 适用性前提：支持自动双面 / 能力未确认的设备，一律拒绝且不下发指令
+backend.set_device_manual_capability(CID, True, "测试")
+fake.sent.clear()
+backend._set_stack_state(CID, False, False)
+j = (post({"client_id": CID, "enable": True}).get_json() or {})
+check("★ 支持自动双面的设备 → 拦下并说明「不需要攒批」",
+      j.get("success") is False and "不需要攒批" in (j.get("message") or ""), j.get("message"))
+check("★ 适用性不符时**不**给设备端下发指令",
+      not [s for s in fake.sent if s["event"] == "set_stack_mode"],
+      f"sent={[s['event'] for s in fake.sent]}")
+backend.set_device_manual_capability(CID, None, "")
+j = (post({"client_id": CID, "enable": True}).get_json() or {})
+check("★ 能力未确认的设备 → 同样拦下（不给攒批入口）",
+      j.get("success") is False and "不需要攒批" in (j.get("message") or ""), j.get("message"))
+backend.set_device_manual_capability(CID, False, "测试")
 
 _online(False)
 j = (post({"client_id": CID, "enable": True}).get_json() or {})
@@ -259,6 +310,14 @@ check("后端：`/api/printer/stack_mode` 需登录",
 check("后端：claiming_devices 下发四个 stack 字段",
       all(k in app_src for k in ('"stack_mode"', '"stack_busy"',
                                  '"stack_can_toggle"', '"stack_reason"')))
+check("★ 后端适用性判据：只认「已确认不支持自动双面」（_stack_needs_manual_flip）",
+      "def _stack_needs_manual_flip" in app_src
+      and 'get_device_capability(client_id).get("auto_duplex") is False' in app_src)
+check("★ 后端闸门先判适用性再看忙闲（顺序即优先级）",
+      app_src.index("if not _stack_needs_manual_flip(client_id):")
+      < app_src.index('st = _stack_state_of(client_id)\n    if st["mode"] is None:')
+      if ("if not _stack_needs_manual_flip(client_id):" in app_src
+          and 'st = _stack_state_of(client_id)\n    if st["mode"] is None:' in app_src) else False)
 check("★ 后端忙闲口径含「等待人工翻纸打第二趟」与「有排队待打的请求」",
       "等待人工翻纸打第二趟" in app_src and "有排队待打的请求" in app_src)
 
@@ -271,6 +330,17 @@ check("★ 本地工具忙闲判定含：正在打印 / 等翻纸打第 2 趟 / 
       and "出纸槽里有" in gui_src
       and "个打印请求在排队等这一叠打完" in gui_src
       and "个订单在补打队列里等打印机空出来" in gui_src)
+check("★ 本地工具适用性：档案未确认不支持自动双面 → 攒批不显示也不生效",
+      "def _stack_applicable" in gui_src
+      and 'getattr(self._printer_profile(), "auto_duplex", None) is False' in gui_src
+      and "and self._stack_applicable()" in gui_src)
+check("★ 本地工具：复选框按适用性显隐（自动双面的机器直接隐藏）",
+      "chk.setVisible(applicable)" in gui_src and "self._set_stack_checkbox(" in gui_src)
+check("★ 本地工具：本地勾选与移动端下发都先过适用性闸门",
+      gui_src.count("if want and not self._stack_applicable():") == 2)
+check("★ 本地工具：换选打印机即刷新攒批入口（不能等下一次刷新）",
+      "currentIndexChanged.connect(self._on_printer_selection_changed)" in gui_src
+      and "def _on_printer_selection_changed" in gui_src)
 check("★ 本地勾选框与移动端下发走同一道闸门（两侧都拦）",
       "def _on_stack_mode_toggled" in gui_src and "self._stack_busy_reason()" in gui_src
       and "空闲后才能" in gui_src)
@@ -299,6 +369,9 @@ check("★ APP：调 POST /api/printer/stack_mode 且带 client_id + enable",
       "/api/printer/stack_mode" in apk_app and "client_id" in apk_app and "enable" in apk_app)
 check("★ APP：管理员角色判定",
       "super_admin" in apk_app and "admin" in apk_app)
+check("★ 移动端两端同一条适用性判据：只给「需人工翻纸」的设备渲染攒批区块",
+      "wx:if=\"{{item.auto_duplex === false}}\"" in mp_wxml
+      and "auto_duplex !== false" in apk_app)
 
 # ==================== ⑥ 判据自证（变异必须报错，否则是恒真守卫）====================
 print("\n=== ⑥ 判据自证（防恒真守卫）===")
@@ -326,6 +399,14 @@ backend._set_stack_state(CID, False, False)
 _ok_user = (post({"client_id": CID, "enable": True}, token=USER_TOKEN).get_json() or {}).get("success")
 check("B4 同一请求：admin 放行、user 被拒（证明权限判据不是恒真）",
       _ok_admin and _ok_user is False)
+# B5：适用性判据不是恒真/恒假 —— 同一状态（空闲 + 未开）下：自动双面 → 拦、需人工翻纸 → 放行
+backend._set_stack_state(CID, False, False)
+backend.set_device_manual_capability(CID, True, "测试")
+_blocked_by_cap = gate(CID, True) != ""
+backend.set_device_manual_capability(CID, False, "测试")
+_allowed_by_cap = gate(CID, True) == ""
+check("B5 同一状态下：自动双面 → 拦、需人工翻纸 → 放行（证明适用性判据真在读设备能力）",
+      _blocked_by_cap and _allowed_by_cap, f"auto={_blocked_by_cap} manual={_allowed_by_cap}")
 
 print("\n" + "=" * 56)
 print("攒批模式远程开关验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

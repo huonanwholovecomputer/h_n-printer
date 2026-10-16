@@ -84,6 +84,22 @@ win.resize(1400, 900)
 win.show()
 app.processEvents()
 
+# 攒批模式的复选框现在**只对「不支持自动双面、需人工翻纸」的机型显示**（2026-10 用户要求）：
+# 临时配置里没有任何打印机档案 ⇒ 本脚本所在机器上它是隐藏的，而隐藏控件的 indicator 矩形会
+# 算到离屏坐标、像素探针扫到图像外（判据假红/假绿）。这里把档案**桩**成那样一台机器，让它在
+# 真实条件下可见 —— 而且必须桩 `_printer_profile`（不是只写 config.printer_profiles）：
+# 探针里 `setChecked(True)` 会真的触发切换 → `_apply_stack_mode` → `_save_config()` →
+# `_sync_ui_to_config()` 从界面下拉框读回真实打印机名，配置里的伪档案随即失效、控件又被收起。
+from printer_config import PrinterProfile  # noqa: E402
+
+_FAKE_MANUAL = PrinterProfile(auto_duplex=False, capability_source="manual",
+                              manual_duplex=True)
+win._printer_profile = lambda: _FAKE_MANUAL
+win._sync_stack_button()
+app.processEvents()
+check("前置：需人工翻纸的机型 → 攒批复选框可见（下面那套对号判据才成立）",
+      not win._chk_stack_mode.isHidden(), f"hidden={win._chk_stack_mode.isHidden()}")
+
 print("\n=== 2. 运行时：勾选后指示器里必须有白色对号像素 ===")
 
 

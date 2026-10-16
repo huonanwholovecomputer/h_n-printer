@@ -16,6 +16,10 @@
   · POST /api/printer/stack_mode  body {client_id, enable}
       **一律 HTTP 200**，用 body 的 success 判断；失败时 message 即拦截原因。
 
+**适用性前提（2026-10 用户要求）**：攒批（多任务合并翻纸）只对「无自动双面器、双面需人工翻纸」
+的机型有意义 —— 两端设备列表**只对 `auto_duplex === false` 的设备**渲染攒批徽标与远程开关
+（支持自动双面 / 能力未确认的连区块都不渲染），点击入口另有兜底。判据见 ⑧。
+
 本脚本是**纯静态断言**（读源码字符串，不启动任何运行时），判据全部落在真实源码上；
 末尾的「变异自证」把源码里的关键标记抹掉再跑同一条判据，必须转假 —— 证明判据不是恒真。
 
@@ -133,6 +137,24 @@ def dark_after_base(src, cls):
 def blank(src, needle):
     """把 needle 全部替换成必然不存在的标记 —— 变异自证用。"""
     return src.replace(needle, "ZZ_不存在的标记_ZZ")
+
+
+# ---- 适用性判据（只给「需人工翻纸」的机型渲染攒批区块；2026-10 用户要求）----
+
+def mini_gate_on_manual_flip(src):
+    """小程序：整个攒批区块（徽标 + 开关）被 auto_duplex === false 的 <block> 包住。"""
+    return ('<block wx:if="{{item.auto_duplex === false}}">' in src
+            and 'wx:if="{{item.auto_duplex === false}}"' in src)
+
+
+def app_gate_on_manual_flip(badge, btn, handler):
+    """APP：徽标 / 开关控件 / 点击入口三处都先筛「需人工翻纸」。"""
+    return all("d.auto_duplex !== false" in body and "return" in body
+               for body in (badge, btn)) and "d.auto_duplex !== false" in handler
+
+
+def mini_js_gate_on_manual_flip(fn):
+    return "device.auto_duplex !== false" in fn and "不需要攒批模式" in fn
 
 
 # ==================== 读源码 ====================
@@ -258,8 +280,21 @@ check("小程序长拦截文案不被 toast 两行截断（>18 字走 wx.showMod
 check("APP #toast 会换行（max-width:80%，长文案不被截断）",
       "max-width: 80%;" in app_css)
 
-# ==================== ⑧ 变异自证（判据不是恒真）====================
-print("\n=== ⑧ 变异自证：抹掉关键标记 → 同一条判据必须转假 ===")
+# ==================== ⑧ 适用性前提：只给「需人工翻纸」的机型渲染（2026-10 用户要求）============
+print("\n=== ⑧ 攒批区块只对「需人工翻纸」的机型渲染 ===")
+check("★ 小程序 WXML：状态徽标 + 远程开关整体被 auto_duplex === false 的 <block> 包住",
+      mini_gate_on_manual_flip(mini_wxml))
+check("★ 小程序 JS：点击入口兜底（非「需人工翻纸」→ 提示后直接 return，不发请求）",
+      mini_js_gate_on_manual_flip(mini_fn))
+check("★ APP：徽标 / 开关控件 / 点击入口三处都先筛「需人工翻纸」",
+      app_gate_on_manual_flip(app_badge, app_btn, app_fn))
+check("★ 设备列表标记本身没被误删（「🖐 需人工翻纸」仍在，仅作提示）",
+      "需人工翻纸" in mini_wxml and "需人工翻纸" in app_js)
+check("★ 攒批文案没被顺手删掉（只是被条件包住）",
+      has_badges(mini_wxml) and has_badges(app_js))
+
+# ==================== ⑨ 变异自证（判据不是恒真）====================
+print("\n=== ⑨ 变异自证：抹掉关键标记 → 同一条判据必须转假 ===")
 check("[变异自证] ① 端点判据：抹掉 /api/printer/stack_mode → 假",
       not has_endpoint(blank(mini_js, "/api/printer/stack_mode"))
       and not has_endpoint(blank(app_js, "/api/printer/stack_mode")))
@@ -279,6 +314,15 @@ check("[变异自证] ⑥ 命中函数体判据：把函数名改掉 → 取不�
       fn_body(mini_js, "onToggleStackModeXX(e) {") == ""
       and fn_body(app_js, "async function toggleStackModeXX(clientId) {") == ""
       and bool(mini_fn) and bool(app_fn))
+check("[变异自证] ⑦ 适用性判据：抹掉 auto_duplex 前置 → 假（说明它真的在筛机型）",
+      not mini_gate_on_manual_flip(
+          blank(mini_wxml, '<block wx:if="{{item.auto_duplex === false}}">'))
+      and not app_gate_on_manual_flip(
+          fn_body(blank(app_js, "d.auto_duplex !== false"), "function stackBadgeHtml(d) {"),
+          fn_body(blank(app_js, "d.auto_duplex !== false"), "function stackToggleBtnHtml(d) {"),
+          fn_body(blank(app_js, "d.auto_duplex !== false"),
+                  "async function toggleStackMode(clientId) {"))
+      and not mini_js_gate_on_manual_flip(blank(mini_fn, "device.auto_duplex !== false")))
 
 print("\n" + "=" * 56)
 print("攒批模式移动端远程开关验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

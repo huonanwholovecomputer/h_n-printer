@@ -54,19 +54,24 @@
               <text class="device-label">{{item.label}}</text>
               <!-- 该设备已确认不支持自动双面（双面需人工翻纸）—— 仅作提示，不拦截无障碍/双面下单 -->
               <text wx:if="{{item.auto_duplex === false}}" class="device-state device-state-manual">🖐 需人工翻纸</text>
-              <!-- 攒批模式状态（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
-                   null（该设备从未上报，状态未知）→ 不渲染该徽标 -->
-              <text wx:if="{{item.stack_mode === true}}" class="device-state device-state-stack">🖐 攒批中</text>
-              <text wx:elif="{{item.stack_mode === false}}" class="device-state device-state-stack-off">攒批未开</text>
-              <!-- 攒批模式远程开关：仅管理员/超管渲染（普通用户看不到可点控件，也不留空壳）；
-                   离线 / 服务端判「当前不可切换」→ 灰显禁用，点击只弹提示（catchtap 防冒泡选中设备） -->
-              <view
-                wx:if="{{userRole === 'admin' || userRole === 'super_admin'}}"
-                class="device-stack-btn {{(item.online === false || item.stack_can_toggle === false || stackTogglingId === item.client_id) ? 'device-stack-btn-disabled' : ''}}"
-                hover-class="{{(item.online === false || item.stack_can_toggle === false || stackTogglingId === item.client_id) ? 'none' : 'device-hover'}}"
-                catchtap="onToggleStackMode"
-                data-index="{{index}}"
-              >{{item.stack_mode === true ? '关闭攒批' : '开启攒批'}}</view>
+              <!-- 攒批模式（状态徽标 + 远程开关）**只对「需人工翻纸」的机型渲染**：
+                   auto_duplex === false（无自动双面器）才有"合并翻纸"的需求；自动双面的机器一次成型，
+                   攒批纯属多余，能力未确认的也不给入口（2026-10 用户要求，与本地工具同一判据）。 -->
+              <block wx:if="{{item.auto_duplex === false}}">
+                <!-- 状态（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
+                     null（该设备从未上报，状态未知）→ 不渲染该徽标 -->
+                <text wx:if="{{item.stack_mode === true}}" class="device-state device-state-stack">🖐 攒批中</text>
+                <text wx:elif="{{item.stack_mode === false}}" class="device-state device-state-stack-off">攒批未开</text>
+                <!-- 远程开关：仅管理员/超管渲染（普通用户看不到可点控件，也不留空壳）；
+                     离线 / 服务端判「当前不可切换」→ 灰显禁用，点击只弹提示（catchtap 防冒泡选中设备） -->
+                <view
+                  wx:if="{{userRole === 'admin' || userRole === 'super_admin'}}"
+                  class="device-stack-btn {{(item.online === false || item.stack_can_toggle === false || stackTogglingId === item.client_id) ? 'device-stack-btn-disabled' : ''}}"
+                  hover-class="{{(item.online === false || item.stack_can_toggle === false || stackTogglingId === item.client_id) ? 'none' : 'device-hover'}}"
+                  catchtap="onToggleStackMode"
+                  data-index="{{index}}"
+                >{{item.stack_mode === true ? '关闭攒批' : '开启攒批'}}</view>
+              </block>
               <text class="device-state {{item.online ? 'device-state-on' : 'device-state-off'}}">{{item.online ? '在线' : '离线'}}</text>
             </view>
           </view>
