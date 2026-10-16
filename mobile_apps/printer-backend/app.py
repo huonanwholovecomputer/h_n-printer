@@ -6107,10 +6107,21 @@ def get_order_price(order_id):
     返回每份文件的价格明细和订单总价。
     """
     conn = get_db()
-    row = conn.execute(
-        "SELECT id, total_price, is_free FROM orders WHERE id = ? AND openid = ?",
-        (order_id, g.openid),
-    ).fetchone()
+    # 🟡-C4b：归属过滤原写法 `WHERE id = ? AND openid = ?` 让管理员读**他人**订单恒 404，
+    # 而本接口唯一调用方就是管理员的「活跃密钥 → 结算」按钮（小程序 onEndPrintTask /
+    # APP settleOrder：把结算详情复制给顾客）⇒ 该按钮线上从未可用。管理员本就可读
+    # 全站订单（订单列表 / 统计 / 许可密钥等接口同理），故只有管理员不过滤 openid；
+    # 其余用户保持「本人订单 + 同一条 404 文案」（不区分"不存在"与"无权"，不泄露存在性）。
+    if compute_role(g.openid) == "admin":
+        row = conn.execute(
+            "SELECT id, total_price, is_free FROM orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id, total_price, is_free FROM orders WHERE id = ? AND openid = ?",
+            (order_id, g.openid),
+        ).fetchone()
 
     if not row:
         conn.close()

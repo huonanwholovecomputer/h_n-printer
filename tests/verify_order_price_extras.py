@@ -19,6 +19,11 @@
      `license_finish` 三者的 total_price 与库里 `orders.total_price` 是否一致。
      覆盖：三类附加费全开 / 无附加费对照 / 只勾首页 / 多文件多份 + 派送 /
      奇数页双面（尾页走单面价）/ 许可密钥结束打印链路 / 归属过滤下的管理员路径。
+  C（🟡-C4b，2026-10-16）：`get_order_price` 的归属过滤 `WHERE id = ? AND openid = ?` 让
+     管理员读**他人**订单恒 404，而本接口唯一调用方就是管理员的「活跃密钥 → 结算」按钮
+     ⇒ 该按钮线上从未可用。修法：管理员不过滤 openid，其余用户保持原判（同一条 404 文案）。
+     断言：G1/G2 管理员放行且金额不变、G3 非归属非管理员仍 404（放行不得外溢）、G4 归属者
+     本人不受影响；A6 静态判据 + 两条"变异必红"对拍。
 
 用法：python tests/verify_order_price_extras.py     （exit 0 = 全部通过）
 """
@@ -91,6 +96,45 @@ chk("权威定价 simplex=0.30 / duplex=0.40 / cover=0.10（期望值的前提�
     and abs(float(PRICING["duplex_price"]) - 0.40) < 1e-9
     and abs(float(PRICING["cover_page_price"]) - 0.10) < 1e-9,
     str({k: PRICING.get(k) for k in ("simplex_price", "duplex_price", "cover_page_price")}))
+
+# A6（🟡-C4b）归属分支：管理员放行 + 经典 openid 过滤仍在 else 侧。
+# 判据抽成函数，配"变异后必红"的对拍（否则这类静态判据很容易写成永远为绿）。
+
+
+def _blank_comment_lines(text):
+    """把每行 `#` 之后的内容换成等长空格（保字符偏移）——
+    **判据不许吃注释**：注释里天然会引用被考的 SQL / 写法，不置空会让"删掉代码里的条件"
+    的对拍永远为绿（D3/D4 都踩过这一条）。"""
+    out = []
+    for line in text.split("\n"):
+        i = line.find("#")
+        out.append(line if i < 0 else line[:i] + " " * (len(line) - i))
+    return "\n".join(out)
+
+
+def _c4b_admin_branch(text):
+    """get_order_price 函数体里必须同时有：管理员放行分支 + 非管理员侧的 openid 归属条件。"""
+    if "def get_order_price(order_id):" not in text:
+        return False
+    body = _blank_comment_lines(
+        text.split("def get_order_price(order_id):", 1)[1].split("\n@app.route", 1)[0])
+    return ('compute_role(g.openid) == "admin"' in body
+            and "WHERE id = ? AND openid = ?" in body)
+
+
+chk("A6：get_order_price 含管理员放行分支（🟡-C4b 的修复点）", _c4b_admin_branch(src))
+# 对拍 1：删掉管理员分支 ⇒ 判据必红
+chk("A6 对拍①：去掉 `compute_role(g.openid) == \"admin\"` 后判据必红",
+    _c4b_admin_branch(src.replace('if compute_role(g.openid) == "admin":', "if False:", 1)) is False)
+# 对拍 2：把 else 侧的 openid 归属条件也去掉（过度放行）⇒ 判据必红。
+# 注意此处**只删代码里的那句、注释里留着**：正是为了钉死"判据不许吃注释"。
+chk("A6 对拍②：else 侧丢掉 openid 归属条件后判据必红（注释里还留着同一句话）",
+    _c4b_admin_branch(src.replace(
+        '"SELECT id, total_price, is_free FROM orders WHERE id = ? AND openid = ?",\n            (order_id, g.openid),',
+        '"SELECT id, total_price, is_free FROM orders WHERE id = ?",\n            (order_id,),', 1)) is False)
+chk("A6 对拍③：置空注释不影响真源码上的判据（不误杀）",
+    _blank_comment_lines(src).count("compute_role(g.openid) == \"admin\"") >= 1
+    and _c4b_admin_branch(src))
 
 # ============================================================
 # B. 行为断言：真实后端 + 真实建单管线（临时目录隔离）
@@ -308,18 +352,28 @@ chk("F：is_free 仍为 bool（无子任务时才可能为 True，本单含子�
 chk("F：文件小计之和 == 场景 D 的文件小计 10.00",
     abs(sum(round(float(f.get("total_price") or 0), 2) for f in files) - 10.00) < 1e-9)
 
-print("\n--- 场景 G：归属过滤下的管理员路径（只钉「绝不返回错误金额」）---")
+print("\n--- 场景 G：归属 —— 管理员放行（🟡-C4b）/ 非归属非管理员仍 404 ---")
 r = client.get("/api/order_price/%d" % oid_e, headers=HDR(ADMIN_OID))
-if r.status_code == 200:
-    got = round(float((r.get_json() or {}).get("total_price") or 0), 2)
-    chk("★ G：管理员读到他人订单时，总额仍必须 == 库值", abs(got - db_total_e) < 1e-9,
-        "%.2f vs %.2f" % (got, db_total_e))
-else:
-    print("[NOTE] 管理员读取他人订单被归属过滤拦截：HTTP %s（既存行为，🔴-C4 未改动；"
-          "见 docs/修复计划_2026-10.md C4 执行记录）" % r.status_code)
-chk("★ G：该路径绝不返回 200 + 错误金额",
-    r.status_code != 200
-    or abs(round(float((r.get_json() or {}).get("total_price") or 0), 2) - db_total_e) < 1e-9)
+chk("★ G1：管理员读**他人**订单现在返回 200（🟡-C4b 修复点；改前恒 404）",
+    r.status_code == 200, "HTTP %s" % r.status_code)
+got_g = round(float((r.get_json() or {}).get("total_price") or 0), 2)
+chk("★ G2：管理员读到他人订单时总额仍 == 库值（放行不改口径）",
+    r.status_code == 200 and abs(got_g - db_total_e) < 1e-9,
+    "HTTP %s / %.2f vs 库 %.2f" % (r.status_code, got_g, db_total_e))
+
+# G3 放行不得外溢：既非归属者、也非管理员的普通用户必须仍拿 404（且文案不泄露存在性）
+OTHER_OID = "openid-other-c4"          # 库里没有该用户 ⇒ compute_role 判 guest
+r_other = client.get("/api/order_price/%d" % oid_e, headers=HDR(OTHER_OID))
+chk("★ G3：非归属、非管理员用户仍 404（放行只给管理员）",
+    r_other.status_code == 404, "HTTP %s %s" % (r_other.status_code, r_other.get_json()))
+chk("★ G3：404 文案与「无权访问」一致（不区分不存在/无权，不泄露存在性）",
+    (r_other.get_json() or {}).get("message") == "任务不存在或无权访问",
+    repr((r_other.get_json() or {}).get("message")))
+
+# G4 归属者本人（顾客 / 普通用户）读自己的订单不受影响
+r_own = client.get("/api/order_price/%d" % oid_e, headers=HDR(GUEST_OID))
+chk("★ G4：订单归属者本人仍可读（未回归）", r_own.status_code == 200,
+    "HTTP %s" % r_own.status_code)
 
 # 清理
 os.chdir(REPO)
