@@ -798,6 +798,8 @@ function uploadFile(idx) {
   }, 500);
   const xhr = new XMLHttpRequest();
   entry.xhr = xhr;
+  // 上传超时上限（10 分钟）：给大文件留足时间，但"连上却收不到数据"时一定会退出来
+  xhr.timeout = UPLOAD_TIMEOUT_MS;
   xhr.open('POST', BASE_URL + '/api/upload');
   xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
   const fd = new FormData();
@@ -862,6 +864,18 @@ function uploadFile(idx) {
     f.failed = true;
     renderFileList();
     showToast('文件上传失败');
+  };
+  // D5（最后一条）：上传也必须**有时间上限**。旧实现没有 timeout —— "TCP 连上但收不到数据"
+  // （弱网/代理异常/校园网抖动）时 xhr 既不 onload 也不 onerror，进度条永远卡在某个百分比、
+  // 卡片一直显示"上传中"，用户既不能重试也不知道发生了什么（只能杀进程）。
+  // 超时判失败并给出可操作提示（与网络错误同样走 failed 态，可重试）。
+  xhr.ontimeout = () => {
+    stopUploadTimer(f);
+    if (!fileAlive(f)) return;
+    f.uploading = false;
+    f.failed = true;
+    renderFileList();
+    showToast('上传超时（网络不稳定），请重试', 3000);
   };
   xhr.send(fd);
 }

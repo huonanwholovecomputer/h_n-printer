@@ -25,16 +25,39 @@ let _refreshing = null;
 
 /* ================= 请求封装 ================= */
 
+// D5（最后一条）：全 APP 原先**没有任何请求超时**。后端与本地工具都有超时（本地工具
+// CONNECT_REQUEST_TIMEOUT=20s），而这里是唯一缺口：`await api(...)` 遇到"TCP 连上但收不到数据"
+// （弱网、校园网抖动、代理异常）会**永久挂起** —— 界面停在加载态，既不报错也不重试。
+// 用 AbortController 设默认上限；需要长耗时的调用可传 opts.timeoutMs 覆盖（传 0 表示不限）。
+const API_TIMEOUT_MS = 20000;
+// 文件上传走 XMLHttpRequest（有进度条），单独给一个宽松上限（大文件 + 慢网）
+const UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+
 async function api(path, opts = {}) {
   const headers = Object.assign({}, opts.headers || {});
   if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  const timeoutMs = (opts.timeoutMs === undefined) ? API_TIMEOUT_MS : opts.timeoutMs;
+  const fetchOpts = Object.assign({}, opts, { headers });
+  delete fetchOpts.timeoutMs;              // 自定义字段不传给 fetch
+  let timer = null;
+  let controller = null;
+  if (!opts.signal && timeoutMs > 0 && typeof AbortController !== 'undefined') {
+    controller = new AbortController();
+    fetchOpts.signal = controller.signal;
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+  }
   let res;
   try {
-    res = await fetch(BASE_URL + path, Object.assign({}, opts, { headers }));
+    res = await fetch(BASE_URL + path, fetchOpts);
   } catch (e) {
-    const err = new Error('网络错误');
+    // AbortController 触发的取消 = 超时（调用方自己传 signal 时不算我们的超时）
+    const aborted = !!(e && (e.name === 'AbortError' || e.code === 20));
+    const err = new Error(aborted ? '请求超时' : '网络错误');
     err.network = true;
+    err.timeout = aborted;
     throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   if (res.status === 401 && !opts._retried) {
     const ok = await refreshToken();
