@@ -40,6 +40,7 @@ DUPLEX_BUTTON_WORDS = ("继续", "continue", "确定", "ok")
 # 页序引擎（唯一真相，纯逻辑 + 独立验收 tests/verify_manual_duplex.py）
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import manual_duplex as md  # noqa: E402
+import pdf_printer as pp  # noqa: E402  （模块级只 import 标准库；fitz/PIL 在函数内惰性导入）
 
 
 # ============================================================
@@ -48,12 +49,15 @@ import manual_duplex as md  # noqa: E402
 
 def probe_printer(win32print, win32con, name: str) -> dict:
     """探测单台打印机：端口、DC_DUPLEX、DEVMODE 双面字段、驱动接受度。"""
-    info = {"name": name, "port": "", "dc_duplex": None, "dm_duplex": None,
-            "dm_fields": None, "accepted": None, "error": ""}
+    info = {"name": name, "port": "", "driver": "", "virtual": False,
+            "dc_duplex": None, "dm_duplex": None, "dm_fields": None,
+            "accepted": None, "error": ""}
     handle = None
     try:
         handle = win32print.OpenPrinter(name)
         info["port"] = win32print.GetPrinter(handle, 2).get("pPortName", "")
+        info["driver"] = win32print.GetPrinter(handle, 2).get("pDriverName", "") or ""
+        info["virtual"] = pp.is_virtual_printer(name, info["driver"], info["port"])
 
         cap = win32print.DeviceCapabilities(name, info["port"], DC_DUPLEX)
         # pywin32 多数版本对 DC_DUPLEX 返回 int；个别能力位返回元组，统一取首元素
@@ -92,6 +96,12 @@ def verdict(info: dict) -> str:
     hinted = any(h in name for h in MANUAL_ONLY_HINTS)
     dc, acc = info["dc_duplex"], info["accepted"]
 
+    # 虚拟打印机优先判：它不出纸，双面**没有物理意义**（不是"驱动做不到"），
+    # 程序对它放行双面请求并按单面输出（见 pdf_printer.is_virtual_printer）。
+    if info.get("virtual"):
+        return (f"虚拟打印机（{'/'.join(x for x in (info.get('driver'), info.get('port')) if x)}）"
+                f"—— 不出纸，双面为空操作：程序按请求放行、按单面输出，不会拦双面打印")
+
     if dc == 0:
         tail = "（该机型只有『Print on Both Sides (Manually)』，须走本程序的手动双面两趟）" \
             if hinted else "须走手动双面两趟或改单面计费"
@@ -129,7 +139,8 @@ def run_probe(argv: list[str]) -> int:
     print(f"共 {len(names)} 台打印机\n" + "=" * 78)
     for n in names:
         info = probe_printer(win32print, win32con, n)
-        print(f"{n}\n  端口            : {info['port']}")
+        print(f"{n}\n  驱动            : {info['driver'] or '(未知)'}")
+        print(f"  端口            : {info['port']}")
         print(f"  DC_DUPLEX       : {info['dc_duplex']}   (1=声明支持双面, 0=不支持)")
         print(f"  DEVMODE.Duplex  : {info['dm_duplex']}  (1=SIMPLEX 2=长边 3=短边)")
         print(f"  请求双面后驱动  : {'接受' if info['accepted'] else '拒绝/改回 SIMPLEX'}")

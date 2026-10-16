@@ -376,6 +376,78 @@ DC_DUPLEX = 7  # wingdi.h: DeviceCapabilities 的能力位
 _DUPLEX_CAP_CACHE: dict[tuple, dict] = {}
 _DUPLEX_CAP_LOCK = threading.Lock()
 
+# ── 虚拟打印机（无纸输出）判定 ─────────────────────────────────────────────
+# Microsoft Print to PDF / Microsoft XPS Document Writer / OneNote / Adobe PDF /
+# 「导出为 WPS PDF」这类队列**不出纸**：Duplex 对它们没有物理意义，驱动把 Duplex 归一化回
+# 1(SIMPLEX) 是常态，也不会浪费纸。真实机型上那条「驱动改回单面 = 假成功，必须拒打」
+# （防按双面计费却出单面纸）对这类队列不成立 —— 不放开就没法用虚拟打印机跑通含双面文件的
+# 整条流程（2026-10 实测报错：拒绝双面打印: 该打印机不支持自动双面…：Microsoft Print to PDF）。
+VIRTUAL_PRINTER_KEYWORDS = (
+    "print to pdf", "xps document writer", "print to onenote", "onenote",
+    "pdfcreator", "cute pdf", "cutepdf", "pdf24", "novapdf", "bullzip", "primopdf",
+    "pdf-xchange", "docucom", "adobe pdf", "wps pdf", "foxit pdf", "print to file",
+    "virtual printer",
+)
+# 端口名同样是证据：PORTPROMPT: = 打印时弹「另存为」；FILE:/nul: = 写文件/丢弃；
+# "…\*.pdf" 这类端口本身就是一条 PDF 路径。
+VIRTUAL_PRINTER_PORT_MARKS = ("portprompt:", "file:", "nul:", ".pdf")
+
+_IDENTITY_CACHE: dict[str, tuple[str, str]] = {}
+_IDENTITY_LOCK = threading.Lock()
+
+
+def _looks_virtual(text: str) -> bool:
+    s = (text or "").strip().lower()
+    return bool(s) and any(k in s for k in VIRTUAL_PRINTER_KEYWORDS)
+
+
+def _port_looks_virtual(port: str) -> bool:
+    s = (port or "").strip().lower()
+    return bool(s) and any(m in s for m in VIRTUAL_PRINTER_PORT_MARKS)
+
+
+def printer_identity(printer_name: str) -> tuple[str, str]:
+    """(驱动名, 端口名)，按队列名缓存；取不到就返回 ("", "")。
+
+    只给 `is_virtual_printer()` 的名字路径兜底用（能力探测自己已读 driver/port，不必走这里）。
+    """
+    name = (printer_name or "").strip()
+    if not name:
+        return "", ""
+    key = name.lower()
+    with _IDENTITY_LOCK:
+        hit = _IDENTITY_CACHE.get(key)
+    if hit is not None:
+        return hit
+    driver = port = ""
+    try:
+        import win32print
+        handle = win32print.OpenPrinter(name)
+        try:
+            info = win32print.GetPrinter(handle, 2)
+            driver = info.get("pDriverName", "") or ""
+            port = info.get("pPortName", "") or ""
+        finally:
+            win32print.ClosePrinter(handle)
+    except Exception as e:
+        logger.debug(f"读取打印机 {name} 的驱动/端口失败（按队列名判虚拟打印机）: {e}")
+    with _IDENTITY_LOCK:
+        _IDENTITY_CACHE[key] = (driver, port)
+    return driver, port
+
+
+def is_virtual_printer(printer_name: str = "", driver: str = "", port: str = "") -> bool:
+    """这台队列是否「虚拟打印机」（不出纸：Print to PDF / XPS / OneNote / PDF 虚拟驱动）。
+
+    判据：队列名或驱动名命中虚拟关键字，或端口名是 PORTPROMPT:/FILE:/nul:/…pdf。
+    driver/port 未给出时按队列名查一次驱动/端口（结果缓存），查不到就只按队列名判。
+    """
+    if _looks_virtual(printer_name):
+        return True
+    if not driver and not port:
+        driver, port = printer_identity(printer_name)
+    return _looks_virtual(driver) or _looks_virtual(port) or _port_looks_virtual(port)
+
 
 def get_printer_duplex_support(printer_name: str = "", refresh: bool = False) -> dict:
     """探测打印机是否具备**自动**双面（物理有没有双面器）。
@@ -401,6 +473,8 @@ def get_printer_duplex_support(printer_name: str = "", refresh: bool = False) ->
           "confidence": "high"|"medium"|"low",
           "printer"/"driver"/"port": str,
           "dc_duplex": 0|1|None, "dm_accepted": bool|None,
+          "virtual": bool,                  # True = 虚拟打印机（不出纸）：双面为空操作，
+                                            #        调用方**不得**按"不支持自动双面"拦截
           "detail": str,                    # 人类可读结论（日志用；不输出 token 之类）
         }
 
@@ -408,7 +482,8 @@ def get_printer_duplex_support(printer_name: str = "", refresh: bool = False) ->
     """
     printer = (printer_name or "").strip()
     out = {"auto_duplex": None, "confidence": "low", "printer": printer,
-           "driver": "", "port": "", "dc_duplex": None, "dm_accepted": None, "detail": ""}
+           "driver": "", "port": "", "dc_duplex": None, "dm_accepted": None,
+           "virtual": _looks_virtual(printer), "detail": ""}
     try:
         import win32con
         import win32print
@@ -430,6 +505,9 @@ def get_printer_duplex_support(printer_name: str = "", refresh: bool = False) ->
         info = win32print.GetPrinter(handle, 2)
         out["driver"] = info.get("pDriverName", "") or ""
         out["port"] = info.get("pPortName", "") or ""
+        if not out["virtual"]:
+            # 队列名判不出来时，驱动名/端口名还能判（如「导出为 WPS PDF」→ 驱动带 virtual printer）
+            out["virtual"] = (is_virtual_printer("", out["driver"], out["port"]))
 
         key = (printer.lower(), out["driver"].lower(), out["port"].lower())
         with _DUPLEX_CAP_LOCK:
@@ -481,6 +559,10 @@ def get_printer_duplex_support(printer_name: str = "", refresh: bool = False) ->
             out["detail"] = "驱动声明支持双面，但未能验证 DEVMODE（无法确认，需实机/人工确认）"
         else:
             out["detail"] = f"判不出来（能力位={dc}, 驱动接受={acc}）"
+        if out["virtual"]:
+            # 能力字段照实报（多数是 False/high），但语义是"双面对它没有意义"，不是
+            # "驱动做不到 → 必须拦"。两者靠 virtual 区分，拦截点只认后者。
+            out["detail"] += "；虚拟打印机（无纸输出）⇒ 双面为空操作，按请求放行"
         logger.info(f"双面能力探测: {printer} → auto_duplex={out['auto_duplex']} "
                     f"({out['confidence']}): {out['detail']}")
         with _DUPLEX_CAP_LOCK:
@@ -756,16 +838,26 @@ def print_pdf(
     # （GDI/Sumatra/循环）都会单面出纸，而客户端按双面计费 → 店里出双倍纸。
     # 只在两条证据都指向"不支持"（confidence=high）时才拒打，避免误伤探测失败的机型；
     # 判不准或证据不足时照常打，但留下日志。
+    #
+    # 例外：**虚拟打印机**（Microsoft Print to PDF / XPS / OneNote / PDF 虚拟驱动）不出纸，
+    # 双面对它没有物理意义、也不浪费纸 —— 不能拿"真机型假成功"那条规矩拦它，否则本地工具
+    # 就没法用虚拟打印机跑通含双面文件的整条流程（测试/开发场景）。放行并注明按单面输出。
     if duplex == "on" and system == "Windows" and pages_override is None:
         verdict = get_printer_duplex_support(printer_name)
-        if verdict.get("auto_duplex") is False and verdict.get("confidence") == "high":
+        target = verdict.get("printer") or printer_name or "(默认打印机)"
+        if verdict.get("virtual") or is_virtual_printer(target):
+            note = (f"虚拟打印机「{target}」不出纸：双面设置为空操作，按请求继续"
+                    f"（输出按单面生成，不浪费纸）")
+            logger.info(f"虚拟打印机放行双面请求: {note}")
+            print(f"[打印] ℹ {note}")
+        elif verdict.get("auto_duplex") is False and verdict.get("confidence") == "high":
             msg = (f"该打印机不支持自动双面（{verdict.get('detail')}）："
                    f"{verdict.get('printer')}。请改用单面打印；"
                    f"若要双面，需走手动双面流程（人工翻纸）")
             logger.error(f"拒绝双面打印: {msg}")
             print(f"[打印] ✗ {msg}")
             return False, msg
-        if verdict.get("auto_duplex") is None:
+        elif verdict.get("auto_duplex") is None:
             logger.warning(f"双面能力判不准，按请求继续打印: {verdict.get('detail')}")
             print(f"[打印] ⚠ 双面能力判不准（{verdict.get('detail')}），仍按双面提交")
 
@@ -899,6 +991,10 @@ def _print_pdf_native(
         pages_to_print = _parse_page_range(page_range, total_pages)
         printer = printer_name or win32print.GetDefaultPrinter()
 
+        # 虚拟打印机（Print to PDF / XPS / OneNote…）不出纸：驱动把 Duplex 归一化回单面是常态，
+        # 不构成"假成功"（既不浪费纸，也不存在"按双面计费却出单面纸"）⇒ 放行并注明。
+        virtual_printer = (duplex == "on") and is_virtual_printer(printer)
+
         # 逐面渲染序列（唯一真相）：常规路径 = 份数 × 页码（奇数页双面多份时插分隔空白页）；
         # 手动双面/校准 = 调用方给定的精确序列（含空白占位页）
         render_seq = build_render_sequence(pages_to_print, copies, duplex, pages_override)
@@ -939,8 +1035,13 @@ def _print_pdf_native(
                     actual = {1: "单面", 2: "长边双面", 3: "短边双面"}.get(applied_duplex,
                                                                         f"未知({applied_duplex})")
                     if duplex == "on" and applied_duplex not in (2, 3):
-                        print(f"[GDI] ✗ DEVMODE 已应用但驱动把双面改回「{actual}」（请求 {desc}）")
-                        logger.warning(f"GDI: 驱动把 Duplex 改回 {applied_duplex}（请求双面）")
+                        if virtual_printer:
+                            print(f"[GDI] ℹ 虚拟打印机：驱动把双面归一化为「{actual}」属正常"
+                                  f"（无纸输出），继续按单面渲染")
+                            logger.info(f"GDI: 虚拟打印机「{printer}」双面归一化为 {applied_duplex}，继续")
+                        else:
+                            print(f"[GDI] ✗ DEVMODE 已应用但驱动把双面改回「{actual}」（请求 {desc}）")
+                            logger.warning(f"GDI: 驱动把 Duplex 改回 {applied_duplex}（请求双面）")
                     else:
                         print(f"[GDI] ✓ DEVMODE 已应用 (win32gui.ResetDC): 双面模式={desc} → 驱动实际={actual}")
                         logger.info(f"GDI: win32gui.ResetDC 成功, duplex={duplex}/{duplex_mode}, 实际={applied_duplex}")
@@ -962,12 +1063,19 @@ def _print_pdf_native(
         # P0（2026-10）：驱动把双面改回单面 → 明确失败，不再"静默单面出纸 + 报成功"。
         # 实测所有无自动双面的队列都会这样（能力位=0 且 Duplex 被改回 1）。此处尚未
         # StartDoc（没出过纸），因此允许上层直接报错，不做整单重打。
+        # 例外：虚拟打印机（Microsoft Print to PDF / XPS / OneNote…）—— 它本来就不出纸，
+        # 双面只是空操作，按单面继续；否则整个测试/开发流程都用不了它。
         if duplex == "on" and devmode is not None and applied_duplex not in (2, 3):
-            msg = (f"驱动未采纳双面设置（Duplex={applied_duplex}）—— 该打印机不支持自动双面，"
-                   f"继续打只会单面出纸: {printer}")
-            logger.error(f"GDI: {msg}")
-            print(f"[GDI] ✗ {msg}")
-            return False, DUPLEX_UNSUPPORTED_MARKER + msg
+            if virtual_printer:
+                print(f"[GDI] ℹ 虚拟打印机「{printer}」不出纸：双面为空操作（Duplex={applied_duplex}），"
+                      f"继续打印")
+                logger.info(f"GDI: 虚拟打印机「{printer}」双面为空操作（Duplex={applied_duplex}），继续")
+            else:
+                msg = (f"驱动未采纳双面设置（Duplex={applied_duplex}）—— 该打印机不支持自动双面，"
+                       f"继续打只会单面出纸: {printer}")
+                logger.error(f"GDI: {msg}")
+                print(f"[GDI] ✗ {msg}")
+                return False, DUPLEX_UNSUPPORTED_MARKER + msg
 
         # 获取打印机可打印区域和分辨率
         native_dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
@@ -1100,6 +1208,8 @@ def _print_pdf_native(
         msg = f"打印成功 (GDI, {len(render_seq)} 面)"
         if needs_separator:
             msg += f" [已插入 {sep_count} 张空白分隔页]"
+        if virtual_printer:
+            msg += " [虚拟打印机：双面为空操作，按单面输出]"
         logger.info(f"GDI 打印完成: {msg}")
         return True, msg
 
