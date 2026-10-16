@@ -1756,6 +1756,36 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
+    # v29 迁移（D5）：给幂等键 client_request_id 加**部分唯一索引**。
+    # 为什么：原实现是"先查再插"（submit_order 里 SELECT 之后才 INSERT），毫秒级并发双击
+    # （小程序/APP 双击、弱网自动重试）两边都查不到对方就都插入 ⇒ 重复建单 = 重复印 + 重复计费。
+    # ① 先去重：同一 (openid, client_request_id) 只保留**最早**一条，其余把该列清空 ——
+    #    不动订单本身、不动 order_number，这些订单只是失去幂等键（重启后新提交仍会被正确拦）；
+    # ② 再建**部分**唯一索引（空串不参与索引 ⇒ 未带幂等键的提交与历史数据不受影响）。
+    # 两步都幂等，重复执行安全。
+    try:
+        _had_idx = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_orders_client_req'"
+        ).fetchone()
+        dup_cleared = conn.execute(
+            """UPDATE orders SET client_request_id = ''
+               WHERE client_request_id IS NOT NULL AND client_request_id != ''
+                 AND id NOT IN (SELECT MIN(id) FROM orders
+                                WHERE client_request_id IS NOT NULL AND client_request_id != ''
+                                GROUP BY openid, client_request_id)"""
+        ).rowcount
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_req
+               ON orders(openid, client_request_id) WHERE client_request_id != ''"""
+        )
+        conn.commit()
+        if dup_cleared:
+            print(f"  已清空 {dup_cleared} 条重复的 client_request_id（保留最早一条）")
+        if not _had_idx:
+            print("  已建立 orders 幂等键唯一索引（idx_orders_client_req）")
+    except sqlite3.OperationalError as e:
+        print(f"  [WARN] 幂等键唯一索引建立失败（不影响启动）: {e}")
+
     # v24 迁移：订单归属标记 —— 谁处理了这笔订单 + 是否为管理员自行打印。
     #   owner_name     TEXT    归属管理员姓名（本地工具下拉选择；云端订单由打印机回报时盖章）
     #   is_admin_print INTEGER 1=管理员自行打印（非顾客订单）；0=顾客订单（接单打印）
@@ -1915,6 +1945,49 @@ def next_order_number():
 
 _ORDER_COUNTER_LOCK = threading.Lock()
 ORDER_COUNTER_FILE = os.path.join(UPLOAD_DIR, "order_counter.json")
+
+
+def _find_order_by_client_request_id(openid: str, client_request_id: str,
+                                      minutes: "int | None" = 10):
+    """按幂等键回查既有订单，返回 dict 或 None。
+
+    minutes=None → **不限时间窗**（并发兜底路径用：同一把钥匙刚被别人抢先插入，无论多久都算重复）。
+    单独开连接查询（不复用建单事务的连接），因此读到的是**已提交**的对方订单。
+    """
+    if not openid or not client_request_id:
+        return None
+    conn = get_db()
+    try:
+        if minutes is None:
+            row = conn.execute(
+                """SELECT id, order_number, status, created_at FROM orders
+                   WHERE openid = ? AND client_request_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (openid, client_request_id),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT id, order_number, status, created_at FROM orders
+                   WHERE openid = ? AND client_request_id = ? AND created_at > ?
+                   ORDER BY id DESC LIMIT 1""",
+                (openid, client_request_id,
+                 (datetime.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")),
+            ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _duplicate_order_response(dup_row: dict, data: dict):
+    """重复提交的统一响应（与正常建单同形；前端靠 is_duplicate 区分，可提示"已提交过"）。"""
+    return jsonify({
+        "success": True,
+        "is_duplicate": True,
+        "message": "检测到重复提交，已返回原订单",
+        "order_id": dup_row["id"],
+        "order_number": dup_row["order_number"],
+        "data": data,
+    })
 
 
 def generate_order_number():
@@ -5021,25 +5094,13 @@ def submit_order():
     # ---- 幂等去重（P0-2）：同用户同 client_request_id 的订单 10 分钟内返回原单 ----
     # 原单已取消则不拦（用户可能在取消后重新提交）。
     if client_request_id:
-        dup_conn = get_db()
-        dup_row = dup_conn.execute(
-            """SELECT id, order_number, status FROM orders
-               WHERE openid = ? AND client_request_id = ? AND created_at > ?
-               ORDER BY id DESC LIMIT 1""",
-            (g.openid, client_request_id,
-             (datetime.now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")),
-        ).fetchone()
-        dup_conn.close()
+        dup_row = _find_order_by_client_request_id(g.openid, client_request_id)
         if dup_row and dup_row["status"] != "canceled":
-            # 构造与正常建单一致的响应（is_duplicate 标记供前端区分）
-            return jsonify({
-                "success": True,
-                "is_duplicate": True,
-                "message": "检测到重复提交，已返回原订单",
-                "order_id": dup_row["id"],
-                "order_number": dup_row["order_number"],
-                "data": data,
-            })
+            return _duplicate_order_response(dup_row, data)
+        if dup_row:
+            # 原单已取消 → 用户是在取消后重新提交：**换一把新幂等键**，免得与那条已取消的
+            # 记录撞 (openid, client_request_id) 唯一索引（idx_orders_client_req）。
+            client_request_id = f"{client_request_id}-r{secrets.token_hex(4)}"
 
     order_number = generate_order_number()
 
@@ -5067,26 +5128,52 @@ def submit_order():
     try:
         # 先插父订单（聚合字段用首文件填充，后续严格通过 order_files 聚合）
         first_file_name = files_input[0].get("file", files_input[0].get("file_name", ""))
-        conn.execute(
-            """INSERT INTO orders (file_id, file, copies, status, created_at, openid, duplex,
-                                   page_count, price_per_page, total_price, is_free,
-                                   delivery_enabled, delivery_location, delivery_percentage,
-                                   urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-                                   order_number, source, auto_print,
-                                   schedule_mode, scheduled_at, schedule_frozen,
-                                   client_request_id, owner_name, is_admin_print, remark, target_client)
-               VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
-            (files_input[0].get("file_id") or None, first_file_name, 0,
-             created_at, g.openid, duplex,
-             0,  # is_free 恒为 0 — 价格仅用于统计
-             delivery_enabled, delivery_location, delivery_percentage,
-             urgency, urgency_price, cover_page, cover_page_price, pickup_address,
-             order_number, client, 1 if auto_print else 0,
-             schedule_mode, scheduled_at,
-             client_request_id, owner_name, admin_print, remark, target_client_id),
-            # is_free 恒为 0 — 价格仅用于统计，无免费策略
-        )
+        # D5：父订单插入加幂等兜底。要在 while 里重试，是因为「换钥匙重插」那条支路
+        # 需要重来一次（只重试父订单这一条 INSERT，此刻还没写任何 order_files）。
+        _idem_attempt = 0
+        while True:
+            _idem_attempt += 1
+            try:
+                conn.execute(
+                    """INSERT INTO orders (file_id, file, copies, status, created_at, openid, duplex,
+                                           page_count, price_per_page, total_price, is_free,
+                                           delivery_enabled, delivery_location, delivery_percentage,
+                                           urgency, urgency_price, cover_page, cover_page_price, pickup_address,
+                                           order_number, source, auto_print,
+                                           schedule_mode, scheduled_at, schedule_frozen,
+                                           client_request_id, owner_name, is_admin_print, remark, target_client)
+                       VALUES (?, ?, ?, 'queued', ?, ?, ?, 1, 0, 0, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+                    (files_input[0].get("file_id") or None, first_file_name, 0,
+                     created_at, g.openid, duplex,
+                     0,  # is_free 恒为 0 — 价格仅用于统计
+                     delivery_enabled, delivery_location, delivery_percentage,
+                     urgency, urgency_price, cover_page, cover_page_price, pickup_address,
+                     order_number, client, 1 if auto_print else 0,
+                     schedule_mode, scheduled_at,
+                     client_request_id, owner_name, admin_print, remark, target_client_id),
+                    # is_free 恒为 0 — 价格仅用于统计，无免费策略
+                )
+                break
+            except sqlite3.IntegrityError as _ie:
+                # 并发/复用同一把钥匙：唯一索引把后来者挡在这里。三种情形分开处理 ——
+                #  ① 真·并发双击 / 弱网重试（**10 分钟窗口内**同一把钥匙）→ 返回原单，
+                #     不重复印、不重复计费（这一支正是本条修复要堵的洞）；
+                #  ② 原单已取消、或**窗口外**复用同一把钥匙（老语义本来就允许新建一单）
+                #     → **换一把新钥匙重插**，保住老语义；
+                #  ③ 其余完整性错误（外键等）原样抛出。
+                if "client_request_id" not in str(_ie) and "idx_orders_client_req" not in str(_ie):
+                    raise
+                # 父订单插入失败即回滚（此刻还没插任何 order_files，重试是干净的）
+                conn.rollback()
+                _fresh = _find_order_by_client_request_id(g.openid, client_request_id)
+                if _fresh and _fresh["status"] != "canceled":
+                    conn.close()
+                    user_conn.close()
+                    return _duplicate_order_response(_fresh, data)
+                if _idem_attempt >= 3:
+                    raise
+                client_request_id = f"{client_request_id}-r{secrets.token_hex(4)}"
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         # 插每个子任务
