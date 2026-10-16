@@ -30,6 +30,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QEasingCurve,
     QUrl,
+    QItemSelectionModel,
 )
 from PySide6.QtGui import (
     QAction,
@@ -229,6 +230,17 @@ class ThemedCheckBox(QCheckBox):
             painter.drawText(rect, Qt.AlignCenter, "✓")
         finally:
             painter.end()
+
+
+# ── PDF 转换引擎下拉（编辑面板）─────────────────────────────────────────────
+# 前 3 项是真实引擎（index ↔ 引擎名一一对应）；第 4 项只在「选区里的 Word 文件引擎不一致」时
+# 出现，选中它 = **不写回**（各自保留原设置）。只读标签（「直接打印/图片渲染/…」）是另一回事，
+# 它只有一个 item，且下拉整体禁用。
+ENGINE_BY_INDEX = {0: "word", 1: "wps", 2: "libreoffice"}   # 索引 → 引擎名
+ENGINE_INDEX_OF = {v: k for k, v in ENGINE_BY_INDEX.items()}  # 引擎名 → 索引（别把两者搞反）
+ENGINE_CHOICE_LABELS = ["Word", "WPS", "LibreOffice"]
+ENGINE_MIXED_LABEL = "混合（各自保留）"
+ENGINE_MIXED_TIP = "选中的 Word 文档引擎不一致，当前各自保留原设置；选一个具体引擎可统一改掉"
 
 
 def _format_engine_label(ext: str) -> str:
@@ -2896,6 +2908,14 @@ class MainWindow(QMainWindow):
         except (ValueError, TypeError):
             return default
 
+    def _next_tab_key(self) -> str:
+        """下一个可用标签页 key = 现有最大数字 key + 1（新建标签页的唯一取号入口）。
+
+        「在最后一页点 ＋」新建、以及「添加到新标签页」（把文件复制到新标签页）都走这里，
+        避免两处各自算号算出同一个 key 把已有标签页顶掉。"""
+        tab_keys = self._sorted_tab_keys(self._config.tabs)
+        return str((self._safe_int_key(tab_keys[-1]) if tab_keys else 0) + 1)
+
     # ---- 云端连接 ----
 
     def _init_cloud_client(self):
@@ -4002,7 +4022,14 @@ class MainWindow(QMainWindow):
         self._table.setHorizontalHeaderLabels(["文件名", "份数", "单/双面", "页码范围", "页数", "方向", "引擎", "费用"])
         self._table.filesDropped.connect(self._on_files_dropped)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # 多选（2026-10）：Ctrl/Shift + 左键、以及鼠标拖框（rubber band）都能选多行；
+        # 右键菜单的批量操作（移除选中 / 添加到新标签页）对**整片选区**生效。
+        # Qt 原生行选择 + 拖框在 ExtendedSelection 下即可用，无需自绘选择框。
+        self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # 关闭「拖出整行」的内部拖动：dragEnabled=True 时从行内按下拖动会被 Qt 判成
+        # 内部拖动（拖出行/光标变禁止）而**不是**拖框选择 —— 手势冲突，拖框会失效。
+        # 资源管理器拖进来的文件投放不受影响（DropTableWidget 自己处理 dragEnter/drop）。
+        self._table.setDragEnabled(False)
         self._table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         _enable_smooth_scroll(self._table)
@@ -4113,8 +4140,7 @@ class MainWindow(QMainWindow):
 
         if new_idx >= len(tab_keys):
             # 在最后一页点 + → 新建标签
-            last_num = self._safe_int_key(tab_keys[-1]) if tab_keys else 0
-            new_key = str(last_num + 1)
+            new_key = self._next_tab_key()
             self._config.tabs[new_key] = self._make_new_tab()
             self._current_tab = new_key
             self._config.active_tab = new_key
@@ -4751,7 +4777,15 @@ class MainWindow(QMainWindow):
         """添加一行到表格。"""
         row = self._table.rowCount()
         self._table.insertRow(row)
+        self._fill_table_row(row, job)
 
+    def _fill_table_row(self, row: int, job: PrintJob):
+        """按 job 的当前值重写第 row 行的全部单元格（新建行与「参数改完就地重画」共用）。
+
+        ⚠ 编辑面板改参数后**必须**走这里。原先只调 `_recalc_row_cost()`（只重画「费用」列），
+        于是「份数」那一格停在旧值 —— 面板写着 2 份、表格里还写着 1 份，操作员会以为自己
+        没点到（2026-10 现场截图报的 bug：2 个文件都被改成 2 份，费用列已按 ×2 算，份数列仍是 1）。
+        """
         ext = os.path.splitext(job.file_path)[1].lower()
         image_exts = self.IMAGE_EXTS
         is_image = ext in image_exts
@@ -4909,9 +4943,49 @@ class MainWindow(QMainWindow):
             if file_path and os.path.isfile(file_path):
                 os.startfile(file_path)
 
+    def _job_is_image(self, job) -> bool:
+        """该任务是不是图片（图片单页、没有页码与双面的概念）。"""
+        ext = os.path.splitext(getattr(job, 'file_path', '') or '')[1].lower()
+        return ext in self.IMAGE_EXTS
+
+    def _job_is_word(self, job) -> bool:
+        """该任务是不是 Word 文档（.doc/.docx —— 只有它们能选 PDF 转换引擎）。"""
+        ext = os.path.splitext(getattr(job, 'file_path', '') or '')[1].lower()
+        return ext in (".doc", ".docx")
+
+    def _selection_jobs(self, jobs, rows) -> list:
+        """选区内的任务对象（按行号升序，越界忽略）。"""
+        return [jobs[r] for r in rows if 0 <= r < len(jobs)]
+
+    def _job_is_single_page(self, job) -> bool:
+        """该任务实际只打 1 页（整份 1 页，或页码范围恰好解析出 1 页）。
+
+        页数未知（page_count=0 且没填范围）不算单页 —— 保持「未知就允许双面」的旧行为，
+        交由打印侧按真实页数处理。"""
+        return _count_pages_in_range(getattr(job, 'page_range', '') or "",
+                                     getattr(job, 'page_count', 0) or 0) == 1
+
+    def _selection_traits(self, jobs, rows) -> tuple:
+        """整片选区的共用特征 → (是否多选, 是否含图片, 是否含单页文件)。
+
+        编辑面板是「一片选区共用」的，所以可用性必须按**全部**选中行判定（任一行不适用即禁用）。
+        只按选区第一行判会出两种错位（2026-10 现场报的 bug）：① 选区里有单页文件，
+        「单/双面」「双面模式」却亮着 —— 单页文件双面无意义；② 多选时「页码范围」亮着 ——
+        同一个范围对页数不同的文件根本没有共同含义（还会被批量写进每一个文件）。
+        """
+        sel = self._selection_jobs(jobs, rows)
+        return (len(sel) > 1,
+                any(self._job_is_image(j) for j in sel),
+                any(self._job_is_single_page(j) for j in sel))
+
     def _on_table_selection(self):
-        """选中行变化 → 同步编辑面板。"""
+        """选中行变化 → 同步编辑面板（多选时面板显示选区第一行，改动作用于全部选中行）。"""
         rows = set(idx.row() for idx in self._table.selectedIndexes())
+        # 多选提示：让操作员一眼看出「这一改会作用到几个文件」
+        grp = getattr(self, '_edit_group', None)
+        if grp is not None:
+            grp.setTitle(f"编辑选中任务（{len(rows)} 个文件）" if len(rows) > 1
+                         else "编辑选中任务")
         if not rows:
             self._sync_edit_enabled(False)
             return
@@ -4933,7 +5007,10 @@ class MainWindow(QMainWindow):
         is_word = ext in (".doc", ".docx")
         # 单页判定：整份 1 页 或 页码范围有效页数恰好 1 页 → 双面打印物理上即单面输出
         single_page = _count_pages_in_range(job.page_range or "", job.page_count or 0) == 1
-        duplex_usable = (not is_img) and (not single_page)
+        # 整片选区的共用可用性（多选/含图片/含单页 → 见 _selection_traits 说明）
+        multi, any_img, any_single = self._selection_traits(jobs, sorted(rows))
+        duplex_usable = (not any_img) and (not any_single)
+        range_usable = (not multi) and (not any_img)
 
         # 同步编辑控件
         self._edit_copies.blockSignals(True)
@@ -4951,45 +5028,60 @@ class MainWindow(QMainWindow):
         self._edit_page_range.set_total_pages(job.page_count)
         self._edit_page_range.set_ranges(job.page_range)
 
-        # PDF转换引擎：Word 显示可选引擎；其余格式显示实际转换引擎（灰色不可选）
-        if is_word:
-            eng_map = {"word": 0, "wps": 1, "libreoffice": 2}
+        # 转换引擎：选区里**只要有 Word 文件**就显示三选一（取值 = 选区里第一个 Word 文件的引擎，
+        # 改动只作用于 .doc/.docx）；Word 文件之间引擎不一致时**追加**一项「混合（各自保留）」
+        # 并选中它（显示真相，且此项不写回 = 保持各自设置）；一个 Word 文件都没有 → 只读标签显示
+        # 第一行的实际转换方式（灰）。
+        # 为什么不按「第一行」取：第一行可能是图片/PDF（它们根本没有引擎可选），照第一行取会把
+        # 面板降成只读标签（选区里的 .docx 明明能选引擎）；更要命的是此时下拉只有那一个标签项，
+        # 索引 0 会被当 "word" 写回，把 WPS 排版的文档静默改成 Word（见 _auto_apply_edit 的闸门）。
+        sel_jobs = self._selection_jobs(jobs, sorted(rows))
+        word_jobs = [j for j in sel_jobs if self._job_is_word(j)]
+        if word_jobs:
+            engines = {(getattr(j, 'engine', '') or 'word') for j in word_jobs}
+            mixed = len(engines) > 1
+            items = list(ENGINE_CHOICE_LABELS) + ([ENGINE_MIXED_LABEL] if mixed else [])
             self._edit_engine.blockSignals(True)
             self._edit_engine.clear()
-            self._edit_engine.addItems(["Word", "WPS", "LibreOffice"])
-            self._edit_engine.setCurrentIndex(eng_map.get(job.engine, 0))
+            self._edit_engine.addItems(items)
+            self._edit_engine.setCurrentIndex(
+                len(items) - 1 if mixed else ENGINE_INDEX_OF.get(word_jobs[0].engine, 0))
             self._edit_engine.blockSignals(False)
+            self._edit_engine.setToolTip(ENGINE_MIXED_TIP if mixed else "")
+            # 重建 addItems 会把「引擎没装 → 灰掉」的状态冲掉 ⇒ 重建后补一次（可用性结果在
+            # converter 里带缓存，重复调用很便宜）
+            self._refresh_engine_availability()
         else:
             self._edit_engine.blockSignals(True)
             self._edit_engine.clear()
             self._edit_engine.addItems([_format_engine_label(ext)])
             self._edit_engine.setCurrentIndex(0)
             self._edit_engine.blockSignals(False)
+            self._edit_engine.setToolTip("")
 
         dpi_map = {0: 0, 200: 1, 300: 2, 400: 3, 600: 4}
         self._edit_dpi.blockSignals(True)
         self._edit_dpi.setCurrentIndex(dpi_map.get(job.dpi, 0))
         self._edit_dpi.blockSignals(False)
 
-        # 按文件类型/页数控制参数可用性：
-        # 双面/双面模式 → 仅非图片且非单页可用（图片单页、无双面概念；单页文件无法双面）；
-        # 页码范围 → 仅非图片可用；
-        # PDF转换引擎 → 仅 Word(doc/docx) 可用（其余格式走各自转换路径或直接打印，引擎选择无意义）；
+        # 按文件类型/页数控制参数可用性（判定口径与 _selection_traits 一致 —— 看**整片选区**）：
+        # 双面/双面模式 → 选区里任一文件是图片或单页 → 整体禁用（单页文件双面无意义）；
+        # 页码范围 → 多选时整体禁用（范围对页数不同的文件没有共同含义）；单张图片也无页码；
+        # PDF转换引擎 → 选区里有 Word(doc/docx) 才可用（其余格式走各自转换路径或直接打印）；
         # 图片方向 → 仅图片可用
-        duplex_usable = (not is_img) and (not single_page)
         self._label_duplex.setEnabled(duplex_usable)
         self._edit_duplex.setEnabled(duplex_usable)
         self._label_duplex_mode.setEnabled(duplex_usable)
         self._edit_duplex_mode.setEnabled(duplex_usable)
-        self._label_range.setEnabled(not is_img)
-        self._edit_page_range.setEnabled(not is_img)
-        self._label_engine.setEnabled(is_word)
-        self._edit_engine.setEnabled(is_word)
+        self._label_range.setEnabled(range_usable)
+        self._edit_page_range.setEnabled(range_usable)
+        self._label_engine.setEnabled(bool(word_jobs))
+        self._edit_engine.setEnabled(bool(word_jobs))
         if not duplex_usable:
             self._edit_duplex.blockSignals(True)
-            self._edit_duplex.setCurrentIndex(1)  # 单面
+            self._edit_duplex.setCurrentIndex(1)  # 单面（仅显示；控件灰着，不会被写回）
             self._edit_duplex.blockSignals(False)
-        if is_img:
+        if any_img:
             # 图片页码无意义 → 清空范围输入
             self._edit_page_range.blockSignals(True)
             self._edit_page_range.set_ranges("")
@@ -5068,83 +5160,163 @@ class MainWindow(QMainWindow):
             self._edit_remark.blockSignals(False)
 
     def _auto_apply_edit(self):
-        """编辑面板参数变更 → 自动应用到当前选中行并保存。"""
+        """编辑面板参数变更 → 自动应用到选中的行并保存。
+
+        多选（Ctrl/Shift/拖框）时**整片选区一起应用**：面板显示的是选区第一行的值，
+        改一次作用到全部选中行 —— 否则会「看着 3 个文件被选中却只改了 1 个」（多选是
+        本版新开的入口，这里必须同一口径，不然就是个静默的半成品操作）。
+
+        但**灰着的控件一律不写回**：双面（选区含图片/单页文件）与页码范围（多选）会被
+        `_on_table_selection` 禁用，此时面板往往是被迫显示第一行的值 —— 照写下去等于
+        改了用户根本没点过的参数（见下方 duplex_editable / range_editable）。
+        """
         if self._is_current_tab_frozen():
             return
-        rows = set(idx.row() for idx in self._table.selectedIndexes())
+        rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
         if not rows:
             return
-        row = min(rows)
         jobs = self._get_current_jobs()
-        if row >= len(jobs):
-            return
 
-        job = jobs[row]
-
-        # 读取编辑控件值
-        job.copies = self._edit_copies.value()
-        # 图片/单页文件：双面无意义，固定单面（避免被禁用的双面控件残留值误写）
-        # 单页判定含范围选 1 页（多页文件手动选 1 页 → 双面物理上即单面输出）
-        is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
-        single_page = _count_pages_in_range(job.page_range or "", job.page_count or 0) == 1
-        if is_img or single_page:
-            job.duplex = "off"
-        else:
-            job.duplex = "on" if self._edit_duplex.currentIndex() == 0 else "off"
-            job.duplex_mode = "short-edge" if self._edit_duplex_mode.currentIndex() == 1 else "long-edge"
-
-        # 图片方向（仅图片可用）：方向变化后清掉已转换的缓存 PDF，打印时按新方向重渲染
-        if is_img:
-            new_ori = {0: "auto", 1: "landscape", 2: "portrait"}.get(
-                self._edit_img_orientation.currentIndex(), "auto")
-            if new_ori != getattr(job, 'image_orientation', 'auto'):
-                job.image_orientation = new_ori
-                job.cached_pdf = ""   # 旧方向 PDF 失效
-
-        # 页码范围（RangeListWidget 仅校验通过才发 rangesChanged；
-        # 此处再校验一次，非法输入时不写入，保留原值，避免被其他控件联动覆盖）
-        if self._edit_page_range.is_valid():
-            ranges_str = ",".join(
-                inp.text().strip() for inp in self._edit_page_range._inputs
-                if inp.text().strip()
-            )
-            job.page_range = ranges_str
-
-        # 引擎（仅 Word 文件有意义；其余格式引擎显示为转换方式，不写回 job.engine）
-        is_word = os.path.splitext(job.file_path)[1].lower() in (".doc", ".docx") if job.file_path else False
-        if is_word:
-            eng_map = {0: "word", 1: "wps", 2: "libreoffice"}
-            job.engine = eng_map.get(self._edit_engine.currentIndex(), "word")
-
-        # DPI
+        # 控件值只读一次（下面所有选中行共用同一组值）
+        copies = self._edit_copies.value()
+        duplex_on = self._edit_duplex.currentIndex() == 0
+        duplex_mode = "short-edge" if self._edit_duplex_mode.currentIndex() == 1 else "long-edge"
+        img_ori = {0: "auto", 1: "landscape", 2: "portrait"}.get(
+            self._edit_img_orientation.currentIndex(), "auto")
+        ranges_valid = self._edit_page_range.is_valid()
+        ranges_str = ",".join(
+            inp.text().strip() for inp in self._edit_page_range._inputs
+            if inp.text().strip()) if ranges_valid else ""
+        engine = ENGINE_BY_INDEX.get(self._edit_engine.currentIndex())   # None = 混合项/只读标签
         dpi_map = {0: 0, 1: 200, 2: 300, 3: 400, 4: 600}
-        job.dpi = dpi_map.get(self._edit_dpi.currentIndex(), 0)
+        dpi = dpi_map.get(self._edit_dpi.currentIndex(), 0)
 
-        # 更新表格行显示
-        self._recalc_row_cost(row)
+        applied = []
+        # 控件可用性按**整片选区**判定（与 _on_table_selection / _selection_traits 同一口径）：
+        # · 选区里有图片/单页文件 → 双面控件是灰的 ⇒ **绝不能**按面板值写 duplex：面板此时被迫
+        #   显示「单面」，照写会把同批的多页文件静默改成单面（改了用户没点过的参数）。
+        # · 多选 → 页码范围整体禁用 ⇒ 不写 page_range（同一个范围对页数不同的文件没有共同含义）。
+        multi, any_img, any_single = self._selection_traits(jobs, rows)
+        duplex_editable = not (any_img or any_single)
+        range_editable = not multi
+        # 引擎：只有下拉**真的停在某个具体引擎**（Word/WPS/LibreOffice）且选区里有 Word 文件时
+        # 才写回。「混合（各自保留）」项与只读标签（索引 0 的「图片渲染/直接打印」）都不写 ——
+        # 后者若照索引 0 映射成 "word"，改个「份数」就把 WPS 文档静默改成 Word 渲染（串版）。
+        engine_editable = (engine is not None
+                           and any(self._job_is_word(j)
+                                   for j in self._selection_jobs(jobs, rows)))
+        for row in rows:
+            if row >= len(jobs):
+                continue
+            job = jobs[row]
+            applied.append(row)
+
+            job.copies = copies
+            # 图片/单页文件：双面无意义，固定单面（避免被禁用的双面控件残留值误写）
+            # 单页判定含范围选 1 页（多页文件手动选 1 页 → 双面物理上即单面输出）
+            is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
+            single_page = _count_pages_in_range(job.page_range or "", job.page_count or 0) == 1
+            if is_img or single_page:
+                job.duplex = "off"
+            elif duplex_editable:
+                job.duplex = "on" if duplex_on else "off"
+                job.duplex_mode = duplex_mode
+            # else：双面控件灰着（选区含图片/单页）→ 这一行的双面设置原样保留
+
+            # 图片方向（仅图片可用）：方向变化后清掉已转换的缓存 PDF，打印时按新方向重渲染
+            if is_img:
+                if img_ori != getattr(job, 'image_orientation', 'auto'):
+                    job.image_orientation = img_ori
+                    job.cached_pdf = ""   # 旧方向 PDF 失效
+
+            # 页码范围（RangeListWidget 仅校验通过才发 rangesChanged；
+            # 此处再校验一次，非法输入时不写入，保留原值，避免被其他控件联动覆盖）
+            if ranges_valid and range_editable:
+                job.page_range = ranges_str
+
+            # 引擎（仅 Word 文件有意义；其余格式引擎显示为转换方式，不写回 job.engine）
+            is_word = os.path.splitext(job.file_path)[1].lower() in (".doc", ".docx") if job.file_path else False
+            if is_word and engine_editable:
+                job.engine = engine
+
+            # DPI
+            job.dpi = dpi
+
+        # 更新表格行显示：**整行重画**（份数/单双面/页码范围/引擎/费用）。
+        # 只调 _recalc_row_cost() 会留下「面板 2 份、表格 1 份」的错位（2026-10 现场报的 bug）；
+        # 也不能整表 _rebuild_table()：那会清掉选区，多选连点几下「+」就断在第二次。
+        for row in applied:
+            self._fill_table_row(row, jobs[row])
+        self._update_total_cost()
         # 实时保存配置
         self._set_current_jobs(jobs)
 
+    def _selected_rows(self) -> list[int]:
+        """表格当前选中的行号（升序、去重）。多选时含全部选中行。"""
+        return sorted({idx.row() for idx in self._table.selectedIndexes()})
+
+    def _select_only_row(self, row: int) -> None:
+        """把选区替换成「只选中这一行」。
+
+        为什么不用 `self._table.selectRow()`：它走视图的选择命令，**右键时用户还按着
+        Ctrl/Shift**（多选完没松手）的那一瞬，ClearAndSelect 会被当成「追加」⇒ 选区里混进
+        旧的行，菜单就对着不是用户点的选区弹出来。直连 selectionModel 永远是「替换」，
+        与按键状态无关（实测：按住修饰键时 selectRow 会把旧选区留下）。
+        """
+        model = self._table.model()
+        sm = self._table.selectionModel()
+        if model is None or sm is None:
+            return
+        sm.select(model.index(row, 0),
+                  QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+
     def _on_table_context_menu(self, pos):
-        """表格右键菜单。"""
+        """表格右键菜单（支持多选：Ctrl/Shift/拖框选中的多行一起操作）。"""
+        self._build_table_context_menu(pos).exec(self._table.viewport().mapToGlobal(pos))
+
+    def _build_table_context_menu(self, pos) -> QMenu:
+        """构造表格右键菜单（**不弹出**，由调用方决定何时 exec）。
+
+        拆出来是为了可验收：验收脚本要能直接检查菜单项文案与启用态，而 exec() 是模态阻塞的。
+        """
         menu = QMenu(self)
-        # 标签页已固定（订单锁定）：除只读操作外一律禁用（删除标签页走标签页管理器）
+        # 标签页已固定（订单锁定）：除只读/复制类操作外一律禁用（删除标签页走标签页管理器）
         frozen = self._is_current_tab_frozen()
         # 检查是否点击在有效行上
         item = self._table.itemAt(pos)
-        if item is not None:
-            row = item.row()
-            # 选中该行
-            self._table.selectRow(row)
+        clicked_row = item.row() if item is not None else -1
+        # 多选保留：右键落在**已选中**的行上时保持整片选区；落在未选中行上才只选该行
+        # （旧写法无条件 selectRow ⇒ 右键一下就把多选压成一行，批量操作永远只剩一个文件）
+        if clicked_row >= 0 and clicked_row not in self._selected_rows():
+            self._select_only_row(clicked_row)
+        rows = self._selected_rows()
+        if rows:
+            n = len(rows)
             # 移除选中（标签页已固定时禁用）
-            remove_action = menu.addAction("🗑 移除选中")
+            remove_action = menu.addAction(
+                f"🗑 移除选中（{n} 个文件）" if n > 1 else "🗑 移除选中")
             remove_action.setEnabled(not frozen)
             remove_action.triggered.connect(self._on_remove_selected)
+            # 添加到新标签页（复制，原订单不动）：冻结标签页唯一的"把这几个文件再打一单"出口。
+            # 菜单项**始终显示**，只在标签页已锁定（🔒 打印完成）时可用 —— 未锁定标签页里
+            # 文件本来就能直接改/删，不需要复制出去（灰掉让用户知道这个功能存在、条件是什么）。
+            move_action = menu.addAction(
+                f"➕ 添加到新标签页（{n} 个文件）" if n > 1 else "➕ 添加到新标签页")
+            move_action.setEnabled(frozen)
+            move_action.setToolTip(
+                "把选中的文件复制一份到新标签页重新处理\n"
+                "（原标签页与已上报订单原样保留，不受影响）"
+                if frozen else
+                "灰色：仅对**已锁定**的标签页（🔒 打印完成）可用。\n"
+                "当前标签页未锁定，文件可直接编辑/移除，无需复制到新标签页。")
+            move_action.triggered.connect(
+                lambda checked=False, rs=list(rows): self._add_rows_to_new_tab(rs))
             menu.addSeparator()
             # 打开文件位置（只读，始终可用）
-            name_item = self._table.item(row, self.COL_FILE)
+            anchor_row = clicked_row if clicked_row >= 0 else rows[0]
+            name_item = self._table.item(anchor_row, self.COL_FILE)
             if name_item:
-                fp = self._job_user_path(row, name_item.data(Qt.UserRole) or "")
+                fp = self._job_user_path(anchor_row, name_item.data(Qt.UserRole) or "")
                 open_action = menu.addAction("📂 打开文件位置")
                 open_action.triggered.connect(lambda checked=False, p=fp: (
                     os.startfile(os.path.dirname(p)) if p and os.path.isfile(p) else None
@@ -5156,7 +5328,112 @@ class MainWindow(QMainWindow):
         paste_action.setEnabled(self._can_paste_files() and not frozen)
         paste_action.triggered.connect(self._on_paste_files)
 
-        menu.exec(self._table.viewport().mapToGlobal(pos))
+        return menu
+
+    def _add_rows_to_new_tab(self, rows) -> str | None:
+        """把选中行**复制**到新标签页并切换过去（原标签页原样不动）。
+
+        为什么需要（2026-10 现场「订单打印出错」的补救路径）：标签页打印完成后即冻结
+        （🔒），文件既不能改也不能移除 —— 但现场经常要「把其中某个文件单独再打一单」。
+        冻结标签页是已完成订单的账目快照（已回报后端、参与收支清算），只能读不能改，
+        所以这里做**复制**：新标签页拿到一份彼此独立的 job。
+
+        · 参数照抄：份数 / 单双面 / 双面翻转方向 / 页码范围 / 引擎 / DPI / 图片方向 / 页数 /
+          引擎缓存 PDF（有缓存则新标签页可秒打，不必重新转换）；
+        · 订单身份清零：task_id / order_id / order_number / sent / remark 全部重置
+          → 新标签页是一张**全新的本地订单**，打印时重新取号、重新计费；
+        · 文件不复制：两个标签页共用同一份暂存副本，引用计数（_staged_reference_paths）
+          保证只要还有一个标签页引用它，副本就不会被清扫掉。
+
+        返回新标签页 key；没有可用文件（全被跳过）时返回 None。
+        """
+        jobs = self._get_current_jobs()
+        rows = sorted({r for r in rows if isinstance(r, int) and 0 <= r < len(jobs)})
+        if not rows:
+            return None
+        src_key = self._current_tab
+        new_jobs: list[PrintJob] = []
+        skipped: list[str] = []
+        for row in rows:
+            job = jobs[row]
+            # 文件兜底：暂存副本被外部删掉时按原件重建（与打印前兜底同一手段）
+            file_path = job.file_path or ""
+            if not (file_path and os.path.isfile(file_path)):
+                src = getattr(job, 'source_path', '') or ""
+                rebuilt = staging.stage_file(src) if src and os.path.isfile(src) else ""
+                if rebuilt and os.path.isfile(rebuilt):
+                    file_path = rebuilt
+                else:
+                    skipped.append(job.display_name or os.path.basename(job.file_path or "?"))
+                    continue
+            cached = getattr(job, 'cached_pdf', '') or ""
+            new_jobs.append(PrintJob(
+                file_path=file_path,
+                copies=job.copies,
+                duplex=job.duplex,
+                duplex_mode=job.duplex_mode,
+                page_range=job.page_range,
+                page_count=job.page_count,
+                orientation=job.orientation,
+                engine=job.engine,
+                cached_pdf=cached if (cached and os.path.isfile(cached)) else "",
+                dpi=getattr(job, 'dpi', 0),
+                image_orientation=getattr(job, 'image_orientation', 'auto'),
+                source_md5=getattr(job, 'source_md5', ''),
+                source_path=getattr(job, 'source_path', ''),
+                display_name=job.display_name,
+                # ── 订单身份清零：新标签页 = 新订单（绝不继承旧单的号/云端 ID/完成标记）──
+                task_id=0,
+                order_id=0,
+                order_number="",
+                remark="",
+                sent=False,
+            ))
+        if not new_jobs:
+            self._log(f"⚠ 选中的 {len(rows)} 个文件都已丢失（暂存副本与原件都不在），未创建新标签页")
+            return None
+
+        # 页数未知的 PDF（后端对云端 Word 返回 0 的常见情况）→ 复制时补一次，别让新标签页
+        # 顶着「页数 ?」进打印（计费/预览都按 0 页算）。非 PDF 交给下面的预转换线程补。
+        for job in new_jobs:
+            if job.page_count > 0 or not job.file_path:
+                continue
+            if os.path.splitext(job.file_path)[1].lower() != ".pdf":
+                continue
+            try:
+                info = get_pdf_info(job.file_path)
+                job.page_count = info.get("page_count", 0)
+                job.orientation = info.get("orientation", "") or job.orientation
+            except Exception as e:
+                logger.debug(f"复制到新标签页时读取 PDF 页数失败: {e}")
+
+        new_key = self._next_tab_key()
+        new_tab = self._make_new_tab()
+        new_tab.jobs = new_jobs
+        self._config.tabs[new_key] = new_tab
+
+        # 换标签页 = 撤回备份属于旧标签页（与 _switch_tab 同一口径）
+        self._cancel_undo_if_active()
+        self._current_tab = new_key
+        self._config.active_tab = new_key
+        self._save_config()
+        self._rebuild_table()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+
+        # 非 PDF 文件补一次预转换：命中 PDF 缓存则只是把缓存路径/页数接回来
+        # （cached_pdf 不写进配置，重启后为空；这一步保证新标签页也能走缓存打印）
+        for i, job in enumerate(new_jobs):
+            ext = os.path.splitext(job.file_path)[1].lower()
+            if ext != ".pdf" and not job.cached_pdf:
+                self._start_convert_worker(i, job.file_path, job.engine, tab_key=new_key)
+
+        msg = (f"➕ 已把 {len(new_jobs)} 个文件复制到新标签页 {new_key}"
+               f"（原标签页 {src_key} 不变，新标签页打印时重新计费）")
+        if skipped:
+            msg += f"；{len(skipped)} 个文件已丢失被跳过：{'、'.join(skipped[:3])}"
+        self._log(msg)
+        return new_key
 
 
     def _setup_edit_panel(self) -> QWidget:
@@ -5181,6 +5458,7 @@ class MainWindow(QMainWindow):
         scroll_layout.setSpacing(8)
 
         gb = QGroupBox("编辑选中任务")
+        self._edit_group = gb   # 多选时标题显示文件数（见 _on_table_selection）
         gl = QVBoxLayout(gb)
         gl.setSpacing(10)
 
@@ -6129,18 +6407,41 @@ class MainWindow(QMainWindow):
         return job.engine
 
     def _refresh_engine_availability(self):
-        """查询引擎可用性，灰度不可用的下拉选项。"""
+        """查询引擎可用性，灰度不可用的下拉选项。
+
+        下拉有两种内容，别搞混（2026-10 收拾）：
+        ① 引擎选择（「Word / WPS / LibreOffice」+ 可能的「混合（各自保留）」）—— 按可用性灰度前 3 项；
+        ② **单项只读标签**（「直接打印 / 图片渲染 / reportlab / …」，选中的文件都不是 Word）——
+           它不是引擎选项，**不能**拿 Word 的可用性去灰它（旧写法按索引 0 灰 ⇒ Word 没装时
+           连「直接打印」这种只读标签都被灰掉）。
+        该方法在启动与每次重建下拉后调用（重建会把灰度状态冲掉，所以在 _on_table_selection 里补调）。
+        """
         from converter import get_available_engines
-        available = get_available_engines()
-        eng_to_idx = {"word": 0, "wps": 1, "libreoffice": 2}
         model = self._edit_engine.model()
-        for eng, idx in eng_to_idx.items():
-            if model and idx < model.rowCount():
-                item = model.item(idx)
-                if item:
-                    item.setEnabled(available.get(eng, False))
-                    if not available.get(eng, False):
-                        item.setToolTip(f"{eng.upper()} 未安装，不可用")
+        if model is None:
+            return
+        n = model.rowCount()
+        if n <= 1:
+            item = model.item(0)
+            if item is not None:
+                item.setEnabled(True)
+                item.setToolTip("")
+            return
+        available = get_available_engines()
+        for idx, eng in ENGINE_BY_INDEX.items():     # 注意方向：字典是「索引 → 引擎名」
+            if idx >= n:
+                continue
+            item = model.item(idx)
+            if item is None:
+                continue
+            ok = available.get(eng, False)
+            item.setEnabled(ok)
+            item.setToolTip("" if ok else f"{eng.upper()} 未安装，不可用")
+        # 「混合（各自保留）」不是引擎，永远可选（它本来就只想显示真相）
+        mixed_item = model.item(len(ENGINE_CHOICE_LABELS))
+        if mixed_item is not None:
+            mixed_item.setEnabled(True)
+            mixed_item.setToolTip(ENGINE_MIXED_TIP)
 
     def _check_word_engine_available(self) -> bool:
         """检查是否至少有一个 Word 引擎可用（用于阻止无引擎打印）。"""
@@ -6514,8 +6815,10 @@ class MainWindow(QMainWindow):
         allowed = {".pdf", ".doc", ".docx", ".txt", ".md",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         # 1. 来自文件管理器的 URL 列表
+        # mimeData() 可能是 None（剪贴板无属主/远程会话/offscreen 平台）——不能直接解引用，
+        # 否则右键菜单一弹就崩（本方法在 _build_table_context_menu 里无条件被调用）
         mime = QApplication.clipboard().mimeData()
-        if mime.hasUrls():
+        if mime is not None and mime.hasUrls():
             for url in mime.urls():
                 if url.isLocalFile():
                     path = url.toLocalFile()
@@ -6538,9 +6841,9 @@ class MainWindow(QMainWindow):
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         files: list[str] = []
 
-        # 1. 优先处理文件管理器复制的 URL 列表
+        # 1. 优先处理文件管理器复制的 URL 列表（mimeData 可能为 None，同 _can_paste_files）
         mime = QApplication.clipboard().mimeData()
-        if mime.hasUrls():
+        if mime is not None and mime.hasUrls():
             for url in mime.urls():
                 if url.isLocalFile():
                     path = url.toLocalFile()

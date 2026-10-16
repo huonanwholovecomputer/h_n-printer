@@ -123,7 +123,12 @@ QTableWidget {
     gridline-color: #ccd0da;
     border: 1px solid #ccd0da;
     border-radius: 6px;
-    selection-background-color: #ccd0da;
+    /* 选中行 = **淡蓝底 + 深色字**（与深色主题同为「蓝」，但浅色用淡底，不刺眼）。
+       演变：灰 #ccd0da 几乎看不出选中 → 换成饱和蓝 #1e66f5 + 白字又太艳、字发飘
+       → 定为现在的淡蓝 #cfe3ff（Windows 浅色选择色同量级）。文字用主题自身的
+       #4c4f69（对比度 6.09:1）⇒ 选中只加一层蓝底，字色与未选中一致、不跳。
+       判据见 tests/verify_table_selection_style.py（含真渲染取像素 + 「淡」与「深字」判定）。 */
+    selection-background-color: #cfe3ff;
     selection-color: #4c4f69;
 }
 QTableWidget::item {
