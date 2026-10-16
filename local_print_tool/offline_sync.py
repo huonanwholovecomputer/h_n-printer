@@ -36,6 +36,9 @@ class OfflineSync:
         self._sync_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._sync_cycles = 0  # 同步调用计数，每 100 次清理一次旧记录
+        # D5：后台同步的**当前**目标（server_url, token）。单次元组赋值在 CPython 下是
+        # 原子的 ⇒ 循环线程读到的要么是整对旧值、要么是整对新值，不会撕裂成「新地址+旧 token」。
+        self._sync_target: tuple[str, str] = ("", "")
         self._init_db()
 
     # ── 数据库初始化 ──
@@ -230,16 +233,26 @@ class OfflineSync:
     # ── 后台定时同步 ──
 
     def start_background_sync(self, server_url: str, token: str, interval: int = 60):
-        """启动后台定时同步线程（守护线程，主程序退出时自动终止）。"""
+        """启动后台定时同步线程（守护线程，主程序退出时自动终止）。
+
+        D5 修复：**无论线程是否已在运行，都先记下新目标**。旧写法把 server_url/token 焊进
+        闭包、且「已在运行」直接 return ⇒ 用户在「云端连接设置」里改了地址/token 之后，本次
+        运行内后台定时同步仍往**旧地址**上报（旧云端会收到不属于它的本地订单）。
+        `_sync_target` 用单次元组赋值更新（CPython 原子），循环里每轮重新读取。
+        """
+        self._sync_target = (server_url or "", token or "")
         self._stop_event.clear()
         if self._sync_thread and self._sync_thread.is_alive():
-            logger.warning("[SYNC] 后台同步已在运行，忽略重复 start_background_sync 调用")
-            return  # 已在运行
+            logger.info(f"[SYNC] 后台同步已在运行 → 仅更新目标（{server_url}）")
+            return  # 线程继续跑，但下一轮就用新目标
 
         def _loop():
             while not self._stop_event.wait(interval):
+                url, tok = self._sync_target   # 每轮取当前目标，不在闭包里持有旧值
+                if not url or not tok:
+                    continue   # 目标被清空（云端关闭）→ 不发请求，也不白耗 retry_count
                 try:
-                    self.sync_all_pending_orders(server_url, token)
+                    self.sync_all_pending_orders(url, tok)
                 except Exception as e:
                     logger.error(f"[SYNC] 后台同步异常: {e}")
 

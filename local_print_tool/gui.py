@@ -3154,6 +3154,20 @@ class MainWindow(QMainWindow):
                     self._cloud_client.stop()
                 self._update_cloud_status()
 
+            # D5 修复：后台离线同步线程的目标也要跟着换 —— 旧写法把 server_url/token 焊进
+            # 闭包、且「已在运行」直接 return ⇒ 用户在这里改完地址/token 后，本次运行内后台
+            # 定时同步仍往**旧地址**上报。云端关闭时停掉线程，否则残留的旧 token 会把本地订单
+            # 静默上传到旧云端（与 _init_cloud_client 里「本地模式不启动后台同步」同源）。
+            if self._offline_sync:
+                if self._config.cloud_enabled and self._config.cloud_token:
+                    self._offline_sync.start_background_sync(
+                        server_url=self._config.cloud_api_url,
+                        token=self._config.cloud_token,
+                        interval=60,
+                    )
+                else:
+                    self._offline_sync.stop_background_sync()
+
             # 接单开关同步后端（多设备可同时启用，2026-12）：勾选 → 加入可接单设备列表
             new_take = bool(take_orders_switch.isChecked()) and bool(cloud_switch.isChecked())
             if self._config.cloud_enabled and self._config.cloud_token and self._cloud_client:
