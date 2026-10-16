@@ -1794,7 +1794,7 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
 .device-state { font-size: 2.64cqw; flex-shrink: 0; }
 .device-state-on { color: var(--green); }
 .device-state-off { color: var(--gray); }
-/* 该设备已确认不支持自动双面（双面需人工翻纸；无人在场时不能打双面） */
+/* 该设备已确认不支持自动双面（双面需人工翻纸）—— 列表提示，不拦截下单 */
 .device-state-manual { color: #e67e22; margin-right: 1.4cqw; }
 /* 攒批模式状态（stack_mode）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=未上报 → 不渲染 */
 .device-state-stack { color: #e67e22; font-weight: 600; margin-right: 1.4cqw; }

@@ -721,11 +721,6 @@ function setDuplex(idx, val) {
   const f = printState.selectedFiles[idx];
   if (!f || f.excelWarning || f.unsupportedFormat) return;
   if (f.pageCount === 1 || f.singlePage) return;
-  // 无障碍打印下不能选双面（目标设备不支持自动双面）：无人值守只会打出半成品等人翻纸
-  if (val === 'on' && printState.autoPrintEnabled && targetNeedsManualFlip()) {
-    showToast('该设备不支持自动双面：无人值守只能单面；需双面请先关闭「无障碍打印」', 3200);
-    return;
-  }
   if (f.duplex === val) return;
   f.duplex = val;
   // 原地更新滑块与选项（整表重绘会重建元素，0.3s 滑动过渡无法播放——对齐小程序 setData 保留元素）
@@ -1287,11 +1282,6 @@ function selectDeliveryLocation(loc) {
 /* ================= 无障碍打印 / 预约 ================= */
 
 function toggleAutoPrint() {
-  // 开启前先拦：目标设备不支持自动双面 + 本单有双面文件 → 无人值守只会卡在半成品
-  if (!printState.autoPrintEnabled && targetNeedsManualFlip() && hasDuplexFile()) {
-    showToast('当前有双面文件，而该设备需人工翻纸：请改为单面，或保持手动开始打印', 3200);
-    return;
-  }
   printState.autoPrintEnabled = !printState.autoPrintEnabled;
   updateScheduleUI();
   const burst = document.getElementById('lightningBurst');
@@ -1786,12 +1776,6 @@ function onSubmit() {
   if (!files.length) { showToast('请先选择打印文件'); return; }
   if (files.some(f => f.uploading)) { showToast('文件上传中，请稍候'); return; }
 
-  // 提交兜底：无障碍打印 + 双面文件 + 不支持自动双面的设备 → 无人值守必然卡住。
-  // 界面上三个入口都已拦（开关/双面/换设备），这里是最后一道（后端同样会 409 拦下）。
-  if (printState.autoPrintEnabled && targetNeedsManualFlip() && hasDuplexFile()) {
-    showToast('目标设备不支持自动双面：请关闭「无障碍打印」，或把双面文件改为单面', 3200);
-    return;
-  }
   const printable = files.filter(f => !f.excelWarning && !f.unsupportedFormat);
   const unsupportedCount = files.length - printable.length;
   if (printable.length === 0) {
@@ -1970,35 +1954,6 @@ function targetDeviceOfflineState() {
   }
   if (devices.length) return !devices.some(d => d && d.online);
   return null;
-}
-
-/* ── 双面 × 无人值守 互斥（2026-10）──────────────────────────────────────────
-   目标设备已确认不支持自动双面（auto_duplex === false）时，双面必须人工翻纸；无障碍/预约是
-   无人值守，本地工具打完第 1 趟就停下等人（挂起并标 ⏸）→ 订单等于卡死。所以三个入口都拦：
-   选双面、开无障碍、换设备。未确认(null)一律"不拦"（老客户端接入时设备常常还没被标注）。 */
-
-/** 当前选中的目标设备是否需人工翻纸（double-sided 需有人在场）。 */
-function targetNeedsManualFlip() {
-  const devices = (typeof claimingDevices !== 'undefined' && claimingDevices) ? claimingDevices : [];
-  const id = (typeof selectedDeviceId !== 'undefined') ? selectedDeviceId : '';
-  const hit = devices.filter(d => d && d.client_id === id)[0];
-  return !!(hit && hit.auto_duplex === false);
-}
-
-/** 本单是否存在"真的会双面打印"的文件（口径与提交时一致：图片/整份1页/有效选1页固定单面）。 */
-function hasDuplexFile() {
-  return (printState.selectedFiles || []).some(f => f
-    && !f.isImage && !f.excelWarning && !f.unsupportedFormat
-    && f.pageCount !== 1 && !f.singlePage && (f.duplex || 'on') === 'on');
-}
-
-/** 目标设备变化（app.js 设备点击回调）→ 冲突时关掉无障碍并说明原因。
-    为什么不改文件的双面：双面是客户已付费的意图，改的是「无人值守」这个执行方式。 */
-function onTargetDeviceChanged() {
-  if (printState.autoPrintEnabled && targetNeedsManualFlip() && hasDuplexFile()) {
-    toggleAutoPrint();   // 当前是开启状态 → 走完整的关闭流程
-    showToast('该设备不支持自动双面，已关闭「无障碍打印」：双面需人工开始并翻纸', 3200);
-  }
 }
 
 /**

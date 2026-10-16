@@ -58,6 +58,12 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 # 原先 verify_apk_release.py 那条过渡项**已删除**（留着会长期掩盖真回归）。
 # 2026-10-16（D5 批次）：又改了 www/updater.js（更新锁三路解锁）+ app.js/print.js（请求超时）
 # ⇒ 再次登记过渡项；**同日已重打 1.1.33（versionCode 34）并发布**，该项随即删除（守卫已转绿）。
+# 2026-10（无障碍 × 双面拦截放开）：改了 www/print.js + www/app.js + www/styles.css（去掉移动端
+# 「双面 × 无人值守」拦截）⇒ APK 内 web 资源与 www/ 暂时不一致。**2026-10-16 已重打 1.1.34
+# （versionCode 35）并通过 verify_apk_release.py + verify_apk_published.py ⇒ 该项已删除**。
+# 2026-10（攒批模式远程开关）：又改了 www/app.js + www/styles.css（设备列表的攒批状态徽标与
+# 远程开关）⇒ 登记过渡项；**2026-10-16 已重打 1.1.35（versionCode 36），verify_apk_release
+# 与 verify_apk_published 均转绿 ⇒ 该项已删除**。
 EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}

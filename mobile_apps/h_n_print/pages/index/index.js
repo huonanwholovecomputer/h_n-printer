@@ -1951,35 +1951,9 @@ Component({
     onSelectDevice(e) {
       const id = e.currentTarget.dataset.id
       if (!id) return
-      // 切到"不支持自动双面"的设备时：若已开着无障碍且存在双面文件 → 关掉无障碍并说明原因。
-      // 为什么不改文件的双面：双面是客户已付费的意图，改的是「无人值守」这个执行方式。
-      if (this.data.autoPrintEnabled && this._targetNeedsManualFlip(id) && this._hasDuplexFile()) {
-        this.setData({ selectedDeviceId: id }, () => {
-          this.onAutoPrintToggle()   // 当前是开启状态 → 走完整的关闭动画与状态清理
-        })
-        wx.showToast({
-          title: '该设备不支持自动双面，已关闭「无障碍打印」：双面需人工开始并翻纸',
-          icon: 'none', duration: 3200,
-        })
-        return
-      }
+      // 换设备不再动无障碍开关：设备端自知其翻纸能力，「双面 × 无人值守」拦截已按要求全面放开
+      // （原三处入口 + 提交兜底 + 后端 409 均已移除，依据见 CLAUDE.md「无障碍打印与预约打印」）。
       this.setData({ selectedDeviceId: id })
-    },
-
-    // 目标设备是否「已确认不支持自动双面」（auto_duplex === false → 双面必须人工翻纸）。
-    // 移动端据此做「双面 × 无人值守」互斥：那张表无人值守只会打完第 1 趟就停下等人。
-    // 未确认(null)一律按"不拦"处理（老客户端接入时设备常常还没被标注）。
-    _targetNeedsManualFlip(id) {
-      const cid = (id === undefined || id === null || id === '') ? this.data.selectedDeviceId : id
-      const dev = (this.data.claimingDevices || []).find(d => d && d.client_id === cid)
-      return !!(dev && dev.auto_duplex === false)
-    },
-
-    // 本单是否存在"真的会双面打印"的文件（口径与提交时一致：图片/整份1页/有效选1页固定单面）
-    _hasDuplexFile() {
-      return (this.data.selectedFiles || []).some(f => f
-        && !f.isImage && !f.excelWarning && !f.unsupportedFormat
-        && f.pageCount !== 1 && !f.singlePage && (f.duplex || 'on') === 'on')
     },
 
     // 攒批模式（多任务合并翻纸）远程开关：仅管理员/超管可点（界面同样只对二者渲染）。
@@ -2068,14 +2042,6 @@ Component({
       const f = this.data.selectedFiles[index]
       if (!f || f.excelWarning || f.unsupportedFormat) return
       if (f.pageCount === 1 || f.singlePage) return  // 整份1页/有效选择1页无法双面，固定单面
-      // 无障碍打印下不能选双面（目标设备不支持自动双面）：无人值守只会打出半成品等人翻纸
-      if (value === 'on' && this.data.autoPrintEnabled && this._targetNeedsManualFlip()) {
-        wx.showToast({
-          title: '该设备不支持自动双面：无人值守只能单面；需双面请先关闭「无障碍打印」',
-          icon: 'none', duration: 3200,
-        })
-        return
-      }
       this.setData({ ['selectedFiles[' + index + '].duplex']: value })
     },
 
@@ -2318,14 +2284,6 @@ Component({
 
     onAutoPrintToggle() {
       const turningOn = !this.data.autoPrintEnabled
-      // 开启前先拦：目标设备不支持自动双面 + 本单有双面文件 → 无人值守只会卡在半成品
-      if (turningOn && this._targetNeedsManualFlip() && this._hasDuplexFile()) {
-        wx.showToast({
-          title: '当前有双面文件，而该设备需人工翻纸：请改为单面，或保持手动开始打印',
-          icon: 'none', duration: 3200,
-        })
-        return
-      }
       this.setData({ autoPrintEnabled: turningOn })
       if (turningOn) {
         // 展开动画：先以 collapsed 初始态渲染，渲染完成后再切 expanded 触发 CSS 过渡
@@ -2895,16 +2853,6 @@ Component({
       // 检查是否有文件正在上传
       if (selectedFiles.some(f => f.uploading)) {
         wx.showToast({ title: '文件上传中，请稍候', icon: 'none', duration: 2000 })
-        return
-      }
-
-      // 提交兜底：无障碍打印 + 双面文件 + 不支持自动双面的设备 → 无人值守必然卡住。
-      // 界面上三个入口都已拦（开关/双面/切设备），这里是最后一道（后端同样会 409 拦下）。
-      if (this.data.autoPrintEnabled && this._targetNeedsManualFlip() && this._hasDuplexFile()) {
-        wx.showToast({
-          title: '目标设备不支持自动双面：请关闭「无障碍打印」，或把双面文件改为单面',
-          icon: 'none', duration: 3200,
-        })
         return
       }
 

@@ -15,10 +15,9 @@ HP LaserJet 1020（没有双面器，只有驱动的「手动双面」）。程�
   · **老版本地工具不带能力参数 → 注册表保持原状**，不会被一次旧连接抹掉（零回归）；
   · 能力随三条链路下发：/api/claiming_devices（移动端选设备）、/api/printer/devices
     （收支清算授权页）、printer_state（本机）；
-  · 下游执行（2026-10 补全）：服务端 `check_auto_print_duplex_conflict` 在建单前拦下
-    「无障碍/预约 + 双面 + 不支持自动双面的设备」；移动端两侧做「双面 × 无人值守」互斥
-    （选双面 / 开无障碍 / 切换设备三个入口 + 提交兜底 + 设备列表标记）。
-    阶段①口径：只有**已确认不支持**（auto_duplex === false）才拦，未确认(null)一律放行。
+  · 下游（2026-10）：能力只用于**记录 + 下发** —— 移动端设备列表标「🖐 需人工翻纸」、本地工具
+    调整双面 UI/提示。曾经它还被用来**拦单**（服务端 `check_auto_print_duplex_conflict` + 移动端
+    三处入口 + 提交兜底）；该拦截已于 2026-10 晚些时候**按要求全面放开**，提交一律放行。
 
 用法: python tests/verify_duplex_capability.py   （exit 0 = 全部通过）
 """
@@ -274,35 +273,28 @@ check("printer_state 带本机能力（本地工具据此调整双面 UI/提示�
 check("printer_state 旧字段未被破坏（claiming_devices/is_active/owner_name）",
       set(state.get("claiming_devices", {}).keys()) == set(CLAIMING) and state.get("is_active") is True)
 
-# ==================== ⑥ 下游执行：无障碍打印 × 双面 的冲突拦截（2026-10）====================
-# 「记录能力」只是前半段；后半段是**真的拦**——目标设备已确认不支持自动双面时，双面必须人工
-# 翻纸，无障碍/预约（无人值守）只会打完第 1 趟就停下等人 → 订单卡死。
-print("\n=== ⑥ 无障碍打印 × 双面 冲突拦截 ===")
-_conflict = backend.check_auto_print_duplex_conflict
-check("★ 老机型(人工盖章不支持) + 无障碍 + 双面 → 拦下并给出可执行提示",
-      _conflict(1, CID_OLD, True) != "" and "人工翻纸" in _conflict(1, CID_OLD, True),
-      f"{_conflict(1, CID_OLD, True)}")
-check("★ 老机型 + 无障碍 + **全是单面** → 放行（那台机器可以无人值守打单面）",
-      _conflict(1, CID_OLD, False) == "")
-check("支持自动双面的设备 → 放行", _conflict(1, CID_NEW, True) == "")
-check("★ 能力**未确认**的设备 → 放行（阶段①：未确认按现状，别让没标注的机器不能下单）",
-      _conflict(1, CID_UNKNOWN, True) == "")
-check("没开无障碍 → 放行（手动开始打印本来就要人在场）", _conflict(0, CID_OLD, True) == "")
-check("没指定目标设备 → 放行", _conflict(1, "", True) == "")
-check("★ 设备不存在（设备表里没有）→ 放行，不误伤", _conflict(1, "NO-SUCH-DEVICE", True) == "")
+# ==================== ⑥ 无障碍 × 双面 拦截已全面放开（2026-10 晚些时候）====================
+# 曾经：目标设备已确认不支持自动双面时，「无障碍/预约 + 双面」在下单前被拦 —— 移动端三处入口
+# （选双面 / 开无障碍 / 换设备）+ 提交兜底 + 服务端 409。按要求**全部放开**：设备端自行负责
+# 无人值守翻纸，服务端与移动端都不再拦单（本地工具遇双面仍会挂起等人翻纸，那是设备侧行为）。
+# 本节钉住"确实已经不拦了"，防止哪天被误加回来；能力字段本身照常收集/下发（见 ①-⑤⑦）。
+print("\n=== ⑥ 无障碍 × 双面 拦截已放开（不再拦单）===")
 
 app_src = open(os.path.join(dst, "app.py"), encoding="utf-8").read()
-check("★ submit_order 在建单之前调用冲突校验（避免先写库再报错）",
-      "conflict = check_auto_print_duplex_conflict(auto_print, target_client_id, has_duplex_file)"
-      in app_src
-      and app_src.index("check_auto_print_duplex_conflict(auto_print") < app_src.index(
-          "# ---- 事务：插 1 条 orders + N 条 order_files ----"))
-check("★ 冲突返回 409 + code（前端按 message 提示，code 供程序判断）",
-      '"code": "auto_print_duplex_conflict"' in app_src and '}), 409' in app_src)
-check("双面目判定口径与打印一致（duplex=on 才算双面）",
-      'str(f.get("duplex", duplex) or "on").strip().lower() == "on"' in app_src)
+check("★ 服务端冲突校验函数已整体移除",
+      not hasattr(backend, "check_auto_print_duplex_conflict")
+      and not hasattr(backend, "_device_needs_manual_flip"))
+check("★ app.py 无任何残留（函数 / submit_order 调用 / 409 code）",
+      "auto_print_duplex_conflict" not in app_src
+      and "check_auto_print_duplex_conflict" not in app_src
+      and "_device_needs_manual_flip" not in app_src)
+_devs = {d["client_id"]: d for d in
+         ((client.get("/api/claiming_devices").get_json() or {}).get("devices") or [])}
+check("★ 放开拦截不影响能力下发：/api/claiming_devices 照常带 auto_duplex",
+      _devs.get(CID_OLD, {}).get("auto_duplex") is False
+      and _devs.get(CID_NEW, {}).get("auto_duplex") is True, f"{_devs.get(CID_OLD, {}).get('auto_duplex')}")
 
-# 移动端两侧的「双面 × 无人值守」互斥（三个入口 + 提交兜底 + 设备标记）
+# 移动端两侧的拦截（三处入口 + 提交兜底 + 辅助方法）应已全部移除；设备列表标记保留（仅提示）
 mp = open(os.path.join(REPO, "mobile_apps", "h_n_print", "pages", "index", "index.js"),
           encoding="utf-8").read()
 wxml = open(os.path.join(REPO, "mobile_apps", "h_n_print", "pages", "index", "index.wxml"),
@@ -316,29 +308,25 @@ apk_app = open(os.path.join(REPO, "mobile_apps", "android_app", "www", "app.js")
 apk_css = open(os.path.join(REPO, "mobile_apps", "android_app", "www", "styles.css"),
                encoding="utf-8").read()
 
-check("★ 小程序：选双面时拦（无障碍开着 + 该设备不支持自动双面）",
-      "value === 'on' && this.data.autoPrintEnabled && this._targetNeedsManualFlip()" in mp)
-check("★ 小程序：开无障碍时拦（有双面文件 + 该设备不支持自动双面）",
-      "turningOn && this._targetNeedsManualFlip() && this._hasDuplexFile()" in mp)
-check("★ 小程序：切换设备时自动关无障碍并说明（不静默改单面）",
-      "this.data.autoPrintEnabled && this._targetNeedsManualFlip(id) && this._hasDuplexFile()" in mp
-      and "已关闭「无障碍打印」" in mp)
-check("★ 小程序：提交兜底（与后端 409 同一口径）",
-      "this.data.autoPrintEnabled && this._targetNeedsManualFlip() && this._hasDuplexFile()" in mp
-      and "目标设备不支持自动双面：请关闭「无障碍打印」" in mp)
-check("★ 小程序：设备列表标出「🖐 需人工翻纸」(+ 样式)",
+check("★ 小程序：四处拦截 + 两个辅助方法已全部移除",
+      "_targetNeedsManualFlip" not in mp and "_hasDuplexFile" not in mp
+      and "该设备不支持自动双面" not in mp
+      and "目标设备不支持自动双面" not in mp)
+check("★ 小程序：无障碍开关直接生效（onAutoPrintToggle 无前置拦截）",
+      "const turningOn = !this.data.autoPrintEnabled\n      this.setData({ autoPrintEnabled: turningOn })" in mp)
+check("★ 小程序：换设备不再自动关无障碍",
+      "已关闭「无障碍打印」" not in mp)
+check("★ 小程序：设备列表仍标「🖐 需人工翻纸」（仅提示，不拦单）",
       'item.auto_duplex === false' in wxml and "需人工翻纸" in wxml
-      and ".device-state-manual" in wxss)
+      and ".device-state-manual" in wxss and "无人值守不可用" not in wxml)
 
-check("★ APK：选双面时拦", "val === 'on' && printState.autoPrintEnabled && targetNeedsManualFlip()" in apk)
-check("★ APK：开无障碍时拦",
-      "!printState.autoPrintEnabled && targetNeedsManualFlip() && hasDuplexFile()" in apk)
-check("★ APK：切换设备时自动关无障碍并说明",
-      "function onTargetDeviceChanged()" in apk and "已关闭「无障碍打印」" in apk
-      and "if (typeof onTargetDeviceChanged === 'function') onTargetDeviceChanged();" in apk_app)
-check("★ APK：提交兜底", "printState.autoPrintEnabled && targetNeedsManualFlip() && hasDuplexFile()" in apk
-      and "目标设备不支持自动双面：请关闭「无障碍打印」" in apk)
-check("★ APK：设备列表标出「🖐 需人工翻纸」(+ 样式)",
+check("★ APK：四处拦截 + 三个辅助函数 + app.js 接线已全部移除",
+      "targetNeedsManualFlip" not in apk and "hasDuplexFile" not in apk
+      and "onTargetDeviceChanged" not in apk and "onTargetDeviceChanged" not in apk_app
+      and "该设备不支持自动双面" not in apk and "目标设备不支持自动双面" not in apk)
+check("★ APK：无障碍开关直接生效（toggleAutoPrint 无前置拦截）",
+      "printState.autoPrintEnabled = !printState.autoPrintEnabled;" in apk)
+check("★ APK：设备列表仍标「🖐 需人工翻纸」（仅提示，不拦单）",
       "d.auto_duplex === false" in apk_app and "需人工翻纸" in apk_app
       and ".device-state-manual" in apk_css)
 

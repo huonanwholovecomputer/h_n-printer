@@ -1443,8 +1443,6 @@ document.addEventListener('click', function (e) {
   if (item && item.dataset && item.dataset.id) {
     selectedDeviceId = item.dataset.id;
     renderDeviceList();
-    // 目标设备变化 → 让打印页重新评估「双面 × 无人值守」互斥（print.js 里实现）
-    if (typeof onTargetDeviceChanged === 'function') onTargetDeviceChanged();
   }
 });
 

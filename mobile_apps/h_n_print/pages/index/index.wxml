@@ -52,7 +52,7 @@
             >
               <view class="device-dot {{item.online ? 'device-dot-on' : 'device-dot-off'}}"></view>
               <text class="device-label">{{item.label}}</text>
-              <!-- 该设备已确认不支持自动双面：双面需人工翻纸，无人值守不可用（2026-10） -->
+              <!-- 该设备已确认不支持自动双面（双面需人工翻纸）—— 仅作提示，不拦截无障碍/双面下单 -->
               <text wx:if="{{item.auto_duplex === false}}" class="device-state device-state-manual">🖐 需人工翻纸</text>
               <!-- 攒批模式状态（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
                    null（该设备从未上报，状态未知）→ 不渲染该徽标 -->

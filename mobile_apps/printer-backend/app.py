@@ -1021,33 +1021,6 @@ def _device_capability_fields(client_id: str) -> dict:
     }
 
 
-def _device_needs_manual_flip(client_id: str) -> bool:
-    """该设备是否**已确认不支持自动双面**（双面必须人工翻纸）。
-
-    只认解析结果 `auto_duplex is False`（人工盖章或本地工具探测得到的高置信结论）；
-    `None`（未确认，老客户端/没标注）与 `True` 一律返回 False —— 阶段①的取舍：**未确认按现状放行**，
-    否则所有还没被标注的设备都会突然不能下单。"""
-    return get_device_capability(client_id).get("auto_duplex") is False
-
-
-def check_auto_print_duplex_conflict(auto_print, target_client_id: str,
-                                     has_duplex: bool) -> str:
-    """「无障碍打印 + 双面文件 + 目标设备不支持自动双面」的冲突校验。
-
-    返回 "" = 放行；非空 = 给用户看的原因（调用方原样回给前端）。
-
-    为什么必须拦：目标设备不支持自动双面时，双面要**人工翻纸**；无障碍/预约是无人值守，
-    本地工具打完第 1 趟就会停下等人（挂起并给标签页标 ⏸），订单等于卡死在那里 ——
-    让用户在下单时就得到提示，比事后在现场发现好得多。
-    单面文件 + 无障碍是允许的（那台机器完全可以无人值守打单面）✔。"""
-    if not auto_print or not has_duplex or not target_client_id:
-        return ""
-    if not _device_needs_manual_flip(target_client_id):
-        return ""
-    return ("目标设备不支持自动双面：双面文件需要人工翻纸，无法无人值守打印。"
-            "请关闭「无障碍打印」改为手动开始打印，或把文件改为单面。")
-
-
 def _printer_probe_from_request() -> dict | None:
     """从连接/心跳请求的 query 里取本地工具上报的打印机能力。
 
@@ -5193,17 +5166,6 @@ def submit_order():
         target_client_id = ""
     printer_online = is_printer_available()  # 有启用接单的设备（含离线：离线设备被指定时任务排队等其上线）
 
-    # ---- 无障碍打印 × 自动双面 冲突校验（2026-10）----
-    # 目标设备已确认不支持自动双面时，双面要人工翻纸，无人值守必然卡住（本地工具会挂起等翻纸）。
-    # 在**建单之前**拦下，前端直接展示 message；未确认/支持自动双面的设备一律放行（零回归）。
-    has_duplex_file = any(
-        str(f.get("duplex", duplex) or "on").strip().lower() == "on" for f in files_input)
-    conflict = check_auto_print_duplex_conflict(auto_print, target_client_id, has_duplex_file)
-    if conflict:
-        return jsonify({"success": False,
-                        "code": "auto_print_duplex_conflict",
-                        "message": conflict}), 409
-
     # ---- 事务：插 1 条 orders + N 条 order_files ----
     conn = get_db()
     user_conn = get_user_db()
@@ -5763,13 +5725,12 @@ def printer_capability():
       才会变；auto_duplex=null 表示清除人工结论、回到自动探测结果。
     · source=probe —— 本地打印工具探测上报，只写探测字段，不覆盖人工结论。
 
-    下游执行（2026-10 起已落地，不只是"记录"）：
-      · **服务端兜底**：`submit_order` 里 `check_auto_print_duplex_conflict` —— 目标设备
-        `auto_duplex is False` 且本单有双面文件时，无障碍/预约提交直接 409 拦下并给出可执行提示；
-      · **移动端**（小程序/APP）：双面 × 无人值守互斥 —— 选双面、开无障碍、切换设备三个入口都拦，
-        切换设备时自动关掉无障碍（不静默改单面），设备列表标「🖐 需人工翻纸」；
-      · 阶段①口径：只有**已确认**（auto_duplex is False）才生效，未确认(null)一律放行，
-        避免还没标注的设备突然不能下单。
+    下游消费（2026-10 起）：
+      · 能力随 `/api/claiming_devices`、`/api/printer/devices`、`printer_state` 下发给移动端与本地
+        工具，设备列表据此标「🖐 需人工翻纸」（仅提示）、本地工具据此调整双面 UI 与提示；
+      · **不再用它拦截下单**（2026-10 晚些时候按要求放开）：原「无障碍/预约 × 双面 × 该设备」的
+        移动端三处入口 + 提交兜底 + 服务端 409 已全部移除，提交一律放行；订单是否真能无人值守
+        完成由设备端自己负责（本地工具仍会在无人值守遇双面时挂起等人翻纸）。
     """
     token = _get_printer_token()
     if not PRINTER_TOKEN or token != PRINTER_TOKEN:
