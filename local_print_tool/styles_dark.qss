@@ -525,17 +525,18 @@ QToolTip {
 }
 
 /* ---------- 标签页选择器 ---------- */
+/* 加减按钮 = 圆角正方形 32×32（QSS 的 min/max 与 gui.py 的 setFixedSize 必须同步） */
 QPushButton#tabBtnMinus, QPushButton#tabBtnPlus {
     background-color: #181818;
     color: #cccccc;
     border: none;
-    border-radius: 4px;
-    font-size: 13px;
+    border-radius: 8px;
+    font-size: 16px;
     font-weight: bold;
-    min-width: 24px;
-    max-width: 24px;
-    min-height: 28px;
-    max-height: 28px;
+    min-width: 32px;
+    max-width: 32px;
+    min-height: 32px;
+    max-height: 32px;
     padding: 0px;
 }
 QPushButton#tabBtnMinus:hover, QPushButton#tabBtnPlus:hover {
@@ -551,10 +552,22 @@ QLabel#tabLabel {
     font-size: 14px;
     font-weight: bold;
 }
+/* 状态徽标（🔒/⏸）：固定宽度槽位，无状态时留空 —— 不承载布局尺寸含义 */
+QLabel#tabStateBadge {
+    background: transparent;
+    border: none;
+    font-size: 13px;
+}
 QLabel#tabScopeLabel {
     color: #4fc1ff;
     font-weight: bold;
     font-size: 12px;
+}
+/* 附加服务行图标位（📑/🔒/⏸）：固定宽度槽位，无状态时显示 📑 —— 不承载布局尺寸含义 */
+QLabel#tabScopeBadge {
+    background: transparent;
+    border: none;
+    font-size: 13px;
 }
 
 /* ---------- 撤回按钮 ---------- */

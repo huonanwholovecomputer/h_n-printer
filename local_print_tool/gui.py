@@ -108,6 +108,27 @@ SCHEDULED_SELF_HEAL_S = 30
 # 由客户端按"已到 / 总数"判定整单到齐（见 docs/修复计划_2026-10.md 批次 E）。
 AUTO_PRINT_DEBOUNCE_MS = 8000
 
+# ---- 标签页选择器几何口径（2026-10）----
+# 需求：**无论有没有状态图标，−/＋ 按钮的位置都不许动**。
+# 旧实现的 🔒/⏸ 是数字标签里的**文字前缀**，且随状态把标签宽度在 36/44/52 之间来回改：
+# 标签一宽，右边的 ＋ 就被推着挪 8~16px（用户要按的位置会跑）。
+# 新机制：数字标签只显示数字、宽度恒定；状态由**独立徽标**承担，徽标槽位恒定占位
+# （无状态时只清空文字，既不 setVisible(False)——隐藏控件会被布局跳过同样挪位，
+# 也不改宽度）。⇒ 加减按钮的几何与状态完全无关。
+TAB_SWITCH_BTN = 32     # − / ＋ 按钮：圆角正方形（QSS 的 min/max 同值，改动需同步两处）
+TAB_NUM_WIDTH = 36      # 数字标签：固定宽度，只放数字
+TAB_BADGE_WIDTH = 24    # 状态徽标（🔒 已固定 / ⏸ 待人工翻纸 / 空）固定宽度
+# 附加服务行左侧的「[徽标]标签页 N」同样按固定宽度处理（旧写法把 ⏸ 的说明拼进这一个标签，
+# 文字一长就把右边的 派送/地点/优先级/首页 整排推走 —— 与加减按钮同一类隐患）。
+# 78px：实测 12px 粗体下「标签页 12」= 72px（余量 ≥4px 由验收脚本按真实字体度量把关）。
+TAB_SCOPE_WIDTH = 78
+
+# 标签页状态的说明文案（唯一真相）：徽标/标签的 tooltip 用它，
+# **不再拼进可见文字**（可见文字一长就会推走同行控件）。
+TAB_FROZEN_HINT = "该标签页已固定（打印完成），不可再编辑。\n如需重打，请新建标签页。"
+TAB_FLIP_HINT = ("本标签页有双面文件，而当前打印机不支持自动双面：\n"
+                 "无障碍/预约打印不会自动开始，需要人工点「开始打印」并在中途翻纸。")
+
 
 # ============================================================
 # 辅助工具
@@ -3787,10 +3808,28 @@ class MainWindow(QMainWindow):
         row2 = QHBoxLayout()
         row2.setSpacing(6)
 
-        # 标签页指示器
-        self._tab_scope_label = QLabel(f"📑 标签页 {self._current_tab}")
+        # 标签页指示器：[状态徽标][标签页 N]
+        # 口径与标签页选择器同源（见文件顶部 TAB_* 常量）：
+        #   · 徽标是**固定宽度槽位**（📑 正常 / 🔒 已固定 / ⏸ 待人工翻纸）；
+        #   · 文字标签**固定宽度**且只含「标签页 N」—— 数字位数变化（1→12）也不撑宽。
+        # 旧写法把状态和说明都塞进这一个标签（`🔒 标签页 1（含双面：需人工翻纸）`）：
+        # 文字一长，右边的 派送/地点/优先级/首页 整排被推走（与加减按钮同一类隐患）。
+        # ⏸ 的完整说明改由 tooltip 承担（挂起那一刻的日志里也有原文，见 _hold_for_manual_duplex）。
+        self._tab_scope_badge = QLabel("📑")
+        self._tab_scope_badge.setObjectName("tabScopeBadge")
+        self._tab_scope_badge.setAlignment(Qt.AlignCenter)
+        self._tab_scope_badge.setFixedWidth(TAB_BADGE_WIDTH)
+
+        self._tab_scope_label = QLabel(f"标签页 {self._current_tab}")
         self._tab_scope_label.setObjectName("tabScopeLabel")
-        row2.addWidget(self._tab_scope_label)
+        self._tab_scope_label.setFixedWidth(TAB_SCOPE_WIDTH)
+
+        scope_row = QHBoxLayout()
+        scope_row.setContentsMargins(0, 0, 0, 0)
+        scope_row.setSpacing(2)
+        scope_row.addWidget(self._tab_scope_badge)
+        scope_row.addWidget(self._tab_scope_label)
+        row2.addLayout(scope_row)
         row2.addSpacing(8)
 
         # —— 先创建所有控件 ——
@@ -3896,21 +3935,23 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        # ── 标签页选择器：[-] [N] [+] ──
+        # ── 标签页选择器：[-] [N] [+] [状态徽标] ──
         tab_row = QHBoxLayout()
         tab_row.setContentsMargins(0, 0, 0, 0)
         tab_row.setSpacing(2)
 
+        # 尺寸口径见文件顶部 TAB_* 常量：按钮/数字/徽标三者宽度恒定，
+        # 徽标槽位**永远**是布局里的一员 ⇒ 状态出现/消失都不挪动 −/＋。
         self._tab_btn_minus = QPushButton("−")
         self._tab_btn_minus.setObjectName("tabBtnMinus")
-        self._tab_btn_minus.setFixedSize(24, 28)
+        self._tab_btn_minus.setFixedSize(TAB_SWITCH_BTN, TAB_SWITCH_BTN)
         self._tab_btn_minus.setToolTip("上一个标签页")
         self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
 
         self._tab_label = QLabel(self._current_tab)
         self._tab_label.setObjectName("tabLabel")
         self._tab_label.setAlignment(Qt.AlignCenter)
-        self._tab_label.setFixedSize(36, 28)
+        self._tab_label.setFixedSize(TAB_NUM_WIDTH, TAB_SWITCH_BTN)
         self._tab_label.setCursor(Qt.PointingHandCursor)
         self._tab_label.setToolTip("点击管理标签页")
         font_tab = QFont(self.font()); font_tab.setPointSize(12); font_tab.setBold(True)
@@ -3920,19 +3961,32 @@ class MainWindow(QMainWindow):
 
         self._tab_btn_plus = QPushButton("+")
         self._tab_btn_plus.setObjectName("tabBtnPlus")
-        self._tab_btn_plus.setFixedSize(24, 28)
+        self._tab_btn_plus.setFixedSize(TAB_SWITCH_BTN, TAB_SWITCH_BTN)
         self._tab_btn_plus.setToolTip("下一个标签页 / 新建标签页")
         self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
 
+        # 状态徽标：🔒 标签页已固定（打印完成）/ ⏸ 含双面、需人工翻纸 / 空 = 正常。
+        # 放在 ＋ 按钮**之后**：加减数字是一组（−1＋），状态是这一组的旁注；
+        # 徽标只占固定槽位、无状态时留空 —— 它的位置在 −/＋ 之后，无论显示什么都不会
+        # 改变 −/＋ 的坐标（这也是它不放进数字标签里的原因）。
+        self._tab_state_badge = QLabel("")
+        self._tab_state_badge.setObjectName("tabStateBadge")
+        self._tab_state_badge.setAlignment(Qt.AlignCenter)
+        self._tab_state_badge.setFixedSize(TAB_BADGE_WIDTH, TAB_SWITCH_BTN)
+        font_badge = QFont(self.font()); font_badge.setPointSize(12)
+        self._tab_state_badge.setFont(font_badge)
+        self._tab_state_badge.setToolTip("")
+
         self._tab_btn_cleanup_empty = QPushButton("🗑 空")
         self._tab_btn_cleanup_empty.setObjectName("tabBtnCleanupEmpty")
-        self._tab_btn_cleanup_empty.setFixedHeight(28)
+        self._tab_btn_cleanup_empty.setFixedHeight(TAB_SWITCH_BTN)
         self._tab_btn_cleanup_empty.setToolTip("删除所有空标签页（不含当前）")
         self._tab_btn_cleanup_empty.clicked.connect(self._on_cleanup_empty_tabs)
 
         tab_row.addWidget(self._tab_btn_minus)
         tab_row.addWidget(self._tab_label)
         tab_row.addWidget(self._tab_btn_plus)
+        tab_row.addWidget(self._tab_state_badge)
         tab_row.addWidget(self._tab_btn_cleanup_empty)
         tab_row.addStretch()
 
@@ -4291,33 +4345,51 @@ class MainWindow(QMainWindow):
                 self._edit_duplex_hint.setText("")
             self._edit_duplex_hint.setVisible(manual)
 
+    def _set_tab_state_badge(self, is_frozen: bool, needs_flip: bool) -> None:
+        """（主线程）刷新标签页状态徽标（两处）：
+
+          · 标签页选择器徽标 `_tab_state_badge`：空 = 正常 / 🔒 / ⏸
+          · 附加服务行徽标 `_tab_scope_badge`：📑 正常 / 🔒 / ⏸（它是这一行的图标位，
+            正常态也占位显示 📑，与旧外观一致）
+
+        **只改文字与提示，绝不改宽度、不 setVisible(False)** —— 两个徽标都是固定槽位，
+        状态切换不能改变 −/＋ 按钮或同行下拉框的位置（原因见文件顶部 TAB_* 常量）。
+        构造阶段控件可能尚未创建 → 各自静默跳过。
+        """
+        if is_frozen:
+            icon, tip = "🔒", TAB_FROZEN_HINT
+        elif needs_flip:
+            icon, tip = "⏸", TAB_FLIP_HINT
+        else:
+            icon, tip = "", ""
+
+        badge = getattr(self, "_tab_state_badge", None)
+        if badge is not None:
+            badge.setText(icon)
+            badge.setToolTip(tip)
+
+        scope_badge = getattr(self, "_tab_scope_badge", None)
+        if scope_badge is not None:
+            scope_badge.setText(icon or "📑")   # 正常态用 📑 占位，槽位不留空
+            scope_badge.setToolTip(tip)
+
     def _refresh_tab_display(self):
         """刷新标签页数字显示和按钮状态。"""
         tab = self._config.tabs.get(self._current_tab)
         is_frozen = tab.frozen if tab else False
         needs_flip = bool(getattr(tab, "manual_duplex_pending", False)) if tab else False
 
-        # 锁定状态下标签显示为 🔒N；含双面需人工翻纸的显示 ⏸（不能无人值守自动开打）
-        if is_frozen:
-            self._tab_label.setText(f"🔒{self._current_tab}")
-            self._tab_label.setFixedWidth(52)  # 锁图标需要更宽
-        elif needs_flip:
-            self._tab_label.setText(f"⏸{self._current_tab}")
-            self._tab_label.setFixedWidth(44)
-        else:
-            self._tab_label.setText(self._current_tab)
-            self._tab_label.setFixedWidth(36)
+        # 数字标签**只放数字**，宽度在 _setup_file_table 里定死；状态走独立徽标。
+        # 旧写法 `🔒{n}` + setFixedWidth(52/44/36) 会让 ＋ 按钮随状态左右挪，已废弃。
+        self._tab_label.setText(self._current_tab)
+        self._set_tab_state_badge(is_frozen, needs_flip)
 
         if hasattr(self, '_tab_scope_label') and self._tab_scope_label:
-            prefix = "🔒 " if is_frozen else ("⏸ " if needs_flip else "📑 ")
-            suffix = "（含双面：需人工翻纸）" if needs_flip else ""
-            self._tab_scope_label.setText(f"{prefix}标签页 {self._current_tab}{suffix}")
-            if needs_flip and not is_frozen:
-                self._tab_scope_label.setToolTip(
-                    "本标签页有双面文件，而当前打印机不支持自动双面：\n"
-                    "无障碍/预约打印不会自动开始，需要人工点「开始打印」并在中途翻纸。")
-            else:
-                self._tab_scope_label.setToolTip("")
+            # 可见文字**只有「标签页 N」**（宽度固定）：状态走左侧徽标，
+            # ⏸/🔒 的说明走 tooltip —— 不再拼进文字里推走同行的下拉框。
+            self._tab_scope_label.setText(f"标签页 {self._current_tab}")
+            self._tab_scope_label.setToolTip(
+                TAB_FLIP_HINT if (needs_flip and not is_frozen) else "")
 
         tab_keys = self._sorted_tab_keys(self._config.tabs)
         try:

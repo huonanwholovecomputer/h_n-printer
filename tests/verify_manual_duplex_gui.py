@@ -915,9 +915,11 @@ check("★ 常驻窗：置顶 + 抢焦点 + 任务栏闪烁",
       and "setWindowFlag(Qt.WindowStaysOnTopHint, True)" in src)
 check("★ 无人值守两处（无障碍 + 预约）都挂了手动双面拦截",
       src.count("self._hold_for_manual_duplex(") == 2)
-check("编辑面板按档案标注双面选项 + 标签页 ⏸ 标记",
+check("编辑面板按档案标注双面选项 + 标签页 ⏸ 状态徽标（固定槽位，不挪动 −/＋ 按钮）",
       'want = "双面（手动翻纸）" if manual else "双面打印"' in src
-      and 'self._tab_label.setText(f"⏸{self._current_tab}")' in src)
+      and 'icon, tip = "⏸", TAB_FLIP_HINT' in src
+      and 'badge.setText(icon)' in src
+      and 'self._tab_label.setText(self._current_tab)' in src)
 check("★ 出纸等待已收紧（队列排空 + 短余量，判断权交给操作员数张数）",
       "margin_per_page: float = 1.5" in open(os.path.join(LOCAL_TOOL, "pdf_printer.py"),
                                              encoding="utf-8").read())
