@@ -266,6 +266,7 @@ class CloudClient(QObject):
     start_print = Signal(int, int, list)  # 预约单到点/解除冻结：order_id, scheduled_ts, task_ids
     auth_failed = Signal(str)             # 认证失败（含消息），GUI 可连接此信号提示用户
     printer_state = Signal(object)        # 接单状态 dict（is_active/active_owner_name/...）— 2026-11
+    stack_mode_requested = Signal(bool, str)  # 移动端下发切换「🖐 攒批模式」：enable, 操作者 — 2026-10
 
     def __init__(
         self,
@@ -652,6 +653,16 @@ class CloudClient(QObject):
         if not ids:
             return False
         return self._sio_emit("print_keepalive", {"task_ids": ids})
+
+    def report_stack_state(self, mode: bool, busy: bool, note: str = "") -> bool:
+        """上报本机「🖐 攒批模式」状态（2026-10）：连接成功后 + 每次状态/忙闲变化时调用。
+
+        服务端只做镜像（给移动端展示「攒批中 / 攒批未开」）并用它校验远程切换请求 ——
+        这是移动端看到的状态、以及「能不能远程改」的唯一数据来源。note 用于把拒绝原因带回移动端。
+        """
+        return self._sio_emit("stack_state", {
+            "mode": bool(mode), "busy": bool(busy), "note": (note or "")[:120],
+        })
 
     # ── 离线状态同步 ──
 
@@ -1269,6 +1280,20 @@ class CloudClient(QObject):
                 claiming = payload.get("claiming_devices") or {}
                 if claiming:
                     self.status_message.emit(f"☁ 当前有 {len(claiming)} 台设备启用接单，本机未接单")
+
+        @sio.on("set_stack_mode")
+        def _on_set_stack_mode(data):
+            """移动端请求切换本机「🖐 攒批模式」（2026-10）。
+
+            这里只把请求转给 GUI 主线程 —— 真正的忙闲校验与落盘在
+            `MainWindow._on_remote_stack_mode`（执行前**再自查一次**，防服务端镜像过期导致的
+            竞态；本机忙时直接拒绝并把原因回报云端）。"""
+            payload = dict(data or {}) if isinstance(data, dict) else {}
+            enable = bool(payload.get("enable"))
+            by = str(payload.get("by") or "")
+            self.status_message.emit(
+                f"📱 移动端请求{'开启' if enable else '关闭'}「🖐 攒批模式」")
+            self.stack_mode_requested.emit(enable, by)
 
         @sio.on("request_log")
         def _on_request_log(data):

@@ -711,6 +711,56 @@ download_serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
 printer_clients = {}
 printer_clients_lock = threading.Lock()
 
+# -------- 攒批模式（多任务合并翻纸）远程状态（2026-10）--------
+# { client_id: {"mode": True/False/None, "busy": bool, "note": str, "updated_at": datetime} }
+# 与 auto_duplex 能力同源：**以设备端为准**。本地工具连上后 + 状态每次变化时用 `stack_state`
+# 事件上报，服务端只做镜像（给移动端展示）+ 转发控制指令（移动端 → 设备端），并把设备端的
+# 执行结果回给移动端。mode=None = 从未上报（旧版客户端/刚接入）→ 移动端显示未知、不可远程切换。
+printer_stack_state = {}
+printer_stack_state_lock = threading.Lock()
+# 在途的远程控制请求：{ client_id: threading.Event }；设备端回报 stack_state 时唤醒等待方
+printer_stack_waiters = {}
+printer_stack_results = {}
+STACK_TOGGLE_WAIT_SEC = 3.0      # 移动端下发指令后等设备端回报的上限（秒）
+
+
+def _stack_state_of(client_id: str) -> dict:
+    """读某设备的攒批镜像状态（从未上报时 mode=None）。"""
+    with printer_stack_state_lock:
+        st = printer_stack_state.get(client_id) or {}
+    return {"mode": st.get("mode"), "busy": bool(st.get("busy")),
+            "note": st.get("note") or "", "updated_at": st.get("updated_at")}
+
+
+def _set_stack_state(client_id: str, mode, busy: bool, note: str = ""):
+    """写攒批镜像状态（mode = True / False / None）。"""
+    with printer_stack_state_lock:
+        printer_stack_state[client_id] = {
+            "mode": mode, "busy": bool(busy), "note": (note or "")[:120],
+            "updated_at": datetime.now(),
+        }
+
+
+def _stack_toggle_problem(client_id: str, enable=None) -> str:
+    """远程切换攒批模式的前置校验：返回 "" = 允许；非空 = 给用户看的原因。
+
+    enable=None 时只判"状态本身可不可操作"（供 /api/claiming_devices 算 stack_can_toggle）。
+    前提（与本地工具侧同口径）：**空闲** + 状态与目标相反 —— 忙（正在打印 / 等待人工翻纸打
+    第二趟 / 有排队待打的请求）时一律不许改动攒批模式。
+    """
+    st = _stack_state_of(client_id)
+    if st["mode"] is None:
+        return "该设备尚未上报攒批状态（旧版客户端或刚接入），暂不能远程切换"
+    if st["busy"]:
+        return ("打印机正忙（正在打印 / 等待人工翻纸打第二趟 / 有排队待打的请求），"
+                "空闲后才能改动攒批模式")
+    if enable is True and st["mode"]:
+        return "攒批模式已经是开启状态"
+    if enable is False and not st["mode"]:
+        return "攒批模式已经是关闭状态"
+    return ""
+
+
 # 推送后等待反馈的任务: { order_id: {"pushed_at": datetime, "client_id": str} }
 pushed_tasks = {}
 pushed_tasks_lock = threading.Lock()
@@ -1134,6 +1184,9 @@ def _printer_state_payload(client_id: str) -> dict:
         "active_device_name": mine.get("device_name", "") if client_id in claiming else "",
         # 本机自动双面能力（服务端为准：人工盖章 > 自动探测 > 未确认）
         **_device_capability_fields(client_id),
+        # 本机攒批模式镜像（2026-10：本地工具上报后这里回显，便于两端对齐）
+        "stack_mode": _stack_state_of(client_id)["mode"],
+        "stack_busy": _stack_state_of(client_id)["busy"],
     }
 
 
@@ -3472,6 +3525,35 @@ def on_start_printing(data):
     print(f"  [START] 本地工具开始打印: {task_ids}")
 
 
+@socketio.on("stack_state")
+def on_stack_state(data):
+    """设备端上报「🖐 攒批模式」状态（2026-10）：连接成功后 + 每次状态/忙闲变化时发一次。
+
+    data: {"mode": true|false|null, "busy": bool, "note": str?, "request_id": str?}
+    服务端只镜像；若移动端正有在途的控制请求在等结果，这里顺带唤醒它并带回设备端的执行结果。
+    """
+    client_id = _get_event_client_id()
+    if not client_id:
+        print(f"  [WARN] stack_state 来自未注册连接（sid={request.sid}），已忽略")
+        return
+    payload = data or {}
+    mode = _as_bool_or_none(payload.get("mode"))
+    busy = bool(payload.get("busy"))
+    note = str(payload.get("note") or "")
+    _set_stack_state(client_id, mode, busy, note)
+    with printer_stack_state_lock:
+        waiter = printer_stack_waiters.pop(client_id, None)
+        if waiter is not None:
+            printer_stack_results[client_id] = {
+                "mode": mode, "busy": busy, "note": note,
+                "request_id": str(payload.get("request_id") or ""),
+            }
+    if waiter is not None:
+        waiter.set()
+    show = "开启" if mode else ("关闭" if mode is False else "未知")
+    print(f"  [STACK] {client_id} 攒批模式={show} 忙={busy}" + (f"（{note}）" if note else ""))
+
+
 @socketio.on("print_keepalive")
 def on_print_keepalive(data):
     """打印中保活：刷新仍在打印中的子任务的 locked_at，避免被超时机制误判。
@@ -5594,6 +5676,80 @@ def printer_devices():
     })
 
 
+@app.route("/api/printer/stack_mode", methods=["POST"])
+@login_required
+def printer_stack_mode():
+    """移动端远程切换某台设备的「🖐 攒批模式」（2026-10，仅管理员/超管）。
+
+    body: {"client_id": "...", "enable": true|false}
+    前提（与本地工具侧同口径，缺一不可）：
+      · 开启：该设备当前**未开**攒批 + **空闲**；
+      · 关闭：该设备当前**已开**攒批 + **空闲**；
+      · 忙（正在打印 / 等待人工翻纸打第二趟 / 有排队待打的请求）时一律拦下并给原因。
+    实现：服务端先按镜像状态校验 → emit `set_stack_mode` 给该设备 → 等设备端回报（≤3s）
+    → 用回报后的最新状态回复。设备端收到指令后会**再自查一次**（防两端状态竞态），
+    最终「以设备端为准」。
+    一律 HTTP 200，靠 body 的 success 判断（前端只读 success / message / stack_mode / stack_busy）。
+    """
+    role = compute_role(getattr(g, "openid", "") or "")
+    if role not in ("admin", "super_admin"):
+        return jsonify({"success": False, "message": "仅管理员可以切换攒批模式"})
+    data = request.get_json(silent=True) or {}
+    client_id = (data.get("client_id") or "").strip()[:64]
+    enable = _as_bool_or_none(data.get("enable"))
+    if not client_id or enable is None:
+        return jsonify({"success": False, "message": "参数不完整（需要 client_id 与 enable）"})
+
+    # 设备必须在线：离线设备无法立刻执行，直接拒绝（攒批状态是实时操作，不排队）
+    with printer_clients_lock:
+        info = printer_clients.get(client_id)
+    sid = info.get("sid") if info else None
+    hb = info.get("heartbeat") if info else None
+    online = bool(sid) and hb is not None and \
+        (datetime.now() - hb).total_seconds() <= CLIENT_HEARTBEAT_TIMEOUT
+    if not online:
+        st = _stack_state_of(client_id)
+        return jsonify({"success": False, "message": "设备离线，无法远程切换攒批模式",
+                        "stack_mode": st["mode"], "stack_busy": st["busy"]})
+
+    problem = _stack_toggle_problem(client_id, enable)
+    if problem:
+        st = _stack_state_of(client_id)
+        return jsonify({"success": False, "message": problem,
+                        "stack_mode": st["mode"], "stack_busy": st["busy"]})
+
+    # 下发指令并等设备端回报（设备端会再自查一次，最终状态以它为准）
+    ev = threading.Event()
+    with printer_stack_state_lock:
+        printer_stack_waiters[client_id] = ev
+        printer_stack_results.pop(client_id, None)
+    try:
+        socketio.emit("set_stack_mode",
+                      {"enable": bool(enable), "by": role, "request_id": uuid.uuid4().hex[:8]},
+                      to=sid)
+    except Exception as e:
+        with printer_stack_state_lock:
+            printer_stack_waiters.pop(client_id, None)
+        st = _stack_state_of(client_id)
+        return jsonify({"success": False, "message": f"下发失败：{e}",
+                        "stack_mode": st["mode"], "stack_busy": st["busy"]})
+
+    got = ev.wait(STACK_TOGGLE_WAIT_SEC)
+    with printer_stack_state_lock:
+        result = printer_stack_results.pop(client_id, None) or {}
+        printer_stack_waiters.pop(client_id, None)
+    st = _stack_state_of(client_id)
+    if not got:
+        return jsonify({"success": False, "message": "设备端未在 3 秒内回应，请稍后重试或刷新",
+                        "stack_mode": st["mode"], "stack_busy": st["busy"]})
+    ok = result.get("mode") is bool(enable)
+    msg = result.get("note") or ("攒批模式已开启" if enable else "攒批模式已关闭")
+    if not ok and not result.get("note"):
+        msg = "设备端拒绝了本次切换"
+    return jsonify({"success": bool(ok), "message": msg,
+                    "stack_mode": st["mode"], "stack_busy": st["busy"]})
+
+
 @app.route("/api/printer/capability", methods=["POST"])
 def printer_capability():
     """写入设备的「自动双面」能力（printer token 鉴权）。
@@ -5669,14 +5825,23 @@ def claiming_devices():
     result = []
     for cid, entry in claiming.items():
         dev = get_device_entry(cid)
+        online = cid in online_set
+        st = _stack_state_of(cid)
+        # 攒批模式（2026-10）：给移动端展示「🖐 攒批中 / 攒批未开 / 未知」+ 管理员远程开关。
+        # stack_can_toggle 由服务端先算一遍（在线 + 已上报 + 空闲 + 状态可反向），移动端据此
+        # 置灰/提示；真正切换时 /api/printer/stack_mode 还会再校验一次（并让设备端自查）。
         result.append({
             "client_id": cid,
             "device_name": dev.get("device_name", "") or cid,
             "owner_name": dev.get("owner_name", "") or "",
-            "online": cid in online_set,
+            "online": online,
             "label": device_display_label(cid),
             # 自动双面能力（三态；移动端无障碍打印的判定依据之一）
             **_device_capability_fields(cid),
+            "stack_mode": st["mode"],
+            "stack_busy": st["busy"],
+            "stack_can_toggle": bool(online) and not _stack_toggle_problem(cid),
+            "stack_reason": ("设备离线" if not online else _stack_toggle_problem(cid)),
         })
     # 在线设备排前，其余按 client_id 排序
     result.sort(key=lambda d: (not d["online"], d["client_id"].lower()))

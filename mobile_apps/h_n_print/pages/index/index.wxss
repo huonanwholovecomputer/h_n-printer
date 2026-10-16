@@ -206,6 +206,24 @@
 .device-state-off { color: var(--gray); }
 /* 该设备已确认不支持自动双面（双面需人工翻纸；无人在场时不能打双面） */
 .device-state-manual { color: #e67e22; margin-right: 12rpx; }
+/* 攒批模式状态（stack_mode）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=未上报 → 不渲染 */
+.device-state-stack { color: #e67e22; font-weight: 600; margin-right: 12rpx; }
+.device-state-stack-off { color: var(--gray); margin-right: 12rpx; }
+/* 攒批模式远程开关（仅 admin/super_admin 渲染）：小胶囊按钮，禁用态灰显但保留可点（点了弹原因） */
+.device-stack-btn {
+  flex-shrink: 0;
+  margin-right: 12rpx;
+  padding: 4rpx 16rpx;
+  font-size: 22rpx;
+  line-height: 1.4;
+  color: var(--blue);
+  border: 1rpx solid var(--blue);
+  border-radius: 8rpx;
+}
+.device-stack-btn-disabled {
+  color: var(--gray);
+  border-color: var(--gray3);
+}
 /* 设备选项按下反馈：微微缩小 0.98（瞬时生效，松手后由基类 transform 过渡平滑弹回） */
 .device-hover {
   transform: scale(0.98);
@@ -1554,6 +1572,22 @@ picker-view-column {
 }
 .theme-dark .param-row {
   border-bottom-color: rgba(84, 84, 88, 0.30);
+}
+/* 深色模式：攒批状态徽标与远程开关 —— 浅色的 #e67e22 在 #1C1C1E 上偏暗，提亮到 #FFA94D；
+   开关描边由 --blue(#007AFF) 换成 --blue-light(#409CFF)，禁用态用 --gray3 保持可辨识 */
+.theme-dark .device-state-stack {
+  color: #FFA94D;
+}
+.theme-dark .device-state-stack-off {
+  color: var(--gray);
+}
+.theme-dark .device-stack-btn {
+  color: var(--blue-light);
+  border-color: rgba(64, 156, 255, 0.55);
+}
+.theme-dark .device-stack-btn-disabled {
+  color: var(--gray3);
+  border-color: var(--gray3);
 }
 
 /* ── 文件预览 ──────────────────────────────────────────────

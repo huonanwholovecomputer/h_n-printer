@@ -1334,6 +1334,7 @@ async function checkPrinterStatus() {
 
 let claimingDevices = [];      // 可接单设备列表 {client_id, label, online, ...}
 let selectedDeviceId = '';     // 当前选中的目标设备（提交订单时随 target_client_id 上报）
+let stackTogglingId = '';      // 攒批模式远程切换中（client_id）：非空时开关置灰、拒绝重复点击
 
 async function loadClaimingDevices() {
   try {
@@ -1364,13 +1365,80 @@ function renderDeviceList() {
       <view class="device-dot ${d.online ? 'device-dot-on' : 'device-dot-off'}"></view>
       <text class="device-label">${esc(d.label || d.client_id)}</text>
       ${d.auto_duplex === false ? '<text class="device-state device-state-manual">🖐 需人工翻纸</text>' : ''}
+      ${stackBadgeHtml(d)}
+      ${stackToggleBtnHtml(d)}
       <text class="device-state ${d.online ? 'device-state-on' : 'device-state-off'}">${d.online ? '在线' : '离线'}</text>
     </view>`
   ).join('');
 }
 
+// 攒批模式状态徽标（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
+// null（该设备从未上报，状态未知）→ 不渲染该徽标
+function stackBadgeHtml(d) {
+  if (d.stack_mode === true) return '<text class="device-state device-state-stack">🖐 攒批中</text>';
+  if (d.stack_mode === false) return '<text class="device-state device-state-stack-off">攒批未开</text>';
+  return '';
+}
+
+// 管理员/超管判定（攒批模式远程开关只对他们渲染）
+function isAdminRole() {
+  return state.role === 'admin' || state.role === 'super_admin';
+}
+
+// 攒批模式远程开关：仅 admin/super_admin 渲染（普通用户看不到可点控件，也不留空壳）；
+// 离线 / 服务端判「当前不可切换」/ 请求中 → 灰显禁用，点击只弹提示不请求
+function stackToggleBtnHtml(d) {
+  if (!isAdminRole()) return '';
+  const disabled = d.online === false || d.stack_can_toggle === false || stackTogglingId === d.client_id;
+  const label = d.stack_mode === true ? '关闭攒批' : '开启攒批';
+  return `<view class="device-stack-btn${disabled ? ' device-stack-btn-disabled' : ''}" data-id="${esc(d.client_id)}">${label}</view>`;
+}
+
+// 攒批模式（多任务合并翻纸）远程开关：开启需「当前未开攒批 + 打印机空闲」，关闭需「当前已开攒批 +
+// 打印机空闲」；繁忙（正在打印 / 等人工翻纸打第二趟 / 有排队待打的请求）由服务端判定
+// （stack_can_toggle / stack_reason），前端只做前置提示 + 请求转发，不复刻这套判定。
+// 该接口一律 HTTP 200，按 body 的 success 判断（失败时 message 即拦截原因）。
+async function toggleStackMode(clientId) {
+  // 兜底：普通用户/游客即使状态异常也不放行
+  if (!isAdminRole()) return;
+  // 请求中禁用，防止重复点击
+  if (stackTogglingId) return;
+  const idx = claimingDevices.findIndex(d => d.client_id === clientId);
+  if (idx < 0) return;
+  const d = claimingDevices[idx];
+  if (d.online === false) { showToast('设备离线，无法远程切换', 2000); return; }
+  if (d.stack_can_toggle === false) { showToast(d.stack_reason || '当前无法切换攒批模式', 2500); return; }
+  const enable = d.stack_mode !== true;
+  stackTogglingId = clientId;
+  renderDeviceList();
+  try {
+    const r = await api('/api/printer/stack_mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: clientId, enable: enable }),
+    });
+    const data = (r && r.data) || {};
+    showToast(data.message || (data.success ? '操作成功' : '切换失败，请稍后重试'), data.success ? 2000 : 2500);
+    if (data.success) {
+      // 成功后就地更新 claimingDevices 缓存里那一台，再刷新列表（就地更新，不整表重新拉取）
+      const i = claimingDevices.findIndex(x => x.client_id === clientId);
+      if (i >= 0) {
+        claimingDevices[i].stack_mode = data.stack_mode === true;
+        claimingDevices[i].stack_busy = !!data.stack_busy;
+      }
+    }
+  } catch (e) {
+    showToast('网络错误，切换失败', 2500);
+  }
+  stackTogglingId = '';
+  renderDeviceList();
+}
+
 // 设备选择（事件委托）
 document.addEventListener('click', function (e) {
+  // 攒批模式开关：先于设备选中处理（它在设备项内部，否则会被当成「选中该设备」）
+  const btn = e.target.closest ? e.target.closest('.device-stack-btn') : null;
+  if (btn && btn.dataset && btn.dataset.id) { toggleStackMode(btn.dataset.id); return; }
   const item = e.target.closest ? e.target.closest('.device-item') : null;
   if (item && item.dataset && item.dataset.id) {
     selectedDeviceId = item.dataset.id;

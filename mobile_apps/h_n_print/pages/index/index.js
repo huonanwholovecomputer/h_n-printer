@@ -149,6 +149,8 @@ Component({
     // 可接单设备（2026-12 多设备接单）：全部启用接单的设备 + 当前选中的目标设备
     claimingDevices: [],
     selectedDeviceId: '',
+    // 攒批模式远程切换中（client_id）：非空时开关置灰、拒绝重复点击
+    stackTogglingId: '',
     showSuccessModal: false,
     // 文件预览层（仅文本类 txt/csv/md 用；图片/PDF/Word 走微信原生能力）
     showPreview: false,
@@ -1978,6 +1980,83 @@ Component({
       return (this.data.selectedFiles || []).some(f => f
         && !f.isImage && !f.excelWarning && !f.unsupportedFormat
         && f.pageCount !== 1 && !f.singlePage && (f.duplex || 'on') === 'on')
+    },
+
+    // 攒批模式（多任务合并翻纸）远程开关：仅管理员/超管可点（界面同样只对二者渲染）。
+    // 准入由服务端判定 —— 开启需「当前未开攒批 + 打印机空闲」，关闭需「当前已开攒批 + 打印机空闲」；
+    // 繁忙（正在打印 / 等人工翻纸打第二趟 / 有排队待打的请求）时服务端给出 stack_can_toggle=false
+    // 与 stack_reason，此处只做前置提示 + 请求转发，不在前端复刻这套判定。
+    onToggleStackMode(e) {
+      // 兜底：普通用户/游客即使状态异常也不放行
+      const role = this.data.userRole
+      if (role !== 'admin' && role !== 'super_admin') return
+      // 请求中禁用，防止重复点击
+      if (this.data.stackTogglingId) return
+      const index = e.currentTarget.dataset.index
+      const device = (this.data.claimingDevices || [])[index]
+      if (!device || !device.client_id) return
+      if (device.online === false) {
+        wx.showToast({ title: '设备离线，无法远程切换', icon: 'none', duration: 2000 })
+        return
+      }
+      if (device.stack_can_toggle === false) {
+        this._showStackTip(device.stack_reason || '当前无法切换攒批模式')
+        return
+      }
+      const enable = device.stack_mode !== true
+      const clientId = device.client_id
+      this.setData({ stackTogglingId: clientId })
+      // 该接口一律 HTTP 200，只看 body 的 success（失败时 message 即拦截原因）
+      request({
+        url: CONFIG.BASE_URL + '/api/printer/stack_mode',
+        method: 'POST',
+        header: {
+          'Authorization': 'Bearer ' + (wx.getStorageSync('token') || ''),
+          'content-type': 'application/json'
+        },
+        data: { client_id: clientId, enable: enable },
+        success: (res) => {
+          this.setData({ stackTogglingId: '' })
+          const data = (res && res.data) || {}
+          this._showStackTip(data.message || (data.success ? '操作成功' : '切换失败，请稍后重试'))
+          if (!data.success) return
+          this._applyStackMode(index, clientId, data)
+        },
+        fail: () => {
+          this.setData({ stackTogglingId: '' })
+          wx.showToast({ title: '网络错误，切换失败', icon: 'none', duration: 2500 })
+        }
+      })
+    },
+
+    // 攒批模式提示：固定短文案（离线/网络错误）走 wx.showToast；服务端的 stack_reason 与拦截
+    // message 动辄 30~45 字（如「打印机正忙（正在打印 / 等待人工翻纸打第二趟 / 有排队待打的请求）…」
+    // 「该设备尚未上报攒批状态（旧版客户端或刚接入），暂不能远程切换」），而 wx.showToast 的
+    // title **只显示两行**，长文案会被截断成读不懂的半句 —— 拦截原因必须完整可读，故改走
+    // wx.showModal(showCancel:false)。APP 侧 #toast 自带 max-width:80% 会换行，无需此分支。
+    _showStackTip(msg) {
+      if (!msg) return
+      if (msg.length > 18) {
+        wx.showModal({ title: '无法切换攒批模式', content: msg, showCancel: false, confirmText: '知道了' })
+        return
+      }
+      wx.showToast({ title: msg, icon: 'none', duration: 2500 })
+    },
+
+    // 攒批模式成功后就地写回**本地那一台**设备：按 client_id 复核下标（列表可能已被刷新过），
+    // 只走精确路径 setData（claimingDevices[i].xxx），不整表重渲染 —— 整表会让设备列表节点重建、
+    // 打断点击/滚动。stack_mode 用服务端返回值，不用本地旧值 + enable 猜。
+    _applyStackMode(index, clientId, data) {
+      const devices = this.data.claimingDevices || []
+      let i = index
+      if (!devices[i] || devices[i].client_id !== clientId) {
+        i = devices.findIndex(d => d && d.client_id === clientId)
+      }
+      if (i < 0) return
+      const patch = {}
+      patch['claimingDevices[' + i + '].stack_mode'] = data.stack_mode === true
+      patch['claimingDevices[' + i + '].stack_busy'] = !!data.stack_busy
+      this.setData(patch)
     },
 
     onFileDuplexChange(e) {

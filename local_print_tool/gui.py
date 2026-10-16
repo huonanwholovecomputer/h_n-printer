@@ -2717,6 +2717,14 @@ class MainWindow(QMainWindow):
         self._keepalive_timer.setInterval(60_000)
         self._keepalive_timer.timeout.connect(self._tick_keepalive)
         self._keepalive_timer.start()
+
+        # 攒批模式状态变化 → 上报云端（移动端实时显示「攒批中 / 攒批未开」+ 能否远程切换）；
+        # 2 秒比对一次，**变化才发**（不刷屏、不打扰服务端）。2026-10
+        self._last_stack_sig = None
+        self._stack_state_timer = QTimer(self)
+        self._stack_state_timer.setInterval(2_000)
+        self._stack_state_timer.timeout.connect(self._stack_state_tick)
+        self._stack_state_timer.start()
         self._keepalive_last: tuple = ()     # 上次实际发送的任务集合（变了才立刻补发一次）
         # 无障碍后台打印：当前打印批次所属的标签页 key（后台创建时不切换前台；
         # 打印启动/回报/冻结据此定位标签页，空 = 前台标签页）
@@ -2954,6 +2962,8 @@ class MainWindow(QMainWindow):
         self._cloud_client.start_print.connect(self._on_cloud_start_print)
         # 接单状态（2026-11）：后端推送 → 本机是否接管/接管者是谁；后台线程 → 主线程 UI
         self._cloud_client.printer_state.connect(self._on_cloud_printer_state)
+        # 移动端远程切换「🖐 攒批模式」（2026-10）：云端下发 → 主线程校验忙闲后再执行
+        self._cloud_client.stack_mode_requested.connect(self._on_remote_stack_mode)
         # 接单配置：本机是否启用接单（仅接管者可接收订单；连上后自动向后端续接单）
         self._cloud_client.take_orders = bool(self._config.cloud_take_orders)
 
@@ -7366,6 +7376,77 @@ class MainWindow(QMainWindow):
     def _stack_mode_on(self) -> bool:
         return bool(getattr(self._config, "duplex_stack_mode", False))
 
+    # ── 攒批模式：忙闲判定 + 云端上报 + 远程控制（2026-10）────────────────────────
+    # 移动端可以看/改本机的「🖐 攒批模式」，硬前提是**打印机空闲**。
+    # 忙 = 正在打印（普通批次 / 攒批第 1 趟 / 整叠第 2 趟）或 有活等在那儿
+    # （出纸槽里还有没打第 2 趟的纸叠 / 攒批排队 / 自动打印补打队列）。
+    # 本地勾选框与移动端下发走**同一道闸门**（_stack_busy_reason），两侧都拦、提示同样口径。
+
+    def _stack_busy_reason(self) -> str:
+        """攒批模式能否改动的前置：返回 "" = 空闲可改；非空 = 忙的原因（给用户看）。
+
+        全部 getattr 兜底 + 整体 try：本方法会被 2 秒定时器调用，而 GUI 验收脚本里存在
+        「MainWindow 只初始化了一半」的场景 —— 不能因为缺一个属性就把异常抛进 Qt 事件循环。
+        """
+        try:
+            worker = getattr(self, "_worker", None)
+            if worker is not None and worker.isRunning():
+                return "正在打印"
+            flush = getattr(self, "_stack_flush_worker", None)
+            if flush is not None and flush.isRunning():
+                return "正在打印整叠的第 2 趟"
+            stack = getattr(self, "_stack", None)
+            if stack is not None and getattr(stack, "entries", None):
+                return (f"出纸槽里有 {stack.total_sheets} 张纸还没打第 2 趟"
+                        f"（{stack.count} 单，等人工翻纸）")
+            wait = getattr(self, "_stack_wait", None) or []
+            if wait:
+                return f"有 {len(wait)} 个打印请求在排队等这一叠打完"
+            retry = getattr(self, "_auto_print_retry", None) or []
+            if retry:
+                return f"有 {len(retry)} 个订单在补打队列里等打印机空出来"
+        except Exception as e:      # 定时器路径绝不能抛；异常时按"空闲"放行（设备端还会再自查）
+            logger.debug(f"攒批忙闲判定失败（按空闲处理）: {e}")
+        return ""
+
+    def _report_stack_state(self, note: str = ""):
+        """把本机攒批模式 + 忙闲报给云端（移动端据此显示状态、判断能否远程切换）。"""
+        cc = getattr(self, "_cloud_client", None)
+        if cc is None or not hasattr(cc, "report_stack_state"):
+            return
+        try:
+            cc.report_stack_state(self._stack_mode_on(), bool(self._stack_busy_reason()), note)
+        except Exception as e:
+            logger.debug(f"上报攒批状态失败: {e}")
+
+    def _stack_state_tick(self):
+        """定时（2s）比对攒批模式 + 忙闲，**变化才上报** —— 移动端状态随之实时刷新。"""
+        try:
+            sig = (self._stack_mode_on(), self._stack_busy_reason())
+            if sig == getattr(self, "_last_stack_sig", None):
+                return
+            self._last_stack_sig = sig
+            self._report_stack_state()
+        except Exception as e:      # 定时器路径绝不能抛
+            logger.debug(f"攒批状态心跳失败: {e}")
+
+    def _on_remote_stack_mode(self, enable: bool, by: str = ""):
+        """（主线程）移动端下发的攒批模式切换。执行前**再自查一次**忙闲（防服务端镜像过期）。"""
+        want = bool(enable)
+        busy = self._stack_busy_reason()
+        if busy:
+            self._log(f"📱 移动端请求{'开启' if want else '关闭'}「🖐 攒批模式」被拒："
+                      f"打印机正忙（{busy}）")
+            self._report_stack_state(f"打印机正忙（{busy}），未执行")
+            return
+        if want == self._stack_mode_on():
+            self._log("📱 移动端请求的攒批模式与当前一致，无需改动")
+            self._report_stack_state(f"状态未变（已是{'开启' if want else '关闭'}）")
+            return
+        who = f"（操作者：{by}）" if by else ""
+        self._log(f"📱 移动端{'开启' if want else '关闭'}「🖐 攒批模式」{who}")
+        self._apply_stack_mode(want, source="移动端")
+
     def _uses_manual_duplex_job(self, job) -> bool:
         """单个任务是否要"程序自己分两趟 + 人工翻纸"（与 PrintWorker._uses_manual_duplex 同口径）。"""
         p = self._printer_profile()
@@ -7394,9 +7475,37 @@ class MainWindow(QMainWindow):
             btn.setVisible(bool(self._stack_mode_on()))
 
     def _on_stack_mode_toggled(self, checked: bool):
-        self._config.duplex_stack_mode = bool(checked)
+        """本地勾选框：先过**忙闲闸门**（与移动端同一口径），再真正切换（2026-10）。"""
+        want = bool(checked)
+        if want == self._stack_mode_on():
+            return
+        busy = self._stack_busy_reason()
+        if busy:
+            # 回滚勾选（不触发信号）并提示原因 —— 与移动端下发同口径的拦截
+            chk = getattr(self, "_chk_stack_mode", None)
+            if chk is not None:
+                chk.blockSignals(True)
+                chk.setChecked(self._stack_mode_on())
+                chk.blockSignals(False)
+            verb = "开启" if want else "关闭"
+            self._log(f"⚠ 打印机正忙（{busy}）—— 空闲后才能{verb}「🖐 攒批模式」")
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "攒批模式",
+                                    f"打印机正忙（{busy}）。\n\n空闲后才能{verb}攒批模式。")
+            return
+        self._apply_stack_mode(want, source="本地")
+
+    def _apply_stack_mode(self, enable: bool, source: str = "本地"):
+        """真正切换攒批模式（本地勾选框与移动端指令共用）：落盘 + 同步 UI + 上报云端。"""
+        enable = bool(enable)
+        self._config.duplex_stack_mode = enable
         self._save_config()
-        if checked:
+        chk = getattr(self, "_chk_stack_mode", None)
+        if chk is not None and chk.isChecked() != enable:
+            chk.blockSignals(True)
+            chk.setChecked(enable)
+            chk.blockSignals(False)
+        if enable:
             self._log("🖐 攒批模式已开启：需手动双面的打印请求不再各自翻纸，"
                       "第 1 趟连续堆进出纸槽，人工一次性确认后打整叠第 2 趟")
             prof = self._printer_profile()
@@ -7413,6 +7522,11 @@ class MainWindow(QMainWindow):
                           f"在打完/放弃这一叠之前，其它打印请求仍会排队")
         self._sync_stack_button()
         self._refresh_stack_dialog()
+        # 立刻上报 + 刷新变化基线（不等下一次 tick）
+        self._last_stack_sig = (self._stack_mode_on(), self._stack_busy_reason())
+        self._report_stack_state(
+            f"攒批模式已{'开启' if enable else '关闭'}"
+            + ("（来自移动端）" if source == "移动端" else ""))
 
     def _on_stack_button(self):
         """点底部「🖐 攒批」：把翻纸窗叫回来（关窗只是收起来，纸还得处理）。"""
@@ -9447,6 +9561,8 @@ class MainWindow(QMainWindow):
         self._cloud_connected = connected
         self._update_cloud_status()
         if connected:
+            # 攒批模式状态（2026-10）：一连上就先报一次，移动端立刻能看到「攒批中/未开」
+            self._report_stack_state()
             threading.Thread(
                 target=self._conn_sync_worker,
                 daemon=True,
