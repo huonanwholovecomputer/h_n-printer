@@ -92,6 +92,10 @@ mobile_apps/AGENTS.md
 # 开发计划（仅本地参考）
 DEVELOPMENT_PLAN.md
 
+# 内部审查报告（含 token / 密码 / 设备 ID 原文，刻意不入 git —— 此前只靠"记得别 add"，
+# 一次 git add -A 就会把密钥推进公开仓库，故补上规则）
+docs/审查报告_2026-10/
+
 # 崩溃报告/调试文件
 crash_traceback.txt
 
