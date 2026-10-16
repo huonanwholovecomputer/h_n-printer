@@ -362,14 +362,30 @@ Component({
             if (n.id !== o.id) { changed = true; break }
             if (n.status !== o.status) {
               updates['orders[' + i + '].status'] = n.status
-              // 同步更新子文件状态
-              if (n.files && o.files) {
-                for (let j = 0; j < Math.min(n.files.length, o.files.length); j++) {
-                  if (n.files[j].status !== o.files[j].status) {
-                    updates['orders[' + i + '].files[' + j + '].status'] = n.files[j].status
-                  }
-                }
+            }
+            // 子文件状态同步（D5 第 6 条）：
+            //  ① **按 file_id 配对**，绝不按下标 —— 子文件集合变化（增删/顺序变化）时按下标
+            //     会把 B 行的状态写到 A 行（行内状态串台）；集合本身变了就全量刷新。
+            //  ② 不再依赖父订单状态是否变化 —— 聚合口径（failed > printing > queued > sent）
+            //     下"某个文件变了、父状态没变"是可能的（如 已sent + queued ⇒ 父仍 queued），
+            //     旧写法会让那一行的状态一直不更新。
+            if (n.files && o.files) {
+              const newIds = n.files
+                .map(f => (f && f.file_id != null) ? String(f.file_id) : '').join(',')
+              const oldIds = o.files
+                .map(f => (f && f.file_id != null) ? String(f.file_id) : '').join(',')
+              if (newIds !== oldIds) {
+                changed = true        // 子文件集合变了 → 全量刷新，别让旧行留着
+                break
               }
+              const oldById = {}
+              o.files.forEach(f => { if (f && f.file_id != null) oldById[f.file_id] = f })
+              n.files.forEach((nf, j) => {
+                const prev = (nf && nf.file_id != null) ? oldById[nf.file_id] : null
+                if (prev && nf.status !== prev.status) {
+                  updates['orders[' + i + '].files[' + j + '].status'] = nf.status
+                }
+              })
             }
             // 开始打印时间随轮询增量更新：订单开始打印后无需切换 tab 即显示
             if ((n.print_started_at || '') !== (o.print_started_at || '')) {
