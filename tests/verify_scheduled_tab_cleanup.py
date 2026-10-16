@@ -216,6 +216,103 @@ for caller, marker in (("删除单个标签页", 'self._remove_tabs([key], reaso
                        ("删除已完成订单", 'self._remove_tabs(frozen_keys, reason="删除已完成订单")')):
     check(f"{caller} 路径已改为走 _remove_tabs", marker in src, marker)
 
+# ══════════════════════════════════════════════════════════════════════════
+print("\n=== 8. 🟡-D5(12) 云端撤单必须清掉「本机还会打它」的四处状态 ===")
+# 缺陷：撤单只弹一句"建议删除对应标签页"，标签页任务/补打队列/纸叠排队都还留着 ⇒
+# 手动双面挂起的单子等人工点「开始打印」、补打队列与纸叠打完自动放行，都会把**已取消订单**
+# 打出来（白费纸、顾客那边是"已取消"，收不到钱；预约单那一路当时已单独修过）。
+win4 = new_win()
+win4._config.tabs = {}
+put_order_tab(win4, "1", 301)                      # 被取消的订单独占一页（挂起等人工点开始打印）
+put_order_tab(win4, "2", 302)                      # 无关订单，必须原样保留
+_tab3 = put_order_tab(win4, "3", 303)              # 同一页里混着两单
+_tab3.jobs.append(gui.PrintJob(file_path=os.path.join(_SANDBOX, "3011.pdf"),
+                               order_id=301, task_id=3011, page_count=1))
+_tab3.manual_duplex_pending = True                 # 该页被标 ⏸（挂起等人翻纸）
+win4._current_tab = "1"
+win4._config.active_tab = "1"
+win4._auto_print_retry = [{"order_id": 301, "tab_key": "1", "task_ids": [301]},
+                          {"order_id": 302, "tab_key": "2", "task_ids": [302]}]
+win4._stack_wait = [{"jobs": [gui.PrintJob(file_path=os.path.join(_SANDBOX, "301.pdf"),
+                                           order_id=301, task_id=301, page_count=1),
+                              gui.PrintJob(file_path=os.path.join(_SANDBOX, "302.pdf"),
+                                           order_id=302, task_id=302, page_count=1)],
+                     "tab_key": "1", "reason": "出纸槽独占"}]
+win4._scheduled_orders = {301: make_st("1"), 302: make_st("2")}
+
+
+def _purge(win, order_id, task_ids):
+    """调用待验方法；改前版本没有它 → 返回 None（让断言变红，而不是 AttributeError 崩在中间）。"""
+    fn = getattr(win, "_purge_canceled_print_state", None)
+    return fn(order_id, task_ids) if fn else None
+
+
+purged = _purge(win4, 301, [301])
+_left = sorted(j.order_id for tab in win4._config.tabs.values() for j in tab.jobs)
+check("★ 被取消订单的任务全部消失（挂起单不会再被「开始打印」打出来）",
+      301 not in _left, str(_left))
+check("★ 其它订单的任务原样保留（按订单粒度剔除，不整页丢）",
+      _left == [302, 303] and len(win4._config.tabs) == 2, f"{_left} / {sorted(win4._config.tabs)}")
+check("★ 补打队列里不再有被取消订单（本方法或 _remove_tabs 清掉都算）",
+      [it["order_id"] for it in win4._auto_print_retry] == [302],
+      str([it["order_id"] for it in win4._auto_print_retry]))
+check("★ 纸叠排队里剔除了被取消订单的文件",
+      [j.order_id for req in win4._stack_wait for j in req["jobs"]] == [302],
+      str([[j.order_id for j in req["jobs"]] for req in win4._stack_wait]))
+check("预约单状态机里的该订单被清掉、别的预约单不受影响",
+      301 not in win4._scheduled_orders and 302 in win4._scheduled_orders,
+      str(sorted(win4._scheduled_orders)))
+check("清理计数如实返回（jobs/tabs/wait 由本方法清；retry/scheduled 已由 _remove_tabs 顺带清）",
+      purged is not None and purged["jobs"] == 2 and purged["tabs"] == 1
+      and purged["wait"] == 1, str(purged))
+check("混排页里仍有未打印任务（303）⇒ ⏸ 保留（剩下那单仍要人工点开始打印）",
+      any(getattr(t, "manual_duplex_pending", False) for t in win4._config.tabs.values()))
+
+# 8b：被取消订单**没有**独占标签页时（_remove_tabs 不介入），本方法必须自己清队列与预约
+win4b = new_win()
+win4b._config.tabs = {}
+put_order_tab(win4b, "1", 501)
+win4b._config.tabs["1"].jobs.append(
+    gui.PrintJob(file_path=os.path.join(_SANDBOX, "502.pdf"),
+                 order_id=502, task_id=502, page_count=1))
+win4b._current_tab = "1"
+win4b._config.active_tab = "1"
+win4b._auto_print_retry = [{"order_id": 501, "tab_key": "1", "task_ids": [501]},
+                           {"order_id": 502, "tab_key": "1", "task_ids": [502]}]
+win4b._scheduled_orders = {501: make_st("1"), 502: make_st("1")}
+_p4b = _purge(win4b, 501, [501])
+check("★ 标签页未被清空时，补打队列里只丢被取消订单那条",
+      [it["order_id"] for it in win4b._auto_print_retry] == [502],
+      str([it["order_id"] for it in win4b._auto_print_retry]))
+check("★ 同一页里别的订单的补打队列项不受影响",
+      win4b._auto_print_retry[0]["tab_key"] == "1")
+check("★ 预约单状态机里只清被取消那单，计数为 1",
+      _p4b is not None and _p4b["scheduled"] == 1 and 501 not in win4b._scheduled_orders
+      and 502 in win4b._scheduled_orders, f"{_p4b} / {sorted(win4b._scheduled_orders)}")
+
+# 8c：已打出去（sent）的任务不删 —— 删不删都不会再出纸，留着才是对账依据
+win5 = new_win()
+win5._config.tabs = {}
+put_order_tab(win5, "1", 401, sent=True)
+win5._current_tab = "1"
+win5._config.active_tab = "1"
+_p5 = _purge(win5, 401, [401])
+check("已 sent 的任务保留（不删已打出的记录）",
+      _p5 is not None and _p5["jobs"] == 0 and len(win5._config.tabs["1"].jobs) == 1, str(_p5))
+
+# 接线判据（语义，不 grep 文案）：_on_cloud_order_canceled 必须真的调用清理
+_gui_src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+_body = _gui_src.split("def _on_cloud_order_canceled(self, order_id: int, task_ids: list):", 1)[1] \
+    .split("\n    def _on_cloud_order_accepted", 1)[0]
+_body_nc = "\n".join(ln[:ln.find("#")] if ln.find("#") >= 0 else ln for ln in _body.split("\n"))
+check("★ _on_cloud_order_canceled 内真的调用了 _purge_canceled_print_state",
+      "_purge_canceled_print_state(" in _body_nc)
+check("撤单不再用「建议删除对应标签页」把责任推给用户",
+      "建议删除对应标签页" not in _body_nc)
+check("D 对拍：抽掉清理调用后该判据必红",
+      "_purge_canceled_print_state(" not in _body_nc.replace(
+          "self._purge_canceled_print_state(", "ZZ_NO_PURGE("))
+
 # 收尾前打桩：closeEvent 在"标签页里仍有未打印文件"时会弹确认框 —— offscreen 平台没有
 # 交互对象，`QMessageBox.question` 会**永久阻塞**（测试挂死）。统一回答 Yes。
 from PySide6.QtWidgets import QMessageBox as _QMB  # noqa: E402
@@ -224,7 +321,7 @@ _QMB.question = staticmethod(lambda *a, **kw: _QMB.Yes)
 _QMB.information = staticmethod(lambda *a, **kw: _QMB.Ok)
 _QMB.warning = staticmethod(lambda *a, **kw: _QMB.Ok)
 
-for w in (win, win2, win3):
+for w in (win, win2, win3, win4, win5):
     # closeEvent 还会调 _refresh_engine_availability → converter.get_available_engines()
     # 做 COM 引擎探测（本机抛 0x800706be），与本脚本无关，一并桩掉。
     w._refresh_engine_availability = lambda *a, **kw: None
