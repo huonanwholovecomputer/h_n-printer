@@ -51,14 +51,9 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 # 以免长期掩盖真回归。`--strict` 下仍按失败计。
 # 2026-10-16：APK 已重打为 1.1.32（versionCode 33）并通过 verify_apk_release.py ⇒
 # 原先 verify_apk_release.py 那条过渡项**已删除**（留着会长期掩盖真回归）。
-# 2026-10-16（D5 批次）：又改了 `www/updater.js`（更新锁三路解锁）⇒ APK 内资源与 www/ 再次不一致，
-# 这是守卫**正确工作**的过渡态。解除条件：重打 APK（versionCode 34 / 1.1.33）+ cap sync 后删掉本条。
-EXPECTED_RED: dict[str, str] = {
-    "verify_apk_release.py":
-        "www/updater.js 已改（D5 第 12 条：更新锁三路解锁），APK 尚未重新打包 ⇒ "
-        "「APK 内 web 资源与 www/ 逐字节一致」必然失败。"
-        "解除条件：重打 APK（cap sync + assembleRelease，versionCode 34）后删除本条。",
-}
+# 2026-10-16（D5 批次）：又改了 www/updater.js（更新锁三路解锁）+ app.js/print.js（请求超时）
+# ⇒ 再次登记过渡项；**同日已重打 1.1.33（versionCode 34）并发布**，该项随即删除（守卫已转绿）。
+EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}
