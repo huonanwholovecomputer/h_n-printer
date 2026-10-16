@@ -2634,7 +2634,7 @@ class MainWindow(QMainWindow):
                 self._config.tabs = kept_tabs if kept_tabs else {"1": self._make_new_tab()}
                 if self._config.active_tab not in self._config.tabs:
                     self._config.active_tab = next(iter(self._config.tabs))
-                self._config.save(config_path)
+                self._save_config(sync_ui=False)
                 self._file_logger.info("启动清理：已移除 %d 个已完成订单标签页", removed_count)
 
         # ── 启动迁移：旧版遗留在 %TEMP% 的云端任务文件 → 暂存目录 ──
@@ -3118,7 +3118,7 @@ class MainWindow(QMainWindow):
 
             # 立刻写入磁盘，防止程序崩溃丢失
             try:
-                self._config.save(self._config_path)
+                self._save_config(sync_ui=False)
             except Exception as e:
                 logger.warning(f"保存云端配置失败: {e}")
 
@@ -3130,7 +3130,7 @@ class MainWindow(QMainWindow):
                         # 用户取消关闭：恢复旧开关状态（配置已写盘，这里改回内存+写盘）
                         self._config.cloud_enabled = True
                         try:
-                            self._config.save(self._config_path)
+                            self._save_config(sync_ui=False)
                         except Exception:
                             pass
                         self._log("❌ 已取消关闭云端")
@@ -3182,7 +3182,7 @@ class MainWindow(QMainWindow):
             if self._config.cloud_take_orders != new_take:
                 self._config.cloud_take_orders = new_take
                 try:
-                    self._config.save(self._config_path)
+                    self._save_config(sync_ui=False)
                 except Exception as e:
                     logger.warning(f"保存接单配置失败: {e}")
             # 同步 stats_server（收支清算页代理）：若已启动，配置可能仍旧占位地址，
@@ -3271,7 +3271,7 @@ class MainWindow(QMainWindow):
             for job in tab.jobs:
                 job.order_number = ""
         try:
-            self._config.save(self._config_path)
+            self._save_config(sync_ui=False)
         except Exception as e:
             logger.warning(f"保存配置失败: {e}")
         # 3. 本地订单库（已尽力冲刷；残留记录随清空移除）
@@ -4399,6 +4399,11 @@ class MainWindow(QMainWindow):
         会读 `QComboBox.currentData()` 等 QWidget —— 从非 GUI 线程调用 QWidget
         方法属未定义行为（间歇性崩溃源），且与主线程并发写配置文件存在竞态。
         后台线程请传 sync_ui=False（纯 config 落盘），仅主线程可读控件。
+
+        D5 第 14 条：本方法（含 `_config_save_lock`）是**唯一的落盘入口** ——
+        GUI 各处不要再直接写 `self._config.save(...)`：那会绕开锁，与后台线程
+        （价格同步/成员同步/本地订单上传）并发写同一个 JSON，可能写出半截文件
+        （历史上真有 10 处直调；已全部收敛到这里，sync_ui=False 表示纯落盘、不读控件）。
         """
         try:
             if sync_ui is None:
@@ -6644,7 +6649,7 @@ class MainWindow(QMainWindow):
                     adopted += 1
         if adopted:
             try:
-                self._config.save(self._config_path)
+                self._save_config(sync_ui=False)
             except Exception as e:
                 logger.warning(f"接管旧版云端临时文件后保存配置失败: {e}")
             self._file_logger.info("已接管 %d 个旧版云端临时文件到暂存目录", adopted)
@@ -7668,7 +7673,7 @@ class MainWindow(QMainWindow):
             j.order_number = order_number
 
         try:
-            self._config.save(self._config_path)
+            self._save_config(sync_ui=False)
         except Exception as e:
             logger.warning(f"保存配置失败: {e}")
 
@@ -8881,6 +8886,84 @@ class MainWindow(QMainWindow):
             if st.get("tab_key") == tab_key:
                 self._cleanup_scheduled_order(oid, reason=reason)
 
+    def _purge_canceled_print_state(self, order_id: int, task_ids) -> dict:
+        """撤单时把本机**还会把这一单打出来**的状态全部清掉（D5 第 12 条）。
+
+        为什么必须"真清"而不只是弹窗提示：订单被顾客取消后，本机有四个入口还记得它 ——
+        ① 标签页里的 job（手动双面挂起的单子正等着人工点「开始打印」）；② `_auto_print_retry`
+        补打队列（打印机忙时暂存、之后自动补打）；③ `_stack_wait` 攒批排队（纸叠打完自动放行）；
+        ④ 预约单状态机（到点自触发）。旧实现只弹一句"建议删除对应标签页" —— 只要操作员在
+        挂起状态点一次「开始打印」，或队列/预约自动放行，就会把**已经取消的订单**打出来：
+        白费纸，顾客那边还是"已取消"，收不到钱。
+
+        清理粒度：只剔除属于该订单/这些 task_id 的项，**不整页丢弃** —— 同一个标签页里可能
+        还混着别的订单（补打队列/纸叠排队同理，所以队列项按 task_ids 过滤而不是按 tab_key）。
+        返回各处的清理计数，供调用方给出"已清理什么"的事实文案。
+        """
+        tids = {t for t in (task_ids or []) if t}
+        removed = {"jobs": 0, "tabs": 0, "retry": 0, "wait": 0, "scheduled": 0}
+
+        def _task_hit(job) -> bool:
+            """这条 job 是否属于被取消的订单（按 task_id 优先，其次 order_id）。"""
+            jt = getattr(job, "task_id", 0) or 0
+            if jt and jt in tids:
+                return True
+            return bool(order_id) and (getattr(job, "order_id", 0) or 0) == order_id
+
+        # ① 标签页任务：只删未完成（未 sent）的；已打出去的留着（删不删都不会再出纸）
+        empty_tabs = []
+        for key, tab in list(self._config.tabs.items()):
+            keep = [j for j in tab.jobs if getattr(j, "sent", False) or not _task_hit(j)]
+            if len(keep) != len(tab.jobs):
+                removed["jobs"] += len(tab.jobs) - len(keep)
+                tab.jobs = keep
+                if not any(not getattr(j, "sent", False) for j in tab.jobs):
+                    # 该页已无待打印内容 ⇒ 撤掉"挂起等人翻纸"的 ⏸（否则标记永远挂着）
+                    tab.manual_duplex_pending = False
+                if not tab.jobs:
+                    empty_tabs.append(key)
+        if empty_tabs:
+            removed["tabs"] = len(empty_tabs)
+            self._remove_tabs(empty_tabs, reason="云端订单已取消")
+
+        # ② 补打队列（按订单/任务过滤；整页丢会把同页别的订单一起废掉）
+        before = len(self._auto_print_retry)
+        self._auto_print_retry[:] = [
+            it for it in self._auto_print_retry
+            if not ((order_id and it.get("order_id") == order_id)
+                    or (tids & set(it.get("task_ids") or ())))
+        ]
+        removed["retry"] = before - len(self._auto_print_retry)
+
+        # ③ 纸叠排队（等纸叠打完再放行的请求；同一个请求里可能混着别的订单的文件）
+        new_wait = []
+        for req in self._stack_wait:
+            jobs = list(req.get("jobs") or [])
+            keep = [j for j in jobs if not _task_hit(j)]
+            removed["wait"] += len(jobs) - len(keep)
+            if keep:
+                req["jobs"] = keep
+                new_wait.append(req)
+        self._stack_wait[:] = new_wait
+
+        # ④ 预约单状态机（到点会自触发；调用方可能已清过，这里兜底）
+        if order_id and self._scheduled_orders.pop(order_id, None) is not None:
+            removed["scheduled"] = 1
+
+        if any(removed.values()):
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+            if removed["wait"]:
+                self._sync_stack_button()
+            # 撤单后这些任务不再被引用 → 暂存副本按引用回收（避免越堆越多）
+            self._sweep_staged_files("云端订单已取消")
+            self._log(f"🧹 已清理订单 #{order_id} 的待打印状态：标签页任务 {removed['jobs']} 个"
+                      f" / 空标签页 {removed['tabs']} 个 / 补打队列 {removed['retry']} 条"
+                      f" / 纸叠排队 {removed['wait']} 个 / 预约单 {removed['scheduled']} 个")
+        return removed
+
     def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
         """云端订单被用户取消 → 通知任务列表窗口更新状态，若正在打印则立即取消。"""
         self._log(f"☁ 订单 #{order_id} 已被用户取消")
@@ -8902,18 +8985,26 @@ class MainWindow(QMainWindow):
             self._log(f"☁ 订单 #{order_id} 正在打印，已自动取消")
             self._worker.cancel()
 
-        # 如果已添加到标签页中，弹出提示（多任务合并为一次，避免弹窗堆叠）
-        cancel_hits = []
-        for key, tab in list(self._config.tabs.items()):
-            for job in tab.jobs:
-                if job.task_id in task_ids:
-                    cancel_hits.append(f"标签页 {key}：「{job.display_name or os.path.basename(job.file_path)}」")
-        if cancel_hits:
-            shown = cancel_hits[:5]
-            more = f"\n...等共 {len(cancel_hits)} 个任务" if len(cancel_hits) > 5 else ""
+        # D5 第 12 条：**真的清掉**还会把它打出来的状态（标签页任务 / 补打队列 / 纸叠排队 /
+        # 预约单），而不是只弹一句"建议删除对应标签页" —— 手动双面挂起的订单要靠人工点
+        # 「开始打印」，补打队列与纸叠排队也会自动放行，留着任务就会把已取消订单打出来。
+        purged = self._purge_canceled_print_state(order_id, task_ids)
+        if any(purged.values()):
+            detail = []
+            if purged["jobs"]:
+                detail.append(f"标签页任务 {purged['jobs']} 个")
+            if purged["tabs"]:
+                detail.append(f"空标签页 {purged['tabs']} 个")
+            if purged["retry"]:
+                detail.append(f"补打队列 {purged['retry']} 条")
+            if purged["wait"]:
+                detail.append(f"纸叠排队 {purged['wait']} 个文件")
+            if purged["scheduled"]:
+                detail.append(f"预约单 {purged['scheduled']} 个")
             QMessageBox.information(
                 self, "任务已取消",
-                "以下任务已被用户取消：\n" + "\n".join(shown) + more + "\n建议删除对应标签页。",
+                f"订单 #{order_id} 已被用户取消，本机待打印的该订单任务已自动清理："
+                + "、".join(detail) + "\n（不会再被打出来）",
             )
 
     def _on_cloud_order_accepted(self, tasks: list):
@@ -8983,7 +9074,7 @@ class MainWindow(QMainWindow):
         if owner and owner != (getattr(self._config, "cloud_owner_name", "") or "").strip():
             self._config.cloud_owner_name = owner
             try:
-                self._config.save(self._config_path)
+                self._save_config(sync_ui=False)
             except Exception:
                 pass
         if state.get("take_orders_rejected"):
@@ -8991,7 +9082,7 @@ class MainWindow(QMainWindow):
             self._log(f"☁ 接单续期失败：{msg}")
             self._config.cloud_take_orders = False
             try:
-                self._config.save(self._config_path)
+                self._save_config(sync_ui=False)
             except Exception:
                 pass
             if self._cloud_client:
@@ -9241,7 +9332,7 @@ class MainWindow(QMainWindow):
             self._cleanup_empty_tabs()
             self._renumber_tabs()
             self._sync_ui_to_config()
-            self._config.save(self._config_path)
+            self._save_config(sync_ui=False)
             self._log(f"配置已自动保存至: {self._config_path}")
         except Exception as e:
             logger.warning(f"自动保存配置失败: {e}")
