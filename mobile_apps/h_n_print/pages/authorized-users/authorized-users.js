@@ -3,6 +3,9 @@
 // 展示所有被本管理员授权过的用户（管理员+临时用户，含已移除/已过期），
 // 卡片含密钥类型与当前状态，可展开查看该用户的全部密钥记录（多次授权）。
 const { CONFIG } = require('../../utils/config')
+// D5 第 7 条：本页原先直接 wx.request（两处），**绕过了 utils/request 的 401 自动重登录重放**
+// ⇒ token 7 天过期后这一页永远打不开（401 既不续登也不引导），而同项目别的页都正常。
+const { request } = require('../../utils/request')
 
 Component({
   data: {
@@ -151,7 +154,7 @@ Component({
       }
       this._hasLoaded = true
       this.setData({ loading: true, loadError: '' })
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/authorized_users',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
@@ -248,7 +251,7 @@ Component({
       const token = wx.getStorageSync('token')
       if (!token) return
       this.setData({ ['keyOrders.' + key + '.loading']: true })
-      wx.request({
+      request({
         url: CONFIG.BASE_URL + '/api/orders?openid=' + encodeURIComponent(openid) + '&per_page=50',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },

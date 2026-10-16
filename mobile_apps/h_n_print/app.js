@@ -1,5 +1,6 @@
 // app.js
 const { CONFIG } = require('./utils/config')
+const { request } = require('./utils/request')   // D5 第 7 条：统一请求封装（401 自动续登重放）
 
 App({
   onLaunch() {
@@ -123,11 +124,12 @@ App({
     } catch (e) { /* 兼容 */ }
   },
 
-  // 保存主题到后端
+  // 保存主题到后端（D5 第 7 条：走 utils/request —— 401 时自动续登重放；
+  // 该封装无 toast/跳转副作用，失败只走这里的空 fail，不改变原有静默行为）
   _saveThemeToServer(themeMode) {
     const token = wx.getStorageSync('token')
     if (!token) return
-    wx.request({
+    request({
       url: CONFIG.BASE_URL + '/api/me/theme',
       method: 'PUT',
       header: {
