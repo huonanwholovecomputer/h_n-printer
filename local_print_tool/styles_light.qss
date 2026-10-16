@@ -272,6 +272,9 @@ QComboBox:disabled {
 }
 
 /* ---------- 复选框 ---------- */
+/* 这里只画方框**底色**：勾选态的对号由 gui.ThemedCheckBox.paintEvent 绘制。
+   新建复选框必须用 ThemedCheckBox，用原生 QCheckBox 勾选后只剩一块实心方块。
+   （验收：tests/verify_checkbox_tick_style.py） */
 QCheckBox {
     background: transparent;
     color: #4c4f69;

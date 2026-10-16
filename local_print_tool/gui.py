@@ -5330,7 +5330,10 @@ class MainWindow(QMainWindow):
         # 只对「无自动双面器、需人工翻纸」的机型有意义（HP LaserJet 1020 等）：
         # 开启后需手动双面的打印请求不再各自翻一次纸，第 1 趟连续打进同一叠，
         # 人工点一次「开始第 2 趟」把整叠打完。攒批期间其余打印请求一律排队。
-        self._chk_stack_mode = QCheckBox("🖐 攒批模式")
+        # 复选框一律用 ThemedCheckBox：QSS 只画方框底色，勾选态的「✓」由
+        # ThemedCheckBox.paintEvent 自己绘制。用原生 QCheckBox 会只剩一块**实心方块**
+        # （没有对号），与「管理员自行打印/启用云端功能/启用接单」的观感不一致。
+        self._chk_stack_mode = ThemedCheckBox("🖐 攒批模式", theme_manager=self._theme_manager)
         self._chk_stack_mode.setToolTip(
             "多任务合并翻纸：把连续多个打印任务的第 1 趟先堆进出纸槽，"
             "最后统一翻一次纸打完整个纸叠。\n"
