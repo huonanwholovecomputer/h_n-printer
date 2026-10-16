@@ -110,6 +110,12 @@ QPushButton#detailToggleBtn {
     font-size: 10px;
 }
 
+/* 底部按钮栏的短竖分隔线（攒批开关 ↔ 开始打印，纯装饰，见 gui._setup_button_bar） */
+QFrame#vSepBottomBar {
+    background-color: #bcc0cc;
+    border: none;
+}
+
 /* ---------- 表格 ---------- */
 QTableWidget {
     background-color: #e6e9ef;

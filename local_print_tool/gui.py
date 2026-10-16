@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
     QWidget,
+    QFrame,
     QVBoxLayout,
     QHBoxLayout,
     QSplitter,
@@ -5348,6 +5349,20 @@ class MainWindow(QMainWindow):
         self._btn_stack.clicked.connect(self._on_stack_button)
         self._btn_stack.setVisible(False)
         layout.addWidget(self._btn_stack)
+
+        # 视觉分隔：左边是「设置类」控件（攒批开关 / 纸叠入口），右边是页面唯一的主操作
+        # 「开始打印」。两者紧挨着容易被读成同一组，故插一道短竖线做分组。
+        # 颜色与粗细由 QSS（styles_dark/light.qss 的 QFrame#vSepBottomBar）给，
+        # 不用 QFrame 自带的 VLine 形状 —— 它按调色板画线，深色主题下几乎看不见。
+        # 纯装饰：不参与业务、无信号、不随攒批状态显隐（始终分隔左右两组）。
+        layout.addSpacing(12)
+        self._btnbar_sep = QFrame()
+        self._btnbar_sep.setObjectName("vSepBottomBar")
+        self._btnbar_sep.setFrameShape(QFrame.NoFrame)
+        self._btnbar_sep.setFixedSize(1, 22)
+        self._btnbar_sep.setAttribute(Qt.WA_StyledBackground, True)
+        layout.addWidget(self._btnbar_sep)
+        layout.addSpacing(12)
 
         self._btn_start = QPushButton("▶ 开始打印")
         self._btn_start.setObjectName("btnStartPrint")
