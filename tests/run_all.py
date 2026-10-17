@@ -82,13 +82,10 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   verify_apk_published.py（线上清单/大小/md5 全部一致）⇒ 该项已删除**。
 # 2026-10-17（移动端「我」页内容布局重排）：改了 www/index.html（个人区前置：身份卡 → 许可 →
 #   我的打印任务 → 账号绑定/检查更新 → 管理区；见 tests/verify_me_layout_order.py 与
-#   tests/verify_me_layout_render.mjs）⇒ APK 内 web 资源与 www/ 暂时不一致 ⇒ 登记过渡项；
-#   **解除条件：重打 APK（versionName/versionCode 同步递增）并通过 verify_apk_release.py +
-#   verify_apk_published.py 后删除本条**。
-EXPECTED_RED: dict[str, str] = {
-    "verify_apk_release.py": "www/index.html 已改（「我」页布局重排），APK 待重打 —— "
-                             "重打并发布后删除本条（判据见 tests/verify_me_layout_order.py ②）",
-}
+#   tests/verify_me_layout_render.mjs）⇒ 登记过渡项；**同日已重打 1.1.40（versionCode 41）并通过
+#   verify_apk_release.py + verify_apk_version_manifest.py + verify_apk_published.py
+#   （线上清单/大小/md5 全部一致）⇒ 该项已删除**。
+EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}
