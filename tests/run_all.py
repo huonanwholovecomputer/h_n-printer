@@ -46,6 +46,8 @@ ENV_REQUIRED: dict[str, str] = {
                                       "dependencies/node/node_modules/playwright；--all 或直接 node 可跑）",
     "verify_order_table_columns.mjs": "需 Playwright / 真实浏览器（订单明细列宽只能靠真实布局量；"
                                       "同上，--all 或直接 node 可跑）",
+    "verify_toast_above_tabbar.mjs": "需 Playwright / 真实浏览器（气泡与悬浮 tabBar 的真实几何只能靠"
+                                     "真实布局量：注入 0/19/34/48px 安全区量矩形；--all 或直接 node 可跑）",
 }
 
 # 非验收脚本（工具/选型/测量），不参与 PASS 计数
@@ -71,6 +73,10 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   pages/index/index.js 同源改动不参与 APK 校验）⇒ 登记过渡项；**2026-10-17 已重打
 #   1.1.38（versionCode 39）并通过 verify_apk_release.py + verify_apk_published.py
 #   （线上清单/大小/md5 全部一致）⇒ 该项已删除**。
+# 2026-10-17（通知气泡被悬浮 tabBar 盖住）：改了 www/styles.css#toast（底距补上
+#   --safe-bottom，见 tests/verify_toast_above_tabbar.mjs）⇒ 登记过渡项；
+#   **同日已重打 1.1.39（versionCode 40）并通过 verify_apk_release.py +
+#   verify_apk_published.py（线上清单/大小/md5 全部一致）⇒ 该项已删除**。
 EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
