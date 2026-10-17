@@ -38,6 +38,24 @@ def config_path() -> str:
     return os.path.join(get_app_data_dir(), "print_config.json")
 
 
+# 打印机档案独立存储的固定文件名（与 printer_config.PRINTER_PROFILES_FILENAME 必须一致；
+# tests/verify_printer_profile_store.py ⑤ 钉住这一点，防止两处口径漂移）。
+PRINTER_PROFILES_FILENAME = "printer_profiles.json"
+
+
+def printer_profiles_path() -> str:
+    """打印机档案（双面能力 / 手动双面实测参数）的独立存储文件。
+
+    为什么独立成文件：printer_profiles 是**机器能力事实**（哪台打印队列支持自动双面、
+    手动双面的页序参数），2026-10 现场事故中它被某次 print_config.json 的整体落盘
+    静默清空（详见 printer_config.py 顶部说明）。正式运行时 PrinterConfig 按
+    「调用方传入的 config 路径同目录 + 固定文件名」推导同一位置，**不直接调用本函数**
+    —— 否则测试/沙箱传临时路径时会漏进真实 %APPDATA%（tests 的隔离就失效了）。
+    本函数供诊断脚本 / 工具显式定位用。
+    """
+    return os.path.join(get_app_data_dir(), PRINTER_PROFILES_FILENAME)
+
+
 def theme_settings_path() -> str:
     return os.path.join(get_app_data_dir(), "theme_settings.json")
 

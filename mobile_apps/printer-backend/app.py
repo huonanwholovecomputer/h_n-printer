@@ -2933,14 +2933,7 @@ def on_connect(auth=None):
     # 已取消/打回/完成的订单文件不再分析；page_count_verified=1 后自然不再命中。
     try:
         conn = get_db()
-        pending = conn.execute(
-            "SELECT DISTINCT f.id, f.original_name FROM files f"
-            " LEFT JOIN order_files of ON f.id = of.file_id"
-            " WHERE f.page_count = 0 AND f.page_count_verified = 0"
-            " AND f.path != ''"
-            " AND (of.id IS NULL OR of.status IN ('queued', 'printing', 'accepted'))"
-            " LIMIT 20"
-        ).fetchall()
+        pending = _pending_page_analysis_rows(conn)
         conn.close()
         pushed = 0
         for row in pending:
@@ -3724,7 +3717,14 @@ def _recalc_prices_for_file(file_id, page_count):
                 urgency_fee = float(o["urgency_price"] or 0)
                 cover_fee = round(float(o["cover_page_price"] or 0) * o["cover_page"], 2) if o["cover_page"] else 0
                 parent_total = round(float(sub_sum) + urgency_fee + cover_fee + delivery_fee, 2)
-                conn.execute("UPDATE orders SET total_price = ? WHERE id = ?", (parent_total, oid))
+                # 2026-10-17：父订单页数一起刷新 —— 否则「我的」订单详情会出现
+                # 「合计页数 1 页 / 金额却是 7 页的价」这种自相矛盾的展示。
+                _pc = conn.execute(
+                    "SELECT COALESCE(SUM(page_count * copies), 0) FROM order_files WHERE order_id = ?",
+                    (oid,),
+                ).fetchone()[0]
+                conn.execute("UPDATE orders SET total_price = ?, page_count = ? WHERE id = ?",
+                             (parent_total, int(_pc or 0), oid))
             refresh_order_status(conn, oid)
         conn.commit()
         print(f"  [PRICE] 已回溯重算 {len(rows)} 个子任务的价格（页数修正为 {page_count} 页）")
@@ -3792,7 +3792,12 @@ def _sync_subtask_config(task_id, copies, duplex, page_range, page_count):
                 urgency_fee = float(o["urgency_price"] or 0)
                 cover_fee = round(float(o["cover_page_price"] or 0) * o["cover_page"], 2) if o["cover_page"] else 0
                 parent_total = round(float(sub_sum) + urgency_fee + cover_fee + delivery_fee, 2)
-                conn.execute("UPDATE orders SET total_price = ? WHERE id = ?", (parent_total, oid))
+                _pc = conn.execute(
+                    "SELECT COALESCE(SUM(page_count * copies), 0) FROM order_files WHERE order_id = ?",
+                    (oid,),
+                ).fetchone()[0]
+                conn.execute("UPDATE orders SET total_price = ?, page_count = ? WHERE id = ?",
+                             (parent_total, int(_pc or 0), oid))
             refresh_order_status(conn, oid)
         conn.commit()
         print(f"  [SYNC] 子任务 #{task_id} 实际打印配置已同步后端")
@@ -4053,6 +4058,32 @@ def _resolve_analysis_client(prefer_client: str, file_id: str) -> tuple:
         if cid in online:
             return cid, "任一在线接单设备"
     return "", "无在线接单设备"
+
+
+def _pending_page_analysis_rows(conn, limit: int = 20):
+    """「还需要本地打印工具分析页数」的文件行（接单设备上线补推的判据；/api/file_page 同源）。
+
+    2026-10-17 修复：判据原先是写死的 `f.page_count = 0`，而 submit_order 过去会把
+    「页数未知」的 Word 按 1 页兜底值**写回 files.page_count** —— 顾客一旦在分析完成
+    前提交，这个文件就再也不满足 page_count = 0，从此不会被送去分析：verified 永远 0、
+    价格永久停在 1 页（少收），前端「复制价格」永久被拦。
+
+    现在按「是否已被本地工具验证过」判断：
+      · page_count = 0                 —— 还没数过（Word 等需转换的类型）；
+      · 或 doc/docx 且 verified = 0     —— 存量被兜底值冻结的 Word 行（自愈）。
+    PDF / 图片 / 文本类在上传时服务端直接数页，verified = 0 只表示「没经过本地工具」，
+    不需要也不该再推一次分析（否则每次上线都白下载转换一遍）。
+    """
+    return conn.execute(
+        "SELECT DISTINCT f.id, f.original_name FROM files f"
+        " LEFT JOIN order_files of ON f.id = of.file_id"
+        " WHERE f.page_count_verified = 0 AND f.path != ''"
+        " AND (f.page_count = 0 OR lower(f.original_name) LIKE '%.doc'"
+        "      OR lower(f.original_name) LIKE '%.docx')"
+        " AND (of.id IS NULL OR of.status IN ('queued', 'printing', 'accepted'))"
+        " LIMIT ?",
+        (int(limit),),
+    ).fetchall()
 
 
 def request_page_analysis(file_id: str, file_name: str, prefer_client: str = "") -> bool:
@@ -4334,15 +4365,18 @@ def get_file_page(file_id):
     if not row:
         return jsonify({"success": False, "message": "文件不存在"}), 404
     printer_online = is_printer_available()  # 2026-11：接单设备在线才算打印机可用
-    if (printer_online and not row["page_count_verified"] and (row["page_count"] or 0) <= 0):
-        fname = row["original_name"] or ""
-        ext = os.path.splitext(fname)[1].lower()
-        if ext in (".doc", ".docx"):
-            # 前端把当前选中的接单设备带上来 → 优先由它分析（用户选了哪台就哪台下载/转换）；
-            # 目标设备离线时 _resolve_analysis_client 会退回订单目标/任一在线接单设备
-            prefer_client = (request.args.get("target_client_id", "") or "").strip()[:64]
-            # 统一防抖在 request_page_analysis 内部：30s 内已被补推/轮询推过则跳过
-            request_page_analysis(file_id, fname, prefer_client=prefer_client)
+    fname = row["original_name"] or ""
+    ext = os.path.splitext(fname)[1].lower()
+    # 2026-10-17：判据与 on_connect 的补推同源（_pending_page_analysis_rows）——
+    # doc/docx 只要 page_count_verified=0 就补推，哪怕 files.page_count 被历史兜底值写成 1
+    # （否则「页数未知时提交」的 Word 会被永久冻结在 1 页）。
+    if (printer_online and not row["page_count_verified"]
+            and ((row["page_count"] or 0) <= 0 or ext in (".doc", ".docx"))):
+        # 前端把当前选中的接单设备带上来 → 优先由它分析（用户选了哪台就哪台下载/转换）；
+        # 目标设备离线时 _resolve_analysis_client 会退回订单目标/任一在线接单设备
+        prefer_client = (request.args.get("target_client_id", "") or "").strip()[:64]
+        # 统一防抖在 request_page_analysis 内部：30s 内已被补推/轮询推过则跳过
+        request_page_analysis(file_id, fname, prefer_client=prefer_client)
     # v4.4：PDF 等后端可直接数页的类型，若历史/异常导致页数缺失，轮询时服务端补数——
     # 不依赖本地打印工具（本地工具离线也不影响这类文件确认页数）
     # P1: sqlite3.Row 既没有 .get()（AttributeError），也不支持字段赋值（TypeError）——
@@ -5270,14 +5304,24 @@ def submit_order():
                         page_count = cached
                         page_count_verified = bool(frow["page_count_verified"])
                     elif frow["path"] and os.path.exists(frow["path"]):
-                        # 缓存未命中，重新计算（PDF可当场获取，doc/docx返回0）
+                        # 缓存未命中，重新计算（PDF 可当场获取；doc/docx 返回 0 = 等本地工具）
                         ext = os.path.splitext(frow["path"])[1].lower().lstrip(".")
-                        page_count = get_file_page_count(frow["path"], ext) or 1
-                        page_count_verified = ext not in ("doc", "docx")
-                        conn.execute(
-                            "UPDATE files SET page_count = ?, page_count_verified = ? WHERE id = ?",
-                            (page_count, int(page_count_verified), f_id),
-                        )
+                        _computed = get_file_page_count(frow["path"], ext) or 0
+                        if _computed > 0:
+                            page_count = _computed
+                            page_count_verified = ext not in ("doc", "docx")
+                            conn.execute(
+                                "UPDATE files SET page_count = ?, page_count_verified = ? WHERE id = ?",
+                                (page_count, int(page_count_verified), f_id),
+                            )
+                        else:
+                            # 2026-10-17：页数未知时**只对本单按 1 页兜底计价**，绝不把兜底值
+                            # 写回 files.page_count —— 补推页数分析的路径以
+                            # 「page_count_verified = 0」为前提（见 _pending_page_analysis_rows），
+                            # 而历史 bug 正是把 0 写成 1 之后：该文件再也不会被送去分析，
+                            # verified 永远 0、价格永久冻在 1 页（少收），前端复制价格永久被拦。
+                            page_count = 1
+                            page_count_verified = False
                     if not f_name:
                         f_name = frow["original_name"]
                 else:

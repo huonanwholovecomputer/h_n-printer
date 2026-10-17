@@ -39,15 +39,180 @@ DUPLEX_UNSUPPORTED_MARKER = "[双面不可用] "
 #     （A4@400dpi=15.5Mpx 恰好全分辨率；A3@400dpi=31Mpx 降 DPI）
 RENDER_TRANSIENT_FACTOR = 5.7      # 实测：单页流水线峰值 ≈ 5.7 个单页位图
 _PIXEL_BYTES_RGB = 3               # alpha=False → RGB，3 字节/像素
+_PIXEL_BYTES_GRAY = 1              # 单色机：MuPDF 先出 8bit 灰度（600dpi A4 ≈ 32 MiB），再转 1bit（≈4 MiB）
 
 
-def max_render_pixels() -> int:
-    """按当前进程位宽给出单页渲染像素上限（超过 → 自动降 DPI；仍超 → 拒绝该页）。"""
+def max_render_pixels(bytes_per_pixel: int = _PIXEL_BYTES_RGB) -> int:
+    """按当前进程位宽给出单页渲染像素上限（超过 → 自动降分辨率；仍超 → 拒绝该页）。
+
+    bytes_per_pixel 决定"一页位图多大"：RGB 24bit 是 3，单色灰度是 1。
+    单色路径的中间缓冲只有 1 字节/像素，同样的内存预算允许 3 倍的像素。
+    """
+    bpp = max(1, int(bytes_per_pixel))
     budget = (1536 * 1024 * 1024) if sys.maxsize > 2 ** 32 else (300 * 1024 * 1024)
-    return max(1_000_000, int(budget / (RENDER_TRANSIENT_FACTOR * _PIXEL_BYTES_RGB)))
+    return max(1_000_000, int(budget / (RENDER_TRANSIENT_FACTOR * bpp)))
 
 
-MAX_RENDER_PIXELS = max_render_pixels()
+MAX_RENDER_PIXELS = max_render_pixels()            # RGB（彩色机）基准
+MONO_RENDER_PIXELS = max_render_pixels(_PIXEL_BYTES_GRAY)   # 单色机（灰度中间缓冲）基准
+
+
+# ── 渲染策略（2026-10 重构）──
+#
+# 旧路径：按「设定 DPI」渲染（默认 400）→ 再按打印机原生 DPI 算出目标矩形 →
+# StretchDIBits 把 400dpi 位图**最近邻放大到 600dpi 设备像素**，最后单色驱动再做半色调。
+# 实测一次打印里发生了两次重采样（1.43× 放大 + 0.955 适配缩放），小字锯齿就是从这里来的；
+# 而"600 太慢/太费内存"的顾虑来自 RGB 24bit（A4@600 = 99.6 MiB/页）。
+#
+# 现在：先算目标设备像素，再**直接渲染到该尺寸**（1:1，MuPDF 只采样一次）；
+# 单色设备输出 1bit（阈值/抖动），驱动无需半色调，内存也从 99.6 MiB 降到 ~4 MiB/页。
+# dpi 参数只作为**上限**（低于设备分辨率时才主动降采样换速度）。
+MONO_THRESHOLD = 136               # 8bit 灰度 → 1bit 的硬阈值（< 阈值判黑）
+# 页面含非纯黑内容（图片/灰底纹/彩字）时整页改抖动：阈值会把浅灰内容抹成白色（见 _page_needs_dither）
+
+
+def plan_page_raster(page_w_pts: float, page_h_pts: float,
+                     native_dpi_x: float, native_dpi_y: float,
+                     printable_w: int, printable_h: int,
+                     dpi_cap: int = 0, pixel_limit: int = 0) -> tuple[int, int, int, int, bool]:
+    """纯逻辑：算一页的「目标设备尺寸」与「实际渲染尺寸」（离线可验收，不碰打印机）。
+
+    返回 (draw_w, draw_h, render_w, render_h, capped)
+      · draw_*   = 页面在设备上的物理像素尺寸（原生 DPI 换算 + 适配可打印区）。
+                   贴图按这个矩形画，保证物理尺寸与渲染 DPI 无关；
+      · render_* = 实际让 MuPDF 渲染的位图尺寸；默认 == draw_* ⇒ 1:1、零重采样；
+      · capped   = 是否因 dpi_cap / pixel_limit 降了分辨率（此时 GDI 会放大一次，属主动取舍）。
+    """
+    dev_w = page_w_pts * native_dpi_x / 72.0
+    dev_h = page_h_pts * native_dpi_y / 72.0
+    # 设备查询异常（HORZRES/VERTRES=0）时不缩成 1px 图，退回按页面物理尺寸
+    if printable_w <= 0 or printable_h <= 0:
+        printable_w = max(1, int(round(dev_w)))
+        printable_h = max(1, int(round(dev_h)))
+    fit = min(1.0, printable_w / max(1.0, dev_w), printable_h / max(1.0, dev_h))
+    draw_w = max(1, int(round(dev_w * fit)))
+    draw_h = max(1, int(round(dev_h * fit)))
+
+    render_w, render_h = draw_w, draw_h
+    capped = False
+
+    # ① dpi 上限：只在低于设备分辨率时生效（高于设备 = 无意义，保持 1:1）
+    cap = int(dpi_cap or 0)
+    if cap > 0:
+        cap_w = max(1, int(round(page_w_pts * cap / 72.0)))
+        cap_h = max(1, int(round(page_h_pts * cap / 72.0)))
+        if cap_w < draw_w or cap_h < draw_h:
+            render_w, render_h = cap_w, cap_h
+            capped = True
+
+    # ② 单页像素上限（防极端尺寸页面 OOM；在 StartPage 之前判定，不浪费纸）
+    limit = int(pixel_limit or 0)
+    if limit > 0 and render_w * render_h > limit:
+        k = (limit / float(render_w * render_h)) ** 0.5
+        render_w = max(1, int(render_w * k))
+        render_h = max(1, int(render_h * k))
+        capped = True
+
+    return draw_w, draw_h, render_w, render_h, capped
+
+
+def _is_monochrome_printer(printer_name: str, devmode, hdc, win32con) -> bool:
+    """判断目标队列是否黑白设备（决定走 1bit 还是 RGB）。三路证据，任一"确定"即采纳。
+
+    ① DEVMODE.dmColor 最权威（DMCOLOR_MONOCHROME=1 / DMCOLOR_COLOR=2）；
+    ② DeviceCapabilities(DC_COLORDEVICE)：0=单色、1=彩色；
+    ③ DC 能力位兜底（NUMCOLORS<=2 或 BITSPIXEL==1）。
+    """
+    color = getattr(devmode, "Color", None) if devmode is not None else None
+    try:
+        if color is not None:
+            if int(color) == 1:      # DMCOLOR_MONOCHROME
+                return True
+            if int(color) == 2:      # DMCOLOR_COLOR
+                return False
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        import win32print
+        cap = getattr(win32con, "DC_COLORDEVICE", 32)
+        res = win32print.DeviceCapabilities(printer_name, "", cap)
+        if res in (0, 1):
+            return res == 0
+    except Exception:
+        pass
+
+    try:
+        if hdc is not None:
+            if hdc.GetDeviceCaps(win32con.NUMCOLORS) <= 2:
+                return True
+            if hdc.GetDeviceCaps(win32con.BITSPIXEL) == 1:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _to_bilevel(gray, threshold: int = MONO_THRESHOLD):
+    """8bit 灰度 → 1bit 硬阈值（Pillow C 实现，A4@600dpi 约几十毫秒）。
+
+    用 `point(lut, "1")` 一步出 1bit：若先 point 成 L 再 convert("1")，中间会多一份
+    32 MiB 的整页灰度副本（600dpi A4），纯属浪费。
+    """
+    t = max(1, min(254, int(threshold)))
+    lut = [0] * t + [255] * (256 - t)
+    return gray.convert("L").point(lut, "1")
+
+
+def _is_blackish(color) -> bool:
+    """判断文本/图元颜色是否接近纯黑（None 视为不适用）。"""
+    try:
+        if color is None:
+            return True
+        vals = list(color)[:3]
+        return bool(vals) and all(float(v) <= 0.02 for v in vals)
+    except Exception:
+        return False
+
+
+def _page_needs_dither(page) -> bool:
+    """页面里存在**非纯黑**内容（图片 / 灰底纹 / 彩色或浅灰文字）时改用抖动。
+
+    为什么不是"统一阈值、统一抖动"：
+      · 硬阈值（默认）保锐度 —— 纯黑文字/线条页的最优解（就是实机 A/B 里那张）；
+      · 但阈值会把浅灰底纹、浅灰小字、照片里的中间调直接抹成白色（内容丢失）。
+        老实现把 RGB 交给驱动做半色调，这些灰阶本来是在的 —— 不能因为改渲染策略而丢内容。
+    所以：**只要页面里有任何非纯黑内容，就整页 Floyd–Steinberg**；纯黑文字页保持阈值。
+    代价是这类页面的文字边缘略软（600dpi 下那些抖动点只有 42µm，肉眼几乎不可见）。
+    """
+    try:
+        # ① 任何图片（哪怕只占一小块：小照片/证件照被阈值化会很难看）
+        if page.get_images(full=False):
+            return True
+    except Exception:
+        pass
+
+    try:
+        # ② 文本颜色非纯黑（浅灰批注、彩色正文）
+        for block in page.get_text("dict").get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if int(span.get("color", 0) or 0) != 0:
+                        return True
+    except Exception:
+        pass
+
+    try:
+        # ③ 矢量填充/描边非纯黑（灰底纹表头、彩色图元）
+        for d in page.get_drawings():
+            if d.get("fill") is not None and not _is_blackish(d.get("fill")):
+                return True
+            if d.get("color") is not None and not _is_blackish(d.get("color")):
+                return True
+    except Exception:
+        pass
+
+    return False
 
 
 # ============================================================
@@ -802,7 +967,8 @@ def print_pdf(
         page_range: 页码范围，如 "1-5"
         orientation: 页面方向 "portrait" | "landscape" | "" (空=不强制)
         progress_callback: 进度回调 (current, total)，每打印一面调用一次
-        dpi: 渲染 DPI，0=使用打印机原生 DPI
+        dpi: 渲染分辨率上限。0（推荐）= 按设备最终像素 1:1 渲染，零缩放零重采样；
+       >0 且低于设备原生分辨率时才会降采样（GDI 随后放大一次，换取速度）
         pages_override: **手动双面/校准专用**：精确的逐面序列（0-based 页号，None=空白占位页）。
                         给出时只用 GDI 一条路（Sumatra 只认整份 PDF，降级过去会把整份文件
                         按它自己的页序又打一遍 —— 那正是手动双面最怕的重复/错位）。
@@ -819,6 +985,20 @@ def print_pdf(
     total_pages = count_pdf_pages(pdf_path)
     if total_pages <= 0:
         return False, f"PDF 无有效页面（页数为 0，文件为空、损坏或无法解析）: {pdf_path}"
+
+    # ── 1 页文件不请求双面（2026-10-17 现场事故的**最深一层**兜底）──
+    # 单页（或页码范围只选出 1 页）时双面在物理上不可能成立，但驱动照 "Duplex=2" 处理：
+    # HP LaserJet 1018/1020/1022 这类**无自动双面器**的驱动把它当"手动双面"，弹官方
+    # 「双面打印说明」向导（偶数页先打 → 提示翻纸 → 再打奇数页）并可能先吐一张空白页
+    # —— 现场订单 HN20261017-0002（1 页 docx）就这样打出了空白页 + 正式页。
+    # 上层 gui.PrintWorker._effective_duplex 已按**真实页数**改判；这里再兜一层，是为了
+    # 任何绕过 PrintWorker 的调用方（工具/脚本/将来的新入口）也不会把 1 页当双面提交。
+    # ⚠ pages_override（手动双面/校准专用，逐面序列）不动：那是调用方有意排好的。
+    if duplex == "on" and pages_override is None and len(_parse_page_range(page_range, total_pages)) == 1:
+        logger.info(f"有效页数=1 → 不请求双面（单页上双面无意义，避免驱动手动双面向导）: "
+                    f"{os.path.basename(pdf_path)}")
+        print("[打印] ℹ 有效页数 = 1 → 按单面打印（双面对单页文件无意义）")
+        duplex = "off"
 
     system = platform.system()
 
@@ -960,7 +1140,8 @@ def _print_pdf_native(
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
     progress_callback: 每完成一面的 EndPage 后调用 (current_side, total_sides)
-    dpi: 渲染 DPI，0=使用打印机原生 DPI
+    dpi: 渲染分辨率上限。0（推荐）= 按设备最终像素 1:1 渲染，零缩放零重采样；
+       >0 且低于设备原生分辨率时才会降采样（GDI 随后放大一次，换取速度）
     pages_override: **手动双面/校准专用** —— 精确的逐面渲染序列（0-based 页号，
                     None = 打一张空白占位页）。给出时忽略 page_range/copies，
                     copies 由调用方自己循环（见 manual_duplex.PrintPlan.pass_pages）。
@@ -1077,20 +1258,25 @@ def _print_pdf_native(
                 print(f"[GDI] ✗ {msg}")
                 return False, DUPLEX_UNSUPPORTED_MARKER + msg
 
-        # 获取打印机可打印区域和分辨率
+        # 获取打印机可打印区域和分辨率（"最终尺寸 1:1 渲染"的两个输入）
         native_dpi_x = hdc.GetDeviceCaps(win32con.LOGPIXELSX)
         native_dpi_y = hdc.GetDeviceCaps(win32con.LOGPIXELSY)
-        # 使用指定 DPI 或打印机原生 DPI
-        dpi_x = dpi if dpi > 0 else native_dpi_x
-        dpi_y = dpi if dpi > 0 else native_dpi_y
         printable_w = hdc.GetDeviceCaps(win32con.HORZRES)
         printable_h = hdc.GetDeviceCaps(win32con.VERTRES)
+
+        # 单色设备（黑白激光）→ 1bit；彩色设备保持 RGB。上限也随像素字节数分档。
+        mono = _is_monochrome_printer(printer, devmode, hdc, win32con)
+        pixel_limit = MONO_RENDER_PIXELS if mono else MAX_RENDER_PIXELS
+
+        logger.info(f"GDI: 原生 DPI=({native_dpi_x},{native_dpi_y}), 可打印区域=({printable_w}x{printable_h}), "
+                    f"渲染={'1bit(单色)' if mono else 'RGB'}, dpi上限={dpi if dpi > 0 else '自动(设备原生)'}")
+        print(f"[GDI] 设备原生: {native_dpi_x}×{native_dpi_y} DPI, 可打印区域: {printable_w}×{printable_h}")
+        if mono:
+            print(f"[GDI] 单色设备 → 按最终像素渲染 1bit（阈值 {MONO_THRESHOLD}），驱动不再做半色调")
         if dpi > 0:
-            logger.info(f"GDI: DPI=({dpi_x},{dpi_y}) [指定], 原生=({native_dpi_x},{native_dpi_y}), 可打印区域=({printable_w},{printable_h})")
-            print(f"[GDI] 分辨率: {dpi_x}×{dpi_y} DPI (指定, 原生{native_dpi_x}×{native_dpi_y}), 可打印区域: {printable_w}×{printable_h}")
+            print(f"[GDI] 渲染策略: 最终尺寸 1:1；{dpi} DPI 仅作上限（低于设备分辨率时才会放大一次）")
         else:
-            logger.info(f"GDI: DPI=({dpi_x},{dpi_y}), 可打印区域=({printable_w},{printable_h})")
-            print(f"[GDI] 分辨率: {dpi_x}×{dpi_y} DPI, 可打印区域: {printable_w}×{printable_h}")
+            print(f"[GDI] 渲染策略: 按设备最终像素 1:1 渲染（零缩放、零重采样）")
 
         title = os.path.basename(pdf_path)
         hdc.StartDoc(title)
@@ -1122,6 +1308,7 @@ def _print_pdf_native(
         # 比内容页还贵 4 倍。手动双面第 2 趟 / 校准序列里空白占位页可以很多，纯属浪费。
         # 填充结果与源尺寸无关（走的是内容页同一条 StretchDIBits 路径，驱动本就在放大）。
         blank_dib = None
+        cap_noted = False        # 「本次打印因上限降了分辨率」只提示一次，别刷屏
         for page_idx in render_seq:
             page_seq += 1
 
@@ -1140,63 +1327,68 @@ def _print_pdf_native(
 
             page = doc[page_idx]
 
-            # P0-1: 渲染前估算像素总量 — 超上限（按进程位宽分档，见模块顶部 MAX_RENDER_PIXELS）
-            #       自动降 DPI；仍超限则拒绝该页（在 StartPage 之前检查，避免浪费纸张并可降级）
+            # ── 目标物理尺寸 + 实际渲染尺寸（纯函数见 plan_page_raster）──
+            # 旧路径先按 400dpi 渲染、再把位图拉伸到 600dpi 设备矩形（1.43× 最近邻 + 0.955 适配），
+            # 小字锯齿就来自这两次重采样。现在直接渲染到最终尺寸：默认 1:1，MuPDF 只采样一次。
             page_w_pts = page.rect.width
             page_h_pts = page.rect.height
-            render_dpi_x = dpi_x
-            render_dpi_y = dpi_y
-            pixel_count = (page_w_pts * render_dpi_x / 72.0) * (page_h_pts * render_dpi_y / 72.0)
-            if pixel_count > MAX_RENDER_PIXELS:
-                reduced_dpi = max(1, int((MAX_RENDER_PIXELS / (page_w_pts * page_h_pts)) ** 0.5 * 72.0))
-                render_dpi_x = min(render_dpi_x, reduced_dpi)
-                render_dpi_y = min(render_dpi_y, reduced_dpi)
-                logger.warning(f"GDI: 页面过大 ({page_w_pts:.0f}x{page_h_pts:.0f}pt)，"
-                               f"像素量 {int(pixel_count):,} > {MAX_RENDER_PIXELS:,}，渲染 DPI 由 {dpi_x} 自动降为 {render_dpi_x}")
-                print(f"[GDI] ⚠ 页面过大，渲染 DPI 由 {dpi_x} 自动降为 {render_dpi_x}")
-                if (page_w_pts * render_dpi_x / 72.0) * (page_h_pts * render_dpi_y / 72.0) > MAX_RENDER_PIXELS:
-                    raise RuntimeError(
-                        f"PDF 页面尺寸极端巨大（{page_w_pts:.0f}×{page_h_pts:.0f}pt），"
-                        f"即使降 DPI 至 {render_dpi_x} 像素量仍超 {MAX_RENDER_PIXELS:,}，已拒绝该页以防内存耗尽"
-                    )
-
-            hdc.StartPage()
-            page_started = True
-
-            mat = fitz.Matrix(render_dpi_x / 72.0, render_dpi_y / 72.0)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
-
-            img = Image.frombuffer(
-                "RGB", (pix.width, pix.height),
-                pix.samples, "raw", "RGB", pix.stride, 1,
+            draw_w, draw_h, render_w, render_h, capped = plan_page_raster(
+                page_w_pts, page_h_pts, native_dpi_x, native_dpi_y,
+                printable_w, printable_h, dpi_cap=dpi, pixel_limit=pixel_limit,
             )
+
+            # P0-1: 极端尺寸页面在**渲染前**就拒绝（还没 StartPage → 没出纸，允许上层降级）
+            if render_w * render_h > pixel_limit:
+                raise RuntimeError(
+                    f"PDF 页面尺寸极端巨大（{page_w_pts:.0f}×{page_h_pts:.0f}pt），"
+                    f"即使降分辨率仍超 {pixel_limit:,} 像素，已拒绝该页以防内存耗尽"
+                )
+            if capped and not cap_noted:
+                cap_noted = True
+                logger.warning(f"GDI: 渲染分辨率受限 → 位图 {render_w}x{render_h}，"
+                               f"目标 {draw_w}x{draw_h}（本次打印 GDI 会放大一次）")
+                print(f"[GDI] ⚠ 渲染位图 {render_w}×{render_h} → 目标 {draw_w}×{draw_h}"
+                      f"（dpi上限/像素上限触发，GDI 将放大一次）")
+
+            # 先渲染、后 StartPage：渲染失败时尚未出纸，可安全降级重试
+            mat = fitz.Matrix(render_w / page_w_pts, render_h / page_h_pts)
+            pix = page.get_pixmap(
+                matrix=mat,
+                colorspace=fitz.csGRAY if mono else fitz.csRGB,
+                alpha=False,
+            )
+
+            if mono:
+                gray = Image.frombuffer(
+                    "L", (pix.width, pix.height),
+                    pix.samples, "raw", "L", pix.stride, 1,
+                )
+                # 图片大面积覆盖 → 抖动保灰阶；纯文字/线条 → 硬阈值保锐度
+                img = gray.convert("1") if _page_needs_dither(page) else _to_bilevel(gray)
+            else:
+                img = Image.frombuffer(
+                    "RGB", (pix.width, pix.height),
+                    pix.samples, "raw", "RGB", pix.stride, 1,
+                )
 
             # 手动双面第 2 趟：纸张在出纸路径里被转了 180°，必须把这一趟的内容也转 180° 补偿，
             # 否则第 2 面的文字整体倒置（实机实测 HP LaserJet 1020：不补偿就是"上下颠倒"）。
-            # 只影响本次渲染的位图，不影响纸张顺序、页序、居中位置。
+            # 只影响本次渲染的位图，不影响纸张顺序、页序、居中位置。1bit/8bit 都支持无损转置。
             if rotate_180 and _rot180 is not None:
                 img = img.transpose(_rot180)
 
-            # ── 将渲染 DPI 的 pixmap 映射到打印机原生 DPI 的物理尺寸 ──
-            # pix 尺寸基于 render_dpi（如400），但设备坐标基于 native_dpi（如600）
-            # 必须按打印机原生 DPI 计算目标矩形，否则打印尺寸会偏小
-            page_rect = page.rect  # PDF 点数 (1/72 inch)
-            page_w_device = int(page_rect.width * native_dpi_x / 72.0)
-            page_h_device = int(page_rect.height * native_dpi_y / 72.0)
+            # 未降采样时以位图**实际**尺寸为贴图矩形：MuPDF 的 ceil 可能比计算值多 1px，
+            # 用计算值会让 StretchDIBits 做一次 1px 的缩放（正好是我们要消灭的东西）。
+            if not capped:
+                draw_w, draw_h = img.size
 
-            # P2-3: 超出可打印区域的页面（如 A5 纸型）先等比缩放到可打印区域内再居中
-            scale = min(1.0, printable_w / max(1, page_w_device), printable_h / max(1, page_h_device))
-            if scale < 1.0:
-                page_w_device = int(page_w_device * scale)
-                page_h_device = int(page_h_device * scale)
+            x = (printable_w - draw_w) // 2
+            y = (printable_h - draw_h) // 2
 
-            x = (printable_w - page_w_device) // 2
-            y = (printable_h - page_h_device) // 2
-
+            hdc.StartPage()
+            page_started = True
             dib = ImageWin.Dib(img)
-            dib.draw(hdc.GetHandleOutput(),
-                     (x, y, x + page_w_device, y + page_h_device))
-
+            dib.draw(hdc.GetHandleOutput(), (x, y, x + draw_w, y + draw_h))
             hdc.EndPage()
             print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (PDF p.{page_idx + 1})")
             if progress_callback:

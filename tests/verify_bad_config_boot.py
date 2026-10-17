@@ -73,7 +73,7 @@ if cfg:
     check("坏值归一到默认（cover_page_price=0.10）", cfg.cover_page_price == 0.10,
           f"{cfg.cover_page_price}")
     check("坏值归一到默认（duplex_price=0.3）", cfg.duplex_price == 0.3, f"{cfg.duplex_price}")
-    check("坏值归一到默认（render_dpi=400）", cfg.render_dpi == 400, f"{cfg.render_dpi}")
+    check("坏值归一到默认（render_dpi=0=自动）", cfg.render_dpi == 0, f"{cfg.render_dpi}")
     check("坏值归一到默认（last_order_number=0）", cfg.last_order_number == 0,
           f"{cfg.last_order_number}")
     check("**其余配置完整保留**（同为 0.5 的 simplex_price 未被牵连）",
@@ -86,7 +86,7 @@ if cfg:
 print("\n=== 2. 根节点是数组（data.get → AttributeError）===")
 raised, exc, cfg, corrupts = try_load("[1, 2, 3]", "array_root.json")
 check("load() 不抛异常（改前 AttributeError 穿出 ⇒ 启动崩）", not raised, exc)
-check("返回默认配置", cfg is not None and cfg.printer_name == "" and cfg.render_dpi == 400,
+check("返回默认配置", cfg is not None and cfg.printer_name == "" and cfg.render_dpi == 0,
       f"cfg={cfg!r}")
 check("损坏文件改名保留为 .corrupt-*（不静默丢失）", len(corrupts) == 1, f"{corrupts}")
 
@@ -94,7 +94,7 @@ print("\n=== 3. 截断 JSON（JSONDecodeError，原有分支）===")
 raised, exc, cfg, corrupts = try_load('{"printer_name": "HP", "tabs": {"1": [',
                                       "truncated.json")
 check("load() 不抛异常", not raised, exc)
-check("返回默认配置", cfg is not None and cfg.render_dpi == 400, f"cfg={cfg!r}")
+check("返回默认配置", cfg is not None and cfg.render_dpi == 0, f"cfg={cfg!r}")
 check("截断文件改名保留", len(corrupts) == 1, f"{corrupts}")
 
 print("\n=== 4. dict 字段被写成列表/字符串（.get/.items 会 AttributeError）===")

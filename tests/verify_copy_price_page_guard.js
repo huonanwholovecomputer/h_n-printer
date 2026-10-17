@@ -10,7 +10,9 @@
  * 修法：复制价格 / 复制详细价格前校验每个文件页数是否可信——
  *   · page_count > 0 且（PDF/图片后端直接数页 → 可信；doc/docx/md/txt/csv 必须
  *     page_count_verified=1 才算可信）；
- *   · 不可信 → 不写剪贴板，改弹提示「需打印的文件中包含X类型，且页数未完成计算，价格计算无效」；
+ *   · 不可信 → 不写剪贴板，改弹提示「需打印的文件中包含X类型，且页数未完成计算，价格暂无法确定。
+ *     页数计算完成后价格会自动更新，请稍后在「我」→ 订单详情查看该订单的最终价格」；
+ *     接管设备离线时额外点明离线；
  *   · 页数在提交后才回报 → 同步进提交快照（_lastOrderResult.files），拦下自动解除、提示消失。
  *
  * 两个前端各用「真实源码 + 桩环境」跑：
@@ -197,9 +199,14 @@ async function runMiniProgram() {
   check('①离线+Word未验证：弹出提示弹窗（单按钮）',
         calls.modal.length === 1 && calls.modal[0].showCancel === false,
         JSON.stringify(calls.modal));
-  check('①提示含「包含Word类型」「页数未完成计算」「价格计算无效」',
+  check('①提示含「包含Word类型」「页数未完成计算」「价格暂无法确定」',
         calls.modal.length === 1 && /包含Word类型/.test(calls.modal[0].content)
-        && /页数未完成计算/.test(calls.modal[0].content) && /价格计算无效/.test(calls.modal[0].content),
+        && /页数未完成计算/.test(calls.modal[0].content) && /价格暂无法确定/.test(calls.modal[0].content),
+        calls.modal.length ? calls.modal[0].content : '(无弹窗)');
+  check('①提示说明价格会自动更新、并引导去「我」→ 订单详情看最终价格',
+        calls.modal.length === 1 && /页数计算完成后价格会自动更新/.test(calls.modal[0].content)
+        && /「我」/.test(calls.modal[0].content) && /订单详情/.test(calls.modal[0].content)
+        && !(/请等本地打印工具完成转换/.test(calls.modal[0].content)),
         calls.modal.length ? calls.modal[0].content : '(无弹窗)');
   check('①提示点明接管设备离线', calls.modal.length === 1 && /接管设备当前离线/.test(calls.modal[0].content));
   check('①成功弹窗内先亮出价格无效提示',
@@ -229,7 +236,11 @@ async function runMiniProgram() {
         calls.modal.length === 1 && /包含Word类型/.test(calls.modal[0].content)
         && !/接管设备当前离线/.test(calls.modal[0].content),
         calls.modal.length ? calls.modal[0].content : '(无弹窗)');
-  check('③提示给出等待指引', calls.modal.length === 1 && /请等本地打印工具完成转换/.test(calls.modal[0].content));
+  check('③提示不叫用户干等，而是引导稍后去「我」→ 订单详情看最终价格',
+        calls.modal.length === 1 && /价格暂无法确定/.test(calls.modal[0].content)
+        && /页数计算完成后价格会自动更新/.test(calls.modal[0].content)
+        && /「我」/.test(calls.modal[0].content) && /订单详情/.test(calls.modal[0].content)
+        && !(/请等本地打印工具完成转换/.test(calls.modal[0].content)));
 
   /* --- 4. Word 页数已验证（离线也一样）→ 放行，且金额按真实页数 --- */
   reset();
@@ -472,9 +483,14 @@ async function runAndroid() {
   check('①单按钮提示弹窗（标题「价格暂不可复制」）',
         calls.alert.length === 1 && calls.alert[0].title === '价格暂不可复制',
         JSON.stringify(calls.alert));
-  check('①提示含「包含Word类型」「页数未完成计算」「价格计算无效」',
+  check('①提示含「包含Word类型」「页数未完成计算」「价格暂无法确定」',
         calls.alert.length === 1 && /包含Word类型/.test(calls.alert[0].content)
-        && /页数未完成计算/.test(calls.alert[0].content) && /价格计算无效/.test(calls.alert[0].content),
+        && /页数未完成计算/.test(calls.alert[0].content) && /价格暂无法确定/.test(calls.alert[0].content),
+        calls.alert.length ? calls.alert[0].content : '(无弹窗)');
+  check('①提示说明价格会自动更新、并引导去「我」→ 订单详情看最终价格',
+        calls.alert.length === 1 && /页数计算完成后价格会自动更新/.test(calls.alert[0].content)
+        && /「我」/.test(calls.alert[0].content) && /订单详情/.test(calls.alert[0].content)
+        && !(/请等本地打印工具完成转换/.test(calls.alert[0].content)),
         calls.alert.length ? calls.alert[0].content : '(无弹窗)');
   check('①提示点明接管设备离线', calls.alert.length === 1 && /接管设备当前离线/.test(calls.alert[0].content));
   check('①成功弹窗内先亮出价格无效提示',

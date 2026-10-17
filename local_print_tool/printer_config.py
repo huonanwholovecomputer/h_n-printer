@@ -2,17 +2,53 @@
 printer_config.py — 配置管理模块
 负责读取/写入 JSON 配置文件，管理打印机名称、双面模式、任务列表等。
 含打印首页(Cover Page) PDF 生成功能。
+
+⚠ 打印机档案（printer_profiles）的落盘守卫（2026-10 现场事故，别删）
+────────────────────────────────────────────────────────────────────
+现象：本机 %APPDATA%\\HN打印工具\\print_config.json 里 `"printer_profiles": {}` 是空的，
+而 2026-10-12..10-16 12:42 手动双面一直可用（日志有「手动双面完成」
+「已记入速度样本（第 14 条）」）⇒ 档案曾经存在，被某次配置**整体落盘**静默清空了。
+
+根因（已由 git 历史 + 现场日志指纹证实）：`printer_profiles` 是 2026-10 才引入的字段 ——
+`git show d597512:local_print_tool/printer_config.py`（v4.5.15）里该词出现 **0** 次；
+v4.5.17 / v4.5.18 的同一次整体落盘也会把它（连 `duplex_stack_mode` 一起）抹掉，v4.5.18
+还会把档案内部的 speed_samples / stack_capacity / stack_warn_after_sec 截掉
+（实测：让各版本代码自己 load→save 往返，v4.5.19 起才完整保留）。**这些旧版客户端根本
+不知道这个字段**，它的一次 `_save_config()` 就把 print_config.json 整体写成不带该键的版本。
+时间线自洽：2026-10-16 12:41:54 还有「已记入速度样本（第 14 条）」（档案在），
+12:55/13:09/13:39 三次退出落盘，16:48 自动更新到 v4.5.20，17:09 起日志变成
+「未确认为『不支持自动双面、需人工翻纸』」⇒ 档案在 12:42–17:09 之间被旧版落盘带走。
+（日志指纹把落盘者夹到 ≤v4.5.17：10-16 每次启动都打「☁ 云端直连…」，该行由 v4.5.17
+引入 ⇒ 落盘进程 ≥v4.5.17；而它同时抹掉了 printer_profiles + duplex_stack_mode
+⇒ ≤v4.5.17。具体二进制来源日志解释不了，故此处**不钉死某个版本号**。）
+
+结论：printer_profiles 是**机器能力事实**（哪台队列支持自动双面、手动双面的页序参数），
+不该跟会话设置同住一个键、被任何一次整体重写带走。守卫做法（本模块）：
+  · 权威存储独立成同目录 `printer_profiles.json`
+    （`{"version":1,"profiles":{<队列名>:<PrinterProfile.to_dict()>}}`，原子写）；
+  · load：同键以独立文件为准（print_config.json 里的旧键只作兼容兜底），
+    独立文件缺失/损坏但旧配置里有档案 → 一次性迁移写入（幂等）；
+  · save：print_config.json 里仍**镜像**一份（旧版兼容 + 后端上报口径不变），
+    同时把「**内存档案 ∪ 磁盘已有档案（内存同键优先）**」写进独立文件 ——
+    内存为空**绝不等于**「删档案」，所以「旧版客户端保存不带该字段的配置」
+    「CLI 校准写档案后 GUI 用过期内存再保存」都不会再清空能力事实。
+  · 独立文件路径由**调用方传入的 config 路径**推导（同目录、固定文件名），
+    刻意不调用 paths.printer_profiles_path()：那函数只给正式运行时用，
+    测试传临时路径时档案必须落在临时目录内，绝不能漏进真实 %APPDATA%。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---- 订单归属默认占位名（仅遗留兼容） ----
@@ -555,6 +591,130 @@ def _default_config_path() -> str:
     return config_path()
 
 
+# ════════════════════════════════════════════════════════════════════
+# 打印机档案独立存储（能力不可被配置重写静默清空，2026-10 现场事故）
+# ════════════════════════════════════════════════════════════════════
+# 事故与根因见模块顶部 docstring。要点只有一条：**内存里没有档案 ≠ 要删档案**
+# —— 旧版客户端不认识这个字段，一次整体落盘就会把能力事实抹掉。
+#
+# 文件形态（权威存储）：
+#   {"version": 1, "profiles": {"<打印队列名>": {<PrinterProfile.to_dict()>}, ...}}
+# 位置：与传入的 print_config.json **同目录、固定文件名**（见 _profiles_path_for）。
+
+PRINTER_PROFILES_FILENAME = "printer_profiles.json"   # 必须与 paths.PRINTER_PROFILES_FILENAME 一致
+PRINTER_PROFILES_VERSION = 1
+
+
+def _profiles_path_for(config_path: str) -> str:
+    """由**调用方传入的 config 路径**推导独立档案文件（同目录、固定文件名）。
+
+    刻意不调用 paths.printer_profiles_path()：那个函数回的是正式运行时的
+    %APPDATA%\\HN打印工具\\printer_profiles.json 绝对路径。测试/沙箱传临时配置路径时，
+    档案必须落在临时目录内 —— 否则一次验收就写进真实用户档案（本任务最大风险点）。
+    正式运行时两者推导结果相同（config_path() 也在 %APPDATA%\\HN打印工具\\ 下）。
+    """
+    folder = os.path.dirname(os.path.abspath(config_path or "")) or "."
+    return os.path.join(folder, PRINTER_PROFILES_FILENAME)
+
+
+def _read_profiles_store(path: str) -> tuple[dict[str, PrinterProfile], bool]:
+    """读独立档案文件 → (档案字典, 文件是否健康可读)。
+
+    不存在 / 解析失败 / **有 `profiles` 键但值不是 dict（写一半/被写坏）** 一律返回
+    空档案 + False（**档案文件坏掉绝不能让程序启动失败**：它是能力事实，不是启动必需的
+    配置）。调用方据 healthy 决定是否迁移/自愈。
+    唯一放过的"不健康"形态是**没有 profiles 外壳的扁平旧格式** `{队列名: 档案}`（手工
+    写的诊断文件），按扁平解析并视为健康。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}, False
+    except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
+        logger.warning(f"打印机档案文件读取失败（按空档案处理，不影响启动）: {path}: {e}")
+        return {}, False
+    if not isinstance(data, dict):
+        return {}, False
+    raw = data.get("profiles")
+    if "profiles" in data and not isinstance(raw, dict):
+        # 有 "profiles" 键但值不是 dict（写一半/被写坏）→ 空档案 + 不健康：让 load 侧
+        # 按"缺文件"处理，从 print_config.json 的镜像迁移 + 自愈（否则这份坏文件既不
+        # 提供档案、又挡住自愈，得等下一次 save 才被重写）。
+        logger.warning(f"打印机档案文件结构不对（按空档案处理，不影响启动）: {path}")
+        return {}, False
+    if not isinstance(raw, dict):
+        raw = data
+    profiles = {str(k): PrinterProfile.from_dict(v) for k, v in raw.items() if isinstance(v, dict)}
+    return profiles, True
+
+
+def _write_profiles_store(path: str, profiles: dict[str, PrinterProfile]) -> None:
+    """原子写独立档案文件（同目录临时文件 + os.replace，防写一半损坏）。"""
+    folder = os.path.dirname(path) or "."
+    os.makedirs(folder, exist_ok=True)
+    payload = {
+        "version": PRINTER_PROFILES_VERSION,
+        "profiles": {str(k): (v.to_dict() if isinstance(v, PrinterProfile)
+                              else PrinterProfile.from_dict(v).to_dict())
+                     for k, v in (profiles or {}).items()},
+    }
+    fd, tmp_path = tempfile.mkstemp(dir=folder, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _merge_profiles_on_load(cfg: "PrinterConfig", config_path: str) -> None:
+    """load 时合并档案：同键独立文件优先；旧配置里有档案而独立文件缺失/损坏 → 迁移。
+
+    兼容口径：print_config.json 里的 printer_profiles 是**旧位置**（也可能是镜像）。
+    独立文件里没有的键仍从旧位置取（升级后第一次 load、或独立文件被误删时靠它兜底）；
+    两边都有的键以独立文件为准（它是权威存储）。
+    迁移是幂等的：写完一次后独立文件健康 ⇒ 后续 load 不再写盘
+    （tests/verify_printer_profile_store.py ① 用调用计数钉住）。
+    """
+    profiles_path = _profiles_path_for(config_path)
+    legacy = dict(cfg.printer_profiles or {})
+    stored, healthy = _read_profiles_store(profiles_path)
+    merged = dict(legacy)
+    merged.update(stored)          # 同键：独立文件（权威）覆盖旧配置镜像
+    cfg.printer_profiles = merged
+    if legacy and not healthy:
+        try:
+            _write_profiles_store(profiles_path, merged)
+            logger.info(f"打印机档案迁移到独立存储: {len(merged)} 条 → {profiles_path}")
+        except OSError as e:
+            # 迁移失败不影响本次启动：内存里已有合并结果，下次 save/load 会重试
+            logger.warning(f"打印机档案迁移落盘失败（下次会重试）: {e}")
+
+
+def _sync_profiles_store(config_path: str, memory_profiles: dict[str, PrinterProfile]) -> None:
+    """save 时把「内存档案 ∪ 磁盘已有档案（内存同键优先）」写进独立文件。
+
+    **永不清空**：内存为空只是"这个配置对象没加载到档案"，绝不等于"档案该删"。
+    磁盘上有的键一律保留（旧版客户端/过期内存保存时靠这条不被带走）；
+    同键冲突取内存值（调用方刚更新的那份最新，例如校准工具/GUI 的写入）。
+    内存与磁盘都没有档案且文件不存在 → 不凭空造空文件；文件存在（哪怕损坏）→ 写空结构自愈。
+    """
+    profiles_path = _profiles_path_for(config_path)
+    disk, _healthy = _read_profiles_store(profiles_path)
+    merged = dict(disk)
+    for k, v in (memory_profiles or {}).items():
+        if isinstance(v, PrinterProfile):
+            merged[str(k)] = v
+    if not merged and not os.path.exists(profiles_path):
+        return
+    _write_profiles_store(profiles_path, merged)
+
+
 def update_user_printer_profile(printer_name: str, path: str = "", **fields) -> PrinterProfile:
     """读-改-写**用户配置**里某台打印机的档案（校准工具 / GUI 共用入口）。
 
@@ -601,7 +761,8 @@ class PrinterConfig:
     """
     printer_name: str = ""
     duplex_mode: str = "long-edge"    # 'simplex' | 'long-edge' | 'short-edge'
-    render_dpi: int = 400             # 全局默认渲染 DPI
+    render_dpi: int = 0               # 全局默认渲染 DPI；0 = 自动（设备原生 1:1，零重采样，推荐）
+    dpi_auto_migrated: bool = True    # 一次性迁移标记：旧版默认 400 → 自动 0（见 load）
     keep_temp_pdf: bool = False
     simplex_price: float = 0.2
     duplex_price: float = 0.3
@@ -676,6 +837,7 @@ class PrinterConfig:
             "printer_name": self.printer_name,
             "duplex_mode": self.duplex_mode,
             "render_dpi": self.render_dpi,
+            "dpi_auto_migrated": self.dpi_auto_migrated,
             "keep_temp_pdf": self.keep_temp_pdf,
             "simplex_price": self.simplex_price,
             "duplex_price": self.duplex_price,
@@ -725,7 +887,8 @@ class PrinterConfig:
         return cls(
             printer_name=data.get("printer_name", ""),
             duplex_mode=data.get("duplex_mode", "long-edge"),
-            render_dpi=_num_or_default(data.get("render_dpi"), 400, int),
+            render_dpi=_num_or_default(data.get("render_dpi"), 0, int),
+            dpi_auto_migrated=bool(data.get("dpi_auto_migrated", False)),
             keep_temp_pdf=bool(data.get("keep_temp_pdf", False)),
             simplex_price=_num_or_default(data.get("simplex_price"), 0.2, float),
             duplex_price=_num_or_default(data.get("duplex_price"), 0.3, float),
@@ -768,7 +931,13 @@ class PrinterConfig:
         )
 
     def save(self, path: str) -> None:
-        """保存配置到 JSON 文件（同目录临时文件 + os.replace 原子替换，防写一半损坏）"""
+        """保存配置到 JSON 文件（同目录临时文件 + os.replace 原子替换，防写一半损坏）。
+
+        同时同步**独立档案存储**（见模块顶部说明）：print_config.json 里仍镜像一份
+        printer_profiles（旧版兼容 + 后端上报口径不变），并把「内存 ∪ 磁盘已有档案
+        （内存同键优先）」写进同目录 printer_profiles.json —— 内存里档案为空**绝不**
+        等于删档案，所以任意一次整体落盘都不会再清空机器能力事实。
+        """
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path) or ".", suffix=".tmp")
         try:
@@ -781,22 +950,51 @@ class PrinterConfig:
             except OSError:
                 pass
             raise
+        # 独立档案写在配置文件落盘之后：即使这里失败，print_config.json（含镜像）已是
+        # 新版本，下一轮 load/save 还能把独立文件补回来。失败只记日志不抛 —— 配置文件
+        # 保存是主流程（GUI 每次改动都调），不能因为档案文件被占用/无权限就整体失败。
+        try:
+            _sync_profiles_store(path, self.printer_profiles)
+        except OSError as e:
+            logger.warning(f"打印机档案独立存储写入失败（配置已保存，档案以其镜像为准）: {e}")
 
     @classmethod
     def load(cls, path: str) -> "PrinterConfig":
-        """从 JSON 文件加载配置；文件不存在则创建默认配置并保存，损坏则返回默认配置"""
+        """从 JSON 文件加载配置；文件不存在则创建默认配置并保存，损坏则返回默认配置。
+
+        档案（printer_profiles）的加载规则见 _merge_profiles_on_load：独立文件为权威，
+        旧配置里的同名键只作兼容兜底，缺独立文件时一次性迁移 —— 也就是「配置文件被
+        旧版整体重写/被写坏」都不该带走机器能力事实。
+        """
         import logging
         logger = logging.getLogger(__name__)
 
         if not os.path.exists(path):
             cfg = cls()
+            # 配置文件丢了不代表档案丢了：档案在独立文件里，照样读回来（能力不丢）
+            cfg.printer_profiles = _read_profiles_store(_profiles_path_for(path))[0]
             logger.info(f"配置文件不存在，已自动创建默认配置: {path}")
             cfg.save(path)
             return cfg
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return cls.from_dict(data)
+            cfg = cls.from_dict(data)
+            # 档案：独立文件（权威）+ 旧配置镜像合并，缺文件时迁移（幂等）
+            _merge_profiles_on_load(cfg, path)
+            # 一次性迁移（2026-10）：旧版默认 render_dpi=400，会被 GDI 最近邻放大到设备
+            # 600dpi（小字锯齿的根源）→ 改为「自动（设备原生 1:1）」。用户之后主动选回
+            # 400 不会被再次覆盖（迁移标记随配置落盘）。
+            if not cfg.dpi_auto_migrated:
+                if cfg.render_dpi == 400:
+                    cfg.render_dpi = 0
+                    logger.info("配置迁移: render_dpi 400 → 0（自动/设备原生 1:1 渲染）")
+                cfg.dpi_auto_migrated = True
+                try:
+                    cfg.save(path)
+                except Exception as e2:
+                    logger.warning(f"配置迁移落盘失败（下次启动会重试）: {e2}")
+            return cfg
         except (json.JSONDecodeError, OSError, ValueError, TypeError, AttributeError) as e:
             logger.warning(f"加载配置失败 ({path}): {e}，将使用默认配置")
             # 损坏文件改名保留为 .corrupt-{时间戳}（不删除，便于排查），下次启动自动重建
@@ -806,7 +1004,11 @@ class PrinterConfig:
                 logger.warning(f"已保留损坏配置为: {backup_path}")
             except Exception as e2:
                 logger.warning(f"备份损坏配置失败: {e2}")
-            return cls()
+            broken = cls()
+            # 配置文件被写坏 ≠ 档案没了：档案独立存活，照样读回来（否则一次手改坏配置
+            # 就把"这台机器不支持自动双面"的事实变成"未确认"，双面又走驱动虚报路径）
+            broken.printer_profiles = _read_profiles_store(_profiles_path_for(path))[0]
+            return broken
 
 
 # ============================================================

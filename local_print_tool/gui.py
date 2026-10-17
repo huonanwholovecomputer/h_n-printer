@@ -96,7 +96,7 @@ import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.21"
+APP_VERSION = "4.5.22"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -1093,6 +1093,151 @@ class ManualDuplexDialog(QDialog):
 
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 打印机双面能力（人工盖章）—— 2026-10-17 现场事故的闭环入口
+# ══════════════════════════════════════════════════════════════════════════════
+# 为什么需要用户能自己盖章：能力"未确认"时程序按**旧行为**把双面请求交给驱动 —— 而
+# HP LaserJet 1018/1020/1022 这类**没有自动双面器**的机型，驱动会虚报支持自动双面
+# （DC_DUPLEX=1 且接受 Duplex=2，实测本机 USB005 队列 confidence=medium 报 true），
+# 于是双面请求走的是**驱动程序自带的手动双面向导**（「双面打印说明」：偶数页先打 →
+# 提示整叠搬回 → 再打奇数页）。现场后果：单页文件被驱动多吐一张空白页（2026-10-17
+# 17:48，订单 HN20261017-0002），而且全程没走程序自己那套两趟控制器（manual_duplex）。
+#
+# 此前唯一能建档案的入口是命令行（tools/print_duplex_calibration.py），而档案又被旧版
+# 客户端的整体落盘清空过一次（根因见 printer_config.py 顶部）⇒ 用户"明明校准过"却
+# 发现双面又回到官方工具。所以补这个图形入口：
+#   · 人工结论 capability_source="manual"，**不被后续自动探测覆盖**（apply_probe 保证）；
+#   · 与打印机档案同一份数据（printer_config 层读写，GUI 不另开口子）。
+CAP_ASK = "未确认（先按驱动双面提交）"
+CAP_MANUAL = "不支持自动双面 —— 由程序分两趟 + 人工翻纸"
+CAP_AUTO = "支持自动双面（驱动一次成型）"
+_CAP_ITEMS = [CAP_ASK, CAP_MANUAL, CAP_AUTO]
+
+_FIRST_ITEMS = ["奇数页先打（成品叠最上面是第 1 页）", "偶数页先打（镜像观感）"]
+
+
+class PrinterDuplexCapabilityDialog(QDialog):
+    """帮助 → 打印机双面能力…：给**当前打印队列**盖一个三态能力章 + 手动双面参数。
+
+    参数默认值是 HP LaserJet 1020 的实机校准结论（first=odd / 逆序 / 180° 补偿），
+    换机型照抄会错 —— 对话框里写明了这一点，并要求填"校准人"留痕。
+    """
+
+    def __init__(self, printer_name: str, profile: PrinterProfile | None = None,
+                 verified_by: str = "", parent=None):
+        super().__init__(parent)
+        self._printer_name = printer_name or "(系统默认打印机)"
+        prof = profile or PrinterProfile()
+        self.setWindowTitle("打印机双面能力")
+        self.setMinimumWidth(620)
+
+        lay = QVBoxLayout(self)
+
+        head = QLabel(f"当前打印队列：<b>{self._printer_name}</b>")
+        lay.addWidget(head)
+
+        info = QLabel(
+            "「未确认」时程序把双面请求<b>交给驱动</b>：若本机没有自动双面器"
+            "（HP LaserJet 1018 / 1020 / 1022 属这类，<b>驱动会虚报支持</b>），"
+            "实际走的是驱动自带的「双面打印说明」向导 —— 偶数页先打、提示翻纸、再打奇数页，"
+            "且<b>可能先吐一张空白页</b>（单页文件尤其明显）。<br>"
+            "选「不支持自动双面」后改用程序自己的两趟控制器：全程单面、只翻一次纸、"
+            "第 2 趟自动做 180° 补偿，并支持「🖐 攒批模式」。<br>"
+            "⚠ 三项手动参数是 <b>HP LaserJet 1020 的实机校准值</b>，换别的机型要重做校准"
+            "（<code>tools/print_duplex_calibration.py \"队列名\" --save</code>），别照抄。")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        cap_row = QHBoxLayout()
+        cap_row.addWidget(QLabel("双面能力："))
+        self._cap = QComboBox()
+        self._cap.addItems(_CAP_ITEMS)
+        self._cap.setCurrentIndex({None: 0, False: 1, True: 2}.get(
+            prof.auto_duplex if isinstance(prof.auto_duplex, bool) else None, 0))
+        self._cap.currentIndexChanged.connect(lambda _i: self._sync_enabled())
+        cap_row.addWidget(self._cap, 1)
+        lay.addLayout(cap_row)
+
+        self._grp = QGroupBox("手动双面参数（仅「不支持自动双面」时生效）")
+        gl = QVBoxLayout(self._grp)
+
+        first_row = QHBoxLayout()
+        first_row.addWidget(QLabel("第 1 趟："))
+        self._first = QComboBox()
+        self._first.addItems(_FIRST_ITEMS)
+        self._first.setCurrentIndex(1 if str(prof.first).lower() == "even" else 0)
+        first_row.addWidget(self._first, 1)
+        gl.addLayout(first_row)
+
+        second_row = QHBoxLayout()
+        second_row.addWidget(QLabel("第 2 趟顺序："))
+        self._reverse = QComboBox()
+        self._reverse.addItems(["逆序（整叠原样搬回纸盘）", "正序（第 2 趟自己重排）"])
+        self._reverse.setCurrentIndex(0 if prof.reverse_second else 1)
+        second_row.addWidget(self._reverse, 1)
+        gl.addLayout(second_row)
+
+        self._rotate = ThemedCheckBox("第 2 趟内容旋转 180°（补偿纸路径翻转，实测 HP 1020 需要）")
+        self._rotate.setChecked(bool(prof.second_rotate_180))
+        gl.addWidget(self._rotate)
+
+        by_row = QHBoxLayout()
+        by_row.addWidget(QLabel("校准人："))
+        self._by = QLineEdit(prof.verified_by or verified_by or "")
+        self._by.setPlaceholderText("谁做的实机校准（留痕用）")
+        by_row.addWidget(self._by, 1)
+        gl.addLayout(by_row)
+
+        lay.addWidget(self._grp)
+
+        self._cur = QLabel("")
+        self._cur.setStyleSheet("font-size: 11px;")
+        self._cur.setWordWrap(True)
+        lay.addWidget(self._cur)
+        self._show_current(prof)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        ok = QPushButton("保存")
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        self._sync_enabled()
+
+    def _sync_enabled(self):
+        manual = self._cap.currentIndex() == 1
+        self._grp.setEnabled(manual)
+        self._by.setEnabled(self._cap.currentIndex() != 0)
+
+    def _show_current(self, prof: PrinterProfile):
+        self._cur.setText(f"当前档案：{prof.summary()}")
+
+    def values(self) -> dict:
+        """对话框 → update_profile 的字段（未确认 = 清掉人工结论，回到驱动双面旧行为）。"""
+        idx = self._cap.currentIndex()
+        if idx == 0:
+            return {"auto_duplex": None, "capability_source": "", "manual_duplex": False,
+                    "verified_at": "", "verified_by": "", "note": "人工改回「未确认」"}
+        manual = (idx == 1)
+        by = self._by.text().strip()
+        return {
+            "auto_duplex": not manual,
+            "capability_source": "manual",
+            "manual_duplex": manual,
+            "first": "even" if self._first.currentIndex() == 1 else "odd",
+            "reverse_second": self._reverse.currentIndex() == 0,
+            "second_rotate_180": bool(self._rotate.isChecked()),
+            "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "verified_by": by,
+            "note": ("人工盖章：不支持自动双面，双面由程序分两趟 + 人工翻纸"
+                     if manual else "人工盖章：支持自动双面（驱动一次成型）"),
+        }
+
+
 class SpeedCalibrationWorker(QThread):
     """打印速度两点标定：打 1 张 + 10 张**空白页**（单面，不需要翻纸）→ 交给档案拟合。
 
@@ -1172,7 +1317,7 @@ class PrintWorker(QThread):
         printer_name: str,
         duplex_mode: str,
         keep_temp_pdf: bool,
-        render_dpi: int = 400,
+        render_dpi: int = 0,
         cover_page: bool = False,
         cover_page_config: dict | None = None,
         manual_duplex_profile: PrinterProfile | None = None,
@@ -1227,9 +1372,62 @@ class PrintWorker(QThread):
         self._flip_continue = bool(cont)
         self._flip_event.set()
 
+    def _effective_pages(self, job: PrintJob, print_path: str = "") -> int:
+        """本任务**实际会打印**的有效页数（单页硬闸门的判据）；0 = 确实未知。
+
+        为什么优先数真实 PDF：job.page_count 可能过时/未知（旧配置、云端订单还没做页数
+        分析时是 0），而"要不要请求双面"必须按**真的要打几页**决定。
+        只在 `page_count <= 1` 时才去解析 PDF —— 页数 ≥2 时按已知页数套页码范围就够了
+        （范围解析不依赖 PDF 内容），免得每次打印都白解析一遍 PDF。
+        """
+        n = int(getattr(job, "page_count", 0) or 0)
+        if n <= 1:
+            for _p in (print_path, getattr(job, "cached_pdf", ""),
+                       getattr(job, "file_path", "")):
+                try:
+                    if _p and os.path.isfile(_p) and str(_p).lower().endswith(".pdf"):
+                        _c = int(count_pdf_pages(_p) or 0)
+                        if _c > 0:
+                            n = _c
+                            break
+                except Exception:
+                    continue
+        if n <= 0:
+            return 0
+        try:
+            return int(_count_pages_in_range(getattr(job, "page_range", "") or "", n))
+        except Exception:
+            return n
+
+    def _effective_duplex(self, job: PrintJob, n_pages: int = 0) -> str:
+        """本次实际该请求的双面模式：有效页数 == 1 ⇒ "off"（单页硬闸门，2026-10-17 事故）。
+
+        现场：单页 docx 的 job.duplex="on" → 驱动弹 HP「双面打印说明」向导，打出一张
+        空白页 + 正式页。1 页纸物理上不可能双面（配对需要 2 页），请求双面只会让驱动
+        多走一张空白纸。放在**打印线程**里做硬闸门，才盖得住云端订单 / 旧配置 / 手工
+        改坏的 job.duplex（主线程 `_on_convert_finished` 的归一化只在**转换完成那一刻**
+        写一次：云端任务与本地文件都走那里，但旧配置里早就存在的 job、或没经过转换的
+        PDF 直打，都不经过它）。
+        页数未知(0) 不当作 1 页：保持请求原样（宁可交给驱动，也不能把多页文件误降单面）。
+        """
+        eff = int(n_pages or 0) or self._effective_pages(job)
+        if eff == 1:
+            return "off"
+        return "on" if (getattr(job, "duplex", "off") or "off") == "on" else "off"
+
     def _uses_manual_duplex(self, job: PrintJob) -> bool:
-        """该任务是否要走"程序自己分两趟 + 人工翻纸"。"""
+        """该任务是否要走"程序自己分两趟 + 人工翻纸"。
+
+        单页硬闸门（2026-10-17 现场事故）：有效页数 == 1 ⇒ **不是**手动双面 —— 1 页要靠
+        一张空白占位纸才能凑成"一张纸的两面"，等于白走一趟纸、白翻一次纸；直接单面打
+        一张更快也不会错。页数未知(0) 不当成 1 页（保持旧行为）。
+        判据只用 job.page_count（**不解析 PDF**）：run() 里在 print_path 就绪后由
+        `_print_one_job` 按真实 PDF 兜底，这里不该为判页数去读盘。
+        """
         p = self._manual_profile
+        if int(_count_pages_in_range(getattr(job, "page_range", "") or "",
+                                     int(getattr(job, "page_count", 0) or 0))) == 1:
+            return False
         return bool(job.duplex == "on" and p is not None
                     and p.auto_duplex is False and p.manual_duplex)
 
@@ -1298,11 +1496,20 @@ class PrintWorker(QThread):
 
         手动双面的任务不会走到这里：它们在 run() 里被"并入手动双面批次"，由
         `_print_manual_batch` 一次性打完（**整批只翻一次纸**）。"""
+        # 单页硬闸门（2026-10-17 现场事故）：按**真实 PDF** 数出的有效页数 == 1 ⇒ 传 "off"。
+        # 这一道盖的是主线程归一化管不到的情形（云端订单 / 旧配置 / 手工改坏）；
+        # 1 页请求双面会让驱动弹手动双面向导、多送一张空白纸走一趟。
+        _eff_pages = self._effective_pages(job, print_path)
+        _duplex = self._effective_duplex(job, _eff_pages)
+        if _duplex != (getattr(job, "duplex", "off") or "off"):
+            self.log_message.emit(
+                f"  ⚠ 有效页数 {_eff_pages} 页 → 本次按**单面**打印"
+                f"（1 页双面物理上不可能，请求双面会让驱动多走一张空白纸）")
         return print_pdf(
             pdf_path=print_path,
             printer_name=self._printer_name,
             copies=copies,
-            duplex=job.duplex,
+            duplex=_duplex,
             duplex_mode=job.duplex_mode or self._duplex_mode,
             page_range=job.page_range,
             orientation=orientation,
@@ -1561,7 +1768,11 @@ class PrintWorker(QThread):
                 if not sel:
                     sel = list(range(1, n + 1))
                 label = job.display_name or os.path.basename(job.file_path) or f"#{idx + 1}"
-                dup = (getattr(job, "duplex", "off") or "off") == "on"
+                # 单页硬闸门（2026-10-17 现场事故）：有效页数 == 1 的文件不按双面配对
+                # （1 页凑不出"一张纸的两面"），按单面入叠 —— 它在纸叠里仍占 1 张纸、
+                # 第 2 趟对应槽位是空白占位（只走纸不打墨），张数与旧写法完全相同，
+                # 只是 file_plans/日志不再谎称它是双面任务。
+                dup = ((getattr(job, "duplex", "off") or "off") == "on" and len(sel) > 1)
                 paths.append(path)
                 for c in range(max(1, int(job.copies or 1))):
                     plans.append({
@@ -1692,8 +1903,11 @@ class PrintWorker(QThread):
                     sides = estimate_manual_duplex_sides(
                         n_pages, max(1, job.copies), job.page_range)
                 else:
+                    # 单双面口径必须与真正打印时一致（`_effective_duplex`）：1 页文件按单面算，
+                    # 否则"1 页 + 多份 + 双面"会把 `estimate_print_sides` 里的副本分隔页也算
+                    # 进去（实测 1 页 ×2 份 估 3 面、实际只打 2 面），进度条永远到不了 100%。
                     sides = estimate_print_sides(
-                        n_pages, max(1, job.copies), job.duplex, job.page_range,
+                        n_pages, max(1, job.copies), self._effective_duplex(job), job.page_range,
                     )
                 job_sides.append(sides)
             total_sides = sum(job_sides)
@@ -1863,6 +2077,21 @@ class PrintWorker(QThread):
                             pass
 
                 # 2. 打印 PDF（传入进度回调）
+                # 单页硬闸门·**转换件补判**（2026-10-17 现场事故）：job.page_count 未知(0) 时
+                # 上面的 defer 按"未知不当成 1 页"判成了"要两趟"；但转换出来的 PDF 此刻就在
+                # 手上、页数可数 —— 数出来确实只有 1 页的就地纠正回"单面直打"，免得给它配一张
+                # 空白占位纸、白翻一次纸（正是事故的浪费形态）。
+                # ⚠ 只对"原件不是 PDF"（= print_path 是转换件）生效：原件本身就是 PDF 的情形由
+                #   `_uses_manual_duplex`（按 job.page_count）与 `_print_one_job`（按真实 PDF）裁决
+                #   ——既有验收把「1 页 PDF 参与手动双面合批」钉成了既有行为，不能在这里推翻。
+                if (defer and not self._stack_mode
+                        and int(getattr(job, "page_count", 0) or 0) <= 0
+                        and not str(job.file_path or "").lower().endswith(".pdf")
+                        and self._effective_pages(job, print_path) == 1):
+                    self.log_message.emit(
+                        "  ⚠ 转换后实际只打 1 页 → 按**单面**直打"
+                        "（不入手动双面批次：省一张空白占位纸、省一次翻纸）")
+                    defer = False
                 # 手动双面：不在这里打 —— 并入批次，等本批所有文件都准备好后**一次翻纸**打完
                 if defer:
                     deferred.append((idx, job, print_path, temp_pdf))
@@ -2825,6 +3054,14 @@ class MainWindow(QMainWindow):
         # 放到启动末尾（UI/日志就绪）再问，避免弹窗盖住启动日志。
         QTimer.singleShot(1200, self._check_pending_stack_on_startup)
 
+        # ── 双面能力未确认就明说（2026-10-17 事故防呆：不盖章 ⇒ 会走驱动程序自带的
+        #    手动双面向导，单页文件可能先吐一张空白页）。同一队列同一状态只提示一次。
+        #    _duplex_warned 可能已被构造期 _refresh_printer_list 的切换回调用过，别清空
+        #    （否则同一队列会连打两条一模一样的提示）。
+        if not hasattr(self, "_duplex_warned"):
+            self._duplex_warned = ""
+        self._warn_if_duplex_capability_unknown()
+
     # ---- 攒批：启动续打 ----
 
     def _check_pending_stack_on_startup(self):
@@ -3557,6 +3794,12 @@ class MainWindow(QMainWindow):
                                 "（翻纸窗的第 1 趟预计耗时用它）")
         speed_action.triggered.connect(self._on_calibrate_speed)
         help_menu.addAction(speed_action)
+        duplex_cap_action = QAction("打印机双面能力…", self)
+        duplex_cap_action.setToolTip("给当前打印队列盖「支持/不支持自动双面」的章："
+                                     "不支持则改用程序自己的两趟控制器（人工翻纸），"
+                                     "不再走驱动程序自带的「双面打印说明」向导")
+        duplex_cap_action.triggered.connect(self._on_printer_duplex_capability)
+        help_menu.addAction(duplex_cap_action)
         help_menu.addSeparator()
         self._update_action = QAction("检查更新(&U)", self)
         self._update_action.triggered.connect(lambda: self._start_update_check(manual=True))
@@ -3829,9 +4072,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel(" DPI："))
 
         self._render_dpi_combo = QComboBox()
-        self._render_dpi_combo.addItems(["高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
+        self._render_dpi_combo.addItems(["自动(设备原生)", "高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
         _disable_combo_wheel(self._render_dpi_combo)
-        self._render_dpi_combo.setToolTip("全局默认渲染质量，DPI越高越清晰但越慢")
+        self._render_dpi_combo.setToolTip(
+            "自动(设备原生)：按打印机最终像素 1:1 渲染"
+            "（最清晰、推荐，且不再吃 100MB/页内存）；"
+            "其它档位是渲染分辨率上限，低于设备分辨率时会被放大一次（换速度）")
         self._render_dpi_combo.currentIndexChanged.connect(self._on_render_dpi_changed)
         layout.addWidget(self._render_dpi_combo)
 
@@ -4366,7 +4612,12 @@ class MainWindow(QMainWindow):
         """按当前打印机档案标注双面选项：不支持自动双面时写明「手动翻纸」。
 
         只在**人工确认过**（档案 auto_duplex=False + manual_duplex=True）时才改文案 —— 能力
-        未确认的机器保持原样，避免凭空吓唬用户（未确认时走驱动双面，与旧版行为一致）。"""
+        未确认的机器保持原样，避免凭空吓唬用户（未确认时走驱动双面，与旧版行为一致）。
+
+        提示行还要看**当前选区能不能双面**（`_duplex_usable`，由 _on_table_selection 记下）：
+        选中图片/单页文件时双面控件整体灰掉、物理上也不会双面，此时提示跟着收起 ——
+        否则面板会一边灰着「单面」一边写着「分两趟打印」。
+        """
         if not hasattr(self, '_edit_duplex'):
             return
         try:
@@ -4378,11 +4629,21 @@ class MainWindow(QMainWindow):
         if self._edit_duplex.itemText(0) != want:
             self._edit_duplex.setItemText(0, want)
         if hasattr(self, '_edit_duplex_hint'):
-            if manual:
-                self._edit_duplex_hint.setText("← 本机无自动双面：程序分两趟打，中途会弹窗提示翻纸")
+            show = bool(manual and getattr(self, '_duplex_usable', True))
+            if show:
+                # 文案必须**极短**（默认窗口下编辑面板视口只有 ~178px，见 task-7 复核：
+                # 之前那句 27 字在里面恒为 3 行，是面板里视觉最重的一块）；正上方下拉已经
+                # 写着「双面（手动翻纸）」，这里只补它没说的两件事：分两趟、中途要翻纸。
+                # 完整三步说明放 tooltip（不占版面，鼠标停上去就有）。
+                self._edit_duplex_hint.setText("分两趟打印 · 中途需翻纸")
+                self._edit_duplex.setToolTip(
+                    "本机无自动双面器（能力已人工确认）：双面由程序自己分两趟打印（全程单面）。\n"
+                    "第 1 趟出纸后弹窗提示你把纸叠原样搬回纸盘、点「继续打第 2 趟」；\n"
+                    "第 2 趟内容会自动做 180° 补偿，成品叠最上面是第 1 页。")
             else:
                 self._edit_duplex_hint.setText("")
-            self._edit_duplex_hint.setVisible(manual)
+                self._edit_duplex.setToolTip("")
+            self._edit_duplex_hint.setVisible(show)
 
     def _set_tab_state_badge(self, is_frozen: bool, needs_flip: bool) -> None:
         """（主线程）刷新标签页状态徽标（两处）：
@@ -5023,6 +5284,10 @@ class MainWindow(QMainWindow):
         multi, any_img, any_single = self._selection_traits(jobs, sorted(rows))
         duplex_usable = (not any_img) and (not any_single)
         range_usable = (not multi) and (not any_img)
+        # 记下"这份选区到底能不能双面"：双面能力提示（"分两趟打印 · 中途需翻纸"）是讲**打印机**的，
+        # 但选中的是图片/单页文件时双面控件整个灰掉、物理上也不会双面 ⇒ 提示跟着收起来，
+        # 免得面板一边灰着"单面"一边还写着"分两趟打印"（见 _update_duplex_label）。
+        self._duplex_usable = duplex_usable
 
         # 同步编辑控件
         self._edit_copies.blockSignals(True)
@@ -5098,6 +5363,10 @@ class MainWindow(QMainWindow):
             self._edit_page_range.blockSignals(True)
             self._edit_page_range.set_ranges("")
             self._edit_page_range.blockSignals(False)
+
+        # 双面能力提示（"分两趟打印 · 中途需翻纸"）跟着选区的可用性收起/恢复 —— 见
+        # _update_duplex_label：选中的是图片/单页文件时双面控件整体灰掉，提示不该还挂着。
+        self._update_duplex_label()
 
         # 图片方向（仅图片可用）：auto=自动 / landscape=横向 / portrait=竖向
         img_ori_map = {"auto": 0, "landscape": 1, "portrait": 2}
@@ -5489,9 +5758,19 @@ class MainWindow(QMainWindow):
         _disable_combo_wheel(self._edit_duplex)
         self._edit_duplex.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_duplex)
-        # 打印机不支持自动双面时的提示（文案随打印机档案变，见 _update_duplex_label）
+        # 打印机不支持自动双面时的说明（文案随打印机档案变，见 _update_duplex_label）
+        # ⚠ 必须是**可换行、不参与最小宽度**的窄提示：早期写法把一整句中文塞进不换行的
+        #   QLabel，它的 sizeHint（整行文字宽度）会直接把编辑面板的最小宽度撑得比可视区
+        #   还宽 ⇒ 窄面板下整行被裁掉、只剩半句（2026-10-17 用户现场截图）。
+        #   修法与同一面板的 selectedFileLabel / 备注框**同策略**：wordWrap + 水平
+        #   QSizePolicy.Ignored + minimumWidth(0)（宽度完全由面板给，多出来的折行），
+        #   颜色与字号交给主题 QSS（QLabel#duplexHint，深浅两套）。缩进 6px 对齐字段。
         self._edit_duplex_hint = QLabel("")
-        self._edit_duplex_hint.setStyleSheet("color: #e67e22;")
+        self._edit_duplex_hint.setObjectName("duplexHint")
+        self._edit_duplex_hint.setWordWrap(True)
+        self._edit_duplex_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._edit_duplex_hint.setMinimumWidth(0)
+        self._edit_duplex_hint.setIndent(6)
         self._edit_duplex_hint.setVisible(False)
         gl.addWidget(self._edit_duplex_hint)
 
@@ -5681,8 +5960,8 @@ class MainWindow(QMainWindow):
         self._sync_stack_button()
 
         # 全局渲染 DPI
-        dpi_map = {200: 0, 300: 1, 400: 2, 600: 3}
-        self._render_dpi_combo.setCurrentIndex(dpi_map.get(self._config.render_dpi, 2))
+        dpi_map = {0: 0, 200: 1, 300: 2, 400: 3, 600: 4}
+        self._render_dpi_combo.setCurrentIndex(dpi_map.get(self._config.render_dpi, 0))
 
         # 附加服务
         self._delivery_onoff_combo.blockSignals(True)
@@ -5787,6 +6066,9 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.debug(f"切换打印机时同步选择失败: {e}")
         self._sync_stack_button()
+        # 换了队列 ⇒ 双面能力要按**新队列**重判并提示（换成未盖章的机型时，
+        # 双面请求会悄悄回到驱动自带的手动双面向导 —— 见 _warn_if_duplex_capability_unknown）
+        self._warn_if_duplex_capability_unknown()
 
     def _on_refresh_printers(self):
         """刷新打印机列表按钮回调。"""
@@ -5935,9 +6217,9 @@ class MainWindow(QMainWindow):
 
     def _on_render_dpi_changed(self):
         """全局渲染 DPI 变更。"""
-        dpi_values = [200, 300, 400, 600]
+        dpi_values = [0, 200, 300, 400, 600]
         idx = self._render_dpi_combo.currentIndex()
-        self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
+        self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 0
 
     # ---- 附加服务信号处理（每标签页独立）----
 
@@ -6306,9 +6588,9 @@ class MainWindow(QMainWindow):
 
         # 价格（单双面/派送百分比/加急/首页费）统一在「收支统计 → 设置」维护，
         # 由 _sync_pricing 同步到 self._config，主界面不提供价格编辑入口。
-        dpi_values = [200, 300, 400, 600]
+        dpi_values = [0, 200, 300, 400, 600]
         idx = self._render_dpi_combo.currentIndex()
-        self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 400
+        self._config.render_dpi = dpi_values[idx] if 0 <= idx < len(dpi_values) else 0
 
         self._config.last_dir = self._last_dir
 
@@ -7199,6 +7481,91 @@ class MainWindow(QMainWindow):
         """当前打印队列的档案（print_config.json 的 printer_profiles；没登记返回默认/未确认）。"""
         return self._config.get_profile(self._config.printer_name)
 
+    # ── 双面能力：未确认就明说 + 给用户一个自己盖章的入口（2026-10-17 事故防呆）──
+
+    def _warn_if_duplex_capability_unknown(self, force: bool = False):
+        """当前队列的双面能力没盖章时，在日志里明确写出后果（同一队列同一状态只说一次）。
+
+        为什么必须说出来：能力"未确认"时程序按**旧行为**把双面请求交给驱动，而
+        HP LaserJet 1018/1020/1022 这类无自动双面器的机型**驱动会虚报支持**
+        （实测本机「HP LaserJet 1020」USB005 队列报 DC_DUPLEX=1 / 接受 Duplex=2），
+        实际弹出的是**驱动程序自带**的手动双面向导（「双面打印说明」：偶数页先打 →
+        提示整叠搬回 → 再打奇数页）——2026-10-17 现场就是这样：单页文件先吐一张空白页
+        再打正式页，而且**完全没走**程序自己的两趟控制器。日志里不说，用户永远不知道
+        该去盖这个章。
+
+        虚拟打印机（Print to PDF / XPS / OneNote / Adobe PDF…）不出纸，双面对它是空操作，
+        不提示（否则天天刷日志，真问题会被淹掉）。切队列时会重判一次。
+        """
+        try:
+            queue = (self._config.printer_name or "").strip()
+            if not queue:
+                return
+            from pdf_printer import is_virtual_printer
+            if is_virtual_printer(queue):
+                return
+            prof = self._printer_profile()
+            if prof.auto_duplex is not None:
+                self._duplex_warned = ""       # 盖章后复位：以后再回到未确认还能再提示
+                return
+            if not force and getattr(self, "_duplex_warned", "") == queue:
+                return                          # 同一队列同一状态只说一次（切回来才再说）
+            self._duplex_warned = queue
+            self._log(f"⚠ 打印机「{queue}」的双面能力**未确认**：含双面文件的作业按驱动双面提交。"
+                      f"若本机没有自动双面器（HP LaserJet 1018/1020/1022 这类驱动会虚报支持），"
+                      f"实际走的是驱动程序自带的「双面打印说明」向导（偶数页先打 → 提示翻纸 → "
+                      f"再打奇数页），单页文件还可能先吐一张空白页。"
+                      f"请用「帮助 → 打印机双面能力…」盖章，改用程序自己的两趟控制器"
+                      f"（全程单面、只翻一次纸、第 2 趟自动 180° 补偿）。")
+        except Exception as e:      # 启动早期/半初始化的验收环境都要能安全调用
+            logger.debug(f"双面能力提示失败（忽略）: {e}")
+
+    def _on_printer_duplex_capability(self):
+        """帮助 → 打印机双面能力…：给当前队列盖三态章 + 手动双面参数。
+
+        人工结论（capability_source="manual"）**优先于自动探测且不被探测覆盖** ——
+        这正是老机型（驱动虚报支持）唯一可靠的判据来源。此前只能敲命令行建档案，
+        而档案又被旧版客户端的整体落盘清空过一次（根因见 printer_config.py 顶部），
+        所以补上这个图形入口。
+        """
+        queue = (self._config.printer_name or "").strip()
+        if not queue:
+            QMessageBox.information(self, "打印机双面能力",
+                                    "请先在顶栏选择一台打印机，再设置它的双面能力。")
+            return
+        dlg = PrinterDuplexCapabilityDialog(
+            queue, self._printer_profile(),
+            verified_by=(self._config.cloud_owner_name or ""), parent=self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        if self._apply_duplex_capability(queue, dlg.values()):
+            summary = self._config.get_profile(queue).summary()
+            self._log(f"🖨 打印机双面能力已更新：{queue} → {summary}")
+            QMessageBox.information(
+                self, "打印机双面能力",
+                f"「{queue}」的能力档案已保存：\n\n{summary}\n\n"
+                f"人工结论不会被自动探测覆盖；双面作业按它决定走程序自己的两趟控制器"
+                f"（人工翻纸）还是交给驱动一次成型。")
+
+    def _apply_duplex_capability(self, queue: str, values: dict) -> bool:
+        """把对话框结果写进该队列档案并落盘（读写都在 printer_config 层，GUI 不另开口子）。"""
+        try:
+            self._config.update_profile(queue, **values)
+        except Exception as e:
+            self._log(f"⚠ 打印能力档案写入失败：{type(e).__name__}: {e}")
+            QMessageBox.warning(self, "打印机双面能力", f"档案写入失败：{e}")
+            return False
+        self._save_config()
+        # 能力变了 ⇒ 攒批入口显隐、「双面（手动翻纸）」文案、无人值守挂起判据都要立刻跟变
+        self._duplex_warned = ""
+        try:
+            self._set_stack_checkbox(self._stack_mode_on())
+            self._sync_stack_button()
+            self._update_duplex_label()
+        except Exception as e:
+            logger.debug(f"能力变更后的 UI 刷新失败（忽略）: {e}")
+        return True
+
     def _manual_flip_required_for(self, jobs) -> bool:
         """这批任务是否"必须人工翻纸"：本机不支持自动双面 **且** 含双面文件。
 
@@ -7517,8 +7884,15 @@ class MainWindow(QMainWindow):
         self._apply_stack_mode(want, source="移动端")
 
     def _uses_manual_duplex_job(self, job) -> bool:
-        """单个任务是否要"程序自己分两趟 + 人工翻纸"（与 PrintWorker._uses_manual_duplex 同口径）。"""
+        """单个任务是否要"程序自己分两趟 + 人工翻纸"（与 PrintWorker._uses_manual_duplex 同口径）。
+
+        单页硬闸门（2026-10-17 现场事故）：有效页数 == 1 ⇒ False —— 1 页文件双面没有
+        意义（配对需要 2 页），进了手动双面批次/攒批单只会白配一张空白占位纸。它照旧
+        按单面直打（攒批模式下若同单里还有真正的双面文件，仍随整单入叠，见
+        `_print_stack_pass1`）。页数未知(0) 不当成 1 页（旧行为不变）。"""
         p = self._printer_profile()
+        if self._job_is_single_page(job):
+            return False
         return bool((getattr(job, "duplex", "off") or "off") == "on"
                     and p.auto_duplex is False and p.manual_duplex)
 
@@ -10045,6 +10419,27 @@ class MainWindow(QMainWindow):
         jobs[target_row].cached_pdf = cached_pdf
         jobs[target_row].page_count = page_count
         jobs[target_row].orientation = orientation
+
+        # ── 单页归一化：有效页数 == 1 的本地文件一律改单面（2026-10-17 现场事故）──
+        # 现场：单页 docx 的 job.duplex="on"（print_config.json 里 page_count=1）→ 日志
+        # 「正在打印 (份数:1, 双面:on)」→ 驱动弹 HP「双面打印说明」向导，打出一张空白页 +
+        # 正式页。1 页纸物理上不可能双面（配对需要 2 页），请求双面只会多走一张空白纸。
+        # 页数**未知(0) 不是 1 页**：`_count_pages_in_range("", 0) == 0`，绝不能归一化
+        # （否则云端/还没分析出页数的文件会被误判成单面而丢掉双面）。
+        # ⚠ 打印侧另有一道**硬闸门**（`PrintWorker._effective_duplex`，按真实 PDF 数页），
+        #    覆盖云端订单 / 旧配置 / 手工改坏；这一道只负责让界面与配置先和事实一致。
+        _single_page_norm = False
+        _job = jobs[target_row]
+        _is_img = (bool(_job.file_path)
+                   and os.path.splitext(_job.file_path)[1].lower() in self.IMAGE_EXTS)
+        if (not _is_img and _job.duplex == "on"
+                and int(_count_pages_in_range(_job.page_range or "", _job.page_count or 0)) == 1):
+            _job.duplex = "off"
+            _single_page_norm = True
+            self._log(f"  → {_job.display_name or os.path.basename(_job.file_path)} "
+                      f"实际只打 1 页 → 自动改为**单面**"
+                      f"（1 页双面物理上不可能，请求双面会让驱动多送一张空白纸）")
+
         self._save_config()
 
         # 仅当目标标签页是当前前台标签页时才更新表格（后台标签页表格不可见）
@@ -10055,8 +10450,17 @@ class MainWindow(QMainWindow):
                 ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
                 ori_text = ori_map.get(orientation, "")
                 self._table.item(target_row, self.COL_ORIENT).setText(ori_text)
+                if _single_page_norm:
+                    # 归一化改了 job.duplex → **整行重画**（双面列必须立刻显示「单面」；
+                    # 只改 COL_PAGES 会留下"表格写着双面、实际按单面打"的假象）。
+                    self._fill_table_row(target_row, jobs[target_row])
             self._recalc_row_cost(target_row)
             self._update_total_cost()
+            if _single_page_norm and target_row in self._selected_rows():
+                # 编辑面板此刻正显示这一行 → 同步（与 `_selection_traits` 同源：1 页文件的
+                # 「单/双面」控件本就该是灰的并显示单面）。它只读 job 重画面板、不写回，
+                # 不会碰用户刚改的其它输入。
+                self._on_table_selection()
 
         # 转换完成后存入 MD5 缓存（供后续同文件复用，避免重复转换）
         if cached_pdf and os.path.isfile(cached_pdf) and target_row < len(jobs):

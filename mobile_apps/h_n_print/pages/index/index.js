@@ -3147,10 +3147,9 @@ Component({
       if (!badNames.length) return { invalid: false, message: '' }
       const what = badTypes.length ? ('包含' + badTypes.join('、') + '类型') : ('包含「' + badNames[0] + '」')
       const offline = this._targetDeviceOfflineState() === true
-      const message = '需打印的文件中' + what + '，且页数未完成计算，价格计算无效。'
-        + (offline
-            ? '接管设备当前离线，请等设备上线并完成转换后再复制价格。'
-            : '请等本地打印工具完成转换、页数返回后再复制价格。')
+      const message = '需打印的文件中' + what + '，且页数未完成计算，价格暂无法确定。'
+        + '页数计算完成后价格会自动更新，请稍后在「我」→ 订单详情查看该订单的最终价格。'
+        + (offline ? '（接管设备当前离线，页数需等设备上线后计算。）' : '')
       return { invalid: true, message }
     },
 

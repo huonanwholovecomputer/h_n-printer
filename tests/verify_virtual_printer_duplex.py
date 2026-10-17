@@ -98,6 +98,7 @@ def install_fake_win32print(*, driver, port, dc_duplex, reverts, log=None):
         Duplex = 1
         Fields = 0
         Orientation = 1
+        Color = 2          # DMCOLOR_COLOR：本测试验证双面闸门，强制走 RGB 位图路径
 
     def _open(name):
         if log is not None:
@@ -216,7 +217,7 @@ class FakePage:
         self.idx = idx
         self.rect = FakeRect(595.0, 842.0)      # A4 pt
 
-    def get_pixmap(self, matrix=None, alpha=False):
+    def get_pixmap(self, matrix=None, colorspace=3, alpha=False):
         return FakePixmap(100, 140)
 
 
@@ -287,6 +288,7 @@ def install_fake_gdi(rec, n_pages, *, printer, driver, port, reverts=True):
         Duplex = 1
         Fields = 0
         Orientation = 1
+        Color = 2          # DMCOLOR_COLOR：本测试验证双面闸门，强制走 RGB 位图路径
 
     def _document_properties(hwnd, handle, name, out, inp, flags):
         if reverts and getattr(inp, "Duplex", 1) in (2, 3):
@@ -314,6 +316,8 @@ def install_fake_gdi(rec, n_pages, *, printer, driver, port, reverts=True):
             self.x, self.y = x, y
 
     fm.Matrix = _Matrix
+    fm.csGRAY = 1               # 渲染策略用到的常量（真实 fitz 里分别是 1/3）
+    fm.csRGB = 3
     fm.open = lambda path: FakeDoc(n_pages)
 
     pim = types.ModuleType("PIL.Image")

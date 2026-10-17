@@ -82,7 +82,7 @@ class FakePage:
         self.idx, self.rec = idx, rec
         self.rect = FakeRect(595.0, 842.0)     # A4 pt
 
-    def get_pixmap(self, matrix=None, alpha=False):
+    def get_pixmap(self, matrix=None, colorspace=3, alpha=False):
         self.rec.current = f"p{self.idx}"
         return FakePixmap(100, 140)
 
@@ -141,6 +141,7 @@ class FakeDevMode:
         self.Duplex = 1
         self.Fields = 0
         self.Orientation = 1
+        self.Color = 2          # DMCOLOR_COLOR：本测试只验证页序/旋转，强制走 RGB 位图路径
 
 
 def install_fakes(rec, *, n_pages=6, driver_reverts=True, dm_readable=True,
@@ -192,6 +193,8 @@ def install_fakes(rec, *, n_pages=6, driver_reverts=True, dm_readable=True,
             self.x, self.y = x, y
 
     fm.Matrix = _Matrix
+    fm.csGRAY = 1               # 新增渲染策略用到这两个常量（真实 fitz 里分别是 1/3）
+    fm.csRGB = 3
     fm.open = lambda path: FakeDoc(n_pages, rec)
 
     # ---- 假 PIL.Image / PIL.ImageWin ----
@@ -652,8 +655,9 @@ try:
           _bytes < 400 * 1024 * 1024, f"{_bytes / 1024 / 1024:.0f} MiB")
     check("★ 32 位分档存在且更保守（源码按 sys.maxsize 分流）",
           "sys.maxsize > 2 ** 32" in code_src and "300 * 1024 * 1024" in code_src)
-    check("★ 上限已提到模块级（不再在逐页循环里重新赋值）",
-          code_src.count("MAX_RENDER_PIXELS") >= 3)
+    check("★ 上限已提到模块级（不在逐页循环里重新赋值；单色另有一档）",
+          code_src.count("MAX_RENDER_PIXELS") >= 2
+          and "MONO_RENDER_PIXELS = max_render_pixels(_PIXEL_BYTES_GRAY)" in code_src)
 except Exception as e:  # pragma: no cover
     check(f"读取 pdf_printer.max_render_pixels() 失败: {e}", False)
 

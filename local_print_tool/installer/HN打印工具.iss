@@ -56,12 +56,12 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"; Flags: unchecked
 
 [Files]
-; 安装整个程序目录（递归），排除一切用户数据文件（配置/收支/缓存/暂存副本/攒批账本/日志/客户端ID）
+; 安装整个程序目录（递归），排除一切用户数据文件（配置/收支/缓存/暂存副本/攒批账本/打印机档案/日志/客户端ID）
 ; ⚠ 这是**第二道防线**（主防线是 .spec 的 datas 白名单，见文件头说明）。
 ;   清单必须与 paths.py 的 get_app_data_dir() 下的全部条目一致 ——
 ;   tests/verify_installer_excludes.py 会做集合比对，漏一项就红。
 Source: "..\dist\HN打印工具\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; \
-  Excludes: "print_config.json,theme_settings.json,user_bindings.json,printer-local.db,.processed_tasks.json,print_data.json,logs,pdf_cache,file_cache,duplex_stack,.client_id,finance\print_data.json"
+  Excludes: "print_config.json,theme_settings.json,user_bindings.json,printer-local.db,.processed_tasks.json,print_data.json,printer_profiles.json,logs,pdf_cache,file_cache,duplex_stack,.client_id,finance\print_data.json"
 
 ; 覆盖安装时先清掉旧 _internal 与旧 exe（新版本删除的文件不残留）
 [InstallDelete]

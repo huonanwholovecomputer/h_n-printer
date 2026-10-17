@@ -414,6 +414,12 @@ QLabel#sectionLabel {
     text-transform: uppercase;
 }
 
+/* 「单/双面」下面那行小提示（本机无自动双面器时出现）：低调琥珀色，11px、可换行 */
+QLabel#duplexHint {
+    color: #8a4a08;
+    font-size: 11px;
+}
+
 /* 选中文件信息标签 */
 QLabel#selectedFileLabel {
     color: #6c6f85;

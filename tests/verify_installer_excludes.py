@@ -80,6 +80,17 @@ def inventory_from_paths(src_text):
 
     items = set()
     joins = 0
+    # 模块级字符串常量（如 `PRINTER_PROFILES_FILENAME = "printer_profiles.json"`）也是合法的
+    # "第 2 段"来源：paths.py 用常量保证「路径函数与 printer_config 同一份文件名」，这里先把
+    # 常量展开再解析 —— 仍然是单一事实来源，且**非字面量/非模块常量的动态段照旧报错**
+    # （下面的对拍节覆盖"推导失效"这条）。
+    consts = {}
+    for node in getattr(tree, "body", []):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    consts[tgt.id] = node.value.value
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and _fn_name(node) == "join" and len(node.args) >= 2):
             continue
@@ -89,6 +100,8 @@ def inventory_from_paths(src_text):
         joins += 1
         if isinstance(seg, ast.Constant) and isinstance(seg.value, str):
             items.add(seg.value)
+        elif isinstance(seg, ast.Name) and seg.id in consts:
+            items.add(consts[seg.id])
         else:
             errors.append(f"get_app_data_dir() 的第 2 段不是字符串常量（第 {node.lineno} 行）")
 
