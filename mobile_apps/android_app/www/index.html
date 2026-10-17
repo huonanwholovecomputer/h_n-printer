@@ -244,153 +244,6 @@
             </view>
           </view>
 
-          <!-- 管理员区块（各子块用 admin-collapsible 展开/收起，对齐小程序入场动画） -->
-          <view id="adminSections">
-
-            <!-- 生成许可密钥 -->
-            <view class="license-section admin-collapsible" id="adminBlockKeys">
-              <view class="section-title">
-                <view class="section-bar"></view>
-                <text>生成许可密钥</text>
-                <text class="order-count" id="activeKeyCount" style="display:none">0</text>
-              </view>
-              <view class="license-card">
-                <text class="license-label">有效时间（分钟）</text>
-                <view class="stepper license-stepper">
-                  <view class="stepper-btn" id="licenseMinutesMinus" data-hover="stepper-hover">−</view>
-                  <input class="stepper-input" id="licenseMinutesValue" type="number" value="1" disabled>
-                  <view class="stepper-btn" id="licenseMinutesPlus" data-hover="stepper-hover">+</view>
-                </view>
-                <view class="key-type-row" id="keyTypeRow">
-                  <text class="key-type-label">密钥类型</text>
-                  <view class="key-type-toggle">
-                    <view class="key-type-slider" id="keyTypeSlider"></view>
-                    <view class="key-type-option opt-active" id="keyTypeTemp">临时许可</view>
-                    <view class="key-type-option" id="keyTypeAdmin">管理员许可</view>
-                  </view>
-                </view>
-                <button class="generate-btn" id="generateKeyBtn" data-hover="generate-hover">生成许可密钥</button>
-              </view>
-              <view id="activeKeys"></view>
-            </view>
-
-            <!-- 账号绑定入口（管理功能收进独立子视图，不在首页常驻展示） -->
-            <view class="role-actions">
-              <button class="role-btn user-btn" id="btnBindAccount" data-hover="role-btn-pressing">
-                <text class="role-btn-icon">🔗</text>
-                <view class="role-btn-text-wrap">
-                  <text class="role-btn-text">账号绑定（APP）</text>
-                  <text class="role-btn-desc" id="bindEntryDesc">管理微信账号绑定</text>
-                </view>
-                <text class="role-btn-arrow">›</text>
-              </button>
-            </view>
-
-            <!-- 检查更新入口 -->
-            <view class="role-actions">
-              <button class="role-btn user-btn" id="btnCheckUpdate" data-hover="role-btn-pressing">
-                <text class="role-btn-icon">🔄</text>
-                <view class="role-btn-text-wrap">
-                  <text class="role-btn-text">检查更新</text>
-                  <text class="role-btn-desc">在线下载新版本 APK</text>
-                </view>
-                <text class="role-btn-arrow">›</text>
-              </button>
-            </view>
-
-            <!-- 服务器存储 -->
-            <view class="storage-section admin-collapsible" id="adminBlockStorage">
-              <view class="section-title">
-                <view class="section-bar"></view>
-                <text>服务器存储</text>
-              </view>
-              <view class="storage-card">
-                <view class="storage-row"><text class="storage-label">📄 缓存文件</text><text class="storage-value" id="storageFiles">—</text></view>
-                <view class="storage-row"><text class="storage-label">💾 占用空间</text><text class="storage-value" id="storageSize">—</text></view>
-                <view class="storage-divider"></view>
-                <text class="retention-title">文件保留时间</text>
-                <text class="retention-forever-hint" id="retentionHint" style="display:none">当前为「永不过期」</text>
-                <view class="retention-row">
-                  <view class="retention-stepper">
-                    <view class="retention-stepper-btn" id="retentionDaysMinus" data-hover="stepper-hover">−</view>
-                    <input class="retention-stepper-input" id="retentionDaysValue" type="number" value="7" disabled>
-                    <view class="retention-stepper-btn" id="retentionDaysPlus" data-hover="stepper-hover">+</view>
-                  </view>
-                  <text class="retention-unit">天</text>
-                  <view class="retention-stepper">
-                    <view class="retention-stepper-btn" id="retentionHoursMinus" data-hover="stepper-hover">−</view>
-                    <input class="retention-stepper-input" id="retentionHoursValue" type="number" value="0" disabled>
-                    <view class="retention-stepper-btn" id="retentionHoursPlus" data-hover="stepper-hover">+</view>
-                  </view>
-                  <text class="retention-unit">小时</text>
-                </view>
-                <button class="retention-save-btn" id="saveRetentionBtn">保存设置</button>
-                <button class="delete-all-btn" id="deleteAllFilesBtn">⚠️ 删除全部缓存文件</button>
-              </view>
-            </view>
-
-            <!-- 防滥用设置 -->
-            <view class="security-section admin-collapsible" id="adminBlockSecurity">
-              <view class="section-title">
-                <view class="section-bar"></view>
-                <text>防滥用设置</text>
-              </view>
-              <view class="security-summary-card" id="securitySummary" data-hover="security-summary-pressing">
-                <view class="security-summary-left">
-                  <text class="security-summary-icon">🛡️</text>
-                  <view class="security-summary-text">
-                    <text class="security-summary-title">防滥用设置</text>
-                    <text class="security-summary-desc">点击管理 DDoS 防护阈值</text>
-                  </view>
-                </view>
-                <text class="security-summary-arrow" id="securityArrow">›</text>
-              </view>
-              <view class="security-detail" id="securityDetail">
-                <view class="storage-card security-detail-card">
-                  <text class="retention-title">以下阈值保存后立即生效（0 表示关闭对应检查）</text>
-                  <view id="securityItems"></view>
-                  <button class="retention-save-btn" id="saveSecurityBtn">保存防滥用设置</button>
-                </view>
-              </view>
-            </view>
-
-            <!-- 角色入口（对齐小程序：两张独立卡片） -->
-            <view class="role-actions admin-collapsible" id="adminBlockAuth">
-              <button class="role-btn user-btn" id="btnAuthorizedUsers" data-hover="role-btn-pressing">
-                <text class="role-btn-icon">👥</text>
-                <text class="role-btn-text">历史授权用户</text>
-                <text class="role-btn-arrow">›</text>
-              </button>
-            </view>
-            <view class="role-actions admin-collapsible" id="adminBlockLocal">
-              <button class="role-btn user-btn" id="btnLocalOrders" data-hover="role-btn-pressing">
-                <text class="role-btn-icon">🖨️</text>
-                <text class="role-btn-text">本地打印任务</text>
-                <text class="role-btn-arrow">›</text>
-              </button>
-            </view>
-
-            <!-- 超级管理员：管理员列表 -->
-            <view class="license-section" id="adminsBlock">
-              <view class="section-title">
-                <view class="section-bar"></view>
-                <text>管理管理员</text>
-                <text class="order-count" id="adminCount" style="display:none">0</text>
-              </view>
-              <view id="adminList"></view>
-            </view>
-
-            <!-- 已临时授权的普通用户 -->
-            <view class="license-section" id="tempUsersBlock">
-              <view class="section-title">
-                <view class="section-bar"></view>
-                <text>已临时授权的普通用户</text>
-                <text class="order-count" id="tempUserCount" style="display:none">0</text>
-              </view>
-              <view id="tempUserList"></view>
-            </view>
-          </view>
-
           <!-- 访客：验证许可密钥 -->
           <view class="license-section" id="guestSection">
             <view class="section-title">
@@ -476,6 +329,154 @@
             <view class="end-hint" id="ordersEndHint" style="display:none">
               <text class="end-hint-text">-- 没有更多内容啦 --</text>
             </view>
+          </view>
+
+          <!-- 账号绑定入口（管理功能收进独立子视图，不在首页常驻展示） -->
+          <view class="role-actions">
+            <button class="role-btn user-btn" id="btnBindAccount" data-hover="role-btn-pressing">
+              <text class="role-btn-icon">🔗</text>
+              <view class="role-btn-text-wrap">
+                <text class="role-btn-text">账号绑定（APP）</text>
+                <text class="role-btn-desc" id="bindEntryDesc">管理微信账号绑定</text>
+              </view>
+              <text class="role-btn-arrow">›</text>
+            </button>
+          </view>
+
+          <!-- 检查更新入口 -->
+          <view class="role-actions">
+            <button class="role-btn user-btn" id="btnCheckUpdate" data-hover="role-btn-pressing">
+              <text class="role-btn-icon">🔄</text>
+              <view class="role-btn-text-wrap">
+                <text class="role-btn-text">检查更新</text>
+                <text class="role-btn-desc">在线下载新版本 APK</text>
+              </view>
+              <text class="role-btn-arrow">›</text>
+            </button>
+          </view>
+
+          <!-- 管理员区块（各子块用 admin-collapsible 展开/收起，对齐小程序入场动画） -->
+          <view id="adminSections">
+
+            <!-- 生成许可密钥 -->
+            <view class="license-section admin-collapsible" id="adminBlockKeys">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>生成许可密钥</text>
+                <text class="order-count" id="activeKeyCount" style="display:none">0</text>
+              </view>
+              <view class="license-card">
+                <text class="license-label">有效时间（分钟）</text>
+                <view class="stepper license-stepper">
+                  <view class="stepper-btn" id="licenseMinutesMinus" data-hover="stepper-hover">−</view>
+                  <input class="stepper-input" id="licenseMinutesValue" type="number" value="1" disabled>
+                  <view class="stepper-btn" id="licenseMinutesPlus" data-hover="stepper-hover">+</view>
+                </view>
+                <view class="key-type-row" id="keyTypeRow">
+                  <text class="key-type-label">密钥类型</text>
+                  <view class="key-type-toggle">
+                    <view class="key-type-slider" id="keyTypeSlider"></view>
+                    <view class="key-type-option opt-active" id="keyTypeTemp">临时许可</view>
+                    <view class="key-type-option" id="keyTypeAdmin">管理员许可</view>
+                  </view>
+                </view>
+                <button class="generate-btn" id="generateKeyBtn" data-hover="generate-hover">生成许可密钥</button>
+              </view>
+              <view id="activeKeys"></view>
+            </view>
+
+            <!-- 已临时授权的普通用户 -->
+            <view class="license-section" id="tempUsersBlock">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>已临时授权的普通用户</text>
+                <text class="order-count" id="tempUserCount" style="display:none">0</text>
+              </view>
+              <view id="tempUserList"></view>
+            </view>
+
+            <!-- 超级管理员：管理员列表 -->
+            <view class="license-section" id="adminsBlock">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>管理管理员</text>
+                <text class="order-count" id="adminCount" style="display:none">0</text>
+              </view>
+              <view id="adminList"></view>
+            </view>
+
+            <!-- 角色入口（对齐小程序：两张独立卡片） -->
+            <view class="role-actions admin-collapsible" id="adminBlockAuth">
+              <button class="role-btn user-btn" id="btnAuthorizedUsers" data-hover="role-btn-pressing">
+                <text class="role-btn-icon">👥</text>
+                <text class="role-btn-text">历史授权用户</text>
+                <text class="role-btn-arrow">›</text>
+              </button>
+            </view>
+            <view class="role-actions admin-collapsible" id="adminBlockLocal">
+              <button class="role-btn user-btn" id="btnLocalOrders" data-hover="role-btn-pressing">
+                <text class="role-btn-icon">🖨️</text>
+                <text class="role-btn-text">本地打印任务</text>
+                <text class="role-btn-arrow">›</text>
+              </button>
+            </view>
+
+            <!-- 服务器存储 -->
+            <view class="storage-section admin-collapsible" id="adminBlockStorage">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>服务器存储</text>
+              </view>
+              <view class="storage-card">
+                <view class="storage-row"><text class="storage-label">📄 缓存文件</text><text class="storage-value" id="storageFiles">—</text></view>
+                <view class="storage-row"><text class="storage-label">💾 占用空间</text><text class="storage-value" id="storageSize">—</text></view>
+                <view class="storage-divider"></view>
+                <text class="retention-title">文件保留时间</text>
+                <text class="retention-forever-hint" id="retentionHint" style="display:none">当前为「永不过期」</text>
+                <view class="retention-row">
+                  <view class="retention-stepper">
+                    <view class="retention-stepper-btn" id="retentionDaysMinus" data-hover="stepper-hover">−</view>
+                    <input class="retention-stepper-input" id="retentionDaysValue" type="number" value="7" disabled>
+                    <view class="retention-stepper-btn" id="retentionDaysPlus" data-hover="stepper-hover">+</view>
+                  </view>
+                  <text class="retention-unit">天</text>
+                  <view class="retention-stepper">
+                    <view class="retention-stepper-btn" id="retentionHoursMinus" data-hover="stepper-hover">−</view>
+                    <input class="retention-stepper-input" id="retentionHoursValue" type="number" value="0" disabled>
+                    <view class="retention-stepper-btn" id="retentionHoursPlus" data-hover="stepper-hover">+</view>
+                  </view>
+                  <text class="retention-unit">小时</text>
+                </view>
+                <button class="retention-save-btn" id="saveRetentionBtn">保存设置</button>
+                <button class="delete-all-btn" id="deleteAllFilesBtn">⚠️ 删除全部缓存文件</button>
+              </view>
+            </view>
+
+            <!-- 防滥用设置 -->
+            <view class="security-section admin-collapsible" id="adminBlockSecurity">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text>防滥用设置</text>
+              </view>
+              <view class="security-summary-card" id="securitySummary" data-hover="security-summary-pressing">
+                <view class="security-summary-left">
+                  <text class="security-summary-icon">🛡️</text>
+                  <view class="security-summary-text">
+                    <text class="security-summary-title">防滥用设置</text>
+                    <text class="security-summary-desc">点击管理 DDoS 防护阈值</text>
+                  </view>
+                </view>
+                <text class="security-summary-arrow" id="securityArrow">›</text>
+              </view>
+              <view class="security-detail" id="securityDetail">
+                <view class="storage-card security-detail-card">
+                  <text class="retention-title">以下阈值保存后立即生效（0 表示关闭对应检查）</text>
+                  <view id="securityItems"></view>
+                  <button class="retention-save-btn" id="saveSecurityBtn">保存防滥用设置</button>
+                </view>
+              </view>
+            </view>
+
           </view>
 
         </div>
