@@ -1275,7 +1275,9 @@ class CloudClient(QObject):
             self.last_printer_state = payload
             self.printer_state.emit(payload)
             if payload.get("is_active"):
-                self.status_message.emit("☁ 本机已启用接单（可接收云端订单）")
+                # 状态陈述（每次连上/收到 printer_state 都会说一遍），不是"刚刚启用"的事件 ——
+                # 旧文案「本机已启用接单」容易被读成"刚开启接单"，改用正在进行时。
+                self.status_message.emit("☁ 本机正在接单（可接收云端订单）")
             else:
                 claiming = payload.get("claiming_devices") or {}
                 if claiming:

@@ -3304,14 +3304,13 @@ Component({
         }
       }
 
-      // 优先级
-      itemNum++
+      // 优先级：附加价格为 0（未加价，如默认「低」）→ 整行不出现、编号也不占位
+      // （与未勾选的派送/首页同口径：既然不加钱，「优先级：低 | ￥0」列进明细只是噪声）
       const urgPrice = urgencyPrice
       if (urgPrice > 0) {
+        itemNum++
         lines.push(itemNum + '. 优先级：' + urgency + ' | ￥' + urgPrice.toFixed(2))
         allParts.push(urgPrice.toFixed(2))
-      } else {
-        lines.push(itemNum + '. 优先级：' + urgency + ' | ￥0')
       }
 
       // 首页：未勾选 → 整行不出现

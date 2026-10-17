@@ -754,6 +754,32 @@ _dlg.close()
 
 
 # ============================================================
+# ⑦ 底部「🖐 攒批」入口：没有纸叠时的可见反馈（2026-10 现场反馈）
+# ============================================================
+print("\n=== ⑦ 「🖐 攒批」空纸叠入口的反馈 ===")
+win._stack.clear()
+win._config.duplex_stack_mode = True
+_prep()
+check("前置：攒批模式生效 + 无纸叠", win._stack_mode_on() and not win._stack.entries)
+_logs_before = win._log_text.toPlainText()
+win._on_stack_button()
+_tip = win._status_bar.currentMessage()
+check("★ 空纸叠点击：状态栏给出轻提示（旧写法只有日志区一行 ⇒ 现场读成「点了没反应」）",
+      "没有待打第 2 趟的纸叠" in _tip, f"tip={_tip!r}")
+check("★ 文案以**纸叠**为主语，不再写成「攒批模式已开启：…」（那句易被读成「刚被开启」）",
+      "攒批模式已开启" not in _tip and "（攒批模式：已开启）" in _tip, f"tip={_tip!r}")
+check("★ 同一句也写进日志（留档与界面同口径）",
+      _tip in win._log_text.toPlainText() and _tip not in _logs_before)
+check("★ 空纸叠点击不做任何动作（不建窗、不改模式）",
+      win._stack.entries == [] and win._config.duplex_stack_mode is True)
+win._config.duplex_stack_mode = False
+win._on_stack_button()
+_tip2 = win._status_bar.currentMessage()
+check("★ 模式关着时同一入口如实说「未开启」", "攒批模式未开启" in _tip2, f"tip={_tip2!r}")
+win._config.duplex_stack_mode = True
+
+
+# ============================================================
 # ④ 静态接线核对（防"改了行为却漏了另一处"）
 # ============================================================
 print("\n=== ④ 静态接线 ===")

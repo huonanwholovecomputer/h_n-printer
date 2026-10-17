@@ -3422,7 +3422,7 @@ class MainWindow(QMainWindow):
                             self._save_config(sync_ui=False)
                         except Exception:
                             pass
-                        self._log("❌ 已取消关闭云端")
+                        self._log("❌ 已取消「关闭云端」：云端保持开启，配置已回滚，未做任何改动")
                         return
                 self._cloud_client and self._cloud_client.stop()
                 self._restart_for_cloud_switch(self._config.cloud_enabled)
@@ -3496,8 +3496,11 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             self._restart_app()
         else:
-            # 不重启：配置已保存，下次启动生效
-            self._log(f"🔁 云端开关已保存，下次启动时生效（{state_txt}）")
+            # 不重启：配置已保存，下次启动生效。⚠ 必须说清"现在"是什么状态 —— 调用方在调
+            # 本函数之前已经 `_cloud_client.stop()`，所以重启前本进程**不会**再连云端。
+            # 旧文案只写「已保存，下次启动时生效（启用云端）」，读起来像"现在已经在连"。
+            self._log(f"🔁 云端开关已保存：下次启动时「{state_txt}」生效。"
+                      f"本次不重启 —— 重启前本进程不会连接云端（云端订单不会进来）")
 
     def _confirm_cloud_off_and_wipe(self) -> bool:
         """关闭云端前的确认与清理。返回 True 表示继续关闭（云端缓存数据已清空）。"""
@@ -7590,8 +7593,8 @@ class MainWindow(QMainWindow):
             tab.manual_duplex_pending = True
             self._save_config()
         self._log(f"⏸ {reason}：含双面文件，而当前打印机「{self._config.printer_name}」"
-                  f"不支持自动双面（需人工翻纸）—— 已挂起，请人工点「开始打印」"
-                  f"（第 1 趟打完后会弹窗提示翻纸）")
+                  f"不支持自动双面（需人工翻纸）—— 本机已挂起（不回报失败），"
+                  f"请人工点「开始打印」（第 1 趟打完后会弹窗提示翻纸）")
         self._refresh_tab_display()
         return True
 
@@ -7786,6 +7789,24 @@ class MainWindow(QMainWindow):
             logger.debug(f"攒批适用性判定失败（按不适用处理）: {e}")
             return False
 
+    def _stack_inapplicable_reason(self) -> str:
+        """攒批**为什么**不适用（给日志 / 弹窗 / 移动端回报的同一句口径）。
+
+        「不适用」有两种完全不同的原因，旧写法糊成一句「支持自动双面（或双面能力未确认）」，
+        读日志的人无从判断"该去盖章"还是"本来就无需求"。这里按档案三态如实分说：
+          · auto_duplex is True  → 机器确实支持自动双面，攒批对它是多余的；
+          · 其余（None / 读不到）→ 能力未确认，攒批只对已确认需人工翻纸的机型开放。
+        """
+        queue = (self._config.printer_name or "（系统默认打印机）")
+        try:
+            ad = getattr(self._printer_profile(), "auto_duplex", None)
+        except Exception:
+            ad = None
+        if ad is True:
+            return f"「{queue}」已确认支持自动双面（双面一次成型，不需要攒批）"
+        return (f"「{queue}」的双面能力未确认（攒批只对「已确认不支持自动双面、"
+                f"双面需人工翻纸」的机型开放；请先用「帮助 → 打印机双面能力…」盖章）")
+
     def _stack_mode_on(self) -> bool:
         """攒批模式**当前是否真的生效**：配置开着 + 当前打印机确实需要攒批。
 
@@ -7865,9 +7886,9 @@ class MainWindow(QMainWindow):
         """
         want = bool(enable)
         if want and not self._stack_applicable():
-            self._log("📱 移动端请求开启「🖐 攒批模式」被拒："
-                      "当前打印机支持自动双面（或双面能力未确认），不需要攒批")
-            self._report_stack_state("当前打印机支持自动双面（或能力未确认），不需要攒批模式")
+            why = self._stack_inapplicable_reason()
+            self._log(f"📱 移动端请求开启「🖐 攒批模式」被拒：{why}")
+            self._report_stack_state(f"未执行：{why}")
             return
         busy = self._stack_busy_reason()
         if busy:
@@ -7938,10 +7959,12 @@ class MainWindow(QMainWindow):
         want = bool(checked)
         if want and not self._stack_applicable():
             self._set_stack_checkbox(False)
-            msg = (f"当前打印机「{self._config.printer_name or '（系统默认打印机）'}」"
-                   f"支持自动双面（或双面能力未确认），不需要攒批模式。\n\n"
-                   f"攒批（多任务合并翻纸）只对「无自动双面器、双面需人工翻纸」的机型有意义。")
-            self._log("⚠ 该打印机支持自动双面（或能力未确认）—— 不需要攒批模式")
+            # 两种"不适用"的原因完全不同 —— 统一走 `_stack_inapplicable_reason()`
+            # （与移动端被拒时的日志/回报同一句口径），不再把两种原因糊成一句。
+            why = self._stack_inapplicable_reason()
+            self._log(f"⚠ 攒批模式不适用：{why}")
+            msg = (why + "\n\n攒批（多任务合并翻纸）只对「无自动双面器、双面需人工翻纸」"
+                          "的机型有意义。")
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(self, "攒批模式", msg)
             return
@@ -7994,13 +8017,30 @@ class MainWindow(QMainWindow):
     def _on_stack_button(self):
         """点底部「🖐 攒批」：把翻纸窗叫回来（关窗只是收起来，纸还得处理）。"""
         if not self._stack.entries:
-            self._log(f"🖐 攒批模式{'已开启' if self._stack_mode_on() else '未开启'}："
-                      f"当前没有正在累积的纸叠")
+            # 没有纸叠时它只是「攒批模式生效中」的常驻入口，点了不会有任何动作。
+            # 旧写法只在日志区写一行「🖐 攒批模式已开启：当前没有正在累积的纸叠」——
+            # 现场读成"点了没反应/程序卡了"，而且前半句像"刚刚被开启"（它其实只是
+            # 当时的开关状态）。现在：① 文案以**纸叠**为主语；② 加一条 4 秒状态栏轻提示
+            # （QStatusBar.showMessage 只**临时覆盖**左侧普通部件，不动 `_status_label`
+            #   正在显示的进度/收尾文案，4 秒后自动还原）。
+            note = ("🖐 当前没有待打第 2 趟的纸叠（攒批模式：已开启）"
+                    if self._stack_mode_on() else
+                    "🖐 当前没有待打第 2 趟的纸叠（攒批模式未开启）")
+            self._log(note)
+            bar = getattr(self, "_status_bar", None)
+            if bar is not None:
+                bar.showMessage(note, 4000)
             return
         if self._stack_busy():
             # 第 1 趟/整叠第 2 趟正在打：此时把窗口切到"可打第 2 趟"会给出一个
             # 看起来能点、点了却被拒的按钮 —— 不如别动窗口，只说明原因。
-            self._log("🖐 打印机正在打（第 1 趟或整叠第 2 趟），打完再决定下一步")
+            # 并说清**正在打哪一趟**：旧文案「（第 1 趟或整叠第 2 趟）」把已知的差别糊在
+            # 一起，现场没法据此判断"还要等多久 / 现在能不能动纸"。
+            _flushing = (self._stack_flush_worker is not None
+                         and self._stack_flush_worker.isRunning())
+            self._log("🖐 打印机正在打"
+                      + ("整叠第 2 趟" if _flushing else "某一单的第 1 趟")
+                      + "，打完再决定下一步（翻纸窗暂不打开）")
             return
         dlg = self._ensure_duplex_dialog()
         dlg.set_stack_ready(self._stack_detail_text(), self._stack.total_sheets,
@@ -8494,9 +8534,13 @@ class MainWindow(QMainWindow):
         #    ⚠ 不能把整个 `_stack_open_for_business()` 判断提到这里 —— 它包含"纸叠里
         #    已堆着第 1 趟的纸"这个**多单攒批的正常中间态**，提前会让攒批永远只能收 1 单。
         if self._stack_flush_worker is not None:
+            # 说清是"正在打"还是"刚打完在收尾"（旧文案写成「正在打（或待收尾）」，
+            # 把代码里**能分辨**的两种状态糊在一起，现场没法判断该等还是该动纸）。
+            _flushing = self._stack_flush_worker.isRunning()
             self._park_print_request(
                 jobs, tab_key,
-                "整叠第 2 趟正在打（或待收尾）——出纸槽与进纸盒都被这一叠独占")
+                "整叠第 2 趟" + ("正在打" if _flushing else "刚打完、正在收尾")
+                + "——出纸槽与进纸盒都被这一叠独占")
             return "parked"
         if self._stack_mode_on() and any(self._uses_manual_duplex_job(j) for j in jobs):
             ok, reason, _sheets, _unknown = self._admit_stack_entry(jobs)
@@ -8907,7 +8951,7 @@ class MainWindow(QMainWindow):
                 f"⚠️ 该标签页已锁定，不可编辑。如需重试失败文件，请新建标签页。\n详情请查看日志。"
             )
         else:
-            self._log(f"🔒 全部 {total} 个任务打印成功！标签页已锁定。")
+            self._log(f"🔒 全部 {total} 个任务已完成打印并回报成功！标签页已锁定。")
 
         # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单（只打未完成的，已打的不重打）
         # 2026-12：补打保持后台（不切换前台标签页），与无障碍订单「后台创建标签页」一致
@@ -9184,7 +9228,10 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         if not logs:
-            text.setPlainText("当前没有在线设备（或全部设备超时未回报）。")
+            # logs 为空 = 服务端一台在线设备都没有（设备超时未回报时它仍会带空 content 列出来，
+            # 见 _show_collected_logs 下面的逐台渲染）—— 旧的「（或全部设备超时未回报）」
+            # 把不可能发生的那种情况也写上了，属误导。
+            text.setPlainText("云端当前没有在线设备 —— 没有可收集的日志。")
         else:
             parts = []
             for l in logs:
@@ -9439,7 +9486,8 @@ class MainWindow(QMainWindow):
         for t in ready_tasks:
             self._mark_processed_task(t.task_id)
 
-        # 自动创建标签页（2026-12：后台创建，不切换当前标签页；返回目标标签页 key）
+        # 自动创建标签页（2026-12：后台创建；当前标签页为空或已锁定时会把前台切过去，
+        # 见 `_cloud_new_tab_should_focus`。返回目标标签页 key）
         tab_key = self._add_cloud_tasks_to_new_tab(ready_tasks, switch_tab=False)
         if not tab_key:
             self._log(f"⚠ 无障碍打印：订单 #{order_id} 未能创建标签页，跳过")
@@ -9503,7 +9551,10 @@ class MainWindow(QMainWindow):
                     })
                     self._log(f"⚡ 打印机正忙，订单 #{order_id} 已加入重试队列（打印完成后自动补打）")
         else:
-            self._log(f"⚠ 无障碍打印：标签页 {tab_key} 无文件，跳过")
+            # jobs 是"该标签页里还没 sent 的文件"，为空 ⇒ 文件都在、只是都已经打完并回报过。
+            # 旧文案写「无文件，跳过」，与"标签页里其实有文件"的事实不符。
+            self._log(f"⚠ 无障碍打印：标签页 {tab_key} 已无待打印文件"
+                      f"（该单文件都已打印完成），跳过")
 
     # ──────── 无障碍打印预约单（指定时间/倒计时 → 到点自动打印，冻结等待）────────
 
@@ -9612,7 +9663,8 @@ class MainWindow(QMainWindow):
             self._log(f"⚠ 预约单 #{order_id}: 标签页 {st['tab_key']} 已失效，重新建立标签页")
             st["tab_key"] = None
         if not st["tab_key"]:
-            # 首次全部就绪 → 创建标签页（后续新增文件追加；2026-12 后台创建，不切换前台）。
+            # 首次全部就绪 → 创建标签页（后续新增文件追加；2026-12 后台创建 —— 当前标签页
+            # 为空或已锁定时会切到新标签页，见 `_cloud_new_tab_should_focus`）。
             # 注意：预约单不走 accept_order（会误把父订单标成 accepted），
             # 后端状态由 file_ready → waiting、start_printing → printing 驱动。
             self._log(f"⏰ 预约单 #{order_id}: 全部 {len(ready_tasks)} 个文件就绪")
@@ -9742,7 +9794,8 @@ class MainWindow(QMainWindow):
             st["frozen"] = False
             self._log(f"⏰ 预约单 #{order_id}: 后端未解冻，本地自恢复打印（文件已全部就绪）")
 
-        # 确保标签页存在（2026-12：后台创建/定位，不切换当前标签页）
+        # 确保标签页存在（2026-12：后台创建/定位；当前标签页为空或已锁定时切过去，
+        # 见 `_cloud_new_tab_should_focus`）
         # 🔴-B2 兜底：同 _evaluate_scheduled_order —— tab_key 失效即丢弃重建，
         # 绝不按残留的旧 key 去取 jobs（那会把别的订单的文件打印出来）。
         if st["tab_key"] and not self._scheduled_tab_still_owns(order_id, st["tab_key"]):
@@ -9781,7 +9834,8 @@ class MainWindow(QMainWindow):
                                                  f"预约打印订单 #{order_id}"):
             # 不支持自动双面 + 含双面文件 → 挂起等人工（重试没意义：需要人翻纸）。
             # 不置 printed、不上报失败：订单保持待打印，等人工点「开始打印」。
-            self._log(f"⏰ 预约单 #{order_id}: 已挂起等人工翻纸（不会再自动重试）")
+            self._log(f"⏰ 预约单 #{order_id}: 本机已挂起等人工翻纸"
+                      f"（不自动重试、不回报失败；需人工点「开始打印」）")
             self._cleanup_scheduled_order(order_id, reason="需人工翻纸，转为人工打印")
             return
         if jobs:
@@ -9952,7 +10006,10 @@ class MainWindow(QMainWindow):
                     cancel_current_print = True
                     break
         if cancel_current_print:
-            self._log(f"☁ 订单 #{order_id} 正在打印，已自动取消")
+            # 「已自动取消」没说清**取消的是什么**（订单？打印作业？云端状态？）——
+            # 这里只中止本机这次打印作业；订单本身是被用户在云端取消的，原因在上一行日志。
+            self._log(f"☁ 订单 #{order_id} 正在本机打印 → 已中止本机打印作业"
+                      f"（订单早已被用户取消）")
             self._worker.cancel()
 
         # D5 第 12 条：**真的清掉**还会把它打出来的状态（标签页任务 / 补打队列 / 纸叠排队 /
@@ -10525,12 +10582,46 @@ class MainWindow(QMainWindow):
             except OSError as e:
                 self._log(f"  → 保存转换副本到桌面失败: {e}")
 
+    def _cloud_new_tab_should_focus(self) -> bool:
+        """云端新订单落地建标签页时，是否要把前台切到那个标签页（2026-10 用户要求）。
+
+        判据只有两条 —— **当前标签页为空** 或 **已锁定（frozen）**：
+          · 空标签页：没有任何正在准备的任务，切过去零打扰；
+          · 已锁定：订单已开始打印、标签页已固定不可编辑，前台停在那里也没事可做
+            （现场：打完一单标签页锁着，无障碍订单在后台悄悄建了标签页，操作员看不到）。
+        当前标签页有未打印任务且未锁定时 **不切**（保持原行为：不抢正在编辑的前台）。
+        """
+        tab = self._config.tabs.get(self._current_tab)
+        if tab is None:
+            return True                     # 标签页已被删除/找不到 → 没有需要保护的前台
+        if getattr(tab, "frozen", False):
+            return True
+        return len(getattr(tab, "jobs", None) or []) == 0
+
+    def _focus_cloud_tab(self, key: str) -> None:
+        """把前台切到云端订单标签页（与 `_switch_tab` 同口径）。
+
+        切之前先结算旧标签页的「撤回清空」窗口（`_cancel_undo_if_active`）：撤回备份与
+        5 秒定时器都按 `_current_tab` 索引，若切页时不清，备份会留在旧 key 上、
+        定时器到期也弹不回来（被清空的云端任务永远不向后端放弃）。
+        """
+        if not key or key == self._current_tab:
+            return
+        self._cancel_undo_if_active()
+        self._current_tab = key
+        self._config.active_tab = key
+
     def _add_cloud_tasks_to_new_tab(self, tasks: list, switch_tab: bool = True) -> str | None:
         """将同一订单的多个云端任务添加到同一个新标签页，全部加入后再刷新显示。
-        switch_tab=False（无障碍自动打印）：在后台创建/追加，不切换当前标签页。
+        switch_tab=False（无障碍/预约自动打印）：默认在后台创建/追加、不切换当前标签页；
+        但当前标签页为空或已锁定（`_cloud_new_tab_should_focus`）时仍会切过去。
         返回目标标签页 key（供后台打印定位 jobs；tasks 为空返回 None）。"""
         if not tasks:
             return None
+        # 后台落地（switch_tab=False）也切前台的条件：当前标签页为空 / 已锁定。
+        # 在这里统一决定，同一订单的多个文件走同一口径（不会中途换前台）。
+        if not switch_tab and self._cloud_new_tab_should_focus():
+            switch_tab = True
         target_key = None
         for task in tasks:
             target_key = self._add_cloud_task_to_new_tab(task, is_first=(task == tasks[0]),
@@ -10555,14 +10646,14 @@ class MainWindow(QMainWindow):
     def _add_cloud_task_to_new_tab(self, task: CloudTask, is_first: bool = True,
                                    switch_tab: bool = True) -> str:
         """将云端任务添加到标签页并（默认）切换过去。同一订单已有标签页 → 追加到该标签页。
-        switch_tab=False（2026-12 无障碍自动打印）：后台创建/追加，不切换当前标签页。
+        switch_tab=False（无障碍/预约自动打印）：默认后台创建/追加、不切换当前标签页，
+        除非当前标签页为空或已锁定（见 `_cloud_new_tab_should_focus`）。
         返回目标标签页 key。"""
         # 同一订单已有标签页 → 追加到它，而不是新建（防下载完成时间分散导致拆成多个标签页）
         existing_key = self._find_tab_for_order(task.order_id)
         if existing_key is not None:
             if switch_tab:
-                self._current_tab = existing_key
-                self._config.active_tab = existing_key
+                self._focus_cloud_tab(existing_key)
             is_first = False
         if is_first:
             tab_keys = self._sorted_tab_keys(self._config.tabs)
@@ -10591,8 +10682,7 @@ class MainWindow(QMainWindow):
                 tab_settings.owner_name = FALLBACK_OWNER_NAME
             self._config.tabs[new_key] = tab_settings
             if switch_tab:
-                self._current_tab = new_key
-                self._config.active_tab = new_key
+                self._focus_cloud_tab(new_key)
         else:
             # 追加到已存在的订单标签页（switch_tab=False 时 _current_tab 未切换，须显式用 existing_key）
             new_key = existing_key if existing_key is not None else self._current_tab

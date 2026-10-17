@@ -2193,11 +2193,13 @@ function onCopyDetailPrice() {
       allParts.push(deliveryCost.toFixed(2));
     } else lines.push(itemNum + '. 派送：是 | ' + p.deliveryLocation + '免费');
   }
-  itemNum++;
+  // 优先级：附加价格为 0（未加价，如默认「低」）→ 整行不出现、编号也不占位
+  // （与未勾选的派送/首页同口径：既然不加钱，「优先级：低 | ￥0」列进明细只是噪声）
   if (p.urgencyPrice > 0) {
+    itemNum++;
     lines.push(itemNum + '. 优先级：' + p.urgency + ' | ￥' + p.urgencyPrice.toFixed(2));
     allParts.push(p.urgencyPrice.toFixed(2));
-  } else lines.push(itemNum + '. 优先级：' + p.urgency + ' | ￥0');
+  }
   if (p.coverPage) {
     itemNum++;
     lines.push(itemNum + '. 打印首页信息 | ' + p.coverPagePrice.toFixed(2));

@@ -67,7 +67,13 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 # 2026-10（攒批只对「需人工翻纸」的机型）：再改 www/app.js（徽标/开关只对 auto_duplex === false
 # 的设备渲染）⇒ 登记过渡项；**同日已重打 1.1.36（versionCode 37）并通过 verify_apk_release.py +
 # verify_apk_published.py（线上清单/大小/md5 全部一致）⇒ 该项已删除**。
-EXPECTED_RED: dict[str, str] = {}
+# 2026-10（移动端详细明细：优先级附加价 0 → 整行不显示）：改了 www/print.js（小程序
+#   pages/index/index.js 同源改动不参与 APK 校验）⇒ APK 内 web 资源与 www/ 暂时不一致。
+#   **待本轮细节调整攒够后重打 APK 并发布（verify_apk_release.py + verify_apk_published.py
+#   转绿）⇒ 届时必须删除本条**（旧约定：产物重建后立刻删，别让它长期掩盖真回归）。
+EXPECTED_RED: dict[str, str] = {
+    "verify_apk_release.py": "www/print.js 已改（优先级 0 元不显示该行），APK 待重打 → 发版后删条",
+}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}

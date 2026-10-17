@@ -317,7 +317,7 @@ async function runMiniProgram() {
         calls.clipboard.length === 1 && calls.clipboard[0].indexOf('¥1.90') >= 0 && calls.modal.length === 0,
         calls.clipboard[0] || '(未复制)');
 
-  /* --- ⑩ 复制详细价格：未勾选的附加服务（派送/首页）整行不出现，且不占编号 --- */
+  /* --- ⑩ 复制详细价格：未勾选的附加服务（派送/首页）+ 0 元优先级 → 整行不出现，且不占编号 --- */
   reset();
   setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
   page._lastOrderResult.data = { delivery_enabled: 0, urgency: '低', cover_page: 0 };
@@ -325,8 +325,8 @@ async function runMiniProgram() {
   const plain = calls.clipboard[0] || '';
   check('⑩未勾选派送：明细无「派送」行', plain.indexOf('派送') < 0, plain);
   check('⑩未勾选首页：明细无「首页」行', plain.indexOf('首页') < 0, plain);
-  check('⑩编号无空洞（优先级接在第 1 项文件后，为 2.）',
-        /(^|\n)2\. 优先级：低/.test(plain), plain);
+  check('⑩优先级附加价 0（默认「低」）：整行不出现、也不占编号（无 2. 项）',
+        plain.indexOf('优先级') < 0 && !/(^|\n)2\. /.test(plain), plain);
   check('⑩合计仍按文件费（¥1.10）', plain.indexOf('￥1.10') >= 0, plain);
 
   reset();
@@ -339,9 +339,18 @@ async function runMiniProgram() {
   const full = calls.clipboard[0] || '';
   check('⑩勾选派送：出现派送行且取该地点百分比（10% → ￥0.11）',
         /(^|\n)2\. 派送：是 \| A校 10\.0% \| ￥0\.11/.test(full), full);
-  check('⑩勾选首页：出现首页行且为第 4 项（派送2/优先级3/首页4）',
-        /(^|\n)3\. 优先级：低/.test(full) && /(^|\n)4\. 打印首页信息 \| 0\.10/.test(full), full);
+  check('⑩勾选首页：出现首页行且为第 3 项（派送2/首页3；0 元优先级不占位）',
+        !/(^|\n)3\. 优先级/.test(full) && /(^|\n)3\. 打印首页信息 \| 0\.10/.test(full), full);
   check('⑩合计=文件1.10+派送0.11+首页0.10=￥1.31', full.indexOf('￥1.31') >= 0, full);
+
+  /* 反证：优先级真加了价（「中」0.08）→ 该行必须出现，编号与合计都要算上 */
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  page._lastOrderResult.data = { delivery_enabled: 0, urgency: '中', cover_page: 0 };
+  page.onCopyDetailPrice();
+  const urg = calls.clipboard[0] || '';
+  check('⑩优先级加价 > 0（「中」0.08）：出现该行、为第 2 项、合计含它（￥1.18）',
+        /(^|\n)2\. 优先级：中 \| ￥0\.08/.test(urg) && urg.indexOf('￥1.18') >= 0, urg);
 
   /* --- ⑪ 🔴-C3：pricingLoaded 真读 —— 未同步云端定价时提示如实说明用的是兜底单价 --- */
   reset();
@@ -593,15 +602,15 @@ async function runAndroid() {
         calls.clipboard.length === 1 && calls.clipboard[0].indexOf('¥1.90') >= 0 && calls.alert.length === 0,
         calls.clipboard[0] || '(未复制)');
 
-  /* --- ⑩ 复制详细价格：未勾选的附加服务（派送/首页）整行不出现，且不占编号 --- */
+  /* --- ⑩ 复制详细价格：未勾选的附加服务（派送/首页）+ 0 元优先级 → 整行不出现，且不占编号 --- */
   reset();
   setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
   run('onCopyDetailPrice();');
   const plain = calls.clipboard[0] || '';
   check('⑩未勾选派送：明细无「派送」行', plain.indexOf('派送') < 0, plain);
   check('⑩未勾选首页：明细无「首页」行', plain.indexOf('首页') < 0, plain);
-  check('⑩编号无空洞（优先级接在第 1 项文件后，为 2.）',
-        /(^|\n)2\. 优先级：低/.test(plain), plain);
+  check('⑩优先级附加价 0（默认「低」）：整行不出现、也不占编号（无 2. 项）',
+        plain.indexOf('优先级') < 0 && !/(^|\n)2\. /.test(plain), plain);
   check('⑩合计仍按文件费（¥1.10）', plain.indexOf('￥1.10') >= 0, plain);
 
   reset();
@@ -615,9 +624,20 @@ async function runAndroid() {
   const full = calls.clipboard[0] || '';
   check('⑩勾选派送：出现派送行且取该地点百分比（10% → ￥0.11）',
         /(^|\n)2\. 派送：是 \| A校 10\.0% \| ￥0\.11/.test(full), full);
-  check('⑩勾选首页：出现首页行且为第 4 项（派送2/优先级3/首页4）',
-        /(^|\n)3\. 优先级：低/.test(full) && /(^|\n)4\. 打印首页信息 \| 0\.10/.test(full), full);
+  check('⑩勾选首页：出现首页行且为第 3 项（派送2/首页3；0 元优先级不占位）',
+        !/(^|\n)3\. 优先级/.test(full) && /(^|\n)3\. 打印首页信息 \| 0\.10/.test(full), full);
   check('⑩合计=文件1.10+派送0.11+首页0.10=￥1.31', full.indexOf('￥1.31') >= 0, full);
+
+  /* 反证：优先级真加了价（「中」0.08）→ 该行必须出现，编号与合计都要算上 */
+  reset();
+  setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
+  run(`
+    printState._lastOrderResult.data = { delivery_enabled: 0, urgency: '中', cover_page: 0 };
+  `);
+  run('onCopyDetailPrice();');
+  const urg = calls.clipboard[0] || '';
+  check('⑩优先级加价 > 0（「中」0.08）：出现该行、为第 2 项、合计含它（￥1.18）',
+        /(^|\n)2\. 优先级：中 \| ￥0\.08/.test(urg) && urg.indexOf('￥1.18') >= 0, urg);
 
   /* --- ⑬ 🔴-C3：兜底单价真的参与计价（旧兜底 0.2/0.3 会低算 33%/25%） --- */
   reset();
