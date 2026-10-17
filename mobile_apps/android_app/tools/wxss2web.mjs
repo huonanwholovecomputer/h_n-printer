@@ -146,7 +146,9 @@ const WEB_FOOT = `
 .toast {
   position: absolute;
   left: 50%;
-  bottom: 19cqw;
+  /* 与 www/styles.css 的实际取值同口径（该文件后来手工调过，本模板已落后）：
+     底距必须 >= tabBar 顶缘（1.44cqw + 13.2cqw + 安全区），否则安全区大的机型上被 tabBar 盖住 */
+  bottom: calc(17.1cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)));
   transform: translateX(-50%) translateY(16px);
   background: rgba(40, 40, 40, 0.92);
   color: #fff;

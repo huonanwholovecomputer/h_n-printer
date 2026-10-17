@@ -5997,7 +5997,11 @@ picker-view-column {
 .toast {
   position: absolute;
   left: 50%;
-  bottom: 17.1cqw;
+  /* 悬浮 tabBar 的顶缘 = 底距 1.44cqw + 高 13.2cqw + 安全区（见 .tab-bar 与「底部安全区」补丁）。
+     气泡必须把同一个安全区算进来：少了它时，导航栏 inset 大的机型上 tabBar 被整体抬高
+     而气泡不动，下沿就压进 tabBar 里被盖住（2026-10 现场截图反馈，实测 inset ≈19px）。
+     17.1cqw = tabBar 顶缘 14.64cqw + 2.46cqw 间隙（约 9px @360px 宽）。 */
+  bottom: calc(17.1cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)));
   transform: translateX(-50%) translateY(16px);
   background: rgba(40, 40, 40, 0.92);
   color: #fff;

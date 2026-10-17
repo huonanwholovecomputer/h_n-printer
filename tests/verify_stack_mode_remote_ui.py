@@ -127,6 +127,22 @@ def has_dark_override(src, *classes):
     return all((".theme-dark ." + c) in src for c in classes)
 
 
+def toast_bottom_decl(css):
+    """取 APP styles.css 里 .toast 的 bottom 声明（按「Web 独有组件」的注释锚点定位：
+    .toast 在文件里有多条同名规则，Web 适配补丁那条只有 position: absolute）。"""
+    anchor = "/* Toast（小程序无此组件） */"
+    if anchor not in css:
+        return ""
+    block = css.split(anchor, 1)[1].split("}", 1)[0]
+    decls = [ln.strip() for ln in block.splitlines() if ln.strip().startswith("bottom:")]
+    return decls[0] if decls else ""
+
+
+def toast_clears_tabbar(css):
+    """气泡底距必须含安全区变量（.tab-bar 顶缘把安全区算进去了，气泡也得算）。"""
+    return "var(--safe-bottom" in toast_bottom_decl(css)
+
+
 def dark_after_base(src, cls):
     """深色覆盖必须写在浅色基类规则**之后**（否则被基类同权重规则压过去，覆盖形同没写）。"""
     base = src.find("." + cls + " {")
@@ -280,6 +296,13 @@ check("小程序长拦截文案不被 toast 两行截断（>18 字走 wx.showMod
 check("APP #toast 会换行（max-width:80%，长文案不被截断）",
       "max-width: 80%;" in app_css)
 
+# 气泡底距必须把悬浮 tabBar 的安全区算进来（.tab-bar 顶缘 = 1.44cqw + 13.2cqw + 安全区）：
+# 少了 --safe-bottom 时，导航栏 inset 大的机型上 tabBar 整体被抬高而气泡不动，下沿被盖住
+# （2026-10 用户截图反馈：这条离线提示正好是被盖住的那个气泡）。
+# 渲染级几何验收（注入 0/19/34/48px 安全区实测矩形）见 tests/verify_toast_above_tabbar.mjs。
+check("APP #toast 底距含安全区（否则导航栏 inset 大的机型上被悬浮 tabBar 盖住）",
+      toast_clears_tabbar(app_css), toast_bottom_decl(app_css))
+
 # ==================== ⑧ 适用性前提：只给「需人工翻纸」的机型渲染（2026-10 用户要求）============
 print("\n=== ⑧ 攒批区块只对「需人工翻纸」的机型渲染 ===")
 check("★ 小程序 WXML：状态徽标 + 远程开关整体被 auto_duplex === false 的 <block> 包住",
@@ -323,6 +346,10 @@ check("[变异自证] ⑦ 适用性判据：抹掉 auto_duplex 前置 → 假（
           fn_body(blank(app_js, "d.auto_duplex !== false"),
                   "async function toggleStackMode(clientId) {"))
       and not mini_js_gate_on_manual_flip(blank(mini_fn, "device.auto_duplex !== false")))
+check("[变异自证] ⑧ 气泡避让判据：把底距改回旧写法 17.1cqw（不含安全区）→ 假",
+      not toast_clears_tabbar(app_css.replace(
+          "calc(17.1cqw + var(--safe-bottom, env(safe-area-inset-bottom, 0px)))", "17.1cqw"))
+      and bool(toast_clears_tabbar(app_css)))
 
 print("\n" + "=" * 56)
 print("攒批模式移动端远程开关验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")
