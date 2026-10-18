@@ -244,11 +244,17 @@ check("两个按钮共用同一套两段式（先 dry_run 预览、确认后才�
       "function runDeviceCleanup(" in html
       and "Object.assign({ dry_run: true }, extraBody || {})" in html
       and "Object.assign({ dry_run: false }, extraBody || {})" in html)
-check("授权页版本记录已写 v6.7（版本号只钉「不早于 v6.7」，不钉死具体值 —— "
-      "每加一版功能都会递增，钉死字面量会误报）",
+# F9（2026-10-18）：版本号原先是全文件 `re.search(r">v(\d+)\.(\d+)</div>", html)` ——
+# 未锚定，将来前面任何地方出现 `>vX.Y</div>`（别的标签页/版权条）就会命中别处而误判。
+# 版本记录 div 实际落在「关于」页的 renderAbout() 里，锚进该函数体再取。
+_m_about = re.search(r"function renderAbout\(\) \{([\s\S]*?)\n\}", html)
+_about_body = _m_about.group(1) if _m_about else ""
+_m_ver = re.search(r">v(\d+)\.(\d+)</div>", _about_body)
+check("版本记录已写 v6.7（版本号只钉「不早于 v6.7」，不钉死具体值 —— "
+      "每加一版功能都会递增，钉死字面量会误报；已锚定 renderAbout 区块）",
       "v6.7：测试设备不再堆在授权页" in html
-      and (lambda m: bool(m) and (int(m.group(1)), int(m.group(2))) >= (6, 7))(
-          re.search(r">v(\d+)\.(\d+)</div>", html)))
+      and _m_ver is not None and (int(_m_ver.group(1)), int(_m_ver.group(2))) >= (6, 7),
+      "about_body=%d ver=%s" % (len(_about_body), _m_ver.groups() if _m_ver else None))
 check("离线却挂着接单记录时显示「接单中（离线）」并提示可删除清空",
       "接单中（离线）" in html and "僵尸记录" in html)
 

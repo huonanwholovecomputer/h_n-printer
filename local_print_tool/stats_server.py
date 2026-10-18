@@ -142,7 +142,10 @@ def _extract_proxy_body(resp) -> dict:
     供收支清算设置页的「打印价格」区块读写服务器定价配置）。
     额外透传 devices / active_client_id / active_owner_name（/api/printer/devices 返回顶层
     设备列表，供收支清算「授权」页展示设备与所有者——2026-11 修复：此前被白名单剥掉
-    导致授权页设备列表空白、绑定后所有者不刷新）。"""
+    导致授权页设备列表空白、绑定后所有者不刷新）。
+    额外透传 order_id / status / previous_status / files_updated（/api/admin/order_status 的
+    回执字段；v7.0 订单状态订正——此前被白名单静默剥掉，页面拿不到改了几条、原来是什么状态）。
+    一律「响应当中有才透传」，不存在时不填空值（语义同上面几个）。"""
     try:
         data = resp.json()
     except Exception:
@@ -163,6 +166,14 @@ def _extract_proxy_body(resp) -> dict:
         out["active_client_id"] = data["active_client_id"]
     if "active_owner_name" in data:
         out["active_owner_name"] = data["active_owner_name"]
+    if "order_id" in data:
+        out["order_id"] = data["order_id"]
+    if "status" in data:
+        out["status"] = data["status"]
+    if "previous_status" in data:
+        out["previous_status"] = data["previous_status"]
+    if "files_updated" in data:
+        out["files_updated"] = data["files_updated"]
     return out
 
 

@@ -168,6 +168,56 @@ r_403 = client.delete("/api/admin/storage", headers=HDR(USER))
 check("普通用户 DELETE → 403（未因本次改动放宽）", r_403.status_code == 403,
       f"HTTP {r_403.status_code}")
 
+print("\n=== ⑨ 代理白名单：订单状态订正回执的 4 个字段原样透传（F6，2026-10-18）===")
+# `/api/proxy/admin/order_status` 这一跳走 stats_server._extract_proxy_body 的白名单；
+# 旧白名单只放 {success,message,data,pricing,devices,...} ⇒ 新端点的
+# order_id/status/previous_status/files_updated 被**静默剥掉**（前端目前只读 success/message
+# 所以今天不坏，但代理这跳无守卫覆盖）。这里用**真实函数 + 假 resp 对象**钉住透传。
+try:
+    _lpt = os.path.join(REPO, "local_print_tool")
+    sys.path.insert(0, _lpt)
+    import stats_server as _ss                                          # noqa: E402
+
+    class _FakeResp:
+        def __init__(self, payload, code=200):
+            self._payload = payload
+            self.status_code = code
+
+        def json(self):
+            if isinstance(self._payload, Exception):
+                raise self._payload
+            return self._payload
+
+    _full = {"files_updated": 1, "message": "订单状态已订正", "order_id": "12",
+             "previous_status": "abandoned", "status": "sent", "success": True}
+    _out = _ss._extract_proxy_body(_FakeResp(_full))
+    check("★ 代理透传 order_id/status/previous_status/files_updated（改前这 4 个被白名单剥掉）",
+          _out.get("order_id") == "12" and _out.get("status") == "sent"
+          and _out.get("previous_status") == "abandoned" and _out.get("files_updated") == 1,
+          str(_out))
+    check("  原有白名单字段未回归（success/message 照旧透传）",
+          _out.get("success") is True and _out.get("message") == "订单状态已订正", str(_out))
+    check("  字段**原样**透传，不做字符串化、也不把 0 当缺失（整数 id 与 files_updated=0 都保留）",
+          _ss._extract_proxy_body(_FakeResp({"success": True, "order_id": 12, "status": "failed",
+                                             "previous_status": "queued",
+                                             "files_updated": 0})).get("order_id") == 12
+          and _ss._extract_proxy_body(_FakeResp({"success": True,
+                                                 "files_updated": 0})).get("files_updated") == 0,
+          str(_ss._extract_proxy_body(_FakeResp({"success": True, "order_id": 12,
+                                                 "files_updated": 0}))))
+    _min = _ss._extract_proxy_body(_FakeResp({"success": True, "message": "ok"}))
+    check("  字段缺失时不凭空补（「有才透传」，沿用既有白名单语义）",
+          not any(k in _min for k in ("order_id", "status", "previous_status", "files_updated")),
+          str(_min))
+    _leak = _ss._extract_proxy_body(_FakeResp({"success": True, "token": "secret", "openid": "x"}))
+    check("  白名单外字段仍被剥掉（没有退化成整体透传）",
+          "token" not in _leak and "openid" not in _leak, str(_leak))
+    _err = _ss._extract_proxy_body(_FakeResp(RuntimeError("boom"), 502))
+    check("  非 JSON 响应仍转通用错误且带上 HTTP 码（错误路径零回归）",
+          _err.get("success") is False and "502" in (_err.get("message") or ""), str(_err))
+except Exception as _e:                                                 # noqa: BLE001
+    check("⑨ 可跑（真实 stats_server 可导入 + 函数可取）", False, repr(_e))
+
 os.chdir(REPO)
 sys.path.remove(DST)
 shutil.rmtree(TMP, ignore_errors=True)

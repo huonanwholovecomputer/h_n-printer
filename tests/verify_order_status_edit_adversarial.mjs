@@ -36,8 +36,10 @@ const FINANCE = path.join(ROOT, 'local_print_tool', 'finance');
 const HTML_PATH = path.join(FINANCE, 'settlement.html');
 
 let bad = 0;
+let total = 0;
 const findings = [];
 function chk(name, cond, detail) {
+  total++;
   if (!cond) bad++;
   console.log(`[${cond ? 'PASS' : 'FAIL'}] ${name}` + (!cond && detail !== undefined ? `  -- ${detail}` : ''));
 }
@@ -156,6 +158,11 @@ async function openPage(mode) {
   return page;
 }
 
+/* F8c（2026-10-18 审查）：原先只有 try/finally —— 功能整体缺失时会红在
+ * waitForSelector / waitForFunction 的 TimeoutError 或 page.evaluate 里的 ReferenceError
+ * （例如 applyOrderStatus 未定义）：finally 关掉浏览器后异常照旧抛穿，**不打印 FAIL 摘要**。
+ * 加 catch 后：任何未捕获异常也计入 FAIL，摘要照打、exit 1。 */
+let caught = null;
 try {
   /* ══════════════ 云端模式：控制台锁定绕过 ══════════════ */
   console.log('=== A. FINANCE_MODE=cloud：锁定态 / 解锁态的控制台等价路径 ===');
@@ -360,12 +367,20 @@ try {
 
   chk('B6 全程无外部网络请求（无 CDN / 无生产接口）', external.length === 0, external.slice(0, 3).join(' | '));
   chk('B7 全程无页面 JS 异常', pageErrors.length === 0, pageErrors.slice(0, 3).join(' | '));
+} catch (e) {
+  caught = e;
+  chk('主流程未抛异常（崩溃 = 页面/功能整体缺失或选择器失效）', false,
+    String((e && e.stack) || e).split('\n').slice(0, 4).join(' | '));
 } finally {
   await browser.close();
   server.close();
 }
 
 console.log('\n' + '='.repeat(60));
+console.log(`已跑断言 ${total} 项，失败 ${bad} 项`);
+if (caught) {
+  console.log('异常终止：' + String((caught && caught.stack) || caught).split('\n')[0]);
+}
 if (findings.length) {
   console.log('发现的问题（需上报）：');
   for (const f of findings) console.log('  ✗ ' + f);

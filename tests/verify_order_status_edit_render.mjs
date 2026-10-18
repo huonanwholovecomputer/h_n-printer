@@ -38,7 +38,9 @@ const HTML_PATH = process.argv[2] || path.join(FINANCE, 'settlement.html');
 const OUT_DIR = path.join(ROOT, '截图展示', '订单状态订正');
 
 let bad = 0;
+let total = 0;
 function chk(name, cond, detail) {
+  total++;
   if (!cond) bad++;
   console.log(`[${cond ? 'PASS' : 'FAIL'}] ${name}` + (!cond && detail !== undefined ? `  -- ${detail}` : ''));
 }
@@ -156,6 +158,11 @@ async function tryUnlock(pwd) {
   await page.waitForTimeout(500);
 }
 
+/* F8c（2026-10-18 审查）：断言主流程原先只有 try/finally —— 功能整体缺失时
+ * （渲染不出来 / 元素不存在）会红在 waitForFunction TimeoutError、page.click TimeoutError
+ * 或 ReferenceError 上：finally 关掉浏览器后异常照旧抛穿，**不打印 FAIL 摘要**，
+ * 进程级红是异常而不是断言。加 catch 后：任何未捕获异常也计入 FAIL 并打印摘要 + exit 1。 */
+let caught = null;
 try {
   await page.goto(BASE + '/settlement.html', { waitUntil: 'domcontentloaded' });
   chk('页面脚本加载无语法错误', pageErrors.length === 0, pageErrors.join(' | '));
@@ -316,11 +323,19 @@ try {
   chk('全程无外部网络请求（无 CDN / 无生产接口）', external.length === 0, external.slice(0, 3).join(' | '));
   chk('全程无页面 JS 异常', pageErrors.length === 0, pageErrors.slice(0, 3).join(' | '));
   console.log(`截图已存 → ${path.relative(ROOT, OUT_DIR)}`);
+} catch (e) {
+  caught = e;
+  chk('断言主流程未抛异常（崩溃 = 页面/功能整体缺失或选择器失效）', false,
+    String((e && e.stack) || e).split('\n').slice(0, 4).join(' | '));
 } finally {
   await browser.close();
   server.close();
 }
 
 console.log('\n' + '='.repeat(52));
+console.log(`已跑断言 ${total} 项，失败 ${bad} 项`);
+if (caught) {
+  console.log('异常终止：' + String((caught && caught.stack) || caught).split('\n')[0]);
+}
 console.log(bad ? `订单状态订正交互验收：存在失败 ❌ (${bad})` : '订单状态订正交互验收：全部通过 ✅');
 process.exit(bad ? 1 : 0);

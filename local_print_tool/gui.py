@@ -87,7 +87,7 @@ from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx
 import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 import duplex_stack  # 攒批模式（多任务合并翻纸）的纸叠账本（纯逻辑，见 duplex_stack.py）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
-from cloud_client import CloudClient, CloudTask, cache_engine_for, pdf_cache_key
+from cloud_client import CloudClient, CloudTask, cache_engine_for, pdf_cache_key, order_status_label_cn
 from stats_server import StatsServer, load_local_data_file, clear_local_data_files
 from offline_sync import OfflineSync
 import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼容，详见 staging.py）
@@ -9988,15 +9988,22 @@ class MainWindow(QMainWindow):
                       f" / 纸叠排队 {removed['wait']} 个 / 预约单 {removed['scheduled']} 个")
         return removed
 
-    def _on_cloud_order_canceled(self, order_id: int, task_ids: list):
-        """云端订单被用户取消 → 通知任务列表窗口更新状态，若正在打印则立即取消。"""
-        self._log(f"☁ 订单 #{order_id} 已被用户取消")
+    def _on_cloud_order_canceled(self, order_id: int, task_ids: list, fix_status: str = ""):
+        """云端订单**不可再打印** → 通知任务列表窗口更新状态，若正在打印则立即取消。
+
+        `fix_status` 非空 = 管理员在结算页**人工订正**为终态（canceled/abandoned/rejected，
+        后端 reason="manual_fix"）—— 与「顾客主动取消」走同一套清理（订单确实不该出纸），
+        只有文案按来源区分，别把人工订正说成「被用户取消」。默认值 "" 保证既有两参调用不破。
+        """
+        fix_label = order_status_label_cn(fix_status) if fix_status else ""
+        reason = (f"已被人工订正为「{fix_label}」" if fix_label else "已被用户取消")
+        self._log(f"☁ 订单 #{order_id} {reason}")
         self._cloud_canceled_orders.add(order_id)  # 拒收该订单迟到的 print_task/状态更新（防乱序复活）
         if self._cloud_task_window:
             self._cloud_task_window.mark_canceled(order_id, task_ids)
         # 预约单被取消 → 清理预约状态机（停掉到点倒计时）
         if order_id in self._scheduled_orders:
-            self._cleanup_scheduled_order(order_id, reason="已被用户取消")
+            self._cleanup_scheduled_order(order_id, reason=reason)
 
         # 检查当前打印的任务是否包含被取消的 task_id → 立即终止打印
         cancel_current_print = False
@@ -10007,9 +10014,9 @@ class MainWindow(QMainWindow):
                     break
         if cancel_current_print:
             # 「已自动取消」没说清**取消的是什么**（订单？打印作业？云端状态？）——
-            # 这里只中止本机这次打印作业；订单本身是被用户在云端取消的，原因在上一行日志。
+            # 这里只中止本机这次打印作业；订单本身不可再打印的原因见上一行日志。
             self._log(f"☁ 订单 #{order_id} 正在本机打印 → 已中止本机打印作业"
-                      f"（订单早已被用户取消）")
+                      f"（订单{reason}）")
             self._worker.cancel()
 
         # D5 第 12 条：**真的清掉**还会把它打出来的状态（标签页任务 / 补打队列 / 纸叠排队 /
@@ -10029,8 +10036,8 @@ class MainWindow(QMainWindow):
             if purged["scheduled"]:
                 detail.append(f"预约单 {purged['scheduled']} 个")
             QMessageBox.information(
-                self, "任务已取消",
-                f"订单 #{order_id} 已被用户取消，本机待打印的该订单任务已自动清理："
+                self, ("任务已订正" if fix_label else "任务已取消"),
+                f"订单 #{order_id} {reason}，本机待打印的该订单任务已自动清理："
                 + "、".join(detail) + "\n（不会再被打出来）",
             )
 

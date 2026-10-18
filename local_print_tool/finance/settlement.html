@@ -1394,8 +1394,11 @@ function _doSave(force) {
 }
 
 /* ==================== Toast ==================== */
-function toast(msg, type) {
+/* replace=true：先把当前屏上的 toast 清空再加这一条 —— 订正失败时要盖掉上一条成功的 ✅，
+   否则「❌ …」与「✅ …」同屏会被读成"部分成功"。默认 false = 既有堆叠行为一字不变。 */
+function toast(msg, type, replace) {
   var wrap = $('#toastWrap');
+  if (replace && wrap) wrap.innerHTML = '';
   var el = document.createElement('div');
   el.className = 'toast ' + (type || '');
   el.textContent = msg;
@@ -2773,9 +2776,12 @@ function _toggleOrderExpand(oid) {
    只列出**终态**（与后端 MANUAL_FIX_STATUSES 同源）：改成排队中/打印中会被推送与预约调度
    重新捡起来打印 —— 页面上的「订正」不该有这个副作用，后端白名单也不放行。 */
 var ORDER_FIXABLE_STATUSES = ['sent', 'failed', 'abandoned', 'canceled', 'rejected'];
-/* 可编辑判据：云端模式 + 已解锁 + 订单 id 合法（本地模式订单库存本地库、无对应写接口，保持只读） */
+/* 可编辑判据：云端模式 + 已解锁 + 订单 id 合法（本地模式订单库存本地库、无对应写接口，保持只读）。
+   id 合法判据 = **规范十进制**（`/^[0-9]+$/`），与后端 `re.fullmatch(r"[0-9]+")` 同源：
+   内联 onclick 里的 id 已是引号字符串（不再当 JS 表达式求值），但 `'1e3'`/`'12-34'`/`'01'`
+   这类写法仍会过旧的 safeId 字母白名单；只认十进制才能保证「页面能点的 id」==「后端认的 id」。 */
 function _orderStatusEditable(oidS) {
-  return FINANCE_MODE !== 'local' && !!unlocked.orderstatus && !!oidS;
+  return FINANCE_MODE !== 'local' && !!unlocked.orderstatus && !!oidS && /^[0-9]+$/.test(String(oidS));
 }
 /* 「状态」表头的锁定开关 HTML（本地模式不渲染） */
 function _orderStatusLockHTML() {
@@ -2863,7 +2869,11 @@ var _orderStatusSaving = false;
    守卫与模板**同源**（_orderStatusEditable = 云端模式 + 已解锁 + id 合法），
    而不是只判「已解锁」—— 本地模式的订单 id 来自本机订单库（从 1 开始），
    若直接放行，控制台/未来重构会把本地 id 发到云端写接口，改掉云端同 id 的无关订单。
-   （UI 上本地模式本就不渲染入口，这里是把闸门下沉到函数，不只靠"没画出来"。） */
+   （UI 上本地模式本就不渲染入口，这里是把闸门下沉到函数，不只靠"没画出来"。）
+   成功后 `_scopeCache = {}`（F5）：每个口径的响应是**独立对象**，`_cloudData` 与
+   `_scopeCache[key]` 是同一引用，订正只改了当前这一个；不清缓存，切回先前访问过的口径会命中
+   缓存、显示订正前的旧状态（库里已是新值）。当前页不闪 —— renderCloud() 用的正是刚被乐观
+   改写的 `_cloudData`，无需整页重拉。 */
 function applyOrderStatus(oid, status) {
   closeOrderStatusMenu();
   if (!_orderStatusEditable(oid)) {
@@ -2882,18 +2892,19 @@ function applyOrderStatus(oid, status) {
     body: JSON.stringify({ order_id: String(oid), status: status })
   }).then(function (r) { return r.json(); }).then(function (res) {
     _orderStatusSaving = false;
-    if (!(res && res.success)) { toast('❌ ' + ((res && res.message) || '订正失败'), 'error'); return; }
+    if (!(res && res.success)) { toast('❌ ' + ((res && res.message) || '订正失败'), 'error', true); return; }
     /* 本地先落地：页面上所有数字（金额/收益/KPI/图表）都是从 _cloudData.orders 现算的，
        把状态与文件级状态同步过来即等价于库里的新状态（后端改的就是这两处），
        因此不必整页重新拉数（那会把操作者正在看的页面刷成加载态）。 */
     o.status = status;
     (o.files || []).forEach(function (f) { f.status = status; });
+    _scopeCache = {};   // 口径缓存整体失效：切回旧口径不该看到订正前状态（见函数头说明）
     toast('✅ 订单 ' + (o.order_number || ('#' + oid)) + ' 状态已改为「' + statusLabel(status) + '」', 'success');
     renderCloud();
     _scrollToOffset('cloud-orders');
   }).catch(function () {
     _orderStatusSaving = false;
-    toast('❌ 网络错误，状态未改动', 'error');
+    toast('❌ 网络错误，状态未改动', 'error', true);
   });
 }
 
@@ -3061,7 +3072,7 @@ function _renderOrderListHTML() {
       }
       var _amtTip = _tipParts.join(' · ');
       var addr = _orderAddr(o);
-      h += '<tr class="order-row st-bar' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '" style="--row-stc:' + _statusColor(o.status) + '"' + (oidS ? ' onclick="_toggleOrderExpand(' + oidS + ')"' : '') + '>';
+      h += '<tr class="order-row st-bar' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '" style="--row-stc:' + _statusColor(o.status) + '"' + (oidS ? ' onclick="_toggleOrderExpand(\'' + oidS + '\')"' : '') + '>';
       h += '<td><span class="expand-icon">▶</span></td>';
       h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
       h += '<td style="white-space:nowrap"><span class="' + srcCls + '">' + srcTxt + '</span></td>';
@@ -3070,7 +3081,7 @@ function _renderOrderListHTML() {
          点状态标签时要拦住行点击（否则会同时展开文件明细）。 */
       var _stTag = '<span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span>';
       h += '<td style="white-space:nowrap">' + (_orderStatusEditable(oidS)
-        ? '<span class="st-edit can" title="点击订正订单状态" onclick="event.stopPropagation();openOrderStatusMenu(event,' + oidS + ')">' +
+        ? '<span class="st-edit can" title="点击订正订单状态" onclick="event.stopPropagation();openOrderStatusMenu(event,\'' + oidS + '\')">' +
             _stTag + '<button type="button" class="st-caret" tabindex="-1">▾</button></span>'
         : _stTag) + '</td>';
       h += '<td style="font-weight:700;color:' + revColor + '" title="' + _amtTip + '">' + RMB(showAmt) +

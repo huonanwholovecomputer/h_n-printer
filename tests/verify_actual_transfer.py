@@ -63,8 +63,14 @@ check("DEFAULT_PASSWORDS 含 transfer", re.search(r"transfer: _PW_123456", src) 
 check("MODULE_NAMES 含 transfer", re.search(r"transfer: '实际转账'", src) is not None)
 check("unlocked 初始状态含 transfer",
       re.search(r"var unlocked = \{[^}]*transfer: false", src) is not None)
-check("resetData 重置后含 transfer",
-      re.search(r"unlocked = \{[^}]*transfer: false[^}]*\};", src) is not None)
+# F7（2026-10-18 审查）：旧正则是 `unlocked = \{…transfer: false…\};`，会**先命中**
+# settlement.html 顶部的 `var unlocked = {…};` 初始声明 —— 只删 resetData() 里的
+# `transfer: false,` 时本条照样 PASS（假绿，实测 exit 0）。现在锚进 resetData 函数体内，
+# 判的是「重置后确实把 transfer 按回锁定」这件事。
+# 反向验证：只删 resetData(:4643) 里的 `transfer: false,` → 本条必须转红。
+check("resetData 重置后含 transfer（锚定 resetData 函数体，不认初始声明）",
+      re.search(r"function resetData\(\)[\s\S]{0,600}?unlocked = \{[^}]*transfer: false[^}]*\};",
+                src) is not None)
 check("设置页密码管理遍历 PASSWORD_KEYS（可设独立密码）",
       src.count("PASSWORD_KEYS.forEach(function (k) { if (!c.passwords[k])") >= 1
       and "PASSWORD_KEYS.forEach(function (k) {" in src)

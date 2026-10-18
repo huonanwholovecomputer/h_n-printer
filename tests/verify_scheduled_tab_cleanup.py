@@ -22,6 +22,7 @@
 """
 import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -301,16 +302,33 @@ check("已 sent 的任务保留（不删已打出的记录）",
       _p5 is not None and _p5["jobs"] == 0 and len(win5._config.tabs["1"].jobs) == 1, str(_p5))
 
 # 接线判据（语义，不 grep 文案）：_on_cloud_order_canceled 必须真的调用清理
+# 2026-10-18（Lead 复核追加）：原先 `split('<新签名>', 1)[1]` 是**裸下标** —— gui.py 一旦
+# 换回旧签名（反向验证）就是 IndexError 抛穿：红在异常、不打印摘要，按 repo-review §4
+# 「改前状态会挂住整个脚本的红不算红」不合格。现改为三层：
+#   ① 契约 chk：定位到冻结的三参签名（第 3 参 = 人工订正后的状态，有默认值 ⇒ 既有两参调用不破）；
+#      签名一变红在这一条（取不到就同步本判据），绝不抛异常；
+#   ② 取函数体用**宽松**正则（允许第 3 参可有可无），后续清理判据与签名解耦；
+#   ③ 取不到函数体时，下面三条也一律判红（不留「空体恒真」的假绿）。
+_CANCEL_SIG = ('def _on_cloud_order_canceled(self, order_id: int, task_ids: list,'
+               ' fix_status: str = ""):')
 _gui_src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
-_body = _gui_src.split("def _on_cloud_order_canceled(self, order_id: int, task_ids: list):", 1)[1] \
-    .split("\n    def _on_cloud_order_accepted", 1)[0]
+_m_sig = re.search(r"(?m)^    " + re.escape(_CANCEL_SIG) + r"\s*$", _gui_src)
+check("★ gui.py 的 _on_cloud_order_canceled 仍是冻结的三参签名"
+      "（第 3 参 fix_status: str = \"\" 有默认值）：签名一变红在这一条，不再 IndexError 抛穿",
+      _m_sig is not None,
+      "旧签名/未找到 ⇒ 同步本判据（不要退回裸 split 下标）")
+_m_loose = re.search(r"(?m)^    def _on_cloud_order_canceled\(self, order_id: int,"
+                     r" task_ids: list[^\n]*\):", _gui_src)
+_body = ""
+if _m_loose is not None:
+    _body = _gui_src[_m_loose.end():].split("\n    def _on_cloud_order_accepted", 1)[0]
 _body_nc = "\n".join(ln[:ln.find("#")] if ln.find("#") >= 0 else ln for ln in _body.split("\n"))
 check("★ _on_cloud_order_canceled 内真的调用了 _purge_canceled_print_state",
-      "_purge_canceled_print_state(" in _body_nc)
+      _body != "" and "_purge_canceled_print_state(" in _body_nc)
 check("撤单不再用「建议删除对应标签页」把责任推给用户",
-      "建议删除对应标签页" not in _body_nc)
+      _body != "" and "建议删除对应标签页" not in _body_nc)
 check("D 对拍：抽掉清理调用后该判据必红",
-      "_purge_canceled_print_state(" not in _body_nc.replace(
+      _body != "" and "_purge_canceled_print_state(" not in _body_nc.replace(
           "self._purge_canceled_print_state(", "ZZ_NO_PURGE("))
 
 # 收尾前打桩：closeEvent 在"标签页里仍有未打印文件"时会弹确认框 —— offscreen 平台没有

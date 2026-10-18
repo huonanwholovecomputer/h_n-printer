@@ -186,11 +186,18 @@ def post(payload, headers=HDR, **kw):
 
 
 # 原始文件哈希在「无写入」时是否稳定？（WAL checkpoint 可能扰动 → 先探一次）
+# F8a（2026-10-18 审查）：原先这里是裸 `assert r.status_code == 403` —— 一旦修前版
+# （或任何回归）把它打成非 403，脚本直接抛 AssertionError 终止，**一个 chk 都不跑、
+# 没有 FAIL 摘要**，红在异常而不是修复点。改成 chk 后继续跑完整套。
 _r0 = raw_fp()
+_r403_bad = []
 for _ in range(3):
     r = post({"order_id": 987654321, "status": "sent"}, headers={})   # 403，绝无写入
-    assert r.status_code == 403
+    if r.status_code != 403:
+        _r403_bad.append("%s %s" % (r.status_code, r.get_json()))
 _r1 = raw_fp()
+chk("无 token 的订正请求一律 403（原始文件哈希探针的前提；裸 assert → chk 后仍继续跑）",
+    not _r403_bad, _r403_bad)
 STRICT_RAW = (_r0 == _r1)
 note("原始文件(order s.db/-wal)哈希在无写入请求前后%s → 本轮%s原始字节断言"
      % ("一致" if STRICT_RAW else "不一致", "启用" if STRICT_RAW else "仅作参考不判定"))
@@ -200,7 +207,13 @@ CANARY = mk("canary", "printing", [("printing", 2.30, "2026-10-18 08:00:00")],
 CANARY_BEFORE = state(CANARY)
 note("canary 订单 #%d = %s（每次订正后校验它没被捎带改到）" % (CANARY, CANARY_BEFORE))
 
-print("\n(夹具矩阵) 目标白名单 MANUAL_FIX_STATUSES = %s" % (backend.MANUAL_FIX_STATUSES,))
+# F8a：白名单属性缺失时用 getattr 兜底继续跑（原先直接 `backend.MANUAL_FIX_STATUSES`
+# 会 AttributeError 终止 → 红在异常而非断言）。兜底成空元组本身必须判红，否则后面的
+# 矩阵会「0 组合 0 失败」空转成假绿。
+FIX_TARGETS = tuple(getattr(backend, "MANUAL_FIX_STATUSES", ()) or ())
+print("\n(夹具矩阵) 目标白名单 MANUAL_FIX_STATUSES = %s" % (FIX_TARGETS,))
+chk("后端暴露终态白名单 MANUAL_FIX_STATUSES（缺了的话下面的 5×5 矩阵会空转）",
+    len(FIX_TARGETS) == 5, FIX_TARGETS)
 
 
 # ============================================================================
@@ -219,7 +232,7 @@ SHAPES = {
 }
 
 matrix_fail = 0
-for target in backend.MANUAL_FIX_STATUSES:
+for target in FIX_TARGETS:
     for tag, (pst, files) in SHAPES.items():
         oid = mk("M-%s-%s" % (target, abs(hash(tag)) % 99999), pst, files)
         locked_before = [f[2] for f in files]
@@ -247,7 +260,7 @@ for target in backend.MANUAL_FIX_STATUSES:
             chk("canary 未被波及 [%s/%s]" % (target, tag), False, state(CANARY))
 
 chk("矩阵 25 组合（5 目标 × 5 形态：父订单+全部子任务+聚合+refresh 回写 全部等于目标）",
-    matrix_fail == 0, "%d 组合失败" % matrix_fail)
+    len(FIX_TARGETS) == 5 and matrix_fail == 0, "%d 组合失败" % matrix_fail)
 chk("canary 订单在所有订正后保持原状（WHERE order_id 作用域无溢出）",
     state(CANARY) == CANARY_BEFORE, "%s → %s" % (CANARY_BEFORE, state(CANARY)))
 
@@ -736,13 +749,17 @@ i_append = body_menu.find("document.body.appendChild")
 chk("openOrderStatusMenu 用的是同一个同源守卫（_orderStatusEditable），且在创建菜单之前",
     0 <= i_mguard < i_append, "guard=%s append=%s" % (i_mguard, i_append))
 
+# 2026-10-18：F4 落地后 `!!oidS`（safeId 字母白名单）收紧为 `/^[0-9]+$/`（与后端
+# re.fullmatch(r"[0-9]+") 同源）—— 判据按**新源码形态**同步，不改回源码迁就正则。
 EDITABLE_RE = re.compile(r"function _orderStatusEditable\(oidS\) \{\s*\n\s*return "
-                         r"FINANCE_MODE !== 'local' && !!unlocked\.orderstatus && !!oidS;")
-chk("_orderStatusEditable 同时要求「非 local + 已解锁 + id 合法」",
-    EDITABLE_RE.search(html) is not None)
+                         r"FINANCE_MODE !== 'local' && !!unlocked\.orderstatus && !!oidS"
+                         r"( && /\^\[0-9\]\+\$/\.test\(String\(oidS\)\))?;")
+chk("_orderStatusEditable 同时要求「非 local + 已解锁 + id 是规范十进制」",
+    EDITABLE_RE.search(html) is not None
+    and "/^[0-9]+$/.test(String(oidS))" in html)
 chk("[自证] 静态变异：_orderStatusEditable 去掉 FINANCE_MODE 判据（退回只判 unlocked）→ 上式转红",
     EDITABLE_RE.search(html.replace(
-        "return FINANCE_MODE !== 'local' && !!unlocked.orderstatus && !!oidS;",
+        "return FINANCE_MODE !== 'local' && !!unlocked.orderstatus && !!oidS && /^[0-9]+$/.test(String(oidS));",
         "return !!unlocked.orderstatus && !!oidS;")) is None)
 chk("local 模式锁开关不渲染（表头没有入口）",
     re.search(r"function _orderStatusLockHTML\(\) \{\s*\n\s*if \(FINANCE_MODE === 'local'\) return '';",
@@ -759,8 +776,16 @@ chk("提交走 /api/proxy/admin/order_status（POST），且只在 success 后�
 chk("前端可选状态集合 == 菜单渲染集合（ORDER_FIXABLE_STATUSES 单一定义，菜单 forEach 它）",
     html.count("var ORDER_FIXABLE_STATUSES") == 1 and
     "ORDER_FIXABLE_STATUSES.forEach(function (s) {" in html)
-note("行内 onclick 用 safeId(oidS) 白名单；菜单内联 onclick 用 esc(String(oid))，"
-     "但 oid 源自同一个 safeId 结果 → 实际不可达（仅防御深度不一致）")
+# F8a（2026-10-18 审查）：这里原先是 note()，理由写的是「行内 onclick 用 safeId(oidS) 白名单 ⇒
+# 实际不可达（仅防御深度不一致）」—— **判据错误**：safeId 的白名单是 ^[A-Za-z0-9_-]+$，
+# 放行字母与 e，'1e3' / '12-34' 都能过，在 JS 里分别被求值成 1000 与 -22（真的会写到另一张单）。
+# 真正让内联表达式不可达的理由是「order_id 只认规范十进制」，所以升级为 chk，
+# 盯前端同款闸门（与后端 re.fullmatch(r"[0-9]+") 同源）；缺了它 = 非规范十进制 id 可能被当表达式。
+_DECIMAL_ID_GATE = re.compile(
+    r"function _orderStatusEditable\(oidS\)\s*\{[\s\S]{0,600}?/\^\[0-9\]\+\$/")
+chk("★ _orderStatusEditable 只认十进制 id（/^[0-9]+$/，与后端 re.fullmatch 同源）"
+    "—— 行内 onclick 不可达的**真正**理由（safeId 字母白名单放行 '1e3'/'12-34'，不构成理由）",
+    _DECIMAL_ID_GATE.search(html) is not None)
 
 
 # ============================================================================
@@ -973,7 +998,7 @@ chk("重复 status 键（printing + sent）→ 200 且落库 sent（与校验值
 
 # 9e status 是布尔/数字时 str() 后的字面量不会意外命中白名单（已在 §2 覆盖），补一个真值表断言
 chk("str(True)/str(1)/str(None) 都不是白名单成员",
-    all(s not in backend.MANUAL_FIX_STATUSES for s in (str(True), str(1), str(None), str(0))))
+    all(s not in FIX_TARGETS for s in (str(True), str(1), str(None), str(0))))
 
 chk("全部 9 组额外攻击后：oid_x 最终状态与最后一次合法请求一致（sent）、无畸形请求被误放行",
     state(oid_x)[0] == "sent", state(oid_x))

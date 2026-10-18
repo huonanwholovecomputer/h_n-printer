@@ -2106,6 +2106,14 @@ _STATUS_PRIORITY = {"failed": 9, "printing": 8, "waiting": 7, "accepted": 6,
                     "downloading": 5, "offline_unknown": 5, "scheduled": 4, "queued": 4,
                     "sent": 3, "abandoned": 2, "rejected": 1, "canceled": 0}
 
+# 「这单不该再有纸出来」的终态（2026-10-18 审查 🔴 的统一判据 = 「云端不要再主动让它打印」）。
+# 人工订正成这三种状态后：① 必须通知设备端停止/丢弃在飞队列（admin_order_status →
+# _notify_order_no_longer_printable）；② 预约单到点也不许开始打印（start_printing）。
+# ⚠ 这三态**不是**对设备的最终裁决（2026-10-18 用户口径）：设备若仍把纸打出来并如实回报成功
+# （典型是它当时离线、没收到通知），云端按回报记 sent —— 见 on_print_success 的白名单与日志。
+# failed 刻意不在本常量里：它同样可以被设备迟到的成功回报救回（2026-09 的既有决定）。
+NO_LONGER_PRINTABLE_STATUSES = ("canceled", "abandoned", "rejected")
+
 
 def aggregate_order_status(conn, order_id):
     """根据 order_files 的状态聚合父订单状态：
@@ -3164,19 +3172,25 @@ def on_print_success(data):
               f"（{own['basis']}={own['owner'] or '<空>'}，来源 {client_id}），已拒绝")
         conn.close()
         return
+    # 回报前的状态：用于事后如实日志（failed / 三终态被覆盖时各说清原因）。
+    prev_status = (own.get("status") or "").strip()
 
     # P1-5：状态集加入 queued（断线回滚闭环：回滚后客户端回报成功也能收敛为 sent）；
     # P0-1.4：完成时清空 locked_at
     # 2026-09：状态集加入 failed —— check_printing_timeout 的 3 分钟反馈窗口对缺纸/卡纸这类
     # 物理中断太短，任务被误判 failed 后，迟到的成功回报原本被白名单挡掉（静默丢弃，订单永久失败）。
-    # abandoned/canceled 仍不在列：用户显式放弃/取消的意图优先于迟到回报。
-    # reject_reason 只在从 failed 恢复时清（提交时写入的页码范围提示需保留）。
+    # 2026-10-18（用户口径）：**设备是这张单的最终裁决者** —— canceled/abandoned/rejected 也放行。
+    # 场景：订正/取消发生在设备离线期间，这台机照旧把纸打了出来并如实回报成功；纸确实出来了，
+    # 账就该算（人工订正只保证"云端不再主动让它打印"，不否定设备已出纸的事实）。
+    # 反过来说：设备**没**打出来时根本不会有成功回报，所以这条放行不会凭空把取消单算成收益。
+    # reject_reason：凡是从"失败/打回/取消/放弃"翻成 sent 都要清掉（旧文案会误导以为这单没成）。
     conn.execute(
-        "UPDATE order_files SET reject_reason = '' WHERE id = ? AND status = 'failed'",
+        "UPDATE order_files SET reject_reason = '' WHERE id = ?"
+        " AND status IN ('failed', 'rejected', 'canceled', 'abandoned')",
         (task_id,),
     )
     conn.execute(
-        "UPDATE order_files SET status = 'sent', locked_at = '' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued', 'failed')",
+        "UPDATE order_files SET status = 'sent', locked_at = '' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued', 'failed', 'canceled', 'abandoned', 'rejected')",
         (task_id,),
     )
     # 获取父订单 ID 并刷新聚合状态
@@ -3200,6 +3214,16 @@ def on_print_success(data):
                 )
     conn.commit()
     conn.close()
+
+    if prev_status in NO_LONGER_PRINTABLE_STATUSES:
+        # 设备最终裁决（2026-10-18 用户口径）：这台机真把纸打出来了，人工订正不否定这个事实 ⇒
+        # 记 sent（进收益）。留一行日志，便于事后核对"账面与人工订正不一致"的原因。
+        print(f"  [FIX] print_success 子任务 #{task_id}: 设备成功回报覆盖云端终态 "
+              f"{prev_status} → sent（设备是最终裁决者）")
+    elif prev_status == "failed":
+        # 2026-09 的既有决定：3 分钟反馈超时把任务误判 failed 后，迟到的成功回报就是
+        # 「纸确实出来了」的证据 ⇒ 救回 sent。人工订正为 failed 的订单同样适用，别加拦截。
+        print(f"  [FIX] print_success 子任务 #{task_id} 由 failed 救回 sent（迟到的成功回报）")
 
     with pushed_tasks_lock:
         pushed_tasks.pop(task_id, None)
@@ -3232,7 +3256,7 @@ def on_print_fail(data):
         print(f"  [WARN] print_fail 来自未注册连接（sid={request.sid}），已忽略")
         return
 
-    print(f"  [FAIL] 子任务 #{task_id}: 客户端打印失败 ({error})，标记为失败")
+    print(f"  [FAIL] 子任务 #{task_id}: 客户端上报打印失败 ({error})")
     conn = get_db()
     row = conn.execute(
         "SELECT order_id, operator_client FROM order_files WHERE id = ?", (task_id,)
@@ -3248,10 +3272,14 @@ def on_print_fail(data):
     # 同时排除 canceled——用户已取消的任务不能被迟到的失败回报覆盖成 failed
     #（否则取消正在打印的订单时，本地工具对剩余任务回报的"已取消"失败会把 canceled
     #  覆盖成 failed，父订单显示"打印失败"）。
-    # 列表与 print_success 不完全对称：那边额外含 failed（迟到成功可把超时误判救回），
-    # 这边不含 failed——本就是 failed，重复写入只会白白覆盖 reject_reason。
+    # 与 print_success **刻意不对称**（2026-10-18 用户口径）：成功回报 = 「纸出来了」，设备说了算，
+    # 连人工终态都能覆盖成 sent；失败回报不带来收益，且终态里的 canceled/abandoned/rejected 被覆盖成
+    # failed 只会把「已取消」标签弄丢 —— 最典型的来源是「取消正在打印的订单」时本地工具对剩余任务
+    # 回报的"已取消"失败（那是同一次取消的副产物，不是设备独立打的标记）。所以白名单只放
+    # 分发/领取过程中的工作状态 + sent 排除（禁止 sent → failed 降级）。
+    # 这边不含 failed 的原因是重复写入只会白白覆盖 reject_reason。
     # 失败原因写入 reject_reason（移动端订单详情/收支结算可展示）
-    conn.execute(
+    cur = conn.execute(
         "UPDATE order_files SET status = 'failed', locked_at = '', reject_reason = ? WHERE id = ?"
         " AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued')",
         (("打印失败: " + str(error))[:200], task_id),
@@ -3261,6 +3289,14 @@ def on_print_fail(data):
         refresh_order_status(conn, row["order_id"])
     conn.commit()
     conn.close()
+
+    if (cur.rowcount or 0) == 0:
+        # 白名单挡下（已 sent / canceled·abandoned·rejected 终态 / 本就 failed）：状态该保持不动，
+        # 但旧写法只在上方打一句「标记为失败」就完事，与实际未改动矛盾 —— 留一行如实日志。
+        print(f"  [WARN] print_fail 子任务 #{task_id} 当前状态为 {own.get('status') or ''}"
+              f"（不在可改白名单），迟到失败回报已忽略")
+    else:
+        print(f"  [FAIL] 子任务 #{task_id}: 状态已置为 failed")
 
     with pushed_tasks_lock:
         pushed_tasks.pop(task_id, None)
@@ -3481,12 +3517,14 @@ def on_start_printing(data):
                 ).fetchone()
                 if not row:
                     continue
-                # 父订单已取消 → 不再开始打印（防已取消订单复活）
+                # 父订单一律不许复活：canceled/abandoned/rejected = 「这单不该再有纸出来」
+                # （结算页人工订正成这三种状态后，预约单到点也不该再开始打印）。
+                # failed 刻意不在列 —— 它仍可被设备迟到的成功回报救回（见 NO_LONGER_PRINTABLE_STATUSES）。
                 o = conn.execute(
                     "SELECT status FROM orders WHERE id = ?", (row["order_id"],)
                 ).fetchone()
-                if o and o["status"] == "canceled":
-                    print(f"  [SKIP] start_printing 子任务 #{tid}: 父订单已取消，跳过")
+                if o and o["status"] in NO_LONGER_PRINTABLE_STATUSES:
+                    print(f"  [SKIP] start_printing 子任务 #{tid}: 父订单状态为 {o['status']}，跳过")
                     continue
                 # 记录实际开始打印时刻（幂等：仅首次，不覆盖早于本次上报的开始时间）
                 conn.execute(
@@ -8278,6 +8316,74 @@ def statistics_my():
 MANUAL_FIX_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected")
 
 
+def _notify_order_no_longer_printable(order_id, status, task_ids, owner_clients, target_client=""):
+    """人工订正成「不该再有纸出来」的终态后，通知设备端停止/丢弃这一单（2026-10-18 审查 🔴）。
+
+    为什么必须发这一枪：订正只落库时，设备侧在飞的四个入口（标签页任务 / 自动打印补打队列
+    `_auto_print_retry` / 攒批排队 `_stack_wait` / 预约状态机 `_scheduled_orders`）照旧会把这单
+    打出来 —— 纸出来了、库里却是终态不计收益，前后端都没有一行日志。这里直接复用现成的
+    `order_canceled` 链路（本地工具 `_on_cloud_order_canceled` → `_purge_canceled_print_state`
+    真的清掉那四处），因此**旧版客户端（≤4.5.24）不认 reason/status 也照样清理**，
+    后端热部署即刻对线上存量客户端生效；`reason`/`status` 只给新版客户端做准确文案
+    （顾客主动取消的事件不带这两个字段）。
+
+    发给谁：先给「摸过这单的设备」（子任务 operator_client / last_operator_client）与订单目标设备
+    （orders.target_client）中在线的；一个都不在线 → 兜底广播给在线接单设备（在无关设备上清理是空操作，
+    只会多一行状态提示）。每个 sid 只发一次；通知失败只记日志，不影响订正本身的成功回执。
+
+    **离线设备收不到这一枪，且这是被允许的**（2026-10-18 用户口径「设备是最终裁决者」）：
+    它本地标签页里那单仍会被打出来 —— 那就按设备回报记 sent（on_print_success 会覆盖云端的
+    人工终态）。所以这条链路的目标是「在线设备别浪费纸」，不是「绝对不许出纸」；无需为离线场景兜底。
+    """
+    try:
+        order_no = int(order_id)
+    except (TypeError, ValueError):
+        return
+    candidates = []
+    seen = set()
+    for cid in list(owner_clients or []) + ([target_client] if target_client else []):
+        cid = (cid or "").strip()
+        if cid and cid not in seen:
+            seen.add(cid)
+            candidates.append(cid)
+
+    def _sid_of(client_id):
+        with printer_clients_lock:
+            info = printer_clients.get(client_id)
+        return info["sid"] if info else None
+
+    targets = []
+    for cid in candidates:
+        sid = _sid_of(cid)
+        if sid:
+            targets.append((cid, sid))
+    if not targets:
+        claiming = set(get_claiming_device_ids())
+        for cid in get_active_clients():
+            if cid in seen or cid not in claiming:
+                continue
+            seen.add(cid)
+            sid = _sid_of(cid)
+            if sid:
+                targets.append((cid, sid))
+
+    payload = {
+        "order_id": order_no,
+        "task_ids": list(task_ids or []),
+        "reason": "manual_fix",
+        "status": status,
+    }
+    for cid, sid in targets:
+        try:
+            socketio.emit("order_canceled", payload, to=sid)
+            print(f"  [FIX] 已通知打印机 {cid}: 订单 #{order_no} 已订正为 {status}，本机不得再打印")
+        except Exception as e:
+            print(f"  [FIX] 通知打印机 {cid} 失败: {e}")
+    if not targets:
+        print(f"  [FIX] 订单 #{order_no} 订正为 {status}: 无在线设备可通知"
+              f"（离线设备本地标签页里的这单仍需人工删除，否则仍可能被打出来）")
+
+
 @app.route("/api/admin/order_status", methods=["POST"])
 def admin_order_status():
     """收支清算页人工订正订单状态（需 printer token 认证）。
@@ -8287,16 +8393,33 @@ def admin_order_status():
     把全部子任务一并写成目标终态，聚合结果就等于目标状态（无子任务的历史老单直接改父订单）。
 
     locked_at 一并清空：终态不该再被 3 分钟反馈超时 / 孤儿回收 / 保活逻辑盯上。
-    子任务里已 sent 的也照改 —— 人工订正是最终裁决（与 abandon_order 只动非终态的口径不同，
-    那里的语义是"打印机放弃"，这里是"账目订正"）。
+    子任务里已 sent 的也照改（订正的是账目口径，与 abandon_order「只动非终态、语义是打印机放弃」不同）。
+
+    **五终态不都是"最终裁决"**（2026-10-18 审查 🟡 + 用户口径）：
+      · canceled / abandoned / rejected = 「云端不再主动让它打印」⇒ 提交成功后**必须通知设备端**
+        （`_notify_order_no_longer_printable` 复用 order_canceled 链路，真的清掉在线设备侧在飞队列）。
+        ⚠ 但它**不是**对设备的最终裁决：设备离线时收不到通知、照旧把纸打出来并如实回报成功的话，
+        `on_print_success` 会按回报把它记成 sent（**打印这张单的机器说了算**，纸出来了账就要算）。
+      · failed = 「本轮没成功」：设备迟到的 print_success 同样会把它救回 sent
+        （2026-09 已为"迟到的成功回报被白名单挡掉 ⇒ 订单永久失败"付过代价）。
+        前端订正为 failed 后不要假设库内恒为 failed，页面刷新/切口径会重新拉数。
+      · sent 天然不会再被改动（除非设备真的又回报一次成功，那也是 sent）。
+      · 反向不成立：设备报**失败**不会把人工终态改掉（`on_print_fail` 的白名单不含这三态与 sent）——
+        那是「被取消后剩余任务回报失败」的副产物，放行只会把「已取消」标签弄成「打印失败」，与钱无关。
 
     畸形请求体（JSON 数组/字符串/数字/布尔）必须 fail-closed：请求体解析一次并做 dict 守卫，
     不能让鉴权表达式自己崩成 500（未认证也能 500 属可用性缺陷）。
+    **深嵌套请求体**（depth ≥ 1000）会让 json.loads 抛 RecursionError —— 它不是 ValueError，
+    `silent=True` 挡不住，所以解析本身也要包住（2026-10-18 审查 🟡）。
     order_id 只认**规范十进制**（纯 ASCII 数字、无前后空白、无前导零）：SQLite 的 INTEGER
     亲和性会把 '1.0' / '01' / '+1' / ' 1 ' / '1e0' 都折算成 id=1 并**真的改写订单 1**，
     「id 写错」绝不能命中另一张单。
     """
-    data = request.get_json(silent=True)
+    try:
+        data = request.get_json(silent=True)
+    except Exception:
+        # RecursionError（深嵌套）/ 解析期其它异常：当成"没有请求体"，交给下面的鉴权与参数校验
+        data = None
     if not isinstance(data, dict):
         data = {}
     token = _get_printer_token() or str(data.get("token") or "")
@@ -8322,16 +8445,31 @@ def admin_order_status():
 
     files_updated = 0
     old_status = ""
+    task_ids = []
+    owner_clients = set()
+    target_client = ""
     with db_lock:
         conn = get_db_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT status FROM orders WHERE id = ?", (order_id,)
+                "SELECT status, target_client FROM orders WHERE id = ?", (order_id,)
             ).fetchone()
             if not row:
                 return jsonify({"success": False, "message": "订单不存在"}), 404
             old_status = row["status"]
+            target_client = (row["target_client"] or "").strip()
+            # 通知设备用的目标清单（在改写之前收集）：谁摸过这单 + 这单的目标设备。
+            # 改写只动 status/locked_at，不碰 operator_client/last_operator_client，先后无差别。
+            for r in conn.execute(
+                "SELECT id, operator_client, last_operator_client FROM order_files WHERE order_id = ?",
+                (order_id,),
+            ).fetchall():
+                task_ids.append(r["id"])
+                for cid in (r["operator_client"], r["last_operator_client"]):
+                    cid = (cid or "").strip()
+                    if cid:
+                        owner_clients.add(cid)
             cur = conn.execute(
                 "UPDATE order_files SET status = ?, locked_at = '' WHERE order_id = ?",
                 (new_status, order_id),
@@ -8347,6 +8485,10 @@ def admin_order_status():
 
     print(f"  [FIX] 订单 #{order_id} 状态人工订正: {old_status} → {new_status}"
           f"（子任务 {files_updated} 个）")
+    if new_status in NO_LONGER_PRINTABLE_STATUSES:
+        # 「这单不该再有纸出来」⇒ 必须通知设备端清掉在飞队列（否则照打、账是终态、零日志）
+        _notify_order_no_longer_printable(order_id, new_status, task_ids,
+                                          owner_clients, target_client)
     return jsonify({
         "success": True,
         "message": "订单状态已订正",

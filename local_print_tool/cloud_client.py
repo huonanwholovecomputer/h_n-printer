@@ -55,6 +55,22 @@ PULL_FALLBACK_INTERVAL = 45
 STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃最旧条目
 MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
+# 订单状态中文名（与收支清算 settlement.html 的 STATUS_LABELS 同源）——
+# 人工订正通知（order_canceled 且 reason=="manual_fix"）用它把后端 status 翻成中文再入文案，
+# 避免把英文状态名直接露给操作员。
+ORDER_STATUS_LABELS_CN = {
+    "sent": "已完成", "failed": "失败", "canceled": "已取消", "rejected": "被打回",
+    "abandoned": "放弃打印", "printing": "待添加", "queued": "排队中",
+    "accepted": "已添加", "reserved": "已预留", "offline_unknown": "断线未知",
+    "scheduled": "已预约", "waiting": "等待打印", "downloading": "文件传输中",
+}
+
+
+def order_status_label_cn(status) -> str:
+    """订单状态 → 中文名；未知状态原样返回（别吞掉信息）。"""
+    s = str(status or "")
+    return ORDER_STATUS_LABELS_CN.get(s, s)
+
 
 _CACHE_ENGINE_SUFFIXABLE = ("word", "wps")
 
@@ -262,7 +278,8 @@ class CloudClient(QObject):
     task_updated = Signal(object)         # CloudTask — 任务状态更新（下载进度等）
     connection_changed = Signal(bool)     # True=已连接, False=已断开
     status_message = Signal(str)          # 日志消息
-    order_canceled = Signal(int, list)    # int=order_id, list=task_ids — 订单被用户取消
+    # int=order_id, list=task_ids, str=人工订正后的状态（普通用户取消为 ""）— 订单不可再打印
+    order_canceled = Signal(int, list, str)
     start_print = Signal(int, int, list)  # 预约单到点/解除冻结：order_id, scheduled_ts, task_ids
     auth_failed = Signal(str)             # 认证失败（含消息），GUI 可连接此信号提示用户
     printer_state = Signal(object)        # 接单状态 dict（is_active/active_owner_name/...）— 2026-11
@@ -1256,10 +1273,26 @@ class CloudClient(QObject):
 
         @sio.on("order_canceled")
         def _on_order_canceled(data):
+            """订单不再该打印：顾客主动取消，或管理员在结算页人工订正为终态。
+
+            人工订正复用同一事件（后端热部署即对存量客户端生效），区别只在 payload：
+            reason=="manual_fix" + status="<新状态>"（**必须是字符串**）⇒ 第 3 参带状态名；
+            用户取消不带（fix_status 为 ""），文案与既有语义完全一致。"""
             order_id = int(data.get("order_id", 0)) if isinstance(data, dict) else 0
             task_ids = data.get("task_ids", []) if isinstance(data, dict) else []
-            self.status_message.emit(f"☁ 订单 #{order_id} 已被用户取消")
-            self.order_canceled.emit(order_id, task_ids)
+            reason = str(data.get("reason") or "") if isinstance(data, dict) else ""
+            # status 只认字符串（与后端 `isinstance(raw_status, str)` 的 fail-closed 同调）：
+            # 缺失/数字/对象等畸变载荷一律不当订正，退化成既有「用户取消」语义，不伪造订正文案。
+            _st = data.get("status") if isinstance(data, dict) else None
+            fix_status = _st.strip() if isinstance(_st, str) else ""
+            if reason == "manual_fix" and fix_status:
+                self.status_message.emit(
+                    f"☁ 订单 #{order_id} 已被人工订正为「{order_status_label_cn(fix_status)}」，"
+                    f"本机相关任务已停止")
+            else:
+                fix_status = ""      # 非人工订正一律按旧语义（用户取消）处理
+                self.status_message.emit(f"☁ 订单 #{order_id} 已被用户取消")
+            self.order_canceled.emit(order_id, task_ids, fix_status)
             # 从待处理列表中移除对应任务
             for tid in task_ids:
                 self._pending_tasks.pop(tid, None)
