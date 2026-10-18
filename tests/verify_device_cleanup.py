@@ -19,6 +19,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -243,8 +244,11 @@ check("两个按钮共用同一套两段式（先 dry_run 预览、确认后才�
       "function runDeviceCleanup(" in html
       and "Object.assign({ dry_run: true }, extraBody || {})" in html
       and "Object.assign({ dry_run: false }, extraBody || {})" in html)
-check("授权页版本记录已写 v6.7（并已随版本号递增到 v6.9）", "v6.7：测试设备不再堆在授权页" in html
-      and ">v6.9</div>" in html)
+check("授权页版本记录已写 v6.7（版本号只钉「不早于 v6.7」，不钉死具体值 —— "
+      "每加一版功能都会递增，钉死字面量会误报）",
+      "v6.7：测试设备不再堆在授权页" in html
+      and (lambda m: bool(m) and (int(m.group(1)), int(m.group(2))) >= (6, 7))(
+          re.search(r">v(\d+)\.(\d+)</div>", html)))
 check("离线却挂着接单记录时显示「接单中（离线）」并提示可删除清空",
       "接单中（离线）" in html and "僵尸记录" in html)
 

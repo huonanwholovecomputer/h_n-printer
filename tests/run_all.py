@@ -51,6 +51,12 @@ ENV_REQUIRED: dict[str, str] = {
     "verify_me_layout_render.mjs": "需 Playwright / 真实浏览器（「我」页首屏到底能看到什么、区块谁先谁后"
                                    "只能靠真实渲染量：桩后端 + 真实 www/，并同时渲染 git HEAD 的旧版作对照；"
                                    "--all 或直接 node 可跑）",
+    "verify_order_status_edit_render.mjs": "需 Playwright / 真实浏览器（订单状态订正的解锁弹窗、"
+                                          "箭头渲染与订正后 KPI 变化只能靠真实渲染 + 真实 Web Crypto 校验；"
+                                          "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
+    "verify_order_status_edit_adversarial.mjs": "需 Playwright / 真实浏览器（同一功能的对抗式 UI 探针："
+                                                "控制台绕过、本地模式跨库 id、零请求判据的变异自证；"
+                                                "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
 }
 
 # 非验收脚本（工具/选型/测量），不参与 PASS 计数

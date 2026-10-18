@@ -53,12 +53,18 @@ for i, s in enumerate(scripts):
 
 # ---------- 2) 静态接线 ----------
 print("\n--- 独立密码模块 ---")
-check("PASSWORD_KEYS 含 transfer", "PASSWORD_KEYS = ['score', 'expense', 'income', 'transfer', 'settings', 'auth']" in src)
+# 注意：断言只钉「transfer 在这个清单里」，不订死整行字面量 ——
+# 后续每加一个独立密码模块（如 v7.0 的 orderstatus）都会让字面量比较失效，
+# 那是「脚本过时」不是回归（旧写法已因此误报过两次）。
+check("PASSWORD_KEYS 含 transfer",
+      re.search(r"var PASSWORD_KEYS = \[([^\]]*)\]",
+                src) is not None and "'transfer'" in re.search(r"var PASSWORD_KEYS = \[([^\]]*)\]", src).group(1))
 check("DEFAULT_PASSWORDS 含 transfer", re.search(r"transfer: _PW_123456", src) is not None)
 check("MODULE_NAMES 含 transfer", re.search(r"transfer: '实际转账'", src) is not None)
-check("unlocked 初始状态含 transfer", "var unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false }" in src)
+check("unlocked 初始状态含 transfer",
+      re.search(r"var unlocked = \{[^}]*transfer: false", src) is not None)
 check("resetData 重置后含 transfer",
-      "unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false };" in src)
+      re.search(r"unlocked = \{[^}]*transfer: false[^}]*\};", src) is not None)
 check("设置页密码管理遍历 PASSWORD_KEYS（可设独立密码）",
       src.count("PASSWORD_KEYS.forEach(function (k) { if (!c.passwords[k])") >= 1
       and "PASSWORD_KEYS.forEach(function (k) {" in src)

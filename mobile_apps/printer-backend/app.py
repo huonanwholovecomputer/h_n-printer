@@ -8267,6 +8267,96 @@ def statistics_my():
     })
 
 
+# ==================== 订单状态人工订正（收支清算「云端数据 → 订单明细」）====================
+# 现场需求（2026-10-18）：打印出错时，订单状态与实际不符（该打的没打出来却显示已完成、
+# 打好了却被超时误判失败……），而状态直接决定结算口径（sent 计入收益，其余不计）。
+# 原先只能人工连服务器改库（前端页面无入口）。现提供页面内订正接口。
+#
+# 只允许改成**终态**：queued/printing/waiting 等非终态是任务分发与预约调度的工作状态，
+# 人工把订单改成它们会让 push/pull/预约调度重新把这张单捡起来打印 —— 页面上的「订正」
+# 不该有这个副作用，后端用白名单一并拦下（前端只列出这几项，两侧同源）。
+MANUAL_FIX_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected")
+
+
+@app.route("/api/admin/order_status", methods=["POST"])
+def admin_order_status():
+    """收支清算页人工订正订单状态（需 printer token 认证）。
+
+    为什么父订单与子任务一起改：`aggregate_order_status()` 才是状态的权威口径
+    （订单明细展示的也是聚合值），只改 orders.status 会被下一次聚合/回报刷回去 ——
+    把全部子任务一并写成目标终态，聚合结果就等于目标状态（无子任务的历史老单直接改父订单）。
+
+    locked_at 一并清空：终态不该再被 3 分钟反馈超时 / 孤儿回收 / 保活逻辑盯上。
+    子任务里已 sent 的也照改 —— 人工订正是最终裁决（与 abandon_order 只动非终态的口径不同，
+    那里的语义是"打印机放弃"，这里是"账目订正"）。
+
+    畸形请求体（JSON 数组/字符串/数字/布尔）必须 fail-closed：请求体解析一次并做 dict 守卫，
+    不能让鉴权表达式自己崩成 500（未认证也能 500 属可用性缺陷）。
+    order_id 只认**规范十进制**（纯 ASCII 数字、无前后空白、无前导零）：SQLite 的 INTEGER
+    亲和性会把 '1.0' / '01' / '+1' / ' 1 ' / '1e0' 都折算成 id=1 并**真的改写订单 1**，
+    「id 写错」绝不能命中另一张单。
+    """
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    token = _get_printer_token() or str(data.get("token") or "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    raw_id = data.get("order_id")
+    if raw_id is None or raw_id == "":
+        return jsonify({"success": False, "message": "缺少 order_id"}), 400
+    if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+        return jsonify({"success": False, "message": "order_id 不合法"}), 400
+    # 只认**规范十进制**（纯 ASCII 数字、无前后空白、无前导零）：
+    # '1.0' / '+1' / '1e0' / ' 1 ' 一律拒绝，'01' 还要单独挡 ——
+    # SQLite 的 INTEGER 亲和性会把它们都折成 id=1，从而改错单（id 写错绝不能命中另一张单）。
+    s_id = raw_id if isinstance(raw_id, str) else str(raw_id)
+    if not re.fullmatch(r"[0-9]+", s_id) or (len(s_id) > 1 and s_id[0] == "0"):
+        return jsonify({"success": False, "message": "order_id 不合法"}), 400
+    order_id = s_id
+    raw_status = data.get("status")
+    new_status = raw_status.strip() if isinstance(raw_status, str) else ""
+    if new_status not in MANUAL_FIX_STATUSES:
+        return jsonify({"success": False, "message": "不允许改为该状态"}), 400
+
+    files_updated = 0
+    old_status = ""
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({"success": False, "message": "订单不存在"}), 404
+            old_status = row["status"]
+            cur = conn.execute(
+                "UPDATE order_files SET status = ?, locked_at = '' WHERE order_id = ?",
+                (new_status, order_id),
+            )
+            files_updated = cur.rowcount or 0
+            conn.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    print(f"  [FIX] 订单 #{order_id} 状态人工订正: {old_status} → {new_status}"
+          f"（子任务 {files_updated} 个）")
+    return jsonify({
+        "success": True,
+        "message": "订单状态已订正",
+        "order_id": order_id,
+        "status": new_status,
+        "previous_status": old_status,
+        "files_updated": files_updated,
+    })
+
+
 @app.route("/api/admin/statistics/revenue", methods=["GET"])
 def admin_statistics_revenue():
     """管理员收益统计接口（printer token 鉴权）。
