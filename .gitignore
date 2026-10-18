@@ -19,6 +19,9 @@ venv/
 .codegraph/
 .workbuddy/
 .mnemon/
+# 技能/代理的仓库级发现入口（DSH 读 <仓库>/.agents/skills/<name>/SKILL.md）；
+# 技能实体仍在 .workbuddy/skills/，这里只是指向它的链接，别把内容提交进来
+.agents/
 
 # 大型安装包 - 需用户手动下载安装
 *.msi

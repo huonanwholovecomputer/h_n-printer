@@ -42,6 +42,8 @@
 
 Windows 桌面应用：拖放文件 / Ctrl+V 粘贴，自动转换格式后静默打印。
 
+> 下面几张界面图都用**模拟数据**渲染生成（脚本在 `tools/readme_screenshots/`，可重放），不是真实订单。
+
 ![本地打印工具主界面](docs/screenshots/local-print-tool.png)
 
 ### 打印管线
@@ -311,6 +313,9 @@ ssh root@YOUR_SERVER "journalctl -u printer-backend --since '5 minutes ago' --no
 
 - 云打印系统子系统架构详见 `mobile_apps/CLAUDE.md`
 - 后端部署与配置指南详见 `mobile_apps/printer-backend/DEPLOY.md`
+- README 里的界面图可用模拟数据重放（不连云端、不碰真实配置）：
+  `python tools/readme_screenshots/gen_gui_shot.py`（本地工具）与
+  `node tools/readme_screenshots/gen_web_shots.mjs`（收支清算 + 小程序/APP）
 - 仓库内 `AGENTS.md` / `CLAUDE.md` 为 AI 助手（Codex / Claude Code）指导文档，包含真实服务器 IP 与 SSH 密钥路径等运维信息，**仅本地参考，不进入 git**（已加入 `.gitignore`）
 
 ## License
