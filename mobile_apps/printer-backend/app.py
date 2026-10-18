@@ -6888,6 +6888,39 @@ def local_orders():
                 conn.close()
                 return jsonify({"success": True, "message": "订单已存在，跳过同步", "order_id": order_id})
 
+            # 🔴 来源闸门（2026-10-18 现场：小程序订单打印后变「本地」）：
+            # 本接口只该改写**本地打印工具自己开的单**（`/api/next_order_number` 预留时写
+            # openid='local', source='local'）。云端用户订单（openid=微信/设备号、
+            # source='wechat'/'app'）**绝不能**被这里改成 local —— 那会让结算页的来源徽标、
+            # 「订单构成」「本地/云端」筛选、按来源对账全部错位，顾客身份也丢了。
+            # 修复后的副作用评估：云端单的完成/失败仍由 print_success / print_failed
+            # （按 task_id）回报，不依赖本接口；本地单的预留→正式流程不受影响。
+            src_row = conn.execute(
+                "SELECT openid, source FROM orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            is_local_order = bool(
+                src_row
+                and (str(src_row["openid"] or "") == "local"
+                     or str(src_row["source"] or "") in ("", "local"))
+            )
+            if not is_local_order:
+                conn.close()
+                try:
+                    app.logger.warning(
+                        "local_orders 拒绝改写云端订单来源: order_number=%s openid=%s source=%s",
+                        order_number,
+                        src_row["openid"] if src_row else "",
+                        src_row["source"] if src_row else "",
+                    )
+                except Exception:
+                    pass
+                return jsonify({
+                    "success": True,
+                    "message": "该订单号属于云端订单，已忽略本地来源改写",
+                    "order_id": order_id,
+                    "ignored": True,
+                })
+
             # 更新占位记录为正式订单（reserved 占位 → reserved 完整 或 sent），并覆盖备注
             conn.execute(
                 """UPDATE orders SET file = ?, total_price = ?, status = ?,

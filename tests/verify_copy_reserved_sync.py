@@ -240,6 +240,52 @@ clip = QApplication.clipboard().text() or ""
 check("离线明细仍写入剪贴板", "计费明细" in clip and "-L" in clip,
       clip.replace("\n", " | ")[:160])
 
+print("=== 4b. 云端订单（带 task_id）→ 绝不能上报 /api/local_orders（会把来源改成「本地」）===")
+# 现场（2026-10-18）：小程序订单在本地工具里打印完，云端那行的 source 被改成 'local'，
+# 结算页来源徽标显示「本地」、订单构成/按来源对账全部错位。
+# 链路：云端任务的 job 带着**云端订单号**（cloud_client 里 order_number=task.order_number）
+#   → `_acquire_order_number_and_upload` 复用该号 → POST /api/local_orders（status=sent）
+#   → 后端 `local_orders()` 按 order_number 命中那行云端单 → UPDATE ... source='local'。
+FAKE._connected = True
+_cl_jobs = win._get_current_jobs()
+for _j in _cl_jobs:
+    _j.order_number = "HN20261018-0023"     # 云端订单号（后端那行 openid=微信/source=wechat）
+    _j.task_id = 98765                      # = 云端子任务，说明这是云端订单
+    _j.order_id = 4321
+win._set_current_jobs(_cl_jobs)
+HTTP.posts.clear()
+_num, _uploaded = win._acquire_order_number_and_upload(
+    _cl_jobs,
+    files_data=[{"file_name": "离散数学作业2.pdf", "copies": 1, "page_count": 1,
+                 "cost": 0.3, "duplex": "off", "page_range": ""}],
+    total_price=0.3, extra_fields={}, tab=win._config.tabs.get(win._current_tab),
+    created_at="2026-10-18 22:00:00", online=True)
+check("★ 云端订单不再上报 /api/local_orders（这是「变成本地订单」的根因）",
+      len(reserved_posts()) == 0, json.dumps([p["url"] for p in HTTP.posts]))
+check("★ 订单号保持云端号不变（不换号、不丢弃）", _num == "HN20261018-0023", _num)
+
+# 反向：本地订单（自己开的号、无 task_id）必须**照旧**上报，否则「复制价格→预留」断掉
+HTTP.posts.clear()
+_lc_jobs = win._get_current_jobs()
+for _j in _lc_jobs:
+    _j.order_number = "HN20261018-0024"
+    _j.task_id = 0
+    _j.order_id = 0
+win._set_current_jobs(_lc_jobs)
+_num2, _ = win._acquire_order_number_and_upload(
+    _lc_jobs,
+    files_data=[{"file_name": "本地单.pdf", "copies": 1, "page_count": 1,
+                 "cost": 0.3, "duplex": "off", "page_range": ""}],
+    total_price=0.3, extra_fields={}, tab=win._config.tabs.get(win._current_tab),
+    created_at="2026-10-18 22:00:00", online=True)
+check("★ 本地订单照旧上报 /api/local_orders（零回归）",
+      len(reserved_posts()) == 1, json.dumps([p["url"] for p in HTTP.posts]))
+if reserved_posts():
+    _b = reserved_posts()[0]["json"] or {}
+    check("本地单上报用本地号 + status=sent",
+          _b.get("order_number") == "HN20261018-0024" and _b.get("status") == "sent",
+          f"{_b.get('order_number')}/{_b.get('status')}")
+
 print("=== 5. 收尾 ===")
 win._on_copy_total  # noqa: B018  仅引用，避免未使用告警
 win.close()

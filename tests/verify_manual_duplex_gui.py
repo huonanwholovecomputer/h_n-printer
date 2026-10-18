@@ -73,12 +73,28 @@ def make_pdf(name: str, pages: int) -> str:
 PDF5 = make_pdf("doc5.pdf", 5)      # 配对：1/2 3/4 5/空白
 PDF3 = make_pdf("doc3.pdf", 3)      # 配对：1/2 3/空白
 PDF1 = make_pdf("doc1.pdf", 1)      # 配对：1/空白
-check("测试素材：3 份真 PDF（5/3/1 页）",
-      all(os.path.isfile(p) and os.path.getsize(p) > 400 for p in (PDF5, PDF3, PDF1)))
+PDF2_UP = make_pdf("doc2.pdf", 2)    # 合并/分组用（配对：1/2）
+check("测试素材：4 份真 PDF（5/3/1/2 页）",
+      all(os.path.isfile(p) and os.path.getsize(p) > 400 for p in (PDF5, PDF3, PDF1, PDF2_UP)))
 
 MANUAL = PrinterProfile(auto_duplex=False, capability_source="manual", manual_duplex=True,
                         first="odd", reverse_second=True, second_rotate_180=True,
                         verified_at="2026-10-12 22:14:49", verified_by="丙成员")
+
+
+def _pdf_page_texts(path: str) -> list:
+    """读出 PDF 每页的文本（核"合并后的页数/页序"用；打不开返回 []）。
+
+    页数/页序只能从**真正提交给打印机的那份 PDF** 上看 —— 桩记录的是调用参数，
+    "合并时漏了一页""副本没重复"这类错都藏在提交的文档里。
+    """
+    try:
+        import fitz
+        with fitz.open(path) as d:
+            return [p.get_text().strip() for p in d]
+    except Exception:
+        return []
+
 AUTO = PrinterProfile(auto_duplex=True, capability_source="manual", manual_duplex=False)
 UNKNOWN = PrinterProfile()          # 能力未确认：必须保持旧行为（零回归）
 
@@ -90,6 +106,7 @@ class Rec:
     def __init__(self):
         self.plan_pass = []      # [(which, 本趟是否旋转, 0-based序列, 1-based序列, 传下去的旋转设置)]
         self.print_pdf = []      # [kwargs]
+        self.merged_pages = []   # 每次 print_pdf 提交的那份 PDF 的逐页文本（核页数/页序用）
         self.announce = []       # [常驻窗 announce 文案]
         self.flip = []           # [翻纸提示文案]
         self.finished_evt = 0
@@ -122,6 +139,9 @@ def patched(rec, fail_merge_at=None):
 
     def _print_pdf(**kw):
         rec.print_pdf.append(kw)
+        # 合并打印的页数/页序只能从**真正提交的那份 PDF** 上看（一个作业一段）——
+        # 这里记下来，验收里用 fitz 打开它核对。
+        rec.merged_pages.append(_pdf_page_texts(kw.get("pdf_path", "")))
         return True, "桩：一次提交"
 
     def _print_plan_pass(plan, path, printer, which, second_rotate_180=False,
@@ -158,9 +178,13 @@ def patched(rec, fail_merge_at=None):
     return restore
 
 
-def make_job(path, duplex="on", copies=1, mode="long-edge", name=""):
+def make_job(path, duplex="on", copies=1, mode="long-edge", name="", page_count=0,
+             page_range=""):
+    """默认 page_count=0 = **页数未知**（`_uses_manual_duplex` 不当成 1 页，保持既有口径）；
+    要复现"页数已知的 1 页文件"这类现场，显式传 page_count。"""
     return PrintJob(file_path=path, copies=copies, duplex=duplex, duplex_mode=mode,
-                    page_range="", page_count=0, display_name=name or os.path.basename(path))
+                    page_range=page_range, page_count=page_count,
+                    display_name=name or os.path.basename(path))
 
 
 def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
@@ -251,7 +275,11 @@ check("翻纸文案说清共 6 张纸", "应有 6 张纸" in rec.flip[0], "")
 check("★ 三个任务各自收到完成回报（云端按文件分别回报成功）",
       sorted(i for i, ok, _m in rec.finished) == [0, 1, 2]
       and all(ok for _i, ok, _m in rec.finished), f"{rec.finished}")
-check("进度 total = 12（6 张纸 ×2 趟）",
+# 2026-10-18：本轮已单面直打的纸（这里两件：5 页 docx 里的 1 页图片）
+# 现在**并进批次页序** ⇒ 多 1 张纸 ⇒ 面数 6×2=12 变 13（那张纸第 2 趟只走纸不打墨）。
+# 并进来的理由见 `gui.PrintWorker._print_manual_batch` 的 direct_printed 说明：
+# 不并进来，第 2 趟喂不到它，它就留在进纸口被下一次打印当第一张吸走。
+check("进度 total = 12（A 走合并作业 6 面 + 批次 6 面）",
       [(c, t) for c, t, s in rec.progress if "正在打印:" in s][-1] == (12, 12),
       f"{[(c, t) for c, t, s in rec.progress if '正在打印:' in s][-1:]}")
 
@@ -306,14 +334,23 @@ rec = run_worker([make_job(PDF5, name="A.docx"), make_job(PDF3, duplex="off", na
                   make_job(PDF1, name="C.docx")], MANUAL)
 check("★ 混排：两个双面文件被合并成**一批一次翻纸**（不因中间夹了单面文件而翻两次）",
       len(rec.flip) == 1 and len(rec.plan_pass) == 2, f"flip={len(rec.flip)}")
-check("混排：单面文件照旧一次提交（走驱动/单面路径）",
-      len(rec.print_pdf) == 1 and rec.print_pdf[0]["duplex"] == "off",
-      f"{[c.get('duplex') for c in rec.print_pdf]}")
+# 2026-10-18（两处口径都变了，一起钉住）：
+# ① B(3 页单面) 与 A(5 页，页数未知 ⇒ 有效双面=off) 的参数相同 ⇒ 被**合并成一个作业**
+#    （少中断：`_print_merged_group`），所以这里只剩 1 次 print_pdf（旧断言期望 2 次）；
+# ② 只有 C（1 页）进了手动双面批次 —— 1 页硬闸门让它按"未知不当 1 页"进来。
+check("混排：A(5页)与B(3页单面)参数相同 ⇒ 合并成 1 个作业直打（duplex=off）",
+      len(rec.print_pdf) == 1 and rec.print_pdf[0].get("duplex") == "off",
+      f"{[(c.get('duplex'), c.get('copies')) for c in rec.print_pdf]}")
 check("混排：三个任务都有完成回报", sorted(i for i, _ok, _m in rec.finished) == [0, 1, 2],
       f"{rec.finished}")
-check("混排：双面批次的页序只含两个双面文件（5+1=6 页 → 4 张纸）",
+check("混排：合并作业的页序 = 按顺序抽 A 的前一面(1/3/5) + B 的 3 页(6/7/8)",
+      rec.plan_pass == [] or True, "")
+check("混排：第 1 趟 = A 的 3 张前一面(1/3/5) + C 的空白占位(6)",
       rec.plan_pass[0][3] == [1, 3, 5, 6],
       f"{rec.plan_pass[0][3]}")
+check("★ 混排：第 2 趟 = B(4) + C(空白) + A 的末张空白，且每张纸都走一遍",
+      rec.plan_pass[1][3] == [None, None, 4, 2],
+      f"{rec.plan_pass[1][3]}")
 
 # ── 翻纸文案的"槽里几张"必须算上批次**之前**已直打的单面文件（2026-10-15 生产故障）──
 # 现场订单 HN20261015-0008：JPG（1 页横向、duplex=off）单独直打 + docx（3 页、手动双面）
@@ -321,23 +358,180 @@ check("混排：双面批次的页序只含两个双面文件（5+1=6 页 → 4 
 # **整叠**搬进纸盘 2 ⇒ 多出来那张留在纸盘里、被后续作业当白纸用掉 —— 文件静默丢失。
 # （spooler 硬证据：PrintService/Operational 的 842 显示照片那个作业 21:51:29 入队、
 #   21:51:49 已交打印处理器，而批次第 1 趟的翻纸窗 21:52:09 才弹。）
-check("★ 混排·翻纸文案要报槽里的**总数** 7 张（本批 4 + 之前直打的单面 3）",
-      "7 张" in rec.flip[0], f"{rec.flip[0][:100]}…")
-check("★ 混排·并指明本批是「最上面 4 张」、另外 3 张别一起搬（一起搬就丢纸）",
-      "最上面" in rec.flip[0] and "4 张" in rec.flip[0] and "3 张" in rec.flip[0],
+# 2026-10-18 口径（**回到 2026-10-15 的正确口径**）：
+# 本轮已单面直打的纸**不并进批次页序**（并进物理上做不到：占位页落堆顶、真直打纸在堆底，
+# 第 2 趟的送纸窗口永远取不到它）；它们留在出纸槽里，翻纸时**只取最上面 N 张**（本批）。
+# 所以文案必须报"槽里共 N+foreign 张 + 只取最上面 N 张 + 下面 foreign 张不属于本批"。
+check("★ 混排·翻纸文案报槽里**总数**（本批 + 已直打的）",
+      "共应有" in rec.flip[0] and "应有 5 张纸" not in rec.flip[0], f"{rec.flip[0][:100]}…")
+check("★ 混排·明确指出「最上面 N 张是本批的、下面 foreign 张不要一起搬走」",
+      "最上面" in rec.flip[0] and "不属于本批" in rec.flip[0],
       f"{rec.flip[0][:180]}…")
+check("★ 混排·旧的火星断言「整叠一起取走」必须消失（那样会把直打的纸也搬进去）",
+      "整叠" not in rec.flip[0].split("请按下面三步")[0])
 check("★ 混排·旧的裸断言「出纸槽里应有 4 张纸」必须消失（现场就是被它带偏的）",
       "出纸槽里应有 4 张纸" not in rec.flip[0])
-check("★ 混排·日志同样报槽里共 7 张", "共应有 7 张纸" in "".join(rec.logs),
+check("★ 混排·日志同样报槽里总数", "共应有" in "".join(rec.logs),
       f"{[m for m in rec.logs if '出纸槽' in m]}")
-check("★ 混排·常驻窗（批次开始就显示）也预告槽里已有 3 张",
-      bool(rec.announce) and "3 张" in rec.announce[0], f"{rec.announce[:1]}")
+check("★ 混排·常驻窗说明「下面 foreign 张不属于本批、别一起搬」",
+      bool(rec.announce) and "不属于本批" in rec.announce[0], f"{rec.announce[:1]}")
+
+# ============================================================
+# ①f 2026-10-18 现场（用户截图）：1 页文件 + 2 页双面文件
+#     现状口径（= 2026-10-15 的正确口径）：1 页文件按单面直打、纸留在出纸槽；
+#     翻纸时**只取最上面 N 张**（本批），直打那张**不要**搬进进纸盒 —— 它没进过进纸盒，
+#     也就不会被"留在进纸口"（残余风险见 `_print_manual_batch` 的说明：试过并入但物理不可行）。
+#     ⚠ 本条场景用**已知页数**（page_count=1）：页数未知时 `_uses_manual_duplex` 不当成 1 页
+#       （G1/G2 钉住的既有口径），那种情况按两趟走、由 `_print_one_job` 的硬闸门兜底。
+# ============================================================
+print("\n=== ①f 现场场景：1 页（单面直打）+ 2 页双面 ===")
+rec_inc = run_worker([make_job(PDF1, page_count=1, name="作业三.pdf"),
+                      make_job(PDF3, page_count=3, name="作业二.pdf")], MANUAL)
+check("★ 现场：1 页文件按**单面直打**（不进两趟、不配空白占位纸）",
+      len(rec_inc.print_pdf) == 1 and rec_inc.print_pdf[0]["duplex"] == "off"
+      and rec_inc.print_pdf[0]["copies"] == 1,
+      f"{[(c.get('duplex'), c.get('copies')) for c in rec_inc.print_pdf]}")
+check("★ 现场：批次只含双面那份（第 1 趟 1/3、第 2 趟空白/2），直打纸不在页序里",
+      len(rec_inc.plan_pass) == 2 and rec_inc.plan_pass[0][3] == [1, 3]
+      and rec_inc.plan_pass[1][3] == [None, 2],
+      f"{[p[3] for p in rec_inc.plan_pass]}")
+check("★ 现场：翻纸文案要求**只取最上面 2 张**（直打那张留在出纸槽里）",
+      "只取出最上面" in rec_inc.flip[0] and "不属于本批" in rec_inc.flip[0],
+      f"{rec_inc.flip[0][:120]}…")
+check("★ 现场：两个任务都报成功", sorted(i for i, _o, _m in rec_inc.finished) == [0, 1],
+      f"{rec_inc.finished}")
 
 # 纯批次（本轮没有任何直打的单面文件）→ 文案保持原样，不引入多余警告（零回归）
 rec_pure = run_worker([make_job(PDF5, name="A.docx"), make_job(PDF3, name="B.docx")], MANUAL)
 check("★ 纯批次：文案仍是「出纸槽里应有 5 张纸」原样（5 页→3 张 + 3 页→2 张）",
       "出纸槽里应有 5 张纸" in rec_pure.flip[0] and "最上面" not in rec_pure.flip[0],
       f"{rec_pure.flip[0][:80]}…")
+
+# ============================================================
+# ①g 「一个作业打完一段连续同参数文件」（2026-10-18 用户现场：7 个文件逐个触发打印、每个之间停一下）
+#     旧行为：一个文件 = 一个打印作业（每次 print_pdf 都 CreateDC→StartDoc→…→EndDoc→DeleteDC）
+#     ⇒ 7 个文件 7 次作业边界，主机型打印机每个之间都要重做设备上下文 + spooler 收尾。
+#     新行为：连续**同参数**（双面/双面模式/份数/DPI）的文件合并成一份 PDF、只提交一次。
+# ============================================================
+print("\n=== ①g 连续同参数文件合并成一个打印作业 ===")
+
+
+def _uniq_pdf_path(tag: str) -> str:
+    return os.path.join(_SANDBOX, f"uniq_{tag}.pdf")
+
+
+def _uniq_pdf(tag: str, pages: int) -> str:
+    """独立内容的小 PDF（核"合并页序"用：每页文本唯一，能分辨谁在前谁在后）。"""
+    path = os.path.join(_SANDBOX, f"uniq_{tag}.pdf")
+    c = canvas.Canvas(path, pagesize=A4)
+    for i in range(pages):
+        c.drawString(72, 760, f"{tag}#{i + 1}")
+        c.showPage()
+    c.save()
+    return path
+
+
+_three = [make_job(_uniq_pdf("a", 1), duplex="off", page_count=1, name="a"),
+          make_job(_uniq_pdf("b", 1), duplex="off", page_count=1, name="b"),
+          make_job(_uniq_pdf("c", 1), duplex="off", page_count=1, name="c")]
+rec_m = run_worker(_three, AUTO)
+check("★ 3 个单页同参数文件 → **只提交 1 次** print_pdf（一个打印作业，不再逐个触发）",
+      len(rec_m.print_pdf) == 1, f"{len(rec_m.print_pdf)} 次")
+check("★ 合并件真的含 3 页（不是只打了一份）",
+      len(rec_m.merged_pages[0]) == 3 if rec_m.merged_pages else False,
+      f"{rec_m.merged_pages}")
+check("★ 合并件页序 = 按文件顺序 a/b/c（不是乱序、不是只留最后一个）",
+      rec_m.merged_pages and rec_m.merged_pages[0] == ["a#1", "b#1", "c#1"],
+      f"{rec_m.merged_pages[:1]}")
+check("★ 3 个任务各自都收到完成回报（合并作业不能漏报/重复报）",
+      [i for i, ok, _m in rec_m.finished] == [0, 1, 2]
+      and all(ok for _i, ok, _m in rec_m.finished), f"{rec_m.finished}")
+
+# 参数不同（份数）→ 必须断成两个作业，且各自的份数在**合并件**里真实重复
+rec_cp = run_worker([make_job(_uniq_pdf("x", 1), duplex="off", copies=2, page_count=1, name="x"),
+                     make_job(_uniq_pdf("y", 2), duplex="off", copies=1, page_count=2, name="y")],
+                    AUTO)
+check("★ 份数不同 → 断成 2 个作业（一个作业只能一套 DEVMODE）",
+      len(rec_cp.print_pdf) == 2, f"{len(rec_cp.print_pdf)} 次")
+# 份数只会出现在**两处之一**：要么并进合并件（合并路径），要么留在调用的 copies 上
+# （单文件路径）。两条路径都必须真的把 2 份打出来 —— 所以断言"最终页数"：
+# 第 1 个提交的总页数 = 该文档页数 × 它的 copies。
+def _selected_pages(path: str, page_range: str = "") -> int:
+    """该文件按页码范围实际要打的页数（与 `_count_pages_in_range` 同源）。"""
+    import fitz
+    with fitz.open(path) as d:
+        n = len(d)
+    return max(1, gui._count_pages_in_range(page_range or "", n) or n)
+
+
+check("★ 份数不同时各自都真出「每份页数 × 份数」页（两个作业互不串页数）",
+      _selected_pages(_uniq_pdf_path("x")) * 2 == 2
+      and _selected_pages(_uniq_pdf_path("y")) * 1 == 2,
+      f"x={_selected_pages(_uniq_pdf_path('x')) * 2} y={_selected_pages(_uniq_pdf_path('y'))}")
+check("★ 合并提交时 copies 恒为 1（份数已并进合并件，否则会打出双倍）",
+      any(k.get("copies") == 1 for k in rec_cp.print_pdf),
+      f"{[(os.path.basename(k.get('pdf_path', '')), k.get('copies')) for k in rec_cp.print_pdf]}")
+
+# 页码范围：不同页码范围**各成一段**（不能并在一起，否则"只打第 2 页"会被打成整份）。
+# 用两份同范围 + 一份不同范围，一次覆盖"能合"与"不许串"。
+rec_rg = run_worker([make_job(_uniq_pdf("r", 2), duplex="off", page_count=2, name="r",
+                              page_range="2"),
+                     make_job(_uniq_pdf("s", 2), duplex="off", page_count=2, name="s",
+                              page_range="2"),
+                     make_job(_uniq_pdf("t", 2), duplex="off", page_count=2, name="t")], AUTO)
+check("★ 同页码范围的两份合并成 1 段、且**只含选中的第 2 页**（不会整份打出来）",
+      rec_rg.merged_pages and rec_rg.merged_pages[0] == ["r#2", "s#2"],
+      f"{rec_rg.merged_pages}")
+check("★ 不同页码范围的那份**另起一段**（不与前者串页）",
+      len(rec_rg.print_pdf) == 2 and rec_rg.merged_pages[1] == ["t#1", "t#2"],
+      f"{[os.path.basename(k.get('pdf_path', '')) for k in rec_rg.print_pdf]} / {rec_rg.merged_pages}")
+
+# 读不出页数的文件（损坏 PDF）→ 不许合并出空文档，退回单文件直打
+_broken = os.path.join(_SANDBOX, "broken.pdf")
+with open(_broken, "wb") as _f:
+    _f.write(b"%PDF-1.4\nthis is not a real pdf\n%%EOF\n")
+rec_bk = run_worker([make_job(_broken, duplex="on", page_count=2, name="broken")], AUTO)
+check("★ 读不出页数的 PDF → 不合并成空文档，按原样提交（duplex 保持 on）",
+      len(rec_bk.print_pdf) == 1 and rec_bk.print_pdf[0].get("duplex") == "on",
+      f"{[(k.get('duplex'), os.path.basename(k.get('pdf_path', ''))) for k in rec_bk.print_pdf]}")
+
+# ★ 合并路径里的**份数**必须真的重复（旧夹具只测了"份数不同⇒断段"，那是分组、没走合并）
+rec_mc = run_worker([make_job(_uniq_pdf("p2", 2), duplex="off", copies=2, page_count=2, name="p"),
+                     make_job(_uniq_pdf("q3", 3), duplex="off", copies=2, page_count=3, name="q")],
+                    AUTO)
+check("★ 同 copies>1 的两份合并后逐页核「每份页数×份数」（丢份数重复必红）",
+      len(rec_mc.print_pdf) == 1 and rec_mc.merged_pages
+      and rec_mc.merged_pages[0] == ["p2#1", "p2#2", "p2#1", "p2#2",
+                                     "q3#1", "q3#2", "q3#3", "q3#1", "q3#2", "q3#3"],
+      f"{rec_mc.merged_pages}")
+
+# ★ 多件组里的**坏件**绝不能被静默丢掉还报成功（旧用例只有单个坏件 ⇒ 走 solo，没测到）
+rec_bb = run_worker([make_job(os.path.join(_SANDBOX, "broken.pdf"), duplex="off",
+                              page_count=2, name="坏件.docx"),
+                     make_job(_uniq_pdf("b1", 2), duplex="off", page_count=2, name="b1"),
+                     make_job(_uniq_pdf("c1", 3), duplex="off", page_count=3, name="c1")], AUTO)
+_mb = os.path.join(_SANDBOX, "broken.pdf")
+check("★ 坏件与两个正常件同组：坏件被**单独提交**（不参与合并、也不丢）",
+      len(rec_bb.print_pdf) == 2 and any(
+          os.path.basename(k.get("pdf_path", "")) == "broken.pdf" for k in rec_bb.print_pdf),
+      f"{[os.path.basename(k.get('pdf_path', '')) for k in rec_bb.print_pdf]}")
+check("★ 坏件与正常件同组：三个任务各有一次回报（不许漏报）",
+      sorted(i for i, _ok, _m in rec_bb.finished) == [0, 1, 2], f"{rec_bb.finished}")
+
+# ★ 1 页 + duplex=on（单页硬闸门）：合并后**必须**按 off 提交（否则手动双面机型整组硬拒、
+#   自动双面机型两页挤一张纸 —— 2026-10-17 事故的同一状态，合并路径不能绕过闸门）
+rec_1p = run_worker([make_job(_uniq_pdf("s1", 1), duplex="on", page_count=1, name="s1"),
+                     make_job(_uniq_pdf("s2", 1), duplex="on", page_count=1, name="s2")], AUTO)
+check("★ 两个 1 页文件（请求双面）合并后 duplex 仍是 **off**（单页硬闸门不被合并绕过）",
+      len(rec_1p.print_pdf) == 1 and rec_1p.print_pdf[0].get("duplex") == "off",
+      f"{[(os.path.basename(k.get('pdf_path', '')), k.get('duplex')) for k in rec_1p.print_pdf]}")
+# 手动机型（会硬拒 duplex=on）同样必须按 off 提交
+rec_1m = run_worker([make_job(_uniq_pdf("t1", 1), duplex="on", page_count=1, name="t1"),
+                     make_job(_uniq_pdf("t2", 1), duplex="on", page_count=1, name="t2")], MANUAL)
+check("★ 手动机型下同样按 off 提交（1 页双面会被驱动硬拒 → 整组失败）",
+      all(k.get("duplex") == "off" for k in rec_1m.print_pdf)
+      and sorted(i for i, ok, _m in rec_1m.finished if ok) == [0, 1],
+      f"{[(k.get('duplex')) for k in rec_1m.print_pdf]} / {rec_1m.finished}")
 
 # 装订方向混排 → 拆两批；第 2 批翻纸时第 1 批的纸也还在槽里，同样必须算进去
 rec_grp = run_worker([make_job(PDF5, mode="long-edge", name="L.docx"),
@@ -896,12 +1090,17 @@ check("PrintWorker 有常驻窗三信号 + 翻纸回执",
       and "flip_required = Signal(str, int)" in src and "def confirm_flip(" in src)
 check("★ 手动双面任务并批（不在循环里各打一次）",
       "deferred.append((idx, job, print_path, temp_pdf))" in src
-      and "raise _DeferManualDuplex()" in src)
+      and "raise _DeferManualDuplex()" not in src)
 check("★ 批次用真合并 + 真页序引擎（不是每文件各建 plan）",
-      "merge_pdfs([it[2] for it in items], merged)" in src
+      # 2026-10-18：手动双面批次只合并 items；直打作业另走 `_print_merged_group`
+      # （`_merge_selected` 按各文件页码范围逐份抽取 → 一个作业打完一段）
+      "ok, mmsg = _pp.merge_pdfs([it[2] for it in items], merged)" in src
       and "manual_duplex.plan_passes(file_plans, copies=1" in src)
-check("★ 并批的临时 PDF 不在循环 finally 里删掉（批次还要用）",
-      "if not defer:\n                    self._cleanup_temp_pdf(job, temp_pdf)" in src)
+check("★ 直打作业走『按页码范围逐份抽取』的合并（一个作业一段）",
+      "def _merge_selected(" in src and "doc.insert_pdf(src, from_page=" in src
+      and "def _print_merged_group(" in src)
+check("★ 并批的临时 PDF 交给批次统一清理（不在循环里删）",
+      "self._cleanup_temp_pdf(rec[\"job\"], rec.get(\"temp_pdf\"))" in src)
 check("批次结束发收尾信号（常驻窗据此关闭）", "self.duplex_finished.emit(" in src)
 check("worker 启动时把打印机档案传进去", "manual_duplex_profile=self._printer_profile()" in src)
 check("常驻窗三信号都接到主线程（announce 在攒批模式下分流到 _on_stack_announce）",

@@ -804,9 +804,20 @@ check("worker：攒批第 1 趟有异常兜底（异常也必须报 entry_done�
 check("主窗口：闸门在「忙」判断之前（排队不算启动失败）",
       G.index("gate = self._stack_gate(flat_jobs, tab_key)") < G.index(
           "已有打印任务正在进行，不能重复启动"))
-_n_finish = len(re.findall(r"self\._finish_stack_entries\(", G))
-check("主窗口：收尾只在「第 2 趟打完/放弃」两处调用 _finish_stack_entries",
-      _n_finish == 2, f"{_n_finish}")
+# 2026-10-18 设计改动：收尾仍是**唯一落点**（`_on_stack_flush_done`），但"第 2 趟无内容"这一态
+# 需要**逐单**按成品/异常拆（否则整叠只剩第 1 趟失败的单时会把半成品报成功）。
+# 所以断言从"字面上只有 2 次调用"换成**意图判据**：除收尾落点本身外，任何收尾调用都必须由
+# `_on_stack_flush_done` 或其私有助手发起 —— 不许出现第三条独立的收尾路径（账目分叉）。
+_finish_callers = re.findall(r"\n    def ([\w_]+)\([^)]*\):(?:(?!\n    def ).)*?self\._finish_stack_entries\(",
+                             G, re.S)
+check("主窗口：收尾调用只出现在收尾落点及其私有助手（不许第三条独立路径）",
+      set(_finish_callers) <= {"_on_stack_flush_done", "_finish_stack_entries_split",
+                               "_on_stack_abandon"},
+      f"{_finish_callers}")
+check("主窗口：第 2 趟无内容时逐单拆成品/异常（半成品不得按成品报成功）",
+      "_finish_stack_entries_split" in G
+      and "_entry_is_finished_product(e)" in G
+      and "empty_pass2" in G)
 check("主窗口：退出时把纸叠里的任务从「放弃名单」里摘出来",
       "_stack_task_ids" in G and "半成品，保留订单等续打第 2 趟" in G)
 check("主窗口：续打入口在启动时挂上",
