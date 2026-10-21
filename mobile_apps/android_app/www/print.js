@@ -1054,6 +1054,12 @@ function normalizeAndValidateRangeLines(idx, smooth) {
   const inputsEl = card ? card.querySelector('.range-inputs-state') : null;
   const needsCollapseAnim = known && inputsEl && !inputsEl.classList.contains('state-collapsed');
   if (smooth && card && (needsCollapseAnim || (singleChanged && !known))) {
+    // 收起前先把焦点从范围输入里挪走：还在 focus 的 input 被 max-height:0 剪掉后
+    // 光标仍在里面（打字进一个看不见的框），Android WebView 还可能把被裁剪的元素
+    // 重新滚进可视区。小程序侧同一场景更严重 —— focused 的 <input> 是原生组件、
+    // 不受裁剪，会与页数选择器重叠（见 h_n_print/pages/index/index.js: _blurRangeInputs）。
+    const active = (typeof document !== 'undefined') ? document.activeElement : null;
+    if (active && inputsEl && inputsEl.contains(active) && typeof active.blur === 'function') active.blur();
     // 原地切换类名，CSS 过渡正常播放（整表重绘会重建元素导致突变）
     const modeRow = card.querySelector('.mode-row');
     if (modeRow) modeRow.classList.toggle('mode-row-collapsed', f.singlePage);

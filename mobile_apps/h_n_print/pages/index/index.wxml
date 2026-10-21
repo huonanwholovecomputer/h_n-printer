@@ -172,21 +172,30 @@
               </view>
 
               <!-- Page range（图片/整份1页隐藏；页数未知→警告+多行输入；页数已知→网格摘要按钮）
-                   黄色警告始终渲染：页数确认后收起(淡出+上移)过渡，避免突变 -->
+                   黄色警告始终渲染：页数确认后收起(淡出+上移)过渡，避免突变
+                   ⚠ 输入区与选择器**互斥渲染**：收起/显示都多带一个 !item.rangeEditing。
+                   原因：微信 <input> 在 focus 时是**原生组件**（渲染在 WebView 之上，不受父级
+                   max-height/overflow/opacity 裁剪）。用户在范围输入框里打字时页数恰好返回，
+                   若此时就把输入区收成 0 高、同时放出「全部页」摘要按钮，原生输入框会留在原地
+                   压住摘要按钮（2026-10-21 现场截图：占位符与「全部页」重叠）。
+                   rangeEditing 只由真正的 bindfocus/bindblur 维护 ⇒ 只要还在焦点里，输入区就
+                   不收起、摘要也不出现，两者永远不会同时在屏上。 -->
               <view wx:if="{{!item.isImage && item.pageCount !== 1}}" class="control-row range-control-multi">
                 <text class="control-label">范围</text>
                 <view class="range-lines-wrap">
                   <view class="range-unknown-warn {{(item.pageCountStatus === 'confirmed' && item.pageCount > 0) ? 'range-warn-collapsed' : ''}}">⚠ 文档页数未知，若页数范围错误，该任务会直接记为"被打回"</view>
                   <!-- 页数未知：多行输入（占位符随行号变化，新增行带弹出动画；页数确认后收起淡出）
                        max-height 内联按行数匹配，保证收起过渡平滑 -->
-                  <view class="range-inputs-state {{(item.pageCountStatus === 'confirmed' && item.pageCount > 0) ? 'state-collapsed' : ''}}" style="max-height: {{(item.rangeLines.length) * 100 + 20}}rpx;">
+                  <view class="range-inputs-state {{(item.pageCountStatus === 'confirmed' && item.pageCount > 0 && !item.rangeEditing) ? 'state-collapsed' : ''}}" style="max-height: {{(item.rangeLines.length) * 100 + 20}}rpx;">
                     <view wx:for="{{item.rangeLines}}" wx:for-item="line" wx:for-index="li" wx:key="li" class="range-line-row {{line.entering ? 'range-line-entering' : ''}}">
                       <input
                         class="input-ios range-line-input {{line.error ? 'range-input-err' : ''}}"
                         type="text"
                         value="{{line.value}}"
+                        focus="{{item.rangeFocusLine === li}}"
                         placeholder="请输入第{{li + 1}}个页面范围(如1-5或7)"
                         bindinput="onRangeLineInput"
+                        bindfocus="onRangeLineFocus"
                         bindblur="onRangeLineBlur"
                         data-file-index="{{index}}"
                         data-line-index="{{li}}"
@@ -194,8 +203,8 @@
                       <text wx:if="{{line.error}}" class="range-err-msg range-line-err">{{line.error}}</text>
                     </view>
                   </view>
-                  <!-- 页数已知：点击弹数字网格选择 -->
-                  <block wx:if="{{item.pageCountStatus === 'confirmed' && item.pageCount > 0}}">
+                  <!-- 页数已知：点击弹数字网格选择（用户还停在输入框里时先不显示，见上） -->
+                  <block wx:if="{{item.pageCountStatus === 'confirmed' && item.pageCount > 0 && !item.rangeEditing}}">
                     <view class="range-summary-trigger" bindtap="onOpenRangePicker" data-index="{{index}}" hover-class="tap-active">
                       <text class="range-summary-text {{item.pageRange ? '' : 'range-summary-all'}}">{{item.pageRange ? '已选 ' + item.pageRange : '全部页'}}</text>
                       <text class="range-summary-arrow">›</text>

@@ -1847,7 +1847,7 @@ class PrintSpeedDialog(QDialog):
         lay.addWidget(g2)
 
         note = QLabel("提示：这台打印机的「完成」回报早于实机出纸（只回报「开始打印」），"
-                      "所以按钮按上面这套**预估**放行；放行前仍会显示还要等几秒。")
+                      "所以按钮按上面这套预估放行；放行前仍会显示还要等几秒。")
         note.setWordWrap(True)
         note.setStyleSheet("color: #7f8c8d; font-size: 11px;")
         lay.addWidget(note)
@@ -2121,8 +2121,8 @@ class PrintWorker(QThread):
         else:
             head = (f"第 1 趟已完成：出纸槽里共应有 {n + foreign} 张纸 —— 最上面 {n} 张是"
                     f"本批的（本趟打的是 {first_pages}），下面 {foreign} 张是本次一起打出的"
-                    f"其它文件，**不属于本批、不要一起搬走**。\n\n")
-            step1 = (f"  1. 不改变方向，从出纸槽中**只取出最上面 {n} 张**"
+                    f"其它文件，不属于本批、不要一起搬走。\n\n")
+            step1 = (f"  1. 不改变方向，从出纸槽中只取出最上面 {n} 张"
                      f"（下面那 {foreign} 张留在出纸槽里）。不要丢弃空白页面。\n")
         text = (
             head
@@ -2266,7 +2266,7 @@ class PrintWorker(QThread):
             if len(mergeable) > 4:
                 head += f" 等 {len(mergeable)} 个文件"
             self.log_message.emit(
-                f"  → 合并打印 {len(mergeable)} 个文件为**一个打印作业**（少中断）：{head}")
+                f"  → 合并打印 {len(mergeable)} 个文件为一个打印作业（少中断）：{head}")
             n_merged = int(count_pdf_pages(merged) or 0)
             if n_merged and n_merged != len(task_ref):
                 self.log_message.emit(
@@ -2387,7 +2387,7 @@ class PrintWorker(QThread):
         _duplex = self._effective_duplex(job, _eff_pages)
         if _duplex != (getattr(job, "duplex", "off") or "off"):
             self.log_message.emit(
-                f"  ⚠ 有效页数 {_eff_pages} 页 → 本次按**单面**打印"
+                f"  ⚠ 有效页数 {_eff_pages} 页 → 本次按单面打印"
                 f"（1 页双面物理上不可能，请求双面会让驱动多走一张空白纸）")
         if task_ref:
             try:
@@ -2486,8 +2486,8 @@ class PrintWorker(QThread):
         if foreign > 0:
             # 常驻窗在第 1 趟**打印期间**就显示 → 操作员能提前知道槽里还有别的纸
             warn = ("\n⚠ 出纸槽里已经压着本次一起打出的 "
-                    f"{foreign} 张纸（单面文件/首页，不属于本批）：翻纸时**只取本批的 "
-                    f"{plan.sheet_count} 张**（在最上面），别把下面的一起搬进纸盘 2。")
+                    f"{foreign} 张纸（单面文件/首页，不属于本批）：翻纸时只取本批的 "
+                    f"{plan.sheet_count} 张（在最上面），别把下面的一起搬进纸盘 2。")
         return (
             f"本批 {len(items)} 个文件需手动双面：{names}\n"
             f"共 {plan.sheet_count} 张纸 —— 程序自己分两趟打（全程单面），中途只需翻一次纸。\n\n"
@@ -2549,7 +2549,7 @@ class PrintWorker(QThread):
             tray_foreign = max(0, int(getattr(self, "_tray_sheets", 0) or 0))
             self.log_message.emit(
                 f"  → 手动双面批次：{len(items)} 个文件 → {plan.sheet_count} 张纸，"
-                f"**一次翻纸**打两趟（{p.first}/{'逆序' if p.reverse_second else '正序'}/"
+                f"一次翻纸打两趟（{p.first}/{'逆序' if p.reverse_second else '正序'}/"
                 f"{'180°补偿' if rotate else '不旋转'}）")
             self.log_message.emit(f"     第 1 趟: {self._fmt_pages(plan.pass_pages(1))}")
             self.log_message.emit(f"     第 2 趟: {self._fmt_pages(plan.pass_pages(2))}")
@@ -2598,9 +2598,15 @@ class PrintWorker(QThread):
                 self.log_message.emit(
                     f"  ⏱ 第 1 趟实测 {_elapsed1:.1f}s（{n1} 张，预估 {_est1:.1f}s）"
                     f"（是否写进速度样本由主线程按物理可信度判定，见紧跟着的一条）")
-                # 一个信号两个用途：① 主线程写档案自动学习；② 常驻窗按这个权威值冻结计时
-                # （界面自己那个时钟只做兜底：信号没到（异常路径）时它照样能冻结）
-                self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
+                if w.get("drained", True):
+                    # 一个信号两个用途：① 主线程写档案自动学习；② 常驻窗按这个权威值冻结计时
+                    # （界面自己那个时钟只做兜底：信号没到（异常路径）时它照样能冻结）
+                    self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
+                else:
+                    # 队列 120s 内没排空 = 这段"实测"里混着我们的出纸等待超时，不是打印机耗时；
+                    # 写进档案会把预估拉长到十几秒/张（打印机离线/卡纸时尤其明显）。
+                    self.log_message.emit(
+                        "  ⚠ 出纸等待超时（队列没排空）→ 本次实测不写进速度样本")
 
             if not self._ask_operator_to_flip(plan, tray_foreign):
                 if self._cancelled:
@@ -2714,7 +2720,7 @@ class PrintWorker(QThread):
                 f"🖐 攒批模式：正在打第 {self._stack_seq} 单的第 1 趟。\n"
                 f"本单 {len(items)} 个文件"
                 + ("＋封面页" if cover_pdf else "")
-                + f"，{plan.sheet_count} 张纸。打完这一单程序**不会**停下来等翻纸 ——"
+                + f"，{plan.sheet_count} 张纸。打完这一单程序不会停下来等翻纸 ——"
                   f"会直接开始下一单的第 1 趟，直到人工点「开始第 2 趟」。\n"
                   f"本单第 1 趟页序：{self._fmt_pages(plan.pass_pages(1))}\n"
                   f"⚠ 攒批期间出纸槽被这一叠独占：请勿在打印机上手动打印别的东西。")
@@ -2761,8 +2767,17 @@ class PrintWorker(QThread):
             self.log_message.emit(
                 f"  → 攒批第 {self._stack_seq} 单第 1 趟出纸（{n1} 张，排队 {w['queue_seconds']}s "
                 f"+ 余量 {w['margin_seconds']}s）—— 纸留在出纸槽里，别动")
+            if not w.get("drained"):
+                # 队列 120s 内没排空（打印机离线/卡纸/队列卡住）：纸到底出了几张，
+                # 程序**看不见**。照旧按"第 1 趟已出纸"记账（与旧口径一致，不擅自判失败），
+                # 但必须把不确定性说出来 —— 否则"6 张纸已堆入出纸槽"会被读成事实。
+                self.log_message.emit(
+                    f"  ⚠ 打印队列 {w['queue_seconds']}s 内没有排空（打印机离线/卡纸/"
+                    f"队列卡住？）—— 本单纸数只能人工核对；点「开始第 2 趟」前务必数清"
+                    f"进纸盒里的纸")
             _elapsed1 = time.perf_counter() - _t_pass1 - float(w.get("margin_seconds", 0.0) or 0.0)
-            if _elapsed1 > 0:
+            if _elapsed1 > 0 and w.get("drained", True):
+                # 队列没排空时这段"实测"混着 120s 出纸等待超时，不是打印机耗时 → 不写样本
                 self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
             self.stack_entry_done.emit(self._stack_seq, True,
                                        f"第 1 趟完成（{plan.sheet_count} 张纸已堆入出纸槽）", n1)
@@ -2996,7 +3011,7 @@ class PrintWorker(QThread):
                         and not str(job.file_path or "").lower().endswith(".pdf")
                         and self._effective_pages(job, print_path) == 1):
                     self.log_message.emit(
-                        "  ⚠ 转换后实际只打 1 页 → 按**单面**直打"
+                        "  ⚠ 转换后实际只打 1 页 → 按单面直打"
                         "（不入手动双面批次：省一张空白占位纸、省一次翻纸）")
                     defer = False
                 if defer:
@@ -3879,6 +3894,10 @@ class MainWindow(QMainWindow):
         # 攒批期间被挡住的打印请求（出纸槽被这一叠独占，插进来就会串页）：
         # [{"jobs": [...], "tab_key": str, "reason": str}]
         self._stack_wait: list[dict] = []
+        # 已受理、等**上一单第 1 趟**打完就接着打的攒批单（2026-10-21）：
+        # [{"jobs": [...], "tab_key": str}]。与 `_stack_wait` 分开：那个要等整叠第 2 趟
+        # 打完才放行，而这个只要打印机从第 1 趟空出来就立刻接上（攒批"连续堆第 1 趟"的本意）。
+        self._stack_entry_wait: list[dict] = []
         # 操作员**主动**收起过攒批列表吗（2026-10-21）：收起后不许被 _sync_stack_list_visible
         # 反复弹回来（否则"关掉"这个动作根本无效）；点底部 🖐 / 切开关 / 有新单一叠时清零。
         self._stack_list_user_closed: bool = False
@@ -4037,7 +4056,7 @@ class MainWindow(QMainWindow):
         finished = [e for e in st.entries if self._entry_is_finished_product(e)]
         remaining = [e for e in st.entries if e not in finished]
         if present <= 0:
-            self._log(f"🖐 发现一叠**已全部取走**的攒批纸叠：{st.count} 单 / 第 1 趟共 {original} 张"
+            self._log(f"🖐 发现一叠已全部取走的攒批纸叠：{st.count} 单 / 第 1 趟共 {original} 张"
                       f"（其中成品单 {len(finished)} 个）—— 第 2 趟无内容")
             if not finished:
                 # 全部不是成品（第 1 趟都没正常收尾）：纸数不明，**必须让操作员明确三选**
@@ -4049,7 +4068,7 @@ class MainWindow(QMainWindow):
                 box.setText(
                     f"磁盘上还有一叠攒批清单（{st.count} 单，第 1 趟共 {original} 张），"
                     f"但每一单的第 1 趟都没有正常收尾，且纸已被标记取走。\n\n"
-                    f"**无法确认顾客是否真的拿到了纸**，请人工核对后再选。\n\n"
+                    f"无法确认顾客是否真的拿到了纸，请人工核对后再选。\n\n"
                     f"清单：{duplex_stack.manifest_path(bdir)}")
                 b_prod = box.addButton("按成品收尾（标记完成、上报成功）", QMessageBox.AcceptRole)
                 b_fail = box.addButton("按失败收尾（放弃这几单）", QMessageBox.DestructiveRole)
@@ -4083,7 +4102,7 @@ class MainWindow(QMainWindow):
                 + (f"（另有 {len(remaining)} 单状态异常）" if remaining else "")
                 + f"；{st.count} 个打印任务的第 1 趟：\n\n"
                 + "\n".join(st.describe_lines()) + "\n\n"
-                f"第 2 趟**没有任何内容**要打 —— 这些纸在第 1 趟就是成品。\n\n"
+                f"第 2 趟没有任何内容要打 —— 这些纸在第 1 趟就是成品。\n\n"
                 f"「是」= 按成品收尾（这几单标记完成、上报成功、清单删除、不出纸）\n"
                 f"「否」= 人工核对后先不动清单（保留下来，稍后再处理）",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
@@ -4106,7 +4125,7 @@ class MainWindow(QMainWindow):
         uncertain = any(e.state != duplex_stack.STATE_DONE for e in st.entries) or st.tainted
         detail = "\n".join(st.describe_lines())
         warn = ("\n\n⚠ 清单里有单的第 1 趟没有正常收尾（或进程是被强杀的），"
-                "**出纸槽里的纸到底有几张无法确定** —— 若页数对不上，"
+                "出纸槽里的纸到底有几张无法确定 —— 若页数对不上，"
                 "打第 2 趟会整叠错位，请人工核对后选择「否」放弃。" if uncertain else "")
         reply = QMessageBox.question(
             self, "上次的攒批还没打第 2 趟",
@@ -6643,7 +6662,7 @@ class MainWindow(QMainWindow):
                 "把选中的文件复制一份到新标签页重新处理\n"
                 "（原标签页与已上报订单原样保留，不受影响）"
                 if frozen else
-                "灰色：仅对**已锁定**的标签页（🔒 打印完成）可用。\n"
+                "灰色：仅对已锁定的标签页（🔒 打印完成）可用。\n"
                 "当前标签页未锁定，文件可直接编辑/移除，无需复制到新标签页。")
             move_action.triggered.connect(
                 lambda checked=False, rs=list(rows): self._add_rows_to_new_tab(rs))
@@ -6970,9 +6989,14 @@ class MainWindow(QMainWindow):
         self._chk_stack_mode.toggled.connect(self._on_stack_mode_toggled)
         layout.addWidget(self._chk_stack_mode)
 
-        # 攒批状态入口：有纸叠在等第 2 趟时显示「🖐 攒批 N张」，点开就是翻纸窗
-        self._btn_stack = QPushButton("🖐 攒批")
-        self._btn_stack.setToolTip("查看/处理正在累积的手动双面纸叠（第 2 趟）")
+        # 攒批入口：**只在出纸槽里真有纸叠时出现**（2026-10-21 用户要求）——
+        # 列表窗本身随模式常驻（_sync_stack_list_visible），空纸叠时再挂一个「🖐 攒批」
+        # 只会和左边「🖐 攒批模式」复选框并排被读成"第二个开关"。有纸叠时文字带读数
+        # （`N张/M单（已取走 R）`），点它 = 把被收起的列表重新叫出来。
+        self._btn_stack = QPushButton("🖐 攒批列表")
+        self._btn_stack.setToolTip(
+            "打开「攒批列表」：看已攒（等第 2 趟）与还在排队等着打印的文件，\n"
+            "第 2 趟也从那个窗口发起。只有出纸槽里有纸叠时这一项才出现。")
         self._btn_stack.clicked.connect(self._on_stack_button)
         self._btn_stack.setVisible(False)
         layout.addWidget(self._btn_stack)
@@ -8571,7 +8595,7 @@ class MainWindow(QMainWindow):
             if not force and getattr(self, "_duplex_warned", "") == queue:
                 return                          # 同一队列同一状态只说一次（切回来才再说）
             self._duplex_warned = queue
-            self._log(f"⚠ 打印机「{queue}」的双面能力**未确认**：含双面文件的作业按驱动双面提交。"
+            self._log(f"⚠ 打印机「{queue}」的双面能力未确认：含双面文件的作业按驱动双面提交。"
                       f"若本机没有自动双面器（HP LaserJet 1018/1020/1022 这类驱动会虚报支持），"
                       f"实际走的是驱动程序自带的「双面打印说明」向导（偶数页先打 → 提示翻纸 → "
                       f"再打奇数页），单页文件还可能先吐一张空白页。"
@@ -8860,7 +8884,7 @@ class MainWindow(QMainWindow):
                               f"出纸，未写入档案，仍用默认/既有模型")
                     QMessageBox.warning(
                         self, "测速结果不可信",
-                        f"{msg}\n\n但这台打印机**只回报「开始打印」就返回**（主机型打印机"
+                        f"{msg}\n\n但这台打印机只回报「开始打印」就返回（主机型打印机"
                         f"不回报「纸打完」），量出来的秒数低于物理下限，一条都没写进档案。\n\n"
                         f"第 1 趟预估继续用默认/既有模型（翻纸按钮按它等到点才放行），没有副作用。")
                     return
@@ -9004,6 +9028,10 @@ class MainWindow(QMainWindow):
             wait = getattr(self, "_stack_wait", None) or []
             if wait:
                 return f"有 {len(wait)} 个打印请求在排队等这一叠打完"
+            entry_wait = getattr(self, "_stack_entry_wait", None) or []
+            if entry_wait:
+                return (f"有 {len(entry_wait)} 个攒批单在排队等上一单的第 1 趟打完"
+                        f"（随后会自动接着打）")
             retry = getattr(self, "_auto_print_retry", None) or []
             if retry:
                 return f"有 {len(retry)} 个订单在补打队列里等打印机空出来"
@@ -9085,7 +9113,9 @@ class MainWindow(QMainWindow):
 
         · 复选框：**只对「不支持自动双面、需人工翻纸」的机型显示** —— 自动双面的机器不需要攒批
           （隐藏时显示态归零；配置里的偏好留着，换回需翻纸的机型自动恢复）；
-        · 底部入口：有纸叠在等第 2 趟时显示张数，否则只在攒批模式生效时显示；
+        · 底部入口：**只在有纸叠（等第 2 趟的纸）时出现**，文字带 `N张/M单（已取走 R）`；
+          空纸叠一律隐藏（2026-10-21 用户要求）—— 列表窗随模式常驻，再挂一个光秃秃的
+          「🖐 攒批」只会被读成"第二个开关"，点了也只是把已经开着的窗抬到最前；
         · 攒批列表：模式开启时**常驻**（2026-10-20 用户要求，见 `_sync_stack_list_visible`）。
         """
         applicable = self._stack_applicable()
@@ -9108,8 +9138,9 @@ class MainWindow(QMainWindow):
                         + (f"（已取走 {taken}）" if taken else ""))
             btn.setVisible(True)
         else:
-            btn.setText("🖐 攒批")
-            btn.setVisible(bool(self._stack_mode_on()))
+            # 空纸叠不占位：列表窗是常驻的，这个入口只在真有纸压进出纸槽时才需要
+            btn.setText("🖐 攒批列表")
+            btn.setVisible(False)
 
     def _on_stack_mode_toggled(self, checked: bool):
         """本地勾选框：先过**适用性**与**忙闲**两道闸门，再真正切换（2026-10）。
@@ -9209,11 +9240,16 @@ class MainWindow(QMainWindow):
             + ("（来自移动端）" if source == "移动端" else ""))
 
     def _on_stack_button(self):
-        """点底部「🖐 攒批」：叫出**攒批列表**（常驻窗；模式开启时它本就在）。
+        """点底部「🖐 攒批 N张/M单」：叫出**攒批列表**（常驻窗；模式开启时它本就在）。
 
         列表左侧＝已攒的文件（第 1 趟已打、等第 2 趟），右侧＝还在排队的文件 —— 见
         `StackQueueDialog`。**第 2 趟也从这个列表发起**（底部「▶ 开始打印第 2 趟」→
         数纸确认 → 打整叠；「⏭ 放弃整叠」同处），攒批不再复用「手动双面」窗。
+
+        入口**只在有纸叠时出现**（2026-10-21 用户要求，`_sync_stack_button`），所以从界面
+        点进来的这一刻一定有纸；它此刻的实质作用就两件：① 把操作员**主动收起**过的列表
+        重新叫出来（`_stack_list_user_closed` 清零，否则不再自动弹回）；② 在日志里报一句
+        「几单 / 第 2 趟要送多少张」。下面的空纸叠分支是防御（理论上点不到）。
         """
         if self._stack_busy():
             # 第 1 趟/整叠第 2 趟正在打：**日志要说清正在打哪一趟**（现场据此判断
@@ -9228,15 +9264,16 @@ class MainWindow(QMainWindow):
         self._refresh_stack_queue()
         self._show_stack_queue_dialog(dlg)
         if not self._stack.entries:
-            # 没有纸叠时列表照旧打开（右侧「等待打印」还有内容可看），同时给一条轻提示：
-            # 旧写法只在日志区写一行，现场读成"点了没反应/程序卡了"。QStatusBar.showMessage
-            # 只**临时覆盖**左侧普通部件，不动 `_status_label` 正在显示的进度文案。
+            # 防御分支：入口在空纸叠时已隐藏（2026-10-21），正常点不到这里 —— 真被程序内部
+            # 调到也照旧把列表打开（右栏「等待打印」还有内容可看）+ 一条轻提示，
+            # 绝不静默什么都不做。
             note = ("🖐 攒批列表：当前没有已攒的纸叠（攒批模式：已开启）"
                     if self._stack_mode_on() else
                     "🖐 攒批列表：当前没有已攒的纸叠（攒批模式未开启）")
             self._log(note)
             bar = getattr(self, "_status_bar", None)
             if bar is not None:
+                # showMessage 只**临时覆盖**左侧普通部件，不动 `_status_label` 的进度文案
                 bar.showMessage(note, 4000)
             return
         self._log(f"🖐 攒批列表：{self._stack.count} 单 / 第 2 趟要送 "
@@ -9261,10 +9298,10 @@ class MainWindow(QMainWindow):
         lines.extend(self._stack.describe_lines())
         lines.append("")
         lines.append("翻纸三步（原文来自 HP 驱动「双面打印说明」弹窗）：")
-        lines.append("  1. 不改变方向，从出纸槽中取出**整叠**纸（不要丢弃空白页面）。")
+        lines.append("  1. 不改变方向，从出纸槽中取出整叠纸（不要丢弃空白页面）。")
         lines.append("  2. 保持相同方向，把整叠插入纸盘 2，使已打印面朝下（不翻面、不重排）。")
         lines.append("  3. 点「开始第 2 趟」——程序会先要你核对张数，再按各单的逆序打完整叠。")
-        lines.append("⚠ 进纸盒里的纸必须与上面登记的张数一致：**少一张/多一张都会让整叠错位**"
+        lines.append("⚠ 进纸盒里的纸必须与上面登记的张数一致：少一张/多一张都会让整叠错位"
                      "（后面每一张的背面都会串到别的页上）。")
         if self._stack.tainted:
             lines.append("")
@@ -9394,10 +9431,97 @@ class MainWindow(QMainWindow):
         return False, adm.message(self._stack), sheets, unknown
 
     def _start_stack_entry(self, flat_jobs: list, tab_key: str) -> bool:
-        """把这一批任务作为**新的一单**打进纸叠（只打第 1 趟）。"""
+        """把这一批任务作为**新的一单**打进纸叠（只打第 1 趟）。
+
+        打印机还在打上一单的第 1 趟时，这一单**排队**而不是被拒（2026-10-21 现场 bug）：
+        攒批模式的本意就是"多个任务的第 1 趟连续堆进同一叠"，操作员在上一单还没出完纸时
+        点第二单是完全正常的动作。旧写法在这里被 `_start_print_worker` 的忙检查硬拒
+        （「已有打印任务正在进行」），而且**在忙检查之前**就覆盖/清空了
+        `_stack_pending_ctx` —— 上一单打完时主窗口会把它误判成"普通打印批次"，报出
+        「全部 0 个任务已完成打印并回报成功」。现在：忙 → 入 `_stack_entry_wait`，
+        上一单第 1 趟一结束由 `_drain_stack_entry_queue` 自动接着打。
+        """
         ok_rot, rotate, rot_reason = self._request_rotate(flat_jobs)
         if not ok_rot:
             return self._park_print_request(flat_jobs, tab_key, rot_reason)
+        if self._stack_flush_worker is not None and self._stack_flush_worker.isRunning():
+            # 整叠第 2 趟在飞：出纸槽与进纸盒都被整叠独占（`_stack_gate` 一般已拦，
+            # 这里兜底）→ 等整叠打完再放行，不能插进去。
+            return self._park_print_request(
+                flat_jobs, tab_key, "整叠第 2 趟正在打——打完整叠再排")
+        busy_worker = self._worker is not None and self._worker.isRunning()
+        if busy_worker or self._print_starting:
+            return self._queue_stack_entry(
+                flat_jobs, tab_key,
+                "上一单的第 1 趟还在打" if busy_worker else "正在启动上一单的打印")
+        return self._begin_stack_entry(flat_jobs, tab_key, rotate)
+
+    def _queue_stack_entry(self, flat_jobs: list, tab_key: str, reason: str) -> bool:
+        """打印机正忙时的"新的一单"：先受理排队，第 1 趟空出来立刻接着打（不丢请求）。"""
+        if not flat_jobs:
+            return True
+        if not self._has_members():
+            self._show_no_member_hint()
+            return False
+        key = tab_key or ""
+        for req in self._stack_entry_wait:
+            if (req.get("tab_key") or "") == key:
+                # 同一标签页重复点：只更新文件清单，不排第二份（否则同一单打两遍）
+                req["jobs"] = list(flat_jobs)
+                self._log("⏸ 这一单已在排队，等上一单第 1 趟打完自动接着打"
+                          "（已按当前文件清单更新，不用重复点）")
+                self._refresh_stack_dialog()
+                return True
+        self._stack_entry_wait.append({
+            "jobs": list(flat_jobs),
+            "tab_key": key,
+            "reason": f"{reason}，打完自动接着打",
+        })
+        names = "、".join((j.display_name or os.path.basename(j.file_path or ""))
+                          for j in flat_jobs[:3])
+        more = f" 等 {len(flat_jobs)} 个文件" if len(flat_jobs) > 3 else ""
+        self._log(f"⏸ 攒批排队：{reason} —— 本单等它打完自动接着打（不用重复点）："
+                  f"{names}{more}")
+        self._sync_stack_button()
+        self._refresh_stack_dialog()
+        return True
+
+    def _drain_stack_entry_queue(self):
+        """上一单第 1 趟结束、打印机空出来的瞬间：把排队等着的新单接着打。
+
+        只放到"又开始打"或队列空为止（`_stack_busy()` 变 True 即停）。容量/装订方向
+        在这里**重新判一次**：排队期间纸叠可能又长高了，放不下的转进 `_stack_wait`
+        （等整叠第 2 趟打完再放行），绝不硬塞进叠里。
+        """
+        guard = 0
+        while self._stack_entry_wait and not self._stack_busy() and guard < 50:
+            guard += 1
+            req = self._stack_entry_wait.pop(0)
+            jobs = [j for j in (req.get("jobs") or []) if not getattr(j, "sent", False)]
+            # 排队期间操作员可能把文件从标签页里移除了（这一单还没冻结）—— 移除即"别打它"，
+            # 不能在标签页里看不见了还照旧印出来（打印前是唯一能收敛的时机）。
+            tab = self._config.tabs.get(req.get("tab_key") or "")
+            if tab is not None:
+                alive = {id(j) for j in (getattr(tab, "jobs", None) or [])}
+                kept = [j for j in jobs if id(j) in alive]
+                if len(kept) != len(jobs):
+                    self._log(f"⏸ 排队的攒批单里有 {len(jobs) - len(kept)} 个文件"
+                              f"已从标签页移除，不再打印")
+                jobs = kept
+            if not jobs:
+                continue
+            ok, reason, _sheets, _unknown = self._admit_stack_entry(jobs)
+            if not ok:
+                self._park_print_request(jobs, req.get("tab_key") or None, reason)
+                continue
+            self._log(f"▶ 上一单第 1 趟结束，接着打排队的攒批单（{len(jobs)} 个文件）")
+            if not self._begin_stack_entry(jobs, req.get("tab_key") or "", self._request_rotate(jobs)[1]):
+                self._log("⚠ 排队的攒批单启动失败，已移出队列"
+                          "（文件还在对应标签页，可重新点「开始打印」）")
+                break
+
+    def _begin_stack_entry(self, flat_jobs: list, tab_key: str, rotate: bool) -> bool:
+        """真正启动一单第 1 趟（`_stack_pending_ctx` 只在这里写，失败就地回滚）。"""
         batch_dir = self._stack_batch_dir() or self._new_stack_batch()
         seq = self._stack.next_seq()
         out_pdf = os.path.join(batch_dir, f"entry_{seq:04d}.pdf")
@@ -9586,7 +9710,11 @@ class MainWindow(QMainWindow):
                 return "正在打整叠第 2 趟"
             w = getattr(self, "_worker", None)
             if w is not None and w.isRunning() and getattr(w, "_stack_mode", False):
-                return "正在打某单的第 1 趟"
+                n = len(getattr(self, "_stack_entry_wait", None) or [])
+                return ("正在打某单的第 1 趟"
+                        + (f"（后面还有 {n} 单等着接着打）" if n else ""))
+            if getattr(self, "_stack_entry_wait", None):
+                return f"{len(self._stack_entry_wait)} 个请求等上一单第 1 趟打完接着打"
             if getattr(self, "_stack_wait", None):
                 return f"{len(self._stack_wait)} 个请求在排队等这一叠打完"
         except Exception as e:      # 定时器/半初始化环境都要能安全调用
@@ -9599,8 +9727,12 @@ class MainWindow(QMainWindow):
         if dlg is None:
             return
         try:
+            # 右栏「等待打印」两来源：① 等整叠第 2 趟打完才放行的 `_stack_wait`；
+            # ② 已接单、等上一单第 1 趟一结束就自动接着打的 `_stack_entry_wait`。
+            wait_requests = (list(getattr(self, "_stack_entry_wait", []) or [])
+                             + list(getattr(self, "_stack_wait", []) or []))
             dlg.render(self._stack, busy=self._stack_busy(),
-                       wait_requests=list(getattr(self, "_stack_wait", []) or []),
+                       wait_requests=wait_requests,
                        printing_text=self._stack_now_printing_text())
         except Exception as e:      # 定时器/半初始化环境都要能安全调用
             logger.debug(f"攒批列表刷新失败: {type(e).__name__}: {e}")
@@ -9693,7 +9825,7 @@ class MainWindow(QMainWindow):
         text = (f"<b>请数清楚进纸盒里现在有多少张纸：应是 {present} 张</b>"
                 f"（第 1 趟共 {original} 张 − 已取走 {taken} 张）。\n\n")
         if taken:
-            text += (f"已登记取走 {taken} 张：这些纸**不要**放进进纸盒"
+            text += (f"已登记取走 {taken} 张：这些纸不要放进进纸盒"
                      f"（它们已是成品，不在第 2 趟的送纸计划里）。\n\n")
         text += ("⚠ 少一张/多一张都会让整叠错位：整叠的第 2 趟按逆序配对，进纸盒里张数不对，"
                  "后面每一张的背面都会串到别的页上。\n\n")
@@ -9818,7 +9950,7 @@ class MainWindow(QMainWindow):
             reply = QMessageBox.question(
                 self, "放弃整叠",
                 f"当前纸叠有 {n} 个打印任务 / {sheets} 张纸（只打了第 1 趟）。\n\n"
-                f"放弃后这些任务**不会**标记完成、也不会打第 2 趟，"
+                f"放弃后这些任务不会标记完成、也不会打第 2 趟，"
                 f"出纸槽里的纸需要人工处理（可自行丢回纸盘再用或作废）。\n\n确定放弃吗？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply != QMessageBox.Yes:
@@ -9834,6 +9966,13 @@ class MainWindow(QMainWindow):
         self._stack_flush_snapshot = []
         duplex_stack.discard_batch(bdir)
         self._sync_stack_button()
+        # 排队等第 1 趟的攒批单：整叠已被放弃 ⇒ 一并取消（不是打了一半的纸，
+        # 文件仍在各自标签页里，操作员可重新点「开始打印」）。
+        if self._stack_entry_wait:
+            n_q = len(self._stack_entry_wait)
+            self._stack_entry_wait.clear()
+            self._log(f"🖐 放弃整叠：另有 {n_q} 个排队等第 1 趟的攒批单已取消"
+                      f"（文件还在对应标签页，可重新点「开始打印」）")
         self._refresh_stack_queue()
         self._drain_stack_wait_queue()
 
@@ -9861,9 +10000,9 @@ class MainWindow(QMainWindow):
             f"（第 1 趟共 {original} 张"
             + (f"，已取走 {taken} 张" if taken else "") + "）。\n\n"
             f"「保留」= 只收起窗口{ '/关掉攒批模式' if '模式' in purpose else '' }："
-            f"纸叠清单和这 {n} 个订单**都留着**，程序会继续给云端保活（不会判失败）；"
+            f"纸叠清单和这 {n} 个订单都留着，程序会继续给云端保活（不会判失败）；"
             f"之后点底部「🖐 攒批 …」还能打开列表、打第 2 趟。\n\n"
-            f"「放弃整叠」= 这 {n} 单**全部按失败收尾**（只有第 1 趟的纸是半成品，需要人工"
+            f"「放弃整叠」= 这 {n} 单全部按失败收尾（只有第 1 趟的纸是半成品，需要人工"
             f"处理），云端会收到打印失败、顾客可能重下单 —— 不可撤销。\n\n"
             f"（直接关程序也不会判失败：清单保留，下次启动会问你是否续打第 2 趟。）")
         b_keep = box.addButton("保留（纸叠与订单都留着）", QMessageBox.AcceptRole)
@@ -10035,6 +10174,8 @@ class MainWindow(QMainWindow):
                 if tid:
                     ids.add(tid)
         for req in self._stack_wait:
+            _grab(req.get("jobs"))
+        for req in getattr(self, "_stack_entry_wait", None) or []:
             _grab(req.get("jobs"))
         for item in self._auto_print_retry:
             for tid in (item.get("task_ids") or []):
@@ -10488,8 +10629,15 @@ class MainWindow(QMainWindow):
 
     def _on_all_finished(self, success_count: int, fail_count: int):
         """全部任务完成。标签页已固定，不允许再次打印或编辑。"""
-        was_stack_entry = bool(getattr(self, "_stack_pending_ctx", None))
+        _finished_worker = self._worker
         self._worker = None
+        # 判据不能只看 `_stack_pending_ctx`：旧写法在"攒批单第 1 趟还在打时点了第二单"
+        # 的情况下 ctx 会被覆盖/清空（那次启动被忙检查拒绝），于是本方法把第 1 趟的结束
+        # 当成普通批次，报出「全部 0 个任务已完成打印并回报成功」。worker 自己知道它是不是
+        # 攒批单（`_stack_mode`），作为兜底判据（2026-10-21）。
+        was_stack_entry = (
+            bool(getattr(self, "_stack_pending_ctx", None))
+            or bool(getattr(_finished_worker, "_stack_mode", False)))
         self._all_printed = (fail_count == 0)
         # 打印批次结束：清除后台打印上下文（下次打印回到前台标签页语义）
         self._printing_tab_key = ""
@@ -10516,6 +10664,8 @@ class MainWindow(QMainWindow):
                           f"（出纸槽 {self._stack.total_sheets}/{self._stack.capacity} 张）")
                 if self._stack.total_sheets >= self._stack.capacity:
                     self._log("⚠ 出纸槽已达容量上限：请点「▶ 开始第 2 趟」腾空出纸槽")
+            # 打印机刚从第 1 趟空出来 → 把排队等着"接着打第 1 趟"的新单顺次放行
+            self._drain_stack_entry_queue()
             return
 
         total = success_count + fail_count
@@ -10564,7 +10714,9 @@ class MainWindow(QMainWindow):
                 self._auto_print_retry.pop(0)
                 self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key or '(已删除)'} 已无文件，跳过补打")
 
-        # 打印机空闲了 → 放行攒批期间被挡住的排队请求（纸叠已打完时才会真的开打）
+        # 打印机空闲了 → 先接着打排队等第 1 趟的攒批单（连续堆纸），
+        # 再放行攒批期间被挡住的其它排队请求（纸叠已打完时才会真的开打）
+        self._drain_stack_entry_queue()
         self._drain_stack_wait_queue()
 
     def _on_about(self):
@@ -11083,7 +11235,7 @@ class MainWindow(QMainWindow):
         jobs = [j for j in self._tab_jobs(tab_key) if not getattr(j, 'sent', False)]
         if jobs and self._manual_flip_required_for(jobs):
             self._log(f"⚡ 无障碍打印订单 #{order_id}：含双面文件且本机需人工翻纸 —— "
-                      f"按无障碍要求**直接开始第 1 趟**（第 2 趟仍会弹窗等翻纸确认）")
+                      f"按无障碍要求直接开始第 1 趟（第 2 趟仍会弹窗等翻纸确认）")
 
         # 通知后端已接受（后端权威校验订单是否仍有效；已取消 → 409 拒绝）
         if ready_tasks[0].order_id and self._cloud_client:
@@ -11505,7 +11657,8 @@ class MainWindow(QMainWindow):
         返回各处的清理计数，供调用方给出"已清理什么"的事实文案。
         """
         tids = {t for t in (task_ids or []) if t}
-        removed = {"jobs": 0, "tabs": 0, "retry": 0, "wait": 0, "scheduled": 0}
+        removed = {"jobs": 0, "tabs": 0, "retry": 0, "wait": 0, "entry": 0,
+                   "scheduled": 0}
 
         def _task_hit(job) -> bool:
             """这条 job 是否属于被取消的订单（按 task_id 优先，其次 order_id）。"""
@@ -11550,6 +11703,18 @@ class MainWindow(QMainWindow):
                 new_wait.append(req)
         self._stack_wait[:] = new_wait
 
+        # ③b 排队等第 1 趟的攒批单（2026-10-21）：同样要按订单剔，否则上一单打完
+        # 它会被自动接着打出来 —— 已取消的订单会白费纸、顾客那边还是「已取消」。
+        new_entry_wait = []
+        for req in self._stack_entry_wait:
+            jobs = list(req.get("jobs") or [])
+            keep = [j for j in jobs if not _task_hit(j)]
+            removed["entry"] += len(jobs) - len(keep)
+            if keep:
+                req["jobs"] = keep
+                new_entry_wait.append(req)
+        self._stack_entry_wait[:] = new_entry_wait
+
         # ④ 预约单状态机（到点会自触发；调用方可能已清过，这里兜底）
         if order_id and self._scheduled_orders.pop(order_id, None) is not None:
             removed["scheduled"] = 1
@@ -11559,13 +11724,17 @@ class MainWindow(QMainWindow):
             self._rebuild_table()
             self._refresh_tab_display()
             self._sync_edit_enabled(False)
-            if removed["wait"]:
+            if removed["wait"] or removed["entry"]:
                 self._sync_stack_button()
+            if removed["entry"]:
+                self._refresh_stack_queue()
             # 撤单后这些任务不再被引用 → 暂存副本按引用回收（避免越堆越多）
             self._sweep_staged_files("云端订单已取消")
             self._log(f"🧹 已清理订单 #{order_id} 的待打印状态：标签页任务 {removed['jobs']} 个"
                       f" / 空标签页 {removed['tabs']} 个 / 补打队列 {removed['retry']} 条"
-                      f" / 纸叠排队 {removed['wait']} 个 / 预约单 {removed['scheduled']} 个")
+                      f" / 纸叠排队 {removed['wait']} 个"
+                      f" / 待打攒批单 {removed['entry']} 个"
+                      f" / 预约单 {removed['scheduled']} 个")
         return removed
 
     def _on_cloud_order_canceled(self, order_id: int, task_ids: list, fix_status: str = ""):
@@ -11613,6 +11782,8 @@ class MainWindow(QMainWindow):
                 detail.append(f"补打队列 {purged['retry']} 条")
             if purged["wait"]:
                 detail.append(f"纸叠排队 {purged['wait']} 个文件")
+            if purged.get("entry"):
+                detail.append(f"待打攒批单 {purged['entry']} 个文件")
             if purged["scheduled"]:
                 detail.append(f"预约单 {purged['scheduled']} 个")
             QMessageBox.information(
@@ -11815,7 +11986,7 @@ class MainWindow(QMainWindow):
                 f"（只打了第 1 趟，还欠整叠的第 2 趟）。\n\n"
                 f"「是」= 保留清单并退出 —— 下次启动会问你是否续打第 2 趟\n"
                 f"「否」= 返回程序先把第 2 趟打完\n\n"
-                f"⚠ 退出时请**不要**动出纸槽里的纸，否则续打会对不上页。",
+                f"⚠ 退出时请不要动出纸槽里的纸，否则续打会对不上页。",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
@@ -12084,7 +12255,7 @@ class MainWindow(QMainWindow):
             _job.duplex = "off"
             _single_page_norm = True
             self._log(f"  → {_job.display_name or os.path.basename(_job.file_path)} "
-                      f"实际只打 1 页 → 自动改为**单面**"
+                      f"实际只打 1 页 → 自动改为单面"
                       f"（1 页双面物理上不可能，请求双面会让驱动多送一张空白纸）")
 
         self._save_config()

@@ -1014,6 +1014,9 @@ Component({
               pageCount: 0,
               pageCountStatus: '',  // '' | 'analyzing' | 'confirmed' — 页数分析进度
               singlePage: false,    // 有效选择恰好 1 页 → 模式行隐藏、提交强制单面
+              // 范围输入的真实焦点状态（页数返回时要先失焦，见 _blurRangeInputs）：
+              rangeFocusLine: -1,   // 正在聚焦的行号（-1=无）→ 驱动 <input focus>
+              rangeEditing: false,  // 焦点确实落在本文件的范围输入区（只由 bindblur 清）
             }
             patches['selectedFiles[' + fileIndex + ']'] = newFile
             uploads.push({ fileUid: newFile._uid, path: file.path })
@@ -1168,6 +1171,8 @@ Component({
           pageCount: Number(f.page_count) || 0,
           pageCountStatus: hasFileId ? (Number(f.page_count) > 0 ? 'confirmed' : 'analyzing') : '',
           singlePage: false,
+          rangeFocusLine: -1,
+          rangeEditing: false,
         }
         file.singlePage = this._computeSinglePage(file)   // 有效选择恰好 1 页 → 模式行隐藏
         return file
@@ -1347,14 +1352,17 @@ Component({
           if (!file || !file.isImage) {
             pageCountStatus = pageCount > 0 ? 'confirmed' : 'analyzing'
           }
-          this.setData({
+          // 页数已知 → 范围输入区要收起让位给页数选择器：若用户正停在输入框里（控件区在上传中
+          // 就已渲染，PDF 完全可能在打字期间上传完成），先失焦再收，见 _blurRangeInputs
+          const blurPatch = pageCountStatus === 'confirmed' ? this._blurRangeInputs(currentIndex) : null
+          this.setData(Object.assign({
             [key + '.uploading']: false,
             [key + '.progress']: 100,
             [key + '.fileId']: fileId,
             [key + '.failed']: false,
             [key + '.pageCount']: pageCount,
             [key + '.pageCountStatus']: pageCountStatus,
-          })
+          }, blurPatch || {}))
           // 页数确认(PDF) → 文本↔网格模式可能切换、整份1页卡片收缩 → 同步 singlePage + 重算列表高度
           if (file && !file.isImage) {
             this._refreshSinglePage(currentIndex)
@@ -1507,11 +1515,18 @@ Component({
                     ['selectedFiles[' + fileIndex + '].pageCount']: pc,
                     ['selectedFiles[' + fileIndex + '].pageCountStatus']: 'confirmed',
                   }
+                  // 页数一到，范围输入区就该收起、让位给页数选择器。若用户正停在输入框里
+                  // （"转换期间点了范围编辑框、正在输入"），必须先失焦再收 —— 微信 <input>
+                  // 在 focus 时是原生组件，不收焦点就收起的话它会留在原地压住摘要按钮。
+                  // 见 _blurRangeInputs 与 index.wxml 里 rangeEditing 那段注释。
+                  const blurPatch = this._blurRangeInputs(fileIndex)
+                  if (blurPatch) Object.assign(patch, blurPatch)
                   if (pc === 1) {
                     // 单页固定单面 + 范围行隐藏 → 清空历史范围输入，避免残留错误/旧页码
                     patch['selectedFiles[' + fileIndex + '].duplex'] = 'off'
                     patch['selectedFiles[' + fileIndex + '].rangeLines'] = [{ value: '', error: '' }]
                     patch['selectedFiles[' + fileIndex + '].pageRange'] = ''
+                    patch['selectedFiles[' + fileIndex + '].rangeEditing'] = false
                   }
                   this.setData(patch)
                   // _normalizeAndValidateRangeLines 末尾会 _refreshSinglePage → 单页判定/文本↔网格切换均重算列表高度
@@ -1666,11 +1681,64 @@ Component({
       }
     },
 
+    // 记录范围输入的真实焦点（bindfocus）。两点用途：
+    //  ① rangeFocusLine → 驱动 <input focus>，页数返回时靠它把焦点收回来（见 _blurRangeInputs）；
+    //  ② rangeEditing → index.wxml 里"输入区 / 页数选择器互斥渲染"的闸门，
+    //     **只由真正的 bindblur 清**（不在这里、也不在 _blurRangeInputs 里清）——
+    //     万一失焦没生效，界面就停在输入态，绝不会出现"原生输入框压住选择器"。
+    onRangeLineFocus(e) {
+      const fileIndex = e.currentTarget.dataset.fileIndex
+      const lineIndex = e.currentTarget.dataset.lineIndex
+      const file = this.data.selectedFiles[fileIndex]
+      if (!file) return
+      const patch = {}
+      if (file.rangeFocusLine !== lineIndex) {
+        patch['selectedFiles[' + fileIndex + '].rangeFocusLine'] = lineIndex
+      }
+      if (!file.rangeEditing) {
+        patch['selectedFiles[' + fileIndex + '].rangeEditing'] = true
+      }
+      if (Object.keys(patch).length) this.setData(patch)
+    },
+
     onRangeLineBlur(e) {
       const fileIndex = e.currentTarget.dataset.fileIndex
+      const lineIndex = e.currentTarget.dataset.lineIndex
       const file = this.data.selectedFiles[fileIndex]
-      if (!file || file.excelWarning || file.unsupportedFormat || file.isImage) return
+      if (!file) return
+      // 清焦点标记 —— 但只认"这一行"：从一行切到另一行时，旧行的 blur 可能晚于新行的
+      // focus 到达，无条件清会把刚拿到焦点的新行按 false 写回（<input focus> 反转=主动
+      // 失焦，等于把用户刚点的输入框踢掉）。rangeFocusLine 已经是 -1 时无条件放行：
+      // 那是页数返回时 _blurRangeInputs 预置的，这次 blur 正是等着的那一次，
+      // 漏掉它输入区就永远收不起来。
+      const focused = file.rangeFocusLine
+      if (focused === lineIndex || focused === -1 || focused === undefined) {
+        const patch = {}
+        if (focused === lineIndex) patch['selectedFiles[' + fileIndex + '].rangeFocusLine'] = -1
+        if (file.rangeEditing) patch['selectedFiles[' + fileIndex + '].rangeEditing'] = false
+        if (Object.keys(patch).length) this.setData(patch)
+      }
+      if (file.excelWarning || file.unsupportedFormat || file.isImage) return
       this._normalizeAndValidateRangeLines(fileIndex)
+    },
+
+    /* 页数由"未知"变"已知"时调用：范围输入区马上要收起、让位给页数选择器，而用户可能
+       正停在输入框里打字。微信 <input> **只在 focus 时表现为原生组件** —— 它渲染在
+       WebView 之上，不参与父级的 max-height / overflow / opacity 裁剪，所以直接收起的话
+       原生输入框会停在原地、压住同一位置的「全部页 / 已选 …」摘要按钮
+       （2026-10-21 现场截图：输入框占位符与「全部页」重叠）。
+       修法 = 先失焦再收：
+         · rangeFocusLine 置 -1 → <input focus> 反转 → 原生层退回同层渲染，才吃得到裁剪；
+         · wx.hideKeyboard() 收键盘（个别基础库 focus 反转不生效时兜底）。
+       返回值由调用方并进同一批 setData（避免多一次渲染）。
+       rangeEditing（布局收起的总闸）刻意不在这里清：它只由 bindblur 清，见 onRangeLineBlur。 */
+    _blurRangeInputs(fileIndex) {
+      const file = this.data.selectedFiles[fileIndex]
+      if (!file || !(file.rangeFocusLine >= 0)) return null
+      try {
+        if (typeof wx.hideKeyboard === 'function') wx.hideKeyboard({})
+      } catch (err) {}
+      return { ['selectedFiles[' + fileIndex + '].rangeFocusLine']: -1 }
     },
 
     // 有效选择是否恰好 1 页：整份 1 页，或有效范围解析出的页面集合只有 1 页。

@@ -134,7 +134,7 @@ def show_checklist(pages: int, copies: int) -> None:
     print(f"   · 若 180 反而倒置 → 用 --second-rotate 0，并让操作员把整叠平面内转 180° 再放")
     print(f"     （页序不受影响；这一项随打印机型号的纸路径而变，实测为准）")
     print(f"5) 奇数页文档（如 5 页）会有一张纸只有一面有内容（另一面是空白占位）——")
-    print(f"   这是**故意的**，对应 HP 驱动弹窗那句「不要丢弃空白页面」，别把它抽走。")
+    print(f"   这是故意的，对应 HP 驱动弹窗那句「不要丢弃空白页面」，别把它抽走。")
     if copies > 1:
         print(f"6) {copies} 份的边界：第 1 份的最后一张与第 2 份的第一张不应混在一张纸上。")
     print("=" * 78)
@@ -343,7 +343,7 @@ def main() -> int:
                 return 1
             if args.only_pass == 1:
                 show_flip_instructions()
-                print("\n（--only-pass 1 完成。翻好纸后，用**完全相同的参数**加 --only-pass 2 打第 2 趟）")
+                print("\n（--only-pass 1 完成。翻好纸后，用完全相同的参数加 --only-pass 2 打第 2 趟）")
                 if args.save:
                     print("（--save 会在第 2 趟跑完后才写档案）")
                 return 0

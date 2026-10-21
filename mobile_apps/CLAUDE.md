@@ -91,6 +91,11 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
 
 **范围控件三态**：页数已知 → 摘要按钮点击弹数字网格选择器（`onOpenRangePicker`，含全部/单页=奇数/双页=偶数一键，`onConfirmRangePicker` 回写 `rangeLines`+`pageRange`）；页数未知 → 黄色警告 + 多行文本输入（占位符随行号变化、新增行带弹出动画）；整份 1 页 → 整行隐藏。
 
+**范围输入框的焦点闸门（2026-10-21 现场 bug，改之前先读）**：页数由"未知"变"已知"时输入区要收成 `max-height:0`、让位给摘要按钮。但微信小程序 `<input>` **只在 focus 时表现为原生组件** —— 它渲染在 WebView 之上，不吃父级 `max-height`/`overflow`/`opacity` 裁剪。用户在范围输入框里打字时页数恰好返回，直接收起的话原生输入框会留在原地压住同一位置的「全部页 / 已选 …」摘要按钮（现场截图：输入框占位符与「全部页」重叠）。修法两条，缺一都会回来：
+① **先失焦再收**：`_blurRangeInputs()` 把该文件的 `rangeFocusLine` 置 -1（驱动 `<input focus="{{item.rangeFocusLine === li}}">` 反转）+ `wx.hideKeyboard()`，原生层退回同层渲染后才吃得到裁剪；PDF 在上传完成时就已确认页数，所以上传回调里也要调它。
+② **`rangeEditing` 闸门**：只由真正的 `bindfocus`/`bindblur` 维护（`_blurRangeInputs` 刻意不碰它），`index.wxml` 里**输入区收起**与**摘要按钮显示**都多带 `!item.rangeEditing` ⇒ 只要还在焦点里就停在输入态，两个控件永远不会同时在屏上（万一失焦没生效，也只是不收起，不会重叠）。`onRangeLineBlur` 只清"这一行"的标记（跨行切换时旧行 blur 可能晚于新行 focus 到达，无条件清会把新行按 false 写回＝主动失焦）。
+APP 同场景（DOM 里会被裁剪，但焦点得挪走，否则会往看不见的框里打字）在 `www/print.js` 的 `normalizeAndValidateRangeLines` 里先 `active.blur()` 再原地收起。验收：`node tests/verify_range_input_focus_blur.js`（行为 + WXML 闸门 + 变异自证：删掉任一处闸门即转红）。
+
 ## Android App (`android_app/`)
 
 Capacitor WebView 封装，无需微信登录（设备账号 `dev_` 前缀 + 可绑定微信）。**页面逻辑与小程序同源，`www/` 即前端源码**（浏览器直接打开 `www/index.html` 即可开发预览）；`android/` 是 Capacitor 生成的原生壳，`npx cap sync android` 把 `www/` 复制进 `android/app/src/main/assets/public/` 后由 Gradle 打包。

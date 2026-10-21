@@ -409,7 +409,7 @@ def run_sniff(argv: list[str]) -> int:
         except Exception:
             pass
 
-    print(f"嗅探 {seconds:.0f} 秒… 现在去打印一份**双面**的测试文件，"
+    print(f"嗅探 {seconds:.0f} 秒… 现在去打印一份双面的测试文件，"
           f"等驱动弹出「双面打印说明」框。")
     print("（本模式只看窗口，不动打印机；加 --press 才会尝试点「继续」）\n" + "=" * 78)
 

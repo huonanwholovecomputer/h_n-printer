@@ -805,6 +805,10 @@ class _FinWin:
         # 不记进 calls —— 那个列表专门用来钉「先开门 → 再补打」的先后顺序。
         pass
 
+    def _drain_stack_entry_queue(self):
+        # 攒批"连续堆第 1 趟"（2026-10-21）：本替身没有排队等第 1 趟的攒批单，空转。
+        pass
+
     def _find_tab_key_by_order_id(self, _oid):
         return ""
 

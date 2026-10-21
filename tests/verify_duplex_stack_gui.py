@@ -103,7 +103,7 @@ class Rec:
         self.progress = []
 
 
-def patched(rec, plan_ok=True):
+def patched(rec, plan_ok=True, drained=True):
     orig = {n: getattr(gui, n) for n in
             ("print_pdf", "print_plan_pass", "wait_for_output", "get_converter")}
 
@@ -123,8 +123,8 @@ def patched(rec, plan_ok=True):
 
     def _wait_for_output(printer, pages=0, **kw):
         rec.waited.append(pages)
-        return {"drained": True, "queue_seconds": 0.0, "margin_seconds": 2.0,
-                "peak_jobs": 0, "detail": ""}
+        return {"drained": bool(drained), "queue_seconds": 0.0 if drained else 120.0,
+                "margin_seconds": 2.0, "peak_jobs": 0, "detail": ""}
 
     gui.print_pdf = _print_pdf
     gui.print_plan_pass = _print_plan_pass
@@ -143,8 +143,9 @@ def make_job(path, duplex="on", copies=1, mode="long-edge", name="", task_id=0, 
                     display_name=name or os.path.basename(path))
 
 
-def run_stack_pass1(jobs, out_pdf, cover=False, rotate=True, seq=1, plan_ok=True):
-    """跑一次攒批第 1 趟（同线程直连信号）。"""
+def run_stack_pass1(jobs, out_pdf, cover=False, rotate=True, seq=1, plan_ok=True,
+                    drained=True):
+    """跑一次攒批第 1 趟（同线程直连信号）。drained=False 模拟"队列 120s 没排空"。"""
     rec = Rec()
     w = gui.PrintWorker(jobs=jobs, printer_name="Fake Print", duplex_mode="long-edge",
                         keep_temp_pdf=False, render_dpi=200, cover_page=cover,
@@ -161,7 +162,7 @@ def run_stack_pass1(jobs, out_pdf, cover=False, rotate=True, seq=1, plan_ok=True
     w.stack_entry_planned.connect(lambda p: rec.planned.append(p))
     w.stack_entry_done.connect(lambda s, ok, msg, n: rec.entry_done.append((s, ok, msg, n)))
     w.duplex_speed_sample.connect(lambda n, t: rec.samples.append((n, t)))
-    restore = patched(rec, plan_ok=plan_ok)
+    restore = patched(rec, plan_ok=plan_ok, drained=drained)
     try:
         w.run()
     finally:
@@ -224,6 +225,14 @@ rec_f = run_stack_pass1(jobs1, OUT1F, plan_ok=False)
 check("★ 第 1 趟失败 → entry_done 报失败（不静默）",
       rec_f.entry_done and rec_f.entry_done[0][1] is False
       and "失败" in rec_f.entry_done[0][2], f"{rec_f.entry_done}")
+
+# 出纸等待超时（打印机离线/USB 拔掉：spooler 永不排空 → 等满 120s）：
+# 这段"实测"里混着超时等待，不是打印机耗时 ⇒ 绝不能写进速度样本（2026-10-21 现场）
+OUT1T = os.path.join(batch_dir, "entry_0004.pdf")
+rec_t = run_stack_pass1(jobs1, OUT1T, drained=False)
+check("★ 出纸等待超时（队列没排空）→ 不写速度样本（120s 超时不能当打印机耗时学进去）",
+      rec_t.samples == [] and rec_t.entry_done and rec_t.entry_done[0][1] is True,
+      f"samples={rec_t.samples} waited={rec_t.waited}")
 
 
 # ============================================================
@@ -849,11 +858,12 @@ check("⑤ 数纸对话框文案：说清「应是 M 张」+ 点是继续 / 点�
 
 
 # ============================================================
-# ⑦ 底部「🖐 攒批」入口 + 攒批列表常驻（2026-10-20 改版）
+# ⑦ 底部「🖐 攒批」入口 + 攒批列表常驻（2026-10-20 改版 / 2026-10-21 收敛）
 # ============================================================
 print("\n=== ⑦ 「🖐 攒批」入口 + 列表常驻 ===")
 win._stack.clear()
 win._config.duplex_stack_mode = True
+win._stack_list_user_closed = False
 _prep()
 check("前置：攒批模式生效 + 无纸叠", win._stack_mode_on() and not win._stack.entries)
 
@@ -862,24 +872,54 @@ win._sync_stack_list_visible()
 _lst = win._ensure_stack_queue_dialog()
 check("★ 攒批模式开启 ⇒ 攒批列表常驻出现（不等点按钮）", not _lst.isHidden(),
       f"hidden={_lst.isHidden()}")
-_logs_before = win._log_text.toPlainText()
-win._on_stack_button()
-_tip = win._status_bar.currentMessage()
-check("★ 空纸叠点击：状态栏给出轻提示（旧写法只有日志区一行 ⇒ 现场读成「点了没反应」）",
-      "没有已攒的纸叠" in _tip, f"tip={_tip!r}")
-check("★ 文案以**纸叠**为主语，不写成「攒批模式已开启：…」（那句易被读成「刚被开启」）",
-      "攒批模式已开启" not in _tip and "（攒批模式：已开启）" in _tip, f"tip={_tip!r}")
-check("★ 同一句也写进日志（留档与界面同口径）",
-      _tip in win._log_text.toPlainText() and _tip not in _logs_before)
-check("★ 空纸叠也把列表打开（右栏还有排队可看，不再是一个什么都不做的按钮）",
-      not _lst.isHidden() and win._config.duplex_stack_mode is True)
+
+# 2026-10-21 用户要求：**空纸叠时底部入口不占位** —— 列表已常驻，留着它只会和左边
+# 「🖐 攒批模式」复选框并排被读成"第二个开关"；点一下也只是把已经开着的窗抬到最前
+win._sync_stack_button()
+check("★ 空纸叠（模式开着）⇒ 底部「🖐 攒批」入口隐藏",
+      win._btn_stack.isHidden(),
+      f"hidden={win._btn_stack.isHidden()} text={win._btn_stack.text()!r}")
+check("★ 隐藏态文案不再顶着光秃秃的「🖐 攒批」（与左边复选框区分开）",
+      win._btn_stack.text().strip() == "🖐 攒批列表", repr(win._btn_stack.text()))
+
 win._config.duplex_stack_mode = False
 win._sync_stack_list_visible()
 check("★ 关掉攒批模式 ⇒ 列表收起", _lst.isHidden(), f"hidden={_lst.isHidden()}")
-win._on_stack_button()
-_tip2 = win._status_bar.currentMessage()
-check("★ 模式关着时同一入口如实说「未开启」", "攒批模式未开启" in _tip2, f"tip={_tip2!r}")
+win._sync_stack_button()
+check("★ 空纸叠（模式关着）⇒ 入口同样隐藏（不是「模式关了才藏」）",
+      win._btn_stack.isHidden(),
+      f"hidden={win._btn_stack.isHidden()} text={win._btn_stack.text()!r}")
 win._config.duplex_stack_mode = True
+
+# 有纸叠 ⇒ 入口出现并给读数：这是它在主界面上剩的第一条实质作用
+# （列表被最小化/被主窗挡住/挪到另一块屏时，只有这里能看到"压着多少张、几单"）
+win._stack.entries = [ds.StackEntry(
+    seq=1, title="HN-⑦", page_count=5, sheet_count=3, rotate=True,
+    pdf="entry7.pdf", first="odd", state=ds.STATE_DONE,
+    original_sheet_count=3,
+    file_plans=[{"label": "⑦.pdf", "pages": [1, 2, 3, 4, 5], "duplex": True}],
+    tasks=[{"task_id": 701, "order_id": 71, "owner_name": "测试成员",
+            "is_admin_print": False, "copies": 1, "duplex": "on",
+            "page_range": "", "page_count": 5}])]
+win._sync_stack_button()
+check("★ 有纸叠 ⇒ 入口出现且带「N张/M单」读数",
+      (not win._btn_stack.isHidden()) and "3张" in win._btn_stack.text()
+      and "1单" in win._btn_stack.text(),
+      f"hidden={win._btn_stack.isHidden()} text={win._btn_stack.text()!r}")
+
+# 第二条实质作用：操作员主动收起列表后，它是唯一既定的重新打开入口
+win._stack_list_user_closed = True
+_lst.hide()
+win._on_stack_button()
+check("★ 主动收起列表后点入口 ⇒ 列表重新出现 + 收起标记清零",
+      (not _lst.isHidden()) and win._stack_list_user_closed is False,
+      f"hidden={_lst.isHidden()} closed={win._stack_list_user_closed}")
+
+win._stack.clear()
+win._sync_stack_button()
+check("★ 整叠打完（纸叠清空）⇒ 入口自动收起，不留下一个没读数可显示的按钮",
+      win._btn_stack.isHidden(),
+      f"hidden={win._btn_stack.isHidden()} text={win._btn_stack.text()!r}")
 
 
 # ============================================================
@@ -1164,6 +1204,103 @@ check("★ 关模式时跳过「出纸槽里有纸」那一条忙判定（否则
 _T_SRC = G9[G9.index("def _sync_stack_list_visible"):G9.index("def _on_stack_taken_toggle")]
 check("★ 列表可见性：有未打完的纸叠即使模式关掉也在场 + 尊重「操作员已收起」",
       "has_entries" in _T_SRC and "_stack_list_user_closed" in _T_SRC)
+
+
+# ============================================================
+# ⑥b 攒批"连续堆第 1 趟"：打印机忙时**排队**，空出来自动接着打（2026-10-21 现场 bug）
+# ============================================================
+# 现场症状（USB 拔掉的生产机实测）：第 1 单第 1 趟还在等出纸时点第 2 单 →
+# 「⚠️ 已有打印任务正在进行，不能重复启动」；反复点无效；等第 1 单打完，
+# `_on_all_finished` 又报「🔒 全部 0 个任务已完成打印并回报成功！」。
+# 根因：① 忙检查在 `_start_stack_entry` 写 `_stack_pending_ctx` **之后**，被拒时 ctx 已被
+#       覆盖成新单、随后清空 ⇒ 在飞那一单收尾时被判成"普通打印批次"（0 个任务）；
+#       ② 攒批单没有排队通道，忙 = 硬拒。
+print("\n=== ⑥b 攒批连续堆第 1 趟：忙时排队 → 自动接着打 ===")
+gui.PrintWorker.start = _fake_start
+try:
+    _prep(win2)
+    win2._stack.clear()
+    win2._stack.capacity = 90
+    win2._stack_wait = []
+    win2._stack_entry_wait = []
+    win2._stack_pending_ctx = {}
+    win2._worker = None
+    win2._config.tabs["1"].jobs = []
+    win2._config.tabs["2"] = TabSettings(jobs=[], owner_name="测试成员", is_admin_print=False)
+    win2._config.tabs["2"].jobs = []
+
+    jobQ1 = make_job(PDF2, "on", name="Q1.pdf", task_id=1101, order_id=501)
+    jobQ2 = make_job(PDF2, "on", name="Q2.pdf", task_id=1102, order_id=502)
+    win2._config.tabs["1"].jobs = [jobQ1]
+    win2._config.tabs["2"].jobs = [jobQ2]
+
+    _n0 = len(started_workers)
+    ok_q1 = win2._start_print_worker([jobQ1], tab_key="1")
+    check("前提：第 1 单已开打，待处理上下文已定格",
+          ok_q1 and len(started_workers) == _n0 + 1
+          and win2._stack_pending_ctx.get("tab_key") == "1",
+          f"ok={ok_q1} ctx={win2._stack_pending_ctx}")
+
+    class _BusyWorker:
+        """模拟"第 1 单第 1 趟还在打"（真 worker 在跑，QThread.isRunning()=True）。"""
+        _stack_mode = True
+
+        def __init__(self, jobs):
+            self._jobs = list(jobs)
+
+        def isRunning(self):
+            return True
+
+    win2._worker = _BusyWorker([jobQ1])
+    _prep(win2)          # `_start_print_worker` 会把界面下拉框里的真机名同步进 config，先钉回去
+    ok_q2 = win2._start_print_worker([jobQ2], tab_key="2")
+    check("★ 第 1 趟还在打时点第二单 → 受理排队（不再硬拒「已有打印任务正在进行」）",
+          ok_q2 is True and len(started_workers) == _n0 + 1
+          and len(win2._stack_entry_wait) == 1
+          and win2._stack_entry_wait[0]["jobs"][0] is jobQ2,
+          f"ok={ok_q2} wait={len(win2._stack_entry_wait)}")
+    check("★ 排队没清掉在飞那一单的上下文（「全部 0 个任务已完成」的根因）",
+          win2._stack_pending_ctx.get("tab_key") == "1",
+          f"ctx={win2._stack_pending_ctx}")
+
+    _prep(win2)
+    ok_q2b = win2._start_print_worker([jobQ2], tab_key="2")
+    check("★ 同一单重复点 → 只在原条目上更新，不排第二份（避免同一单打两遍）",
+          ok_q2b is True and len(win2._stack_entry_wait) == 1,
+          f"wait={len(win2._stack_entry_wait)}")
+
+    win2._on_all_finished(0, 0)      # 第 1 单第 1 趟结束
+    check("★ 第 1 趟结束 → 排队的第 2 单**自动开打**（不用再点一次）",
+          len(win2._stack_entry_wait) == 0
+          and len(started_workers) == _n0 + 2
+          and started_workers[-1]._stack_out_pdf.endswith("entry_0001.pdf"),
+          f"wait={len(win2._stack_entry_wait)} workers={len(started_workers) - _n0}")
+    check("★ 第 1 趟结束仍走攒批分支（状态栏「攒批中」，不再报「全部 0 个任务已完成」）",
+          "攒批中" in win2._status_label.text(), win2._status_label.text())
+    check("★ 自动接上的第 2 单已把上下文换成自己的标签页（收尾归属不串单）",
+          win2._stack_pending_ctx.get("tab_key") == "2",
+          f"ctx={win2._stack_pending_ctx}")
+
+    # 排队窗口里操作员把文件从标签页删了（这一单还没冻结）→ 不能再印已看不见的文件
+    jobQ3 = make_job(PDF2, "on", name="Q3.pdf", task_id=1103, order_id=503)
+    win2._config.tabs["2"].jobs = []
+    win2._stack_entry_wait = [{"jobs": [jobQ3], "tab_key": "2"}]
+    _prep(win2)
+    win2._worker = None
+    _n1 = len(started_workers)
+    win2._drain_stack_entry_queue()
+    check("★ 排队期间文件被移出标签页 → 该项不再开打（不让已删除文件继续印）",
+          len(started_workers) == _n1 and not win2._stack_entry_wait,
+          f"started={len(started_workers) - _n1}")
+finally:
+    gui.PrintWorker.start = _orig_start
+    win2._worker = None
+    win2._stack.clear()
+    win2._stack_wait = []
+    win2._stack_entry_wait = []
+    win2._stack_pending_ctx = {}
+    win2._stack.capacity = 90
+    win2._config.tabs["1"].jobs = []
 
 
 # ============================================================
