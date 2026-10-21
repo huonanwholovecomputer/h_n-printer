@@ -91,6 +91,11 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   tests/verify_me_layout_render.mjs）⇒ 登记过渡项；**同日已重打 1.1.40（versionCode 41）并通过
 #   verify_apk_release.py + verify_apk_version_manifest.py + verify_apk_published.py
 #   （线上清单/大小/md5 全部一致）⇒ 该项已删除**。
+# 2026-10-21（范围输入框"输入中页数返回"→ 输入框与页数选择器重叠）：改了
+#   www/print.js（收起输入区前先 blur 焦点，对齐小程序 pages/index/index.js 的
+#   _blurRangeInputs；见 tests/verify_range_input_focus_blur.js）⇒ 登记过渡项；
+#   **同日已重打 1.1.42（versionCode 43）并通过 verify_apk_release.py +
+#   verify_apk_version_manifest.py + verify_apk_published.py ⇒ 该项已删除**。
 EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
