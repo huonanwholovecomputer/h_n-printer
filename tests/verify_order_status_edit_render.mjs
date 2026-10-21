@@ -77,6 +77,7 @@ const STORE = {
 const json = (res, obj) => { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
 
 const posted = [];      // 收到的 /api/proxy/admin/order_status 请求体
+const postedType = [];  // 收到的 /api/proxy/admin/order_type 请求体（v7.1 类型订正）
 const saved = [];       // 收到的 finance/config 保存
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://127.0.0.1');
@@ -93,6 +94,19 @@ const server = http.createServer((req, res) => {
         // 桩不做真实写库（真后端行为由 verify_order_status_edit.py 钉住），只回执
         return json(res, { success: true, message: '订单状态已订正', order_id: parsed.order_id,
                            status: parsed.status, previous_status: 'sent', files_updated: 1 });
+      });
+      return;
+    }
+    if (p === '/api/proxy/admin/order_type') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = { _raw: body }; }
+        postedType.push(parsed);
+        return json(res, { success: true, message: '订单类型已订正', order_id: parsed.order_id,
+                           order_type: parsed.order_type, previous_order_type: 'receive',
+                           is_admin_print: parsed.order_type === 'self' ? 1 : 0 });
       });
       return;
     }
@@ -135,12 +149,20 @@ page.on('request', (r) => { if (!r.url().startsWith(BASE) && !r.url().startsWith
 const snap = () => page.evaluate(() => ({
   locked: window.unlocked.orderstatus !== true,
   lockIcon: (document.querySelector('.order-table thead th:nth-child(5) .st-lock') || {}).textContent || '',
+  typeLockIcon: (document.querySelector('.order-table thead th:nth-child(10) .st-lock') || {}).textContent || '',
   rows: document.querySelectorAll('tr.order-row').length,
-  edits: document.querySelectorAll('tr.order-row .st-edit').length,
-  carets: document.querySelectorAll('tr.order-row .st-caret').length,
+  // v7.1：类型列也有 .st-edit/.st-caret，计数必须按列分开（否则「解锁后每行一个」判据被翻倍）
+  edits: document.querySelectorAll('tr.order-row td:nth-child(5) .st-edit').length,
+  carets: document.querySelectorAll('tr.order-row td:nth-child(5) .st-caret').length,
+  typeEdits: document.querySelectorAll('tr.order-row td:nth-child(10) .st-edit').length,
+  typeCarets: document.querySelectorAll('tr.order-row td:nth-child(10) .st-caret').length,
+  typeTags: [...document.querySelectorAll('tr.order-row td:nth-child(10) .tag')].map((t) => t.textContent.trim()),
   menu: !!document.getElementById('stMenu'),
   menuItems: [...document.querySelectorAll('#stMenu .st-menu-item')].map((b) => b.textContent.trim()),
   menuCur: [...document.querySelectorAll('#stMenu .st-menu-item.cur')].map((b) => b.textContent.trim()),
+  tyMenu: !!document.getElementById('tyMenu'),
+  tyItems: [...document.querySelectorAll('#tyMenu .st-menu-item')].map((b) => b.textContent.trim()),
+  tyCur: [...document.querySelectorAll('#tyMenu .st-menu-item.cur')].map((b) => b.textContent.trim()),
   tags: [...document.querySelectorAll('tr.order-row td:nth-child(5) .tag')].map((t) => t.textContent.trim()),
   tagCls: [...document.querySelectorAll('tr.order-row td:nth-child(5) .tag')].map((t) => t.className),
   kpi: (document.querySelector('.hero-card.c-green .num') || {}).getAttribute
@@ -177,6 +199,10 @@ try {
   chk('「状态」表头右侧有锁图标且是 🔒', s.lockIcon.trim() === '🔒', JSON.stringify(s.lockIcon));
   chk('锁定态行内没有任何状态订正入口（.st-edit / .st-caret 均为 0）',
     s.edits === 0 && s.carets === 0, `edits=${s.edits} carets=${s.carets}`);
+  chk('「类型」表头右侧也有锁图标且同为 🔒（两列共用一把锁）',
+    s.typeLockIcon.trim() === '🔒', JSON.stringify(s.typeLockIcon));
+  chk('锁定态类型列没有任何订正入口',
+    s.typeEdits === 0 && s.typeCarets === 0, `typeEdits=${s.typeEdits}`);
   chk('锁定态点状态标签不弹菜单',
     await (async () => { await page.click('tr.order-row td:nth-child(5)'); await page.waitForTimeout(200);
                          return !(await page.$('#stMenu')); })());
@@ -197,11 +223,32 @@ try {
   chk('解锁后锁图标变 🔓', s.lockIcon.trim() === '🔓', JSON.stringify(s.lockIcon));
   chk('解锁后每行都有状态订正入口与 ▾（行数一致）',
     s.edits === s.rows && s.carets === s.rows && s.rows === 3, `rows=${s.rows} edits=${s.edits} carets=${s.carets}`);
+  chk('★ 同一把锁：解锁「状态」后「类型」表头也是 🔓（不输第二次密码）',
+    s.typeLockIcon.trim() === '🔓', JSON.stringify(s.typeLockIcon));
+  chk('★ 解锁后类型列同样每行可点（接单/自打）',
+    s.typeEdits === s.rows && s.typeCarets === s.rows, `typeEdits=${s.typeEdits}`);
   chk('解锁后状态标签仍是原状态（未误改）',
     JSON.stringify(s.tags) === JSON.stringify(['已完成', '放弃打印', '已完成']) &&
     JSON.stringify(s.statuses) === JSON.stringify(['sent', 'abandoned', 'sent']),
     JSON.stringify([s.tags, s.statuses]));
   await page.locator('#cloud-orders').screenshot({ path: path.join(OUT_DIR, '02-解锁后-每单带小箭头.png') });
+
+  /* ── ②b 类型列的小箭头与状态列「同款」（2026-10-20 用户要求）──────────
+     之前是贴角绝对定位 + 缩字号（.55rem），看起来是另一个控件；现在两列共用 .st-caret。 */
+  const caret = await page.evaluate(() => {
+    const a = document.querySelector('tr.order-row td:nth-child(5) .st-caret');
+    const b = document.querySelector('tr.order-row td:nth-child(10) .st-caret');
+    if (!a || !b) return null;
+    const ca = getComputedStyle(a), cb = getComputedStyle(b);
+    return { fsA: ca.fontSize, fsB: cb.fontSize, posB: cb.position,
+             lhA: ca.lineHeight, lhB: cb.lineHeight,
+             txt: (b.textContent || '').trim(),
+             overflow: b.getBoundingClientRect().width };
+  });
+  chk('②b 类型列小箭头与状态列同字号同位置方式（不再贴角/缩字号）',
+    !!caret && caret.fsA === caret.fsB && caret.posB === 'static'
+    && caret.lhA === caret.lhB && caret.txt === '▾' && caret.overflow > 0,
+    JSON.stringify(caret));
 
   /* ── ③ 菜单：5 个终态 + 当前项标注 ───────────────────────────────────── */
   await page.click('tr.order-row:nth-child(1) td:nth-child(5) .st-edit');
@@ -219,6 +266,14 @@ try {
     s.menuItems.every((t) => !/排队中|打印中|待添加|已添加|预留|预约|等待打印|传输中/.test(t)),
     JSON.stringify(s.menuItems));
   await page.screenshot({ path: path.join(OUT_DIR, '03-状态菜单.png') });
+
+  /* ── ③b 再点同一个状态标签 → 菜单收起（toggle）──────────────────────── */
+  await page.click('tr.order-row:nth-child(1) td:nth-child(5) .st-edit');
+  await page.waitForTimeout(250);
+  chk('③b 再点同一个状态标签 → 菜单收起（旧写法只会重开、关不掉）',
+    !(await page.$('#stMenu')));
+  await page.click('tr.order-row:nth-child(1) td:nth-child(5) .st-edit');
+  await page.waitForSelector('#stMenu', { timeout: 3000 });
 
   /* ── ④ 选「失败」→ 真实提交 + 立即生效（标签 / 文件级 / KPI） ────── */
   const kpiBefore = parseInt(s.kpi, 10);
@@ -241,13 +296,69 @@ try {
     s.toasts.some((t) => t.includes('状态已改为') && t.includes('失败')), JSON.stringify(s.toasts));
   await page.locator('#cloud-orders').screenshot({ path: path.join(OUT_DIR, '04-订正为失败-立即生效.png') });
 
-  /* ── ⑤ 点 🔓 回到锁定 ────────────────────────────────────────────────── */
-  await page.click('.order-table thead th:nth-child(5) .st-lock');
+  /* ── ④b 类型订正（v7.1）：同一把锁、只允许「接单 ⇄ 自打」 ────────────── */
+  const kpiAfterStatus = parseInt((await snap()).kpi, 10);
+  // 按 data-order 定位（表格里每个订单后面还跟着一行文件展开行，nth-child 会被它带偏）
+  const TYPE_SEL = 'tr.order-row[data-order="900003"] td:nth-child(10)';
+  const typeTagOf = () => page.evaluate((sel) =>
+    (document.querySelector(sel + ' .tag') || {}).textContent || '', TYPE_SEL);
+  await page.click(TYPE_SEL + ' .st-edit');
+  await page.waitForSelector('#tyMenu', { timeout: 3000 });
+  s = await snap();
+  chk('点类型标签弹出类型菜单（#tyMenu）', s.tyMenu);
+  chk('类型菜单只有「接单 / 自打」两项（其余槽位是订单属性派生，不允许改）',
+    s.tyItems.length === 2 && s.tyItems.some((t) => t.indexOf('接单') >= 0) &&
+    s.tyItems.some((t) => t.indexOf('自打') >= 0), JSON.stringify(s.tyItems));
+  chk('类型菜单标出当前项（✓ 当前）且不可点',
+    s.tyCur.length === 1 && s.tyCur[0].indexOf('接单') >= 0, JSON.stringify(s.tyCur));
+  chk('类型菜单没有底部那一长串说明（只留两项 + ✓当前）',
+    !/只决定结算归类|不改打印状态/.test(
+      await page.evaluate(() => (document.getElementById('tyMenu') || {}).textContent || '')));
+  await page.screenshot({ path: path.join(OUT_DIR, '04b-类型菜单.png') });
+  await page.click(TYPE_SEL + ' .st-edit');
+  await page.waitForTimeout(250);
+  chk('④c 再点同一个类型标签 → 菜单收起（与状态列同一套行为）',
+    !(await page.$('#tyMenu')));
+  await page.click(TYPE_SEL + ' .st-edit');
+  await page.waitForSelector('#tyMenu', { timeout: 3000 });
+  const itemType = await page.evaluateHandle(() =>
+    [...document.querySelectorAll('#tyMenu .st-menu-item')].find((b) => b.textContent.indexOf('自打') >= 0));
+  await itemType.asElement().click();
+  await page.waitForTimeout(600);
+  s = await snap();
+  chk('提交打到 /api/proxy/admin/order_type，body = {order_id, order_type}',
+    postedType.length === 1 && String(postedType[0].order_id) === '900003' &&
+    postedType[0].order_type === 'self', JSON.stringify(postedType));
+  chk('菜单提交后自动收起', !s.tyMenu);
+  chk('行内类型标签立即变「自打」（无需刷新）',
+    (await typeTagOf()).indexOf('自打') >= 0, await typeTagOf());
+  chk('自打订单不计入收益 → KPI 立即减去该单 ¥1.50',
+    kpiAfterStatus - parseInt(s.kpi, 10) === 150, `${kpiAfterStatus} → ${s.kpi}`);
+  await page.locator('#cloud-orders').screenshot({ path: path.join(OUT_DIR, '04c-类型订正为自打-收益扣除.png') });
+  /* 改回「接单」：验证反方向，并把数据恢复成后续断言假设的口径 */
+  await page.click(TYPE_SEL + ' .st-edit');
+  await page.waitForSelector('#tyMenu', { timeout: 3000 });
+  const itemBack = await page.evaluateHandle(() =>
+    [...document.querySelectorAll('#tyMenu .st-menu-item')].find((b) => b.textContent.indexOf('接单') >= 0));
+  await itemBack.asElement().click();
+  await page.waitForTimeout(600);
+  s = await snap();
+  chk('改回「接单」→ 标签与收益口径都恢复（两个方向都能改）',
+    postedType.length === 2 && postedType[1].order_type === 'receive' &&
+    (await typeTagOf()).indexOf('接单') >= 0 && parseInt(s.kpi, 10) === kpiAfterStatus,
+    JSON.stringify([postedType, await typeTagOf(), s.kpi]));
+  await page.locator('#cloud-orders').screenshot({ path: path.join(OUT_DIR, '04c-类型订正生效.png') });
+
+  /* ── ⑤ 点 🔓 回到锁定（点「类型」那把锁，两列必须一起锁上）────────────── */
+  await page.click('.order-table thead th:nth-child(10) .st-lock');
   await page.waitForTimeout(300);
   s = await snap();
-  chk('点 🔓 → 重新锁定：锁图标回到 🔒', s.locked && s.lockIcon.trim() === '🔒', JSON.stringify([s.locked, s.lockIcon]));
-  chk('重新锁定后箭头与入口全部收起（.st-edit / .st-caret = 0）',
-    s.edits === 0 && s.carets === 0, `edits=${s.edits} carets=${s.carets}`);
+  chk('★ 点「类型」表头的 🔓 → 「状态」与「类型」两列同时回到 🔒（同一把锁）',
+    s.locked && s.lockIcon.trim() === '🔒' && s.typeLockIcon.trim() === '🔒',
+    JSON.stringify([s.locked, s.lockIcon, s.typeLockIcon]));
+  chk('重新锁定后箭头与入口全部收起（两列的 .st-edit / .st-caret = 0）',
+    s.edits === 0 && s.carets === 0 && s.typeEdits === 0 && s.typeCarets === 0,
+    `edits=${s.edits} carets=${s.carets} typeEdits=${s.typeEdits}`);
   chk('重新锁定后菜单不残留', !s.menu);
   chk('锁定态点状态标签仍不弹菜单',
     await (async () => { await page.locator('tr.order-row').nth(1).locator('td:nth-child(5)').click();
@@ -268,9 +379,17 @@ try {
                  await page.click('#modalRoot .modal-card [data-act=ok]'); await page.waitForTimeout(500); }
       return !!(await page.$('#pwd-orderstatus'));
     })());
-  chk('设置页有「订单状态订正 密码」输入框（新模块自动出现在密码管理里）',
+  chk('设置页有该模块的密码输入框（新模块自动出现在密码管理里）',
     await page.$eval('label + input#pwd-orderstatus', () => true).catch(() => false) ||
     !!(await page.$('#pwd-orderstatus')));
+  const pwdRowText = await page.evaluate(() => {
+    const el = document.getElementById('pwd-orderstatus');
+    return el && el.parentElement ? el.parentElement.textContent : '';
+  });
+  chk('★ 设置页密码描述已改为「订单状态/类型订正」，并注明这一把密码同时管两列',
+    pwdRowText.indexOf('订单状态/类型订正') >= 0 &&
+    (await page.evaluate(() => document.getElementById('tab-settings').textContent)).indexOf('同时管') >= 0,
+    pwdRowText.slice(0, 60));
   await page.evaluate(() => { document.getElementById('pwd-orderstatus').value = '654321'; });
   await page.evaluate(() => updatePassword('orderstatus'));
   await page.waitForTimeout(600);

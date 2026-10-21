@@ -145,6 +145,9 @@ def run_one(path: Path, node: str | None, timeout: int) -> tuple[str, str, float
     # 统一 UTF-8：脚本里的 emoji/中文断言在 GBK 控制台会直接崩（见审查报告根因 4）
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    # 批处理标记：交互式验收脚本（verify_stack_list_virtual.py）据此强制走 --auto，
+    # 否则它继承终端 stdin 会停在 input() 上，把整个套件拖到超时。
+    env["HN_ACCEPTANCE_BATCH"] = "1"
 
     t0 = time.time()
     try:

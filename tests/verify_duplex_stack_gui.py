@@ -336,7 +336,7 @@ class FlushStub:
         self.started = True
 
     def isRunning(self):
-        return False
+        return bool(self.started)   # 真 worker 一 start 就在跑；列表按钮的 busy 判据要能测到
 
     def wait(self, ms=0):
         return True
@@ -657,6 +657,113 @@ win2._config.duplex_stack_mode = True
 win2._stack.entries = []
 win2._stack_wait = []
 
+
+# ============================================================
+# ③b 翻纸窗按钮 → 攒批动作的**真实点击路径**（2026-10-20 现场 bug）
+# ============================================================
+# 现场症状：点「▶ 开始第 2 趟」后窗口切到「③ 正在打印整叠的第 2 趟…（请勿再动纸叠）」，
+# 却一张纸都不出、两个按钮全灰 —— 现场读作"点了没反应"，而且再也点不动。
+# 根因：ManualDuplexDialog._on_go/_on_skip 是**先改 `_mode` 再 emit**，主窗口
+# `_on_duplex_continue` 按 `dlg._mode == "stack_ready"` 分流 ⇒ 永远分不进攒批分支
+# （弃整叠同理：`_on_duplex_skip` 也一样分不进去）。旧验收全是直接调 `win._on_stack_flush()`,
+# 没走按钮 ⇒ 这条断线一直没人抓到。
+print("\n=== ③b 翻纸窗按钮 → 攒批动作（真实点击） ===")
+
+
+def _seed_stack(win_, task_id=901, order_id=91, pdf=PDF2):
+    """造一单已经打完第 1 趟、正等第 2 趟的纸叠。"""
+    job = make_job(pdf, "on", name="K.pdf", task_id=task_id, order_id=order_id)
+    win_._config.tabs["1"].jobs = [job]
+    _prep(win_)
+    win_._start_print_worker([job], tab_key="1")
+    win_._on_stack_entry_planned({
+        "seq": 1, "pdf": "entry_0001.pdf", "rotate": True,
+        "file_plans": [{"label": "K.pdf", "pages": [1, 2], "duplex": True}],
+        "page_count": 2, "sheet_count": 1,
+        "pass1_pages": [1], "pass2_pages": [2], "state": ds.STATE_PRINTING,
+        "items": [{"idx": 0, "task_id": task_id, "order_id": order_id,
+                   "order_number": "HN-K", "display_name": "K.pdf", "file_path": pdf,
+                   "copies": 1, "duplex": "on", "page_range": "", "page_count": 2}],
+    })
+    win_._on_stack_entry_done(1, True, "第 1 趟完成（1 张纸已堆入出纸槽）", 1)
+    win_._on_all_finished(0, 0)
+    return job
+
+
+def _ready_list(win_):
+    """叫出攒批列表并按当前纸叠刷新 —— 第 2 趟从这里发起（2026-10-20 改版）。"""
+    lst = win_._ensure_stack_queue_dialog()
+    win_._refresh_stack_queue()
+    return lst
+
+
+# ① 开始第 2 趟：按钮点下去必须真的启动整叠 worker（现场 bug 就是这里断的）
+jobK = _seed_stack(win2, task_id=901, order_id=91)
+_lst = _ready_list(win2)
+_n_flush = len(flush_created)
+_lst._btn_start.click()
+check("★ 点「▶ 开始打印第 2 趟」→ 真的启动整叠第 2 趟 worker（现场 bug：点了没反应）",
+      len(flush_created) == _n_flush + 1 and flush_created[-1].started
+      and win2._stack_flush_worker is flush_created[-1],
+      f"created={len(flush_created) - _n_flush} "
+      f"started={flush_created[-1].started if flush_created else None}")
+check("★ 启动后列表按钮立刻禁用（第 2 趟在飞时不许再点）",
+      not _lst._btn_start.isEnabled() and "正在打整叠第 2 趟" in _lst._summary.text(),
+      f"{_lst._btn_start.isEnabled()}/{_lst._summary.text()[:24]}")
+win2._on_stack_flush_done(True, "整叠第 2 趟完成（桩）", 1)
+check("★ 真实点击 → 打完正常收尾（本单标完成、纸叠清空）",
+      jobK.sent is True and win2._stack.entries == [],
+      f"sent={jobK.sent} entries={win2._stack.count}")
+
+# ② 放弃整叠：同一处断线的另一半（点下去必须按失败收尾，不能只是"跳过本任务"）
+jobL = _seed_stack(win2, task_id=902, order_id=92)
+_lst = _ready_list(win2)
+gui.QMessageBox.question = staticmethod(lambda *a, **k: gui.QMessageBox.Yes)
+_n_fail = len(win2._cloud_client.fail)
+_lst._btn_abandon.click()
+check("★ 点「⏭ 放弃整叠」→ 真的按失败收尾 + 清空纸叠（旧写法只打一行日志，"
+      "半成品留在出纸槽、订单一直挂着）",
+      jobL.sent is False and win2._stack.entries == []
+      and any(t == 902 for t, _ in win2._cloud_client.fail[_n_fail:]),
+      f"entries={win2._stack.count} fail={win2._cloud_client.fail[_n_fail:]}")
+
+# ③ 放弃时点「否」→ 纸叠保留、按钮必须还能点（旧写法是死状态）
+jobM = _seed_stack(win2, task_id=903, order_id=93)
+_lst = _ready_list(win2)
+gui.QMessageBox.question = staticmethod(lambda *a, **k: gui.QMessageBox.No)
+_lst._btn_abandon.click()
+check("★ 放弃整叠点「否」→ 纸叠保留 + 按钮仍可用（不卡死）",
+      win2._stack.count == 1 and _lst._btn_start.isEnabled()
+      and _lst._btn_abandon.isEnabled() and jobM.sent is False,
+      f"entries={win2._stack.count} enabled={_lst._btn_start.isEnabled()}")
+
+# ④ 开打前的落机对账点「否」→ 不启动、不抽纸、纸叠保留、按钮仍可用
+_n_flush = len(flush_created)
+_lst._btn_start.click()
+check("★ 对账点「否」→ 第 2 趟不启动（不白抽纸）+ 纸叠保留 + 按钮仍可用",
+      len(flush_created) == _n_flush and win2._stack.count == 1
+      and _lst._btn_start.isEnabled(),
+      f"created={len(flush_created) - _n_flush} entries={win2._stack.count}")
+
+# ⑤ 打印机还在忙（第 1 趟在打）时：列表按钮直接禁用，点了也不会启动
+class _RunningWorker:
+    def isRunning(self):
+        return True
+
+
+win2._worker = _RunningWorker()
+win2._refresh_stack_queue()
+_n_flush = len(flush_created)
+gui.QMessageBox.question = staticmethod(lambda *a, **k: gui.QMessageBox.Yes)
+_lst._btn_start.click()
+check("★ 忙时列表按钮禁用 → 点不动、不会启动第 2 趟（纸叠保留）",
+      len(flush_created) == _n_flush and not _lst._btn_start.isEnabled()
+      and win2._stack.count == 1,
+      f"created={len(flush_created) - _n_flush} enabled={_lst._btn_start.isEnabled()}")
+win2._worker = None
+win2._stack.clear()
+win2._stack_wait = []
+
 gui.PrintWorker.start = _orig_start
 gui.DuplexFlushWorker = _orig_flush
 
@@ -714,69 +821,349 @@ gui.QMessageBox.question = staticmethod(lambda *a, **k: gui.QMessageBox.Yes)
 
 
 # ============================================================
-# ⑥ 翻纸窗的攒批状态机（铁律③：超时只预警、不跳过）
+# ⑥ 攒批不再复用「手动双面」窗（2026-10-20 用户要求）
 # ============================================================
-print("\n=== ⑥ 翻纸窗攒批状态 ===")
-_dlg = win._ensure_duplex_dialog()
-_dlg.announce_stack("本单 2 个文件", sheets=3, capacity=90, count=1, estimate_sec=10.0)
-check("① 攒批第 1 趟：窗口常驻、第 2 趟按钮禁用、文案点明攒批",
-      _dlg._mode == "stack_pass1" and not _dlg._btn_go.isEnabled()
-      and "攒批" in _dlg._status.text() and "放弃整叠" in _dlg._btn_skip.text(),
-      f"{_dlg._mode}/{_dlg._status.text()[:20]}")
-
-_dlg.set_stack_ready("出纸槽里应有 3 张纸", sheets=3, capacity=90, count=1,
-                     warn_after_sec=1800)
-check("② 攒批待翻：按钮启用 + 标题给出整叠张数 + 正计时文案",
-      _dlg._mode == "stack_ready" and _dlg._btn_go.isEnabled()
-      and "1 单" in _dlg._btn_go.text() and "等待" in _dlg._countdown.text(),
-      f"{_dlg._btn_go.text()}/{_dlg._countdown.text()[:20]}")
-
-_dlg._stack_warn = 60          # 预警阈值的下限就是 60s（clamp_warn_after 同口径）
-_dlg._stack_wait = 61
-_dlg._paint_stack_countdown()
-check("③ 铁律③：等待超阈值只变红预警，**绝不**自动跳过",
-      "#e74c3c" in _dlg._countdown.styleSheet() and _dlg._mode == "stack_ready"
-      and _dlg._btn_go.isEnabled() and "不自动跳过" in _dlg._countdown.text(),
-      f"{_dlg._mode}/{_dlg._countdown.text()[:30]}")
-
-# 关窗 ≠ 放弃（攒批的纸还在机器里，窗口只是显示器）
-_seen = []
-_dlg.skip_requested.connect(lambda: _seen.append("skip"))
-_dlg.closeEvent_orig = None
-from PySide6.QtGui import QCloseEvent  # noqa: E402
-_dlg.closeEvent(QCloseEvent())
-check("④ 攒批中关窗只收起、不算放弃（不会发出 skip）", _seen == [] and _dlg._mode == "stack_ready",
-      f"{_seen}/{_dlg._mode}")
-_dlg.stack_finished("攒批完成")
-check("⑤ 结束态：按钮全部禁用、⏭ 变「关闭」",
-      _dlg._mode == "done" and _dlg._btn_skip.text() == "关闭")
-_dlg.close()
+print()
+print("=== ⑥ 攒批不再复用「手动双面」窗（2026-10-20 用户要求） ===")
+check("① 双面窗已没有攒批专用状态（announce_stack/set_stack_ready/stack_finished 全删）",
+      not any(hasattr(gui.ManualDuplexDialog, _n) for _n in
+              ("announce_stack", "set_stack_ready", "set_stack_waiting", "stack_finished")))
+check("② 双面窗不再声明攒批信号",
+      not hasattr(gui.ManualDuplexDialog, "stack_flush_requested")
+      and not hasattr(gui.ManualDuplexDialog, "stack_abandon_requested"))
+# 攒批第 1 趟播报只记日志 + 刷列表：绝不把翻纸窗弹出来（旧实现会弹，还从第 1 趟开始计时）
+win._duplex_dialog = None
+win._on_stack_announce("本单 2 个文件（第 1 趟）")
+check("③ 攒批第 1 趟开打：**不弹**手动双面窗、不建窗口、不计时",
+      getattr(win, "_duplex_dialog", None) is None,
+      f"{type(getattr(win, '_duplex_dialog', None)).__name__}")
+check("④ 但攒批列表被刷新了（操作员在列表里看进度）",
+      getattr(win, "_stack_queue_dialog", None) is not None)
+_G6 = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+_gate_src = _G6[_G6.index("def _stack_reconcile_gate"):
+                _G6.index("def _finish_empty_stack_second_pass")]
+check("⑤ 数纸对话框文案：说清「应是 M 张」+ 点是继续 / 点否取消",
+      "请数清楚进纸盒里现在有多少张纸" in _gate_src
+      and "应是 {present} 张" in _gate_src
+      and "点「是」= 继续打印整叠的第 2 趟" in _gate_src)
 
 
 # ============================================================
-# ⑦ 底部「🖐 攒批」入口：没有纸叠时的可见反馈（2026-10 现场反馈）
+# ⑦ 底部「🖐 攒批」入口 + 攒批列表常驻（2026-10-20 改版）
 # ============================================================
-print("\n=== ⑦ 「🖐 攒批」空纸叠入口的反馈 ===")
+print("\n=== ⑦ 「🖐 攒批」入口 + 列表常驻 ===")
 win._stack.clear()
 win._config.duplex_stack_mode = True
 _prep()
 check("前置：攒批模式生效 + 无纸叠", win._stack_mode_on() and not win._stack.entries)
+
+# 2026-10-20 用户要求：开启攒批模式后列表就**常驻**，不用再点按钮
+win._sync_stack_list_visible()
+_lst = win._ensure_stack_queue_dialog()
+check("★ 攒批模式开启 ⇒ 攒批列表常驻出现（不等点按钮）", not _lst.isHidden(),
+      f"hidden={_lst.isHidden()}")
 _logs_before = win._log_text.toPlainText()
 win._on_stack_button()
 _tip = win._status_bar.currentMessage()
 check("★ 空纸叠点击：状态栏给出轻提示（旧写法只有日志区一行 ⇒ 现场读成「点了没反应」）",
-      "没有待打第 2 趟的纸叠" in _tip, f"tip={_tip!r}")
-check("★ 文案以**纸叠**为主语，不再写成「攒批模式已开启：…」（那句易被读成「刚被开启」）",
+      "没有已攒的纸叠" in _tip, f"tip={_tip!r}")
+check("★ 文案以**纸叠**为主语，不写成「攒批模式已开启：…」（那句易被读成「刚被开启」）",
       "攒批模式已开启" not in _tip and "（攒批模式：已开启）" in _tip, f"tip={_tip!r}")
 check("★ 同一句也写进日志（留档与界面同口径）",
       _tip in win._log_text.toPlainText() and _tip not in _logs_before)
-check("★ 空纸叠点击不做任何动作（不建窗、不改模式）",
-      win._stack.entries == [] and win._config.duplex_stack_mode is True)
+check("★ 空纸叠也把列表打开（右栏还有排队可看，不再是一个什么都不做的按钮）",
+      not _lst.isHidden() and win._config.duplex_stack_mode is True)
 win._config.duplex_stack_mode = False
+win._sync_stack_list_visible()
+check("★ 关掉攒批模式 ⇒ 列表收起", _lst.isHidden(), f"hidden={_lst.isHidden()}")
 win._on_stack_button()
 _tip2 = win._status_bar.currentMessage()
 check("★ 模式关着时同一入口如实说「未开启」", "攒批模式未开启" in _tip2, f"tip={_tip2!r}")
 win._config.duplex_stack_mode = True
+
+
+# ============================================================
+# ⑧ 攒批列表：左「已攒」/ 右「等待打印」两栏 + 页号 + [空]（2026-10-20 改版）
+# ============================================================
+# 用户口径：左侧列出所有"攒"了的文件及具体页数，右侧列出所有等待打印的文件及具体页数，
+# 空白占位写 [空]。判据走**渲染出来的树**（不是方法返回值），才抓得到"界面没跟上"。
+print("\n=== ⑧ 攒批列表左右两栏 ===")
+_list_dlg = gui.StackQueueDialog()
+_st = ds.DuplexStack(capacity=90, printer_name="Fake Print")
+_st.entries = [
+    ds.StackEntry(seq=1, title="HN-A", page_count=3, sheet_count=2, rotate=True,
+                  pdf="e1.pdf", first="odd", state=ds.STATE_DONE,
+                  file_plans=[{"label": "双面3页.pdf", "pages": [1, 2, 3], "duplex": True}]),
+    ds.StackEntry(seq=2, title="HN-B", page_count=2, sheet_count=2, rotate=True,
+                  pdf="e2.pdf", first="odd", state=ds.STATE_DONE,
+                  file_plans=[{"label": "单面2页.pdf", "pages": [1, 2], "duplex": False}]),
+]
+_q1 = make_job(PDF2, "on", name="排队双面.pdf")
+_q1.page_count = 4
+_q2 = make_job(PDF2, "off", name="排队单面.pdf")
+_q2.page_count = 3
+_list_dlg.render(_st, busy=False,
+                 wait_requests=[{"jobs": [_q1], "tab_key": "2", "reason": "容量不足：还需 2 张"},
+                                {"jobs": [_q2], "tab_key": "3", "reason": "装订方向不一致"}],
+                 printing_text="")
+_TL, _TR = _list_dlg._tree_left, _list_dlg._tree_right
+
+
+def _cell(tree, row, col):
+    it = tree.topLevelItem(0) if row == 0 else tree.topLevelItem(0).child(row - 1)
+    return it.text(col)
+
+
+def _rows_of(tree):
+    out = []
+    n = tree.columnCount()
+    for i in range(tree.topLevelItemCount()):
+        top = tree.topLevelItem(i)
+        out.append([top.text(0)] + [[top.child(j).text(c) for c in range(n)]
+                                    for j in range(top.childCount())])
+    return out
+
+
+_left_rows = lambda: _rows_of(_TL)
+_right_rows = lambda: _rows_of(_TR)
+
+
+_L = _left_rows()
+_R = _right_rows()
+check("★ 左栏按单分组，列出每个文件（不合并成一句『本单 3 页』）",
+      len(_L) == 2 and len(_L[0]) == 2 and _L[0][1][0].endswith("双面3页.pdf")
+      and _L[1][1][0].endswith("单面2页.pdf"),
+      f"{[r[0] for r in _L]} / {[r[1][0] for r in _L]}")
+check("★ 双面 3 页：第 1 趟=1 3、第 2 趟=[空] 2（空白占位写 [空]，逆序在最上面）",
+      _L[0][1][1] == "1 3" and _L[0][1][2] == "[空] 2", f"{_L[0][1][1]} | {_L[0][1][2]}")
+check("★ 单面 2 页：第 1 趟=1 2、第 2 趟=[空] [空]（每页各占一张纸，背面全空）",
+      _L[1][1][1] == "1 2" and _L[1][1][2] == "[空] [空]",
+      f"{_L[1][1][1]} | {_L[1][1][2]}")
+check("★ 每行给张数（3 页双面=2 张 / 2 页单面=2 张）",
+      _L[0][1][3] == "2 张" and _L[1][1][3] == "2 张",
+      f"{_L[0][1][3]} / {_L[1][1][3]}")
+check("★ 右栏列出所有等待打印的文件 + 页号 + 排队原因",
+      len(_R) == 2 and "容量不足" in _R[0][0] and "装订方向不一致" in _R[1][0]
+      and _R[0][1][0].endswith("排队双面.pdf") and _R[1][1][0].endswith("排队单面.pdf"),
+      f"{[r[0] for r in _R]}")
+check("★ 排队文件也按第 1 趟/第 2 趟给页号（4 页双面 → 1 3 / 4 2，第 2 趟逆序）",
+      _R[0][1][1] == "1 3" and _R[0][1][2] == "4 2",
+      f"{_R[0][1][1]} | {_R[0][1][2]}")
+check("★ 排队单面 3 页：第 2 趟 3 个 [空]（背面全空但仍要各走一遍纸）",
+      _R[1][1][2] == "[空] [空] [空]", _R[1][1][2])
+check("★ 右栏写明页数/份数（不只一个文件名）",
+      "4 页" in _R[0][1][3] and "3 页" in _R[1][1][3], f"{_R[0][1][3]} / {_R[1][1][3]}")
+check("★ 列表标题给出整叠汇总 + 左右栏各自的计数",
+      "1 单" not in _list_dlg._summary.text() and "2 单" in _list_dlg._summary.text()
+      and "2 单" in _list_dlg._left_group.title() and "2 个请求" in _list_dlg._right_group.title(),
+      f"{_list_dlg._summary.text()} / {_list_dlg._left_group.title()} / "
+      f"{_list_dlg._right_group.title()}")
+
+# 「我已取走」只对「第 2 趟无内容」的计划开放（整份单面文件才有内容全空）
+_list_dlg._tree_left.topLevelItem(1).child(0).setSelected(True)
+_list_dlg._on_left_selection()
+check("★ 选中「第 2 趟全空」的文件 → 「我已取走」可点",
+      _list_dlg._btn_take.isEnabled(), f"enabled={_list_dlg._btn_take.isEnabled()}")
+_list_dlg._tree_left.topLevelItem(0).child(0).setSelected(True)
+_list_dlg._tree_left.topLevelItem(1).child(0).setSelected(False)
+_list_dlg._on_left_selection()
+check("★ 选中「第 2 趟还要用」的文件 → 「我已取走」禁用（撤走必然整叠错位）",
+      not _list_dlg._btn_take.isEnabled())
+_list_dlg.close()
+
+# 空纸叠/空队列也要有明确占位文案（常驻窗不能是一片空白）
+_list_dlg2 = gui.StackQueueDialog()
+_list_dlg2.render(ds.DuplexStack(capacity=90), busy=False, wait_requests=[])
+check("★ 空列表给出占位文案（左『还没有攒进任何文件』/ 右『没有在等的文件』）",
+      "还没有攒进" in _list_dlg2._tree_left.topLevelItem(0).text(0)
+      and "没有在等的文件" in _list_dlg2._tree_right.topLevelItem(0).text(0),
+      f"{_list_dlg2._tree_left.topLevelItem(0).text(0)} / "
+      f"{_list_dlg2._tree_right.topLevelItem(0).text(0)}")
+_list_dlg2.close()
+
+
+# ============================================================
+# ⑨ 关闭攒批列表 / 关闭攒批模式：必须三选确认（2026-10-21 用户提问）
+# ============================================================
+# 用户口径：「如果攒批列表里还有没打第 2 趟的文件，手动点关闭攒批 / 关闭攒批列表会发生
+# 什么？应该弹确认窗口，确认关闭会导致相关订单全部失败。」
+# 旧行为两条都不对：关窗口只 hide（一句提示都没有，订单既不失败也看不见），
+# 关模式被「打印机正忙」直接堵死（连选择都没有）。
+# 现在的口径：三选 —— 保留（只收起/关模式，纸叠与订单都留着，绝不失败）/
+# 放弃整叠（这 N 单全部按失败收尾）/ 取消（什么都不做）。
+print("\n=== ⑨ 关闭列表 / 关闭模式：三选确认 ===")
+
+
+def _fake_stack(win_, tids=(801, 802)):
+    """直接造账本（不走真实打印）：两单已打第 1 趟、等第 2 趟，任务里有云端 task_id。"""
+    win_._stack.clear()
+    win_._stack_wait = []
+    win_._config.tabs["1"].jobs = []          # job 找不到 ⇒ 收尾只走"回报云端"那条路
+    ents = []
+    for i, tid in enumerate(tids, 1):
+        ents.append(ds.StackEntry(
+            seq=i, title=f"HN-{tid}", page_count=2, sheet_count=1, rotate=True,
+            pdf=f"e{i}.pdf", first="odd", state=ds.STATE_DONE,
+            file_plans=[{"label": f"{tid}.pdf", "pages": [1, 2], "duplex": True}],
+            tasks=[{"task_id": tid, "order_id": 800 + i, "owner_name": "测试成员",
+                    "is_admin_print": False, "copies": 1, "duplex": "on",
+                    "page_range": "", "page_count": 2, "display_name": f"{tid}.pdf"}]))
+    win_._stack.entries = ents
+    return ents
+
+
+_fake_stack(win2)
+_confirm_calls = []
+
+
+def _confirm_stub(answer):
+    def _f(purpose="关闭攒批列表"):
+        _confirm_calls.append(purpose)
+        return answer
+    return _f
+
+
+_orig_confirm = win2._confirm_stack_close
+
+# ① 有纸叠时点「关闭」→ 必须问（不能像旧写法那样直接 hide）
+win2._stack_list_user_closed = False
+_lst9 = _ready_list(win2)
+win2._show_stack_queue_dialog(_lst9)          # 先让它真的显示出来，才验得了"收起/不收起"
+win2._confirm_stack_close = _confirm_stub("")
+_confirm_calls.clear()
+_lst9._btn_close.click()
+check("★ 有未打第 2 趟的纸叠时点「关闭」→ 先弹三选确认（旧写法直接 hide）",
+      _confirm_calls == ["关闭攒批列表"], f"{_confirm_calls}")
+check("★ 选「取消」→ 窗口不收起、纸叠原样保留",
+      not _lst9.isHidden() and win2._stack.count == 2,
+      f"hidden={_lst9.isHidden()} count={win2._stack.count}")
+
+# ② 选「保留」→ 只收起窗口：订单**绝不能**被判失败
+_n_fail = len(win2._cloud_client.fail)
+win2._confirm_stack_close = _confirm_stub("keep")
+_lst9._btn_close.click()
+check("★ 选「保留」→ 窗口收起 + 纸叠/订单都留着 + 一个失败回报都不发",
+      _lst9.isHidden() and win2._stack.count == 2
+      and len(win2._cloud_client.fail) == _n_fail
+      and win2._stack_list_user_closed is True,
+      f"hidden={_lst9.isHidden()} count={win2._stack.count} "
+      f"fail={win2._cloud_client.fail[_n_fail:]}")
+check("★ 「保留」收起后，同步逻辑不会把窗口抢着弹回来（旧写法每次 sync 都 show）",
+      (win2._sync_stack_list_visible() or True) and _lst9.isHidden(),
+      f"hidden={_lst9.isHidden()}")
+win2._on_stack_button()
+check("★ 点底部「🖐 攒批」→ 重新打开并清掉「操作员已收起」标记",
+      not _lst9.isHidden() and win2._stack_list_user_closed is False,
+      f"hidden={_lst9.isHidden()} closed={win2._stack_list_user_closed}")
+
+# ③ 选「放弃整叠」→ 这 N 单全部按失败收尾（用户口径：确认关闭 = 相关订单全部失败）
+_fake_stack(win2)
+_n_fail = len(win2._cloud_client.fail)
+_lst9 = _ready_list(win2)
+win2._show_stack_queue_dialog(_lst9)
+win2._confirm_stack_close = _confirm_stub("abandon")
+_lst9._btn_close.click()
+_failed = {t for t, _m in win2._cloud_client.fail[_n_fail:]}
+check("★ 选「放弃整叠」→ 两单都按失败回报云端 + 账本清空 + 窗口收起",
+      _failed == {801, 802} and win2._stack.entries == [] and _lst9.isHidden(),
+      f"failed={sorted(_failed)} count={win2._stack.count} hidden={_lst9.isHidden()}")
+
+# ④ 空纸叠：关闭不该再弹框（省一次无意义的确认）
+_fake_stack(win2)
+win2._stack.clear()
+_lst9 = _ready_list(win2)
+win2._show_stack_queue_dialog(_lst9)
+_confirm_calls.clear()
+win2._confirm_stack_close = _confirm_stub("")
+_lst9._btn_close.click()
+check("★ 没有纸叠时点「关闭」→ 不问、直接收起", _confirm_calls == [] and _lst9.isHidden(),
+      f"calls={_confirm_calls} hidden={_lst9.isHidden()}")
+
+# ⑤ 关闭攒批模式（勾选框）：有纸叠时同样三选，且不再被「打印机正忙」堵死
+_prep(win2)
+_fake_stack(win2)
+win2._config.duplex_stack_mode = True
+win2._stack_list_user_closed = False
+win2._confirm_stack_close = _confirm_stub("")
+win2._on_stack_mode_toggled(False)
+check("★ 关闭攒批模式选「取消」→ 勾选回滚、模式仍开、纸叠保留",
+      win2._config.duplex_stack_mode is True and win2._stack.count == 2
+      and win2._chk_stack_mode.isChecked() is True,
+      f"mode={win2._config.duplex_stack_mode} count={win2._stack.count}")
+
+_n_fail = len(win2._cloud_client.fail)
+_prep(win2)
+win2._confirm_stack_close = _confirm_stub("keep")
+win2._on_stack_mode_toggled(False)
+check("★ 关闭攒批模式选「保留」→ 模式关掉但纸叠保留、订单不失败",
+      win2._config.duplex_stack_mode is False and win2._stack.count == 2
+      and len(win2._cloud_client.fail) == _n_fail,
+      f"mode={win2._config.duplex_stack_mode} count={win2._stack.count} "
+      f"fail={win2._cloud_client.fail[_n_fail:]}")
+check("★ 模式关掉后列表仍在场（纸叠还没打第 2 趟，不能让它离开视线）",
+      not win2._stack_queue_dialog.isHidden(),
+      f"hidden={win2._stack_queue_dialog.isHidden()}")
+
+_prep(win2)
+_fake_stack(win2)
+win2._config.duplex_stack_mode = True
+_n_fail = len(win2._cloud_client.fail)
+win2._confirm_stack_close = _confirm_stub("abandon")
+_confirm_calls.clear()
+win2._on_stack_mode_toggled(False)
+_failed = {t for t, _m in win2._cloud_client.fail[_n_fail:]}
+check("★ 关闭攒批模式选「放弃整叠」→ 模式关掉 + 这 N 单全部按失败收尾",
+      win2._config.duplex_stack_mode is False and win2._stack.entries == []
+      and _failed == {801, 802},
+      f"mode={win2._config.duplex_stack_mode} failed={sorted(_failed)}")
+
+# ⑥ 正在打印时关闭模式仍硬拦（那是真忙，不是"有一叠在等翻纸"）
+
+
+class _RunningWorker2:
+    def isRunning(self):
+        return True
+
+
+_prep(win2)
+_fake_stack(win2)
+win2._config.duplex_stack_mode = True
+win2._worker = _RunningWorker2()
+_confirm_calls.clear()
+win2._confirm_stack_close = _confirm_stub("keep")
+_gui_i = gui.QMessageBox.information
+gui.QMessageBox.information = staticmethod(lambda *a, **k: gui.QMessageBox.Ok)
+win2._on_stack_mode_toggled(False)
+gui.QMessageBox.information = _gui_i
+win2._worker = None
+check("★ 正在打印时关闭攒批模式 → 仍然硬拦（不弹三选、不问纸叠）",
+      _confirm_calls == [] and win2._config.duplex_stack_mode is True
+      and win2._stack.count == 2,
+      f"calls={_confirm_calls} mode={win2._config.duplex_stack_mode}")
+win2._confirm_stack_close = _orig_confirm
+win2._stack.clear()
+win2._stack_wait = []
+win2._stack_list_user_closed = False
+
+# 静态接线：关闭按钮/窗口 × 都走 close_requested；主窗口三选框存在且默认是安全项
+G9 = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+check("★ 列表「关闭」按钮发 close_requested（不再自己 hide）",
+      "self._btn_close.clicked.connect(lambda *_: self.close_requested.emit())" in G9)
+check("★ 窗口 × / Esc 也走 close_requested（closeEvent 里 emit + ignore）",
+      "def closeEvent(self, ev):" in G9 and "self.close_requested.emit()" in G9
+      and "ev.ignore()" in G9)
+check("★ 主窗口接了 close_requested（不接就是「点了没反应」）",
+      "dlg.close_requested.connect(self._on_stack_list_close_requested)" in G9)
+_check_src = G9[G9.index("def _confirm_stack_close"):G9.index("def _on_stack_list_close_requested")]
+check("★ 三选确认框：保留 / 放弃整叠 / 取消 三颗键，默认是安全的「保留」",
+      "保留（纸叠与订单都留着）" in _check_src
+      and "单全部按失败收尾" in _check_src and "取消（保持原样）" in _check_src
+      and "box.setDefaultButton(b_keep)" in _check_src)
+check("★ 关模式时跳过「出纸槽里有纸」那一条忙判定（否则永远走不到确认框）",
+      "self._stack_busy_reason(skip_entries=True)" in G9)
+_T_SRC = G9[G9.index("def _sync_stack_list_visible"):G9.index("def _on_stack_taken_toggle")]
+check("★ 列表可见性：有未打完的纸叠即使模式关掉也在场 + 尊重「操作员已收起」",
+      "has_entries" in _T_SRC and "_stack_list_user_closed" in _T_SRC)
 
 
 # ============================================================
@@ -804,6 +1191,22 @@ check("worker：攒批第 1 趟有异常兜底（异常也必须报 entry_done�
 check("主窗口：闸门在「忙」判断之前（排队不算启动失败）",
       G.index("gate = self._stack_gate(flat_jobs, tab_key)") < G.index(
           "已有打印任务正在进行，不能重复启动"))
+# 2026-10-20（用户要求）：攒批不再复用「手动双面」窗 —— 第 1 趟不弹窗/不计时，
+# 第 2 趟与放弃整叠都从攒批列表发起（数纸确认 → 打整叠）。
+check("★ 双面窗里不许再出现攒批状态/信号（它只管单任务）",
+      "stack_flush_requested" not in G and "stack_abandon_requested" not in G
+      and "def announce_stack" not in G and "def set_stack_ready" not in G
+      and "def stack_finished" not in G and 'getattr(dlg, "_mode", "") == "stack_ready"' not in G)
+check("★ 攒批列表三个动作直连主窗口（▶ 开始第 2 趟 / ⏭ 放弃整叠 / 关闭先确认）",
+      "dlg.start_second_requested.connect(self._on_stack_flush)" in G
+      and "dlg.abandon_requested.connect(lambda *_: self._on_stack_abandon())" in G
+      and "dlg.close_requested.connect(self._on_stack_list_close_requested)" in G)
+check("★ 攒批第 1 趟播报不碰双面窗（_on_stack_announce 只记日志 + 刷列表）",
+      "_ensure_duplex_dialog" not in G[G.index("def _on_stack_announce"):
+                                      G.index("def _stack_present_sheets")])
+check("★ 第 2 趟没启动的每一条提前返回都刷新列表（按钮不停在假的「打印中」）",
+      "_stack_ready_state" not in G
+      and G.count("self._refresh_stack_queue()") >= 6)
 # 2026-10-18 设计改动：收尾仍是**唯一落点**（`_on_stack_flush_done`），但"第 2 趟无内容"这一态
 # 需要**逐单**按成品/异常拆（否则整叠只剩第 1 趟失败的单时会把半成品报成功）。
 # 所以断言从"字面上只有 2 次调用"换成**意图判据**：除收尾落点本身外，任何收尾调用都必须由

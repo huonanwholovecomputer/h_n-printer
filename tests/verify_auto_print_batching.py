@@ -196,6 +196,63 @@ for w in (win, win3, win4):
     except Exception:
         pass
 
+print("\n=== 7. 2026-10-20 用户要求：无障碍打印遇「需人工翻纸」→ 直接开始，不挂起等人点 ===")
+# 旧行为（2026-10-18）：本机不支持自动双面 + 含双面文件 → 挂起、亮 ⏸、等操作员点「开始打印」。
+# 新行为：无障碍 = 顾客要求无人值守 ⇒ 直接 accept + 打第 1 趟（第 2 趟仍弹翻纸窗等确认）。
+# 为什么现在安全：作业进行中每 60 秒发 print_keepalive 刷新 locked_at，
+# 后端 3 分钟反馈窗口不会把这种长作业误判失败。
+from printer_config import PrinterProfile  # noqa: E402
+
+win6 = new_win()
+win6._printer_profile = lambda: PrinterProfile(
+    auto_duplex=False, capability_source="manual", manual_duplex=True)
+# 用**真实**判据（别用 new_win 里那个恒 False 的桩）
+win6._manual_flip_required_for = gui.MainWindow._manual_flip_required_for.__get__(win6)
+_holds = []
+_orig_hold = gui.MainWindow._hold_for_manual_duplex.__get__(win6)
+
+
+def _spy_hold(jobs, tab_key, reason):
+    _holds.append((tab_key, reason))
+    return _orig_hold(jobs, tab_key, reason)
+
+
+win6._hold_for_manual_duplex = _spy_hold
+_starts = []
+
+
+def _add_duplex(tasks, switch_tab=True):
+    tab = win6._config.tabs.setdefault("1", gui.TabSettings())
+    for t in tasks:
+        tab.jobs.append(gui.PrintJob(file_path=os.path.join(_SANDBOX, t.file_name),
+                                     task_id=t.task_id, order_id=t.order_id,
+                                     page_count=5, duplex="on"))
+    return "1"
+
+
+win6._add_cloud_tasks_to_new_tab = _add_duplex
+
+
+def _start(jobs, **kw):
+    _starts.append([j.task_id for j in jobs])
+    return True
+
+
+win6._start_print_worker = _start
+win6._enqueue_auto_print_task(FakeTask(5011, 8001))
+win6._process_auto_print_order(8001)
+check("★ 无障碍 + 手动双面机 + 双面文件 → **不挂起**（_hold_for_manual_duplex 0 次）",
+      _holds == [], f"{_holds}")
+check("★ 无障碍 + 手动双面机 + 双面文件 → 直接 accept 并开始打印第 1 趟",
+      win6._cloud_client.accepted == [8001] and _starts == [[5011]],
+      f"accepted={win6._cloud_client.accepted} starts={_starts}")
+check("★ 标签页没有被标记「待人工翻纸」（不该亮 ⏸ 等人点）",
+      getattr(win6._config.tabs["1"], "manual_duplex_pending", False) is False,
+      f"{getattr(win6._config.tabs['1'], 'manual_duplex_pending', None)}")
+check("★ 日志如实说明「直接开始第 1 趟、第 2 趟仍等翻纸确认」",
+      any("直接开始第 1 趟" in m for m in win6._log_text.toPlainText().splitlines()),
+      win6._log_text.toPlainText()[-160:])
+
 print("\n" + ("全部通过" if ok_all else "存在失败项"))
 shutil.rmtree(_SANDBOX, ignore_errors=True)
 sys.exit(0 if ok_all else 1)

@@ -972,15 +972,109 @@ check("★ 颜色阈值：在预估内(+30s 宽容带)绿 / 超出 30 秒黄 / �
       and gui.ManualDuplexDialog.pass1_color(74.0, 43.0) == gui.ManualDuplexDialog.PASS1_YELLOW
       and gui.ManualDuplexDialog.pass1_color(103.0, 43.0) == gui.ManualDuplexDialog.PASS1_YELLOW
       and gui.ManualDuplexDialog.pass1_color(104.0, 43.0) == gui.ManualDuplexDialog.PASS1_RED)
+
+# ── ★ 翻纸放行闸门（2026-10-19 现场 bug）──────────────────────────────────────
+# 主机型打印机只回报"数据送进端口"、不回报"纸打完"：换原生 1:1 渲染策略后第 1 趟的
+# "完成回报"从 60~70 秒塌到 1~2 秒（16 张纸 2.1 秒），纸还在出窗口就说打完了。
+# 用户口径：按钮按**预估**放行 —— 等到"预估结束前 5 秒"；预估 <10 秒不做这个特判。
+# 2026-10-20 用户口径：改成「预估 × 比例」放行（纸越多误差越大，固定提前 5 秒不合适）
+check("★ 闸门时刻 = 预估 × 50%（默认）；可叠加人工翻页准备时间；没预估/算出<1 秒 → 0",
+      gui.ManualDuplexDialog.flip_gate_at(43.0) == 21.5
+      and gui.ManualDuplexDialog.flip_gate_at(43.0, 0.5, 20.0) == 41.5
+      and gui.ManualDuplexDialog.flip_gate_at(100.0, 1.0, 0.0) == 100.0
+      and gui.ManualDuplexDialog.flip_gate_at(1.0) == 0.0
+      and gui.ManualDuplexDialog.flip_gate_at(0.0) == 0.0
+      and gui.ManualDuplexDialog.flip_gate_at(None) == 0.0,
+      f"{gui.ManualDuplexDialog.flip_gate_at(43.0)} / {gui.ManualDuplexDialog.flip_gate_at(1.0)}")
+# 比例来自档案（「帮助 → 打印速度…」可调）：announce 传进来后，闸门按它算
+_dlg_ratio = gui.ManualDuplexDialog()
+_dlg_ratio.announce("按比例放行", sheets=20, estimate_sec=100.0, gate_ratio=0.8,
+                    gate_extra=10.0)
+_dlg_ratio.set_flippable("翻纸说明", 600)
+check("★ 档案里的放行比例/翻页准备时间真的进入闸门（100 × 80% + 10 = 90 秒）",
+      _dlg_ratio._mode == "flip_gate" and _dlg_ratio._flip_gate_at == 90.0
+      and "80%" in _dlg_ratio._countdown.text(),
+      f"{_dlg_ratio._flip_gate_at} | {_dlg_ratio._countdown.text()[:60]}")
+
+_dlg_noest = gui.ManualDuplexDialog()
+_dlg_noest.announce("没样本的机型", sheets=3, estimate_sec=0.0)
+_dlg_noest.set_flippable("翻纸说明", 600)
+check("★ 没有预估（老档案/没速度样本）→ 不设闸门，一回报就能翻纸（零回归）",
+      _dlg_noest._mode == "flip" and _dlg_noest._btn_go.isEnabled()
+      and _dlg_noest._pass1_done and _dlg_noest.is_early_signal(0.1) is False,
+      f"{_dlg_noest._mode}")
+
+_dlg_short = gui.ManualDuplexDialog()
+_dlg_short.announce("短活儿", sheets=2, estimate_sec=9.0)
+_dlg_short.set_flippable("翻纸说明", 600)
+check("★ 短活儿（预估 9 秒 → 闸门 4.5 秒）仍按比例放行；预估 <2 秒干脆不设闸门",
+      _dlg_short._mode == "flip_gate" or _dlg_short._mode == "flip")
+_dlg_tiny = gui.ManualDuplexDialog()
+_dlg_tiny.announce("极小活儿", sheets=1, estimate_sec=1.0)
+_dlg_tiny.set_flippable("翻纸说明", 600)
+check("★ 预估 1 秒 → 闸门算出来 0.5 秒 < 1 秒 ⇒ 不设闸门（打完即翻）",
+      _dlg_tiny._mode == "flip" and _dlg_tiny._btn_go.isEnabled())
+
+# 早回报：界面时钟≈0 秒，闸门在 38 秒 → **按钮不放行**，计时继续走
 _dlg9.set_flippable("翻纸说明", 600)
-check("★ 第 1 趟出纸 → 冻结成「用时」（0 秒也是合法结果，不能拿 0.0 当「未完成」）",
-      _dlg9._pass1_done and "用时" in _dlg9._pass1.text() and not _dlg9._pass1_timer.isActive(),
+check("★ 早回报（预估 43s）→「继续打第 2 趟」**不放行**，窗口明说还在出纸",
+      _dlg9._mode == "flip_gate" and _dlg9._btn_go.isEnabled() is False
+      and "还在出纸" in _dlg9._status.text() and "还有" in _dlg9._countdown.text()
+      and "还要等" in _dlg9._btn_go.text(),
+      f"{_dlg9._mode} | {_dlg9._countdown.text()} | {_dlg9._btn_go.text()}")
+check("★ 闸门期间**不拿假回报冻结**计时（真实用时还在走：_pass1_done 仍为 False）",
+      not _dlg9._pass1_done and _dlg9._pass1_timer.isActive() and "已用" in _dlg9._pass1.text(),
       _dlg9._pass1.text())
+check("★ 闸门期间不扣翻纸确认倒计时（那 10 分钟从「真的能翻纸」那一刻才算）",
+      _dlg9._left == 0 and "还有" in _dlg9._countdown.text()
+      and "超时按跳过处理" not in _dlg9._countdown.text(),
+      f"_left={_dlg9._left} | {_dlg9._countdown.text()}")
+check("闸门期间提示里保留预估依据 + 说明为什么不采信打印机回报",
+      "基于最近 2 次实测" in _dlg9._pass1_hint.text()
+      and "早于实机出纸" in _dlg9._pass1_hint.text(), _dlg9._pass1_hint.text())
+# 到点：把"实时已用"换成 39 秒（真等 38 秒没必要，逻辑与真时钟同一条路径）
+_elapsed9_orig = _dlg9._elapsed_sec
+_dlg9._elapsed_sec = lambda: 39.0
+_dlg9._tick()
+check("★ 到闸门时刻 → 放行：按钮启用 + 状态切「请翻纸」+ 计时冻结成「用时」",
+      _dlg9._mode == "flip" and _dlg9._btn_go.isEnabled() and _dlg9._pass1_done
+      and "请翻纸" in _dlg9._status.text() and "用时 00:39" in _dlg9._pass1.text(),
+      f"{_dlg9._mode} | {_dlg9._pass1.text()}")
+check("★ 放行后翻纸确认倒计时才开始（两个计时器互不干扰）",
+      _dlg9._left == 599 and "超时按跳过处理" in _dlg9._countdown.text(),
+      f"_left={_dlg9._left} | {_dlg9._countdown.text()}")
 _frozen_text = _dlg9._pass1.text()
 _dlg9._pass1_tick()
 check("冻结后再 tick 也不会继续走", _dlg9._pass1.text() == _frozen_text)
-check("翻纸确认倒计时仍在（两个计时器互不干扰）", "还有" in _dlg9._countdown.text(),
-      _dlg9._countdown.text())
+_dlg9._elapsed_sec = _elapsed9_orig
+
+_dlg_huge = gui.ManualDuplexDialog()
+_dlg_huge.announce("超大批次", sheets=400, estimate_sec=1200.0)
+_dlg_huge.set_flippable("翻纸说明", 600)
+check("★ 超大批次：闸门被钳在翻纸确认超时之内（worker 只等 600+30 秒；不钳就会先超时"
+      "按半成品判失败、纸白打）",
+      _dlg_huge._mode == "flip_gate" and _dlg_huge._flip_gate_at == 600.0,
+      f"{_dlg_huge._flip_gate_at}")
+
+# 闸门期间关窗 / 点跳过 = 跳过本任务（绝不能把第 2 趟放过去）
+_dlg_gate = gui.ManualDuplexDialog()
+_gate_ev = []
+_dlg_gate.skip_requested.connect(lambda: _gate_ev.append("skip"))
+_dlg_gate.announce("闸门期间关窗", sheets=16, estimate_sec=43.0)
+_dlg_gate.set_flippable("翻纸说明", 600)
+_dlg_gate.close()
+check("★ 闸门期间关窗 = 跳过（不会「关一下窗就把第 2 趟打了」）",
+      _dlg_gate._mode == "skipped" and _gate_ev == ["skip"], f"{_dlg_gate._mode} {_gate_ev}")
+_dlg_gate_click = gui.ManualDuplexDialog()
+_gate_click = []
+_dlg_gate_click.continue_requested.connect(lambda: _gate_click.append("go"))
+_dlg_gate_click.announce("闸门期间硬点继续", sheets=16, estimate_sec=43.0)
+_dlg_gate_click.set_flippable("翻纸说明", 600)
+_dlg_gate_click._on_go()          # 按钮虽然禁用，仍要挡住程序化/快捷键触发
+check("★ 闸门期间就算硬调 _on_go 也不放行（按钮禁用不是唯一防线）",
+      _dlg_gate_click._mode == "flip_gate" and _gate_click == [],
+      f"{_dlg_gate_click._mode} {_gate_click}")
+
 _dlg9.announce("第二批", sheets=3, estimate_sec=18.5)
 check("新批次复位重新计时",
       not _dlg9._pass1_done and "已用" in _dlg9._pass1.text() and _dlg9._pass1_timer.isActive())
@@ -994,9 +1088,12 @@ _dlg9.freeze_pass1(None)
 check("没有权威值时退回界面时钟兜底（照样能冻结）",
       _dlg9._pass1_done and _dlg9._pass1_final >= 0.0)
 _dlg9.announce("第四批", sheets=3, estimate_sec=18.5)
+_dlg9.freeze_pass1(30.0)          # 一笔不早于闸门（13.5s）的可信实测
 _dlg9.set_flippable("翻纸说明", 600)
-check("先冻结过就不会被后来的 set_flippable 覆盖（幂等）",
-      _dlg9._pass1_done and not _dlg9._pass1_timer.isActive())
+check("★ 手上已有可信实测时直接放行（闸门只挡提前回报，不挡真打完的）",
+      _dlg9._pass1_done and _dlg9._mode == "flip" and _dlg9._btn_go.isEnabled()
+      and not _dlg9._pass1_timer.isActive() and abs(_dlg9._pass1_final - 30.0) < 0.01,
+      f"{_dlg9._mode} {_dlg9._pass1_final}")
 _dlg9.finish("批次结束")
 check("收尾把计时器停掉", not _dlg9._pass1_timer.isActive())
 
@@ -1052,6 +1149,67 @@ check("异常样本（0.1 秒）被丢弃，档案里只有 2 条", len(_reloade
 check("学习结果有日志反馈", any("速度样本" in m for m in _lw.logs))
 check("★ 另一种打印机（不同队列名）不会串到本机档案",
       gui.PrinterConfig.load(_cfg9).get_profile("另一台打印机").speed_samples == [])
+
+# ── ⑨d 提前回报不采信（否则预估被带塌，闸门自己失效）──────────────────────────
+print("\n=== ⑨d 提前回报（主机型打印机只回报「开始打印」）不采信 ===")
+_cfg9d = os.path.join(_SANDBOX, "early_cfg.json")
+_early_cfg = gui.PrinterConfig()
+_early_cfg.printer_name = "Fake Print 早回报"
+_early_cfg.save(_cfg9d)
+_dlg_early = gui.ManualDuplexDialog()
+_dlg_early.announce("早回报", sheets=16, estimate_sec=43.0)
+_lw_early = _LearnWin(_early_cfg, _cfg9d, dialog=_dlg_early)
+check("★ 16 张 2.1 秒（预估 43s）被判为提前回报；不早于闸门（38s）的不算",
+      _dlg_early.is_early_signal(2.1) is True and _dlg_early.is_early_signal(38.0) is False
+      and _dlg_early.is_early_signal(0.0) is True)
+_before9d = list(gui.PrinterConfig.load(_cfg9d).get_profile("Fake Print 早回报").speed_samples)
+gui.MainWindow._on_duplex_speed_sample(_lw_early, 16, 2.1)
+_after9d = list(gui.PrinterConfig.load(_cfg9d).get_profile("Fake Print 早回报").speed_samples)
+check("★ 提前回报**不写进速度样本**（写进去就反向拟合：16 张比 3 张还快 ⇒ 预估塌进 10 秒、"
+      "闸门自己失效 —— 2026-10-18~19 现场就是这么塌的）",
+      _after9d == _before9d, f"{_before9d} → {_after9d}")
+check("★ 提前回报也**不冻结**窗口计时（真实用时还在走；按钮按预估放行）",
+      not _dlg_early._pass1_done and _dlg_early._pass1_timer.isActive()
+      and "已用" in _dlg_early._pass1.text(), _dlg_early._pass1.text())
+check("日志说清为什么弃用这笔实测", any("不可信" in m for m in _lw_early.logs),
+      f"{_lw_early.logs}")
+# 同一台机器真打完一笔（不早于闸门）→ 照旧入库（别把正常学习一起关掉）
+gui.MainWindow._on_duplex_speed_sample(_lw_early, 16, 42.0)
+_grown9d = gui.PrinterConfig.load(_cfg9d).get_profile("Fake Print 早回报").speed_samples
+check("★ 不早于闸门的实测照旧入库（没有把正常学习一起关掉）",
+      len(_grown9d) == len(_before9d) + 1 and _grown9d[-1][0] == 16, f"{_grown9d}")
+
+# 测速校准时这台机器同样"提前回报"：数值低于物理下限 → 不写档案、也**不许谎报成功**
+_cfg9e = os.path.join(_SANDBOX, "cal_cfg.json")
+_cal_cfg = gui.PrinterConfig()
+_cal_cfg.printer_name = "Fake Print 校准"
+_cal_cfg.save(_cfg9e)
+_lw_cal = _LearnWin(_cal_cfg, _cfg9e)
+_lw_cal._speed_cal_worker = object()
+_calls9 = []
+_orig_warn, _orig_info = gui.QMessageBox.warning, gui.QMessageBox.information
+try:
+    gui.QMessageBox.warning = staticmethod(
+        lambda *a, **k: _calls9.append(("warn", a[1] if len(a) > 1 else "")) or 0)
+    gui.QMessageBox.information = staticmethod(
+        lambda *a, **k: _calls9.append(("info", a[1] if len(a) > 1 else "")) or 0)
+    _before9e = list(gui.PrinterConfig.load(_cfg9e).get_profile("Fake Print 校准").speed_samples)
+    gui.MainWindow._on_speed_calibration_done(
+        _lw_cal, True, "标定完成：1 张 1.1s / 10 张 2.4s", [[1, 1.1], [10, 2.4]])
+    check("★ 测速数值全低于物理下限 → 一条不写档案，且**不谎报**「已写进档案」",
+          gui.PrinterConfig.load(_cfg9e).get_profile("Fake Print 校准").speed_samples == _before9e
+          and _calls9 and _calls9[-1][0] == "warn"
+          and any("不可信" in m for m in _lw_cal.logs),
+          f"{_calls9} | {_lw_cal.logs}")
+    gui.MainWindow._on_speed_calibration_done(
+        _lw_cal, True, "标定完成：1 张 11.5s / 10 张 43.0s", [[1, 11.5], [10, 43.0]])
+    _grown9e = gui.PrinterConfig.load(_cfg9e).get_profile("Fake Print 校准").speed_samples
+    check("正常标定照旧两点入库 + 提示成功",
+          len(_grown9e) == len(_before9e) + 2 and [s[0] for s in _grown9e[-2:]] == [1, 10]
+          and _calls9[-1][0] == "info",
+          f"{_calls9} | {_grown9e}")
+finally:
+    gui.QMessageBox.warning, gui.QMessageBox.information = _orig_warn, _orig_info
 
 # ── 测速校准线程（打 1 张 + 10 张；桩掉真实打印函数，不发一个任务到打印机）──
 print("\n=== ⑨c 测速校准（两点标定）===")
@@ -1112,8 +1270,13 @@ check("★ 常驻窗：置顶 + 抢焦点 + 任务栏闪烁",
       "dlg.raise_()" in src and "dlg.activateWindow()" in src
       and "QApplication.alert(self, 0)" in src
       and "setWindowFlag(Qt.WindowStaysOnTopHint, True)" in src)
-check("★ 无人值守两处（无障碍 + 预约）都挂了手动双面拦截",
-      src.count("self._hold_for_manual_duplex(") == 2)
+check("★ 无人值守只剩「预约到点」还挂起等人（无障碍 2026-10-20 已改为直接开始）",
+      src.count("self._hold_for_manual_duplex(") == 1)
+check("★ 无障碍打印遇「需人工翻纸」→ **直接开始**（方法体里不再调 _hold_for_manual_duplex）",
+      "_hold_for_manual_duplex" not in
+      src.split("def _process_auto_print_order", 1)[1].split("def ", 1)[0])
+check("★ 无障碍直接开始的理由写进源码（print_keepalive 兜住 3 分钟反馈窗口）",
+      "print_keepalive" in src.split("def _process_auto_print_order", 1)[1].split("def ", 1)[0])
 check("编辑面板按档案标注双面选项 + 标签页 ⏸ 状态徽标（固定槽位，不挪动 −/＋ 按钮）",
       'want = "双面（手动翻纸）" if manual else "双面打印"' in src
       and 'icon, tip = "⏸", TAB_FLIP_HINT' in src
@@ -1122,6 +1285,12 @@ check("编辑面板按档案标注双面选项 + 标签页 ⏸ 状态徽标（�
 check("★ 出纸等待已收紧（队列排空 + 短余量，判断权交给操作员数张数）",
       "margin_per_page: float = 1.5" in open(os.path.join(LOCAL_TOOL, "pdf_printer.py"),
                                              encoding="utf-8").read())
+check("★ 翻纸按钮按预估比例放行（早回报既不冻结计时、也不写速度样本）—— 静态接线",
+      "def flip_gate_at(" in src and "FLIP_GATE_RATIO = 0.5" in src
+      and "FLIP_GATE_MIN_SEC = 1.0" in src
+      and "gate_ratio=prof.gate_ratio" in src
+      and "dlg.is_early_signal(seconds)" in src
+      and "self._mode = \"flip_gate\"" in src)
 
 print("\n" + "=" * 56)
 print("手动双面 GUI 集成验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

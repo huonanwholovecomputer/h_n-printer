@@ -77,6 +77,7 @@ const STORE = {
 const json = (res, o) => { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(o)); };
 
 const posted = [];       // /api/proxy/admin/order_status 收到的体
+const postedType = [];   // /api/proxy/admin/order_type 收到的体（v7.1）
 const otherApi = [];     // 其它 /api/** 调用（诊断用）
 /* B5 变异自证用：把产品 HTML 在**内存里**改成「守卫退回旧版」再喂给浏览器（绝不落盘）。 */
 let htmlOverride = null;
@@ -100,6 +101,19 @@ const server = http.createServer((req, res) => {
         }
         return json(res, { success: true, message: '订单状态已订正', order_id: parsed.order_id,
                            status: parsed.status, previous_status: 'sent', files_updated: 1 });
+      });
+      return;
+    }
+    if (p === '/api/proxy/admin/order_type') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = { _raw: body }; }
+        postedType.push(parsed);
+        return json(res, { success: true, message: '订单类型已订正', order_id: parsed.order_id,
+                           order_type: parsed.order_type, previous_order_type: 'receive',
+                           is_admin_print: parsed.order_type === 'self' ? 1 : 0 });
       });
       return;
     }
@@ -173,8 +187,11 @@ try {
     locked: window.unlocked.orderstatus !== true,
     lockIcon: (document.querySelector('.order-table thead th:nth-child(5) .st-lock') || {}).textContent || '',
     rows: document.querySelectorAll('tr.order-row').length,
-    edits: document.querySelectorAll('tr.order-row .st-edit').length,
-    carets: document.querySelectorAll('tr.order-row .st-caret').length,
+    edits: document.querySelectorAll('tr.order-row td:nth-child(5) .st-edit').length,
+    carets: document.querySelectorAll('tr.order-row td:nth-child(5) .st-caret').length,
+    typeEdits: document.querySelectorAll('tr.order-row td:nth-child(10) .st-edit').length,
+    typeCarets: document.querySelectorAll('tr.order-row td:nth-child(10) .st-caret').length,
+    typeMenu: !!document.getElementById('tyMenu'),
     menu: !!document.getElementById('stMenu'),
     toasts: [...document.querySelectorAll('#toastWrap .toast')].map((t) => t.textContent),
     statuses: (window._cloudData.orders || []).map((o) => o.status),
@@ -186,6 +203,8 @@ try {
   chk('A1 默认锁定：unlocked.orderstatus=false、🔒、0 个 .st-edit / 0 个 .st-caret',
     s.locked && s.lockIcon.trim() === '🔒' && s.edits === 0 && s.carets === 0 && s.rows === 3,
     JSON.stringify(s));
+  chk('A1b 锁定态类型列同样没有入口（两列共用 unlocked.orderstatus）',
+    s.typeEdits === 0 && s.typeCarets === 0, `typeEdits=${s.typeEdits}`);
 
   // A2 ★ 锁定态控制台直接调用 applyOrderStatus → 函数自身守卫必须拦下（不发请求）
   let n0 = posted.length;
@@ -206,6 +225,21 @@ try {
     `menu=${s.menu} toasts=${JSON.stringify(s.toasts)}`);
   if (s.menu) findings.push('锁定态 openOrderStatusMenu 仍能弹出菜单（守卫失效）');
 
+  // A3b ★ 锁定态控制台直接调用 applyOrderType → 必须被函数自身守卫拦下
+  let nT0 = postedType.length;
+  await page.evaluate(() => applyOrderType(700001, 'self'));
+  await page.waitForTimeout(400);
+  s = await snap();
+  chk('A3b 锁定态控制台 applyOrderType(700001,"self") → 不发任何 POST，标签不变',
+    postedType.length === nT0 && s.toasts.some((t) => t.includes('🔒')),
+    `postedType=${postedType.length - nT0} toasts=${JSON.stringify(s.toasts)}`);
+  // A3c ★ 锁定态 openOrderTypeMenu → 不创建 #tyMenu
+  await page.evaluate(() => openOrderTypeMenu({ stopPropagation() {}, currentTarget: null }, 700001));
+  await page.waitForTimeout(300);
+  s = await snap();
+  chk('A3c 锁定态控制台 openOrderTypeMenu(...) → 不创建 #tyMenu',
+    !s.typeMenu, `typeMenu=${s.typeMenu}`);
+
   // A4 正常解锁（真实密码流程，默认 123456）
   await page.click('.order-table thead th:nth-child(5) .st-lock');
   await page.waitForSelector('#modalRoot .modal-card', { timeout: 5000 });
@@ -215,6 +249,8 @@ try {
   s = await snap();
   chk('A4 解锁后：🔓、每行 .st-edit/.st-caret 各 3 个', !s.locked && s.edits === 3 && s.carets === 3,
     JSON.stringify([s.locked, s.edits, s.carets]));
+  chk('A4b 同一把锁：解锁状态列后类型列每行也各 3 个入口（不需要第二个密码）',
+    s.typeEdits === 3 && s.typeCarets === 3, JSON.stringify([s.typeEdits, s.typeCarets]));
 
   // A5 解锁态：非白名单状态 → 函数自身必须拦（不发请求）
   n0 = posted.length;
@@ -225,6 +261,22 @@ try {
     posted.length === n0 && s.toasts.some((t) => t.includes('不允许')),
     `posted=${posted.length - n0} toasts=${JSON.stringify(s.toasts)}`);
   if (posted.length !== n0) findings.push('非白名单状态仍被前端发出（白名单守卫失效）');
+
+  // A5b ★ 解锁态但类型非白名单（auto）→ 不发 POST
+  nT0 = postedType.length;
+  await page.evaluate(() => applyOrderType(700001, 'auto'));
+  await page.waitForTimeout(400);
+  s = await snap();
+  chk('A5b 解锁态但类型非白名单（auto）→ 不发 POST、提示「不允许改为该类型」',
+    postedType.length === nT0 && s.toasts.some((t) => t.includes('不允许')),
+    `postedType=${postedType.length - nT0} toasts=${JSON.stringify(s.toasts)}`);
+  // A5c ★ 不存在的订单 id → 不发 POST
+  nT0 = postedType.length;
+  await page.evaluate(() => applyOrderType(424242, 'self'));
+  await page.waitForTimeout(400);
+  s = await snap();
+  chk('A5c 类型订正：不在当前列表的 order_id → 不发 POST',
+    postedType.length === nT0, `postedType=${postedType.length - nT0}`);
 
   // A6 连调两次（双击等价）→ 只允许 1 个请求，且本地状态正确落地
   n0 = posted.length;
@@ -255,6 +307,8 @@ try {
   chk('A8 重新锁定（🔒）后控制台调用 → 不发 POST、箭头已收起',
     posted.length === n0 && s.locked && s.edits === 0 && s.carets === 0,
     `posted=${posted.length - n0} locked=${s.locked} edits=${s.edits} carets=${s.carets}`);
+  chk('A8b 重新锁定后类型列入口也一起收起（一把锁管两列）',
+    s.typeEdits === 0 && s.typeCarets === 0, `typeEdits=${s.typeEdits}`);
   await page.close();
 
   /* ══════════════ 本地模式：入口不渲染 + 控制台跨库写入 ══════════════ */
@@ -264,8 +318,9 @@ try {
     mode: window.FINANCE_MODE,
     lockHTML: (typeof _orderStatusLockHTML === 'function') ? _orderStatusLockHTML() : 'N/A',
     lockBtn: document.querySelectorAll('.st-lock').length,
-    edits: document.querySelectorAll('.st-edit').length,
-    carets: document.querySelectorAll('.st-caret').length,
+    edits: document.querySelectorAll('tr.order-row td:nth-child(5) .st-edit').length,
+    carets: document.querySelectorAll('tr.order-row td:nth-child(5) .st-caret').length,
+    typeEdits: document.querySelectorAll('tr.order-row td:nth-child(10) .st-edit').length,
     rows: document.querySelectorAll('tr.order-row').length,
     orderIds: (window._cloudData.orders || []).map((o) => o.order_id),
     firstTag: (document.querySelector('tr.order-row td:nth-child(5) .tag') || {}).textContent || '',
@@ -276,6 +331,8 @@ try {
   chk('B2 本地模式没有订正入口：_orderStatusLockHTML()==="" 且 .st-lock/.st-edit/.st-caret 全为 0',
     ls.lockHTML === '' && ls.lockBtn === 0 && ls.edits === 0 && ls.carets === 0,
     JSON.stringify(ls));
+  chk('B2b 本地模式类型列同样没有入口（类型锁与状态锁同一判据）',
+    ls.typeEdits === 0, `typeEdits=${ls.typeEdits}`);
 
   // B3/B4 ★ 回归守卫（本块原为「断言缺陷存在」的探针，功能方修复后已翻转）：
   //     本地模式下 _cloudData.orders 装的是**本地订单库的 id**（1..N），而 /api/proxy/admin/order_status

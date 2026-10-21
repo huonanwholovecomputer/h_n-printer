@@ -1298,6 +1298,9 @@ class StackQueueDialog(QDialog):
     start_second_requested = Signal()            # ▶ 开始打印第 2 趟（主窗口先弹数纸确认）
     abandon_requested = Signal()                 # ⏭ 放弃整叠（半成品按失败收尾）
     refresh_requested = Signal()                 # 重新读一遍纸叠/排队（主窗口回填）
+    # 关闭（「关闭」按钮 / 窗口 ×）：本窗**不自己隐藏**，交给主窗口决定 ——
+    # 左栏还有没打第 2 趟的纸时，主窗口会先弹确认（保留 / 放弃整叠 / 取消）。
+    close_requested = Signal()
 
     LEFT_COLS = ["文件", "第 1 趟", "第 2 趟", "张数", "状态"]
     RIGHT_COLS = ["文件", "第 1 趟", "第 2 趟", "张数 · 页数"]
@@ -1325,9 +1328,11 @@ class StackQueueDialog(QDialog):
         lay.addWidget(self._summary)
 
         self._hint = QLabel(
-            "左栏＝已经攒进出纸槽的文件（第 1 趟已打，等第 2 趟）；右栏＝还没入叠、正在排队的文件。"
-            "页号按「第 1 趟 / 第 2 趟」分列，<b>[空]</b> = 那一面没有内容，程序会送一张空白纸"
-            "（不能跳过：漏一张，后面整叠错位）。")
+            "左栏＝已经攒进出纸槽的文件（第 1 趟已打，等第 2 趟）；右栏＝<b>本机已经受理、"
+            "但还没能开打</b>的文件（出纸槽被当前纸叠独占 / 容量或装订方向不允许）——"
+            "不是云端排队列表，云端还没下发给本机的订单不会出现在这里；纸叠打完第 2 趟后"
+            "它们会自动放行。页号按「第 1 趟 / 第 2 趟」分列，<b>[空]</b> = 那一面没有内容，"
+            "程序会送一张空白纸（不能跳过：漏一张，后面整叠错位）。")
         self._hint.setWordWrap(True)
         self._hint.setStyleSheet("font-size: 11px;")
         lay.addWidget(self._hint)
@@ -1367,7 +1372,7 @@ class StackQueueDialog(QDialog):
         self._btn_refresh = QPushButton("🔄 刷新")
         self._btn_refresh.clicked.connect(lambda *_: self.refresh_requested.emit())
         self._btn_close = QPushButton("关闭")
-        self._btn_close.clicked.connect(self.hide)
+        self._btn_close.clicked.connect(lambda *_: self.close_requested.emit())
         row.addWidget(self._btn_start)
         row.addWidget(self._btn_abandon)
         row.addWidget(self._btn_refresh)
@@ -1600,6 +1605,17 @@ class StackQueueDialog(QDialog):
         if not d:
             return
         self.toggle_requested.emit(int(d["seq"]), int(d["index"]), not bool(d["taken"]))
+
+    # ── 关闭：**不自己隐藏**，交给主窗口裁决 ──
+    # 为什么不让窗口自己 hide：左栏还有没打第 2 趟的纸时，关掉窗口/关掉攒批模式会让
+    # 一整叠半成品与若干订单**离开视线**（旧写法只 hide，连一句提示都没有；操作员很容易
+    # 以为"关掉就等于这叠不要了"，或者反过来以为"关掉订单就完成了"）。
+    # 主窗口先弹三选确认（保留 / 放弃整叠=按失败收尾 / 取消），再决定 hide()。
+
+    def closeEvent(self, ev):
+        """点窗口 × / Esc：只发信号，是否真的隐藏由主窗口决定（它会调 hide()）。"""
+        self.close_requested.emit()
+        ev.ignore()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3863,6 +3879,9 @@ class MainWindow(QMainWindow):
         # 攒批期间被挡住的打印请求（出纸槽被这一叠独占，插进来就会串页）：
         # [{"jobs": [...], "tab_key": str, "reason": str}]
         self._stack_wait: list[dict] = []
+        # 操作员**主动**收起过攒批列表吗（2026-10-21）：收起后不许被 _sync_stack_list_visible
+        # 反复弹回来（否则"关掉"这个动作根本无效）；点底部 🖐 / 切开关 / 有新单一叠时清零。
+        self._stack_list_user_closed: bool = False
         self._stack_flush_worker: DuplexFlushWorker | None = None
         # 第 2 趟开始那一刻的整叠快照（_on_stack_flush 冻结 → _on_stack_flush_done 按它收尾）：
         # 防止第 2 趟期间混进新单后被一起当成品 report_success（🔴-3 的第二道防线）
@@ -8962,11 +8981,14 @@ class MainWindow(QMainWindow):
     # （出纸槽里还有没打第 2 趟的纸叠 / 攒批排队 / 自动打印补打队列）。
     # 本地勾选框与移动端下发走**同一道闸门**（_stack_busy_reason），两侧都拦、提示同样口径。
 
-    def _stack_busy_reason(self) -> str:
+    def _stack_busy_reason(self, skip_entries: bool = False) -> str:
         """攒批模式能否改动的前置：返回 "" = 空闲可改；非空 = 忙的原因（给用户看）。
 
         全部 getattr 兜底 + 整体 try：本方法会被 2 秒定时器调用，而 GUI 验收脚本里存在
         「MainWindow 只初始化了一半」的场景 —— 不能因为缺一个属性就把异常抛进 Qt 事件循环。
+
+        `skip_entries=True`：忽略"出纸槽里还有一叠等第 2 趟"这一条。只给**关闭**攒批模式
+        用（那时会先弹三选确认：保留纸叠照样可以关模式）；其余调用方保持默认口径。
         """
         try:
             worker = getattr(self, "_worker", None)
@@ -8976,7 +8998,7 @@ class MainWindow(QMainWindow):
             if flush is not None and flush.isRunning():
                 return "正在打印整叠的第 2 趟"
             stack = getattr(self, "_stack", None)
-            if stack is not None and getattr(stack, "entries", None):
+            if (not skip_entries) and stack is not None and getattr(stack, "entries", None):
                 return (f"出纸槽里有 {stack.total_sheets} 张纸还没打第 2 趟"
                         f"（{stack.count} 单，等人工翻纸）")
             wait = getattr(self, "_stack_wait", None) or []
@@ -9094,6 +9116,12 @@ class MainWindow(QMainWindow):
 
         适用性 = 当前打印机确实需要攒批（不支持自动双面）；不适用时复选框本就不显示，
         真被点到也只提示、绝不回写（与移动端下发、服务端 _stack_needs_manual_flip 同口径）。
+
+        **关闭时若纸叠还没打第 2 趟**（2026-10-21 用户要求）：不再像旧版那样直接回滚 +
+        一句"打印机正忙"，而是弹三选确认 ——「保留纸叠并关掉模式」/「放弃整叠（按失败收尾）」
+        /「取消」。旧行为把"关模式"整件事堵死，用户根本没法选择；而一句忙提示也说不清
+        "关掉会不会把订单弄失败"（事实是：保留就不失败，放弃才失败）。
+        正在打印 / 有排队 / 有补打队列时仍然硬拦（那是真的忙，不是"有一叠在等翻纸"）。
         """
         want = bool(checked)
         if want and not self._stack_applicable():
@@ -9108,6 +9136,31 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "攒批模式", msg)
             return
         if want == self._stack_mode_on():
+            return
+        has_entries = bool(getattr(getattr(self, "_stack", None), "entries", None))
+        if (not want) and has_entries:
+            other = self._stack_busy_reason(skip_entries=True)
+            if other:
+                self._set_stack_checkbox(self._stack_mode_on())
+                self._log(f"⚠ 打印机正忙（{other}）—— 空闲后才能关闭「🖐 攒批模式」")
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "攒批模式",
+                                        f"打印机正忙（{other}）。\n\n空闲后才能关闭攒批模式。")
+                return
+            choice = self._confirm_stack_close("关闭攒批模式")
+            if choice == "":
+                self._set_stack_checkbox(self._stack_mode_on())
+                self._log("🖐 已取消关闭攒批模式 —— 纸叠原样保留，可以继续打第 2 趟")
+                return
+            # 先关模式再决定纸叠：关掉后新请求不会再入叠；不这样的话，下面"放弃整叠"
+            # 顺手放行排队请求时，那单会跟着进一叠新模式已经关掉的纸叠。
+            self._apply_stack_mode(False, source="本地")
+            if choice == "abandon":
+                self._on_stack_abandon(interactive=False)
+            else:
+                self._log(f"🖐 攒批模式已关闭，但纸叠保留（{self._stack.count} 单 / "
+                          f"{self._stack_present_sheets()} 张纸仍未打第 2 趟）——"
+                          f"列表里随时可以继续")
             return
         busy = self._stack_busy_reason()
         if busy:
@@ -9130,6 +9183,8 @@ class MainWindow(QMainWindow):
         self._config.duplex_stack_mode = enable
         self._save_config()
         self._set_stack_checkbox(enable)
+        # 开关是**明示**操作：允许列表重新出现（操作员之前的"收起"到此为止）
+        self._stack_list_user_closed = False
         if enable:
             self._log("🖐 攒批模式已开启：需手动双面的打印请求不再各自翻纸，"
                       "第 1 趟连续堆进出纸槽，人工一次性确认后打整叠第 2 趟")
@@ -9169,6 +9224,7 @@ class MainWindow(QMainWindow):
                       + ("整叠第 2 趟" if _flushing else "某一单的第 1 趟")
                       + "，打完再决定下一步（列表里可看进度，按钮已置灰）")
         dlg = self._ensure_stack_queue_dialog()
+        self._stack_list_user_closed = False     # 明示点入口 ⇒ 让它出现
         self._refresh_stack_queue()
         self._show_stack_queue_dialog(dlg)
         if not self._stack.entries:
@@ -9420,6 +9476,8 @@ class MainWindow(QMainWindow):
         self._log(f"🖐 攒批第 {seq} 单已入叠：{title} —— {entry.sheet_count} 张纸"
                   f"（整叠 {self._stack.total_sheets}/{self._stack.capacity} 张 / "
                   f"{self._stack.count} 单）")
+        # 有新单入叠 ⇒ 纸叠状态实质变了，让列表重新露面（之前"主动收起"到此为止）
+        self._stack_list_user_closed = False
         self._sync_stack_button()
         # 立刻给后端发一次保活：本单可能已经被 accept，3 分钟反馈窗口现在就要开始顺延
         self._tick_keepalive(force=True)
@@ -9495,8 +9553,11 @@ class MainWindow(QMainWindow):
             dlg = StackQueueDialog(self)
             dlg.toggle_requested.connect(self._on_stack_taken_toggle)
             dlg.start_second_requested.connect(self._on_stack_flush)
-            dlg.abandon_requested.connect(self._on_stack_abandon)
+            # 用 lambda 转发：_on_stack_abandon 多了一个 interactive 参数（默认 True），
+            # 零参信号直接连到带默认值的方法上虽然多数情况能跑，但别依赖 PySide 的签名推断。
+            dlg.abandon_requested.connect(lambda *_: self._on_stack_abandon())
             dlg.refresh_requested.connect(self._refresh_stack_queue)
+            dlg.close_requested.connect(self._on_stack_list_close_requested)
             self._stack_queue_dialog = dlg
         return dlg
 
@@ -9547,18 +9608,26 @@ class MainWindow(QMainWindow):
     def _sync_stack_list_visible(self):
         """攒批模式开启 ⇒ 攒批列表**常驻**（2026-10-20 用户要求）；关闭 ⇒ 收起。
 
-        只负责"该不该出现"；窗口内容由 `_refresh_stack_queue()` 填。用户自己点「关闭」关掉的
-        窗口**不在这里强行弹回来**（下次切开关或点底部 🖐 会再出来），免得抢操作员的操作。
+        两条额外口径（2026-10-21 用户提问后补）：
+          · **只要还有没打第 2 趟的纸叠，窗口就必须在场** —— 即使攒批模式刚被关掉
+            （纸还在出纸槽里、订单还是半成品，让人看不见只会被彻底忘掉）；
+          · 操作员**主动**关掉的窗口不在这里强行弹回来（`_stack_list_user_closed`）——
+            旧写法每次 `_sync_stack_button()` 都会把它重新 show 出来，"关闭"形同虚设；
+            点底部 🖐、切开关、有新单入叠时清标记（那些场景确实该让它出现）。
         """
-        if not self._stack_mode_on():
-            dlg = getattr(self, "_stack_queue_dialog", None)
+        dlg = getattr(self, "_stack_queue_dialog", None)
+        mode_on = self._stack_mode_on()
+        has_entries = bool(getattr(getattr(self, "_stack", None), "entries", None))
+        if not mode_on and not has_entries:
             if dlg is not None and dlg.isVisible():
                 dlg.hide()
             return
-        if not self._stack_applicable():
+        if not has_entries and not self._stack_applicable():
             return
         dlg = self._ensure_stack_queue_dialog()
         self._refresh_stack_queue()
+        if getattr(self, "_stack_list_user_closed", False):
+            return                    # 操作员主动收起的：不抢着弹回来
         if not dlg.isVisible():
             self._show_stack_queue_dialog(dlg, activate=False)
 
@@ -9735,22 +9804,27 @@ class MainWindow(QMainWindow):
         finally:
             self._drain_stack_wait_queue()
 
-    def _on_stack_abandon(self):
-        """放弃整叠：第 1 趟的纸已是半成品，撤销不了；按失败收尾并清掉清单。"""
+    def _on_stack_abandon(self, interactive: bool = True):
+        """放弃整叠：第 1 趟的纸已是半成品，撤销不了；按失败收尾并清掉清单。
+
+        `interactive=False`：调用方**已经问过**了（关闭列表 / 关攒批模式的三选确认里
+        选了「放弃整叠」），别再弹第二个 Yes/No 框 —— 双重确认会让人以为第一次没生效。
+        """
         if not self._stack.entries:
             self._refresh_stack_queue()
             return
         n, sheets = self._stack.count, self._stack_present_sheets()
-        reply = QMessageBox.question(
-            self, "放弃整叠",
-            f"当前纸叠有 {n} 个打印任务 / {sheets} 张纸（只打了第 1 趟）。\n\n"
-            f"放弃后这些任务**不会**标记完成、也不会打第 2 趟，"
-            f"出纸槽里的纸需要人工处理（可自行丢回纸盘再用或作废）。\n\n确定放弃吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if reply != QMessageBox.Yes:
-            self._log("🖐 已取消「放弃整叠」—— 纸叠原样保留，可以继续打第 2 趟")
-            self._refresh_stack_queue()
-            return
+        if interactive:
+            reply = QMessageBox.question(
+                self, "放弃整叠",
+                f"当前纸叠有 {n} 个打印任务 / {sheets} 张纸（只打了第 1 趟）。\n\n"
+                f"放弃后这些任务**不会**标记完成、也不会打第 2 趟，"
+                f"出纸槽里的纸需要人工处理（可自行丢回纸盘再用或作废）。\n\n确定放弃吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self._log("🖐 已取消「放弃整叠」—— 纸叠原样保留，可以继续打第 2 趟")
+                self._refresh_stack_queue()
+                return
         entries = list(self._stack.entries)
         bdir = self._stack_batch_dir()
         self._log(f"⏭ 放弃整叠：{n} 单 / {sheets} 张纸（半成品）")
@@ -9762,6 +9836,77 @@ class MainWindow(QMainWindow):
         self._sync_stack_button()
         self._refresh_stack_queue()
         self._drain_stack_wait_queue()
+
+    def _confirm_stack_close(self, purpose: str = "关闭攒批列表") -> str:
+        """纸叠还没打第 2 趟时，"关闭列表 / 关掉攒批模式"必须先让人明确三选。
+
+        返回 `"keep"`（保留纸叠，只收起窗口或关模式）/ `"abandon"`（放弃整叠：这些单
+        全部按失败收尾，不可撤销）/ `""`（取消，什么都不做）。
+
+        为什么不能只给「是/否」（2026-10-21 用户提问）：两种意图都要有出口 ——
+        ① 我只是想把这个窗收起来，纸和订单都还在（绝不能让订单失败）；
+        ② 我不打算打第 2 趟了，这叠纸作废（这时订单必须按失败收尾，否则永远挂在 printing）。
+        旧实现两条路都不通：关窗口只是 hide（没有任何提示，订单既不失败也看不到），
+        关模式则被"打印机正忙"直接堵死。
+        """
+        n = self._stack.count
+        sheets = self._stack_present_sheets()
+        original = self._stack_original_sheets()
+        taken = max(0, original - sheets)
+        box = QMessageBox(self)
+        box.setWindowTitle(purpose)
+        box.setIcon(QMessageBox.Warning)
+        box.setText(
+            f"这一叠还有 {n} 单 / {sheets} 张纸只打了第 1 趟，还欠整叠的第 2 趟"
+            f"（第 1 趟共 {original} 张"
+            + (f"，已取走 {taken} 张" if taken else "") + "）。\n\n"
+            f"「保留」= 只收起窗口{ '/关掉攒批模式' if '模式' in purpose else '' }："
+            f"纸叠清单和这 {n} 个订单**都留着**，程序会继续给云端保活（不会判失败）；"
+            f"之后点底部「🖐 攒批 …」还能打开列表、打第 2 趟。\n\n"
+            f"「放弃整叠」= 这 {n} 单**全部按失败收尾**（只有第 1 趟的纸是半成品，需要人工"
+            f"处理），云端会收到打印失败、顾客可能重下单 —— 不可撤销。\n\n"
+            f"（直接关程序也不会判失败：清单保留，下次启动会问你是否续打第 2 趟。）")
+        b_keep = box.addButton("保留（纸叠与订单都留着）", QMessageBox.AcceptRole)
+        b_abandon = box.addButton(f"放弃整叠（{n} 单全部按失败收尾）",
+                                  QMessageBox.DestructiveRole)
+        b_cancel = box.addButton("取消（保持原样）", QMessageBox.RejectRole)
+        box.setDefaultButton(b_keep)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_abandon:
+            self._log(f"🖐 {purpose}：人工选择「放弃整叠」（{n} 单 → 按失败收尾）")
+            return "abandon"
+        if clicked is b_keep:
+            self._log(f"🖐 {purpose}：人工选择「保留」—— 纸叠与 {n} 个订单都留着，"
+                      f"第 2 趟随时可打")
+            return "keep"
+        self._log(f"🖐 {purpose}：已取消（{n} 单 / {sheets} 张纸仍在等第 2 趟）")
+        return ""
+
+    def _on_stack_list_close_requested(self):
+        """攒批列表的「关闭」/窗口 ×：有没打第 2 趟的纸时先确认，再决定隐藏/放弃。"""
+        dlg = getattr(self, "_stack_queue_dialog", None)
+        if dlg is None:
+            return
+        if not getattr(self._stack, "entries", None):
+            self._stack_list_user_closed = True
+            dlg.hide()
+            return
+        choice = self._confirm_stack_close("关闭攒批列表")
+        if choice == "":
+            return
+        self._stack_list_user_closed = True
+        dlg.hide()
+        if choice == "abandon":
+            self._on_stack_abandon(interactive=False)
+            return
+        # 保留：给一条不挡操作的提示（状态栏），别让"关掉窗"被读成"这叠不要了"
+        note = (f"🖐 攒批列表已收起：{self._stack.count} 单 / "
+                f"{self._stack_present_sheets()} 张纸仍在等第 2 趟 —— 点底部「🖐 攒批」可再打开")
+        self._log(note)
+        bar = getattr(self, "_status_bar", None)
+        if bar is not None:
+            bar.showMessage(note, 6000)
 
     def _entry_is_finished_product(self, entry) -> bool:
         """整单文件计划全部被取走 ⇒ 这一单"第 1 趟即成品"（第 2 趟无内容）。

@@ -328,6 +328,9 @@ async function runMiniProgram() {
   check('⑩优先级附加价 0（默认「低」）：整行不出现、也不占编号（无 2. 项）',
         plain.indexOf('优先级') < 0 && !/(^|\n)2\. /.test(plain), plain);
   check('⑩合计仍按文件费（¥1.10）', plain.indexOf('￥1.10') >= 0, plain);
+  /* 合计行格式（2026-10-21 用户要求，三端同款）：上方一条分隔线 + 💰 前缀 */
+  check('⑩合计行：上方分隔线 + 💰 前缀',
+        plain.indexOf('─'.repeat(14) + '\n💰合计: ') >= 0, plain);
 
   reset();
   setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);
@@ -612,6 +615,9 @@ async function runAndroid() {
   check('⑩优先级附加价 0（默认「低」）：整行不出现、也不占编号（无 2. 项）',
         plain.indexOf('优先级') < 0 && !/(^|\n)2\. /.test(plain), plain);
   check('⑩合计仍按文件费（¥1.10）', plain.indexOf('￥1.10') >= 0, plain);
+  /* 合计行格式（2026-10-21 用户要求，三端同款）：上方一条分隔线 + 💰 前缀 */
+  check('⑩合计行：上方分隔线 + 💰 前缀',
+        plain.indexOf('─'.repeat(14) + '\n💰合计: ') >= 0, plain);
 
   reset();
   setOrder([subtask({ file_name: 'a.pdf', page_count: 5, page_count_verified: false })], OFFLINE_DEVICE);

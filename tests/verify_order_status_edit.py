@@ -227,6 +227,35 @@ chk("start_printing 读父订单状态并按**三终态常量**跳过（改前�
 chk("start_printing 不再只认单一 canceled（改前形态已消失）",
     _sp_body != "" and '== "canceled"' not in _sp_body)
 
+
+# A9 v7.1 订单**类型**订正（接单 ⇄ 自打）——与状态**共用同一把锁**，不设第二个密码
+chk("MODULE_NAMES 的 orderstatus 描述已包含「类型」（设置页密码那一行读的就是它）",
+    re.search(r"orderstatus: '订单状态/类型订正'", html) is not None)
+chk("类型表头挂 _orderTypeLockHTML()（锁在表头，不是每行）",
+    "类型' + _orderTypeLockHTML()" in html)
+chk("类型锁按钮走**同一个** toggleOrderStatusLock（不另开一把锁/不另要一次密码）",
+    re.search(r"function _orderTypeLockHTML\(\)[\s\S]{0,700}?onclick=\"event\.stopPropagation\(\);toggleOrderStatusLock\(\)\"",
+              html) is not None)
+chk("类型可编辑判据与状态同源（_orderTypeEditable → _orderStatusEditable）",
+    re.search(r"function _orderTypeEditable\(oidS\) \{ return _orderStatusEditable\(oidS\); \}", html) is not None)
+chk("前端只允许 receive/self（与后端 MANUAL_FIX_ORDER_TYPES 同源）",
+    re.search(r"var ORDER_FIXABLE_TYPES = \['receive', 'self'\];", html) is not None
+    and re.search(r'MANUAL_FIX_ORDER_TYPES = \("receive", "self"\)', app_src) is not None)
+chk("类型槽在解锁后才有可点入口（锁定态是纯标签）",
+    re.search(r"if \(!_orderTypeEditable\(oidT\)\) return mtag;", html) is not None
+    and "openOrderTypeMenu(event," in html)
+chk("类型提交打到 /api/proxy/admin/order_type（POST，带 order_id + order_type）",
+    re.search(r"fetch\('/api/proxy/admin/order_type', \{\s*\n\s*method: 'POST'", html) is not None
+    and re.search(r"body: JSON\.stringify\(\{ order_id: String\(oid\), order_type: type \}\)", html) is not None)
+chk("类型落地只改 is_admin_print（不动 status/文件级状态）",
+    re.search(r"o\.is_admin_print = \(type === 'self'\);", html) is not None)
+chk("设置页给 orderstatus 补了一句「这把密码同时管状态与类型两列」",
+    "同时管订单明细的<b>「状态」</b>与<b>「类型」</b>两把锁" in html)
+chk("代理白名单透传类型回执（order_type/previous_order_type/is_admin_print）",
+    all(k in open(os.path.join(REPO, "local_print_tool", "stats_server.py"),
+                  encoding="utf-8").read() for k in
+        ('"order_type"', '"previous_order_type"', '"is_admin_print"')))
+
 # ============================================================================
 print("=== B. 行为验收（真实 Flask + 真实 SQLite）===")
 
@@ -702,6 +731,81 @@ finally:
 chk("[自证] 把守卫退回改前口径（常量只剩 canceled）→ 同款 abandoned 场景**真的复活**成 printing"
     "（证明 B5⑥ 的「不许复活」有判别力）",
     _mut_st == "printing", _mut_st)
+
+print("\n-- B8 订单**类型**订正（接单 / 自打，v7.1）--")
+
+
+def admin_flag(oid):
+    conn = backend.get_db()
+    row = conn.execute("SELECT is_admin_print FROM orders WHERE id = ?", (oid,)).fetchone()
+    conn.close()
+    return int(row["is_admin_print"] or 0) if row else None
+
+
+TYPE_URL = "/api/admin/order_type"
+
+
+def post_type(payload, headers=HDR):
+    return client.post(TYPE_URL, headers=headers, json=payload)
+
+
+oid_t = mk_order("sent", [("sent", 4.60, "")], number="HN-TYPE-1", is_admin_print=0)
+_before_t = db_state(oid_t)
+r = post_type({"order_id": oid_t, "order_type": "self"}, headers={})
+chk("类型订正：无 token → 403 且库未动",
+    r.status_code == 403 and admin_flag(oid_t) == 0 and db_state(oid_t) == _before_t,
+    "%s %s" % (r.status_code, r.get_json()))
+r = post_type({"order_id": oid_t, "order_type": "self"}, headers={"X-Printer-Token": "wrong"})
+chk("类型订正：错误 token → 403", r.status_code == 403)
+r = post_type({"order_id": oid_t})
+chk("类型订正：缺 order_type → 400", r.status_code == 400)
+for badt in ("auto", "scheduled", "free", "delivery", "urgent", "cover", "SELF", "", None):
+    rr = post_type({"order_id": oid_t, "order_type": badt})
+    if rr.status_code != 400:
+        break
+chk("类型订正：只允许 receive/self（自动/预约/免费/派送/加急/封面/大小写变体一律 400）",
+    rr.status_code == 400, "%s %s" % (rr.status_code, rr.get_json()))
+chk("被拦下的类型请求没有改动 is_admin_print", admin_flag(oid_t) == 0, admin_flag(oid_t))
+r = post_type({"order_id": 99999999, "order_type": "self"})
+chk("类型订正：订单不存在 → 404", r.status_code == 404, r.get_json())
+for aff in ("1.0", "01", "+1", " 1 ", "1e0", True, 1.0, ["1"], {"id": 1}, None, ""):
+    rr = post_type({"order_id": aff, "order_type": "self"})
+    if rr.status_code != 400:
+        break
+chk("类型订正：order_id 亲和性/类型变体一律 400（绝不改错单）",
+    rr.status_code == 400, "%s %s" % (rr.status_code, rr.get_json()))
+chk("上述畸形类型请求一条都没改动数据库", db_state(oid_t) == _before_t, db_state(oid_t))
+for raw in (b'["self"]', b'"self"', b'123', b'true', b''):
+    rr = client.post(TYPE_URL, headers=HDR, data=raw, content_type="application/json")
+    if rr.status_code != 400:
+        break
+chk("类型订正：带 token + 非对象请求体 → 400（不是 500）", rr.status_code == 400,
+    "%s %s" % (rr.status_code, rr.get_json()))
+rr = client.post(TYPE_URL, headers={}, data=b'["self"]', content_type="application/json")
+chk("类型订正：未认证 + 畸形请求体 → 403（不是 500）", rr.status_code == 403,
+    "%s %s" % (rr.status_code, rr.get_json()))
+
+r = post_type({"order_id": oid_t, "order_type": "self"})
+j = r.get_json() or {}
+chk("改为自打：200 + is_admin_print=1 + 回执 order_type/previous_order_type",
+    r.status_code == 200 and j.get("success") and j.get("order_type") == "self"
+    and j.get("previous_order_type") == "receive" and j.get("is_admin_print") == 1
+    and admin_flag(oid_t) == 1, j)
+chk("类型订正**不动**状态 / 子任务状态 / locked_at（与状态订正是两条独立链路）",
+    db_state(oid_t) == _before_t, db_state(oid_t))
+o_self = revenue_of(oid_t)
+chk("改自打后：订单明细里该单收益归零（自打不计入收益——这正是类型影响结算的口径）",
+    o_self is not None and round(o_self["revenue"] + o_self["receivable"], 2) == 0.0,
+    o_self and (o_self["revenue"], o_self["receivable"]))
+r = post_type({"order_id": oid_t, "order_type": "receive"})
+j = r.get_json() or {}
+o_back = revenue_of(oid_t) or {}
+chk("改回接单：is_admin_print=0，回执 previous=self，收益恢复 4.60",
+    r.status_code == 200 and j.get("previous_order_type") == "self" and admin_flag(oid_t) == 0
+    and round(o_back.get("revenue", 0) + o_back.get("receivable", 0), 2) == 4.60, j)
+chk("幂等：重复提交同一类型仍 200 且值不变",
+    post_type({"order_id": oid_t, "order_type": "receive"}).status_code == 200
+    and admin_flag(oid_t) == 0)
 
 print("\n" + "=" * 52)
 if bad:

@@ -191,6 +191,33 @@ check("异常样本被钳制（卡纸/操作员中途离开不会把预估带飞
       pc.fit_print_speed([[10, 99999.0]])[1] <= 60.0
       and pc.fit_print_speed([[1, 0.1]]) == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC))
 
+# ── 2026-10-19：物理上不可能的样本（打印机只回报"开始打印"就返回）不得污染预估 ──
+# 现场样本：换原生 1:1 渲染策略后，16 张纸的"第 1 趟实测"只有 2.1 秒、3 张 1.3 秒
+# （同机历史真值是 3 张 ~20s、14 张 ~72s）。这类假数据会把斜率带成负数 ⇒ 16 张开出
+# 10 秒以内的预估 ⇒「等到预估时刻再翻纸」的闸门直接失效。
+check("★ 物理下限：首张 ≥2s、其后每张 ≥0.8s（假数据一律判不可信）",
+      pc.speed_sample_plausible(16, 2.1) is False and pc.speed_sample_plausible(3, 1.3) is False
+      and pc.speed_sample_plausible(1, 0.4) is False and pc.speed_sample_plausible(1, 0.5) is False
+      and pc.speed_sample_plausible(1, 20.7) is True and pc.speed_sample_plausible(3, 20.9) is True
+      and pc.speed_sample_plausible(16, 70.0) is True and pc.speed_sample_plausible(0, 30) is False
+      and pc.speed_sample_plausible(16, 7200) is False)
+check("★ 假样本不参与拟合：现场那套 [[1,20.7],[3,1.3],[16,2.1]] 退回默认模型"
+      "（而不是算出「16 张 9.9 秒」）",
+      pc.fit_print_speed([[1, 20.7], [3, 1.3], [16, 2.1]])
+      == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC)
+      and pc.fit_print_speed([[1, 20.7]]) == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC),
+      f"{pc.fit_print_speed([[1, 20.7], [3, 1.3], [16, 2.1]])}")
+check("★ 只剩「1 张」一种页数时不分斜率（1 张的耗时里 a 与 b 纠缠，旧公式会读成 12.7 s/张 ⇒ "
+      "16 张 211 秒），退回默认模型",
+      pc.fit_print_speed([[1, 20.7], [1, 21.0]])
+      == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC)
+      and pc.fit_print_speed([[1, 30.0]]) == (pc.DEFAULT_STARTUP_SEC, pc.DEFAULT_PER_PAGE_SEC))
+check("真样本仍照旧拟合（没有被物理下限误伤）",
+      [round(v, 1) for v in pc.fit_print_speed([[1, 11.5], [10, 43.0]])] == [8.0, 3.5]
+      and [round(v, 1) for v in pc.fit_print_speed([[10, 43.0]])] == [8.0, 3.5]
+      and pc.fit_print_speed([[2, 16.2], [10, 54.5], [14, 72.3]])[1] > 3.0,
+      f"{[round(v, 2) for v in pc.fit_print_speed([[2, 16.2], [10, 54.5], [14, 72.3]])]}")
+
 p = pc.PrinterProfile(auto_duplex=False, manual_duplex=True, capability_source="manual")
 est10 = p.estimate_first_pass(10)
 check("没有样本时也能给预估（默认 8s + 3.5s×10 = 43s）", 42.0 <= est10 <= 44.0, f"{est10:.1f}")
@@ -205,6 +232,17 @@ check("样本入库后 speed_summary 标注来源",
 check("★ 记样本会丢弃明显异常值（≤0.5s / >1h / 张数<1）",
       p.add_speed_sample(3, 0.2) is False and p.add_speed_sample(3, 7200) is False
       and p.add_speed_sample(0, 12) is False and len(p.speed_samples) == 2)
+check("★ 物理上不可能的样本（打印机提前回报）也拒收：16 张 2.1s 进不去档案",
+      p.add_speed_sample(16, 2.1) is False and p.add_speed_sample(3, 1.3) is False
+      and len(p.speed_samples) == 2, f"{p.speed_samples}")
+_p9 = pc.PrinterProfile(auto_duplex=False, manual_duplex=True,
+                        speed_samples=[[1, 20.7], [3, 1.3], [16, 2.1]])
+check("★ 档案里已有假样本 → 预估退回默认模型（现场 16 张纸预估 64s ≈ 实机 70~80s，"
+      "而不是被假数据带塌的 9.9s），且不谎报「基于最近 3 次实测」",
+      63.0 <= _p9.estimate_first_pass(16) <= 65.0
+      and "基于最近 1 次实测" in _p9.speed_summary()
+      and "已忽略 2 条不可信样本" in _p9.speed_summary(),
+      f"{_p9.estimate_first_pass(16):.1f} | {_p9.speed_summary()}")
 _q = pc.PrinterProfile()
 for _i in range(30):
     _q.add_speed_sample(5, 20.0 + _i)
@@ -243,6 +281,46 @@ check("--forward / --reverse 互斥（避免同时给正序与逆序）",
 check("★ 校准工具有 --speed（两点测速，走 pdf_printer.measure_print_speed_two_point）",
       '"--speed"' in tool and "measure_print_speed_two_point(" in tool
       and "add_speed_sample(" in tool and "speed_samples=prof.speed_samples" in tool)
+
+# ============================================================
+# ⑦ 2026-10-20 用户要求：耗时模型人工覆盖 + 翻纸放行比例
+# ============================================================
+print(chr(10) + "=== ⑦ 人工覆盖模型 / 翻纸放行策略 ===")
+_base = pc.PrinterProfile()
+check("① 默认：两个分量都自动（0），放行比例 50%、翻页准备 0 秒",
+      _base.speed_manual_a == 0.0 and _base.speed_manual_b == 0.0
+      and abs(_base.gate_ratio - 0.5) < 1e-9 and _base.flip_ready_sec == 0.0
+      and _base.speed_is_manual is False)
+check("② 默认闸门 = 预估 × 50%（放行时刻）",
+      abs(_base.gate_unlock_seconds(100.0) - 50.0) < 1e-6
+      and _base.gate_unlock_seconds(0.0) == 0.0)
+_man = pc.PrinterProfile(speed_manual_a=13.0, speed_manual_b=6.9,
+                      gate_ratio=0.75, flip_ready_sec=20.0)
+check("③ 手动覆盖进入 speed_fit（启动/每张纸以人工为准）",
+      _man.speed_fit() == (13.0, 6.9) and _man.speed_is_manual is True
+      and _man.estimate_first_pass(18) == 13.0 + 6.9 * 18)
+check("④ 闸门 = 预估 × 比例 + 翻页准备时间（100 × 75% + 20 = 95 秒）",
+      abs(_man.gate_unlock_seconds(100.0) - 95.0) < 1e-6)
+check("⑤ 只填一个分量时另一个仍用自动值",
+      pc.PrinterProfile(speed_manual_a=20.0).speed_fit()[1]
+      == pc.PrinterProfile().speed_fit()[1])
+_rt = pc.PrinterProfile.from_dict(_man.to_dict())
+check("⑥ 四个新字段能落盘并读回（重启不丢）",
+      _rt.speed_manual_a == 13.0 and _rt.speed_manual_b == 6.9
+      and abs(_rt.gate_ratio - 0.75) < 1e-9 and _rt.flip_ready_sec == 20.0)
+_bad = pc.PrinterProfile.from_dict({"speed_manual_a": "abc", "speed_manual_b": None,
+                                 "gate_ratio": 5, "flip_ready_sec": -3})
+check("⑦ 坏值/越界值兜底（垃圾字符串 → 0；比例夹到 1；负数夹到 0）",
+      _bad.speed_manual_a == 0.0 and _bad.speed_manual_b == 0.0
+      and _bad.gate_ratio == 1.0 and _bad.flip_ready_sec == 0.0,
+      f"{_bad.speed_manual_a}/{_bad.speed_manual_b}/{_bad.gate_ratio}/{_bad.flip_ready_sec}")
+check("⑧ 旧配置（没有这四个键）照样能读，默认值生效",
+      pc.PrinterProfile.from_dict({"auto_duplex": False}).gate_ratio == 0.5)
+_src = open(os.path.join(LOCAL_TOOL, "printer_config.py"), encoding="utf-8").read()
+_fields_src = _src.split("_FIELDS = ", 1)[1].split(")", 1)[0]
+check("⑨ 静态：四个新字段都在 _FIELDS 里（否则 to_dict 会静默丢掉）",
+      '"speed_manual_a"' in _fields_src and '"gate_ratio"' in _fields_src
+      and '"flip_ready_sec"' in _fields_src)
 
 print("\n" + "=" * 56)
 print("打印机档案验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

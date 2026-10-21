@@ -216,6 +216,18 @@ clip = QApplication.clipboard().text() or ""
 check("计费明细仍写入剪贴板", "计费明细" in clip and "报告.pdf" in clip,
       clip.replace("\n", " | ")[:160])
 check("明细含订单号", "HN20261008-9001" in clip, clip.replace("\n", " | ")[:80])
+# ③b 合计行格式（2026-10-21 用户要求）：合计行上方一条与抬头同款的分隔线 + 💰 前缀，
+#     与小程序 / APP 的「💰合计」同口径。改回去立刻转红。
+_lines = clip.split("\n")
+_tot = next((i for i, ln in enumerate(_lines) if ln.startswith("💰合计")), -1)
+check("合计行带 💰 前缀（💰合计: ¥x.xx）", _tot >= 0 and _lines[_tot].startswith("💰合计: ¥"),
+      _lines[_tot] if _tot >= 0 else clip.replace("\n", " | ")[:120])
+check("合计行上方紧贴 14 个半角 - 的分隔线",
+      _tot >= 1 and _lines[_tot - 1] == "-" * 14,
+      repr(_lines[_tot - 1]) if _tot >= 1 else "(合计行缺失)")
+check("抬头的分隔线仍是同款（未把分隔线换成别的字符）",
+      _lines[1:2] == ["-" * 14] and _lines[3:4] == ["-" * 14],
+      " | ".join(repr(x) for x in _lines[:5]))
 check("按钮切换为已复制", bool(win._copy_detail_btn) and "已复制" in win._copy_detail_btn.text(),
       win._copy_detail_btn.text() if win._copy_detail_btn else "")
 print(f"    (复制前按钮文本={_clip_before!r})")
