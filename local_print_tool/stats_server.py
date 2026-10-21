@@ -145,6 +145,8 @@ def _extract_proxy_body(resp) -> dict:
     导致授权页设备列表空白、绑定后所有者不刷新）。
     额外透传 order_id / status / previous_status / files_updated（/api/admin/order_status 的
     回执字段；v7.0 订单状态订正——此前被白名单静默剥掉，页面拿不到改了几条、原来是什么状态）。
+    额外透传 order_type / previous_order_type / is_admin_print（/api/admin/order_type 的回执；
+    v7.1 订单类型订正——同款白名单问题，不补就「改成功但页面不知道原来是什么类型」）。
     一律「响应当中有才透传」，不存在时不填空值（语义同上面几个）。"""
     try:
         data = resp.json()
@@ -174,6 +176,10 @@ def _extract_proxy_body(resp) -> dict:
         out["previous_status"] = data["previous_status"]
     if "files_updated" in data:
         out["files_updated"] = data["files_updated"]
+    # v7.1 订单类型订正的回执（与上面同一条规矩：有才透传）
+    for _k in ("order_type", "previous_order_type", "is_admin_print"):
+        if _k in data:
+            out[_k] = data[_k]
     return out
 
 

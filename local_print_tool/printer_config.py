@@ -367,9 +367,49 @@ DEFAULT_STARTUP_SEC = 8.0     # 唤醒 + 首页出纸（冷机可能多 10~20s�
 DEFAULT_PER_PAGE_SEC = 3.5    # 每张纸走纸+成像
 SPEED_SAMPLES_MAX = 20        # 档案里最多保留这么多样本（越近越能代表当前状态）
 
+# ── 速度样本的**物理可信度**（2026-10-19）──────────────────────────────────────
+# 起因：换原生 1:1 渲染策略后，主机型打印机（LaserJet 1020）**只回报「数据送进端口」，
+# 不回报「纸打完」** —— 第 1 趟的"实测"从 60~70 秒塌到 1~2 秒（实测 16 张纸 2.1 秒）。
+# 这类样本一旦入库，两参数拟合立刻反向（16 张比 3 张还快）⇒ 预估塌到 10 秒以内，
+# 「等到预估时刻再翻纸」的闸门就形同虚设（见 gui.ManualDuplexDialog.flip_gate_at）。
+# 这里按**物理下限**筛：任何 A4 机单张走纸都不可能快于 ~0.8 秒（60ppm 是市面上的顶级），
+# 首张更不可能短于 2 秒（唤醒 + 引擎就绪 + 首页）。快于这个下限的"实测"必然是假数据。
+SPEED_SAMPLE_MIN_FIRST_SEC = 2.0      # 第一张纸的物理下限（含唤醒/引擎就绪）
+SPEED_SAMPLE_MIN_PER_SHEET_SEC = 0.8  # 之后每张纸的物理下限（走纸 + 成像）
+
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def speed_sample_plausible(sheets, seconds) -> bool:
+    """(张数, 秒数) 是否**物理上可能**。
+
+    不可能的一定是"打印机提前回报"的假数据（它只回报开始打印），不能拿来学习、也不能
+    拿来冻结界面计时。下限：首张 ≥2s、其后每张 ≥0.8s（见上面的常量注释）。"""
+    try:
+        n, t = int(sheets), float(seconds)
+    except (TypeError, ValueError):
+        return False
+    if n < 1 or t <= 0.5 or t > 3600:
+        return False
+    return t >= SPEED_SAMPLE_MIN_FIRST_SEC + SPEED_SAMPLE_MIN_PER_SHEET_SEC * (n - 1)
+
+
+def usable_speed_samples(samples) -> list[tuple[float, float]]:
+    """筛出物理上可信的样本（拟合与「基于最近 N 次实测」的口径都走它）。
+
+    旧样本（换渲染策略之前采的、或换策略后塌成 1~2 秒的）留在档案里也无害：
+    拟合与文案都只认这里筛出来的。"""
+    pts: list[tuple[float, float]] = []
+    for s in (samples if isinstance(samples, (list, tuple)) else []):
+        try:
+            n, t = float(s[0]), float(s[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if speed_sample_plausible(n, t):
+            pts.append((n, t))
+    return pts
 
 
 def format_duration(seconds: float) -> str:
@@ -381,6 +421,25 @@ def format_duration(seconds: float) -> str:
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+
+def _coerce_num(value, default: float, lo: float | None = None,
+                hi: float | None = None) -> float:
+    """把配置里的数转成 float 并夹进 [lo, hi]；坏值/None 一律回落 default。
+
+    用在「人工覆盖」类字段上：老配置里没有这些键（default 生效）、手改成垃圾值（回默认）、
+    手改成 0/负数（按 lo 夹住 —— 0 对 speed_manual_* 有"自动"的含义，由调用方解释）。"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if v != v:                      # NaN
+        return float(default)
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
 
 
 def _coerce_speed_samples(value) -> list:
@@ -418,20 +477,21 @@ def fit_print_speed(samples) -> tuple[float, float]:
     打 50 页会高估（固定开销被重复计入 50 次）。
 
     样本 ≥2 种页数 → 最小二乘拟合两点；只有一种页数 → 启动取默认值、只识别斜率（中位数抗离群）；
-    没样本 → 全用默认值。结果钳制在合理区间，避免卡纸/操作员中途离开这类异常把预估带飞。"""
-    pts: list[tuple[float, float]] = []
-    for s in (samples if isinstance(samples, (list, tuple)) else []):
-        try:
-            n, t = float(s[0]), float(s[1])
-        except (TypeError, ValueError, IndexError):
-            continue
-        if n >= 1 and t > 0.5:
-            pts.append((n, t))
+    没样本 → 全用默认值。结果钳制在合理区间，避免卡纸/操作员中途离开这类异常把预估带飞。
+
+    2026-10-19 补两道闸（见 SPEED_SAMPLE_MIN_* 的注释）：
+      · **物理上不可能的样本先丢掉**（打印机只回报"开始打印"，1 张 1.3 秒 / 16 张 2.1 秒
+        这种"实测"是假数据）—— 它们会把斜率带成负数；
+      · 只剩"1 张纸"这一种页数时**退回默认模型**：1 张的耗时里 a（启动）与 b（每张）
+        完全纠缠在一起，旧公式硬把 (t − 默认启动) 当斜率，(1 张, 20.7s) 会被读成
+        12.7 s/张 ⇒ 16 张开出 211 秒的荒唐预估。"""
+    pts = usable_speed_samples(samples)
     if not pts:
         return DEFAULT_STARTUP_SEC, DEFAULT_PER_PAGE_SEC
 
     a, b = DEFAULT_STARTUP_SEC, DEFAULT_PER_PAGE_SEC
-    if len({round(n) for n, _ in pts}) >= 2:
+    counts = {round(n) for n, _ in pts}
+    if len(counts) >= 2:
         k = len(pts)
         sx = sum(n for n, _ in pts)
         sy = sum(t for _, t in pts)
@@ -441,8 +501,10 @@ def fit_print_speed(samples) -> tuple[float, float]:
         if abs(den) > 1e-9:
             b = (k * sxy - sx * sy) / den
             a = (sy - b * sx) / k
+    elif counts == {1}:
+        pass                     # 只有 1 张：分不开 a 与 b，保持默认（理由见 docstring）
     else:
-        n0 = float(next(iter({round(n) for n, _ in pts})))
+        n0 = float(next(iter(counts)))
         med = sorted(t for _, t in pts)[len(pts) // 2]
         b = (med - DEFAULT_STARTUP_SEC) / max(1.0, n0)
     return _clamp(a, 0.0, 120.0), _clamp(b, 0.2, 60.0)
@@ -483,10 +545,22 @@ class PrinterProfile:
     # 第 2 趟等待多久开始变红预警（秒）。只预警、**不自动跳过**
     # （第 2 趟要人把纸叠搬回进纸盒，程序不可能自动补）。
     stack_warn_after_sec: int = 1800
+    # ── 第 1 趟耗时模型的人工覆盖（2026-10-20 用户要求）──
+    # 「启动/预热」和「每张纸」两个分量在有些机器上量不准（驱动的完成回报早于实机出纸），
+    # 允许人工填写：0 = 该分量仍用自动学习值。
+    speed_manual_a: float = 0.0
+    speed_manual_b: float = 0.0
+    # ── 「▶ 继续打第 2 趟」的放行策略（2026-10-20 用户要求，替换旧的"预估 −5 秒"）──
+    # 放行时刻 = 第 1 趟预估 × gate_ratio + flip_ready_sec
+    # 旧口径固定提前 5 秒，纸越多预估误差越大 ⇒ 比例放行更贴合现场（两者都可调）。
+    # flip_ready_sec = 「人工翻页准备时间」：第 1 趟出完后还要给操作员留多久才允许翻纸。
+    gate_ratio: float = 0.5
+    flip_ready_sec: float = 0.0
 
     _FIELDS = ("auto_duplex", "capability_source", "manual_duplex", "first",
                "reverse_second", "second_rotate_180", "verified_at", "verified_by", "note",
-               "speed_samples", "stack_capacity", "stack_warn_after_sec")
+               "speed_samples", "stack_capacity", "stack_warn_after_sec",
+               "speed_manual_a", "speed_manual_b", "gate_ratio", "flip_ready_sec")
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self._FIELDS}
@@ -508,6 +582,10 @@ class PrinterProfile:
             speed_samples=_coerce_speed_samples(d.get("speed_samples")),
             stack_capacity=_coerce_stack_capacity(d.get("stack_capacity")),
             stack_warn_after_sec=_coerce_stack_warn(d.get("stack_warn_after_sec")),
+            speed_manual_a=_coerce_num(d.get("speed_manual_a"), 0.0, 0.0, 3600.0),
+            speed_manual_b=_coerce_num(d.get("speed_manual_b"), 0.0, 0.0, 600.0),
+            gate_ratio=_coerce_num(d.get("gate_ratio"), 0.5, 0.0, 1.0),
+            flip_ready_sec=_coerce_num(d.get("flip_ready_sec"), 0.0, 0.0, 3600.0),
         )
 
     def apply(self, **fields) -> "PrinterProfile":
@@ -558,8 +636,35 @@ class PrinterProfile:
     # ── 第 1 趟耗时预估（两参数线性模型，现场反馈：翻纸窗要显示"打了多久 / 预计多久"）──
 
     def speed_fit(self) -> tuple[float, float]:
-        """本机档案的 (启动开销 a, 每张纸耗时 b)；无样本时给保守默认值。"""
-        return fit_print_speed(self.speed_samples)
+        """本机档案的 (启动开销 a, 每张纸耗时 b)；无样本时给保守默认值。
+
+        人工覆盖（speed_manual_a / speed_manual_b）优先：>0 就以它为准，0 表示该分量
+        仍用自动学习的拟合值 —— 驱动/打印机量不准的分量（预热）靠人工填正。"""
+        a, b = fit_print_speed(self.speed_samples)
+        ma = float(self.speed_manual_a or 0.0)
+        mb = float(self.speed_manual_b or 0.0)
+        if ma > 0:
+            a = ma
+        if mb > 0:
+            b = mb
+        return a, b
+
+    @property
+    def speed_is_manual(self) -> bool:
+        return bool((self.speed_manual_a or 0) > 0 or (self.speed_manual_b or 0) > 0)
+
+    def gate_unlock_seconds(self, estimate: float) -> float:
+        """「▶ 继续打第 2 趟」在第 1 趟第几秒放行（未做最小闸门裁剪，见 dialog 侧）。"""
+        est = float(estimate or 0.0)
+        if est <= 0:
+            return 0.0
+        try:
+            ratio = float(self.gate_ratio)
+        except (TypeError, ValueError):
+            ratio = 0.5
+        ratio = min(max(ratio, 0.0), 1.0)
+        extra = max(0.0, float(self.flip_ready_sec or 0.0))
+        return est * ratio + extra
 
     def estimate_first_pass(self, sheets: int) -> float:
         """第 1 趟预估秒数。sheets = 第 1 趟**槽位数**（含空白占位页：空白页也要走纸）。"""
@@ -567,12 +672,16 @@ class PrinterProfile:
         return max(1.0, a + b * max(0, int(sheets or 0)))
 
     def add_speed_sample(self, sheets: int, seconds: float) -> bool:
-        """记一笔第 1 趟实测（真实打印自动采样 / 测速校准）。异常样本直接丢弃。"""
+        """记一笔第 1 趟实测（真实打印自动采样 / 测速校准）。异常样本直接丢弃。
+
+        "异常"包含**物理上不可能**的：主机型打印机只回报"开始打印"就返回，换原生渲染策略后
+        16 张纸的"实测"可能只有 2 秒 —— 写进去会把预估带塌、连带「等到预估时刻再翻纸」的
+        安全闸门一起失效（见 speed_sample_plausible）。"""
         try:
             n, t = int(sheets), float(seconds)
         except (TypeError, ValueError):
             return False
-        if n < 1 or t <= 0.5 or t > 3600:
+        if not speed_sample_plausible(n, t):
             return False
         self.speed_samples = (list(self.speed_samples or []) + [[n, round(t, 1)]])[-SPEED_SAMPLES_MAX:]
         return True
@@ -580,10 +689,19 @@ class PrinterProfile:
     def speed_summary(self) -> str:
         """给 UI 显示预估可信度用的一句话。"""
         a, b = self.speed_fit()
-        n = len(self.speed_samples or [])
+        used = len(usable_speed_samples(self.speed_samples))
+        dropped = max(0, len(self.speed_samples or []) - used)
         base = f"启动 ≈{a:.0f}s + 每张 ≈{b:.1f}s"
-        return (f"{base} · 基于最近 {n} 次实测" if n
-                else f"{base}（出厂默认值，尚无实测样本）")
+        if self.speed_is_manual:
+            base += "（含手动覆盖）"
+        if used:
+            txt = f"{base} · 基于最近 {used} 次实测"
+        else:
+            txt = f"{base}（出厂默认值，尚无实测样本）"
+        if dropped:
+            # 别把"档案里有 N 条"说成"预估基于 N 条"：被物理下限筛掉的那些没参与拟合
+            txt += f"（已忽略 {dropped} 条不可信样本）"
+        return txt
 
 
 def _default_config_path() -> str:

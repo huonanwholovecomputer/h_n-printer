@@ -8532,6 +8532,83 @@ def admin_order_status():
     })
 
 
+# ==================== 订单**类型**人工订正（接单 / 自打）====================
+# 2026-10-20 用户需求：类型列也要能订正，且与「状态」共用**同一个锁**（同一密码、任一边解锁
+# 两边一起解锁）。只允许「接单 / 自打」两种 —— 类型列其余槽位（自动/预约/免费/派送/加急/封面）
+# 都是订单属性派生出来的，改它们等于伪造订单参数；而接单/自打只是**结算归类**：
+# 自打订单不计入收益（前端 `_orderMoney(o, true)` 与全部 KPI 同口径），顾客单被误标成自打会少收钱、
+# 本地自打单被误标成接单会虚增收益 —— 所以它和状态订正一样默认锁定、共用同一把锁。
+#
+# 与状态订正**刻意不同**（别照抄）：不改任何 status、不清 locked_at、不通知设备端 ——
+# 纸打没打、还能不能打，一点没变；只写 orders.is_admin_print（order_files 没有该列，
+# 展示与统计都按订单级算）。
+MANUAL_FIX_ORDER_TYPES = ("receive", "self")
+
+
+@app.route("/api/admin/order_type", methods=["POST"])
+def admin_order_type():
+    """收支清算页人工订正订单类型（接单 / 自打；需 printer token）。
+
+    校验与 /api/admin/order_status 同一套（dict 守卫 / 规范十进制 id / 白名单 /
+    db_lock + BEGIN IMMEDIATE）——两处口径一致，畸形请求一律 fail-closed，绝不 500。
+    """
+    try:
+        data = request.get_json(silent=True)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    token = _get_printer_token() or str(data.get("token") or "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    raw_id = data.get("order_id")
+    if raw_id is None or raw_id == "":
+        return jsonify({"success": False, "message": "缺少 order_id"}), 400
+    if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+        return jsonify({"success": False, "message": "order_id 不合法"}), 400
+    s_id = raw_id if isinstance(raw_id, str) else str(raw_id)
+    if not re.fullmatch(r"[0-9]+", s_id) or (len(s_id) > 1 and s_id[0] == "0"):
+        return jsonify({"success": False, "message": "order_id 不合法"}), 400
+
+    raw_type = data.get("order_type")
+    new_type = raw_type.strip() if isinstance(raw_type, str) else ""
+    if new_type not in MANUAL_FIX_ORDER_TYPES:
+        return jsonify({"success": False, "message": "不允许改为该类型"}), 400
+    is_admin_print = 1 if new_type == "self" else 0
+
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT is_admin_print FROM orders WHERE id = ?", (s_id,)
+            ).fetchone()
+            if not row:
+                return jsonify({"success": False, "message": "订单不存在"}), 404
+            prev = 1 if int(row["is_admin_print"] or 0) else 0
+            conn.execute(
+                "UPDATE orders SET is_admin_print = ? WHERE id = ?", (is_admin_print, s_id)
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    print(f"  [FIX] 订单 #{s_id} 类型人工订正: "
+          f"{'自打' if prev else '接单'} → {'自打' if is_admin_print else '接单'}")
+    return jsonify({
+        "success": True,
+        "message": "订单类型已订正",
+        "order_id": s_id,
+        "order_type": new_type,
+        "previous_order_type": "self" if prev else "receive",
+        "is_admin_print": is_admin_print,
+    })
+
+
 @app.route("/api/admin/statistics/revenue", methods=["GET"])
 def admin_statistics_revenue():
     """管理员收益统计接口（printer token 鉴权）。
