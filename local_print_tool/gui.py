@@ -2068,6 +2068,29 @@ class PrintWorker(QThread):
             return "off"
         return "on" if (getattr(job, "duplex", "off") or "off") == "on" else "off"
 
+    def _driver_pairs_pages(self) -> bool:
+        """本次双面请求会不会由**打印机硬件**把两页配到一张纸的两面。
+
+        只影响一件事：合并作业里要不要在文件/副本之间补空白页（见 `_print_merged_group`）。
+        · 档案明确 auto_duplex=False（无自动双面器）→ 驱动不会真双面（双面作业已走程序
+          自己的两趟，或走驱动自带的手动向导弹窗），配对由那边负责；这里**不补**，
+          补了只会白出空白纸；
+        · 能力未确认 → 按"会双面"处理（与 `_sheets_of_job` 的出纸槽口径一致：宁可按会
+          双面估算，也不要漏算配对）；
+        · 虚拟打印机（Print to PDF / XPS / OneNote…）→ 不出纸、双面是空操作，页面根本
+          不会两两配对，不补（否则导出的 PDF 里会多出空白页）。
+        """
+        p = self._manual_profile
+        if p is not None and p.auto_duplex is False:
+            return False
+        try:
+            from pdf_printer import is_virtual_printer
+            if is_virtual_printer(self._printer_name):
+                return False
+        except Exception:
+            pass
+        return True
+
     def _uses_manual_duplex(self, job: PrintJob) -> bool:
         """该任务是否要走"程序自己分两趟 + 人工翻纸"。
 
@@ -2170,29 +2193,44 @@ class PrintWorker(QThread):
         return [list(sel) for _ in range(max(1, int(getattr(job, "copies", 1) or 1)))]
 
     @staticmethod
-    def _merge_selected(items: list[tuple[str, list[int]]], out_path: str) -> tuple[bool, str]:
+    def _merge_selected(items: list[tuple[str, list[int]]], out_path: str,
+                        blank_after: Optional[list[bool]] = None) -> tuple[bool, str]:
         """按 [(pdf路径, 要取的 1-based 页码…)] 的顺序合并成一份 PDF（每份各占一段）。
 
         ⚠ 必须按**顺序**逐份 insert：`fitz.Select` 的页码顺序不被保留，靠它表达"两份"
         或"副本重复"都不可靠。这正是"一个作业打完整个订单"的落点：合成一份文档后
         只调一次 `print_pdf` ⇒ 只有一个打印作业，打印机连续成像、中间没有作业边界。
+
+        blank_after：与 items 等长的布尔表，True = 这一段的**末尾补一张空白页**（尺寸取该段
+        最后一页）。自动双面时页数为奇数的文件/副本必须补：驱动按"前一页/后一页 = 一张纸
+        的两面"连续配对，不补的话下一段第 1 页会印在**这张纸的背面**（顾客拿到的文件背面
+        印着下一个文件 = 串页，2026-10-21 现场）。空白页直接写进合并件，GDI / Sumatra /
+        循环三条打印路径都会把它当成一页打出去。
         """
         try:
             import fitz
         except Exception as e:
             return False, f"合并 PDF 需要 PyMuPDF: {e}"
+        pads = list(blank_after or [])
+        pad_n = 0
         try:
             doc = fitz.open()
             try:
-                for path, pages in items or []:
+                for seg_i, (path, pages) in enumerate(items or []):
                     src = fitz.open(path)
                     try:
                         total = len(src)
+                        # 空白页要盖住**这一张纸的背面** ⇒ 尺寸跟该段最后一页一致
+                        last_rect = src[0].rect if total else fitz.Rect(0, 0, 595, 842)
                         for p in pages or []:
                             if 1 <= int(p) <= total:
+                                last_rect = src[int(p) - 1].rect
                                 doc.insert_pdf(src, from_page=int(p) - 1, to_page=int(p) - 1)
                     finally:
                         src.close()
+                    if seg_i < len(pads) and pads[seg_i]:
+                        doc.new_page(width=last_rect.width, height=last_rect.height)
+                        pad_n += 1
                 doc.save(out_path)
             finally:
                 doc.close()
@@ -2203,16 +2241,22 @@ class PrintWorker(QThread):
             except OSError:
                 pass
             return False, f"合并 PDF 失败: {type(e).__name__}: {e}"
-        return True, f"已合并 {len(items or [])} 份 PDF → {os.path.basename(out_path)}"
+        extra = f"（含 {pad_n} 张文件间空白页）" if pad_n else ""
+        return True, (f"已合并 {len(items or [])} 份 PDF{extra} → "
+                      f"{os.path.basename(out_path)}")
 
     def _print_merged_group(self, group: list[dict],
-                            base_offset: int, total_sides: int) -> dict:
+                            base_offset: int, total_sides: int) -> tuple[dict, int]:
         """把**连续同参数**的若干文件合并成**一个打印作业**打出去。
 
-        返回 `{idx: (ok, msg)}` —— **逐文件**的结果（不是整组一个结果）。调用方按它逐条
-        `job_finished`。为什么不返回整组结果：组里可能有"读不出页数"的文件被排除在合并之外
-        （见下），它们必须被单独打印、单独报成败；整组一个结果会让它们**被静默丢掉却报成功**
-        （云端把那张单标 sent、顾客永远拿不到纸 —— 独立审查用 `[坏件, 2页, 3页]` 复现过）。
+        返回 `({idx: (ok, msg)}, 额外面数)` —— 第一个是**逐文件**的结果（不是整组
+        一个结果）。调用方按它逐条 `job_finished`。为什么不返回整组结果：组里可能有
+        "读不出页数"的文件被排除在合并之外（见下），它们必须被单独打印、单独报成败；
+        整组一个结果会让它们**被静默丢掉却报成功**（云端把那张单标 sent、顾客永远拿不到
+        纸 —— 独立审查用 `[坏件, 2页, 3页]` 复现过）。
+        第二个数是**比 `estimate_print_sides` 多出来的面数** = 文件与文件之间补的空白页
+        （`estimate_print_sides` 只算了同一文件的多份之间的分隔页）。调用方要把它
+        算进进度分母 —— 空白页也是真实送进打印机的一面。
 
         group 里每项：{idx, job, path, temp_pdf, copies, dpi, ori, duplex, sides, key}。
         日志与 progress 都按"这份文件第几面"报，界面上看不出与"每文件一个作业"的区别 ——
@@ -2220,6 +2264,12 @@ class PrintWorker(QThread):
 
         **读不出页数的文件不参与合并、退回各自单打**（`_job_copy_pages` 返回 []）：
         用 `job.page_count` 兜底去"取页"会合出空文档、把 duplex 静默降成单面。
+
+        **自动双面时必须补文件间空白页**（2026-10-21 现场「串页」）：驱动把一份文档的
+        连续页两两配到一张纸的两面，页数为奇数的文件最后一张纸背面会接着印**下一个文件**
+        的第 1 页 ⇒ 顾客拿到的文件背面是别人的内容、也没法按文件分开。所以每个"页数为奇数
+        且后面还有内容"的文件/副本段尾补一张空白页（见 `_merge_selected`）。只在双面真由
+        硬件配对时补（`_driver_pairs_pages`）；单面作业、无自动双面器的机型、虚拟打印机都不补。
 
         失败粒度：合并后的作业失败 = 参与合并的那几个文件一起失败（各自 report 各自的
         task_id）；被排除在外、单独打印的那几个各自报各自的成败。
@@ -2234,8 +2284,8 @@ class PrintWorker(QThread):
                 names.append(job.display_name or os.path.basename(job.file_path) or
                              f"#{rec['idx'] + 1}")
                 if not path or not os.path.isfile(path):
-                    return {r["idx"]: (False, f"文件不存在: {getattr(r['job'], 'file_path', '')}")
-                            for r in group}
+                    return ({r["idx"]: (False, f"文件不存在: {getattr(r['job'], 'file_path', '')}")
+                             for r in group}, 0)
                 per = self._job_copy_pages(job, path)
                 if not per:
                     # 读不出页数（损坏/加密）→ 不合并这一份，交回 `_print_one_job` 按真实
@@ -2246,20 +2296,42 @@ class PrintWorker(QThread):
 
             if len(mergeable) < 2:
                 # 只有一份可合并（或都不可合并）→ 合并没有收益，直接逐份单打（保持旧行为）
-                return self._print_solo_group(group, base_offset, total_sides)
+                return self._print_solo_group(group, base_offset, total_sides), 0
 
-            paths: list[tuple[str, list[int]]] = []
-            task_ref: list[tuple[int, PrintJob]] = []
-            for rec in mergeable:
-                for pages in rec["copies_pages"]:
-                    paths.append((rec["path"], pages))
-                    task_ref.append((rec["idx"], rec["job"]))
+            # ── 合并段：每个文件的**每一份**各占一段（份数已在 `_job_copy_pages` 里重复）──
+            segs: list[tuple[dict, list[int]]] = [
+                (rec, pages) for rec in mergeable for pages in rec["copies_pages"]]
+            # 空白页只补在"这一段后面还有内容"的位置：最后一段的背面本来就是空白，不用补。
+            # 判据用**这一段实际要打几页**（页码范围/份数都已体现），不是 job.page_count。
+            eff_duplex = str(mergeable[0].get("duplex") or "off")
+            pad = bool(eff_duplex == "on" and self._driver_pairs_pages())
+            blank_after = [
+                bool(pad and len(pages) % 2 == 1 and i < len(segs) - 1)
+                for i, (_rec, pages) in enumerate(segs)
+            ]
+            pads = sum(1 for b in blank_after if b)
+            # 进度口径：`estimate_print_sides` **已经**把"同一个文件的多份之间"那张空白页
+            # 算进分母了（奇数页 + 双面 + 多份），但**文件与文件之间**那一张没算。
+            # 所以额外面数只数"文件分界"这一种：本组里页数为奇数、且后面还有文件的作业，
+            # 每个多 1 面。直接拿 pads 加会重复计（多份 + 多文件时进度条反而打不满）。
+            extra_sides = 0
+            if pad:
+                extra_sides = sum(
+                    1 for rec in mergeable[:-1]
+                    if rec["copies_pages"] and len(rec["copies_pages"][0]) % 2 == 1)
+            paths: list[tuple[str, list[int]]] = [
+                (rec["path"], pages) for rec, pages in segs]
+            task_ref: list = []
+            for i, (rec, pages) in enumerate(segs):
+                task_ref.extend([(rec["idx"], rec["job"])] * len(pages))
+                if blank_after[i]:
+                    task_ref.append(None)     # 文件间空白页：进度文案要认得它（不是文件）
             merged = os.path.join(
                 tempfile.gettempdir(),
                 f"hn_merged_{os.getpid()}_{int(time.time() * 1000)}.pdf")
-            ok_m, msg_m = self._merge_selected(paths, merged)
+            ok_m, msg_m = self._merge_selected(paths, merged, blank_after)
             if not ok_m:
-                return {r["idx"]: (False, msg_m) for r in group}
+                return {r["idx"]: (False, msg_m) for r in group}, 0
             merged_ids = {rec["idx"] for rec in mergeable}
             head = "、".join(rec["job"].display_name or os.path.basename(rec["job"].file_path)
                             for rec in mergeable[:4])
@@ -2267,6 +2339,10 @@ class PrintWorker(QThread):
                 head += f" 等 {len(mergeable)} 个文件"
             self.log_message.emit(
                 f"  → 合并打印 {len(mergeable)} 个文件为一个打印作业（少中断）：{head}")
+            if pads:
+                self.log_message.emit(
+                    f"  ⚙ 自动双面：在 {pads} 处文件/副本分界补了空白页"
+                    f"（页数为奇数的段后面补一张，否则下一份从这张纸背面接着印 = 串页）")
             n_merged = int(count_pdf_pages(merged) or 0)
             if n_merged and n_merged != len(task_ref):
                 self.log_message.emit(
@@ -2278,13 +2354,13 @@ class PrintWorker(QThread):
                 copies=1,                      # 各文件的份数已经合并进 merged 了
                 # 双面用**逐文件算好的生效值**（1 页文件 ⇒ off，不会被合并件页数带偏），
                 # 组内所有文件这个值必然相同（它就是分组键的一项）
-                duplex=str(mergeable[0].get("duplex") or "off"),
+                duplex=eff_duplex,
                 duplex_mode=str(mergeable[0]["key"][1] or self._duplex_mode),
                 page_range="",                 # 已按各文件页码范围抽好页
                 # 方向只影响日志/DEVMODE 文案（逐页按自己尺寸渲染），取**真正参与合并**的第一项
                 orientation=str(mergeable[0].get("ori") or ""),
                 progress_callback=self._group_progress_callback(
-                    task_ref, base_offset, total_sides),
+                    task_ref, base_offset, total_sides + extra_sides),
                 dpi=int(group[0]["dpi"] or 0),
             )
             if ok:
@@ -2305,9 +2381,13 @@ class PrintWorker(QThread):
                     for rec in solo:
                         out[rec["idx"]] = (
                             False, f"单独打印异常：{type(e).__name__}: {e}")
-            return out
+            # 空白页只在这一组合并作业真的送出去之后才算"打过的面"；
+            # 返回的是**额外面数**（文件分界补的那几张），多份之间的分隔页已在各任务
+            # 自己的 `estimate_print_sides` 里，不能再算一遍。
+            return out, (extra_sides if ok else 0)
         except Exception as e:
-            return {r["idx"]: (False, f"合并打印异常：{type(e).__name__}: {e}") for r in group}
+            return ({r["idx"]: (False, f"合并打印异常：{type(e).__name__}: {e}")
+                     for r in group}, 0)
         finally:
             if merged:
                 try:
@@ -2352,16 +2432,24 @@ class PrintWorker(QThread):
                                f"正在打印: {name} ({page_seq}面)")
         return _on_side
 
-    def _group_progress_callback(self, task_ref: list[tuple[int, PrintJob]],
+    def _group_progress_callback(self, task_ref: list,
                                  base_offset: int, total_all: int):
-        """合并作业的进度回调：把"第 k 面"映射回**是哪个文件的第几面**。"""
+        """合并作业的进度回调：把"第 k 面"映射回**是哪个文件的第几面**。
+
+        task_ref 里的 `None` 是自动双面补的**文件间空白页**（没有归属文件）—— 文案要
+        说清楚它是什么，不能拿前一份文件名凑数，否则日志里看起来像"这个文件多打了一面"。
+        """
         def _on_side(page_seq: int, _task_total: int = 0):
             if self._cancelled:
                 return
             idx = ""
             if 0 < int(page_seq or 0) <= len(task_ref):
-                _i, _j = task_ref[int(page_seq) - 1]
-                idx = f" ({_j.display_name or os.path.basename(_j.file_path or '')})"
+                ref = task_ref[int(page_seq) - 1]
+                if ref is None:
+                    idx = " （文件间空白页）"
+                else:
+                    _i, _j = ref
+                    idx = f" ({_j.display_name or os.path.basename(_j.file_path or '')})"
             self.progress.emit(base_offset + int(page_seq or 0), total_all,
                                f"正在打印: {page_seq}/{len(task_ref)}面{idx}")
         return _on_side
@@ -3072,7 +3160,13 @@ class PrintWorker(QThread):
             for grp in groups:
                 # 逐文件结果（不是整组一个）：组里可能有"读不出页数"被排除在合并之外的文件，
                 # 它们必须被单独报成败 —— 整组一个结果会让它们被静默丢掉却报成功。
-                res = self._print_merged_group(grp, offset_sides, total_sides)
+                res, pad_sides = self._print_merged_group(grp, offset_sides, total_sides)
+                if pad_sides:
+                    # 自动双面在**文件分界**补的空白页也是真实送进打印机的一面 ⇒ 进度分母
+                    # 同步加（多份之间的分隔页已由各任务 `estimate_print_sides` 计入，别重复加）。
+                    # 不加的话状态栏会出现 "12/11 面" 这种读数（进度条被 Qt 夹住，但数字不对），
+                    # 而且后面几组的偏移会整体偏小。
+                    total_sides += int(pad_sides)
                 for rec in grp:
                     ok_g, msg_g = res.get(rec["idx"], (False, "打印结果缺失（内部错误）"))
                     if ok_g:
@@ -3089,7 +3183,8 @@ class PrintWorker(QThread):
                 # ⚠ 这里**不夹上限**：夹了就再也回不去，预估值累计略超时进度会提前顶到 100%；
                 #   `emit` 的那两处各自 min() 一次即可（纯观感）。
                 offset_sides += sum(
-                    int(r.get("sides") or 0) for r in grp if res.get(r["idx"], (False, ""))[0])
+                    int(r.get("sides") or 0) for r in grp
+                    if res.get(r["idx"], (False, ""))[0]) + int(pad_sides or 0)
 
         # ── 攒批模式：本单只打第 1 趟，纸堆进出纸槽；第 2 趟等整叠一起打 ──
         if deferred and self._stack_mode:

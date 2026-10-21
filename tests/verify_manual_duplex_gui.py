@@ -95,6 +95,16 @@ def _pdf_page_texts(path: str) -> list:
     except Exception:
         return []
 
+def _pdf_page_rects(path: str) -> list:
+    """每页尺寸 (宽, 高)（核"补的空白页是否与它盖住的那张纸同尺寸"）。"""
+    try:
+        import fitz
+        with fitz.open(path) as d:
+            return [(round(p.rect.width, 1), round(p.rect.height, 1)) for p in d]
+    except Exception:
+        return []
+
+
 AUTO = PrinterProfile(auto_duplex=True, capability_source="manual", manual_duplex=False)
 UNKNOWN = PrinterProfile()          # 能力未确认：必须保持旧行为（零回归）
 
@@ -142,6 +152,13 @@ def patched(rec, fail_merge_at=None):
         # 合并打印的页数/页序只能从**真正提交的那份 PDF** 上看（一个作业一段）——
         # 这里记下来，验收里用 fitz 打开它核对。
         rec.merged_pages.append(_pdf_page_texts(kw.get("pdf_path", "")))
+        # 模拟逐面进度（与真实 GDI 一致：每送出一面回调一次）。合并路径的进度分母
+        # 是否算进了"文件间空白页"，只能从这里看。
+        _cb = kw.get("progress_callback")
+        _n = len(rec.merged_pages[-1])
+        if _cb and _n:
+            for _i in range(1, _n + 1):
+                _cb(_i, _n)
         return True, "桩：一次提交"
 
     def _print_plan_pass(plan, path, printer, which, second_rotate_180=False,
@@ -188,9 +205,9 @@ def make_job(path, duplex="on", copies=1, mode="long-edge", name="", page_count=
 
 
 def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
-               cover=False, fail_merge_at=None):
+               cover=False, fail_merge_at=None, printer_name="Fake Print"):
     rec = Rec()
-    w = gui.PrintWorker(jobs=jobs, printer_name="Fake Print", duplex_mode="long-edge",
+    w = gui.PrintWorker(jobs=jobs, printer_name=printer_name, duplex_mode="long-edge",
                         keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=profile,
                         cover_page=cover,
                         cover_page_config={"order_number": "HN20261015-0008",
@@ -532,6 +549,104 @@ check("★ 手动机型下同样按 off 提交（1 页双面会被驱动硬拒 �
       all(k.get("duplex") == "off" for k in rec_1m.print_pdf)
       and sorted(i for i, ok, _m in rec_1m.finished if ok) == [0, 1],
       f"{[(k.get('duplex')) for k in rec_1m.print_pdf]} / {rec_1m.finished}")
+
+# ============================================================
+# ①h 自动双面合并作业：文件/副本之间补空白页（2026-10-21 现场「串页」）
+#   旧行为：3 页文件 + 2 页文件合并成一个作业后，驱动按"连续两页 = 一张纸的两面"
+#   配对 ⇒ 第二个文件从第一个文件的**第 4 页位置**（= 第 2 张纸的背面）开始印：
+#   顾客拿到的文件背面是别人文件的内容，也没法按文件把纸分开。
+#   修法：页数为奇数的文件/副本段尾补一张空白页，把下一段顶到新的纸正面。
+# ============================================================
+print("\n=== ①h 自动双面合并作业：文件间补空白页（修串页）===")
+
+P3 = _uniq_pdf("p3", 3)
+P2 = _uniq_pdf("p2", 2)
+rec_pad = run_worker([make_job(P3, duplex="on", page_count=3, name="p3"),
+                      make_job(P2, duplex="on", page_count=2, name="p2")], AUTO)
+check("★ 3 页 + 2 页双面合并：页序 = 1,2,3,〔空〕,1,2（下一份从新纸正面开始）",
+      rec_pad.merged_pages and rec_pad.merged_pages[0] ==
+      ["p3#1", "p3#2", "p3#3", "", "p2#1", "p2#2"], f"{rec_pad.merged_pages}")
+check("★ 合并件 6 面 = 3 + 1 空白 + 2（不是把两个文件硬拼成 5 页）",
+      rec_pad.merged_pages and len(rec_pad.merged_pages[0]) == 6)
+# 物理出纸模拟：自动双面 = 连续两页印在同一张纸的前/后两面（「串页」就是这个模型）
+_seq = (rec_pad.merged_pages or [[]])[0]
+_sheets = [(_seq[i] if i < len(_seq) else "", _seq[i + 1] if i + 1 < len(_seq) else "")
+           for i in range(0, len(_seq), 2)]
+check("★ 物理出纸模拟：第 2 张纸背面是空白，第二个文件从第 3 张纸**正面**开始（不串页）",
+      _sheets == [("p3#1", "p3#2"), ("p3#3", ""), ("p2#1", "p2#2")], f"{_sheets}")
+check("日志说明补了空白页，且不再误报『合并页数不符』",
+      any("补了空白页" in m for m in rec_pad.logs)
+      and not any("合并页数不符" in m for m in rec_pad.logs), f"{rec_pad.logs}")
+check("★ 进度分母含空白页（状态栏不出现 x/5 却打了 6 面）",
+      all(t == 6 for _c, t, s in rec_pad.progress if s.startswith("正在打印"))
+      and any("文件间空白页" in s for _c, _t, s in rec_pad.progress),
+      f"{[(c, t) for c, t, s in rec_pad.progress]}")
+check("两个任务都照常各报一次成功（补空白页不改变回报粒度）",
+      [(i, ok) for i, ok, _m in rec_pad.finished] == [(0, True), (1, True)])
+
+# 直接核合并件：空白页尺寸 = 它盖住的那张纸（A4），不是默认 Letter 之类
+_mp = os.path.join(_SANDBOX, "merge_pad.pdf")
+_ok_pad, _msg_pad = gui.PrintWorker._merge_selected([(P3, [1, 2, 3]), (P2, [1, 2])],
+                                                    _mp, [True, False])
+_rects = _pdf_page_rects(_mp)
+check("★ 空白页尺寸取『被盖住那张纸』的尺寸（6 页同尺寸 A4，第 4 页 = 第 3 页）",
+      _ok_pad and len(_rects) == 6 and len(set(_rects)) == 1
+      and _rects[3] == _rects[2], f"{_msg_pad} / {_rects}")
+_ok_nopad, _msg_nopad = gui.PrintWorker._merge_selected([(P3, [1, 2, 3]), (P2, [1, 2])], _mp)
+check("blank_after 不给 ⇒ 不补（单面 / 末段的旧行为不变）",
+      _ok_nopad and _pdf_page_texts(_mp) == ["p3#1", "p3#2", "p3#3", "p2#1", "p2#2"],
+      f"{_msg_nopad} / {_pdf_page_texts(_mp)}")
+
+# 份数：同一个文件的两份各自独立成段 ⇒ 每份后面都要补（否则第 2 份接着背面印）
+rec_padc = run_worker([make_job(_uniq_pdf("pc", 3), duplex="on", copies=2,
+                                page_count=3, name="pc"),
+                       make_job(_uniq_pdf("qc", 2), duplex="on", copies=2,
+                                page_count=2, name="qc")], AUTO)
+check("★ 3 页×2 份 + 2 页×2 份：每份 3 页后补空页，2 页份不补"
+      "（pc1-pc3,〔空〕,pc1-pc3,〔空〕,qc1,qc2,qc1,qc2）",
+      rec_padc.merged_pages and rec_padc.merged_pages[0] ==
+      ["pc#1", "pc#2", "pc#3", "", "pc#1", "pc#2", "pc#3", "",
+       "qc#1", "qc#2", "qc#1", "qc#2"],
+      f"{rec_padc.merged_pages}")
+check("★ 多份 + 多文件时进度分母不重复计分隔页（估算 11 + 文件分界 1 = 实际 12 面）",
+      all(t == 12 for _c, t, s in rec_padc.progress if s.startswith("正在打印")),
+      f"{[(c, t) for c, t, s in rec_padc.progress]}")
+
+# 偶数页不用补（本来就从正面开始）；最后一段是奇数也不补（它的背面本来就是空白）
+rec_even = run_worker([make_job(_uniq_pdf("e2", 2), duplex="on", page_count=2, name="e2"),
+                       make_job(_uniq_pdf("o3", 3), duplex="on", page_count=3, name="o3")], AUTO)
+check("偶数页段不补空页、末段奇数也不补（不白加页）",
+      rec_even.merged_pages and rec_even.merged_pages[0] ==
+      ["e2#1", "e2#2", "o3#1", "o3#2", "o3#3"], f"{rec_even.merged_pages}")
+
+# 单面作业（duplex=off）合并：不补（每页各占一张纸，不存在正反面配对）
+rec_simplex_odd = run_worker([make_job(_uniq_pdf("s3", 3), duplex="off", page_count=3, name="s3"),
+                              make_job(_uniq_pdf("s2", 2), duplex="off", page_count=2, name="s2")],
+                             AUTO)
+check("★ 单面作业合并不补空白页（只有硬件双面配对才需要）",
+      rec_simplex_odd.merged_pages and
+      rec_simplex_odd.merged_pages[0] == ["s3#1", "s3#2", "s3#3", "s2#1", "s2#2"],
+      f"{rec_simplex_odd.merged_pages}")
+
+# 档案明确「无自动双面器」（还没盖成手动章时）：驱动不会真配对，补了就是白出空白纸
+SIMPLEX_PROBED = PrinterProfile(auto_duplex=False, capability_source="probe",
+                                manual_duplex=False)
+rec_sx = run_worker([make_job(_uniq_pdf("x3", 3), duplex="on", page_count=3, name="x3"),
+                     make_job(_uniq_pdf("x2", 2), duplex="on", page_count=2, name="x2")],
+                    SIMPLEX_PROBED)
+check("★ 无自动双面器的档案（auto_duplex=False）不补空白页（补了只会白出纸）",
+      rec_sx.merged_pages and
+      rec_sx.merged_pages[0] == ["x3#1", "x3#2", "x3#3", "x2#1", "x2#2"],
+      f"{rec_sx.merged_pages}")
+
+# 虚拟打印机：双面是空操作、页面不两两配对 ⇒ 不补（否则导出的 PDF 多出空白页）
+rec_v = run_worker([make_job(_uniq_pdf("v3", 3), duplex="on", page_count=3, name="v3"),
+                    make_job(_uniq_pdf("v2", 2), duplex="on", page_count=2, name="v2")],
+                   AUTO, printer_name="Microsoft Print to PDF")
+check("★ 虚拟打印机（Print to PDF）不补空白页（双面为空操作、不配对）",
+      rec_v.merged_pages and
+      rec_v.merged_pages[0] == ["v3#1", "v3#2", "v3#3", "v2#1", "v2#2"],
+      f"{rec_v.merged_pages}")
 
 # 装订方向混排 → 拆两批；第 2 批翻纸时第 1 批的纸也还在槽里，同样必须算进去
 rec_grp = run_worker([make_job(PDF5, mode="long-edge", name="L.docx"),
@@ -1261,6 +1376,12 @@ check("★ 批次用真合并 + 真页序引擎（不是每文件各建 plan）"
 check("★ 直打作业走『按页码范围逐份抽取』的合并（一个作业一段）",
       "def _merge_selected(" in src and "doc.insert_pdf(src, from_page=" in src
       and "def _print_merged_group(" in src)
+check("★ 自动双面合并作业在文件/副本之间补空白页（串页修复的唯一落点）",
+      "def _driver_pairs_pages(" in src
+      and "blank_after: Optional[list[bool]] = None" in src
+      and "doc.new_page(width=last_rect.width, height=last_rect.height)" in src
+      and "eff_duplex == \"on\" and self._driver_pairs_pages()" in src
+      and "res, pad_sides = self._print_merged_group(" in src)
 check("★ 并批的临时 PDF 交给批次统一清理（不在循环里删）",
       "self._cleanup_temp_pdf(rec[\"job\"], rec.get(\"temp_pdf\"))" in src)
 check("批次结束发收尾信号（常驻窗据此关闭）", "self.duplex_finished.emit(" in src)
