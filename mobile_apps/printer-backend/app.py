@@ -8692,6 +8692,11 @@ def admin_statistics_revenue():
             oid = of_row["order_id"]
             if oid not in files_by_order:
                 files_by_order[oid] = []
+            # 有效口径（v7.2）：页数/张数一律按**页码范围折算**后下发，前端只展示不再自行折算
+            # ——页数 = 实际要打的页（折范围）、张数 = 实际出纸张数（单面每页 1 张 / 双面每 2 页 1 张）。
+            # 与 calculate_price / _file_range_stats 同源，避免结算页与金额对不上。
+            _st = _file_range_stats(of_row["page_count"] or 0, of_row["copies"] or 1,
+                                    of_row["duplex"] or "on", of_row["page_range"] or "")
             files_by_order[oid].append({
                 "id": of_row["id"],
                 "file_name": of_row["file_name"],
@@ -8705,6 +8710,10 @@ def admin_statistics_revenue():
                 "is_free": bool(of_row["is_free"]),
                 "created_at": of_row["created_at"],
                 "reject_reason": of_row["reject_reason"] or "",
+                "effective_pages": _st["effective_pages"],
+                "sheets": _st["sheets"],
+                "total_pages": _st["total_pages"],
+                "total_sheets": _st["total_sheets"],
             })
 
     # 全部子任务费用合计（含被排除状态；订单级附加服务费 = 父订单 total_price − 全部子任务费）
@@ -8802,7 +8811,10 @@ def admin_statistics_revenue():
             "received_client": row["received_client"] or "",
             "received_label": device_display_label(row["received_client"] or ""),
             "files_count": len(files),
-            "total_page_count": sum(f["page_count"] * f["copies"] for f in files),
+            # 有效口径（v7.2）：页数 = Σ(折范围后的每份有效页 × 份数)，张数 = Σ(折范围后的张数 × 份数)。
+            # 与各文件 total_pages/total_sheets 完全同源，保证「订单行 = 文件行之和」，也与金额口径一致。
+            "total_page_count": sum(f["total_pages"] for f in files),
+            "total_sheet_count": sum(f["total_sheets"] for f in files),
             "revenue": round(paid_revenue, 2),
             "receivable": round(receivable, 2),
             "free_files": free_files,

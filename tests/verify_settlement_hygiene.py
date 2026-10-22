@@ -304,7 +304,9 @@ const sum = (o, ids) => ids.reduce((s, id) => s + (o[id] || 0), 0);
   vm.runInContext(fnBody('_trendAccumulate'), sb);
   vm.runInContext(fnBody('_computeDailyTrend'), sb);
   vm.runInContext(fnBody('_trendByBucket'), sb);
-  // 只服务 pages/sheets 两列，与「收益」口径无关
+  // 只服务 pages/sheets 两列，与「收益」口径无关（v7.2：页数走 _orderPages → _filePages）
+  vm.runInContext(fnBody('_filePages'), sb);
+  vm.runInContext(fnBody('_orderPages'), sb);
   sb._orderSheets = () => ({ total: 0 });
   sb._fmtDate = (d) => String(d || '').substring(0, 10);
 

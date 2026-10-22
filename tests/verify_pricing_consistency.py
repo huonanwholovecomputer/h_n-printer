@@ -331,38 +331,66 @@ if fee_diff:
             f"前端显示 ¥{e[5]:.2f}（差 1 分）。10%/20% 因恰好整除不受影响。")
 
 # ============================================================
-# E) 张数口径
+# E) 页数/张数口径
 # ============================================================
-print("\n=== E) 张数口径（结算页 vs 后端）===")
+# v7.2 起：结算页**不再自行折算** —— 后端 revenue / 本地订单接口都已把
+# effective_pages / total_sheets（订单级 total_page_count / total_sheet_count）算好下发，
+# 页面只展示。这样「选了几页」只存在一份实现（后端 _file_range_stats，本地侧复用
+# printer_config），不会再出现两份口径漂移（历史事故：页面按整份页数算，2 页文件只打
+# 第 1 页时张数仍显示 2 张，与实收金额、真实出纸量都对不上）。
+# 行为级验收（真实 Flask + 真实 SQLite + Node 实跑 + 变异自证）见
+# tests/verify_effective_pages_settlement.py，本节点只做口径一致性的轻量对拍。
+print("\n=== E) 页数/张数口径（结算页只展示后端折算值）===")
 settle_src = open(SETTLEMENT, encoding="utf-8").read()
 m = re.search(r"function _fileSheets\(f\) \{.*?\n\}", settle_src, re.S)
-if not m:
-    check("能从结算页提取 _fileSheets", False)
+m2 = re.search(r"function _filePages\(f\) \{.*?\n\}", settle_src, re.S)
+if not m or not m2:
+    check("能从结算页提取 _fileSheets / _filePages", False)
 else:
     sheets_js = os.path.join(tmp, "sheets.js")
     cases = [[pc, copies, duplex, pr] for pc in (1, 2, 3, 4, 5, 9, 10)
              for copies in (1, 2, 3) for duplex in ("on", "off")
              for pr in ("", "1-3", "2", "1,3,5")]
+    # 每组喂「后端折算好的字段」，页面必须原样展示（与后端逐组一致）
+    payload = []
+    for (pc, copies, duplex, pr) in cases:
+        st = backend._file_range_stats(pc, copies, duplex, pr)
+        payload.append({"page_count": pc, "copies": copies, "duplex": duplex,
+                        "page_range": pr, "effective_pages": st["effective_pages"],
+                        "sheets": st["sheets"], "total_pages": st["total_pages"],
+                        "total_sheets": st["total_sheets"]})
     open(sheets_js, "w", encoding="utf-8").write(
-        m.group(0) + "\nconst cs = JSON.parse(process.argv[2]);\n"
-        "process.stdout.write(JSON.stringify(cs.map(([pc,copies,duplex,pr]) => "
-        "_fileSheets({page_count:pc,copies:copies,duplex:duplex,page_range:pr}))));\n")
-    r2 = subprocess.run(["node", sheets_js, json.dumps(cases)],
+        m2.group(0) + "\n" + m.group(0) + "\n"
+        "const cs = JSON.parse(process.argv[2]);\n"
+        "process.stdout.write(JSON.stringify(cs.map(f => "
+        "[_filePages(f), _fileSheets(f)])));\n")
+    r2 = subprocess.run(["node", sheets_js, json.dumps(payload)],
                         capture_output=True, text=True, encoding="utf-8")
-    settle_sheets = json.loads(r2.stdout)
-    sheets_diff = []
-    for (pc, copies, duplex, pr), ss in zip(cases, settle_sheets):
-        stats = backend._file_range_stats(pc, copies, duplex, pr)
-        if ss != stats["total_sheets"]:
-            sheets_diff.append((pc, copies, duplex, pr, ss, stats["total_sheets"]))
-    if sheets_diff:
-        finding(f"张数口径不同（结算页 {len(sheets_diff)} 组与后端不一致）",
-                f"结算页 `_fileSheets` 按**整份页数**折算（注释写明与「总页数」口径一致），"
-                f"后端 `_file_range_stats` 按**页码范围**折算。例：{sheets_diff[0][0]} 页 {sheets_diff[0][1]} 份 "
-                f"范围'{sheets_diff[0][3]}' → 结算页 {sheets_diff[0][4]} 张 vs 后端 {sheets_diff[0][5]} 张。"
-                "两者都不算错，但对账时容易被误读为不一致。")
+    if r2.returncode != 0:
+        check("结算页折算函数可在 Node 中运行", False, (r2.stderr or "")[:300])
     else:
-        check("张数口径一致", True)
+        shown = json.loads(r2.stdout)
+        diff = [(c, s) for c, s in zip(cases, shown)
+                if tuple(s) != (backend._file_range_stats(*c)["effective_pages"],
+                                backend._file_range_stats(*c)["total_sheets"])]
+        check(f"★ 结算页页数/张数逐组等于后端折算值（{len(cases)} 组）", not diff,
+              f"不一致 {len(diff)} 组，例：{diff[0] if diff else ''}")
+
+    # 降级分支：字段缺失时按整份口径（**文档化的降级**，旧缓存/旧本地库才走）
+    legacy_js = os.path.join(tmp, "legacy.js")
+    open(legacy_js, "w", encoding="utf-8").write(
+        m2.group(0) + "\n" + m.group(0) + "\n"
+        "process.stdout.write(JSON.stringify([_filePages({page_count:2}),"
+        "_fileSheets({page_count:2,copies:1,duplex:'off'})]));")
+    r4 = subprocess.run(["node", legacy_js], capture_output=True, text=True, encoding="utf-8")
+    check("字段缺失时退回整份口径（降级：2 页单面 → 2 页 / 2 张，不影响新数据）",
+          r4.returncode == 0 and json.loads(r4.stdout) == [2, 2], (r4.stdout or "")[:80])
+
+    # 页面内不许出现第二份页码范围解析
+    leak = [n for n in ("countPagesInRange", "_countRangePages", "countRangePages",
+                        "_parse_page_range", "_parse_range_parts", "_count_pages_in_range")
+            if re.search(r"function\s+%s\s*\(" % re.escape(n), settle_src)]
+    check("★ 结算页内没有第二份页码范围解析（口径只由后端提供）", not leak, f"发现 {leak}")
 
 shutil.rmtree(tmp, ignore_errors=True)
 

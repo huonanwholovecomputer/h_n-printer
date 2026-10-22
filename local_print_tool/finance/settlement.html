@@ -2346,7 +2346,7 @@ function _trendByBucket(orders, granularity) {
     if (!b) b = map[key] = { key: key, label: key, count: 0, revenue: 0, pages: 0, files: 0, sheets: 0 };
     b.count++;
     b.revenue += _orderMoney(o, true).record / 100;   // 🔴-F7：与 KPI 同一函数同一口径（record 为分，趋势图单位为元；自打在 _orderMoney 内已排除）。本函数已由切片替代、保留防回退
-    b.pages += o.total_page_count || 0;
+    b.pages += _orderPages(o);
     b.files += o.files_count || 0;
     b.sheets += _orderSheets(o).total;
   });
@@ -2511,17 +2511,47 @@ function _orderNominalAmount(o) {
   (o.files || []).forEach(function (f) { sum += parseCents(f.total_price); });
   return sum;
 }
-/* 纸张张数统计（v6.2）：单面每页用 1 张纸，双面每张纸印 2 页（奇数页最后一张仍占 1 张纸）；
-   × 份数。与后端 calculate_price 的纸张模型一致（双面 0.3 元/张，每张两页；奇数页最后一张按单面价但同样占一张纸）。
-   页码范围按完整 page_count 折算（与「总页数」total_page_count 口径一致）。 */
+/* 有效页数 / 张数口径（v7.2：一律**按页码范围折算**）
+   —— 后端 `/api/admin/statistics/revenue`（云端）与 `/api/local/orders`（本地）都已在
+   `effective_pages` / `sheets` / `total_pages` / `total_sheets`（订单级 `total_page_count` /
+   `total_sheet_count`）里算好，这里**只展示、不折算**。
+   本页刻意**不实现**页码范围解析：口径只能有一处（后端 _file_range_stats / 本地
+   stats_server 复用 printer_config），否则「选了几页」会有两份实现、迟早漂移 ——
+   历史事故就是前端按整份页数算，导致 2 页文件只打第 1 页时张数仍显示 2 张、与金额对不上。
+   字段缺失（旧缓存/旧本地库）时才退回整份口径，属降级显示。 */
+function _filePages(f) {
+  var eff = f && f.effective_pages;
+  if (typeof eff === 'number' && isFinite(eff)) return eff;
+  return (f && f.page_count) || 0;
+}
+/* 订单级有效页数：后端已按「范围 × 份数」算好（total_page_count），缺失时用文件行回算。 */
+function _orderPages(o) {
+  var tp = o && o.total_page_count;
+  if (typeof tp === 'number' && isFinite(tp)) return tp;
+  var n = 0;
+  (o.files || []).forEach(function (f) { n += _filePages(f) * (f.copies || 1); });
+  return n;
+}
 function _fileSheets(f) {
-  var pg = f.page_count || 0;
+  var ts = f && f.total_sheets;
+  if (typeof ts === 'number' && isFinite(ts)) return ts;
+  // 降级：后端未给折算值 → 按整份页数折算（单面每页 1 张，双面每 2 页 1 张；× 份数）
+  var pg = (f && f.page_count) || 0;
   if (pg <= 0) return 0;
   var per = (f.duplex === 'off') ? 1 : 2;   // 缺省按双面（与后端 order_files.duplex 默认 'on' 一致）
   return Math.ceil(pg / per) * (f.copies || 1);
 }
 function _orderSheets(o) {
   var s = { total: 0, single: 0, duplex: 0 };
+  var ts = o && o.total_sheet_count;
+  if (typeof ts === 'number' && isFinite(ts)) {
+    // 后端已给订单级张数（折范围）：总数直接用它；单双面拆分仍按文件逐条累计。
+    (o.files || []).forEach(function (f) {
+      if ((f.duplex || 'on') === 'on') s.duplex += _fileSheets(f); else s.single += _fileSheets(f);
+    });
+    s.total = ts;
+    return s;
+  }
   (o.files || []).forEach(function (f) {
     var sh = _fileSheets(f);
     s.total += sh;
@@ -2539,7 +2569,7 @@ function _cloudAgg(orders) {
     a.paid += m.paid; a.receivable += m.receivable; a.record += m.record; a.free += m.free; a.pendingFiles += m.pendingFiles;
     if (m.record > 0) a.recordOrders++;
     a.allFiles += (o.files || []).length;
-    a.pages += o.total_page_count || 0;
+    a.pages += _orderPages(o);
     var sh = _orderSheets(o);
     a.sheets += sh.total; a.singleSheets += sh.single; a.duplexSheets += sh.duplex;
     if (o.is_admin_print) a.selfOrders++;
@@ -2562,7 +2592,7 @@ function _sourceAgg(orders) {
     rs[src + '_orders']++;
     var nf = (o.files || []).length;
     rs[src + '_files'] += nf;
-    var pg = o.total_page_count || 0;
+    var pg = _orderPages(o);
     rs[src + '_pages'] += pg;
     rs.total_pages += pg;
     var m = _orderMoney(o, true);
@@ -2604,7 +2634,7 @@ function _userAgg(orders) {
     if (isLocal) u.localRecord += m.record;
     if (m.record > 0) u.recordOrders++;
     u.files += (o.files || []).length;
-    u.pages += o.total_page_count || 0;
+    u.pages += _orderPages(o);
   });
   var arr = Object.keys(map).map(function (k) { return map[k]; });
   arr.forEach(function (u) {
@@ -3216,9 +3246,9 @@ function _renderOrderListHTML() {
       h += '<td style="font-weight:700;color:' + revColor + '" title="' + _amtTip + '">' + RMB(showAmt) +
         (_partial ? '<span style="color:var(--muted);font-weight:400">*</span>' : '') + '</td>';
       h += '<td>' + o.files_count + '</td>';
-      h += '<td>' + (o.total_page_count || 0) + '</td>';
+      h += '<td title="有效打印页数（按页码范围折算，已含份数）">' + (_orderPages(o) || 0) + '</td>';
       var _osheets = _orderSheets(o);
-      h += '<td title="单面 ' + _osheets.single + ' 张 · 双面 ' + _osheets.duplex + ' 张">' + (_osheets.total || 0) + '</td>';
+      h += '<td title="有效纸张张数（按页码范围折算，已含份数）· 单面 ' + _osheets.single + ' 张 · 双面 ' + _osheets.duplex + ' 张">' + (_osheets.total || 0) + '</td>';
       h += '<td style="font-size:.76rem;line-height:1.9" title="' + esc(addr) + '">' + _orderTypeTags(o, money, typeUsed) + '</td>';
       h += '<td class="ell" style="font-size:.76rem;color:var(--muted)">' + esc((o.created_at || '').substring(0, 19)) + '</td>';
       // 开始打印：无则显示 —；有则显示时间，悬停展示后端计算的等待时长
@@ -3235,13 +3265,22 @@ function _renderOrderListHTML() {
         if (o.remark) {
           h += '<div class="order-remark" title="订单备注">📝 备注：' + esc(o.remark) + '</div>';
         }
-        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span>页数</span><span>张数</span><span>单/双面</span><span>状态</span></div>';
+        h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span title="有效打印页数（按页码范围折算）">页数</span><span title="有效纸张张数（按页码范围折算，含份数）">张数</span><span>单/双面</span><span>状态</span></div>';
         o.files.forEach(function (f) {
           h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + (f.reject_reason ? ' · ' + esc(f.reject_reason) : '') + '">';
           h += '<span class="fn">📄 ' + esc(f.file_name) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
           h += '<span style="font-weight:700;color:' + revColor + '">' + RMB(parseCents(f.total_price)) + '</span>';
           h += '<span>' + f.copies + '份</span>';
-          h += '<span>' + (f.page_count || 0) + '页' + (f.page_range ? ' (' + esc(f.page_range) + ')' : '') + '</span>';
+          // 页数 = **有效打印页数**（折页码范围）；括号注明文件本身共几页（两者不同才标）。
+          // 例：2 页的 Word 只打第 1 页 → 「1页 (共2页)」，与金额 ¥0.30（单面 1 页）一致。
+          var _effPg = _filePages(f);
+          var _totPg = f.page_count || 0;
+          var _pgTip = '文件共 ' + _totPg + ' 页' + (f.page_range
+            ? ' · 页码范围 ' + esc(f.page_range) + '（实际打印 ' + _effPg + ' 页）' : '');
+          h += '<span title="' + _pgTip + '">' + _effPg + '页'
+            + ((_totPg && _effPg !== _totPg)
+              ? ' <span style="color:var(--muted)">(共' + _totPg + '页)</span>' : '')
+            + '</span>';
           h += '<span>' + _fileSheets(f) + '张</span>';
           h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
           h += '<span><span class="tag ' + esc(statusClass(f.status)) + '">' + esc(statusLabel(f.status)) + '</span></span>';
@@ -3796,7 +3835,7 @@ function _trendEmptyBucket(extra) {
 function _trendAccumulate(b, o) {
   b.count++;
   b.revenue += _orderMoney(o, true).record / 100;   // 🔴-F7：不读后端逐单下发的 o.revenue/o.receivable（那是页里唯一与 KPI 不同源的「收益」）
-  b.pages += o.total_page_count || 0;
+  b.pages += _orderPages(o);
   b.files += o.files_count || 0;
   b.sheets += _orderSheets(o).total;
   return b;
@@ -5448,6 +5487,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v6.9：订单明细「类型」列按需取列 —— 类型列原先恒占 7 个固定槽（自打/接单 | 自动 | 预约 | 免费 | 派送 | 加急 | 封面、共 432px），而实际一个月常常只用到第 1~2 槽，整列大段是空槽，右侧「时间 / 开始打印 / 接单设备」反被挤到截断（时间与开始打印需要 139px 只分到 132px、接单设备需要 280px 只分到 200px）。现改为：① <b>当前页无人使用的槽整列移除</b>（判据是页面上真正渲染的那批订单 —— 所见即所得；翻页或改「每页条数」会按新一页的内容重新排列宽，不会出现「这一页根本没人用、却还白占一列」），同页内剩余槽仍是固定宽度 —— 跨订单竖直对齐不受影响；② 类型列随实际槽位数缩窄，腾出的宽度按 <b>时间 → 开始打印 → 接单设备</b> 的优先级补齐到「完整显示」所需宽度（146 / 146 / 320px）；③ 补不完的余量交给表 min-width —— 表格整体变窄、不再横向留白，也不让类型列虚胖回去；④ 顺手修正 7 槽全用时 430px 的网格塞进 404px 内容盒、「封面」标签溢出压到「时间」列的问题（该情形类型列宽 460px）。</p>' +
     '<p style="margin-top:10px">v7.0：订单状态订正（打印出错的便捷处理）—— 云端订单明细的「状态」列右上角新增锁定开关（默认 🔒，防误触）：点它输入密码解锁（默认 123456，与其他敏感模块一样在「设置 → 敏感模块密码」里管理）后变成 🔓，这时每个订单的状态标签才带小箭头，<b>点标签直接在「已完成 / 失败 / 放弃打印 / 已取消 / 被打回」中选正确状态，改动立即写库生效</b>（父订单与其全部子任务一并改写，金额口径、KPI、图表、明细同时按新状态重算），再点 🔓 即回到锁定、箭头收起。状态直接决定结算口径（仅「已完成」计入收益），因此订正后收益立即跟着变。⚠ 只允许改成终态：排队中 / 打印中 / 预约中这类工作状态若允许人工改，推送与预约调度会把订单重新捡起来打印，前后端都拦下。</p>' +
     '<p style="margin-top:10px">v7.1：订单<b>类型</b>订正（接单 ⇄ 自打）——「类型」列也带锁定开关，但这把锁<b>不是第二个密码</b>：它与「状态」共用同一个解锁状态，在任意一列解锁，另一列同时变成 🔓（同一个密码，在「设置 → 敏感模块密码 → 订单状态/类型订正」里管理）。解锁后点「🤝接单 / 👤自打」标签即可在两者之间切换，改动立即写库。类型只决定结算归类（<b>自打不计入收益</b>、接单计入收益），不改变打印状态、不会让订单重新排队或开打。</p>' +
+    '<p style="margin-top:10px">v7.2：页数 / 张数改为<b>有效口径</b>（按页码范围折算）—— 以前「页数」「张数」及 KPI 的总页数、趋势的纸张指标一律按文件<b>整份</b>页数算，只要顾客选了页码范围（例如 2 页的 Word 只打第 1 页），张数仍显示 2 张、与实收金额（单面 1 页 ¥0.30）和真实出纸量都对不上。现在：① 文件行「页数」显示<b>实际打印页数</b>，与整份不同时用括号注明「(共 N 页)」，悬停可看页码范围原文；② 文件行「张数」、订单行「页数 / 张数」、KPI「总页数 / 纸张」、趋势「页数 / 纸张」、按来源与按成员的页数统计全部改按页码范围折算（张数仍按单面每页 1 张、双面每 2 页 1 张，含份数）。折算只由后端算（云端 revenue 与本地订单库同一套字段），页面不自行解析页码范围，避免两份口径漂移。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

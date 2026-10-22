@@ -22,6 +22,19 @@ from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
+# 「页码范围 → 有效页数」的**单一来源**：复用 printer_config 的权威实现。
+# 本文件（以及 finance/settlement.html）**不许**再写第二份解析 —— 两份口径一漂移，
+# 结算页的页数/张数就会与金额静默对不上（历史教训：旧副本把空白替换成逗号、parseInt 宽松解析）。
+# 取不到实现（极端打包/单测环境）时退回整份口径而不是抛异常：这里的异常会被外层
+# try/except 当成"这条订单的文件都坏了"→ 整单文件列表清空，代价远大于一次降级。
+def _count_range_pages(page_range: str, page_count: int) -> int:
+    total = int(page_count or 0)
+    try:
+        from printer_config import _count_pages_in_range as _impl
+        return _impl(page_range or "", total)
+    except Exception:
+        return total
+
 # ── 云端代理连接池（连接复用 + 自动重试）──
 # 收支清算页的代理请求走共享 Session：keep-alive 复用 TCP 连接，配合重试适配器
 # 消化校园/宿舍 NAT 等网络的瞬时连接波动（ConnectTimeout/ReadTimeout）——
@@ -556,6 +569,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                     owner_name, is_admin_print, synced) in rows:
                 files = []
                 total_page_count = 0
+                total_sheet_count = 0
                 try:
                     fdata = json.loads(files_json) if files_json else []
                     for f in fdata or []:
@@ -566,16 +580,29 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                         page_count = int(f.get("page_count", 0) or 0)
                         cost = float(f.get("cost", 0) or 0)          # 元
                         is_free = bool(f.get("is_free", False))
+                        duplex = (f.get("duplex") or "on")
+                        page_range = f.get("page_range", "") or ""
+                        # 有效口径（v7.2）：与云端 revenue 同构 —— 页数/张数按页码范围折算后下发，
+                        # 结算页只展示不折算（云端 q 与本地 q 必须是同一套字段与同一套算法）。
+                        eff = _count_range_pages(page_range, page_count)
+                        per_sheets = (eff + 1) // 2 if duplex == "on" else eff
                         files.append({
                             "id": seq,
                             "file_name": f.get("file_name", ""),
                             "copies": copies,
                             "page_count": page_count,
+                            "duplex": duplex,
+                            "page_range": page_range,
                             "total_price": round(cost, 2),           # 元（与云端 revenue 的 total_price 单位一致）
                             "status": "sent",                        # 本地订单已打印完成
                             "is_free": is_free,
+                            "effective_pages": eff,
+                            "sheets": per_sheets,
+                            "total_pages": eff * copies,
+                            "total_sheets": per_sheets * copies,
                         })
-                        total_page_count += page_count * copies
+                        total_page_count += eff * copies
+                        total_sheet_count += per_sheets * copies
                 except Exception:
                     files = []
                 orders.append({
@@ -583,6 +610,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                     "order_number": order_number,
                     "created_at": created_at or "",
                     "total_page_count": total_page_count,
+                    "total_sheet_count": total_sheet_count,
                     "owner_name": owner_name or "",
                     "is_admin_print": bool(is_admin_print),
                     "source": "local",
