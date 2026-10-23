@@ -423,6 +423,7 @@ MAX_REPORTED_PAGES = 20000
 # 1 MB JSON 能塞进的元素数远大于任何真实业务（最大单通常十几份），超限一律 400。
 MAX_ORDER_FILES = 20          # /api/submit_order 的 files 数组上限
 MAX_PAGE_RANGE_LEN = 200      # 单条页码范围字符串上限（库里另有 500 字符截断兜底）
+MAX_ECHO_FILES = 50           # submit_order 响应回显的子任务上限（超出只给 files_total/files_omitted）
 MAX_EVENT_TASK_IDS = 100      # SocketIO 事件的 task_ids 上限
 
 # ===== S0-05（D-2 已拍板：永久拒绝，不做开关）=====
@@ -2874,14 +2875,16 @@ def _find_order_by_client_request_id(openid: str, client_request_id: str,
 
 
 def _duplicate_order_response(dup_row: dict, data: dict):
-    """重复提交的统一响应（与正常建单同形；前端靠 is_duplicate 区分，可提示"已提交过"）。"""
+    """重复提交的统一响应（与正常建单同形；前端靠 is_duplicate 区分，可提示"已提交过"）。
+
+    S2-02：不再回显请求体 `data`（放大面，客户端不读）；`files` 也不回 ——
+    重复提交的调用方只需要订单号与状态。"""
     return jsonify({
         "success": True,
         "is_duplicate": True,
         "message": "检测到重复提交，已返回原订单",
         "order_id": dup_row["id"],
         "order_number": dup_row["order_number"],
-        "data": data,
     })
 
 
@@ -6216,6 +6219,112 @@ def upload_file():
     )
 
 
+def _plan_order_files(conn, files_input, openid, default_duplex, schedule_mode, prices):
+    """（S2-02）订单子任务的**只读**预计算：页数 / 单价 / 初始状态 / 打回原因。
+
+    ⚠ 只允许在**写事务之外**调用：本函数会读 PDF 数页（磁盘 IO，可能是整份文件解析），
+    而 SQLite 的写者锁是全站唯一的 —— 放在写事务里等于把文件 IO 的成本摊到所有写路径上
+    （DDoS 报告 A3/R6：1 MB 请求能把写锁占 1.7 s）。submit_order 的写事务里只许
+    INSERT/UPDATE，不许出现任何读盘操作。
+
+    返回：计划列表，每项一个 dict（不碰数据库）。抛 OrderRejected 表示整单应被拒 ——
+    与"事务内抛异常回滚"的语义一致（400 且一条行都不落），只是现在连事务都还没开。
+    """
+    plan = []
+    for f in files_input:
+        f_id = f.get("file_id", "") or ""
+        f_name = f.get("file", f.get("file_name", ""))
+        # P1-4.4：份数钳制 1-999，非法类型 → 400
+        try:
+            f_copies = max(1, min(999, int(f.get("copies", 1))))
+        except (ValueError, TypeError):
+            raise OrderRejected("份数必须是 1-999 的整数")
+        f_page_range = (f.get("page_range", "") or "").strip()
+
+        # 计算页数与价格（优先从 files 表缓存读取）
+        page_count = 1
+        page_count_verified = False
+        persist_pages = None          # (page_count, verified)：需要写回 files 表（写事务里做）
+        if f_id:
+            frow = conn.execute(
+                "SELECT path, original_name, page_count, page_count_verified, openid FROM files WHERE id = ?",
+                (f_id,),
+            ).fetchone()
+            if frow:
+                # P2-10：文件归属校验（openid 为空 = 迁移前的旧记录，兼容放行）
+                if frow["openid"] and frow["openid"] != openid:
+                    raise OrderRejected("文件归属校验失败，无权使用该文件")
+                cached = frow["page_count"] or 0
+                if cached > 0:
+                    page_count = cached
+                    page_count_verified = bool(frow["page_count_verified"])
+                elif frow["path"] and os.path.exists(frow["path"]):
+                    # 缓存未命中，重新计算（PDF 可当场获取；doc/docx 返回 0 = 等本地工具）
+                    ext = os.path.splitext(frow["path"])[1].lower().lstrip(".")
+                    _computed = get_file_page_count(frow["path"], ext) or 0
+                    if _computed > 0:
+                        page_count = _computed
+                        page_count_verified = ext not in ("doc", "docx")
+                        persist_pages = (page_count, page_count_verified)
+                    else:
+                        # 2026-10-17：页数未知时**只对本单按 1 页兜底计价**，绝不把兜底值
+                        # 写回 files.page_count —— 补推页数分析的路径以
+                        # 「page_count_verified = 0」为前提（见 _pending_page_analysis_rows），
+                        # 而历史 bug 正是把 0 写成 1 之后：该文件再也不会被送去分析，
+                        # verified 永远 0、价格永久冻在 1 页（少收），前端复制价格永久被拦。
+                        page_count = 1
+                        page_count_verified = False
+                if not f_name:
+                    f_name = frow["original_name"]
+            else:
+                ext = os.path.splitext(f_name)[1].lower().lstrip(".")
+                page_count = get_file_page_count(None, ext) or 1
+        else:
+            ext = os.path.splitext(f_name)[1].lower().lstrip(".")
+            page_count = get_file_page_count(None, ext) or 1
+
+        if not f_name:
+            f_name = "未知文件"
+
+        # 读取每文件的双面设置（优先 files 数组中的值，其次顶层 duplex）
+        f_duplex = f.get("duplex", default_duplex) or "on"
+
+        per_copy_price = calculate_price(page_count, f_duplex, f_page_range, prices=prices)
+        total_price = round(per_copy_price * f_copies, 2)  # 始终计算真实价格，is_free 控制是否收费
+        # 普通单从 queued 开始，由 push_print_task_to_client 原子锁定为 printing；
+        # 预约单从 scheduled 开始，阶段①下发文件时为 downloading（不进 queued，避免被普通链路误分发）
+        sub_status = "scheduled" if schedule_mode != "now" else "queued"
+        reject_reason = ""
+
+        # 若页数已确认，立即校验页码范围
+        if page_count_verified and page_count > 0 and f_page_range:
+            max_page = _parse_page_range_max(f_page_range)
+            if max_page > page_count:
+                sub_status = "rejected"
+                reject_reason = f"页码范围超出文件总页数（填写 {max_page} 页，文件共 {page_count} 页）"
+                print(f"  [REJECT] 提交时打回: {f_name} range={f_page_range} 超出 {page_count} 页")
+
+        f_image_orientation = f.get("image_orientation", "auto") or "auto"
+        if f_image_orientation not in ("auto", "landscape", "portrait"):
+            f_image_orientation = "auto"
+
+        plan.append({
+            "file_id": f_id or None,
+            "file_name": f_name,
+            "copies": f_copies,
+            "page_count": page_count,
+            "page_count_verified": page_count_verified,
+            "persist_pages": persist_pages,
+            "page_range": f_page_range,
+            "total_price": total_price,
+            "status": sub_status,
+            "duplex": f_duplex,
+            "image_orientation": f_image_orientation,
+            "reject_reason": reject_reason,
+        })
+    return plan
+
+
 @app.route("/api/submit_order", methods=["POST"])
 @require_printer_access
 def submit_order():
@@ -6385,7 +6494,20 @@ def submit_order():
         target_client_id = ""
     printer_online = is_printer_available()  # 有启用接单的设备（含离线：离线设备被指定时任务排队等其上线）
 
-    # ---- 事务：插 1 条 orders + N 条 order_files ----
+    # ---- 阶段 A：只读预计算（S2-02，在开写事务之前）----
+    # 原来「父单 INSERT → 逐文件 SELECT + get_file_page_count(读 PDF) + 计费 + INSERT」
+    # 全在同一个 SQLite 写事务里，写者锁是全站唯一的 ⇒ 文件解析的磁盘 IO 会变成所有写路径的排队。
+    # 现在页数/单价/状态全部在写事务**之前**用只读连接算完；失败直接 400，一行都不写。
+    pre_conn = get_db()
+    try:
+        file_plan = _plan_order_files(pre_conn, files_input, g.openid, duplex,
+                                      schedule_mode, _load_paper_prices())
+    except OrderRejected as e:
+        return jsonify({"success": False, "message": e.message}), 400
+    finally:
+        pre_conn.close()
+
+    # ---- 事务：插 1 条 orders + N 条 order_files（只做 INSERT/UPDATE，无读盘）----
     conn = get_db()
     user_conn = get_user_db()
     try:
@@ -6439,109 +6561,34 @@ def submit_order():
                 client_request_id = f"{client_request_id}-r{secrets.token_hex(4)}"
         order_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        # 插每个子任务
+        # 插每个子任务（S2-02：本段只做 INSERT/UPDATE —— 页数/单价已在写事务之外算好，
+        # 见 _plan_order_files 的注释；这里绝不允许再出现读盘/PDF 解析）
         sub_tasks = []
-        # S2-01：单价在循环外读一次（pricing.json 的 mtime 缓存 + 结构化传参），
-        # 原来每个文件都各走一次 `_load_paper_prices()`（读盘 + json.loads）。
-        _paper_prices = _load_paper_prices()
-        for f in files_input:
-            f_id = f.get("file_id", "") or ""
-            f_name = f.get("file", f.get("file_name", ""))
-            # P1-4.4：份数钳制 1-999，非法类型 → 400（事务内抛异常回滚）
-            try:
-                f_copies = max(1, min(999, int(f.get("copies", 1))))
-            except (ValueError, TypeError):
-                raise OrderRejected("份数必须是 1-999 的整数")
-            f_page_range = (f.get("page_range", "") or "").strip()
-
-            # 计算页数与价格（优先从 files 表缓存读取）
-            page_count = 1
-            page_count_verified = False
-            if f_id:
-                frow = conn.execute(
-                    "SELECT path, original_name, page_count, page_count_verified, openid FROM files WHERE id = ?",
-                    (f_id,),
-                ).fetchone()
-                if frow:
-                    # P2-10：文件归属校验（openid 为空 = 迁移前的旧记录，兼容放行）
-                    if frow["openid"] and frow["openid"] != g.openid:
-                        raise OrderRejected("文件归属校验失败，无权使用该文件")
-                    cached = frow["page_count"] or 0
-                    if cached > 0:
-                        page_count = cached
-                        page_count_verified = bool(frow["page_count_verified"])
-                    elif frow["path"] and os.path.exists(frow["path"]):
-                        # 缓存未命中，重新计算（PDF 可当场获取；doc/docx 返回 0 = 等本地工具）
-                        ext = os.path.splitext(frow["path"])[1].lower().lstrip(".")
-                        _computed = get_file_page_count(frow["path"], ext) or 0
-                        if _computed > 0:
-                            page_count = _computed
-                            page_count_verified = ext not in ("doc", "docx")
-                            conn.execute(
-                                "UPDATE files SET page_count = ?, page_count_verified = ? WHERE id = ?",
-                                (page_count, int(page_count_verified), f_id),
-                            )
-                        else:
-                            # 2026-10-17：页数未知时**只对本单按 1 页兜底计价**，绝不把兜底值
-                            # 写回 files.page_count —— 补推页数分析的路径以
-                            # 「page_count_verified = 0」为前提（见 _pending_page_analysis_rows），
-                            # 而历史 bug 正是把 0 写成 1 之后：该文件再也不会被送去分析，
-                            # verified 永远 0、价格永久冻在 1 页（少收），前端复制价格永久被拦。
-                            page_count = 1
-                            page_count_verified = False
-                    if not f_name:
-                        f_name = frow["original_name"]
-                else:
-                    ext = os.path.splitext(f_name)[1].lower().lstrip(".")
-                    page_count = get_file_page_count(None, ext) or 1
-            else:
-                ext = os.path.splitext(f_name)[1].lower().lstrip(".")
-                page_count = get_file_page_count(None, ext) or 1
-
-            if not f_name:
-                f_name = "未知文件"
-
-            # 读取每文件的双面设置（优先 files 数组中的值，其次顶层 duplex）
-            f_duplex = f.get("duplex", duplex) or "on"
-
-            is_free_val = 0  # 价格仅用于统计，无免费策略
-            per_copy_price = calculate_price(page_count, f_duplex, f_page_range,
-                                             prices=_paper_prices)
-            total_price = round(per_copy_price * f_copies, 2)  # 始终计算真实价格，is_free 控制是否收费
-            # 普通单从 queued 开始，由 push_print_task_to_client 原子锁定为 printing；
-            # 预约单从 scheduled 开始，阶段①下发文件时为 downloading（不进 queued，避免被普通链路误分发）
-            sub_status = "scheduled" if schedule_mode != "now" else "queued"
-            reject_reason = ""
-
-            # 若页数已确认，立即校验页码范围
-            if page_count_verified and page_count > 0 and f_page_range:
-                max_page = _parse_page_range_max(f_page_range)
-                if max_page > page_count:
-                    sub_status = "rejected"
-                    reject_reason = f"页码范围超出文件总页数（填写 {max_page} 页，文件共 {page_count} 页）"
-                    print(f"  [REJECT] 提交时打回: {f_name} range={f_page_range} 超出 {page_count} 页")
-
-            f_image_orientation = f.get("image_orientation", "auto") or "auto"
-            if f_image_orientation not in ("auto", "landscape", "portrait"):
-                f_image_orientation = "auto"
-
+        for item in file_plan:
+            if item["persist_pages"] is not None:
+                conn.execute(
+                    "UPDATE files SET page_count = ?, page_count_verified = ? WHERE id = ?",
+                    (item["page_count"], int(item["page_count_verified"]), item["file_id"]),
+                )
             conn.execute(
                 """INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,
                                             page_range, price_per_page, total_price, is_free, status, created_at, duplex, reject_reason, image_orientation)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (order_id, f_id or None, f_name, f_copies, page_count,
-                 f_page_range, 0, total_price, is_free_val, sub_status, created_at, f_duplex, reject_reason, f_image_orientation),
+                (order_id, item["file_id"], item["file_name"], item["copies"], item["page_count"],
+                 item["page_range"], 0, item["total_price"], 0, item["status"], created_at,
+                 item["duplex"], item["reject_reason"], item["image_orientation"]),
             )
             sub_task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             sub_tasks.append({
-                "id": sub_task_id, "file_id": f_id, "file_name": f_name,
-                "copies": f_copies, "page_count": page_count,
-                "page_count_verified": page_count_verified,
-                "page_range": f_page_range,
-                "total_price": total_price, "status": sub_status,
-                "duplex": f_duplex,
-                "image_orientation": f_image_orientation,
-                "reject_reason": reject_reason,
+                "id": sub_task_id, "file_id": item["file_id"] or "",
+                "file_name": item["file_name"],
+                "copies": item["copies"], "page_count": item["page_count"],
+                "page_count_verified": item["page_count_verified"],
+                "page_range": item["page_range"],
+                "total_price": item["total_price"], "status": item["status"],
+                "duplex": item["duplex"],
+                "image_orientation": item["image_orientation"],
+                "reject_reason": item["reject_reason"],
             })
 
         # 汇总父订单 total_price 和 page_count
@@ -6675,16 +6722,25 @@ def submit_order():
           f"schedule_mode={schedule_mode}, scheduled_at={scheduled_at}, "
           f"is_admin_print={admin_print}, owner_name={owner_name!r}")
 
-    return jsonify({
+    # S2-02：响应体保护 —— 子任务列表超过 MAX_ECHO_FILES 条时只回前 N 条 + 汇总
+    # （现在入口上限是 MAX_ORDER_FILES=20，正常永远不触发；留着是为了将来放宽上限时
+    #  不会把一个 MB 级的列表一次回显出去）。
+    # 同时**不再回显请求体 data**：那是客户端原样上传的 JSON（可带任意垃圾键），
+    # 回显等于把请求体再原样发回去一倍，属于纯粹的放大面（客户端两侧都不读这个字段）。
+    resp_files = sub_tasks[:MAX_ECHO_FILES]
+    payload = {
         "success": True,
         "message": "任务已接收" + ("，已推送打印" if pushed_count > 0 else "，排队等待打印"),
         "order_id": order_id,
         "order_number": order_number,
         "status": final_status,
-        "files": sub_tasks,
+        "files": resp_files,
+        "files_total": len(sub_tasks),
         "pushed_count": pushed_count,
-        "data": data,
-    })
+    }
+    if len(sub_tasks) > MAX_ECHO_FILES:
+        payload["files_omitted"] = len(sub_tasks) - MAX_ECHO_FILES
+    return jsonify(payload)
 
 
 

@@ -85,8 +85,9 @@ H.chk("_load_paper_prices 走缓存（原来每一笔计价都读盘）",
       "_cached_json_read(path, _paper_prices_cache, _paper_prices_lock)" in prices_block)
 H.chk("calculate_price 支持传入单价（批量计价不再每个文件各读一次）",
       "prices=None" in calc_block and "prices or _load_paper_prices()" in calc_block)
-H.chk("submit_order 把单价读到文件循环外",
-      "_paper_prices = _load_paper_prices()" in code and "prices=_paper_prices" in code)
+H.chk("单价只读一次、不随文件循环重复读取（S2-02 起改为传进 _plan_order_files）",
+      "schedule_mode, _load_paper_prices())" in code and "prices=prices" in code
+      and "_paper_prices = _load_paper_prices()" not in code)
 
 for name, sql in [
     ("orders(openid, id)", "CREATE INDEX IF NOT EXISTS idx_orders_openid_id ON orders(openid, id)"),
