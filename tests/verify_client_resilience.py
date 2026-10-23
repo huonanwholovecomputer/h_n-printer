@@ -325,6 +325,14 @@ def check_unsynced_ui(files):
         bad.append("gui: 没有手动重试入口")
     if "sync.retry_now(" not in gui:
         bad.append("gui: 手动重试没调用 offline_sync.retry_now()")
+    # 2026-10-23 用户要求：菜单项只在真有未同步单时出现（平时是纯噪音），与角标同一判据
+    if not re.search(r"(?:self\._offline_action|action)\.setVisible\(n > 0\)", gui):
+        bad.append("gui: 文件菜单「离线未同步订单」没有按未同步数显隐（要求：有未同步单才出现）")
+    if "self._offline_action.setVisible(False)" not in gui:
+        bad.append("gui: 菜单项没有默认隐藏（首帧会闪一下）")
+    # 窗口提示曾是 markdown 写法（**只存在本机**），QLabel 不解析 → 原样显示星号
+    if "下列订单只存在本机" not in gui or "**只存在本机**" in gui:
+        bad.append("gui: 「离线未同步订单」窗口提示残留 markdown 星号（**…**）")
     st = _strip_py_docstrings(_py_func_block(gui, "status_text"))
     if "离线未同步" not in st:
         bad.append("gui: 状态列没有「离线未同步」")

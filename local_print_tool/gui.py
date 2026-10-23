@@ -3933,7 +3933,7 @@ class OfflineOrdersDialog(QDialog):
 
         root = QVBoxLayout(self)
         self._hint = QLabel(
-            "下列订单**只存在本机**，云端还没有它们（结算页也就看不到）。"
+            "下列订单只存在本机，云端还没有它们（结算页也就看不到）。"
             "联网后会自动补报（失败按 1.5× 指数退避，永不放弃）；也可以现在就手动重试。")
         self._hint.setWordWrap(True)
         root.addWidget(self._hint)
@@ -4899,22 +4899,28 @@ class MainWindow(QMainWindow):
     # ── S1-09：离线未同步订单（状态栏角标 / 明细窗 / 手动重试）──
 
     def _refresh_offline_badge(self):
-        """刷新状态栏「📴 离线未同步 N」角标（**本地 SQLite 计数，不走网络**）。"""
+        """刷新「📴 离线未同步」状态栏角标 + 文件菜单入口（**本地 SQLite 计数，不走网络**）。
+
+        两处同一判据「未同步数 > 0」：状态栏角标（带条数）负责"有事要你看"，文件菜单项负责
+        "点开看明细 / 手动重试"。2026-10-23 用户要求菜单项**只在真有未同步单时出现** ——
+        没有未同步单时它就是一行纯噪音；而角标一出现菜单项会跟着出现，入口不会丢。
+        """
+        action = getattr(self, "_offline_action", None)
         btn = getattr(self, "_offline_badge", None)
+        n, rejected = 0, 0
+        sync = getattr(self, "_offline_sync", None)
+        if sync is not None:
+            try:
+                summary = sync.status_summary()
+                n = int(summary.get("unsynced", 0) or 0)
+                rejected = int(summary.get("rejected", 0) or 0)
+            except Exception as e:
+                logger.debug(f"刷新离线角标失败: {e}")
+                n, rejected = 0, 0
+        if action is not None:
+            action.setVisible(n > 0)
         if btn is None:
             return
-        sync = getattr(self, "_offline_sync", None)
-        if sync is None:
-            btn.setVisible(False)
-            return
-        try:
-            summary = sync.status_summary()
-        except Exception as e:
-            logger.debug(f"刷新离线角标失败: {e}")
-            btn.setVisible(False)
-            return
-        n = int(summary.get("unsynced", 0) or 0)
-        rejected = int(summary.get("rejected", 0) or 0)
         if n <= 0:
             btn.setVisible(False)
             btn.setText("")
@@ -5204,11 +5210,14 @@ class MainWindow(QMainWindow):
         cloud_action.triggered.connect(self._on_cloud_settings)
         file_menu.addAction(cloud_action)
 
-        # S1-09：离线未同步订单（本地库里 synced=0 的单，云端还没有）——手动重试入口
-        offline_action = QAction("📴 离线未同步订单(&O)…", self)
-        offline_action.setToolTip("查看本机还没上报到云端的订单，并可手动重试上传")
-        offline_action.triggered.connect(self._open_offline_orders_dialog)
-        file_menu.addAction(offline_action)
+        # S1-09：离线未同步订单（本地库里 synced=0 的单，云端还没有）——手动重试入口。
+        # 2026-10-23 用户要求：**只在真有未同步单时出现**（平时它就是一行纯噪音）。
+        # 显隐由 _refresh_offline_badge() 统一决定（同一判据 n>0），与状态栏角标同步。
+        self._offline_action = QAction("📴 离线未同步订单(&O)…", self)
+        self._offline_action.setToolTip("查看本机还没上报到云端的订单，并可手动重试上传")
+        self._offline_action.triggered.connect(self._open_offline_orders_dialog)
+        self._offline_action.setVisible(False)      # 默认隐藏，下面按本地库真实条数定一次
+        file_menu.addAction(self._offline_action)
 
         file_menu.addSeparator()
 
@@ -5285,6 +5294,11 @@ class MainWindow(QMainWindow):
         self._shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self)
         self._shortcut_paste.setContext(Qt.ApplicationShortcut)
         self._shortcut_paste.activated.connect(self._on_shortcut_paste)
+
+        # 菜单建完了：按本地库里当前真实的未同步条数定一次「离线未同步订单」显隐
+        # （此刻状态栏还没建，_refresh_offline_badge 只动菜单项；角标随后由
+        #  _init_cloud_client → _refresh_offline_badge 补一次）
+        self._refresh_offline_badge()
 
     # ---- 自更新（检查 / 下载 / 触发静默安装）----
 
