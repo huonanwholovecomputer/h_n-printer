@@ -230,6 +230,41 @@ AVATAR_DIR = os.path.join(UPLOAD_DIR, "avatars")
 MD5_INDEX_FILE = os.path.join(UPLOAD_DIR, "md5_index.json")
 RETENTION_CONFIG_FILE = os.path.join(UPLOAD_DIR, "retention_config.json")
 
+
+# ===== S2-11（DS-20）：日志脱敏助手 =====
+# 日志进 journald（会留 30 天、可被 collect_all 打包回传），所以**顾客原文件名与绝对路径
+# 一律不落盘**：排查靠 file_id / MD5 前缀已经够用，原文件名属于顾客隐私，绝对路径会暴露
+# 部署目录结构（DS-10 同一类信息面）。错误文本同理：OSError 的 str 里通常带完整路径。
+def _redact_filename(name: str) -> str:
+    """日志用文件名：只保留扩展名（xxx.pdf → ***.pdf）。"""
+    ext = os.path.splitext(name or "")[1].lower()
+    return ("***" + ext) if ext else "***"
+
+
+_PATH_IN_TEXT_RE = re.compile(r"(?:[A-Za-z]:\[^\s'\"<>]+|/(?:[\w.\-]+/)*[\w.\-]+)")
+
+
+def _redact_paths(text: str) -> str:
+    """把一段文本里的绝对路径（C:\... 或 /a/b/c）替换成 <path>。
+
+    用于异常文本：`str(e)` 经常带完整路径（OSError/FileNotFoundError），而异常文本会进
+    journald 并被「日志管理」打包回传。只留诊断用的类名 + 少量上下文，路径不落盘。"""
+    return _PATH_IN_TEXT_RE.sub("<path>", text or "")
+
+
+def _rel_display(path: str) -> str:
+    """日志用路径：uploads 下的给相对路径，其余只给 basename（绝不打印绝对路径）。"""
+    if not path:
+        return ""
+    try:
+        base = os.path.abspath(UPLOAD_DIR)
+        full = os.path.abspath(path)
+        if full == base or full.startswith(base + os.sep):
+            return os.path.relpath(full, base)
+    except (OSError, ValueError):
+        pass
+    return os.path.basename(path)
+
 # 打印机设备注册表 / 接单接管状态（2026-11 新增：多设备共连服务器时的唯一接管者机制）
 # devices.json: { client_id: {device_name, owner_name, first_seen, last_seen} }
 DEVICES_FILE = "devices.json"
@@ -730,7 +765,7 @@ def build_md5_index():
                             }
                             print(f"  [MD5] 补充索引: {md5[:8]}... → {rel}")
                     except Exception as e:
-                        print(f"  [MD5] 扫描文件失败 {fpath}: {e}")
+                        print(f"  [MD5] 扫描文件失败 {_rel_display(fpath)}: {type(e).__name__}")
         save_md5_index(existing)
         print(f"  [MD5] 索引已更新，共 {len(existing)} 条记录")
         return
@@ -750,13 +785,13 @@ def build_md5_index():
                 md5 = get_file_md5(fpath)
                 ext = os.path.splitext(fname)[1].lower().lstrip(".")
                 if md5 in index:
-                    print(f"  [MD5] 重复文件: {fpath}")
+                    print(f"  [MD5] 重复文件: {_rel_display(fpath)}")
                 index[md5] = {
                     "path": rel, "original_name": fname,
                     "page_count": 0, "page_count_verified": False,
                 }
             except Exception as e:
-                print(f"  [MD5] 扫描文件失败 {fpath}: {e}")
+                print(f"  [MD5] 扫描文件失败 {_rel_display(fpath)}: {type(e).__name__}")
     save_md5_index(index)
     print(f"  [MD5] 索引构建完成，共 {len(index)} 条记录")
 
@@ -901,7 +936,7 @@ def cleanup_expired_files():
             try:
                 os.remove(file_path)
             except OSError as e:
-                print(f"  [CLEANUP] 删除文件失败 {file_path}: {e}")
+                print(f"  [CLEANUP] 删除文件失败 {_rel_display(file_path)}: {type(e).__name__}")
                 continue
 
         # 从 MD5 索引中移除（兼容新旧格式）
@@ -5300,7 +5335,7 @@ def _on_unhandled_exception(e):
     if isinstance(e, HTTPException):
         return e
     print(f"[ERROR] {request.method} {request.path} ip={request.remote_addr} "
-          f"exc={type(e).__name__}: {_scrub_secret(str(e))[:160]}")
+          f"exc={type(e).__name__}: {_redact_paths(_scrub_secret(str(e)))[:160]}")
     return jsonify({"success": False, "message": "服务器内部错误"}), 500
 
 
@@ -5597,7 +5632,7 @@ def delete_my_file(file_id):
             try:
                 os.remove(path)
             except OSError as e:
-                print(f"  [DEL] 删除文件失败 {path}: {e}")
+                print(f"  [DEL] 删除文件失败 {_rel_display(path)}: {type(e).__name__}")
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
         conn.commit()
     finally:
@@ -6240,7 +6275,7 @@ def upload_file():
     # 可读 file:///…/print_config.json 并把全站 printer token 外发（DS-01 的完整链路）。
     # 放在落盘之前拒绝，不写临时文件；对存量客户端立即生效（客户端侧入口由 S0-09 删除）。
     if ext_lower in DANGEROUS_UPLOAD_EXTS:
-        print(f"  [UPLOAD] 拒绝危险类型上传: {f.filename!r} ext={ext_lower}")
+        print(f"  [UPLOAD] 拒绝危险类型上传: {_redact_filename(f.filename)!r} ext={ext_lower}")
         return jsonify({
             "success": False,
             "message": "本服务不支持 HTML/SVG/JS 文件；请另存为 PDF/DOCX 后重试",
@@ -6248,7 +6283,7 @@ def upload_file():
     # S2-03：白名单 + MIME 冲突（落盘之前就能判的两项；魔数要读内容，放在保存之后）。
     # 白名单先行 ⇒ 压缩包/未知类型连临时文件都不写。
     if ext_lower not in UPLOAD_EXT_WHITELIST:
-        print(f"  [UPLOAD] 拒绝白名单外类型: {f.filename!r} ext={ext_lower}")
+        print(f"  [UPLOAD] 拒绝白名单外类型: {_redact_filename(f.filename)!r} ext={ext_lower}")
         return jsonify({
             "success": False,
             "message": (f"本服务不支持 .{ext_lower} 文件；支持 PDF/Word/Excel/PPT/TXT/CSV/"
@@ -6256,7 +6291,7 @@ def upload_file():
         }), 400
     _client_mime = (f.mimetype or "").lower().strip()
     if _client_mime in _DANGEROUS_MIMES:
-        print(f"  [UPLOAD] 拒绝危险 MIME: {f.filename!r} mime={_client_mime}")
+        print(f"  [UPLOAD] 拒绝危险 MIME: {_redact_filename(f.filename)!r} mime={_client_mime}")
         return jsonify({
             "success": False,
             "message": "本服务不支持 HTML/SVG/JS 文件；请另存为 PDF/DOCX 后重试",
@@ -6281,7 +6316,7 @@ def upload_file():
             os.remove(temp_path)
         except OSError:
             pass
-        print(f"  [UPLOAD] 拒绝类型不一致上传: {f.filename!r} ext={ext_lower} "
+        print(f"  [UPLOAD] 拒绝类型不一致上传: {_redact_filename(f.filename)!r} ext={ext_lower} "
               f"mime={_client_mime!r} 原因={_sig_msg}")
         return jsonify({"success": False, "message": _sig_msg}), 400
 
@@ -6300,7 +6335,7 @@ def upload_file():
                 os.remove(temp_path)
             except OSError:
                 pass
-            print(f"  [UPLOAD] 拒绝含危险语法的 Markdown: {f.filename!r} 命中={_hit}")
+            print(f"  [UPLOAD] 拒绝含危险语法的 Markdown: {_redact_filename(f.filename)!r} 命中={_hit}")
             return jsonify({
                 "success": False,
                 "message": "文档包含不安全内容，已拒绝——请另存为 PDF/DOCX 后重试",
@@ -6350,7 +6385,7 @@ def upload_file():
             # 读取缓存的页数
             cached_page_count = existing_entry.get("page_count", 0) or 0
             cached_page_verified = existing_entry.get("page_count_verified", False)
-            print(f"  [MD5] 文件复用: {f.filename} → {existing_rel} (MD5={file_md5[:8]}..."
+            print(f"  [MD5] 文件复用: {_redact_filename(f.filename)} → {existing_rel} (MD5={file_md5[:8]}..."
                   f"{', 页数已验证=' + str(cached_page_count) if cached_page_verified else ''})")
         else:
             # 索引记录存在但磁盘文件丢失 → 清理索引，走新文件保存
@@ -6386,7 +6421,7 @@ def upload_file():
     if cached_page_verified and cached_page_count > 0:
         # 同 MD5 文件已由本地工具验证 → 直接复用页数，跳过分析
         page_count = cached_page_count
-        print(f"  [PAGE] 复用已验证页数: {f.filename} → {page_count} 页 (from MD5 cache)")
+        print(f"  [PAGE] 复用已验证页数: {_redact_filename(f.filename)} → {page_count} 页 (from MD5 cache)")
     else:
         page_count = get_file_page_count(file_path, ext_lower)
 
@@ -6411,7 +6446,8 @@ def upload_file():
         prefer_client = (request.form.get("target_client_id", "") or "").strip()[:64]
         request_page_analysis(file_id, f.filename, prefer_client=prefer_client)
 
-    print(f"文件上传: {f.filename} -> {file_path} (id={file_id}, pages={page_count}, reused={reused})")
+    print(f"文件上传: {_redact_filename(f.filename)} -> {_rel_display(file_path)} "
+          f"(id={file_id}, pages={page_count}, reused={reused})")
 
     return jsonify(
         {
@@ -8274,7 +8310,9 @@ def abandon_reserved_order():
         return jsonify({"success": True, "message": f"已处理 {count} 个预留订单"})
     except Exception as e:
         conn.rollback()
-        return jsonify({"success": False, "message": str(e)}), 500
+        print(f"[ERROR] {request.method} {request.path} exc={type(e).__name__}: "
+              f"{_redact_paths(_scrub_secret(str(e)))[:160]}")
+        return jsonify({"success": False, "message": "服务器内部错误"}), 500
     finally:
         conn.close()
 
@@ -8425,7 +8463,9 @@ def local_orders():
         return jsonify({"success": True, "order_id": order_id})
     except Exception as e:
         conn.rollback()
-        return jsonify({"success": False, "message": str(e)}), 500
+        print(f"[ERROR] {request.method} {request.path} exc={type(e).__name__}: "
+              f"{_redact_paths(_scrub_secret(str(e)))[:160]}")
+        return jsonify({"success": False, "message": "服务器内部错误"}), 500
     finally:
         conn.close()
 
@@ -9713,7 +9753,7 @@ def admin_storage():
                     deleted_count += 1
                     deleted_size += size
                 except OSError as e:
-                    print(f"  [DELETE-ALL] 删除失败 {fpath}: {e}")
+                    print(f"  [DELETE-ALL] 删除失败 {_rel_display(fpath)}: {type(e).__name__}")
 
         # 清空 MD5 索引
         save_md5_index({})

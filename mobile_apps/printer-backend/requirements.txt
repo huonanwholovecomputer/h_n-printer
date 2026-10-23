@@ -1,10 +1,23 @@
-flask
-flask-cors
-flask-socketio
-APScheduler
-requests
-python-socketio
-pypdf
-gunicorn
-eventlet
-Pillow
+# HN 云打印后端 — 生产依赖（S2-07：**锁版本**，与线上 venv 的 pip freeze 逐项对齐）
+#
+# 依据 docs/安全加固修复计划_2026-10-23.md §S2-07（DS-17）。
+#   · 全部用 `==` 固定：`pip install -r requirements.txt` 拿到的是**可复现**的一套；
+#   · 只列**直接依赖**，传递依赖由解析器决定（如需逐字节复现，另跑 pip-compile 出锁文件）；
+#   · eventlet 已删除：实时通道用 async_mode="threading" + gunicorn gthread，
+#     eventlet 是历史遗留，留着只会把 monkey-patch 风险重新引进来。
+#     ⚠ 服务器 venv 里仍装着它（pip 不会自动卸载）；确认线上无 worker_class=eventlet 后
+#     可以 `pip uninstall eventlet` 清掉（见 DEPLOY.md「依赖治理」）。
+#   · 发布前检查：`pip install pip-audit && pip-audit -r requirements.txt`。
+flask==3.1.3
+flask-cors==6.0.5
+flask-socketio==5.6.1
+APScheduler==3.11.2
+requests==2.34.2
+python-socketio==5.16.3
+pypdf==6.13.2
+gunicorn==21.2.0
+Pillow==12.3.0
+# Flask 的传递依赖，但 app.py **直接 import** 了它们 ⇒ 必须显式锁定，
+# 否则 Flask 升级时会被动换版本（安全修复与回归都不可预测）。
+Werkzeug==3.1.8
+itsdangerous==2.2.0

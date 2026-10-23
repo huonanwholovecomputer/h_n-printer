@@ -167,15 +167,39 @@ cp /opt/printer-backend/nginx-https.conf /etc/nginx/sites-available/printer-back
 
 ---
 
-## 8. 配置备份
+## 8. 配置备份（S2-06 重构，2026-10-23）
+
+`backup.sh` 现在：用 **SQLite 在线 backup API**（不是 `cp`，WAL 模式下 `cp` 会丢最近未 checkpoint 的订单）、
+同时备 **orders.db + users.db**、备份后立刻 `integrity_check`、gzip、按 `RETENTION_DAYS` 清理、
+支持 `--restore-check` 做一次**恢复演练**（恢复临时目录 → 核对完整性 + 各表行数 + 最新订单 + WAL 缺失）。
 
 ```bash
-# 设置每天凌晨 3 点自动备份
-echo "0 3 * * * /opt/printer-backend/backup.sh >> /var/log/printer-backup.log 2>&1" | crontab -
+# 生产目录是 /home/printer-backend（不是 /opt），装 cron：
+echo "0 3 * * * /home/printer-backend/backup.sh >> /var/log/printer-backup.log 2>&1" | crontab -
 
-# 手动执行一次测试
-bash /opt/printer-backend/backup.sh
+# 手动执行一次 + 当场恢复演练（必须看到 RESTORE_CHECK=ok）
+bash /home/printer-backend/backup.sh --restore-check
+
+# 可选：静态加密（配了 GPG 收件人就只留 .gz.gpg、删掉明文）与异地副本
+BACKUP_GPG_RECIPIENT=hn-backup@example.com \
+BACKUP_REMOTE=root@backup-host:/srv/hn-backups/ \
+bash /home/printer-backend/backup.sh
 ```
+
+⚠ **共享密钥不在仓库里**：GPG 公钥与异地主机需要运维自己准备；没有配这两个时脚本仍会正常出
+`.gz` 到本机 `backups/`（并照常 `integrity_check` + 保留期清理），只是少了"加密 + 异地"两层。
+
+## 8.1 依赖治理（S2-07）
+
+`requirements.txt` 现在**逐行锁死版本**，且与线上 venv 的 `pip freeze` 对齐。规则：
+
+- 新增依赖先在这里固定 `==`，再 `pip install -r requirements.txt`；不要在服务器上 `pip install <包>` 裸装。
+- `eventlet` 已从依赖里删除（实时通道是 `async_mode="threading"` + gunicorn **gthread**）。
+  服务器 venv 里可能还留着它（`pip` 不会自动卸载）；确认 `gunicorn_config.py` 里
+  `worker_class` 不是 eventlet 后可以 `pip uninstall eventlet`。
+- 发布前跑一次 CVE 扫描：`pip install pip-audit && pip-audit -r requirements.txt`
+  （离线环境会失败，属于预期；联网机器上必须跑过）。
+- 验收：`python tests/verify_dependencies.py`（锁版本 / 无 eventlet / import 与依赖对齐 + 变异自证）。
 
 ---
 
