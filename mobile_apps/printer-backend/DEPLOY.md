@@ -279,3 +279,51 @@ curl -s "http://127.0.0.1:5000/api/printer/devices?token=$TOKEN"
 | 文件上传失败 | 检查 `client_max_body_size`（Nginx）和 `MAX_CONTENT_LENGTH`（Flask） |
 | 备份没有执行 | 检查 crontab：`crontab -l`；确保 backup.sh 有执行权限 |
 | 服务无法启动 | `journalctl -u printer-backend -n 30` 查看错误日志 |
+
+---
+
+## 12. 安全加固（2026-10-23，S0-A）——线上真配置与运维脚本
+
+本节对应 `docs/安全加固修复计划_2026-10-23.md` 的 S0-A 批次。**线上为唯一真相**，
+下面这些文件就是 2026-10-23 在生产实际生效的版本（已脱敏、已入库，改动前请比对线上）。
+
+| 文件 | 服务器位置 | 说明 |
+|---|---|---|
+| `nginx-production-hn-space.conf` | `/etc/nginx/sites-enabled/printer-backend` | 站点配置（`limit_conn_zone hn_conn`、`hn_sio`/`hn_login` 请求桶、`/socket.io/` 限速 + 120s 超时、`/api/` burst 150 + body 2m、上传 50m、profile 3m、登录 64k/conn 3）。**不要**用 `nginx-https.conf` 覆盖它（那是模板：含 `http2`、`proxy_read_timeout 3600s`、无 `hn_login`） |
+| `nginx-conf-d-00-security-hardening.conf` | `/etc/nginx/conf.d/00-security-hardening.conf` | http 上下文：`client_header_timeout/client_body_timeout 10s`、`send_timeout 30s`、`keepalive_timeout 30s`、`reset_timedout_connection on`、`limit_req_status 429`、`limit_conn_status 429` |
+| `ops/hn_metrics.py` | `/home/printer-backend/ops/` | S0-08 指标采集（cron 每分钟）：`logs/metrics-YYYYMMDD.csv` + `logs/alerts.log`；可选 Prometheus textfile |
+| `ops/health_probe.py` | **另一台机器** | 外部拨测（每 60s，连续 2 次失败告警，`--selftest` 演练）；`HN_ALERT_WEBHOOK` 配企业微信/钉钉/自建 |
+
+```bash
+# 应用/回滚 nginx（回滚 ≤60s，reload 不断已建连接）
+cp /root/nginx-backup-*/printer-backend /etc/nginx/sites-enabled/printer-backend
+install -m 644 nginx-conf-d-00-security-hardening.conf /etc/nginx/conf.d/00-security-hardening.conf
+nginx -t && systemctl reload nginx
+
+# S0-08 指标 cron
+cat > /etc/cron.d/hn-metrics <<'CRON'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+* * * * * root cd /home/printer-backend && python3 ops/hn_metrics.py >> /home/printer-backend/logs/metrics-cron.log 2>&1
+CRON
+
+# 冒烟：匿名 Engine.IO 握手必须 403（S0-02 的门在工作）
+curl -sS -o /dev/null -w '%{http_code}\n' "https://hn-space.cn/socket.io/?EIO=4&transport=polling"
+```
+
+**部署时的三个坑（本批实测）**
+
+1. **gunicorn 的默认 access log 会把 `?token=` 写进 journald**（每台设备每次心跳一条）。
+   `gunicorn_config.py` 必须保留 `access_log_format`（只记 `%(m)s %(U)s`，丢掉 query string），
+   否则 S0-06 的"日志里没有 token"永远不成立。
+2. **`client_max_body_size` 改成 server 级 2m 后别忘上传**：`/api/upload` 的 50m 是
+   **location 级覆盖**，删掉那一行会静默把上传压到 2m。
+3. `limit_conn` 命中是**并发**判定、`limit_req` 命中是**速率**判定：现场用单源 IP（服务器自身
+   `--resolve` 到 127.0.0.1）才能验证出 429；从校园网多出口 IP 打只会分散到不同桶，永远看不到 429。
+
+**运维动作（代码/配置之外）**
+
+- 轮换 printer token：`config.py` 先写 `TOKEN=<新>` + `TOKEN_PREV=<旧>`（后端双接受），
+  逐台更新门店 `print_config.json` 并确认 `/api/printer/devices` 200，最后删 `TOKEN_PREV`。
+- 结算页「设置 → 敏感模块密码」7 个模块的默认 `123456` 必须逐个改成强密码（S0-07 的人工部分）。
+- 全员重登：S0-07 换了登录 salt（`login-v2`），所有 7 天登录态一次性作废（D-3 已接受）。

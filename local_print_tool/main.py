@@ -294,7 +294,7 @@ def _check_external_tools(logger: logging.Logger):
     if wk:
         logger.info(f"✓ wkhtmltopdf: {wk}")
     else:
-        logger.warning("✗ 未找到 wkhtmltopdf — HTML/Markdown 无法转换")
+        logger.warning("✗ 未找到 wkhtmltopdf — Markdown 无法转换（HTML 已不支持）")
 
     sumatra = _find_sumatra_pdf()
     if sumatra:

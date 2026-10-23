@@ -100,7 +100,7 @@ import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.31"
+APP_VERSION = "4.5.32"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -247,6 +247,10 @@ ENGINE_CHOICE_LABELS = ["Word", "WPS", "LibreOffice"]
 ENGINE_MIXED_LABEL = "混合（各自保留）"
 ENGINE_MIXED_TIP = "选中的 Word 文档引擎不一致，当前各自保留原设置；选一个具体引擎可统一改掉"
 
+# S0-09 / D-2（2026-10-23）：HTML 打印支持**永久删除**（转换器已不注册 .html/.htm，
+# 且本机转换器禁止本地文件访问、禁用 JS）。拒绝文案只维护这一份，拖入/粘贴/对话框共用。
+HTML_UNSUPPORTED_MSG = "本工具已不支持 HTML 文件，请另存为 PDF/DOCX 后打印"
+
 
 def _format_engine_label(ext: str) -> str:
     """返回某文件格式实际使用的 PDF 转换引擎名（参数面板灰色显示用）。"""
@@ -254,8 +258,6 @@ def _format_engine_label(ext: str) -> str:
         return "Word"
     if ext == ".md":
         return "markdown 库"
-    if ext in (".html", ".htm"):
-        return "wkhtmltopdf"
     if ext in (".txt", ".csv"):
         return "reportlab"
     if ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"):
@@ -8401,11 +8403,49 @@ class MainWindow(QMainWindow):
                     return True
         return False
 
+    def _clipboard_paths(self) -> list[str]:
+        """剪贴板里的**全部**本地文件路径（文件管理器 URL + 纯文本路径，不按扩展名过滤）。
+
+        S0-09：粘贴 `.html/.htm` 时要给明确拒绝文案，所以先把候选路径全部收上来，
+        再由调用方区分「可添加的格式」与「已被永久删除的 HTML」。
+        """
+        paths: list[str] = []
+        mime = QApplication.clipboard().mimeData()
+        if mime is not None and mime.hasUrls():
+            for url in mime.urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if os.path.isfile(path):
+                        paths.append(os.path.normpath(path))
+        if not paths:
+            text = QApplication.clipboard().text().strip()
+            for line in text.splitlines():
+                line = line.strip().strip('"').strip("'")
+                if line and os.path.isfile(line):
+                    paths.append(os.path.normpath(line))
+        return paths
+
+    def _warn_html_unsupported(self, paths: list[str]):
+        """S0-09 / D-2：往列表里加 `.html/.htm` 时给明确文案（不静默丢弃）。"""
+        if not paths:
+            return
+        names = "、".join(os.path.basename(p) for p in paths[:5])
+        if len(paths) > 5:
+            names += f" 等 {len(paths)} 个文件"
+        msg = f"{HTML_UNSUPPORTED_MSG}\n\n已跳过: {names}"
+        self._log("⛔ " + msg.replace("\n", " "))
+        QMessageBox.warning(self, "不支持 HTML 文件", msg)
+
     def _on_paste_files(self):
         """从剪贴板粘贴文件，支持文件管理器复制和纯文本路径。"""
         allowed = {".pdf", ".doc", ".docx", ".txt", ".md",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         files: list[str] = []
+        # S0-09：HTML 已永久不支持 —— 单独收集，给明确提示而不是默默忽略
+        html_paths = [
+            p for p in self._clipboard_paths()
+            if os.path.splitext(p)[1].lower() in (".html", ".htm")
+        ]
 
         # 1. 优先处理文件管理器复制的 URL 列表（mimeData 可能为 None，同 _can_paste_files）
         mime = QApplication.clipboard().mimeData()
@@ -8430,7 +8470,9 @@ class MainWindow(QMainWindow):
 
         if files:
             self._add_files_to_table(files)
-        else:
+        if html_paths:
+            self._warn_html_unsupported(html_paths)
+        elif not files:
             QMessageBox.information(self, "粘贴", "剪贴板中没有可识别的文件。\n\n"
                                     "请先在文件管理器中复制文件(Ctrl+C)，再来粘贴。\n"
                                     "支持格式: PDF, Word(.doc/.docx), "
@@ -8443,7 +8485,7 @@ class MainWindow(QMainWindow):
             " *.jpg *.jpeg *.png *.bmp *.gif *.webp);;"
             "PDF (*.pdf);;"
             "Word 文档 (*.doc *.docx);;"
-            "文本 (*.txt *.md *.html *.htm);;"
+            "文本 (*.txt *.md);;"
             "图片 (*.jpg *.jpeg *.png *.bmp *.gif *.webp);;"
             "所有文件 (*.*)"
         )
@@ -8500,6 +8542,14 @@ class MainWindow(QMainWindow):
             return  # 让输入框正常处理粘贴
         if self._can_paste_files():
             self._on_paste_files()
+            return
+        # S0-09 / D-2：只在剪贴板里是 HTML 时也要给明确文案（否则 Ctrl+V 毫无反应）
+        html_paths = [
+            p for p in self._clipboard_paths()
+            if os.path.splitext(p)[1].lower() in (".html", ".htm")
+        ]
+        if html_paths:
+            self._warn_html_unsupported(html_paths)
 
     def _abandon_jobs(self, jobs):
         """通知后端放弃未打印的云端任务（已完成的跳过）。"""
@@ -11007,7 +11057,7 @@ class MainWindow(QMainWindow):
                      _status_text(lo is not None, f"<small>{lo or ''}</small>")))
 
         wk = _find_wkhtmltopdf()
-        rows.append(("wkhtmltopdf<br><small>(HTML/MD→PDF)</small>",
+        rows.append(("wkhtmltopdf<br><small>(Markdown→PDF；HTML 已不支持)</small>",
                      _status_text(wk is not None, f"<small>{wk or ''}</small>")))
 
         sumatra = _find_sumatra_pdf()
@@ -12893,6 +12943,7 @@ class MainWindow(QMainWindow):
             ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
         }
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+        html_rejected: list[str] = []
 
         self._cancel_undo_if_active()
         jobs = self._get_current_jobs()
@@ -12916,6 +12967,10 @@ class MainWindow(QMainWindow):
             if src in existing_paths or src_key in existing_sources:
                 continue  # 已在列表中
             ext = os.path.splitext(src)[1].lower()
+            if ext in (".html", ".htm"):
+                # S0-09 / D-2：HTML 打印支持**永久删除**。不静默 continue，收上来统一提示
+                html_rejected.append(src)
+                continue
             if ext not in allowed_types:
                 continue
             # 关键：复制工作副本（原件之后被删/临时目录被系统清理都不影响打印）
@@ -12953,6 +13008,10 @@ class MainWindow(QMainWindow):
                 page_count=page_count, orientation=orientation, engine=engine,
             )
             jobs.append(job)
+
+        if html_rejected:
+            # 拖入/粘贴/对话框选择 `.html/.htm`：明确告知不支持并给出替代路径
+            self._warn_html_unsupported(html_rejected)
 
         if len(jobs) > rows_before:
             self._set_current_jobs(jobs)

@@ -174,7 +174,11 @@ chk("后端接口存在且需 printer token",
     # F8b（2026-10-18）：窗口从 {0,900} 放宽到 {0,2500} —— `def admin_order_status():` 到
     # `_get_printer_token()` 的距离会随后端 docstring 增长（本批 F1/F2/F3 已从 848 涨到 1435，
     # 旧窗口余量只剩 52，docstring 再加一行就假红）。判据没变：接口存在 + 取 token 后再比对。
-    re.search(r"def admin_order_status\(\):[\s\S]{0,2500}?_get_printer_token\(\)[\s\S]{0,300}?token != PRINTER_TOKEN", app_src) is not None)
+    # S0-06（2026-10-23）：26 处内联 `token != PRINTER_TOKEN` 已收敛到统一助手
+    # `_printer_token_ok()`（轮换双接受 + 恒时比较）。判据随之接受新形态，语义不变：
+    # 取 token → 判定。把这一步删掉（不判 token）仍会红。
+    re.search(r"def admin_order_status\(\):[\s\S]{0,2500}?_get_printer_token\(\)[\s\S]{0,300}?"
+              r"(?:token != PRINTER_TOKEN|_printer_token_ok\(token\))", app_src) is not None)
 chk("父订单与全部子任务在**同一个事务**里改写（BEGIN IMMEDIATE）",
     # F8b 同款：窗口也随后端 docstring/函数体增长（本批 F1 在 BEGIN 之前加了「收集归属设备」
     # 一段，`def → BEGIN IMMEDIATE` 实测已涨到 2724，旧窗口 {0,2000} 直接假红）。

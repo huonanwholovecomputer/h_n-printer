@@ -9,6 +9,7 @@ converter.py — 通用文件转换器 UniversalConverter
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import platform
@@ -19,6 +20,7 @@ import tempfile
 import threading
 import time
 from typing import Callable
+from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
 
@@ -1119,11 +1121,163 @@ def _convert_image_to_pdf(file_path: str, output_pdf: str, orientation: str = "a
     logger.info(f"图片 → PDF 完成: {output_pdf} ({page_num} 页)")
 
 
+# ============================================================
+# S0-09（2026-10-23）：Markdown 渲染后 HTML 的安全闸门 + 本地图片内联
+# ============================================================
+# 背景（DS-01，已动态复现）：wkhtmltopdf 带「允许本地文件访问」开关时，顾客文档里的
+# <img src="file:///…/print_config.json"> 或 XHR 能把本机任意文件读进 PDF / 外发。
+# D-2 已拍板**永久拒绝 HTML 文件**，`.html/.htm` 的转换入口已从扩展名表删除；只剩
+# Markdown 内部仍走 HTML 管线，所以这里做两道闸：
+#   ① 转换前扫描危险语法 → 命中**直接拒绝**（不净化、不"尽力而为"）；
+#   ② 去掉「允许本地文件访问」开关后本地相对路径图片会被**静默丢弃**（附录 A-7），
+#      故先把输入文件同目录（含子目录）里的图片内联成 data: URI。内联做不到（不存在/
+#      越界/超限/格式不支持）就**明确失败**，绝不静默少印图片。
+
+# 与后端 S0-05 的 Markdown 扫描同一份判据；顺序无所谓，命中即拒。
+_UNSAFE_HTML_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("file: 协议（可读取本机任意文件）", re.compile(r"file:", re.IGNORECASE)),
+    ("UNC 网络路径（\\\\server\\share）", re.compile(r"\\\\")),
+    ("<script> 脚本", re.compile(r"<\s*script", re.IGNORECASE)),
+    ("<iframe> 内嵌框架", re.compile(r"<\s*iframe", re.IGNORECASE)),
+    ("<object> 外部对象", re.compile(r"<\s*object", re.IGNORECASE)),
+    ("<embed> 外部嵌入", re.compile(r"<\s*embed", re.IGNORECASE)),
+    ("内联事件处理器（on…=）", re.compile(r"\bon\w+\s*=", re.IGNORECASE)),
+    ("data:text/html 内联文档", re.compile(r"data\s*:\s*text/html", re.IGNORECASE)),
+)
+
+# 本地图片内联上限（附录 A-7）：单文件 ≤10MB、单份文档合计 ≤50MB
+_MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_INLINE_IMAGE_TOTAL_BYTES = 50 * 1024 * 1024
+# 只内联位图。SVG 可内嵌脚本（且属 D-2 的永久拒绝类型）⇒ 一律不内联，直接明确失败。
+_INLINE_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+
+_IMG_SRC_RE = re.compile(
+    r"""(<img\b[^>]*?\bsrc\s*=\s*)(?:"([^"]*)"|'([^']*)')""",
+    re.IGNORECASE,
+)
+
+
+def _scan_unsafe_html(html: str) -> None:
+    """Markdown 渲染后的 HTML 危险语法扫描（命中即拒绝转换，不做净化）。
+
+    命中抛现有的转换失败异常（`RuntimeError`，与 wkhtmltopdf 失败同一族 —— 本模块没有
+    也不新增 `ConversionError` 类），文案以「文档包含不安全内容」开头，GUI 会把它原样
+    显示在「✗ 错误: …」里，操作员据此请顾客另存 PDF/DOCX 或转人工。
+    """
+    if not html:
+        return
+    for label, pattern in _UNSAFE_HTML_PATTERNS:
+        m = pattern.search(html)
+        if not m:
+            continue
+        pos = m.start()
+        snippet = html[max(0, pos - 20):pos + 60].replace("\n", " ").replace("\r", " ")
+        raise RuntimeError(
+            f"文档包含不安全内容（{label}），已拒绝转换。"
+            f"命中片段: …{snippet}…。"
+            f"本工具不允许打印会读取本机文件或执行脚本的文档；"
+            f"请让顾客另存为 PDF/DOCX 后重试，或联系管理员人工核对。"
+        )
+
+
+def _inline_local_images(html: str, base_dir: str) -> str:
+    """把 `<img src>` 指向的本地文件内联成 data: URI（仅限 base_dir 及其子目录）。
+
+    为什么必须做（附录 A-7）：wkhtmltopdf 0.12 去掉「允许本地文件访问」开关后，
+    本地相对路径图片会被**静默丢弃**（不报错、PDF 里就是没有图）—— 顾客文档会少印
+    图片，而操作员看不出任何异常。所以转换前把图片自己读进来内联。
+
+    做不到的情况（图片不存在 / 超出输入文件目录 / 单文件 >10MB / 合计 >50MB / 格式
+    不支持）一律抛 RuntimeError 明确失败 —— **绝不**允许静默少印。
+    """
+    base = os.path.abspath(base_dir or ".")
+    total = 0
+
+    def _repl(m: re.Match) -> str:
+        nonlocal total
+        prefix = m.group(1)
+        src = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+        quote = '"' if m.group(2) is not None else "'"
+        raw = src.strip()
+        low = raw.lower()
+        # 已经是内联数据 / 远程 URL / 协议相对地址：原样保留（远程图仍交给 wkhtmltopdf
+        # 按 90s 整体超时去取；取不到属网络问题，不属于"本地文件访问"的范畴）
+        if (not raw or low.startswith("data:") or low.startswith("http://")
+                or low.startswith("https://") or raw.startswith("//")):
+            return m.group(0)
+        if low.startswith("file:"):
+            # 正常走不到（_scan_unsafe_html 已先拒绝），留着兜底防将来漏审
+            raise RuntimeError(
+                f"文档包含不安全内容（file: 协议图片 {raw}），已拒绝转换。"
+                f"请让顾客把图片嵌入文档后另存为 PDF/DOCX 再打印。")
+
+        rel = raw.split("#", 1)[0].split("?", 1)[0]
+        try:
+            rel = unquote(rel)
+        except Exception:  # noqa: BLE001 — 解码失败就按原样处理
+            pass
+        target = os.path.abspath(rel if os.path.isabs(rel) else os.path.join(base, rel))
+        try:
+            inside = os.path.commonpath([base, target]) == base
+        except ValueError:
+            inside = False
+        if not inside:
+            raise RuntimeError(
+                f"文档引用了输入文件目录之外的本地图片，已中止转换（避免读取本机其它文件）: {raw}。"
+                f"请把图片放到文档同目录（或其子目录）后重试，或让顾客另存为 PDF/DOCX。")
+        if not os.path.isfile(target):
+            raise RuntimeError(
+                f"文档引用的本地图片不存在，已中止转换（避免静默少印图片）: {raw}。"
+                f"请补齐图片后重试，或让顾客另存为 PDF/DOCX。")
+        ext = os.path.splitext(target)[1].lower()
+        mime = _INLINE_IMAGE_MIME.get(ext)
+        if not mime:
+            raise RuntimeError(
+                f"文档引用的本地图片格式不支持内联（{ext or '无扩展名'}），已中止转换: {raw}。"
+                f"请换成 PNG/JPG 等位图后重试。")
+        try:
+            size = os.path.getsize(target)
+        except OSError as e:
+            raise RuntimeError(f"读取本地图片信息失败，已中止转换: {raw} ({e})") from None
+        if size > _MAX_INLINE_IMAGE_BYTES:
+            raise RuntimeError(
+                f"文档引用的本地图片过大（{size / 1024 / 1024:.1f} MB > 10 MB 上限），"
+                f"已中止转换（避免静默少印图片）: {raw}。请压缩图片后重试。")
+        if total + size > _MAX_INLINE_IMAGE_TOTAL_BYTES:
+            raise RuntimeError(
+                f"文档引用的本地图片合计超过 50 MB 上限，已中止转换（避免静默少印图片）。"
+                f"请压缩/精简图片后重试。")
+        try:
+            with open(target, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            raise RuntimeError(f"本地图片读取失败，已中止转换: {raw} ({e})") from None
+        total += len(data)
+        return f"{prefix}{quote}data:{mime};base64,{base64.b64encode(data).decode('ascii')}{quote}"
+
+    return _IMG_SRC_RE.sub(_repl, html)
+
+
 def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content: bool = False) -> None:
-    """HTML 文件或内容 → PDF（wkhtmltopdf 直接 subprocess 调用 + 90s 超时）。
+    """HTML 内容 → PDF（wkhtmltopdf 直接 subprocess 调用 + 90s 超时）。
+
+    ⚠ 自 S0-09 / D-2 起**不再有 HTML 文件打印入口**（`.html/.htm` 已从
+    `UniversalConverter.CONVERSION_MAP` 删除），本函数只供 Markdown 内部调用。
 
     说明：pdfkit 不暴露 timeout 参数（其底层就是调用 wkhtmltopdf 可执行文件），
-    故改为直接 subprocess 调用，可加超时与限制 JS 执行时间的选项，避免页面 JS 挂死。
+    故改为直接 subprocess 调用，可加超时与安全选项。S0-09：命令行不含「允许本地
+    文件访问」（local-file-access）开关，且带 `--disable-javascript`（顾客文档里的
+    JS 一律不执行）；JS 关闭后限制脚本执行时长的两个参数失去意义，已一并移除
+    （仍保留 90 s 进程超时）。
     """
     wk_path = _find_wkhtmltopdf()
     if not wk_path:
@@ -1147,15 +1301,15 @@ def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content:
             wk_path,
             "--page-size", "A4",
             "--encoding", "UTF-8",
-            "--enable-local-file-access",
+            # S0-09 / DS-01：**不许**读本机文件（原先「允许本地文件访问」的参数已删除）。
+            # 本地图片由 _inline_local_images 提前内联成 data: URI（附录 A-7）。
+            # JS 一律不执行：顾客文档里的脚本无法读文件、也无法外发（XHR/fetch/Image）。
+            "--disable-javascript",
             "--no-outline",
             "--margin-top", "10mm",
             "--margin-bottom", "10mm",
             "--margin-left", "10mm",
             "--margin-right", "10mm",
-            # P1-4: 限制 JS 执行时间（最多 1000ms），避免无限脚本挂死；远程图片下载依赖整体 90s 超时
-            "--no-stop-slow-scripts",
-            "--javascript-delay", "1000",
             input_path,
             os.path.abspath(output_pdf),
         ]
@@ -1174,8 +1328,8 @@ def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content:
                 f"wkhtmltopdf 转换失败 (rc={result.returncode}): {result.stderr.strip()[:300]}"
             )
     except subprocess.TimeoutExpired:
-        # P1-4: 超时 → 抛明确错误，不再挂死
-        raise RuntimeError("wkhtmltopdf 转换超时（90 秒），已中止（页面 JS 可能无限执行）") from None
+        # 超时 → 抛明确错误，不再挂死（JS 已禁用，通常是文档过大或远程图片下载过慢）
+        raise RuntimeError("wkhtmltopdf 转换超时（90 秒），已中止（文档过大或远程图片下载过慢）") from None
     except FileNotFoundError:
         raise RuntimeError(f"wkhtmltopdf 可执行文件未找到: {wk_path}") from None
     finally:
@@ -1189,7 +1343,7 @@ def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content:
 
 
 def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
-    """Markdown → HTML → PDF。"""
+    """Markdown → HTML → PDF（S0-09：转换前做危险语法扫描 + 本地图片内联）。"""
     import markdown
 
     md_text = _read_text_auto(file_path)  # 与 TXT/CSV 一致的编码探测链（utf-8-sig → gbk → latin-1）
@@ -1215,6 +1369,10 @@ def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
 {md_body}
 </body>
 </html>"""
+
+    _scan_unsafe_html(html)  # 先拒危险语法（file:/脚本/事件处理器…），再谈图片
+    # 本地相对路径图片内联成 data: URI —— 必须做在转换**之前**（附录 A-7）
+    html = _inline_local_images(html, os.path.dirname(os.path.abspath(file_path)))
 
     _convert_html_to_pdf(html, output_pdf, is_content=True)
     logger.info(f"Markdown → PDF 完成: {output_pdf}")
@@ -1536,11 +1694,9 @@ class UniversalConverter:
         # Office 文档
         for ext in (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"):
             cm[ext] = _convert_office_to_pdf
-        # Markdown
+        # Markdown（HTML 支持按 D-2 **永久删除**：`.html/.htm` 不再注册；
+        # `_convert_html_to_pdf` 保留，仅供 Markdown 内部调用）
         cm[".md"] = _convert_markdown_to_pdf
-        # HTML
-        cm[".html"] = _convert_html_to_pdf
-        cm[".htm"] = _convert_html_to_pdf
 
     def convert(self, file_path: str, output_pdf: str | None = None,
                 image_orientation: str = "auto") -> str:

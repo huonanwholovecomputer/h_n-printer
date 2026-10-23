@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import sys
@@ -21,6 +22,40 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
+
+# ===== S0-06：日志脱敏（安全加固计划 §S0-06 动作 3）=====
+# requests 的异常文本里带**完整 URL**（含 ?token=…），这些行会落进 logs/*.log。
+# 在 logger 上挂一道过滤器：本模块任何日志记录都先过 scrub，再交给 handler ——
+# 比逐处改 f-string 可靠（漏一处就漏一条凭据）。
+_SECRET_QUERY_RE = re.compile(r"([?&](?:token|t|key|access_token)=)[^&\s\"'<>]+", re.I)
+
+
+def scrub_secrets(text):
+    """把 URL 查询串里的 token / t / key / access_token 值替换成 ***。"""
+    if not text:
+        return text
+    try:
+        return _SECRET_QUERY_RE.sub(r"\1***", str(text))
+    except Exception:
+        return "[scrub-failed]"
+
+
+class _SecretScrubFilter(logging.Filter):
+    """logging.Filter：命中敏感查询参数就改写记录（不改变是否输出）。"""
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            scrubbed = scrub_secrets(msg)
+            if scrubbed != msg:
+                record.msg = scrubbed
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+logger.addFilter(_SecretScrubFilter())
 
 # 「页码范围 → 有效页数」的**单一来源**：复用 printer_config 的权威实现。
 # 本文件（以及 finance/settlement.html）**不许**再写第二份解析 —— 两份口径一漂移，

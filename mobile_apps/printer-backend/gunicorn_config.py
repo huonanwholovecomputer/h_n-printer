@@ -22,6 +22,11 @@ threads = 16
 
 # 日志
 accesslog = "-"          # 访问日志输出到 stdout
+# ⚠ S0-06（2026-10-23 安全加固）：**不要**用默认 access_log_format。
+#   默认格式含 %(r)s（完整请求行，带 ?token=…）⇒ journald 里每台设备每次心跳都留一份
+#   printer token 明文 —— DS-02 说的「日志分发面」正是这里。改成只记方法 + 路径（%(m)s %(U)s），
+#   丢掉 query string；S1-01 把 token 全部搬到 header 之后可再恢复字段完整度。
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "%(f)s" "%(a)s"'
 errorlog = "-"           # 错误日志输出到 stderr
 loglevel = "info"
 
