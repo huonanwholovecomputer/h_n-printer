@@ -316,18 +316,32 @@ def static_html():
         and "请解锁需要编辑的模块" in html
         and re.search(r"financeSetup\(a, 'all'\)\.then[\s\S]{0,700}?save\(\)", html) is not None)
 
-    print("\n-- B3b 「首次设置」按钮只在真的还有模块没密码时出现 --")
+    print("\n-- B3b 「首次设置」入口只在真的还有模块没密码时出现；技术说明不上常驻横幅 --")
     chk("设置页不再无条件渲染那个按钮（槽位 #financeSetupSlot）",
         'id="financeSetupSlot"' in html
         and re.search(r'首次设置/批量重置未设置模块</button>', html) is None)
-    chk("_refreshFinanceSetupSlot 读服务端 needs_setup：为空就不渲染任何按钮",
-        re.search(r"function _refreshFinanceSetupSlot\(\)[\s\S]{0,900}?if \(!need\.length\) \{ slot\.innerHTML = ''; return; \}", html) is not None)
+    chk("_refreshFinanceSetupSlot 读服务端 needs_setup：为空就不渲染任何按钮、整块横幅隐藏",
+        re.search(r"function _refreshFinanceSetupSlot\(\)[\s\S]{0,1400}?var html = '';", html) is not None
+        and "box.style.display = html ? 'block' : 'none'" in html)
     chk("确实还有未设置模块时才给批量设置入口（带数量与模块名）",
         re.search(r"为 ' \+ need\.length \+ ' 个未设置密码的模块批量设置", html) is not None)
     chk("renderSettings 渲染完就刷新该槽位（改完密码回来按钮自动消失）",
         re.search(r"el\.innerHTML = _lz\(h\);[\s\S]{0,300}?_refreshFinanceSetupSlot\(\)", html) is not None)
     chk("状态拿不到时留兜底入口（不把唯一入口也藏掉）",
         re.search(r"if \(need === null\) \{[\s\S]{0,300}?首次设置密码</button>", html) is not None)
+    # 2026-10-23 用户口径：「S1-05：默认密码…PBKDF2…30 分钟会话」这句没必要常驻在设置页
+    _i_sec = html.find("// 密码管理")
+    _sec = html[_i_sec:_i_sec + 1600] if _i_sec >= 0 else ''
+    chk("设置页顶部**不再**常驻那句 S1-05 技术说明（对操作员是噪音）",
+        "S1-05：默认密码" not in _sec
+        and "PBKDF2-HMAC-SHA256「每模块独立 salt」" not in _sec, _sec[:160])
+    chk("技术口径没丢：收进标题旁 ⓘ 的 title（悬停可看，排查时还在）",
+        "加密与会话说明" in _sec and "PBKDF2-HMAC-SHA256 + 每模块独立 salt" in _sec
+        and "title=" in _sec, _sec[:200])
+    _i_foot = html.find("密码存在本机服务端")
+    _foot = html[_i_foot:_i_foot + 220] if _i_foot >= 0 else ''
+    chk("脚注改成用户语言（保留「存哪、云端是副本、改密要先解锁设置、忘不掉」）",
+        "云端配置只作同步副本" in _foot and "遗忘后无法自助找回" in _foot, _foot)
 
     print("\n-- B4 写操作没有会话就不发 / 失效就回锁 --")
     chk("_doSave 在无会话时不发写请求（避免必 403 的噪音与假成功）",

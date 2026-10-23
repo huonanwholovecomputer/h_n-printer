@@ -248,6 +248,20 @@ try {
   chk('A 7 个模块都已设密码 → 设置页**不再显示**「首次设置/批量重置未设置模块」按钮',
     !/批量设置|首次设置/.test(slotHTML) && !/批量设置/.test(await page.evaluate(() => document.body.innerText)),
     slotHTML);
+  const bannerA = await page.evaluate(() => {
+    const b = document.getElementById('financeSetupBanner');
+    return { exists: !!b, display: b ? getComputedStyle(b).display : '' };
+  });
+  chk('A 那句 S1-05 技术说明的常驻横幅**整块隐藏**（没动作可做就不留空块）',
+    bannerA.exists && bannerA.display === 'none', bannerA);
+  chk('A 页面上看不到「PBKDF2-HMAC-SHA256『每模块独立 salt』」这类技术说明',
+    !/每模块独立 salt/.test(await page.evaluate(() => document.body.innerText)));
+  const tooltip = await page.evaluate(() => {
+    const t = [...document.querySelectorAll('#tab-settings h2 span[title]')]
+      .map((s) => s.getAttribute('title') || '').find((x) => /PBKDF2/.test(x));
+    return t || '';
+  });
+  chk('A 技术口径没丢：收进标题旁 ⓘ 的 title（悬停可看）', /PBKDF2/.test(tooltip), tooltip.slice(0, 80));
   await shot('A_全模块已设置_按钮不显示.png');
 
   /* ── B 真有离线数据：未解锁不弹，解锁后才问，合并完清副本 ───────────────── */
@@ -319,6 +333,11 @@ try {
     await page.click('#modalRoot .modal-card [data-act=ok]');
     await page.waitForTimeout(600);
   }
+  const bannerC = await page.evaluate(() => {
+    const b = document.getElementById('financeSetupBanner');
+    return b ? getComputedStyle(b).display : '';
+  });
+  chk('C 真有未设置模块 → 横幅才出现（display:block）', bannerC === 'block', bannerC);
   const slotC = await page.evaluate(() => (document.getElementById('financeSetupSlot') || {}).innerHTML || '');
   chk('C 还有 1 个模块没设密码 → 设置页出现批量设置入口，并写明数量与模块名',
     /为 1 个未设置密码的模块批量设置/.test(slotC) && /实际转账/.test(slotC), slotC);

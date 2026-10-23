@@ -5141,10 +5141,17 @@ function renderSettings() {
   var h = '';
 
   // 密码管理
-  h += '<div class="section"><h2>🔐 敏感模块密码</h2>';
-  h += '<div style="margin-bottom:10px;padding:8px 10px;background:var(--surface2,#f6f7fb);border-radius:8px;font-size:.8rem;color:var(--muted)">'
-    + 'S1-05：默认密码（旧版 <code>123456</code>）已被服务端停用；密码以 <b>PBKDF2-HMAC-SHA256「每模块独立 salt」</b>'
-    + ' 保存（≥210k 迭代），解锁后由本机服务端签发 30 分钟会话，所有写操作都要它。'
+  /* 2026-10-23 用户口径：顶上那句 S1-05 技术说明（「默认密码已被服务端停用；密码以
+     PBKDF2-HMAC-SHA256『每模块独立 salt』保存（≥210k 迭代）…」）对操作员是纯噪音 ——
+     常驻、每次进设置都占一行、看完也用不上。技术口径收进标题旁的 ⓘ（悬停可看，排查时还在），
+     页面上只保留「确实需要动作」的那块（还有模块没密码时才出现）。 */
+  h += '<div class="section"><h2>🔐 敏感模块密码'
+    + '<span class="hint" style="cursor:help;margin-left:6px;font-weight:normal" title="'
+    + '密码以 PBKDF2-HMAC-SHA256 + 每模块独立 salt（≥210k 迭代）保存在本机服务端 print_data.json'
+    + '（该文件另有 HMAC 完整性校验，密钥受 Windows DPAPI 保护）；云端配置只作同步副本。'
+    + '解锁后由本机服务端签发 30 分钟会话，本页所有写操作都要它。">ⓘ 加密与会话说明</span></h2>';
+  h += '<div id="financeSetupBanner" style="display:none;margin-bottom:10px;padding:8px 10px;'
+    + 'background:var(--surface2,#f6f7fb);border-radius:8px;font-size:.82rem">'
     + '<span id="financeSetupSlot"></span></div>';
   PASSWORD_KEYS.forEach(function (k) {
     h += '<div class="settings-row"><label>' + MODULE_NAMES[k] + ' 密码</label>';
@@ -5158,7 +5165,7 @@ function renderSettings() {
            '类型只允许在「🤝接单 / 👤自打」之间订正（自打不计入收益）。</div>';
     }
   });
-  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码以 PBKDF2 哈希保存在本机服务端（print_data.json，受 HMAC + DPAPI 密钥保护）；云端配置只作同步副本。改密需要先解锁「设置」模块。请牢记密码，遗忘后无法自助找回。</div></div>';
+  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码存在本机服务端（print_data.json），云端配置只作同步副本；改密前需要先解锁「设置」。请牢记密码 —— 遗忘后无法自助找回。</div></div>';
 
   // 成员管理
   h += '<div class="section"><h2>👥 成员管理</h2>';
@@ -5242,15 +5249,20 @@ function _refreshFinanceSetupSlot() {
   financeAuthStatus().then(function (st) {
     var slot = $('#financeSetupSlot');
     if (!slot) return;                       // 已经切到别的 tab / 又渲染过一轮
+    var box = $('#financeSetupBanner');
     var need = (st && st.success && st.needs_setup) ? st.needs_setup : null;
+    var html = '';
     if (need === null) {
-      slot.innerHTML = '<button class="btn sm" style="margin-left:8px" onclick="openFinanceSetupModal()">🔐 首次设置密码</button>';
-      return;
+      // 状态拿不到（服务端异常）：留兜底入口，不把唯一入口也藏了
+      html = '<button class="btn sm" onclick="openFinanceSetupModal()">🔐 首次设置密码</button>';
+    } else if (need.length) {
+      html = '<button class="btn sm" onclick="openFinanceSetupModal()">'
+        + '🔐 为 ' + need.length + ' 个未设置密码的模块批量设置</button>'
+        + '<span style="margin-left:6px;color:var(--muted)">（'
+        + esc(need.map(function (k) { return MODULE_NAMES[k] || k; }).join('、')) + '）</span>';
     }
-    if (!need.length) { slot.innerHTML = ''; return; }
-    slot.innerHTML = '<button class="btn sm" style="margin-left:8px" onclick="openFinanceSetupModal()">'
-      + '🔐 为 ' + need.length + ' 个未设置密码的模块批量设置</button>'
-      + '<span style="margin-left:6px">（' + esc(need.map(function (k) { return MODULE_NAMES[k] || k; }).join('、')) + '）</span>';
+    slot.innerHTML = html;
+    if (box) box.style.display = html ? 'block' : 'none';   // 没有要动作的就不留空块
   }).catch(function () {});
 }
 /* ==================== 打印价格（收支统计设置 → 全局定价） ====================
