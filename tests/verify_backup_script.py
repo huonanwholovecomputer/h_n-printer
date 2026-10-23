@@ -62,6 +62,10 @@ H.chk("支持 --restore-check 恢复演练（行数 + 最新订单 + WAL 缺失�
 H.chk("可选加密（gpg --encrypt 并删除明文）与异地副本",
       "BACKUP_GPG_RECIPIENT" in script_src and "gpg --yes --batch --encrypt" in script_src
       and 'rm -f "$OUT.gz"' in script_src and "BACKUP_REMOTE" in script_src)
+H.chk("★ PROJECT_DIR 缺省 = 脚本所在目录（不写死 /opt，换部署位置不会静默备份 0 个库）",
+      'PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)' in script_src)
+H.chk("★ 一个库都没备到 ⇒ 非 0 退出（绝不假绿）",
+      "备份失败：在 $PROJECT_DIR 下没有找到任何数据库文件" in script_src and "exit 3" in script_src)
 H.chk("journald 容量上限 drop-in 已入库",
       os.path.exists(os.path.join(BACKEND, "ops", "journald-hn-limits.conf"))
       and "SystemMaxUse=300M" in open(os.path.join(BACKEND, "ops", "journald-hn-limits.conf"),
@@ -180,6 +184,31 @@ H.chk("--restore-check 退出码 0", r2.returncode == 0, out2[-500:])
 H.chk("★ 恢复演练输出 RESTORE_CHECK=ok", "RESTORE_CHECK=ok" in out2, out2[-300:])
 H.chk("超过保留期的旧备份被清理", not os.path.exists(old_bk))
 H.chk("未过期的备份保留", os.path.exists(new_bk))
+
+# 空目录（没有任何库）必须失败：这是"假绿"的守卫
+empty_proj = os.path.join(TMP, "emptyproj")
+os.makedirs(empty_proj, exist_ok=True)
+r_empty = _run_script({"PROJECT_DIR": empty_proj, "BACKUP_DIR": os.path.join(TMP, "b_empty")},
+                      args=("--restore-check",))
+out_empty = (r_empty.stdout or "") + (r_empty.stderr or "")
+H.chk("★ 没有任何库文件 ⇒ 非 0 退出且不给 RESTORE_CHECK=ok（防止空跑假绿）",
+      r_empty.returncode != 0 and "RESTORE_CHECK=ok" not in out_empty, out_empty[-300:])
+
+# 缺省 PROJECT_DIR：把脚本放进"库所在目录"，不传 PROJECT_DIR 也必须能备到
+proj3 = os.path.join(TMP, "proj3")
+_seed(proj3)
+shutil.copy(BACKUP_SH, os.path.join(proj3, "backup.sh"))
+env3 = dict(os.environ)
+env3["PYTHON"] = sys.executable
+env3.pop("PROJECT_DIR", None)
+r3b = subprocess.run([BASH, os.path.join(proj3, "backup.sh")], cwd=proj3, env=env3,
+                     capture_output=True, text=True, encoding="utf-8", errors="replace",
+                     timeout=120)
+H.chk("★ 不传 PROJECT_DIR ⇒ 用脚本所在目录（备份到 proj3/backups）",
+      r3b.returncode == 0 and any(n.startswith("orders_") for n in
+                                  os.listdir(os.path.join(proj3, "backups"))
+                                  if os.path.isdir(os.path.join(proj3, "backups"))),
+      (r3b.returncode, (r3b.stdout or "")[-200:]))
 
 # ============================================================
 # C. 变异自证：备份动作换回 cp

@@ -23,7 +23,9 @@
 # ============================================================
 set -euo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/opt/printer-backend}"
+# 缺省 = **脚本自己所在的目录**（生产在 /home/printer-backend、文档旧版写的是 /opt，
+# 写死某个路径会在换部署位置后"静默备份 0 个库"——2026-10-23 生产实测踩到过）。
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 BACKUP_DIR="${BACKUP_DIR:-$PROJECT_DIR/backups}"
 RETENTION_DAYS="${RETENTION_DAYS:-7}"
 DB_FILES=(orders.db users.db)
@@ -78,6 +80,13 @@ PY
     PRODUCED[-1]="$OUT.gz.gpg"
   fi
 done
+
+# 一个库都没备到 ⇒ 直接失败。绝不能"什么都没做却 exit 0"：
+# 生产上首次跑就撞到过（PROJECT_DIR 指错 ⇒ 跳过两个库 ⇒ 恢复演练空跑还报 ok）。
+if [[ ${#PRODUCED[@]} -eq 0 ]]; then
+  echo "[$(LOG_TS)] 备份失败：在 $PROJECT_DIR 下没有找到任何数据库文件（orders.db/users.db）" >&2
+  exit 3
+fi
 
 # 异地副本（可选）
 if [[ -n "${BACKUP_REMOTE:-}" ]]; then
