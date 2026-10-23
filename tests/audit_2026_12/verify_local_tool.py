@@ -317,15 +317,46 @@ for bad in ("http://evil.example.com/a.exe", "file:///C:/Windows/System32/calc.e
     except ValueError:
         check(f"拒绝非法下载地址 {bad[:36]!r}", True)
 
-check("放行 https 地址",
-      validate_download_url("https://cos.example.com/a.exe") == "https://cos.example.com/a.exe")
+# S1-02（2026-10-23）：更新链从「只强制 https」收紧为「https + host 白名单」
+# （hn-space.cn + COS 桶）。旧断言"任意 https host 放行"正是 DS-03 要堵的口子
+# （能改清单 = 能把 url 指到任意域名、让全部门店以管理员权限装包），故翻成反向期望；
+# 正向用例保留白名单内的两个域名，判据本身不删。
+for good in ("https://hn-space.cn/updates/h_n-printer_setup_4.5.33.exe",
+             "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/"
+             "h_n-printer_setup_4.5.32.exe"):
+    check(f"放行白名单内的 https 地址 {good[:52]}…",
+          validate_download_url(good) == good)
+for foreign in ("https://cos.example.com/a.exe",
+                "https://hn-space.cn.evil.example/a.exe",
+                "http://hn-space.cn/a.exe"):
+    try:
+        validate_download_url(foreign)
+        check(f"拒绝白名单外的地址 {foreign[:44]!r}", False, "竟然通过")
+    except ValueError:
+        check(f"拒绝白名单外的地址 {foreign[:44]!r}", True)
 
 check("download_setup 对 http:// 立即返回 None（不发请求）",
       download_setup("http://evil/a.exe", "x", tempfile.mkdtemp()) is None)
 check("download_setup 对 file:// 立即返回 None（不读本机文件当安装包）",
       download_setup("file:///C:/Windows/win.ini", "x", tempfile.mkdtemp()) is None)
-check("manifest 校验：fetch_update_info 内会校验 url scheme",
-      "data[\"url\"] = validate_download_url" in src_of("updater.py"))
+# S1-02（2026-10-23）：清单校验从"只查 scheme"收紧为 validate_manifest（host 白名单 +
+# 哈希必填 + 验签），故旧实现细节断言（`data["url"] = ...` 那一行）已不成立 ——
+# 改成**行为**断言（白名单外 / 非 https 的清单必须被拒）+ 接线断言，判据不删。
+_validate_manifest = getattr(updater, "validate_manifest", None)
+if _validate_manifest is None:
+    check("manifest 校验入口存在（validate_manifest）", False, "缺少 validate_manifest")
+else:
+    for bad_manifest in (
+            {"version": "9.9.9", "url": "https://evil.example.com/a.exe", "md5": "0" * 32},
+            {"version": "9.9.9", "url": "http://hn-space.cn/a.exe", "md5": "0" * 32}):
+        try:
+            _validate_manifest(bad_manifest)
+            check(f"validate_manifest 拒绝非法清单 url {bad_manifest['url'][:36]!r}", False,
+                  "竟然通过")
+        except ValueError:
+            check(f"validate_manifest 拒绝非法清单 url {bad_manifest['url'][:36]!r}", True)
+    check("fetch_update_info 内会调用 validate_manifest（清单必过白名单/哈希/验签）",
+          "validate_manifest(data)" in src_of("updater.py"))
 
 # gui 侧对版本格式错误做了显式提示（不静默当“无更新”）
 check("gui 捕获 VersionFormatError 并显式提示", "except VersionFormatError as e:" in gui_src

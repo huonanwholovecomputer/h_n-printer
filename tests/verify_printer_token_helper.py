@@ -41,8 +41,13 @@ H.chk("统一判定函数 _printer_token_ok 存在", "def _printer_token_ok(" in
 n_inline = code.count("if not PRINTER_TOKEN or token != PRINTER_TOKEN")
 H.chk("内联 `if not PRINTER_TOKEN or token != PRINTER_TOKEN` 清零（原 26 处）", n_inline == 0,
       "残留 %d 处" % n_inline)
-n_calls = code.count("_printer_token_ok(")
-H.chk("所有 printer 入口都改走统一判定（调用点 ≥25 处）", n_calls >= 25, "实际 %d" % n_calls)
+# S1-01（2026-10-23）：printer 入口的**认证**统一走 _authenticate_printer()（per-device
+# token 优先、全局 TOKEN 兜底），_printer_token_ok() 只剩"全局 TOKEN 恒时比较"这一层。
+n_calls = code.count("_authenticate_printer(token)")
+H.chk("所有 printer 入口都改走统一认证（_authenticate_printer 调用点 ≥25 处）",
+      n_calls >= 25, "实际 %d" % n_calls)
+H.chk("_printer_token_ok 只留在认证入口内部（不再被各路由直接调用）",
+      code.count("_printer_token_ok(") <= 4, code.count("_printer_token_ok("))
 H.chk("过渡期双接受：PRINTER_TOKEN_PREV 从 config.py 的 TOKEN_PREV 读入",
       "PRINTER_TOKEN_PREV = None" in code
       and 'getattr(config, "TOKEN_PREV", PRINTER_TOKEN_PREV)' in code)

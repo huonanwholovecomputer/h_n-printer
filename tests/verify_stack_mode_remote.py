@@ -304,7 +304,9 @@ mp_wxml = open(os.path.join(REPO, "mobile_apps", "h_n_print", "pages", "index", 
 apk_app = open(os.path.join(REPO, "mobile_apps", "android_app", "www", "app.js"),
                encoding="utf-8").read()
 
-check("后端：socketio `stack_state` 通道存在", '@socketio.on("stack_state")' in app_src)
+# S1-07（2026-10-23）：事件注册统一走 @sio_event（自带令牌桶），判据接受两种写法。
+check("后端：socketio `stack_state` 通道存在",
+      '@sio_event("stack_state")' in app_src or '@socketio.on("stack_state")' in app_src)
 check("后端：`/api/printer/stack_mode` 需登录",
       '"/api/printer/stack_mode"' in app_src and "@login_required" in app_src)
 check("后端：claiming_devices 下发四个 stack 字段",

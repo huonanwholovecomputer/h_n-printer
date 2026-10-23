@@ -1106,39 +1106,46 @@ function cancelOrder(id) {
   });
 }
 
+// 订单轮询（S1-09：自调度 —— 上一轮落定后才排下一轮；失败 1.5× 退避、成功恢复 15s）
 function startOrderPolling() {
   stopOrderPolling();
-  meState._orderPollTimer = setInterval(() => {
-    if (document.getElementById('page-me').style.display !== 'none') {
-      api('/api/orders?page=' + meState.ordersPage + '&per_page=' + meState.ordersPerPage).then(r => {
-        if (r.status === 200 && r.data && r.data.success) {
-          const orders = (r.data.orders || []).map(normalizeOrder);
-          meState.orders = orders;
-          meState.ordersTotal = r.data.total || 0;
-          meState.ordersTotalPages = Math.ceil(meState.ordersTotal / meState.ordersPerPage);
-          renderOrders();
-        }
-      }).catch(() => {});
-    }
+  meState._orderPoll = createPollScheduler(async () => {
+    const page = document.getElementById('page-me');
+    if (!page || page.style.display === 'none') return;   // 页面不可见 = 本轮跳过（不算失败）
+    const r = await api('/api/orders?page=' + meState.ordersPage + '&per_page=' + meState.ordersPerPage);
+    if (r.status !== 200 || !r.data || !r.data.success) throw new Error('order poll failed: ' + r.status);
+    const orders = (r.data.orders || []).map(normalizeOrder);
+    meState.orders = orders;
+    meState.ordersTotal = r.data.total || 0;
+    meState.ordersTotalPages = Math.ceil(meState.ordersTotal / meState.ordersPerPage);
+    renderOrders();
   }, 15000);
+  meState._orderPoll.start();
 }
 
 function stopOrderPolling() {
+  if (meState._orderPoll) { meState._orderPoll.stop(); meState._orderPoll = null; }
   if (meState._orderPollTimer) { clearInterval(meState._orderPollTimer); meState._orderPollTimer = null; }
 }
 
 // 管理员许可密钥轮询（对齐小程序：me 页展示期间每 15s 刷新密钥状态 + 管理员列表）
+// S1-09：自调度 + 失败退避（密钥/管理员两个请求都落定才算一轮）
 function startKeyPolling() {
   stopKeyPolling();
-  meState._keyPollTimer = setInterval(() => {
-    const meVisible = document.getElementById('page-me') && document.getElementById('page-me').style.display !== 'none';
-    if (!meVisible || state.role !== 'admin') return;
-    loadActiveKeys();
-    if (state.isSuperAdmin) loadAdmins();
+  meState._keyPoll = createPollScheduler(async () => {
+    const meEl = document.getElementById('page-me');
+    const meVisible = meEl && meEl.style.display !== 'none';
+    if (!meVisible || state.role !== 'admin') return;      // 不满足条件 = 本轮跳过
+    const jobs = [loadActiveKeys()];
+    if (state.isSuperAdmin) jobs.push(loadAdmins());
+    const results = await Promise.all(jobs);
+    if (results.some((ok) => ok === false)) throw new Error('key poll failed');
   }, 15000);
+  meState._keyPoll.start();
 }
 
 function stopKeyPolling() {
+  if (meState._keyPoll) { meState._keyPoll.stop(); meState._keyPoll = null; }
   if (meState._keyPollTimer) { clearInterval(meState._keyPollTimer); meState._keyPollTimer = null; }
 }
 
@@ -2109,12 +2116,14 @@ async function loadUserOrders(silent) {
     v.loading = true;
     list.innerHTML = '<view class="status-box"><text class="status-text">加载中...</text></view>';
   }
+  let ok = false;
   try {
     let url = '/api/orders?page=' + v.page + '&per_page=' + v.perPage;
     if (v.source === 'local') url += '&source=local';
     else if (v.openid) url += '&openid=' + encodeURIComponent(v.openid);
     const r = await api(url);
     if (r.status === 200 && r.data && r.data.success) {
+      ok = true;
       v.orders = (r.data.orders || []).map(normalizeOrder);
       v.total = r.data.total || 0;
       v.totalPages = Math.ceil(v.total / v.perPage);
@@ -2136,6 +2145,7 @@ async function loadUserOrders(silent) {
   v.loading = false;
   startUserOrdersPolling();
   measureAll(150);
+  return ok;   // S1-09：轮询调度器据此退避（false = 本轮失败）
 }
 
 function renderUserOrders() {
@@ -2315,17 +2325,28 @@ function scrollUserOrdersToTop() {
 }
 
 let _userOrdersPollTimer = null;
+let _userOrdersPoll = null;
 
+// 「本地打印任务」列表轮询（10s）。S1-09：自调度 + 失败退避（见 app.js 的 createPollScheduler）
 function startUserOrdersPolling() {
-  if (!meState.userOrdersView || _userOrdersPollTimer) return;
-  _userOrdersPollTimer = setInterval(() => {
-    const view = document.getElementById('view-user-orders');
-    if (!view || view.style.display === 'none') { stopUserOrdersPolling(); return; }
-    loadUserOrders(true);
-  }, 10000);
+  if (!meState.userOrdersView) return;
+  if (_userOrdersPoll && _userOrdersPoll.isRunning()) return;
+  if (!_userOrdersPoll) {
+    _userOrdersPoll = createPollScheduler(async () => {
+      const view = document.getElementById('view-user-orders');
+      if (!view || view.style.display === 'none') { stopUserOrdersPolling(); return; }
+      const ok = await loadUserOrders(true);
+      if (ok === false) throw new Error('user orders poll failed');
+    }, 10000);
+  }
+  _userOrdersPoll.start();
 }
 
 function stopUserOrdersPolling() {
+  if (_userOrdersPoll) {
+    _userOrdersPoll.stop();
+    _userOrdersPoll = null;
+  }
   if (_userOrdersPollTimer) {
     clearInterval(_userOrdersPollTimer);
     _userOrdersPollTimer = null;

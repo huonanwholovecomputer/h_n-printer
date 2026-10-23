@@ -115,7 +115,9 @@ function fnBody(name) {
   if (t.indexOf('return') < 0) throw new Error('函数 ' + name + ' 抽取不完整');
   return t;
 }
-const mExcl = js.match(/^var _EXCLUDE_STATUS = \{[^\n]*\};/m);
+// S1-05（2026-10-23）：排除表新增「离线未同步 / 云端拒收」后成了多行对象字面量，
+// 判据放宽为跨行匹配（否则会因为换行假红）。语义不变：必须能抽到整张排除表。
+const mExcl = js.match(/^var _EXCLUDE_STATUS = \{[\s\S]*?\};/m);
 if (!mExcl) { console.log('EXCLUDED_STATUS_FAIL'); process.exit(3); }
 
 const warns = [];

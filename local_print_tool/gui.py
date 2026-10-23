@@ -107,6 +107,13 @@ APP_VERSION = "4.5.32"
 # 提为模块级常量便于验收脚本把它临时调成 0（否则测试要真等 30 秒）。
 SCHEDULED_SELF_HEAL_S = 30
 
+# 云端取号（/api/next_order_number + /api/local_orders 上报）在主线程等待的上限（秒）。
+# S1-09：旧值是 **30 秒** —— "连着但慢"（TCP 半开、代理抖动、云端 502 后重试）时，
+# 点「开始打印」会冻结 30 秒（期间靠 processEvents 保活，界面基本不可用）。
+# 现在 4 秒（3–5 s 区间）就放弃等待、**直接用本地 -L 临时号开打**（连线后由换号流程补报），
+# 取号慢不该拦住出纸。⚠ 别调回 30：这是现场"卡 30 秒不打印"的直接原因。
+ORDER_NUMBER_WAIT_S = 4
+
 # 无障碍自动打印的防抖窗口（毫秒）。同一订单的文件是**逐个下载完成**推送的，间隔可达数秒；
 # 原来的 3000ms 会被"击穿"——每批先到的文件立即被当成整单处理并把队列 pop 清空
 # （🔴-B4-2 现场实测：订单 #535 的 11 个文件分 7 批打印、同一订单号被上报 4 次）。
@@ -3087,8 +3094,12 @@ class PrintWorker(QThread):
                     self.log_message.emit(f"  → 使用缓存的 PDF")
                 else:
                     self.log_message.emit(f"  → 正在转换为 PDF...")
+                    # S1-04：云端任务（task_id>0，文件是顾客上传的）⇒ 强制 LibreOffice，
+                    # 绝不在打印路径上给 Word/WPS 执行宏的机会；本地任务保持原三引擎降级链。
+                    _from_cloud = int(getattr(job, "task_id", 0) or 0) > 0
                     temp_pdf = self._converter.convert(
-                        job.file_path, image_orientation=getattr(job, 'image_orientation', 'auto'))
+                        job.file_path, image_orientation=getattr(job, 'image_orientation', 'auto'),
+                        from_cloud=_from_cloud)
                     print_path = temp_pdf
                     self.log_message.emit(f"  → 转换完成: {os.path.basename(temp_pdf)}")
 
@@ -3388,12 +3399,16 @@ class ConvertWorker(QThread):
     # file_path 用于回调按文件匹配行，避免多文件订单行号错位
     finished = Signal(int, str, str, int, str)
 
-    def __init__(self, row: int, file_path: str, engine: str, source_md5: str = ""):
+    def __init__(self, row: int, file_path: str, engine: str, source_md5: str = "",
+                 from_cloud: bool = False):
         super().__init__()
         self._row = row
         self._file_path = file_path
         self._engine = engine
         self._source_md5 = source_md5
+        # S1-04：文件来自云端（顾客上传，内容不可信）⇒ 转换绝不走 Word/WPS COM（宏执行路径），
+        # 强制 LibreOffice。默认 False = 用户本地文件，保持原三引擎降级链（零回归）。
+        self._from_cloud = bool(from_cloud)
         self._cancelled = False
 
     def cancel(self):
@@ -3414,7 +3429,10 @@ class ConvertWorker(QThread):
             if self._cancelled:
                 self.finished.emit(self._row, self._file_path, "", 0, "")
                 return
-            if ext in (".doc", ".docx") and self._engine != "libreoffice":
+            if (ext in (".doc", ".docx") and self._engine != "libreoffice"
+                    and not self._from_cloud):
+                # ⚠ 云端来源必须在上面这条闸门处就被挡住（S1-04）：走 else 分支交给
+                #   converter.convert(from_cloud=True) ⇒ LibreOffice，绝不给 Word/WPS 机会。
                 # 直接以 MD5 命名存入 pdf_cache（docx 缓存 key 含引擎后缀，防止 WPS 文档
                 # 被 Word 引擎转换的错误 PDF 被复用；若无 MD5 则用临时文件）
                 if self._source_md5:
@@ -3435,10 +3453,11 @@ class ConvertWorker(QThread):
                     _convert_via_word_com(self._file_path, temp_pdf)
             else:
                 converter = get_converter()
-                temp_pdf = converter.convert(self._file_path)
+                temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud)
         except Exception:
             # Word/WPS 引擎失败，降级到 LibreOffice
-            if ext in (".doc", ".docx") and self._engine != "libreoffice":
+            if (ext in (".doc", ".docx") and self._engine != "libreoffice"
+                    and not self._from_cloud):
                 try:
                     if temp_pdf and os.path.isfile(temp_pdf):
                         os.remove(temp_pdf)
@@ -3446,7 +3465,7 @@ class ConvertWorker(QThread):
                     pass
                 try:
                     converter = get_converter()
-                    temp_pdf = converter.convert(self._file_path)
+                    temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud)
                 except Exception:
                     self.finished.emit(self._row, self._file_path, "", 0, "")
                     return
@@ -3890,6 +3909,136 @@ class CloudTaskListWindow(QDialog):
 
 
 # ============================================================
+# S1-09：离线未同步订单窗口
+# ============================================================
+
+class OfflineOrdersDialog(QDialog):
+    """「离线未同步订单」窗口：列出本地离线库里 `synced=0` 的订单，并提供手动重试。
+
+    为什么需要它（S1-09 现场问题）：离线期间打的单只写在本地 `offline_orders` 表里，
+    云端**没有**这张单 —— 结算页自然看不到、金额也不会入账。旧实现只有一条日志、且
+    重试 5 次后该行会被**永久跳过**，等于订单静默消失。现在：
+      · 状态列明确写「⏳ 离线未同步 / ⚠ 云端拒收」，**绝不**显示成「已完成」；
+      · 永不放弃重试（指数退避），也可在这里点「重试上传」立刻再来一次；
+      · 表格下方给出"还差几张单没上云"的总结与最近失败原因。
+    """
+
+    retry_requested = Signal(str)   # 订单号（空串 = 全部）
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📴 离线未同步订单")
+        self.setMinimumSize(720, 420)
+        self._rows: list[dict] = []
+
+        root = QVBoxLayout(self)
+        self._hint = QLabel(
+            "下列订单**只存在本机**，云端还没有它们（结算页也就看不到）。"
+            "联网后会自动补报（失败按 1.5× 指数退避，永不放弃）；也可以现在就手动重试。")
+        self._hint.setWordWrap(True)
+        root.addWidget(self._hint)
+
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(["订单号", "创建时间", "金额", "状态", "最近失败原因"])
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        hdr = self._table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.Stretch)
+        root.addWidget(self._table, 1)
+        self._table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        self._summary = QLabel("")
+        root.addWidget(self._summary)
+
+        btns = QHBoxLayout()
+        self._retry_selected_btn = QPushButton("🔄 重试选中")
+        self._retry_selected_btn.clicked.connect(self._on_retry_selected)
+        self._retry_all_btn = QPushButton("🔄 全部重试")
+        self._retry_all_btn.clicked.connect(lambda: self.retry_requested.emit(""))
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.clicked.connect(self.reload)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.close)
+        btns.addWidget(self._retry_selected_btn)
+        btns.addWidget(self._retry_all_btn)
+        btns.addStretch(1)
+        btns.addWidget(refresh_btn)
+        btns.addWidget(close_btn)
+        root.addLayout(btns)
+
+    # ── 数据 ──
+
+    @staticmethod
+    def status_text(row: dict) -> str:
+        """状态列文案（**不许**把未同步单写成「已完成」）。"""
+        st = str(row.get("status") or "")
+        retries = int(row.get("retry_count") or 0)
+        if st == "rejected":
+            return "⚠ 云端拒收（需处理）"
+        if retries > 0:
+            return f"⏳ 离线未同步（已重试 {retries} 次）"
+        return "⏳ 离线未同步"
+
+    def set_rows(self, rows: list[dict]):
+        """填充表格（rows 来自 OfflineSync.list_unsynced_orders）。"""
+        self._rows = list(rows or [])
+        self._table.setRowCount(len(self._rows))
+        for i, r in enumerate(self._rows):
+            vals = [
+                str(r.get("order_number") or ""),
+                str(r.get("created_at") or ""),
+                f"¥{float(r.get('total_price') or 0):.2f}",
+                self.status_text(r),
+                str(r.get("last_error") or ""),
+            ]
+            for col, v in enumerate(vals):
+                self._table.setItem(i, col, QTableWidgetItem(v))
+        n = len(self._rows)
+        if n == 0:
+            self._summary.setText("✅ 没有离线未同步订单（本地库里的订单都已上报云端）")
+        else:
+            rejected = sum(1 for r in self._rows if str(r.get("status") or "") == "rejected")
+            extra = f"，其中 {rejected} 条被云端拒收（需人工处理）" if rejected else ""
+            self._summary.setText(f"共 {n} 条离线未同步订单{extra}（云端尚未入账）")
+        self._retry_all_btn.setEnabled(n > 0)
+        self._retry_selected_btn.setEnabled(False)
+
+    def reload(self):
+        """从本地库重新读一遍（窗口打开期间/手动点刷新时用）。"""
+        sync = getattr(self, "_offline_sync", None)
+        if sync is None:
+            self.set_rows([])
+            return
+        try:
+            self.set_rows(sync.list_unsynced_orders())
+        except Exception as e:
+            logger.warning(f"读取离线未同步订单失败: {e}")
+            self.set_rows([])
+
+    def set_offline_sync(self, sync):
+        self._offline_sync = sync
+
+    # ── 交互 ──
+
+    def _on_selection_changed(self):
+        row = self._table.currentRow()
+        self._retry_selected_btn.setEnabled(0 <= row < len(self._rows))
+
+    def _on_retry_selected(self):
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._rows):
+            return
+        num = str(self._rows[row].get("order_number") or "")
+        if num:
+            self.retry_requested.emit(num)
+
+
+# ============================================================
 # 主窗口
 # ============================================================
 
@@ -4054,6 +4203,7 @@ class MainWindow(QMainWindow):
         self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
         self._cloud_task_window: CloudTaskListWindow | None = None
         self._offline_sync: OfflineSync | None = None  # 初始化在 _init_cloud_client 之后
+        self._offline_dialog = None                    # 「离线未同步订单」窗口（懒创建）
         # 无障碍打印：按订单收集自动任务，防抖后批量创建标签页并自动开始打印
         self._auto_print_queue: dict[int, list[CloudTask]] = {}  # order_id → tasks
         self._auto_print_timers: dict[int, QTimer] = {}          # order_id → debounce timer
@@ -4133,6 +4283,9 @@ class MainWindow(QMainWindow):
             logger.warning(f"启动清理暂存副本失败: {e}")
 
         # ── 自更新：启动 4 秒后后台检查更新（不阻塞 UI，发现新版本才弹窗）──
+        #    S1-02 改动 4（2026-10-23）：启动检查**只提示**——不自动下载、不生成 update.cmd、
+        #    不静默安装。真正的下载/安装只能由用户在「帮助 → 检查更新」后明确点「立即更新」触发
+        #    （见 _on_update_check_result 的 manual 分支与 updater.prepare_update(user_confirmed=True)）。
         self._update_checking: bool = False
         self._updateCheckDone.connect(self._on_update_check_result)
         QTimer.singleShot(4000, lambda: self._start_update_check(manual=False))
@@ -4364,6 +4517,8 @@ class MainWindow(QMainWindow):
         """
         # 初始化本地订单库（离线/本地模式订单都写这里，供本地订单统计）
         self._offline_sync = OfflineSync()
+        # S1-09：启动即刷一次「📴 离线未同步」角标（上次运行遗留的未同步单要立刻看得见）
+        self._refresh_offline_badge()
 
         if not self._config.cloud_enabled:
             logger.info("云端功能未启用：以本地订单模式运行（CloudClient 不创建）")
@@ -4741,6 +4896,91 @@ class MainWindow(QMainWindow):
         if remain > 0:
             self._log(f"⚠️ 仍有 {remain} 条未同步订单，将随云端缓存数据一并清空（云端不可达或上传失败）")
 
+    # ── S1-09：离线未同步订单（状态栏角标 / 明细窗 / 手动重试）──
+
+    def _refresh_offline_badge(self):
+        """刷新状态栏「📴 离线未同步 N」角标（**本地 SQLite 计数，不走网络**）。"""
+        btn = getattr(self, "_offline_badge", None)
+        if btn is None:
+            return
+        sync = getattr(self, "_offline_sync", None)
+        if sync is None:
+            btn.setVisible(False)
+            return
+        try:
+            summary = sync.status_summary()
+        except Exception as e:
+            logger.debug(f"刷新离线角标失败: {e}")
+            btn.setVisible(False)
+            return
+        n = int(summary.get("unsynced", 0) or 0)
+        rejected = int(summary.get("rejected", 0) or 0)
+        if n <= 0:
+            btn.setVisible(False)
+            btn.setText("")
+            return
+        text = f"📴 离线未同步 {n}"
+        if rejected:
+            text += f"（{rejected} 条拒收）"
+        btn.setText(text)
+        btn.setVisible(True)
+
+    def _open_offline_orders_dialog(self):
+        """打开「离线未同步订单」窗口（行来自本地离线库 synced=0）。"""
+        dlg = getattr(self, "_offline_dialog", None)
+        if dlg is None:
+            dlg = OfflineOrdersDialog(self)
+            dlg.retry_requested.connect(self._retry_offline_orders)
+            self._offline_dialog = dlg
+        dlg.set_offline_sync(getattr(self, "_offline_sync", None))
+        dlg.reload()
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _reload_offline_dialog(self):
+        dlg = getattr(self, "_offline_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.reload()
+
+    def _retry_offline_orders(self, order_number: str = ""):
+        """手动重试离线未同步订单：清掉退避/拒收标记 → 立即同步一轮（网络在后台线程）。
+
+        ⚠ 只做"立刻再试一次"，不改任何上报口径：成功后该行 synced=1，云端照常入账；
+        失败则保持「⏳ 离线未同步」并继续按指数退避自动重试（永不放弃）。
+        """
+        sync = getattr(self, "_offline_sync", None)
+        client = getattr(self, "_cloud_client", None)
+        if sync is None:
+            return
+        api_url = getattr(client, "api_url", "") if client else ""
+        token = getattr(client, "token", "") if client else ""
+        if not api_url or not token:
+            self._log("⚠️ 云端未配置/未连接：离线订单暂时无法重试（恢复连接后会自动补报）")
+            return
+        try:
+            n = sync.retry_now(order_number)
+        except Exception as e:
+            self._log(f"⚠️ 重置离线订单重试状态失败: {e}")
+            return
+        scope = order_number or "全部"
+        self._log(f"🔄 手动重试离线未同步订单（{scope}）：重置 {n} 条，正在上传…")
+
+        def _net():
+            try:
+                ok = sync.sync_all_pending_orders(server_url=api_url, token=token)
+                self._cloudConnSyncLog.emit(f"📋 离线订单手动重试：本次上传成功 {ok} 条")
+            except Exception as e:
+                self._cloudConnSyncLog.emit(f"⚠️ 离线订单手动重试失败: {e}")
+
+        threading.Thread(target=_net, daemon=True).start()
+        # 主线程稍后刷新角标/明细（网络结果可能还没回来，角标会在 60s 定时器里再对齐）
+        QTimer.singleShot(2500, self._after_offline_retry)
+
+    def _after_offline_retry(self):
+        self._refresh_offline_badge()
+        self._reload_offline_dialog()
+
     def _wipe_cloud_cached_data(self):
         """关闭云端时清空本机云端缓存数据：
         成员名单、收支数据文件、openid 绑定、本地订单库、标签页归属与订单号。
@@ -4932,6 +5172,21 @@ class MainWindow(QMainWindow):
             self._cloud_status_btn.clicked.connect(self._toggle_cloud_connection)
             self._status_bar.addPermanentWidget(self._cloud_status_btn)
 
+        # S1-09：离线未同步订单角标（有未同步单才出现）。旧行为是"未同步单只在日志里
+        # 一句 📋 离线模式：任务已缓存"，出纸后没人知道这张单其实还没上云 —— 结算页上
+        # 也就没有它。这里给一个常驻读数 + 点开手动重试的入口。
+        self._offline_badge = QPushButton("")
+        self._offline_badge.setObjectName("offlineBadge")
+        self._offline_badge.setToolTip("本机还有订单**没有上报到云端**（离线未同步）。\n"
+                                      "点开可查看明细并手动重试上传。")
+        self._offline_badge.setVisible(False)
+        self._offline_badge.clicked.connect(self._open_offline_orders_dialog)
+        self._status_bar.addPermanentWidget(self._offline_badge)
+        self._offline_badge_timer = QTimer(self)
+        self._offline_badge_timer.setInterval(60000)   # 本地 SQLite 计数，不走网络
+        self._offline_badge_timer.timeout.connect(self._refresh_offline_badge)
+        self._offline_badge_timer.start()
+
     def _setup_menu(self):
         """设置菜单栏。"""
         mb = self.menuBar()
@@ -4948,6 +5203,12 @@ class MainWindow(QMainWindow):
         cloud_action = QAction("云端(&C)", self)
         cloud_action.triggered.connect(self._on_cloud_settings)
         file_menu.addAction(cloud_action)
+
+        # S1-09：离线未同步订单（本地库里 synced=0 的单，云端还没有）——手动重试入口
+        offline_action = QAction("📴 离线未同步订单(&O)…", self)
+        offline_action.setToolTip("查看本机还没上报到云端的订单，并可手动重试上传")
+        offline_action.triggered.connect(self._open_offline_orders_dialog)
+        file_menu.addAction(offline_action)
 
         file_menu.addSeparator()
 
@@ -5047,10 +5308,16 @@ class MainWindow(QMainWindow):
 
     def _update_check_worker(self, manual: bool):
         try:
-            from updater import fetch_update_info, compare_versions, VersionFormatError
+            from updater import (fetch_update_info, compare_versions, VersionFormatError,
+                                 last_reject_reason)
             manifest = fetch_update_info()
             if not manifest:
-                if manual:
+                # 区分「网络/服务器问题」与「清单被安全校验拒绝」（host 白名单/哈希必填/验签）：
+                # 后者必须让操作员看见原因，不能混成"检查更新失败，请检查网络"。
+                reject = last_reject_reason()
+                if reject:
+                    self._updateCheckDone.emit(("rejected", reject, manual))
+                elif manual:
                     self._updateCheckDone.emit(("latest", None, manual))
                 else:
                     self._updateCheckDone.emit(("none", None, manual))
@@ -5084,11 +5351,43 @@ class MainWindow(QMainWindow):
             msg = f"发现新版本 v{version}（当前 v{APP_VERSION}）"
             if notes:
                 msg += f"\n\n更新说明：\n{notes}"
-            msg += "\n\n是否立即下载并更新？（更新过程需退出程序，配置数据不会丢失）"
-            reply = QMessageBox.question(self, "发现新版本", msg,
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-            if reply == QMessageBox.Yes:
-                self._perform_update(manifest)
+            if manual:
+                # S1-02 改动 4（2026-10-23）：只有**这一次明确点击**才允许进入下载 → 生成
+                # update.cmd（/VERYSILENT 静默安装）。默认按钮是「稍后」：回车/直接关窗
+                # 都等于不更新，绝不默认「立即更新」。
+                msg += "\n\n是否立即下载并更新？（更新过程需退出程序，配置数据不会丢失）"
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("发现新版本")
+                box.setText(msg)
+                btn_now = box.addButton("立即下载并更新", QMessageBox.AcceptRole)
+                btn_later = box.addButton("稍后", QMessageBox.RejectRole)
+                box.setDefaultButton(btn_later)
+                box.exec()
+                if box.clickedButton() is btn_now:
+                    self._perform_update(manifest)
+            else:
+                # 启动检查（manual=False）：**只提示**，不下载、不写 update.cmd、不安装。
+                # 用户此刻多半正要开工，自动装会打断打印（旧行为：启动 4 秒弹「是否立即更新」，
+                # 默认按钮还是「是」）。这里只给一个「稍后」，把决定权交回菜单。
+                msg += ("\n\n为避免打断正在进行的打印，启动时不会自动更新。\n"
+                        "需要升级时请点「帮助 → 检查更新」手动下载安装。")
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Information)
+                box.setWindowTitle("发现新版本")
+                box.setText(msg)
+                btn_later = box.addButton("稍后", QMessageBox.RejectRole)
+                box.setDefaultButton(btn_later)
+                box.exec()
+        elif kind == "rejected":
+            # 清单没通过安全校验（host 白名单 / 哈希必填 / ed25519 验签）→ 绝不降级更新。
+            detail = manifest if isinstance(manifest, str) else str(manifest)
+            self._log(f"⚠ 更新清单未通过安全校验，已拒绝本次更新：{detail}")
+            if manual:
+                QMessageBox.warning(
+                    self, "检查更新",
+                    f"更新清单未通过安全校验，已拒绝本次更新：\n{detail}\n\n"
+                    "（可能是清单被篡改，或发布流程未按新规签名；请联系发布者核对。）")
         elif kind == "latest" and manual:
             QMessageBox.information(self, "检查更新", f"当前已是最新版本 v{APP_VERSION}")
         elif kind == "manifest_error":
@@ -5105,7 +5404,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "检查更新", "检查更新失败，请检查网络连接后重试")
 
     def _perform_update(self, manifest: dict):
-        """用户确认更新：检查打印状态 → 弹出下载进度窗口 → 后台下载 → 生成 update.cmd → 退出主程序。"""
+        """用户明确点击「立即更新」后才走到这里：检查打印状态 → 下载进度窗口 → 后台下载
+        → 生成 update.cmd（/VERYSILENT）→ 退出主程序。
+
+        S1-02 改动 4（2026-10-23）：本方法是**唯一**能让更新进入"下载 + 静默安装"的入口，
+        只由 _on_update_check_result 的 manual 分支在用户点「立即下载并更新」后调用；
+        启动自动检查不会、也不能调用它。"""
         if self._worker and self._worker.isRunning():
             reply = QMessageBox.question(
                 self, "正在打印",
@@ -5160,7 +5464,11 @@ class MainWindow(QMainWindow):
                 self._updateProgress.emit(int(downloaded), int(total))
                 return not getattr(self, '_update_cancelled', False)
 
-            result = prepare_update(manifest, APP_VERSION, progress_cb=_progress)
+            # S1-02（2026-10-23）：user_confirmed=True —— 本函数只由 _perform_update（用户
+            # 明确点击「立即下载并更新」）启动；updater 会再次校验清单（host 白名单 + 哈希必填
+            # + ed25519 验签），验签失败在这里就会返回 None，一步安装包都不会下载。
+            result = prepare_update(manifest, APP_VERSION, progress_cb=_progress,
+                                    user_confirmed=True)
             if not result:
                 self._updateCheckDone.emit(("download_fail", None, False))
                 return
@@ -5180,7 +5488,8 @@ class MainWindow(QMainWindow):
                 start_cmd = (
                     f'cd /d "{script_dir}" & start "" "{exe_path}" "{argv0}"')
             if not write_update_cmd(setup_path, exe_path, cmd_path,
-                                    start_cmd=start_cmd, install_dir=install_dir):
+                                    start_cmd=start_cmd, install_dir=install_dir,
+                                    allow_silent_install=True):
                 self._updateCheckDone.emit(("download_fail", None, False))
                 return
             if not _run_cmd_minimized(cmd_path):
@@ -7850,13 +8159,15 @@ class MainWindow(QMainWindow):
                 return i
         return None
 
-    def _start_convert_worker(self, row: int, file_path: str, engine: str, tab_key: str = ""):
+    def _start_convert_worker(self, row: int, file_path: str, engine: str, tab_key: str = "",
+                              from_cloud: bool = False):
         """启动后台 PDF 转换线程。先检查 MD5 缓存，命中则跳过转换。
 
         MD5 一律从 file_path 计算（不再依赖 jobs[row].source_md5 ——
         多文件订单并发转换时行号可能错位，会读到别的文件的 MD5）。
         仅当任务上已有相同 file_path 的 source_md5 时复用，避免重复计算大文件。
-        tab_key（2026-12）：目标标签页（无障碍后台创建时定位 job；空 = 当前前台标签页）。"""
+        tab_key（2026-12）：目标标签页（无障碍后台创建时定位 job；空 = 当前前台标签页）。
+        from_cloud（S1-04）：云端任务 ⇒ Office 文档强制 LibreOffice，不走 Word/WPS COM。"""
         # 计算源文件 MD5 并检查 PDF 缓存
         source_md5 = ""
         image_orientation = "auto"
@@ -7923,7 +8234,7 @@ class MainWindow(QMainWindow):
                 return
         # 缓存未命中 → 启动转换线程（同 file_path 的旧 worker 先取消，防重复写缓存）
         self._cancel_convert_worker_for_path(file_path)
-        worker = ConvertWorker(row, file_path, engine, source_md5)
+        worker = ConvertWorker(row, file_path, engine, source_md5, from_cloud=from_cloud)
         worker.finished.connect(
             lambda r, fp, pdf, pc, ori, tk=tab_key: self._on_convert_finished(r, fp, pdf, pc, ori, tk))
         self._convert_workers.append(worker)
@@ -8062,7 +8373,8 @@ class MainWindow(QMainWindow):
                     result["order_number"] = ""
 
             threading.Thread(target=_net, daemon=True).start()
-            deadline = time.time() + 6
+            # S1-09：取号等待 ≤ 5s（原 6s），超时直接回落本地 -L 临时号
+            deadline = time.time() + ORDER_NUMBER_WAIT_S
             while "order_number" not in result and time.time() < deadline:
                 QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
                 time.sleep(0.02)
@@ -10803,7 +11115,11 @@ class MainWindow(QMainWindow):
                             is_admin_print=bool(tab.is_admin_print) if tab else True,
                             remark=(tab.remark if tab else ''),
                         )
-                        self._log(f"📋 离线模式：任务已缓存，联网后自动上传 ({len(files_data)} 个文件)")
+                        self._log(f"📴 离线未同步：任务只在本地（离线模式），联网后自动上传 "
+                                  f"({len(files_data)} 个文件)")
+                        # S1-09：这张单只在本地库里 —— 状态栏角标立刻显示「📴 离线未同步」，
+                        # 不要再让它看起来像"已完成"（结算页上没有它）
+                        self._refresh_offline_badge()
                     except Exception as e:
                         self._log(f"⚠️ 离线缓存失败: {e}")
             return order_number, False
@@ -10823,7 +11139,9 @@ class MainWindow(QMainWindow):
                     self._cloudConnSyncLog.emit(f"⚠️ 订单号获取/上报异常: {e}")
 
             threading.Thread(target=_net, daemon=True).start()
-            deadline = time.time() + 30
+            # S1-09：取号等待 30s → ORDER_NUMBER_WAIT_S（4s）。超时就用本地临时号开打，
+            # 出纸不因为"云端取号慢"被拦住；连线后由换号流程把 -L 换成正式号并补报。
+            deadline = time.time() + ORDER_NUMBER_WAIT_S
             while "order_number" not in result and time.time() < deadline:
                 QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
                 time.sleep(0.02)
@@ -10832,7 +11150,7 @@ class MainWindow(QMainWindow):
                 return "", False
             if "order_number" not in result:
                 # 超时兜底：本地临时号，连线后自动换正式号
-                self._log("⚠️ 订单号获取超时，改用本地临时号")
+                self._log(f"⚠️ 订单号获取超时（>{ORDER_NUMBER_WAIT_S}s），改用本地临时号")
                 result["order_number"] = self._generate_local_order_number_l()
             return result.get("order_number") or "", bool(result.get("uploaded", False))
         finally:
@@ -12818,9 +13136,11 @@ class MainWindow(QMainWindow):
 
         # Word 文件：缓存未命中时才启动转换（传真实行号，job 已 append；
         # 回调改为按 file_path 匹配，行号仅作快速路径提示；tab_key 定位目标标签页）
+        # from_cloud=True（S1-04）：云端任务的文件是顾客上传的 ⇒ 强制 LibreOffice，不碰 COM
         if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
             row = len(self._config.tabs[new_key].jobs) - 1
-            self._start_convert_worker(row, task.local_path, engine, tab_key=new_key)
+            self._start_convert_worker(row, task.local_path, engine, tab_key=new_key,
+                                       from_cloud=True)
 
         self._log(f"☁ 云端任务 #{task.task_id} 已添加到标签页 {new_key}")
         if self._cloud_client:

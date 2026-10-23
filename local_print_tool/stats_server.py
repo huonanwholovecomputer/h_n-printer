@@ -6,15 +6,22 @@ stats_server.py — 内置 HTTP 服务器，为收支清算 HTML 提供：
 """
 from __future__ import annotations
 
+import base64
+import getpass
+import hashlib
+import hmac
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import socket
 import sys
 import threading
+import time
 import urllib.parse
+from datetime import datetime
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 import requests as http_requests
@@ -123,8 +130,855 @@ _BINDINGS_FILE_LOCK = threading.Lock()
 # 请求体大小上限（10MB）与读取超时（秒）
 _MAX_BODY_SIZE = 10 * 1024 * 1024
 _BODY_READ_TIMEOUT = 15
+# S1-09：本地 HTTP 服务自身也要有资源上限（否则一次 POST 塞 1GB / 上百个并发就能把机器拖死）
+_MAX_CONCURRENT_REQUESTS = 16     # 并发处理线程上限：超了直接 503，不排队、不无限起线程
+_SOCKET_TIMEOUT = 30              # 连接级空闲/读写超时（秒）：慢速或半开连接 30 秒后断开
 # 公共静态文件白名单：浏览器加载这些文件时不要求启动令牌（其余静态文件一律校验）
 _PUBLIC_STATIC_FILES = {"/chart.umd.min.js"}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# S1-05 财务安全加固（docs/安全加固修复计划_2026-10-23.md §S1-05；D-5 已拍板
+# 「接受首次强制改密 + 后端二次校验」）
+#
+#   ① 密码：PBKDF2-HMAC-SHA256 + **每模块独立 salt** + ≥200k 迭代。**本文件是唯一实现**，
+#      前端不再自带哈希（前端算的哈希永远不能证明"用户知道密码"，那只证明"客户端愿意相信"）。
+#      旧的无盐 SHA-256 / 明文在**首次解锁成功时**自动重算升级为 PBKDF2（幂等：升级过就不再动）。
+#   ② 首次强制改密：代码里没有可用的默认密码。`123456` 只出现在**拒绝清单**与
+#      「旧默认密码指纹」里 —— 命中即判 needs_setup，必须先在页面上设新密码。
+#   ③ 后端二次校验：密码校验通过 → 签发 30 分钟的 `finance_session`（HMAC 签名 + 绑定本机 +
+#      随机 sid，进程重启即全部作废）。**所有写操作**必须带它（未登记的写路由 fail-closed 同样要求），
+#      读操作照旧放行（向后兼容）。
+#   ④ 完整性：print_data.json 配旁路 HMAC（密钥由 Windows DPAPI 保护，取不到时降级为
+#      0600 权限的随机密钥文件并**明确日志说明降级**）。启动时校验；被整份覆写 → 只读保护，
+#      **不覆盖数据**，等操作员在页面上确认后按当前内容重建基线。
+#   ⑤ 审计：财务写操作追加只读日志（%APPDATA%\HN打印工具\logs\finance_audit.log），
+#      记时间/模块/字段/前后值摘要，**不含密码与密钥**。
+# ═══════════════════════════════════════════════════════════════════════════
+
+FINANCE_MODULES = ("score", "expense", "income", "transfer", "settings", "auth", "orderstatus")
+# D-5：解锁会话 30 分钟（超时需重新输入密码，是已接受的操作摩擦）
+FINANCE_SESSION_TTL = 30 * 60
+FINANCE_SESSION_HEADER = "X-Finance-Session"
+PBKDF2_SCHEME = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 210_000          # ≥200k（计划 §S1-05）
+PBKDF2_SALT_BYTES = 16               # 每模块独立 salt：每次设置/升级都重新生成
+MIN_PASSWORD_LEN = 6
+# 旧默认密码的指纹（sha256('123456')）。**只用于识别**「还是默认密码」的存量模块 → 强制改密；
+# 任何校验路径都不会拿它当可通过的密码（识别出来就是 needs_setup）。
+LEGACY_DEFAULT_SHA256 = "8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92"
+# 服务端**先于校验**拒绝的弱口令/默认值：不管库里存的是什么，这些密码永远不能用来解锁
+WEAK_PASSWORDS = frozenset({
+    "123456", "1234567", "12345678", "123456789", "12345", "password", "passwd",
+    "111111", "000000", "666666", "888888", "abc123", "qwerty", "admin", "iloveyou",
+})
+# 服务端权威凭据存储键：写在 print_data.json **顶层**（页面不读不写、不参与 hasRealData，
+# 因此不会把「本机凭据副本」误判成"本地也有真实收支数据"而每次启动弹合并框）
+CRED_KEY = "_finance_credentials"
+# 写操作 → 必须解锁的模块（None = 任意已解锁模块即可；未登记的写路由按 None 处理 = fail-closed）
+FINANCE_WRITE_MODULES = {
+    "/api/proxy/admin/order_status": "orderstatus",
+    "/api/proxy/admin/order_type": "orderstatus",
+    "/api/proxy/finance/config": None,
+    "/api/proxy/pricing": "settings",
+    "/api/proxy/printer/bind_owner": "auth",
+    "/api/proxy/printer/devices/delete": "auth",
+    "/api/proxy/printer/devices/cleanup": "auth",
+    "/api/proxy/printer/capability": "auth",
+    "/api/local/data": None,
+    "/api/local/bindings": None,
+}
+# 不需要会话的 POST（登录/首次设置/登出：它们本身就是"换会话"的动作）
+FINANCE_AUTH_OPEN_PATHS = frozenset({
+    "/api/local/finance_auth/unlock",
+    "/api/local/finance_auth/setup",
+    "/api/local/finance_auth/logout",
+})
+_DPAPI_MAGIC = b"HNDPAPI1"          # 密钥文件前缀：DPAPI 保护
+_RAW_KEY_MAGIC = b"HNRAW001"        # 密钥文件前缀：降级为明文随机密钥
+_AUDIT_MAX_BYTES = 2 * 1024 * 1024  # 审计日志超过 2MB 轮转一次
+
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+def _iso_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def machine_fingerprint() -> str:
+    """本机指纹（会话绑定用）：计算机名 + 登录用户名。换机器/换账户的 token 一律作废。"""
+    try:
+        node = platform.node() or "?"
+    except Exception:
+        node = "?"
+    try:
+        user = getpass.getuser() or "?"
+    except Exception:
+        user = "?"
+    return "%s|%s" % (node, user)
+
+
+def _b64e(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64d(text: str) -> bytes:
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
+
+
+def _dpapi_protect(raw: bytes) -> bytes:
+    """Windows DPAPI 加密（当前用户范围）。取不到 pywin32/失败时由调用方降级。"""
+    import win32crypt                                   # noqa: F401（不存在就抛 ImportError）
+    return win32crypt.CryptProtectData(raw, "HN打印工具 财务完整性密钥", None, None, None, 0)
+
+
+def _dpapi_unprotect(blob: bytes) -> bytes:
+    import win32crypt                                   # noqa: F401
+    _desc, raw = win32crypt.CryptUnprotectData(blob, None, None, None, 0)
+    return raw
+
+
+def _money(value) -> float:
+    try:
+        return round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def finance_data_summary(data) -> dict:
+    """数据摘要（审计日志的「前后值摘要」）：只记条数与合计金额，**绝不记密码/密钥/哈希**。"""
+    if not isinstance(data, dict):
+        return {}
+    recs = data.get("records") if isinstance(data.get("records"), dict) else {}
+    cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+    out = {"members": len(cfg.get("members") or [])}
+    for key in ("expenses", "income", "transfers", "scores"):
+        arr = recs.get(key) or []
+        if not isinstance(arr, list):
+            arr = []
+        total = 0.0
+        for r in arr:
+            if not isinstance(r, dict):
+                continue
+            if key == "scores":
+                try:
+                    total += float(r.get("score") or 0)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                total += _money(r.get("amount"))
+        out[key] = [len(arr), round(total, 2)]
+    pw = cfg.get("passwords") if isinstance(cfg.get("passwords"), dict) else {}
+    # 只记「哪几个模块有密码」，不记哈希、不记明文
+    out["password_modules"] = sorted([k for k, v in pw.items() if v])
+    return out
+
+
+_AUDIT_SECRET_KEYS = re.compile(r"(password|passwd|pwd|secret|token|key|mac|hash|salt)", re.I)
+
+
+def _scrub_audit(value, depth=0):
+    """审计字段脱敏：键名命中 password/secret/token/key/mac/hash/salt 的一律替换成 ***。"""
+    if depth > 4:
+        return "…"
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if _AUDIT_SECRET_KEYS.search(str(k)):
+                out[str(k)] = "***"
+            else:
+                out[str(k)] = _scrub_audit(v, depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_scrub_audit(v, depth + 1) for v in value[:50]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+class FinanceSecurity:
+    """收支清算页的财务安全门（密码 / 会话 / 数据完整性 / 审计）。
+
+    一个数据文件对应一个实例（见 get_finance_security 的进程内缓存）：
+      · 会话登记表在实例内存里，`_secret` 每进程随机 ⇒ 进程重启即全部作废；
+      · 所有公开方法都在 self._lock 下串行（ThreadingHTTPServer 是多线程的）。
+    """
+
+    def __init__(self, data_file: str = "", session_ttl: int = 0,
+                 api_url: str = "", token: str = "", finance_mode: str = "cloud"):
+        self.data_file = data_file or _DEFAULT_DATA_FILE
+        self.home_dir = os.path.dirname(self.data_file) or "."
+        self.logs_dir = os.path.join(self.home_dir, "logs")
+        self.audit_file = os.path.join(self.logs_dir, "finance_audit.log")
+        # 密钥与 HMAC 旁路文件与数据文件同目录（生产 = %APPDATA%\HN打印工具）
+        self.key_file = os.path.join(self.home_dir, "finance_hmac.key")
+        self.mac_file = self.data_file + ".hmac"
+        self.seal_mark_file = self.data_file + ".sealed"
+        self.session_ttl = int(session_ttl or FINANCE_SESSION_TTL)
+        self.api_url = (api_url or "").rstrip("/")
+        self.token = token or ""
+        self.finance_mode = finance_mode if finance_mode in ("cloud", "local") else "cloud"
+        self.machine = machine_fingerprint()
+        self._secret = secrets.token_bytes(32)
+        self._sessions = {}                              # sid → {exp, mods, iat}
+        self._lock = threading.RLock()
+        self._hmac_key = None                            # bytes | None
+        self._key_mode = ""                              # 'dpapi' / 'raw' / 'unreadable' / ''
+        self._read_only = False
+        self._integrity = "unknown"
+        self._cloud_summary = None                       # 上一次看到的云端配置摘要（审计 before）
+        self._cloud_cache = None                         # 云端 config.passwords 缓存
+        self._cloud_cache_ts = 0
+        self._cloud_cache_ready = False
+
+    # ── 文件小工具（原子写 + 0600） ──
+
+    @staticmethod
+    def _read_json(path: str, default=None):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _write_bytes(path: str, data: bytes) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    def _write_json(self, path: str, data) -> None:
+        self._write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+
+    # ── 完整性密钥（DPAPI / 降级明文） ──
+
+    def _load_or_create_key(self):
+        with self._lock:
+            if self._hmac_key is not None:
+                return self._hmac_key
+            if os.path.exists(self.key_file):
+                try:
+                    with open(self.key_file, "rb") as f:
+                        blob = f.read()
+                except OSError:
+                    blob = b""
+                if blob.startswith(_DPAPI_MAGIC):
+                    try:
+                        key = _dpapi_unprotect(blob[len(_DPAPI_MAGIC):])
+                    except Exception as e:
+                        # 换了机器/换用户/DPAPI 损坏：拿不到密钥 ⇒ 无法验证既有基线（人工确认后重建）
+                        logger.error("财务完整性：DPAPI 密钥解密失败（%s），既有 HMAC 无法校验"
+                                     "（需人工确认后重建基线）", type(e).__name__)
+                        self._key_mode = "unreadable"
+                        return None
+                    if len(key) == 32:
+                        self._hmac_key, self._key_mode = key, "dpapi"
+                        return key
+                elif blob.startswith(_RAW_KEY_MAGIC):
+                    key = blob[len(_RAW_KEY_MAGIC):]
+                    if len(key) == 32:
+                        self._hmac_key, self._key_mode = key, "raw"
+                        return key
+                logger.warning("财务完整性密钥文件格式异常 → 重新生成（旧基线需人工确认后重建）")
+            key = self._new_key()
+            return key
+
+    def _new_key(self):
+        """生成并落盘新密钥：优先 DPAPI；取不到就**降级**为 0600 随机密钥文件并明确记日志。"""
+        key = secrets.token_bytes(32)
+        try:
+            blob = _dpapi_protect(key)
+            self._write_bytes(self.key_file, _DPAPI_MAGIC + blob)
+            self._key_mode = "dpapi"
+            logger.info("财务完整性：已用 Windows DPAPI 保护 HMAC 密钥")
+        except Exception as e:
+            # 非 Windows / 没装 pywin32 / 服务账户 —— 降级但要让人一眼看见
+            logger.warning(
+                "财务完整性：Windows DPAPI 不可用（%s）→ 已**降级**为随机密钥文件 %s"
+                "（0600 权限，位于当前用户配置目录；保护强度低于 DPAPI，仅本机用户可读）",
+                type(e).__name__, os.path.basename(self.key_file))
+            self._write_bytes(self.key_file, _RAW_KEY_MAGIC + key)
+            self._key_mode = "raw"
+        self._hmac_key = key
+        return key
+
+    def _mac_of(self, data) -> str:
+        key = self._load_or_create_key()
+        if not key:
+            return ""
+        try:
+            raw = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError):
+            return ""
+        return hmac.new(key, raw, hashlib.sha256).hexdigest()
+
+    # ── 完整性：封存 / 校验 / 人工确认 ──
+
+    def _seal(self, data, mac: str) -> None:
+        self._write_json(self.mac_file, {
+            "alg": "hmac-sha256", "v": 1, "mac": mac,
+            "file": os.path.basename(self.data_file), "sealed_at": _iso_now(),
+        })
+        try:
+            self._write_bytes(self.seal_mark_file, b"sealed\n")
+        except OSError:
+            pass
+
+    def check_integrity(self) -> str:
+        """启动时/每次写入前校验。返回状态：
+        ok / sealed（首次启用保护，基线已建立）/ absent（还没有数据文件）/
+        mismatch（被改过）/ missing_mac（基线文件被删）/ unreadable / key_unavailable。
+        只有 ok / sealed / absent 允许写。"""
+        with self._lock:
+            if not os.path.exists(self.data_file):
+                self._integrity, self._read_only = "absent", False
+                return self._integrity
+            data = self._read_json(self.data_file, default=None)
+            if not isinstance(data, dict):
+                self._integrity, self._read_only = "unreadable", True
+                logger.error("财务数据完整性：print_data.json 无法解析 → 只读保护（不覆盖数据）")
+                return self._integrity
+            current = self._mac_of(data)
+            if not current:
+                self._integrity, self._read_only = "key_unavailable", True
+                logger.error("财务数据完整性：HMAC 密钥不可用 → 只读保护（不覆盖数据）")
+                return self._integrity
+            macinfo = self._read_json(self.mac_file, default=None)
+            if isinstance(macinfo, dict) and macinfo.get("mac"):
+                if hmac.compare_digest(str(macinfo.get("mac")), current):
+                    self._integrity, self._read_only = "ok", False
+                else:
+                    self._integrity, self._read_only = "mismatch", True
+                    logger.error("财务数据完整性校验失败：print_data.json 与上次基线不一致"
+                                 "（被整份覆写/外部改过）→ 已进入只读保护，不覆盖数据")
+                    self.audit("integrity_mismatch", module="integrity",
+                               fields={"baseline": str(macinfo.get("mac"))[:12] + "…",
+                                       "actual": current[:12] + "…"})
+                return self._integrity
+            if os.path.exists(self.seal_mark_file):
+                self._integrity, self._read_only = "missing_mac", True
+                logger.error("财务数据完整性：基线文件 %s 缺失（曾被删除？）→ 只读保护，需人工确认",
+                             os.path.basename(self.mac_file))
+                return self._integrity
+            # S1-05 之前写的历史数据：首次启用保护。**不改数据本身**，只补基线。
+            self._seal(data, current)
+            self._integrity, self._read_only = "sealed", False
+            logger.info("财务数据完整性：首次为既有 print_data.json 建立 HMAC 基线")
+            return self._integrity
+
+    def acknowledge_integrity(self, confirm: bool) -> dict:
+        """操作员在页面上确认「这确实是我自己的改动」→ 按当前内容重建基线。"""
+        if confirm is not True:
+            return {"ok": False, "code": "confirm_required", "message": "需要显式确认（confirm=true）"}
+        with self._lock:
+            data = self._read_json(self.data_file, default=None)
+            if not isinstance(data, dict):
+                return {"ok": False, "code": "unreadable",
+                        "message": "数据文件不可读，无法建立新基线（请人工检查 print_data.json）"}
+            self._hmac_key = None                     # 可能换了机器/密钥不可用 → 重新取或重建
+            mac = self._mac_of(data)
+            if not mac:
+                return {"ok": False, "code": "key_unavailable", "message": "完整性密钥不可用"}
+            self._seal(data, mac)
+            self._integrity, self._read_only = "resealed", False
+            self.audit("integrity_rebaselined", module="integrity",
+                       fields={"mac": mac[:12] + "…"})
+            logger.warning("财务数据完整性：操作员已确认 → 按当前文件内容重建基线，写入恢复")
+            return {"ok": True, "integrity": "resealed"}
+
+    def current_mac(self) -> str:
+        data = self._read_json(self.data_file, default=None)
+        if not isinstance(data, dict):
+            return ""
+        return self._mac_of(data)
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    @property
+    def integrity_state(self) -> str:
+        return self._integrity
+
+    def status_payload(self, session_token: str = "") -> dict:
+        """给页面的状态：每个模块是否需要设置、是否有可用的解锁会话、完整性/只读。"""
+        with self._lock:
+            modules = {}
+            for key in FINANCE_MODULES:
+                stored, source = self._stored_for(key)
+                unset = self._is_unset(stored) or self._is_default_marker(stored)
+                modules[key] = {
+                    "configured": not unset,
+                    "needs_setup": unset,
+                    "legacy": (not unset) and self._is_legacy(stored),
+                    "source": source,
+                }
+            ok, _code, sess = self.verify_session(session_token)
+            session_info = {
+                "active": bool(ok),
+                "modules": list(sess.get("mods") or []) if ok else [],
+                "expires_in": max(0, int(sess.get("exp") or 0) - _now_ts()) if ok else 0,
+            }
+            return {
+                "modules": modules,
+                "needs_setup": [k for k, v in modules.items() if v["needs_setup"]],
+                "session": session_info,
+                "session_ttl": self.session_ttl,
+                "read_only": self._read_only,
+                "integrity": self._integrity,
+                "key_mode": self._key_mode,
+            }
+
+    # ── 凭据读写 ──
+
+    def _local_credentials(self) -> dict:
+        """本机凭据：优先服务端权威存储（CRED_KEY），再吃掉旧版 config.passwords（兼容导入）。"""
+        data = self._read_json(self.data_file, default=None)
+        out = {}
+        if isinstance(data, dict):
+            cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
+            pw = cfg.get("passwords") if isinstance(cfg.get("passwords"), dict) else {}
+            for k, v in pw.items():
+                if isinstance(v, str) and v:
+                    out[k] = v
+            creds = data.get(CRED_KEY)
+            if isinstance(creds, dict):
+                for k, v in creds.items():
+                    if isinstance(v, str) and v:
+                        out[k] = v            # 权威存储覆盖旧字段
+        return out
+
+    def _cloud_credentials(self):
+        """云端 config.passwords（仅云端模式且可达时）；任何失败都返回 None（不抛）。
+        带 10 秒缓存：状态查询/解锁会为多个模块问同一份配置，不能每个模块都打一次云端。"""
+        if not self.api_url or not self.token:
+            return None
+        now = _now_ts()
+        with self._lock:
+            if self._cloud_cache_ready and now - self._cloud_cache_ts < 10:
+                return self._cloud_cache
+        result = None
+        try:
+            resp = _get_proxy_session().get(
+                "%s/api/finance/config" % self.api_url,
+                params={"token": self.token}, timeout=(2, 3))
+            if resp.ok:
+                body = resp.json()
+                data = body.get("data") if isinstance(body, dict) else None
+                cfg = data.get("config") if isinstance(data, dict) else None
+                pw = cfg.get("passwords") if isinstance(cfg, dict) else None
+                if isinstance(pw, dict):
+                    result = pw
+        except Exception:
+            result = None
+        with self._lock:
+            self._cloud_cache = result
+            self._cloud_cache_ts = now
+            self._cloud_cache_ready = True
+        return result
+
+    def _stored_for(self, module: str):
+        """返回 (存储值, 来源)。规则（写进文档，避免两处口径漂移）：
+        1. 本机已是 PBKDF2 ⇒ 本机权威（幂等迁移的落地结果）；
+        2. 否则云端有值 ⇒ 云端（首次升级的源）；
+        3. 否则用本机旧格式（sha256:/明文）。
+        """
+        local = self._local_credentials()
+        stored = (local.get(module) or "").strip()
+        if stored.startswith(PBKDF2_SCHEME + "$"):
+            return stored, "local"
+        cloud = self._cloud_credentials()
+        if isinstance(cloud, dict):
+            cstored = cloud.get(module)
+            cstored = cstored.strip() if isinstance(cstored, str) else ""
+            if cstored and not self._is_unset(cstored):
+                return cstored, "cloud"
+        return stored, "local"
+
+    @staticmethod
+    def _is_unset(stored) -> bool:
+        return not isinstance(stored, str) or not stored.strip()
+
+    @staticmethod
+    def _is_default_marker(stored) -> bool:
+        """旧默认密码指纹（'123456' 的各种历史存法）→ 必须改密。"""
+        if not isinstance(stored, str):
+            return False
+        s = stored.strip()
+        if s == "123456":
+            return True
+        body = s[7:] if s.lower().startswith("sha256:") else s
+        return body.lower() == LEGACY_DEFAULT_SHA256
+
+    @staticmethod
+    def _is_legacy(stored) -> bool:
+        if not isinstance(stored, str) or not stored:
+            return False
+        return not stored.startswith(PBKDF2_SCHEME + "$")
+
+    @staticmethod
+    def _scheme_of(stored) -> str:
+        if isinstance(stored, str) and stored.startswith(PBKDF2_SCHEME + "$"):
+            return PBKDF2_SCHEME
+        if isinstance(stored, str) and stored.lower().startswith("sha256:"):
+            return "sha256-unsalted"
+        return "plaintext"
+
+    @staticmethod
+    def _hash_password(password: str) -> str:
+        """PBKDF2-HMAC-SHA256 + 每次全新随机 salt（每模块独立）。"""
+        salt = secrets.token_bytes(PBKDF2_SALT_BYTES)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+        return "%s$%d$%s$%s" % (PBKDF2_SCHEME, PBKDF2_ITERATIONS, salt.hex(), dk.hex())
+
+    @classmethod
+    def verify_password_value(cls, password: str, stored: str) -> bool:
+        """纯函数式口令校验（不碰文件）：PBKDF2 / 旧 sha256 / 旧明文。"""
+        if not isinstance(stored, str) or not stored:
+            return False
+        if stored.startswith(PBKDF2_SCHEME + "$"):
+            try:
+                _scheme, iterations, salt_hex, dk_hex = stored.split("$", 3)
+                iterations = int(iterations)
+            except (ValueError, TypeError):
+                return False
+            if iterations < 1 or iterations > 5_000_000:
+                return False
+            try:
+                salt = bytes.fromhex(salt_hex)
+                expected = bytes.fromhex(dk_hex)
+            except ValueError:
+                return False
+            dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+            return hmac.compare_digest(dk, expected)
+        if stored.lower().startswith("sha256:"):
+            digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+            return hmac.compare_digest(digest, stored[7:].strip().lower())
+        # 旧明文（极老的数据）：只在没有其他格式时才走到这里
+        return hmac.compare_digest(password, stored)
+
+    def _validate_new_password(self, password: str):
+        if not isinstance(password, str) or not password:
+            return False, "请输入新密码"
+        if len(password) < MIN_PASSWORD_LEN:
+            return False, "密码至少 %d 位" % MIN_PASSWORD_LEN
+        if password in WEAK_PASSWORDS:
+            return False, "该密码在弱口令清单里（含旧的默认密码），请换一个"
+        if len(set(password)) == 1:
+            return False, "密码不能是同一个字符重复"
+        return True, ""
+
+    def _store_credentials(self, module: str, stored_hash: str, source: str = "") -> bool:
+        """把（升级后的）凭据写进 print_data.json：顶层权威键 + 本地模式同步 config.passwords。
+        只读保护时不写（宁可下次再升级一次，也不改动被篡改的文件）。"""
+        with self._lock:
+            if self._read_only:
+                logger.warning("财务凭据升级未落盘：数据处于只读保护（%s）", self._integrity)
+                return False
+            data = self._read_json(self.data_file, default=None)
+            if not isinstance(data, dict):
+                data = {}
+            creds = data.get(CRED_KEY)
+            if not isinstance(creds, dict):
+                creds = {}
+            creds[module] = stored_hash
+            data[CRED_KEY] = creds
+            # 本地模式同步旧字段（config.passwords），页面/云端合并逻辑照旧能看到密码状态。
+            # 云端模式**不写**这里：那份 config 是"云端配置的本机镜像"，
+            # 一旦写进密码哈希，页面的 hasRealData() 会把它判成"本地也有真实收支数据"，
+            # 于是每次打开都弹「本地与云端均存在数据，是否合并」（S1-05 实测踩到）。
+            if self.finance_mode != "cloud":
+                cfg = data.get("config")
+                if not isinstance(cfg, dict):
+                    cfg = {}
+                pw = cfg.get("passwords")
+                if not isinstance(pw, dict):
+                    pw = {}
+                pw[module] = stored_hash
+                cfg["passwords"] = pw
+                data["config"] = cfg
+            try:
+                self._write_json(self.data_file, data)
+                mac = self._mac_of(data)
+                if mac:
+                    self._seal(data, mac)
+            except OSError as e:
+                logger.error("财务凭据写入失败: %s", type(e).__name__)
+                return False
+            self._cloud_cache_ready = False     # 凭据变了 → 云端缓存作废（下次重新取）
+            return True
+
+    # ── 会话 ──
+
+    def issue_session(self, modules) -> str:
+        with self._lock:
+            mods = sorted({m for m in (modules or []) if m in FINANCE_MODULES})
+            sid = secrets.token_hex(16)
+            iat, exp = _now_ts(), _now_ts() + self.session_ttl
+            self._sessions[sid] = {"exp": exp, "mods": mods, "iat": iat}
+            self._prune_sessions()
+            payload = {"sid": sid, "iat": iat, "exp": exp, "host": self.machine, "mods": mods}
+            raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            sig = hmac.new(self._secret, raw, hashlib.sha256).hexdigest()
+            return "%s.%s" % (_b64e(raw), sig)
+
+    def verify_session(self, token: str, module=None):
+        """返回 (ok, code, session)。code ∈ ''/finance_session_required/invalid/expired/forbidden。"""
+        with self._lock:
+            if not token:
+                return False, "finance_session_required", None
+            if not isinstance(token, str) or "." not in token:
+                return False, "finance_session_invalid", None
+            raw_b64, sig = token.rsplit(".", 1)
+            try:
+                raw = _b64d(raw_b64)
+            except Exception:
+                return False, "finance_session_invalid", None
+            expect = hmac.new(self._secret, raw, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expect, sig):
+                return False, "finance_session_invalid", None
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except Exception:
+                return False, "finance_session_invalid", None
+            if not isinstance(payload, dict):
+                return False, "finance_session_invalid", None
+            if payload.get("host") != self.machine:      # 绑定本机：换机器/换账户一律作废
+                return False, "finance_session_invalid", None
+            sid = payload.get("sid") or ""
+            sess = self._sessions.get(sid)
+            if not sess:
+                return False, "finance_session_invalid", None
+            if int(payload.get("exp") or 0) <= _now_ts() or int(sess.get("exp") or 0) <= _now_ts():
+                self._sessions.pop(sid, None)
+                return False, "finance_session_expired", None
+            mods = list(sess.get("mods") or [])
+            if module and module not in mods:
+                return False, "finance_session_forbidden", None
+            return True, "", {"sid": sid, "exp": sess.get("exp"), "mods": mods}
+    def revoke_session(self, token: str) -> bool:
+        with self._lock:
+            if not isinstance(token, str) or "." not in token:
+                return False
+            raw_b64 = token.rsplit(".", 1)[0]
+            try:
+                payload = json.loads(_b64d(raw_b64).decode("utf-8"))
+            except Exception:
+                return False
+            sid = (payload or {}).get("sid") if isinstance(payload, dict) else ""
+            return bool(self._sessions.pop(sid, None))
+
+    def _prune_sessions(self) -> None:
+        now = _now_ts()
+        for sid in [k for k, v in self._sessions.items() if int(v.get("exp") or 0) <= now]:
+            self._sessions.pop(sid, None)
+
+    # ── 解锁 / 设置 / 改密 ──
+
+    def unlock(self, module: str, password: str) -> dict:
+        module = (module or "").strip()
+        if module not in FINANCE_MODULES:
+            return {"ok": False, "code": "unknown_module", "message": "未知的密码模块"}
+        if not isinstance(password, str) or not password:
+            return {"ok": False, "code": "empty_password", "message": "请输入密码"}
+        stored, source = self._stored_for(module)
+        if self._is_unset(stored) or self._is_default_marker(stored):
+            self.audit("unlock_denied", module=module, fields={"reason": "needs_setup"})
+            return {"ok": False, "code": "needs_setup",
+                    "message": "该模块还没有设置密码（默认密码已停用），请先设置新密码"}
+        if password in WEAK_PASSWORDS:
+            # 先于校验拒绝：默认/弱口令永远不能用来解锁
+            self.audit("unlock_denied", module=module, fields={"reason": "default_password"})
+            return {"ok": False, "code": "default_password",
+                    "message": "默认密码已停用，请先在「设置 → 敏感模块密码」里设置新密码"}
+        if not self.verify_password_value(password, stored):
+            self.audit("unlock_denied", module=module, fields={"reason": "wrong_password",
+                                                               "scheme": self._scheme_of(stored)})
+            return {"ok": False, "code": "wrong_password", "message": "密码错误"}
+        upgraded = False
+        stored_hash = ""
+        if self._is_legacy(stored):
+            # 旧的无盐 SHA-256 / 明文 → 首次解锁成功时自动升级为 PBKDF2，写回 print_data.json
+            new_hash = self._hash_password(password)
+            if self._store_credentials(module, new_hash, source):
+                upgraded, stored_hash = True, new_hash
+            self.audit("password_upgraded", module=module,
+                       fields={"from": self._scheme_of(stored), "to": PBKDF2_SCHEME,
+                               "persisted": upgraded})
+        token = self.issue_session([module])
+        self.audit("unlock_ok", module=module,
+                   fields={"source": source, "upgraded": upgraded, "scheme":
+                           PBKDF2_SCHEME if upgraded else self._scheme_of(stored)})
+        out = {"ok": True, "session": token, "expires_in": self.session_ttl,
+               "modules": [module], "upgraded": upgraded}
+        if stored_hash:
+            out["stored_hash"] = stored_hash
+        return out
+
+    def setup(self, module: str, new_password: str) -> dict:
+        """首次设置密码（默认/未设置 → 新密码）。已配置的模块必须先解锁再改，不走这里。"""
+        targets = list(FINANCE_MODULES) if (not module or module == "all") else [module]
+        if any(m not in FINANCE_MODULES for m in targets):
+            return {"ok": False, "code": "unknown_module", "message": "未知的密码模块"}
+        allowed = []
+        for m in targets:
+            stored, _src = self._stored_for(m)
+            if self._is_unset(stored) or self._is_default_marker(stored):
+                allowed.append(m)
+        if not allowed:
+            return {"ok": False, "code": "already_configured",
+                    "message": "该模块已设置密码，请先解锁再在「设置」里修改"}
+        valid, msg = self._validate_new_password(new_password)
+        if not valid:
+            return {"ok": False, "code": "weak_password", "message": msg}
+        stored_map, persisted = {}, []
+        for m in allowed:
+            h = self._hash_password(new_password)        # 每个模块各自独立 salt
+            if self._store_credentials(m, h):
+                persisted.append(m)
+            stored_map[m] = h
+        if not persisted:
+            return {"ok": False, "code": "read_only",
+                    "message": "数据处于只读保护（完整性校验失败），请先确认后再设置密码"}
+        self.audit("password_setup", module=",".join(persisted), fields={"modules": persisted})
+        return {"ok": True, "stored": {m: stored_map[m] for m in persisted}, "modules": persisted}
+
+    def change_password(self, module: str, new_password: str, session_mods) -> dict:
+        """改密（设置页）。必须已解锁「设置」模块 —— 与既有 UI 的权限口径一致。"""
+        if module not in FINANCE_MODULES:
+            return {"ok": False, "code": "unknown_module", "message": "未知的密码模块"}
+        if "settings" not in (session_mods or []):
+            return {"ok": False, "code": "finance_session_forbidden",
+                    "message": "修改密码需要先解锁「设置」模块"}
+        valid, msg = self._validate_new_password(new_password)
+        if not valid:
+            return {"ok": False, "code": "weak_password", "message": msg}
+        h = self._hash_password(new_password)
+        if not self._store_credentials(module, h):
+            return {"ok": False, "code": "read_only", "message": "数据只读，改密未生效"}
+        self.audit("password_change", module=module, fields={"to": PBKDF2_SCHEME})
+        return {"ok": True, "stored_hash": h}
+
+    # ── 数据读写（含完整性） ──
+
+    def load_data(self):
+        with self._lock:
+            if not os.path.exists(self.data_file):
+                return None, False
+            data = self._read_json(self.data_file, default=None)
+            return (data if isinstance(data, dict) else None), True
+
+    def _preserve_credentials(self, existing, incoming) -> dict:
+        """页面提交的整份数据落盘前的两道折返：
+        ① 保留服务端凭据（页面不认这个键，整份覆盖会把它抹掉）；
+        ② 服务端权威凭据覆盖页面提交的旧哈希（否则「保存页面状态」会把刚升级的密码回退成旧格式）。"""
+        incoming = dict(incoming) if isinstance(incoming, dict) else {}
+        creds = {}
+        if isinstance(existing, dict) and isinstance(existing.get(CRED_KEY), dict):
+            creds.update({k: v for k, v in existing[CRED_KEY].items() if isinstance(v, str) and v})
+        if isinstance(incoming.get(CRED_KEY), dict):
+            creds.update({k: v for k, v in incoming[CRED_KEY].items() if isinstance(v, str) and v})
+        if not creds:
+            return incoming
+        incoming[CRED_KEY] = creds
+        cfg = incoming.get("config")
+        if not isinstance(cfg, dict):
+            cfg = {}
+        pw = cfg.get("passwords")
+        if not isinstance(pw, dict):
+            pw = {}
+        for mod, stored in creds.items():
+            pw[mod] = stored
+        cfg["passwords"] = pw
+        incoming["config"] = cfg
+        return incoming
+
+    def write_data(self, incoming) -> dict:
+        """页面保存 → 完整性门禁 → 原子写 → 重建 HMAC 基线 → 审计。"""
+        with self._lock:
+            state = self.check_integrity()
+            if state in ("mismatch", "missing_mac", "unreadable", "key_unavailable"):
+                raise PermissionError("数据完整性校验失败（%s），已进入只读保护：本机拒绝覆盖数据" % state)
+            existing, _exists = self.load_data()
+            merged = self._preserve_credentials(existing, incoming)
+            before = finance_data_summary(existing)
+            after = finance_data_summary(merged)
+            self._write_json(self.data_file, merged)
+            mac = self._mac_of(merged)
+            if mac:
+                self._seal(merged, mac)
+            if before != after:
+                self.audit("local_data_write", module="data",
+                           fields={"before": before, "after": after})
+            return merged
+
+    # ── 审计（只读日志） ──
+
+    def _rotate_audit(self) -> None:
+        try:
+            if os.path.getsize(self.audit_file) > _AUDIT_MAX_BYTES:
+                os.replace(self.audit_file, self.audit_file + ".1")
+        except OSError:
+            pass
+
+    def audit(self, event: str, module: str = "", fields=None, extra=None) -> None:
+        """追加一条审计；字段一律过脱敏（不含密码/密钥/哈希）。写失败只告警，绝不影响业务。"""
+        try:
+            rec = {"ts": _iso_now(), "event": event, "module": module}
+            if fields:
+                rec["fields"] = _scrub_audit(fields)
+            if extra:
+                rec["extra"] = _scrub_audit(extra)
+            line = json.dumps(rec, ensure_ascii=False, sort_keys=True)
+            with self._lock:
+                os.makedirs(self.logs_dir, exist_ok=True)
+                self._rotate_audit()
+                with open(self.audit_file, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                try:
+                    os.chmod(self.audit_file, 0o600)
+                except OSError:
+                    pass
+        except Exception as e:                            # noqa: BLE001
+            logger.warning("财务审计日志写入失败: %s", type(e).__name__)
+
+
+_FINANCE_CACHE = {}
+_FINANCE_CACHE_LOCK = threading.Lock()
+
+
+def get_finance_security(data_file: str = "", api_url: str = "", token: str = "",
+                         finance_mode: str = "") -> FinanceSecurity:
+    """按数据文件路径取（进程内单例）：会话登记表必须跨请求存活。"""
+    path = os.path.abspath(data_file or _DEFAULT_DATA_FILE)
+    with _FINANCE_CACHE_LOCK:
+        sec = _FINANCE_CACHE.get(path)
+        if sec is None:
+            sec = FinanceSecurity(path, api_url=api_url, token=token,
+                                  finance_mode=finance_mode or "cloud")
+            _FINANCE_CACHE[path] = sec
+        else:
+            if api_url:
+                sec.api_url = api_url.rstrip("/")
+            if token:
+                sec.token = token
+            if finance_mode:
+                sec.finance_mode = finance_mode
+        return sec
 
 
 def load_bindings() -> dict:
@@ -243,6 +1097,11 @@ class _StatsHandler(SimpleHTTPRequestHandler):
     device_name: str = ""
     client_id: str = ""
     take_orders: bool = False
+    # S1-05：上一次看到的云端收支配置摘要（审计 before，由 GET /api/proxy/finance/config 预热）
+    _last_finance_summary = None
+    # S1-09：连接级空闲/读写超时（秒）。socketserver.StreamRequestHandler.setup() 会把它
+    # 设到 socket 上：半开连接/慢速客户端不会永远占着一个工作线程。
+    timeout = _SOCKET_TIMEOUT
 
     def __init__(self, *args, **kwargs):
         # 设置静态文件根目录
@@ -271,6 +1130,64 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
+
+    # ── S1-05 财务安全（密码 / 会话 / 完整性 / 审计） ──
+
+    def _fin(self) -> FinanceSecurity:
+        """本请求对应的财务安全门（按数据文件路径取进程内单例）。"""
+        return get_finance_security(
+            getattr(self, "_data_file", _DEFAULT_DATA_FILE),
+            api_url=getattr(self, "api_url", ""),
+            token=getattr(self, "token", ""),
+            finance_mode=getattr(self, "finance_mode", ""))
+
+    def _finance_session_token(self) -> str:
+        return (self.headers.get(FINANCE_SESSION_HEADER) or "").strip()
+
+    def _finance_write_allowed(self, path: str) -> bool:
+        """**所有写操作**的后端二次校验（S1-05 ③）。返回 True=放行（False=已回包）。
+
+        规则：`FINANCE_WRITE_MODULES` 里登记的路径按模块校验；**未登记的写路由一律按
+        "任意已解锁模块"要求**（fail-closed：以后新增写接口不会因为忘记登记而裸奔）。
+        读操作不经过这里（向后兼容：没有 session 也能看数据）。
+        """
+        if path in FINANCE_AUTH_OPEN_PATHS:
+            return True
+        required = FINANCE_WRITE_MODULES.get(path)
+        ok, code, _sess = self._fin().verify_session(self._finance_session_token(), required)
+        if ok:
+            return True
+        if code == "finance_session_expired":
+            status, msg = 401, "解锁会话已过期（30 分钟），请重新输入密码"
+        elif code == "finance_session_forbidden":
+            status, msg = 403, "该模块需要单独解锁后才能写入"
+        else:
+            status, msg = 403, "需要先解锁财务模块（finance_session）才能写入"
+        self._fin().audit("write_denied", module=required or "-",
+                          fields={"path": path, "code": code})
+        self._send_json({"success": False, "code": code, "message": msg}, status)
+        return False
+
+    def _request_body_ok(self) -> bool:
+        """S1-09：读之前先看 Content-Length —— 超限直接 413 并断开，绝不"先读完 1GB 再判断"。"""
+        raw = self.headers.get("Content-Length", "")
+        if not raw:
+            return True
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            self._send_json({"success": False, "code": "bad_content_length",
+                             "message": "非法的 Content-Length"}, 400)
+            return False
+        if length < 0 or length > _MAX_BODY_SIZE:
+            self.close_connection = True     # 不读请求体，直接断开（避免把超大 body 收进来）
+            logger.warning("拒绝超大请求体：Content-Length=%s（上限 %.0fMB）",
+                           raw, _MAX_BODY_SIZE / (1024 * 1024))
+            self._send_json({"success": False, "code": "body_too_large",
+                             "message": "请求体过大（上限 %dMB）" % (_MAX_BODY_SIZE // (1024 * 1024))},
+                            413)
+            return False
+        return True
 
     def _read_body(self) -> bytes:
         """读取请求体：校验 Content-Length 上限（10MB），并设置读取超时防挂起。"""
@@ -310,6 +1227,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if path == "/api/health":
             return self._handle_health()
 
+        # S1-05：财务安全状态（只读接口：读操作不需要 finance_session）
+        if path == "/api/local/finance_auth/status":
+            return self._handle_finance_status()
+
         # 代理请求：/api/proxy/xxx → 云端 API
         if path.startswith("/api/proxy/"):
             return self._proxy_get(path, parsed.query)
@@ -341,6 +1262,28 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if not self._check_launch_token():
             return self._send_json({"success": False, "message": "未授权：请通过本地打印工具打开收支清算"}, 403)
 
+        # S1-09：请求体上限（读之前就判：超限 = 413 + 断开，不把超大 body 收进内存）
+        if not self._request_body_ok():
+            return
+
+        # S1-05：**所有**写操作的财务会话二次校验（登录/首次设置/登出除外）
+        if not self._finance_write_allowed(path):
+            return
+
+        # ── S1-05 财务安全接口（密码 / 会话 / 完整性确认） ──
+        if path == "/api/local/finance_auth/status":
+            return self._handle_finance_status()
+        if path == "/api/local/finance_auth/unlock":
+            return self._handle_finance_unlock()
+        if path == "/api/local/finance_auth/setup":
+            return self._handle_finance_setup()
+        if path == "/api/local/finance_auth/password":
+            return self._handle_finance_password()
+        if path == "/api/local/finance_auth/logout":
+            return self._handle_finance_logout()
+        if path == "/api/local/finance_integrity/ack":
+            return self._handle_finance_integrity_ack()
+
         # 代理 POST 请求
         if path.startswith("/api/proxy/"):
             return self._proxy_post(path, parsed.query)
@@ -363,6 +1306,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 
         if not self._check_launch_token():
             return self._send_json({"success": False, "message": "未授权：请通过本地打印工具打开收支清算"}, 403)
+
+        # S1-05：删除数据也是写操作，同样要财务会话
+        if not self._finance_write_allowed(path):
+            return
 
         # 本地数据删除（CEO 迁移到云端 / 关闭云端清空缓存时由页面调用）
         if path == "/api/local/data":
@@ -469,14 +1416,18 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 
         try:
             resp = _get_proxy_session().get(url, timeout=_PROXY_TIMEOUT)
-            self._send_json(_extract_proxy_body(resp), resp.status_code)
+            out = _extract_proxy_body(resp)
+            self._send_json(out, resp.status_code)
+            # S1-05：记一份「当前云端配置摘要」当审计的 before（写配置时对照用，零额外请求）
+            if target_path.endswith("/finance/config") and isinstance(out.get("data"), dict):
+                type(self)._last_finance_summary = finance_data_summary(out["data"])
         except Exception as e:
             # 不拼接完整 URL / str(e)：其中可能包含 token 查询参数
             logger.error(f"代理请求失败 GET {target_path}: {type(e).__name__}")
             self._send_json({"success": False, "message": f"请求云端失败: {type(e).__name__}"}, 502)
 
     def _proxy_post(self, path: str, query: str):
-        """POST 代理到云端 API"""
+        """POST 代理到云端 API（S1-05：财务写操作追加审计日志）"""
         target_path = path.replace("/api/proxy", "/api", 1)
         safe_qs = _strip_token_from_query(query)  # 剥离客户端 token，防止覆盖后端令牌
         url = f"{self.api_url}{target_path}"
@@ -487,13 +1438,174 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 
         try:
             body = self._read_body()
+            payload = None
+            try:
+                payload = json.loads(body or b"{}")
+            except Exception:
+                payload = None
+            # 服务端权威凭据不外发：云端配置里不需要 _finance_credentials（密码状态由 config.passwords 承载）
+            if (target_path.endswith("/finance/config") and isinstance(payload, dict)
+                    and isinstance(payload.get("data"), dict)):
+                clean = {k: v for k, v in payload["data"].items() if k != CRED_KEY}
+                payload = dict(payload, data=clean)
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             resp = _get_proxy_session().post(url, data=body, timeout=_PROXY_TIMEOUT,
                                              headers={"Content-Type": "application/json"})
-            self._send_json(_extract_proxy_body(resp), resp.status_code)
+            out = _extract_proxy_body(resp)
+            self._send_json(out, resp.status_code)
+            self._audit_proxy_write(target_path, payload, out, resp.status_code)
         except Exception as e:
             # 不拼接完整 URL / str(e)：其中可能包含 token 查询参数
             logger.error(f"代理请求失败 POST {target_path}: {type(e).__name__}")
             self._send_json({"success": False, "message": f"请求云端失败: {type(e).__name__}"}, 502)
+            try:
+                self._audit_proxy_write(target_path, None, {"success": False}, 502)
+            except Exception:
+                pass
+
+    def _audit_proxy_write(self, target_path: str, payload, result, status: int) -> None:
+        """把经本机代理的财务写操作记进只读审计日志（时间/模块/字段/前后值摘要）。
+
+        只记**摘要**：订单订正记 order_id + 前后状态；配置写入记各区块条数与合计金额；
+        设备相关只记 client_id/所有者/结论。**绝不记密码、token、密钥、哈希**（audit 再脱敏一层）。
+        """
+        sec = self._fin()
+        ok = bool(result.get("success")) if isinstance(result, dict) else False
+        body = payload if isinstance(payload, dict) else {}
+        try:
+            if target_path.endswith("/order_status") or target_path.endswith("/order_type"):
+                is_status = target_path.endswith("/order_status")
+                field = "status" if is_status else "order_type"
+                before = result.get("previous_status" if is_status else "previous_order_type")
+                sec.audit("order_fix", module="orderstatus",
+                          fields={"order_id": body.get("order_id"), field: body.get(field),
+                                  "before": before},
+                          extra={"success": ok, "http": status, "path": target_path})
+            elif target_path.endswith("/finance/config"):
+                after = finance_data_summary(body.get("data") or {})
+                before = getattr(type(self), "_last_finance_summary", None)
+                sec.audit("finance_config_write", module="finance",
+                          fields={"before": before or "unknown", "after": after},
+                          extra={"success": ok, "http": status})
+                if ok:
+                    type(self)._last_finance_summary = after
+            elif target_path.endswith("/pricing"):
+                pricing = body.get("pricing")
+                keys = sorted(pricing.keys()) if isinstance(pricing, dict) else []
+                sec.audit("pricing_write", module="settings", fields={"keys": keys},
+                          extra={"success": ok, "http": status})
+            elif target_path.startswith("/api/printer/"):
+                keep = ("client_id", "owner_name", "auto_duplex", "dry_run",
+                        "include_offline_unbound", "min_offline_days")
+                sec.audit("device_write", module="auth",
+                          fields={k: body.get(k) for k in keep if k in body},
+                          extra={"path": target_path, "success": ok, "http": status})
+        except Exception as e:                            # noqa: BLE001
+            logger.warning("代理写操作审计失败: %s", type(e).__name__)
+
+    # ── S1-05 财务安全接口 ──
+
+    def _handle_finance_status(self):
+        """密码/会话/完整性状态（页面首载用它决定是否强制进改密流程）。"""
+        sec = self._fin()
+        state = sec.integrity_state
+        if state == "unknown":
+            state = sec.check_integrity()
+        payload = sec.status_payload(self._finance_session_token())
+        out = {"success": True}
+        out.update(payload)
+        out["integrity"] = state
+        out["read_only"] = sec.read_only
+        self._send_json(out)
+
+    def _handle_finance_unlock(self):
+        """密码校验（**唯一**的密码校验实现）→ 签发 30 分钟 finance_session。"""
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            return self._send_json({"success": False, "code": "bad_request",
+                                    "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return self._send_json({"success": False, "code": "bad_request",
+                                    "message": "请求体必须是对象"}, 400)
+        module = str(body.get("module") or "")
+        password = body.get("password")
+        if not isinstance(password, str):
+            password = ""
+        res = self._fin().unlock(module, password)
+        if res.get("ok"):
+            return self._send_json({"success": True, "session": res["session"],
+                                    "expires_in": res.get("expires_in"),
+                                    "modules": res.get("modules"),
+                                    "upgraded": bool(res.get("upgraded")),
+                                    "stored_hash": res.get("stored_hash") or ""})
+        code = res.get("code") or "unlock_failed"
+        status = 403 if code in ("needs_setup", "default_password", "wrong_password") else 400
+        self._send_json({"success": False, "code": code,
+                         "message": res.get("message") or "解锁失败"}, status)
+
+    def _handle_finance_setup(self):
+        """首次设置密码（默认密码已停用 → 必须走这里）。不发会话：设置完仍需解锁一次。"""
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            return self._send_json({"success": False, "code": "bad_request",
+                                    "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return self._send_json({"success": False, "code": "bad_request",
+                                    "message": "请求体必须是对象"}, 400)
+        module = str(body.get("module") or "all")
+        new_password = body.get("new_password")
+        res = self._fin().setup(module, new_password if isinstance(new_password, str) else "")
+        if res.get("ok"):
+            return self._send_json({"success": True, "modules": res.get("modules"),
+                                    "stored": res.get("stored") or {}})
+        code = res.get("code") or "setup_failed"
+        status = 403 if code in ("already_configured", "read_only") else 400
+        self._send_json({"success": False, "code": code,
+                         "message": res.get("message") or "设置密码失败"}, status)
+
+    def _handle_finance_password(self):
+        """改密（需要已解锁「设置」模块）。"""
+        ok, code, sess = self._fin().verify_session(self._finance_session_token(), "settings")
+        if not ok:
+            return self._send_json({"success": False, "code": code,
+                                    "message": "修改密码需要先解锁「设置」模块"},
+                                   401 if code == "finance_session_expired" else 403)
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            return self._send_json({"success": False, "code": "bad_request",
+                                    "message": "请求体不是合法 JSON"}, 400)
+        module = str((body or {}).get("module") or "") if isinstance(body, dict) else ""
+        new_password = (body or {}).get("new_password") if isinstance(body, dict) else ""
+        res = self._fin().change_password(module, new_password if isinstance(new_password, str) else "",
+                                         sess.get("mods"))
+        if res.get("ok"):
+            return self._send_json({"success": True, "module": module,
+                                    "stored_hash": res.get("stored_hash") or ""})
+        code = res.get("code") or "password_change_failed"
+        status = 403 if code == "finance_session_forbidden" else 400
+        self._send_json({"success": False, "code": code,
+                         "message": res.get("message") or "改密失败"}, status)
+
+    def _handle_finance_logout(self):
+        """登出（页面锁定模块时调用）。"""
+        revoked = self._fin().revoke_session(self._finance_session_token())
+        self._send_json({"success": True, "revoked": bool(revoked)})
+
+    def _handle_finance_integrity_ack(self):
+        """完整性校验失败后的人工确认：按当前文件内容重建 HMAC 基线（数据一个字不动）。"""
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except Exception:
+            body = {}
+        confirm = bool((body or {}).get("confirm")) if isinstance(body, dict) else False
+        res = self._fin().acknowledge_integrity(confirm)
+        if res.get("ok"):
+            return self._send_json({"success": True, "integrity": res.get("integrity")})
+        self._send_json({"success": False, "code": res.get("code"),
+                         "message": res.get("message") or "确认失败"}, 400)
 
     # ── 本地绑定 ──
 
@@ -540,11 +1652,15 @@ class _StatsHandler(SimpleHTTPRequestHandler):
     # ── 本地数据读写（无浏览器安全弹窗） ──
 
     def _handle_get_data(self):
-        """读取本地数据文件，返回 JSON 内容；文件不存在时返回 exists=false"""
+        """读取本地数据文件，返回 JSON 内容；文件不存在时返回 exists=false。
+        S1-05：额外返回 `integrity` / `read_only` —— 完整性校验失败时页面要挂只读横幅并要求确认，
+        但**数据照常返回**（读操作不需要 finance_session，向后兼容）。"""
         data_file = getattr(self, "_data_file", _DEFAULT_DATA_FILE)
+        sec = self._fin()
         with _DATA_FILE_LOCK:
             if not os.path.exists(data_file):
-                self._send_json({"success": True, "data": None, "exists": False})
+                self._send_json({"success": True, "data": None, "exists": False,
+                                 "integrity": "absent", "read_only": False})
                 return
             try:
                 with open(data_file, "r", encoding="utf-8") as f:
@@ -553,20 +1669,35 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                 logger.error(f"读取数据文件失败: {type(e).__name__}")
                 self._send_json({"success": False, "message": f"读取失败: {type(e).__name__}"}, 500)
                 return
-        self._send_json({"success": True, "data": data, "exists": True})
+        if sec.integrity_state == "unknown":
+            sec.check_integrity()
+        # 服务端权威凭据（PBKDF2 哈希）不下发给页面/云端：页面用不到，少一份外泄面
+        if isinstance(data, dict) and CRED_KEY in data:
+            data = {k: v for k, v in data.items() if k != CRED_KEY}
+        payload = {"success": True, "data": data, "exists": True,
+                   "integrity": sec.integrity_state, "read_only": sec.read_only}
+        if sec.read_only:
+            # 只读时把"当前文件真实指纹"给页面：确认框里展示给操作员对照
+            payload["current_mac"] = sec.current_mac()[:16]
+        self._send_json(payload)
 
     def _handle_delete_data(self):
-        """删除本地数据文件（CEO 迁移到云端 / 关闭云端清空缓存时由页面调用）。"""
+        """删除本地数据文件（CEO 迁移到云端 / 关闭云端清空缓存时由页面调用）。
+        S1-05：连完整性基线一起清（否则下一次写入会被旧基线判成篡改）；
+        本地凭据一并清空 —— 云端配置里仍有哈希，下次解锁会从云端重新导入并升级。"""
+        data_file = getattr(self, "_data_file", _DEFAULT_DATA_FILE)
+        sec = self._fin()
         with _DATA_FILE_LOCK:
             try:
-                tmp_file = _DEFAULT_DATA_FILE + ".tmp"
-                for p in (_DEFAULT_DATA_FILE, tmp_file):
+                tmp_file = data_file + ".tmp"
+                for p in (data_file, tmp_file, data_file + ".hmac", data_file + ".sealed"):
                     if os.path.exists(p):
                         os.remove(p)
             except Exception as e:
                 logger.error(f"删除本地数据文件失败: {type(e).__name__}")
                 self._send_json({"success": False, "message": f"删除失败: {type(e).__name__}"}, 500)
                 return
+        sec.audit("local_data_delete", module="data", fields={"files": [os.path.basename(data_file)]})
         self._send_json({"success": True, "message": "本地数据已清空"})
 
     def _handle_local_orders(self, query: str = ""):
@@ -583,8 +1714,15 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             end_date = (qs.get("end_date", [""])[0] or "").strip()
             with _DATA_FILE_LOCK:
                 conn = _sqlite.connect(_LOCAL_DB_FILE)
+                # S1-09：status 列由 offline_sync 迁移补上（旧库可能还没有）→ 先探测再用
+                try:
+                    cols = {r[1] for r in conn.execute("PRAGMA table_info(offline_orders)").fetchall()}
+                except _sqlite.Error:
+                    cols = set()
+                has_status = "status" in cols
                 sql = ("SELECT id, order_number, files_json, total_price, created_at, "
-                       "owner_name, is_admin_print, synced FROM offline_orders")
+                       "owner_name, is_admin_print, synced%s FROM offline_orders"
+                       % (", COALESCE(status, 'pending') AS status" if has_status else ""))
                 conds, args = [], []
                 if owner:
                     conds.append("owner_name = ?")
@@ -600,8 +1738,19 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                 sql += " ORDER BY created_at DESC, id DESC"
                 rows = conn.execute(sql, args).fetchall()
                 conn.close()
-            for (dbid, order_number, files_json, total_price, created_at,
-                    owner_name, is_admin_print, synced) in rows:
+            for row in rows:
+                (dbid, order_number, files_json, total_price, created_at,
+                 owner_name, is_admin_print, synced) = row[:8]
+                sync_status = (row[8] if len(row) > 8 else "synced") or "pending"
+                # S1-09：**只有 truly 同步到云端的单才算「已完成」**。
+                # 离线期间打的单还躺在本地库（synced=0）：显示成 sent 会让结算页把它算进
+                # 「已完成 / 已入账」，钱还没进云端账就虚增收益。云端业务拒收（rejected）同理。
+                if synced and sync_status == "synced":
+                    row_status = "sent"
+                elif sync_status == "rejected":
+                    row_status = "unsynced_rejected"
+                else:
+                    row_status = "unsynced"
                 files = []
                 total_page_count = 0
                 total_sheet_count = 0
@@ -629,7 +1778,7 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                             "duplex": duplex,
                             "page_range": page_range,
                             "total_price": round(cost, 2),           # 元（与云端 revenue 的 total_price 单位一致）
-                            "status": "sent",                        # 本地订单已打印完成
+                            "status": row_status,                    # 与订单级同口径（未同步 ≠ 已完成）
                             "is_free": is_free,
                             "effective_pages": eff,
                             "sheets": per_sheets,
@@ -657,7 +1806,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                     "delivery_enabled": False,
                     "urgency": "低",
                     "cover_page": False,
-                    "status": "sent",
+                    "status": row_status,
+                    # S1-09：未同步/被拒的可见标记（结算页据此显示 ⏳/⚠️ 且**不计收益**）
+                    "unsynced": row_status != "sent",
+                    "sync_status": sync_status,
                     "files": files,
                 })
         except Exception as e:
@@ -669,19 +1821,22 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 
     def _handle_post_data(self):
         """写入本地数据文件：路径固定为默认数据文件（不支持客户端指定路径），
-        加线程锁并以「临时文件 + os.replace」原子写入，避免并发写与写半损坏。"""
+        原子写入 + 重签 HMAC（S1-05 ④）。完整性校验失败时**拒绝写入、不覆盖任何数据**（423）。"""
         with _DATA_FILE_LOCK:
             try:
                 body = json.loads(self._read_body())
                 data = body.get("data", body) if isinstance(body, dict) else body
+                if not isinstance(data, dict):
+                    raise ValueError("data 必须是对象")
                 data_file = getattr(self, "_data_file", _DEFAULT_DATA_FILE)
                 os.makedirs(os.path.dirname(data_file), exist_ok=True)
-                tmp_file = data_file + ".tmp"
-                with open(tmp_file, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_file, data_file)
+                self._fin().write_data(data)
+            except PermissionError as e:
+                # 只读保护：绝不覆盖（这是 S1-05 的核心承诺）
+                logger.error("拒绝覆盖财务数据：%s", e)
+                self._send_json({"success": False, "code": "integrity_readonly",
+                                 "read_only": True, "message": str(e)}, 423)
+                return
             except Exception as e:
                 # 错误消息不含完整路径（只含文件名），避免泄露本地目录结构
                 logger.error(f"保存数据失败: {type(e).__name__}")
@@ -689,6 +1844,75 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                 self._send_json({"success": False, "message": f"保存失败: {type(e).__name__}（{fname}）"}, 500)
                 return
         self._send_json({"success": True, "message": "数据已保存"})
+
+
+class _LimitedThreadingHTTPServer(ThreadingHTTPServer):
+    """带**并发上限**的 ThreadingHTTPServer（S1-09）。
+
+    ThreadingHTTPServer 每个请求开一条线程、没有上限：本地服务被异常/恶意并发打满时
+    会把整机拖死。这里用一个信号量把处理线程钳在 `max_workers`：超了**直接回 503**
+    （明确、可重试），不排队、不无限起线程；请求结束（含异常）必定归还槽位。
+    """
+
+    max_workers = _MAX_CONCURRENT_REQUESTS
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(self.max_workers)
+        self.rejected = 0            # 因并发上限被拒的请求数（诊断/验收用）
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        try:
+            request.settimeout(_SOCKET_TIMEOUT)
+        except OSError:
+            pass
+        if not self._slots.acquire(blocking=False):
+            self.rejected += 1
+            logger.warning("本地统计服务并发已达上限（%d），拒绝一个请求", self.max_workers)
+            self._reject_busy(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()        # 起线程失败也必须还槽位，否则上限会永久漏掉一个
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    @staticmethod
+    def _reject_busy(request):
+        """直接在工作线程之外回 503（不读请求体），随后关闭连接。"""
+        body = json.dumps({"success": False, "code": "server_busy",
+                           "message": "本地服务繁忙（并发上限 %d），请稍后重试"
+                                      % _MAX_CONCURRENT_REQUESTS},
+                          ensure_ascii=False).encode("utf-8")
+        head = (b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
+        try:
+            request.settimeout(2)
+            request.sendall(head + body)
+        except OSError:
+            pass
+        finally:
+            try:
+                request.close()
+            except OSError:
+                pass
+
+    def handle_error(self, request, client_address):
+        """超时/断连是正常现象（浏览器 keep-alive、用户关页），别刷 traceback。"""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (socket.timeout, TimeoutError, ConnectionResetError,
+                            ConnectionAbortedError, BrokenPipeError)):
+            logger.debug("本地统计服务连接中断（%s）", type(exc).__name__)
+            return
+        return super().handle_error(request, client_address)
 
 
 class StatsServer:
@@ -727,6 +1951,12 @@ class StatsServer:
     def launch_token(self) -> str:
         return self._launch_token
 
+    @property
+    def finance(self) -> FinanceSecurity:
+        """财务安全门（S1-05）：启动时注入 handler，测试/调试也可从这里取。"""
+        return get_finance_security(self.data_file, api_url=self.api_url, token=self.token,
+                                    finance_mode=self.finance_mode)
+
     def start(self):
         """启动服务器（阻塞式，应在后台线程调用）"""
         # 注入配置到 handler
@@ -739,8 +1969,21 @@ class StatsServer:
         _StatsHandler.client_id = self.client_id
         _StatsHandler.take_orders = self.take_orders
 
-        # 多线程 HTTP 服务器：避免单请求（如慢代理）阻塞其他请求
-        self._server = ThreadingHTTPServer(("127.0.0.1", self._port), _StatsHandler)
+        # S1-05 ④：启动时校验数据完整性（HMAC）。校验失败 → 只读保护（不覆盖数据），
+        # 由页面横幅要求操作员确认后重建基线。
+        try:
+            state = self.finance.check_integrity()
+            if self.finance.read_only:
+                logger.error("财务数据完整性校验未通过（%s）：print_data.json 已进入只读保护，"
+                             "需在收支清算页面确认后才会恢复写入", state)
+            else:
+                logger.info("财务数据完整性校验：%s", state)
+        except Exception as e:                            # noqa: BLE001
+            logger.error("财务数据完整性校验异常: %s", type(e).__name__)
+
+        # 多线程 HTTP 服务器：避免单请求（如慢代理）阻塞其他请求；
+        # S1-09：并发线程数封顶（超额 503）+ 连接级超时（见 _LimitedThreadingHTTPServer）
+        self._server = _LimitedThreadingHTTPServer(("127.0.0.1", self._port), _StatsHandler)
         self._port = self._server.server_port  # 实际端口（port=0 时系统分配）
         logger.info(f"统计服务器启动: http://127.0.0.1:{self._port}")
         self._running = True
@@ -791,5 +2034,11 @@ class StatsServer:
         if self._server:   # 已在运行 → 同步 handler 类属性（每次请求读取）
             _StatsHandler.api_url = self.api_url
             _StatsHandler.token = self.token
+        # S1-05：云端凭据来源也要跟着换（云端模式下密码哈希从云端 config 读）
+        try:
+            self.finance.api_url = self.api_url
+            self.finance.token = self.token
+        except Exception:                                 # noqa: BLE001
+            pass
         # 注意：这里只更新配置，服务器保持运行（切勿误以为已停止）
         logger.info("统计服务器配置已更新（服务器保持运行）")

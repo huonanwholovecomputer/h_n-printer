@@ -29,7 +29,8 @@ let _refreshing = null;
 // CONNECT_REQUEST_TIMEOUT=20s），而这里是唯一缺口：`await api(...)` 遇到"TCP 连上但收不到数据"
 // （弱网、校园网抖动、代理异常）会**永久挂起** —— 界面停在加载态，既不报错也不重试。
 // 用 AbortController 设默认上限；需要长耗时的调用可传 opts.timeoutMs 覆盖（传 0 表示不限）。
-const API_TIMEOUT_MS = 20000;
+// S1-09：默认上限收敛到 **15s**（计划要求 10–15s 区间；原先 20s 偏长，弱网下用户要干等）。
+const API_TIMEOUT_MS = 15000;
 // 注：文件上传走 XMLHttpRequest（在 print.js），它的超时常量由 print.js 自己定义
 // （`UPLOAD_TIMEOUT_MS`）—— 两个文件各自的超时上限都在使用它的文件里，不跨文件依赖词法作用域。
 
@@ -72,11 +73,21 @@ async function refreshToken() {
   if (_refreshing) return _refreshing;
   _refreshing = (async () => {
     try {
-      const r = await fetch(BASE_URL + '/api/device_login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_id: getDeviceId() }),
-      });
+      // S1-09：这条是**裸 fetch**（不走 api()），必须自己挂 AbortController 超时，
+      // 否则弱网/校园网抖动时会永久挂起（401 刷新卡住 ⇒ 所有重试都排队等它）。
+      const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      const t = ctrl ? setTimeout(() => ctrl.abort(), API_TIMEOUT_MS) : null;
+      let r;
+      try {
+        r = await fetch(BASE_URL + '/api/device_login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device_id: getDeviceId() }),
+          ...(ctrl ? { signal: ctrl.signal } : {}),
+        });
+      } finally {
+        if (t) clearTimeout(t);
+      }
       const data = await r.json();
       if (data.success && data.token) {
         setAuth(data.token, data.openid || '');
@@ -101,6 +112,76 @@ function setAuth(token, openid) {
   }
   localStorage.setItem('hn_token', token);
   localStorage.setItem('hn_openid', state.openid);
+}
+
+/* ============================================================
+ * S1-09：轮询自调度器（setInterval → setTimeout 链 + 失败指数退避）
+ * ============================================================
+ * 旧写法 `setInterval(fn, 30s)` 不管上一轮是否回来：弱网下 api() 要 20s 才超时，
+ * 连续失败时仍以固定频率重试（把弱网里本就不通的请求一遍遍打出去，还叠着跑）。
+ * 现在：**上一次任务落定后**才排下一次；失败 1.5× 指数退避（上限 5 分钟），
+ * 成功立刻恢复基线间隔。taskFn(done) / 或返回 Promise（resolve=成功 / reject=失败）。
+ * me.js 与本文件共享同一个 window 作用域，直接复用这一个实现。
+ */
+const POLL_BACKOFF_FACTOR = 1.5;
+const POLL_BACKOFF_MAX_MS = 300000;
+
+function createPollScheduler(taskFn, baseDelayMs, options) {
+  const opts = options || {};
+  const base = Math.max(1, Number(baseDelayMs) || 30000);
+  const maxDelay = Number(opts.maxDelayMs) || POLL_BACKOFF_MAX_MS;
+  const factor = Number(opts.factor) || POLL_BACKOFF_FACTOR;
+  // immediate=false：start() 后先等一个基线间隔再跑（调用方已自己先拉过一次时用）
+  const immediate = opts.immediate !== false;
+  let timer = null;
+  let delay = base;
+  let stopped = true;
+  let running = false;
+
+  function schedule(ok) {
+    if (stopped) return;
+    if (ok === false) delay = Math.min(Math.round(delay * factor), maxDelay);
+    else if (ok === true) delay = base;
+    timer = setTimeout(tick, delay);
+  }
+
+  function tick() {
+    timer = null;
+    if (stopped || running) return;
+    running = true;
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      running = false;
+      schedule(ok);
+    };
+    try {
+      const ret = taskFn(done);
+      if (ret && typeof ret.then === 'function') {
+        ret.then(() => done(true), () => done(false));
+      }
+    } catch (e) {
+      done(false);
+    }
+  }
+
+  return {
+    start() {
+      if (!stopped) return;
+      stopped = false;
+      delay = base;
+      if (immediate) tick();
+      else timer = setTimeout(tick, delay);
+    },
+    stop() {
+      stopped = true;
+      running = false;
+      if (timer) { clearTimeout(timer); timer = null; }
+    },
+    isRunning() { return !stopped; },
+    currentDelay() { return delay; },
+  };
 }
 
 // 是否已绑定微信账号：当前 token 是微信 openid，且与本地设备账号不同
@@ -1317,6 +1398,7 @@ async function checkPrinterStatus() {
       bar.classList.toggle('status-active', active);
       bar.classList.toggle('status-inactive', !active);
     }
+    return true;   // S1-09：给轮询调度器一个成功信号
   } catch (e) {
     const dot = document.querySelector('.status-dot');
     const text = document.getElementById('statusText');
@@ -1327,6 +1409,27 @@ async function checkPrinterStatus() {
       bar.classList.remove('status-active');
       bar.classList.add('status-inactive');
     }
+    return false;  // S1-09：失败 → 轮询退避
+  }
+}
+
+/* ================= 打印机状态轮询（S1-09：自调度） ================= */
+let printerPoll = null;
+
+function startPrinterPolling() {
+  stopPrinterPolling();
+  printerPoll = createPollScheduler(async () => {
+    // 两个请求都落定后才算这一轮结束；任一失败 → reject → 调度器退避
+    const results = await Promise.all([checkPrinterStatus(), loadClaimingDevices()]);
+    if (results.some((ok) => ok === false)) throw new Error('printer poll failed');
+  }, 30000, { immediate: false });   // initApp 已先拉过一次，别立刻重复
+  printerPoll.start();
+}
+
+function stopPrinterPolling() {
+  if (printerPoll) {
+    printerPoll.stop();
+    printerPoll = null;
   }
 }
 
@@ -1347,7 +1450,11 @@ async function loadClaimingDevices() {
       selectedDeviceId = onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : '');
     }
     renderDeviceList();
-  } catch (e) { /* 静默失败，保留上次列表 */ }
+    return true;   // S1-09：给轮询调度器一个成功信号
+  } catch (e) {
+    /* 静默失败，保留上次列表 */
+    return false;  // S1-09：失败 → 轮询退避
+  }
 }
 
 function renderDeviceList() {
@@ -1542,7 +1649,8 @@ function initApp() {
   initScrollEngines();
   checkPrinterStatus();
   loadClaimingDevices();
-  setInterval(() => { checkPrinterStatus(); loadClaimingDevices(); }, 30000);
+  // S1-09：自调度轮询（上一轮两个请求都落定后才排下一轮；失败 1.5× 退避、成功恢复 30s）
+  startPrinterPolling();
   ensureLogin().then(() => refreshSession()).finally(() => {
     if (typeof initPrintPage === 'function') initPrintPage();
     if (typeof initMePage === 'function') initMePage();

@@ -41,6 +41,7 @@ function makeEnv(manifest, currentCode) {
     toasts: [],
     confirmCb: null,
     installCalls: [],
+    openCalls: [],
     listeners: {},
   };
   const documentStub = {
@@ -51,7 +52,10 @@ function makeEnv(manifest, currentCode) {
     AppUpdater: {
       getVersionCode: () => currentCode,
       getVersionName: () => '1.0.0',
+      // S1-02（2026-10-23）：updater.js 改为打开下载页，不再调 downloadAndInstall；
+      // 这里同时留两个桩，用来断言「旧静默安装路径一次都没被调用」。
       downloadAndInstall: (...a) => st.installCalls.push(a),
+      openUrl: (...a) => st.openCalls.push(a),
     },
     addEventListener(type, fn) { (st.listeners['window:' + type] = st.listeners['window:' + type] || []).push(fn); },
   };
@@ -59,6 +63,7 @@ function makeEnv(manifest, currentCode) {
     window: windowStub,
     document: documentStub,
     BASE_URL: 'https://example.invalid',
+    URL,                          // updater.js 用 new URL() 做 host 白名单校验（vm 上下文没有该全局）
     setTimeout: () => 0,          // 启动 5s 静默检查与兜底超时都由测试显式驱动，不真的计时
     clearTimeout: () => {},
     console,
@@ -82,7 +87,16 @@ function fire(st, key) {
   (st.listeners[key] || []).forEach((fn) => fn());
 }
 
-const MANIFEST = { version: '1.2.0', versionCode: 99, url: 'https://cos/1.2.0.apk', md5: 'abc', notes: 'x' };
+// S1-02（2026-10-23）：清单 fixture 换成**合法**取值 —— 更新链已要求「https + host 白名单」
+// 与「哈希必填（sha256 优先 / md5 兼容）」，`url:'https://cos/1.2.0.apk'` + `md5:'abc'`
+// 在新代码里会被正确拒绝（那样本脚本的 ①~④ 就测不到更新锁了）。
+const MANIFEST = {
+  version: '1.2.0',
+  versionCode: 99,
+  url: 'https://hn-space.cn/updates/h_n-printer_android_v1.2.0.apk',
+  md5: '0123456789abcdef0123456789abcdef',
+  notes: 'x',
+};
 
 (async () => {
   section('① 确认更新后持锁，并发调用不重复请求清单');
@@ -91,8 +105,15 @@ const MANIFEST = { version: '1.2.0', versionCode: 99, url: 'https://cos/1.2.0.ap
     await st.ctx.checkAppUpdate(true);
     check('首次检查发出 1 次清单请求', st.fetchCalls === 1, `fetch=${st.fetchCalls}`);
     check('发现新版本时弹出确认框', typeof st.confirmCb === 'function');
-    st.confirmCb();                          // 用户点「立即更新」
-    check('确认后调用原生下载', st.installCalls.length === 1, JSON.stringify(st.installCalls));
+    st.confirmCb();                          // 用户点「去下载」
+    // S1-02（2026-10-23）：应用内静默安装已关闭 ⇒ 不再调用原生 downloadAndInstall，
+    // 改为打开下载页（系统浏览器/系统安装器完成安装与确认）。
+    check('确认后**不再**调用原生下载安装（应用内静默安装已关闭）',
+      st.installCalls.length === 0, JSON.stringify(st.installCalls));
+    check('确认后改为打开下载页', st.openCalls.length === 1, JSON.stringify(st.openCalls));
+    check('打开的是清单里那一个已过白名单的 APK 地址',
+      st.openCalls.length === 1 && String(st.openCalls[0][0]) === MANIFEST.url,
+      JSON.stringify(st.openCalls));
     check('★ 持锁：第二次检查不再发请求', (await st.ctx.checkAppUpdate(true), st.fetchCalls === 1),
       `fetch=${st.fetchCalls}`);
     check('★ 忙时手动点击有反馈（旧实现静默吞掉，像按钮坏了）',
@@ -185,6 +206,11 @@ const MANIFEST = { version: '1.2.0', versionCode: 99, url: 'https://cos/1.2.0.ap
     check('确认路径走 _setUpdateBusy(true, …)', /_setUpdateBusy\(true,\s*UPDATE_BUSY_TIMEOUT_MS\)/.test(noComment));
     check('★ 源码里已无裸 `_updateBusy = true`（注释里引用旧写法不算）',
       !/_updateBusy\s*=\s*true/.test(noComment));
+    // S1-02（2026-10-23）：应用内静默安装必须彻底退场（只允许出现在注释里）
+    check('★ 源码不再调用 AppUpdater.downloadAndInstall（应用内静默安装已关闭）',
+      !/\.downloadAndInstall\s*\(/.test(noComment));
+    check('★ 静态：打开下载页（openUrl / window.open）',
+      /_openUpdateDownloadPage/.test(noComment) && /openUrl|window\.open/.test(noComment));
   }
 
   console.log('\n' + (failures ? `存在失败项 ❌ (${failures})` : '全部通过 ✅'));

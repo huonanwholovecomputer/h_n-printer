@@ -58,6 +58,87 @@ _warm_word_thread: threading.Thread | None = None
 _warm_word_running = False
 
 
+# ============================================================
+# Office COM 自动化安全（S1-04）
+# ============================================================
+#
+# 威胁模型：Office 文档可以带 VBA 宏（.docm/.doc 甚至改后缀的 .docx）。用 COM 打开时
+# 默认会**执行**宏（Document_Open / AutoOpen），或者在「禁用宏」提示背后仍可能跑
+# 连接/字段更新（DDE、远程模板、外部链接）—— 打印机是长期在线的、以管理员身份跑的
+# 终端，云端来的文档由顾客控制内容，绝不能获得这条执行路径。
+#
+# 这条链上有两个独立的控制点，缺一不可：
+#   ① 打开前收紧 COM 实例：Visible=False（不弹主窗）、DisplayAlerts=0（吞掉所有模态框，
+#      包括「是否启用宏」——否则自动化会挂在没人点的对话框上）、
+#      AutomationSecurity=3（msoAutomationSecurityForceDisable，**禁用所有宏**）、
+#      Options.UpdateLinksAtOpen=False（不更新外部链接/远程模板/DDE 字段）；
+#   ② **云端来源的 Office 文档不交给 Word/WPS**：直接走 LibreOffice 无头转换
+#      （它不执行 VBA，见 `_convert_office_to_pdf(from_cloud=True)`）。
+# 只做 ① 是不够的：任何 Office COM 版本差异/注册表策略都可能让宏重新可用。
+
+# MsoAutomationSecurity 枚举：3 = msoAutomationSecurityForceDisable（禁用所有宏，不提示）
+MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
+
+# 只有这两种扩展名会走 Word/WPS COM（xls/ppt 一直走 LibreOffice）
+COM_OFFICE_EXTS = (".doc", ".docx")
+
+
+def _harden_office_com_app(app, label: str) -> dict[str, bool]:
+    """在 `Documents.Open` **之前**把 Word / WPS 的 COM 实例收紧到「不执行宏、不弹窗、不更新链接」。
+
+    返回 `{设置项: 是否真的生效}`，并把它写进日志 —— 属性在某种 Office 版本上不存在时
+    不谎报成功（`try/except` 逐项记录）。调用方只需调用，不需要判断返回值。
+
+    WPS 的实际行为（如实记录，别在文档里夸大成"和 Word 完全一样"）：
+      · `Visible` / `DisplayAlerts` —— WPS 的 COM 对象模型是 Word 的克隆，这两个一直可用；
+      · `AutomationSecurity`（=3 禁用所有宏）—— 新版本 WPS 提供该属性，老版本可能没有；
+        取不到时**这一项在 WPS 侧不生效**，宏拦截退回到 WPS 自身的宏安全级别设置
+        （界面「信任中心」/ 注册表项，本程序不越权去改用户的安全策略）；
+      · `Options.UpdateLinksAtOpen` —— 同上，取不到时只是不主动关链接更新。
+    因此**云端来源的文档根本不会走到这里**（强制 LibreOffice）；这里服务的是用户自己
+    从本地拖进来的文件 —— 出问题的是用户自己的文件，而宏仍被上面两条挡住（Word 侧全生效，
+    WPS 侧尽力而为 + 新版本生效）。
+    """
+    applied: dict[str, bool] = {}
+
+    try:
+        app.Visible = False
+        applied["Visible=False"] = True
+    except Exception as e:
+        applied["Visible=False"] = False
+        logger.debug(f"{label}: Visible=False 未生效 ({e})")
+
+    try:
+        app.DisplayAlerts = 0          # wdAlertsNone：不弹任何模态框
+        applied["DisplayAlerts=0"] = True
+    except Exception as e:
+        applied["DisplayAlerts=0"] = False
+        logger.debug(f"{label}: DisplayAlerts=0 未生效 ({e})")
+
+    # msoAutomationSecurityForceDisable：**禁用所有宏**（不提示、不执行）
+    try:
+        app.AutomationSecurity = MSO_AUTOMATION_SECURITY_FORCE_DISABLE
+        applied["AutomationSecurity=3"] = True
+    except Exception as e:
+        applied["AutomationSecurity=3"] = False
+        logger.warning(f"{label}: AutomationSecurity=3 未生效（该版本 COM 无此属性）: {e}")
+
+    # 打开时不更新外部链接（远程模板 / DDE / 外链字段）—— 否则打开动作本身就会出网
+    try:
+        app.Options.UpdateLinksAtOpen = False
+        applied["Options.UpdateLinksAtOpen=False"] = True
+    except Exception as e:
+        applied["Options.UpdateLinksAtOpen=False"] = False
+        logger.debug(f"{label}: Options.UpdateLinksAtOpen=False 未生效 ({e})")
+
+    if all(applied.values()):
+        logger.info(f"{label} COM 安全设置已生效: {', '.join(applied)}")
+    else:
+        logger.info(f"{label} COM 安全设置（部分属性该版本不支持）: "
+                    + ", ".join(f"{k}={'✓' if v else '✗'}" for k, v in applied.items()))
+    return applied
+
+
 def start_word_warmup() -> None:
     """
     后台线程预热 Word COM — 启动 WINWORD.EXE 并保持存活。
@@ -77,11 +158,8 @@ def start_word_warmup() -> None:
         pythoncom.CoInitialize()
         try:
             word = win32com.client.dynamic.Dispatch("Word.Application")
-            word.Visible = False
-            try:
-                word.DisplayAlerts = 0
-            except Exception:
-                pass
+            # S1-04：预热实例也会被后续转换复用 ⇒ 现在就把宏/弹窗/链接收紧
+            _harden_office_com_app(word, "Word(预热)")
             logger.info("Word COM 已预热（后台常驻）")
 
             # 保持存活，等待外部信号
@@ -143,11 +221,8 @@ def start_wps_warmup() -> None:
             else:
                 raise RuntimeError("WPS COM ProgID 未注册")
 
-            wps.Visible = False
-            try:
-                wps.DisplayAlerts = 0
-            except Exception:
-                pass
+            # S1-04：WPS 侧的宏/弹窗/链接收紧（属性缺失时记录实际生效项，不谎报）
+            _harden_office_com_app(wps, "WPS(预热)")
             logger.info(f"WPS COM 已预热（后台常驻, ProgID={_wps_progid}）")
 
             while _warm_wps_running:
@@ -509,12 +584,8 @@ def _convert_via_word_com(file_path: str, output_pdf: str) -> None:
     doc = None
     try:
         word = _safe_word_dispatch()
-        word.Visible = False
-        # 兼容不同 Word 版本的 DisplayAlerts 属性名
-        try:
-            word.DisplayAlerts = 0  # wdAlertsNone
-        except Exception:
-            pass
+        # S1-04：必须在 Documents.Open 之前收紧（宏在 Open 期间就会跑）
+        _harden_office_com_app(word, "Word")
 
         # wdOpenFormat = 自动检测, ReadOnly=True 避免修改原文件
         doc = word.Documents.Open(os.path.abspath(temp_input), ReadOnly=True)
@@ -581,11 +652,8 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
     doc = None
     try:
         wps = win32com.client.dynamic.Dispatch(prog_id)
-        wps.Visible = False
-        try:
-            wps.DisplayAlerts = 0
-        except Exception:
-            pass
+        # S1-04：WPS 打开前同样收紧（宏/弹窗/外链）；属性缺失时日志记录实际生效项
+        _harden_office_com_app(wps, "WPS")
 
         doc = wps.Documents.Open(os.path.abspath(temp_input), ReadOnly=True)
 
@@ -721,11 +789,8 @@ def _get_com_page_counts_batch(
                 app = _safe_word_dispatch()
             else:
                 app = win32com.client.dynamic.Dispatch(prog_id)
-            app.Visible = False
-            try:
-                app.DisplayAlerts = 0
-            except Exception:
-                pass
+            # S1-04：批量数页同样要打开文档 ⇒ 打开前收紧（宏/弹窗/外链更新）
+            _harden_office_com_app(app, label)
 
             for fp in file_paths:
                 doc = None
@@ -805,11 +870,8 @@ def _get_word_page_count(file_path: str) -> int:
     doc = None
     try:
         word = _safe_word_dispatch()
-        word.Visible = False
-        try:
-            word.DisplayAlerts = 0
-        except Exception:
-            pass
+        # S1-04：打开前收紧（宏/弹窗/外链）
+        _harden_office_com_app(word, "Word")
 
         doc = word.Documents.Open(os.path.abspath(temp_fp), ReadOnly=True)
         # 2 = wdStatisticPages
@@ -859,11 +921,8 @@ def _get_wps_page_count(file_path: str) -> int:
     doc = None
     try:
         wps = win32com.client.dynamic.Dispatch(prog_id)
-        wps.Visible = False
-        try:
-            wps.DisplayAlerts = 0
-        except Exception:
-            pass
+        # S1-04：WPS 打开前同样收紧（宏/弹窗/外链）
+        _harden_office_com_app(wps, "WPS")
 
         doc = wps.Documents.Open(abs_input, ReadOnly=True)
         # 2 = wdStatisticPages (WPS 兼容此常量)
@@ -1411,7 +1470,8 @@ def _discard_invalid_pdf(path: str) -> None:
         logger.warning(f"丢弃无效产物失败（忽略）: {path} ({e})")
 
 
-def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
+def _convert_office_to_pdf(file_path: str, output_pdf: str,
+                           from_cloud: bool = False) -> None:
     """
     Office 文档 → PDF（多引擎智能降级）。
 
@@ -1426,11 +1486,35 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str) -> None:
 
     其他 Office 格式 (.xls/.xlsx/.ppt/.pptx):
       → LibreOffice 无头模式
+
+    Args:
+        from_cloud: **来源标记（S1-04）**。True = 文件来自云端（顾客上传，内容不可信）
+            ⇒ 跳过 Word/WPS COM，**强制 LibreOffice**（无 VBA 执行路径）；
+            False（默认）= 用户本地文件 ⇒ 保持原三引擎降级链，行为零变化。
+            ⚠ **默认值必须是 False**：把本地文件也赶去 LibreOffice 会让「门店装没装
+            LibreOffice」从"只影响兜底"变成"直接影响首选渲染"，那是回归。
     """
     ext = ext_of(file_path)
 
+    # ── 云端来源的 Office 文档：绝不交给 Word/WPS（S1-04）──
+    # LibreOffice 无头转换不执行 VBA（也不跑 AutoOpen/Document_Open 宏），是这条链上
+    # 唯一"内容不可信也敢打开"的引擎。装没装 LibreOffice 在这里变成硬前提，见下方报错。
+    if from_cloud and ext in COM_OFFICE_EXTS:
+        if not _find_libreoffice():
+            raise RuntimeError(
+                "云端来源的 Office 文档（.doc/.docx）强制用 LibreOffice 转换（不执行宏），"
+                "但本机未安装 / 未找到 LibreOffice。\n"
+                "请安装 LibreOffice 后再打印云端 Word 文档。\n"
+                "下载地址: https://www.libreoffice.org/download/"
+            )
+        logger.info(
+            f"引擎选择: LibreOffice（云端来源强制，跳过 Word/WPS COM 以杜绝宏执行）"
+            f" ({os.path.basename(file_path)})")
+        _convert_office_via_libreoffice(file_path, output_pdf)
+        return
+
     # Word 文档：多引擎降级
-    if ext in (".doc", ".docx"):
+    if ext in COM_OFFICE_EXTS:
         # docx 优先用最后编辑它的引擎渲染（WPS 特殊布局须用 WPS，Word 渲染会错位）
         preferred = "word"
         if ext == ".docx":
@@ -1699,7 +1783,7 @@ class UniversalConverter:
         cm[".md"] = _convert_markdown_to_pdf
 
     def convert(self, file_path: str, output_pdf: str | None = None,
-                image_orientation: str = "auto") -> str:
+                image_orientation: str = "auto", from_cloud: bool = False) -> str:
         """
         将文件转换为 PDF。
 
@@ -1708,6 +1792,11 @@ class UniversalConverter:
             output_pdf: 输出 PDF 路径；若为 None 则自动生成临时文件
             image_orientation: 图片方向（'auto' | 'landscape' | 'portrait'），
                 仅图片类生效；其余文件类型忽略。
+            from_cloud: **文件来源（S1-04）**。True = 云端下载来的文件（顾客控制内容）
+                ⇒ Office 文档强制走 LibreOffice（无宏执行），绝不交给 Word/WPS COM。
+                **默认 False = 本地文件语义**，三引擎降级链与之前完全一致。
+                云端调用点：`cloud_client.py` 页数分析、`gui.ConvertWorker`（云端任务
+                预转换）、`gui.PrintWorker`（job.task_id > 0 的兜底转换）。
 
         Returns:
             生成的 PDF 文件路径
@@ -1740,10 +1829,14 @@ class UniversalConverter:
             created_temp = True
 
         try:
-            logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF")
+            logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF"
+                        + ("（云端来源：Office 强制 LibreOffice）" if from_cloud else ""))
             # 图片方向可配置：把 image_orientation 传给图片渲染函数（其余类型忽略）
             if convert_func is _convert_image_to_pdf:
                 convert_func(file_path, output_pdf, image_orientation)
+            elif convert_func is _convert_office_to_pdf:
+                # S1-04：来源标记只影响 Office 转换引擎的选择（云端 → LibreOffice）
+                convert_func(file_path, output_pdf, from_cloud=from_cloud)
             else:
                 convert_func(file_path, output_pdf)
 

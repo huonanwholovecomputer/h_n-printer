@@ -1,6 +1,6 @@
 // index.js
 const { CONFIG } = require('../../utils/config')
-const { request } = require('../../utils/request')
+const { request, createPollScheduler } = require('../../utils/request')
 // 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
 const { countPagesInRange } = require('../../utils/pages')
 
@@ -488,19 +488,43 @@ Component({
 
     _startPrinterPolling() {
       this._stopPrinterPolling()
-      // 30s 轮询（设计意图，避免高频请求触发 Nginx hn_api 限流：60r/m + burst 150）
-      this._printerPollTimer = setInterval(() => {
-        this.loadPrinterStatus()
-        this.loadClaimingDevices()
-        // 借轮询顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
-        this.loadPricing()
-      }, 30000)
+      // 桩环境/老版本 utils/request 没导出调度器时安静跳过（真机永远有；见 utils/request.js）
+      if (typeof createPollScheduler !== 'function') return
+      // S1-09：改成**自调度**轮询（上一轮三个请求都落定后才排下一轮），失败按 1.5× 指数
+      // 退避、上限 5 分钟，成功即恢复到 30s 基线。旧写法 setInterval(30s) 不管上一轮是否
+      // 回来 —— 弱网（请求 12s 超时）时会叠着跑、越积越多。30s 基线也保留（Nginx hn_api
+      // 限流 60r/m + burst 150，一轮 3 个请求）。
+      if (!this._printerPoll) {
+        // immediate:false —— show() 里已经同步拉过一次，不必刚加载完立刻再发同一轮
+        this._printerPoll = createPollScheduler((done) => this._pollPrinterOnce(done), 30000,
+          { immediate: false })
+      }
+      this._printerPoll.start()
     },
     _stopPrinterPolling() {
+      // 兼容旧字段：老代码/热重载可能只留 _printerPollTimer
+      if (this._printerPoll) {
+        this._printerPoll.stop()
+      }
       if (this._printerPollTimer) {
         clearInterval(this._printerPollTimer)
         this._printerPollTimer = null
       }
+    },
+    // 一轮 = 3 个请求（打印机状态 / 可接单设备 / 定价），全部落定后才算这一轮结束；
+    // 任一失败 → 让调度器退避（否则弱网里会以固定 30s 死磕）。
+    _pollPrinterOnce(done) {
+      let remaining = 3
+      let failed = false
+      const fin = (ok) => {
+        if (ok === false) failed = true
+        remaining -= 1
+        if (remaining <= 0) done(!failed)
+      }
+      this.loadPrinterStatus(fin)
+      this.loadClaimingDevices(fin)
+      // 借轮询顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
+      this.loadPricing(fin)
     },
     // ==================== 微信登录 ====================
 
@@ -1948,12 +1972,13 @@ Component({
       setTimeout(() => this.setData({ showRangePicker: false, rangePickerClosing: false }), 200)
     },
 
-    loadPricing() {
+    loadPricing(done) {
       request({
         url: CONFIG.BASE_URL + '/api/pricing',
         method: 'GET',
         success: (res) => {
-          if (res.statusCode === 200 && res.data && res.data.success) {
+          const ok = !!(res.statusCode === 200 && res.data && res.data.success)
+          if (ok) {
             const p = res.data.pricing
             this.setData({
               pricingLoaded: true,
@@ -1972,16 +1997,18 @@ Component({
               this.setData({ deliveryPercent: updatedPct })
             }
           }
+          if (done) done(ok)   // 非 2xx / 业务失败也算失败 → 轮询退避
         },
         fail: () => {
           // 加载失败使用默认值，不阻塞
+          if (done) done(false)   // S1-09：失败上报给轮询调度器（触发退避）
         }
       })
     },
 
     // ==================== 表单操作 ====================
 
-    loadPrinterStatus() {
+    loadPrinterStatus(done) {
       request({
         url: CONFIG.BASE_URL + '/api/printer_status',
         method: 'GET',
@@ -1989,20 +2016,22 @@ Component({
           if (res.data.success) {
             this.setData({ printerActive: res.data.active })
           }
+          if (done) done(true)
         },
         fail: () => {
           this.setData({ printerActive: false })
+          if (done) done(false)   // S1-09：失败上报给轮询调度器（触发退避）
         }
       })
     },
 
     // 可接单设备列表（多设备接单）：全部启用接单的设备（含离线），默认选中第一个在线设备
-    loadClaimingDevices() {
+    loadClaimingDevices(done) {
       request({
         url: CONFIG.BASE_URL + '/api/claiming_devices',
         method: 'GET',
         success: (res) => {
-          if (!res.data || !res.data.success) return
+          if (!res.data || !res.data.success) return done ? done(false) : undefined
           const devices = res.data.devices || []
           let selected = this.data.selectedDeviceId
           // 保持用户已选设备（若仍在列表中）；否则默认选第一个在线设备（无在线则第一个）
@@ -2011,8 +2040,11 @@ Component({
             selected = onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : '')
           }
           this.setData({ claimingDevices: devices, selectedDeviceId: selected })
+          if (done) done(true)
         },
-        fail: () => {}
+        fail: () => {
+          if (done) done(false)   // S1-09：失败上报给轮询调度器（触发退避）
+        }
       })
     },
 

@@ -2,7 +2,9 @@
  *
  * 需求：云端数据 → 订单明细的「状态」列可直接订正状态；为防误触**默认锁定**，
  *       「状态」右侧一个 🔒 → 点击输密码解锁 → 🔓 → 此时每个订单的状态标签才带小箭头，
- *       点击后直接选正确状态、改动直接生效；再点 🔓 回到 🔒。密码在设置界面管理（默认 123456）。
+ *       点击后直接选正确状态、改动直接生效；再点 🔓 回到 🔒。密码在设置界面管理。
+ *       S1-05（2026-10-23）：密码校验搬到本机 stats_server（PBKDF2），解锁成功签发 30 分钟
+ *       finance_session；默认密码 123456 已被服务端停用（本用例改用 TEST_PWD 解锁）。
  *
  * 为什么必须真浏览器：解锁是一次真实密码校验（Web Crypto SHA-256）、弹窗是真实 DOM；
  * 「锁定态没有箭头 / 解锁态每行都有箭头」是渲染结果；提交后 KPI 与状态标签要真的跟着变。
@@ -11,12 +13,12 @@
  * 做法：起本地 HTTP 服务（静态文件来自 local_print_tool/finance/，/api/** 全部打桩，
  * 绝不发外网请求），Playwright 打开 settlement.html → 切「云端数据」→ 逐场景断言：
  *   ① 默认锁定：表头 🔒、行内无箭头/无点击入口；
- *   ② 密码错 → 仍锁定；密码对（默认 123456）→ 🔓 且每行出现 ▾；
+ *   ② 密码错 → 仍锁定；默认密码 123456 → 仍锁定（服务端拒绝）；TEST_PWD → 🔓 且每行出现 ▾；
  *   ③ 点状态标签 → 菜单列出 5 个终态、当前项 ✓ 当前 且不可点；
  *   ④ 选「打印失败」→ 真实 POST /api/proxy/admin/order_status（order_id + status），
  *      行内标签变「打印失败」、文件级状态一起变、云端收益记录 KPI 跟着少掉该单金额；
  *   ⑤ 点 🔓 锁定 → 箭头消失、菜单收起，锁定态点状态标签不弹菜单；
- *   ⑥ 设置页「订单状态订正 密码」可改（默认 123456）→ 改后旧密码失效、新密码可解锁。
+ *   ⑥ 设置页「订单状态订正 密码」可改 → 改后旧密码失效、新密码可解锁（改密走后端接口）。
  * 产物：截图存 截图展示/订单状态订正/。
  *
  * 用法：node tests/verify_order_status_edit_render.mjs
@@ -79,11 +81,93 @@ const json = (res, obj) => { res.writeHead(200, { 'Content-Type': 'application/j
 const posted = [];      // 收到的 /api/proxy/admin/order_status 请求体
 const postedType = [];  // 收到的 /api/proxy/admin/order_type 请求体（v7.1 类型订正）
 const saved = [];       // 收到的 finance/config 保存
+/* ── S1-05（2026-10-23）财务安全：本桩模拟 stats_server 的解锁/会话接口 ──────────
+   默认密码 123456 已被服务端停用，所以本用例统一用 TEST_PWD 解锁；解锁后桩签发一个
+   假会话，并要求**所有 admin 写请求都带 X-Finance-Session**（缺了就 403）——
+   这样「页面忘了带会话头」会在本用例里直接红，而不是只在真机上 403。 */
+const TEST_PWD = { orderstatus: 'FinPass2026', settings: 'FinPass2026' };
+const adminNoSession = [];   // 没带会话头却被放行/被拦的 admin 写请求（用于断言）
+const setupCalls = [];       // 首次改密（/api/local/finance_auth/setup）收到的 new_password
+let NEEDS_SETUP = [];        // status 里报「还没设密码」的模块（⑧ 之前置为 ['orderstatus']）
+let sessionSeq = 0;
+function issueSession(module) {
+  sessionSeq++;
+  return { session: 'stub-sess-' + sessionSeq + '-' + module, expires_in: 1800, modules: [module] };
+}
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://127.0.0.1');
   const p = decodeURIComponent(u.pathname);
   if (p.startsWith('/api/')) {
     if (p === '/api/health') return json(res, { success: true, cloud: true });
+    if (p === '/api/local/finance_auth/status') {
+      // 默认已配置好密码 → 不弹首次改密框；⑧ 之前把 needsSetup 置成 ['orderstatus']，
+      // 与真服务端保持一致（unlock 回 needs_setup 时，status 也一定把该模块列进 needs_setup）
+      return json(res, { success: true, modules: {}, needs_setup: NEEDS_SETUP.slice(),
+                         session: { active: false, modules: [], expires_in: 0 },
+                         session_ttl: 1800, read_only: false, integrity: 'ok' });
+    }
+    if (p === '/api/local/finance_auth/unlock') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = {}; }
+        const mod = String(parsed.module || '');
+        const pwd = String(parsed.password || '');
+        if (pwd === '123456') {
+          return json(res, { success: false, code: 'default_password',
+                             message: '默认密码已停用，请先在设置里设置新密码' }, 403);
+        }
+        if (!TEST_PWD[mod] || pwd !== TEST_PWD[mod]) {
+          return json(res, { success: false, code: 'wrong_password', message: '密码错误' }, 403);
+        }
+        const s = issueSession(mod);
+        return json(res, { success: true, session: s.session, expires_in: s.expires_in,
+                           modules: s.modules, upgraded: false });
+      });
+      return;
+    }
+    if (p === '/api/local/finance_auth/setup') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = {}; }
+        setupCalls.push(String(parsed.new_password || ''));
+        const mods = Object.keys(TEST_PWD);
+        mods.forEach((m) => { TEST_PWD[m] = String(parsed.new_password || ''); });
+        const stored = {};
+        mods.forEach((m, i) => { stored[m] = 'pbkdf2_sha256$210000$' + (i + 1).toString(16).padStart(32, 'c') + '$' + 'd'.repeat(64); });
+        return json(res, { success: true, modules: mods, stored });
+      });
+      return;
+    }
+    if (p === '/api/local/finance_auth/password') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = {}; }
+        const mod = String(parsed.module || '');
+        if (!req.headers['x-finance-session']) {
+          return json(res, { success: false, code: 'finance_session_required',
+                             message: '需要先解锁「设置」模块' }, 403);
+        }
+        TEST_PWD[mod] = String(parsed.new_password || '');
+        return json(res, { success: true, module: mod,
+                           stored_hash: 'pbkdf2_sha256$210000$' + 'a'.repeat(32) + '$' + 'b'.repeat(64) });
+      });
+      return;
+    }
+    if (p === '/api/local/finance_auth/logout') return json(res, { success: true, revoked: true });
+    if (p === '/api/proxy/admin/order_status' || p === '/api/proxy/admin/order_type') {
+      // S1-05：真正的门禁在 stats_server，本桩只复刻「无会话就 403」这一条
+      if (!req.headers['x-finance-session']) {
+        adminNoSession.push(p);
+        return json(res, { success: false, code: 'finance_session_required',
+                           message: '需要先解锁财务模块（finance_session）才能写入' }, 403);
+      }
+    }
     if (p === '/api/proxy/admin/order_status') {
       let body = '';
       req.on('data', (c) => { body += c; });
@@ -217,9 +301,9 @@ try {
     JSON.stringify({ locked: s.locked, edits: s.edits, toasts: s.toasts }));
   chk('密码错误 → 弹窗已关闭', await page.$('#modalRoot .modal-card') === null);
 
-  await tryUnlock('123456');
+  await tryUnlock(TEST_PWD.orderstatus);
   s = await snap();
-  chk('密码正确（默认 123456）→ 解锁：unlocked.orderstatus = true', !s.locked, JSON.stringify(s.locked));
+  chk('密码正确（已设置的 TEST_PWD）→ 解锁：unlocked.orderstatus = true', !s.locked, JSON.stringify(s.locked));
   chk('解锁后锁图标变 🔓', s.lockIcon.trim() === '🔓', JSON.stringify(s.lockIcon));
   chk('解锁后每行都有状态订正入口与 ▾（行数一致）',
     s.edits === s.rows && s.carets === s.rows && s.rows === 3, `rows=${s.rows} edits=${s.edits} carets=${s.carets}`);
@@ -371,12 +455,12 @@ try {
   /* ── ⑥ 密码在设置页管理：改成 654321 后旧密码失效 ────────────────────── */
   await page.click('#tabNav button[data-tab="settings"]');
   await page.waitForTimeout(200);
-  chk('设置已锁定 → 先解锁设置（默认 123456）',
+  chk('设置已锁定 → 先解锁设置（S1-05：用已设置的 TEST_PWD，默认 123456 已被停用）',
     await (async () => {
       const btn = await page.$('#tab-settings .btn.pri');
       if (btn) { await btn.click(); await page.waitForSelector('#modalRoot .modal-card');
-                 await page.fill('#modalRoot .modal-card input[type=password]', '123456');
-                 await page.click('#modalRoot .modal-card [data-act=ok]'); await page.waitForTimeout(500); }
+                 await page.fill('#modalRoot .modal-card input[type=password]', TEST_PWD.settings);
+                 await page.click('#modalRoot .modal-card [data-act=ok]'); await page.waitForTimeout(600); }
       return !!(await page.$('#pwd-orderstatus'));
     })());
   chk('设置页有该模块的密码输入框（新模块自动出现在密码管理里）',
@@ -390,24 +474,34 @@ try {
     pwdRowText.indexOf('订单状态/类型订正') >= 0 &&
     (await page.evaluate(() => document.getElementById('tab-settings').textContent)).indexOf('同时管') >= 0,
     pwdRowText.slice(0, 60));
+  const NEW_PWD = 'NewPass654321';
+  const OLD_PWD = TEST_PWD.orderstatus;   // 改密前先记下旧密码（桩会随改密更新 TEST_PWD）
   await page.evaluate(() => { document.getElementById('pwd-orderstatus').value = '654321'; });
+  await page.evaluate(() => updatePassword('orderstatus'));
+  await page.waitForTimeout(400);
+  chk('S1-05：小于 6 位的密码被拒（前端与服务端同口径），未提交改密',
+    (await page.evaluate(() => (window.STORE.config.passwords || {}).orderstatus || '')).indexOf('654321') < 0);
+  await page.evaluate((pwd) => { document.getElementById('pwd-orderstatus').value = pwd; }, NEW_PWD);
   await page.evaluate(() => updatePassword('orderstatus'));
   await page.waitForTimeout(600);
   const stored = await page.evaluate(() => (window.STORE.config.passwords || {}).orderstatus || '');
-  chk('保存后只存 SHA-256 哈希（不存明文）',
-    /^sha256:[0-9a-f]{64}$/.test(stored) && !stored.includes('654321'), JSON.stringify(stored));
+  chk('S1-05：保存的是**服务端回执的 PBKDF2 哈希**（不是前端算的 SHA-256，也不是明文）',
+    /^pbkdf2_sha256\$\d+\$[0-9a-f]+\$[0-9a-f]+$/.test(stored) && !stored.includes('654321'),
+    JSON.stringify(stored));
   chk('保存会同步到云端配置（POST /api/proxy/finance/config）', saved.length >= 1, JSON.stringify(saved.length));
 
   await page.click('#tabNav button[data-tab="cloud"]');
   await page.waitForSelector('.order-table', { timeout: 5000 });
-  await tryUnlock('123456');
+  await tryUnlock(OLD_PWD);
   s = await snap();
-  chk('改了密码之后：旧密码 123456 不再能解锁', s.locked && s.edits === 0,
+  chk('改了密码之后：旧密码不再能解锁', s.locked && s.edits === 0,
     JSON.stringify({ locked: s.locked, toasts: s.toasts }));
-  await tryUnlock('654321');
+  await tryUnlock(NEW_PWD);
   s = await snap();
-  chk('新密码 654321 可解锁（密码确实由设置页管理）', !s.locked && s.edits === s.rows,
+  chk('新密码可解锁（密码确实由设置页管理，且改密走了后端接口）', !s.locked && s.edits === s.rows,
     JSON.stringify({ locked: s.locked, edits: s.edits, rows: s.rows }));
+  chk('S1-05：所有 admin 写请求都带了 X-Finance-Session（桩从不因缺会话放行）',
+    adminNoSession.length === 0, JSON.stringify(adminNoSession));
   await page.locator('#cloud-orders').screenshot({ path: path.join(OUT_DIR, '06-设置页改密码后新密码可解锁.png') });
 
   /* ── ⑦ 深色主题（用户现场截图就是深色界面）───────────────────────────── */
@@ -438,6 +532,46 @@ try {
     document.documentElement.setAttribute('data-theme', 'light');
     closeOrderStatusMenu();
   });
+
+  /* ── ⑧ S1-05：默认密码 123456 被服务端拒绝（放在最后：它会弹强制改密框）────── */
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  // 上一步已解锁 → 先回锁，再走一次真实解锁流程输默认密码
+  await page.evaluate(() => { if (typeof lockModule === 'function') lockModule('orderstatus'); });
+  // 模拟「该模块密码仍是旧默认」：status 与 unlock 两个接口都按 needs_setup 口径回答
+  NEEDS_SETUP = ['orderstatus'];
+  await page.waitForTimeout(300);
+  await tryUnlock('123456');
+  s = await snap();
+  chk('S1-05：默认密码 123456 被服务端拒绝 → 仍锁定、无箭头',
+    s.locked && s.edits === 0, JSON.stringify({ locked: s.locked, edits: s.edits }));
+  chk('S1-05：提示默认密码已停用并弹出「设置财务密码」流程（不是只说"密码错误"）',
+    s.toasts.some((t) => t.includes('默认密码') || t.includes('停用')),
+    JSON.stringify(s.toasts));
+  const setupModal = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll('#modalRoot .modal-card')];
+    return cards.some((c) => c.textContent.indexOf('设置财务密码') >= 0 && !!c.querySelector('#fpNew1'));
+  });
+  chk('S1-05：默认被拒后强制进入改密流程（有 fpNew1/fpNew2 两个密码输入）', setupModal);
+  await page.screenshot({ path: path.join(OUT_DIR, '08-默认密码被拒-强制改密.png') });
+
+  /* ── ⑨ S1-05：首次改密**真的能从 UI 走通**（填两次密码 → 点确定 → 用新密码解锁）── */
+  const BRAND_NEW = 'BrandNewPass1';
+  await page.fill('#fpNew1', BRAND_NEW);
+  await page.fill('#fpNew2', BRAND_NEW);
+  await page.click('#modalRoot .modal-card [data-act=ok]');
+  await page.waitForTimeout(600);
+  chk('首次改密：在页面上填两次新密码点确定 → 真的 POST /api/local/finance_auth/setup',
+    setupCalls.length === 1 && setupCalls[0] === BRAND_NEW, JSON.stringify(setupCalls));
+  chk('首次改密：成功后提示「财务密码已设置」并给出模块名',
+    (await page.evaluate(() => [...document.querySelectorAll('#toastWrap .toast')]
+      .map((t) => t.textContent).join(' '))).indexOf('财务密码已设置') >= 0);
+  await page.waitForTimeout(300);
+  await tryUnlock(BRAND_NEW);
+  s = await snap();
+  chk('★ 首次改密后：用刚设置的新密码可以解锁，🔓 且每行出现订正入口（UI 全链路走通）',
+    !s.locked && s.edits === s.rows, JSON.stringify({ locked: s.locked, edits: s.edits, rows: s.rows }));
+  await page.screenshot({ path: path.join(OUT_DIR, '09-首次改密后新密码解锁.png') });
 
   chk('全程无外部网络请求（无 CDN / 无生产接口）', external.length === 0, external.slice(0, 3).join(' | '));
   chk('全程无页面 JS 异常', pageErrors.length === 0, pageErrors.slice(0, 3).join(' | '));

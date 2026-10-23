@@ -18,7 +18,20 @@ a = Analysis(
     # （theme_settings.json 曾同时出现在这里与 Excludes 里，自相矛盾：它按 paths.py 属用户数据，
     #   已从 datas 移除 —— 主题设置丢失时程序按默认主题启动。）
     datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('finance/settlement.html', 'finance'), ('finance/chart.umd.min.js', 'finance')],
-    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client'],
+    # S1-02 更新链加固（2026-10-23）：updater.py 用 cryptography 校验 update.json 的
+    # ed25519 签名，是**延迟 import**（点「检查更新」时才进）—— PyInstaller 的静态分析
+    # 看不到它，必须显式列；漏收 = 打包后门店机一检查更新就 ImportError（新版收不到更新，
+    # 且只有现场才会发现）。cryptography 的 Rust 扩展由 hooks-contrib 的
+    # hook-cryptography.py + pyi_rth_cryptography_openssl 负责收集（datas/binaries），
+    # 这里补 hiddenimports 覆盖我们直接 import 的那几个子模块。
+    # S1-05（2026-10-23）：财务 HMAC 的密钥用 DPAPI（win32crypt）保护；取不到会降级，
+    # 但显式收进来才能走 DPAPI 主路径（否则打包版永远走降级分支）。
+    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client',
+                   'win32crypt',
+                   'cryptography', 'cryptography.exceptions',
+                   'cryptography.hazmat.primitives.asymmetric.ed25519',
+                   'cryptography.hazmat.primitives.serialization',
+                   'cryptography.hazmat.bindings._rust'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -76,6 +76,8 @@ const STORE = {
 };
 const json = (res, o) => { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(o)); };
 
+const ADV_PWD = 'AdvPass2026';   // S1-05：测试用密码（默认 123456 已被服务端停用）
+const adminNoSession = [];      // 缺会话头就被桩拦下的 admin 写请求（诊断用）
 const posted = [];       // /api/proxy/admin/order_status 收到的体
 const postedType = [];   // /api/proxy/admin/order_type 收到的体（v7.1）
 const otherApi = [];     // 其它 /api/** 调用（诊断用）
@@ -89,6 +91,54 @@ const server = http.createServer((req, res) => {
   if (p.startsWith('/api/')) {
     otherApi.push(req.method + ' ' + p);
     if (p === '/api/health') return json(res, { success: true, cloud: true });
+    /* S1-05（2026-10-23）：解锁改为「服务端校验 + 30 分钟会话」。
+       默认密码 123456 已被服务端停用 —— 本用例统一用 ADV_PWD 解锁；桩在缺会话时对
+       admin 写请求回 403（与 stats_server 同口径），用来暴露"前端忘带会话头"。 */
+    if (p === '/api/local/finance_auth/status') {
+      return json(res, { success: true, modules: {}, needs_setup: [],
+                         session: { active: false, modules: [], expires_in: 0 },
+                         session_ttl: 1800, read_only: false, integrity: 'ok' });
+    }
+    if (p === '/api/local/finance_auth/unlock') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = {}; }
+        const mod = String(parsed.module || '');
+        const pwd = String(parsed.password || '');
+        if (pwd === '123456') {
+          return json(res, { success: false, code: 'default_password',
+                             message: '默认密码已停用，请先设置新密码' });
+        }
+        if (pwd !== ADV_PWD) {
+          return json(res, { success: false, code: 'wrong_password', message: '密码错误' });
+        }
+        return json(res, { success: true, session: 'adv-sess-' + mod, expires_in: 1800,
+                           modules: [mod], upgraded: false });
+      });
+      return;
+    }
+    if (p === '/api/local/finance_auth/logout') return json(res, { success: true, revoked: true });
+    if (p === '/api/local/finance_auth/password' || p === '/api/local/finance_auth/setup') {
+      return json(res, { success: true, modules: [], stored: {} });
+    }
+    if ((p === '/api/proxy/admin/order_status' || p === '/api/proxy/admin/order_type')
+        && !req.headers['x-finance-session']) {
+      adminNoSession.push(p);
+      // 请求确实到达了服务端（只是被会话门拦下）：把请求体记下来，
+      // B5 的变异自证要靠它证明「零请求」判据有判别力（变异体确实发出过写请求）。
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        let parsed = {};
+        try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = { _raw: body }; }
+        (p.endsWith('order_status') ? posted : postedType).push(parsed);
+        json(res, { success: false, code: 'finance_session_required',
+                    message: '需要先解锁财务模块（finance_session）才能写入' });
+      });
+      return;
+    }
     if (p === '/api/proxy/admin/order_status') {
       let body = '';
       req.on('data', (c) => { body += c; });
@@ -240,12 +290,12 @@ try {
   chk('A3c 锁定态控制台 openOrderTypeMenu(...) → 不创建 #tyMenu',
     !s.typeMenu, `typeMenu=${s.typeMenu}`);
 
-  // A4 正常解锁（真实密码流程，默认 123456）
+  // A4 正常解锁（真实密码流程；S1-05：密码由服务端校验，默认 123456 已被停用）
   await page.click('.order-table thead th:nth-child(5) .st-lock');
   await page.waitForSelector('#modalRoot .modal-card', { timeout: 5000 });
-  await page.fill('#modalRoot .modal-card input[type=password]', '123456');
+  await page.fill('#modalRoot .modal-card input[type=password]', ADV_PWD);
   await page.click('#modalRoot .modal-card [data-act=ok]');
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(600);
   s = await snap();
   chk('A4 解锁后：🔓、每行 .st-edit/.st-caret 各 3 个', !s.locked && s.edits === 3 && s.carets === 3,
     JSON.stringify([s.locked, s.edits, s.carets]));

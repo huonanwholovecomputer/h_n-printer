@@ -1,6 +1,6 @@
 // me.js
 const { CONFIG } = require('../../utils/config')
-const { request } = require('../../utils/request')
+const { request, createPollScheduler } = require('../../utils/request')
 // 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
 const { countPagesInRange } = require('../../utils/pages')
 
@@ -333,23 +333,35 @@ Component({
       })
     },
 
-    // 订单状态轮询（静默增量更新，不触发全量渲染）；15s 避免高频请求触发 Nginx 限流
+    // 订单状态轮询（静默增量更新，不触发全量渲染）；基线 15s，避免高频请求触发 Nginx 限流。
+    // S1-09：**自调度** —— 上一次 `_pollOrdersSilent` 的请求落定后才排下一次（setTimeout 链），
+    // 失败按 1.5× 指数退避（上限 5 分钟），成功即恢复 15s。旧写法 setInterval(15s) 在弱网
+    // （请求 12s 超时）时会叠着跑，越积越多。
     _startOrderPolling() {
       this._stopOrderPolling()
-      this._orderPollTimer = setInterval(() => {
-        this._pollOrdersSilent()
-      }, 15000)
+      // 桩环境/老版本 utils/request 没导出调度器时安静跳过（真机永远有；见 utils/request.js）
+      if (typeof createPollScheduler !== 'function') return
+      if (!this._orderPoll) {
+        this._orderPoll = createPollScheduler((done) => this._pollOrdersSilent(done), 15000)
+      }
+      this._orderPoll.start()
     },
-    _pollOrdersSilent() {
+    _pollOrdersSilent(done) {
       const token = wx.getStorageSync('token')
-      if (!token) return
+      if (!token) {
+        if (done) done(true)   // 未登录 = 不发请求，不算失败（不退避）
+        return
+      }
       request({
         url: CONFIG.BASE_URL + '/api/orders',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
         data: { page: this.data.ordersCurrentPage, per_page: this.data.ordersPerPage },
         success: (res) => {
-          if (res.statusCode !== 200 || !res.data || !res.data.success) return
+          if (res.statusCode !== 200 || !res.data || !res.data.success) {
+            if (done) done(false)
+            return
+          }
           const newOrders = res.data.orders || []
           const oldOrders = this.data.orders || []
           // 逐条对比，仅更新变化的 status 字段
@@ -405,11 +417,17 @@ Component({
           } else if (Object.keys(updates).length > 0) {
             this.setData(updates)
           }
+          if (done) done(true)   // S1-09：本轮成功 → 轮询恢复 15s 基线
         },
-        fail: () => {}
+        fail: () => {
+          if (done) done(false)  // S1-09：本轮失败 → 退避（1.5× / 上限 5 分钟）
+        }
       })
     },
     _stopOrderPolling() {
+      if (this._orderPoll) {
+        this._orderPoll.stop()
+      }
       if (this._orderPollTimer) {
         clearInterval(this._orderPollTimer)
         this._orderPollTimer = null
@@ -1041,15 +1059,21 @@ Component({
 
     // 从后端恢复所有活跃密钥（attached / pageLifetimes.show / 轮询 调用）
     // isInitial=true 时新卡片附加入场动画
-    loadActiveKey(isInitial) {
+    loadActiveKey(isInitial, done) {
       const token = wx.getStorageSync('token')
-      if (!token) return
+      if (!token) {
+        if (done) done(true)
+        return
+      }
       request({
         url: CONFIG.BASE_URL + '/api/license/active',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
         success: (res) => {
-          if (res.statusCode !== 200 || !res.data || !res.data.success) return
+          if (res.statusCode !== 200 || !res.data || !res.data.success) {
+            if (done) done(false)
+            return
+          }
           const newKeys = res.data.keys || []
           const oldKeys = this.data.activeKeys || []
           const oldKeySet = oldKeys.map(o => o.key).sort().join(',')
@@ -1102,8 +1126,11 @@ Component({
           } else {
             this._stopCountdown()
           }
+          if (done) done(true)
         },
-        fail: () => {},
+        fail: () => {
+          if (done) done(false)
+        },
       })
     },
 
@@ -1787,19 +1814,35 @@ Component({
       setTimeout(() => this._scheduleMeasure(80), 320)
     },
 
-    // 管理员许可密钥轮询：抽屉打开时每 5 秒刷新状态
+    // 管理员许可密钥轮询：抽屉打开时每 15s 刷新状态（S1-09：自调度 + 失败退避）
     _startKeyPolling() {
       this._stopKeyPolling()
-      this._keyPollTimer = setInterval(() => {
-        this.loadActiveKey(false)
-        // 同步刷新管理员列表（头像等）
-        if (this.data.isSuperAdmin) {
-          this._pollAdminsSilent()
-        }
-      }, 15000)
+      if (typeof createPollScheduler !== 'function') return   // 同 _startOrderPolling
+      if (!this._keyPoll) {
+        this._keyPoll = createPollScheduler((done) => this._pollKeysOnce(done), 15000)
+      }
+      this._keyPoll.start()
+    },
+    // 一轮 = 许可密钥（必发）+ 管理员列表（超管才发），两者都落定才算结束
+    _pollKeysOnce(done) {
+      let remaining = this.data.isSuperAdmin ? 2 : 1
+      let failed = false
+      const fin = (ok) => {
+        if (ok === false) failed = true
+        remaining -= 1
+        if (remaining <= 0) done(!failed)
+      }
+      this.loadActiveKey(false, fin)
+      // 同步刷新管理员列表（头像等）
+      if (this.data.isSuperAdmin) {
+        this._pollAdminsSilent(fin)
+      }
     },
 
     _stopKeyPolling() {
+      if (this._keyPoll) {
+        this._keyPoll.stop()
+      }
       if (this._keyPollTimer) {
         clearInterval(this._keyPollTimer)
         this._keyPollTimer = null
@@ -1807,16 +1850,22 @@ Component({
     },
 
     // 管理员列表静默轮询（仅更新变化字段，不触发全量渲染）
-    _pollAdminsSilent() {
+    _pollAdminsSilent(done) {
       const token = wx.getStorageSync('token')
-      if (!token) return
+      if (!token) {
+        if (done) done(true)
+        return
+      }
       request({
         url: CONFIG.BASE_URL + '/api/admin/admins',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
         data: { page: 1, page_size: 50 },
         success: (res) => {
-          if (!res.data || !res.data.success) return
+          if (!res.data || !res.data.success) {
+            if (done) done(false)
+            return
+          }
           const newAdmins = res.data.admins || []
           const oldAdmins = this.data.admins || []
           // 数量变化 → 全量刷新
@@ -1843,8 +1892,11 @@ Component({
           } else if (Object.keys(updates).length > 0) {
             this.setData(updates)
           }
+          if (done) done(true)
         },
-        fail: () => {}
+        fail: () => {
+          if (done) done(false)
+        }
       })
     },
 

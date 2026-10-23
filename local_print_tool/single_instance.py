@@ -23,9 +23,81 @@ from ctypes import wintypes
 
 _kernel32 = ctypes.windll.kernel32
 
-# 命名互斥体/事件：Local\ 前缀 = 当前登录会话内唯一（同机多用户互不影响）
-_MUTEX_NAME = "Local\\HN_Print_Tool_SingleInstance_Mutex"
-_EVENT_NAME = "Local\\HN_Print_Tool_SingleInstance_Event"
+# ===== S1-10（DS-08 余项）：命名对象从 Local\ 改成 Global\ + 用户 SID =====
+# 为什么：`Local\` 前缀的对象**只在当前登录会话内可见**。同一台机器同时存在两个会话
+# （控制台 + 远程桌面，或快速用户切换后残留的会话）时，两个实例互相看不见 ⇒ 同时运行、
+# 互相抢 print_config.json / 攒批清单（duplex_stack）/ pdf_cache —— 这正是要修的洞。
+#
+# 为什么还要带用户 SID：`Global\` 跨会话、跨用户可见。数据目录 `%APPDATA%` 本来就是
+# 按用户隔离的，A 用户跑着不该挡住 B 用户，所以名字里带"当前用户 SID"，语义是
+# **同一用户的所有会话共用一个锁**。
+#
+# 为什么保留 Local\ 回退：创建 `Global\` 对象需要 SeCreateGlobalPrivilege（默认只给
+# 管理员/服务账号）。普通用户门店机上创建会失败 —— 那种情况必须退回 `Local\`，
+# 否则单实例保护会被静默关掉（原来的 `if not h: return True` 就是"失败即放行"）。
+_MUTEX_NAMES = []
+_EVENT_NAMES = []
+
+
+def _user_sid_suffix() -> str:
+    """当前进程用户 SID 的字符串形式；取不到时退回 用户名@域 的短哈希。"""
+    try:
+        import hashlib
+        import os
+
+        advapi32 = ctypes.windll.advapi32
+        TOKEN_QUERY, TokenUser = 0x0008, 1
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                             ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                 ctypes.c_void_p, wintypes.DWORD,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+        advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                                    ctypes.POINTER(wintypes.LPWSTR)]
+        htoken = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(), TOKEN_QUERY,
+                                         ctypes.byref(htoken)):
+            raise OSError("OpenProcessToken failed")
+        try:
+            need = wintypes.DWORD(0)
+            advapi32.GetTokenInformation(htoken, TokenUser, None, 0, ctypes.byref(need))
+            buf = ctypes.create_string_buffer(max(int(need.value), 64))
+            if not advapi32.GetTokenInformation(htoken, TokenUser, buf, need,
+                                                ctypes.byref(need)):
+                raise OSError("GetTokenInformation failed")
+            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+            str_sid = wintypes.LPWSTR()
+            if not advapi32.ConvertSidToStringSidW(sid_ptr, ctypes.byref(str_sid)):
+                raise OSError("ConvertSidToStringSidW failed")
+            sid = str_sid.value or ""
+            _kernel32.LocalFree(str_sid) if hasattr(_kernel32, "LocalFree") else None
+            if sid:
+                return sid.replace("-", "")[-16:]
+        finally:
+            _kernel32.CloseHandle(htoken)
+    except Exception:
+        pass
+    # 回退：用户名@域 的短哈希（仍然按用户隔离，只是理论碰撞面大一点）
+    import hashlib
+    import os
+    ident = "%s@%s" % (os.environ.get("USERNAME", ""), os.environ.get("USERDOMAIN", ""))
+    return "u" + hashlib.sha256(ident.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+_SID_SUFFIX = _user_sid_suffix()
+for _ns in ("Global", "Local"):
+    _MUTEX_NAMES.append("%s\\HN_Print_Tool_SingleInstance_Mutex_%s" % (_ns, _SID_SUFFIX))
+    _EVENT_NAMES.append("%s\\HN_Print_Tool_SingleInstance_Event_%s" % (_ns, _SID_SUFFIX))
+
+# 兼容旧名（下面 acquire 里会先按新名判定；旧名只用于"升级瞬间"的过渡：
+# 旧版本进程持的是 Local\HN_Print_Tool_SingleInstance_Mutex，不检查它就可能在升级后
+# 出现"新旧两个实例同时跑"，所以一并尝试打开）
+_LEGACY_MUTEX_NAME = "Local\\HN_Print_Tool_SingleInstance_Mutex"
+_LEGACY_EVENT_NAME = "Local\\HN_Print_Tool_SingleInstance_Event"
+
+# 当前实际生效的命名（acquire 成功后写入；供测试与日志用）
+_MUTEX_NAME = ""
+_EVENT_NAME = ""
 
 ERROR_ALREADY_EXISTS = 183
 _EVENT_MODIFY_STATE = 0x0002          # SetEvent 所需权限
@@ -61,25 +133,42 @@ def acquire(retries: int = 3, retry_delay: float = 0.15) -> bool:
         True  = 本实例是唯一实例（互斥体已持有，继续启动）
         False = 已有实例在运行（已通知其将窗口置于前台），调用方应立即退出
     """
-    global _mutex_handle, _front_event
-    for attempt in range(retries + 1):
-        h = _kernel32.CreateMutexW(None, False, _MUTEX_NAME)
-        if not h:
-            # 创建失败（权限/系统异常）→ 放行，避免把用户锁在门外
+    global _mutex_handle, _front_event, _MUTEX_NAME, _EVENT_NAME
+    # 先试 Global\（跨会话），失败再退 Local\（普通用户没有 SeCreateGlobalPrivilege）
+    for ns_idx, mutex_name in enumerate(_MUTEX_NAMES):
+        event_name = _EVENT_NAMES[ns_idx]
+        for attempt in range(retries + 1):
+            h = _kernel32.CreateMutexW(None, False, mutex_name)
+            if not h:
+                # 该命名空间不可用（权限/系统异常）→ 换下一个命名空间；
+                # 全部不可用才放行（避免把用户锁在门外）
+                break
+            if _kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+                _kernel32.CloseHandle(h)
+                # 升级过渡：旧版本进程可能仍持有不带 SID 后缀的 Local\ 锁
+                legacy = _kernel32.CreateMutexW(None, False, _LEGACY_MUTEX_NAME)
+                if legacy and _kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+                    _kernel32.CloseHandle(legacy)
+                    if attempt < retries:
+                        time.sleep(retry_delay)
+                        continue
+                    _notify_front()
+                    return False
+                if legacy:
+                    _kernel32.CloseHandle(legacy)
+                if attempt < retries:
+                    time.sleep(retry_delay)
+                    continue
+                _notify_front()
+                return False
+            # 第一个实例：持有互斥体句柄，保持锁
+            _mutex_handle = h
+            _MUTEX_NAME, _EVENT_NAME = mutex_name, event_name
+            # 创建置前通知事件（自动复位）；若已存在（上次实例残留）则复用，无碍
+            _front_event = _kernel32.CreateEventW(None, False, False, event_name)
             return True
-        if _kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            _kernel32.CloseHandle(h)
-            if attempt < retries:
-                time.sleep(retry_delay)
-                continue
-            _notify_front()
-            return False
-        # 第一个实例：持有互斥体句柄，保持锁
-        _mutex_handle = h
-        # 创建置前通知事件（自动复位）；若已存在（上次实例残留）则复用，无碍
-        _front_event = _kernel32.CreateEventW(None, False, False, _EVENT_NAME)
-        return True
-    return False  # 不可达
+    # 所有命名空间都创建失败（权限/系统异常）→ 放行，避免把用户锁在门外
+    return True
 
 
 def _notify_front() -> None:
@@ -87,8 +176,13 @@ def _notify_front() -> None:
 
     事件可能恰逢首个实例刚创建互斥体、尚未创建事件（极短窗口），短时重试兜底。
     """
+    _event_names = ([_EVENT_NAME] if _EVENT_NAME else []) + _EVENT_NAMES + [_LEGACY_EVENT_NAME]
     for _ in range(10):
-        evt = _kernel32.OpenEventW(_EVENT_MODIFY_STATE, False, _EVENT_NAME)
+        evt = None
+        for _en in _event_names:
+            evt = _kernel32.OpenEventW(_EVENT_MODIFY_STATE, False, _en)
+            if evt:
+                break
         if evt:
             try:
                 _kernel32.SetEvent(evt)

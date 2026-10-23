@@ -15,7 +15,7 @@ import uuid
 import math
 import re
 import urllib.parse
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
 from urllib import request as urlrequest, parse as urlparse
@@ -46,7 +46,14 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 最大上传 50MB
 # Access-Control-* 头，避免出现重复头。
 # max_age=86400：浏览器缓存 OPTIONS 预检 1 天，避免每次刷新都重发预检导致 nginx 限流 503
 CORS(app, resources={r"/api/*": {"origins": "*"}}, max_age=86400)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+# S1-07（R7）：`async_handlers=False` —— 事件在处理线程内**同步**执行。本仓 handler
+# 全是同步 SQL，异步化只会把"一个请求占线程"搬成"占住该设备的事件线程"，症状更隐蔽
+# （计划 §1.4 依赖 2：先做 collect_all 的异步化，再改这里 —— 见 log_collect_all）。
+# engineio 参数同时收紧：心跳 15s / 超时 10s（更快发现死连接、释放线程），
+# 单帧缓冲 256 KB（默认 1 MB；事件载荷正常远小于它）。
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+                    async_handlers=False, ping_interval=15, ping_timeout=10,
+                    max_http_buffer_size=262144)
 
 # ===== S0-02：Engine.IO 握手前置 token 门 =====
 # 背景（安全加固计划 S0-02 / DDoS R1）：token 校验原先只在 Socket.IO 的 "40 CONNECT" 里做，
@@ -59,6 +66,72 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # 且 ProxyFix 必须在 gate 外层，否则真实 IP 永远是 nginx 的 127.0.0.1。
 _SIO_GATE_STATS = {"rejected": 0, "accepted": 0}
 _SIO_GATE_MAX_QUERY = 8192
+
+# S1-07：sid → client_id 映射（on_ping O(1) 用；connect 建、disconnect 删）
+_sid_to_client = {}
+
+# ===== S1-07：每连接事件令牌桶 =====
+# 一条连接发 1000 事件/秒时，原实现会逐个进 handler（同步 SQL）⇒ 占死该连接的处理线程。
+# 桶：20 事件/秒补充、突发上限 40；超出的**丢弃并计数**（不报错、不断连接 —— 正常客户端
+# 不会有这种流量，断开只会让"网络抖动导致的重发"变成掉线）。
+_EVENT_BUCKET_RATE = 20.0
+_EVENT_BUCKET_CAP = 40.0
+_event_buckets = {}
+_event_buckets_lock = threading.Lock()
+_event_bucket_stats = {"dropped": 0, "conns": 0}
+
+
+def _event_rate_ok():
+    """该连接当前是否还有事件配额。取不到 sid（非事件上下文）时一律放行。"""
+    try:
+        sid = request.sid
+    except Exception:
+        return True
+    now = time.time()
+    with _event_buckets_lock:
+        b = _event_buckets.get(sid)
+        if b is None:
+            b = [_EVENT_BUCKET_CAP, now]
+            _event_buckets[sid] = b
+            _event_bucket_stats["conns"] += 1
+            if len(_event_buckets) > 5000:
+                # 兜底清理：60s 没动静的连接直接删（正常情况下 disconnect 会删）
+                for k in [k for k, v in _event_buckets.items() if now - v[1] > 60]:
+                    _event_buckets.pop(k, None)
+        else:
+            b[0] = min(_EVENT_BUCKET_CAP, b[0] + (now - b[1]) * _EVENT_BUCKET_RATE)
+            b[1] = now
+        if b[0] < 1.0:
+            _event_bucket_stats["dropped"] += 1
+            return False
+        b[0] -= 1.0
+        return True
+
+
+def _with_event_bucket(fn):
+    """给 socketio 事件处理器套一层令牌桶（connect/disconnect 不套）。"""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not _event_rate_ok():
+            return None
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def sio_event(name):
+    """`@sio_event(...)` 的替代：注册时套上事件令牌桶（S1-07）。
+
+    刻意用同一个装饰器入口替换全部 `@sio_event(...)`：这样"以后新增的 handler 忘了
+    加限速"在结构上不会发生（漏写装饰器 = 事件根本没注册，验收脚本会立刻发现）。
+    """
+    def deco(fn):
+        if name in ("connect", "disconnect"):
+            socketio.on(name)(fn)
+            return fn
+        wrapped = _with_event_bucket(fn)
+        socketio.on(name)(wrapped)
+        return wrapped
+    return deco
 
 
 def _sio_handshake_gate(wsgi_app):
@@ -82,7 +155,8 @@ def _sio_handshake_gate(wsgi_app):
                           if len(qs) <= _SIO_GATE_MAX_QUERY else {})
                 if "sid" not in params:
                     tok = environ.get("HTTP_X_PRINTER_TOKEN") or params.get("token") or ""
-                    if not _printer_token_ok(tok):
+                    # S1-01：per-device token 与全局 TOKEN 都走统一认证
+                    if not _authenticate_printer(tok):
                         _SIO_GATE_STATS["rejected"] += 1
                         return _forbid()
                     _SIO_GATE_STATS["accepted"] += 1
@@ -114,6 +188,14 @@ RETENTION_CONFIG_FILE = os.path.join(UPLOAD_DIR, "retention_config.json")
 # 打印机设备注册表 / 接单接管状态（2026-11 新增：多设备共连服务器时的唯一接管者机制）
 # devices.json: { client_id: {device_name, owner_name, first_seen, last_seen} }
 DEVICES_FILE = "devices.json"
+# S1-06：APP/网页设备的"设备密钥"（不是 printer token）。{sha256(device_id)[:32]: {...}}
+# 只存 secret 的哈希；首次登录下发一次，之后凭 secret 换 token —— 不再只凭自报 device_id。
+DEVICE_SECRETS_FILE = "device_secrets.json"
+# 迁移宽限：老 APP 不会带 device_secret，窗口内放行并（轮换）下发一次；窗口后强制。
+# 解除条件：门店/用户手机全部 ≥ 会存 device_secret 的客户端版本后，把这里改成 0 并观察 24h。
+DEVICE_SECRET_GRACE_SECONDS = 14 * 24 * 3600
+_device_secrets_lock = threading.Lock()
+
 # printer_claim.json: { active_client_id, owner_name, claimed_at } — 当前启用「接单」的设备
 CLAIM_FILE = "printer_claim.json"
 
@@ -166,6 +248,34 @@ def _delete_devices(client_ids, reason: str = "") -> list[str]:
 
 # 默认保留时间：7 天
 DEFAULT_RETENTION = {"days": 7, "hours": 0}
+
+# ===== S1-03（D-6 / D-7 已拍板）：客户自选保留期，服务器给硬上限 =====
+# `max_retention_hours` 是**天花板**（168h = 7 天）：客户可以选"立即 / 24h / 3天 / 7天"，
+# 服务端逐请求夹到 1..168，选超上限按上限截断；`files.retention_hours = 0` 表示"用全局默认"
+# （沿用管理员在「服务器存储」里配的 days/hours，保持旧数据的语义不变）。
+MAX_RETENTION_HOURS = 168
+DEFAULT_FILE_RETENTION_HOURS = 24
+RETENTION_CHOICES_HOURS = (0, 1, 24, 72, 168)   # 立即(1h) / 24h / 3天 / 7天（0=用默认）
+
+
+def _clamp_retention_hours(value):
+    """把客户选择夹进 1..MAX_RETENTION_HOURS；非法/缺失返回 0（= 用全局默认）。"""
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if hours <= 0:
+        return 0
+    return min(hours, MAX_RETENTION_HOURS)
+
+
+def get_retention_limits():
+    """对外暴露的保留期口径（移动端选择器用；也用于测试）。"""
+    return {
+        "max_retention_hours": MAX_RETENTION_HOURS,
+        "default_retention_hours": DEFAULT_FILE_RETENTION_HOURS,
+        "choices_hours": list(RETENTION_CHOICES_HOURS),
+    }
 
 # -------- 防滥用 / DDoS 防护阈值 --------
 # 管理员/超管可通过 /api/admin/security 查看和调整，持久化到 uploads/security_config.json，
@@ -251,11 +361,47 @@ db_lock = threading.Lock()
 # -------- MD5 索引文件锁（P2-5）：load/save 均需持锁，防并发读写损坏索引 --------
 _md5_index_lock = threading.Lock()
 
-# -------- 内存限速器（P1-6）--------
-# 滑动窗口 {key: [timestamp, ...]}。注意：内存计数仅对单 worker 生效，
-# 生产环境多 worker / 多实例时需要在 nginx 层再加 IP 维度限速。
-_rate_limits = defaultdict(list)
+# -------- 内存限速器（P1-6；S1-08 改造）--------
+# 滑动窗口 {key_hash: {"ts": [timestamp, ...], "win": 窗口秒数}}。
+# 注意：内存计数仅对单 worker 生效，生产环境多 worker / 多实例时需要在 nginx 层再加
+# IP 维度限速（S0-01 已加）。
+#
+# S1-08 改造（docs/安全加固修复计划_2026-10-23.md §S1-08 / R8）——原来有三个洞：
+#   ① **无界增长**：`defaultdict(list)` 永不删 key，任何"带随机后缀"的参数（device_id、
+#      file_id、openid）都能让字典无限涨（R8 的内存增长面）；
+#   ② **key 是原串**：一个 1 MB 的 device_id 直接成为 key（S0-03 已在调用侧用
+#      sha256 截断，这里再统一兜一层，避免下一个入口又忘了）；
+#   ③ **无清扫**：过期时间戳只在被再次访问时才清理，冷 key 永久占内存。
+# 现在：key 一律 sha256[:16]；容量上限 50k（超了先清过期、再按插入顺序淘汰最旧）；
+# 每 60 秒做一次全量清扫（摊薄成本，不在每次请求里扫全表）。
+_RATE_LIMIT_MAX_KEYS = 50000
+_RATE_LIMIT_SWEEP_INTERVAL = 60.0
+_rate_limits = OrderedDict()
 _rate_limits_lock = threading.Lock()
+_rate_limits_last_sweep = [0.0]
+_rate_limits_stats = {"sweeps": 0, "evicted": 0, "rejected": 0}
+
+
+def _rate_limit_hash(key):
+    """限速 key 统一 sha256 截断：原串不进字典（R8 的内存增长面 / 长 key 放大面）。"""
+    return hashlib.sha256(str(key).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _sweep_rate_limits_locked(now):
+    """清掉「窗口内已无有效时间戳」的 key。**必须在持锁下调用**。
+
+    桶结构刻意用**单个 list**（`[window_seconds, ts1, ts2, ...]`）而不是
+    `{"ts": [...], "win": n}`：50k 个 key 时前者约 14 MB 堆、后者约 24 MB（实测），
+    而 §S1-08 的验收线是"灌 10 万个 key 后堆增长 < 20 MB"。少一层容器就是少一半开销。
+    """
+    dead = []
+    for k, bucket in _rate_limits.items():
+        if len(bucket) <= 1 or bucket[-1] <= now - bucket[0]:
+            dead.append(k)
+    for k in dead:
+        _rate_limits.pop(k, None)
+    _rate_limits_last_sweep[0] = now
+    _rate_limits_stats["sweeps"] += 1
 
 # 页数分析惰性触发防抖：file_id → 最近一次主动推送时间戳
 # （前端 /api/file_page 轮询时，若打印机在线且文件未分析，可主动补推；
@@ -331,17 +477,41 @@ def _json_dict():
 
 
 def _rate_limit(key, max_count, window_seconds):
-    """滑动窗口限速：key 在 window_seconds 秒内最多 max_count 次，超限返回 False。"""
+    """滑动窗口限速：key 在 window_seconds 秒内最多 max_count 次，超限返回 False。
+
+    key 只用于寻址（内部 sha256[:16]），容量与清扫见上面的 `_RATE_LIMIT_*`。"""
     now = time.time()
+    hkey = _rate_limit_hash(key)
     with _rate_limits_lock:
-        ts_list = _rate_limits[key]
-        # 清理窗口外的旧时间戳（顺序追加，队头最旧）
-        while ts_list and ts_list[0] <= now - window_seconds:
-            ts_list.pop(0)
-        if len(ts_list) >= max_count:
+        # 定期全量清扫（每 60s 一次；冷 key 不会永久占内存）
+        if now - _rate_limits_last_sweep[0] >= _RATE_LIMIT_SWEEP_INTERVAL:
+            _sweep_rate_limits_locked(now)
+        bucket = _rate_limits.get(hkey)
+        if bucket is None:
+            # 容量上限：先清过期，仍满就按插入顺序淘汰最旧（OrderedDict）
+            if len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:
+                _sweep_rate_limits_locked(now)
+                while len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:
+                    _rate_limits.popitem(last=False)
+                    _rate_limits_stats["evicted"] += 1
+            bucket = [window_seconds]
+            _rate_limits[hkey] = bucket
+        else:
+            bucket[0] = window_seconds
+            _rate_limits.move_to_end(hkey)
+        # 清理窗口外的旧时间戳（下标 1 是队头，最旧）
+        while len(bucket) > 1 and bucket[1] <= now - window_seconds:
+            del bucket[1]
+        if len(bucket) - 1 >= max_count:
+            _rate_limits_stats["rejected"] += 1
             return False
-        ts_list.append(now)
+        bucket.append(now)
         return True
+
+
+def _rate_limit_ok(key, max_count, window_seconds):
+    """语义别名（S1-08 起新入口统一用这个读起来更直白）。"""
+    return _rate_limit(key, max_count, window_seconds)
 
 
 class OrderRejected(Exception):
@@ -590,18 +760,35 @@ def cleanup_expired_files():
         conn.commit()
         print(f"  [CLEANUP] 已删除 {len(ghost_ids)} 条幽灵文件记录（物理已清理，防止页数分析补推刷屏）")
 
-    # 0 天 0 小时 = 永不过期（幽灵清理已在上方完成）
-    if no_retention:
-        conn.close()
-        return
-
     cutoff = datetime.now() - timedelta(days=days, hours=hours)
     cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
-    rows = conn.execute(
-        "SELECT id, path FROM files WHERE created_at < ? AND path != ''",
-        (cutoff_str,),
+    # ===== S1-03：客户自选保留期的文件按**各自的** retention_hours 到期 =====
+    # 这一段必须在 `no_retention` 早退**之前**：管理员把全局策略设成"永不过期"时，
+    # 客户明确选了 24h 的文件仍然必须按时删除（D-6 的口径是"由客户决定删除时间"）。
+    per_file_rows = conn.execute(
+        """SELECT id, path, retention_hours FROM files
+            WHERE path != '' AND COALESCE(retention_hours, 0) > 0
+              AND datetime(created_at, '+' || retention_hours || ' hours')
+                  <= datetime('now', 'localtime')"""
     ).fetchall()
+    # 0 天 0 小时 = 全局策略永不过期（但上面的"客户自选到期"仍要执行）
+    if no_retention:
+        rows = []
+        if not per_file_rows:
+            conn.close()
+            return
+    else:
+        rows = conn.execute(
+            "SELECT id, path FROM files WHERE created_at < ? AND path != ''",
+            (cutoff_str,),
+        ).fetchall()
+    # 合并去重（同一个文件可能同时命中全局与自选口径）
+    _seen_ids = {r["id"] for r in rows}
+    for _r in per_file_rows:
+        if _r["id"] not in _seen_ids:
+            rows = list(rows) + [_r]
+            _seen_ids.add(_r["id"])
 
     md5_index = load_md5_index()
     deleted_count = 0
@@ -701,8 +888,37 @@ PRINTER_NAME = ""
 # 订单归属默认占位名（未显式指定归属时使用通用占位，避免把真实用户名硬编码为默认值）
 DEFAULT_OWNER_NAME = "张三"
 
+# ===== S1-10（DS-10 / DS-18）：配置由**服务器侧**维护，不进程序目录、不进部署包 =====
+# 生产：/etc/hn-printer/config.py（root:root 600）。程序目录里的 config.py 只作为
+# 开发机/旧部署的兼容回退。这样"部署时把开发机配置覆盖到生产"在结构上不可能发生
+# （部署 tar 也已经 --exclude=config.py，见 更新后端服务.txt）。
+_CONFIG_PATHS = [
+    os.environ.get("HN_CONFIG_PATH", "/etc/hn-printer/config.py"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py"),
+]
+
+
+def _load_config_module():
+    """按顺序找第一个存在的配置文件并作为模块执行；都没有返回 None。"""
+    import importlib.util
+    for _p in _CONFIG_PATHS:
+        if not _p or not os.path.exists(_p):
+            continue
+        try:
+            _spec = importlib.util.spec_from_file_location("hn_printer_config", _p)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            print(f"已加载配置: {_p}")
+            return _mod
+        except Exception as e:  # noqa: BLE001
+            print(f"[WARN] 配置文件 {_p} 加载失败: {type(e).__name__}: {e}")
+    return None
+
+
 try:
-    import config
+    config = _load_config_module()
+    if config is None:
+        raise ImportError("no config file")
     WECHAT_APPID = getattr(config, "WECHAT_APPID", WECHAT_APPID)
     WECHAT_APPSECRET = getattr(config, "WECHAT_APPSECRET", WECHAT_APPSECRET)
     SECRET_KEY = getattr(config, "SECRET_KEY", SECRET_KEY)
@@ -1322,9 +1538,112 @@ def broadcast_printer_state():
             print(f"  [CLAIM] 推送接单状态到 {cid} 失败: {e}")
 
 
-def make_download_url(file_id):
-    """生成带签名的文件下载 URL（1 小时有效）"""
-    token = download_serializer.dumps(file_id)
+class TokenRevoked(Exception):
+    """S1-06：token 的 ver 与用户当前 token_version 不一致（= 已"退出全部设备"）。"""
+
+
+# -------- S1-06：会话可吊销（jti/ver + users.token_version，60s 缓存避免每请求打库）--------
+TOKEN_VERSION_CACHE_TTL = 60
+_token_version_cache = {}
+_token_version_lock = threading.Lock()
+
+
+def _token_version_of(openid):
+    """读 users.token_version（60s 内存缓存）。取不到按 0（老库/异常时保持可用）。"""
+    now = time.time()
+    with _token_version_lock:
+        hit = _token_version_cache.get(openid)
+        if hit and now - hit[1] < TOKEN_VERSION_CACHE_TTL:
+            return hit[0]
+    ver = 0
+    try:
+        conn = get_user_db()
+        try:
+            row = conn.execute(
+                "SELECT version FROM token_versions WHERE openid = ?", (openid,)).fetchone()
+            if row and row["version"] is not None:
+                ver = int(row["version"])
+        finally:
+            conn.close()
+    except Exception:
+        ver = 0
+    with _token_version_lock:
+        _token_version_cache[openid] = (ver, now)
+    return ver
+
+
+def _invalidate_token_version_cache(openid):
+    with _token_version_lock:
+        _token_version_cache.pop(openid, None)
+
+
+def _bump_token_version(openid):
+    """递增该用户的 token_version（"退出全部设备"）：所有旧 token 立即失效。"""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_user_db()
+    try:
+        # UPSERT：首次就是 1；已存在则 +1（guest 账号没有 users 行也能吊销）
+        conn.execute(
+            "INSERT INTO token_versions (openid, version, updated_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(openid) DO UPDATE SET version = version + 1, updated_at = excluded.updated_at",
+            (openid, now_str))
+        conn.commit()
+        row = conn.execute(
+            "SELECT version FROM token_versions WHERE openid = ?", (openid,)).fetchone()
+        new_ver = int(row["version"]) if row and row["version"] is not None else 1
+    finally:
+        conn.close()
+    with _token_version_lock:
+        _token_version_cache[openid] = (new_ver, time.time())
+    return new_ver
+
+
+def _issue_login_token(openid):
+    """签发登录 token（S1-06）：payload 带 openid + ver + jti。
+
+    · `ver` = 该用户当前 token_version ⇒ "退出全部设备"后旧 token 的 ver 对不上；
+    · `jti` = 单次签发标识（供后续按会话吊销/审计；本轮只做 ver 吊销）。
+    · 兼容：S1-06 之前签发的 payload 是纯字符串 openid，`_load_login_token` 按 ver=0 处理
+      （老库 token_version 默认 0 ⇒ 存量登录态不会因为这次改动被踢下线）。
+    """
+    return token_serializer.dumps({
+        "o": openid,
+        "v": _token_version_of(openid),
+        "j": uuid.uuid4().hex,
+    })
+
+
+def _load_login_token(token):
+    """解析登录 token → openid；被吊销抛 TokenRevoked，签名/过期抛原始异常。"""
+    payload = token_serializer.loads(token, max_age=TOKEN_MAX_AGE)
+    if isinstance(payload, str):
+        openid, ver = payload, 0          # S1-06 之前的形态
+    elif isinstance(payload, dict):
+        openid = str(payload.get("o") or "")
+        try:
+            ver = int(payload.get("v") or 0)
+        except (TypeError, ValueError):
+            raise BadSignature("bad token payload")
+    else:
+        raise BadSignature("bad token payload")
+    if not openid:
+        raise BadSignature("empty openid")
+    if ver != _token_version_of(openid):
+        raise TokenRevoked(openid)
+    return openid
+
+
+def make_download_url(file_id, openid="", task_id=None):
+    """生成带签名的文件下载 URL（1 小时有效）。
+
+    S1-06：**绑定 openid + file_id + task_id**（不再是"谁拿到 URL 谁下"）。payload 里
+    写入这三者，下载时校验：文件属于该任务、任务属于该 openid。泄露的 URL 只能下载
+    "这一个任务的这一个文件"，且 1 小时过期。分析请求等没有任务的场景传空即可。
+    """
+    payload = {"f": file_id, "o": openid or ""}
+    if task_id is not None:
+        payload["t"] = int(task_id)
+    token = download_serializer.dumps(payload)
     return f"{PUBLIC_BASE_URL}/api/download/{file_id}?t={token}"
 
 
@@ -1373,6 +1692,213 @@ def _printer_token_ok(tok):
         except TypeError:
             continue
     return ok
+
+
+def _hash_device_secret(secret):
+    return hashlib.sha256(("hn-device:" + str(secret)).encode("utf-8")).hexdigest()
+
+
+def _load_device_secrets_unlocked():
+    try:
+        with open(DEVICE_SECRETS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _load_device_secrets():
+    with _device_secrets_lock:
+        return _load_device_secrets_unlocked()
+
+
+def _save_device_secrets(data):
+    """原子写（临时文件 + os.replace），读写都在锁内。"""
+    with _device_secrets_lock:
+        tmp = DEVICE_SECRETS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, DEVICE_SECRETS_FILE)
+
+
+def _check_device_secret(device_id, provided):
+    """S1-06 设备密钥校验。返回 (ok, message, issued_secret|None)。
+
+    · 首次见到该 device_id：生成密钥、存哈希、**下发一次**（客户端应保存）；
+    · 已有记录且带密钥：恒时比对，错误 → 拒绝；
+    · 已有记录但不带密钥（老 APP）：宽限窗口内**轮换并再次下发**（下次能存下来），
+      窗口后拒绝 —— 这是计划 §S1-06「不再只凭自报 device_id」的迁移路径。
+    """
+    key = hashlib.sha256(("device_secret:" + device_id).encode("utf-8")).hexdigest()[:32]
+    rec = _load_device_secrets().get(key) or {}
+    now_ts = time.time()
+    provided = provided.strip() if isinstance(provided, str) else ""
+
+    if rec.get("secret_hash"):
+        if provided:
+            if not hmac.compare_digest(_hash_device_secret(provided), rec["secret_hash"]):
+                return False, "设备凭证无效，请重新登录", None
+            return True, "", None
+        issued_at = float(rec.get("issued_at_ts") or 0)
+        # 宽限期从**首次签发时刻**起算；时间戳缺失/为 0 一律按"已过期"处理（fail-closed）
+        grace_left = (DEVICE_SECRET_GRACE_SECONDS - (now_ts - issued_at)) if issued_at else 0
+        if grace_left <= 0:
+            return False, "请更新 APP 后重新登录（设备凭证已启用）", None
+        # 宽限期内：轮换并下发（老版本会忽略，新版本会存下来）
+        new_secret = secrets.token_urlsafe(32)
+        secrets_map = _load_device_secrets()
+        secrets_map[key] = {
+            "secret_hash": _hash_device_secret(new_secret),
+            "issued_at_ts": now_ts,
+            "last_used_at": now_ts,
+            "rotated_for_legacy": True,
+        }
+        _save_device_secrets(secrets_map)
+        print(f"  [AUTH] 设备 {device_id[:12]}... 未带 device_secret（老客户端），宽限期内轮换下发一次")
+        return True, "", new_secret
+
+    # 首次注册
+    new_secret = secrets.token_urlsafe(32)
+    secrets_map = _load_device_secrets()
+    secrets_map[key] = {
+        "secret_hash": _hash_device_secret(new_secret),
+        "issued_at_ts": now_ts,
+        "last_used_at": now_ts,
+    }
+    _save_device_secrets(secrets_map)
+    return True, "", new_secret
+
+
+# ===== S1-01：per-device token（DS-02 根治 / R7）=====
+# 现状：全站只有 config.py 里的**一个** TOKEN —— 泄露一次就要全站轮换、无法单独吊销某台
+# 设备、也无法区分"这台设备能做什么"。现在每台设备在 devices.json 里各有一条：
+#   token_hash / scopes / token_issued_at / revoked_at / label（**只存哈希**，明文只在
+#   签发响应里出现一次）。
+# 迁移窗口：全局 TOKEN 继续被接受（`legacy=True`，映射成 print+admin 全部 scope），
+# 等两台门店都换成本机 token 后再把它降权/删除（见 docs/安全加固修复计划 §S1-01）。
+_PRINTER_SCOPES = ("print", "admin")
+_DEFAULT_DEVICE_SCOPES = ("print", "admin")   # 门店机既要拉单/回报，也要看统计/订正
+
+
+def _hash_printer_token(tok):
+    """printer token 的存储哈希（与全局 TOKEN 的恒时比较分开：这里只用于查表）。"""
+    return hashlib.sha256(("hn-printer:" + str(tok)).encode("utf-8")).hexdigest()
+
+
+def _find_device_by_token(tok):
+    """按 token 哈希查设备记录；已吊销返回 None。设备表只有几十条，线性扫描足够。"""
+    if not isinstance(tok, str) or not tok:
+        return None
+    h = _hash_printer_token(tok)
+    for cid, rec in load_devices().items():
+        if not isinstance(rec, dict) or not rec.get("token_hash"):
+            continue
+        try:
+            if not hmac.compare_digest(str(rec["token_hash"]), h):
+                continue
+        except TypeError:
+            continue
+        if rec.get("revoked_at"):
+            return None
+        scopes = rec.get("scopes")
+        if not isinstance(scopes, list) or not scopes:
+            scopes = list(_DEFAULT_DEVICE_SCOPES)
+        return {"client_id": cid, "scopes": set(scopes), "legacy": False}
+    return None
+
+
+def _authenticate_printer(tok):
+    """printer 认证的**唯一入口**（S1-01）：返回 {client_id, scopes, legacy} 或 None。
+
+    顺序：per-device token 优先；其次全局 TOKEN（迁移窗口，legacy）；都不匹配 → None。
+    注意：全局 TOKEN 只作为**迁移兼容**存在，它的存在意味着"一把钥匙全站通用"这个洞
+    还没完全关掉 —— 两台门店换完本机 token 后应把 config.py 的 TOKEN 删掉。
+    """
+    dev = _find_device_by_token(tok)
+    if dev:
+        return dev
+    if _printer_token_ok(tok):
+        return {"client_id": "", "scopes": set(_DEFAULT_DEVICE_SCOPES), "legacy": True}
+    return None
+
+
+def _printer_scope_ok(tok, scope):
+    rec = _authenticate_printer(tok)
+    return bool(rec and scope in rec["scopes"])
+
+
+def _request_printer_token():
+    """取本次请求携带的 printer token（头 → query → JSON body，与 _get_printer_token 同源）。"""
+    tok = _get_printer_token()
+    if tok:
+        return tok
+    # 深嵌套请求体（depth ≥ 1000）解析会抛 RecursionError：这里**吞掉并当成"没有 token"**，
+    # 让 scope 装饰器回 403（v7.0b 的契约：未认证一律 403，绝不因为畸形体变成 400/500）。
+    try:
+        body = request.get_json(silent=True)
+    except RecursionError:
+        return ""
+    if isinstance(body, dict):
+        return str(body.get("token") or "")
+    return ""
+
+
+def require_printer_scope(scope):
+    """装饰器：printer token 必须具备指定 scope（S1-01）。
+
+    用在"管理类"路由上（订单订正/统计/日志/设备管理）。**不替换**各路由内部原有的
+    `_printer_token_ok` 判定 —— 多一道校验比少一道好，且旧客户端/旧测试不会因为
+    "没带 scope 概念"而改变行为（全局 TOKEN 映射为 print+admin）。
+    """
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not _printer_scope_ok(_request_printer_token(), scope):
+                return jsonify({"success": False,
+                                "message": "token 无效或缺少 %s 权限" % scope}), 403
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
+
+
+def issue_device_token(client_id, label="", scopes=None):
+    """为设备签发（或轮换）token。返回明文 token（**只此一次**），devices.json 存哈希。"""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scopes = [s for s in (scopes or list(_DEFAULT_DEVICE_SCOPES)) if s in _PRINTER_SCOPES]
+    if not scopes:
+        scopes = list(_DEFAULT_DEVICE_SCOPES)
+    token = secrets.token_urlsafe(32)
+    devices = load_devices()
+    rec = devices.get(client_id)
+    if not isinstance(rec, dict):
+        rec = {}
+    rec.update({
+        "token_hash": _hash_printer_token(token),
+        "scopes": scopes,
+        "token_issued_at": now_str,
+        "revoked_at": "",
+        "label": (label or rec.get("label") or "")[:64],
+    })
+    devices[client_id] = rec
+    save_devices(devices)
+    print(f"[TOKEN] 已为设备 {client_id} 签发 token（scopes={scopes}）")
+    return token, scopes
+
+
+def revoke_device_token(client_id):
+    """吊销某台设备的 token（保留其余记录，便于审计/恢复）。"""
+    devices = load_devices()
+    rec = devices.get(client_id)
+    if not isinstance(rec, dict) or not rec.get("token_hash"):
+        return False
+    rec["revoked_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rec["token_hash"] = ""          # 立即失效（不留哈希，避免"吊销后又被恢复"）
+    devices[client_id] = rec
+    save_devices(devices)
+    print(f"[TOKEN] 已吊销设备 {client_id} 的 token")
+    return True
 
 
 def _get_pricing_config():
@@ -1455,11 +1981,42 @@ def download_file(file_id):
     """打印机客户端下载文件（用签名 token 验证）"""
     token = request.args.get("t", "")
     try:
-        fid = download_serializer.loads(token, max_age=3600)
-        if fid != file_id:
-            raise BadSignature("file_id mismatch")
+        payload = download_serializer.loads(token, max_age=3600)
     except (BadSignature, SignatureExpired):
         return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
+
+    # S1-06：三种 payload 形态
+    #   ① dict（新）：{"f": file_id, "o": openid, "t": task_id?} → 校验绑定
+    #   ② str（S0-07 之后、S1-06 之前的短窗口）：只有 file_id，按旧口径放行
+    if isinstance(payload, dict):
+        fid = str(payload.get("f") or "")
+        bound_openid = str(payload.get("o") or "")
+        bound_task = payload.get("t")
+    elif isinstance(payload, str):
+        fid, bound_openid, bound_task = payload, "", None
+    else:
+        return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
+    if fid != file_id:
+        return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
+    if bound_task is not None:
+        try:
+            bound_task = int(bound_task)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
+        conn = get_db()
+        try:
+            trow = conn.execute(
+                "SELECT order_id FROM order_files WHERE id = ? AND file_id = ?",
+                (bound_task, file_id)).fetchone()
+            if not trow:
+                return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
+            if bound_openid:
+                orow = conn.execute(
+                    "SELECT openid FROM orders WHERE id = ?", (trow["order_id"],)).fetchone()
+                if not orow or (orow["openid"] or "") != bound_openid:
+                    return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
+        finally:
+            conn.close()
 
     conn = get_db()
     row = conn.execute("SELECT path, original_name FROM files WHERE id = ?", (file_id,)).fetchone()
@@ -1558,12 +2115,48 @@ def _retry_on_lock(fn, *args, max_attempts=3, **kwargs):
             raise
 
 
+def _cleanup_once_on_startup():
+    """S1-03：**启动时**也做一次过期清理（原来只有 10 分钟定时任务）。
+
+    计划 §S1-03 要求"启动 + 定时双触发"：门店机/服务器重启后，到期文件不必再等一个
+    定时周期；也避免"进程长期不重启、定时任务被跳过"时保留期形同虚设。
+    """
+    def _run():
+        try:
+            cleanup_expired_files()
+            print("  [CLEANUP] 启动时过期清理完成")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [CLEANUP] 启动时过期清理失败: {type(e).__name__}: {e}")
+    t = threading.Thread(target=_run, name="startup-cleanup", daemon=True)
+    t.start()
+    return t
+
+
+def _build_md5_index_in_background():
+    """S1-10：把"扫全盘算 MD5"移出启动关键路径。
+
+    原实现每次启动都在 init_db 里同步跑 build_md5_index()（逐文件读全量算 MD5）——
+    文件数一多，重启到可服务的时间随文件数线性变长（计划 §S1-10）。现在放后台线程：
+    服务先起来，索引补全在后台完成。并发安全：上传侧只读索引、写入走 `_md5_index_lock`；
+    后台补全期间上传去重可能漏掉"尚未入索引"的老文件（最多多存一份，不会丢数据）。
+    """
+    def _run():
+        try:
+            build_md5_index()
+            print("  [MD5] 后台索引补全完成")
+        except Exception as e:  # noqa: BLE001
+            print(f"  [MD5] 后台索引补全失败: {type(e).__name__}: {e}")
+    t = threading.Thread(target=_run, name="md5-index-builder", daemon=True)
+    t.start()
+    return t
+
+
 def init_db():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     os.makedirs(AVATAR_DIR, exist_ok=True)
 
-    # 构建/补全 MD5 文件索引（用于上传去重）
-    build_md5_index()
+    # 构建/补全 MD5 文件索引（用于上传去重）—— S1-10：改后台线程，不阻塞启动
+    _build_md5_index_in_background()
 
     conn = get_db()
     user_conn = get_user_db()
@@ -1738,6 +2331,28 @@ def init_db():
         print("  已添加 users.bound_openid 列")
     except sqlite3.OperationalError:
         pass
+
+    # S1-03：客户自选保留期（0 = 用全局默认；>0 = created_at + N 小时到期）
+    try:
+        conn.execute("ALTER TABLE files ADD COLUMN retention_hours INTEGER DEFAULT 0")
+        conn.commit()
+        print("  已添加 files.retention_hours 列（S1-03 客户自选保留期）")
+    except sqlite3.OperationalError:
+        pass
+
+    # S1-06：会话版本号 —— "退出全部设备"递增它，旧 token 立即失效（jti/ver 吊销的锚点）。
+    # ⚠ 刻意**不**放 users 表：guest 设备账号（device_login 的 dev_ 前缀）在 users 表里
+    # 根本没有行（惰性注册，见 device_login 的注释），改 users 列会 UPDATE 0 行 ⇒ 版本
+    # 永远停在 0、"退出全部设备"对它们静默失效。独立表对"有行/无行"两种账号一视同仁。
+    user_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS token_versions (
+            openid     TEXT PRIMARY KEY,
+            version    INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT    NOT NULL DEFAULT ''
+        )
+        """)
+    user_conn.commit()
 
     # 个人认证密钥表：微信账号生成 → APP 设备兑换，完成身份绑定。
     # 与 license_keys 语义分离（授权 vs 身份），已使用的记录作为绑定历史永久保留。
@@ -2093,6 +2708,12 @@ def init_db():
     conn.close()
 
 
+    # S1-03：启动时也做一次保留期清理（与 10 分钟定时任务双触发）。
+    # ⚠ 必须放在**所有迁移之后**：放在 init_db 开头时后台线程会抢在
+    #   `ALTER TABLE files ADD COLUMN retention_hours` 之前跑，直接报
+    #   'no such column: retention_hours'（2026-10-23 首次部署实测撞到）。
+    _cleanup_once_on_startup()
+
 # ==================== 订单号生成 ====================
 
 @app.route("/api/next_order_number", methods=["GET"])
@@ -2102,7 +2723,7 @@ def next_order_number():
     防止订单号被浪费。若后续未调用 /api/local_orders 提交，
     超时后由定时任务自动标记为 abandoned。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     order_number = generate_order_number()
 
@@ -2698,7 +3319,16 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
         client_info = printer_clients.get(client_id)
         sid = client_info["sid"] if client_info else None
 
-    download_url = make_download_url(file_id)
+    # S1-06：把 openid + task_id 绑进下载 URL（泄露也只能下这一单的这一个文件）
+    _bind_openid = ""
+    if order_id:
+        _c = get_db()
+        try:
+            _r = _c.execute("SELECT openid FROM orders WHERE id = ?", (order_id,)).fetchone()
+            _bind_openid = (_r["openid"] or "") if _r else ""
+        finally:
+            _c.close()
+    download_url = make_download_url(file_id, openid=_bind_openid, task_id=sub_task_id)
 
     # 查询订单号
     order_number = ""
@@ -3039,13 +3669,14 @@ def recover_stale_downloading():
 # ==================== SocketIO 事件 ====================
 
 
-@socketio.on("connect")
+@sio_event("connect")
 def on_connect(auth=None):
     """打印机客户端连接 -- 验证 URL 查询参数中的 token"""
     token = _get_printer_token()
     if not token and auth and isinstance(auth, dict):
         token = auth.get("token", "")
-    if not _printer_token_ok(token):
+    _auth = _authenticate_printer(token)
+    if not _auth:
         print(f"[WARN] 打印机客户端认证失败: token 无效")
         emit("auth_fail", {"message": "token 无效"})
         disconnect()
@@ -3056,6 +3687,12 @@ def on_connect(auth=None):
     if not client_id or len(client_id) > 64:
         print(f"[WARN] 打印机客户端连接: client_id 非法，拒绝")
         emit("auth_fail", {"message": "client_id 无效"})
+        disconnect()
+        return False
+    # S1-01：per-device token 只能以自己的 client_id 连接（防止拿到 A 的 token 冒充 B）
+    if _auth.get("client_id") and _auth["client_id"] != client_id:
+        print(f"[WARN] 打印机客户端连接: token 属于 {_auth['client_id']}，却以 {client_id} 连接，拒绝")
+        emit("auth_fail", {"message": "token 与 client_id 不匹配"})
         disconnect()
         return False
 
@@ -3075,6 +3712,7 @@ def on_connect(auth=None):
             "connected_at": datetime.now(),
         }
     join_room(client_id)
+    _sid_to_client[request.sid] = client_id   # S1-07：on_ping 的 O(1) 映射
     print(f"[LINK] 打印机客户端已连接: {client_id}")
 
     # 上线即同步接单状态（本机是否接管 / 当前接管者是谁），供设备端 UI 与自动续接单判断
@@ -3117,7 +3755,7 @@ def on_connect(auth=None):
         print(f"  [CACHE] 同步保留策略失败: {e}")
 
 
-@socketio.on("disconnect")
+@sio_event("disconnect")
 def on_disconnect(reason=None):
     """打印机客户端断开 — 立即回滚其名下所有 printing 任务为 queued
 
@@ -3130,6 +3768,7 @@ def on_disconnect(reason=None):
     """
     client_id = request.args.get("client_id")
     sid = request.sid
+    _sid_to_client.pop(sid, None)   # S1-07：清掉 on_ping 的 sid→client 映射
 
     # 先判定本连接是否已被同 client_id 的新连接取代
     replaced = False
@@ -3231,14 +3870,19 @@ def on_disconnect(reason=None):
     print(f"[LINK] 打印机客户端已断开: {client_id or request.sid}")
 
 
-@socketio.on("ping")
+@sio_event("ping")
 def on_ping():
-    """心跳 -- 更新最后心跳时间"""
-    with printer_clients_lock:
-        for cid, info in printer_clients.items():
-            if info["sid"] == request.sid:
+    """心跳 -- 更新最后心跳时间。
+
+    S1-07：改成 O(1)（原实现每次 ping 都遍历全部 printer_clients；设备数一多、
+    ping 一密就是 O(n²) 的 CPU 放大面）。映射在 connect 建立、disconnect 删除。
+    """
+    cid = _sid_to_client.get(request.sid)
+    if cid:
+        with printer_clients_lock:
+            info = printer_clients.get(cid)
+            if info and info.get("sid") == request.sid:
                 info["heartbeat"] = datetime.now()
-                break
     emit("pong")
 
 
@@ -3316,7 +3960,7 @@ def _get_event_client_id():
     return _find_client_id_by_sid(request.sid)
 
 
-@socketio.on("print_success")
+@sio_event("print_success")
 def on_print_success(data):
     """打印成功 -- 更新子任务状态为 sent，并聚合父订单状态"""
     task_id = data.get("task_id")
@@ -3411,7 +4055,7 @@ def on_print_success(data):
     print(f"  [OK] 子任务 #{task_id}: 客户端确认打印成功")
 
 
-@socketio.on("print_fail")
+@sio_event("print_fail")
 def on_print_fail(data):
     """打印失败 -- 更新子任务状态为 failed，并聚合父订单状态"""
     task_id = data.get("task_id")
@@ -3500,7 +4144,7 @@ def _all_subtasks_ready(conn, order_id):
     return all(r["status"] in ("waiting", "sent", "accepted", "offline_unknown") for r in rows)
 
 
-@socketio.on("file_ready")
+@sio_event("file_ready")
 def on_file_ready(data):
     """预约单阶段①文件下载完成：downloading → waiting。
     若该订单之前被冻结（到点文件未就绪），且本任务补齐后全部就绪 → 解除冻结，
@@ -3572,7 +4216,7 @@ def on_file_ready(data):
     print(f"  [READY] 预约单文件就绪: {task_ids}")
 
 
-@socketio.on("download_delayed")
+@sio_event("download_delayed")
 def on_download_delayed(data):
     """预约单到点文件未就绪 → 冻结订单（暂停倒计时）。
     本地文件补齐后会重新发 file_ready，届时解除冻结并重设目标。"""
@@ -3641,7 +4285,7 @@ def on_download_delayed(data):
     emit("download_delayed_ack", {"order_id": order_id, "frozen": 1})
 
 
-@socketio.on("start_printing")
+@sio_event("start_printing")
 def on_start_printing(data):
     """本地工具开始打印：记录订单实际开始打印的时刻（print_started_at，幂等写入），
     并驱动预约单 waiting/downloading → printing，登记 pushed_tasks
@@ -3712,7 +4356,7 @@ def on_start_printing(data):
     print(f"  [START] 本地工具开始打印: {task_ids}")
 
 
-@socketio.on("stack_state")
+@sio_event("stack_state")
 def on_stack_state(data):
     """设备端上报「🖐 攒批模式」状态（2026-10）：连接成功后 + 每次状态/忙闲变化时发一次。
 
@@ -3741,7 +4385,7 @@ def on_stack_state(data):
     print(f"  [STACK] {client_id} 攒批模式={show} 忙={busy}" + (f"（{note}）" if note else ""))
 
 
-@socketio.on("print_keepalive")
+@sio_event("print_keepalive")
 def on_print_keepalive(data):
     """打印中保活：刷新仍在打印中的子任务的 locked_at，避免被超时机制误判。
 
@@ -3807,7 +4451,7 @@ def on_print_keepalive(data):
         pass
 
 
-@socketio.on("page_count_result")
+@sio_event("page_count_result")
 def on_page_count_result(data):
     """本地打印工具回报文件页数分析结果。
     data: {file_id, page_count, orientation, success}"""
@@ -4132,7 +4776,7 @@ def _validate_page_ranges_for_file(file_id: str, page_count: int):
     conn.close()
 
 
-@socketio.on("page_range_truncated")
+@sio_event("page_range_truncated")
 def on_page_range_truncated(data):
     """本地打印工具回报：某任务的页码范围被截断。
     data: {task_id, original_range, effective_range, total_pages}"""
@@ -4183,12 +4827,18 @@ def on_page_range_truncated(data):
 
 # ── 在线设备日志收集（日志管理页发起：后端下发 request_log → 各在线设备回报本机日志）──
 _collect_logs_lock = threading.Lock()
+# S1-07：用 Condition 替代 `time.sleep(0.2)` 轮询 —— 设备回报即唤醒，最坏只等
+# `COLLECT_MAX_WAIT` 秒（原实现可占线程 20 秒，是 R1 的直接放大器）。
+_collect_cond = threading.Condition(_collect_logs_lock)
+# 全局只允许一次收集在飞（第二次直接 503，不排队、不占线程）
+_collect_sem = threading.Semaphore(1)
+COLLECT_MAX_WAIT = 3.0
 _collect_logs: dict = {}      # client_id → 设备回报的日志内容
 _collect_request_id = 0       # 区分多次收集请求，防旧回报串台
 _COLLECT_LOG_MAX_BYTES = 200 * 1024  # 每台设备最多回报 200KB 尾部日志
 
 
-@socketio.on("logs")
+@sio_event("logs")
 def on_device_logs(data):
     """在线设备回报日志（配合 /api/log/collect_all 下发的 request_log 事件）。"""
     client_id = _find_client_id_by_sid(request.sid)
@@ -4202,6 +4852,10 @@ def on_device_logs(data):
             return
         content = str(data.get("content", "") or "")
         _collect_logs[client_id] = content[:_COLLECT_LOG_MAX_BYTES]
+        try:
+            _collect_cond.notify_all()   # S1-07：唤醒等待中的收集请求（持锁调用）
+        except RuntimeError:
+            pass
 
 
 # ==================== 页面分析请求（推送到本地打印工具）====================
@@ -4373,7 +5027,10 @@ def login_required(f):
             return jsonify({"success": False, "message": "未登录，请先授权"}), 401
         token = auth[7:]  # "Bearer " 之后的内容
         try:
-            g.openid = token_serializer.loads(token, max_age=TOKEN_MAX_AGE)
+            g.openid = _load_login_token(token)
+        except TokenRevoked:
+            # S1-06：ver 对不上 = 该账号已"退出全部设备"
+            return jsonify({"success": False, "message": "登录已失效，请重新登录"}), 401
         except SignatureExpired:
             return jsonify({"success": False, "message": "登录已过期，请重新登录"}), 401
         except BadSignature:
@@ -4393,7 +5050,9 @@ def require_printer_access(f):
             return jsonify({"success": False, "message": "未登录，请先授权"}), 401
         token = auth[7:]
         try:
-            g.openid = token_serializer.loads(token, max_age=TOKEN_MAX_AGE)
+            g.openid = _load_login_token(token)
+        except TokenRevoked:
+            return jsonify({"success": False, "message": "登录已失效，请重新登录"}), 401
         except SignatureExpired:
             return jsonify({"success": False, "message": "登录已过期，请重新登录"}), 401
         except BadSignature:
@@ -4493,6 +5152,7 @@ def get_pricing():
 
 
 @app.route("/api/pricing", methods=["POST"])
+@require_printer_scope("admin")
 def save_pricing():
     """更新打印定价配置（pricing.json，需 printer token 认证）。
     价格权威源：小程序/APP 计费显示、后端订单计价（calculate_price / submit_order）、
@@ -4500,7 +5160,7 @@ def save_pricing():
     body: { "pricing": { ...完整 pricing.json 结构... } }（兼容直接传 pricing 对象）
     """
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     payload = data.get("pricing", data)
@@ -4576,8 +5236,16 @@ def get_file_page(file_id):
     """查询文件的页数信息（供前端轮询本地工具分析结果）。
     返回 page_count 和 page_count_verified 标志。
 
+    S1-08：每用户限速。客户端每 5s 轮询一个文件（12 次/分），6 个待验证文件 ≈72 次/分，
+    故阈值取 300/分（正常用量的 4 倍），只拦"一个 token 刷爆轮询"的情形。
+
     惰性触发：打印机在线但文件页数仍未知（上传时离线、补推遗漏）→ 主动补推分析请求
     （去重由 request_page_analysis 内部统一 30s 防抖，与 on_connect 补推共享）。"""
+    # S1-08：先校验参数（file_id 规范长度）再进限速 key
+    if not isinstance(file_id, str) or not (0 < len(file_id) <= 64):
+        return jsonify({"success": False, "message": "文件不存在"}), 404
+    if not _rate_limit_ok(f"file_page:{g.openid}", 300, 60):
+        return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
     conn = get_db()
     row = conn.execute(
         "SELECT page_count, page_count_verified, original_name, path FROM files WHERE id = ?", (file_id,)
@@ -4641,6 +5309,9 @@ def cancel_page_analysis():
     file_ids = (data or {}).get("file_ids", [])
     if not isinstance(file_ids, list) or not file_ids:
         return jsonify({"success": False, "message": "缺少 file_ids"}), 400
+    # S1-08：每用户限速（取消分析是"删除文件/关页面"时的动作，30/分 足够）
+    if not _rate_limit_ok(f"cancel_analysis:{g.openid}", 30, 60):
+        return jsonify({"success": False, "message": "操作过于频繁，请稍后再试"}), 429
     # S0-04：上限 50 条、每条 ≤64 字符。原实现 1 MB JSON 塞 5 万个 id ⇒ 5 万次 emit
     # 全在锁内同步完成（CPU/带宽放大面）。
     if len(file_ids) > 50:
@@ -4684,6 +5355,75 @@ _WX_LOGIN_SEM = threading.BoundedSemaphore(4)
 _wx_http = requests.Session()
 _wx_http.mount("https://", requests.adapters.HTTPAdapter(
     pool_connections=4, pool_maxsize=8, max_retries=0))
+
+
+@app.route("/api/retention_config", methods=["GET"])
+def retention_config():
+    """保留期口径（S1-03）：移动端提交页的选择器上限来自这里，不在客户端硬编码。"""
+    data = dict(get_retention_limits())
+    data["success"] = True
+    return jsonify(data)
+
+
+@app.route("/api/file/<file_id>", methods=["DELETE"])
+@login_required
+def delete_my_file(file_id):
+    """删除我的文件（S1-03 / D-7）。
+
+    规则：
+      · **只有属主**能删（openid 必须一致）；
+      · 被**活跃订单**引用时拒绝（409）—— 不能删掉正在排队/打印的文件，
+        否则设备下载 404、顾客的单永久卡住；
+      · 删除物理文件 + 清 files 行 + 从 MD5 索引移除（清引用，避免"删了还能被复用"）。
+    """
+    if not isinstance(file_id, str) or not (0 < len(file_id) <= 64):
+        return jsonify({"success": False, "message": "文件不存在"}), 404
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, path, original_name, openid FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
+        if not row:
+            return jsonify({"success": False, "message": "文件不存在"}), 404
+        if (row["openid"] or "") != g.openid:
+            return jsonify({"success": False, "message": "无权删除该文件"}), 403
+        active_statuses = ('queued', 'printing', 'accepted', 'reserved',
+                           'scheduled', 'waiting', 'downloading')
+        placeholders = ",".join("?" for _ in active_statuses)
+        busy = conn.execute(
+            f"SELECT 1 FROM order_files WHERE file_id = ? AND status IN ({placeholders}) LIMIT 1",
+            (file_id, *active_statuses)).fetchone()
+        if busy:
+            return jsonify({"success": False,
+                            "message": "该文件正在被订单使用（排队/打印中），暂不能删除"}), 409
+        path = row["path"] or ""
+        # 先删盘（失败只记日志：记录仍按"已删除"处理，避免留下永远删不掉的幽灵行）
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as e:
+                print(f"  [DEL] 删除文件失败 {path}: {e}")
+        conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 从 MD5 索引里摘掉（同一物理文件可能被多行引用：只摘"指向该路径"的条目）
+    try:
+        if path:
+            rel = os.path.relpath(path, UPLOAD_DIR)
+            index = load_md5_index()
+            dead = [k for k, v in index.items()
+                    if (isinstance(v, str) and v == rel)
+                    or (isinstance(v, dict) and v.get("path") == rel)]
+            for k in dead:
+                index.pop(k, None)
+            if dead:
+                save_md5_index(index)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [DEL] 清理 MD5 索引失败: {type(e).__name__}")
+    print(f"  [DEL] 用户 {g.openid[:8]}... 删除了文件 {file_id[:8]}...")
+    return jsonify({"success": True, "file_id": file_id, "message": "已删除"})
 
 
 @app.route("/api/login", methods=["POST"])
@@ -4745,7 +5485,7 @@ def wx_login():
 
     openid = wx_data["openid"]
     # session_key 不返回给前端 ---- 服务端解密用户数据时使用
-    token = token_serializer.dumps(openid)
+    token = _issue_login_token(openid)
 
     # 首次登录：创建用户记录并分配默认昵称
     conn = get_user_db()
@@ -4814,6 +5554,13 @@ def device_login():
         resp.headers["Retry-After"] = "600"
         return resp, 429
 
+    # ===== S1-06：设备密钥校验（不再只凭自报 device_id 换 token）=====
+    _secret_ok, _secret_msg, _issued_secret = _check_device_secret(
+        device_id, data.get("device_secret"))
+    if not _secret_ok:
+        print(f"  [AUTH] 设备登录被拒（device_secret 校验失败）: {device_id[:12]}...")
+        return jsonify({"success": False, "message": _secret_msg}), 403
+
     # 用 device_id 生成稳定的设备 openid
     dev_openid = "dev_" + hashlib.sha256(device_id.encode()).hexdigest()[:24]
 
@@ -4833,18 +5580,22 @@ def device_login():
         bound_openid = ""
         token_openid = dev_openid
 
-    token = token_serializer.dumps(token_openid)
+    token = _issue_login_token(token_openid)
     conn.close()
 
     print(f"设备登录: device_id={device_id[:12]}..., openid={token_openid[:8]}..., bound={bool(bound_openid)}, registered={registered}")
 
-    return jsonify({
+    _resp = {
         "success": True,
         "token": token,
         "openid": token_openid,
         "bound": bool(bound_openid),
         "registered": registered,
-    })
+    }
+    if _issued_secret:
+        # 只在"首次注册 / 宽限期轮换"时下发一次；客户端应存到本地并在后续登录时回传
+        _resp["device_secret"] = _issued_secret
+    return jsonify(_resp)
 
 
 # ==================== 微信账号绑定（个人认证密钥） ====================
@@ -5024,7 +5775,7 @@ def bind_key_redeem():
         orders_conn.close()
 
     # 返回微信账号 token，APP 切换身份
-    token = token_serializer.dumps(wx_openid)
+    token = _issue_login_token(wx_openid)
     profile_conn = get_user_db()
     prow = profile_conn.execute(
         "SELECT nickname FROM users WHERE openid = ?", (wx_openid,)
@@ -5171,7 +5922,7 @@ def bind_revoke():
     conn.commit()
     conn.close()
 
-    dev_token = token_serializer.dumps(dev_openid)
+    dev_token = _issue_login_token(dev_openid)
     print(f"微信账号 {wx_openid[:8]}... 已解绑设备 {dev_openid[:10]}...")
     return jsonify({
         "success": True,
@@ -5210,6 +5961,9 @@ def upload_file():
         return jsonify({"success": False, "message": "文件名为空"}), 400
 
     file_id = uuid.uuid4().hex
+    # S1-03（D-6）：客户自选的保留期（表单字段 retention_hours），服务端夹到 1..168。
+    # 缺省/非法 = 0 = 用全局默认（与旧客户端完全兼容）。
+    _retention_hours = _clamp_retention_hours(request.form.get("retention_hours"))
     ext = os.path.splitext(f.filename)[1]  # 保留原始大小写
     ext_lower = ext.lower().lstrip(".")
     # P2-9：扩展名白名单正则校验（1-8 位字母数字），非法 → 400（原实现会把非法扩展名
@@ -5342,12 +6096,12 @@ def upload_file():
     conn = get_db()
     conn.execute(
         """
-        INSERT INTO files (id, original_name, saved_name, path, size, created_at, page_count, page_count_verified, md5, openid)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO files (id, original_name, saved_name, path, size, created_at, page_count, page_count_verified, md5, openid, retention_hours)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (file_id, f.filename, saved_name, file_path, file_size,
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), page_count,
-         int(cached_page_verified), file_md5, g.openid),
+         int(cached_page_verified), file_md5, g.openid, _retention_hours),
     )
     conn.commit()
     conn.close()
@@ -5847,7 +6601,7 @@ def pull_queued_orders():
     """打印机客户端拉取排队中的子任务（原子取锁，每次返回一个任务，防止多打印机重复领取）
     2026-11：仅「启用接单」的设备可领取；未启用/无接管者时一律返回空，杜绝多设备同时接收。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     client_id = request.args.get("client_id", "") or socket.gethostname()
@@ -5915,7 +6669,9 @@ def pull_queued_orders():
         "source": task.get("source", "") or "wechat",
     }
     if task["file_id"]:
-        item["download_url"] = make_download_url(task["file_id"])
+        # S1-06：绑定 openid + 子任务 id
+        item["download_url"] = make_download_url(
+            task["file_id"], openid=(task.get("openid") or ""), task_id=task.get("id"))
 
     return jsonify({
         "success": True,
@@ -5938,7 +6694,7 @@ def printer_claim():
     2026-12 重构：不再是「唯一接管者」独占，勾选接单的设备都会进入可接单设备列表，
     移动端提交订单时选择目标设备；任务只会发往目标设备（未指定目标时取任一在线接单设备）。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
@@ -5969,7 +6725,7 @@ def printer_claim():
 def printer_release():
     """关闭接单（从可接单设备集合移除本机）。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
@@ -5986,12 +6742,54 @@ def printer_release():
     return jsonify({"success": True, "message": "当前设备未启用接单"})
 
 
+@app.route("/api/printer/token/create", methods=["POST"])
+@require_printer_scope("admin")
+def printer_token_create():
+    """为设备签发/轮换 printer token（S1-01）。
+
+    body: {"client_id": "...", "label": "门店机", "scopes": ["print","admin"]}
+    response: {"success": true, "token": "<明文，只此一次>", "scopes": [...]}
+
+    引导：新设备还没有自己的 token 时，用全局 TOKEN（迁移窗口，具备 admin scope）调一次；
+    拿到本机 token 后应立刻写进 print_config.json 并改用它。
+    """
+    data = _json_dict() or {}
+    client_id = (data.get("client_id") or "").strip()
+    if not client_id or len(client_id) > 64:
+        return jsonify({"success": False, "message": "client_id 无效"}), 400
+    label = (data.get("label") or "").strip()
+    scopes = data.get("scopes")
+    if scopes is not None and not isinstance(scopes, list):
+        return jsonify({"success": False, "message": "scopes 必须是数组"}), 400
+    token, scopes = issue_device_token(client_id, label=label, scopes=scopes)
+    return jsonify({
+        "success": True,
+        "client_id": client_id,
+        "token": token,
+        "scopes": scopes,
+        "message": "请立刻保存：明文只返回这一次",
+    })
+
+
+@app.route("/api/printer/token/revoke", methods=["POST"])
+@require_printer_scope("admin")
+def printer_token_revoke():
+    """吊销某台设备的 token（S1-01）。吊销后该设备的请求立即 403（全局 TOKEN 仍有效）。"""
+    data = _json_dict() or {}
+    client_id = (data.get("client_id") or "").strip()
+    if not client_id:
+        return jsonify({"success": False, "message": "缺少 client_id"}), 400
+    if not revoke_device_token(client_id):
+        return jsonify({"success": False, "message": "该设备没有已签发的 token"}), 404
+    return jsonify({"success": True, "client_id": client_id, "message": "已吊销"})
+
+
 @app.route("/api/printer/devices", methods=["GET"])
 def printer_devices():
     """返回连接过云服务器的全部设备：计算机名称、在线状态、所有者、是否接单、自动双面能力。
     供收支清算「授权」页展示（打印机 token 鉴权，本地打印工具经 stats_server 代理调用）。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     online_set = set(get_active_clients())
@@ -6122,7 +6920,7 @@ def printer_capability():
         完成由设备端自己负责（本地工具仍会在无人值守遇双面时挂起等人翻纸）。
     """
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     data = request.get_json(silent=True) or {}
@@ -6204,7 +7002,7 @@ def claiming_devices():
 def printer_bind_owner():
     """绑定设备所有者（计算机名 → 收支成员姓名）。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
@@ -6238,11 +7036,12 @@ def printer_bind_owner():
 
 
 @app.route("/api/printer/devices/delete", methods=["POST"])
+@require_printer_scope("admin")
 def printer_devices_delete():
     """删除设备注册表中的一台设备（清理历史遗留 / 重复 client_id，如软件升级后产生的新 ID）。
     若删除的是当前「接单」设备则同时清空接管记录；在线设备下次连接会自动重新登记。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
@@ -6275,6 +7074,7 @@ def printer_devices_delete():
 
 
 @app.route("/api/printer/devices/cleanup", methods=["POST"])
+@require_printer_scope("admin")
 def printer_devices_cleanup():
     """批量清理测试设备 / 长期离线的无主设备（printer token 鉴权）。
 
@@ -6287,7 +7087,7 @@ def printer_devices_cleanup():
     所以一律跳过并回报。删除同时清掉这些 id 的接单记录 —— 否则僵尸「接单中」会一直挂在
     授权页，且 get_active_printer_client() 可能挑到一台永远不会干活的机器。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     data = request.get_json(silent=True) or {}
@@ -6367,6 +7167,10 @@ def get_orders():
     超级管理员可通过 ?view=all 查看全部订单，或 ?openid=xxx 查看指定用户。
     支持分页: ?page=1&per_page=20
     """
+    # S1-08：每用户限速（结算页/订单列表会轮询；120/分 是正常用量的数倍，
+    # 只拦"一个 token 把 /api/orders 当扫描器用"）。
+    if not _rate_limit_ok(f"orders:{g.openid}", 120, 60):
+        return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 20, type=int)
     page = max(1, page)
@@ -6881,7 +7685,7 @@ def accept_order():
     已取消订单在窗口期被"添加"会把 canceled 污染成 accepted，且本地会打印已取消订单。
     改为 db_lock 原子校验 + 仅当确有子任务被接受时才更新父订单。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     order_id = data.get("order_id", "") or request.args.get("order_id", "")
@@ -6928,7 +7732,7 @@ def reject_order():
     P2-9：已取消订单不允许打回（409），避免 canceled 被覆盖成 rejected；
     且仅当确有子任务被打回时才更新父订单（防空转污染）。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     data = request.get_json(silent=True) or {}
@@ -6976,7 +7780,7 @@ def reject_order():
 def get_finance_config():
     """读取收支清算云端配置（需 printer token 认证）。data 为 null 表示尚未保存。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     conn = get_db()
     try:
@@ -6995,7 +7799,7 @@ def get_finance_config():
 def save_finance_config():
     """保存收支清算云端配置（需 printer token 认证）。body: {"data": {...完整配置}}"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     payload = data.get("data", None)
@@ -7025,7 +7829,7 @@ def save_finance_config():
 def abandon_order():
     """打印机放弃已接受的订单（需 token 认证）。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     order_id = data.get("order_id", "") or request.args.get("order_id", "")
@@ -7058,7 +7862,7 @@ def abandon_reserved_order():
     直接关闭窗口或删除标签页时调用，将 reserved 标记为 abandoned，
     同时补记价格（本地工具在获取订单号时已知文件/份数/双面配置）。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     order_number = data.get("order_number", "") or request.args.get("order_number", "")
@@ -7130,7 +7934,7 @@ def local_orders():
     status='sent' 覆盖（或断线重连按本地是否已打印选择状态）。两次上报都会删旧插新
     覆盖文件明细与备注，保证后端信息与本地一致。"""
     token = _get_printer_token() or (request.get_json(silent=True) or {}).get("token", "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     data = request.get_json(silent=True) or {}
@@ -7297,7 +8101,7 @@ def local_order_status():
     if not isinstance(data, dict):
         data = {}
     token = _get_printer_token() or str(data.get("token") or "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     order_number = data.get("order_number")
@@ -7364,6 +8168,19 @@ def local_order_status():
 
 
 # ==================== 用户身份接口 ====================
+
+
+@app.route("/api/logout_all", methods=["POST"])
+@login_required
+def logout_all_devices():
+    """退出全部设备（S1-06）：递增 token_version ⇒ 该账号所有已签发的 token 立即失效。
+
+    这是"会话可吊销"的唯一入口：不需要记住 jti 清单，也不需要服务端会话表 ——
+    token 里带 ver，与 users.token_version 不一致即视为已吊销。
+    """
+    ver = _bump_token_version(g.openid)
+    print(f"[AUTH] 用户 {g.openid[:8]}... 退出全部设备（token_version → {ver}）")
+    return jsonify({"success": True, "token_version": ver, "message": "已退出全部设备"})
 
 
 @app.route("/api/me", methods=["GET"])
@@ -7787,6 +8604,9 @@ def admin_user_detail():
 @login_required
 def get_profile():
     """获取当前用户的头像和昵称"""
+    # S1-08：每用户限速（APP 启动/切页会拉，60/分 足够）
+    if not _rate_limit_ok(f"profile_get:{g.openid}", 60, 60):
+        return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
     conn = get_user_db()
     row = conn.execute(
         "SELECT nickname, avatar_path FROM users WHERE openid = ?",
@@ -7818,6 +8638,9 @@ def update_profile():
     # 头像本身上限 2 MB；原实现要先解析完 multipart（可能落临时文件）才检查大小。
     if (request.content_length or 0) > 3 * 1024 * 1024:
         return jsonify({"success": False, "message": "请求体过大"}), 413
+    # S1-08：每用户限速（改昵称/头像 30/分 足够；也挡住"反复写库"的放大面）
+    if not _rate_limit_ok(f"profile_post:{g.openid}", 30, 60):
+        return jsonify({"success": False, "message": "操作过于频繁，请稍后再试"}), 429
     nickname = ""
     avatar_file = None
 
@@ -8806,6 +9629,7 @@ def _notify_order_no_longer_printable(order_id, status, task_ids, owner_clients,
 
 
 @app.route("/api/admin/order_status", methods=["POST"])
+@require_printer_scope("admin")
 def admin_order_status():
     """收支清算页人工订正订单状态（需 printer token 认证）。
 
@@ -8844,7 +9668,7 @@ def admin_order_status():
     if not isinstance(data, dict):
         data = {}
     token = _get_printer_token() or str(data.get("token") or "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     raw_id = data.get("order_id")
@@ -8934,6 +9758,7 @@ MANUAL_FIX_ORDER_TYPES = ("receive", "self")
 
 
 @app.route("/api/admin/order_type", methods=["POST"])
+@require_printer_scope("admin")
 def admin_order_type():
     """收支清算页人工订正订单类型（接单 / 自打；需 printer token）。
 
@@ -8947,7 +9772,7 @@ def admin_order_type():
     if not isinstance(data, dict):
         data = {}
     token = _get_printer_token() or str(data.get("token") or "")
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     raw_id = data.get("order_id")
@@ -8998,6 +9823,7 @@ def admin_order_type():
 
 
 @app.route("/api/admin/statistics/revenue", methods=["GET"])
+@require_printer_scope("admin")
 def admin_statistics_revenue():
     """管理员收益统计接口（printer token 鉴权）。
     查询指定日期区间内的所有订单收益，按来源/用户/月份分组。
@@ -9010,7 +9836,7 @@ def admin_statistics_revenue():
               订单/文件/页数等运营量仍计入。
     """
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     start_date = request.args.get("start_date", "").strip()
@@ -9267,6 +10093,7 @@ def admin_statistics_revenue():
 
 
 @app.route("/api/admin/statistics/owners", methods=["GET"])
+@require_printer_scope("admin")
 def admin_statistics_owners():
     """管理员订单归属统计（printer token 鉴权）。
     按订单归属管理员（orders.owner_name）分组，拆分"管理员自己的订单"（is_admin_print=1）
@@ -9275,7 +10102,7 @@ def admin_statistics_owners():
     参数: start_date / end_date / status（同 revenue 接口）
     """
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     start_date = request.args.get("start_date", "").strip()
@@ -9359,12 +10186,13 @@ def admin_statistics_owners():
 
 
 @app.route("/api/admin/statistics/months", methods=["GET"])
+@require_printer_scope("admin")
 def admin_statistics_months():
     """按月份统计订单/文件数与收益（printer token 鉴权），供收支清算云端模块自动列出月份。
     收益口径沿用 revenue 接口：of.status='sent' 的 total_price 合计。
     """
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
 
     conn = get_db()
@@ -9527,13 +10355,13 @@ def log_report():
     message 长度限制 4KB（超长截断）、frontend.log 超 50MB 自动轮转。"""
     # 鉴权：打印机 token（X-Printer-Token / ?token=）或登录态（Bearer token）二选一
     authorized = False
-    if _printer_token_ok(_get_printer_token()):
+    if _authenticate_printer(_get_printer_token()):
         authorized = True
     else:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             try:
-                token_serializer.loads(auth[7:], max_age=TOKEN_MAX_AGE)
+                _load_login_token(auth[7:])
                 authorized = True
             except Exception:
                 authorized = False
@@ -9562,11 +10390,12 @@ def log_report():
 
 
 @app.route("/api/log/fetch", methods=["GET"])
+@require_printer_scope("admin")
 def log_fetch():
     """本地打印工具拉取后端/前端日志（需 token 认证）。
     P2-14：支持 ?tail=N 只返回末尾 N 行（默认 500，0 = 不返回内容，仅取大小）。"""
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
     log_type = request.args.get("type", "server")
     if log_type not in ("server", "frontend"):
@@ -9589,6 +10418,7 @@ def log_fetch():
 
 
 @app.route("/api/log/collect_all", methods=["POST"])
+@require_printer_scope("admin")
 def log_collect_all():
     """收集所有在线打印设备的日志（本地打印工具「日志管理」页发起，需打印机 token）。
 
@@ -9599,45 +10429,54 @@ def log_collect_all():
     """
     global _collect_request_id
     token = _get_printer_token()
-    if not _printer_token_ok(token):
+    if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
-    data = request.get_json(silent=True) or {}
+    data = _json_dict() or {}
     try:
         timeout = max(2, min(20, int(data.get("timeout", 8) or 8)))
     except (ValueError, TypeError):
         timeout = 8
+    # S1-07：单次收集最长等 3 秒（原实现最多占线程 20 秒）
+    timeout = min(float(timeout), COLLECT_MAX_WAIT)
 
     active = get_active_clients()
     if not active:
         return jsonify({"success": True, "logs": []})
 
-    with _collect_logs_lock:
-        _collect_request_id += 1
-        request_id = _collect_request_id
-        _collect_logs.clear()
+    # S1-07：全局只允许一次收集在飞；第二次立即 503（快速失败，不排队）
+    if not _collect_sem.acquire(blocking=False):
+        return jsonify({"success": False,
+                        "message": "上一次日志收集尚未结束，请稍后重试"}), 503
+    try:
+        with _collect_cond:
+            _collect_request_id += 1
+            request_id = _collect_request_id
+            _collect_logs.clear()
 
-    # 向所有在线打印机客户端下发收集指令
-    for cid in active:
-        with printer_clients_lock:
-            info = printer_clients.get(cid)
-            sid = info["sid"] if info else None
-        if sid:
-            try:
-                socketio.emit("request_log", {"request_id": request_id, "max_bytes": _COLLECT_LOG_MAX_BYTES}, to=sid)
-            except Exception as e:
-                print(f"  [LOG] 下发 request_log 到 {cid} 失败: {e}")
+        # 向所有在线打印机客户端下发收集指令
+        for cid in active:
+            with printer_clients_lock:
+                info = printer_clients.get(cid)
+                sid = info["sid"] if info else None
+            if sid:
+                try:
+                    socketio.emit("request_log",
+                                  {"request_id": request_id,
+                                   "max_bytes": _COLLECT_LOG_MAX_BYTES}, to=sid)
+                except Exception as e:
+                    print(f"  [LOG] 下发 request_log 到 {cid} 失败: {e}")
 
-    # 等待各设备回报（轮询；eventlet 下 sleep 让出协程，socketio 事件可并发处理）
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        with _collect_logs_lock:
-            received = set(_collect_logs.keys())
-        if received >= set(active):
-            break
-        time.sleep(0.2)
-
-    with _collect_logs_lock:
-        collected = dict(_collect_logs)
+        # 等待各设备回报：Condition 唤醒（不再 sleep 轮询），最多 timeout 秒
+        deadline = time.time() + timeout
+        with _collect_cond:
+            while len(_collect_logs) < len(active):
+                remain = deadline - time.time()
+                if remain <= 0:
+                    break
+                _collect_cond.wait(remain)
+            collected = dict(_collect_logs)
+    finally:
+        _collect_sem.release()
 
     devices = load_devices()
     logs = []

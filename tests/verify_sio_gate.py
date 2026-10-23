@@ -52,8 +52,9 @@ H.chk("只拦无 sid 的握手", 'if "sid" not in params:' in code and
       'params = (dict(urllib.parse.parse_qsl' in code)
 H.chk("超长 query 有上限（不把 parse_qsl 变成 CPU 放大面）",
       "_SIO_GATE_MAX_QUERY" in code and "len(qs) <= _SIO_GATE_MAX_QUERY" in code)
-H.chk("token 判定走统一助手 _printer_token_ok（而不是内联比较）",
-      "_printer_token_ok(tok)" in code[i_gate_def:i_gate_def + 2500])
+# S1-01（2026-10-23）：握手门改走统一认证入口（per-device token 优先、全局 TOKEN 兜底）
+H.chk("token 判定走统一认证入口 _authenticate_printer（而不是内联比较）",
+      "_authenticate_printer(tok)" in code[i_gate_def:i_gate_def + 2500])
 H.chk("同时接受 X-Printer-Token 头与 ?token= query",
       'environ.get("HTTP_X_PRINTER_TOKEN")' in code and 'params.get("token")' in code)
 def _top_level_block(text, marker):

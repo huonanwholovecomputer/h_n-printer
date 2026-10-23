@@ -1,22 +1,38 @@
 [Unit]
-Description=HN Cloud Print Backend (Gunicorn + Flask-SocketIO)
+Description=Printer Backend
 After=network.target
+# S1-10：重启风暴保护交给 RestartSec=3（StartLimitIntervalSec=0 关掉 systemd 的
+# 默认"5 次/10 秒即放弃"限制，否则一次磁盘抖动就会把服务钉死在 failed）
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
-User=www-data
-Group=www-data
-WorkingDirectory=/opt/printer-backend
-Environment="PATH=/opt/printer-backend/venv/bin"
-ExecStart=/opt/printer-backend/venv/bin/gunicorn -c gunicorn_config.py app:app
+User=root
+WorkingDirectory=/home/printer-backend
+Environment=PATH=/home/printer-backend/venv/bin
+# S1-10：配置由服务器侧维护（root:root 600），不再放在程序目录里
+Environment=HN_CONFIG_PATH=/etc/hn-printer/config.py
+ExecStart=/home/printer-backend/venv/bin/gunicorn -c gunicorn_config.py app:app
 
-# 自动重启
+# ---- 可用性（S1-10 / R9）----
+# 原 unit 是 Restart=no：进程一崩就永久停服，只能靠人发现（§13 曾误以为已是 always）
 Restart=always
-RestartSec=5
+RestartSec=3
 
-# 日志
-StandardOutput=journal
-StandardError=journal
+# ---- 主机硬化（S1-10 / DS-18）----
+# ProtectSystem=strict：整个文件系统只读，只有 ReadWritePaths 里的可写
+ProtectSystem=strict
+ReadWritePaths=/home/printer-backend
+PrivateTmp=yes
+NoNewPrivileges=yes
+UMask=0077
+# 资源上限：2 vCPU / 2 GB 的机器上，防止一次事件洪水把整机拖死（R1 的兜底）
+MemoryMax=1200M
+TasksMax=256
+LimitNOFILE=8192
+# ⚠ 刻意不用 ProtectHome=yes / ProtectHome=read-only：程序本体就在 /home/printer-backend，
+#   ProtectHome 会把 /home 变成不可访问/只读，服务直接起不来。要搬到 /opt 才能开。
+ProtectHome=no
+PrivateDevices=no
 
 [Install]
 WantedBy=multi-user.target

@@ -66,11 +66,18 @@ app_src = open(APP, encoding="utf-8").read()
 # ============================================================================
 print("=== A. 静态接线 ===")
 
-# A1 密码模块注册（默认 123456 = sha256:8d969eef…，与其它模块同一个常量）
+# A1 密码模块注册
+# S1-05（2026-10-23）：默认密码已停用（D-5 拍板「首次强制改密 + 后端二次校验」）。
+#   · DEFAULT_PASSWORDS 全为空串 = 「未设置/必须改密」，不再是 123456 的 SHA-256；
+#   · _PW_123456 降级为「旧默认密码指纹」，只用于把存量模块识别成 needs_setup；
+#   · 密码哈希/校验只在服务端（PBKDF2），前端不再自带 hashPassword 比对。
 chk("PASSWORD_KEYS 含 orderstatus（迁移补默认值 / 设置页密码管理共用同一份清单）",
     re.search(r"var PASSWORD_KEYS = \[[^\]]*'orderstatus'", html) is not None)
-chk("DEFAULT_PASSWORDS 里 orderstatus 默认 123456 的 SHA-256（不存明文）",
-    re.search(r"DEFAULT_PASSWORDS = \{[^}]*orderstatus: _PW_123456", html) is not None)
+chk("DEFAULT_PASSWORDS 里 orderstatus 是空串（S1-05：未设置 = 强制改密，不再有 123456 默认值）",
+    re.search(r"var DEFAULT_PASSWORDS = \{[^}]*orderstatus: ''", html) is not None
+    and re.search(r"(?<!_)DEFAULT_PASSWORDS = \{[^}]*orderstatus: _PW_123456", html) is None)
+chk("_PW_123456 仍保留，但只作「旧默认密码指纹」表（LEGACY_DEFAULT_PASSWORDS）用于识别强制改密",
+    re.search(r"var LEGACY_DEFAULT_PASSWORDS = \{[^}]*orderstatus: _PW_123456", html) is not None)
 chk("MODULE_NAMES 有 orderstatus → 中文名（解锁弹窗/设置页/提示共用）",
     re.search(r"MODULE_NAMES = \{[^}]*orderstatus: '[^']+'", html) is not None)
 chk("unlocked 初始含 orderstatus: false（默认锁定，刷新页面即回到锁定）",
@@ -78,8 +85,10 @@ chk("unlocked 初始含 orderstatus: false（默认锁定，刷新页面即回�
 chk("设置页密码区按 PASSWORD_KEYS 渲染（新模块自动可改密码，无需另加 UI）",
     re.search(r"PASSWORD_KEYS\.forEach\(function \(k\) \{\s*\n\s*h \+= '<div class=\"settings-row\"><label>' \+ MODULE_NAMES\[k\]",
               html) is not None)
-chk("设置页写密码仍走 hashPassword（只存哈希）",
-    re.search(r"function updatePassword\(key\)[\s\S]{0,600}?hashPassword\(v\)", html) is not None)
+chk("设置页改密走后端接口 /api/local/finance_auth/password（S1-05：前端不再算哈希）",
+    re.search(r"function updatePassword\(key\)[\s\S]{0,900}?'/api/local/finance_auth/password'", html) is not None
+    and re.search(r"function updatePassword\(key\)[\s\S]{0,900}?hashPassword\(v\)", html) is None
+    and "function isPasswordValid" not in html)
 
 # A2 锁开关挂在「状态」表头（且只挂这一列）
 chk("ORDER_FIXED_COLS 的「状态」列带列键 'status'",
@@ -178,7 +187,8 @@ chk("后端接口存在且需 printer token",
     # `_printer_token_ok()`（轮换双接受 + 恒时比较）。判据随之接受新形态，语义不变：
     # 取 token → 判定。把这一步删掉（不判 token）仍会红。
     re.search(r"def admin_order_status\(\):[\s\S]{0,2500}?_get_printer_token\(\)[\s\S]{0,300}?"
-              r"(?:token != PRINTER_TOKEN|_printer_token_ok\(token\))", app_src) is not None)
+              r"(?:token != PRINTER_TOKEN|_printer_token_ok\(token\)|_authenticate_printer\(token\))",
+              app_src) is not None)
 chk("父订单与全部子任务在**同一个事务**里改写（BEGIN IMMEDIATE）",
     # F8b 同款：窗口也随后端 docstring/函数体增长（本批 F1 在 BEGIN 之前加了「收集归属设备」
     # 一段，`def → BEGIN IMMEDIATE` 实测已涨到 2724，旧窗口 {0,2000} 直接假红）。

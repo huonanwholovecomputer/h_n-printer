@@ -77,12 +77,58 @@ function fileAlive(f) { return fileIndexOf(f) >= 0; }
 
 /* ================= 初始化 ================= */
 
+// S1-09：定价刷新轮询句柄（自调度，见 app.js 的 createPollScheduler）
+let pricingPoll = null;
+
+/**
+ * 取轮询自调度器。正式实现是 app.js 的 createPollScheduler（页面里 app.js 先加载）；
+ * 但本文件在若干**单元测试夹具**里会被单独加载（没有 app.js），此时用一个契约相同的
+ * 极简兜底：一样是「上一轮落定后才排下一轮 + 失败 1.5× 退避（上限 5 分钟）+ 成功回基线」。
+ * 这样"少一个全局函数"不会让页数轮询/定价轮询整个不工作。
+ */
+function _pollScheduler(taskFn, baseDelayMs) {
+  if (typeof createPollScheduler === 'function') {
+    return createPollScheduler(taskFn, baseDelayMs);
+  }
+  const base = Math.max(1, Number(baseDelayMs) || 5000);
+  let delay = base;
+  let stopped = false;
+  let timer = null;
+  const tick = () => {
+    if (stopped) return;
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (stopped) return;
+      delay = (ok === false) ? Math.min(Math.round(delay * 1.5), 300000) : base;
+      timer = setTimeout(tick, delay);
+    };
+    try {
+      const ret = taskFn(done);
+      if (ret && typeof ret.then === 'function') ret.then(() => done(true), () => done(false));
+    } catch (e) {
+      done(false);
+    }
+  };
+  return {
+    start() { if (stopped) return; stopped = false; delay = base; tick(); },
+    stop() { stopped = true; if (timer) { clearTimeout(timer); timer = null; } },
+    isRunning() { return !stopped; },
+  };
+}
+
 function initPrintPage() {
   setupFileInput();
   setupPrintButtons();
   loadPricing();
-  // 每 5 分钟顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
-  setInterval(loadPricing, 5 * 60 * 1000);
+  // 每 5 分钟顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致。
+  // S1-09：自调度（上一轮落定后才排下一轮；失败 1.5× 退避、成功恢复 5 分钟基线）
+  pricingPoll = _pollScheduler(async () => {
+    const ok = await loadPricing();
+    if (ok === false) throw new Error('pricing poll failed');
+  }, 5 * 60 * 1000);
+  pricingPoll.start();
   refreshPrintRoleUI();
   buildScheduleDays();
   scheduleMeasureSoon();
@@ -893,14 +939,15 @@ function startPageCountPoll(f, fileId) {
   stopPageCountPoll(f);
   if (!f || !fileId) return;
   let attempts = 0;
-  const poll = async () => {
-    if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return; }
+  /** 单轮：返回 true=本轮成功 / false=本轮失败（网络错误、非 2xx）→ 调度器退避 */
+  const pollOnce = async () => {
+    if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return true; }
     try {
       // 每次轮询都带上当前选中的接单设备：由它做页数分析（用户中途换设备也能跟上）
       const prefer = (typeof selectedDeviceId !== 'undefined' && selectedDeviceId) ? selectedDeviceId : '';
       const r = await api('/api/file_page/' + fileId + (prefer ? '?target_client_id=' + encodeURIComponent(prefer) : ''));
       // await 期间文件可能被删除 / 被重新上传（fileId 变了）→ 丢弃本次结果
-      if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return; }
+      if (!fileAlive(f) || f.fileId !== fileId) { stopPageCountPoll(f); return true; }
       if (r.status === 200 && r.data && r.data.success) {
         const pc = r.data.page_count || 0;
         const verified = !!r.data.verified;
@@ -918,7 +965,7 @@ function startPageCountPoll(f, fileId) {
           // 取的就是它（否则页数永远停在提交时刻的估算值，价格无效）
           applyPageCountToOrder(fileId, pc);
           stopPageCountPoll(f);
-          return;
+          return true;
         }
         // v4.4：仅 doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告；
         // PDF 等后端可直接数页的类型保持「等待中」，后端未返回时正常等待即可
@@ -928,15 +975,28 @@ function startPageCountPoll(f, fileId) {
         attempts++;
         if (attempts >= MAX_POLL_ATTEMPTS) stopPageCountPoll(f);
         renderFileList();
+        return true;
       }
-    } catch (e) { /* 网络错误继续轮询 */ }
+      return false;
+    } catch (e) {
+      return false;   // 网络错误 → 指数退避后再试（不再 5s 死磕）
+    }
   };
-  poll();
-  f._pollTimer = setInterval(poll, 5000);
+  // S1-09：**自调度**（上一次请求落定后才排下一次，失败 1.5× 退避 / 上限 5 分钟），
+  // 不再用 setInterval(5s) —— api() 超时是 20s，弱网下旧写法会同时堆着 4 个请求。
+  f._poll = _pollScheduler(async () => {
+    const ok = await pollOnce();
+    if (ok === false) throw new Error('page count poll failed');
+  }, 5000);
+  f._poll.start();
 }
 
 function stopPageCountPoll(f) {
-  if (f && f._pollTimer) {
+  if (f && f._poll) {
+    f._poll.stop();
+    f._poll = null;
+  }
+  if (f && f._pollTimer) {   // 兼容旧字段
     clearInterval(f._pollTimer);
     f._pollTimer = null;
   }
@@ -1184,8 +1244,12 @@ async function loadPricing() {
       const pct = printState.deliveryPercentages[printState.deliveryLocation];
       if (pct != null) printState.deliveryPercent = pct;
       renderExtParams();
+      return true;   // S1-09：轮询调度器据此恢复基线间隔
     }
-  } catch (e) { /* 默认值 */ }
+    return false;
+  } catch (e) {
+    return false;    // 默认值 + 轮询退避
+  }
 }
 
 function renderExtParams() {

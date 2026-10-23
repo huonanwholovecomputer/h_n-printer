@@ -272,9 +272,14 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .tag.st-scheduled      { background: #FFF8E1; color: #F57F17; }
 .tag.st-waiting        { background: #E0F2F1; color: #00897B; }
 .tag.st-downloading    { background: #E3F2FD; color: #1565C0; }
+/* S1-09：离线未同步（灰蓝、待处理）与云端拒收（洋红、要人工介入） */
+.tag.st-unsynced           { background: #ECEFF1; color: #455A64; }
+.tag.st-unsynced-rejected  { background: #FCE4EC; color: #AD1457; }
 [data-theme="dark"] .tag.st-scheduled      { background: rgba(255,213,79,.15); color: #FFD54F; }
 [data-theme="dark"] .tag.st-waiting        { background: rgba(77,182,172,.15); color: #4DB6AC; }
 [data-theme="dark"] .tag.st-downloading    { background: rgba(100,181,246,.15); color: #64B5F6; }
+[data-theme="dark"] .tag.st-unsynced           { background: rgba(176,190,197,.18); color: #B0BEC5; }
+[data-theme="dark"] .tag.st-unsynced-rejected  { background: rgba(244,143,177,.18); color: #F48FB1; }
 .member-tag { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-size: .82rem; font-weight: 600; color: #fff; box-shadow: var(--shadow-sm); }
 .member-del { cursor: pointer; opacity: .65; font-size: 1rem; transition: opacity .15s ease; }
 .member-del:hover { opacity: 1; }
@@ -775,7 +780,13 @@ var FINANCE_MODE = '__FINANCE_MODE__';   // 'cloud' 或 'local'：收支清算�
   }
   if (FINANCE_MODE !== 'cloud' && FINANCE_MODE !== 'local') FINANCE_MODE = 'cloud';
 })();
-function apiHeaders() { return { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type': 'application/json' }; }
+/* S1-05：解锁会话自动带在**所有**请求头里（读操作服务端不校验，写操作必须要它）。
+   会话变量在下面的「密码 / 解锁会话」段声明；用 typeof 兜住脚本加载顺序。 */
+function apiHeaders() {
+  var h = { 'X-Launch-Token': LAUNCH_TOKEN, 'Content-Type': 'application/json' };
+  if (typeof FINANCE_SESSION !== 'undefined' && FINANCE_SESSION) h['X-Finance-Session'] = FINANCE_SESSION;
+  return h;
+}
 
 /* ==================== 禁用右键菜单 ==================== */
 /* 右键菜单：已解除限制（不再拦截）。如需恢复，取消下面代码块注释即可。
@@ -793,12 +804,18 @@ var DEFAULT_MEMBERS = [];
 var PLACEHOLDER_MEMBER_NAMES = ['张三', '李四', '王五'];
 var DEFAULT_SCORE_CAP = 15;
 var DEFAULT_RATE = 0.05;
-/* 默认密码存储 SHA-256 哈希（'123456' 的 sha256），不存明文 */
+/* S1-05（2026-10-23 财务安全加固）：**代码里不再有可用的默认密码**。
+   `_PW_123456` 只是「旧默认密码的指纹」（sha256('123456')），用途只有一个：把仍是 123456 的
+   存量模块**识别成「必须改密」**（needs_setup，服务端直接拒绝解锁）。
+   `DEFAULT_PASSWORDS` 现在全是空串 = 「未设置」—— 迁移时补齐的是空值，不是密码。 */
 var _PW_123456 = 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92';
-var DEFAULT_PASSWORDS = { score: _PW_123456, expense: _PW_123456, income: _PW_123456, settings: _PW_123456, auth: _PW_123456, transfer: _PW_123456, orderstatus: _PW_123456 };
+var LEGACY_DEFAULT_PASSWORDS = { score: _PW_123456, expense: _PW_123456, income: _PW_123456, settings: _PW_123456, auth: _PW_123456, transfer: _PW_123456, orderstatus: _PW_123456 };
+var DEFAULT_PASSWORDS = { score: '', expense: '', income: '', transfer: '', settings: '', auth: '', orderstatus: '' };
 /* PASSWORD_KEYS：需要独立密码的模块清单（迁移补默认值 / 设置页密码管理共用同一份顺序） */
 var PASSWORD_KEYS = ['score', 'expense', 'income', 'transfer', 'settings', 'auth', 'orderstatus'];
 var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', transfer: '实际转账', settings: '设置', auth: '设备授权', orderstatus: '订单状态/类型订正' };
+/* 密码最小长度（与服务端 stats_server.MIN_PASSWORD_LEN 同口径） */
+var FINANCE_PASSWORD_MIN_LEN = 6;
 /* 打印价格默认值（本地模式初始化 / 字段兜底用）。
    云端模式下价格以服务器 pricing.json 为权威（/api/pricing），本常量仅作本地模式默认。 */
 var DEFAULT_PRICING = {
@@ -816,7 +833,10 @@ function _saveToServer(data, force) {
   return fetch('/api/proxy/finance/config', { method: 'POST', headers: apiHeaders(), body: JSON.stringify(payload) })
     .then(function (r) { return r.json(); })
     .then(function (res) {
-      if (!(res && res.success)) return { ok: false, message: (res && res.message) || '保存失败' };
+      if (!(res && res.success)) {
+        _writeAuthProblem(res);
+        return { ok: false, message: (res && res.message) || '保存失败' };
+      }
       var sv = res.server_version;
       var conflict = false;
       if (typeof sv === 'number') {
@@ -838,13 +858,36 @@ function _loadFromServer() {
 function _loadFromLocalFile() {
   return fetch('/api/local/data', { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
-    .then(function (res) { return (res && res.success && res.data) ? res.data : null; })
+    .then(function (res) {
+      // S1-05 ④：服务端顺带下发数据完整性状态（校验失败 ⇒ 只读保护 + 顶部横幅）
+      if (res && typeof res === 'object') {
+        if (typeof res.read_only !== 'undefined') {
+          _integrityReadOnly = !!res.read_only;
+          _integrityState = res.integrity || '';
+          try { syncIntegrityBanner(); } catch (e) {}
+        }
+        return (res.success && res.data) ? res.data : null;
+      }
+      return null;
+    })
     .catch(function () { return null; });
 }
 function _saveToLocalFile(data) {
   return fetch('/api/local/data', { method: 'POST', headers: apiHeaders(), body: JSON.stringify({ data: data }) })
     .then(function (r) { return r.json(); })
-    .then(function (res) { return (res && res.success) ? { ok: true } : { ok: false, message: (res && res.message) || '保存失败' }; })
+    .then(function (res) {
+      if (!(res && res.success)) {
+        if (res && res.code === 'integrity_readonly') {
+          _integrityReadOnly = true;
+          _integrityState = res.integrity || 'mismatch';
+          try { syncIntegrityBanner(); } catch (e) {}
+        } else {
+          _writeAuthProblem(res);
+        }
+        return { ok: false, message: (res && res.message) || '保存失败' };
+      }
+      return { ok: true };
+    })
     .catch(function (e) { return { ok: false, message: String(e) }; });
 }
 
@@ -1121,38 +1164,118 @@ function RMB(cents) { return '¥' + formatCents(cents); }
 /* 本地化文案：本地模式下把可见文本中的「云端」统一替换为「本地」（本地模式复用云端驾驶舱渲染）。
    参数为已拼好的 HTML 字符串，仅对用户可见文案生效；云端模式原样返回。 */
 function _lz(s) { return FINANCE_MODE === 'local' ? String(s).replace(/云端/g, '本地') : s; }
-/* ==================== 密码哈希（SHA-256，Web Crypto） ==================== */
-/* P1（审计 2026-12）：不支持 Web Crypto 时**禁用密码功能**，不再降级到弱哈希。
-   旧实现退化为 32 位 djb2 —— 碰撞极易构造；更糟的是：一旦在这种环境下设过密码，
-   存入的 'djb2:...' 在后续正常分支（只认 'sha256:' / 明文）永远校验不通过，
-   等于把模块永久锁死。拒绝服务优于弱保护。 */
-var CRYPTO_UNAVAILABLE_MSG =
-  '当前运行环境不支持 Web Crypto（SHA-256），密码功能已禁用。' +
-  '请用现代浏览器内核或经 127.0.0.1 访问本页。';
-function cryptoAvailable() {
-  return !!(window.crypto && window.crypto.subtle && window.crypto.subtle.digest
-            && typeof TextEncoder === 'function');
-}
-function _sha256Hex(str) {
-  if (!cryptoAvailable()) {
-    return Promise.reject(new Error(CRYPTO_UNAVAILABLE_MSG));
+/* ==================== 密码 / 解锁会话（S1-05：校验只在服务端） ====================
+   旧实现是「前端算 SHA-256 再跟页里的哈希比对」—— 那证明的只是"客户端愿意相信"，
+   打开控制台就能绕过。现在：
+     · 密码只存服务端（print_data.json，PBKDF2-HMAC-SHA256 + 每模块独立 salt + 210k 迭代）；
+     · 解锁成功 → 服务端签发 30 分钟 finance_session，页面放进 X-Finance-Session 请求头；
+     · 页面不再自带哈希函数、不再有默认密码；服务端拒绝默认/弱口令解锁。 */
+var FINANCE_SESSION = '';
+var FINANCE_SESSION_EXP = 0;
+var _financeSessionTimer = null;
+var _pendingSave = false;             // 没会话时被挡下的保存：解锁后自动补做
+var _afterUnlockQueue = [];           // 同上，任意"解锁后补做"的写动作
+var _integrityState = '';             // 数据完整性状态（服务端 /api/local/data 下发）
+var _integrityReadOnly = false;
+
+function _clearFinanceSession(silent) {
+  FINANCE_SESSION = '';
+  FINANCE_SESSION_EXP = 0;
+  if (_financeSessionTimer) { clearTimeout(_financeSessionTimer); _financeSessionTimer = null; }
+  PASSWORD_KEYS.forEach(function (k) { unlocked[k] = false; });
+  if (!silent) {
+    try { toast('🔒 解锁会话已结束（30 分钟），请重新输入密码'); } catch (e) {}
   }
-  return window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(str)).then(function (buf) {
-    var bytes = new Uint8Array(buf), hex = '';
-    for (var i = 0; i < bytes.length; i++) hex += ('0' + bytes[i].toString(16)).slice(-2);
-    return hex;
-  });
 }
-function hashPassword(pwd) { return _sha256Hex(String(pwd || '')); }
-/* 双模式校验：'sha256:' 前缀按哈希比对；其余按旧明文比对（兼容存量数据），新写入只存哈希。
-   无 Web Crypto → 一律 reject（不做任何降级比对，避免"看起来能用"的假象）。 */
-function isPasswordValid(input, stored) {
-  if (!cryptoAvailable()) return Promise.reject(new Error(CRYPTO_UNAVAILABLE_MSG));
-  stored = String(stored || '');
-  if (stored.indexOf('sha256:') === 0) {
-    return hashPassword(input).then(function (h) { return h === stored.slice(7); });
+function _setFinanceSession(token, ttl, modules) {
+  FINANCE_SESSION = String(token || '');
+  var secs = Number(ttl || 0) || 0;
+  FINANCE_SESSION_EXP = secs ? (Date.now() + secs * 1000) : 0;
+  if (_financeSessionTimer) clearTimeout(_financeSessionTimer);
+  if (secs) {
+    _financeSessionTimer = setTimeout(function () {
+      _clearFinanceSession(false);
+      try { renderCurrent(); } catch (e) {}
+    }, secs * 1000);
   }
-  return Promise.resolve(input === stored);
+  (modules || []).forEach(function (k) { if (k in unlocked) unlocked[k] = true; });
+}
+function _runAfterUnlock() {
+  var q = _afterUnlockQueue.slice();
+  _afterUnlockQueue = [];
+  q.forEach(function (fn) { try { fn(); } catch (e) {} });
+  if (_pendingSave) { _pendingSave = false; try { save(); } catch (e) {} }
+}
+function _afterUnlock(fn) {
+  if (FINANCE_SESSION) { try { fn(); } catch (e) {} return; }
+  _afterUnlockQueue.push(fn);
+}
+/* 写接口返回「会话缺失/过期/无权限」时统一处理：清会话 + 回锁 + 提示（绝不静默丢写入） */
+function _writeAuthProblem(res) {
+  if (!res || res.success !== false) return false;
+  var code = String(res.code || '');
+  if (code.indexOf('finance_session') !== 0) return false;
+  _clearFinanceSession(true);
+  toast('🔒 ' + ((res && res.message) || '解锁会话已失效，请重新解锁'), 'error', true);
+  try { renderCurrent(); } catch (e) {}
+  return true;
+}
+function _financeAuthFetch(url, payload) {
+  return fetch(url, { method: 'POST', headers: apiHeaders(), body: JSON.stringify(payload || {}) })
+    .then(function (r) { return r.json().catch(function () { return {}; }); })
+    .catch(function (e) { return { success: false, code: 'network', message: String((e && e.message) || e) }; });
+}
+/* 解锁一个模块 → Promise<{ok, code, message, needsSetup}> */
+function financeUnlock(module, password) {
+  return _financeAuthFetch('/api/local/finance_auth/unlock',
+    { module: module, password: String(password == null ? '' : password) })
+    .then(function (res) {
+      if (res && res.success && res.session) {
+        _setFinanceSession(res.session, res.expires_in, res.modules);
+        if (res.stored_hash && STORE && STORE.config) {
+          /* 服务端把旧的无盐 SHA-256 升级成了 PBKDF2：把新哈希带回页面，
+             否则下一次 save() 会把刚升级的结果回退成旧格式（迁移必须幂等）。 */
+          STORE.config.passwords = STORE.config.passwords || {};
+          STORE.config.passwords[module] = res.stored_hash;
+          _pendingSave = true;
+        }
+        if (res.upgraded) toast('🔐 旧密码已自动升级为 PBKDF2（本机 HMAC 保护）', 'success');
+        return { ok: true, code: '', message: '', needsSetup: false };
+      }
+      var code = (res && res.code) || 'unlock_failed';
+      return {
+        ok: false, code: code,
+        message: (res && res.message) || '解锁失败',
+        needsSetup: (code === 'needs_setup' || code === 'default_password'),
+      };
+    });
+}
+/* 首次设置密码（默认密码已停用 → 必须走这里，服务端生成每模块独立 salt） */
+function financeSetup(newPassword, moduleKey) {
+  return _financeAuthFetch('/api/local/finance_auth/setup',
+    { module: moduleKey || 'all', new_password: String(newPassword == null ? '' : newPassword) })
+    .then(function (res) {
+      if (res && res.success) {
+        var stored = res.stored || {};
+        if (STORE && STORE.config) {
+          STORE.config.passwords = STORE.config.passwords || {};
+          Object.keys(stored).forEach(function (k) { STORE.config.passwords[k] = stored[k]; });
+        }
+        return { ok: true, modules: res.modules || [], stored: stored };
+      }
+      return { ok: false, code: (res && res.code) || 'setup_failed',
+               message: (res && res.message) || '设置密码失败' };
+    });
+}
+function financeAuthStatus() {
+  return fetch('/api/local/finance_auth/status', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .catch(function () { return null; });
+}
+/* 兼容旧调用点：前端不再自带密码哈希（S1-05）。留一个显式失败的桩，
+   任何残留调用都会立刻暴露，而不是悄悄算出一个"看起来能用"的弱哈希。 */
+function hashPassword() {
+  return Promise.reject(new Error('密码哈希已迁移到服务端（PBKDF2），前端不再计算哈希'));
 }
 function $(s) { return document.querySelector(s); }
 function $$(s) { return Array.prototype.slice.call(document.querySelectorAll(s)); }
@@ -1371,6 +1494,13 @@ function save() {
    若 server_version > client_version + 1 说明期间有其他设备写入 → 弹冲突确认（覆盖则强制保存）。
    后端暂未实现版本号时，前端本地自增 meta.version，等待后端配合。 */
 function _doSave(force) {
+  /* S1-05 ③：写操作必须带 finance_session（服务端会 403）。没有会话 = 还没解锁任何模块 ——
+     首次部署迁移、离线暂存重放这类"自动保存"会走到这里，先记下来，解锁成功后自动补做。 */
+  if (!FINANCE_SESSION) {
+    _pendingSave = true;
+    _afterUnlock(function () { _doSave(force); });
+    return;
+  }
   if (FINANCE_MODE === 'local') {
     // 本地模式：配置/数据存本地 print_data.json
     _saveToLocalFile(STORE).then(function (r) {
@@ -1453,23 +1583,31 @@ function openConfirm(message, confirmText) {
   return openModal({ title: '⚠️ 确认操作', body: '<p style="margin:0;color:var(--muted)">' + esc(message) + '</p>', confirmText: confirmText || '确定', cancelText: '取消', danger: true });
 }
 
-/* ==================== 密码解锁 ==================== */
-function getPassword(key) { return (STORE.config.passwords || {})[key] || DEFAULT_PASSWORDS[key]; }
+/* ==================== 密码解锁（S1-05：服务端校验 + 会话） ==================== */
+function getPassword(key) { return (STORE.config.passwords || {})[key] || ''; }
 function isUnlocked(key) { return !!unlocked[key]; }
 function requestPassword(key, label) {
   return openModal({
     title: '🔒 解锁' + label,
-    body: '<p style="margin:0 0 12px;color:var(--muted);font-size:.88rem">输入「' + label + '」密码以继续编辑</p>',
+    body: '<p style="margin:0 0 12px;color:var(--muted);font-size:.88rem">输入「' + label + '」密码以继续编辑'
+      + '<br><span style="font-size:.8rem">（密码由本机服务端校验，解锁后 30 分钟内有效）</span></p>',
     input: { type: 'password', placeholder: '请输入密码' },
     confirmText: '解锁', cancelText: '取消'
   }).then(function (pwd) {
     if (pwd === null) return false;
-    return isPasswordValid(pwd, getPassword(key)).then(function (ok) {
-      if (ok) { unlocked[key] = true; toast('🔓 已解锁' + label, 'success'); return true; }
-      toast('❌ 密码错误', 'error'); return false;
-    }).catch(function (e) {
-      // 无 Web Crypto → 密码功能已禁用（不再降级到弱哈希校验）
-      toast('❌ ' + (e && e.message ? e.message : '密码校验失败'), 'error');
+    return financeUnlock(key, pwd).then(function (r) {
+      if (r.ok) {
+        unlocked[key] = true;
+        toast('🔓 已解锁' + label, 'success');
+        _runAfterUnlock();
+        return true;
+      }
+      if (r.needsSetup) {
+        toast('⚠️ ' + (MODULE_NAMES[key] || key) + ' 还没有设置密码（默认密码已停用），请先设置新密码', 'error', true);
+        openFinanceSetupModal();
+        return false;
+      }
+      toast('❌ ' + (r.message || '密码错误'), 'error');
       return false;
     });
   });
@@ -1477,7 +1615,132 @@ function requestPassword(key, label) {
 function unlockFlow(key, label) {
   requestPassword(key, label).then(function (ok) { if (ok) renderCurrent(); });
 }
-function lockModule(key) { unlocked[key] = false; toast('🔒 ' + (MODULE_NAMES[key] || key) + ' 已锁定'); renderCurrent(); }
+function lockModule(key) {
+  unlocked[key] = false;
+  // 全部锁定后顺手作废服务端会话：不要留一个后台仍可写的 token
+  var anyUnlocked = PASSWORD_KEYS.some(function (k) { return unlocked[k]; });
+  if (!anyUnlocked && FINANCE_SESSION) {
+    fetch('/api/local/finance_auth/logout', { method: 'POST', headers: apiHeaders() }).catch(function () {});
+    _clearFinanceSession(true);
+  }
+  toast('🔒 ' + (MODULE_NAMES[key] || key) + ' 已锁定');
+  renderCurrent();
+}
+/* 首次强制改密：默认/未设置密码的模块必须先在页面上设新密码（D-5 拍板接受的操作摩擦）。
+   非模态无法关闭太久：用户点掉背景也会再弹一次，避免"默认密码永远有效"。 */
+function openFinanceSetupModal(needList) {
+  /* 入口：先问服务端「现在到底哪些模块还没密码」，避免"全都设好了还硬弹窗/失败后无限重弹"。
+     明确传了 needList（checkFinanceSetup 拿到 needs_setup）就直接渲染。 */
+  if (needList && needList.length) return _renderSetupModal(needList);
+  return financeAuthStatus().then(function (st) {
+    var need = (st && st.success && st.needs_setup) ? st.needs_setup : PASSWORD_KEYS.slice();
+    if (!need.length) {
+      toast('✅ 所有模块都已设置密码，请直接解锁需要编辑的模块');
+      return;
+    }
+    return _renderSetupModal(need);
+  }).catch(function () { return _renderSetupModal(PASSWORD_KEYS.slice()); });
+}
+function _renderSetupModal(need) {
+  var names = (need || []).map(function (k) { return MODULE_NAMES[k] || k; }).join('、');
+  return openModal({
+    title: '🔐 设置财务密码（首次必须）',
+    body: '<p style="margin:0 0 10px;color:var(--muted);font-size:.9rem">'
+      + '默认密码（旧版的 <code>123456</code>）已被服务端停用。以下模块还没有密码：<b>' + esc(names) + '</b>。<br>'
+      + '请设置一个新密码（至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位；服务端以 PBKDF2-HMAC-SHA256 + 每模块独立 salt 保存），'
+      + '设置完成后各模块仍需分别解锁。</p>'
+      + '<input id="fpNew1" type="password" placeholder="新密码（≥' + FINANCE_PASSWORD_MIN_LEN + ' 位）" autocomplete="new-password" style="width:100%;margin-bottom:8px">'
+      + '<input id="fpNew2" type="password" placeholder="再次输入新密码" autocomplete="new-password" style="width:100%">'
+      + '<p style="margin:8px 0 0;color:var(--muted);font-size:.78rem">忘记密码只能删除本机收支数据后重新设置（钱相关，刻意不做自助找回）。</p>',
+    confirmText: '设置密码', cancelText: ''
+  }).then(function (val) {
+    if (!val) {   // 点背景/ESC 关掉 → 再来一次（强制）
+      setTimeout(function () { _renderSetupModal(need); }, 400);
+      return;
+    }
+    var a = ($('#fpNew1') || {}).value || '';
+    var b = ($('#fpNew2') || {}).value || '';
+    if (String(a).length < FINANCE_PASSWORD_MIN_LEN) {
+      toast('密码至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位', 'error');
+      setTimeout(function () { _renderSetupModal(need); }, 400);
+      return;
+    }
+    if (a !== b) {
+      toast('两次输入不一致', 'error');
+      setTimeout(function () { _renderSetupModal(need); }, 400);
+      return;
+    }
+    financeSetup(a, 'all').then(function (r) {
+      if (r.ok) {
+        var okNames = (r.modules || []).map(function (k) { return MODULE_NAMES[k] || k; }).join('、');
+        toast('✅ 财务密码已设置：' + okNames + '（请解锁需要编辑的模块）', 'success');
+        _pendingSave = true;                       // 设置结果随后落盘（解锁后自动补做）
+        _afterUnlock(function () { save(); });
+        renderCurrent();
+      } else {
+        toast('❌ ' + (r.message || '设置密码失败'), 'error');
+        setTimeout(function () { _renderSetupModal(need); }, 600);
+      }
+    });
+  });
+}
+/* 页面首载调用：问服务端"哪些模块还没密码 / 数据是否只读"，需要就强制改密。 */
+function checkFinanceSetup() {
+  return financeAuthStatus().then(function (st) {
+    if (!st || !st.success) return;
+    if (typeof st.read_only !== 'undefined') {
+      _integrityReadOnly = !!st.read_only;
+      _integrityState = st.integrity || _integrityState;
+      syncIntegrityBanner();
+    }
+    var need = st.needs_setup || [];
+    if (need.length) {
+      // 等主界面渲染完再弹，避免看着像"页面坏了"
+      setTimeout(function () { _renderSetupModal(need); }, 600);
+    }
+  }).catch(function () {});
+}
+/* 数据完整性横幅：HMAC 校验失败 → 页面顶部常驻提示 + 人工确认入口（服务端此时只读，不覆盖数据） */
+function syncIntegrityBanner() {
+  var id = 'financeIntegrityBanner';
+  var old = document.getElementById(id);
+  if (old && old.parentNode) old.parentNode.removeChild(old);
+  if (!_integrityReadOnly) return;
+  var box = document.createElement('div');
+  box.id = id;
+  box.setAttribute('style', 'position:fixed;left:0;right:0;top:0;z-index:9999;'
+    + 'background:#b91c1c;color:#fff;padding:10px 14px;font-size:.86rem;display:flex;gap:12px;align-items:center');
+  box.innerHTML = '<b>⚠️ 收支数据完整性校验失败</b>'
+    + '<span style="flex:1">print_data.json 与上次记录不一致（可能被其他程序整份覆写）。'
+    + '为防止覆盖真实账目，本机已进入<b>只读保护</b>：新的修改不会被保存。'
+    + '（状态：' + esc(_integrityState || 'mismatch') + '）</span>'
+    + '<button class="btn sm" onclick="ackIntegrity()" style="white-space:nowrap">我已确认，重建基线</button>';
+  (document.body || document.documentElement).appendChild(box);
+}
+function ackIntegrity() {
+  var doAck = function () {
+    fetch('/api/local/finance_integrity/ack', {
+      method: 'POST', headers: apiHeaders(), body: JSON.stringify({ confirm: true })
+    }).then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (res && res.success) {
+          _integrityReadOnly = false;
+          _integrityState = res.integrity || 'resealed';
+          syncIntegrityBanner();
+          toast('✅ 已按当前文件内容重建完整性基线，写入恢复', 'success');
+        } else {
+          toast('❌ ' + ((res && res.message) || '确认失败'), 'error');
+        }
+      })
+      .catch(function () { toast('❌ 网络错误', 'error'); });
+  };
+  if (!FINANCE_SESSION) {
+    // 重建基线是敏感操作：先解锁「设置」模块（服务端同样要求带会话）
+    requestPassword('settings', MODULE_NAMES.settings).then(function (ok) { if (ok) doAck(); });
+    return;
+  }
+  doAck();
+}
 function lockBarHTML(key) {
   var name = MODULE_NAMES[key] || key;
   if (unlocked[key]) return '<div class="unlock-badge">🔓 ' + name + ' 已解锁 <button class="btn sm" onclick="lockModule(\'' + key + '\')">锁定</button></div>';
@@ -1679,13 +1942,16 @@ var STATUS_LABELS = {
   sent: '已完成', printing: '待添加', queued: '排队中', failed: '失败', canceled: '已取消',
   rejected: '被打回', abandoned: '放弃打印', offline_unknown: '断线未知',
   accepted: '已添加', reserved: '已预留',
-  scheduled: '已预约', waiting: '等待打印', downloading: '文件传输中'
+  scheduled: '已预约', waiting: '等待打印', downloading: '文件传输中',
+  /* S1-09：本地离线库里的单**还没有同步到云端**（synced=0）—— 不能显示成「已完成」，
+     否则钱还没进云端账，结算页的「已完成/已入账」就虚增。rejected = 云端业务拒收（4xx）。 */
+  unsynced: '⏳ 离线未同步', unsynced_rejected: '⚠️ 云端拒收'
 };
-var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown', scheduled: 'st-scheduled', waiting: 'st-waiting', downloading: 'st-downloading' };
+var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown', scheduled: 'st-scheduled', waiting: 'st-waiting', downloading: 'st-downloading', unsynced: 'st-unsynced', unsynced_rejected: 'st-unsynced-rejected' };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 function statusClass(s) { return STATUS_CLASSES[s] || ''; }
 var CHART_COLORS = {
-  status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', reserved: '#F57F17', scheduled: '#F57F17', waiting: '#00897B', downloading: '#1565C0' },
+  status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', reserved: '#F57F17', scheduled: '#F57F17', waiting: '#00897B', downloading: '#1565C0', unsynced: '#6D4C41', unsynced_rejected: '#AD1457' },
   palette: ['#4f6ef7', '#34a853', '#f59e0b', '#8b5cf6', '#d97706', '#16a34a', '#e11d48', '#38bdf8', '#f472b6', '#a855f7', '#14b8a6', '#f97316']
 };
 function _statusColor(s) { return CHART_COLORS.status[s] || '#9ca3af'; }
@@ -1724,8 +1990,9 @@ var _cloudCompare = null, _cloudCompareMonth = null, _cloudCompareLoading = fals
 var _cloudDataFetchedAt = null;           // 最近一次成功同步时间
 var _ddOpen = null;                       // 口径栏多选下拉展开项：'members' | 'sources' | null
 /* 状态分组（v5）：进行中/待处理 / 异常 */
-var _ACTIVE_STATUS = { queued: 1, printing: 1, accepted: 1, reserved: 1, scheduled: 1, waiting: 1, downloading: 1 };
-var _ABNORMAL_STATUS = { failed: 1, rejected: 1, abandoned: 1, offline_unknown: 1 };
+/* S1-09：⏳ 离线未同步算「待处理」（还等联网补报）；⚠️ 云端拒收算「异常」（要人工重试/核对） */
+var _ACTIVE_STATUS = { queued: 1, printing: 1, accepted: 1, reserved: 1, scheduled: 1, waiting: 1, downloading: 1, unsynced: 1 };
+var _ABNORMAL_STATUS = { failed: 1, rejected: 1, abandoned: 1, offline_unknown: 1, unsynced_rejected: 1 };
 function _statusGroups(st) {
   st = st || {};
   var done = st.sent || 0;
@@ -2468,7 +2735,10 @@ function undoTrendDrill() {
    免费文件 free         = 文件级 is_free=1（不计金额，单独计数）
    v5.1：自打订单（is_admin_print=1，管理员自行打印）不计入收益金额 ——
          excludeSelf=true 时金额/待处理计数全部跳过；订单明细表展示时仍用原样金额。 */
-var _EXCLUDE_STATUS = { canceled: 1, abandoned: 1, rejected: 1, failed: 1 };
+/* S1-09：unsynced / unsynced_rejected 也排除在收益统计之外 —— 这两态的钱还没被云端确认，
+   计入「云端收益记录」（= 已入账 + 应收未收）就是虚增。它们在明细里照常可见、可筛选。 */
+var _EXCLUDE_STATUS = { canceled: 1, abandoned: 1, rejected: 1, failed: 1,
+                        unsynced: 1, unsynced_rejected: 1 };
 function _orderMoney(o, excludeSelf) {
   var m = { paid: 0, receivable: 0, record: 0, free: 0, pendingFiles: 0 };
   var isSelf = !!(excludeSelf && o && o.is_admin_print);
@@ -2939,6 +3209,7 @@ function applyOrderType(oid, type) {
     body: JSON.stringify({ order_id: String(oid), order_type: type })
   }).then(function (r) { return r.json(); }).then(function (res) {
     _orderTypeSaving = false;
+    if (!(res && res.success) && _writeAuthProblem(res)) return;
     if (!(res && res.success)) { toast('❌ ' + ((res && res.message) || '订正失败'), 'error', true); return; }
     o.is_admin_print = (type === 'self');
     _scopeCache = {};   // 口径缓存整体失效（切回旧口径不该看到订正前的类型/金额）
@@ -3050,6 +3321,7 @@ function applyOrderStatus(oid, status) {
     body: JSON.stringify({ order_id: String(oid), status: status })
   }).then(function (r) { return r.json(); }).then(function (res) {
     _orderStatusSaving = false;
+    if (!(res && res.success) && _writeAuthProblem(res)) return;
     if (!(res && res.success)) { toast('❌ ' + ((res && res.message) || '订正失败'), 'error', true); return; }
     /* 本地先落地：页面上所有数字（金额/收益/KPI/图表）都是从 _cloudData.orders 现算的，
        把状态与文件级状态同步过来即等价于库里的新状态（后端改的就是这两处），
@@ -3154,7 +3426,7 @@ function _renderOrderListHTML() {
   var typeUsed = _typeSlotsUsed(pageOrders);
   var colW = _orderColWidths(typeUsed);
 
-  var h = '<div class="section" id="cloud-orders"><h2>📋 订单明细 <span class="hint">' + total + ' 条，时间倒序 · 自打/放弃/取消/打回/失败订单金额仅展示、不计入收益 · 带 <b>*</b> 的金额含未计入收益的部分</span>';
+  var h = '<div class="section" id="cloud-orders"><h2>📋 订单明细 <span class="hint">' + total + ' 条，时间倒序 · 自打/放弃/取消/打回/失败/⏳离线未同步/⚠️云端拒收订单金额仅展示、不计入收益 · 带 <b>*</b> 的金额含未计入收益的部分</span>';
   h += '<span style="margin-left:auto"><select onchange="onCloudStatusFilter(this.value)" style="padding:6px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.8rem">';
   h += '<option value="all"' + (_cloudStatusFilter === 'all' ? ' selected' : '') + '>全部状态</option>';
   h += '<option value="active"' + (_cloudStatusFilter === 'active' ? ' selected' : '') + '>🟢 进行中/待处理</option>';
@@ -4820,6 +5092,11 @@ function resetData() {
       STORE = migrateConfig(null);
       currentKey = currentMonthKey();
       unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false };
+      // S1-05：重置等于退出登录态（服务端会话一并作废，别留后台可写 token）
+      if (FINANCE_SESSION) {
+        fetch('/api/local/finance_auth/logout', { method: 'POST', headers: apiHeaders() }).catch(function () {});
+      }
+      _clearFinanceSession(true);
       save();
       renderAll();
       toast('已重置，数据已清空');
@@ -4842,9 +5119,13 @@ function renderSettings() {
 
   // 密码管理
   h += '<div class="section"><h2>🔐 敏感模块密码</h2>';
+  h += '<div style="margin-bottom:10px;padding:8px 10px;background:var(--surface2,#f6f7fb);border-radius:8px;font-size:.8rem;color:var(--muted)">'
+    + 'S1-05：默认密码（旧版 <code>123456</code>）已被服务端停用；密码以 <b>PBKDF2-HMAC-SHA256「每模块独立 salt」</b>'
+    + ' 保存（≥210k 迭代），解锁后由本机服务端签发 30 分钟会话，所有写操作都要它。'
+    + '<button class="btn sm" style="margin-left:8px" onclick="openFinanceSetupModal()">🔐 首次设置/批量重置未设置模块</button></div>';
   PASSWORD_KEYS.forEach(function (k) {
     h += '<div class="settings-row"><label>' + MODULE_NAMES[k] + ' 密码</label>';
-    h += '<input type="password" id="pwd-' + k + '" placeholder="输入新密码（至少 4 位）" style="width:200px" autocomplete="new-password">';
+    h += '<input type="password" id="pwd-' + k + '" placeholder="输入新密码（至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位）" style="width:200px" autocomplete="new-password">';
     h += '<button class="btn green sm" onclick="updatePassword(\'' + k + '\')">保存</button>';
     h += '<span style="color:var(--muted);font-size:.78rem">当前：' + (k === 'settings' ? '管理密码' : '编辑密码') + '</span>';
     h += '</div>';
@@ -4854,7 +5135,7 @@ function renderSettings() {
            '类型只允许在「🤝接单 / 👤自打」之间订正（自打不计入收益）。</div>';
     }
   });
-  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码以 SHA-256 哈希保存于云端配置（受打印机令牌保护）。请牢记密码，遗忘后无法自助找回。</div></div>';
+  h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码以 PBKDF2 哈希保存在本机服务端（print_data.json，受 HMAC + DPAPI 密钥保护）；云端配置只作同步副本。改密需要先解锁「设置」模块。请牢记密码，遗忘后无法自助找回。</div></div>';
 
   // 成员管理
   h += '<div class="section"><h2>👥 成员管理</h2>';
@@ -5048,7 +5329,9 @@ function savePricing() {
       if (res && res.success) {
         _cloudPricing = res.pricing || p;
         toast('✅ 打印价格已保存到云端，全端生效', 'success');
-      } else toast('❌ ' + ((res && res.message) || '保存失败'), 'error');
+      } else if (!_writeAuthProblem(res)) {
+        toast('❌ ' + ((res && res.message) || '保存失败'), 'error');
+      }
     })
     .catch(function () { toast('❌ 网络错误', 'error'); });
 }
@@ -5056,17 +5339,28 @@ function updatePassword(key) {
   var input = $('#pwd-' + key);
   if (!input) return;
   var v = input.value.trim();
-  if (!v || v.length < 4) { toast('密码至少 4 位', 'error'); return; }
-  // 只存 SHA-256 哈希，不再存明文（旧明文配置仍可校验，兼容迁移）
-  hashPassword(v).then(function (h) {
-    STORE.config.passwords[key] = 'sha256:' + h;
-    save();
-    input.value = '';
-    toast('✅ ' + MODULE_NAMES[key] + ' 密码已更新', 'success');
-  }).catch(function (e) {
-    // 无 Web Crypto → 拒绝写入（写入 djb2 会让后续正常分支永远解不开锁）
-    toast('❌ ' + (e && e.message ? e.message : '密码保存失败'), 'error');
-  });
+  if (!v || v.length < FINANCE_PASSWORD_MIN_LEN) {
+    toast('密码至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位', 'error');
+    return;
+  }
+  // S1-05：改密走服务端（PBKDF2 + 每模块独立 salt），前端只负责传新密码、把服务端回执的哈希带回页面
+  fetch('/api/local/finance_auth/password', {
+    method: 'POST', headers: apiHeaders(),
+    body: JSON.stringify({ module: key, new_password: v })
+  }).then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!(res && res.success)) {
+        if (_writeAuthProblem(res)) return;
+        toast('❌ ' + ((res && res.message) || '密码保存失败'), 'error');
+        return;
+      }
+      STORE.config.passwords = STORE.config.passwords || {};
+      if (res.stored_hash) STORE.config.passwords[key] = res.stored_hash;
+      save();
+      input.value = '';
+      toast('✅ ' + MODULE_NAMES[key] + ' 密码已更新（PBKDF2，服务端保存）', 'success');
+    })
+    .catch(function () { toast('❌ 网络错误，密码未改动', 'error'); });
 }
 function updateScoreCap(val) {
   if (val < 1) val = 1;
@@ -5549,13 +5843,18 @@ function loadConfig() {
         STORE = migrateConfig(localData);
         save();
         // CEO 首次部署：数据已上云，清空本地副本（成员/密码/评分/流水以云端为准）
-        fetch('/api/local/data', { method: 'DELETE', headers: apiHeaders() })
-          .then(function (r) {
-            toast('✅ 已从本地文件迁移到云端，本地数据副本已清空', 'success');
-          })
-          .catch(function () {
-            toast('✅ 已从本地文件迁移到云端（本地副本清理失败，可在「设置 → 数据管理」重置）', 'success');
-          });
+        // S1-05：DELETE 也是写操作（要 finance_session），没解锁就先记下来、解锁后补做
+        _afterUnlock(function () {
+          fetch('/api/local/data', { method: 'DELETE', headers: apiHeaders() })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+              if (res && res.success) toast('✅ 已从本地文件迁移到云端，本地数据副本已清空', 'success');
+              else toast('✅ 已从本地文件迁移到云端（本地副本清理失败，可在「设置 → 数据管理」重置）', 'success');
+            })
+            .catch(function () {
+              toast('✅ 已从本地文件迁移到云端（本地副本清理失败，可在「设置 → 数据管理」重置）', 'success');
+            });
+        });
       }
       // 旧版本地绑定迁移（仅当尚无云端绑定）
       if (!(STORE.config.memberBindings || []).length) {
@@ -5648,6 +5947,9 @@ function replayOfflinePending() {
   switchTab(window.__initialTab || 'dash');
   // 初始为 loading 骨架
   renderAll();
+  // S1-05：先问服务端「哪些模块还没设密码 / 数据是否只读」——默认密码已停用，
+  // 需要时立即进强制改密流程（D-5 拍板接受的操作摩擦）；随后再加载数据。
+  try { checkFinanceSetup(); } catch (e) {}
   loadConfig();
 })();
 </script>

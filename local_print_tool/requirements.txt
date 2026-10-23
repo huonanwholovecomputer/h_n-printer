@@ -24,6 +24,13 @@ requests>=2.28
 python-socketio>=5.8
 urllib3>=2.0
 
+# S1-02 更新链加固（2026-10-23）：更新清单 ed25519 验签（updater.py 运行时直接 import）。
+#   cryptography —— 校验 update.json 的 sig（Ed25519PublicKey / InvalidSignature）。
+#   打包注意：PyInstaller 的 hooks-contrib 有 hook-cryptography.py + pyi_rth_cryptography_openssl，
+#   但本工具是**延迟 import**（只在检查更新时进入），故 .spec 里再显式列一遍 hiddenimports；
+#   漏收会在门店机点「检查更新」时 ImportError（新客户端将无法升级）。
+cryptography>=41.0
+
 # ============================================================
 # 需要单独安装的外部程序（下载安装后加入系统 PATH）
 # ============================================================

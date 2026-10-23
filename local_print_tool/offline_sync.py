@@ -20,8 +20,32 @@ from printer_config import DEFAULT_OWNER_NAME
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRY_COUNT = 5  # 超过此次数的离线记录不再重试
+# S1-09（客户端韧性）：**离线单永不放弃**。
+# 旧行为：retry_count 到 5 次就再也不会被扫到（SYNC 查询里 `retry_count < 5`），离线单
+# 静默变成"永远不会上云"的僵尸行 —— 门店断网半小时、或云端临时 502 五次，订单就永久丢了。
+# 现在：不按次数放弃（`MAX_RETRY_COUNT` 只作为"重试次数里程碑"用于日志/展示），单条失败
+# 走**指数退避**（60s × 1.5^n，上限 1 小时）后继续重试，直到成功或云端明确业务拒收
+# （4xx：重试也不会成功 ⇒ status='rejected'，仍然可见、可人工重试，绝不删行）。
+MAX_RETRY_COUNT = 50          # 兼容既有引用；不是"放弃阈值"（不再用于 WHERE 过滤）
+NEVER_GIVE_UP = True          # 语义常量：离线队列不因重试次数丢单
+RETRY_BACKOFF_FIRST_S = 60    # 第 1 次失败后的等待时间
+RETRY_BACKOFF_FACTOR = 1.5    # 指数退避倍数
+RETRY_BACKOFF_MAX_S = 3600    # 单条退避上限（1 小时）
+SYNC_LOOP_BACKOFF_MAX_S = 300  # 后台同步循环自身退避上限（5 分钟）
+
 OFFLINE_QUEUE_MAX = 5000  # 离线队列上限，超过时丢弃最旧记录
+
+# offline_orders.status 取值（S1-09）
+STATUS_PENDING = "pending"     # 未同步（等待重试 / 正在重试）
+STATUS_SYNCED = "synced"       # 已同步
+STATUS_REJECTED = "rejected"   # 云端业务拒收（4xx）—— 自动重试无意义，保留给人看/手动重试
+
+
+def retry_backoff_seconds(retry_count: int) -> float:
+    """第 n 次失败后要等多久（秒）：60 × 1.5^(n-1)，上限 3600。纯函数，便于验收。"""
+    n = max(1, int(retry_count or 1))
+    return min(RETRY_BACKOFF_FIRST_S * (RETRY_BACKOFF_FACTOR ** (n - 1)),
+               RETRY_BACKOFF_MAX_S)
 
 
 class OfflineSync:
@@ -39,6 +63,8 @@ class OfflineSync:
         # D5：后台同步的**当前**目标（server_url, token）。单次元组赋值在 CPython 下是
         # 原子的 ⇒ 循环线程读到的要么是整对旧值、要么是整对新值，不会撕裂成「新地址+旧 token」。
         self._sync_target: tuple[str, str] = ("", "")
+        # S1-09：上一轮同步有没有遇到网络错误（后台循环据此做 1.5× 指数退避）
+        self._last_cycle_network_ok = True
         self._init_db()
 
     # ── 数据库初始化 ──
@@ -65,6 +91,21 @@ class OfflineSync:
                 conn.execute("ALTER TABLE offline_orders ADD COLUMN is_admin_print INTEGER DEFAULT 1")
             if "remark" not in cols:
                 conn.execute("ALTER TABLE offline_orders ADD COLUMN remark TEXT DEFAULT ''")
+            # S1-09：状态列 + 退避调度列（旧库补列，幂等迁移）
+            #   status        —— 'pending' 未同步 / 'synced' 已同步 / 'rejected' 云端业务拒收
+            #   next_retry_at —— 早于该时间（epoch 秒）的行本轮不扫（指数退避）
+            #   last_error    —— 最近一次失败原因（展示给人看，不静默吞掉）
+            if "status" not in cols:
+                conn.execute(
+                    f"ALTER TABLE offline_orders ADD COLUMN status TEXT DEFAULT '{STATUS_PENDING}'")
+            if "next_retry_at" not in cols:
+                conn.execute("ALTER TABLE offline_orders ADD COLUMN next_retry_at REAL DEFAULT 0")
+            if "last_error" not in cols:
+                conn.execute("ALTER TABLE offline_orders ADD COLUMN last_error TEXT DEFAULT ''")
+            # 旧库回填：synced=1 的行 status 必须是 'synced'（否则会被当成"未同步"再上报一次）
+            conn.execute(
+                f"UPDATE offline_orders SET status = '{STATUS_SYNCED}' "
+                f"WHERE synced = 1 AND (status IS NULL OR status <> '{STATUS_SYNCED}')")
             conn.commit()
             conn.close()
 
@@ -85,11 +126,12 @@ class OfflineSync:
             conn = sqlite3.connect(self.db_path)
             conn.execute(
                 """INSERT INTO offline_orders (order_number, files_json, total_price, created_at,
-                                               owner_name, is_admin_print, remark, synced)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+                                               owner_name, is_admin_print, remark, synced,
+                                               status, next_retry_at, last_error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, '')""",
                 (order_number, json.dumps(files_data, ensure_ascii=False), total_price,
                  created_at, owner_name or DEFAULT_OWNER_NAME, 1 if is_admin_print else 0,
-                 str(remark or "")[:100]),
+                 str(remark or "")[:100], STATUS_PENDING),
             )
             # P2: 队列无上限保护 —— 超过 OFFLINE_QUEUE_MAX 条时丢弃最旧记录
             cur = conn.execute(
@@ -121,6 +163,32 @@ class OfflineSync:
         remark: str = "",
     ) -> bool:
         """尝试上传单个订单到服务器。返回 True 表示成功。"""
+        ok, _rejected, _err = self._upload_order_detail(
+            db_id, order_number, files_json, total_price, created_at, server_url, token,
+            owner_name, is_admin_print, remark,
+        )
+        return ok
+
+    def _upload_order_detail(
+        self,
+        db_id: int,
+        order_number: str,
+        files_json: str,
+        total_price: float,
+        created_at: str,
+        server_url: str,
+        token: str,
+        owner_name: str = DEFAULT_OWNER_NAME,
+        is_admin_print: bool = True,
+        remark: str = "",
+    ) -> tuple[bool, bool, str]:
+        """上传单条离线订单，返回 `(成功?, 云端业务拒收?, 错误说明)`。
+
+        **业务拒收（4xx）与网络/服务端故障要分开**（S1-09）：
+          · 4xx = 云端明确说"这单我不要/不能收"（订单号非法、已被别的来源占用…）——
+            无限重试没有意义，标记 status='rejected'，仍然留在库里可见、可人工重试；
+          · 网络异常 / 5xx / 429 = 暂时性 —— 保留 pending，按指数退避继续重试（不放弃）。
+        """
         try:
             url = f"{server_url}/api/local_orders"
             payload = {
@@ -134,45 +202,56 @@ class OfflineSync:
                 # 备注（离线打印的订单重连后补报，不丢）
                 "remark": str(remark or "")[:100],
             }
+            # S1-09：请求超时 10s（断网时不会把后台线程挂在半开连接上）
             resp = http_requests.post(url, params={"token": token}, json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
                 logger.info(f"[SYNC] 上传成功: {order_number}")
-                return True
-            else:
-                msg = ""
-                try:
-                    msg = resp.json().get("message", resp.text[:200])
-                except Exception:
-                    msg = resp.text[:200] if resp.text else "无响应"
-                logger.warning(f"[SYNC] 上传失败 ({order_number}): {msg}")
-                return False
+                return True, False, ""
+            msg = ""
+            try:
+                msg = resp.json().get("message", resp.text[:200])
+            except Exception:
+                msg = resp.text[:200] if resp.text else "无响应"
+            rejected = 400 <= int(getattr(resp, "status_code", 0) or 0) < 500
+            logger.warning(f"[SYNC] 上传失败 ({order_number})"
+                           f"{'（云端拒收，停止自动重试）' if rejected else ''}: {msg}")
+            return False, rejected, str(msg or "")[:300]
         except Exception as e:
             logger.warning(f"[SYNC] 网络异常 ({order_number}): {e}")
-            return False
+            return False, False, str(e)[:300]
 
     # ── 批量同步 ──
 
     def sync_all_pending_orders(self, server_url: str = "", token: str = "") -> int:
-        """扫描并上传所有未同步的离线订单。返回本次同步成功的数量。"""
+        """扫描并上传所有未同步的离线订单。返回本次同步成功的数量。
+
+        S1-09：**不按重试次数放弃**，按 `next_retry_at` 退避调度；`status='rejected'`
+        （云端业务拒收）的行不参与自动重试，留给人工在「离线未同步订单」窗里手动重试。
+        """
         if not server_url or not token:
             logger.debug("[SYNC] 未提供服务器 URL 或 token，跳过同步")
             return 0
 
+        self._last_cycle_network_ok = True
+        now = time.time()
         rows = []
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             # 跳过待换号的本地临时订单号（含 "-L" 或 "LOCAL-" 前缀）：
             # 这类订单由 gui._sync_local_orders_to_cloud 在连线时统一换正式号并上报，
             # 若在此处直接上传会污染云端订单号（HN…-L / LOCAL-* 残留），并可能产生重复单。
+            # 注意：**没有 retry_count 上限过滤**（永不放弃），只有退避时间 + 拒收状态过滤。
             rows = list(
                 conn.execute(
                     """SELECT id, order_number, files_json, total_price, created_at,
                               owner_name, is_admin_print, remark
                        FROM offline_orders
-                       WHERE synced = 0 AND retry_count < ?
+                       WHERE synced = 0
+                         AND COALESCE(status, 'pending') <> ?
+                         AND COALESCE(next_retry_at, 0) <= ?
                          AND order_number NOT LIKE '%-L%'
                          AND order_number NOT LIKE 'LOCAL-%'""",
-                    (MAX_RETRY_COUNT,),
+                    (STATUS_REJECTED, now),
                 ).fetchall()
             )
             conn.close()
@@ -184,21 +263,40 @@ class OfflineSync:
         synced_count = 0
 
         for db_id, order_number, files_json, total_price, created_at, owner_name, is_admin_print, remark in rows:
-            success = self.upload_order(
+            ok, rejected, err = self._upload_order_detail(
                 db_id, order_number, files_json,
                 total_price, created_at, server_url, token,
                 owner_name or DEFAULT_OWNER_NAME, bool(is_admin_print), remark,
             )
+            if not ok and not rejected:
+                # 判断"是不是网络/暂时性故障"：业务拒收已单独标记，其余算暂时性
+                self._last_cycle_network_ok = False
 
             with self._lock:
                 conn = sqlite3.connect(self.db_path)
-                if success:
-                    conn.execute("UPDATE offline_orders SET synced = 1 WHERE id = ?", (db_id,))
-                    synced_count += 1
-                else:
+                if ok:
                     conn.execute(
-                        "UPDATE offline_orders SET retry_count = retry_count + 1 WHERE id = ?",
-                        (db_id,),
+                        "UPDATE offline_orders SET synced = 1, status = ?, retry_count = 0, "
+                        "next_retry_at = 0, last_error = '' WHERE id = ?",
+                        (STATUS_SYNCED, db_id),
+                    )
+                    synced_count += 1
+                elif rejected:
+                    conn.execute(
+                        "UPDATE offline_orders SET retry_count = retry_count + 1, "
+                        "next_retry_at = 0, last_error = ?, status = ? WHERE id = ?",
+                        (err or "云端拒收", STATUS_REJECTED, db_id),
+                    )
+                else:
+                    # 指数退避：按"本轮之后"的重试次数算等待时间
+                    cur = conn.execute(
+                        "SELECT retry_count FROM offline_orders WHERE id = ?", (db_id,)
+                    ).fetchone()
+                    next_retry = now + retry_backoff_seconds((cur[0] if cur else 0) + 1)
+                    conn.execute(
+                        "UPDATE offline_orders SET retry_count = retry_count + 1, "
+                        "next_retry_at = ?, last_error = ?, status = ? WHERE id = ?",
+                        (next_retry, err or "", STATUS_PENDING, db_id),
                     )
                 conn.commit()
                 conn.close()
@@ -247,18 +345,30 @@ class OfflineSync:
             return  # 线程继续跑，但下一轮就用新目标
 
         def _loop():
-            while not self._stop_event.wait(interval):
+            # S1-09：后台同步也是"自调度循环"—— 上一轮跑完才排下一轮；失败（网络/服务端
+            # 暂时性故障）按 1.5× 指数退避（上限 5 分钟），成功即恢复基线间隔。
+            delay = float(interval)
+            while not self._stop_event.wait(delay):
                 url, tok = self._sync_target   # 每轮取当前目标，不在闭包里持有旧值
                 if not url or not tok:
+                    delay = float(interval)
                     continue   # 目标被清空（云端关闭）→ 不发请求，也不白耗 retry_count
                 try:
                     self.sync_all_pending_orders(url, tok)
+                    ok = bool(getattr(self, "_last_cycle_network_ok", True))
                 except Exception as e:
                     logger.error(f"[SYNC] 后台同步异常: {e}")
+                    ok = False
+                if ok:
+                    delay = float(interval)
+                else:
+                    delay = min(delay * RETRY_BACKOFF_FACTOR, float(SYNC_LOOP_BACKOFF_MAX_S))
+                    logger.debug(f"[SYNC] 上一轮失败 → {delay:.0f}s 后再试")
 
         self._sync_thread = threading.Thread(target=_loop, daemon=True)
         self._sync_thread.start()
-        logger.info(f"[SYNC] 后台同步已启动（间隔 {interval}s）")
+        logger.info(f"[SYNC] 后台同步已启动（基线间隔 {interval}s，失败退避 1.5× / 上限 "
+                    f"{SYNC_LOOP_BACKOFF_MAX_S}s）")
 
     def stop_background_sync(self):
         """停止后台同步线程。"""
@@ -270,18 +380,7 @@ class OfflineSync:
     # ── 工具方法 ──
 
     def pending_count(self) -> int:
-        """返回尚未同步的离线订单数量。"""
-        with self._lock:
-            conn = sqlite3.connect(self.db_path)
-            row = conn.execute(
-                "SELECT COUNT(*) FROM offline_orders WHERE synced = 0 AND retry_count < ?",
-                (MAX_RETRY_COUNT,),
-            ).fetchone()
-            conn.close()
-            return row[0] if row else 0
-
-    def count_unsynced(self) -> int:
-        """返回所有未同步记录数（含重试耗尽的行；清空本地库前的安全校验用）。"""
+        """返回尚未同步的离线订单数量（S1-09：**不按重试次数过滤**，永不放弃）。"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             row = conn.execute(
@@ -290,9 +389,104 @@ class OfflineSync:
             conn.close()
             return row[0] if row else 0
 
+    def count_unsynced(self) -> int:
+        """返回所有未同步记录数（含拒收的行；清空本地库前的安全校验用）。"""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT COUNT(*) FROM offline_orders WHERE synced = 0",
+            ).fetchone()
+            conn.close()
+            return row[0] if row else 0
+
+    def status_summary(self) -> dict:
+        """未同步订单的状态摘要（供 GUI 角标/离线队列表格）：{pending, rejected, unsynced}。"""
+        out = {"pending": 0, "rejected": 0, "unsynced": 0}
+        try:
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
+                rows = list(conn.execute(
+                    "SELECT COALESCE(status, 'pending') AS st, COUNT(*) "
+                    "FROM offline_orders WHERE synced = 0 GROUP BY st").fetchall())
+                conn.close()
+            for st, n in rows:
+                out[st] = int(n or 0)
+                out["unsynced"] += int(n or 0)
+        except Exception as e:
+            logger.warning(f"[SYNC] 统计离线状态失败: {e}")
+        return out
+
+    def list_unsynced_orders(self, limit: int = 200) -> list[dict]:
+        """列出未同步订单（供「离线未同步订单」窗口展示 + 手动重试）。
+
+        返回字典列表：id / order_number / created_at / total_price / retry_count /
+        status / last_error / next_retry_at / file_count。
+        ⚠ 这些单据**没有**在云端落库（或落库后仍是 reserved），展示时必须标「离线未同步」，
+        绝不能显示成「已完成」。
+        """
+        out: list[dict] = []
+        try:
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
+                rows = list(conn.execute(
+                    """SELECT id, order_number, created_at, total_price, retry_count,
+                              COALESCE(status, 'pending'), COALESCE(last_error, ''),
+                              COALESCE(next_retry_at, 0), files_json
+                       FROM offline_orders WHERE synced = 0
+                       ORDER BY id DESC LIMIT ?""",
+                    (int(limit or 200),),
+                ).fetchall())
+                conn.close()
+            for (db_id, num, created, price, retries, st, err, next_at, files_json) in rows:
+                try:
+                    file_count = len(json.loads(files_json) or [])
+                except Exception:
+                    file_count = 0
+                out.append({
+                    "id": db_id,
+                    "order_number": num,
+                    "created_at": created,
+                    "total_price": float(price or 0),
+                    "retry_count": int(retries or 0),
+                    "status": st or STATUS_PENDING,
+                    "last_error": err or "",
+                    "next_retry_at": float(next_at or 0),
+                    "file_count": file_count,
+                })
+        except Exception as e:
+            logger.warning(f"[SYNC] 列出未同步订单失败: {e}")
+        return out
+
+    def retry_now(self, order_number: str = "") -> int:
+        """手动重试：清掉退避/拒收标记，让下一轮同步立刻（或本轮手动调用）重试。
+
+        参数为空 = 全部未同步订单。返回被重置的行数。
+        """
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            if order_number:
+                cur = conn.execute(
+                    "UPDATE offline_orders SET retry_count = 0, next_retry_at = 0, "
+                    "status = ?, last_error = '' WHERE synced = 0 AND order_number = ?",
+                    (STATUS_PENDING, order_number),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE offline_orders SET retry_count = 0, next_retry_at = 0, "
+                    "status = ?, last_error = '' WHERE synced = 0",
+                    (STATUS_PENDING,),
+                )
+            conn.commit()
+            n = cur.rowcount
+            conn.close()
+        if n > 0:
+            logger.info(f"[SYNC] 已重置 {n} 条离线订单的重试状态（手动重试）")
+        return n
+
     def list_pending_orders(self, like: str = "") -> list:
         """列出待同步的离线订单行（可按 order_number LIKE 过滤），供换号流程使用。
-        返回行元组: (id, order_number, files_json, total_price, created_at, owner_name, is_admin_print, remark)。"""
+        返回行元组: (id, order_number, files_json, total_price, created_at, owner_name, is_admin_print, remark)。
+        S1-09：**不按 retry_count 过滤** —— 换号流程要能捞到"已经重试过很多次"的单。"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             if like:
@@ -300,16 +494,15 @@ class OfflineSync:
                     """SELECT id, order_number, files_json, total_price, created_at,
                               owner_name, is_admin_print, remark
                        FROM offline_orders
-                       WHERE synced = 0 AND retry_count < ? AND order_number LIKE ?""",
-                    (MAX_RETRY_COUNT, like),
+                       WHERE synced = 0 AND order_number LIKE ?""",
+                    (like,),
                 ).fetchall())
             else:
                 rows = list(conn.execute(
                     """SELECT id, order_number, files_json, total_price, created_at,
                               owner_name, is_admin_print, remark
                        FROM offline_orders
-                       WHERE synced = 0 AND retry_count < ?""",
-                    (MAX_RETRY_COUNT,),
+                       WHERE synced = 0""",
                 ).fetchall())
             conn.close()
             return rows
@@ -345,8 +538,9 @@ class OfflineSync:
         with self._lock:
             conn = sqlite3.connect(self.db_path)
             conn.execute(
-                "UPDATE offline_orders SET synced = 1 WHERE order_number = ? AND synced = 0",
-                (order_number,),
+                "UPDATE offline_orders SET synced = 1, status = ?, next_retry_at = 0, "
+                "last_error = '' WHERE order_number = ? AND synced = 0",
+                (STATUS_SYNCED, order_number),
             )
             conn.commit()
             conn.close()

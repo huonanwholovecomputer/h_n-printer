@@ -86,6 +86,13 @@ CONNECT_WAIT_TIMEOUT = 25
 # 断线期间 HTTP 兜底拉单间隔。必须小于服务端 CLIENT_HEARTBEAT_TIMEOUT（90s）——
 # 设备「在线」只看服务端心跳，间隔大于它就会在两次轮询之间被判离线。
 PULL_FALLBACK_INTERVAL = 45
+# S1-09：兜底拉单是**自调度**轮询（上一轮跑完才排下一轮），失败按 1.5× 指数退避。
+# 退避上限 180s **大于** PULL_FALLBACK_INTERVAL 的 90s 心跳约束 —— 这是有意的取舍：
+# 退避只在"这条 HTTP 通道连续失败、且 socket 已断"时发生，此时推送路径本来就到不了本机，
+# 服务端把设备标离线是**如实反映**；订单不会丢（留在服务端 queued），下一次拉通即补发，
+# socket 一恢复则 delay 立刻回基线。换成"6 秒一次死磕一个 502"只会刷屏并把线程占满。
+PULL_FALLBACK_BACKOFF_FACTOR = 1.5
+PULL_FALLBACK_BACKOFF_MAX = 180
 STATUS_QUEUE_MAX = 5000        # status_queue.json 队列上限，超出丢弃最旧条目
 MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停止并保持提示
 
@@ -937,13 +944,16 @@ class CloudClient(QObject):
             except Exception as e:
                 logger.warning(f"回报 page_range_truncated 失败: {e}")
 
-    def pull_pending(self, quiet: bool = False):
+    def pull_pending(self, quiet: bool = False) -> bool:
         """HTTP 拉取云端排队任务（作为 SocketIO 推送的补充）。
 
         quiet=True 时不打失败警告：断线兜底每 PULL_FALLBACK_INTERVAL 一次，长断网期间
-        失败刷屏没有意义（socket 重连循环已在报网络状态）。"""
+        失败刷屏没有意义（socket 重连循环已在报网络状态）。
+
+        Returns（S1-09）：本次**是否成功**（HTTP 通且响应可解析）—— 兜底循环据此做
+        1.5× 指数退避（失败退避、成功即恢复基线间隔）。"""
         if not self.api_url or not self.token:
-            return
+            return False
         try:
             resp = http_requests.get(
                 f"{self.api_url}/api/pull_queued_orders",
@@ -968,12 +978,16 @@ class CloudClient(QObject):
                             )
                             # 自动开始下载
                             self.accept_task(task.task_id)
+                return True
+            logger.debug(f"HTTP 兜底拉单返回非 2xx: {resp.status_code}")
+            return False
         except Exception as e:
             # P2: 拉取失败不再是 debug 级别 —— 需在日志中可见
             if quiet:
                 logger.debug(f"HTTP 兜底拉取失败: {e}")
             else:
                 logger.warning(f"HTTP 拉取排队任务失败: {e}")
+            return False
 
     def _pull_fallback_loop(self):
         """断线期间的 HTTP 兜底拉单。
@@ -982,21 +996,38 @@ class CloudClient(QObject):
         而 /api/pull_queued_orders 又被同一心跳门控 —— socket 掉线但网络正常时（本机代理
         掐断长连接、namespace 握手超时、服务端连接重建），工具会彻底隐身：服务端把订单
         排队等它上线，它却在等 socket 恢复。这里在未连接时主动走 HTTP 保活 + 领单，
-        让「双通道」名副其实。socket 正常时不发这个请求（推送与连线拉取已覆盖）。"""
+        让「双通道」名副其实。socket 正常时不发这个请求（推送与连线拉取已覆盖）。
+
+        S1-09：改成**自调度**（每一轮跑完才排下一轮，间隔从"上一轮结束"算起，绝不会
+        出现两轮叠着跑），失败按 1.5× 指数退避（上限 PULL_FALLBACK_BACKOFF_MAX），
+        成功立刻恢复到 PULL_FALLBACK_INTERVAL。"""
+        delay = float(PULL_FALLBACK_INTERVAL)
         while not self._stop_event.is_set():
-            self._stop_event.wait(PULL_FALLBACK_INTERVAL)
+            # wait 的返回值 = 事件是否被置位（停止）：True 直接退出，不再多跑一轮
+            if self._stop_event.wait(delay):
+                break
             if self._stop_event.is_set():
                 break
             if self._connected or not self.api_url or not self.token:
+                delay = float(PULL_FALLBACK_INTERVAL)   # socket 已恢复 / 未配置 → 回基线
                 continue
             if not self._pull_lock.acquire(blocking=False):
-                continue          # 上一轮还没回来（网络卡住），不叠加
+                delay = float(PULL_FALLBACK_INTERVAL)   # 上一轮还没回来（网络卡住），不叠加
+                continue
+            ok = False
             try:
-                self.pull_pending(quiet=True)
+                ok = bool(self.pull_pending(quiet=True))
             except Exception as e:  # pull_pending 内部已兜底，这里只防意外
                 logger.debug(f"HTTP 兜底拉取异常: {e}")
+                ok = False
             finally:
                 self._pull_lock.release()
+            if ok:
+                delay = float(PULL_FALLBACK_INTERVAL)
+            else:
+                delay = min(delay * PULL_FALLBACK_BACKOFF_FACTOR,
+                            float(PULL_FALLBACK_BACKOFF_MAX))
+                logger.debug(f"HTTP 兜底拉单失败 → {delay:.0f}s 后再试")
 
     # ── 接单接管（2026-11：多设备共连时仅启用接单的设备接收订单）──
 
@@ -2053,7 +2084,7 @@ class CloudClient(QObject):
                     self._report_page_count(file_id, file_name, page_count, orientation)
                     return
 
-            # 3. 确定是否需要转换（优先 Word/WPS COM，降级 LibreOffice 子进程）
+            # 3. 确定是否需要转换（**云端来源 ⇒ Office 强制 LibreOffice，S1-04**）
             if ext in (".doc", ".docx"):
                 if _canceled():
                     return
@@ -2061,9 +2092,10 @@ class CloudClient(QObject):
                 try:
                     from converter import get_converter
                     converter = get_converter()
-                    temp_pdf = converter.convert(temp_dl)
+                    # 顾客上传的内容不可信：不给 Word/WPS COM 机会执行宏
+                    temp_pdf = converter.convert(temp_dl, from_cloud=True)
                 except Exception:
-                    # COM 不可用时降级 LibreOffice
+                    # COM/LibreOffice 都不可用时的最后兜底（同样是 LibreOffice，无宏执行）
                     temp_pdf = self._convert_via_libreoffice(temp_dl)
                 if temp_pdf and os.path.isfile(temp_pdf):
                     from pdf_printer import get_pdf_info
