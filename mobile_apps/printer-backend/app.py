@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import hmac
 import json
@@ -1177,18 +1178,62 @@ def touch_printer_heartbeat(client_id, sid=None):
 _devices_lock = threading.Lock()
 _claim_lock = threading.Lock()
 
+# ==================== 小 JSON 文件的进程内读取缓存（S2-01）====================
+# 背景：devices.json / printer_claim.json / pricing.json 都是"每个请求都读一遍再 json.loads"
+# 的小文件，而命中它们的路径全是高频的 —— 心跳 / printer_state 广播（每次广播遍历全部设备）、
+# 设备列表、接单状态、**每一笔计价**。文件不大，但磁盘 IO + 解析被放大成每秒数百次，
+# 且都发生在持有业务锁的调用方附近。
+#
+# 判据：文件内容的"指纹" = (st_mtime_ns, st_size, st_ino)。带 inode 是刻意的 ——
+# 本仓所有写盘都走"临时文件 + os.replace"，换的是 inode，所以哪怕 mtime 精度粗、
+# 同一秒内改两次，也不会被误判成"没变"。
+_devices_cache = {"sig": None, "data": None}
+_claim_cache = {"sig": None, "data": None}
+
+
+def _json_file_sig(path):
+    """文件指纹；不存在/不可读返回 None。"""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_mtime_ns, st.st_size, getattr(st, "st_ino", 0))
+
+
+def _cached_json_read(path, cache, lock=None):
+    """读取小 JSON 文件，命中缓存则直接返回**深拷贝**（调用方可随意改写返回值）。
+
+    lock=None 表示调用方已经在更粗的锁内（`_load_claim_impl` 的既有契约就是"无锁实现"，
+    它的调用方都持 `_claim_lock`；在那里再取同一把非重入 Lock 会自锁）。
+    文件缺失或损坏返回 None，由调用方决定缺省值。
+    """
+    sig = _json_file_sig(path)
+    if sig is None:
+        return None
+    if lock is None:
+        if cache.get("sig") == sig and cache.get("data") is not None:
+            return copy.deepcopy(cache["data"])
+    else:
+        with lock:
+            if cache.get("sig") == sig and cache.get("data") is not None:
+                return copy.deepcopy(cache["data"])
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if lock is None:
+        cache["sig"], cache["data"] = sig, data
+    else:
+        with lock:
+            cache["sig"], cache["data"] = sig, data
+    return copy.deepcopy(data)
+
 
 def load_devices() -> dict:
     """读取设备注册表；文件缺失/损坏返回空 dict。"""
-    with _devices_lock:
-        if not os.path.exists(DEVICES_FILE):
-            return {}
-        try:
-            with open(DEVICES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, IOError):
-            return {}
+    data = _cached_json_read(DEVICES_FILE, _devices_cache, _devices_lock)
+    return data if isinstance(data, dict) else {}
 
 
 def save_devices(data: dict) -> None:
@@ -1199,6 +1244,9 @@ def save_devices(data: dict) -> None:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp, DEVICES_FILE)
+            # 写回后立刻刷新缓存（省掉下一次 stat+解析，也保证紧随其后的读一定看到新值）
+            _devices_cache["sig"] = _json_file_sig(DEVICES_FILE)
+            _devices_cache["data"] = copy.deepcopy(data)
         except OSError as e:
             print(f"  [DEV] 保存设备注册表失败: {e}")
 
@@ -1403,14 +1451,10 @@ def _printer_probe_from_request() -> dict | None:
 def _load_claim_impl() -> dict:
     """读取接单设备集合（无锁实现，供持锁调用方在 _claim_lock 内使用）。
     新格式: {"claiming_devices": {client_id: {"claimed_at": ..., "owner_name": ...}}}
-    兼容旧格式: {"active_client_id": "xxx", ...} → 读取时自动归一化为 claiming_devices。"""
-    if not os.path.exists(CLAIM_FILE):
-        return {}
-    try:
-        with open(CLAIM_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {}
+    兼容旧格式: {"active_client_id": "xxx", ...} → 读取时自动归一化为 claiming_devices。
+    读取走进程内缓存（S2-01）；缓存本身不加锁 —— 本函数的所有调用方要么已持
+    `_claim_lock`，要么是只读展示路径，缓存写入是单条赋值（CPython 下原子）。"""
+    data = _cached_json_read(CLAIM_FILE, _claim_cache, None)
     if not isinstance(data, dict):
         return {}
     # 旧格式（唯一接管者）→ 新格式（多设备集合）
@@ -1442,6 +1486,9 @@ def _save_claim_impl(data: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CLAIM_FILE)
+        # 写回后刷新缓存（S2-01；与 save_devices 同一口径）
+        _claim_cache["sig"] = _json_file_sig(CLAIM_FILE)
+        _claim_cache["data"] = copy.deepcopy(data)
     except OSError as e:
         print(f"  [CLAIM] 保存接单状态失败: {e}")
 
@@ -2704,6 +2751,37 @@ def init_db():
         """
     )
 
+    # ===== S2-01：高频查询补索引（原来只有幂等键那一条唯一索引，其余全是全表扫）=====
+    # 依据：安全加固计划 §S2-01 / DDoS 报告 R5。逐条对应真实热点查询：
+    #   · orders(openid, id)    —— /api/orders 默认路径 `WHERE openid=? ORDER BY id DESC`；
+    #      索引键是 (openid, rowid)，同 openid 段内按 rowid 递增 ⇒ 反向扫即得倒序，不需要临时排序。
+    #   · orders(created_at)    —— 收支清算 /api/admin/statistics/revenue 的时间区间扫描。
+    #   · order_files(order_id) —— 订单列表中「每个父单查一次子任务」的 N+1、状态聚合、
+    #      结算页的 `order_id IN (...)` 批量查询。
+    #   · order_files(file_id)  —— 过期清理的两条 `SELECT DISTINCT file_id ... status IN (...)`、
+    #      「删除我的文件」的活跃引用校验。
+    #   · files(openid)         —— 存储用量 SUM(size)、按用户删除文件。
+    # 全部 IF NOT EXISTS ⇒ 幂等；已存在的索引不会重建，重复启动零开销。
+    # 放在所有迁移之后（files.openid 是迁移列，之前建会报 no such column）。
+    _S2_INDEXES = (
+        ("idx_orders_openid_id", "CREATE INDEX IF NOT EXISTS idx_orders_openid_id ON orders(openid, id)"),
+        ("idx_orders_created", "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)"),
+        ("idx_order_files_order",
+         "CREATE INDEX IF NOT EXISTS idx_order_files_order ON order_files(order_id)"),
+        ("idx_order_files_file",
+         "CREATE INDEX IF NOT EXISTS idx_order_files_file ON order_files(file_id)"),
+        ("idx_files_openid", "CREATE INDEX IF NOT EXISTS idx_files_openid ON files(openid)"),
+    )
+    _have = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()}
+    for _name, _sql in _S2_INDEXES:
+        try:
+            conn.execute(_sql)
+            if _name not in _have:
+                print(f"  已建立查询索引（{_name}）")
+        except sqlite3.OperationalError as e:
+            print(f"  [WARN] 索引 {_name} 建立失败（不影响启动）: {e}")
+
     conn.commit()
     conn.close()
 
@@ -2835,16 +2913,18 @@ def generate_order_number():
 
 # ==================== 价格计算 ====================
 
-def calculate_price(page_count, duplex, page_range=""):
+def calculate_price(page_count, duplex, page_range="", prices=None):
     """根据有效打印页数（范围过滤后）和双面模式计算价格（单份文件，不含份数倍率）。
     单面打印: simplex_price 元/页（默认 0.2）
     双面打印: duplex_price 元/张（默认 0.3，每张纸可印两页，奇数页最后一张按单面价计费）
     价格来源 pricing.json（与 /api/pricing、前端计费显示、本地打印工具一致，
     在「收支统计 → 设置」中统一维护）；读取失败回退默认 0.2/0.3。
-    page_range 为空 → 按整份页数计。"""
+    page_range 为空 → 按整份页数计。
+    prices：可选 (单面, 双面) 单价。批量计价（如 submit_order 的文件循环）应在循环外
+    调一次 `_load_paper_prices()` 传进来，避免每个文件各走一次读盘/缓存查询。"""
     if page_count <= 0:
         return 0.0
-    simplex_price, duplex_price = _load_paper_prices()
+    simplex_price, duplex_price = prices or _load_paper_prices()
     effective = _count_pages_in_range(page_range or "", page_count)
     if duplex == "on":
         sheets = math.ceil(effective / 2)
@@ -2855,17 +2935,25 @@ def calculate_price(page_count, duplex, page_range=""):
     return round(price, 2)
 
 
+_paper_prices_cache = {"sig": None, "data": None}
+_paper_prices_lock = threading.Lock()
+
+
 def _load_paper_prices() -> tuple[float, float]:
-    """读取 pricing.json 的单双面价格，失败/非法回退默认 0.2/0.3。"""
+    """读取 pricing.json 的单双面价格，失败/非法回退默认 0.2/0.3。
+
+    S2-01：带进程内缓存（按文件指纹失效）—— 原实现**每一笔计价**都读盘 + json.loads，
+    而计价出现在提交订单的每个文件、每个订单的金额重算、结算页每次刷新里。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing.json")
+    cfg = _cached_json_read(path, _paper_prices_cache, _paper_prices_lock)
+    if not isinstance(cfg, dict):
+        return 0.2, 0.3
     try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pricing.json")
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
         sp = float(cfg.get("simplex_price", 0.2) or 0.2)
         dp = float(cfg.get("duplex_price", 0.3) or 0.3)
-        return (sp if sp > 0 else 0.2), (dp if dp > 0 else 0.3)
-    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return 0.2, 0.3
+    return (sp if sp > 0 else 0.2), (dp if dp > 0 else 0.3)
 
 
 # ==================== 订单状态聚合 ====================
@@ -6353,6 +6441,9 @@ def submit_order():
 
         # 插每个子任务
         sub_tasks = []
+        # S2-01：单价在循环外读一次（pricing.json 的 mtime 缓存 + 结构化传参），
+        # 原来每个文件都各走一次 `_load_paper_prices()`（读盘 + json.loads）。
+        _paper_prices = _load_paper_prices()
         for f in files_input:
             f_id = f.get("file_id", "") or ""
             f_name = f.get("file", f.get("file_name", ""))
@@ -6414,7 +6505,8 @@ def submit_order():
             f_duplex = f.get("duplex", duplex) or "on"
 
             is_free_val = 0  # 价格仅用于统计，无免费策略
-            per_copy_price = calculate_price(page_count, f_duplex, f_page_range)
+            per_copy_price = calculate_price(page_count, f_duplex, f_page_range,
+                                             prices=_paper_prices)
             total_price = round(per_copy_price * f_copies, 2)  # 始终计算真实价格，is_free 控制是否收费
             # 普通单从 queued 开始，由 push_print_task_to_client 原子锁定为 printing；
             # 预约单从 scheduled 开始，阶段①下发文件时为 downloading（不进 queued，避免被普通链路误分发）
