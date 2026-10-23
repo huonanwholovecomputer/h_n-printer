@@ -46,7 +46,24 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 最大上传 50MB
 # 与下方 SocketIO 的 cors_allowed_origins="*" 保持一致。只配此一层即可，nginx 不要再加
 # Access-Control-* 头，避免出现重复头。
 # max_age=86400：浏览器缓存 OPTIONS 预检 1 天，避免每次刷新都重发预检导致 nginx 限流 503
-CORS(app, resources={r"/api/*": {"origins": "*"}}, max_age=86400)
+#
+# S2-04（DS-13）：从 "*" 收窄到**白名单**。鉴权走 Bearer 不是 Cookie，所以"任意 Origin"
+# 不算凭据泄露，但它意味着任何网页都能以访客浏览器身份打接口、读状态（含设备列表）。
+# 说明：
+#   · 小程序原生 wx.request 不带 Origin ⇒ 不受 CORS 影响；
+#   · Android Capacitor WebView 的 Origin 是 https://localhost（新版本）/ capacitor://localhost；
+#   · 本地开发端口（127.0.0.1 / localhost 任意端口）用正则放行；
+#   · SocketIO 那一层刻意**不收窄**：本地打印工具的 python-socketio 不发 Origin，
+#     而实时通道本身已经有 S0-02 的握手 token 门 + 事件归属校验，收窄收益小、掉线风险大。
+CORS_ALLOWED_ORIGINS = [
+    "https://hn-space.cn",
+    "https://www.hn-space.cn",
+    "https://localhost",
+    "capacitor://localhost",
+    r"http://localhost(:\d+)?",
+    r"http://127\.0\.0\.1(:\d+)?",
+]
+CORS(app, resources={r"/api/*": {"origins": CORS_ALLOWED_ORIGINS}}, max_age=86400)
 # S1-07（R7）：`async_handlers=False` —— 事件在处理线程内**同步**执行。本仓 handler
 # 全是同步 SQL，异步化只会把"一个请求占线程"搬成"占住该设备的事件线程"，症状更隐蔽
 # （计划 §1.4 依赖 2：先做 collect_all 的异步化，再改这里 —— 见 log_collect_all）。
@@ -174,6 +191,33 @@ app.wsgi_app = _sio_handshake_gate(app.wsgi_app)
 # （计划附录 A-1：传了会 TypeError、后端直接起不来）。
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 # 注意：以上两行依赖下方定义的 _printer_token_ok()，在请求期解析（模块导入完成后才收请求）。
+
+
+# ===== S2-04（DS-13/R4）：安全响应头 =====
+# 这些头对所有响应生效（含上传目录里被下载的文件）：
+#   · nosniff —— 浏览器不得把上传的文件按内容猜成 HTML/JS 执行（文件下载面必配）；
+#   · X-Frame-Options + CSP frame-ancestors —— 任何站点都不能把接口/文件嵌进 iframe；
+#   · Referrer-Policy —— 带 file_id/下载 token 的 URL 不随 Referer 外发；
+#   · HSTS 只在 https 下加（本机 http 调试不加，避免"localhost 被强制 https"）。
+# 刻意不加 Cross-Origin-Resource-Policy：APK 的 WebView 与第三方客户端会跨源取图，
+# 收紧它容易变成"图片不显示"的线上疑难杂症，收益（防 no-cors 嵌入）远小于代价。
+@app.after_request
+def _apply_security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Content-Security-Policy",
+                            "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+    resp.headers.setdefault("Permissions-Policy",
+                            "geolocation=(), microphone=(), camera=()")
+    try:
+        if request.is_secure:
+            resp.headers.setdefault("Strict-Transport-Security",
+                                    "max-age=31536000; includeSubDomains")
+    except Exception:
+        pass
+    return resp
+
 
 DATABASE = "orders.db"
 USER_DATABASE = "users.db"
@@ -1575,13 +1619,29 @@ def is_printer_available() -> bool:
     return len(get_claiming_device_ids()) > 0
 
 
-def device_display_label(client_id: str) -> str:
+def _mask_person_name(name: str) -> str:
+    """S2-04：对外接口里的真实姓名脱敏（保留首字，其余 *）。
+
+    背景（DS-12/DS-13）：`/api/printer_status` 与 `/api/claiming_devices` 是**公开**接口
+    （不需要登录），却直接下发设备所有者的真实姓名（如「姚懿祥的设备 | DESKTOP-…」）——
+    任何人扫一眼接口就能拿到店里员工的真实姓名 + 机器标识。管理侧的
+    `/api/printer/devices`（printer token + admin scope）仍然返回真名，绑定/对账不受影响。
+    """
+    name = (name or "").strip()
+    if not name:
+        return ""
+    return name[0] + "*" * max(1, len(name) - 1)
+
+
+def device_display_label(client_id: str, mask: bool = False) -> str:
     """设备展示名：「{所有者}的设备 | {client_id}」，如「姚懿祥的设备 | DESKTOP-EJGEB1V-a6c1a1365e」。
-    未绑定所有者 → 直接显示 client_id。"""
+    未绑定所有者 → 直接显示 client_id。mask=True 时所有者姓名按 _mask_person_name 脱敏。"""
     if not client_id:
         return ""
     entry = get_device_entry(client_id)
     owner = entry.get("owner_name", "") or ""
+    if mask:
+        owner = _mask_person_name(owner)
     if owner:
         return f"{owner}的设备 | {client_id}"
     return client_id
@@ -5268,7 +5328,9 @@ def printer_status():
         "take_orders_online": len(online_claiming) > 0,
         "claiming_count": len(claiming_ids),
         "active_client_id": online_claiming[0] if online_claiming else "",
-        "active_owner_name": get_device_owner(online_claiming[0]) if online_claiming else "",
+        # S2-04：公开接口不下发真实姓名（真名只在 /api/printer/devices 的管理 scope 里）
+        "active_owner_name": _mask_person_name(
+            get_device_owner(online_claiming[0]) if online_claiming else ""),
     })
 
 
@@ -7276,9 +7338,10 @@ def claiming_devices():
         result.append({
             "client_id": cid,
             "device_name": dev.get("device_name", "") or cid,
-            "owner_name": dev.get("owner_name", "") or "",
+            # S2-04：公开接口 —— 姓名脱敏（真名只在 /api/printer/devices 的管理 scope 里）
+            "owner_name": _mask_person_name(dev.get("owner_name", "") or ""),
             "online": online,
-            "label": device_display_label(cid),
+            "label": device_display_label(cid, mask=True),
             # 自动双面能力（三态；移动端无障碍打印的判定依据之一）
             **_device_capability_fields(cid),
             "stack_mode": st["mode"],
