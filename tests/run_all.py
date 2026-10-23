@@ -96,12 +96,11 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   _blurRangeInputs；见 tests/verify_range_input_focus_blur.js）⇒ 登记过渡项；
 #   **同日已重打 1.1.42（versionCode 43）并通过 verify_apk_release.py +
 #   verify_apk_version_manifest.py + verify_apk_published.py ⇒ 该项已删除**。
-EXPECTED_RED: dict[str, str] = {
-    # 源码已改、APK 产物待重建（S1-09 改了 www/{app,me,print,updater}.js 的请求超时/
-    # 轮询自调度/更新链）。解除条件：跑一次 build-release-apk.ps1 重新出包并同步三份
-    # app_update.json 后，**立刻删掉本条**（否则它会长期掩盖真实资源不同步）。
-    "verify_apk_release.py": "APK 内 web 资源落后于 www/（S1-09 客户端韧性改动），需重建 APK",
-}
+# 2026-10-23（S1-09 客户端韧性）：改了 www/{app,me,print,updater}.js（全量请求超时 /
+#   轮询自调度+1.5×退避 / 更新链打开下载页）⇒ 登记过渡项；**同日已重打 1.1.43
+#   （versionCode 44）并通过 verify_apk_release.py + verify_apk_version_manifest.py +
+#   verify_apk_published.py（线上清单/大小/md5 全部一致）⇒ 该项已删除**。
+EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}

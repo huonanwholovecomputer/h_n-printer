@@ -200,9 +200,17 @@ def static_gui_checks() -> None:
           and "self._warn_html_unsupported(html_rejected)" in gui)
 
     # ── 版本号 ──
-    check('gui.py APP_VERSION == "4.5.32"', 'APP_VERSION = "4.5.32"' in gui)
-    check("version_info.txt 同步 4.5.32（filevers/prodvers/FileVersion/ProductVersion）",
-          "(4, 5, 32, 0)" in vi and "u'4.5.32'" in vi and "4.5.31" not in vi)
+    # 判据是「两处同步」而不是「等于某个写死的版本号」：后者每发一版都要改验收脚本，
+    # 2026-10-23 发 4.5.33 时就因此误红（红在断言上，不是真回归）。版本号本身由发版流程管。
+    m_ver = re.search(r'APP_VERSION\s*=\s*"([0-9]+(?:\.[0-9]+)+)"', gui)
+    ver = m_ver.group(1) if m_ver else ""
+    check("gui.py 能取到 APP_VERSION", bool(ver), f"APP_VERSION={ver!r}")
+    if ver:
+        tuple_lit = "(" + ", ".join(ver.split(".")) + ", 0)"
+        check(f"version_info.txt 与 APP_VERSION 同步（{ver}）",
+              tuple_lit in vi and vi.count(f"u'{ver}'") >= 2,
+              f"期望 {tuple_lit} 与 u'{ver}' 各出现（filevers/prodvers/FileVersion/ProductVersion），"
+              f"实际 tuple={tuple_lit in vi} 次数={vi.count(chr(117) + chr(39) + ver + chr(39))}")
 
 
 def static_mobile_checks() -> None:

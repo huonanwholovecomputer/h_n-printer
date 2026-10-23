@@ -1,6 +1,9 @@
 {
-  "version": "4.5.32",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.32.exe",
-  "md5": "9671732a159a14c508bc476bc82cc781",
-  "notes": "v4.5.32（安全加固）：① 不再支持 HTML 文件 —— 文件对话框、拖入、Ctrl+V 粘贴三个入口都会提示「本工具已不支持 HTML 文件，请另存为 PDF/DOCX 后打印」，转换器里 .html/.htm 的注册也一并删除（原因是顾客上传的 HTML/Markdown 会在本机转换管线里执行脚本、能读本机配置并外发）。② Markdown 转换改用隔离模式：关闭 JS 执行、不允许本地文件访问，转换前先扫描不安全语法（file: 路径 / UNC 共享 / script / iframe / object / embed / 内联事件 / data:text/html），命中即明确报错「文档包含不安全内容」而不是照旧转换；文档引用的本地图片会被内联进 PDF，缺图 / 越界 / 单文件超过 10MB 时**明确失败**（不再静默少印图片）—— Markdown 里有相对路径图片时，请把图片与文档放在同一目录。③ 云端同步拒绝 .html/.htm/.shtml/.xhtml/.svg/.js/.mjs 上传（对旧版客户端立即生效）。④ 含 4.5.31 全部内容（本地单失败回落、攒批收尾 UI 等）。"
+  "version": "4.5.33",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.33.exe",
+  "md5": "ac49104f044640d5a23248007494576a",
+  "sha256": "5273799297ead45ea9d1378f9718a2051375405b88b1e3f8cc8fb04ae87a7019",
+  "notes": "v4.5.33（安全加固 · 客户端部分）：① 更新流程收紧 —— 启动检查只提示新版本，必须点「立即下载并更新」才会下载安装（不再自动静默装）；更新清单要过 ed25519 签名 + 下载地址白名单 + sha256/md5 校验，安装包落在私有目录并保留上一版用于回滚。② 云端 Word/Excel 一律改用 LibreOffice 转换：本机必须安装 LibreOffice（未安装会明确报错并提示安装），不再走可执行宏的 Word/WPS 自动路径；本机手动打印 Word 仍可用 Word/WPS，但已关闭宏执行、链接自动更新与宏提示。③ 财务页：首次打开强制设置财务密码（默认 123456 已停用），之后每个敏感模块单独解锁、会话 30 分钟；print_data.json 被程序外部整份改写时页面转只读并要求人工确认；所有改动写审计日志。④ 离线订单不再放弃：新增「📴 离线未同步 N」角标与明细窗，离线单联网后自动重试上传 —— 升级后一批历史离线单可能重新上云入账，请财务按明细窗核对。⑤ 取号等待 30 秒 → 4 秒：弱网时更常用 -L 本地号先开打、随后自动换正式号补报（单据不丢）。⑥ 结算页「离线未同步 / 云端拒收」的订单不计收益。含 4.5.32 全部内容（不再支持 HTML、Markdown 隔离模式等）。",
+  "sig_algo": "ed25519",
+  "sig": "mV5s4qFtlVUSg0v6clvJumue8Lq0ciJYx9tQ/FWqB3p6oQb/7QAtuh3nofcJXRihGjHvAb/XdnhZormBquPvDw=="
 }

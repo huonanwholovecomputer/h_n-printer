@@ -42,6 +42,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import traceback
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace",
@@ -175,9 +176,24 @@ def raw_fp():
     parts = []
     for name in ("orders.db", "orders.db-wal", "orders.db-shm"):
         p = os.path.join(os.getcwd(), name)
-        if os.path.exists(p):
-            with open(p, "rb") as f:
-                parts.append("%s:%s" % (name, hashlib.sha256(f.read()).hexdigest()))
+        # WAL/SHM 是 SQLite 随连接开关**动态创建/删除**的：`os.path.exists()` 判真之后、
+        # `open()` 之前被它自己删掉是常态（2026-10-23 发版回归里就撞上了 —— 整个脚本
+        # FileNotFoundError 红在异常上，一个断言都没跑）。
+        # 这里只把「读不到」当成「此刻不存在」，判据一律不变：下面 `STRICT_RAW = (_r0 == _r1)`
+        # 本来就会在原始文件不稳定时自动放弃"原始文件哈希相等"这条判据。
+        data = None
+        for _ in range(5):
+            try:
+                with open(p, "rb") as f:
+                    data = f.read()
+                break
+            except FileNotFoundError:
+                time.sleep(0.01)
+                continue
+            except OSError:
+                break
+        if data is not None:
+            parts.append("%s:%s" % (name, hashlib.sha256(data).hexdigest()))
     return "|".join(parts)
 
 
