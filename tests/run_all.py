@@ -57,6 +57,10 @@ ENV_REQUIRED: dict[str, str] = {
     "verify_order_status_edit_adversarial.mjs": "需 Playwright / 真实浏览器（同一功能的对抗式 UI 探针："
                                                 "控制台绕过、本地模式跨库 id、零请求判据的变异自证；"
                                                 "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
+    "verify_finance_setup_merge_render.mjs": "需 Playwright / 真实浏览器（「首次设置按钮常驻」与"
+                                            "「未解锁就弹合并且必定 403」两处 UI 逻辑只能靠真实渲染量："
+                                            "桩后端 + 真实 settlement.html，并渲染 HEAD 旧版作反向自证；"
+                                            "--all 或直接 node 可跑）",
 }
 
 # 非验收脚本（工具/选型/测量），不参与 PASS 计数

@@ -906,8 +906,13 @@ function hasRealData(store) {
   if (cfg.members && cfg.members.length) return true;
   // 配过 openid 绑定 → 算真实数据
   if ((cfg.memberBindings || []).length) return true;
-  // 改过密码（任一不等于默认哈希）→ 算真实数据
-  if (cfg.passwords) {
+  // 改过密码（任一不等于默认哈希）→ 算真实数据。
+  // ⚠ **只在本地模式**算：云端模式下 print_data.json 只是「本机凭据副本 + 离线期间的暂存」，
+  //   而服务端每次写本机文件都会把 _finance_credentials 回填进 config.passwords
+  //   （stats_server._preserve_credentials）。把凭据镜像算成业务数据 ⇒「本地也有真实数据」
+  //   永远成立 ⇒ **每次打开结算页都弹「本地与云端均存在数据，是否合并」**，而合并要
+  //   finance_session、没解锁就必定 403（2026-10-23 现场：每次开页两条 write_denied）。
+  if (FINANCE_MODE !== 'cloud' && cfg.passwords) {
     var keys = Object.keys(cfg.passwords);
     for (var i = 0; i < keys.length; i++) {
       if ((cfg.passwords[keys[i]] || '') !== (DEFAULT_PASSWORDS[keys[i]] || '')) return true;
@@ -1626,8 +1631,13 @@ function lockModule(key) {
   toast('🔒 ' + (MODULE_NAMES[key] || key) + ' 已锁定');
   renderCurrent();
 }
-/* 首次强制改密：默认/未设置密码的模块必须先在页面上设新密码（D-5 拍板接受的操作摩擦）。
-   非模态无法关闭太久：用户点掉背景也会再弹一次，避免"默认密码永远有效"。 */
+/* 首次设置密码：默认/未设置密码的模块必须先在页面上设新密码（D-5 拍板接受的操作摩擦）。
+   **强制体现在两点，不体现在「关不掉的窗」上**：
+     ① 服务端把默认/未设置判成 needs_setup 并拒绝解锁（真正起作用的那道门）；
+     ② 解锁时撞上 needs_setup → 直接把人送进这个框。
+   所以这个框**可以关**（旧写法不给取消按钮、点背景还会 400ms 后再弹，撞上
+   「数据只读 / 已经设过密码」这类重试多少次都一样的结果时就变成"永远关不掉"的弹窗）。 */
+var _setupModalOpen = false;
 function openFinanceSetupModal(needList) {
   /* 入口：先问服务端「现在到底哪些模块还没密码」，避免"全都设好了还硬弹窗/失败后无限重弹"。
      明确传了 needList（checkFinanceSetup 拿到 needs_setup）就直接渲染。 */
@@ -1636,12 +1646,15 @@ function openFinanceSetupModal(needList) {
     var need = (st && st.success && st.needs_setup) ? st.needs_setup : PASSWORD_KEYS.slice();
     if (!need.length) {
       toast('✅ 所有模块都已设置密码，请直接解锁需要编辑的模块');
+      try { _refreshFinanceSetupSlot(); } catch (e) {}
       return;
     }
     return _renderSetupModal(need);
   }).catch(function () { return _renderSetupModal(PASSWORD_KEYS.slice()); });
 }
 function _renderSetupModal(need) {
+  if (_setupModalOpen) return;      // 已经有一个在等：别叠出第二层（解锁引导与首载检查会同时来）
+  _setupModalOpen = true;
   var names = (need || []).map(function (k) { return MODULE_NAMES[k] || k; }).join('、');
   return openModal({
     title: '🔐 设置财务密码（首次必须）',
@@ -1652,10 +1665,11 @@ function _renderSetupModal(need) {
       + '<input id="fpNew1" type="password" placeholder="新密码（≥' + FINANCE_PASSWORD_MIN_LEN + ' 位）" autocomplete="new-password" style="width:100%;margin-bottom:8px">'
       + '<input id="fpNew2" type="password" placeholder="再次输入新密码" autocomplete="new-password" style="width:100%">'
       + '<p style="margin:8px 0 0;color:var(--muted);font-size:.78rem">忘记密码只能删除本机收支数据后重新设置（钱相关，刻意不做自助找回）。</p>',
-    confirmText: '设置密码', cancelText: ''
+    confirmText: '设置密码', cancelText: '稍后设置'
   }).then(function (val) {
-    if (!val) {   // 点背景/ESC 关掉 → 再来一次（强制）
-      setTimeout(function () { _renderSetupModal(need); }, 400);
+    _setupModalOpen = false;
+    if (!val) {   // 「稍后设置」/点背景/ESC：关掉就关掉（入口留在设置页，见 _refreshFinanceSetupSlot）
+      toast('稍后可在「设置 → 敏感模块密码」里设置；未设置密码的模块解不开锁');
       return;
     }
     var a = ($('#fpNew1') || {}).value || '';
@@ -1676,7 +1690,16 @@ function _renderSetupModal(need) {
         toast('✅ 财务密码已设置：' + okNames + '（请解锁需要编辑的模块）', 'success');
         _pendingSave = true;                       // 设置结果随后落盘（解锁后自动补做）
         _afterUnlock(function () { save(); });
+        try { _refreshFinanceSetupSlot(); } catch (e) {}
         renderCurrent();
+      } else if (r.code === 'read_only' || r.code === 'already_configured') {
+        /* 这两类失败**重试多少次结果都一样**（只读保护 / 状态过时），再弹一次只会
+           变成关不掉的窗：明确告诉人怎么办，然后收手并刷新入口状态。 */
+        toast('❌ ' + (r.message || '设置密码失败'), 'error', true);
+        if (r.code === 'read_only') {
+          toast('本机数据处于只读保护，请先在顶部横幅点「我已确认，重建基线」', 'error', true);
+        }
+        try { _refreshFinanceSetupSlot(); } catch (e) {}
       } else {
         toast('❌ ' + (r.message || '设置密码失败'), 'error');
         setTimeout(function () { _renderSetupModal(need); }, 600);
@@ -5122,7 +5145,7 @@ function renderSettings() {
   h += '<div style="margin-bottom:10px;padding:8px 10px;background:var(--surface2,#f6f7fb);border-radius:8px;font-size:.8rem;color:var(--muted)">'
     + 'S1-05：默认密码（旧版 <code>123456</code>）已被服务端停用；密码以 <b>PBKDF2-HMAC-SHA256「每模块独立 salt」</b>'
     + ' 保存（≥210k 迭代），解锁后由本机服务端签发 30 分钟会话，所有写操作都要它。'
-    + '<button class="btn sm" style="margin-left:8px" onclick="openFinanceSetupModal()">🔐 首次设置/批量重置未设置模块</button></div>';
+    + '<span id="financeSetupSlot"></span></div>';
   PASSWORD_KEYS.forEach(function (k) {
     h += '<div class="settings-row"><label>' + MODULE_NAMES[k] + ' 密码</label>';
     h += '<input type="password" id="pwd-' + k + '" placeholder="输入新密码（至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位）" style="width:200px" autocomplete="new-password">';
@@ -5207,8 +5230,28 @@ function renderSettings() {
   h += '</div>';
 
   el.innerHTML = _lz(h);
-  // DOM 就绪后再异步填充云端价格表单
+  // DOM 就绪后再异步填充云端价格表单；顺便按服务端状态决定「首次设置」入口显不显示
+  try { _refreshFinanceSetupSlot(); } catch (e) {}
   if (FINANCE_MODE !== 'local') loadCloudPricingForm();
+}
+/* 「首次设置密码」入口**按服务端状态显示**：只有真的还有模块没设密码时才出现。
+   旧写法是无条件渲染那个按钮 —— 7 个模块全配好之后它照样常驻在设置页顶部，
+   点下去只回一句「所有模块都已设置密码」，看起来就是"这个按钮永远关不掉"
+   （2026-10-23 用户反馈「一直不消失」）。状态拿不到时留一个兜底入口，不把唯一入口藏了。 */
+function _refreshFinanceSetupSlot() {
+  financeAuthStatus().then(function (st) {
+    var slot = $('#financeSetupSlot');
+    if (!slot) return;                       // 已经切到别的 tab / 又渲染过一轮
+    var need = (st && st.success && st.needs_setup) ? st.needs_setup : null;
+    if (need === null) {
+      slot.innerHTML = '<button class="btn sm" style="margin-left:8px" onclick="openFinanceSetupModal()">🔐 首次设置密码</button>';
+      return;
+    }
+    if (!need.length) { slot.innerHTML = ''; return; }
+    slot.innerHTML = '<button class="btn sm" style="margin-left:8px" onclick="openFinanceSetupModal()">'
+      + '🔐 为 ' + need.length + ' 个未设置密码的模块批量设置</button>'
+      + '<span style="margin-left:6px">（' + esc(need.map(function (k) { return MODULE_NAMES[k] || k; }).join('、')) + '）</span>';
+  }).catch(function () {});
 }
 /* ==================== 打印价格（收支统计设置 → 全局定价） ====================
    云端模式：读写服务器 pricing.json（/api/proxy/pricing，printer token 鉴权），
@@ -5788,6 +5831,67 @@ function renderAbout() {
 }
 
 /* ==================== 初始化 ==================== */
+/* ── 本地 / 云端都有数据时的「安全合并」（2026-10-23 现场反馈后重写） ──
+   合并要把结果写回**云端配置**（/api/proxy/finance/config）与**本机文件**（/api/local/data），
+   两者都是写操作 ⇒ 都必须带 finance_session。旧写法在页面刚打开、什么都没解锁的时候就弹框，
+   点「合并」必然 403 → 红字「需要先解锁财务模块（finance_session）才能写入」，数据一点没合并，
+   下次打开照旧再弹（现场审计日志：每次开页两条 write_denied）。现在的口径：
+     · 有会话 → 立刻问；没会话 → **先不问**，把上下文挂到 _afterUnlock，等真解锁了再问；
+     · 合并成功 → 清空本机那份**重复副本**（业务数据以云端为准），否则下次打开又会问一遍；
+       凭据不清 —— 服务端 _preserve_credentials 会保留 _finance_credentials 并回填
+       config.passwords，密码不会因为这次清空而丢；
+     · 上传失败 → 本机副本原样保留（不丢数据），下次解锁后可以再合并。 */
+var _mergeCtx = null;
+function _queueMergePrompt(localData, cloudData) {
+  _mergeCtx = { local: localData, cloud: cloudData };
+  if (FINANCE_SESSION) return _openMergeConfirm();
+  _afterUnlock(_openMergeConfirm);
+  toast('ℹ️ 本机还留有一份离线收支数据；解锁任一财务模块后会询问是否合并上传');
+  return null;
+}
+function _openMergeConfirm() {
+  if (!_mergeCtx) return null;
+  if (!FINANCE_SESSION) { _afterUnlock(_openMergeConfirm); return null; }   // 还没解锁：继续等
+  var ctx = _mergeCtx;
+  _mergeCtx = null;
+  return openConfirm(
+    '检测到本地与云端均存在收支数据（本地为离线期间产生，云端为多人共用）。\n\n' +
+    '为避免数据丢失，将执行「安全合并」：\n' +
+    '· 订单/流水/成员按记录合并（去重；示例占位名不并入）\n' +
+    '· 密码与服务评分以云端为权威（本地无法覆盖云端密码与评分）\n\n' +
+    '合并结果会上传云端，并清空本机这份重复副本。是否合并？',
+    '合并'
+  ).then(function (ok) {
+    if (!ok) {
+      // 取消 = 以云端为准（云端是多人共用权威）；本机副本保留，下次解锁后还会问一次
+      toast('已按云端数据展示（本机副本保留，解锁后可再合并）');
+      return;
+    }
+    _applyMerge(ctx.local, ctx.cloud);
+  });
+}
+function _applyMerge(localData, cloudData) {
+  STORE = mergeStores(localData, cloudData || localData);
+  var keys = allMonthKeys();
+  currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
+  renderAll();
+  return _saveToServer(STORE, true).then(function (sr) {
+    if (!sr.ok) {
+      toast('⚠️ 合并结果没能上传云端，本机副本已保留（解锁后可重试）', 'error', true);
+      return;
+    }
+    toast('✅ 已安全合并本地与云端数据并上传', 'success');
+    _clearLocalDuplicate();
+  });
+}
+function _clearLocalDuplicate() {
+  var blank = { config: {}, records: { expenses: [], income: [], scores: [], transfers: [] },
+                notes: {}, meta: { version: 0 } };
+  _saveToLocalFile(blank).then(function (lr) {
+    if (lr.ok) toast('🧹 已清空本机重复副本（收支数据以云端为准）', 'success');
+    else toast('⚠️ 本机重复副本清理失败（云端数据不受影响）', 'error');
+  });
+}
 var _configLoaded = false;
 function loadConfig() {
   if (FINANCE_MODE === 'local') {
@@ -5813,29 +5917,9 @@ function loadConfig() {
       var localReal = hasRealData(localData);
       var cloudReal = hasRealData(cloudData);
       if (localReal && cloudReal && localData) {
-        // 两边都有真实数据 → 询问合并（安全合并；密码/评分单向权威保护）
-        openConfirm(
-          '检测到本地与云端均存在收支数据（本地为离线期间产生，云端为多人共用）。\n\n' +
-          '为避免数据丢失，将执行「安全合并」：\n' +
-          '· 订单/流水/成员按记录合并（去重；示例占位名不并入）\n' +
-          '· 密码与服务评分以云端为权威（本地无法覆盖云端密码与评分）\n\n' +
-          '是否合并并上传云端？',
-          '合并'
-        ).then(function (ok) {
-          if (ok) {
-            STORE = mergeStores(localData, cloudData || localData);
-            // 合并结果写回本地 + 云端
-            _saveToServer(STORE, true).then(function (sr) {
-              if (sr.ok) toast('✅ 已安全合并本地与云端数据并上传', 'success');
-              else toast('⚠️ 合并结果已保留，云端保存失败', 'error');
-            });
-            _saveToLocalFile(STORE);
-            finishLoad(true);
-          } else {
-            // 用户取消合并：以云端为准（云端是多人共用权威）
-            finishLoad(true);
-          }
-        });
+        // 两边都有真实数据 → 询问「安全合并」（写操作要有会话：没解锁就先不问、等解锁再问）
+        _queueMergePrompt(localData, cloudData);
+        finishLoad(true);
         return;
       }
       // 无云端真实数据但本地有 → 本地一次性迁移到云端（CEO 首次部署）

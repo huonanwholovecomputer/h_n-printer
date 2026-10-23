@@ -291,16 +291,43 @@ def static_html():
     chk("改密框有两个密码输入 + 长度校验 + 两次一致性校验",
         all(k in html for k in ('id="fpNew1"', 'id="fpNew2"', "两次输入不一致",
                                 "FINANCE_PASSWORD_MIN_LEN")))
-    chk("改密框被点掉会再弹（强制，不能靠关窗绕过）",
-        re.search(r"if \(!val\) \{[\s\S]{0,200}?_renderSetupModal\(need\)", html) is not None)
+    chk("改密框**可以关**（取消按钮存在；强制靠服务端拒绝默认密码，不靠关不掉的窗）",
+        re.search(r"confirmText: '设置密码', cancelText: '稍后设置'", html) is not None
+        and re.search(r"if \(!val\) \{[\s\S]{0,260}?return;", html) is not None
+        and re.search(r"if \(!val\) \{[\s\S]{0,260}?_renderSetupModal\(need\)", html) is None)
+    chk("同一个改密框不会叠出第二层（_setupModalOpen 闸门）",
+        re.search(r"if \(_setupModalOpen\) return;", html) is not None
+        and re.search(r"_setupModalOpen = false;", html) is not None)
     chk("入口先问服务端哪些模块没密码（全设好就不硬弹窗、不无限重弹）",
         re.search(r"function openFinanceSetupModal\(needList\)[\s\S]{0,500}?if \(!need\.length\) \{"
                   r"[\s\S]{0,200}?所有模块都已设置密码", html) is not None)
+    _i_term = html.find("else if (r.code === 'read_only' || r.code === 'already_configured')")
+    _term_branch = html[_i_term:_i_term + 900] if _i_term >= 0 else ''
+    _cut = _term_branch.find('} else {')
+    if _cut >= 0:
+        _term_branch = _term_branch[:_cut]
+    chk("「重试多少次都一样」的失败不再重弹（read_only / already_configured 收手）",
+        _i_term >= 0 and "_refreshFinanceSetupSlot" in _term_branch
+        and "_renderSetupModal" not in _term_branch,
+        _term_branch[:120])
     chk("设置成功后把结果写回 STORE（含每模块的 PBKDF2 哈希）并提示需解锁",
         re.search(r"function financeSetup\(newPassword, moduleKey\)[\s\S]{0,1200}?"
                   r"STORE\.config\.passwords\[k\] = stored\[k\]", html) is not None
         and "请解锁需要编辑的模块" in html
         and re.search(r"financeSetup\(a, 'all'\)\.then[\s\S]{0,700}?save\(\)", html) is not None)
+
+    print("\n-- B3b 「首次设置」按钮只在真的还有模块没密码时出现 --")
+    chk("设置页不再无条件渲染那个按钮（槽位 #financeSetupSlot）",
+        'id="financeSetupSlot"' in html
+        and re.search(r'首次设置/批量重置未设置模块</button>', html) is None)
+    chk("_refreshFinanceSetupSlot 读服务端 needs_setup：为空就不渲染任何按钮",
+        re.search(r"function _refreshFinanceSetupSlot\(\)[\s\S]{0,900}?if \(!need\.length\) \{ slot\.innerHTML = ''; return; \}", html) is not None)
+    chk("确实还有未设置模块时才给批量设置入口（带数量与模块名）",
+        re.search(r"为 ' \+ need\.length \+ ' 个未设置密码的模块批量设置", html) is not None)
+    chk("renderSettings 渲染完就刷新该槽位（改完密码回来按钮自动消失）",
+        re.search(r"el\.innerHTML = _lz\(h\);[\s\S]{0,300}?_refreshFinanceSetupSlot\(\)", html) is not None)
+    chk("状态拿不到时留兜底入口（不把唯一入口也藏掉）",
+        re.search(r"if \(need === null\) \{[\s\S]{0,300}?首次设置密码</button>", html) is not None)
 
     print("\n-- B4 写操作没有会话就不发 / 失效就回锁 --")
     chk("_doSave 在无会话时不发写请求（避免必 403 的噪音与假成功）",
@@ -328,6 +355,33 @@ def static_html():
     chk("本地数据读/写都接收服务端下发的 integrity / read_only",
         re.search(r"if \(typeof res\.read_only !== 'undefined'\)", html) is not None
         and "_integrityReadOnly = !!res.read_only" in html)
+
+    print("\n-- B6 「本地 vs 云端」合并：没会话不弹、解锁后再问、合并完清掉本地副本 --")
+    _i_load = html.find("function loadConfig()")
+    _load_body = html[_i_load:_i_load + 2600] if _i_load >= 0 else ''
+    chk("loadConfig 的合并分支不再直接写（无会话必 403 的 write_denied 就在这里产生）",
+        "_queueMergePrompt(localData, cloudData);" in _load_body
+        and "_saveToServer(STORE, true)" not in _load_body
+        and "_saveToLocalFile(STORE)" not in _load_body,
+        _load_body[:200])
+    chk("没会话 → 挂到 _afterUnlock（解锁任一模块后再问），不弹必失败的确认框",
+        re.search(r"function _queueMergePrompt\(localData, cloudData\)[\s\S]{0,600}?"
+                  r"if \(FINANCE_SESSION\) return _openMergeConfirm\(\);[\s\S]{0,200}?_afterUnlock\(_openMergeConfirm\)",
+                  html) is not None)
+    chk("_openMergeConfirm 自己再验一次会话（补做的时刻可能又过期了）",
+        re.search(r"function _openMergeConfirm\(\)[\s\S]{0,400}?if \(!FINANCE_SESSION\) \{ _afterUnlock\(_openMergeConfirm\); return null; \}",
+                  html) is not None)
+    chk("合并成功才清本地重复副本（失败保留，不丢数据）",
+        re.search(r"_saveToServer\(STORE, true\)\.then\(function \(sr\) \{[\s\S]{0,400}?if \(!sr\.ok\)[\s\S]{0,300}?return;[\s\S]{0,200}?_clearLocalDuplicate\(\);",
+                  html) is not None)
+    chk("清副本写的是「空业务数据」而不是 DELETE（DELETE 会连本机 PBKDF2 凭据一起删掉）",
+        re.search(r"function _clearLocalDuplicate\(\)[\s\S]{0,500}?config: \{\}, records: \{ expenses: \[\], income: \[\], scores: \[\], transfers: \[\] \}",
+                  html) is not None
+        and re.search(r"function _clearLocalDuplicate\(\)[\s\S]{0,700}?method: 'DELETE'", html) is None)
+    _i_hrd = html.find("function hasRealData(store)")
+    _hrd = html[_i_hrd:_i_hrd + 1400] if _i_hrd >= 0 else ''
+    chk("凭据镜像（config.passwords）在云端模式不算「本地真实数据」（否则每次开页都弹合并）",
+        "FINANCE_MODE !== 'cloud' && cfg.passwords" in _hrd, _hrd[:160])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -395,6 +449,55 @@ def behavior():
     data_file = os.path.join(tmp, "print_data.json")
     try:
         _run_behavior(tmp, data_file)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    behavior_merge_clear()
+
+
+def behavior_merge_clear():
+    """C11：页面「合并成功后清空本机重复副本」写的是**空业务数据**，落盘时必须保留凭据。
+
+    这是合并链路能安全清本地副本的前提（前端 _clearLocalDuplicate 就是 POST 一份空 store）：
+    若服务端在这里把 _finance_credentials 一起抹掉，本机就只剩云端那份（可能还是旧的无盐
+    默认哈希）⇒ 7 个模块全部回到 needs_setup，等于让人把密码重设一遍。
+    """
+    section("C11 · 清空业务数据（合并后的本机副本）不会丢凭据")
+    tmp = tempfile.mkdtemp(prefix="hn_s105_clear_")
+    try:
+        df = os.path.join(tmp, "print_data.json")
+        mods = ("score", "expense", "income", "transfer", "settings", "auth", "orderstatus")
+        creds = {m: "pbkdf2_sha256$210000$%s$%s" % (("%02x" % i) * 16, "b" * 64)
+                 for i, m in enumerate(mods)}
+        data = {
+            "config": {"members": [{"id": "m1", "name": "某人"}],
+                       "passwords": {"settings": "sha256:" + "0" * 64}},
+            "records": {"expenses": [{"id": "e1", "date": "2026-10-01", "item": "纸",
+                                      "amount": 10.0, "payer": "m1"}],
+                        "income": [], "scores": [], "transfers": []},
+            "notes": {}, "meta": {"version": 0},
+            "_finance_credentials": dict(creds),
+        }
+        os.makedirs(tmp, exist_ok=True)
+        with open(df, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        sys.path.insert(0, TOOL)
+        import stats_server as ss
+        sec = ss.get_finance_security(df)
+        blank = {"config": {}, "records": {"expenses": [], "income": [], "scores": [], "transfers": []},
+                 "notes": {}, "meta": {"version": 0}}
+        sec.write_data(blank)
+        on_disk = json.load(open(df, encoding="utf-8"))
+        after = (on_disk.get("_finance_credentials") or {})
+        chk("清空业务数据后 7 个模块的 PBKDF2 凭据一个不少", set(after.keys()) == set(creds),
+            sorted(after.keys()))
+        chk("凭据逐字节一致（清本机副本不会重新生成 salt / 不会让密码失效）",
+            all(after.get(m) == creds[m] for m in mods))
+        chk("config.passwords 回填成服务端权威凭据（旧的无盐默认哈希被覆盖，不再触发 needs_setup）",
+            (on_disk.get("config", {}).get("passwords") or {}).get("settings") == creds["settings"])
+        chk("业务数据确实清空了（采购记录与成员都没了）",
+            not on_disk["records"]["expenses"] and not (on_disk.get("config", {}).get("members") or []))
+        chk("清空后状态接口不再把任何模块判成 needs_setup",
+            not ss.get_finance_security(df).status_payload("").get("needs_setup"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1015,6 +1118,78 @@ vm.createContext(sandbox);
   chk('恢复正常后横幅被移除（parentNode 已摘掉）',
     !!GLOBAL.financeIntegrityBanner && GLOBAL.financeIntegrityBanner.parentNode === null,
     GLOBAL.financeIntegrityBanner && String(GLOBAL.financeIntegrityBanner.parentNode));
+
+  /* ⑧ 「首次设置」按钮只在真的还有模块没密码时出现（旧行为：7 个都配好了它照样常驻） */
+  SERVER.needs_setup = [];
+  vm.runInContext('FINANCE_MODE = "local"; unlocked.settings = true; renderSettings();', sandbox);
+  await sleep(120);
+  const slot0 = GLOBAL.financeSetupSlot;
+  chk('设置页：所有模块都已设密码 → 那个「首次设置」按钮不渲染（用户反馈的"一直不消失"）',
+    !slot0 || String(slot0.innerHTML).trim() === '',
+    slot0 && String(slot0.innerHTML).slice(0, 120));
+  SERVER.needs_setup = ['transfer'];
+  vm.runInContext('_refreshFinanceSetupSlot()', sandbox);
+  await sleep(120);
+  const slot1 = String(GLOBAL.financeSetupSlot && GLOBAL.financeSetupSlot.innerHTML || '');
+  chk('设置页：真有未设置模块时才出现入口，并写明数量与模块名',
+    /为 1 个未设置密码的模块批量设置/.test(slot1) && /实际转账/.test(slot1), slot1.slice(0, 160));
+  SERVER.needs_setup = [];
+
+  /* ⑨ 本地/云端合并：没会话不弹 → 解锁后再问 → 合并成功清掉本机重复副本 */
+  const modalCount = () => modalRoot.children.length;
+  const lastModalHTML = () => {
+    const arr = modalRoot.children;
+    const m = arr[arr.length - 1];
+    return String((m && m._html) || '');
+  };
+  const localStore = {
+    config: { members: [{ id: 'ml', name: '本地成员', color: '#888888' }],
+              passwords: { settings: 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92' } },
+    records: { expenses: [{ id: 'le1', date: '2026-07-01', item: '本地纸', amount: 12.5, payer: 'ml' }],
+               income: [], scores: [], transfers: [] },
+    notes: {}, meta: { version: 0 },
+  };
+  const cloudStore = {
+    config: { members: [{ id: 'mc', name: '云端成员', color: '#4472C4' }] },
+    records: { expenses: [], income: [], scores: [], transfers: [] },
+    notes: {}, meta: { version: 5 },
+  };
+  vm.runInContext('__loc = ' + JSON.stringify(localStore) + '; __cld = ' + JSON.stringify(cloudStore) + ';', sandbox);
+  chk('云端模式：只有凭据镜像（config.passwords）、没有业务数据的本机文件**不算**真实数据',
+    vm.runInContext('(FINANCE_MODE = "cloud"), hasRealData({config:{passwords:{settings:"sha256:8d969eef"}},records:{},notes:{}})', sandbox) === false);
+  chk('本地模式口径不变（本地模式下"改过密码"仍然算配置过数据）',
+    vm.runInContext('(FINANCE_MODE = "local"), hasRealData({config:{passwords:{settings:"sha256:8d969eef"}},records:{},notes:{}})', sandbox) === true);
+  vm.runInContext('FINANCE_MODE = "cloud"; _clearFinanceSession(true); _mergeCtx = null;', sandbox);
+  const before9 = modalCount();
+  const writesBefore9 = dataWrites().length;
+  vm.runInContext('_queueMergePrompt(__loc, __cld)', sandbox);
+  await sleep(120);
+  chk('没有会话时**不弹**「是否合并」（旧行为：弹了也必定 403，红字甩屏）',
+    modalCount() === before9, { now: modalCount(), before: before9 });
+  chk('没有会话时一条写请求都不发（不再制造 write_denied 噪音）',
+    dataWrites().length === writesBefore9);
+  chk('合并上下文被记下并挂进解锁队列（解锁后再问，而不是丢掉）',
+    vm.runInContext('!!_mergeCtx', sandbox) === true);
+  await vm.runInContext('financeUnlock("settings", "GoodPass2026")', sandbox);
+  vm.runInContext('_runAfterUnlock()', sandbox);
+  await sleep(200);
+  chk('解锁后自动弹出合并确认框（这时写入才可能成功）',
+    modalCount() > before9 && /安全合并/.test(lastModalHTML()), lastModalHTML().slice(0, 120));
+  const writesBeforeMerge = dataWrites().length;
+  ACTS.ok.click();                       // 点「合并」（openConfirm 的确定键）
+  await sleep(400);
+  const mergeWrites = calls.filter(c => c.method === 'POST' &&
+    (c.url === '/api/proxy/finance/config' || c.url === '/api/local/data')).slice(writesBeforeMerge);
+  chk('合并真的写入云端 + 本机，且两个写请求都带会话头（不再 403）',
+    mergeWrites.length >= 2
+    && mergeWrites.every(w => w.headers['X-Finance-Session'] === SERVER.session),
+    mergeWrites.map(w => w.url));
+  const blankWrite = mergeWrites.filter(w => w.url === '/api/local/data').pop();
+  chk('合并成功后把本机重复副本清成空业务数据（否则下次开页又问一遍）',
+    !!blankWrite && JSON.parse(blankWrite.body).data.records.expenses.length === 0,
+    blankWrite && String(blankWrite.body).slice(0, 120));
+  chk('合并结果 = 本地 + 云端（本地那条采购记录进了合并结果）',
+    vm.runInContext('STORE.records.expenses.some(function(r){return r.id==="le1";})', sandbox) === true);
 
   console.log(fails ? ('FRONTEND_FAIL ' + fails) : 'FRONTEND_OK');
   process.exit(fails ? 1 : 0);
