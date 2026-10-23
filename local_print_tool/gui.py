@@ -396,6 +396,31 @@ def _enable_smooth_scroll(view: QAbstractScrollArea) -> None:
     view.viewport().installEventFilter(_SmoothFilter(view))
 
 
+def _fit_message_box_buttons(box: QMessageBox | None) -> None:
+    """把 QMessageBox 的自定义按钮按**文字实际宽度**撑开（2026-10-23 用户截图反馈）。
+
+    现象：「关闭攒批列表」那个三选框底部按钮只剩中间几个字（"留（纸叠与订单都留着）"、
+    "弃整叠（1 单全部按失败收尾）"），首尾被裁掉 → 最容易选错的三个选项恰好读不全。
+
+    成因：Qt 的 QMessageBox 把整行按钮压进对话框宽度里，**不换行、也不为按钮撑宽对话框**
+    ——文字比可用宽度长时按比例把每个按钮压窄（实测 sizeHint 190px 的文字被压成 114px，
+    而 minimumSizeHint 仍是 190px，即布局被 forced）。所以这里显式把每个按钮的最小宽度
+    设成它自己的 sizeHint ⇒ 对话框随按钮一起变宽（实测 400 → 589px）。
+
+    只对**手写文字**的按钮有意义（标准 Yes/No 很短，设了也不会变宽）；调用点在
+    `box.exec()` 之前（`addButton` 之后）。
+    """
+    if box is None:
+        return
+    try:
+        for b in box.buttons():
+            need = int(b.sizeHint().width())
+            if need > int(b.minimumWidth()):
+                b.setMinimumWidth(need)
+    except Exception as e:      # 纯版式辅助：失败也不能影响对话框照常弹出
+        logger.debug(f"调整对话框按钮宽度失败（忽略）: {e}")
+
+
 # ============================================================
 # 自定义计数器控件
 # ============================================================
@@ -4169,6 +4194,8 @@ class MainWindow(QMainWindow):
                 b_fail = box.addButton("按失败收尾（放弃这几单）", QMessageBox.DestructiveRole)
                 b_keep = box.addButton("先保留、稍后处理（不清清单）", QMessageBox.RejectRole)
                 box.setDefaultButton(b_keep)
+                # 同样是三选长文案：按钮被压扁就剩中间几个字（见 _fit_message_box_buttons）
+                _fit_message_box_buttons(box)
                 box.exec()
                 clicked = box.clickedButton()
                 if clicked is b_prod:
@@ -5786,6 +5813,10 @@ class MainWindow(QMainWindow):
         提示行还要看**当前选区能不能双面**（`_duplex_usable`，由 _on_table_selection 记下）：
         选中图片/单页文件时双面控件整体灰掉、物理上也不会双面，此时提示跟着收起 ——
         否则面板会一边灰着「单面」一边写着「分两趟打印」。
+
+        同理，面板上**已经选着「单面打印」**时也收起（2026-10-23 用户截图反馈：单面打印下面
+        还挂着「分两趟打印 · 中途需翻纸」，与旁边灰掉的「双面模式」一样自相矛盾）。这句话讲的
+        是「双面要分两趟」，只有真选了双面才有意义；选了双面它立刻出现，不需要常驻。
         """
         if not hasattr(self, '_edit_duplex'):
             return
@@ -5798,7 +5829,8 @@ class MainWindow(QMainWindow):
         if self._edit_duplex.itemText(0) != want:
             self._edit_duplex.setItemText(0, want)
         if hasattr(self, '_edit_duplex_hint'):
-            show = bool(manual and getattr(self, '_duplex_usable', True))
+            show = bool(manual and getattr(self, '_duplex_usable', True)
+                        and self._edit_duplex.currentIndex() == 0)   # 索引 0 = 双面
             if show:
                 # 文案必须**极短**（默认窗口下编辑面板视口只有 ~178px，见 task-7 复核：
                 # 之前那句 27 字在里面恒为 3 行，是面板里视觉最重的一块）；正上方下拉已经
@@ -6420,6 +6452,27 @@ class MainWindow(QMainWindow):
                 any(self._job_is_image(j) for j in sel),
                 any(self._job_is_single_page(j) for j in sel))
 
+    def _sync_duplex_mode_availability(self, duplex_usable: bool | None = None) -> bool:
+        """「双面模式」（长/短边翻转）的可用性：**只有真的选了双面**才可用（2026-10-23 用户反馈）。
+
+        单面打印时纸只有一面，翻转方式没有任何物理意义 —— 旧写法只跟着"选区里有没有图片/单页
+        文件"走，于是面板会出现「单面打印 + 长边翻转亮着」这种自相矛盾的状态（用户拿截图报的
+        就是这一处）。这里把标签与下拉**一起灰掉**（与图片/单页文件同一个表现：灰着、值不改、
+        也不写回），并且**每次「单/双面」切换后都要重算**（见 _auto_apply_edit）。
+
+        返回是否可用，调用方据此决定要不要把下拉的值写回 job（灰着的不写）。
+        """
+        if not hasattr(self, '_edit_duplex_mode'):
+            return False
+        if duplex_usable is None:
+            duplex_usable = bool(getattr(self, '_duplex_usable', True))
+        usable = bool(duplex_usable) and self._edit_duplex.currentIndex() == 0
+        label = getattr(self, '_label_duplex_mode', None)
+        if label is not None:
+            label.setEnabled(usable)
+        self._edit_duplex_mode.setEnabled(usable)
+        return usable
+
     def _on_table_selection(self):
         """选中行变化 → 同步编辑面板（多选时面板显示选区第一行，改动作用于全部选中行）。"""
         rows = set(idx.row() for idx in self._table.selectedIndexes())
@@ -6511,14 +6564,15 @@ class MainWindow(QMainWindow):
         self._edit_dpi.blockSignals(False)
 
         # 按文件类型/页数控制参数可用性（判定口径与 _selection_traits 一致 —— 看**整片选区**）：
-        # 双面/双面模式 → 选区里任一文件是图片或单页 → 整体禁用（单页文件双面无意义）；
+        # 双面 → 选区里任一文件是图片或单页 → 整体禁用（单页文件双面无意义）；
+        # 双面模式 → 上面那条 **且** 面板当前真的选着「双面打印」（单面没有翻转方式可言，
+        #            2026-10-23 用户截图反馈；见 _sync_duplex_mode_availability）；
         # 页码范围 → 多选时整体禁用（范围对页数不同的文件没有共同含义）；单张图片也无页码；
         # PDF转换引擎 → 选区里有 Word(doc/docx) 才可用（其余格式走各自转换路径或直接打印）；
         # 图片方向 → 仅图片可用
         self._label_duplex.setEnabled(duplex_usable)
         self._edit_duplex.setEnabled(duplex_usable)
-        self._label_duplex_mode.setEnabled(duplex_usable)
-        self._edit_duplex_mode.setEnabled(duplex_usable)
+        self._sync_duplex_mode_availability(duplex_usable)
         self._label_range.setEnabled(range_usable)
         self._edit_page_range.setEnabled(range_usable)
         self._label_engine.setEnabled(bool(word_jobs))
@@ -6648,6 +6702,13 @@ class MainWindow(QMainWindow):
         # · 多选 → 页码范围整体禁用 ⇒ 不写 page_range（同一个范围对页数不同的文件没有共同含义）。
         multi, any_img, any_single = self._selection_traits(jobs, rows)
         duplex_editable = not (any_img or any_single)
+        # 「双面模式」还要看**面板当前选的是不是双面**：单面打印 ⇒ 灰掉（没有翻转方式可言），
+        # 且用户刚在「单/双面」上切换过值 ⇒ 必须在这里立刻重算，否则会停在
+        # 「单面打印 + 长边翻转亮着」的矛盾状态（2026-10-23 用户截图）。返回值 = 下拉可用，
+        # 灰着时它的值**不写回**（与图片/单页文件同一口径：灰着的不碰）。
+        mode_editable = self._sync_duplex_mode_availability(duplex_editable)
+        # 提示行（分两趟打印 · 中途需翻纸）同理随「单/双面」收起/恢复
+        self._update_duplex_label()
         range_editable = not multi
         # 引擎：只有下拉**真的停在某个具体引擎**（Word/WPS/LibreOffice）且选区里有 Word 文件时
         # 才写回。「混合（各自保留）」项与只读标签（索引 0 的「图片渲染/直接打印」）都不写 ——
@@ -6670,7 +6731,10 @@ class MainWindow(QMainWindow):
                 job.duplex = "off"
             elif duplex_editable:
                 job.duplex = "on" if duplex_on else "off"
-                job.duplex_mode = duplex_mode
+                # 双面模式下拉**灰着**（当前选的是单面打印）⇒ 不写回：翻转方式与单面无关，
+                # 各文件原来的值原样保留（下次改回双面时还是它自己那一档）。
+                if mode_editable:
+                    job.duplex_mode = duplex_mode
             # else：双面控件灰着（选区含图片/单页）→ 这一行的双面设置原样保留
 
             # 图片方向（仅图片可用）：方向变化后清掉已转换的缓存 PDF，打印时按新方向重渲染
@@ -8626,7 +8690,14 @@ class MainWindow(QMainWindow):
             # 打印成功 → 标记已完成并立即持久化，异常退出重载后仍保留，退出时不再放弃
             job.sent = True
             self._save_config()
-        if not (task_id and self._cloud_client):
+        if not task_id:
+            # 本地单（来源=本地，没有云端 task_id）：它的 `sent` 是**打印启动那一刻**由
+            # /api/local_orders 写下的（幂等：重复上报直接跳过）⇒ 失败必须单独回落，否则结算页
+            # 把没打出来的单记「已完成」并计入收益（2026-10-23 现场：缺纸中断 + 攒批放弃整叠）。
+            if not success:
+                self._report_local_order_failed(job, message)
+            return
+        if not self._cloud_client:
             return
         if success:
             # 归属标记（v24）：云端订单为顾客订单，由打印它的管理员盖章（订单号右侧下拉选择）。
@@ -8653,6 +8724,64 @@ class MainWindow(QMainWindow):
             self._cloud_client.report_success(task_id, report_cfg)
         else:
             self._cloud_client.report_fail(task_id, message)
+
+    def _report_local_order_failed(self, job, message: str = ""):
+        """本地单打印失败 → 把云端那笔「已完成」回落成「失败」（后台线程，不挡 GUI）。
+
+        为什么必须有这条路（2026-10-23 现场，HN20261023-0013）：
+          本地单的 `status='sent'` 是**打印启动那一刻**由 `/api/local_orders` 写下的
+          （单据化 + 幂等：重复上报直接跳过），这条链路**没有失败分支** —— 缺纸中断、操作员
+          在 Windows 里取消作业、攒批「放弃整叠」，订单在结算页仍是「已完成」，金额还进了收益。
+          云端单不受影响：它们由 print_success / print_failed 按 task_id 回报。
+
+        走向新接口 `/api/local_order_status`（只允许 failed，且只认本地单）：后端把父单与
+        全部子任务一起改成 failed，人工订正过的终态（已取消/放弃打印/被打回）不覆盖。
+
+        离线/取号失败时的 `-L` 临时号跳过（云端没有这笔单，换正式号后由同步流程补报；
+        离线期间的失败目前**不会**补报——离线库没有状态列，这一点已知并记录在文档里）。
+        """
+        order_number = str(getattr(job, "order_number", "") or "").strip()
+        client = self._cloud_client
+        if not order_number or client is None:
+            return
+        upper = order_number.upper()
+        if "-L" in upper or upper.startswith("LOCAL-"):
+            return
+        api_url = (client.api_url or "").rstrip("/")
+        token = client.token or ""
+        if not api_url or not token:
+            return
+        payload = {
+            "order_number": order_number,
+            "status": "failed",
+            "reason": str(message or "")[:200],
+            "client_id": getattr(client, "client_id", "") or "",
+        }
+
+        def _net():
+            try:
+                resp = http_requests.post(
+                    f"{api_url}/api/local_order_status",
+                    params={"token": token}, json=payload, timeout=10)
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                if resp.ok and body.get("success"):
+                    changed = body.get("changed", False)
+                    self._cloudConnSyncLog.emit(
+                        f"📋 本地订单 {order_number} → 失败"
+                        f"（{str(message or '')[:40]}）"
+                        + ("" if changed else "：云端已是终态/无需改动"))
+                else:
+                    self._cloudConnSyncLog.emit(
+                        f"⚠️ 本地订单 {order_number} 失败状态回落未成功: "
+                        f"{(body.get('message') if isinstance(body, dict) else '') or resp.text[:120]}")
+            except Exception as e:
+                self._cloudConnSyncLog.emit(
+                    f"⚠️ 本地订单 {order_number} 失败状态回落异常: {e}")
+
+        threading.Thread(target=_net, daemon=True).start()
 
     # ──────── 手动双面（无自动双面器的机型：程序自己分两趟 + 人工翻纸）────────
 
@@ -9994,6 +10123,21 @@ class MainWindow(QMainWindow):
         w.start()
         self._refresh_stack_queue()       # 列表立刻切到「正在打整叠第 2 趟」+ 按钮禁用
 
+    def _finish_stack_progress(self, text: str = ""):
+        """整叠处理完毕（放弃 / 第 2 趟失败 / 无第 2 趟内容）→ 进度条打到 100%。
+
+        攒批单的进度分母是「纸张数 × 2」（两趟都要打），只打完第 1 趟自然停在 50%；但这一叠
+        既然不再处理了，半格进度会让人以为还在进行中（2026-10-23 用户截图：放弃整叠之后
+        进度条停在 50%）。这里把它收成满格，状态栏写明结局（`text` 为空时只动进度条）。
+        """
+        bar = getattr(self, "_progress_bar", None)
+        if bar is not None:
+            bar.setMaximum(100)
+            bar.setValue(100)
+        label = getattr(self, "_status_label", None)
+        if text and label is not None:
+            label.setText(text)
+
     def _on_stack_flush_done(self, ok: bool, msg: str, sides: int):
         """整叠第 2 趟结束（成功/失败）→ 统一收尾所有单的任务。
 
@@ -10023,6 +10167,9 @@ class MainWindow(QMainWindow):
             self._stack.clear()
             duplex_stack.discard_batch(bdir)
             self._sync_stack_button()
+            # 这一叠到此为止（成功/失败都不再有第 2 趟进度）→ 进度条收满格
+            self._finish_stack_progress(
+                "" if ok else f"⏹ 攒批未完成：{str(msg)[:70]}")
             if not ok:
                 QMessageBox.warning(
                     self, "攒批第 2 趟失败",
@@ -10057,6 +10204,9 @@ class MainWindow(QMainWindow):
         self._log(f"⏭ 放弃整叠：{n} 单 / {sheets} 张纸（半成品）")
         self._finish_stack_entries(entries, False,
                                    "攒批被人工放弃（只打了第 1 趟，纸是半成品）")
+        # 放弃 = 这一叠处理完了：进度条不能停在「第 1 趟打完的 50%」（用户截图反馈），
+        # 状态栏同时写明结局，免得被读成"还在打印"
+        self._finish_stack_progress(f"⏹ 已放弃整叠：{n} 单 / {sheets} 张纸按失败收尾")
         self._stack.clear()
         self._stack_flush_snapshot = []
         duplex_stack.discard_batch(bdir)
@@ -10105,6 +10255,8 @@ class MainWindow(QMainWindow):
                                   QMessageBox.DestructiveRole)
         b_cancel = box.addButton("取消（保持原样）", QMessageBox.RejectRole)
         box.setDefaultButton(b_keep)
+        # 三个选项的文案都长（且「放弃」不可撤销）→ 必须完整显示，见 _fit_message_box_buttons
+        _fit_message_box_buttons(box)
         box.exec()
         clicked = box.clickedButton()
         if clicked is b_abandon:

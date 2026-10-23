@@ -6986,6 +6986,99 @@ def local_orders():
         conn.close()
 
 
+@app.route("/api/local_order_status", methods=["POST"])
+def local_order_status():
+    """本地打印工具回报**本地订单**的失败（2026-10-23 现场：缺纸中止 / 放弃整叠后仍是「已完成」）。
+
+    为什么需要这个接口：本地单的 `status='sent'` 是**打印启动那一刻**由 `/api/local_orders`
+    写下的（单据化 + 幂等：重复上报直接跳过），那条链路**没有失败分支** —— 打印缺纸中止、
+    操作员在 Windows 打印管理器里取消作业、攒批模式「放弃整叠」，订单一律留在「已完成」，
+    结算页照算收益（HN20261023-0010 / -0013 现场）。云端单不受影响：它们的终态由
+    print_success / print_failed 按 task_id 管，此接口对它们一律忽略。
+
+    只允许把 `reserved` / `sent` 的**本地单**改成 `failed`：
+      · 云端单（source = wechat/app）→ 忽略（按订单号改会绕过任务归属校验）；
+      · `canceled` / `abandoned` / `rejected`（人工订正成"云端不要再打"的终态）→ 不覆盖；
+      · `failed` → 幂等成功（重复上报不重复写）。
+    父单与它的**全部**子任务一起改（`aggregate_order_status()` 口径：含 failed → failed），
+    并清空子任务 `locked_at`（终态不该再被反馈超时 / 孤儿回收盯上）。
+
+    畸形请求体（数组/字符串/数字/布尔、深嵌套 RecursionError）一律 fail-closed：
+    未认证 403 / 带 token 400，绝不 500。
+    """
+    try:
+        data = request.get_json(silent=True)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    token = _get_printer_token() or str(data.get("token") or "")
+    if not PRINTER_TOKEN or token != PRINTER_TOKEN:
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    order_number = data.get("order_number")
+    if not isinstance(order_number, str):
+        return jsonify({"success": False, "message": "缺少 order_number"}), 400
+    order_number = order_number.strip()
+    if not order_number or len(order_number) > 64:
+        return jsonify({"success": False, "message": "order_number 不合法"}), 400
+    raw_status = data.get("status", "failed")
+    status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
+    if status != "failed":
+        return jsonify({"success": False, "message": "只支持 status=failed"}), 400
+    reason = str(data.get("reason") or "")[:200]
+
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT id, status, openid, source FROM orders WHERE order_number = ?",
+                (order_number,),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return jsonify({"success": True, "changed": False,
+                                "message": "订单不存在（可能还没上报成功）"})
+            order_id = row["id"]
+            old_status = str(row["status"] or "")
+            is_local = (str(row["openid"] or "") == "local"
+                        or str(row["source"] or "") in ("", "local"))
+            if not is_local:
+                conn.rollback()
+                try:
+                    app.logger.warning(
+                        "local_order_status 忽略云端订单: order_number=%s openid=%s source=%s",
+                        order_number, row["openid"], row["source"])
+                except Exception:
+                    pass
+                return jsonify({"success": True, "changed": False, "ignored": True,
+                                "message": "该订单属于云端订单，已忽略（终态由 task 回报决定）"})
+            if old_status in ("canceled", "abandoned", "rejected"):
+                conn.rollback()
+                return jsonify({"success": True, "changed": False, "order_id": order_id,
+                                "message": f"订单已是人工终态 {old_status}，不覆盖"})
+            if old_status == "failed":
+                conn.rollback()
+                return jsonify({"success": True, "changed": False, "order_id": order_id,
+                                "message": "订单已是失败态"})
+            conn.execute(
+                "UPDATE order_files SET status = 'failed', locked_at = '' WHERE order_id = ?",
+                (order_id,),
+            )
+            conn.execute("UPDATE orders SET status = 'failed' WHERE id = ?", (order_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    print(f"  [LOCAL-FAIL] 本地订单 {order_number} #{order_id} {old_status} → failed（{reason}）")
+    return jsonify({"success": True, "changed": True, "order_id": order_id,
+                    "previous_status": old_status, "status": "failed"})
+
+
 # ==================== 用户身份接口 ====================
 
 
