@@ -136,6 +136,13 @@ for name, content in GOOD:
 # C. 变异自证：删掉 denylist 判断
 # ============================================================
 print("\n=== C. 变异自证（删掉 denylist 判断）===")
+# 生产侧：.html 被**denylist**拦下（文案点明 HTML/SVG/JS），不是碰巧被白名单拦的。
+_base = upload("base.html", b"<html></html>").get_json() or {}
+H.chk("★ 生产侧 .html 的拒绝文案来自 denylist（HTML/SVG/JS）",
+      "HTML/SVG/JS" in (_base.get("message") or ""), _base.get("message"))
+
+# 变异：只把 denylist 那一条关掉 ⇒ .html 仍 400（白名单兜底），但**文案变了** ——
+# 说明生产上那条 400 确实是 denylist 给的。S2-03 的白名单是第二层，两者都要在。
 mut_tmp, mut_dst = H.mutated_copy([
     ("    if ext_lower in DANGEROUS_UPLOAD_EXTS:",
      "    if False and ext_lower in DANGEROUS_UPLOAD_EXTS:"),
@@ -149,10 +156,12 @@ r = http.post("/api/upload",
               headers={"Authorization": "Bearer " + tok},
               content_type="multipart/form-data")
 print("RESULT=%s" % r.status_code)
+print("MSG=%s" % ((r.get_json() or {}).get("message") or ""))
 """)
 mut_status = H.probe_value(proc)
-H.chk("取消 denylist 后 .html 又被接收（证明 400 来自 denylist）",
-      mut_status is not None and mut_status != "400",
-      "变异副本 status=%r stderr=%r" % (mut_status, (proc.stderr or "")[-400:]))
+mut_msg = H.probe_value(proc, "MSG") or ""
+H.chk("取消 denylist 后 .html 的拒绝文案不再来自 denylist（白名单兜底，判据能红）",
+      mut_status == "400" and "HTML/SVG/JS" not in mut_msg,
+      "变异副本 status=%r msg=%r stderr=%r" % (mut_status, mut_msg, (proc.stderr or "")[-300:]))
 
 H.finish()

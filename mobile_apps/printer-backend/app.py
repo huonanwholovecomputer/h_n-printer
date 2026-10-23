@@ -431,6 +431,48 @@ MAX_EVENT_TASK_IDS = 100      # SocketIO 事件的 task_ids 上限
 # file:///…/print_config.json 并把全站 printer token 外发（DS-01）。
 DANGEROUS_UPLOAD_EXTS = frozenset({"html", "htm", "shtml", "xhtml", "svg", "js", "mjs"})
 
+# ===== S2-03：上传类型白名单 + 魔数一致性 =====
+# 与 S0-05 的 denylist 是**两层**：denylist 挡"已知危险"，白名单保证"只收认识的格式" ——
+# 以后出现新花样（.svgz / .hta / .mhtml …）默认进不来，不用等有人想起来往 denylist 里补。
+# 口径 = 两端客户端 supportedExts（pdf/doc/docx/txt/csv/md/图片）+ 客户端明确列为"不支持"
+# 的办公格式（xls/xlsx/ppt/pptx，保留兼容，服务端不主动扩大拒绝面）。压缩包与未知类型不再收。
+UPLOAD_EXT_WHITELIST = frozenset({
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "md",
+    "jpg", "jpeg", "png", "bmp", "gif", "webp", "tiff", "tif",
+})
+
+# 扩展名 → 允许的"真实家族"（魔数判定结果）。file 头对不上 ⇒ 改名/伪装，拒绝。
+#   ole  = OLE2 复合文档（doc/xls/ppt 的经典格式）
+#   zip  = OOXML 容器（docx/xlsx/pptx），本质是 zip
+#   text = 无魔数，只粗判"是否二进制"（见 _looks_binary_text）
+_UPLOAD_EXT_FAMILIES = {
+    "pdf": ("pdf",),
+    "doc": ("ole", "rtf"), "xls": ("ole",), "ppt": ("ole",),
+    "docx": ("zip",), "xlsx": ("zip",), "pptx": ("zip",),
+    "jpg": ("jpeg",), "jpeg": ("jpeg",), "png": ("png",), "gif": ("gif",),
+    "bmp": ("bmp",), "webp": ("webp",), "tiff": ("tiff",), "tif": ("tiff",),
+}
+_TEXT_UPLOAD_EXTS = frozenset({"txt", "csv", "md"})
+
+# 明确的"危险 MIME"：即便扩展名看着正常也拒绝（与 denylist 同一条链的纵深）
+_DANGEROUS_MIMES = frozenset({"text/html", "application/xhtml+xml", "image/svg+xml",
+                              "application/javascript", "text/javascript",
+                              "application/x-javascript"})
+# MIME → 家族（只用于"扩展名与 MIME 明确冲突"时拒绝；octet-stream/空值一律放行，
+# 真实客户端（微信 wx.uploadFile）大量使用 application/octet-stream，不能因此误杀）
+_MIME_FAMILIES = {
+    "application/pdf": "pdf",
+    "application/msword": "ole",
+    "application/vnd.ms-excel": "ole",
+    "application/vnd.ms-powerpoint": "ole",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "zip",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "zip",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "zip",
+    "image/jpeg": "jpeg", "image/png": "png", "image/gif": "gif", "image/bmp": "bmp",
+    "image/webp": "webp", "image/tiff": "tiff",
+    "text/plain": "text", "text/csv": "text", "text/markdown": "text",
+}
+
 # Markdown 在 wkhtmltopdf 里被渲染成 HTML：扫描危险语法（与客户端 converter 同一份口径）
 _UNSAFE_MD_PATTERNS = (
     ("<script", re.compile(r"<\s*script", re.I)),
@@ -6023,6 +6065,76 @@ def bind_revoke():
     })
 
 
+def _sniff_upload_family(head: bytes):
+    """按文件头判断真实家族（只认本系统关心的几种）；认不出返回 None。
+
+    S2-03：客户端的 Content-Type 与文件名都不可信，**只看内容**。这里只做"是不是它声称的
+    那一类"的判定，不做格式完整性解析（上传面的目标是拦住改名伪装，不是校验文件可用性）。"""
+    if b"%PDF-" in head[:1024]:
+        # PDF 规范允许头部前有少量垃圾字节 ⇒ 在前 1 KB 内找，别把正常 PDF 判成伪装
+        return "pdf"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if head.startswith(b"BM"):
+        return "bmp"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    if head[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"):
+        return "zip"
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "ole"
+    if head.lstrip()[:5].lower() == b"{\\rtf":
+        return "rtf"
+    return None
+
+
+def _check_upload_type(ext_lower, head, client_mime):
+    """S2-03：上传类型的三方一致性检查（白名单 / MIME / 魔数）。
+
+    返回 (ok: bool, message: str)。**不碰磁盘**，调用方决定拒绝时机。
+      · 扩展名不在白名单 → 直接拒（这是永久防线，新格式默认进不来）；
+      · 客户端 MIME 是明确的危险类型（text/html、svg、js）→ 拒（与 denylist 同一条链）；
+      · 客户端 MIME 是**具体类型**且与扩展名家族冲突（如 .pdf 却报 image/jpeg）→ 拒；
+        octet-stream / 空 MIME 一律放行 —— 微信 wx.uploadFile 就是这么发的，误杀会打断业务；
+      · 二进制类型的**魔数**必须落在该扩展名允许的家族里（挡住"改名伪装"）；
+      · 文本类（txt/csv/md）无魔数，只拒"前 8 KB 出现 NUL"的伪文本。
+    """
+    if ext_lower not in UPLOAD_EXT_WHITELIST:
+        return False, (f"本服务不支持 .{ext_lower} 文件；支持 PDF/Word/Excel/PPT/TXT/CSV/"
+                       "Markdown/图片，请转换后重试")
+    if client_mime in _DANGEROUS_MIMES:
+        return False, "本服务不支持 HTML/SVG/JS 文件；请另存为 PDF/DOCX 后重试"
+    ext_families = _UPLOAD_EXT_FAMILIES.get(ext_lower)
+    if client_mime:
+        mime_family = _MIME_FAMILIES.get(client_mime)
+        if mime_family and ext_families and mime_family not in ext_families:
+            return False, "文件类型与扩展名不一致，已拒绝——请用原始文件或另存为 PDF 后重试"
+    if ext_families is None:
+        # 文本类
+        if _looks_like_binary(head):
+            return False, "文件内容与扩展名不一致（疑似二进制文件），已拒绝"
+        return True, ""
+    actual = _sniff_upload_family(head)
+    if actual is None:
+        return False, ("无法识别的文件内容（或扩展名与实际格式不一致），已拒绝——"
+                       "请用原始文件或另存为 PDF 后重试")
+    if actual not in ext_families:
+        return False, ("文件内容与扩展名不一致（可能是改名后的其他格式），已拒绝——"
+                       "请用原始文件或另存为 PDF 后重试")
+    return True, ""
+
+
+def _looks_like_binary(head: bytes) -> bool:
+    """文本类上传的粗判：前 8 KB 出现 NUL 即视为二进制（改名冒充 .txt/.csv/.md）。"""
+    return b"\x00" in head
+
+
 @app.route("/api/upload", methods=["POST"])
 @require_printer_access
 def upload_file():
@@ -6071,12 +6183,45 @@ def upload_file():
             "success": False,
             "message": "本服务不支持 HTML/SVG/JS 文件；请另存为 PDF/DOCX 后重试",
         }), 400
+    # S2-03：白名单 + MIME 冲突（落盘之前就能判的两项；魔数要读内容，放在保存之后）。
+    # 白名单先行 ⇒ 压缩包/未知类型连临时文件都不写。
+    if ext_lower not in UPLOAD_EXT_WHITELIST:
+        print(f"  [UPLOAD] 拒绝白名单外类型: {f.filename!r} ext={ext_lower}")
+        return jsonify({
+            "success": False,
+            "message": (f"本服务不支持 .{ext_lower} 文件；支持 PDF/Word/Excel/PPT/TXT/CSV/"
+                        "Markdown/图片，请转换后重试"),
+        }), 400
+    _client_mime = (f.mimetype or "").lower().strip()
+    if _client_mime in _DANGEROUS_MIMES:
+        print(f"  [UPLOAD] 拒绝危险 MIME: {f.filename!r} mime={_client_mime}")
+        return jsonify({
+            "success": False,
+            "message": "本服务不支持 HTML/SVG/JS 文件；请另存为 PDF/DOCX 后重试",
+        }), 400
     saved_name = f"{file_id}{ext}"
 
     # 1. 先保存到 uploads/ 根目录作为临时文件
     temp_path = os.path.join(UPLOAD_DIR, saved_name)
     f.save(temp_path)
     file_size = os.path.getsize(temp_path)
+
+    # S2-03：魔数一致性（只剩这一项要读内容）。不通过 ⇒ 删临时文件 + 400，
+    # 绝不把"改名伪装"的文件留在 uploads 里（与下面的 Markdown 扫描同一收尾口径）。
+    try:
+        with open(temp_path, "rb") as _sig_fh:
+            _head = _sig_fh.read(8192)
+    except OSError:
+        _head = b""
+    _sig_ok, _sig_msg = _check_upload_type(ext_lower, _head, _client_mime)
+    if not _sig_ok:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        print(f"  [UPLOAD] 拒绝类型不一致上传: {f.filename!r} ext={ext_lower} "
+              f"mime={_client_mime!r} 原因={_sig_msg}")
+        return jsonify({"success": False, "message": _sig_msg}), 400
 
     # S0-05：Markdown 会被渲染成 HTML 交给 wkhtmltopdf —— 扫危险语法（≤1 MB）。
     # 客户端 converter 有同一份扫描（S0-09），这里是**服务端持久防线**：旧客户端仍在跑时
