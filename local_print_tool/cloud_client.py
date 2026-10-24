@@ -26,7 +26,7 @@ import threading
 import time
 import urllib.parse
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 from urllib.parse import quote
 
@@ -36,6 +36,7 @@ from PySide6.QtCore import QObject, Signal
 
 import staging  # 云端下载文件落到暂存目录（%APPDATA%，抗临时目录清理；见 staging.py）
 import net_direct  # 云端直连：绕开系统/环境代理（代理异常会让长连接卡死；见 net_direct.py）
+import retention  # 本地副本生命周期：保留期夹紧 / PDF 缓存清理 / 启动扫描（见 retention.py）
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,8 @@ class CloudTask:
         "auto_print",
         # 无障碍打印预约（此前 __init__ 已赋值但这些字段漏在 __slots__ 之外 → 构造必报 AttributeError）
         "schedule_mode", "scheduled_at", "scheduled_ts", "schedule_frozen",
+        # S1-03：服务端该文件的保留期（小时；0 = 服务端未指定，本地回落默认 24h）
+        "retention_hours",
     )
 
     def __init__(self, data: dict):
@@ -272,6 +275,11 @@ class CloudTask:
         self.scheduled_at: str = data.get("scheduled_at", "") or ""     # 绝对时间 "%Y-%m-%d %H:%M:%S"
         self.scheduled_ts: int = int(data.get("scheduled_ts", 0) or 0)  # epoch 秒，本地到点自触发
         self.schedule_frozen: bool = bool(data.get("schedule_frozen", False))
+        # S1-03：该文件的保留期（后端随任务下发，0 = 未指定 → 本地按默认 24h 清理）
+        try:
+            self.retention_hours: int = int(data.get("retention_hours", 0) or 0)
+        except (TypeError, ValueError):
+            self.retention_hours = 0
 
     def to_dict(self) -> dict:
         return {
@@ -293,6 +301,7 @@ class CloudTask:
             "owner_name": self.owner_name,
             "is_admin_print": self.is_admin_print,
             "bound_owner_name": self.bound_owner_name,
+            "retention_hours": self.retention_hours,
         }
 
 
@@ -441,6 +450,9 @@ class CloudClient(QObject):
         self._auth_fail_count = 0
         # P1: 启动时清理 %TEMP% 下超过 24h 的残留下载临时文件（崩溃遗留兜底）
         self._cleanup_old_temp_files()
+        # S1-03：启动扫描本地 PDF 缓存（保留期夹紧 1..168 h）。旧实现只在"写新缓存"后
+        # 调度清理，进程重启后不跑 ⇒ DS-06 实测 184 h 的条目仍在。
+        self.cleanup_caches_on_startup()
         self._thread = threading.Thread(target=self._run_loop, daemon=True, name="cloud-client")
         self._thread.start()
         # HTTP 兜底拉单线程：socket 掉线但网络正常时仍能保持服务端心跳并领走排队订单。
@@ -1282,7 +1294,9 @@ class CloudClient(QObject):
             days = data.get("retention_days", None)
             hours = data.get("retention_hours", None)
             if days is not None and hours is not None:
-                new_hours = int(days) * 24 + int(hours)
+                # S1-03：服务端值一律夹到 1..168（0 = 服务端"永不过期"→ 本地 24h 下限保护，
+                # 详见 retention.py 模块注释；这是 DS-06 要求的"本地副本不得永久驻留"）
+                new_hours = retention.effective_hours(int(days) * 24 + int(hours))
                 old_hours = self._CACHE_RETENTION_HOURS
                 if new_hours == old_hours:
                     return  # 未变化，跳过日志和清理
@@ -1663,6 +1677,12 @@ class CloudClient(QObject):
             task.local_path = dest
             task.status = "ready"
             task.download_progress = 100
+            # S1-03：把服务端该文件的保留期记到副本目录的侧车（只存小时数），
+            # 启动扫描按它清理；后端没下发（旧版后端/0）则侧车不写、回落默认 24h。
+            try:
+                retention.write_sidecar(dest, task.retention_hours)
+            except Exception:
+                pass
             self.task_updated.emit(task)
             self.status_message.emit(
                 f"☁ 下载完成 #{task_id}: {original_name} ({os.path.getsize(dest)} bytes)"
@@ -1698,31 +1718,37 @@ class CloudClient(QObject):
     # ── PDF 缓存（MD5 绑定，默认 7 天自动清理）──
 
     _CACHE_DIR: str | None = None
-    _CACHE_RETENTION_HOURS = 168  # 7天，默认为小时；0 = 永不过期
+    # S1-03：本地缓存保留期（小时）。上限 168h，缺省 24h，**"0 = 永不过期"的旧口径已废弃**
+    # （DS-06：顾客文件不能因为管理员把全局保留期设成 0 就在店铺机上永久驻留）。
+    _CACHE_RETENTION_HOURS = retention.DEFAULT_RETENTION_HOURS
+
+    @property
+    def cache_retention_hours(self) -> int:
+        """当前生效的本地缓存保留期（已夹紧 1..168），供 GUI 启动扫描复用同一口径。"""
+        return retention.effective_hours(self._CACHE_RETENTION_HOURS)
 
     def _retention_path(self) -> str:
         """持久化保留时间的侧边文件路径。"""
         return os.path.join(self._cache_dir, "retention.json")
 
     def _load_retention(self):
-        """从本地文件加载上次保存的保留时间，避免每次启动从 7 天硬编码开始。"""
+        """从本地文件加载上次保存的保留时间，并按 1..168 夹紧（旧值 0/超限一并归一）。"""
         path = os.path.join(self._cache_dir, "retention.json")
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     val = int(data.get("retention_hours", 0))
-                    if val > 0:
-                        self._CACHE_RETENTION_HOURS = val
+                    self._CACHE_RETENTION_HOURS = retention.effective_hours(val)
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
 
     def _save_retention(self, hours: int):
-        """将保留时间持久化到本地文件，供下次启动恢复。"""
+        """将保留时间持久化到本地文件，供下次启动恢复（写入前夹紧）。"""
         path = os.path.join(self._cache_dir, "retention.json")
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"retention_hours": hours}, f)
+                json.dump({"retention_hours": retention.effective_hours(hours)}, f)
         except OSError:
             pass
 
@@ -1841,6 +1867,11 @@ class CloudClient(QObject):
                 tmp = dest + ".tmp"
                 shutil.copy2(cached_pdf, tmp)
                 os.replace(tmp, dest)  # 原子落地，避免半截文件被挂到任务上
+            # S1-03：缓存命中抄成的任务自持副本同样记保留期侧车（与下载路径同口径）
+            try:
+                retention.write_sidecar(dest, getattr(task, "retention_hours", 0))
+            except Exception:
+                pass
             return dest
         except Exception as e:
             logger.warning(f"缓存命中但复制到暂存目录失败 → 回退直接引用共享缓存: {e}")
@@ -1942,56 +1973,38 @@ class CloudClient(QObject):
         return removed
 
     def _cleanup_pdf_cache(self):
-        """清理过期的缓存 PDF（超过保留小时数）+ 回收无索引孤儿文件。"""
+        """清理过期的缓存 PDF（超过保留小时数）+ 回收无索引孤儿文件。
+
+        S1-03：TTL 统一由 `retention.effective_hours()` 夹在 1..168 h（0/超限都归一，
+        "永不过期"的旧口径已废弃）；扫描时机也从"只在写新缓存后"扩展到 start() 启动扫描
+        （DS-06 实测：旧实现重启后不跑，184 h 的条目仍在）。
+        """
         index = self._load_cache_index()
         stale_removed = self._purge_stale_engine_entries(index)
-        if self._CACHE_RETENTION_HOURS <= 0:
-            # 0 = 永不过期：过期清理跳过，但脏条目（上面）仍要落盘
-            if stale_removed:
-                self._save_cache_index(index)
-            return
-        cutoff = datetime.now() - timedelta(hours=self._CACHE_RETENTION_HOURS)
-        removed = 0
-        live_keys: set[str] = set()
-        for key, meta in list(index.items()):
-            created_str = meta.get("created_at", "")
-            try:
-                created = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S")
-                # P1（审计 2026-12）：索引 key（可能含 _landscape/_eword 等后缀）就是
-                # 文件名主体，旧代码按纯 md5 拼名 → 带后缀条目永不过期清理，缓存无限膨胀。
-                if created < cutoff:
-                    pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
-                    if os.path.isfile(pdf_path):
-                        os.remove(pdf_path)
-                    del index[key]
-                    removed += 1
-                else:
-                    live_keys.add(f"{key}.pdf")
-            except (ValueError, OSError):
-                pass
-        # 孤儿回收：磁盘上存在、索引里却没有的 .pdf（历史 key 失配残留 / 崩溃半途产物）。
-        # 仅回收早于 cutoff 的（避免误删"刚写完文件、索引尚未落盘"的竞态窗口）。
-        cutoff_ts = cutoff.timestamp()
-        try:
-            for name in os.listdir(self._cache_dir):
-                if not name.lower().endswith(".pdf") or name in live_keys:
-                    continue
-                full = os.path.join(self._cache_dir, name)
-                try:
-                    if os.path.getmtime(full) < cutoff_ts:
-                        os.remove(full)
-                        removed += 1
-                        logger.info(f"回收无索引孤儿缓存: {name}")
-                except OSError:
-                    pass
-        except OSError:
-            pass
+        # 用 getattr 取原始值再夹紧：验收存根（tests/audit_2026_12/verify_local_tool.py）
+        # 直接借用本方法、只提供 _CACHE_RETENTION_HOURS，不实现 cache_retention_hours。
+        hours = retention.effective_hours(
+            getattr(self, "_CACHE_RETENTION_HOURS", retention.DEFAULT_RETENTION_HOURS))
+        removed, index, freed = retention.sweep_pdf_cache(
+            self._cache_dir, index, hours=hours)
         if removed > 0 or stale_removed > 0:
             self._save_cache_index(index)   # 过期条目与脏条目一次落盘
         if removed > 0:
-            self.status_message.emit(f"📦 已清理 {removed} 个过期缓存 PDF")
+            self.status_message.emit(f"📦 已清理 {removed} 个过期缓存 PDF（保留期 {hours}h）")
+            logger.info("PDF 缓存保留期清理：%d 个文件 / %.1f MB（保留期 %dh）",
+                        removed, freed / 1048576.0, hours)
         if stale_removed > 0:
             logger.info(f"清理引擎后缀脏缓存 {stale_removed} 条（非 docx 带 _eword/_ewps）")
+
+    def cleanup_caches_on_startup(self) -> int:
+        """启动时扫一遍 PDF 缓存（return 删除数）。异常不外抛，清理失败不挡启动。"""
+        try:
+            before = len(self._load_cache_index())
+            self._cleanup_pdf_cache()
+            return max(0, before - len(self._load_cache_index()))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"启动清理 PDF 缓存失败: {e}")
+            return 0
 
     _cache_cleanup_scheduled = False
 

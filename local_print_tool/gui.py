@@ -95,6 +95,7 @@ from cloud_client import CloudClient, CloudTask, cache_engine_for, pdf_cache_key
 from stats_server import StatsServer, load_local_data_file, clear_local_data_files
 from offline_sync import OfflineSync
 import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼容，详见 staging.py）
+import retention  # 本地副本生命周期：保留期清理 / 攒批 .keep 过期 / 启动扫描（见 retention.py）
 import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在这里）
 
 logger = logging.getLogger(__name__)
@@ -4282,6 +4283,45 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"启动清理暂存副本失败: {e}")
 
+        # ── 启动扫描：本地副本保留期（S1-03 / DS-06）──
+        # 旧实现只在"写新缓存/移除任务"等事件上清理，进程重启后不跑一次 ⇒ 顾客文件可长期驻留。
+        # 这里按服务端下发的保留期（缺省 24h、夹在 1..168h）扫一遍 file_cache，并解除超过 30 天
+        # 的攒批 `.keep` 人工保留标记；仍被任务引用的副本不动（任务结束后的按引用清扫回收）。
+        try:
+            _hours = (self._cloud_client.cache_retention_hours
+                      if getattr(self, "_cloud_client", None)
+                      else retention.DEFAULT_RETENTION_HOURS)
+            _rep = retention.startup_sweep(
+                file_cache_root=staging.staging_root(),
+                keep_paths=self._staged_reference_paths(),
+                stack_root=paths.duplex_stack_dir(),
+                hours=_hours,
+            )
+            _fc = _rep["file_cache"]
+            if _fc.removed:
+                self._log(f"🧹 已清理 {_fc.removed} 个超过保留期（{_fc.hours}h）的本地副本"
+                          f"（{_fc.mb:.1f} MB）" + ("；另有 %d 个仍被任务引用、已保留"
+                                                   % _fc.skipped_referenced
+                                                   if _fc.skipped_referenced else ""))
+            elif _fc.skipped_referenced:
+                self._log(f"ℹ 有 {_fc.skipped_referenced} 个本地副本超过保留期但仍在任务列表中，"
+                          f"任务结束或清除后自动回收")
+            for _b in _rep["keep_expired"]:
+                self._log(f"⚠ 攒批批次 {_b} 的「人工保留」标记已超过 "
+                          f"{retention.KEEP_MARKER_MAX_DAYS} 天，已自动解除（批次文件未删）")
+        except Exception as e:
+            logger.warning(f"启动清理本地副本失败: {e}")
+
+        # 云端未启用时也要扫一遍 PDF 缓存（没有 CloudClient，就没有 start() 里的那次扫描）
+        if not getattr(self, "_cloud_client", None):
+            try:
+                _pdf_rep = retention.sweep_pdf_cache_dir(
+                    paths.pdf_cache_dir(), hours=retention.DEFAULT_RETENTION_HOURS)
+                if _pdf_rep.removed:
+                    self._log(f"🧹 已清理 {_pdf_rep.removed} 个超过保留期的 PDF 缓存")
+            except Exception as e:
+                logger.warning(f"启动清理 PDF 缓存失败: {e}")
+
         # ── 自更新：启动 4 秒后后台检查更新（不阻塞 UI，发现新版本才弹窗）──
         #    S1-02 改动 4（2026-10-23）：启动检查**只提示**——不自动下载、不生成 update.cmd、
         #    不静默安装。真正的下载/安装只能由用户在「帮助 → 检查更新」后明确点「立即更新」触发
@@ -5578,6 +5618,9 @@ class MainWindow(QMainWindow):
         self._keep_temp_check = QComboBox()
         self._keep_temp_check.addItems(["否", "是"])
         self._keep_temp_check.setCurrentIndex(0)
+        # S1-03（DS-06）：这是"把含顾客文档全文的 PDF 复制到桌面"的开关，桌面副本不受本工具
+        # 生命周期清理保护 ⇒ 悬停可见后果、切到"是"时再弹一次确认（见 _on_keep_temp_changed）。
+        self._keep_temp_check.setToolTip(retention.KEEP_TEMP_WARNING)
         self._keep_temp_check.currentIndexChanged.connect(self._on_keep_temp_changed)
         _disable_combo_wheel(self._keep_temp_check)
         layout.addWidget(self._keep_temp_check)
@@ -7518,7 +7561,10 @@ class MainWindow(QMainWindow):
         self._refresh_printer_list()
         self._printer_combo.setCurrentText(self._config.printer_name)
 
+        # 配置 → UI：屏蔽信号，避免加载时触发「开启桌面副本」的确认框
+        self._keep_temp_check.blockSignals(True)
         self._keep_temp_check.setCurrentIndex(1 if self._config.keep_temp_pdf else 0)
+        self._keep_temp_check.blockSignals(False)
 
         # 攒批模式开关（配置 → UI；加载期间屏蔽信号，避免把保存又触发一遍）
         self._chk_stack_mode.blockSignals(True)
@@ -7779,8 +7825,24 @@ class MainWindow(QMainWindow):
             logger.debug(f"刷新价格显示失败: {e}")
 
     def _on_keep_temp_changed(self):
-        """保存转换副本设置变更 → 实时同步到 config。"""
-        self._config.keep_temp_pdf = (self._keep_temp_check.currentIndex() == 1)
+        """保存转换副本设置变更 → 实时同步到 config。
+
+        S1-03（DS-06）：从「否」切到「是」必须先告知后果 —— 桌面副本含顾客文档全文、
+        不受本工具生命周期清理保护。用户点取消 ⇒ 回滚下拉框、不写配置。
+        """
+        want = (self._keep_temp_check.currentIndex() == 1)
+        if want and not self._config.keep_temp_pdf:
+            reply = QMessageBox.question(
+                self, "确认开启「保存转换副本到桌面」",
+                retention.KEEP_TEMP_WARNING + "\n\n确定要开启吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                self._keep_temp_check.blockSignals(True)
+                self._keep_temp_check.setCurrentIndex(0)
+                self._keep_temp_check.blockSignals(False)
+                return
+        self._config.keep_temp_pdf = want
 
     def _on_render_dpi_changed(self):
         """全局渲染 DPI 变更。"""

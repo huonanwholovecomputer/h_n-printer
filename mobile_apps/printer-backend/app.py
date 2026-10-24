@@ -3387,7 +3387,7 @@ def fetch_and_lock_task(client_id):
                 """SELECT of.*, o.order_number, o.delivery_enabled, o.delivery_location,
                           o.urgency, o.cover_page, o.cover_page_price, o.auto_print,
                           o.owner_name, o.is_admin_print, o.openid, o.remark, o.source,
-                          f.md5 as source_md5
+                          f.md5 as source_md5, f.retention_hours as retention_hours
                    FROM order_files of
                    LEFT JOIN orders o ON of.order_id = o.id
                    LEFT JOIN files f ON of.file_id = f.id
@@ -3741,8 +3741,16 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
     # 查询文件 MD5（供本地工具 PDF 缓存命中，避免重复下载，P1-7）
     if file_id:
         conn = get_db()
-        row = conn.execute("SELECT md5, path FROM files WHERE id = ?", (file_id,)).fetchone()
+        row = conn.execute(
+            "SELECT md5, path, retention_hours FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
         conn.close()
+        # S1-03：把该文件的保留期一并下发（客户端据此清理本地副本；0 = 未自选 → 本地默认 24h）
+        if row is not None:
+            try:
+                task_msg["retention_hours"] = int(row["retention_hours"] or 0)
+            except (KeyError, TypeError, ValueError):
+                task_msg["retention_hours"] = 0
         if row and row["md5"]:
             task_msg["source_md5"] = row["md5"]
         elif row and row["path"]:
@@ -7276,6 +7284,8 @@ def pull_queued_orders():
         "bound_owner_name": _get_bound_owner_name(task.get("openid") or ""),
         # 订单来源（wechat/app/local），本地工具云端任务列表展示
         "source": task.get("source", "") or "wechat",
+        # S1-03：该文件的保留期（小时；0 = 未自选，本地按默认 24h 清理自己的副本）
+        "retention_hours": int(task.get("retention_hours") or 0),
     }
     if task["file_id"]:
         # S1-06：绑定 openid + 子任务 id
