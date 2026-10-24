@@ -126,7 +126,16 @@ APK 命名约定（2026-09 起）：**`h_n-printer_android_v{版本}.apk`**，�
 - JDK 17 + Android SDK 固定路径：`C:\Users\Administrator\android-tools\jdk-17.0.20+8`（JAVA_HOME）与 `...\sdk`（ANDROID_HOME）；系统默认 java 是 SPSS 的 JRE 1.8，**不可用**。
 - Release 签名：`android/app/keystore.properties` + `release.keystore`（不入 git，缺失时 release 构建直接报错）。
 - **版本号**：`android/app/build.gradle` 的 `versionName`（用户可见，如 `1.1.7`）与 `versionCode`（内部编号）。**升级必须两者同步递增**（versionCode 不增则已装用户无法覆盖安装）。
-- 基础 API 地址在 `www/app.js` 的 `DEFAULT_BASE_URL`（默认 `https://hn-space.cn`），可被 localStorage `hn_base_url` 覆盖。
+- 基础 API 地址是 `www/app.js` 的**编译期常量** `DEFAULT_BASE_URL`（默认 `https://hn-space.cn`）。
+  **S2-09 起不再支持 localStorage `hn_base_url` 覆盖**（那等于把"把基址改到任意域名"做成产品能力）；
+  测试/本地桩改注入显式钩子 `window.__HN_TEST_BASE_URL__`（生产包与页面自身永不设置）。
+- **S2-09 移动端加固契约**（改之前先看，验收 `tests/verify_mobile_hardening.py`）：
+  ① `capacitor.config.json` 的 `allowMixedContent` 必须 `false`；② `res/xml/network_security_config.xml`
+  显式 `cleartextTrafficPermitted="false"` 且 manifest 引用（平台层硬禁明文）；③ `www/index.html` 有 CSP
+  （`default-src 'self'`；**新增任何外链资源都要同步改 CSP**，否则被浏览器拦）；④ `file_paths.xml`
+  只暴露 `<cache-path name="updates" path="updates/" />`，APK 固定下载到 `getCacheDir()/updates/` 且文件名
+  经 `sanitizeApkName()` 白名单化（桥入参不得参与路径拼接）；⑤ 小程序/APP 都不把 openid 拼进 URL ——
+  页面跳转用 `app.globalData.userOrdersTarget` 交接，API 用 `X-Target-Openid` 头（后端头优先、`?openid=` 回退）。
 
 ## 部署
 
@@ -204,7 +213,7 @@ bash backup.sh  # crontab 每天凌晨3点
 - APP 预览层复用 `.modal-mask`（点遮罩关闭），`closeModal('previewMask')` 里统一回收 objectURL/清空内容。
 - 验收：`node tests/verify_file_preview.js`（两端真实源码 + 桩环境：分派、openDocument 失败重试、截断、大文件、云端订单文案、objectURL 回收 + 接线核对）；
   `node tests/verify_preview_render.mjs`（Playwright + 真实 `index.html`：截图到 `截图展示/文件预览/`、断言 header 行高不变、层叠顺序、图片真解码、截断提示）。
-  ⚠ 该脚本**必须先把 `BASE_URL` 覆盖到本地桩**（`addInitScript` 写 `localStorage.hn_base_url` + `page.route('**/api/**')` 兜底）——app 的 `DEFAULT_BASE_URL` 是线上域名，不覆盖会打到生产接口（脚本最后一项断言全程无外部请求）。
+  ⚠ 该脚本**必须先把 `BASE_URL` 覆盖到本地桩**（`addInitScript` 写 `window.__HN_TEST_BASE_URL__` + `page.route('**/api/**')` 兜底）——app 的 `DEFAULT_BASE_URL` 是线上域名，不覆盖会打到生产接口（脚本最后一项断言全程无外部请求）。
 
 ## 关键文件索引
 
