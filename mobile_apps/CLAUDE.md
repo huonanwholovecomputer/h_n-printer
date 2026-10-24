@@ -156,6 +156,25 @@ ln -s ... && nginx -t && systemctl reload nginx
 bash backup.sh  # crontab 每天凌晨3点
 ```
 
+## 运维与安全运营（S3，2026-10-24）
+
+`printer-backend/ops/` 是运维脚本目录（全部非破坏性、可独立跑、JSON 报告留档）：
+
+- `ha_snapshot.sh`：主库 **5 分钟滚动快照**（SQLite backup API，`backups/recent/` 最新 + `prev/`），
+  生产 cron 已装；`--check` 超 RPO(5min) 退 4。`ha_standby_sync.sh` / `ha_promote.sh`：备机
+  拉取与提级（含 pre_promote 安全备份、DNS 切换清单、回滚）；`ha_failover_drill.py`：真子进程
+  起备站测 RTO/RPO。
+- `db_migration_drill.py`：S3-02 迁移演练（源库只读 + backup API + 当前 `init_db()` 重放 +
+  写锁下读耗时 + 8 并发写）；`db_fk_policy.py`：外键"良性/异常"分类**唯一真相**
+  （生产 228 条 `orders.file_id→files.id` 是文件到期清理后的历史引用，不是损坏）。
+- `audit_query.py`：查文件访问审计（`file_audit.py` 写 `logs/audit/`；下载/删除/列表三处接线，
+  `GET /api/admin/file_audit` 仅 admin/super_admin）。
+- `credential_rotation.py`（凭据轮换日历，`--check`/`--mark`）、`cve_scan.py`（pip-audit，
+  Windows 上必须 `PYTHONUTF8=1`）、`quarterly_ops_report.py`（季度报告 + `--release-gate`）。
+
+改依赖版本后 `tests/verify_dependencies.py` 的变异锚点已改成 regex（别再写死版本串）；
+`tests/run_all.py` 会自动发现新增验收脚本。详见根 `CLAUDE.md`「云打印后端运维与安全运营（S3）」。
+
 ## 价格模型
 
 `calculate_price(page_count, duplex)`:

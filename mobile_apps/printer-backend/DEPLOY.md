@@ -426,3 +426,54 @@ curl -sS -o /dev/null -w '%{http_code}\n' "https://hn-space.cn/socket.io/?EIO=4&
 - 现在（3 台）：**不必切**。16 线程需 12，余量 4，S2-12 实测 3 台档 1044 req/s、orders p95 31 ms。
 - 设备数将达 5–6 台：**切换 gevent**（或先把 threads 调到 24，二选一，见 §11.2）。
 - 设备数 ≥10 台或需要 `workers>1` 做滚动重启不中断：**S3-01 后半段**（实时通道拆进程 + Redis）。
+
+## S3 运维与安全运营（2026-10-24 起）
+
+### 1) 5 分钟滚动快照（RPO ≤5 min）
+
+每天 03:00 的 `backup.sh` 是**归档**（gz + 7 天保留 + 可选孤儿/异地），滚动快照是**故障恢复点**：
+
+```bash
+# 手动一次（生产目录，自动找 venv/bin/python）
+cd /home/printer-backend && bash ops/ha_snapshot.sh
+# 新鲜度自检：超过 RPO_MIN（默认 5）分钟 ⇒ exit 4
+bash ops/ha_snapshot.sh --check
+
+# crontab（已装；重复执行前先 grep -v 去掉旧行）
+*/5  * * * * cd /home/printer-backend && bash ops/ha_snapshot.sh >> /var/log/hn-ha-snapshot.log 2>&1
+*/15 * * * * cd /home/printer-backend && bash ops/ha_snapshot.sh --check >> /var/log/hn-ha-snapshot.log 2>&1
+```
+
+产物：`backups/recent/{orders.db,users.db}`（原子替换）+ `prev/` 上一版 + `last_snapshot.json`
+（md5/integrity/行数/源库 SHA-256）。**不要**用 `cp` 拷活动库（WAL 未 checkpoint 的写入会丢）。
+
+备机（第二台主机）与提级：`ops/ha_standby_sync.sh` / `ops/ha_promote.sh`；
+切换演练：`ops/ha_failover_drill.py --source-dir <快照目录> --snapshot-dir <同目录> --report ...`
+（真子进程 + 随机端口起备站，测 RTO/RPO）。
+
+### 2) 文件访问审计
+
+`file_audit.py` 在下载（签名 URL）、删除、`/api/my_files` 三处写
+`logs/audit/file_access-YYYYMMDD.jsonl`（180 天惰性清理、只记扩展名、fail-open）。
+
+```bash
+# 部署后确认模块已随 app 导入（服务 active + ping 200 即为证据）
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:5000/api/admin/file_audit   # 未登录 401
+# 巡检（服务器本地）
+/home/printer-backend/venv/bin/python ops/audit_query.py --limit 20
+/home/printer-backend/venv/bin/python ops/audit_query.py --stats --json
+```
+
+### 3) 依赖 CVE 扫描与升级
+
+```bash
+# 在联网机器/venv 里（Windows 必须 PYTHONUTF8=1；PIP_CONFIG_FILE 指向空文件可绕开非 UTF-8 pip.ini）
+pip install pip-audit
+python ops/cve_scan.py            # 0 干净 / 3 有漏洞 / 2 工具缺失(SKIP，绝不算通过)
+python ops/credential_rotation.py --check   # 凭据轮换到期/从未轮换
+python ops/quarterly_ops_report.py --period 2026-Q4 --run-all-log <run_all 日志> --release-gate
+```
+
+**升级依赖后必须**：`venv/bin/pip install -r requirements.txt` → `systemctl restart printer-backend`
+→ `curl /api/ping` 200 → 复核 `python -c "import importlib.metadata as m; print(m.version(...))"`。
+2026-10-24 已升 `pypdf 6.21.2 / Pillow 13.0.0 / Werkzeug 3.1.9 / gunicorn 22.0.0`（扫描 CLEAN）。
