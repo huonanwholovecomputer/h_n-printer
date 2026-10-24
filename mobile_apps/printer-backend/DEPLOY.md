@@ -11,6 +11,13 @@
 
 ## 1. 上传代码
 
+> **本项目的标准做法是 `bash deploy_backend.sh`**（见 §12；也可用 Git/SCP，但那样没有排除项保护）。
+> 脚本在解包后会**把文本文件的行尾统一归一化成 LF**：Windows 工作区是
+> `core.autocrlf=true` + 编辑器混排，同一个目录里既有 LF 也有 CRLF 文件，直接 tar 会把 CRLF
+> 带上线 ⇒ 线上文件与 `git show <rev>:path` 的 blob 字节不同，而"线上 LF-md5 == 某个 commit"
+> 正是判断『线上有没有仓库外手工热修』的唯一口径（2026-10-24 实测踩到：`app.py` 带上 CRLF，
+> 比 blob 多 11 153 字节）。Python 对 CRLF 无感 ⇒ 不会报错，只能靠部署脚本兜住。
+
 将 `printer-backend/` 目录上传到服务器 `/opt/printer-backend/`：
 
 ```bash
