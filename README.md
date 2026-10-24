@@ -254,7 +254,7 @@ npx cap sync android && npx cap open android
 # 开发预览：直接用浏览器打开 index.html
 ```
 
-后端地址默认见 `www/app.js` 的 `DEFAULT_BASE_URL`；本地调试可用 `localStorage.setItem('hn_base_url', 'https://你的地址')` 覆盖。一键构建：`.\build-apk.ps1`（debug 包）；`.\build-release-apk.ps1`（发布包，正式签名 + 混淆，见 `android_app/README.md` 的「发布」章节）。
+后端地址默认见 `www/app.js` 的 `DEFAULT_BASE_URL`；本地调试用测试钩子 `window.__HN_TEST_BASE_URL__ = 'http://127.0.0.1:端口'`（S2-09 起不再支持 localStorage 覆盖）。一键构建：`.\build-apk.ps1`（debug 包）；`.\build-release-apk.ps1`（发布包，正式签名 + 混淆，见 `android_app/README.md` 的「发布」章节）。
 
 ---
 

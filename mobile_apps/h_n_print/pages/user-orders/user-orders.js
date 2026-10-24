@@ -87,8 +87,14 @@ Component({
       const app = getApp()
       this.setData({ isDarkMode: app.globalData.isDarkMode })
       this._initScrollEngine()
-      const openid = this.data.openid || ''
-      const nickname = this.data.nickname ? decodeURIComponent(this.data.nickname) : ''
+      // S2-09（DS-22）：目标用户改由 app.globalData 交接（页面 URL 不再带 openid ——
+      // 页面栈/截图/真机调试都会把 openid 带出去）。从页面参数进来的老路径仍兼容。
+      const target = (app.globalData && app.globalData.userOrdersTarget) || null
+      if (target) app.globalData.userOrdersTarget = null
+      const openid = this.data.openid || (target && target.openid) || ''
+      const nickname = this.data.nickname
+        ? decodeURIComponent(this.data.nickname)
+        : ((target && target.nickname) || '')
       const source = this.data.source || ''
 
       let title = '订单列表'
@@ -284,9 +290,6 @@ Component({
         page: this.data.currentPage,
         per_page: this.data.perPage,
       }
-      if (openid) {
-        data.openid = openid
-      }
       if (source) {
         data.source = source
       }
@@ -294,7 +297,11 @@ Component({
       request({
         url: CONFIG.BASE_URL + '/api/orders',
         method: 'GET',
-        header: { 'Authorization': 'Bearer ' + token },
+        // S2-09（DS-22）：目标用户走 X-Target-Openid 头，不进 URL/访问日志；
+        // 服务端仍按目标 openid 做「管理员是否授权过该用户」的校验。
+        header: openid
+          ? { 'Authorization': 'Bearer ' + token, 'X-Target-Openid': openid }
+          : { 'Authorization': 'Bearer ' + token },
         data: data,
         success: (res) => {
           if (res.statusCode === 200 && res.data && res.data.success) {
@@ -351,8 +358,8 @@ Component({
       request({
         url: CONFIG.BASE_URL + '/api/admin/user_detail',
         method: 'GET',
-        header: { 'Authorization': 'Bearer ' + token },
-        data: { openid },
+        // S2-09（DS-22）：目标用户走头，不进 URL
+        header: { 'Authorization': 'Bearer ' + token, 'X-Target-Openid': openid },
         success: (res) => {
           if (res.statusCode === 200 && res.data && res.data.success) {
             const detail = res.data

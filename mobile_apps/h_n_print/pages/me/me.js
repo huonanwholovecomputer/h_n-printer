@@ -1604,10 +1604,11 @@ Component({
         // 没有任何移动 → 纯点击，跳转到该管理员的任务列表
         const admin = this.data.admins.find(a => a.openid === openid)
         if (admin) {
-          const nickname = encodeURIComponent(admin.nickname || '')
-          this._navigateWithAnimation(
-            `/pages/user-orders/user-orders?openid=${openid}&nickname=${nickname}`
-          )
+          // S2-09（DS-22）：目标 openid 不再拼进页面 URL（页面栈/截图/真机调试都会带出去），
+          // 改由 app.globalData 交接；user-orders 页 attached() 读取后立即清空。
+          const app = getApp()
+          app.globalData.userOrdersTarget = { openid, nickname: admin.nickname || '' }
+          this._navigateWithAnimation('/pages/user-orders/user-orders')
         }
         return
       }

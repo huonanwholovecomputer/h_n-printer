@@ -2063,7 +2063,7 @@ async function toggleRecordOrders(openid, key) {
     const inner = wrap ? wrap.querySelector('.record-orders-inner') : null;
     if (inner) inner.innerHTML = '<text class="record-orders-status">加载中...</text>';
     try {
-      const r = await api('/api/orders?openid=' + encodeURIComponent(openid) + '&per_page=50');
+      const r = await api('/api/orders?per_page=50', { headers: { 'X-Target-Openid': openid } });
       u._ordersLoaded = true;
       u._ordersLoading = false;
       u._ordersCache = (r.data && r.data.success) ? (r.data.orders || []) : [];
@@ -2126,8 +2126,10 @@ async function loadUserOrders(silent) {
   try {
     let url = '/api/orders?page=' + v.page + '&per_page=' + v.perPage;
     if (v.source === 'local') url += '&source=local';
-    else if (v.openid) url += '&openid=' + encodeURIComponent(v.openid);
-    const r = await api(url);
+    // S2-09（DS-22）：目标用户走 X-Target-Openid 头，不进 URL/访问日志
+    const targetOpts = (v.source !== 'local' && v.openid)
+      ? { headers: { 'X-Target-Openid': v.openid } } : {};
+    const r = await api(url, targetOpts);
     if (r.status === 200 && r.data && r.data.success) {
       ok = true;
       v.orders = (r.data.orders || []).map(normalizeOrder);
@@ -2139,7 +2141,8 @@ async function loadUserOrders(silent) {
       list.innerHTML = '<view class="status-box"><text class="status-text">' + esc((r.data && r.data.message) || '加载失败') + '</text></view>';
     }
     if (v.openid && !v.userDetail) {
-      const d = await api('/api/admin/user_detail?openid=' + encodeURIComponent(v.openid)).catch(() => null);
+      const d = await api('/api/admin/user_detail',
+        { headers: { 'X-Target-Openid': v.openid } }).catch(() => null);
       if (d && d.data && d.data.success) {
         v.userDetail = d.data;
         renderUserOrdersUserCard();

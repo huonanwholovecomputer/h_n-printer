@@ -147,7 +147,7 @@ page.on('request', (r) => {
 });
 await page.addInitScript((base) => {
   try {
-    localStorage.setItem('hn_base_url', base);
+    window.__HN_TEST_BASE_URL__ = base;
     localStorage.setItem('hn_theme_mode', 'dark');   // 与用户截图同为深色主题
   } catch (e) { /* 忽略 */ }
 }, LOCAL_BASE);

@@ -107,7 +107,7 @@ page.on('console', (m) => { if (m.type() === 'error') errors.push('console: ' + 
 page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
 
 await page.addInitScript((p) => {
-  localStorage.setItem('hn_base_url', 'http://127.0.0.1:' + p);
+  window.__HN_TEST_BASE_URL__ = 'http://127.0.0.1:' + p;
   localStorage.setItem('hn_token', 'mock-token');
   localStorage.setItem('hn_openid', 'mock-openid');
   localStorage.setItem('hn_role', 'admin');

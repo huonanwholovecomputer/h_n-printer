@@ -615,7 +615,9 @@ Component({
                 const app = getApp()
                 app.globalData.token = token
                 app.globalData.openid = openid
-                console.log('登录成功, openid:', openid)
+                // S2-09（DS-22/MB-05）：不再打印 openid —— 小程序包可被反编译，
+                // openid 是跨设备稳定、不可重置的用户标识，日志随包下发即产品数据。
+                console.log('[doLogin] 登录成功')
                 this.loadUserRole()
               } else {
                 console.error('[doLogin] 登录失败:', loginRes.statusCode, loginRes.data)
@@ -3218,7 +3220,8 @@ Component({
             wx.showToast({ title: msg, icon: 'none', duration: 2500 })
             return
           }
-          console.log('任务提交成功：', submitRes.data)
+          // S2-09（DS-22/MB-05）：不打印整份提交结果（订单号/金额/文件名）。
+          console.log('[submit] 任务提交成功')
           this._lastOrderResult = submitRes.data
           this.setData({
             submitting: false,

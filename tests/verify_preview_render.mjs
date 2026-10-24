@@ -82,7 +82,8 @@ page.on('pageerror', (e) => console.log('  [pageerror] ' + e.message));
 page.on('console', (m) => { if (m.type() === 'error') console.log('  [console.error] ' + m.text()); });
 
 /* 必须隔离到本地服务器：app 的 DEFAULT_BASE_URL 是 https://hn-space.cn，
-   不覆盖 hn_base_url 会打到生产接口（device_login / claiming_devices / pricing…）。 */
+   S2-09 起基址是编译期常量（不再支持 localStorage 的 hn_base_url 覆盖），测试改用
+   显式测试钩子 window.__HN_TEST_BASE_URL__；不覆盖会打到生产接口。 */
 const LOCAL_BASE = `http://127.0.0.1:${port}`;
 const foreign = [];
 page.on('request', (r) => {
@@ -90,7 +91,7 @@ page.on('request', (r) => {
   if (!u.startsWith(LOCAL_BASE) && !u.startsWith('data:') && !u.startsWith('blob:')) foreign.push(u);
 });
 await page.addInitScript((base) => {
-  try { localStorage.setItem('hn_base_url', base); } catch (e) { /* 忽略 */ }
+  try { window.__HN_TEST_BASE_URL__ = base; } catch (e) { /* 忽略 */ }
 }, LOCAL_BASE);
 // 双保险：即使有漏网的接口调用，也在网络层拦掉（绝不落到生产）
 await page.route('**/api/**', (route) => {

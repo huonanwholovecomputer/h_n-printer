@@ -45,7 +45,7 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 const browser = await chromium.launch({ executablePath: CHROME });
 const page = await browser.newPage({ viewport: { width: 430, height: 932 } });
-await page.addInitScript((base) => { try { localStorage.setItem('hn_base_url', base); } catch (e) {} }, `http://127.0.0.1:${port}`);
+await page.addInitScript((base) => { try { window.__HN_TEST_BASE_URL__ = base; } catch (e) {} }, `http://127.0.0.1:${port}`);
 await page.route('**/api/**', (route) => route.request().url().startsWith(`http://127.0.0.1:${port}`)
   ? route.continue()
   : route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(MOCK) }));

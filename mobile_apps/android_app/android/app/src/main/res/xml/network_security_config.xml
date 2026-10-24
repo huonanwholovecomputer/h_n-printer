@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- S2-09（DS-22/MB-06）：把"禁明文"从平台默认值变成**显式契约**。
+
+     targetSdk 34 本来默认禁止明文（app 既没有 usesCleartextTraffic=true 也没有 NSC），
+     所以现在没有可直接利用的降级路径；但默认值是"跟着 targetSdk 走"的，一旦哪天有人为了
+     某个接口加例外、或 targetSdk 语义变化，https 页面就能加载 http 子资源。这里显式写入
+     cleartextTrafficPermitted=false，让任何 http:// 请求在平台层硬失败（含 localhost）。
+     与之配套：capacitor.config.json 已把 allowMixedContent 关掉、www/index.html 有 CSP。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -4,7 +4,15 @@
  */
 
 const DEFAULT_BASE_URL = 'https://hn-space.cn';
-const BASE_URL = localStorage.getItem('hn_base_url') || DEFAULT_BASE_URL;
+/* S2-09（DS-22/MB-06）：API 基址是**编译期常量**，不再允许 localStorage 覆盖。
+ *
+ * 旧写法 `localStorage.getItem('hn_base_url') || DEFAULT_BASE_URL` 把"把 API 基址改到任意
+ * 域名"变成产品能力：WebView 里任何一次脚本执行（XSS / 未来引入的第三方 SDK）都能持久化
+ * 改写基址，之后所有请求（含 Authorization 头）都发往攻击者。它唯一的使用者是静态测试桩，
+ * 所以改成**显式的测试钩子** `window.__HN_TEST_BASE_URL__`（由测试在 addInitScript 里设置，
+ * 生产包与页面自身永不设置）。改动同时要同步 tests/*.mjs 与 android_app/tools/*.mjs。 */
+const TEST_BASE_URL = (typeof window !== 'undefined' && window.__HN_TEST_BASE_URL__) || '';
+const BASE_URL = TEST_BASE_URL || DEFAULT_BASE_URL;
 
 const state = {
   token: localStorage.getItem('hn_token') || '',

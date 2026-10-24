@@ -68,7 +68,7 @@ npx cap add android
 
 ## API 对接
 
-- 后端地址默认 `https://hn-space.cn`（见 `app.js` 的 `DEFAULT_BASE_URL`）；本地调试可用 `localStorage.setItem('hn_base_url', 'https://你的地址')` 覆盖
+- 后端地址默认 `https://hn-space.cn`（见 `app.js` 的 `DEFAULT_BASE_URL`）；本地浏览器调试时用测试钩子 `window.__HN_TEST_BASE_URL__ = 'http://127.0.0.1:端口'`（S2-09 起不再支持 localStorage 覆盖；APK 里基址是编译期常量）
 - 使用 `/api/device_login` 端点进行设备认证（无需微信），401 自动重登
 - 其他 API 端点与微信小程序完全共用
 

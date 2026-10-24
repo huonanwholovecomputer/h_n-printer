@@ -110,8 +110,8 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   **解除条件 = 下次统一构建 APK 后跑 verify_apk_release.py 转绿，即删本条**。
 EXPECTED_RED: dict[str, str] = {
     "verify_apk_release.py":
-        "S2-08 改了 www/（隐私告知/保留期/我的文件），APK 待下次统一构建；"
-        "构建后跑本脚本转绿即删除本条",
+        "S2-08/S2-09 改了 www/ 与原生壳（隐私告知/保留期/我的文件、CSP/NSC/FileProvider），"
+        "APK 待下次统一构建；构建后跑本脚本转绿即删除本条",
 }
 
 PY_EXTS = {".py"}

@@ -1,0 +1,13 @@
+// config.local.js.example — 本地/测试地址覆盖模板（S2-09 / MB-04）
+//
+// 用法：复制成同目录的 config.local.js（该文件已被 .gitignore 排除，不会提交），
+// 按需修改 BASE_URL；不复制则一律使用 utils/config.js 里的生产默认值。
+//
+// ⚠ 小程序真机只能访问 https 域名（且要在微信公众平台配置 request/uploadFile/
+//   downloadFile 合法域名）；http://127.0.0.1:5000 这类地址只在开发者工具里勾选
+//   「不校验合法域名」时可用，用于本地后端联调。
+const LOCAL_CONFIG = {
+  BASE_URL: 'http://127.0.0.1:5000',
+}
+
+module.exports = { LOCAL_CONFIG }

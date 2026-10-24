@@ -6,6 +6,14 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="theme-color" content="#F2F2F7">
+<!-- S2-09（DS-22/MB-06）：CSP 把「只能从本包与生产域名取资源」变成契约。
+     · script-src/style-src 必须留 'unsafe-inline'：本页与 www/*.js 大量内联脚本/样式（现状如此，
+       移除需要整包重写，不在本批范围）；script-src 不含任何远端域，故无第三方脚本执行面。
+     · connect-src 只放行本页 origin 与生产域名 —— API 基址是编译期常量（app.js），
+       localStorage 的 hn_base_url 覆盖已在 S2-09 删除。
+     · img-src 放行 https: 与 blob:（头像来自生产域名；预览用 objectURL）；
+     · 保留 'self' 以便本地静态桩（tests/*.mjs，页面与桩 API 同源）能跑。 -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://hn-space.cn; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
 <title>HN 云打印</title>
 <link rel="stylesheet" href="styles.css">
 </head>

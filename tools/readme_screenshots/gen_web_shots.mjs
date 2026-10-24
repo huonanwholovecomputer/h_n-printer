@@ -294,7 +294,7 @@ if (want('print') || want('me')) {
   page.on('pageerror', (e) => console.log('  [pageerror] ' + e.message));
   await page.addInitScript((base) => {
     try {
-      localStorage.setItem('hn_base_url', base);
+      window.__HN_TEST_BASE_URL__ = base;
       localStorage.setItem('hn_token', 'stub-token');
       localStorage.setItem('hn_theme_mode', 'dark');
       localStorage.setItem('hn_nickname', '张伟');

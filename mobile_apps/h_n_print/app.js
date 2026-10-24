@@ -152,5 +152,8 @@ App({
     isDarkMode: false,
     _systemTheme: 'light',
     _pageRegistry: [],  // 所有存活页面实例，供主题切换直接覆写缓存页数据
+    // S2-09（DS-22）：管理员"查看某用户订单"的目标交接位。openid 不再拼进页面 URL
+    // （页面栈/截图/真机调试都会把它带出去），由跳转方写入、user-orders 页读取后清空。
+    userOrdersTarget: null,
   }
 })

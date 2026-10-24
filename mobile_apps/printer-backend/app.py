@@ -7732,12 +7732,26 @@ def purge_test_devices() -> int:
         return 0
 
 
+def _target_openid_arg() -> str:
+    """S2-09（DS-22）：管理员"查看指定用户"的目标 openid。
+
+    优先读请求头 `X-Target-Openid`，回退 query 参数 `?openid=`（老客户端兼容）。
+    换成头的原因：openid 是跨设备稳定的用户标识，放进 URL 会落进 nginx/gunicorn
+    访问日志、浏览器历史与 Referer。**它本身不是凭据** —— 两个调用点（/api/orders、
+    /api/admin/user_detail）在取到目标后仍各自做角色/授权校验，伪造头得不到额外数据。
+    """
+    val = (request.headers.get("X-Target-Openid", "") or "").strip()
+    if not val:
+        val = (request.args.get("openid", "") or "").strip()
+    return val
+
+
 @app.route("/api/orders", methods=["GET"])
 @login_required
 def get_orders():
     """返回任务列表。默认仅返回当前用户自己的订单。
-    管理员可通过 ?openid=xxx 查看指定授权用户的订单。
-    超级管理员可通过 ?view=all 查看全部订单，或 ?openid=xxx 查看指定用户。
+    管理员可通过 X-Target-Openid 头（兼容 ?openid=）查看指定授权用户的订单。
+    超级管理员可通过 ?view=all 查看全部订单，或指定 openid 查看指定用户。
     支持分页: ?page=1&per_page=20
     """
     # S1-08：每用户限速（结算页/订单列表会轮询；120/分 是正常用量的数倍，
@@ -7752,7 +7766,7 @@ def get_orders():
 
     role = compute_role(g.openid)
     is_super = SUPER_ADMIN_OPENID and g.openid == SUPER_ADMIN_OPENID
-    target_openid = (request.args.get("openid", "") or "").strip()
+    target_openid = _target_openid_arg()
     view_all = is_super and request.args.get("view", "") == "all"
     source_filter = (request.args.get("source", "") or "").strip()
 
@@ -9107,7 +9121,7 @@ def admin_user_detail():
     if compute_role(g.openid) != "admin":
         return jsonify({"success": False, "message": "仅限管理员操作"}), 403
 
-    openid = (request.args.get("openid", "") or "").strip()
+    openid = _target_openid_arg()
     if not openid:
         return jsonify({"success": False, "message": "缺少 openid 参数"}), 400
 

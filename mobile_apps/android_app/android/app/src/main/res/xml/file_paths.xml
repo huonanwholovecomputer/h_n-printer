@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- S2-09（DS-22/MB-02）：FileProvider 只暴露**实际用到的子目录**。
+     旧写法是 <external-path path=".">（整个外部存储根）+ <cache-path path=".">（整个 cacheDir），
+     等于"任何来自共享存储/缓存的文件都能被本 App 生成可读 content URI"——现在无调用点故不可利用，
+     但一旦新增"分享/另存/导出"就会把顾客文档任意外泄。
+     唯一使用点：MainActivity.installApk() 分享自更新下载的 APK，落在
+     getCacheDir()/updates/（Java 侧已把文件名收成白名单字符，见 downloadAndInstall）。 -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-path name="my_images" path="." />
-    <cache-path name="my_cache_images" path="." />
+    <cache-path name="updates" path="updates/" />
 </paths>

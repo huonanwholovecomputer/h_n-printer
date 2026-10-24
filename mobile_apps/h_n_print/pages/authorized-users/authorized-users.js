@@ -209,9 +209,11 @@ Component({
     onUserTap(e) {
       const openid = e.currentTarget.dataset.openid
       const nickname = e.currentTarget.dataset.nickname || ''
-      this._navigateWithAnimation(
-        `/pages/user-orders/user-orders?openid=${openid}&nickname=${encodeURIComponent(nickname)}`
-      )
+      // S2-09（DS-22）：目标 openid 不再拼进页面 URL，改由 app.globalData 交接
+      // （user-orders 页 attached() 读取后清空；服务端仍按目标 openid 做授权校验）。
+      const app = getApp()
+      app.globalData.userOrdersTarget = { openid, nickname }
+      this._navigateWithAnimation('/pages/user-orders/user-orders')
     },
 
     // 展开/收起该用户的全部密钥记录
@@ -252,9 +254,10 @@ Component({
       if (!token) return
       this.setData({ ['keyOrders.' + key + '.loading']: true })
       request({
-        url: CONFIG.BASE_URL + '/api/orders?openid=' + encodeURIComponent(openid) + '&per_page=50',
+        url: CONFIG.BASE_URL + '/api/orders?per_page=50',
         method: 'GET',
-        header: { 'Authorization': 'Bearer ' + token },
+        // S2-09（DS-22）：目标用户走 X-Target-Openid 头，不进 URL/访问日志
+        header: { 'Authorization': 'Bearer ' + token, 'X-Target-Openid': openid },
         success: (res) => {
           const orders = (res.data && res.data.success) ? (res.data.orders || []) : []
           this.setData({

@@ -67,7 +67,7 @@ const browser = await chromium.launch({ executablePath: CHROME });
 const page = await browser.newPage({ viewport: { width: 430, height: 932 }, deviceScaleFactor: 2 });
 await page.addInitScript((base) => {
   try {
-    localStorage.setItem('hn_base_url', base);
+    window.__HN_TEST_BASE_URL__ = base;
     localStorage.setItem('hn_theme_mode', 'dark');
   } catch (e) {}
 }, `http://127.0.0.1:${port}`);
@@ -90,7 +90,32 @@ await page.evaluate(() => {
   document.body.classList.add('theme-dark');
   document.querySelectorAll('.modal-mask').forEach((m) => m.classList.add('theme-dark'));
 });
-await page.waitForTimeout(300);
+// 等**布局稳定**再采样：固定 300ms 不够 —— 卡片入场动画、图片/字体加载会让
+// .img-ori-toggle 在 100~800ms 之间继续移动（S2-09 加 CSP 后实测 top 430→447→443）。
+// 采样点按 toggle 矩形现算，位置一变就会把选项文字（白字）扫进 6×6 色块，
+// 测出来"修复后比修复前更亮"的假失败。判据 = 连续两次矩形完全一致。
+async function waitLayoutStable(selector, timeoutMs = 4000) {
+  const t0 = Date.now();
+  let prev = null;
+  let stable = 0;
+  while (Date.now() - t0 < timeoutMs) {
+    const r = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const b = el.getBoundingClientRect();
+      return [b.top, b.left, b.width, b.height];
+    }, selector);
+    if (r && prev && r.every((v, i) => Math.abs(v - prev[i]) < 0.01)) {
+      if (++stable >= 2) return;
+    } else {
+      stable = 0;
+    }
+    prev = r;
+    await page.waitForTimeout(100);
+  }
+  throw new Error('布局在超时内未稳定: ' + selector);
+}
+await waitLayoutStable('#fileList .file-card .img-ori-toggle');
 check('页面处于深色模式', (await page.evaluate(() => document.body.classList.contains('theme-dark'))) === true);
 await mkdir(OUT_DIR, { recursive: true });
 
@@ -154,7 +179,7 @@ await page.addStyleTag({ content: `
   background-color: rgba(60, 60, 67, 0.08) !important;
   box-shadow: none !important;
 }` });
-await page.waitForTimeout(200);
+await waitLayoutStable('#fileList .file-card .img-ori-toggle');
 files.before = await capture('before_old');
 await page.locator('#fileList .file-card').screenshot({ path: join(OUT_DIR, 'before_old_card.png') });
 

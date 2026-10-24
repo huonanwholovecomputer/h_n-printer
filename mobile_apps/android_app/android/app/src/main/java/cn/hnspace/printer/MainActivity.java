@@ -154,7 +154,16 @@ public class MainActivity extends BridgeActivity {
                         return;
                     }
                     long total = conn.getContentLengthLong();
-                    apk = new File(getCacheDir(), fileName);
+                    // S2-09（DS-22/MB-02）：安装包固定落到 getCacheDir()/updates/，
+                    // 文件名只取 basename + 白名单字符（桥入参来自 JS，绝不允许参与路径拼接），
+                    // 与 res/xml/file_paths.xml 的 <cache-path name="updates" path="updates/">
+                    // 严格对齐 —— FileProvider 只认这一个子目录，多一级少一级都会抛异常。
+                    File updateDir = new File(getCacheDir(), "updates");
+                    if (!updateDir.isDirectory() && !updateDir.mkdirs()) {
+                        updateProgress("error", "更新目录创建失败");
+                        return;
+                    }
+                    apk = new File(updateDir, sanitizeApkName(fileName));
                     try (InputStream in = conn.getInputStream();
                          FileOutputStream out = new FileOutputStream(apk)) {
                         byte[] buf = new byte[8192];
@@ -198,6 +207,29 @@ public class MainActivity extends BridgeActivity {
                 + JSONObject.quote(status) + "," + JSONObject.quote(msg) + ")";
             webView.evaluateJavascript(js, null);
         });
+    }
+
+    /** S2-09（DS-22/MB-02）：把桥入参 fileName 收成"安全 basename"：
+     *  只保留 [A-Za-z0-9._-]，去掉任何目录分隔与上跳；空/非法/不以 .apk 结尾时回落固定名。
+     *  这样即使 JS 侧传 "../../x" 或绝对路径，也只能落在 getCacheDir()/updates/ 下。 */
+    private static String sanitizeApkName(String raw) {
+        String name = (raw == null) ? "" : raw.trim();
+        int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (slash >= 0) name = name.substring(slash + 1);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < name.length() && sb.length() < 64; i++) {
+            char c = name.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+                sb.append(c);
+            }
+        }
+        String safe = sb.toString();
+        if (safe.isEmpty() || safe.equals(".") || safe.equals("..")
+            || !safe.toLowerCase().endsWith(".apk")) {
+            return "hn-cloud-print-update.apk";
+        }
+        return safe;
     }
 
     private String md5Of(File f) throws Exception {
