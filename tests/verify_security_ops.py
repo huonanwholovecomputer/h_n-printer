@@ -336,6 +336,15 @@ p = run_py(CRED, ["--check", "--registry", reg_ok])
 H.chk("全新鲜登记表 --check → exit 0（PASS）",
       p.returncode == 0 and "PASS" in p.stdout, "rc=%s" % p.returncode)
 
+# 按需/外部管理策略：APK keystore（换了会破坏覆盖升级）与 TLS（certbot 自动续期）
+# 即使 last_rotated=null 也不该算欠账、更不该永久卡发布门。
+reg_pol = make_registry(root1, overrides={"apk_keystore": None, "tls_cert": None},
+                        name="policy.json")
+p = run_py(CRED, ["--check", "--registry", reg_pol])
+H.chk("★ 按需轮换（APK keystore）/ 自动续期（TLS）从不判欠账：--check exit 0",
+      p.returncode == 0 and "按需/自动" in p.stdout
+      and "关键凭据欠账" not in p.stdout, "rc=%s" % p.returncode)
+
 overdue_date = (dt.date.today() - dt.timedelta(days=200)).isoformat()
 reg_overdue = make_registry(root1, overrides={"printer_global_token": overdue_date},
                             name="overdue.json")
@@ -508,6 +517,12 @@ missing_sections = [s for s in ("## 1. 摘要", "## 2. 凭据轮换", "## 3. CVE
 H.chk("★ 合成证据齐全 → --release-gate exit 0 且报告含全部 10 个章节",
       p.returncode == 0 and not missing_sections,
       {"rc": p.returncode, "missing": missing_sections})
+ev_pol = make_evidence(os.path.join(root_q, "policy"),
+                       reg_overrides={"apk_keystore": None, "tls_cert": None})
+p = run_py(QREP, report_args(ev_pol))
+md_pol = _read(ev_pol["out"]) if os.path.isfile(ev_pol["out"]) else ""
+H.chk("★ 发布门不被「按需/自动」项卡住（否则 APK keystore 永远无法放行）",
+      p.returncode == 0 and "按需/自动" in md_pol, "rc=%s" % p.returncode)
 H.chk("报告里 RTO/RPO 实测 vs 目标都落在表里（不是只写一句话）",
       "RTO" in md and "RPO" in md and "12.5" in md and "30" in md and "5" in md)
 H.chk("报告仍诚实标注缺失项（审计模块不存在 ⇒ 「缺失」并进人工清单）",

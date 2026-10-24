@@ -71,6 +71,17 @@ DATE_FMT = "%Y-%m-%d"
 FIELDS = ("id", "name", "owner", "interval_days", "last_rotated", "method",
           "critical", "evidence", "note")
 
+# 轮换策略（可选字段 `policy`，缺省 = scheduled）：
+#   scheduled       —— 按 interval_days 周期轮换；过期/从未轮换算欠账，关键项拦发布门。
+#   on_compromise   —— **只在确认泄漏时**才换（换了会破坏兼容性）：如 APK 签名 keystore，
+#                      换掉后所有已装用户无法覆盖升级。不参与"到期"判定，也不拦发布门；
+#                      正确动作是离线备份 + 泄漏时按预案换。
+#   managed_external—— 由外部机制自动轮换/续期（如 certbot 续 TLS），登记表只做核对记录。
+# 判据见 `_item_status()`：policy != scheduled 的条目不进 never/overdue 欠账，
+# 发布门（quarterly_ops_report 的 critical_bad）因此也不会被"按需轮换"项永久卡住。
+POLICIES = ("scheduled", "on_compromise", "managed_external")
+POLICY_CN = {"scheduled": "周期", "on_compromise": "按需", "managed_external": "自动/外部"}
+
 # 必须覆盖的凭据（S3-04 交付要求 + 现场已确认存在的凭据面）。
 # 允许登记表多出别的条目；少了这些就说明登记表不完整 ⇒ schema 错误（exit 2）。
 REQUIRED_IDS = (
@@ -185,6 +196,10 @@ def _check_item(idx: int, item) -> list:
     crit = item.get("critical")
     if not isinstance(crit, bool):
         errs.append("%s.critical 必须是布尔值" % where)
+    pol = item.get("policy", "scheduled")
+    if pol not in POLICIES:
+        errs.append("%s.policy 只能是 %s（收到 %r）"
+                    % (where, "/".join(POLICIES), pol))
     last = item.get("last_rotated")
     if last is not None:
         try:
@@ -243,10 +258,18 @@ def load_registry(path: str = "") -> dict:
 def _item_status(item: dict, today: dt.date) -> dict:
     last = item["last_rotated"]
     interval = int(item["interval_days"])
+    policy = item.get("policy", "scheduled")
     row = dict(item)
+    row["policy"] = policy
     row["due_date"] = None
     row["days_overdue"] = None
     row["days_left"] = None
+    # 按需/外部管理的凭据不参与"到期"判定：它们的正确动作不是按期轮换。
+    if policy != "scheduled":
+        row["state"] = "not_applicable"
+        if last is not None:
+            row["due_date"] = (parse_date(last) + dt.timedelta(days=interval)).strftime(DATE_FMT)
+        return row
     if last is None:
         row["state"] = "never"
         return row
@@ -278,6 +301,7 @@ def status(path: str = "", registry: dict | None = None,
     overdue = [r["id"] for r in rows if r["state"] == "overdue"]
     due_soon = [r["id"] for r in rows if r["state"] == "due_soon"]
     ok_rows = [r["id"] for r in rows if r["state"] == "ok"]
+    not_applicable = [r["id"] for r in rows if r["state"] == "not_applicable"]
     critical_bad = [r["id"] for r in rows
                     if r["critical"] and r["state"] in ("never", "overdue")]
     critical_overdue = [r["id"] for r in rows
@@ -296,17 +320,20 @@ def status(path: str = "", registry: dict | None = None,
             "due_soon": len(due_soon),
             "overdue": len(overdue),
             "never": len(never),
+            "not_applicable": len(not_applicable),
         },
         "never": never,
         "overdue": overdue,
         "due_soon": due_soon,
+        "not_applicable": not_applicable,
         "critical_bad": critical_bad,
         "critical_overdue": critical_overdue,
         "critical_never": critical_never,
     }
 
 
-STATE_CN = {"ok": "正常", "due_soon": "即将到期", "overdue": "已过期", "never": "从未轮换"}
+STATE_CN = {"ok": "正常", "due_soon": "即将到期", "overdue": "已过期",
+            "never": "从未轮换", "not_applicable": "按需/自动（不计欠账）"}
 
 
 def render_md(st: dict) -> str:
@@ -315,12 +342,13 @@ def render_md(st: dict) -> str:
     lines = [
         "**凭据轮换状态**（检查日 %s，到期前 %d 天提醒）" % (st["today"], st["warn_days"]),
         "",
-        "| ID | 名称 | 关键 | 上次轮换 | 周期(天) | 到期日 | 状态 | 负责人 |",
-        "|---|---|---|---|---|---|---|---|",
+        "| ID | 名称 | 关键 | 策略 | 上次轮换 | 周期(天) | 到期日 | 状态 | 负责人 |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in st["items"]:
-        lines.append("| `%s` | %s | %s | %s | %d | %s | %s | %s |" % (
+        lines.append("| `%s` | %s | %s | %s | %s | %d | %s | %s | %s |" % (
             r["id"], r["name"], "⚠️ 是" if r["critical"] else "否",
+            POLICY_CN.get(r["policy"], r["policy"]),
             r["last_rotated"] or "—", r["interval_days"],
             r["due_date"] or "—",
             STATE_CN.get(r["state"], r["state"]) +
@@ -328,8 +356,9 @@ def render_md(st: dict) -> str:
             r["owner"]))
     lines += [
         "",
-        "合计 %d 项：正常 %d ｜ 即将到期 %d ｜ 已过期 %d ｜ 从未轮换 %d"
-        % (c["total"], c["ok"], c["due_soon"], c["overdue"], c["never"]),
+        "合计 %d 项：正常 %d ｜ 即将到期 %d ｜ 已过期 %d ｜ 从未轮换 %d ｜ 按需/自动 %d"
+        % (c["total"], c["ok"], c["due_soon"], c["overdue"], c["never"],
+           c.get("not_applicable", 0)),
     ]
     bad = [r for r in st["items"] if r["state"] in ("never", "overdue")]
     if bad:
@@ -432,21 +461,23 @@ def atomic_save(reg: dict, path: str) -> str | None:
 
 def _cmd_check(st: dict) -> int:
     c = st["counts"]
-    widths = (26, 34, 5, 12, 12, 8, 10)
+    widths = (26, 34, 6, 10, 12, 12, 10, 26)
     print("[ROT] 凭据轮换检查（%s，到期前 %d 天提醒）"
           % (st["today"], st["warn_days"]))
     print("".join(_pad(h, w) for h, w in zip(
-        ("ID", "名称", "关键", "上次轮换", "到期日", "过期天数", "状态"), widths)))
+        ("ID", "名称", "关键", "策略", "上次轮换", "到期日", "过期天数", "状态"), widths)))
     print("-" * (sum(widths) + 12))
     for r in st["items"]:
         overdue_cell = "—" if r["days_overdue"] is None else str(r["days_overdue"])
         cells = (r["id"], r["name"], "是" if r["critical"] else "否",
+                 POLICY_CN.get(r["policy"], r["policy"]),
                  r["last_rotated"] or "从未轮换", r["due_date"] or "—",
                  overdue_cell, STATE_CN.get(r["state"], r["state"]))
         print("".join(_pad(v, w) for v, w in zip(cells, widths)))
     print("-" * (sum(widths) + 12))
-    print("合计 %d 项：正常 %d ｜ 即将到期 %d ｜ 已过期 %d ｜ 从未轮换 %d"
-          % (c["total"], c["ok"], c["due_soon"], c["overdue"], c["never"]))
+    print("合计 %d 项：正常 %d ｜ 即将到期 %d ｜ 已过期 %d ｜ 从未轮换 %d ｜ 按需/自动 %d"
+          % (c["total"], c["ok"], c["due_soon"], c["overdue"], c["never"],
+             c.get("not_applicable", 0)))
     if st["critical_bad"]:
         print("关键凭据欠账（%d）：%s" % (len(st["critical_bad"]),
                                       ", ".join(st["critical_bad"])))
@@ -465,10 +496,11 @@ def _cmd_list(reg: dict, st: dict) -> int:
     by_id = {r["id"]: r for r in st["items"]}
     for item in reg["items"]:
         r = by_id[item["id"]]
-        print("%s %s 负责人=%s 周期=%d天 上次=%s 关键=%s 状态=%s"
+        print("%s %s 负责人=%s 周期=%d天 上次=%s 关键=%s 策略=%s 状态=%s"
               % (_pad(item["id"], 26), _pad(item["name"], 34), item["owner"],
                  item["interval_days"], item["last_rotated"] or "从未轮换",
                  "是" if item["critical"] else "否",
+                 POLICY_CN.get(r["policy"], r["policy"]),
                  STATE_CN.get(r["state"], r["state"])))
         print("    方式：%s" % item["method"])
         print("    证据：%s" % item["evidence"])
