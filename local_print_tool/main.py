@@ -13,6 +13,19 @@ import threading
 # 确保本地模块可以导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ═══════════════════════════════════════════════════════════════
+# S2-03：隔离转换 worker 入口 —— 必须在导入 PySide6 / 创建 QApplication 之前分发
+# ═══════════════════════════════════════════════════════════════
+# office_sandbox 以 `python convert_worker.py <spec>`（源码）或
+# `HN打印工具.exe --convert-worker <spec>`（打包）拉起本进程；后者会走到这里。
+# 静态 import convert_worker 是刻意的：PyInstaller 只收集静态可达模块，动态
+# `__import__("convert_worker")` 不会被打进包 ⇒ 打包版沙箱永远 unavailable。
+import convert_worker as _convert_worker  # noqa: E402
+
+if "--convert-worker" in sys.argv:
+    _idx = sys.argv.index("--convert-worker")
+    sys.exit(_convert_worker.main(sys.argv[_idx + 1:]))
+
 from PySide6.QtWidgets import QApplication, QMessageBox
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, qInstallMessageHandler, QtMsgType

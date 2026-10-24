@@ -82,6 +82,40 @@ MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
 # 只有这两种扩展名会走 Word/WPS COM（xls/ppt 一直走 LibreOffice）
 COM_OFFICE_EXTS = (".doc", ".docx")
 
+# ── S2-03：Office 转换沙箱（默认关闭；默认值必须是 False）──
+# 开启后，**本地** .doc/.docx 的 Word/WPS COM 转换改到 Job Object 隔离 worker 里跑
+# （office_sandbox.py + convert_worker.py）。默认关闭的原因：它改的是"每一单 Word"的
+# 主链路，必须先在真机（Word/WPS/LibreOffice 三引擎）逐项验证再打开。打开方式：
+#   ① 客户端配置 conversion_sandbox=true（GUI 启动时调 set_office_sandbox）；
+#   ② 环境变量 HN_OFFICE_SANDBOX=1（现场调试/验收用，优先级最高）。
+_office_sandbox_enabled = False
+
+
+def set_office_sandbox(enabled: bool) -> None:
+    """设置进程级沙箱开关（GUI 启动时按配置调用）。"""
+    global _office_sandbox_enabled
+    _office_sandbox_enabled = bool(enabled)
+
+
+def office_sandbox_enabled() -> bool:
+    """生效值：环境变量可强制开关（1/0），否则用配置项。"""
+    env = (os.environ.get("HN_OFFICE_SANDBOX") or "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    return bool(_office_sandbox_enabled)
+
+
+def should_sandbox(file_path: str, from_cloud: bool = False) -> bool:
+    """该文件本次转换是否走沙箱：只有**本地**的 .doc/.docx（COM 引擎）才需要。
+
+    · 云端文件在 S1-04 已强制 LibreOffice（无宏执行路径），不必再套 COM 沙箱；
+    · xls/xlsx/ppt/pptx 本来就只走 LibreOffice 子进程（独立进程、无宏），不套；
+    · 开关关闭 ⇒ 恒 False（对存量行为零影响）。
+    """
+    return (not from_cloud) and ext_of(file_path) in COM_OFFICE_EXTS and office_sandbox_enabled()
+
 
 def _harden_office_com_app(app, label: str) -> dict[str, bool]:
     """在 `Documents.Open` **之前**把 Word / WPS 的 COM 实例收紧到「不执行宏、不弹窗、不更新链接」。
@@ -1248,6 +1282,93 @@ def _scan_unsafe_html(html: str) -> None:
         )
 
 
+# ── S2-03 外部引用策略：转换过程一律不访问外网 ──
+# Markdown 里可以出现指向远程的 `<img src=http…>`、CSS `url(http…)`/`@import`、
+# `<link rel=stylesheet href=http…>`、`<base href=…>` 与 `<meta http-equiv=refresh>`
+# （后两者能把相对地址/整页跳到攻击者站点）。S0-09 已经禁了 JS 与本地文件访问，
+# 但 wkhtmltopdf 仍会去下载这些远程资源 —— 顾客文档可以让店铺机向任意地址发请求
+# （内网探测/打点），也会把转换拖到 90 s 超时。策略：**不抓取**，直接剥离并记日志。
+_REMOTE_URL_RE = re.compile(r"^\s*(?:https?:)?//", re.IGNORECASE)
+_FETCH_ATTR_RE = re.compile(
+    r"""(\s(?:src|srcset|poster)\s*=\s*)(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
+_LINK_TAG_RE = re.compile(r"<\s*link\b[^>]*>", re.IGNORECASE)
+_BASE_TAG_RE = re.compile(r"<\s*base\b[^>]*>", re.IGNORECASE)
+_META_REFRESH_RE = re.compile(
+    r"""<\s*meta\b[^>]*http-equiv\s*=\s*["']?\s*refresh["']?[^>]*>""", re.IGNORECASE)
+_CSS_IMPORT_RE = re.compile(r"@import\b[^;]*;", re.IGNORECASE)
+_CSS_URL_RE = re.compile(r"""url\(\s*(["']?)([^)"']*)\1\s*\)""", re.IGNORECASE)
+
+
+def _attr_value(tag: str, name: str) -> str:
+    m = re.search(r"""\b%s\s*=\s*(?:"([^"]*)"|'([^']*)')""" % re.escape(name), tag,
+                  re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1) if m.group(1) is not None else (m.group(2) or "")
+
+
+def _strip_remote_refs(html: str) -> tuple[str, int]:
+    """剥离所有会发起网络请求的外部引用，返回 (净化后 HTML, 移除处数)。
+
+    只处理"会被 wkhtmltopdf 主动抓取"的引用；`<a href>` 只是链接（无 JS、不会自动打开），
+    保留不动（不影响打印内容）。本地相对路径/data: URI 原样保留。
+    """
+    if not html:
+        return html, 0
+    removed = 0
+
+    html, n = _BASE_TAG_RE.subn("", html)          # <base> 会改变相对地址的解析基准
+    removed += n
+
+    def _meta(m: re.Match) -> str:
+        nonlocal removed
+        removed += 1
+        return ""
+
+    html = _META_REFRESH_RE.sub(_meta, html)       # meta refresh 可整页跳转到远程
+
+    def _link(m: re.Match) -> str:
+        nonlocal removed
+        tag = m.group(0)
+        if _REMOTE_URL_RE.search(_attr_value(tag, "href")):
+            removed += 1
+            return ""
+        return tag
+
+    html = _LINK_TAG_RE.sub(_link, html)           # 远程样式表/预加载
+
+    def _fetch_attr(m: re.Match) -> str:
+        nonlocal removed
+        val = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+        parts = [p.strip() for p in val.split(",")] if "srcset" in m.group(1).lower() else [val.strip()]
+        if any(_REMOTE_URL_RE.match(p) for p in parts if p):
+            removed += 1
+            return ""                              # 整个属性移除：没有 src 就不会发请求
+        return m.group(0)
+
+    html = _FETCH_ATTR_RE.sub(_fetch_attr, html)   # img/source/video 等
+
+    def _css_url(m: re.Match) -> str:
+        nonlocal removed
+        val = (m.group(2) or "").strip()
+        if _REMOTE_URL_RE.match(val):
+            removed += 1
+            return 'url("data:,")'                 # data: 不会出网
+        return m.group(0)
+
+    html = _CSS_URL_RE.sub(_css_url, html)
+
+    def _css_import(m: re.Match) -> str:
+        nonlocal removed
+        if _REMOTE_URL_RE.search(m.group(0)):
+            removed += 1
+            return ""
+        return m.group(0)
+
+    html = _CSS_IMPORT_RE.sub(_css_import, html)
+    return html, removed
+
+
 def _inline_local_images(html: str, base_dir: str) -> str:
     """把 `<img src>` 指向的本地文件内联成 data: URI（仅限 base_dir 及其子目录）。
 
@@ -1349,9 +1470,15 @@ def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content:
     temp_html: str | None = None
     try:
         if is_content:
+            # S2-03 外部引用策略：先剥离远程图片/CSS/跳转（转换过程不访问外网）
+            html_text, n_remote = _strip_remote_refs(html_path_or_content)
+            if n_remote:
+                logger.warning(
+                    f"已移除 {n_remote} 处外部引用（远程图片/CSS/刷新跳转）："
+                    f"转换过程不访问外网，相关图片不会打印")
             fd, temp_html = tempfile.mkstemp(suffix=".html", prefix="_md_")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(html_path_or_content)
+                f.write(html_text)
             input_path = temp_html
         else:
             input_path = html_path_or_content
@@ -1835,8 +1962,27 @@ class UniversalConverter:
             if convert_func is _convert_image_to_pdf:
                 convert_func(file_path, output_pdf, image_orientation)
             elif convert_func is _convert_office_to_pdf:
-                # S1-04：来源标记只影响 Office 转换引擎的选择（云端 → LibreOffice）
-                convert_func(file_path, output_pdf, from_cloud=from_cloud)
+                # S2-03：本地 Office 文件优先在 Job Object 隔离 worker 里转换（默认关闭）。
+                # 注意「失败闭环」：沙箱**跑起来后**失败/超时绝不回退进程内转换（恶意文档
+                # 正是靠"卡死 → 回退"把风险带回主进程）；只有沙箱本身不可用才回退。
+                if should_sandbox(file_path, from_cloud=from_cloud):
+                    import office_sandbox  # noqa: PLC0415
+                    _res = office_sandbox.run_office_conversion(
+                        file_path, output_pdf, image_orientation=image_orientation)
+                    if _res.status == "ok":
+                        logger.info(f"引擎选择: 隔离沙箱 worker（Job Object）"
+                                    f" ({os.path.basename(file_path)})")
+                        return output_pdf
+                    if _res.status == "unavailable":
+                        logger.warning(f"转换沙箱不可用，回退进程内转换: {_res.error}")
+                        convert_func(file_path, output_pdf, from_cloud=from_cloud)
+                    else:
+                        raise RuntimeError(
+                            f"隔离转换失败（{_res.status}）：{_res.error}。"
+                            f"若该文档在其它机器能正常转换，请把日志里的 office_sandbox 行交给管理员。")
+                else:
+                    # S1-04：来源标记只影响 Office 转换引擎的选择（云端 → LibreOffice）
+                    convert_func(file_path, output_pdf, from_cloud=from_cloud)
             else:
                 convert_func(file_path, output_pdf)
 

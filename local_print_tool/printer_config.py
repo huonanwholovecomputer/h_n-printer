@@ -882,6 +882,10 @@ class PrinterConfig:
     render_dpi: int = 0               # 全局默认渲染 DPI；0 = 自动（设备原生 1:1，零重采样，推荐）
     dpi_auto_migrated: bool = True    # 一次性迁移标记：旧版默认 400 → 自动 0（见 load）
     keep_temp_pdf: bool = False
+    # S2-03：Office 转换沙箱（默认 False）。开启后本地 .doc/.docx 的 Word/WPS COM 转换
+    # 改到 Job Object 隔离 worker 执行（office_sandbox.py）；失败/超时拒转，不回退。
+    # 默认关闭：需先在真机（Word/WPS/LibreOffice）验证通过再启用。
+    conversion_sandbox: bool = False
     simplex_price: float = 0.2
     duplex_price: float = 0.3
     last_dir: str = ""
@@ -960,6 +964,7 @@ class PrinterConfig:
             "render_dpi": self.render_dpi,
             "dpi_auto_migrated": self.dpi_auto_migrated,
             "keep_temp_pdf": self.keep_temp_pdf,
+            "conversion_sandbox": self.conversion_sandbox,
             "simplex_price": self.simplex_price,
             "duplex_price": self.duplex_price,
             "last_dir": self.last_dir,
@@ -1012,6 +1017,7 @@ class PrinterConfig:
             render_dpi=_num_or_default(data.get("render_dpi"), 0, int),
             dpi_auto_migrated=bool(data.get("dpi_auto_migrated", False)),
             keep_temp_pdf=bool(data.get("keep_temp_pdf", False)),
+            conversion_sandbox=bool(data.get("conversion_sandbox", False)),
             simplex_price=_num_or_default(data.get("simplex_price"), 0.2, float),
             duplex_price=_num_or_default(data.get("duplex_price"), 0.3, float),
             last_dir=data.get("last_dir", ""),

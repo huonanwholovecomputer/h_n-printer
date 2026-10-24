@@ -84,7 +84,7 @@ from PySide6.QtWidgets import (
 )
 
 from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration
-from converter import get_converter, UniversalConverter
+from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
                          print_plan_pass, wait_for_output, count_pdf_pages)
@@ -4261,6 +4261,11 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._load_config_to_ui()
+        # S2-03：Office 转换沙箱开关（配置默认 False；环境变量 HN_OFFICE_SANDBOX 可强制覆盖）
+        try:
+            set_office_sandbox(bool(self._config.conversion_sandbox))
+        except Exception as e:
+            logger.warning(f"应用转换沙箱开关失败: {e}")
         self._init_cloud_client()
 
         # ── 启动日志：让日志区启动即有内容 ──
