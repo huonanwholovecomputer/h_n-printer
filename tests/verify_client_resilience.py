@@ -604,10 +604,10 @@ mut["mini_request"] = FILES["mini_request"].replace(
 mutations.append(("退避倍数 1.5 → 1.0", mut,
                   "② 退避公式 1.5× / 上限 5min / 成功恢复"))
 
-# 4d. 本地工具 requests 去掉一个 timeout
+# 4d. 本地工具 requests 去掉一个 timeout（S1-01 起 token 走 X-Printer-Token 头，锚点同步）
 _c2 = FILES["cloud_client"].replace(
-    "params={\"token\": self.token, \"client_id\": self.client_id},\n                timeout=10,",
-    "params={\"token\": self.token, \"client_id\": self.client_id},", 1)
+    "headers=self._auth_headers(),\n                params={\"client_id\": self.client_id},\n                timeout=10,",
+    "headers=self._auth_headers(),\n                params={\"client_id\": self.client_id},", 1)
 mut = dict(FILES)
 mut["cloud_client"] = _c2
 mutations.append(("cloud_client 拉单请求去掉 timeout", mut,

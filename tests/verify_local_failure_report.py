@@ -205,6 +205,8 @@ class _Resp:
 class FakeClient:
     api_url = "https://example.invalid"
     token = "tok"
+    # S1-01：GUI 改用 auth_token（本机 token 优先，缺失回退全局 token）
+    auth_token = "tok"
     client_id = "cid-test"
 
     def __init__(self):
@@ -262,8 +264,10 @@ url, kw = POSTS[0] if POSTS else ("", {})
 payload = kw.get("json") or {}
 check("B1 本地单失败会上报 /api/local_order_status",
       ok and url.endswith("/api/local_order_status"), f"{url}")
-check("B1 带 printer token（query）", (kw.get("params") or {}).get("token") == "tok",
-      str(kw.get("params")))
+check("B1 带 printer token（X-Printer-Token 头，不再拼 URL query）",
+      (kw.get("headers") or {}).get("X-Printer-Token") == "tok"
+      and "token" not in (kw.get("params") or {}),
+      str({k: kw.get(k) for k in ("params", "headers")}))
 check("B1 payload: status=failed + 订单号 + 原因",
       payload.get("status") == "failed"
       and payload.get("order_number") == "HN20261023-9001"

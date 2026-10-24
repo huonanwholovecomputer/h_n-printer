@@ -57,6 +57,24 @@ def scrub_secrets(text):
         return "[scrub-failed]"
 
 
+def auth_headers(token: str) -> dict:
+    """S1-01：printer token 一律走 `X-Printer-Token` 请求头。
+
+    旧写法把 token 拼进 URL query（`?token=…`），它会落进 nginx access.log、代理日志、
+    requests 异常文本与截图里 —— 等于把全站钥匙反复写在日志里。服务端 `_get_printer_token()`
+    头优先、query 仅作旧客户端兼容（过渡期），客户端不再使用 query。
+    """
+    return {"X-Printer-Token": token} if token else {}
+
+
+class DeviceTokenError(RuntimeError):
+    """自签本机 token 失败（status_code=0 表示网络/其它异常，允许稍后重试）。"""
+
+    def __init__(self, message: str, status_code: int = 0):
+        super().__init__(message)
+        self.status_code = int(status_code or 0)
+
+
 class _SecretScrubFilter(logging.Filter):
     """logging.Filter：命中敏感查询参数就改写记录（不改变是否输出）。"""
 
@@ -334,6 +352,9 @@ class CloudClient(QObject):
     auth_failed = Signal(str)             # 认证失败（含消息），GUI 可连接此信号提示用户
     printer_state = Signal(object)        # 接单状态 dict（is_active/active_owner_name/...）— 2026-11
     stack_mode_requested = Signal(bool, str)  # 移动端下发切换「🖐 攒批模式」：enable, 操作者 — 2026-10
+    # S1-01：启动时用迁移全局 TOKEN 换到本机专用 token（GUI 收到后写入 print_config 并持久化）
+    token_issued = Signal(str, list)      # 新 token, scopes
+    token_invalid = Signal()              # 本机 token 被吊销/失效 → GUI 清除已保存的本机 token
 
     def __init__(
         self,
@@ -342,12 +363,19 @@ class CloudClient(QObject):
         token: str = "",
         client_id: str = "",
         device_name: str = "",
+        device_token: str = "",
         parent=None,
     ):
         super().__init__(parent)
         self.api_url = api_url
         self.ws_url = ws_url
         self.token = token
+        # S1-01：本机专用 token（优先于全局 token 使用）。为空 ⇒ 启动时尝试用全局 token 自签；
+        # 保存位置与全局 token 分开，全局 token 仍留作迁移/紧急通道（吊销本机 token 后可回退）。
+        self.device_token = device_token
+        # 自签状态（每个进程只尝试一次成功/4xx；网络失败允许下次重连再试）
+        self._self_sign_done = False
+        self._self_sign_forbidden = False
         # 云端直连：构造时就登记，保证后续任何 HTTP（价格同步/成员名单等）都不过代理
         net_direct.ensure_direct(api_url, ws_url)
         # 设备（计算机）名称：随连接上报后端，用于设备注册表与「打印机已被 XXX 接管」提示
@@ -438,6 +466,87 @@ class CloudClient(QObject):
         # 最近一次后端下发的接单状态（printer_state 事件），GUI 可据此展示接管者
         self.last_printer_state: dict = {}
 
+    # ── S1-01：token 选择 / 请求头 / 自签本机 token ──
+
+    @property
+    def auth_token(self) -> str:
+        """实际用于认证的 token：本机专用 token 优先，缺失时回退全局 token（迁移窗口）。"""
+        return self.device_token or self.token
+
+    def _auth_headers(self) -> dict:
+        return auth_headers(self.auth_token)
+
+    def request_device_token(self, scopes=None, label: str = "") -> tuple[str, list]:
+        """向服务端为本机签发/轮换专用 token（S1-01）。
+
+        当前 token 必须具备 admin scope（全局迁移 TOKEN 默认是 print+admin）。
+        返回 (明文 token, scopes)；失败抛 DeviceTokenError（status_code 区分 4xx 与网络错误）。
+        明文只返回这一次，调用方必须立刻持久化。
+        """
+        tok = self.auth_token
+        if not self.api_url:
+            raise DeviceTokenError("云端未配置 API 地址")
+        if not tok:
+            raise DeviceTokenError("云端未配置 token")
+        payload = {"client_id": self.client_id, "label": (label or self.device_name)[:64]}
+        if scopes:
+            payload["scopes"] = list(scopes)
+        try:
+            resp = http_requests.post(
+                f"{self.api_url}/api/printer/token/create",
+                headers=auth_headers(tok), json=payload, timeout=10)
+        except Exception as e:
+            raise DeviceTokenError(f"签发请求失败: {e}") from e
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        if not resp.ok or not data.get("success") or not data.get("token"):
+            raise DeviceTokenError(
+                f"签发失败 HTTP {resp.status_code}: {data.get('message') or resp.text[:120]}",
+                status_code=resp.status_code)
+        return data["token"], list(data.get("scopes") or [])
+
+    def _ensure_device_token(self) -> None:
+        """启动时自签一次本机 token（S1-01）。
+
+        - 已有本机 token、或已成功、或已失败过 → 本次会话不再尝试（下次启动重试）；
+        - 失败**不阻塞连接**：继续用现有（全局迁移）token，功能零退化；
+        - 成功立即切换 `device_token` 并 emit `token_issued` 让 GUI 落盘。
+        注意：失败后不按"重连就再试"处理 —— 每次重连多等一个 10s HTTP 超时，
+        断网时会把重连节奏拖垮；换 token 不是连接的必要条件。
+        """
+        if self.device_token or self._self_sign_done or self._self_sign_forbidden:
+            return
+        if not self.api_url or not self.auth_token:
+            return
+        try:
+            new_tok, scopes = self.request_device_token(scopes=("print", "admin"))
+        except DeviceTokenError as e:
+            self._self_sign_done = True   # 本次会话不再尝试（下次启动重试）
+            if 400 <= e.status_code < 500:
+                # 4xx：现有 token 没有 admin 权限（或 server 旧版无此接口）
+                self._self_sign_forbidden = True
+                logger.warning(f"本机 token 自签被拒（现有 token 可能无 admin scope），继续用现有 token: {e}")
+                self.status_message.emit(
+                    "⚠ 未能自签本机 token（现有 token 可能无 admin 权限），继续使用现有 token")
+            else:
+                logger.warning(f"本机 token 自签失败（本次会话使用现有 token，下次启动再试）: {e}")
+            return
+        except Exception as e:  # noqa: BLE001
+            self._self_sign_done = True
+            logger.warning(f"本机 token 自签异常（本次会话使用现有 token，下次启动再试）: {e}")
+            return
+        self.device_token = new_tok
+        self._self_sign_done = True
+        logger.info(f"已自签本机专用 token（scopes={scopes}）")
+        self.status_message.emit(
+            f"🔑 已启用本机专用 token（scopes={','.join(scopes) or 'print'}）")
+        try:
+            self.token_issued.emit(new_tok, list(scopes))
+        except Exception:
+            pass
+
     # ── 公共 API ──
 
     def start(self):
@@ -448,6 +557,10 @@ class CloudClient(QObject):
         self._stop_event.clear()
         self._auth_fail_stop = False
         self._auth_fail_count = 0
+        # 自签状态按本次启动重置：已有本机 token 就不再签；上次 4xx 拒绝允许重试
+        # （用户可能在设置里改好了 token / 服务端升到了支持 scope 的版本）
+        self._self_sign_done = bool(self.device_token)
+        self._self_sign_forbidden = False
         # P1: 启动时清理 %TEMP% 下超过 24h 的残留下载临时文件（崩溃遗留兜底）
         self._cleanup_old_temp_files()
         # S1-03：启动扫描本地 PDF 缓存（保留期夹紧 1..168 h）。旧实现只在"写新缓存"后
@@ -551,7 +664,7 @@ class CloudClient(QObject):
                 payload["is_admin_print"] = bool(is_admin_print)
             resp = http_requests.post(
                 f"{self.api_url}/api/abandon_reserved_order",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 json=payload,
                 timeout=10,
             )
@@ -574,7 +687,7 @@ class CloudClient(QObject):
         try:
             resp = http_requests.post(
                 f"{self.api_url}/api/accept_order",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 json={"order_id": order_id},
                 timeout=10,
             )
@@ -598,7 +711,7 @@ class CloudClient(QObject):
         try:
             resp = http_requests.post(
                 f"{self.api_url}/api/reject_order",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 json={"order_id": order_id},
                 timeout=10,
             )
@@ -840,7 +953,7 @@ class CloudClient(QObject):
         try:
             resp = http_requests.post(
                 f"{self.api_url}/api/{endpoint}",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 json={"order_id": order_id},
                 timeout=10,
             )
@@ -906,7 +1019,7 @@ class CloudClient(QObject):
                 try:
                     resp = http_requests.post(
                         f"{self.api_url}/api/{endpoint}",
-                        params={"token": self.token},
+                        headers=self._auth_headers(),
                         json={"order_id": order_id},
                         timeout=10,
                     )
@@ -969,7 +1082,8 @@ class CloudClient(QObject):
         try:
             resp = http_requests.get(
                 f"{self.api_url}/api/pull_queued_orders",
-                params={"token": self.token, "client_id": self.client_id},
+                headers=self._auth_headers(),
+                params={"client_id": self.client_id},
                 timeout=10,
             )
             if resp.ok:
@@ -1052,7 +1166,7 @@ class CloudClient(QObject):
         try:
             resp = http_requests.post(
                 f"{self.api_url}/api/printer/claim",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 json={"client_id": self.client_id, "device_name": self.device_name,
                       "owner_name": owner_name or ""},
                 timeout=10,
@@ -1077,7 +1191,7 @@ class CloudClient(QObject):
         try:
             resp = http_requests.post(
                 f"{self.api_url}/api/printer/release",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 json={"client_id": self.client_id},
                 timeout=10,
             )
@@ -1100,7 +1214,7 @@ class CloudClient(QObject):
         try:
             resp = http_requests.get(
                 f"{self.api_url}/api/printer/devices",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 timeout=10,
             )
             if resp.ok:
@@ -1119,7 +1233,7 @@ class CloudClient(QObject):
         try:
             resp = http_requests.post(
                 f"{self.api_url}/api/printer/bind_owner",
-                params={"token": self.token},
+                headers=self._auth_headers(),
                 json={"client_id": self.client_id, "owner_name": owner_name or ""},
                 timeout=10,
             )
@@ -1191,9 +1305,28 @@ class CloudClient(QObject):
                     f"☁ {int(delay)}s 后重连（第 {self._reconnect_count} 次）...")
                 self._stop_event.wait(delay)
 
+    def _make_sio_session(self):
+        """给 Socket.IO 的 HTTP 会话带上 `X-Printer-Token`（Engine.IO 首次轮询握手要过 token 门）。
+
+        为什么不能只靠 WebSocket 头：Engine.IO 默认先走 polling 握手、再升级 WebSocket；
+        握手请求（无 sid）正是服务端 `_sio_handshake_gate` 唯一检查的那一条。
+        """
+        try:
+            sess = http_requests.Session()
+            hdrs = self._auth_headers()
+            if hdrs:
+                sess.headers.update(hdrs)
+            return sess
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"创建 Socket.IO HTTP 会话失败（回退默认会话）: {e}")
+            return None
+
     def _connect_and_wait(self):
         """建立 SocketIO 连接并阻塞等待，直到断开或停止。"""
         import socketio as socketio_lib
+
+        # S1-01：先自签本机专用 token（已有 / 已 4xx 拒绝则跳过），再用它建连
+        self._ensure_device_token()
 
         # 云端直连：把云端主机名并入本进程 NO_PROXY，避免云端长连接被系统/环境代理
         # 掐死（每次建连都调，兼顾用户在设置里改了云端地址的情况；幂等）
@@ -1206,6 +1339,10 @@ class CloudClient(QObject):
             logger=False,
             engineio_logger=False,
             request_timeout=CONNECT_REQUEST_TIMEOUT,
+            # S1-01：token 走请求头，不再拼 URL query
+            #  · polling 握手用带默认头的 session；WebSocket 升级用 websocket_extra_options
+            http_session=self._make_sio_session(),
+            websocket_extra_options={"header": self._auth_headers()},
         )
         self._sio = sio
 
@@ -1430,6 +1567,17 @@ class CloudClient(QObject):
             if self._sio is not sio:
                 return  # 旧连接的迟到回调，忽略（否则会掐断当前连接）
             msg = data.get("message", "未知原因") if isinstance(data, dict) else str(data)
+            # S1-01：本机专用 token 失效（被吊销/轮换）→ 回退全局 token，并允许下次重连重新自签；
+            # 通知 GUI 清掉已保存的本机 token（否则重启会一直用失效 token 重试）。
+            if self.device_token:
+                self.device_token = ""
+                self._self_sign_done = False
+                self._self_sign_forbidden = False
+                logger.warning("本机专用 token 已失效，回退全局 token")
+                try:
+                    self.token_invalid.emit()
+                except Exception:
+                    pass
             self._auth_fail_count += 1
             logger.error(f"认证失败({self._auth_fail_count}/{MAX_AUTH_FAIL_RETRIES}): {msg}")
             self.status_message.emit(
@@ -1446,7 +1594,8 @@ class CloudClient(QObject):
                 pass
 
         # 连接
-        connect_url = (f"{self.ws_url}?token={self.token}&client_id={self.client_id}"
+        # S1-01：token 只走 X-Printer-Token 头（query 里不再出现 token，nginx/代理日志零凭据）
+        connect_url = (f"{self.ws_url}?client_id={self.client_id}"
                        f"&device_name={quote(self.device_name)}")
         self.status_message.emit(f"☁ 正在连接 {self.ws_url} ...")
         try:

@@ -91,7 +91,8 @@ from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx
 import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 import duplex_stack  # 攒批模式（多任务合并翻纸）的纸叠账本（纯逻辑，见 duplex_stack.py）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
-from cloud_client import CloudClient, CloudTask, cache_engine_for, pdf_cache_key, order_status_label_cn
+from cloud_client import (CloudClient, CloudTask, cache_engine_for, pdf_cache_key,
+                          order_status_label_cn, auth_headers)
 from stats_server import StatsServer, load_local_data_file, clear_local_data_files
 from offline_sync import OfflineSync
 import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼容，详见 staging.py）
@@ -4574,6 +4575,7 @@ class MainWindow(QMainWindow):
             ws_url=self._config.cloud_ws_url,
             token=self._config.cloud_token,
             client_id=client_id,
+            device_token=self._config.cloud_device_token,
             parent=self,
         )
 
@@ -4589,6 +4591,9 @@ class MainWindow(QMainWindow):
         self._cloud_client.printer_state.connect(self._on_cloud_printer_state)
         # 移动端远程切换「🖐 攒批模式」（2026-10）：云端下发 → 主线程校验忙闲后再执行
         self._cloud_client.stack_mode_requested.connect(self._on_remote_stack_mode)
+        # S1-01：本机专用 token 自签成功 / 被判失效 → 持久化或清除
+        self._cloud_client.token_issued.connect(self._on_cloud_token_issued)
+        self._cloud_client.token_invalid.connect(self._on_cloud_token_invalid)
         # 接单配置：本机是否启用接单（仅接管者可接收订单；连上后自动向后端续接单）
         self._cloud_client.take_orders = bool(self._config.cloud_take_orders)
 
@@ -4619,7 +4624,8 @@ class MainWindow(QMainWindow):
         if self._config.cloud_enabled and self._config.cloud_token:
             self._offline_sync.start_background_sync(
                 server_url=self._config.cloud_api_url,
-                token=self._config.cloud_token,
+                # S1-01：本机 token 优先（尚未签出来时就是全局 token）
+                token=self._cloud_client.auth_token if self._cloud_client else self._config.cloud_token,
                 interval=60,
             )
         else:
@@ -4641,7 +4647,8 @@ class MainWindow(QMainWindow):
         if self._stats_server is None:
             self._stats_server = StatsServer(
                 api_url=self._config.cloud_api_url,
-                token=self._config.cloud_token,
+                token=(self._cloud_client.auth_token if self._cloud_client
+                       else self._config.cloud_token),
                 finance_mode=finance_mode,
                 device_name=device_name,
                 client_id=client_id,
@@ -4650,7 +4657,9 @@ class MainWindow(QMainWindow):
             self._stats_server.start_in_thread()
         else:
             # 已启动但配置可能已变更（如云端设置对话框保存后），同步一次代理目标与模式
-            self._stats_server.update_config(self._config.cloud_api_url, self._config.cloud_token)
+            self._stats_server.update_config(
+                self._config.cloud_api_url,
+                self._cloud_client.auth_token if self._cloud_client else self._config.cloud_token)
             if self._config.cloud_enabled:
                 self._stats_server.finance_mode = "cloud"
             else:
@@ -4726,9 +4735,77 @@ class MainWindow(QMainWindow):
         # Token
         layout.addWidget(QLabel("认证 Token："))
         token_input = QLineEdit(self._config.cloud_token)
-        token_input.setPlaceholderText("打印机认证 token")
+        token_input.setPlaceholderText("打印机认证 token（全局 token，或用下面的按钮换本机专用 token）")
         token_input.setEchoMode(QLineEdit.Password)
         layout.addWidget(token_input)
+
+        # S1-01：本机专用 token 状态 + 手动重新签发
+        # 迁移口径：首次连上会自动用上面的全局 token 为本机签一个专用 token（只存本机配置），
+        # 之后请求都带它；全局 token 保留作紧急通道，本机 token 失效时自动回退并重签。
+        device_tok_label = QLabel("")
+        device_tok_label.setWordWrap(True)
+        device_tok_label.setStyleSheet("color: #8a8f98; font-size: 12px;")
+        layout.addWidget(device_tok_label)
+
+        def _fill_device_token_hint():
+            if self._config.cloud_device_token:
+                device_tok_label.setText(
+                    "🔑 本机专用 token：已启用（只存在本机配置文件，可在服务端单独吊销）")
+            else:
+                device_tok_label.setText(
+                    "🔑 本机专用 token：未启用（连接时会用全局 token 自动签发一次）")
+
+        _fill_device_token_hint()
+
+        issue_row = QHBoxLayout()
+        issue_btn = QPushButton("🔑 重新签发本机 token")
+        issue_btn.setToolTip(
+            "用上面的认证 Token（需 admin 权限）为本机签发专用 token。\n"
+            "签发后立即改用新 token 重连；服务端会作废旧 token（明文只显示这一次，工具自动保存）。")
+        issue_btn.setEnabled(bool(self._cloud_client))
+        issue_row.addWidget(issue_btn)
+        issue_row.addStretch()
+        layout.addLayout(issue_row)
+
+        def _issue_device_token():
+            client = self._cloud_client
+            if not client:
+                device_tok_label.setText(
+                    "⚠ 云端未启用：先勾选「启用云端功能」并保存，再签发本机 token")
+                return
+            issue_btn.setEnabled(False)
+            device_tok_label.setText("⏳ 正在签发本机 token…")
+
+            def _net():
+                err, tok, scopes = "", "", []
+                try:
+                    tok, scopes = client.request_device_token(scopes=("print", "admin"))
+                except Exception as e:  # noqa: BLE001
+                    err = str(e)
+
+                def _done():
+                    issue_btn.setEnabled(True)
+                    if err:
+                        device_tok_label.setText(f"❌ 签发失败：{err}")
+                        return
+                    self._config.cloud_device_token = tok
+                    client.device_token = tok
+                    try:
+                        self._save_config(sync_ui=False)
+                    except Exception as e:
+                        logger.warning(f"保存本机 token 失败: {e}")
+                    device_tok_label.setText(
+                        f"✅ 已签发并切换本机 token（scopes={','.join(scopes) or 'print'}），正在重连…")
+                    try:
+                        client.stop()
+                        client.start()
+                    except Exception as e:
+                        logger.warning(f"切换本机 token 后重连失败: {e}")
+                QTimer.singleShot(0, _done)
+
+            threading.Thread(target=_net, daemon=True).start()
+
+        issue_btn.clicked.connect(_issue_device_token)
 
         # 连接状态
         layout.addSpacing(4)
@@ -4792,9 +4869,13 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             # 保存配置到内存（云端开关以对话中的勾选为准）
             old_enabled = bool(self._config.cloud_enabled)
+            old_token = self._config.cloud_token
             self._config.cloud_api_url = api_input.text().strip()
             self._config.cloud_ws_url = ws_input.text().strip()
             self._config.cloud_token = token_input.text().strip()
+            # S1-01：换了全局 token ⇒ 旧的本机专用 token 不再可信，清掉并按新 token 重新自签
+            if self._config.cloud_token != old_token:
+                self._config.cloud_device_token = ""
             self._config.cloud_enabled = bool(cloud_switch.isChecked())
 
             # 立刻写入磁盘，防止程序崩溃丢失
@@ -4828,6 +4909,7 @@ class MainWindow(QMainWindow):
                     self._cloud_client.api_url = self._config.cloud_api_url
                     self._cloud_client.ws_url = self._config.cloud_ws_url
                     self._cloud_client.token = self._config.cloud_token
+                    self._cloud_client.device_token = self._config.cloud_device_token
                     self._cloud_client.start()
                 self._update_cloud_status()
             else:
@@ -4843,7 +4925,8 @@ class MainWindow(QMainWindow):
                 if self._config.cloud_enabled and self._config.cloud_token:
                     self._offline_sync.start_background_sync(
                         server_url=self._config.cloud_api_url,
-                        token=self._config.cloud_token,
+                        token=(self._cloud_client.auth_token if self._cloud_client
+                               else self._config.cloud_token),
                         interval=60,
                     )
                 else:
@@ -4869,7 +4952,9 @@ class MainWindow(QMainWindow):
             # 同步 stats_server（收支清算页代理）：若已启动，配置可能仍旧占位地址，
             # 不同步会导致代理请求打到不存在的占位域名 → SSLError（重启后才恢复）。
             if self._stats_server:
-                self._stats_server.update_config(self._config.cloud_api_url, self._config.cloud_token)
+                self._stats_server.update_config(
+                    self._config.cloud_api_url,
+                    self._cloud_client.auth_token if self._cloud_client else self._config.cloud_token)
             self._log("☁ 云端配置已保存并写入磁盘" + ("，正在连接..." if self._config.cloud_enabled else "，云端已关闭"))
 
     def _restart_for_cloud_switch(self, enabled: bool):
@@ -4926,11 +5011,11 @@ class MainWindow(QMainWindow):
         # ② 其余待同步单 → 直接上报
         pending = self._offline_sync.pending_count()
         if pending > 0:
-            if self._cloud_client and self._cloud_client.api_url and self._cloud_client.token:
+            if self._cloud_client and self._cloud_client.api_url and self._cloud_client.auth_token:
                 try:
                     n = self._offline_sync.sync_all_pending_orders(
                         server_url=self._cloud_client.api_url,
-                        token=self._cloud_client.token,
+                        token=self._cloud_client.auth_token,
                     )
                     if n > 0:
                         self._log(f"📋 关闭云端前已上传 {n} 条未同步订单")
@@ -8061,7 +8146,7 @@ class MainWindow(QMainWindow):
         try:
             cloud_ok = bool(
                 self._cloud_client and self._cloud_client.is_connected()
-                and self._cloud_client.api_url and self._cloud_client.token
+                and self._cloud_client.api_url and self._cloud_client.auth_token
             )
             if cloud_ok:
                 self._refresh_owner_names_from_cloud_net()
@@ -8101,12 +8186,12 @@ class MainWindow(QMainWindow):
         · 云端配置已存在 → 严格采用云端成员（云端为空 = 无成员，本地/标签页旧名字不保留）。"""
         if not self._cloud_client or not self._cloud_client.is_connected():
             return
-        if not self._cloud_client.api_url or not self._cloud_client.token:
+        if not self._cloud_client.api_url or not self._cloud_client.auth_token:
             return
         try:
             resp = http_requests.get(
                 f"{self._cloud_client.api_url}/api/finance/config",
-                params={"token": self._cloud_client.token},
+                headers=auth_headers(self._cloud_client.auth_token),
                 timeout=4,
             )
             if not resp.ok:
@@ -8433,7 +8518,7 @@ class MainWindow(QMainWindow):
         # 尝试从后端获取（网络放后台线程 + processEvents 保活事件循环，
         # 避免同步 GET 冻结主线程导致云端推送/下载完成等信号延迟处理）
         online = self._cloud_client and self._cloud_client.is_connected()
-        if online and self._cloud_client.api_url and self._cloud_client.token:
+        if online and self._cloud_client.api_url and self._cloud_client.auth_token:
             tab_key = self._current_tab
             result: dict = {}
 
@@ -8441,7 +8526,8 @@ class MainWindow(QMainWindow):
                 try:
                     resp = http_requests.get(
                         f"{self._cloud_client.api_url}/api/next_order_number",
-                        params={**{"token": self._cloud_client.token}, **self._current_owner_params()},
+                        headers=auth_headers(self._cloud_client.auth_token),
+                        params=self._current_owner_params(),
                         timeout=5,
                     )
                     if resp.ok:
@@ -8485,7 +8571,7 @@ class MainWindow(QMainWindow):
         以旧号重复上传；随后用新号走 /api/local_orders 上报（reserved → sent）。"""
         if not self._cloud_client or not self._cloud_client.is_connected():
             return
-        if not (self._cloud_client.api_url and self._cloud_client.token):
+        if not (self._cloud_client.api_url and self._cloud_client.auth_token):
             return
         candidates: dict[str, dict] = {}  # old_number → {"owner_name", "is_admin_print"}
         # ① 标签页 jobs
@@ -8514,8 +8600,8 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.get(
                     f"{self._cloud_client.api_url}/api/next_order_number",
+                    headers=auth_headers(self._cloud_client.auth_token),
                     params={
-                        "token": self._cloud_client.token,
                         "owner_name": meta["owner_name"] or DEFAULT_OWNER_NAME,
                         "is_admin_print": "1" if meta["is_admin_print"] else "0",
                     },
@@ -8588,7 +8674,7 @@ class MainWindow(QMainWindow):
                     payload["is_admin_print"] = meta["is_admin_print"]
                     resp = http_requests.post(
                         f"{self._cloud_client.api_url}/api/local_orders",
-                        params={"token": self._cloud_client.token},
+                        headers=auth_headers(self._cloud_client.auth_token),
                         json=payload,
                         timeout=10,
                     )
@@ -8706,7 +8792,7 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.post(
                     f"{api_url}/api/local_orders",
-                    params={"token": token},
+                    headers=auth_headers(token),
                     json=payload, timeout=10,
                 )
                 if resp.ok and resp.json().get("success"):
@@ -9204,7 +9290,7 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.post(
                     f"{api_url}/api/local_order_status",
-                    params={"token": token}, json=payload, timeout=10)
+                    headers=auth_headers(token), json=payload, timeout=10)
                 try:
                     body = resp.json()
                 except Exception:
@@ -11180,7 +11266,7 @@ class MainWindow(QMainWindow):
         is_cloud_order = any(int(getattr(j, "task_id", 0) or 0) > 0 for j in flat_jobs)
 
         # 离线/未配置云端：无网络，本地临时号 + 本地库缓存（快速，主线程直接执行）
-        if not online or not self._cloud_client or not (self._cloud_client.api_url and self._cloud_client.token):
+        if not online or not self._cloud_client or not (self._cloud_client.api_url and self._cloud_client.auth_token):
             order_number = existing_order or self._generate_local_order_number_l()
             if not existing_order:
                 self._log(f"📋 离线模式：已生成本地订单号 {order_number}")
@@ -11257,7 +11343,7 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.post(
                     f"{api_url}/api/local_orders",
-                    params={"token": token},
+                    headers=auth_headers(token),
                     json={
                         "order_number": num,
                         "status": "sent",
@@ -11543,7 +11629,7 @@ class MainWindow(QMainWindow):
 
     def _fetch_remote_logs(self, status_label: QLabel):
         """从后端拉取 server.log 和 frontend.log（网络放后台线程，界面保持响应）。"""
-        if not self._cloud_client or not self._cloud_client.api_url or not self._cloud_client.token:
+        if not self._cloud_client or not self._cloud_client.api_url or not self._cloud_client.auth_token:
             status_label.setText("⚠ 云端未连接，无法拉取")
             return
         status_label.setText("⏳ 正在拉取...")
@@ -11553,12 +11639,12 @@ class MainWindow(QMainWindow):
             try:
                 results = []
                 api_url = self._cloud_client.api_url
-                token = self._cloud_client.token
+                token = self._cloud_client.auth_token
                 for log_type in ("server", "frontend"):
                     try:
                         resp = http_requests.get(
                             f"{api_url}/api/log/fetch",
-                            params={"token": token, "type": log_type},
+                            headers=auth_headers(token), params={"type": log_type},
                             timeout=15,
                         )
                         if resp.ok:
@@ -11594,7 +11680,7 @@ class MainWindow(QMainWindow):
         经后端 /api/log/collect_all（printer token）：后端向所有在线客户端推送
         request_log，各设备回报本机日志尾部，后端聚合后返回。网络放后台线程，
         期间 processEvents 保活事件循环（不阻塞云端信号）。"""
-        if not self._cloud_client or not self._cloud_client.api_url or not self._cloud_client.token:
+        if not self._cloud_client or not self._cloud_client.api_url or not self._cloud_client.auth_token:
             status_label.setText("⚠ 云端未连接，无法收集")
             return
         status_label.setText("⏳ 正在收集在线设备日志（最多等待 12 秒）...")
@@ -11604,7 +11690,7 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.post(
                     f"{self._cloud_client.api_url}/api/log/collect_all",
-                    params={"token": self._cloud_client.token},
+                    headers=auth_headers(self._cloud_client.auth_token),
                     json={"timeout": 10},
                     timeout=25,
                 )
@@ -12600,7 +12686,7 @@ class MainWindow(QMainWindow):
                 try:
                     count = self._offline_sync.sync_all_pending_orders(
                         server_url=self._cloud_client.api_url,
-                        token=self._cloud_client.token,
+                        token=self._cloud_client.auth_token,
                     )
                     if count > 0:
                         self._cloudConnSyncLog.emit(f"📋 离线订单已同步: {count} 个任务已上报云端")
@@ -12652,6 +12738,40 @@ class MainWindow(QMainWindow):
             "云端认证失败",
             f"{msg}\n\n工具将自动重试连接。若持续失败，请检查云端令牌（cloud_token）是否已更新。",
         )
+
+    def _on_cloud_token_issued(self, token: str, scopes: list):
+        """S1-01：本机专用 token 自签成功 → 持久化，并让离线同步/本地服务改用新 token。"""
+        try:
+            self._config.cloud_device_token = token or ""
+            self._save_config(sync_ui=False)
+        except Exception as e:
+            logger.warning(f"保存本机专用 token 失败: {e}")
+        _scopes = ",".join(scopes or []) or "print"
+        self._log(f"🔑 已启用本机专用 token（scopes={_scopes}；只存本机配置，可单独吊销）")
+        # 离线补报与收支代理原先用配置里的全局 token → 换成本机 token（本机 token 优先）
+        _tok = self._cloud_client.auth_token if self._cloud_client else self._config.cloud_token
+        try:
+            if self._offline_sync and self._config.cloud_enabled:
+                self._offline_sync.start_background_sync(
+                    server_url=self._config.cloud_api_url, token=_tok)
+        except Exception as e:
+            logger.debug(f"同步离线队列 token 失败: {e}")
+        try:
+            if self._stats_server is not None:
+                self._stats_server.update_config(self._config.cloud_api_url, _tok)
+        except Exception as e:
+            logger.debug(f"同步本地服务 token 失败: {e}")
+
+    def _on_cloud_token_invalid(self):
+        """S1-01：本机 token 被吊销/失效 → 清除保存值（客户端已自动回退全局 token）。"""
+        if not self._config.cloud_device_token:
+            return
+        self._config.cloud_device_token = ""
+        try:
+            self._save_config(sync_ui=False)
+        except Exception as e:
+            logger.warning(f"清除失效的本机 token 失败: {e}")
+        self._log("⚠ 本机专用 token 已失效，已回退全局 token；下次重连会重新签发")
 
     def _on_cloud_pull(self):
         """手动拉取云端排队任务。"""

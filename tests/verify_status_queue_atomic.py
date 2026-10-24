@@ -112,7 +112,7 @@ posted = []
 injected = {"done": False}
 
 
-def post_inject(url, params=None, json=None, timeout=None):
+def post_inject(url, params=None, json=None, timeout=None, headers=None):
     posted.append(json)
     if not injected["done"]:
         injected["done"] = True
@@ -142,7 +142,7 @@ reset_queue([{"order_id": 2001, "status": "accepted", "queued_at": "2026-10-14 1
              {"order_id": 2003, "status": "abandoned", "queued_at": "2026-10-14 11:00:02"}])
 
 
-def post_mixed(url, params=None, json=None, timeout=None):
+def post_mixed(url, params=None, json=None, timeout=None, headers=None):
     oid = (json or {}).get("order_id")
     if oid == 2002:
         raise RuntimeError("网络断了")            # 失败 → 保留
@@ -167,7 +167,7 @@ reset_queue([{"order_id": 1, "status": "??", "queued_at": "x"},
              {"order_id": 1, "status": "accepted", "queued_at": "x"}])
 
 
-def post_ok(url, params=None, json=None, timeout=None):
+def post_ok(url, params=None, json=None, timeout=None, headers=None):
     return Resp(200)
 
 

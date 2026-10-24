@@ -86,13 +86,14 @@ class _HttpRecorder:
         self.next_order_number = "HN20261008-9001"
 
     def get(self, url, params=None, timeout=None, **kw):
-        self.gets.append({"url": url, "params": params})
+        self.gets.append({"url": url, "params": params, "headers": kw.get("headers")})
         if str(url).endswith("/api/next_order_number"):
             return _Resp({"success": True, "order_number": self.next_order_number})
         return _Resp({"success": True})
 
     def post(self, url, params=None, json=None, timeout=None, **kw):
-        self.posts.append({"url": url, "params": params, "json": json})
+        self.posts.append({"url": url, "params": params, "json": json,
+                           "headers": kw.get("headers")})
         return _Resp({"success": True})
 
 
@@ -119,6 +120,9 @@ class _FakeClient:
     def __init__(self, connected=True):
         self.api_url = "https://example.test"
         self.token = "tok"
+        # S1-01：GUI 改用 auth_token（本机 token 优先，缺失回退全局 token）
+        self.auth_token = "tok"
+        self.device_token = ""
         self.client_id = "pc-test"
         self._connected = connected
         self.calls = []
@@ -172,7 +176,9 @@ posts = reserved_posts()
 check("上报到 /api/local_orders", len(posts) == 1, json.dumps([p['url'] for p in HTTP.posts]))
 if posts:
     body = posts[0]["json"]
-    check("带打印机 token", (posts[0]["params"] or {}).get("token") == "tok")
+    check("带打印机 token（X-Printer-Token 头，不再拼 URL query）",
+          (posts[0]["headers"] or {}).get("X-Printer-Token") == "tok"
+          and "token" not in (posts[0]["params"] or {}))
     check("状态为 reserved", body.get("status") == "reserved", str(body.get("status")))
     check("订单号来自云端取号", body.get("order_number") == "HN20261008-9001",
           str(body.get("order_number")))

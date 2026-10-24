@@ -912,7 +912,10 @@ class PrinterConfig:
     cloud_enabled: bool = False             # 是否启用云端连接
     cloud_api_url: str = "https://your-server.com"   # 云端 API 地址（替换为你自己的服务器）
     cloud_ws_url: str = "wss://your-server.com"     # WebSocket 地址（替换为你自己的服务器）
-    cloud_token: str = ""                   # 打印机客户端认证 token
+    cloud_token: str = ""                   # 打印机客户端认证 token（全局迁移 token）
+    # S1-01：本机专用 token（启动时用全局 token 自签，优先于 cloud_token 使用；可与全局 token
+    # 分开吊销/回退 —— 它失效时客户端会自动回退 cloud_token 并重新自签一次）
+    cloud_device_token: str = ""
     cloud_auto_accept: bool = False         # 是否自动接受云端任务（false=手动确认）
     # v5.22：启用接单（多设备共连服务器时，仅启用接单的设备接收订单；同一时间唯一接管者）
     cloud_take_orders: bool = False         # 是否启用接单（保存后由云端设置对话框同步到后端）
@@ -976,6 +979,7 @@ class PrinterConfig:
             "cloud_api_url": self.cloud_api_url,
             "cloud_ws_url": self.cloud_ws_url,
             "cloud_token": self.cloud_token,
+            "cloud_device_token": self.cloud_device_token,
             "cloud_auto_accept": self.cloud_auto_accept,
             "cloud_take_orders": self.cloud_take_orders,
             "cloud_owner_name": self.cloud_owner_name,
@@ -1034,6 +1038,7 @@ class PrinterConfig:
             cloud_api_url=data.get("cloud_api_url", "https://your-server.com"),
             cloud_ws_url=data.get("cloud_ws_url", "wss://your-server.com"),
             cloud_token=data.get("cloud_token", ""),
+            cloud_device_token=data.get("cloud_device_token", "") or "",
             cloud_auto_accept=bool(data.get("cloud_auto_accept", False)),
             cloud_take_orders=bool(data.get("cloud_take_orders", False)),
             cloud_owner_name=(data.get("cloud_owner_name") or "").strip(),
