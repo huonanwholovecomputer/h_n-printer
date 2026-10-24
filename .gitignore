@@ -173,3 +173,7 @@ _归档/
 
 # 压测结果（每次复跑重写，不入库；结论见 docs 报告）
 tests/staging/results/
+
+# 运维证据（HA 演练 / CVE 扫描 / 生产迁移演练报告：含生产主机路径、包版本与时间戳，
+# 随机器与时间变化，只留本地；结论与命令见 docs/ 内部文档）
+mobile_apps/printer-backend/ops/reports/

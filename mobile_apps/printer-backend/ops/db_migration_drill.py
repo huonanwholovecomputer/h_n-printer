@@ -32,6 +32,12 @@
 ----
 `READ_BLOCK_MS_LIMIT = 250`：WAL 下写事务持锁时，普通 SELECT 应在毫秒级完成；超过 250ms
 说明读被写锁挡住了（或库不在 WAL 上），判失败。阈值可用 `--read-limit-ms` 调整。
+
+外键口径（2026-10-24 生产演练后补）
+----------------------------------
+线上 `orders.file_id → files.id` 有**已知良性**违例：文件到期被清理（S1-03/S2-05），订单行
+保留 file_id 作历史凭据；SQLite 默认不强制外键，生产实测 228 条全部属于这一类。默认放行该类
+（计入 warnings），其它组合仍判失败；`--strict-fk` 可恢复"任何违例即失败"。用户库无豁免。
 """
 
 from __future__ import annotations
@@ -78,19 +84,53 @@ def _count_tables(conn: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
-def _inspect_db(path: str) -> dict:
+# 已知"良性"外键违例（**不是损坏**，是保留期清理留下的历史引用）：
+#   orders.file_id → files.id
+# files 行到期后由 cleanup_expired_files 清掉（S1-03 保留期 / S2-05 引用计数），但订单行
+# 保留 file_id 作为历史凭据（结算/追溯/重印要用）；SQLite 默认不强制外键
+# （PRAGMA foreign_keys 默认 OFF），所以线上一直存在这类行。
+# 2026-10-24 生产演练实测 228 条，全部是这一种（`orders.file_id` 非空、files 行已过期）。
+# 处置：默认计为 benign（写进 warnings）；**不**去改历史订单数据，也**不**把整类违例一律放过 ——
+# 其它 (table -> parent) 组合仍算 unexpected（例如某次迁移写坏的外键）并判失败。
+# 需要"任何违例即失败"的严格口径时加 `--strict-fk`。
+BENIGN_FK_RULES = {("orders", "files")}
+
+
+def _fk_violations(conn: sqlite3.Connection, benign_rules=BENIGN_FK_RULES) -> dict:
+    """把 PRAGMA foreign_key_check 的结果按 (table -> parent) 分类。"""
+    try:
+        rows = conn.execute("PRAGMA foreign_key_check").fetchall()
+    except sqlite3.Error as e:  # noqa: BLE001
+        return {"total": -1, "benign": 0, "unexpected": 0, "detail": {},
+                "samples": [], "error": "%s: %s" % (type(e).__name__, e)}
+    detail: dict[str, int] = {}
+    samples: list[dict] = []
+    benign = unexpected = 0
+    for table, rowid, parent, _fkid in rows:
+        key = "%s->%s" % (table, parent)
+        detail[key] = detail.get(key, 0) + 1
+        if (str(table), str(parent)) in benign_rules:
+            benign += 1
+        else:
+            unexpected += 1
+            if len(samples) < 5:
+                samples.append({"table": table, "rowid": rowid, "parent": parent})
+    return {"total": len(rows), "benign": benign, "unexpected": unexpected,
+            "detail": detail, "samples": samples, "error": ""}
+
+
+def _inspect_db(path: str, benign_rules=BENIGN_FK_RULES) -> dict:
     conn = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True, timeout=10)
     try:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        try:
-            fk_bad = len(conn.execute("PRAGMA foreign_key_check").fetchall())
-        except sqlite3.Error:
-            fk_bad = -1
+        fk = _fk_violations(conn, benign_rules)
         journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
         counts = _count_tables(conn)
         return {
             "integrity_check": integrity,
-            "foreign_key_violations": fk_bad,
+            # 兼容旧字段：违例总数（含 benign）
+            "foreign_key_violations": fk["total"],
+            "foreign_key_detail": fk,
             "journal_mode": journal,
             "tables": counts,
             "rows": sum(v for v in counts.values() if v > 0),
@@ -288,11 +328,18 @@ def run_drill(args) -> dict:
     report["backup"] = {"orders": b_orders, "users": backup_users,
                         "orders_sha256": _sha256(b_orders)}
 
-    before = _inspect_db(b_orders)
+    before = _inspect_db(b_orders, () if args.strict_fk else BENIGN_FK_RULES)
     report["integrity_before"] = before
+    fk_before = before.get("foreign_key_detail") or {}
+    if fk_before.get("benign"):
+        report["warnings"].append(
+            "外键违例 %d 条属于已知良性类（orders.file_id → files.id：文件到期已清理、"
+            "订单保留历史 file_id），不计失败；明细 %s"
+            % (fk_before.get("benign"), fk_before.get("detail")))
     checks = {
         "integrity_before_ok": before["integrity_check"] == "ok",
-        "foreign_keys_before_ok": before["foreign_key_violations"] == 0,
+        # 只把**非良性**违例判失败；--strict-fk 时 benign 规则被清空 ⇒ 等价于"任何违例即失败"
+        "foreign_keys_before_ok": fk_before.get("unexpected", 1) == 0,
         "orders_copy_has_data": before["rows"] > 0 or bool(args.allow_empty),
     }
     if before["rows"] == 0:
@@ -307,7 +354,8 @@ def run_drill(args) -> dict:
     checks["migration_ok"] = bool(migration.get("ok"))
 
     after_orders = os.path.join(migration.get("app_dir", workdir), "orders.db")
-    after = _inspect_db(after_orders) if os.path.isfile(after_orders) else {}
+    after = _inspect_db(after_orders, () if args.strict_fk else BENIGN_FK_RULES) \
+        if os.path.isfile(after_orders) else {}
     report["integrity_after"] = after
     rows_after = after.get("tables") or {}
     rows_before = before.get("tables") or {}
@@ -317,14 +365,19 @@ def run_drill(args) -> dict:
     report["migration"]["row_count_diff"] = missing
     checks["migration_kept_all_rows"] = bool(after) and not missing
     checks["integrity_after_ok"] = bool(after) and after.get("integrity_check") == "ok"
+    # 迁移不得新增非良性外键违例（良性那类只核"没有变多"）
+    fk_after = (after.get("foreign_key_detail") or {}) if after else {}
+    checks["foreign_keys_after_ok"] = (
+        bool(after) and fk_after.get("unexpected", 1) == 0
+        and fk_after.get("benign", 0) <= fk_before.get("benign", 0))
     checks["wal_after_migration"] = bool(after) and after.get("journal_mode", "").lower() == "wal"
 
-    # 用户库同样比对（若提供）
+    # 用户库同样比对（若提供）：用户库没有"保留期历史引用"的豁免，任何外键违例都算异常
     if backup_users:
-        users_before = _inspect_db(backup_users)
+        users_before = _inspect_db(backup_users, ())
         report["users_before"] = users_before
         users_after_path = os.path.join(migration.get("app_dir", workdir), "users.db")
-        users_after = _inspect_db(users_after_path) if os.path.isfile(users_after_path) else {}
+        users_after = _inspect_db(users_after_path, ()) if os.path.isfile(users_after_path) else {}
         report["users_after"] = users_after
         users_diff = {
             t: n for t, n in (users_before.get("tables") or {}).items()
@@ -365,6 +418,9 @@ def main(argv=None) -> int:
                     help="后端源码目录（默认本脚本上一级）")
     ap.add_argument("--read-limit-ms", type=float, default=READ_BLOCK_MS_LIMIT,
                     help="写事务持锁时读耗时阈值（毫秒，默认 250）")
+    ap.add_argument("--strict-fk", action="store_true",
+                    help="任何外键违例都判失败（默认放过已知良性类 orders.file_id→files.id，"
+                         "那是文件到期清理后的历史引用，见 BENIGN_FK_RULES 注释）")
     ap.add_argument("--allow-empty", action="store_true",
                     help="允许源库没有数据行（默认要求有业务数据，否则演练意义不足）")
     args = ap.parse_args(argv)
@@ -404,6 +460,11 @@ def _print_summary(report: dict) -> None:
     if rw.get("read_ms") is not None:
         print("  写事务持锁时读耗时: %s ms（阈值 %s ms，journal=%s）"
               % (rw.get("read_ms"), rw.get("limit_ms"), rw.get("journal_mode")))
+    fk = ((report.get("integrity_before") or {}).get("foreign_key_detail") or {})
+    if fk.get("total"):
+        print("  外键违例: 总 %s（良性 %s / 异常 %s）%s"
+              % (fk.get("total"), fk.get("benign"), fk.get("unexpected"),
+                 ("明细 " + str(fk.get("detail"))) if fk.get("detail") else ""))
     cw = report.get("concurrent_writes") or {}
     if cw:
         print("  并发写: %s/%s 成功，用时 %s ms"

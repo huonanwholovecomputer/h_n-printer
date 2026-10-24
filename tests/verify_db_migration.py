@@ -5,7 +5,7 @@
 
 交付物：`mobile_apps/printer-backend/ops/db_migration_drill.py`
   · 源库只读 + SQLite backup API 拷出（不是 cp，WAL 未 checkpoint 的页也进备份）；
-  · integrity_check / foreign_key_check / 逐表行数；
+  · integrity_check / foreign_key_check（良性/异常分类）/ 逐表行数；
   · 用**当前代码的 init_db()** 在副本上重放迁移（幂等性 + 行数不丢 + 迁移后仍是 WAL）；
   · WAL 下"写事务持锁时另一连接读"的耗时（阈值默认 250ms）+ N 并发写全部成功；
   · 源库 SHA-256 前后一致（演练绝不碰生产库）；
@@ -74,6 +74,11 @@ H.chk("★ 写事务用 BEGIN IMMEDIATE（WAL 下写串行、读不阻塞）",
 H.chk("★ 演练前后校验源库 SHA-256 未变化（绝不改生产库）",
       "sha256_before" in drill_src and "sha256_after" in drill_src
       and "source_unchanged" in drill_src)
+H.chk("★ 外键违例分类：良性 orders.file_id→files.id 与异常分开（生产实测 228 条该类）",
+      "BENIGN_FK_RULES" in drill_src and "unexpected" in drill_src
+      and '"orders", "files"' in drill_src)
+H.chk("★ 提供 --strict-fk（任何违例即失败）且用户库无豁免",
+      '"--strict-fk"' in drill_src and "_inspect_db(backup_users, ())" in drill_src)
 H.chk("演练模式显式跳过 app 启动清理与 MD5 索引（副本没有 uploads）",
       app_src.count('os.environ.get("HN_DRILL_MODE") == "1"') >= 2
       and "HN_DRILL_MODE" in drill_src)
@@ -175,6 +180,74 @@ _p3 = subprocess.run(
     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
 H.chk("源库损坏 → 非 0 退出（不会假装演练通过）", _p3.returncode != 0, f"rc={_p3.returncode}")
 
+# ── 外键口径（2026-10-24 生产演练发现：orders.file_id→files.id 有 228 条历史良性违例）
+#   ① 良性违例：演练应通过但写明 warnings（不是"假装没看见"，也不许改历史订单数据）
+bconn = sqlite3.connect(src_orders)
+bconn.execute(
+    "INSERT INTO orders (id, file, file_id, copies, status, created_at, openid) "
+    "VALUES (3, 'gone.pdf', 'expired-file-id', 1, 'sent', '2026-10-01 10:00:00', 'u1')")
+bconn.commit()
+bconn.close()
+_benign_work = _mkroot("hn_s302_benign_")
+_benign_report = os.path.join(_benign_work, "report.json")
+_pb = subprocess.run(
+    [sys.executable, DRILL, "--source", src_orders, "--users", src_users,
+     "--workdir", _benign_work, "--report", _benign_report, "--backend-dir", BACKEND],
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
+_rb = {}
+if os.path.isfile(_benign_report):
+    with open(_benign_report, "r", encoding="utf-8") as f:
+        _rb = json.load(f)
+_fkb = ((_rb.get("integrity_before") or {}).get("foreign_key_detail") or {})
+H.chk("★ 良性外键违例（已过期文件的 orders.file_id）不判失败",
+      _pb.returncode == 0 and (_rb.get("checks") or {}).get("foreign_keys_before_ok") is True,
+      f"rc={_pb.returncode} fk={_fkb}")
+H.chk("★ 良性违例写进 warnings（不是'看不见'）",
+      _fkb.get("benign") == 1 and _fkb.get("unexpected") == 0
+      and any("良性" in w for w in (_rb.get("warnings") or [])),
+      _rb.get("warnings"))
+
+#   ② --strict-fk：同一份库必须判失败（"严格口径"是真的能拦住）
+_pbs = subprocess.run(
+    [sys.executable, DRILL, "--source", src_orders, "--users", src_users,
+     "--workdir", _mkroot("hn_s302_strict_"), "--report", _benign_report + ".strict.json",
+     "--backend-dir", BACKEND, "--strict-fk"],
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
+_rbs = {}
+_strict_rp = _benign_report + ".strict.json"
+if os.path.isfile(_strict_rp):
+    with open(_strict_rp, "r", encoding="utf-8") as f:
+        _rbs = json.load(f)
+H.chk("★ --strict-fk 下同一良性违例必须判失败（严格口径可切换）",
+      _pbs.returncode == 1 and (_rbs.get("checks") or {}).get("foreign_keys_before_ok") is False,
+      f"rc={_pbs.returncode} checks={_rbs.get('checks')}")
+
+#   ③ 非良性违例（别的表/父表组合）：默认也必须判失败，不能被"良性规则"顺带放过
+_badfk_dir = _mkroot("hn_s302_badfk_")
+_badfk_db = os.path.join(_badfk_dir, "orders.db")
+shutil.copy2(src_orders, _badfk_db)
+_x = sqlite3.connect(_badfk_db)
+_x.execute("CREATE TABLE IF NOT EXISTS probe_child (id INTEGER PRIMARY KEY, "
+           "oid INTEGER REFERENCES orders(id))")
+_x.execute("INSERT INTO probe_child (oid) VALUES (999999)")
+_x.commit()
+_x.close()
+_badfk_work = _mkroot("hn_s302_badfk_work_")
+_badfk_report = os.path.join(_badfk_work, "report.json")
+_px = subprocess.run(
+    [sys.executable, DRILL, "--source", _badfk_db,
+     "--workdir", _badfk_work, "--report", _badfk_report, "--backend-dir", BACKEND],
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
+_rx = {}
+if os.path.isfile(_badfk_report):
+    with open(_badfk_report, "r", encoding="utf-8") as f:
+        _rx = json.load(f)
+_fkx = ((_rx.get("integrity_before") or {}).get("foreign_key_detail") or {})
+H.chk("★ 非良性外键违例（其它 table→parent）仍判失败",
+      _px.returncode == 1 and _fkx.get("unexpected") == 1
+      and (_rx.get("checks") or {}).get("foreign_keys_before_ok") is False,
+      f"rc={_px.returncode} fk={_fkx}")
+
 # ============================================================
 # C. 变异自证：写事务换 rollback journal + BEGIN EXCLUSIVE
 # ============================================================
@@ -213,6 +286,27 @@ _pm = subprocess.run([sys.executable, _probe], capture_output=True, text=True,
 H.chk("变异后退回 rollback journal + 独占锁 ⇒ 读被挡住（B 的判据能红）",
       H.probe_value(_pm, "READ_OK") == "0",
       "probe=%s stderr=%s" % (H.probe_value(_pm, "READ_OK"), (_pm.stderr or "")[-200:]))
+
+# ── 变异 2：外键分类"一律当良性" ⇒ 非良性违例的判据必须红（上面 _badfk_db 的用例）
+_mut2_dir = _mkroot("hn_s302_mut_fk_")
+_anchor = "        if (str(table), str(parent)) in benign_rules:\n            benign += 1"
+if _anchor not in drill_src:
+    raise AssertionError("变异锚点未命中：外键分类")
+_mut2_src = drill_src.replace(
+    _anchor,
+    "        if True:  # 变异：把所有外键违例都当良性\n            benign += 1", 1)
+_mut2_path = os.path.join(_mut2_dir, "drill_mut_fk.py")
+with open(_mut2_path, "w", encoding="utf-8") as f:
+    f.write(_mut2_src)
+_mut2_work = _mkroot("hn_s302_mut_fk_work_")
+_mut2_report = os.path.join(_mut2_work, "report.json")
+_pm2 = subprocess.run(
+    [sys.executable, _mut2_path, "--source", _badfk_db,
+     "--workdir", _mut2_work, "--report", _mut2_report, "--backend-dir", BACKEND],
+    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
+H.chk("变异后'一律当良性' ⇒ 非良性违例不再判失败（B 的判据能红）",
+      _pm2.returncode == 0,
+      f"rc={_pm2.returncode} stdout={(_pm2.stdout or '')[-300:]}")
 
 for _d in _TMPS:
     shutil.rmtree(_d, ignore_errors=True)
