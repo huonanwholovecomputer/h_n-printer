@@ -4616,9 +4616,13 @@ class MainWindow(QMainWindow):
             else:
                 self._stats_server.finance_mode = "local"
 
-        # 附加启动令牌：settlement.html 要求每次启动的随机 token 才能访问；mode 显式传存储模式
+        # S2-10 ①：启动令牌**不再进地址栏**（它会留在浏览器历史/截图/Referer 里）。
+        # 每次打开向 StatsServer 要一个**一次性 nonce**（短 TTL + 用过即废，重放 403）；
+        # 真实启动令牌由服务端注入 HTML，页面后续请求一律用 X-Launch-Token 请求头。
+        # mode/tab 等其余参数照旧（深链与本地/云端模式判定不受影响）。
+        nonce = self._stats_server.issue_nonce()
         url = (f"{self._stats_server.url}/settlement.html"
-               f"?token={self._stats_server.launch_token}&mode={finance_mode}")
+               f"?nonce={nonce}&mode={finance_mode}")
         if isinstance(tab, str) and tab in ("settings", "auth"):
             url += f"&tab={tab}"
         mode_txt = "云端收支清算" if finance_mode == "cloud" else "本地收支清算"

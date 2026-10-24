@@ -648,9 +648,13 @@ def _run_behavior(tmp, data_file):
             chk("无会话写 %s → 403（后端二次校验，不是只靠前端锁）" % p,
                 st == 403 and r.get("code") == "finance_session_required", (st, r))
         # 未登记的写路由 = fail-closed
+        # （S2-10 ⑤ 起：代理白名单**先于**会话门拒掉未登记路径 ⇒ 403 的 code 是
+        #   proxy_path_not_allowed 而不是 finance_session_required；判据仍是"必须 403、
+        #   请求不得越过本机服务"，两种 code 都是 fail-closed，随本批语义同步取样。）
         st, r = c.call("POST", "/api/proxy/admin/some_new_write_route", {"x": 1})
         chk("**未登记**的 proxy 写路由同样 403（fail-closed：以后新增写接口不会裸奔）",
-            st == 403 and r.get("code") == "finance_session_required", (st, r))
+            st == 403 and r.get("code") in ("finance_session_required",
+                                            "proxy_path_not_allowed"), (st, r))
         st, r = c.call("POST", "/api/proxy/admin/order_status",
                        {"order_id": "1", "status": "sent"}, session=sess)
         chk("只用 settings 会话写 order_status → 403 forbidden（模块越权被拦）",

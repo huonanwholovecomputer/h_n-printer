@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import platform
+import posixpath
 import re
 import secrets
 import socket
@@ -135,6 +136,63 @@ _MAX_CONCURRENT_REQUESTS = 16     # 并发处理线程上限：超了直接 503�
 _SOCKET_TIMEOUT = 30              # 连接级空闲/读写超时（秒）：慢速或半开连接 30 秒后断开
 # 公共静态文件白名单：浏览器加载这些文件时不要求启动令牌（其余静态文件一律校验）
 _PUBLIC_STATIC_FILES = {"/chart.umd.min.js"}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# S2-10 本地 HTTP 服务加固收尾（docs/安全加固修复计划_2026-10-23.md §S2-10 / LT-11）
+#
+#   ① 启动令牌不再进地址栏：GUI 打开页面时签发**一次性 nonce**（`?nonce=`），HTML 入口校验
+#      后**当场作废**（重放 403）；页面加载即 `history.replaceState` 清掉。`?token=` 作为老
+#      入口**保留**（老书签/旧流程），但它只对 HTML 入口生效 —— API 一律只认 X-Launch-Token 头。
+#   ② Host 白名单：只接受 127.0.0.1 / localhost / [::1] + **实际端口**（防 DNS rebinding）。
+#   ③ ACAO 收窄：只回显本服务自己的 origin，其它 Origin（含 null / 外部域名）不发 CORS 头。
+#   ④ 令牌比较一律 hmac.compare_digest（header / query / nonce 三条路径）。
+#   ⑤ 代理路径归一化 + 显式白名单：越界/未知 → 4xx，且**不发出**上游请求。
+#   ⑥ 出站 printer token 改 X-Printer-Token 请求头（不再拼 ?token=，否则每次打开页面都在
+#      VPS 的 access log 里留下 token；后端 app.py:_get_printer_token 优先读该头）。
+#   ⑦ 安全响应头：X-Frame-Options / Referrer-Policy / nosniff 加到**所有**响应，HTML 另加 CSP。
+#   ⑧ 并发上限沿用 S1-09 的 _LimitedThreadingHTTPServer（本批**不重复实现**，只补验收断言）。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ① 一次性 nonce 有效期：要够浏览器从「点菜单」走到「首个请求」，但不能长到可被翻历史重放
+NONCE_TTL = 120                  # 秒
+_NONCE_MAX_PENDING = 32          # 未消费 nonce 上限（每次点开页面才签发一个；TTL 到期即清）
+
+# ⑤ 代理白名单：`/api/proxy/<x>` 归一化后必须**精确**命中这些云端路径 —— 与
+# settlement.html 里实际调用的 `/api/proxy/...` 一一对应。新增代理接口必须同时加进这里
+# （验收脚本会拿 settlement.html 的调用面反查本集合，防止"页面加了接口、白名单忘了加"）。
+_PROXY_PREFIX = "/api/proxy"
+_PROXY_ALLOWED_TARGETS = frozenset({
+    "/api/admin/order_status",
+    "/api/admin/order_type",
+    "/api/admin/statistics/months",
+    "/api/admin/statistics/revenue",
+    "/api/finance/config",
+    "/api/pricing",
+    "/api/printer/bind_owner",
+    "/api/printer/capability",
+    "/api/printer/devices",
+    "/api/printer/devices/cleanup",
+    "/api/printer/devices/delete",
+})
+
+# ⑦ 所有响应都带的安全头；HTML 额外加 CSP。CSP 必须真的不把页面打坏：页面有内联
+# script/style（'unsafe-inline'）、Chart.js 本地文件（'self'）与 jsdelivr CDN 兜底
+# （显式放行该域名 —— **不要**为了 CSP 把 CDN 兜底删掉）。
+_SECURITY_HEADERS = (
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Content-Type-Options", "nosniff"),
+)
+_HTML_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: https:; "
+    "connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
+)
+# 本机回环主机名（Host 白名单 ② 与 CORS 回显 ③ 共用同一份口径）
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # S1-05 财务安全加固（docs/安全加固修复计划_2026-10-23.md §S1-05；D-5 已拍板
@@ -573,9 +631,10 @@ class FinanceSecurity:
                 return self._cloud_cache
         result = None
         try:
+            # S2-10 ⑥：出站令牌走请求头（query 会进 nginx access log；后端头优先）
             resp = _get_proxy_session().get(
                 "%s/api/finance/config" % self.api_url,
-                params={"token": self.token}, timeout=(2, 3))
+                headers={"X-Printer-Token": self.token}, timeout=(2, 3))
             if resp.ok:
                 body = resp.json()
                 data = body.get("data") if isinstance(body, dict) else None
@@ -1085,6 +1144,68 @@ def _extract_proxy_body(resp) -> dict:
     return out
 
 
+# ── S2-10 公共判定（模块级：handler / 服务器 / 验收脚本都能直接调） ──
+
+def _token_equal(candidate, expected) -> bool:
+    """启动令牌 / nonce 的**恒时**比较（S2-10 ④）。
+
+    · 双方都必须是非空 str（令牌未注入时 fail-closed：空串永远不通过）；
+    · 非 ASCII 直接判失败 —— `hmac.compare_digest` 对含非 ASCII 的 str 会抛 TypeError，
+      而这些值来自攻击者可控的请求头/查询串，绝不能让它变成 500。
+    """
+    if not isinstance(candidate, str) or not isinstance(expected, str):
+        return False
+    if not candidate or not expected:
+        return False
+    try:
+        if not (candidate.isascii() and expected.isascii()):
+            return False
+        return hmac.compare_digest(candidate, expected)
+    except TypeError:                                   # 防御：类型/编码的极端情况
+        return False
+
+
+def allowed_hosts(port: int) -> frozenset:
+    """Host 白名单（S2-10 ②）：只认本机回环地址 + **实际**端口。
+
+    `port=0` 时由 `server_port` 反查，所以调用方必须传**绑定之后**的端口；
+    取不到端口 → 空集合 = 一切 Host 都不匹配（fail-closed，宁可 403 也不放行）。
+    """
+    try:
+        p = int(port or 0)
+    except (TypeError, ValueError):
+        return frozenset()
+    if p <= 0:
+        return frozenset()
+    return frozenset("%s:%d" % (name, p) for name in _LOOPBACK_HOSTS)
+
+
+def normalize_proxy_target(proxy_path: str):
+    """`/api/proxy/<x>` → 云端目标路径。返回 `(target, code)`（S2-10 ⑤）。
+
+    code 为空 = 通过；`bad_path` = 路径本身非法（`..` / 空段 / 反斜杠 / 编码越界）→ 400；
+    `not_allowed` = 归一化后不在白名单 → 403。**两种失败都必须在发出上游请求之前返回**。
+    """
+    if not isinstance(proxy_path, str) or not proxy_path.startswith(_PROXY_PREFIX + "/"):
+        return "", "bad_path"
+    rest = proxy_path[len(_PROXY_PREFIX):]              # '/admin/order_status'
+    decoded = urllib.parse.unquote(rest, errors="replace")
+    for probe in (rest, decoded):
+        if "\\" in probe or "\x00" in probe:
+            return "", "bad_path"
+        segs = probe.split("/")
+        if segs and segs[0] == "":
+            segs = segs[1:]
+        if any(seg in ("", ".", "..") for seg in segs):
+            return "", "bad_path"
+    target = "/api" + rest
+    if posixpath.normpath(target) != target:            # 归一化后必须**原样**（双斜杠等一律拒）
+        return "", "bad_path"
+    if target not in _PROXY_ALLOWED_TARGETS:
+        return "", "not_allowed"
+    return target, ""
+
+
 class _StatsHandler(SimpleHTTPRequestHandler):
     """自定义请求处理器"""
 
@@ -1110,26 +1231,145 @@ class _StatsHandler(SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.debug(f"StatsServer: {format % args}")
 
-    def _check_launch_token(self, allow_query: bool = False) -> bool:
-        """校验启动令牌。API 用 header X-Launch-Token；HTML 页面加载用 ?token= 查询参数。"""
-        header = self.headers.get("X-Launch-Token") or ""
-        if header and header == self.launch_token:
-            return True
-        if allow_query:
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            qtoken = qs.get("token", [""])[0]
-            if qtoken and qtoken == self.launch_token:
+    # ── S2-10 ⑦ 安全响应头：所有响应（含基类发的 404/304/静态文件）都带上 ──
+    # 做法是在 send_response/send_header/end_headers 三个钩子上补齐，而不是逐个路由手写：
+    # 少写一处就漏一处（favicon、403、静态文件、send_error 都是基类发的）。
+
+    def send_response(self, code, message=None):
+        self._sec_headers_done = False
+        self._resp_is_html = False
+        super().send_response(code, message)
+
+    def send_header(self, keyword, value):
+        try:
+            if str(keyword).lower() == "content-type" and "text/html" in str(value).lower():
+                self._resp_is_html = True
+        except Exception:                               # noqa: BLE001
+            pass
+        super().send_header(keyword, value)
+
+    def end_headers(self):
+        if not getattr(self, "_sec_headers_done", True):
+            self._sec_headers_done = True
+            try:
+                for _k, _v in _SECURITY_HEADERS:
+                    self.send_header(_k, _v)
+                if getattr(self, "_resp_is_html", False):
+                    self.send_header("Content-Security-Policy", _HTML_CSP)
+                self.send_header("Vary", "Origin")      # ACAO 按 Origin 变：缓存要按它分键
+            except Exception:                           # noqa: BLE001
+                pass                                    # 头发不出去时别把整个响应吞掉
+        super().end_headers()
+
+    # ── S2-10 ② Host 白名单 ──
+
+    def _allowed_hosts(self) -> frozenset:
+        """本机回环主机名 + **实际**端口。优先取服务器实例上的（端口只有绑定后才知道）。"""
+        srv = getattr(self, "server", None)
+        hosts = getattr(srv, "allowed_hosts", None)
+        if isinstance(hosts, frozenset) and hosts:
+            return hosts
+        return allowed_hosts(getattr(srv, "server_port", 0))
+
+    def _client_host_ok(self) -> bool:
+        """Host 必须是 `127.0.0.1:<port>` / `localhost:<port>` / `[::1]:<port>`。
+
+        缺 Host（HTTP/1.0、原始 socket）、DNS rebinding 用的域名、其它端口一律 False。
+        """
+        raw = (self.headers.get("Host") or "").strip().lower()
+        if not raw:
+            return False
+        for allowed in self._allowed_hosts():
+            if _token_equal(raw, allowed):
                 return True
         return False
+
+    def _guard_host(self, path: str = "") -> bool:
+        """所有请求（含 HEAD/OPTIONS）先过 Host 白名单。返回 False = 已回包。"""
+        if self._client_host_ok():
+            return True
+        logger.info("拒绝 Host=%r 的请求（只允许 127.0.0.1/localhost/[::1] + 实际端口）",
+                    (self.headers.get("Host") or "")[:120])
+        if path.startswith("/api/"):
+            self._send_json({"success": False, "code": "bad_host",
+                             "message": "Host 校验失败：本服务只接受本机回环地址访问"}, 403)
+        else:
+            self._serve_403_page()
+        return False
+
+    # ── S2-10 ① 一次性 nonce（HTML 入口用；由签发它的 StatsServer 校验并作废） ──
+
+    def _query_nonce(self) -> str:
+        try:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        except Exception:                               # noqa: BLE001
+            return ""
+        return ((qs.get("nonce") or [""])[0] or "").strip()
+
+    def _consume_nonce(self, nonce: str) -> bool:
+        owner = getattr(getattr(self, "server", None), "nonce_owner", None)
+        if owner is None:
+            return False
+        return bool(owner.consume_nonce(nonce))
+
+    # ── 启动令牌（④ 恒时比较；API 只认请求头） ──
+
+    def _check_launch_token(self, allow_query: bool = False) -> bool:
+        """校验启动令牌。
+
+        · API（`/api/*`）：**只**认 `X-Launch-Token` 请求头 —— 查询串令牌已停用
+          （S2-10：令牌不再出现在 URL 里）。
+        · `allow_query=True`：额外接受 `?token=`，仅给**老的 HTML 入口**做兼容
+          （老书签/旧流程）；页面拿到的是服务端注入的那份令牌，后续请求照旧走请求头。
+        比较一律 `hmac.compare_digest`（S2-10 ④）。
+        """
+        header = self.headers.get("X-Launch-Token") or ""
+        if _token_equal(header, self.launch_token):
+            return True
+        if allow_query:
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            except Exception:                           # noqa: BLE001
+                return False
+            qtoken = (qs.get("token") or [""])[0]
+            if _token_equal(qtoken, self.launch_token):
+                return True
+        return False
+
+    def _cors_origin(self) -> str:
+        """S2-10 ③：只回显**本服务自己的** origin（回环主机 + 实际端口）。
+
+        其它 Origin（`null`、外部域名、其它端口）返回空串 ⇒ 响应里根本不放
+        `Access-Control-Allow-Origin`，跨源页面读不到内容（同源请求本来也不需要它）。
+        """
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return ""
+        low = origin.lower()
+        if not low.startswith("http://"):
+            return ""
+        host_part = low[len("http://"):]
+        for allowed in self._allowed_hosts():
+            if _token_equal(host_part, allowed):
+                return origin
+        return ""
+
+    def _write_body(self, body: bytes):
+        """写响应体；HEAD 请求按协议**不写** body（响应头照旧发，含 Content-Length）。"""
+        if (self.command or "").upper() == "HEAD":
+            return
+        self.wfile.write(body)
 
     def _send_json(self, data: dict, status: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", len(body))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     # ── S1-05 财务安全（密码 / 会话 / 完整性 / 审计） ──
 
@@ -1204,11 +1444,18 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         return self.rfile.read(length)
 
     def do_OPTIONS(self):
-        """CORS 预检"""
+        """CORS 预检（S2-10 ③：只对本服务 origin 回 CORS 头；Allow-Headers 补齐实际用的头）。"""
+        if not self._guard_host(urllib.parse.urlparse(self.path).path):
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers",
+                             "X-Launch-Token, X-Finance-Session, Content-Type")
+            self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     # ── 路由分发 ──
@@ -1217,8 +1464,12 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        # S2-10 ②：Host 白名单（DNS rebinding 的第一道闸门）—— 所有请求都要过
+        if not self._guard_host(path):
+            return
+
         # 启动令牌门：所有 /api/* 请求均须携带有效令牌
-        # （页面 API 请求经 X-Launch-Token 请求头；HTML 页面首载经 ?token= 查询参数）
+        # （页面 API 请求经 X-Launch-Token 请求头；查询串令牌只对老 HTML 入口兼容）
         if path.startswith("/api/"):
             if not self._check_launch_token():
                 return self._send_json({"success": False, "message": "未授权：请通过本地打印工具打开收支清算"}, 403)
@@ -1254,17 +1505,36 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         # 默认：静态文件
         return self._serve_static(path)
 
+    def do_HEAD(self):
+        """S2-10：HEAD 也必须过同一套门。
+
+        旧实现没有覆写 `do_HEAD`，基类 `SimpleHTTPRequestHandler.do_HEAD` 直接把静态文件的
+        响应头发出去了 —— 启动令牌与 Host 两道闸门全被绕过（能探测/校验任意静态文件是否存在）。
+        这里统一走 `_serve_static(head_only=True)`：同样校验 Host + 令牌，只是不写 body。
+        """
+        parsed = urllib.parse.urlparse(self.path)
+        if not self._guard_host(parsed.path):
+            return
+        return self._serve_static(parsed.path, head_only=True)
+
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
-        # 启动令牌门（POST 一律要求有效令牌）
+        if not self._guard_host(path):
+            return
+
+        # 启动令牌门（POST 一律要求有效令牌，且只认请求头）
         if not self._check_launch_token():
             return self._send_json({"success": False, "message": "未授权：请通过本地打印工具打开收支清算"}, 403)
 
         # S1-09：请求体上限（读之前就判：超限 = 413 + 断开，不把超大 body 收进内存）
         if not self._request_body_ok():
             return
+
+        # S2-10 ⑤：代理路径先归一化 + 白名单 —— 越界/未知直接 4xx（不读请求体、不发上游请求）
+        if path.startswith(_PROXY_PREFIX + "/") and normalize_proxy_target(path)[1]:
+            return self._reject_proxy_path(path)
 
         # S1-05：**所有**写操作的财务会话二次校验（登录/首次设置/登出除外）
         if not self._finance_write_allowed(path):
@@ -1304,6 +1574,9 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
 
+        if not self._guard_host(path):
+            return
+
         if not self._check_launch_token():
             return self._send_json({"success": False, "message": "未授权：请通过本地打印工具打开收支清算"}, 403)
 
@@ -1319,13 +1592,23 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 
     # ── 静态文件 ──
 
-    def _serve_static(self, path: str):
+    def _serve_static(self, path: str, head_only: bool = False):
         """提供静态文件，根路径默认返回 settlement.html。
-        HTML 入口要求启动令牌（?token=），并将 __LAUNCH_TOKEN__ 替换为本次启动的真实令牌。
-        __FINANCE_MODE__ 替换为当前存储模式（cloud/local）。
-        公共库文件（chart.umd.min.js）豁免令牌；其余静态文件（含数据文件 print_data.json）一律校验令牌。"""
+
+        HTML 入口（S2-10 ①）：优先消费**一次性 nonce**（`?nonce=`，用过即废、重放 403）；
+        兼容老的 `?token=`（只对 HTML 入口生效 —— API 仍然只认 X-Launch-Token 请求头）。
+        注入 __LAUNCH_TOKEN__（页面后续请求用它做请求头）与 __FINANCE_MODE__。
+        公共库文件（chart.umd.min.js）豁免令牌；其余静态文件（含数据文件 print_data.json）
+        一律校验令牌。`head_only=True`（HEAD 请求）只发响应头 —— body 由 `_write_body` 统一拦掉。
+        """
         serve_html = (path in ("", "/", "/settlement.html"))
         if serve_html:
+            nonce = self._query_nonce()
+            if nonce:
+                # 一次性 nonce：伪造 / 过期 / 重放一律 403（**不回退**到 ?token=）
+                if not self._consume_nonce(nonce):
+                    return self._serve_403_page()
+                return self._serve_injected_html("settlement.html")
             if not self._check_launch_token(allow_query=True):
                 return self._serve_403_page()
             return self._serve_injected_html("settlement.html")
@@ -1337,12 +1620,12 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             return
         if path in _PUBLIC_STATIC_FILES:
             self.path = path
-            return super().do_GET()
+            return super().do_HEAD() if head_only else super().do_GET()
         # 非公共静态文件：一律要求启动令牌，防止绕过令牌门直接读取数据文件
         if not self._check_launch_token(allow_query=True):
             return self._serve_403_page()
         self.path = path
-        return super().do_GET()
+        return super().do_HEAD() if head_only else super().do_GET()
 
     def _serve_injected_html(self, name: str = "settlement.html"):
         """读取指定 HTML 并注入启动令牌与存储模式。"""
@@ -1365,10 +1648,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         self.send_header("Expires", "0")
         self.send_header("Content-Length", len(body))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     def _serve_403_page(self):
-        """未带启动令牌时返回 403 提示页。"""
+        """未带有效启动凭据（或 Host/nonce 不合格）时返回 403 提示页。"""
         body = ("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='UTF-8'>"
                 "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
                 "<title>访问受限</title></head>"
@@ -1378,12 +1661,13 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                 "<h2 style='margin:12px 0 6px'>访问受限</h2>"
                 "<p style='color:#6b7280'>收支清算页面仅能从本地打印工具中打开。</p>"
                 "<p style='color:#9ca3af;font-size:0.85rem'>请关闭本页，从打印工具的「📊 收支清算」菜单进入。</p>"
+                "<p style='color:#9ca3af;font-size:0.8rem'>（本页的一次性入口用后即失效：刷新需重新从打印工具打开）</p>"
                 "</div></body></html>").encode("utf-8")
         self.send_response(403)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", len(body))
         self.end_headers()
-        self.wfile.write(body)
+        self._write_body(body)
 
     # ── 健康检查 ──
 
@@ -1403,38 +1687,50 @@ class _StatsHandler(SimpleHTTPRequestHandler):
 
     # ── 代理 ──
 
+    def _reject_proxy_path(self, path: str):
+        """S2-10 ⑤：越界/未知的代理路径 —— 回 4xx，**不读请求体、不发上游请求**。"""
+        _target, code = normalize_proxy_target(path)
+        status = 400 if code == "bad_path" else 403
+        logger.warning("拒绝越界代理路径 %r（%s）", (path or "")[:120], code or "bad_path")
+        # 请求体还没读：这条连接上剩下的字节会被当成下一个请求解析 ⇒ 直接关掉
+        self.close_connection = True
+        self._send_json({"success": False, "code": "proxy_path_" + (code or "bad_path"),
+                         "message": "代理路径越界或不在白名单内"}, status)
+
     def _proxy_get(self, path: str, query: str):
-        """GET 代理到云端 API"""
+        """GET 代理到云端 API（S2-10 ⑤ 归一化+白名单；⑥ 出站 token 走请求头）"""
         # /api/proxy/admin/statistics/revenue → {api_url}/api/admin/statistics/revenue
-        target_path = path.replace("/api/proxy", "/api", 1)
+        target_path, code = normalize_proxy_target(path)
+        if code:
+            return self._reject_proxy_path(path)
         safe_qs = _strip_token_from_query(query)  # 剥离客户端 token，防止覆盖后端令牌
         url = f"{self.api_url}{target_path}"
         if safe_qs:
-            url += f"?{safe_qs}&token={self.token}"
-        else:
-            url += f"?token={self.token}"
+            url += f"?{safe_qs}"
 
         try:
-            resp = _get_proxy_session().get(url, timeout=_PROXY_TIMEOUT)
+            # ⑥ 出站令牌走请求头：query 会进 nginx/网关的 access log（后端 app.py 的头优先）
+            resp = _get_proxy_session().get(url, timeout=_PROXY_TIMEOUT,
+                                            headers={"X-Printer-Token": self.token})
             out = _extract_proxy_body(resp)
             self._send_json(out, resp.status_code)
             # S1-05：记一份「当前云端配置摘要」当审计的 before（写配置时对照用，零额外请求）
             if target_path.endswith("/finance/config") and isinstance(out.get("data"), dict):
                 type(self)._last_finance_summary = finance_data_summary(out["data"])
         except Exception as e:
-            # 不拼接完整 URL / str(e)：其中可能包含 token 查询参数
+            # 不拼接完整 URL / str(e)：其中可能包含凭据
             logger.error(f"代理请求失败 GET {target_path}: {type(e).__name__}")
             self._send_json({"success": False, "message": f"请求云端失败: {type(e).__name__}"}, 502)
 
     def _proxy_post(self, path: str, query: str):
-        """POST 代理到云端 API（S1-05：财务写操作追加审计日志）"""
-        target_path = path.replace("/api/proxy", "/api", 1)
+        """POST 代理到云端 API（S1-05：财务写操作追加审计日志；S2-10 ⑤⑥ 同 GET）"""
+        target_path, code = normalize_proxy_target(path)
+        if code:
+            return self._reject_proxy_path(path)
         safe_qs = _strip_token_from_query(query)  # 剥离客户端 token，防止覆盖后端令牌
         url = f"{self.api_url}{target_path}"
         if safe_qs:
-            url += f"?{safe_qs}&token={self.token}"
-        else:
-            url += f"?token={self.token}"
+            url += f"?{safe_qs}"
 
         try:
             body = self._read_body()
@@ -1450,12 +1746,13 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                 payload = dict(payload, data=clean)
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             resp = _get_proxy_session().post(url, data=body, timeout=_PROXY_TIMEOUT,
-                                             headers={"Content-Type": "application/json"})
+                                             headers={"Content-Type": "application/json",
+                                                      "X-Printer-Token": self.token})
             out = _extract_proxy_body(resp)
             self._send_json(out, resp.status_code)
             self._audit_proxy_write(target_path, payload, out, resp.status_code)
         except Exception as e:
-            # 不拼接完整 URL / str(e)：其中可能包含 token 查询参数
+            # 不拼接完整 URL / str(e)：其中可能包含凭据
             logger.error(f"代理请求失败 POST {target_path}: {type(e).__name__}")
             self._send_json({"success": False, "message": f"请求云端失败: {type(e).__name__}"}, 502)
             try:
@@ -1626,7 +1923,8 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             try:
                 resp = _get_proxy_session().get(
                     f"{self.api_url}/api/printer_status",
-                    params={"token": getattr(self, "token", "")},
+                    # S2-10 ⑥：出站令牌走请求头（该接口本身不校验 token，更没理由放 query）
+                    headers={"X-Printer-Token": getattr(self, "token", "")},
                     timeout=_PROXY_TIMEOUT,
                 )
                 if resp.ok:
@@ -1852,6 +2150,11 @@ class _LimitedThreadingHTTPServer(ThreadingHTTPServer):
     ThreadingHTTPServer 每个请求开一条线程、没有上限：本地服务被异常/恶意并发打满时
     会把整机拖死。这里用一个信号量把处理线程钳在 `max_workers`：超了**直接回 503**
     （明确、可重试），不排队、不无限起线程；请求结束（含异常）必定归还槽位。
+
+    S2-10：另外挂两个**实例级**属性（不能塞进 handler 类属性 —— handler 是类级共享的，
+    端口/nonce 都是 per-server 的）：
+      · `allowed_hosts`：绑定后的实际端口推出的 Host 白名单（防 DNS rebinding）；
+      · `nonce_owner`：签发一次性 nonce 的 StatsServer（HTML 入口消费/作废它）。
     """
 
     max_workers = _MAX_CONCURRENT_REQUESTS
@@ -1859,7 +2162,11 @@ class _LimitedThreadingHTTPServer(ThreadingHTTPServer):
     def __init__(self, *args, **kwargs):
         self._slots = threading.BoundedSemaphore(self.max_workers)
         self.rejected = 0            # 因并发上限被拒的请求数（诊断/验收用）
+        self.nonce_owner = None      # StatsServer 在 start() 里注入
+        self.allowed_hosts = frozenset()
         super().__init__(*args, **kwargs)
+        # 端口只有绑定之后才知道（port=0 由系统分配）
+        self.allowed_hosts = allowed_hosts(getattr(self, "server_port", 0))
 
     def process_request(self, request, client_address):
         try:
@@ -1931,6 +2238,9 @@ class StatsServer:
         self.take_orders = bool(take_orders)
         self._port = port
         self._launch_token = secrets.token_hex(16)  # 每次启动随机，仅本地打印工具持有
+        # S2-10 ①：一次性 nonce（nonce → 过期时间戳）。只放内存、随进程结束消失。
+        self._nonces = {}
+        self._nonce_lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._running = False
@@ -1956,6 +2266,49 @@ class StatsServer:
         """财务安全门（S1-05）：启动时注入 handler，测试/调试也可从这里取。"""
         return get_finance_security(self.data_file, api_url=self.api_url, token=self.token,
                                     finance_mode=self.finance_mode)
+
+    # ── S2-10 ① 一次性 nonce（GUI 打开页面时签发，HTML 入口消费） ──
+
+    def issue_nonce(self, ttl: float = NONCE_TTL) -> str:
+        """签发一个**一次性** nonce（放进打开页面的 URL：`?nonce=…`）。
+
+        与启动令牌的区别：nonce 只有一个用途（换取一次 HTML 入口），
+        用过即废、还带 TTL —— 所以它可以进地址栏，而长期有效的 launch token 不行。
+        """
+        nonce = secrets.token_urlsafe(32)
+        try:
+            expire = time.time() + max(0.0, float(ttl))
+        except (TypeError, ValueError):
+            expire = time.time() + NONCE_TTL
+        with self._nonce_lock:
+            now = time.time()
+            for k in [k for k, exp in self._nonces.items() if exp <= now]:
+                self._nonces.pop(k, None)              # 过期即清（不无限攒）
+            while len(self._nonces) >= _NONCE_MAX_PENDING:
+                oldest = next(iter(self._nonces), None)
+                if oldest is None:
+                    break
+                self._nonces.pop(oldest, None)         # FIFO 丢最旧的（正常永远到不了这里）
+            self._nonces[nonce] = expire
+        return nonce
+
+    def consume_nonce(self, nonce) -> bool:
+        """校验并**当场作废**（一次性）。伪造 / 过期 / 重放一律 False。"""
+        if not isinstance(nonce, str) or not nonce or len(nonce) > 128:
+            return False
+        now = time.time()
+        with self._nonce_lock:
+            for k in [k for k, exp in self._nonces.items() if exp <= now]:
+                self._nonces.pop(k, None)
+            matched = ""
+            # 恒时比较（S2-10 ④）：未消费的 nonce 极少（≤32），线性扫一遍代价可忽略
+            for pending in list(self._nonces):
+                if _token_equal(nonce, pending):
+                    matched = pending
+            if not matched:
+                return False
+            self._nonces.pop(matched, None)            # 一次性：先作废，再回报成功
+        return True
 
     def start(self):
         """启动服务器（阻塞式，应在后台线程调用）"""
@@ -1985,6 +2338,10 @@ class StatsServer:
         # S1-09：并发线程数封顶（超额 503）+ 连接级超时（见 _LimitedThreadingHTTPServer）
         self._server = _LimitedThreadingHTTPServer(("127.0.0.1", self._port), _StatsHandler)
         self._port = self._server.server_port  # 实际端口（port=0 时系统分配）
+        # S2-10 ①②：Host 白名单要用**实际**端口；nonce 的一次性判定挂在 server 实例上
+        # （handler 类是全局共享的，端口/nonce 都是 per-server 的东西，不能塞进类属性）
+        self._server.allowed_hosts = allowed_hosts(self._port)
+        self._server.nonce_owner = self
         logger.info(f"统计服务器启动: http://127.0.0.1:{self._port}")
         self._running = True
 
@@ -2018,6 +2375,8 @@ class StatsServer:
         if self._server:
             self._server.shutdown()
             self._server = None
+        with self._nonce_lock:
+            self._nonces.clear()                           # 停服即作废所有未消费 nonce
         self._running = False
         logger.info("统计服务器已停止")
 

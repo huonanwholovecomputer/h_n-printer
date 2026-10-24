@@ -779,6 +779,22 @@ var FINANCE_MODE = '__FINANCE_MODE__';   // 'cloud' 或 'local'：收支清算�
     if (mv === 'cloud' || mv === 'local') FINANCE_MODE = mv;
   }
   if (FINANCE_MODE !== 'cloud' && FINANCE_MODE !== 'local') FINANCE_MODE = 'cloud';
+  /* S2-10：地址栏里的启动凭据用完就清 —— nonce 是一次性的（服务端已当场作废），
+     token 只可能来自老的 ?token= 兼容入口；两者都不该留在浏览器历史/截图/Referer 里。
+     只删这两个参数，mode / tab 等其余参数原样保留（深链照旧可用）；
+     LAUNCH_TOKEN 已在上面读进变量，清掉地址栏不影响后续 X-Launch-Token 请求头。 */
+  try {
+    if (window.history && history.replaceState && location.search) {
+      var _q = new URLSearchParams(location.search);
+      if (_q.has('nonce') || _q.has('token')) {
+        _q.delete('nonce');
+        _q.delete('token');
+        var _qs = _q.toString();
+        history.replaceState(null, '',
+          location.pathname + (_qs ? '?' + _qs : '') + (location.hash || ''));
+      }
+    }
+  } catch (e) { /* 老浏览器没有 URLSearchParams/replaceState：保持原地址不变即可 */ }
 })();
 /* S1-05：解锁会话自动带在**所有**请求头里（读操作服务端不校验，写操作必须要它）。
    会话变量在下面的「密码 / 解锁会话」段声明；用 typeof 兜住脚本加载顺序。 */
