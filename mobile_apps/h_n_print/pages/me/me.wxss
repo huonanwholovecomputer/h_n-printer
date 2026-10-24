@@ -1896,3 +1896,84 @@
   line-height: 1.4;
 }
 
+
+/* ==================== 我的文件（S2-08 / D-7） ==================== */
+.myfiles-entry {
+  display: flex;
+  align-items: center;
+  margin: 4rpx 0 20rpx;
+  padding: 20rpx 24rpx;
+  border-radius: 20rpx;
+  background: rgba(120, 120, 128, 0.10);
+}
+.myfiles-entry-icon {
+  margin-right: 12rpx;
+  font-size: 30rpx;
+}
+.myfiles-entry-text {
+  font-size: 28rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.myfiles-entry-desc {
+  flex: 1;
+  margin-left: 12rpx;
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+}
+.myfiles-entry-arrow {
+  font-size: 32rpx;
+  color: var(--text-tertiary);
+}
+.myfiles-sheet {
+  max-height: 76vh;
+}
+.myfiles-list {
+  max-height: 46vh;
+}
+.myfile-row {
+  display: flex;
+  align-items: center;
+  padding: 18rpx 0;
+  border-bottom: 1rpx solid rgba(120, 120, 128, 0.18);
+}
+.myfile-main {
+  flex: 1;
+  min-width: 0;
+}
+.myfile-name {
+  display: block;
+  font-size: 26rpx;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.myfile-meta {
+  display: block;
+  margin-top: 4rpx;
+  font-size: 21rpx;
+  color: var(--text-tertiary);
+}
+.myfile-del {
+  margin-left: 16rpx;
+  padding: 8rpx 20rpx;
+  border-radius: 999rpx;
+  font-size: 23rpx;
+  color: #FF3B30;
+  background: rgba(255, 59, 48, 0.12);
+}
+.myfile-busy {
+  margin-left: 16rpx;
+  padding: 8rpx 16rpx;
+  border-radius: 999rpx;
+  font-size: 21rpx;
+  color: var(--text-tertiary);
+  background: rgba(120, 120, 128, 0.14);
+}
+.myfiles-more {
+  padding: 16rpx 0;
+  text-align: center;
+  font-size: 23rpx;
+  color: var(--blue);
+}

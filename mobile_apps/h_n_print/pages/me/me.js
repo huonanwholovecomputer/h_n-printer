@@ -60,6 +60,13 @@ Component({
     ordersPageNumbers: [],
     pageOptions: [10, 20, 50, 100],
     showPageSizePicker: false,
+    // S2-08（D-7）：「我的文件」弹窗（查看保留期 + 删除自己的文件）
+    showMyFiles: false,
+    myFilesClosing: false,
+    myFiles: [],
+    myFilesLoading: false,
+    myFilesPage: 0,
+    myFilesTotal: 0,
     pageSizeDropdownLeft: 0,   // 分页下拉 fixed 定位（viewport 坐标）
     pageSizeDropdownTop: 0,
     statusMap: {
@@ -1242,6 +1249,99 @@ Component({
         this.setData({ showConfirmModal: false, modalClosing: false, _confirmCallback: null })
         if (typeof cb === 'function') cb()
       }, 200)
+    },
+
+    // ==================== 我的文件（S2-08 / D-7）====================
+    // 删除我的文件入口：GET /api/my_files 列出自己的文件（含保留期与到期时间），
+    // DELETE /api/file/<id> 真正删除（服务端再判属主/活跃订单，409 时提示等订单结束）。
+    onOpenMyFiles() {
+      this.setData({ showMyFiles: true, myFilesClosing: false })
+      this.loadMyFiles(true)
+    },
+
+    onCloseMyFiles() {
+      if (this.data.myFilesClosing) return
+      this.setData({ myFilesClosing: true })
+      setTimeout(() => this.setData({ showMyFiles: false, myFilesClosing: false }), 200)
+    },
+
+    _fmtFileSize(bytes) {
+      const n = Number(bytes) || 0
+      if (n < 1024) return n + ' B'
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB'
+      return (n / (1024 * 1024)).toFixed(1) + ' MB'
+    },
+
+    _decorateMyFile(f) {
+      const hours = Number(f.retention_hours) || 0
+      const retentionText = hours > 0 ? ('保留 ' + (hours >= 24 && hours % 24 === 0 ? (hours / 24) + ' 天' : hours + ' 小时')) : '不自动删除'
+      const expireText = f.auto_delete_at ? ('将于 ' + f.auto_delete_at + ' 自动删除') : retentionText
+      return Object.assign({}, f, {
+        sizeText: this._fmtFileSize(f.size),
+        retentionText: retentionText,
+        expireText: expireText,
+      })
+    },
+
+    loadMyFiles(reset) {
+      if (this.data.myFilesLoading && !reset) return
+      const page = reset ? 1 : (this.data.myFilesPage || 0) + 1
+      this.setData({ myFilesLoading: true })
+      request({
+        url: CONFIG.BASE_URL + '/api/my_files?page=' + page + '&per_page=20',
+        method: 'GET',
+        success: (res) => {
+          const d = (res && res.data) || {}
+          if (res.statusCode !== 200 || !d.success) {
+            this.setData({ myFilesLoading: false })
+            wx.showToast({ title: (d && d.message) || '加载失败，请重试', icon: 'none' })
+            return
+          }
+          const files = (d.files || []).map(f => this._decorateMyFile(f))
+          this.setData({
+            myFiles: reset ? files : (this.data.myFiles || []).concat(files),
+            myFilesPage: page,
+            myFilesTotal: Number(d.total) || files.length,
+            myFilesLoading: false,
+          })
+        },
+        fail: () => {
+          this.setData({ myFilesLoading: false })
+          wx.showToast({ title: '网络异常，请重试', icon: 'none' })
+        },
+      })
+    },
+
+    onLoadMoreMyFiles() {
+      this.loadMyFiles(false)
+    },
+
+    onDeleteMyFile(e) {
+      const fileId = e.currentTarget.dataset.id
+      const name = e.currentTarget.dataset.name || '该文件'
+      if (!fileId) return
+      this._showConfirm('删除文件', '确定删除「' + name + '」吗？删除后不可恢复。', '删除', '#FF3B30', () => {
+        wx.showLoading({ title: '删除中...' })
+        request({
+          url: CONFIG.BASE_URL + '/api/file/' + encodeURIComponent(fileId),
+          method: 'DELETE',
+          success: (res) => {
+            wx.hideLoading()
+            const d = (res && res.data) || {}
+            if (res.statusCode === 200 && d.success) {
+              const list = (this.data.myFiles || []).filter(f => f.file_id !== fileId)
+              this.setData({ myFiles: list, myFilesTotal: Math.max(0, (Number(this.data.myFilesTotal) || 1) - 1) })
+              wx.showToast({ title: '已删除', icon: 'success' })
+            } else {
+              wx.showToast({ title: (d && d.message) || '删除失败，请稍后重试', icon: 'none', duration: 2500 })
+            }
+          },
+          fail: () => {
+            wx.hideLoading()
+            wx.showToast({ title: '网络异常，请重试', icon: 'none' })
+          },
+        })
+      })
     },
 
     // 作废指定密钥

@@ -144,6 +144,14 @@
         <text wx:if="{{orders.length > 0}}" class="order-count">{{ordersTotal || orders.length}}</text>
       </view>
 
+      <!-- S2-08（D-7）：我的文件 —— 查看并删除自己上传的文件（接 S1-03 的 DELETE /api/file） -->
+      <view class="myfiles-entry" bindtap="onOpenMyFiles" hover-class="tap-active">
+        <text class="myfiles-entry-icon">🗂</text>
+        <text class="myfiles-entry-text">我的文件</text>
+        <text class="myfiles-entry-desc">查看保留期、删除自己的文件</text>
+        <text class="myfiles-entry-arrow">›</text>
+      </view>
+
       <!-- 加载中 -->
       <view wx:if="{{loading}}" class="status-box">
         <text class="status-text">加载中...</text>
@@ -638,6 +646,34 @@
       <view class="modal-buttons">
         <button class="btn-secondary modal-half-btn" bindtap="onCancelConfirm" hover-class="tap-active">取消</button>
         <button class="btn-primary modal-half-btn" style="background-color: {{confirmModalConfirmColor || '#ff4d4f'}};" bindtap="onConfirmModal" hover-class="tap-active">{{confirmModalConfirmText}}</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- S2-08（D-7）：我的文件（查看保留期 + 删除；在 page-root 外，不参与「我」页布局顺序） -->
+  <view wx:if="{{showMyFiles}}" class="modal-mask {{myFilesClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCloseMyFiles">
+    <view class="modal-sheet myfiles-sheet" catchtap="noop">
+      <text class="title-medium" style="margin-bottom: 8rpx;">我的文件</text>
+      <text class="body-small" style="margin-bottom: 16rpx;">下列文件还在服务器上。删除后不可恢复；正在打印或排队的文件需等订单结束。</text>
+      <view wx:if="{{myFilesLoading && !myFiles.length}}" class="status-box">
+        <text class="status-text">加载中...</text>
+      </view>
+      <view wx:elif="{{!myFiles.length}}" class="status-box">
+        <text class="status-text">暂无文件</text>
+      </view>
+      <scroll-view wx:else scroll-y class="myfiles-list">
+        <view wx:for="{{myFiles}}" wx:key="file_id" class="myfile-row">
+          <view class="myfile-main">
+            <text class="myfile-name">{{item.original_name}}</text>
+            <text class="myfile-meta">{{item.sizeText}} · {{item.expireText}}</text>
+          </view>
+          <view wx:if="{{item.in_active_order}}" class="myfile-busy">打印中</view>
+          <view wx:else class="myfile-del" catchtap="onDeleteMyFile" data-id="{{item.file_id}}" data-name="{{item.original_name}}">删除</view>
+        </view>
+      </scroll-view>
+      <view wx:if="{{!myFilesLoading && myFilesTotal > myFiles.length}}" class="myfiles-more" bindtap="onLoadMoreMyFiles">加载更多（共 {{myFilesTotal}} 个）</view>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" bindtap="onCloseMyFiles" hover-class="tap-active">关闭</button>
       </view>
     </view>
   </view>

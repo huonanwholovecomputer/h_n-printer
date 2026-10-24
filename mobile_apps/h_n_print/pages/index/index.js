@@ -220,6 +220,14 @@ Component({
     coverPage: false,
     // 订单备注（选填，≤100 字）
     remark: '',
+    // S2-08（DS-19 / D-6 / D-7）：文件保留期（客户可选，服务端夹 1..168h）+ 隐私告知同意
+    retentionHours: 24,
+    retentionChoices: [{ hours: 1, label: '1 小时' }, { hours: 24, label: '24 小时' },
+                       { hours: 72, label: '3 天' }, { hours: 168, label: '7 天' }],
+    retentionMaxHours: 168,
+    privacyAgreed: false,
+    showPrivacyNotice: false,
+    privacyNoticeClosing: false,
     // 兜底单价（🔴-C3）：**必须与后端 printer-backend/pricing.json 逐值一致**。
     // 旧值是 0.2 / 0.3（比权威的 0.3 / 0.4 低 33%/25%）—— /api/pricing 拉不到时
     //「复制价格」写进剪贴板的就是低于实收的金额。pricingLoaded 也从"只写不读"改为真读。
@@ -297,6 +305,7 @@ Component({
       this._pollTimers = {}     // { fileUid: intervalId } — 页数轮询定时器（键=文件稳定 uid）
       this._fileUidSeq = 0      // 文件稳定身份自增序列（见 _fileUid / _fileIndexByUid）
       this._buildScheduleDays()
+      this.loadRetentionOptions()   // S2-08：保留期选项以服务端口径为准（失败用本地兜底）
       this.doLogin()
     },
     detached() {
@@ -526,6 +535,63 @@ Component({
       // 借轮询顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
       this.loadPricing(fin)
     },
+    // ==================== 文件保留与隐私（S2-08）====================
+
+    _retentionLabel(hours) {
+      const h = Number(hours) || 0
+      if (h <= 0) return '默认'
+      if (h < 24) return h + ' 小时'
+      if (h % 24 === 0) return (h / 24) + ' 天'
+      return h + ' 小时'
+    },
+
+    // 保留期选项来自 /api/retention_config（上限/默认/可选值由服务端定，客户端不硬编码口径）。
+    // 拿不到就保留 data 里的兜底四档 —— 界面永远有可选项，不会因为一次网络失败卡住下单。
+    loadRetentionOptions() {
+      request({
+        url: CONFIG.BASE_URL + '/api/retention_config',
+        method: 'GET',
+        success: (res) => {
+          const d = (res && res.data) || {}
+          if (res.statusCode !== 200 || !d.success || !Array.isArray(d.choices_hours)) return
+          const maxH = Number(d.max_retention_hours) || 168
+          const defH = Number(d.default_retention_hours) || 24
+          const choices = d.choices_hours
+            .map(h => Math.min(Number(h) || 0, maxH))
+            .filter(h => h > 0)
+            .map(h => ({ hours: h, label: this._retentionLabel(h) }))
+          if (!choices.length) return
+          const has = choices.some(c => c.hours === this.data.retentionHours)
+          this.setData({
+            retentionChoices: choices,
+            retentionMaxHours: maxH,
+            retentionHours: has ? this.data.retentionHours : Math.min(defH, maxH),
+          })
+        },
+        fail: () => {},
+      })
+    },
+
+    onSelectRetention(e) {
+      const h = Number(e.currentTarget.dataset.hours) || 0
+      if (h <= 0) return
+      this.setData({ retentionHours: h })
+    },
+
+    onTogglePrivacyAgree() {
+      this.setData({ privacyAgreed: !this.data.privacyAgreed })
+    },
+
+    onOpenPrivacyNotice() {
+      this.setData({ showPrivacyNotice: true, privacyNoticeClosing: false })
+    },
+
+    onClosePrivacyNotice() {
+      if (this.data.privacyNoticeClosing) return
+      this.setData({ privacyNoticeClosing: true })
+      setTimeout(() => this.setData({ showPrivacyNotice: false, privacyNoticeClosing: false }), 200)
+    },
+
     // ==================== 微信登录 ====================
 
     doLogin() {
@@ -1306,7 +1372,11 @@ Component({
         header: { 'Authorization': 'Bearer ' + token },
         // 带上当前选中的接单设备：Word/md 上传后要由某台设备下载+转 PDF 才能数页，
         // 优先让用户选的那台做（它才是订单的接管设备）；为空/离线时后端退回订单目标/任一在线接单设备
-        formData: { target_client_id: this.data.selectedDeviceId || '' },
+        // S2-08：同时带上当前保留期选择（提交时还会以最终选择再定稿一次）
+        formData: {
+          target_client_id: this.data.selectedDeviceId || '',
+          retention_hours: String(this.data.retentionHours || 0),
+        },
         success: (uploadRes) => {
           const entry = this._uploadTimers[fileUid]
           if (!entry || entry.cancelled) return  // 上传已被取消
@@ -3068,6 +3138,11 @@ Component({
 
     _doSubmit(skipPageValidation) {
       if (this.data.submitting) return   // 防连点：提交进行中直接忽略
+      // S2-08（DS-19）：隐私告知必须由顾客**主动勾选**后才提交（三个提交入口都经过这里）。
+      if (!this.data.privacyAgreed) {
+        wx.showToast({ title: '请先阅读并勾选《文件使用与隐私说明》', icon: 'none', duration: 2500 })
+        return
+      }
       const { selectedFiles } = this.data
       // 提交时跳过不支持格式（Excel/PPT/CAD），仅提交可打印文件
       const printableFiles = selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat)
@@ -3117,6 +3192,8 @@ Component({
           skip_page_validation: skipPageValidation ? 1 : 0,
           // 目标设备（多设备接单）：用户选择的接单设备，订单只发往该设备
           target_client_id: this.data.selectedDeviceId || '',
+          // S2-08：本单文件的保留期（提交时定稿；服务端夹到 1..168h）
+          retention_hours: Number(this.data.retentionHours) || 0,
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
           // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
           is_admin_print: (this.data.userRole === 'admin' && this.data.adminPrintEnabled) ? 1 : 0,
@@ -3146,6 +3223,8 @@ Component({
           this.setData({
             submitting: false,
             showSuccessModal: true,
+            // S2-08：同意是**逐单**的（下一单重新确认），不记住上次勾选
+            privacyAgreed: false,
             lastOrderNumber: submitRes.data.order_number || '',
             // 页数未完成计算（Word/md 等需本地转换的类型，接管设备离线时等不到）
             // → 弹窗内先亮出提示：此时价格无效，点「复制价格」会被拦下

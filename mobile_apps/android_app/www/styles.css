@@ -6343,3 +6343,183 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   color: var(--text-tertiary);
   text-align: center;
 }
+
+/* ==================== 文件保留与隐私（S2-08 / DS-19） ====================
+   对齐小程序 index.wxss 同名段：rpx → cqw（750 设计稿，1rpx ≈ 0.1333cqw） */
+.privacy-retention-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1.07cqw;
+}
+.privacy-retention-label {
+  font-size: 3.47cqw;
+  color: var(--text-secondary);
+}
+.privacy-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 1.6cqw;
+}
+.privacy-chip {
+  padding: 1.07cqw 2.67cqw;
+  border-radius: 99cqw;
+  font-size: 3.2cqw;
+  color: var(--text-secondary);
+  background: rgba(120, 120, 128, 0.12);
+}
+.privacy-chip-active {
+  color: #fff;
+  background: var(--blue);
+}
+.privacy-retention-hint {
+  display: block;
+  margin-top: 1.6cqw;
+  font-size: 2.93cqw;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+.privacy-consent-row {
+  display: flex;
+  align-items: center;
+  margin-top: 2.13cqw;
+}
+.privacy-checkbox {
+  width: 4.27cqw;
+  height: 4.27cqw;
+  margin-right: 1.33cqw;
+  border-radius: 1.07cqw;
+  border: 0.27cqw solid rgba(120, 120, 128, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.privacy-checked {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+.privacy-check-mark {
+  font-size: 2.93cqw;
+  line-height: 1;
+  color: #fff;
+}
+.privacy-consent-text {
+  font-size: 3.2cqw;
+  color: var(--text-secondary);
+}
+.privacy-link {
+  margin-left: 0.53cqw;
+  font-size: 3.2cqw;
+  color: var(--blue);
+}
+.privacy-notice-sheet {
+  max-height: 72vh;
+}
+.privacy-notice-heading {
+  margin-bottom: 2.13cqw;
+}
+.privacy-notice-body {
+  max-height: 50vh;
+  overflow-y: auto;
+}
+.privacy-notice-section {
+  margin-bottom: 2.67cqw;
+}
+.privacy-notice-title {
+  display: block;
+  margin-bottom: 0.8cqw;
+  font-size: 3.47cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* ==================== 我的文件（S2-08 / D-7） ==================== */
+.myfiles-entry {
+  display: flex;
+  align-items: center;
+  margin: 0.53cqw 0 2.67cqw;
+  padding: 2.67cqw 3.2cqw;
+  border-radius: 2.67cqw;
+  background: rgba(120, 120, 128, 0.10);
+}
+.myfiles-entry-icon {
+  margin-right: 1.6cqw;
+  font-size: 4cqw;
+}
+.myfiles-entry-text {
+  font-size: 3.73cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.myfiles-entry-desc {
+  flex: 1;
+  margin-left: 1.6cqw;
+  font-size: 2.93cqw;
+  color: var(--text-tertiary);
+}
+.myfiles-entry-arrow {
+  font-size: 4.27cqw;
+  color: var(--text-tertiary);
+}
+.myfiles-sheet {
+  max-height: 76vh;
+}
+.myfiles-title {
+  display: block;
+  margin-bottom: 1.07cqw;
+}
+.myfiles-hint {
+  display: block;
+  margin-bottom: 2.13cqw;
+}
+.myfiles-list {
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.myfile-row {
+  display: flex;
+  align-items: center;
+  padding: 2.4cqw 0;
+  border-bottom: 0.13cqw solid rgba(120, 120, 128, 0.18);
+}
+.myfile-main {
+  flex: 1;
+  min-width: 0;
+}
+.myfile-name {
+  display: block;
+  font-size: 3.47cqw;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.myfile-meta {
+  display: block;
+  margin-top: 0.53cqw;
+  font-size: 2.8cqw;
+  color: var(--text-tertiary);
+}
+.myfile-del {
+  margin-left: 2.13cqw;
+  padding: 1.07cqw 2.67cqw;
+  border-radius: 99cqw;
+  font-size: 3.07cqw;
+  color: #FF3B30;
+  background: rgba(255, 59, 48, 0.12);
+}
+.myfile-busy {
+  margin-left: 2.13cqw;
+  padding: 1.07cqw 2.13cqw;
+  border-radius: 99cqw;
+  font-size: 2.8cqw;
+  color: var(--text-tertiary);
+  background: rgba(120, 120, 128, 0.14);
+}
+.myfiles-more {
+  padding: 2.13cqw 0;
+  text-align: center;
+  font-size: 3.07cqw;
+  color: var(--blue);
+}

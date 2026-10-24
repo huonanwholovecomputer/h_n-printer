@@ -1701,3 +1701,88 @@ picker-view-column {
   color: var(--text-tertiary);
   text-align: center;
 }
+
+/* ==================== 文件保留与隐私（S2-08 / DS-19） ==================== */
+.privacy-retention-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8rpx;
+}
+.privacy-retention-label {
+  font-size: 26rpx;
+  color: var(--text-secondary);
+}
+.privacy-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12rpx;
+}
+.privacy-chip {
+  padding: 8rpx 20rpx;
+  border-radius: 999rpx;
+  font-size: 24rpx;
+  color: var(--text-secondary);
+  background: rgba(120, 120, 128, 0.12);
+}
+.privacy-chip-active {
+  color: #fff;
+  background: var(--blue);
+}
+.privacy-retention-hint {
+  display: block;
+  margin-top: 12rpx;
+  font-size: 22rpx;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+.privacy-consent-row {
+  display: flex;
+  align-items: center;
+  margin-top: 16rpx;
+}
+.privacy-checkbox {
+  width: 32rpx;
+  height: 32rpx;
+  margin-right: 10rpx;
+  border-radius: 8rpx;
+  border: 2rpx solid rgba(120, 120, 128, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.privacy-checked {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+.privacy-check-mark {
+  font-size: 22rpx;
+  line-height: 1;
+  color: #fff;
+}
+.privacy-consent-text {
+  font-size: 24rpx;
+  color: var(--text-secondary);
+}
+.privacy-link {
+  margin-left: 4rpx;
+  font-size: 24rpx;
+  color: var(--blue);
+}
+.privacy-notice-sheet {
+  max-height: 72vh;
+}
+.privacy-notice-body {
+  max-height: 50vh;
+}
+.privacy-notice-section {
+  margin-bottom: 20rpx;
+}
+.privacy-notice-title {
+  display: block;
+  margin-bottom: 6rpx;
+  font-size: 26rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}

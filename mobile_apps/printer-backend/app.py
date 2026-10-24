@@ -5748,6 +5748,89 @@ def delete_my_file(file_id):
     return jsonify({"success": True, "file_id": file_id, "message": "已删除"})
 
 
+@app.route("/api/my_files", methods=["GET"])
+@login_required
+def list_my_files():
+    """我的文件（S2-08 / D-7）：供「删除我的文件」入口使用。
+
+    · 只回**自己的**行（openid 一致），已过期/已清理（path=''）的不回；
+    · `in_active_order`：仍被排队/打印中的订单引用 ⇒ 前端把「删除」置灰
+      （服务端 DELETE 也会再判一次，返回 409）；
+    · `retention_hours` / `auto_delete_at`：把"保留期"变成顾客看得见的事实
+      （行上没选过就按全局默认；全局设成"永不过期"时 `auto_delete_at` 为空）。
+    """
+    if not _rate_limit_ok(f"my_files:{g.openid}", 60, 60):
+        return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = max(1, min(50, request.args.get("per_page", 20, type=int)))
+    offset = (page - 1) * per_page
+
+    cfg = load_retention_config()
+    global_hours = int(cfg.get("days", 0) or 0) * 24 + int(cfg.get("hours", 0) or 0)
+
+    conn = get_db()
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE openid = ? AND path != ''", (g.openid,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            """SELECT id, original_name, size, created_at, page_count, retention_hours
+               FROM files WHERE openid = ? AND path != ''
+               ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+            (g.openid, per_page, offset),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        busy_ids = set()
+        if ids:
+            _ph = ",".join("?" for _ in ids)
+            active_statuses = ('queued', 'printing', 'accepted', 'reserved',
+                               'scheduled', 'waiting', 'downloading')
+            _sp = ",".join("?" for _ in active_statuses)
+            for r in conn.execute(
+                f"SELECT DISTINCT file_id FROM order_files WHERE file_id IN ({_ph}) "
+                f"AND status IN ({_sp})", (*ids, *active_statuses)).fetchall():
+                if r["file_id"]:
+                    busy_ids.add(r["file_id"])
+            # 旧数据（没有 order_files）退化按父单引用判断
+            for r in conn.execute(
+                f"SELECT DISTINCT file_id FROM orders WHERE file_id IN ({_ph}) "
+                f"AND status IN ({_sp})", (*ids, *active_statuses)).fetchall():
+                if r["file_id"]:
+                    busy_ids.add(r["file_id"])
+    finally:
+        conn.close()
+
+    out = []
+    for r in rows:
+        own_hours = int(r["retention_hours"] or 0)
+        eff_hours = own_hours if own_hours > 0 else global_hours
+        auto_delete_at = ""
+        if eff_hours > 0 and r["created_at"]:
+            try:
+                auto_delete_at = (datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
+                                  + timedelta(hours=eff_hours)).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                auto_delete_at = ""
+        out.append({
+            "file_id": r["id"],
+            "original_name": r["original_name"],
+            "size": int(r["size"] or 0),
+            "page_count": int(r["page_count"] or 0),
+            "created_at": r["created_at"],
+            "retention_hours": eff_hours,
+            "auto_delete_at": auto_delete_at,
+            "in_active_order": r["id"] in busy_ids,
+        })
+    return jsonify({
+        "success": True,
+        "files": out,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "has_more": (page * per_page) < total,
+    })
+
+
 @app.route("/api/login", methods=["POST"])
 def wx_login():
     """微信小程序登录：用 code 换取 openid 并返回 token"""
@@ -6780,6 +6863,11 @@ def submit_order():
         if _fid not in (None, "") and not isinstance(_fid, str):
             return jsonify({"success": False, "message": "file_id 不合法"}), 400
 
+    # S2-08（D-6）：客户在下单页选的「文件保留时长」。上传发生在选文件当下、保留期却可能在
+    # 提交前才改，所以**以提交时为准**：写事务里把本单全部文件的 retention_hours 统一改写
+    # （只动自己名下的行；钳到 1..168；0/非法 = 不动，继续用上传时或全局默认）。
+    order_retention_hours = _clamp_retention_hours(data.get("retention_hours"))
+
     user_is_admin = (g.user_role == "admin")
     # v24.1：管理员自行打印标记（仅管理员可设置；非管理员一律强制 0，防止伪造）
     admin_print = 1 if (user_is_admin and data.get("is_admin_print")) else 0
@@ -6917,10 +7005,20 @@ def submit_order():
                 "reject_reason": item["reject_reason"],
             })
 
+        # S2-08（D-6）：本单文件的保留期以提交时的选择定稿（文件是先上传、后选保留期的）。
+        # 只 UPDATE（不读盘，符合 S2-02 对写事务的约束）；只动自己名下的文件。
+        if order_retention_hours > 0:
+            _ret_ids = [it["file_id"] for it in file_plan if it.get("file_id")]
+            if _ret_ids:
+                _rph = ",".join("?" for _ in _ret_ids)
+                conn.execute(
+                    f"UPDATE files SET retention_hours = ? WHERE openid = ? AND id IN ({_rph})",
+                    [order_retention_hours, g.openid] + _ret_ids,
+                )
+
         # 汇总父订单 total_price 和 page_count
         parent_base_price = sum(st["total_price"] for st in sub_tasks)
         parent_page_count = sum(st["page_count"] * st["copies"] for st in sub_tasks)
-
         # 计算最终价格 = 基础打印费 + 附加服务费
         urgency_fee = urgency_price if urgency_price else 0
         cover_fee = round(cover_page_price * cover_page, 2) if cover_page else 0

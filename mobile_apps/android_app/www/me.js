@@ -49,6 +49,11 @@ const meState = {
   expandedOrders: {},
   showLicenseDetail: false,
   loadingOrders: false,
+  // S2-08（D-7）：「我的文件」弹窗（查看保留期 + 删除自己的文件）
+  myFiles: [],
+  myFilesPage: 0,
+  myFilesTotal: 0,
+  myFilesLoading: false,
   _lastDataLoad: 0,
   _orderPollTimer: null,
   _keyPollTimer: null,
@@ -78,6 +83,7 @@ const meState = {
 
 function initMePage() {
   setupMeButtons();
+  setupMyFiles();
   refreshMeUI();
   loadOrders();
 }
@@ -2351,6 +2357,116 @@ function stopUserOrdersPolling() {
     clearInterval(_userOrdersPollTimer);
     _userOrdersPollTimer = null;
   }
+}
+
+/* ================= 我的文件（S2-08 / D-7） =================
+   删除我的文件入口：GET /api/my_files 列出自己的文件（含保留期与到期时间），
+   DELETE /api/file/<id> 真正删除（服务端再判属主/活跃订单，409 时提示等订单结束）。 */
+
+function setupMyFiles() {
+  const list = document.getElementById('myFilesList');
+  if (!list || list._wired) return;
+  list._wired = true;
+  list.addEventListener('click', (e) => {
+    const del = e.target && e.target.closest ? e.target.closest('.myfile-del') : null;
+    if (!del) return;
+    deleteMyFile(del.dataset.fileId, del.dataset.fileName);
+  });
+}
+
+function openMyFiles() {
+  openModal('myFilesModal');
+  loadMyFiles(true);
+}
+
+function fmtMyFileSize(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function decorateMyFile(f) {
+  const hours = Number(f.retention_hours) || 0;
+  const retentionText = hours > 0
+    ? ('保留 ' + (hours >= 24 && hours % 24 === 0 ? (hours / 24) + ' 天' : hours + ' 小时'))
+    : '不自动删除';
+  return Object.assign({}, f, {
+    sizeText: fmtMyFileSize(f.size),
+    expireText: f.auto_delete_at ? ('将于 ' + f.auto_delete_at + ' 自动删除') : retentionText,
+  });
+}
+
+function loadMyFiles(reset) {
+  if (meState.myFilesLoading && !reset) return;
+  const page = reset ? 1 : (meState.myFilesPage || 0) + 1;
+  meState.myFilesLoading = true;
+  renderMyFiles();
+  api('/api/my_files?page=' + page + '&per_page=20').then(r => {
+    meState.myFilesLoading = false;
+    const d = (r && r.data) || {};
+    if (!(r.status === 200 && d.success)) {
+      showToast((d && d.message) || '加载失败，请重试');
+      renderMyFiles();
+      return;
+    }
+    const files = (d.files || []).map(decorateMyFile);
+    meState.myFiles = reset ? files : (meState.myFiles || []).concat(files);
+    meState.myFilesPage = page;
+    meState.myFilesTotal = Number(d.total) || files.length;
+    renderMyFiles();
+  }).catch(() => {
+    meState.myFilesLoading = false;
+    showToast('网络异常，请重试');
+    renderMyFiles();
+  });
+}
+
+function loadMoreMyFiles() {
+  loadMyFiles(false);
+}
+
+function renderMyFiles() {
+  const list = document.getElementById('myFilesList');
+  const loading = document.getElementById('myFilesLoading');
+  const empty = document.getElementById('myFilesEmpty');
+  const more = document.getElementById('myFilesMore');
+  if (!list) return;
+  if (loading) loading.style.display = (meState.myFilesLoading && !meState.myFiles.length) ? '' : 'none';
+  if (empty) empty.style.display = (!meState.myFilesLoading && !meState.myFiles.length) ? '' : 'none';
+  list.innerHTML = meState.myFiles.map(f => {
+    const action = f.in_active_order
+      ? '<text class="myfile-busy">打印中</text>'
+      : '<text class="myfile-del" data-file-id="' + escHtml(f.file_id) + '" data-file-name="' +
+        escHtml(f.original_name || '') + '">删除</text>';
+    return '<view class="myfile-row">' +
+      '<view class="myfile-main">' +
+        '<text class="myfile-name">' + escHtml(f.original_name || '未命名文件') + '</text>' +
+        '<text class="myfile-meta">' + escHtml(f.sizeText + ' · ' + f.expireText) + '</text>' +
+      '</view>' + action + '</view>';
+  }).join('');
+  if (more) {
+    more.style.display = (!meState.myFilesLoading && meState.myFilesTotal > meState.myFiles.length) ? '' : 'none';
+    more.textContent = '加载更多（共 ' + meState.myFilesTotal + ' 个）';
+  }
+}
+
+function deleteMyFile(fileId, name) {
+  if (!fileId) return;
+  showConfirm('删除文件', '确定删除「' + (name || '该文件') + '」吗？删除后不可恢复。', '删除', '#FF3B30', () => {
+    showToast('删除中...', 1500);
+    api('/api/file/' + encodeURIComponent(fileId), { method: 'DELETE' }).then(r => {
+      const d = (r && r.data) || {};
+      if (r.status === 200 && d.success) {
+        meState.myFiles = (meState.myFiles || []).filter(f => f.file_id !== fileId);
+        meState.myFilesTotal = Math.max(0, (Number(meState.myFilesTotal) || 1) - 1);
+        renderMyFiles();
+        showToast('已删除');
+      } else {
+        showToast((d && d.message) || '删除失败，请稍后重试', 2500);
+      }
+    }).catch(() => showToast('网络异常，请重试'));
+  });
 }
 
 /* ================= 启动 ================= */

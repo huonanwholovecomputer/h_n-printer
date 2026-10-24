@@ -193,6 +193,24 @@
             </view>
           </view>
 
+          <!-- 文件保留与隐私（S2-08 / DS-19 / D-6 / D-7）：保留期可选 + 使用说明 + 下单前确认 -->
+          <view class="card privacy-card">
+            <view class="section-header inline-header">
+              <view class="section-header-bar"></view>
+              <text class="section-header-title">文件保留与隐私</text>
+            </view>
+            <view class="privacy-retention-row">
+              <text class="privacy-retention-label">文件保留</text>
+              <view class="privacy-chips" id="retentionChips"></view>
+            </view>
+            <text class="privacy-retention-hint" id="retentionHintText">到期后服务器自动删除（最长 168 小时）；也可在「我 → 我的文件」随时删除。</text>
+            <view class="privacy-consent-row" id="privacyConsentRow">
+              <view class="privacy-checkbox" id="privacyCheckbox"><text class="privacy-check-mark" id="privacyCheckMark" style="display:none">✓</text></view>
+              <text class="privacy-consent-text">我已阅读并同意</text>
+              <text class="privacy-link" onclick="openPrivacyNotice()">《文件使用与隐私说明》</text>
+            </view>
+          </view>
+
           <!-- 提交 -->
           <view class="submit-area card-preload" id="submitArea">
             <button class="btn-primary" id="submitBtn">提交打印任务</button>
@@ -291,6 +309,14 @@
               <view class="section-bar"></view>
               <text>我的打印任务</text>
               <text class="order-count" id="orderCountBadge" style="display:none">0</text>
+            </view>
+
+            <!-- S2-08（D-7）：我的文件 —— 查看保留期、删除自己的文件（接 S1-03 的 DELETE /api/file） -->
+            <view class="myfiles-entry" onclick="openMyFiles()">
+              <text class="myfiles-entry-icon">🗂</text>
+              <text class="myfiles-entry-text">我的文件</text>
+              <text class="myfiles-entry-desc">查看保留期、删除自己的文件</text>
+              <text class="myfiles-entry-arrow">›</text>
             </view>
 
             <view class="orders-pagination-bar" id="ordersPager" style="display:none">
@@ -651,6 +677,49 @@
   <button class="theme-toggle-btn" id="themeToggle" data-hover="tp-pressing" style="display:none"><span class="theme-toggle-icon">🌓</span></button>
 
   <!-- ===== 成功弹窗 ===== -->
+  <!-- S2-08：文件使用与隐私说明 -->
+  <view class="modal-mask" id="privacyNoticeModal" style="display:none">
+    <view class="modal-sheet privacy-notice-sheet">
+      <text class="title-medium privacy-notice-heading">文件使用与隐私说明</text>
+      <view class="privacy-notice-body">
+        <view class="privacy-notice-section">
+          <text class="privacy-notice-title">用途</text>
+          <text class="body-small">你上传的文件只用于本次打印：由本店打印终端下载后直接打印，不做其他用途。</text>
+        </view>
+        <view class="privacy-notice-section">
+          <text class="privacy-notice-title">保留期限</text>
+          <text class="body-small">下单时可选 1 小时 / 24 小时 / 3 天 / 7 天，到期后服务器自动删除；最长不超过 168 小时。你也可以在「我 → 我的文件」提前删除（正在打印或排队的文件需等订单结束）。</text>
+        </view>
+        <view class="privacy-notice-section">
+          <text class="privacy-notice-title">第三方</text>
+          <text class="body-small">登录使用微信（openid）；APP 更新安装包经腾讯云 COS 分发。除完成打印所必需的上述环节外，文件不会主动提供给第三方。</text>
+        </view>
+        <view class="privacy-notice-section">
+          <text class="privacy-notice-title">你的权利</text>
+          <text class="body-small">可随时查看并删除自己的文件；删除后不可恢复。</text>
+        </view>
+      </view>
+      <view class="modal-buttons">
+        <button class="btn-primary modal-half-btn" onclick="closeModal('privacyNoticeModal')">我知道了</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- S2-08（D-7）：我的文件（查看保留期 + 删除；在「我」页布局区之外） -->
+  <view class="modal-mask" id="myFilesModal" style="display:none">
+    <view class="modal-sheet myfiles-sheet">
+      <text class="title-medium myfiles-title">我的文件</text>
+      <text class="body-small myfiles-hint">下列文件还在服务器上。删除后不可恢复；正在打印或排队的文件需等订单结束。</text>
+      <view id="myFilesLoading" class="status-box" style="display:none"><text class="status-text">加载中...</text></view>
+      <view id="myFilesEmpty" class="status-box" style="display:none"><text class="status-text">暂无文件</text></view>
+      <view class="myfiles-list" id="myFilesList"></view>
+      <view class="myfiles-more" id="myFilesMore" style="display:none" onclick="loadMoreMyFiles()">加载更多</view>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" onclick="closeModal('myFilesModal')">关闭</button>
+      </view>
+    </view>
+  </view>
+
   <view class="modal-mask" id="successModal" style="display:none">
     <view class="modal-sheet">
       <view class="modal-icon-wrap">✓</view>

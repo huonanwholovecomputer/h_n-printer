@@ -370,6 +370,30 @@
           </view>
         </view>
 
+        <!-- 文件保留与隐私（S2-08 / DS-19 / D-6 / D-7）：保留期可选 + 使用说明 + 下单前确认 -->
+        <view class="card privacy-card">
+          <view class="section-header inline-header">
+            <view class="section-header-bar"></view>
+            <text class="section-header-title">文件保留与隐私</text>
+          </view>
+          <view class="privacy-retention-row">
+            <text class="privacy-retention-label">文件保留</text>
+            <view class="privacy-chips">
+              <view wx:for="{{retentionChoices}}" wx:key="hours"
+                    class="privacy-chip {{retentionHours === item.hours ? 'privacy-chip-active' : ''}}"
+                    bindtap="onSelectRetention" data-hours="{{item.hours}}">{{item.label}}</view>
+            </view>
+          </view>
+          <text class="privacy-retention-hint">到期后服务器自动删除（最长 {{retentionMaxHours}} 小时）；也可在「我 → 我的文件」随时删除。</text>
+          <view class="privacy-consent-row" bindtap="onTogglePrivacyAgree">
+            <view class="privacy-checkbox {{privacyAgreed ? 'privacy-checked' : ''}}">
+              <text wx:if="{{privacyAgreed}}" class="privacy-check-mark">✓</text>
+            </view>
+            <text class="privacy-consent-text">我已阅读并同意</text>
+            <text class="privacy-link" catchtap="onOpenPrivacyNotice">《文件使用与隐私说明》</text>
+          </view>
+        </view>
+
         <!-- Submit Button -->
         <view class="submit-area {{entranceDone ? '' : (entered.submit ? 'entrance-play' : 'card-preload')}}">
           <button class="btn-primary" bindtap="onSubmit" hover-class="tap-active" loading="{{submitting}}" disabled="{{submitting}}">
@@ -380,6 +404,34 @@
       </view>
       <!-- 垫片（scrollPadHeight 现恒为 0）：容器自带底部 padding，文件列表为有界滚动，无需额外撑高 -->
       <view style="height: {{scrollPadHeight}}px; width: 100%; pointer-events: none;"></view>
+    </view>
+  </view>
+</view>
+
+<!-- Page Count Warning Modal -->
+<view wx:if="{{showPrivacyNotice}}" class="modal-mask {{privacyNoticeClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onClosePrivacyNotice">
+  <view class="modal-sheet privacy-notice-sheet" catchtap="noop">
+    <text class="title-medium" style="margin-bottom: 16rpx;">文件使用与隐私说明</text>
+    <scroll-view scroll-y class="privacy-notice-body">
+      <view class="privacy-notice-section">
+        <text class="privacy-notice-title">用途</text>
+        <text class="body-small">你上传的文件只用于本次打印：由本店打印终端下载后直接打印，不做其他用途。</text>
+      </view>
+      <view class="privacy-notice-section">
+        <text class="privacy-notice-title">保留期限</text>
+        <text class="body-small">下单时可选 1 小时 / 24 小时 / 3 天 / 7 天，到期后服务器自动删除；最长不超过 {{retentionMaxHours}} 小时。你也可以在「我 → 我的文件」提前删除（正在打印或排队的文件需等订单结束）。</text>
+      </view>
+      <view class="privacy-notice-section">
+        <text class="privacy-notice-title">第三方</text>
+        <text class="body-small">登录使用微信（openid）；APP 更新安装包经腾讯云 COS 分发。除完成打印所必需的上述环节外，文件不会主动提供给第三方。</text>
+      </view>
+      <view class="privacy-notice-section">
+        <text class="privacy-notice-title">你的权利</text>
+        <text class="body-small">可随时查看并删除自己的文件；删除后不可恢复。</text>
+      </view>
+    </scroll-view>
+    <view class="modal-buttons">
+      <button class="btn-primary modal-half-btn" bindtap="onClosePrivacyNotice" hover-class="tap-active">我知道了</button>
     </view>
   </view>
 </view>

@@ -39,6 +39,12 @@ const printState = {
   urgencyPrice: 0,
   coverPage: false,
   remark: '',               // 订单备注（选填，≤100 字）
+  // S2-08（DS-19 / D-6 / D-7）：文件保留期（客户可选，服务端夹 1..168h）+ 隐私告知同意
+  retentionHours: 24,
+  retentionChoices: [{ hours: 1, label: '1 小时' }, { hours: 24, label: '24 小时' },
+                     { hours: 72, label: '3 天' }, { hours: 168, label: '7 天' }],
+  retentionMaxHours: 168,
+  privacyAgreed: false,
   simplexPrice: FALLBACK_SIMPLEX_PRICE,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
   duplexPrice: FALLBACK_DUPLEX_PRICE,     // 双面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
   coverPagePrice: FALLBACK_COVER_PAGE_PRICE,
@@ -122,6 +128,8 @@ function initPrintPage() {
   setupFileInput();
   setupPrintButtons();
   loadPricing();
+  loadRetentionOptions();   // S2-08：保留期选项以服务端口径为准（失败用本地兜底）
+  setupPrivacyConsent();
   // 每 5 分钟顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致。
   // S1-09：自调度（上一轮落定后才排下一轮；失败 1.5× 退避、成功恢复 5 分钟基线）
   pricingPoll = _pollScheduler(async () => {
@@ -138,6 +146,88 @@ function initPrintPage() {
 function onPrintTabShown() {
   refreshPrintRoleUI();
   scheduleMeasureSoon();
+}
+
+/* ================= 文件保留与隐私（S2-08 / DS-19 / D-6 / D-7） =================
+   保留期选项来自 /api/retention_config（上限/默认/可选值由服务端定，客户端不硬编码口径）；
+   拿不到就保留内置四档 —— 界面永远有得选，不会因为一次网络失败卡住下单。
+   提交时把最终选择随订单一起发（服务端以提交时为准），上传时也带一份供立即删除使用。 */
+function retentionLabel(hours) {
+  const h = Number(hours) || 0;
+  if (h <= 0) return '默认';
+  if (h < 24) return h + ' 小时';
+  if (h % 24 === 0) return (h / 24) + ' 天';
+  return h + ' 小时';
+}
+
+async function loadRetentionOptions() {
+  try {
+    const r = await api('/api/retention_config');
+    const d = (r && r.data) || {};
+    if (!(r.status === 200 && d.success && Array.isArray(d.choices_hours))) return;
+    const maxH = Number(d.max_retention_hours) || 168;
+    const defH = Number(d.default_retention_hours) || 24;
+    const choices = d.choices_hours
+      .map(h => Math.min(Number(h) || 0, maxH))
+      .filter(h => h > 0)
+      .map(h => ({ hours: h, label: retentionLabel(h) }));
+    if (!choices.length) return;
+    printState.retentionChoices = choices;
+    printState.retentionMaxHours = maxH;
+    if (!choices.some(c => c.hours === printState.retentionHours)) {
+      printState.retentionHours = Math.min(defH, maxH);
+    }
+    renderRetentionChips();
+  } catch (e) { /* 保留内置四档 */ }
+}
+
+function renderRetentionChips() {
+  const box = document.getElementById('retentionChips');
+  if (!box) return;
+  box.innerHTML = printState.retentionChoices.map(c =>
+    '<view class="privacy-chip' + (c.hours === printState.retentionHours ? ' privacy-chip-active' : '') +
+    '" onclick="selectRetention(' + c.hours + ')">' + escHtml(c.label) + '</view>').join('');
+  const hint = document.getElementById('retentionHintText');
+  if (hint) {
+    hint.textContent = '到期后服务器自动删除（最长 ' + printState.retentionMaxHours + ' 小时）；也可在「我 → 我的文件」随时删除。';
+  }
+}
+
+function selectRetention(hours) {
+  const h = Number(hours) || 0;
+  if (h <= 0) return;
+  printState.retentionHours = h;
+  renderRetentionChips();
+}
+
+function setupPrivacyConsent() {
+  const row = document.getElementById('privacyConsentRow');
+  if (row && !row._wired) {
+    row._wired = true;
+    row.addEventListener('click', (e) => {
+      // 点「《文件使用与隐私说明》」只打开说明，不改变勾选
+      if (e.target && e.target.closest && e.target.closest('.privacy-link')) return;
+      togglePrivacyAgree();
+    });
+  }
+  renderRetentionChips();
+  syncPrivacyCheckbox();
+}
+
+function togglePrivacyAgree() {
+  printState.privacyAgreed = !printState.privacyAgreed;
+  syncPrivacyCheckbox();
+}
+
+function syncPrivacyCheckbox() {
+  const box = document.getElementById('privacyCheckbox');
+  const mark = document.getElementById('privacyCheckMark');
+  if (box) box.classList.toggle('privacy-checked', !!printState.privacyAgreed);
+  if (mark) mark.style.display = printState.privacyAgreed ? '' : 'none';
+}
+
+function openPrivacyNotice() {
+  openModal('privacyNoticeModal');
 }
 
 let _printEntrancePlayed = false;
@@ -852,6 +942,8 @@ function uploadFile(idx) {
   // 带上当前选中的接单设备：Word/md 上传后要由某台设备下载+转 PDF 才能数页，
   // 优先让用户选的那台做（它才是订单的接管设备）；为空/离线时后端退回订单目标/任一在线接单设备
   fd.append('target_client_id', (typeof selectedDeviceId !== 'undefined' && selectedDeviceId) ? selectedDeviceId : '');
+  // S2-08：带上当前保留期选择（提交时还会以最终选择再定稿一次）
+  fd.append('retention_hours', String(printState.retentionHours || 0));
   xhr.upload.onprogress = (e) => {
     if (e.lengthComputable) entry.realProgress = Math.round(e.loaded / e.total * 100);
   };
@@ -1879,6 +1971,11 @@ function onSubmit() {
 
 function doSubmit(skipPageValidation) {
   if (printState.submitting) return;
+  // S2-08（DS-19）：隐私告知必须由顾客**主动勾选**后才提交（三个提交入口都经过这里）
+  if (!printState.privacyAgreed) {
+    showToast('请先阅读并勾选《文件使用与隐私说明》', 2500);
+    return;
+  }
   const printable = printState.selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat);
   printState.submitting = true;
   const btn = document.getElementById('submitBtn');
@@ -1918,6 +2015,8 @@ function doSubmit(skipPageValidation) {
       skip_page_validation: skipPageValidation ? 1 : 0,
       // 目标设备（多设备接单）：用户选择的接单设备，订单只发往该设备
       target_client_id: (typeof selectedDeviceId !== 'undefined') ? (selectedDeviceId || '') : '',
+      // S2-08：本单文件的保留期（提交时定稿；服务端夹到 1..168h）
+      retention_hours: Number(printState.retentionHours) || 0,
       auto_print: printState.autoPrintEnabled ? 1 : 0,
       // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
       is_admin_print: (state.role === 'admin' && printState.adminPrintEnabled) ? 1 : 0,
@@ -1965,6 +2064,9 @@ function clearFilesAfterSuccess() {
   // 计时器按文件对象停（旧实现遍历索引表，与文件对象已解耦 → 会漏停/错停）
   printState.selectedFiles.forEach(f => { stopPageCountPoll(f); stopUploadTimer(f); });
   printState.selectedFiles = [];
+  // S2-08：隐私同意是**逐单**的（下一单重新确认），不记住上次勾选
+  printState.privacyAgreed = false;
+  if (typeof syncPrivacyCheckbox === 'function') syncPrivacyCheckbox();
   // 订单发起后清空备注（与文件列表同步复位，输入框高度/计数回到初始状态）
   printState.remark = '';
   const remarkInput = document.getElementById('remarkInput');
