@@ -701,7 +701,8 @@ def _md5_entry_get(index, md5):
     return val
 
 
-def _md5_entry_set(index, md5, path=None, original_name=None, page_count=None, page_count_verified=None):
+def _md5_entry_set(index, md5, path=None, original_name=None, page_count=None,
+                   page_count_verified=None, openid=None):
     """写入/更新 MD5 条目，自动升级旧格式。返回更新后的 index。"""
     existing = index.get(md5)
     if isinstance(existing, str):
@@ -716,6 +717,8 @@ def _md5_entry_set(index, md5, path=None, original_name=None, page_count=None, p
         existing["page_count"] = page_count
     if page_count_verified is not None:
         existing["page_count_verified"] = page_count_verified
+    if openid is not None:
+        existing["openid"] = openid
     index[md5] = existing
     return index
 
@@ -726,6 +729,67 @@ def _md5_entry_has_verified_count(index, md5):
     if not entry:
         return False
     return entry.get("page_count", 0) > 0 and entry.get("page_count_verified", False)
+
+
+def _cached_verified_page_count(file_md5, openid, md5_index=None):
+    """按 MD5 取「已验证页数」缓存（S2-05）。**只认同一属主**的缓存。
+
+    为什么要有 files 表这条兜底：MD5 索引条目是"md5 → 某一个副本的路径 + 页数"，
+    副本被属主删除或过期清理时该条目会被摘掉 —— 但"这版文档共几页"是**内容属性**，
+    与哪一个副本还在无关。以前只认索引 ⇒ 删掉一个副本就把页数缓存一起忘了，
+    后来者重新上传同一版 Word 又要等设备重新分析（顾客多等一轮、多一次下载转换）。
+
+    为什么限定 openid（DS-14 的存在性预言机）：跨用户复用页数缓存会让"上传即拿到页数"
+    与"上传后要等设备分析"形成可观测差异 —— 攻击者拿一份候选文档来试，就能判断
+    "这份内容是否已经在系统里被别人传过"（`reused` 字段虽然拆了，这条旁路会重新打开）。
+    只认自己的缓存后，第二个用户上传同一内容与上传全新内容的响应完全一致。
+    """
+    if not file_md5 or not openid:
+        return 0
+    idx = md5_index if md5_index is not None else load_md5_index()
+    entry = _md5_entry_get(idx, file_md5) or {}
+    try:
+        if (entry.get("openid") == openid and entry.get("page_count_verified")
+                and int(entry.get("page_count") or 0) > 0):
+            return int(entry["page_count"])
+    except (TypeError, ValueError):
+        pass
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT page_count FROM files WHERE md5 = ? AND openid = ? AND page_count_verified = 1 "
+            "AND page_count > 0 ORDER BY created_at DESC LIMIT 1",
+            (file_md5, openid),
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row["page_count"]) if row else 0
+
+
+def _path_reference_index(conn):
+    """S2-05：物理路径 → 仍指向它的 files 行 id 集合（批量删除时用一次扫描）。
+
+    新上传每行都有**自己的副本**，正常情况下一个路径只对应一行；本索引主要给存量数据
+    兜底：历史 MD5 去重让多行共享同一物理文件，任一行到期都不能把别人的文件带走。
+    """
+    refs = {}
+    for row in conn.execute("SELECT id, path FROM files WHERE path != ''"):
+        p = row["path"]
+        if not p:
+            continue
+        refs.setdefault(os.path.normpath(p), set()).add(row["id"])
+    return refs
+
+
+def _path_shared_by_others(conn, file_path, file_id):
+    """该物理路径是否仍被**其它** files 行引用（单行删除用；批量见 _path_reference_index）。"""
+    if not file_path:
+        return False
+    norm = os.path.normpath(file_path)
+    for row in conn.execute("SELECT id, path FROM files WHERE path != '' AND id != ?", (file_id,)):
+        if row["path"] and os.path.normpath(row["path"]) == norm:
+            return True
+    return False
 
 
 def build_md5_index():
@@ -870,6 +934,9 @@ def cleanup_expired_files():
             if _p:
                 active_paths.add(os.path.normpath(_p))
 
+    # S2-05（DS-14）：路径 → 仍引用它的行集合。一次扫描，循环里只做集合判断。
+    path_refs = _path_reference_index(conn)
+
     # ---- 幽灵记录清理（不受保留期限制）----
     ghost_ids = []
     for (fid, fpath) in conn.execute("SELECT id, path FROM files").fetchall():
@@ -916,6 +983,7 @@ def cleanup_expired_files():
     md5_index = load_md5_index()
     deleted_count = 0
     skipped_active = 0
+    shared_skipped = 0
 
     for row in rows:
         file_id = row["id"]
@@ -930,6 +998,21 @@ def cleanup_expired_files():
         if file_path and os.path.normpath(file_path) in active_paths:
             skipped_active += 1
             continue
+
+        # S2-05（DS-14）存量共享文件保护：本行到期，但仍有**别的行**指向同一物理路径
+        # （历史 MD5 去重的产物）⇒ 只清自己的这一行、**绝不删盘**：另一方（保留期更长、
+        # 还没到期）还要下载，删掉就是"一方到期把另一方文件弄悬空"。等最后一个引用它的
+        # 行也到期时，才会走下面的正常删除分支。
+        _norm_path = os.path.normpath(file_path) if file_path else ""
+        _ref_ids = path_refs.get(_norm_path) if _norm_path else None
+        if _ref_ids and len(_ref_ids - {file_id}) > 0:
+            conn.execute("UPDATE files SET path = '', size = 0 WHERE id = ?", (file_id,))
+            _ref_ids.discard(file_id)
+            deleted_count += 1
+            shared_skipped += 1
+            continue
+        if _ref_ids is not None:
+            _ref_ids.discard(file_id)
 
         # 删除磁盘文件
         if file_path and os.path.exists(file_path):
@@ -959,6 +1042,8 @@ def cleanup_expired_files():
 
     if skipped_active > 0:
         print(f"  [CLEANUP] 已跳过 {skipped_active} 个活跃订单引用的过期文件")
+    if shared_skipped > 0:
+        print(f"  [CLEANUP] {shared_skipped} 个过期行与其它行共享物理文件：只清记录，文件保留给另一方")
     if deleted_count > 0:
         save_md5_index(md5_index)
         print(f"  [CLEANUP] 已清理 {deleted_count} 个过期文件（cutoff={cutoff_str}）")
@@ -4730,14 +4815,15 @@ def on_page_count_result(data):
             (file_id,),
         )
     # 同步更新 MD5 索引：下次同 MD5 文件上传直接复用页数，无需再次分析
-    row = conn.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
+    row = conn.execute("SELECT path, openid FROM files WHERE id = ?", (file_id,)).fetchone()
     conn.commit()
     conn.close()
     if row and row["path"] and os.path.exists(row["path"]):
         try:
             file_md5 = get_file_md5(row["path"])
             md5_index = load_md5_index()
-            _md5_entry_set(md5_index, file_md5, page_count=page_count, page_count_verified=True)
+            _md5_entry_set(md5_index, file_md5, page_count=page_count, page_count_verified=True,
+                           openid=row["openid"])
             save_md5_index(md5_index)
             print(f"  [PAGE] MD5 索引已更新: {file_md5[:8]}... → {page_count} 页")
         except Exception as e:
@@ -5627,20 +5713,26 @@ def delete_my_file(file_id):
             return jsonify({"success": False,
                             "message": "该文件正在被订单使用（排队/打印中），暂不能删除"}), 409
         path = row["path"] or ""
+        # S2-05（DS-14）：物理文件若还被**别的 files 行**引用（历史 MD5 去重的存量数据），
+        # 只删自己这一行、不删盘 —— 否则另一方当场悬空（下载 404、订单永久卡住）。
+        shared = _path_shared_by_others(conn, path, file_id)
         # 先删盘（失败只记日志：记录仍按"已删除"处理，避免留下永远删不掉的幽灵行）
-        if path and os.path.exists(path):
+        if path and not shared and os.path.exists(path):
             try:
                 os.remove(path)
             except OSError as e:
                 print(f"  [DEL] 删除文件失败 {_rel_display(path)}: {type(e).__name__}")
         conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
         conn.commit()
+        if shared:
+            print(f"  [DEL] 物理文件仍被其它记录引用，保留: {_rel_display(path)}")
     finally:
         conn.close()
 
-    # 从 MD5 索引里摘掉（同一物理文件可能被多行引用：只摘"指向该路径"的条目）
+    # 从 MD5 索引里摘掉（同一物理文件可能被多行引用：只摘"指向该路径"的条目；
+    # 共享时保留 —— 另一方还要靠它命中页数缓存，等最后一个引用消失时会自己过期）
     try:
-        if path:
+        if path and not shared:
             rel = os.path.relpath(path, UPLOAD_DIR)
             index = load_md5_index()
             dead = [k for k, v in index.items()
@@ -6342,7 +6434,8 @@ def upload_file():
             }), 400
 
     # 防滥用：每用户累计配额检查（含本次文件；超限拒绝并清理临时文件，防存储型 DDoS）。
-    # 注：MD5 复用文件也计入配额——同一文件被多个用户引用时各算一份，偏保守但更安全。
+    # 注：S2-05 起每个上传都落**自己的一份副本**（不再共享物理文件），所以"配额合计"
+    # 就是"实际磁盘占用"，口径一致。
     quota_bytes = _SECURITY["user_quota_mb"] * 1024 * 1024
     if quota_bytes > 0:
         conn = get_db()
@@ -6363,59 +6456,47 @@ def upload_file():
                 "used_mb": round(used / (1024 * 1024), 1),
             }), 413
 
-    # 2. 计算 MD5 并查重
+    # 2. 计算 MD5（S2-05 起**只**用于「已验证页数」缓存命中，不再共享物理文件）
     file_md5 = get_file_md5(temp_path)
     md5_index = load_md5_index()
     existing_entry = _md5_entry_get(md5_index, file_md5)
+    cached_page_count = _cached_verified_page_count(file_md5, g.openid, md5_index)
+    cached_page_verified = cached_page_count > 0
 
-    reused = False
-    cached_page_count = 0
-    cached_page_verified = False
-
+    # 索引条目指向的物理文件已丢失（属主删过/过期清理过）→ 只作废**这个条目**；
+    # 页数缓存另有 files 表兜底（见 _cached_verified_page_count），不会因为删了一个副本
+    # 就把"这版文档有几页"这个事实忘掉。
     if existing_entry:
-        existing_rel = existing_entry.get("path", "")
-        existing_path = os.path.join(UPLOAD_DIR, existing_rel) if existing_rel else ""
-        if existing_path and os.path.exists(existing_path):
-            # MD5 命中且文件存在 → 复用
-            os.remove(temp_path)
-            file_path = existing_path
-            file_size = os.path.getsize(file_path)
-            saved_name = os.path.basename(existing_path)
-            reused = True
-            # 读取缓存的页数
-            cached_page_count = existing_entry.get("page_count", 0) or 0
-            cached_page_verified = existing_entry.get("page_count_verified", False)
-            print(f"  [MD5] 文件复用: {_redact_filename(f.filename)} → {existing_rel} (MD5={file_md5[:8]}..."
-                  f"{', 页数已验证=' + str(cached_page_count) if cached_page_verified else ''})")
-        else:
-            # 索引记录存在但磁盘文件丢失 → 清理索引，走新文件保存
-            del md5_index[file_md5]
+        _stale_rel = existing_entry.get("path", "") or ""
+        _stale_abs = os.path.join(UPLOAD_DIR, _stale_rel) if _stale_rel else ""
+        if not _stale_abs or not os.path.exists(_stale_abs):
+            md5_index.pop(file_md5, None)
             save_md5_index(md5_index)
             existing_entry = None
-            print(f"  [MD5] 索引记录失效（文件丢失），重新保存: {existing_rel}")
+            print(f"  [MD5] 索引记录失效（文件丢失），改为保存新副本: {_stale_rel}")
 
-    if not reused:
-        # 3. 确定扩展名子目录，移动文件
-        subdir = get_ext_dir(ext_lower)
-        target_dir = os.path.join(UPLOAD_DIR, subdir)
-        os.makedirs(target_dir, exist_ok=True)
+    # 3. 确定扩展名子目录，把**本次上传**的文件移进去。
+    #    S2-05（DS-14）：每个上传都保存**自己的副本**，不再把新行指向别人的物理文件 ——
+    #    旧行为让多个 files 行共享同一路径，「任一行到期即删盘」会让另一方文件悬空
+    #    （下载 404、订单卡死），且 `reused:true` 变成"跨用户内容存在性"预言机。
+    subdir = get_ext_dir(ext_lower)
+    target_dir = os.path.join(UPLOAD_DIR, subdir)
+    os.makedirs(target_dir, exist_ok=True)
+    final_path = os.path.join(target_dir, saved_name)
+    if os.path.exists(final_path):
+        saved_name = f"{file_id}_{uuid.uuid4().hex[:6]}{ext}"
         final_path = os.path.join(target_dir, saved_name)
-        if os.path.exists(final_path):
-            saved_name = f"{file_id}_{uuid.uuid4().hex[:6]}{ext}"
-            final_path = os.path.join(target_dir, saved_name)
-        shutil.move(temp_path, final_path)
-        file_path = final_path
+    shutil.move(temp_path, final_path)
+    file_path = final_path
 
-        # 4. 更新 MD5 索引（新格式：含原始文件名）
-        rel_path = os.path.relpath(file_path, UPLOAD_DIR)
-        _md5_entry_set(md5_index, file_md5, path=rel_path, original_name=f.filename,
-                        page_count=0, page_count_verified=False)
-        save_md5_index(md5_index)
-        print(f"  [MD5] 新增索引: {file_md5[:8]}... → {rel_path}")
-    else:
-        # 更新 MD5 索引中的原始文件名（可能不同用户上传了不同命名的同一文件）
-        _md5_entry_set(md5_index, file_md5, original_name=f.filename)
-        save_md5_index(md5_index)
+    # 4. 更新 MD5 索引（页数缓存；path 指向本行自己的副本）
+    rel_path = os.path.relpath(file_path, UPLOAD_DIR)
+    _md5_entry_set(md5_index, file_md5, path=rel_path, original_name=f.filename,
+                   page_count=cached_page_count, page_count_verified=cached_page_verified,
+                   openid=g.openid)
+    save_md5_index(md5_index)
+    print(f"  [MD5] 已保存副本: {file_md5[:8]}... → {rel_path}"
+          f"{', 页数缓存=' + str(cached_page_count) if cached_page_verified else ''}")
 
     # 5. 计算/复用文件页数
     if cached_page_verified and cached_page_count > 0:
@@ -6447,17 +6528,19 @@ def upload_file():
         request_page_analysis(file_id, f.filename, prefer_client=prefer_client)
 
     print(f"文件上传: {_redact_filename(f.filename)} -> {_rel_display(file_path)} "
-          f"(id={file_id}, pages={page_count}, reused={reused})")
+          f"(id={file_id}, pages={page_count}, md5={file_md5[:8]}...)")
 
+    # S2-05（DS-14）：响应**不再**带 `reused` 字段，也不再有「文件已存在」文案 ——
+    # 否则任何人上传一份候选内容就能问出"这份内容是否已经在系统里"（跨用户存在性预言机）。
+    # 客户端（小程序/APP）本来就不读这个字段，只有 `message` 被展示。
     return jsonify(
         {
             "success": True,
-            "message": "文件上传成功" if not reused else "文件已存在，直接使用",
+            "message": "文件上传成功",
             "file_id": file_id,
             "original_name": f.filename,
             "size": file_size,
             "page_count": page_count,
-            "reused": reused,
         }
     )
 

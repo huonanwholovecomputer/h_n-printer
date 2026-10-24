@@ -25,6 +25,7 @@ import io
 import json
 import os
 import sys
+import traceback
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace",
                               line_buffering=True)
@@ -180,9 +181,19 @@ print("\n  【缓存】")
 orig_loads = backend.json.loads
 counter = {"n": 0}
 
+# ⚠ 只统计「这三个读取器发起的解析」。
+# 原来的写法统计进程内**全部** json.loads —— 后端的启动清理线程
+# （`_cleanup_once_on_startup` → `cleanup_expired_files` → `load_md5_index`）随时可能在
+# 计数窗口里插一次解析，让 `devices.json：外部原子改写后立刻生效` 约 1/3 概率假红
+# （在 HEAD 上可复现，与本脚本要验的行为无关）。按调用栈归因后，判据仍然是原来的判据：
+# 若读取器改回「每次读盘」，计数照样是 2（变异自证见 C 段）。
+_READER_FRAMES = ("load_devices", "_load_claim_impl", "_load_paper_prices")
+
 
 def counting_loads(*a, **k):
-    counter["n"] += 1
+    names = {fr.name for fr in traceback.extract_stack()}
+    if names.intersection(_READER_FRAMES):
+        counter["n"] += 1
     return orig_loads(*a, **k)
 
 
@@ -315,12 +326,14 @@ mut2_tmp, mut2_dst = H.mutated_copy([
      "    return data if isinstance(data, dict) else {}\n"),
 ], prefix="hn_idx_mut2_")
 proc2 = H.run_probe(mut2_dst, r"""
-import json as _json
+import json as _json, traceback
 backend.save_devices({"devA": {"device_name": "A"}})
 orig = _json.loads
 cnt = {"n": 0}
 def counting(*a, **k):
-    cnt["n"] += 1
+    # 同主脚本：只统计 load_devices 发起的解析，避免启动清理线程插一次把计数打成 3
+    if any(fr.name == "load_devices" for fr in traceback.extract_stack()):
+        cnt["n"] += 1
     return orig(*a, **k)
 _json.loads = counting
 cnt["n"] = 0
