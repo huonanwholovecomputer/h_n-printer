@@ -114,7 +114,7 @@ H.chk("app.py 用到的第三方包都在列（含 Flask 的传递依赖 Werkzeu
                                       "requests", "python-socketio", "pypdf", "pillow",
                                       "werkzeug", "itsdangerous")), sorted(pins))
 H.chk("gunicorn 在列且锁版本", "gunicorn" in pins, pins.get("gunicorn"))
-H.chk("版本与线上 venv 对齐的说明写在文件里（生产实测：Flask 3.1.3 / gunicorn 21.2.0）",
+H.chk("版本与线上 venv 对齐的说明写在文件里（生产实测：Flask 3.1.3 / gunicorn 22.0.0）",
       "线上 venv" in req_text and pins.get("flask") == "3.1.3")
 
 # ============================================================
@@ -125,7 +125,7 @@ bad1 = "flask\nflask-cors==6.0.5\ngunicorn==21.2.0\n"
 _, p1 = _check(bad1, app_src)
 H.chk("未锁版本 ⇒ 被报出", any("没有锁版本" in x for x in p1), p1)
 
-bad2 = req_text.replace("gunicorn==21.2.0\n", "")
+bad2 = re.sub(r"^gunicorn==[^\n]*\n", "", req_text, flags=re.M)
 _, p2 = _check(bad2, app_src)
 H.chk("删掉 gunicorn ⇒ 被报出", any("gunicorn" in x for x in p2), p2)
 
@@ -142,7 +142,7 @@ H.chk("装了 gevent 但没有 HN_RUNTIME 开关 ⇒ 被报出",
       any("HN_RUNTIME" in x for x in p4b), p4b)
 
 
-bad4 = req_text.replace("pypdf==6.13.2\n", "")
+bad4 = re.sub(r"^pypdf==[^\n]*\n", "", req_text, flags=re.M)
 _, p4 = _check(bad4, app_src)
 H.chk("删掉 app.py 真用到的包（pypdf）⇒ 被报出", any("pypdf" in x for x in p4), p4)
 
