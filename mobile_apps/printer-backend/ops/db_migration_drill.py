@@ -84,46 +84,17 @@ def _count_tables(conn: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
-# 已知"良性"外键违例（**不是损坏**，是保留期清理留下的历史引用）：
-#   orders.file_id → files.id
-# files 行到期后由 cleanup_expired_files 清掉（S1-03 保留期 / S2-05 引用计数），但订单行
-# 保留 file_id 作为历史凭据（结算/追溯/重印要用）；SQLite 默认不强制外键
-# （PRAGMA foreign_keys 默认 OFF），所以线上一直存在这类行。
-# 2026-10-24 生产演练实测 228 条，全部是这一种（`orders.file_id` 非空、files 行已过期）。
-# 处置：默认计为 benign（写进 warnings）；**不**去改历史订单数据，也**不**把整类违例一律放过 ——
-# 其它 (table -> parent) 组合仍算 unexpected（例如某次迁移写坏的外键）并判失败。
-# 需要"任何违例即失败"的严格口径时加 `--strict-fk`。
-BENIGN_FK_RULES = {("orders", "files")}
-
-
-def _fk_violations(conn: sqlite3.Connection, benign_rules=BENIGN_FK_RULES) -> dict:
-    """把 PRAGMA foreign_key_check 的结果按 (table -> parent) 分类。"""
-    try:
-        rows = conn.execute("PRAGMA foreign_key_check").fetchall()
-    except sqlite3.Error as e:  # noqa: BLE001
-        return {"total": -1, "benign": 0, "unexpected": 0, "detail": {},
-                "samples": [], "error": "%s: %s" % (type(e).__name__, e)}
-    detail: dict[str, int] = {}
-    samples: list[dict] = []
-    benign = unexpected = 0
-    for table, rowid, parent, _fkid in rows:
-        key = "%s->%s" % (table, parent)
-        detail[key] = detail.get(key, 0) + 1
-        if (str(table), str(parent)) in benign_rules:
-            benign += 1
-        else:
-            unexpected += 1
-            if len(samples) < 5:
-                samples.append({"table": table, "rowid": rowid, "parent": parent})
-    return {"total": len(rows), "benign": benign, "unexpected": unexpected,
-            "detail": detail, "samples": samples, "error": ""}
+# 外键违例的"良性/异常"分类是 S3-02 与 S3-03 的**共用口径**，唯一真相在 ops/db_fk_policy.py
+# （生产 228 条 orders.file_id→files.id 是文件到期清理后的历史引用，不是损坏）。
+# 本脚本只 import，不另写一份规则；`--strict-fk` 传空规则集即"任何违例都失败"。
+from db_fk_policy import BENIGN_FK_RULES, classify_fk_violations, warning_text
 
 
 def _inspect_db(path: str, benign_rules=BENIGN_FK_RULES) -> dict:
     conn = sqlite3.connect("file:%s?mode=ro" % path.replace("\\", "/"), uri=True, timeout=10)
     try:
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
-        fk = _fk_violations(conn, benign_rules)
+        fk = classify_fk_violations(conn, benign_rules)
         journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
         counts = _count_tables(conn)
         return {
@@ -331,11 +302,9 @@ def run_drill(args) -> dict:
     before = _inspect_db(b_orders, () if args.strict_fk else BENIGN_FK_RULES)
     report["integrity_before"] = before
     fk_before = before.get("foreign_key_detail") or {}
-    if fk_before.get("benign"):
-        report["warnings"].append(
-            "外键违例 %d 条属于已知良性类（orders.file_id → files.id：文件到期已清理、"
-            "订单保留历史 file_id），不计失败；明细 %s"
-            % (fk_before.get("benign"), fk_before.get("detail")))
+    _fk_warn = warning_text(fk_before)
+    if _fk_warn:
+        report["warnings"].append(_fk_warn)
     checks = {
         "integrity_before_ok": before["integrity_check"] == "ok",
         # 只把**非良性**违例判失败；--strict-fk 时 benign 规则被清空 ⇒ 等价于"任何违例即失败"

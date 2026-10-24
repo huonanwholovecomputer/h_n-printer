@@ -66,7 +66,9 @@ app_src = H.read_app_source()
 H.chk("演练工具存在且用 SQLite backup API 备份（不是 cp）",
       os.path.isfile(DRILL) and ".backup(" in drill_src and "mode=ro" in drill_src)
 H.chk("备份前后做 integrity_check / foreign_key_check",
-      "PRAGMA integrity_check" in drill_src and "PRAGMA foreign_key_check" in drill_src)
+      "PRAGMA integrity_check" in drill_src
+      and ("PRAGMA foreign_key_check" in drill_src
+           or "PRAGMA foreign_key_check" in _read(os.path.join(BACKEND, "ops", "db_fk_policy.py"))))
 H.chk("★ 用当前代码的 init_db() 在副本上重放迁移（同一份迁移代码）",
       "import app as backend" in drill_src and "backend.init_db()" in drill_src)
 H.chk("★ 写事务用 BEGIN IMMEDIATE（WAL 下写串行、读不阻塞）",
@@ -75,8 +77,10 @@ H.chk("★ 演练前后校验源库 SHA-256 未变化（绝不改生产库）",
       "sha256_before" in drill_src and "sha256_after" in drill_src
       and "source_unchanged" in drill_src)
 H.chk("★ 外键违例分类：良性 orders.file_id→files.id 与异常分开（生产实测 228 条该类）",
-      "BENIGN_FK_RULES" in drill_src and "unexpected" in drill_src
-      and '"orders", "files"' in drill_src)
+      "from db_fk_policy import" in drill_src and "classify_fk_violations" in drill_src
+      and "unexpected" in drill_src
+      and '"orders", "files"' in _read(os.path.join(BACKEND, "ops", "db_fk_policy.py"))
+      and "BENIGN_FK_RULES" in _read(os.path.join(BACKEND, "ops", "db_fk_policy.py")))
 H.chk("★ 提供 --strict-fk（任何违例即失败）且用户库无豁免",
       '"--strict-fk"' in drill_src and "_inspect_db(backup_users, ())" in drill_src)
 H.chk("演练模式显式跳过 app 启动清理与 MD5 索引（副本没有 uploads）",
@@ -262,6 +266,9 @@ if _mut_src == drill_src:
 _mut_path = os.path.join(_mut_dir, "drill_mut.py")
 with open(_mut_path, "w", encoding="utf-8") as f:
     f.write(_mut_src)
+# drill 现在从同目录 import db_fk_policy（唯一真相）；变异副本也要带上它
+shutil.copy2(os.path.join(BACKEND, "ops", "db_fk_policy.py"),
+             os.path.join(_mut_dir, "db_fk_policy.py"))
 
 _probe = os.path.join(_mut_dir, "_probe.py")
 with open(_probe, "w", encoding="utf-8") as f:
@@ -289,15 +296,18 @@ H.chk("变异后退回 rollback journal + 独占锁 ⇒ 读被挡住（B 的判�
 
 # ── 变异 2：外键分类"一律当良性" ⇒ 非良性违例的判据必须红（上面 _badfk_db 的用例）
 _mut2_dir = _mkroot("hn_s302_mut_fk_")
+_policy_src = _read(os.path.join(BACKEND, "ops", "db_fk_policy.py"))
 _anchor = "        if (str(table), str(parent)) in benign_rules:\n            benign += 1"
-if _anchor not in drill_src:
+if _anchor not in _policy_src:
     raise AssertionError("变异锚点未命中：外键分类")
-_mut2_src = drill_src.replace(
+_mut2_policy = _policy_src.replace(
     _anchor,
     "        if True:  # 变异：把所有外键违例都当良性\n            benign += 1", 1)
+with open(os.path.join(_mut2_dir, "db_fk_policy.py"), "w", encoding="utf-8") as f:
+    f.write(_mut2_policy)
 _mut2_path = os.path.join(_mut2_dir, "drill_mut_fk.py")
 with open(_mut2_path, "w", encoding="utf-8") as f:
-    f.write(_mut2_src)
+    f.write(drill_src)   # 规则在 policy 里，drill 本体不改；同目录的 policy 才是变异点
 _mut2_work = _mkroot("hn_s302_mut_fk_work_")
 _mut2_report = os.path.join(_mut2_work, "report.json")
 _pm2 = subprocess.run(
