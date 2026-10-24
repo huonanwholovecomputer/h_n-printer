@@ -611,9 +611,11 @@ def _rate_limit(key, max_count, window_seconds):
             _sweep_rate_limits_locked(now)
         bucket = _rate_limits.get(hkey)
         if bucket is None:
-            # 容量上限：先清过期，仍满就按插入顺序淘汰最旧（OrderedDict）
+            # 容量上限：按插入顺序淘汰最旧（OrderedDict，O(1)）。
+            # ⚠ 这里**绝不**做全量清扫（S2-12 压测实测：满 50k 后每插入一个 key 就扫 50k 条
+            #   ⇒ O(N×M)，灌 10 万 key 从 0.3 s 劣化到 64 s，等于给攻击者一个 CPU 放大器）。
+            #   过期 key 由上面「每 60s 一次」的周期清扫回收，够用且成本摊薄。
             if len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:
-                _sweep_rate_limits_locked(now)
                 while len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:
                     _rate_limits.popitem(last=False)
                     _rate_limits_stats["evicted"] += 1

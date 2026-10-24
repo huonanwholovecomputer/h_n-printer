@@ -38,6 +38,9 @@ ENV_REQUIRED: dict[str, str] = {
     "verify_http_heartbeat_channel.py": "需在服务器上跑（导入真实 app）",
     "verify_gthread_websocket.py": "需后端依赖环境（本机起独立小应用 5099）",
     "verify_apk_published.py": "需联网比对线上清单与 APK",
+    # S2-12 容量压测全系列（约 7 分钟、起本地服务与 16 条长连接）：默认跳过，
+    # 手动跑 `python tests/staging/99_run_all.py`（快速守门已由 verify_capacity_staging.py 覆盖）
+    "99_run_all.py": "容量压测全系列（约 7 分钟），手动跑 tests/staging/99_run_all.py",
     "measure_card_heights.mjs": "需 Playwright / 真实浏览器",
     "verify_dark_rail_contrast.mjs": "需 Playwright / 真实浏览器",
     "verify_preview_render.mjs": "需 Playwright / 真实浏览器",
@@ -123,6 +126,7 @@ def discover() -> list[Path]:
     for pattern in ("*.py", "*.js", "*.mjs"):
         found.extend(TESTS.glob(pattern))
         found.extend((TESTS / "audit_2026_12").glob(pattern))
+        found.extend((TESTS / "staging").glob("99_run_all.py"))
     out = []
     for p in sorted(set(found)):
         name = p.name

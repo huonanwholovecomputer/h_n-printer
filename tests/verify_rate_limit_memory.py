@@ -114,6 +114,17 @@ backend._rate_limit("fresh:c", 5, 60)
 H.chk("过期的冷 key 会被 60s 清扫掉", len(backend._rate_limits) <= 2,
       "剩余 %d" % len(backend._rate_limits))
 
+# S2-12 压测发现：修复前「满容量后每插一个 key 就全量清扫」是 O(N×M) ——
+# 灌 10 万 key 要 64 s（生产上等于一个 CPU 放大器）。修好后应 < 10 s。
+import time as _t2
+backend._rate_limits.clear()
+_t0 = _t2.perf_counter()
+for i in range(N):
+    backend._rate_limit("perf:%d" % i, 5, 60)
+_elapsed = _t2.perf_counter() - _t0
+H.chk("灌 %d 个 key 的插入耗时 < 10s（容量满后不得每次全量清扫）" % N,
+      _elapsed < 10.0, "实际 %.1fs" % _elapsed)
+
 # 真实入口：超限 429
 backend.ADMIN_OPENIDS = {"rl-admin"}
 atok = backend.token_serializer.dumps("rl-admin")
@@ -152,5 +163,29 @@ mut_keys = H.probe_value(proc)
 H.chk("去掉容量上限后 6 万个 key 全留下（判据能红）",
       mut_keys is not None and int(mut_keys) > 50000,
       "变异副本 keys=%r stderr=%r" % (mut_keys, (proc.stderr or "")[-300:]))
+
+# 变异 2：把「满容量后每插一个 key 就全量清扫」加回去 ⇒ 插入耗时应爆掉（S2-12 的回归守卫）
+mut2_tmp, mut2_dst = H.mutated_copy([(
+    "            if len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:\n"
+    "                while len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:",
+    "            if len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:\n"
+    "                _sweep_rate_limits_locked(now)\n"
+    "                while len(_rate_limits) >= _RATE_LIMIT_MAX_KEYS:",
+)], prefix="hn_rlmem_mut2_")
+import subprocess as _sp
+try:
+    proc2 = H.run_probe(mut2_dst, """
+import time
+backend._rate_limits.clear()
+t0 = time.perf_counter()
+for i in range(60000):
+    backend._rate_limit("mut2:%d" % i, 5, 60)
+print("RESULT=%.1f" % (time.perf_counter() - t0))
+""", timeout=45)
+    mut2_secs = float(H.probe_value(proc2) or 0)
+except _sp.TimeoutExpired:
+    mut2_secs = 999.0      # 变异副本 45s 跑不完 = 判据确实能抓住这个放大器
+H.chk("变异：满容量每插一格就全量清扫 ⇒ 6 万 key 插入明显变慢（>20s）",
+      mut2_secs > 20.0, "变异副本 %.1fs" % mut2_secs)
 
 H.finish()
