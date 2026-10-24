@@ -351,3 +351,71 @@ curl -sS -o /dev/null -w '%{http_code}\n' "https://hn-space.cn/socket.io/?EIO=4&
   逐台更新门店 `print_config.json` 并确认 `/api/printer/devices` 200，最后删 `TOKEN_PREV`。
 - 结算页「设置 → 敏感模块密码」7 个模块的默认 `123456` 必须逐个改成强密码（S0-07 的人工部分）。
 - 全员重登：S0-07 换了登录 salt（`login-v2`），所有 7 天登录态一次性作废（D-3 已接受）。
+
+---
+
+## 13. 运行时切换（S3-01：gevent）— 可选，默认不启用
+
+**为什么有这个开关**：threading + gthread `threads=16` 时，**每条 WebSocket 连接占住一个
+worker 线程**。S2-12 压测（`tests/staging/08_staging_tiers.py`）实测：15 条连接就把 16 个
+worker 占满、HTTP 全线超时；按 §11.2 `required_threads = ceil(在线设备×2.5)+4`，
+3 台需 12（够）、6 台需 19、10 台需 29。gevent 把一条连接降为一个 greenlet，不再占 OS 线程：
+**48 条连接时 `/api/ping` 仍全部 200、OS 线程只有 3 条**（`tests/staging/09_gevent_runtime.py`，
+对照同一台机器上 gthread 16 线程 + 24 条连接 ⇒ HTTP 全超时）。
+
+### 切换 / 回滚（只改一个环境变量）
+
+```bash
+# 切换：在 systemd unit 的 [Service] 里加一行，然后重启
+sudo systemctl edit printer-backend            # 或直接编辑 unit
+#   Environment=HN_RUNTIME=gevent
+sudo systemctl daemon-reload && sudo systemctl restart printer-backend
+
+# 回滚：删掉那一行（或改成空值），重启即可
+#   HN_RUNTIME 未设 = gthread + threads=16，行为与 2026-10-24 之前完全一致
+sudo systemctl restart printer-backend
+```
+
+**app.py 与 gunicorn_config.py 读的是同一个变量**，不要只改一处：worker_class=gevent 必须配
+async_mode=gevent，交叉组合会重演 2026-09 那次 eventlet/gthread 混用的「连接建立与数据面脱节」
+（客户端 SSL 握手 EOF、服务端 48 分钟后才发现死连接）。
+
+### 部署前后检查清单
+
+```bash
+# 1) 依赖（requirements.txt 已锁 gevent==26.9.0）
+/home/printer-backend/venv/bin/pip install -r requirements.txt
+/home/printer-backend/venv/bin/python -c "import gevent; print(gevent.__version__)"
+
+# 2) 启动日志必须出现 gevent worker（不是 gthread）
+journalctl -u printer-backend -n 30 | grep -E "Booting worker|gevent|gthread"
+
+# 3) 线上冒烟（与 S0 相同）：匿名握手 403、设备能连、HTTP 拉单保活
+python tests/verify_deploy_smoke.py          # 在本机跑（scp 到服务器，见脚本说明）
+curl -sS -o /dev/null -w '%{http_code}\n' "https://hn-space.cn/socket.io/?EIO=4&transport=polling"  # 403
+
+# 4) 关键业务：门店机重连后接一单，确认打印成功回报（这是 gevent 下 SQLite/推送路径的实机验证）
+```
+
+### gevent 模式的已知代价（切之前接受）
+
+1. **SQLite 的 C 调用不受 monkey-patch 影响**：一次 `BEGIN IMMEDIATE` 等写锁会阻塞整个
+   greenlet 事件循环（线程模型下只阻塞一个线程）。缓解：写事务保持短（S2-02 已做）、
+   `09` 实验里 32 条连接 + 10 个并发写的 p95 约 40 ms、写期间 ping 全部 200 —— **但如果将来
+   出现长事务/大文件清理占住写锁，症状会是"全站卡一下"而不是"一个请求慢"**。出现时优先查
+   慢查询/长事务，别先怪 gevent。
+2. **`workers` 仍必须为 1**：`printer_clients` / `pushed_tasks` / 限速桶 / `sid→client_id`
+   都是进程内内存。gevent **不解决**多进程一致性；`workers>1` 是 S3-01 的后半段（要先把这些
+   迁到 Redis），本次没做。gevent 只解决「一条连接占一个 worker」。
+3. **APScheduler**：BackgroundScheduler 的线程池在 gevent 下变成 greenlet，定时任务里的
+   SQLite/网络调用会协程化（`POST /job` 实测 `process_pending_orders` 2.6 ms 成功）；但如果
+   某个任务里出现**长时间阻塞的 C 调用**（如一次性扫描巨大目录），同样会卡住事件循环。
+   任务侧保持"小而频繁"的既有口径即可。
+4. **调试体验**：所有请求在一条 OS 线程里跑，`py-spy dump` 只能看到 hub；排查卡死优先看
+   `/api/ping` 是否还响应 + greenlet 数（`tests/staging/srv.py` 的 `/stats`）。
+
+### 什么时候该切
+
+- 现在（3 台）：**不必切**。16 线程需 12，余量 4，S2-12 实测 3 台档 1044 req/s、orders p95 31 ms。
+- 设备数将达 5–6 台：**切换 gevent**（或先把 threads 调到 24，二选一，见 §11.2）。
+- 设备数 ≥10 台或需要 `workers>1` 做滚动重启不中断：**S3-01 后半段**（实时通道拆进程 + Redis）。

@@ -8,7 +8,8 @@
 且 `eventlet` 是历史遗留（实时通道早就改成 threading + gthread），留着只是风险面。
 
 本脚本：
-  A. 静态：每一行都用 `==` 固定；没有 eventlet/gevent 这类"已停用的并发后端"；
+  A. 静态：每一行都用 `==` 固定；**eventlet 永久禁用**；gevent 只允许作为
+     `HN_RUNTIME=gevent` 开关背后的可选运行时（S3-01a），且必须真有开关接线；
      app.py 里出现的第三方顶层 import 全部有对应的固定版本依赖；gunicorn 在列
      （systemd 就是靠它起服务的）。
   B. 行为（纯本地）：用同一份检查函数喂"未锁版本 / 少依赖 / 混入 eventlet"三种坏清单，
@@ -50,7 +51,10 @@ IMPORT_PACKAGES = {
 }
 # 允许"用到但由别的包带入"的（Werkzeug/itsdangerous 是 Flask 的传递依赖，
 # 但 app.py 直接 import 了它们 ⇒ 必须显式固定，避免 Flask 升级时被动换版本）
-FORBIDDEN = ("eventlet", "gevent")
+# eventlet 永久禁用（S2-07 已删；2026-09 那次 eventlet×threading 混用的现场证据见
+# gunicorn_config.py）。gevent 允许，但**只能是开关背后的可选运行时**（S3-01a）：
+# 装了却没接 `HN_RUNTIME` 就等于默认启用了一个不同的事件模型，必须报错。
+FORBIDDEN = ("eventlet",)
 
 
 def _parse_requirements(text):
@@ -83,6 +87,8 @@ def _check(text, app_source):
     for bad in FORBIDDEN:
         if bad in pins:
             problems.append(f"依赖里仍有已停用的并发后端：{bad}")
+    if "gevent" in pins and 'os.environ.get("HN_RUNTIME"' not in app_source:
+        problems.append("装了 gevent 但 app.py 没有 HN_RUNTIME 开关（等于默认换事件模型）")
     for mod, pkg in IMPORT_PACKAGES.items():
         used = re.search(r"^\s*(?:import\s+%s\b|from\s+%s\b)" % (re.escape(mod), re.escape(mod)),
                          app_source, re.M) is not None
@@ -99,8 +105,10 @@ def _check(text, app_source):
 print("=== A. 静态（真实 requirements.txt）===")
 pins, problems = _check(req_text, app_src)
 H.chk("★ 每一行都锁死了版本（pip install 可复现）", not problems, problems[:5])
-H.chk("★ 没有 eventlet/gevent（实时通道是 threading + gthread）",
-      all(b not in pins for b in FORBIDDEN), sorted(pins))
+H.chk("★ 没有 eventlet；gevent 仅作为 HN_RUNTIME 开关背后的可选运行时",
+      all(b not in pins for b in FORBIDDEN)
+      and ("gevent" not in pins or 'os.environ.get("HN_RUNTIME"' in app_src),
+      sorted(pins))
 H.chk("app.py 用到的第三方包都在列（含 Flask 的传递依赖 Werkzeug/itsdangerous）",
       all(p.lower() in pins for p in ("flask", "flask-cors", "flask-socketio", "apscheduler",
                                       "requests", "python-socketio", "pypdf", "pillow",
@@ -124,6 +132,15 @@ H.chk("删掉 gunicorn ⇒ 被报出", any("gunicorn" in x for x in p2), p2)
 bad3 = req_text + "eventlet==0.41.0\n"
 _, p3 = _check(bad3, app_src)
 H.chk("混入 eventlet ⇒ 被报出", any("eventlet" in x for x in p3), p3)
+
+# S3-01a：gevent 本身允许（可选运行时），但**必须真有 HN_RUNTIME 开关**；
+# 把开关拿掉后仍带着 gevent ⇒ 等于默认换了事件模型，必须被报出。
+bad4b = req_text + "gevent==26.9.0\n"
+_, p4b = _check(bad4b, app_src.replace('os.environ.get("HN_RUNTIME"',
+                                       'os.environ.get("X_RUNTIME"'))
+H.chk("装了 gevent 但没有 HN_RUNTIME 开关 ⇒ 被报出",
+      any("HN_RUNTIME" in x for x in p4b), p4b)
+
 
 bad4 = req_text.replace("pypdf==6.13.2\n", "")
 _, p4 = _check(bad4, app_src)

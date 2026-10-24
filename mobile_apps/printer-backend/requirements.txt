@@ -17,6 +17,10 @@ python-socketio==5.16.3
 pypdf==6.13.2
 gunicorn==21.2.0
 Pillow==12.3.0
+# S3-01（2026-10-24）：可选运行时。设置 `HN_RUNTIME=gevent` 时启用
+# （gunicorn worker_class=gevent + Flask-SocketIO async_mode=gevent + monkey-patch）。
+# 不设该环境变量时它只是「装了不用」：启动不导入 gevent，行为与 gthread 完全一致。
+gevent==26.9.0
 # Flask 的传递依赖，但 app.py **直接 import** 了它们 ⇒ 必须显式锁定，
 # 否则 Flask 升级时会被动换版本（安全修复与回归都不可预测）。
 Werkzeug==3.1.8

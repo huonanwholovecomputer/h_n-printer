@@ -31,83 +31,11 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (COPY, PRINTER_TOKEN, ServerProc, http_get,  # noqa: E402
-                    open_eio_ws, save_result, summarize_http)
+from common import (COPY, PRINTER_TOKEN, ServerProc, db_bytes, http_get,  # noqa: E402
+                    open_eio_ws, save_result, seed_bench, summarize_http)
 
 APP_PORT, CTL_PORT = 18085, 18094
 USER_OPENID = "bench-user-0001"
-
-
-def db_bytes():
-    """副本里的数据体积：主库 + WAL + 日志目录（压测报告要求的「磁盘」一栏）。"""
-    total = 0
-    parts = {}
-    for name in ("orders.db", "orders.db-wal", "users.db", "users.db-wal"):
-        p = os.path.join(COPY, name)
-        n = os.path.getsize(p) if os.path.exists(p) else 0
-        parts[name] = n
-        total += n
-    logs = os.path.join(COPY, "logs")
-    log_bytes = 0
-    if os.path.isdir(logs):
-        for root, _dirs, files in os.walk(logs):
-            for fn in files:
-                try:
-                    log_bytes += os.path.getsize(os.path.join(root, fn))
-                except OSError:
-                    pass
-    parts["logs"] = log_bytes
-    total += log_bytes
-    parts["total"] = total
-    return parts
-
-
-def seed(n_orders, token_openid):
-    """建库 + 灌 1 万单（每单 1 个子任务）+ 1 个可登录用户。返回 (token, seed 耗时)。"""
-    os.chdir(COPY)                 # app.py 的相对路径（orders.db/uploads）都在副本目录
-    sys.path.insert(0, COPY)
-    import app as backend  # 只在父进程用：造 token / 建表 / 灌数据（副本内）
-
-    backend.init_db()
-    t0 = time.perf_counter()
-    conn = sqlite3.connect(os.path.join(COPY, "orders.db"), timeout=30)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "DELETE FROM order_files WHERE order_id IN (SELECT id FROM orders WHERE openid = ?)",
-            (token_openid,))
-        conn.execute("DELETE FROM orders WHERE openid = ?", (token_openid,))
-        rows, subs = [], []
-        for i in range(n_orders):
-            oid = 900000 + i
-            created = "2026-10-%02d %02d:%02d:%02d" % (
-                1 + (i % 24), (i // 60) % 24, i % 60, (i * 7) % 60)
-            rows.append((oid, "f-%06d" % i, "bench_%06d.pdf" % i, 1, "sent", created,
-                         token_openid, "off", 2, 0.3, 0.6, n_orders - i,
-                         "wechat", "bench"))
-            subs.append((oid, "f-%06d" % i, "bench_%06d.pdf" % i, 1, 2, 0.3, 0.6, 0,
-                         "sent", created))
-        conn.executemany(
-            "INSERT OR REPLACE INTO orders (id, file_id, file, copies, status, created_at,"
-            " openid, duplex, page_count, price_per_page, total_price, order_number,"
-            " source, owner_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-        conn.executemany(
-            "INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,"
-            " price_per_page, total_price, is_free, status, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)", subs)
-        conn.commit()
-    finally:
-        conn.close()
-    uconn = sqlite3.connect(os.path.join(COPY, "users.db"), timeout=30)
-    try:
-        uconn.execute(
-            "INSERT OR REPLACE INTO users (openid, nickname, avatar_path, updated_at, role)"
-            " VALUES (?,?,?,?,?)", (token_openid, "bench", "", "2026-10-24 00:00:00", "user"))
-        uconn.commit()
-    finally:
-        uconn.close()
-    token = backend.token_serializer.dumps(token_openid)
-    return token, time.perf_counter() - t0
 
 
 def conc_pings(n=16, per_thread=20):
@@ -148,7 +76,7 @@ def main():
 
     print(f"[ENV] 副本={COPY} pool={args.pool} 订单={args.orders} 档位={tiers} "
           f"连接/台={args.conn_per_device}")
-    token, seed_secs = seed(args.orders, USER_OPENID)
+    token, seed_secs = seed_bench(args.orders, USER_OPENID)
     disk_seeded = db_bytes()
     print(f"[SEED] {args.orders} 单 + {args.orders} 子任务，用时 {seed_secs:.1f}s；"
           f"磁盘 orders.db={disk_seeded['orders.db']}B wal={disk_seeded['orders.db-wal']}B "

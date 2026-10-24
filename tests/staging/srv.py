@@ -33,11 +33,18 @@ sys.path.insert(0, COPY)
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, required=True)
 ap.add_argument("--control-port", type=int, required=True)
-ap.add_argument("--mode", choices=["werkzeug", "pool"], default="werkzeug")
+ap.add_argument("--mode", choices=["werkzeug", "pool", "gevent"], default="werkzeug",
+                help="werkzeug=线程无限；pool=固定线程池（gthread 模拟）；"
+                     "gevent=gevent greenlet 运行时（S3-01）")
 ap.add_argument("--pool-size", type=int, default=16)
 ap.add_argument("--login-delay", type=float, default=0.0,
                 help=">0 时把 app.urlrequest.urlopen 打桩成 sleep(N) 后抛 URLError（模拟微信上游 10s 延迟）")
 args = ap.parse_args()
+
+# S3-01：gevent 模式必须在 import app **之前**设环境变量 —— app.py 顶部会据此
+# monkey-patch（gevent 要求在导入 socket/threading 之前完成）。
+if args.mode == "gevent":
+    os.environ["HN_RUNTIME"] = "gevent"
 
 import app as backend  # noqa: E402
 
@@ -120,6 +127,9 @@ class CtlHandler(BaseHTTPRequestHandler):
             "thread_names": [t.name for t in threading.enumerate()],
             "engineio_sessions": len(getattr(backend.socketio.server, "sockets", {}) or {}),
             "pool": STATS["pool_ref"].pool_snapshot() if STATS.get("pool_ref") else None,
+            "runtime": getattr(backend, "_ASYNC_MODE", "threading"),
+            "scheduler_running": bool(getattr(getattr(backend, "scheduler", None), "running", False)),
+            "greenlets": _greenlet_count(),
             "rss_kb": rss_kb(),
             "alive": True,
         }
@@ -129,6 +139,47 @@ class CtlHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        """POST /job —— 在**当前运行时**里同步跑一次定时任务（验证 APScheduler 代码路径）。
+
+        gevent 下 job 里的 SQLite/requests 调用会在 greenlet 里执行；这一步既是
+        「monkey-patch 没把定时任务打坏」的冒烟，也能量出单次扫描耗时。
+        """
+        if self.path != "/job":
+            self.send_error(404)
+            return
+        t0 = time.time()
+        err = ""
+        try:
+            backend.process_pending_orders()
+            ok = True
+        except Exception as e:  # noqa: BLE001
+            ok, err = False, "%s: %s" % (type(e).__name__, str(e)[:160])
+        info = {"ok": ok, "ms": round((time.time() - t0) * 1000, 1), "error": err,
+                "runtime": getattr(backend, "_ASYNC_MODE", "threading")}
+        body = json.dumps(info, ensure_ascii=False).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _greenlet_count():
+    """gevent 模式下活跃 greenlet 数（非 gevent 运行/未安装时返回 None）。
+
+    没装 gevent 时**不能**因为统计功能把服务弄挂：整段 try/except。
+    """
+    try:
+        import gc
+        import greenlet as _gl
+        if not hasattr(_gl, "greenlet"):
+            return None
+        return sum(1 for o in gc.get_objects()
+                   if isinstance(o, _gl.greenlet) and not o.dead)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def start_control(port):
@@ -209,10 +260,22 @@ if args.mode == "pool":
 
 
 def main():
+    try:
+        backend.init_db()          # 与生产 post_worker_init 等价（迁移/建表）
+    except Exception as e:  # noqa: BLE001
+        print(f"[SRV] init_db 失败: {type(e).__name__}: {e}", flush=True)
     start_control(args.control_port)
     print(f"[SRV] mode={args.mode} app=127.0.0.1:{args.port} ctl=127.0.0.1:{args.control_port} "
-          f"pool={args.pool_size} login_delay={args.login_delay}", flush=True)
-    if args.mode == "werkzeug":
+          f"pool={args.pool_size} login_delay={args.login_delay} "
+          f"runtime={getattr(backend, '_ASYNC_MODE', '?')}", flush=True)
+    if args.mode == "gevent":
+        # S3-01：gevent WSGI 服务器 + async_mode="gevent"（app.py 导入时已 monkey-patch）。
+        # socketio.run 在 gevent 模式下会选 gevent 的 WSGI/WebSocket 后端；
+        # 一条 WS 连接 = 一个 greenlet，不再占 OS 线程。
+        backend.socketio.run(backend.app, host="127.0.0.1", port=args.port,
+                             use_reloader=False, log_output=False,
+                             allow_unsafe_werkzeug=False)
+    elif args.mode == "werkzeug":
         backend.socketio.run(
             backend.app, host="127.0.0.1", port=args.port,
             allow_unsafe_werkzeug=True, use_reloader=False,

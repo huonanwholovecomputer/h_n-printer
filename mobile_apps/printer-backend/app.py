@@ -1,9 +1,40 @@
+# ============================================================================
+# S3-01（2026-10-24）：**可选运行时** gevent —— 一条实时连接不再独占 worker
+#
+# 背景（S2-12 压测实测）：threading 模式下每条 WebSocket 连接占住一个 gthread worker，
+# 生产 `threads=16` ⇒ 15 条设备连接就把 HTTP 全部堵死（3 台约需 8、6 台约需 15、10 台需 25，
+# 按 §11.2 required_threads=ceil(设备×2.5)+4）。gevent 下一条连接 = 一个 greenlet，
+# 不再占 OS 线程，因此 16/24/32 条连接时 HTTP 仍然可用（`tests/staging/09_gevent_runtime.py`）。
+#
+# 开关：环境变量 `HN_RUNTIME=gevent`（**同时**决定 gunicorn worker_class，见 gunicorn_config.py）。
+#   · 不设 / 其它值 = 现状（async_mode="threading" + gthread worker），行为与性能零变化；
+#   · 设了 = 下面先 monkey-patch（必须在**任何网络/线程模块导入之前**，这是 gevent 的硬要求），
+#     再让 SocketIO 用 async_mode="gevent"；回滚 = 去掉该环境变量并重启。
+#
+# ⚠ 已知取舍（验证数据见 09 实验与 docs/容量压测报告）：
+#   · **SQLite 不受 monkey-patch 影响**（C 扩展）：一次 `BEGIN IMMEDIATE` 等写锁会阻塞整个
+#     greenlet 事件循环（线程模型下只阻塞一个线程）。所以必须保持写事务短（S2-02 已做）；
+#     `tests/staging/09` 里专门量了「32 条连接 + 并发写」时 HTTP p95。
+#   · `workers` 仍必须为 1（printer_clients/pushed_tasks/限速桶/sid 映射都是进程内内存）；
+#     workers>1 需要把这几样迁到 Redis —— 那是 S3-01 的**后半段**，本次不做。
+# ============================================================================
+import os
+
+_RUNTIME = (os.environ.get("HN_RUNTIME", "") or "").strip().lower()
+_GEVENT = _RUNTIME == "gevent"
+if _GEVENT:                                                    # pragma: no cover
+    try:
+        from gevent import monkey as _gevent_monkey
+        _gevent_monkey.patch_all()
+    except ImportError as _e:                                  # 明确失败，不静默降级
+        raise RuntimeError(
+            "HN_RUNTIME=gevent 但未安装 gevent：pip install -r requirements.txt") from _e
+
 import copy
 import hashlib
 import hmac
 import json
 import logging
-import os
 import shutil
 import socket
 import sqlite3
@@ -69,7 +100,11 @@ CORS(app, resources={r"/api/*": {"origins": CORS_ALLOWED_ORIGINS}}, max_age=8640
 # （计划 §1.4 依赖 2：先做 collect_all 的异步化，再改这里 —— 见 log_collect_all）。
 # engineio 参数同时收紧：心跳 15s / 超时 10s（更快发现死连接、释放线程），
 # 单帧缓冲 256 KB（默认 1 MB；事件载荷正常远小于它）。
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading",
+# S3-01：async_mode 跟随运行时开关（HN_RUNTIME=gevent ⇒ "gevent"，否则维持 "threading"）。
+# **不能混用**：gevent 的 WSGI 服务器 + async_mode="threading" 会重演 2026-09 那次
+# eventlet/gthread 混用的"连接建立与数据面脱节"（见 gunicorn_config.py 末尾的现场证据）。
+_ASYNC_MODE = "gevent" if _GEVENT else "threading"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode=_ASYNC_MODE,
                     async_handlers=False, ping_interval=15, ping_timeout=10,
                     max_http_buffer_size=262144)
 

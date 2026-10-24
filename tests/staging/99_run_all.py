@@ -27,6 +27,7 @@ ORDER = [
     ("06_input_cost.py", "单请求输入成本与 1MB/深嵌套边界（S0-04）"),
     ("07_longpolling.py", "long-polling 的线程成本"),
     ("08_staging_tiers.py", "三档设备规模容量复核（3/6/10 台，§11.2）"),
+    ("09_gevent_runtime.py", "S3-01 运行时对比：gevent 48 条连接 vs gthread 16 线程"),
 ]
 
 
