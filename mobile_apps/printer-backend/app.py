@@ -62,6 +62,10 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 
+# S3-04（DS-24）：文件访问审计（谁、读了哪个文件、何时）。
+# 独立模块：不 import Flask、不依赖 app 的任何全局量；坏了也只影响"记不记"，不影响主流程。
+import file_audit
+
 try:
     from PIL import Image
     HAS_PIL = True
@@ -299,6 +303,34 @@ def _rel_display(path: str) -> str:
     except (OSError, ValueError):
         pass
     return os.path.basename(path)
+
+
+# ===== S3-04（DS-24）：文件访问审计的唯一入口 =====
+def _audit_ext(name) -> str:
+    """从文件名/路径里只取扩展名（S2-11：审计只记扩展名，不记原文件名）。"""
+    try:
+        return os.path.splitext(str(name or ""))[1].lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _audit_file_access(action, result, file_id="", openid="", actor="",
+                       task_id=None, ext="", count=None):
+    """记一条文件访问审计（谁、读了哪个文件、何时）。
+
+    fail-open 的第二层：`file_audit.record()` 自身吞一切异常，这里再兜一层 —— 审计模块/字段
+    出任何问题都**不许**改变下载、删除、列表的正常返回。`ip` 用 `request.remote_addr`
+    （ProxyFix 已还原 nginx 之后的真实 IP），**不信任**原始 `X-Forwarded-For`。
+    """
+    try:
+        try:
+            ip = request.remote_addr or ""
+        except Exception:  # noqa: BLE001  非请求上下文（后台任务复用本函数）时没有 IP
+            ip = ""
+        file_audit.record(action, result, file_id=file_id, openid=openid, actor=actor,
+                          task_id=task_id, ip=ip, ext=ext, count=count)
+    except Exception as e:  # noqa: BLE001
+        print("  [AUDIT] 文件访问审计记录失败（已忽略，不影响主流程）: %s" % type(e).__name__)
 
 # 打印机设备注册表 / 接单接管状态（2026-11 新增：多设备共连服务器时的唯一接管者机制）
 # devices.json: { client_id: {device_name, owner_name, first_seen, last_seen} }
@@ -2290,6 +2322,8 @@ def download_file(file_id):
     try:
         payload = download_serializer.loads(token, max_age=3600)
     except (BadSignature, SignatureExpired):
+        # S3-04：过期/伪造链接也是一次"试图读文件" ⇒ 记 denied（此时拿不到任何绑定信息）
+        _audit_file_access("download", "denied", file_id=file_id, actor="signed_url")
         return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
 
     # S1-06：三种 payload 形态
@@ -2302,13 +2336,18 @@ def download_file(file_id):
     elif isinstance(payload, str):
         fid, bound_openid, bound_task = payload, "", None
     else:
+        _audit_file_access("download", "denied", file_id=file_id, actor="signed_url")
         return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
     if fid != file_id:
+        _audit_file_access("download", "denied", file_id=file_id, openid=bound_openid,
+                           actor="signed_url")
         return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
     if bound_task is not None:
         try:
             bound_task = int(bound_task)
         except (TypeError, ValueError):
+            _audit_file_access("download", "denied", file_id=file_id, openid=bound_openid,
+                               actor="signed_url")
             return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
         conn = get_db()
         try:
@@ -2316,11 +2355,15 @@ def download_file(file_id):
                 "SELECT order_id FROM order_files WHERE id = ? AND file_id = ?",
                 (bound_task, file_id)).fetchone()
             if not trow:
+                _audit_file_access("download", "denied", file_id=file_id, openid=bound_openid,
+                                   task_id=bound_task, actor="signed_url")
                 return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
             if bound_openid:
                 orow = conn.execute(
                     "SELECT openid FROM orders WHERE id = ?", (trow["order_id"],)).fetchone()
                 if not orow or (orow["openid"] or "") != bound_openid:
+                    _audit_file_access("download", "denied", file_id=file_id, openid=bound_openid,
+                                       task_id=bound_task, actor="signed_url")
                     return jsonify({"success": False, "message": "下载链接无效或已过期"}), 403
         finally:
             conn.close()
@@ -2330,8 +2373,16 @@ def download_file(file_id):
     conn.close()
 
     if not row or not os.path.exists(row["path"]):
+        # S3-04：行没了/盘上没了都记 not_found（ext 从原文件名取，审计里仍不落原名）
+        _audit_file_access("download", "not_found", file_id=file_id, openid=bound_openid,
+                           task_id=bound_task, actor="signed_url",
+                           ext=_audit_ext(row["original_name"]) if row else "")
         return jsonify({"success": False, "message": "文件不存在"}), 404
 
+    # S3-04：成功必须在**返回响应之前**记（resp 一旦返回，send_file 的流可能立刻被消费）
+    _audit_file_access("download", "ok", file_id=file_id, openid=bound_openid,
+                       task_id=bound_task, actor="signed_url",
+                       ext=_audit_ext(row["original_name"] or row["path"]))
     resp = send_file(row["path"], as_attachment=False)
     resp.headers["Content-Disposition"] = _content_disposition(
         row["original_name"] or os.path.basename(row["path"]))
@@ -5749,6 +5800,7 @@ def delete_my_file(file_id):
       · 删除物理文件 + 清 files 行 + 从 MD5 索引移除（清引用，避免"删了还能被复用"）。
     """
     if not isinstance(file_id, str) or not (0 < len(file_id) <= 64):
+        _audit_file_access("delete", "not_found", file_id=file_id, openid=g.openid, actor="user")
         return jsonify({"success": False, "message": "文件不存在"}), 404
     conn = get_db()
     try:
@@ -5756,8 +5808,11 @@ def delete_my_file(file_id):
             "SELECT id, path, original_name, openid FROM files WHERE id = ?", (file_id,)
         ).fetchone()
         if not row:
+            _audit_file_access("delete", "not_found", file_id=file_id, openid=g.openid,
+                               actor="user")
             return jsonify({"success": False, "message": "文件不存在"}), 404
         if (row["openid"] or "") != g.openid:
+            _audit_file_access("delete", "denied", file_id=file_id, openid=g.openid, actor="user")
             return jsonify({"success": False, "message": "无权删除该文件"}), 403
         active_statuses = ('queued', 'printing', 'accepted', 'reserved',
                            'scheduled', 'waiting', 'downloading')
@@ -5766,6 +5821,8 @@ def delete_my_file(file_id):
             f"SELECT 1 FROM order_files WHERE file_id = ? AND status IN ({placeholders}) LIMIT 1",
             (file_id, *active_statuses)).fetchone()
         if busy:
+            _audit_file_access("delete", "conflict", file_id=file_id, openid=g.openid,
+                               actor="user")
             return jsonify({"success": False,
                             "message": "该文件正在被订单使用（排队/打印中），暂不能删除"}), 409
         path = row["path"] or ""
@@ -5800,6 +5857,9 @@ def delete_my_file(file_id):
                 save_md5_index(index)
     except Exception as e:  # noqa: BLE001
         print(f"  [DEL] 清理 MD5 索引失败: {type(e).__name__}")
+    # S3-04：删除成功（只记 file_id + 扩展名，不记原文件名/路径）
+    _audit_file_access("delete", "ok", file_id=file_id, openid=g.openid, actor="user",
+                       ext=_audit_ext(row["original_name"]))
     print(f"  [DEL] 用户 {g.openid[:8]}... 删除了文件 {file_id[:8]}...")
     return jsonify({"success": True, "file_id": file_id, "message": "已删除"})
 
@@ -5877,6 +5937,8 @@ def list_my_files():
             "auto_delete_at": auto_delete_at,
             "in_active_order": r["id"] in busy_ids,
         })
+    # S3-04：列表成功记一条（只记本页条数，不逐条记 file_id —— 否则一次列表放大 50 倍）
+    _audit_file_access("list", "ok", openid=g.openid, actor="user", count=len(out))
     return jsonify({
         "success": True,
         "files": out,
@@ -5885,6 +5947,52 @@ def list_my_files():
         "per_page": per_page,
         "has_more": (page * per_page) < total,
     })
+
+
+@app.route("/api/admin/file_audit", methods=["GET"])
+@login_required
+def admin_file_audit():
+    """S3-04（DS-24）：管理员查询「文件访问审计」（谁、读了哪个文件、何时）。
+
+    只读旁路日志，不碰业务库。参数（全部可选）：
+      file_id / openid / action / result / since / until / limit(1..500，默认 100) / stats=1
+    返回 `{success, entries, count}`；`stats=1` 时多一个 `stats`（季度报告口径）。
+    审计日志里**没有**原文件名/绝对路径，只有 file_id + 扩展名（S2-11）。
+    """
+    role = compute_role(g.openid)
+    if role not in ("admin", "super_admin"):
+        return jsonify({"success": False, "message": "需要管理员权限"}), 403
+    if not _rate_limit_ok(f"file_audit:{g.openid}", 30, 60):
+        return jsonify({"success": False, "message": "查询过于频繁，请稍后再试"}), 429
+
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(500, limit))  # 上限 500：避免一次请求把几十万行读进内存
+
+    since = (request.args.get("since") or "").strip()[:40]
+    until = (request.args.get("until") or "").strip()[:40]
+    try:
+        entries = file_audit.query(
+            file_id=(request.args.get("file_id") or "").strip()[:64],
+            openid=(request.args.get("openid") or "").strip()[:128],
+            action=(request.args.get("action") or "").strip()[:32],
+            result=(request.args.get("result") or "").strip()[:16],
+            since=since or None, until=until or None, limit=limit)
+    except ValueError:
+        # 不把异常文本回给客户端（S2-11）：给出固定的参数说明即可
+        return jsonify({"success": False,
+                        "message": "时间参数格式不合法（支持 ISO8601 / YYYY-MM-DD[ HH:MM:SS]）"}), 400
+
+    body = {"success": True, "entries": entries, "count": len(entries)}
+    if (request.args.get("stats") or "").strip().lower() in ("1", "true", "yes"):
+        try:
+            body["stats"] = file_audit.stats(since=since or None, until=until or None)
+        except ValueError:
+            return jsonify({"success": False,
+                            "message": "时间参数格式不合法（支持 ISO8601 / YYYY-MM-DD[ HH:MM:SS]）"}), 400
+    return jsonify(body)
 
 
 @app.route("/api/login", methods=["POST"])
