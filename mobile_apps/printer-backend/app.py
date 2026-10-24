@@ -2428,6 +2428,13 @@ def _cleanup_once_on_startup():
     计划 §S1-03 要求"启动 + 定时双触发"：门店机/服务器重启后，到期文件不必再等一个
     定时周期；也避免"进程长期不重启、定时任务被跳过"时保留期形同虚设。
     """
+    # S3-02 迁移演练（ops/db_migration_drill.py）：演练副本不搬 uploads 目录，启动清理会把
+    # 所有 files 行当成"物理文件已消失的幽灵"删掉 ⇒ 行数比对失去意义。演练只需要验证
+    # schema/迁移本身，用显式环境变量跳过（正常启动/生产**不会**设置它）。
+    if os.environ.get("HN_DRILL_MODE") == "1":
+        print("  [DRILL] HN_DRILL_MODE=1：跳过启动清理（迁移演练副本无 uploads）")
+        return None
+
     def _run():
         try:
             cleanup_expired_files()
@@ -2447,6 +2454,10 @@ def _build_md5_index_in_background():
     服务先起来，索引补全在后台完成。并发安全：上传侧只读索引、写入走 `_md5_index_lock`；
     后台补全期间上传去重可能漏掉"尚未入索引"的老文件（最多多存一份，不会丢数据）。
     """
+    if os.environ.get("HN_DRILL_MODE") == "1":
+        print("  [DRILL] HN_DRILL_MODE=1：跳过 MD5 索引补全（演练副本无 uploads）")
+        return None
+
     def _run():
         try:
             build_md5_index()
