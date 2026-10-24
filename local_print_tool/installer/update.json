@@ -1,9 +1,9 @@
 {
-  "version": "4.5.33",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.33.exe",
-  "md5": "ac49104f044640d5a23248007494576a",
-  "sha256": "5273799297ead45ea9d1378f9718a2051375405b88b1e3f8cc8fb04ae87a7019",
-  "notes": "v4.5.33（安全加固 · 客户端部分）：① 更新流程收紧 —— 启动检查只提示新版本，必须点「立即下载并更新」才会下载安装（不再自动静默装）；更新清单要过 ed25519 签名 + 下载地址白名单 + sha256/md5 校验，安装包落在私有目录并保留上一版用于回滚。② 云端 Word/Excel 一律改用 LibreOffice 转换：本机必须安装 LibreOffice（未安装会明确报错并提示安装），不再走可执行宏的 Word/WPS 自动路径；本机手动打印 Word 仍可用 Word/WPS，但已关闭宏执行、链接自动更新与宏提示。③ 财务页：首次打开强制设置财务密码（默认 123456 已停用），之后每个敏感模块单独解锁、会话 30 分钟；print_data.json 被程序外部整份改写时页面转只读并要求人工确认；所有改动写审计日志。④ 离线订单不再放弃：新增「📴 离线未同步 N」角标与明细窗，离线单联网后自动重试上传 —— 升级后一批历史离线单可能重新上云入账，请财务按明细窗核对。⑤ 取号等待 30 秒 → 4 秒：弱网时更常用 -L 本地号先开打、随后自动换正式号补报（单据不丢）。⑥ 结算页「离线未同步 / 云端拒收」的订单不计收益。含 4.5.32 全部内容（不再支持 HTML、Markdown 隔离模式等）。",
+  "version": "4.5.34",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.34.exe",
+  "md5": "e04ef8921f9c0aa74189fdae08ba2f5e",
+  "sha256": "a93da78b7d719b08aecd9aff9f0547157b2265da177613b4bc164029f922e7b2",
+  "notes": "v4.5.34（安全加固 · 收支清算本地服务）：① 结算页背后的本地 HTTP 服务加固 —— 启动令牌改为一次性、用完即失效（地址栏不再残留凭据），外部网页不能再用 DNS rebinding 借你的浏览器读结算数据；代理接口只放行既定的 11 条路径，越界请求一律在发往云端之前拦下；出站打印机 token 改走请求头，不再出现在 URL 里；所有响应补安全头与 CSP。⚠ 直接后果：结算页按 F5 刷新会显示 403（这是预期行为），请从工具菜单「📊 收支清算」重新打开。② 收支清算几处体验修正：「离线未同步」入口改为有单才出现；首次设置的按钮不再常驻；设置页里那条常驻的技术说明已去掉。③ 含 4.5.33 全部内容（云端 Word 走 LibreOffice、首次打开强制设置财务密码、更新清单 ed25519 验签、离线单不放弃等）。",
   "sig_algo": "ed25519",
-  "sig": "mV5s4qFtlVUSg0v6clvJumue8Lq0ciJYx9tQ/FWqB3p6oQb/7QAtuh3nofcJXRihGjHvAb/XdnhZormBquPvDw=="
+  "sig": "xhjGOyGVUu9asM2Ng0W5VsmVw0gH0xgKN4SdOgy9F/II8AeZS52i0Qg9GNoJO7AbRUq+TbCI2yHNnc2FZwfTBA=="
 }

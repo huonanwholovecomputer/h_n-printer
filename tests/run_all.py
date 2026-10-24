@@ -107,15 +107,11 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   轮询自调度+1.5×退避 / 更新链打开下载页）⇒ 登记过渡项；**同日已重打 1.1.43
 #   （versionCode 44）并通过 verify_apk_release.py + verify_apk_version_manifest.py +
 #   verify_apk_published.py（线上清单/大小/md5 全部一致）⇒ 该项已删除**。
-# 2026-10-24（S2-08 隐私告知 + 我的文件）：改了 www/{index.html,print.js,me.js,styles.css}
-#   （下单页隐私告知/勾选/保留期选择器 + 「我 → 我的文件」删除入口）⇒ APK 内 web 资源
-#   与 www/ 不再逐字节一致。按「打印业务暂停期只提交、不构建」的口径登记过渡项；
-#   **解除条件 = 下次统一构建 APK 后跑 verify_apk_release.py 转绿，即删本条**。
-EXPECTED_RED: dict[str, str] = {
-    "verify_apk_release.py":
-        "S2-08/S2-09 改了 www/ 与原生壳（隐私告知/保留期/我的文件、CSP/NSC/FileProvider），"
-        "APK 待下次统一构建；构建后跑本脚本转绿即删除本条",
-}
+# 2026-10-24（S2-08 隐私告知 + 「我的文件」）曾登记过一条 `verify_apk_release.py` 过渡项：
+#   改了 www/{index.html,print.js,me.js,styles.css} 后 APK 内 web 资源与 www/ 不再逐字节一致。
+#   **已解除**：APK **1.1.44** 已于当日构建并发布（md5 1608cff4570ab4b672824f15b34d5ec2，公网下载自检全绿），
+#   `verify_apk_release.py` 转绿 ⇒ 按「产物重建后必须删条」的约定删除。
+EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}
