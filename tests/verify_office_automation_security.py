@@ -458,11 +458,11 @@ mutations.append(("把 from_cloud 默认值改成 True（本地文件也被赶�
 
 # 5g. 某个 Open 之前的 harden 调用删掉（WPS 转换路径）
 _mut = CONV_SRC.replace(
-    '        wps = win32com.client.dynamic.Dispatch(prog_id)\n'
+    '        wps = _safe_wps_dispatch()\n'
     '        # S1-04：WPS 打开前同样收紧（宏/弹窗/外链）；属性缺失时日志记录实际生效项\n'
     '        _harden_office_com_app(wps, "WPS")\n\n'
     '        doc = wps.Documents.Open(os.path.abspath(temp_input), ReadOnly=True)',
-    '        wps = win32com.client.dynamic.Dispatch(prog_id)\n\n'
+    '        wps = _safe_wps_dispatch()\n\n'
     '        doc = wps.Documents.Open(os.path.abspath(temp_input), ReadOnly=True)')
 mutations.append(("删掉 WPS 转换路径的 harden 调用",
                   _mut, "★ 每个 Documents.Open 之前都调用了 _harden_office_com_app（宏在 Open 期间跑）"))

@@ -169,6 +169,10 @@ def run_one(path: Path, node: str | None, timeout: int) -> tuple[str, str, float
     # 批处理标记：交互式验收脚本（verify_stack_list_virtual.py）据此强制走 --auto，
     # 否则它继承终端 stdin 会停在 input() 上，把整个套件拖到超时。
     env["HN_ACCEPTANCE_BATCH"] = "1"
+    # 2026-10-24 现场事故：测试构造 MainWindow → 引擎探测 Dispatch("Word.Application")
+    # 并 Quit，把用户正在编辑的 Word 关掉。验收套件里强制关闭 Office 引擎探测
+    # （探测本身也不再碰 COM，这是第二道闸门）；需要真引擎的脚本自行覆盖该变量。
+    env.setdefault("HN_NO_ENGINE_PROBE", "1")
 
     t0 = time.time()
     try:

@@ -40,6 +40,28 @@ def _com_uninitialize_quietly() -> None:
         logger.debug(f"CoUninitialize 忽略异常: {e}")
 
 
+def _engine_probe_disabled() -> bool:
+    """`HN_NO_ENGINE_PROBE=1` ⇒ 引擎探测直接判"不可用"（不碰 exe、更不碰 COM）。
+
+    给测试/CI 的硬闸门：run_all.py 会对每个脚本注入该变量，保证**任何**测试构造
+    MainWindow / 调 get_available_engines() 都不会启动或附着 Office。
+    """
+    return (os.environ.get("HN_NO_ENGINE_PROBE") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _dispatch_ex(prog_id: str):
+    """用 `DispatchEx` 创建**私有** Office COM 实例（本项目唯一允许的启动方式）。
+
+    为什么不能 Dispatch（2026-10-24 现场事故）：Word/WPS 是单实例 COM 服务器，
+    机器上已有用户打开的实例时 `Dispatch` 会**附着**到它；随后 `Quit()` / `Visible=False`
+    直接作用在用户的文档上 —— 一次"探测 Word 装没装"就能把用户正在编辑的 Word 关掉。
+    `DispatchEx` 强制新进程，生命周期完全归本程序，用户实例不受影响。
+    """
+    import win32com.client
+    return win32com.client.DispatchEx(prog_id)
+
+
 # ============================================================
 # 多引擎转换缓存
 # ============================================================
@@ -177,9 +199,16 @@ def start_word_warmup() -> None:
     """
     后台线程预热 Word COM — 启动 WINWORD.EXE 并保持存活。
     后续所有 COM Dispatch 不再冷启动，显著加速页数统计和打印。
+
+    ⚠ 默认**不启用**（需 `HN_WARM_OFFICE=1`）：预热会在后台常驻一个 Office 进程，
+    对"只是开一下工具"的用户是纯资源消耗；而且隔离沙箱/测试环境里更不该自动拉起
+    Office。预热用 `DispatchEx` 私有实例，不碰用户已打开的 Word。
     """
     global _warm_word_thread, _warm_word_running
     if _warm_word_running:
+        return
+    if _engine_probe_disabled() or (os.environ.get("HN_WARM_OFFICE") or "").strip() != "1":
+        logger.info("Office 预热未启用（默认关闭；需要时设置 HN_WARM_OFFICE=1）")
         return
 
     _warm_word_running = True
@@ -191,7 +220,7 @@ def start_word_warmup() -> None:
 
         pythoncom.CoInitialize()
         try:
-            word = win32com.client.dynamic.Dispatch("Word.Application")
+            word = _dispatch_ex("Word.Application")
             # S1-04：预热实例也会被后续转换复用 ⇒ 现在就把宏/弹窗/链接收紧
             _harden_office_com_app(word, "Word(预热)")
             logger.info("Word COM 已预热（后台常驻）")
@@ -229,9 +258,12 @@ _warm_wps_running = False
 
 
 def start_wps_warmup() -> None:
-    """后台线程预热 WPS COM — 启动 wps.exe 并保持存活。"""
+    """后台线程预热 WPS COM — 启动 wps.exe 并保持存活（默认不启用，同 Word 预热）。"""
     global _warm_wps_thread, _warm_wps_running
     if _warm_wps_running:
+        return
+    if _engine_probe_disabled() or (os.environ.get("HN_WARM_OFFICE") or "").strip() != "1":
+        logger.info("WPS 预热未启用（默认关闭；需要时设置 HN_WARM_OFFICE=1）")
         return
 
     _warm_wps_running = True
@@ -246,7 +278,7 @@ def start_wps_warmup() -> None:
             # 先检测 WPS ProgID
             for pid in ["WPS.Application", "KWPS.Application"]:
                 try:
-                    wps = win32com.client.dynamic.Dispatch(pid)
+                    wps = _dispatch_ex(pid)
                     global _wps_progid
                     _wps_progid = pid
                     break
@@ -286,13 +318,31 @@ def stop_wps_warmup() -> None:
 
 
 def _safe_word_dispatch():
+    """获取 Word **私有** COM 实例（DispatchEx；绝不 attach 用户正在用的 Word）。"""
+    return _dispatch_ex("Word.Application")
+
+
+def _safe_wps_dispatch():
+    """获取 WPS **私有** COM 实例：依次尝试缓存/两个 ProgID，全部失败才抛错。
+
+    与 Word 同理用 DispatchEx；ProgID 不再在探测阶段确认（探测不碰 COM）。
     """
-    获取 Word COM 实例。
-    有预热时复用预热进程（瞬间连接），无预热时正常 Dispatch。
-    配合 _copy_to_temp() 使用——COM 操作副本文件，不干扰用户原文件。
-    """
-    import win32com.client
-    return win32com.client.dynamic.Dispatch("Word.Application")
+    global _wps_progid
+    candidates: list[str] = []
+    if _wps_progid:
+        candidates.append(_wps_progid)
+    for pid in ("WPS.Application", "KWPS.Application"):
+        if pid not in candidates:
+            candidates.append(pid)
+    last_err = None
+    for pid in candidates:
+        try:
+            app = _dispatch_ex(pid)
+            _wps_progid = pid
+            return app
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise RuntimeError(f"WPS COM 启动失败（DispatchEx 私有实例）: {last_err}")
 
 
 def get_available_engines() -> dict[str, bool]:
@@ -465,12 +515,21 @@ def _find_wkhtmltopdf() -> str | None:
 
 def _detect_word() -> bool:
     """
-    检测 Microsoft Word 是否可用。
-    先快速检查 EXE 文件，再通过 COM Dispatch 确认，结果缓存。
+    检测 Microsoft Word 是否可用：**只看 exe 是否存在，绝不碰 COM**。
+
+    2026-10-24 现场事故：旧实现用 `Dispatch("Word.Application")` + `Quit()` 做"确认"，
+    而 Word 是单实例 COM 服务器 ⇒ 用户正开着 Word 时会被附身，Quit 直接把用户的文档关掉
+    （测试只是构造主窗口、界面上什么都看不到）。可用性探测不允许有任何用户可见副作用。
+    真正转换时才用 `_dispatch_ex()` 建私有实例，失败由降级链兜底。
     """
     global _engine_cache
     if _engine_cache["word"] is not None:
         return _engine_cache["word"]
+
+    if _engine_probe_disabled():
+        logger.info("HN_NO_ENGINE_PROBE=1：跳过 Office 引擎探测（测试/CI 强制）")
+        _engine_cache["word"] = False
+        return False
 
     # Step 1: 快速文件检测
     exe_found = False
@@ -495,32 +554,27 @@ def _detect_word() -> bool:
         _engine_cache["word"] = False
         return False
 
-    # Step 2: COM Dispatch 确认（有预热时不杀进程）
-    try:
-        import win32com.client
-        word = win32com.client.dynamic.Dispatch("Word.Application")
-        if not _warm_word_running:
-            try:
-                word.Quit()
-            except Exception:
-                pass
-        _engine_cache["word"] = True
-        logger.info("✓ 检测到 Microsoft Word (COM 可用)")
-        return True
-    except Exception as e:
-        logger.warning(f"检测到 WINWORD.EXE 但 COM 调用失败: {e}")
-        _engine_cache["word"] = False
-        return False
+    # exe 在 ⇒ 认为可用（COM 是否真的能起，交给转换时的 DispatchEx + 降级链判定）
+    _engine_cache["word"] = True
+    logger.info("✓ 检测到 Microsoft Word (WINWORD.EXE，未启动 COM)")
+    return True
 
 
 def _detect_wps() -> bool:
     """
-    检测 WPS Office 是否可用。
-    先搜索 wps.exe，再尝试多种 ProgID COM Dispatch，结果缓存。
+    检测 WPS Office 是否可用：**只看 wps.exe 是否存在，绝不碰 COM**（理由同 _detect_word）。
+
+    ProgID（WPS.Application / KWPS.Application）不再在探测阶段确认；转换时由
+    `_safe_wps_dispatch()` 用 DispatchEx 依次尝试。
     """
     global _engine_cache, _wps_progid
     if _engine_cache["wps"] is not None:
         return _engine_cache["wps"]
+
+    if _engine_probe_disabled():
+        logger.info("HN_NO_ENGINE_PROBE=1：跳过 Office 引擎探测（测试/CI 强制）")
+        _engine_cache["wps"] = False
+        return False
 
     # Step 1: 搜索 wps.exe
     exe_found = False
@@ -567,30 +621,11 @@ def _detect_wps() -> bool:
         _engine_cache["wps"] = False
         return False
 
-    # Step 2: COM Dispatch 确认（尝试不同 ProgID）
-    try:
-        import win32com.client
-        for prog_id in ["WPS.Application", "KWPS.Application"]:
-            try:
-                wps = win32com.client.dynamic.Dispatch(prog_id)
-                if not _warm_wps_running:  # P1-6: 与 Word 路径对齐，不杀预热实例
-                    try:
-                        wps.Quit()
-                    except Exception:
-                        pass
-                _engine_cache["wps"] = True
-                _wps_progid = prog_id
-                logger.info(f"✓ 检测到 WPS Office (ProgID={prog_id})")
-                return True
-            except Exception:
-                continue
-        logger.warning("检测到 wps.exe 但所有 ProgID COM 调用均失败")
-        _engine_cache["wps"] = False
-        return False
-    except Exception as e:
-        logger.warning(f"WPS COM 检测异常: {e}")
-        _engine_cache["wps"] = False
-        return False
+    # exe 在 ⇒ 认为可用；ProgID 留默认值，真正转换时由 _safe_wps_dispatch() 逐个试
+    _wps_progid = _wps_progid or "WPS.Application"
+    _engine_cache["wps"] = True
+    logger.info(f"✓ 检测到 WPS Office (wps.exe，未启动 COM；默认 ProgID={_wps_progid})")
+    return True
 
 
 # ============================================================
@@ -685,7 +720,7 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
     wps = None
     doc = None
     try:
-        wps = win32com.client.dynamic.Dispatch(prog_id)
+        wps = _safe_wps_dispatch()
         # S1-04：WPS 打开前同样收紧（宏/弹窗/外链）；属性缺失时日志记录实际生效项
         _harden_office_com_app(wps, "WPS")
 
@@ -822,7 +857,7 @@ def _get_com_page_counts_batch(
             if prog_id == "Word.Application":
                 app = _safe_word_dispatch()
             else:
-                app = win32com.client.dynamic.Dispatch(prog_id)
+                app = _safe_wps_dispatch()
             # S1-04：批量数页同样要打开文档 ⇒ 打开前收紧（宏/弹窗/外链更新）
             _harden_office_com_app(app, label)
 
@@ -954,7 +989,7 @@ def _get_wps_page_count(file_path: str) -> int:
     wps = None
     doc = None
     try:
-        wps = win32com.client.dynamic.Dispatch(prog_id)
+        wps = _safe_wps_dispatch()
         # S1-04：WPS 打开前同样收紧（宏/弹窗/外链）
         _harden_office_com_app(wps, "WPS")
 

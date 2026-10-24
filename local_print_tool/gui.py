@@ -7493,8 +7493,9 @@ class MainWindow(QMainWindow):
         _disable_combo_wheel(self._edit_engine)
         self._edit_engine.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_engine)
-        # 灰度不可用引擎（延迟到窗口显示后，避免阻塞启动）
-        QTimer.singleShot(0, self._refresh_engine_availability)
+        # 引擎可用性**按需**刷新：不再启动时探测（2026-10-24 现场：旧探测会 Dispatch
+        # 用户正在用的 Word 并 Quit 掉它）。首次选中 Word 文件重建下拉时会调
+        # _refresh_engine_availability；探测本身也已改成完全不碰 COM。
 
         # 渲染质量（逐文件）
         label_dpi = QLabel("DPI：")

@@ -275,16 +275,14 @@ def main():
     # 后台：外部工具检测（日志记录，不阻塞 UI）
     _check_external_tools(logger)
 
-    # 后台：预热 Word COM + WPS COM
+    # 2026-10-24：**不再**在启动时预热 Word/WPS，也不再定时刷新引擎可用性。
+    # 原因：预热会在后台常驻 Office 进程（且旧实现用 Dispatch 会附着用户已打开的实例）；
+    # 引擎可用性第一次真正需要时（选中 Word 文件重建下拉 / 转换前）才算，探测本身也不再碰 COM。
+    # 需要预热的老办法仍可用：设置 HN_WARM_OFFICE=1（converter.start_*_warmup 会生效）。
     from converter import start_word_warmup, stop_word_warmup, start_wps_warmup, stop_wps_warmup
-    start_word_warmup()
+    start_word_warmup()   # 默认 no-op（HN_WARM_OFFICE!=1）；显式设置时才预热
     start_wps_warmup()
-
-    # 后台：刷新引擎可用性（灰度 UI 下拉框）
-    from PySide6.QtCore import QTimer
-    QTimer.singleShot(500, window._refresh_engine_availability)
-
-    # 应用退出时清理预热实例
+    # 应用退出时清理预热实例（未预热时是 no-op）
     app.aboutToQuit.connect(stop_word_warmup)
     app.aboutToQuit.connect(stop_wps_warmup)
 
