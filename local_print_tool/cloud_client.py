@@ -1115,6 +1115,35 @@ class CloudClient(QObject):
                 logger.warning(f"HTTP 拉取排队任务失败: {e}")
             return False
 
+    def pull_pending_all(self, quiet: bool = False, max_rounds: int = 20) -> int:
+        """连续 HTTP 拉单直到队列为空，返回本次新领到的任务数。
+
+        为什么必须连续拉：`/api/pull_queued_orders` 每次只返回**一个**任务（后端
+        `fetch_and_lock_task` 的 `LIMIT 1`，为的是多台打印机并发领取时不重复分配），
+        而自动打印（无障碍）只等 AUTO_PRINT_DEBOUNCE_MS（8 秒）就开打 —— 同一订单的
+        「第 2 个文件」若没在这一轮里到齐，就只能等后端 30 秒扫描用 SocketIO 补推，
+        那时第一份已经开打，**整张订单被拆成两个打印作业**（2026-10-25 现场
+        HN20261025-0005 / 订单 753：6 页双面文件先打，1 页单面文件 14 秒后才到，
+        进了补打队列，操作员看到「一次订单打了两次」）。
+
+        `max_rounds` 是护栏：后端异常持续返任务时也不会无限循环（正常 1~3 轮即空）。
+        本轮没有新任务、或本次 HTTP 失败即停（失败不重试 —— 交给
+        `_pull_fallback_loop` 的退避循环）；停止事件置位时立即退出。
+        """
+        total = 0
+        rounds = max(1, int(max_rounds))
+        for _ in range(rounds):
+            if self._stop_event.is_set():
+                break
+            before = set(self._pending_tasks)
+            if not self.pull_pending(quiet=quiet):
+                break                       # HTTP 不通 / 非 2xx：不在这里死循环
+            new_ids = set(self._pending_tasks) - before
+            if not new_ids:
+                break                       # 队列已空
+            total += len(new_ids)
+        return total
+
     def _pull_fallback_loop(self):
         """断线期间的 HTTP 兜底拉单。
 
@@ -1273,7 +1302,10 @@ class CloudClient(QObject):
             except Exception as e:
                 logger.warning(f"接单续期异常: {e}")
         try:
-            self.pull_pending()
+            # 必须**连续**拉到空：拉单接口每次只给一个任务，而同一订单的多文件要尽量
+            # 同时到齐（自动打印只等 AUTO_PRINT_DEBOUNCE_MS=8s，晚到的会被拆成第二个
+            # 打印作业 —— 2026-10-25 HN20261025-0005 现场）。见 pull_pending_all。
+            self.pull_pending_all()
         except Exception as e:
             logger.warning(f"拉取排队任务异常: {e}")
 
