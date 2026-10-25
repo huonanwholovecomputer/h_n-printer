@@ -1,9 +1,9 @@
 {
-  "version": "4.5.34",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.34.exe",
-  "md5": "e04ef8921f9c0aa74189fdae08ba2f5e",
-  "sha256": "a93da78b7d719b08aecd9aff9f0547157b2265da177613b4bc164029f922e7b2",
-  "notes": "v4.5.34（安全加固 · 收支清算本地服务）：① 结算页背后的本地 HTTP 服务加固 —— 启动令牌改为一次性、用完即失效（地址栏不再残留凭据），外部网页不能再用 DNS rebinding 借你的浏览器读结算数据；代理接口只放行既定的 11 条路径，越界请求一律在发往云端之前拦下；出站打印机 token 改走请求头，不再出现在 URL 里；所有响应补安全头与 CSP。⚠ 直接后果：结算页按 F5 刷新会显示 403（这是预期行为），请从工具菜单「📊 收支清算」重新打开。② 收支清算几处体验修正：「离线未同步」入口改为有单才出现；首次设置的按钮不再常驻；设置页里那条常驻的技术说明已去掉。③ 含 4.5.33 全部内容（云端 Word 走 LibreOffice、首次打开强制设置财务密码、更新清单 ed25519 验签、离线单不放弃等）。",
+  "version": "4.5.35",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.35.exe",
+  "md5": "ebec791a14727b323f5f0d924fa2eea6",
+  "sha256": "7e0de863a3d30af2f729e83265c3645e094df3e8da49a81c6bbfbf479615f28b",
+  "notes": "v4.5.35（安全加固收尾 + 两个现场 bug）：① 修「翻纸窗遮挡导致打印完成提示框整片空白」—— 在需要人工翻纸的机型（如 LaserJet 1020）上跳过本任务后，失败提示框只画出标题栏、内容区纯白；现在提示框会真的画出来并压在最前面。② 修「云端凭空多出一个空的『已预留』订单」—— 取号响应丢包后重连换号会重复占号，现在按标签页带幂等键，同一个号只建一次；已完成/失败/取消的单不会被复用。③ 每台设备改用**自己的**打印机令牌（首次连接自动签发，设置页可「🔑 重新签发本机 token」）；令牌失效会自动退回全站令牌并提示，不影响出纸。④ 本机文件保留期管理：云端文件按各自保留期清理，正在被引用的不按时间删只预警，退出/启动都扫一遍；「保留临时 PDF」默认更安全，开启前会明确提示。⑤ Office 转换更稳：引擎探测不再碰 COM（不会再把你正开着的 Word 关掉），Word/WPS 一律私有实例、不显示界面；转换沙箱已内置但**默认关闭**（真机验证发现它约束不住 Word/WPS，开了没有安全收益）。⑥ 含 4.5.34 全部内容（结算页本地服务加固、更新清单签名、离线单不放弃等）。",
   "sig_algo": "ed25519",
-  "sig": "xhjGOyGVUu9asM2Ng0W5VsmVw0gH0xgKN4SdOgy9F/II8AeZS52i0Qg9GNoJO7AbRUq+TbCI2yHNnc2FZwfTBA=="
+  "sig": "xOvhWhULXsklQ9d2Om3QcGLqLZqpXvX+YbXtnNuZ6xbsBZ37hF/dbdgrJkegovBAhzlGUPd5WftcJ5QmybCQBw=="
 }
