@@ -55,17 +55,73 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEOUT_SEC = 180.0
 DEFAULT_MEMORY_MB = 2048
 
+# 超时按文件大小放大（2026-10-25 真机验证后修）：原来恒定 180 s，把 LibreOffice 原本
+# 600 s 的上限盖掉了 ⇒ 大文件「关沙箱能转完、开沙箱拒转」。
+#   · 下限保留 180 s（**不比改前更短**：小文件不会因为换口径反而超时）；
+#   · 5 s/MB 线性放大，上限 600 s（与 LibreOffice 原口径一致）；
+#   · HN_OFFICE_SANDBOX_TIMEOUT 仍可强制覆盖（现场调试用）。
+MIN_TIMEOUT_SEC = 180.0
+MAX_TIMEOUT_SEC = 600.0
+SEC_PER_MB = 5.0
+
+# 子进程环境标记：worker 看到它就必须走进程内转换，绝不再起第二个 worker。
+# 不加标记时 HN_OFFICE_SANDBOX=1 会无限套娃（实测 11.5 s 内 79 个并发 convert_worker）。
+CHILD_ENV = "HN_OFFICE_SANDBOX_CHILD"
+
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _CREATE_NO_WINDOW = 0x08000000
 
 
-def _timeout_sec() -> float:
+def _timeout_for_size(size_mb: float) -> float:
+    """按文件大小算超时（秒）：min(max(180, size_mb*5), 600)。"""
     try:
-        return max(10.0, float(os.environ.get("HN_OFFICE_SANDBOX_TIMEOUT", DEFAULT_TIMEOUT_SEC)))
+        mb = max(0.0, float(size_mb))
     except (TypeError, ValueError):
+        mb = 0.0
+    return min(max(MIN_TIMEOUT_SEC, mb * SEC_PER_MB), MAX_TIMEOUT_SEC)
+
+
+def _timeout_sec(size_mb: float | None = None) -> float:
+    """生效超时：环境变量覆盖 > 按文件大小 > 默认。"""
+    env = os.environ.get("HN_OFFICE_SANDBOX_TIMEOUT")
+    if env:
+        try:
+            return max(10.0, float(env))
+        except (TypeError, ValueError):
+            pass                      # 值非法时落到按大小/默认，不要把畸形 env 变成"没有超时"
+    if size_mb is None:
         return DEFAULT_TIMEOUT_SEC
+    return _timeout_for_size(size_mb)
+
+
+def _child_env() -> dict:
+    """传给 worker 的环境：带 CHILD_ENV 标记，防止 should_sandbox 再套一层 worker。"""
+    env = dict(os.environ)
+    env[CHILD_ENV] = "1"
+    return env
+
+
+def _is_child_process() -> bool:
+    """当前进程是不是沙箱 worker 拉起的子进程（见 converter.should_sandbox）。"""
+    return (os.environ.get(CHILD_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _log_worker_stderr(stderr: str, ok: bool) -> None:
+    """把 worker 的 stderr 落到主进程日志（2026-10-25：原来成功路径直接丢弃 ⇒ 现场看不到
+    「引擎选择」「COM 安全设置」这些行，开沙箱后等于瞎跑）。最多记 20 行，避免刷屏。"""
+    text = (stderr or "").strip()
+    if not text:
+        return
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    level = logger.info if ok else logger.warning
+    level(f"转换沙箱 worker stderr（{len(lines)} 行）:")
+    for ln in lines[:20]:
+        level("  | %s", ln[:300])
+    if len(lines) > 20:
+        level("  | ...（省略 %d 行）", len(lines) - 20)
+
 
 
 def _memory_mb() -> int:
@@ -202,7 +258,16 @@ def run_office_conversion(src: str, dst: str, image_orientation: str = "auto",
     if not src or not os.path.isfile(src):
         return SandboxResult(status="failed", error=f"源文件不存在: {src}")
 
-    timeout = _timeout_sec() if timeout is None else float(timeout)
+    if timeout is None:
+        try:
+            size_mb = os.path.getsize(src) / (1024.0 * 1024.0)
+        except OSError:
+            size_mb = 0.0
+        timeout = _timeout_sec(size_mb)
+        logger.info(f"转换沙箱超时按文件大小取 {timeout:.0f}s（{size_mb:.1f} MB，"
+                    f"规则 min(max(180, MB*5), 600)）")
+    else:
+        timeout = float(timeout)
     memory_mb = _memory_mb() if memory_mb is None else int(memory_mb)
 
     spec_fd, spec_path = tempfile.mkstemp(suffix=".json", prefix="_convspec_")
@@ -236,6 +301,7 @@ def _run_worker(spec_path: str, timeout: float, memory_mb: int) -> SandboxResult
             proc = subprocess.Popen(
                 _worker_command(spec_path),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=_child_env(),   # 带 CHILD_ENV 标记：worker 内绝不再起第二个 worker
                 creationflags=_CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except OSError as e:
@@ -282,6 +348,8 @@ def _run_worker(spec_path: str, timeout: float, memory_mb: int) -> SandboxResult
         stdout = (out or b"").decode("utf-8", "replace")
         stderr = (err or b"").decode("utf-8", "replace")
         data = _parse_result(stdout)
+        # 成功路径也要看 worker 的 stderr：引擎选择、COM 安全设置都在里面
+        _log_worker_stderr(stderr, ok=bool(data and data.get("ok")))
         if data is None:
             tail = (stderr or stdout).strip()[-300:]
             return SandboxResult(status="failed",

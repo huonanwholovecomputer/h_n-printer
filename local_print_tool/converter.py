@@ -135,7 +135,16 @@ def should_sandbox(file_path: str, from_cloud: bool = False) -> bool:
     · 云端文件在 S1-04 已强制 LibreOffice（无宏执行路径），不必再套 COM 沙箱；
     · xls/xlsx/ppt/pptx 本来就只走 LibreOffice 子进程（独立进程、无宏），不套；
     · 开关关闭 ⇒ 恒 False（对存量行为零影响）。
+
+    ⚠ **worker 内部恒 False**（2026-10-25 真机验证后修）：沙箱 worker 是父进程用
+    `subprocess` 起的，会继承 `HN_OFFICE_SANDBOX=1`；若不做闸门，worker 里的转换又会判定
+    "需要沙箱" ⇒ 再起一个 worker ⇒ 无限套娃（实测 11.5 s 内 79 个并发 `convert_worker`，
+    最终超时失败）。所以 worker 一律带 `HN_OFFICE_SANDBOX_CHILD=1`，这里见到它就是
+    "我已经在沙箱里了，直接转"。
     """
+    if (os.environ.get("HN_OFFICE_SANDBOX_CHILD") or "").strip().lower() in (
+            "1", "true", "yes", "on"):
+        return False
     return (not from_cloud) and ext_of(file_path) in COM_OFFICE_EXTS and office_sandbox_enabled()
 
 

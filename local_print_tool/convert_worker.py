@@ -58,9 +58,19 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": False, "error": "spec 缺少 src/dst"})
             return 2
 
+        # worker 的日志走 stderr，父进程会把它转进主进程日志（2026-10-25：原来 INFO 级
+        # 因为没有 handler 而被丢弃 ⇒ 开沙箱后现场看不到"引擎选择""COM 安全设置"）。
+        import logging  # noqa: PLC0415
+        logging.basicConfig(stream=sys.stderr, level=logging.INFO,
+                            format="%(levelname)s %(name)s: %(message)s")
+
         # 延迟到收到 GO 之后再导入（保证导入/依赖初始化也在 Job 内完成）
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import converter  # noqa: PLC0415
+        logging.getLogger("convert_worker").info(
+            "worker 开始转换: %s → %s（sandbox_child=%s）",
+            os.path.basename(src), os.path.basename(dst),
+            os.environ.get("HN_OFFICE_SANDBOX_CHILD", ""))
 
         conv = converter.UniversalConverter()
         out = conv.convert(
