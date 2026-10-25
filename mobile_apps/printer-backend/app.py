@@ -396,21 +396,23 @@ def _delete_devices(client_ids, reason: str = "") -> list[str]:
 # 默认保留时间：7 天
 DEFAULT_RETENTION = {"days": 7, "hours": 0}
 
-# ===== S1-03（D-6 / D-7 已拍板）：客户自选保留期，服务器给硬上限 =====
-# `max_retention_hours` 是**天花板**（168h = 7 天）：客户可以选"立即 / 24h / 3天 / 7天"，
-# 服务端逐请求夹到 1..168，选超上限按上限截断；`files.retention_hours = 0` 表示"用全局默认"
-# （沿用管理员在「服务器存储」里配的 days/hours，保持旧数据的语义不变）。
+# ===== S1-03（D-6 / D-7 已拍板）：客户保留模式 =====
+# `-1` = 打印完成后立即从服务器删除；`0` = 遵从管理员在「服务器存储」里的当前设置。
+# 正数小时仍保留给旧版客户端，并夹到 1..MAX_RETENTION_HOURS。
 MAX_RETENTION_HOURS = 168
-DEFAULT_FILE_RETENTION_HOURS = 24
-RETENTION_CHOICES_HOURS = (0, 1, 24, 72, 168)   # 立即(1h) / 24h / 3天 / 7天（0=用默认）
+IMMEDIATE_DELETE_RETENTION_HOURS = -1
+DEFAULT_FILE_RETENTION_HOURS = 0
+RETENTION_CHOICES_HOURS = (IMMEDIATE_DELETE_RETENTION_HOURS, 0)
 
 
 def _clamp_retention_hours(value):
-    """把客户选择夹进 1..MAX_RETENTION_HOURS；非法/缺失返回 0（= 用全局默认）。"""
+    """规范化客户保留模式；非法/缺失返回 0（= 遵从服务器当前设置）。"""
     try:
         hours = int(value)
     except (TypeError, ValueError):
         return 0
+    if hours == IMMEDIATE_DELETE_RETENTION_HOURS:
+        return IMMEDIATE_DELETE_RETENTION_HOURS
     if hours <= 0:
         return 0
     return min(hours, MAX_RETENTION_HOURS)
@@ -418,10 +420,17 @@ def _clamp_retention_hours(value):
 
 def get_retention_limits():
     """对外暴露的保留期口径（移动端选择器用；也用于测试）。"""
+    cfg = load_retention_config()
+    server_retention_hours = max(
+        0,
+        int(cfg.get("days", 0) or 0) * 24 + int(cfg.get("hours", 0) or 0),
+    )
     return {
         "max_retention_hours": MAX_RETENTION_HOURS,
         "default_retention_hours": DEFAULT_FILE_RETENTION_HOURS,
         "choices_hours": list(RETENTION_CHOICES_HOURS),
+        "immediate_delete_hours": IMMEDIATE_DELETE_RETENTION_HOURS,
+        "server_retention_hours": server_retention_hours,
     }
 
 # -------- 防滥用 / DDoS 防护阈值 --------
@@ -861,6 +870,88 @@ def _path_shared_by_others(conn, file_path, file_id):
     return False
 
 
+def _purge_file_after_print(file_id):
+    """按“立即删除”模式清理刚打印完成的文件。
+
+    只删除物理文件并清空 files.path；订单/文件元数据保留，历史订单详情仍可展示。
+    若同一物理文件仍被其它 files 行引用（历史 MD5 去重），只清当前行，绝不误删
+    其它订单仍在使用的文件。
+    """
+    if not file_id:
+        return False
+    conn = get_db()
+    path = ""
+    shared = False
+    row = None
+    try:
+        row = conn.execute(
+            "SELECT id, path, original_name, openid, retention_hours "
+            "FROM files WHERE id = ?",
+            (file_id,),
+        ).fetchone()
+        if not row or int(row["retention_hours"] or 0) != IMMEDIATE_DELETE_RETENTION_HOURS:
+            return False
+
+        active_statuses = ('queued', 'printing', 'accepted', 'reserved',
+                           'scheduled', 'waiting', 'downloading')
+        placeholders = ",".join("?" for _ in active_statuses)
+        busy = conn.execute(
+            f"SELECT 1 FROM order_files WHERE file_id = ? AND status IN ({placeholders}) LIMIT 1",
+            (file_id, *active_statuses),
+        ).fetchone()
+        if not busy:
+            busy = conn.execute(
+                f"SELECT 1 FROM orders WHERE file_id = ? AND status IN ({placeholders}) LIMIT 1",
+                (file_id, *active_statuses),
+            ).fetchone()
+        if busy:
+            print(f"  [DEL] 立即删除暂缓：文件 {file_id[:8]}... 仍被其它活跃订单使用")
+            return False
+
+        path = row["path"] or ""
+        if not path:
+            return False
+        shared = _path_shared_by_others(conn, path, file_id)
+        if not shared and os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError as e:
+                print(f"  [DEL] 立即删除文件失败 {_rel_display(path)}: {type(e).__name__}")
+                return False
+
+        conn.execute("UPDATE files SET path = '', size = 0 WHERE id = ?", (file_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    if path and not shared:
+        try:
+            rel = os.path.relpath(path, UPLOAD_DIR)
+            index = load_md5_index()
+            dead = [
+                k for k, v in index.items()
+                if (isinstance(v, str) and v == rel)
+                or (isinstance(v, dict) and v.get("path") == rel)
+            ]
+            for k in dead:
+                index.pop(k, None)
+            if dead:
+                save_md5_index(index)
+        except Exception as e:  # noqa: BLE001
+            print(f"  [DEL] 立即删除后清理 MD5 索引失败: {type(e).__name__}")
+
+    if shared:
+        print(f"  [DEL] 文件 {file_id[:8]}... 已按立即删除清空；物理文件仍被其它记录引用")
+    else:
+        print(f"  [DEL] 文件 {file_id[:8]}... 打印完成后已立即从服务器删除")
+    if row is not None:
+        _audit_file_access(
+            "delete", "ok", file_id=file_id, openid=row["openid"] or "",
+            actor="system", ext=_audit_ext(row["original_name"]),
+        )
+    return True
+
+
 def build_md5_index():
     """扫描 uploads/ 目录下所有文件，构建 MD5 索引。已有索引则跳过全量重建但会补全缺失条目。"""
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -1031,10 +1122,33 @@ def cleanup_expired_files():
               AND datetime(created_at, '+' || retention_hours || ' hours')
                   <= datetime('now', 'localtime')"""
     ).fetchall()
+    # “立即删除”订单若在 print_success 之后清理失败（例如短暂文件占用），定时扫描兜底。
+    # 仅命中已经打印成功、且没有活跃订单引用的文件，上传后尚未下单的文件不会被误删。
+    immediate_rows = conn.execute(
+        """SELECT DISTINCT f.id, f.path, f.retention_hours FROM files f
+           WHERE f.path != '' AND COALESCE(f.retention_hours, 0) = ?
+             AND EXISTS (
+                 SELECT 1 FROM order_files done
+                 WHERE done.file_id = f.id AND done.status = 'sent'
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM order_files busy
+                 WHERE busy.file_id = f.id AND busy.status IN
+                     ('queued', 'printing', 'accepted', 'reserved',
+                      'scheduled', 'waiting', 'downloading')
+             )
+             AND NOT EXISTS (
+                 SELECT 1 FROM orders busy_order
+                 WHERE busy_order.file_id = f.id AND busy_order.status IN
+                     ('queued', 'printing', 'accepted', 'reserved',
+                      'scheduled', 'waiting', 'downloading')
+             )""",
+        (IMMEDIATE_DELETE_RETENTION_HOURS,),
+    ).fetchall()
     # 0 天 0 小时 = 全局策略永不过期（但上面的"客户自选到期"仍要执行）
     if no_retention:
         rows = []
-        if not per_file_rows:
+        if not per_file_rows and not immediate_rows:
             conn.close()
             return
     else:
@@ -1045,6 +1159,10 @@ def cleanup_expired_files():
     # 合并去重（同一个文件可能同时命中全局与自选口径）
     _seen_ids = {r["id"] for r in rows}
     for _r in per_file_rows:
+        if _r["id"] not in _seen_ids:
+            rows = list(rows) + [_r]
+            _seen_ids.add(_r["id"])
+    for _r in immediate_rows:
         if _r["id"] not in _seen_ids:
             rows = list(rows) + [_r]
             _seen_ids.add(_r["id"])
@@ -3121,11 +3239,25 @@ def next_order_number():
     """本地打印工具获取下一个可用订单号（需 token 认证）。
     调用即分配，同时在数据库创建 reserved 状态占位记录，
     防止订单号被浪费。若后续未调用 /api/local_orders 提交，
-    超时后由定时任务自动标记为 abandoned。"""
+    超时后由定时任务自动标记为 abandoned。
+
+    **取号幂等（2026-10-25 现场）**：调用方可带 `request_id`（同一标签页/同一订单固定不变，
+    由本地工具生成并随标签页持久化）。同一个 request_id 已经建过 reserved 占位单时，
+    **直接返回那个订单号**，不再新建：
+      现场 LaserJet 1020 机器上 `/api/next_order_number` 的响应在 TLS 层丢了
+      (`SSLEOFError`)，服务端其实已经建好占位单 HN20261025-0003，客户端却按超时回落本地
+      临时号；十几分钟后重连同步换号时又申请到 HN20261025-0004 ⇒ 云端留下一个**永远空的
+      「已预留」0003**（结算页可见、还吃掉一个订单号）。带上 request_id 后，那次重连拿到
+      的是 0003 本身，订单信息写进同一行，不再有多余的空预留单。
+    只复用 `status='reserved'` 的行（纯占位/预留上报都还没定稿）：已完成/失败/取消的行
+    绝不复用，否则会把新订单挂到旧单号上。
+    """
     token = _get_printer_token()
     if not _authenticate_printer(token):
         return jsonify({"success": False, "message": "token 无效"}), 403
-    order_number = generate_order_number()
+
+    # 取号幂等键（可选；旧版客户端不带）
+    request_id = (request.args.get("request_id") or request.form.get("request_id") or "").strip()[:128]
 
     # 预留即记归属（与 local_orders 上报口径一致）：先把当前归属者写进占位单，
     # 这样即使预留后未打印上报（被标 abandoned），也不会留下 owner_name 为空的“无归属”残留。
@@ -3139,19 +3271,64 @@ def next_order_number():
         is_admin_print = 1  # 本地预留默认视为管理员自行打印
     owner_name = owner_name or DEFAULT_OWNER_NAME
 
-    # 创建占位订单记录（状态 reserved），后续 /api/local_orders 会更新为 sent
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def _existing_row(conn_, req):
+        """同一 request_id 的本地订单行（openid='local'；带状态，供判定能否复用）。
+
+        查询失败（锁/表结构异常）一律当"没有"处理：这段只是**防重复建占位单的优化**，
+        绝不能让取号本身 500（旧版没有这次查询，照样要能取到号）。
+        """
+        if not req:
+            return None
+        try:
+            return conn_.execute(
+                """SELECT order_number, status FROM orders
+                   WHERE openid = 'local' AND client_request_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (req,),
+            ).fetchone()
+        except Exception:
+            return None
+
     conn = get_db()
+    order_number = ""
+    insert_req = request_id      # 写进新占位单的幂等键（可能因为"键已被终态单占用"而清空）
     try:
-        conn.execute(
-            """INSERT INTO orders (file, copies, status, created_at, openid, order_number, source,
-                                   owner_name, is_admin_print)
-               VALUES (?, 1, 'reserved', ?, 'local', ?, 'local', ?, ?)""",
-            ("（预留位置）", created_at, order_number, owner_name, is_admin_print),
-        )
-        conn.commit()
-    except Exception:
-        pass  # 占位插入失败不影响订单号分配
+        # ① 幂等复用：上次取号的响应丢了/客户端重试 → 返回同一个号（不再新建占位单）
+        row = _existing_row(conn, request_id)
+        if row is not None and row["status"] == "reserved":
+            try:
+                app.logger.info("next_order_number 复用已预留订单号: request_id=%s → %s",
+                                request_id, row["order_number"])
+            except Exception:
+                pass
+            return jsonify({"success": True, "order_number": row["order_number"], "reused": True})
+        if row is not None:
+            # 这把钥匙已经绑在一张**终态**订单上（已完成/失败/取消…）：新订单必须换号，
+            # 而且不能再用同一把钥匙（(openid, client_request_id) 是部分唯一索引）——
+            # 否则会把新订单挂到旧单号上，或者插入直接撞唯一索引。
+            insert_req = ""
+
+        order_number = generate_order_number()
+        # 创建占位订单记录（状态 reserved），后续 /api/local_orders 会更新为 sent
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            conn.execute(
+                """INSERT INTO orders (file, copies, status, created_at, openid, order_number, source,
+                                       owner_name, is_admin_print, client_request_id)
+                   VALUES (?, 1, 'reserved', ?, 'local', ?, 'local', ?, ?, ?)""",
+                ("（预留位置）", created_at, order_number, owner_name, is_admin_print, insert_req),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # 同一 request_id 并发取号：另一个请求先插进去了 ⇒ 回滚后返回它那个号
+            conn.rollback()
+            row = _existing_row(conn, insert_req)
+            if row is not None and row["status"] == "reserved":
+                return jsonify({"success": True, "order_number": row["order_number"],
+                                "reused": True})
+            # 其余完整性冲突（极少）：占位单插不进去不影响订单号分配
+        except Exception:
+            pass  # 占位插入失败不影响订单号分配
     finally:
         conn.close()
 
@@ -3528,7 +3705,13 @@ def process_pending_orders():
             conn.close()
             if frow and os.path.exists(frow["path"]):
                 file_path = frow["path"]
-                file_name = frow["original_name"]
+                # 文件名以 order_files.file_name（顾客看到的原始名）为准；files.original_name
+                # 是**上传时的临时名**（小程序 tmp_xxx.pdf），只在订单元数据为空时兜底。
+                # 2026-10-25 现场 HN20261025-0005：同一订单两个文件，走 HTTP 拉单的那个显示
+                # 「示波器的使用.pdf」，走本推送的这个显示「tmp_3de4….pdf」—— 两条通道口径
+                # 不一致，操作员在标签页里看到的就是一串乱码名。
+                if not (file_name or "").strip():
+                    file_name = frow["original_name"]
 
         if not file_path:
             print(f"  [FAIL] 子任务 #{of_id}: 文件不存在")
@@ -3807,7 +3990,7 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             "SELECT md5, path, retention_hours FROM files WHERE id = ?", (file_id,)
         ).fetchone()
         conn.close()
-        # S1-03：把该文件的保留期一并下发（客户端据此清理本地副本；0 = 未自选 → 本地默认 24h）
+        # S1-03：把该文件的保留模式一并下发（-1 立即删除 / 0 服务器管理 / 正数旧客户端）
         if row is not None:
             try:
                 task_msg["retention_hours"] = int(row["retention_hours"] or 0)
@@ -4404,7 +4587,7 @@ def on_print_success(data):
     # —— operator_client 被断线回滚清空后**完全放行**，任何注册设备都能把别人的任务标 sent。
     conn = get_db()
     row = conn.execute(
-        "SELECT order_id, operator_client FROM order_files WHERE id = ?", (task_id,)
+        "SELECT order_id, operator_client, file_id FROM order_files WHERE id = ?", (task_id,)
     ).fetchone()
     ok, own = _subtask_ownership(task_id, client_id, conn=conn)
     if not ok:
@@ -4471,6 +4654,8 @@ def on_print_success(data):
     # 同步本地回报的实际打印配置（份数/双面/范围/页数）并重算价格
     _sync_subtask_config(task_id, data.get("copies"), data.get("duplex"),
                          data.get("page_range"), data.get("page_count"))
+    if row and row["file_id"]:
+        _purge_file_after_print(row["file_id"])
 
     print(f"  [OK] 子任务 #{task_id}: 客户端确认打印成功")
 
@@ -5872,8 +6057,8 @@ def list_my_files():
     · 只回**自己的**行（openid 一致），已过期/已清理（path=''）的不回；
     · `in_active_order`：仍被排队/打印中的订单引用 ⇒ 前端把「删除」置灰
       （服务端 DELETE 也会再判一次，返回 409）；
-    · `retention_hours` / `auto_delete_at`：把"保留期"变成顾客看得见的事实
-      （行上没选过就按全局默认；全局设成"永不过期"时 `auto_delete_at` 为空）。
+    · `retention_mode` / `retention_label` / `auto_delete_at`：把保留模式变成
+      顾客看得见的事实（服务器管理时按当前全局设置；立即删除时不给到期时间）。
     """
     if not _rate_limit_ok(f"my_files:{g.openid}", 60, 60):
         return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
@@ -5919,21 +6104,34 @@ def list_my_files():
     out = []
     for r in rows:
         own_hours = int(r["retention_hours"] or 0)
+        immediate = own_hours == IMMEDIATE_DELETE_RETENTION_HOURS
         eff_hours = own_hours if own_hours > 0 else global_hours
         auto_delete_at = ""
-        if eff_hours > 0 and r["created_at"]:
+        if not immediate and eff_hours > 0 and r["created_at"]:
             try:
                 auto_delete_at = (datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
                                   + timedelta(hours=eff_hours)).strftime("%Y-%m-%d %H:%M:%S")
             except (TypeError, ValueError):
                 auto_delete_at = ""
+        if immediate:
+            retention_label = "打印完成后立即删除"
+        elif eff_hours > 0:
+            retention_label = (
+                f"保留 {eff_hours // 24} 天"
+                if eff_hours >= 24 and eff_hours % 24 == 0
+                else f"保留 {eff_hours} 小时"
+            )
+        else:
+            retention_label = "不自动删除"
         out.append({
             "file_id": r["id"],
             "original_name": r["original_name"],
             "size": int(r["size"] or 0),
             "page_count": int(r["page_count"] or 0),
             "created_at": r["created_at"],
-            "retention_hours": eff_hours,
+            "retention_hours": -1 if immediate else eff_hours,
+            "retention_mode": "immediate" if immediate else "server",
+            "retention_label": retention_label,
             "auto_delete_at": auto_delete_at,
             "in_active_order": r["id"] in busy_ids,
         })
@@ -6600,8 +6798,8 @@ def upload_file():
         return jsonify({"success": False, "message": "文件名为空"}), 400
 
     file_id = uuid.uuid4().hex
-    # S1-03（D-6）：客户自选的保留期（表单字段 retention_hours），服务端夹到 1..168。
-    # 缺省/非法 = 0 = 用全局默认（与旧客户端完全兼容）。
+    # S1-03（D-6）：-1 = 打印完成立即删除；0 = 遵从服务器当前设置。
+    # 正数仍兼容旧客户端，并夹到 1..168。
     _retention_hours = _clamp_retention_hours(request.form.get("retention_hours"))
     ext = os.path.splitext(f.filename)[1]  # 保留原始大小写
     ext_lower = ext.lower().lstrip(".")
@@ -7027,10 +7225,19 @@ def submit_order():
         if _fid not in (None, "") and not isinstance(_fid, str):
             return jsonify({"success": False, "message": "file_id 不合法"}), 400
 
-    # S2-08（D-6）：客户在下单页选的「文件保留时长」。上传发生在选文件当下、保留期却可能在
-    # 提交前才改，所以**以提交时为准**：写事务里把本单全部文件的 retention_hours 统一改写
-    # （只动自己名下的行；钳到 1..168；0/非法 = 不动，继续用上传时或全局默认）。
-    order_retention_hours = _clamp_retention_hours(data.get("retention_hours"))
+    # S2-08（D-6）：客户在下单页选的保留模式。新客户端用 retention_mode 区分
+    # immediate/server，确保提交前从“立即删除”切回“遵从服务器管理”时 0 能真正覆盖上传值；
+    # 旧客户端不带 mode 时，沿用“正数 retention_hours 才改写”的兼容语义。
+    retention_mode = (data.get("retention_mode") or "").strip().lower()
+    if retention_mode == "immediate":
+        order_retention_hours = IMMEDIATE_DELETE_RETENTION_HOURS
+        apply_order_retention = True
+    elif retention_mode == "server":
+        order_retention_hours = 0
+        apply_order_retention = True
+    else:
+        order_retention_hours = _clamp_retention_hours(data.get("retention_hours"))
+        apply_order_retention = order_retention_hours > 0
 
     user_is_admin = (g.user_role == "admin")
     # v24.1：管理员自行打印标记（仅管理员可设置；非管理员一律强制 0，防止伪造）
@@ -7171,7 +7378,7 @@ def submit_order():
 
         # S2-08（D-6）：本单文件的保留期以提交时的选择定稿（文件是先上传、后选保留期的）。
         # 只 UPDATE（不读盘，符合 S2-02 对写事务的约束）；只动自己名下的文件。
-        if order_retention_hours > 0:
+        if apply_order_retention:
             _ret_ids = [it["file_id"] for it in file_plan if it.get("file_id")]
             if _ret_ids:
                 _rph = ",".join("?" for _ in _ret_ids)
@@ -7403,7 +7610,7 @@ def pull_queued_orders():
         "bound_owner_name": _get_bound_owner_name(task.get("openid") or ""),
         # 订单来源（wechat/app/local），本地工具云端任务列表展示
         "source": task.get("source", "") or "wechat",
-        # S1-03：该文件的保留期（小时；0 = 未自选，本地按默认 24h 清理自己的副本）
+        # S1-03：该文件的保留模式（-1 立即删除 / 0 服务器管理 / 正数旧客户端）
         "retention_hours": int(task.get("retention_hours") or 0),
     }
     if task["file_id"]:

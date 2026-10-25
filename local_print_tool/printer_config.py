@@ -82,6 +82,10 @@ class TabSettings:
     manual_duplex_pending: bool = False
     # 订单备注（v4.6）：标签页（订单）级，不依赖选中任务；云端订单注入后端 remark
     remark: str = ""
+    # 取号幂等键（2026-10-25）：本标签页第一次向云端要订单号时生成并持久化，之后每次重试
+    # /api/next_order_number 都带同一个值。上次响应丢包（服务端已建占位单、客户端却按超时
+    # 回落本地临时号）时，重连换号能拿回**同一个号**，不会在云端留下一个空的「已预留」订单。
+    order_req_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -96,6 +100,7 @@ class TabSettings:
             "is_admin_print": self.is_admin_print,
             "manual_duplex_pending": self.manual_duplex_pending,
             "remark": self.remark,
+            "order_req_id": self.order_req_id,
         }
 
     @classmethod
@@ -116,6 +121,7 @@ class TabSettings:
             is_admin_print=_bool_or_default(data.get("is_admin_print"), True),
             manual_duplex_pending=_bool_or_default(data.get("manual_duplex_pending"), False),
             remark=str(data.get("remark", "") or ""),
+            order_req_id=str(data.get("order_req_id", "") or ""),
         )
 
     def calc_extra_total(self, base_total: float, config: "PrinterConfig") -> float:

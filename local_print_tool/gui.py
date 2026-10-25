@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 import requests as http_requests
 import traceback
 from dataclasses import dataclass, field
@@ -102,7 +103,7 @@ import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.34"
+APP_VERSION = "4.5.35"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -1171,6 +1172,48 @@ class ManualDuplexDialog(QDialog):
         if self._mode in ("flip", "flip_gate"):
             self._on_skip()
         super().closeEvent(ev)
+
+
+class _MsgBoxAboveFlipWindow(QObject):
+    """翻纸常驻窗可见期间，让 QMessageBox **真的画出来**（2026-10-25 现场 bug）。
+
+    现场：LaserJet 1020 上「跳过本任务」之后，批次失败的「打印完成（有错误）」提示框是一个
+    **纯白空窗口** —— 标题栏正常（深色、带 HN 图标），内容区全白，没有文字、没有 OK 按钮。
+    操作员只能盲点关闭，看不到「成功 0 / 失败 1、纸是半成品」这些关键信息。
+
+    复现与根因（本机真显示器上稳定复现三次）：翻纸窗是 `Qt.WindowStaysOnTopHint` 常驻窗
+    （批次一开始就立在最前），而提示框（QMessageBox，父子关系挂在主窗口下）是在它**完全遮住**
+    的位置被创建的 ⇒ Win32 层的首次 paint 从未发生；1.5 秒后翻纸窗自动关闭、提示框露出来时，
+    DWM 里仍是一片空白，之后 `repaint()` 也不会恢复（Qt 的 backing store 其实有内容 ——
+    `grab()` 能拿到完整文字与按钮，屏幕就是不画）。
+    对照组：① 把提示框自己也设成置顶 → 正常；② 先收起翻纸窗再弹 → 正常；③ 翻纸窗不可见时
+    弹 → 正常。所以只要**创建/显示那一刻不被完全遮挡**就不会白。
+
+    修法（本类）：应用级事件过滤器 —— 翻纸窗可见期间，任何 QMessageBox 显示时补一个置顶标志
+    （它本来就是模态框，理应盖在最上面）；翻纸窗不在场时什么都不做（零回归，也不影响正常
+    提示框的层级）。实测：同一个「打印完成（有错误）」框在翻纸窗还开着时也能正常显示文字与
+    按钮，翻纸窗随后自动关闭，提示框留在最前等操作员点确定。
+    """
+
+    def __init__(self, owner: "MainWindow"):
+        super().__init__(owner)
+        self._owner = owner
+
+    def eventFilter(self, obj, ev):       # noqa: N802（Qt 命名）
+        try:
+            if ev.type() == QEvent.Show and isinstance(obj, QMessageBox):
+                dlg = getattr(self._owner, "_duplex_dialog", None)
+                if (dlg is not None and dlg is not obj and dlg.isVisible()
+                        and not (obj.windowFlags() & Qt.WindowStaysOnTopHint)):
+                    wh = obj.windowHandle()
+                    if wh is not None:
+                        # 在 Show 事件里改的是**平台窗口**的标志（不重排 Qt 控件、不重新 show，
+                        # 不会把键盘焦点从消息框上抢走）
+                        wh.setFlag(Qt.WindowStaysOnTopHint, True)
+                        logger.debug("翻纸窗可见：提示框补置顶标志（避免被完全遮挡后画不出来）")
+        except Exception as e:      # 纯显示兜底：绝不能因为这里异常让消息框弹不出来
+            logger.debug(f"提示框置顶守卫失败（忽略）: {e}")
+        return False
 
 
 # ── 攒批队列：账本可视化 + 「我已取走」对账入口（2026-10）──────────────────────
@@ -8510,6 +8553,31 @@ class MainWindow(QMainWindow):
         self._config.last_order_number += 1
         return f"HN{today}-L{self._config.last_order_number:04d}"
 
+    def _order_request_id(self, tab) -> str:
+        """本标签页订单的**取号幂等键**（第一次需要时生成，随标签页持久化）。
+
+        为什么需要（2026-10-25 现场）：`/api/next_order_number` 在服务端**一调用就建 reserved
+        占位单**；当响应在 TLS 层丢包时客户端并不知道号已经分配，只能按超时回落本地临时号，
+        十几分钟后重连换号时又会申请到一个新号 ⇒ 云端留下一个永远空的「已预留」订单
+        （现场 HN20261025-0003，0 文件 ¥0.00）。带着同一个 request_id 重试后，后端会把
+        那份占位单的号原样还回来，订单信息写进同一行，空预留单不再产生。
+
+        键按**标签页**生成（一个标签页 = 一张订单）；复制到新标签页会得到新的 TabSettings
+        （新键），不会把两张单的取号串在一起。
+        """
+        if tab is None:
+            return ""
+        rid = (getattr(tab, "order_req_id", "") or "").strip()
+        if not rid:
+            rid = uuid.uuid4().hex
+            tab.order_req_id = rid
+            # 落盘：进程重启/掉电后重试仍用同一把钥匙（否则又会申请到新号）
+            try:
+                self._save_config(sync_ui=False)
+            except Exception as e:
+                logger.debug(f"保存取号幂等键失败（不影响取号）: {e}")
+        return rid
+
     def _ensure_order_number(self) -> str:
         """确保当前标签页有订单号。连线时从后端获取，离线时生成本地临时号（-L 前缀）。"""
         jobs = self._get_current_jobs()
@@ -8526,6 +8594,11 @@ class MainWindow(QMainWindow):
         online = self._cloud_client and self._cloud_client.is_connected()
         if online and self._cloud_client.api_url and self._cloud_client.auth_token:
             tab_key = self._current_tab
+            # 取号幂等键：这次请求的响应万一丢包，重连换号时还会用同一把钥匙拿回同一个号
+            _req_id = self._order_request_id(self._config.tabs.get(tab_key))
+            _params = dict(self._current_owner_params())
+            if _req_id:
+                _params["request_id"] = _req_id
             result: dict = {}
 
             def _net():
@@ -8533,7 +8606,7 @@ class MainWindow(QMainWindow):
                     resp = http_requests.get(
                         f"{self._cloud_client.api_url}/api/next_order_number",
                         headers=auth_headers(self._cloud_client.auth_token),
-                        params=self._current_owner_params(),
+                        params=_params,
                         timeout=5,
                     )
                     if resp.ok:
@@ -8579,7 +8652,7 @@ class MainWindow(QMainWindow):
             return
         if not (self._cloud_client.api_url and self._cloud_client.auth_token):
             return
-        candidates: dict[str, dict] = {}  # old_number → {"owner_name", "is_admin_print"}
+        candidates: dict[str, dict] = {}  # old_number → {"owner_name", "is_admin_print", "request_id"}
         # ① 标签页 jobs
         for key, tab in self._config.tabs.items():
             for job in tab.jobs:
@@ -8588,6 +8661,10 @@ class MainWindow(QMainWindow):
                     candidates[num] = {
                         "owner_name": (tab.owner_name or ""),
                         "is_admin_print": bool(tab.is_admin_print),
+                        # 这个本地号当初是"云端取号响应丢了"才回落的吗？带上同一把钥匙，
+                        # 后端会把当初已经建好的占位单号还给我们（否则又申请一个新号，
+                        # 云端就留下一个永远空的「已预留」订单）。老的/离线的标签页没有键。
+                        "request_id": (getattr(tab, "order_req_id", "") or ""),
                     }
         # ② 本地离线库（含标签页已清理的孤儿单）
         if self._offline_sync:
@@ -8598,19 +8675,23 @@ class MainWindow(QMainWindow):
                     candidates[num] = {
                         "owner_name": (row[5] or ""),
                         "is_admin_print": bool(row[6]),
+                        "request_id": "",
                     }
         if not candidates:
             return
         replacements = {}  # old_number → new_number
         for old_num, meta in candidates.items():
             try:
+                _params = {
+                    "owner_name": meta["owner_name"] or DEFAULT_OWNER_NAME,
+                    "is_admin_print": "1" if meta["is_admin_print"] else "0",
+                }
+                if meta.get("request_id"):
+                    _params["request_id"] = meta["request_id"]
                 resp = http_requests.get(
                     f"{self._cloud_client.api_url}/api/next_order_number",
                     headers=auth_headers(self._cloud_client.auth_token),
-                    params={
-                        "owner_name": meta["owner_name"] or DEFAULT_OWNER_NAME,
-                        "is_admin_print": "1" if meta["is_admin_print"] else "0",
-                    },
+                    params=_params,
                     timeout=5,
                 )
                 if resp.ok and resp.json().get("success"):
@@ -8756,6 +8837,12 @@ class MainWindow(QMainWindow):
         # 不能借 /api/local_orders 把 source 改写成 'local'（2026-10-18 现场：小程序订单
         # 打印后变「本地」）。后端也有同一道闸门（热部署即生效），这里是客户端侧的第一道。
         if any(int(getattr(j, "task_id", 0) or 0) > 0 for j in jobs):
+            return
+        # 本地临时号（-L / LOCAL-）不是云端号：云端没有这一行，上传只会造出一条"号长得像
+        # 本地号"的订单，随后换号流程还会再建一条（重复/错账）。等换号后由同步流程补报。
+        _upper_num = str(order_number or "").upper()
+        if "-L" in _upper_num or _upper_num.startswith("LOCAL-"):
+            logger.debug(f"预留上报跳过本地临时号: {order_number}")
             return
         files_data = []
         total = 0.0
@@ -9450,6 +9537,14 @@ class MainWindow(QMainWindow):
             dlg.continue_requested.connect(self._on_duplex_continue)
             dlg.skip_requested.connect(self._on_duplex_skip)
             self._duplex_dialog = dlg
+            # 翻纸窗是置顶常驻窗：它盖着的 QMessageBox 会**永久空白**（见 _MsgBoxAboveFlipWindow
+            # 顶部现场记录）。装一个应用级事件过滤器，翻纸窗可见时给消息框补置顶。
+            if getattr(self, "_msgbox_topmost_guard", None) is None:
+                _app = QApplication.instance()
+                if _app is not None:
+                    _guard = _MsgBoxAboveFlipWindow(self)
+                    _app.installEventFilter(_guard)
+                    self._msgbox_topmost_guard = _guard
         return dlg
 
     def _show_duplex_dialog(self, dlg: ManualDuplexDialog):
@@ -11297,6 +11392,9 @@ class MainWindow(QMainWindow):
             return order_number, False
 
         self._print_starting = True
+        # 取号幂等键（在线取号前生成并落盘）：响应丢包 → 重连换号时拿回同一个号，
+        # 不留下空的「已预留」占位单（2026-10-25 现场，见 _order_request_id）。
+        req_id = self._order_request_id(tab)
         try:
             result: dict = {}
 
@@ -11304,7 +11402,7 @@ class MainWindow(QMainWindow):
                 try:
                     result.update(self._acquire_order_number_and_upload_net(
                         existing_order, files_data, total_price, extra_fields, tab,
-                        created_at, is_cloud_order=is_cloud_order))
+                        created_at, is_cloud_order=is_cloud_order, request_id=req_id))
                 except Exception as e:
                     result["order_number"] = ""
                     result["uploaded"] = False
@@ -11330,7 +11428,7 @@ class MainWindow(QMainWindow):
 
     def _acquire_order_number_and_upload_net(
         self, existing_order, files_data, total_price, extra_fields, tab, created_at,
-        is_cloud_order: bool = False,
+        is_cloud_order: bool = False, request_id: str = "",
     ) -> dict:
         """后台线程：云端取号 + 订单上报（网络部分）。
 
@@ -11338,6 +11436,7 @@ class MainWindow(QMainWindow):
         仅在线路径使用（离线路径由 _acquire_order_number_and_upload 主线程处理）。
         `is_cloud_order`：本批任务是云端订单（带 task_id）→ **不**再走 /api/local_orders，
         否则后端会把那行订单的 source 改写成 'local'（现场：小程序订单变「本地」）。
+        `request_id`：取号幂等键（见 `_order_request_id`）——响应丢了也能拿回同一个号。
         """
         client = self._cloud_client
         api_url = client.api_url if client else ""
@@ -11346,6 +11445,14 @@ class MainWindow(QMainWindow):
         uploaded = False
 
         def _upload(num: str) -> bool:
+            # 本地临时号不是云端号（云端没有这一行）：按它上报只会造出一条"号长得像本地号"
+            # 的订单，重连换号时再建一条 ⇒ 重复/错账。调用方本该先取号（见下方 existing_order
+            # 分支），这里是最后一道兜底。
+            _up = str(num or "").upper()
+            if not _up or "-L" in _up or _up.startswith("LOCAL-"):
+                self._cloudConnSyncLog.emit(
+                    f"ℹ 本地临时号 {num or '(空)'}：不上报 /api/local_orders（等换号后同步流程补报）")
+                return False
             try:
                 resp = http_requests.post(
                     f"{api_url}/api/local_orders",
@@ -11389,15 +11496,31 @@ class MainWindow(QMainWindow):
                     f"ℹ 云端订单 {existing_order}：本机不再重复上报本地订单"
                     f"（来源由云端订单自身维护，避免被改写成「本地」）")
                 return {"order_number": existing_order, "uploaded": False}
-            self._cloudConnSyncLog.emit(f"📋 复用已有订单号: {existing_order}")
-            return {"order_number": existing_order, "uploaded": _upload(existing_order)}
+            # 本地临时号（-L / LOCAL-，上一轮取号失败/离线留下的）**不是云端号**：
+            # 按它上报会在云端建出一条怪号订单，随后换号流程还会再建一条。
+            # 所以当作"还没有订单号"重新取号 —— 带同一把取号键（request_id）时，
+            # 服务端会把上次丢包时已建好的占位单号还回来，正好把那份空预留写满。
+            _existing_upper = str(existing_order).upper()
+            if "-L" in _existing_upper or _existing_upper.startswith("LOCAL-"):
+                self._cloudConnSyncLog.emit(
+                    f"ℹ 本地临时号 {existing_order} 尚未换成云端号：先取号再上报"
+                    f"（不按本地号建单）")
+                existing_order = ""
+            else:
+                self._cloudConnSyncLog.emit(f"📋 复用已有订单号: {existing_order}")
+                return {"order_number": existing_order, "uploaded": _upload(existing_order)}
 
         # 在线：从后端获取全局唯一订单号（同时后端创建 reserved 占位记录）——
         # 预留即带当前标签页归属，避免上报失败时占位单无归属
+        # request_id：取号幂等键。响应丢包时服务端其实已经建好占位单，凭这把钥匙重试能拿回
+        # **同一个号**（否则每次重试都新建占位单 → 云端一堆空的「已预留」）。
+        _params = {**{"token": token}, **self._current_owner_params()}
+        if request_id:
+            _params["request_id"] = request_id
         try:
             resp = http_requests.get(
                 f"{api_url}/api/next_order_number",
-                params={**{"token": token}, **self._current_owner_params()},
+                params=_params,
                 timeout=5,
             )
             if resp.ok:
