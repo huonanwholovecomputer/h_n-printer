@@ -1274,7 +1274,9 @@ Component({
 
     _decorateMyFile(f) {
       const hours = Number(f.retention_hours) || 0
-      const retentionText = hours > 0 ? ('保留 ' + (hours >= 24 && hours % 24 === 0 ? (hours / 24) + ' 天' : hours + ' 小时')) : '不自动删除'
+      const retentionText = f.retention_label || (hours < 0
+        ? '打印完成后立即删除'
+        : (hours > 0 ? ('保留 ' + (hours >= 24 && hours % 24 === 0 ? (hours / 24) + ' 天' : hours + ' 小时')) : '不自动删除'))
       const expireText = f.auto_delete_at ? ('将于 ' + f.auto_delete_at + ' 自动删除') : retentionText
       return Object.assign({}, f, {
         sizeText: this._fmtFileSize(f.size),

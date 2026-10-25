@@ -1703,6 +1703,9 @@ picker-view-column {
 }
 
 /* ==================== 文件保留与隐私（S2-08 / DS-19） ==================== */
+.privacy-card {
+  margin-top: 16rpx;
+}
 .privacy-retention-row {
   display: flex;
   align-items: center;
@@ -1725,6 +1728,7 @@ picker-view-column {
   font-size: 24rpx;
   color: var(--text-secondary);
   background: rgba(120, 120, 128, 0.12);
+  white-space: nowrap;
 }
 .privacy-chip-active {
   color: #fff;
@@ -1736,6 +1740,9 @@ picker-view-column {
   font-size: 22rpx;
   line-height: 1.5;
   color: var(--text-tertiary);
+}
+.privacy-retention-hint-line {
+  display: block;
 }
 .privacy-consent-row {
   display: flex;
@@ -1778,6 +1785,9 @@ picker-view-column {
 }
 .privacy-notice-section {
   margin-bottom: 20rpx;
+}
+.privacy-notice-copy {
+  display: block;
 }
 .privacy-notice-title {
   display: block;

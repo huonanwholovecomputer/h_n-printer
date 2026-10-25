@@ -220,10 +220,11 @@ Component({
     coverPage: false,
     // 订单备注（选填，≤100 字）
     remark: '',
-    // S2-08（DS-19 / D-6 / D-7）：文件保留期（客户可选，服务端夹 1..168h）+ 隐私告知同意
-    retentionHours: 24,
-    retentionChoices: [{ hours: 1, label: '1 小时' }, { hours: 24, label: '24 小时' },
-                       { hours: 72, label: '3 天' }, { hours: 168, label: '7 天' }],
+    // S2-08（DS-19 / D-6 / D-7）：-1 立即删除；0 遵从服务器当前设置
+    retentionHours: 0,
+    retentionChoices: [{ hours: -1, label: '立即删除' }, { hours: 0, label: '遵从服务器管理' }],
+    serverRetentionHours: 168,
+    serverRetentionLabel: '7天后自动删除',
     retentionMaxHours: 168,
     privacyAgreed: false,
     showPrivacyNotice: false,
@@ -539,33 +540,41 @@ Component({
 
     _retentionLabel(hours) {
       const h = Number(hours) || 0
-      if (h <= 0) return '默认'
+      if (h < 0) return '立即删除'
+      if (h === 0) return '遵从服务器管理'
       if (h < 24) return h + ' 小时'
       if (h % 24 === 0) return (h / 24) + ' 天'
       return h + ' 小时'
     },
 
-    // 保留期选项来自 /api/retention_config（上限/默认/可选值由服务端定，客户端不硬编码口径）。
-    // 拿不到就保留 data 里的兜底四档 —— 界面永远有可选项，不会因为一次网络失败卡住下单。
+    _serverRetentionLabel(hours) {
+      const h = Math.max(0, Number(hours) || 0)
+      if (h === 0) return '不自动删除'
+      if (h % 24 === 0) return (h / 24) + '天后自动删除'
+      return h + '小时后自动删除'
+    },
+
+    // 保留模式固定为两种；服务器当前设置从 /api/retention_config 动态读取后展示。
     loadRetentionOptions() {
       request({
         url: CONFIG.BASE_URL + '/api/retention_config',
         method: 'GET',
         success: (res) => {
           const d = (res && res.data) || {}
-          if (res.statusCode !== 200 || !d.success || !Array.isArray(d.choices_hours)) return
+          if (res.statusCode !== 200 || !d.success) return
           const maxH = Number(d.max_retention_hours) || 168
-          const defH = Number(d.default_retention_hours) || 24
-          const choices = d.choices_hours
-            .map(h => Math.min(Number(h) || 0, maxH))
-            .filter(h => h > 0)
-            .map(h => ({ hours: h, label: this._retentionLabel(h) }))
-          if (!choices.length) return
+          const serverH = Number(d.server_retention_hours)
+          const choices = [{ hours: -1, label: '立即删除' },
+                           { hours: 0, label: '遵从服务器管理' }]
           const has = choices.some(c => c.hours === this.data.retentionHours)
           this.setData({
             retentionChoices: choices,
             retentionMaxHours: maxH,
-            retentionHours: has ? this.data.retentionHours : Math.min(defH, maxH),
+            serverRetentionHours: Number.isFinite(serverH) ? Math.max(0, serverH) : 168,
+            serverRetentionLabel: this._serverRetentionLabel(
+              Number.isFinite(serverH) ? serverH : 168
+            ),
+            retentionHours: has ? this.data.retentionHours : 0,
           })
         },
         fail: () => {},
@@ -574,7 +583,7 @@ Component({
 
     onSelectRetention(e) {
       const h = Number(e.currentTarget.dataset.hours) || 0
-      if (h <= 0) return
+      if (h !== -1 && h !== 0) return
       this.setData({ retentionHours: h })
     },
 
@@ -3194,8 +3203,9 @@ Component({
           skip_page_validation: skipPageValidation ? 1 : 0,
           // 目标设备（多设备接单）：用户选择的接单设备，订单只发往该设备
           target_client_id: this.data.selectedDeviceId || '',
-          // S2-08：本单文件的保留期（提交时定稿；服务端夹到 1..168h）
+          // S2-08：本单文件的保留模式（提交时定稿；-1 立即删除 / 0 服务器管理）
           retention_hours: Number(this.data.retentionHours) || 0,
+          retention_mode: this.data.retentionHours === -1 ? 'immediate' : 'server',
           auto_print: this.data.autoPrintEnabled ? 1 : 0,
           // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
           is_admin_print: (this.data.userRole === 'admin' && this.data.adminPrintEnabled) ? 1 : 0,

@@ -77,6 +77,8 @@ def checks(t):
                               and "retentionChoices" in t["mp_wxml"]
                               and "retention_hours: String(this.data.retentionHours" in t["mp_js"])
     c["mp_retention_submit"] = ("retention_hours: Number(this.data.retentionHours)" in t["mp_js"])
+    c["mp_retention_modes"] = all(k in t["mp_js"] + t["mp_wxml"]
+                                  for k in ("立即删除", "遵从服务器管理", "打印完成后立即从服务器删除"))
     c["mp_consent_reset"] = "privacyAgreed: false" in t["mp_js"]
     # ---- APP：同一套 ----
     c["app_notice"] = all(k in t["app_html"] for k in
@@ -87,6 +89,8 @@ def checks(t):
                                and "selectRetention" in t["app_js"]
                                and "fd.append('retention_hours'" in t["app_js"])
     c["app_retention_submit"] = "retention_hours: Number(printState.retentionHours)" in t["app_js"]
+    c["app_retention_modes"] = all(k in t["app_html"] + t["app_js"]
+                                   for k in ("立即删除", "遵从服务器管理", "打印完成后立即从服务器删除"))
     c["app_consent_reset"] = "printState.privacyAgreed = false" in t["app_js"]
     # ---- 两端「我的文件」入口 ----
     c["mp_myfiles"] = ('class="myfiles-entry"' in t["mp_me_wxml"]
@@ -107,6 +111,10 @@ def checks(t):
                                      in b
                                      and "UPDATE files SET retention_hours = ?" in b
                                      and "WHERE openid = ? AND id IN" in b)
+    c["backend_retention_modes"] = ("IMMEDIATE_DELETE_RETENTION_HOURS = -1" in b
+                                    and 'retention_mode == "immediate"' in b
+                                    and 'retention_mode == "server"' in b
+                                    and "_purge_file_after_print" in b)
     return c
 
 
@@ -150,12 +158,14 @@ def row_of(fid):
         conn.close()
 
 
-def submit(headers, fid, retention=None, crid=None):
+def submit(headers, fid, retention=None, crid=None, mode=None):
     payload = {"client": "app", "duplex": "off",
                "files": [{"file_id": fid, "file": "a.pdf", "copies": 1}],
                "client_request_id": crid or ("priv-" + fid[:8])}
     if retention is not None:
         payload["retention_hours"] = retention
+    if mode:
+        payload["retention_mode"] = mode
     return http.post("/api/submit_order", json=payload, headers=headers)
 
 
@@ -175,13 +185,25 @@ H.chk("提交带 retention_hours=999 → 200", rs.status_code == 200, rs.status_
 H.chk("★ 提交时 999 被夹到 168 并写回 files 行", row_of(fid2)["retention_hours"] == 168,
       row_of(fid2)["retention_hours"])
 
-# B3. 提交时 0/非法 = 不动（保留上传时的值）
+# B3. 旧客户端不带 mode 时 0 = 不动；新客户端显式 server = 覆盖上传值
 r3 = upload(A, retention=24)
 fid3 = (r3.get_json() or {}).get("file_id")
 rs = submit(A, fid3, retention=0, crid="priv-zero")
-H.chk("提交带 retention_hours=0 → 不改（仍是上传时的 24）",
+H.chk("旧客户端提交 retention_hours=0 → 不改（仍是上传时的 24）",
       rs.status_code == 200 and row_of(fid3)["retention_hours"] == 24,
       (rs.status_code, row_of(fid3)["retention_hours"]))
+rs = submit(A, fid3, retention=0, crid="priv-server-mode", mode="server")
+H.chk("★ 新客户端显式“遵从服务器管理” → 覆盖为 0",
+      rs.status_code == 200 and row_of(fid3)["retention_hours"] == 0,
+      (rs.status_code, row_of(fid3)["retention_hours"]))
+
+# B3b. 显式“立即删除” → 落库 -1
+r_imm = upload(A, name="immediate.pdf")
+fid_imm = (r_imm.get_json() or {}).get("file_id")
+rs = submit(A, fid_imm, retention=-1, crid="priv-immediate", mode="immediate")
+H.chk("★ 新客户端选择“立即删除” → 落库 -1",
+      rs.status_code == 200 and row_of(fid_imm)["retention_hours"] == -1,
+      (rs.status_code, row_of(fid_imm)["retention_hours"]))
 
 # B4. 不能借提交改别人的文件保留期
 r_other = upload(A2, retention=168, name="other.pdf")
@@ -291,7 +313,7 @@ H.chk("全部变异都被判据打红（%d 处）" % len(mutations), bad == 0, b
 
 # 后端行为变异：去掉「提交时改写保留期」→ 行上仍是 0
 mut_tmp, mut_dst = H.mutated_copy([
-    ("        if order_retention_hours > 0:\n", "        if False:\n"),
+    ("        if apply_order_retention:\n", "        if False:\n"),
 ], prefix="hn_privacy_mut_")
 proc = H.run_probe(mut_dst, r"""
 import io

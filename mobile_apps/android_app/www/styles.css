@@ -6346,6 +6346,9 @@ body.theme-dark #view-user-orders .page-size-dropdown {
 
 /* ==================== 文件保留与隐私（S2-08 / DS-19） ====================
    对齐小程序 index.wxss 同名段：rpx → cqw（750 设计稿，1rpx ≈ 0.1333cqw） */
+.privacy-card {
+  margin-top: 2.13cqw;
+}
 .privacy-retention-row {
   display: flex;
   align-items: center;
@@ -6368,6 +6371,7 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   font-size: 3.2cqw;
   color: var(--text-secondary);
   background: rgba(120, 120, 128, 0.12);
+  white-space: nowrap;
 }
 .privacy-chip-active {
   color: #fff;
@@ -6379,6 +6383,9 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   font-size: 2.93cqw;
   line-height: 1.5;
   color: var(--text-tertiary);
+}
+.privacy-retention-hint-line {
+  display: block;
 }
 .privacy-consent-row {
   display: flex;
@@ -6425,6 +6432,9 @@ body.theme-dark #view-user-orders .page-size-dropdown {
 }
 .privacy-notice-section {
   margin-bottom: 2.67cqw;
+}
+.privacy-notice-copy {
+  display: block;
 }
 .privacy-notice-title {
   display: block;

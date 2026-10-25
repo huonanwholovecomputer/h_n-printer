@@ -65,8 +65,10 @@ del_block = block("def delete_my_file(")
 # A. 静态接线
 # ============================================================
 print("=== A. 静态接线 ===")
-H.chk("硬上限 168h / 默认 24h 常量化（D-6 定稿）",
-      "MAX_RETENTION_HOURS = 168" in code and "DEFAULT_FILE_RETENTION_HOURS = 24" in code)
+H.chk("硬上限 168h / 服务端默认 0h / 立即删除 -1 常量化（D-6 定稿）",
+      "MAX_RETENTION_HOURS = 168" in code
+      and "DEFAULT_FILE_RETENTION_HOURS = 0" in code
+      and "IMMEDIATE_DELETE_RETENTION_HOURS = -1" in code)
 H.chk("files.retention_hours 迁移存在",
       "ALTER TABLE files ADD COLUMN retention_hours INTEGER DEFAULT 0" in code)
 H.chk("上传接收 retention_hours 并夹紧",
@@ -76,6 +78,8 @@ H.chk("处理 retention_hours 的 SQL 落库",
 H.chk("★ 清理按**每个文件**的 retention_hours（不只是全局 cutoff）",
       "COALESCE(retention_hours, 0) > 0" in cleanup
       and "datetime(created_at, '+' || retention_hours || ' hours')" in cleanup)
+H.chk("★ 打印成功调用“立即删除”定向清理",
+      '_purge_file_after_print(row["file_id"])' in code)
 H.chk("★ 全局=永不过期时仍执行自选 TTL（早退在自选清理之后）",
       "per_file_rows" in cleanup and
       cleanup.find("per_file_rows = conn.execute(") < cleanup.find("if no_retention:"))
@@ -110,15 +114,17 @@ def _upload(name, retention=None):
     return http.post("/api/upload", data=data, headers=A, content_type="multipart/form-data")
 
 
-H.chk("夹紧矩阵：0→0 / 24→24 / 999→168 / -5→0 / abc→0",
-      [backend._clamp_retention_hours(v) for v in (0, 24, 999, -5, "abc")]
-      == [0, 24, 168, 0, 0],
-      [backend._clamp_retention_hours(v) for v in (0, 24, 999, -5, "abc")])
+H.chk("夹紧矩阵：-1→立即 / 0→服务器 / 24→24 / 999→168 / -5→0 / abc→0",
+      [backend._clamp_retention_hours(v) for v in (-1, 0, 24, 999, -5, "abc")]
+      == [-1, 0, 24, 168, 0, 0],
+      [backend._clamp_retention_hours(v) for v in (-1, 0, 24, 999, -5, "abc")])
 
 r = http.get("/api/retention_config").get_json() or {}
-H.chk("口径接口返回上限/默认/选项",
-      r.get("max_retention_hours") == 168 and r.get("default_retention_hours") == 24
-      and 168 in (r.get("choices_hours") or []))
+H.chk("口径接口返回两种模式 + 服务器当前 7 天设置",
+      r.get("max_retention_hours") == 168
+      and r.get("default_retention_hours") == 0
+      and r.get("choices_hours") == [-1, 0]
+      and r.get("server_retention_hours") == 168)
 
 r = _upload("a.pdf", retention=999)
 fid = (r.get_json() or {}).get("file_id")
@@ -178,6 +184,94 @@ conn.commit()
 conn.close()
 H.chk("被排队订单引用的文件 → 409（不能删正在用的）",
       http.delete("/api/file/" + fid3, headers=A).status_code == 409)
+
+# 立即删除：活跃订单期间保留，打印成功后的定向清理才删除物理文件
+r4 = _upload("immediate.pdf", retention=-1)
+fid4 = (r4.get_json() or {}).get("file_id")
+conn = backend.get_db()
+f4 = conn.execute("SELECT path, retention_hours FROM files WHERE id=?", (fid4,)).fetchone()
+conn.execute("INSERT INTO orders (id, file, copies, status, created_at, openid) "
+             "VALUES (9602, 'immediate.pdf', 1, 'queued', '2026-10-25 10:00:00', 'ret-user')")
+conn.execute("INSERT INTO order_files (id, order_id, file_id, file_name, copies, page_count, "
+             "status, created_at) VALUES (7402, 9602, ?, 'immediate.pdf', 1, 1, 'queued', "
+             "'2026-10-25 10:00:00')", (fid4,))
+conn.commit()
+conn.close()
+backend.cleanup_expired_files()
+H.chk("★ 立即删除文件在订单活跃期间仍保留",
+      f4["retention_hours"] == -1 and os.path.exists(f4["path"]))
+conn = backend.get_db()
+conn.execute("UPDATE order_files SET status='sent' WHERE id=7402")
+conn.execute("UPDATE orders SET status='sent' WHERE id=9602")
+conn.commit()
+conn.close()
+H.chk("打印完成后定向立即删除成功", backend._purge_file_after_print(fid4) is True)
+conn = backend.get_db()
+f4_after = conn.execute("SELECT path, size FROM files WHERE id=?", (fid4,)).fetchone()
+conn.close()
+H.chk("★ 打印完成后物理文件立即删除且 files.path 清空",
+      not os.path.exists(f4["path"]) and not (f4_after["path"] or "") and f4_after["size"] == 0)
+
+# 服务器管理（0）不能被“立即删除”逻辑误伤
+r_server = _upload("server-managed.pdf", retention=0)
+fid_server = (r_server.get_json() or {}).get("file_id")
+conn = backend.get_db()
+f_server = conn.execute("SELECT path FROM files WHERE id=?", (fid_server,)).fetchone()
+conn.close()
+H.chk("★ 服务器管理模式不会走立即删除",
+      backend._purge_file_after_print(fid_server) is False
+      and os.path.exists(f_server["path"]))
+
+# 定时清理兜底：print_success 后的定向清理若未执行，下一轮也能收敛
+r5 = _upload("immediate-fallback.pdf", retention=-1)
+fid5 = (r5.get_json() or {}).get("file_id")
+conn = backend.get_db()
+f5 = conn.execute("SELECT path FROM files WHERE id=?", (fid5,)).fetchone()
+conn.execute("INSERT INTO orders (id, file, copies, status, created_at, openid) "
+             "VALUES (9603, 'immediate-fallback.pdf', 1, 'sent', '2026-10-25 10:00:00', 'ret-user')")
+conn.execute("INSERT INTO order_files (id, order_id, file_id, file_name, copies, page_count, "
+             "status, created_at) VALUES (7403, 9603, ?, 'immediate-fallback.pdf', 1, 1, 'sent', "
+             "'2026-10-25 10:00:00')", (fid5,))
+conn.commit()
+conn.close()
+backend.cleanup_expired_files()
+conn = backend.get_db()
+f5_after = conn.execute("SELECT path FROM files WHERE id=?", (fid5,)).fetchone()
+conn.close()
+H.chk("★ 定时清理兜底也会删除已完成订单的“立即删除”文件",
+      not os.path.exists(f5["path"]) and f5_after is not None and not (f5_after["path"] or ""))
+
+# 真实 SocketIO print_success：归属设备回报成功后立即触发清理（不是只测辅助函数）
+r6 = _upload("immediate-socket.pdf", retention=-1)
+fid6 = (r6.get_json() or {}).get("file_id")
+conn = backend.get_db()
+f6 = conn.execute("SELECT path FROM files WHERE id=?", (fid6,)).fetchone()
+conn.execute("INSERT INTO orders (id, file, copies, status, created_at, openid) "
+             "VALUES (9604, 'immediate-socket.pdf', 1, 'printing', '2026-10-25 10:00:00', 'ret-user')")
+conn.execute("INSERT INTO order_files (id, order_id, file_id, file_name, copies, page_count, "
+             "status, created_at, operator_client, last_operator_client) "
+             "VALUES (7404, 9604, ?, 'immediate-socket.pdf', 1, 1, 'printing', "
+             "'2026-10-25 10:00:00', 'ret-device', 'ret-device')", (fid6,))
+conn.commit()
+conn.close()
+sio_client = backend.socketio.test_client(
+    backend.app, query_string="?token=ret-tok&client_id=ret-device")
+H.chk("立即删除验收：SocketIO 设备已连接", sio_client.is_connected())
+sio_client.emit("print_success", {"task_id": 7404, "copies": 1, "duplex": "off", "page_count": 1})
+time.sleep(0.05)
+sio_client.get_received()
+conn = backend.get_db()
+sent6 = conn.execute("SELECT status FROM order_files WHERE id=7404").fetchone()
+f6_after = conn.execute("SELECT path, size FROM files WHERE id=?", (fid6,)).fetchone()
+conn.close()
+sio_client.disconnect()
+H.chk("★ 真实 print_success 回报后立即删除（同一事件链路）",
+      sent6 and sent6["status"] == "sent"
+      and f6_after is not None and not (f6_after["path"] or "")
+      and not os.path.exists(f6["path"]),
+      (sent6["status"] if sent6 else None,
+       f6_after["path"] if f6_after else None,
+       os.path.exists(f6["path"])))
 
 # ============================================================
 # C. 变异自证：删掉"按文件 TTL"清理

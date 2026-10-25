@@ -73,12 +73,29 @@ function request(options) {
   const RETRY_DELAY = [500, 1500]
   const isLoginUrl = String(options.url || '').indexOf('/api/login') !== -1
 
+  // 2026-10-25 修复（现场：/api/my_files 反复 401）：
+  // 小程序没有请求拦截器，Authorization 全靠调用方手写 —— 漏一处就是永久 401；
+  // 而旧实现在 401 分支里算出了新头（`const header = ...`）却**从来没发出去**
+  // （attempt() 发的是 options.header），等于"续登重放"整条路径从未生效：
+  //   漏带的永远漏带、带过期 token 的永远重发旧 token。
+  // 现在改为**每次发送前现算**：token 只有一个权威来源（storage），
+  //   ① 调用方漏写 Authorization → 自动补；
+  //   ② 调用方写的是过期 token → 用 storage 里的最新值覆盖；
+  //   ③ 续登重放时 storage 已被刷新 ⇒ 重放天然带新 token。
+  const buildHeader = () => {
+    const header = Object.assign({}, options.header)
+    let token = ''
+    try { token = wx.getStorageSync('token') || '' } catch (e) { token = '' }
+    if (token) header['Authorization'] = 'Bearer ' + token
+    return header
+  }
+
   const attempt = (retryCount) => {
     wx.request({
       url: options.url,
       method: options.method || 'GET',
       data: options.data,
-      header: options.header,
+      header: buildHeader(),
       // S1-09：**每个请求都有超时** —— 未显式传就用 12s 默认，绝不落到微信的 60s 默认
       timeout: options.timeout || DEFAULT_TIMEOUT_MS,
       success: (res) => {
@@ -90,8 +107,7 @@ function request(options) {
               if (options.complete) options.complete(res)
               return
             }
-            const header = Object.assign({}, options.header)
-            header['Authorization'] = 'Bearer ' + (wx.getStorageSync('token') || '')
+            // 新 token 已由 _refreshToken 写进 storage，重放时 buildHeader() 会取到它
             setTimeout(() => attempt(retryCount + 1), RETRY_DELAY[retryCount] || 1500)
           })
           return

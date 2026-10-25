@@ -39,10 +39,11 @@ const printState = {
   urgencyPrice: 0,
   coverPage: false,
   remark: '',               // 订单备注（选填，≤100 字）
-  // S2-08（DS-19 / D-6 / D-7）：文件保留期（客户可选，服务端夹 1..168h）+ 隐私告知同意
-  retentionHours: 24,
-  retentionChoices: [{ hours: 1, label: '1 小时' }, { hours: 24, label: '24 小时' },
-                     { hours: 72, label: '3 天' }, { hours: 168, label: '7 天' }],
+  // S2-08（DS-19 / D-6 / D-7）：-1 立即删除；0 遵从服务器当前设置
+  retentionHours: 0,
+  retentionChoices: [{ hours: -1, label: '立即删除' }, { hours: 0, label: '遵从服务器管理' }],
+  serverRetentionHours: 168,
+  serverRetentionLabel: '7天后自动删除',
   retentionMaxHours: 168,
   privacyAgreed: false,
   simplexPrice: FALLBACK_SIMPLEX_PRICE,   // 单面价（loadPricing 从 /api/pricing 同步，此值仅兜底）
@@ -149,36 +150,42 @@ function onPrintTabShown() {
 }
 
 /* ================= 文件保留与隐私（S2-08 / DS-19 / D-6 / D-7） =================
-   保留期选项来自 /api/retention_config（上限/默认/可选值由服务端定，客户端不硬编码口径）；
-   拿不到就保留内置四档 —— 界面永远有得选，不会因为一次网络失败卡住下单。
-   提交时把最终选择随订单一起发（服务端以提交时为准），上传时也带一份供立即删除使用。 */
+   保留模式固定为“立即删除 / 遵从服务器管理”；服务器当前设置由接口动态返回。
+   提交时把最终模式随订单一起发（服务端以提交时为准），上传时也带一份供立即删除使用。 */
 function retentionLabel(hours) {
   const h = Number(hours) || 0;
-  if (h <= 0) return '默认';
+  if (h < 0) return '立即删除';
+  if (h === 0) return '遵从服务器管理';
   if (h < 24) return h + ' 小时';
   if (h % 24 === 0) return (h / 24) + ' 天';
   return h + ' 小时';
+}
+
+function serverRetentionLabel(hours) {
+  const h = Math.max(0, Number(hours) || 0);
+  if (h === 0) return '不自动删除';
+  if (h % 24 === 0) return (h / 24) + '天后自动删除';
+  return h + '小时后自动删除';
 }
 
 async function loadRetentionOptions() {
   try {
     const r = await api('/api/retention_config');
     const d = (r && r.data) || {};
-    if (!(r.status === 200 && d.success && Array.isArray(d.choices_hours))) return;
+    if (!(r.status === 200 && d.success)) return;
     const maxH = Number(d.max_retention_hours) || 168;
-    const defH = Number(d.default_retention_hours) || 24;
-    const choices = d.choices_hours
-      .map(h => Math.min(Number(h) || 0, maxH))
-      .filter(h => h > 0)
-      .map(h => ({ hours: h, label: retentionLabel(h) }));
-    if (!choices.length) return;
+    const serverH = Number(d.server_retention_hours);
+    const choices = [{ hours: -1, label: '立即删除' },
+                     { hours: 0, label: '遵从服务器管理' }];
     printState.retentionChoices = choices;
     printState.retentionMaxHours = maxH;
+    printState.serverRetentionHours = Number.isFinite(serverH) ? Math.max(0, serverH) : 168;
+    printState.serverRetentionLabel = serverRetentionLabel(printState.serverRetentionHours);
     if (!choices.some(c => c.hours === printState.retentionHours)) {
-      printState.retentionHours = Math.min(defH, maxH);
+      printState.retentionHours = 0;
     }
     renderRetentionChips();
-  } catch (e) { /* 保留内置四档 */ }
+  } catch (e) { /* 保留内置两档 */ }
 }
 
 function renderRetentionChips() {
@@ -189,13 +196,19 @@ function renderRetentionChips() {
     '" onclick="selectRetention(' + c.hours + ')">' + escHtml(c.label) + '</view>').join('');
   const hint = document.getElementById('retentionHintText');
   if (hint) {
-    hint.textContent = '到期后服务器自动删除（最长 ' + printState.retentionMaxHours + ' 小时）；也可在「我 → 我的文件」随时删除。';
+    hint.innerHTML =
+      '<text class="privacy-retention-hint-line">立即删除：打印完成后立即从服务器删除。</text>' +
+      '<text class="privacy-retention-hint-line">遵从服务器管理：遵从服务器当前设置，当前设置为“' +
+      escHtml(printState.serverRetentionLabel) + '”。</text>';
   }
+  document.querySelectorAll('.privacy-server-retention-label').forEach(node => {
+    node.textContent = printState.serverRetentionLabel;
+  });
 }
 
 function selectRetention(hours) {
   const h = Number(hours) || 0;
-  if (h <= 0) return;
+  if (h !== -1 && h !== 0) return;
   printState.retentionHours = h;
   renderRetentionChips();
 }
@@ -2015,8 +2028,9 @@ function doSubmit(skipPageValidation) {
       skip_page_validation: skipPageValidation ? 1 : 0,
       // 目标设备（多设备接单）：用户选择的接单设备，订单只发往该设备
       target_client_id: (typeof selectedDeviceId !== 'undefined') ? (selectedDeviceId || '') : '',
-      // S2-08：本单文件的保留期（提交时定稿；服务端夹到 1..168h）
+      // S2-08：本单文件的保留模式（提交时定稿；-1 立即删除 / 0 服务器管理）
       retention_hours: Number(printState.retentionHours) || 0,
+      retention_mode: printState.retentionHours === -1 ? 'immediate' : 'server',
       auto_print: printState.autoPrintEnabled ? 1 : 0,
       // v24.1：管理员自行打印（后端仅管理员角色生效；自己的订单不计入收益）
       is_admin_print: (state.role === 'admin' && printState.adminPrintEnabled) ? 1 : 0,
