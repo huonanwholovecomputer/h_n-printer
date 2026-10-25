@@ -1641,6 +1641,157 @@ def _discard_invalid_pdf(path: str) -> None:
         logger.warning(f"丢弃无效产物失败（忽略）: {path} ({e})")
 
 
+def _strip_docx_external_refs(src: str) -> tuple[str, int]:
+    """把 .docx 副本里**指向外部**的引用剥掉，返回 `(可交给引擎的路径, 剥离条数)`。
+
+    为什么必须做（2026-10-25 真机验证实测，见 docs/S2-03沙箱三引擎验证_2026-10-25.md）：
+    Office 打开文档时会去抓 `TargetMode="External"` 的链接图片（诱捕服务实测 Word 抓 2 次、
+    WPS 1 次、LibreOffice 1 次，**开沙箱照样抓**）—— 这既是隐私泄露（谁在什么时候打印了什么
+    会打到外部服务器），也是"文档可访问内网"的入口。`AutomationSecurity`/`UpdateLinksAtOpen`
+    只挡 `INCLUDEPICTURE` 一类域，挡不住 blip 的 `r:link`。
+
+    做法（不重新序列化 XML，避免破坏 `mc:Ignorable` 的命名空间声明）：
+      1. 解析 `word/_rels/*.rels`，删掉 `TargetMode="External"` 的 `<Relationship>`，记下 Id；
+      2. 在对应部件里删掉**只**引用这些 Id 的属性（`r:link` / `r:embed` / `r:id`）；
+      3. 把 `w:instrText` 里以 INCLUDEPICTURE / LINK 开头的域指令清空（域结果保留占位）。
+    没有可剥的东西时**原样返回原路径**（不产生临时文件）。
+
+    只支持 .docx（OOXML = zip）。`.doc` 是复合二进制，改不了内容 —— 调用方记日志说明限制。
+    """
+    import zipfile  # noqa: PLC0415
+
+    rel_external = re.compile(rb'<Relationship\b[^>]*TargetMode\s*=\s*"External"[^>]*/>', re.I)
+    rel_id = re.compile(rb'\bId\s*=\s*"([^"]+)"')
+    instr = re.compile(rb'<w:instrText\b[^>]*>.*?</w:instrText>', re.S | re.I)
+
+    def _instr_inner(block: bytes) -> bytes:
+        m = re.match(rb'<w:instrText\b[^>]*>(.*?)</w:instrText>', block, re.S | re.I)
+        return m.group(1) if m else b""
+
+    stripped = 0
+    changed: dict[str, bytes] = {}
+    external_ids: dict[str, set[bytes]] = {}
+
+    with zipfile.ZipFile(src) as zin:
+        names = zin.namelist()
+        for name in names:
+            if not (name.endswith(".rels") and "/_rels/" in name):
+                continue
+            raw = zin.read(name)
+            hit_ids: set[bytes] = set()
+            for m in rel_external.finditer(raw):
+                mid = rel_id.search(m.group(0))
+                if mid:
+                    hit_ids.add(mid.group(1))
+            if not hit_ids:
+                continue
+            body = rel_external.sub(b"", raw)
+            changed[name] = body
+            stripped += len(hit_ids)
+            base_dir, rels_name = name.rsplit("/_rels/", 1)
+            part = (base_dir + "/" if base_dir else "") + rels_name[:-len(".rels")]
+            external_ids.setdefault(part, set()).update(hit_ids)
+
+        # 部件里删属性 + 清域指令
+        targets = set(external_ids)
+        targets.update(n for n in names if n.startswith("word/") and n.endswith(".xml"))
+        for name in sorted(targets):
+            if name not in names:
+                continue
+            raw = changed.get(name) or zin.read(name)
+            out = raw
+            for rid in external_ids.get(name, ()):
+                pat = re.compile(rb'\s[\w]+:(?:link|embed|id)\s*=\s*"' + re.escape(rid) + rb'"')
+                out = pat.sub(b"", out)
+
+            instr_hits = 0
+
+            def _clear(m):
+                nonlocal instr_hits
+                inner = re.sub(rb"<[^>]+>", b"", _instr_inner(m.group(0))).strip()
+                if inner.upper().startswith((b"INCLUDEPICTURE", b"LINK ")):
+                    instr_hits += 1
+                    head = m.group(0).split(b">", 1)[0]
+                    return head + b"></w:instrText>"
+                return m.group(0)
+
+            cleaned = instr.sub(_clear, out)
+            stripped += instr_hits
+            if cleaned != raw:
+                changed[name] = cleaned
+
+    if not changed:
+        return src, 0
+
+    import tempfile  # noqa: PLC0415
+    fd, out_path = tempfile.mkstemp(suffix=".docx", prefix="_hn_noref_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(src) as zin, zipfile.ZipFile(out_path, "w") as zout:
+            for item in zin.infolist():
+                data = changed.get(item.filename)
+                if data is None:
+                    data = zin.read(item.filename)
+                zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                zi.compress_type = item.compress_type
+                zi.external_attr = item.external_attr
+                zout.writestr(zi, data)
+    except Exception:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise
+    return out_path, stripped
+
+
+def _prepare_office_src(file_path: str) -> tuple[str, str]:
+    """转换前把「要交给引擎的路径」和「需要事后清理的临时副本」算出来。
+
+    返回 `(src, temp_to_clean)`；没有净化动作时 `temp_to_clean == ""`（原样用原文件）。
+    """
+    ext = ext_of(file_path)
+    if ext == ".docx":
+        try:
+            src, n = _strip_docx_external_refs(file_path)
+        except Exception as e:  # noqa: BLE001 —— 净化是加固，失败不该拦住打印
+            logger.warning(f"剥离 docx 外部引用失败，按原文件转换（风险已记录）: {e}")
+            return file_path, ""
+        if src != file_path:
+            logger.info(f"已剥离 {n} 处 Office 外部引用（转换过程不访问外网）"
+                        f" ({os.path.basename(file_path)})")
+            return src, src
+        return file_path, ""
+    if ext == ".doc":
+        logger.warning("老格式 .doc 是复合二进制，无法剥离文档内的外部引用；"
+                       "如需彻底隔离，请把文档另存为 .docx 再打印")
+    return file_path, ""
+
+
+def _sanitize_office_refs(func):
+    """入口装饰器：先净化（docx 外部引用），再交给引擎链；用完清理临时副本。
+
+    放在装饰器里而不是改函数体：`tests/verify_office_automation_security.py` 会静态取
+    `_convert_office_to_pdf` 的函数体核对「云端分支必须走 LibreOffice」，函数体保持不动最安全。
+    """
+    import functools  # noqa: PLC0415
+
+    @functools.wraps(func)
+    def wrapper(file_path: str, output_pdf: str, *args, **kwargs):
+        src, temp = _prepare_office_src(file_path)
+        try:
+            return func(src, output_pdf, *args, **kwargs)
+        finally:
+            if temp:
+                try:
+                    os.remove(temp)
+                except OSError:
+                    pass
+
+    return wrapper
+
+
+@_sanitize_office_refs
 def _convert_office_to_pdf(file_path: str, output_pdf: str,
                            from_cloud: bool = False) -> None:
     """

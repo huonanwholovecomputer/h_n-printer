@@ -211,6 +211,73 @@ if S.available():
           _res2.status == "timeout" and not os.path.exists(_marker),
           f"status={_res2.status} marker={os.path.exists(_marker)}")
 
+# ── ⑧ Job Object 对 **Office** 的真实覆盖（DCOM 场景，2026-10-25 真机结论）──
+# 上面那条"孙进程"用的是 subprocess.Popen —— 那条路径必然继承 Job，所以它永远绿，
+# 抓不到真实情况：Word/WPS 由 DCOM 启动器 svchost.exe 拉起，**不是** worker 的子进程，
+# 因此不在 Job 内。这里改真跑一次 Word COM，用 QueryInformationJobObject 的成员列表核对。
+# 判据写的是**当前事实**（不覆盖），将来若真做了"收养新 Office PID"，这条会红 ⇒ 提醒同步改口径。
+def _pids_by_names(names):
+    out = {}
+    try:
+        q = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, timeout=20)
+        for line in (q.stdout or b"").decode("gbk", "replace").splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2 and parts[1].isdigit() and parts[0].upper() in names:
+                out[int(parts[1])] = parts[0]
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+_d8 = _mkroot("hn_sbx_dcom_")
+_docx = os.path.join(_d8, "jobscope.docx")
+_pdf8 = os.path.join(_d8, "jobscope.pdf")
+_new_office = {}
+try:
+    from docx import Document
+    _dd = Document()
+    _dd.add_heading("Job 覆盖验收（DCOM 场景）", level=0)
+    for _i in range(12):
+        _dd.add_paragraph(f"第 {_i + 1} 行：核对 Job 成员列表里到底有没有 WINWORD")
+    _dd.save(_docx)
+
+    import converter as _C8
+    if not _C8._detect_word():
+        H.chk("⑧ Word 真机转换（DCOM 场景）", True, "SKIP：本机没有 Word")
+    else:
+        _office_names = {"WINWORD.EXE", "WPS.EXE"}
+        _before = _pids_by_names(_office_names)
+        _res3 = S.run_office_conversion(_docx, _pdf8, timeout=180)
+        time.sleep(1.0)
+        _after = _pids_by_names(_office_names)
+        _new_office = {p: n for p, n in _after.items() if p not in _before}
+        _snaps = list(getattr(S, "LAST_JOB_SNAPSHOTS", []) or [])
+        _all_job_pids = set()
+        for _s in _snaps:
+            _all_job_pids |= set(_s.get("job_pids") or [])
+        _started = [s for s in _snaps if s.get("phase") == "started"]
+        H.chk("⑧a Word 真机转换在沙箱里跑通（DCOM 路径可复现）",
+              _res3.status == "ok" and os.path.isfile(_pdf8) and os.path.getsize(_pdf8) > 0,
+              f"status={_res3.status} err={(_res3.error or '')[:80]}")
+        H.chk("⑧b 入 Job 后立刻快照：worker 确实在 Job 内（AssignProcessToJobObject 生效）",
+              bool(_started) and any(
+                  int(s.get("worker") or 0) in set(s.get("job_pids") or []) for s in _started),
+              f"started 快照={_started}")
+        H.chk("⑧c ★ 实测：新拉起的 WINWORD/wps **不在** Job 内（DCOM 拉起，继承不到）"
+              " —— 这就是'Job 约束不到 Office'的证据",
+              not (_all_job_pids & set(_new_office)),
+              f"新 Office={sorted(_new_office)} 各次 Job 成员={sorted(_all_job_pids)}")
+        H.chk("⑧d 诊断快照被记录下来（LAST_JOB_SNAPSHOT(S) 有 phase/worker/job_pids）",
+              bool(_snaps) and all({"phase", "worker", "job_pids"} <= set(s) for s in _snaps))
+finally:
+    # 只杀「转换窗口内新出现」的 Office 进程（自己拉起的），不碰用户已开的
+    for _p in _new_office:
+        try:
+            subprocess.run(["taskkill", "/PID", str(_p), "/F"],
+                           capture_output=True, timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+
 # worker 拒绝在没有 GO 时执行
 _d2 = _mkroot("hn_sbx_nogo_")
 _src2 = os.path.join(_d2, "a.txt")

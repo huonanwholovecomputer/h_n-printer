@@ -13,14 +13,26 @@ Word/WPS 的 COM 转换会在本进程里拉起 Office，并打开顾客/用户�
 做法
 ----
 把**本地 Office 文档**的转换改到独立 worker 进程里跑（`convert_worker.py`），
-父进程用 Windows **Job Object** 把它和它拉起的所有 Office 子进程绑在一起：
+父进程用 Windows **Job Object** 约束它：
 
-- `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：父进程退出/崩溃 ⇒ 整棵进程树一起回收；
+- `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`：父进程退出/崩溃 ⇒ **worker 进程**被回收；
 - `JOB_OBJECT_LIMIT_JOB_MEMORY`（默认 2048 MB，可用 `HN_OFFICE_SANDBOX_MEM_MB` 调）：
-  文档吃内存到上限就让 Office 失败，而不是拖垮整台机器；
-- 超时（默认 180 s，可用 `HN_OFFICE_SANDBOX_TIMEOUT` 调）到点直接 `TerminateJobObject`
-  —— 这是**失败闭环**：超时/失败不静默回退进程内转换（恶意文档正是靠"卡死→回退"
-  把风险带回主进程），只有"沙箱本身不可用"才回退（等于今天的行为）。
+  只对 Job **内**的进程生效 —— 也就是 worker；
+- 超时（按文件大小 `min(max(180, MB*5), 600)`，可用 `HN_OFFICE_SANDBOX_TIMEOUT` 覆盖）到点
+  直接 `TerminateJobObject` —— 这是**失败闭环**：超时/失败不静默回退进程内转换（恶意文档正是
+  靠"卡死→回退"把风险带回主进程），只有"沙箱本身不可用"才回退（等于今天的行为）。
+
+⚠ **这个 Job 约束不到 Word/WPS（2026-10-25 真机验证结论，别再按旧说法写文档）**
+--------------------------------------------------------------------------
+Word / WPS 由 **DCOM 启动器 `svchost.exe`** 拉起，不是 worker 的子进程，因此进程树继承
+**不包含**它们。实测（`docs/S2-03沙箱三引擎验证_2026-10-25.md` §5.2，4 条独立证据）：
+转换期间 Job 里只有 `python.exe` + `conhost.exe`；`TerminateJobObject` 之后 WINWORD 仍活；
+硬杀父进程后 worker 被回收而 WINWORD 残留；256 MB 内存上限下 80 页文档照样转成功
+（Job 峰值只算 python 的 17–83 MB）。**对照**：LibreOffice 的 `soffice.exe/soffice.bin`
+是真子进程、确实在 Job 内（峰值 469 MB 真计入、被 Terminate 全杀）。
+所以本模块能兑现的承诺只有两条：**① 转换跑在独立子进程里（GUI 不再被 COM 阻塞）；
+② 卡死/超时能拒转并杀掉 worker。**"整棵进程树回收""内存上限让 Office 失败"**不成立**，
+别再写回去（`LAST_JOB_SNAPSHOT` 会把实测的 Job 成员记下来，便于现场核对）。
 
 启动协议（防竞态）
 ----------------
@@ -201,8 +213,76 @@ if sys.platform == "win32":  # pragma: no cover - Windows 专属分支
     _kernel32.TerminateJobObject.restype = _wt.BOOL
     _kernel32.CloseHandle.argtypes = [_wt.HANDLE]
     _kernel32.CloseHandle.restype = _wt.BOOL
+    _kernel32.QueryInformationJobObject.argtypes = [
+        _wt.HANDLE, ctypes.c_int, _wt.LPVOID, _DWORD, ctypes.POINTER(_DWORD)]
+    _kernel32.QueryInformationJobObject.restype = _wt.BOOL
+
+    class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+        _fields_ = [
+            ("NumberOfAssignedProcesses", _DWORD),
+            ("NumberOfProcessIdsInList", _DWORD),
+            ("ProcessIdList", ctypes.c_size_t * 64),   # 够用：这里最多几个进程
+        ]
+
 else:  # pragma: no cover
     _kernel32 = None
+
+_JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS = 3
+
+# 诊断用：最近一次转换的 Job 成员快照 + 最近 5 次历史（实测证据，见模块头 ⚠ 段）。
+LAST_JOB_SNAPSHOT: dict = {}
+LAST_JOB_SNAPSHOTS: list = []
+
+
+def _job_process_ids(job) -> list[int]:
+    """列出 Job 内当前进程 PID（诊断用；失败返回空列表，绝不抛）。"""
+    try:
+        info = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        ret = _DWORD(0)
+        ok = _kernel32.QueryInformationJobObject(
+            job, _JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS,
+            ctypes.byref(info), ctypes.sizeof(info), ctypes.byref(ret))
+        if not ok:
+            return []
+        n = min(int(info.NumberOfProcessIdsInList), 64)
+        return [int(info.ProcessIdList[i]) for i in range(n)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _record_job_snapshot(job, proc, phase: str) -> None:
+    """记下 Job 里实际有哪些进程，并把结论写进日志（诊断 / 验收判据用）。
+
+    这行日志就是「Job 到底约束到了什么」的现场证据 —— 2026-10-25 实测里它只会列出
+    worker（python.exe）与 conhost.exe，**不会**有 WINWORD/wps.exe。
+    """
+    pids = _job_process_ids(job)
+    worker = int(proc.pid) if proc is not None else 0
+    snap = {"phase": phase, "worker": worker, "job_pids": pids}
+    LAST_JOB_SNAPSHOTS.append(snap)
+    del LAST_JOB_SNAPSHOTS[:-5]          # 只留最近 5 次（诊断用，别无限长）
+    LAST_JOB_SNAPSHOT.clear()
+    LAST_JOB_SNAPSHOT.update(snap)
+    try:
+        import subprocess as _sp  # noqa: PLC0415
+        names = {}
+        if pids:
+            q = _sp.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+                        timeout=10)
+            for line in (q.stdout or b"").decode("gbk", "replace").splitlines():
+                parts = [p.strip('"') for p in line.split('","')]
+                if len(parts) >= 2 and parts[1].isdigit():
+                    names[int(parts[1])] = parts[0].strip('"')
+    except Exception:  # noqa: BLE001
+        names = {}
+    pretty = ", ".join(f"{n}({p})" if (n := names.get(p)) else str(p) for p in pids)
+    has_office = any(
+        ("WINWORD" in (names.get(p) or "").upper()) or ("wps" in (names.get(p) or "").lower())
+        for p in pids)
+    office_txt = "见上" if has_office else "未捕获（Word/WPS 由 DCOM 拉起，不在 Job 内）"
+    logger.info("job 成员（%s）: worker=%s | %s | office=%s",
+                phase, worker, pretty or "空", office_txt)
+
 
 
 def _create_job(memory_mb: int):
@@ -329,11 +409,16 @@ def _run_worker(spec_path: str, timeout: float, memory_mb: int) -> SandboxResult
                 pass
             return SandboxResult(status="unavailable", error=str(e))
 
+        # 入 Job 成功 ⇒ 立刻记一次成员快照（此刻 worker 一定在 Job 内；转换结束后 worker
+        # 已退出，快照里就看不到它了 —— 所以这一条要单独记，别只记 finished）
+        _record_job_snapshot(job, proc, "started")
         logger.info(f"转换沙箱: 启动隔离 worker（超时 {timeout:.0f}s，内存上限 {memory_mb} MB）")
         try:
             out, err = proc.communicate(input=b"GO\n", timeout=timeout)
         except subprocess.TimeoutExpired:
-            logger.warning(f"转换沙箱超时（{timeout:.0f}s），终止整个 Job（含 Office 子进程）")
+            _record_job_snapshot(job, proc, "timeout")
+            logger.warning(f"转换沙箱超时（{timeout:.0f}s），终止 Job 内的进程"
+                           f"（⚠ Word/WPS 不在 Job 内，见模块头说明）")
             try:
                 _kernel32.TerminateJobObject(job, 1)
             except Exception:  # noqa: BLE001
@@ -345,6 +430,7 @@ def _run_worker(spec_path: str, timeout: float, memory_mb: int) -> SandboxResult
             return SandboxResult(status="timeout", error=f"隔离转换超时（{timeout:.0f}s）",
                                  returncode=proc.returncode)
 
+        _record_job_snapshot(job, proc, "finished")
         stdout = (out or b"").decode("utf-8", "replace")
         stderr = (err or b"").decode("utf-8", "replace")
         data = _parse_result(stdout)
