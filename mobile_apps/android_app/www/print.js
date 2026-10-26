@@ -235,16 +235,25 @@ async function loadRetentionOptions() {
     if (!(r.status === 200 && d.success)) return;
     const maxH = Number(d.max_retention_hours) || 168;
     const serverH = Number(d.server_retention_hours);
+    const srv = Number.isFinite(serverH) ? Math.max(0, serverH) : 168;
+    const label = serverRetentionLabel(srv);
     const choices = [{ hours: -1, label: '立即删除' },
                      { hours: 0, label: '遵从服务器管理' }];
+    // 2026-10-26（用户现场）：全局保留期会被管理员随时改（9天→7天）⇒ 由 30s 轮询顺带刷新，
+    // 只在值真的变了才重绘，避免每轮 innerHTML。
+    const changed = JSON.stringify(choices) !== JSON.stringify(printState.retentionChoices)
+      || maxH !== printState.retentionMaxHours
+      || srv !== printState.serverRetentionHours
+      || label !== printState.serverRetentionLabel;
     printState.retentionChoices = choices;
     printState.retentionMaxHours = maxH;
-    printState.serverRetentionHours = Number.isFinite(serverH) ? Math.max(0, serverH) : 168;
-    printState.serverRetentionLabel = serverRetentionLabel(printState.serverRetentionHours);
+    printState.serverRetentionHours = srv;
+    printState.serverRetentionLabel = label;
     if (!choices.some(c => c.hours === printState.retentionHours)) {
       printState.retentionHours = 0;
     }
-    renderRetentionChips();
+    if (changed) renderRetentionChips();
+    else renderRetentionEntry();
   } catch (e) { /* 保留内置两档 */ }
 }
 

@@ -59,6 +59,10 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
   小弹层可改保留期（`hn_retention_hours_v1`，`-1` 立即删除 / `0` 遵从服务器）并重看
   《文件使用与隐私说明》；保留期在提交时仍随单下发（`retention_hours` / `retention_mode`）。
   ③ 提交闸门仍保留：从未同意时点提交 → 弹告知层 + 提示，不发起请求（三个提交入口同一条）。
+  ④ **服务器当前保留期会变**（管理员随时改，现场 9天→7天）⇒ 常驻那一行文案不是一次性快照：
+  小程序在 `_pollPrinterOnce`（30s 基线，与状态/设备/定价同一轮）里顺带 `loadRetentionOptions()`，
+  APP 在 `startPrinterPolling` 的 30s 轮询里调 `loadRetentionOptions()`；两端都**只在值真的变了才
+  setData/重绘**，且该请求不参与轮询成败计数（失败不拖累状态/设备轮询退避）。
   小程序侧 `_loadPrivacyPrefs` / `onAgreePrivacy` / `onOpenPrivacySheet` / `retentionEntryText`
   / `privacySheetVisible`；APP 侧 `loadPrivacyPrefs` / `agreePrivacy` / `openPrivacySheet` /
   `retentionEntryText` / `privacySheet`。改 `www/` 后必须重打 APK。

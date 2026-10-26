@@ -1429,6 +1429,9 @@ function startPrinterPolling() {
   printerPoll = createPollScheduler(async () => {
     // 两个请求都落定后才算这一轮结束；任一失败 → reject → 调度器退避
     const results = await Promise.all([checkPrinterStatus(), loadClaimingDevices()]);
+    // 2026-10-26（用户现场）：全局保留期会被管理员随时改（9天→7天），下单页常驻的
+    // 「文件保留」那一行要跟着刷新；不参与本轮成败（该接口偶发失败不该让状态/设备轮询退避）。
+    if (typeof loadRetentionOptions === 'function') loadRetentionOptions();
     if (results.some((ok) => ok === false)) throw new Error('printer poll failed');
   }, 30000, { immediate: false });   // initApp 已先拉过一次，别立刻重复
   printerPoll.start();

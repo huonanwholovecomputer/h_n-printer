@@ -31,6 +31,7 @@ const MP_WXSS = path.join(MP_DIR, 'index.wxss');
 const APP_WWW = path.join(REPO, 'mobile_apps', 'android_app', 'www');
 const APP_HTML = path.join(APP_WWW, 'index.html');
 const APP_PRINT = path.join(APP_WWW, 'print.js');
+const APP_JS = path.join(APP_WWW, 'app.js');
 const APP_CSS = path.join(APP_WWW, 'styles.css');
 
 let failures = 0;
@@ -50,6 +51,7 @@ function checkStaticWiring() {
   const mpWxss = fs.readFileSync(MP_WXSS, 'utf8');
   const appHtml = fs.readFileSync(APP_HTML, 'utf8');
   const appJs = fs.readFileSync(APP_PRINT, 'utf8');
+  const appMain = fs.readFileSync(APP_JS, 'utf8');
   const appCss = fs.readFileSync(APP_CSS, 'utf8');
 
   check('小程序：常驻隐私卡片已移除（无 privacy-card / 无常驻勾选行）',
@@ -97,6 +99,17 @@ function checkStaticWiring() {
         !/syncPrivacyCheckbox|togglePrivacyAgree|privacyConsentRow|privacyCheckbox/.test(appJs + appHtml));
   check('APP：新样式存在（入口行 + 小弹层）',
         /\.privacy-entry-row\s*\{/.test(appCss) && /\.privacy-sheet\s*\{/.test(appCss));
+
+  // 2026-10-26 用户现场：全局保留期会被管理员随时改（截图里 9天，实际已改 7天），
+  // 常驻那一行的文案必须跟界面轮询一起刷新，不能只在本页首次加载时取一次。
+  check('小程序：保留期配置跟着界面轮询刷新（_pollPrinterOnce 里调 loadRetentionOptions）',
+        /_pollPrinterOnce\(done\) \{[\s\S]{0,900}?this\.loadRetentionOptions\(\)/.test(mpJs));
+  check('APP：保留期配置跟着打印机状态轮询（30s）刷新',
+        /printerPoll = createPollScheduler\([\s\S]{0,700}?loadRetentionOptions\(\)/.test(appMain));
+  check('小程序：保留期刷新只在值变了才 setData（不每轮重绘）',
+        /if \(Object\.keys\(patch\)\.length\) this\.setData\(patch\)/.test(mpJs));
+  check('APP：保留期刷新只在值变了才重绘',
+        /if \(changed\) renderRetentionChips\(\);/.test(appJs));
 }
 
 /* ============================================================
@@ -244,6 +257,26 @@ async function runMiniProgram() {
   check('⑧入口文案带服务器当前设置',
         serverPage.data.retentionEntryText === '遵从服务器管理（3天后自动删除）',
         serverPage.data.retentionEntryText);
+
+  /* --- 9. 全局设置被改（9天 → 7天）：轮询刷新后文案立即跟上 --- */
+  const th = mkHarness({});
+  th.page._loadPrivacyPrefs();
+  th.page.loadRetentionOptions();
+  let cfgReq = th.calls.requests[th.calls.requests.length - 1];
+  cfgReq.success({ statusCode: 200, data: { success: true, max_retention_hours: 168, server_retention_hours: 216 } });
+  check('⑨服务器 9 天时：入口显示 9 天',
+        th.page.data.serverRetentionLabel === '9天后自动删除'
+        && th.page.data.retentionEntryText === '遵从服务器管理（9天后自动删除）',
+        th.page.data.retentionEntryText);
+  th.page.loadRetentionOptions();
+  cfgReq = th.calls.requests[th.calls.requests.length - 1];
+  cfgReq.success({ statusCode: 200, data: { success: true, max_retention_hours: 168, server_retention_hours: 168 } });
+  check('⑨管理员改成 7 天后再刷一轮：入口立即变成 7 天（无需重进页面）',
+        th.page.data.serverRetentionLabel === '7天后自动删除'
+        && th.page.data.retentionEntryText === '遵从服务器管理（7天后自动删除）',
+        th.page.data.retentionEntryText);
+  check('⑨轮询每轮都会真的去取一次配置（不是只读缓存）',
+        th.calls.requests.filter((r) => /\/api\/retention_config$/.test(r.url)).length === 2);
 }
 
 /* ============================================================
@@ -292,6 +325,9 @@ async function runAndroid() {
     sandbox.BASE_URL = 'https://example.test';
     sandbox.api = (url, opt) => {
       calls.api.push({ url, opt });
+      if (url.indexOf('/api/retention_config') >= 0) {
+        return Promise.resolve(store.__retention || { status: 200, data: { success: false } });
+      }
       return Promise.resolve({ status: 200, data: { success: false } });
     };
     sandbox.ensureLogin = () => Promise.resolve(true);
@@ -380,6 +416,21 @@ async function runAndroid() {
   /* --- 7. 成功收尾不清零同意状态 --- */
   h3.run('printState.privacyAgreed = true; clearFilesAfterSuccess()');
   check('⑦成功收尾：printState.privacyAgreed 保持 true', h3.run('printState.privacyAgreed') === true);
+
+  /* --- 8. 全局保留期被改（9天 → 7天）：轮询刷新后入口文案立即跟上 --- */
+  h3.run('printState.retentionHours = 0');   // ⑥ 里选过「立即删除」，这里回到遵从服务器管理再验文案
+  store.__retention = { status: 200, data: { success: true, max_retention_hours: 168, server_retention_hours: 216 } };
+  await h3.run('loadRetentionOptions()');
+  check('⑧服务器 9 天时：入口显示 9 天',
+        h3.run('printState.serverRetentionLabel') === '9天后自动删除'
+        && h3.sandbox.document.getElementById('retentionEntryValue').textContent === '遵从服务器管理（9天后自动删除）',
+        h3.sandbox.document.getElementById('retentionEntryValue').textContent);
+  store.__retention = { status: 200, data: { success: true, max_retention_hours: 168, server_retention_hours: 168 } };
+  await h3.run('loadRetentionOptions()');
+  check('⑧管理员改成 7 天后再刷一轮：入口立即变成 7 天（无需重进页面）',
+        h3.run('printState.serverRetentionLabel') === '7天后自动删除'
+        && h3.sandbox.document.getElementById('retentionEntryValue').textContent === '遵从服务器管理（7天后自动删除）',
+        h3.sandbox.document.getElementById('retentionEntryValue').textContent);
 }
 
 (async () => {

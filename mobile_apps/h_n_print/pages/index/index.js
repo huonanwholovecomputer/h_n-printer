@@ -548,6 +548,10 @@ Component({
       this.loadClaimingDevices(fin)
       // 借轮询顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
       this.loadPricing(fin)
+      // 2026-10-26（用户现场）：全局保留期是会被管理员随时改的（9天→7天），常驻「文件保留」
+      // 那一行的文案必须跟着刷新 —— 旧写法只在本页首次加载时取一次，改完设置要等重进页面。
+      // 不参与本轮成败计数：这个接口偶发失败不该让状态/设备/定价的轮询一起退避。
+      this.loadRetentionOptions()
     },
     // ==================== 文件保留与隐私（S2-08 / 2026-10-26 改为一次性告知）====================
 
@@ -611,33 +615,35 @@ Component({
     },
 
     // 保留模式固定为两种；服务器当前设置从 /api/retention_config 动态读取后展示。
-    loadRetentionOptions() {
+    // 2026-10-26（用户现场）：管理员会随时改全局保留期（9天→7天），而本页不是每次都会重新进入
+    // ⇒ 由 `_pollPrinterOnce` 每轮（30s 基线）顺带刷新；仅在值真的变了才 setData（避免无谓重绘）。
+    loadRetentionOptions(done) {
       request({
         url: CONFIG.BASE_URL + '/api/retention_config',
         method: 'GET',
         success: (res) => {
           const d = (res && res.data) || {}
-          if (res.statusCode !== 200 || !d.success) return
+          if (res.statusCode !== 200 || !d.success) { if (done) done(false); return }
           const maxH = Number(d.max_retention_hours) || 168
           const serverH = Number(d.server_retention_hours)
+          const srv = Number.isFinite(serverH) ? Math.max(0, serverH) : 168
+          const label = this._serverRetentionLabel(srv)
           const choices = [{ hours: -1, label: '立即删除' },
                            { hours: 0, label: '遵从服务器管理' }]
           const has = choices.some(c => c.hours === this.data.retentionHours)
-          this.setData({
-            retentionChoices: choices,
-            retentionMaxHours: maxH,
-            serverRetentionHours: Number.isFinite(serverH) ? Math.max(0, serverH) : 168,
-            serverRetentionLabel: this._serverRetentionLabel(
-              Number.isFinite(serverH) ? serverH : 168
-            ),
-            retentionHours: has ? this.data.retentionHours : 0,
-            retentionEntryText: this._retentionEntryText(
-              has ? this.data.retentionHours : 0,
-              this._serverRetentionLabel(Number.isFinite(serverH) ? serverH : 168)
-            ),
-          })
+          const hours = has ? this.data.retentionHours : 0
+          const entry = this._retentionEntryText(hours, label)
+          const patch = {}
+          if (JSON.stringify(choices) !== JSON.stringify(this.data.retentionChoices)) patch.retentionChoices = choices
+          if (maxH !== this.data.retentionMaxHours) patch.retentionMaxHours = maxH
+          if (srv !== this.data.serverRetentionHours) patch.serverRetentionHours = srv
+          if (label !== this.data.serverRetentionLabel) patch.serverRetentionLabel = label
+          if (!has) patch.retentionHours = 0
+          if (entry !== this.data.retentionEntryText) patch.retentionEntryText = entry
+          if (Object.keys(patch).length) this.setData(patch)
+          if (done) done(true)
         },
-        fail: () => {},
+        fail: () => { if (done) done(false) },
       })
     },
 
