@@ -6344,10 +6344,62 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   text-align: center;
 }
 
-/* ==================== 文件保留与隐私（S2-08 / DS-19） ====================
-   对齐小程序 index.wxss 同名段：rpx → cqw（750 设计稿，1rpx ≈ 0.1333cqw） */
-.privacy-card {
-  margin-top: 2.13cqw;
+/* ==================== 文件保留与隐私（S2-08 / 2026-10-26 改为一次性告知） ====================
+   对齐小程序 index.wxss 同名段：rpx → cqw（750 设计稿，1rpx ≈ 0.1333cqw）。
+   常驻界面只留一行低存在感入口（点开小弹层：改保留期 / 重看说明）。 */
+.privacy-entry-row {
+  display: flex;
+  align-items: center;
+  margin-top: 1.6cqw;
+  padding: 1.33cqw 2.13cqw;
+  border-radius: 2.13cqw;
+  background: rgba(120, 120, 128, 0.08);
+}
+.theme-dark .privacy-entry-row {
+  background: rgba(255, 255, 255, 0.08);
+}
+.privacy-entry-icon {
+  margin-right: 1.07cqw;
+  font-size: 2.93cqw;
+}
+.privacy-entry-label {
+  margin-right: 1.07cqw;
+  font-size: 3.2cqw;
+  color: var(--text-tertiary);
+}
+.privacy-entry-value {
+  flex: 1;
+  font-size: 3.2cqw;
+  color: var(--text-secondary);
+}
+.privacy-entry-arrow {
+  margin-left: 1.07cqw;
+  font-size: 3.73cqw;
+  line-height: 1;
+  color: var(--text-tertiary);
+}
+.privacy-sheet {
+  max-height: 72vh;
+}
+.privacy-sheet-title {
+  margin-bottom: 2.13cqw;
+}
+.privacy-sheet-link-row {
+  margin-top: 1.6cqw;
+}
+.privacy-sheet-actions {
+  margin-top: 3.2cqw;
+}
+.privacy-agree-btn {
+  width: 100%;
+}
+.privacy-sheet-footnote {
+  display: block;
+  margin-top: 1.6cqw;
+  font-size: 2.93cqw;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  text-align: center;
 }
 .privacy-retention-row {
   display: flex;
@@ -6386,34 +6438,6 @@ body.theme-dark #view-user-orders .page-size-dropdown {
 }
 .privacy-retention-hint-line {
   display: block;
-}
-.privacy-consent-row {
-  display: flex;
-  align-items: center;
-  margin-top: 2.13cqw;
-}
-.privacy-checkbox {
-  width: 4.27cqw;
-  height: 4.27cqw;
-  margin-right: 1.33cqw;
-  border-radius: 1.07cqw;
-  border: 0.27cqw solid rgba(120, 120, 128, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.privacy-checked {
-  background: var(--blue);
-  border-color: var(--blue);
-}
-.privacy-check-mark {
-  font-size: 2.93cqw;
-  line-height: 1;
-  color: #fff;
-}
-.privacy-consent-text {
-  font-size: 3.2cqw;
-  color: var(--text-secondary);
 }
 .privacy-link {
   margin-left: 0.53cqw;

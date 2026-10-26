@@ -201,26 +201,14 @@
             </view>
           </view>
 
-          <!-- 文件保留与隐私（S2-08 / DS-19 / D-6 / D-7）：保留期可选 + 使用说明 + 下单前确认 -->
-          <view class="card privacy-card">
-            <view class="section-header inline-header">
-              <view class="section-header-bar"></view>
-              <text class="section-header-title">文件保留与隐私</text>
-            </view>
-            <view class="privacy-retention-row">
-              <text class="privacy-retention-label">文件保留</text>
-              <view class="privacy-chips" id="retentionChips"></view>
-            </view>
-            <view class="privacy-retention-hint" id="retentionHintText">
-              <text class="privacy-retention-hint-line">立即删除：打印完成后立即从服务器删除。</text>
-              <text class="privacy-retention-hint-line">遵从服务器管理：遵从服务器当前设置，当前设置为“<text class="privacy-server-retention-label">7天后自动删除</text>”。</text>
-            </view>
-            <view class="privacy-consent-row" id="privacyConsentRow">
-              <view class="privacy-checkbox" id="privacyCheckbox"><text class="privacy-check-mark" id="privacyCheckMark" style="display:none">✓</text></view>
-              <text class="privacy-consent-text">我已阅读并同意</text>
-              <text class="privacy-link" onclick="openPrivacyNotice()">《文件使用与隐私说明》</text>
-            </view>
-          </view>
+          <!-- 文件保留与隐私（S2-08 / 2026-10-26 用户要求）：告知只在首次使用弹一次并永久记住，
+               不再常驻整张卡片、也不每单重新勾选；日常只留这一行低存在感入口 -->
+          <div class="privacy-entry-row" id="privacyEntryRow">
+            <span class="privacy-entry-icon">🔒</span>
+            <span class="privacy-entry-label">文件保留</span>
+            <span class="privacy-entry-value" id="retentionEntryValue">遵从服务器管理</span>
+            <span class="privacy-entry-arrow">›</span>
+          </div>
 
           <!-- 提交 -->
           <view class="submit-area card-preload" id="submitArea">
@@ -686,6 +674,29 @@
 
   <!-- ===== 主题切换（我页右上角） ===== -->
   <button class="theme-toggle-btn" id="themeToggle" data-hover="tp-pressing" style="display:none"><span class="theme-toggle-icon">🌓</span></button>
+
+  <!-- ===== 文件保留与隐私小弹层（首次使用自动弹一次，之后从「文件保留」一行进入） ===== -->
+  <view class="modal-mask" id="privacySheet" style="display:none" onclick="closePrivacySheet()">
+    <view class="modal-sheet privacy-sheet" onclick="event.stopPropagation()">
+      <text class="title-medium privacy-sheet-title">文件保留与隐私</text>
+      <view class="privacy-retention-row">
+        <text class="privacy-retention-label">文件保留</text>
+        <view class="privacy-chips" id="retentionChips"></view>
+      </view>
+      <view class="privacy-retention-hint" id="retentionHintText">
+        <text class="privacy-retention-hint-line">立即删除：打印完成后立即从服务器删除。</text>
+        <text class="privacy-retention-hint-line">遵从服务器管理：遵从服务器当前设置，当前设置为“<text class="privacy-server-retention-label">7天后自动删除</text>”。</text>
+        <text class="privacy-retention-hint-line">你也可以在「我 → 我的文件」提前删除（正在打印或排队的文件需等订单结束）。</text>
+      </view>
+      <view class="privacy-sheet-link-row">
+        <text class="privacy-link" id="privacyNoticeLink">查看《文件使用与隐私说明》</text>
+      </view>
+      <view class="privacy-sheet-actions">
+        <button class="btn-primary privacy-agree-btn" id="privacyAgreeBtn" onclick="agreePrivacy()">我已阅读并同意</button>
+      </view>
+      <text class="privacy-sheet-footnote" id="privacySheetFootnote">同意后不再重复询问，也不会每单重新勾选。</text>
+    </view>
+  </view>
 
   <!-- ===== 成功弹窗 ===== -->
   <!-- S2-08：文件使用与隐私说明 -->

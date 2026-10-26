@@ -39,6 +39,31 @@ HN 云打印 — 微信小程序云打印系统，三个组件协作：
 
 - **页面**: `pages/index/index`(首页，文件选择+上传+提交), `pages/me/me`(个人中心，订单列表+许可密钥+管理员面板), `pages/order-detail/order-detail`, `pages/my-performance/my-performance`(月度统计), `pages/authorized-users/authorized-users`(历史授权用户列表，管理员/超管可见), `pages/user-orders/user-orders`(按 openid/来源查看订单列表，含分页与状态过滤，供管理员查看某用户/本地任务的打印记录)
 - **自定义滚动引擎**: index 和 me 页面都实现了手写的橡皮筋物理滚动（`_initScrollEngine` / `_startPhysics` / `_snapBack`），通过 `translateY` 驱动，含惯性衰减、阻尼过拉、方向锁定。非原生 scroll-view。小程序侧实现在 **WXS**（`utils/scroll.wxs`，视图层 rAF+setStyle，0 setData），APP 侧是同构的 JS `FlingEngine`（`www/app.js`）。
+  - **几何自愈（2026-10-25 现场：滚到最顶端内容整块错位 / 最底端多出一大块空白，偶发）**。独立诊断（Chromium 真几何 + 真实 `scroll.wxs` 探针，报告 `_tmp_scroll/诊断报告.md`，只留本地）把两端拆成两个独立缺陷：
+    | 现象 | 量级 | 根因 | 修法 |
+    |---|---|---|---|
+    | 顶端看起来「少了一整块页头」（内容位置偏下） | K = 222.4px（无设备卡）/ 386.9px（2 台设备卡）= 正好整块「header-area + status-bar [+ 设备卡]」 | **H5**：`.scroll-content` 的内联 `translateY` 与 WXS `state.y` 失同步 —— `ensureState()` 把 y 归零却不重绘，屏幕上还停着上一帧的位移（唯一写 transform 的地方是 `applyRender`） | 逻辑层每次推送 `scrollConfig` 带**自增 `rev`**（其余字段不变时 `change:prop` 不触发观察器）⇒ `onConfig` 每次重绘一次；`pageLifetimes.show` 也补测一次 |
+    | 最底端最后内容停在屏幕半腰、下面一大块空白 | D = 532.7px（现场反解：2 个 word-grid 文件列表塌陷 521.0 / 设备卡消失 153.3） | **H1**：`maxY` 只是逻辑层 `_measure()` 的一次性快照，之后内容变短没人重测 | ① 视图层 `syncGeometry()` 在**手势入口**用真实 rect 重算 `maxY = 内容高 - 视口高 + padY` 并把 y 钳回边界；② 逻辑层补上可证的漏测点 + `_measure` 闸门 |
+    - `syncGeometry()` **只允许在 touch 事件里调用**（`touchstart`）：微信的 `getBoundingClientRect()` 在 `change:prop` 观察器里可能返回旧帧/0，旧值会把 `maxY` 写错（0 只是无害的回退）。`onConfig` 只消费逻辑层推来的快照。
+    - `padY`（底部留白 = `_bottomPad + _tabOverlayPx`）由逻辑层以 **`padPx`** 显式下发；老页面配置没有该字段时，WXS 从那一帧的 `maxY - (contentH - scrollerH)` 反推一次。
+    - **WXS 不再改写 `.header-area` 的 padding**（旧实现在 ratio≥1 时 40rpx→8rpx）：那等于**在滚动过程中改变内容总高**（64rpx≈36px），任何快照式 `maxY` 都会随滚动位置漂移；logo 的 `scale` 已足够表达页头让位，而那段 padding 在 y>400 时本就在视口外。判据：H2 只值 26.9~35.8px，解释不了现场 500+px。
+    - 逻辑层补测点（缺一个就复现一次）：`loadClaimingDevices` 设备卡**张数变化**、提交成功收起文件列表、`onLogoLoad`（`widthFix` 解码前高度为 0 ⇒ 首测漏整块页头）、`pageLifetimes.show`；`_measure` 加 `vp > 100 && ch > 0` 闸门（隐藏页/首帧量到 0 会一次污染 +一整屏）。
+    - 验收：`node tests/verify_scroll_geometry_selfheal.js`（真实 WXS + 桩几何：底端留白自愈、无 rect 回退、失同步重绘、rev 触发、老配置反推 padY；两条变异自证 —— 摘掉 `syncGeometry` 或摘掉 onConfig 重绘都必须转红）。
+- **「我 → 我的文件」显示的必须是顾客的原始文件名（2026-10-25 现场）**: 现场列出的是 `tmp_617c7e76….pdf`。根因在**上传**：微信 `wx.uploadFile` 的 multipart 文件名取自「临时路径的 basename」（`tmp_<40~64 位十六进制>.<ext>`），生产库 61 行 `files.original_name` 里 59 行是这种临时名；真正有意义的名字在 `order_files.file_name`（提交订单时客户端带上来的，1472 条里 0 条是临时名）。四层落地：① 小程序 `/api/upload` 表单带 `file_name`（APP 走浏览器 `FormData`，`File.name` 本来就是真名，无需改）；② 服务端 `clean_original_name()` 优先用它（basename / 去控制字符 / 限长 / **扩展名必须与本次上传一致**，不通过退回临时名，绝不因为可选字段拒单）；③ `/api/my_files` 用该文件**最近一次下单用过的** `order_files.file_name` 兜底（字段名仍是 `original_name`，前端零改动，另回 `stored_original_name` 供诊断）；④ 提交订单时若该行仍是临时名，按本次提交的真实名**回填**（同扩展名才写，纯 UPDATE 在写事务内，符合 S2-02 的「写事务不读盘」）。验收 `python tests/verify_orig_filename_display.py`（真 Flask+SQLite 24 条 + 3 条变异自证）。
+- **「文件保留与隐私」改为一次性告知（2026-10-26 用户要求，两端同款）**: 首页原先常驻一张
+  「文件保留与隐私」卡片 + 每单重新勾选同意。现在：
+  ① **只在首次使用弹一次**告知层（从未同意过才弹）：点「我已阅读并同意」后写
+  `hn_privacy_agreed_v1`（小程序 `wx.setStorageSync` / APP `localStorage`）永久记住；之后启动
+  不再出现，**也不每单重新勾选**（提交成功后不再清零）。
+  ② 常驻界面只剩一行低存在感入口「🔒 文件保留：遵从服务器管理（7天后自动删除）›」，点开
+  小弹层可改保留期（`hn_retention_hours_v1`，`-1` 立即删除 / `0` 遵从服务器）并重看
+  《文件使用与隐私说明》；保留期在提交时仍随单下发（`retention_hours` / `retention_mode`）。
+  ③ 提交闸门仍保留：从未同意时点提交 → 弹告知层 + 提示，不发起请求（三个提交入口同一条）。
+  小程序侧 `_loadPrivacyPrefs` / `onAgreePrivacy` / `onOpenPrivacySheet` / `retentionEntryText`
+  / `privacySheetVisible`；APP 侧 `loadPrivacyPrefs` / `agreePrivacy` / `openPrivacySheet` /
+  `retentionEntryText` / `privacySheet`。改 `www/` 后必须重打 APK。
+  验收 `node tests/verify_privacy_once.js`（两端静态接线 + 桩环境跑真实源码：首次弹一次、
+  记住后不再弹、提交放行、成功不清零、保留期持久化并在下次启动沿用、仍随单下发）。
 - **嵌套滚动接力（内层文件列表 ↔ 外层页面）**: 首页文件列表是**有界 scroll-view**（内容高 > 列表高时可内部滚动），手势落到列表内时默认让位原生；滚到列表**贴顶/贴底**后，必须把滚动交给外层页面接管，否则手指一直被列表吞掉、整页滚不动；反向（外层已到边界、手指反向拖）再交还内层。两端同口径：
   - 小程序：逻辑层 `bindscroll` → `_refreshListEdges`（仅贴边状态翻转时 setData）→ `scrollConfig.listAtTop/listAtBottom` → WXS `touchmove` 据此决定让原生 / 外层接管。`.scroller` 只驱动 transform，列表为原生滚动；`_measure` 额外 `scrollOffset()` 同步边界，避免内容增减后状态失效。
     ⚠ **必须用滚动事件里的真实 `scrollHeight` 判定是否到底**：`FILE_CARD_HEIGHT_RPX` 是**估算常量**（Chromium 实测比真实渲染高 4~7%），拿它算 `maxScroll` 会恒大于真实值 → `atBottom` 永远为 false → 内层滚到底后外层永不接管（"滑动列表带不动页面"的真实根因）。`_fileListRealPx` 缓存实测值，取不到才退回常量估值；`listOverflow=false`（内容不足一屏）时两边直接置贴边。

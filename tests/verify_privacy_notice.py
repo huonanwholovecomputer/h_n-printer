@@ -10,16 +10,16 @@
     （S1-03 服务端 `DELETE /api/file/<id>` 已就绪，但移动端没有任何地方调用它）。
 
 本脚本：
-  A. 静态（两端 + 后端）：告知文案（用途/保留期/第三方）、逐单勾选闸门、保留期选择器与
-     上传/提交两处 payload、提交成功后复位勾选、两端「我的文件」入口与删除接线、
-     后端 `/api/my_files` 与提交时改写 retention_hours。
+  A. 静态（两端 + 后端）：告知文案（用途/保留期/第三方）、**一次性同意**（首次确认后永久记住，
+     不再每单勾选；未同意时提交仍被拦并弹告知层）、保留期选择器与上传/提交两处 payload、
+     两端「我的文件」入口与删除接线、后端 `/api/my_files` 与提交时改写 retention_hours。
   B. 行为（真 Flask + 真 SQLite）：
      · 上传带 retention_hours=true 值入库；提交时以**提交时**的选择为准（999→168 夹紧；
        0/非法 = 不动）；只改自己名下的文件；
      · `/api/my_files` 只回自己的文件、未登录 401；含 retention_hours / auto_delete_at /
        in_active_order；全局设成永不过期时 auto_delete_at 为空；
      · 被排队订单引用的文件 in_active_order=True 且 DELETE 409；订单结束后可删，删完列表不再出现。
-  C. 变异自证：去掉勾选闸门 / 去掉提交 payload 的 retention_hours / 去掉移动端 DELETE 调用 /
+  C. 变异自证：去掉一次性同意的闸门 / 去掉提交 payload 的 retention_hours / 去掉移动端 DELETE 调用 /
      去掉后端"提交时改写保留期" —— 对应判据必须变红。
 
 用法：python tests/verify_privacy_notice.py     （exit 0 = 全部通过）
@@ -68,30 +68,38 @@ def checks(t):
     """返回 {判据名: 是否满足}（纯文本判据，变异自证直接复用）。"""
     b = t["backend"]
     c = {}
-    # ---- 小程序：告知 + 勾选 + 保留期 ----
+    # ---- 小程序：告知 + 一次性同意 + 保留期 ----
     c["mp_notice"] = all(k in t["mp_wxml"] for k in
                          ("文件使用与隐私说明", "用途", "保留期限", "第三方", "微信", "COS"))
+    # 2026-10-26：同意改为**一次性**（首次确认后永久记住），但"从未同意"时提交仍必须被拦
+    # （提交闸门 = 弹告知层 + 提示；用 doSubmit 里那一段做定位，避免命中 agreePrivacy 里的同名判断）
     c["mp_consent_gate"] = ("if (!this.data.privacyAgreed)" in t["mp_js"]
-                            and "请先阅读并勾选" in t["mp_js"])
+                            and "请先阅读并同意" in t["mp_js"]
+                            and "privacySheetVisible: true" in t["mp_js"])
     c["mp_retention_pick"] = ("onSelectRetention" in t["mp_wxml"]
                               and "retentionChoices" in t["mp_wxml"]
                               and "retention_hours: String(this.data.retentionHours" in t["mp_js"])
     c["mp_retention_submit"] = ("retention_hours: Number(this.data.retentionHours)" in t["mp_js"])
     c["mp_retention_modes"] = all(k in t["mp_js"] + t["mp_wxml"]
                                   for k in ("立即删除", "遵从服务器管理", "打印完成后立即从服务器删除"))
-    c["mp_consent_reset"] = "privacyAgreed: false" in t["mp_js"]
+    # 同意状态持久化：脚本里只允许出现 data 默认值一处 `privacyAgreed: false`
+    # （提交成功后不再清零），且有 storage 键（下次启动沿用）。
+    c["mp_consent_persist"] = (t["mp_js"].count("privacyAgreed: false") == 1
+                               and "PRIVACY_AGREE_KEY" in t["mp_js"])
     # ---- APP：同一套 ----
     c["app_notice"] = all(k in t["app_html"] for k in
                           ("文件使用与隐私说明", "用途", "保留期限", "第三方", "微信", "COS"))
-    c["app_consent_gate"] = ("if (!printState.privacyAgreed)" in t["app_js"]
-                             and "请先阅读并勾选" in t["app_js"])
+    c["app_consent_gate"] = bool(re.search(
+        r"if \(!printState\.privacyAgreed\) \{[\s\S]{0,240}?openPrivacySheet\(\);"
+        r"[\s\S]{0,120}?showToast\('请先阅读并同意", t["app_js"]))
     c["app_retention_pick"] = ("retentionChips" in t["app_html"]
                                and "selectRetention" in t["app_js"]
                                and "fd.append('retention_hours'" in t["app_js"])
     c["app_retention_submit"] = "retention_hours: Number(printState.retentionHours)" in t["app_js"]
     c["app_retention_modes"] = all(k in t["app_html"] + t["app_js"]
                                    for k in ("立即删除", "遵从服务器管理", "打印完成后立即从服务器删除"))
-    c["app_consent_reset"] = "printState.privacyAgreed = false" in t["app_js"]
+    c["app_consent_persist"] = ("printState.privacyAgreed = false" not in t["app_js"]
+                                and "PRIVACY_AGREE_KEY" in t["app_js"])
     # ---- 两端「我的文件」入口 ----
     c["mp_myfiles"] = ('class="myfiles-entry"' in t["mp_me_wxml"]
                        and "/api/my_files" in t["mp_me_js"]
@@ -293,7 +301,7 @@ mutations = [
     ("小程序上传不再带 retention_hours", "mp_js",
      "retention_hours: String(this.data.retentionHours || 0),", "", "mp_retention_pick"),
     ("APP 去掉隐私勾选闸门", "app_js",
-     "if (!printState.privacyAgreed)", "if (false)", "app_consent_gate"),
+     "    openPrivacySheet();\n    showToast('请先阅读并同意", "    showToast('请先阅读并同意", "app_consent_gate"),
     ("APP 提交不再发 retention_hours", "app_js",
      "retention_hours: Number(printState.retentionHours) || 0,", "", "app_retention_submit"),
     ("小程序「我的文件」不再调用删除接口", "mp_me_js",

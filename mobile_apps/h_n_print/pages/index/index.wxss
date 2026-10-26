@@ -1702,9 +1702,59 @@ picker-view-column {
   text-align: center;
 }
 
-/* ==================== 文件保留与隐私（S2-08 / DS-19） ==================== */
-.privacy-card {
-  margin-top: 16rpx;
+/* ==================== 文件保留与隐私（S2-08 / 2026-10-26 改为一次性告知） ==================== */
+/* 常驻界面只留一行低存在感入口（点开小弹层：改保留期 / 重看说明） */
+.privacy-entry-row {
+  display: flex;
+  align-items: center;
+  margin-top: 12rpx;
+  padding: 10rpx 16rpx;
+  border-radius: 16rpx;
+  background: rgba(120, 120, 128, 0.08);
+}
+.privacy-entry-hover {
+  background: rgba(120, 120, 128, 0.16);
+}
+.privacy-entry-icon {
+  margin-right: 8rpx;
+  font-size: 22rpx;
+}
+.privacy-entry-label {
+  margin-right: 8rpx;
+  font-size: 24rpx;
+  color: var(--text-tertiary);
+}
+.privacy-entry-value {
+  flex: 1;
+  font-size: 24rpx;
+  color: var(--text-secondary);
+}
+.privacy-entry-arrow {
+  margin-left: 8rpx;
+  font-size: 28rpx;
+  line-height: 1;
+  color: var(--text-tertiary);
+}
+/* 小弹层 */
+.privacy-sheet {
+  max-height: 72vh;
+}
+.privacy-sheet-link-row {
+  margin-top: 12rpx;
+}
+.privacy-sheet-actions {
+  margin-top: 24rpx;
+}
+.privacy-agree-btn {
+  width: 100%;
+}
+.privacy-sheet-footnote {
+  display: block;
+  margin-top: 12rpx;
+  font-size: 22rpx;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  text-align: center;
 }
 .privacy-retention-row {
   display: flex;
@@ -1743,34 +1793,6 @@ picker-view-column {
 }
 .privacy-retention-hint-line {
   display: block;
-}
-.privacy-consent-row {
-  display: flex;
-  align-items: center;
-  margin-top: 16rpx;
-}
-.privacy-checkbox {
-  width: 32rpx;
-  height: 32rpx;
-  margin-right: 10rpx;
-  border-radius: 8rpx;
-  border: 2rpx solid rgba(120, 120, 128, 0.45);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.privacy-checked {
-  background: var(--blue);
-  border-color: var(--blue);
-}
-.privacy-check-mark {
-  font-size: 22rpx;
-  line-height: 1;
-  color: #fff;
-}
-.privacy-consent-text {
-  font-size: 24rpx;
-  color: var(--text-secondary);
 }
 .privacy-link {
   margin-left: 4rpx;

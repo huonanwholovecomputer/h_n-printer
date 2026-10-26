@@ -129,6 +129,7 @@ function initPrintPage() {
   setupFileInput();
   setupPrintButtons();
   loadPricing();
+  loadPrivacyPrefs();       // S2-08：同意/保留期偏好从 localStorage 恢复（首次使用自动弹一次告知）
   loadRetentionOptions();   // S2-08：保留期选项以服务端口径为准（失败用本地兜底）
   setupPrivacyConsent();
   // 每 5 分钟顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致。
@@ -149,9 +150,14 @@ function onPrintTabShown() {
   scheduleMeasureSoon();
 }
 
-/* ================= 文件保留与隐私（S2-08 / DS-19 / D-6 / D-7） =================
-   保留模式固定为“立即删除 / 遵从服务器管理”；服务器当前设置由接口动态返回。
-   提交时把最终模式随订单一起发（服务端以提交时为准），上传时也带一份供立即删除使用。 */
+/* ================= 文件保留与隐私（S2-08 / 2026-10-26 改为一次性告知） =================
+   告知只在**首次使用**弹一次，确认后写 localStorage 永久记住（清缓存/重装才会重问）；
+   之后不再常驻整张卡片、也不每单重新勾选。日常只留一行「文件保留」入口（小弹层里改保留期/重看说明）。
+   保留期偏好同样持久化，下次启动沿用。提交时把最终模式随订单一起发（服务端以提交时为准），
+   上传时也带一份供立即删除使用。 */
+const PRIVACY_AGREE_KEY = 'hn_privacy_agreed_v1';
+const PRIVACY_RETENTION_KEY = 'hn_retention_hours_v1';
+
 function retentionLabel(hours) {
   const h = Number(hours) || 0;
   if (h < 0) return '立即删除';
@@ -166,6 +172,60 @@ function serverRetentionLabel(hours) {
   if (h === 0) return '不自动删除';
   if (h % 24 === 0) return (h / 24) + '天后自动删除';
   return h + '小时后自动删除';
+}
+
+// 常驻那一行的文案：「立即删除」/「遵从服务器管理（7天后自动删除）」
+function retentionEntryText(hours, serverLabel) {
+  if (Number(hours) === -1) return '立即删除';
+  const label = serverLabel || printState.serverRetentionLabel || '';
+  return label ? ('遵从服务器管理（' + label + '）') : '遵从服务器管理';
+}
+
+// 从 localStorage 恢复「是否已同意」「保留期偏好」；首次使用（从未同意）自动弹一次告知。
+function loadPrivacyPrefs() {
+  let agreed = false;
+  try { agreed = localStorage.getItem(PRIVACY_AGREE_KEY) === '1'; } catch (e) {}
+  let hours = 0;
+  try {
+    const raw = localStorage.getItem(PRIVACY_RETENTION_KEY);
+    if (raw === '-1' || raw === '0') hours = Number(raw);
+  } catch (e) {}
+  printState.privacyAgreed = agreed;
+  printState.retentionHours = hours;
+  renderRetentionEntry();
+  if (!agreed) openPrivacySheet();
+}
+
+function renderRetentionEntry() {
+  const el = document.getElementById('retentionEntryValue');
+  if (el) el.textContent = retentionEntryText(printState.retentionHours);
+}
+
+function renderPrivacySheetState() {
+  const btn = document.getElementById('privacyAgreeBtn');
+  const footnote = document.getElementById('privacySheetFootnote');
+  if (btn) btn.textContent = printState.privacyAgreed ? '完成' : '我已阅读并同意';
+  if (footnote) footnote.style.display = printState.privacyAgreed ? 'none' : '';
+}
+
+function openPrivacySheet() {
+  renderRetentionChips();
+  renderPrivacySheetState();
+  openModal('privacySheet');
+}
+
+function closePrivacySheet() {
+  closeModal('privacySheet');
+}
+
+// 首次（且仅首次）确认：写 localStorage，之后永久记住（清缓存/重装才会重问）
+function agreePrivacy() {
+  if (!printState.privacyAgreed) {
+    try { localStorage.setItem(PRIVACY_AGREE_KEY, '1'); } catch (e) {}
+    printState.privacyAgreed = true;
+  }
+  renderPrivacySheetState();
+  closePrivacySheet();
 }
 
 async function loadRetentionOptions() {
@@ -199,44 +259,40 @@ function renderRetentionChips() {
     hint.innerHTML =
       '<text class="privacy-retention-hint-line">立即删除：打印完成后立即从服务器删除。</text>' +
       '<text class="privacy-retention-hint-line">遵从服务器管理：遵从服务器当前设置，当前设置为“' +
-      escHtml(printState.serverRetentionLabel) + '”。</text>';
+      escHtml(printState.serverRetentionLabel) + '”。</text>' +
+      '<text class="privacy-retention-hint-line">你也可以在「我 → 我的文件」提前删除（正在打印或排队的文件需等订单结束）。</text>';
   }
   document.querySelectorAll('.privacy-server-retention-label').forEach(node => {
     node.textContent = printState.serverRetentionLabel;
   });
+  renderRetentionEntry();
+  renderPrivacySheetState();
 }
 
 function selectRetention(hours) {
   const h = Number(hours) || 0;
   if (h !== -1 && h !== 0) return;
   printState.retentionHours = h;
+  // 保留期偏好持久化：下次启动沿用（用户随时还能再改）
+  try { localStorage.setItem(PRIVACY_RETENTION_KEY, String(h)); } catch (e) {}
   renderRetentionChips();
 }
 
 function setupPrivacyConsent() {
-  const row = document.getElementById('privacyConsentRow');
+  const row = document.getElementById('privacyEntryRow');
   if (row && !row._wired) {
     row._wired = true;
-    row.addEventListener('click', (e) => {
-      // 点「《文件使用与隐私说明》」只打开说明，不改变勾选
-      if (e.target && e.target.closest && e.target.closest('.privacy-link')) return;
-      togglePrivacyAgree();
+    row.addEventListener('click', () => openPrivacySheet());
+  }
+  const link = document.getElementById('privacyNoticeLink');
+  if (link && !link._wired) {
+    link._wired = true;
+    link.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openPrivacyNotice();
     });
   }
   renderRetentionChips();
-  syncPrivacyCheckbox();
-}
-
-function togglePrivacyAgree() {
-  printState.privacyAgreed = !printState.privacyAgreed;
-  syncPrivacyCheckbox();
-}
-
-function syncPrivacyCheckbox() {
-  const box = document.getElementById('privacyCheckbox');
-  const mark = document.getElementById('privacyCheckMark');
-  if (box) box.classList.toggle('privacy-checked', !!printState.privacyAgreed);
-  if (mark) mark.style.display = printState.privacyAgreed ? '' : 'none';
 }
 
 function openPrivacyNotice() {
@@ -1986,7 +2042,9 @@ function doSubmit(skipPageValidation) {
   if (printState.submitting) return;
   // S2-08（DS-19）：隐私告知必须由顾客**主动勾选**后才提交（三个提交入口都经过这里）
   if (!printState.privacyAgreed) {
-    showToast('请先阅读并勾选《文件使用与隐私说明》', 2500);
+    // 首次使用没确认 / 清过缓存 → 弹告知层并要求先确认（同意一次永久记住，之后不再每单勾选）
+    openPrivacySheet();
+    showToast('请先阅读并同意《文件使用与隐私说明》', 2500);
     return;
   }
   const printable = printState.selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat);
@@ -2078,9 +2136,7 @@ function clearFilesAfterSuccess() {
   // 计时器按文件对象停（旧实现遍历索引表，与文件对象已解耦 → 会漏停/错停）
   printState.selectedFiles.forEach(f => { stopPageCountPoll(f); stopUploadTimer(f); });
   printState.selectedFiles = [];
-  // S2-08：隐私同意是**逐单**的（下一单重新确认），不记住上次勾选
-  printState.privacyAgreed = false;
-  if (typeof syncPrivacyCheckbox === 'function') syncPrivacyCheckbox();
+  // S2-08（2026-10-26）：同意已持久化，**不再**在本单结束后清空（旧行为会让下一单重新勾选）
   // 订单发起后清空备注（与文件列表同步复位，输入框高度/计数回到初始状态）
   printState.remark = '';
   const remarkInput = document.getElementById('remarkInput');

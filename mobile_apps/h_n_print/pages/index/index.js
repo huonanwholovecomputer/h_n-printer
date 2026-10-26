@@ -24,6 +24,11 @@ const FILE_CARD_GAP_RPX = 12
 // 文本模式(页数未知)下，每多一个范围行在基础高度上额外增加的高度(rpx)：输入框56 + 行间距4
 const RANGE_LINE_EXTRA_RPX = 60
 
+// S2-08（2026-10-26 用户要求）：隐私告知**只在第一次使用本产品时问一次**，确认后永久记住；
+// 保留期仍可随时改（保留期偏好同样记住）。清缓存/换机才会重新询问。
+const PRIVACY_AGREE_KEY = 'hn_privacy_agreed_v1'
+const PRIVACY_RETENTION_KEY = 'hn_retention_hours_v1'
+
 function _fileCardTypeKey(file) {
   if (file.excelWarning) return 'excel'
   if (file.isImage) return 'image'
@@ -226,7 +231,12 @@ Component({
     serverRetentionHours: 168,
     serverRetentionLabel: '7天后自动删除',
     retentionMaxHours: 168,
+    // S2-08（2026-10-26）：同意一次永久记住（storage 持久化），不再每单勾选；
+    // 常驻界面只留一行「文件保留」入口，点开的小弹层里改保留期 / 重看说明。
     privacyAgreed: false,
+    privacySheetVisible: false,
+    privacySheetClosing: false,
+    retentionEntryText: '遵从服务器管理（7天后自动删除）',
     showPrivacyNotice: false,
     privacyNoticeClosing: false,
     // 兜底单价（🔴-C3）：**必须与后端 printer-backend/pricing.json 逐值一致**。
@@ -306,6 +316,7 @@ Component({
       this._pollTimers = {}     // { fileUid: intervalId } — 页数轮询定时器（键=文件稳定 uid）
       this._fileUidSeq = 0      // 文件稳定身份自增序列（见 _fileUid / _fileIndexByUid）
       this._buildScheduleDays()
+      this._loadPrivacyPrefs()      // S2-08：同意/保留期偏好从 storage 恢复（首次使用自动弹一次告知）
       this.loadRetentionOptions()   // S2-08：保留期选项以服务端口径为准（失败用本地兜底）
       this.doLogin()
     },
@@ -328,6 +339,8 @@ Component({
       const app = getApp()
       const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
       wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
+      // 回到本页先补测一次滚动边界（切 tab 期间内容可能变过：设备卡/页数/文件列表）
+      this._scheduleMeasure(60)
       // 系统对话框返回 → 跳过入场动画，直接恢复数据刷新
       if (this._returningFromDialog) {
         this._returningFromDialog = false
@@ -536,7 +549,50 @@ Component({
       // 借轮询顺带刷新定价（单双面/首页/派送/加急），保证与服务器 pricing.json 一致
       this.loadPricing(fin)
     },
-    // ==================== 文件保留与隐私（S2-08）====================
+    // ==================== 文件保留与隐私（S2-08 / 2026-10-26 改为一次性告知）====================
+
+    // 从 storage 恢复「是否已同意」「保留期偏好」；首次使用（从未同意）自动弹一次告知。
+    // 只问一次：同意后永久记住，之后启动不再出现，也**不再每单重新勾选**。
+    _loadPrivacyPrefs() {
+      let agreed = false
+      try { agreed = !!wx.getStorageSync(PRIVACY_AGREE_KEY) } catch (e) {}
+      let hours = 0
+      try {
+        const raw = wx.getStorageSync(PRIVACY_RETENTION_KEY)
+        if (raw === -1 || raw === 0) hours = Number(raw)
+        else if (raw === '-1' || raw === '0') hours = Number(raw)
+      } catch (e) {}
+      this.setData({
+        privacyAgreed: agreed,
+        retentionHours: hours,
+        retentionEntryText: this._retentionEntryText(hours, this.data.serverRetentionLabel),
+      })
+      if (!agreed) this.setData({ privacySheetVisible: true, privacySheetClosing: false })
+    },
+
+    // 常驻那一行的文案：「立即删除」/「遵从服务器管理（7天后自动删除）」
+    _retentionEntryText(hours, serverLabel) {
+      if (Number(hours) === -1) return '立即删除'
+      const label = serverLabel || this.data.serverRetentionLabel || ''
+      return label ? ('遵从服务器管理（' + label + '）') : '遵从服务器管理'
+    },
+
+    onOpenPrivacySheet() {
+      this.setData({ privacySheetVisible: true, privacySheetClosing: false })
+    },
+
+    onClosePrivacySheet() {
+      if (this.data.privacySheetClosing) return
+      this.setData({ privacySheetClosing: true })
+      setTimeout(() => this.setData({ privacySheetVisible: false, privacySheetClosing: false }), 200)
+    },
+
+    // 首次（且仅首次）确认：写 storage，之后永久记住（清缓存/换机才会重问）
+    onAgreePrivacy() {
+      try { wx.setStorageSync(PRIVACY_AGREE_KEY, true) } catch (e) {}
+      this.setData({ privacyAgreed: true })
+      this.onClosePrivacySheet()
+    },
 
     _retentionLabel(hours) {
       const h = Number(hours) || 0
@@ -575,20 +631,25 @@ Component({
               Number.isFinite(serverH) ? serverH : 168
             ),
             retentionHours: has ? this.data.retentionHours : 0,
+            retentionEntryText: this._retentionEntryText(
+              has ? this.data.retentionHours : 0,
+              this._serverRetentionLabel(Number.isFinite(serverH) ? serverH : 168)
+            ),
           })
         },
         fail: () => {},
       })
     },
 
+    // 保留期改动立即持久化（下次启动沿用），并刷新常驻那一行的文案
     onSelectRetention(e) {
       const h = Number(e.currentTarget.dataset.hours) || 0
       if (h !== -1 && h !== 0) return
-      this.setData({ retentionHours: h })
-    },
-
-    onTogglePrivacyAgree() {
-      this.setData({ privacyAgreed: !this.data.privacyAgreed })
+      try { wx.setStorageSync(PRIVACY_RETENTION_KEY, h) } catch (e) {}
+      this.setData({
+        retentionHours: h,
+        retentionEntryText: this._retentionEntryText(h, this.data.serverRetentionLabel),
+      })
     },
 
     onOpenPrivacyNotice() {
@@ -792,12 +853,22 @@ Component({
         this._listAtBottom = true
         this._fileListRealPx = 0
       }
+      // rev 自增：scrollConfig 的其余字段相同时（比如切 tab 回来 maxY 没变），
+      // change:prop 观察器不会触发 —— 而"内联 transform 与 state.y 失同步"要靠
+      // onConfig 里的那次 applyRender 收敛。带一个恒变的 rev 保证每次推送都被消费。
+      this._scrollRev = (this._scrollRev || 0) + 1
       this.setData({
         scrollConfig: {
+          rev: this._scrollRev,
           minY: 0,
           maxY: Math.round(this._maxY || 0),
           scrollerH: this._scrollerH || 0,
           contentH: this._contentH || 0,
+          // 底部留白（px）：WXS 现在会用「真实内容高 - 真实视口高 + padPx」自己算 maxY
+          // （内容随异步数据/图片/列表补间变化时，快照式的 maxY 会过期 → 底端多一块空白
+          //  或最后一段滚不到）。这里显式下发，避免 WXS 反推。
+          // （|| 0：_pushScrollConfig 若早于 _initScrollEngine 被调用，别把 NaN 推下去）
+          padPx: (this._bottomPad || 0) + (this._tabOverlayPx || 0),
           listOverflow,
           // 内层列表是否贴顶/贴底：贴边后继续同向拖拽 → WXS 把滚动交给外层；
           // 反向回到外层边界 → 再交还内层（双向滚动接力）
@@ -835,6 +906,13 @@ Component({
 
     // WXS 分桶回调（每 100px 一次），供回顶按钮等阈值类 UI 使用；本页暂不消费
     onWxsScroll() {},
+
+    // logo 解码完成：`mode="widthFix"` 在图片没解码前高度是 0（冷启动/首次进页面常见），
+    // 首测会把整块页头漏掉 ⇒ 滚动范围少一截。解码事件一来立刻补测。
+    onLogoLoad() {
+      this._scheduleMeasure(60)
+      setTimeout(() => this._scheduleMeasure(240), 240)
+    },
 
     // 圆点清除计时器（badge 状态已在上层 setData 中同帧设置，这里只负责定时清除）
     _scheduleBadgeClear(entering) {
@@ -875,10 +953,15 @@ Component({
         if (!res || !res[0] || !res[1]) return
         const vp = res[0].height || 0
         const ch = res[1].height || 0
+        // 隐藏页/首帧渲染会量到 vp=0 或 ch=0：照收会让 maxY 多出一整屏（滚到底大块空白），
+        // 也会把 scrollerH 写坏。量不到就保持上一次的可信值，等下一次测量。
+        if (!(vp > 100) || !(ch > 0)) return
         this._scrollerH = vp
-        // 估算同步为实测：避免 _contentEst 只涨不跌（否则 _contentH 恒取估算，滚动范围偏大）
+        // 实测优先（2026-10-25）：之前是 Math.max(ch, _contentEst)，估算只涨不跌时
+        // 滚动范围会恒偏大 —— 现场表现为「滚到底还剩一大块空白」。_contentEst 只作兜底
+        // （量不到高度时用），量到就以实测为准；同时把它同步成实测值，别让它带着旧增量。
         if (ch > 0) this._contentEst = ch
-        this._contentH = Math.max(ch, this._contentEst)
+        this._contentH = ch > 0 ? ch : this._contentEst
         this._maxY = Math.max(0, this._contentH - vp + this._bottomPad + this._tabOverlayPx)
         this._pushScrollConfig()
         const listOffset = res[2] || {}
@@ -1387,6 +1470,14 @@ Component({
         formData: {
           target_client_id: this.data.selectedDeviceId || '',
           retention_hours: String(this.data.retentionHours || 0),
+          // 2026-10-25：wx.uploadFile 的 multipart 文件名取自「临时路径的 basename」
+          // （微信把它变成 tmp_<hex>.pdf），服务端 files.original_name 会因此存成无意义的
+          // 临时名 ——「我 → 我的文件」里看到的全是 tmp_xxx 就是这个原因。
+          // 这里把顾客真正选中的文件名一起带上（服务端 prefer，校验不过才退回临时名）。
+          file_name: (() => {
+            const i = this._fileIndexByUid(fileUid)
+            return i >= 0 ? (this.data.selectedFiles[i].name || '') : ''
+          })(),
         },
         success: (uploadRes) => {
           const entry = this._uploadTimers[fileUid]
@@ -2120,7 +2211,12 @@ Component({
             const onlineOne = devices.find(d => d.online)
             selected = onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : '')
           }
+          const _devCountBefore = (this.data.claimingDevices || []).length
           this.setData({ claimingDevices: devices, selectedDeviceId: selected })
+          // 「选择接单设备」卡按 claimingDevices.length 显隐：出现/消失会整块改内容高
+          // （Chromium 实测单卡 ≈153px）。以前这条路径完全不重测 ⇒ maxY 停在旧值，
+          // 滚到底就多出一块空白（现场 2026-10-25）。只在张数变化时测，免得轮询每轮都测。
+          if (_devCountBefore !== devices.length) this._scheduleMeasure(200)
           if (done) done(true)
         },
         fail: () => {
@@ -3149,9 +3245,11 @@ Component({
 
     _doSubmit(skipPageValidation) {
       if (this.data.submitting) return   // 防连点：提交进行中直接忽略
-      // S2-08（DS-19）：隐私告知必须由顾客**主动勾选**后才提交（三个提交入口都经过这里）。
+      // S2-08（2026-10-26 用户要求）：隐私告知只在**首次**确认一次并永久记住，
+      // 之后不再每单勾选。未同意（首次使用没确认 / 清过缓存）→ 弹告知层并要求先确认。
       if (!this.data.privacyAgreed) {
-        wx.showToast({ title: '请先阅读并勾选《文件使用与隐私说明》', icon: 'none', duration: 2500 })
+        this.setData({ privacySheetVisible: true, privacySheetClosing: false })
+        wx.showToast({ title: '请先阅读并同意《文件使用与隐私说明》', icon: 'none', duration: 2500 })
         return
       }
       const { selectedFiles } = this.data
@@ -3236,8 +3334,7 @@ Component({
           this.setData({
             submitting: false,
             showSuccessModal: true,
-            // S2-08：同意是**逐单**的（下一单重新确认），不记住上次勾选
-            privacyAgreed: false,
+            // S2-08（2026-10-26）：同意已持久化，**不再**在本单结束后清空（旧行为会让下一单重新勾选）
             lastOrderNumber: submitRes.data.order_number || '',
             // 页数未完成计算（Word/md 等需本地转换的类型，接管设备离线时等不到）
             // → 弹窗内先亮出提示：此时价格无效，点「复制价格」会被拦下
@@ -3249,6 +3346,7 @@ Component({
           // 任务发起后自动收起"打印文件"列表（高度补间归零，返回初始状态）
           this._fileListPx = 0
           this._animateFileListHeight(0, 300)
+          this._scheduleMeasure(400)   // 列表整块消失 → 重算滚动范围（否则底部留一大块空白）
           // 隐藏 tab 栏发丝线，让成功弹窗与 tab 栏融为一体
           try {
             const tabBar = this.getTabBar && this.getTabBar()

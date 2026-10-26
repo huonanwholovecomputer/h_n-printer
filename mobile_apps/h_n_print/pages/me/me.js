@@ -197,6 +197,8 @@ Component({
       const app = getApp()
       const bg = app.globalData.isDarkMode ? '#1C1C1E' : '#F2F2F7'
       wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
+      // 回到本页先补测一次滚动边界（切 tab 期间订单/密钥/存储统计可能已经变了高度）
+      this._scheduleMeasure(60)
       const resumedFromBg = app.globalData._resumedFromBackground
       if (resumedFromBg) {
         app.globalData._resumedFromBackground = false
@@ -507,12 +509,19 @@ Component({
 
     // 推送滚动边界给 WXS 引擎（change:prop 观察器，低频同步，不逐帧走 setData）
     _pushScrollConfig() {
+      // rev 自增：其余字段相同时 change:prop 不触发，而失同步的内联 transform
+      // 要靠 onConfig 里的重绘收敛（与首页同口径）。
+      this._scrollRev = (this._scrollRev || 0) + 1
       this.setData({
         scrollConfig: {
+          rev: this._scrollRev,
           minY: 0,
           maxY: Math.round(this._maxY || 0),
           scrollerH: this._scrollerH || 0,
           contentH: this._contentH || 0,
+          // 底部留白（px）：WXS 用它 + 真实内容高/视口高自己重算 maxY（与首页同口径）
+          // （|| 0：_pushScrollConfig 若早于 _initScrollEngine 被调用，别把 NaN 推下去）
+          padPx: (this._bottomPad || 0) + (this._tabOverlayPx || 0),
           listOverflow: false,
           closePicker: true,   // 触摸开始时通知逻辑层收起分页下拉
         },
@@ -538,6 +547,8 @@ Component({
         if (!res || !res[0] || !res[1]) return
         const vp = res[0].height || 0
         const ch = res[1].height || 0
+        // 隐藏页/首帧会量到 0：照收会把 maxY 写成一整屏的空白（与首页同一道闸门）
+        if (!(vp > 100) || !(ch > 0)) return
         this._scrollerH = vp
         this._contentH = ch
         this._maxY = Math.max(0, ch - vp + this._bottomPad + this._tabOverlayPx)

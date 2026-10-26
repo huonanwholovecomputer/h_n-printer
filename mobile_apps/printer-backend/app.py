@@ -305,6 +305,51 @@ def _rel_display(path: str) -> str:
     return os.path.basename(path)
 
 
+# ===== 2026-10-25：原文件名（「我 → 我的文件」显示的是微信临时名） =====
+# 现场：/api/my_files 列出的是 tmp_617c7e76….pdf 这种名字。根因是**上传** ——
+# 小程序 `wx.uploadFile` 的 multipart 文件名取自「临时路径的 basename」，微信把它变成
+# `tmp_<40~64 位十六进制>.<ext>`（真机实测），而 `files.original_name` 直接存了这个值。
+# 真正对顾客有意义的名字记录在 `order_files.file_name`（提交订单时客户端把自己选的文件名
+# 带上来）。四条落地（缺一不可）：
+#   ① 客户端在 /api/upload 表单里带真实文件名 `file_name`（小程序 chooseMessageFile 的 name）；
+#   ② 服务端优先用它当 `files.original_name`（`clean_original_name` 规整：basename、
+#      去控制字符、限长、扩展名必须与本次上传一致；不通过就退回上传头里的名字，不拒单）；
+#   ③ 存量行：`/api/my_files` 用 `order_files.file_name`（最近一次下单用过的名字）兜底显示；
+#   ④ 存量行自愈：提交订单时若该行仍是临时名，按本次提交的真实名回填（同扩展名才写）。
+_TEMP_UPLOAD_NAME_RE = re.compile(r"^tmp_[0-9a-fA-F]{16,}\.[A-Za-z0-9]{1,8}$")
+
+
+def looks_like_temp_upload_name(name) -> bool:
+    """是否是微信上传留下的临时文件名（tmp_<hex>.<ext>）—— 对顾客没有意义。"""
+    return bool(_TEMP_UPLOAD_NAME_RE.match(str(name or "").strip()))
+
+
+def clean_original_name(name, ext_lower="", max_len=200) -> str:
+    """把客户端自报的原文件名规整成可安全落库/展示的名字；不可用返回 ""。
+
+    只做**展示/审计用**的规整，不参与落盘路径（落盘名仍然由服务端自己生成）：
+      · 只取 basename（同时兼容 `\\` 与 `/`）—— 客户端不能借路径改写任何东西；
+      · 去掉控制字符/换行，长度截到 max_len（保留扩展名）；
+      · 给了 ext_lower 时要求扩展名一致（否则 ""：绝不让展示名与真实格式脱钩，
+        页数分析/白名单等按扩展名分支的逻辑都读这个字段）。
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    base = raw.replace("\\", "/").split("/")[-1].strip()
+    if not base or base in (".", ".."):
+        return ""
+    base = "".join(ch for ch in base if ch >= " " and ch != "\x7f")
+    if not base:
+        return ""
+    if len(base) > max_len:
+        stem, ext = os.path.splitext(base)
+        base = (stem[:max(1, max_len - len(ext))] or "file") + ext
+    if ext_lower and os.path.splitext(base)[1].lower().lstrip(".") != str(ext_lower).lower():
+        return ""
+    return base
+
+
 # ===== S3-04（DS-24）：文件访问审计的唯一入口 =====
 def _audit_ext(name) -> str:
     """从文件名/路径里只取扩展名（S2-11：审计只记扩展名，不记原文件名）。"""
@@ -6098,6 +6143,21 @@ def list_my_files():
                 f"AND status IN ({_sp})", (*ids, *active_statuses)).fetchall():
                 if r["file_id"]:
                     busy_ids.add(r["file_id"])
+        # 展示名（2026-10-25 现场）：老客户端上传时 multipart 文件名是微信临时名
+        # （tmp_<hex>.pdf），不该拿它给顾客看。真正有意义的名字在
+        # order_files.file_name（提交订单时客户端带上来的），按「该文件最近一次下单用过的
+        # 名字」兜底；字段名仍叫 original_name，前端（小程序/APP）不用改。
+        display_names = {}
+        if ids:
+            _ph2 = ",".join("?" for _ in ids)
+            for r in conn.execute(
+                f"SELECT file_id, file_name FROM order_files WHERE file_id IN ({_ph2}) "
+                f"AND file_name != '' ORDER BY id DESC", tuple(ids),
+            ).fetchall():
+                _fid = r["file_id"]
+                _nm = (r["file_name"] or "").strip()
+                if _fid and _nm and _fid not in display_names:
+                    display_names[_fid] = _nm
     finally:
         conn.close()
 
@@ -6125,7 +6185,11 @@ def list_my_files():
             retention_label = "不自动删除"
         out.append({
             "file_id": r["id"],
-            "original_name": r["original_name"],
+            # 展示名：老客户端上传留下的微信临时名（tmp_<hex>.pdf）用
+            # order_files.file_name（该文件最近一次下单用的名字）兜底；没有下单记录时照实回。
+            "original_name": display_names.get(r["id"]) or r["original_name"],
+            # 原始落库值（诊断用：想区分「这行到底存了什么」时看它）
+            "stored_original_name": r["original_name"],
             "size": int(r["size"] or 0),
             "page_count": int(r["page_count"] or 0),
             "created_at": r["created_at"],
@@ -6817,6 +6881,11 @@ def upload_file():
             "success": False,
             "message": "本服务不支持 HTML/SVG/JS 文件；请另存为 PDF/DOCX 后重试",
         }), 400
+    # 2026-10-25：真实文件名（客户端自报）优先于 multipart 里的临时名。
+    # `f.filename` 在小程序上传时是 `tmp_<hex>.<ext>`（微信临时路径 basename）；
+    # 客户端在 4.5.36+ / 小程序同版起把顾客选的文件名放在表单字段 `file_name`。
+    # 校验不通过（路径、异扩展名、控制字符）一律退回 f.filename —— 可选字段不应让上传失败。
+    display_name = clean_original_name(request.form.get("file_name"), ext_lower) or f.filename
     # S2-03：白名单 + MIME 冲突（落盘之前就能判的两项；魔数要读内容，放在保存之后）。
     # 白名单先行 ⇒ 压缩包/未知类型连临时文件都不写。
     if ext_lower not in UPLOAD_EXT_WHITELIST:
@@ -6936,7 +7005,7 @@ def upload_file():
 
     # 4. 更新 MD5 索引（页数缓存；path 指向本行自己的副本）
     rel_path = os.path.relpath(file_path, UPLOAD_DIR)
-    _md5_entry_set(md5_index, file_md5, path=rel_path, original_name=f.filename,
+    _md5_entry_set(md5_index, file_md5, path=rel_path, original_name=display_name,
                    page_count=cached_page_count, page_count_verified=cached_page_verified,
                    openid=g.openid)
     save_md5_index(md5_index)
@@ -6947,7 +7016,7 @@ def upload_file():
     if cached_page_verified and cached_page_count > 0:
         # 同 MD5 文件已由本地工具验证 → 直接复用页数，跳过分析
         page_count = cached_page_count
-        print(f"  [PAGE] 复用已验证页数: {_redact_filename(f.filename)} → {page_count} 页 (from MD5 cache)")
+        print(f"  [PAGE] 复用已验证页数: {_redact_filename(display_name)} → {page_count} 页 (from MD5 cache)")
     else:
         page_count = get_file_page_count(file_path, ext_lower)
 
@@ -6958,7 +7027,7 @@ def upload_file():
         INSERT INTO files (id, original_name, saved_name, path, size, created_at, page_count, page_count_verified, md5, openid, retention_hours)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (file_id, f.filename, saved_name, file_path, file_size,
+        (file_id, display_name, saved_name, file_path, file_size,
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), page_count,
          int(cached_page_verified), file_md5, g.openid, _retention_hours),
     )
@@ -6970,9 +7039,9 @@ def upload_file():
     # prefer：前端当前选中的接单设备（用户选了哪台就哪台分析；离线则退回订单目标/任一在线接单设备）
     if page_count == 0 and ext_lower in ("doc", "docx") and not cached_page_verified:
         prefer_client = (request.form.get("target_client_id", "") or "").strip()[:64]
-        request_page_analysis(file_id, f.filename, prefer_client=prefer_client)
+        request_page_analysis(file_id, display_name, prefer_client=prefer_client)
 
-    print(f"文件上传: {_redact_filename(f.filename)} -> {_rel_display(file_path)} "
+    print(f"文件上传: {_redact_filename(display_name)} -> {_rel_display(file_path)} "
           f"(id={file_id}, pages={page_count}, md5={file_md5[:8]}...)")
 
     # S2-05（DS-14）：响应**不再**带 `reused` 字段，也不再有「文件已存在」文案 ——
@@ -6983,7 +7052,7 @@ def upload_file():
             "success": True,
             "message": "文件上传成功",
             "file_id": file_id,
-            "original_name": f.filename,
+            "original_name": display_name,
             "size": file_size,
             "page_count": page_count,
         }
@@ -7016,6 +7085,7 @@ def _plan_order_files(conn, files_input, openid, default_duplex, schedule_mode, 
         page_count = 1
         page_count_verified = False
         persist_pages = None          # (page_count, verified)：需要写回 files 表（写事务里做）
+        persist_original_name = None  # 展示名自愈：临时名 → 本次提交的真实名（写事务里做）
         if f_id:
             frow = conn.execute(
                 "SELECT path, original_name, page_count, page_count_verified, openid FROM files WHERE id = ?",
@@ -7047,6 +7117,18 @@ def _plan_order_files(conn, files_input, openid, default_duplex, schedule_mode, 
                         page_count_verified = False
                 if not f_name:
                     f_name = frow["original_name"]
+                # 展示名自愈（2026-10-25）：老客户端上传留下的微信临时名（tmp_<hex>.pdf）
+                # 在这份文件第一次以「真实文件名」下单时订正掉 —— 之后 /api/my_files、
+                # 下载（Content-Disposition）与页数分析（按扩展名分支）都拿到顾客认得的名字。
+                # 只认**同扩展名**的真实名，且只改临时名（别覆盖用户已经正确的名字）。
+                _stored_name = (frow["original_name"] or "").strip()
+                _submitted = (f_name or "").strip()
+                if (looks_like_temp_upload_name(_stored_name) and _submitted
+                        and not looks_like_temp_upload_name(_submitted)):
+                    _new_name = clean_original_name(_submitted)
+                    if _new_name and (os.path.splitext(_new_name)[1].lower()
+                                      == os.path.splitext(_stored_name)[1].lower()):
+                        persist_original_name = _new_name
             else:
                 ext = os.path.splitext(f_name)[1].lower().lstrip(".")
                 page_count = get_file_page_count(None, ext) or 1
@@ -7086,6 +7168,7 @@ def _plan_order_files(conn, files_input, openid, default_duplex, schedule_mode, 
             "page_count": page_count,
             "page_count_verified": page_count_verified,
             "persist_pages": persist_pages,
+            "persist_original_name": persist_original_name,
             "page_range": f_page_range,
             "total_price": total_price,
             "status": sub_status,
@@ -7354,6 +7437,14 @@ def submit_order():
                 conn.execute(
                     "UPDATE files SET page_count = ?, page_count_verified = ? WHERE id = ?",
                     (item["page_count"], int(item["page_count_verified"]), item["file_id"]),
+                )
+            # 展示名自愈（2026-10-25）：临时名 → 本次提交的真实名。纯 UPDATE，不读盘，
+            # 符合 S2-02 对写事务的约束；归属校验与 _plan_order_files 同一口径（空 openid = 旧数据）。
+            if item.get("persist_original_name"):
+                conn.execute(
+                    "UPDATE files SET original_name = ? WHERE id = ? "
+                    "AND (openid = ? OR openid IS NULL OR openid = '')",
+                    (item["persist_original_name"], item["file_id"], g.openid),
                 )
             conn.execute(
                 """INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,

@@ -40,6 +40,8 @@ function ensureState(state) {
     state.maxY = 0;
     state.scrollerH = 0;
     state.contentH = 0;
+    state.padY = 0;            // 底部留白（逻辑层 _bottomPad + _tabOverlayPx，px）
+    state.padYSet = false;     // false = 还没拿到可信的 padY（老页面配置里没有 padPx）
     state.vel = 0;
     state.inDecel = false;
     state.running = false;
@@ -116,9 +118,47 @@ function estimateReleaseVel(state) {
   state.samples = [];
 }
 
-// 渲染：内容 transform + logo 缩放 + header 内边距（rpx），全部 setStyle 直写视图层
+// 从**真实布局**校正滚动边界（滚动范围 = 内容高 - 视口高 + 底部留白）
+//
+// 为什么必须这样做（2026-10-25 现场：偶发的「最顶端内容位置不对 / 最底端一大块空白」）：
+// 逻辑层 `_measure()` 推来的 maxY 是**某一瞬间的快照**，而这一页的内容高随时在变 ——
+// 接单设备卡异步出现/消失、保留期文案由 /api/retention_config 回填、文件列表高度补间、
+// 页数确认后卡片在「文本 ↔ 数字网格」之间换形态、logo 图片解码后 widthFix 才长出高度……
+// 任何一次变化之后没来得及重测，maxY 就偏大（滚到底多出一块空白）或偏小（最后一段永远
+// 滚不到）。以前只在逻辑层按事件补测，漏一个触发点就复现一次。
+// 现在：**视图层在手势入口（touchstart）直接量真实节点**（两个 rect，成本可忽略），
+// 量到就以它为准，量不到才沿用逻辑层的快照（桩环境/首帧渲染都能照常工作）。
+// 同时把「超出范围的 state.y」钳回边界内，避免停在越界位置后表现为大块空白。
+//
+// ⚠ 只允许在 touch 事件里调用：微信的 `getBoundingClientRect()` 只在 touch 回调中保证
+// 拿到当前布局值（本文件其它调用也都在 touchstart），在 change:prop 观察器里可能给旧帧/0。
+function syncGeometry(state, owner) {
+  var scroller = owner.selectComponent('.scroller');
+  var content = owner.selectComponent('.scroll-content');
+  if (!scroller || !content) return false;
+  if (typeof scroller.getBoundingClientRect !== 'function') return false;
+  if (typeof content.getBoundingClientRect !== 'function') return false;
+  var r1 = scroller.getBoundingClientRect();
+  var r2 = content.getBoundingClientRect();
+  if (!r1 || !r2) return false;
+  var vp = r1.height || 0;
+  var ch = r2.height || 0;
+  if (vp <= 0 || ch <= 0) return false;
+  state.scrollerH = vp;
+  state.contentH = ch;
+  var pad = typeof state.padY === 'number' ? state.padY : 0;
+  state.maxY = Math.max(0, ch - vp + pad);
+  return true;
+}
+
+// 渲染：内容 transform + logo 缩放，全部 setStyle 直写视图层
 // 内容用 2D translateY：微信对 will-change/translate3d 会预分配固定尺寸 GPU 层，
 // 文件列表高度动态变化时可能截断内容（index.wxss 旧注释记录过该坑），2D 无此问题。
+//
+// ⚠ 不复写 `.header-area` 的 padding（旧实现在 ratio≥1 时把 padding 从 40rpx 改成 8rpx）：
+// 那是在**滚动过程中改变内容总高**（64rpx≈36px），等于让 maxY 随滚动位置漂移 —— 上面
+// syncGeometry 量到的高度也就跟着上下文变化，属于自找的几何不一致。logo 的缩放已经足够
+// 表达"页头让位"，而那段 padding 在 y>400 时本来就在视口外（看不见），去掉零视觉损失。
 function applyRender(state, owner, rawY) {
   var content = owner.selectComponent('.scroll-content');
   if (content) {
@@ -129,11 +169,6 @@ function applyRender(state, owner, rawY) {
   var logo = owner.selectComponent('.logo-wrap');
   if (logo) {
     logo.setStyle({ transform: 'scale(' + (1 - ratio * 0.7) + ')' });
-  }
-  var header = owner.selectComponent('.header-area');
-  if (header) {
-    var pad = Math.round(40 - ratio * 32);
-    header.setStyle({ 'padding-top': pad + 'rpx', 'padding-bottom': pad + 'rpx' });
   }
   // 分桶节流通知逻辑层（每 100px 一次），供回顶按钮等阈值类 UI 使用
   var bucket = Math.floor(real / 100);
@@ -428,6 +463,24 @@ module.exports = {
     if (newValue.listAtTop !== undefined) state.listAtTop = !!newValue.listAtTop;
     if (newValue.listAtBottom !== undefined) state.listAtBottom = !!newValue.listAtBottom;
     state.closePicker = !!newValue.closePicker;
+    // 底部留白（px）：逻辑层显式下发（_bottomPad + _tabOverlayPx）；老页面配置里没有这个
+    // 字段时，从这一次的 maxY 反推一次（maxY = contentH - scrollerH + pad）并记住 ——
+    // 之后 syncGeometry 才能用"真实内容高"重算出等价口径的 maxY。
+    if (typeof newValue.padPx === 'number') {
+      state.padY = Math.max(0, newValue.padPx);
+      state.padYSet = true;
+    } else if (!state.padYSet && state.contentH > state.scrollerH) {
+      state.padY = Math.max(0, state.maxY - (state.contentH - state.scrollerH));
+      state.padYSet = true;
+    }
+    // ⚠ 这里**不**调 syncGeometry：微信的 `getBoundingClientRect()` 只在 touch 事件的
+    // 回调里保证拿到当前布局值（仓库原有用法都在 touchstart，见 scroll.wxs 内其它调用），
+    // 在 change:prop 的观察器里可能返回旧帧/0。旧值会直接把 maxY 写错（0 无害、旧值有害），
+    // 所以测量只放在手势入口（touchstart）做；配置路径只消费逻辑层推来的快照。
+    // 负向越界（状态被重置/回弹残留）同样钳回边界，静止态不该停在 minY 之外。
+    if (!state.touching && !state.inDecel && state.y < state.minY) {
+      state.y = state.minY;
+    }
     // 内容变短（maxY 减小）：阻尼弹簧实时跟随目标，平滑收到新底部。
     // 弹簧对位置/速度积分（无离散跳变）→ 无论何时收起（静止/滚动中/弹回中）
     // 都不会闪现，也不会出现两段式移动；中间重测只更新 maxY，弹簧自行跟随。
@@ -462,6 +515,12 @@ module.exports = {
     state.horizontal = false;
     state.moved = false;
     state.touching = true;
+    // 手势开始前用真实布局刷新边界，并把 y 钳回 [minY, maxY]：
+    // 上一次内容变化（删文件/设备卡消失/页数确认）之后没来得及重测的范围，
+    // 在这一刻自愈 —— 否则手指会从"越界位置"开始，表现为顶端/底端位置不对。
+    syncGeometry(state, ownerInstance);
+    if (state.y > state.maxY) state.y = state.maxY;
+    if (state.y < state.minY) state.y = state.minY;
     var t0 = touches[0];
     state.trackId = t0.identifier;
     state.lastY = t0.clientY;
