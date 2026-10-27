@@ -116,6 +116,19 @@ Component({
     scrollCmd: null,        // WXS 程序化滚动命令（回顶 / 滚到订单区）
     // 任务卡展开状态: { [orderId]: true }
     expandedOrders: {},
+    // 合计价格复制 Popconfirm（气泡在 page-root 外 fixed 定位，坐标为视口 px）：
+    //   showPricePop / pricePopOrderId —— 气泡显隐与所属订单
+    //   pricePopLeft / pricePopWidth / pricePopCaretLeft —— 水平位置（左右都按 px 夹在视口内）
+    //   pricePopBottom（气泡在价格上方时的 bottom 距离）/ pricePopTop（空间不足翻到下方时的 top）
+    //   pricePopBelow —— 上方放不下时翻到价格下方，箭头改为朝上
+    showPricePop: false,
+    pricePopOrderId: '',
+    pricePopLeft: 0,
+    pricePopWidth: 0,
+    pricePopCaretLeft: 0,
+    pricePopBottom: 0,
+    pricePopTop: 0,
+    pricePopBelow: false,
     // 管理员：服务器存储统计
     storageStats: null,
     retentionDays: 7,
@@ -199,6 +212,8 @@ Component({
       wx.setBackgroundColor({ backgroundColor: bg, backgroundColorTop: bg, backgroundColorBottom: bg })
       // 回到本页先补测一次滚动边界（切 tab 期间订单/密钥/存储统计可能已经变了高度）
       this._scheduleMeasure(60)
+      // 切回本页时收起「合计价格复制」气泡（切 tab 期间它不该跟着回来）
+      if (this.data.showPricePop) this.setData({ showPricePop: false })
       const resumedFromBg = app.globalData._resumedFromBackground
       if (resumedFromBg) {
         app.globalData._resumedFromBackground = false
@@ -422,7 +437,7 @@ Component({
             newOrders.forEach(order => {
               order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
             })
-            this.setData({ orders: newOrders, expandedOrders: this.data.expandedOrders })
+            this.setData({ orders: newOrders, expandedOrders: this.data.expandedOrders, showPricePop: false })
           } else if (Object.keys(updates).length > 0) {
             this.setData(updates)
           }
@@ -2329,6 +2344,7 @@ Component({
               ordersTotal: total,
               ordersTotalPages: Math.ceil(total / this.data.ordersPerPage),
               expandedOrders: {},
+              showPricePop: false,
               ordersAnimated: firstLoad,
             }, () => {
               this._syncOrdersPageNumbers()
@@ -2477,11 +2493,164 @@ Component({
       } else {
         expanded[orderId] = true
       }
-      this.setData({ expandedOrders: expanded })
+      this.setData({ expandedOrders: expanded, showPricePop: false })
       // 详情展开/收起有 250ms 动画：过渡中途先跟一版，动画结束后再测最终值
       this._scheduleMeasure()
       setTimeout(() => this._scheduleMeasure(120), 120)
       setTimeout(() => this._scheduleMeasure(300), 300)
+    },
+
+    // ==================== 合计价格复制（Popconfirm 气泡） ====================
+    // 金额一律取订单**已定稿**的实收值（orders.total_price / order_files.total_price）：
+    // 设备回报页数后后端会用 _recalc_prices_for_file 重算并回写这两处，前端不再自己套单价，
+    // 复制出去的就是页面上看到的数字（避免「复制价 ≠ 实收价」）。
+
+    _findOrderById(id) {
+      const list = this.data.orders || []
+      for (let i = 0; i < list.length; i++) {
+        const o = list[i]
+        if (o && String(o.id) === String(id)) return o
+      }
+      return null
+    },
+
+    _orderTotal(o) {
+      return Math.round((Number(o && o.total_price) || 0) * 100) / 100
+    },
+
+    _copyText(text, toastTitle) {
+      wx.setClipboardData({
+        data: text,
+        success: () => wx.showToast({ title: toastTitle, icon: 'success' }),
+        fail: () => wx.showToast({ title: '复制失败', icon: 'none' }),
+      })
+    },
+
+    // 点击「¥xx.xx」→ 在价格处弹出气泡（再点一次收起）。
+    // 气泡在 page-root 外、position:fixed：既逃出 scroll-content 的 translateY 变换层，
+    // 也不会被订单卡片的 overflow:hidden / max-height 裁剪。
+    onPriceTap(e) {
+      const id = e.currentTarget.dataset.id
+      if (this.data.showPricePop && String(this.data.pricePopOrderId) === String(id)) {
+        this.setData({ showPricePop: false })
+        return
+      }
+      const win = (typeof wx.getWindowInfo === 'function' ? wx.getWindowInfo() : null) || {}
+      const winW = win.windowWidth || 375
+      const winH = win.windowHeight || 667
+      const popW = Math.min(Math.round(winW * 0.74), winW - 24)
+      const q = this.createSelectorQuery()
+      q.select('#price-tap-' + id).boundingClientRect()
+      q.exec((res) => {
+        const rect = res && res[0]
+        if (!rect) return
+        // 水平：气泡右边对齐价格右边，再夹在视口内；箭头指向价格中心
+        const left = Math.max(8, Math.min(rect.right - popW, winW - popW - 8))
+        const caret = Math.max(18, Math.min(rect.left + rect.width / 2 - left, popW - 18))
+        this.setData({
+          showPricePop: true,
+          pricePopOrderId: id,
+          pricePopWidth: popW,
+          pricePopLeft: left,
+          pricePopCaretLeft: caret,
+          // 垂直：气泡底边锚在价格上方 12px（高度未知也可用，向上自然长高）
+          pricePopBottom: Math.max(8, winH - rect.top + 12),
+          pricePopTop: rect.bottom + 12,
+          pricePopBelow: false,
+        }, () => {
+          // 价格贴近屏幕顶部、上方放不下 → 翻到价格下方，箭头朝上
+          const q2 = this.createSelectorQuery()
+          q2.select('.price-pop').boundingClientRect()
+          q2.exec((r2) => {
+            const b = r2 && r2[0]
+            if (b && b.top < 8) this.setData({ pricePopBelow: true })
+          })
+        })
+      })
+    },
+
+    onClosePricePop() {
+      if (this.data.showPricePop) this.setData({ showPricePop: false })
+    },
+
+    // 复制价格（简略：订单号 + 金额，与提交成功弹窗里的「复制价格」同格式）
+    onCopyOrderPrice(e) {
+      const o = this._findOrderById(e.currentTarget.dataset.id)
+      this.setData({ showPricePop: false })
+      if (!o) return
+      const text = (o.order_number ? o.order_number + ' ' : '') + '¥' + this._orderTotal(o).toFixed(2)
+      this._copyText(text, '已复制价格')
+    },
+
+    // 复制详细价格：逐文件 + 附加服务 + 合计（金额全部取订单已定稿的实收值）
+    onCopyOrderDetailPrice(e) {
+      const o = this._findOrderById(e.currentTarget.dataset.id)
+      this.setData({ showPricePop: false })
+      if (!o) return
+      const lines = ['计费明细']
+      if (o.order_number) lines.push(o.order_number)
+      lines.push('─'.repeat(14))
+      const total = this._orderTotal(o)
+      const parts = []
+      let itemNo = 0
+      let baseTotal = 0
+      ;(o.files || []).forEach((f) => {
+        itemNo++
+        const amount = Number(f.total_price) || 0
+        baseTotal += amount
+        const duplexLabel = f.duplex === 'on' ? '双面' : '单面'
+        const rangeLabel = f.page_range ? ('选 ' + f.page_range + ' 页') : '全部页'
+        const pagesText = f.pagesLine || ((Number(f.copies) || 1) + ' 份')
+        lines.push(itemNo + '. ' + (f.original_name || f.file_name || '未知文件'))
+        lines.push('   ' + pagesText + ' | ' + duplexLabel + ' | ' + rangeLabel + ' | ¥' + amount.toFixed(2))
+        if (amount > 0) parts.push(amount.toFixed(2))
+      })
+      const urgencyFee = Number(o.urgency_price) || 0
+      if (urgencyFee > 0) {
+        itemNo++
+        lines.push(itemNo + '. 优先级：' + (o.urgency || '中') + ' | ￥' + urgencyFee.toFixed(2))
+        parts.push(urgencyFee.toFixed(2))
+      }
+      const coverCount = Number(o.cover_page) || 0
+      const coverFee = coverCount > 0
+        ? Math.round((Number(o.cover_page_price) || 0) * coverCount * 100) / 100
+        : 0
+      if (coverFee > 0) {
+        itemNo++
+        lines.push(itemNo + '. 打印首页信息 | ' + coverFee.toFixed(2))
+        parts.push(coverFee.toFixed(2))
+      }
+      if (Number(o.delivery_enabled)) {
+        itemNo++
+        const pct = Number(o.delivery_percentage) || 0
+        const loc = o.delivery_location || '未指定地点'
+        // 派送费取「实收合计 − 文件小计 − 加急 − 首页」的残差：后端父订单价 =
+        // round(文件小计 + 加急 + 首页 + round(文件小计 × 百分比 / 100, 2), 2)，
+        // 每项都是两位小数 ⇒ 残差就是实收派送费。这样不必在前端重写一遍取整口径
+        //（Math.round 与后端 Python round 在 .5 边界会差 1 分），也保证与实收一致。
+        const deliveryFee = Math.max(0, Math.round((total - baseTotal - urgencyFee - coverFee) * 100) / 100)
+        // 残差与「小计 × 百分比」相差一分以内才算可信：历史单被人工改过价时
+        // 不把差额乱归因到派送（那一行就只写百分比、不写金额；合计仍按实收）
+        const feeSane = Math.abs(deliveryFee - baseTotal * pct / 100) <= 0.011
+        if (deliveryFee > 0 && feeSane) {
+          lines.push(itemNo + '. 派送：是 | ' + loc + ' ' + pct + '% | ￥' + deliveryFee.toFixed(2))
+          parts.push(deliveryFee.toFixed(2))
+        } else if (feeSane) {
+          lines.push(itemNo + '. 派送：是 | ' + loc + '（免费）')
+        } else {
+          // 实收对不上「小计 × 百分比」：只写百分比，不猜金额（合计仍按实收）
+          lines.push(itemNo + '. 派送：是 | ' + loc + ' ' + pct + '%')
+        }
+      }
+      lines.push('─'.repeat(14))
+      const sum = Math.round(parts.reduce((s, p) => s + parseFloat(p), 0) * 100) / 100
+      // 逐项相加与实收一致 → 给出算式；不一致（历史数据/人工调整）只给实收合计，不编算式
+      if (parts.length && Math.abs(sum - total) < 0.005) {
+        lines.push('💰合计: ' + parts.join('+') + '=￥' + total.toFixed(2))
+      } else {
+        lines.push('💰合计: ￥' + total.toFixed(2))
+      }
+      this._copyText(lines.join('\n'), '已复制详细价格')
     },
 
     onDetailCancelOrder(e) {

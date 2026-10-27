@@ -1533,6 +1533,120 @@
    其他状态（失败/等待/放弃等）仍用状态色突出 */
 .detail-price-value.is-self-sent { color: #1e66f5 !important; }
 
+/* 合计价格可点：点击弹出「复制价格 / 复制详细价格」气泡（Popconfirm，见页面底部 page-root 外） */
+.detail-price-tap {
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  padding: 4rpx 2rpx 4rpx 10rpx;
+  margin: -4rpx -2rpx -4rpx 0;
+  border-radius: var(--radius-sm);
+  transition: background-color 0.2s ease;
+}
+.price-tap-hover {
+  background-color: var(--gray6);
+}
+.price-copy-icon {
+  font-size: 20rpx;
+  opacity: 0.55;
+}
+
+/* ── 合计价格复制弹层（Popconfirm）：mask 透明，只负责「点外部关闭」 ── */
+.price-pop-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: transparent;
+  /* 高于悬浮 tabBar（custom-tab-bar 9999）：气泡翻到价格下方时才不会被 tabBar 盖住 */
+  z-index: 10000;
+}
+
+.price-pop {
+  position: fixed;
+  box-sizing: border-box;
+  padding: 22rpx 24rpx 20rpx;
+  border-radius: 20rpx;
+  background-color: var(--bg-card);
+  box-shadow: 0 12rpx 48rpx rgba(0, 0, 0, 0.18), 0 0 0 1rpx var(--separator);
+  animation: pricePopIn 0.18s ease;
+}
+
+@keyframes pricePopIn {
+  from { opacity: 0; transform: translateY(6rpx) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.price-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  margin-bottom: 16rpx;
+}
+.price-pop-icon {
+  font-size: 24rpx;
+}
+.price-pop-title {
+  font-size: 24rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.price-pop-acts {
+  display: flex;
+  gap: 12rpx;
+}
+.price-pop-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 60rpx;
+  border-radius: 14rpx;
+  font-size: 24rpx;
+  font-weight: 500;
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.10);
+}
+.price-pop-btn.primary {
+  color: #fff;
+  background-color: var(--blue);
+}
+.price-pop-btn-hover {
+  opacity: 0.72;
+}
+/* 小三角：气泡在价格上方时朝下；翻到价格下方时朝上 */
+.price-pop-caret {
+  position: absolute;
+  width: 16rpx;
+  height: 16rpx;
+  background-color: var(--bg-card);
+  transform: rotate(45deg);
+}
+.price-pop-above .price-pop-caret {
+  bottom: -8rpx;
+  box-shadow: 3rpx 3rpx 6rpx rgba(0, 0, 0, 0.06);
+}
+.price-pop-below .price-pop-caret {
+  top: -8rpx;
+}
+/* 深色模式：气泡底色/箭头走 --bg-card（theme-dark 挂在 mask 上，变量已在深色作用域），
+   只补一条更重的投影与描边 —— 半透明 glass 压在文件列表上会让文字看不清 */
+.theme-dark .price-pop {
+  box-shadow: 0 12rpx 48rpx rgba(0, 0, 0, 0.45), 0 0 0 1rpx rgba(255, 255, 255, 0.08);
+}
+.theme-dark .price-pop-btn {
+  background-color: rgba(10, 132, 255, 0.18);
+  color: var(--blue-light);
+}
+.theme-dark .price-pop-btn.primary {
+  background-color: var(--blue);
+  color: #fff;
+}
+.theme-dark .price-tap-hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
 /* File rows in detail */
 .detail-file-row {
   display: flex;

@@ -1771,6 +1771,9 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
 .device-list { display: flex; flex-direction: column; gap: 1.44cqw; }
 .device-item {
   display: flex; align-items: center; gap: 1.44cqw;
+  /* 管理员 + 需人工翻纸的设备会同时出现「🖐 需人工翻纸」「攒批」等胶囊 + 在线状态：允许换行，
+     避免把设备名挤到几像素（375px 实测；2026-10-26 晚删掉「☁ LO / ☁ Word」后仍保留） */
+  flex-wrap: wrap;
   padding: 1.92cqw 2.16cqw;
   border: 0.12cqw solid var(--separator);
   border-radius: 1.92cqw;
@@ -1788,12 +1791,13 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
 .device-dot-on { background-color: var(--green); }
 .device-dot-off { background-color: var(--gray3); }
 .device-label {
-  flex: 1; font-size: 3cqw; font-weight: 500; color: var(--text-primary);
+  flex: 1; min-width: 40%; font-size: 3cqw; font-weight: 500; color: var(--text-primary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .device-state { font-size: 2.64cqw; flex-shrink: 0; }
-.device-state-on { color: var(--green); }
-.device-state-off { color: var(--gray); }
+/* 设备卡允许换行（管理员会同时看到「攒批」「☁」胶囊）⇒ 状态在换行后也要贴当行右端 */
+.device-state-on { color: var(--green); margin-left: auto; }
+.device-state-off { color: var(--gray); margin-left: auto; }
 /* 该设备已确认不支持自动双面（双面需人工翻纸）—— 列表提示，不拦截下单 */
 .device-state-manual { color: #e67e22; margin-right: 1.4cqw; }
 /* 攒批模式状态（stack_mode）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=未上报 → 不渲染 */
@@ -4819,6 +4823,128 @@ picker-view-column {
 .detail-price-value.status-waiting,
 .detail-price-value.status-delivered {
   background-color: transparent;
+}
+
+/* 合计价格可点：点击弹出「复制价格 / 复制详细价格」气泡（Popconfirm） */
+.detail-price-tap {
+  display: flex;
+  align-items: center;
+  gap: 0.96cqw;
+  padding: 0.48cqw 0.24cqw 0.48cqw 1.2cqw;
+  margin: -0.48cqw -0.24cqw -0.48cqw 0;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 0.2s ease;
+}
+.detail-price-tap:active {
+  background-color: var(--gray6);
+}
+.price-copy-icon {
+  font-size: 2.4cqw;
+  opacity: 0.55;
+}
+
+/* ── 合计价格复制弹层（Popconfirm）：mask 透明，只负责「点外部关闭」 ── */
+.price-pop-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: transparent;
+  /* 高于悬浮 tabBar（.tab-bar 9999）：气泡翻到价格下方时才不会被 tabBar 盖住 */
+  z-index: 10000;
+  touch-action: none;
+}
+.price-pop {
+  position: fixed;
+  box-sizing: border-box;
+  padding: 2.64cqw 2.88cqw 2.4cqw;
+  border-radius: var(--radius-lg);
+  background-color: var(--bg-card);
+  color: var(--text-primary);
+  box-shadow: 0 1.44cqw 5.76cqw rgba(0, 0, 0, 0.18), 0 0 0 0.12cqw var(--separator);
+  animation: pricePopIn 0.18s ease;
+}
+@keyframes pricePopIn {
+  from { opacity: 0; transform: translateY(0.72cqw) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+.price-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 0.96cqw;
+  margin-bottom: 1.92cqw;
+}
+.price-pop-icon {
+  font-size: 2.88cqw;
+}
+.price-pop-title {
+  font-size: 2.88cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.price-pop-acts {
+  display: flex;
+  gap: 1.44cqw;
+}
+.price-pop-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 7.2cqw;
+  border: none;
+  border-radius: 1.68cqw;
+  font-size: 2.88cqw;
+  font-weight: 500;
+  font-family: inherit;
+  color: var(--blue);
+  background-color: rgba(0, 122, 255, 0.10);
+  cursor: pointer;
+  padding: 0;
+}
+.price-pop-btn.primary {
+  color: #fff;
+  background-color: var(--blue);
+}
+.price-pop-btn:active {
+  opacity: 0.72;
+}
+/* 小三角：气泡在价格上方时朝下；翻到价格下方时朝上 */
+.price-pop-caret {
+  position: absolute;
+  width: 1.92cqw;
+  height: 1.92cqw;
+  background-color: var(--bg-card);
+  transform: rotate(45deg);
+}
+.price-pop:not(.price-pop-below) .price-pop-caret {
+  bottom: -0.96cqw;
+  box-shadow: 0.36cqw 0.36cqw 0.72cqw rgba(0, 0, 0, 0.06);
+}
+.price-pop.price-pop-below .price-pop-caret {
+  top: -0.96cqw;
+}
+/* 深色模式：气泡与按钮跟随 glass 材质（theme-dark 挂在 body 上） */
+.theme-dark .price-pop {
+  background-color: #2C2C2E;
+  color: var(--text-primary);
+  box-shadow: 0 1.44cqw 5.76cqw rgba(0, 0, 0, 0.45), 0 0 0 0.12cqw rgba(255, 255, 255, 0.08);
+}
+.theme-dark .price-pop-caret {
+  background-color: #2C2C2E;
+}
+.theme-dark .price-pop-btn {
+  background-color: rgba(10, 132, 255, 0.18);
+  color: var(--blue-light);
+}
+.theme-dark .price-pop-btn.primary {
+  background-color: var(--blue);
+  color: #fff;
+}
+.theme-dark .detail-price-tap:active {
+  background-color: rgba(255, 255, 255, 0.08);
 }
 
 /* File rows in detail */

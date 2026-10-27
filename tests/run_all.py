@@ -64,6 +64,16 @@ ENV_REQUIRED: dict[str, str] = {
                                             "「未解锁就弹合并且必定 403」两处 UI 逻辑只能靠真实渲染量："
                                             "桩后端 + 真实 settlement.html，并渲染 HEAD 旧版作反向自证；"
                                             "--all 或直接 node 可跑）",
+    # v7.6「🖨️ 打印机折旧」标签页：标签切换/锁定态只读/解锁后出现下拉/改价格后每页成本重算
+    # 全是渲染结果，静态 grep 只能证明"代码里写了"。
+    "verify_printers_tab_ui.mjs": "需 Playwright / 真实浏览器（打印机折旧页的标签切换、锁定态只读、"
+                                  "解锁后出现下拉、改价格后每页成本立即重算都是渲染结果；"
+                                  "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
+    # v7.7 累计实测寿命：累计读数要拉区间订单、报废结算要弹窗预览、写回后历史月份折旧要立刻回溯
+    # —— 全是渲染 + 异步结果，静态 grep 覆盖不到。
+    "verify_printer_life_mode_ui.mjs": "需 Playwright / 真实浏览器（累计读数 / 报废结算弹窗 / 写回后台账 + "
+                                       "云端配置落盘 / 历史月份回溯折旧都是渲染与异步结果；"
+                                       "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
 }
 
 # 非验收脚本（工具/选型/测量），不参与 PASS 计数
@@ -111,6 +121,12 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   改了 www/{index.html,print.js,me.js,styles.css} 后 APK 内 web 资源与 www/ 不再逐字节一致。
 #   **已解除**：APK **1.1.44** 已于当日构建并发布（md5 1608cff4570ab4b672824f15b34d5ec2，公网下载自检全绿），
 #   `verify_apk_release.py` 转绿 ⇒ 按「产物重建后必须删条」的约定删除。
+# 2026-10-26（「我」页价格复制气泡 + 云端 Word 引擎远程开关）：改了
+#   www/{app,me}.js 与 www/styles.css ⇒ APK 内 web 资源与 www/ 不再逐字节一致
+#   （app.js / me.js / styles.css）。**已解除**：APK **1.1.47**（versionCode 48，
+#   md5 befe7d0928855fd122756743633d26bf）已重打并发布，verify_apk_release.py /
+#   verify_apk_version_manifest.py / verify_apk_published.py 三件套全绿 ⇒ 按约定删除本条。
+#   （同批还删掉了云端 Word 引擎的「☁ LO / ☁ Word」设备开关 —— 小程序/APP 侧一并清理。）
 EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}

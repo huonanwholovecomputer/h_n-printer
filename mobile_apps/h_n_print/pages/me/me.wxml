@@ -315,11 +315,15 @@
             </view>
           </view>
 
-          <!-- 价格 -->
+          <!-- 价格（点击弹出 Popconfirm：复制价格 / 复制详细价格；catchtap 防止冒泡到卡片把详情收起） -->
           <view class="detail-section">
             <view class="detail-row detail-price-row">
               <text class="detail-label">合计价格</text>
-              <text class="detail-price-value status-{{item.status}}{{item.is_admin_print && item.status === 'sent' ? ' is-self-sent' : ''}}">¥{{item.totalPriceDisplay}}</text>
+              <view class="detail-price-tap" id="price-tap-{{item.id}}" data-id="{{item.id}}"
+                    catchtap="onPriceTap" hover-class="price-tap-hover" hover-start-time="0" hover-stay-time="100">
+                <text class="detail-price-value status-{{item.status}}{{item.is_admin_print && item.status === 'sent' ? ' is-self-sent' : ''}}">¥{{item.totalPriceDisplay}}</text>
+                <text class="price-copy-icon">📋</text>
+              </view>
             </view>
           </view>
 
@@ -646,6 +650,27 @@
       <view class="modal-buttons">
         <button class="btn-secondary modal-half-btn" bindtap="onCancelConfirm" hover-class="tap-active">取消</button>
         <button class="btn-primary modal-half-btn" style="background-color: {{confirmModalConfirmColor || '#ff4d4f'}};" bindtap="onConfirmModal" hover-class="tap-active">{{confirmModalConfirmText}}</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- 合计价格复制 Popconfirm（在 page-root 外：fixed 才真正相对视口定位，
+       也逃出订单卡片的 overflow:hidden / max-height 裁剪；气泡锚在「合计价格」上方/下方） -->
+  <view wx:if="{{showPricePop}}" class="price-pop-mask {{isDarkMode ? 'theme-dark' : ''}}"
+        catchtap="onClosePricePop" catchtouchmove="noop">
+    <view class="price-pop {{pricePopBelow ? 'price-pop-below' : 'price-pop-above'}}"
+          style="left: {{pricePopLeft}}px; width: {{pricePopWidth}}px; {{pricePopBelow ? 'top:' + pricePopTop + 'px;' : 'bottom:' + pricePopBottom + 'px;'}}"
+          catchtap="noop">
+      <view class="price-pop-caret" style="left: {{pricePopCaretLeft}}px;"></view>
+      <view class="price-pop-head">
+        <text class="price-pop-icon">📋</text>
+        <text class="price-pop-title">复制这份订单的价格</text>
+      </view>
+      <view class="price-pop-acts">
+        <view class="price-pop-btn" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderPrice"
+              hover-class="price-pop-btn-hover" hover-stay-time="80">复制价格</view>
+        <view class="price-pop-btn primary" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderDetailPrice"
+              hover-class="price-pop-btn-hover" hover-stay-time="80">复制详细价格</view>
       </view>
     </view>
   </view>

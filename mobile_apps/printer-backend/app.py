@@ -1501,6 +1501,30 @@ printer_stack_results = {}
 STACK_TOGGLE_WAIT_SEC = 3.0      # 移动端下发指令后等设备端回报的上限（秒）
 
 
+# -------- 云端 Word 转换引擎（2026-10-26 晚定稿：隐式规则，没有开关/镜像）--------
+# 云端 .doc/.docx 默认强制 LibreOffice（S1-04，不执行宏）。**唯一例外**：该子任务是
+# 「管理员自打」（orders.is_admin_print）**且**文件由管理员上传（files/orders 的 openid
+# 属于 admin / super_admin）⇒ 设备端允许 Word/WPS COM（仍带宏/弹窗/外链硬化）。
+# 用户口径：「管理员直接默认不强制使用 LO 即可，普通用户必须强制使用 LO」——
+# 判定本体在设备端 `printer_config.cloud_word_com_allowed()`，服务端只负责如实下发
+# `is_admin_print` + `uploader_is_admin` 两个位；不再有策略镜像 / 远程切换端点。
+# ⚠ 光看 is_admin_print 不够：它是可变的业务列（人工类型订正 / 机位勾选 / print_success
+#   都会改写），顾客上传的文件一旦被订正成"自打"，就会把顾客内容送进 COM。内容归属只看
+#   上传者 ⇒ 第二道位 uploader_is_admin 必须同时成立。
+
+
+def is_admin_uploader(openid) -> bool:
+    """该 openid 是不是「管理员」（admin 或 super_admin）—— uploader_is_admin 的唯一算法。
+
+    与 `compute_role()` 的区别只有一条：**super_admin 也算**（它有自己的 openid 配置项，
+    不保证同时出现在 ADMIN_OPENIDS 里；漏掉会让超级管理员的自打单永远退回强制 LO）。
+    """
+    if not openid:
+        return False
+    return compute_role(openid) == "admin" or bool(
+        SUPER_ADMIN_OPENID and openid == SUPER_ADMIN_OPENID)
+
+
 def _stack_state_of(client_id: str) -> dict:
     """读某设备的攒批镜像状态（从未上报时 mode=None）。"""
     with printer_stack_state_lock:
@@ -4022,6 +4046,9 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             # v24.1：订单归属标记随任务下发，本地工具据此预勾选"管理员自行打印"
             task_msg["owner_name"] = o_row["owner_name"] or ""
             task_msg["is_admin_print"] = bool(o_row["is_admin_print"])
+            # 2026-10-26（隐式规则）：内容归属看**上传者**（is_admin_print 是可变的业务列：
+            # 人工类型订正 / 机位勾选 / print_success 都会改写它，光看它会把顾客内容送进 COM）。
+            task_msg["uploader_is_admin"] = is_admin_uploader(o_row["openid"] or "")
             # 2026-12：顾客订单的标签页归属 = 下单用户绑定的成员名（收支清算成员绑定）。
             # 管理员自行打印订单沿用 orders.owner_name（提交者昵称/前端指定）。
             task_msg["bound_owner_name"] = _get_bound_owner_name(o_row["openid"] or "")
@@ -7697,6 +7724,8 @@ def pull_queued_orders():
         "auto_print": bool(task.get("auto_print", False)),
         "owner_name": task.get("owner_name", "") or "",
         "is_admin_print": bool(task.get("is_admin_print", False)),
+        # 2026-10-26（隐式规则）：文件上传者是否管理员（与 push 通道同口径；旧客户端忽略该字段）
+        "uploader_is_admin": is_admin_uploader(task.get("openid") or ""),
         # 2026-12：顾客订单标签页归属 = 下单用户绑定的成员名（与 push 通道一致）
         "bound_owner_name": _get_bound_owner_name(task.get("openid") or ""),
         # 订单来源（wechat/app/local），本地工具云端任务列表展示

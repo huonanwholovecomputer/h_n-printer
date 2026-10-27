@@ -659,14 +659,23 @@ check("撤走再放回：页序与张数完全恢复到初始",
 sty8 = ds.DuplexStack(capacity=99)
 sty8.add(_mk_entry_copies(1, [("S", [1, 2, 3], False, 1), ("D", [1, 2, 3, 4], True, 1)]))
 rows = sty8.entries[0].ui_lines()
-keys_ok = all({"index", "label", "pages", "sheets", "second", "blank_second", "taken"} <= set(r)
-              for r in rows)
+keys_ok = all({"index", "label", "pages", "file_pages", "sheets", "second",
+               "blank_second", "taken"} <= set(r) for r in rows)
 check("ui_lines：逐计划一行、字段齐全、blank_second/sheets 与接口同源",
       len(rows) == 2 and keys_ok
       and rows[0]["blank_second"] is True and rows[0]["sheets"] == 3
       and rows[0]["taken"] is False and rows[1]["blank_second"] is False
       and rows[1]["sheets"] == 2,
       f"{rows}")
+check("ui_lines：file_pages = 文件自己的页号（旧清单没有该字段 → 退回合并页码）",
+      rows[0]["file_pages"] == rows[0]["pages"] == [1, 2, 3]
+      and rows[1]["file_pages"] == rows[1]["pages"] == [4, 5, 6, 7]
+      and ds.plan_own_pages({"pages": [4, 5, 6], "file_pages": [1, 2, 3]}) == [1, 2, 3]
+      and ds.plan_own_pages({"pages": [4, 5, 6]}) == [4, 5, 6]
+      # 长度对不上（清单被写坏）→ 退回合并页码，绝不按错位页号去数纸
+      and ds.plan_own_pages({"pages": [4, 5, 6], "file_pages": [1, 2]}) == [4, 5, 6]
+      and ds.plan_own_pages({"pages": [4, 5], "file_pages": [1, "坏"]}) == [4, 5],
+      f"{[(r['pages'], r['file_pages']) for r in rows]}")
 check("removable_plans 只列『第 2 趟无内容且未撤走』的计划",
       sty8.removable_plans() == [(1, 0)], f"{sty8.removable_plans()}")
 ok8, why8 = sty8.toggle_taken(1, 0, True)

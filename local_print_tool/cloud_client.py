@@ -242,6 +242,8 @@ class CloudTask:
         "image_orientation",
         "delivery_enabled", "delivery_location", "urgency", "cover_page", "cover_page_price",
         "owner_name", "is_admin_print",
+        # 2026-10-26 方案 B：该文件的上传者是不是管理员（挡住"顾客上传→人工订正成自打→COM"）
+        "uploader_is_admin",
         # 2026-12：顾客订单标签页归属 = 下单用户绑定的成员名（后端从收支清算成员绑定反查）
         "bound_owner_name",
         # 订单备注与来源（本地工具云端任务列表展示：成员/来源/备注列）
@@ -282,6 +284,8 @@ class CloudTask:
         # v24.1：订单归属（管理员自行打印标记随任务下发，本地标签页预勾选）
         self.owner_name: str = data.get("owner_name", "") or ""
         self.is_admin_print: bool = bool(data.get("is_admin_print", False))
+        # 2026-10-26 方案 B：文件上传者是否管理员（后端按 files.openid 算好；旧后端不传 ⇒ False）
+        self.uploader_is_admin: bool = bool(data.get("uploader_is_admin", False))
         # v5.24：顾客订单标签页的默认归属 = 下单用户绑定的成员名（后端反查成员绑定表）
         self.bound_owner_name: str = data.get("bound_owner_name", "") or ""
         # 订单备注（提交时填写的附加说明）与来源（wechat/app/local），供云端任务列表展示
@@ -318,6 +322,7 @@ class CloudTask:
             "image_orientation": self.image_orientation,
             "owner_name": self.owner_name,
             "is_admin_print": self.is_admin_print,
+            "uploader_is_admin": self.uploader_is_admin,
             "bound_owner_name": self.bound_owner_name,
             "retention_hours": self.retention_hours,
         }

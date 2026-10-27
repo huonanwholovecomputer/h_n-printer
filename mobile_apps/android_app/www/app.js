@@ -1021,6 +1021,8 @@ function switchTab(tab) {
   });
   // 每页条数下拉在 page-root 外 fixed，切页时一并收起
   if (typeof closePageSizePicker === 'function') closePageSizePicker();
+  // 「合计价格复制」气泡同理（tab 栏 z-index 高于气泡遮罩，不关会跟到另一页）
+  if (typeof closePricePop === 'function') closePricePop();
 
   // tab 栏立即更新选中态 + 点击图标弹跳
   document.querySelectorAll('.tab-item').forEach(t => {

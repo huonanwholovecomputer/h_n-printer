@@ -213,7 +213,7 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 #      记时间/模块/字段/前后值摘要，**不含密码与密钥**。
 # ═══════════════════════════════════════════════════════════════════════════
 
-FINANCE_MODULES = ("score", "expense", "income", "transfer", "settings", "auth", "orderstatus")
+FINANCE_MODULES = ("score", "expense", "income", "transfer", "settings", "auth", "orderstatus", "orderprinter")
 # D-5：解锁会话 30 分钟（超时需重新输入密码，是已接受的操作摩擦）
 FINANCE_SESSION_TTL = 30 * 60
 FINANCE_SESSION_HEADER = "X-Finance-Session"

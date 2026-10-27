@@ -127,27 +127,42 @@ check("历史表用 actualPL 并附应得盈亏小字",
 check("历史表下方有口径说明", "团队总盈亏不变" in src)
 
 print("\n--- 取整余数承接（🔴-C1）---")
+# v7.3 起「收支清算」多了一个**只做展示**的「📐 结算公式」块：它引用 r.perPersonShare 现算
+# Σ应得盈亏、文案里也会「提到」apportionCents()（要写明分摊走哪个函数）。下面两条是
+# **精确计数**判据，本意是「别处不许再多出第二份逐人计算」—— 因此把该展示块整体剔除后再数。
+# 剔除失败（锚点全丢）时 `_removable` 为假，下面会立刻多出一条 FAIL，不会静默放宽。
+_i_fbox = src.find('/* ==================== 📐 结算公式（v7.')   # v7.3 起存在，v7.4 仍是这一行
+_i_fbox_fn = src.find('function settleFormulaHTML(r, open) {')
+_i_fbox_end = src.find('\n}', _i_fbox_fn) + 2
+_removable = 0 <= _i_fbox < _i_fbox_fn < _i_fbox_end
+src_count = (src[:_i_fbox] + src[_i_fbox_end:]) if _removable else src
+check("『📐 结算公式』展示块可从计数源剔除（锚点仍在，否则下面两条不放宽）", _removable)
+
 check("apportionCents 用最大余数法（先 floor，剩余分按小数部分补）",
       "function apportionCents(pool, weights, members) {" in src
       and "out[mem.id] = f;" in src
       and "for (var k = 0; k < left; k++) out[fracs[k].id] += 1;" in src)
-check("三个池子分摊都走 apportionCents，不再各自 Math.round",
-      src.count("apportionCents(") == 4          # 1 处定义 + 3 处调用
+check("各处分摊都走 apportionCents，不再各自 Math.round",
+      # v7.5：定义 + 7 处调用（采购应摊 / 团队折旧 / 损耗费三处分配 / 投资回报 / 服务回报）
+      # v7.7：再 +1（报废结算快照把整机价按各月页数摊成每月金额）⇒ 9 处
+      src_count.count("apportionCents(") >= 9
+      and "apportionCents(pool, keys.map(function (k) { return monthsRaw[k].pages; })" in src
       and "investReturn[mem.id] = Math.round(investPool / memberCount)" not in src
       and "serviceReturn[mem.id] = Math.round(servicePool * ratio);" not in src
       and "var investPool = Math.round(totalInc * rate);" in src)   # 池子自身的取整保留（只此一次）
 check("净额改用「每人应摊」，不再用标量 perPerson",
-      "net[mem.id] = redist[mem.id] - perPersonShare[mem.id]" in src
+      "settleNet[mem.id] = redist[mem.id] - perPersonShare[mem.id]" in src
       and "r.redist[mem.id] - r.perPerson;" not in src
       and "redist[mem.id] - perPerson -" not in src)
 check("合计行「垫付差额」改为逐行求和（不再硬编码 0 / 人均×人数）",
       "advSum += adv;" in src and "RMB(r.perPerson * r.memberCount)" not in src)
 check("合计行「差额（未结清）」改为逐行求和（不再硬编码 0）",
       "gapSum += gap;" in src and "signed(gapSum)" in src)
-check("perPerson 仅剩「人均」展示用途（3 处），不再参与逐人计算",
-      len(re.findall(r"r\.perPerson(?!Share)", src)) == 3
-      and src.count("RMB(r.perPerson)") == 3
-      and src.count("r.perPersonShare") == 9)
+check("perPerson 仅剩「人均」展示用途（2 处），不再参与逐人计算",
+      # v7.4：KPI 副行改成"分摊口径"文案后少一处；逐人分摊一律用 perPersonShare
+      len(re.findall(r"r\.perPerson(?!Share)", src_count)) == 2
+      and src_count.count("RMB(r.perPerson)") == 2
+      and src_count.count("r.perPersonShare") == 6)
 
 # ---------- 3) 函数级行为验证 ----------
 print("\n--- calcMonth 行为（Node VM 内实测真实函数）---")

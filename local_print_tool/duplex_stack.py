@@ -194,6 +194,33 @@ def sheet_count_of_plans(plans) -> int:
         return -1
 
 
+def plan_own_pages(fp) -> list[int]:
+    """文件计划在**这份文件自己里面**的页号（攒批列表显示用）。
+
+    ⚠ 账本里的 `pages` 是**本单合并 PDF 的页码**（第 2 趟拼整叠时 `DuplexStack.file_plans()`
+    还要再加各单页数偏移）—— 拿它直接显示，操作员会看到「三页文档测试.pdf：第 1 趟 4 6 /
+    第 2 趟 [空] 5」，那是这份文件**在合并任务里的位置**，不是它自己的页号（它自己就是
+    1/2/3 页）。2026-10-25 用户反馈：列表里每个文件都应显示**它自己的**页号。
+
+    入叠时 `gui._print_stack_pass1` 把原页号（已应用页码范围、每份相同）顺手存进
+    `file_pages`；这里优先用它。旧清单没有这个字段 ⇒ 回落 `pages`（升级前在飞的那一叠，
+    宁可显示合并页码，也不能让整行没有页号）。长度对不上（清单被写坏）同样回落。
+    """
+    if not isinstance(fp, dict):
+        return []
+    merged = fp.get("pages") or []
+    try:
+        own = [int(p) for p in (fp.get("file_pages") or [])]
+    except (TypeError, ValueError):
+        own = []
+    if own and len(own) == len(list(merged)):
+        return own
+    try:
+        return [int(p) for p in merged]
+    except (TypeError, ValueError):
+        return []
+
+
 def _int_index_list(value) -> list[int]:
     """把清单里的 `taken_plans` 归一化成合法下标列表。
 
@@ -255,7 +282,10 @@ class StackEntry:
     rotate: bool = True
     created_at: str = ""
     pdf: str = ""                  # 本单合并 PDF 的文件名（批次目录内）
-    # 单内文件计划（1-based、单内页码；重建第 2 趟的全局页序要用）
+    # 单内文件计划（1-based、单内页码；重建第 2 趟的全局页序要用）。
+    # 每项 = {label, pages, duplex[, file_pages]} —— `pages` 是**本单合并 PDF** 的页码
+    # （第 2 趟还要再加各单偏移），`file_pages` 是这份文件**自己**的页号（已应用页码范围），
+    # 只给攒批列表显示用（`plan_own_pages`），不参与任何页序计算。
     file_plans: list = field(default_factory=list)
     pass1_pages: list = field(default_factory=list)   # 展示用（页码 / None=空白占位）
     pass2_pages: list = field(default_factory=list)
@@ -474,6 +504,8 @@ class StackEntry:
                 "index": i,
                 "label": one["label"],
                 "pages": list(one["pages"]),
+                # 显示用：这份文件自己的页号（不是它在合并任务里的页码）
+                "file_pages": plan_own_pages(fp),
                 "duplex": one["duplex"],
                 "sheets": sheet_count_of_plans([one]),
                 "second": self.plan_second_text(i),
@@ -523,9 +555,18 @@ class StackEntry:
                 continue
             if not pages:
                 continue
-            plans.append({"label": str(fp.get("label", "") or ""),
-                          "pages": pages,
-                          "duplex": bool(fp.get("duplex", True))})
+            one = {"label": str(fp.get("label", "") or ""),
+                   "pages": pages,
+                   "duplex": bool(fp.get("duplex", True))}
+            # 显示用的「本文件自己的页号」（见 plan_own_pages）。只有长度与 pages 一致才收：
+            # 长度对不上的话攒批列表会按错位的页号去数纸，比不显示更糟。
+            try:
+                own = [int(p) for p in (fp.get("file_pages") or [])]
+            except (TypeError, ValueError):
+                own = []
+            if len(own) == len(pages):
+                one["file_pages"] = own
+            plans.append(one)
         def _int_or_none(seq):
             out = []
             for x in (seq or []):

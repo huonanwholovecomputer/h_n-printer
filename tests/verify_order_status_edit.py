@@ -124,8 +124,11 @@ chk("失败不落地（success 校验失败即 return，不改本地状态）",
     re.search(r"if \(!\(res && res\.success\)\) \{ toast\('❌ '[\s\S]{0,200}?return; \}[\s\S]{0,900}?o\.status = status;", html) is not None)
 chk("本地落地同时改文件级状态（金额/收益/KPI 都由文件状态现算）",
     re.search(r"o\.status = status;\s*\n\s*\(o\.files \|\| \[\]\)\.forEach\(function \(f\) \{ f\.status = status; \}\);", html) is not None)
+# v7.5：`o.status = status;` 与 `renderCloud()` 之间多了「用量缓存失效」一行（共同出资机的折旧
+# 只统计 sent 子任务，状态订正会改变本月用纸量）⇒ 距离上限从 300 放宽到 600 字符，
+# 判据意图不变：落地后必须整页重绘。
 chk("落地后重绘整页（renderCloud）→ KPI/图表/明细按新状态重算",
-    re.search(r"o\.status = status;[\s\S]{0,300}?renderCloud\(\);", html) is not None)
+    re.search(r"o\.status = status;[\s\S]{0,600}?renderCloud\(\);", html) is not None)
 chk("防重复提交（_orderStatusSaving 闸门）",
     "_orderStatusSaving" in html and re.search(r"if \(_orderStatusSaving\) \{ toast", html) is not None)
 chk("重绘订单区块会收起菜单（菜单挂 body，不随区块替换）",

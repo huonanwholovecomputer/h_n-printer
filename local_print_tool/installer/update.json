@@ -1,9 +1,9 @@
 {
-  "version": "4.5.35",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.35.exe",
-  "md5": "ebec791a14727b323f5f0d924fa2eea6",
-  "sha256": "7e0de863a3d30af2f729e83265c3645e094df3e8da49a81c6bbfbf479615f28b",
-  "notes": "v4.5.35（安全加固收尾 + 两个现场 bug）：① 修「翻纸窗遮挡导致打印完成提示框整片空白」—— 在需要人工翻纸的机型（如 LaserJet 1020）上跳过本任务后，失败提示框只画出标题栏、内容区纯白；现在提示框会真的画出来并压在最前面。② 修「云端凭空多出一个空的『已预留』订单」—— 取号响应丢包后重连换号会重复占号，现在按标签页带幂等键，同一个号只建一次；已完成/失败/取消的单不会被复用。③ 每台设备改用**自己的**打印机令牌（首次连接自动签发，设置页可「🔑 重新签发本机 token」）；令牌失效会自动退回全站令牌并提示，不影响出纸。④ 本机文件保留期管理：云端文件按各自保留期清理，正在被引用的不按时间删只预警，退出/启动都扫一遍；「保留临时 PDF」默认更安全，开启前会明确提示。⑤ Office 转换更稳：引擎探测不再碰 COM（不会再把你正开着的 Word 关掉），Word/WPS 一律私有实例、不显示界面；转换沙箱已内置但**默认关闭**（真机验证发现它约束不住 Word/WPS，开了没有安全收益）。⑥ 含 4.5.34 全部内容（结算页本地服务加固、更新清单签名、离线单不放弃等）。",
+  "version": "4.5.36",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.36.exe",
+  "md5": "e4a4b10ca89416603e3cbad11ddbeff8",
+  "sha256": "f63c6ef2c245864194984091a42d119b9adfcadf3e06d96fc4da39872c978602",
+  "notes": "v4.5.36（云端 Word 引擎改为隐式规则）：① 取消设备级「☁ LO / ☁ Word」开关（移动端设备卡上的胶囊一并去掉，点它不会再报「切换失败，请稍后重试」）—— 现在**隐式执行**：订单类型=自打 **且** 文件由管理员上传的云端 Word 走 Word/WPS（仍禁用宏 / 弹窗 / 外链更新），其余（顾客订单、顾客上传的内容）一律强制 LibreOffice。② 修掉「超级管理员上传的文件被判成非管理员」，导致管理员自打单也走不了 Word 的漏洞。③ 含 4.5.35 全部内容（翻纸窗遮挡完成提示框、空「已预留」订单、本机独立令牌、保留期管理等）。",
   "sig_algo": "ed25519",
-  "sig": "xOvhWhULXsklQ9d2Om3QcGLqLZqpXvX+YbXtnNuZ6xbsBZ37hF/dbdgrJkegovBAhzlGUPd5WftcJ5QmybCQBw=="
+  "sig": "xodf8xZY5JiADA0HCNTSe+kbSJ0UCzowsc7c2qK+mGR0mMjqxt/kuoJ2c3a49pxPMogl5gZd8vcl4WT72LdKAw=="
 }

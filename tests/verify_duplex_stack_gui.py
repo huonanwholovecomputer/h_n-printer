@@ -193,6 +193,11 @@ check("★ 本单台账：6 张纸 / 8 页 / file_plans 带真实单双面",
       pl["sheet_count"] == 6 and pl["page_count"] == 8
       and [f["duplex"] for f in pl["file_plans"]] == [True, False],
       f"{pl['sheet_count']}/{pl['page_count']}/{pl['file_plans']}")
+check("★ 台账里每个文件计划都带 file_pages（它**自己**的页号，供列表显示；"
+      "pages 是合并 PDF 里的页码，不拿来当页号给人看）",
+      [f.get("file_pages") for f in pl["file_plans"]] == [[1, 2, 3, 4, 5], [1, 2, 3]]
+      and [f["pages"] for f in pl["file_plans"]] == [[1, 2, 3, 4, 5], [6, 7, 8]],
+      f"{pl['file_plans']}")
 check("★ 第 2 趟页序（整叠逆序）＝ 单面 3 张空白在前 + 双面 5 的 4/2/空白",
       pl["pass2_pages"] == [None, None, None, None, 4, 2], f"{pl['pass2_pages']}")
 check("★ 铁律②：第 1 趟**不**发 job_finished（半成品不能被标记完成）",
@@ -211,7 +216,8 @@ OUT1C = os.path.join(batch_dir, "entry_0002.pdf")
 rec_c = run_stack_pass1(jobs1, OUT1C, cover=True)
 plc = rec_c.planned[0]
 check("★ 封面页并入本单：占独立一张纸、file_plans 首项是单面封面",
-      plc["file_plans"][0] == {"label": "封面页", "pages": [1], "duplex": False},
+      plc["file_plans"][0] == {"label": "封面页", "pages": [1], "file_pages": [1],
+                               "duplex": False},
       f"{plc['file_plans'][:1]}")
 check("★ 封面页**没有**被单独 print_pdf（否则会插进纸叠中间串页）",
       rec_c.print_pdf == [], f"{rec_c.print_pdf}")
@@ -1010,6 +1016,37 @@ _list_dlg._on_left_selection()
 check("★ 选中「第 2 趟还要用」的文件 → 「我已取走」禁用（撤走必然整叠错位）",
       not _list_dlg._btn_take.isEnabled())
 _list_dlg.close()
+
+# 页号必须是**这份文件自己**的页码，而不是它在合并任务里的页码（2026-10-25 用户反馈：
+# 现场看到「三页文档测试.pdf 第 1 趟 4 6 / 第 2 趟 [空] 5」，那是它在整单合并 PDF 里的位置）
+_list_own = gui.StackQueueDialog()
+_st_own = ds.DuplexStack(capacity=90, printer_name="Fake Print")
+_st_own.entries = [
+    ds.StackEntry(seq=1, title="HN-MERGED", page_count=6, sheet_count=4, rotate=True,
+                  pdf="m.pdf", first="odd", state=ds.STATE_DONE,
+                  file_plans=[
+                      {"label": "单页文档测试.pdf", "pages": [1], "file_pages": [1],
+                       "duplex": False},
+                      {"label": "双页文档测试.pdf", "pages": [2, 3], "file_pages": [1, 2],
+                       "duplex": True},
+                      {"label": "三页文档测试.pdf", "pages": [4, 5, 6], "file_pages": [1, 2, 3],
+                       "duplex": True},
+                  ]),
+]
+_list_own.render(_st_own)
+_own_rows = [_list_own._tree_left.topLevelItem(0).child(k) for k in range(3)]
+check("★ 每个文件的页号按**它自己**算（合并任务里的 2/3、4/5/6 → 1/2、1/2/3）",
+      [r.text(1) for r in _own_rows] == ["1", "1", "1 3"]
+      and [r.text(2) for r in _own_rows] == ["[空]", "2", "[空] 2"],
+      f"{[(r.text(1), r.text(2)) for r in _own_rows]}")
+check("★ 张数列不受影响：仍是每份文件在纸叠里占几张纸（1/1/2 张）",
+      [r.text(3) for r in _own_rows] == ["1 张", "1 张", "2 张"],
+      f"{[r.text(3) for r in _own_rows]}")
+check("★ 旧清单（没有 file_pages）退回合并页码，不崩、不留空",
+      _list_own._add_plan_row is not None
+      and ds.plan_own_pages({"pages": [4, 5, 6]}) == [4, 5, 6],
+      f"{ds.plan_own_pages({'pages': [4, 5, 6]})}")
+_list_own.close()
 
 # 空纸叠/空队列也要有明确占位文案（常驻窗不能是一片空白）
 _list_dlg2 = gui.StackQueueDialog()

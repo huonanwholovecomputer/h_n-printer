@@ -172,6 +172,9 @@
   display: flex;
   align-items: center;
   gap: 12rpx;
+  /* 管理员 + 需人工翻纸的设备会同时出现「🖐 需人工翻纸」「攒批」等胶囊 + 在线状态：允许换行，
+     避免把设备名挤到几像素（375px 实测；2026-10-26 晚删掉「☁ LO / ☁ Word」后仍保留） */
+  flex-wrap: wrap;
   padding: 16rpx 18rpx;
   border: 1rpx solid var(--gray4);
   border-radius: 16rpx;
@@ -194,6 +197,8 @@
 .device-dot-off { background-color: var(--gray3); }
 .device-label {
   flex: 1;
+  /* 窄屏下设备卡有胶囊（需人工翻纸 / 攒批）时也别把设备名压没（至少留 40%，其余换行） */
+  min-width: 40%;
   font-size: 25rpx;
   font-weight: 500;
   color: var(--text-primary);
@@ -202,8 +207,10 @@
   white-space: nowrap;
 }
 .device-state { font-size: 22rpx; flex-shrink: 0; }
-.device-state-on { color: var(--green); }
-.device-state-off { color: var(--gray); }
+/* 设备卡允许换行（需人工翻纸 + 攒批胶囊）⇒ 状态在换行后也要贴当行右端，
+   否则同一个列表里「在线/离线」会出现两个位置。 */
+.device-state-on { color: var(--green); margin-left: auto; }
+.device-state-off { color: var(--gray); margin-left: auto; }
 /* 该设备已确认不支持自动双面（双面需人工翻纸）—— 列表提示，不拦截下单 */
 .device-state-manual { color: #e67e22; margin-right: 12rpx; }
 /* 攒批模式状态（stack_mode）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=未上报 → 不渲染 */

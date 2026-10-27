@@ -302,7 +302,9 @@ def entry_plans(specs, base=0):
             label = str(s["label"])
             if copies > 1:
                 label = f"{label}（第{c + 1}份）"
+            # file_pages = 这份文件**自己**的页号（列表显示用）；pages = 单内合并页码。
             out.append({"label": label, "pages": list(pages),
+                        "file_pages": [int(p) for p in s["pages"]],
                         "duplex": bool(s["duplex"])})
         off += full
     return out, off - base
@@ -1561,6 +1563,9 @@ check("★ 列表：已取走的行仍正常显示（不再整单消失），状
       and _a_rows[1].font(0).strikeOut()
       and _a_rows[1].text(2) == "[空] [空] [空]",
       f"{_a_top.text(0)} / {_a_rows[1].text(4) if _a_rows else '?'}")
+check("★ 页号按**文件自己**算（单面 3 页是第 2 个文件：合并页码 6 7 8 → 1 2 3）",
+      _a_rows[1].text(1) == "1 2 3" and _a_rows[0].text(1) == "1 3 5",
+      f"{_a_rows[1].text(1)} / {_a_rows[0].text(1)}")
 
 # ══════════════════════════════════════════════════════════════════════
 # ⑦ 准入：容量阈值 + 装订方向

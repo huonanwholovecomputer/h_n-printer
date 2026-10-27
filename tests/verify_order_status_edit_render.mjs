@@ -114,6 +114,15 @@ const server = http.createServer((req, res) => {
         try { parsed = JSON.parse(body || '{}'); } catch (e) { parsed = {}; }
         const mod = String(parsed.module || '');
         const pwd = String(parsed.password || '');
+        /* 与真服务端严格同序（stats_server.FinanceSecurity.unlock）：
+           ① 该模块「还没密码 / 仍是旧默认密码」→ needs_setup（**先于**口令比对，因为库里那个值
+              根本不允许再用来解锁）；
+           ② 用户敲的正是被停用的默认/弱口令 → default_password（模块其实已有密码）；
+           ③ 最后才比对口令。⑧ 模拟的是①，别再用②冒充（v7.6 起前端把两者分开处理了）。 */
+        if (NEEDS_SETUP.indexOf(mod) >= 0) {
+          return json(res, { success: false, code: 'needs_setup',
+                             message: '该模块还没有设置密码（默认密码已停用），请先设置新密码' }, 403);
+        }
         if (pwd === '123456') {
           return json(res, { success: false, code: 'default_password',
                              message: '默认密码已停用，请先在设置里设置新密码' }, 403);
@@ -136,6 +145,8 @@ const server = http.createServer((req, res) => {
         setupCalls.push(String(parsed.new_password || ''));
         const mods = Object.keys(TEST_PWD);
         mods.forEach((m) => { TEST_PWD[m] = String(parsed.new_password || ''); });
+        NEEDS_SETUP = [];       // 与真服务端一致：设过密码之后就不再是 needs_setup
+        TEST_PWD['orderstatus'] = String(parsed.new_password || '');
         const stored = {};
         mods.forEach((m, i) => { stored[m] = 'pbkdf2_sha256$210000$' + (i + 1).toString(16).padStart(32, 'c') + '$' + 'd'.repeat(64); });
         return json(res, { success: true, modules: mods, stored });

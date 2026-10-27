@@ -381,20 +381,27 @@ check("⑤ 2 页 + 手动机型 → 手动双面两趟照旧（1/2，无空白�
       and rec.plan_pass[1][3] == [2],
       f"{[p[3] for p in rec.plan_pass]}")
 
-# 混合批次：多页文件仍按两趟并批（1 页文件不进两趟）
+# 混合批次：多页文件仍按两趟并批
 rec = run_worker([job1page(PDF3, page_count=3, name="A.docx"),
                   job1page(PDF2, page_count=2, name="B.docx")], MANUAL)
 check("⑤ 混合：两个多页文件合并成一批一次翻纸",
       len(rec.plan_pass) == 2 and len(rec.flip) == 1 and not rec.print_pdf,
       f"plan_pass={len(rec.plan_pass)} flip={len(rec.flip)} print_pdf={len(rec.print_pdf)}")
 
+# 2026-10-26：**整单一个批次** —— 1 页文件不再单独直打（那会多一个 spooler 作业），
+# 而是按 FilePlan(duplex=False) 并进同一份页序（一张纸、背面留空，第 2 趟打空白占位页）。
+# 关键不变式仍在：它**没有**被排成双面配对（每页一张纸），驱动侧也永远收不到 duplex="on"。
 rec_mix = run_worker([job1page(PDF3, page_count=3, name="A.docx"),
                       job1page(PDF2, page_count=2, name="B.docx"),
                       job1page(PDF1, page_count=1, name="C单页.docx")], MANUAL)
-check("★ ⑤ 混排：1 页文件按单面直打（一次提交 'off'），多页文件照旧两趟一批",
-      len(rec_mix.print_pdf) == 1 and rec_mix.print_pdf[0]["duplex"] == "off"
+check("★ ⑤ 混排：整单一个批次（不再单独直打 1 页文件）",
+      len(rec_mix.print_pdf) == 0 and all(c.get("duplex") != "on" for c in rec_mix.print_pdf)
       and len(rec_mix.plan_pass) == 2 and len(rec_mix.flip) == 1,
       f"print_pdf={[c.get('duplex') for c in rec_mix.print_pdf]} plan_pass={len(rec_mix.plan_pass)}")
+check("★ ⑤ 混排：1 页文件在页序里只占**一张纸**（第 1 趟打它、第 2 趟空白占位）",
+      rec_mix.plan_pass[0][3] == [1, 3, 4, 6]
+      and rec_mix.plan_pass[1][3] == [None, 5, None, 2],
+      f"{[p[3] for p in rec_mix.plan_pass]}")
 check("⑤ 混排：三个任务都收到完成回报",
       sorted(i for i, ok, _m in rec_mix.finished) == [0, 1, 2]
       and all(ok for _i, ok, _m in rec_mix.finished), f"{rec_mix.finished}")
@@ -422,7 +429,8 @@ finally:
     _restore6()
 _pl6 = _plans6[0] if _plans6 else {}
 check("★ ⑥ 攒批单里的 1 页任务 file_plans 标 duplex=False（不再谎称双面任务）",
-      _pl6.get("file_plans") == [{"label": "单页.docx", "pages": [1], "duplex": False}],
+      _pl6.get("file_plans") == [{"label": "单页.docx", "pages": [1], "file_pages": [1],
+                                  "duplex": False}],
       f"{_pl6.get('file_plans')}")
 check("⑥ 但它仍占 1 张纸、第 2 趟给一个空白占位槽（张数不变，配对结构不破）",
       _pl6.get("sheet_count") == 1 and _pl6.get("pass1_pages") == [1]

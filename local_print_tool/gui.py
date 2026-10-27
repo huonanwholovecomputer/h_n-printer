@@ -84,7 +84,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, cloud_word_com_allowed
 from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
@@ -103,7 +103,7 @@ import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.35"
+APP_VERSION = "4.5.36"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -1312,6 +1312,8 @@ def _stack_entry_ui_lines(entry) -> list:
             "index": i,
             "label": str(fp.get("label", "") or f"第 {i + 1} 个文件"),
             "pages": pages,
+            # 显示用：这份文件自己的页号（旧账本没有 file_pages ⇒ 回落合并页码）
+            "file_pages": duplex_stack.plan_own_pages(fp),
             "sheets": duplex_stack.sheets_for(len(pages), dup),
             "second": "第 2 趟内容未知（账本版本较旧）",
             # 旧账本算不出"第 2 趟是否全空白" ⇒ 一律不许撤走（fail-closed：宁可不让点，
@@ -1364,6 +1366,9 @@ class StackQueueDialog(QDialog):
 
     左栏「已攒」：已经打过第 1 趟、正等第 2 趟的文件 —— 每个文件一行，给出**具体页号**：
         第 1 趟打哪些页、第 2 趟打哪些页；该面没有内容就写 `[空]`（空白占位页）。
+        ⚠ 页号是**这份文件自己**的页码（`file_pages`），不是它在整单合并 PDF 里的页码：
+        账本里的 `pages` 是合并任务内的位置，显示出来会变成「三页文档测试.pdf：4 6 / [空] 5」，
+        让人以为这个文件有 6 页（2026-10-25 用户反馈）。张数列仍是纸张数。
     右栏「等待打印」：因容量/装订方向/纸叠还没打完而**尚未入叠**的文件 —— 同样给页号，
         并写明排队原因。
 
@@ -1410,7 +1415,8 @@ class StackQueueDialog(QDialog):
             "左栏＝已经攒进出纸槽的文件（第 1 趟已打，等第 2 趟）；右栏＝<b>本机已经受理、"
             "但还没能开打</b>的文件（出纸槽被当前纸叠独占 / 容量或装订方向不允许）——"
             "不是云端排队列表，云端还没下发给本机的订单不会出现在这里；纸叠打完第 2 趟后"
-            "它们会自动放行。页号按「第 1 趟 / 第 2 趟」分列，<b>[空]</b> = 那一面没有内容，"
+            "它们会自动放行。页号按「第 1 趟 / 第 2 趟」分列，<b>每个文件的页号按它自己算</b>"
+            "（不是整叠合并后的页码），<b>[空]</b> = 那一面没有内容，"
             "程序会送一张空白纸（不能跳过：漏一张，后面整叠错位）。")
         self._hint.setWordWrap(True)
         self._hint.setStyleSheet("font-size: 11px;")
@@ -1578,7 +1584,9 @@ class StackQueueDialog(QDialog):
     def _add_plan_row(self, top, seq: int, entry, ln: dict):
         idx = int(ln.get("index", 0) or 0)
         label = str(ln.get("label", "") or f"第 {idx + 1} 个文件")
-        pages = list(ln.get("pages") or [])
+        # 页号一律按**这份文件自己**算（`file_pages`）：账本里的 `pages` 是合并 PDF 的页码，
+        # 显示成「三页文档测试.pdf：4 6 / [空] 5」会让人以为这个文件有 6 页（2026-10-25 反馈）。
+        pages = list(ln.get("file_pages") or []) or list(ln.get("pages") or [])
         duplex = bool(ln.get("duplex", True))
         taken = bool(ln.get("taken"))
         blank = bool(ln.get("blank_second"))
@@ -1589,13 +1597,14 @@ class StackQueueDialog(QDialog):
         child = QTreeWidgetItem([f"📄 {label}", p1, p2, f"{sheets} 张", status])
         child.setData(0, Qt.UserRole, {"seq": int(seq), "index": idx,
                                        "taken": taken, "blank": blank})
+        child.setToolTip(0, f"页号是**这份文件自己**的页码；它在纸叠里占 {sheets} 张纸")
         child.setToolTip(4, ("这份第 2 趟没有内容，可以整份取走"
                              if blank and not taken else
                              "已登记取走（不再计入第 2 趟的送纸数）" if taken else
                              "第 2 趟还要用这张纸，不能取走"))
         if pages:
-            child.setToolTip(1, f"第 1 趟：{p1}")
-            child.setToolTip(2, f"第 2 趟：{p2}")
+            child.setToolTip(1, f"第 1 趟：{p1}（本文件页号）")
+            child.setToolTip(2, f"第 2 趟：{p2}（逆序；[空] = 这一面没有内容）")
         if taken:
             _f = child.font(0)
             _f.setStrikeOut(True)
@@ -2104,6 +2113,17 @@ class PrintWorker(QThread):
         self._flip_continue = bool(cont)
         self._flip_event.set()
 
+    def _cloud_com_allowed(self, job) -> bool:
+        """该云端任务是否允许走 Word/WPS COM（唯一判定点，隐式规则）。
+
+        两条同时成立才放行（判定本体在 `printer_config.cloud_word_com_allowed`）：
+        ① 任务被标为管理员自打；② **文件由管理员上传**。
+        任务缺失字段（旧数据/旧后端）按 False 处理 —— 宁可按最严的 LibreOffice 走。
+        """
+        return cloud_word_com_allowed(
+            getattr(job, "admin_self_print", False),
+            getattr(job, "uploader_is_admin", False))
+
     def _effective_pages(self, job: PrintJob, print_path: str = "") -> int:
         """本任务**实际会打印**的有效页数（单页硬闸门的判据）；0 = 确实未知。
 
@@ -2595,6 +2615,16 @@ class PrintWorker(QThread):
             job.duplex_mode or self._duplex_mode,
         )
 
+    def _pairs_pages(self, item) -> bool:
+        """这一项在批次里会不会**真的双面配对**（== `_print_manual_batch` 里 `dup` 的判据）。
+
+        item: (idx, job, print_path, temp_pdf)。单页文件（单页硬闸门）与 duplex=off 的单面
+        文件每页各占一张纸、背面留空 ⇒ 不配对，装订方向对它也没有意义。
+        """
+        job = item[1]
+        return (((getattr(job, "duplex", "off") or "off") == "on")
+                and self._effective_pages(job, item[2]) > 1)
+
     def _sheets_of_job(self, job: PrintJob, copies: int, print_path: str = "") -> int:
         """本任务会往出纸槽里放几张纸（台账用：翻纸文案要说清"槽里共几张"）。
 
@@ -2625,6 +2655,57 @@ class PrintWorker(QThread):
             n_sel, (job.duplex or "off") == "on" and driver_duplex,
             max(1, int(copies or 1)))
 
+    def _batch_sheets_of(self, rec: dict) -> int:
+        """这个"本来要直打"的文件并进手动双面批次后占几张纸（单面 = 每页一张）。"""
+        job = rec.get("job")
+        path = str(rec.get("path") or "")
+        n = 0
+        try:
+            n = int(count_pdf_pages(path) or 0)
+        except Exception:
+            n = 0
+        if n <= 0:
+            n = max(1, int(getattr(job, "page_count", 0) or 1))
+        try:
+            n_sel = _count_pages_in_range(getattr(job, "page_range", "") or "", n) or n
+        except Exception:
+            n_sel = n
+        # 单面文件 = 每页各占一张纸（背面留空），与 `manual_duplex.build_sheets` 一致
+        return duplex_stack.sheets_for(n_sel, False,
+                                       max(1, int(getattr(job, "copies", 1) or 1)))
+
+    def _can_join_manual_batch(self, rec: dict) -> bool:
+        """"本来要直打"的文件能否并进本单的手动双面批次（整单一个作业）。
+
+        2026-10-26 现场（HN20261026-0014）：一个订单里 3 页双面 + 1 页 + 2 页双面，
+        spooler 里出现「单页文档测试.pdf」和「hn_duplex_batch_xxx.pdf」两个作业 ——
+        1 页文件被单页硬闸门判成单面直打、于是另起一个作业。既然本单反正要翻一次纸，
+        就把它并进同一份页序（`FilePlan(duplex=False)`：一张纸、背面留空）。
+
+        三条全满足才并，任何一条不满足就留在 `pending` 按原样直打 —— 宁可多一个作业
+        边界，也不能把文件打错/打丢：
+        ① **页数读得出来**：批次是按"合并件的页码"排两趟的，读不出页数就取不到页，
+           还可能把整批带失败（坏件仍走 `_print_merged_group` 的单独直打 + 单独报成败）；
+        ② **DPI 与批次一致**：两趟只有一个渲染 DPI（`print_plan_pass` 不接逐文件 DPI），
+           文件自己设过别的 DPI 就不能并进来；
+        ③ 文件还在（转换失败的在准备阶段就报过成败，不会走到这里）。
+        """
+        job = rec.get("job")
+        path = str(rec.get("path") or "")
+        if job is None or not path or not os.path.isfile(path):
+            return False
+        try:
+            if int(count_pdf_pages(path) or 0) <= 0:
+                return False
+        except Exception:
+            return False
+        try:
+            if int(getattr(job, "dpi", 0) or 0) not in (0, int(self._render_dpi or 0)):
+                return False
+        except Exception:
+            return False
+        return True
+
     def _cleanup_temp_pdf(self, job: PrintJob, temp_pdf: Optional[str]) -> None:
         """清理转换出的临时 PDF（keep_temp_pdf 时先复制一份到桌面）。缓存的 PDF 不删。"""
         if not temp_pdf or not os.path.isfile(temp_pdf):
@@ -2646,7 +2727,8 @@ class PrintWorker(QThread):
     def _fmt_pages(seq) -> str:
         return " ".join("〔空白〕" if x is None else str(x) for x in seq)
 
-    def _duplex_announce_text(self, items, plan, rotate: bool, tray_foreign: int = 0) -> str:
+    def _duplex_announce_text(self, items, plan, rotate: bool, tray_foreign: int = 0,
+                              singles: Optional[list[str]] = None) -> str:
         names = "、".join((j.display_name or os.path.basename(j.file_path)) for _i, j, _p, _t in items)
         foreign = max(0, int(tray_foreign or 0))
         warn = ""
@@ -2655,8 +2737,16 @@ class PrintWorker(QThread):
             warn = ("\n⚠ 出纸槽里已经压着本次一起打出的 "
                     f"{foreign} 张纸（单面文件/首页，不属于本批）：翻纸时只取本批的 "
                     f"{plan.sheet_count} 张（在最上面），别把下面的一起搬进纸盘 2。")
+        # 单面文件（duplex=off / 有效页数只有 1 页）也并进同一批：每页各占一张纸、
+        # 背面留空 ⇒ 第 2 趟对应槽位打空白页（只走纸不打墨）。文案要说清，否则操作员
+        # 看到"第 2 趟有空白页"会以为程序算错了。
+        extra = ""
+        if singles:
+            extra = ("\n其中 " + str(len(singles)) + " 个是单面文件（每页各占一张纸、背面留空，"
+                     "第 2 趟对应槽位是空白占位页）：" + "、".join(singles))
         return (
-            f"本批 {len(items)} 个文件需手动双面：{names}\n"
+            f"本批 {len(items)} 个文件需手动双面：{names}"
+            + extra + "\n"
             f"共 {plan.sheet_count} 张纸 —— 程序自己分两趟打（全程单面），中途只需翻一次纸。\n\n"
             f"第 1 趟（现在打）：{self._fmt_pages(plan.pass_pages(1))}\n"
             f"第 2 趟（翻纸后打）：{self._fmt_pages(plan.pass_pages(2))}\n"
@@ -2666,19 +2756,22 @@ class PrintWorker(QThread):
 
     def _print_manual_batch(self, items, rotate: bool, base_offset: int,
                             total_sides: int) -> tuple[bool, str, int]:
-        """把若干个"需手动双面"的文件合并成**一批**：一次翻纸、两趟打完。
+        """把本单的文件合并成**一批**：一次翻纸、两趟打完。
 
         items: [(idx, job, print_path, temp_pdf)]（同批的 rotate 必须一致，调用方已分好组）
         返回 (ok, msg, 物理面数)；物理面数用于推进进度条。
 
-        ⚠ 本批**只包含需手动双面的文件**。本轮里"已单面直打"的文件（1 页文件被单页硬闸门
-        排除在批次外、或 duplex=off 的单面文件）**不并进来** —— 它们先打完、压在出纸槽下面，
-        第 2 趟从堆顶取纸只取本批那几张（翻纸提示会明确说"只取最上面 N 张"），
-        它们就留在出纸槽里等操作员取走。
-        **不要**试图把它们并进页序：2026-10-18 试过"追加空白占位页 + 直打单元排最后"，
-        结果是占位页落在**堆顶**、真直打纸在**堆底**，第 2 趟的送纸窗口（槽位数 = 第 1 趟
-        打出的张数）**永远取不到那张纸** ⇒ 直打纸照旧留着、还白打一张空白。独立审查用真
-        纸堆物理模型复现了这一点（`PrintPlan` 两趟长度绑死，物理上不可能表达"已打好的纸"）。
+        **整单一个作业（2026-10-26 用户现场）**：本批不只装"需手动双面"的文件 —— 同一单里
+        的 1 页文件 / duplex=off 的单面文件也并进来（按 `FilePlan(duplex=False)`：每页各占
+        一张纸、背面留空 ⇒ 第 2 趟对应槽位是空白占位页）。这样 spooler 里一个订单只有
+        「第 1 趟 / 第 2 趟」两个作业；旧写法要把单面文件先单独直打一遍，同一个订单就多出
+        一个作业边界（现场 HN20261026-0014：3 页双面 + 1 页 + 2 页双面 = 3 个作业）。
+        页序与配对仍**只由** `manual_duplex.plan_passes` 决定（与攒批模式同一条语义）。
+
+        ⚠ 并进来的前提是它们**由本批自己打出来**（纸按计划插在纸叠中间）。**不要**改成
+        "先单独直打、再在批次末尾补一张空白占位页"：2026-10-18 试过，占位页落在**堆顶**、
+        真直打纸在**堆底**，第 2 趟的送纸窗口（槽位数 = 第 1 趟打出的张数）**永远取不到那张
+        纸** ⇒ 直打纸照旧留着、还白打一张空白。独立审查用真纸堆物理模型复现过。
         """
         import pdf_printer as _pp
         p = self._manual_profile
@@ -2694,6 +2787,7 @@ class PrintWorker(QThread):
 
             # 合并后的页码是**同一份文档**的连续页码：每个文件按自己的页码范围取页，再整体偏移
             file_plans, off = [], 0
+            singles: list[str] = []
             for _idx, job, path, _t in items:
                 n = count_pdf_pages(path)
                 if n <= 0:
@@ -2702,27 +2796,39 @@ class PrintWorker(QThread):
                 if not sel:
                     sel = list(range(1, n + 1))
                 label = job.display_name or os.path.basename(job.file_path) or f"#{_idx + 1}"
+                # 双面配对只对"请求双面、且真的不止 1 页"的文件成立。单页文件（单页硬闸门）
+                # 与 duplex=off 的单面文件都按单面入批：每页各占一张纸、背面留空 ⇒ 第 2 趟
+                # 对应槽位打空白占位页（只走纸不打墨）。判据与攒批模式
+                # （`_print_stack_pass1` 的 `dup`）完全一致。
+                # 注：1 页时 True/False 的**页序完全相同**（`build_sheets` 都得到 (p, None)），
+                #     `len(sel) > 1` 只是为了让"哪个文件是单面文件"的日志/常驻窗文案准确，
+                #     别以为它守住了什么页序口径。
+                dup = ((getattr(job, "duplex", "off") or "off") == "on") and len(sel) > 1
+                if not dup and label not in singles:
+                    singles.append(label)
                 for c in range(max(1, job.copies)):
                     file_plans.append(manual_duplex.FilePlan(
                         f"{label}（第{c + 1}份）" if job.copies > 1 else label,
-                        [off + x for x in sel], True))
+                        [off + x for x in sel], dup))
                 off += n
 
             plan = manual_duplex.plan_passes(file_plans, copies=1, first=p.first,
                                              reverse_second=p.reverse_second)
             n1 = len(plan.first_pass)
-            # 本轮**本批之前**已经落在出纸槽里、还压在本批下面的张数（直打的单面文件 /
+            # 本轮**本批之前**已经落在出纸槽里、还压在本批下面的张数（没并进来的文件 /
             # 首页 / 上一批）。翻纸文案与"取出哪几张"都要靠它 —— 见 _ask_operator_to_flip。
             tray_foreign = max(0, int(getattr(self, "_tray_sheets", 0) or 0))
             self.log_message.emit(
-                f"  → 手动双面批次：{len(items)} 个文件 → {plan.sheet_count} 张纸，"
+                f"  → 手动双面批次：{len(items)} 个文件"
+                f"{f'（含 {len(singles)} 个单面文件，各占一张纸、背面留空）' if singles else ''}"
+                f" → {plan.sheet_count} 张纸，"
                 f"一次翻纸打两趟（{p.first}/{'逆序' if p.reverse_second else '正序'}/"
                 f"{'180°补偿' if rotate else '不旋转'}）")
             self.log_message.emit(f"     第 1 趟: {self._fmt_pages(plan.pass_pages(1))}")
             self.log_message.emit(f"     第 2 趟: {self._fmt_pages(plan.pass_pages(2))}")
             self.duplex_plan.emit(plan.sheet_count, self._estimate_first_pass(plan.sheet_count))
             self.duplex_announce.emit(
-                self._duplex_announce_text(items, plan, rotate, tray_foreign))
+                self._duplex_announce_text(items, plan, rotate, tray_foreign, singles))
 
             def _cb(base: int, slots):
                 def _on_side(cur: int, _total: int):
@@ -2843,7 +2949,8 @@ class PrintWorker(QThread):
         if cover_pdf and os.path.isfile(cover_pdf):
             # 封面页 = 独立单面纸：第 1 趟打它本身，第 2 趟给一个空白槽（消耗这张纸的背面）
             paths.append(cover_pdf)
-            plans.append({"label": "封面页", "pages": [1], "duplex": False})
+            plans.append({"label": "封面页", "pages": [1], "file_pages": [1],
+                          "duplex": False})
             off = 1
         try:
             for idx, job, path, _t in items:
@@ -2864,6 +2971,10 @@ class PrintWorker(QThread):
                     plans.append({
                         "label": f"{label}（第{c + 1}份）" if int(job.copies or 1) > 1 else label,
                         "pages": [off + x for x in sel],
+                        # 显示用：这份文件**自己**的页号（已应用页码范围）。
+                        # `pages` 是合并 PDF 里的页码（账本做页序要用），直接显示会让人看到
+                        # "第二个文件从第 6 页开始打"——2026-10-25 用户反馈的正是这个。
+                        "file_pages": list(sel),
                         "duplex": dup,
                     })
                 off += n
@@ -3098,7 +3209,8 @@ class PrintWorker(QThread):
         # ── 两阶段打印（2026-10-18）──
         # 阶段 1：逐文件把 PDF 准备好（转换 / 缓存命中），并分流：
         #   · 需手动双面的文件 → deferred（阶段 2 并成"一次翻纸"的一批，两趟）
-        #   · 其余 → pending（阶段 2 把**连续同参数**的文件合并成**一个打印作业**）
+        #   · 其余 → pending（阶段 2 把**连续同参数**的文件合并成**一个打印作业**；
+        #     本单只要有需手动双面的文件，它们随后也会被并进**同一批**，见"整单并批"）
         # 阶段 2 打印为什么重要（用户现场反馈）：旧写法**一个文件 = 一个打印作业**
         # （每次 print_pdf 都 CreateDC → StartDoc → 逐页渲染 → EndDoc → DeleteDC），
         # 7 个文件就是 7 次作业边界；主机型打印机（LaserJet 1020）在两个作业之间要重做
@@ -3106,6 +3218,8 @@ class PrintWorker(QThread):
         # 合并后同一段连续同参数文件共用一个作业，打印机连续成像、中间不留作业边界。
         # ⚠ 一个作业只能有一套 DEVMODE（双面/双面模式/份数/DPI）⇒ 只有这些**全部相同**
         #    的连续文件才并；不同参数自动断成新作业（同订单里混单双面 = 2 个作业，而不是 7 个）。
+        #    手动双面的机型上这条限制被"整单并批"绕开：两趟本来就是多份小作业的一方，
+        #    单面文件按 FilePlan(duplex=False) 并入同一份页序即可。
         deferred: list[tuple[int, PrintJob, str, Optional[str]]] = []
         pending: list[dict] = []     # 阶段 2 待合并打印的项（按 _jobs 顺序）
         for idx, job in enumerate(self._jobs):
@@ -3141,10 +3255,13 @@ class PrintWorker(QThread):
                     self.log_message.emit(f"  → 正在转换为 PDF...")
                     # S1-04：云端任务（task_id>0，文件是顾客上传的）⇒ 强制 LibreOffice，
                     # 绝不在打印路径上给 Word/WPS 执行宏的机会；本地任务保持原三引擎降级链。
+                    # 2026-10-26 隐式规则：仅当该任务确为「管理员自打 + 管理员上传」时，
+                    # 才允许走 COM（仍带宏/弹窗/外链硬化）。
                     _from_cloud = int(getattr(job, "task_id", 0) or 0) > 0
+                    _allow_cloud_com = _from_cloud and self._cloud_com_allowed(job)
                     temp_pdf = self._converter.convert(
                         job.file_path, image_orientation=getattr(job, 'image_orientation', 'auto'),
-                        from_cloud=_from_cloud)
+                        from_cloud=_from_cloud, allow_cloud_com=_allow_cloud_com)
                     print_path = temp_pdf
                     self.log_message.emit(f"  → 转换完成: {os.path.basename(temp_pdf)}")
 
@@ -3182,8 +3299,8 @@ class PrintWorker(QThread):
                         and not str(job.file_path or "").lower().endswith(".pdf")
                         and self._effective_pages(job, print_path) == 1):
                     self.log_message.emit(
-                        "  ⚠ 转换后实际只打 1 页 → 按单面直打"
-                        "（不入手动双面批次：省一张空白占位纸、省一次翻纸）")
+                        "  ⚠ 转换后实际只打 1 页 → 不配双面配对（省一张空白占位纸）"
+                        "；若本单还有别的双面文件，它稍后会并进同一批次（各占一张纸）")
                     defer = False
                 if defer:
                     # 手动双面：不在这里打 —— 并入批次，等本批所有文件都准备好后**一次翻纸**打完
@@ -3230,6 +3347,43 @@ class PrintWorker(QThread):
                 # 准备阶段就失败（文件丢失 / 转换失败）：临时件此刻无人再引用，就地清掉
                 if temp_pdf:
                     self._cleanup_temp_pdf(job, temp_pdf)
+
+        # ── 整单并批（2026-10-26 用户现场）──
+        # 本单既然要翻一次纸，就别让"单面 / 1 页"文件另起一个作业：现场 HN20261026-0014
+        # 一个订单 3 个文件（3 页双面 + 1 页 + 2 页双面）在 spooler 里出现
+        # 「单页文档测试.pdf」+「hn_duplex_batch_xxx.pdf」两个作业（第 2 趟再一个）。
+        # 用户口径：同一个订单应当只出「第 1 趟 / 第 2 趟」两个作业。
+        # 做法与攒批模式同一条语义：这些文件按 `FilePlan(duplex=False)` 并入同一份页序
+        # （每页各占一张纸、背面留空 ⇒ 第 2 趟对应槽位打空白占位页），页序仍只由
+        # `manual_duplex.plan_passes` 决定。**不能**改成"先直打、再补空白占位页"（2026-10-18
+        # 试过：占位页在堆顶、真直打纸在堆底，第 2 趟永远取不到那张纸）。
+        if deferred and not self._stack_mode and pending and not self._cancelled:
+            moved = [rec for rec in pending if self._can_join_manual_batch(rec)]
+            if moved:
+                moved_ids = {rec["idx"] for rec in moved}
+                pending = [rec for rec in pending if rec["idx"] not in moved_ids]
+                for rec in moved:
+                    job = rec["job"]
+                    name = job.display_name or os.path.basename(job.file_path or "")
+                    # 面数按"两趟各走一遍"重算（它现在也占一整张纸、第 2 趟要再走一次）
+                    new_sides = self._batch_sheets_of(rec) * 2
+                    old_sides = int(rec.get("sides") or 0)
+                    if new_sides > old_sides:
+                        total_sides += new_sides - old_sides
+                    self.log_message.emit(
+                        f"  ⏳ 并入本单同一批次（不另起打印作业）：{name}"
+                        f" —— 单面文件各占一张纸、背面留空")
+                    deferred.append((rec["idx"], job, rec["path"], rec.get("temp_pdf")))
+                # 页序按本单原来的文件顺序（不是"先双面后单面"）：成品叠顺序才对
+                deferred.sort(key=lambda it: it[0])
+                # ⚠ 只有**全部**都并进来时才能说"队列里只剩两个作业"：留下的那些会先直打成
+                #   另一个作业（翻纸文案同时会说"只取最上面 N 张"）。日志谎报作业数会把现场
+                #   判断带偏（2026-10-26 独立审查指出）。
+                _tail = ("打印队列里只有「第 1 趟 / 第 2 趟」两个作业"
+                         if not pending else
+                         f"另有 {len(pending)} 个文件并不进来（先单独直打，见下）")
+                self.log_message.emit(
+                    f"  → 整单同一个批次：{len(deferred)} 个文件 / 一次翻纸 —— {_tail}")
 
         # ── 阶段 2a：把**连续同参数**的直打文件合并成一个打印作业 ──
         if pending:
@@ -3297,7 +3451,7 @@ class PrintWorker(QThread):
             )
             return
 
-        # ── 手动双面批次：把本次打印里所有"需手动双面"的文件合并成**一次翻纸**打完 ──
+        # ── 手动双面批次：本单的文件（含并进来的单面/1 页文件）合并成**一次翻纸**打完 ──
         if deferred:
             if self._cancelled:
                 for _idx, job, _p, temp_pdf in deferred:
@@ -3311,9 +3465,26 @@ class PrintWorker(QThread):
                 try:
                     # 按装订方向分组：同批必须用同一个旋转补偿（长边补偿 180°、短边不补偿）。
                     # 一般整批同向 → 一批一次翻纸；长短边混排才拆成两批（翻两次，并记日志）。
+                    # 单面文件（第 2 趟背面全空白）的旋转补偿没有意义 ⇒ 跟**主方向**走，
+                    # 不能让它的 duplex_mode 把整单多拆出一次翻纸。
+                    # ⚠ "主方向"必须由**第一个真的会双面配对**的文件决定，不能取"第一批"：
+                    #   单面文件排在首位时会先建出一批，后面的双面文件方向不同就另起一批
+                    #   ⇒ 多翻一次纸，而那一批的第 2 趟全是空白页（纯白走一遍纸）。
+                    #   2026-10-26 独立审查用 `[1页(short-edge), 3页双面(long-edge)]` 复现过。
                     groups: dict[bool, list] = {}
+                    primary: Optional[bool] = None
                     for it in deferred:
-                        groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
+                        if self._pairs_pages(it):
+                            primary = self._rotate_for_job(it[1])
+                            break
+                    for it in deferred:
+                        if self._pairs_pages(it):
+                            groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
+                        elif primary is not None:
+                            groups.setdefault(primary, []).append(it)
+                        else:
+                            # 整批都没有"真双面配对"的文件（全是 1 页/单面）：按第一项的方向
+                            groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
                     if len(groups) > 1:
                         self.log_message.emit(
                             f"⚠ 本批存在两种装订方向，将分 {len(groups)} 次翻纸")
@@ -3322,10 +3493,11 @@ class PrintWorker(QThread):
                             f"▶ 手动双面批次：{len(items)} 个文件，"
                             f"{'长边（第 2 趟内容旋转 180°）' if rotate else '短边（第 2 趟内容不旋转）'}"
                             f" —— 整批只翻一次纸")
-                        # ⚠ 本批**只含**手动双面的文件：本轮已单面直打的纸先打完、压在出纸槽
-                        # 下面，第 2 趟从堆顶取纸只取本批那几张（翻纸文案说"只取最上面 N 张"）。
-                        # 不要把它们并进页序 —— 2026-10-18 试过，占位页落在堆顶、真直打纸
-                        # 在堆底，第 2 趟永远取不到那张纸（记在 _print_manual_batch 的说明里）。
+                        # ⚠ 本批**已包含本单全部文件**（单面/1 页文件按 FilePlan(duplex=False)
+                        # 并进来）。只有"并不进来"的（读不出页数、逐文件 DPI 不同）才会先在
+                        # 上面直打、压在出纸槽下面 —— 那种情况翻纸文案会说"只取最上面 N 张"。
+                        # **不要**改成"先直打、再补空白占位页"：2026-10-18 试过，占位页落在
+                        # 堆顶、真直打纸在堆底，第 2 趟永远取不到那张纸。
                         ok_b, msg_b, sides_b = self._print_manual_batch(
                             items, rotate, offset_sides, total_sides)
                         for _idx, _job, _p, _t in items:
@@ -3445,7 +3617,7 @@ class ConvertWorker(QThread):
     finished = Signal(int, str, str, int, str)
 
     def __init__(self, row: int, file_path: str, engine: str, source_md5: str = "",
-                 from_cloud: bool = False):
+                 from_cloud: bool = False, allow_cloud_com: bool = False):
         super().__init__()
         self._row = row
         self._file_path = file_path
@@ -3454,6 +3626,9 @@ class ConvertWorker(QThread):
         # S1-04：文件来自云端（顾客上传，内容不可信）⇒ 转换绝不走 Word/WPS COM（宏执行路径），
         # 强制 LibreOffice。默认 False = 用户本地文件，保持原三引擎降级链（零回归）。
         self._from_cloud = bool(from_cloud)
+        # 2026-10-26 隐式规则：管理员自打 + 管理员上传时由调用方置 True，
+        # 允许云端 Word 走 COM（仍带硬化）。默认 False = 顾客文件永远强制 LibreOffice。
+        self._allow_cloud_com = bool(allow_cloud_com)
         self._cancelled = False
 
     def cancel(self):
@@ -3475,9 +3650,10 @@ class ConvertWorker(QThread):
                 self.finished.emit(self._row, self._file_path, "", 0, "")
                 return
             if (ext in (".doc", ".docx") and self._engine != "libreoffice"
-                    and not self._from_cloud):
-                # ⚠ 云端来源必须在上面这条闸门处就被挡住（S1-04）：走 else 分支交给
+                    and (not self._from_cloud or self._allow_cloud_com)):
+                # ⚠ 云端来源默认在上一行就被挡住（S1-04）：走 else 分支交给
                 #   converter.convert(from_cloud=True) ⇒ LibreOffice，绝不给 Word/WPS 机会。
+                #   只有「管理员自打 + 管理员上传」才会带 allow_cloud_com 进来。
                 # 直接以 MD5 命名存入 pdf_cache（docx 缓存 key 含引擎后缀，防止 WPS 文档
                 # 被 Word 引擎转换的错误 PDF 被复用；若无 MD5 则用临时文件）
                 if self._source_md5:
@@ -3498,11 +3674,12 @@ class ConvertWorker(QThread):
                     _convert_via_word_com(self._file_path, temp_pdf)
             else:
                 converter = get_converter()
-                temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud)
+                temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud,
+                                             allow_cloud_com=self._allow_cloud_com)
         except Exception:
             # Word/WPS 引擎失败，降级到 LibreOffice
             if (ext in (".doc", ".docx") and self._engine != "libreoffice"
-                    and not self._from_cloud):
+                    and (not self._from_cloud or self._allow_cloud_com)):
                 try:
                     if temp_pdf and os.path.isfile(temp_pdf):
                         os.remove(temp_pdf)
@@ -3510,7 +3687,8 @@ class ConvertWorker(QThread):
                     pass
                 try:
                     converter = get_converter()
-                    temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud)
+                    temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud,
+                                                 allow_cloud_com=self._allow_cloud_com)
                 except Exception:
                     self.finished.emit(self._row, self._file_path, "", 0, "")
                     return
@@ -6490,8 +6668,10 @@ class MainWindow(QMainWindow):
                 self._sync_ui_to_config()
             with self._config_save_lock:
                 self._config.save(self._config_path)
+            return True
         except Exception as e:
             logger.warning(f"自动保存配置失败: {e}")
+            return False
 
     def _cleanup_orphan_pdf_cache(self, abandoned_jobs: list):
         """放弃订单后清理不再被任何活跃任务引用的 PDF 缓存。
@@ -8374,14 +8554,15 @@ class MainWindow(QMainWindow):
         return None
 
     def _start_convert_worker(self, row: int, file_path: str, engine: str, tab_key: str = "",
-                              from_cloud: bool = False):
+                              from_cloud: bool = False, allow_cloud_com: bool = False):
         """启动后台 PDF 转换线程。先检查 MD5 缓存，命中则跳过转换。
 
         MD5 一律从 file_path 计算（不再依赖 jobs[row].source_md5 ——
         多文件订单并发转换时行号可能错位，会读到别的文件的 MD5）。
         仅当任务上已有相同 file_path 的 source_md5 时复用，避免重复计算大文件。
         tab_key（2026-12）：目标标签页（无障碍后台创建时定位 job；空 = 当前前台标签页）。
-        from_cloud（S1-04）：云端任务 ⇒ Office 文档强制 LibreOffice，不走 Word/WPS COM。"""
+        from_cloud（S1-04）：云端任务 ⇒ Office 文档强制 LibreOffice，不走 Word/WPS COM。
+        allow_cloud_com（2026-10-26 隐式规则）：仅「管理员自打 + 管理员上传」才 True。"""
         # 计算源文件 MD5 并检查 PDF 缓存
         source_md5 = ""
         image_orientation = "auto"
@@ -8448,7 +8629,8 @@ class MainWindow(QMainWindow):
                 return
         # 缓存未命中 → 启动转换线程（同 file_path 的旧 worker 先取消，防重复写缓存）
         self._cancel_convert_worker_for_path(file_path)
-        worker = ConvertWorker(row, file_path, engine, source_md5, from_cloud=from_cloud)
+        worker = ConvertWorker(row, file_path, engine, source_md5, from_cloud=from_cloud,
+                               allow_cloud_com=allow_cloud_com)
         worker.finished.connect(
             lambda r, fp, pdf, pc, ori, tk=tab_key: self._on_convert_finished(r, fp, pdf, pc, ori, tk))
         self._convert_workers.append(worker)
@@ -9906,10 +10088,9 @@ class MainWindow(QMainWindow):
         """定时（2s）比对攒批模式 + 忙闲，**变化才上报** —— 移动端状态随之实时刷新。"""
         try:
             sig = (self._stack_mode_on(), self._stack_busy_reason())
-            if sig == getattr(self, "_last_stack_sig", None):
-                return
-            self._last_stack_sig = sig
-            self._report_stack_state()
+            if sig != getattr(self, "_last_stack_sig", None):
+                self._last_stack_sig = sig
+                self._report_stack_state()
         except Exception as e:      # 定时器路径绝不能抛
             logger.debug(f"攒批状态心跳失败: {e}")
 
@@ -11691,6 +11872,17 @@ class MainWindow(QMainWindow):
         rows.append(("WPS Office COM", _status_text(wps_ok, wps_w)))
         rows.append(("LibreOffice 无头模式", _status_text(lo_ok)))
 
+        # ── 云端 Word 引擎（2026-10-26 晚：隐式规则，没有开关）──
+        rows.append(("<hr><b>云端 Word 引擎</b>", ""))
+        rows.append(("放行规则",
+                     "<span style='color:#4a9;font-weight:bold'>顾客内容强制 LibreOffice</span>"
+                     "<br><small>云端 .doc/.docx 一律用 LibreOffice（不执行宏）⇒ 打顾客 Word/Excel 需装 "
+                     "LibreOffice</small>"))
+        rows.append(("管理员自打",
+                     "<span style='color:#e67e22;font-weight:bold'>允许 Word/WPS COM</span>"
+                     "<br><small>仅「订单类型=自打 **且** 文件由管理员上传」；COM 已禁用宏/弹窗/外链更新，"
+                     "Word/WPS 都不可用时自动降级 LibreOffice</small>"))
+
         # ── 系统打印机 ──
         printers = list_system_printers()
         printer_count = len(printers)
@@ -13460,16 +13652,24 @@ class MainWindow(QMainWindow):
             order_number=task.order_number,  # 云端订单号
             remark=getattr(task, 'remark', '') or '',  # 云端订单备注
             cached_pdf=cached_pdf,        # 使用缓存的 PDF（如有）
+            # 2026-10-26 隐式规则：只有「管理员自打 + 管理员上传」才可能拿到 Word/WPS COM
+            # 放行位；顾客订单/顾客上传的内容一律强制 LibreOffice。
+            admin_self_print=bool(getattr(task, 'is_admin_print', False)),
+            uploader_is_admin=bool(getattr(task, 'uploader_is_admin', False)),
         )
         self._config.tabs[new_key].jobs.append(job)
 
         # Word 文件：缓存未命中时才启动转换（传真实行号，job 已 append；
         # 回调改为按 file_path 匹配，行号仅作快速路径提示；tab_key 定位目标标签页）
-        # from_cloud=True（S1-04）：云端任务的文件是顾客上传的 ⇒ 强制 LibreOffice，不碰 COM
+        # from_cloud=True（S1-04）：云端任务的文件是顾客上传的 ⇒ 默认强制 LibreOffice，不碰 COM。
+        # allow_cloud_com（2026-10-26 隐式规则）：仅「管理员自打 + 管理员上传」放行。
         if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
             row = len(self._config.tabs[new_key].jobs) - 1
-            self._start_convert_worker(row, task.local_path, engine, tab_key=new_key,
-                                       from_cloud=True)
+            self._start_convert_worker(
+                row, task.local_path, engine, tab_key=new_key, from_cloud=True,
+                allow_cloud_com=cloud_word_com_allowed(
+                    getattr(task, 'is_admin_print', False),
+                    getattr(task, 'uploader_is_admin', False)))
 
         self._log(f"☁ 云端任务 #{task.task_id} 已添加到标签页 {new_key}")
         if self._cloud_client:

@@ -273,8 +273,16 @@ def static_html():
         re.search(r"function updatePassword\(key\)[\s\S]{0,900}?'/api/local/finance_auth/password'", html) is not None)
     chk("requestPassword 走 financeUnlock（本地不再比对哈希）",
         re.search(r"function requestPassword\(key, label\)[\s\S]{0,1200}?financeUnlock\(key, pwd\)", html) is not None)
-    chk("needs_setup / default_password → 提示并打开强制改密框（不是「密码错误」了事）",
+    chk("needs_setup → 提示并打开强制改密框（不是「密码错误」了事）",
         re.search(r"if \(r\.needsSetup\)\s*\{[\s\S]{0,400}?openFinanceSetupModal\(\)", html) is not None)
+    # v7.6：`needs_setup`（这个模块还没有密码）与 `default_password`（用户敲了已被停用的
+    # 默认/弱口令，而模块其实有密码）是两件事 —— 混成一个标志会出现「先说你还没设密码、
+    # 紧接着说所有模块都已设置密码」这对自相矛盾的提示（2026-10-25 现场，授权页）。
+    chk("两个失败码分开：needsSetup 只认 needs_setup，default_password 走独立的 weakDefault",
+        re.search(r"needsSetup: \(code === 'needs_setup'\)", html) is not None
+        and re.search(r"weakDefault: \(code === 'default_password'\)", html) is not None)
+    chk("default_password 只给准确提示，**不**打开首次设置框（模块其实已有密码，setup 会被服务端拒）",
+        re.search(r"if \(r\.weakDefault\)\s*\{[\s\S]{0,300}?return false;", html) is not None)
     chk("旧密码升级后把服务端回执的 stored_hash 带回 STORE（否则下次保存会回退成旧格式）",
         re.search(r"if \(res\.stored_hash && STORE && STORE\.config\)", html) is not None
         and "STORE.config.passwords[module] = res.stored_hash" in html)
@@ -479,7 +487,11 @@ def behavior_merge_clear():
     tmp = tempfile.mkdtemp(prefix="hn_s105_clear_")
     try:
         df = os.path.join(tmp, "print_data.json")
-        mods = ("score", "expense", "income", "transfer", "settings", "auth", "orderstatus")
+        sys.path.insert(0, TOOL)
+        import stats_server as _ss_mods
+        # 模块清单**从服务端常量派生**（每加一个密码模块就不用改这个脚本；曾经写死 7 个，
+        # v7.6 新增 orderprinter 后这条断言就假红了）
+        mods = tuple(_ss_mods.FINANCE_MODULES)
         creds = {m: "pbkdf2_sha256$210000$%s$%s" % (("%02x" % i) * 16, "b" * 64)
                  for i, m in enumerate(mods)}
         data = {
@@ -502,7 +514,7 @@ def behavior_merge_clear():
         sec.write_data(blank)
         on_disk = json.load(open(df, encoding="utf-8"))
         after = (on_disk.get("_finance_credentials") or {})
-        chk("清空业务数据后 7 个模块的 PBKDF2 凭据一个不少", set(after.keys()) == set(creds),
+        chk("清空业务数据后 %d 个模块的 PBKDF2 凭据一个不少" % len(mods), set(after.keys()) == set(creds),
             sorted(after.keys()))
         chk("凭据逐字节一致（清本机副本不会重新生成 salt / 不会让密码失效）",
             all(after.get(m) == creds[m] for m in mods))
@@ -916,6 +928,20 @@ function mkEl(tag) {
     },
     set(o, k, v) { o[k] = v; if (k === 'id') { GLOBAL[String(v)] = api; } return true; },
   });
+  /* ⚠ innerHTML / value 的访问器定义在**这个元素对象自己**（t）上，绝不打到 Object.prototype 上：
+     打到 Object.prototype 等于给 Node 自己的内置模块（streams 等）也装上了 innerHTML/value 访问器，
+     Node 22/24 会直接 TypeError: Invalid property descriptor. Cannot both specify accessors and a value
+     —— 整段前端行为验收连跑都跑不起来（本脚本在 Node 24 上就是这么红的）。 */
+  Object.defineProperty(t, 'innerHTML', {
+    get() { return t._html; },
+    set(v) { t._html = String(v); registerHTML(api, v); },
+    configurable: true, enumerable: false,
+  });
+  Object.defineProperty(t, 'value', {
+    get() { return t._value; },
+    set(v) { t._value = String(v); },
+    configurable: true, enumerable: false,
+  });
   return api;
 }
 /* innerHTML 写入时把 id / data-act 注册出来（modal 的按钮与输入框就是这样来的） */
@@ -934,16 +960,6 @@ function findSel(el, sel) {
   if (m) return ACTS[m[1]] || (ACTS[m[1]] = mkEl('button'));
   return mkEl('div');
 }
-Object.defineProperty(Object.getPrototypeOf(mkEl('div')), 'innerHTML', {
-  get() { return this._html; },
-  set(v) { this._html = String(v); registerHTML(this, v); },
-  configurable: true,
-});
-['value'].forEach(prop => {
-  Object.defineProperty(Object.getPrototypeOf(mkEl('div')), prop, {
-    get() { return this._value; }, set(v) { this._value = String(v); }, configurable: true,
-  });
-});
 
 const body = mkEl('body'), docEl = mkEl('html'), modalRoot = mkEl('div');
 GLOBAL.modalRoot = modalRoot;
@@ -1080,8 +1096,9 @@ vm.createContext(sandbox);
 
   /* ③ 解锁：默认密码被服务端拒绝，正确密码拿到会话 */
   let r1 = await vm.runInContext('financeUnlock("settings", "123456")', sandbox);
-  chk('默认密码 123456 解锁 → ok=false 且 needsSetup=true（引导去改密，不是"密码错误"）',
-    r1 && r1.ok === false && r1.needsSetup === true && r1.code === 'default_password', r1);
+  chk('默认密码 123456 解锁 → ok=false，且按「弱口令」处理（weakDefault=true / needsSetup=false）',
+    r1 && r1.ok === false && r1.code === 'default_password'
+    && r1.weakDefault === true && r1.needsSetup === false, r1);
   chk('失败后仍没有会话', vm.runInContext('FINANCE_SESSION', sandbox) === '');
   let r2 = await vm.runInContext('financeUnlock("settings", "GoodPass2026")', sandbox);
   chk('正确密码 → ok=true 且 unlocked.settings=true',

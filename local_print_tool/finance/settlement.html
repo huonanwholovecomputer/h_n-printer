@@ -323,6 +323,43 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .settle-box-real { border-color: var(--primary); }
 .settle-box-real h2 { color: var(--primary); }
 
+/* ==================== 📐 结算公式说明块（v7.3） ====================
+   可折叠：常驻只占一行（<summary>），展开才把 8 步公式摊开，不干扰日常看数。
+   用原生 <details> 而不是自写开关 —— 不需要 JS 记状态、刷新后默认收起、键盘可达。 */
+.formula-box { background: var(--card); border: 1px solid var(--border-strong); border-radius: var(--radius); margin-top: 18px; box-shadow: var(--shadow-sm); }
+.formula-box > summary {
+  cursor: pointer; padding: 12px 16px; font-weight: 700; font-size: .95rem;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  list-style: none; user-select: none; border-radius: var(--radius);
+}
+.formula-box > summary::-webkit-details-marker { display: none; }
+.formula-box > summary .hint { font-weight: 400; font-size: .8rem; color: var(--muted); }
+/* 展开/收起提示紧跟在标题文案之后（不靠右对齐）：右上角有个固定的 🌓 主题悬浮按钮
+   （.floating-btn，top:14 right:16），窄窗口下它正好压在大卡片的右上角 —— 提示若右对齐
+   就会被它盖住。跟着标题走则任何宽度都点得到。 */
+.formula-box > summary::after { content: '展开 ▾'; margin-left: 8px; font-size: .78rem; font-weight: 400; color: var(--primary); }
+.formula-box[open] > summary::after { content: '收起 ▴'; }
+.formula-box[open] > summary { border-bottom: 1px solid var(--border); border-radius: var(--radius) var(--radius) 0 0; }
+.formula-body { padding: 14px 16px 8px; font-size: .86rem; line-height: 1.9; }
+.formula-body h3 { font-size: .9rem; margin: 12px 0 6px; color: var(--primary); }
+.formula-body h3:first-child { margin-top: 0; }
+.formula-body code {
+  font-family: Consolas, 'Courier New', monospace; font-size: .84rem;
+  background: var(--bg-soft); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px;
+}
+.formula-code {
+  font-family: Consolas, 'Courier New', monospace; font-size: .84rem; line-height: 1.85;
+  display: block; padding: 10px 12px; margin: 6px 0 8px;
+  background: var(--bg-soft); border: 1px solid var(--border); border-radius: 8px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.formula-body table { margin: 6px 0 10px; }
+.formula-body table th, .formula-body table td { font-size: .84rem; padding: 7px 10px; }
+.formula-body .note { color: var(--muted); font-size: .8rem; }
+.formula-body .chk { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; }
+.formula-body .chk.ok { color: var(--pos); }
+.formula-body .chk.bad { color: var(--neg); }
+
 /* ==================== 图表 ==================== */
 .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
 .chart-grid .section { margin-bottom: 0; }
@@ -694,6 +731,7 @@ img, button { -webkit-user-drag: none; }
     <button class="on" data-tab="dash"><span class="ico">📊</span>收支清算</button>
     <button data-tab="entry"><span class="ico">📝</span>手动记账</button>
     <button data-tab="cloud"><span class="ico">📡</span>云端数据</button>
+    <button data-tab="printers"><span class="ico">🖨️</span>打印机折旧</button>
     <button data-tab="history"><span class="ico">📅</span>历史记录</button>
     <button data-tab="settings"><span class="ico">⚙️</span>设置</button>
     <button data-tab="auth"><span class="ico">🔐</span>授权</button>
@@ -705,6 +743,7 @@ img, button { -webkit-user-drag: none; }
   <div class="tab on" id="tab-dash"></div>
   <div class="tab" id="tab-entry"></div>
   <div class="tab" id="tab-cloud"></div>
+  <div class="tab" id="tab-printers"></div>
   <div class="tab" id="tab-history"></div>
   <div class="tab" id="tab-settings"></div>
   <div class="tab" id="tab-auth"></div>
@@ -723,7 +762,7 @@ img, button { -webkit-user-drag: none; }
   if (!fromUrl) {
     try { tab = sessionStorage.getItem('finance_last_tab'); } catch (e2) {}
   }
-  var valid = ['dash', 'entry', 'cloud', 'history', 'settings', 'auth', 'about'];
+  var valid = ['dash', 'entry', 'cloud', 'printers', 'history', 'settings', 'auth', 'about'];
   if (!tab || valid.indexOf(tab) === -1) tab = 'dash';
   // FINANCE_MODE 此时还没赋值，这里按同样规则解析一次（仅用于本地模式隐藏授权入口的判定）
   var mode = '__FINANCE_MODE__';
@@ -825,11 +864,11 @@ var DEFAULT_RATE = 0.05;
    存量模块**识别成「必须改密」**（needs_setup，服务端直接拒绝解锁）。
    `DEFAULT_PASSWORDS` 现在全是空串 = 「未设置」—— 迁移时补齐的是空值，不是密码。 */
 var _PW_123456 = 'sha256:8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92';
-var LEGACY_DEFAULT_PASSWORDS = { score: _PW_123456, expense: _PW_123456, income: _PW_123456, settings: _PW_123456, auth: _PW_123456, transfer: _PW_123456, orderstatus: _PW_123456 };
-var DEFAULT_PASSWORDS = { score: '', expense: '', income: '', transfer: '', settings: '', auth: '', orderstatus: '' };
+var LEGACY_DEFAULT_PASSWORDS = { score: _PW_123456, expense: _PW_123456, income: _PW_123456, settings: _PW_123456, auth: _PW_123456, transfer: _PW_123456, orderstatus: _PW_123456, orderprinter: _PW_123456 };
+var DEFAULT_PASSWORDS = { score: '', expense: '', income: '', transfer: '', settings: '', auth: '', orderstatus: '', orderprinter: '' };
 /* PASSWORD_KEYS：需要独立密码的模块清单（迁移补默认值 / 设置页密码管理共用同一份顺序） */
-var PASSWORD_KEYS = ['score', 'expense', 'income', 'transfer', 'settings', 'auth', 'orderstatus'];
-var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', transfer: '实际转账', settings: '设置', auth: '设备授权', orderstatus: '订单状态/类型订正' };
+var PASSWORD_KEYS = ['score', 'expense', 'income', 'transfer', 'settings', 'auth', 'orderstatus', 'orderprinter'];
+var MODULE_NAMES = { score: '服务评估', expense: '采购支出', income: '代收收入', transfer: '实际转账', settings: '设置', auth: '设备授权', orderstatus: '订单状态/类型订正', orderprinter: '打印机台账/归属' };
 /* 密码最小长度（与服务端 stats_server.MIN_PASSWORD_LEN 同口径） */
 var FINANCE_PASSWORD_MIN_LEN = 6;
 /* 打印价格默认值（本地模式初始化 / 字段兜底用）。
@@ -1006,6 +1045,14 @@ function mergeStores(localStore, cloudStore) {
       pricing: cloudHasCfg && cc.pricing
         ? JSON.parse(JSON.stringify(cc.pricing))
         : JSON.parse(JSON.stringify(lc.pricing || {})),
+      /* v7.4：打印机台账按 id 并集 —— 两台设备各自登记过机器，合并时都要留下（缺一台就会
+         让那台机器的折旧凭空消失）；分摊口径取云端为准（云端已有配置时） */
+      printers: (function () {
+        var map = {};
+        (lc.printers || []).concat(cc.printers || []).forEach(function (p) { if (p && p.id) map[p.id] = p; });
+        return Object.keys(map).map(function (k) { return map[k]; });
+      })(),
+      purchaseBasis: (cloudHasCfg && cc.purchaseBasis) ? cc.purchaseBasis : (lc.purchaseBasis || 'equal'),
     },
     records: {
       expenses: unionById((localStore && localStore.records && localStore.records.expenses) || [], (cloudStore && cloudStore.records && cloudStore.records.expenses) || []),
@@ -1023,7 +1070,7 @@ function mergeStores(localStore, cloudStore) {
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
-var unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false };
+var unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false, orderprinter: false };
 
 /* ==================== 数据模型 / 迁移 ==================== */
 function migrateConfig(data) {
@@ -1041,6 +1088,14 @@ function migrateConfig(data) {
   // 兼容旧配置：授权 / 实际转账等后加模块的密码缺失时补默认（老数据不会出现「无密码可用」）
   PASSWORD_KEYS.forEach(function (k) { if (!c.passwords[k]) c.passwords[k] = DEFAULT_PASSWORDS[k]; });
   if (!c.memberBindings) c.memberBindings = [];
+  /* v7.4：打印机台账（消耗品）—— 每台记 价格 / 寿命页数 / 绑定的设备 client_id。
+     寿命按「价格 ÷ 能打印页数」折成每页成本，月度结算按实际出纸页数计提折旧。
+     老配置没有这一项 ⇒ 补空数组（不自动造数据，绝不凭空算出一笔折旧）。 */
+  if (!Array.isArray(c.printers)) c.printers = [];
+  c.printers.forEach(function (p) { if (p && typeof p === 'object') normalizePrinter(p); });
+  c.printers = c.printers.filter(function (p) { return p && p.id && p.name; });
+  /* v7.4：采购分摊口径 —— 'equal' 均摊（旧默认，零回归）/ 'usage' 按各成员实际出纸页数比例 */
+  if (c.purchaseBasis !== 'usage') c.purchaseBasis = 'equal';
   // 打印价格（本地模式存储；云端模式以服务器 pricing.json 为权威，不在 STORE 维护）
   if (!c.pricing || typeof c.pricing !== 'object') {
     c.pricing = JSON.parse(JSON.stringify(DEFAULT_PRICING));
@@ -1126,6 +1181,32 @@ function sanitizeStore(data) {
       return true;
     });
   }
+  /* v7.4：打印机台账同样净化 —— 非法 id / 寿命 0 / 负价格整条丢弃（寿命 0 会让每页成本变成
+     Infinity，一条脏数据就能把整月折旧算成天文数字）；同一个 client_id 只留第一台（否则订单
+     到底归哪台机器就说不清了）。 */
+  if (data && data.config && Array.isArray(data.config.printers)) {
+    var seenClient = {};
+    data.config.printers = data.config.printers.filter(function (p) {
+      if (!p || typeof p !== 'object') { console.warn('导入：跳过非法的打印机记录'); return false; }
+      normalizePrinter(p);
+      if (!p.id || !p.name) { console.warn('导入：跳过缺 id/名称的打印机', p.id); return false; }
+      if (!(p.price >= 0)) { console.warn('导入：跳过价格非法的打印机', p.id); return false; }
+      /* v7.7：累计实测模式的机器寿命**天生是 0**（还没报废就无从知道总页数）——
+         这类记录必须留下，否则一次导入/同步就把"正在累计"的机器整台丢掉，累计白攒。 */
+      if (!(p.life_pages > 0) && printerLifeState(p) !== 'accumulating') {
+        console.warn('导入：跳过寿命/价格非法的打印机', p.id); return false;
+      }
+      if (p.client_id) {
+        if (seenClient[p.client_id]) {
+          console.warn('导入：同一个设备绑了两台打印机，已忽略后一台', p.client_id);
+          return false;   // 两份都留会让「订单归哪台机」变成掷骰子 ⇒ 只保留第一台
+        }
+        seenClient[p.client_id] = true;
+      }
+      return true;
+    });
+  }
+  if (data && data.config && data.config.purchaseBasis !== 'usage') data.config.purchaseBasis = 'equal';
   return data;
 }
 function convertMonths(months) {
@@ -1159,6 +1240,341 @@ function getMembers() { return STORE.config.members || DEFAULT_MEMBERS; }
 function getScoreCap() { return STORE.config.scoreCap || DEFAULT_SCORE_CAP; }
 function getRate() { return STORE.config.investRate != null ? STORE.config.investRate : DEFAULT_RATE; }
 function getMember(id) { var m = getMembers().find(function (x) { return x.id === id; }); return m; }
+
+/* ==================== v7.4：打印机台账（消耗品寿命核算） ====================
+   每台机记「价格 / 寿命页数」，折成**每页成本 = 价格 ÷ 寿命页数**；
+   本月该机折旧 = 本月它的实际出纸页数 × 每页成本。
+   金额一律落在整数分（与 calcMonth 同域），且**每台机单独取整** —— 逐单/逐人取整会累积漂移，
+   与「Σ 恒等于池子」的分摊口径（apportionCents）是一套思路。 */
+/* v7.7：日期白名单（只认真实存在的 YYYY-MM-DD，月份 01-12、日 01-31 ——
+   光看「四位-两位-两位」会把 2026-13-99 这种脏值放进来，结算区间就会变成非法 SQL 参数） */
+function _legalDateStr(s) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s == null ? '' : s));
+  if (!m) return '';
+  var mo = +m[2], d = +m[3];
+  if (mo < 1 || mo > 12 || d < 1 || d > 31) return '';
+  return m[0];
+}
+function normalizePrinter(p) {
+  p.id = safeId(p.id) || uid();
+  p.name = String(p.name == null ? '' : p.name).trim().slice(0, 40);
+  p.model = String(p.model == null ? '' : p.model).trim().slice(0, 40);
+  p.client_id = safeId(p.client_id) || '';
+  p.price = Math.round((+p.price || 0) * 100) / 100;          // 元，两位小数
+  p.life_pages = Math.max(0, Math.round(+p.life_pages || 0)); // 0 = 未填寿命（不参与折旧）
+  /* v7.7：寿命两种口径 ——
+       'estimate'（默认）：人工预估总寿命，每页成本 = 价格 ÷ 寿命页数（老口径，一分不改）；
+       'accumulate'      ：**不预估** —— 先把用量一直累计，机器报废时把累计页数结算成「实测寿命」，
+                           历史各期再按各月页数回溯计提（Σ各月 == 追踪期应承担的寿命价值）。
+     累计模式的输入与结算结果：
+       pre_pages    起算前已用页数（机器进这套系统之前就打掉的量；0 = 忽略）
+       started_at   累计起算日（'' = 从有记录以来）
+       measured     已按实测寿命结算（此时 life_pages 是实测值，不是预估）
+       settled      结算快照 { at, pages, trackedPages, prePages, cents, months:{'YYYY-MM':{pages,byMember,cents}} }
+                    —— 金额与分摊一次冻结：报废后设备可能改名 / 换绑 / 被删，订单归属也可能被人工改，
+                       历史折旧若继续跟着订单现算，一次误操作就能把已经报给成员的账改掉。 */
+  p.life_mode = (p.life_mode === 'accumulate') ? 'accumulate' : 'estimate';
+  p.pre_pages = Math.max(0, Math.round(+p.pre_pages || 0));
+  p.started_at = _legalDateStr(p.started_at);
+  p.measured = !!p.measured && +p.life_pages > 0;
+  p.settled_at = _legalDateStr(p.settled_at);
+  if (!p.settled || typeof p.settled !== 'object' || !(+p.settled.pages > 0)
+      || !p.settled.months || typeof p.settled.months !== 'object') {
+    p.settled = null;
+  } else {
+    /* 只留合法月份键与整数分 —— 一份脏配置不该把某个月算成 NaN */
+    var _settledMonths = {};
+    Object.keys(p.settled.months).forEach(function (mk) {
+      var mm = p.settled.months[mk];
+      if (!/^\d{4}-\d{2}$/.test(mk) || !mm || typeof mm !== 'object') return;
+      var bm = {}, sum = 0;
+      Object.keys(mm.byMember || {}).forEach(function (mid) {
+        var nn = Math.max(0, Math.round(+mm.byMember[mid] || 0));
+        if (nn > 0) { bm[mid] = nn; sum += nn; }
+      });
+      _settledMonths[mk] = { pages: Math.max(0, Math.round(+mm.pages || sum)), byMember: bm,
+                             cents: Math.max(0, Math.round(+mm.cents || 0)) };
+    });
+    p.settled.months = _settledMonths;
+    p.settled.pages = Math.max(0, Math.round(+p.settled.pages || 0));
+    p.settled.trackedPages = Math.max(0, Math.round(+p.settled.trackedPages || 0));
+    p.settled.prePages = Math.max(0, Math.round(+p.settled.prePages || 0));
+    p.settled.cents = Math.max(0, Math.round(+p.settled.cents || 0));
+    p.settled.at = _legalDateStr(p.settled.at);
+  }
+  p.status = (p.status === 'retired') ? 'retired' : 'active';
+  /* v7.5：所有者与计费方式分开记 ——
+       owner   : 'shared'（共有，全体成员均等）或某个成员 id（个人所有）
+       billing : 'team'（团队共担：磨损算团队成本，机器没进过采购账，如 1020）
+                 'wear'（收损耗费：购买款所有者已付过，如 M232 三人均摊）
+     上一版用的 ownership/owners 表示同一件事，这里做一次性兼容映射。 */
+  if (p.ownership === 'coowned') p.billing = 'wear';
+  else if (p.ownership === 'team') p.billing = 'team';
+  delete p.ownership;
+  p.billing = (p.billing === 'wear') ? 'wear' : 'team';
+  p.owner = (p.owner && p.owner !== 'team') ? String(p.owner) : 'shared';
+  if (Array.isArray(p.owners)) {
+    if (p.billing === 'wear' && p.owners.length === 1) p.owner = String(p.owners[0]);
+    delete p.owners;
+  }
+  p.note = String(p.note == null ? '' : p.note).slice(0, 80);
+  if (!p.bought_at) p.bought_at = '';
+  return p;
+}
+function getPrinters() { return STORE.config.printers || []; }
+/* 在役（未退役）的机器：只有它们继续计提折旧 */
+function getActivePrinters() { return getPrinters().filter(function (p) { return p.status !== 'retired'; }); }
+/* v7.7：寿命口径状态（界面文案 / 计提规则都只认这一个判据）
+     'estimate'     预估总寿命（价格 ÷ 寿命页数）
+     'accumulating' 累计实测 · 还没结算（寿命未知 ⇒ 暂不计提，只累计页数）
+     'measured'     累计实测 · 已按实测页数结算（life_pages 是实测值，历史按快照回溯） */
+function printerLifeState(p) {
+  if (!p) return 'estimate';
+  if (p.life_mode !== 'accumulate') return 'estimate';
+  return (p.measured && +p.life_pages > 0) ? 'measured' : 'accumulating';
+}
+/* 计提对象 = 在役机 + 「已按实测寿命结算过」的报废机。
+   报废机不会再打新页（页数来自结算快照），但它的历史折旧必须留在账上 ——
+   如果只认在役，机器一报废，前面已经算给成员的成本就会凭空消失（追溯口径直接断掉）。 */
+function getDepreciablePrinters() {
+  return getPrinters().filter(function (p) {
+    if (p.status !== 'retired') return true;
+    return !!(p.measured && +p.life_pages > 0);
+  });
+}
+function printerById(id) {
+  var hit = getPrinters().filter(function (p) { return p.id === id; });
+  return hit.length ? hit[0] : null;
+}
+/* 设备 client_id → 打印机（订单的 received_client 就是「哪台机器打的」的唯一线索） */
+function printerByClient(cid) {
+  var c = String(cid || '');
+  if (!c) return null;
+  var hit = getPrinters().filter(function (p) { return p.client_id && p.client_id === c; });
+  return hit.length ? hit[0] : null;
+}
+/* 每页成本（元，保留 4 位小数供展示；计算一律用 printerDepCents 的整数分口径） */
+function printerUnitYuan(p) {
+  var life = +p.life_pages || 0;
+  return life > 0 ? (+p.price || 0) / life : 0;
+}
+/* pages 页在打印机 p 上的折旧（整数分）。寿命未填/为 0 ⇒ 0（宁可少提，不能算出 Infinity）。 */
+function printerDepCents(p, pages) {
+  var life = +p.life_pages || 0;
+  var n = Math.max(0, Math.round(+pages || 0));
+  if (!p || life <= 0 || n <= 0) return 0;
+  return Math.round(n * Math.round((+p.price || 0) * 100) / life);
+}
+function getPurchaseBasis() { return STORE.config.purchaseBasis === 'usage' ? 'usage' : 'equal'; }
+
+/* ==================== v7.7：累计实测寿命的纯计算（这里只算数，不碰 DOM / 不发请求） ====================
+   两个函数是「报废结算」的唯一真相：
+     · _printerPagesFromOrders —— 订单集 → 这台机的页数（按月 / 按成员）
+     · _buildSettledSnapshot   —— 实测总页数 → 各月金额（整数分，Σ 恒等于追踪期应承担的寿命价值）
+   发请求、弹窗、写台账都在后面 v7.7 的界面块里（openPrinterSettle），别把这两块混在一起。 */
+/* 某台机在给定订单集里的出纸页数（含按月 / 按成员明细）。
+   口径与按月用量完全一致：只算 status='sent' 的子任务、页数取后端折算好的 total_pages。
+   归属：正常 printerForOrder() 命中本机；本机若已被标退役（重算的场合）则按它自己的
+   client_id / 已知机型再认一次 —— 绝不把别的机器的单算进来。 */
+function _printerPagesFromOrders(orders, p) {
+  var res = { pages: 0, months: {} };
+  if (!p) return res;
+  var pid = safeId(p.id);
+  (orders || []).forEach(function (o) {
+    var hit = printerForOrder(o);
+    if (hit && safeId(hit.id) !== pid) return;      // 明确归到别的机器 ⇒ 不算
+    if (!hit) {
+      var cid = String((o && o.received_client) || '');
+      var owner = _deviceOwnerOfOrder(o);
+      var model = owner ? (KNOWN_PRINTER_MODELS[owner] || '') : '';
+      var mine = (p.client_id && cid && cid === p.client_id)
+        || (model && (model === p.name || model === p.model));
+      if (!mine) return;
+    }
+    var pages = 0;
+    (o.files || []).forEach(function (f) {
+      if ((f.status || '') !== 'sent') return;
+      pages += _filePagesOf(f);
+    });
+    if (!pages) return;
+    var mk = monthKeyOf(o.created_at);
+    var mid = (function () { var k = _orderMemberKey(o); return k.indexOf('member:') === 0 ? k.slice(7) : ''; })();
+    res.pages += pages;
+    var b = res.months[mk] || (res.months[mk] = { pages: 0, byMember: {} });
+    b.pages += pages;
+    if (mid) b.byMember[mid] = (b.byMember[mid] || 0) + pages;
+  });
+  return res;
+}
+/* 结算快照：实测总页数 → 各月金额（整数分）。
+   · pool = 整机价 × 追踪期页数 ÷ 实测总页数 —— 起算前（pre_pages）的磨损价值不进这套账
+     （那是账开始之前就发生的，不该摊给现在的人；快照里单列 prePages 说明）。
+   · 逐月金额走 apportionCents（最大余数法）⇒ Σ各月 ≡ pool，不会每月差一两分。 */
+function _buildSettledSnapshot(priceCents, totalPages, trackedPages, monthsRaw) {
+  var keys = Object.keys(monthsRaw || {}).sort();
+  var pool = (totalPages > 0) ? Math.round(priceCents * trackedPages / totalPages) : 0;
+  var cents = keys.length
+    ? apportionCents(pool, keys.map(function (k) { return monthsRaw[k].pages; }),
+                     keys.map(function (k) { return { id: k }; }))
+    : {};
+  var months = {};
+  keys.forEach(function (k) {
+    months[k] = { pages: monthsRaw[k].pages, byMember: monthsRaw[k].byMember, cents: cents[k] || 0 };
+  });
+  return { months: months, poolCents: pool };
+}
+
+/* ==================== v7.4：设备所有者 → 打印机机型 对照（2026-10-25 用户提供） ====================
+   现场两台在役机器：霍楠的设备 = HP LaserJet 1020；姚懿祥的设备 = HP LaserJet MFP M232-M237。
+   它的用途有两个（都只影响"显示/归属"，不影响金额）：
+     ① 现有订单的「打印机」列立刻显示正确机型 —— 不用先去授权页登记一遍才能看；
+     ② 登记时只填了机型、还没来得及绑 client_id 的机器，也能按机型把订单对上。
+   ⚠ 折旧仍以「已登记的机器（价格 + 寿命页数）」为准：没登记 ⇒ 认得出机型但提不出折旧。 */
+var KNOWN_PRINTER_MODELS = { '霍楠': 'HP LaserJet 1020', '姚懿祥': 'HP LaserJet MFP M232-M237' };
+/* 从订单认出「这台单是哪个所有者的设备打的」：优先用后端给的 received_label
+   （格式「{所有者}的设备 | {client_id}」），取不到再拿 client_id 去设备列表里反查 */
+function _deviceOwnerOfOrder(o) {
+  var lbl = String((o && o.received_label) || '');
+  var i = lbl.indexOf('的设备');
+  if (i > 0) return lbl.slice(0, i).trim();
+  var cid = String((o && o.received_client) || '');
+  if (cid && _authDevices) {
+    var hit = _authDevices.filter(function (d) { return d.client_id === cid; });
+    if (hit.length) return String(hit[0].owner_name || '');
+  }
+  return '';
+}
+/* 订单 → 打印机记录（或 null）：
+     ① client_id 精确绑定（且机器在役）；
+     ② 按「设备所有者 → 已知机型」找同名/同型号的在役机器；
+     ③ 订单没有设备号、且**只有一台**在役机 → 归它（单机店铺常态；绝不把别的设备的单塞给它）。 */
+function printerForOrder(o) {
+  /* 0) 人工指定优先：接单设备不决定用哪台打印机（一台设备可能接着好几台机，
+        也可能根本不是它打的），所以「这张单到底哪台机打的」允许在打印机列表里逐单指定。 */
+  var oid = String((o && (o.order_id != null ? o.order_id : o.id)) || '');
+  var omap = (STORE.config.orderPrinterMap || {});
+  if (oid && omap[oid]) {
+    var picked = printerById(omap[oid]);
+    if (picked) return picked;
+  }
+  var cid = String((o && o.received_client) || '');
+  var bound = printerByClient(cid);
+  if (bound && bound.status !== 'retired') return bound;
+  var owner = _deviceOwnerOfOrder(o);
+  var model = owner ? KNOWN_PRINTER_MODELS[owner] : '';
+  if (model) {
+    var hit = getActivePrinters().filter(function (p) { return p.name === model || p.model === model; });
+    if (hit.length) return hit[0];
+  }
+  if (!cid) {
+    var act = getActivePrinters();
+    if (act.length === 1) return act[0];
+  }
+  return null;
+}
+/* 订单 → 展示用机型名（未登记也能显示已知机型；都没有则 '') */
+function printerNameForOrder(o) {
+  var p = printerForOrder(o);
+  if (p) return { name: p.name, registered: true, client_id: p.client_id || '' };
+  var owner = _deviceOwnerOfOrder(o);
+  if (owner && KNOWN_PRINTER_MODELS[owner]) {
+    return { name: KNOWN_PRINTER_MODELS[owner], registered: false, client_id: String(o.received_client || '') };
+  }
+  return { name: '', registered: false, client_id: String(o.received_client || '') };
+}
+/* 人工指定某张单用了哪台打印机 —— 接单设备不决定打印机，以人确认为准。
+   存 STORE.config.orderPrinterMap = { '<order_id>': '<printer_id>' }，随 finance 配置同步多设备。
+   v7.6：这条归属直接决定折旧摊到谁头上（= 钱）⇒ 与台账共用同一把锁（密码模块 orderprinter）。 */
+function setOrderPrinter(orderKey, printerId) {
+  if (!unlocked.orderprinter) {
+    toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」再改订单归属', 'error');
+    renderPrinters();
+    return;
+  }
+  STORE.config.orderPrinterMap = STORE.config.orderPrinterMap || {};
+  var k = String(orderKey);
+  if (printerId) STORE.config.orderPrinterMap[k] = String(printerId);
+  else delete STORE.config.orderPrinterMap[k];
+  save();
+  invalidateUsage();     // 用量/折旧的机器归属变了 ⇒ 结算页下次进入重新统计
+  if (currentTab === 'printers') renderPrinters();
+  else if (currentTab === 'cloud') renderCloud();
+  else if (currentTab === 'dash') renderDash();
+  toast('✅ 已指定该订单的打印机', 'success');
+}
+/* 订单行里的「打印机」下拉（未指定时可留空，靠设备/已知机型兜底）。
+   锁定时不给下拉，只显示"现在是哪台" —— 与订单明细「状态 / 类型」列同一条规矩：默认防误点。
+   两条硬约束（2026-10-25 用户反馈，改之前先读）：
+     ① 这个单元格里**只能有一行** —— 绝不另起一行 div，否则把行高撑高；
+     ② 解锁态下**不许在下拉旁边再挂文字**（哪怕只是个小标签）—— td 是居中的，
+        多一个 inline 元素就会把这一行的下拉整体顶偏，整列看起来歪歪扭扭。
+        所以「未识别 / 未登记」这类状态一律写进下拉自己的占位项里（+ 橙色边框），
+        这样每一行的 select 宽度、位置完全一致。 */
+function printerPickerHTML(o, info) {
+  var oid = safeId(String((o && (o.order_id != null ? o.order_id : o.id)) || ''));
+  var cur = printerForOrder(o);
+  /* 小标记（仅锁定态用：那时没有下拉，不存在把控件挤歪的问题） */
+  function tag(txt, tip) {
+    return '<span style="font-size:.7rem;color:var(--orange);margin-left:5px;white-space:nowrap"'
+      + (tip ? ' title="' + esc(tip) + '"' : '') + '>' + txt + '</span>';
+  }
+  var unreg = !!(info && info.name && !info.registered && !cur);   // 认得出机型但台账没登记
+  var unknown = !cur && !(info && info.name);                       // 完全认不出是哪台机
+  if (!oid) return (info && info.name) ? esc(info.name) : tag('未识别', '这张单没有订单号，无法人工指定机型');
+  if (!unlocked.orderprinter) {
+    var nm = cur ? cur.name : ((info && info.name) || '');
+    if (!nm) return tag('未识别', '认不出是哪台机打的：解锁「' + MODULE_NAMES.orderprinter + '」后可在这一格下拉指定');
+    return esc(nm) + (unreg ? tag('未登记', '按已知机型显示；台账里没登记 ⇒ 不提折旧') : '');
+  }
+  /* 解锁态：状态写进占位项（宽度由「最宽的选项」决定、每行都一样 ⇒ 下拉列绝对竖直对齐） */
+  var opts = [], listed = 0;
+  getPrinters().forEach(function (pp) {
+    var pid2 = safeId(pp.id);
+    if (!pid2) return;
+    listed++;
+    opts.push('<option value="' + esc(pid2) + '"' + (cur && cur.id === pp.id ? ' selected' : '') + '>' + esc(pp.name) + '</option>');
+  });
+  var ph = '未指定', warn = false;
+  if (!listed) { ph = '未指定 · 台账无机器'; warn = true; }
+  else if (unknown) { ph = '未识别 · 请指定'; warn = true; }
+  else if (unreg) { ph = '未指定 · 按已知机型'; }
+  var h = '<select onchange="setOrderPrinter(\'' + oid + '\',this.value)"'
+    + ' style="font-size:.76rem;max-width:196px' + (warn ? ';border-color:var(--orange);color:var(--orange)' : '') + '"'
+    + ' title="' + (unknown ? '自动认不出是哪台机打的 —— 在这里指定' : '人工指定这张单用了哪台打印机') + '">';
+  h += '<option value=""' + (!cur ? ' selected' : '') + '>' + ph + '</option>' + opts.join('');
+  h += '</select>';
+  return h;
+}
+/* 一键把两台已知机型登记进台账（价格/寿命留空由人补；能按所有者自动绑定设备号就绑上） */
+function seedKnownPrinters() {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); return; }
+  var added = 0;
+  Object.keys(KNOWN_PRINTER_MODELS).forEach(function (owner) {
+    var model = KNOWN_PRINTER_MODELS[owner];
+    var exists = getPrinters().some(function (p) { return p.name === model || p.model === model; });
+    if (exists) return;
+    var cid = '';
+    (_authDevices || []).forEach(function (d) {
+      if (!cid && String(d.owner_name || '') === owner) cid = safeId(d.client_id) || '';
+    });
+    /* 现场口径（2026-10-25 用户）：1020 归 闫承翰，但没进过采购账 ⇒ 团队共担；
+       M232 由三人均摊买下 ⇒ 共有 + 收损耗费。 */
+    var yan = null;
+    getMembers().forEach(function (mm) { if (!yan && String(mm.name || '').indexOf('闫承翰') >= 0) yan = mm; });
+    var is1020 = model.indexOf('1020') >= 0;
+    STORE.config.printers.push(normalizePrinter({
+      id: uid(), name: model, model: model, price: 0, life_pages: 0,
+      client_id: cid, status: 'active', note: owner + '的设备',
+      owner: is1020 ? (yan ? yan.id : 'shared') : 'shared',
+      billing: is1020 ? 'team' : 'wear' }));
+    added++;
+  });
+  if (!added) { toast('两台已知机型都已在台账里', 'success'); return; }
+  save();
+  invalidateUsage();
+  renderPrinters();
+  toast('已登记 ' + added + ' 台已知机型，请补填价格与寿命页数', 'success');
+}
 function MN(id) { var m = getMember(id); return m ? m.name : id; }
 function MC(id) { var m = getMember(id); return m ? m.color : '#888'; }
 function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
@@ -1182,6 +1598,8 @@ function parseCents(n) { return Math.round((+n || 0) * 100); }
 function formatCents(c) { return ((+c || 0) / 100).toFixed(2); }
 function F(n) { return (n || 0).toFixed(2); }
 function RMB(cents) { return '¥' + formatCents(cents); }
+/* 金额为 0 时不带负号 —— 避免渲染出「−¥0.00」这种看着像 bug 的显示（v7.4 起折旧/按用量分摊常出现 0） */
+function RMBneg(cents) { return (+cents || 0) > 0 ? '−' + RMB(cents) : '¥0.00'; }
 /* 本地化文案：本地模式下把可见文本中的「云端」统一替换为「本地」（本地模式复用云端驾驶舱渲染）。
    参数为已拼好的 HTML 字符串，仅对用户可见文案生效；云端模式原样返回。 */
 function _lz(s) { return FINANCE_MODE === 'local' ? String(s).replace(/云端/g, '本地') : s; }
@@ -1267,7 +1685,12 @@ function financeUnlock(module, password) {
       return {
         ok: false, code: code,
         message: (res && res.message) || '解锁失败',
-        needsSetup: (code === 'needs_setup' || code === 'default_password'),
+        /* needsSetup 只认「这个模块还没有密码」。输入了**已被停用的默认/弱口令**（服务端
+           default_password）是另一件事：密码是设过的，只是这个值永远不许用 —— 两者混成一个
+           标志就会出现 2026-10-25 现场那对自相矛盾的提示（先「还没有设置密码」、紧接着
+           「所有模块都已设置密码」）。 */
+        needsSetup: (code === 'needs_setup'),
+        weakDefault: (code === 'default_password'),
       };
     });
 }
@@ -1396,7 +1819,13 @@ function apportionCents(pool, weights, members) {
   return out;
 }
 
-function calcMonth(m) {
+/* opts.usage（v7.4，可选）—— 该结算月的「实际出纸页数」统计，由 _usageForMonth() 产出：
+     { pages, pagesByMember:{mid:n}, pagesByMemberClient:{'mid|client_id':n},
+       pagesByClient:{client_id:n} }
+   不传（历史遗留调用/脚本）⇒ 完全走旧口径：均摊 + 零折旧，零回归。 */
+function calcMonth(m, opts) {
+  opts = opts || {};
+  var usage = opts.usage || null;
   var members = getMembers();
   var rate = getRate();
   var scoreCap = getScoreCap();
@@ -1435,10 +1864,158 @@ function calcMonth(m) {
   var servicePool = totalInc - investPool;
   var memberCount = members.length || 1;
 
+  /* ══════════ v7.4：采购分摊口径（均摊 / 按用量）+ 设备折旧 ══════════
+     ① 采购分摊：'equal' 老口径（每人 1/n）；'usage' 按各成员本月**实际出纸页数**的比例。
+        没有用量数据（未取到/当月零页）时**自动退回均摊**并标记 basisFallback，
+        绝不用 0 权重算出一堆 0 元应摊（那会让"本月盈亏"凭空多出全额采购）。
+     ② 设备折旧：每台在役打印机「本月它打的页数 × 每页成本」，按成员在这台机上的页数分摊
+        （Σ分摊 ≡ 该机折旧，整数分最大余数法）。折旧是**非现金成本**：它同时从账面盈亏
+        和实际盈亏里扣，但不参与"建议转账"（没有人该为此转账）—— 见 net 的注释。
+     ③ 页数归属不到成员（未绑定成员）的那部分折旧**不进任何人的账**，单独汇总为
+        depUnallocated，由「设备折旧」区块显式标注 —— 与 orphanPayerExp 同一处置原则。 */
+  var basis = getPurchaseBasis();
+  var usagePages = {}, usageTotal = 0;
+  if (usage && usage.pagesByMember) {
+    members.forEach(function (mem) { usagePages[mem.id] = Math.max(0, Math.round(+usage.pagesByMember[mem.id] || 0)); });
+  }
+  members.forEach(function (mem) { usageTotal += (usagePages[mem.id] || 0); });
+  var useUsage = (basis === 'usage') && usageTotal > 0;
+  var basisFallback = (basis === 'usage') && !useUsage;
+  var purchaseWeights = members.map(function (mem) { return useUsage ? (usagePages[mem.id] || 0) : 1; });
+
+  /* ══════════ v7.5：设备寿命消耗的两种计费方式（所有者 ≠ 接单设备） ══════════
+     ① team（团队共担）：机器钱没在「采购」里出现过（如 1020 是闫承翰自带的）⇒ 寿命消耗是
+        **团队成本**，按用量分摊到使用者，从账面与实际盈亏里各扣一次；它不是谁该付给谁的钱
+        （没有对手方）⇒ 不进「建议转账」。
+     ② wear（收损耗费）：购买款已由所有者**付过**（如 M232 三人均摊）⇒ 再当团队成本就是
+        **二次计费**。正确做法是「谁用谁出损耗费」：使用者按自己消耗的寿命价值，把
+        **其他所有者应得的那几份**付给他们（现金转账）。
+        · 所有者 = 共有（全体成员均等）或某个成员（个人所有：全额付给他）；
+        · 使用者自己那一份（s_i）是自己资产缩水，不产生现金；
+        · 使用者实际承担全额损耗；其他所有者收现后被自己的资产缩水抵平（净 0）；
+        · 这笔钱进 net（零和，Σ ≡ 0）、也进 B（本月已确定由使用者承担的成本），
+          C 通过真实转账体现 ⇒ 三条恒等式全部保持。 */
+  var depByMember = {}, depByPrinter = [], depTotal = 0, depUnallocated = 0, depPagesUnattributed = 0;
+  var wearByMember = {}, wearTransfers = [], wearTotal = 0, wearUnallocated = 0;
+  members.forEach(function (mem) {
+    depByMember[mem.id] = 0;
+    wearByMember[mem.id] = { cost: 0, pay: 0, recv: 0, own: 0 };
+  });
+  getDepreciablePrinters().forEach(function (p) {
+    /* v7.7：已结算的机器在这个月有冻结快照 ⇒ 页数 / 金额 / 分摊全用快照（不再看订单归属）；
+       其余（预估口径 / 累计中 / 结算前的月份）⇒ 老口径：本口径页数 × 每页成本。 */
+    var snap = (p.settled && p.settled.months) ? p.settled.months[m.key] : null;
+    var per = {}, pagesOnThis = 0, pagesAll = 0, costAll = 0, pagesOrphan = 0;
+    if (snap) {
+      members.forEach(function (mem) {
+        var n = Math.max(0, Math.round(+snap.byMember[mem.id] || 0));
+        if (n > 0) { per[mem.id] = n; pagesOnThis += n; }
+      });
+      pagesAll = Math.max(0, Math.round(+snap.pages || 0)) || pagesOnThis;
+      pagesOrphan = Math.max(0, pagesAll - pagesOnThis);
+      costAll = Math.max(0, Math.round(+snap.cents || 0));
+    } else {
+      members.forEach(function (mem) {
+        var n = (usage && usage.pagesByMemberPrinter && usage.pagesByMemberPrinter[mem.id + '|' + p.id]) || 0;
+        if (n > 0) { per[mem.id] = n; pagesOnThis += n; }
+      });
+      pagesAll = Math.round((usage && usage.pagesByPrinter && usage.pagesByPrinter[p.id]) || 0);
+      /* 该机上「归属不到成员」的页：机器确实打了纸、成本真实发生，但没人能承接 ⇒ 单列 */
+      pagesOrphan = Math.max(0, pagesAll - pagesOnThis);
+      costAll = printerDepCents(p, pagesAll);
+    }
+    /* 快照里的页数可能含已从名单移除的成员 ⇒ 未归属部分按页数比例从冻结金额里切出来。
+       这两笔（能分到人的 / 分不出去的）口径与老版完全一致：只有前者进团队盈亏，后者单列。 */
+    var orphanCost = snap
+      ? (pagesAll > 0 ? Math.round(costAll * pagesOrphan / pagesAll) : 0)
+      : printerDepCents(p, pagesOrphan);
+    var costOnThis = snap ? Math.max(0, costAll - orphanCost) : printerDepCents(p, pagesOnThis);
+
+    /* ── ② 收损耗费（购买款所有者已付过 ⇒ 团队不再承担） ── */
+    if (p.billing === 'wear') {
+      var pool = costOnThis;
+      var dAlloc = apportionCents(pool, members.map(function (mem) { return per[mem.id] || 0; }), members);
+      var owners = [];
+      if (p.owner && p.owner !== 'shared') {
+        var ownMem = getMember(p.owner);
+        if (ownMem) owners = [ownMem];
+      }
+      if (!owners.length) owners = members.slice();      // 共有 / 所有者已不在名单 = 全体成员均等
+      var ownersW = owners.map(function () { return 1; });
+      var thisTransfers = [];
+      members.forEach(function (mi) {
+        var di = dAlloc[mi.id] || 0;
+        if (di <= 0) return;
+        var isOwner = owners.some(function (o) { return o.id === mi.id; });
+        var ownSh = 0;
+        if (isOwner) ownSh = apportionCents(di, ownersW, owners)[mi.id] || 0;   // 自己那一份不付现金
+        var pay = di - ownSh;
+        wearByMember[mi.id].cost += di;
+        wearByMember[mi.id].own += ownSh;
+        if (pay <= 0) return;
+        var others = owners.filter(function (o) { return o.id !== mi.id; });
+        if (!others.length) { wearByMember[mi.id].own += pay; return; }   // 唯一所有者就是本人：全自己承担
+        var payAlloc = apportionCents(pay, others.map(function () { return 1; }), others);
+        var paidOut = 0;
+        others.forEach(function (oj) {
+          var amt = payAlloc[oj.id] || 0;
+          if (amt <= 0) return;
+          wearByMember[oj.id].recv += amt;
+          paidOut += amt;
+          var t = { from: mi.id, to: oj.id, amount: amt, kind: 'wear', printer: p.name, printerId: p.id };
+          thisTransfers.push(t);
+          wearTransfers.push(t);
+        });
+        wearByMember[mi.id].pay += paidOut;
+        /* 分配余数（整数分尾数）留给自己承担，绝不丢分、也不凭空多出一分 */
+        if (paidOut < pay) wearByMember[mi.id].own += (pay - paidOut);
+      });
+      wearTotal += pool;
+      wearUnallocated += orphanCost;
+      if (pagesAll > 0) {
+        depByPrinter.push({ id: p.id, name: p.name, client_id: p.client_id || '', price: +p.price || 0,
+                            life_pages: +p.life_pages || 0, unit: printerUnitYuan(p), billing: 'wear',
+                            life_mode: p.life_mode, measured: !!p.measured, frozen: !!snap,
+                            ownerIds: owners.map(function (o) { return o.id; }),
+                            pages: pagesAll, pagesByMember: per,
+                            cost: 0, costAll: costAll, wearCost: pool, wearTransfers: thisTransfers,
+                            unallocatedCost: Math.max(0, costAll - pool), unallocatedPages: pagesOrphan });
+      }
+      return;
+    }
+
+    /* ── ① 团队共担：按页计提团队折旧 ── */
+    var cost = costOnThis;
+    if (pagesOnThis > 0) {
+      var alloc = apportionCents(cost, members.map(function (mem) { return per[mem.id] || 0; }), members);
+      members.forEach(function (mem) { depByMember[mem.id] += alloc[mem.id] || 0; });
+    }
+    if (pagesAll > 0) {
+      /* cost = 能分摊到成员的部分（= 计入盈亏的折旧）；costAll = 整台机（含未归属页）的寿命消耗。
+         两者差额就是「机器磨掉了、但没人能承接」的那部分，单列展示、不进任何人的账。 */
+      depByPrinter.push({ id: p.id, name: p.name, client_id: p.client_id || '', price: +p.price || 0,
+                          life_pages: +p.life_pages || 0, unit: printerUnitYuan(p), billing: 'team',
+                          life_mode: p.life_mode, measured: !!p.measured, frozen: !!snap,
+                          pages: pagesAll, pagesByMember: per,
+                          cost: cost, costAll: costAll,
+                          unallocatedCost: Math.max(0, costAll - cost),
+                          unallocatedPages: pagesOrphan });
+    }
+    depTotal += cost;
+    depUnallocated += orphanCost;
+    depPagesUnattributed += pagesOrphan;
+  });
+  /* 损耗费净额（收 − 付）：零和，Σ ≡ 0 */
+  var wearNet = {};
+  members.forEach(function (mem) { wearNet[mem.id] = wearByMember[mem.id].recv - wearByMember[mem.id].pay; });
+  /* 用量里那些「认不出是哪台机打的」页 —— 只提示、不产生成本（没有单价就无从计提） */
+  var pagesUnregisteredPrinter = Math.round((usage && usage.unmatchedPrinterPages) || 0);
+
   /* 三处分摊一律走 apportionCents：Σ每人应摊 == totalExp、Σ投资回报 == investPool、
      Σ服务回报 == servicePool ⇒ Σnet == Σredist − totalExp − totalInc + totalExp == 0。
-     服务池按分值加权（等权时 → 均分），替掉原来的「各自 Math.round」。 */
-  var perPersonShare = apportionCents(totalExp, members.map(function () { return 1; }), members);
+     服务池按分值加权（等权时 → 均分），替掉原来的「各自 Math.round」。
+     采购池的权重由上面的 purchaseWeights 给出（均摊时全 1，等价旧口径）。 */
+  var perPersonShare = apportionCents(totalExp, purchaseWeights, members);
   var investReturn = apportionCents(investPool, members.map(function () { return 1; }), members);
   var serviceReturn = apportionCents(servicePool, members.map(function (mem) {
     return totalScore > 0 ? (scoreTotals[mem.id] || 0) : 1;
@@ -1447,12 +2024,18 @@ function calcMonth(m) {
   var redist = {};
   members.forEach(function (mem) { redist[mem.id] = investReturn[mem.id] + serviceReturn[mem.id]; });
 
-  var net = {};
+  /* 建议转账分两部分（两块各自 Σ ≡ 0，合起来仍是零和）：
+       · settleNet = 应得收入 − 采购应摊 − 代收 + 垫付（老口径；团队共担机的折旧不进这里 —— 没有对手方）
+       · wearNet   = 损耗费净额（共同出资机：别人用我那份机器我应收的补偿 − 我用别人那份应付的）
+     合并后的 net 才是「这个月该转出/入」的总额；转账指令也按这两组分别给出（别混成一笔配对）。 */
+  var settleNet = {};
   members.forEach(function (mem) {
-    net[mem.id] = redist[mem.id] - perPersonShare[mem.id] - parseCents(inc[mem.id] || 0) + (paid[mem.id] || 0);
+    settleNet[mem.id] = redist[mem.id] - perPersonShare[mem.id] - parseCents(inc[mem.id] || 0) + (paid[mem.id] || 0);
   });
+  var net = {};
+  members.forEach(function (mem) { net[mem.id] = settleNet[mem.id] + (wearNet[mem.id] || 0); });
 
-  var balances = members.map(function (m) { return { id: m.id, net: net[m.id] }; });
+  var balances = members.map(function (m) { return { id: m.id, net: settleNet[m.id] }; });
   // 转账阈值：1 分（整数分，≤ -1 分为欠款方，≥ 1 分为收款方）
   var payers = balances.filter(function (b) { return b.net <= -1; }).sort(function (a, b) { return a.net - b.net; });
   var receivers = balances.filter(function (b) { return b.net >= 1; }).sort(function (a, b) { return a.net - b.net; });
@@ -1464,12 +2047,14 @@ function calcMonth(m) {
     var debt = Math.abs(rem[payers[pi].id]);
     var credit = rem[receivers[ri].id];
     var amt = Math.min(debt, credit);
-    if (amt >= 1) transfers.push({ from: payers[pi].id, to: receivers[ri].id, amount: amt });
+    if (amt >= 1) transfers.push({ from: payers[pi].id, to: receivers[ri].id, amount: amt, kind: 'settle' });
     rem[payers[pi].id] += amt;
     rem[receivers[ri].id] -= amt;
     if (Math.abs(rem[payers[pi].id]) < 1) pi++;
     if (Math.abs(rem[receivers[ri].id]) < 1) ri++;
   }
+  /* 损耗费是**定向**的（使用者 → 其他所有者），不能进贪心配对 —— 直接追加在后面 */
+  wearTransfers.forEach(function (t) { transfers.push(t); });
 
   /* ── 实际转账（现金口径，v6.4） ────────────────────────────────────
      与上面「建议转账指令」不同：这是真的转了多少。决定「谁实际吃亏」。
@@ -1488,13 +2073,18 @@ function calcMonth(m) {
     transferTotal += amt;
   });
 
-  /* 实际盈亏 = 代收 + 实收转账 − 垫付 − 实付转账。
-     全部结清时它正好等于 redist − 每人应摊（账目盈亏）；
-     没结清时差额 = net −（实收 − 实付）= 还没结清的金额，正数=别人还欠他。 */
-  var actualNet = {}, actualPL = {}, settleGap = {};
+  /* 账面盈亏（应得）B_i = 应得收入 − 采购应摊 − 团队共担机折旧 + 损耗费净额
+        · 团队共担机折旧：非现金成本，直接扣（机器钱没进过采购账）；
+        · 损耗费净额：共同出资机的寿命消耗**不重复计团队成本**，只把"该谁付给谁"记在使用者头上
+          —— 使用者这项是负的（付出去了），其他所有者是正的（收到补偿），合计为 0。
+     实际盈亏（现金）C_i = 代收 + 实收转账 − 垫付 − 实付转账 − 团队共担机折旧。
+        损耗费不在 C 里另扣 —— 它已经作为**真实转账**（T_i）流过一遍，
+        这样「建议转账全部照做 ⇒ C_i = B_i」仍然成立。 */
+  var bookPL = {}, actualNet = {}, actualPL = {}, settleGap = {};
   members.forEach(function (mem) {
+    bookPL[mem.id] = redist[mem.id] - perPersonShare[mem.id] - (depByMember[mem.id] || 0) + (wearNet[mem.id] || 0);
     actualNet[mem.id] = recv[mem.id] - sent[mem.id];
-    actualPL[mem.id] = parseCents(inc[mem.id] || 0) - (paid[mem.id] || 0) + actualNet[mem.id];
+    actualPL[mem.id] = parseCents(inc[mem.id] || 0) - (paid[mem.id] || 0) + actualNet[mem.id] - (depByMember[mem.id] || 0);
     settleGap[mem.id] = net[mem.id] - actualNet[mem.id];   // 正=仍应收，负=已超付
   });
 
@@ -1502,7 +2092,17 @@ function calcMonth(m) {
            totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
            paid: paid, orphanPayerExp: orphanPayerExp, investPool: investPool, servicePool: servicePool, investReturn: investReturn, serviceReturn: serviceReturn,
            redist: redist, net: net, transfers: transfers, members: members, memberCount: memberCount, scoreCap: scoreCap,
-           sent: sent, recv: recv, transferTotal: transferTotal, actualNet: actualNet, actualPL: actualPL, settleGap: settleGap };
+           sent: sent, recv: recv, transferTotal: transferTotal, actualNet: actualNet, actualPL: actualPL, settleGap: settleGap,
+           /* v7.4 新增：分摊口径与用量、设备折旧 */
+           basis: basis, basisFallback: basisFallback, useUsage: useUsage,
+           purchaseWeights: purchaseWeights, usagePages: usagePages, usageTotal: usageTotal,
+           depByMember: depByMember, depByPrinter: depByPrinter, depTotal: depTotal,
+           depUnallocated: depUnallocated, depPagesUnattributed: depPagesUnattributed,
+           pagesUnregisteredPrinter: pagesUnregisteredPrinter,
+           bookPL: bookPL, settleNet: settleNet, wearNet: wearNet,
+           wearByMember: wearByMember, wearTransfers: wearTransfers,
+           wearTotal: wearTotal, wearUnallocated: wearUnallocated,
+           usage: usage };
 }
 
 /* ==================== 保存 ==================== */
@@ -1626,6 +2226,13 @@ function requestPassword(key, label) {
       if (r.needsSetup) {
         toast('⚠️ ' + (MODULE_NAMES[key] || key) + ' 还没有设置密码（默认密码已停用），请先设置新密码', 'error', true);
         openFinanceSetupModal();
+        return false;
+      }
+      /* 「敲了已被停用的默认/弱口令」≠「这个模块还没设密码」：模块其实有密码，走首次设置框
+         只会被服务端 already_configured 打回来（现场表现就是「还没有设置密码」+「所有模块
+         都已设置密码」两条自相矛盾的提示）。这里只给一条准确提示。 */
+      if (r.weakDefault) {
+        toast('❌ ' + (r.message || '这个密码已停用（旧默认/弱口令不能再用）') + '，请到「设置 → 敏感模块密码」设置新密码', 'error');
         return false;
       }
       toast('❌ ' + (r.message || '密码错误'), 'error');
@@ -1900,6 +2507,7 @@ function switchTab(name) {
   if (name === 'dash') renderDash();
   else if (name === 'entry') renderEntry();
   else if (name === 'cloud') { if (FINANCE_MODE === 'local') renderCloud(); else { renderCloud(); ensureCloudMonths(); } }
+  else if (name === 'printers') { renderPrinters(); if (FINANCE_MODE !== 'local') ensureCloudMonths(); }
   else if (name === 'history') renderHistory();
   else if (name === 'settings') renderSettings();
   else if (name === 'auth') renderAuth();
@@ -1910,12 +2518,13 @@ function renderCurrent() {
   if (currentTab === 'dash') renderDash();
   else if (currentTab === 'entry') renderEntry();
   else if (currentTab === 'cloud') renderCloud();
+  else if (currentTab === 'printers') renderPrinters();
   else if (currentTab === 'history') renderHistory();
   else if (currentTab === 'settings') renderSettings();
   else if (currentTab === 'auth') renderAuth();
   else if (currentTab === 'about') renderAbout();
 }
-function renderAll() { renderDash(); renderEntry(); renderCloud(); renderHistory(); renderSettings(); renderAuth(); renderAbout(); }
+function renderAll() { renderDash(); renderEntry(); renderCloud(); renderPrinters(); renderHistory(); renderSettings(); renderAuth(); renderAbout(); }
 
 /* ==================== 月份选择器 ==================== */
 function monthSelectHTML(id, selected) {
@@ -2078,7 +2687,7 @@ function ensureCloudMonths() {
   if (_cloudMonthsReady) return Promise.resolve(true);
   return loadCloudMonths().then(function (ok) {
     _cloudMonthsReady = ok;
-    renderCloud();
+    _renderScopeViews();      // 月份列表就绪 → 重绘当前口径页（云端数据 / 打印机折旧）
     return ok;
   });
 }
@@ -2135,7 +2744,7 @@ function fetchScopeData(force) {
   if (force) { _scopeCache = {}; _scopeFailedKey = null; }
   if (!force && _scopeDataKey === key && (_cloudData || _cloudLoading)) return;   // 当前口径已有数据或请求中
   if (!force && _scopeCache[key]) {                                               // 缓存命中
-    _cloudData = _scopeCache[key]; _scopeDataKey = key; renderCloud(); return;
+    _cloudData = _scopeCache[key]; _scopeDataKey = key; _renderScopeViews(); return;
   }
   var reqKey = key;
   var statuses = selectedStatuses();
@@ -2143,7 +2752,7 @@ function fetchScopeData(force) {
   _cloudLoading = true;
   _scopeDataKey = key;
   _cloudDataFetchedAt = null;   // 旧数据作废，等新数据返回后再显示同步时间
-  renderCloud();
+  _renderScopeViews();
   fetch('/api/proxy/admin/statistics/revenue?' + params, { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
     .then(function (data) {
@@ -2156,12 +2765,12 @@ function fetchScopeData(force) {
         _cloudDataFetchedAt = new Date().toTimeString().substring(0, 8);
         if (_scopeTime.mode === 'month') fetchCloudCompare(_scopeTime.month);   // 懒加载上月数据用于环比徽标（仅自然月口径）
       } else { _cloudData = null; _scopeFailedKey = reqKey; toast('❌ ' + ((data && data.message) || '查询失败'), 'error'); }
-      renderCloud();
+      _renderScopeViews();
     })
     .catch(function (err) {
       if (_scopeDataKey !== reqKey) return;
       _cloudLoading = false; _cloudData = null; _scopeFailedKey = reqKey;
-      toast('❌ 请求失败: ' + err.message, 'error'); renderCloud();
+      toast('❌ 请求失败: ' + err.message, 'error'); _renderScopeViews();
     });
 }
 
@@ -2307,11 +2916,11 @@ function _scopeSourcesLabel() {
 function _fetchScope(force) {
   return FINANCE_MODE === 'local' ? fetchLocalScopeData(force) : fetchScopeData(force);
 }
-function onScopeTimeChange(v) {
+function onScopeTimeChange(v, el) {
   if (v === 'r:custom') {
     // 无论当前是否已是自定义，都弹出日历：(原 return 会把"再次选自定义日期"挡住，
     // 且原生 select 重选同值不触发 onchange → 表现为点了没反应)
-    var anchor = document.getElementById('scopeTimeSel') ||
+    var anchor = el || document.getElementById('scopeTimeSel') ||
                  document.getElementById('scopeRangeStart');
     if (anchor) _calOpen('start', anchor);      // 弹日历选开始日期，选完结束日期自动应用
     return;
@@ -2324,12 +2933,12 @@ function onScopeTimeChange(v) {
   _ordersPage = 1;
   _fetchScope();
 }
-function onScopeDD(which) {
-  _ddOpen = _ddOpen === which ? null : which;
-  ['members', 'sources'].forEach(function (w) {
-    var p = document.getElementById('dd-' + w);
-    if (p) p.style.display = (_ddOpen === w ? 'block' : 'none');
-  });
+function onScopeDD(which, idp) {
+  var key = which + (idp || '');
+  _ddOpen = _ddOpen === key ? null : key;
+  $$('.dd-panel').forEach(function (p) { p.style.display = 'none'; });   // 两页各有一套浮层，一起收
+  var p = document.getElementById('dd-' + key);
+  if (p && _ddOpen === key) p.style.display = 'block';
 }
 function onScopeToggle(which, key, checked) {
   var opts = which === 'members' ? _memberOptions() : _SOURCE_OPTIONS;
@@ -2341,13 +2950,19 @@ function onScopeToggle(which, key, checked) {
   var next = Object.keys(cur).length >= opts.length ? null : cur;
   if (which === 'members') _scopeMembers = next; else _scopeSources = next;
   _ordersPage = 1;
-  renderCloud();
+  _renderScopeViews();
 }
 function onScopeSelectAll(which, selectAll) {
   var next = selectAll ? null : {};   // 清空=空集（无匹配数据，各模块展示空态）
   if (which === 'members') _scopeMembers = next; else _scopeSources = next;
   _ordersPage = 1;
-  renderCloud();
+  _renderScopeViews();
+}
+/* 口径变化后重绘「当前正在看的那个口径页」：云端数据与打印机折旧共用同一份口径状态
+   （_scopeTime/_scopeMembers/_scopeSources/_cloudData），谁在前台就只重绘谁。 */
+function _renderScopeViews() {
+  if (currentTab === 'printers') renderPrinters();
+  else renderCloud();
 }
 /* 点击口径栏下拉外部时收起（复选触发整页重渲染时 _ddOpen 保持，面板不丢展开状态） */
 document.addEventListener('click', function (e) {
@@ -2355,21 +2970,22 @@ document.addEventListener('click', function (e) {
   var t = e.target;
   if (t && t.closest && t.closest('.dd')) return;
   _ddOpen = null;
-  ['members', 'sources'].forEach(function (w) {
-    var p = document.getElementById('dd-' + w);
-    if (p) p.style.display = 'none';
-  });
+  $$('.dd-panel').forEach(function (p) { p.style.display = 'none'; });
 });
-/* 多选下拉（成员/来源共用）：trigger 按钮 + 浮层复选列表 */
-function _renderScopeDD(which) {
+/* 多选下拉（成员/来源共用）：trigger 按钮 + 浮层复选列表。
+   idp：口径栏多实例前缀 —— 「云端数据」页用 ''，「打印机折旧」页用 '-p'（两页共享同一份口径状态，
+   所以控件 id/浮层 id 必须各自唯一，否则 getElementById 只会命中先渲染的那一个）。 */
+function _renderScopeDD(which, idp) {
+  idp = idp || '';
   var isM = which === 'members';
   var opts = isM ? _memberOptions() : _SOURCE_OPTIONS;
   var sel = isM ? _scopeMembers : _scopeSources;
+  var key = which + idp;
   var btnTxt = sel ? ('已选 ' + Object.keys(sel).length + ' 项') : (isM ? '全部成员' : '全部来源');
   var h = '<div class="f-item"><label>' + (isM ? '👥 成员（可多选）' : '🧩 来源（可多选）') + '</label><div class="dd">';
-  h += '<button type="button" class="dd-btn' + (sel ? ' filtered' : '') + '" onclick="onScopeDD(\'' + which + '\')">' + esc(btnTxt) + ' <span class="dd-caret">▾</span></button>';
-  h += '<div class="dd-panel" id="dd-' + which + '" style="display:' + (_ddOpen === which ? 'block' : 'none') + '">';
-  h += '<div class="dd-head"><button type="button" onclick="onScopeSelectAll(\'' + which + '\',true)">全选</button><button type="button" onclick="onScopeSelectAll(\'' + which + '\',false)">清空</button></div>';
+  h += '<button type="button" class="dd-btn' + (sel ? ' filtered' : '') + '" onclick="onScopeDD(\'' + which + '\',\'' + idp + '\')">' + esc(btnTxt) + ' <span class="dd-caret">▾</span></button>';
+  h += '<div class="dd-panel" id="dd-' + key + '" style="display:' + (_ddOpen === key ? 'block' : 'none') + '">';
+  h += '<div class="dd-head"><button type="button" onclick="onScopeSelectAll(\'' + which + '\',true,\'' + idp + '\')">全选</button><button type="button" onclick="onScopeSelectAll(\'' + which + '\',false,\'' + idp + '\')">清空</button></div>';
   var lastGroup = null;
   opts.forEach(function (o) {
     if (isM && o.group && o.group !== lastGroup) { lastGroup = o.group; h += '<div class="dd-group">' + esc(o.group) + '</div>'; }
@@ -2384,13 +3000,15 @@ function _renderScopeDD(which) {
   h += '</div></div></div>';
   return h;
 }
-/* 口径栏：时间范围（月份/快捷区间/自定义）+ 成员多选 + 来源多选 + 同步/刷新 + 口径摘要行 */
-function _renderScopeBar(keys) {
+/* 口径栏：时间范围（月份/快捷区间/自定义）+ 成员多选 + 来源多选 + 同步/刷新 + 口径摘要行
+   idp 见 _renderScopeDD（'' = 云端数据页，'-p' = 打印机折旧页） */
+function _renderScopeBar(keys, idp) {
+  idp = idp || '';
   var range = _scopeRange();
   var t = _scopeTime;
-  var h = '<div class="scope-bar" id="scopeBar"><div class="scope-row">';
+  var h = '<div class="scope-bar" id="scopeBar' + idp + '"><div class="scope-row">';
   h += '<div class="f-item"><label>🗓 时间范围</label><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">';
-  h += '<select id="scopeTimeSel" onchange="onScopeTimeChange(this.value)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.9rem">';
+  h += '<select id="scopeTimeSel' + idp + '" class="scope-time-sel" onchange="onScopeTimeChange(this.value, this)" style="padding:8px 12px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.9rem">';
   h += '<optgroup label="按月结算">';
   keys.forEach(function (k) { h += '<option value="m:' + k + '"' + (t.mode === 'month' && t.month === k ? ' selected' : '') + '>' + labelOf(k) + '</option>'; });
   h += '</optgroup><optgroup label="任意区间">';
@@ -2404,13 +3022,13 @@ function _renderScopeBar(keys) {
   h += '</optgroup></select>';
   if (t.mode === 'custom') {
     var rangeTitle = '可查范围：' + _scopeMinDate() + ' ~ ' + todayStr() + '（点击选择日期）';
-    h += '<span class="date-field" id="scopeRangeStart" onclick="_calOpen(\'start\', this)" title="' + rangeTitle + '"><span class="cal-ico">📅</span><span class="df-txt' + (t.start ? '' : ' placeholder') + '">' + esc(t.start || '开始日期') + '</span></span>';
+    h += '<span class="date-field" id="scopeRangeStart' + idp + '" onclick="_calOpen(\'start\', this)" title="' + rangeTitle + '"><span class="cal-ico">📅</span><span class="df-txt' + (t.start ? '' : ' placeholder') + '">' + esc(t.start || '开始日期') + '</span></span>';
     h += '<span style="color:var(--muted)">~</span>';
-    h += '<span class="date-field" id="scopeRangeEnd" onclick="_calOpen(\'end\', this)" title="' + rangeTitle + '"><span class="cal-ico">📅</span><span class="df-txt' + (t.end ? '' : ' placeholder') + '">' + esc(t.end || '结束日期') + '</span></span>';
+    h += '<span class="date-field" id="scopeRangeEnd' + idp + '" onclick="_calOpen(\'end\', this)" title="' + rangeTitle + '"><span class="cal-ico">📅</span><span class="df-txt' + (t.end ? '' : ' placeholder') + '">' + esc(t.end || '结束日期') + '</span></span>';
   }
   h += '</div></div>';
-  h += _renderScopeDD('members');
-  if (FINANCE_MODE !== 'local') h += _renderScopeDD('sources');   // 本地模式全部为本地订单，无来源可选
+  h += _renderScopeDD('members', idp);
+  if (FINANCE_MODE !== 'local') h += _renderScopeDD('sources', idp);   // 本地模式全部为本地订单，无来源可选
   h += '<div class="f-item" style="margin-left:auto;text-align:right"><label>&nbsp;</label><div style="display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap">';
   if (_cloudDataFetchedAt) h += '<span style="font-size:.76rem;color:var(--muted)">☁ 最后同步 <b style="color:var(--text)">' + _cloudDataFetchedAt + '</b></span>';
   h += '<button class="btn" onclick="_fetchScope(true)">🔄 刷新</button></div></div>';
@@ -2452,7 +3070,7 @@ function _calInit() {
     if (div.contains(el)) return;
     // 豁免日期字段与「时间范围」下拉（二者都通过 onmousedown/onchange 触发日历，
     // 松开左键产生的 click 不应把刚弹出的日历关掉——否则表现为"按住出现、松开消失"）
-    if (el.closest && (el.closest('.date-field') || el.closest('#scopeTimeSel'))) return;
+    if (el.closest && (el.closest('.date-field') || el.closest('.scope-time-sel'))) return;
     _calClose();
   });
   window.addEventListener('scroll', function () { if (_cal.open) _calClose(); }, { passive: true });
@@ -2553,17 +3171,18 @@ function _calPick(ds) {
     onScopeCustomApply();   // 选完结束日期自动应用
   }
 }
-/* 同步工具栏两个日期字段的显示文本（不触发整页重渲染） */
+/* 同步工具栏两个日期字段的显示文本（不触发整页重渲染）。
+   两页各有一套口径栏 ⇒ 这里更新**所有**副本（id 前缀 '' / '-p'）。 */
 function _syncScopeDateFields() {
-  var s = $('#scopeRangeStart'), e = $('#scopeRangeEnd');
-  if (s) {
-    var t1 = s.querySelector('.df-txt');
-    if (t1) { t1.textContent = _scopeCustom.start || '选择日期'; t1.classList.toggle('placeholder', !_scopeCustom.start); }
-  }
-  if (e) {
-    var t2 = e.querySelector('.df-txt');
-    if (t2) { t2.textContent = _scopeCustom.end || '选择日期'; t2.classList.toggle('placeholder', !_scopeCustom.end); }
-  }
+  $$('.scope-bar .date-field').forEach(function (el) {
+    var id = el.id || '';
+    var isStart = id.indexOf('scopeRangeStart') === 0;
+    var isEnd = id.indexOf('scopeRangeEnd') === 0;
+    if (!isStart && !isEnd) return;
+    var v = isStart ? _scopeCustom.start : _scopeCustom.end;
+    var t = el.querySelector('.df-txt');
+    if (t) { t.textContent = v || '选择日期'; t.classList.toggle('placeholder', !v); }
+  });
 }
 /* 粒度判定（v5.9）：≤60 天按日（柱状图，每天一柱）；>60 天切片（固定最多 90 片，平滑折线图，v5.16 由 60 片调整），
    不再按月/年划分 —— 月度聚合会抹平月内波动，固定切片能保留更多变化趋势；
@@ -3252,6 +3871,7 @@ function applyOrderType(oid, type) {
     if (!(res && res.success)) { toast('❌ ' + ((res && res.message) || '订正失败'), 'error', true); return; }
     o.is_admin_print = (type === 'self');
     _scopeCache = {};   // 口径缓存整体失效（切回旧口径不该看到订正前的类型/金额）
+    invalidateUsage();  // v7.4：类型决定"这单算不算收益"，但页数统计与折旧也按订单集合现算 ⇒ 一并失效
     toast('✅ 订单 ' + (o.order_number || ('#' + oid)) + ' 类型已改为「' + _orderTypeLabel(type) + '」'
       + (type === 'self' ? '（不计入收益）' : '（计入收益）'), 'success');
     renderCloud();
@@ -3368,6 +3988,9 @@ function applyOrderStatus(oid, status) {
     o.status = status;
     (o.files || []).forEach(function (f) { f.status = status; });
     _scopeCache = {};   // 口径缓存整体失效：切回旧口径不该看到订正前状态（见函数头说明）
+    /* v7.4：用量与折旧只统计 status='sent' 的子任务，状态订正会改变"这个月用掉多少纸"，
+       缓存的用量必须一起作废，否则结算页会继续按订正前的页数计提折旧。 */
+    invalidateUsage();
     toast('✅ 订单 ' + (o.order_number || ('#' + oid)) + ' 状态已改为「' + statusLabel(status) + '」', 'success');
     renderCloud();
     _scrollToOffset('cloud-orders');
@@ -4184,13 +4807,145 @@ function _countByStatus(orders) {
   orders.forEach(function (o) { var s = o.status || 'unknown'; map[s] = (map[s] || 0) + 1; });
   return map;
 }
+/* ==================== v7.4：结算月「实际出纸页数」统计（用量） ====================
+   采购按用量分摊、设备折旧，都要知道「这个月每个人 / 每台机各打了多少页」。
+   数据源与「云端数据」页同源（云端 /api/proxy/admin/statistics/revenue、本地 /api/local/orders），
+   区间固定为**结算月**。只统计 `files[].status === 'sent'` 的子任务 —— 排队/失败/取消/放弃的
+   纸没出来（或有争议），不该算进"用纸量"。
+
+   缓存按**月份键**（不是区间键）：收支清算、历史记录、打印机区块三处共用一套。
+   取数失败只影响「按用量分摊 / 折旧」两项，页面其余照常 —— 并明确标注"未取到用量"，
+   绝不把失败当成 0 页（那会静默把口径退回均摊且折旧变 0，账看着对、其实错）。 */
+var _usageCache = {};      // 'YYYY-MM' -> usage
+var _usageLoading = {};    // 'YYYY-MM' -> true
+var _usageFailed = {};     // 'YYYY-MM' -> true
+var _usageWaiters = {};    // 'YYYY-MM' -> [cb]
+
+function _usageMonthRange(key) {
+  var y = +String(key || '').slice(0, 4), mo = +String(key || '').slice(5, 7);
+  if (!(y > 2000) || !(mo >= 1 && mo <= 12)) return null;
+  var last = new Date(y, mo, 0).getDate();
+  return { start: key + '-01', end: key + '-' + (last < 10 ? '0' + last : String(last)) };
+}
+function _usageEmpty(key) {
+  return { month: key || '', pages: 0, orders: 0, files: 0,
+           pagesByMember: {}, pagesByMemberPrinter: {}, pagesByPrinter: {},
+           unmatchedPrinterPages: 0, unattributedPages: 0, fetchedAt: '' };
+}
+function usageOfMonth(key) { return _usageCache[key] || null; }
+function usageStateOfMonth(key) {
+  if (_usageCache[key]) return 'ready';
+  if (_usageLoading[key]) return 'loading';
+  if (_usageFailed[key]) return 'failed';
+  return 'idle';
+}
+/* 单据页数：优先后端折算好的 total_pages（有效口径，含份数），缺字段才退回 有效页×份数 */
+function _filePagesOf(f) {
+  if (!f) return 0;
+  var n = +f.total_pages;
+  if (!(n >= 0)) n = (+f.effective_pages || +f.page_count || 0) * (+f.copies || 1);
+  return Math.max(0, Math.round(n || 0));
+}
+/* 订单数组 → 用量结构。打印机的归属统一走 printerForOrder()（绑定设备 → 已知机型 → 单机兜底），
+   认不出机器的页记入 unmatchedPrinterPages（不产生折旧，页面上显式提示）。 */
+function _usageFromOrders(orders) {
+  var u = _usageEmpty('');
+  (orders || []).forEach(function (o) {
+    var mk = _orderMemberKey(o);
+    var mid = mk.indexOf('member:') === 0 ? mk.slice(7) : '';
+    var cid = String(o.received_client || '');
+    var pages = 0, nf = 0;
+    (o.files || []).forEach(function (f) {
+      if ((f.status || '') !== 'sent') return;   // 只算真正打出来的子任务
+      pages += _filePagesOf(f); nf++;
+    });
+    if (!pages) return;
+    u.pages += pages; u.files += nf; u.orders += 1;
+    if (mid) u.pagesByMember[mid] = (u.pagesByMember[mid] || 0) + pages;
+    else u.unattributedPages += pages;
+    var bound = printerForOrder(o);
+    var p = bound;
+    if (!p) { u.unmatchedPrinterPages += pages; return; }
+    u.pagesByPrinter[p.id] = (u.pagesByPrinter[p.id] || 0) + pages;
+    if (mid) {
+      var k = mid + '|' + p.id;
+      u.pagesByMemberPrinter[k] = (u.pagesByMemberPrinter[k] || 0) + pages;
+    }
+  });
+  return u;
+}
+function _flushUsageWaiters(key) {
+  var list = _usageWaiters[key] || [];
+  delete _usageWaiters[key];
+  list.forEach(function (fn) { try { fn(_usageCache[key] || null); } catch (e) {} });
+}
+/* 取某月的用量（有缓存直接回调；并发只发一次请求；失败置 failed 并回调 null） */
+function ensureUsage(key, cb) {
+  if (!isMonthKey(key)) { if (cb) cb(null); return; }
+  if (_usageCache[key]) { if (cb) cb(_usageCache[key]); return; }
+  if (cb) (_usageWaiters[key] = _usageWaiters[key] || []).push(cb);
+  if (_usageLoading[key]) return;
+  var range = _usageMonthRange(key);
+  if (!range) return;
+  _usageLoading[key] = true;
+  _usageFailed[key] = false;
+  var url = FINANCE_MODE === 'local'
+    ? '/api/local/orders?start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end)
+    : '/api/proxy/admin/statistics/revenue?start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end);
+  fetch(url, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      _usageLoading[key] = false;
+      if (data && data.success && data.data) {
+        var u = _usageFromOrders(data.data.orders || []);
+        u.month = key;
+        u.fetchedAt = new Date().toTimeString().substring(0, 8);
+        _usageCache[key] = u;
+      } else { _usageFailed[key] = true; }
+      _flushUsageWaiters(key);
+    })
+    .catch(function () { _usageLoading[key] = false; _usageFailed[key] = true; _flushUsageWaiters(key); });
+}
+/* 逐月补取（历史记录一次要看多个月）：串行，取完再回调，避免一次性打十几个请求 */
+function ensureUsageMany(keys, cb) {
+  var list = (keys || []).filter(function (k) { return isMonthKey(k) && !_usageCache[k] && !_usageFailed[k]; });
+  if (!list.length) { if (cb) cb(); return; }
+  var i = 0;
+  (function next() {
+    if (i >= list.length) { if (cb) cb(); return; }
+    ensureUsage(list[i++], function () { next(); });
+  })();
+}
+function invalidateUsage(key) {
+  if (key) {
+    delete _usageCache[key]; delete _usageFailed[key];
+    /* 区间缓存 / 累计读数是跨月的聚合，没法按单月精确失效 ⇒ 一律清掉（下次用到时重取） */
+    _rangeOrdersCache = {}; _cumCache = {};
+  } else { _usageCache = {}; _usageFailed = {}; _rangeOrdersCache = {}; _cumCache = {}; }
+}
+/* 结算用的唯一入口：给 calcMonth 带上该月的用量（没有就照旧口径，零回归） */
+function calcMonthWithUsage(key) {
+  return calcMonth(monthFromRecords(key), { usage: usageOfMonth(key) });
+}
+/* 用量取数失败后的手动重试（页面上红条上的「重试」按钮） */
+function retryUsage() {
+  _usageFailed[currentKey] = false;
+  renderDash();
+}
+
 /* ==================== TAB: 收支清算 ==================== */
 function renderDash() {
   var el = $('#tab-dash');
   var keys = allMonthKeys();
   if (!keys.includes(currentKey)) currentKey = keys[keys.length - 1] || currentMonthKey();
   var m = monthFromRecords(currentKey);
-  var r = calcMonth(m);
+  var r = calcMonthWithUsage(currentKey);
+  /* 用量（按用量分摊 / 设备折旧）按需拉取：首次进入或换月取一次，取回后就地重绘。
+     失败不重试（避免打满请求），页面照旧可用并显式标注"未取到用量"。 */
+  if (usageStateOfMonth(currentKey) === 'idle') {
+    var _uKey = currentKey;
+    ensureUsage(_uKey, function () { if (currentTab === 'dash' && currentKey === _uKey) renderDash(); });
+  }
   var hasData = (m.expenses.length + (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + (STORE.records.scores || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + m.transfers.length) > 0;
 
   // v4.2：无成员空态 —— 引导到「设置」添加成员（订单归属/收支结算的前提）
@@ -4215,17 +4970,36 @@ function renderDash() {
   }
 
   // KPI（data-count 为整数分，countUp 显示时 ÷100）
+  /* 本月盈亏（团队）= Σ(应得收入 − 采购应摊 − 设备折旧)。折旧是非现金成本，必须在这里扣掉，
+     否则"赚了多少"会虚高（打印机越用越旧，那部分价值是实打实消耗掉的）。 */
   var totalPL = 0;
-  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPersonShare[mem.id]; });
+  getMembers().forEach(function (mem) { totalPL += (r.bookPL[mem.id] || 0); });
+  var basisLabel = r.useUsage
+    ? ('按用量分摊 · 共 ' + r.usageTotal + ' 页')
+    : (r.basis === 'usage' ? '均摊（未取到用量）' : ('均摊 · ' + r.memberCount + ' 人'));
   h += '<div class="kpi-grid">';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">🧾</div><div class="num" data-count="' + r.totalExp + '" data-prefix="¥">0</div><div class="lbl">采购支出</div><div class="sub">人均 ' + RMB(r.perPerson) + '</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">🧾</div><div class="num" data-count="' + r.totalExp + '" data-prefix="¥">0</div><div class="lbl">采购支出</div><div class="sub">' + basisLabel + '</div></div>';
   h += '<div class="kpi-card c-green"><div class="kpi-ico">💵</div><div class="num" data-count="' + r.totalInc + '" data-prefix="¥">0</div><div class="lbl">代收总额</div><div class="sub">' + r.memberCount + ' 人均摊投资回报</div></div>';
-  h += '<div class="kpi-card ' + (totalPL >= 0 ? 'c-green' : 'c-red') + '"><div class="kpi-ico">📈</div><div class="num" data-count="' + totalPL + '" data-prefix="¥">0</div><div class="lbl">本月盈亏</div><div class="sub">' + (totalPL >= 0 ? '盈利' : '亏损') + '</div></div>';
+  h += '<div class="kpi-card ' + (totalPL >= 0 ? 'c-green' : 'c-red') + '"><div class="kpi-ico">📈</div><div class="num" data-count="' + totalPL + '" data-prefix="¥">0</div><div class="lbl">本月盈亏</div><div class="sub">' + (totalPL >= 0 ? '盈利' : '亏损') + (r.depTotal > 0 ? ' · 已扣折旧 ' + RMB(r.depTotal) : '') + '</div></div>';
   h += '<div class="kpi-card c-orange"><div class="kpi-ico">⭐</div><div class="num">' + r.totalScore + '</div><div class="lbl">服务总分</div><div class="sub">上限 ' + r.scoreCap + ' 分/项</div></div>';
   h += '</div>';
 
-  // 采购明细
-  h += '<div class="section"><h2>🧾 采购明细 <span class="hint">(' + r.memberCount + ' 人均摊)</span></h2><div class="table-wrap"><table><thead><tr><th class="l">项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
+  /* 用量统计状态条：没取到就明说（绝不假装 0 页 —— 那会把折旧静默变成 ¥0、把按用量
+     静默退回均摊，账面看着"正常"其实错了） */
+  var ustate = usageStateOfMonth(currentKey);
+  if (ustate === 'loading') {
+    h += '<div class="alert-banner"><span class="msg">⏳ 正在统计「' + m.label + '」的实际出纸页数（用量）—— 按用量分摊与设备折旧随后自动刷新。</span></div>';
+  } else if (ustate === 'failed') {
+    h += '<div class="alert-banner" style="border-left-color:var(--neg)"><span class="msg">⚠️ 未取到「' + m.label + '」的用量统计：本月<b>设备折旧按 ¥0 计</b>'
+      + (r.basis === 'usage' ? '、采购分摊已临时退回均摊' : '')
+      + '。<span class="sub">（口径不会被写死，重试成功后自动改为真实值）</span></span><button class="btn sm" onclick="retryUsage()">重试</button></div>';
+  } else if (r.basis === 'usage' && r.basisFallback) {
+    h += '<div class="alert-banner"><span class="msg">ℹ️ 已选「按用量分摊」，但本月用量为 0 页 ⇒ 本次按均摊计算。'
+      + '<span class="sub">录了订单 / 绑定成员后会自动改回按用量。</span></span></div>';
+  }
+
+  // 采购明细（v7.4：分摊口径 = 均摊 / 按用量，比例与应摊额单列一张表）
+  h += '<div class="section"><h2>🧾 采购明细 <span class="hint">(' + esc(basisLabel) + ')</span></h2><div class="table-wrap"><table><thead><tr><th class="l">项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
   var _expMemberSet = {};
   getMembers().forEach(function (mem) { _expMemberSet[mem.id] = true; });
   (m.expenses || []).forEach(function (e) {
@@ -4234,10 +5008,89 @@ function renderDash() {
     h += '<tr' + (orphan ? ' style="opacity:.55"' : '') + '><td class="l">' + esc(e.item) + '</td><td>' + RMB(parseCents(e.amount)) + '</td><td><span class="member-tag" style="background:' + sanitizeColor(MC(e.payer)) + '">' + esc(MN(e.payer)) + '</span>' + (orphan ? ' <span class="tag b">未纳入结算</span>' : '') + '</td></tr>';
   });
   if (r.orphanPayerExp > 0) {
-    h += '<tr><td class="l" style="color:var(--muted)">其中：已删除成员垫付</td><td style="color:var(--muted)">' + RMB(r.orphanPayerExp) + '</td><td style="color:var(--muted)">无人可收，不计入均摊</td></tr>';
+    h += '<tr><td class="l" style="color:var(--muted)">其中：已删除成员垫付</td><td style="color:var(--muted)">' + RMB(r.orphanPayerExp) + '</td><td style="color:var(--muted)">无人可收，不计入' + (r.useUsage ? '分摊' : '均摊') + '</td></tr>';
   }
-  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalExp) + '</td><td>人均 ' + RMB(r.perPerson) + '</td></tr>';
-  h += '</tbody></table></div></div>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalExp) + '</td><td>' + (r.useUsage ? '按用量比例' : '人均 ' + RMB(r.perPerson)) + '</td></tr>';
+  h += '</tbody></table></div>';
+
+  /* 采购分摊明细：谁该出多少（按用量时给出 用量 / 占比；均摊时给出 1/n） */
+  h += '<div style="font-weight:700;margin:16px 0 8px">按' + (r.useUsage ? '用量' : '人头') + '分摊到人</div>';
+  h += '<div class="table-wrap"><table><thead><tr><th></th><th>本月出纸页数</th><th>分摊比例</th><th>应摊采购</th></tr></thead><tbody>';
+  var _mw = 0;
+  getMembers().forEach(function (mem) { _mw += (r.useUsage ? (r.usagePages[mem.id] || 0) : 1); });
+  getMembers().forEach(function (mem) {
+    var w = r.useUsage ? (r.usagePages[mem.id] || 0) : 1;
+    var ratio = _mw > 0 ? (w / _mw * 100) : 0;
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
+    h += '<td>' + (r.useUsage ? (r.usagePages[mem.id] || 0) + ' 页' : '<span style="color:var(--muted)">—</span>') + '</td>';
+    h += '<td>' + ratio.toFixed(1) + '%</td>';
+    h += '<td class="neg" style="font-weight:700">' + RMBneg(r.perPersonShare[mem.id]) + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td>' + (r.useUsage ? r.usageTotal + ' 页' : '—') + '</td><td>100%</td><td>−' + RMB(r.totalExp) + '</td></tr>';
+  h += '</tbody></table></div>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
+    + (r.useUsage
+        ? '「用量」= 本月<b>实际出纸页数</b>（只算已完成的子任务，含自打 / 免费单 —— 纸确实用掉了）。口径可在「设置 → 采购分摊」里改为均摊。'
+        : '当前为均摊口径。想按各人实际用纸比例出钱 → 「设置 → 采购分摊」切成<b>按用量</b>。')
+    + (r.usage && r.usage.unattributedPages > 0 ? ' 另有 <b>' + r.usage.unattributedPages + ' 页</b>未归属成员（订单没绑定到成员），未计入任何人的用量。' : '')
+    + '</div></div>';
+
+  /* ── v7.4：设备折旧（消耗品寿命成本） ─────────────────────────────
+     每台机「本月它打的页数 × 每页成本（价格 ÷ 寿命页数）」= 本月折旧；
+     折旧按成员在这台机上的页数分摊（整数分、Σ分摊 ≡ 该机折旧）。 */
+  h += '<div class="section"><h2>🖨️ 设备折旧 <span class="hint">（打印机是消耗品：本月消耗的寿命价值 · 每台机按自己的「团队共担 / 收损耗费」结算）</span></h2>';
+  if (!getPrinters().length) {
+    h += '<div style="color:var(--muted);font-size:.85rem">还没有登记打印机。到 <b>「🖨️ 打印机折旧」→「🖨️ 打印机台账」</b> 里录入机器（名称 / 价格 / 寿命页数 / 归属与计费），折旧才会开始计提。</div></div>';
+  } else {
+    h += '<div class="table-wrap"><table><thead><tr><th>打印机</th><th>所有者 / 计费</th><th>本月页数</th><th>每页成本</th><th>本月成本</th><th>归属 / 补偿</th></tr></thead><tbody>';
+    if (!r.depByPrinter.length) {
+      h += '<tr><td colspan="6" style="color:var(--muted)">本月这些机器没有统计到出纸页数（订单未归属 / 未取到用量）。</td></tr>';
+    }
+    r.depByPrinter.forEach(function (d) {
+      var who = getMembers().filter(function (mem) { return (d.pagesByMember[mem.id] || 0) > 0; })
+        .map(function (mem) { return esc(mem.name) + ' ' + d.pagesByMember[mem.id] + ' 页'; }).join(' · ');
+      var ownerTxt = (d.billing === 'wear')
+        ? (d.ownerIds && d.ownerIds.length === 1 ? esc(MN(d.ownerIds[0])) + ' 个人所有' : '共有（全体均等）')
+        : '团队共担';
+      h += '<tr><td style="font-weight:700">' + esc(d.name) + '</td>';
+      h += '<td style="font-size:.8rem">' + ownerTxt
+        + '<div style="font-size:.7rem;color:var(--muted)">' + (d.billing === 'wear' ? '收损耗费（已付过款的机器）' : '折旧计入团队成本') + '</div></td>';
+      h += '<td>' + d.pages + ' 页' + (d.unallocatedPages > 0 ? '<div style="font-size:.72rem;color:var(--orange)">含 ' + d.unallocatedPages + ' 页未归属成员</div>' : '') + '</td>';
+      h += '<td>' + (d.life_pages > 0
+        ? '¥' + d.unit.toFixed(4)
+        : (d.measured || d.life_mode === 'accumulate'
+            ? '<span style="color:var(--muted)" title="累计实测模式：报废结算后才有每页成本">累计中</span>'
+            : '<span style="color:var(--neg)">寿命未填</span>')) + '</td>';
+      if (d.billing === 'wear') {
+        h += '<td class="neg" style="font-weight:700">' + RMBneg(d.wearCost) + '<div style="font-size:.7rem;color:var(--muted);font-weight:400">损耗费（不进团队成本）</div></td>';
+        h += '<td style="font-size:.8rem">' + (d.wearTransfers && d.wearTransfers.length
+          ? d.wearTransfers.map(function (t) { return esc(MN(t.from)) + ' → ' + esc(MN(t.to)) + ' ' + RMB(t.amount); }).join('<br>')
+          : '<span style="color:var(--muted)">无需补偿（使用者就是唯一所有者）</span>') + '</td>';
+      } else {
+        h += '<td class="neg" style="font-weight:700">' + RMBneg(d.cost)
+          + (d.unallocatedCost > 0 ? '<div style="font-size:.7rem;color:var(--orange);font-weight:400">另有 ' + RMB(d.unallocatedCost) + ' 未归属成员</div>' : '') + '</td>';
+        h += '<td style="font-size:.8rem">' + (who || '<span style="color:var(--muted)">—</span>') + (d.pages > 0 && d.life_pages > 0 ? '<div style="font-size:.72rem;color:var(--muted)">已耗寿命 ' + ((d.pages / d.life_pages) * 100).toFixed(1) + '%</div>' : '') + '</td>';
+      }
+      h += '</tr>';
+    });
+    var _teamPages = r.depByPrinter.reduce(function (sum, d) { return sum + d.pages; }, 0);
+    h += '<tr class="tfoot"><td>合计</td><td></td><td>' + _teamPages + ' 页</td><td>—</td><td>' + RMBneg(r.depTotal)
+      + (r.wearTotal > 0 ? '<div style="font-size:.7rem;color:var(--muted);font-weight:400">另有损耗费 ' + RMB(r.wearTotal) + '</div>' : '')
+      + '</td><td></td></tr>';
+    h += '</tbody></table></div>';
+    h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
+      + '每页成本 = 价格 ÷ 寿命页数；对<b>在役</b>机器计提（退役机不再打新页，不计提）。<br>'
+      + '· <b>累计实测</b>（台账里寿命栏显示「累计中」）：总寿命还没结算 ⇒ <b>暂不计提</b>，'
+      + '机器报废时点「💥 结算」，那几个月的折旧会一次性回溯进各自的月份（金额与分摊冻结在快照里，'
+      + '之后改订单归属也不会变）。<br>'
+      + '两种计费方式：<br>'
+      + '· <b>团队共担</b>：折旧是团队成本（非现金），按用量分摊到使用者，从「经营损益 / 实际盈亏」里扣，不进转账；<br>'
+      + '· <b>收损耗费</b>：购买款所有者已付过（如 M232 三人均摊），团队不再重复承担；使用者把自己消耗的寿命价值中'
+      + '<b>属于别人的那份</b>付给所有者（自己那一份是自己资产缩水，不产生现金），这笔钱进「资金重分配」的损耗费组。'
+      + (r.depUnallocated > 0 ? '<br>⚠ 另有 <b>' + RMB(r.depUnallocated) + '</b>（' + r.depPagesUnattributed + ' 页）因订单未归属成员而未分摊到人，未计入团队盈亏。' : '')
+      + (r.pagesUnregisteredPrinter > 0 ? '<br>⚠ 有 <b>' + r.pagesUnregisteredPrinter + ' 页</b>认不出是哪台机打的（订单未指定打印机），未计提。' : '')
+      + '</div></div>';
+  }
 
   // 收入分配
   var rpct = (r.rate * 100).toFixed(1);
@@ -4262,18 +5115,28 @@ function renderDash() {
   h += '</tbody></table></div>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">差额 = 应得收入 − 实际代收（正=补足，负=分给别人）。投资/服务比例可在「设置」中调整。</div></div>';
 
-  // 经营损益
-  h += '<div class="section"><h2>📊 经营损益 <span class="hint">（本月每人实际赚/亏）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>应得收入</th><th>− 均摊支出</th><th>= 本月盈亏</th></tr></thead><tbody>';
+  // 经营损益（v7.5：应得收入 − 采购应摊 − 团队机折旧 ± 损耗费 = 本月盈亏）
+  var wearSum = 0;
+  getMembers().forEach(function (mem) { wearSum += (r.wearNet[mem.id] || 0); });
+  h += '<div class="section"><h2>📊 经营损益 <span class="hint">（本月每人实际赚/亏 · 已扣折旧，含损耗费收付）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>应得收入</th><th>− 采购应摊</th><th>− 设备折旧</th><th>± 损耗费</th><th>= 本月盈亏</th></tr></thead><tbody>';
   getMembers().forEach(function (mem) {
-    var pl = r.redist[mem.id] - r.perPersonShare[mem.id];
+    var dep = r.depByMember[mem.id] || 0;
+    var wear = r.wearNet[mem.id] || 0;
+    var pl = r.bookPL[mem.id] || 0;
     var tag = pl >= 0 ? '<span class="tag g">盈利</span>' : '<span class="tag r">亏损</span>';
     h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td>' + RMB(r.redist[mem.id]) + '</td>';
     h += '<td class="neg">−' + RMB(r.perPersonShare[mem.id]) + '</td>';
+    h += '<td class="neg">' + RMBneg(dep) + '</td>';
+    h += '<td class="' + (wear > 0 ? 'pos' : (wear < 0 ? 'neg' : '')) + '">' + (wear > 0 ? '+' : '') + RMB(wear) + '</td>';
     h += '<td class="' + (pl >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (pl >= 0 ? '+' : '') + RMB(pl) + ' ' + tag + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>−' + RMB(r.totalExp) + '</td><td class="' + (totalPL >= 0 ? 'pos' : 'neg') + '">' + (totalPL >= 0 ? '+' : '') + RMB(totalPL) + '</td></tr>';
-  h += '</tbody></table></div></div>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>−' + RMB(r.totalExp) + '</td><td>' + RMBneg(r.depTotal || 0)
+    + '</td><td>' + RMB(wearSum) + '</td><td class="' + (totalPL >= 0 ? 'pos' : 'neg') + '">' + (totalPL >= 0 ? '+' : '') + RMB(totalPL) + '</td></tr>';
+  h += '</tbody></table></div>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">「± 损耗费」只有<b>收损耗费</b>的机器才有：'
+    + '使用者为消耗掉的他人份额付钱（负数），所有者收到补偿（正数）—— 这一列合计恒为 0，不影响团队盈亏。'
+    + '团队共担的机器折旧不产生这列数字（没有对手方）。</div></div>';
 
   // 垫付清算
   h += '<div class="section"><h2>💳 垫付清算 <span class="hint">（谁多垫了、谁少垫了）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>实际代付</th><th>− 应均摊</th><th>= 垫付差额</th></tr></thead><tbody>';
@@ -4291,27 +5154,48 @@ function renderDash() {
   h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(r.totalExp) + '</td><td>−' + RMB(r.totalExp) + '</td><td>' + (advSum > 0 ? '+' : '') + RMB(advSum) + '</td></tr>';
   h += '</tbody></table></div></div>';
 
+  /* 📐 结算公式（只展示，v7.3）—— 放在「资金重分配」之前：先讲清算式，再看具体的转账指令。
+     默认收起（open=false）：日常看数时它只占一行，不挤占 KPI 与表格的视线。 */
+  h += '<div id="dashFormula">' + settleFormulaHTML(r, false) + '</div>';
+
   // 资金重分配
   h += '<div class="settle-box"><h2>🔄 资金重分配 <span class="hint">（建议转账指令 · 按账面算，不代表真的转了）</span></h2>';
-  h += '<div class="table-wrap"><table style="margin-bottom:14px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>= 应转出/入</th></tr></thead><tbody>';
+  h += '<div class="table-wrap"><table style="margin-bottom:14px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>± 损耗费</th><th>= 应转出/入</th></tr></thead><tbody>';
   getMembers().forEach(function (mem) {
     var incomeAdj = r.redist[mem.id] - parseCents((m.income || {})[mem.id] || 0);
     var adv = (r.paid[mem.id] || 0) - r.perPersonShare[mem.id];
-    var transfer = incomeAdj + adv;
+    var wear = r.wearNet[mem.id] || 0;
+    var transfer = incomeAdj + adv + wear;
     h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td class="' + (incomeAdj >= 0 ? 'pos' : 'neg') + '">' + (incomeAdj >= 0 ? '+' : '') + RMB(incomeAdj) + '</td>';
     h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '">' + (adv >= 0 ? '+' : '') + RMB(adv) + '</td>';
+    h += '<td class="' + (wear >= 0 ? 'pos' : 'neg') + '">' + (wear > 0 ? '+' : '') + RMB(wear) + '</td>';
     h += '<td class="' + (transfer >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (transfer >= 0 ? '+' : '') + RMB(transfer) + '</td></tr>';
   });
   h += '</tbody></table></div>';
+  var _settleT = r.transfers.filter(function (t) { return t.kind !== 'wear'; });
+  var _wearT = r.transfers.filter(function (t) { return t.kind === 'wear'; });
   if (r.transfers.length > 0) {
-    h += '<div style="font-weight:700;margin-bottom:8px;color:var(--orange)">转账指令：</div>';
-    r.transfers.forEach(function (t) {
-      h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
-      h += ' <span class="arrow">→</span> ';
-      h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
-      h += ' <span class="amount">' + RMB(t.amount) + '</span></div>';
-    });
+    if (_settleT.length) {
+      h += '<div style="font-weight:700;margin-bottom:8px;color:var(--orange)">① 结算转账（多垫的收、少垫的付）：</div>';
+      _settleT.forEach(function (t) {
+        h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
+        h += ' <span class="arrow">→</span> ';
+        h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
+        h += ' <span class="amount">' + RMB(t.amount) + '</span></div>';
+      });
+    }
+    if (_wearT.length) {
+      h += '<div style="font-weight:700;margin:14px 0 8px;color:var(--orange)">② 损耗费（用了别人的机器，把他们的那份付给他们）：</div>';
+      _wearT.forEach(function (t) {
+        h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
+        h += ' <span class="arrow">→</span> ';
+        h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
+        h += ' <span class="amount">' + RMB(t.amount) + '</span>';
+        if (t.printer) h += ' <span style="font-size:.76rem;color:var(--muted)">' + esc(t.printer) + '</span>';
+        h += '</div>';
+      });
+    }
   } else {
     h += '<div style="color:var(--muted)">✅ 收支平衡，无需转账</div>';
   }
@@ -4376,7 +5260,8 @@ function transferGapChipsHTML(m, r, disabledAttr) {
     h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
     h += '<span class="arrow" style="color:var(--muted)">→</span>';
     h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
-    h += '<span style="font-size:.86rem">建议 ' + RMB(t.amount) + ' · 已转 <b>' + RMB(done) + '</b></span>';
+    h += '<span style="font-size:.86rem">' + (t.kind === 'wear' ? '<span class="tag b">损耗费</span> ' : '')
+      + '建议 ' + RMB(t.amount) + ' · 已转 <b>' + RMB(done) + '</b></span>';
     h += (left > 1 ? '<span class="tag y">还差 ' + RMB(left) + '</span>' : '<span class="tag g">已结清</span>') + '<span style="width:12px"></span>';
   });
   h += '</div>';
@@ -4389,12 +5274,13 @@ function realPLSectionHTML(m, r, totalPL) {
   getMembers().forEach(function (mem) { totalActual += r.actualPL[mem.id]; });
   var signed = function (c) { return (c > 0 ? '+' : '') + RMB(c); };
   var spend = function (c) { return (c > 0 ? '−' : '') + RMB(c); };
-  var h = '<div class="section"><h2>💰 实际盈亏 <span class="hint">（现金口径：代收 + 实收转账 − 垫付 − 实付转账）</span></h2>';
-  h += '<div class="table-wrap"><table><thead><tr><th></th><th>代收</th><th>+ 实收转账</th><th>− 垫付</th><th>− 实付转账</th><th>= 实际盈亏</th><th>应得盈亏</th><th>差额（未结清）</th></tr></thead><tbody>';
+  var h = '<div class="section"><h2>💰 实际盈亏 <span class="hint">（现金口径：代收 + 实收转账 − 垫付 − 实付转账 − 设备折旧）</span></h2>';
+  h += '<div class="table-wrap"><table><thead><tr><th></th><th>代收</th><th>+ 实收转账</th><th>− 垫付</th><th>− 实付转账</th><th>− 设备折旧</th><th>= 实际盈亏</th><th>应得盈亏</th><th>差额（未结清）</th></tr></thead><tbody>';
   var gapSum = 0;   // 合计行的「差额（未结清）」改为**逐行求和**（旧写法硬编码 0）
   getMembers().forEach(function (mem) {
     var aPL = r.actualPL[mem.id];
-    var nPL = r.redist[mem.id] - r.perPersonShare[mem.id];
+    var dep = r.depByMember[mem.id] || 0;
+    var nPL = r.redist[mem.id] - r.perPersonShare[mem.id] - dep;
     var gap = r.settleGap[mem.id];
     gapSum += gap;
     var tag3 = gap > 1 ? '<span class="tag g">还应收 ' + RMB(gap) + '</span>' : (gap < -1 ? '<span class="tag r">已超付 ' + RMB(-gap) + '</span>' : '<span class="tag b">已结清</span>');
@@ -4403,14 +5289,221 @@ function realPLSectionHTML(m, r, totalPL) {
     h += '<td class="pos">' + signed(r.recv[mem.id]) + '</td>';
     h += '<td class="neg">' + spend(r.paid[mem.id] || 0) + '</td>';
     h += '<td class="neg">' + spend(r.sent[mem.id]) + '</td>';
+    h += '<td class="neg">' + spend(dep) + '</td>';
     h += '<td class="' + (aPL >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + signed(aPL) + '</td>';
     h += '<td style="color:var(--muted)">' + signed(nPL) + '</td>';
     h += '<td>' + tag3 + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>' + signed(r.transferTotal) + '</td><td>' + spend(r.totalExp) + '</td><td>' + spend(r.transferTotal) + '</td>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>' + signed(r.transferTotal) + '</td><td>' + spend(r.totalExp) + '</td><td>' + spend(r.transferTotal) + '</td><td>' + spend(r.depTotal || 0) + '</td>';
   h += '<td class="' + (totalActual >= 0 ? 'pos' : 'neg') + '">' + signed(totalActual) + '</td><td>' + signed(totalPL) + '</td><td>' + signed(gapSum) + '</td></tr>';
   h += '</tbody></table></div>';
-  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">实际盈亏 = 这个月他<b>真正</b>拿到的钱减真正掏出去的钱（转账是成员内部的钱，合计为 0，不影响团队总盈亏）。<br>全部结清时「实际盈亏」= 「应得盈亏」；没结清时差额就是<b>还没到位的钱</b> —— 差额为正的人被欠着，团队亏损实际由他垫着。</div></div>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">实际盈亏 = 这个月他<b>真正</b>拿到的钱减真正掏出去的钱，再扣掉自己用掉的<b>设备寿命价值</b>（折旧是非现金成本：机器早已买好，本月没有现金流出，但它确实被磨掉了）。<br>转账是成员内部的钱，合计为 0，不影响团队总盈亏。全部结清时「实际盈亏」= 「应得盈亏」；没结清时差额就是<b>还没到位的钱</b> —— 差额为正的人被欠着，团队亏损实际由他垫着。</div></div>';
+  return h;
+}
+/* ==================== v7.4：云端数据「🖨️ 打印机」区块 ====================
+   两张表：
+     ① 每台机器在本口径区间内：页数 / 已耗寿命% / 该区间折旧（页数 × 每页成本）；
+     ② 订单级：时间 / 订单号 / 成员 / 接单设备 / 打印机 / 页数 / 折旧 —— 回答"这单是哪台机打的"。
+   机型来源：已登记机器（绑定设备或机型名命中）> 已知机型表（霍楠=1020 / 姚懿祥=M232）；
+   只认得出机型但没登记的，**照实显示机型但折旧为 0**（没有价格/寿命就无从计提，不编数）。 */
+function printerUsageSectionHTML(orders) {
+  var list = orders || [];
+  var perPrinter = {}, orderRows = [], unmatchedPages = 0, unmatchedOrders = 0;
+
+  list.forEach(function (o) {
+    var pages = 0;
+    (o.files || []).forEach(function (f) {
+      if ((f.status || '') !== 'sent') return;
+      pages += _filePagesOf(f);
+    });
+    if (!pages) return;
+    var info = printerNameForOrder(o);
+    var p = info.registered ? printerForOrder(o) : null;
+    var dep = p ? printerDepCents(p, pages) : 0;
+    orderRows.push({ o: o, pages: pages, name: info.name, registered: info.registered, dep: dep });
+    if (!info.name) { unmatchedPages += pages; unmatchedOrders++; return; }
+    var k = info.name;
+    if (!perPrinter[k]) {
+      perPrinter[k] = { name: k, registered: !!p, pages: 0, dep: 0, orders: 0,
+                        price: p ? +p.price || 0 : 0, life: p ? +p.life_pages || 0 : 0,
+                        unit: p ? printerUnitYuan(p) : 0, client_id: p ? (p.client_id || '') : '' };
+    }
+    perPrinter[k].pages += pages;
+    perPrinter[k].dep += dep;
+    perPrinter[k].orders++;
+  });
+
+  var names = Object.keys(perPrinter).sort(function (a, b) { return perPrinter[b].pages - perPrinter[a].pages; });
+  var totalPages = 0, totalDep = 0;
+  names.forEach(function (n) { totalPages += perPrinter[n].pages; totalDep += perPrinter[n].dep; });
+
+  var h = '<div class="section" id="printer-usage"><h2>📈 本口径用量与折旧 <span class="hint">（本口径内每台机打了多少页、吃掉多少寿命价值 · 机型优先按人工指定，其次「默认设备」→ 已知机型兜底）</span></h2>';
+  if (!getPrinters().length && !names.length) {
+    h += '<div style="color:var(--muted);font-size:.85rem">还没有登记打印机，本口径内也没有可识别的机型。到本页上方 <b>「🖨️ 打印机台账」</b> 登记（价格 / 寿命页数 / 绑定设备）后，这里会按页计提折旧。</div></div>';
+    return h;
+  }
+  h += '<div class="table-wrap"><table><thead><tr><th>打印机</th><th>所有者 / 计费</th><th>价格</th><th>寿命（页）</th><th>每页成本</th><th>本口径页数</th><th>已耗寿命</th><th>本口径寿命消耗</th></tr></thead><tbody>';
+  if (!names.length) {
+    h += '<tr><td colspan="8" style="color:var(--muted)">本口径内没有已完成的出纸页数（或订单都没归属到机器）。</td></tr>';
+  }
+  names.forEach(function (n) {
+    var d = perPrinter[n];
+    h += '<tr><td style="font-weight:700">' + esc(d.name)
+      + (d.registered ? '' : '<div style="font-size:.72rem;color:var(--orange)">未登记（认得出机型，无价格/寿命 ⇒ 不提折旧）</div>')
+      + '</td>';
+    var _p = getPrinters().filter(function (x) { return x.name === d.name; })[0];
+    /* v7.7：累计实测模式 —— 未结算时寿命/每页成本天然未知（不是漏填），已结算时寿命是实测值 */
+    var _lifeSt = _p ? printerLifeState(_p) : '';
+    /* 文案与台账里的「归属 / 计费」下拉同源（printerBillingLabel），避免两处口径漂移 */
+    h += '<td style="font-size:.8rem">' + (_p ? esc(printerBillingLabel(_p)) : '团队共担') + '</td>';
+    h += '<td>' + (d.price ? '¥' + d.price.toFixed(2) : '—') + '</td>';
+    h += '<td style="white-space:nowrap">' + (_lifeSt === 'accumulating'
+        ? '<span class="tag" style="white-space:nowrap" title="累计实测模式：报废结算后才有实测寿命">累计中</span>'
+        : (d.life ? fmtInt(d.life) + (_lifeSt === 'measured' ? ' <span class="tag g" style="white-space:nowrap">实测</span>' : '') : '—')) + '</td>';
+    h += '<td style="white-space:nowrap">' + (d.unit > 0 ? '¥' + d.unit.toFixed(4) : (_lifeSt === 'accumulating' ? '累计中' : '—')) + '</td>';
+    h += '<td>' + fmtInt(d.pages) + '</td>';
+    h += '<td>' + (d.life > 0 ? ((d.pages / d.life) * 100).toFixed(1) + '%' : (_lifeSt === 'accumulating' ? '—' : '—')) + '</td>';
+    h += '<td class="neg" style="font-weight:700">' + (d.dep > 0 ? '−' + RMB(d.dep) : '<span style="color:var(--muted)">¥0.00</span>') + '</td></tr>';
+  });
+  h += '<tr class="tfoot"><td>合计</td><td></td><td></td><td></td><td></td><td>' + fmtInt(totalPages) + '</td><td></td><td class="neg">' + (totalDep > 0 ? '−' + RMB(totalDep) : '¥0.00') + '</td></tr>';
+  h += '</tbody></table></div>';
+
+  /* 订单级：这单是哪台机打的（最多列 50 行，其余用合计说明） */
+  h += '<div style="font-weight:700;margin:16px 0 8px">订单 → 打印机 <span style="font-weight:400;font-size:.8rem;color:var(--muted)">（最近 ' + Math.min(orderRows.length, 50) + ' / ' + orderRows.length + ' 单）</span></div>';
+  if (!orderRows.length) {
+    h += '<div style="color:var(--muted);font-size:.85rem">本口径内没有已完成的出纸订单。</div>';
+  } else {
+    orderRows.sort(function (a, b) { return String(b.o.created_at || '').localeCompare(String(a.o.created_at || '')); });
+    h += '<div class="table-wrap"><table><thead><tr><th>时间</th><th>订单号</th><th>成员</th><th class="l">接单设备</th><th>打印机' + _printerAssignLockHTML() + '</th><th>页数</th><th>折旧</th></tr></thead><tbody>';
+    orderRows.slice(0, 50).forEach(function (row) {
+      var o = row.o;
+      var mo = memberOfName((o.owner_name || '').trim()) || memberOfOpenid(o.openid);
+      h += '<tr>';
+      h += '<td style="white-space:nowrap;font-size:.8rem">' + esc(_fmtDate(o.created_at)) + '</td>';
+      h += '<td style="font-family:monospace;font-size:.78rem" class="l">' + esc(o.order_number || ('#' + o.order_id)) + '</td>';
+      /* 成员列只用普通文字（2026-10-25 用户要求：这一列不需要彩色底纹） */
+      h += '<td style="font-size:.82rem">' + (mo ? esc(mo.name) : '<span style="color:var(--muted)">未归属</span>') + '</td>';
+      h += '<td class="l ell" style="font-size:.76rem;color:var(--muted)">' + esc(o.received_label || o.received_client || '—') + '</td>';
+      /* 认不出机型的行也必须走同一个出口 —— 解锁后要给**真的下拉**（2026-10-25 用户反馈：
+         旧写法只写一句「可下拉指定」的提示、却没渲染 select，等于指着一个不存在的东西让人点）。
+         nowrap：下拉与旁边的小标记必须挤在同一行，否则会把这一行的行高撑高。 */
+      h += '<td style="white-space:nowrap">' + printerPickerHTML(o, { name: row.name, registered: row.registered }) + '</td>';
+      h += '<td>' + fmtInt(row.pages) + '</td>';
+      h += '<td class="neg">' + (row.dep > 0 ? '−' + RMB(row.dep) : '—') + '</td>';
+      h += '</tr>';
+    });
+    h += '</tbody></table></div>';
+  }
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
+    + (unlocked.orderprinter
+        ? '打印机列可直接下拉<b>人工指定</b>（接单设备不决定用哪台机，人工指定优先级最高）；未指定时按「默认设备」→ 已知机型表兜底。'
+        : '打印机列<b>默认锁定</b>（🔒 与上方台账共用同一把锁）：解锁后可逐单指定"这张单是哪台机打的"，未指定时按「默认设备」→ 已知机型表兜底。')
+    + '折旧 = 页数 × 每页成本（价格 ÷ 寿命页数），只对<b>已登记且在役</b>的机器计提；'
+    + '寿命口径为<b>累计实测</b>且还没结算的机器显示「累计中」—— 总寿命未知，所以暂不计提（不是漏了），'
+    + '报废结算后这些页数会一次性回溯折旧。'
+    + (unmatchedPages > 0 ? '<br>⚠ 有 <b>' + fmtInt(unmatchedPages) + ' 页 / ' + unmatchedOrders + ' 单</b>认不出是哪台机打的（设备未登记且不在已知机型表里）。' : '')
+    + '</div></div>';
+  return h;
+}
+
+/* ==================== 📐 结算公式（v7.4） ====================
+   收支清算的完整算式：从「采购 / 代收 / 评分 / 实际转账 / 设备折旧」推到「本月盈亏」。
+   ⚠ 本函数**只做展示** —— 所有金额都取自 calcMonth 的返回值（r.xxx），这里绝不做
+   第二份计算 / 第二份取整。页面上任何数字只有一个来源，否则两套口径迟早漂移。
+   （tests/verify_settle_formula.py 与 tests/verify_usage_depreciation.py 盯住这一点。）
+
+   记法（金额一律整数分）：
+     E     有效采购总额（付款人仍是成员的记录）        I_i  i 的代收      E_i  i 的垫付
+     s_i   i 的服务得分（单项封顶 scoreCap）           k    投资分成比例
+     P₁ = round(I·k) 投资回报池                        P₂ = I − P₁ 服务回报池
+     R_i   应得收入 = 分摊(P₁, 等权) + 分摊(P₂, 按 s 加权)
+     A_i   采购应摊 = 分摊(E, 权重)；权重 = 均摊时全 1，按用量时各人**实际出纸页数**
+     D_i   设备折旧 = 每台机（本月页数 × 每页成本）按人分摊；每页成本 = 价格 ÷ 寿命页数
+     N_i   建议转账 = (R_i − I_i) + (E_i − A_i)        T_i 实收−实付（真实转账）
+     B_i   应得盈亏 = R_i − A_i − D_i                 C_i 实际盈亏 = I_i + T_i − E_i − D_i
+     g_i   未结清 = N_i − T_i = B_i − C_i
+   恒等式：ΣN_i ≡ 0；ΣC_i ≡ ΣB_i ≡ Π = I − E − D；T_i ≡ N_i ⇒ C_i = B_i（全额结清时两口径重合）。
+   open 参数：就地刷新时保留展开态 —— 用户摊开公式在看，改一笔转账不该把它收起来。 */
+function settleFormulaHTML(r, open) {
+  var members = getMembers();
+  var sumNet = 0, sumBook = 0, sumActual = 0;
+  var depTotal = r.depTotal || 0;
+  members.forEach(function (mem) {
+    sumNet += r.net[mem.id] || 0;
+    sumBook += (r.redist[mem.id] || 0) - (r.perPersonShare[mem.id] || 0) - (r.depByMember[mem.id] || 0);
+    sumActual += r.actualPL[mem.id] || 0;
+  });
+  var teamPL = r.totalInc - r.totalExp - depTotal;
+  /* 0 不带符号 —— 别渲染出「−¥0.00」「+¥0.00」这种看着像 bug 的东西 */
+  var sg = function (c) { return (c > 0 ? '+' : '') + RMB(c); };
+  var identOk = (sumNet === 0) && (sumBook === sumActual) && (sumActual === teamPL);
+
+  var h = '<details class="formula-box" id="settleFormula"' + (open ? ' open' : '') + '>';
+  h += '<summary>📐 结算公式 <span class="hint">（采购 / 代收 / 评分 / 实际转账 / 设备折旧 → 本月盈亏 的完整算式 · 金额一律整数分）</span></summary>';
+  h += '<div class="formula-body">';
+
+  /* ── ① 团队层 ── */
+  h += '<h3>① 团队层：一行总式</h3>';
+  h += '<pre class="formula-code">团队盈亏 Π = Σ代收 − Σ有效采购 − Σ设备折旧\n           = （投资回报池 P₁ + 服务回报池 P₂） − E − D      ※ P₁ + P₂ ≡ Σ代收</pre>';
+  h += '<p>本月代入：Π = ' + RMB(r.totalInc) + ' − ' + RMB(r.totalExp) + (depTotal ? ' − ' + RMB(depTotal) : '')
+     + ' = ' + RMB(r.investPool) + ' + ' + RMB(r.servicePool) + ' − ' + RMB(r.totalExp) + (depTotal ? ' − ' + RMB(depTotal) : '')
+     + ' = <b>' + sg(teamPL) + '</b></p>';
+  h += '<p class="note">「有效采购」= 付款人仍在成员名单里的记录。'
+     + (r.orphanPayerExp > 0
+        ? '本月另有已删成员垫付的 ' + RMB(r.orphanPayerExp) + ' 不进结算（采购明细里标「未纳入结算」）'
+          + '—— 否则这笔钱会被 ' + r.memberCount + ' 人分摊、却无人承接。'
+        : '已删成员垫付的采购不进结算（本月没有这类记录）。')
+     + (depTotal > 0
+        ? ' 设备折旧 D 是<b>非现金成本</b>（机器早就买好了），它减少利润但不产生任何转账。'
+        : ' 本月没有计提设备折旧（未登记打印机 / 本月无出纸页数）。')
+     + '</p>';
+
+  /* ── ② 成员层 ── */
+  h += '<h3>② 成员层：从流水推到「实际盈亏」</h3>';
+  h += '<div class="table-wrap"><table><thead><tr><th style="width:34px">步</th><th style="width:22%">量</th><th>公式</th><th>含义 / 守恒</th></tr></thead><tbody>';
+  h += '<tr><td>1</td><td>收入池 <code>P₁ / P₂</code></td><td><code>P₁ = round(I·k)</code>、<code>P₂ = I − P₁</code></td><td>投资池按比例取整，余数全进服务池；<code>P₁ + P₂ = Σ代收</code></td></tr>';
+  h += '<tr><td>2</td><td>应得收入 <code>Rᵢ</code></td><td><code>Rᵢ = 分摊(P₁, 等权) + 分摊(P₂, 按 sᵢ 加权)</code></td><td><code>ΣRᵢ = I</code>；服务分全为 0 时退化为等权均分</td></tr>';
+  h += '<tr><td>3</td><td>采购应摊 <code>Aᵢ</code></td><td><code>Aᵢ = 分摊(E, 权重)</code></td><td><code>ΣAᵢ = E</code>；<b>权重 = 均摊时全 1，按用量时各人本月出纸页数</b></td></tr>';
+  h += '<tr><td>4</td><td>设备折旧 <code>Dᵢ</code></td><td><code>Dᵢ = Σ_团队共担机 (该机本月页数_i × 每页成本)</code></td><td><code>ΣDᵢ = D</code>；每页成本 = 价格 ÷ 寿命页数；<b>非现金成本</b></td></tr>';
+  h += '<tr><td>5</td><td>损耗费 <code>Wᵢ</code></td><td><code>Wᵢ = Σ_收损耗费机 (收到的补偿ᵢ − 付给所有者的ᵢ)</code></td><td><b><code>ΣWᵢ ≡ 0</code></b>；使用者为负、所有者为正；只有"购买款已付过"的机器才有</td></tr>';
+  h += '<tr><td>6</td><td>建议转账 <code>Nᵢ</code></td><td><code>Nᵢ = (Rᵢ − Iᵢ) + (Eᵢ − Aᵢ) + Wᵢ</code></td><td>即页面「收入调整 + 垫付差额 ± 损耗费」；<b><code>ΣNᵢ ≡ 0</code></b></td></tr>';
+  h += '<tr><td>7</td><td>实收实付 <code>Tᵢ</code></td><td><code>Tᵢ = Σ转入ᵢ − Σ转出ᵢ</code></td><td>只认当月、收付双方仍在名单、非自转、非 0 元的记录（含损耗费是否真的付了）</td></tr>';
+  h += '<tr><td>8</td><td><b>实际盈亏</b> <code>Cᵢ</code></td><td><code>Cᵢ = Iᵢ + Tᵢ − Eᵢ − Dᵢ</code></td><td>现金口径（损耗费通过 T 流过，不在这里另扣）</td></tr>';
+  h += '<tr><td>9</td><td><b>应得盈亏</b> <code>Bᵢ</code></td><td><code>Bᵢ = Rᵢ − Aᵢ − Dᵢ + Wᵢ = Nᵢ + Iᵢ − Eᵢ − Dᵢ</code></td><td>账面口径：该赚该亏，与钱有没有真转无关</td></tr>';
+  h += '<tr><td>10</td><td>未结清 <code>gᵢ</code></td><td><code>gᵢ = Nᵢ − Tᵢ = Bᵢ − Cᵢ</code></td><td>正 = 别人还欠他；负 = 已超付</td></tr>';
+  h += '</tbody></table></div>';
+
+  /* ── ③ 恒等式 + 本月实算自检 ── */
+  h += '<h3>③ 三条恒等式（也是本月数据的自检）</h3>';
+  h += '<pre class="formula-code">Σ 建议转账 Nᵢ ≡ 0                        ← 内部转账自平衡\nΣ 损耗费 Wᵢ ≡ 0                          ← 使用者付给所有者，只在成员间转移\nΣ 实际盈亏 Cᵢ ≡ Σ 应得盈亏 Bᵢ ≡ Π = I − E − D   ← 团队盈亏不因转账/损耗费改变\nTᵢ ≡ Nᵢ  ⇒  Cᵢ = Bᵢ                     ← 全额结清时两个口径重合</pre>';
+  h += '<p>本月实算：<code>ΣN = ' + sg(sumNet) + '</code> · <code>ΣB = ' + sg(sumBook)
+     + '</code> · <code>ΣC = ' + sg(sumActual) + '</code> · <code>Π = ' + sg(teamPL) + '</code> '
+     + (identOk ? '<span class="chk ok">✅ 自检通过</span>' : '<span class="chk bad">❌ 三处对不上（数据异常，请核对采购 / 转账 / 打印机记录）</span>') + '</p>';
+  h += '<p class="note">团队盈亏与转账无关：转账只改变「亏损由谁垫着」。全部结清时每个人的实际盈亏 = 应得盈亏；没结清时 '
+     + '<code>gᵢ</code> 就是还没到位的钱 —— 垫了大头又收不到转账的人，实际亏损会远大于账面亏损。</p>';
+
+  /* ── ④ 取整规则 ── */
+  h += '<h3>④ 取整规则（唯一需要注意的坑）</h3>';
+  h += '<p>五处分摊（采购应摊 / 团队折旧 / 损耗费 / 投资回报 / 服务回报）一律走 <code>apportionCents()</code>：先各自向下取整，'
+     + '余下的分按小数部分从大到小各补 1 分，同值按成员顺序（稳定可复现），<b>保证 Σ 恒等于池子总额</b>。'
+     + '绝不能各自四舍五入 —— 那样 3 人 ¥1.00 会成 ¥0.34×3 = ¥1.02，上面两条 <code>ΣN ≡ 0</code>、'
+     + '「结清即相等」的恒等式就永久不成立了。</p>';
+
+  /* ── ⑤ 页面各表 ↔ 公式记号 ── */
+  h += '<h3>⑤ 页面上每张表用的是哪个量</h3>';
+  h += '<div class="table-wrap"><table><thead><tr><th>页面区块</th><th>对应的量</th></tr></thead><tbody>';
+  h += '<tr><td>🧾 采购明细</td><td><code>E</code> + 每人分摊比例与应摊额（<code>Aᵢ</code>）</td></tr>';
+  h += '<tr><td>🖨️ 设备折旧</td><td><code>Dᵢ</code> / <code>Wᵢ</code> 的来源（团队共担 → 折旧；收损耗费 → 损耗费转账）</td></tr>';
+  h += '<tr><td>💵 收入分配</td><td><code>Rᵢ</code>（「差额」= <code>Rᵢ − Iᵢ</code>）</td></tr>';
+  h += '<tr><td>📊 经营损益</td><td><code>Bᵢ</code> = 应得收入 − 采购应摊 − 团队折旧 ± 损耗费</td></tr>';
+  h += '<tr><td>💳 垫付清算</td><td><code>Eᵢ − Aᵢ</code>（垫付差额）</td></tr>';
+  h += '<tr><td>🔄 资金重分配</td><td><code>Nᵢ</code>（再贪心配对成具体转账指令，仅建议）</td></tr>';
+  h += '<tr><td>💸 实际转账</td><td><code>Tᵢ</code> 的来源（人工录入的真实转账）</td></tr>';
+  h += '<tr><td>💰 实际盈亏</td><td><code>Cᵢ</code>（小字「应 …」= <code>Bᵢ</code>，末列「差额」= <code>gᵢ</code>）</td></tr>';
+  h += '<tr><td>KPI「本月盈亏」</td><td><code>Π</code> = <code>Σ代收 − Σ有效采购 − Σ设备折旧</code></td></tr>';
+  h += '</tbody></table></div>';
+
+  h += '</div></details>';
   return h;
 }
 /* 只重绘两个派生区块（转出/入 状态条 + 实际盈亏表），不整体重绘 ——
@@ -4418,13 +5511,21 @@ function realPLSectionHTML(m, r, totalPL) {
 function _refreshDashSummary() {
   if (currentTab !== 'dash') return;
   var m = monthFromRecords(currentKey);
-  var r = calcMonth(m);
+  var r = calcMonthWithUsage(currentKey);
   var totalPL = 0;
-  getMembers().forEach(function (mem) { totalPL += r.redist[mem.id] - r.perPersonShare[mem.id]; });
+  getMembers().forEach(function (mem) { totalPL += (r.bookPL[mem.id] || 0); });
   var g = $('#dashTransferGaps');
   if (g) g.innerHTML = transferGapChipsHTML(m, r, unlocked.transfer ? '' : ' disabled');
   var p = $('#dashRealPL');
   if (p) p.innerHTML = realPLSectionHTML(m, r, totalPL);
+  /* 📐 结算公式：里面的「本月实算」跟着转账变（ΣC 与 g 依赖 T_i），必须一起刷新。
+     但它是个 <details>，整体 innerHTML 重绘会把它收起来 —— 先记住展开态再按原样重绘。 */
+  var f = $('#dashFormula');
+  if (f) {
+    var keepOpen = false;
+    try { keepOpen = !!document.querySelector('#settleFormula[open]'); } catch (e) { keepOpen = false; }
+    f.innerHTML = settleFormulaHTML(r, keepOpen);
+  }
   var t = $('#dashTransferTotal');
   if (t) t.textContent = RMB(r.transferTotal);
 }
@@ -4440,6 +5541,21 @@ function onRateSlide(val) {
   if (b) b.textContent = val + '%';
   var s = $('#rateSvcLive');
   if (s) s.textContent = '服务按分占比 ' + (100 - val) + '%';
+}
+/* v7.4：采购分摊口径切换（均摊 ⇄ 按用量）。与其它结算参数一样要「设置」解锁。 */
+function setPurchaseBasis(basis) {
+  if (!unlocked.settings) {
+    requestPassword('settings', '设置').then(function (ok) { if (ok) setPurchaseBasis(basis); });
+    return;
+  }
+  STORE.config.purchaseBasis = (basis === 'usage') ? 'usage' : 'equal';
+  save();
+  // 切到按用量：该月的用量可能还没取过，顺手取一次再重绘（取不到就照旧显示"未取到"提示）
+  if (STORE.config.purchaseBasis === 'usage' && usageStateOfMonth(currentKey) === 'idle') {
+    ensureUsage(currentKey, function () { renderCurrent(); });
+  }
+  renderCurrent();
+  toast(basis === 'usage' ? '✅ 采购改为按用量分摊（按各人实际出纸页数）' : '✅ 采购改为均摊', 'success');
 }
 
 /* ==================== TAB: 记账 ==================== */
@@ -4654,7 +5770,7 @@ function delTransfer(id) {
 function fillSuggestedTransfers() {
   if (!unlocked.transfer) { toast('🔒 请先解锁实际转账', 'error'); return; }
   var m = monthFromRecords(currentKey);
-  var r = calcMonth(m);
+  var r = calcMonthWithUsage(currentKey);
   var added = 0;
   r.transfers.forEach(function (t) {
     var done = 0;
@@ -4684,7 +5800,7 @@ function fetchLocalScopeData(force) {
   var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end);
   _cloudLoading = true;
   _cloudDataFetchedAt = null;
-  renderCloud();
+  _renderScopeViews();
   fetch('/api/local/orders?' + params, { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
     .then(function (data) {
@@ -4695,9 +5811,9 @@ function fetchLocalScopeData(force) {
         _scopeFailedKey = null;
         _cloudDataFetchedAt = new Date().toTimeString().substring(0, 8);
       } else { _cloudData = null; _scopeFailedKey = _scopeRangeKey(); }
-      renderCloud();
+      _renderScopeViews();
     })
-    .catch(function () { _cloudLoading = false; _cloudData = null; _scopeFailedKey = _scopeRangeKey(); renderCloud(); });
+    .catch(function () { _cloudLoading = false; _cloudData = null; _scopeFailedKey = _scopeRangeKey(); _renderScopeViews(); });
 }
 function _scopeRangeKey() { var r = _scopeRange(); return r ? (r.start + '_' + r.end) : ''; }
 
@@ -4920,6 +6036,10 @@ function _renderCloudShared() {
   }
   h += '</div>';   // 区块「成员账目」闭合
 
+  /* v7.6：打印机台账 / 用量 / 订单→打印机已整体移到「🖨️ 打印机折旧」标签页 ——
+     本页只展示云端收益与订单（台账是"我们有什么机器"，两件事不该挤在同一屏；
+     而订单明细那张表已经挤到不能再加「打印机」一列）。 */
+
   // 订单明细（v5.16：分页渲染 —— 状态筛选/页码/每页条数，翻页与筛选仅局部刷新本区块，不影响其他图表；展开行含文件级状态）
   h += _renderOrderListHTML();
 
@@ -4955,6 +6075,89 @@ function _renderCloudShared() {
     }
   }, 60);
 }
+
+/* ==================== TAB: 打印机折旧（v7.6，2026-10-25 用户要求） ====================
+   为什么单开一页：
+     ·「云端数据」是给"这个月赚了多少、订单怎么样"看的，打印机台账属于"我们有哪些机器、
+       它们的寿命被吃掉了多少"，两件事挤在同一屏只会互相干扰（用户的判断）；
+     · 订单明细那张表已经挤到不能再加「打印机」一列，所以"这张单到底是哪台机打的"
+       只能放到这里逐单人工指定。
+   本页三块（自上而下）：
+     ① 口径栏 —— 与「云端数据」共用同一份口径状态（_scopeTime/_scopeMembers/_scopeSources/_cloudData），
+        改这里的时间/成员/来源，两页一起变（控件 id 用 '-p' 前缀区分）；
+     ② 🖨️ 打印机台账 —— 价格 / 寿命页数 / 归属与计费 / 默认设备 / 在役，编辑需密码 orderprinter；
+     ③ 本口径的用量与折旧 —— 每台机打了多少页、已耗寿命%、吃掉多少寿命价值，
+        以及「订单 → 打印机」逐单指定（同样要解锁 orderprinter，防误点）。
+   ⚠ 台账是**本地数据**（print_data.json），本地模式照样能维护；只有"默认设备"在本地模式没有
+     云端设备可绑（那一列退化为说明文字）。 */
+function renderPrinters() {
+  var el = $('#tab-printers');
+  if (!el) return;
+  var keys = cloudMonthKeys();
+  var cm = currentMonthKey();
+  if (!keys.includes(cm)) keys.unshift(cm);   // 本月始终可选（即使当月尚无数据）
+  if (!_scopeTime.month) _scopeTime.month = cm;
+  if (_scopeTime.mode === 'month' && keys.length && !keys.includes(_scopeTime.month)) _scopeTime.month = keys[0];
+
+  var h = _renderScopeBar(keys, '-p');   // 与云端数据页同一份口径
+  /* 台账与口径无关（它回答"我们有什么机器"），任何时候都显示 —— 拉订单失败也不该挡住改价格/寿命 */
+  h += printerAdminHTML();
+  /* v7.7：累计实测模式的机器 —— 进本页时把「累计到今天多少页」取回来（内部延后一拍，
+     等 innerHTML 写完再回填单元格；不在本页就不打这个接口） */
+  if (currentTab === 'printers') _kickCumulativeFetch();
+
+  if (_cloudLoading) {
+    h += '<div class="section" style="text-align:center;padding:36px"><span class="loading-spin"></span> <span style="margin-left:6px;color:var(--muted)">正在' + (FINANCE_MODE === 'local' ? '读取本地订单' : '从云端获取数据') + '…</span></div>';
+    el.innerHTML = _lz(h);
+    return;
+  }
+  if (FINANCE_MODE !== 'local' && !_cloudMonthsReady) {
+    h += '<div class="empty"><div class="ico">📡</div><h3>正在加载云端月份…</h3></div>';
+    el.innerHTML = _lz(h);
+    return;
+  }
+  if (!_cloudData) {
+    var rk = _scopeRange(), rkKey = rk ? (rk.start + '_' + rk.end) : '';
+    if (rk && _scopeFailedKey !== rkKey) {
+      /* 只有用户真的停在这一页时才发起请求（renderAll 会在后台把所有 tab 画一遍，
+         那时 currentTab 不是 printers —— 别让隐藏页抢着打接口） */
+      if (!_cloudLoading && currentTab === 'printers') _fetchScope();
+      h += '<div class="section" style="text-align:center;padding:36px;color:var(--muted)"><span class="loading-spin"></span> <span style="margin-left:6px">正在拉取该口径的订单（用于按机器统计页数与折旧）…</span></div>';
+      el.innerHTML = _lz(h);
+      return;
+    }
+    h += '<div class="empty"><div class="ico">🖨️</div><h3>查询失败或无数据</h3>'
+      + '<p>本口径内没有可统计的订单；折旧需要"这台机打了多少页"作为输入，所以先要有订单数据。</p>'
+      + '<button class="btn pri" style="margin-top:14px" onclick="' + (FINANCE_MODE === 'local' ? 'fetchLocalScopeData(true)' : 'fetchScopeData(true)') + '">🔍 重试查询</button></div>';
+    el.innerHTML = _lz(h);
+    return;
+  }
+
+  h += printerUsageSectionHTML(_cloudFilteredOrders());
+  el.innerHTML = _lz(h);
+  _ensurePrinterDevices();   // 云端设备列表（「默认设备」下拉用）：首次到达时补一次
+}
+
+/* 设备列表懒加载：没进过「授权」页时 _authDevices 是 null，「默认设备」下拉会只剩"不指定"。
+   这里补一次（只一次，失败就退回"不指定"，不阻断台账编辑）。 */
+var _printerDevicesLoading = false;
+function _ensurePrinterDevices() {
+  if (FINANCE_MODE === 'local' || _authDevices || _printerDevicesLoading) return;
+  if (currentTab !== 'printers') return;   // 不在本页就别替隐藏页打接口（renderAll 会把所有 tab 都画一遍）
+  _printerDevicesLoading = true;
+  fetch('/api/proxy/printer/devices', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      var dl = res && (res.devices || (res.data && res.data.devices));
+      if (Array.isArray(dl)) _authDevices = dl;
+    })
+    .catch(function () { /* 拿不到就保持"不指定"，不阻断 */ })
+    .then(function () {
+      _printerDevicesLoading = false;
+      if (currentTab === 'printers') renderPrinters();
+    });
+}
+
 function _renderServiceBar(canvasId, svc, svcRev) {
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
@@ -5047,17 +6250,17 @@ function renderHistory() {
   list.forEach(function (key) {
     var keySafe = safeId(key);
     var m = monthFromRecords(key);
-    var r = calcMonth(m);
+    var r = calcMonthWithUsage(key);
     h += '<tr>';
     h += '<td style="font-weight:700">' + m.label + '</td>';
     h += '<td>' + RMB(r.totalExp) + '</td><td>' + RMB(r.perPerson) + '</td><td>' + RMB(r.totalInc) + '</td>';
     members.forEach(function (mem) {
-      // 实际盈亏（现金口径）：代收 + 实收转账 − 垫付 − 实付转账。全结清时等于应得盈亏。
+      // 实际盈亏（现金口径）：代收 + 实收转账 − 垫付 − 实付转账 − 设备折旧。全结清时等于应得盈亏。
       var aPL = r.actualPL[mem.id];
-      var nPL = r.redist[mem.id] - r.perPersonShare[mem.id];
+      var nPL = r.bookPL[mem.id] || 0;
       h += '<td class="' + (aPL >= 0 ? 'pos' : 'neg') + '" style="white-space:nowrap">';
       h += '<div style="font-weight:800">' + (aPL >= 0 ? '+' : '') + RMB(aPL) + '</div>';
-      h += '<div style="font-size:.72rem;font-weight:400;color:var(--muted)" title="应得盈亏 = 应得收入 − 均摊支出（账面口径，与转账是否发生无关）">应 ' + (nPL >= 0 ? '+' : '') + RMB(nPL) + '</div>';
+      h += '<div style="font-size:.72rem;font-weight:400;color:var(--muted)" title="应得盈亏 = 应得收入 − 采购应摊 − 设备折旧（账面口径，与转账是否发生无关）">应 ' + (nPL >= 0 ? '+' : '') + RMB(nPL) + '</div>';
       h += '</td>';
     });
     h += '<td style="max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.76rem">' + esc(m.note || '-') + '</td>';
@@ -5065,8 +6268,14 @@ function renderHistory() {
     h += '</tr>';
   });
   h += '</tbody></table></div>';
-  h += '<div style="margin-top:10px;font-size:.8rem;color:var(--muted)">「实际盈亏」= 该成员当月真正拿到手的钱（代收 + 实收转账 − 垫付 − 实付转账），取决于「收支清算」里录入的<b>实际转账</b>；小字「应 …」是账面应得盈亏。<br>两者不一致说明还有人没转够钱 —— 团队总盈亏不变，但亏损实际由<b>还没收到钱的人</b>垫着。要补录转账请到「收支清算」标签页。</div>';
+  h += '<div style="margin-top:10px;font-size:.8rem;color:var(--muted)">「实际盈亏」= 该成员当月<b>真正</b>拿到手的钱（代收 + 实收转账 − 垫付 − 实付转账 − 设备折旧），取决于「收支清算」里录入的<b>实际转账</b>；小字「应 …」是账面应得盈亏（应得收入 − 采购应摊 − 设备折旧）。<br>两者不一致说明还有人没转够钱 —— 团队总盈亏不变，但亏损实际由<b>还没收到钱的人</b>垫着。要补录转账请到「收支清算」标签页。</div>';
   el.innerHTML = h;
+  /* 历史各月也要带上「按用量分摊 / 设备折旧」才和「收支清算」算得一致：逐月补取用量，
+     取完再重绘一次（失败的月份会标记 failed，不会反复重试） */
+  var need = list.slice(0, 12).filter(function (k) { return usageStateOfMonth(k) === 'idle'; });
+  if (need.length) {
+    ensureUsageMany(need, function () { if (currentTab === 'history') renderHistory(); });
+  }
 }
 function editMonth(key) { currentKey = key; switchTab('entry'); }
 /* 危险操作统一前置：要求 settings 已解锁，未解锁则先弹密码框 */
@@ -5130,7 +6339,7 @@ function resetData() {
       if (!ok) return;
       STORE = migrateConfig(null);
       currentKey = currentMonthKey();
-      unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false };
+      unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false, orderprinter: false };
       // S1-05：重置等于退出登录态（服务端会话一并作废，别留后台可写 token）
       if (FINANCE_SESSION) {
         fetch('/api/local/finance_auth/logout', { method: 'POST', headers: apiHeaders() }).catch(function () {});
@@ -5179,6 +6388,12 @@ function renderSettings() {
       h += '<div style="margin:-2px 0 8px 2px;font-size:.76rem;color:var(--muted)">' +
            '这一把密码同时管订单明细的<b>「状态」</b>与<b>「类型」</b>两把锁：在任意一列解锁，另一列同时解锁；' +
            '类型只允许在「🤝接单 / 👤自打」之间订正（自打不计入收益）。</div>';
+    }
+    if (k === 'orderprinter') {
+      h += '<div style="margin:-2px 0 8px 2px;font-size:.76rem;color:var(--muted)">' +
+           '这一把密码管「🖨️ 打印机折旧」页的两处入口：<b>打印机台账</b>（价格 / 寿命页数 / 归属与计费）与' +
+           '<b>「订单 → 打印机」的逐单归属</b>。它们直接决定折旧算到谁头上（= 钱），所以默认 🔒 防误点；' +
+           '解锁任一处，另一处同时解锁。</div>';
     }
   });
   h += '<div style="margin-top:8px;font-size:.78rem;color:var(--muted)">密码存在本机服务端（print_data.json），云端配置只作同步副本；改密前需要先解锁「设置」。请牢记密码 —— 遗忘后无法自助找回。</div></div>';
@@ -5243,6 +6458,16 @@ function renderSettings() {
   h += '<div class="section"><h2>⚖️ 结算参数</h2>';
   h += '<div class="settings-row"><label>投资均分比例</label><input type="range" min="0" max="50" step="1" value="' + rate + '" oninput="onRateSlide(+this.value)" onchange="updateRate(+this.value)" style="width:180px"> <b id="rateValLive">' + rate + '%</b><span id="rateSvcLive" style="color:var(--muted);font-size:.78rem">服务按分占比 ' + (100 - rate) + '%</span></div>';
   h += '<div class="settings-row"><label>评分单项上限</label><input type="number" min="1" max="100" step="1" value="' + scoreCap + '" onchange="updateScoreCap(+this.value)" style="width:90px"><span style="color:var(--muted);font-size:.78rem">修改后所有月份计算即时生效</span></div>';
+  /* v7.4：采购分摊口径（只是"怎么分"，改它会让历史月份的采购分摊数字一起变 —— 这是预期的） */
+  var _purchaseBasis = getPurchaseBasis();
+  h += '<div class="settings-row" style="align-items:flex-start"><label style="padding-top:6px">采购分摊</label>'
+    + '<div style="display:flex;flex-direction:column;gap:6px">'
+    + '<label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="radio" name="purchaseBasis" value="equal"'
+    + (_purchaseBasis === 'equal' ? ' checked' : '') + ' onchange="setPurchaseBasis(\'equal\')"> 均摊（每人 1 / 人数）</label>'
+    + '<label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="radio" name="purchaseBasis" value="usage"'
+    + (_purchaseBasis === 'usage' ? ' checked' : '') + ' onchange="setPurchaseBasis(\'usage\')"> 按用量（各人本月实际出纸页数比例）</label>'
+    + '<span style="color:var(--muted);font-size:.78rem">按用量时只算「已完成」子任务的页数（含自打 / 免费单）；当月总页数为 0 会自动退回均摊。'
+    + '口径变化会影响所有月份的分摊结果。</span></div></div>';
   h += '</div>';
 
   // 数据管理
@@ -5493,14 +6718,587 @@ function manualBind() {
    2. 云端设备列表 —— 所有连接过云服务器的设备：计算机名称 / 在线状态 / 所有者 / 是否接单 /
       自动双面能力（v6.6：三态人工标注，决定该设备能否无人值守打双面）。
    独立密码保护（密码 key = 'auth'，默认与其它模块一致，可在「设置」中修改）。 */
+/* ==================== v7.4 / v7.6：打印机台账（「🖨️ 打印机折旧」页） ====================
+   一台机一行：名称 / 价格 / 寿命页数 / 归属与计费 / 默认设备 / 状态。
+   折旧不需要"手工录入本月成本"——它按「本口径这台机出纸页数 × 每页成本」实时算出来，
+   所以这里只要把机器、价格与寿命登记对，结算页就能自动计提。
+
+   v7.6（2026-10-25 用户要求）：
+     ① 台账从「🔒 授权」搬到「🖨️ 打印机折旧」页 —— 授权管"谁能连上来"，台账管"我们有什么机器"；
+     ② 单独一把锁（密码模块 orderprinter，设置页可改）：「订单 → 打印机」的人工指定也锁在里面，
+        因为它直接决定折旧摊到谁头上（= 钱）；
+     ③ 「所有者」+「计费方式」两个下拉合成**一个**「归属 / 计费」（用户选定方案 A）：
+        底层 owner / billing 两个字段照旧（账务一分不改），只是界面上一次选完。 */
+var _authDevices = null;      // 设备列表缓存（「默认设备」下拉用；避免每次重绘都打接口）
+
+/* ---- 归属 / 计费 合成一个下拉（v7.6） ----
+   旧写法两个下拉交叉起来很反直觉：1020 = 个人所有 + 团队共担、M232 = 共有 + 收损耗费，
+   看上去像两列在说同一件事。但账上它们不冗余：
+     · 团队共担（team）：机器的钱**没有**进过「采购」，磨损只能当团队成本（按页分摊、不产生转账）；
+     · 收损耗费（wear）：购买款**已经**由所有者付过（如 M232 三人均摊），再计团队成本就是二次计费，
+       所以改成"谁用谁把其他所有者那几份付给他们"（一笔现金转账）。
+   ⇒ 一个下拉四类选项，owner × billing 一次选完；账户口径完全不变。 */
+function printerBillingOf(p) {
+  var billing = (p && p.billing === 'wear') ? 'wear' : 'team';
+  var owner = (p && p.owner) ? String(p.owner) : 'shared';
+  if (owner === 'team') owner = 'shared';
+  return billing + ':' + owner;
+}
+/* 展示用文案（锁定态单元格 / 用量表「所有者 / 计费」列共用同一份措辞，避免两处漂移） */
+function printerBillingLabel(p) {
+  var billing = (p && p.billing === 'wear') ? 'wear' : 'team';
+  var ownerId = (p && p.owner && p.owner !== 'shared' && p.owner !== 'team') ? String(p.owner) : '';
+  var m = ownerId ? getMember(ownerId) : null;
+  var nm = ownerId ? ((m && m.name) || ownerId) : '';
+  if (billing === 'wear') return (nm ? nm + ' 个人所有' : '共有') + ' · 收损耗费';
+  return (nm ? nm + ' 自带' : '团队共有') + ' · 团队共担';
+}
+function printerBillingSelectHTML(pid, p) {
+  var cur = printerBillingOf(p);
+  var owner = (cur.split(':')[1] || 'shared');
+  var members = getMembers();
+  var known = owner === 'shared' || members.some(function (m) { return safeId(m.id) === owner; });
+  var h = '<select onchange="updPrinterBilling(\'' + pid + '\',this.value)" style="font-size:.82rem;max-width:240px"'
+    + ' title="决定这台机的寿命消耗算谁的钱：团队共担 = 机器钱没进「采购」（无偿共享，不产生转账）；收损耗费 = 购买款所有者已付过，用的人补给所有者">';
+  h += '<optgroup label="团队共担（机器钱不在采购里 · 不产生转账）">';
+  h += '<option value="team:shared"' + (cur === 'team:shared' ? ' selected' : '') + '>团队共有 · 团队共担</option>';
+  members.forEach(function (m) {
+    var mid = safeId(m.id);
+    if (!mid) return;
+    h += '<option value="team:' + esc(mid) + '"' + (cur === 'team:' + mid ? ' selected' : '') + '>' + esc(m.name) + ' 自带 · 团队共担（不收费）</option>';
+  });
+  h += '</optgroup><optgroup label="收损耗费（购买款已付过 · 用的人补给所有者）">';
+  h += '<option value="wear:shared"' + (cur === 'wear:shared' ? ' selected' : '') + '>共有 · 收损耗费</option>';
+  members.forEach(function (m) {
+    var mid = safeId(m.id);
+    if (!mid) return;
+    h += '<option value="wear:' + esc(mid) + '"' + (cur === 'wear:' + mid ? ' selected' : '') + '>' + esc(m.name) + ' 个人所有 · 收损耗费</option>';
+  });
+  h += '</optgroup>';
+  /* 所有者已不在成员名单：保留一个选项，免得一打开就被静默改成"共有"（那会把损耗费算错人） */
+  if (!known) h += '<option value="' + esc(cur) + '" selected>' + esc(owner) + '（已不在成员名单）</option>';
+  h += '</select>';
+  return h;
+}
+/* 归属 / 计费 的唯一写入口（与「订单→打印机」共用 unlocked.orderprinter 这一把锁） */
+function updPrinterBilling(id, val) {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); renderPrinters(); return; }
+  var p = printerById(id);
+  if (!p) return;
+  var parts = String(val || '').split(':');
+  p.billing = parts[0] === 'wear' ? 'wear' : 'team';
+  p.owner = (parts[1] && parts[1] !== 'shared') ? (safeId(parts[1]) || 'shared') : 'shared';
+  normalizePrinter(p);
+  save();
+  invalidateUsage();     // 归属/计费变了 ⇒ 结算页的折旧分摊要重算
+  /* 不整页重绘（沿用 v7.5b 的口径：切换下拉时整页闪一下很难受）；只补「每页成本」这类派生显示。
+     归属/计费本身是选中态，无需回填。 */
+  toast('✅ 已更新「' + esc(p.name) + '」的归属 / 计费', 'success');
+}
+
+/* ---- 台账 / 归属的锁定开关（样式与订单明细「状态 / 类型」列同款：表头一个 🔒） ---- */
+function _printerLedgerLockHTML() {
+  var on = !!unlocked.orderprinter;
+  return ' <button type="button" class="st-lock' + (on ? ' on' : '') + '"'
+    + ' title="' + (on ? '打印机台账已解锁，点击锁定（防误触）'
+                       : '打印机台账已锁定；点击输入密码解锁后可改价格 / 寿命 / 归属与计费') + '"'
+    + ' onclick="event.stopPropagation();togglePrinterLedgerLock()">' + (on ? '🔓' : '🔒') + '</button>';
+}
+function _printerAssignLockHTML() {
+  var on = !!unlocked.orderprinter;
+  return ' <button type="button" class="st-lock' + (on ? ' on' : '') + '"'
+    + ' title="' + (on ? '订单归属已解锁（与台账共用这把锁），点击锁定'
+                       : '订单归属已锁定；点击输入密码解锁后可逐单指定「这张单是哪台机打的」') + '"'
+    + ' onclick="event.stopPropagation();togglePrinterLedgerLock()">' + (on ? '🔓' : '🔒') + '</button>';
+}
+/* 一把锁管两处（台账 + 订单归属）：任一处解锁另一处一起变 🔓，再点任一处一起锁定 */
+function togglePrinterLedgerLock() {
+  if (unlocked.orderprinter) {
+    unlocked.orderprinter = false;
+    toast('🔒 打印机台账 / 订单归属已锁定');
+    renderPrinters();
+    return;
+  }
+  requestPassword('orderprinter', MODULE_NAMES.orderprinter).then(function (ok) {
+    if (ok) renderPrinters();     // 解锁成功后只重绘本页
+  });
+}
+
+function printerDeviceSelectHTML(pid, cur) {
+  var h = '<select onchange="updPrinter(\'' + pid + '\',\'client_id\',this.value)" style="font-size:.8rem;max-width:172px" title="只作「这张单默认归哪台机」的兜底：接单设备并不决定用哪台打印机，真正归属以打印机列表里的人工指定为准">';
+  var seen = false;
+  h += '<option value="">不指定</option>';
+  (_authDevices || []).forEach(function (d) {
+    var cid = safeId(d.client_id);
+    if (!cid) return;
+    if (cid === cur) seen = true;
+    var label = (d.device_name || cid) + (d.owner_name ? ' · ' + d.owner_name : '') + (d.online ? '（在线）' : '');
+    h += '<option value="' + esc(cid) + '"' + (cid === cur ? ' selected' : '') + '>' + esc(label) + '</option>';
+  });
+  /* 历史/已删除设备：仍保留一个选项，免得一打开就被静默改成"未绑定" */
+  if (cur && !seen) h += '<option value="' + esc(cur) + '" selected>' + esc(cur) + '（设备已不在列表）</option>';
+  h += '</select>';
+  return h;
+}
+/* 每页成本单元格（唯一出口：整表渲染与就地刷新都走它，避免两处格式漂移） */
+function printerUnitCellHTML(p) {
+  var st = printerLifeState(p);
+  if (st === 'accumulating') {
+    return '<span class="tag" style="white-space:nowrap" title="累计实测模式：先累计用量，机器报废时再按实测总页数回溯计提 —— 现在还不知道总寿命，所以没有每页成本（这不是漏填）">累计中 · 未计提</span>';
+  }
+  if (!(p.life_pages > 0)) return '<span class="tag r" style="white-space:nowrap">寿命未填</span>';
+  return '<span style="white-space:nowrap">¥' + printerUnitYuan(p).toFixed(4) + '</span>'
+    + ' <span style="color:var(--muted);font-size:.72rem;white-space:nowrap">/页</span>'
+    + (st === 'measured' ? ' <span class="tag g" style="white-space:nowrap" title="实测寿命：报废时按累计出纸页数结算，历史各月按结算快照回溯">实测</span>' : '');
+}
+/* 寿命单元格（台账唯一出口）：预估模式给输入框；累计实测给累计读数 + 结算/参数入口 */
+function printerLifeCellHTML(p, editable) {
+  var pid = safeId(p.id);
+  var st = printerLifeState(p);
+  if (!editable) {
+    if (st === 'accumulating') return '<span class="tag" style="white-space:nowrap">累计中</span>';
+    return (+p.life_pages ? fmtInt(p.life_pages) + ' 页' : '—')
+      + (st === 'measured' ? ' <span class="tag g" style="white-space:nowrap">实测</span>' : '');
+  }
+  if (st === 'accumulating') {
+    return '<span id="printer-cum-' + pid + '" style="white-space:nowrap;font-size:.8rem;color:var(--muted)">累计中 · 读取中…</span>'
+      + ' <button class="btn sm" style="padding:0 6px;line-height:1.5;color:var(--neg)" title="报废结算：把累计页数写成实测寿命，历史各月按页数回溯计提（机器坏了才点）"'
+      + ' onclick="openPrinterSettle(\'' + pid + '\')">💥</button>'
+      + ' <a href="javascript:;" style="font-size:.74rem;margin-left:3px" title="累计参数：起算日 / 起算前已用页数"'
+      + ' onclick="openPrinterAccumModal(\'' + pid + '\')">⚙</a>'
+      + ' <a href="javascript:;" style="font-size:.74rem;margin-left:2px" title="改回「预估总寿命」口径"'
+      + ' onclick="setPrinterLifeMode(\'' + pid + '\',\'estimate\')">⇄</a>';
+  }
+  if (st === 'measured') {
+    return '<span style="white-space:nowrap"><b>' + fmtInt(p.life_pages) + '</b> 页 '
+      + '<span class="tag g" style="white-space:nowrap" title="实测寿命：报废时按累计出纸页数结算，历史各月按快照回溯">实测</span></span>'
+      + ' <a href="javascript:;" style="font-size:.74rem;margin-left:3px" title="逐月明细 / 重算报废结算"'
+      + ' onclick="openPrinterSettle(\'' + pid + '\')">🧾</a>'
+      + ' <a href="javascript:;" style="font-size:.74rem;margin-left:2px" title="改回「预估总寿命」口径（会解除冻结的历史折旧）"'
+      + ' onclick="setPrinterLifeMode(\'' + pid + '\',\'estimate\')">⇄</a>';
+  }
+  return '<input type="number" step="1" min="0" value="' + (+p.life_pages || 0) + '" style="width:88px"'
+    + ' onchange="updPrinter(\'' + pid + '\',\'life_pages\',+this.value)">'
+    + ' <a href="javascript:;" style="font-size:.74rem;margin-left:4px" title="不预估总寿命：先累计用量，机器坏了再按实测页数结算"'
+    + ' onclick="setPrinterLifeMode(\'' + pid + '\',\'accumulate\')">累计</a>';
+}
+function printerAdminHTML() {
+  var list = getPrinters();
+  var editable = !!unlocked.orderprinter;
+  var h = '<div class="section" id="printer-ledger"><h2>🖨️ 打印机台账 <span class="hint">（在运营的机器：价格 / 寿命（预估页数 或 累计实测） / 归属与计费 —— 按「本口径页数 × 每页成本」自动计提）</span>' + _printerLedgerLockHTML() + '</h2>';
+  if (!editable) {
+    h += '<div class="lock-bar" style="margin-bottom:10px"><span>🔒 台账已锁定：价格 / 寿命 / 归属与「订单 → 打印机」归属都要解锁后才能改（它们直接决定折旧算到谁头上）</span>'
+      + '<button class="btn pri sm" onclick="unlockFlow(\'orderprinter\',\'' + esc(MODULE_NAMES.orderprinter) + '\')">🔑 输入密码解锁</button></div>';
+  }
+  h += '<div class="table-wrap"><table><thead><tr><th class="l">打印机</th><th>价格（元）</th><th>寿命（页）</th><th style="white-space:nowrap">每页成本</th><th class="l">归属 / 计费</th><th class="l">默认设备</th><th>状态</th>' + (editable ? '<th></th>' : '') + '</tr></thead><tbody>';
+  if (!list.length) {
+    h += '<tr><td colspan="' + (editable ? 8 : 7) + '" style="color:var(--muted)">还没有登记打印机 —— 不登记就不会计提折旧。' + (editable ? '点下方「+ 添加打印机」录入。' : '解锁后可在此录入。') + '</td></tr>';
+  }
+  list.forEach(function (p) {
+    var pid = safeId(p.id);
+    if (!pid) return;
+    h += '<tr id="printer-row-' + pid + '">';
+    /* v7.5b（用户要求）：名称与型号重复，合并成一格 —— 这一格同时写 name 与 model，
+       保证本页 / 收支清算里显示的名字跟这里一致。 */
+    if (editable) {
+      h += '<td class="l"><input id="printer-name-' + pid + '" type="text" value="' + esc(p.name || p.model) + '" title="' + esc(p.name || p.model) + '" placeholder="如 HP LaserJet 1020" style="width:236px" onchange="updPrinter(\'' + pid + '\',\'name\',this.value)"></td>';
+      h += '<td><input type="number" step="0.01" min="0" value="' + (+p.price || 0) + '" style="width:88px" onchange="updPrinter(\'' + pid + '\',\'price\',+this.value)"></td>';
+      h += '<td style="white-space:nowrap">' + printerLifeCellHTML(p, true) + '</td>';
+    } else {
+      h += '<td class="l"><b>' + esc(p.name || p.model || '未命名') + '</b>'
+        + (p.note ? '<div style="font-size:.72rem;color:var(--muted)">' + esc(p.note) + '</div>' : '') + '</td>';
+      h += '<td>' + (+p.price ? '¥' + (+p.price).toFixed(2) : '—') + '</td>';
+      h += '<td style="white-space:nowrap">' + printerLifeCellHTML(p, false) + '</td>';
+    }
+    h += '<td id="printer-unit-' + pid + '" style="white-space:nowrap">' + printerUnitCellHTML(p) + '</td>';
+    h += '<td class="l">' + (editable ? printerBillingSelectHTML(pid, p)
+      : '<span style="font-size:.8rem">' + esc(printerBillingLabel(p)) + '</span>') + '</td>';
+    h += '<td class="l">' + ((editable && FINANCE_MODE !== 'local') ? printerDeviceSelectHTML(pid, p.client_id || '')
+      : '<span style="font-size:.78rem;color:var(--muted)">' + esc(_printerDeviceLabel(p.client_id)) + '</span>') + '</td>';
+    h += '<td>' + (editable
+      ? '<select onchange="updPrinter(\'' + pid + '\',\'status\',this.value)" style="font-size:.82rem">'
+        + '<option value="active"' + (p.status !== 'retired' ? ' selected' : '') + '>在役</option>'
+        + '<option value="retired"' + (p.status === 'retired' ? ' selected' : '') + '>退役</option></select>'
+      : (p.status === 'retired' ? '<span class="tag" style="white-space:nowrap">退役</span>'
+                                : '<span class="tag g" style="white-space:nowrap">在役</span>')) + '</td>';
+    if (editable) h += '<td><button class="btn danger sm" onclick="delPrinter(\'' + pid + '\')" title="删除">✕</button></td>';
+    h += '</tr>';
+  });
+  h += '</tbody></table></div>';
+  if (editable) {
+    h += '<button class="btn sm" style="margin-top:10px" onclick="addPrinter()">+ 添加打印机</button>';
+    /* 现场已知的两台（霍楠 = HP LaserJet 1020 / 姚懿祥 = HP LaserJet MFP M232-M237）：
+       一键登记成台账条目，用户只需补价格与寿命（能识别所有者就顺手绑定设备号） */
+    var _missingKnown = Object.keys(KNOWN_PRINTER_MODELS).filter(function (owner) {
+      var md = KNOWN_PRINTER_MODELS[owner];
+      return !getPrinters().some(function (p) { return p.name === md || p.model === md; });
+    });
+    if (_missingKnown.length) {
+      h += '<button class="btn sm" style="margin-top:10px;margin-left:8px" onclick="seedKnownPrinters()" title="'
+        + esc(_missingKnown.map(function (o) { return o + ' = ' + KNOWN_PRINTER_MODELS[o]; }).join('；')) + '">'
+        + '➕ 登记已知机型（' + _missingKnown.length + ' 台）</button>';
+    }
+  }
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
+    + '<b>寿命两种口径</b>（「寿命」单元格右侧的「累计 / ⇄」切换）：<br>'
+    + '· <b>预估总寿命</b>（默认）：每页成本 = 价格 ÷ 寿命页数（例：¥1200 / 100000 页 = ¥0.0120/页）；<br>'
+    + '· <b>累计实测</b>：不知道总寿命就先不填 —— 台账一直累计这台机的出纸页数，'
+    + '机器报废时点「💥」（= 报废结算），把<b>累计页数</b>写成实测寿命，历史各月随即按当天页数回溯计提'
+    + '（金额与分摊一次冻结，之后改订单归属 / 改名 / 换绑都不会把已经算好的账改掉）。'
+    + '累计期间该机<b>不计提折旧</b>（不是漏了，是还不知道每页多少钱）。<br>'
+    + '<b>寿命格里的图标</b>：💥 = 报废结算（把累计页数写成实测寿命）、⚙ = 累计参数（起算日 / 起算前已用页数）、'
+    + '🧾 = 逐月明细 / 重算、⇄ = 在两种口径之间切换（切回估算会解除冻结的历史折旧）。<br>'
+    + '<b>归属 / 计费</b>用一个下拉管两件事 —— <b>团队共担</b>：机器的钱没进过「采购」（无偿共享，如 1020），'
+    + '磨损只当团队成本，<b>不产生任何转账</b>；<b>收损耗费</b>：购买款已由所有者付过（如 M232 三人均摊），'
+    + '再算团队成本就是二次计费，所以改成"谁用谁把其他所有者那几份补给对方"，是一笔现金转账。<br>'
+    + '<b>默认设备</b>只是「这张单默认归哪台机」的兜底 —— 接单设备并不决定用哪台打印机，'
+    + '真正归属以下方<b>「订单 → 打印机」</b>的人工指定为准。改/删机器后结算页会自动重算。</div></div>';
+  return h;
+}
+/* 「默认设备」的展示文案（锁定态 / 本地模式用）：设备名 + 所有者，找不到就退回 client_id */
+function _printerDeviceLabel(cid) {
+  var c = String(cid || '');
+  if (!c) return FINANCE_MODE === 'local' ? '不指定（本地模式无云端设备）' : '不指定';
+  var hit = (_authDevices || []).filter(function (d) { return String(d.client_id) === c; });
+  if (!hit.length) return c + '（设备已不在列表）';
+  var d = hit[0];
+  return (d.device_name || c) + (d.owner_name ? ' · ' + d.owner_name : '') + (d.online ? '（在线）' : '');
+}
+function addPrinter() {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); return; }
+  STORE.config.printers = STORE.config.printers || [];
+  STORE.config.printers.push(normalizePrinter({ id: uid(), name: '未命名打印机', model: '未命名打印机', price: 0, life_pages: 0, client_id: '', status: 'active' }));
+  save();
+  invalidateUsage();
+  renderPrinters();
+  toast('已添加，请填写价格与寿命页数（寿命为 0 时不计提折旧）', 'success');
+}
+function updPrinter(id, field, val) {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); renderPrinters(); return; }
+  var p = printerById(id);
+  if (!p) return;
+  if (field === 'price') p.price = Math.max(0, +val || 0);
+  else if (field === 'life_pages') p.life_pages = Math.max(0, Math.round(+val || 0));
+  else if (field === 'status') p.status = (val === 'retired') ? 'retired' : 'active';
+  else if (field === 'client_id') p.client_id = safeId(val) || '';
+  else if (field === 'owner') p.owner = (val === 'shared') ? 'shared' : (safeId(val) || 'shared');
+  else if (field === 'billing') p.billing = (val === 'wear') ? 'wear' : 'team';
+  else p[field] = String(val == null ? '' : val);
+  normalizePrinter(p);
+  if (field === 'name') p.model = p.name;
+  save();
+  invalidateUsage();   // 机器归属/寿命变了 ⇒ 折旧映射要重算（下次进结算页自动重新取数）
+  /* ⚠ 这里**不整页重绘**（v7.5b 用户反馈「切任意选项整页闪一下」）：
+     旧写法每次改一个下拉都重建整页，画面闪、下拉被拉回去。
+     现在只更新这一行里会变的「每页成本」；归属与计费 / 默认设备 / 状态本身就是选中态。 */
+  var pidSafe = safeId(id);
+  var unitCell = pidSafe ? document.getElementById('printer-unit-' + pidSafe) : null;
+  if (unitCell) unitCell.innerHTML = printerUnitCellHTML(p);
+  var nameEl = pidSafe ? document.getElementById('printer-name-' + pidSafe) : null;
+  if (nameEl && document.activeElement !== nameEl && nameEl.value !== (p.name || '')) nameEl.value = p.name || '';
+}
+function delPrinter(id) {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); return; }
+  var p = printerById(id);
+  if (!p) return;
+  openConfirm('删除打印机「' + p.name + '」？\n\n折旧是按「页数 × 每页成本」实时算的，删掉这台机之后它本月的折旧就不再计提 —— 历史月份不会留痕。', '删除').then(function (ok) {
+    if (!ok) return;
+    STORE.config.printers = getPrinters().filter(function (x) { return x.id !== id; });
+    save();
+    invalidateUsage();
+    renderPrinters();
+    toast('已删除打印机', 'success');
+  });
+}
+
+/* ==================== v7.7：累计实测寿命（不预估总寿命） ====================
+   用户的真实处境：两台在役机 HP 官方只给「月打印负荷 / 建议月印量 / 硒鼓寿命」，
+   **整机总寿命本来就是个未知数**（1020 甚至能跑十几年）。硬填一个估计值 = 拿猜测去分钱，
+   所以新增「累计实测」口径：
+     ① 不填寿命 —— 台账一直累计这台机的出纸页数（起算日到今天，含「起算前已用页数」）；
+     ② 机器报废时点「💥 结算」：把累计页数写成**实测寿命**，并按各月页数把整机价折成每月金额，
+        历史各月立刻回溯计提（Σ各月 == 追踪期应承担的寿命价值）；
+     ③ 结算结果**冻结成快照**：之后改订单归属 / 改名 / 换绑 / 删设备，都不会把已经报给成员的账改掉
+        （历史板的账不能因为一次误操作就变）。
+   ⚠ 累计期间该机**不计提折旧**（寿命未知 ⇒ 每页成本未知）—— 这是设计，不是漏算：
+     金额等到结算那天一次性回溯，永远不会出现「先按猜的值扣了、后来又改」的来回。 */
+
+function _todayStr() {
+  var n = new Date();
+  return n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0');
+}
+var _rangeOrdersCache = {};   // 'start|end' -> orders[]（报废结算与累计读数共用）
+/* 取任意区间的订单（与按月用量同一个接口、同一份鉴权）：结算要跨好几个月，
+   按月发 N 次请求太慢 —— 一次拉完，本地按月聚合。 */
+function fetchOrdersRange(start, end, cb) {
+  var key = start + '|' + end;
+  if (_rangeOrdersCache[key]) { if (cb) cb(_rangeOrdersCache[key], null); return; }
+  var url = FINANCE_MODE === 'local'
+    ? '/api/local/orders?start_date=' + encodeURIComponent(start) + '&end_date=' + encodeURIComponent(end)
+    : '/api/proxy/admin/statistics/revenue?start_date=' + encodeURIComponent(start) + '&end_date=' + encodeURIComponent(end);
+  fetch(url, { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data && data.success && data.data && Array.isArray(data.data.orders)) {
+        _rangeOrdersCache[key] = data.data.orders;
+        if (cb) cb(data.data.orders, null);
+      } else if (cb) cb(null, '接口返回失败');
+    })
+    .catch(function () { if (cb) cb(null, '网络异常'); });
+}
+/* 「累计到今天多少页」—— 台账每格显示一次（缓存到 invalidateUsage 为止） */
+var _cumCache = {};           // printerId -> { pages, tracked, months, since, at }
+var _cumFetching = {};
+function printerCumulative(p, cb) {
+  if (!p) { if (cb) cb(null); return; }
+  var pid = safeId(p.id);
+  if (_cumCache[pid]) { if (cb) cb(_cumCache[pid]); return; }
+  var since = p.started_at || '2000-01-01', at = _todayStr();
+  fetchOrdersRange(since, at, function (orders) {
+    if (!orders) { if (cb) cb(null); return; }
+    var agg = _printerPagesFromOrders(orders, p);
+    _cumCache[pid] = { pages: agg.pages + Math.max(0, Math.round(+p.pre_pages || 0)),
+                       tracked: agg.pages, months: agg.months, since: since, at: at };
+    if (cb) cb(_cumCache[pid]);
+  });
+}
+/* 台账里「累计中」单元格的读数（fetch 回来后原地替换，不整页重绘） */
+function _cumCellInner(p, rec) {
+  if (!rec) return '<span style="color:var(--muted)">累计中 · 读数失败</span>';
+  var pre = Math.max(0, rec.pages - rec.tracked);
+  /* 只留「累计 N 页」—— 明细（多少页有单 / 起算前多少页 / 统计区间）放 title。
+     这一格在台账里必须短：写全（含括号明细 + 三个按钮）会把「状态 / 删除」整列挤出屏幕。 */
+  return '<span style="font-weight:700;white-space:nowrap" title="累计页数 = 起算日之后这台机的出纸页数 '
+    + fmtInt(rec.tracked) + ' 页'
+    + (pre > 0 ? ' + 起算前已用 ' + fmtInt(pre) + ' 页' : '')
+    + '（' + rec.since + ' ~ ' + rec.at + '）">累计 ' + fmtInt(rec.pages) + ' 页</span>';
+}
+/* 进「🖨️ 打印机折旧」页时把累计读数取回来（只取在役、未结算的；失败只在格子里显示"读数失败"） */
+function _kickCumulativeFetch() {
+  getPrinters().forEach(function (p) {
+    if (printerLifeState(p) !== 'accumulating') return;
+    var pid = safeId(p.id);
+    if (!pid || _cumFetching[pid]) return;
+    _cumFetching[pid] = true;
+    /* 延后一拍：台账的 innerHTML 由 renderPrinters 在本函数之后才写入 */
+    setTimeout(function () {
+      printerCumulative(p, function (rec) {
+        _cumFetching[pid] = false;
+        var el = document.getElementById('printer-cum-' + pid);
+        if (el) el.innerHTML = _cumCellInner(p, rec);
+      });
+    }, 0);
+  });
+}
+/* 通用「多输入框」模态（openModal 只支持一个输入框）：返回 { 字段id: 值 } 或 null。
+   只用于台账的两个累计参数，不承担别的职责（别拿它改密码 / 改金额这类敏感写操作）。 */
+function openInputsModal(opts) {
+  return new Promise(function (resolve) {
+    var root = $('#modalRoot');
+    if (!root) { resolve(null); return; }
+    var m = document.createElement('div');
+    m.className = 'modal-backdrop';
+    var h = '<div class="modal-card" role="dialog"><h3>' + (opts.title || '') + '</h3><div class="modal-body">';
+    if (opts.intro) h += '<p style="margin:0 0 12px;color:var(--muted);font-size:.86rem">' + opts.intro + '</p>';
+    (opts.fields || []).forEach(function (f) {
+      h += '<label style="display:block;margin:0 0 10px"><div style="font-size:.82rem;margin-bottom:4px">' + esc(f.label) + '</div>'
+        + '<input id="im-' + esc(f.id) + '" type="' + esc(f.type || 'text') + '" value="'
+        + esc(String(f.value == null ? '' : f.value)) + '" style="width:100%">'
+        + (f.hint ? '<div style="font-size:.74rem;color:var(--muted);margin-top:3px">' + f.hint + '</div>' : '')
+        + '</label>';
+    });
+    h += '</div><div class="modal-actions"><button class="btn ghost" data-act="cancel">取消</button>'
+      + '<button class="btn pri" data-act="ok">' + esc(opts.confirmText || '确定') + '</button></div></div>';
+    m.innerHTML = h;
+    root.appendChild(m);
+    requestAnimationFrame(function () { m.classList.add('in'); });
+    var first = m.querySelector('input');
+    if (first) setTimeout(function () { first.focus(); }, 60);
+    var done = false;
+    function close(val) {
+      if (done) return;
+      done = true;
+      m.classList.remove('in');
+      setTimeout(function () { m.remove(); }, 190);
+      resolve(val);
+    }
+    m.addEventListener('click', function (e) { if (e.target === m) close(null); });
+    m.querySelector('[data-act=cancel]').addEventListener('click', function () { close(null); });
+    m.querySelector('[data-act=ok]').addEventListener('click', function () {
+      var out = {};
+      (opts.fields || []).forEach(function (f) {
+        var el2 = m.querySelector('#im-' + f.id);
+        out[f.id] = el2 ? el2.value : '';
+      });
+      close(out);
+    });
+  });
+}
+/* 累计参数：起算日 + 起算前已用页数（后者最容易漏 —— 机器进系统之前打掉的量不补上，
+   实测寿命就会偏小、每页成本偏高，等于让现在的人替过去的人出钱） */
+function openPrinterAccumModal(id) {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); return; }
+  var p = printerById(id);
+  if (!p) return;
+  openInputsModal({
+    title: '⚙ 累计参数 · ' + (p.name || '打印机'),
+    intro: '累计页数 = <b>起算前已用页数</b> + 起算日之后这台机的出纸页数。机器在进这套系统之前打掉的量，'
+      + '请填在下面第二项 —— 不补的话实测寿命会偏小、每页成本偏高。',
+    fields: [
+      { id: 'started_at', label: '累计起算日', type: 'date', value: p.started_at || '',
+        hint: '留空 = 从有记录以来（全部历史）。只统计这个日期之后的订单' },
+      { id: 'pre_pages', label: '起算前已用页数', type: 'number', value: p.pre_pages || 0,
+        hint: '起算日之前这台机已经打掉的页数（0 = 忽略；只影响实测寿命的分母，不会被摊给某个月）' }
+    ],
+    confirmText: '保存'
+  }).then(function (v) {
+    if (!v) return;
+    p.pre_pages = Math.max(0, Math.round(+v.pre_pages || 0));
+    p.started_at = _legalDateStr(v.started_at);
+    normalizePrinter(p);
+    save();
+    invalidateUsage();     // 起算范围变了 ⇒ 累计读数与结算预览都要重算
+    renderPrinters();
+    toast('✅ 已更新累计参数', 'success');
+  });
+}
+/* 寿命口径切换（⚠ 会把「预估 / 实测」互斥地清掉，两处都要提示清楚） */
+function setPrinterLifeMode(id, mode) {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); return; }
+  var p = printerById(id);
+  if (!p) return;
+  var want = (mode === 'accumulate') ? 'accumulate' : 'estimate';
+  if (want === 'accumulate') {
+    if (p.settled || p.measured) {
+      toast('这台机已经按实测寿命结算过 —— 想重新累计请点「🧾」重算', 'error');
+      return;
+    }
+    if (p.life_mode === 'accumulate') return;
+    openConfirm('改用「累计实测」？\n\n'
+      + (p.life_pages > 0 ? '现在填的预估寿命 ' + fmtInt(p.life_pages) + ' 页会被清零' : '现在没有预估寿命')
+      + '，本月起不再按估算计提折旧（改回估算法需要重新填）。\n\n'
+      + '机器报废时点「💥 结算」：把累计页数写成实测寿命，历史各月按当天页数回溯计提。', '改用累计实测')
+      .then(function (ok) {
+        if (!ok) return;
+        p.life_mode = 'accumulate';
+        p.life_pages = 0;
+        p.measured = false;
+        p.settled_at = '';
+        normalizePrinter(p);
+        save(); invalidateUsage(); renderPrinters();
+        toast('✅ 已改为累计实测：先累计用量，报废时再结算', 'success');
+      });
+    return;
+  }
+  if (p.life_mode === 'estimate') return;
+  var frozen = 0;
+  if (p.settled && p.settled.months) {
+    Object.keys(p.settled.months).forEach(function (k) { frozen += (+p.settled.months[k].cents || 0); });
+  }
+  openConfirm('改回「预估总寿命」？\n\n'
+    + (p.settled
+        ? '会解除已冻结的历史折旧（' + fmtInt(p.life_pages) + ' 页 / 合计 ' + RMB(frozen) + '，涉及 '
+          + Object.keys(p.settled.months || {}).length + ' 个月），之后历史各月改按「价格 ÷ 寿命页数」现算'
+          + '（订单归属一改，历史金额就会跟着变）。寿命页数保留 ' + fmtInt(p.life_pages) + ' 页，可再改。'
+        : '之后按「价格 ÷ 寿命页数」计提折旧。')
+    + '\n\n继续？', '改回估算').then(function (ok) {
+    if (!ok) return;
+    p.life_mode = 'estimate';
+    p.settled = null;
+    p.measured = false;
+    p.settled_at = '';
+    normalizePrinter(p);
+    save(); invalidateUsage(); renderPrinters();
+    toast('✅ 已改回预估总寿命口径', 'success');
+  });
+}
+/* 报废结算（点「💥 结算」/ 已结算机的「🧾 重算」都走这里）：
+     ① 一次拉全区间订单 → ② 按本机归属聚出「各月页数」→ ③ 预览（实测寿命 / 每页成本 / 逐月金额）
+     → ④ 确认后写回台账（寿命=实测、标记报废、冻结快照）。
+   不做任何"临时估算"：取数失败就一个字节都不改。 */
+function openPrinterSettle(id) {
+  if (!unlocked.orderprinter) { toast('🔒 请先解锁「' + MODULE_NAMES.orderprinter + '」', 'error'); return; }
+  var p = printerById(id);
+  if (!p) return;
+  var priceCents = parseCents(p.price);
+  if (!(priceCents > 0)) {
+    toast('这台机还没填「价格」—— 折旧 = 价格 × 页数 ÷ 实测总页数，没有价格算不出每页成本', 'error');
+    return;
+  }
+  var since = p.started_at || '2000-01-01', at = _todayStr();
+  var oldCents = 0, oldMonths = 0;
+  if (p.settled && p.settled.months) {
+    oldMonths = Object.keys(p.settled.months).length;
+    Object.keys(p.settled.months).forEach(function (k) { oldCents += (+p.settled.months[k].cents || 0); });
+  }
+  toast('正在统计 ' + since + ' ~ ' + at + ' 的出纸页数…');
+  fetchOrdersRange(since, at, function (orders, err) {
+    if (!orders) { toast('取数失败（' + (err || '未知') + '），未做任何修改', 'error'); return; }
+    var agg = _printerPagesFromOrders(orders, p);
+    if (!(agg.pages > 0)) {
+      toast('这台机在 ' + since + ' ~ ' + at + ' 内没有认领到任何已完成的出纸页数 —— 请先在「订单 → 打印机」里把它打过的单指定过来，或填「⚙ 累计参数 → 起算前已用页数」', 'error');
+      return;
+    }
+    var pre = Math.max(0, Math.round(+p.pre_pages || 0));
+    var total = agg.pages + pre;
+    var snap = _buildSettledSnapshot(priceCents, total, agg.pages, agg.months);
+    var keys = Object.keys(snap.months).sort();
+    var rows = keys.map(function (k) {
+      var mm = snap.months[k];
+      return '<tr><td style="white-space:nowrap">' + esc(k) + '</td><td>' + fmtInt(mm.pages) + ' 页</td>'
+        + '<td class="neg" style="white-space:nowrap">' + RMBneg(mm.cents) + '</td></tr>';
+    }).join('');
+    var body = '<p style="margin:0 0 10px;color:var(--muted);font-size:.86rem">'
+      + '统计区间 <b>' + esc(since) + ' ~ ' + esc(at) + '</b>，只算已完成的子任务'
+      + (pre > 0 ? '（另加「起算前已用」<b>' + fmtInt(pre) + '</b> 页）' : '') + '。<br>'
+      + '实测寿命 = <b>' + fmtInt(total) + ' 页</b>；整机价 ¥' + formatCents(priceCents)
+      + ' ⇒ 每页 <b>¥' + ((priceCents / total) / 100).toFixed(4) + '</b>。<br>'
+      + '确认后：台账寿命写成 ' + fmtInt(total) + ' 页（标「实测」）、这台机标记<b>报废 / 退役</b>，'
+      + '下面这些月份的折旧立刻回溯进各自月份（合计 ¥' + formatCents(snap.poolCents) + '）'
+      + (pre > 0 ? '；起算前那 ' + fmtInt(pre) + ' 页对应的 ¥' + formatCents(priceCents - snap.poolCents)
+          + ' 属于账开始之前的磨损，不摊进这些月份' : '')
+      + '。</p>'
+      + (p.settled ? '<p style="margin:0 0 10px;font-size:.84rem;color:var(--orange)">⚠ 这台机已结算过（'
+          + fmtInt(p.life_pages) + ' 页 / ' + oldMonths + ' 个月 / 合计 ' + RMB(oldCents)
+          + '）。下面是<b>重算</b>结果，确认后覆盖旧的快照。</p>' : '')
+      + '<div class="table-wrap" style="max-height:260px;overflow:auto"><table><thead><tr><th>月份</th><th>出纸页数</th><th>该月折旧</th></tr></thead><tbody>'
+      + (rows || '<tr><td colspan="3" style="color:var(--muted)">没有可分摊的月份</td></tr>')
+      + '<tr class="tfoot"><td>合计</td><td>' + fmtInt(agg.pages) + ' 页</td>'
+      + '<td class="neg" style="white-space:nowrap">' + RMBneg(snap.poolCents) + '</td></tr>'
+      + '</tbody></table></div>';
+    openModal({ title: (p.settled ? '🧾 重算报废结算 · ' : '💥 报废结算 · ') + (p.name || '打印机'),
+                body: body, confirmText: p.settled ? '重算并覆盖' : '写回台账', cancelText: '取消' })
+      .then(function (ok) {
+        if (!ok) return;
+        p.life_mode = 'accumulate';
+        p.life_pages = total;
+        p.measured = true;
+        p.settled_at = at;
+        p.settled = { at: at, pages: total, trackedPages: agg.pages, prePages: pre,
+                      cents: snap.poolCents, months: snap.months };
+        p.status = 'retired';
+        normalizePrinter(p);
+        save();
+        invalidateUsage();
+        if (currentTab === 'printers') renderPrinters(); else renderCurrent();
+        toast('✅ 已按实测 ' + fmtInt(total) + ' 页结算；' + keys.length + ' 个月的折旧已回溯', 'success');
+      });
+  });
+}
+
 function renderAuth() {
   var el = $('#tab-auth');
   if (FINANCE_MODE === 'local') {
-    el.innerHTML = '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">🔐</div><h3>授权模块仅云端模式可用</h3><p style="margin-top:6px">当前为本地模式。启用云端功能后，可在本模块绑定本设备所有者，并查看所有连接云服务器的设备。</p></div></div>';
+    /* v7.6：打印机台账已搬到「🖨️ 打印机折旧」页（它本来就是本地数据，本地模式在那页照样维护）；
+       本页只剩"云端设备"这一件事 —— 本地模式没有，故整页只给一句说明 + 指路。 */
+    var hl = '<div class="section" style="padding:16px 20px"><div class="empty" style="padding:0"><h3 style="margin-bottom:4px">本地模式</h3>'
+      + '<p style="margin:0;font-size:.84rem;color:var(--muted)">本机信息与设备列表仅云端模式可用；'
+      + '<b>打印机台账 / 折旧 / 订单归属</b>已移到「🖨️ 打印机折旧」页（本地数据，本地模式同样可以维护）。</p></div></div>';
+    el.innerHTML = hl;
     return;
   }
   if (!unlocked.auth) {
-    el.innerHTML = '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">🔐</div><h3>授权模块已锁定</h3><p style="margin-top:6px">绑定设备所有者、查看在线设备需先解锁授权模块（独立密码）。</p><button class="btn pri" style="margin-top:16px" onclick="unlockFlow(\'auth\',\'设备授权\')">🔑 输入密码解锁</button></div></div>';
+    el.innerHTML = '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">🔐</div><h3>授权模块已锁定</h3><p style="margin-top:6px">绑定设备所有者、查看在线设备需先解锁授权模块（独立密码）。<br>打印机台账与折旧不在这里 —— 已移到「🖨️ 打印机折旧」页（独立密码）。</p><button class="btn pri" style="margin-top:16px" onclick="unlockFlow(\'auth\',\'设备授权\')">🔑 输入密码解锁</button></div></div>';
     return;
   }
   var members = getMembers();
@@ -5508,7 +7306,8 @@ function renderAuth() {
   h += '<div class="section"><h2>💻 本设备 <span class="hint">（本机信息，来自本地打印工具 · 所有者从成员列表选择）</span></h2>';
   h += '<div id="auth-local-device" style="color:var(--muted)">加载中…</div></div>';
   h += '<div class="section"><h2>📡 云端设备列表 <span class="hint">（连接过云服务器的所有设备 · 在线状态实时 · 可标注自动双面能力）</span></h2>';
-  h += '<div id="auth-devices" style="color:var(--muted)">加载中…</div></div>';
+  h += '<div id="auth-devices" style="color:var(--muted)">加载中…</div>'
+    + '<div style="margin-top:10px;font-size:.78rem;color:var(--muted)">🖨️ <b>打印机台账 / 折旧 / 订单归属</b>在「🖨️ 打印机折旧」页（独立密码，与授权模块分开）。</div></div>';
   el.innerHTML = h;
   loadAuthData(members);
 }
@@ -5519,6 +7318,17 @@ function loadAuthData(members) {
     fetch('/api/local/device', { headers: apiHeaders() }).then(function (r) { return r.json(); }),
     fetch('/api/proxy/printer/devices', { headers: apiHeaders() }).then(function (r) { return r.json(); }).catch(function () { return null; })
   ]).then(function (results) {
+    /* 设备列表先缓存给「打印机 → 绑定设备」下拉用（首次到达时补一次重绘 —— 之前下拉里
+       只有"未绑定"）。即便后面本设备信息取不到，绑定下拉也已经可用。 */
+    var _dl = results[1] && (results[1].devices || (results[1].data && results[1].data.devices));
+    if (Array.isArray(_dl) && !_authDevices) {
+      _authDevices = _dl;
+      /* 「默认设备」下拉在「🔒 授权」与「🖨️ 打印机折旧」两页都要用 ⇒ 哪一页在前台就补画哪一页 */
+      setTimeout(function () {
+        if (currentTab === 'auth') renderAuth();
+        else if (currentTab === 'printers') renderPrinters();
+      }, 0);
+    }
     var box = $('#auth-local-device');
     if (!box) return;
     var dev = results[0] && results[0].device;
@@ -5811,7 +7621,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v7.0</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v7.5</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -5853,6 +7663,46 @@ function renderAbout() {
     '<p style="margin-top:10px">v7.0：订单状态订正（打印出错的便捷处理）—— 云端订单明细的「状态」列右上角新增锁定开关（默认 🔒，防误触）：点它输入密码解锁（默认 123456，与其他敏感模块一样在「设置 → 敏感模块密码」里管理）后变成 🔓，这时每个订单的状态标签才带小箭头，<b>点标签直接在「已完成 / 失败 / 放弃打印 / 已取消 / 被打回」中选正确状态，改动立即写库生效</b>（父订单与其全部子任务一并改写，金额口径、KPI、图表、明细同时按新状态重算），再点 🔓 即回到锁定、箭头收起。状态直接决定结算口径（仅「已完成」计入收益），因此订正后收益立即跟着变。⚠ 只允许改成终态：排队中 / 打印中 / 预约中这类工作状态若允许人工改，推送与预约调度会把订单重新捡起来打印，前后端都拦下。</p>' +
     '<p style="margin-top:10px">v7.1：订单<b>类型</b>订正（接单 ⇄ 自打）——「类型」列也带锁定开关，但这把锁<b>不是第二个密码</b>：它与「状态」共用同一个解锁状态，在任意一列解锁，另一列同时变成 🔓（同一个密码，在「设置 → 敏感模块密码 → 订单状态/类型订正」里管理）。解锁后点「🤝接单 / 👤自打」标签即可在两者之间切换，改动立即写库。类型只决定结算归类（<b>自打不计入收益</b>、接单计入收益），不改变打印状态、不会让订单重新排队或开打。</p>' +
     '<p style="margin-top:10px">v7.2：页数 / 张数改为<b>有效口径</b>（按页码范围折算）—— 以前「页数」「张数」及 KPI 的总页数、趋势的纸张指标一律按文件<b>整份</b>页数算，只要顾客选了页码范围（例如 2 页的 Word 只打第 1 页），张数仍显示 2 张、与实收金额（单面 1 页 ¥0.30）和真实出纸量都对不上。现在：① 文件行「页数」显示<b>实际打印页数</b>，与整份不同时用括号注明「(共 N 页)」，悬停可看页码范围原文；② 文件行「张数」、订单行「页数 / 张数」、KPI「总页数 / 纸张」、趋势「页数 / 纸张」、按来源与按成员的页数统计全部改按页码范围折算（张数仍按单面每页 1 张、双面每 2 页 1 张，含份数）。折算只由后端算（云端 revenue 与本地订单库同一套字段），页面不自行解析页码范围，避免两份口径漂移。</p>' +
+    '<p style="margin-top:10px">v7.3：📐 结算公式说明块 —— 「收支清算」页在「🔄 资金重分配」上方新增一个<b>可折叠</b>的「📐 结算公式」（默认收起，只占一行）：把整月结算的算式一次写清 —— ① 团队层一行总式 <b>Π = Σ代收 − Σ有效采购</b>（并代入本月数字）；② 成员层 8 步（收入池 → 应得收入 → 每人应摊 → 建议转账 → 实收实付 → 实际盈亏 → 应得盈亏 → 未结清），每步都标出守恒关系；③ 三条恒等式（<b>Σ建议转账 ≡ 0</b>、<b>Σ实际盈亏 ≡ Σ应得盈亏 ≡ 团队盈亏</b>、全额结清时两个口径重合）并用<b>本月真实数据自检</b>，对不上会红字提示；④ 取整规则（三处池子一律走整数分「最大余数法」，各自四舍五入会让恒等式永久不成立）；⑤ 页面上每张表用的是哪个量。说明块只做展示，所有数字仍由 calcMonth 唯一给出，改一笔实际转账会就地刷新（并保持展开态）。</p>' +
+    '<p style="margin-top:10px">v7.4：采购按用量分摊 + 🖨️ 打印机寿命（折旧）—— ① 采购不再只能均摊：「设置 → 结算参数 → 采购分摊」可切成<b>按用量</b>，按各成员本月<b>实际出纸页数</b>的比例出采购钱（只算已完成子任务，含自打/免费单——纸确实用掉了；当月总页数为 0 自动退回均摊）；「收支清算」的采购明细新增<b>每人用量 / 占比 / 应摊</b>表。② 新增<b>「🔒 授权 → 🖨️ 打印机」台账</b>：登记在运营的机器（名称 / 型号 / 价格 / 寿命页数 / 绑定设备 / 在役或退役），每页成本 = 价格 ÷ 寿命页数；现场两台已知机型可一键登记（霍楠的设备 = HP LaserJet 1020、姚懿祥的设备 = HP LaserJet MFP M232-M237）。③ 「云端数据」新增<b>「🖨️ 打印机」列表</b>：每台机在本口径内打了多少页、已耗寿命百分比、吃掉多少折旧，并逐单列出<b>这单是哪台机打的</b>（按接单设备自动匹配，认不出设备时按已知机型兜底）。④ 「收支清算」新增<b>「🖨️ 设备折旧」</b>区块，折旧作为<b>非现金成本</b>同时从「经营损益」和「实际盈亏」里扣（不参与建议转账——没有人该为此转账），团队盈亏公式变为 <b>Π = Σ代收 − Σ采购 − Σ折旧</b>，三条恒等式照旧成立（Σ建议转账 ≡ 0、Σ实际盈亏 ≡ Σ应得盈亏 ≡ Π、全额结清时两口径重合）；「📐 结算公式」说明块同步更新到含折旧的 9 步。用量取数失败时页面会<b>显式标注并给重试</b>，绝不把失败当成 0 页（那会把折旧静默算成 ¥0）。</p>' +
+    '<p style="margin-top:10px">v7.5：打印机「所有者 + 两种计费方式」+ 订单→打印机人工指定 —— '
+    + '① 「🔒 授权 → 🖨️ 打印机」的「绑定设备」改为<b>所有者</b>（共有 / 某个成员个人所有）与<b>计费方式</b>：'
+    + '<b>团队共担</b> = 磨损算团队成本（机器没进过采购账，如 1020，所有者记 闫承翰）；'
+    + '<b>收损耗费</b> = 购买款所有者已付过（如 HP LaserJet MFP M232-M237 由三人均摊买下）。'
+    + '② 「收损耗费」的机器不再计入团队成本（否则购买款会被重复计一次），改为<b>损耗费转账</b>：'
+    + '谁用谁按自己消耗的寿命价值，把<b>其他所有者应得的那几份</b>付给他们（自己那一份是自己资产缩水，不产生现金）；'
+    + '这笔钱进「资金重分配」的独立损耗费组、并在「经营损益」多出一列「± 损耗费」（合计恒为 0，不影响团队盈亏）；'
+    + '「实际转账」里照常记录是否已付，付清后「实际盈亏 = 应得盈亏」仍然成立。'
+    + '③ 接单设备<b>不决定</b>用哪台打印机（一台设备可能接着好几台机），因此「默认设备」降级为兜底线索，'
+    + '真正归属在「🖨️ 打印机折旧」页的<b>「订单 → 打印机」</b>里<b>逐单人工指定</b>（选择结果随财务配置同步）。'
+    + '④ 「📐 结算公式」更新为 10 步（新增损耗费 Wᵢ，含 <b>ΣWᵢ ≡ 0</b> 恒等式）。⑤ 授权台账顺手做了三处打磨：' + 
+    '去掉与型号重复的「名称」列（一格同时写名称与型号）、「每页成本」不再被挤成竖排、切换下拉<b>不再整页重绘</b>' + 
+    '（旧写法每改一个选项就重建整个标签页并重新拉设备列表 → 画面闪一下、下拉被弹回）。</p>' +
+    '<p style="margin-top:10px">v7.6：<b>「🖨️ 打印机折旧」独立成页</b> + 台账单独一把锁 —— '
+    + '① 打印机相关的三块内容（<b>打印机台账</b>、<b>本口径用量与折旧</b>、<b>订单 → 打印机逐单归属</b>）'
+    + '从「🔒 授权」和「📡 云端数据」两个页面收拢到新标签页「🖨️ 打印机折旧」：'
+    + '云端数据页只讲"这个月赚了多少、订单怎么样"，而订单明细那张表已经挤到不能再加「打印机」一列。'
+    + '② 新页与云端数据<b>共用同一份口径</b>（时间 / 成员 / 来源筛选），改一边另一边一起变；'
+    + '顶部口径栏仍可切换月份与自定义区间。'
+    + '③ 台账与逐单归属改由<b>独立密码模块「打印机台账/归属」</b>保护（在「设置 → 敏感模块密码」里设置），'
+    + '表头一个 🔒：默认锁定（只读展示），解锁后才能改价格 / 寿命 / 归属与计费、才能逐单指定"这单是哪台机打的"；'
+    + '两处共用同一把锁（任一处解锁另一处同时解锁）。'
+    + '④ 「所有者」+「计费方式」两个下拉合成<b>一个「归属 / 计费」</b>（四类选项：团队共有·团队共担 / 某人自带·团队共担 / 共有·收损耗费 / 某人个人所有·收损耗费）：'
+    + '两列在账上并不冗余（团队共担 = 机器钱没进过采购 ⇒ 只算团队成本、没有转账；收损耗费 = 购买款所有者已付过 ⇒ 用的人补给所有者），'
+    + '但交叉起来非常反直觉，所以底层字段照旧、界面上一次选完。'
+    + '⑤ 「订单 → 打印机」的成员列改为<b>普通文字</b>（不再用彩色底纹，用户 2026-10-25 要求 —— 一眼看名字就够，颜色在这一页没有含义）。</p>' +
+    '<p style="margin-top:10px">v7.7：<b>寿命第二口径「累计实测」</b>（不预估总寿命）—— '
+    + 'HP 官方只给「月打印负荷 / 建议月印量 / 硒鼓寿命」，<b>整机总寿命本来就查不到</b>（1020 能跑十几年），'
+    + '硬填一个猜测值等于拿猜的数字去分钱。现在台账「寿命」栏多一种口径（右侧「累计 / ⇄」切换）：'
+    + '① <b>累计实测</b>：不填寿命 —— 台账从起算日（可留空 = 全部历史，另可填「起算前已用页数」）'
+    + '一直累计这台机的<b>出纸页数</b>并在格子里实时显示；'
+    + '② 机器报废时点<b>「💥 结算」</b>：把累计页数写成<b>实测寿命</b>，同时按各月页数把整机价折成每月金额'
+    + '（整数分、最大余数法，<b>Σ各月恰好等于追踪期应承担的寿命价值</b>，起算前那部分单列不进本账），'
+    + '确认后这台机标记<b>报废 / 退役</b>、寿命标「实测」，那些月份的折旧<b>立刻回溯进各自月份</b>；'
+    + '③ 结算结果<b>冻结成快照</b>（每月页数 / 每人页数 / 每月金额）—— 之后改订单归属、改名、换绑、删设备，'
+    + '都不会把已经报给成员的账改掉；④ 累计期间该机<b>不计提折旧</b>（每页成本未知），'
+    + '报废机因为带着快照，历史折旧照旧留在账上（不会随"退役"一起消失）；'
+    + '⑤ 想换回估算口径点「⇄」即可（会解除冻结的历史折旧，寿命页数保留可再改）。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
@@ -6015,7 +7865,7 @@ function finishLoad(hadCloud) {
   var keys = allMonthKeys();
   currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
   // 云端月份预加载
-  loadCloudMonths().then(function () { _cloudMonthsReady = true; renderCloud(); });
+  loadCloudMonths().then(function () { _cloudMonthsReady = true; _renderScopeViews(); });
   renderAll();
   checkHealth();
   setInterval(checkHealth, 30000);

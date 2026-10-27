@@ -343,6 +343,9 @@ function setupMeButtons() {
   document.getElementById('orderList').addEventListener('click', (e) => {
     const cancel = e.target.closest('[data-cancel-order]');
     if (cancel) { e.stopPropagation(); cancelOrder(parseInt(cancel.dataset.cancelOrder, 10)); return; }
+    // 合计价格 → 复制气泡（Popconfirm）。必须挡在卡片折叠之前，否则点价格会把详情收起
+    const priceTap = e.target.closest('[data-price-copy]');
+    if (priceTap) { e.stopPropagation(); openPricePop(priceTap, priceTap.dataset.priceCopy); return; }
     const card = e.target.closest('[data-order-id]');
     if (card) toggleOrder(parseInt(card.dataset.orderId, 10));
   });
@@ -419,6 +422,9 @@ function setupMeButtons() {
   document.getElementById('userOrdersList').addEventListener('click', (e) => {
     const cancel = e.target.closest('[data-cancel-order]');
     if (cancel) { e.stopPropagation(); cancelOrder(parseInt(cancel.dataset.cancelOrder, 10)); return; }
+    // 同一张订单卡片模板：合计价格也可复制（管理员在「用户订单」子视图里同样能用）
+    const priceTap = e.target.closest('[data-price-copy]');
+    if (priceTap) { e.stopPropagation(); openPricePop(priceTap, priceTap.dataset.priceCopy); return; }
     const card = e.target.closest('[data-order-id]');
     if (card) toggleUserOrdersOrder(parseInt(card.dataset.orderId, 10));
   });
@@ -864,7 +870,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
       ${extRows}
       ${remarkRows}
       <view class="detail-section">
-        <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text><text class="detail-price-value status-${o.status || 'queued'}${(o.is_admin_print && o.status === 'sent') ? ' is-self-sent' : ''}">¥${o.totalPriceDisplay || '0.00'}</text></view>
+        <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text><view class="detail-price-tap" data-price-copy="${o.id}"><text class="detail-price-value status-${o.status || 'queued'}${(o.is_admin_print && o.status === 'sent') ? ' is-self-sent' : ''}">¥${o.totalPriceDisplay || '0.00'}</text><text class="price-copy-icon">📋</text></view></view>
       </view>
       <view class="detail-actions">
         ${canCancel ? `<button class="btn-cancel-sm" data-cancel-order="${o.id}">取消任务</button>` : ''}
@@ -970,6 +976,158 @@ function toggleOrder(id) {
   // 详情展开/收起有 0.3s 动画，收起后内容变短需在动画结束后再次测量（对齐小程序 onOrderTap 双测量），
   // 否则界面停留在旧滚动位置下方留白
   setTimeout(() => measureAll(320), 340);
+}
+
+/* ================= 合计价格复制（Popconfirm 气泡） =================
+   金额一律取订单**已定稿**的实收值（orders.total_price / order_files.total_price）——
+   设备回报页数后后端会重算并回写，前端不再套单价，所以复制出去的就是页面上看到的数字。
+   气泡挂在 body 末尾（fixed），既逃出 .scroll-content 的 translateY 变换层，
+   也不会被订单卡片的 overflow:hidden / max-height 裁剪。 */
+
+let _pricePopEl = null;
+
+function _priceOrderTotal(o) {
+  return Math.round((Number(o && o.total_price) || 0) * 100) / 100;
+}
+
+function _priceOrderById(id) {
+  const pools = [meState.orders];
+  const v = meState.userOrdersView;
+  if (v && v.orders && v.orders.length) pools.push(v.orders);
+  for (let i = 0; i < pools.length; i++) {
+    const hit = (pools[i] || []).filter(o => o && String(o.id) === String(id))[0];
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// 详细价格文本：逐文件 + 附加服务 + 合计（金额全部取订单已定稿的实收值）
+function buildPriceDetailText(o) {
+  const lines = ['计费明细'];
+  if (o.order_number) lines.push(o.order_number);
+  lines.push('─'.repeat(14));
+  const total = _priceOrderTotal(o);
+  const parts = [];
+  let itemNo = 0;
+  let baseTotal = 0;
+  (o.files || []).forEach(f => {
+    itemNo++;
+    const amount = Number(f.total_price) || 0;
+    baseTotal += amount;
+    const duplexLabel = f.duplex === 'on' ? '双面' : '单面';
+    const rangeLabel = f.page_range ? ('选 ' + f.page_range + ' 页') : '全部页';
+    const pagesText = f.pagesLine || ((Number(f.copies) || 1) + ' 份');
+    lines.push(itemNo + '. ' + (f.original_name || f.file_name || '未知文件'));
+    lines.push('   ' + pagesText + ' | ' + duplexLabel + ' | ' + rangeLabel + ' | ¥' + amount.toFixed(2));
+    if (amount > 0) parts.push(amount.toFixed(2));
+  });
+  const urgencyFee = Number(o.urgency_price) || 0;
+  if (urgencyFee > 0) {
+    itemNo++;
+    lines.push(itemNo + '. 优先级：' + (o.urgency || '中') + ' | ￥' + urgencyFee.toFixed(2));
+    parts.push(urgencyFee.toFixed(2));
+  }
+  const coverCount = Number(o.cover_page) || 0;
+  const coverFee = coverCount > 0
+    ? Math.round((Number(o.cover_page_price) || 0) * coverCount * 100) / 100
+    : 0;
+  if (coverFee > 0) {
+    itemNo++;
+    lines.push(itemNo + '. 打印首页信息 | ' + coverFee.toFixed(2));
+    parts.push(coverFee.toFixed(2));
+  }
+  if (Number(o.delivery_enabled)) {
+    itemNo++;
+    const pct = Number(o.delivery_percentage) || 0;
+    const loc = o.delivery_location || '未指定地点';
+    // 派送费取残差：后端父订单价 = round(文件小计 + 加急 + 首页 + round(文件小计 × 百分比/100, 2), 2)，
+    // 每项都是两位小数 ⇒ 残差即实收派送费。前端不重写取整口径（Math.round 与 Python round
+    // 在 .5 边界会差 1 分），也保证与实收一致。
+    const deliveryFee = Math.max(0, Math.round((total - baseTotal - urgencyFee - coverFee) * 100) / 100);
+    // 残差与「小计 × 百分比」相差一分以内才算可信：历史单被人工改过价时不把差额乱归因到派送
+    const feeSane = Math.abs(deliveryFee - baseTotal * pct / 100) <= 0.011;
+    if (deliveryFee > 0 && feeSane) {
+      lines.push(itemNo + '. 派送：是 | ' + loc + ' ' + pct + '% | ￥' + deliveryFee.toFixed(2));
+      parts.push(deliveryFee.toFixed(2));
+    } else if (feeSane) {
+      lines.push(itemNo + '. 派送：是 | ' + loc + '（免费）');
+    } else {
+      // 实收对不上「小计 × 百分比」：只写百分比，不猜金额（合计仍按实收）
+      lines.push(itemNo + '. 派送：是 | ' + loc + ' ' + pct + '%');
+    }
+  }
+  lines.push('─'.repeat(14));
+  const sum = Math.round(parts.reduce((s, p) => s + parseFloat(p), 0) * 100) / 100;
+  // 逐项相加与实收一致 → 给出算式；不一致（历史数据/人工调整）只写实收合计，不编算式
+  if (parts.length && Math.abs(sum - total) < 0.005) {
+    lines.push('💰合计: ' + parts.join('+') + '=￥' + total.toFixed(2));
+  } else {
+    lines.push('💰合计: ￥' + total.toFixed(2));
+  }
+  return lines.join('\n');
+}
+
+function closePricePop() {
+  if (_pricePopEl) {
+    _pricePopEl.remove();
+    _pricePopEl = null;
+  }
+}
+
+function openPricePop(anchor, orderId) {
+  closePricePop();
+  const o = _priceOrderById(orderId);
+  if (!o || !anchor) return;
+  const mask = document.createElement('div');
+  mask.className = 'price-pop-mask';
+  mask.innerHTML =
+    '<div class="price-pop" role="dialog">' +
+      '<div class="price-pop-head"><span class="price-pop-icon">📋</span>' +
+        '<span class="price-pop-title">复制这份订单的价格</span></div>' +
+      '<div class="price-pop-acts">' +
+        '<button type="button" class="price-pop-btn" data-price-act="simple">复制价格</button>' +
+        '<button type="button" class="price-pop-btn primary" data-price-act="detail">复制详细价格</button>' +
+      '</div>' +
+      '<div class="price-pop-caret"></div>' +
+    '</div>';
+  document.body.appendChild(mask);
+  _pricePopEl = mask;
+
+  const pop = mask.querySelector('.price-pop');
+  const caret = mask.querySelector('.price-pop-caret');
+  const rect = anchor.getBoundingClientRect();
+  const winW = window.innerWidth || 375;
+  const winH = window.innerHeight || 667;
+  const w = Math.min(280, winW - 24);
+  pop.style.width = w + 'px';
+  const left = Math.max(8, Math.min(rect.right - w, winW - w - 8));
+  pop.style.left = left + 'px';
+  caret.style.left = Math.max(16, Math.min(rect.left + rect.width / 2 - left, w - 16)) + 'px';
+  // 垂直：优先在价格上方；上方放不下（卡片贴近屏幕顶部）翻到下方，箭头朝上
+  const ph = pop.offsetHeight || 96;
+  let top = rect.top - ph - 12;
+  let below = false;
+  if (top < 8) { below = true; top = rect.bottom + 12; }
+  pop.style.top = top + 'px';
+  pop.classList.toggle('price-pop-below', below);
+
+  mask.addEventListener('click', (ev) => {
+    const act = ev.target.closest ? ev.target.closest('[data-price-act]') : null;
+    if (act) {
+      ev.stopPropagation();
+      const cur = _priceOrderById(orderId) || o;   // 点下去那一刻再取一次，避免轮询后价格过期
+      const simple = act.dataset.priceAct === 'simple';
+      const text = simple
+        ? ((cur.order_number ? cur.order_number + ' ' : '') + '¥' + _priceOrderTotal(cur).toFixed(2))
+        : buildPriceDetailText(cur);
+      closePricePop();
+      copyText(text, simple ? '已复制价格' : '已复制详细价格');
+      return;
+    }
+    closePricePop();
+  });
+  // 气泡打开时屏蔽背景滚动（与小程序 catchtouchmove 同口径）
+  mask.addEventListener('touchmove', (ev) => ev.preventDefault(), { passive: false });
 }
 
 function changeOrdersPage(page) {
@@ -2476,4 +2634,4 @@ function deleteMyFile(fileId, name) {
 
 /* ================= 启动 ================= */
 
-window.addEventListener('pagehide', () => { stopOrderPolling(); stopUserOrdersPolling(); stopKeyPolling(); stopTempCountdown(); });
+window.addEventListener('pagehide', () => { closePricePop(); stopOrderPolling(); stopUserOrdersPolling(); stopKeyPolling(); stopTempCountdown(); });

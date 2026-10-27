@@ -221,6 +221,21 @@ bash backup.sh  # crontab 每天凌晨3点
 - 页数在提交后才回报 → 轮询成功处调 `_applyPageCountToOrder` / `applyPageCountToOrder` 写回提交快照（`_lastOrderResult.files`），拦下自动解除、提示消失（后端 `page_count_result` → `_recalc_prices_for_file` 已回溯重算订单价，此时复制到的就是实收价）。
 - 验收：`node tests/verify_copy_price_page_guard.js`（真实源码 + 桩环境：离线 Word、md、在线未返回、已验证放行、PDF/图片、混合订单、页数回报后解除）。
 
+### 「我 → 订单详情 → 合计价格」复制（Popconfirm 气泡，2026-10-26 用户要求）
+
+需求原话：「给这个价格加上一个复制功能，点击之后弹出一个 Popconfirm 气泡，两个按钮是『复制价格』和『复制详细价格』。」
+
+- **入口**：`合计价格` 那行右侧的 `¥xx.xx`（旁边一个小 📋）可点。两端同款：小程序 `pages/me/me.wxml`（`.detail-price-tap`）→ `me.js::onPriceTap`；APP `www/me.js::orderCardHTML` 输出 `data-price-copy` → `#orderList` / `#userOrdersList` 的委托里 `openPricePop`。
+- **气泡**：**必须挂在 page-root 外 + `position: fixed`**。订单卡片 `.order-card-detail` 有 `overflow:hidden` + `max-height`（小程序 2000rpx / APP 240cqw），放进卡片里必被裁；滚动容器 `.scroll-content` 还有 `translateY` 变换层，fixed 在里面会相对变换层定位。锚在价格上方 12px（`.price-pop-above`），上方放不下自动翻到下方（`.price-pop-below`，箭头朝上）。小程序用 `wx.getWindowInfo()` + `createSelectorQuery` 量价格矩形后写 px 坐标（`pricePopLeft/Top/Bottom/CaretLeft`）；APP 直接 `getBoundingClientRect()`，气泡 `document.body.appendChild`。
+- **关闭**：点透明 mask、复制成功、订单卡片收起/分页刷新（`loadOrders` 重置 `expandedOrders`）、切 tab（APP `switchTab` 调 `closePricePop`；小程序 `pageLifetimes.show` 重置 `showPricePop`）。
+- **金额口径（关键）**：一律取订单**已定稿**的实收值 —— `orders.total_price` / `order_files[].total_price`，**「我」页不重算单价、不复刻取整**（设备回报页数后后端 `_recalc_prices_for_file` 会重算并回写这两处）。
+  - 「复制价格」= `订单号 + 空格 + ¥xx.xx`（与首页提交成功弹窗里的「复制价格」同格式）。
+  - 「复制详细价格」= `计费明细` / 订单号 / 分隔线 / 逐文件（`份 × 页 | 单/双面 | 页码范围 | ¥小计`）/ 加急 / 首页 / 派送 / 合计算式。
+  - **派送费取残差** `实收合计 − 文件小计 − 加急 − 首页`：后端父订单价 = `round(文件小计 + 加急 + 首页 + round(文件小计 × 百分比/100, 2), 2)`，每项都是两位小数 ⇒ 残差就是实收派送费；**不要**在这里重写 `Math.round`（它与 Python `round` 在 .5 边界差 1 分，首页那边为此专门写了 `pyRound2`）。残差与「小计 × 百分比」相差超过 1 分（历史单被人工改过价）→ 派送行只写百分比不写金额，合计仍按实收。
+  - 逐项相加 ≠ 实收时只写 `💰合计: ￥实收`，**不编算式**。
+- 边界：本次只做「我」页订单详情；小程序管理员侧的 `pages/user-orders`（按用户看订单）仍未接（APP 的「用户订单」子视图复用同一张卡片模板，因此免费带上）。
+- 验收：`node tests/verify_price_copy_popconfirm.js`（真实两端源码 + 桩环境：定位/翻下/两种文案/附加服务残差/口径不一致/关闭时机/两端文案一致）与 `node tests/verify_price_copy_render.mjs`（Playwright 真实渲染：气泡不在卡片内、底边=价格顶边-12px、箭头对准、点价格不收起卡片、两个按钮真的写进剪贴板、mask 关闭、翻下、深色模式；截图在 `截图展示/价格复制气泡/`）。
+
 ### 页数分析的设备归属（谁下载 / 转 PDF / 数页）
 
 页数分析要把**整份文件**下载到某台机器、用 Word/WPS 转 PDF 才能数页，所以"发给谁"有成本，不能随便挑第一台在线设备（线上反馈：选了离线设备 A，Word 被在线设备 B 拿去转换）。`request_page_analysis(file_id, file_name, prefer_client)` 的优先级：

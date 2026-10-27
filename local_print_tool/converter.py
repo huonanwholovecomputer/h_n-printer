@@ -132,7 +132,11 @@ def office_sandbox_enabled() -> bool:
 def should_sandbox(file_path: str, from_cloud: bool = False) -> bool:
     """该文件本次转换是否走沙箱：只有**本地**的 .doc/.docx（COM 引擎）才需要。
 
-    · 云端文件在 S1-04 已强制 LibreOffice（无宏执行路径），不必再套 COM 沙箱；
+    · 云端文件默认在 S1-04 已强制 LibreOffice（无宏执行路径），不必再套 COM 沙箱；
+      ⚠ 2026-10-26 隐式规则的唯一例外（管理员自打 + 管理员上传）会在**主进程**直接跑 COM，
+      **不经过 Job Object 沙箱**（S2-03 的沙箱本来就只覆盖本地
+      .doc/.docx；真机验证也证明它对 Word/WPS 基本无效）。要连它一起套，得把
+      `allow_cloud_com` 传进来并重做 S2-03 的口径 —— 本批刻意没做；
     · xls/xlsx/ppt/pptx 本来就只走 LibreOffice 子进程（独立进程、无宏），不套；
     · 开关关闭 ⇒ 恒 False（对存量行为零影响）。
 
@@ -160,9 +164,10 @@ def _harden_office_com_app(app, label: str) -> dict[str, bool]:
         取不到时**这一项在 WPS 侧不生效**，宏拦截退回到 WPS 自身的宏安全级别设置
         （界面「信任中心」/ 注册表项，本程序不越权去改用户的安全策略）；
       · `Options.UpdateLinksAtOpen` —— 同上，取不到时只是不主动关链接更新。
-    因此**云端来源的文档根本不会走到这里**（强制 LibreOffice）；这里服务的是用户自己
-    从本地拖进来的文件 —— 出问题的是用户自己的文件，而宏仍被上面两条挡住（Word 侧全生效，
-    WPS 侧尽力而为 + 新版本生效）。
+    因此**顾客上传的云端文档根本不会走到这里**（强制 LibreOffice）；这里服务的是用户自己
+    从本地拖进来的文件，以及「管理员自打 + 管理员上传」那一条隐式放行路径（2026-10-26）——
+    出问题时都能追溯到具体文件，而宏仍被上面两条挡住（Word 侧全生效，WPS 侧尽力而为 +
+    新版本生效）。
     """
     applied: dict[str, bool] = {}
 
@@ -1793,7 +1798,8 @@ def _sanitize_office_refs(func):
 
 @_sanitize_office_refs
 def _convert_office_to_pdf(file_path: str, output_pdf: str,
-                           from_cloud: bool = False) -> None:
+                           from_cloud: bool = False,
+                           allow_cloud_com: bool = False) -> None:
     """
     Office 文档 → PDF（多引擎智能降级）。
 
@@ -1815,13 +1821,23 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
             False（默认）= 用户本地文件 ⇒ 保持原三引擎降级链，行为零变化。
             ⚠ **默认值必须是 False**：把本地文件也赶去 LibreOffice 会让「门店装没装
             LibreOffice」从"只影响兜底"变成"直接影响首选渲染"，那是回归。
+        allow_cloud_com: **「管理员自打 + 管理员上传」隐式规则的放行位**（2026-10-26 晚）。
+            只有该任务确为 `is_admin_print`（订单类型「自打」）**且**文件由管理员上传
+            （`uploader_is_admin`）时才由调用方置 True —— 判定本体在
+            `printer_config.cloud_word_com_allowed()`，本函数只消费结论。
+            为 True 时云端 .doc/.docx 走与本地文件相同的 COM 降级链（仍带
+            AutomationSecurity=3 / DisplayAlerts=0 / UpdateLinksAtOpen=False 硬化）。
+            ⚠ **默认值必须是 False**：默认仍强制 LibreOffice，不给顾客文件任何 COM 机会。
     """
     ext = ext_of(file_path)
 
-    # ── 云端来源的 Office 文档：绝不交给 Word/WPS（S1-04）──
+    # ── 云端来源的 Office 文档：默认绝不交给 Word/WPS（S1-04）──
     # LibreOffice 无头转换不执行 VBA（也不跑 AutoOpen/Document_Open 宏），是这条链上
     # 唯一"内容不可信也敢打开"的引擎。装没装 LibreOffice 在这里变成硬前提，见下方报错。
-    if from_cloud and ext in COM_OFFICE_EXTS:
+    # ⚠ 唯一例外（2026-10-26 隐式规则）：该任务是「管理员自打」**且**文件由管理员上传时，
+    #   调用方会传 allow_cloud_com=True —— 那时走下面的 COM 降级链（仍带宏/弹窗/外链硬化）。
+    #   顾客上传的内容永远拿不到这个放行位。
+    if from_cloud and ext in COM_OFFICE_EXTS and not allow_cloud_com:
         if not _find_libreoffice():
             raise RuntimeError(
                 "云端来源的 Office 文档（.doc/.docx）强制用 LibreOffice 转换（不执行宏），"
@@ -1834,6 +1850,13 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
             f" ({os.path.basename(file_path)})")
         _convert_office_via_libreoffice(file_path, output_pdf)
         return
+
+    # 云端来源 + 隐式放行（管理员自打 + 管理员上传）：显式记一条 WARNING，事后能从日志分辨
+    # 「这单为什么没走 LibreOffice」，也让安全口径（谁在什么情况下放开的）可追溯。
+    if from_cloud and ext in COM_OFFICE_EXTS and allow_cloud_com:
+        logger.warning(
+            "引擎策略：云端 Word 文档按「管理员自打 + 管理员上传」隐式规则允许 Word/WPS COM"
+            f"（COM 已硬化：禁用宏/弹窗/外链更新）: {os.path.basename(file_path)}")
 
     # Word 文档：多引擎降级
     if ext in COM_OFFICE_EXTS:
@@ -2105,7 +2128,8 @@ class UniversalConverter:
         cm[".md"] = _convert_markdown_to_pdf
 
     def convert(self, file_path: str, output_pdf: str | None = None,
-                image_orientation: str = "auto", from_cloud: bool = False) -> str:
+                image_orientation: str = "auto", from_cloud: bool = False,
+                allow_cloud_com: bool = False) -> str:
         """
         将文件转换为 PDF。
 
@@ -2119,6 +2143,9 @@ class UniversalConverter:
                 **默认 False = 本地文件语义**，三引擎降级链与之前完全一致。
                 云端调用点：`cloud_client.py` 页数分析、`gui.ConvertWorker`（云端任务
                 预转换）、`gui.PrintWorker`（job.task_id > 0 的兜底转换）。
+            allow_cloud_com: 仅当「本机策略允许 + 任务确为管理员自打单」时置 True
+                （见 `_convert_office_to_pdf`）；默认 False = 云端 Word 仍强制 LibreOffice。
+                页数分析路径**永远不传**（上传时还不知道订单归属，按最严口径走 LO）。
 
         Returns:
             生成的 PDF 文件路径
@@ -2152,7 +2179,10 @@ class UniversalConverter:
 
         try:
             logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF"
-                        + ("（云端来源：Office 强制 LibreOffice）" if from_cloud else ""))
+                        + ("（云端来源：Office 强制 LibreOffice）"
+                           if from_cloud and not allow_cloud_com else "")
+                        + ("（云端来源：管理员自打单放行 COM）"
+                           if from_cloud and allow_cloud_com else ""))
             # 图片方向可配置：把 image_orientation 传给图片渲染函数（其余类型忽略）
             if convert_func is _convert_image_to_pdf:
                 convert_func(file_path, output_pdf, image_orientation)
@@ -2170,14 +2200,17 @@ class UniversalConverter:
                         return output_pdf
                     if _res.status == "unavailable":
                         logger.warning(f"转换沙箱不可用，回退进程内转换: {_res.error}")
-                        convert_func(file_path, output_pdf, from_cloud=from_cloud)
+                        convert_func(file_path, output_pdf, from_cloud=from_cloud,
+                                     allow_cloud_com=allow_cloud_com)
                     else:
                         raise RuntimeError(
                             f"隔离转换失败（{_res.status}）：{_res.error}。"
                             f"若该文档在其它机器能正常转换，请把日志里的 office_sandbox 行交给管理员。")
                 else:
                     # S1-04：来源标记只影响 Office 转换引擎的选择（云端 → LibreOffice）
-                    convert_func(file_path, output_pdf, from_cloud=from_cloud)
+                    # 2026-10-26 方案 B：管理员自打单可按本机策略放行 COM（allow_cloud_com）
+                    convert_func(file_path, output_pdf, from_cloud=from_cloud,
+                                 allow_cloud_com=allow_cloud_com)
             else:
                 convert_func(file_path, output_pdf)
 

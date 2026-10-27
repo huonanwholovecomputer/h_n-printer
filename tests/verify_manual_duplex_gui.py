@@ -125,6 +125,8 @@ class Rec:
         self.progress = []
         self.finished = []
         self.plan_labels = []    # [{sheets:[(标签,a,b)], slots:{纸序:标签}}]
+        # 每一趟**真正提交的那份批次 PDF** 的逐页文本（核"单面文件真的并进来了吗"）
+        self.plan_pages = []     # [[页文本…], [页文本…]]（第 1 趟 / 第 2 趟）
         self.plan = []           # [(第 1 趟张数, 预估秒数)] —— 批次开始播报
         self.samples = []        # [(第 1 趟张数, 实测秒数)] —— 自动学习样本
         self.all_finished = []   # [(成功数, 失败数)]
@@ -173,6 +175,8 @@ def patched(rec, fail_merge_at=None):
             "sheets": [(s.label, s.side_a, s.side_b) for s in plan.sheets],
             "slots": {s.sheet_index: s.label for s in list(plan.first_pass) + list(plan.second_pass)},
         })
+        # 真正提交给打印机的那份批次 PDF 的逐页文本（"单面文件有没有并进来"只能看这里）
+        rec.plan_pages.append(_pdf_page_texts(path))
         if progress_callback:
             for i in range(1, len(seq0) + 1):
                 progress_callback(i, len(seq0))
@@ -196,11 +200,11 @@ def patched(rec, fail_merge_at=None):
 
 
 def make_job(path, duplex="on", copies=1, mode="long-edge", name="", page_count=0,
-             page_range=""):
+             page_range="", dpi=0):
     """默认 page_count=0 = **页数未知**（`_uses_manual_duplex` 不当成 1 页，保持既有口径）；
     要复现"页数已知的 1 页文件"这类现场，显式传 page_count。"""
     return PrintJob(file_path=path, copies=copies, duplex=duplex, duplex_mode=mode,
-                    page_range=page_range, page_count=page_count,
+                    page_range=page_range, page_count=page_count, dpi=dpi,
                     display_name=name or os.path.basename(path))
 
 
@@ -351,74 +355,187 @@ rec = run_worker([make_job(PDF5, name="A.docx"), make_job(PDF3, duplex="off", na
                   make_job(PDF1, name="C.docx")], MANUAL)
 check("★ 混排：两个双面文件被合并成**一批一次翻纸**（不因中间夹了单面文件而翻两次）",
       len(rec.flip) == 1 and len(rec.plan_pass) == 2, f"flip={len(rec.flip)}")
-# 2026-10-18（两处口径都变了，一起钉住）：
-# ① B(3 页单面) 与 A(5 页，页数未知 ⇒ 有效双面=off) 的参数相同 ⇒ 被**合并成一个作业**
-#    （少中断：`_print_merged_group`），所以这里只剩 1 次 print_pdf（旧断言期望 2 次）；
-# ② 只有 C（1 页）进了手动双面批次 —— 1 页硬闸门让它按"未知不当 1 页"进来。
-check("混排：A(5页)与B(3页单面)参数相同 ⇒ 合并成 1 个作业直打（duplex=off）",
-      len(rec.print_pdf) == 1 and rec.print_pdf[0].get("duplex") == "off",
-      f"{[(c.get('duplex'), c.get('copies')) for c in rec.print_pdf]}")
+# 2026-10-26（用户现场 HN20261026-0014）口径：**整单一个批次** ——
+# 本单既然要翻一次纸，单面/1 页文件就不许另起直打作业（旧口径下 B、C 会先直打成
+# 另一份 spooler 作业，同一个订单 = 3 个作业）。它们按 `FilePlan(duplex=False)` 并入
+# 同一份页序：每页各占一张纸、背面留空，第 2 趟对应槽位打空白占位页（只走纸不打墨）。
+check("★ 混排：**没有**任何直打作业（A/B/C 全并进同一批次 ⇒ spooler 里只剩两趟）",
+      len(rec.print_pdf) == 0, f"{[(c.get('duplex'), c.get('copies')) for c in rec.print_pdf]}")
 check("混排：三个任务都有完成回报", sorted(i for i, _ok, _m in rec.finished) == [0, 1, 2],
       f"{rec.finished}")
-check("混排：合并作业的页序 = 按顺序抽 A 的前一面(1/3/5) + B 的 3 页(6/7/8)",
-      rec.plan_pass == [] or True, "")
-check("混排：第 1 趟 = A 的 3 张前一面(1/3/5) + C 的空白占位(6)",
-      rec.plan_pass[0][3] == [1, 3, 5, 6],
+check("★ 混排：7 张纸（A 3 + B 3 + C 1），第 1 趟 = A 1/3/5 + B 6/7/8 + C 9",
+      rec.plan_pass[0][3] == [1, 3, 5, 6, 7, 8, 9],
       f"{rec.plan_pass[0][3]}")
-check("★ 混排：第 2 趟 = B(4) + C(空白) + A 的末张空白，且每张纸都走一遍",
-      rec.plan_pass[1][3] == [None, None, 4, 2],
+check("★ 混排：第 2 趟 = 整批逆序补打（B/C 与 A 末张的背面都是空白占位）",
+      rec.plan_pass[1][3] == [None, None, None, None, None, 4, 2],
       f"{rec.plan_pass[1][3]}")
+check("★ 混排：单面文件在页序里各自成一张纸（B 三页各占一张、C 一页一张）",
+      [s for s in rec.plan_labels[0]["sheets"] if s[0].startswith("B.docx")]
+      == [("B.docx", 6, None), ("B.docx", 7, None), ("B.docx", 8, None)]
+      and [s for s in rec.plan_labels[0]["sheets"] if s[0].startswith("C.docx")]
+      == [("C.docx", 9, None)],
+      f"{rec.plan_labels[0]['sheets']}")
+check("★ 混排·翻纸文案：槽里只有本批的 7 张（不再有「只取最上面 N 张」的 foreign 口径）",
+      "出纸槽里应有 7 张纸" in rec.flip[0] and "不属于本批" not in rec.flip[0]
+      and "最上面" not in rec.flip[0],
+      f"{rec.flip[0][:120]}…")
+check("★ 混排：进度分母 = 7 张 × 两趟 = 14 面（并进来的单面文件第 2 趟也要走纸）",
+      [t for c, t, s in rec.progress if "正在打印:" in s][-1] == 14,
+      f"{[t for c, t, s in rec.progress if '正在打印:' in s][-1:]}")
+check("★ 混排·常驻窗标明哪几个是单面文件（背面留空、第 2 趟打空白页）",
+      bool(rec.announce) and "单面文件" in rec.announce[0]
+      and "B.docx" in rec.announce[0] and "C.docx" in rec.announce[0]
+      and "背面留空" in rec.announce[0], f"{rec.announce[:1]}")
 
-# ── 翻纸文案的"槽里几张"必须算上批次**之前**已直打的单面文件（2026-10-15 生产故障）──
+# ── 翻纸文案的"槽里几张"必须算上批次**之前**已直打的纸（2026-10-15 生产故障）──
 # 现场订单 HN20261015-0008：JPG（1 页横向、duplex=off）单独直打 + docx（3 页、手动双面）
 # 进批次。翻纸窗只报本批的 2 张，而槽里实际有 3 张；操作员照"从出纸槽中取出纸叠"把
 # **整叠**搬进纸盘 2 ⇒ 多出来那张留在纸盘里、被后续作业当白纸用掉 —— 文件静默丢失。
 # （spooler 硬证据：PrintService/Operational 的 842 显示照片那个作业 21:51:29 入队、
 #   21:51:49 已交打印处理器，而批次第 1 趟的翻纸窗 21:52:09 才弹。）
-# 2026-10-18 口径（**回到 2026-10-15 的正确口径**）：
-# 本轮已单面直打的纸**不并进批次页序**（并进物理上做不到：占位页落堆顶、真直打纸在堆底，
-# 第 2 趟的送纸窗口永远取不到它）；它们留在出纸槽里，翻纸时**只取最上面 N 张**（本批）。
-# 所以文案必须报"槽里共 N+foreign 张 + 只取最上面 N 张 + 下面 foreign 张不属于本批"。
-check("★ 混排·翻纸文案报槽里**总数**（本批 + 已直打的）",
-      "共应有" in rec.flip[0] and "应有 5 张纸" not in rec.flip[0], f"{rec.flip[0][:100]}…")
+# 2026-10-26：默认已经整单并批（上面那组），所以"批次前已直打"只剩**并不进来**的两种：
+# 读不出页数的坏件、以及逐文件 DPI 与批次不同（`_can_join_manual_batch` 的两条闸门）。
+# 那种情况口径不变：只取最上面 N 张，下面 foreign 张留在出纸槽里。这里用"DIP 不同"造，
+# 因为它是**成功直打**（能覆盖"槽里真有纸"的台账口径）。
+rec_dpi = run_worker([make_job(PDF5, name="A.docx"),
+                      make_job(PDF3, duplex="off", page_count=3, dpi=300, name="B.docx")], MANUAL)
+check("★ DPI 与批次不同 ⇒ 不并进批次（两趟只有一个渲染 DPI）",
+      len(rec_dpi.print_pdf) == 1 and rec_dpi.print_pdf[0].get("dpi") == 300,
+      f"{[(k.get('dpi'), os.path.basename(k.get('pdf_path', ''))) for k in rec_dpi.print_pdf]}")
+check("★ 混排·翻纸文案报槽里**总数**（本批 3 张 + 已直打 3 张）",
+      "共应有 6 张纸" in rec_dpi.flip[0], f"{rec_dpi.flip[0][:100]}…")
 check("★ 混排·明确指出「最上面 N 张是本批的、下面 foreign 张不要一起搬走」",
-      "最上面" in rec.flip[0] and "不属于本批" in rec.flip[0],
-      f"{rec.flip[0][:180]}…")
+      "最上面" in rec_dpi.flip[0] and "不属于本批" in rec_dpi.flip[0],
+      f"{rec_dpi.flip[0][:180]}…")
 check("★ 混排·旧的火星断言「整叠一起取走」必须消失（那样会把直打的纸也搬进去）",
-      "整叠" not in rec.flip[0].split("请按下面三步")[0])
-check("★ 混排·旧的裸断言「出纸槽里应有 4 张纸」必须消失（现场就是被它带偏的）",
-      "出纸槽里应有 4 张纸" not in rec.flip[0])
-check("★ 混排·日志同样报槽里总数", "共应有" in "".join(rec.logs),
-      f"{[m for m in rec.logs if '出纸槽' in m]}")
+      "整叠" not in rec_dpi.flip[0].split("请按下面三步")[0])
+check("★ 混排·日志同样报槽里总数", "共应有" in "".join(rec_dpi.logs),
+      f"{[m for m in rec_dpi.logs if '出纸槽' in m]}")
+# ★ 部分并批：能并的并（单页）、并不了的（DPI 不同）先直打 —— 日志必须照实说"另有 N 个"，
+#   绝不能在同一轮里谎报"只有两个作业"（2026-10-26 独立审查指出）
+rec_part = run_worker([make_job(PDF3, page_count=3, name="双面.docx"),
+                       make_job(PDF1, page_count=1, name="单页.docx"),
+                       make_job(PDF2_UP, duplex="off", page_count=2, dpi=300,
+                                name="高DPI.docx")], MANUAL)
+check("★ 部分并批：能并的并、并不了的（DPI 不同）仍单独直打 —— 日志照实说「另有 N 个」",
+      len(rec_part.print_pdf) == 1 and rec_part.print_pdf[0].get("dpi") == 300
+      and any("另有 1 个文件并不进来" in m for m in rec_part.logs)
+      and not any("只有「第 1 趟 / 第 2 趟」两个作业" in m for m in rec_part.logs)
+      and "不属于本批" in rec_part.flip[0],
+      f"{[m for m in rec_part.logs if '整单同一个批次' in m]} / "
+      f"{[k.get('dpi') for k in rec_part.print_pdf]}")
 check("★ 混排·常驻窗说明「下面 foreign 张不属于本批、别一起搬」",
-      bool(rec.announce) and "不属于本批" in rec.announce[0], f"{rec.announce[:1]}")
+      bool(rec_dpi.announce) and "不属于本批" in rec_dpi.announce[0], f"{rec_dpi.announce[:1]}")
+
+# ★ 2026-10-26 独立审查 M8：单面文件排在**首位**、且 duplex_mode 与后面双面文件不同时，
+#   绝不能按"它的方向"建第一批（那会多拆一次翻纸，且那一批的第 2 趟全是空白页）。
+rec_ord = run_worker([make_job(PDF1, page_count=1, mode="short-edge", name="单页短边.pdf"),
+                      make_job(PDF3, page_count=3, mode="long-edge", name="双面长边.pdf")],
+                     MANUAL)
+check("★ 顺序：单面文件排首位 + 装订方向不同 ⇒ 仍**只翻一次纸**、只有两个作业",
+      len(rec_ord.plan_pass) == 2 and len(rec_ord.flip) == 1 and not rec_ord.print_pdf,
+      f"plan_pass={len(rec_ord.plan_pass)} flip={len(rec_ord.flip)} "
+      f"print_pdf={len(rec_ord.print_pdf)}")
+check("★ 顺序：那一批的页序仍按文件顺序（单页在前、双面在后），没有多出空白批次",
+      rec_ord.plan_pass[0][3] == [1, 2, 4] and rec_ord.plan_pass[1][3] == [None, 3, None],
+      f"{[p[3] for p in rec_ord.plan_pass]}")
+
+# 读不出页数的坏件绝不并进批次（会把整批带失败），仍按原样单独打、单独报成败
+_BROKEN_J = os.path.join(_SANDBOX, "broken_join.pdf")
+with open(_BROKEN_J, "wb") as _f:
+    _f.write(b"%PDF-1.4\nthis is not a real pdf\n%%EOF\n")
+rec_bj = run_worker([make_job(_BROKEN_J, duplex="off", page_count=2, name="坏件.docx"),
+                     make_job(PDF3, name="好件.docx")], MANUAL)
+check("★ 坏件（读不出页数）不并进批次：单独提交、单独报成败（不许把整批带失败）",
+      len(rec_bj.print_pdf) == 1
+      and os.path.basename(rec_bj.print_pdf[0].get("pdf_path", "")) == "broken_join.pdf"
+      and sorted(i for i, _o, _m in rec_bj.finished) == [0, 1],
+      f"{[os.path.basename(k.get('pdf_path', '')) for k in rec_bj.print_pdf]} / {rec_bj.finished}")
 
 # ============================================================
-# ①f 2026-10-18 现场（用户截图）：1 页文件 + 2 页双面文件
-#     现状口径（= 2026-10-15 的正确口径）：1 页文件按单面直打、纸留在出纸槽；
-#     翻纸时**只取最上面 N 张**（本批），直打那张**不要**搬进进纸盒 —— 它没进过进纸盒，
-#     也就不会被"留在进纸口"（残余风险见 `_print_manual_batch` 的说明：试过并入但物理不可行）。
+# ①f 2026-10-18 / 2026-10-26 现场：1 页文件 + 2 页双面文件
+#     口径（2026-10-26 用户要求）：**整单一个批次** —— 1 页文件不再单独直打，而是
+#     按 `FilePlan(duplex=False)` 并进同一份页序（一张纸、背面留空，第 2 趟打空白占位页）。
+#     这样 spooler 里只剩「第 1 趟 / 第 2 趟」两个作业；旧口径会多一个直打作业。
 #     ⚠ 本条场景用**已知页数**（page_count=1）：页数未知时 `_uses_manual_duplex` 不当成 1 页
-#       （G1/G2 钉住的既有口径），那种情况按两趟走、由 `_print_one_job` 的硬闸门兜底。
+#       （G1/G2 钉住的既有口径），那种情况本来就按两趟走。
 # ============================================================
-print("\n=== ①f 现场场景：1 页（单面直打）+ 2 页双面 ===")
+print("\n=== ①f 现场场景：1 页 + 2 页双面（整单一个批次）===")
 rec_inc = run_worker([make_job(PDF1, page_count=1, name="作业三.pdf"),
                       make_job(PDF3, page_count=3, name="作业二.pdf")], MANUAL)
-check("★ 现场：1 页文件按**单面直打**（不进两趟、不配空白占位纸）",
-      len(rec_inc.print_pdf) == 1 and rec_inc.print_pdf[0]["duplex"] == "off"
-      and rec_inc.print_pdf[0]["copies"] == 1,
+check("★ 现场：**没有**直打作业（1 页文件并进同一批次 ⇒ 只剩两趟）",
+      len(rec_inc.print_pdf) == 0,
       f"{[(c.get('duplex'), c.get('copies')) for c in rec_inc.print_pdf]}")
-check("★ 现场：批次只含双面那份（第 1 趟 1/3、第 2 趟空白/2），直打纸不在页序里",
-      len(rec_inc.plan_pass) == 2 and rec_inc.plan_pass[0][3] == [1, 3]
-      and rec_inc.plan_pass[1][3] == [None, 2],
+check("★ 现场：批次含两份（第 1 趟 = 1 页文件的正文 + 3 页双面的 2/4）",
+      len(rec_inc.plan_pass) == 2 and rec_inc.plan_pass[0][3] == [1, 2, 4]
+      and rec_inc.plan_pass[1][3] == [None, 3, None],
       f"{[p[3] for p in rec_inc.plan_pass]}")
-check("★ 现场：翻纸文案要求**只取最上面 2 张**（直打那张留在出纸槽里）",
-      "只取出最上面" in rec_inc.flip[0] and "不属于本批" in rec_inc.flip[0],
+check("★ 现场：1 页文件在页序里是一个独立纸位（正面 = 它、背面空白）",
+      ("作业三.pdf", 1, None) in rec_inc.plan_labels[0]["sheets"],
+      f"{rec_inc.plan_labels[0]['sheets']}")
+check("★ 现场：翻纸文案说槽里只有本批的 3 张（不再要求「只取最上面 2 张」）",
+      "出纸槽里应有 3 张纸" in rec_inc.flip[0] and "不属于本批" not in rec_inc.flip[0],
       f"{rec_inc.flip[0][:120]}…")
 check("★ 现场：两个任务都报成功", sorted(i for i, _o, _m in rec_inc.finished) == [0, 1],
       f"{rec_inc.finished}")
+check("★ 现场：常驻窗点名「作业三.pdf」是单面文件（背面留空）",
+      bool(rec_inc.announce) and "作业三.pdf" in rec_inc.announce[0]
+      and "单面文件" in rec_inc.announce[0], f"{rec_inc.announce[:1]}")
 
-# 纯批次（本轮没有任何直打的单面文件）→ 文案保持原样，不引入多余警告（零回归）
+# ★★ 2026-10-26 现场原样复刻（HN20261026-0014）：3 页双面 + 1 页 + 2 页双面，
+#    spooler 里曾经是「单页文档测试.pdf」+「hn_duplex_batch_xxx.pdf」两个作业（第 2 趟再一个）。
+#    现在必须只剩「第 1 趟 / 第 2 趟」两个：3+1+2 共 7 页 → 4 张纸。
+print("\n=== ①f2 现场复刻：3 页双面 + 1 页 + 2 页双面（整单一个批次）===")
+rec_live = run_worker([make_job(PDF3, page_count=3, name="三页文档测试.pdf"),
+                       make_job(PDF1, page_count=1, name="单页文档测试.pdf"),
+                       make_job(PDF2_UP, page_count=2, name="双页文档测试.pdf")], MANUAL)
+check("★★ 现场复刻：一个订单只提交**两趟**（spooler 里不再有单独的直打作业）",
+      len(rec_live.plan_pass) == 2 and len(rec_live.print_pdf) == 0 and len(rec_live.flip) == 1,
+      f"plan_pass={len(rec_live.plan_pass)} print_pdf={len(rec_live.print_pdf)} "
+      f"flip={len(rec_live.flip)}")
+check("★★ 现场复刻：4 张纸，第 1 趟 = 1 3 4 5（1 页文件占第 3 张纸）",
+      rec_live.plan_pass[0][3] == [1, 3, 4, 5],
+      f"{rec_live.plan_pass[0][3]}")
+check("★★ 现场复刻：第 2 趟 = 6 〔空白〕 〔空白〕 2（整叠逆序，单页文件的背面是空白）",
+      rec_live.plan_pass[1][3] == [6, None, None, 2],
+      f"{rec_live.plan_pass[1][3]}")
+check("★★ 现场复刻：每张纸两面同属一个文件（3 页→2 张、单页→1 张、2 页→1 张）",
+      rec_live.plan_labels[0]["sheets"] == [
+          ("三页文档测试.pdf", 1, 2), ("三页文档测试.pdf", 3, None),
+          ("单页文档测试.pdf", 4, None), ("双页文档测试.pdf", 5, 6)],
+      f"{rec_live.plan_labels[0]['sheets']}")
+check("★★ 现场复刻：三个文件各自回报成功（单页文件不再走另一条直接打印路径）",
+      sorted(i for i, ok, _m in rec_live.finished) == [0, 1, 2]
+      and all(ok for _i, ok, _m in rec_live.finished), f"{rec_live.finished}")
+check("★★ 现场复刻：日志里出现「整单同一个批次」（可现场核对是否真的只有一个作业）",
+      any("整单同一个批次" in m for m in rec_live.logs),
+      f"{[m for m in rec_live.logs if '批次' in m][:3]}")
+check("★★ 现场复刻：批次 PDF 里**真的含三个文件的页、且顺序 = 文件顺序**",
+      rec_live.plan_pages and rec_live.plan_pages[0] == [
+          "doc3.pdf page 1", "doc3.pdf page 2", "doc3.pdf page 3",
+          "doc1.pdf page 1",
+          "doc2.pdf page 1", "doc2.pdf page 2"],
+      f"{rec_live.plan_pages[:1]}")
+check("★★ 现场复刻：两趟提交的是**同一份**合并件（单面文件的两趟都在这份文档里）",
+      len(rec_live.plan_pages) == 2 and rec_live.plan_pages[0] == rec_live.plan_pages[1],
+      f"{[len(p) for p in rec_live.plan_pages]}")
+
+# 单面文件并进批次时，**份数 + 页码范围**也必须照实生效（少打 = 顾客少纸）
+rec_cp_b = run_worker([make_job(PDF3, page_count=3, name="A.docx"),
+                       make_job(PDF2_UP, duplex="off", page_count=2, copies=2,
+                                page_range="1-2", name="B.docx")], MANUAL)
+check("★ 单面文件并批：份数×页码范围 各自占纸（B 选 2 页 ×2 份 = 4 张，共 6 张）",
+      rec_cp_b.plan_pass[0][3] == [1, 3, 4, 5, 4, 5]
+      and rec_cp_b.plan_pass[1][3] == [None, None, None, None, None, 2]
+      and "应有 6 张纸" in rec_cp_b.flip[0],
+      f"{[p[3] for p in rec_cp_b.plan_pass]}")
+check("★ 单面文件并批：合并件 = A 的 3 页 + B 的 2 页（份数/页码由页序引用，重复不写进合并件）",
+      rec_cp_b.plan_pages and rec_cp_b.plan_pages[0] == [
+          "doc3.pdf page 1", "doc3.pdf page 2", "doc3.pdf page 3",
+          "doc2.pdf page 1", "doc2.pdf page 2"],
+      f"{rec_cp_b.plan_pages[:1]}")
+
+# 纯批次（本单没有单面文件）→ 文案保持原样，不引入多余警告（零回归）
 rec_pure = run_worker([make_job(PDF5, name="A.docx"), make_job(PDF3, name="B.docx")], MANUAL)
 check("★ 纯批次：文案仍是「出纸槽里应有 5 张纸」原样（5 页→3 张 + 3 页→2 张）",
       "出纸槽里应有 5 张纸" in rec_pure.flip[0] and "最上面" not in rec_pure.flip[0],

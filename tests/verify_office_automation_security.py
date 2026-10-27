@@ -5,8 +5,11 @@
   ① 打开文档**前**：`AutomationSecurity = 3`（msoAutomationSecurityForceDisable）、
      `DisplayAlerts = 0`、`Options.UpdateLinksAtOpen = False`（外加 `Visible = False`）；
      WPS 走同等设置，API 不同时至少禁用宏，并在注释里写明 WPS 实际做了什么；
-  ② **云端来源的 Office 文档强制走 LibreOffice**（无宏执行），Word/WPS COM 只服务本地文件；
+  ② **云端来源的 Office 文档默认强制走 LibreOffice**（无宏执行），Word/WPS COM 只服务本地文件；
      来源参数默认为「本地」语义（不能悄悄把本地文件也赶去 LibreOffice）；
+     2026-10-26 隐式规则：唯一例外是 `allow_cloud_com=True`（管理员自打 + 管理员上传，
+      由 `printer_config.cloud_word_com_allowed` 判定；没有设备级开关）——
+      闸门必须写成 `and not allow_cloud_com`，且默认值必须是 False；
   ③ 断言 + 变异自证（删掉任一设置/任一闸门即红）。
 
 ⚠ 本脚本**绝不真的跑 COM**（会拉起 Word/WPS 弹窗、甚至真的执行宏）。所有涉及 COM 的
@@ -165,11 +168,16 @@ def check_no_raw_open_without_harden(src: str):
 
 
 def check_cloud_forced_to_libreoffice(src: str):
-    """`_convert_office_to_pdf` 里 `from_cloud` 分支必须先走 LibreOffice、**不得**碰 COM。"""
+    """`_convert_office_to_pdf` 里云端分支默认先走 LibreOffice、**不得**碰 COM。
+
+    2026-10-26 隐式规则：唯一例外必须显式写成 `and not allow_cloud_com` 闸门 ——
+    没有这个闸门的"云端也走 COM"写法必须判红（那等于把 DS-09 直接打开）。
+    """
     body = _func_block(src, "_convert_office_to_pdf")
     if not body:
         return False
-    m = re.search(r"^    if from_cloud and ext in COM_OFFICE_EXTS:\n", body, re.M)
+    m = re.search(r"^    if from_cloud and ext in COM_OFFICE_EXTS and not allow_cloud_com:\n",
+                  body, re.M)
     if not m:
         return False
     # 该分支到下一个**顶格 4 空格**的分支/循环为止（分支内部一律 8 空格起）
@@ -182,20 +190,27 @@ def check_cloud_forced_to_libreoffice(src: str):
 
 
 def check_default_is_local(src: str):
-    """来源参数的默认值必须是「本地」——否则本地文件也被赶去 LibreOffice（回归）。"""
+    """两个默认值的语义都必须是「最严」：
+
+    · `from_cloud=False` —— 否则本地文件也被赶去 LibreOffice（回归）；
+    · `allow_cloud_com=False` —— 否则云端字默认就走 COM，等于绕过 S1-04（2026-10-26 隐式规则）。
+    """
     conv = _func_block(src, "convert")          # 类方法：先抓 `def convert(`，再取签名
     office = _func_block(src, "_convert_office_to_pdf")
 
     def _has_local_default(block):
-        return bool(re.search(r"from_cloud\s*:\s*bool\s*=\s*False", block))
+        return (bool(re.search(r"from_cloud\s*:\s*bool\s*=\s*False", block))
+                and bool(re.search(r"allow_cloud_com\s*:\s*bool\s*=\s*False", block)))
 
     return _has_local_default(conv) and _has_local_default(office)
 
 
 def check_convert_passes_source_through(src: str):
-    """`convert()` 必须把 from_cloud 真的传给 Office 转换函数（不是只写在签名里）。"""
+    """`convert()` 必须把 from_cloud / allow_cloud_com 真的传给 Office 转换函数（不是只写在签名里）。"""
     body = _blank_comment_lines(_func_block(src, "convert"))
-    return bool(re.search(r"convert_func\(file_path,\s*output_pdf,\s*from_cloud=from_cloud\)", body))
+    return bool(re.search(
+        r"convert_func\(file_path,\s*output_pdf,\s*from_cloud=from_cloud,\s*\n\s*"
+        r"allow_cloud_com=allow_cloud_com\)", body))
 
 
 def check_wps_note(src: str):
@@ -216,7 +231,7 @@ STATIC_CONV = [
      check_every_open_is_hardened),
     ("已无\"裸 .Visible= 直接开文档\"的旧写法", check_no_raw_open_without_harden),
     ("★ 云端来源分支强制 LibreOffice、不碰 Word/WPS COM", check_cloud_forced_to_libreoffice),
-    ("★ from_cloud 默认值 = False（本地文件语义不变）", check_default_is_local),
+    ("★ from_cloud / allow_cloud_com 默认值 = False（最严语义）", check_default_is_local),
     ("convert() 把 from_cloud 传给 Office 转换函数", check_convert_passes_source_through),
     ("注释写明 WPS 侧实际做了什么（AutomationSecurity / 宏安全级别）", check_wps_note),
 ]
@@ -244,20 +259,36 @@ section("2. 云端调用链：三个入口都把「云端来源」传下去")
 check("cloud_client.py 页数分析：converter.convert(..., from_cloud=True)",
       bool(re.search(r"converter\.convert\(temp_dl,\s*from_cloud=True\)", CLOUD_SRC)))
 
-check("gui.py ConvertWorker 接收 from_cloud 并在云端时不走 COM",
+check("gui.py ConvertWorker 接收 from_cloud/allow_cloud_com；未放行时云端不走 COM",
       bool(re.search(r"def __init__\(self,\s*row:\s*int,\s*file_path:\s*str,\s*engine:\s*str,"
-                     r"\s*source_md5:\s*str\s*=\s*\"\",\s*\n\s*from_cloud:\s*bool\s*=\s*False\)",
-                     GUI_SRC))
+                     r"\s*source_md5:\s*str\s*=\s*\"\",\s*\n\s*from_cloud:\s*bool\s*=\s*False,"
+                     r"\s*allow_cloud_com:\s*bool\s*=\s*False\)", GUI_SRC))
       and "self._from_cloud" in GUI_SRC
-      and bool(re.search(r"and not self\._from_cloud", GUI_SRC)))
+      and bool(re.search(r"not self\._from_cloud or self\._allow_cloud_com", GUI_SRC))
+      and bool(re.search(r"self\._allow_cloud_com\s*=\s*bool\(allow_cloud_com\)", GUI_SRC)))
 
-check("gui.py 云端任务预转换：_start_convert_worker(..., from_cloud=True)",
-      bool(re.search(r"_start_convert_worker\(row,\s*task\.local_path,\s*engine,\s*tab_key=new_key,\s*\n\s*from_cloud=True\)",
-                     GUI_SRC)))
+def check_preconvert_wiring(src: str):
+    """云任务预转换必须同时传 from_cloud=True 与「自打 + 上传者」算出的 allow_cloud_com（隐式规则）。"""
+    return (bool(re.search(r"_start_convert_worker\(\s*\n\s*row,\s*task\.local_path,\s*engine,"
+                           r"\s*tab_key=new_key,\s*from_cloud=True,", src))
+            and bool(re.search(r"allow_cloud_com=cloud_word_com_allowed\(\s*\n\s*"
+                               r"getattr\(task,\s*'is_admin_print',\s*False\),", src))
+            and bool(re.search(r"getattr\(task,\s*'uploader_is_admin',\s*False\)\)", src)))
 
-check("gui.py 打印兜底转换：按 job.task_id 判定云端来源后传 from_cloud",
+
+check("gui.py 云端任务预转换：from_cloud=True + 按「自打 + 上传者」给 allow_cloud_com",
+      check_preconvert_wiring(GUI_SRC))
+
+check("gui.py 打印兜底转换：按 job.task_id 判定云端来源后传 from_cloud + allow_cloud_com",
       bool(re.search(r'_from_cloud\s*=\s*int\(getattr\(job,\s*"task_id",\s*0\)\s*or\s*0\)\s*>\s*0', GUI_SRC))
-      and bool(re.search(r"from_cloud=_from_cloud", GUI_SRC)))
+      and bool(re.search(r"_allow_cloud_com\s*=\s*(?:_from_cloud\s+and\s+)?"
+                         r"self\._cloud_com_allowed\(job\)", GUI_SRC))
+      and bool(re.search(r"from_cloud=_from_cloud,\s*allow_cloud_com=_allow_cloud_com", GUI_SRC))
+      # 放行位判定必须走纯函数并带两个位（自打 / 上传者）——行为真值表见
+      # tests/verify_cloud_word_implicit.py（静态这里只防接线被拆掉）。
+      and bool(re.search(r"def _cloud_com_allowed\(self,\s*job\).*?cloud_word_com_allowed\("
+                         r".*?getattr\(job,\s*\"admin_self_print\""
+                         r".*?getattr\(job,\s*\"uploader_is_admin\"", GUI_SRC, re.S)))
 
 check("gui.py 本地添加文件路径**不传** from_cloud（保持本地语义）",
       bool(re.search(r"self\._start_convert_worker\(i,\s*job\.file_path,\s*job\.engine\)\s*$",
@@ -363,12 +394,26 @@ try:
     C._read_docx_last_editor = lambda p: None
     C._discard_invalid_pdf = lambda p: None
 
-    # 4a. 显式 from_cloud=True
+    # 4a. 显式 from_cloud=True（默认 allow_cloud_com=False）
     calls.clear()
     C._convert_office_to_pdf(_SRC, _OUT, from_cloud=True)
     check("★ 云端来源：只调用 LibreOffice", calls == ["libreoffice"], str(calls))
     check("★ 云端来源：Word/WPS COM 一次都没被调用",
           "word" not in calls and "wps" not in calls, str(calls))
+
+    # 4a-2. 显式 allow_cloud_com=False 与默认一致（默认值不能被悄悄改成 True）
+    calls.clear()
+    C._convert_office_to_pdf(_SRC, _OUT, from_cloud=True, allow_cloud_com=False)
+    check("★ 云端 + allow_cloud_com=False：仍只走 LibreOffice",
+          calls == ["libreoffice"], str(calls))
+
+    # 4a-3. 放行位 = True（管理员自打 + 管理员上传，隐式规则）⇒ 走 COM 降级链
+    calls.clear()
+    C._convert_office_to_pdf(_SRC, _OUT, from_cloud=True, allow_cloud_com=True)
+    check("★ 云端 + allow_cloud_com=True：走 Word COM（放行位唯一例外）",
+          calls == ["word"], str(calls))
+    check("云端 + allow_cloud_com=True：不再强制 LibreOffice",
+          "libreoffice" not in calls, str(calls))
 
     # 4b. 默认（不传）= 本地语义 → 仍走 COM 降级链
     calls.clear()
@@ -380,6 +425,10 @@ try:
     calls.clear()
     conv.convert(_SRC, _OUT, from_cloud=True)
     check("★ convert(..., from_cloud=True) → LibreOffice", calls == ["libreoffice"], str(calls))
+    calls.clear()
+    conv.convert(_SRC, _OUT, from_cloud=True, allow_cloud_com=True)
+    check("★ convert(..., from_cloud=True, allow_cloud_com=True) → COM 链",
+          calls == ["word"], str(calls))
     calls.clear()
     conv.convert(_SRC, _OUT)
     check("★ convert(...) 默认 → COM（本地文件零回归）", calls == ["word"], str(calls))
@@ -446,15 +495,26 @@ mutations.append(("把强制禁用宏改成 1（允许宏）",
                   _mut, "msoAutomationSecurityForceDisable 常量 = 3"))
 
 # 5e. 云端分支整段删掉（云端文件又回到 COM）
-_mut = re.sub(r"    if from_cloud and ext in COM_OFFICE_EXTS:\n(?:        .*\n|\n)*?        return\n",
-              "", CONV_SRC, count=1)
+_mut = re.sub(r"    if from_cloud and ext in COM_OFFICE_EXTS and not allow_cloud_com:\n"
+              r"(?:        .*\n|\n)*?        return\n", "", CONV_SRC, count=1)
 mutations.append(("删掉\"云端来源强制 LibreOffice\"分支",
+                  _mut, "★ 云端来源分支强制 LibreOffice、不碰 Word/WPS COM"))
+
+# 5e-2. 去掉 allow_cloud_com 闸门（云端无条件走 COM）
+_mut = CONV_SRC.replace("if from_cloud and ext in COM_OFFICE_EXTS and not allow_cloud_com:",
+                        "if from_cloud and ext in COM_OFFICE_EXTS:")
+mutations.append(("去掉 allow_cloud_com 闸门（云端无条件走 COM）",
                   _mut, "★ 云端来源分支强制 LibreOffice、不碰 Word/WPS COM"))
 
 # 5f. 默认值改成 True（把本地文件也赶去 LibreOffice）
 _mut = CONV_SRC.replace("from_cloud: bool = False", "from_cloud: bool = True")
 mutations.append(("把 from_cloud 默认值改成 True（本地文件也被赶走）",
-                  _mut, "★ from_cloud 默认值 = False（本地文件语义不变）"))
+                  _mut, "★ from_cloud / allow_cloud_com 默认值 = False（最严语义）"))
+
+# 5f-2. allow_cloud_com 默认值改成 True（云端默认走 COM）
+_mut = CONV_SRC.replace("allow_cloud_com: bool = False", "allow_cloud_com: bool = True")
+mutations.append(("把 allow_cloud_com 默认值改成 True（云端默认走 COM）",
+                  _mut, "★ from_cloud / allow_cloud_com 默认值 = False（最严语义）"))
 
 # 5g. 某个 Open 之前的 harden 调用删掉（WPS 转换路径）
 _mut = CONV_SRC.replace(
@@ -489,12 +549,15 @@ check("变异「云端页数分析不传 from_cloud」→ 接线判据变红",
       and bool(re.search(r"converter\.convert\(temp_dl,\s*from_cloud=True\)", CLOUD_SRC)))
 
 _mut_gui = GUI_SRC.replace(
-    "self._start_convert_worker(row, task.local_path, engine, tab_key=new_key,\n"
-    "                                       from_cloud=True)",
-    "self._start_convert_worker(row, task.local_path, engine, tab_key=new_key)")
+    "row, task.local_path, engine, tab_key=new_key, from_cloud=True,",
+    "row, task.local_path, engine, tab_key=new_key,")
 check("变异「云端任务预转换不传 from_cloud」→ 接线判据变红",
-      not re.search(r"_start_convert_worker\(row,\s*task\.local_path,\s*engine,"
-                    r"\s*tab_key=new_key,\s*\n\s*from_cloud=True\)", _mut_gui))
+      _mut_gui != GUI_SRC and not check_preconvert_wiring(_mut_gui))
+
+_mut_gui2 = GUI_SRC.replace(
+    "allow_cloud_com=cloud_word_com_allowed(", "")
+check("变异「云端任务预转换不给 allow_cloud_com」→ 接线判据变红",
+      _mut_gui2 != GUI_SRC and not check_preconvert_wiring(_mut_gui2))
 
 print("\n" + "=" * 68)
 print("S1-04 Office COM 自动化安全验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

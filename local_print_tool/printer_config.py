@@ -160,6 +160,14 @@ class PrintJob:
     order_number: str = ""   # 订单号（云端的来自后端，本地的在复制时生成）
     remark: str = ""         # 订单/任务备注（云端订单来自后端 remark；本地任务可自行填写，≤100 字）
     sent: bool = False       # 是否已打印完成（成功回报后置位，退出时不再放弃；持久化以扛异常退出重载）
+    # 该任务是否「管理员自行打印」（云端 is_admin_print）。只用于「云端 Word 是否走 COM」的
+    # 放行判定的一半（见 cloud_word_com_allowed）：顾客订单这一位恒 False ⇒ 永远强制 LibreOffice。
+    # 持久化：崩溃续打/重启后不能因为字段丢失而把管理员单又卡成"缺 LO 打不了"。
+    admin_self_print: bool = False
+    # 该云端文件的**上传者是不是管理员**（后端按 files.openid 算好下发）。
+    # 挡住「顾客上传 → 人工订正/机位勾选成自打 → 顾客内容进 COM」这条链路：
+    # 光有 is_admin_print 不够，内容归属看上传者。缺失/旧后端一律 False（fail-closed）。
+    uploader_is_admin: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -180,6 +188,8 @@ class PrintJob:
             "order_number": self.order_number,
             "remark": self.remark,
             "sent": self.sent,
+            "admin_self_print": self.admin_self_print,
+            "uploader_is_admin": self.uploader_is_admin,
             # cached_pdf 不持久化，每次启动重新生成
         }
 
@@ -203,7 +213,32 @@ class PrintJob:
             order_id=_num_or_default(data.get("order_id"), 0, int),
             order_number=data.get("order_number", ""),
             remark=str(data.get("remark", "") or ""),
+            admin_self_print=bool(data.get("admin_self_print", False)),
+            uploader_is_admin=bool(data.get("uploader_is_admin", False)),
         )
+
+
+# ── 云端 Word 转换引擎（2026-10-26 晚定稿：**隐式规则**，不再有设备级开关） ──
+# 默认仍是最严口径（S1-04）：云端 .doc/.docx 一律 LibreOffice（不执行宏），
+#   本机没装 LibreOffice 就打不了云端 Word。
+# **唯一例外**：这单是「管理员自打」（`is_admin_print`）**且**该文件由管理员上传
+#   （`uploader_is_admin`）⇒ 允许 Word/WPS COM（仍带 AutomationSecurity=3 /
+#   DisplayAlerts=0 / UpdateLinksAtOpen=False 硬化）；顾客内容永远强制 LibreOffice。
+# 用户口径（2026-10-26）：「管理员直接默认不强制使用 LO 即可，普通用户必须强制使用 LO」——
+#   行为隐式执行，移动端不再有「☁ LO / ☁ Word」开关，也不再有设备级配置项。
+
+
+def cloud_word_com_allowed(admin_self_print: bool, uploader_is_admin: bool) -> bool:
+    """云端 Word 是否允许走 Word/WPS COM —— **唯一判定点**。
+
+    两条同时成立才放行（隐式规则，没有设备级策略）：
+      ① 该任务被标为管理员自打（is_admin_print = 订单类型「自打」）；
+      ② **该文件是管理员上传的**（uploader_is_admin）—— 光看 ① 不够：`is_admin_print` 是
+         可变的业务列（人工类型订正 / 机位勾选 / print_success 都会改写它），顾客上传的文件
+         一旦被订正成"自打"，就会把顾客内容送进 COM。内容归属只看上传者。
+    返回 False 时调用方仍走强制 LibreOffice（S1-04 默认口径）。
+    """
+    return bool(admin_self_print) and bool(uploader_is_admin)
 
 
 def _parse_range_parts(raw: str, total_pages: int) -> set[int]:
@@ -892,6 +927,10 @@ class PrinterConfig:
     # 改到 Job Object 隔离 worker 执行（office_sandbox.py）；失败/超时拒转，不回退。
     # 默认关闭：需先在真机（Word/WPS/LibreOffice）验证通过再启用。
     conversion_sandbox: bool = False
+    # 2026-10-26 晚：不再有「云端 Word 转换引擎」设备级配置项 —— 放行规则是隐式的
+    # （管理员自打 + 管理员上传 ⇒ 允许 Word/WPS COM；顾客内容永远强制 LibreOffice），
+    # 判定本体见模块级 cloud_word_com_allowed()。旧配置里残留的 cloud_word_engine
+    # 字段会在下次保存时自然消失（from_dict 不读、to_dict 不写）。
     simplex_price: float = 0.2
     duplex_price: float = 0.3
     last_dir: str = ""
