@@ -112,7 +112,7 @@ def patched(rec, plan_ok=True, drained=True):
         return True, "桩：一次提交"
 
     def _print_plan_pass(plan, path, printer, which, second_rotate_180=False,
-                         progress_callback=None, dpi=0):
+                         progress_callback=None, dpi=0, landscape_fill=True, **kw):
         rec.plan_pass.append((which, bool(which == 2 and second_rotate_180),
                               plan.pass_page_indices(which), plan.pass_pages(which)))
         if progress_callback:

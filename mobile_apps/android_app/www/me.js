@@ -253,7 +253,8 @@ function setupMeButtons() {
   document.getElementById('avatarBtn').addEventListener('click', () => document.getElementById('avatarInput').click());
   document.getElementById('avatarInput').addEventListener('change', (e) => {
     const file = e.target.files[0];
-    if (file) uploadAvatar(file);
+    // 2026-10-27 用户要求：选完先裁剪（拖动/缩放选区域），确认后才上传
+    if (file) openAvatarCrop(file);
     e.target.value = '';
   });
   document.getElementById('nicknameRow').addEventListener('click', openNicknameModal);
@@ -483,6 +484,167 @@ function saveNicknameFromModal() {
     localStorage.setItem('hn_nickname', val);
     refreshMeUI();
   }
+}
+
+/* ================= 头像裁剪（2026-10-27 用户要求） =================
+ * 与小程序同款：选图后弹圆形取景框，拖动/双指/滑杆缩放，确认时按 AvatarCrop.cropRect
+ * 的源矩形画进 512×512 的 canvas，导出 JPEG 再走原来的 /api/profile 上传。
+ * 几何在 www/avatar_crop.js（纯函数，验收脚本与小程序那份同用例比对）。
+ * 任何一步失败都退回上传原图（裁剪是增强，不能因为它坏了就换不了头像）。
+ */
+const cropState = { file: null, url: '', img: null, vp: 240, fit: 1, scale: 1, x: 0, y: 0, drag: null, pinch: 0 };
+
+function _cropEl(id) { return document.getElementById(id); }
+
+function _cropImageSize() {
+  return { width: (cropState.img && cropState.img.naturalWidth) || 1, height: (cropState.img && cropState.img.naturalHeight) || 1 };
+}
+
+function _applyCropState(st) {
+  cropState.scale = st.scale;
+  cropState.x = st.x;
+  cropState.y = st.y;
+  const img = _cropEl('cropImg');
+  if (img) {
+    const size = _cropImageSize();
+    img.style.width = (size.width * st.scale) + 'px';
+    img.style.height = (size.height * st.scale) + 'px';
+    img.style.left = st.x + 'px';
+    img.style.top = st.y + 'px';
+  }
+  const slider = _cropEl('cropZoom');
+  if (slider) {
+    const pct = Math.round((st.scale / (cropState.fit || 1)) * 100);
+    slider.value = String(Math.max(100, Math.min(Number(slider.max) || 400, pct)));
+  }
+}
+
+function openAvatarCrop(file) {
+  if (!file) return;
+  if (cropState.url) { try { URL.revokeObjectURL(cropState.url); } catch (e) {} }
+  cropState.file = file;
+  cropState.url = URL.createObjectURL(file);
+  const probe = new Image();
+  probe.onload = () => {
+    cropState.img = probe;
+    const vp = 240;
+    const st = AvatarCrop.fitState(vp, { width: probe.naturalWidth, height: probe.naturalHeight });
+    cropState.vp = vp;
+    cropState.fit = st.scale;
+    const view = _cropEl('cropImg');
+    if (view) view.src = cropState.url;
+    _applyCropState(st);
+    const mask = _cropEl('cropMask');
+    if (mask) mask.style.display = 'flex';
+    setupAvatarCropHandlers();
+  };
+  probe.onerror = () => { showToast('读取图片失败'); uploadAvatar(file); };
+  probe.src = cropState.url;
+}
+
+function closeAvatarCrop() {
+  const mask = _cropEl('cropMask');
+  if (mask) mask.style.display = 'none';
+  const view = _cropEl('cropImg');
+  if (view) view.removeAttribute('src');
+  if (cropState.url) { try { URL.revokeObjectURL(cropState.url); } catch (e) {} }
+  cropState.url = '';
+  cropState.img = null;
+  cropState.drag = null;
+  cropState.pinch = 0;
+}
+
+let cropHandlersBound = false;
+
+function setupAvatarCropHandlers() {
+  if (cropHandlersBound) return;
+  const box = _cropEl('cropBox');
+  if (!box) return;
+  cropHandlersBound = true;
+  _cropEl('cropCancel').addEventListener('click', closeAvatarCrop);
+  _cropEl('cropOk').addEventListener('click', confirmAvatarCrop);
+  _cropEl('cropMask').addEventListener('click', (e) => { if (e.target && e.target.id === 'cropMask') closeAvatarCrop(); });
+  _cropEl('cropZoom').addEventListener('input', (e) => {
+    const img = _cropImageSize();
+    const fit = cropState.fit || 1;
+    const cur = cropState.scale || fit;
+    const want = fit * ((Number(e.target.value) || 100) / 100);
+    _applyCropState(AvatarCrop.zoomAt({ scale: cur, x: cropState.x, y: cropState.y }, cropState.vp, img, want / cur));
+  });
+  // 单指/鼠标拖动
+  box.addEventListener('pointerdown', (e) => {
+    if (!cropState.img) return;
+    cropState.drag = { x: cropState.x, y: cropState.y, scale: cropState.scale, sx: e.clientX, sy: e.clientY };
+    box.setPointerCapture && box.setPointerCapture(e.pointerId);
+  });
+  box.addEventListener('pointermove', (e) => {
+    const d = cropState.drag;
+    if (!d || cropState.pinch) return;
+    _applyCropState(AvatarCrop.clamp({
+      scale: d.scale,
+      x: d.x + (e.clientX - d.sx),
+      y: d.y + (e.clientY - d.sy),
+    }, cropState.vp, _cropImageSize()));
+  });
+  const endDrag = () => { cropState.drag = null; };
+  box.addEventListener('pointerup', endDrag);
+  box.addEventListener('pointercancel', endDrag);
+  box.addEventListener('pointerleave', endDrag);
+  // 双指缩放
+  const dist = (t1, t2) => Math.sqrt(Math.pow(t1.clientX - t2.clientX, 2) + Math.pow(t1.clientY - t2.clientY, 2));
+  box.addEventListener('touchstart', (e) => {
+    if (e.touches.length > 1) {
+      cropState.pinch = dist(e.touches[0], e.touches[1]);
+      cropState.drag = null;
+    }
+  }, { passive: true });
+  box.addEventListener('touchmove', (e) => {
+    if (e.touches.length > 1 && cropState.pinch > 0) {
+      const d = dist(e.touches[0], e.touches[1]);
+      _applyCropState(AvatarCrop.zoomAt({ scale: cropState.scale, x: cropState.x, y: cropState.y },
+        cropState.vp, _cropImageSize(), d / cropState.pinch));
+      cropState.pinch = d;
+      e.preventDefault();
+    }
+  }, { passive: false });
+  box.addEventListener('touchend', (e) => {
+    if (!e.touches || e.touches.length < 2) cropState.pinch = 0;
+  });
+}
+
+function confirmAvatarCrop() {
+  const img = cropState.img;
+  const original = cropState.file;
+  if (!img) { closeAvatarCrop(); return; }
+  const size = AvatarCrop.OUTPUT_SIZE;
+  const rect = AvatarCrop.cropRect({ scale: cropState.scale, x: cropState.x, y: cropState.y },
+    cropState.vp, _cropImageSize());
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillRect(0, 0, size, size);
+  try {
+    ctx.drawImage(img, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, size, size);
+  } catch (e) {
+    closeAvatarCrop();
+    if (original) uploadAvatar(original);
+    return;
+  }
+  if (typeof canvas.toBlob !== 'function') {
+    closeAvatarCrop();
+    if (original) uploadAvatar(original);
+    return;
+  }
+  canvas.toBlob((blob) => {
+    let out = null;
+    try {
+      if (blob) out = new File([blob], 'avatar_' + Date.now() + '.jpg', { type: 'image/jpeg' });
+    } catch (e) { out = null; }
+    closeAvatarCrop();
+    uploadAvatar(out || original);
+  }, 'image/jpeg', 0.92);
 }
 
 async function uploadAvatar(file) {

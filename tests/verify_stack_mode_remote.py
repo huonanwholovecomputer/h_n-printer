@@ -270,6 +270,57 @@ check("★ 下发了 set_stack_mode 给该设备（带 enable）",
           and (s["payload"] or {}).get("enable") is True for s in fake.sent),
       f"{fake.sent}")
 
+# ── 下发的是**操作者昵称**（2026-10-27 用户要求：设备端日志写着"操作者：admin"没用）──
+print("\n=== ③.1 下发操作者昵称（不是角色名）===")
+
+
+def _set_nick(oid, nick):
+    conn = backend.get_user_db()
+    try:
+        cur = conn.execute("UPDATE users SET nickname = ? WHERE openid = ?", (nick, oid))
+        if not cur.rowcount:
+            conn.execute("INSERT INTO users (openid, nickname, avatar_path, updated_at) "
+                         "VALUES (?, ?, '', ?)", (oid, nick, "2026-10-27 00:00:00"))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _by_payload():
+    return [s["payload"] for s in fake.sent if s["event"] == "set_stack_mode"]
+
+
+_set_nick(ADMIN_OID, "张三")
+backend._set_stack_state(CID, False, False)
+fake.sent.clear()
+fake.auto_reply, fake.reply_mode, fake.reply_note = True, None, ""
+post({"client_id": CID, "enable": True})
+_p = _by_payload()
+check("★ payload.by = 操作者**昵称**（不再是 admin / super_admin）",
+      bool(_p) and (_p[0] or {}).get("by") == "张三",
+      str(_p[0] if _p else None))
+check("payload.by_role 仍带角色（排查权限问题时还要看它）",
+      bool(_p) and (_p[0] or {}).get("by_role") == "admin",
+      str(_p[0] if _p else None))
+
+_set_nick(ADMIN_OID, "   ")
+backend._set_stack_state(CID, True, False)
+fake.sent.clear()
+post({"client_id": CID, "enable": False})
+_p = _by_payload()
+check("★ 没设昵称（空串/空白）→ 退回角色中文名，不显示 openid、也不留空",
+      bool(_p) and (_p[0] or {}).get("by") == "管理员",
+      str(_p[0] if _p else None))
+check("operator_display_name 不泄露 openid（昵称里绝不该出现 openid 片段）",
+      "openid" not in str(_p[0] if _p else ""))
+
+# 本地工具侧：日志/窗口用的是设备端收到的 by（不是自己拼角色名）
+_cc_src = open(os.path.join(REPO, "local_print_tool", "cloud_client.py"), encoding="utf-8").read()
+_gui_src = open(os.path.join(REPO, "local_print_tool", "gui.py"), encoding="utf-8").read()
+check("★ 本地工具把 payload.by 原样当操作者名显示（操作者：{by}）",
+      'stack_mode_requested = Signal(bool, str)' in _cc_src
+      and '（操作者：{by}）' in _gui_src)
+
 backend._set_stack_state(CID, False, False)      # 服务端镜像：空闲、未开（放行后由设备端自查拒绝）
 fake.sent.clear()
 fake.reply_mode, fake.reply_note = False, "打印机正忙（正在打印），未执行"

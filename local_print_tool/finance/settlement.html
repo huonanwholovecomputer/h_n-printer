@@ -1122,6 +1122,13 @@ function migrateConfig(data) {
     if (t && !isMonthKey(t.month) && t.date) t.month = monthKeyOf(t.date);
     if (t) delete t.date;
   });
+  /* v7.9：长期耗材采购的 kind / units 归一 —— 旧数据没有这两个字段是正常的（expenseKind()
+     会按项目名自动识别 A4纸 / 硒鼓）；非法 kind 删掉而不是写成 'other'，免得把自动识别堵死。 */
+  (data.records.expenses || []).forEach(function (e) {
+    if (!e || typeof e !== 'object') return;
+    if (e.kind !== 'paper' && e.kind !== 'toner' && e.kind !== 'other') delete e.kind;
+    e.units = Math.max(0, Math.round(+e.units || 0));
+  });
   if (!data.notes) data.notes = {};
   // 乐观锁版本号：多设备并发编辑冲突检测用
   if (!data.meta || typeof data.meta.version !== 'number') data.meta = { version: 0 };
@@ -1161,6 +1168,12 @@ function sanitizeStore(data) {
       r[OWNER_KEY[k]] = owner;
       if (k === 'scores') r.score = +r.score || 0;
       else r.amount = Math.round((+r.amount || 0) * 100) / 100;
+      /* v7.9：长期耗材类型 / 数量净化 —— 类型只留三个合法值（不认识就删掉，交给
+         expenseKind() 按项目名自动识别）；数量必须是非负整数。 */
+      if (k === 'expenses') {
+        if (r.kind !== 'paper' && r.kind !== 'toner' && r.kind !== 'other') delete r.kind;
+        r.units = Math.max(0, Math.round(+r.units || 0));
+      }
       return true;
     });
   });
@@ -1238,8 +1251,72 @@ function uid() { return 'r' + Date.now().toString(36) + Math.floor(Math.random()
 /* ==================== 数据访问助手 ==================== */
 function getMembers() { return STORE.config.members || DEFAULT_MEMBERS; }
 function getScoreCap() { return STORE.config.scoreCap || DEFAULT_SCORE_CAP; }
+/* 单个成员的服务得分 = Σ min(单项得分, 单项上限)。
+   v7.8：封顶求和只此一份 —— 结算（calcMonth 的「服务按分」）、记账页的「总分 N」徽标、
+   以及改分后的即时重算（refreshScoreTotals）都必须走它，避免三处各写一遍后悄悄漂移。 */
+function memberScoreTotal(items, cap) {
+  cap = (cap == null) ? getScoreCap() : cap;
+  return (items || []).reduce(function (s, x) { return s + Math.min(x.score || 0, cap); }, 0);
+}
 function getRate() { return STORE.config.investRate != null ? STORE.config.investRate : DEFAULT_RATE; }
 function getMember(id) { var m = getMembers().find(function (x) { return x.id === id; }); return m; }
+
+/* ==================== v7.9：长期耗材（A4纸 / 硒鼓）按月摊销 ====================
+   现场问题（2026-10-27 用户）：A4纸和硒鼓是能长期用的，旧口径把这个月的**打印比例**
+   直接套在整笔采购上 ⇒ 买纸/买鼓的那个月被分走一大笔（一个人一个月就摊了 300 块），
+   后面几个月反而没有耗材成本。
+   新口径：采购照旧记在「采购支出」里（带类型 + 数量），但**购买当月不再全额计入**，
+   而是按每月实际用量折成原价：
+     · A4纸：本月实际出纸张数 × 每张成本（= 金额 ÷ 总张数）；
+     · 硒鼓：本月实际打印页数 × 每页成本（= 金额 ÷ 可打印页数，即"寿命损耗"）。
+   每月这笔摊销记在**采购人名下**（整笔钱是他先垫的）⇒ 结算时他按垫付收回、其他人按
+   分摊出钱 —— 等价于"每月给采购者原价返还"。累计摊销严格封顶在采购价（整数分、
+   按累计用量取整差，用完即停，不会多返一分）。
+   ⚠ 类型是「常驻枚举」：普通采购 / A4纸 / 硒鼓。旧数据没有 kind 时按项目名自动识别
+   （A4纸、打印纸、复印纸 → paper；硒鼓、碳粉、墨粉、墨盒 → toner），识别不出的算普通采购。
+   数量没填（0）⇒ **暂按普通采购全额计入本月**（宁可保持旧口径，也不让这笔钱凭空消失），
+   并在记账页 / 收支清算里显式提示"填数量后改为按月摊销"。 */
+var CONSUMABLE_KIND = {
+  paper: { label: 'A4纸', unit: '张', field: 'sheetsByDay' },
+  toner: { label: '硒鼓', unit: '页', field: 'pagesByDay' }
+};
+var EXPENSE_KIND_OPTIONS = [['other', '普通采购'], ['paper', 'A4纸'], ['toner', '硒鼓']];
+function expenseKind(e) {
+  if (!e) return 'other';
+  if (e.kind === 'paper' || e.kind === 'toner' || e.kind === 'other') return e.kind;
+  var s = String(e.item || '');
+  /* 刻意收紧：裸「A4」会把 A4文件夹 / A4相纸 / A4封面纸 误判成耗材；「墨盒/粉盒」
+     还会把「墨盒加粉服务费」这种服务费算成硒鼓采购 —— 一旦有人照着提示填数量，
+     历史月份的钱就会被悄悄改掉。宁可漏识别（用户可手动选类型），不可误识别。 */
+  if (/(硒鼓|碳粉|墨粉)/.test(s)) return 'toner';
+  if (/(A4\s*纸|A4\s*打印纸|A4\s*复印纸|打印纸|复印纸|纸张)/i.test(s)) return 'paper';
+  return 'other';
+}
+function isConsumableExpense(e) { return expenseKind(e) !== 'other'; }
+function expenseUnits(e) {
+  var n = Math.round(+((e && e.units) || 0));
+  return n > 0 ? n : 0;
+}
+/* 金额一律整数分：摊销行自带 amountCents（避免 cents/100 再 parseCents 的浮点尾差） */
+function expenseAmountCents(e) {
+  if (e && e.amountCents != null) return Math.max(0, Math.round(e.amountCents));
+  return parseCents(e && e.amount);
+}
+/* 能参与摊销的耗材采购：类型对、数量 > 0、金额 > 0、日期合法、采购人仍是成员。
+   不满足的（尤其没填数量）不参与摊销 —— 由 calcMonth 按普通采购处理，页面上显式提示。 */
+function isAmortizableExpense(e) {
+  if (!isConsumableExpense(e)) return false;
+  if (expenseUnits(e) <= 0 || expenseAmountCents(e) <= 0) return false;
+  if (!isDateStr(e.date) || !isMonthKey(monthKeyOf(e.date))) return false;
+  return !!getMember(e.payer);
+}
+function consumablePurchases() {
+  return (STORE.records.expenses || []).filter(isAmortizableExpense);
+}
+function consumableUnitYuan(e) {
+  var n = expenseUnits(e);
+  return n > 0 ? expenseAmountCents(e) / n / 100 : 0;
+}
 
 /* ==================== v7.4：打印机台账（消耗品寿命核算） ====================
    每台机记「价格 / 寿命页数」，折成**每页成本 = 价格 ÷ 寿命页数**；
@@ -1770,7 +1847,12 @@ function defaultDateFor(key) {
 }
 function monthFromRecords(key) {
   var expenses = [], income = {}, scMap = {}, scores = {}, transfers = [];
-  (STORE.records.expenses || []).forEach(function (r) { if (monthKeyOf(r.date) === key) expenses.push({ id: r.id, date: r.date, item: r.item, amount: r.amount, payer: r.payer }); });
+  /* v7.9：expenses 必须原样带上 kind / units（长期耗材的类型与数量）—— 旧写法只挑 5 个字段，
+     记账页的数量列会永远显示空、结算也会把耗材当普通采购整笔计入。 */
+  (STORE.records.expenses || []).forEach(function (r) {
+    if (monthKeyOf(r.date) === key) expenses.push({ id: r.id, date: r.date, item: r.item, amount: r.amount,
+                                                    payer: r.payer, kind: r.kind, units: r.units });
+  });
   (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === key) income[r.memberId] = (income[r.memberId] || 0) + (r.amount || 0); });
   (STORE.records.scores || []).forEach(function (r) { if (monthKeyOf(r.date) === key) (scMap[r.memberId] = scMap[r.memberId] || []).push({ id: r.id, date: r.date, item: r.item, score: r.score }); });
   /* 实际转账按「结算月份」归属，不存日期：转账常常在下个月才付，但它是**这个月**的账，
@@ -1819,17 +1901,135 @@ function apportionCents(pool, weights, members) {
   return out;
 }
 
+/* ==================== v7.9：长期耗材摊销（纯计算，唯一真相） ====================
+   两个入口：
+     · consumableAmort(purchases, usageByMonth, targetKey) —— 纯函数，给「某结算月」算出
+       本月该摊销多少（以及每个采购批次的生命周期）；验收脚本与变异自证都直接打它；
+     · calcMonth 只接收 opts.amort 的结果（rows 里是本月摊销行），不在这里重算。
+   推演规则（同一类型先进先出，逐日模拟 —— 采购日之前不算这批的用量）：
+     ① 同一类型的采购按日期排队，每一天的用量先喂给最早、还有剩余的批次；
+     ② 某批用完就轮到下一批；所有批次都用完仍有用量 ⇒ 记「无库存可摊」（不凭空计费）；
+     ③ 批次在月份 m 的金额 = round(价格 × 累计用量(m) / 总量)
+                          − round(价格 × 累计用量(m−1) / 总量)，
+        逐月取整差 ⇒ Σ各月恰好 = 采购价（用完时），不会每月各自四舍五入漂移。 */
+function monthRangeKeys(startKey, endKey) {
+  var out = [];
+  if (!isMonthKey(startKey) || !isMonthKey(endKey) || startKey > endKey) return out;
+  var y = +startKey.slice(0, 4), mo = +startKey.slice(5, 7);
+  var ey = +endKey.slice(0, 4), em = +endKey.slice(5, 7);
+  for (var guard = 0; guard < 600; guard++) {
+    out.push(y + '-' + (mo < 10 ? '0' + mo : '' + mo));
+    if (y === ey && mo === em) break;
+    mo++;
+    if (mo > 12) { mo = 1; y++; }
+  }
+  return out;
+}
+function consumableAmort(purchases, usageByMonth, targetKey) {
+  var res = { rows: [], lots: [], byBuyer: {}, totalCents: 0, totalUnits: 0,
+              uncovered: { paper: {}, toner: {} } };
+  if (!isMonthKey(targetKey)) return res;
+  var lots = [];
+  (purchases || []).forEach(function (e) {
+    var kind = expenseKind(e);
+    var units = expenseUnits(e);
+    var month = monthKeyOf(e.date);
+    if (kind === 'other' || units <= 0 || !isMonthKey(month) || month > targetKey) return;
+    lots.push({ id: String(e.id == null ? '' : e.id), kind: kind,
+                item: String(e.item == null ? '' : e.item), date: normDateStr(e.date),
+                payer: String(e.payer == null ? '' : e.payer),
+                priceCents: expenseAmountCents(e), units: units,
+                remaining: units, consumed: 0, perMonth: {}, months: {}, order: lots.length });
+  });
+  if (!lots.length) return res;
+  var self = res;
+  ['paper', 'toner'].forEach(function (kind) {
+    var list = lots.filter(function (l) { return l.kind === kind; })
+      .sort(function (a, b) { return a.date === b.date ? (a.order - b.order) : (a.date < b.date ? -1 : 1); });
+    if (!list.length) return;
+    /* 逐日用量：把每月的 pagesByDay / sheetsByDay 摊平（只取到 targetKey 为止） */
+    var dayMap = {};
+    Object.keys(usageByMonth || {}).forEach(function (mk) {
+      var u = usageByMonth[mk];
+      if (!u || !isMonthKey(mk) || mk > targetKey) return;
+      var dm = u[CONSUMABLE_KIND[kind].field] || {};
+      Object.keys(dm).forEach(function (d) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+        var n = Math.max(0, Math.round(+dm[d] || 0));
+        if (n > 0) dayMap[d] = (dayMap[d] || 0) + n;
+      });
+    });
+    var firstDate = list[0].date;
+    var days = Object.keys(dayMap).filter(function (d) { return d >= firstDate; }).sort();
+    var queue = list.slice(), qi = 0, active = [];
+    days.forEach(function (d) {
+      while (qi < queue.length && queue[qi].date <= d) active.push(queue[qi++]);
+      var need = Math.round(dayMap[d] || 0), mk = d.slice(0, 7);
+      for (var i = 0; i < active.length && need > 0; i++) {
+        var lot = active[i];
+        if (lot.remaining <= 0) continue;
+        var take = Math.min(lot.remaining, need);
+        lot.remaining -= take; lot.consumed += take; need -= take;
+        lot.perMonth[mk] = (lot.perMonth[mk] || 0) + take;
+      }
+      if (need > 0) self.uncovered[kind][mk] = (self.uncovered[kind][mk] || 0) + need;
+    });
+    list.forEach(function (lot) {
+      var months = monthRangeKeys(monthKeyOf(lot.date), targetKey);
+      var cum = 0, prevCents = 0;
+      months.forEach(function (mk) {
+        cum += (lot.perMonth[mk] || 0);
+        var cents = Math.round(lot.priceCents * cum / lot.units);
+        lot.months[mk] = { units: lot.perMonth[mk] || 0, cents: cents - prevCents, cumUnits: cum };
+        prevCents = cents;
+      });
+      var tm = lot.months[targetKey] || { units: 0, cents: 0, cumUnits: 0 };
+      var unitYuan = lot.priceCents / lot.units / 100;
+      if (tm.cents > 0) {
+        self.rows.push({ id: 'amort:' + lot.id, kind: lot.kind, lotId: lot.id, payer: lot.payer,
+                         item: CONSUMABLE_KIND[kind].label + '摊销（本月 ' + tm.units + ' ' + CONSUMABLE_KIND[kind].unit + '）',
+                         cents: tm.cents, units: tm.units, purchaseItem: lot.item });
+      }
+      self.lots.push({ id: lot.id, kind: lot.kind, label: CONSUMABLE_KIND[kind].label,
+                       item: lot.item, date: lot.date, payer: lot.payer,
+                       priceCents: lot.priceCents, units: lot.units,
+                       unit: CONSUMABLE_KIND[kind].unit, unitYuan: unitYuan,
+                       usedUnits: tm.cumUnits, chargedCents: prevCents,
+                       remainingCents: Math.max(0, lot.priceCents - prevCents),
+                       monthUnits: tm.units, monthCents: tm.cents });
+      self.totalCents += tm.cents;
+      self.totalUnits += tm.units;
+      if (tm.cents > 0 && lot.payer) self.byBuyer[lot.payer] = (self.byBuyer[lot.payer] || 0) + tm.cents;
+    });
+  });
+  res.lots.sort(function (a, b) { return a.date === b.date ? 0 : (a.date < b.date ? -1 : 1); });
+  return res;
+}
+
 /* opts.usage（v7.4，可选）—— 该结算月的「实际出纸页数」统计，由 _usageForMonth() 产出：
      { pages, pagesByMember:{mid:n}, pagesByMemberClient:{'mid|client_id':n},
        pagesByClient:{client_id:n} }
-   不传（历史遗留调用/脚本）⇒ 完全走旧口径：均摊 + 零折旧，零回归。 */
+   opts.amort（v7.9，可选）—— 长期耗材本月摊销（{ rows, lots, ... }，见 consumableAmort）。
+   两者都不传（历史遗留调用/脚本）⇒ 完全走旧口径：均摊 + 零折旧 + 耗材整笔计入，零回归。 */
 function calcMonth(m, opts) {
   opts = opts || {};
   var usage = opts.usage || null;
+  /* v7.9：长期耗材 —— 能摊销的整笔采购不计入本月，改为 opts.amort.rows 里的本月摊销行
+     （记在采购人名下）。amort 一旦传入就按新口径处理，哪怕 rows 是空（用量还没取到）：
+     页面上有明确的加载/失败提示，绝不在"看起来正常"的数字里偷偷把购买月撑爆。 */
+  var exps = (m.expenses || []).slice();
+  var amort = opts.amort || null;
+  if (amort) {
+    exps = exps.filter(function (e) { return !isAmortizableExpense(e); });
+    (amort.rows || []).forEach(function (a) {
+      if (!(a.cents > 0)) return;
+      exps.push({ id: a.id, date: m.key + '-01', item: a.item, amount: a.cents / 100,
+                  amountCents: a.cents, payer: a.payer, virtual: true, kind: a.kind, units: a.units });
+    });
+  }
   var members = getMembers();
   var rate = getRate();
   var scoreCap = getScoreCap();
-  var exps = m.expenses || [];
   var inc = m.income || {};
   var scores = m.scores || {};
   var known = {};
@@ -1842,9 +2042,9 @@ function calcMonth(m, opts) {
      由「采购明细」显式标注「未纳入结算」，避免钱凭空消失。 */
   var settledExps = exps.filter(function (e) { return known[e.payer]; });
   var orphanPayerExp = exps.reduce(function (s, e) {
-    return known[e.payer] ? s : s + parseCents(e.amount);
+    return known[e.payer] ? s : s + expenseAmountCents(e);
   }, 0);
-  var totalExp = settledExps.reduce(function (s, e) { return s + parseCents(e.amount); }, 0);
+  var totalExp = settledExps.reduce(function (s, e) { return s + expenseAmountCents(e); }, 0);
   var perPerson = members.length > 0 ? Math.round(totalExp / members.length) : 0;
   var totalInc = 0;
   members.forEach(function (mem) { totalInc += parseCents(inc[mem.id] || 0); });
@@ -1852,13 +2052,13 @@ function calcMonth(m, opts) {
   var scoreTotals = {}, totalScore = 0;
   members.forEach(function (mem) {
     var items = scores[mem.id] || [];
-    scoreTotals[mem.id] = items.reduce(function (s, x) { return s + Math.min(x.score || 0, scoreCap); }, 0);
+    scoreTotals[mem.id] = memberScoreTotal(items, scoreCap);
     totalScore += scoreTotals[mem.id];
   });
 
   var paid = {};
   members.forEach(function (m) { paid[m.id] = 0; });
-  settledExps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + parseCents(e.amount); });
+  settledExps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + expenseAmountCents(e); });
 
   var investPool = Math.round(totalInc * rate);
   var servicePool = totalInc - investPool;
@@ -2102,7 +2302,10 @@ function calcMonth(m, opts) {
            bookPL: bookPL, settleNet: settleNet, wearNet: wearNet,
            wearByMember: wearByMember, wearTransfers: wearTransfers,
            wearTotal: wearTotal, wearUnallocated: wearUnallocated,
-           usage: usage };
+           usage: usage,
+            /* v7.9：本月采购的「计费行」（普通采购 + 耗材摊销，不含能摊销的整笔耗材采购）
+               与耗材摊销明细（rows / lots / byBuyer）。页面只展示，不再另算一份。 */
+            expenses: exps, amort: amort };
 }
 
 /* ==================== 保存 ==================== */
@@ -4288,6 +4491,7 @@ function updateBinding(oid, memberId) {
     if (memberId) arr.push({ openid: oid, memberId: memberId });
     STORE.config.memberBindings = arr;
     save();
+    invalidateUsage();   // v7.9：绑定关系决定订单归属 ⇒ 用量/摊销缓存重算
     renderCurrent();
   }
   if (unlocked.settings) { doBind(); return; }
@@ -4820,16 +5024,23 @@ var _usageCache = {};      // 'YYYY-MM' -> usage
 var _usageLoading = {};    // 'YYYY-MM' -> true
 var _usageFailed = {};     // 'YYYY-MM' -> true
 var _usageWaiters = {};    // 'YYYY-MM' -> [cb]
+var _usageGen = 0;         // invalidateUsage() 自增：在飞响应据此作废（别把旧成员口径写回缓存）
+var _usageReqSeq = 0;      // 每次请求的序号：同一月份被更新的请求接管时，旧响应直接丢弃
 
 function _usageMonthRange(key) {
   var y = +String(key || '').slice(0, 4), mo = +String(key || '').slice(5, 7);
-  if (!(y > 2000) || !(mo >= 1 && mo <= 12)) return null;
+  /* 年份下限放宽到 1900（日期输入框不限年份；只挡明显不可能的脏值）。
+     超出范围返回 null 时调用方必须判失败，不能干等（见 ensureUsage 的 null 分支）。 */
+  if (!(y >= 1900) || !(mo >= 1 && mo <= 12)) return null;
   var last = new Date(y, mo, 0).getDate();
   return { start: key + '-01', end: key + '-' + (last < 10 ? '0' + last : String(last)) };
 }
 function _usageEmpty(key) {
-  return { month: key || '', pages: 0, orders: 0, files: 0,
+  /* v7.9：多记 sheets（纸张张数）与逐日用量 —— 长期耗材摊销要按「采购日之后」的
+     实际出纸量算，月度汇总不够（同一笔采购的购买日可能在某月中间）。 */
+  return { month: key || '', pages: 0, sheets: 0, orders: 0, files: 0,
            pagesByMember: {}, pagesByMemberPrinter: {}, pagesByPrinter: {},
+           pagesByDay: {}, sheetsByDay: {}, undatedPages: 0, undatedSheets: 0,
            unmatchedPrinterPages: 0, unattributedPages: 0, fetchedAt: '' };
 }
 function usageOfMonth(key) { return _usageCache[key] || null; }
@@ -4854,13 +5065,21 @@ function _usageFromOrders(orders) {
     var mk = _orderMemberKey(o);
     var mid = mk.indexOf('member:') === 0 ? mk.slice(7) : '';
     var cid = String(o.received_client || '');
-    var pages = 0, nf = 0;
+    var pages = 0, sheets = 0, nf = 0;
     (o.files || []).forEach(function (f) {
       if ((f.status || '') !== 'sent') return;   // 只算真正打出来的子任务
-      pages += _filePagesOf(f); nf++;
+      pages += _filePagesOf(f);
+      sheets += _fileSheets(f);                 // v7.9：纸张张数（A4纸摊销用）
+      nf++;
     });
-    if (!pages) return;
-    u.pages += pages; u.files += nf; u.orders += 1;
+    if (!pages && !sheets) return;
+    u.pages += pages; u.sheets += sheets; u.files += nf; u.orders += 1;
+    /* v7.9：逐日用量（采购月份中途买入的耗材只吃购买日之后的用量） */
+    var day = _fmtDate(o.created_at);
+    if (day) {
+      if (pages) u.pagesByDay[day] = (u.pagesByDay[day] || 0) + pages;
+      if (sheets) u.sheetsByDay[day] = (u.sheetsByDay[day] || 0) + sheets;
+    }
     if (mid) u.pagesByMember[mid] = (u.pagesByMember[mid] || 0) + pages;
     else u.unattributedPages += pages;
     var bound = printerForOrder(o);
@@ -4886,8 +5105,18 @@ function ensureUsage(key, cb) {
   if (cb) (_usageWaiters[key] = _usageWaiters[key] || []).push(cb);
   if (_usageLoading[key]) return;
   var range = _usageMonthRange(key);
-  if (!range) return;
-  _usageLoading[key] = true;
+  if (!range) {
+    /* 非法/超出支持范围的月份（如年份敲成 1996）必须**明确判失败并回调** ——
+       旧写法直接 return，waiters 永不 flush、ensureUsageMany 的串行链永远卡住，
+       长期耗材摊销会永久停在「正在统计」，整笔采购永远不计入。 */
+    _usageLoading[key] = false;
+    _usageFailed[key] = true;
+    _flushUsageWaiters(key);
+    return;
+  }
+  var token = ++_usageReqSeq;           // 本次请求的序号（invalidateUsage 后旧响应作废）
+  var gen = _usageGen;
+  _usageLoading[key] = token;
   _usageFailed[key] = false;
   var url = FINANCE_MODE === 'local'
     ? '/api/local/orders?start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end)
@@ -4895,16 +5124,31 @@ function ensureUsage(key, cb) {
   fetch(url, { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
     .then(function (data) {
+      if (_usageLoading[key] !== token) return;   // 已被更新的请求/失效接管 ⇒ 丢弃本次结果
       _usageLoading[key] = false;
       if (data && data.success && data.data) {
         var u = _usageFromOrders(data.data.orders || []);
         u.month = key;
+        /* v7.9：没有 created_at 的老订单**不**硬塞到月末（那会把购买日之前的用量也摊进这批）。
+           单独记 undated，页面上显式提示「这部分无法按采购日摊销」。 */
+        var pDay = 0, sDay = 0;
+        Object.keys(u.pagesByDay).forEach(function (d) { pDay += u.pagesByDay[d]; });
+        Object.keys(u.sheetsByDay).forEach(function (d) { sDay += u.sheetsByDay[d]; });
+        u.undatedPages = Math.max(0, u.pages - pDay);
+        u.undatedSheets = Math.max(0, u.sheets - sDay);
+        if (gen !== _usageGen) {               // 配置/成员已变：这次结果作废（别写回旧口径）
+          _flushUsageWaiters(key);
+          return;
+        }
         u.fetchedAt = new Date().toTimeString().substring(0, 8);
         _usageCache[key] = u;
       } else { _usageFailed[key] = true; }
       _flushUsageWaiters(key);
     })
-    .catch(function () { _usageLoading[key] = false; _usageFailed[key] = true; _flushUsageWaiters(key); });
+    .catch(function () {
+      if (_usageLoading[key] !== token) return;
+      _usageLoading[key] = false; _usageFailed[key] = true; _flushUsageWaiters(key);
+    });
 }
 /* 逐月补取（历史记录一次要看多个月）：串行，取完再回调，避免一次性打十几个请求 */
 function ensureUsageMany(keys, cb) {
@@ -4917,20 +5161,178 @@ function ensureUsageMany(keys, cb) {
   })();
 }
 function invalidateUsage(key) {
+  /* v7.9：把在飞请求一并作废 —— 否则「成员刚改 → 旧请求落地 → 把旧口径写回缓存」，
+     而 renderDash 只在 idle 时才取数，之后永远不会自己刷新（旧数据被当成权威）。
+     _usageLoading 也要清：旧请求占着 loading 会让新的一轮根本发不出去。 */
+  _usageGen++;
+  _usageLoading = {};
+  _amortKick = {};   // 在飞的补取回调可能永远不会回来（结果被作废）⇒ 清掉单飞标记，允许重新取
   if (key) {
     delete _usageCache[key]; delete _usageFailed[key];
     /* 区间缓存 / 累计读数是跨月的聚合，没法按单月精确失效 ⇒ 一律清掉（下次用到时重取） */
     _rangeOrdersCache = {}; _cumCache = {};
   } else { _usageCache = {}; _usageFailed = {}; _rangeOrdersCache = {}; _cumCache = {}; }
 }
-/* 结算用的唯一入口：给 calcMonth 带上该月的用量（没有就照旧口径，零回归） */
+/* ── v7.9：长期耗材摊销的月份范围 / 就绪状态 / 取数 ──
+   一笔 bought-in-October 的 A4纸要摊销到「之后每个月」，所以某结算月要看的是
+   「最早采购月 ~ 该月」这一整段的逐日用量（不是只看本月）。缺任何一个月都不算就绪 ——
+   绝不把"没取到"当成 0，否则摊销会被静默算小。 */
+function consumableFirstMonth() {
+  var first = '';
+  consumablePurchases().forEach(function (e) {
+    var mk = monthKeyOf(e.date);
+    if (isMonthKey(mk) && (!first || mk < first)) first = mk;
+  });
+  return first;
+}
+function amortNeededMonths(key) {
+  var first = consumableFirstMonth();
+  if (!first || !isMonthKey(key)) return [];
+  return monthRangeKeys(first, key);
+}
+function amortStateOfMonth(key) {
+  var need = amortNeededMonths(key);
+  if (!need.length) return 'none';
+  var st = 'ready';
+  need.forEach(function (mk) {
+    var s = usageStateOfMonth(mk);
+    if (s === 'failed') st = 'failed';
+    else if (s !== 'ready' && st !== 'failed') st = 'loading';
+  });
+  return st;
+}
+/* 逐月串行补取（一次别打十几个请求）；同一结算月只挂一次回调，避免重复重绘 */
+var _amortKick = {};
+function kickAmortUsage(key, rerender) {
+  if (_amortKick[key]) return;
+  _amortKick[key] = true;
+  ensureUsageMany(amortNeededMonths(key), function () {
+    _amortKick[key] = false;
+    if (typeof rerender === 'function') rerender();
+  });
+}
+/* 结算用的唯一入口：给 calcMonth 带上该月的用量与长期耗材摊销。
+   ⚠ 用量没就绪（loading / failed）时**退回旧口径**（整笔采购照旧计入），绝不把整笔钱
+   静默剔除 —— 否则历史记录 / 添加转账 / 一键填入建议转账三个入口都会少记一笔，
+   最坏情况（该月只有这一笔采购）会把「还欠采购人多少」算成 0 并报“全部结清”。
+   页面在「收支清算」有横幅说明，取数成功后自动改为按月摊销。 */
 function calcMonthWithUsage(key) {
-  return calcMonth(monthFromRecords(key), { usage: usageOfMonth(key) });
+  var st = amortStateOfMonth(key);
+  var need = amortNeededMonths(key);
+  var amort = { rows: [], lots: [], byBuyer: {}, totalCents: 0, totalUnits: 0,
+                uncovered: { paper: {}, toner: {} }, state: st, needed: need };
+  var ready = (st === 'ready');
+  if (ready) {
+    var um = {};
+    need.forEach(function (mk) { um[mk] = usageOfMonth(mk); });
+    amort = consumableAmort(consumablePurchases(), um, key);
+    amort.state = 'ready';
+    amort.needed = need;
+  }
+  var r = calcMonth(monthFromRecords(key), {
+    usage: usageOfMonth(key),
+    amort: (st === 'ready' || st === 'none') ? amort : null,   // 未就绪 ⇒ 旧口径
+  });
+  r.amort = amort;   // 展示层仍要知道「现在是 loading/failed」，提示与标记都靠它
+  return r;
 }
 /* 用量取数失败后的手动重试（页面上红条上的「重试」按钮） */
 function retryUsage() {
   _usageFailed[currentKey] = false;
   renderDash();
+}
+function retryAmortUsage() {
+  amortNeededMonths(currentKey).forEach(function (mk) { delete _usageFailed[mk]; });
+  _amortKick[currentKey] = false;
+  renderDash();
+}
+/* ── v7.9：长期耗材摊销区块（只展示 r.amort，不另算一份） ──
+   四类信息：① 未参与摊销的耗材行为什么没参与（缺数量 / 采购人不在名单）；
+   ② 每个采购批次的「总量 / 单价 / 累计已用 / 已摊销 / 本月用量 / 本月摊销 / 剩余」；
+   ③ 本月按垫付记在采购人名下的金额（结算时他从「垫付差额」里收回）；
+   ④ 本月有用量但没库存可摊时明确提示（否则会以为"怎么没摊"）。 */
+function consumableAmortSectionHTML(r, m) {
+  var am = (r && r.amort) ? r.amort : null;
+  var state = am && am.state ? am.state : 'none';
+  var raw = (m.expenses || []).filter(isConsumableExpense);
+  var pending = raw.filter(function (e) { return !isAmortizableExpense(e); });
+  var h = '<div class="section" id="consumableSection"><h2>🧾 长期耗材摊销 <span class="hint">（A4纸按张 / 硒鼓按页 · 采购时先垫整笔，结算只认本月用掉的部分）</span></h2>';
+  /* ⚠ 早退条件必须同时看「本月有没有耗材采购」与「有没有摊销批次」：
+     购买月之后的月份，本月 expenses 里当然没有那笔采购，但 r.amort.lots 里还挂着
+     它（按「最早采购月 → 结算月」重算）—— 只看 raw.length 会让购买月之后的**每个月**
+     都显示“还没有长期耗材采购”，本月摊销 / 剩余 / 返还对象全部消失。
+     取数中/失败时也不能早退（那时 lots 还没算出来，但下面有「正在统计 / 暂按整笔」提示）。 */
+  var _busy = !!(am && (am.state === 'loading' || am.state === 'failed'));
+  if (!raw.length && !(am && am.lots && am.lots.length) && !_busy) {
+    h += '<div style="color:var(--muted);font-size:.85rem">还没有长期耗材采购。到 <b>「手动记账 → 采购支出」</b> 把「类型」选成 <b>A4纸</b> 或 <b>硒鼓</b>，再填总张数 / 可打印页数 —— 之后这笔采购不再在购买当月全额计入，而是按每月实际用量摊销、逐月返还给采购人。</div></div>';
+    return h;
+  }
+  if (pending.length) {
+    h += '<div style="font-size:.8rem;color:var(--orange);margin-bottom:8px">⚠ 有 ' + pending.length + ' 笔长期耗材未参与摊销（<b>暂按普通采购全额计入本月</b>）：'
+      + pending.map(function (e) {
+          var why = expenseUnits(e) <= 0 ? '未填数量' : (!getMember(e.payer) ? '采购人不在成员名单' : '金额 / 日期无效');
+          return esc(e.item || '未命名') + '（' + why + '）';
+        }).join('；')
+      + '</div>';
+  }
+  if (state === 'loading' || state === 'failed') {
+    h += '<div style="font-size:.85rem;color:' + (state === 'failed' ? 'var(--neg)' : 'var(--muted)') + '">'
+      + (state === 'failed'
+          ? '未取到用量：本月长期耗材<b>暂按整笔采购计入</b>（不会静默少记），点上方红条「重试」；成功后自动改为按月摊销。'
+          : '正在统计用量：本月长期耗材<b>暂按整笔采购计入</b>，统计完成后自动改为按月摊销。')
+      + '</div></div>';
+    return h;
+  }
+  if (state === 'ready' && am && am.lots && am.lots.length) {
+    h += '<div class="table-wrap"><table><thead><tr><th>耗材</th><th>采购（日期 · 金额 · 采购人）</th><th>总量</th><th>单价</th><th>累计使用</th><th>已摊销</th><th>本月用量</th><th>本月摊销</th><th>剩余未摊销</th></tr></thead><tbody>';
+    am.lots.forEach(function (d) {
+      var buyer = getMember(d.payer);
+      h += '<tr><td style="font-weight:700">' + esc(d.label) + (d.item ? '<div style="font-size:.72rem;color:var(--muted);font-weight:400">' + esc(d.item) + '</div>' : '') + '</td>';
+      h += '<td style="font-size:.8rem;white-space:nowrap">' + esc(d.date) + ' · ' + RMB(d.priceCents) + '<div style="font-size:.72rem;color:var(--muted)">' + esc(buyer ? buyer.name : d.payer) + '</div></td>';
+      h += '<td>' + fmtInt(d.units) + ' ' + d.unit + '</td>';
+      h += '<td style="white-space:nowrap">¥' + d.unitYuan.toFixed(4) + '/' + d.unit + '</td>';
+      h += '<td>' + fmtInt(d.usedUnits) + ' ' + d.unit + '</td>';
+      h += '<td>' + RMB(d.chargedCents) + '</td>';
+      h += '<td>' + fmtInt(d.monthUnits) + ' ' + d.unit + '</td>';
+      h += '<td class="neg" style="font-weight:700">' + (d.monthCents > 0 ? RMB(d.monthCents) : '<span style="color:var(--muted)">¥0.00</span>') + '</td>';
+      h += '<td>' + (d.remainingCents > 0 ? RMB(d.remainingCents) : '<span class="tag g">已摊销完</span>') + '</td></tr>';
+    });
+    h += '<tr class="tfoot"><td>本月摊销合计</td><td colspan="6" style="color:var(--muted)">已计入上方「采购明细」的采购支出</td><td class="neg" style="font-weight:800">' + RMB(am.totalCents) + '</td><td></td></tr>';
+    h += '</tbody></table></div>';
+    var buyers = Object.keys(am.byBuyer || {});
+    if (buyers.length) {
+      h += '<div style="margin-top:8px;font-size:.82rem">本月按垫付返还给采购人：'
+        + buyers.map(function (id) {
+            var mem = getMember(id);
+            return '<b>' + esc(mem ? mem.name : id) + '</b> ' + RMB(am.byBuyer[id]);
+          }).join(' · ')
+        + '<span style="color:var(--muted)">（已记在他们名下，结算时随「垫付差额」收回；实际收回 = 本月摊销 − 他自己应摊的那份）</span></div>';
+    } else {
+      h += '<div style="margin-top:8px;font-size:.82rem;color:var(--muted)">本月这些耗材没有产生用量，所以没有摊销（剩余价值留在库存里）。</div>';
+    }
+    /* 有用量但没有库存可摊 —— 说清楚，别让人以为摊销漏了 */
+    ['paper', 'toner'].forEach(function (kind) {
+      var n = (am.uncovered && am.uncovered[kind] && am.uncovered[kind][m.key]) || 0;
+      if (n > 0) {
+        h += '<div style="margin-top:6px;font-size:.8rem;color:var(--orange)">⚠ 本月有 ' + fmtInt(n) + ' ' + CONSUMABLE_KIND[kind].unit
+          + ' ' + CONSUMABLE_KIND[kind].label + '用量没有对应库存（采购未录入或已用完），这部分未计摊销。</div>';
+      }
+    });
+    /* v7.9：没有 created_at 的老订单无法归日 ⇒ 不进摊销（也绝不硬塞到月末 —— 那会把
+       购买日之前的用量也摊进这批）。单独提示，别让人以为少算了。 */
+    var _u = usageOfMonth(m.key) || {};
+    var _undated = _u.undatedSheets || 0, _undatedP = _u.undatedPages || 0;
+    if (_undated > 0 || _undatedP > 0) {
+      h += '<div style="margin-top:6px;font-size:.8rem;color:var(--orange)">⚠ 本月有 ' + fmtInt(_undated) + ' 张纸 / ' + fmtInt(_undatedP)
+        + ' 页的老订单缺少时间（created_at），无法按采购日摊销，这部分未计入。</div>';
+    }
+    h += '<div style="margin-top:6px;font-size:.78rem;color:var(--muted)">摊销只在<b>采购日之后</b>的用量上计算（买之前用的纸 / 鼓不算这批）；'
+      + '累计摊销封顶在采购价（整数分、按累计用量取整差，用完即停，不会多返一分）。'
+      + '摊销按<b>当前订单数据</b>实时计算 —— 之后若删改历史订单，对应月份的摊销会跟着变（与「按用量分摊」同一口径）。</div></div>';
+    return h;
+  }
+  h += '<div style="color:var(--muted);font-size:.85rem">本月还没有可摊销的长期耗材（填好类型与数量后自动开始）。</div></div>';
+  return h;
 }
 
 /* ==================== TAB: 收支清算 ==================== */
@@ -4940,12 +5342,6 @@ function renderDash() {
   if (!keys.includes(currentKey)) currentKey = keys[keys.length - 1] || currentMonthKey();
   var m = monthFromRecords(currentKey);
   var r = calcMonthWithUsage(currentKey);
-  /* 用量（按用量分摊 / 设备折旧）按需拉取：首次进入或换月取一次，取回后就地重绘。
-     失败不重试（避免打满请求），页面照旧可用并显式标注"未取到用量"。 */
-  if (usageStateOfMonth(currentKey) === 'idle') {
-    var _uKey = currentKey;
-    ensureUsage(_uKey, function () { if (currentTab === 'dash' && currentKey === _uKey) renderDash(); });
-  }
   var hasData = (m.expenses.length + (STORE.records.income || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + (STORE.records.scores || []).filter(function (x) { return monthKeyOf(x.date) === currentKey; }).length + m.transfers.length) > 0;
 
   // v4.2：无成员空态 —— 引导到「设置」添加成员（订单归属/收支结算的前提）
@@ -4956,6 +5352,23 @@ function renderDash() {
     hEmpty += '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">👥</div><h3>暂无成员</h3><p style="margin-top:6px">请先在「设置」中添加成员，成员将用于订单归属与收支结算，添加后本地打印工具的归属下拉会同步显示。</p><button class="btn pri" style="margin-top:16px" onclick="switchTab(\'settings\')">⚙️ 去设置添加成员</button></div></div>';
     el.innerHTML = hEmpty;
     return;
+  }
+
+  /* 用量（按用量分摊 / 设备折旧 / 长期耗材摊销）按需拉取：首次进入或换月取一次，取回后就地重绘。
+     失败不重试（避免打满请求），页面照旧可用并显式标注"未取到用量"。
+     ⚠ 必须放在「无成员」早退**之后**：页面初始化时 STORE 还是空的（成员为空），
+     若此时就发请求，回调里 `_orderMemberKey` 认不出成员 ⇒ 用量被缓存成「全部未归属」，
+     按用量分摊会一直退回均摊（要等某次缓存失效才恢复）。 */
+  if (usageStateOfMonth(currentKey) === 'idle') {
+    var _uKey = currentKey;
+    ensureUsage(_uKey, function () { if (currentTab === 'dash' && currentKey === _uKey) renderDash(); });
+  }
+  /* v7.9：长期耗材要回溯「最早采购月 ~ 本月」的逐日用量，缺月就补取（取回后自动重绘） */
+  var _amKey = currentKey;
+  if (amortStateOfMonth(_amKey) === 'loading') {
+    kickAmortUsage(_amKey, function () {
+      if (currentTab === 'dash' && currentKey === _amKey) renderDash();
+    });
   }
 
   var h = '<div class="filter-bar" style="align-items:center">';
@@ -4977,8 +5390,10 @@ function renderDash() {
   var basisLabel = r.useUsage
     ? ('按用量分摊 · 共 ' + r.usageTotal + ' 页')
     : (r.basis === 'usage' ? '均摊（未取到用量）' : ('均摊 · ' + r.memberCount + ' 人'));
+  /* v7.9：采购支出里含多少「长期耗材本月摊销」—— 购买月不再整笔计入，这一行让人一眼对上 */
+  var amortSub = (r.amort && r.amort.totalCents > 0) ? (' · 含耗材摊销 ' + RMB(r.amort.totalCents)) : '';
   h += '<div class="kpi-grid">';
-  h += '<div class="kpi-card c-blue"><div class="kpi-ico">🧾</div><div class="num" data-count="' + r.totalExp + '" data-prefix="¥">0</div><div class="lbl">采购支出</div><div class="sub">' + basisLabel + '</div></div>';
+  h += '<div class="kpi-card c-blue"><div class="kpi-ico">🧾</div><div class="num" data-count="' + r.totalExp + '" data-prefix="¥">0</div><div class="lbl">采购支出</div><div class="sub">' + basisLabel + amortSub + '</div></div>';
   h += '<div class="kpi-card c-green"><div class="kpi-ico">💵</div><div class="num" data-count="' + r.totalInc + '" data-prefix="¥">0</div><div class="lbl">代收总额</div><div class="sub">' + r.memberCount + ' 人均摊投资回报</div></div>';
   h += '<div class="kpi-card ' + (totalPL >= 0 ? 'c-green' : 'c-red') + '"><div class="kpi-ico">📈</div><div class="num" data-count="' + totalPL + '" data-prefix="¥">0</div><div class="lbl">本月盈亏</div><div class="sub">' + (totalPL >= 0 ? '盈利' : '亏损') + (r.depTotal > 0 ? ' · 已扣折旧 ' + RMB(r.depTotal) : '') + '</div></div>';
   h += '<div class="kpi-card c-orange"><div class="kpi-ico">⭐</div><div class="num">' + r.totalScore + '</div><div class="lbl">服务总分</div><div class="sub">上限 ' + r.scoreCap + ' 分/项</div></div>';
@@ -4997,15 +5412,32 @@ function renderDash() {
     h += '<div class="alert-banner"><span class="msg">ℹ️ 已选「按用量分摊」，但本月用量为 0 页 ⇒ 本次按均摊计算。'
       + '<span class="sub">录了订单 / 绑定成员后会自动改回按用量。</span></span></div>';
   }
+  /* v7.9：长期耗材摊销的取数状态（要回溯到最早采购月，第一次进页会多拉几个月）。
+     未就绪时**暂按整笔采购计入**（旧口径）—— 宁可购买月暂时偏高，也不让整笔钱在
+     历史记录 / 新增转账 / 一键填入建议转账里静默消失。 */
+  if (r.amort && r.amort.state === 'loading') {
+    h += '<div class="alert-banner"><span class="msg">⏳ 正在统计长期耗材（A4纸 / 硒鼓）的逐日用量（需回溯到最早采购月）：本月长期耗材<b>暂按整笔采购计入</b>，统计完成后自动改为按月摊销。</span></div>';
+  } else if (r.amort && r.amort.state === 'failed') {
+    h += '<div class="alert-banner" style="border-left-color:var(--neg)"><span class="msg">⚠️ 未取到长期耗材的用量：本月长期耗材<b>暂按整笔采购计入</b>（不会静默少记），重试成功后自动改为按月摊销。'
+      + '<span class="sub">在取数成功前，先别「一键填入建议转账」。</span></span><button class="btn sm" onclick="retryAmortUsage()">重试</button></div>';
+  }
 
-  // 采购明细（v7.4：分摊口径 = 均摊 / 按用量，比例与应摊额单列一张表）
+  // 采购明细（v7.4：分摊口径 = 均摊 / 按用量，比例与应摊额单列一张表；v7.9：含耗材本月摊销）
   h += '<div class="section"><h2>🧾 采购明细 <span class="hint">(' + esc(basisLabel) + ')</span></h2><div class="table-wrap"><table><thead><tr><th class="l">项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
   var _expMemberSet = {};
   getMembers().forEach(function (mem) { _expMemberSet[mem.id] = true; });
-  (m.expenses || []).forEach(function (e) {
+  /* v7.9：用 calcMonth 返回的「计费行」渲染（普通采购 + 耗材本月摊销，**不含**能摊销的
+     整笔耗材采购 —— 那笔全额只在购买人身上垫了一次，按用量逐月返还在下方单独列出）。 */
+  var _amortOk = !r.amort || r.amort.state === 'ready' || r.amort.state === 'none';
+  (r.expenses || []).forEach(function (e) {
     // 🔴-F2：付款人已不在成员名单 → 这笔钱不进均摊（进了就会被 N 人分摊却无人承接）
     var orphan = !_expMemberSet[e.payer];
-    h += '<tr' + (orphan ? ' style="opacity:.55"' : '') + '><td class="l">' + esc(e.item) + '</td><td>' + RMB(parseCents(e.amount)) + '</td><td><span class="member-tag" style="background:' + sanitizeColor(MC(e.payer)) + '">' + esc(MN(e.payer)) + '</span>' + (orphan ? ' <span class="tag b">未纳入结算</span>' : '') + '</td></tr>';
+    var tag = e.virtual ? ' <span class="tag b">长期耗材摊销</span>'
+      : (isConsumableExpense(e)
+          ? (!_amortOk ? ' <span class="tag y">耗材 · 暂按整笔</span>'
+                       : (!isAmortizableExpense(e) ? ' <span class="tag y">耗材 · 未摊销</span>' : ''))
+          : '');
+    h += '<tr' + (orphan ? ' style="opacity:.55"' : '') + '><td class="l">' + esc(e.item) + tag + '</td><td>' + RMB(expenseAmountCents(e)) + '</td><td><span class="member-tag" style="background:' + sanitizeColor(MC(e.payer)) + '">' + esc(MN(e.payer)) + '</span>' + (orphan ? ' <span class="tag b">未纳入结算</span>' : '') + '</td></tr>';
   });
   if (r.orphanPayerExp > 0) {
     h += '<tr><td class="l" style="color:var(--muted)">其中：已删除成员垫付</td><td style="color:var(--muted)">' + RMB(r.orphanPayerExp) + '</td><td style="color:var(--muted)">无人可收，不计入' + (r.useUsage ? '分摊' : '均摊') + '</td></tr>';
@@ -5034,6 +5466,9 @@ function renderDash() {
         : '当前为均摊口径。想按各人实际用纸比例出钱 → 「设置 → 采购分摊」切成<b>按用量</b>。')
     + (r.usage && r.usage.unattributedPages > 0 ? ' 另有 <b>' + r.usage.unattributedPages + ' 页</b>未归属成员（订单没绑定到成员），未计入任何人的用量。' : '')
     + '</div></div>';
+
+  /* ── v7.9：长期耗材摊销（A4纸 / 硒鼓） ─────────────────────────── */
+  h += consumableAmortSectionHTML(r, m);
 
   /* ── v7.4：设备折旧（消耗品寿命成本） ─────────────────────────────
      每台机「本月它打的页数 × 每页成本（价格 ÷ 寿命页数）」= 本月折旧；
@@ -5152,7 +5587,11 @@ function renderDash() {
     h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (adv >= 0 ? '+' : '') + RMB(adv) + ' ' + tag2 + '</td></tr>';
   });
   h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(r.totalExp) + '</td><td>−' + RMB(r.totalExp) + '</td><td>' + (advSum > 0 ? '+' : '') + RMB(advSum) + '</td></tr>';
-  h += '</tbody></table></div></div>';
+  h += '</tbody></table></div>';
+  if (r.amort && r.amort.totalCents > 0) {
+    h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">长期耗材（A4纸 / 硒鼓）的整笔采购款是采购人一次付清的，但结算只按本月实际用掉的部分记他的「实际代付」（' + RMB(r.amort.totalCents) + '）；没用的部分是库存，以后各月再逐月返还 —— 这样购买月不会被整笔采购撑爆。</div>';
+  }
+  h += '</div>';
 
   /* 📐 结算公式（只展示，v7.3）—— 放在「资金重分配」之前：先讲清算式，再看具体的转账指令。
      默认收起（open=false）：日常看数时它只占一行，不挤占 KPI 与表格的视线。 */
@@ -5297,7 +5736,7 @@ function realPLSectionHTML(m, r, totalPL) {
   h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>' + signed(r.transferTotal) + '</td><td>' + spend(r.totalExp) + '</td><td>' + spend(r.transferTotal) + '</td><td>' + spend(r.depTotal || 0) + '</td>';
   h += '<td class="' + (totalActual >= 0 ? 'pos' : 'neg') + '">' + signed(totalActual) + '</td><td>' + signed(totalPL) + '</td><td>' + signed(gapSum) + '</td></tr>';
   h += '</tbody></table></div>';
-  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">实际盈亏 = 这个月他<b>真正</b>拿到的钱减真正掏出去的钱，再扣掉自己用掉的<b>设备寿命价值</b>（折旧是非现金成本：机器早已买好，本月没有现金流出，但它确实被磨掉了）。<br>转账是成员内部的钱，合计为 0，不影响团队总盈亏。全部结清时「实际盈亏」= 「应得盈亏」；没结清时差额就是<b>还没到位的钱</b> —— 差额为正的人被欠着，团队亏损实际由他垫着。</div></div>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">实际盈亏 = 这个月他<b>真正</b>拿到的钱减真正掏出去的钱，再扣掉自己用掉的<b>设备寿命价值</b>（折旧是非现金成本：机器早已买好，本月没有现金流出，但它确实被磨掉了）。<br>长期耗材（A4纸 / 硒鼓）的整笔采购款同理不算当月成本 —— 那是库存，按每月实际用量摊销后逐月记到采购人名下（见「垫付清算」脚注）。<br>转账是成员内部的钱，合计为 0，不影响团队总盈亏。全部结清时「实际盈亏」= 「应得盈亏」；没结清时差额就是<b>还没到位的钱</b> —— 差额为正的人被欠着，团队亏损实际由他垫着。</div></div>';
   return h;
 }
 /* ==================== v7.4：云端数据「🖨️ 打印机」区块 ====================
@@ -5448,7 +5887,15 @@ function settleFormulaHTML(r, open) {
   h += '<p>本月代入：Π = ' + RMB(r.totalInc) + ' − ' + RMB(r.totalExp) + (depTotal ? ' − ' + RMB(depTotal) : '')
      + ' = ' + RMB(r.investPool) + ' + ' + RMB(r.servicePool) + ' − ' + RMB(r.totalExp) + (depTotal ? ' − ' + RMB(depTotal) : '')
      + ' = <b>' + sg(teamPL) + '</b></p>';
-  h += '<p class="note">「有效采购」= 付款人仍在成员名单里的记录。'
+  var _amNotReady = r.amort && (r.amort.state === 'loading' || r.amort.state === 'failed');
+  h += '<p class="note">「有效采购」E = 付款人仍在成员名单里的记录 <b>+ 长期耗材本月摊销</b>'
+     + (_amNotReady
+        ? '（长期耗材的用量还没就绪：本月<b>暂按整笔采购计入</b>，统计完成后自动改为按月摊销）'
+        : (r.amort && r.amort.totalCents > 0
+            ? '（本月 A4纸 / 硒鼓摊销 ' + RMB(r.amort.totalCents) + '，已按实际用量折原价计入；'
+              + '整笔耗材采购<b>不再在购买当月全额计入</b>，没用的部分留在库存里逐月摊销）'
+            : '（长期耗材按每月实际用量摊销，购买当月不计入整笔采购）'))
+     + '。'
      + (r.orphanPayerExp > 0
         ? '本月另有已删成员垫付的 ' + RMB(r.orphanPayerExp) + ' 不进结算（采购明细里标「未纳入结算」）'
           + '—— 否则这笔钱会被 ' + r.memberCount + ' 人分摊、却无人承接。'
@@ -5463,7 +5910,7 @@ function settleFormulaHTML(r, open) {
   h += '<div class="table-wrap"><table><thead><tr><th style="width:34px">步</th><th style="width:22%">量</th><th>公式</th><th>含义 / 守恒</th></tr></thead><tbody>';
   h += '<tr><td>1</td><td>收入池 <code>P₁ / P₂</code></td><td><code>P₁ = round(I·k)</code>、<code>P₂ = I − P₁</code></td><td>投资池按比例取整，余数全进服务池；<code>P₁ + P₂ = Σ代收</code></td></tr>';
   h += '<tr><td>2</td><td>应得收入 <code>Rᵢ</code></td><td><code>Rᵢ = 分摊(P₁, 等权) + 分摊(P₂, 按 sᵢ 加权)</code></td><td><code>ΣRᵢ = I</code>；服务分全为 0 时退化为等权均分</td></tr>';
-  h += '<tr><td>3</td><td>采购应摊 <code>Aᵢ</code></td><td><code>Aᵢ = 分摊(E, 权重)</code></td><td><code>ΣAᵢ = E</code>；<b>权重 = 均摊时全 1，按用量时各人本月出纸页数</b></td></tr>';
+  h += '<tr><td>3</td><td>采购应摊 <code>Aᵢ</code></td><td><code>Aᵢ = 分摊(E, 权重)</code></td><td><code>ΣAᵢ = E</code>；<b>权重 = 均摊时全 1，按用量时各人本月出纸页数</b>；<b>E = 普通采购 + 长期耗材本月摊销</b></td></tr>';
   h += '<tr><td>4</td><td>设备折旧 <code>Dᵢ</code></td><td><code>Dᵢ = Σ_团队共担机 (该机本月页数_i × 每页成本)</code></td><td><code>ΣDᵢ = D</code>；每页成本 = 价格 ÷ 寿命页数；<b>非现金成本</b></td></tr>';
   h += '<tr><td>5</td><td>损耗费 <code>Wᵢ</code></td><td><code>Wᵢ = Σ_收损耗费机 (收到的补偿ᵢ − 付给所有者的ᵢ)</code></td><td><b><code>ΣWᵢ ≡ 0</code></b>；使用者为负、所有者为正；只有"购买款已付过"的机器才有</td></tr>';
   h += '<tr><td>6</td><td>建议转账 <code>Nᵢ</code></td><td><code>Nᵢ = (Rᵢ − Iᵢ) + (Eᵢ − Aᵢ) + Wᵢ</code></td><td>即页面「收入调整 + 垫付差额 ± 损耗费」；<b><code>ΣNᵢ ≡ 0</code></b></td></tr>';
@@ -5492,7 +5939,7 @@ function settleFormulaHTML(r, open) {
   /* ── ⑤ 页面各表 ↔ 公式记号 ── */
   h += '<h3>⑤ 页面上每张表用的是哪个量</h3>';
   h += '<div class="table-wrap"><table><thead><tr><th>页面区块</th><th>对应的量</th></tr></thead><tbody>';
-  h += '<tr><td>🧾 采购明细</td><td><code>E</code> + 每人分摊比例与应摊额（<code>Aᵢ</code>）</td></tr>';
+  h += '<tr><td>🧾 采购明细</td><td><code>E</code> + 每人分摊比例与应摊额（<code>Aᵢ</code>）；长期耗材的购买 / 摊销明细另见表下方「🧾 长期耗材摊销」</td></tr>';
   h += '<tr><td>🖨️ 设备折旧</td><td><code>Dᵢ</code> / <code>Wᵢ</code> 的来源（团队共担 → 折旧；收损耗费 → 损耗费转账）</td></tr>';
   h += '<tr><td>💵 收入分配</td><td><code>Rᵢ</code>（「差额」= <code>Rᵢ − Iᵢ</code>）</td></tr>';
   h += '<tr><td>📊 经营损益</td><td><code>Bᵢ</code> = 应得收入 − 采购应摊 − 团队折旧 ± 损耗费</td></tr>';
@@ -5586,13 +6033,35 @@ function renderEntry() {
   h += '<div class="section"><h2>🧾 采购支出 <span class="hint">（谁垫付了什么，AA 均摊）</span>' + lockBadge('expense') + '</h2>';
   h += lockBarHTML('expense');
   var disabled = unlocked.expense ? '' : ' disabled';
-  h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">项目</th><th>金额（元）</th><th>代付人</th><th></th></tr></thead><tbody>';
+  /* v7.9：类型是常驻枚举（普通采购 / A4纸 / 硒鼓）。选了长期耗材就多出「数量」列：
+     A4纸填总张数、硒鼓填可打印页数 —— 结算只按每月实际用掉的量摊销，购买月不再整笔计入。 */
+  var hasConsumable = m.expenses.some(isConsumableExpense);
+  h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">项目</th><th>类型</th>'
+    + (hasConsumable ? '<th>数量</th>' : '')
+    + '<th>金额（元）</th><th>代付人</th><th></th></tr></thead><tbody>';
   m.expenses.forEach(function (e, i) {
     var eid = safeId(e.id);
     if (!eid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
+    var kind = expenseKind(e), units = expenseUnits(e);
     h += '<tr>';
     h += '<td><input type="date" value="' + esc(e.date) + '" onchange="updExp(\'' + eid + '\',\'date\',this.value)"' + disabled + '></td>';
-    h += '<td class="l"><input type="text" value="' + esc(e.item) + '" onchange="updExp(\'' + eid + '\',\'item\',this.value)" placeholder="项目名称" style="width:300px"' + disabled + '></td>';
+    h += '<td class="l"><input type="text" value="' + esc(e.item) + '" onchange="updExp(\'' + eid + '\',\'item\',this.value)" placeholder="项目名称" style="width:260px"' + disabled + '></td>';
+    h += '<td><select onchange="updExpType(\'' + eid + '\',this.value)" title="长期耗材选 A4纸 / 硒鼓，填数量后按月摊销"' + disabled + '>';
+    EXPENSE_KIND_OPTIONS.forEach(function (opt) {
+      h += '<option value="' + opt[0] + '"' + (kind === opt[0] ? ' selected' : '') + '>' + esc(opt[1]) + '</option>';
+    });
+    h += '</select></td>';
+    if (hasConsumable) {
+      if (kind === 'other') {
+        h += '<td style="color:var(--muted)">—</td>';
+      } else {
+        var ck = CONSUMABLE_KIND[kind];
+        h += '<td style="white-space:nowrap"><input type="number" step="1" min="0" value="' + (units || '') + '" placeholder="' + (kind === 'paper' ? '总张数' : '可打印页数') + '" style="width:104px" onchange="updExp(\'' + eid + '\',\'units\',+this.value)"' + disabled + '> <span style="font-size:.75rem;color:var(--muted)">' + ck.unit + '</span>';
+        if (units > 0) h += '<div style="font-size:.72rem;color:var(--muted)">单价 ¥' + consumableUnitYuan(e).toFixed(4) + '/' + ck.unit + '</div>';
+        else h += '<div style="font-size:.72rem;color:var(--orange)">填数量后按月摊销</div>';
+        h += '</td>';
+      }
+    }
     h += '<td><input type="number" step="0.01" min="0" value="' + esc(e.amount) + '" onchange="updExp(\'' + eid + '\',\'amount\',+this.value)"' + disabled + '></td>';
     h += '<td><select onchange="updExp(\'' + eid + '\',\'payer\',this.value)"' + disabled + '>';
     members.forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (e.payer === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
@@ -5600,9 +6069,10 @@ function renderEntry() {
     h += '<td><button class="btn danger sm" onclick="delExp(\'' + eid + '\')"' + disabled + '>✕</button></td>';
     h += '</tr>';
   });
-  if (!m.expenses.length) h += '<tr><td colspan="5" style="color:var(--muted)">暂无采购记录</td></tr>';
+  if (!m.expenses.length) h += '<tr><td colspan="' + (hasConsumable ? 7 : 6) + '" style="color:var(--muted)">暂无采购记录</td></tr>';
   h += '</tbody></table></div>';
   h += '<button class="btn sm" style="margin-top:10px" onclick="addExp()"' + disabled + '>+ 添加采购项</button>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">长期耗材：<b>A4纸</b>填<b>总张数</b>（如 5 包 × 500 = 2500 张）、<b>硒鼓</b>填<b>可打印页数</b>（如 1600 页）。填好后这笔采购<b>不再在购买当月全额计入</b>，而是按每月实际用量摊销、逐月返还给采购人 —— 详情见「收支清算 → 长期耗材摊销」。</div>';
   h += '</div>';
 
   /* ── 代收收入 ── */
@@ -5644,8 +6114,8 @@ function renderEntry() {
     var memId = safeId(mem.id);
     if (!memId) return;   // 非法成员 ID 跳过该成员区块（safeId 已 console.warn）
     var sc = m.scores[memId] || [];
-    var capped = sc.reduce(function (s, x) { return s + Math.min(x.score || 0, scoreCap); }, 0);
-    h += '<h3 style="margin:16px 0 8px;display:flex;align-items:center;gap:8px;font-size:.95rem"><span class="member-tag" style="background:' + sanitizeColor(mem.color) + '">' + esc(mem.name) + '</span> <span class="tag b">总分 ' + capped + '</span></h3>';
+    var capped = memberScoreTotal(sc, scoreCap);
+    h += '<h3 style="margin:16px 0 8px;display:flex;align-items:center;gap:8px;font-size:.95rem"><span class="member-tag" style="background:' + sanitizeColor(mem.color) + '">' + esc(mem.name) + '</span> <span class="tag b" id="scoreTotal-' + memId + '">总分 ' + capped + '</span></h3>';
     h += '<div class="table-wrap"><table><thead><tr><th class="l">评分项目</th><th>得分</th><th></th></tr></thead><tbody>';
     sc.forEach(function (s) {
       var sid = safeId(s.id);
@@ -5685,14 +6155,29 @@ function addExp() {
   if (!unlocked.expense) { toast('🔒 请先解锁采购支出', 'error'); return; }
   var members = getMembers();
   if (!members.length) { toast('👥 请先在「设置」中添加成员', 'error'); return; }
-  STORE.records.expenses.push({ id: uid(), date: defaultDateFor(currentKey), item: '新采购', amount: 0, payer: members.length ? members[0].id : '' });
+  STORE.records.expenses.push({ id: uid(), date: defaultDateFor(currentKey), item: '新采购', kind: 'other', units: 0, amount: 0, payer: members.length ? members[0].id : '' });
   save(); renderEntry();
 }
 function updExp(id, field, val) {
   var r = STORE.records.expenses.find(function (x) { return x.id === id; });
   if (!r) return;
-  r[field] = field === 'amount' ? (+val || 0) : val;
-  save(); handleDateMove(r);
+  if (field === 'amount') r[field] = Math.max(0, +val || 0);
+  else if (field === 'units') r[field] = Math.max(0, Math.round(+val || 0));
+  else r[field] = val;
+  save();
+  handleDateMove(r);
+  /* v7.9：数量变化要刷新「单价 ¥x/张」提示（onchange 提交，重建表格不会影响输入） */
+  if (field === 'units' && monthKeyOf(r.date) === currentKey) renderEntry();
+}
+/* v7.9：切换采购类型（普通采购 / A4纸 / 硒鼓）。类型会改变列结构（多出「数量」列），
+   所以改完直接重绘；切回普通采购时清掉数量，避免隐藏在数据里的旧值以后又被捡起来用。 */
+function updExpType(id, val) {
+  if (!unlocked.expense) { toast('🔒 请先解锁采购支出', 'error'); return; }
+  var r = STORE.records.expenses.find(function (x) { return x.id === id; });
+  if (!r) return;
+  r.kind = (val === 'paper' || val === 'toner') ? val : 'other';
+  if (r.kind === 'other') delete r.units;
+  save(); renderEntry();
 }
 function delExp(id) { STORE.records.expenses = STORE.records.expenses.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
 function addInc() {
@@ -5720,6 +6205,22 @@ function updScore(id, field, val) {
   if (!r) return;
   r[field] = field === 'score' ? (+val || 0) : val;
   save();   // 日期列已移除，评分项归属月份固定，无需 handleDateMove 重绘（避免编辑失焦）
+  /* v7.8：改完子项得分立刻重算该成员「总分」（用户要求：不再等切页/整表重绘才更新）。
+     只改徽标文本、不整表重绘 —— 整表重绘会重建所有输入框，正在连续录入时会失焦。 */
+  if (field === 'score') refreshScoreTotals();
+}
+/* v7.8：按 STORE 重算每个成员的总分并就地更新「总分 N」徽标。
+   口径 = memberScoreTotal（与 calcMonth / renderEntry 同一份封顶求和），不另写一套。 */
+function refreshScoreTotals() {
+  var cap = getScoreCap();
+  var m = monthFromRecords(currentKey);
+  getMembers().forEach(function (mem) {
+    var memId = safeId(mem.id);
+    if (!memId) return;   // 非法成员 ID：renderEntry 也不会渲染它（safeId 已 console.warn）
+    var el = document.getElementById('scoreTotal-' + memId);
+    if (!el) return;      // 该成员区块不在当前 DOM（未渲染 / 已切到别的标签页）→ 静默跳过
+    el.textContent = '总分 ' + memberScoreTotal(m.scores[memId], cap);
+  });
 }
 function delScore(id) { STORE.records.scores = STORE.records.scores.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
 
@@ -5736,11 +6237,16 @@ function addTransfer() {
   var m = monthFromRecords(currentKey);
   // 默认填第一条还没结清的建议转账，省去手填
   var from = members[0].id, to = members[1].id, amount = 0;
-  var r = calcMonth(m);
-  for (var i = 0; i < r.transfers.length; i++) {
-    var t = r.transfers[i], done = 0;
-    m.transfers.forEach(function (x) { if (x.from === t.from && x.to === t.to) done += parseCents(x.amount); });
-    if (t.amount - done > 1) { from = t.from; to = t.to; amount = (t.amount - done) / 100; break; }
+  /* v7.9：与收支清算同口径（含用量分摊 / 折旧 / 耗材摊销），否则默认金额会偏。
+     用量还没就绪时**不预填金额**（此时耗材暂按整笔计入，预填会多算），只给默认收付方。 */
+  var _st = amortStateOfMonth(currentKey);
+  if (_st === 'ready' || _st === 'none') {
+    var r = calcMonthWithUsage(currentKey);
+    for (var i = 0; i < r.transfers.length; i++) {
+      var t = r.transfers[i], done = 0;
+      m.transfers.forEach(function (x) { if (x.from === t.from && x.to === t.to) done += parseCents(x.amount); });
+      if (t.amount - done > 1) { from = t.from; to = t.to; amount = (t.amount - done) / 100; break; }
+    }
   }
   STORE.records.transfers.push({ id: uid(), month: currentKey, from: from, to: to, amount: amount, note: '' });
   save(); renderDash();
@@ -5769,6 +6275,13 @@ function delTransfer(id) {
    同一条建议路径若已有记录则累加到最上面那条（保持记录简洁）。 */
 function fillSuggestedTransfers() {
   if (!unlocked.transfer) { toast('🔒 请先解锁实际转账', 'error'); return; }
+  /* v7.9：用量未就绪时不能填 —— 此时耗材暂按整笔计入（旧口径），按它填的转账会多算；
+     等取数完成（页面会自己重绘）再点。 */
+  var _st = amortStateOfMonth(currentKey);
+  if (_st === 'loading' || _st === 'failed') {
+    toast(_st === 'failed' ? '⚠️ 长期耗材用量没取到，先点红条「重试」再填' : '⏳ 用量统计中，稍后再填建议转账', 'error');
+    return;
+  }
   var m = monthFromRecords(currentKey);
   var r = calcMonthWithUsage(currentKey);
   var added = 0;
@@ -6253,7 +6766,12 @@ function renderHistory() {
     var r = calcMonthWithUsage(key);
     h += '<tr>';
     h += '<td style="font-weight:700">' + m.label + '</td>';
-    h += '<td>' + RMB(r.totalExp) + '</td><td>' + RMB(r.perPerson) + '</td><td>' + RMB(r.totalInc) + '</td>';
+    /* v7.9：用量没就绪的月份，耗材暂按整笔采购计入（旧口径）—— 必须标出来，
+       否则会和已经摊销的月份看起来一样（历史页没有收支清算页的横幅）。 */
+    var _amSt = r.amort && r.amort.state;
+    var _amMark = (_amSt === 'loading' || _amSt === 'failed')
+      ? '<div style="font-size:.68rem;color:var(--orange)" title="长期耗材用量统计中/未取到：本月暂按整笔采购计入，取数成功后自动改为按月摊销">耗材暂按整笔</div>' : '';
+    h += '<td>' + RMB(r.totalExp) + _amMark + '</td><td>' + RMB(r.perPerson) + '</td><td>' + RMB(r.totalInc) + '</td>';
     members.forEach(function (mem) {
       // 实际盈亏（现金口径）：代收 + 实收转账 − 垫付 − 实付转账 − 设备折旧。全结清时等于应得盈亏。
       var aPL = r.actualPL[mem.id];
@@ -6270,9 +6788,18 @@ function renderHistory() {
   h += '</tbody></table></div>';
   h += '<div style="margin-top:10px;font-size:.8rem;color:var(--muted)">「实际盈亏」= 该成员当月<b>真正</b>拿到手的钱（代收 + 实收转账 − 垫付 − 实付转账 − 设备折旧），取决于「收支清算」里录入的<b>实际转账</b>；小字「应 …」是账面应得盈亏（应得收入 − 采购应摊 − 设备折旧）。<br>两者不一致说明还有人没转够钱 —— 团队总盈亏不变，但亏损实际由<b>还没收到钱的人</b>垫着。要补录转账请到「收支清算」标签页。</div>';
   el.innerHTML = h;
-  /* 历史各月也要带上「按用量分摊 / 设备折旧」才和「收支清算」算得一致：逐月补取用量，
-     取完再重绘一次（失败的月份会标记 failed，不会反复重试） */
-  var need = list.slice(0, 12).filter(function (k) { return usageStateOfMonth(k) === 'idle'; });
+  /* 历史各月也要带上「按用量分摊 / 设备折旧 / 长期耗材摊销」才和「收支清算」算得一致：
+     逐月补取用量，取完再重绘一次（失败的月份会标记 failed，不会反复重试）。
+     v7.9：耗材摊销要回溯到最早采购月，那些月不在展示列表里也要一并补取。 */
+  var _needMap = {};
+  list.slice(0, 12).forEach(function (k) {
+    _needMap[k] = true;
+    amortNeededMonths(k).forEach(function (x) { _needMap[x] = true; });
+  });
+  var need = Object.keys(_needMap).filter(function (k) {
+    var s = usageStateOfMonth(k);
+    return s === 'idle' || s === 'loading';
+  });
   if (need.length) {
     ensureUsageMany(need, function () { if (currentTab === 'history') renderHistory(); });
   }
@@ -6672,6 +7199,7 @@ function addMember() {
   members.push({ id: 'm' + Date.now().toString(36).slice(-4), name: name, color: $('#newMemberColor').value });
   STORE.config.members = members;
   save();
+  invalidateUsage();   // v7.9：成员名单变了 ⇒ 订单归属 / 按用量分摊 / 耗材摊销都要重算
   $('#newMemberName').value = '';
   renderSettings();
   toast('✅ 已添加成员：' + name, 'success');
@@ -6682,8 +7210,14 @@ function removeMember(mid) {
   if (idx === -1) return;
   var name = members[idx].name;
   // 删除前扫描该成员名下的垫付 / 代收记录，避免金额静默消失
-  var paidN = 0, paidC = 0, incN = 0, incC = 0;
-  (STORE.records.expenses || []).forEach(function (e) { if (e.payer === mid) { paidN++; paidC += parseCents(e.amount); } });
+  var paidN = 0, paidC = 0, incN = 0, incC = 0, consN = 0;
+  (STORE.records.expenses || []).forEach(function (e) {
+    if (e.payer !== mid) return;
+    paidN++; paidC += parseCents(e.amount);
+    /* v7.9：长期耗材的采购人是唯一收款方 —— 成员被删后这批就退出摊销（剩余未摊销部分
+       既不会返还给他、也不会分摊给别人），必须在确认框里说清楚。 */
+    if (isConsumableExpense(e) && expenseUnits(e) > 0) consN++;
+  });
   (STORE.records.income || []).forEach(function (r) { if (r.memberId === mid) { incN++; incC += parseCents(r.amount); } });
   var msg = '确定移除成员「' + name + '」？';
   if (paidN || incN) {
@@ -6692,12 +7226,17 @@ function removeMember(mid) {
     if (incN) parts.push(incN + ' 条代收（合计 ' + RMB(incC) + ' 元）');
     msg += '该成员名下有 ' + parts.join('、') + '，删除后这些金额将从结算中消失。';
   }
+  if (consN) {
+    msg += '其中 ' + consN + ' 笔长期耗材（A4纸 / 硒鼓）的采购人就是该成员：删除后这批耗材不再摊销，'
+      + '剩余未摊销的采购款既不会返还给他、也不会分摊给其他成员（建议先结清或保留该成员）。';
+  }
   msg += '已有记录不会丢失，但不再参与后续计算。';
   openConfirm(msg, '移除').then(function (ok) {
     if (!ok) return;
     members.splice(idx, 1);
     STORE.config.members = members;
     save();
+    invalidateUsage();   // v7.9：成员名单变了 ⇒ 订单归属 / 按用量分摊 / 耗材摊销都要重算
     renderSettings();
     toast('已移除：' + name);
   });
@@ -7621,7 +8160,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v7.5</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v7.9</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -7703,6 +8242,18 @@ function renderAbout() {
     + '都不会把已经报给成员的账改掉；④ 累计期间该机<b>不计提折旧</b>（每页成本未知），'
     + '报废机因为带着快照，历史折旧照旧留在账上（不会随"退役"一起消失）；'
     + '⑤ 想换回估算口径点「⇄」即可（会解除冻结的历史折旧，寿命页数保留可再改）。</p>' +
+    '<p style="margin-top:10px">v7.9：<b>长期耗材按用量摊销</b>（A4纸 / 硒鼓）—— '
+    + '① 「手动记账 → 采购支出」新增<b>类型</b>列（常驻枚举：普通采购 / A4纸 / 硒鼓）：'
+    + '选 A4纸 填<b>总张数</b>、选硒鼓 填<b>可打印页数</b>，之后多出「数量」列与实时单价；'
+    + '老记录没有类型时按项目名自动识别（A4纸 / 打印纸 / 复印纸 → A4纸；硒鼓 / 碳粉 / 墨粉 / 墨盒 → 硒鼓）。'
+    + '② 长期耗材的<b>整笔采购不再在购买当月全额计入</b>，改为按每月实际用量折原价摊销：'
+    + 'A4纸 = 本月出纸张数 × 每张成本，硒鼓 = 本月打印页数 × 每页成本（即"寿命损耗"）；'
+    + '摊销按<b>采购日期之后</b>的用量、同类型先进先出，累计封顶在采购价（整数分、逐月取整差，用完即停）。'
+    + '③ 每月摊销<b>记在采购人名下</b>（整笔钱是他先垫的）⇒ 结算时他随「垫付差额」逐月收回，'
+    + '等价于"每月给采购者原价返还"；「收支清算」新增<b>「🧾 长期耗材摊销」</b>区块，'
+    + '逐批列出采购 / 总量 / 单价 / 累计使用 / 已摊销 / 本月用量 / 本月摊销 / 剩余未摊销，并标注本月返还对象。'
+    + '④ 缺数量（0）的耗材<b>暂按普通采购全额计入</b>并显式提示"填数量后改为按月摊销"，'
+    + '绝不让这笔钱凭空消失；用量没取到时摊销按 ¥0 计并给重试，绝不静默算错。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
@@ -7750,6 +8301,7 @@ function _openMergeConfirm() {
 }
 function _applyMerge(localData, cloudData) {
   STORE = mergeStores(localData, cloudData || localData);
+  invalidateUsage();   // 成员 / 采购 / 打印机台账刚合并 —— 旧用量缓存作废（口径见 finishLoad）
   var keys = allMonthKeys();
   currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
   renderAll();
@@ -7839,6 +8391,9 @@ function loadConfig() {
 }
 function finishLocalLoad() {
   replayOfflinePending();   // 本地模式同样重放暂存
+  /* v7.9：配置刚就位（成员 / 采购 / 打印机）—— 之前基于空配置缓存的用量一律作废，
+     否则「按用量分摊 / 折旧 / 耗材摊销」会拿一份成员全认不出的旧缓存算账。 */
+  invalidateUsage();
   var keys = allMonthKeys();
   currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
   renderAll();
@@ -7862,6 +8417,8 @@ function setCloudStateLocal() {
 }
 function finishLoad(hadCloud) {
   replayOfflinePending();   // 云端可达：重放上次离线暂存的未保存数据
+  /* v7.9：配置刚就位（成员 / 采购 / 打印机）—— 之前基于空配置缓存的用量一律作废 */
+  invalidateUsage();
   var keys = allMonthKeys();
   currentKey = keys.length ? keys[keys.length - 1] : currentMonthKey();
   // 云端月份预加载

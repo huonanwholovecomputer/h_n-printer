@@ -327,7 +327,10 @@ check("★ APK：四处拦截 + 三个辅助函数 + app.js 接线已全部移�
 check("★ APK：无障碍开关直接生效（toggleAutoPrint 无前置拦截）",
       "printState.autoPrintEnabled = !printState.autoPrintEnabled;" in apk)
 check("★ APK：设备列表仍标「🖐 需人工翻纸」（仅提示，不拦单）",
-      "d.auto_duplex === false" in apk_app and "需人工翻纸" in apk_app
+      # 2026-10-27：设备条改为**单行**，「需人工翻纸 / 攒批中 / 攒批未开」三选一（同一条判据
+      # auto_duplex === false），所以判据从"模板里就地判"改为"落在 stackBadgeHtml 的闸门里"。
+      "if (!d || d.auto_duplex !== false) return '';" in apk_app
+      and "需人工翻纸" in apk_app
       and ".device-state-manual" in apk_css)
 
 # ==================== ⑦ 静态接线（防止改别处时把上报/标注路径拆掉）====================

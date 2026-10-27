@@ -22,6 +22,7 @@
 """
 import io
 import os
+import re
 import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace",
@@ -92,10 +93,86 @@ H.chk("HSTS 只在 https 下加（request.is_secure 闸门）",
 H.chk("nginx 生产配置已入库（脱敏）", bool(nginx) and "hn-space.cn" in nginx)
 H.chk("★ nginx **没有**开 http2（报告结论：刻意不开）",
       all("listen 443 ssl http2" not in ln for ln in nginx.splitlines()))
-H.chk("加固项仍在：hn_sio / hn_login / hn_conn / burst=150 / body 2m / 50m",
-      "hn_sio" in nginx and "hn_login" in nginx and "limit_conn_zone" in nginx
-      and "burst=150" in nginx and "client_max_body_size 2m" in nginx
-      and "client_max_body_size 50m" in nginx)
+
+def ngx_location_blocks():
+    """[(head, body)] —— 配置里每一个 `location …{…}`（含 80/443 两个 `location = /`）。"""
+    out = []
+    for m in re.finditer(r"location\s+([^\s{][^{]*?)\s*\{", nginx):
+        depth = 0
+        for j in range(m.end() - 1, len(nginx)):
+            if nginx[j] == "{":
+                depth += 1
+            elif nginx[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append((m.group(1).strip(), nginx[m.start():j + 1]))
+                    break
+    return out
+
+
+def ngx_loc(head):
+    """按 location 头取块体；取不到返回空串（判据自己会红，不在这里抛）。"""
+    for h, body in ngx_location_blocks():
+        if h == head:
+            return body
+    return ""
+
+
+def ngx_zone_rate(zone):
+    """`limit_req_zone … zone=<zone>:10m rate=<N>r/<unit>;` 的口径（如 "600r/m"）；缺桶返回 ""。"""
+    m = re.search(r"limit_req_zone\s+\S+\s+zone=" + re.escape(zone)
+                  + r":\S+\s+rate=(\d+r/[sm]);", nginx)
+    return m.group(1) if m else ""
+
+
+def ngx_burst(body, zone):
+    """该块里 `limit_req zone=<zone> burst=N` 的 N；没配这个桶返回 None。"""
+    m = re.search(r"limit_req\s+zone=" + re.escape(zone) + r"\s+burst=(\d+)", body)
+    return int(m.group(1)) if m else None
+
+
+API = ngx_loc("/api/")
+UPLOAD = ngx_loc("= /api/upload")
+SIO = ngx_loc("/socket.io/")
+UPDATES = ngx_loc("/updates/")
+LOGIN = ngx_loc("= /api/login")
+DEVLOGIN = ngx_loc("= /api/device_login")
+
+# 限流口径 2026-10-27（配置头「限流口径修正」有实测证据）：hn_api 60r/m 低于移动端自身
+# 轮询速率（实测 173 req/min ≈ 2.9 r/s，带 Authorization 的跨域还要多一次 OPTIONS 预检）
+# ⇒ 桶长期满，连 /updates/ 的更新清单都被 429（现场「APP 检查更新 → 网络错误」）。
+# 现口径：hn_api rate=600r/m + /api/ burst=200，/updates/ 拆出独立桶 hn_updates。
+# 下面钉的是**当前生产口径的具体数值**：有意改口径就同步改这里；删桶 / 拆错桶 /
+# 放宽成无限 / 缩小 body 上限 ⇒ 必须红。
+H.chk("加固项仍在：hn_sio / hn_login 桶与 hn_conn 并发上限",
+      ngx_zone_rate("hn_sio") == "30r/m" and ngx_zone_rate("hn_login") == "20r/m"
+      and "limit_conn_zone $binary_remote_addr zone=hn_conn:10m;" in nginx,
+      "hn_sio=%s hn_login=%s" % (ngx_zone_rate("hn_sio"), ngx_zone_rate("hn_login")))
+H.chk("★ /api/ 限速仍在且未被放宽：hn_api rate=600r/m + burst=200 + limit_conn",
+      ngx_zone_rate("hn_api") == "600r/m" and ngx_burst(API, "hn_api") == 200
+      and "limit_conn hn_conn" in API,
+      "rate=%s burst=%s" % (ngx_zone_rate("hn_api"), ngx_burst(API, "hn_api")))
+H.chk("/socket.io/ 用 hn_sio 桶、两个匿名登录入口都用 hn_login 桶（各带 limit_conn）",
+      ngx_burst(SIO, "hn_sio") is not None and "limit_conn hn_conn" in SIO
+      and ngx_burst(LOGIN, "hn_login") is not None
+      and ngx_burst(DEVLOGIN, "hn_login") is not None,
+      "sio burst=%s" % (ngx_burst(SIO, "hn_sio"),))
+H.chk("★ /updates/ 用独立的 hn_updates 桶，不与 /api/ 挤同一个桶（2026-10-27 拆桶）",
+      ngx_zone_rate("hn_updates") == "60r/m" and ngx_burst(UPDATES, "hn_updates") is not None
+      and "zone=hn_api" not in UPDATES and "limit_conn hn_conn" in UPDATES,
+      "rate=%s burst=%s" % (ngx_zone_rate("hn_updates"), ngx_burst(UPDATES, "hn_updates")))
+H.chk("body 上限未被放宽：/api/ 2m（全局兜底 2m），仅 /api/upload 50m",
+      "client_max_body_size 2m" in nginx and "client_max_body_size 2m" in API
+      and "client_max_body_size 50m" in UPLOAD,
+      "api=%r upload=%r" % ("client_max_body_size 2m" in API,
+                            "client_max_body_size 50m" in UPLOAD))
+_undeclared = sorted(set(re.findall(r"limit_req\s+zone=(\w+)\s", nginx))
+                     - set(re.findall(r"limit_req_zone\s+\S+\s+zone=(\w+):", nginx)))
+H.chk("每个被引用的限流桶都已声明（拆/改名不留悬空引用）", not _undeclared, _undeclared)
+_unlimited = [h for h, b in ngx_location_blocks()
+              if "proxy_pass" in b and ("limit_req" not in b or "limit_conn" not in b)]
+H.chk("★ 没有任何代理 location 漏掉 limit_req / limit_conn（删掉或注释掉限速必须红）",
+      not _unlimited, _unlimited)
 H.chk("慢连接超时与 429 状态码在 conf.d 文件里",
       "client_header_timeout 10s" in nginx_hard and "limit_req_status 429" in nginx_hard
       and "limit_conn_status 429" in nginx_hard)

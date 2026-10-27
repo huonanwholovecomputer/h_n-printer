@@ -39,6 +39,20 @@ function check(name, cond, detail) {
 }
 function section(t) { console.log('\n================ ' + t + ' ================'); }
 
+/* me.js 2026-10 起 require('../../utils/avatar_crop')（头像裁剪几何）：**真实加载**该模块，
+   文件缺失/语法错/导出缺失直接抛 —— 不用空对象桩，免得 me.js 的依赖被静默放过。 */
+const AVATAR_CROP_MOD = (() => {
+  const p = path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'avatar_crop.js');
+  const m = { exports: {} };
+  new Function('module', 'exports', 'require', fs.readFileSync(p, 'utf8'))(m, m.exports, (dep) => {
+    throw new Error('真实模块 utils/avatar_crop.js 意外 require 了 ' + dep);
+  });
+  if (typeof m.exports.fitState !== 'function' || typeof m.exports.cropRect !== 'function') {
+    throw new Error('utils/avatar_crop.js 未导出 fitState/cropRect（头像裁剪几何变了？）');
+  }
+  return m.exports;
+})();
+
 /* ── 夹具：形状对齐 /api/orders（order_files 已带 effective_pages/sheets/total_*） ── */
 function makeOrder(over) {
   return Object.assign({
@@ -79,6 +93,7 @@ function loadMiniProgram() {
     require: (dep) => {
       if (dep.indexOf('utils/config') >= 0) return { CONFIG: { BASE_URL: 'https://example.invalid' } };
       if (dep.indexOf('utils/pages') >= 0) return { countPagesInRange: () => 1 };
+      if (dep.indexOf('utils/avatar_crop') >= 0) return AVATAR_CROP_MOD;
       if (dep.indexOf('utils/request') >= 0) {
         return { request: () => {}, createPollScheduler: () => ({ start() {}, stop() {} }) };
       }

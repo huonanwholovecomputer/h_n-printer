@@ -148,6 +148,56 @@ window.hnUpdateProgress = function (status, msg) {
   }
 };
 
+// 拉一次更新清单（12s 超时；禁止 302）
+async function _fetchManifestOnce() {
+  // S1-02 ②：redirect:'error' ⇒ 清单被 302 到任何地方都直接失败（跨 host 重定向无从发生）
+  // S1-09：裸 fetch 必须自己挂 AbortController 超时（12s）—— 弱网下不设超时会永久挂起，
+  // 「检查更新」按钮点了没有任何反应，也没有错误提示。
+  const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
+  let res;
+  try {
+    res = await fetch(UPDATE_MANIFEST_URL + '?t=' + Date.now(),
+      Object.assign({ cache: 'no-store', redirect: 'error' },
+        ctrl ? { signal: ctrl.signal } : {}));
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  if (!res.ok) {
+    // 把 HTTP 状态带出去：429（限流）与"手机没网"必须给不同文案 —— 2026-10-27 现场就是
+    // 服务端限流被显示成「网络错误」，用户以为要手动装包（见 _fetchManifestWithRetry 注释）。
+    const err = new Error('HTTP ' + res.status);
+    err.httpStatus = res.status;
+    throw err;
+  }
+  if (res.redirected) throw new Error('清单被重定向，已拒绝');
+  return res.json();
+}
+
+// 429 / 5xx = 服务端临时拒绝（nginx 限速桶：hn_updates 60r/m burst 60）。退避 1.5s 重试一次。
+// 2026-10-27 现场事故：/updates/ 与 /api/ 共用 hn_api 桶（60r/m），App 自身轮询（约 2.9 r/s）
+// 把桶长期占满 ⇒ 更新清单一律 429，界面上只写「网络错误」，看起来像手机网络坏了。
+// 服务端已拆独立桶并提容；这里再做一层"可读错误 + 一次退避重试"，避免同类问题再次被误读。
+async function _fetchManifestWithRetry() {
+  try {
+    return await _fetchManifestOnce();
+  } catch (e) {
+    const st = Number(e && e.httpStatus) || 0;
+    if (st !== 429 && st < 500) throw e;
+    await new Promise((r) => setTimeout(r, 1500));
+    return await _fetchManifestOnce();
+  }
+}
+
+// 失败文案：区分「被限流 / 服务端错误 / 真网络错误」，不再一律「网络错误」
+function _updateErrorText(e) {
+  const st = Number(e && e.httpStatus) || 0;
+  if (st === 429) return '检查更新失败：服务器繁忙（429 限流），请稍后再试';
+  if (st >= 500) return '检查更新失败：服务器错误（' + st + '）';
+  if (st) return '检查更新失败：HTTP ' + st;
+  return '检查更新失败：网络错误';
+}
+
 async function checkAppUpdate(manual) {
   if (_updateBusy) {
     // 不再静默吞掉：手动点「检查更新」时至少要给出反馈（否则像"按钮坏了"）
@@ -160,24 +210,9 @@ async function checkAppUpdate(manual) {
   }
   let manifest;
   try {
-    // S1-02 ②：redirect:'error' ⇒ 清单被 302 到任何地方都直接失败（跨 host 重定向无从发生）
-    // S1-09：裸 fetch 必须自己挂 AbortController 超时（12s）—— 弱网下不设超时会永久挂起，
-    // 「检查更新」按钮点了没有任何反应，也没有错误提示。
-    const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-    const timer = ctrl ? setTimeout(() => ctrl.abort(), 12000) : null;
-    let res;
-    try {
-      res = await fetch(UPDATE_MANIFEST_URL + '?t=' + Date.now(),
-        Object.assign({ cache: 'no-store', redirect: 'error' },
-          ctrl ? { signal: ctrl.signal } : {}));
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    if (res.redirected) throw new Error('清单被重定向，已拒绝');
-    manifest = await res.json();
+    manifest = await _fetchManifestWithRetry();
   } catch (e) {
-    if (manual) showToast('检查更新失败：网络错误');
+    if (manual) showToast(_updateErrorText(e));
     return;
   }
   if (!manifest || typeof manifest !== 'object') {

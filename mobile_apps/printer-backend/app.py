@@ -1392,6 +1392,30 @@ def is_admin(openid):
     return openid in ADMIN_OPENIDS
 
 
+def operator_display_name(openid):
+    """人工操作者的**展示名**：优先 users.nickname（微信/APP 昵称），没有昵称才退回角色名。
+
+    2026-10-27 用户要求：设备端日志里显示"操作者：admin"没用（那是角色，不是人）。
+    这里只读 nickname，不拼 openid（日志会被窗口展示、也会回传设备端）。
+    """
+    oid = (openid or "").strip()
+    if not oid:
+        return ""
+    nick = ""
+    try:
+        conn = get_user_db()
+        row = conn.execute("SELECT nickname FROM users WHERE openid = ?", (oid,)).fetchone()
+        conn.close()
+        nick = (row["nickname"] if row else "") or ""
+    except Exception:
+        nick = ""
+    nick = " ".join(str(nick).split())[:20]
+    if nick:
+        return nick
+    role = compute_role(oid)
+    return {"super_admin": "超级管理员", "admin": "管理员"}.get(role, "操作员")
+
+
 def compute_role(openid):
     """计算用户角色: admin / user / guest（含 DB 中 admin 角色和临时授权）"""
     if is_admin(openid):
@@ -7938,8 +7962,13 @@ def printer_stack_mode():
         printer_stack_waiters[client_id] = ev
         printer_stack_results.pop(client_id, None)
     try:
+        # by = **操作者的昵称**（不是角色名）：设备端日志/窗口直接显示"操作者：张三"。
+        # by_role 另带一份角色，便于排查权限问题（旧客户端只读 by，多一个字段无副作用）。
         socketio.emit("set_stack_mode",
-                      {"enable": bool(enable), "by": role, "request_id": uuid.uuid4().hex[:8]},
+                      {"enable": bool(enable),
+                       "by": operator_display_name(getattr(g, "openid", "")) or role,
+                       "by_role": role,
+                       "request_id": uuid.uuid4().hex[:8]},
                       to=sid)
     except Exception as e:
         with printer_stack_state_lock:

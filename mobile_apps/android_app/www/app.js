@@ -1484,7 +1484,6 @@ function renderDeviceList() {
     `<view class="device-item ${selectedDeviceId === d.client_id ? 'device-item-on' : ''}" data-id="${esc(d.client_id)}" data-hover="device-hover">
       <view class="device-dot ${d.online ? 'device-dot-on' : 'device-dot-off'}"></view>
       <text class="device-label">${esc(d.label || d.client_id)}</text>
-      ${d.auto_duplex === false ? '<text class="device-state device-state-manual">🖐 需人工翻纸</text>' : ''}
       ${stackBadgeHtml(d)}
       ${stackToggleBtnHtml(d)}
       <text class="device-state ${d.online ? 'device-state-on' : 'device-state-off'}">${d.online ? '在线' : '离线'}</text>
@@ -1493,14 +1492,16 @@ function renderDeviceList() {
 }
 
 // 攒批模式状态徽标（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
-// null（该设备从未上报，状态未知）→ 不渲染该徽标。
+// null（该设备从未上报，状态未知）→ 只显示「🖐 需人工翻纸」。
 // ⚠ 攒批只对「需人工翻纸」的机型（auto_duplex === false）渲染 —— 自动双面的机器一次成型，
 // 多任务合并翻纸纯属多余；能力未确认的也不给入口（2026-10 用户要求，三端同一条判据）。
+// ⚠ 这三个胶囊**互斥**（2026-10-27 用户要求：设备条必须只占一行、高度一致）：旧写法「需人工翻纸」
+//   与「攒批未开」同时出现，加上「开启攒批」按钮和「在线」，375px 一行放不下 ⇒ 换行 ⇒ 高度参差。
 function stackBadgeHtml(d) {
   if (!d || d.auto_duplex !== false) return '';
   if (d.stack_mode === true) return '<text class="device-state device-state-stack">🖐 攒批中</text>';
-  if (d.stack_mode === false) return '<text class="device-state device-state-stack-off">攒批未开</text>';
-  return '';
+  if (d.stack_mode === false) return '<text class="device-state device-state-stack-off">🖐 攒批未开</text>';
+  return '<text class="device-state device-state-manual">🖐 需人工翻纸</text>';
 }
 
 // 管理员/超管判定（攒批模式远程开关只对他们渲染）

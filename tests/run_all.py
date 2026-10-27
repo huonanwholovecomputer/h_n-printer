@@ -74,6 +74,16 @@ ENV_REQUIRED: dict[str, str] = {
     "verify_printer_life_mode_ui.mjs": "需 Playwright / 真实浏览器（累计读数 / 报废结算弹窗 / 写回后台账 + "
                                        "云端配置落盘 / 历史月份回溯折旧都是渲染与异步结果；"
                                        "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
+    # v7.8：改子项得分后「总分」是否当场重算，本质是「渲染后有没有再读数据」——
+    # 还要证明不是靠整表重绘刷出来的（节点不被重建、录入不失焦），只能真实浏览器量。
+    "verify_score_total_live.mjs": "需 Playwright / 真实浏览器（改分后同一帧内总分是否重算、"
+                                   "徽标/输入框节点是否被重建只能靠真实渲染与真实 change 事件量；"
+                                   "桩后端 + 真实 settlement.html，含变异自证；--all 或直接 node 可跑）",
+    # v7.9：长期耗材「选类型才多出数量列」「填数量后单价提示」「购买月不再整笔计入」
+    # 全是渲染结果；还要证明摊销按真实订单用量（购买日之前不算）算出来。
+    "verify_consumable_amortization_ui.mjs": "需 Playwright / 真实浏览器（类型选择后多出的数量列、"
+                                             "单价提示、采购支出 KPI 从整笔变摊销、摊销区块用量都是渲染结果；"
+                                             "桩后端 + 真实 settlement.html，含变异自证；--all 或直接 node 可跑）",
 }
 
 # 非验收脚本（工具/选型/测量），不参与 PASS 计数

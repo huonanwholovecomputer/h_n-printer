@@ -367,7 +367,9 @@ try {
   const ls = await lp.evaluate(() => ({
     mode: window.FINANCE_MODE,
     lockHTML: (typeof _orderStatusLockHTML === 'function') ? _orderStatusLockHTML() : 'N/A',
-    lockBtn: document.querySelectorAll('.st-lock').length,
+    /* 只数「订单状态表头」那把锁（与 A 侧 snap 同口径）。全页 .st-lock 还包括「打印机台账 /
+       订单归属」的锁 —— 那是本地数据、本地模式下**应该**照常渲染，不是订正入口。 */
+    lockBtn: document.querySelectorAll('.order-table thead th:nth-child(5) .st-lock').length,
     edits: document.querySelectorAll('tr.order-row td:nth-child(5) .st-edit').length,
     carets: document.querySelectorAll('tr.order-row td:nth-child(5) .st-caret').length,
     typeEdits: document.querySelectorAll('tr.order-row td:nth-child(10) .st-edit').length,

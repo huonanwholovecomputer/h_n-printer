@@ -171,11 +171,16 @@
 .device-item {
   display: flex;
   align-items: center;
-  gap: 12rpx;
-  /* 管理员 + 需人工翻纸的设备会同时出现「🖐 需人工翻纸」「攒批」等胶囊 + 在线状态：允许换行，
-     避免把设备名挤到几像素（375px 实测；2026-10-26 晚删掉「☁ LO / ☁ Word」后仍保留） */
-  flex-wrap: wrap;
-  padding: 16rpx 18rpx;
+  /* 2026-10-27 用户要求：接单设备条**每条只占一行**、高度一致。
+     旧写法 flex-wrap: wrap + 标签 min-width: 40% ⇒ 「🖐 需人工翻纸 / 攒批未开 / 开启攒批 / 在线」
+     四个块放不下就换行，同列表里高度参差。现在胶囊合并成一个（见 index.wxml）且禁止换行，
+     设备名吃剩余宽度并用省略号截断。 */
+  gap: 10rpx;
+  flex-wrap: nowrap;
+  /* 固定最小高度：普通行与带「开启攒批」按钮的行走同一个基线（按钮自身高度已按 ≤ 内容高做钳制） */
+  min-height: 68rpx;
+  box-sizing: border-box;
+  padding: 12rpx 18rpx;
   border: 1rpx solid var(--gray4);
   border-radius: 16rpx;
   background: var(--bg-card);
@@ -197,8 +202,8 @@
 .device-dot-off { background-color: var(--gray3); }
 .device-label {
   flex: 1;
-  /* 窄屏下设备卡有胶囊（需人工翻纸 / 攒批）时也别把设备名压没（至少留 40%，其余换行） */
-  min-width: 40%;
+  /* 单行布局：min-width 必须归零，否则 flex 项的下限会把右侧胶囊/按钮顶出行外 */
+  min-width: 0;
   font-size: 25rpx;
   font-weight: 500;
   color: var(--text-primary);
@@ -206,23 +211,23 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.device-state { font-size: 22rpx; flex-shrink: 0; }
-/* 设备卡允许换行（需人工翻纸 + 攒批胶囊）⇒ 状态在换行后也要贴当行右端，
-   否则同一个列表里「在线/离线」会出现两个位置。 */
+.device-state { font-size: 21rpx; line-height: 1.3; flex-shrink: 0; }
+/* 设备卡是 nowrap 单行：状态贴行尾（标签 flex:1 已占满，这里的 auto 仅作兜底） */
 .device-state-on { color: var(--green); margin-left: auto; }
 .device-state-off { color: var(--gray); margin-left: auto; }
 /* 该设备已确认不支持自动双面（双面需人工翻纸）—— 列表提示，不拦截下单 */
-.device-state-manual { color: #e67e22; margin-right: 12rpx; }
+.device-state-manual { color: #e67e22; margin-right: 8rpx; }
 /* 攒批模式状态（stack_mode）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=未上报 → 不渲染 */
-.device-state-stack { color: #e67e22; font-weight: 600; margin-right: 12rpx; }
-.device-state-stack-off { color: var(--gray); margin-right: 12rpx; }
-/* 攒批模式远程开关（仅 admin/super_admin 渲染）：小胶囊按钮，禁用态灰显但保留可点（点了弹原因） */
+.device-state-stack { color: #e67e22; font-weight: 600; margin-right: 8rpx; }
+.device-state-stack-off { color: var(--gray); margin-right: 8rpx; }
+/* 攒批模式远程开关（仅 admin/super_admin 渲染）：小胶囊按钮，禁用态灰显但保留可点（点了弹原因）。
+   高度刻意钳在 21rpx×1.3+2×2rpx 内 —— 一旦比文字行高，带按钮的行就会比不带按钮的行高出一截。 */
 .device-stack-btn {
   flex-shrink: 0;
-  margin-right: 12rpx;
-  padding: 4rpx 16rpx;
-  font-size: 22rpx;
-  line-height: 1.4;
+  margin-right: 8rpx;
+  padding: 2rpx 12rpx;
+  font-size: 21rpx;
+  line-height: 1.3;
   color: var(--blue);
   border: 1rpx solid var(--blue);
   border-radius: 8rpx;

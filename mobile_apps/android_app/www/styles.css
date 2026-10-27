@@ -1770,11 +1770,17 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
 .device-select-card { margin-bottom: 2.4cqw; }
 .device-list { display: flex; flex-direction: column; gap: 1.44cqw; }
 .device-item {
-  display: flex; align-items: center; gap: 1.44cqw;
-  /* 管理员 + 需人工翻纸的设备会同时出现「🖐 需人工翻纸」「攒批」等胶囊 + 在线状态：允许换行，
-     避免把设备名挤到几像素（375px 实测；2026-10-26 晚删掉「☁ LO / ☁ Word」后仍保留） */
-  flex-wrap: wrap;
-  padding: 1.92cqw 2.16cqw;
+  display: flex; align-items: center; gap: 1.2cqw;
+  /* 2026-10-27 用户要求：接单设备条**每条只占一行**、高度一致。
+     旧写法 flex-wrap: wrap + 标签 min-width: 40% ⇒ 「🖐 需人工翻纸 / 攒批未开 / 开启攒批 / 在线」
+     四个块放不下就换行，同列表里高度参差（现场截图：四条设备三种高度）。现在胶囊合并成一个
+     （见 app.js stackBadgeHtml）且禁止换行，设备名吃剩余宽度并用省略号截断。
+     ⚠ 本文件是**手改**的，不要直接跑 tools/wxss2web.mjs：它当前的换算基准（100/750）与提交版
+     的（100/833）不同，重跑会产生 ~1700 行与本改动无关的 diff。改小程序样式时同步手改这里。 */
+  flex-wrap: nowrap;
+  min-height: 8.16cqw;
+  box-sizing: border-box;
+  padding: 1.44cqw 2.16cqw;
   border: 0.12cqw solid var(--separator);
   border-radius: 1.92cqw;
   background: var(--bg-card);
@@ -1791,25 +1797,28 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
 .device-dot-on { background-color: var(--green); }
 .device-dot-off { background-color: var(--gray3); }
 .device-label {
-  flex: 1; min-width: 40%; font-size: 3cqw; font-weight: 500; color: var(--text-primary);
+  /* 单行布局：min-width 必须归零，否则 flex 项的下限会把右侧胶囊/按钮顶出行外 */
+  flex: 1; min-width: 0; font-size: 3cqw; font-weight: 500; color: var(--text-primary);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.device-state { font-size: 2.64cqw; flex-shrink: 0; }
-/* 设备卡允许换行（管理员会同时看到「攒批」「☁」胶囊）⇒ 状态在换行后也要贴当行右端 */
+.device-state { font-size: 2.52cqw; line-height: 1.3; flex-shrink: 0; }
+/* 设备卡是 nowrap 单行：状态贴行尾（标签 flex:1 已占满，这里的 auto 仅作兜底） */
 .device-state-on { color: var(--green); margin-left: auto; }
 .device-state-off { color: var(--gray); margin-left: auto; }
 /* 该设备已确认不支持自动双面（双面需人工翻纸）—— 列表提示，不拦截下单 */
-.device-state-manual { color: #e67e22; margin-right: 1.4cqw; }
-/* 攒批模式状态（stack_mode）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=未上报 → 不渲染 */
-.device-state-stack { color: #e67e22; font-weight: 600; margin-right: 1.4cqw; }
-.device-state-stack-off { color: var(--gray); margin-right: 1.4cqw; }
-/* 攒批模式远程开关（仅 admin/super_admin 渲染）：小胶囊按钮，禁用态灰显但保留可点（点了弹原因） */
+.device-state-manual { color: #e67e22; margin-right: 0.96cqw; }
+/* 攒批模式状态（stack_mode）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=未上报 →
+   与「需人工翻纸」三选一（互斥），保证每条设备恒定一行 */
+.device-state-stack { color: #e67e22; font-weight: 600; margin-right: 0.96cqw; }
+.device-state-stack-off { color: var(--gray); margin-right: 0.96cqw; }
+/* 攒批模式远程开关（仅 admin/super_admin 渲染）：小胶囊按钮，禁用态灰显但保留可点（点了弹原因）。
+   高度刻意钳在 2.52cqw×1.3+2×0.24cqw 内 —— 一旦比文字行高，带按钮的行就会比不带按钮的行高出一截。 */
 .device-stack-btn {
   flex-shrink: 0;
-  margin-right: 1.4cqw;
-  padding: 0.48cqw 1.92cqw;
-  font-size: 2.64cqw;
-  line-height: 1.4;
+  margin-right: 0.96cqw;
+  padding: 0.24cqw 1.44cqw;
+  font-size: 2.52cqw;
+  line-height: 1.3;
   color: var(--blue);
   border: 0.12cqw solid var(--blue);
   border-radius: 0.96cqw;
@@ -6682,4 +6691,82 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   text-align: center;
   font-size: 3.07cqw;
   color: var(--blue);
+}
+
+/* ===== 头像裁剪（2026-10-27 用户要求）=====
+   圆形取景框 + 拖动/双指/滑杆缩放；导出 512×512 JPEG（服务端再压到 200px）。
+   z-index 必须高于悬浮 tabBar 与其它浮层。 */
+.crop-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 10010;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+}
+.crop-panel {
+  width: 88%;
+  max-width: 360px;
+  padding: 18px 16px 14px;
+  border-radius: 18px;
+  background: var(--card-bg, #ffffff);
+  color: var(--text, #1c1c1e);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+body.theme-dark .crop-panel,
+.theme-dark .crop-panel {
+  background: #1c1c1e;
+  color: #ffffff;
+}
+.crop-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.crop-hint {
+  font-size: 12px;
+  opacity: 0.6;
+  margin-bottom: 12px;
+}
+.crop-box {
+  position: relative;
+  width: 240px;
+  height: 240px;
+  max-width: 72vw;
+  max-height: 72vw;
+  border-radius: 50%;
+  overflow: hidden;
+  background: #000;
+  touch-action: none;
+  user-select: none;
+}
+.crop-img {
+  position: absolute;
+  left: 0;
+  top: 0;
+  will-change: left, top, width, height;
+  pointer-events: none;
+}
+.crop-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  pointer-events: none;
+}
+.crop-slider {
+  width: 100%;
+  margin: 14px 0 6px;
+}
+.crop-actions {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+}
+.crop-btn {
+  flex: 1;
 }

@@ -103,7 +103,7 @@ import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.36"
+APP_VERSION = "4.5.37"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -2727,6 +2727,22 @@ class PrintWorker(QThread):
     def _fmt_pages(seq) -> str:
         return " ".join("〔空白〕" if x is None else str(x) for x in seq)
 
+    @staticmethod
+    def _rotate_summary(plan) -> str:
+        """第 2 趟的 180° 补偿摘要（整批同向 / 长短短混排两种说法）。
+
+        混排是**正常**的：同一单里横向文件按 short-edge（不转）、竖版按 long-edge（转 180°），
+        操作员动作不变（整叠原样放回），只是第 2 趟的每一面各转各的。
+        """
+        slots = list(getattr(plan, "second_pass", []) or [])
+        rot = [bool(getattr(s, "rotate", False)) for s in slots]
+        n_rot, n_all = sum(rot), len(rot)
+        if n_all == 0 or n_rot == n_all:
+            return "第 2 趟内容全部旋转 180° 补偿" if n_rot else "第 2 趟内容不旋转"
+        if n_rot == 0:
+            return "第 2 趟内容不旋转"
+        return f"第 2 趟按各文件装订方向逐面补偿：转 180° {n_rot} 面、不转 {n_all - n_rot} 面"
+
     def _duplex_announce_text(self, items, plan, rotate: bool, tray_foreign: int = 0,
                               singles: Optional[list[str]] = None) -> str:
         names = "、".join((j.display_name or os.path.basename(j.file_path)) for _i, j, _p, _t in items)
@@ -2750,15 +2766,18 @@ class PrintWorker(QThread):
             f"共 {plan.sheet_count} 张纸 —— 程序自己分两趟打（全程单面），中途只需翻一次纸。\n\n"
             f"第 1 趟（现在打）：{self._fmt_pages(plan.pass_pages(1))}\n"
             f"第 2 趟（翻纸后打）：{self._fmt_pages(plan.pass_pages(2))}\n"
-            f"（第 2 趟内容{'旋转 180° 补偿' if rotate else '不旋转'}）"
+            f"（{self._rotate_summary(plan)}）"
             + warn
         )
 
-    def _print_manual_batch(self, items, rotate: bool, base_offset: int,
-                            total_sides: int) -> tuple[bool, str, int]:
+    def _print_manual_batch(self, items, rotate: Optional[bool] = None, base_offset: int = 0,
+                            total_sides: int = 0) -> tuple[bool, str, int]:
         """把本单的文件合并成**一批**：一次翻纸、两趟打完。
 
-        items: [(idx, job, print_path, temp_pdf)]（同批的 rotate 必须一致，调用方已分好组）
+        items: [(idx, job, print_path, temp_pdf)]
+        rotate: 整批统一的第 2 面 180° 补偿。**None（生产路径）= 每个文件按自己的装订方向**
+                逐面补偿**（同一批里长边/短边可以混排，整批仍只翻一次纸）；给 bool 则整批
+                统一用它（旧口径，历史验收脚本仍按它调用）。
         返回 (ok, msg, 物理面数)；物理面数用于推进进度条。
 
         **整单一个作业（2026-10-26 用户现场）**：本批不只装"需手动双面"的文件 —— 同一单里
@@ -2806,14 +2825,19 @@ class PrintWorker(QThread):
                 dup = ((getattr(job, "duplex", "off") or "off") == "on") and len(sel) > 1
                 if not dup and label not in singles:
                     singles.append(label)
+                # 这份文件的第 2 面转不转，按**它自己**的装订方向算（横向文件是 short-edge、
+                # 竖版是 long-edge），而不是整批一个开关 —— 这是"整单只翻一次纸"的前提。
+                file_rot = (bool(rotate) if rotate is not None
+                            else self._rotate_for_job(job))
                 for c in range(max(1, job.copies)):
                     file_plans.append(manual_duplex.FilePlan(
                         f"{label}（第{c + 1}份）" if job.copies > 1 else label,
-                        [off + x for x in sel], dup))
+                        [off + x for x in sel], dup, file_rot))
                 off += n
 
             plan = manual_duplex.plan_passes(file_plans, copies=1, first=p.first,
-                                             reverse_second=p.reverse_second)
+                                             reverse_second=p.reverse_second,
+                                             second_rotate_180=p.second_rotate_180)
             n1 = len(plan.first_pass)
             # 本轮**本批之前**已经落在出纸槽里、还压在本批下面的张数（没并进来的文件 /
             # 首页 / 上一批）。翻纸文案与"取出哪几张"都要靠它 —— 见 _ask_operator_to_flip。
@@ -2823,7 +2847,7 @@ class PrintWorker(QThread):
                 f"{f'（含 {len(singles)} 个单面文件，各占一张纸、背面留空）' if singles else ''}"
                 f" → {plan.sheet_count} 张纸，"
                 f"一次翻纸打两趟（{p.first}/{'逆序' if p.reverse_second else '正序'}/"
-                f"{'180°补偿' if rotate else '不旋转'}）")
+                f"{self._rotate_summary(plan)}）")
             self.log_message.emit(f"     第 1 趟: {self._fmt_pages(plan.pass_pages(1))}")
             self.log_message.emit(f"     第 2 趟: {self._fmt_pages(plan.pass_pages(2))}")
             self.duplex_plan.emit(plan.sheet_count, self._estimate_first_pass(plan.sheet_count))
@@ -2840,10 +2864,14 @@ class PrintWorker(QThread):
             map1 = [(s.label, s.page) for s in plan.first_pass]
             map2 = [(s.label, s.page) for s in plan.second_pass]
 
+            # 传给渲染层的"整趟默认"：rotate 显式给了就照它（旧口径），否则用档案里
+            # 纸路径实测值 —— 逐面表（plan.pass_rotate）才是真正生效的那一份。
+            _rot_arg = bool(rotate) if rotate is not None else bool(p.second_rotate_180)
             _t_pass1 = time.perf_counter()
             ok1, msg1 = print_plan_pass(plan, merged, self._printer_name, 1,
-                                        second_rotate_180=rotate,
-                                        progress_callback=_cb(base_offset, map1))
+                                        second_rotate_180=_rot_arg,
+                                        progress_callback=_cb(base_offset, map1),
+                                        landscape_fill=bool(getattr(p, "landscape_fill", True)))
             if not ok1:
                 return False, f"手动双面第 1 趟失败: {msg1}", n1
             # 第 1 趟的纸已经压进出纸槽了：台账往前推 —— 下一批（长短边混排拆出的第 2 批）
@@ -2889,8 +2917,9 @@ class PrintWorker(QThread):
                                f"纸叠是半成品，请人工处理"), n1
 
             ok2, msg2 = print_plan_pass(plan, merged, self._printer_name, 2,
-                                        second_rotate_180=rotate,
-                                        progress_callback=_cb(base_offset + n1, map2))
+                                        second_rotate_180=_rot_arg,
+                                        progress_callback=_cb(base_offset + n1, map2),
+                                        landscape_fill=bool(getattr(p, "landscape_fill", True)))
             if not ok2:
                 return False, f"手动双面第 2 趟失败: {msg2}（第 1 趟已打出）", plan.total_sides
             return True, (f"手动双面完成（{len(items)} 个文件 / {plan.sheet_count} 张纸 / 2 趟，"
@@ -3032,7 +3061,8 @@ class PrintWorker(QThread):
             _t_pass1 = time.perf_counter()
             ok1, msg1 = print_plan_pass(plan, self._stack_out_pdf, self._printer_name, 1,
                                         second_rotate_180=self._stack_rotate,
-                                        progress_callback=_cb(base_offset, map1))
+                                        progress_callback=_cb(base_offset, map1),
+                                        landscape_fill=bool(getattr(p, "landscape_fill", True)))
             if self._cancelled:
                 self.stack_entry_done.emit(self._stack_seq, False, "已取消", n1)
                 return False, "已取消", n1
@@ -3471,44 +3501,33 @@ class PrintWorker(QThread):
                     #   单面文件排在首位时会先建出一批，后面的双面文件方向不同就另起一批
                     #   ⇒ 多翻一次纸，而那一批的第 2 趟全是空白页（纯白走一遍纸）。
                     #   2026-10-26 独立审查用 `[1页(short-edge), 3页双面(long-edge)]` 复现过。
-                    groups: dict[bool, list] = {}
-                    primary: Optional[bool] = None
-                    for it in deferred:
-                        if self._pairs_pages(it):
-                            primary = self._rotate_for_job(it[1])
-                            break
-                    for it in deferred:
-                        if self._pairs_pages(it):
-                            groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
-                        elif primary is not None:
-                            groups.setdefault(primary, []).append(it)
+                    # ── 整单只翻一次纸（2026-10-27 用户现场 HN20261027-0004）──
+                    # 旧写法按装订方向分组，横向文件（short-edge）与竖版文件（long-edge）
+                    # 各成一批 ⇒ 一个订单被劈成两次打印、翻两次纸；第二批还得在出纸槽里
+                    # "只取最上面 N 张"，操作员看不懂就直接跳过（那次整单判失败）。
+                    # 现在不再拆批：操作员的动作完全相同（整叠原样放回），长/短边只差
+                    # "这一面内容转不转" ⇒ 由 manual_duplex 逐面补偿，一次翻纸打完。
+                    dirs = {self._rotate_for_job(it[1]) for it in deferred if self._pairs_pages(it)}
+                    if len(dirs) > 1:
+                        self.log_message.emit(
+                            "ℹ 本批文件装订方向不同（横向/竖版混排）：按各自方向逐面补偿，"
+                            "仍然只翻一次纸")
+                    # ⚠ 本批**已包含本单全部文件**（单面/1 页文件按 FilePlan(duplex=False)
+                    # 并进来）。只有"并不进来"的（读不出页数、逐文件 DPI 不同）才会先在
+                    # 上面直打、压在出纸槽下面 —— 那种情况翻纸文案会说"只取最上面 N 张"。
+                    # **不要**改成"先直打、再补空白占位页"：2026-10-18 试过，占位页落在
+                    # 堆顶、真直打纸在堆底，第 2 趟永远取不到那张纸。
+                    ok_b, msg_b, sides_b = self._print_manual_batch(
+                        deferred, None, offset_sides, total_sides)
+                    for _idx, _job, _p, _t in deferred:
+                        self.job_finished.emit(_idx, ok_b, msg_b)
+                        reported.add(_idx)
+                        if ok_b:
+                            success_count += 1
                         else:
-                            # 整批都没有"真双面配对"的文件（全是 1 页/单面）：按第一项的方向
-                            groups.setdefault(self._rotate_for_job(it[1]), []).append(it)
-                    if len(groups) > 1:
-                        self.log_message.emit(
-                            f"⚠ 本批存在两种装订方向，将分 {len(groups)} 次翻纸")
-                    for rotate, items in groups.items():
-                        self.log_message.emit(
-                            f"▶ 手动双面批次：{len(items)} 个文件，"
-                            f"{'长边（第 2 趟内容旋转 180°）' if rotate else '短边（第 2 趟内容不旋转）'}"
-                            f" —— 整批只翻一次纸")
-                        # ⚠ 本批**已包含本单全部文件**（单面/1 页文件按 FilePlan(duplex=False)
-                        # 并进来）。只有"并不进来"的（读不出页数、逐文件 DPI 不同）才会先在
-                        # 上面直打、压在出纸槽下面 —— 那种情况翻纸文案会说"只取最上面 N 张"。
-                        # **不要**改成"先直打、再补空白占位页"：2026-10-18 试过，占位页落在
-                        # 堆顶、真直打纸在堆底，第 2 趟永远取不到那张纸。
-                        ok_b, msg_b, sides_b = self._print_manual_batch(
-                            items, rotate, offset_sides, total_sides)
-                        for _idx, _job, _p, _t in items:
-                            self.job_finished.emit(_idx, ok_b, msg_b)
-                            reported.add(_idx)
-                            if ok_b:
-                                success_count += 1
-                            else:
-                                fail_count += 1
-                        self.log_message.emit(f"  {'✓' if ok_b else '✗'} {msg_b}")
-                        offset_sides += sides_b
+                            fail_count += 1
+                    self.log_message.emit(f"  {'✓' if ok_b else '✗'} {msg_b}")
+                    offset_sides += sides_b
                 except Exception as e:
                     # ── **总兜底**：异常绝不能逃出 run() ──
                     # 逃出去之后 job_finished / all_finished 一个都不发，主线程收不到收尾
@@ -10571,8 +10590,10 @@ class MainWindow(QMainWindow):
             "order_number": next((getattr(j, "order_number", "") for j in flat_jobs
                                   if getattr(j, "order_number", "")), ""),
         }
+        # 第 1 趟**永远不转**（180° 补偿只针对"翻纸后的那一面"）；这里原本写"第 1 趟旋转 180°"
+        # 是错的，会让排查的人以为第 1 趟内容被转过。
         self._log(f"🖐 攒批：本单作为第 {seq} 单开打第 1 趟"
-                  f"（第 1 趟{'旋转 180° 补偿' if rotate else '不旋转'}；"
+                  f"（第 2 趟{'旋转 180° 补偿' if rotate else '不旋转'}；"
                   f"本叠已有 {self._stack.total_sheets}/{self._stack.capacity} 张）")
 
         if not self._start_print_worker(flat_jobs, tab_key=tab_key,

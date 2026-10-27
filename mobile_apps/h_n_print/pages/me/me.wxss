@@ -2091,3 +2091,84 @@
   font-size: 23rpx;
   color: var(--blue);
 }
+
+
+/* ===== 头像裁剪（2026-10-27 用户要求）=====
+   圆形取景框 + 拖动/缩放；导出的是正方形 JPEG（服务端再压到 200px），
+   所以圆框外的四角也只是"视觉上不显示"，实际会裁进图里 —— 头像在两端都是圆形展示，
+   看不出来。z-index 必须高于悬浮 tabBar(9999) 与文件预览层(10000)。 */
+.crop-mask {
+  position: fixed;
+  left: 0; top: 0; right: 0; bottom: 0;
+  z-index: 10010;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.crop-panel {
+  width: 620rpx;
+  padding: 32rpx 28rpx 24rpx;
+  border-radius: 28rpx;
+  background: #FFFFFF;
+  box-shadow: 0 16rpx 48rpx rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.theme-dark .crop-panel {
+  background: #1C1C1E;
+  box-shadow: 0 16rpx 48rpx rgba(0, 0, 0, 0.6);
+}
+.crop-title {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #000000;
+  margin-bottom: 8rpx;
+}
+.theme-dark .crop-title { color: #FFFFFF; }
+.crop-hint {
+  font-size: 24rpx;
+  color: #8E8E93;
+  margin-bottom: 20rpx;
+}
+.crop-box {
+  position: relative;
+  overflow: hidden;
+  border-radius: 50%;
+  background: #000000;
+  touch-action: none;
+}
+.crop-img {
+  position: absolute;
+  will-change: left, top;
+}
+.crop-ring {
+  position: absolute;
+  left: 0; top: 0; right: 0; bottom: 0;
+  border-radius: 50%;
+  border: 3rpx solid rgba(255, 255, 255, 0.85);
+  pointer-events: none;
+}
+.crop-slider {
+  width: 100%;
+  margin: 20rpx 0 8rpx;
+}
+.crop-actions {
+  display: flex;
+  flex-direction: row;
+  width: 100%;
+  gap: 20rpx;
+  margin-top: 8rpx;
+}
+.crop-btn {
+  flex: 1;
+}
+/* 离屏画布：不能 display:none（拿不到 2d 节点），挪到屏幕外即可 */
+.crop-canvas {
+  position: fixed;
+  left: -9999px;
+  top: -9999px;
+  width: 512px;
+  height: 512px;
+}

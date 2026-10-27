@@ -53,6 +53,11 @@ class FilePlan:
     label: str
     pages: list[int]
     duplex: bool = True
+    # 这份文件的第 2 面要不要转 180°（None = 跟 plan_passes 的默认值走）。
+    # 值一般来自 rotate_second_for(档案 second_rotate_180, 该文件的 duplex_mode)：同一个批次
+    # 里长边/短边可以混排 —— 操作员的动作完全相同（整叠原样放回），差异只在内容转不转。
+    # 旧写法把"转不转"当成**整趟**一个开关，于是混排只能拆成两批、多翻一次纸（2026-10-27）。
+    second_rotate: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,7 @@ class Sheet:
     label: str
     side_a: int | None
     side_b: int | None
+    rotate_second: bool = False   # 这张纸第 2 面的内容要不要转 180°（来自所属 FilePlan）
 
 
 @dataclass(frozen=True)
@@ -71,6 +77,7 @@ class PassSlot:
     label: str
     page: int | None
     sheet_index: int
+    rotate: bool = False          # 这一面要不要转 180°（第 1 趟恒 False；空白面无所谓）
 
 
 @dataclass
@@ -119,6 +126,14 @@ class PrintPlan:
     def pass_slots(self, which: int) -> list[PassSlot]:
         return list(self.first_pass if which == 1 else self.second_pass)
 
+    def pass_rotate(self, which: int) -> list[bool]:
+        """第 which 趟**逐面**的 180° 补偿表（True=该面内容转 180°）。
+
+        直接作 pdf_printer.print_pdf(..., rotate_slots=...) 的入参 —— 一个批次里长边/短边
+        混排时，每张纸按**自己那份文件**的装订方向补偿，而整批仍然只翻一次纸。
+        """
+        return [bool(s.rotate) for s in self.pass_slots(which)]
+
     def pair_lines(self) -> list[str]:
         """每张纸的两面（验收/日志用）："F1: 1/2"、"F3: 5/空白"。"""
         out = []
@@ -161,12 +176,14 @@ class PrintPlan:
         return "\n".join(lines)
 
 
-def build_sheets(files: list[FilePlan], copies: int = 1) -> list[Sheet]:
+def build_sheets(files: list[FilePlan], copies: int = 1,
+                 default_rotate: bool = False) -> list[Sheet]:
     """把整批文件摊成「纸张」列表（按第 1 趟的进纸/印刷顺序）。
 
     双面文件：第 k 张纸 = (pages[2k], pages[2k+1])，页数为奇数时最后一张的 side_b = None。
     单面文件：**每页各占一张纸** = (page, None) —— 不能把两页配到一张纸上。
     多份：整批重复 copies 次（第 2 趟统一逆序即可自动对齐各份的分组）。
+    default_rotate：文件自己没指定 second_rotate 时用的第 2 面补偿（整批同一方向的旧口径）。
     """
     sheets: list[Sheet] = []
     for _ in range(max(1, copies)):
@@ -174,13 +191,15 @@ def build_sheets(files: list[FilePlan], copies: int = 1) -> list[Sheet]:
             pages = list(fp.pages or [])
             if not pages:
                 continue
+            rot = bool(default_rotate) if fp.second_rotate is None else bool(fp.second_rotate)
             if fp.duplex:
                 for i in range(0, len(pages), 2):
                     sheets.append(Sheet(fp.label, pages[i],
-                                        pages[i + 1] if i + 1 < len(pages) else None))
+                                        pages[i + 1] if i + 1 < len(pages) else None,
+                                        rot))
             else:
                 for p in pages:
-                    sheets.append(Sheet(fp.label, p, None))
+                    sheets.append(Sheet(fp.label, p, None, rot))
     return sheets
 
 
@@ -189,26 +208,31 @@ def plan_passes(
     copies: int = 1,
     first: str = FIRST_ODD,
     reverse_second: bool = True,
+    second_rotate_180: bool = True,
 ) -> PrintPlan:
     """给出两趟打印计划（本模块的入口）。
 
     Args:
-        files: 批内文件（label/pages/duplex）。pages 必须是**已应用页码范围**后的页码。
+        files: 批内文件（label/pages/duplex/second_rotate）。pages 必须是**已应用页码范围**后的页码。
         copies: 份数（整批重复；第 2 趟统一逆序，各份分组自动对齐）。
-        first: "even"（默认，HP 约定）| "odd"。
+        first: "odd"（默认）| "even"（镜像约定）。
         reverse_second: 第 2 趟是否逆序（默认 True = 整叠原样放回）。
+        second_rotate_180: 这台机器的纸路径会不会把第 2 趟内容整体转 180°（档案实测值）。
+            文件没自带 second_rotate 时用它当默认 —— 于是"整批同向"的老口径保持原样，
+            而自带 second_rotate 的文件按**自己**的装订方向走（同批可混排）。
     """
     if first not in (FIRST_EVEN, FIRST_ODD):
         raise ValueError(f"first 只能是 '{FIRST_EVEN}' 或 '{FIRST_ODD}'，收到 {first!r}")
 
-    sheets = build_sheets(files, copies)
+    sheets = build_sheets(files, copies, default_rotate=bool(second_rotate_180))
     first_pass: list[PassSlot] = []
     second_pass: list[PassSlot] = []
     for idx, sh in enumerate(sheets):
         # "even" 约定：第 1 趟打 side_b（双面文件的偶数页 / 单面文件的空白面）
         head, tail = (sh.side_b, sh.side_a) if first == FIRST_EVEN else (sh.side_a, sh.side_b)
-        first_pass.append(PassSlot(sh.label, head, idx))
-        second_pass.append(PassSlot(sh.label, tail, idx))
+        # 第 1 趟永远不转（补偿只针对"翻纸后的那一面"）
+        first_pass.append(PassSlot(sh.label, head, idx, False))
+        second_pass.append(PassSlot(sh.label, tail, idx, bool(sh.rotate_second)))
     if reverse_second:
         second_pass.reverse()
 

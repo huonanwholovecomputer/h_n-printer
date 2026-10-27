@@ -597,11 +597,17 @@ class PrinterProfile:
     # flip_ready_sec = 「人工翻页准备时间」：第 1 趟出完后还要给操作员留多久才允许翻纸。
     gate_ratio: float = 0.5
     flip_ready_sec: float = 0.0
+    # ── 横向页铺满纸张（2026-10-27 现场）──
+    # 纵向纸打横向页时，等比缩放只占纸张 49%（LJ1020 实测 4736×3349 / 4736×6824），
+    # 现场读成"横向文件打出来是竖着的"。开=整页转 90° 铺满（与 Word/Adobe 自动旋转同效），
+    # 读者把纸横过来看。纸真的横着进纸的机器可关掉（否则会转错方向）。
+    landscape_fill: bool = True
 
     _FIELDS = ("auto_duplex", "capability_source", "manual_duplex", "first",
                "reverse_second", "second_rotate_180", "verified_at", "verified_by", "note",
                "speed_samples", "stack_capacity", "stack_warn_after_sec",
-               "speed_manual_a", "speed_manual_b", "gate_ratio", "flip_ready_sec")
+               "speed_manual_a", "speed_manual_b", "gate_ratio", "flip_ready_sec",
+               "landscape_fill")
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self._FIELDS}
@@ -627,6 +633,7 @@ class PrinterProfile:
             speed_manual_b=_coerce_num(d.get("speed_manual_b"), 0.0, 0.0, 600.0),
             gate_ratio=_coerce_num(d.get("gate_ratio"), 0.5, 0.0, 1.0),
             flip_ready_sec=_coerce_num(d.get("flip_ready_sec"), 0.0, 0.0, 3600.0),
+            landscape_fill=_bool_or_default(d.get("landscape_fill"), True),
         )
 
     def apply(self, **fields) -> "PrinterProfile":

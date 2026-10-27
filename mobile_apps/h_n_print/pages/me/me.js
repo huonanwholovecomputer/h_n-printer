@@ -3,6 +3,8 @@ const { CONFIG } = require('../../utils/config')
 const { request, createPollScheduler } = require('../../utils/request')
 // 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
 const { countPagesInRange } = require('../../utils/pages')
+// 头像裁剪的纯几何（fit/clamp/cropRect/zoomAt）：与 APP 的 www/avatar_crop.js 同一语义
+const avatarCrop = require('../../utils/avatar_crop')
 
 function _initIsDark() {
   try {
@@ -39,6 +41,19 @@ Component({
   data: {
     nickname: '',
     avatarUrl: '',
+    // 头像裁剪（2026-10-27 用户要求）：取景几何全部走 utils/avatar_crop.js 的纯函数；
+    // 这里只放渲染需要的值（手势过程中的 _cropTouch 挂在实例上，不进 data）。
+    cropVisible: false,
+    cropSrc: '',
+    cropImgW: 0,
+    cropImgH: 0,
+    cropViewport: 240,
+    cropFit: 1,
+    cropScale: 1,
+    cropX: 0,
+    cropY: 0,
+    cropZoomPct: 100,
+    cropMaxZoomPct: 400,
     isAdmin: false,
     isSuperAdmin: false,
     userRole: '',
@@ -573,6 +588,169 @@ Component({
 
     noop() {},
 
+    /* ================= 头像裁剪（2026-10-27 用户要求） =================
+     * 选图/取微信头像之后**先裁剪**再上传：拖动选位置、双指或滑杆缩放，圆形取景框，
+     * 确认时用 canvas 2d 按 cropRect 的源矩形导出 512×512 的 JPEG，再走原来的
+     * /api/profile 上传（服务端本来就会再压到 200px）。
+     * 几何全部在 utils/avatar_crop.js（纯函数、有验收）；这里只做手势与画布。
+     * 任何一步失败都**退回上传原图**（宁可头像不方，也不让用户卡在弹层里）。
+     */
+    openAvatarCrop(src) {
+      const that = this
+      if (!src) return
+      wx.getImageInfo({
+        src,
+        success(info) {
+          const vp = 240        // 裁剪框边长（px），与 me.wxss 的 .crop-box 一致
+          const w = info.width || info.orientation === 'right' ? info.height : info.width
+          const h = info.orientation === 'right' ? info.width : info.height
+          const st = avatarCrop.fitState(vp, { width: w, height: h })
+          that.setData({
+            cropVisible: true,
+            cropSrc: src,
+            cropImgW: w,
+            cropImgH: h,
+            cropViewport: vp,
+            cropFit: st.scale,
+            cropMaxZoomPct: Math.round(avatarCrop.MAX_ZOOM * 100),
+            cropZoomPct: 100,
+            cropScale: st.scale,
+            cropX: st.x,
+            cropY: st.y
+          })
+        },
+        fail(err) {
+          console.error('[openAvatarCrop] 读取图片信息失败，退回直接上传:', err)
+          that.uploadAvatar(src)
+        }
+      })
+    },
+
+    closeAvatarCrop() {
+      this._cropTouch = null
+      this.setData({ cropVisible: false, cropSrc: '' })
+    },
+
+    onCropCancel() {
+      this.closeAvatarCrop()
+    },
+
+    _cropImage() {
+      return { width: this.data.cropImgW, height: this.data.cropImgH }
+    },
+
+    _applyCropState(st) {
+      const fit = this.data.cropFit || 1
+      const pct = Math.round((st.scale / fit) * 100)
+      this.setData({
+        cropScale: st.scale,
+        cropX: st.x,
+        cropY: st.y,
+        cropZoomPct: Math.max(100, Math.min(this.data.cropMaxZoomPct || 400, pct))
+      })
+    },
+
+    onCropTouchStart(e) {
+      const ts = e.touches || []
+      if (!ts.length) return
+      this._cropTouch = {
+        x: this.data.cropX,
+        y: this.data.cropY,
+        scale: this.data.cropScale,
+        clientX: ts[0].clientX,
+        clientY: ts[0].clientY,
+        distance: ts.length > 1
+          ? Math.sqrt(Math.pow(ts[0].clientX - ts[1].clientX, 2) + Math.pow(ts[0].clientY - ts[1].clientY, 2))
+          : 0
+      }
+    },
+
+    onCropTouchMove(e) {
+      const base = this._cropTouch
+      const ts = e.touches || []
+      if (!base || !ts.length) return
+      const img = this._cropImage()
+      const vp = this.data.cropViewport
+      if (ts.length > 1 && base.distance > 0) {
+        const d = Math.sqrt(Math.pow(ts[0].clientX - ts[1].clientX, 2) + Math.pow(ts[0].clientY - ts[1].clientY, 2))
+        this._applyCropState(avatarCrop.zoomAt(
+          { scale: base.scale, x: base.x, y: base.y }, vp, img, d / base.distance))
+        return
+      }
+      this._applyCropState(avatarCrop.clamp({
+        scale: base.scale,
+        x: base.x + (ts[0].clientX - base.clientX),
+        y: base.y + (ts[0].clientY - base.clientY)
+      }, vp, img))
+    },
+
+    onCropTouchEnd() {
+      this._cropTouch = null
+    },
+
+    onCropZoom(e) {
+      const img = this._cropImage()
+      const vp = this.data.cropViewport
+      const fit = this.data.cropFit || 1
+      const cur = this.data.cropScale || fit
+      const want = fit * ((Number(e.detail && e.detail.value) || 100) / 100)
+      const factor = want > 0 ? want / cur : 1
+      this._applyCropState(avatarCrop.zoomAt(
+        { scale: cur, x: this.data.cropX, y: this.data.cropY }, vp, img, factor))
+    },
+
+    onCropConfirm() {
+      const that = this
+      const src = this.data.cropSrc
+      const img = this._cropImage()
+      const vp = this.data.cropViewport
+      const rect = avatarCrop.cropRect(
+        { scale: this.data.cropScale, x: this.data.cropX, y: this.data.cropY }, vp, img)
+      // 兜底一律退回原图上传：裁剪是增强，不能因为它失败就让人换不了头像
+      const done = (path) => {
+        that.closeAvatarCrop()
+        const p = path || src
+        if (p) that.uploadAvatar(p)
+      }
+      try {
+        wx.createSelectorQuery().in(this).select('#cropCanvas')
+          .fields({ node: true, size: true })
+          .exec((res) => {
+            const canvas = res && res[0] && res[0].node
+            if (!canvas) { done(src); return }
+            const size = avatarCrop.OUTPUT_SIZE
+            canvas.width = size
+            canvas.height = size
+            const ctx = canvas.getContext('2d')
+            const image = canvas.createImage()
+            image.onload = () => {
+              ctx.fillStyle = '#FFFFFF'
+              ctx.fillRect(0, 0, size, size)
+              ctx.drawImage(image, rect.sx, rect.sy, rect.sw, rect.sh, 0, 0, size, size)
+              wx.canvasToTempFilePath({
+                canvas,
+                x: 0, y: 0, width: size, height: size,
+                destWidth: size, destHeight: size,
+                fileType: 'jpg', quality: 0.92,
+                success(out) { done(out.tempFilePath) },
+                fail(err) {
+                  console.error('[onCropConfirm] 导出裁剪图失败，退回原图:', err)
+                  done(src)
+                }
+              })
+            }
+            image.onerror = (err) => {
+              console.error('[onCropConfirm] 载入图片失败，退回原图:', err)
+              done(src)
+            }
+            image.src = src
+          })
+      } catch (err) {
+        console.error('[onCropConfirm] 裁剪异常，退回原图:', err)
+        done(src)
+      }
+    },
+
     onScrollToTop() {
       // 交给 WXS 引擎做 easeOutCubic 平滑滚动（视图层 rAF）
       this.setData({ scrollCmd: { mode: 'to', y: 0, dur: 300 } })
@@ -645,8 +823,9 @@ Component({
         success(res) {
           const avatarUrl = res.tempFilePaths[0]
           if (!avatarUrl) return
-          that.setData({ avatarUrl })
-          that.uploadAvatar(avatarUrl)
+          // 2026-10-27 用户要求：选完先裁剪（拖动/缩放选区域），确认后才上传。
+          // 不再先把未裁剪的原图塞进 avatarUrl —— 否则上传成功前会闪一张方图变圆图。
+          that.openAvatarCrop(avatarUrl)
         },
         fail(err) {
           console.error('[chooseFromAlbum] 选择图片失败:', err)
@@ -673,8 +852,7 @@ Component({
             success(downloadRes) {
               wx.hideLoading()
               if (downloadRes.statusCode === 200) {
-                that.setData({ avatarUrl: downloadRes.tempFilePath })
-                that.uploadAvatar(downloadRes.tempFilePath)
+                that.openAvatarCrop(downloadRes.tempFilePath)
               } else {
                 wx.showToast({ title: '下载头像失败', icon: 'none' })
               }

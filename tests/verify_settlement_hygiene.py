@@ -63,7 +63,9 @@ check("allMonthKeys 只收合法月份键（挡住幽灵月份，覆盖所有载
 
 check("calcMonth 只结算「付款人仍是成员」的采购，并汇总 orphanPayerExp",
       "var settledExps = exps.filter(function (e) { return known[e.payer]; });" in src
-      and "settledExps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + parseCents(e.amount); });" in src
+      # v7.9：金额统一走 expenseAmountCents（虚拟摊销行自带 amountCents，避免浮点尾差）
+      and "settledExps.forEach(function (e) { paid[e.payer] = (paid[e.payer] || 0) + expenseAmountCents(e); });" in src
+      and "var totalExp = settledExps.reduce(function (s, e) { return s + expenseAmountCents(e); }, 0);" in src
       and "orphanPayerExp: orphanPayerExp," in src
       and "exps.forEach(function (e) { paid[e.payer] =" not in src)
 

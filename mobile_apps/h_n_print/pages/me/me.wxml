@@ -702,3 +702,29 @@
       </view>
     </view>
   </view>
+\n
+
+
+  <!-- 头像裁剪（2026-10-27 用户要求）：选图/取微信头像之后先裁剪再上传。
+       放在 page-root 外 + position:fixed —— me 页的 .scroll-content 有 translateY 变换层，
+       放里面会跟着滚、fixed 也会相对变换层定位（价格气泡那条教训同源）。 -->
+  <view wx:if="{{cropVisible}}" class="crop-mask {{isDarkMode ? 'theme-dark' : ''}}" bindtap="onCropCancel">
+    <view class="crop-panel" catchtap="noop">
+      <text class="crop-title">调整头像</text>
+      <text class="crop-hint">拖动图片选择位置，双指或下面的滑杆缩放</text>
+      <view class="crop-box" style="width: {{cropViewport}}px; height: {{cropViewport}}px;"
+            bindtouchstart="onCropTouchStart" bindtouchmove="onCropTouchMove" bindtouchend="onCropTouchEnd">
+        <image class="crop-img" src="{{cropSrc}}" mode="scaleToFill"
+               style="width: {{cropImgW * cropScale}}px; height: {{cropImgH * cropScale}}px; left: {{cropX}}px; top: {{cropY}}px;"></image>
+        <view class="crop-ring"></view>
+      </view>
+      <slider class="crop-slider" min="100" max="{{cropMaxZoomPct}}" value="{{cropZoomPct}}"
+              bindchange="onCropZoom" bindchanging="onCropZoom" block-size="18" />
+      <view class="crop-actions">
+        <button class="btn-secondary crop-btn" catchtap="onCropCancel" hover-class="tap-active">取消</button>
+        <button class="btn-primary crop-btn" catchtap="onCropConfirm" hover-class="tap-active">确定</button>
+      </view>
+      <!-- 离屏画布：确认时按 cropRect 的源矩形把 512×512 画出来再导出 -->
+      <canvas type="2d" id="cropCanvas" class="crop-canvas"></canvas>
+    </view>
+  </view>

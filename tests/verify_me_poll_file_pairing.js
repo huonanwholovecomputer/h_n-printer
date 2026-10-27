@@ -48,6 +48,9 @@ function loadModule(rel, exportName) {
 
 const CONFIG_MOD = { CONFIG: { BASE_URL: 'https://example.invalid' } };
 const PAGES_MOD = loadModule('utils/pages.js', 'countPagesInRange');
+// 头像裁剪几何（me.js 2026-10 起 require 的模块）：**真实加载**，文件缺失/语法错直接抛，
+// 不做"空对象桩" —— 否则 me.js 一旦依赖它的导出就会被静默放过。
+const AVATAR_CROP_MOD = loadModule('utils/avatar_crop.js');
 
 /** 载入真实 me.js，返回 { methods, captured: {lastOpts} } */
 function loadMe() {
@@ -65,6 +68,7 @@ function loadMe() {
     require: (dep) => {
       if (dep.endsWith('utils/config')) return CONFIG_MOD;
       if (dep.endsWith('utils/pages')) return PAGES_MOD;
+      if (dep.endsWith('utils/avatar_crop')) return AVATAR_CROP_MOD;
       if (dep.endsWith('utils/request')) {
         return { request: (opts) => { captured.lastOpts = opts; } };
       }

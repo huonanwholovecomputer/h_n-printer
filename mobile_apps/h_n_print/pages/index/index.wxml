@@ -53,16 +53,16 @@
             >
               <view class="device-dot {{item.online ? 'device-dot-on' : 'device-dot-off'}}"></view>
               <text class="device-label">{{item.label}}</text>
-              <!-- 该设备已确认不支持自动双面（双面需人工翻纸）—— 仅作提示，不拦截无障碍/双面下单 -->
-              <text wx:if="{{item.auto_duplex === false}}" class="device-state device-state-manual">🖐 需人工翻纸</text>
-              <!-- 攒批模式（状态徽标 + 远程开关）**只对「需人工翻纸」的机型渲染**：
-                   auto_duplex === false（无自动双面器）才有"合并翻纸"的需求；自动双面的机器一次成型，
-                   攒批纯属多余，能力未确认的也不给入口（2026-10 用户要求，与本地工具同一判据）。 -->
+              <!-- 需人工翻纸 + 攒批状态合成**一个**胶囊（2026-10-27 用户要求：接单设备条高度不一致，
+                   必须缩到一行）。旧写法「🖐 需人工翻纸」+「攒批未开」+「开启攒批」+「在线」四个块
+                   在 375px 上放不下 ⇒ flex-wrap 换行，列表里每条高度都不一样（有的两行有的三行）。
+                   判据不变：攒批只对「无自动双面器」的机型渲染（auto_duplex === false，三端同一条），
+                   stack_mode 三态：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=从未上报
+                   → 只显示「需人工翻纸」。三个胶囊互斥出现，行内宽度因此恒定。 -->
               <block wx:if="{{item.auto_duplex === false}}">
-                <!-- 状态（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
-                     null（该设备从未上报，状态未知）→ 不渲染该徽标 -->
                 <text wx:if="{{item.stack_mode === true}}" class="device-state device-state-stack">🖐 攒批中</text>
-                <text wx:elif="{{item.stack_mode === false}}" class="device-state device-state-stack-off">攒批未开</text>
+                <text wx:elif="{{item.stack_mode === false}}" class="device-state device-state-stack-off">🖐 攒批未开</text>
+                <text wx:else class="device-state device-state-manual">🖐 需人工翻纸</text>
                 <!-- 远程开关：仅管理员/超管渲染（普通用户看不到可点控件，也不留空壳）；
                      离线 / 服务端判「当前不可切换」→ 灰显禁用，点击只弹提示（catchtap 防冒泡选中设备） -->
                 <view

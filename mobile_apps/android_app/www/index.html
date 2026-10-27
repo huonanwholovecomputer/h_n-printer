@@ -937,6 +937,24 @@
 <script src="app.js"></script>
 <script src="updater.js"></script>
 <script src="print.js"></script>
+<script src="avatar_crop.js"></script>
 <script src="me.js"></script>
+
+<!-- 头像裁剪（2026-10-27 用户要求）：选图后先裁剪再上传；见 www/me.js / avatar_crop.js -->
+<view class="modal-mask crop-mask" id="cropMask" style="display:none">
+  <view class="crop-panel">
+    <text class="crop-title">调整头像</text>
+    <text class="crop-hint">拖动图片选择位置，双指或下面的滑杆缩放</text>
+    <view class="crop-box" id="cropBox">
+      <img class="crop-img" id="cropImg" alt="裁剪预览" />
+      <view class="crop-ring"></view>
+    </view>
+    <input class="crop-slider" id="cropZoom" type="range" min="100" max="400" value="100" step="1" />
+    <view class="crop-actions">
+      <button class="btn-secondary crop-btn" id="cropCancel" type="button">取消</button>
+      <button class="btn-primary crop-btn" id="cropOk" type="button">确定</button>
+    </view>
+  </view>
+</view>
 </body>
 </html>

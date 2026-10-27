@@ -116,6 +116,42 @@ def plan_page_raster(page_w_pts: float, page_h_pts: float,
     return draw_w, draw_h, render_w, render_h, capped
 
 
+def plan_page_draw(page_w_pts: float, page_h_pts: float,
+                   native_dpi_x: float, native_dpi_y: float,
+                   printable_w: int, printable_h: int,
+                   dpi_cap: int = 0, pixel_limit: int = 0,
+                   landscape_fill: bool = True) -> tuple[int, int, int, int, int, bool]:
+    """一页该怎么摆到纸上：要不要**整页转 90°**，以及转完之后的绘制/渲染尺寸。
+
+    返回 (angle, draw_w, draw_h, render_w, render_h, capped)。
+    angle ∈ {0, 90}：90 表示这一页整页转 90° 再贴图（页横纸竖、或页竖纸横）。
+
+    为什么要有它（2026-10-27 现场）：横向 PDF（841.9×595.3pt，A4 横）在**纵向纸**上
+    按旧的等比缩放只能占纸张 49%（LJ1020 可打印区 4736×6824 @600dpi ⇒ 画成
+    4736×3349、上下各留 1737px 空白），现场读成"横向文件打出来是竖着的"。
+    正解不是缩小，而是把这一页转 90° 铺满纸张 —— 与 Word/Adobe 的「自动旋转」同一效果，
+    读者把纸横过来看即可（纸耗不变、字大约 ×1.48）。
+
+    ⚠ 转 90° 与手动双面第 2 趟的 180° 补偿是**两件独立的事**，叠加顺序不影响结果
+    （90+180 与 180+90 都等于 270）。这里只负责 90°，180° 仍由调用方逐面决定。
+
+    draw_*/render_*/capped 的语义与 plan_page_raster 完全一致，只是都变成**转完之后**的
+    尺寸（转置只换宽高、不改像素数），所以调用方拿到位图后直接用 img.size 即可。
+    """
+    paper_portrait = int(printable_w) <= int(printable_h)
+    page_landscape = float(page_w_pts) > float(page_h_pts)
+    # 页面朝向与纸张朝向**不一致**时才转：横页 + 竖纸、竖页 + 横纸。
+    # （纸是不是竖的 ⇔ paper_portrait；"页横" 与 "纸竖" 同真 ⇒ 要转 90°。）
+    angle = 90 if (landscape_fill and page_landscape == paper_portrait) else 0
+    # 转 90° ⇒ 目标框按"转置后的页面"算（等效于把纸横过来量）
+    eff_w, eff_h = (page_h_pts, page_w_pts) if angle else (page_w_pts, page_h_pts)
+    draw_w, draw_h, render_w, render_h, capped = plan_page_raster(
+        eff_w, eff_h, native_dpi_x, native_dpi_y, printable_w, printable_h,
+        dpi_cap=dpi_cap, pixel_limit=pixel_limit,
+    )
+    return angle, draw_w, draw_h, render_w, render_h, capped
+
+
 def _is_monochrome_printer(printer_name: str, devmode, hdc, win32con) -> bool:
     """判断目标队列是否黑白设备（决定走 1bit 还是 RGB）。三路证据，任一"确定"即采纳。
 
@@ -954,6 +990,8 @@ def print_pdf(
     dpi: int = 0,
     pages_override: Optional[list[Optional[int]]] = None,
     rotate_180: bool = False,
+    rotate_slots: Optional[list[bool]] = None,
+    landscape_fill: bool = True,
 ) -> tuple[bool, str]:
     """
     静默打印 PDF 文件。
@@ -974,6 +1012,10 @@ def print_pdf(
                         按它自己的页序又打一遍 —— 那正是手动双面最怕的重复/错位）。
         rotate_180: 内容整体旋转 180°（手动双面第 2 趟用，补偿纸路径的 180° 翻转）。
                     一般不要直接调它 —— 用 print_plan_pass()，那里把这条规则封在一处。
+        rotate_slots: 逐面 180° 补偿表（与 pages_override 等长，True=该面转 180°）；给出时
+                    覆盖 rotate_180。手动双面一个批次里长边/短边混排就靠它（见 _print_pdf_native）。
+        landscape_fill: 横向页整页转 90° 铺满纸张（默认开；纵向纸上打横向页不再缩到 49%）。
+                    打印机的纸横向进纸时可传 False。
 
     Returns:
         (success, message)
@@ -1044,7 +1086,9 @@ def print_pdf(
     if system == "Windows":
         # 方案 1: Windows 原生 GDI 打印（驱动级双面/份数控制，最可靠）
         print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
-        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback, dpi, pages_override, rotate_180)
+        ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range,
+                                    copies, orientation, progress_callback, dpi, pages_override,
+                                    rotate_180, rotate_slots, landscape_fill)
         if ok:
             print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
@@ -1083,7 +1127,8 @@ def print_pdf(
         # 方案 3: 应用层循环打印（最可靠兜底；pages_override 原样透传，保证序列一致）
         print("[打印] 方案3: 应用层循环打印（兜底）...")
         ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies,
-                                  orientation, progress_callback, dpi, pages_override, rotate_180)
+                                  orientation, progress_callback, dpi, pages_override, rotate_180,
+                                  rotate_slots, landscape_fill)
         print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
         return ok, msg
     else:
@@ -1102,6 +1147,7 @@ def print_plan_pass(
     second_rotate_180: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
     dpi: int = 0,
+    landscape_fill: bool = True,
 ) -> tuple[bool, str]:
     """按 manual_duplex.PrintPlan 打印第 which 趟（1/2）。
 
@@ -1114,13 +1160,29 @@ def print_plan_pass(
         → 第 2 趟内容旋转 180°，操作员照 HP 弹窗"不改变方向、原样放回"即得长边/书本式；
       · False → 不旋转，操作员需把整叠在平面内转 180° 再放（短边/便签式）。
       该值随打印机型号的纸路径而不同，用 tools/print_duplex_calibration.py 实测确定。
+      ⚠ 2026-10-27 起：真正逐面生效的是**计划里每张纸自带的 rotate**（plan.pass_rotate），
+      本参数退化为"整趟默认/兜底"（传 False = 这一趟整体不转）。这样同一批次里长边/短边
+      可以混排，不必再拆成两批各翻一次纸。
+    landscape_fill：横向页整页转 90° 铺满纸张（见 plan_page_draw），随打印机档案走。
     """
     which = 2 if int(which) == 2 else 1
+    slots = plan.pass_page_indices(which)
+    # 逐面 180° 补偿表：计划里每张纸自己带着"要不要转"（同一批可长边/短边混排）。
+    # 调用方传 second_rotate_180=False = 这一趟整体不转（旧口径，例如攒批档案里实测不需要），
+    # 那就把表全清空，别让计划里的值把它顶掉。
+    rotate_slots: Optional[list[bool]] = None
+    flags = [bool(x) for x in getattr(plan, "pass_rotate", lambda _w: [])(which)]
+    if flags and len(flags) == len(slots):
+        if which == 2 and not second_rotate_180:
+            flags = [False] * len(flags)
+        rotate_slots = flags
     return print_pdf(
         pdf_path, printer_name, copies=1, duplex="off",
-        pages_override=plan.pass_page_indices(which),
+        pages_override=slots,
         rotate_180=(which == 2 and second_rotate_180),
+        rotate_slots=rotate_slots,
         progress_callback=progress_callback, dpi=dpi,
+        landscape_fill=landscape_fill,
     )
 
 
@@ -1136,6 +1198,8 @@ def _print_pdf_native(
     dpi: int = 0,
     pages_override: Optional[list[Optional[int]]] = None,
     rotate_180: bool = False,
+    rotate_slots: Optional[list[bool]] = None,
+    landscape_fill: bool = True,
 ) -> tuple[bool, str]:
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
@@ -1148,6 +1212,12 @@ def _print_pdf_native(
     rotate_180: 把本次所有内容页渲染后旋转 180°（空白页不受影响）。**手动双面第 2 趟必须开**：
                 纸张在出纸路径里被转了 180°，不补偿则第 2 面的文字整体倒置
                 （HP LaserJet 1020 实机实测确认；HP 驱动自己分两趟时也在内部做了这个补偿）。
+    rotate_slots: **逐面**的 180° 补偿表（与 render_seq 等长，True=该面转 180°）。给出时
+                覆盖 rotate_180 —— 手动双面一个批次里可以长边/短边**混排**（同一叠纸、
+                同一次翻纸，各文件按自己的装订方向补偿），旧写法只能整趟一个开关，因此
+                只能把混排拆成两批、多翻一次纸（2026-10-27 现场 HN20261027-0004）。
+    landscape_fill: 横向页要不要整页转 90° 铺满纸张（见 plan_page_draw）。默认开：
+                纵向纸上打横向页，缩放居中只占纸张 49%，读起来像"横向文件打成了竖的"。
     """
     import fitz
 
@@ -1289,8 +1359,13 @@ def _print_pdf_native(
         # Pillow ≥10 移除了 Image.ROTATE_180，只剩 Image.Transpose.ROTATE_180 —— 两边都兼容。
         _rot180 = getattr(getattr(Image, "Transpose", None), "ROTATE_180", None) \
             or getattr(Image, "ROTATE_180", None)
+        # 横向页铺满纸张用的 90°（同样是 transpose，无损、精确）
+        _rot90 = getattr(getattr(Image, "Transpose", None), "ROTATE_90", None) \
+            or getattr(Image, "ROTATE_90", None)
         if rotate_180 and _rot180 is None:
             logger.warning("GDI: 当前 Pillow 版本取不到 180° 旋转常量，rotate_180 被忽略")
+        elif landscape_fill and _rot90 is None:
+            logger.warning("GDI: 取不到 90° 旋转常量，横向页将退回等比缩放（留白边）")
 
         # 单数页 + 双面 + 多份 → 每份之间需插入空白页，确保副本独立（已在 render_seq 里排好）
         needs_separator = (pages_override is None and duplex == "on" and copies > 1
@@ -1327,15 +1402,22 @@ def _print_pdf_native(
 
             page = doc[page_idx]
 
-            # ── 目标物理尺寸 + 实际渲染尺寸（纯函数见 plan_page_raster）──
+            # ── 目标物理尺寸 + 实际渲染尺寸 + 要不要整页转 90°（纯函数见 plan_page_draw）──
             # 旧路径先按 400dpi 渲染、再把位图拉伸到 600dpi 设备矩形（1.43× 最近邻 + 0.955 适配），
             # 小字锯齿就来自这两次重采样。现在直接渲染到最终尺寸：默认 1:1，MuPDF 只采样一次。
             page_w_pts = page.rect.width
             page_h_pts = page.rect.height
-            draw_w, draw_h, render_w, render_h, capped = plan_page_raster(
+            angle, draw_w, draw_h, render_w, render_h, capped = plan_page_draw(
                 page_w_pts, page_h_pts, native_dpi_x, native_dpi_y,
                 printable_w, printable_h, dpi_cap=dpi, pixel_limit=pixel_limit,
+                landscape_fill=landscape_fill and _rot90 is not None,
             )
+            # 这一面要不要 180° 补偿：给了逐面表就按表（同一批里长边/短边可混排），否则按整趟
+            slot_rotate_180 = (bool(rotate_slots[page_seq - 1])
+                               if rotate_slots and 0 < page_seq <= len(rotate_slots)
+                               else bool(rotate_180))
+            if angle and _rot90 is None:
+                angle = 0            # 取不到常量 → 退回旧的等比缩放（至少不崩）
 
             # P0-1: 极端尺寸页面在**渲染前**就拒绝（还没 StartPage → 没出纸，允许上层降级）
             if render_w * render_h > pixel_limit:
@@ -1351,7 +1433,11 @@ def _print_pdf_native(
                       f"（dpi上限/像素上限触发，GDI 将放大一次）")
 
             # 先渲染、后 StartPage：渲染失败时尚未出纸，可安全降级重试
-            mat = fitz.Matrix(render_w / page_w_pts, render_h / page_h_pts)
+            # 转 90° 时：位图宽对应页面**高**、位图高对应页面**宽**（转置后才是 draw_*）
+            if angle:
+                mat = fitz.Matrix(render_h / page_w_pts, render_w / page_h_pts)
+            else:
+                mat = fitz.Matrix(render_w / page_w_pts, render_h / page_h_pts)
             pix = page.get_pixmap(
                 matrix=mat,
                 colorspace=fitz.csGRAY if mono else fitz.csRGB,
@@ -1371,10 +1457,15 @@ def _print_pdf_native(
                     pix.samples, "raw", "RGB", pix.stride, 1,
                 )
 
-            # 手动双面第 2 趟：纸张在出纸路径里被转了 180°，必须把这一趟的内容也转 180° 补偿，
+            # ① 横向页铺满纸张：整页转 90°（与 Word/Adobe「自动旋转」同效）。
+            if angle:
+                img = img.transpose(_rot90)
+
+            # ② 手动双面第 2 趟：纸张在出纸路径里被转了 180°，必须把这一趟的内容也转 180° 补偿，
             # 否则第 2 面的文字整体倒置（实机实测 HP LaserJet 1020：不补偿就是"上下颠倒"）。
             # 只影响本次渲染的位图，不影响纸张顺序、页序、居中位置。1bit/8bit 都支持无损转置。
-            if rotate_180 and _rot180 is not None:
+            # ①②叠加与顺序无关（90+180 == 180+90 == 270）。
+            if slot_rotate_180 and _rot180 is not None:
                 img = img.transpose(_rot180)
 
             # 未降采样时以位图**实际**尺寸为贴图矩形：MuPDF 的 ceil 可能比计算值多 1px，
@@ -1390,7 +1481,13 @@ def _print_pdf_native(
             dib = ImageWin.Dib(img)
             dib.draw(hdc.GetHandleOutput(), (x, y, x + draw_w, y + draw_h))
             hdc.EndPage()
-            print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (PDF p.{page_idx + 1})")
+            _tags = []
+            if angle:
+                _tags.append("横向→转90°铺满")
+            if slot_rotate_180:
+                _tags.append("转180°补偿")
+            print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (PDF p.{page_idx + 1})"
+                  + (f" 〔{'/'.join(_tags)}〕" if _tags else ""))
             if progress_callback:
                 progress_callback(page_seq, total_sides)
 
@@ -1722,6 +1819,8 @@ def _print_via_loop(
     dpi: int = 0,
     pages_override: Optional[list[Optional[int]]] = None,
     rotate_180: bool = False,
+    rotate_slots: Optional[list[bool]] = None,
+    landscape_fill: bool = True,
 ) -> tuple[bool, str]:
     """终极兜底：应用层循环打印，每次只打 1 份。成功率最高。
 
@@ -1732,7 +1831,7 @@ def _print_via_loop(
         print(f"[循环打印] 第 {i + 1}/{copies} 份...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range,
                                     1, orientation, progress_callback, dpi, pages_override,
-                                    rotate_180)
+                                    rotate_180, rotate_slots, landscape_fill)
         if not ok:
             print(f"[循环打印] ✗ 第 {i + 1} 份失败: {msg}")
             # 双面不可用是终止型失败：原样上抛，别被改写成"第 N 份失败"而丢掉语义

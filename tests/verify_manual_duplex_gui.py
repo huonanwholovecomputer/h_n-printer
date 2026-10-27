@@ -164,12 +164,16 @@ def patched(rec, fail_merge_at=None):
         return True, "桩：一次提交"
 
     def _print_plan_pass(plan, path, printer, which, second_rotate_180=False,
-                         progress_callback=None, dpi=0):
+                         progress_callback=None, dpi=0, landscape_fill=True, **kw):
         seq0 = plan.pass_page_indices(which)
         # 真正"只在第 2 趟旋转"的判定在 print_plan_pass 内部（verify_duplex_probe 断言了位图真的
         # 被 transpose）；这里按同一契约记录"本趟实际是否旋转"+ GUI 是否把设置传下去。
+        # 第 6 项 = 计划里**逐面**的 180° 补偿表（2026-10-27 起真正生效的是它；
+        # 第 5 项那个"整趟默认值"只是兜底，长短短混排时一定是 True，不能拿它判定）
         rec.plan_pass.append((which, bool(which == 2 and second_rotate_180), seq0,
-                              plan.pass_pages(which), bool(second_rotate_180)))
+                              plan.pass_pages(which), bool(second_rotate_180),
+                              [bool(x) for x in plan.pass_rotate(which)],
+                              [(s.label, bool(s.rotate)) for s in plan.pass_slots(which)]))
         # 组一致性检查用：每张纸的两面、以及每个槽位归属的标签
         rec.plan_labels.append({
             "sheets": [(s.label, s.side_a, s.side_b) for s in plan.sheets],
@@ -347,9 +351,14 @@ check("★ 两个任务各自回报一次（份数不再多报）",
       sorted(i for i, _ok, _m in rec.finished) == [0, 1], f"{rec.finished}")
 
 rec = run_worker([make_job(PDF5, mode="short-edge")], MANUAL)
-check("★ 短边装订 → 第 2 趟**不**旋转（长边才补偿 180°）",
-      rec.plan_pass[1][4] is False and rec.plan_pass[1][1] is False,
-      f"传下去={rec.plan_pass[1][4]}")
+check("★ 短边装订 → 第 2 趟**不**旋转（长边才补偿 180°；判据看逐面表）",
+      all(x is False for x in rec.plan_pass[1][5]) and sum(rec.plan_pass[1][5]) == 0,
+      f"逐面表={rec.plan_pass[1][5]}")
+
+rec = run_worker([make_job(PDF5, mode="long-edge")], MANUAL)
+check("★ 长边装订 → 第 2 趟内容页全部补偿 180°（逐面表全 True）",
+      all(rec.plan_pass[1][5]) and len(rec.plan_pass[1][5]) == 3,
+      f"逐面表={rec.plan_pass[1][5]}")
 
 rec = run_worker([make_job(PDF5, name="A.docx"), make_job(PDF3, duplex="off", name="B.docx"),
                   make_job(PDF1, name="C.docx")], MANUAL)
@@ -765,16 +774,25 @@ check("★ 虚拟打印机（Print to PDF）不补空白页（双面为空操作
       rec_v.merged_pages[0] == ["v3#1", "v3#2", "v3#3", "v2#1", "v2#2"],
       f"{rec_v.merged_pages}")
 
-# 装订方向混排 → 拆两批；第 2 批翻纸时第 1 批的纸也还在槽里，同样必须算进去
+# 装订方向混排（长边 + 短边）→ **不拆批**（2026-10-27 用户现场 HN20261027-0004）：
+# 操作员动作完全相同（整叠原样放回），长/短边只差"第 2 趟这一面转不转"⇒ 逐面补偿，
+# 整单仍然只翻一次纸。旧口径按方向分组 ⇒ 劈成两次打印、第二批还要"只取最上面 N 张"，
+# 现场操作员看不懂直接点了跳过，整单判失败。
 rec_grp = run_worker([make_job(PDF5, mode="long-edge", name="L.docx"),
                       make_job(PDF3, mode="short-edge", name="S.docx")], MANUAL)
-check("★ 装订方向混排 → 拆两批、翻两次纸", len(rec_grp.flip) == 2, f"{len(rec_grp.flip)}")
-check("第 1 批翻纸时槽里是空的 → 保持原文案",
-      "出纸槽里应有 3 张纸" in rec_grp.flip[0] and "最上面" not in rec_grp.flip[0],
+check("★ 装订方向混排 → 仍只有一次翻纸（不再拆两批）", len(rec_grp.flip) == 1, f"{len(rec_grp.flip)}")
+check("混排：5 张纸一次翻完（不再有『只取最上面 N 张』的分批口径）",
+      "出纸槽里应有 5 张纸" in rec_grp.flip[0] and "最上面" not in rec_grp.flip[0],
       f"{rec_grp.flip[0][:80]}…")
-check("★ 第 2 批翻纸：本批 2 张 + 第 1 批已出的 3 张 = 5 张，且只翻最上面 2 张",
-      "5 张" in rec_grp.flip[1] and "最上面 2 张" in rec_grp.flip[1],
-      f"{rec_grp.flip[1][:180]}…")
+# 补偿口径写在**常驻窗播报**里（翻纸窗那三步是 HP 原文，不含旋转说明）
+check("★ 混排：播报说明「按各文件装订方向逐面补偿：转 180° N 面、不转 M 面」",
+      any("逐面补偿" in t and "转 180°" in t for t in rec_grp.announce),
+      f"{rec_grp.announce[-1][:260] if rec_grp.announce else ''}…")
+_lab_rot = rec_grp.plan_pass[1][6]
+_L = [r for lb, r in _lab_rot if lb.startswith("L.docx")]
+_S = [r for lb, r in _lab_rot if lb.startswith("S.docx")]
+check("★ 混排：L（长边）的每一面都转 180°、S（短边）的每一面都不转（按文件、不是按批）",
+      _L and _S and all(_L) and not any(_S), f"L={_L} S={_S}")
 
 # 首页（封面页）：非攒批时它同样是"单独打一张再进批次"⇒ 同一机制。
 # docs/审查报告_2026-10/findings_B_gui_print.md:183 记的就是这条，且此前**只有攒批那条有守卫**。
@@ -804,13 +822,16 @@ check("★ 并批异常：日志里有一条可读失败原因（不只 tracebac
       any("手动双面批次异常" in m for m in rec_bad.logs),
       f"{[m for m in rec_bad.logs if '异常' in m]}")
 
-# 第 2 批才炸：已成功的第 1 批不能重复回报，失败也只报一次
+# 前面已有成功回报、后面批次才炸：成功的那份不能重复回报，失败也只报一次。
+# （2026-10-27 起装订方向不再拆批，所以这里改成"先直打的坏件成功 + 批次合并失败"，
+#   要守的性质不变：已发过 job_finished 的 idx 不再补发。）
 rec_bad2 = run_worker([make_job(PDF5, mode="long-edge", name="L.docx"),
-                       make_job(PDF3, mode="short-edge", name="S.docx")],
-                      MANUAL, fail_merge_at=2)
-check("★ 并批异常·第 2 批才炸：成功的那批照常回报，失败只报一次、不重复",
+                       make_job(os.path.join(_SANDBOX, "broken.pdf"), duplex="off",
+                                name="broken.pdf")],
+                      MANUAL, fail_merge_at=1)
+check("★ 并批异常·前面已有成功：成功的那份照常回报，失败只报一次、不重复",
       rec_bad2.raised is None
-      and [(i, ok) for i, ok, _m in rec_bad2.finished] == [(0, True), (1, False)]
+      and sorted((i, ok) for i, ok, _m in rec_bad2.finished) == [(0, False), (1, True)]
       and rec_bad2.all_finished == [(1, 1)],
       f"{rec_bad2.finished} {rec_bad2.all_finished}")
 
