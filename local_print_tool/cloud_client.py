@@ -2317,11 +2317,14 @@ class CloudClient(QObject):
                     from pdf_printer import get_pdf_info
                     info = get_pdf_info(temp_pdf)
                     page_count = info.get("page_count", 0)
-                    # docx 不在此写缓存：渲染随引擎变化，而分析路径拿不到 converter 实际
-                    # 用的引擎 ⇒ 写进去可能带错引擎身份。打印侧本就按引擎 key 读取，读不到
-                    # 无后缀条目，故不写零损失（避免留下"引擎不明"的缓存被别的路径复用）。
-                    if ext != ".docx":
-                        self._save_pdf_to_cache(source_md5, temp_pdf, file_name, ext, page_count)
+                    # ⚠ **Office 文档一律不写打印缓存**（.doc 也不行 —— 2026-10-28 修的真实缺陷）：
+                    #   本路径恒用 LibreOffice（S1-04：云端触发、不给宏执行机会），而打印侧可能
+                    #   按 `allow_cloud_com` 走 Word/WPS。`.docx` 有引擎后缀能隔离，`.doc` 的
+                    #   `cache_engine_for()` 恒返回 "" ⇒ 打印侧算出的 key 与这份 LO 产物**完全相同**
+                    #   ⇒ 命中复用 ⇒ 管理员例外对 `.doc` 结构性失效（现场 HN20261028-0002：
+                    #   「管理员上传」放行了 COM，却永远打出 LO 版式）。
+                    #   代价：`.doc` 云端单会多转换一次（分析一次、打印一次），换来引擎身份不再
+                    #   被静默调包。
                     if page_count > 0 and not _canceled():
                         self._report_page_count(file_id, file_name, page_count, info.get("orientation", ""))
                     elif _canceled():

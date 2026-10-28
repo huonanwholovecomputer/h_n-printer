@@ -508,7 +508,7 @@ def _write_rollback_note(root: str, exe_dir: str = "") -> None:
         f'    previous\\ 里的安装包 /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR="{target}"\r\n'
         "\r\n"
         "注意：更新器只升不降 —— 回滚到较低版本后，客户端下次检查更新会再次提示升级。\r\n"
-        "正式回滚应由发布者发一个**版本号更高、内容为回退代码**的安装包。\r\n"
+        "正式回滚应由发布者发一个「版本号更高、内容为回退代码」的安装包。\r\n"
         "\r\n"
         "目录 ACL 已尽量收紧为仅当前用户；请勿把本目录共享或复制到公共路径。\r\n"
     )

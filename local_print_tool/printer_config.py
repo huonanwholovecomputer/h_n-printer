@@ -160,14 +160,22 @@ class PrintJob:
     order_number: str = ""   # 订单号（云端的来自后端，本地的在复制时生成）
     remark: str = ""         # 订单/任务备注（云端订单来自后端 remark；本地任务可自行填写，≤100 字）
     sent: bool = False       # 是否已打印完成（成功回报后置位，退出时不再放弃；持久化以扛异常退出重载）
-    # 该任务是否「管理员自行打印」（云端 is_admin_print）。只用于「云端 Word 是否走 COM」的
-    # 放行判定的一半（见 cloud_word_com_allowed）：顾客订单这一位恒 False ⇒ 永远强制 LibreOffice。
+    # 该任务是否「管理员自行打印」（云端 is_admin_print）。**已不参与**云端 Word 是否走 COM 的
+    # 判定（2026-10-28：只看 uploader_is_admin，见 cloud_word_com_allowed）；保留它是因为
+    # 「自打」仍决定结算归类（自打不计收益）与界面展示。
     # 持久化：崩溃续打/重启后不能因为字段丢失而把管理员单又卡成"缺 LO 打不了"。
     admin_self_print: bool = False
     # 该云端文件的**上传者是不是管理员**（后端按 files.openid 算好下发）。
     # 挡住「顾客上传 → 人工订正/机位勾选成自打 → 顾客内容进 COM」这条链路：
     # 光有 is_admin_print 不够，内容归属看上传者。缺失/旧后端一律 False（fail-closed）。
     uploader_is_admin: bool = False
+    # 末尾连续空白页的**检测结果**（2026-10-28 用户需求），只描述文件本身。
+    # ⚠ 排除动作**不**记在这里：它落到 page_range 上（有效页数只允许 `_count_pages_in_range`
+    # 一份口径，见 v7.2 契约）—— 否则打印、计费、单页硬闸门会各减一次。
+    blank_tail: int = 0
+    # 已排除末尾空白页时 = 排除**前**的 page_range（"" = 当时是"全部"）；None = 没排除。
+    # 有它才谈得上"恢复"，也让界面能区分"检测到空白"与"已经排掉了"。
+    blank_undo_range: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -190,6 +198,8 @@ class PrintJob:
             "sent": self.sent,
             "admin_self_print": self.admin_self_print,
             "uploader_is_admin": self.uploader_is_admin,
+            "blank_tail": self.blank_tail,
+            "blank_undo_range": self.blank_undo_range,
             # cached_pdf 不持久化，每次启动重新生成
         }
 
@@ -215,30 +225,41 @@ class PrintJob:
             remark=str(data.get("remark", "") or ""),
             admin_self_print=bool(data.get("admin_self_print", False)),
             uploader_is_admin=bool(data.get("uploader_is_admin", False)),
+            blank_tail=_num_or_default(data.get("blank_tail"), 0, int),
+            blank_undo_range=(data.get("blank_undo_range")
+                              if isinstance(data.get("blank_undo_range"), str) else None),
         )
 
 
 # ── 云端 Word 转换引擎（2026-10-26 晚定稿：**隐式规则**，不再有设备级开关） ──
 # 默认仍是最严口径（S1-04）：云端 .doc/.docx 一律 LibreOffice（不执行宏），
 #   本机没装 LibreOffice 就打不了云端 Word。
-# **唯一例外**：这单是「管理员自打」（`is_admin_print`）**且**该文件由管理员上传
-#   （`uploader_is_admin`）⇒ 允许 Word/WPS COM（仍带 AutomationSecurity=3 /
-#   DisplayAlerts=0 / UpdateLinksAtOpen=False 硬化）；顾客内容永远强制 LibreOffice。
+# **唯一例外**（2026-10-28 起：只看上传者）：**该文件由管理员上传**（`uploader_is_admin`）
+#   ⇒ 允许 Word/WPS COM（仍带 AutomationSecurity=3 / DisplayAlerts=0 /
+#   UpdateLinksAtOpen=False 硬化）；顾客上传的内容永远强制 LibreOffice。
+#   订单类型（`is_admin_print`）**不再参与**判定 —— 它是可变的结算位，不是内容归属证据。
 # 用户口径（2026-10-26）：「管理员直接默认不强制使用 LO 即可，普通用户必须强制使用 LO」——
 #   行为隐式执行，移动端不再有「☁ LO / ☁ Word」开关，也不再有设备级配置项。
 
 
-def cloud_word_com_allowed(admin_self_print: bool, uploader_is_admin: bool) -> bool:
-    """云端 Word 是否允许走 Word/WPS COM —— **唯一判定点**。
+def cloud_word_com_allowed(uploader_is_admin: bool) -> bool:
+    """云端 Word 是否允许走 Word/WPS COM —— **唯一判定点**（2026-10-28 口径）。
 
-    两条同时成立才放行（隐式规则，没有设备级策略）：
-      ① 该任务被标为管理员自打（is_admin_print = 订单类型「自打」）；
-      ② **该文件是管理员上传的**（uploader_is_admin）—— 光看 ① 不够：`is_admin_print` 是
-         可变的业务列（人工类型订正 / 机位勾选 / print_success 都会改写它），顾客上传的文件
-         一旦被订正成"自打"，就会把顾客内容送进 COM。内容归属只看上传者。
-    返回 False 时调用方仍走强制 LibreOffice（S1-04 默认口径）。
+    只剩**一条**：该文件是不是**管理员上传**的。
+
+    为什么不再看订单类型（`orders.is_admin_print`，2026-10-26 的旧口径是"自打 且 管理员上传"）：
+      · 内容归属只看**上传者**——管理员自己的机器上传的文件，走 COM 没有"顾客内容被执行宏"
+        的风险；反过来，顾客上传的文件即使被人工订正成"自打"，也绝不能进 COM；
+      · `is_admin_print` 是**可变业务/结算位**（人工类型订正、机位勾选、print_success 都会改写它），
+        拿它当"内容可信度"判据，等于让一个结算开关决定要不要执行宏；
+      · 现场后果（2026-10-28，HN20261028-0002）：管理员闫承翰从手机下单，身份是 admin，
+        但订单类型是普通「接单」⇒ 旧规则判 False ⇒ 强制 LibreOffice，排版与他期望不符；
+        要放行还得每次下单记得勾「管理员自行打印」（那一位还会顺带把该单改成不计营收）。
+
+    返回值就是 `allow_cloud_com`：False 时调用方仍走强制 LibreOffice（S1-04 默认口径）。
+    注意这只决定**转换引擎**，不改变订单类型/计费（该单照旧按「接单」计入营收）。
     """
-    return bool(admin_self_print) and bool(uploader_is_admin)
+    return bool(uploader_is_admin)
 
 
 def _parse_range_parts(raw: str, total_pages: int) -> set[int]:
@@ -301,6 +322,63 @@ def _count_pages_in_range(page_range: str, total_pages: int) -> int:
 
     pages = _parse_range_parts(raw, total_pages)
     return len(pages) if pages else total_pages
+
+def format_page_selection(pages) -> str:
+    """页码集合 → 页码范围字符串（连续段压成 a-b）：{1,2,3,5} → "1-3,5"。
+
+    只用于把"排除末尾空白页"的结果**落到 page_range 上**（唯一口径），不是另一种页数算法。
+    """
+    nums = sorted({int(p) for p in pages if int(p) > 0})
+    if not nums:
+        return ""
+    parts: list[str] = []
+    start = prev = nums[0]
+    for p in nums[1:]:
+        if p == prev + 1:
+            prev = p
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = p
+    parts.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(parts)
+
+
+def split_tail_blank(page_range: str, page_count: int, blank_tail: int) -> tuple[str, int]:
+    """排除末尾空白页后应使用的 page_range，返回 (新范围, 实际排掉几页)。
+
+    规则（2026-10-28 用户口径：只处理"最后的空白页"，且排除后**不收那一页的钱**）：
+      · 只排**文件末尾**那几页，而且必须落在当前页码范围里 —— 范围只选了"1"时，末尾的空白
+        页本来就不打，什么都不用改；
+      · 排到"一页不剩"时**不排**（返回原范围）：0 页的文件没法打印；
+      · 新范围仍然覆盖整份 ⇒ 返回 ""（"全部"的规范写法）；
+      · 排不掉时原样返回 (page_range, 0)，调用方据此判断"没变化"。
+
+    为什么把结果写成 page_range 而不是新字段：有效页数/计费/单页硬闸门/手动双面配对
+    全部只认 `_count_pages_in_range(page_range, page_count)` 这一个口径（v7.2 契约），
+    另立字段就得在每条消费路径上再减一次，迟早漏一处。
+    """
+    total = int(page_count or 0)
+    k = int(blank_tail or 0)
+    if total <= 1 or k <= 0:
+        return page_range, 0
+    k = min(k, total - 1)                      # 至少留 1 页可打
+
+    raw = (page_range or "").strip()
+    raw = raw.replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
+    selected = _parse_range_parts(raw, total) if raw else set()
+    if not selected:                            # 空/非法范围 = 全部（与 _count_pages_in_range 同口径）
+        selected = set(range(1, total + 1))
+
+    tail = set(range(total - k + 1, total + 1))
+    removable = selected & tail
+    if not removable:
+        return page_range, 0
+    remaining = selected - removable
+    if not remaining:                           # 排完一页不剩 ⇒ 不动
+        return page_range, 0
+    if remaining == set(range(1, total + 1)):
+        return "", len(removable)
+    return format_page_selection(remaining), len(removable)
 
 
 def calc_cost(
@@ -992,6 +1070,10 @@ class PrinterConfig:
     # 连续打进同一叠（出纸槽），人工一次性确认后统一打第 2 趟。见 duplex_stack.py。
     # 攒批期间其余打印请求（单面订单/自动打印/测速）一律排队——插进纸叠会串页。
     duplex_stack_mode: bool = False
+    # ---- 外部打印监视（A 档最小版：只检测 + 记账，不阻断，见 print_watch.py）----
+    # 勾上后本地工具订阅本机 spooler 作业事件，把"绕过本工具"的打印记进 external_prints.json。
+    # 默认 False：老配置文件没有这个键 ⇒ 保持关，且不影响其他默认值。
+    external_watch_enabled: bool = False
 
     def get_profile(self, printer_name: str = "") -> PrinterProfile:
         """取某台打印机的档案（缺省用 self.printer_name）；没有则返回默认档案（不落盘）。"""
@@ -1047,6 +1129,7 @@ class PrinterConfig:
             "printer_profiles": {k: v.to_dict() for k, v in self.printer_profiles.items()},
             # 攒批模式开关（多任务合并翻纸）
             "duplex_stack_mode": self.duplex_stack_mode,
+            "external_watch_enabled": self.external_watch_enabled,
         }
 
     @classmethod
@@ -1109,6 +1192,8 @@ class PrinterConfig:
                               if isinstance(v, dict)},
             # 攒批模式开关（老配置没有这个键 → 关，零回归）
             duplex_stack_mode=_bool_or_default(data.get("duplex_stack_mode"), False),
+            # 外部打印监视（老配置没有这个键 → 关，零回归）
+            external_watch_enabled=_bool_or_default(data.get("external_watch_enabled"), False),
         )
 
     def save(self, path: str) -> None:

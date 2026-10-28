@@ -518,15 +518,6 @@
       </view>
     </view>
 
-    <!-- 管理员/超级管理员：本地打印任务 -->
-    <view class="role-actions admin-collapsible {{userRole === 'admin' || isSuperAdmin ? 'admin-expanded' : ''}}">
-      <view class="role-btn user-btn" bindtap="onGoLocalOrders" hover-class="role-btn-pressing" hover-start-time="0" hover-stay-time="100">
-        <text class="role-btn-icon">🖨️</text>
-        <text class="role-btn-text">本地打印任务</text>
-        <text class="role-btn-arrow">›</text>
-      </view>
-    </view>
-
     <!-- 管理员：存储统计 -->
     <view class="storage-section admin-collapsible {{userRole === 'admin' && storageStats ? 'admin-expanded' : ''}}">
       <view class="section-title">

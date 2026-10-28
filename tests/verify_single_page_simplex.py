@@ -428,9 +428,13 @@ try:
 finally:
     _restore6()
 _pl6 = _plans6[0] if _plans6 else {}
+# 2026-10-28：file_plans 每项还多带一个 `second_rotate`（第 2 趟逐张纸补偿，攒批混排要用），
+# 所以这里按字段判，不再整字典相等 —— 判的仍是"1 页任务不许标成双面配对"。
+_fp6 = (_pl6.get("file_plans") or [{}])[0]
 check("★ ⑥ 攒批单里的 1 页任务 file_plans 标 duplex=False（不再谎称双面任务）",
-      _pl6.get("file_plans") == [{"label": "单页.docx", "pages": [1], "file_pages": [1],
-                                  "duplex": False}],
+      _fp6.get("label") == "单页.docx" and _fp6.get("pages") == [1]
+      and _fp6.get("file_pages") == [1] and _fp6.get("duplex") is False
+      and isinstance(_fp6.get("second_rotate"), bool),
       f"{_pl6.get('file_plans')}")
 check("⑥ 但它仍占 1 张纸、第 2 趟给一个空白占位槽（张数不变，配对结构不破）",
       _pl6.get("sheet_count") == 1 and _pl6.get("pass1_pages") == [1]

@@ -85,7 +85,8 @@ check("estimate_jobs_sheets：单面 3 页 × 2 份 = 6 张（单面不配对）
 
 
 # ============================================================
-# ② 准入判断：空叠永远收；非空叠看容量与装订方向
+# ② 准入判断：空叠永远收；非空叠只剩容量门槛
+#   （2026-10-28 起装订方向不再是门槛：第 2 趟补偿早就是逐张纸的，见 _plan_rotate）
 # ============================================================
 print("\n=== ② 准入判断 admit ===")
 st = ds.DuplexStack(capacity=10)
@@ -101,12 +102,16 @@ a_cap = st.admit(5, True)
 check("再加 5 张超容量 → 拒绝且原因是容量",
       (not a_cap.ok) and a_cap.reason == ds.REASON_CAPACITY, a_cap.reason)
 a_rot = st.admit(1, False)
-check("装订方向不一致 → 拒绝且原因是方向",
-      (not a_rot.ok) and a_rot.reason == ds.REASON_ROTATE, a_rot.reason)
+check("★ 装订方向不一致**也放行**（2026-10-28：逐张纸补偿，不再按方向拒叠）",
+      a_rot.ok, a_rot.reason)
+check("REASON_ROTATE 常量仍在（旧批次清单/旧日志还能读），但 admit 不再产生它",
+      isinstance(ds.REASON_ROTATE, str) and not hasattr(ds, "_UNUSED")
+      and "adm.reason = REASON_ROTATE" not in open(ds.__file__, encoding="utf-8").read())
 check("拒绝文案含容量与已堆张数",
       "放不下" in a_cap.message(st) and "6" in a_cap.message(st), a_cap.message(st))
-check("方向不一致的文案解释『旋转补偿』",
-      "旋转补偿" in a_rot.message(st))
+check("方向不一致不再有拒绝文案（拒的是容量）",
+      a_rot.message(st) == "" or "旋转补偿" not in a_rot.message(st),
+      a_rot.message(st))
 check("total_sheets / remaining / sheet_text",
       st.total_sheets == 6 and st.remaining == 4 and st.sheet_text() == "6/10 张")
 
@@ -736,8 +741,8 @@ st_dir.toggle_taken(1, 0, True)                                        # 撤走�
 check("撤走一单后 total_sheets == present_sheet_count == 3",
       st_dir.total_sheets == 3 == st_dir.present_sheet_count,
       f"{st_dir.total_sheets}/{st_dir.present_sheet_count}")
-check("装订方向仍锁定（撤走不改变本叠方向）→ 反向单仍被拒",
-      st_dir.rotate is True and st_dir.admit(1, False).reason == ds.REASON_ROTATE)
+check("撤走不改变本叠名义方向；反向单**照收**（2026-10-28 逐张纸补偿）",
+      st_dir.rotate is True and st_dir.admit(1, False).ok)
 check("容量文案里的『已堆』用**在叠**张数（不是原始张数）",
       "已堆 3 张" in st_dir.admit(40, True).message(st_dir),
       st_dir.admit(40, True).message(st_dir))

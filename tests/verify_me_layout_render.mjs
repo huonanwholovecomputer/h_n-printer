@@ -3,8 +3,8 @@
  *
  * 为什么需要它：静态脚本 tests/verify_me_layout_order.py 只能证明"源码里的区块顺序对"，
  * 证明不了"用户打开页面第一眼看到的是什么"。本脚本用 Playwright + 真实 www/ 源码 +
- * 桩后端渲染「我」页，量**真实几何与 DOM 顺序**，并同时渲染**重排前**（git HEAD 的
- * index.html）作对照 —— 重排前必须量不到"首屏有我的打印任务"，重排后必须量得到。
+ * 桩后端渲染「我」页，量**真实几何与 DOM 顺序**，并同时渲染**重排前**（重排提交 26e0594 的父提交
+ * 那一版 index.html）作对照 —— 重排前必须量不到"首屏有我的打印任务"，重排后必须量得到。
  *
  * 判据（超管，12 单）：
  *   ① 重排后：「我的打印任务」区块顶边落在首屏（< 视口高）内
@@ -279,14 +279,17 @@ check('④ 访客首屏先看到「验证许可密钥」，它在「账号绑定
       `guestBeforeBind=${afterGuest.geo.guestBeforeBind}, guest.top=${afterGuest.geo.topGuest}px`);
 await afterGuest.shot('重排后_访客首屏', false);
 
-/* ── 场景 3/4：重排前（git HEAD 的 index.html） ──────────────────────── */
-console.log('\n=== 重排前（git HEAD 的 index.html，仅作对照） ===');
+/* ── 场景 3/4：重排前（26e0594^ 那一版 index.html） ────────────────────
+   基线必须**钉死**在重排提交 26e0594 的父提交上：原先写 'HEAD:' 时，重排一旦被提交，
+   对照组的"重排前"就成了重排后，③/⑤ 会永远红（2026-10-28 实测：HEAD 里 orders 已在
+   adminSections 之前）。钉 rev 后语义稳定，与仓库里其他反向验证基线（0ea71f3 等）同一做法。 */
+console.log('\n=== 重排前（26e0594^ 那一版 index.html，仅作对照） ===');
 let oldHtml = null;
 try {
-  oldHtml = execFileSync('git', ['show', 'HEAD:mobile_apps/android_app/www/index.html'],
+  oldHtml = execFileSync('git', ['show', '26e0594^:mobile_apps/android_app/www/index.html'],
     { cwd: REPO, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
 } catch (e) {
-  console.log(`  （取不到 git HEAD 版本，跳过对照：${e.message.split('\n')[0]}）`);
+  console.log(`  （取不到基线版本，跳过对照：${e.message.split('\n')[0]}）`);
 }
 if (oldHtml) {
   overrideHtml = oldHtml;

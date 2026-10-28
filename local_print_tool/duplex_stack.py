@@ -22,8 +22,12 @@
   两种算法在 tests/verify_duplex_stack.py 里被逐组合钉死。
 · 一叠纸一旦开始累积，**中途不能插入任何别的打印输出**（哪怕同单里的单面文件、
   封面页、别的订单）——插进去的纸会让第 2 趟的逆序整体错位、串页。
-  所以本模块只判断「容量够不够 / 装订方向一致不一致」，
-  「现在能不能收」的队列规则由调用方（gui.MainWindow）保证：攒批期间其余打印请求一律排队。
+  所以本模块只判断「容量够不够」，「现在能不能收」的队列规则由调用方
+  （gui.MainWindow）保证：攒批期间其余打印请求一律排队。
+· **装订方向不再是门槛**（2026-10-28）：第 2 趟的 180° 补偿自 2026-10-27 起是**逐张纸**
+  的（`FilePlan.second_rotate` → `print_plan_pass` 的 `rotate_slots`），同一叠里长边/
+  短边可以混排；操作员动作完全相同（整叠原样放回）。旧版按"一叠一种方向"拒绝入叠，
+  现场后果是"横向成绩表 + 竖向申请表"的订单被永久排队、且没有任何事件能放行它。
 
 超时不自动跳过
 --------------
@@ -81,7 +85,19 @@ MIN_WARN_AFTER_SEC = 60
 MAX_WARN_AFTER_SEC = 24 * 3600
 
 REASON_CAPACITY = "capacity"     # 加上这一单会超出出纸槽容量
-REASON_ROTATE = "rotate"         # 装订方向（长/短边）与本叠不一致，不能混打第 2 趟
+REASON_ROTATE = "rotate"         # 【已废弃】旧版"装订方向不一致不能入叠"的原因码；
+                                 # 现在不再产生（逐张纸补偿，见 DuplexStack.admit）。
+                                 # 常量留着是为了让旧批次清单/旧日志还能被读出来。
+
+
+def _plan_rotate(fp: dict):
+    """文件计划里自带的第 2 趟 180° 补偿（True/False/None）。
+
+    None = 旧批次清单（2026-10-27 之前落盘的，没有这个字段）⇒ 让 `plan_passes` 用整叠
+    默认值（`DuplexStack.rotate`）兜底，老清单照样能打对。
+    """
+    v = (fp or {}).get("second_rotate", None)
+    return bool(v) if isinstance(v, bool) else None
 REASON_EMPTY = "empty"           # 没什么可打的
 
 STATE_PRINTING = "pass1_printing"   # 第 1 趟正在打（崩溃后状态未知 → 需要人工确认）
@@ -384,8 +400,10 @@ class StackEntry:
             return []
         return manual_duplex.plan_passes(
             [manual_duplex.FilePlan(str(fp.get("label", "") or ""), pages,
-                                    bool(fp.get("duplex", True)))],
-            copies=1, first=self.first).pass_pages(2)
+                                    bool(fp.get("duplex", True)),
+                                    second_rotate=_plan_rotate(fp))],
+            copies=1, first=self.first,
+            second_rotate_180=bool(self.rotate)).pass_pages(2)
 
     def plan_blank_second(self, index: int) -> bool:
         """该文件计划第 2 趟是否**全为空白占位** ⇒ 这一份的纸可以整份取走。
@@ -479,11 +497,13 @@ class StackEntry:
         """
         files = [manual_duplex.FilePlan(str(fp.get("label", "") or ""),
                                        [int(p) for p in (fp.get("pages") or [])],
-                                       bool(fp.get("duplex", True)))
+                                       bool(fp.get("duplex", True)),
+                                       second_rotate=_plan_rotate(fp))
                  for fp in self.active_plans()]
         if not files:
             return manual_duplex.plan_passes([], first=self.first)
-        return manual_duplex.plan_passes(files, copies=1, first=self.first)
+        return manual_duplex.plan_passes(files, copies=1, first=self.first,
+                                         second_rotate_180=bool(self.rotate))
 
     def ui_lines(self) -> list[dict]:
         """常驻窗用：一行一个文件计划（谁、哪几页、占几张纸、第 2 趟打什么、是否已取走）。"""
@@ -763,11 +783,22 @@ class DuplexStack:
 
     # ── 准入判断 ──
 
-    def admit(self, sheets: int, rotate: bool, unknown_pages: bool = False) -> Admission:
+    def admit(self, sheets: int, rotate: bool = None, unknown_pages: bool = False) -> Admission:
         """判断一张新单能不能收进当前纸叠。
 
         空叠永远能收（哪怕单张数超容量 —— 否则这单永远打不出来）；
-        非空叠要同时满足「装订方向一致」与「容量够」。
+        非空叠**只剩容量**这一条门槛。
+
+        ⚠ 2026-10-28：**装订方向不再是入叠门槛**。旧版（连同 `REASON_ROTATE`）要求整叠
+        「只能有一种旋转补偿」，因为那时第 2 趟的 180° 是**整趟一个开关**；2026-10-27
+        起 `manual_duplex` 改成**逐张纸**自带 `rotate_second`（`print_plan_pass` 用
+        `plan.pass_rotate` / `rotate_slots` 逐面补偿），于是同一叠里长边/短边完全可以混排，
+        操作员动作一模一样（整叠原样放回），只是每张纸按它自己那份文件的装订方向补偿。
+        留着那道门槛的现场后果（2026-10-28 事故）：一张"成绩表横向 + 申请表竖向"的订单
+        被判 `REASON_ROTATE` → 进 `_stack_wait` 排队 → **永远没有东西能把它放行**
+        （纸叠是空的，没有任何收尾事件会触发 drain）⇒ 点了「开始打印」不出纸、
+        还关不掉攒批模式。
+        `rotate` 参数保留只为兼容旧调用（今仅作"本叠名义方向"记录，不参与裁决）。
         """
         sheets = max(0, int(sheets or 0))
         adm = Admission(ok=False, estimated_sheets=sheets, unknown_pages=bool(unknown_pages))
@@ -776,9 +807,6 @@ class DuplexStack:
             return adm
         if self.is_empty:
             adm.ok = True
-            return adm
-        if bool(rotate) != bool(self.rotate):
-            adm.reason = REASON_ROTATE
             return adm
         if self.total_sheets + sheets > self.capacity:
             adm.reason = REASON_CAPACITY
@@ -854,7 +882,8 @@ class DuplexStack:
                 if not pages:
                     continue
                 plans.append(manual_duplex.FilePlan(
-                    str(fp.get("label", "") or ""), pages, bool(fp.get("duplex", True))))
+                    str(fp.get("label", "") or ""), pages, bool(fp.get("duplex", True)),
+                    second_rotate=_plan_rotate(fp)))
             # 偏移按整个单的**原始页数**推进：合并 PDF 是在撤走之前生成的，
             # 单内页码是相对本单合并 PDF 的绝对页码，撤走某一份不会改变其它份的偏移。
             off += max(0, int(e.page_count or 0))
@@ -866,9 +895,13 @@ class DuplexStack:
         只吃在叠的计划：全部被取走时返回一个 0 张纸的**空计划**
         （调用方必须据此走"第 2 趟无内容"的收尾，绝不能真去送纸）。
         """
+        # `second_rotate_180` 只作**兜底**：计划里自带 second_rotate 的（2026-10-28 起的批次）
+        # 一律按自己那份文件的装订方向；旧批次清单没这个字段 ⇒ 用本叠名义方向，与旧版等价
+        # （否则短边机型上续打一份旧清单会把第 2 趟整趟转 180°，背面倒置）。
         return manual_duplex.plan_passes(
             self.file_plans(), copies=1, first=self.first,
-            reverse_second=self.reverse_second)
+            reverse_second=self.reverse_second,
+            second_rotate_180=(True if self.rotate is None else bool(self.rotate)))
 
     def entry_pdfs(self, batch_dir: str) -> list[str]:
         """按加入顺序给出各单合并 PDF 的绝对路径（合并成整叠 PDF 用）。"""

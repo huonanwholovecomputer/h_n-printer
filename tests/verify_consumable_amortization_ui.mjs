@@ -208,6 +208,25 @@ async function runScenario(mutate, withScreenshots) {
     return { ths, rows };
   });
   const rowByName = (state, name) => state.rows.find((r) => r.text.indexOf(name) >= 0) || null;
+  /* 数量格 vs 同行金额格：两个输入框的垂直中心必须一致。
+     2026-10-27 现场：单价 / 「填数量后按月摊销」那行小字参与文档流 ⇒ 数量格比同行其它格高，
+     整格垂直居中把输入框顶上去，与 日期 / 金额 / 代付人 那一排错位（用户截图框住的正是这里）。 */
+  const qtyAlign = () => page.evaluate(() => {
+    const sec = [...document.querySelectorAll('#tab-entry .section')].find((s) => s.textContent.indexOf('采购支出') >= 0);
+    if (!sec) return { err: '没有采购支出区块' };
+    const pick = (field) => {
+      const inp = [...sec.querySelectorAll('input[onchange]')]
+        .find((i) => (i.getAttribute('onchange') || '').indexOf("'" + field + "'") >= 0);
+      if (!inp) return null;
+      const r = inp.getBoundingClientRect();
+      return { cy: r.top + r.height / 2, top: r.top, bottom: r.top + r.height, h: r.height };
+    };
+    const qty = pick('units'), amount = pick('amount');
+    const note = sec.querySelector('.exp-qty-note');
+    const nr = note ? note.getBoundingClientRect() : null;
+    return { qty, amount, noteText: note ? note.textContent.trim() : null,
+             noteTop: nr ? nr.top : null, noteBottom: nr ? nr.bottom : null };
+  });
 
   /* ① 基线：没有「数量」列（两条都是普通采购） */
   const s1 = await entryState();
@@ -233,6 +252,22 @@ async function runScenario(mutate, withScreenshots) {
   chk('②b 「电费」是普通采购 ⇒ 数量列显示「—」（不需要填）',
     (() => { const r = rowByName(s2, '电费'); return r && r.tds.indexOf('—') >= 0; })(),
     JSON.stringify(s2.rows.map((r) => r.tds)));
+  /* ②c 「数量」格的输入框与同一行「金额」输入框垂直对齐（小字不顶起输入框） */
+  const al2 = await qtyAlign();
+  chk('②c 「数量」格输入框与同行「金额」输入框垂直居中对齐（Δ ≤ 2px，小字不再把输入框顶上去）',
+    al2.qty && al2.amount && Math.abs(al2.qty.cy - al2.amount.cy) <= 2,
+    JSON.stringify(al2));
+  chk('②d 小字挂在输入框下方（绝对定位在单元格预留的底部空白里，不压输入框）',
+    al2.noteText && al2.noteTop !== null && al2.noteTop >= al2.qty.bottom - 0.5,
+    JSON.stringify(al2));
+
+  if (withScreenshots) {   // 用户现场那一态：数量空着 + 橙色「填数量后按月摊销」，输入框仍对齐
+    await page.evaluate(() => {
+      const h2 = [...document.querySelectorAll('#tab-entry h2')].find((h) => h.textContent.indexOf('采购支出') >= 0);
+      if (h2) { h2.scrollIntoView({ block: 'start' }); window.scrollBy(0, -80); }
+    });
+    await page.screenshot({ path: path.join(OUT_DIR, '01a-记账-数量列-空值黄字.png'), fullPage: false });
+  }
 
   /* ③ 填 500 张 ⇒ 单价提示 ¥0.2000/张（金额 ¥100 ÷ 500 张） */
   await page.evaluate(() => {
@@ -247,6 +282,13 @@ async function runScenario(mutate, withScreenshots) {
   const r3 = rowByName(s3, '门禁卡');
   chk('③ 填 500 张后显示单价 ¥0.2000/张（¥100 ÷ 500 张）',
     !!r3 && r3.text.indexOf('¥0.2000/张') >= 0, r3 ? r3.text : 'no row');
+  /* ③b units>0 时换成「单价 ¥x/张」小字，布局与 ② 同一条规则 ⇒ 仍不许把输入框顶起 */
+  const al3 = await qtyAlign();
+  chk('③b 单价提示同样不顶起输入框（数量格与金额格仍垂直居中对齐）',
+    al3.qty && al3.amount && Math.abs(al3.qty.cy - al3.amount.cy) <= 2
+    && al3.noteText && al3.noteText.indexOf('单价') >= 0,
+    JSON.stringify(al3));
+
   if (withScreenshots) {
     await page.evaluate(() => {
       const h2 = [...document.querySelectorAll('#tab-entry h2')].find((h) => h.textContent.indexOf('采购支出') >= 0);

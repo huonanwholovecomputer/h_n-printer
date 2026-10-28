@@ -1570,7 +1570,7 @@ check("★ 页号按**文件自己**算（单面 3 页是第 2 个文件：合�
 # ══════════════════════════════════════════════════════════════════════
 # ⑦ 准入：容量阈值 + 装订方向
 # ══════════════════════════════════════════════════════════════════════
-section("⑦ 准入：容量阈值 × 装订方向（纯账本）")
+section("⑦ 准入：容量阈值（装订方向已不再是门槛，2026-10-28）")
 
 _cap = ds.DuplexStack(capacity=10)
 _e1 = ds.StackEntry(seq=1, title="6张", sheet_count=6, rotate=True, state=ds.STATE_DONE)
@@ -1583,9 +1583,12 @@ check("★ 容量：已堆 9 张 + 2 张 > 上限 10 → 拒绝，提示先打�
       _a1.ok and _a2.ok is False and _a2.reason == ds.REASON_CAPACITY
       and "上限 10 张" in _a2.message(_cap),
       f"{_a1.ok}/{_a2.ok}/{_a2.reason}")
-check("★ 装订方向：本叠长边，短边单被拒（一叠只能有一种旋转补偿）",
-      _a3.ok is False and _a3.reason == ds.REASON_ROTATE,
-      _a3.message(_cap)[:30])
+# 2026-10-28：装订方向不再是准入门槛（第 2 趟补偿是逐张纸的，一叠里长边/短边可混排）。
+# 这一单 3 张 + 已堆 9 张 > 上限 10 ⇒ 现在被拦的是**容量**，不再是方向。
+check("★ 装订方向不再拦：短边单被拒的原因只剩容量",
+      _a3.ok is False and _a3.reason == ds.REASON_CAPACITY
+      and "旋转补偿" not in _a3.message(_cap),
+      f"{_a3.reason} / {_a3.message(_cap)[:40]}")
 
 _empty = ds.DuplexStack(capacity=4)
 _a4 = _empty.admit(6, rotate=False)

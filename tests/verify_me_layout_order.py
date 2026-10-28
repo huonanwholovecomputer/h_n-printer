@@ -4,8 +4,8 @@
 ## 为什么要有这个脚本
 
 「我」页原来是**按"功能出现的历史顺序"堆出来**的：身份卡 → 生成许可密钥 → 账号绑定 →
-（访客/普通用户的许可区块）→ 服务器存储 → 防滥用设置 → 历史授权用户 → 本地打印任务 →
-管理管理员 → 已临时授权的普通用户 → 我的打印任务。问题：
+（访客/普通用户的许可区块）→ 服务器存储 → 防滥用设置 → 历史授权用户 → 管理管理员 →
+已临时授权的普通用户 → 我的打印任务。问题：
 
   1. **「我的打印任务」被压在最底部** —— 全页唯一的高频内容（顾客查进度、管理员看自己下的单）
      要滑过 8~9 个区块才够得着（线上实测超管 121 单，第一屏全是管理面板）；
@@ -19,7 +19,10 @@
     → 我的东西（我的打印任务） → 我的设置（账号绑定、检查更新）
     —— 以上个人区全角色可见，且**永远在管理区之前** ——
     → 管理区（仅 admin/super：生成许可密钥 → 已临时授权用户 → 管理管理员
-      → 历史授权用户 → 本地打印任务 → 服务器存储 → 防滥用设置）
+      → 历史授权用户 → 服务器存储 → 防滥用设置）
+
+（2026-10-28 用户要求：管理区的「本地打印任务」卡片是早期测试残留，两端入口都已删除；
+ 该页只保留「历史授权用户」一张角色入口卡片。）
 
 ## 判据
 
@@ -57,12 +60,11 @@ MP_ANCHORS = [
     ("tempusers", "    <!-- 管理员/超级管理员：已临时授权的普通用户（位于管理管理员下方；管理员同样位置） -->"),
     ("admins", "    <!-- 超级管理员：管理员列表 -->"),
     ("authusers", "    <!-- 管理员/超级管理员：历史授权用户 -->"),
-    ("local", "    <!-- 管理员/超级管理员：本地打印任务 -->"),
     ("storage", "    <!-- 管理员：存储统计 -->"),
     ("security", "    <!-- 管理员：防滥用设置（DDoS 防护阈值） -->"),
 ]
 MP_DESIGN = ["card", "guest", "userlic", "orders", "bind",
-             "keys", "tempusers", "admins", "authusers", "local", "storage", "security"]
+             "keys", "tempusers", "admins", "authusers", "storage", "security"]
 MP_REGION_START = '      <view class="container">'
 MP_REGION_END = "  <!-- 昵称选择弹窗 -->"
 
@@ -78,7 +80,7 @@ APP_ANCHORS = [
     ("keys", "            <!-- 生成许可密钥 -->"),
     ("tempusers", "            <!-- 已临时授权的普通用户 -->"),
     ("admins", "            <!-- 超级管理员：管理员列表 -->"),
-    ("role", "            <!-- 角色入口（对齐小程序：两张独立卡片） -->"),
+    ("role", "            <!-- 角色入口（对齐小程序：历史授权用户） -->"),
     ("storage", "            <!-- 服务器存储 -->"),
     ("security", "            <!-- 防滥用设置 -->"),
 ]
@@ -99,7 +101,6 @@ MP_MARK = {
     "tempusers": 'wx:for="{{tempUsers}}"',
     "admins": 'wx:for="{{admins}}"',
     "authusers": 'bindtap="onGoAuthorizedUsers"',
-    "local": 'bindtap="onGoLocalOrders"',
     "storage": 'bindtap="onSaveRetention"',
     "security": 'class="security-summary-card',
 }
@@ -121,10 +122,10 @@ APP_MARK = {
 
 # APP 我页 id 快照（搬漏/搬重/误删都会改变这个集合）
 APP_ID_SNAPSHOT = {
-    "activeKeyCount", "activeKeys", "adminBlockAuth", "adminBlockKeys", "adminBlockLocal",
+    "activeKeyCount", "activeKeys", "adminBlockAuth", "adminBlockKeys",
     "adminBlockSecurity", "adminBlockStorage", "adminCount", "adminList", "adminSections",
     "adminsBlock", "avatarBtn", "avatarImg", "avatarInput", "bindEntryDesc", "btnAuthorizedUsers",
-    "btnBindAccount", "btnCheckUpdate", "btnLocalOrders", "deleteAllFilesBtn", "generateKeyBtn",
+    "btnBindAccount", "btnCheckUpdate", "deleteAllFilesBtn", "generateKeyBtn",
     "guestSection", "keyTypeAdmin", "keyTypeRow", "keyTypeSlider", "keyTypeTemp", "licenseBadge",
     "licenseBadgeKey", "licenseBadgeValidity", "licenseDetail", "licenseDetailCreated",
     "licenseDetailCreator", "licenseDetailExpires", "licenseDetailKey", "licenseDetailStatus",
@@ -150,7 +151,6 @@ MP_GATES = [
     'wx:if="{{isSuperAdmin}}" class="license-section"',
     'wx:if="{{userRole === \'admin\'}}" class="license-section"',
     "role-actions admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}",
-    "role-actions admin-collapsible {{userRole === 'admin' || isSuperAdmin ? 'admin-expanded' : ''}}",
     "storage-section admin-collapsible {{userRole === 'admin' && storageStats ? 'admin-expanded' : ''}}",
     "security-section admin-collapsible {{userRole === 'admin' && securityConfig ? 'admin-expanded' : ''}}",
 ]
@@ -160,7 +160,6 @@ APP_JS_GATES = [
     "setBlock('adminBlockStorage', isAdmin && !!meState.storageStats)",
     "setBlock('adminBlockSecurity', isAdmin && !!meState.securityConfig)",
     "setBlock('adminBlockAuth', isAdmin)",
-    "setBlock('adminBlockLocal', isAdmin || !!state.isSuperAdmin)",
     "document.getElementById('guestSection').style.display = state.role === 'guest' ? '' : 'none'",
     "userLic.style.display = state.role === 'user' ? '' : 'none'",
     "document.getElementById('adminsBlock').style.display = state.isSuperAdmin ? '' : 'none'",
@@ -226,7 +225,7 @@ def evaluate(mp_text, app_text, app_js):
          % (app_order, APP_DESIGN))
 
     # ② 「我的打印任务」不再垫底：必须在全部管理区块之前
-    mgmt_mp = [k for k in MP_DESIGN if k in ("keys", "tempusers", "admins", "authusers", "local",
+    mgmt_mp = [k for k in MP_DESIGN if k in ("keys", "tempusers", "admins", "authusers",
                                              "storage", "security")]
     for f in (mp_order, app_order):
         o = f
@@ -247,12 +246,12 @@ def evaluate(mp_text, app_text, app_js):
     mp_shared = [k for k in mp_order if k != "bind" or True]
     app_shared = [k for k in app_order if k not in ("update", "admin_open")]
     app_for_cmp = ["role" if k == "role" else k for k in app_shared]
-    # role = 历史授权用户 + 本地打印任务 两块的合集，展开后按小程序口径比对
+    # role = 「历史授权用户」这一块（本地打印任务入口已于 2026-10-28 删除），按小程序口径比对
     mp_cmp = list(mp_order)
     app_cmp = []
     for k in app_for_cmp:
         if k == "role":
-            app_cmp.extend(["authusers", "local"])
+            app_cmp.append("authusers")
         else:
             app_cmp.append(k)
     want(mp_cmp == app_cmp,

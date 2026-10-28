@@ -111,6 +111,216 @@ def _get_proxy_session():
                 _proxy_session = s
     return _proxy_session
 
+
+# ── 外部打印监视账本 → 收支清算「订单明细」的只读数据源（GET /api/local/external_prints）──
+# 只返回账本里**已处理**（status == print_watch.STATUS_CONFIRMED）的记录：待处理(new)的页数/
+# 单双面还没确认，忽略(ignored)的已明确不收钱 —— 两者进「订单明细」都会把账做歪。
+# 金额一律 print_watch.amount_for（内部走 printer_config.calc_cost，与工具自身同一口径）；
+# 它返回 None（页数未知 / 单双面未确认）的记录**跳过并计入 skipped**，绝不猜、也不按 0 元入账。
+# 订单行与云端 revenue 的订单对象同构（前端不改口径函数即可复用），另带 external=true 便于标注。
+EXTERNAL_OWNER_TTL = 60.0                 # 本机绑定所有者的缓存时长（秒）
+_external_owner_cache: dict = {}          # "api_url|client_id" → (取到的时刻, owner_name)
+_external_owner_lock = threading.Lock()
+
+
+def _list_device_owner(client_id: str, api_url: str, token: str) -> str:
+    """向后端 GET {api_url}/api/printer/devices，取 client_id 那台设备的 owner_name。
+
+    失败（离线/令牌失效/形状不认识）一律返回 "" —— 由调用方当作"未绑定"照常出订单，
+    绝不因为查不到归属就让整页订单明细失败。
+    """
+    resp = _get_proxy_session().get(
+        "%s/api/printer/devices" % api_url,
+        # S2-10 ⑥：出站令牌走请求头（与 /api/printer_status 同一套写法）
+        headers={"X-Printer-Token": token},
+        timeout=_PROXY_TIMEOUT,
+    )
+    if not resp.ok:
+        return ""
+    data = resp.json()
+    devices = data.get("devices") if isinstance(data, dict) else data
+    if not isinstance(devices, list):
+        return ""
+    for dev in devices:
+        if not isinstance(dev, dict):
+            continue
+        if str(dev.get("client_id") or "") == client_id:
+            return str(dev.get("owner_name") or "").strip()
+    return ""                              # 本机还没在云端绑定/注册过
+
+
+def fetch_device_owner(client_id: str = "", api_url: str = "", token: str = "",
+                       now: float = None, lister=None) -> str:
+    """本机绑定设备的 owner_name；未配置云端/未绑定/查询失败一律 ""（订单照常返回）。
+
+    结果（含失败）缓存 EXTERNAL_OWNER_TTL 秒：翻页不该每请求都打一次后端，失败也不该
+    被放大成请求风暴。lister 可注入（验收脚本用它，一次真网都不发）。
+    """
+    client_id = str(client_id or "").strip()
+    api_url = str(api_url or "").strip().rstrip("/")
+    token = str(token or "")
+    if not client_id or not api_url:
+        return ""                          # 本地模式/未接云端：不猜、也不必缓存
+    key = "%s|%s" % (api_url, client_id)
+    ts = time.time() if now is None else float(now)
+    with _external_owner_lock:
+        hit = _external_owner_cache.get(key)
+        if hit and ts - hit[0] < EXTERNAL_OWNER_TTL:
+            return hit[1]
+    try:
+        owner = str((lister or _list_device_owner)(client_id, api_url, token) or "").strip()
+    except Exception as e:
+        logger.warning("查询本机绑定所有者失败（%s），本次按未绑定展示", type(e).__name__)
+        owner = ""
+    with _external_owner_lock:
+        _external_owner_cache[key] = (ts, owner)
+    return owner
+
+
+def load_external_print_items(path: str = "") -> list:
+    """读外部打印监视账本（默认真实账本）→ ExternalPrint 列表。
+
+    账本不存在 / JSON 损坏（断电写半截）一律返回空列表并记 warning，**绝不抛给上层**：
+    这是只读展示接口，坏账本不该让整页收支清算 500。path 只给验收脚本用。
+    """
+    try:
+        import print_watch as _pw
+        store = _pw.ExternalPrintStore(path)
+        ledger = getattr(store, "path", "") or path
+        if ledger and not os.path.exists(ledger):
+            logger.warning("外部打印账本不存在（%s），按空账本返回", os.path.basename(ledger))
+            return []
+        return store.load()
+    except Exception as e:
+        logger.warning("读取外部打印账本失败（%s），按空账本返回", type(e).__name__)
+        return []
+
+
+def load_external_prices():
+    """外部打印的 (单面单价, 双面单价)，一律取配置（改价金额跟着变）。
+
+    读不到配置（极端打包/权限）时退回 PrinterConfig 的类默认值并记 warning：
+    单价硬编码会让"配置改了价、账不跟着变"再犯一次。
+    """
+    from printer_config import PrinterConfig
+    try:
+        cfg = PrinterConfig.load(_paths.config_path())
+        return float(cfg.simplex_price), float(cfg.duplex_price)
+    except Exception as e:
+        logger.warning("读取打印单价失败（%s），本次按 PrinterConfig 默认单价结算",
+                       type(e).__name__)
+        cfg = PrinterConfig()
+        return float(cfg.simplex_price), float(cfg.duplex_price)
+
+
+def _external_order_row(item, amount: float, owner_name: str) -> dict:
+    """一条外部打印记录 → 与云端 revenue 同构的订单行（单文件）。
+
+    页数/张数口径与云端一致：effective_pages=pages，sheets=ceil(pages/2)（双面）/ pages（单面），
+    total_* 都已乘份数。
+
+    files[0].total_price 是**该文件含份数的总金额**（与云端/本地 order_files[].total_price 同义：
+    结算页 _orderMoney 把各文件金额相加，再用「订单 total_price − 文件小计」反推附加服务费；
+    这里若放「每份金额」，copies>1 时差额会被误当成附加服务费）。
+    """
+    import print_watch as _pw
+    job_id = int(getattr(item, "job_id", 0) or 0)
+    detected_at = str(getattr(item, "detected_at", "") or "")
+    pages = max(int(getattr(item, "pages", 0) or 0), 0)
+    copies = int(getattr(item, "copies", 1) or 1) or 1
+    duplex = str(getattr(item, "duplex", "") or "")
+    sheets = (pages + 1) // 2 if duplex == _pw.DUPLEX_ON else pages
+    day = detected_at[:10].replace("-", "")
+    clock = detected_at[11:19].replace(":", "")
+    order_number = ("EXT-%s-%s-%d" % (day, clock, job_id)
+                    if len(day) == 8 and len(clock) == 6 else "EXT-%d" % job_id)
+    return {
+        # 带前缀的字符串：**绝不是纯数字**（本地/云端订单 id 是整数，纯数字会让前端按 id 去重/取数）
+        "order_id": "ext:%d:%s" % (job_id, detected_at),
+        "order_number": order_number,
+        "created_at": detected_at,
+        "total_price": round(float(amount), 2),
+        "total_page_count": pages * copies,
+        "total_sheet_count": sheets * copies,
+        "owner_name": owner_name,
+        "is_admin_print": False,
+        "source": "external",
+        "openid": "local",
+        "nickname": "",
+        "auto_print": False,
+        "schedule_mode": None,
+        "delivery_enabled": False,
+        "urgency": "低",
+        "cover_page": False,
+        "status": "sent",                  # 已处理 = 纸已经打出来了
+        "unsynced": False,
+        "sync_status": "synced",
+        "external": True,
+        "files": [{
+            "id": "ext-%d" % job_id,
+            "file_name": str(getattr(item, "document", "") or ""),
+            "copies": copies,
+            "page_count": pages,
+            "duplex": duplex,
+            "page_range": "",
+            "total_price": round(float(amount), 2),
+            "status": "sent",
+            "is_free": False,
+            "effective_pages": pages,
+            "sheets": sheets,
+            "total_pages": pages * copies,
+            "total_sheets": sheets * copies,
+        }],
+    }
+
+
+def build_external_orders(items, simplex_price, duplex_price, owner_name: str = "",
+                          start_date: str = "", end_date: str = ""):
+    """账本记录 → (订单行列表, 被跳过的条数)。纯函数，不碰 HTTP / 账本 / 配置。
+
+    过滤顺序：只留「已处理」→ 日期（detected_at 前 10 位做 YYYY-MM-DD 字符串比较）→ 算钱。
+    算不出金额（amount_for 回 None）的**跳过并计数**；日期不命中的直接不返回、不计数
+    （那不是"算不出钱"，只是不在这次查询的区间里）。
+    """
+    import print_watch as _pw
+    orders, skipped = [], 0
+    start_date = str(start_date or "").strip()
+    end_date = str(end_date or "").strip()
+    for item in items or ():
+        if str(getattr(item, "status", "") or "") != _pw.STATUS_CONFIRMED:
+            continue
+        detected_at = str(getattr(item, "detected_at", "") or "")
+        day = detected_at[:10]
+        if start_date and day < start_date:
+            continue
+        if end_date and day > end_date:
+            continue
+        amount = _pw.amount_for(item, simplex_price, duplex_price)
+        if amount is None:
+            skipped += 1
+            continue                       # 页数/单双面未知 ⇒ 不进明细，也绝不按 0 元算
+        orders.append(_external_order_row(item, float(amount), str(owner_name or "")))
+    orders.sort(key=lambda o: str(o.get("created_at") or ""), reverse=True)   # 新的在前
+    return orders, skipped
+
+
+def build_external_prints_payload(items, simplex_price, duplex_price, owner_name: str = "",
+                                  start_date: str = "", end_date: str = "") -> dict:
+    """GET /api/local/external_prints 的响应体。序列化特意从 handler 里拿出来，
+    验收脚本据此逐键核对契约，不必起 HTTP、也不必连后端。"""
+    orders, skipped = build_external_orders(items, simplex_price, duplex_price,
+                                            owner_name, start_date, end_date)
+    return {
+        "success": True,
+        "orders": orders,
+        "count": len(orders),
+        "skipped": skipped,
+        "simplex_price": float(simplex_price),
+        "duplex_price": float(duplex_price),
+        "owner_name": str(owner_name or ""),
+    }
+
+
 # 静态文件根目录（支持 PyInstaller 打包和开发环境）
 if getattr(sys, "frozen", False):
     _STATIC_DIR = os.path.join(sys._MEIPASS, "finance")
@@ -465,7 +675,7 @@ class FinanceSecurity:
         except Exception as e:
             # 非 Windows / 没装 pywin32 / 服务账户 —— 降级但要让人一眼看见
             logger.warning(
-                "财务完整性：Windows DPAPI 不可用（%s）→ 已**降级**为随机密钥文件 %s"
+                "财务完整性：Windows DPAPI 不可用（%s）→ 已降级为随机密钥文件 %s"
                 "（0600 权限，位于当前用户配置目录；保护强度低于 DPAPI，仅本机用户可读）",
                 type(e).__name__, os.path.basename(self.key_file))
             self._write_bytes(self.key_file, _RAW_KEY_MAGIC + key)
@@ -1502,6 +1712,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/orders":
             return self._handle_local_orders(parsed.query)
 
+        # 外部打印监视账本里「已处理」的作业（只读；收支清算「订单明细」的合并数据源）
+        if path == "/api/local/external_prints":
+            return self._handle_local_external_prints(parsed.query)
+
         # 默认：静态文件
         return self._serve_static(path)
 
@@ -2116,6 +2330,26 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             return
         # 顶层结构与云端 revenue 一致（前端 renderCloud 只消费 orders）
         self._send_json({"success": True, "data": {"orders": orders}})
+
+    def _handle_local_external_prints(self, query: str = ""):
+        """外部打印监视账本里**已处理**（status=confirmed）的作业 → 与云端 revenue 同构的订单行。
+
+        只读：不写账本、不改状态、不碰云端（owner 查询带 60 秒缓存）。
+        start_date/end_date 均可空，按 detected_at 前 10 位做 YYYY-MM-DD 字符串比较。
+        账本不存在 / JSON 损坏 ⇒ orders=[] + success（**绝不 500**）；页数或单双面未知的记录
+        跳过并计入 skipped（不猜、不按 0 元算）。金额口径/过滤/序列化都在 build_external_* 里，
+        这里只负责取账本、取单价、取 owner。
+        """
+        qs = urllib.parse.parse_qs(query)
+        start_date = (qs.get("start_date", [""])[0] or "").strip()
+        end_date = (qs.get("end_date", [""])[0] or "").strip()
+        items = load_external_print_items()
+        simplex_price, duplex_price = load_external_prices()
+        owner_name = fetch_device_owner(getattr(self, "client_id", ""),
+                                        getattr(self, "api_url", ""),
+                                        getattr(self, "token", ""))
+        self._send_json(build_external_prints_payload(
+            items, simplex_price, duplex_price, owner_name, start_date, end_date))
 
     def _handle_post_data(self):
         """写入本地数据文件：路径固定为默认数据文件（不支持客户端指定路径），

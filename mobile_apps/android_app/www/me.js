@@ -177,7 +177,6 @@ function refreshMeUI() {
 function updateRoleActions() {
   const admin = state.role === 'admin';
   document.getElementById('btnAuthorizedUsers').style.display = admin ? '' : 'none';
-  document.getElementById('btnLocalOrders').style.display = admin ? '' : 'none';
   document.getElementById('adminsBlock').style.display = state.isSuperAdmin ? '' : 'none';
   document.getElementById('tempUsersBlock').style.display = admin ? '' : 'none';
   document.getElementById('keyTypeRow').style.display = state.isSuperAdmin ? '' : 'none';
@@ -196,7 +195,6 @@ function updateAdminCollapsed() {
   setBlock('adminBlockStorage', isAdmin && !!meState.storageStats);
   setBlock('adminBlockSecurity', isAdmin && !!meState.securityConfig);
   setBlock('adminBlockAuth', isAdmin);
-  setBlock('adminBlockLocal', isAdmin || !!state.isSuperAdmin);
   measureAll(150);
 }
 
@@ -358,7 +356,6 @@ function setupMeButtons() {
   document.getElementById('btnBindAccount').addEventListener('click', openBindView);
   const btnCheckUpdate = document.getElementById('btnCheckUpdate');
   if (btnCheckUpdate) btnCheckUpdate.addEventListener('click', () => checkAppUpdate(true));
-  document.getElementById('btnLocalOrders').addEventListener('click', () => openUserOrdersView({ source: 'local', nickname: '本地打印任务' }));
   document.getElementById('adminList').addEventListener('click', (e) => {
     const rm = e.target.closest('[data-remove-admin]');
     if (rm) { e.stopPropagation(); removeAdmin(rm.dataset.removeAdmin); return; }

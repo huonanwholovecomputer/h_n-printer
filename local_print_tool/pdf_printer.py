@@ -291,6 +291,27 @@ def get_docx_orientation(docx_path: str) -> str:
         return ""
 
 
+def _pdf_page_rotation(page) -> int:
+    """读取页面的**实际** /Rotate（含从 /Pages 节点继承的值），归一化到 0/90/180/270。
+
+    ⚠ 这是 2026-10-28 现场 bug 的根因：page.mediabox 是**未旋转**的物理页面框，
+    而 /Rotate 90 会让整页在阅读器里转 90° 显示。手机扫描 / 部分学校系统导出的 PDF
+    就是「A4 竖 mediabox(595×842) + /Rotate 90」= 看起来横版 —— 只看 mediabox 会判成竖版。
+    PyPDF2 的 page.get("/Rotate") 不保证做继承，所以页上没有时手动沿 /Parent 往上找。
+    """
+    try:
+        val = page.get("/Rotate", None)
+        node = page.get("/Parent", None) if val is None else None
+        depth = 0
+        while val is None and node is not None and depth < 32:
+            val = node.get("/Rotate", None)
+            node = node.get("/Parent", None) if val is None else None
+            depth += 1
+        return int(val) % 360 if val is not None else 0
+    except Exception:
+        return 0
+
+
 def count_pdf_pages(pdf_path: str) -> int:
     """统计 PDF 文件页数，失败返回 0。"""
     return get_pdf_info(pdf_path).get("page_count", 0)
@@ -299,6 +320,9 @@ def count_pdf_pages(pdf_path: str) -> int:
 def get_pdf_info(pdf_path: str) -> dict:
     """
     获取 PDF 信息：页数 + 页面方向。
+
+    方向按**阅读器里看到的样子**判：MediaBox 的宽高先按 /Rotate 折算（见
+    _pdf_page_rotation），否则「A4 竖 mediabox + /Rotate 90」的扫描件会被判成竖版。
 
     Returns:
         {
@@ -322,6 +346,9 @@ def get_pdf_info(pdf_path: str) -> dict:
                 continue
             w = float(mb.width)
             h = float(mb.height)
+            if _pdf_page_rotation(page) % 180:
+                # /Rotate 90/270：显示方向被转了 90°，宽高互换后再判朝向
+                w, h = h, w
             if w > h:
                 has_landscape = True
             else:
@@ -375,6 +402,79 @@ def _get_pdf_info_via_fitz(pdf_path: str) -> dict:
     except Exception as e2:
         logger.warning(f"fitz 读取 PDF 信息也失败 ({pdf_path}): {e2}")
         return {"page_count": 0, "orientation": "unknown"}
+
+
+# ── 末尾空白页检测（2026-10-28 用户需求）──────────────────────────────
+# 现场：学校系统导出的 .doc/.docx 申请表常在最后多带一张完全空白的页（表格后面那个
+# 空段落/分页符撑出来的），打出来就是一张白纸。只查**末尾连续**空白页 —— 中间的
+# 留白页（装订留白、章节分隔）不动，用户没要求也没有把握替人判断。
+BLANK_PAGE_MAX_INK = 0.0002      # 暗像素占比门槛：A4@72dpi ≈ 100 px
+BLANK_PAGE_MIN_INK_PX = 40       # 绝对容差：再小的墨点按"扫描噪声/微小污点"算空白
+BLANK_SCAN_MAX_PAGES = 8         # 最多往回扫几页（末尾 1~2 页是常态）
+
+
+def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
+    """这一页是不是"白纸一张"。只认两路判据（实测余量极大，见下）：
+
+    · **页面文字为空** —— 有页脚页码、只有一两个字符都算有内容（那确实会印出来）；
+    · **72dpi 灰度栅格化后暗像素占比 < max_ink** —— 栅格看的是"最终印出来什么样"，
+      所以白底矩形、空图层、扫描件整页是图都不影响判定。
+
+    2026-10-28 现场标定（打印列表真实文件，A4@72dpi = 501832 px）：
+      真空白页 0 个暗像素；最"空"的内容页 9483 个（1.89%，只有 191 个字符）；
+      普通内容页 8.8%~26.5%。门槛取 0.02%（≈100 px）离两头都有 100 倍余量。
+    """
+    try:
+        if page.get_text("text").strip():
+            return False
+    except Exception:
+        return False            # 连文字都读不出来 ⇒ 按"有内容"处理（fail-open，绝不误删）
+    try:
+        import fitz
+        pix = page.get_pixmap(dpi=72, colorspace=fitz.csGRAY)
+        data = pix.samples
+    except Exception:
+        return False
+    if not data:
+        return True
+    dark = sum(1 for v in data if v < 245)
+    # 两道容差取大：占比口径（页面越大容差越大）+ 绝对值 40 px（≈1mm²，挡扫描噪点）。
+    # 任何**会印出来**的内容（一个字符/一条线/一个图章）都远超这个量级。
+    return dark <= max(float(BLANK_PAGE_MIN_INK_PX), float(max_ink) * len(data))
+
+
+def detect_trailing_blank_pages(pdf_path: str, max_scan: int = BLANK_SCAN_MAX_PAGES) -> int:
+    """末尾**连续**空白页的页数（0 = 末页有内容 / 打不开文件）。
+
+    从最后一页往回想，遇到第一张有内容的页就停 —— 只处理"最后的空白页"，且不必为一个
+    200 页的扫描件把每页都栅格化。任何异常一律返回 0：检测不可用绝不能妨碍打印。
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        logger.debug(f"空白页检测打不开 {pdf_path}: {e}")
+        return 0
+    try:
+        n = len(doc)
+        if n <= 0:
+            return 0
+        limit = max(0, int(max_scan))
+        count = 0
+        for pno in range(n - 1, max(-1, n - 1 - limit), -1):
+            if page_is_blank(doc[pno]):
+                count += 1
+            else:
+                break
+        return count
+    except Exception as e:
+        logger.debug(f"空白页检测失败 {pdf_path}: {e}")
+        return 0
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -1349,6 +1449,11 @@ def _print_pdf_native(
             print(f"[GDI] 渲染策略: 按设备最终像素 1:1 渲染（零缩放、零重采样）")
 
         title = os.path.basename(pdf_path)
+        try:  # 加 HN| 前缀：外部打印监视据此排除自家作业（导入失败就用原标题，绝不影响打印）
+            from print_watch import tag_self_title
+            title = tag_self_title(title)
+        except Exception:
+            pass
         hdc.StartDoc(title)
         started = True
         print(f"[GDI] StartDoc 完成，开始逐页渲染...")
@@ -1765,6 +1870,14 @@ def _print_via_sumatra(
         cmd += ["-print-settings", settings]
 
     cmd.append(os.path.abspath(pdf_path))
+
+    # SumatraPDF 自己起 StartDoc，作业名取自 PDF 文件名 —— 加不了 HN| 前缀，只能先登记
+    # 这个名字（TTL 20 分钟），否则外部打印监视会把它当成外部作业再记一遍账（同一单收两遍钱）。
+    try:
+        from print_watch import note_self_job
+        note_self_job(os.path.basename(pdf_path))
+    except Exception:
+        pass
 
     print(f"[SumatraPDF] 命令: {' '.join(cmd)}")
     logger.info(f"SumatraPDF 执行: {' '.join(cmd)}")

@@ -522,14 +522,20 @@ check("★ 容量拒绝的文案点明已堆/还需/上限",
       "4" in win._stack_wait[-1]["reason"] and "上限" in win._stack_wait[-1]["reason"],
       win._stack_wait[-1]["reason"])
 
-# 3.6 装订方向闸门：短边请求 → 拒（一叠只能一种旋转补偿）
+# 3.6 装订方向**不再**是闸门（2026-10-28）：第 2 趟补偿是逐张纸的，长边/短边可以混排。
+#     ① 容量够时必须能入叠（旧实现这里被 REASON_ROTATE 拒，正是 13:34 现场那个死锁）；
+#     ② 现在容量压在 4 张、纸叠已 4 张 ⇒ 拦它的只能是**容量**，理由里不许再提装订方向。
 jobS = make_job(PDF2, "on", mode="short-edge", name="S.pdf", task_id=105, order_id=15)
+win._stack.capacity = 90
+_ok_dir, _why_dir, _sh_dir, _unk_dir = win._admit_stack_entry([jobS])
+check("★ 容量够时短边单能入叠（装订方向不再是门槛）", _ok_dir, _why_dir)
+win._stack.capacity = 4
 _prep()
 okS = win._start_print_worker([jobS], tab_key="1")
-check("★ 装订方向不一致 → 拒绝入叠并排队",
+check("★ 短边请求被拦只因容量（理由里不再出现『装订方向』）",
       okS is True and any(r["jobs"][0] is jobS for r in win._stack_wait)
-      and "装订方向" in win._stack_wait[-1]["reason"],
-      f"{win._stack_wait[-1]['reason'][:30]}")
+      and "装订方向" not in win._stack_wait[-1]["reason"],
+      f"{win._stack_wait[-1]['reason'][:40]}")
 
 # 3.7 保活：纸叠/排队/在飞的任务都被覆盖
 alive = win._collect_keepalive_tasks()

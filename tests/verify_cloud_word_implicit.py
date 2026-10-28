@@ -63,26 +63,30 @@ def section(title):
 
 
 # ==================== ① 纯函数真值表 ====================
-section("① 隐式规则：cloud_word_com_allowed 四格真值表（行为断言）")
+section("① 隐式规则：cloud_word_com_allowed 只看上传者（2026-10-28 口径）")
 
 from printer_config import (  # noqa: E402
     cloud_word_com_allowed, PrinterConfig, PrintJob,
 )
 
 _CASES = [
-    (True, True, True, "管理员自打 + 管理员上传（唯一应放行）"),
-    (True, False, False, "顾客上传后被人为订正成自打（内容归属看上传者）"),
-    (False, True, False, "管理员上传但订单类型是「接单」（不是自打）"),
-    (False, False, False, "顾客订单 + 顾客上传（普通用户必须强制 LO）"),
+    (True, True, "管理员上传（含普通「接单」订单）→ 放行 COM"),
+    (False, False, "顾客上传 → 强制 LibreOffice（S1-04 默认口径）"),
 ]
-for self_p, up_p, want, label in _CASES:
-    got = cloud_word_com_allowed(self_p, up_p)
-    check(f"真值表（纯函数）：{label} → {'放行 COM' if want else '强制 LO'}",
-          got is want, f"self={self_p} uploader={up_p} got={got}")
+for up_p, want, label in _CASES:
+    got = cloud_word_com_allowed(up_p)
+    check(f"真值表（纯函数）：{label}", got is want, f"uploader={up_p} got={got}")
 
-check("★ 两个入参必须是**关键字**形状（防止把策略参数又加回来）",
-      cloud_word_com_allowed(admin_self_print=True, uploader_is_admin=True) is True
-      and cloud_word_com_allowed(admin_self_print=False, uploader_is_admin=True) is False)
+# 2026-10-28 口径变化：订单类型（is_admin_print）**不再参与**。旧写法接受两个入参，
+# 现在多传一个必须直接报错 —— 这样"把订单类型当判据"的写法无法悄悄回流。
+check("★ 纯函数只接受 1 个入参（旧的 admin_self_print 位置已不存在）",
+      cloud_word_com_allowed(uploader_is_admin=True) is True)
+_two_arg_raises = False
+try:
+    cloud_word_com_allowed(False, True)      # 旧的两参调用形状
+except TypeError:
+    _two_arg_raises = True
+check("★ 旧的两参调用形状必须报错（防止订单类型判据回流）", _two_arg_raises)
 
 # 设备端真正用的是 PrintWorker._cloud_com_allowed（不是直接调纯函数）—— 空壳对象直调未绑定方法，
 # 不需要 QApplication。有人往方法体里插 `return True` 时，"应强制 LO"的用例必须变红。
@@ -102,17 +106,19 @@ if gui is not None:
         job = PrintJob(admin_self_print=self_print, uploader_is_admin=uploader)
         return gui.PrintWorker._cloud_com_allowed(s, job)
 
-    check("★ 行为：PrintWorker._cloud_com_allowed 两条件齐备才放行",
+    check("★ 行为：PrintWorker._cloud_com_allowed 只看上传者",
           _gui_allow(True, True) is True
           and _gui_allow(True, False) is False
-          and _gui_allow(False, True) is False
           and _gui_allow(False, False) is False)
+    check("★ 行为：订单类型（admin_self_print）**不影响**结论 —— "
+          "现场 HN20261028-0002 就是「管理员上传 + 普通接单」被旧规则判成强制 LO",
+          _gui_allow(False, True) is True)
     check("★ 行为：PrintWorker 不再读任何「本机策略」属性（旧 _cloud_word_engine 已删）",
           not hasattr(_SelfStub(), "_cloud_word_engine"))
     # 变异自证：把判定函数换成无条件 True，真值表必须红
     _orig_pred = gui.cloud_word_com_allowed
     gui.cloud_word_com_allowed = lambda *a, **kw: True
-    _mut_red = not (_gui_allow(False, True) is False)
+    _mut_red = not (_gui_allow(False, False) is False)
     gui.cloud_word_com_allowed = _orig_pred
     check("★ 变异「判定恒 True」→ 真值表必须变红（证明行为断言不是恒真）", _mut_red)
 
@@ -236,28 +242,60 @@ def _p_backend_pull(src):
     return '"uploader_is_admin": is_admin_uploader(task.get("openid") or ""),' in src
 
 
+def _gui_allow_body(src):
+    """取出 `_cloud_com_allowed` 的函数体（到下一个 `def ` 为止），供谓词与变异共用。
+
+    判定"订单类型是否参与"时必须**先去掉注释与 docstring**：方法的 docstring 里会写
+    到 `admin_self_print`（解释为什么不再看它），拿原文判定会误红。
+    """
+    m = re.search(r"def _cloud_com_allowed\(self,\s*job\).*?\n(?=\s{4}def )", src, re.S)
+    if not m:
+        return ""
+    body = re.sub(r'""".*?"""', "", m.group(0), flags=re.S)
+    return "\n".join(ln for ln in body.splitlines() if not ln.strip().startswith("#"))
+
+
 def _p_gui_allow(src):
-    """放行位：纯函数 + **恰好两个位**（不再有任何策略参数）。"""
-    return ("def _cloud_com_allowed" in src
-            and bool(re.search(r"return cloud_word_com_allowed\(\s*\n\s*"
-                               r"getattr\(job, \"admin_self_print\", False\),\s*\n\s*"
-                               r"getattr\(job, \"uploader_is_admin\", False\)\)", src))
+    """放行位：纯函数 + **只看上传者**（不看订单类型、没有任何策略参数）。"""
+    body = _gui_allow_body(src)
+    return (bool(body)
+            and "cloud_word_com_allowed(getattr(job, \"uploader_is_admin\", False))" in body
+            and "admin_self_print" not in body
             and "self._cloud_word_engine" not in src)
 
 
 def _p_gui_preconvert(src):
     return bool(re.search(r"allow_cloud_com=cloud_word_com_allowed\(\s*\n\s*"
-                          r"getattr\(task,\s*'is_admin_print',\s*False\),\s*\n\s*"
                           r"getattr\(task,\s*'uploader_is_admin',\s*False\)\)", src))
+
+
+def _p_doc_cache_guard(src):
+    """`.doc` 缓存身份缺陷的守卫：放行 COM + 缓存无引擎身份 ⇒ 不采纳既有缓存。
+
+    按位置切片而不是正则：条件本身跨行且带括号（`(".doc", ".docx")`），正则会被内层右括号
+    提前截断，谓词就成了恒真。
+    """
+    i = src.find("_skip_cache_for_com")
+    if i < 0:
+        return False
+    chunk = src[i:i + 500]
+    return ("_com_allowed" in chunk and "not _cache_identity_known" in chunk
+            and "_cache_identity_known = bool(cache_engine)" in src
+            and 'cached_pdf = ""' in src)
 
 
 check("★ 后端：socket push 通道用 is_admin_uploader 算 uploader_is_admin",
       _p_backend_push(app_src))
 check("★ 后端：HTTP pull 通道用 is_admin_uploader 算 uploader_is_admin",
       _p_backend_pull(app_src))
-check("★ 本地工具：放行位走纯函数、只读「自打 + 上传者」两个位",
+check("★ 本地工具：放行位走纯函数、只读「上传者」一个位（订单类型不参与）",
       _p_gui_allow(gui_src))
-check("本地工具：云端任务预转换按两个位给 allow_cloud_com", _p_gui_preconvert(gui_src))
+check("本地工具：云端任务预转换只按上传者给 allow_cloud_com", _p_gui_preconvert(gui_src))
+check("★ 本地工具：`.doc` 的「无引擎身份缓存」不再挡住 COM（2026-10-28 修的缺陷）",
+      _p_doc_cache_guard(gui_src))
+check("★ 页数分析路径不再把 Office 产物写进打印缓存（.doc 的 LO 版本会被打印路径复用）",
+      cc_src.count("self._save_pdf_to_cache(") == 1,
+      f"出现 {cc_src.count('self._save_pdf_to_cache(')} 次（只应剩 .pdf 下载那一处）")
 check("本地工具：安全口径默认值 False（converter 闸门仍在）",
       "if from_cloud and ext in COM_OFFICE_EXTS and not allow_cloud_com:" in conv_src
       and "allow_cloud_com: bool = False" in conv_src)
@@ -298,18 +336,29 @@ _mut = app_src.replace('"uploader_is_admin": is_admin_uploader(task.get("openid"
 check("B2 pull 通道恒 False（管理员单永远进不了 COM）→ 判据变红",
       _mut != app_src and not _p_backend_pull(_mut))
 
-_mut = gui_src.replace('getattr(job, "uploader_is_admin", False))', '            )')
-check("B3 放行位不再看 uploader_is_admin（顾客上传被订正成自打就放行）→ 判据变红",
+_mut = gui_src.replace('cloud_word_com_allowed(getattr(job, "uploader_is_admin", False))',
+                       "True")
+check("B3 放行位恒 True（顾客上传也进 COM）→ 判据变红",
       _mut != gui_src and not _p_gui_allow(_mut))
 
-_mut = gui_src.replace('getattr(job, "admin_self_print", False),', '')
-check("B4 放行位不再看 is_admin_print（顾客单也会被放行）→ 判据变红",
+_mut = gui_src.replace(
+    'cloud_word_com_allowed(getattr(job, "uploader_is_admin", False))',
+    ('cloud_word_com_allowed(getattr(job, "admin_self_print", False), '
+     'getattr(job, "uploader_is_admin", False))'))
+check("B4 把订单类型判据塞回放行位（旧口径复活）→ 判据变红",
       _mut != gui_src and not _p_gui_allow(_mut))
 
-_mut = gui_src.replace("cloud_word_com_allowed(\n            getattr(job",
-                       "cloud_word_com_allowed(\n            'libreoffice',\n            getattr(job")
+_mut = gui_src.replace(
+    'cloud_word_com_allowed(getattr(job, "uploader_is_admin", False))',
+    'cloud_word_com_allowed("libreoffice", getattr(job, "uploader_is_admin", False))')
 check("B5 把「本机策略」参数塞回放行位（开关复活）→ 判据变红",
       _mut != gui_src and not _p_gui_allow(_mut))
+
+_mut = gui_src.replace(
+    '_skip_cache_for_com = (_com_allowed and ext in (".doc", ".docx")',
+    '_skip_cache_for_com = (False and ext in (".doc", ".docx")')
+check("B8 去掉「无引擎身份缓存」闸门（.doc 又会被 LO 产物顶掉）→ 判据变红",
+      _mut != gui_src and not _p_doc_cache_guard(_mut))
 
 _mut = mp_wxml.replace('<text class="device-state',
                        '<view catchtap="onToggleCloudWord">☁ LO</view>\n              <text class="device-state',
@@ -318,10 +367,10 @@ check("B6 小程序把「☁ LO」开关加回来 → 移动端判据变红",
       _mut != mp_wxml and ("cloud_word" in _mut or "onToggleCloudWord" in _mut))
 
 # 行为面：纯函数对同一组输入必须给出稳定、可区分的结果（不是恒 True / 恒 False）
-_pairs = [((True, True), True), ((False, False), False)]
+_pairs = [((True,), True), ((False,), False)]
 check("B7 纯函数对相同输入稳定且可区分（排除恒真/恒假实现）",
       all(cloud_word_com_allowed(*a) is w for a, w in _pairs)
-      and cloud_word_com_allowed(True, True) != cloud_word_com_allowed(False, True))
+      and cloud_word_com_allowed(True) != cloud_word_com_allowed(False))
 
 print("\n" + "=" * 56)
 print("云端 Word 隐式规则验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

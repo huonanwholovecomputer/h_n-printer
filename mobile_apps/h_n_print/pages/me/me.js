@@ -1889,11 +1889,6 @@ Component({
       this._navigateWithAnimation('/pages/authorized-users/authorized-users')
     },
 
-    // F12: 跳转本地打印任务列表（通过 source=local 过滤）
-    onGoLocalOrders() {
-      this._navigateWithAnimation('/pages/user-orders/user-orders?source=local')
-    },
-
     loadStorageStats() {
       const token = wx.getStorageSync('token')
       if (!token) return

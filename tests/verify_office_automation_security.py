@@ -268,15 +268,28 @@ check("gui.py ConvertWorker 接收 from_cloud/allow_cloud_com；未放行时云�
       and bool(re.search(r"self\._allow_cloud_com\s*=\s*bool\(allow_cloud_com\)", GUI_SRC)))
 
 def check_preconvert_wiring(src: str):
-    """云任务预转换必须同时传 from_cloud=True 与「自打 + 上传者」算出的 allow_cloud_com（隐式规则）。"""
+    """云任务预转换必须传 from_cloud=True 与 allow_cloud_com（2026-10-28：只看上传者）。
+
+    旧口径是「自打 + 上传者」两个位；现在订单类型不参与（见
+    printer_config.cloud_word_com_allowed 的说明与现场 HN20261028-0002）。
+    """
     return (bool(re.search(r"_start_convert_worker\(\s*\n\s*row,\s*task\.local_path,\s*engine,"
                            r"\s*tab_key=new_key,\s*from_cloud=True,", src))
             and bool(re.search(r"allow_cloud_com=cloud_word_com_allowed\(\s*\n\s*"
-                               r"getattr\(task,\s*'is_admin_print',\s*False\),", src))
-            and bool(re.search(r"getattr\(task,\s*'uploader_is_admin',\s*False\)\)", src)))
+                               r"getattr\(task,\s*'uploader_is_admin',\s*False\)\)", src))
+            # 订单类型不许再出现在这处调用里（它仍会出现在建 PrintJob 的地方——那是
+            # 结算归类用的，与转换引擎无关），所以只切这段调用判断。
+            and _convert_call_has_no_self_print(src))
 
 
-check("gui.py 云端任务预转换：from_cloud=True + 按「自打 + 上传者」给 allow_cloud_com",
+def _convert_call_has_no_self_print(src: str) -> bool:
+    i = src.find("allow_cloud_com=cloud_word_com_allowed(")
+    if i < 0:
+        return False
+    return "is_admin_print" not in src[i:i + 220]
+
+
+check("gui.py 云端任务预转换：from_cloud=True + 按「上传者」给 allow_cloud_com",
       check_preconvert_wiring(GUI_SRC))
 
 check("gui.py 打印兜底转换：按 job.task_id 判定云端来源后传 from_cloud + allow_cloud_com",
@@ -284,11 +297,11 @@ check("gui.py 打印兜底转换：按 job.task_id 判定云端来源后传 from
       and bool(re.search(r"_allow_cloud_com\s*=\s*(?:_from_cloud\s+and\s+)?"
                          r"self\._cloud_com_allowed\(job\)", GUI_SRC))
       and bool(re.search(r"from_cloud=_from_cloud,\s*allow_cloud_com=_allow_cloud_com", GUI_SRC))
-      # 放行位判定必须走纯函数并带两个位（自打 / 上传者）——行为真值表见
+      # 放行位判定必须走纯函数、只看上传者（2026-10-28）——行为真值表见
       # tests/verify_cloud_word_implicit.py（静态这里只防接线被拆掉）。
       and bool(re.search(r"def _cloud_com_allowed\(self,\s*job\).*?cloud_word_com_allowed\("
-                         r".*?getattr\(job,\s*\"admin_self_print\""
-                         r".*?getattr\(job,\s*\"uploader_is_admin\"", GUI_SRC, re.S)))
+                         r"\s*getattr\(job,\s*\"uploader_is_admin\",\s*False\)\)",
+                         GUI_SRC, re.S)))
 
 check("gui.py 本地添加文件路径**不传** from_cloud（保持本地语义）",
       bool(re.search(r"self\._start_convert_worker\(i,\s*job\.file_path,\s*job\.engine\)\s*$",

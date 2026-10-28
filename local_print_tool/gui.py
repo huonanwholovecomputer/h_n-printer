@@ -63,6 +63,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QSpinBox,
+    QAbstractSpinBox,
     QSizePolicy,
     QPushButton,
     QProgressBar,
@@ -84,13 +85,15 @@ from PySide6.QtWidgets import (
     QFormLayout,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, cloud_word_com_allowed
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, cloud_word_com_allowed, split_tail_blank
 from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
-                         print_plan_pass, wait_for_output, count_pdf_pages)
+                         print_plan_pass, wait_for_output, count_pdf_pages,
+                         detect_trailing_blank_pages)
 import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 import duplex_stack  # 攒批模式（多任务合并翻纸）的纸叠账本（纯逻辑，见 duplex_stack.py）
+import print_watch   # 外部打印监视（绕过本工具的作业：只检测+记账，不阻断，见 print_watch.py）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 from cloud_client import (CloudClient, CloudTask, cache_engine_for, pdf_cache_key,
                           order_status_label_cn, auth_headers)
@@ -1597,7 +1600,7 @@ class StackQueueDialog(QDialog):
         child = QTreeWidgetItem([f"📄 {label}", p1, p2, f"{sheets} 张", status])
         child.setData(0, Qt.UserRole, {"seq": int(seq), "index": idx,
                                        "taken": taken, "blank": blank})
-        child.setToolTip(0, f"页号是**这份文件自己**的页码；它在纸叠里占 {sheets} 张纸")
+        child.setToolTip(0, f"页号是「这份文件自己」的页码；它在纸叠里占 {sheets} 张纸")
         child.setToolTip(4, ("这份第 2 趟没有内容，可以整份取走"
                              if blank and not taken else
                              "已登记取走（不再计入第 2 趟的送纸数）" if taken else
@@ -2114,15 +2117,15 @@ class PrintWorker(QThread):
         self._flip_event.set()
 
     def _cloud_com_allowed(self, job) -> bool:
-        """该云端任务是否允许走 Word/WPS COM（唯一判定点，隐式规则）。
+        """该云端任务是否允许走 Word/WPS COM（唯一判定点）。
 
-        两条同时成立才放行（判定本体在 `printer_config.cloud_word_com_allowed`）：
-        ① 任务被标为管理员自打；② **文件由管理员上传**。
+        2026-10-28 起只看一条（判定本体在 `printer_config.cloud_word_com_allowed`）：
+        **文件是否由管理员上传**。订单类型（`admin_self_print`）不再参与 —— 它是可变的
+        结算位，拿它决定"要不要执行宏"是错的（现场 HN20261028-0002：管理员下单但类型是
+        「接单」⇒ 旧规则强制 LO）。
         任务缺失字段（旧数据/旧后端）按 False 处理 —— 宁可按最严的 LibreOffice 走。
         """
-        return cloud_word_com_allowed(
-            getattr(job, "admin_self_print", False),
-            getattr(job, "uploader_is_admin", False))
+        return cloud_word_com_allowed(getattr(job, "uploader_is_admin", False))
 
     def _effective_pages(self, job: PrintJob, print_path: str = "") -> int:
         """本任务**实际会打印**的有效页数（单页硬闸门的判据）；0 = 确实未知。
@@ -2996,10 +2999,14 @@ class PrintWorker(QThread):
                 # 只是 file_plans/日志不再谎称它是双面任务。
                 dup = ((getattr(job, "duplex", "off") or "off") == "on" and len(sel) > 1)
                 paths.append(path)
+                # 这份文件第 2 趟要不要 180° 补偿（长边/短边装订）——**逐文件**记进账本，
+                # 第 2 趟才能在同一叠里按各自方向补偿（2026-10-28 起不再要求整叠同向）。
+                _rot = self._rotate_for_job(job)
                 for c in range(max(1, int(job.copies or 1))):
                     plans.append({
                         "label": f"{label}（第{c + 1}份）" if int(job.copies or 1) > 1 else label,
                         "pages": [off + x for x in sel],
+                        "second_rotate": bool(_rot),
                         # 显示用：这份文件**自己**的页号（已应用页码范围）。
                         # `pages` 是合并 PDF 里的页码（账本做页序要用），直接显示会让人看到
                         # "第二个文件从第 6 页开始打"——2026-10-25 用户反馈的正是这个。
@@ -3012,7 +3019,8 @@ class PrintWorker(QThread):
             if not ok:
                 return False, f"攒批本单合并失败：{mmsg}", 0
 
-            file_plans = [manual_duplex.FilePlan(fp["label"], list(fp["pages"]), bool(fp["duplex"]))
+            file_plans = [manual_duplex.FilePlan(fp["label"], list(fp["pages"]), bool(fp["duplex"]),
+                                                 second_rotate=fp.get("second_rotate"))
                           for fp in plans]
             plan = manual_duplex.plan_passes(file_plans, copies=1, first=p.first,
                                             reverse_second=p.reverse_second)
@@ -3601,9 +3609,11 @@ class DuplexFlushWorker(QThread):
                 return
             merged = os.path.join(self._batch_dir, "merged_pass2.pdf")
             present = _stack_present_sheet_count(self._stack)
+            _flags = [bool(x) for x in plan.pass_rotate(2)]
+            _n_rot = sum(1 for x in _flags if x)
             self.log_message.emit(
-                f"▶ 攒批第 2 趟：{self._stack.count} 单 / {present} 张纸，"
-                f"{'长边（内容旋转 180° 补偿）' if self._stack.rotate else '短边（不旋转）'}")
+                f"▶ 攒批第 2 趟：{self._stack.count} 单 / {present} 张纸，逐张纸补偿："
+                f"转 180° {_n_rot} 面、不转 {len(_flags) - _n_rot} 面")
             ok, msg = _pp.merge_pdfs(pdfs, merged)
             if not ok:
                 self.done.emit(False, f"整叠合并失败：{msg}", 0)
@@ -3613,9 +3623,13 @@ class DuplexFlushWorker(QThread):
                 lbl = slots[cur - 1].label if 0 < cur <= total else ""
                 self.progress.emit(cur, total, f"正在打第 2 趟(整叠): {lbl} ({cur}/{total}面)")
 
+            # second_rotate_180=True = **不做整趟压平**，让计划里每张纸的 rotate_second 生效
+            # （2026-10-27 起 `print_plan_pass` 从 `plan.pass_rotate()` 取 `rotate_slots`）。
+            # 旧写法传 `bool(self._stack.rotate)`：整叠一个开关 ⇒ 长边/短边混排只能拆叠，
+            # 而拆叠在攒批里等于"另一个订单永远排不上队"（2026-10-28 事故）。
             ok2, msg2 = print_plan_pass(
                 plan, merged, self._printer_name, 2,
-                second_rotate_180=bool(self._stack.rotate),
+                second_rotate_180=True,
                 progress_callback=_on_side, dpi=self._dpi)
             if not ok2:
                 self.done.emit(False, f"整叠第 2 趟失败：{msg2}", total)
@@ -3769,6 +3783,311 @@ class DropTableWidget(QTableWidget):
             event.acceptProposedAction()
         else:
             event.ignore()
+
+
+# ============================================================
+# 外部打印监视（A 档最小版：只检测 + 记账，不阻断出纸）
+# ============================================================
+
+class ExternalPrintBridge(QObject):
+    """监视线程 → 主线程的唯一通道。
+
+    监视线程（print_watch.PrintJobWatcher）里**绝不碰 Qt**：它只调 emit。本对象在主线程创建，
+    跨线程 emit 走 Qt 的排队连接 ⇒ 槽函数在主线程执行（与 cloud_client 的写法同一套）。
+    """
+
+    detected = Signal(object)      # ExternalPrint — 检测到一条外部打印
+    logged = Signal(str)           # 一行日志：起停 / 虚拟打印机跳过 / 陈年残留…
+
+
+class ExternalPagesPromptDialog(QDialog):
+    """页数（或单双面）未确认时的**非模态**补录提示。
+
+    为什么非模态：出纸现场不能被人点掉一个弹窗卡住 —— 模态框会连带攒批翻纸窗、云端接单
+    一起停摆。所以 show() 就走、60 秒自动关，也可以直接关掉、事后到「外部打印账本」里补。
+    这是 1020 拿不到页数时**给操作员的唯一兜底**（见 print_watch 模块头 ③）。
+    """
+
+    AUTO_CLOSE_MS = 60000
+
+    def __init__(self, item, parent=None, simplex_price: float = 0.0, duplex_price: float = 0.0,
+                 on_submit=None):
+        super().__init__(parent)
+        self._item = item
+        self._simplex = float(simplex_price)
+        self._duplex = float(duplex_price)
+        self._on_submit = on_submit
+
+        self.setWindowTitle("外部打印：补录页数")
+        self.setWindowModality(Qt.NonModal)
+        self.setMinimumWidth(460)
+
+        lay = QVBoxLayout(self)
+        head = QLabel(f"检测到<b>绕过本工具</b>的打印作业：<br>"
+                      f"打印机：{item.printer}<br>"
+                      f"文档：{item.document or '(无文档名)'}　用户：{item.user or '(未知)'}<br>"
+                      f"时间：{item.detected_at}")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        hint = QLabel("这台打印机（主机型驱动，如 HP LaserJet 1020）不回报页数，程序查不到实际印了几页。"
+                      "请按纸数填一下，账本金额才是对的；不填就先留着，之后仍可在「外部打印账本」补。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 11px;")
+        lay.addWidget(hint)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("实际页数："))
+        self._pages = QSpinBox()
+        self._pages.setRange(0, 9999)
+        self._pages.setValue(int(item.pages or 0))
+        self._pages.setSpecialValueText("未知")
+        self._pages.valueChanged.connect(lambda _v: self._refresh_amount())
+        row.addWidget(self._pages, 1)
+
+        row.addWidget(QLabel("单双面："))
+        self._duplex_box = QComboBox()
+        self._duplex_box.addItem("待确认", "")
+        self._duplex_box.addItem("单面", print_watch.DUPLEX_OFF)
+        self._duplex_box.addItem("双面", print_watch.DUPLEX_ON)
+        idx = {print_watch.DUPLEX_OFF: 1, print_watch.DUPLEX_ON: 2}.get(item.duplex, 0)
+        self._duplex_box.setCurrentIndex(idx)
+        self._duplex_box.currentIndexChanged.connect(lambda _i: self._refresh_amount())
+        row.addWidget(self._duplex_box, 1)
+        lay.addLayout(row)
+
+        self._amount = QLabel("")
+        lay.addWidget(self._amount)
+
+        btns = QHBoxLayout()
+        btns.addStretch(1)
+        save = QPushButton("保存")
+        save.clicked.connect(self._on_save)
+        later = QPushButton("稍后补")
+        later.clicked.connect(self.close)
+        btns.addWidget(save)
+        btns.addWidget(later)
+        lay.addLayout(btns)
+
+        self._refresh_amount()
+        QTimer.singleShot(self.AUTO_CLOSE_MS, self.close)
+
+    def _current_duplex(self) -> str:
+        return str(self._duplex_box.currentData() or "")
+
+    def _refresh_amount(self):
+        preview = print_watch.ExternalPrint(job_id=self._item.job_id, pages=self._pages.value(),
+                                            duplex=self._current_duplex(),
+                                            copies=self._item.copies)
+        value = print_watch.amount_for(preview, self._simplex, self._duplex)
+        self._amount.setText("预估金额：" + ("待确认（页数或单双面还没定）" if value is None
+                                          else f"¥{value:.2f}"))
+
+    def _on_save(self):
+        if self._on_submit is not None:
+            try:
+                self._on_submit(self._item, self._pages.value(), self._current_duplex())
+            except Exception as e:
+                logger.warning(f"外部打印补录失败: {e}")
+        self.close()
+
+
+class ExternalPrintDialog(QDialog):
+    """「文件 → 外部打印账本…」：外部打印清单 + 补录页数 / 标记已处理 / 导出 CSV / 清空。"""
+
+    COLUMNS = ["时间", "打印机", "文档", "用户", "页数", "单双面", "彩色", "金额", "来源", "状态"]
+
+    def __init__(self, store, simplex_price: float = 0.0, duplex_price: float = 0.0, parent=None):
+        super().__init__(parent)
+        self._store = store
+        self._simplex = float(simplex_price)
+        self._duplex = float(duplex_price)
+        self._row_index: list[int] = []        # 表格行 → 账本下标（账本按时间正序，表格新在上）
+
+        self.setWindowTitle("🧾 外部打印账本")
+        self.setMinimumSize(980, 520)
+
+        root = QVBoxLayout(self)
+        tip = QLabel("下列作业是「绕过本工具」直接发到打印机的（Word 等任意软件）。"
+                     "程序只检测和记账、不阻断出纸。页数显示「未确认」时按实际纸数补录，金额才对得上。")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        # 空态：占住表格那片空间并**居中**（旧写法把标签顶在上沿，表格一隐藏就剩一大块空白，
+        # 汇总行还被顶到窗口中间 —— 2026-10-28 用户截图）。只有它可见时才吃掉拉伸空间。
+        self._empty = QLabel("🧾\n\n还没有检测到外部打印\n"
+                             "勾选「文件 → 外部打印监视」后，绕过本工具的作业会出现在这里")
+        self._empty.setWordWrap(True)
+        self._empty.setAlignment(Qt.AlignCenter)
+        self._empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._empty.setStyleSheet("color: #888; font-size: 13px;")
+        root.addWidget(self._empty, 1)
+
+        self._table = QTableWidget(0, len(self.COLUMNS))
+        self._table.setHorizontalHeaderLabels(self.COLUMNS)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        hdr = self._table.horizontalHeader()
+        for col in range(len(self.COLUMNS)):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.Stretch)     # 文档名撑开
+        root.addWidget(self._table, 1)
+
+        self._summary = QLabel("")
+        root.addWidget(self._summary)
+
+        btns = QHBoxLayout()
+        self._btn_pages = QPushButton("补录页数…")
+        self._btn_pages.setToolTip("改选中行的实际页数（来源列会标成「人工」），金额按配置单价重算")
+        self._btn_pages.clicked.connect(self._on_edit_pages)
+        self._btn_done = QPushButton("标记已处理")
+        self._btn_done.setToolTip("确认这笔确实出纸了；只有已处理的记录才计入「已确认金额合计」")
+        self._btn_done.clicked.connect(self._on_mark_done)
+        self._btn_ignore = QPushButton("标记已忽略")
+        self._btn_ignore.setToolTip("没出纸（队列里取消了 / 打印失败 / 只是试打）：留档但永不计入合计")
+        self._btn_ignore.clicked.connect(self._on_mark_ignored)
+        self._btn_csv = QPushButton("导出 CSV…")
+        self._btn_csv.clicked.connect(self._on_export_csv)
+        self._btn_clear = QPushButton("清空")
+        self._btn_clear.clicked.connect(self._on_clear)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.close)
+        btns.addWidget(self._btn_pages)
+        btns.addWidget(self._btn_done)
+        btns.addWidget(self._btn_ignore)
+        btns.addWidget(self._btn_csv)
+        btns.addStretch(1)
+        btns.addWidget(self._btn_clear)
+        btns.addWidget(close_btn)
+        root.addLayout(btns)
+
+        self._table.itemSelectionChanged.connect(self._sync_buttons)
+        self.reload()
+
+    # ── 数据 ──
+
+    def set_prices(self, simplex_price: float, duplex_price: float):
+        self._simplex = float(simplex_price)
+        self._duplex = float(duplex_price)
+        self.reload()
+
+    def _amount_text(self, item) -> str:
+        value = print_watch.amount_for(item, self._simplex, self._duplex)
+        return "待确认" if value is None else f"{value:.2f}"
+
+    def reload(self):
+        items = self._store.load()
+        ordered = list(reversed(items))          # 最新的在最上面
+        self._row_index = [len(items) - 1 - i for i in range(len(ordered))]
+        self._table.setRowCount(len(ordered))
+        total = 0.0
+        pending_total = 0.0
+        unknown = 0
+        pending = 0
+        for row, item in enumerate(ordered):
+            cells = [item.detected_at, item.printer, item.document, item.user,
+                     f"{item.pages} 页" if item.pages > 0 else "未确认",
+                     print_watch.duplex_label(item.duplex),
+                     print_watch.color_label(item.color),
+                     self._amount_text(item),
+                     print_watch.SOURCE_LABELS.get(item.pages_source, item.pages_source),
+                     print_watch.STATUS_LABELS.get(item.status, item.status)]
+            for col, text in enumerate(cells):
+                self._table.setItem(row, col, QTableWidgetItem(str(text)))
+            value = print_watch.amount_for(item, self._simplex, self._duplex)
+            # 只有「已处理」才计入合计：待处理 = 还没人确认这张纸真的出来了
+            # （2026-10-28 现场：拔掉 USB 后发起的作业从没出纸，却被算进了合计）
+            if value is not None and item.status == print_watch.STATUS_CONFIRMED:
+                total += value
+            elif value is not None and item.status == print_watch.STATUS_NEW:
+                pending_total += value
+            if item.pages <= 0:
+                unknown += 1
+            if item.status == print_watch.STATUS_NEW:
+                pending += 1
+        empty = not ordered
+        self._empty.setVisible(empty)
+        self._table.setVisible(not empty)
+        self._summary.setVisible(not empty)     # 空态不显示「共 0 条 …」，免得悬在中间
+        self._summary.setText(
+            f"共 {len(ordered)} 条｜已确认金额合计 ¥{total:.2f}"
+            f"｜待处理 {pending} 条"
+            + (f"（¥{pending_total:.2f}，未计入）" if pending else "")
+            + (f"｜页数未确认 {unknown} 条（需人工补录）" if unknown else ""))
+        self._sync_buttons()
+
+    def _current_index(self):
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._row_index):
+            return None
+        return self._row_index[row]
+
+    def _current_item(self):
+        idx = self._current_index()
+        return None if idx is None else self._store.load()[idx]
+
+    def _sync_buttons(self):
+        has_row = self._current_index() is not None
+        item = self._current_item() if has_row else None
+        status = getattr(item, "status", "")
+        for btn in (self._btn_pages,):
+            btn.setEnabled(has_row)
+        # 已经处理/忽略的行不必再点一次（按钮灰掉，状态一眼看得懂）
+        self._btn_done.setEnabled(has_row and status != print_watch.STATUS_CONFIRMED)
+        self._btn_ignore.setEnabled(has_row and status != print_watch.STATUS_IGNORED)
+        self._btn_csv.setEnabled(True)
+        self._btn_clear.setEnabled(True)
+
+    # ── 操作 ──
+
+    def _on_edit_pages(self):
+        item = self._current_item()
+        idx = self._current_index()
+        if item is None or idx is None:
+            return
+        from PySide6.QtWidgets import QInputDialog
+        value, ok = QInputDialog.getInt(self, "补录页数",
+                                        f"「{item.document or item.printer}」实际印了几页？",
+                                        max(int(item.pages or 1), 1), 1, 9999, 1)
+        if not ok or value <= 0:
+            return
+        self._store.set_pages(idx, value)
+        self.reload()
+
+    def _on_mark_done(self):
+        idx = self._current_index()
+        if idx is None:
+            return
+        self._store.set_status(idx, print_watch.STATUS_CONFIRMED)
+        self.reload()
+
+    def _on_mark_ignored(self):
+        idx = self._current_index()
+        if idx is None:
+            return
+        self._store.set_status(idx, print_watch.STATUS_IGNORED)
+        self.reload()
+
+    def _on_export_csv(self):
+        default = os.path.join(os.path.expanduser("~"), "外部打印账本.csv")
+        path, _sel = QFileDialog.getSaveFileName(self, "导出外部打印账本", default, "CSV 文件 (*.csv)")
+        if not path:
+            return
+        try:
+            n = self._store.to_csv(path, self._simplex, self._duplex)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"写 CSV 失败：{e}")
+            return
+        QMessageBox.information(self, "已导出", f"共 {n} 条已写入：\n{path}")
+
+    def _on_clear(self):
+        if QMessageBox.question(self, "清空账本",
+                                "清空后这些外部打印记录就没了（建议先导出 CSV）。确定清空？") \
+                != QMessageBox.Yes:
+            return
+        self._store.clear()
+        self.reload()
 
 
 # ============================================================
@@ -5557,7 +5876,7 @@ class MainWindow(QMainWindow):
         # 也就没有它。这里给一个常驻读数 + 点开手动重试的入口。
         self._offline_badge = QPushButton("")
         self._offline_badge.setObjectName("offlineBadge")
-        self._offline_badge.setToolTip("本机还有订单**没有上报到云端**（离线未同步）。\n"
+        self._offline_badge.setToolTip("本机还有订单「没有上报到云端」（离线未同步）。\n"
                                       "点开可查看明细并手动重试上传。")
         self._offline_badge.setVisible(False)
         self._offline_badge.clicked.connect(self._open_offline_orders_dialog)
@@ -5607,6 +5926,24 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self._finance_action)
 
         file_menu.addSeparator()
+
+        # 外部打印监视（A 档最小版）：勾上 = 订阅本机 spooler，绕过本工具的作业一律记账（不阻断）。
+        # 连接放在 setChecked 之后：启动恢复时不会再触发一次 toggled（否则重复起一次线程）。
+        self._ext_print_action = QAction("外部打印监视(&W)", self)
+        self._ext_print_action.setCheckable(True)
+        self._ext_print_action.setChecked(bool(getattr(self._config, "external_watch_enabled", False)))
+        self._ext_print_action.setToolTip("检测操作员/顾客绕过本工具直接发到打印机的作业并记账"
+                                          "（只记账，不阻断出纸）")
+        self._ext_print_action.toggled.connect(self._on_external_watch_toggled)
+        file_menu.addAction(self._ext_print_action)
+
+        ext_ledger_action = QAction("外部打印账本…(&E)", self)
+        ext_ledger_action.setToolTip("查看检测到的外部打印、补录页数"
+                                     "（HP LaserJet 1020 这类机型拿不到页数时靠它）、导出 CSV")
+        ext_ledger_action.triggered.connect(self._open_external_prints_dialog)
+        file_menu.addAction(ext_ledger_action)
+        # 窗口建完后按配置恢复监视线程（延迟一下：订阅失败也不能卡住启动）
+        QTimer.singleShot(1200, self._restore_external_watch)
 
         exit_action = QAction("退出(&X)", self)
         exit_action.triggered.connect(self.close)
@@ -5668,6 +6005,28 @@ class MainWindow(QMainWindow):
         self._shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self)
         self._shortcut_paste.setContext(Qt.ApplicationShortcut)
         self._shortcut_paste.activated.connect(self._on_shortcut_paste)
+        # Ctrl+T / Ctrl+N = 新建标签页（浏览器式习惯；与右上「＋」同一个入口 _new_tab）。
+        # 两个键各注册一次：ApplicationShortcut 保证焦点在表格/输入框/日志区时都生效。
+        self._shortcuts_new_tab = []
+        for _seq in ("Ctrl+T", "Ctrl+N"):
+            _sc = QShortcut(QKeySequence(_seq), self)
+            _sc.setContext(Qt.ApplicationShortcut)
+            _sc.activated.connect(self._on_shortcut_new_tab)
+            self._shortcuts_new_tab.append(_sc)
+        # Ctrl+W = 关闭当前标签页（浏览器式习惯）。落点 _close_current_tab：已打印完的静默关、
+        # 有未打印的先确认、正在打印的硬拦、只剩一个标签页时只清空不删页。
+        self._shortcut_ctrl_w = QShortcut(QKeySequence("Ctrl+W"), self)
+        self._shortcut_ctrl_w.setContext(Qt.ApplicationShortcut)
+        self._shortcut_ctrl_w.activated.connect(self._on_shortcut_close_tab)
+        # ←/→ = 切换标签页（浏览器式习惯）。右端**不新建** —— 与「＋」按钮刻意不同：
+        # 方向键是连按的键，误按一下就在最右侧凭空多出一个空标签页，操作员还得回头收拾。
+        # 焦点在文本框/数字框里时让给控件（见 _focus_takes_arrow_keys），否则改不了页码/份数。
+        self._shortcuts_switch_tab = []
+        for _seq, _delta in (("Left", -1), ("Right", 1)):
+            _sc = QShortcut(QKeySequence(_seq), self)
+            _sc.setContext(Qt.ApplicationShortcut)
+            _sc.activated.connect(lambda d=_delta: self._on_shortcut_switch_tab(d))
+            self._shortcuts_switch_tab.append(_sc)
 
         # 菜单建完了：按本地库里当前真实的未同步条数定一次「离线未同步订单」显隐
         # （此刻状态栏还没建，_refresh_offline_badge 只动菜单项；角标随后由
@@ -6122,7 +6481,7 @@ class MainWindow(QMainWindow):
         self._tab_btn_minus = QPushButton("−")
         self._tab_btn_minus.setObjectName("tabBtnMinus")
         self._tab_btn_minus.setFixedSize(TAB_SWITCH_BTN, TAB_SWITCH_BTN)
-        self._tab_btn_minus.setToolTip("上一个标签页")
+        self._tab_btn_minus.setToolTip("上一个标签页（←）")
         self._tab_btn_minus.clicked.connect(lambda: self._switch_tab(-1))
 
         self._tab_label = QLabel(self._current_tab)
@@ -6139,7 +6498,8 @@ class MainWindow(QMainWindow):
         self._tab_btn_plus = QPushButton("+")
         self._tab_btn_plus.setObjectName("tabBtnPlus")
         self._tab_btn_plus.setFixedSize(TAB_SWITCH_BTN, TAB_SWITCH_BTN)
-        self._tab_btn_plus.setToolTip("下一个标签页 / 新建标签页")
+        self._tab_btn_plus.setToolTip(
+            "下一个标签页（→，到最右侧不新建）/ 新建标签页（Ctrl+T 或 Ctrl+N）")
         self._tab_btn_plus.clicked.connect(lambda: self._switch_tab(1))
 
         # 状态徽标：🔒 标签页已固定（打印完成）/ ⏸ 含双面、需人工翻纸 / 空 = 正常。
@@ -6275,8 +6635,29 @@ class MainWindow(QMainWindow):
 
     # ──────── 标签页切换 ────────
 
-    def _switch_tab(self, delta: int):
-        """切换标签页。delta: -1 上一页, +1 下一页（若已在最后一页则新建）。"""
+    def _new_tab(self) -> str:
+        """新建一个空标签页并切换过去（「＋」按钮、标签页管理窗、Ctrl+T/Ctrl+N 共用）。
+
+        取号走 `_next_tab_key()`（唯一取号入口），避免与已有标签页撞号。
+        副作用与「在最后一页点 ＋」完全一致：取消撤回状态、落盘、重建表格、刷新页签。"""
+        self._cancel_undo_if_active()
+        new_key = self._next_tab_key()
+        self._config.tabs[new_key] = self._make_new_tab()
+        self._current_tab = new_key
+        self._config.active_tab = new_key
+        self._save_config()
+        self._rebuild_table()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+        self._log(f"📑 新建标签页 {new_key}")
+        return new_key
+
+    def _switch_tab(self, delta: int, create_at_end: bool = True):
+        """切换标签页。delta: -1 上一页, +1 下一页。
+
+        `create_at_end`（默认 True = 「＋」按钮的口径）：已在最后一页再往后 ⇒ 新建标签页。
+        ←/→ 快捷键传 False ⇒ 到最后一页就停住，**不**新建（方向键是连按的键）。
+        """
         tab_keys = self._sorted_tab_keys(self._config.tabs)
         if not tab_keys:
             self._config.tabs = {"1": self._make_new_tab()}
@@ -6295,16 +6676,9 @@ class MainWindow(QMainWindow):
             return
 
         if new_idx >= len(tab_keys):
-            # 在最后一页点 + → 新建标签
-            new_key = self._next_tab_key()
-            self._config.tabs[new_key] = self._make_new_tab()
-            self._current_tab = new_key
-            self._config.active_tab = new_key
-            self._save_config()
-            self._rebuild_table()
-            self._refresh_tab_display()
-            self._sync_edit_enabled(False)
-            self._log(f"📑 新建标签页 {new_key}")
+            # 在最后一页点 + → 新建标签；←/→ 传 create_at_end=False ⇒ 停住不动
+            if create_at_end:
+                self._new_tab()
             return
 
         self._current_tab = tab_keys[new_idx]
@@ -6410,7 +6784,7 @@ class MainWindow(QMainWindow):
             self._save_config()
             self._refresh_tab_display()
 
-    def _abandon_tab_jobs(self, tab_entry) -> list:
+    def _abandon_tab_jobs(self, tab_entry, skip=()) -> list:
         """通知后端放弃该标签页中**未打印**的云端任务/本地预留订单，返回其全部 jobs。
 
         归属/自打标记随放弃请求一起上报：否则后端只能按缺省值补记，会把「接单打印」
@@ -6421,7 +6795,12 @@ class MainWindow(QMainWindow):
         jobs = list(getattr(tab_entry, "jobs", None) or [])
         if not jobs or not self._cloud_client:
             return jobs
+        # skip：这些 job **不**放弃（攒批纸叠里"只打了第 1 趟"的任务 —— 与 closeEvent 同一条口径，
+        # 放弃了第 2 趟就再也报不成功）。按对象身份匹配，同一订单在别的标签页的副本不受影响。
+        skip_ids = {id(j) for j in (skip or ())}
         for job in jobs:
+            if id(job) in skip_ids:
+                continue
             if getattr(job, 'sent', False):
                 continue
             if job.order_id > 0:
@@ -6435,7 +6814,7 @@ class MainWindow(QMainWindow):
                     is_admin_print=bool(tab_entry.is_admin_print))
         return jobs
 
-    def _remove_tabs(self, keys, reason: str = "删除标签页") -> list:
+    def _remove_tabs(self, keys, reason: str = "删除标签页", skip_jobs=()) -> list:
         """删除一批标签页（**一次**重编号，避免逐个删除导致 key 漂移），
         并做全部联动清理：后端放弃通知 / 预约单状态机 / 补打队列 / 孤儿 PDF 缓存。
         返回**实际删除**的 key 列表（按输入顺序）。
@@ -6456,7 +6835,7 @@ class MainWindow(QMainWindow):
             tab_entry = self._config.tabs.get(key)
             if tab_entry is None:
                 continue
-            all_jobs.extend(self._abandon_tab_jobs(tab_entry))
+            all_jobs.extend(self._abandon_tab_jobs(tab_entry, skip=skip_jobs))
             del self._config.tabs[key]
             removed_keys.append(key)
         if not removed_keys:
@@ -6482,6 +6861,154 @@ class MainWindow(QMainWindow):
         self._current_tab = "1"
         self._config.active_tab = "1"
         self._save_config()
+
+    # ──────── 关闭当前标签页（Ctrl+W，2026-10-27）────────
+    # 口径（用户拍板）：① 全部已打印完成 → 静默关闭（与退出时"全部完成即自动清理"同一条）；
+    # ② 还有未打印的文件 → 先确认，写明有几个文件没打印；③ 只剩一个标签页 → 不删页，
+    # 只清空它的文件（"至少保留一个标签页"仍成立）；④ 本页的文件正在打印 → 硬拦。
+
+    def _tab_jobs_in_flight(self, key: str) -> list:
+        """该标签页里正被在跑的打印线程持有的任务（Ctrl+W 的硬拦判据）。
+
+        按 **job 对象身份** 比对，不用 task_id：同一订单可能被复制进别的标签页，
+        按 task_id 比会连带拦掉别的页。整叠第 2 趟打的是开打前就并好的批次 PDF、
+        不再引用标签页里的 job（归属/管理员标记在开打前已定格）⇒ 不受删页影响，
+        所以这里只判 self._worker（普通批次与攒批单的第 1 趟都由它持有 job 对象）。
+        """
+        worker = getattr(self, "_worker", None)
+        if worker is None:
+            return []
+        try:
+            if not worker.isRunning():
+                return []
+        except Exception:
+            return []
+        held = {id(j) for j in (getattr(worker, "_jobs", None) or [])}
+        if not held:
+            return []
+        return [j for j in self._tab_jobs(key) if id(j) in held]
+
+    def _drop_parked_requests_for_tab(self, key: str, jobs: list) -> int:
+        """摘掉**已受理但被纸叠挡在队里**、属于该标签页的打印请求，返回摘掉的文件数。
+
+        _stack_entry_wait 的放行处会自己按标签页现存 job 过滤（_drain_stack_entry_queue），
+        但 _stack_wait 不会 —— 不摘掉，关页后纸叠一打完它照样把这一单印出来，
+        与刚才"放弃打印"的确认自相矛盾（白费纸）。
+        """
+        ids = {id(j) for j in (jobs or [])}
+        if not ids:
+            return 0
+        dropped = 0
+        for queue in (getattr(self, "_stack_wait", None),
+                      getattr(self, "_stack_entry_wait", None)):
+            if not queue:
+                continue
+            for req in list(queue):
+                before = len(req.get("jobs") or [])
+                if req.get("tab_key") == key:
+                    queue.remove(req)
+                    dropped += before
+                    continue
+                kept = [j for j in (req.get("jobs") or []) if id(j) not in ids]
+                if len(kept) != before:
+                    dropped += before - len(kept)
+                    if kept:
+                        req["jobs"] = kept
+                    else:
+                        queue.remove(req)
+        return dropped
+
+    def _close_current_tab(self):
+        """关闭当前标签页（Ctrl+W 的落点）。四条口径见本节开头。"""
+        key = self._current_tab
+        tab = self._config.tabs.get(key)
+        if tab is None:
+            return
+
+        in_flight = self._tab_jobs_in_flight(key)
+        if in_flight:
+            self._log(f"🛑 Ctrl+W 被拒：标签页 {key} 有 {len(in_flight)} 个文件正在打印")
+            QMessageBox.warning(
+                self, "正在打印",
+                f"标签页 {key} 里还有 {len(in_flight)} 个文件正在打印。\n\n"
+                "打完再关 —— 打印过程中删除标签页会立刻向后端报「放弃」，"
+                "而纸已经/正在出纸槽里，账与纸会对不上。",
+            )
+            return
+
+        only_one = len(self._config.tabs) <= 1
+        jobs = list(tab.jobs or [])
+        if only_one and not jobs:
+            self._log(f"⌨ Ctrl+W：只剩一个空标签页 {key}，无需关闭")
+            return
+
+        # 攒批纸叠里"只打了第 1 趟"的任务：删页**不放弃**它们的订单（与 closeEvent 同一条
+        # 理由 —— 那不是"没打"而是"打了一半"，放弃了第 2 趟就再也报不成功）。
+        stack_task_ids = {int(t.get("task_id") or 0)
+                          for e in (getattr(self._stack, "entries", None) or [])
+                          for t in (e.tasks or [])}
+        stack_task_ids.discard(0)
+        keep_jobs = [j for j in jobs if not getattr(j, "sent", False)
+                     and int(getattr(j, "task_id", 0) or 0) in stack_task_ids]
+
+        unsent = [j for j in jobs if not getattr(j, "sent", False)]
+        if unsent:
+            todo = "清空这个标签页的文件" if only_one else "删除这个标签页"
+            msg = (f"标签页 {key} 里有 {len(unsent)} 个文件还没打印完"
+                   f"（整个标签页共 {len(jobs)} 个文件）。\n\n")
+            if keep_jobs:
+                msg += (f"其中 {len(keep_jobs)} 个已经在出纸槽的攒批纸叠里（只打了第 1 趟）："
+                        f"删页不会放弃它们的订单，打完第 2 趟照常回报成功。\n\n")
+            msg += (f"「是」= 放弃这些未打印的任务并{todo}（删了无法恢复）\n"
+                    f"「否」= 不删，返回继续")
+            reply = QMessageBox.question(self, "放弃打印？", msg,
+                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self._log(f"↩ 已取消关闭标签页 {key}")
+                return
+
+        self._cancel_undo_if_active()
+
+        if only_one:
+            # 只剩这一个标签页：不删页，只清空它的文件
+            self._cancel_all_convert_workers()
+            abandoned = self._abandon_tab_jobs(tab, skip=keep_jobs)
+            tab.jobs = []
+            tab.frozen = False
+            self._cleanup_scheduled_orders_for_tab(key, reason="标签页已清空")
+            self._drop_auto_print_retry_for_tab(key)
+            self._cleanup_orphan_pdf_cache(abandoned)
+            self._save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+            self._sweep_staged_files("清空标签页")
+            self._log(f"⌨ Ctrl+W：只剩一个标签页，已清空其文件（标签页 {key} 保留）")
+            return
+
+        # 先切到相邻标签页（右侧优先，没有就左侧）再删：_renumber_tabs 顺着 _current_tab
+        # 重映射 key，删完再切会落到 1 号页而不是邻居。
+        keys = self._sorted_tab_keys(self._config.tabs)
+        try:
+            idx = keys.index(key)
+        except ValueError:
+            idx = 0
+        neighbor = keys[idx + 1] if idx + 1 < len(keys) else (keys[idx - 1] if idx > 0 else "")
+        if neighbor:
+            self._current_tab = neighbor
+            self._config.active_tab = neighbor
+        dropped = self._drop_parked_requests_for_tab(key, jobs)
+        if dropped:
+            self._log(f"⏸ 已摘掉 {dropped} 个排队等放行的文件（标签页 {key} 已关闭）")
+        if not self._remove_tabs([key], reason="Ctrl+W 关闭标签页", skip_jobs=keep_jobs):
+            return
+        self._rebuild_table()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+        self._sweep_staged_files("关闭标签页")
+        if dropped:
+            self._sync_stack_button()
+            self._refresh_stack_dialog()
 
     def _scheduled_tab_still_owns(self, order_id: int, tab_key: str) -> bool:
         """预约单的 `tab_key` 是否仍指向**该订单自己的**标签页。
@@ -6663,6 +7190,172 @@ class MainWindow(QMainWindow):
         except Exception:
             return True  # 判定失败时按主线程处理（保持旧行为，不丢 UI 同步）
 
+    # ──────── 外部打印监视（A 档最小版：只检测 + 记账，不阻断出纸）────────
+
+    def _external_store(self) -> "print_watch.ExternalPrintStore":
+        """账本单例（位置 = %APPDATA%\\HN打印工具\\external_prints.json，由 paths 同目录推导）。"""
+        store = getattr(self, "_ext_store", None)
+        if store is None:
+            store = print_watch.ExternalPrintStore()
+            self._ext_store = store
+        return store
+
+    def _external_prices(self) -> tuple:
+        """外部打印的计价单价 —— 一律取配置对象现值，绝不硬编码（改价金额要跟着变）。"""
+        return float(self._config.simplex_price), float(self._config.duplex_price)
+
+    def _ensure_external_bridge(self) -> "ExternalPrintBridge":
+        bridge = getattr(self, "_ext_bridge", None)
+        if bridge is None:
+            bridge = ExternalPrintBridge(self)
+            bridge.detected.connect(self._on_external_print_detected)
+            bridge.logged.connect(self._on_external_watch_log)
+            self._ext_bridge = bridge
+        return bridge
+
+    def _start_external_watch(self, announce: bool = True) -> bool:
+        """启动监视线程（菜单勾选与启动恢复共用）。返回是否真的起来了。
+
+        监视线程只回调、不碰 Qt：回调是 bridge 的 Signal.emit，跨线程排队回主线程。
+        排除自家作业有两层：
+          ① HN| 前缀 —— GDI 路径在 StartDoc 前加的（HN|xxx.pdf），静态就够；
+          ② recent_self_titles() —— SumatraPDF 兜底是它自己起 StartDoc、名字取自 PDF 文件名，
+             只能靠"提交前临时登记 + TTL 20 分钟"排除。所以这里必须传**可调用对象**，
+             构造时算一次快照会漏掉运行中才登记的作业名。
+        """
+        watcher = getattr(self, "_ext_watch", None)
+        if watcher is not None and watcher.is_running():
+            return True
+        try:
+            bridge = self._ensure_external_bridge()
+            watcher = print_watch.PrintJobWatcher(
+                store=self._external_store(),
+                on_external=bridge.detected.emit,
+                on_log=bridge.logged.emit,
+                self_titles=print_watch.recent_self_titles,
+            )
+            started = watcher.start()
+        except Exception as e:
+            logger.warning(f"外部打印监视启动异常: {e}")
+            started = False
+        if not started:
+            if announce:
+                self._log("⚠ 外部打印监视启动失败（winspool 订阅不可用，或本机没有打印队列）")
+            return False
+        self._ext_watch = watcher
+        return True
+
+    def _stop_external_watch(self) -> None:
+        watcher = getattr(self, "_ext_watch", None)
+        self._ext_watch = None
+        if watcher is None:
+            return
+        try:
+            watcher.stop()
+        except Exception as e:
+            logger.warning(f"外部打印监视停止异常: {e}")
+
+    def _set_external_action_checked(self, checked: bool) -> None:
+        action = getattr(self, "_ext_print_action", None)
+        if action is None:
+            return
+        action.blockSignals(True)          # 回滚勾选时不许再触发一次 toggled
+        action.setChecked(bool(checked))
+        action.blockSignals(False)
+
+    def _on_external_watch_toggled(self, checked: bool):
+        """菜单勾选 = 开/关监视，状态写 external_watch_enabled（下次启动按它恢复）。"""
+        want = bool(checked)
+        if want:
+            if not self._start_external_watch():
+                self._set_external_action_checked(False)   # 起不来就不许显示"已开"
+                self._config.external_watch_enabled = False
+                self._save_config()
+                return
+        else:
+            self._stop_external_watch()
+        self._config.external_watch_enabled = want
+        self._save_config()
+        self._log("👀 外部打印监视已开启（绕过本工具直接打印的作业会被记账）" if want
+                  else "👀 外部打印监视已关闭")
+
+    def _restore_external_watch(self):
+        """启动时按配置恢复（老配置没这个键 → 关）。订阅失败只记日志，不弹窗打扰开机。"""
+        try:
+            want = bool(getattr(self._config, "external_watch_enabled", False))
+            self._set_external_action_checked(want)
+            if want and not self._start_external_watch(announce=False):
+                self._set_external_action_checked(False)
+                self._log("⚠ 外部打印监视未能自动恢复（可在「文件」菜单里手动开启）")
+        except Exception as e:
+            self._log(f"⚠ 外部打印监视恢复失败：{e}")
+
+    def _on_external_watch_log(self, message: str):
+        """监视线程的一行日志（Signal → 主线程）。"""
+        self._log(message)
+
+    def _on_external_print_detected(self, item):
+        """检测到一条外部打印（Signal 已回主线程）：记日志 + 需要时弹非模态补录。"""
+        try:
+            pages = f"{item.pages} 页" if item.pages > 0 else "页数未确认"
+            self._log(f"🧾 外部打印：{item.printer} / {item.document or '(无文档名)'} / {pages}"
+                      f" / {print_watch.duplex_label(item.duplex)}")
+        except Exception:
+            pass
+        dialog = getattr(self, "_ext_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.reload()
+        if item.pages <= 0 or not item.duplex:
+            self._prompt_external_pages(item)
+
+    def _prompt_external_pages(self, item):
+        """页数/单双面不全 ⇒ 非模态提示补录。最多同时 3 个（多的关最旧的），绝不阻塞打印现场。"""
+        prompts = getattr(self, "_ext_prompts", None)
+        if prompts is None:
+            prompts = []
+            self._ext_prompts = prompts
+        prompts[:] = [p for p in prompts if p.isVisible()]
+        while len(prompts) >= 3:
+            prompts.pop(0).close()
+        simplex, duplex_price = self._external_prices()
+        dlg = ExternalPagesPromptDialog(item, self, simplex, duplex_price,
+                                        on_submit=self._on_external_pages_submitted)
+        prompts.append(dlg)
+        dlg.show()
+
+    def _on_external_pages_submitted(self, item, pages: int, duplex: str):
+        """人工补录：页数（来源 → 人工）+ 单双面，落盘后账本按配置单价重算金额。"""
+        try:
+            if int(pages) > 0:
+                item.pages = int(pages)
+                item.pages_source = print_watch.SOURCE_CONFIRMED
+            if duplex in (print_watch.DUPLEX_ON, print_watch.DUPLEX_OFF):
+                item.duplex = duplex
+            self._external_store().update(item)
+        except Exception as e:
+            logger.warning(f"外部打印补录失败: {e}")
+            return
+        dialog = getattr(self, "_ext_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.reload()
+        self._log(f"✅ 已补录外部打印：{item.document or '(无文档名)'} → "
+                  f"{item.pages} 页 / {print_watch.duplex_label(item.duplex)}")
+
+    def _open_external_prints_dialog(self):
+        """打开外部打印账本窗口（非模态，可一直开着看新检测到的作业）。"""
+        try:
+            dialog = getattr(self, "_ext_dialog", None)
+            if dialog is None:
+                simplex, duplex_price = self._external_prices()
+                dialog = ExternalPrintDialog(self._external_store(), simplex, duplex_price, self)
+                self._ext_dialog = dialog
+            dialog.set_prices(*self._external_prices())
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as e:
+            self._log(f"⚠ 打开外部打印账本失败：{e}")
+
     def _save_config(self, sync_ui: bool | None = None):
         """实时保存配置到 JSON 文件。
 
@@ -6833,7 +7526,7 @@ class MainWindow(QMainWindow):
 
         new_btn = QPushButton("＋ 新建标签页")
         new_btn.clicked.connect(lambda: (
-            self._switch_tab(999),
+            self._new_tab(),
             _rebuild_dialog_table(),
         ))
         btn_row.addWidget(new_btn)
@@ -6957,6 +7650,141 @@ class MainWindow(QMainWindow):
         self._table.insertRow(row)
         self._fill_table_row(row, job)
 
+    @staticmethod
+    def _detect_blank_tail(pdf_path: str) -> int:
+        """末尾连续空白页页数（0 = 没有 / 读不出来）。
+
+        只对 PDF 生效、只往回扫末尾几页（见 pdf_printer.detect_trailing_blank_pages），
+        任何异常一律 0 —— 检测不可用绝不能妨碍加文件/打印（fail-open）。
+        """
+        if not pdf_path or not str(pdf_path).lower().endswith(".pdf"):
+            return 0
+        try:
+            if not os.path.isfile(pdf_path):
+                return 0
+            return int(detect_trailing_blank_pages(pdf_path) or 0)
+        except Exception:
+            return 0
+
+    def _set_blank_tail_excluded(self, rows, exclude: bool) -> int:
+        """把选中的行「排除 / 恢复」末尾空白页，返回实际改动的行数。
+
+        排除**落到 page_range 上**（printer_config.split_tail_blank），不新增"要少打几页"
+        这种第二口径：有效页数、计费、单页硬闸门、手动双面配对全都只认 page_range ⇒
+        「2 页（1 页内容 + 1 页空白）」排完自动变成「单面 1 页」，不会再多走一张空白纸。
+        """
+        if self._is_current_tab_frozen():
+            return 0
+        jobs = self._get_current_jobs()
+        touched: list[int] = []
+        for r in rows:
+            if not (0 <= r < len(jobs)) or r >= self._table.rowCount():
+                continue
+            job = jobs[r]
+            tail = int(getattr(job, "blank_tail", 0) or 0)
+            if tail <= 0:
+                continue
+            if exclude:
+                if getattr(job, "blank_undo_range", None) is not None:
+                    continue
+                new_range, dropped = split_tail_blank(
+                    getattr(job, "page_range", "") or "", int(job.page_count or 0), tail)
+                if dropped <= 0:
+                    continue
+                job.blank_undo_range = getattr(job, "page_range", "") or ""
+                job.page_range = new_range
+            else:
+                if getattr(job, "blank_undo_range", None) is None:
+                    continue
+                job.page_range = job.blank_undo_range or ""
+                job.blank_undo_range = None
+            touched.append(r)
+
+        if not touched:
+            return 0
+
+        self._save_config()
+        for r in touched:
+            self._fill_table_row(r, jobs[r])      # 只重画改动行：保住选区
+        self._update_total_cost()
+        # 面板里的「页码范围」必须跟着变：否则控件还显示旧值，操作员接着改别的参数时
+        # 会被 `_auto_apply_edit` 把旧范围**写回去**（等于撤销了刚才的排除）。
+        self._on_table_selection()
+        if any(int(getattr(jobs[r], "task_id", 0) or 0) > 0 for r in touched):
+            self._log("⚠ 云端订单：金额由后端结算，本次排除只影响出纸、不改已定价格")
+        self._log(("⚠ 已排除末尾空白页：" if exclude else "↩ 已恢复末尾空白页：")
+                  + f"{len(touched)} 个文件（页数/费用已重算）")
+        return len(touched)
+
+    def _on_blank_tail_toggled(self, checked: bool):
+        """「排除末尾空白页」勾选框 → 作用于整片选区（与其它面板控件同一口径）。"""
+        rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
+        if not rows:
+            return
+        if self._set_blank_tail_excluded(rows, bool(checked)) == 0:
+            # 一个都没改（选区里没有可排的空白页 / 已经排过 / 标签页冻结）⇒ 勾选态回滚到事实
+            self._on_table_selection()
+
+    @staticmethod
+    def _pages_effective(job) -> tuple:
+        """(有效打印页数, 文件整份页数)；页数未知 = (0, 0)。
+
+        有效页数按**页码范围**折算，算的是 `printer_config._count_pages_in_range` ——
+        与计费、单页硬闸门、后端 `_file_range_stats` 同一份算法（本项目只允许一处口径）。
+        范围为空/非法时退回整份。"""
+        total = int(getattr(job, "page_count", 0) or 0)
+        if total <= 0:
+            return 0, 0
+        try:
+            eff = int(_count_pages_in_range(getattr(job, "page_range", "") or "", total))
+        except (TypeError, ValueError):
+            eff = total
+        if eff <= 0:
+            eff = total
+        return eff, total
+
+    def _pages_cell_text(self, job) -> str:
+        """「页数」列文案 = **有效打印页数**；与整份页数不同时括号注明（口径同结算页「1页 (共2页)」）。
+
+        为什么不是整份页数：2026-10-27 现场把页码范围改成 1、费用已按 1 张算（¥0.30），
+        表格却仍写着 2 ⇒ 被判成「页码范围没生效、卡住了」。整份页数照样看得见（选范围要看它），
+        只是不再冒充「这次要打几页」。"""
+        eff, total = self._pages_effective(job)
+        if total <= 0:
+            return "?"
+        tail = int(getattr(job, "blank_tail", 0) or 0)
+        mark = "" if tail <= 0 else (" ⚠" if getattr(job, "blank_undo_range", None) is None
+                                     else " ⚠已排")
+        if eff == total:
+            return str(total) + mark
+        return f"{eff} (共 {total} 页)" + mark
+
+    def _pages_cell_tip(self, job) -> str:
+        """「页数」格悬停说明：文件共几页 · 页码范围 · 实际打印几页。"""
+        eff, total = self._pages_effective(job)
+        if total <= 0:
+            return "页数未知（转换/分析完成后自动补上）"
+        rng = (getattr(job, "page_range", "") or "").strip()
+        base = (f"文件共 {total} 页" + (f"（页码范围 {rng}）" if rng else "")
+                if eff == total else
+                f"文件共 {total} 页 · 页码范围 {rng}（实际打印 {eff} 页）")
+        tail = int(getattr(job, "blank_tail", 0) or 0)
+        if tail <= 0:
+            return base
+        if getattr(job, "blank_undo_range", None) is not None:
+            return base + f"\n⚠ 末尾有 {tail} 页空白：已排除（不收那一页的钱）。" \
+                          f"取消勾选「排除末尾空白页」可恢复。"
+        return base + f"\n⚠ 末尾有 {tail} 页空白（打出来就是白纸）。" \
+                      f"勾选「排除末尾空白页」可排掉并重算价格。"
+
+    def _set_pages_cell(self, row: int, job) -> None:
+        """只重写「页数」一格（页数后补 / 缓存命中时用；别整行重画，会丢选区）。"""
+        item = self._table.item(row, self.COL_PAGES)
+        if item is None:
+            return
+        item.setText(self._pages_cell_text(job))
+        item.setToolTip(self._pages_cell_tip(job))
+
     def _fill_table_row(self, row: int, job: PrintJob):
         """按 job 的当前值重写第 row 行的全部单元格（新建行与「参数改完就地重画」共用）。
 
@@ -7004,10 +7832,10 @@ class MainWindow(QMainWindow):
         range_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_RANGE, range_item)
 
-        # 页数
-        pages_text = str(job.page_count) if job.page_count > 0 else "?"
-        pages_item = QTableWidgetItem(pages_text)
+        # 页数 = 有效打印页数（按页码范围折算）；整份页数不同时括号注明，见 _pages_cell_text
+        pages_item = QTableWidgetItem(self._pages_cell_text(job))
         pages_item.setTextAlignment(Qt.AlignCenter)
+        pages_item.setToolTip(self._pages_cell_tip(job))
         self._table.setItem(row, self.COL_PAGES, pages_item)
 
         # 方向
@@ -7231,6 +8059,19 @@ class MainWindow(QMainWindow):
         self._edit_page_range.set_total_pages(job.page_count)
         self._edit_page_range.set_ranges(job.page_range)
 
+        # 末尾空白页勾选框：检测到才可用；勾选态 = "已经排除过"（有 undo 范围）
+        _tail = int(getattr(job, "blank_tail", 0) or 0)
+        self._edit_blank_tail.blockSignals(True)
+        self._edit_blank_tail.setChecked(getattr(job, "blank_undo_range", None) is not None)
+        self._edit_blank_tail.blockSignals(False)
+        self._edit_blank_tail.setEnabled(_tail > 0 and range_usable)
+        self._edit_blank_tail.setText(
+            f"排除末尾空白页（{_tail} 页）" if _tail > 0 else "排除末尾空白页")
+        self._edit_blank_tail.setToolTip(
+            (f"文件末尾有 {_tail} 页空白（打出来就是白纸）。\n"
+             "勾上 = 从本次打印里排掉并重算费用；再点一次恢复。") if _tail > 0 else
+            "未检测到末尾空白页（或页数还没分析出来）")
+
         # 转换引擎：选区里**只要有 Word 文件**就显示三选一（取值 = 选区里第一个 Word 文件的引擎，
         # 改动只作用于 .doc/.docx）；Word 文件之间引擎不一致时**追加**一项「混合（各自保留）」
         # 并选中它（显示真相，且此项不写回 = 保持各自设置）；一个 Word 文件都没有 → 只读标签显示
@@ -7427,8 +8268,17 @@ class MainWindow(QMainWindow):
             applied.append(row)
 
             job.copies = copies
+
+            # 页码范围（RangeListWidget 仅校验通过才发 rangesChanged；
+            # 此处再校验一次，非法输入时不写入，保留原值，避免被其他控件联动覆盖）
+            if ranges_valid and range_editable:
+                job.page_range = ranges_str
+
             # 图片/单页文件：双面无意义，固定单面（避免被禁用的双面控件残留值误写）
-            # 单页判定含范围选 1 页（多页文件手动选 1 页 → 双面物理上即单面输出）
+            # 单页判定含范围选 1 页（多页文件手动选 1 页 → 双面物理上即单面输出）。
+            # ⚠ 必须读**刚写入的** page_range：旧写法先算 single_page 再写范围，于是
+            # 「多页文件把范围改成 1 页」这一次不归一化 ⇒ 同一行同时写着「页数 1 页」和
+            # 「双面(长边)」，要等转换/开打才纠正（2026-10-27 现场 HN20261027-0012）。
             is_img = bool(job.file_path) and os.path.splitext(job.file_path)[1].lower() in self.IMAGE_EXTS
             single_page = _count_pages_in_range(job.page_range or "", job.page_count or 0) == 1
             if is_img or single_page:
@@ -7446,11 +8296,6 @@ class MainWindow(QMainWindow):
                 if img_ori != getattr(job, 'image_orientation', 'auto'):
                     job.image_orientation = img_ori
                     job.cached_pdf = ""   # 旧方向 PDF 失效
-
-            # 页码范围（RangeListWidget 仅校验通过才发 rangesChanged；
-            # 此处再校验一次，非法输入时不写入，保留原值，避免被其他控件联动覆盖）
-            if ranges_valid and range_editable:
-                job.page_range = ranges_str
 
             # 引擎（仅 Word 文件有意义；其余格式引擎显示为转换方式，不写回 job.engine）
             is_word = os.path.splitext(job.file_path)[1].lower() in (".doc", ".docx") if job.file_path else False
@@ -7529,6 +8374,34 @@ class MainWindow(QMainWindow):
                 "当前标签页未锁定，文件可直接编辑/移除，无需复制到新标签页。")
             move_action.triggered.connect(
                 lambda checked=False, rs=list(rows): self._add_rows_to_new_tab(rs))
+            # 末尾空白页（2026-10-28）：只对"检测到末尾有空白页"的行出现 —— 默认不排，
+            # 这里给批量入口（单个文件走编辑面板的勾选框）。
+            _jobs_now = self._get_current_jobs()
+            _blank_rows = [r for r in rows if r < len(_jobs_now)
+                           and int(getattr(_jobs_now[r], "blank_tail", 0) or 0) > 0]
+            _pending = [r for r in _blank_rows
+                        if getattr(_jobs_now[r], "blank_undo_range", None) is None]
+            _excluded = [r for r in _blank_rows
+                         if getattr(_jobs_now[r], "blank_undo_range", None) is not None]
+            if _pending or _excluded:
+                menu.addSeparator()
+            if _pending:
+                _blk = menu.addAction(
+                    f"⚠ 排除末尾空白页（{len(_pending)} 个文件）" if len(_pending) > 1
+                    else "⚠ 排除末尾空白页")
+                _blk.setEnabled(not frozen)
+                _blk.setToolTip("把文件末尾那张空白页从本次打印里排掉，页数/费用同步重算")
+                _blk.triggered.connect(
+                    lambda checked=False, rs=list(_pending):
+                    self._set_blank_tail_excluded(rs, True))
+            if _excluded:
+                _rst = menu.addAction(
+                    f"↩ 恢复末尾空白页（{len(_excluded)} 个文件）" if len(_excluded) > 1
+                    else "↩ 恢复末尾空白页")
+                _rst.setEnabled(not frozen)
+                _rst.triggered.connect(
+                    lambda checked=False, rs=list(_excluded):
+                    self._set_blank_tail_excluded(rs, False))
             menu.addSeparator()
             # 打开文件位置（只读，始终可用）
             anchor_row = clicked_row if clicked_row >= 0 else rows[0]
@@ -7727,6 +8600,17 @@ class MainWindow(QMainWindow):
         self._edit_page_range.rangesChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_page_range)
 
+        # 末尾空白页（2026-10-28 用户需求）：只在**检测到**末尾有空白页时可用。
+        # 勾上 = 把那几页从本次打印里排掉（排除动作落到 page_range 上，计费/双面配对/
+        # 进度条自然跟着变）；默认**不排** —— 白纸也是钱，得让操作员看见再决定。
+        self._edit_blank_tail = ThemedCheckBox("排除末尾空白页",
+                                            theme_manager=self._theme_manager)
+        self._edit_blank_tail.setToolTip(
+            "把文件末尾的空白页从本次打印里排掉（页数、费用、双面配对同步按排除后算）。\n"
+            "只有检测到末尾有空白页时才可用；取消勾选即恢复。")
+        self._edit_blank_tail.clicked.connect(self._on_blank_tail_toggled)
+        gl.addWidget(self._edit_blank_tail)
+
         # 打印引擎
         self._label_engine = QLabel("PDF转换引擎：")
         gl.addWidget(self._label_engine)
@@ -7765,6 +8649,7 @@ class MainWindow(QMainWindow):
             self._label_duplex, self._edit_duplex,
             self._label_duplex_mode, self._edit_duplex_mode,
             self._label_range, self._edit_page_range,
+            self._edit_blank_tail,
             self._label_engine, self._edit_engine,
             label_dpi, self._edit_dpi,
             self._label_img_orientation, self._edit_img_orientation,
@@ -8633,14 +9518,28 @@ class MainWindow(QMainWindow):
                         match_row = i
                         break
                 if match_row is not None:
+                    _old_pages = int(jobs[match_row].page_count or 0)
                     jobs[match_row].source_md5 = source_md5
                     jobs[match_row].cached_pdf = cached_pdf
                     jobs[match_row].page_count = page_count
                     jobs[match_row].orientation = orientation
+                    # 末尾空白页检测必须**同样覆盖缓存命中**：.doc/.docx 的 PDF 一旦进了
+                    # pdf_cache，后续添加走的就是这条路，而 _on_convert_finished 只覆盖
+                    # "真正转换这一次" ⇒ 漏了这里就是"页数出得来、⚠ 永远不出现"
+                    # （2026-10-28 现场：三个文件全部"缓存命中 → 2 页"、一个 ⚠ 都没有）。
+                    jobs[match_row].blank_tail = self._detect_blank_tail(cached_pdf)
+                    # 页数变了 ⇒ 按旧页数算出的排除范围会指错页，先还原再重标
+                    # （与 _on_convert_finished 同一道护栏）
+                    if (jobs[match_row].blank_undo_range is not None
+                            and int(page_count or 0) != _old_pages):
+                        jobs[match_row].page_range = jobs[match_row].blank_undo_range or ""
+                        jobs[match_row].blank_undo_range = None
+                        self._log(f"↩ 页数变化（{_old_pages}→{page_count}）："
+                                  f"已还原末尾空白页的排除，请重新确认")
                     self._save_config()
                     # 仅当目标标签页是当前前台标签页时更新表格（后台标签页表格不可见）
                     if not tab_key or tab_key == self._current_tab:
-                        self._table.item(match_row, self.COL_PAGES).setText(str(page_count))
+                        self._set_pages_cell(match_row, jobs[match_row])
                         ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
                         self._table.item(match_row, self.COL_ORIENT).setText(ori_map.get(orientation, ""))
                         self._recalc_row_cost(match_row)
@@ -9307,6 +10206,10 @@ class MainWindow(QMainWindow):
             return  # 让输入框正常处理 Delete 键
         self._on_remove_selected()
 
+    def _on_shortcut_new_tab(self):
+        """Ctrl+T / Ctrl+N 快捷键：新建标签页（等同点右上「＋」，不切走当前标签页的文件）。"""
+        self._new_tab()
+
     def _on_shortcut_paste(self):
         """Ctrl+V 快捷键：非文本编辑时粘贴文件。"""
         focused = QApplication.focusWidget()
@@ -9322,6 +10225,35 @@ class MainWindow(QMainWindow):
         ]
         if html_paths:
             self._warn_html_unsupported(html_paths)
+
+    def _on_shortcut_close_tab(self):
+        """Ctrl+W 快捷键：关闭当前标签页（未打印的先确认，正在打印则硬拦）。"""
+        self._close_current_tab()
+
+    def _focus_takes_arrow_keys(self) -> bool:
+        """焦点是否落在「←/→ 是编辑手势」的**文本类**控件上（光标移动 / 数字增减）。
+
+        命中就放行给控件：否则操作员改不了页码范围、调不动份数、动不了备注光标。
+
+        **下拉框（QComboBox）刻意不豁免**：① 方向键在下拉框里是"静默改值"——焦点若停在
+        打印机下拉上，按一下 → 就把打印队列换掉了，比"切页没生效"危险得多；② 主窗口启动时
+        第一个拿到焦点的控件就是打印机下拉，豁免它等于快捷键默认全失效。改下拉项仍可用
+        点击/展开后选。表格是只读的（NoEditTriggers），方向键在那里只挪选中格 —— 也不豁免。
+
+        焦点在**别的顶层窗口**（攒批队列、翻纸窗、标签页管理窗…）时同样不抢：那里的 ←/→
+        是树的展开/收起、列表导航，而且切的是背后主窗口的标签页 —— 用户看不到因果。
+        """
+        focused = QApplication.focusWidget()
+        if focused is not None and focused.window() is not self:
+            return True
+        return isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit,
+                                    QAbstractSpinBox))
+
+    def _on_shortcut_switch_tab(self, delta: int):
+        """←/→ 快捷键：切换标签页。到两端即停，**最右侧不新建**（与「＋」按钮相反）。"""
+        if self._focus_takes_arrow_keys():
+            return  # 让输入框/下拉框/数字框自己处理方向键
+        self._switch_tab(delta, create_at_end=False)
 
     def _abandon_jobs(self, jobs):
         """通知后端放弃未打印的云端任务（已完成的跳过）。"""
@@ -10104,7 +11036,13 @@ class MainWindow(QMainWindow):
             logger.debug(f"上报攒批状态失败: {e}")
 
     def _stack_state_tick(self):
-        """定时（2s）比对攒批模式 + 忙闲，**变化才上报** —— 移动端状态随之实时刷新。"""
+        """定时（2s）比对攒批模式 + 忙闲，**变化才上报** —— 移动端状态随之实时刷新。
+
+        顺带做一道**防呆兜底**：排队里还有请求、纸叠是空的、也没在打印 ⇒ 这些请求现在
+        一定放得出去（准入只看容量），不必等某个"纸叠收尾"事件来叫醒它们。
+        2026-10-28 现场就是缺这一步：请求被停在队列里，而那张纸叠是**空的**，
+        永远不会有收尾事件 ⇒ 点了「开始打印」不出纸、也关不掉攒批模式。
+        """
         try:
             sig = (self._stack_mode_on(), self._stack_busy_reason())
             if sig != getattr(self, "_last_stack_sig", None):
@@ -10112,6 +11050,17 @@ class MainWindow(QMainWindow):
                 self._report_stack_state()
         except Exception as e:      # 定时器路径绝不能抛
             logger.debug(f"攒批状态心跳失败: {e}")
+        # 兜底放行（见文档串）：只在"有排队 + 纸叠空 + 没在打"时动，条件不成立就什么都不做
+        try:
+            queued = bool(getattr(self, "_stack_wait", None)
+                          or getattr(self, "_stack_entry_wait", None))
+            # `_stack_flush_worker is None`：整叠第 2 趟刚打完、正在收尾的那一小段里
+            # 新请求仍该排队（出纸槽还是那一叠），别在收尾前抢跑。
+            if (queued and not self._stack_busy() and not self._stack.entries
+                    and self._stack_flush_worker is None):
+                self._flush_stack_queues_as_normal()
+        except Exception as e:
+            logger.debug(f"攒批排队兜底放行失败: {e}")
 
     def _on_remote_stack_mode(self, enable: bool, by: str = ""):
         """（主线程）移动端下发的攒批模式切换。执行前**再自查一次**适用性与忙闲。
@@ -10124,6 +11073,13 @@ class MainWindow(QMainWindow):
             why = self._stack_inapplicable_reason()
             self._log(f"📱 移动端请求开启「🖐 攒批模式」被拒：{why}")
             self._report_stack_state(f"未执行：{why}")
+            return
+        has_entries = bool(getattr(getattr(self, "_stack", None), "entries", None))
+        if (not want) and (not has_entries) and (not self._stack_busy()):
+            # 与本地开关同口径：只剩排队的请求不算"忙"，关掉后立刻按普通打印放行
+            self._log(f"📱 移动端关闭「🖐 攒批模式」{f'（操作者：{by}）' if by else ''}")
+            self._apply_stack_mode(False, source="移动端")
+            self._flush_stack_queues_as_normal()
             return
         busy = self._stack_busy_reason()
         if busy:
@@ -10245,6 +11201,13 @@ class MainWindow(QMainWindow):
                 self._log(f"🖐 攒批模式已关闭，但纸叠保留（{self._stack.count} 单 / "
                           f"{self._stack_present_sheets()} 张纸仍未打第 2 趟）——"
                           f"列表里随时可以继续")
+            return
+        # 关闭模式时，"只剩排队中的请求"（纸叠空、也没在打）**不能**当成"打印机正忙"把人
+        # 锁死：2026-10-28 现场就是这么被卡住的 —— 点了「开始打印」不出纸，想关攒批又被
+        # 拒绝，只能强关程序。关掉后立刻把这些请求按普通流程打出去（顺序不变、不丢单）。
+        if (not want) and (not has_entries) and (not self._stack_busy()):
+            self._apply_stack_mode(False, source="本地")
+            self._flush_stack_queues_as_normal()
             return
         busy = self._stack_busy_reason()
         if busy:
@@ -10391,10 +11354,21 @@ class MainWindow(QMainWindow):
         """把一次打印请求排队，等当前纸叠打完再放行（出纸槽独占，见铁律①）。"""
         if not flat_jobs:
             return True
+        key = tab_key or ""
+        for req in self._stack_wait:
+            # 同一标签页的**同一批 job 对象**已经排在队里 ⇒ 不再压第二条。旧写法没有这道
+            # 去重：现场连点两次「开始打印」就排了两条（2026-10-28 13:34:55 / 13:35:22），
+            # 一旦真被放行，同一批文件会打两遍 —— 白花纸和白花钱。
+            if (req.get("tab_key") or "") == key and req.get("_job_ids") == {id(j) for j in flat_jobs}:
+                req["reason"] = reason
+                self._log("⏸ 这一单已经在排队等纸叠打完（同一批文件），不用重复点")
+                self._refresh_stack_dialog()
+                return True
         self._stack_wait.append({
             "jobs": list(flat_jobs),
-            "tab_key": tab_key or "",
+            "tab_key": key,
             "reason": reason,
+            "_job_ids": {id(j) for j in flat_jobs},
         })
         names = "、".join((j.display_name or os.path.basename(j.file_path or ""))
                           for j in flat_jobs[:3])
@@ -10426,6 +11400,26 @@ class MainWindow(QMainWindow):
                 self._stack_wait.insert(0, req)
                 break
 
+    def _flush_stack_queues_as_normal(self) -> int:
+        """把攒批排队里的请求按**普通打印**放行（关掉攒批模式、或纸叠已空时的兜底）。
+
+        两类队列都收：「等上一单第 1 趟」的 `_stack_entry_wait` 原样搬进 `_stack_wait`，
+        再走同一个 drain —— 顺序不变、不丢单。攒批模式已关 / 纸叠已空时 `_stack_gate` 会
+        判 "normal"，这些请求就按普通流程打出去（不再进叠）。返回放行了几条。
+        """
+        entries = list(getattr(self, "_stack_entry_wait", None) or [])
+        if entries:
+            try:
+                self._stack_entry_wait.clear()
+            except AttributeError:
+                self._stack_entry_wait = []
+            self._stack_wait.extend(entries)
+        before = len(self._stack_wait)
+        # 这里**刻意不打日志**：本方法也可能被 2 秒定时器反复调用，而真正放行时
+        # `_drain_stack_wait_queue` 自己会为每个请求写一条 —— 在这里再写就成了刷屏。
+        self._drain_stack_wait_queue()
+        return before
+
     def _can_start_request_now(self, jobs: list) -> bool:
         """这批请求现在能不能开打（不实际启动，只看纸叠准入）。
 
@@ -10448,19 +11442,23 @@ class MainWindow(QMainWindow):
         return not self._stack.entries
 
     def _request_rotate(self, jobs: list) -> tuple[bool, bool, str]:
-        """本请求的第 2 趟旋转补偿 → (是否可用, 旋转值, 不可用原因)。
+        """本请求的第 2 趟旋转补偿 → (是否可用, 名义旋转值, 说明)。
 
-        ⚠ 别把"旋转值"当成功标志用：`rotate=False`（短边不补偿）是**合法值**，
-        拿它做 `if not ok` 判断会把短边单误判成"不可用"并带着空原因去排队。
-        同一请求里混排长短边 → 不可用（一叠只能有一种补偿）。
+        ⚠ 别把"旋转值"当成功标志用：`rotate=False`（短边不补偿）是**合法值**。
+
+        ⚠ **混排长短边不再算"不可用"**（2026-10-28）：第 2 趟的 180° 早就是逐张纸的
+        （`FilePlan.second_rotate` → `print_plan_pass` 的 rotate_slots），一叠里长边/短边
+        可以混排。旧实现把混排判成"不可用"→ 请求被丢进排队的死胡同：纸叠是空的，
+        没有任何收尾事件能放行它（2026-10-28 现场：点「开始打印」不出纸、还关不掉攒批）。
+        返回值里的 rotate 只作"本叠名义方向"（日志/旧清单兜底），不参与裁决。
         """
         duplex_jobs = [j for j in jobs if self._uses_manual_duplex_job(j)]
         if not duplex_jobs:
             return True, True, ""
         vals = {self._rotate_for_job(j) for j in duplex_jobs}
-        if len(vals) > 1:
-            return False, False, "同一单里混排了长边/短边装订，攒批时只能有一种旋转补偿"
-        return True, bool(next(iter(vals))), ""
+        note = ("本单混排长边/短边装订：第 2 趟按各文件自己的装订方向逐张纸补偿"
+                if len(vals) > 1 else "")
+        return True, bool(next(iter(vals))), note
 
     def _rotate_for_job(self, job) -> bool:
         """本任务第 2 趟要不要旋转 180°：纸路径实测值 × 装订方向（与 worker 同口径）。"""
@@ -10475,7 +11473,7 @@ class MainWindow(QMainWindow):
         返回 (能否, 原因, 估算张数, 是否有页数未知的文件)。
         """
         ok_rot, rotate, rot_reason = self._request_rotate(jobs)
-        if not ok_rot:
+        if not ok_rot:                      # 现在恒为 True（保留分支给未来强约束）
             return False, rot_reason, 0, False
         sheets, unknown = duplex_stack.estimate_jobs_sheets(jobs, _count_pages_in_range)
         adm = self._stack.admit(sheets, rotate, unknown)
@@ -11901,7 +12899,7 @@ class MainWindow(QMainWindow):
                      "LibreOffice</small>"))
         rows.append(("管理员自打",
                      "<span style='color:#e67e22;font-weight:bold'>允许 Word/WPS COM</span>"
-                     "<br><small>仅「订单类型=自打 **且** 文件由管理员上传」；COM 已禁用宏/弹窗/外链更新，"
+                     "<br><small>仅「订单类型=自打 <b>且</b> 文件由管理员上传」；COM 已禁用宏/弹窗/外链更新，"
                      "Word/WPS 都不可用时自动降级 LibreOffice</small>"))
 
         # ── 系统打印机 ──
@@ -12133,6 +13131,10 @@ class MainWindow(QMainWindow):
             "<tr><td><b>Ctrl+Shift+C</b></td><td>复制计费明细</td></tr>"
             "<tr><td><b>Delete</b> / <b>Ctrl+D</b></td><td>删除选中文件</td></tr>"
             "<tr><td><b>Ctrl+V</b></td><td>粘贴文件</td></tr>"
+            "<tr><td><b>Ctrl+T</b> / <b>Ctrl+N</b></td><td>新建标签页</td></tr>"
+            "<tr><td><b>Ctrl+W</b></td><td>关闭当前标签页（未打印的先确认）</td></tr>"
+            "<tr><td><b>←</b> / <b>→</b></td>"
+            "<td>切换标签页（到两端即停，最右侧不新建；输入框里有焦点时是编辑光标）</td></tr>"
             "</table>"
         )
 
@@ -13126,6 +14128,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """关闭窗口时检查未完成任务，确认后保存并退出。"""
         self._closing = True  # 打印启动等待（processEvents）期间检测到关窗 → 中止启动流程
+        # 外部打印监视：退出前停线程 + 关 spooler 通知句柄（别指望进程退出时的隐式清理）
+        self._stop_external_watch()
         # 关闭云端任务列表窗口
         if self._cloud_task_window and self._cloud_task_window.isVisible():
             self._cloud_task_window.close()
@@ -13391,9 +14395,21 @@ class MainWindow(QMainWindow):
                 os.remove(old_pdf)
             except OSError:
                 pass
+        _old_page_count = int(jobs[target_row].page_count or 0)
         jobs[target_row].cached_pdf = cached_pdf
         jobs[target_row].page_count = page_count
         jobs[target_row].orientation = orientation
+        # 末尾空白页检测：只在**真实 PDF 到手**之后才谈得上（.doc/.docx 的页是转换出来的）。
+        # 只标不排：排除动作由操作员勾选「排除末尾空白页」（见 _set_blank_tail_excluded）。
+        jobs[target_row].blank_tail = self._detect_blank_tail(cached_pdf)
+        # 换引擎重转 ⇒ 页数可能变。旧的"排除范围"是按旧页数算出来的，对不上就是错页，
+        # 所以先还原成排除前的范围再按新页数重标（宁可让操作员再勾一次）。
+        if (jobs[target_row].blank_undo_range is not None
+                and int(page_count or 0) != _old_page_count):
+            jobs[target_row].page_range = jobs[target_row].blank_undo_range or ""
+            jobs[target_row].blank_undo_range = None
+            self._log(f"↩ 页数变化（{_old_page_count}→{page_count}）："
+                      f"已还原末尾空白页的排除，请重新确认")
 
         # ── 单页归一化：有效页数 == 1 的本地文件一律改单面（2026-10-17 现场事故）──
         # 现场：单页 docx 的 job.duplex="on"（print_config.json 里 page_count=1）→ 日志
@@ -13421,7 +14437,7 @@ class MainWindow(QMainWindow):
         if not tab_key or tab_key == self._current_tab:
             self._set_current_jobs(jobs)
             if target_row < self._table.rowCount():
-                self._table.item(target_row, self.COL_PAGES).setText(str(page_count))
+                self._set_pages_cell(target_row, jobs[target_row])
                 ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
                 ori_text = ori_map.get(orientation, "")
                 self._table.item(target_row, self.COL_ORIENT).setText(ori_text)
@@ -13611,7 +14627,7 @@ class MainWindow(QMainWindow):
         # 缺失时由 _start_convert_worker 在转换流程中计算
         source_md5 = getattr(task, 'source_md5', '') or ''
 
-        page_count = 0; orientation = ""; cached_pdf = ""
+        page_count = 0; orientation = ""; cached_pdf = ""; blank_tail = 0
         need_convert = False
 
         # 0. 先确定 docx 转换引擎（缓存 key 需按引擎隔离，必须在查缓存之前计算；
@@ -13629,7 +14645,18 @@ class MainWindow(QMainWindow):
             cache_engine = cache_engine_for(task.file_name, engine)
 
         # 1. 检查 PDF 缓存（MD5 索引；图片按方向、docx 按转换引擎分开缓存）
-        if source_md5 and self._cloud_client:
+        #
+        # ⚠ 2026-10-28 修的真实缺陷（现场 HN20261028-0002 撞上）：放行 COM 的文件**不能**采纳
+        #   一份"引擎身份不明"的缓存 —— 页数分析路径恒用 LibreOffice 转换，且历史上会把
+        #   `.doc` 的产物写进打印缓存（`.doc` 的 `cache_engine_for()` 恒返回 ""，不带引擎后缀），
+        #   于是打印侧算出的 key 与它完全相同 ⇒ 永远命中那份 LO PDF ⇒ 管理员例外对 `.doc`
+        #   结构性失效（勾了自打也不会走 Word/WPS）。现在：分析路径不再写 Office 缓存，
+        #   且放行 COM + 无引擎后缀时**忽略缓存、重新转换**（见 _start_convert_worker）。
+        _com_allowed = cloud_word_com_allowed(getattr(task, 'uploader_is_admin', False))
+        _cache_identity_known = bool(cache_engine)
+        _skip_cache_for_com = (_com_allowed and ext in (".doc", ".docx")
+                               and not _cache_identity_known)
+        if source_md5 and self._cloud_client and not _skip_cache_for_com:
             cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
                 source_md5, getattr(task, 'image_orientation', 'auto'), cache_engine)
             if cached_pdf and cached_meta:
@@ -13640,14 +14667,19 @@ class MainWindow(QMainWindow):
                     _info = _gpi(cached_pdf)
                     page_count = _info.get("page_count", page_count)
                     orientation = _info.get("orientation", "")
+                    blank_tail = self._detect_blank_tail(cached_pdf)
                 self._log(f"📦 缓存命中: {task.file_name} → {page_count} 页 (MD5={source_md5[:8]}...)"
                           + (f", 引擎={cache_engine}" if cache_engine else ""))
-                cached_pdf = cached_pdf  # 直接使用缓存的 PDF
+        if _skip_cache_for_com:
+            self._log(f"  → 管理员上传：跳过无引擎身份的既有 PDF 缓存，按 {engine} 重新转换"
+                      f"（避免复用分析路径留下的 LibreOffice 产物）")
+            cached_pdf = ""
 
         # 2. 未命中缓存 → 从本地文件获取信息
         if page_count <= 0 and task.local_path and os.path.isfile(task.local_path):
             if ext == ".pdf":
                 info = get_pdf_info(task.local_path); page_count = info["page_count"]; orientation = info["orientation"]
+                blank_tail = self._detect_blank_tail(task.local_path)
             elif ext in image_exts:
                 info = get_image_info(task.local_path); page_count = info["page_count"]; orientation = info["orientation"]
             elif ext == ".docx":
@@ -13669,6 +14701,7 @@ class MainWindow(QMainWindow):
             task_id=task.task_id,
             order_id=task.order_id or 0,
             source_md5=source_md5,
+            blank_tail=blank_tail,        # 末尾空白页：**只标不排**（云端价格后端已定，见需求口径）
             display_name=task.file_name,  # 使用后端返回的原始文件名
             order_number=task.order_number,  # 云端订单号
             remark=getattr(task, 'remark', '') or '',  # 云端订单备注
@@ -13682,14 +14715,13 @@ class MainWindow(QMainWindow):
 
         # Word 文件：缓存未命中时才启动转换（传真实行号，job 已 append；
         # 回调改为按 file_path 匹配，行号仅作快速路径提示；tab_key 定位目标标签页）
-        # from_cloud=True（S1-04）：云端任务的文件是顾客上传的 ⇒ 默认强制 LibreOffice，不碰 COM。
-        # allow_cloud_com（2026-10-26 隐式规则）：仅「管理员自打 + 管理员上传」放行。
+        # from_cloud=True（S1-04）：云端任务的文件默认强制 LibreOffice，不碰 COM。
+        # allow_cloud_com（2026-10-28 口径）：只看**上传者是不是管理员**。
         if ext in (".doc", ".docx") and task.local_path and not cached_pdf:
             row = len(self._config.tabs[new_key].jobs) - 1
             self._start_convert_worker(
                 row, task.local_path, engine, tab_key=new_key, from_cloud=True,
                 allow_cloud_com=cloud_word_com_allowed(
-                    getattr(task, 'is_admin_print', False),
                     getattr(task, 'uploader_is_admin', False)))
 
         self._log(f"☁ 云端任务 #{task.task_id} 已添加到标签页 {new_key}")
@@ -13852,9 +14884,10 @@ class MainWindow(QMainWindow):
             existing_paths.add(work_path)
             existing_sources.add(src_key)
 
-            page_count = 0; orientation = ""
+            page_count = 0; orientation = ""; blank_tail = 0
             if ext == ".pdf":
                 info = get_pdf_info(work_path); page_count = info["page_count"]; orientation = info["orientation"]
+                blank_tail = self._detect_blank_tail(work_path)
             elif ext == ".docx":
                 orientation = get_docx_orientation(work_path)
             elif ext in image_exts:
@@ -13876,6 +14909,7 @@ class MainWindow(QMainWindow):
                 duplex="off" if is_image else "on",
                 duplex_mode=duplex_mode,
                 page_count=page_count, orientation=orientation, engine=engine,
+                blank_tail=blank_tail,
             )
             jobs.append(job)
 
