@@ -673,8 +673,11 @@ for depth in (1000, 2000, 5000):
         r_no.status_code == 403, _b7[-1])
     r_tok = client.post(URL, headers=HDR, data=_deep_body(depth), content_type="application/json")
     _b7.append(("token", depth, r_tok.status_code))
-    chk("B7 depth %d + 带 token → 400（请求体不可用，不是 500）" % depth,
-        r_tok.status_code == 400, _b7[-1])
+    # 不可接受的只有 500：解析失败要 fail-closed 成 400；而 CPython 3.12 的 json 扫描器能吃掉
+    # 更深的嵌套（同样的 1000/2000 层在 3.11 抛 RecursionError、在 3.12 正常解析），此时按
+    # 正常请求处理（200）才是对的。判据因此钉「不是 500」，不钉具体是 400 还是 200。
+    chk("B7 depth %d + 带 token → 不是 500（能解析就正常处理，解析不了 fail-closed 成 400）" % depth,
+        r_tok.status_code in (200, 400), _b7[-1])
 chk("B7 深嵌套请求的 500 计数 = 0", sum(1 for _ in _b7 if _[2] == 500) == 0, _b7)
 
 print("\n-- B5⑥/B6b start_printing 父订单守卫（行为）：三终态不许复活 waiting 单；failed 放行 --")

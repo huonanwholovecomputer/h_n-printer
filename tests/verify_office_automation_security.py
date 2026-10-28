@@ -256,8 +256,17 @@ check("WPS COM 路径也调用了 _harden_office_com_app",
 # ============================================================
 section("2. 云端调用链：三个入口都把「云端来源」传下去")
 
-check("cloud_client.py 页数分析：converter.convert(..., from_cloud=True)",
-      bool(re.search(r"converter\.convert\(temp_dl,\s*from_cloud=True\)", CLOUD_SRC)))
+def _cloud_analysis_passes_from_cloud(src: str) -> bool:
+    """页数分析调用点必须传 from_cloud=True。
+
+    2026-10-28 起它同时会传 allow_cloud_com（分析用的引擎要与打印同一口径），
+    所以判据只钉「from_cloud=True 仍在」，不钉参数表的结尾形状。
+    """
+    return bool(re.search(r"converter\.convert\(\s*temp_dl,\s*from_cloud=True", src))
+
+
+check("cloud_client.py 页数分析：converter.convert(..., from_cloud=True[+ allow_cloud_com])",
+      _cloud_analysis_passes_from_cloud(CLOUD_SRC))
 
 check("gui.py ConvertWorker 接收 from_cloud/allow_cloud_com；未放行时云端不走 COM",
       bool(re.search(r"def __init__\(self,\s*row:\s*int,\s*file_path:\s*str,\s*engine:\s*str,"
@@ -555,11 +564,13 @@ check("基线：八条静态判据全绿（变异自证的前提）", all(ok for
       str([n for n, ok in results if not ok]))
 
 # 5h. 云端调用点去掉 from_cloud → 接线判据必须红
-_mut_cloud = CLOUD_SRC.replace("converter.convert(temp_dl, from_cloud=True)",
-                              "converter.convert(temp_dl)")
+_mut_cloud = CLOUD_SRC.replace(
+    "converter.convert(temp_dl, from_cloud=True, allow_cloud_com=bool(allow_cloud_com))",
+    "converter.convert(temp_dl, allow_cloud_com=bool(allow_cloud_com))")
 check("变异「云端页数分析不传 from_cloud」→ 接线判据变红",
-      not re.search(r"converter\.convert\(temp_dl,\s*from_cloud=True\)", _mut_cloud)
-      and bool(re.search(r"converter\.convert\(temp_dl,\s*from_cloud=True\)", CLOUD_SRC)))
+      _mut_cloud != CLOUD_SRC
+      and not _cloud_analysis_passes_from_cloud(_mut_cloud)
+      and _cloud_analysis_passes_from_cloud(CLOUD_SRC))
 
 _mut_gui = GUI_SRC.replace(
     "row, task.local_path, engine, tab_key=new_key, from_cloud=True,",

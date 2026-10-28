@@ -627,6 +627,11 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .donut-center { position: absolute; left: 0; right: 0; top: 48%; transform: translateY(-50%); text-align: center; pointer-events: none; }
 .donut-center .dc-num { font-size: 1.02rem; font-weight: 800; }
 .donut-center .dc-lbl { font-size: .66rem; color: var(--muted); }
+/* 环形图图例（订单构成）：小到画不出扇区/标签的来源也在这里露出名称与单数 */
+.donut-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; justify-content: center; margin-top: 8px; font-size: .78rem; color: var(--muted); }
+.donut-legend .dl-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.donut-legend .dl-dot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.donut-legend .dl-num { color: var(--text); font-weight: 700; }
 
 /* 订单明细：状态色条 */
 tr.st-bar td:first-child { position: relative; }
@@ -3846,11 +3851,16 @@ function _cloudAgg(orders) {
 /* 收益构成（按来源，全量订单口径）：返回「元」，结构与后端 revenue_summary 一致。
    v5.1：自打订单金额不计入；v5.17：金额按合并后的云端收益记录（sent+待处理）计算，与 KPI 同口径。 */
 function _sourceAgg(orders) {
-  var rs = { total: 0, wechat: 0, app: 0, local: 0, wechat_orders: 0, app_orders: 0, local_orders: 0,
-             wechat_files: 0, app_files: 0, local_files: 0, wechat_pages: 0, app_pages: 0, local_pages: 0, total_pages: 0 };
+  var rs = { total: 0, wechat: 0, app: 0, local: 0, external: 0,
+             wechat_orders: 0, app_orders: 0, local_orders: 0, external_orders: 0,
+             wechat_files: 0, app_files: 0, local_files: 0, external_files: 0,
+             wechat_pages: 0, app_pages: 0, local_pages: 0, external_pages: 0, total_pages: 0 };
   (orders || []).forEach(function (o) {
     var src = o.source || 'wechat';
-    if (src !== 'wechat' && src !== 'app' && src !== 'local') src = 'wechat';
+    /* v7.4（2026-10-28 用户要求）：「外部监视」是**第四个来源**，必须自成一段 —— 旧写法把它折成
+       wechat，于是饼图里根本没有它的扇区，还把它算进了「小程序」的订单数（与「来源」筛选、
+       明细徽标三处口径不一致）。 */
+    if (src !== 'wechat' && src !== 'app' && src !== 'local' && src !== 'external') src = 'wechat';
     rs[src + '_orders']++;
     var nf = (o.files || []).length;
     rs[src + '_files'] += nf;
@@ -4806,23 +4816,66 @@ function _renderStatusDonut(canvasId, orderStatusCount) {
     plugins: [_leaderLabelPlugin]
   });
 }
+/* 订单构成的四个来源（**唯一真相**：环形图分段与下方图例都读这一份，改色/加来源只改这里）。
+   v7.4：外部打印监视（print_watch 里「已处理」的作业）与云端三来源并列，颜色与
+   _SOURCE_OPTIONS 的 external 同色 —— 来源筛选 / 明细徽标 / 环形图 / 图例一个色系。 */
+var _SOURCE_SEGS = [
+  { key: 'wechat', label: '小程序', color: '#07C160' },
+  { key: 'app', label: 'APP', color: '#4F6EF7' },
+  { key: 'local', label: '本地', color: '#FF9500' },
+  { key: 'external', label: '外部监视', color: '#0d9488' }
+];
+/* 环形图下方的图例（**唯一实现**，三个环形图共用）：items = [{label, color, count, unit}]，
+   count<=0 的不占位置。为什么需要它：引线标签插件对弧长 < MIN_ARC≈5.2° 的扇区直接跳过
+   （外部监视 1 单 = 0.22%、放弃打印 1 单……），光看图看不出这些项存在过；图例把名称与
+   计数直接写出来，与扇区同色，小到看不见的项也一眼能找到。 */
+function _donutLegendHTML(items) {
+  var parts = (items || []).map(function (it) {
+    if (!it) return '';
+    var n = Number(it.count) || 0;
+    if (n <= 0) return '';
+    return '<span class="dl-item"><i class="dl-dot" style="background:' + it.color + '"></i>'
+      + it.label + ' <b class="dl-num">' + n + '</b>' + (it.unit || '单') + '</span>';
+  }).filter(function (x) { return x; });
+  return parts.length ? '<div class="donut-legend">' + parts.join('') + '</div>' : '';
+}
+/* 订单构成：四个来源（_SOURCE_SEGS 是唯一真相） */
+function _sourceLegendHTML(rs) {
+  return _donutLegendHTML(_SOURCE_SEGS.map(function (s) {
+    return { label: s.label, color: s.color, count: (rs && rs[s.key + '_orders']) || 0 };
+  }));
+}
+/* 订单状态分布：与环形图**同一排序**（按单数降序），否则图例顺序跟扇区对不上 */
+function _statusLegendHTML(statusCount) {
+  var src = statusCount || {};
+  var sorted = Object.keys(src).sort(function (a, b) { return src[b] - src[a]; });
+  return _donutLegendHTML(sorted.map(function (s) {
+    return { label: statusLabel(s), color: _statusColor(s), count: src[s] };
+  }));
+}
+/* 免费打印占比：两段（免费打印=管理员自行打印 / 实际订单），颜色与扇区一致 */
+function _selfRatioLegendHTML(selfCount, totalCount) {
+  var self = Number(selfCount) || 0;
+  var total = Number(totalCount) || 0;
+  return _donutLegendHTML([
+    { label: '免费打印', color: '#007AFF', count: self },
+    { label: '实际订单', color: '#FF9500', count: Math.max(0, total - self) }
+  ]);
+}
 function _renderSourceDonut(canvasId, rs) {
   var canvas = document.getElementById(canvasId);
   if (!canvas) return;
   var ctx = canvas.getContext('2d');
-  var segs = [
-    { key: 'wechat', label: '小程序', color: '#07C160' },
-    { key: 'app', label: 'APP', color: '#4F6EF7' },
-    { key: 'local', label: '本地', color: '#FF9500' },
-  ];
+  var segs = _SOURCE_SEGS;
   // v5.19：订单构成 —— 按来源订单数绘图（由「收益构成」改为「订单构成」）
-  var labels = [], data = [], colors = [];
+  var labels = [], data = [], colors = [], keys = [];
   segs.forEach(function (s) {
     var v = rs[s.key + '_orders'] || 0;
     if (v <= 0) return;
     labels.push(s.label + ' ' + v + '单');
     data.push(v);
     colors.push(s.color);
+    keys.push(s.key);        // 与 data 一一对应：扇形下标 → 来源 key（见下方 tooltip）
   });
   if (!data.length) return;   // 本月无订单，不画图
   _cloudCharts[canvasId] = new Chart(ctx, {
@@ -4834,8 +4887,10 @@ function _renderSourceDonut(canvasId, rs) {
       plugins: {
         legend: { display: false },
         tooltip: { callbacks: { label: function (c) {
-          var s = segs[c.dataIndex];
-          return c.label + ' — 文件 ' + (rs[s.key + '_files'] || 0) + ' · ' + (rs[s.key + '_pages'] || 0) + '页';
+          // ⚠ 必须用 keys[c.dataIndex]：无单的来源不会推入 data，直接用 segs 下标会错位
+          //（如 APP 为 0 时，悬停「本地」会报成 APP 的文件数与页数）
+          var k = keys[c.dataIndex];
+          return c.label + ' — 文件 ' + (rs[k + '_files'] || 0) + ' · ' + (rs[k + '_pages'] || 0) + '页';
         } } }
       },
       animation: { animateRotate: true, duration: 1000, easing: 'easeOutQuart' }
@@ -6622,12 +6677,12 @@ function _renderCloudShared() {
   h += '</div>';
 
   h += '<div id="cloud-view-revenue" class="chart-grid"' + (_cloudChartView !== 'revenue' ? ' style="display:none"' : '') + '>';
-  h += '<div class="section"><h2>🧩 订单状态分布</h2><div class="chart-wrap"><canvas id="cloud-chart-status"></canvas><div class="donut-center"><div class="dc-num">' + sg.rate + '%</div><div class="dc-lbl">完成率</div></div></div></div>';
-  h += '<div class="section"><h2>📦 订单构成 <span class="hint">按来源订单数</span></h2><div class="chart-wrap"><canvas id="cloud-chart-source"></canvas><div class="donut-center"><div class="dc-num">' + ((rs.wechat_orders || 0) + (rs.app_orders || 0) + (rs.local_orders || 0)) + '</div><div class="dc-lbl">总订单</div></div></div>';
+  h += '<div class="section"><h2>🧩 订单状态分布</h2><div class="chart-wrap"><canvas id="cloud-chart-status"></canvas><div class="donut-center"><div class="dc-num">' + sg.rate + '%</div><div class="dc-lbl">完成率</div></div></div>' + _statusLegendHTML(st) + '</div>';
+  h += '<div class="section"><h2>📦 订单构成 <span class="hint">按来源订单数</span></h2><div class="chart-wrap"><canvas id="cloud-chart-source"></canvas><div class="donut-center"><div class="dc-num">' + ((rs.wechat_orders || 0) + (rs.app_orders || 0) + (rs.local_orders || 0) + (rs.external_orders || 0)) + '</div><div class="dc-lbl">总订单</div></div></div>' + _sourceLegendHTML(rs);
   h += '</div>';
   // 免费打印 vs 实际订单 比例（免费打印=管理员自行打印）
   var selfPct = fagg.orders > 0 ? Math.round(fagg.selfOrders / fagg.orders * 100) : 0;
-  h += '<div class="section"><h2>🆓 免费打印占比 <span class="hint">免费打印=管理员自行打印</span></h2><div class="chart-wrap"><canvas id="cloud-chart-selfratio"></canvas><div class="donut-center"><div class="dc-num">' + selfPct + '%</div><div class="dc-lbl">免费打印</div></div></div>';
+  h += '<div class="section"><h2>🆓 免费打印占比 <span class="hint">免费打印=管理员自行打印</span></h2><div class="chart-wrap"><canvas id="cloud-chart-selfratio"></canvas><div class="donut-center"><div class="dc-num">' + selfPct + '%</div><div class="dc-lbl">免费打印</div></div></div>' + _selfRatioLegendHTML(fagg.selfOrders || 0, fagg.orders || 0);
   h += '</div>';
   h += '</div>';
 

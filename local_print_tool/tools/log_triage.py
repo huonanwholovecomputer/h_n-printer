@@ -2,9 +2,10 @@
 
 Why this exists
 ---------------
-local_tool.log is written at INFO level only — the sample log has 1846 lines and not one
-WARNING or ERROR. Severity is not in the level field; it is in the message text. A keyword
-scan over that text both misses things and invents them:
+The local tool now writes one log file per day (logs/YYYY-MM-DD.log) at INFO level only —
+the sample log has 1846 lines and not one WARNING or ERROR. Severity is not in the level
+field; it is in the message text. A keyword scan over that text both misses things and
+invents them:
 
     ========== 打印完毕：成功 1，失败 0 ==========   ← contains 失败, reports success
     📦 缓存命中: 示例文档.pdf → 0 页                ← a real fault, contains no fault word
@@ -47,7 +48,7 @@ Jev only judges. Every number in the output comes from code arithmetic over its 
 
 Usage
 -----
-    python tools/log_triage.py                    # triage %APPDATA%\\HN打印工具\\logs\\local_tool.log
+    python tools/log_triage.py                    # triage %APPDATA%\\HN打印工具\\logs\\YYYY-MM-DD.log
     python tools/log_triage.py --log some.log
     python tools/log_triage.py --dry-run          # build the corpus and check the payload; no API call
     python tools/log_triage.py --fixture          # judge the committed corpus instead
@@ -291,7 +292,11 @@ def load_events(args) -> tuple[list[dict], list[str]]:
         path = Path(args.log)
     else:
         import paths                                      # only needed for the live-log path
-        path = Path(paths.logs_dir()) / "local_tool.log"
+        import daily_log
+        live = daily_log.latest_log_path(paths.logs_dir())  # 按天日志：最近的 YYYY-MM-DD.log
+        if not live:
+            raise SystemExit("no log yet in %s\n(use --log <file> or --fixture)" % paths.logs_dir())
+        path = Path(live)
     if not path.is_file():
         raise SystemExit("log not found: %s\n(point --log at a file, or use --fixture)" % path)
     events, unparsed = build_corpus(path.read_text(encoding="utf-8", errors="replace").splitlines())

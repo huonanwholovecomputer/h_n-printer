@@ -106,7 +106,7 @@ import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.37"
+APP_VERSION = "4.5.38"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -4644,16 +4644,10 @@ class MainWindow(QMainWindow):
         self._file_logger = logging.getLogger("hn_local_tool")
         self._file_logger.setLevel(logging.DEBUG)
         if not self._file_logger.handlers:
-            fh = logging.FileHandler(
-                os.path.join(self._log_dir, "local_tool.log"),
-                encoding="utf-8",
-            )
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            ))
-            self._file_logger.addHandler(fh)
+            # 按天分文件（2026-10-28 用户要求）：logs/2026-10-28.log，跨午夜自动落到新文件。
+            # 文件命名与「读日志尾部」都在 daily_log 一处（云端日志收集走同一个模块）。
+            import daily_log
+            self._file_logger.addHandler(daily_log.make_handler(self._log_dir))
         self._file_logger.info("HN 本地打印工具启动")
 
         # ── 云端直连自检 ──
@@ -5893,20 +5887,20 @@ class MainWindow(QMainWindow):
         # 文件菜单
         file_menu = mb.addMenu("文件(&F)")
 
-        open_action = QAction("打开(&O)", self)
+        open_action = QAction("打开…(&O)", self)   # 点了会弹文件选择框 ⇒ 按菜单惯例带省略号
         open_action.triggered.connect(self._on_add_files)
         file_menu.addAction(open_action)
 
         file_menu.addSeparator()
 
-        cloud_action = QAction("云端(&C)", self)
+        cloud_action = QAction("云端…(&C)", self)   # 打开连接设置对话框 ⇒ 同上
         cloud_action.triggered.connect(self._on_cloud_settings)
         file_menu.addAction(cloud_action)
 
         # S1-09：离线未同步订单（本地库里 synced=0 的单，云端还没有）——手动重试入口。
         # 2026-10-23 用户要求：**只在真有未同步单时出现**（平时它就是一行纯噪音）。
         # 显隐由 _refresh_offline_badge() 统一决定（同一判据 n>0），与状态栏角标同步。
-        self._offline_action = QAction("📴 离线未同步订单(&O)…", self)
+        self._offline_action = QAction("📴 离线未同步订单…(&O)", self)
         self._offline_action.setToolTip("查看本机还没上报到云端的订单，并可手动重试上传")
         self._offline_action.triggered.connect(self._open_offline_orders_dialog)
         self._offline_action.setVisible(False)      # 默认隐藏，下面按本地库真实条数定一次
@@ -12944,7 +12938,7 @@ class MainWindow(QMainWindow):
 
         # 收集在线设备日志按钮
         collect_btn = QPushButton("📥 收集所有在线设备日志")
-        collect_btn.setToolTip("向后端请求：向所有在线打印设备下发收集指令，各设备回报本机 local_tool.log 尾部日志（每台最多 200KB）")
+        collect_btn.setToolTip("向后端请求：向所有在线打印设备下发收集指令，各设备回报本机日志（logs/YYYY-MM-DD.log）尾部（每台最多 200KB）")
         collect_btn.clicked.connect(lambda: self._collect_device_logs(status_label))
         layout.addWidget(collect_btn)
 
@@ -13100,10 +13094,10 @@ class MainWindow(QMainWindow):
     def _clear_local_logs(self, status_label: QLabel):
         """清空本地日志文件。
 
-        local_tool.log 正被 FileHandler 占用：Windows 下 Python 默认共享模式不含
-        FILE_SHARE_DELETE，直接 os.remove 会抛 PermissionError（此前异常被静默吞掉，
-        表现为「清空无效」）。改为截断为 0 字节——被占用句柄同样允许截断，
-        后续日志 append 写入自动落在新文件末尾。"""
+        日志按天分文件（logs/YYYY-MM-DD.log，见 daily_log），今天是那一份正被 FileHandler
+        占用：Windows 下 Python 默认共享模式不含 FILE_SHARE_DELETE，直接 os.remove 会抛
+        PermissionError（此前异常被静默吞掉，表现为「清空无效」）。改为**逐个文件截断为 0 字节**
+        ——被占用句柄同样允许截断，后续日志 append 写入自动落在该文件末尾。"""
         cleared = 0
         failed = 0
         for fname in os.listdir(self._log_dir):
@@ -13235,9 +13229,8 @@ class MainWindow(QMainWindow):
             return  # 订单已被用户取消（push 与 cancel 并发/乱序），不再注册/打印
         self._cloud_tasks[task.task_id] = task
         is_scheduled = task.auto_print and getattr(task, "schedule_mode", "now") != "now"
-        self._log(f"☁ 收到云端任务 #{task.task_id}: {task.file_name}"
-                  + (" ⚡无障碍" if task.auto_print else "")
-                  + (" ⏰预约" if is_scheduled else ""))
+        # 「收到任务」那行日志由 cloud_client 统一输出（含 份数/单面双面/⚡无障碍/⏰预约 与通道后缀），
+        # 这里不再重复写一行 —— 同一事件两行会被现场读成"任务收到了两次"（2026-10-28 收敛）。
         if is_scheduled:
             # 预约单：进入预约状态机（到点才自动打印）
             self._register_scheduled_task(task)
@@ -13281,8 +13274,7 @@ class MainWindow(QMainWindow):
                 if t:
                     t.stop()
         elif task.status == "ready":
-            self._log(f"☁ 云端任务 #{task.task_id} 下载完成"
-                      + (" ⚡无障碍" if task.auto_print else ""))
+            # 「下载完成」那行同样由 cloud_client 输出（带文件名/字节数/⚡无障碍），此处不再重复。
             if task.auto_print:
                 self._enqueue_auto_print_task(task)
             elif self._cloud_task_window:
@@ -13871,7 +13863,10 @@ class MainWindow(QMainWindow):
         """
         fix_label = order_status_label_cn(fix_status) if fix_status else ""
         reason = (f"已被人工订正为「{fix_label}」" if fix_label else "已被用户取消")
-        self._log(f"☁ 订单 #{order_id} {reason}")
+        # ⚠ 这里**不再自己写一行日志**：cloud_client 收到 order_canceled 时已经发过同一条
+        #   status_message（「☁ 订单 #N 已被用户取消」/「…已被人工订正为「X」，本机相关
+        #   任务已停止」），两边各写一遍会让同一时刻出现两条一模一样的行（人工订正时是
+        #   只差后缀的两行），现场读成"取消通知发了两遍"（2026-10-28 订单 #822 现场）。
         self._cloud_canceled_orders.add(order_id)  # 拒收该订单迟到的 print_task/状态更新（防乱序复活）
         if self._cloud_task_window:
             self._cloud_task_window.mark_canceled(order_id, task_ids)

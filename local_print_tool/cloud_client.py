@@ -795,20 +795,14 @@ class CloudClient(QObject):
             return False
 
     def _read_local_log_tail(self, max_bytes: int = 200 * 1024) -> str:
-        """读取本机日志文件（%APPDATA%\\HN打印工具\\logs\\local_tool.log）尾部，供云端日志收集回报。
+        """读取本机日志尾部（logs/YYYY-MM-DD.log），供云端日志收集回报。
+
         v4.5 起日志统一存用户数据目录（paths.logs_dir()），与程序安装目录解耦；
-        从倒数 max_bytes 字节处开始，跳过可能截断的半行再读取；失败返回空串。"""
+        2026-10-28 起**按天分文件**，读尾逻辑在 daily_log.read_tail（从最新的日文件
+        往前拼，零点刚过也收得到内容，总量仍是 max_bytes）；读不到返回空串。"""
         import paths as _paths
-        log_path = os.path.join(_paths.logs_dir(), "local_tool.log")
-        try:
-            size = os.path.getsize(log_path)
-            with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                if size > max_bytes:
-                    f.seek(size - max_bytes)
-                    f.readline()  # 丢弃半行，保证从完整行开始
-                return f.read()[-max_bytes:]
-        except OSError:
-            return ""
+        import daily_log
+        return daily_log.read_tail(_paths.logs_dir(), max_bytes)
 
     def report_file_ready(self, order_id: int, task_ids: list):
         """预约单阶段①文件下载完成 → 后端 downloading→waiting（冻结时自动解除）。"""
@@ -1121,8 +1115,14 @@ class CloudClient(QObject):
                         if task.task_id not in self._pending_tasks:
                             self._pending_tasks[task.task_id] = task
                             self.task_received.emit(task)
+                            # 与推送路径同一条文案，只在末尾标注通道（见 _on_print_task 的说明）
                             self.status_message.emit(
-                                f"☁ HTTP 拉取到任务 #{task.task_id}: {task.file_name}"
+                                f"☁ 收到云端任务 #{task.task_id}: {task.file_name} "
+                                f"({task.copies}份, {'双面' if task.duplex == 'on' else '单面'})"
+                                + (" ⚡无障碍" if task.auto_print else "")
+                                + (" ⏰预约" if (task.auto_print
+                                               and getattr(task, "schedule_mode", "now") != "now") else "")
+                                + "（HTTP 拉取）"
                             )
                             # 自动开始下载
                             self.accept_task(task.task_id)
@@ -1441,9 +1441,15 @@ class CloudClient(QObject):
             if task.task_id not in self._pending_tasks:
                 self._pending_tasks[task.task_id] = task
                 self.task_received.emit(task)
+                # 「收到任务」只在这里写一行（2026-10-28 收敛重复日志）：推送与 HTTP 拉取共用
+                # 同一段文案（拉取多带「（HTTP 拉取）」后缀），GUI 侧不再重复写一行 —— 同一事件
+                # 两行，现场会读成"任务收到了两次"。份数/单双面、⚡无障碍、⏰预约 全在这一行。
                 self.status_message.emit(
-                    f"☁ 收到云任务 #{task.task_id}: {task.file_name} "
+                    f"☁ 收到云端任务 #{task.task_id}: {task.file_name} "
                     f"({task.copies}份, {'双面' if task.duplex == 'on' else '单面'})"
+                    + (" ⚡无障碍" if task.auto_print else "")
+                    + (" ⏰预约" if (task.auto_print
+                                   and getattr(task, "schedule_mode", "now") != "now") else "")
                 )
                 # 自动开始下载
                 self.accept_task(task.task_id)
@@ -1467,9 +1473,14 @@ class CloudClient(QObject):
             file_name = data.get("file_name", "")
             download_url = data.get("download_url", "")
             source_md5 = data.get("source_md5", "") or ""  # 后端携带 MD5 → 本地可先查缓存免下载
+            # 后端按「这份文件的上传者」判定的放行位（2026-10-28：只看上传者）——
+            # 分析用的转换引擎要与打印侧一致，否则回报的页数可能与实际打出来不符。
+            # 缺字段（旧后端）一律 False ⇒ 仍强制 LibreOffice（S1-04 默认口径不破）。
+            allow_com = bool(data.get("uploader_is_admin"))
             if file_id and download_url:
                 self.status_message.emit(f"☁ 收到页数分析请求: {file_name}")
-                self._spawn_analysis_thread(file_id, download_url, file_name, source_md5)
+                self._spawn_analysis_thread(file_id, download_url, file_name, source_md5,
+                                            allow_cloud_com=allow_com)
 
         @sio.on("cancel_page_analysis")
         def _on_cancel_page_analysis(data):
@@ -1887,8 +1898,11 @@ class CloudClient(QObject):
             except Exception:
                 pass
             self.task_updated.emit(task)
+            # 「下载完成」同样只在这里写一行（GUI 侧的「云端任务 #N 下载完成」已删）：
+            # 文件名/字节数/⚡无障碍 都在这一行，事件本身已经是"可以打了"的信号。
             self.status_message.emit(
                 f"☁ 下载完成 #{task_id}: {original_name} ({os.path.getsize(dest)} bytes)"
+                + (" ⚡无障碍" if task.auto_print else "")
             )
             self._report_file_ready_if_scheduled(task)
 
@@ -2225,13 +2239,15 @@ class CloudClient(QObject):
 
     # ── 页数分析 ──
 
-    def _spawn_analysis_thread(self, file_id: str, download_url: str, file_name: str, source_md5: str = ""):
+    def _spawn_analysis_thread(self, file_id: str, download_url: str, file_name: str,
+                               source_md5: str = "", allow_cloud_com: bool = False):
         """以受限并发启动一个页数分析线程（防滥用：防分析线程无界堆积拖垮本机）。
         用独立信号量排队，等待者不占线程栈；超出的请求排队而非直接丢弃。"""
         def _worker():
             self._analyze_semaphore.acquire()
             try:
-                self._analyze_and_report_page_count(file_id, download_url, file_name, source_md5)
+                self._analyze_and_report_page_count(file_id, download_url, file_name, source_md5,
+                                                   allow_cloud_com=allow_cloud_com)
             finally:
                 self._analyze_semaphore.release()
 
@@ -2240,10 +2256,20 @@ class CloudClient(QObject):
         self._download_threads.append(t)  # 纳入 stop() 的 join 管理
 
     def _analyze_and_report_page_count(self, file_id: str, download_url: str, file_name: str,
-                                       source_md5: str = ""):
+                                       source_md5: str = "", allow_cloud_com: bool = False):
         """后台：查缓存（后端 MD5 → 免下载） → 下载 → MD5 查缓存 → 转换 PDF → 统计页数 → 回报后端。
-        支持取消：cancel_page_analysis 事件置位 _analysis_abort[file_id]，下载/转换各阶段检查后中止且不回报。"""
+
+        支持取消：cancel_page_analysis 事件置位 _analysis_abort[file_id]，下载/转换各阶段检查后中止且不回报。
+
+        allow_cloud_com（2026-10-28）：分析用的引擎必须与**打印侧**同一口径 —— 只剩「上传者是不是
+        管理员」一条（后端按 `files.openid` 判定并放在 analyze_page_count 载荷里）。管理员上传的
+        文件打印时走 Word/WPS，分析若仍用 LibreOffice，回报的页数就可能与实际排出来的不符（页数是
+        文件级事实，计费与页数展示直接采用）。缺字段（旧后端）一律 False ⇒ 仍强制 LO。"""
         ext = os.path.splitext(file_name)[1].lower()
+        # `.doc` 的缓存 key 不带引擎身份（`cache_engine_for()` 恒返回 ""）：放行 COM 时打印侧会
+        # 刻意忽略这种"身份不明"的缓存重新转换（gui `_skip_cache_for_com`），分析侧必须同一口径 ——
+        # 否则会拿旧版 LibreOffice 产物的页数去回报。`.docx` 的 key 带引擎后缀，可正常命中。
+        _skip_cache_for_com = (bool(allow_cloud_com) and ext == ".doc")
         temp_dl: str = ""
         temp_pdf: str | None = None
         # 新一轮分析开始：清掉可能残留的取消标记（取消后同一 file_id 可能被重新发起）
@@ -2256,7 +2282,7 @@ class CloudClient(QObject):
             # 0. 后端已带 MD5 → 先查 PDF 缓存，命中则跳过下载（本地按云端 MD5 直接命中）
             #    docx 除外：转换引擎取决于文档内容（last editor），未下载无法确定 ⇒ 一律
             #    下载后判断（与 _download_file_inner 同一设计，避免命中错引擎的缓存）。
-            if source_md5 and ext != ".docx":
+            if source_md5 and ext != ".docx" and not _skip_cache_for_com:
                 cached_pdf, cached_meta = self._get_cached_pdf(source_md5)
                 if cached_pdf and cached_meta:
                     from pdf_printer import get_pdf_info
@@ -2286,8 +2312,13 @@ class CloudClient(QObject):
             # docx 的缓存按引擎隔离（与 GUI 侧同一口径 cache_engine_for）：此处从文件内容
             # 推断引擎，非 docx / 推断不出则 ""。原先一律按无后缀查 ⇒ 永远命中不了打印侧
             # 写的 _e{engine} 条目（每次分析都白跑一次完整转换）。
-            _eng = self._infer_cache_engine(temp_dl, ext)
-            cached_pdf, cached_meta = self._get_cached_pdf(source_md5, "", _eng)
+            if _skip_cache_for_com:
+                self.status_message.emit(
+                    f"  → 上传者=管理员：跳过无引擎身份的既有缓存，重新转换 {file_name}")
+                cached_pdf, cached_meta = "", {}
+            else:
+                _eng = self._infer_cache_engine(temp_dl, ext)
+                cached_pdf, cached_meta = self._get_cached_pdf(source_md5, "", _eng)
 
             if cached_pdf and cached_meta:
                 # 缓存命中：直接统计页数
@@ -2300,7 +2331,8 @@ class CloudClient(QObject):
                     self._report_page_count(file_id, file_name, page_count, orientation)
                     return
 
-            # 3. 确定是否需要转换（**云端来源 ⇒ Office 强制 LibreOffice，S1-04**）
+            # 3. 确定是否需要转换（**云端来源 ⇒ Office 默认强制 LibreOffice，S1-04**；
+            #    唯一例外是管理员上传的文件，与打印侧同一口径，见 allow_cloud_com）
             if ext in (".doc", ".docx"):
                 if _canceled():
                     return
@@ -2308,8 +2340,9 @@ class CloudClient(QObject):
                 try:
                     from converter import get_converter
                     converter = get_converter()
-                    # 顾客上传的内容不可信：不给 Word/WPS COM 机会执行宏
-                    temp_pdf = converter.convert(temp_dl, from_cloud=True)
+                    # 顾客上传的内容不可信：不给 Word/WPS COM 机会执行宏；
+                    # 管理员上传（后端 uploader_is_admin）才放行 COM，仍带宏/弹窗/外链硬化。
+                    temp_pdf = converter.convert(temp_dl, from_cloud=True, allow_cloud_com=bool(allow_cloud_com))
                 except Exception:
                     # COM/LibreOffice 都不可用时的最后兜底（同样是 LibreOffice，无宏执行）
                     temp_pdf = self._convert_via_libreoffice(temp_dl)

@@ -1,8 +1,8 @@
 {
-  "version": "1.1.48",
-  "versionCode": 49,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.48.apk",
-  "md5": "16384c796413b92578ec0f13aac2a6e6",
-  "notes": "v1.1.48：① 「我」页选头像改成圆形取景框裁剪（拖动/双指/滑杆 + canvas 导出 512×512 JPEG 再上传，任一步失败退回上传原图）；② 手动双面打印侧的两处修正随服务端/打印工具生效（横向页铺满、整单一个批次一次翻纸）；③ 设备列表的攒批开关操作者现在显示昵称而不是角色名。",
+  "version": "1.1.49",
+  "versionCode": 50,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.49.apk",
+  "md5": "f31f824b4c85e772b3c2c20fab94ff23",
+  "notes": "v1.1.49：本版**只重打包对齐 web 资源**（本轮没有移动端功能改动）—— 修正上一版 APK 内嵌的 index.html / me.js 与 www/ 不一致的问题；头像裁剪、价格复制气泡等既有功能不变。",
   "force": false
 }

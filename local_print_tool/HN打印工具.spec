@@ -26,8 +26,10 @@ a = Analysis(
     # 这里补 hiddenimports 覆盖我们直接 import 的那几个子模块。
     # S1-05（2026-10-23）：财务 HMAC 的密钥用 DPAPI（win32crypt）保护；取不到会降级，
     # 但显式收进来才能走 DPAPI 主路径（否则打包版永远走降级分支）。
+    # 按天日志（daily_log）在 MainWindow.__init__ 里才 import —— 静态分析本应收得到，
+    # 但打包漏收的后果是「门店机一启动就 ImportError」，故与 cryptography 一样显式列一遍。
     hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client',
-                   'win32crypt',
+                   'win32crypt', 'daily_log',
                    'cryptography', 'cryptography.exceptions',
                    'cryptography.hazmat.primitives.asymmetric.ed25519',
                    'cryptography.hazmat.primitives.serialization',

@@ -5657,7 +5657,7 @@ def request_page_analysis(file_id: str, file_name: str, prefer_client: str = "")
     try:
         conn = get_db()
         prow = conn.execute(
-            "SELECT path, page_count, page_count_verified, md5 FROM files WHERE id = ?",
+            "SELECT path, page_count, page_count_verified, md5, openid FROM files WHERE id = ?",
             (file_id,),
         ).fetchone()
         conn.close()
@@ -5708,6 +5708,11 @@ def request_page_analysis(file_id: str, file_name: str, prefer_client: str = "")
             "file_name": file_name,
             "download_url": download_url,
             "source_md5": file_md5,   # 本地可直接按 MD5 命中 PDF 缓存，无需下载文件
+            # 分析用哪个引擎必须与**打印**同一口径（2026-10-28 起只看上传者）：
+            # `files.openid` 就是这份副本的上传者（S2-05 起每次上传各自一行、不共享物理文件），
+            # 因此这里给出的是与打印任务 `uploader_is_admin` 完全同源的证据。
+            # 缺该字段的旧客户端照旧强制 LibreOffice（S1-04 默认口径不破）。
+            "uploader_is_admin": is_admin_uploader(prow["openid"] or ""),
         }, to=sid)
         print(f"  [PAGE] 已推送页数分析请求: {file_name} (file_id={file_id[:8]}...) → {client_id}")
         return True
@@ -11536,7 +11541,7 @@ def log_collect_all():
     """收集所有在线打印设备的日志（本地打印工具「日志管理」页发起，需打印机 token）。
 
     向所有在线客户端 SocketIO 推送 request_log（附本次 request_id），等待各设备
-    回报本机日志尾部（logs/local_tool.log 末尾 200KB）；超时未回报的设备标记 error。
+    回报本机日志尾部（logs/YYYY-MM-DD.log 末尾 200KB，按天分文件见客户端 daily_log）；超时未回报的设备标记 error。
     body: {"timeout": 秒（2-20，默认 8）}
     response: {"success": true, "logs": [{client_id, device_name, online, content | error}]}
     """

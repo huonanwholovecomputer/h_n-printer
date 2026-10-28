@@ -189,6 +189,72 @@ check("普通用户上传 → False", _up(USER_OID) is False, repr(_up(USER_OID)
 check("空 / None → False（fail-closed）",
       _up("") is False and _up(None) is False)
 
+# ==================== ④b 页数分析也按「上传者」放行 COM ====================
+section("④b 页数分析请求下发的 uploader_is_admin（决定分析用 LO 还是 Word/WPS）")
+
+# 现场（2026-10-28 21:40，管理员闫承翰）：分析走 LibreOffice 报「云端来源：Office 强制
+# LibreOffice」，打印却按管理员例外走 Word ⇒ 同一份文件两套引擎，页数对不上。
+# 旧口径「页数分析永远不传 allow_cloud_com」的理由是"上传时还不知道订单归属"，
+# 而 2026-10-28 起判定只看上传者，`files.openid` 在分析请求那一刻就已经知道。
+
+class _FakeSio:
+    def __init__(self):
+        self.sent = []
+
+    def emit(self, event, payload=None, to=None):
+        self.sent.append({"event": event, "payload": payload, "to": to})
+
+
+def _seed_upload(file_id, openid):
+    """造一行「本次上传自己的副本」（S2-05：每次上传各自一行，openid 就是上传者）。"""
+    p = os.path.join(tmp, f"{file_id}.doc")
+    with open(p, "wb") as f:
+        f.write(b"\xd0\xcf\x11\xe0fake-doc")
+    conn = backend.get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO files (id, original_name, saved_name, path, size, created_at,"
+        " page_count, page_count_verified, md5, openid) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (file_id, "附件5.doc", "附件5.doc", p, os.path.getsize(p),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0, 0, f"md5-{file_id}", openid),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _analyze_payload(file_id, openid):
+    _seed_upload(file_id, openid)
+    _online(True)
+    fake = _FakeSio()
+    orig_sio = backend.socketio
+    backend.socketio = fake
+    try:
+        backend._last_page_analysis_push.clear()
+        backend.request_page_analysis(file_id, "附件5.doc", prefer_client=CID)
+    finally:
+        backend.socketio = orig_sio
+    hits = [s for s in fake.sent if s["event"] == "analyze_page_count"]
+    return hits[0]["payload"] if hits else {}
+
+
+_p_admin = _analyze_payload("file-admin-doc", ADMIN_OID)
+_p_user = _analyze_payload("file-user-doc", USER_OID)
+_p_super = _analyze_payload("file-super-doc", SUPER_OID)
+_p_empty = _analyze_payload("file-empty-doc", "")
+
+check("★ 管理员上传的 .doc → analyze_page_count 带 uploader_is_admin=True（分析走 Word/WPS）",
+      _p_admin.get("uploader_is_admin") is True, repr(_p_admin.get("uploader_is_admin")))
+check("★ super_admin 上传 → True（与 is_admin_uploader 同一口径，不漏超管）",
+      _p_super.get("uploader_is_admin") is True, repr(_p_super.get("uploader_is_admin")))
+check("★ 顾客上传的 .doc → False（分析仍强制 LibreOffice，S1-04 不破）",
+      _p_user.get("uploader_is_admin") is False, repr(_p_user.get("uploader_is_admin")))
+check("openid 为空（历史数据）→ False（fail-closed，仍走 LO）",
+      _p_empty.get("uploader_is_admin") is False, repr(_p_empty.get("uploader_is_admin")))
+check("回归：载荷其余字段不变（file_id / download_url / source_md5 / file_name）",
+      _p_admin.get("file_id") == "file-admin-doc"
+      and bool(_p_admin.get("download_url"))
+      and _p_admin.get("file_name") == "附件5.doc"
+      and "source_md5" in _p_admin, str(sorted(_p_admin)))
+
 # ==================== ⑤ 开关删干净：端点 / 镜像 / 下发字段 ====================
 section("⑤ 旧开关确实删干净（端点 404 / 无镜像 / 列表不不再下发 cloud_word_*）")
 
@@ -296,6 +362,34 @@ check("★ 本地工具：`.doc` 的「无引擎身份缓存」不再挡住 COM�
 check("★ 页数分析路径不再把 Office 产物写进打印缓存（.doc 的 LO 版本会被打印路径复用）",
       cc_src.count("self._save_pdf_to_cache(") == 1,
       f"出现 {cc_src.count('self._save_pdf_to_cache(')} 次（只应剩 .pdf 下载那一处）")
+
+
+def _p_backend_analysis(src):
+    """页数分析载荷按 `files.openid`（该副本的上传者）算 uploader_is_admin。"""
+    return '"uploader_is_admin": is_admin_uploader(prow["openid"] or ""),' in src
+
+
+def _p_analysis_com(src):
+    """分析侧把 allow_cloud_com 真的传给 converter（不是只读出字段不用）。"""
+    return ("from_cloud=True, allow_cloud_com=bool(allow_cloud_com))" in src
+            and "allow_cloud_com=allow_cloud_com)" in src)   # _spawn → _analyze 的透传
+
+
+def _p_analysis_cache_guard(src):
+    """放行 COM 时 `.doc` 不采纳无引擎身份的既有缓存（与打印侧 _skip_cache_for_com 同口径）。"""
+    return ('_skip_cache_for_com = (bool(allow_cloud_com) and ext == ".doc")' in src
+            and 'if source_md5 and ext != ".docx" and not _skip_cache_for_com:' in src)
+
+
+# 日志去重（取消 / 收到任务 / 下载完成）不在本脚本，见 tests/verify_cloud_log_dedup.py
+
+
+check("★ 后端：页数分析下发 uploader_is_admin（按 files.openid = 该副本的上传者）",
+      _p_backend_analysis(app_src))
+check("★ 本地工具：页数分析把 allow_cloud_com 透传到 converter.convert",
+      _p_analysis_com(cc_src))
+check("★ 本地工具：放行 COM 时 .doc 跳过无引擎身份的既有缓存（与打印侧同口径）",
+      _p_analysis_cache_guard(cc_src))
 check("本地工具：安全口径默认值 False（converter 闸门仍在）",
       "if from_cloud and ext in COM_OFFICE_EXTS and not allow_cloud_com:" in conv_src
       and "allow_cloud_com: bool = False" in conv_src)
@@ -359,6 +453,20 @@ _mut = gui_src.replace(
     '_skip_cache_for_com = (False and ext in (".doc", ".docx")')
 check("B8 去掉「无引擎身份缓存」闸门（.doc 又会被 LO 产物顶掉）→ 判据变红",
       _mut != gui_src and not _p_doc_cache_guard(_mut))
+
+_mut = app_src.replace('is_admin_uploader(prow["openid"] or "")', "False")
+check("B9 分析载荷恒 False（管理员文档的分析永远走 LO）→ 判据变红",
+      _mut != app_src and not _p_backend_analysis(_mut))
+
+_mut = cc_src.replace("from_cloud=True, allow_cloud_com=bool(allow_cloud_com))",
+                      "from_cloud=True)")
+check("B10 分析侧不传 allow_cloud_com（退回\"页数分析永远走 LO\"）→ 判据变红",
+      _mut != cc_src and not _p_analysis_com(_mut))
+
+_mut = cc_src.replace('_skip_cache_for_com = (bool(allow_cloud_com) and ext == ".doc")',
+                      '_skip_cache_for_com = False')
+check("B11 分析侧不跳过 .doc 无身份缓存（回报 LO 的页数）→ 判据变红",
+      _mut != cc_src and not _p_analysis_cache_guard(_mut))
 
 _mut = mp_wxml.replace('<text class="device-state',
                        '<view catchtap="onToggleCloudWord">☁ LO</view>\n              <text class="device-state',

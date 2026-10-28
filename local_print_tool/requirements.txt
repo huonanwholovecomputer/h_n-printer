@@ -22,6 +22,10 @@ python-docx>=1.0
 PyMuPDF>=1.23
 requests>=2.28
 python-socketio>=5.8
+# websocket-client —— python-socketio 客户端走 websocket 传输时的底层实现；漏装会在
+# 连云端时 ImportError: No module named 'websocket'（verify_cloud_proxy_bypass /
+# verify_gevent_runtime 就是靠它实跑）。原先只在个别机器上 ad-hoc 装过，清单漏登记。
+websocket-client>=1.6
 urllib3>=2.0
 
 # S1-02 更新链加固（2026-10-23）：更新清单 ed25519 验签（updater.py 运行时直接 import）。

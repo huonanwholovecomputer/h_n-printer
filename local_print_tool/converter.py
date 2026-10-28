@@ -1821,10 +1821,10 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
             False（默认）= 用户本地文件 ⇒ 保持原三引擎降级链，行为零变化。
             ⚠ **默认值必须是 False**：把本地文件也赶去 LibreOffice 会让「门店装没装
             LibreOffice」从"只影响兜底"变成"直接影响首选渲染"，那是回归。
-        allow_cloud_com: **「管理员自打 + 管理员上传」隐式规则的放行位**（2026-10-26 晚）。
-            只有该任务确为 `is_admin_print`（订单类型「自打」）**且**文件由管理员上传
-            （`uploader_is_admin`）时才由调用方置 True —— 判定本体在
-            `printer_config.cloud_word_com_allowed()`，本函数只消费结论。
+        allow_cloud_com: **「文件由管理员上传」隐式规则的放行位**（2026-10-28 口径）。
+            只看上传者（`uploader_is_admin`）—— 订单类型 `is_admin_print` 是可变结算位，
+            不再参与判定。判定本体在 `printer_config.cloud_word_com_allowed()`，
+            本函数只消费结论。
             为 True 时云端 .doc/.docx 走与本地文件相同的 COM 降级链（仍带
             AutomationSecurity=3 / DisplayAlerts=0 / UpdateLinksAtOpen=False 硬化）。
             ⚠ **默认值必须是 False**：默认仍强制 LibreOffice，不给顾客文件任何 COM 机会。
@@ -1834,8 +1834,8 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
     # ── 云端来源的 Office 文档：默认绝不交给 Word/WPS（S1-04）──
     # LibreOffice 无头转换不执行 VBA（也不跑 AutoOpen/Document_Open 宏），是这条链上
     # 唯一"内容不可信也敢打开"的引擎。装没装 LibreOffice 在这里变成硬前提，见下方报错。
-    # ⚠ 唯一例外（2026-10-26 隐式规则）：该任务是「管理员自打」**且**文件由管理员上传时，
-    #   调用方会传 allow_cloud_com=True —— 那时走下面的 COM 降级链（仍带宏/弹窗/外链硬化）。
+    # ⚠ 唯一例外（2026-10-28 口径：只看上传者）：该文件由**管理员上传**时，调用方会传
+    #   allow_cloud_com=True —— 那时走下面的 COM 降级链（仍带宏/弹窗/外链硬化）。
     #   顾客上传的内容永远拿不到这个放行位。
     if from_cloud and ext in COM_OFFICE_EXTS and not allow_cloud_com:
         if not _find_libreoffice():
@@ -1851,11 +1851,11 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
         _convert_office_via_libreoffice(file_path, output_pdf)
         return
 
-    # 云端来源 + 隐式放行（管理员自打 + 管理员上传）：显式记一条 WARNING，事后能从日志分辨
-    # 「这单为什么没走 LibreOffice」，也让安全口径（谁在什么情况下放开的）可追溯。
+    # 云端来源 + 隐式放行（管理员上传）：显式记一条 WARNING，事后能从日志分辨
+    # 「这份文件为什么没走 LibreOffice」，也让安全口径（谁在什么情况下放开的）可追溯。
     if from_cloud and ext in COM_OFFICE_EXTS and allow_cloud_com:
         logger.warning(
-            "引擎策略：云端 Word 文档按「管理员自打 + 管理员上传」隐式规则允许 Word/WPS COM"
+            "引擎策略：云端 Word 文档按「管理员上传」隐式规则允许 Word/WPS COM"
             f"（COM 已硬化：禁用宏/弹窗/外链更新）: {os.path.basename(file_path)}")
 
     # Word 文档：多引擎降级
@@ -2143,9 +2143,11 @@ class UniversalConverter:
                 **默认 False = 本地文件语义**，三引擎降级链与之前完全一致。
                 云端调用点：`cloud_client.py` 页数分析、`gui.ConvertWorker`（云端任务
                 预转换）、`gui.PrintWorker`（job.task_id > 0 的兜底转换）。
-            allow_cloud_com: 仅当「本机策略允许 + 任务确为管理员自打单」时置 True
-                （见 `_convert_office_to_pdf`）；默认 False = 云端 Word 仍强制 LibreOffice。
-                页数分析路径**永远不传**（上传时还不知道订单归属，按最严口径走 LO）。
+            allow_cloud_com: 仅当该文件**由管理员上传**时置 True（2026-10-28 口径，见
+                `_convert_office_to_pdf`）；默认 False = 云端 Word 仍强制 LibreOffice。
+                **页数分析路径也传它**：分析用的引擎必须与打印一致，否则回报的页数
+                可能小于实际排出来的（2026-10-28 前的"永远不传"让管理员文档的分析与
+                打印各用一套引擎）。
 
         Returns:
             生成的 PDF 文件路径
@@ -2181,7 +2183,7 @@ class UniversalConverter:
             logger.info(f"开始转换: {os.path.basename(file_path)} ({ext}) → PDF"
                         + ("（云端来源：Office 强制 LibreOffice）"
                            if from_cloud and not allow_cloud_com else "")
-                        + ("（云端来源：管理员自打单放行 COM）"
+                        + ("（云端来源：管理员上传放行 COM）"
                            if from_cloud and allow_cloud_com else ""))
             # 图片方向可配置：把 image_orientation 传给图片渲染函数（其余类型忽略）
             if convert_func is _convert_image_to_pdf:

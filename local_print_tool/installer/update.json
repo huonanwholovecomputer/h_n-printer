@@ -1,9 +1,9 @@
 {
-  "version": "4.5.37",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.37.exe",
-  "md5": "844fb4f312558377fbd646bffea28bf3",
-  "sha256": "6fccda5b13d825093b45fd3c05363a230e8d36db415c8283b7b3df84916bee48",
-  "notes": "v4.5.37：① 横向页铺满——页面朝向与纸张不一致时整页转 90° 铺满（旧口径横向 A4 只占纸张 49%，读者把纸顺时针转 90° 看），可在打印机档案里关掉（landscape_fill）；② 手动双面不再按装订方向拆批——同一订单只出「第 1 趟/第 2 趟」两个作业、只翻一次纸，每个文件按自己的长短边逐面补偿；③ 攒批第 1 趟日志口径修正（「第 2 趟旋转 180° 补偿」）。",
+  "version": "4.5.38",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.38.exe",
+  "md5": "4a6db96a9a9b6c68a865164099f440ed",
+  "sha256": "da80148e7e4e338201a9ceeff9383f464eaab45f6b3a5b232d37075e8be91f0f",
+  "notes": "v4.5.38：① 页数分析也按「上传者=管理员」放行 Word/WPS —— 此前分析恒用 LibreOffice、打印却按管理员例外走 Word，同一份文件的页数可能对不上；② 云端日志去重（订单取消 / 收到任务 / 下载完成各只写一行，推送与 HTTP 拉取同一段文案）；③ 本机日志改为按天分文件 logs/YYYY-MM-DD.log（跨午夜自动换，云端「收集设备日志」与日志排查工具同步跟改）；④ 收支清算「订单构成」加入外部打印监视来源，三张环形图都带图例（小到画不出扇区的来源也能看见）；⑤ 文件菜单省略号与文案统一。",
   "sig_algo": "ed25519",
-  "sig": "Jw1U4KatqsSe2bB+8NxExg5mGOSvDlX8t3uIDKINbtfnoBewwJ447ppGrhm/yyM354iF4VXai9HfK7xh5j5QAA=="
+  "sig": "bedhzfqfoPGq9z+ukvrvxrx0Cus3klAHer7SMnaQC+uVF06X8XQvQulkPdWJ8ln+2aCoL3GmawHMwJIEBiv8Bg=="
 }
