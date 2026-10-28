@@ -57,6 +57,23 @@ def scrub_secrets(text):
         return "[scrub-failed]"
 
 
+# 断开原因（python-socketio 5.x 把 engineio 的 reason 传给 disconnect 回调；旧版/桩不传）
+# 光有「已断开云端连接」这行，事后分不清是本机退出、服务端踢人，还是网络/VPN 抖动。
+_DISCONNECT_REASONS = {
+    "client disconnect": "本机主动断开",
+    "server disconnect": "服务端断开：别处用同一设备号登录，或后端重启",
+    "transport error": "传输中断：断网 / VPN·代理抖动 / 心跳无响应",
+}
+
+
+def disconnect_hint(reason) -> str:
+    """把断开原因翻成一句人话，接在「已断开云端连接」后面（空串 = 这次拿不到原因）。"""
+    text = str(reason or "").strip()
+    if not text:
+        return ""
+    return f"（原因：{_DISCONNECT_REASONS.get(text, text)}）"
+
+
 def auth_headers(token: str) -> dict:
     """S1-01：printer token 一律走 `X-Printer-Token` 请求头。
 
@@ -1402,12 +1419,12 @@ class CloudClient(QObject):
             connect_event.set()
 
         @sio.on("disconnect")
-        def _on_disconnect():
+        def _on_disconnect(reason=None):
             if self._sio is not sio:
                 return  # 旧连接的迟到回调，忽略
             self._connected = False
             self.connection_changed.emit(False)
-            self.status_message.emit("☁ 已断开云端连接")
+            self.status_message.emit("☁ 已断开云端连接" + disconnect_hint(reason))
             self._cancel_heartbeat()
             self._cancel_backoff_reset()
             connect_event.set()

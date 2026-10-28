@@ -241,5 +241,73 @@ for mod, hint in (("cloud_client.py", "云端长连接/HTTP"),
 check("gui.py 启动日志含直连自检结果", "net_direct.describe" in
       open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read())
 
+print("\n=== 9. 断连可诊断：TUN 接管自检 + 断开原因 ===")
+# 现场（2026-10-28）：iKuuuVPN 的 TUN 抢走默认路由（198.18.0.2 metric 0）→ 云端流量整条走
+# VPN，切换/抖动 VPN 即断连；而日志只有「☁ 已断开云端连接」一句，分不清是断网、VPN 抖动
+# 还是服务端踢人。这里钉住两处自检（纯日志，不参与建连/重连决策）。
+_real_tunnel = net_direct.tunnel_egress
+egress = _real_tunnel()
+check("tunnel_egress() 只认 fake-ip 段（198.18/198.19）",
+      egress == "" or egress.startswith(("198.18.", "198.19.")), repr(egress))
+# 探测本身也要钉住：把 socket 换成桩，验「出口 IP 落在 198.18/198.19 才算 TUN」这段判断
+# （只 monkeypatch 返回值的话，真实现返回恒空也没人发现 —— 变异自证时正是这么漏的）。
+class _FakeRouteSock:
+    def __init__(self, ip):
+        self._ip = ip
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def settimeout(self, _timeout):
+        pass
+
+    def connect(self, _addr):
+        pass
+
+    def getsockname(self):
+        return (self._ip, 40000)
+
+
+_real_socket_module = net_direct.socket
+try:
+    for fake_ip, expect in (("198.18.0.1", "198.18.0.1"), ("198.19.7.7", "198.19.7.7"),
+                            ("192.168.153.150", ""), ("10.150.192.5", "")):
+        net_direct.socket = types.SimpleNamespace(
+            socket=lambda *a, _ip=fake_ip, **k: _FakeRouteSock(_ip),
+            AF_INET=_real_socket_module.AF_INET,
+            SOCK_DGRAM=_real_socket_module.SOCK_DGRAM)
+        got_ip = _real_tunnel()
+        check(f"tunnel_egress 出口 {fake_ip} → {expect or '(不算 TUN)'}", got_ip == expect, repr(got_ip))
+finally:
+    net_direct.socket = _real_socket_module
+
+try:
+    net_direct.tunnel_egress = lambda: "198.18.0.1"      # 假装 TUN 接管默认路由
+    check("describe() 在 TUN 接管时告警（NO_PROXY 对 TUN 无效）",
+          "TUN 隧道接管" in net_direct.describe(CLOUD), net_direct.describe(CLOUD))
+    check("告警里带上本机隧道出口地址", "198.18.0.1" in net_direct.describe(CLOUD))
+    net_direct.tunnel_egress = lambda: ""                 # 假装没有 TUN
+    check("没有 TUN 时不误报", "TUN 隧道接管" not in net_direct.describe(CLOUD),
+          net_direct.describe(CLOUD))
+finally:
+    net_direct.tunnel_egress = _real_tunnel
+
+check("断开原因 client disconnect 翻成人话", "本机主动断开" in cc.disconnect_hint("client disconnect"))
+check("断开原因 server disconnect 指向顶号/后端重启",
+      "同一设备号" in cc.disconnect_hint("server disconnect"))
+check("断开原因 transport error 指向网络/VPN 抖动",
+      "VPN" in cc.disconnect_hint("transport error"))
+check("拿不到原因时不多写一个字（旧库/桩不传参）",
+      cc.disconnect_hint(None) == "" and cc.disconnect_hint("") == "")
+check("未识别的原因原样透出，不吞掉", "odd-reason" in cc.disconnect_hint("odd-reason"))
+
+_src = open(os.path.join(LOCAL_TOOL, "cloud_client.py"), encoding="utf-8").read()
+check("断开回调接收 reason 并写进日志（静态接线）",
+      "def _on_disconnect(reason=None):" in _src
+      and '"☁ 已断开云端连接" + disconnect_hint(reason)' in _src)
+
 print("\n" + ("全部通过 ✅" if ok_all else "存在失败项 ❌"))
 sys.exit(0 if ok_all else 1)

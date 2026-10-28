@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 import urllib.request
 from urllib.parse import urlparse
 
@@ -35,6 +36,44 @@ logger = logging.getLogger(__name__)
 # 环境变量名：requests 的 get_proxy("no_proxy") 与 websocket-client 都优先读小写，
 # urllib 两者都认。写入时两个都写，读取时取并集，避免受其它组件写法影响。
 _NO_PROXY_KEYS = ("no_proxy", "NO_PROXY")
+
+# TUN 模式的 fake-ip 段（Clash/mihomo 一类把 198.18.0.0/15 当占位网段）
+_TUN_EGRESS_PREFIXES = ("198.18.", "198.19.")
+# UDP connect 不发包，只是让内核按当前路由表选出口
+_ROUTE_PROBE = ("8.8.8.8", 53)
+_tunnel_logged = False
+
+
+def tunnel_egress() -> str:
+    """默认路由被 TUN 接管时返回本机在该隧道上的出口地址，否则空串。
+
+    这是唯一能自检的 TUN 证据：出口落在 fake-ip 段 ⇒ 云端流量在 IP 层就被隧道接走，
+    下面的 NO_PROXY 全部无效（TUN 切节点/抖动的表现就是「连接超时」「已断开云端连接」）。
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(0.5)
+            sock.connect(_ROUTE_PROBE)
+            ip = sock.getsockname()[0]
+    except OSError:
+        return ""
+    return ip if ip.startswith(_TUN_EGRESS_PREFIXES) else ""
+
+
+def _tunnel_warning(ip: str) -> str:
+    return (f"⚠ 默认路由被 TUN 隧道接管（本机出口 {ip}）：云端流量实际走 VPN，"
+            f"切换/抖动 VPN 即断连，NO_PROXY 对 TUN 无效")
+
+
+def _log_tunnel_once() -> None:
+    """每次进程只报一次 TUN 接管（重连时 ensure_direct 会反复被调）。"""
+    global _tunnel_logged
+    if _tunnel_logged:
+        return
+    ip = tunnel_egress()
+    if ip:
+        _tunnel_logged = True
+        logger.warning(_tunnel_warning(ip))
 
 
 def _host_of(url: str) -> str:
@@ -106,6 +145,7 @@ def ensure_direct(*urls: str) -> list[str]:
             f"（代理异常时会让云端连接卡死/断开）")
     else:
         logger.info(f"云端直连：{', '.join(added)} 不经过代理（未检测到代理配置）")
+    _log_tunnel_once()
     return added
 
 
@@ -116,11 +156,17 @@ def describe(url: str) -> str:
         return ""
     proxy = _configured_proxy()
     if not proxy:
-        return f"{host}：未检测到代理配置，直连"
-    try:
-        direct = urllib.request.proxy_bypass(host)
-    except Exception:
-        direct = False
-    if direct:
-        return f"{host}：已对系统/环境代理 {proxy} 直连"
-    return f"{host}：⚠ 仍会走系统/环境代理 {proxy}（代理异常时云端会连不上）"
+        text = f"{host}：未检测到代理配置，直连"
+    else:
+        try:
+            direct = urllib.request.proxy_bypass(host)
+        except Exception:
+            direct = False
+        if direct:
+            text = f"{host}：已对系统/环境代理 {proxy} 直连"
+        else:
+            text = f"{host}：⚠ 仍会走系统/环境代理 {proxy}（代理异常时云端会连不上）"
+    tunnel = tunnel_egress()
+    if tunnel:
+        text += "；" + _tunnel_warning(tunnel)
+    return text
