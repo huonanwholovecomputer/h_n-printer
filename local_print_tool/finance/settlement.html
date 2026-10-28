@@ -139,6 +139,14 @@ table { width: 100%; border-collapse: collapse; font-size: .86rem; }
 th, td { padding: 10px 14px; text-align: center; border-bottom: 1px solid var(--border); }
 th { background: var(--card-2); font-weight: 600; font-size: .8rem; color: var(--muted); }
 td.l { text-align: left; }
+/* 采购表的「数量」格（v7.9）：单价 / 「填数量后按月摊销」那行小字**不参与行高**。
+   2026-10-27 现场：黄字让「数量」格比同行其它格高出 13px，整格垂直居中时输入框被顶上去，
+   与 日期 / 金额 / 代付人 那一排看得见的错位（用户截图框住的正是这里）。
+   做法 = 有数量列时给整行单元格预留同样的底部空白，小字绝对定位进这块空白 ⇒
+   每个格的内容盒一样高、所有输入框仍对齐，小字只居中挂在下面。 */
+.exp-table.has-qty td { padding-bottom: 22px; }
+.exp-qty { position: relative; }
+.exp-qty-note { position: absolute; left: 0; right: 0; bottom: 3px; text-align: center; font-size: .72rem; line-height: 1.2; white-space: nowrap; }
 tbody tr { transition: background .15s ease; }
 tbody tr:hover { background: var(--card-2); }
 .tfoot td { font-weight: 700; background: var(--card-2); border-top: 2px solid var(--border); }
@@ -235,6 +243,11 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 [data-theme="dark"] .tag.y { color: #fbbf24; }
 .tag.p { background: rgba(139,92,246,.15); color: #8b5cf6; }
 [data-theme="dark"] .tag.p { color: #a78bfa; }
+/* v7.3：外部打印监视（绕过本工具直接打印、经人工确认出纸的作业）来源标签 —— 青绿色，
+   与 小程序绿 / APP 蓝 / 本地橙 / 预约黄 / 加急红 / 封面紫 都不同色。标签 4 个字，
+   所以单独收一点字号与左右 padding，让它在「来源」列里整块显示、不压到「用户」列。 */
+.tag.ext { background: rgba(13,148,136,.14); color: #0d9488; padding: 2px 6px; font-size: .70rem; }
+[data-theme="dark"] .tag.ext { background: rgba(45,212,191,.16); color: #2dd4bf; }
 /* 订单类型固定槽位网格（v5.23）：相同/同类标签在不同订单间竖直对齐——
    槽序：自打/接单 | 自动 | 预约 | 免费 | 派送 | 加急 | 封面。
    每个槽位固定宽度，无标签时留空占位，保证跨行对齐。
@@ -1443,6 +1456,14 @@ function printerDepCents(p, pages) {
   return Math.round(n * Math.round((+p.price || 0) * 100) / life);
 }
 function getPurchaseBasis() { return STORE.config.purchaseBasis === 'usage' ? 'usage' : 'equal'; }
+/* 采购口径的**文案**（2026-10-27 用户要求：文案必须与「设置 → 采购分摊」里选的模式同步）。
+   采购支出小标题原来写死「AA 均摊」，选了「按用量」还这么写会让人以为这一步只均摊 ——
+   而这恰恰是决定谁出多少钱的地方。均摊口径下的文案保持原样（零回归）。 */
+function purchaseBasisHint() {
+  return getPurchaseBasis() === 'usage'
+    ? '（谁垫付了什么 · 按各人本月实际出纸页数分摊）'
+    : '（谁垫付了什么，AA 均摊）';
+}
 
 /* ==================== v7.7：累计实测寿命的纯计算（这里只算数，不碰 DOM / 不发请求） ====================
    两个函数是「报废结算」的唯一真相：
@@ -2694,7 +2715,13 @@ function animateTab(tabEl) {
   for (var i = 0; i < kids.length; i++) {
     kids[i].style.animation = 'none';
     void kids[i].offsetWidth;
-    kids[i].style.animation = 'fadeUp .45s ease both';
+    /* 填充模式必须是 backwards，不能是 both（2026-10-27 现场「口径栏下拉偶尔样式像丢了」）：
+       fadeUp 的 to 是 transform: translateY(0)，both 会让动画结束后**残留一个非 none 的 transform**
+       ⇒ 每个 tab 子元素长期都是层叠上下文；里面的浮层（.dd-panel，z-index:70）跳不出这个上下文，
+       于是被后面的兄弟卡片（.alert-banner 警示条 / KPI 卡）盖住 —— 表现为「下拉一打开像没样式了、
+       底下的字压在面板上」。backwards 只在延迟期间套用 from，动画一结束就回到元素自身样式
+       （transform: none），浮层的 z-index 才有意义。验收 tests/verify_scope_dropdown_layer.mjs。 */
+    kids[i].style.animation = 'fadeUp .45s ease backwards';
     kids[i].style.animationDelay = (i * 0.05) + 's';
   }
 }
@@ -2938,6 +2965,106 @@ function _scopeTimeLabel() {
   if (t.mode === 'custom' && t.start && t.start === t.end) return t.start === todayStr() ? '今天' : t.start;
   return '自定义区间';
 }
+/* ==================== v7.3：外部打印监视订单（并入订单明细） ====================
+   背景：print_watch 账本记录「绕过本工具、直接送进打印机」的作业（顾客拿 U 盘/别的软件打的纸），
+   人工在「外部打印监视」窗里逐条确认出纸 → 那些纸的钱也是这台机器挣的，必须计入收益并归到
+   设备所有者（账本里的 owner_name）。所以它们以**与云端 revenue 订单同构的行**并进订单明细。
+   口径边界（接口契约 stats_server GET /api/local/external_prints）：
+     · 只返回 status == print_watch.STATUS_CONFIRMED（"confirmed"，界面叫「已处理」）的记录；
+       待处理(new)/已忽略(ignored) 一条都不返回；
+     · 金额由后端 amount_for(item, simplex_price, duplex_price) 算好；返回 None（页数未知 /
+       单双面未确认）的记录后端**跳过**并计入 skipped —— 前端不猜、也不按 0 顶上去；
+     · order_id 必须是带前缀的字符串 ext:<job_id>:<detected_at>，绝不能是纯数字
+       （否则会被「状态/类型订正」的十进制正则当成云端订单）。 */
+var _externalOrderIds = {};      // 本次合并进来的外部订单（raw id + 行 key），订正闸门按它兜底
+var _externalPending = null;     // { key, orders }：外部端点比云端先回来时先存着，云端一到就并进去
+/* 外部订单的行 key：raw id 含冒号/空格进不了内联事件（safeId 会判非法并 console.warn），
+   派生一个只含 [A-Za-z0-9_-] 的行 key 给 data-order / _toggleOrderExpand 用；
+   真正的 order_id 仍留在数据里（_orderStatusEditable 按 raw id 判外部订单）。 */
+function _externalRowKey(oid) { return 'extrow-' + String(oid || '').replace(/[^A-Za-z0-9]/g, '-'); }
+/* 取外部监视订单：失败一律**静默**返回空数组（500 / 404 / 非 JSON / 断连 / 挂住都不能让
+   订单明细跟着消失 —— 它只是明细的补充来源）。 */
+function _fetchExternalOrders(range) {
+  var r = range || _scopeRange();
+  if (!r) return Promise.resolve([]);
+  var params = 'start_date=' + encodeURIComponent(r.start) + '&end_date=' + encodeURIComponent(r.end);
+  return fetch('/api/local/external_prints?' + params, { headers: apiHeaders() })
+    .then(function (res) {
+      if (!res || res.ok === false) return null;                       // 500/404：不解析、不抛
+      return res.json().catch(function () { return null; });           // 非 JSON 也当「没有」
+    })
+    .then(function (data) {
+      var list = (data && data.success && Array.isArray(data.orders)) ? data.orders : [];
+      return list.filter(function (o) {
+        // 契约兜底：id 必须是 ext: 前缀字符串、必须有排序/趋势要用的 created_at
+        return o && typeof o.order_id === 'string' && o.order_id.indexOf('ext:') === 0 && !!o.created_at;
+      }).map(function (o) {
+        o.source = 'external';
+        o.external = true;
+        o.openid = o.openid || 'local';                       // 归组走「本地归属人」这条分支
+        o.files_count = (o.files || []).length;               // 表里直接读 files_count，不另立口径
+        return o;
+      });
+    })
+    .catch(function () { return []; });                          // 超时/断连：静默
+}
+/* 外部行是否应排在 b 之前（倒序口径：created_at 大的在前；同一时刻 order_id 大的在前）。
+   只用来**定位外部行的插入点**，绝不用来重排既有行（见 _mergeExternalOrders）。 */
+function _extRowBefore(a, b) {
+  var ta = String((a && a.created_at) || ''), tb = String((b && b.created_at) || '');
+  if (ta !== tb) return ta > tb;
+  return String((a && a.order_id) || '') > String((b && b.order_id) || '');
+}
+/* 把外部订单并进**订单明细使用的那份 orders 数组**：KPI / 趋势图 / 成员账目 / 订单明细
+   全部由这一份数组聚合（_orderMoney / _userAgg / _currentOrderList / 趋势切片），
+   所以「并入数据源」这一层就能让四处一致 —— 一个口径函数的内部算法都不用改。
+   排序口径（刻意只做最小动作）：
+     · 没有外部行 ⇒ **一个字节都不动** data.orders（不 concat、不 sort）。外部账本为空 /
+       端点未部署 / 500 / 404 时，云端订单必须与后端返回的顺序一字不差 —— 重排会改掉页面上
+       「第几条」的含义（按行定位的交互会整体漂移）。
+     · 有外部行 ⇒ 以 base 的**原顺序**为基准，把每条外部行按 created_at 倒序（同一时刻按
+       order_id 倒序）**稳定插入**到合适位置；base 内部相对顺序永远不变。 */
+function _mergeExternalOrders(data, ext) {
+  if (!data) return data;
+  var add = (ext || []).filter(function (o) { return o && o.source === 'external'; });
+  _externalOrderIds = {};
+  add.forEach(function (o) {
+    _externalOrderIds[String(o.order_id)] = true;
+    _externalOrderIds[_externalRowKey(o.order_id)] = true;
+  });
+  if (!add.length) return data;                        // 没有外部行：原样返回，一个字节都不动
+  add.sort(function (a, b) { return _extRowBefore(a, b) ? -1 : (_extRowBefore(b, a) ? 1 : 0); });
+  var out = (data.orders || []).slice();
+  add.forEach(function (row) {
+    var idx = out.length;                              // 默认排在最后（比所有既有行都旧）
+    for (var i = 0; i < out.length; i++) {
+      if (_extRowBefore(row, out[i])) { idx = i; break; }   // 插到第一条「比它旧」的行之前
+    }
+    out.splice(idx, 0, row);
+  });
+  data.orders = out;
+  return data;
+}
+/* 外部订单**单独取、单独到**（两段式）：云端/本地订单先按原样画出来，外部订单到了再并进去重绘。
+   这样外部账本一坏（500/挂住/后端还没部署）只是「这次没有外部订单」，绝不会拖住或清空明细。 */
+function _startExternalMerge(range, reqKey) {
+  _externalPending = null;
+  _fetchExternalOrders(range).then(function (ext) {
+    if (_scopeDataKey !== reqKey) return;                        // 口径已切换：丢弃
+    if (_cloudData && _cloudData.orders) {                       // 订单已渲染：并入后重绘
+      _cloudData = _mergeExternalOrders(_cloudData, ext);
+      _scopeCache[reqKey] = _cloudData;
+      _renderScopeViews();
+    } else {
+      _externalPending = { key: reqKey, orders: ext };           // 云端还没到：等它的 then 合并
+    }
+  });
+}
+function _takePendingExternal(reqKey) {
+  var p = _externalPending;
+  _externalPending = null;
+  return (p && p.key === reqKey) ? p.orders : [];
+}
 /* 口径唯一数据源：按当前时间口径拉取（成员/来源筛选为前端过滤，不触发请求；趋势与全页共用本数据）。
    force=true 为手动刷新：清缓存重拉当前口径。 */
 function fetchScopeData(force) {
@@ -2956,14 +3083,15 @@ function fetchScopeData(force) {
   _scopeDataKey = key;
   _cloudDataFetchedAt = null;   // 旧数据作废，等新数据返回后再显示同步时间
   _renderScopeViews();
+  _startExternalMerge(range, reqKey);   // v7.3：外部监视订单并行取，到了再并入（不阻塞本请求）
   fetch('/api/proxy/admin/statistics/revenue?' + params, { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
     .then(function (data) {
       if (_scopeDataKey !== reqKey) return;                      // 口径已切换，丢弃过期响应
       _cloudLoading = false;
       if (data && data.success) {
-        _cloudData = data.data;
-        _scopeCache[reqKey] = data.data;
+        _cloudData = _mergeExternalOrders(data.data, _takePendingExternal(reqKey));
+        _scopeCache[reqKey] = _cloudData;
         _scopeFailedKey = null;
         _cloudDataFetchedAt = new Date().toTimeString().substring(0, 8);
         if (_scopeTime.mode === 'month') fetchCloudCompare(_scopeTime.month);   // 懒加载上月数据用于环比徽标（仅自然月口径）
@@ -3097,7 +3225,10 @@ function _memberOptions() {
 var _SOURCE_OPTIONS = [
   { key: 'wechat', label: '小程序', color: '#16a34a' },
   { key: 'app', label: 'APP', color: '#4f6ef7' },
-  { key: 'local', label: '本地', color: '#b45309' }
+  { key: 'local', label: '本地', color: '#b45309' },
+  /* v7.3：外部打印监视（print_watch 账本里「已处理」的作业）—— 绕过本工具直接打印、
+     经人工确认出纸。它和云端三来源并列成为第四个来源，可单独筛选（只看外部作业）。 */
+  { key: 'external', label: '外部监视', color: '#0d9488' }
 ];
 function _scopeMembersLabel() {
   if (!_scopeMembers) return '全部成员';
@@ -3854,9 +3985,13 @@ var ORDER_COL_DEVICE = { min: 200, full: 320 };
 /* 类型列以外的固定列 [表头文字, 宽度, 列键(可选)] —— 顺序必须与订单行 <td> 的输出顺序一致：
    展开 / 订单号 / 来源 / 用户 / 状态 / 金额 / 文件 / 页数 / 张数（这 9 列之后才是动态的 4 列）。
    列键 'status' 用于在该表头右侧挂「订单状态订正」的锁定开关（v7.0，见 _orderStatusLockHTML）。 */
+/* v7.3：「来源」从 64 加到 88 —— 新增的「外部监视」是 4 个字，64px（再减左右 padding 28 = 36px）
+   装不下，标签会压到「用户」列上。**合计仍是 756**（文件 58→50、页数 96→88、张数 88→80 各让 8~6），
+   所以类型列宽度、腾出宽度与表 min-width 的口径一字未动（tests/verify_order_table_columns.mjs 的
+   FIXED_W 仍成立），只是把宽度从「装数字的列」挪给了「装 4 个字标签的列」。 */
 var ORDER_FIXED_COLS = [
-  ['', 34], ['订单号', 140], ['来源', 64], ['用户', 104], ['状态', 84, 'status'],
-  ['金额', 88], ['文件', 58], ['页数', 96], ['张数', 88]
+  ['', 34], ['订单号', 140], ['来源', 88], ['用户', 104], ['状态', 84, 'status'],
+  ['金额', 88], ['文件', 56], ['页数', 82], ['张数', 80]
 ];
 var ORDER_FIXED_W = ORDER_FIXED_COLS.reduce(function (a, c) { return a + c[1]; }, 0);
 /* 列宽分配（唯一真相）：类型列按槽位数取宽，腾出的宽度按 时间 → 开始打印 → 接单设备 依次补齐，
@@ -3953,7 +4088,22 @@ var ORDER_FIXABLE_STATUSES = ['sent', 'failed', 'abandoned', 'canceled', 'reject
    内联 onclick 里的 id 已是引号字符串（不再当 JS 表达式求值），但 `'1e3'`/`'12-34'`/`'01'`
    这类写法仍会过旧的 safeId 字母白名单；只认十进制才能保证「页面能点的 id」==「后端认的 id」。 */
 function _orderStatusEditable(oidS) {
-  return FINANCE_MODE !== 'local' && !!unlocked.orderstatus && !!oidS && /^[0-9]+$/.test(String(oidS));
+  if (FINANCE_MODE === 'local' || !unlocked.orderstatus || !oidS) return false;
+  if (!/^[0-9]+$/.test(String(oidS))) return false;
+  /* v7.3：外部打印监视订单**永不**可订正 —— 它们不在云端 orders 表里（写库接口根本找不到这单），
+     所以这里显式再挡一条，别指望「id 带前缀、过不了十进制正则」这一条默契能一直成立。 */
+  if (_isExternalOrder(oidS)) return false;
+  return true;
+}
+/* 是否外部监视订单（三种判据都认）：本次合并进来的 id / 行 key → 契约前缀兜底 → 最后按订单对象核对
+   source（_findCloudOrder 是线性查找，只在前面两条都没命中时才用，避免逐行渲染时白跑）。 */
+function _isExternalOrder(oid) {
+  var key = String(oid == null ? '' : oid);
+  if (!key) return false;
+  if (_externalOrderIds[key]) return true;
+  if (key.indexOf('ext:') === 0 || key.indexOf('extrow-') === 0) return true;
+  var o = _findCloudOrder(key);
+  return !!(o && o.source === 'external');
 }
 /* 「状态」表头的锁定开关 HTML（本地模式不渲染） */
 function _orderStatusLockHTML() {
@@ -3988,7 +4138,8 @@ function toggleOrderStatusLock() {
    误改就是账目错，所以它也要锁在同一把锁里。 */
 var ORDER_FIXABLE_TYPES = ['receive', 'self'];
 function _orderTypeLabel(t) { return t === 'self' ? '👤自打' : '🤝接单'; }
-/* 可编辑判据与状态**同源**（云端 + 已解锁 + id 规范十进制）：一把锁管两列，判据也只该有一份 */
+/* 可编辑判据与状态**同源**（云端 + 已解锁 + id 规范十进制 + 非外部监视订单）：
+   一把锁管两列，判据也只该有一份 —— 外部订单在 _orderStatusEditable 里就被挡住了，这里自然同样挡住 */
 function _orderTypeEditable(oidS) { return _orderStatusEditable(oidS); }
 function _orderTypeLockHTML() {
   if (FINANCE_MODE === 'local') return '';
@@ -4229,7 +4380,8 @@ function _cloudFilteredOrders() {
   var orders = _memberFilteredOrders();
   if (_scopeSources) orders = orders.filter(function (o) {
     var s = o.source || 'wechat';
-    if (s !== 'wechat' && s !== 'app' && s !== 'local') s = 'wechat';
+    // v7.3：external 是第四个来源，必须留在白名单里（否则「外部监视」一筛就永远命中不到自己）
+    if (s !== 'wechat' && s !== 'app' && s !== 'local' && s !== 'external') s = 'wechat';
     return !!_scopeSources[s];
   });
   return orders;
@@ -4315,21 +4467,30 @@ function _renderOrderListHTML() {
              '<th style="width:' + colW.print + 'px">开始打印</th><th style="width:' + colW.device + 'px">接单设备</th>';
     h += '<div class="table-wrap"><table class="order-table" style="min-width:' + colW.minWidth + 'px"><thead><tr>' + hcols + '</tr></thead><tbody>';
     pageOrders.forEach(function (o) {
-      var isExp = !!_cloudExpanded[o.order_id];
-      var srcTxt = o.source === 'app' ? 'APP' : (o.source === 'local' ? '本地' : '小程序');
-      // 来源三色：小程序=绿 / APP=蓝 / 本地=橙（与收益构成环形图同色系）
-      var srcCls = o.source === 'app' ? 'tag b' : (o.source === 'local' ? 'tag y' : 'tag g');
+      // v7.3：外部监视订单的 id 是 ext:<job_id>:<detected_at>（含冒号/空格），不能进内联事件，
+      // 行 key 用安全派生值；云端订单仍走 safeId（十进制白名单）。
+      var _isExternal = o.source === 'external';
+      var isExp = !!_cloudExpanded[_isExternal ? _externalRowKey(o.order_id) : o.order_id];
+      // 来源四色：小程序=绿 / APP=蓝 / 本地=橙 / 外部监视=青（与收益构成环形图同色系）
+      var srcTxt = _isExternal ? '外部监视'
+        : (o.source === 'app' ? 'APP' : (o.source === 'local' ? '本地' : '小程序'));
+      var srcCls = _isExternal ? 'tag ext'
+        : (o.source === 'app' ? 'tag b' : (o.source === 'local' ? 'tag y' : 'tag g'));
+      var srcTip = _isExternal ? '绕过本工具直接打印、经人工确认出纸的作业' : '';
       // 本地订单已归属到具体管理员：用户列显示归属人（owner_name），不再笼统显示"本地任务"
       // 归属人即成员名 → 按成员查找以复用彩色胶囊样式，与云端绑定用户文字样式保持一致
+      // v7.3：外部监视订单的「设备所有者」走同一条本地归属人分支（openid 恒为 'local'）；
+      // 账本里没记所有者时显示「未绑定」—— 它是绕过本工具打出去的作业，不是「本地任务」。
       var mo = o.openid === 'local'
-        ? (o.owner_name ? (memberOfName(o.owner_name) || { name: o.owner_name }) : { name: '本地任务' })
+        ? (o.owner_name ? (memberOfName(o.owner_name) || { name: o.owner_name })
+                        : { name: _isExternal ? '未绑定' : '本地任务' })
         : memberOfOpenid(o.openid);
       // v5.25：云端订单用户列显示「发起订单用户的昵称」（绑定微信后即微信小程序昵称，
       // 后端实时查 users 表，修改昵称自动同步）；昵称为空时回退绑定成员名 / openid 缩写
       var who = o.openid === 'local'
         ? (mo ? mo.name : '本地任务')
         : (o.nickname || (mo ? mo.name : (o.openid || '').substring(0, 8) + '…'));
-      var oidS = safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
+      var oidS = _isExternal ? _externalRowKey(o.order_id) : safeId(o.order_id);   // 订单 ID 白名单校验后才进入内联事件
       // 金额配色：自打订单且已完成（sent）→ 与「自打」标记同色（蓝色主题色 var(--primary)）；
       // 其他状态（放弃/失败等）→ 以该状态的颜色为准
       var revColor = (o.is_admin_print && o.status === 'sent')
@@ -4371,7 +4532,8 @@ function _renderOrderListHTML() {
       h += '<tr class="order-row st-bar' + (isExp ? ' expanded' : '') + '" data-order="' + oidS + '" style="--row-stc:' + _statusColor(o.status) + '"' + (oidS ? ' onclick="_toggleOrderExpand(\'' + oidS + '\')"' : '') + '>';
       h += '<td><span class="expand-icon">▶</span></td>';
       h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
-      h += '<td style="white-space:nowrap"><span class="' + srcCls + '">' + srcTxt + '</span></td>';
+      h += '<td style="white-space:nowrap"><span class="' + srcCls + '"' +
+        (srcTip ? ' title="' + srcTip + '"' : '') + '>' + srcTxt + '</span></td>';
       h += '<td class="l ell" title="' + esc(who) + (addr ? ' · ' + esc(addr) : '') + '">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
       /* 状态列：锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头，点开即选终态（v7.0）。
          点状态标签时要拦住行点击（否则会同时展开文件明细）。 */
@@ -5574,7 +5736,9 @@ function renderDash() {
     + '团队共担的机器折旧不产生这列数字（没有对手方）。</div></div>';
 
   // 垫付清算
-  h += '<div class="section"><h2>💳 垫付清算 <span class="hint">（谁多垫了、谁少垫了）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>实际代付</th><th>− 应均摊</th><th>= 垫付差额</th></tr></thead><tbody>';
+  /* 第三列 = 该成员应承担的采购份额：均摊口径写「应均摊」，按用量口径写「应摊（按用量）」
+     （同一个 purchaseBasisHint 的判据，别让表头把按用量算出来的数说成均摊）。 */
+  h += '<div class="section"><h2>💳 垫付清算 <span class="hint">（谁多垫了、谁少垫了）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>实际代付</th><th>− ' + (getPurchaseBasis() === 'usage' ? '应摊（按用量）' : '应均摊') + '</th><th>= 垫付差额</th></tr></thead><tbody>';
   var advSum = 0;   // 合计行的「垫付差额」改为**逐行求和** —— 旧写法硬编码 0，
                     // 取整余数一出现（每人应摊不再相等）就与上面几列自相矛盾。
   getMembers().forEach(function (mem) {
@@ -6030,13 +6194,13 @@ function renderEntry() {
   }
 
   /* ── 采购支出 ── */
-  h += '<div class="section"><h2>🧾 采购支出 <span class="hint">（谁垫付了什么，AA 均摊）</span>' + lockBadge('expense') + '</h2>';
+  h += '<div class="section"><h2>🧾 采购支出 <span class="hint">' + purchaseBasisHint() + '</span>' + lockBadge('expense') + '</h2>';
   h += lockBarHTML('expense');
   var disabled = unlocked.expense ? '' : ' disabled';
   /* v7.9：类型是常驻枚举（普通采购 / A4纸 / 硒鼓）。选了长期耗材就多出「数量」列：
      A4纸填总张数、硒鼓填可打印页数 —— 结算只按每月实际用掉的量摊销，购买月不再整笔计入。 */
   var hasConsumable = m.expenses.some(isConsumableExpense);
-  h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th class="l">项目</th><th>类型</th>'
+  h += '<div class="table-wrap"><table class="exp-table' + (hasConsumable ? ' has-qty' : '') + '"><thead><tr><th>日期</th><th class="l">项目</th><th>类型</th>'
     + (hasConsumable ? '<th>数量</th>' : '')
     + '<th>金额（元）</th><th>代付人</th><th></th></tr></thead><tbody>';
   m.expenses.forEach(function (e, i) {
@@ -6056,9 +6220,10 @@ function renderEntry() {
         h += '<td style="color:var(--muted)">—</td>';
       } else {
         var ck = CONSUMABLE_KIND[kind];
-        h += '<td style="white-space:nowrap"><input type="number" step="1" min="0" value="' + (units || '') + '" placeholder="' + (kind === 'paper' ? '总张数' : '可打印页数') + '" style="width:104px" onchange="updExp(\'' + eid + '\',\'units\',+this.value)"' + disabled + '> <span style="font-size:.75rem;color:var(--muted)">' + ck.unit + '</span>';
-        if (units > 0) h += '<div style="font-size:.72rem;color:var(--muted)">单价 ¥' + consumableUnitYuan(e).toFixed(4) + '/' + ck.unit + '</div>';
-        else h += '<div style="font-size:.72rem;color:var(--orange)">填数量后按月摊销</div>';
+        h += '<td class="exp-qty"><input type="number" step="1" min="0" value="' + (units || '') + '" placeholder="' + (kind === 'paper' ? '总张数' : '可打印页数') + '" style="width:104px" onchange="updExp(\'' + eid + '\',\'units\',+this.value)"' + disabled + '> <span style="font-size:.75rem;color:var(--muted)">' + ck.unit + '</span>';
+        /* 这两行小字绝对定位（.exp-qty-note），别再改回普通 div：会让本格变高、把输入框顶上去 */
+        if (units > 0) h += '<div class="exp-qty-note" style="color:var(--muted)">单价 ¥' + consumableUnitYuan(e).toFixed(4) + '/' + ck.unit + '</div>';
+        else h += '<div class="exp-qty-note" style="color:var(--orange)">填数量后按月摊销</div>';
         h += '</td>';
       }
     }
@@ -6311,22 +6476,25 @@ function fetchLocalScopeData(force) {
   if (!range) { toast('请选择起止日期', 'error'); return; }
   if (force) { _scopeCache = {}; _scopeFailedKey = null; }
   var params = 'start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end);
+  var reqKey = _scopeRangeKey();
   _cloudLoading = true;
+  _scopeDataKey = reqKey;        // 与云端模式同一套「口径失效」判据（外部订单的迟到合并也认它）
   _cloudDataFetchedAt = null;
   _renderScopeViews();
+  _startExternalMerge(range, reqKey);   // v7.3：本地模式同样合并外部监视订单（两段式，失败静默）
   fetch('/api/local/orders?' + params, { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
     .then(function (data) {
       _cloudLoading = false;
       if (data && data.success && data.data) {
-        _cloudData = data.data;
-        _scopeCache[_scopeRangeKey()] = data.data;
+        _cloudData = _mergeExternalOrders(data.data, _takePendingExternal(reqKey));
+        _scopeCache[reqKey] = _cloudData;
         _scopeFailedKey = null;
         _cloudDataFetchedAt = new Date().toTimeString().substring(0, 8);
-      } else { _cloudData = null; _scopeFailedKey = _scopeRangeKey(); }
+      } else { _cloudData = null; _scopeFailedKey = reqKey; }
       _renderScopeViews();
     })
-    .catch(function () { _cloudLoading = false; _cloudData = null; _scopeFailedKey = _scopeRangeKey(); _renderScopeViews(); });
+    .catch(function () { _cloudLoading = false; _cloudData = null; _scopeFailedKey = reqKey; _renderScopeViews(); });
 }
 function _scopeRangeKey() { var r = _scopeRange(); return r ? (r.start + '_' + r.end) : ''; }
 

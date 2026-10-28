@@ -105,9 +105,22 @@ chk("锁定态同时收起状态菜单（closeOrderStatusMenu）",
     re.search(r"function closeOrderStatusMenu\(\)[\s\S]{0,200}?m\.remove\(\)", html) is not None)
 
 # A3 解锁后才有小箭头 / 点击入口（锁定态点状态什么都不发生）
+# 判据按**语义**取函数体里的三道闸门，不钉代码形状：2026-10-28 起该函数由单行 return 改成多行守卫
+# （新增「外部监视订单永不订正」那条），写死单行形状会让正当改动误报红。
+_status_gate = re.search(r"function _orderStatusEditable\(oidS\) \{([\s\S]*?)\n\}", html)
+_gate_body = _status_gate.group(1) if _status_gate else ""
+_gate_ok = (
+    bool(_gate_body)
+    and re.search(r"FINANCE_MODE === 'local'[\s\S]{0,160}?return false", _gate_body) is not None
+    and "unlocked.orderstatus" in _gate_body
+    and "/^[0-9]+$/" in _gate_body
+    and re.search(r"return true", _gate_body) is not None
+)
 chk("行内状态单元格由 _orderStatusEditable 门控（仅云端 + 已解锁 + id 合法）",
-    re.search(r"function _orderStatusEditable\(oidS\) \{\s*\n\s*return FINANCE_MODE !== 'local' && !!unlocked\.orderstatus && !!oidS",
-              html) is not None)
+    _gate_ok, _gate_body.strip()[:120])
+chk("外部监视订单永不订正（它们不在云端 orders 表里，写库接口根本找不到这单）",
+    re.search(r"_isExternalOrder\(oidS\)[\s\S]{0,40}?return false", _gate_body) is not None,
+    _gate_body.strip()[:160])
 chk("小箭头 st-caret 只出现在可编辑分支里",
     re.search(r"_orderStatusEditable\(oidS\)[\s\S]{0,400}?st-caret", html) is not None)
 chk("锁定分支就是纯标签（没有箭头 / 没有 onclick）",
@@ -177,7 +190,7 @@ chk("白名单只含终态（sent/failed/abandoned/canceled/rejected）——"
     "排队中/打印中会被推送与预约调度重新捡起来打印，不能人工改",
     set(fe_list) == {"sent", "failed", "abandoned", "canceled", "rejected"})
 chk("本地模式不给订正入口（本地订单库存本地库、无对应写接口）",
-    "FINANCE_MODE !== 'local' && !!unlocked.orderstatus" in html and
+    re.search(r"FINANCE_MODE === 'local'[\s\S]{0,160}?return false", _gate_body) is not None and
     re.search(r"function _orderStatusLockHTML\(\) \{\s*\n\s*if \(FINANCE_MODE === 'local'\) return '';", html) is not None)
 
 # A6 后端：printer token 鉴权 + 父/子一起改 + 事务
