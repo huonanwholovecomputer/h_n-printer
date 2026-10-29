@@ -1,9 +1,9 @@
 {
-  "version": "4.5.38",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.38.exe",
-  "md5": "4a6db96a9a9b6c68a865164099f440ed",
-  "sha256": "da80148e7e4e338201a9ceeff9383f464eaab45f6b3a5b232d37075e8be91f0f",
-  "notes": "v4.5.38：① 页数分析也按「上传者=管理员」放行 Word/WPS —— 此前分析恒用 LibreOffice、打印却按管理员例外走 Word，同一份文件的页数可能对不上；② 云端日志去重（订单取消 / 收到任务 / 下载完成各只写一行，推送与 HTTP 拉取同一段文案）；③ 本机日志改为按天分文件 logs/YYYY-MM-DD.log（跨午夜自动换，云端「收集设备日志」与日志排查工具同步跟改）；④ 收支清算「订单构成」加入外部打印监视来源，三张环形图都带图例（小到画不出扇区的来源也能看见）；⑤ 文件菜单省略号与文案统一。",
+  "version": "4.5.39",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.39.exe",
+  "md5": "1e4a853795a7f217ae6f0eb8af0d05dd",
+  "sha256": "0f8b7fef7537ceeb2e5de0981ce88bfe7d0aae7dce7ff1452d038f2a9bf9a8b3",
+  "notes": "v4.5.39：① 外部打印监视不再每条都要人工确认 —— 页数与单双面都自动读到就直接记为「已确认」并计入合计（只有读不全才弹补录框，补完在「外部打印账本」里点「标记已处理」；实际没出纸的用「标记已忽略」撤销）；② 收支清算页两条「正在统计…」横幅改成转圈加载态，不再像卡住；③ 取数完成、以及首屏「暂无成员」→ 卡片载入时，KPI 卡片与下方区块错峰淡入；④ 系统开启「减少动效」时不播这段动画。",
   "sig_algo": "ed25519",
-  "sig": "bedhzfqfoPGq9z+ukvrvxrx0Cus3klAHer7SMnaQC+uVF06X8XQvQulkPdWJ8ln+2aCoL3GmawHMwJIEBiv8Bg=="
+  "sig": "B8s7Hj86hPAKLLlxNxF7lCDo8VYkrGrtUhWQpCxe/TFQyKXUyOFrDlSBAyJB1GcE7hHjcHjM8Jyse/x4R0rEBQ=="
 }
