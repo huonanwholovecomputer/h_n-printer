@@ -15,7 +15,9 @@
   ⑦ 账本原子写、损坏文件容错（.corrupt 副本）、2000 条上限丢最旧；
   ⑧ CSV 导出列正确；
   ⑨ pdf_printer 的 tag_self_title 接线（静态 + 导入失败回退不抛）；
-  ⑩ gui.py 静态接线（菜单可勾选项 / 对话框 / Signal / 非模态补录提示）。
+  ⑩ gui.py 静态接线（菜单可勾选项 / 对话框 / Signal / 非模态补录提示）；
+  ⑪ 自动记账（2026-10-29）：页数与单双面都读到 ⇒ 直接「已确认」，缺一个才弹补录；
+     人工点过的「已忽略」不许被自动记账翻回来。
 
 用法: python tests/verify_print_watch.py   （exit 0 = 全部通过）
 """
@@ -772,6 +774,71 @@ try:
           "¥0.40" in _summary and "¥0.70，未计入" in _summary, _summary)
 except Exception as _e:                                     # 没装 PySide6/无显示环境时不阻塞
     print(f"[SKIP] 账本合计渲染检查跳过：{_e}")
+
+# ══════════════════════════════════════════════════════════════════
+section("⑫ 自动记账：页数与单双面都读到就不再等人工确认（2026-10-29 用户口径）")
+# ══════════════════════════════════════════════════════════════════
+
+check("auto_confirmable 判据：页数 > 0 且单双面已知才 True（缺一个照旧走人工）",
+      pw.auto_confirmable(pw.ExternalPrint(pages=3, duplex=pw.DUPLEX_ON)) is True
+      and pw.auto_confirmable(pw.ExternalPrint(pages=2, duplex=pw.DUPLEX_OFF)) is True
+      and pw.auto_confirmable(pw.ExternalPrint(pages=0, duplex=pw.DUPLEX_ON)) is False
+      and pw.auto_confirmable(pw.ExternalPrint(pages=3, duplex=pw.DUPLEX_UNKNOWN)) is False)
+
+st_auto = new_store("auto_confirm")
+logs_auto = []
+w_auto = pw.PrintJobWatcher(st_auto, enum_jobs=lambda p: [], printers=["HP LaserJet 1020"],
+                            virtual_check=not_virtual, on_log=lambda m: logs_auto.append(m))
+w_auto.consider("HP LaserJet 1020", job(job_id=71, doc="自动记账.pdf", total=3, duplex=2), now)
+items_auto = st_auto.load()
+check("页数+单双面都读到的作业直接落成「已确认」（不必再等人工点）",
+      len(items_auto) == 1 and items_auto[0].status == pw.STATUS_CONFIRMED,
+      f"{[i.status for i in items_auto]}")
+_amount_auto = pw.amount_for(items_auto[0], 0.3, 0.4) if items_auto else None
+check("落账即可算钱（3 页双面 = 1 张双面 0.4 + 1 张单面 0.3 = 0.70）",
+      _amount_auto == 0.7, f"{_amount_auto}")
+check("自动记账在日志里明说「已自动记账」（现场可核，不静默）",
+      any("已自动记账" in m for m in logs_auto), str(logs_auto[-1:]))
+
+st_auto2 = new_store("auto_confirm_partial")
+w_auto2 = pw.PrintJobWatcher(st_auto2, enum_jobs=lambda p: [], printers=["HP LaserJet 1020"],
+                             virtual_check=not_virtual, on_log=lambda m: None)
+w_auto2.consider("HP LaserJet 1020", job(job_id=72, doc="缺单双面.pdf", total=3), now)
+w_auto2.consider("HP LaserJet 1020", job(job_id=73, doc="缺页数.pdf", total=0, duplex=2), now)
+_pend = {i.document: i.status for i in st_auto2.load()}
+check("缺页数或缺单双面的作业仍是「待处理」（不猜，等人工补录）",
+      _pend.get("缺单双面.pdf") == pw.STATUS_NEW and _pend.get("缺页数.pdf") == pw.STATUS_NEW,
+      str(_pend))
+
+st_auto3 = new_store("auto_confirm_late")
+w_auto3 = pw.PrintJobWatcher(st_auto3, enum_jobs=lambda p: [],
+                             printers=["HP LaserJet MFP M232-M237"],
+                             virtual_check=not_virtual, on_log=lambda m: None)
+w_auto3.consider("HP LaserJet MFP M232-M237",
+                 job(job_id=74, doc="后报页数.pdf", total=0, duplex=2,
+                     printer="HP LaserJet MFP M232-M237"), now)
+w_auto3.consider("HP LaserJet MFP M232-M237",
+                 job(job_id=74, doc="后报页数.pdf", total=4, duplex=2,
+                     printer="HP LaserJet MFP M232-M237"), now + timedelta(seconds=5))
+_late = st_auto3.load()
+check("页数作业跑起来才报的机型：补上后自动转「已确认」（不再要求人点一次）",
+      len(_late) == 1 and _late[0].pages == 4 and _late[0].status == pw.STATUS_CONFIRMED,
+      f"{[(i.pages, i.status) for i in _late]}")
+
+st_auto4 = new_store("auto_confirm_ignored")
+w_auto4 = pw.PrintJobWatcher(st_auto4, enum_jobs=lambda p: [], printers=["P"],
+                             virtual_check=not_virtual, on_log=lambda m: None)
+w_auto4.consider("P", job(job_id=75, doc="人工已忽略.pdf", total=0, duplex=2, printer="P"), now)
+st_auto4.set_status(0, pw.STATUS_IGNORED)
+w_auto4.consider("P", job(job_id=75, doc="人工已忽略.pdf", total=5, duplex=2, printer="P"),
+                 now + timedelta(seconds=5))
+_kept = st_auto4.load()[0]
+check("人工点过「已忽略」的记录不会被自动记账翻回「已确认」（撤销必须留得住）",
+      _kept.status == pw.STATUS_IGNORED and _kept.pages == 5, f"{_kept.status}/{_kept.pages}")
+
+check("GUI 的补录弹窗判据换成 auto_confirmable（能自动的绝不弹框打扰现场）",
+      "print_watch.auto_confirmable(item)" in gui_src)
+
 
 print("\n" + "=" * 78)
 print("全部通过 ✅" if ok_all else "有失败项 ❌")

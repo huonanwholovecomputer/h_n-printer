@@ -360,6 +360,18 @@ def amount_for(item: ExternalPrint, simplex_price: float, duplex_price: float) -
     return round(float(cost), 2)
 
 
+def auto_confirmable(item: ExternalPrint) -> bool:
+    """页数与单双面都拿到了 ⇒ 可以直接记为「已确认」，不必等人点「标记已处理」。
+
+    2026-10-29 用户口径：能自动拿到准确页数和单双面就自动记账，只有拿不到时才弹补录框、
+    再由人工在账本里点。判据与 amount_for 是同一件事的两面 —— 金额算得出来就说明这笔账
+    没有歧义，人工确认只是重复劳动；缺一个就返回 False，照旧走人工。
+    不看 pages_source：人工补录的页数同样算"准确"（那更准）。
+    """
+    pages = _as_int(getattr(item, "pages", 0), 0)
+    return pages > 0 and str(getattr(item, "duplex", "") or "") in (DUPLEX_ON, DUPLEX_OFF)
+
+
 def duplex_label(duplex: str) -> str:
     return {DUPLEX_ON: "双面", DUPLEX_OFF: "单面"}.get(str(duplex or ""), "待确认")
 
@@ -937,12 +949,21 @@ class PrintJobWatcher:
         item = build_external(job, now, printer=printer, virtual=False,
                               self_titles=self_titles,
                               virtual_check=self.virtual_check)
+        # 页数与单双面都读到了 ⇒ 直接记为「已确认」（2026-10-29 用户口径：不要再等人点）。
+        # 账本里的「标记已忽略」保留：唯一拿不到的就是"这篇纸到底出没出"（拔 USB / 队列取消
+        # 也照样能被扫到），那种只能事后人工撤销，不能因为自动化连撤销入口一起没有。
+        auto_done = auto_confirmable(item)
+        if auto_done:
+            item.status = STATUS_CONFIRMED
         if not store.add(item):
             return None
         self._emit_log(f"🧾 检测到外部打印：{item.printer} / {item.document or '(无文档名)'} / "
                        f"{item.pages if item.pages > 0 else '页数未知'} 页")
         # 原始 DEVMODE 一行：现场只有它能区分"驱动没写"与"我们没读"（两者界面上都是待确认）
         self._emit_log(f"🧾 外部打印解析：{devmode_debug(job)}")
+        if auto_done:
+            self._emit_log("🧾 已自动记账：页数与单双面都已读到（无需人工确认；若实际没出纸，"
+                           "在「外部打印账本」里点「标记已忽略」即可）")
         callback = self.on_external
         if callback:
             try:
@@ -969,6 +990,14 @@ class PrintJobWatcher:
                 continue
             item.pages = pages
             item.pages_source = source
+            if item.status == STATUS_NEW and auto_confirmable(item):
+                # 页数是作业跑起来之后才报的（MFP M232 那类机型）：补上就满足自动记账条件，
+                # 不必再等人点一次（2026-10-29 用户口径）。已确认/已忽略的状态一概不动。
+                item.status = STATUS_CONFIRMED
+                store.update(item)
+                self._emit_log(f"🧾 外部打印页数补全并自动记账："
+                               f"{item.document or '(无文档名)'} → {pages} 页")
+                return
             store.update(item)
             self._emit_log(f"🧾 外部打印页数补全：{item.document or '(无文档名)'} → {pages} 页")
             return

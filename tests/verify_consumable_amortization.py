@@ -157,8 +157,24 @@ check("收支清算：长期耗材摊销区块（总量/单价/累计/已摊销/
       and "本月按垫付返还给采购人" in src
       and "本月摊销合计" in src and "剩余未摊销" in src)
 check("摊销加载/失败有明确提示与重试；未就绪时暂按整笔计入（绝不静默少记）",
-      "⏳ 正在统计长期耗材（A4纸 / 硒鼓）的逐日用量" in src
+      "正在统计长期耗材（A4纸 / 硒鼓）的逐日用量" in src
       and "暂按整笔采购计入" in src and "onclick=\"retryAmortUsage()\"" in src)
+check("两条「正在统计…」横条用转圈动效，不再用静态 ⏳（静态表情看不出在加载，像卡死）",
+      '<span class="loading-spin"></span>正在统计「' in src
+      and '<span class="loading-spin"></span>正在统计长期耗材' in src
+      and "⏳ 正在统计" not in src
+      and ".alert-banner .loading-spin {" in src)
+check("取数完成（loading → 终态）给 KPI/区块播放入场动画；紧跟的重画要重播（否则新 DOM 上一条动画都不剩），窗口外不重复播",
+      "function playSettledEntrance(ustate, amortState) {" in src
+      and "_dashLoadStates" in src and "wasLoading" in src and "settledNow" in src
+      and "ENTRANCE_WINDOW_MS" in src and "_dashEntranceUntil" in src
+      and "if (wasLoading && settledNow) _dashEntranceUntil = now + ENTRANCE_WINDOW_MS;" in src
+      and "playSettledEntrance(ustate, r.amort ? r.amort.state : 'none');" in src)
+check("可见结构跳变也播入场（首屏占位 → 成员载入 → 卡片）：只认「取数完成」会让前后两次硬跳没动画",
+      "function dashShapeKey() {" in src and "var _dashShape = '';" in src
+      and "if (trackDashShape()) _dashEntranceUntil = now + ENTRANCE_WINDOW_MS;" in src
+      and "playSettledEntrance(usageStateOfMonth(currentKey), 'none');   // 首屏占位也要淡入" in src
+      and "trackDashShape();   // 记下" not in src)
 check("缺数量的耗材显式提示「暂按普通采购全额计入本月」（钱不凭空消失）",
       "有 ' + pending.length + ' 笔长期耗材未参与摊销（<b>暂按普通采购全额计入本月</b>）" in src)
 check("历史记录补取「最早采购月 ~ 各结算月」的用量（摊销才和历史一致）",

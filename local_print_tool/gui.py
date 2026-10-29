@@ -106,7 +106,7 @@ import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.38"
+APP_VERSION = "4.5.39"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -3830,8 +3830,9 @@ class ExternalPagesPromptDialog(QDialog):
         head.setWordWrap(True)
         lay.addWidget(head)
 
-        hint = QLabel("这台打印机（主机型驱动，如 HP LaserJet 1020）不回报页数，程序查不到实际印了几页。"
-                      "请按纸数填一下，账本金额才是对的；不填就先留着，之后仍可在「外部打印账本」补。")
+        hint = QLabel("这项作业的页数或单双面没能自动读到（主机型驱动如 HP LaserJet 1020 不回报页数）。"
+                      "请按纸数填一下并确认单双面 —— 保存后到「外部打印账本」点「标记已处理」才计入合计；"
+                      "不填就先留着，之后仍可在账本里补。")
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size: 11px;")
         lay.addWidget(hint)
@@ -3909,7 +3910,8 @@ class ExternalPrintDialog(QDialog):
 
         root = QVBoxLayout(self)
         tip = QLabel("下列作业是「绕过本工具」直接发到打印机的（Word 等任意软件）。"
-                     "程序只检测和记账、不阻断出纸。页数显示「未确认」时按实际纸数补录，金额才对得上。")
+                     "程序只检测和记账、不阻断出纸。页数与单双面都自动读到的会直接记为「已确认」并计钱；"
+                     "显示「待处理」的是没读全的，补录页数后点「标记已处理」才计入合计。")
         tip.setWordWrap(True)
         root.addWidget(tip)
 
@@ -3942,10 +3944,12 @@ class ExternalPrintDialog(QDialog):
         self._btn_pages.setToolTip("改选中行的实际页数（来源列会标成「人工」），金额按配置单价重算")
         self._btn_pages.clicked.connect(self._on_edit_pages)
         self._btn_done = QPushButton("标记已处理")
-        self._btn_done.setToolTip("确认这笔确实出纸了；只有已处理的记录才计入「已确认金额合计」")
+        self._btn_done.setToolTip("人工确认这笔确实出纸了（页数与单双面自动读到的作业无需再点）；"
+                                  "只有已确认的记录才计入「已确认金额合计」")
         self._btn_done.clicked.connect(self._on_mark_done)
         self._btn_ignore = QPushButton("标记已忽略")
-        self._btn_ignore.setToolTip("没出纸（队列里取消了 / 打印失败 / 只是试打）：留档但永不计入合计")
+        self._btn_ignore.setToolTip("没出纸（队列里取消了 / 打印失败 / 只是试打）：留档但永不计入合计"
+                                    "（自动记账的发现没出纸，也在这里撤销）")
         self._btn_ignore.clicked.connect(self._on_mark_ignored)
         self._btn_csv = QPushButton("导出 CSV…")
         self._btn_csv.clicked.connect(self._on_export_csv)
@@ -7299,7 +7303,9 @@ class MainWindow(QMainWindow):
         dialog = getattr(self, "_ext_dialog", None)
         if dialog is not None and dialog.isVisible():
             dialog.reload()
-        if item.pages <= 0 or not item.duplex:
+        # 页数与单双面都读到了 ⇒ print_watch 已直接记为「已确认」，账本里立即计钱，不弹框。
+        # 只有缺页数或缺单双面（1020 这类主机型驱动的常态）才提示补录（2026-10-29 用户口径）。
+        if not print_watch.auto_confirmable(item):
             self._prompt_external_pages(item)
 
     def _prompt_external_pages(self, item):

@@ -416,6 +416,9 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .skeleton { background: linear-gradient(100deg, var(--card-2) 40%, var(--border) 50%, var(--card-2) 60%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; border-radius: 8px; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .loading-spin { display: inline-block; width: 18px; height: 18px; border: 2.5px solid var(--border-strong); border-top-color: var(--primary); border-radius: 50%; animation: spin .65s linear infinite; vertical-align: middle; }
+/* 横条正文只有 .88rem，18px 的圈会把行高顶起来 —— 横幅内缩小并跟文字基线对齐。
+   取数中必须是「看得出在转」的动效，静态 ⏳ 表情看起来跟卡死没区别（2026-10-29 用户反馈） */
+.alert-banner .loading-spin { width: 14px; height: 14px; border-width: 2px; margin-right: 8px; flex: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ==================== 订单明细 ==================== */
@@ -2972,8 +2975,9 @@ function _scopeTimeLabel() {
 }
 /* ==================== v7.3：外部打印监视订单（并入订单明细） ====================
    背景：print_watch 账本记录「绕过本工具、直接送进打印机」的作业（顾客拿 U 盘/别的软件打的纸），
-   人工在「外部打印监视」窗里逐条确认出纸 → 那些纸的钱也是这台机器挣的，必须计入收益并归到
-   设备所有者（账本里的 owner_name）。所以它们以**与云端 revenue 订单同构的行**并进订单明细。
+   页数与单双面都自动读到就自动记为「已确认」（2026-10-29 起不必人工逐条点），人工只在读不到时补录 →
+   那些纸的钱也是这台机器挣的，必须计入收益并归到设备所有者（账本里的 owner_name）。
+   所以它们以**与云端 revenue 订单同构的行**并进订单明细。
    口径边界（接口契约 stats_server GET /api/local/external_prints）：
      · 只返回 status == print_watch.STATUS_CONFIRMED（"confirmed"，界面叫「已处理」）的记录；
        待处理(new)/已忽略(ignored) 一条都不返回；
@@ -5568,6 +5572,7 @@ function renderDash() {
     hEmpty += '</div>';
     hEmpty += '<div class="section" style="text-align:center;padding:60px 20px"><div class="empty"><div class="ico">👥</div><h3>暂无成员</h3><p style="margin-top:6px">请先在「设置」中添加成员，成员将用于订单归属与收支结算，添加后本地打印工具的归属下拉会同步显示。</p><button class="btn pri" style="margin-top:16px" onclick="switchTab(\'settings\')">⚙️ 去设置添加成员</button></div></div>';
     el.innerHTML = hEmpty;
+    playSettledEntrance(usageStateOfMonth(currentKey), 'none');   // 首屏占位也要淡入；并记下这套结构，成员载入后算跳变
     return;
   }
 
@@ -5596,6 +5601,7 @@ function renderDash() {
   if (!hasData) {
     h += '<div class="section" style="text-align:center;padding:50px 20px"><div class="empty"><div class="ico">📭</div><h3>' + m.label + ' 暂无数据</h3><p style="margin-top:6px">切换到「记账」标签录入采购 / 代收 / 评分，数据将自动归入对应月份。</p><button class="btn pri" style="margin-top:16px" onclick="switchTab(\'entry\')">📝 去记账</button></div></div>';
     el.innerHTML = h;
+    playSettledEntrance(usageStateOfMonth(currentKey), r.amort ? r.amort.state : 'none');
     return;
   }
 
@@ -5620,7 +5626,7 @@ function renderDash() {
      静默退回均摊，账面看着"正常"其实错了） */
   var ustate = usageStateOfMonth(currentKey);
   if (ustate === 'loading') {
-    h += '<div class="alert-banner"><span class="msg">⏳ 正在统计「' + m.label + '」的实际出纸页数（用量）—— 按用量分摊与设备折旧随后自动刷新。</span></div>';
+    h += '<div class="alert-banner"><span class="msg"><span class="loading-spin"></span>正在统计「' + m.label + '」的实际出纸页数（用量）—— 按用量分摊与设备折旧随后自动刷新。</span></div>';
   } else if (ustate === 'failed') {
     h += '<div class="alert-banner" style="border-left-color:var(--neg)"><span class="msg">⚠️ 未取到「' + m.label + '」的用量统计：本月<b>设备折旧按 ¥0 计</b>'
       + (r.basis === 'usage' ? '、采购分摊已临时退回均摊' : '')
@@ -5633,7 +5639,7 @@ function renderDash() {
      未就绪时**暂按整笔采购计入**（旧口径）—— 宁可购买月暂时偏高，也不让整笔钱在
      历史记录 / 新增转账 / 一键填入建议转账里静默消失。 */
   if (r.amort && r.amort.state === 'loading') {
-    h += '<div class="alert-banner"><span class="msg">⏳ 正在统计长期耗材（A4纸 / 硒鼓）的逐日用量（需回溯到最早采购月）：本月长期耗材<b>暂按整笔采购计入</b>，统计完成后自动改为按月摊销。</span></div>';
+    h += '<div class="alert-banner"><span class="msg"><span class="loading-spin"></span>正在统计长期耗材（A4纸 / 硒鼓）的逐日用量（需回溯到最早采购月）：本月长期耗材<b>暂按整笔采购计入</b>，统计完成后自动改为按月摊销。</span></div>';
   } else if (r.amort && r.amort.state === 'failed') {
     h += '<div class="alert-banner" style="border-left-color:var(--neg)"><span class="msg">⚠️ 未取到长期耗材的用量：本月长期耗材<b>暂按整笔采购计入</b>（不会静默少记），重试成功后自动改为按月摊销。'
       + '<span class="sub">在取数成功前，先别「一键填入建议转账」。</span></span><button class="btn sm" onclick="retryAmortUsage()">重试</button></div>';
@@ -5901,6 +5907,61 @@ function renderDash() {
     var target = parseFloat(node.getAttribute('data-count'));  // 整数分
     var prefix = node.getAttribute('data-prefix') || '';
     countUp(node, target, { dec: 2, fmt: function (n) { return prefix + (n / 100).toFixed(2); } });
+  });
+  playSettledEntrance(ustate, r.amort ? r.amort.state : 'none');
+}
+
+/* 取数完成时的入场动画（2026-10-29 用户反馈「分段加载会闪一下」）。
+   用量统计与长期耗材摊销是**分两段**回来的：先渲染一版「正在统计…」的骨架，结果到了再整块
+   重画成真实值 —— 两次 innerHTML 替换之间比例、金额一起跳变，眼睛看着就是闪。
+   这里在「取数中 → 拿到结果」之后，给 KPI 卡与下方各区块补一段 fadeUp 入场
+   （按顺序 stagger），把突变变成过渡。
+   ⚠ 只认「完成那一次重画」不够（2026-10-29 现场逐帧截图：动画一次都没出现）：取数回调
+   往往**连着**触发好几次重画（云端月份、设备列表、外部账本各通知一次），上一次播到一半的
+   DOM 会被下一份 innerHTML 整个换掉 ⇒ 新节点上一条动画都不剩。所以在完成后的
+   ENTRANCE_WINDOW_MS 内**每次重画都重播**（新节点从 opacity:0 淡入，不会有闪回感），
+   窗口一过就彻底停。
+   触发源有两个：①「取数中 → 拿到结果」；②可见结构跳变（首次渲染、暂无成员 → 卡片、
+   区块/横幅增减）。只改数字与行数的重画（记金额、切份数、改密码、后台新进一单）不播。 */
+var _dashLoadStates = { usage: '', amort: '' };
+var ENTRANCE_WINDOW_MS = 600;      // 入场窗口：这段时间内每次重画都重播（见上）
+var _dashEntranceUntil = 0;
+/* 「可见结构」指纹：占位/空态、KPI 卡数、区块数、横幅数。
+   刻意**不含表格行数** —— 外部打印自动记账是后台持续进来的（每出一单多一行），把行数算进指纹
+   会让整页每来一单都淡入一次，比不动更扰。行级新增本来也不需要整页入场。
+   取数完成只是**结构跳变**的一种 —— 页面上还有两种更早的跳变（2026-10-29 用户逐帧反馈
+   「第三张图的动画有了，但是前两个没有」）：页面刚打开时 STORE 还没取回来 ⇒ 先渲染
+   「暂无成员」占位，配置到达后整页换成 KPI 卡 + 两条「正在统计…」。这两次同样是 innerHTML
+   整块替换，没有动画就是硬跳。指纹变了就补一段入场，指纹没变（只改了数字/金额）不播。 */
+var _dashShape = '';
+function dashShapeKey() {
+  function n(sel) { return document.querySelectorAll('#tab-dash ' + sel).length; }
+  return [n('.empty'), n('.kpi-card'), n('.section'), n('.alert-banner')].join('/');
+}
+function trackDashShape() {
+  var key = dashShapeKey();
+  var changed = key !== _dashShape;
+  _dashShape = key;
+  return changed;
+}
+function playSettledEntrance(ustate, amortState) {
+  var now = (window.performance && window.performance.now) ? window.performance.now() : +new Date();
+  var prev = _dashLoadStates;
+  _dashLoadStates = { usage: ustate, amort: amortState };
+  var wasLoading = prev.usage === 'loading' || prev.amort === 'loading';
+  var settledNow = ustate !== 'loading' && amortState !== 'loading';
+  if (wasLoading && settledNow) _dashEntranceUntil = now + ENTRANCE_WINDOW_MS;
+  if (trackDashShape()) _dashEntranceUntil = now + ENTRANCE_WINDOW_MS;   // 占位→卡片、成员载入、区块增减
+  if (!_dashEntranceUntil || now > _dashEntranceUntil) return;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var nodes = $$('#tab-dash .kpi-card, #tab-dash .section, #tab-dash .settle-box');
+  if (!nodes || !nodes.forEach) return;
+  nodes.forEach(function (node, i) {
+    if (!node.animate) return;             // 老 Safari 没有 WAAPI：直接就是终态，不影响读数
+    node.animate(
+      [{ opacity: 0, transform: 'translateY(12px)' }, { opacity: 1, transform: 'none' }],
+      { duration: 360, delay: Math.min(i, 12) * 45,
+        easing: 'cubic-bezier(.2,.7,.3,1)', fill: 'backwards' });
   });
 }
 
