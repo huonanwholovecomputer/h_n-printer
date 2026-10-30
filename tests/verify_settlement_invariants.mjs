@@ -836,6 +836,62 @@ try {
   chk('v7.12 记一笔转账后摘要行跟着重算（_refreshDashSummary 里挂了 _applyFoldSums）',
       sliceFn(src, '_refreshDashSummary').indexOf('_applyFoldSums(') >= 0);
 
+  /* ══ 14. v7.13：结算公式块（原生 <details>）也有开合动画 ══
+     原生 <details> 是瞬时开关。这里钉两件事：
+       ① 打开时真的跑了一段 220ms 的高度动画（不是瞬移），跑完不残留内联高度；
+       ② 收起是"先动画、动画完才真的关"（动画期间 details 仍是 open），不是瞬间消失。 */
+  const fa = await page.evaluate(async () => {
+    const det = document.querySelector('details.formula-box#settleFormula');
+    if (!det) return { ok: false, why: 'no details' };
+    const sum = det.querySelector('summary');
+    const body = det.querySelector('.formula-body');
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    const running = () => document.getAnimations()
+      .filter((a) => a.effect && a.effect.target === body && a.playState === 'running');
+    const out = { ok: true };
+
+    sum.click();                                   /* 打开 */
+    await wait(40);
+    out.opening = running().map((a) => a.effect.getTiming().duration);
+    out.openingCount = running().length;
+    await wait(320);
+    out.openDone = { open: det.open, inline: body.style.cssText, h: body.offsetHeight, scroll: body.scrollHeight };
+
+    sum.click();                                   /* 收起 */
+    await wait(40);
+    out.closing = { open: det.open, running: running().length, h: Math.round(body.getBoundingClientRect().height) };
+    await wait(360);
+    /* 注意：收起后 .formula-body 被浏览器的 details 内部容器（content-visibility: hidden）藏起来，
+       但对它量 offsetHeight / getBoundingClientRect 仍返回"最后一次布局"的旧高度（夹具里 1531），
+       所以"关掉了没有"只能看 details 自己的盒子高度（剩 summary 一行），别看 body。 */
+    out.closed = { open: det.open, inline: body.style.cssText,
+                   detH: Math.round(det.getBoundingClientRect().height) };
+    return out;
+  });
+  chk('v7.13 打开结算公式：真的跑了 220ms 高度动画（不是瞬移）',
+      fa.ok && fa.openingCount === 1 && fa.opening[0] === 220, fa);
+  chk('v7.13 动画跑完不残留内联高度（body 回到 auto，否则后续内容会被裁）',
+      fa.ok && fa.openDone.open === true && fa.openDone.inline === ''
+      && Math.abs(fa.openDone.h - fa.openDone.scroll) < 2, fa.openDone);
+  chk('v7.13 收起是"先动画、动画完才真的关"：动画期间 details 仍是 open，高度已在收',
+      fa.ok && fa.closing.open === true && fa.closing.running === 1
+      && fa.closing.h > 0 && fa.closing.h < fa.openDone.h, fa.closing);
+  chk('v7.13 动画结束后 details 真的关掉（盒子只剩 summary 一行，不是被内联高度撑着）',
+      fa.ok && fa.closed.open === false && fa.closed.inline === ''
+      && fa.closed.detH > 0 && fa.closed.detH < 90, fa.closed);
+
+  const fasc = sliceFn(src, '_formulaAnimRun');
+  chk('v7.13 结算公式动画走 WAAPI + 自定义缓动，且 reduced-motion 时整段让位给原生',
+      fasc.indexOf('body.animate(') >= 0 && fasc.indexOf("fill: 'both'") >= 0
+      && fasc.indexOf('FORMULA_ANIM_EASE') >= 0
+      && /_formulaReduceMotion\(\)/.test(sliceFn(src, '_isFormulaSummary') + sliceFn(src, '_formulaReduceMotion'))
+      && src.indexOf("document.addEventListener('toggle'") >= 0
+      && src.indexOf('if (!det.open) return;') >= 0,
+      { len: fasc.length });
+  chk('v7.13 收起时在捕获阶段 preventDefault 拦住原生开关（否则内容瞬间消失、动画看不见）',
+      /document\.addEventListener\('click', function \(ev\) \{[\s\S]*?ev\.preventDefault\(\);[\s\S]*?_formulaAnimRun\(det, false\)/.test(src)
+      && src.indexOf("}, true);") >= 0);
+
   /* ══ 11. 页面干净：没有 JS 报错、没有外网请求 ══ */
   chk('无 JS 运行时错误（pageerror）', pageErrors.length === 0, pageErrors.slice(0, 3));
   chk('无外网请求（全程只打本地桩）', externalReq.length === 0, externalReq.slice(0, 3));
