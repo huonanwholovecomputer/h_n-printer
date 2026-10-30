@@ -91,14 +91,17 @@ function wxssToCss(css) {
     .replace(/(-?\d+(?:\.\d+)?)rpx/g, (_m, n) => `calc(${n} * var(--rp))`)
     .replace(/^page\s*\{/m, 'body {');
 }
+// 反向对照用的**修复前**基线。⚠ 不能再钉 `git HEAD`：单行设备条那次修复已经提交进 HEAD，
+// 钉 HEAD 等于拿「现在这份正确代码」当对照组，自证会永久变红（同类坑见 verify_me_layout_render.mjs）。
+const OLD_REV = '990e320^';
 function readMiniCss(fromHead) {
   if (!fromHead) {
     return wxssToCss(fs.readFileSync(path.join(MP, 'app.wxss'), 'utf8'))
       + '\n' + wxssToCss(fs.readFileSync(path.join(MP, 'pages', 'index', 'index.wxss'), 'utf8'));
   }
   const git = (spec) => execFileSync('git', ['show', spec], { cwd: REPO, encoding: 'utf8' });
-  return wxssToCss(git('HEAD:mobile_apps/h_n_print/app.wxss'))
-    + '\n' + wxssToCss(git('HEAD:mobile_apps/h_n_print/pages/index/index.wxss'));
+  return wxssToCss(git(OLD_REV + ':mobile_apps/h_n_print/app.wxss'))
+    + '\n' + wxssToCss(git(OLD_REV + ':mobile_apps/h_n_print/pages/index/index.wxss'));
 }
 
 const MINI_BASE = `
@@ -216,7 +219,7 @@ function judge(tag, rows) {
     await appCtx.close();
   }
 
-  // ── 反向对照：git HEAD 的旧样式 + 旧模板（两个胶囊）必须量到「高度不一致」 ──
+  // ── 反向对照：990e320^ 的旧样式 + 旧模板（两个胶囊）必须量到「高度不一致」 ──
   let oldCss;
   try {
     oldCss = readMiniCss(true);
@@ -224,14 +227,14 @@ function judge(tag, rows) {
     oldCss = '';
   }
   if (!oldCss) {
-    check('反向对照：可读取 git HEAD 旧样式', false, 'git show 失败，跳过对照');
+    check('反向对照：可读取 990e320^ 旧样式', false, 'git show 失败，跳过对照');
   } else {
     const ctx = await browser.newContext({ viewport: { width: 390, height: 640 }, deviceScaleFactor: 2 });
     const p = await ctx.newPage();
     await p.setContent(miniPage(oldCss, true, 390));
     const rows = await p.evaluate(MEASURE);
     const hs = rows.map(r => r.height);
-    console.log('\n── 反向对照（git HEAD 旧 wxss + 旧模板） ──');
+    console.log('\n── 反向对照（990e320^ 旧 wxss + 旧模板） ──');
     console.log('   heights=' + hs.join(' / ') + '  widths(scroll/client)=' + rows.map(r => `${r.scrollWidth}/${r.clientWidth}`).join(' '));
     check('反向对照：旧写法**必须**量到高度不一致（判据不是恒真）',
       Math.max(...hs) - Math.min(...hs) > 2, `heights=${hs.join(' / ')}`);

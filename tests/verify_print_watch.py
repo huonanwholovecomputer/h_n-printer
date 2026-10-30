@@ -67,8 +67,9 @@ def new_store(tag):
 
 
 def job(job_id=1, doc="报告.docx", user="顾客", total=0, printed=0, duplex=None,
-        color=None, copies=None, printer="HP LaserJet 1020", submitted=None, size=1024):
-    """造一条 JOB_INFO_2（pywin32 的 dict 形状）。"""
+        color=None, copies=None, printer="HP LaserJet 1020", submitted=None, size=1024,
+        status=None):
+    """造一条 JOB_INFO_2（pywin32 的 dict 形状）。status 是 JOB_STATUS_* 位（None=不给该字段）。"""
     devmode = {}
     if duplex is not None:
         devmode["Duplex"] = duplex
@@ -76,11 +77,14 @@ def job(job_id=1, doc="报告.docx", user="顾客", total=0, printed=0, duplex=N
         devmode["Color"] = color
     if copies is not None:
         devmode["Copies"] = copies
-    return {
+    info = {
         "JobId": job_id, "pDocument": doc, "pUserName": user, "TotalPages": total,
         "PagesPrinted": printed, "Size": size, "pDevMode": devmode or None,
         "pPrinterName": printer, "Submitted": submitted if submitted is not None else 0,
     }
+    if status is not None:
+        info["Status"] = status
+    return info
 
 
 def not_virtual(_name):
@@ -838,6 +842,93 @@ check("人工点过「已忽略」的记录不会被自动记账翻回「已确�
 
 check("GUI 的补录弹窗判据换成 auto_confirmable（能自动的绝不弹框打扰现场）",
       "print_watch.auto_confirmable(item)" in gui_src)
+
+
+# ══════════════════════════════════════════════════════════════════
+section("⑬ 假脱机阶段（Status&0x8）不许记账：「本地下层文档」+页数 0 是窗口期，不是真值")
+# ══════════════════════════════════════════════════════════════════
+# 2026-10-30 现场：外部打印账本里 13:09:14（3 页/0.90 元）与 14:04:41（0 页）两条文档名都写着
+# 「本地下层文档」——实测（1 页 + 3 页两轮探针）证明那是**本工具自己**的作业：作业刚入队那
+# 1 秒 Status=0x8(SPOOLING)，spooler 里 pDocument 还没拿到 StartDoc 里给的名字（占位串
+# 「本地下层文档」/Local Downlevel Document）、TotalPages 也还是 0；同一作业进到
+# Status=0x2010(PRINTING) 才变成 HN|xxx.pdf / TotalPages=3。
+# ⇒ 判「是不是自家作业」只认 HN| 前缀，这个时间窗里过滤必然失效 ⇒ 只能整轮跳过、下一轮再看。
+# 下面第一、二条就是现场那两条记录的复现；把 should_record 里的 is_spooling 分支删掉，
+# 它们立刻变红（账本从 0 条变 1 条）。
+
+check("is_spooling 只认 Status 的 0x8 位（缺字段/非整数一律当不在假脱机，保持旧行为）",
+      pw.is_spooling({"Status": 0x0008}) is True
+      and pw.is_spooling({"Status": 0x2010}) is False
+      and pw.is_spooling({"Status": 0x0008 | 0x0010}) is True
+      and pw.is_spooling({}) is False
+      and pw.is_spooling({"Status": None}) is False
+      and pw.is_spooling({"Status": "x"}) is False)
+
+check("占位名常量覆盖中英文（本地下层文档 / Local Downlevel Document），真文档名不误判",
+      pw.is_placeholder_title("本地下层文档") is True
+      and pw.is_placeholder_title(" Local Downlevel Document ") is True
+      and pw.is_placeholder_title("HN|本地打印 5 个文件.pdf") is False
+      and pw.is_placeholder_title("顾客合同.docx") is False)
+
+check("假脱机中的作业一律 (False, 'spooling')，且不因为没有 JobId/是自家而混淆",
+      pw.should_record(job(job_id=81, doc="本地下层文档", total=0, size=0, status=0x8),
+                       (), now, virtual_check=not_virtual) == (False, "spooling")
+      and pw.should_record(job(job_id=0, doc="本地下层文档", total=0, size=0, status=0x8),
+                           (), now, virtual_check=not_virtual) == (False, "no_id")
+      and pw.should_record(job(job_id=82, doc="顾客合同.docx", total=3, duplex=1, status=0x10),
+                           (), now, virtual_check=not_virtual) == (True, "ok"))
+
+st_sp = new_store("spooling")
+w_sp = pw.PrintJobWatcher(st_sp, enum_jobs=lambda p: [], printers=["HP LaserJet 1020"],
+                          virtual_check=not_virtual, on_log=lambda m: None)
+
+# 现场原样复刻：自家 3 页 GDI 作业，提交后 1 秒内被扫到（仍 SPOOLING、占位名、页数 0）
+w_sp.consider("HP LaserJet 1020",
+              job(job_id=83, doc="本地下层文档", total=0, printed=0, size=0, status=0x8), now)
+check("① 假脱机那一秒扫到自家作业 —— 一条都不许记（0.90 元重复收费的复现）",
+      len(st_sp) == 0, f"账本 {len(st_sp)} 条：{[i.document for i in st_sp.load()]}")
+
+# 下一轮：同一个作业进 PRINTING，名字与页数都落地 ⇒ 这时才认得出是自己
+w_sp.consider("HP LaserJet 1020",
+              job(job_id=83, doc="HN|hn_merged_28312.pdf", total=3, printed=0, size=0,
+                  status=0x2010), now + timedelta(seconds=2))
+check("② 同一作业进 PRINTING 后被 HN| 前缀认出来 ⇒ 仍然不记账",
+      len(st_sp) == 0, f"账本 {len(st_sp)} 条：{[i.document for i in st_sp.load()]}")
+
+# 外部作业：假脱机阶段同样跳过（那会儿页数还没落地，记了也只能人工补），进 PRINTING 再记
+w_sp.consider("HP LaserJet 1020",
+              job(job_id=84, doc="本地下层文档", total=0, size=0, status=0x8),
+              now + timedelta(seconds=4))
+check("③ 外部作业假脱机阶段也先跳过（此时页数/单双面都还没有，记下来也只能等人工补）",
+      len(st_sp) == 0, f"账本 {len(st_sp)} 条")
+w_sp.consider("HP LaserJet 1020",
+              job(job_id=84, doc="顾客合同.docx", total=4, duplex=1, color=1, status=0x10),
+              now + timedelta(seconds=6))
+_items_sp = st_sp.load()
+check("④ 外部作业进 PRINTING 后照常记账，且页数是真的 4 页（不是假脱机时的 0 页）",
+      len(_items_sp) == 1 and _items_sp[0].pages == 4
+      and _items_sp[0].status == pw.STATUS_CONFIRMED,
+      f"{[(i.document, i.pages, i.status) for i in _items_sp]}")
+
+# 驱动/系统给不出 Status 的老环境：不许因为读不到状态位就永远不记账（那是真漏钱）
+st_legacy = new_store("no_status")
+w_legacy = pw.PrintJobWatcher(st_legacy, enum_jobs=lambda p: [], printers=["HP LaserJet 1020"],
+                              virtual_check=not_virtual, on_log=lambda m: None)
+w_legacy.consider("HP LaserJet 1020", job(job_id=85, doc="无状态位.docx", total=2, duplex=1),
+                  now + timedelta(seconds=8))
+check("⑤ 作业没有 Status 字段时照旧记账（fail-open：宁可多一条让人忽略，不能永远漏记）",
+      len(st_legacy) == 1, f"账本 {len(st_legacy)} 条")
+
+# 收尾：假脱机跳过只写 debug 日志，不刷 UI（每轮都会扫到，刷了就是刷屏）
+st_log = new_store("spooling_log")
+_logs_sp = []
+w_log = pw.PrintJobWatcher(st_log, enum_jobs=lambda p: [], printers=["HP LaserJet 1020"],
+                           virtual_check=not_virtual, on_log=lambda m: _logs_sp.append(m))
+w_log.consider("HP LaserJet 1020",
+               job(job_id=86, doc="本地下层文档", total=0, size=0, status=0x8),
+               now + timedelta(seconds=10))
+check("⑥ 假脱机跳过不刷 UI 日志（同一作业每轮都扫到，刷了等于刷屏）", _logs_sp == [],
+      str(_logs_sp))
 
 
 print("\n" + "=" * 78)

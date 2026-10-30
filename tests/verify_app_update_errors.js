@@ -11,7 +11,9 @@
  *   ① 429 与 5xx 要说「服务器繁忙 / 服务器错误」，不能再说「网络错误」；
  *   ② 429 / 5xx 退避 1.5s **重试一次**（第二次成功就照常走更新流程）；
  *   ③ 真正的网络异常（fetch reject）/ 4xx 仍按原样报错，且**不**重试（不放大服务端压力）。
- * 末尾变异自证：换成 git HEAD 的旧 updater.js，① 必须转红（证明判据不是恒真）。
+ * 末尾变异自证：换成**修复前那一版** updater.js，① 必须转红（证明判据不是恒真）。
+ *   ⚠ 对照组不能再钉 `git HEAD`：429 文案/重试那次修复（2026-10-27）已经提交进 HEAD，
+ *   钉 HEAD 等于拿「现在的正确代码」当对照组，自证会永久变红。现钉 `990e320^`（修复前一个提交）。
  *
  * 用法：node tests/verify_app_update_errors.js   （exit 0 = 全绿）
  */
@@ -164,14 +166,14 @@ async function main() {
     check('静默检查失败不打扰用户（无 toast）', r.toasts.length === 0, JSON.stringify(r.toasts));
   }
 
-  section('⑥ 变异自证：换成 git HEAD 的旧 updater.js，①② 必须转红');
+  section('⑥ 变异自证：换成修复前那一版 updater.js（990e320^），①② 必须转红');
   let oldSrc = '';
   try {
-    oldSrc = execFileSync('git', ['show', 'HEAD:mobile_apps/android_app/www/updater.js'],
+    oldSrc = execFileSync('git', ['show', '990e320^:mobile_apps/android_app/www/updater.js'],
       { cwd: REPO, encoding: 'utf8' });
-  } catch (e) { /* 无 git / 无该文件 */ }
+  } catch (e) { /* 无 git / 无该提交 */ }
   if (!oldSrc) {
-    check('可读取 git HEAD 的旧 updater.js', false, 'git show 失败');
+    check('可读取修复前的旧 updater.js（990e320^）', false, 'git show 失败');
   } else {
     const r = runUpdater(oldSrc, [{ status: 429 }]);
     await r.sandbox.checkAppUpdate(true);

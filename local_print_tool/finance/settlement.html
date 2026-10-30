@@ -1074,6 +1074,24 @@ function mergeStores(localStore, cloudStore) {
         return Object.keys(map).map(function (k) { return map[k]; });
       })(),
       purchaseBasis: (cloudHasCfg && cc.purchaseBasis) ? cc.purchaseBasis : (lc.purchaseBasis || 'equal'),
+      /* v7.10：废纸人工值按「月 × 成员」并集 —— 两台设备可能各填过不同月份，合并时都要留下
+         （漏一个月就等于那张纸没人认账）。同一格冲突时云端优先，本地只补云端没有的。 */
+      waste_paper: (function () {
+        var out = {};
+        var put = function (src) {
+          Object.keys(src || {}).forEach(function (mk) {
+            if (!isMonthKey(mk) || !src[mk] || typeof src[mk] !== 'object') return;
+            var bag = out[mk] = out[mk] || {};
+            Object.keys(src[mk]).forEach(function (mid) {
+              var v = +src[mk][mid];
+              if (!isFinite(v) || v < 0) return;
+              if (bag[mid] == null) bag[mid] = Math.max(0, Math.round(v));
+            });
+          });
+        };
+        put(cc.waste_paper); put(lc.waste_paper);
+        return out;
+      })(),
     },
     records: {
       expenses: unionById((localStore && localStore.records && localStore.records.expenses) || [], (cloudStore && cloudStore.records && cloudStore.records.expenses) || []),
@@ -1149,6 +1167,26 @@ function migrateConfig(data) {
     if (!e || typeof e !== 'object') return;
     if (e.kind !== 'paper' && e.kind !== 'toner' && e.kind !== 'other') delete e.kind;
     e.units = Math.max(0, Math.round(+e.units || 0));
+    /* v7.10：硒鼓「所属打印机」—— 旧数据没有这个字段是正常的（= 未指定，按全队页数摊销）。
+       非法 ID 直接删掉（内联事件只认 safeId 白名单）；指向已删除机器的 ID 保留原值，
+       由 consumableAmort 按「未指定」处理并在界面上显式提示（不静默改成 0 摊销）。 */
+    if (e.printer_id != null && e.printer_id !== '') {
+      var _pid = safeId(e.printer_id);
+      if (_pid) e.printer_id = _pid; else delete e.printer_id;
+    } else delete e.printer_id;
+  });
+  /* v7.10：废纸人工值 —— 按「月 × 成员」记，0 = 明确没有废纸，缺格 = 用失败单自动预估。
+     非月份 / 非对象 / 负数 / 非数字一律清掉（脏数据不能变成一张算不清的纸）。 */
+  if (!c.waste_paper || typeof c.waste_paper !== 'object' || Array.isArray(c.waste_paper)) c.waste_paper = {};
+  Object.keys(c.waste_paper).forEach(function (mk) {
+    var bag = c.waste_paper[mk];
+    if (!isMonthKey(mk) || !bag || typeof bag !== 'object' || Array.isArray(bag)) { delete c.waste_paper[mk]; return; }
+    Object.keys(bag).forEach(function (mid) {
+      var v = bag[mid];
+      if (!isFinite(+v) || v == null || +v < 0) { delete bag[mid]; return; }
+      bag[mid] = Math.max(0, Math.round(+v));
+    });
+    if (!Object.keys(bag).length) delete c.waste_paper[mk];
   });
   if (!data.notes) data.notes = {};
   // 乐观锁版本号：多设备并发编辑冲突检测用
@@ -1194,6 +1232,9 @@ function sanitizeStore(data) {
       if (k === 'expenses') {
         if (r.kind !== 'paper' && r.kind !== 'toner' && r.kind !== 'other') delete r.kind;
         r.units = Math.max(0, Math.round(+r.units || 0));
+        /* v7.10：导入的「所属打印机」同样走 safeId 白名单（非法就删 = 未指定） */
+        var _ip = safeId(r.printer_id);
+        if (_ip) r.printer_id = _ip; else delete r.printer_id;
       }
       return true;
     });
@@ -1302,6 +1343,25 @@ var CONSUMABLE_KIND = {
   toner: { label: '硒鼓', unit: '页', field: 'pagesByDay' }
 };
 var EXPENSE_KIND_OPTIONS = [['other', '普通采购'], ['paper', 'A4纸'], ['toner', '硒鼓']];
+/* v7.10「废纸」口径 —— 用户说的「失败订单」，实现上取「这一单没有产出可交付的纸」的终态：
+     failed（打印失败）/ abandoned（放弃打印）/ canceled（已取消）——
+   它们的纸张量按废纸计。刻意**不**含：
+     · rejected（被打回）= 云端不再让它打印，通常还没进打印、更没费纸；
+     · offline_unknown / printing / queued / accepted / reserved / scheduled / waiting /
+       downloading —— 都还不是终态，纸可能还会出来。
+   ⚠ 这是预估口径（不接任何新后端字段）；真出过纸的取消单，操作员可用「手工废纸」覆盖。 */
+var WASTE_PAPER_STATUSES = { failed: 1, abandoned: 1, canceled: 1 };
+/* v7.10：为了让失败单回到前端，取数 URL 会多带 status=selectedStatuses()（见 ensureUsage）。
+   于是以前根本不会返回的父订单状态（canceled / rejected / abandoned / reserved …）现在可能出现，
+   而「正常用量」的旧口径是「只算状态不在排除表里的订单」—— 这里显式列出排除项，
+   保证多取回来的单不会把正常出纸量顶高（旧数据、旧行为零回归）。
+   本地模式的状态（sent / unsynced / unsynced_rejected）不在这张表里 ⇒ 照旧计入。 */
+var NORMAL_EXCLUDED_STATUSES = { canceled: 1, rejected: 1, abandoned: 1, reserved: 1,
+                                 accepted: 1, scheduled: 1, waiting: 1, downloading: 1 };
+/* v7.10：这笔耗材属于哪台打印机（只对硒鼓有意义；空 = 未指定 ⇒ 按全队页数摊销）。
+   这里不校验机器是否还在 —— 被删/改名的机器由 consumableAmort 按「未指定」摊，
+   并在摊销区块里显式提示，绝不让它悄悄摊成 0。 */
+function expensePrinterId(e) { return e ? safeId(e.printer_id) : ''; }
 function expenseKind(e) {
   if (!e) return 'other';
   if (e.kind === 'paper' || e.kind === 'toner' || e.kind === 'other') return e.kind;
@@ -1443,6 +1503,11 @@ function getDepreciablePrinters() {
 function printerById(id) {
   var hit = getPrinters().filter(function (p) { return p.id === id; });
   return hit.length ? hit[0] : null;
+}
+/* v7.10：打印机 ID → 名称（找不到返回 ''，由调用方决定怎么提示「机器没了」） */
+function printerNameOf(id) {
+  var p = printerById(id);
+  return p ? (p.name || '') : '';
 }
 /* 设备 client_id → 打印机（订单的 received_client 就是「哪台机器打的」的唯一线索） */
 function printerByClient(cid) {
@@ -1879,8 +1944,12 @@ function monthFromRecords(key) {
   /* v7.9：expenses 必须原样带上 kind / units（长期耗材的类型与数量）—— 旧写法只挑 5 个字段，
      记账页的数量列会永远显示空、结算也会把耗材当普通采购整笔计入。 */
   (STORE.records.expenses || []).forEach(function (r) {
-    if (monthKeyOf(r.date) === key) expenses.push({ id: r.id, date: r.date, item: r.item, amount: r.amount,
-                                                    payer: r.payer, kind: r.kind, units: r.units });
+    if (monthKeyOf(r.date) !== key) return;
+    expenses.push({ id: r.id, date: r.date, item: r.item, amount: r.amount,
+                    payer: r.payer, kind: r.kind, units: r.units });
+    /* v7.10：所属打印机（printer_id）也要带上 —— 记账页那一列的下拉按它回显。
+       单独挂在刚 push 的那行上（保持上面 push 的原样：老档案里有脚本按它做锚点） */
+    expenses[expenses.length - 1].printer_id = safeId(r.printer_id);
   });
   (STORE.records.income || []).forEach(function (r) { if (monthKeyOf(r.date) === key) income[r.memberId] = (income[r.memberId] || 0) + (r.amount || 0); });
   (STORE.records.scores || []).forEach(function (r) { if (monthKeyOf(r.date) === key) (scMap[r.memberId] = scMap[r.memberId] || []).push({ id: r.id, date: r.date, item: r.item, score: r.score }); });
@@ -1956,7 +2025,11 @@ function monthRangeKeys(startKey, endKey) {
 }
 function consumableAmort(purchases, usageByMonth, targetKey) {
   var res = { rows: [], lots: [], byBuyer: {}, totalCents: 0, totalUnits: 0,
-              uncovered: { paper: {}, toner: {} } };
+              uncovered: { paper: {}, toner: {} },
+              /* v7.10：硒鼓按「所属打印机」分桶摊销后多出来的两块 —— 单机桶摊不掉的量、
+                 以及每台机自己的本月摊销额（给区块文案用）。旧数据全在 team 桶里，
+                 这两块是空的，渲染侧一律 (x || {}) 容错。 */
+              uncoveredPrinter: {}, tonersByPrinter: {} };
   if (!isMonthKey(targetKey)) return res;
   var lots = [];
   (purchases || []).forEach(function (e) {
@@ -1968,67 +2041,121 @@ function consumableAmort(purchases, usageByMonth, targetKey) {
                 item: String(e.item == null ? '' : e.item), date: normDateStr(e.date),
                 payer: String(e.payer == null ? '' : e.payer),
                 priceCents: expenseAmountCents(e), units: units,
+                /* v7.10：这支硒鼓是给哪台打印机买的（空 = 未指定，走全队页数 = 旧口径）。
+                   A4纸没有「属于哪台机」这回事，一律不带归属。 */
+                printerId: kind === 'toner' ? safeId(e.printer_id) : '',
                 remaining: units, consumed: 0, perMonth: {}, months: {}, order: lots.length });
   });
   if (!lots.length) return res;
   var self = res;
+  /* 某类型某范围的逐日用量。printerId 为空 = 全队（旧口径），有值 = 该机自己的逐日页数。
+     ⚠ 单机口径只认 usage.pagesByDayPrinter（旧缓存/旧数据没有这个字段 ⇒ 空表，本月先不摊），
+     绝不回落到全队 pagesByDay —— 拿 1020 的页数去摊 M232 的鼓正是需求 A 要修的错误。 */
+  function usageDayMap(kind, printerId) {
+    var out = {};
+    Object.keys(usageByMonth || {}).forEach(function (mk) {
+      var u = usageByMonth[mk];
+      if (!u || !isMonthKey(mk) || mk > targetKey) return;
+      var dm = {};
+      if (printerId) {
+        var per = u.pagesByDayPrinter || {};
+        Object.keys(per).forEach(function (k) {
+          var bar = k.indexOf('|');
+          if (bar <= 0 || k.slice(0, bar) !== printerId) return;
+          var d1 = k.slice(bar + 1);
+          dm[d1] = (dm[d1] || 0) + (+per[k] || 0);
+        });
+      } else {
+        var raw = u[CONSUMABLE_KIND[kind].field] || {};
+        Object.keys(raw).forEach(function (d1) { dm[d1] = (+raw[d1] || 0); });
+      }
+      Object.keys(dm).forEach(function (d) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+        var n = Math.max(0, Math.round(+dm[d] || 0));
+        if (n > 0) out[d] = (out[d] || 0) + n;
+      });
+    });
+    return out;
+  }
   ['paper', 'toner'].forEach(function (kind) {
     var list = lots.filter(function (l) { return l.kind === kind; })
       .sort(function (a, b) { return a.date === b.date ? (a.order - b.order) : (a.date < b.date ? -1 : 1); });
     if (!list.length) return;
-    /* 逐日用量：把每月的 pagesByDay / sheetsByDay 摊平（只取到 targetKey 为止） */
-    var dayMap = {};
-    Object.keys(usageByMonth || {}).forEach(function (mk) {
-      var u = usageByMonth[mk];
-      if (!u || !isMonthKey(mk) || mk > targetKey) return;
-      var dm = u[CONSUMABLE_KIND[kind].field] || {};
-      Object.keys(dm).forEach(function (d) {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
-        var n = Math.max(0, Math.round(+dm[d] || 0));
-        if (n > 0) dayMap[d] = (dayMap[d] || 0) + n;
-      });
-    });
-    var firstDate = list[0].date;
-    var days = Object.keys(dayMap).filter(function (d) { return d >= firstDate; }).sort();
-    var queue = list.slice(), qi = 0, active = [];
-    days.forEach(function (d) {
-      while (qi < queue.length && queue[qi].date <= d) active.push(queue[qi++]);
-      var need = Math.round(dayMap[d] || 0), mk = d.slice(0, 7);
-      for (var i = 0; i < active.length && need > 0; i++) {
-        var lot = active[i];
-        if (lot.remaining <= 0) continue;
-        var take = Math.min(lot.remaining, need);
-        lot.remaining -= take; lot.consumed += take; need -= take;
-        lot.perMonth[mk] = (lot.perMonth[mk] || 0) + take;
-      }
-      if (need > 0) self.uncovered[kind][mk] = (self.uncovered[kind][mk] || 0) + need;
-    });
+    /* v7.10 分桶：硒鼓按「所属打印机」各算各的（FIFO 只在同一台机的鼓之间滚动），
+       未指定 + A4纸 一起走全队桶（'' 桶）= 旧口径。 */
+    var buckets = {}, order = [];
     list.forEach(function (lot) {
-      var months = monthRangeKeys(monthKeyOf(lot.date), targetKey);
-      var cum = 0, prevCents = 0;
-      months.forEach(function (mk) {
-        cum += (lot.perMonth[mk] || 0);
-        var cents = Math.round(lot.priceCents * cum / lot.units);
-        lot.months[mk] = { units: lot.perMonth[mk] || 0, cents: cents - prevCents, cumUnits: cum };
-        prevCents = cents;
+      var pid = lot.printerId || '';
+      if (!buckets[pid]) { buckets[pid] = []; order.push(pid); }
+      buckets[pid].push(lot);
+    });
+    order.forEach(function (pid) {
+      var list = buckets[pid];
+      /* 机器被删（或 ID 指向不存在的记录）⇒ 按「未指定」用全队页数摊，并在 lots / 区块里
+         显式提示。绝不按 0 页摊：那会让这支鼓永远摊不出去、账上凭空多一笔"库存"。 */
+      var gone = !!pid && !printerById(pid);
+      var scope = gone ? '' : pid;
+      var pName = pid ? (printerNameOf(pid) || ('已删除的打印机 #' + pid)) : '';
+      var dayMap = usageDayMap(kind, scope);
+      var firstDate = list[0].date;
+      var days = Object.keys(dayMap).filter(function (d) { return d >= firstDate; }).sort();
+      var queue = list.slice(), qi = 0, active = [];
+      days.forEach(function (d) {
+        while (qi < queue.length && queue[qi].date <= d) active.push(queue[qi++]);
+        var need = Math.round(dayMap[d] || 0), mk = d.slice(0, 7);
+        for (var i = 0; i < active.length && need > 0; i++) {
+          var lot = active[i];
+          if (lot.remaining <= 0) continue;
+          var take = Math.min(lot.remaining, need);
+          lot.remaining -= take; lot.consumed += take; need -= take;
+          lot.perMonth[mk] = (lot.perMonth[mk] || 0) + take;
+        }
+        /* 摊不掉的量：全队桶记老的 uncovered（区块提示照旧），单机桶单独记 uncoveredPrinter */
+        if (need > 0 && !scope) self.uncovered[kind][mk] = (self.uncovered[kind][mk] || 0) + need;
+        else if (need > 0) {
+          var bag = self.uncoveredPrinter[scope] = self.uncoveredPrinter[scope] || {};
+          bag[mk] = (bag[mk] || 0) + need;
+        }
       });
-      var tm = lot.months[targetKey] || { units: 0, cents: 0, cumUnits: 0 };
-      var unitYuan = lot.priceCents / lot.units / 100;
-      if (tm.cents > 0) {
-        self.rows.push({ id: 'amort:' + lot.id, kind: lot.kind, lotId: lot.id, payer: lot.payer,
-                         item: CONSUMABLE_KIND[kind].label + '摊销（本月 ' + tm.units + ' ' + CONSUMABLE_KIND[kind].unit + '）',
-                         cents: tm.cents, units: tm.units, purchaseItem: lot.item });
-      }
-      self.lots.push({ id: lot.id, kind: lot.kind, label: CONSUMABLE_KIND[kind].label,
-                       item: lot.item, date: lot.date, payer: lot.payer,
-                       priceCents: lot.priceCents, units: lot.units,
-                       unit: CONSUMABLE_KIND[kind].unit, unitYuan: unitYuan,
-                       usedUnits: tm.cumUnits, chargedCents: prevCents,
-                       remainingCents: Math.max(0, lot.priceCents - prevCents),
-                       monthUnits: tm.units, monthCents: tm.cents });
-      self.totalCents += tm.cents;
-      self.totalUnits += tm.units;
-      if (tm.cents > 0 && lot.payer) self.byBuyer[lot.payer] = (self.byBuyer[lot.payer] || 0) + tm.cents;
+      list.forEach(function (lot) {
+        var months = monthRangeKeys(monthKeyOf(lot.date), targetKey);
+        var cum = 0, prevCents = 0;
+        months.forEach(function (mk) {
+          cum += (lot.perMonth[mk] || 0);
+          var cents = Math.round(lot.priceCents * cum / lot.units);
+          lot.months[mk] = { units: lot.perMonth[mk] || 0, cents: cents - prevCents, cumUnits: cum };
+          prevCents = cents;
+        });
+        var tm = lot.months[targetKey] || { units: 0, cents: 0, cumUnits: 0 };
+        var unitYuan = lot.priceCents / lot.units / 100;
+        var label = CONSUMABLE_KIND[kind].label, unit = CONSUMABLE_KIND[kind].unit;
+        if (tm.cents > 0) {
+          var item = label + '摊销（本月 ' + tm.units + ' ' + unit + '）';
+          if (scope) item = label + '摊销（按 ' + pName + ' 本月 ' + tm.units + ' ' + unit + '）';
+          else if (gone) item = label + '摊销（本月 ' + tm.units + ' ' + unit + ' · 原所属打印机已删除，按全队）';
+          self.rows.push({ id: 'amort:' + lot.id, kind: lot.kind, lotId: lot.id, payer: lot.payer,
+                           printerId: scope, printerMissing: gone,
+                           item: item, cents: tm.cents, units: tm.units, purchaseItem: lot.item });
+        }
+        self.lots.push({ id: lot.id, kind: lot.kind, label: label,
+                         item: lot.item, date: lot.date, payer: lot.payer,
+                         priceCents: lot.priceCents, units: lot.units,
+                         unit: unit, unitYuan: unitYuan,
+                         usedUnits: tm.cumUnits, chargedCents: prevCents,
+                         remainingCents: Math.max(0, lot.priceCents - prevCents),
+                         monthUnits: tm.units, monthCents: tm.cents,
+                         printerId: scope, printerRequested: pid || '',
+                         printerMissing: gone, printerName: pName,
+                         scope: scope ? 'printer' : 'team' });
+        if (scope) {
+          var b = self.tonersByPrinter[scope];
+          if (!b) b = self.tonersByPrinter[scope] = { id: scope, name: pName, lots: 0, monthUnits: 0, monthCents: 0 };
+          b.lots += 1; b.monthUnits += tm.units; b.monthCents += tm.cents;
+        }
+        self.totalCents += tm.cents;
+        self.totalUnits += tm.units;
+        if (tm.cents > 0 && lot.payer) self.byBuyer[lot.payer] = (self.byBuyer[lot.payer] || 0) + tm.cents;
+      });
     });
   });
   res.lots.sort(function (a, b) { return a.date === b.date ? 0 : (a.date < b.date ? -1 : 1); });
@@ -5259,10 +5386,19 @@ function _usageMonthRange(key) {
 function _usageEmpty(key) {
   /* v7.9：多记 sheets（纸张张数）与逐日用量 —— 长期耗材摊销要按「采购日之后」的
      实际出纸量算，月度汇总不够（同一笔采购的购买日可能在某月中间）。 */
+  /* v7.10 新增字段（旧缓存/旧接口没有它们 ⇒ 读的时候一律 (u.x || {}) 容错）：
+       · pagesByDayPrinter —— '<printerId>|<YYYY-MM-DD>' → 该机当天页数（硒鼓按所属打印机摊销用）；
+       · sheetsByMember / unattributedSheets —— 每人本月出纸张数（「用纸统计」的正常量）；
+       · waste* —— 失败终态订单（没产出纸）的纸张量，按成员归属（废纸自动预估）；
+       · wasteSheets / wasteTotal / wasteManualCount / wasteUnattributedSheets ——
+         _applyWasteToUsage() 把「人工值优先 / 留空用预估」算完之后的结果。 */
   return { month: key || '', pages: 0, sheets: 0, orders: 0, files: 0,
            pagesByMember: {}, pagesByMemberPrinter: {}, pagesByPrinter: {},
            pagesByDay: {}, sheetsByDay: {}, undatedPages: 0, undatedSheets: 0,
-           unmatchedPrinterPages: 0, unattributedPages: 0, fetchedAt: '' };
+           unmatchedPrinterPages: 0, unattributedPages: 0, fetchedAt: '',
+           pagesByDayPrinter: {}, sheetsByMember: {}, unattributedSheets: 0,
+           waste: 0, wasteOrders: 0, wasteByMember: {}, wasteUnattributed: 0,
+           wasteSheets: {}, wasteTotal: 0, wasteManualCount: 0, wasteUnattributedSheets: 0 };
 }
 function usageOfMonth(key) { return _usageCache[key] || null; }
 function usageStateOfMonth(key) {
@@ -5286,13 +5422,33 @@ function _usageFromOrders(orders) {
     var mk = _orderMemberKey(o);
     var mid = mk.indexOf('member:') === 0 ? mk.slice(7) : '';
     var cid = String(o.received_client || '');
-    var pages = 0, sheets = 0, nf = 0;
+    var ost = String(o.status || '');
+    var pages = 0, sheets = 0, nf = 0, waste = 0;
+    /* v7.10 废纸预估：父订单是「没产出纸」的终态时，没打出来的子任务按「本该用掉的纸」计。
+       判据刻意挂在**父订单终态**上（用户口语的「失败订单」），不认单个子任务失败 ——
+       一单里部分文件成功、部分失败时，成功那部分的纸是真出来了（已计在正常用量里），
+       只有没出来的那些才算废。单独走一遍文件表，是为了让下面那句老断言原样保留。 */
+    if (WASTE_PAPER_STATUSES[ost]) {
+      (o.files || []).forEach(function (f) {
+        if ((f.status || '') === 'sent') return;
+        waste += _fileSheets(f);
+      });
+    }
     (o.files || []).forEach(function (f) {
       if ((f.status || '') !== 'sent') return;   // 只算真正打出来的子任务
       pages += _filePagesOf(f);
       sheets += _fileSheets(f);                 // v7.9：纸张张数（A4纸摊销用）
       nf++;
     });
+    /* ⚠ 废纸必须在下面 `if (!pages && !sheets) return;` 之前算完：取消单通常一个 sent 文件都没有 */
+    if (waste > 0) {
+      u.waste += waste;
+      u.wasteOrders += 1;
+      if (mid) u.wasteByMember[mid] = (u.wasteByMember[mid] || 0) + waste;
+      else u.wasteUnattributed += waste;
+    }
+    /* 多取回来的终态单不参与正常用量（见 NORMAL_EXCLUDED_STATUSES 的注释：旧口径零回归） */
+    if (NORMAL_EXCLUDED_STATUSES[ost]) return;
     if (!pages && !sheets) return;
     u.pages += pages; u.sheets += sheets; u.files += nf; u.orders += 1;
     /* v7.9：逐日用量（采购月份中途买入的耗材只吃购买日之后的用量） */
@@ -5301,12 +5457,22 @@ function _usageFromOrders(orders) {
       if (pages) u.pagesByDay[day] = (u.pagesByDay[day] || 0) + pages;
       if (sheets) u.sheetsByDay[day] = (u.sheetsByDay[day] || 0) + sheets;
     }
-    if (mid) u.pagesByMember[mid] = (u.pagesByMember[mid] || 0) + pages;
-    else u.unattributedPages += pages;
+    if (mid) {
+      u.pagesByMember[mid] = (u.pagesByMember[mid] || 0) + pages;
+      u.sheetsByMember[mid] = (u.sheetsByMember[mid] || 0) + sheets;
+    } else {
+      u.unattributedPages += pages;
+      u.unattributedSheets += sheets;
+    }
     var bound = printerForOrder(o);
     var p = bound;
     if (!p) { u.unmatchedPrinterPages += pages; return; }
     u.pagesByPrinter[p.id] = (u.pagesByPrinter[p.id] || 0) + pages;
+    /* v7.10：逐机逐日页数 —— 硒鼓按「所属打印机」摊销时的唯一用量来源 */
+    if (day && pages) {
+      var dk = p.id + '|' + day;
+      u.pagesByDayPrinter[dk] = (u.pagesByDayPrinter[dk] || 0) + pages;
+    }
     if (mid) {
       var k = mid + '|' + p.id;
       u.pagesByMemberPrinter[k] = (u.pagesByMemberPrinter[k] || 0) + pages;
@@ -5314,6 +5480,87 @@ function _usageFromOrders(orders) {
   });
   return u;
 }
+/* ─────────────────────────────────────────────────────────────────────────────
+   v7.10「废纸」(A4 纸没进收支清算的那部分)
+   用户口径：A4 纸会有「废纸」（打废/取消没交付的纸），要能填每人大概废了多少张，
+   同时给出预估 —— 预估 = 本月「失败」终态订单累积的纸张数（按成员归属）。
+   · 人工值存 config.waste_paper['YYYY-MM'][memberId]（非负整数；**0 = 明确没有废纸**）；
+   · 留空（没有这一格）= 用预估；
+   · 用纸记录显示成「正常 N + 废 M 张」，合计（N+M）计入本月用纸量，
+     从而进入 A4 纸摊销（consumableAmort 的 sheetsByDay）。
+   ───────────────────────────────────────────────────────────────────────────── */
+/* 手工废纸：返回 null = 没填（回落到预估）；返回 0 是**有效值**（明确没有废纸），别用 || 判空 */
+function wasteManualOf(key, memberId) {
+  var bag = (STORE.config && STORE.config.waste_paper) || {};
+  var mon = bag[key];
+  if (!mon || typeof mon !== 'object' || !memberId) return null;
+  if (!Object.prototype.hasOwnProperty.call(mon, memberId)) return null;
+  var n = Math.round(+mon[memberId]);
+  if (!isFinite(n) || n < 0) return null;
+  return n;
+}
+/* 自动预估：本月失败终态订单里，这个人名下没打出来的纸张数 */
+function wasteEstimateOf(u, memberId) {
+  if (!u || !memberId) return 0;
+  var n = Math.round(+((u.wasteByMember || {})[memberId]) || 0);
+  return n > 0 ? n : 0;
+}
+/* 这个月这个人最终采用几废纸张：人工值优先，留空用预估 */
+function wasteSheetsOf(key, memberId, u) {
+  var v = wasteManualOf(key, memberId);
+  if (v !== null) return v;
+  return wasteEstimateOf(u, memberId);
+}
+/* 把「人工优先 / 留空用预估」的废纸并进本月用纸量。
+   ⚠ 必须在 ensureUsage 算完 undatedSheets **之后**调用：废纸是额外的纸，
+   算进「逐日抓不到 creation 时间」的差额里会让 undated 提示变成假警报。
+   废纸没有可靠的发生日（失败单可能在月末才被判废），一律记在当月最后一天 ——
+   这样「月中买入的 A4 纸不吃购买日之前的量」这条既有口径不受影响。 */
+function _applyWasteToUsage(u, key) {
+  if (!u) return u;
+  /* 幂等：同一份用量对象被重复处理（重试、验收脚本直调）时，先撤回上一次加进去的量 */
+  if (u._wasteAdd > 0) {
+    u.sheets = Math.max(0, u.sheets - u._wasteAdd);
+    if (u._wasteAddDay && u.sheetsByDay[u._wasteAddDay] != null) {
+      u.sheetsByDay[u._wasteAddDay] = Math.max(0, u.sheetsByDay[u._wasteAddDay] - u._wasteAdd);
+      if (!u.sheetsByDay[u._wasteAddDay]) delete u.sheetsByDay[u._wasteAddDay];
+    }
+  }
+  u._wasteAdd = 0;
+  u._wasteAddDay = '';
+  var members = getMembers();
+  var manual = 0, total = 0;
+  u.wasteSheets = {};
+  u.wasteManualCount = 0;
+  members.forEach(function (mem) {
+    var v = wasteManualOf(key, mem.id);
+    var n = (v === null) ? wasteEstimateOf(u, mem.id) : v;
+    if (v !== null) manual += 1;
+    u.wasteSheets[mem.id] = n;
+    total += n;
+  });
+  /* 成员列表之外的预估（删过人 / 改过名）不丢：算进总废纸，但不摊给任何人 */
+  Object.keys(u.wasteByMember || {}).forEach(function (mid) {
+    var known = members.some(function (m) { return m.id === mid; });
+    if (!known) total += Math.max(0, Math.round(+(u.wasteByMember[mid]) || 0));
+  });
+  u.wasteUnattributedSheets = Math.max(0, Math.round(+(u.wasteUnattributed) || 0));
+  total += u.wasteUnattributedSheets;
+  u.wasteManualCount = manual;
+  u.wasteTotal = total;
+  if (total > 0) {
+    u.sheets += total;
+    var range = _usageMonthRange(key);
+    var lastDay = range ? range.end : '';
+    if (lastDay) {
+      u.sheetsByDay[lastDay] = (u.sheetsByDay[lastDay] || 0) + total;
+      u._wasteAdd = total;
+      u._wasteAddDay = lastDay;
+    }
+  }
+  return u;
+}
+
 function _flushUsageWaiters(key) {
   var list = _usageWaiters[key] || [];
   delete _usageWaiters[key];
@@ -5341,7 +5588,11 @@ function ensureUsage(key, cb) {
   _usageFailed[key] = false;
   var url = FINANCE_MODE === 'local'
     ? '/api/local/orders?start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end)
-    : '/api/proxy/admin/statistics/revenue?start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end);
+    : '/api/proxy/admin/statistics/revenue?start_date=' + encodeURIComponent(range.start) + '&end_date=' + encodeURIComponent(range.end) +
+      /* v7.10：默认口径只回 sent/printing/queued/failed/offline_unknown，**没有** canceled/abandoned，
+         而「废纸预估」正是要靠这些没产出的终态单。这里带上页面已有的状态全集（全选框那套），
+         多取回来的单由 _usageFromOrders 的 NORMAL_EXCLUDED_STATUSES 挡在正常用量之外。 */
+      '&status=' + encodeURIComponent(selectedStatuses().join(','));
   fetch(url, { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
     .then(function (data) {
@@ -5357,6 +5608,8 @@ function ensureUsage(key, cb) {
         Object.keys(u.sheetsByDay).forEach(function (d) { sDay += u.sheetsByDay[d]; });
         u.undatedPages = Math.max(0, u.pages - pDay);
         u.undatedSheets = Math.max(0, u.sheets - sDay);
+        /* v7.10：废纸（人工优先 / 留空用预估）计入本月用纸量 —— 必须在上面两条之后 */
+        _applyWasteToUsage(u, key);
         if (gen !== _usageGen) {               // 配置/成员已变：这次结果作废（别写回旧口径）
           _flushUsageWaiters(key);
           return;
@@ -5472,6 +5725,68 @@ function retryAmortUsage() {
    ② 每个采购批次的「总量 / 单价 / 累计已用 / 已摊销 / 本月用量 / 本月摊销 / 剩余」；
    ③ 本月按垫付记在采购人名下的金额（结算时他从「垫付差额」里收回）；
    ④ 本月有用量但没库存可摊时明确提示（否则会以为"怎么没摊"）。 */
+/* ── v7.10：用纸统计（正常出纸 + 废纸） ───────────────────────────────
+   用户口径：A4 纸会有没计入收支清算的「废纸」，要能按人填一个大概数，
+   同时给预估（本月失败终态订单本该用掉的纸）。用纸记录显示成「正常 N + 废 M 张」，
+   合计（N+M）计入本月用纸量 ⇒ 走 sheetsByDay 进 A4纸摊销（见 _applyWasteToUsage）。
+   留空 = 用预估；填 0 = 明确没有废纸（两者必须能区分：wasteManualOf 返回 null / 0）。 */
+function paperStatsSectionHTML(r, m) {
+  var key = m.key;
+  var u = r.usage || usageOfMonth(key) || null;
+  var ustate = usageStateOfMonth(key);
+  var normalBy = (u && u.sheetsByMember) || {};
+  var h = '<div class="section" id="paperStatsSection"><h2>🧻 用纸统计 <span class="hint">（每人「正常出纸 + 废纸」；废纸留空 = 按本月失败订单自动预估，填 0 = 明确没有废纸）</span></h2>';
+  if (ustate === 'loading' || (r.amort && r.amort.state === 'loading')) {
+    h += '<div style="color:var(--muted);font-size:.85rem;margin-bottom:8px"><span class="loading-spin"></span>本月出纸张数统计中…</div>';
+  } else if (!u) {
+    h += '<div style="color:var(--orange);font-size:.85rem;margin-bottom:8px">⚠️ 未取到本月用量：正常出纸张数未知（废纸仍可手工填，会照常计入本月用纸量）。</div>';
+  }
+  h += '<div class="table-wrap"><table><thead><tr><th></th><th>正常用纸</th><th>废纸（可编辑）</th><th>合计</th><th>废纸来源</th></tr></thead><tbody>';
+  var tn = 0, tw = 0;
+  getMembers().forEach(function (mem) {
+    var normal = Math.max(0, Math.round(+((normalBy[mem.id]) || 0)));
+    var manual = wasteManualOf(key, mem.id);
+    var est = wasteEstimateOf(u, mem.id);
+    var waste = (manual === null) ? est : manual;
+    tn += normal; tw += waste;
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
+    h += '<td>' + fmtInt(normal) + ' 张</td>';
+    h += '<td><input type="number" min="0" step="1" class="inp-waste" style="width:76px" '
+      + 'value="' + (manual === null ? '' : manual) + '" placeholder="' + fmtInt(est) + '" '
+      + 'title="留空 = 按本月失败订单自动预估（' + fmtInt(est) + ' 张）；填 0 = 明确没有废纸" '
+      + 'onchange="updWastePaper(\'' + mem.id + '\', this.value)"></td>';
+    h += '<td style="font-weight:700">正常 ' + fmtInt(normal) + ' + 废 ' + fmtInt(waste) + ' 张</td>';
+    h += '<td>' + (manual === null ? '<span class="tag b">预估</span>' : '<span class="tag g">人工</span>') + '</td></tr>';
+  });
+  /* 未归属：删除过成员 / 订单没绑定成员 —— 纸真的废了，但摊不到任何人头上 */
+  var orphanWaste = 0, known = {};
+  getMembers().forEach(function (mem) { known[mem.id] = true; });
+  Object.keys((u && u.wasteByMember) || {}).forEach(function (mid) {
+    if (!known[mid]) orphanWaste += Math.max(0, Math.round(+u.wasteByMember[mid]) || 0);
+  });
+  orphanWaste += Math.max(0, Math.round(+((u && u.wasteUnattributed) || 0)));
+  var orphanNormal = Math.max(0, Math.round(+((u && u.unattributedSheets) || 0)));
+  if (orphanNormal > 0 || orphanWaste > 0) {
+    h += '<tr style="opacity:.7"><td style="color:var(--muted)">未归属</td><td>' + fmtInt(orphanNormal) + ' 张</td><td>'
+      + fmtInt(orphanWaste) + ' 张</td><td>正常 ' + fmtInt(orphanNormal) + ' + 废 ' + fmtInt(orphanWaste) + ' 张</td>'
+      + '<td><span class="tag y">摊不到人</span></td></tr>';
+    tw += orphanWaste;
+    /* 未归属的正常用纸不进 tw；合计行的「正常」列只统计成员名下 */
+  }
+  h += '<tr class="tfoot"><td>合计</td><td>' + fmtInt(tn) + ' 张</td><td>' + fmtInt(tw) + ' 张</td><td>正常 '
+    + fmtInt(tn) + ' + 废 ' + fmtInt(tw) + ' 张</td><td></td></tr>';
+  h += '</tbody></table></div>';
+  var _manualCnt = getMembers().filter(function (mem) { return wasteManualOf(key, mem.id) !== null; }).length;
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
+    + '「废纸」= 本月<b>没产出纸</b>的订单（失败 / 放弃打印 / 已取消）本该用掉的纸张数，按订单归属的成员计；'
+    + '留空自动取这个预估，填了就按人工值（<b>0 与留空不同</b>：0 表示确认没有废纸）。'
+    + '本月合计 <b>' + fmtInt(tn + tw) + ' 张</b>（正常 ' + fmtInt(tn) + ' + 废 ' + fmtInt(tw) + '）计入本月用纸量，A4 纸摊销按这个量算。'
+    + (_manualCnt > 0 ? ' 其中 ' + _manualCnt + ' 人填了人工值。' : '')
+    + '<br>「按用量分摊」的权重仍是<b>出纸页数</b>（不是张数），废纸不改变它；废纸通过 A4 纸摊销的成本进入分摊。'
+    + '</div>';
+  h += '</div>';
+  return h;
+}
 function consumableAmortSectionHTML(r, m) {
   var am = (r && r.amort) ? r.amort : null;
   var state = am && am.state ? am.state : 'none';
@@ -5505,10 +5820,22 @@ function consumableAmortSectionHTML(r, m) {
     return h;
   }
   if (state === 'ready' && am && am.lots && am.lots.length) {
-    h += '<div class="table-wrap"><table><thead><tr><th>耗材</th><th>采购（日期 · 金额 · 采购人）</th><th>总量</th><th>单价</th><th>累计使用</th><th>已摊销</th><th>本月用量</th><th>本月摊销</th><th>剩余未摊销</th></tr></thead><tbody>';
+    h += '<div class="table-wrap"><table><thead><tr><th>耗材</th><th>所属打印机</th><th>采购（日期 · 金额 · 采购人）</th><th>总量</th><th>单价</th><th>累计使用</th><th>已摊销</th><th>本月用量</th><th>本月摊销</th><th>剩余未摊销</th></tr></thead><tbody>';
     am.lots.forEach(function (d) {
       var buyer = getMember(d.payer);
       h += '<tr><td style="font-weight:700">' + esc(d.label) + (d.item ? '<div style="font-size:.72rem;color:var(--muted);font-weight:400">' + esc(d.item) + '</div>' : '') + '</td>';
+      /* v7.10：这支耗材按哪台机的用量摊销（硒鼓）；A4纸 / 未指定硒鼓 = 全队用量（旧口径） */
+      if (d.kind === 'toner' && d.scope === 'printer') {
+        h += '<td style="font-size:.8rem;white-space:nowrap">🖨 ' + esc(d.printerName || d.printerId)
+          + '<div style="font-size:.72rem;color:var(--muted)">按该机本月 ' + fmtInt(d.monthUnits) + ' 页摊</div></td>';
+      } else if (d.kind === 'toner' && d.printerMissing) {
+        h += '<td style="font-size:.8rem;color:var(--orange);white-space:nowrap">⚠ 原所属打印机已删除'
+          + '<div style="font-size:.72rem;color:var(--muted)">按全队 ' + fmtInt(d.monthUnits) + ' 页摊</div></td>';
+      } else if (d.kind === 'toner') {
+        h += '<td style="font-size:.8rem;color:var(--muted);white-space:nowrap">未指定<div style="font-size:.72rem">按全队本月 ' + fmtInt(d.monthUnits) + ' 页摊</div></td>';
+      } else {
+        h += '<td style="font-size:.8rem;color:var(--muted);white-space:nowrap">—<div style="font-size:.72rem">A4纸按全队 ' + fmtInt(d.monthUnits) + ' 张摊</div></td>';
+      }
       h += '<td style="font-size:.8rem;white-space:nowrap">' + esc(d.date) + ' · ' + RMB(d.priceCents) + '<div style="font-size:.72rem;color:var(--muted)">' + esc(buyer ? buyer.name : d.payer) + '</div></td>';
       h += '<td>' + fmtInt(d.units) + ' ' + d.unit + '</td>';
       h += '<td style="white-space:nowrap">¥' + d.unitYuan.toFixed(4) + '/' + d.unit + '</td>';
@@ -5518,7 +5845,7 @@ function consumableAmortSectionHTML(r, m) {
       h += '<td class="neg" style="font-weight:700">' + (d.monthCents > 0 ? RMB(d.monthCents) : '<span style="color:var(--muted)">¥0.00</span>') + '</td>';
       h += '<td>' + (d.remainingCents > 0 ? RMB(d.remainingCents) : '<span class="tag g">已摊销完</span>') + '</td></tr>';
     });
-    h += '<tr class="tfoot"><td>本月摊销合计</td><td colspan="6" style="color:var(--muted)">已计入上方「采购明细」的采购支出</td><td class="neg" style="font-weight:800">' + RMB(am.totalCents) + '</td><td></td></tr>';
+    h += '<tr class="tfoot"><td>本月摊销合计</td><td colspan="7" style="color:var(--muted)">已计入上方「采购明细」的采购支出</td><td class="neg" style="font-weight:800">' + RMB(am.totalCents) + '</td><td></td></tr>';
     h += '</tbody></table></div>';
     var buyers = Object.keys(am.byBuyer || {});
     if (buyers.length) {
@@ -5539,6 +5866,31 @@ function consumableAmortSectionHTML(r, m) {
           + ' ' + CONSUMABLE_KIND[kind].label + '用量没有对应库存（采购未录入或已用完），这部分未计摊销。</div>';
       }
     });
+    /* v7.10：硒鼓按「所属打印机」摊销后要说清口径 —— 一台机一支鼓，各算各的 */
+    var _pmKeys = Object.keys(am.tonersByPrinter || {});
+    if (_pmKeys.length) {
+      h += '<div style="margin-top:6px;font-size:.82rem">🖨 按机器摊销（只吃「这台机」本月页数）：'
+        + _pmKeys.map(function (pid) {
+            var b = am.tonersByPrinter[pid];
+            return '<b>' + esc(b.name || pid) + '</b> 本月 ' + fmtInt(b.monthUnits) + ' 页 / ' + RMB(b.monthCents);
+          }).join(' · ')
+        + '<span style="color:var(--muted)">（硒鼓是按打印机买的：一台机买的鼓只按这台机打的页数摊）</span></div>';
+    }
+    /* v7.10：单机桶摊不掉 / 机器被删 的两类提示 */
+    var _pmNameOf = {};
+    am.lots.forEach(function (d) { if (d.printerId) _pmNameOf[d.printerId] = d.printerName || d.printerId; });
+    Object.keys(am.uncoveredPrinter || {}).forEach(function (pid) {
+      var n = ((am.uncoveredPrinter[pid] || {})[m.key]) || 0;
+      if (n > 0) {
+        h += '<div style="margin-top:6px;font-size:.8rem;color:var(--orange)">⚠ 「' + esc(_pmNameOf[pid] || pid) + '」本月有 '
+          + fmtInt(n) + ' 页没有对应这台机的硒鼓库存（没录采购或已用完），这部分未计摊销。</div>';
+      }
+    });
+    var _pmGone = am.lots.some(function (d) { return d.printerMissing; });
+    if (_pmGone) {
+      h += '<div style="margin-top:6px;font-size:.8rem;color:var(--orange)">⚠ 有硒鼓的「所属打印机」已经不在打印机台账里（被删除或改过 ID）：'
+        + '这些鼓<b>已按全队页数</b>摊销（不是摊 0）。请到 <b>「手动记账 → 采购支出」</b> 把这一行的「所属打印机」重新选一次。</div>';
+    }
     /* v7.9：没有 created_at 的老订单无法归日 ⇒ 不进摊销（也绝不硬塞到月末 —— 那会把
        购买日之前的用量也摊进这批）。单独提示，别让人以为少算了。 */
     var _u = usageOfMonth(m.key) || {};
@@ -5689,6 +6041,9 @@ function renderDash() {
         : '当前为均摊口径。想按各人实际用纸比例出钱 → 「设置 → 采购分摊」切成<b>按用量</b>。')
     + (r.usage && r.usage.unattributedPages > 0 ? ' 另有 <b>' + r.usage.unattributedPages + ' 页</b>未归属成员（订单没绑定到成员），未计入任何人的用量。' : '')
     + '</div></div>';
+
+  /* ── v7.10：用纸统计（正常出纸 + 废纸，可编辑） ─────────────────── */
+  h += paperStatsSectionHTML(r, m);
 
   /* ── v7.9：长期耗材摊销（A4纸 / 硒鼓） ─────────────────────────── */
   h += consumableAmortSectionHTML(r, m);
@@ -6317,7 +6672,7 @@ function renderEntry() {
      A4纸填总张数、硒鼓填可打印页数 —— 结算只按每月实际用掉的量摊销，购买月不再整笔计入。 */
   var hasConsumable = m.expenses.some(isConsumableExpense);
   h += '<div class="table-wrap"><table class="exp-table' + (hasConsumable ? ' has-qty' : '') + '"><thead><tr><th>日期</th><th class="l">项目</th><th>类型</th>'
-    + (hasConsumable ? '<th>数量</th>' : '')
+    + (hasConsumable ? '<th>数量</th><th>所属打印机</th>' : '')
     + '<th>金额（元）</th><th>代付人</th><th></th></tr></thead><tbody>';
   m.expenses.forEach(function (e, i) {
     var eid = safeId(e.id);
@@ -6343,6 +6698,10 @@ function renderEntry() {
         h += '</td>';
       }
     }
+    /* v7.10：硒鼓的「所属打印机」列 —— 硒鼓是按打印机买的（买给 M232 的鼓装不进 LaserJet 1020），
+       所以这支鼓只按「这台机」本月页数摊销；未指定就回到旧口径（全队页数）。
+       A4纸不受影响（纸不分机器），那一格恒为 —。 */
+    if (hasConsumable) h += expPrinterCellHTML(e, eid, kind, disabled);
     h += '<td><input type="number" step="0.01" min="0" value="' + esc(e.amount) + '" onchange="updExp(\'' + eid + '\',\'amount\',+this.value)"' + disabled + '></td>';
     h += '<td><select onchange="updExp(\'' + eid + '\',\'payer\',this.value)"' + disabled + '>';
     members.forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (e.payer === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
@@ -6350,10 +6709,11 @@ function renderEntry() {
     h += '<td><button class="btn danger sm" onclick="delExp(\'' + eid + '\')"' + disabled + '>✕</button></td>';
     h += '</tr>';
   });
-  if (!m.expenses.length) h += '<tr><td colspan="' + (hasConsumable ? 7 : 6) + '" style="color:var(--muted)">暂无采购记录</td></tr>';
+  if (!m.expenses.length) h += '<tr><td colspan="' + (hasConsumable ? 8 : 6) + '" style="color:var(--muted)">暂无采购记录</td></tr>';
   h += '</tbody></table></div>';
   h += '<button class="btn sm" style="margin-top:10px" onclick="addExp()"' + disabled + '>+ 添加采购项</button>';
-  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">长期耗材：<b>A4纸</b>填<b>总张数</b>（如 5 包 × 500 = 2500 张）、<b>硒鼓</b>填<b>可打印页数</b>（如 1600 页）。填好后这笔采购<b>不再在购买当月全额计入</b>，而是按每月实际用量摊销、逐月返还给采购人 —— 详情见「收支清算 → 长期耗材摊销」。</div>';
+  h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">长期耗材：<b>A4纸</b>填<b>总张数</b>（如 5 包 × 500 = 2500 张）、<b>硒鼓</b>填<b>可打印页数</b>（如 1600 页）。填好后这笔采购<b>不再在购买当月全额计入</b>，而是按每月实际用量摊销、逐月返还给采购人 —— 详情见「收支清算 → 长期耗材摊销」。'
+    + '<br><b>硒鼓的「所属打印机」</b>：硒鼓是按打印机买的（买给 HP M232 的鼓装不到 HP 1020 上），所以在那一列选这台机 —— 这支鼓<b>只按这台机本月页数</b>摊销；留「未指定」则按<b>全队页数</b>摊（旧口径）。A4纸不分机器，恒按全队用纸量摊。</div>';
   h += '</div>';
 
   /* ── 代收收入 ── */
@@ -6458,7 +6818,74 @@ function updExpType(id, val) {
   if (!r) return;
   r.kind = (val === 'paper' || val === 'toner') ? val : 'other';
   if (r.kind === 'other') delete r.units;
+  /* v7.10：所属打印机只对硒鼓有意义 —— 改成 A4纸 / 普通采购时清掉，避免旧值以后又被捡起来用 */
+  if (r.kind !== 'toner') delete r.printer_id;
   save(); renderEntry();
+}
+/* v7.10：采购支出行的「所属打印机」格（只有耗材列存在时才渲染）。
+   硒鼓 = 下拉（未指定 / 台账里各台机）；A4纸 = 恒 —（纸不分机器）。 */
+function expPrinterCellHTML(e, eid, kind, disabled) {
+  if (kind !== 'toner') {
+    return '<td class="exp-qty" style="color:var(--muted)">—'
+      + '<div class="exp-qty-note">' + (kind === 'paper' ? 'A4纸按全队用纸量摊' : '只有耗材需要指定') + '</div></td>';
+  }
+  var pid = expensePrinterId(e);
+  var pname = pid ? printerNameOf(pid) : '';
+  var gone = !!pid && !pname;
+  var h = '<td class="exp-qty"><select'
+    + (gone ? ' style="border-color:var(--orange)"' : '')
+    + ' onchange="updExpPrinter(\'' + eid + '\',this.value)" title="硒鼓是按打印机买的：选了这台机，这支鼓就只按这台机本月页数摊销；未指定 = 按全队页数（旧口径）"' + disabled + '>';
+  h += '<option value=""' + (!pid ? ' selected' : '') + '>未指定（全队页数）</option>';
+  getPrinters().forEach(function (p) {
+    h += '<option value="' + esc(p.id) + '"' + (pid === p.id ? ' selected' : '') + '>' + esc(p.name || p.id) + '</option>';
+  });
+  if (gone) h += '<option value="' + esc(pid) + '" selected>⚠ 原打印机已删除</option>';
+  h += '</select>';
+  if (gone) h += '<div class="exp-qty-note" style="color:var(--orange)">⚠ 台账里没有这台机 → 暂按全队页数摊，请重选</div>';
+  else if (pid) h += '<div class="exp-qty-note" style="color:var(--muted)">🖨 按「' + esc(pname) + '」本月页数摊</div>';
+  else h += '<div class="exp-qty-note" style="color:var(--muted)">按全队页数摊</div>';
+  return h + '</td>';
+}
+/* v7.10：改硒鼓的所属打印机。空 = 未指定（旧口径）。不需要让用量失效：
+   归属只影响「怎么摊」，不改变用量本身（renderDash 每次都重算摊销）。 */
+function updExpPrinter(id, val) {
+  if (!unlocked.expense) { toast('🔒 请先解锁采购支出', 'error'); return; }
+  var r = STORE.records.expenses.find(function (x) { return x.id === id; });
+  if (!r) return;
+  var pid = safeId(val);
+  if (pid && !printerById(pid)) {
+    toast('⚠ 选的打印机不在台账里了，请重新选', 'error');
+    renderEntry();
+    return;
+  }
+  if (pid) r.printer_id = pid; else delete r.printer_id;
+  save(); renderEntry();
+}
+/* v7.10：用纸统计里每人「废纸(张)」格。
+   留空 = 删掉这一格（回落到自动预估）；填 0 = 明确没有废纸；非法输入（负数/文字）不落库并恢复原值。 */
+function updWastePaper(memberId, raw) {
+  var mid = safeId(memberId);
+  if (!mid) return;
+  var cfg = STORE.config = STORE.config || {};
+  var bag = cfg.waste_paper = cfg.waste_paper || {};
+  var mon = bag[currentKey] = bag[currentKey] || {};
+  var txt = (raw === null || raw === undefined) ? '' : String(raw).trim();
+  if (txt === '') {
+    delete mon[mid];
+    if (!Object.keys(mon).length) delete bag[currentKey];
+    save(); invalidateUsage(currentKey); renderDash();
+    return;
+  }
+  if (!/^\d+$/.test(txt)) {
+    toast('废纸张数要填非负整数（留空 = 按失败订单自动预估）', 'error');
+    renderDash();          // 不落库：重绘把那格恢复成有效值
+    return;
+  }
+  mon[mid] = Math.round(+txt);
+  save();
+  /* 废纸计入本月用纸量 ⇒ 用量缓存必须失效重算（A4纸摊销跟着变） */
+  invalidateUsage(currentKey);
+  renderDash();
 }
 function delExp(id) { STORE.records.expenses = STORE.records.expenses.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
 function addInc() {
@@ -8444,7 +8871,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v7.9</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v7.10</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -8538,6 +8965,21 @@ function renderAbout() {
     + '逐批列出采购 / 总量 / 单价 / 累计使用 / 已摊销 / 本月用量 / 本月摊销 / 剩余未摊销，并标注本月返还对象。'
     + '④ 缺数量（0）的耗材<b>暂按普通采购全额计入</b>并显式提示"填数量后改为按月摊销"，'
     + '绝不让这笔钱凭空消失；用量没取到时摊销按 ¥0 计并给重试，绝不静默算错。</p>' +
+    '<p style="margin-top:10px">v7.10：<b>硒鼓按所属打印机摊销</b> + <b>废纸</b> —— '
+    + '① 「手动记账 → 采购支出」的耗材行新增<b>「所属打印机」</b>列：硒鼓是按打印机买的'
+    + '（买给 HP M232 的鼓装不到 HP 1020 上），所以给这支鼓选上它服务的那台机后，'
+    + '<b>这支鼓只按这台机本月的页数摊销</b>（不再拿别的机器打的页去摊）；'
+    + '留「未指定（全队页数）」则维持旧口径（全队页数），老数据零回归。A4纸不分机器，恒按全队用纸量摊。'
+    + '若选的打印机后来被删掉，这批就<b>回落成按全队页数</b>摊并在摊销区块明确提示（不会静默摊成 0）。'
+    + '② 「收支清算」新增<b>「🧻 用纸统计」</b>区块：每人一行「正常用纸 / 废纸（可编辑）/ 合计」，'
+    + '显示成<b>正常 N + 废 M 张</b>。'
+    + '③ <b>废纸</b> = 本月<b>没产出纸</b>的订单（失败 / 放弃打印 / 已取消）本该用掉的纸张数，按订单归属的成员算；'
+    + '留空 = 自动用这个预估，<b>填 0 = 明确没有废纸</b>（留空与 0 是两件事），填了就按人工值、非法输入不落库。'
+    + '人工值按月按成员存在配置里（换月看对应月份的值）。'
+    + '④ 废纸计入本月<b>用纸量</b>（正常 + 废纸），从而进入 <b>A4纸摊销</b>；'
+    + '「按用量分摊」的权重仍是出纸<b>页数</b>，不因废纸改变。'
+    + '⑤ 为了让预估拿得到「失败 / 放弃打印 / 已取消」的订单，用量接口改为按全部状态取数后在前端分口径统计'
+    + '（正常用量仍只算真正出纸的完成单，与旧口径一致）。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

@@ -64,6 +64,24 @@ COLOR_UNKNOWN, COLOR_MONO, COLOR_COLOR = 0, 1, 2
 # 记进账本只会把昨天的账重复记一遍 ⇒ 判 stale 只记日志不记账。
 STALE_AFTER_SEC = 48 * 3600
 
+# ── 假脱机（spooling）阶段的两个字段都不可信，必须先跳过、下一轮再看 ──
+#
+# 2026-10-30 实测（HP LaserJet 1020，本工具自己的 GDI 作业）：
+#   Status=0x0008（SPOOLING）时  pDocument='本地下层文档'  TotalPages=0  Size=0
+#   Status=0x2010（PRINTING|RETAINED）时  pDocument='HN|hn_selftag_probe3.pdf'  TotalPages=3
+# ⇒ 作业刚进队的那 1 秒里，spooler 还没有我们在 StartDoc 里给的文档名，页数也没落地。
+# 判「是不是自家作业」只认文档名（SELF_TAG），这个时间窗里过滤必然失效 ——
+# 现场后果是 2026-10-30 13:09:14 与 14:04:41 两条自家作业被记成外部打印（重复收费 0.90 元）。
+# 所以：还在 SPOOLING 的作业本轮不判，等它进 PRINTING 再扫（名字/页数那时才是真的）。
+JOB_STATUS_SPOOLING = 0x0008
+
+# Windows 给「没有文档名的作业」的占位串（中文/英文系统各一份）。出现它说明名字还没落地，
+# 或确实是某个老程序没调 StartDoc 名字 —— 前者靠 SPOOLING 位挡住，后者照记（页数人工补）。
+PLACEHOLDER_TITLES = frozenset({
+    "本地下层文档",
+    "Local Downlevel Document",
+})
+
 # PRINTER_CHANGE_* 位（winspool.h）。只用与"作业"有关的三位：新增/修改（页数在修改里过来）/删除。
 PRINTER_CHANGE_ADD_JOB = 0x00000100
 PRINTER_CHANGE_SET_JOB = 0x00000200
@@ -91,6 +109,20 @@ def tag_self_title(title: str) -> str:
 
 def is_self_title(title: str) -> bool:
     return str(title or "").startswith(SELF_TAG)
+
+
+def is_spooling(job: Any) -> bool:
+    """作业是否还在假脱机阶段（此时文档名与页数都还没落地，见 JOB_STATUS_SPOOLING）。
+
+    `Status` 缺字段/不是整数 ⇒ 当作"不在假脱机"，保持旧行为（宁可多记一条让人忽略，
+    也不能因为读不到状态位就永远不记账 —— 那才是真漏钱）。
+    """
+    return bool(_as_int(job_get(job, "Status"), 0) & JOB_STATUS_SPOOLING)
+
+
+def is_placeholder_title(title: str) -> bool:
+    """是不是 Windows「无文档名作业」的占位串（本地下层文档 / Local Downlevel Document）。"""
+    return str(title or "").strip() in PLACEHOLDER_TITLES
 
 
 # TTL 内登记的作业名也按自家作业跳过（见 note_self_job 的注释解释代价）
@@ -412,15 +444,20 @@ def should_record(job: Any, self_titles: Iterable[str] = (), now: Optional[datet
     """纯函数：这条作业要不要记账。返回 (要不要记, 原因)。
 
     原因取值：ok / self（自家作业）/ virtual（虚拟打印机）/ duplicate（已在账本）/
-             stale（陈年残留）/ no_id（没有 JobId）。
+             stale（陈年残留）/ no_id（没有 JobId）/ spooling（还在假脱机，本轮先不判）。
 
     self_titles 是"本工具提交过的文档名"集合（调用方传 pdf_printer 实际用的标题）；
     正常情况下 SELF_TAG 前缀已经足够，这一份是给"标题被驱动改写/旧版没加前缀"兜底的。
+
+    spooling：见 JOB_STATUS_SPOOLING —— 这一阶段 pDocument 还是「本地下层文档」占位串、
+    TotalPages 还是 0，判自家/判页数都会错，所以**本轮先跳过**，等作业进 PRINTING 再判。
     """
     now = now or datetime.now()
     job_id = _as_int(job_get(job, "JobId"), 0)
     if job_id <= 0:
         return False, "no_id"
+    if is_spooling(job):
+        return False, "spooling"
     title = str(job_get(job, "pDocument", "") or "")
     if is_self_title(title) or (title and title in set(self_titles or ())):
         return False, "self"

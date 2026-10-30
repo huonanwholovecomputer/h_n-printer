@@ -351,8 +351,13 @@ check("授权页表格新增「自动双面」列 + 语义说明",
       "<th>自动双面</th>" in html and "不支持（需人工翻纸）" in html)
 
 # ── 来源标签的措辞 / 可读性 / 标注人（2026-10 现场反馈：「✅ 支持自动双面」旁边也挂「人工」被误读）──
+# 2026-10-30：判据从「全文不许出现 >人工</span>」收窄成「能力来源标签这一块不许」——
+# 新增的「🧻 用纸统计 · 废纸来源」列里有合法的 `<span class="tag g">人工</span>`（人工填 vs 预估），
+# 全文级断言会误伤；这里只看 👤 人工标注 / 🔍 探测 所在的那段渲染代码。
+_cap_i = html.find("👤 人工标注")
+_cap_block = html[max(0, _cap_i - 1500): _cap_i + 1500] if _cap_i >= 0 else ""
 check("★ 来源标签改叫「👤 人工标注」/「🔍 探测」（说的是结论谁定的，不是「要人工翻纸」）",
-      "👤 人工标注" in html and "🔍 探测" in html and ">人工</span>" not in html)
+      "👤 人工标注" in html and "🔍 探测" in html and ">人工</span>" not in _cap_block)
 check("★ 下拉放宽到 220px（170px 时「🖐 不支持（需人工翻纸）」被截断成「不支持（需人工」）",
       "max-width:220px" in html and "max-width:170px" not in html)
 check("★ 保存人工结论时一并上报标注人（本页无登录身份 → 取该设备绑定的所有者）",

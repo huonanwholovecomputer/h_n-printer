@@ -17,7 +17,7 @@ import uuid
 import requests as http_requests
 import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from PySide6.QtCore import (
@@ -85,7 +85,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, cloud_word_com_allowed, split_tail_blank
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, fit_print_speed, cloud_word_com_allowed, split_tail_blank
 from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
@@ -1435,6 +1435,10 @@ class StackQueueDialog(QDialog):
     # 列宽只给「非文件」列：文件列一律 Stretch（文件名长短差别大，固定宽会把名字挤成省略号）
     LEFT_WIDTHS = [0, 108, 108, 52, 126]
     RIGHT_WIDTHS = [0, 92, 92, 124]
+    # 「本机队列」= 打印机当前在处理 + 本机已经受理还没开打的任务（含非攒批的单子）。
+    # 列宽只给「非内容」列：内容列一律 Stretch（文件名长短差别大）。
+    LOCAL_COLS = ["状态", "来源", "内容", "张数", "预计完成"]
+    LOCAL_WIDTHS = [136, 84, 0, 52, 92]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1461,7 +1465,9 @@ class StackQueueDialog(QDialog):
             "不是云端排队列表，云端还没下发给本机的订单不会出现在这里；纸叠打完第 2 趟后"
             "它们会自动放行。页号按「第 1 趟 / 第 2 趟」分列，<b>每个文件的页号按它自己算</b>"
             "（不是整叠合并后的页码），<b>[空]</b> = 那一面没有内容，"
-            "程序会送一张空白纸（不能跳过：漏一张，后面整叠错位）。")
+            "程序会送一张空白纸（不能跳过：漏一张，后面整叠错位）。<br>"
+            "下方<b>「🖨 本机队列」</b>＝打印机当前正在处理 + 本机已受理但还在排队的"
+            "<b>全部</b>任务（不止攒批单：普通/云端自动/预约都算），空闲时自动隐藏。")
         self._hint.setWordWrap(True)
         self._hint.setStyleSheet("font-size: 11px;")
         lay.addWidget(self._hint)
@@ -1485,7 +1491,19 @@ class StackQueueDialog(QDialog):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([660, 500])
-        lay.addWidget(split, 1)
+        lay.addWidget(split, 3)
+
+        # ── 第三块：本机队列（打印机忙时第二、第三个任务也要有总体队列视图）──
+        # 数据全部由主窗口组装成纯结构后经 `set_local_queue()` 喂进来（对话框不摸 MainWindow）。
+        # 空闲时整块 `setVisible(False)`（不占位置、不闪），有内容才显示。
+        self._local_group = QGroupBox("🖨 本机队列")
+        _lq = QVBoxLayout(self._local_group)
+        self._tree_local = self._make_tree(self.LOCAL_COLS, self.LOCAL_WIDTHS, stretch_col=2)
+        _lq.addWidget(self._tree_local)
+        self._local_group.setVisible(False)
+        lay.addWidget(self._local_group, 1)
+        self._local_rows: list = []
+        self._local_sig = None
 
         row = QHBoxLayout()
         self._btn_take = QPushButton("✓ 我已取走")
@@ -1510,7 +1528,7 @@ class StackQueueDialog(QDialog):
 
         self._tree_left.itemSelectionChanged.connect(self._on_left_selection)
 
-    def _make_tree(self, cols, widths) -> "QTreeWidget":
+    def _make_tree(self, cols, widths, stretch_col: int = 0) -> "QTreeWidget":
         t = QTreeWidget()
         t.setHeaderLabels(cols)
         t.setRootIsDecorated(True)
@@ -1522,11 +1540,56 @@ class StackQueueDialog(QDialog):
         t.setWordWrap(False)                 # 页号一行放得下；太长靠 tooltip + 横向滚动
         hdr = t.header()
         hdr.setStretchLastSection(False)
-        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(stretch_col, QHeaderView.Stretch)
         for i in range(1, len(widths)):
+            if i == stretch_col:
+                continue
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
             t.setColumnWidth(i, widths[i])
         return t
+
+    # ── 本机队列（第三块；主窗口组装好纯数据再喂进来）──
+
+    def set_local_queue(self, rows=None):
+        """刷新「🖨 本机队列」区。
+
+        `rows` = list[dict]，每项 `{"state","source","content","sheets","eta","active"}`，
+        `active=True` 表示"进行中"（含手动双面的「等待翻纸」，那一态算进行中而不是等待中）。
+        空列表 ⇒ 整块隐藏（空闲不占地方）。内容没变就直接 return —— 这个 setter 由主窗口
+        2 秒心跳调用，每 2 秒重建表格会闪，所以用签名比对（比对的是**渲染出来的文本**，
+        不是对象 id，队列里换了个 job 对象但显示一样时同样不重建）。
+        """
+        rows = list(rows or [])
+        sig = tuple(
+            (str(r.get("state", "")), str(r.get("source", "")), str(r.get("content", "")),
+             str(r.get("sheets", "")), str(r.get("eta", "")), bool(r.get("active")))
+            for r in rows
+        )
+        if sig == self._local_sig:
+            return
+        self._local_sig = sig
+        self._local_rows = rows
+        self._tree_local.clear()
+        if not rows:
+            self._local_group.setVisible(False)
+            return
+        n_active = sum(1 for r in rows if r.get("active"))
+        n_wait = len(rows) - n_active
+        self._local_group.setTitle(f"🖨 本机队列 —— 进行中 {n_active} / 等待中 {n_wait}")
+        for r in rows:
+            it = QTreeWidgetItem([
+                str(r.get("state", "")), str(r.get("source", "")),
+                str(r.get("content", "")), str(r.get("sheets", "")),
+                str(r.get("eta", "")),
+            ])
+            it.setForeground(0, QColor("#c0392b" if r.get("active") else "#7f8c8d"))
+            it.setToolTip(2, str(r.get("content", "")))
+            self._tree_local.addTopLevelItem(it)
+        self._local_group.setVisible(True)
+
+    def local_queue_visible(self) -> bool:
+        """本机队列区当前是否显示（测试与主窗口底栏读数共用；不用 isVisible，父窗没 show 时它恒为 False）。"""
+        return not self._local_group.isHidden()
 
     # ── 渲染（可反复调用：常驻窗随纸叠/排队实时刷新）──
 
@@ -2170,6 +2233,12 @@ class PrintWorker(QThread):
         # 多出来的纸就留在纸盘里、被后续作业当白纸用掉（文件静默丢失，零日志零报错）。
         # 现场：2026-10-15 订单 HN20261015-0008（照片先直打 + 申请书手动双面）。
         self._tray_sheets = 0
+        # 手动双面走到哪一趟（只读展示用，**不参与任何打印判定**）：由
+        # `_print_manual_batch` 在打第 1 趟 / 等翻纸 / 打第 2 趟前后写成
+        # "第 1 趟进行中" / "等待翻纸" / "第 2 趟进行中"，批次结束清空。
+        # 「🖨 本机队列」用它区分无自动双面机型的两趟（翻纸等待算**进行中**，
+        # 不是排队）；自动双面机型整批只有一个作业，这里一直是空串。
+        self._pass_state = ""
 
     # 翻纸提示的超时（秒）：主线程的弹窗自带倒计时，这里只多留一点余量兜底，
     # 保证 GUI 万一没响应时 worker 也不会永久挂住。
@@ -2992,6 +3061,7 @@ class PrintWorker(QThread):
             # 纸路径实测值 —— 逐面表（plan.pass_rotate）才是真正生效的那一份。
             _rot_arg = bool(rotate) if rotate is not None else bool(p.second_rotate_180)
             _t_pass1 = time.perf_counter()
+            self._pass_state = "第 1 趟进行中"
             ok1, msg1 = print_plan_pass(plan, merged, self._printer_name, 1,
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset, map1),
@@ -3033,6 +3103,7 @@ class PrintWorker(QThread):
                     self.log_message.emit(
                         "  ⚠ 出纸等待超时（队列没排空）→ 本次实测不写进速度样本")
 
+            self._pass_state = "等待翻纸"
             if not self._ask_operator_to_flip(plan, tray_foreign):
                 if self._cancelled:
                     return False, f"已取消（第 1 趟已打出 {plan.sheet_count} 张纸，纸叠是半成品）", n1
@@ -3040,6 +3111,7 @@ class PrintWorker(QThread):
                                f"{self._fmt_pages(plan.pass_pages(1))}），第 2 趟未打印 —— "
                                f"纸叠是半成品，请人工处理"), n1
 
+            self._pass_state = "第 2 趟进行中"
             ok2, msg2 = print_plan_pass(plan, merged, self._printer_name, 2,
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset + n1, map2),
@@ -3049,6 +3121,7 @@ class PrintWorker(QThread):
             return True, (f"手动双面完成（{len(items)} 个文件 / {plan.sheet_count} 张纸 / 2 趟，"
                           f"只翻一次纸）"), plan.total_sides
         finally:
+            self._pass_state = ""
             self.duplex_finished.emit("手动双面批次结束")
             try:
                 if os.path.isfile(merged):
@@ -4770,9 +4843,22 @@ class MainWindow(QMainWindow):
         self._file_logger.setLevel(logging.DEBUG)
         if not self._file_logger.handlers:
             # 按天分文件（2026-10-28 用户要求）：logs/2026-10-28.log，跨午夜自动落到新文件。
-            # 文件命名与「读日志尾部」都在 daily_log 一处（云端日志收集走同一个模块）。
+            # 文件命名、「读日志尾部」「清理 30 天以上」都在 daily_log 一处（同一个模块）。
+            # keep_days=30：2026-10-30 用户要求，30 天以上的日文件在启动/跨天换文件时自动删。
             import daily_log
-            self._file_logger.addHandler(daily_log.make_handler(self._log_dir))
+
+            def _on_logs_pruned(gone, _win=self):
+                # 在 Handler 的锁内被调用 ⇒ 不能直接写 GUI（会重入日志）；延迟到事件循环再落一行。
+                try:
+                    QTimer.singleShot(0, lambda: _win._log(
+                        f"🧹 日志清理：删除 {len(gone)} 个超过 "
+                        f"{daily_log.KEEP_LOG_DAYS} 天的日志文件"))
+                except Exception:
+                    pass
+
+            self._file_logger.addHandler(
+                daily_log.make_handler(self._log_dir, keep_days=daily_log.KEEP_LOG_DAYS,
+                                       on_prune=_on_logs_pruned))
         self._file_logger.info("HN 本地打印工具启动")
 
         # ── 云端直连自检 ──
@@ -6137,6 +6223,13 @@ class MainWindow(QMainWindow):
         self._shortcut_ctrl_w = QShortcut(QKeySequence("Ctrl+W"), self)
         self._shortcut_ctrl_w.setContext(Qt.ApplicationShortcut)
         self._shortcut_ctrl_w.activated.connect(self._on_shortcut_close_tab)
+        # Ctrl+Shift+T = 打开「📑 标签页管理」窗口（2026-10-30 用户要求），与点标签页那个
+        # 数字（_tab_label.mousePressEvent）完全等价 —— 同一个落点 _show_tab_manager，
+        # 不另写一份窗口代码。单独注册、**不并进上面的 _seq 循环**：那个循环的写法被
+        # tests/verify_tab_arrow_shortcut.py 按出现次数钉住（== 2），塞进去会打破既有验收。
+        self._shortcut_tab_manager = QShortcut(QKeySequence("Ctrl+Shift+T"), self)
+        self._shortcut_tab_manager.setContext(Qt.ApplicationShortcut)
+        self._shortcut_tab_manager.activated.connect(self._show_tab_manager)
         # ←/→ = 切换标签页（浏览器式习惯）。右端**不新建** —— 与「＋」按钮刻意不同：
         # 方向键是连按的键，误按一下就在最右侧凭空多出一个空标签页，操作员还得回头收拾。
         # 焦点在文本框/数字框里时让给控件（见 _focus_takes_arrow_keys），否则改不了页码/份数。
@@ -6608,10 +6701,10 @@ class MainWindow(QMainWindow):
         self._tab_label.setAlignment(Qt.AlignCenter)
         self._tab_label.setFixedSize(TAB_NUM_WIDTH, TAB_SWITCH_BTN)
         self._tab_label.setCursor(Qt.PointingHandCursor)
-        self._tab_label.setToolTip("点击管理标签页")
+        self._tab_label.setToolTip("点击管理标签页（Ctrl+Shift+T）")
         font_tab = QFont(self.font()); font_tab.setPointSize(12); font_tab.setBold(True)
         self._tab_label.setFont(font_tab)
-        # 点击标签数字 → 弹出标签页管理窗口
+        # 点击标签数字 → 弹出标签页管理窗口（与 Ctrl+Shift+T 同一落点）
         self._tab_label.mousePressEvent = lambda e: self._show_tab_manager()
 
         self._tab_btn_plus = QPushButton("+")
@@ -7528,8 +7621,25 @@ class MainWindow(QMainWindow):
     # ──────── 标签页管理窗口 ────────
 
     def _show_tab_manager(self):
-        """弹出标签页管理窗口，可查看各标签页信息、新建和删除标签页。"""
+        """弹出标签页管理窗口，可查看各标签页信息、新建和删除标签页。
+
+        两个入口：点标签页那个数字（鼠标）、或 Ctrl+Shift+T（全局快捷键，2026-10-30）。
+        **重入守卫**：窗口是模态 `exec()`，连按快捷键/连点数字时如果每次再建一个，
+        模态窗会一层层叠起来 —— 按 Esc 只关掉最上面那层，操作员会以为"关不掉"。
+        已经开着就把旧窗抬到最前、直接返回。
+        """
+        _open = getattr(self, "_tab_manager_dialog", None)
+        if _open is not None:
+            try:
+                if _open.isVisible():
+                    _open.raise_()
+                    _open.activateWindow()
+                    return
+            except RuntimeError:      # 底层 C++ 对象已被销毁（旧窗关掉后残留的引用）
+                pass
+            self._tab_manager_dialog = None
         dlg = QDialog(self)
+        self._tab_manager_dialog = dlg
         dlg.setWindowTitle("📑 标签页管理")
         dlg.setMinimumWidth(500)
         dlg.setMinimumHeight(350)
@@ -7754,7 +7864,13 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(close_btn)
 
         layout.addLayout(btn_row)
-        dlg.exec()
+        try:
+            dlg.exec()
+        finally:
+            # 无论正常关闭、Esc 还是异常退出，都必须把重入标记清掉 ——
+            # 留着旧引用会让下一次 Ctrl+Shift+T 被守卫误判成"已经开着"直接 return。
+            if getattr(self, "_tab_manager_dialog", None) is dlg:
+                self._tab_manager_dialog = None
 
     # ──────── 表格重建与行操作 ────────
 
@@ -11199,6 +11315,12 @@ class MainWindow(QMainWindow):
                 self._flush_stack_queues_as_normal()
         except Exception as e:
             logger.debug(f"攒批排队兜底放行失败: {e}")
+        # 本机队列（第三块）：复用这个 2 秒心跳刷新，**不新起定时器**；内容没变时
+        # 对话框内部按签名早退，不会每 2 秒重建表格闪一下。
+        self._sync_local_queue()
+        # 底栏读数（🖨 打印中 N · 排队 M）也要跟着走：只在状态变化时才刷的
+        # `_sync_stack_button()` 在"一直打"的不变状态里不会动，读秒就会冻住。
+        self._sync_stack_button()
 
     def _on_remote_stack_mode(self, enable: bool, by: str = ""):
         """（主线程）移动端下发的攒批模式切换。执行前**再自查一次**适用性与忙闲。
@@ -11278,11 +11400,22 @@ class MainWindow(QMainWindow):
             return
         stack = getattr(self, "_stack", None)
         entries = bool(getattr(stack, "entries", None)) if stack is not None else False
+        # 本机队列读数（打印机忙时第二/第三个任务也要看得见；空纸叠 + 空队列才隐藏）
+        try:
+            _active, _waiting = self._local_queue_counts()
+        except Exception:
+            _active, _waiting = 0, 0
         if entries:
             present = _stack_present_sheet_count(stack)
             taken = max(0, _stack_original_sheet_count(stack) - present)
             btn.setText(f"🖐 攒批 {present}张/{stack.count}单"
-                        + (f"（已取走 {taken}）" if taken else ""))
+                        + (f"（已取走 {taken}）" if taken else "")
+                        + (f" · 🖨 打印中 {_active} · 排队 {_waiting}"
+                           if (_active or _waiting) else ""))
+            btn.setVisible(True)
+        elif _active or _waiting:
+            # 空纸叠但本机还有活：入口保留，读数就是"打印机在忙什么"
+            btn.setText(f"🖨 打印中 {_active} · 排队 {_waiting}")
             btn.setVisible(True)
         else:
             # 空纸叠不占位：列表窗是常驻的，这个入口只在真有纸压进出纸槽时才需要
@@ -11927,6 +12060,232 @@ class MainWindow(QMainWindow):
                        printing_text=self._stack_now_printing_text())
         except Exception as e:      # 定时器/半初始化环境都要能安全调用
             logger.debug(f"攒批列表刷新失败: {type(e).__name__}: {e}")
+        # 第三块「本机队列」跟着一起刷（同一份窗口、同一个 2 秒心跳；不新起定时器）
+        self._sync_local_queue()
+
+    # ── 本机队列（StackQueueDialog 第三块）：主窗口组装纯数据 → `set_local_queue` ──
+    # 口径：**队列内容只在这里组装**，对话框不摸 MainWindow 的任何状态（与
+    # `_sync_stack_button` / `StackQueueDialog.render` 同一分工）。2 秒心跳
+    # `_stack_state_tick()` 调用 `_sync_local_queue()`，内容没变时对话框内部早退不重建。
+
+    def _local_queue_source(self, jobs) -> str:
+        """这批任务的来源：预约 / 云端自动 / 本机点击（按 job 上的归属字段判定）。"""
+        jobs = list(jobs or [])
+        sched = getattr(self, "_scheduled_orders", None) or {}
+        for j in jobs:
+            try:
+                oid = int(getattr(j, "order_id", 0) or 0)
+            except Exception:
+                oid = 0
+            if oid and oid in sched:
+                return "预约"
+        for j in jobs:
+            try:
+                if int(getattr(j, "task_id", 0) or 0) > 0:
+                    return "云端自动"
+            except Exception:
+                pass
+        return "本机点击"
+
+    def _local_queue_content(self, jobs) -> str:
+        """「内容」列：单个文件给文件名，多个给「N 个文件」。"""
+        jobs = list(jobs or [])
+        if not jobs:
+            return "—"
+        if len(jobs) > 1:
+            return f"{len(jobs)} 个文件"
+        j = jobs[0]
+        name = (getattr(j, "display_name", "")
+                or os.path.basename(getattr(j, "file_path", "") or ""))
+        return name or "1 个文件"
+
+    def _local_queue_sheets(self, jobs) -> tuple:
+        """(张数, 显示文本) —— 张数走 duplex_stack 的唯一估算口径。
+
+        页数未知（云端 Word 还没分析出来 / 刚加进列表还没转完）时返回 `≈N`，
+        一个张数都算不出来时给「—」。
+        """
+        try:
+            sheets, unknown = duplex_stack.estimate_jobs_sheets(
+                list(jobs or []), _count_pages_in_range)
+        except Exception:
+            return 0, "—"
+        sheets = int(sheets or 0)
+        if sheets <= 0:
+            return 0, "—"
+        return sheets, (f"≈{sheets}" if unknown else str(sheets))
+
+    def _local_queue_speed(self) -> tuple:
+        """(启动秒, 每张纸秒) —— 与手动双面窗/闸门同一个两参数速度模型。"""
+        try:
+            prof = self._printer_profile()
+            samples = getattr(prof, "speed_samples", None)
+        except Exception:
+            samples = None
+        return fit_print_speed(samples)
+
+    def _local_queue_eta_text(self, secs: float) -> str:
+        """把「还要多少秒」折成 `03:20 · 14:32`；算不出来就给「—」。"""
+        try:
+            secs = float(secs)
+        except Exception:
+            return "—"
+        if secs <= 0:
+            return "—"
+        try:
+            when = datetime.now() + timedelta(seconds=secs)
+            return f"{format_duration(secs)} · {when.strftime('%H:%M')}"
+        except Exception:
+            return "—"
+
+    def _local_queue_rows(self) -> list:
+        """「本机队列」的全部行（纯数据，对话框只管画）。
+
+        顺序 = **进行中在前、等待中在后**（操作员先看"现在在打什么"）。数据源全是主窗口
+        自己的状态，不新开定时器、不碰对话框：
+          · 整叠第 2 趟在飞 → `_stack_flush_worker`；
+          · 在飞的批次 → `_worker`（手动双面用 `_pass_state` 区分两趟，翻纸等待算**进行中**）；
+          · 打完第 1 趟、等人工翻纸的纸叠 → `_stack.entries` + 无 worker；
+          · 等待中 → `_stack_entry_wait`（等上一单第 1 趟）/ `_stack_wait`（等纸叠打完）/
+            `_auto_print_retry`（补打）/ `_scheduled_orders`（预约未到点）。
+        """
+        rows: list = []
+        a, b = self._local_queue_speed()
+
+        def _eta_of(sheets: int) -> float:
+            return (a + b * sheets) if sheets > 0 else 0.0
+
+        # ── ① 进行中：整叠第 2 趟 ──
+        flush = getattr(self, "_stack_flush_worker", None)
+        flush_running = False
+        try:
+            flush_running = bool(flush is not None and flush.isRunning())
+        except Exception:
+            flush_running = False
+        stack = getattr(self, "_stack", None)
+        entries = list(getattr(stack, "entries", None) or [])
+        if flush_running:
+            present = _stack_present_sheet_count(stack) if entries else 0
+            rows.append({
+                "state": "第 2 趟进行中", "source": "本机点击",
+                "content": (f"整叠 {len(entries)} 单 / {present} 张纸（翻完纸打第 2 趟）"
+                            if entries else "整叠第 2 趟"),
+                "sheets": str(present) if present else "—",
+                "eta": self._local_queue_eta_text(_eta_of(present)),
+                "active": True,
+            })
+
+        # ── ② 进行中：在飞的批次（普通 / 攒批第 1 趟 / 手动双面两趟）──
+        w = getattr(self, "_worker", None)
+        worker_running = False
+        try:
+            worker_running = bool(w is not None and w.isRunning())
+        except Exception:
+            worker_running = False
+        worker_sheets = 0
+        if worker_running:
+            jobs = list(getattr(w, "_jobs", None) or [])
+            worker_sheets, sheets_text = self._local_queue_sheets(jobs)
+            pass_state = str(getattr(w, "_pass_state", "") or "")
+            if bool(getattr(w, "_stack_mode", False)):
+                state = "第 1 趟进行中（攒批）"
+            elif pass_state:
+                state = pass_state          # 第 1 趟进行中 / 等待翻纸 / 第 2 趟进行中
+            else:
+                state = "进行中"
+            rows.append({
+                "state": state, "source": self._local_queue_source(jobs),
+                "content": self._local_queue_content(jobs),
+                "sheets": sheets_text,
+                # 手动双面的「等待翻纸」要人动手，估时没有意义
+                "eta": ("—" if state == "等待翻纸"
+                        else self._local_queue_eta_text(_eta_of(worker_sheets))),
+                "active": True,
+            })
+
+        # ── ③ 进行中：第 1 趟打完、纸叠在等人工翻纸（翻纸等待态算进行中）──
+        if entries and not flush_running and not worker_running:
+            present = _stack_present_sheet_count(stack)
+            rows.append({
+                "state": "等待翻纸",
+                "source": self._local_queue_source(
+                    [j for e in entries for j in (getattr(e, "jobs", None) or [])]),
+                "content": f"整叠 {len(entries)} 单 / {present} 张纸（翻纸后打第 2 趟）",
+                "sheets": str(present) if present else "—",
+                "eta": "—",
+                "active": True,
+            })
+
+        # ── ④ 等待中：本机排队（攒批第 1 趟排队 / 等纸叠打完 / 补打 / 预约）──
+        running_secs = _eta_of(worker_sheets)
+        if flush_running:
+            running_secs += _eta_of(_stack_present_sheet_count(stack) if entries else 0)
+
+        def _add_waiting(state: str, jobs, sheets_text=None, source: str = "",
+                         content: str = "", eta_override: str = "") -> None:
+            nonlocal running_secs
+            sheets, stext = self._local_queue_sheets(jobs)
+            if sheets_text is not None:
+                stext = sheets_text
+                sheets = 0
+            running_secs += _eta_of(sheets)
+            rows.append({
+                "state": state,
+                "source": source or self._local_queue_source(jobs),
+                "content": content or self._local_queue_content(jobs),
+                "sheets": stext,
+                "eta": eta_override or self._local_queue_eta_text(running_secs),
+                "active": False,
+            })
+
+        for req in (getattr(self, "_stack_entry_wait", None) or []):
+            _add_waiting("等待中", req.get("jobs"))
+        for req in (getattr(self, "_stack_wait", None) or []):
+            _add_waiting("等待中", req.get("jobs"))
+        for item in (getattr(self, "_auto_print_retry", None) or []):
+            tids = list(item.get("task_ids") or [])
+            _add_waiting(
+                "等待中（补打）", [], sheets_text="—", source="云端自动",
+                content=(f"订单 #{item.get('order_id', '?')} · {len(tids)} 个文件"
+                         if tids else f"订单 #{item.get('order_id', '?')}"))
+        for oid, st in (getattr(self, "_scheduled_orders", None) or {}).items():
+            try:
+                if st.get("printed"):
+                    continue
+                n_files = len(st.get("ready") or {}) + len(st.get("pending") or {})
+                ts = int(st.get("target_ts") or 0)
+                eta = (datetime.fromtimestamp(ts).strftime("预约 %H:%M") if ts > 0 else "—")
+            except Exception:
+                continue
+            rows.append({
+                "state": "等待中（预约）", "source": "预约",
+                "content": f"预约单 #{oid} · {n_files} 个文件",
+                "sheets": "—", "eta": eta, "active": False,
+            })
+        return rows
+
+    def _local_queue_counts(self) -> tuple:
+        """(进行中, 等待中) —— 底栏读数与窗口可见性共用同一个口径。"""
+        try:
+            rows = self._local_queue_rows()
+        except Exception as e:
+            logger.debug(f"本机队列统计失败: {type(e).__name__}: {e}")
+            return 0, 0
+        active = sum(1 for r in rows if r.get("active"))
+        return active, len(rows) - active
+
+    def _sync_local_queue(self):
+        """把「本机队列」推给常驻窗（空 ⇒ 整块隐藏；不新建窗口）。"""
+        try:
+            rows = self._local_queue_rows()
+            dlg = getattr(self, "_stack_queue_dialog", None)
+            if dlg is None:
+                if not rows:
+                    return              # 空闲：连锁窗都不必造
+                dlg = self._ensure_stack_queue_dialog()
+            dlg.set_local_queue(rows)
+        except Exception as e:      # 定时器路径绝不能抛
+            logger.debug(f"本机队列刷新失败: {type(e).__name__}: {e}")
 
     def _sync_stack_list_visible(self):
         """攒批模式开启 ⇒ 攒批列表**常驻**（2026-10-20 用户要求）；关闭 ⇒ 收起。
@@ -11941,11 +12300,18 @@ class MainWindow(QMainWindow):
         dlg = getattr(self, "_stack_queue_dialog", None)
         mode_on = self._stack_mode_on()
         has_entries = bool(getattr(getattr(self, "_stack", None), "entries", None))
-        if not mode_on and not has_entries:
+        # 「本机队列」有内容时窗口也要在场（2026-10-30 用户要求）：自动双面机型上
+        # `_stack_applicable()` 恒 False、纸叠永远为空，攒批那一套根本不会出现 ——
+        # 可"打印机忙时第二个/第三个任务要有总体队列"恰恰主要是自动双面机的场景。
+        try:
+            has_local = bool(self._local_queue_rows())
+        except Exception:
+            has_local = False
+        if not mode_on and not has_entries and not has_local:
             if dlg is not None and dlg.isVisible():
                 dlg.hide()
             return
-        if not has_entries and not self._stack_applicable():
+        if not has_entries and not has_local and not self._stack_applicable():
             return
         dlg = self._ensure_stack_queue_dialog()
         self._refresh_stack_queue()
@@ -12470,6 +12836,47 @@ class MainWindow(QMainWindow):
             return "parked"
         return "normal"
 
+    def _pending_page_count_stats(self, flat_jobs: list) -> list:
+        """哪些文件「页数还没数出来、而且统计/转换线程正在跑」——返回它们的显示名。
+
+        判据只有两条，缺一不可：
+        ① `page_count <= 0`（页数还没写回列表）；
+        ② `self._convert_workers` 里有**同一个文件**的线程 `isRunning()`。
+
+        只看 ① 是不够的：文件损坏/加密/转换彻底失败时页数会**永远**是 0，线程早已结束。
+        那种情况下把用户永久挡在「开始打印」外面比按 0 页上报更糟（无人值守的机器会一直不出纸），
+        所以"线程还在跑"才是等待的理由 —— 它意味着几秒后页数就会出现。
+        """
+        paths, names = set(), []
+        for j in flat_jobs:
+            try:
+                if int(getattr(j, "page_count", 0) or 0) > 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            raw = str(getattr(j, "file_path", "") or "")
+            fp = os.path.normcase(os.path.abspath(raw)) if raw else ""
+            if not fp:
+                continue
+            paths.add(fp)
+            names.append((fp, getattr(j, "display_name", "") or os.path.basename(raw)))
+        if not paths:
+            return []
+        alive = set()
+        for w in list(getattr(self, "_convert_workers", None) or []):
+            try:
+                if not w.isRunning():
+                    continue
+                wraw = str(getattr(w, "_file_path", "") or "")
+                if not wraw:
+                    continue
+                wfp = os.path.normcase(os.path.abspath(wraw))
+            except (RuntimeError, TypeError, ValueError):
+                continue
+            if wfp in paths:
+                alive.add(wfp)
+        return [name for fp, name in names if fp in alive]
+
     def _start_print_worker(self, flat_jobs: list, tab_key: str | None = None,
                             stack_entry: tuple | None = None) -> bool:
         """用给定的任务列表启动打印 Worker。返回 True=已启动，False=忙/被取消。
@@ -12541,6 +12948,44 @@ class MainWindow(QMainWindow):
         # 打印批次所属标签页：默认前台；无障碍后台打印时显式指定（冻结/附加服务/回报据此定位）
         target_key = tab_key or self._current_tab
         self._printing_tab_key = target_key
+
+        # ── 页数守卫：页数还没统计完就**不许开始打印**（2026-10-30 现场 bug）─────────
+        # 现场 HN20261030-0021：Word/TXT 刚拖进列表（后台 ConvertWorker 还在转 PDF 数页数）
+        # 就点了「开始打印」⇒ 下面几步照常把标签页冻结、按钮禁用，然后用 page_count=0
+        # 算出 0 元价格、把一份**页数不全**的订单上报给云端 —— 价格卡住、云端订单也不完整。
+        # 所以停在这里：不冻结、不取号、不上报、不打，等统计线程结束再让用户点一次。
+        # 按钮此处本来就还没被禁用，显式 setEnabled(True) 只为兜住"上游分支提前禁用"的情形，
+        # 绝不能让「开始打印」永久灰掉（这台机器常常无人值守）。
+        _pending_stat = self._pending_page_count_stats(flat_jobs)
+        if _pending_stat:
+            _names = "、".join(_pending_stat[:3])
+            _more = f" 等 {len(_pending_stat)} 个文件" if len(_pending_stat) > 3 else ""
+            _msg = (f"⏳ 还有 {len(_pending_stat)} 个文件正在统计页数"
+                    f"（{_names}{_more}），统计完再点开始打印")
+            self._log(_msg)
+            try:
+                self._status_bar.showMessage(_msg, 8000)
+            except (AttributeError, RuntimeError):
+                pass
+            self._print_starting = False   # 本单没开始，别把取号标记留成脏状态
+            try:
+                self._btn_start.setEnabled(True)
+            except (AttributeError, RuntimeError):
+                pass
+            return False
+        # 页数 0 但**没有**在跑的统计线程（文件损坏 / 转换彻底失败）：页数就是数不出来。
+        # 仍然允许开打（否则这单永远打不出去），但明确告知会按 0 页计费上报 ——
+        # 只用日志 + 状态栏，不弹模态框：这台机器要能无人值守，不能被一个对话框卡住整条流程。
+        _unknown_pages = [j for j in flat_jobs
+                          if int(getattr(j, "page_count", 0) or 0) <= 0]
+        if _unknown_pages:
+            _msg = (f"⚠ 有 {len(_unknown_pages)} 个文件页数未知，将按 0 页计费上报"
+                    f"（文件可能损坏或转换失败；云端可人工订正）")
+            self._log(_msg)
+            try:
+                self._status_bar.showMessage(_msg, 8000)
+            except (AttributeError, RuntimeError):
+                pass
 
         # 立即冻结标签页 — 一旦开始打印，订单即已固定，不允许任何编辑
         tab = self._config.tabs.get(target_key)
@@ -13274,6 +13719,7 @@ class MainWindow(QMainWindow):
             "<tr><td><b>Ctrl+V</b></td><td>粘贴文件</td></tr>"
             "<tr><td><b>Ctrl+T</b> / <b>Ctrl+N</b></td><td>新建标签页</td></tr>"
             "<tr><td><b>Ctrl+W</b></td><td>关闭当前标签页（未打印的先确认）</td></tr>"
+            "<tr><td><b>Ctrl+Shift+T</b></td><td>标签页管理窗口（等同点标签页那个数字）</td></tr>"
             "<tr><td><b>←</b> / <b>→</b></td>"
             "<td>切换标签页（到两端即停，最右侧不新建；输入框里有焦点时是编辑光标）</td></tr>"
             "</table>"

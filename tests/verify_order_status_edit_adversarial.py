@@ -767,16 +767,32 @@ chk("openOrderStatusMenu 用的是同一个同源守卫（_orderStatusEditable�
 
 # 2026-10-18：F4 落地后 `!!oidS`（safeId 字母白名单）收紧为 `/^[0-9]+$/`（与后端
 # re.fullmatch(r"[0-9]+") 同源）—— 判据按**新源码形态**同步，不改回源码迁就正则。
-EDITABLE_RE = re.compile(r"function _orderStatusEditable\(oidS\) \{\s*\n\s*return "
-                         r"FINANCE_MODE !== 'local' && !!unlocked\.orderstatus && !!oidS"
-                         r"( && /\^\[0-9\]\+\$/\.test\(String\(oidS\)\))?;")
+# 2026-10-30：v7.3 把 `_orderStatusEditable` 从「单行 && 表达式」改写成「早返回 + 外部单守卫」，
+# 旧正则（要求 `return FINANCE_MODE !== 'local' && ...;` 一整行）必然失配 —— 源码是对的，
+# 是判据形态过期。改成「取函数体，三条判据都在、且都在 return true 之前」。
+def _editable_body(src):
+    i = src.find("function _orderStatusEditable(oidS) {")
+    if i < 0:
+        return ""
+    j = src.find("\n}", i)
+    return src[i:j + 2] if j > i else ""
+
+
+def _editable_ok(src):
+    b = _editable_body(src)
+    return (bool(b) and "FINANCE_MODE === 'local'" in b
+            and "unlocked.orderstatus" in b
+            and "/^[0-9]+$/.test(String(oidS))" in b
+            and b.count("return false") >= 2)
+
+
 chk("_orderStatusEditable 同时要求「非 local + 已解锁 + id 是规范十进制」",
-    EDITABLE_RE.search(html) is not None
+    _editable_ok(html)
     and "/^[0-9]+$/.test(String(oidS))" in html)
 chk("[自证] 静态变异：_orderStatusEditable 去掉 FINANCE_MODE 判据（退回只判 unlocked）→ 上式转红",
-    EDITABLE_RE.search(html.replace(
-        "return FINANCE_MODE !== 'local' && !!unlocked.orderstatus && !!oidS && /^[0-9]+$/.test(String(oidS));",
-        "return !!unlocked.orderstatus && !!oidS;")) is None)
+    not _editable_ok(html.replace(
+        "if (FINANCE_MODE === 'local' || !unlocked.orderstatus || !oidS) return false;",
+        "if (!unlocked.orderstatus || !oidS) return false;")))
 chk("local 模式锁开关不渲染（表头没有入口）",
     re.search(r"function _orderStatusLockHTML\(\) \{\s*\n\s*if \(FINANCE_MODE === 'local'\) return '';",
               html) is not None)

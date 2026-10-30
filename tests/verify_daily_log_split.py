@@ -189,7 +189,10 @@ try:
     def gui_wired(src):
         i = src.find("self._file_logger = logging.getLogger")
         chunk = src[i:i + 900]
-        return ("daily_log.make_handler(self._log_dir)" in chunk
+        # 2026-10-30 起 make_handler 多了 keep_days / on_prune（30 天保留），
+        # 所以判据只认前缀调用，不再要求右括号紧跟；但仍必须带保留参数。
+        return ("daily_log.make_handler(self._log_dir" in chunk
+                and "keep_days=" in chunk
                 and 'FileHandler(' not in chunk
                 and "local_tool.log" not in chunk)
 
@@ -221,7 +224,7 @@ try:
     check("B1 去掉「按日期换文件」（日期键恒为一固定值）→ ② 的判据必须变红",
           not os.path.isfile(os.path.join(d6, "2026-10-29.log")), str(sorted(os.listdir(d6))))
 
-    _mut_gui = gui_src.replace("daily_log.make_handler(self._log_dir)",
+    _mut_gui = gui_src.replace("daily_log.make_handler(self._log_dir",
                                'logging.FileHandler(os.path.join(self._log_dir, "local_tool.log"))')
     check("B2 gui 退回固定 local_tool.log → ⑥ 判据变红", not gui_wired(_mut_gui))
 

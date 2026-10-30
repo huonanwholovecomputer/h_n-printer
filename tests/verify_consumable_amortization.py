@@ -86,8 +86,9 @@ check("采购日之前不算这批的用量（逐日过滤）",
 check("每月金额 = 累计取整差（Σ各月恰好 = 采购价，不逐月四舍五入漂移）",
       "var cents = Math.round(lot.priceCents * cum / lot.units);" in src
       and "lot.months[mk] = { units: lot.perMonth[mk] || 0, cents: cents - prevCents, cumUnits: cum };" in src)
-check("用超库存记 uncovered（不凭空计费）",
-      "if (need > 0) self.uncovered[kind][mk] = (self.uncovered[kind][mk] || 0) + need;" in src)
+check("用超库存记 uncovered（不凭空计费；v7.10 起单机桶另记 uncoveredPrinter）",
+      "self.uncovered[kind][mk] = (self.uncovered[kind][mk] || 0) + need;" in src
+      and "uncoveredPrinter[scope] = self.uncoveredPrinter[scope] || {};" in src)
 check("calcMonth 接收 opts.amort：能摊销的整笔采购不计入本月，只合并摊销行",
       "var amort = opts.amort || null;" in src
       and "exps = exps.filter(function (e) { return !isAmortizableExpense(e); });" in src

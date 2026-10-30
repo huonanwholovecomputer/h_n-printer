@@ -79,7 +79,7 @@ check("CSS：折叠箭头 / 隐藏默认三角 / 展开分隔线",
       and ".formula-box[open] > summary { border-bottom: 1px solid var(--border);" in src)
 
 check("关于页版本号与更新日志都有 v7.3 段（版本号跟随最新，v7.3 的历史条目保留）",
-      ">v7.9</div>" in src and "v7.3：📐 结算公式说明块" in src)
+      ">v7.10</div>" in src and "v7.3：📐 结算公式说明块" in src)
 
 # ══════════════════════════════════════════════════════════════
 # B. 口径纪律：说明块里不许有第二份计算

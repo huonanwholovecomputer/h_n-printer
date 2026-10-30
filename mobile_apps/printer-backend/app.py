@@ -9335,6 +9335,21 @@ def local_orders():
                  f_info.get("page_count", 0), f_info.get("cost", 0),
                  sub_status, f_info.get("duplex", "on"), created_at, f_info.get("page_range", "")),
             )
+        # 父单 page_count 汇总（2026-10-30 修）：旧写法从不写这一列 —— 新建单走 INSERT 建表默认值
+        # （DEFAULT 1）、预留单走 UPDATE 也不带它，于是「本地打印 5 个文件」这类多文件单在结算页
+        # 明细里永远显示 1 页（现场 HN20261030-0021：实际 116 页、父单记 1 页、钱只收了 6.90）。
+        # 只在汇总值 > 0 时写：子行页数为 0（转换还没统计完就点了开始打印的脏数据）时宁可留下旧值，
+        # 也别把父单写成 0 页。单价列（price_per_page）不动 —— 本地单的钱是各子行合计，父单没有单一单价。
+        if files:
+            try:
+                _parent_pages = sum(int(f.get("page_count") or 0) for f in files)
+            except Exception:
+                _parent_pages = 0
+            if _parent_pages > 0:
+                conn.execute(
+                    "UPDATE orders SET page_count = ? WHERE id = ?",
+                    (_parent_pages, order_id),
+                )
         conn.commit()
         return jsonify({"success": True, "order_id": order_id})
     except Exception as e:
