@@ -392,6 +392,7 @@ const expSnap = await page.evaluate(() => {
       item: (tds[1] ? (tds[1].querySelector('input') || {}).value : '') || (tds[1] ? tds[1].textContent.trim() : ''),
       kind: (tds[2] ? (tds[2].querySelector('select') || {}).value : ''),
       cellText: tds[4] ? tds[4].textContent.trim() : '',
+      cellTitle: tds[4] ? ((tds[4].querySelector('.exp-qty-note') || {}).title || '') : '',
       hasSelect: !!sel,
       selValue: sel ? sel.value : null,
       opts: sel ? [...sel.options].map((o) => o.value + '=' + o.textContent.trim()) : [],
@@ -410,11 +411,13 @@ chk('C4 下拉选项 = 未指定 + 台账两台机（1020 / M232）',
     tRow.opts && tRow.opts.length === 3 && tRow.opts[0].indexOf('未指定') >= 0
     && tRow.opts.some((o) => o.indexOf('HP LaserJet 1020') >= 0)
     && tRow.opts.some((o) => o.indexOf('HP LaserJet MFP M232-M237') >= 0), JSON.stringify(tRow.opts));
-chk('C5 硒鼓格小字写明「🖨 按「M232」本月页数摊」',
-    (tRow.cellText || '').indexOf('按「HP LaserJet MFP M232-M237」本月页数摊') >= 0, tRow.cellText);
+chk('C5 硒鼓格小字结论「按这台机页数摊」，机器名口径在 title 里（整串会挤爆本格）',
+    (tRow.cellText || '').indexOf('按这台机页数摊') >= 0
+    && (tRow.cellTitle || '').indexOf('只按「HP LaserJet MFP M232-M237」本月页数摊') >= 0,
+    tRow.cellText + ' | title=' + tRow.cellTitle);
 const pRow = expSnap.rows.find((r) => r.kind === 'paper') || {};
-chk('C6 A4纸行没有下拉，显示 — 并写明「A4纸按全队用纸量摊」',
-    !pRow.hasSelect && (pRow.cellText || '').indexOf('A4纸按全队用纸量摊') >= 0, JSON.stringify(pRow));
+chk('C6 A4纸行没有下拉，显示 — 并写明「按全队用纸量摊」',
+    !pRow.hasSelect && (pRow.cellText || '').indexOf('按全队用纸量摊') >= 0, JSON.stringify(pRow));
 chk('C7 普通采购行也没有下拉', !(expSnap.rows.find((r) => r.kind === 'other') || {}).hasSelect);
 chk('C8 表格带 has-qty 类（数量/打印机格的小字绝对定位靠它留 padding）', expSnap.hasQtyClass);
 

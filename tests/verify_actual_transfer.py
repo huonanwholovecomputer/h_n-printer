@@ -155,14 +155,27 @@ check("净额改用「每人应摊」，不再用标量 perPerson",
       and "r.redist[mem.id] - r.perPerson;" not in src
       and "redist[mem.id] - perPerson -" not in src)
 check("合计行「垫付差额」改为逐行求和（不再硬编码 0 / 人均×人数）",
-      "advSum += adv;" in src and "RMB(r.perPerson * r.memberCount)" not in src)
+      # v7.11：逐行求和搬进了 calcMonth 的展示模型（view.totals.advSum = Σview.advance[].adv），
+      # 块里只读 t.advSum —— 所以断言跟着换到新的唯一出处，不再找页面里的 advSum += adv。
+      re.search(r"advSum:\s*_sumOf\(view\.advance,\s*\"adv\"\)", src) is not None
+      and "t.advSum" in src
+      and "RMB(r.perPerson * r.memberCount)" not in src)
 check("合计行「差额（未结清）」改为逐行求和（不再硬编码 0）",
-      "gapSum += gap;" in src and "signed(gapSum)" in src)
-check("perPerson 仅剩「人均」展示用途（2 处），不再参与逐人计算",
+      # 同上：gapSum 现在由 view.totals.gapSum 汇总，块里读 t.gapSum。
+      re.search(r"gapSum:\s*_sumOf\(view\.realPL,\s*\"gap\"\)", src) is not None
+      and "t.gapSum" in src
+      and "signed(0)" not in src)
+check("perPerson 仅剩「人均」展示用途（2 处），逐人分摊一律走 perPersonShare / bookPL",
       # v7.4：KPI 副行改成"分摊口径"文案后少一处；逐人分摊一律用 perPersonShare
       len(re.findall(r"r\.perPerson(?!Share)", src_count)) == 2
       and src_count.count("RMB(r.perPerson)") == 2
-      and src_count.count("r.perPersonShare") == 6)
+      # v7.11-C：逐人分摊 / 应得盈亏已经收进 calcMonth 的 view（share.share = perPersonShare、
+      # realPL[].book = bookPL），页面不再持有这两个字段 —— 断言改成钉「模型里确实是同一个量」，
+      # 而不是数页面里出现几次（数次数一改结构就假红）。
+      and re.search(r"share:\s*perPersonShare\[mem\.id\]", src) is not None
+      and re.search(r"book:\s*bookPL\[mem\.id\],\s*gap:\s*settleGap\[mem\.id\]", src) is not None
+      and "r.redist[mem.id] - r.perPersonShare[mem.id] - dep" not in src_count
+      and "r.redist[mem.id] - r.perPersonShare[mem.id]" not in src_count)
 
 # ---------- 3) 函数级行为验证 ----------
 print("\n--- calcMonth 行为（Node VM 内实测真实函数）---")

@@ -245,8 +245,8 @@ async function runScenario(mutate, withScreenshots) {
   await page.waitForTimeout(400);
   const s2 = await entryState();
   const r2 = rowByName(s2, '门禁卡');
-  chk('② 类型选 A4纸 ⇒ 立刻多出「数量」列（表头 7 列），该行出现「总张数」输入框',
-    s2 && s2.ths.indexOf('数量') >= 0 && s2.ths.length === 7
+  chk('② 类型选 A4纸 ⇒ 立刻多出「数量」「所属打印机」两列（表头 8 列），该行出现「总张数」输入框',
+    s2 && s2.ths.indexOf('数量') >= 0 && s2.ths.indexOf('所属打印机') >= 0 && s2.ths.length === 8
     && r2 && r2.tds.some((t) => t.indexOf('总张数') >= 0 || t === '填数量后按月摊销'),
     s2 ? s2.ths.join(' | ') : 'no table');
   chk('②b 「电费」是普通采购 ⇒ 数量列显示「—」（不需要填）',
@@ -452,7 +452,7 @@ const staticResults = [];
   const chk = (name, cond, detail) => staticResults.push([name, !!cond, detail === undefined ? '' : String(detail)]);
   chk('静态① 记账页「数量」列是条件渲染（hasConsumable 才多出这一列）',
     SRC.indexOf("var hasConsumable = m.expenses.some(isConsumableExpense);") >= 0
-    && SRC.indexOf("+ (hasConsumable ? '<th>数量</th>' : '')") >= 0);
+    && SRC.indexOf("+ (hasConsumable ? '<th>数量</th><th>所属打印机</th>' : '')") >= 0);
   chk('静态② 类型下拉走 updExpType（重绘列结构），数量走 updExp(units)',
     SRC.indexOf("onchange=\"updExpType(\\'' + eid + '\\',this.value)\"") >= 0
     && SRC.indexOf("onchange=\"updExp(\\'' + eid + '\\',\\'units\\',+this.value)\"") >= 0);

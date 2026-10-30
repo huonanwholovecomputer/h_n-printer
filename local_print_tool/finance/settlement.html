@@ -146,7 +146,14 @@ td.l { text-align: left; }
    每个格的内容盒一样高、所有输入框仍对齐，小字只居中挂在下面。 */
 .exp-table.has-qty td { padding-bottom: 22px; }
 .exp-qty { position: relative; }
-.exp-qty-note { position: absolute; left: 0; right: 0; bottom: 3px; text-align: center; font-size: .72rem; line-height: 1.2; white-space: nowrap; }
+/* 数量格第一行 = 输入框 + 单位（2026-10-30 现场：单位「页/张」被挤到单独一行，
+   看起来像凭空多出一个孤零零的汉字）。用不换行的 flex 行把它们绑在一起，
+   输入框收窄到 84px 让「10000 页」在本列内放得下。 */
+.exp-qty-line { display: flex; align-items: center; justify-content: center; gap: 5px; white-space: nowrap; }
+.exp-qty-line .exp-unit { font-size: .78rem; color: var(--muted); line-height: 1; }
+/* 小字只占一格：左右各让 6px + 省略号兜底，绝不跨列跑到邻居家里（长机器名曾把
+   「所属打印机」那行小字顶到「数量 / 金额」两列上）。完整文案挂在 title 里。 */
+.exp-qty-note { position: absolute; left: 6px; right: 6px; bottom: 3px; text-align: center; font-size: .72rem; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 tbody tr { transition: background .15s ease; }
 tbody tr:hover { background: var(--card-2); }
 .tfoot td { font-weight: 700; background: var(--card-2); border-top: 2px solid var(--border); }
@@ -2162,6 +2169,19 @@ function consumableAmort(purchases, usageByMonth, targetKey) {
   return res;
 }
 
+/* 真实转账（m.transfers）的合法判据 —— **唯一一份**，算钱与展示都必须走它。
+   v7.11：以前 calcMonth 的 sent/recv 排除了「自转 / 已删成员 / 0 元」，而「资金重分配」的
+   「已转」chips 却把任何 from→to 匹配的记录都累加 ⇒ 同一笔转账两处显示不同数。
+   规则：收付双方都还在成员名单、不是自己转给自己、金额非 0 分。 */
+function _validTransfers(m) {
+  var known = {};
+  getMembers().forEach(function (mem) { known[mem.id] = true; });
+  return ((m && m.transfers) || []).filter(function (t) {
+    if (!t || !known[t.from] || !known[t.to] || t.from === t.to) return false;
+    return parseCents(t.amount) !== 0;
+  });
+}
+
 /* opts.usage（v7.4，可选）—— 该结算月的「实际出纸页数」统计，由 _usageForMonth() 产出：
      { pages, pagesByMember:{mid:n}, pagesByMemberClient:{'mid|client_id':n},
        pagesByClient:{client_id:n} }
@@ -2420,10 +2440,9 @@ function calcMonth(m, opts) {
   var sent = {}, recv = {};
   members.forEach(function (m) { sent[m.id] = 0; recv[m.id] = 0; });
   var transferTotal = 0;
-  (m.transfers || []).forEach(function (t) {
-    if (!known[t.from] || !known[t.to] || t.from === t.to) return;
+  /* v7.11：合法性判据抽到 _validTransfers()，与「资金重分配」的「已转」chips 共用 */
+  _validTransfers(m).forEach(function (t) {
     var amt = parseCents(t.amount);
-    if (amt === 0) return;
     sent[t.from] += amt;
     recv[t.to] += amt;
     transferTotal += amt;
@@ -2444,6 +2463,94 @@ function calcMonth(m, opts) {
     settleGap[mem.id] = net[mem.id] - actualNet[mem.id];   // 正=仍应收，负=已超付
   });
 
+  /* ── v7.11-C：展示模型 view（页面零重算的唯一出处） ────────────────────────
+     下面这几组行，以前是 6 个块各自把同一批中间量再拼一遍（应摊 / 折旧 / 损耗费 /
+     代收 / 实收实付），于是「同一笔钱算两遍」——A 组修掉的 6 条矛盾全是这么来的。
+     现在统一在这里算一次，块函数只负责排版；给某块加一列，先在这里加字段。
+     两条不变量（tests/verify_settlement_invariants.mjs 钉住）：
+       · view.redist[i].transfer === view.redist[i].sumCheck === net[i]
+       · view.totals.* === 各块逐行之和                                        */
+  var _vi = function (id) { return parseCents(inc[id] || 0); };
+  var _wTotal = 0;
+  members.forEach(function (mem) { _wTotal += (useUsage ? (usagePages[mem.id] || 0) : 1); });
+  var view = {
+    share: members.map(function (mem) {
+      var w = useUsage ? (usagePages[mem.id] || 0) : 1;
+      return { id: mem.id, weight: w, pages: useUsage ? (usagePages[mem.id] || 0) : 0,
+               ratio: _wTotal > 0 ? w / _wTotal : 0,
+               share: perPersonShare[mem.id] };
+    }),
+    income: members.map(function (mem) {
+      var col = _vi(mem.id);
+      return { id: mem.id, invest: investReturn[mem.id] || 0, score: scoreTotals[mem.id] || 0,
+               svcRatio: totalScore > 0 ? ((scoreTotals[mem.id] || 0) / totalScore) : (memberCount > 0 ? 1 / memberCount : 0),
+               svc: serviceReturn[mem.id] || 0, redist: redist[mem.id],
+               collected: col, diff: redist[mem.id] - col };
+    }),
+    pl: members.map(function (mem) {
+      return { id: mem.id, redist: redist[mem.id], share: perPersonShare[mem.id],
+               dep: depByMember[mem.id] || 0, wear: wearNet[mem.id] || 0, pl: bookPL[mem.id] };
+    }),
+    advance: members.map(function (mem) {
+      var pd = paid[mem.id] || 0;
+      return { id: mem.id, paid: pd, share: perPersonShare[mem.id], adv: pd - perPersonShare[mem.id] };
+    }),
+    redist: members.map(function (mem) {
+      var incomeAdj = redist[mem.id] - _vi(mem.id);
+      var adv = (paid[mem.id] || 0) - perPersonShare[mem.id];
+      var wear = wearNet[mem.id] || 0;
+      /* transfer 直接取 net（应得 − 应摊 − 代收 + 垫付 + 损耗费），不再现场把三列相加：
+         sumCheck 是同一笔钱按三列重算出来的值，与 transfer 恒等 —— 自证的锚点。 */
+      return { id: mem.id, incomeAdj: incomeAdj, adv: adv, wear: wear,
+               transfer: net[mem.id], sumCheck: incomeAdj + adv + wear };
+    }),
+    realPL: members.map(function (mem) {
+      return { id: mem.id, collected: _vi(mem.id), recv: recv[mem.id] || 0,
+               paid: paid[mem.id] || 0, sent: sent[mem.id] || 0,
+               dep: depByMember[mem.id] || 0, actual: actualPL[mem.id],
+               book: bookPL[mem.id], gap: settleGap[mem.id] };
+    })
+  };
+  /* 团队合计：所有「合计」行只许读这里（块里不再各自 reduce 一遍） */
+  var _sumOf = function (arr, key) {
+    var s = 0;
+    arr.forEach(function (row) { s += (row[key] || 0); });
+    return s;
+  };
+  view.totals = {
+    totalExp: totalExp, totalInc: totalInc,
+    depTotal: depTotal || 0, wearTotal: wearTotal || 0,
+    wearSum: _sumOf(view.pl, "wear"),
+    totalPL: _sumOf(view.pl, "pl"),
+    totalActual: _sumOf(view.realPL, "actual"),
+    shareTotal: _sumOf(view.share, "share"),
+    advSum: _sumOf(view.advance, "adv"),
+    gapSum: _sumOf(view.realPL, "gap"),
+    transferTotal: transferTotal,
+    investPool: investPool, servicePool: servicePool,
+    redistTotal: _sumOf(view.income, "redist"),
+    scoreTotal: totalScore, weightTotal: _wTotal,
+    pagesTotal: useUsage ? usageTotal : memberCount
+  };
+  /* 口径状态：只说「这次算的是不是临时口径」，页面据此写一句人话（不参与任何金额计算） */
+  var _uncovKeys = 0;
+  if (amort && amort.uncoveredPrinter) {
+    Object.keys(amort.uncoveredPrinter).forEach(function (pid) {
+      var byMonth = amort.uncoveredPrinter[pid] || {};
+      var n = byMonth[m.key] != null ? byMonth[m.key] : 0;
+      if (n > 0) _uncovKeys++;
+    });
+  }
+  view.caliber = {
+    basis: basis, useUsage: useUsage, basisFallback: basisFallback,
+    depUnallocated: depUnallocated || 0,
+    depPagesUnattributed: depPagesUnattributed || 0,
+    pagesUnregisteredPrinter: pagesUnregisteredPrinter,
+    orphanPayerExp: orphanPayerExp || 0,
+    amortState: amort ? (amort.state || "ready") : "none",
+    amortUncovered: _uncovKeys
+  };
+
   return { rate: rate, totalExp: totalExp, perPerson: perPerson, perPersonShare: perPersonShare,
            totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
            paid: paid, orphanPayerExp: orphanPayerExp, investPool: investPool, servicePool: servicePool, investReturn: investReturn, serviceReturn: serviceReturn,
@@ -2461,7 +2568,8 @@ function calcMonth(m, opts) {
            usage: usage,
             /* v7.9：本月采购的「计费行」（普通采购 + 耗材摊销，不含能摊销的整笔耗材采购）
                与耗材摊销明细（rows / lots / byBuyer）。页面只展示，不再另算一份。 */
-            expenses: exps, amort: amort };
+            expenses: exps, amort: amort,
+            view: view };
 }
 
 /* ==================== 保存 ==================== */
@@ -5414,6 +5522,27 @@ function _filePagesOf(f) {
   if (!(n >= 0)) n = (+f.effective_pages || +f.page_count || 0) * (+f.copies || 1);
   return Math.max(0, Math.round(n || 0));
 }
+/* v7.11（B1）：**一张订单「正常用量」页数/张数的唯一出处**。
+   以前「结算用量统计」(_usageFromOrders) 与「打印机折旧」tab 的逐单表各写一遍
+   「父订单状态过滤 + 只认 sent 子文件 + 累页/累纸」的循环，改一处就漂一处
+   （v7.11 前后者漏了 NORMAL_EXCLUDED_STATUSES，同一单两处页数不等）。
+   返回：
+     · pages / sheets —— 只累「子文件 status === 'sent'」的页数与张数；
+     · files          —— 参与计数的 sent 子文件个数；
+     · excluded       —— 父订单状态落在 NORMAL_EXCLUDED_STATUSES 里 ⇒ 正常用量口径一律不计。
+   ⚠ 废纸（WASTE_PAPER_STATUSES 的未 sent 子文件）不在这里算：它的判据是另一套，
+     且必须在 `excluded` 早退**之前**算完，留在调用处。 */
+function _orderNormalUsage(o) {
+  var pages = 0, sheets = 0, files = 0;
+  ((o && o.files) || []).forEach(function (f) {
+    if ((f.status || '') !== 'sent') return;   // 只算真正打出来的子任务
+    pages += _filePagesOf(f);
+    sheets += _fileSheets(f);                  // v7.9：纸张张数（A4纸摊销用）
+    files++;
+  });
+  return { pages: pages, sheets: sheets, files: files,
+           excluded: !!NORMAL_EXCLUDED_STATUSES[String((o && o.status) || '')] };
+}
 /* 订单数组 → 用量结构。打印机的归属统一走 printerForOrder()（绑定设备 → 已知机型 → 单机兜底），
    认不出机器的页记入 unmatchedPrinterPages（不产生折旧，页面上显式提示）。 */
 function _usageFromOrders(orders) {
@@ -5423,7 +5552,7 @@ function _usageFromOrders(orders) {
     var mid = mk.indexOf('member:') === 0 ? mk.slice(7) : '';
     var cid = String(o.received_client || '');
     var ost = String(o.status || '');
-    var pages = 0, sheets = 0, nf = 0, waste = 0;
+    var waste = 0;
     /* v7.10 废纸预估：父订单是「没产出纸」的终态时，没打出来的子任务按「本该用掉的纸」计。
        判据刻意挂在**父订单终态**上（用户口语的「失败订单」），不认单个子任务失败 ——
        一单里部分文件成功、部分失败时，成功那部分的纸是真出来了（已计在正常用量里），
@@ -5434,12 +5563,9 @@ function _usageFromOrders(orders) {
         waste += _fileSheets(f);
       });
     }
-    (o.files || []).forEach(function (f) {
-      if ((f.status || '') !== 'sent') return;   // 只算真正打出来的子任务
-      pages += _filePagesOf(f);
-      sheets += _fileSheets(f);                 // v7.9：纸张张数（A4纸摊销用）
-      nf++;
-    });
+    /* v7.11（B1）：正常用量的页/张/文件数只从 _orderNormalUsage 拿 —— 与「打印机折旧」tab 同一份判据 */
+    var nu = _orderNormalUsage(o);
+    var pages = nu.pages, sheets = nu.sheets, nf = nu.files;
     /* ⚠ 废纸必须在下面 `if (!pages && !sheets) return;` 之前算完：取消单通常一个 sent 文件都没有 */
     if (waste > 0) {
       u.waste += waste;
@@ -5448,7 +5574,7 @@ function _usageFromOrders(orders) {
       else u.wasteUnattributed += waste;
     }
     /* 多取回来的终态单不参与正常用量（见 NORMAL_EXCLUDED_STATUSES 的注释：旧口径零回归） */
-    if (NORMAL_EXCLUDED_STATUSES[ost]) return;
+    if (nu.excluded) return;
     if (!pages && !sheets) return;
     u.pages += pages; u.sheets += sheets; u.files += nf; u.orders += 1;
     /* v7.9：逐日用量（采购月份中途买入的耗材只吃购买日之后的用量） */
@@ -5771,7 +5897,10 @@ function paperStatsSectionHTML(r, m) {
       + fmtInt(orphanWaste) + ' 张</td><td>正常 ' + fmtInt(orphanNormal) + ' + 废 ' + fmtInt(orphanWaste) + ' 张</td>'
       + '<td><span class="tag y">摊不到人</span></td></tr>';
     tw += orphanWaste;
-    /* 未归属的正常用纸不进 tw；合计行的「正常」列只统计成员名下 */
+    /* v7.11：未归属的正常用纸（删过成员 / 订单没绑成员）也必须进合计 —— 合计行的定义是
+       「本月计入用纸量」（= u.sheets，A4 纸摊销按它算），而 u.sheets 里本来就含这部分；
+       旧写法只在灰行显示、不进合计 ⇒ 合计 < 实际计入量，和摊销口径对不上。 */
+    tn += orphanNormal;
   }
   h += '<tr class="tfoot"><td>合计</td><td>' + fmtInt(tn) + ' 张</td><td>' + fmtInt(tw) + ' 张</td><td>正常 '
     + fmtInt(tn) + ' + 废 ' + fmtInt(tw) + ' 张</td><td></td></tr>';
@@ -5960,23 +6089,189 @@ function renderDash() {
   // KPI（data-count 为整数分，countUp 显示时 ÷100）
   /* 本月盈亏（团队）= Σ(应得收入 − 采购应摊 − 设备折旧)。折旧是非现金成本，必须在这里扣掉，
      否则"赚了多少"会虚高（打印机越用越旧，那部分价值是实打实消耗掉的）。 */
-  var totalPL = 0;
-  getMembers().forEach(function (mem) { totalPL += (r.bookPL[mem.id] || 0); });
+  var totalPL = r.view.totals.totalPL;   /* v7.11-C：团队合计也只许从 view 读 */
   var basisLabel = r.useUsage
     ? ('按用量分摊 · 共 ' + r.usageTotal + ' 页')
     : (r.basis === 'usage' ? '均摊（未取到用量）' : ('均摊 · ' + r.memberCount + ' 人'));
   /* v7.9：采购支出里含多少「长期耗材本月摊销」—— 购买月不再整笔计入，这一行让人一眼对上 */
   var amortSub = (r.amort && r.amort.totalCents > 0) ? (' · 含耗材摊销 ' + RMB(r.amort.totalCents)) : '';
+  /* v7.11-C：本月结论卡放在最前面 —— 先给「多少钱 / 谁给谁 / 为什么 / 还差多少」，
+     再往下才是可以逐项核对的明细（明细块的数字全部来自同一个 view）。 */
+  var ustate = usageStateOfMonth(currentKey);
+  h += '<div id="dashVerdict">' + dashVerdictHTML(m, r, ustate) + '</div>';
+
+  h += dashKpiHTML(r, totalPL, basisLabel, amortSub);
+
+  /* 用量统计状态条：没取到就明说（绝不假装 0 页 —— 那会把折旧静默变成 ¥0、把按用量
+     静默退回均摊，账面看着"正常"其实错了） */
+  h += dashBannerHTML(r, m, ustate);
+
+  h += dashExpenseHTML(r, basisLabel);
+
+  h += dashShareHTML(r);
+
+  /* ── v7.10：用纸统计（正常出纸 + 废纸，可编辑） ─────────────────── */
+  h += paperStatsSectionHTML(r, m);
+
+  /* ── v7.9：长期耗材摊销（A4纸 / 硒鼓） ─────────────────────────── */
+  h += consumableAmortSectionHTML(r, m);
+
+  h += dashDepHTML(r);
+
+  h += dashIncomeHTML(r);
+
+  h += dashPLHTML(r);
+
+  h += dashAdvanceHTML(r);
+
+  /* 📐 结算公式（只展示，v7.3）—— 放在「资金重分配」之前：先讲清算式，再看具体的转账指令。
+     默认收起（open=false）：日常看数时它只占一行，不挤占 KPI 与表格的视线。 */
+  h += '<div id="dashFormula">' + settleFormulaHTML(r, false) + '</div>';
+
+  h += dashRedistHTML(r);
+
+  /* 「实际转账」整块的禁用态：只有转账模块解锁后才能改（块函数只负责渲染） */
+  var dT = unlocked.transfer ? '' : ' disabled';
+  h += dashTransferHTML(m, r, dT);
+
+  /* ── 实际盈亏（现金口径） ── */
+  h += '<div id="dashRealPL">' + realPLSectionHTML(r) + '</div>';
+
+  el.innerHTML = h;
+  // KPI 数字滚动
+  $$('#tab-dash .num[data-count]').forEach(function (node) {
+    var target = parseFloat(node.getAttribute('data-count'));  // 整数分
+    var prefix = node.getAttribute('data-prefix') || '';
+    countUp(node, target, { dec: 2, fmt: function (n) { return prefix + (n / 100).toFixed(2); } });
+  });
+  playSettledEntrance(ustate, r.amort ? r.amort.state : 'none');
+}
+
+/* v7.11（B3）：收支清算「KPI 四卡」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+/* ══════════════════════════════════════════════════════════════════════════
+   v7.11-C：本月结论卡 —— 用户真正想知道的三件事，一屏说完
+     ① 这个月团队到底赚了/亏了多少（账面口径，已扣折旧）
+     ② 谁该给谁多少钱、还差多少（直接读建议转账 + 合法实转，不另算）
+     ③ 为什么是这个数、这一屏的数字按什么口径算（临时口径必须自曝）
+   所有数字来自 calcMonth 的 r.view；本函数只排版，不参与任何计算。
+   ══════════════════════════════════════════════════════════════════════════ */
+function dashVerdictHTML(m, r, ustate) {
+  var v = (r && r.view) || null;
+  if (!v) return '';
+  var t = v.totals, cal = v.caliber;
+  var h = '<div class="section" id="dashVerdictCard">';
+  h += '<h2>🧭 本月结论 <span class="hint">（先看结论：多少钱 · 谁给谁 · 为什么 · 还差多少）</span></h2>';
+
+  /* ① 一句话：赚亏多少 */
+  var plTxt = t.totalPL >= 0
+    ? '本月团队净赚 <b class="pos">+' + RMB(t.totalPL) + '</b>'
+    : '本月团队净亏 <b class="neg">' + RMB(-t.totalPL) + '</b>';
+  h += '<div style="font-size:1.02rem;line-height:1.75;margin:2px 0 8px">' + plTxt
+    + '（账面口径）：代收 <b>' + RMB(t.totalInc) + '</b> − 采购 <b>' + RMB(t.totalExp) + '</b>'
+    + ' − 折旧 <b>' + RMB(t.depTotal) + '</b>'
+    + (t.wearSum !== 0 ? '；另有损耗费在成员之间互相补偿 ' + RMB(t.wearSum) + '（合计 0，不影响团队）' : '')
+    + '。</div>';
+
+  /* ② 该谁给谁：建议转账逐条对照「实际已经转了多少」 */
+  var _vt = _validTransfers(m);
+  /* 同一对（付款人→收款人）可能有多笔建议（如「结算转账」+「损耗费」），而实际转账只记了「谁给谁多少钱」，
+     没有分到具体哪一笔。所以**按对汇总后再逐笔冲抵**：先冲第一笔，冲不完的留到下一笔。
+     不能每笔各自减一遍全额（那样同一笔钱会被抵扣两次，「还差」合计会凭空变小）。
+     tt.amount 已是「分」（calcMonth 统一下来的），只有人工录入的 x.amount 才是「元」字符串。 */
+  var _pairDone = {};
+  _vt.forEach(function (x) { var k = x.from + '|' + x.to; _pairDone[k] = (_pairDone[k] || 0) + parseCents(x.amount); });
+  var rows = (r.transfers || []).map(function (tt) {
+    var k = tt.from + '|' + tt.to;
+    var pool = _pairDone[k] || 0;
+    var amt = tt.amount || 0;
+    var used = Math.min(pool, amt);
+    _pairDone[k] = pool - used;
+    return { t: tt, done: used, left: amt - used };
+  });
+  var leftSum = 0, openCnt = 0;
+  rows.forEach(function (x) { if (x.left > 1) { leftSum += x.left; openCnt++; } });
+  h += '<div style="font-weight:700;margin:10px 0 6px">该谁给谁</div>';
+  if (!rows.length) {
+    h += '<div style="color:var(--muted);font-size:.9rem">✅ 账面完全平衡，本月不需要转账。</div>';
+  } else {
+    rows.slice(0, 4).forEach(function (x) {
+      var tag = x.left > 1
+        ? '<span class="tag y">还差 ' + RMB(x.left) + '</span>'
+        : '<span class="tag g">已结清</span>';
+      h += '<div style="font-size:.9rem;line-height:1.95">'
+        + '<span class="member-tag" style="background:' + sanitizeColor(MC(x.t.from)) + '">' + esc(MN(x.t.from)) + '</span>'
+        + ' <span class="arrow">→</span> '
+        + '<span class="member-tag" style="background:' + sanitizeColor(MC(x.t.to)) + '">' + esc(MN(x.t.to)) + '</span> '
+        + '<b>' + RMB(x.t.amount) + '</b> '        /* 建议转账的 amount 已是「分」，别再 parseCents */
+        + (x.t.kind === 'wear' ? '<span class="tag p">损耗费</span> ' : '')
+        + tag + '</div>';
+    });
+    if (rows.length > 4) {
+      h += '<div style="color:var(--muted);font-size:.84rem">还有 ' + (rows.length - 4) + ' 笔（见下方「实际转账」）</div>';
+    }
+    h += '<div style="font-size:.88rem;margin-top:2px">共 ' + rows.length + ' 笔，已结清 ' + (rows.length - openCnt) + ' 笔'
+      + (openCnt
+          ? '，<b class="neg">还差 ' + RMB(leftSum) + '</b>（' + openCnt + ' 笔没到位）'
+          : '，<b class="pos">全部到位</b>')
+      + '。</div>';
+  }
+
+  /* ③ 为什么是这个数 */
+  h += '<div style="font-weight:700;margin:12px 0 4px">为什么是这个数</div>';
+  h += '<ul style="margin:0 0 6px 18px;padding:0;font-size:.88rem;line-height:1.85">';
+  h += '<li>采购 ' + RMB(t.totalExp) + '：' + (cal.useUsage
+      ? '按<b>用量</b>摊 —— 本月共 ' + fmtInt(r.usageTotal) + ' 页，各人只出自己的页数比例'
+      : '按<b>人头</b>均摊 —— ' + r.memberCount + ' 人平分，打多打少不影响')
+    + (cal.basisFallback ? '；<span class="pos">⚠ 本月用量为 0 页，已临时回退均摊</span>' : '') + '。</li>';
+  h += '<li>折旧 ' + RMB(t.depTotal) + '：' + (t.depTotal > 0
+      ? (r.depByPrinter || []).length + ' 台在役机器按本月页数计提（<b>非现金成本</b>：机器钱没进采购账，所以扣盈亏但不进转账）'
+      : '本月没有需要计提的在役机器') + '。</li>';
+  if (t.wearTotal > 0) {
+    h += '<li>损耗费 ' + RMB(t.wearTotal) + '：共同出资的机器只按「谁用得多」在成员之间互相补偿，团队不重复承担这笔成本。</li>';
+  }
+  h += '</ul>';
+
+  /* ④ 当前口径：把所有降级/异常摊开说，别让人以为是准的 */
+  var badges = [];
+  badges.push(cal.useUsage ? '<span class="tag g">按用量分摊</span>' : '<span class="tag b">按人头均摊</span>');
+  if (ustate === 'loading' || ustate === 'idle') badges.push('<span class="tag y">用量统计中</span>');
+  else if (ustate === 'failed') badges.push('<span class="tag y">用量取不到 · 折旧按 ¥0</span>');
+  if (cal.basisFallback) badges.push('<span class="tag y">用量 0 · 已回退均摊</span>');
+  if (cal.amortState === 'loading') badges.push('<span class="tag y">耗材摊销统计中 · 暂按整笔</span>');
+  else if (cal.amortState === 'failed') badges.push('<span class="tag y">耗材摊销失败 · 暂按整笔</span>');
+  else if (cal.amortState === 'ready') badges.push('<span class="tag g">耗材摊销已就绪</span>');
+  if (cal.amortUncovered > 0) badges.push('<span class="tag y">' + cal.amortUncovered + ' 台机硒鼓没库存可摊</span>');
+  if (cal.depUnallocated > 0) badges.push('<span class="tag y">折旧 ' + RMB(cal.depUnallocated) + ' 无主</span>');
+  if (cal.depPagesUnattributed > 0) badges.push('<span class="tag y">' + fmtInt(cal.depPagesUnattributed) + ' 页归属不到成员</span>');
+  if (cal.pagesUnregisteredPrinter > 0) badges.push('<span class="tag y">' + fmtInt(cal.pagesUnregisteredPrinter) + ' 页台账没这台机</span>');
+  if (cal.orphanPayerExp > 0) badges.push('<span class="tag y">' + RMB(cal.orphanPayerExp) + ' 是已删成员垫付</span>');
+  var degraded = badges.join('').indexOf('tag y') >= 0;
+  h += '<div style="font-size:.86rem;line-height:1.95">当前口径：' + badges.join(' ')
+    + (degraded
+        ? '<div style="margin-top:2px;color:var(--orange)">⚠ 这是<b>临时口径</b>：带黄色标签的那几项没算准（多为用量/摊销还没取回来），看金额时请把它们的影响扣掉。</div>'
+        : '<span style="color:var(--muted)">（各项都已取到，金额是准的）</span>')
+    + '</div>';
+  h += '</div>';
+  return h;
+}
+function dashKpiHTML(r, totalPL, basisLabel, amortSub) {
+  var h = '';
   h += '<div class="kpi-grid">';
   h += '<div class="kpi-card c-blue"><div class="kpi-ico">🧾</div><div class="num" data-count="' + r.totalExp + '" data-prefix="¥">0</div><div class="lbl">采购支出</div><div class="sub">' + basisLabel + amortSub + '</div></div>';
   h += '<div class="kpi-card c-green"><div class="kpi-ico">💵</div><div class="num" data-count="' + r.totalInc + '" data-prefix="¥">0</div><div class="lbl">代收总额</div><div class="sub">' + r.memberCount + ' 人均摊投资回报</div></div>';
   h += '<div class="kpi-card ' + (totalPL >= 0 ? 'c-green' : 'c-red') + '"><div class="kpi-ico">📈</div><div class="num" data-count="' + totalPL + '" data-prefix="¥">0</div><div class="lbl">本月盈亏</div><div class="sub">' + (totalPL >= 0 ? '盈利' : '亏损') + (r.depTotal > 0 ? ' · 已扣折旧 ' + RMB(r.depTotal) : '') + '</div></div>';
   h += '<div class="kpi-card c-orange"><div class="kpi-ico">⭐</div><div class="num">' + r.totalScore + '</div><div class="lbl">服务总分</div><div class="sub">上限 ' + r.scoreCap + ' 分/项</div></div>';
   h += '</div>';
+  return h;
+}
 
-  /* 用量统计状态条：没取到就明说（绝不假装 0 页 —— 那会把折旧静默变成 ¥0、把按用量
-     静默退回均摊，账面看着"正常"其实错了） */
-  var ustate = usageStateOfMonth(currentKey);
+/* v7.11（B3）：收支清算「用量 / 耗材取数状态条」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashBannerHTML(r, m, ustate) {
+  var h = '';
   if (ustate === 'loading') {
     h += '<div class="alert-banner"><span class="msg"><span class="loading-spin"></span>正在统计「' + m.label + '」的实际出纸页数（用量）—— 按用量分摊与设备折旧随后自动刷新。</span></div>';
   } else if (ustate === 'failed') {
@@ -5996,7 +6291,14 @@ function renderDash() {
     h += '<div class="alert-banner" style="border-left-color:var(--neg)"><span class="msg">⚠️ 未取到长期耗材的用量：本月长期耗材<b>暂按整笔采购计入</b>（不会静默少记），重试成功后自动改为按月摊销。'
       + '<span class="sub">在取数成功前，先别「一键填入建议转账」。</span></span><button class="btn sm" onclick="retryAmortUsage()">重试</button></div>';
   }
+  return h;
+}
 
+/* v7.11（B3）：收支清算「采购明细」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashExpenseHTML(r, basisLabel) {
+  var h = '';
   // 采购明细（v7.4：分摊口径 = 均摊 / 按用量，比例与应摊额单列一张表；v7.9：含耗材本月摊销）
   h += '<div class="section"><h2>🧾 采购明细 <span class="hint">(' + esc(basisLabel) + ')</span></h2><div class="table-wrap"><table><thead><tr><th class="l">项目</th><th>金额</th><th>代付人</th></tr></thead><tbody>';
   var _expMemberSet = {};
@@ -6019,21 +6321,26 @@ function renderDash() {
   }
   h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalExp) + '</td><td>' + (r.useUsage ? '按用量比例' : '人均 ' + RMB(r.perPerson)) + '</td></tr>';
   h += '</tbody></table></div>';
+  return h;
+}
 
-  /* 采购分摊明细：谁该出多少（按用量时给出 用量 / 占比；均摊时给出 1/n） */
+/* v7.11（B3）：收支清算「按用量 / 人头分摊到人」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashShareHTML(r) {
+  var h = '';
+  /* v7.11-C：行数据全部来自 calcMonth 的 view.share（权重 / 占比 / 应摊同一处算好），
+     本函数只排版 —— 不再自己 Σ 权重、不再自己除比例。 */
+  var v = r.view;
   h += '<div style="font-weight:700;margin:16px 0 8px">按' + (r.useUsage ? '用量' : '人头') + '分摊到人</div>';
   h += '<div class="table-wrap"><table><thead><tr><th></th><th>本月出纸页数</th><th>分摊比例</th><th>应摊采购</th></tr></thead><tbody>';
-  var _mw = 0;
-  getMembers().forEach(function (mem) { _mw += (r.useUsage ? (r.usagePages[mem.id] || 0) : 1); });
-  getMembers().forEach(function (mem) {
-    var w = r.useUsage ? (r.usagePages[mem.id] || 0) : 1;
-    var ratio = _mw > 0 ? (w / _mw * 100) : 0;
-    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
-    h += '<td>' + (r.useUsage ? (r.usagePages[mem.id] || 0) + ' 页' : '<span style="color:var(--muted)">—</span>') + '</td>';
-    h += '<td>' + ratio.toFixed(1) + '%</td>';
-    h += '<td class="neg" style="font-weight:700">' + RMBneg(r.perPersonShare[mem.id]) + '</td></tr>';
+  v.share.forEach(function (row) {
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(row.id)) + '">' + esc(MN(row.id)) + '</td>';
+    h += '<td>' + (r.useUsage ? row.pages + ' 页' : '<span style="color:var(--muted)">—</span>') + '</td>';
+    h += '<td>' + (row.ratio * 100).toFixed(1) + '%</td>';
+    h += '<td class="neg" style="font-weight:700">' + RMBneg(row.share) + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>' + (r.useUsage ? r.usageTotal + ' 页' : '—') + '</td><td>100%</td><td>−' + RMB(r.totalExp) + '</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + (r.useUsage ? r.usageTotal + ' 页' : '—') + '</td><td>100%</td><td>−' + RMB(v.totals.totalExp) + '</td></tr>';
   h += '</tbody></table></div>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
     + (r.useUsage
@@ -6041,13 +6348,14 @@ function renderDash() {
         : '当前为均摊口径。想按各人实际用纸比例出钱 → 「设置 → 采购分摊」切成<b>按用量</b>。')
     + (r.usage && r.usage.unattributedPages > 0 ? ' 另有 <b>' + r.usage.unattributedPages + ' 页</b>未归属成员（订单没绑定到成员），未计入任何人的用量。' : '')
     + '</div></div>';
+  return h;
+}
 
-  /* ── v7.10：用纸统计（正常出纸 + 废纸，可编辑） ─────────────────── */
-  h += paperStatsSectionHTML(r, m);
-
-  /* ── v7.9：长期耗材摊销（A4纸 / 硒鼓） ─────────────────────────── */
-  h += consumableAmortSectionHTML(r, m);
-
+/* v7.11（B3）：收支清算「设备折旧」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashDepHTML(r) {
+  var h = '';
   /* ── v7.4：设备折旧（消耗品寿命成本） ─────────────────────────────
      每台机「本月它打的页数 × 每页成本（价格 ÷ 寿命页数）」= 本月折旧；
      折旧按成员在这台机上的页数分摊（整数分、Σ分摊 ≡ 该机折旧）。 */
@@ -6104,114 +6412,133 @@ function renderDash() {
       + (r.pagesUnregisteredPrinter > 0 ? '<br>⚠ 有 <b>' + r.pagesUnregisteredPrinter + ' 页</b>认不出是哪台机打的（订单未指定打印机），未计提。' : '')
       + '</div></div>';
   }
+  return h;
+}
 
-  // 收入分配
+/* v7.11（B3）：收支清算「收入分配」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashIncomeHTML(r) {
+  var h = '';
+  // 收入分配（v7.11-C：逐行取 view.income，合计取 view.totals）
+  var v = r.view, t = v.totals;
   var rpct = (r.rate * 100).toFixed(1);
   var spct = ((1 - r.rate) * 100).toFixed(1);
   h += '<div class="section"><h2>💵 收入分配 <span class="hint">投资均分 <b>' + rpct + '%</b> | 服务按分 ' + spct + '% | 上限 ' + r.scoreCap + ' 分</span></h2>';
   h += '<div class="table-wrap"><table><thead><tr><th></th><th>投资回报<br>（均分）</th><th>服务得分</th><th>服务占比</th><th>服务回报</th><th>应得收入</th><th>实际代收</th><th>差额</th></tr></thead><tbody>';
-  getMembers().forEach(function (mem) {
-    var svcRatio = r.totalScore > 0 ? r.scoreTotals[mem.id] / r.totalScore : 1 / r.memberCount;
-    var diff = r.redist[mem.id] - parseCents((m.income || {})[mem.id] || 0);
+  v.income.forEach(function (row) {
     h += '<tr>';
-    h += '<td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
-    h += '<td>' + RMB(r.investReturn[mem.id]) + '</td>';
-    h += '<td>' + (r.scoreTotals[mem.id] || 0) + '</td>';
-    h += '<td>' + (svcRatio * 100).toFixed(1) + '%</td>';
-    h += '<td>' + RMB(r.serviceReturn[mem.id]) + '</td>';
-    h += '<td style="font-weight:700">' + RMB(r.redist[mem.id]) + '</td>';
-    h += '<td>' + RMB(parseCents((m.income || {})[mem.id] || 0)) + '</td>';
-    h += '<td class="' + (diff >= 0 ? 'pos' : 'neg') + '">' + (diff >= 0 ? '+' : '') + RMB(diff) + '</td>';
+    h += '<td style="font-weight:700;color:' + sanitizeColor(MC(row.id)) + '">' + esc(MN(row.id)) + '</td>';
+    h += '<td>' + RMB(row.invest) + '</td>';
+    h += '<td>' + (row.score || 0) + '</td>';
+    h += '<td>' + (row.svcRatio * 100).toFixed(1) + '%</td>';
+    h += '<td>' + RMB(row.svc) + '</td>';
+    h += '<td style="font-weight:700">' + RMB(row.redist) + '</td>';
+    h += '<td>' + RMB(row.collected) + '</td>';
+    h += '<td class="' + (row.diff >= 0 ? 'pos' : 'neg') + '">' + (row.diff >= 0 ? '+' : '') + RMB(row.diff) + '</td>';
     h += '</tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.investPool) + '</td><td>' + r.totalScore + '</td><td>100%</td><td>' + RMB(r.servicePool) + '</td><td>' + RMB(r.totalInc) + '</td><td>' + RMB(r.totalInc) + '</td><td>0</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(t.investPool) + '</td><td>' + t.scoreTotal + '</td><td>100%</td><td>' + RMB(t.servicePool) + '</td><td>' + RMB(t.redistTotal) + '</td><td>' + RMB(t.totalInc) + '</td><td>0</td></tr>';
   h += '</tbody></table></div>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">差额 = 应得收入 − 实际代收（正=补足，负=分给别人）。投资/服务比例可在「设置」中调整。</div></div>';
+  return h;
+}
 
-  // 经营损益（v7.5：应得收入 − 采购应摊 − 团队机折旧 ± 损耗费 = 本月盈亏）
-  var wearSum = 0;
-  getMembers().forEach(function (mem) { wearSum += (r.wearNet[mem.id] || 0); });
+/* v7.11（B3）：收支清算「经营损益」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashPLHTML(r) {
+  var h = '';
+  // 经营损益（v7.5：应得收入 − 采购应摊 − 团队机折旧 ± 损耗费 = 本月盈亏；v7.11-C 改用 view.pl）
+  var v = r.view, t = v.totals;
   h += '<div class="section"><h2>📊 经营损益 <span class="hint">（本月每人实际赚/亏 · 已扣折旧，含损耗费收付）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>应得收入</th><th>− 采购应摊</th><th>− 设备折旧</th><th>± 损耗费</th><th>= 本月盈亏</th></tr></thead><tbody>';
-  getMembers().forEach(function (mem) {
-    var dep = r.depByMember[mem.id] || 0;
-    var wear = r.wearNet[mem.id] || 0;
-    var pl = r.bookPL[mem.id] || 0;
-    var tag = pl >= 0 ? '<span class="tag g">盈利</span>' : '<span class="tag r">亏损</span>';
-    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
-    h += '<td>' + RMB(r.redist[mem.id]) + '</td>';
-    h += '<td class="neg">−' + RMB(r.perPersonShare[mem.id]) + '</td>';
-    h += '<td class="neg">' + RMBneg(dep) + '</td>';
-    h += '<td class="' + (wear > 0 ? 'pos' : (wear < 0 ? 'neg' : '')) + '">' + (wear > 0 ? '+' : '') + RMB(wear) + '</td>';
-    h += '<td class="' + (pl >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (pl >= 0 ? '+' : '') + RMB(pl) + ' ' + tag + '</td></tr>';
+  v.pl.forEach(function (row) {
+    var tag = row.pl >= 0 ? '<span class="tag g">盈利</span>' : '<span class="tag r">亏损</span>';
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(row.id)) + '">' + esc(MN(row.id)) + '</td>';
+    h += '<td>' + RMB(row.redist) + '</td>';
+    h += '<td class="neg">−' + RMB(row.share) + '</td>';
+    h += '<td class="neg">' + RMBneg(row.dep) + '</td>';
+    h += '<td class="' + (row.wear > 0 ? 'pos' : (row.wear < 0 ? 'neg' : '')) + '">' + (row.wear > 0 ? '+' : '') + RMB(row.wear) + '</td>';
+    h += '<td class="' + (row.pl >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (row.pl >= 0 ? '+' : '') + RMB(row.pl) + ' ' + tag + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>−' + RMB(r.totalExp) + '</td><td>' + RMBneg(r.depTotal || 0)
-    + '</td><td>' + RMB(wearSum) + '</td><td class="' + (totalPL >= 0 ? 'pos' : 'neg') + '">' + (totalPL >= 0 ? '+' : '') + RMB(totalPL) + '</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(t.redistTotal) + '</td><td>−' + RMB(t.totalExp) + '</td><td>' + RMBneg(t.depTotal)
+    + '</td><td>' + RMB(t.wearSum) + '</td><td class="' + (t.totalPL >= 0 ? 'pos' : 'neg') + '">' + (t.totalPL >= 0 ? '+' : '') + RMB(t.totalPL) + '</td></tr>';
   h += '</tbody></table></div>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">「± 损耗费」只有<b>收损耗费</b>的机器才有：'
     + '使用者为消耗掉的他人份额付钱（负数），所有者收到补偿（正数）—— 这一列合计恒为 0，不影响团队盈亏。'
     + '团队共担的机器折旧不产生这列数字（没有对手方）。</div></div>';
+  return h;
+}
 
-  // 垫付清算
-  /* 第三列 = 该成员应承担的采购份额：均摊口径写「应均摊」，按用量口径写「应摊（按用量）」
-     （同一个 purchaseBasisHint 的判据，别让表头把按用量算出来的数说成均摊）。 */
-  h += '<div class="section"><h2>💳 垫付清算 <span class="hint">（谁多垫了、谁少垫了）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>实际代付</th><th>− ' + (getPurchaseBasis() === 'usage' ? '应摊（按用量）' : '应均摊') + '</th><th>= 垫付差额</th></tr></thead><tbody>';
-  var advSum = 0;   // 合计行的「垫付差额」改为**逐行求和** —— 旧写法硬编码 0，
-                    // 取整余数一出现（每人应摊不再相等）就与上面几列自相矛盾。
-  getMembers().forEach(function (mem) {
-    var adv = (r.paid[mem.id] || 0) - r.perPersonShare[mem.id];
-    advSum += adv;
-    var tag2 = adv > 1 ? '<span class="tag g">多垫，应收</span>' : (adv < -1 ? '<span class="tag r">少垫，应付</span>' : '<span class="tag b">持平</span>');
-    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
-    h += '<td class="pos">+' + RMB(r.paid[mem.id]) + '</td>';
-    h += '<td class="neg">−' + RMB(r.perPersonShare[mem.id]) + '</td>';
-    h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (adv >= 0 ? '+' : '') + RMB(adv) + ' ' + tag2 + '</td></tr>';
+/* v7.11（B3）：收支清算「垫付清算」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashAdvanceHTML(r) {
+  var h = '';
+  // 垫付清算（v7.11-C：行取 view.advance，合计取 view.totals.advSum）
+  /* 第三列 = 该成员应承担的采购份额。表头必须跟**本月实际生效的判据**（r.useUsage），
+     不能读配置项 getPurchaseBasis()：选了「按用量」但当月用量为 0 页时 calcMonth 已自动
+     回退均摊（r.basisFallback），表头若还写「按用量」，就会把均摊算出来的数说成按用量。
+     v7.11 起：回退时表头直接写「应均摊（本月用量为 0，已回退）」。 */
+  var v = r.view, t = v.totals;
+  var _shareTh = r.useUsage ? '应摊（按用量）'
+                 : (r.basisFallback ? '应均摊' + '<span style="font-weight:400;font-size:.68rem;color:var(--muted)">（本月用量 0，已回退）</span>' : '应均摊');
+  h += '<div class="section"><h2>💳 垫付清算 <span class="hint">（谁多垫了、谁少垫了）</span></h2><div class="table-wrap"><table><thead><tr><th></th><th>实际代付</th><th>− ' + _shareTh + '</th><th>= 垫付差额</th></tr></thead><tbody>';
+  v.advance.forEach(function (row) {
+    var tag2 = row.adv > 1 ? '<span class="tag g">多垫，应收</span>' : (row.adv < -1 ? '<span class="tag r">少垫，应付</span>' : '<span class="tag b">持平</span>');
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(row.id)) + '">' + esc(MN(row.id)) + '</td>';
+    h += '<td class="pos">+' + RMB(row.paid) + '</td>';
+    h += '<td class="neg">−' + RMB(row.share) + '</td>';
+    h += '<td class="' + (row.adv >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (row.adv >= 0 ? '+' : '') + RMB(row.adv) + ' ' + tag2 + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(r.totalExp) + '</td><td>−' + RMB(r.totalExp) + '</td><td>' + (advSum > 0 ? '+' : '') + RMB(advSum) + '</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td>+' + RMB(t.totalExp) + '</td><td>−' + RMB(t.totalExp) + '</td><td>' + (t.advSum > 0 ? '+' : '') + RMB(t.advSum) + '</td></tr>';
   h += '</tbody></table></div>';
   if (r.amort && r.amort.totalCents > 0) {
     h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">长期耗材（A4纸 / 硒鼓）的整笔采购款是采购人一次付清的，但结算只按本月实际用掉的部分记他的「实际代付」（' + RMB(r.amort.totalCents) + '）；没用的部分是库存，以后各月再逐月返还 —— 这样购买月不会被整笔采购撑爆。</div>';
   }
   h += '</div>';
+  return h;
+}
 
-  /* 📐 结算公式（只展示，v7.3）—— 放在「资金重分配」之前：先讲清算式，再看具体的转账指令。
-     默认收起（open=false）：日常看数时它只占一行，不挤占 KPI 与表格的视线。 */
-  h += '<div id="dashFormula">' + settleFormulaHTML(r, false) + '</div>';
-
-  // 资金重分配
+/* v7.11（B3）：收支清算「资金重分配（建议转账指令）」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashRedistHTML(r) {
+  var h = '';
+  // 资金重分配（v7.11-C：行取 view.redist；「= 应转出/入」直接读 net，不再现场三列相加）
+  var v = r.view;
   h += '<div class="settle-box"><h2>🔄 资金重分配 <span class="hint">（建议转账指令 · 按账面算，不代表真的转了）</span></h2>';
   h += '<div class="table-wrap"><table style="margin-bottom:14px"><thead><tr><th></th><th>收入调整<br>（应得−代收）</th><th>+ 垫付差额<br>（代付−均摊）</th><th>± 损耗费</th><th>= 应转出/入</th></tr></thead><tbody>';
-  getMembers().forEach(function (mem) {
-    var incomeAdj = r.redist[mem.id] - parseCents((m.income || {})[mem.id] || 0);
-    var adv = (r.paid[mem.id] || 0) - r.perPersonShare[mem.id];
-    var wear = r.wearNet[mem.id] || 0;
-    var transfer = incomeAdj + adv + wear;
-    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
-    h += '<td class="' + (incomeAdj >= 0 ? 'pos' : 'neg') + '">' + (incomeAdj >= 0 ? '+' : '') + RMB(incomeAdj) + '</td>';
-    h += '<td class="' + (adv >= 0 ? 'pos' : 'neg') + '">' + (adv >= 0 ? '+' : '') + RMB(adv) + '</td>';
-    h += '<td class="' + (wear >= 0 ? 'pos' : 'neg') + '">' + (wear > 0 ? '+' : '') + RMB(wear) + '</td>';
-    h += '<td class="' + (transfer >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + (transfer >= 0 ? '+' : '') + RMB(transfer) + '</td></tr>';
+  v.redist.forEach(function (row) {
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(row.id)) + '">' + esc(MN(row.id)) + '</td>';
+    h += '<td class="' + (row.incomeAdj >= 0 ? 'pos' : 'neg') + '">' + (row.incomeAdj >= 0 ? '+' : '') + RMB(row.incomeAdj) + '</td>';
+    h += '<td class="' + (row.adv >= 0 ? 'pos' : 'neg') + '">' + (row.adv >= 0 ? '+' : '') + RMB(row.adv) + '</td>';
+    h += '<td class="' + (row.wear >= 0 ? 'pos' : 'neg') + '">' + (row.wear > 0 ? '+' : '') + RMB(row.wear) + '</td>';
+    /* title 里明写自证等式：三列之和必须等于本格（sumCheck 与 net 恒等） */
+    h += '<td class="' + (row.transfer >= 0 ? 'pos' : 'neg') + '" style="font-weight:800" title="三列相加 = '
+      + RMB(row.sumCheck) + '，与「建议转账」用的 net 同源">' + (row.transfer >= 0 ? '+' : '') + RMB(row.transfer) + '</td></tr>';
   });
   h += '</tbody></table></div>';
-  var _settleT = r.transfers.filter(function (t) { return t.kind !== 'wear'; });
-  var _wearT = r.transfers.filter(function (t) { return t.kind === 'wear'; });
+  var _settleT = r.transfers.filter(function (tt) { return tt.kind !== 'wear'; });
+  var _wearT = r.transfers.filter(function (tt) { return tt.kind === 'wear'; });
   if (r.transfers.length > 0) {
     if (_settleT.length) {
       h += '<div style="font-weight:700;margin-bottom:8px;color:var(--orange)">① 结算转账（多垫的收、少垫的付）：</div>';
-      _settleT.forEach(function (t) {
-        h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
+      _settleT.forEach(function (tt) {
+        h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(tt.from)) + '">' + esc(MN(tt.from)) + '</span>';
         h += ' <span class="arrow">→</span> ';
-        h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
-        h += ' <span class="amount">' + RMB(t.amount) + '</span></div>';
+        h += '<span class="member-tag" style="background:' + sanitizeColor(MC(tt.to)) + '">' + esc(MN(tt.to)) + '</span>';
+        h += ' <span class="amount">' + RMB(tt.amount) + '</span></div>';
       });
     }
     if (_wearT.length) {
       h += '<div style="font-weight:700;margin:14px 0 8px;color:var(--orange)">② 损耗费（用了别人的机器，把他们的那份付给他们）：</div>';
-      _wearT.forEach(function (t) {
-        h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
+      _wearT.forEach(function (tt) {
+        h += '<div class="transfer"><span class="member-tag" style="background:' + sanitizeColor(MC(tt.from)) + '">' + esc(MN(tt.from)) + '</span>';
         h += ' <span class="arrow">→</span> ';
-        h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.to)) + '">' + esc(MN(t.to)) + '</span>';
-        h += ' <span class="amount">' + RMB(t.amount) + '</span>';
-        if (t.printer) h += ' <span style="font-size:.76rem;color:var(--muted)">' + esc(t.printer) + '</span>';
+        h += '<span class="member-tag" style="background:' + sanitizeColor(MC(tt.to)) + '">' + esc(MN(tt.to)) + '</span>';
+        h += ' <span class="amount">' + RMB(tt.amount) + '</span>';
+        if (tt.printer) h += ' <span style="font-size:.76rem;color:var(--muted)">' + esc(tt.printer) + '</span>';
         h += '</div>';
       });
     }
@@ -6219,11 +6546,18 @@ function renderDash() {
     h += '<div style="color:var(--muted)">✅ 收支平衡，无需转账</div>';
   }
   h += '</div>';
+  return h;
+}
 
+/* v7.11（B3）：收支清算「实际转账 + 已转 / 还差 chips」区块 —— 从 renderDash 里拆出来的纯块函数。
+   只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
+   主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
+function dashTransferHTML(m, r, dT) {
+  var h = '';
   /* ── 实际转账（独立密码，v6.4） ── */
   h += '<div class="settle-box settle-box-real"><h2>💸 实际转账 <span class="hint">（' + esc(m.label) + ' 归属 · 真正转了多少钱 · 决定谁实际吃亏）</span>' + lockBadge('transfer') + '</h2>';
   h += lockBarHTML('transfer');
-  var dT = unlocked.transfer ? '' : ' disabled';
+  /* dT（整块是否禁用）由调用方按解锁态算好传进来，块内不再重算 */
   // 建议 vs 实际 差额（一眼看出谁还没转够）—— 独立成块，改金额时就地刷新
   h += '<div id="dashTransferGaps">' + transferGapChipsHTML(m, r, dT) + '</div>';
   // 无日期列：转账归属当前「结算月份」，不按付款时间归月（转账常在下月才付，仍算本月的账）
@@ -6252,18 +6586,7 @@ function renderDash() {
   h += '<button class="btn sm" style="margin-top:10px" onclick="addTransfer()"' + dT + '>+ 添加转账记录</button>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">记录<b>真实发生</b>的转账，金额归属当前结算月份（' + esc(m.label) + '）—— 钱即使下个月才转，也还算这个月的结算，不随付款时间跑到下个月。<br>每改一行，下面的「实际盈亏」与上面的「已转 / 还差」会立即重算（不刷新整表，避免输入框失焦）。</div>';
   h += '</div>';
-
-  /* ── 实际盈亏（现金口径） ── */
-  h += '<div id="dashRealPL">' + realPLSectionHTML(m, r, totalPL) + '</div>';
-
-  el.innerHTML = h;
-  // KPI 数字滚动
-  $$('#tab-dash .num[data-count]').forEach(function (node) {
-    var target = parseFloat(node.getAttribute('data-count'));  // 整数分
-    var prefix = node.getAttribute('data-prefix') || '';
-    countUp(node, target, { dec: 2, fmt: function (n) { return prefix + (n / 100).toFixed(2); } });
-  });
-  playSettledEntrance(ustate, r.amort ? r.amort.state : 'none');
+  return h;
 }
 
 /* 取数完成时的入场动画（2026-10-29 用户反馈「分段加载会闪一下」）。
@@ -6325,10 +6648,13 @@ function transferGapChipsHTML(m, r, disabledAttr) {
   var h = '';
   if (!r.transfers.length) return '<div style="color:var(--muted);margin-bottom:12px">本月收支平衡，无建议转账。</div>';
   var pending = 0;
+  /* v7.11：只认 _validTransfers（与 calcMonth 的 sent/recv 同一判据）——
+     旧写法把自转 / 已删成员 / 0 元记录也累加进「已转」，与实际转账表对不上。 */
+  var _vt = _validTransfers(m);
   h += '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px">';
   r.transfers.forEach(function (t) {
     var done = 0;
-    (m.transfers || []).forEach(function (x) { if (x.from === t.from && x.to === t.to) done += parseCents(x.amount); });
+    _vt.forEach(function (x) { if (x.from === t.from && x.to === t.to) done += parseCents(x.amount); });
     var left = t.amount - done;
     if (left > 1) pending++;
     h += '<span class="member-tag" style="background:' + sanitizeColor(MC(t.from)) + '">' + esc(MN(t.from)) + '</span>';
@@ -6343,33 +6669,29 @@ function transferGapChipsHTML(m, r, disabledAttr) {
   return h;
 }
 /* 实际盈亏（现金口径）区块。金额为 0 时不带正负号，避免出现「−¥0.00」「+¥0.00」这类看着像 bug 的显示。 */
-function realPLSectionHTML(m, r, totalPL) {
-  var totalActual = 0;
-  getMembers().forEach(function (mem) { totalActual += r.actualPL[mem.id]; });
+function realPLSectionHTML(r) {
+  // 实际盈亏（现金口径 · v7.11-C：行取 view.realPL，合计取 view.totals）
+  var t = r.view.totals;
   var signed = function (c) { return (c > 0 ? '+' : '') + RMB(c); };
   var spend = function (c) { return (c > 0 ? '−' : '') + RMB(c); };
   var h = '<div class="section"><h2>💰 实际盈亏 <span class="hint">（现金口径：代收 + 实收转账 − 垫付 − 实付转账 − 设备折旧）</span></h2>';
   h += '<div class="table-wrap"><table><thead><tr><th></th><th>代收</th><th>+ 实收转账</th><th>− 垫付</th><th>− 实付转账</th><th>− 设备折旧</th><th>= 实际盈亏</th><th>应得盈亏</th><th>差额（未结清）</th></tr></thead><tbody>';
-  var gapSum = 0;   // 合计行的「差额（未结清）」改为**逐行求和**（旧写法硬编码 0）
-  getMembers().forEach(function (mem) {
-    var aPL = r.actualPL[mem.id];
-    var dep = r.depByMember[mem.id] || 0;
-    var nPL = r.redist[mem.id] - r.perPersonShare[mem.id] - dep;
-    var gap = r.settleGap[mem.id];
-    gapSum += gap;
-    var tag3 = gap > 1 ? '<span class="tag g">还应收 ' + RMB(gap) + '</span>' : (gap < -1 ? '<span class="tag r">已超付 ' + RMB(-gap) + '</span>' : '<span class="tag b">已结清</span>');
-    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
-    h += '<td>' + RMB(parseCents((m.income || {})[mem.id] || 0)) + '</td>';
-    h += '<td class="pos">' + signed(r.recv[mem.id]) + '</td>';
-    h += '<td class="neg">' + spend(r.paid[mem.id] || 0) + '</td>';
-    h += '<td class="neg">' + spend(r.sent[mem.id]) + '</td>';
-    h += '<td class="neg">' + spend(dep) + '</td>';
-    h += '<td class="' + (aPL >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + signed(aPL) + '</td>';
-    h += '<td style="color:var(--muted)">' + signed(nPL) + '</td>';
+  r.view.realPL.forEach(function (row) {
+    var tag3 = row.gap > 1
+      ? '<span class="tag g">还应收 ' + RMB(row.gap) + '</span>'
+      : (row.gap < -1 ? '<span class="tag r">已超付 ' + RMB(-row.gap) + '</span>' : '<span class="tag b">已结清</span>');
+    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(row.id)) + '">' + esc(MN(row.id)) + '</td>';
+    h += '<td>' + RMB(row.collected) + '</td>';
+    h += '<td class="pos">' + signed(row.recv) + '</td>';
+    h += '<td class="neg">' + spend(row.paid) + '</td>';
+    h += '<td class="neg">' + spend(row.sent) + '</td>';
+    h += '<td class="neg">' + spend(row.dep) + '</td>';
+    h += '<td class="' + (row.actual >= 0 ? 'pos' : 'neg') + '" style="font-weight:800">' + signed(row.actual) + '</td>';
+    h += '<td style="color:var(--muted)">' + signed(row.book) + '</td>';
     h += '<td>' + tag3 + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(r.totalInc) + '</td><td>' + signed(r.transferTotal) + '</td><td>' + spend(r.totalExp) + '</td><td>' + spend(r.transferTotal) + '</td><td>' + spend(r.depTotal || 0) + '</td>';
-  h += '<td class="' + (totalActual >= 0 ? 'pos' : 'neg') + '">' + signed(totalActual) + '</td><td>' + signed(totalPL) + '</td><td>' + signed(gapSum) + '</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + RMB(t.totalInc) + '</td><td>' + signed(t.transferTotal) + '</td><td>' + spend(t.totalExp) + '</td><td>' + spend(t.transferTotal) + '</td><td>' + spend(t.depTotal) + '</td>';
+  h += '<td class="' + (t.totalActual >= 0 ? 'pos' : 'neg') + '">' + signed(t.totalActual) + '</td><td>' + signed(t.totalPL) + '</td><td>' + signed(t.gapSum) + '</td></tr>';
   h += '</tbody></table></div>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">实际盈亏 = 这个月他<b>真正</b>拿到的钱减真正掏出去的钱，再扣掉自己用掉的<b>设备寿命价值</b>（折旧是非现金成本：机器早已买好，本月没有现金流出，但它确实被磨掉了）。<br>长期耗材（A4纸 / 硒鼓）的整笔采购款同理不算当月成本 —— 那是库存，按每月实际用量摊销后逐月记到采购人名下（见「垫付清算」脚注）。<br>转账是成员内部的钱，合计为 0，不影响团队总盈亏。全部结清时「实际盈亏」= 「应得盈亏」；没结清时差额就是<b>还没到位的钱</b> —— 差额为正的人被欠着，团队亏损实际由他垫着。</div></div>';
   return h;
@@ -6385,11 +6707,12 @@ function printerUsageSectionHTML(orders) {
   var perPrinter = {}, orderRows = [], unmatchedPages = 0, unmatchedOrders = 0;
 
   list.forEach(function (o) {
-    var pages = 0;
-    (o.files || []).forEach(function (f) {
-      if ((f.status || '') !== 'sent') return;
-      pages += _filePagesOf(f);
-    });
+    /* v7.11（B1）：正常用量判据只认 _orderNormalUsage —— 与「收支清算」的用量统计同一份实现。
+       旧写法是本函数里再写一遍「父订单状态过滤 + 只认 sent 子文件」的循环，v7.11 之前它漏了
+       NORMAL_EXCLUDED_STATUSES ⇒ 已取消 / 已拒绝 / 预约中的单在这里照样计页并计提折旧。 */
+    var nu = _orderNormalUsage(o);
+    if (nu.excluded) return;
+    var pages = nu.pages;
     if (!pages) return;
     var info = printerNameForOrder(o);
     var p = info.registered ? printerForOrder(o) : null;
@@ -6408,17 +6731,24 @@ function printerUsageSectionHTML(orders) {
   });
 
   var names = Object.keys(perPrinter).sort(function (a, b) { return perPrinter[b].pages - perPrinter[a].pages; });
-  var totalPages = 0, totalDep = 0;
+  var totalPages = 0, totalDep = 0, totalSettlePages = 0, totalSettleDep = 0;
   names.forEach(function (n) { totalPages += perPrinter[n].pages; totalDep += perPrinter[n].dep; });
 
   var h = '<div class="section" id="printer-usage"><h2>📈 本口径用量与折旧 <span class="hint">（本口径内每台机打了多少页、吃掉多少寿命价值 · 机型优先按人工指定，其次「默认设备」→ 已知机型兜底）</span></h2>';
+  /* v7.11：这里和「收支清算」的折旧块（calcMonth 的 D）**区间与来源本来就不同**，以前不说，
+     用户看到同一个月两处页数不等就当成 bug。现在把差异显式写出来；能统一的部分（订单状态过滤、
+     机型归属判据）已经统一，剩下「口径区间 / 是否含外部监视来源」是按设计不同的。 */
+  h += '<div style="margin:-4px 0 10px;font-size:.8rem;color:var(--muted)">与「收支清算」里的<b>设备折旧</b>口径不同：左边几列按上方<b>口径区间 + 来源</b>统计（含外部监视来源），结算页按<b>结算月</b>且不含外部来源 —— 页数/折旧不必相等；但两边「哪些订单算正常用量、页归哪台机」的规则是同一套。右边两列就是<b>结算月</b>的同机数字（与「收支清算 → 设备折旧」同一个数），当上方口径正好等于结算月、也不含外部来源时，两边的页数会相等。</div>';
   if (!getPrinters().length && !names.length) {
     h += '<div style="color:var(--muted);font-size:.85rem">还没有登记打印机，本口径内也没有可识别的机型。到本页上方 <b>「🖨️ 打印机台账」</b> 登记（价格 / 寿命页数 / 绑定设备）后，这里会按页计提折旧。</div></div>';
     return h;
   }
-  h += '<div class="table-wrap"><table><thead><tr><th>打印机</th><th>所有者 / 计费</th><th>价格</th><th>寿命（页）</th><th>每页成本</th><th>本口径页数</th><th>已耗寿命</th><th>本口径寿命消耗</th></tr></thead><tbody>';
+  /* v7.11（B2）：最后两列是**结算月**（「收支清算」用的那个月）的同机页数 / 折旧 —— 与 calcMonth 的 D
+     同一口径，摆在同一行里做对照。左边两列是「本口径（上方区间 + 来源）」，两者区间的定义本来就不同，
+     所以不强行相等，但至少能一眼看出差多少、差在哪一边。 */
+  h += '<div class="table-wrap"><table><thead><tr><th>打印机</th><th>所有者 / 计费</th><th>价格</th><th>寿命（页）</th><th>每页成本</th><th>本口径页数</th><th>已耗寿命</th><th>本口径寿命消耗</th><th>结算月页数</th><th>结算月折旧</th></tr></thead><tbody>';
   if (!names.length) {
-    h += '<tr><td colspan="8" style="color:var(--muted)">本口径内没有已完成的出纸页数（或订单都没归属到机器）。</td></tr>';
+    h += '<tr><td colspan="10" style="color:var(--muted)">本口径内没有已完成的出纸页数（或订单都没归属到机器）。</td></tr>';
   }
   names.forEach(function (n) {
     var d = perPrinter[n];
@@ -6437,9 +6767,21 @@ function printerUsageSectionHTML(orders) {
     h += '<td style="white-space:nowrap">' + (d.unit > 0 ? '¥' + d.unit.toFixed(4) : (_lifeSt === 'accumulating' ? '累计中' : '—')) + '</td>';
     h += '<td>' + fmtInt(d.pages) + '</td>';
     h += '<td>' + (d.life > 0 ? ((d.pages / d.life) * 100).toFixed(1) + '%' : (_lifeSt === 'accumulating' ? '—' : '—')) + '</td>';
-    h += '<td class="neg" style="font-weight:700">' + (d.dep > 0 ? '−' + RMB(d.dep) : '<span style="color:var(--muted)">¥0.00</span>') + '</td></tr>';
+    h += '<td class="neg" style="font-weight:700">' + (d.dep > 0 ? '−' + RMB(d.dep) : '<span style="color:var(--muted)">¥0.00</span>') + '</td>';
+    /* v7.11（B2）：结算月对照 —— pagesByPrinter 来自 usageOfMonth(currentKey)，与「收支清算 → 设备折旧」同一个数 */
+    var _su = usageOfMonth(currentKey);
+    var _sp = (_p && _su && ((_su.pagesByPrinter || {})[_p.id] || 0)) || 0;
+    var _sdep = (_p && _su) ? printerDepCents(_p, _sp) : 0;
+    totalSettlePages += _sp;
+    totalSettleDep += _sdep;
+    h += '<td title="结算月（' + esc(currentKey) + '）的用量 · 与「收支清算 → 设备折旧」同口径">'
+      + (_su ? fmtInt(_sp) : '<span style="color:var(--muted)" title="结算月用量还没统计完">—</span>') + '</td>';
+    h += '<td class="neg"' + (_su ? '' : ' style="color:var(--muted)"') + '>'
+      + (_su ? (_sdep > 0 ? '−' + RMB(_sdep) : '<span style="color:var(--muted)">¥0.00</span>') : '—') + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td></td><td></td><td></td><td></td><td>' + fmtInt(totalPages) + '</td><td></td><td class="neg">' + (totalDep > 0 ? '−' + RMB(totalDep) : '¥0.00') + '</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td></td><td></td><td></td><td></td><td>' + fmtInt(totalPages) + '</td><td></td><td class="neg">' + (totalDep > 0 ? '−' + RMB(totalDep) : '¥0.00') + '</td>'
+    + '<td>' + (usageOfMonth(currentKey) ? fmtInt(totalSettlePages) : '—') + '</td>'
+    + '<td class="neg">' + (usageOfMonth(currentKey) ? (totalSettleDep > 0 ? '−' + RMB(totalSettleDep) : '¥0.00') : '—') + '</td></tr>';
   h += '</tbody></table></div>';
 
   /* 订单级：这单是哪台机打的（最多列 50 行，其余用合计说明） */
@@ -6473,6 +6815,7 @@ function printerUsageSectionHTML(orders) {
         ? '打印机列可直接下拉<b>人工指定</b>（接单设备不决定用哪台机，人工指定优先级最高）；未指定时按「默认设备」→ 已知机型表兜底。'
         : '打印机列<b>默认锁定</b>（🔒 与上方台账共用同一把锁）：解锁后可逐单指定"这张单是哪台机打的"，未指定时按「默认设备」→ 已知机型表兜底。')
     + '折旧 = 页数 × 每页成本（价格 ÷ 寿命页数），只对<b>已登记且在役</b>的机器计提；'
+    + '已取消 / 已拒绝 / 预约中等<b>非正常用量</b>的订单不计页（与结算页的用量统计同一份排除表）。'
     + '寿命口径为<b>累计实测</b>且还没结算的机器显示「累计中」—— 总寿命未知，所以暂不计提（不是漏了），'
     + '报废结算后这些页数会一次性回溯折旧。'
     + (unmatchedPages > 0 ? '<br>⚠ 有 <b>' + fmtInt(unmatchedPages) + ' 页 / ' + unmatchedOrders + ' 单</b>认不出是哪台机打的（设备未登记且不在已知机型表里）。' : '')
@@ -6500,17 +6843,23 @@ function printerUsageSectionHTML(orders) {
    open 参数：就地刷新时保留展开态 —— 用户摊开公式在看，改一笔转账不该把它收起来。 */
 function settleFormulaHTML(r, open) {
   var members = getMembers();
-  var sumNet = 0, sumBook = 0, sumActual = 0;
+  var sumNet = 0, sumBook = 0, sumActual = 0, bookClash = 0;
   var depTotal = r.depTotal || 0;
   members.forEach(function (mem) {
     sumNet += r.net[mem.id] || 0;
-    sumBook += (r.redist[mem.id] || 0) - (r.perPersonShare[mem.id] || 0) - (r.depByMember[mem.id] || 0);
+    /* v7.11：ΣB 直接累加 calcMonth 的 bookPL（含 ± 损耗费 W）。
+       旧写法现场重算 R−A−D，因 ΣW ≡ 0 恰好仍与 ΣC 相等 ⇒ 自检永远绿，抓不到缺项。 */
+    var b = r.bookPL[mem.id] || 0;
+    sumBook += b;
+    /* 逐人核对「返回的 bookPL」是否真等于文档口径 R−A−D+W —— 恒等式只比总和，
+       个体写错但总和凑巧相等时抓不到，所以这里逐个比一次。 */
+    if (b !== ((r.redist[mem.id] || 0) - (r.perPersonShare[mem.id] || 0) - (r.depByMember[mem.id] || 0) + (r.wearNet[mem.id] || 0))) bookClash++;
     sumActual += r.actualPL[mem.id] || 0;
   });
   var teamPL = r.totalInc - r.totalExp - depTotal;
   /* 0 不带符号 —— 别渲染出「−¥0.00」「+¥0.00」这种看着像 bug 的东西 */
   var sg = function (c) { return (c > 0 ? '+' : '') + RMB(c); };
-  var identOk = (sumNet === 0) && (sumBook === sumActual) && (sumActual === teamPL);
+  var identOk = (sumNet === 0) && (sumBook === sumActual) && (sumActual === teamPL) && (bookClash === 0);
 
   var h = '<details class="formula-box" id="settleFormula"' + (open ? ' open' : '') + '>';
   h += '<summary>📐 结算公式 <span class="hint">（采购 / 代收 / 评分 / 实际转账 / 设备折旧 → 本月盈亏 的完整算式 · 金额一律整数分）</span></summary>';
@@ -6594,12 +6943,14 @@ function _refreshDashSummary() {
   if (currentTab !== 'dash') return;
   var m = monthFromRecords(currentKey);
   var r = calcMonthWithUsage(currentKey);
-  var totalPL = 0;
-  getMembers().forEach(function (mem) { totalPL += (r.bookPL[mem.id] || 0); });
+  var totalPL = r.view.totals.totalPL;
+  /* v7.11-C：结论卡里写着「还差多少」，转账一改就必须跟着变（它没有输入框 ⇒ 可整块重绘） */
+  var vd = $('#dashVerdict');
+  if (vd) vd.innerHTML = dashVerdictHTML(m, r, usageStateOfMonth(currentKey));
   var g = $('#dashTransferGaps');
   if (g) g.innerHTML = transferGapChipsHTML(m, r, unlocked.transfer ? '' : ' disabled');
   var p = $('#dashRealPL');
-  if (p) p.innerHTML = realPLSectionHTML(m, r, totalPL);
+  if (p) p.innerHTML = realPLSectionHTML(r);
   /* 📐 结算公式：里面的「本月实算」跟着转账变（ΣC 与 g 依赖 T_i），必须一起刷新。
      但它是个 <details>，整体 innerHTML 重绘会把它收起来 —— 先记住展开态再按原样重绘。 */
   var f = $('#dashFormula');
@@ -6680,7 +7031,7 @@ function renderEntry() {
     var kind = expenseKind(e), units = expenseUnits(e);
     h += '<tr>';
     h += '<td><input type="date" value="' + esc(e.date) + '" onchange="updExp(\'' + eid + '\',\'date\',this.value)"' + disabled + '></td>';
-    h += '<td class="l"><input type="text" value="' + esc(e.item) + '" onchange="updExp(\'' + eid + '\',\'item\',this.value)" placeholder="项目名称" style="width:260px"' + disabled + '></td>';
+    h += '<td class="l"><input type="text" value="' + esc(e.item) + '" onchange="updExp(\'' + eid + '\',\'item\',this.value)" placeholder="项目名称" style="width:210px"' + disabled + '></td>';
     h += '<td><select onchange="updExpType(\'' + eid + '\',this.value)" title="长期耗材选 A4纸 / 硒鼓，填数量后按月摊销"' + disabled + '>';
     EXPENSE_KIND_OPTIONS.forEach(function (opt) {
       h += '<option value="' + opt[0] + '"' + (kind === opt[0] ? ' selected' : '') + '>' + esc(opt[1]) + '</option>';
@@ -6691,7 +7042,7 @@ function renderEntry() {
         h += '<td style="color:var(--muted)">—</td>';
       } else {
         var ck = CONSUMABLE_KIND[kind];
-        h += '<td class="exp-qty"><input type="number" step="1" min="0" value="' + (units || '') + '" placeholder="' + (kind === 'paper' ? '总张数' : '可打印页数') + '" style="width:104px" onchange="updExp(\'' + eid + '\',\'units\',+this.value)"' + disabled + '> <span style="font-size:.75rem;color:var(--muted)">' + ck.unit + '</span>';
+        h += '<td class="exp-qty"><div class="exp-qty-line"><input type="number" step="1" min="0" value="' + (units || '') + '" placeholder="' + (kind === 'paper' ? '总张数' : '可打印页数') + '" style="width:84px" onchange="updExp(\'' + eid + '\',\'units\',+this.value)"' + disabled + '><span class="exp-unit">' + ck.unit + '</span></div>';
         /* 这两行小字绝对定位（.exp-qty-note），别再改回普通 div：会让本格变高、把输入框顶上去 */
         if (units > 0) h += '<div class="exp-qty-note" style="color:var(--muted)">单价 ¥' + consumableUnitYuan(e).toFixed(4) + '/' + ck.unit + '</div>';
         else h += '<div class="exp-qty-note" style="color:var(--orange)">填数量后按月摊销</div>';
@@ -6827,7 +7178,8 @@ function updExpType(id, val) {
 function expPrinterCellHTML(e, eid, kind, disabled) {
   if (kind !== 'toner') {
     return '<td class="exp-qty" style="color:var(--muted)">—'
-      + '<div class="exp-qty-note">' + (kind === 'paper' ? 'A4纸按全队用纸量摊' : '只有耗材需要指定') + '</div></td>';
+      + '<div class="exp-qty-note" title="' + (kind === 'paper' ? 'A4纸不分机器，恒按全队用纸量摊' : '只有耗材需要指定所属打印机') + '">'
+      + (kind === 'paper' ? '按全队用纸量摊' : '只有耗材需要指定') + '</div></td>';
   }
   var pid = expensePrinterId(e);
   var pname = pid ? printerNameOf(pid) : '';
@@ -6841,9 +7193,11 @@ function expPrinterCellHTML(e, eid, kind, disabled) {
   });
   if (gone) h += '<option value="' + esc(pid) + '" selected>⚠ 原打印机已删除</option>';
   h += '</select>';
-  if (gone) h += '<div class="exp-qty-note" style="color:var(--orange)">⚠ 台账里没有这台机 → 暂按全队页数摊，请重选</div>';
-  else if (pid) h += '<div class="exp-qty-note" style="color:var(--muted)">🖨 按「' + esc(pname) + '」本月页数摊</div>';
-  else h += '<div class="exp-qty-note" style="color:var(--muted)">按全队页数摊</div>';
+  /* 小字只写「怎么摊」这一个结论 —— 机器名就在上面的下拉里，重复一遍会把本格挤爆、
+     再跨列压到「数量 / 金额」上（完整口径挂在 title，鼠标悬停可见）。 */
+  if (gone) h += '<div class="exp-qty-note" style="color:var(--orange)" title="台账里已经没有这台机了 → 暂按全队页数摊，请重新选">⚠ 台账没这台机，按全队摊</div>';
+  else if (pid) h += '<div class="exp-qty-note" style="color:var(--muted)" title="只按「' + esc(pname) + '」本月页数摊">按这台机页数摊</div>';
+  else h += '<div class="exp-qty-note" style="color:var(--muted)" title="未指定机器 ⇒ 按全队本月页数摊">按全队页数摊</div>';
   return h + '</td>';
 }
 /* v7.10：改硒鼓的所属打印机。空 = 未指定（旧口径）。不需要让用量失效：

@@ -71,7 +71,7 @@ check("采购表在「数量」后新增「所属打印机」列头（仅耗材�
 check("行内归属格：硒鼓给下拉（未指定 + 各台机），A4纸恒为 —",
       "function expPrinterCellHTML(e, eid, kind, disabled) {" in src
       and "未指定（全队页数）" in src
-      and "只有耗材需要指定" in src and "A4纸按全队用纸量摊" in src)
+      and "只有耗材需要指定" in src and "A4纸不分机器，恒按全队用纸量摊" in src)
 check("updExpPrinter：safeId 校验、空则删除字段、保存后重绘表格",
       "function updExpPrinter(id, val) {" in src
       and "if (pid) r.printer_id = pid; else delete r.printer_id;" in src
