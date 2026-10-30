@@ -4,8 +4,10 @@
 被验对象：`local_print_tool/finance/settlement.html` 里「收支清算」标签页新增的可折叠公式块。
 
 判据（三组）：
-  A. 静态接线 —— 块在 renderDash 里被插入、位置在「🔄 资金重分配」之前、默认收起、
-     就地刷新保留展开态、CSS 用原生 <details> 那套。
+  A. 静态接线 —— 块在 renderDash 里被插入（v7.14 起走自写 secFold，与其它明细区同一套
+     折叠：.cs / .cs-body / localStorage 持久化）、位置在「🔄 资金重分配」之前、默认收起、
+     就地刷新后仍是折叠块（展开态由 foldIsOpen 从 localStorage 恢复）、CSS 已无原生
+     <details> 那套（.formula-box / _formulaAnimRun 全部删净）。
   B. 口径纪律 —— `settleFormulaHTML()` **只做展示**：函数体内不得出现第二份计算
      （Math.round / parseCents / apportionCents / calcMonth）。页面数字只有一个来源，
      否则两套口径必然漂移（这正是 v7.2 页数/张数出事的根因）。
@@ -15,7 +17,7 @@
      · 公式块的 ΣC 与「💰 实际盈亏」表合计行显示**同一个数**；
      · 零值不渲染成「−¥0.00」/「+¥0.00」。
 
-变异自证（必须能红）：把 `settleFormulaHTML(r, false)` 改成 true、把 ΣN 的累加改坏、
+变异自证（必须能红）：把公式块默认展开（defOpen 改 true）、把 ΣN 的累加改坏、
 把团队盈亏的正负号改坏 —— 三种改法各有一组断言必须当场转红。
 
 用法：python tests/verify_settle_formula.py
@@ -53,30 +55,41 @@ src = open(HTML, encoding="utf-8").read()
 # ══════════════════════════════════════════════════════════════
 section("A. 静态接线（renderDash / 就地刷新 / CSS）")
 
-check("settleFormulaHTML(r, open) 存在（两个入参：数据 + 展开态）",
-      "function settleFormulaHTML(r, open) {" in src)
+check("settleFormulaHTML(r) 只收数据一个入参（开关交给 secFold，函数不再管展开态）",
+      "function settleFormulaHTML(r) {" in src
+      and "function settleFormulaHTML(r, open)" not in src)
 
-check("renderDash 把块插进「收支清算」（默认收起，套一层 #dashFormula 便于就地刷新）",
-      "h += '<div id=\"dashFormula\">' + settleFormulaHTML(r, false) + '</div>';" in src)
+check("自检算式抽成 _formulaIdent(r)：块内与摘要行共用同一份结果",
+      "function _formulaIdent(r) {" in src
+      and "var ide = _formulaIdent(r);" in src
+      and "sum: FS.formula" in src)
+
+check("renderDash 把块插成 secFold('formula')（默认收起，套一层 #dashFormula 便于就地刷新）",
+      "secFold('formula', { title: '📐 结算公式', hint: '完整算式 · 金额整数分', sum: FS.formula, kind: 'real' },"
+      in src
+      and "settleFormulaHTML(r), false)" in src
+      and "h += '<div id=\"dashFormula\">'" in src)
 
 i_formula = src.find("h += '<div id=\"dashFormula\">'")
 i_redist = src.find("'<div class=\"settle-box\"><h2>🔄 资金重分配")
 check("位置：在「🔄 资金重分配」之前（先讲算式，再看转账指令）",
       0 <= i_formula < i_redist, f"formula@{i_formula} redist@{i_redist}")
 
-check("就地刷新：改实际转账后跟着重算，并保留展开态",
+check("就地刷新：改实际转账后重绘同一套折叠块，并同步「已收起 N / M 块」",
       "var f = $('#dashFormula');" in src
-      and "document.querySelector('#settleFormula[open]')" in src
-      and "f.innerHTML = settleFormulaHTML(r, keepOpen);" in src)
+      and "f.innerHTML = secFold('formula'," in src
+      and "_syncFoldCount();" in src
+      and "keepOpen" not in src)
 
-check("用原生 <details> + <summary>（无需 JS 记状态、刷新默认收起、键盘可达）",
-      "var h = '<details class=\"formula-box\" id=\"settleFormula\"' + (open ? ' open' : '') + '>';" in src
-      and "'<summary>📐 结算公式 <span class=\"hint\">" in src)
+check("CSS：原生 <details> 那套已删净（无 .formula-box / 无「展开 ▾」提示）",
+      ".formula-box" not in src
+      and "展开 ▾" not in src
+      and ".formula-body { padding: 4px 18px 16px;" in src)
 
-check("CSS：折叠箭头 / 隐藏默认三角 / 展开分隔线",
-      ".formula-box > summary::-webkit-details-marker { display: none; }" in src
-      and ".formula-box[open] > summary::after { content: '收起 ▴'; }" in src
-      and ".formula-box[open] > summary { border-bottom: 1px solid var(--border);" in src)
+check("v7.13 的 JS 高度动画已删净（不再有 _formulaAnimRun / FORMULA_ANIM / toggle 监听）",
+      "_formulaAnimRun" not in src
+      and "FORMULA_ANIM" not in src
+      and "_isFormulaSummary" not in src)
 
 check("关于页版本号与更新日志都有 v7.3 段（版本号跟随最新，v7.3 的历史条目保留）",
       ">v7.10</div>" in src and "v7.3：📐 结算公式说明块" in src)
@@ -86,10 +99,17 @@ check("关于页版本号与更新日志都有 v7.3 段（版本号跟随最新�
 # ══════════════════════════════════════════════════════════════
 section("B. 口径纪律（说明块只做展示，不算第二份账）")
 
-i_fn = src.find("function settleFormulaHTML(r, open) {")
+i_fn = src.find("function settleFormulaHTML(r) {")
 i_fn_end = src.find("\n}", i_fn)
 fn_body = src[i_fn:i_fn_end + 2]
 check("函数体抽取成功（防止下面的判据空转）", i_fn > 0 and len(fn_body) > 500, f"{len(fn_body)} 字符")
+
+i_id = src.find("function _formulaIdent(r) {")
+i_id_end = src.find("\n}", i_id)
+id_body = src[i_id:i_id_end + 2]
+check("_formulaIdent() 抽取成功", i_id > 0 and len(id_body) > 300, f"{len(id_body)} 字符")
+for bad, why in [("Math.round", "自己取整"), ("parseCents(", "自己换算分"), ("calcMonth(", "自己算一遍月结")]:
+    check(f"_formulaIdent() 内也不出现 {bad}（{why}）", bad not in id_body)
 
 for bad, why in [("Math.round", "自己取整"),
                  ("parseCents(", "自己换算分"),
@@ -101,8 +121,8 @@ for bad, why in [("Math.round", "自己取整"),
 check("函数体内不调用 apportionCents(…（只允许文案里出现函数名）",
       re.search(r"apportionCents\(\s*[A-Za-z0-9_]", fn_body) is None)
 
-check("金额全部经 RMB()/r.xxx 取用（与表格同源）",
-      fn_body.count("RMB(") >= 6 and "r.totalInc" in fn_body and "r.actualPL" in fn_body)
+check("金额全部经 RMB()/r.xxx 取用（与表格同源；逐人的 actualPL 现在由 _formulaIdent 汇总）",
+      fn_body.count("RMB(") >= 6 and "r.totalInc" in fn_body and "r.actualPL" in id_body)
 
 # ══════════════════════════════════════════════════════════════
 # C. 真实渲染（Node VM）
@@ -249,13 +269,17 @@ const results = [];
 const P = (n, c, d) => results.push([n, !!c, d || '']);
 
 /* —— 结构 —— */
-P('公式块已渲染', out.indexOf('id="settleFormula"') >= 0);
-P('默认收起（<details> 不带 open）', /<details class="formula-box" id="settleFormula">/.test(out),
-  (out.match(/<details class="formula-box"[^>]*>/) || [''])[0]);
+P('公式块已渲染成折叠块（#cs-formula）', out.indexOf('id="cs-formula"') >= 0);
+P('默认收起（data-open="0"、aria-expanded="false"）',
+  /<section class="section cs" id="cs-formula"[^>]*data-open="0"/.test(out)
+  && out.indexOf('aria-expanded="false" aria-controls="cs-formula-body"') >= 0,
+  (out.match(/<section class="section cs" id="cs-formula"[^>]*>/) || [''])[0]);
+P('与其它明细区同一套结构（cs-head / cs-caret / cs-body / cs-inner）',
+  out.indexOf('id="cs-formula-body"') >= 0 && out.indexOf('📐 结算公式') >= 0);
 P('五个小节齐全', ['① 团队层', '② 成员层', '③ 三条恒等式', '④ 取整规则', '⑤ 页面上每张表']
   .every((t) => out.indexOf(t) >= 0));
 P('位置：公式块在「🔄 资金重分配」之前',
-  out.indexOf('id="settleFormula"') < out.indexOf('🔄 资金重分配'));
+  out.indexOf('id="cs-formula"') < out.indexOf('🔄 资金重分配'));
 P('成员层 10 步都列了（v7.5 加入损耗费一步）',
   (out.match(/<tr><td>(?:[1-9]|10)<\/td>/g) || []).length === 10,
   String((out.match(/<tr><td>(?:[1-9]|10)<\/td>/g) || []).length));
@@ -292,16 +316,29 @@ P('块内不出现 −¥0.00 / +¥0.00（零值不带符号）',
   block.indexOf('−¥0.00') < 0 && block.indexOf('+¥0.00') < 0);
 P('块切片抓取成功（判据不空转）', block.length > 1500, String(block.length));
 
-/* —— 展开态：open=true 时带 open 属性 —— */
-const opened = vm.runInContext('settleFormulaHTML(calcMonth(monthFromRecords("2026-06")), true)', sandbox);
-P('open=true 时渲染出 open 属性（就地刷新可保留展开态）',
-  /<details class="formula-box" id="settleFormula" open>/.test(opened));
+/* —— 函数只产出块内内容：不再自带开关 —— */
+const opened = vm.runInContext('settleFormulaHTML(calcMonth(monthFromRecords("2026-06")))', sandbox);
+P('函数只返回块内内容（.formula-body，无 <details>/<summary>）',
+  opened.indexOf('<div class="formula-body">') === 0
+  && opened.indexOf('<details') < 0 && opened.indexOf('<summary') < 0,
+  opened.slice(0, 40));
+
+/* —— 摘要行与块内自检同源 —— */
+const sumTxt = String(vm.runInContext(
+  '_foldSums(calcMonthWithUsage(currentKey), monthFromRecords(currentKey)).formula', sandbox));
+const ident = vm.runInContext('_formulaIdent(calcMonth(monthFromRecords("2026-06")))', sandbox);
+P('折叠摘要行跑的是同一份 _formulaIdent()（✅/❌ 与 Π 都在，且与自检结果一致）',
+  sumTxt.indexOf('恒等式') >= 0 && sumTxt.indexOf('Π') >= 0
+  && sumTxt.indexOf(ident.ok ? '✅' : '❌') >= 0
+  && sumTxt.indexOf('¥') >= 0,
+  sumTxt + '  /  ok=' + ident.ok);
 
 /* —— 就地刷新接线真的会重写 #dashFormula —— */
 vm.runInContext('currentTab = "dash"; _refreshDashSummary();', sandbox);
 const refreshed = els['#dashFormula'].innerHTML || '';
-P('_refreshDashSummary() 重写 #dashFormula（改转账后公式跟着变）',
-  refreshed.indexOf('📐 结算公式') >= 0 && refreshed.indexOf('ΣC = ' + R.sCtxt) >= 0,
+P('_refreshDashSummary() 重写 #dashFormula（改转账后公式跟着变，且仍是折叠块）',
+  refreshed.indexOf('📐 结算公式') >= 0 && refreshed.indexOf('ΣC = ' + R.sCtxt) >= 0
+  && refreshed.indexOf('id="cs-formula"') >= 0,
   String(refreshed.length) + ' 字符');
 
 let bad = 0;
@@ -330,13 +367,13 @@ section("D. 变异自证（改坏 → 必须变红，证明上面的绿不是空
 
 MUTANTS = [
     ("默认收起",
-     "h += '<div id=\"dashFormula\">' + settleFormulaHTML(r, false) + '</div>';",
-     "h += '<div id=\"dashFormula\">' + settleFormulaHTML(r, true) + '</div>';"),
+     "              settleFormulaHTML(r), false)",
+     "              settleFormulaHTML(r), true)"),
     ("ΣN ≡ 0 与自检",
      "sumNet += r.net[mem.id] || 0;",
      "sumNet += 1;"),
     ("团队盈亏",
-     "var teamPL = r.totalInc - r.totalExp - depTotal;",
+     "var teamPL = r.totalInc - r.totalExp - (r.depTotal || 0);",
      "var teamPL = r.totalInc + r.totalExp;"),
 ]
 for name, old, new in MUTANTS:

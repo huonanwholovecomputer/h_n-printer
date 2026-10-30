@@ -406,26 +406,12 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .settle-box-real { border-color: var(--primary); }
 .settle-box-real h2 { color: var(--primary); }
 
-/* ==================== 📐 结算公式说明块（v7.3） ====================
-   可折叠：常驻只占一行（<summary>），展开才把 8 步公式摊开，不干扰日常看数。
-   用原生 <details> 而不是自写开关 —— 开关状态由它自己管、刷新后默认收起、键盘可达。
-   v7.13 起开合带高度动画（见 JS 里的 _formulaAnimRun）：状态仍归 <details>，
-   JS 只在点 <summary> 时接管"先动画再关"，prefers-reduced-motion 下退回瞬时开关。 */
-.formula-box { background: var(--card); border: 1px solid var(--border-strong); border-radius: var(--radius); margin-top: 18px; box-shadow: var(--shadow-sm); }
-.formula-box > summary {
-  cursor: pointer; padding: 12px 16px; font-weight: 700; font-size: .95rem;
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  list-style: none; user-select: none; border-radius: var(--radius);
-}
-.formula-box > summary::-webkit-details-marker { display: none; }
-.formula-box > summary .hint { font-weight: 400; font-size: .8rem; color: var(--muted); }
-/* 展开/收起提示紧跟在标题文案之后（不靠右对齐）：右上角有个固定的 🌓 主题悬浮按钮
-   （.floating-btn，top:14 right:16），窄窗口下它正好压在大卡片的右上角 —— 提示若右对齐
-   就会被它盖住。跟着标题走则任何宽度都点得到。 */
-.formula-box > summary::after { content: '展开 ▾'; margin-left: 8px; font-size: .78rem; font-weight: 400; color: var(--primary); }
-.formula-box[open] > summary::after { content: '收起 ▴'; }
-.formula-box[open] > summary { border-bottom: 1px solid var(--border); border-radius: var(--radius) var(--radius) 0 0; }
-.formula-body { padding: 14px 16px 8px; font-size: .86rem; line-height: 1.9; }
+/* ==================== 📐 结算公式说明块（v7.3 / v7.14） ====================
+   常驻只占一行摘要，展开才把完整算式摊开，不干扰日常看数。
+   v7.14 起与其它十个明细区统一走自写 secFold（.cs / .cs-head / .cs-body）：
+   开合动画、状态持久化（localStorage）、键盘可达全部复用那一套，
+   这里只剩内容样式 —— 原来那套原生 <details> + WAAPI 高度动画已整体删除。 */
+.formula-body { padding: 4px 18px 16px; font-size: .86rem; line-height: 1.9; }
 .formula-body h3 { font-size: .9rem; margin: 12px 0 6px; color: var(--primary); }
 .formula-body h3:first-child { margin-top: 0; }
 .formula-body code {
@@ -6192,8 +6178,11 @@ function renderDash() {
                dashAdvanceHTML(r), false);
 
   /* 📐 结算公式（只展示，v7.3）—— 放在「资金重分配」之前：先讲清算式，再看具体的转账指令。
-     它本身是原生 <details>（一行标题），不再套一层折叠。 */
-  h += '<div id="dashFormula">' + settleFormulaHTML(r, false) + '</div>';
+     v7.14：它也是一个 secFold 折叠块（与上面十个同一套开关/动画/持久化）。 */
+  h += '<div id="dashFormula">'
+    + secFold('formula', { title: '📐 结算公式', hint: '完整算式 · 金额整数分', sum: FS.formula, kind: 'real' },
+              settleFormulaHTML(r), false)
+    + '</div>';
 
   h += secFold('redist', { title: '🔄 资金重分配', hint: '按账面算的建议转账', sum: FS.redist, kind: 'warn' },
                dashRedistHTML(r), false);
@@ -6318,6 +6307,7 @@ function _foldSums(r, m) {
   (r.view.advance || []).forEach(function (row) {
     if (row.adv > 0) advIn += row.adv; else if (row.adv < 0) advOut += -row.adv;
   });
+  var ide = _formulaIdent(r);
   var amortState = (amort.state || 'none');
   var amortHint = amortState === 'ready' ? '按批次摊销'
     : amortState === 'loading' ? '统计中…'
@@ -6340,6 +6330,8 @@ function _foldSums(r, m) {
       + (left > 1 ? (' · 还差 ' + RMB(left)) : ' · 已结清'),
     /* Σgap ≡ 0（Σnet ≡ 0），「还差多少」只在「实际转账」那行有意义，别在这里重复一遍 */
     realpl: '实际 ' + sgn(t.totalActual),
+    /* 与块内「③ 三条恒等式 · 本月实算」同一份 _formulaIdent() 结果，不允许各算一次 */
+    formula: '恒等式 ' + (ide.ok ? '✅' : '❌') + ' · Π ' + sgn(ide.teamPL),
   };
 }
 
@@ -6369,81 +6361,6 @@ document.addEventListener('click', function (ev) {
   _syncFoldCount();
 });
 
-/* ── v7.13：结算公式块（原生 <details>）的开合动画 ──
-   原生 <details> 是瞬时开关，没有过渡。这里用 WAAPI 把 .formula-body 从 0 撑到内容高度：
-   · 打开：默认行为照走（<details> 自己变 open），toggle 事件里补一段 0 → 全高的动画；
-   · 收起：<details> 一旦 open=false 内容立刻消失、动画无从谈起，所以点 <summary> 时在捕获阶段
-     preventDefault 把开关拦住，先把高度动画到 0，结束时再 det.open = false；
-   · 动画中途再点（收起途中）＝ 反悔要它展开，直接反向跑回全高；
-   · prefers-reduced-motion: reduce 时全部放行原生行为，不加动画。
-   为什么要 JS 而不是纯 CSS：`interpolate-size: allow-keywords` + `::details-content`
-   只有很新的 Chromium 支持，用户是系统浏览器（Chrome/Edge 版本不可控），不能赌。 */
-var FORMULA_ANIM_MS = 220;
-var FORMULA_ANIM_EASE = 'cubic-bezier(0.23, 1, 0.32, 1)';
-
-function _formulaReduceMotion() {
-  try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
-  catch (e) { return false; }
-}
-
-function _formulaAnimRun(det, opening) {
-  var body = det.querySelector('.formula-body');
-  if (!body) return null;
-  if (det._fAnim) { try { det._fAnim.cancel(); } catch (e) {} det._fAnim = null; }
-  body.style.cssText = '';
-  var full = body.offsetHeight;          /* 展开态整块高度：收起动画的起点、打开动画的终点 */
-  if (!full) return null;
-  body.style.boxSizing = 'border-box';
-  body.style.overflow = 'hidden';
-  var OPEN_KF = { height: full + 'px', paddingTop: '14px', paddingBottom: '8px', opacity: 1 };
-  var SHUT_KF = { height: '0px', paddingTop: '0px', paddingBottom: '0px', opacity: 0 };
-  if (opening) {                          /* 先落到收起态，避免第一帧闪一下全高 */
-    body.style.height = '0px';
-    body.style.paddingTop = '0px';
-    body.style.paddingBottom = '0px';
-    body.style.opacity = '0';
-  }
-  var anim = body.animate(opening ? [SHUT_KF, OPEN_KF] : [OPEN_KF, SHUT_KF],
-    { duration: FORMULA_ANIM_MS, easing: FORMULA_ANIM_EASE, fill: 'both' });
-  det._fAnim = anim;
-  det._fOpening = !!opening;
-  anim.onfinish = function () {
-    det._fAnim = null;
-    if (!opening) det.open = false;       /* 先真的关掉，再清内联样式（否则会闪一帧全高） */
-    body.style.cssText = '';
-  };
-  return anim;
-}
-
-function _isFormulaSummary(el) {
-  while (el && el.nodeType === 1 && el.tagName !== 'SUMMARY') el = el.parentNode;
-  if (!el || el.nodeType !== 1 || el.tagName !== 'SUMMARY') return null;
-  var det = el.parentNode;
-  if (!det || det.tagName !== 'DETAILS' || !det.classList || !det.classList.contains('formula-box')) return null;
-  return det;
-}
-
-document.addEventListener('click', function (ev) {
-  var det = _isFormulaSummary(ev.target);
-  if (!det) return;
-  if (_formulaReduceMotion()) return;                 /* 降级：交给原生瞬时开合 */
-  if (!det.open) return;                              /* 打开：走默认行为，toggle 事件里补动画 */
-  if (det._fAnim && !det._fOpening) {                 /* 收起途中又点：反悔，跑回全高 */
-    ev.preventDefault();
-    _formulaAnimRun(det, true);
-    return;
-  }
-  ev.preventDefault();                                /* 收起：先动画，结束时再真的关 */
-  _formulaAnimRun(det, false);
-}, true);
-
-document.addEventListener('toggle', function (ev) {
-  var det = ev.target;
-  if (!det || det.tagName !== 'DETAILS' || !det.classList || !det.classList.contains('formula-box')) return;
-  if (!det.open || _formulaReduceMotion()) return;
-  if (det._fAnim && det._fOpening) return;            /* 反悔路径自己已经在跑了 */
-  _formulaAnimRun(det, true);
-}, true);
 
 function dashVerdictHTML(m, r, ustate) {
   var v = (r && r.view) || null;
@@ -7128,11 +7045,10 @@ function printerUsageSectionHTML(orders) {
      B_i   应得盈亏 = R_i − A_i − D_i                 C_i 实际盈亏 = I_i + T_i − E_i − D_i
      g_i   未结清 = N_i − T_i = B_i − C_i
    恒等式：ΣN_i ≡ 0；ΣC_i ≡ ΣB_i ≡ Π = I − E − D；T_i ≡ N_i ⇒ C_i = B_i（全额结清时两口径重合）。
-   open 参数：就地刷新时保留展开态 —— 用户摊开公式在看，改一笔转账不该把它收起来。 */
-function settleFormulaHTML(r, open) {
+   展开/收起：v7.14 起归 secFold（简洁一行摘要），这里不再管开关，只产出块内内容。 */
+function _formulaIdent(r) {
   var members = getMembers();
   var sumNet = 0, sumBook = 0, sumActual = 0, bookClash = 0;
-  var depTotal = r.depTotal || 0;
   members.forEach(function (mem) {
     sumNet += r.net[mem.id] || 0;
     /* v7.11：ΣB 直接累加 calcMonth 的 bookPL（含 ± 损耗费 W）。
@@ -7144,14 +7060,24 @@ function settleFormulaHTML(r, open) {
     if (b !== ((r.redist[mem.id] || 0) - (r.perPersonShare[mem.id] || 0) - (r.depByMember[mem.id] || 0) + (r.wearNet[mem.id] || 0))) bookClash++;
     sumActual += r.actualPL[mem.id] || 0;
   });
-  var teamPL = r.totalInc - r.totalExp - depTotal;
+  var teamPL = r.totalInc - r.totalExp - (r.depTotal || 0);
+  return {
+    sumNet: sumNet, sumBook: sumBook, sumActual: sumActual, teamPL: teamPL, bookClash: bookClash,
+    ok: (sumNet === 0) && (sumBook === sumActual) && (sumActual === teamPL) && (bookClash === 0)
+  };
+}
+
+function settleFormulaHTML(r) {
+  /* 自检只算一次：折叠块的摘要行（_foldSums.formula）与块内「本月实算」共用同一份结果，
+     否则摘要写 ✅、详情里写 ❌ 这种自相矛盾迟早出现。 */
+  var ide = _formulaIdent(r);
+  var sumNet = ide.sumNet, sumBook = ide.sumBook, sumActual = ide.sumActual;
+  var teamPL = ide.teamPL, identOk = ide.ok;
+  var depTotal = r.depTotal || 0;
   /* 0 不带符号 —— 别渲染出「−¥0.00」「+¥0.00」这种看着像 bug 的东西 */
   var sg = function (c) { return (c > 0 ? '+' : '') + RMB(c); };
-  var identOk = (sumNet === 0) && (sumBook === sumActual) && (sumActual === teamPL) && (bookClash === 0);
 
-  var h = '<details class="formula-box" id="settleFormula"' + (open ? ' open' : '') + '>';
-  h += '<summary>📐 结算公式 <span class="hint">（采购 / 代收 / 评分 / 实际转账 / 设备折旧 → 本月盈亏 的完整算式 · 金额一律整数分）</span></summary>';
-  h += '<div class="formula-body">';
+  var h = '<div class="formula-body">';
 
   /* ── ① 团队层 ── */
   h += '<h3>① 团队层：一行总式</h3>';
@@ -7222,7 +7148,7 @@ function settleFormulaHTML(r, open) {
   h += '<tr><td>KPI「本月盈亏」</td><td><code>Π</code> = <code>Σ代收 − Σ有效采购 − Σ设备折旧</code></td></tr>';
   h += '</tbody></table></div>';
 
-  h += '</div></details>';
+  h += '</div>';
   return h;
 }
 /* 只重绘两个派生区块（转出/入 状态条 + 实际盈亏表），不整体重绘 ——
@@ -7241,12 +7167,14 @@ function _refreshDashSummary() {
   var p = $('#dashRealPL');
   if (p) p.innerHTML = realPLSectionHTML(r);
   /* 📐 结算公式：里面的「本月实算」跟着转账变（ΣC 与 g 依赖 T_i），必须一起刷新。
-     但它是个 <details>，整体 innerHTML 重绘会把它收起来 —— 先记住展开态再按原样重绘。 */
+     v7.14：它也是 secFold —— 重绘后展开态由 foldIsOpen('formula') 从 localStorage 自动恢复，
+     不需要再探测 <details open>；重绘的块数没变，但要同步一次「已收起 N / M 块」。 */
   var f = $('#dashFormula');
   if (f) {
-    var keepOpen = false;
-    try { keepOpen = !!document.querySelector('#settleFormula[open]'); } catch (e) { keepOpen = false; }
-    f.innerHTML = settleFormulaHTML(r, keepOpen);
+    f.innerHTML = secFold('formula',
+      { title: '📐 结算公式', hint: '完整算式 · 金额整数分', sum: _foldSums(r, m).formula, kind: 'real' },
+      settleFormulaHTML(r), false);
+    _syncFoldCount();
   }
   var t = $('#dashTransferTotal');
   if (t) t.textContent = RMB(r.transferTotal);

@@ -131,9 +131,9 @@ print("\n--- 取整余数承接（🔴-C1）---")
 # Σ应得盈亏、文案里也会「提到」apportionCents()（要写明分摊走哪个函数）。下面两条是
 # **精确计数**判据，本意是「别处不许再多出第二份逐人计算」—— 因此把该展示块整体剔除后再数。
 # 剔除失败（锚点全丢）时 `_removable` 为假，下面会立刻多出一条 FAIL，不会静默放宽。
-_i_fbox = src.find('/* ==================== 📐 结算公式（v7.')   # v7.3 起存在，v7.4 仍是这一行
-_i_fbox_fn = src.find('function settleFormulaHTML(r, open) {')
-_i_fbox_end = src.find('\n}', _i_fbox_fn) + 2
+_i_fbox = src.find('/* ==================== 📐 结算公式（v7.')   # JS 段那行注释（v7.3 起存在，v7.4 至今未改）
+_i_fbox_fn = src.find('function _formulaIdent(r) {')   # v7.14：逐人自检抽成这个函数
+_i_fbox_end = src.find('\n}', src.find('function settleFormulaHTML(r) {')) + 2
 _removable = 0 <= _i_fbox < _i_fbox_fn < _i_fbox_end
 src_count = (src[:_i_fbox] + src[_i_fbox_end:]) if _removable else src
 check("『📐 结算公式』展示块可从计数源剔除（锚点仍在，否则下面两条不放宽）", _removable)

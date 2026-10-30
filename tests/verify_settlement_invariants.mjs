@@ -774,18 +774,18 @@ try {
         .filter((n) => typeof window[n] !== 'function'),
     };
   });
-  chk('v7.12 十个明细区都折成了折叠块（采购/用纸/摊销/折旧/收入/损益/垫付/重分配/转账/实际盈亏）',
-      fold.n === 10 && fold.keys.join(',') === 'expense,paper,amort,dep,income,pl,advance,redist,transfer,realpl',
+  chk('v7.12/14 十一个明细区都折成了折叠块（……/垫付/结算公式/重分配/转账/实际盈亏）',
+      fold.n === 11 && fold.keys.join(',') === 'expense,paper,amort,dep,income,pl,advance,formula,redist,transfer,realpl',
       fold.keys);
   chk('v7.12 默认全部收起（收敛态才叫"抓得住重点"）', fold.open === 0 && fold.aria === true, JSON.stringify({ open: fold.open, aria: fold.aria }));
   chk('v7.12 收起态 body 高度都是 0（不是靠 overflow 视觉隐藏）', fold.bodyH.every((h) => h < 1), fold.bodyH);
   chk('v7.12 收起后整页 < 1600px（改版前 4987px：结论卡 + KPI + 10 行摘要就够看完）',
       fold.height > 0 && fold.height < 1600, fold.height + 'px');
   chk('v7.12 标题上移到摘要行（块内 h2 隐藏，但仍留在 DOM 里给脚本按文案查）', fold.h2hidden);
-  chk('v7.12 工具条写着「已收起 N / 10 块」且与实际一致',
-      fold.hasBar && /已收起 10 \/ 10 块/.test(fold.count), fold.count);
-  chk('v7.12 每块摘要行都写了这一块最该看的数（10 块全非空）',
-      Object.keys(fold.sums).length === 10 && Object.keys(fold.sums).every((k) => (fold.sums[k] || '').length > 2),
+  chk('v7.12 工具条写着「已收起 N / 11 块」且与实际一致',
+      fold.hasBar && /已收起 11 \/ 11 块/.test(fold.count), fold.count);
+  chk('v7.12/14 每块摘要行都写了这一块最该看的数（11 块全非空）',
+      Object.keys(fold.sums).length === 11 && Object.keys(fold.sums).every((k) => (fold.sums[k] || '').length > 2),
       fold.sums);
   chk('v7.12 摘要行数字与 view/usage 同源（采购总额 / 团队折旧 / 损耗费单列 / 已录转账）',
       String(fold.sums.expense || '').indexOf('300.00') >= 0 && /^团队/.test(String(fold.sums.dep || ''))
@@ -823,74 +823,91 @@ try {
     count: (document.querySelector('#foldCount') || {}).textContent || '',
     height: document.querySelector('#tab-dash').scrollHeight,
   }));
-  chk('v7.12「全部展开」把 10 块都摊开且计数同步', allOpen.open === 10 && /已收起 0 \/ 10 块/.test(allOpen.count), allOpen);
+  chk('v7.12「全部展开」把 11 块都摊开且计数同步', allOpen.open === 11 && /已收起 0 \/ 11 块/.test(allOpen.count), allOpen);
   chk('v7.12 展开后仍装得下全部明细（高度回到 4000px 以上，说明内容没被折叠逻辑吃掉）',
       allOpen.height > 4000, allOpen.height + 'px');
   await page.evaluate(() => window.foldAllDash(0));
   await page.waitForTimeout(320);
 
-  chk('v7.12 renderDash 只用 foldBarHTML + 10 个 secFold 编排（再有人把表格 inline 回主函数会红）',
-      rd.indexOf('foldBarHTML()') >= 0 && (rd.match(/secFold\(/g) || []).length === 10
+  chk('v7.12/14 renderDash 只用 foldBarHTML + 11 个 secFold 编排（再有人把表格 inline 回主函数会红）',
+      rd.indexOf('foldBarHTML()') >= 0 && (rd.match(/secFold\(/g) || []).length === 11
       && rd.indexOf('<table') < 0 && rd.indexOf('kpi-grid') < 0,
       { secFold: (rd.match(/secFold\(/g) || []).length, len: rd.length });
   chk('v7.12 记一笔转账后摘要行跟着重算（_refreshDashSummary 里挂了 _applyFoldSums）',
       sliceFn(src, '_refreshDashSummary').indexOf('_applyFoldSums(') >= 0);
 
-  /* ══ 14. v7.13：结算公式块（原生 <details>）也有开合动画 ══
-     原生 <details> 是瞬时开关。这里钉两件事：
-       ① 打开时真的跑了一段 220ms 的高度动画（不是瞬移），跑完不残留内联高度；
-       ② 收起是"先动画、动画完才真的关"（动画期间 details 仍是 open），不是瞬间消失。 */
-  const fa = await page.evaluate(async () => {
-    const det = document.querySelector('details.formula-box#settleFormula');
-    if (!det) return { ok: false, why: 'no details' };
-    const sum = det.querySelector('summary');
-    const body = det.querySelector('.formula-body');
+  /* ══ 14. v7.14：结算公式也是一个自写 secFold 折叠块（原生 <details> 那套已删净） ══
+     它曾经是整页唯一的原生 <details>（v7.3），v7.13 还给它单独写过 WAAPI 高度动画；
+     v7.14 统一到 secFold —— 一份折叠实现、一份动画、一份 localStorage 记忆。
+     这里钉三件事：① DOM 是标准折叠块且默认收起；② 点开后有内容、摘要行与自检同源；
+     ③ 源码里不再有第二套开关（details / _formulaAnimRun / toggle 监听）。 */
+  const fx = await page.evaluate(async () => {
+    const sec = document.querySelector('#cs-formula');
+    if (!sec) return { ok: false };
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const running = () => document.getAnimations()
-      .filter((a) => a.effect && a.effect.target === body && a.playState === 'running');
     const out = { ok: true };
-
-    sum.click();                                   /* 打开 */
-    await wait(40);
-    out.opening = running().map((a) => a.effect.getTiming().duration);
-    out.openingCount = running().length;
-    await wait(320);
-    out.openDone = { open: det.open, inline: body.style.cssText, h: body.offsetHeight, scroll: body.scrollHeight };
-
-    sum.click();                                   /* 收起 */
-    await wait(40);
-    out.closing = { open: det.open, running: running().length, h: Math.round(body.getBoundingClientRect().height) };
-    await wait(360);
-    /* 注意：收起后 .formula-body 被浏览器的 details 内部容器（content-visibility: hidden）藏起来，
-       但对它量 offsetHeight / getBoundingClientRect 仍返回"最后一次布局"的旧高度（夹具里 1531），
-       所以"关掉了没有"只能看 details 自己的盒子高度（剩 summary 一行），别看 body。 */
-    out.closed = { open: det.open, inline: body.style.cssText,
-                   detH: Math.round(det.getBoundingClientRect().height) };
+    out.static = {
+      isCs: sec.classList.contains('cs'),
+      open: sec.getAttribute('data-open'),
+      aria: sec.querySelector('.cs-head').getAttribute('aria-expanded'),
+      sum: ((sec.querySelector('.cs-sum') || {}).textContent || '').replace(/\s+/g, ' ').trim(),
+      hasFormulaBody: !!sec.querySelector('#cs-formula-body .cs-inner .formula-body'),
+      detailsLeft: document.querySelectorAll('details.formula-box, #settleFormula').length,
+    };
+    sec.querySelector('.cs-head').click();
+    await wait(340);
+    const body = sec.querySelector('.cs-body');
+    out.open = {
+      open: sec.getAttribute('data-open'),
+      aria: sec.querySelector('.cs-head').getAttribute('aria-expanded'),
+      h: Math.round(body.getBoundingClientRect().height),
+      inner: sec.querySelector('.cs-inner').scrollHeight,
+      store: localStorage.getItem('finance.fold.v1') || '',
+      chkCount: sec.querySelectorAll('.chk').length,
+    };
+    const t = sec.textContent || '';
+    out.text = ['① 团队层', '② 成员层', '③ 三条恒等式', '④ 取整规则', '⑤ 页面上每张表']
+      .every((x) => t.indexOf(x) >= 0);
+    out.ident = /✅ 自检通过|❌ 三处对不上/.test(t);
+    out.steps = (t.match(/<tr><td>(?:[1-9]|10)<\/td>/g) || []).length;
+    sec.querySelector('.cs-head').click();
+    await wait(340);
+    out.reclosed = Math.round(body.getBoundingClientRect().height);
     return out;
   });
-  chk('v7.13 打开结算公式：真的跑了 220ms 高度动画（不是瞬移）',
-      fa.ok && fa.openingCount === 1 && fa.opening[0] === 220, fa);
-  chk('v7.13 动画跑完不残留内联高度（body 回到 auto，否则后续内容会被裁）',
-      fa.ok && fa.openDone.open === true && fa.openDone.inline === ''
-      && Math.abs(fa.openDone.h - fa.openDone.scroll) < 2, fa.openDone);
-  chk('v7.13 收起是"先动画、动画完才真的关"：动画期间 details 仍是 open，高度已在收',
-      fa.ok && fa.closing.open === true && fa.closing.running === 1
-      && fa.closing.h > 0 && fa.closing.h < fa.openDone.h, fa.closing);
-  chk('v7.13 动画结束后 details 真的关掉（盒子只剩 summary 一行，不是被内联高度撑着）',
-      fa.ok && fa.closed.open === false && fa.closed.inline === ''
-      && fa.closed.detH > 0 && fa.closed.detH < 90, fa.closed);
+  chk('v7.14 结算公式是标准折叠块（#cs-formula / .cs / 摘要行 / .cs-inner>.formula-body / 默认收起）',
+      fx.ok && fx.static.isCs && fx.static.open === '0' && fx.static.aria === 'false'
+      && fx.static.hasFormulaBody && fx.static.sum.length > 2, fx.static);
+  chk('v7.14 页面里已经没有原生 <details> 公式块（details.formula-box / #settleFormula）',
+      fx.ok && fx.static.detailsLeft === 0, fx.static && fx.static.detailsLeft);
+  chk('v7.14 点开：高度动画到内容高度、aria 与 localStorage 同步（与其它块同一套开关）',
+      fx.ok && fx.open.open === '1' && fx.open.aria === 'true'
+      && Math.abs(fx.open.h - fx.open.inner) < 2 && /"formula":1/.test(fx.open.store), fx.open);
+  chk('v7.14 展开后五个小节齐、恒等式自检标记在、再点收起高度归 0',
+      fx.ok && fx.text === true && fx.ident === true && fx.reclosed < 1,
+      { text: fx.ok && fx.text, ident: fx.ok && fx.ident, reclosed: fx.ok && fx.reclosed });
 
-  const fasc = sliceFn(src, '_formulaAnimRun');
-  chk('v7.13 结算公式动画走 WAAPI + 自定义缓动，且 reduced-motion 时整段让位给原生',
-      fasc.indexOf('body.animate(') >= 0 && fasc.indexOf("fill: 'both'") >= 0
-      && fasc.indexOf('FORMULA_ANIM_EASE') >= 0
-      && /_formulaReduceMotion\(\)/.test(sliceFn(src, '_isFormulaSummary') + sliceFn(src, '_formulaReduceMotion'))
-      && src.indexOf("document.addEventListener('toggle'") >= 0
-      && src.indexOf('if (!det.open) return;') >= 0,
-      { len: fasc.length });
-  chk('v7.13 收起时在捕获阶段 preventDefault 拦住原生开关（否则内容瞬间消失、动画看不见）',
-      /document\.addEventListener\('click', function \(ev\) \{[\s\S]*?ev\.preventDefault\(\);[\s\S]*?_formulaAnimRun\(det, false\)/.test(src)
-      && src.indexOf("}, true);") >= 0);
+  chk('v7.14 renderDash 用 secFold(\'formula\') 编排、settleFormulaHTML 只收一个数据参数',
+      src.indexOf("secFold('formula'") >= 0
+      && /function settleFormulaHTML\(r\) \{/.test(src)
+      && src.indexOf('function settleFormulaHTML(r, open)') < 0);
+  chk('v7.14 v7.13 的 details 动画已删净（无 _formulaAnimRun / FORMULA_ANIM / toggle 监听）',
+      src.indexOf('_formulaAnimRun') < 0 && src.indexOf('FORMULA_ANIM') < 0
+      && src.indexOf('_isFormulaSummary') < 0 && src.indexOf("document.addEventListener('toggle'") < 0);
+  const fBody = sliceFn(src, 'settleFormulaHTML');
+  chk('v7.14 摘要行与块内自检同源（共用 _formulaIdent，块内不再自己累加一遍）',
+      /function _formulaIdent\(r\) \{/.test(src)
+      && sliceFn(src, '_foldSums').indexOf('_formulaIdent(r)') >= 0
+      && fBody.indexOf('_formulaIdent(r)') >= 0
+      && fBody.indexOf('Math.round') < 0
+      /* 只「调用」_formulaIdent 还不够：v21 变体保留调用、又把 sumNet 现场重算了一遍，
+         摘要行与块内就可能各说一套 —— 所以块内不许再出现累加/遍历成员。 */
+      && fBody.indexOf('sumNet +=') < 0 && fBody.indexOf('sumBook +=') < 0
+      && fBody.indexOf('getMembers().forEach') < 0);
+  chk('v7.14 就地刷新：重绘同一套折叠块并同步「已收起 N / M 块」',
+      /f\.innerHTML = secFold\('formula'/.test(src)
+      && sliceFn(src, '_refreshDashSummary').indexOf('_syncFoldCount()') >= 0
+      && src.indexOf('keepOpen') < 0);
 
   /* ══ 11. 页面干净：没有 JS 报错、没有外网请求 ══ */
   chk('无 JS 运行时错误（pageerror）', pageErrors.length === 0, pageErrors.slice(0, 3));
