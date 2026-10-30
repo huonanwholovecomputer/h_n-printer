@@ -1,9 +1,9 @@
 {
-  "version": "4.5.39",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.39.exe",
-  "md5": "1e4a853795a7f217ae6f0eb8af0d05dd",
-  "sha256": "0f8b7fef7537ceeb2e5de0981ce88bfe7d0aae7dce7ff1452d038f2a9bf9a8b3",
-  "notes": "v4.5.39：① 外部打印监视不再每条都要人工确认 —— 页数与单双面都自动读到就直接记为「已确认」并计入合计（只有读不全才弹补录框，补完在「外部打印账本」里点「标记已处理」；实际没出纸的用「标记已忽略」撤销）；② 收支清算页两条「正在统计…」横幅改成转圈加载态，不再像卡住；③ 取数完成、以及首屏「暂无成员」→ 卡片载入时，KPI 卡片与下方区块错峰淡入；④ 系统开启「减少动效」时不播这段动画。",
+  "version": "4.5.40",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.40.exe",
+  "md5": "4399b4ced6f5e98690e48fd0e29175ea",
+  "sha256": "f215b084cac4ee34cc2b32e6590110cfea9bb976637c460f428f57442b560943",
+  "notes": "v4.5.40：① 手动双面「第 1 趟」计时不再抢跑 —— 上一单还在出纸时点第二单，翻纸窗会等队列排空才开始计时，不会再让你提前翻纸；② Ctrl+Shift+T 打开「标签页管理」窗；③ 「本机队列」并入攒批队列常驻窗（进行中/等待中/预计完成）；④ 开始打印前若还有文件在统计页数，先等统计完再出纸（不再冻结标签页、不空转取号）；⑤ 日志只保留近 30 天（local_tool.log 与 finance_audit.log 永不清理）；⑥ 外部打印监视不再把 Windows 占位作业「本地下层文档」重复记账。收支清算：采购支出新增「所属打印机」列（硒鼓按所属机器本月页数摊销）；「用纸统计」每人可编辑「废纸」格，废纸计入本月用纸量。云端：接单设备支持置顶排序（离线不降级）；父单页数按子行汇总，修正个别订单少收费。",
   "sig_algo": "ed25519",
-  "sig": "B8s7Hj86hPAKLLlxNxF7lCDo8VYkrGrtUhWQpCxe/TFQyKXUyOFrDlSBAyJB1GcE7hHjcHjM8Jyse/x4R0rEBQ=="
+  "sig": "P6168dXj70v2zZ4tAysheYriKEU2wtfO+LdtIO6N4kdvmqOj6F0V2oPv1HI4BmDy2PpfcWrUbvJSDsDp7FbLBw=="
 }

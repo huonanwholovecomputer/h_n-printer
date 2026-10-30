@@ -1,8 +1,8 @@
 {
-  "version": "1.1.49",
-  "versionCode": 50,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.49.apk",
-  "md5": "f31f824b4c85e772b3c2c20fab94ff23",
-  "notes": "v1.1.49：本版**只重打包对齐 web 资源**（本轮没有移动端功能改动）—— 修正上一版 APK 内嵌的 index.html / me.js 与 www/ 不一致的问题；头像裁剪、价格复制气泡等既有功能不变。",
+  "version": "1.1.50",
+  "versionCode": 51,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.50.apk",
+  "md5": "26cac71885e7934e7834b3abbaf5e027",
+  "notes": "v1.1.50：① 接单设备支持置顶顺序 —— 常来的那台机器排在最前，离线设备自动排到在线之后（置顶排名在后台设置，App 按顺序展示）；② 隐私弹层按钮改为整行各半宽，更好点；③ 同步本轮云端修复（父单页数按子行汇总，个别订单不再少收费）。",
   "force": false
 }
