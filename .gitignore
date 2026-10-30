@@ -109,6 +109,15 @@ docs/DDoS评估_2026-10/
 # 需要取回历史版本：`git show <rev>:docs/<文件名>`。
 docs/*.md
 
+# 同理：`CLAUDE.md` 拆出来的移动端子文档（`mobile_apps/docs/*.md`）也只留本地。
+# 上面的 `docs/*.md` 只覆盖根 docs/，不含子目录；不显式写这条，拆分出的子文档就会
+# 以未跟踪文件身份出现在 git status，一次 `git add -A` 就会被带进公开仓库。
+mobile_apps/docs/*.md
+
+# 拆分基线（拆分前的 CLAUDE.md 原文，供 tests/verify_context_docs.py 逐字节对账）。
+# 目录不是 .md 文件，`docs/*.md` 盖不住，必须显式忽略，否则 134 KB 原文会被 `git add -A` 带进仓库。
+docs/拆分基线_2026-10-30/
+
 # 崩溃报告/调试文件
 crash_traceback.txt
 
