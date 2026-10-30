@@ -1448,19 +1448,46 @@ function stopPrinterPolling() {
 
 /* ================= 可接单设备（2026-12 多设备接单） ================= */
 
-let claimingDevices = [];      // 可接单设备列表 {client_id, label, online, ...}
+let claimingDevices = [];      // 可接单设备列表 {client_id, label, online, pin, pin_index, ...}
 let selectedDeviceId = '';     // 当前选中的目标设备（提交订单时随 target_client_id 上报）
 let stackTogglingId = '';      // 攒批模式远程切换中（client_id）：非空时开关置灰、拒绝重复点击
+// 接单设备「自动选中 / 用户手动选中」状态位（2026-10 置顶）。只有用户真手点设备条
+// （设备列表的事件委托）会置 true；默认口径选出来的设备一律保持 false。
+let deviceChosenByUser = false;
+// 刚保存过新的置顶顺序（一次性消费）：下一次 loadClaimingDevices 必须按服务端新顺序重置选中
+let deviceOrderJustSaved = false;
+// 「接单设备显示顺序」弹窗的**本地临时顺序**（置顶组在前）：{client_id,label,online,pin,pin_index}
+let deviceOrderRows = [];
+let deviceOrderSaving = false;
 
+// 服务端已排好序，返回顺序**就是**展示顺序：置顶组在前（按 pin_index 升序，组内完全不看在线）
+// → 未置顶组在线优先 → client_id。每台带 pin:boolean 与 pin_index:int(0 基)|null。
+//
+// 默认选中口径（2026-10 置顶，两条）：
+//   ① 有置顶 ⇒ 选 pin_index === 0 的那台（**离线也选**：任务排进队列等它上线，
+//      而不是偷偷换一台在线设备把顾客的单打到别人的纸上）；
+//   ② 无置顶 ⇒ 沿用老口径「第一个在线设备」，无在线则第一个。
+// 重置触发的三条条件（其余情况一律不抢用户的手动选择）：
+//   A) 用户刚保存了新的置顶顺序（deviceOrderJustSaved）⇒ 按新顺序重选（一次性）；
+//   B) 当前选中已失效（那台设备不再出现在可接单列表里）；
+//   C) 用户从未手动点选过（deviceChosenByUser !== true）⇒ 跟随默认口径（置顶变了也跟着变）。
+// 这三条任一命中才重置；且重置出来的选择仍是「自动选择」⇒ deviceChosenByUser 归 false。
 async function loadClaimingDevices() {
   try {
     const r = await api('/api/claiming_devices');
     const devices = (r.data && r.data.success && r.data.devices) ? r.data.devices : [];
     claimingDevices = devices;
-    // 保持用户已选设备；否则默认选第一个在线设备（无在线则第一个）
-    if (!devices.some(d => d.client_id === selectedDeviceId)) {
-      const onlineOne = devices.find(d => d.online);
-      selectedDeviceId = onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : '');
+    const pinFirst = devices.find(d => d.pin === true && d.pin_index === 0) ||
+                     devices.find(d => d.pin === true) || null;
+    const onlineOne = devices.find(d => d.online);
+    const defaultId = pinFirst ? pinFirst.client_id
+      : (onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : ''));
+    const stillSelectable = !!selectedDeviceId && devices.some(d => d.client_id === selectedDeviceId);
+    const justSaved = deviceOrderJustSaved === true;
+    if (justSaved) deviceOrderJustSaved = false;
+    if (justSaved || !stillSelectable || deviceChosenByUser !== true) {
+      selectedDeviceId = defaultId;
+      deviceChosenByUser = false;   // 重置出来的仍是自动选择
     }
     renderDeviceList();
     return true;   // S1-09：给轮询调度器一个成功信号
@@ -1474,6 +1501,9 @@ function renderDeviceList() {
   const card = document.getElementById('deviceSelectCard');
   const list = document.getElementById('deviceList');
   if (!card || !list) return;
+  // 「显示顺序」入口：仅 admin/super_admin（普通用户整块不渲染，不留空壳）
+  const orderEntry = document.getElementById('deviceOrderEntry');
+  if (orderEntry) orderEntry.style.display = isAdminRole() ? '' : 'none';
   if (!claimingDevices.length) { card.style.display = 'none'; return; }
   card.style.display = '';
   // 入场动画：设备卡片已加入 PRINT_ENTRANCE 调度（0.15s）。
@@ -1484,6 +1514,7 @@ function renderDeviceList() {
     `<view class="device-item ${selectedDeviceId === d.client_id ? 'device-item-on' : ''}" data-id="${esc(d.client_id)}" data-hover="device-hover">
       <view class="device-dot ${d.online ? 'device-dot-on' : 'device-dot-off'}"></view>
       <text class="device-label">${esc(d.label || d.client_id)}</text>
+      ${d.pin ? '<text class="device-pin-badge">📌 置顶</text>' : ''}
       ${stackBadgeHtml(d)}
       ${stackToggleBtnHtml(d)}
       <text class="device-state ${d.online ? 'device-state-on' : 'device-state-off'}">${d.online ? '在线' : '离线'}</text>
@@ -1565,17 +1596,163 @@ async function toggleStackMode(clientId) {
   renderDeviceList();
 }
 
-// 设备选择（事件委托）
+// 设备相关点击（事件委托）
 document.addEventListener('click', function (e) {
+  if (!e.target.closest) return;
+  // 「显示顺序」入口（仅 admin/super_admin 会渲染它，openDeviceOrderSheet 里再兜一次底）
+  if (e.target.closest('.device-order-entry')) { openDeviceOrderSheet(); return; }
+  // 置顶开关（弹窗内）：先于其它处理，它在 .device-order-row 内部
+  const pinEl = e.target.closest('.device-order-pin');
+  if (pinEl && pinEl.dataset && pinEl.dataset.id) { toggleDevicePin(pinEl.dataset.id); return; }
+  // 置顶组内 ↑/↓
+  const moveEl = e.target.closest('.device-order-move');
+  if (moveEl && moveEl.dataset && moveEl.dataset.id && moveEl.dataset.dir) {
+    moveDevicePin(moveEl.dataset.id, moveEl.dataset.dir); return;
+  }
   // 攒批模式开关：先于设备选中处理（它在设备项内部，否则会被当成「选中该设备」）
-  const btn = e.target.closest ? e.target.closest('.device-stack-btn') : null;
+  const btn = e.target.closest('.device-stack-btn');
   if (btn && btn.dataset && btn.dataset.id) { toggleStackMode(btn.dataset.id); return; }
-  const item = e.target.closest ? e.target.closest('.device-item') : null;
+  const item = e.target.closest('.device-item');
   if (item && item.dataset && item.dataset.id) {
+    // 用户**真手点**的唯一入口 ⇒ 打开状态位：之后 30s 轮询/刷新都不许把它抢回去
+    // （除非那台设备从列表里消失，或用户自己又保存了新的置顶顺序）。
+    deviceChosenByUser = true;
     selectedDeviceId = item.dataset.id;
     renderDeviceList();
   }
 });
+
+/* ================= 接单设备显示顺序（置顶 / 置顶组内调优先级） =================
+   链路：GET /api/claiming_devices 拿 pin/pin_index → 本地改临时顺序（deviceOrderRows）→
+   POST /api/admin/device_pin_order {order:[置顶的 client_id 按序]} → 成功则重新拉列表
+   （服务端已排好序）并按新的 pin_index===0 重选；失败回滚本地顺序 + 弹窗内可见红字 + toast。 */
+
+// 服务端顺序 → 弹窗行：置顶组在前（按 pin_index 升序），未置顶组保持服务端顺序
+function buildDeviceOrderRows(devices) {
+  const pinned = [];
+  const rest = [];
+  (devices || []).forEach((d) => {
+    if (!d || !d.client_id) return;
+    const row = {
+      client_id: d.client_id,
+      label: d.label || d.device_name || d.client_id,
+      online: d.online === true,
+      pin: d.pin === true,
+      pin_index: (typeof d.pin_index === 'number') ? d.pin_index : null,
+    };
+    (row.pin ? pinned : rest).push(row);
+  });
+  const key = (r) => (r.pin_index === null ? 1e9 : r.pin_index);
+  pinned.sort((a, b) => key(a) - key(b));
+  return reindexPins(pinned.concat(rest));
+}
+
+// 置顶行的 pin_index 重排成 0..n-1（未置顶恒为 null），本地顺序与展示序一致
+function reindexPins(rows) {
+  let p = 0;
+  return rows.map(r => Object.assign({}, r, { pin_index: r.pin ? p++ : null }));
+}
+
+function openDeviceOrderSheet() {
+  if (!isAdminRole()) return;   // 兜底：普通用户/游客即使状态异常也不放行
+  deviceOrderRows = buildDeviceOrderRows(claimingDevices);
+  deviceOrderSaving = false;
+  const err = document.getElementById('deviceOrderError');
+  if (err) { err.style.display = 'none'; err.textContent = ''; }
+  const btn = document.getElementById('deviceOrderSaveBtn');
+  if (btn) { btn.textContent = '完成'; btn.disabled = false; }
+  renderDeviceOrderRows();
+  openModal('deviceOrderSheet');
+}
+
+function renderDeviceOrderRows() {
+  const body = document.getElementById('deviceOrderBody');
+  if (!body) return;
+  body.innerHTML = deviceOrderRows.map(r =>
+    `<view class="device-order-row${r.pin ? ' device-order-row-pinned' : ''}" data-id="${esc(r.client_id)}">
+      <view class="device-order-pin${r.pin ? ' device-order-pin-on' : ''}" data-id="${esc(r.client_id)}">${r.pin ? '📌 置顶' : '置顶'}</view>
+      <text class="device-order-name">${esc(r.label)}</text>
+      <text class="device-state device-order-state ${r.online ? 'device-state-on' : 'device-state-off'}">${r.online ? '在线' : '离线'}</text>
+      <view class="device-order-move${r.pin ? '' : ' device-order-move-disabled'}" data-id="${esc(r.client_id)}" data-dir="up">↑</view>
+      <view class="device-order-move${r.pin ? '' : ' device-order-move-disabled'}" data-id="${esc(r.client_id)}" data-dir="down">↓</view>
+    </view>`
+  ).join('');
+}
+
+// 置顶 / 取消置顶。新置顶的排到**置顶组末尾**（不抢已有的第一台，避免一次点击就改掉默认设备），
+// 取消置顶的回到**未置顶组开头** —— 两种情况下"插入点"都是去掉它之后的置顶行数。
+function toggleDevicePin(clientId) {
+  const rows = deviceOrderRows.slice();
+  const i = rows.findIndex(r => r.client_id === clientId);
+  if (i < 0) return;
+  const row = rows.splice(i, 1)[0];
+  const insertAt = rows.filter(r => r.pin).length;
+  rows.splice(insertAt, 0, Object.assign({}, row, { pin: !row.pin }));
+  deviceOrderRows = reindexPins(rows);
+  const err = document.getElementById('deviceOrderError');
+  if (err) { err.style.display = 'none'; err.textContent = ''; }
+  renderDeviceOrderRows();
+}
+
+// ↑ / ↓ 只在**置顶组内**调优先级（未置顶组顺序由服务端按「在线优先 → client_id」定）；
+// 到顶/到底不动，也不跨组。
+function moveDevicePin(clientId, dir) {
+  const rows = deviceOrderRows.slice();
+  const i = rows.findIndex(r => r.client_id === clientId);
+  if (i < 0 || !rows[i].pin) return;
+  const pinCount = rows.filter(r => r.pin).length;
+  const j = i + (dir === 'up' ? -1 : 1);
+  if (j < 0 || j >= pinCount) return;
+  const tmp = rows[i]; rows[i] = rows[j]; rows[j] = tmp;
+  deviceOrderRows = reindexPins(rows);
+  renderDeviceOrderRows();
+}
+
+function failDeviceOrder(msg) {
+  deviceOrderSaving = false;
+  const btn = document.getElementById('deviceOrderSaveBtn');
+  if (btn) { btn.textContent = '完成'; btn.disabled = false; }
+  // 回滚本地临时顺序（按服务端真值重建），再把失败原因**可见地**摆出来（不静默、也不显示成功态）
+  deviceOrderRows = buildDeviceOrderRows(claimingDevices);
+  renderDeviceOrderRows();
+  const err = document.getElementById('deviceOrderError');
+  if (err) { err.textContent = msg; err.style.display = ''; }
+  showToast(msg, 2500);
+}
+
+// 保存：order 只带**置顶**的 client_id（服务端自己去重保序、丢弃不可用 cid、截到 50 项）
+async function saveDeviceOrder() {
+  if (deviceOrderSaving) return;
+  const order = deviceOrderRows.filter(r => r.pin).map(r => r.client_id);
+  deviceOrderSaving = true;
+  const btn = document.getElementById('deviceOrderSaveBtn');
+  if (btn) { btn.textContent = '保存中…'; btn.disabled = true; }
+  try {
+    const r = await api('/api/admin/device_pin_order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order: order }),
+    });
+    const data = (r && r.data) || {};
+    const code = (r && r.status) || 0;
+    // 只有 HTTP 200 + success:true 才算成功（401/403/500 都是失败，403 文案「需要管理员权限」）
+    if (code !== 200 || data.success !== true) {
+      failDeviceOrder(data.message || ('保存失败（HTTP ' + code + '）'));
+      return;
+    }
+    deviceOrderSaving = false;
+    if (btn) { btn.textContent = '完成'; btn.disabled = false; }
+    closeModal('deviceOrderSheet');
+    // 保存成功 ⇒ 触发条件 A：重拉列表（服务端已按新顺序排好）并按 pin_index===0 重置选中
+    deviceChosenByUser = false;
+    deviceOrderJustSaved = true;
+    await loadClaimingDevices();
+    showToast('显示顺序已保存', 1500);
+  } catch (e) {
+    // 网络层异常（超时/断网/401 重登失败）同样回滚 + 明确提示
+    failDeviceOrder('网络错误，显示顺序保存失败');
+  }
+}
 
 /* ================= 初始化 ================= */
 

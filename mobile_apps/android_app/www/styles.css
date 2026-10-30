@@ -1829,6 +1829,133 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
   border-color: var(--gray3);
 }
 
+/* ── 接单设备置顶 / 显示顺序（2026-10，入口仅 admin/super_admin）──
+   1) .device-order-entry：卡片标题行右上角的入口（view 而非 button：小程序侧用 view + tap，
+      Web 侧同构，避免两端口径分叉）。margin-left:auto 推到行尾，字号沿用 .device-state 那一档。
+   2) .device-pin-badge：设备条里的置顶标记，字号/行高与 .device-state 同档 ⇒ 设备条仍
+      「每条一行、高度恒定」（.device-item 是 flex-wrap:nowrap + min-height 8.16cqw）。
+   3) 弹窗：复用 .modal-mask / .modal-sheet 家族；模糊来自 .modal-mask 的 backdrop-filter，
+      不生效时由它的半透明底色兜底。单位用 cqw（与既有写法一致，1rpx ≈ 0.12cqw）。 */
+.device-order-entry {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 0.48cqw 1.92cqw;
+  font-size: 2.64cqw;
+  line-height: 1.4;
+  color: var(--blue);
+  border: 0.12cqw solid var(--blue);
+  border-radius: 1.2cqw;
+  background: rgba(0, 122, 255, 0.08);
+  cursor: pointer;
+}
+.device-pin-badge {
+  flex-shrink: 0;
+  margin-right: 0.96cqw;
+  font-size: 2.52cqw;
+  line-height: 1.3;   /* 与 .device-state 同档，绝不撑高设备条 */
+  color: var(--blue);
+  font-weight: 600;
+}
+.device-order-sheet {
+  max-height: 76vh;
+}
+.device-order-hint {
+  display: block;
+  width: 100%;
+  margin-bottom: 2.4cqw;
+  font-size: 2.64cqw;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.device-order-body {
+  width: 100%;
+  max-height: 48vh;
+  overflow-y: auto;
+}
+.device-order-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: 1.2cqw;
+  padding: 1.44cqw 1.68cqw;
+  margin-bottom: 1.2cqw;
+  border: 0.12cqw solid var(--gray4);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+}
+.device-order-row-pinned {
+  border-color: var(--blue);
+  background: rgba(0, 122, 255, 0.08);
+}
+.device-order-pin {
+  flex-shrink: 0;
+  padding: 0.48cqw 1.68cqw;
+  font-size: 2.52cqw;
+  line-height: 1.3;
+  color: var(--text-secondary);
+  border: 0.12cqw solid var(--gray3);
+  border-radius: 0.96cqw;
+  cursor: pointer;
+}
+.device-order-pin-on {
+  color: #FFFFFF;
+  background: var(--blue);
+  border-color: var(--blue);
+}
+.device-order-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 2.88cqw;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 行内状态不再靠 margin-left:auto 贴尾（名称是 flex:1，已占满中间） */
+.device-order-state {
+  margin-left: 0;
+}
+.device-order-move {
+  flex-shrink: 0;
+  width: 6.24cqw;
+  height: 6.24cqw;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 3.12cqw;
+  color: var(--text-secondary);
+  background: rgba(120, 120, 128, 0.12);
+  border-radius: 1.2cqw;
+  cursor: pointer;
+}
+/* 未置顶的行不给调序（↑/↓ 只作用于置顶组），灰显但仍占位 ⇒ 行高不变 */
+.device-order-move-disabled {
+  color: var(--gray3);
+}
+/* 操作行**必须**显式整行宽（与 .modal-buttons / .privacy-sheet-actions 同一口径）：
+   .modal-sheet 是 align-items:center 的纵向 flex，width:auto 的中间层先收缩成内容宽，
+   里面按钮的 width:100% 会退化成「100% 的文案宽」。 */
+.device-order-actions {
+  display: flex;
+  width: 100%;
+  margin-top: 2.88cqw;
+}
+.device-order-done-btn {
+  width: 100%;
+  padding: 2.64cqw 0;
+  font-size: 3.12cqw;
+}
+.device-order-error {
+  display: block;
+  width: 100%;
+  margin-top: 1.92cqw;
+  font-size: 2.64cqw;
+  line-height: 1.5;
+  color: var(--red);
+  text-align: center;
+}
+
 /* ── File Section ── */
 .file-section {
   margin-bottom: 2.4cqw;
@@ -3204,6 +3331,31 @@ picker-view-column {
 .theme-dark .device-stack-btn-disabled {
   color: var(--gray3);
   border-color: var(--gray3);
+}
+/* 深色模式：显示顺序入口 / 置顶标记 / 弹窗行 —— 一律走既有令牌（--blue-light、--bg-card、
+   --text-secondary、--gray3/4），只把浅色那几处"亮底"的半透明改深，避免在 #1C1C1E 上发灰 */
+.theme-dark .device-order-entry {
+  color: var(--blue-light);
+  border-color: rgba(64, 156, 255, 0.55);
+  background: rgba(64, 156, 255, 0.12);
+}
+.theme-dark .device-pin-badge {
+  color: var(--blue-light);
+}
+.theme-dark .device-order-row {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.10);
+}
+.theme-dark .device-order-row-pinned {
+  border-color: rgba(64, 156, 255, 0.55);
+  background: rgba(64, 156, 255, 0.14);
+}
+.theme-dark .device-order-move {
+  background: rgba(255, 255, 255, 0.10);
+  color: var(--text-secondary);
+}
+.theme-dark .device-order-move-disabled {
+  color: var(--gray3);
 }
 
 /* ========== me.wxss — 我页 ========== */
@@ -6522,8 +6674,13 @@ body.theme-dark #view-user-orders .page-size-dropdown {
 .privacy-sheet-link-row {
   margin-top: 1.6cqw;
 }
+/* 操作行必须显式整行宽：.modal-sheet 是 align-items:center 的纵向 flex，
+   width:auto 的中间层会先被收缩成**内容宽**，里面按钮的 width:100% 随之退化成
+   「100% 的文案宽」⇒ 长文案撑开、短文案（「完成」）塌成窄条。
+   与 .modal-buttons{width:100%} 同一口径。 */
 .privacy-sheet-actions {
   margin-top: 3.2cqw;
+  width: 100%;
 }
 .privacy-agree-btn {
   width: 100%;
@@ -6536,11 +6693,13 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   color: var(--text-tertiary);
   text-align: center;
 }
+/* 同上：space-between 要生效必须占满整行（内容宽时无余量可分配）。 */
 .privacy-retention-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-top: 1.07cqw;
+  width: 100%;
 }
 .privacy-retention-label {
   font-size: 3.47cqw;

@@ -959,6 +959,8 @@ class ManualDuplexDialog(QDialog):
 
     def _pass1_tick(self):
         """每 0.5 秒刷新；第 1 趟已冻结（_pass1_done）就停在那里，不再继续走。"""
+        if self._mode == "waiting":
+            return      # 等待上一个任务：本态计时器应当是停的，万一被 tick 也绝不许显示「已用」
         elapsed = self._pass1_final if self._pass1_done else self._elapsed_sec()
         self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done))
         self._pass1.setStyleSheet(f"color: {self.pass1_color(elapsed, self._pass1_est)};")
@@ -995,13 +997,8 @@ class ManualDuplexDialog(QDialog):
 
     # ── 状态切换（全部由 worker 信号 / 本窗按钮驱动）──
 
-    def announce(self, text: str, sheets: int = 0, estimate_sec: float = 0.0,
-                 gate_ratio: float | None = None, gate_extra: float = 0.0):
-        """批次开始：窗口先立起来（常驻），此时还不能翻纸；第 1 趟计时从这一刻起。
-
-        gate_ratio / gate_extra：本机档案的放行策略（预估百分比 + 人工翻页准备秒数）。"""
-        self._timer.stop()
-        self._mode = "pass1"
+    def _apply_batch_params(self, sheets, estimate_sec, gate_ratio, gate_extra):
+        """本批的张数/预估/放行策略（announce 与 announce_waiting 共用同一份，别两处各写一套）。"""
         if gate_ratio is not None:
             try:
                 self._gate_ratio = min(max(float(gate_ratio), 0.0), 1.0)
@@ -1011,6 +1008,55 @@ class ManualDuplexDialog(QDialog):
             self._gate_extra = max(0.0, float(gate_extra or 0.0))
         except (TypeError, ValueError):
             self._gate_extra = 0.0
+        self._pass1_sheets = int(sheets or 0)
+        self._pass1_est = float(estimate_sec or 0.0)
+        self._pass1_final = 0.0
+        self._pass1_done = False
+        self._flip_gate_at = 0.0
+        self._left = 0                  # 翻纸确认倒计时：本批还没开始（闸门到点才起算）
+
+    def announce_waiting(self, text: str, sheets: int = 0, estimate_sec: float = 0.0,
+                         gate_ratio: float | None = None, gate_extra: float = 0.0):
+        """批次已排好、但**上一个任务还在出纸**：窗口先立起来，这一态**不计时**。
+
+        用户现场：常驻窗显示「⏱ 第 1 趟已用 02:07 / 预计 00:42（超出 85 秒）」，而 6 张纸
+        本来只该花 42 秒 —— 上一单第 2 趟的纸还在出，新单的计时已经起跑了。计时起点必须
+        晚于/等于真正开始送纸的时刻，所以：
+
+          · 等待态**不显示**「已用 / 预计」、不变色（没在打，凭什么计时）；
+          · 「▶ 继续打第 2 趟」保持禁用；
+          · 只有打印队列真的排空（`PrintWorker._wait_previous_output`）之后，worker 才发
+            duplex_announce → `announce()` 把计时从 0 重新起跑。
+        """
+        self._timer.stop()
+        self._pass1_timer.stop()
+        self._apply_batch_params(sheets, estimate_sec, gate_ratio, gate_extra)
+        self._mode = "waiting"
+        self._flip_text = text
+        self._flip_timeout = 0
+        self._status.setText("⏸ 请等待上一个任务完成…（上一批的纸还在出）")
+        self._detail.setText(text)
+        self._countdown.setText("")
+        self._countdown.setStyleSheet("color: #e67e22;")
+        self._countdown.setToolTip("")
+        self._pass1.setText("")             # 等待态不给秒数
+        self._pass1.setStyleSheet("")       # 也不给颜色
+        self._btn_go.setText("▶ 继续打第 2 趟（等上一个任务结束）")
+        self._btn_go.setEnabled(False)
+        self._btn_skip.setText("⏭ 跳过本任务")
+        self._btn_skip.setEnabled(True)
+
+    def announce(self, text: str, sheets: int = 0, estimate_sec: float = 0.0,
+                 gate_ratio: float | None = None, gate_extra: float = 0.0):
+        """批次开始（= **真的**要开打第 1 趟了）：窗口先立起来，第 1 趟计时从这一刻起。
+
+        ⚠ 只在「上一批次已结束 / 打印队列已排空」之后由 worker 调用 —— 等待期走
+        announce_waiting，否则计时起点又会早于真正开始送纸的时刻。
+
+        gate_ratio / gate_extra：本机档案的放行策略（预估百分比 + 人工翻页准备秒数）。"""
+        self._timer.stop()
+        self._mode = "pass1"
+        self._apply_batch_params(sheets, estimate_sec, gate_ratio, gate_extra)
         self._status.setText("① 正在打印第 1 趟…（程序自己分两趟，中途只需要翻一次纸）")
         self._detail.setText(text)
         self._countdown.setText("")
@@ -1018,15 +1064,10 @@ class ManualDuplexDialog(QDialog):
         self._btn_go.setEnabled(False)
         self._btn_skip.setText("⏭ 跳过本任务")
         self._btn_skip.setEnabled(True)
-        # 第 1 趟计时/预估：操作员看到的"窗口出现"就是计时起点
-        self._pass1_sheets = int(sheets or 0)
-        self._pass1_est = float(estimate_sec or 0.0)
-        self._pass1_final = 0.0
-        self._pass1_done = False
-        self._flip_gate_at = 0.0
+        # ★ 第 1 趟计时从**真正开始送纸**这一刻起（不是"窗口出现"那一刻）：上一批次没结束时
+        #   走的是 announce_waiting（不计时），等队列排空才来这里 restart → 从 0 起跑。
         self._flip_text = text
         self._flip_timeout = 0
-        self._left = 0                  # 翻纸确认倒计时：本批还没开始（闸门到点才起算）
         self._t0.restart()
         self._pass1_tick()
         self._pass1_timer.start(500)
@@ -2020,6 +2061,33 @@ class _DeferManualDuplex(Exception):
     原有的转换/缓存/出错分支。"""
 
 
+# 等「上一个任务的纸出完」的上限（秒）：与 wait_for_output 的既有上限一致 —— 等不到
+# （队列卡住 / 打印机离线）就按既有「队列没排空」口径继续，绝不把整个流程吊死。
+QUEUE_GATE_TIMEOUT_SEC = 120.0
+
+
+def count_pending_print_jobs(printer_name: str = "") -> int:
+    """打印队列里还有几个作业（**只读**：不发、不删、不暂停任何作业）。
+
+    用途：判断「上一个任务是不是还在出纸」。返回 -1 = 探测不了（没有 win32print /
+    队列名不存在）—— 调用方一律当作"没有上一个任务"，绝不因为探测失败凭空等两分钟。
+    """
+    try:
+        import win32print
+        printer = printer_name or win32print.GetDefaultPrinter()
+        handle = win32print.OpenPrinter(printer)
+        try:
+            try:
+                jobs = win32print.EnumJobs(handle, 0, -1, 1) or []
+            except TypeError:          # 个别 pywin32 版本不接受 -1 表示"全部"
+                jobs = win32print.EnumJobs(handle, 0, 9999, 1) or []
+        finally:
+            win32print.ClosePrinter(handle)
+        return len(jobs)
+    except Exception:
+        return -1
+
+
 class PrintWorker(QThread):
     """
     后台打印工作线程。
@@ -2045,6 +2113,9 @@ class PrintWorker(QThread):
     duplex_finished = Signal(str)
     # 第 1 趟的「张数 + 预计秒数」（2026-10）：常驻窗据此显示计时器并按超时变色。
     duplex_plan = Signal(int, float)
+    # 上一个任务的纸还在出（打印队列没排空）→ 常驻窗进「等待上一个任务」态：立窗但**不计时**。
+    # 队列排空之后才发 duplex_announce，第 1 趟计时从那一刻从 0 起跑。
+    duplex_waiting = Signal(str)
     # 第 1 趟**实测**（张数, 秒数）→ 主线程写进该打印队列的档案，自动学习出纸速度
     # （T(n) ≈ a + b·n 的 a/b），下次预估更准。零额外用纸。
     duplex_speed_sample = Signal(int, float)
@@ -2773,6 +2844,36 @@ class PrintWorker(QThread):
             + warn
         )
 
+    def _wait_previous_output(self, pending: int = 0) -> dict:
+        """等**上一个任务**的纸出完（打印队列排空）再开打本批第 1 趟。
+
+        为什么要等：第 1 趟计时的起点必须晚于/等于真正开始送纸的时刻。上一单第 2 趟的纸
+        还在出时起跑，计时就把别人的出纸时间算进了本单（现场：6 张纸「已用 02:07」而预估
+        只有 42 秒），连同翻纸闸门、预警颜色一起带偏。
+
+        队列本来就是空的（前面没有任何作业）⇒ 调用方压根不会进这里，这里也再兜一次：
+        pending<=0 立刻返回，**一秒都不多等**（单任务零延迟）。
+
+        等不到（队列卡住 / 打印机离线）⇒ 停在 QUEUE_GATE_TIMEOUT_SEC（120 秒，与
+        wait_for_output 同一条上限），按既有「队列没排空」口径继续，由调用方写日志说明。
+
+        Returns: {"waited": 秒, "drained": bool, "detail": str}（只进日志，不进计时/样本）
+        """
+        out = {"waited": 0.0, "drained": True, "detail": ""}
+        try:
+            if int(pending or 0) <= 0:
+                return out
+        except (TypeError, ValueError):
+            return out
+        t0 = time.perf_counter()
+        # pages=0 ⇒ 余量只取 settle：这里等的是"队列排空 + 一点点出纸余量"，
+        # 不是给本批算张数（本批的张数在 wait_for_output(pages=n1) 那一处）。
+        w = wait_for_output(self._printer_name, pages=0, timeout=QUEUE_GATE_TIMEOUT_SEC)
+        out["waited"] = round(time.perf_counter() - t0, 1)
+        out["drained"] = bool(w.get("drained", False))
+        out["detail"] = str(w.get("detail", "") or "")
+        return out
+
     def _print_manual_batch(self, items, rotate: Optional[bool] = None, base_offset: int = 0,
                             total_sides: int = 0) -> tuple[bool, str, int]:
         """把本单的文件合并成**一批**：一次翻纸、两趟打完。
@@ -2854,8 +2955,28 @@ class PrintWorker(QThread):
             self.log_message.emit(f"     第 1 趟: {self._fmt_pages(plan.pass_pages(1))}")
             self.log_message.emit(f"     第 2 趟: {self._fmt_pages(plan.pass_pages(2))}")
             self.duplex_plan.emit(plan.sheet_count, self._estimate_first_pass(plan.sheet_count))
-            self.duplex_announce.emit(
-                self._duplex_announce_text(items, plan, rotate, tray_foreign, singles))
+            _announce_txt = self._duplex_announce_text(items, plan, rotate, tray_foreign, singles)
+            # ★ 上一个任务还在出纸（打印队列没排空）⇒ 常驻窗先进「等待」态、**不计时**；
+            #   队列排空才发 duplex_announce → 第 1 趟计时从 0 起跑。等待时长因此既不进
+            #   第 1 趟用时（_t_pass1 在它之后才取），也不进速度样本（否则斜率被带成负数、
+            #   闸门自失效 —— 2026-10-18 踩过的坑）。队列本来就空则一秒都不多等。
+            _pending = count_pending_print_jobs(self._printer_name)
+            if _pending > 0:
+                self.duplex_waiting.emit(_announce_txt)
+                self.log_message.emit(
+                    f"  ⏸ 打印队列里还有 {_pending} 个作业（上一个任务还在出纸）：等它排空再开始"
+                    f"本单第 1 趟 —— 这段等待不计入第 1 趟用时")
+                _gate = self._wait_previous_output(_pending)
+                if _gate.get("drained", True):
+                    self.log_message.emit(
+                        f"  ▶ 上一个任务已结束（等了 {_gate['waited']:.1f}s）→ 本单第 1 趟开始，"
+                        f"计时从 0 起跑")
+                else:
+                    self.log_message.emit(
+                        f"  ⚠ 等待上一个任务超时（{_gate['waited']:.1f}s 队列没排空"
+                        + (f"：{_gate['detail']}" if _gate.get("detail") else "")
+                        + "）→ 按既有「队列没排空」口径继续，等待时长不计入第 1 趟用时")
+            self.duplex_announce.emit(_announce_txt)
 
             def _cb(base: int, slots):
                 def _on_side(cur: int, _total: int):
@@ -10697,8 +10818,25 @@ class MainWindow(QMainWindow):
         """批次开始播报「第 1 趟几张纸 / 预计多久」——常驻窗据此计时并按超时变色。"""
         self._duplex_plan_info = (int(sheets or 0), float(estimate_sec or 0.0))
 
+    def _on_duplex_waiting(self, text: str):
+        """上一个任务的纸还在出 → 常驻窗先立起来，但**不计时**（等队列排空才从 0 起跑）。
+
+        为什么要单独一态：计时起点若早于真正开始送纸的时刻，操作员看到的就是
+        「已用 02:07 / 预计 00:42（超出 85 秒）」而实际只有 6 张纸 —— 数据是假的，
+        预警颜色也跟着假。攒批第 1 趟不走这个窗（`_print_stack_pass1` 不发本信号）。"""
+        dlg = self._ensure_duplex_dialog()
+        sheets, est = getattr(self, "_duplex_plan_info", (0, 0.0))
+        try:
+            prof = self._printer_profile()
+            dlg.announce_waiting(text, sheets=sheets, estimate_sec=est,
+                                 gate_ratio=prof.gate_ratio, gate_extra=prof.flip_ready_sec)
+            dlg.set_speed_hint(prof.speed_summary())
+        except Exception:
+            dlg.announce_waiting(text, sheets=sheets, estimate_sec=est)
+        self._show_duplex_dialog(dlg)
+
     def _on_duplex_announce(self, text: str):
-        """批次开始 → 常驻窗立刻出现（此后状态都在同一个窗口里切换，不再"等弹窗"）。"""
+        """批次真的开打（上一批次已结束/队列已排空）→ 常驻窗切「正在打印第 1 趟」，计时从 0 起。"""
         dlg = self._ensure_duplex_dialog()
         sheets, est = getattr(self, "_duplex_plan_info", (0, 0.0))
         try:
@@ -12515,6 +12653,9 @@ class MainWindow(QMainWindow):
             self._on_stack_announce if stack_entry else self._on_duplex_announce)
         worker.duplex_finished.connect(self._on_duplex_finished)
         worker.duplex_plan.connect(self._on_duplex_plan)
+        # 「上一个任务还在出纸」→ 常驻窗的等待态（不计时）。攒批第 1 趟不发这个信号
+        # （`_print_stack_pass1` 只发 duplex_announce，且那边的收件人是 _on_stack_announce）。
+        worker.duplex_waiting.connect(self._on_duplex_waiting)
         worker.duplex_speed_sample.connect(self._on_duplex_speed_sample)
         if stack_entry:
             worker.stack_entry_planned.connect(self._on_stack_entry_planned)

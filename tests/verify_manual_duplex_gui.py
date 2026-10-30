@@ -134,8 +134,12 @@ class Rec:
 
 
 def patched(rec, fail_merge_at=None):
+    # 打印队列探测也桩掉：本机真实 spooler 里有别人的作业时，这个脚本会被
+    # 「等上一个任务出完」那道闸门拖住（本脚本验的是页序/并批，不是闸门本身 ——
+    # 闸门由 tests/verify_duplex_timing_gate.py 专门验）。
     orig = {n: getattr(gui, n) for n in
-            ("print_pdf", "print_plan_pass", "wait_for_output", "get_converter")}
+            ("print_pdf", "print_plan_pass", "wait_for_output", "get_converter",
+             "count_pending_print_jobs")}
     orig_merge = pdf_printer.merge_pdfs
     _calls = {"n": 0}
 
@@ -195,6 +199,7 @@ def patched(rec, fail_merge_at=None):
     gui.print_plan_pass = _print_plan_pass
     gui.wait_for_output = _wait_for_output
     gui.get_converter = lambda: object()
+    gui.count_pending_print_jobs = lambda printer="": 0
 
     def restore():
         for k, v in orig.items():

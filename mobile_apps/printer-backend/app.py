@@ -380,6 +380,9 @@ def _audit_file_access(action, result, file_id="", openid="", actor="",
 # 打印机设备注册表 / 接单接管状态（2026-11 新增：多设备共连服务器时的唯一接管者机制）
 # devices.json: { client_id: {device_name, owner_name, first_seen, last_seen} }
 DEVICES_FILE = "devices.json"
+# device_pin_order.json: {"order": [client_id, ...], "updated_at": <epoch 秒>, "updated_by": <openid|"">}
+# 「接单设备置顶顺序」（2026-10）—— 全局共享一份，第一项就是默认选中的设备。
+DEVICE_PIN_FILE = "device_pin_order.json"
 # S1-06：APP/网页设备的"设备密钥"（不是 printer token）。{sha256(device_id)[:32]: {...}}
 # 只存 secret 的哈希；首次登录下发一次，之后凭 secret 换 token —— 不再只凭自报 device_id。
 DEVICE_SECRETS_FILE = "device_secrets.json"
@@ -2017,6 +2020,102 @@ def get_active_printer_client():
 def is_printer_available() -> bool:
     """是否有「启用接单」的打印机（含离线设备——离线时任务排队等其上线，提交仍被接受）。"""
     return len(get_claiming_device_ids()) > 0
+
+
+# ── 接单设备置顶顺序（2026-10）──────────────────────────────────────────────
+# 需求：设备列表原先按「在线优先」排；用户可以把某台设备**置顶**，置顶后它成为默认选中的
+# 设备（不管在不在线），多台置顶时还能再排优先级。顺序存服务端、全局共享（小程序与 APP
+# 同一份），只有 admin / super_admin 能改。
+#
+# 为什么单独一个文件而不是塞进 devices.json：顺序是一份**有序列表**，而 devices.json 是字典
+# —— 键顺序会被其它写盘路径（load_devices/save_devices 的读-改-写）与 JSON 序列化打乱；
+# 而且它与注册表的生命周期不同（设备被删/改名不该连带把顺序清掉）。
+# 结构：{"order": [client_id, ...], "updated_at": <epoch 秒>, "updated_by": <openid 或 "">}
+# fail-open：文件缺失/损坏/结构不对一律当空列表 —— 这只是「默认选中哪台」的偏好，读不出来就
+# 退回「在线优先」的老口径，绝不让公开的设备列表接口 500。
+DEVICE_PIN_MAX = 50         # 置顶列表上限（单次提交也按它截断）
+DEVICE_PIN_CID_MAXLEN = 64  # 单个 client_id 的最大长度（与 /api/printer/bind_owner 同口径）
+_device_pin_lock = threading.Lock()
+_device_pin_cache = {"sig": None, "data": None}
+
+
+def load_device_pin_order() -> list:
+    """读取持久化的置顶顺序（**原始值**，尚未按当前设备集合过滤）；缺失/损坏返回空列表。"""
+    data = _cached_json_read(DEVICE_PIN_FILE, _device_pin_cache, _device_pin_lock)
+    if not isinstance(data, dict):
+        return []
+    order = data.get("order")
+    if not isinstance(order, list):
+        return []
+    return [c for c in order if isinstance(c, str)]
+
+
+def save_device_pin_order(order: list, updated_by: str = "") -> bool:
+    """原子写入置顶顺序；成功 True，失败 False（**旧文件保持原样**）。
+
+    与 save_devices() 同一条路：临时文件 + os.replace（换 inode ⇒ 指纹缓存不会把半截文件
+    当成新内容），且只在真的写好之后才刷缓存。
+    """
+    payload = {"order": list(order), "updated_at": int(time.time()),
+               "updated_by": (updated_by or "")[:128]}
+    with _device_pin_lock:
+        tmp = DEVICE_PIN_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, DEVICE_PIN_FILE)
+        except OSError as e:
+            print(f"  [DEV] 保存设备置顶顺序失败: {e}")
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+        _device_pin_cache["sig"] = _json_file_sig(DEVICE_PIN_FILE)
+        _device_pin_cache["data"] = copy.deepcopy(payload)
+    return True
+
+
+def get_pin_valid_cids() -> set:
+    """当前**可被置顶**的设备集合 = 启用接单 ∩ 注册表里存在。
+
+    两个条件都要：接单集合才是「能被选为打印目标」的真实来源（移动端只列这些）；
+    注册表里有登记才说明这台设备真的连过服务器（接单记录可能是历史残留）。
+    """
+    claiming = set(get_claiming_devices().keys())
+    if not claiming:
+        return set()
+    devices = load_devices()
+    return {cid for cid in claiming if isinstance(cid, str) and cid in devices}
+
+
+def sanitize_pin_order(raw, valid_ids: set) -> list:
+    """归一化成「实际生效」的顺序：逐项校验 → 去重保序 → 丢掉不可用 cid → 截断上限。
+
+    元素不是 str 在这里**静默丢弃**（这条函数也服务于读路径）；请求体结构本身不对
+    （非 dict / order 不是 list / 元素不是 str）由 admin_device_pin_order 直接判 400。
+    """
+    if not isinstance(raw, list):
+        return []
+    out, seen = [], set()
+    for cid in raw:
+        if not isinstance(cid, str):
+            continue
+        cid = cid.strip()
+        if not cid or len(cid) > DEVICE_PIN_CID_MAXLEN:
+            continue
+        if cid in seen or cid not in valid_ids:
+            continue
+        seen.add(cid)
+        out.append(cid)
+        if len(out) >= DEVICE_PIN_MAX:
+            break
+    return out
+
+
+def get_effective_pin_order() -> list:
+    """本次**实际生效**的置顶顺序（已按当前设备集合过滤 —— 被过滤项不占序位）。"""
+    return sanitize_pin_order(load_device_pin_order(), get_pin_valid_cids())
 
 
 def _mask_person_name(name: str) -> str:
@@ -8066,9 +8165,16 @@ def claiming_devices():
     """返回全部启用接单的设备列表（含在线状态；离线设备也允许被选择发送任务，任务排队等其上线）。
     供移动端任务发起界面选择目标设备（公开接口，与 printer_status 一致）。
     2026-10：附带 auto_duplex 三态能力 —— 移动端据此禁用「不支持自动双面」设备的无障碍打印
-    （null=未确认，按安全侧处理），双面文件在该设备上需人工翻纸。"""
+    （null=未确认，按安全侧处理），双面文件在该设备上需人工翻纸。
+    2026-10（置顶顺序）：每台设备多带 pin（true/false）与 pin_index（0 基序位，未置顶为
+    null），顶层多带 pin_order（本次**实际生效**的顺序，已过滤掉不存在的/不接单的 cid）。
+    置顶的设备排在最前且按置顶顺序，**在线与否不影响它的位置** —— 移动端据此默认选中
+    pin_index==0 的那台（离线也照样默认选中，任务排队等它上线）。"""
     online_set = set(get_active_clients())
     claiming = get_claiming_devices()
+    # 置顶顺序（读盘 + 按当前设备集合过滤）。fail-open：读不出来就是空列表 = 老口径。
+    pin_order = get_effective_pin_order()
+    pin_index_of = {cid: i for i, cid in enumerate(pin_order)}
     result = []
     for cid, entry in claiming.items():
         dev = get_device_entry(cid)
@@ -8092,10 +8198,58 @@ def claiming_devices():
             "stack_busy": st["busy"],
             "stack_can_toggle": bool(online) and not _stack_toggle_problem(cid),
             "stack_reason": ("设备离线" if not online else _stack_toggle_problem(cid)),
+            # 置顶（2026-10）：pin_index 是「在生效顺序里的 0 基序位」，未置顶为 null（不是 -1：
+            # 前端一律用 pin_index === 0 判默认选中，null/缺字段都能被它排除掉）。
+            "pin": cid in pin_index_of,
+            "pin_index": pin_index_of.get(cid),
         })
-    # 在线设备排前，其余按 client_id 排序
-    result.sort(key=lambda d: (not d["online"], d["client_id"].lower()))
-    return jsonify({"success": True, "devices": result})
+    # 排序：① 置顶的在前、按置顶顺序（**离线不降级** —— 置顶就是"不管在不在线都优先"）；
+    # ② 未置顶的沿用老口径「在线优先，其余按 client_id」。两组内部各自保持原口径。
+    result.sort(key=lambda d: (
+        d["pin_index"] is None,
+        d["pin_index"] if d["pin_index"] is not None else 0,
+        not d["online"],
+        d["client_id"].lower(),
+    ))
+    return jsonify({"success": True, "devices": result, "pin_order": pin_order})
+
+
+@app.route("/api/admin/device_pin_order", methods=["POST"])
+@login_required
+def admin_device_pin_order():
+    """设置「接单设备置顶顺序」（2026-10；仅 admin / super_admin）。
+
+    body: {"order": [client_id, ...]} —— 第一项就是移动端默认选中的设备。
+    服务端归一化（顺序固定）：去重保序 → 丢弃不在「启用接单 ∩ 注册表存在」集合里的 cid
+    （长度 > 64 的也丢） → 截断到最多 50 项；返回 {"success": true, "pin_order": [...]}。
+    畸形请求体（非 dict / order 不是 list / 元素不是 str）一律 400，绝不 500 —— 这条接口
+    一旦 500，置顶就会变成把整张设备选择页弄白的故障点。
+    写盘失败：旧文件原样保留（原子写天然保证），返回 success:false 并带上当前生效顺序。
+    """
+    role = compute_role(getattr(g, "openid", "") or "")
+    if role not in ("admin", "super_admin"):
+        return jsonify({"success": False, "message": "需要管理员权限"}), 403
+
+    try:
+        data = request.get_json(silent=True)
+    except RecursionError:
+        # 深嵌套请求体会让 json.loads 抛 RecursionError（不是 ValueError，silent=True 挡不住）
+        return jsonify({"success": False, "message": "请求体格式不合法"}), 400
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "message": "请求体必须是 JSON 对象"}), 400
+    raw = data.get("order")
+    if not isinstance(raw, list):
+        return jsonify({"success": False, "message": "order 必须是数组"}), 400
+    if any(not isinstance(cid, str) for cid in raw):
+        return jsonify({"success": False, "message": "order 里每一项都必须是字符串"}), 400
+
+    order = sanitize_pin_order(raw, get_pin_valid_cids())
+    if not save_device_pin_order(order, getattr(g, "openid", "") or ""):
+        # 原子写失败 ⇒ 旧文件没动过；如实回报，别让前端以为改成功了
+        return jsonify({"success": False, "message": "保存失败，置顶顺序未改变",
+                        "pin_order": get_effective_pin_order()}), 500
+    print(f"[DEV] 接单设备置顶顺序已更新（{role}）: {order}")
+    return jsonify({"success": True, "pin_order": order})
 
 
 @app.route("/api/printer/bind_owner", methods=["POST"])

@@ -62,6 +62,9 @@
             <view class="section-header inline-header">
               <view class="section-header-bar"></view>
               <text class="section-header-title">选择接单设备</text>
+              <!-- 「显示顺序」（置顶 + 调优先级）入口：仅 admin/super_admin 显示（display 由
+                   renderDeviceList() 按 isAdminRole() 切换，与小程序的 userRole 判定同一口径） -->
+              <view class="device-order-entry" id="deviceOrderEntry" style="display:none">显示顺序</view>
             </view>
             <view class="device-list" id="deviceList"></view>
           </view>
@@ -688,6 +691,25 @@
         <button class="btn-primary privacy-agree-btn" id="privacyAgreeBtn" onclick="agreePrivacy()">我已阅读并同意</button>
       </view>
       <text class="privacy-sheet-footnote" id="privacySheetFootnote">同意后不再重复询问，也不会每单重新勾选。</text>
+    </view>
+  </view>
+
+  <!-- ===== 接单设备显示顺序（置顶 + 置顶组内调优先级；入口仅 admin/super_admin） ===== -->
+  <!-- 视觉复用 .modal-sheet / .modal-mask 家族：背景模糊来自 .modal-mask 的 backdrop-filter，
+       WebView 上不生效（旧 Chromium / 省电模式）时由它自带的半透明底色兜底 ⇒ 退化为
+       「半透明遮罩 + 阴影弹层」，不会变成没有遮罩的裸弹窗。行内容由 renderDeviceOrderRows() 生成。 -->
+  <view class="modal-mask" id="deviceOrderSheet" style="display:none">
+    <!-- 不写 onclick="event.stopPropagation()"：遮罩关闭由 setupNav 的 e.target === mask 判定，
+         而 inline stopPropagation 会把弹窗内控件的 click 拦在 sheet 这一层，
+         document 级委托（置顶开关 / ↑ / ↓）就永远收不到（2026-10 渲染验收实测）。 -->
+    <view class="modal-sheet device-order-sheet">
+      <text class="title-medium">接单设备显示顺序</text>
+      <text class="device-order-hint">置顶的设备排在最前；第一台置顶设备默认被选中（离线也选，任务排队等它上线）</text>
+      <view class="device-order-body" id="deviceOrderBody"></view>
+      <text class="device-order-error" id="deviceOrderError" style="display:none"></text>
+      <view class="device-order-actions">
+        <button class="btn-primary device-order-done-btn" id="deviceOrderSaveBtn" onclick="saveDeviceOrder()">完成</button>
+      </view>
     </view>
   </view>
 

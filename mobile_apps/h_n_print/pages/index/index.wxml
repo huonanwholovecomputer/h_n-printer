@@ -39,6 +39,13 @@
           <view class="section-header inline-header">
             <view class="section-header-bar"></view>
             <text class="section-header-title">选择接单设备</text>
+            <!-- 「显示顺序」（置顶 + 调优先级）入口：仅管理员/超管渲染，与下方攒批开关同一角色口径
+                 （userRole 由 loadUserRole() 从 /api/me 写入）。用 view 而非 button：小程序 button
+                 有自带宽度的怪癖，view + catchtap 才能稳定贴在这一行右上角。 -->
+            <view wx:if="{{userRole === 'admin' || userRole === 'super_admin'}}"
+                  class="device-order-entry"
+                  catchtap="onOpenDeviceOrderSheet"
+                  hover-class="device-hover">显示顺序</view>
           </view>
           <view class="device-list">
             <view
@@ -53,6 +60,8 @@
             >
               <view class="device-dot {{item.online ? 'device-dot-on' : 'device-dot-off'}}"></view>
               <text class="device-label">{{item.label}}</text>
+              <!-- 置顶标记：轻量一行内徽标，字号/行高与 .device-state 同档 ⇒ 设备条仍是「每条一行、高度恒定」 -->
+              <text wx:if="{{item.pin}}" class="device-pin-badge">📌 置顶</text>
               <!-- 需人工翻纸 + 攒批状态合成**一个**胶囊（2026-10-27 用户要求：接单设备条高度不一致，
                    必须缩到一行）。旧写法「🖐 需人工翻纸」+「攒批未开」+「开启攒批」+「在线」四个块
                    在 375px 上放不下 ⇒ flex-wrap 换行，列表里每条高度都不一样（有的两行有的三行）。
@@ -419,6 +428,42 @@
       <button wx:else class="btn-primary privacy-agree-btn" bindtap="onClosePrivacySheet" hover-class="tap-active">完成</button>
     </view>
     <text wx:if="{{!privacyAgreed}}" class="privacy-sheet-footnote">同意后不再重复询问，也不会每单重新勾选。</text>
+  </view>
+</view>
+
+<!-- 接单设备显示顺序（置顶 + 置顶组内调优先级）：入口在「选择接单设备」标题行右上角，仅 admin/super_admin。
+     视觉复用 .modal-mask / .modal-sheet 家族 —— 遮罩的**背景模糊**来自 app.wxss 里 .modal-mask 的
+     backdrop-filter: saturate(200%) blur(44px)；微信端合成器采样并不可靠（部分机型/版本直接不生效），
+     故 .modal-mask 同时带半透明底色 rgba(255,255,255,.45)（深色沿用同一值 + .theme-dark 令牌，
+     与既有隐私弹层/成功弹窗完全一致）兜底：
+     模糊失效时退化成「半透明遮罩 + 阴影弹层」，可读性与层次仍成立，不会变成"没有遮罩"的裸弹窗。 -->
+<view wx:if="{{deviceOrderVisible}}"
+      class="modal-mask {{deviceOrderClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}"
+      catchtap="onCloseDeviceOrderSheet">
+  <view class="modal-sheet device-order-sheet" catchtap="noop">
+    <text class="title-medium" style="margin-bottom: 8rpx;">接单设备显示顺序</text>
+    <text class="device-order-hint">置顶的设备排在最前；第一台置顶设备默认被选中（离线也选，任务排队等它上线）</text>
+    <scroll-view scroll-y class="device-order-body">
+      <view wx:for="{{deviceOrderRows}}" wx:key="client_id"
+            class="device-order-row {{item.pin ? 'device-order-row-pinned' : ''}}">
+        <view class="device-order-pin {{item.pin ? 'device-order-pin-on' : ''}}"
+              catchtap="onToggleDevicePin" data-index="{{index}}">{{item.pin ? '📌 置顶' : '置顶'}}</view>
+        <text class="device-order-name">{{item.label}}</text>
+        <text class="device-state device-order-state {{item.online ? 'device-state-on' : 'device-state-off'}}">{{item.online ? '在线' : '离线'}}</text>
+        <view class="device-order-move {{item.pin ? '' : 'device-order-move-disabled'}}"
+              catchtap="onMoveDevicePin" data-index="{{index}}" data-dir="up">↑</view>
+        <view class="device-order-move {{item.pin ? '' : 'device-order-move-disabled'}}"
+              catchtap="onMoveDevicePin" data-index="{{index}}" data-dir="down">↓</view>
+      </view>
+    </scroll-view>
+    <text wx:if="{{deviceOrderError}}" class="device-order-error">{{deviceOrderError}}</text>
+    <!-- 操作行必须显式 width:100%（与 .modal-buttons / .privacy-sheet-actions 同一口径）：
+         .modal-sheet 是 align-items:center 的纵向 flex，width:auto 的中间层会先收缩成内容宽，
+         里面 button 的 width:100% 随之退化成「100% 的文案宽」。 -->
+    <view class="device-order-actions">
+      <button class="btn-primary device-order-done-btn" bindtap="onSaveDeviceOrder"
+              hover-class="tap-active" disabled="{{deviceOrderSaving}}">{{deviceOrderSaving ? '保存中…' : '完成'}}</button>
+    </view>
   </view>
 </view>
 

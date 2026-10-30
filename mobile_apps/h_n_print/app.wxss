@@ -538,7 +538,13 @@ page {
   box-shadow: var(--shadow-lg);
 }
 
-/* Modal footer — two buttons side by side */
+/* Modal footer — two buttons side by side.
+   ⚠ 弹层里的「操作行」容器必须显式 width:100%：.modal-sheet 是 align-items:center
+   的纵向 flex，width:auto 的中间层会先被收缩成**内容宽**，里面按钮的 width:100%
+   随之退化成「100% 的文案宽」⇒ 长文案撑开、短文案（如「完成」）塌成窄条。
+   反例见 index.wxss 的 .privacy-sheet-actions（2026-10 现场）。也不要图省事把
+   .modal-sheet 改成 align-items:stretch：.title-medium 没有 text-align，
+   stretch 会让弹窗标题一律左对齐。 */
 .modal-buttons {
   display: flex;
   width: 100%;

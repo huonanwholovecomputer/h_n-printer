@@ -156,6 +156,12 @@ Component({
     selectedDeviceId: '',
     // 攒批模式远程切换中（client_id）：非空时开关置灰、拒绝重复点击
     stackTogglingId: '',
+    // 「接单设备显示顺序」弹窗（置顶 + 调序；入口仅 admin/super_admin 渲染）
+    deviceOrderVisible: false,   // 弹窗是否挂载
+    deviceOrderClosing: false,   // 关闭动画进行中（200ms 后卸载）
+    deviceOrderRows: [],         // 本地临时顺序（置顶组在前）：{client_id,label,online,pin,pin_index}
+    deviceOrderSaving: false,    // POST 进行中（同时兼作并发保存闸门）
+    deviceOrderError: '',        // 保存失败提示（可见，不静默）
     showSuccessModal: false,
     // 文件预览层（仅文本类 txt/csv/md 用；图片/PDF/Word 走微信原生能力）
     showPreview: false,
@@ -315,6 +321,12 @@ Component({
       this._uploadTimers = {}   // { fileUid: entry } — 每个文件独立的进度条定时器（键=文件稳定 uid）
       this._pollTimers = {}     // { fileUid: intervalId } — 页数轮询定时器（键=文件稳定 uid）
       this._fileUidSeq = 0      // 文件稳定身份自增序列（见 _fileUid / _fileIndexByUid）
+      // 接单设备「自动选中 / 用户手动选中」状态位（2026-10 置顶）。只有 onSelectDevice（用户真手点）
+      // 会置 true；loadClaimingDevices 里的默认口径选出来的设备一律保持 false。
+      // 初始 false = 未手动选过 ⇒ 允许跟随「置顶第一 / 第一个在线」口径变化。
+      this._deviceChosenByUser = false
+      // 刚保存过新的置顶顺序：下一次 loadClaimingDevices 必须按服务端新顺序重置选中（一次性消费）
+      this._deviceOrderJustSaved = false
       this._buildScheduleDays()
       this._loadPrivacyPrefs()      // S2-08：同意/保留期偏好从 storage 恢复（首次使用自动弹一次告知）
       this.loadRetentionOptions()   // S2-08：保留期选项以服务端口径为准（失败用本地兜底）
@@ -2203,7 +2215,20 @@ Component({
       })
     },
 
-    // 可接单设备列表（多设备接单）：全部启用接单的设备（含离线），默认选中第一个在线设备
+    // 可接单设备列表（多设备接单）：全部启用接单的设备（含离线）。
+    // 服务端已排好序，返回顺序**就是**展示顺序：置顶组在前（按 pin_index 升序，组内完全不看在线）
+    // → 未置顶组在线优先 → client_id。每台带 pin:boolean 与 pin_index:int(0 基)|null。
+    //
+    // 默认选中口径（2026-10 置顶，两条）：
+    //   ① 有置顶 ⇒ 选 pin_index === 0 的那台（**离线也选**：任务排进队列等它上线，
+    //      而不是偷偷换一台在线设备把顾客的单打到别人的纸上）；
+    //   ② 无置顶 ⇒ 沿用老口径「第一个在线设备」，无在线则第一个。
+    //
+    // 重置触发的三条条件（其余情况一律不抢用户的手动选择）：
+    //   A) 用户刚保存了新的置顶顺序（_deviceOrderJustSaved）⇒ 按新顺序重选（一次性）；
+    //   B) 当前选中已失效（那台设备不再出现在可接单列表里）；
+    //   C) 用户从未手动点选过（_deviceChosenByUser === false）⇒ 跟随默认口径（置顶变了也跟着变）。
+    // 这三条任一命中才重置；且重置出来的选择仍是「自动选择」⇒ _deviceChosenByUser 归 false。
     loadClaimingDevices(done) {
       request({
         url: CONFIG.BASE_URL + '/api/claiming_devices',
@@ -2211,11 +2236,18 @@ Component({
         success: (res) => {
           if (!res.data || !res.data.success) return done ? done(false) : undefined
           const devices = res.data.devices || []
+          const pinFirst = devices.find(d => d.pin === true && d.pin_index === 0) ||
+                           devices.find(d => d.pin === true) || null
+          const onlineOne = devices.find(d => d.online)
+          const defaultId = pinFirst ? pinFirst.client_id
+            : (onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : ''))
           let selected = this.data.selectedDeviceId
-          // 保持用户已选设备（若仍在列表中）；否则默认选第一个在线设备（无在线则第一个）
-          if (!devices.some(d => d.client_id === selected)) {
-            const onlineOne = devices.find(d => d.online)
-            selected = onlineOne ? onlineOne.client_id : (devices.length ? devices[0].client_id : '')
+          const stillSelectable = !!selected && devices.some(d => d.client_id === selected)
+          const justSaved = this._deviceOrderJustSaved === true
+          if (justSaved) this._deviceOrderJustSaved = false
+          if (justSaved || !stillSelectable || this._deviceChosenByUser !== true) {
+            selected = defaultId
+            this._deviceChosenByUser = false   // 重置出来的仍是自动选择
           }
           const _devCountBefore = (this.data.claimingDevices || []).length
           this.setData({ claimingDevices: devices, selectedDeviceId: selected })
@@ -2236,7 +2268,137 @@ Component({
       if (!id) return
       // 换设备不再动无障碍开关：设备端自知其翻纸能力，「双面 × 无人值守」拦截已按要求全面放开
       // （原三处入口 + 提交兜底 + 后端 409 均已移除，依据见 CLAUDE.md「无障碍打印与预约打印」）。
+      // 这是用户**真手点**的唯一入口 ⇒ 打开状态位：之后 30s 轮询/刷新都不许把它抢回去
+      // （除非那台设备从列表里消失，或用户自己又保存了新的置顶顺序）。
+      this._deviceChosenByUser = true
       this.setData({ selectedDeviceId: id })
+    },
+
+    // ==================== 接单设备显示顺序（置顶 / 调序）====================
+    // 入口按钮仅 admin/super_admin 渲染（index.wxml 用 userRole 判定，与攒批开关同一口径），
+    // 这里再兜一次底。链路：GET /api/claiming_devices 拿 pin/pin_index →
+    // 本地改临时顺序 → POST /api/admin/device_pin_order {order:[置顶的 client_id 按序]} →
+    // 成功则重新拉列表（服务端已排好序）并按新的 pin_index===0 重选。
+
+    // 服务端顺序 → 弹窗行：置顶组在前（按 pin_index 升序），未置顶组保持服务端顺序。
+    _buildDeviceOrderRows(devices) {
+      const pinned = []
+      const rest = []
+      ;(devices || []).forEach((d) => {
+        if (!d || !d.client_id) return
+        const row = {
+          client_id: d.client_id,
+          label: d.label || d.device_name || d.client_id,
+          online: d.online === true,
+          pin: d.pin === true,
+          pin_index: (typeof d.pin_index === 'number') ? d.pin_index : null,
+        }
+        ;(row.pin ? pinned : rest).push(row)
+      })
+      const key = (r) => (r.pin_index === null ? 1e9 : r.pin_index)
+      pinned.sort((a, b) => key(a) - key(b))
+      return this._reindexPins(pinned.concat(rest))
+    },
+    // 把置顶行的 pin_index 重排成 0..n-1（未置顶恒为 null），本地顺序与展示序一致
+    _reindexPins(rows) {
+      let p = 0
+      return rows.map((r) => Object.assign({}, r, { pin_index: r.pin ? p++ : null }))
+    },
+
+    onOpenDeviceOrderSheet() {
+      const role = this.data.userRole
+      if (role !== 'admin' && role !== 'super_admin') return
+      this.setData({
+        deviceOrderVisible: true,
+        deviceOrderClosing: false,
+        deviceOrderRows: this._buildDeviceOrderRows(this.data.claimingDevices || []),
+        deviceOrderSaving: false,
+        deviceOrderError: '',
+      })
+    },
+    onCloseDeviceOrderSheet() {
+      if (this.data.deviceOrderClosing || this.data.deviceOrderSaving) return
+      this.setData({ deviceOrderClosing: true })
+      setTimeout(() => {
+        this.setData({ deviceOrderVisible: false, deviceOrderClosing: false, deviceOrderRows: [], deviceOrderError: '' })
+      }, 200)
+    },
+
+    // 置顶 / 取消置顶。新置顶的排到**置顶组末尾**（不抢已有的第一台，避免一次点击就改掉默认设备），
+    // 取消置顶的回到**未置顶组开头** —— 两种情况下"插入点"都是去掉它之后的置顶行数。
+    onToggleDevicePin(e) {
+      const i = Number(e.currentTarget.dataset.index)
+      const rows = (this.data.deviceOrderRows || []).slice()
+      const row = rows[i]
+      if (!row) return
+      rows.splice(i, 1)
+      const insertAt = rows.filter(r => r.pin).length
+      rows.splice(insertAt, 0, Object.assign({}, row, { pin: !row.pin }))
+      this.setData({ deviceOrderRows: this._reindexPins(rows), deviceOrderError: '' })
+    },
+
+    // ↑ / ↓ 只在**置顶组内**调优先级（未置顶组的顺序由服务端按「在线优先 → client_id」定，
+    // 不给手动序）。到顶/到底不动，也不跨组。
+    onMoveDevicePin(e) {
+      const ds = e.currentTarget.dataset
+      const i = Number(ds.index)
+      const dir = ds.dir === 'up' ? -1 : 1
+      const rows = (this.data.deviceOrderRows || []).slice()
+      const row = rows[i]
+      if (!row || !row.pin) return
+      const pinCount = rows.filter(r => r.pin).length
+      const j = i + dir
+      if (j < 0 || j >= pinCount) return
+      rows[i] = rows[j]
+      rows[j] = row
+      this.setData({ deviceOrderRows: this._reindexPins(rows), deviceOrderError: '' })
+    },
+
+    // 保存：order 只带**置顶**的 client_id（服务端自己去重保序、丢弃不可用 cid、截到 50 项）。
+    onSaveDeviceOrder() {
+      if (this.data.deviceOrderSaving) return
+      const rows = this.data.deviceOrderRows || []
+      const order = rows.filter(r => r.pin).map(r => r.client_id)
+      this.setData({ deviceOrderSaving: true, deviceOrderError: '' })
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/device_pin_order',
+        method: 'POST',
+        header: {
+          'Authorization': 'Bearer ' + (wx.getStorageSync('token') || ''),
+          'content-type': 'application/json',
+        },
+        data: { order: order },
+        success: (res) => {
+          const data = (res && res.data) || {}
+          const code = (res && res.statusCode) || 0
+          // 服务端一律返回 200+success:true 才算成功；401/403/500 都是失败（403 文案「需要管理员权限」）
+          if (code !== 200 || data.success !== true) {
+            return this._failDeviceOrder(data.message || ('保存失败（HTTP ' + code + '）'))
+          }
+          this.setData({
+            deviceOrderSaving: false,
+            deviceOrderVisible: false,
+            deviceOrderClosing: false,
+            deviceOrderRows: [],
+            deviceOrderError: '',
+          })
+          // 保存成功 ⇒ 触发条件 A：重拉列表（服务端已按新顺序排好）并按 pin_index===0 重置选中
+          this._deviceChosenByUser = false
+          this._deviceOrderJustSaved = true
+          this.loadClaimingDevices()
+          wx.showToast({ title: '显示顺序已保存', icon: 'none', duration: 1500 })
+        },
+        fail: () => this._failDeviceOrder('网络错误，显示顺序保存失败'),
+      })
+    },
+    // 失败：**回滚本地临时顺序**（按服务端真值重建）+ 弹窗内可见红字 + toast，绝不静默、也不显示成功态
+    _failDeviceOrder(msg) {
+      this.setData({
+        deviceOrderSaving: false,
+        deviceOrderRows: this._buildDeviceOrderRows(this.data.claimingDevices || []),
+        deviceOrderError: msg,
+      })
+      wx.showToast({ title: msg, icon: 'none', duration: 2500 })
     },
 
     // 攒批模式（多任务合并翻纸）远程开关：仅管理员/超管可点（界面同样只对二者渲染），
