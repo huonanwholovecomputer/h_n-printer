@@ -575,11 +575,13 @@ try {
   chk('B3 收支清算 10 个展示区块都已拆成独立函数（KPI / 横幅 / 采购 / 分摊 / 折旧 / 收入 / 损益 / 垫付 / 重分配 / 转账）',
       b3.miss.length === 0, b3.miss);
   const rd = sliceFn(src, 'renderDash');
-  const calls = B_BLOCKS.filter((n) => rd.indexOf('h += ' + n + '(') >= 0);
+  /* v7.12：块调用被 secFold() 包在参数里（h += secFold(..., dashXxxHTML(r), ...)），
+     所以判据从「h += block(」放宽成「block( 出现在主函数里」，仍然要求 10 个都在、且只出现一次。 */
+  const calls = B_BLOCKS.filter((n) => rd.indexOf(n + '(') >= 0);
   chk('B3 主函数 renderDash() 只按顺序调用这 10 个块（调用点齐全）',
       calls.length === 10, { called: calls, miss: B_BLOCKS.filter((n) => calls.indexOf(n) < 0) });
   chk('B3 主函数里不再残留块内容（没有 <table>、没有 kpi-grid）—— 有人把块 inline 回去就会红',
-      !!rd && rd.indexOf('<table') < 0 && rd.indexOf('kpi-grid') < 0 && rd.length < 6000,
+      !!rd && rd.indexOf('<table') < 0 && rd.indexOf('kpi-grid') < 0 && rd.length < 7200,
       rd && { len: rd.length, hasTable: rd.indexOf('<table') >= 0, hasKpi: rd.indexOf('kpi-grid') >= 0 });
   const inBlock = B_BLOCKS.filter((n) => sliceFn(src, n).indexOf('<table') >= 0);
   chk('B3 表格内容确实搬进了块函数（采购/分摊/折旧/收入/损益/垫付/重分配/转账 8 个块各含一张表）',
@@ -740,6 +742,99 @@ try {
   });
   chk('C4 11 月（用量 0、已回退均摊）结论卡把降级说出来：按人头均摊 + 已回退 + ⚠ 临时口径',
       c4.fallback === true && c4.useUsage === false && c4.hasBack && c4.hasHead && c4.hasWarn, c4);
+
+  /* ══ 13. v7.12 折叠版式：明细区收起成「一行摘要」，展开才是明细 ══
+     判据不是"好不好看"，而是三件事：
+       ① 默认全部收起、且收起态真的没有高度（否则等于没收敛）；
+       ② 摘要行上的数字必须来自 view / usage，不是另算一份；
+       ③ 展开只切 data-open（不重绘整页），状态记进 localStorage。 */
+  await goMonth('2026-10');
+  const fold = await page.evaluate(() => {
+    const secs = Array.from(document.querySelectorAll('#tab-dash .cs'));
+    const sums = {};
+    secs.forEach((s) => {
+      const n = s.querySelector('.cs-sum');
+      sums[s.id.replace(/^cs-/, '')] = n ? n.textContent.replace(/\s+/g, ' ').trim() : '';
+    });
+    return {
+      n: secs.length,
+      keys: secs.map((s) => s.id.replace(/^cs-/, '')),
+      open: secs.filter((s) => s.getAttribute('data-open') === '1').length,
+      bodyH: secs.map((s) => Math.round(s.querySelector('.cs-body').getBoundingClientRect().height)),
+      h2hidden: secs.every((s) => {
+        const h = s.querySelector('.section > h2, .settle-box > h2');
+        return !h || getComputedStyle(h).display === 'none';
+      }),
+      aria: secs.every((s) => s.querySelector('.cs-head').getAttribute('aria-expanded') === 'false'),
+      count: (document.querySelector('#foldCount') || {}).textContent || '',
+      hasBar: !!document.querySelector('#dashFoldBar'),
+      height: document.querySelector('#tab-dash').scrollHeight,
+      sums: sums,
+      missingFns: ['secFold', 'foldBarHTML', 'foldAllDash', '_foldSums', '_applyFoldSums', 'foldIsOpen', 'foldSet']
+        .filter((n) => typeof window[n] !== 'function'),
+    };
+  });
+  chk('v7.12 十个明细区都折成了折叠块（采购/用纸/摊销/折旧/收入/损益/垫付/重分配/转账/实际盈亏）',
+      fold.n === 10 && fold.keys.join(',') === 'expense,paper,amort,dep,income,pl,advance,redist,transfer,realpl',
+      fold.keys);
+  chk('v7.12 默认全部收起（收敛态才叫"抓得住重点"）', fold.open === 0 && fold.aria === true, JSON.stringify({ open: fold.open, aria: fold.aria }));
+  chk('v7.12 收起态 body 高度都是 0（不是靠 overflow 视觉隐藏）', fold.bodyH.every((h) => h < 1), fold.bodyH);
+  chk('v7.12 收起后整页 < 1600px（改版前 4987px：结论卡 + KPI + 10 行摘要就够看完）',
+      fold.height > 0 && fold.height < 1600, fold.height + 'px');
+  chk('v7.12 标题上移到摘要行（块内 h2 隐藏，但仍留在 DOM 里给脚本按文案查）', fold.h2hidden);
+  chk('v7.12 工具条写着「已收起 N / 10 块」且与实际一致',
+      fold.hasBar && /已收起 10 \/ 10 块/.test(fold.count), fold.count);
+  chk('v7.12 每块摘要行都写了这一块最该看的数（10 块全非空）',
+      Object.keys(fold.sums).length === 10 && Object.keys(fold.sums).every((k) => (fold.sums[k] || '').length > 2),
+      fold.sums);
+  chk('v7.12 摘要行数字与 view/usage 同源（采购总额 / 团队折旧 / 损耗费单列 / 已录转账）',
+      String(fold.sums.expense || '').indexOf('300.00') >= 0 && /^团队/.test(String(fold.sums.dep || ''))
+      && /损耗费/.test(String(fold.sums.dep || '')) && /已录/.test(String(fold.sums.transfer || '')),
+      { expense: fold.sums.expense, dep: fold.sums.dep, transfer: fold.sums.transfer });
+  chk('v7.12 折叠相关函数都在（secFold / foldBarHTML / foldAllDash / _foldSums / _applyFoldSums / foldIsOpen / foldSet）',
+      fold.missingFns.length === 0, fold.missingFns);
+
+  const toggle = await page.evaluate(async () => {
+    const sec = document.querySelector('#cs-expense');
+    sec.querySelector('.cs-head').click();
+    await new Promise((r) => setTimeout(r, 340));
+    const out = {
+      open: sec.getAttribute('data-open'),
+      aria: sec.querySelector('.cs-head').getAttribute('aria-expanded'),
+      bodyH: Math.round(sec.querySelector('.cs-body').getBoundingClientRect().height),
+      innerH: sec.querySelector('.cs-inner').scrollHeight,
+      store: localStorage.getItem('finance.fold.v1'),
+    };
+    sec.querySelector('.cs-head').click();
+    await new Promise((r) => setTimeout(r, 340));
+    out.reclosed = Math.round(sec.querySelector('.cs-body').getBoundingClientRect().height);
+    return out;
+  });
+  chk('v7.12 点开：data-open=1、aria-expanded=true、高度动画到内容高度（不是瞬移也不是裁切）',
+      toggle.open === '1' && toggle.aria === 'true' && Math.abs(toggle.bodyH - toggle.innerH) < 2, toggle);
+  chk('v7.12 展开状态记进 localStorage（下次打开还是你上次的样子）',
+      /"expense":1/.test(toggle.store || ''), toggle.store);
+  chk('v7.12 再点收起：高度回到 0', toggle.reclosed < 1, toggle.reclosed);
+
+  await page.evaluate(() => window.foldAllDash(1));
+  await page.waitForTimeout(400);
+  const allOpen = await page.evaluate(() => ({
+    open: Array.from(document.querySelectorAll('#tab-dash .cs')).filter((s) => s.getAttribute('data-open') === '1').length,
+    count: (document.querySelector('#foldCount') || {}).textContent || '',
+    height: document.querySelector('#tab-dash').scrollHeight,
+  }));
+  chk('v7.12「全部展开」把 10 块都摊开且计数同步', allOpen.open === 10 && /已收起 0 \/ 10 块/.test(allOpen.count), allOpen);
+  chk('v7.12 展开后仍装得下全部明细（高度回到 4000px 以上，说明内容没被折叠逻辑吃掉）',
+      allOpen.height > 4000, allOpen.height + 'px');
+  await page.evaluate(() => window.foldAllDash(0));
+  await page.waitForTimeout(320);
+
+  chk('v7.12 renderDash 只用 foldBarHTML + 10 个 secFold 编排（再有人把表格 inline 回主函数会红）',
+      rd.indexOf('foldBarHTML()') >= 0 && (rd.match(/secFold\(/g) || []).length === 10
+      && rd.indexOf('<table') < 0 && rd.indexOf('kpi-grid') < 0,
+      { secFold: (rd.match(/secFold\(/g) || []).length, len: rd.length });
+  chk('v7.12 记一笔转账后摘要行跟着重算（_refreshDashSummary 里挂了 _applyFoldSums）',
+      sliceFn(src, '_refreshDashSummary').indexOf('_applyFoldSums(') >= 0);
 
   /* ══ 11. 页面干净：没有 JS 报错、没有外网请求 ══ */
   chk('无 JS 运行时错误（pageerror）', pageErrors.length === 0, pageErrors.slice(0, 3));

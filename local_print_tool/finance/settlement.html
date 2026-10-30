@@ -21,6 +21,9 @@
   --shadow-md: 0 8px 26px rgba(20,22,40,.09);
   --shadow-lg: 0 20px 55px rgba(20,22,40,.20);
   --radius: 14px; --radius-sm: 9px;
+  /* v7.12：动效曲线（内建 ease/ease-out 太弱，UI 上的"到位感"靠自定义曲线） */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
   --content-max: 1360px;   /* v5.1：宽屏内容宽度上限（居中布局），避免 100% 拉伸影响阅读；可在此调整 */
   --header-from: #23244d; --header-to: #3b2f7d;
   color-scheme: light;
@@ -118,6 +121,61 @@ main { max-width: var(--content-max); margin: 0 auto; padding: 20px 20px 60px; }
 .section h2 { font-size: 1.02rem; font-weight: 700; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .section h2 .hint { font-weight: 400; font-size: .8rem; color: var(--muted); }
 
+/* ==================== v7.12 明细区折叠（收起=一行摘要 / 展开=明细） ====================
+   目的：这一页的表格太多，滚动几屏都抓不住重点。收敛态每块只占一行，写清"这块最该看的两个数"；
+   展开态才是可逐项核对的明细。动效只改 grid-template-rows（0fr↔1fr），不逐帧改 height
+   —— 后者每帧都触发布局重排，长表格会掉帧。 */
+.fold-bar { display: flex; align-items: center; gap: 8px; margin: 2px 0 10px; }
+.fold-bar .fb-label { font-size: .82rem; font-weight: 700; color: var(--muted); letter-spacing: .04em; }
+.fold-bar .fb-note { font-size: .78rem; color: var(--muted); margin-right: auto; font-variant-numeric: tabular-nums; }
+.fb-btn {
+  font: inherit; font-size: .8rem; padding: 5px 12px; border-radius: 999px; cursor: pointer;
+  background: var(--card); color: var(--text); border: 1px solid var(--border);
+  transition: background .16s ease, border-color .16s ease, transform .12s var(--ease-out);
+}
+.fb-btn:hover { border-color: var(--border-strong); }
+.fb-btn:active { transform: scale(.97); }
+.fb-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+.cs { padding: 0; margin-bottom: 10px; overflow: hidden; }
+.cs[data-open="0"] { background: var(--card-2); }
+.cs-head {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 46px;
+  padding: 11px 18px; border: 0; background: none; color: inherit; font: inherit;
+  text-align: left; cursor: pointer; -webkit-appearance: none; appearance: none;
+}
+.cs-head:hover .cs-title { color: var(--primary); }
+.cs-title { font-size: .97rem; font-weight: 700; white-space: nowrap; transition: color .16s ease; }
+.cs-hint { font-size: .78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cs-sum { margin-left: auto; font-size: .85rem; color: var(--text); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.cs-sum b { font-weight: 800; }
+.cs-sum .pos { color: var(--pos); }
+.cs-sum .neg { color: var(--neg); }
+.cs-caret {
+  width: 16px; height: 16px; flex: 0 0 16px; display: grid; place-items: center;
+  color: var(--muted); transition: transform .2s var(--ease-out), color .2s ease;
+}
+.cs-caret::before {
+  content: ''; width: 6px; height: 6px;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg) translate(-1px, -1px);
+}
+.cs[data-open="1"] .cs-caret { transform: rotate(90deg); color: var(--primary); }
+.cs[data-kind="warn"] .cs-title { color: var(--orange); }
+.cs[data-kind="real"] .cs-title { color: var(--primary); }
+.cs-body { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .22s var(--ease-out); }
+.cs[data-open="1"] .cs-body { grid-template-rows: 1fr; }
+.cs-inner { overflow: hidden; min-height: 0; }
+/* 折进摘要行的块不再画自己的卡片边框与标题（标题已在摘要行上） */
+.cs-inner .section, .cs-inner .settle-box {
+  margin: 0; padding: 0 18px 16px; border: 0; background: none; box-shadow: none; border-radius: 0;
+}
+.cs-inner .section > h2, .cs-inner .settle-box > h2 { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .cs-body { transition: none; }
+  .cs-caret { transition: none; }
+}
+
 .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
 .kpi-card {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
@@ -132,6 +190,11 @@ main { max-width: var(--content-max); margin: 0 auto; padding: 20px 20px 60px; }
 .kpi-card .num { font-size: 1.55rem; font-weight: 800; line-height: 1.25; letter-spacing: -.3px; }
 .kpi-card .lbl { font-size: .74rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; margin-top: 3px; }
 .kpi-card .sub { font-size: .76rem; color: var(--muted); margin-top: 3px; }
+/* v7.12：KPI 四个数和结论卡重复度高，压成一条读数带，把纵向空间让给摘要行 */
+.kpi-grid { gap: 10px; margin-bottom: 14px; }
+.kpi-card { padding: 12px 16px; }
+.kpi-card .num { font-size: 1.3rem; }
+.kpi-card .sub { margin-top: 2px; }
 
 /* ==================== 表格 ==================== */
 .table-wrap { overflow-x: auto; }
@@ -6106,38 +6169,43 @@ function renderDash() {
      静默退回均摊，账面看着"正常"其实错了） */
   h += dashBannerHTML(r, m, ustate);
 
-  h += dashExpenseHTML(r, basisLabel);
-
-  h += dashShareHTML(r);
-
-  /* ── v7.10：用纸统计（正常出纸 + 废纸，可编辑） ─────────────────── */
-  h += paperStatsSectionHTML(r, m);
-
-  /* ── v7.9：长期耗材摊销（A4纸 / 硒鼓） ─────────────────────────── */
-  h += consumableAmortSectionHTML(r, m);
-
-  h += dashDepHTML(r);
-
-  h += dashIncomeHTML(r);
-
-  h += dashPLHTML(r);
-
-  h += dashAdvanceHTML(r);
+  /* v7.12：明细区一律折成「一行摘要」（点开才摊明细）。
+     收起态就是这张表最该看的那两个数，扫一眼不必滚屏；展开态才是逐项可核对的表。
+     默认全部收起：结论卡 + KPI 已经回答了"多少钱"，明细只在要核对时打开。 */
+  h += foldBarHTML();
+  var FS = _foldSums(r, m);
+  h += secFold('expense', { title: '🧾 采购支出', hint: basisLabel, sum: FS.expense },
+               dashExpenseHTML(r, basisLabel) + dashShareHTML(r), false);
+  h += secFold('paper', { title: '🧻 用纸统计', hint: '正常出纸 + 废纸', sum: FS.paper },
+               paperStatsSectionHTML(r, m), false);
+  h += secFold('amort', { title: '🧾 长期耗材摊销', hint: FS.amortHint, sum: FS.amort },
+               consumableAmortSectionHTML(r, m), false);
+  h += secFold('dep', { title: '🖨️ 设备折旧', hint: '非现金成本', sum: FS.dep },
+               dashDepHTML(r), false);
+  h += secFold('income', { title: '💵 收入分配', hint: FS.incomeHint, sum: FS.income },
+               dashIncomeHTML(r), false);
+  h += secFold('pl', { title: '📊 经营损益', hint: '账面口径', sum: FS.pl, kind: 'real' },
+               dashPLHTML(r), false);
+  h += secFold('advance', { title: '💳 垫付清算', hint: '代付 − 应摊', sum: FS.advance },
+               dashAdvanceHTML(r), false);
 
   /* 📐 结算公式（只展示，v7.3）—— 放在「资金重分配」之前：先讲清算式，再看具体的转账指令。
-     默认收起（open=false）：日常看数时它只占一行，不挤占 KPI 与表格的视线。 */
+     它本身是原生 <details>（一行标题），不再套一层折叠。 */
   h += '<div id="dashFormula">' + settleFormulaHTML(r, false) + '</div>';
 
-  h += dashRedistHTML(r);
+  h += secFold('redist', { title: '🔄 资金重分配', hint: '按账面算的建议转账', sum: FS.redist, kind: 'warn' },
+               dashRedistHTML(r), false);
 
   /* 「实际转账」整块的禁用态：只有转账模块解锁后才能改（块函数只负责渲染） */
   var dT = unlocked.transfer ? '' : ' disabled';
-  h += dashTransferHTML(m, r, dT);
+  h += secFold('transfer', { title: '💸 实际转账', hint: '真正转了多少钱', sum: FS.transfer, kind: 'real' },
+               dashTransferHTML(m, r, dT), false);
 
   /* ── 实际盈亏（现金口径） ── */
-  h += '<div id="dashRealPL">' + realPLSectionHTML(r) + '</div>';
-
+  h += secFold('realpl', { title: '💰 实际盈亏', hint: '现金口径', sum: FS.realpl, kind: 'real' },
+               '<div id="dashRealPL">' + realPLSectionHTML(r) + '</div>', false);
   el.innerHTML = h;
+  _syncFoldCount();
   // KPI 数字滚动
   $$('#tab-dash .num[data-count]').forEach(function (node) {
     var target = parseFloat(node.getAttribute('data-count'));  // 整数分
@@ -6157,6 +6225,148 @@ function renderDash() {
      ③ 为什么是这个数、这一屏的数字按什么口径算（临时口径必须自曝）
    所有数字来自 calcMonth 的 r.view；本函数只排版，不参与任何计算。
    ══════════════════════════════════════════════════════════════════════════ */
+/* ==================== v7.12 明细区折叠 ====================
+   收起/展开是纯 DOM 属性切换（data-open），不重绘整页 —— 这样动效不会被 re-render 打断，
+   输入框也不会丢焦点。状态存 localStorage：同一台机器上下次打开还是你上次的样子。 */
+var FOLD_STORE_KEY = 'finance.fold.v1';
+var _foldCache = null;
+
+function _foldStore() {
+  if (_foldCache) return _foldCache;
+  _foldCache = {};
+  try {
+    var raw = localStorage.getItem(FOLD_STORE_KEY);
+    if (raw) { var parsed = JSON.parse(raw); if (parsed && typeof parsed === 'object') _foldCache = parsed; }
+  } catch (e) { _foldCache = {}; }
+  return _foldCache;
+}
+
+function foldIsOpen(key, defOpen) {
+  var v = _foldStore()[key];
+  if (v === 1 || v === true) return true;
+  if (v === 0 || v === false) return false;
+  return !!defOpen;
+}
+
+function foldSet(key, open) {
+  var st = _foldStore();
+  st[key] = open ? 1 : 0;
+  try { localStorage.setItem(FOLD_STORE_KEY, JSON.stringify(st)); } catch (e) {}
+}
+
+/* 摘要行：收起态就是这一块最该看的那两个数；展开态仍显示（当"这一块的总数"用）。 */
+function secFold(key, opts, body, defOpen) {
+  var open = foldIsOpen(key, defOpen);
+  return '<section class="section cs" id="cs-' + key + '" data-kind="' + (opts.kind || '') + '"'
+    + ' data-open="' + (open ? 1 : 0) + '">'
+    + '<button type="button" class="cs-head" aria-expanded="' + (open ? 'true' : 'false') + '"'
+    + ' aria-controls="cs-' + key + '-body">'
+    + '<span class="cs-caret" aria-hidden="true"></span>'
+    + '<span class="cs-title">' + opts.title + '</span>'
+    + (opts.hint ? '<span class="cs-hint">' + opts.hint + '</span>' : '')
+    + '<span class="cs-sum">' + (opts.sum || '') + '</span>'
+    + '</button>'
+    + '<div class="cs-body" id="cs-' + key + '-body"><div class="cs-inner">' + body + '</div></div>'
+    + '</section>';
+}
+
+function foldBarHTML() {
+  return '<div class="fold-bar" id="dashFoldBar">'
+    + '<span class="fb-label">明细区</span>'
+    + '<span class="fb-note" id="foldCount"></span>'
+    + '<button type="button" class="fb-btn" onclick="foldAllDash(1)">全部展开</button>'
+    + '<button type="button" class="fb-btn" onclick="foldAllDash(0)">全部收起</button>'
+    + '</div>';
+}
+
+function foldAllDash(open) {
+  $$('#tab-dash .cs').forEach(function (sec) {
+    sec.setAttribute('data-open', open ? '1' : '0');
+    var btn = sec.querySelector('.cs-head');
+    if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    foldSet(String(sec.id).replace(/^cs-/, ''), open);
+  });
+  _syncFoldCount();
+}
+
+function _syncFoldCount() {
+  var note = $('#foldCount');
+  if (!note) return;
+  var all = $$('#tab-dash .cs');
+  var closed = 0;
+  all.forEach(function (sec) { if (sec.getAttribute('data-open') === '0') closed++; });
+  note.textContent = all.length ? ('已收起 ' + closed + ' / ' + all.length + ' 块') : '';
+}
+
+function _foldSums(r, m) {
+  var t = r.view.totals;
+  var u = r.usage || {};
+  var amort = r.amort || {};
+  var lots = amort.lots || amort.rows || [];
+  var normalSheets = Math.max(0, (u.sheets || 0) - (u.wasteTotal || 0));
+  var suggest = 0;
+  (r.transfers || []).forEach(function (x) { suggest += (x.amount || 0); });
+  var recorded = r.transferTotal || 0;
+  var left = suggest - recorded;
+  var sgn = function (cents) {
+    return '<b class="' + (cents >= 0 ? 'pos' : 'neg') + '">'
+      + (cents >= 0 ? '+' : '−') + RMB(Math.abs(cents)) + '</b>';
+  };
+  var advIn = 0, advOut = 0;
+  (r.view.advance || []).forEach(function (row) {
+    if (row.adv > 0) advIn += row.adv; else if (row.adv < 0) advOut += -row.adv;
+  });
+  var amortState = (amort.state || 'none');
+  var amortHint = amortState === 'ready' ? '按批次摊销'
+    : amortState === 'loading' ? '统计中…'
+    : amortState === 'failed' ? '统计失败 → 暂按整笔' : '未开始';
+  return {
+    expense: RMB(t.totalExp) + ' · ' + (r.expenses || []).length + ' 笔',
+    paper: '正常 ' + fmtInt(normalSheets) + ' 张 · 废纸 ' + fmtInt(u.wasteTotal || 0) + ' 张',
+    amort: (amort.totalCents > 0 ? ('本月 ' + RMB(amort.totalCents) + ' · ' + lots.length + ' 批') : '本月 ¥0.00 · 无在摊批次'),
+    amortHint: amortHint,
+    /* 只写团队成本（= 结论卡里被扣掉的那笔折旧）；损耗费是成员之间互相补的，单列不混算 */
+    dep: (r.depTotal > 0 ? ('团队 −' + RMB(r.depTotal)) : '团队 ¥0.00')
+      + ((r.wearTotal || 0) > 0 ? (' · 损耗费 ' + RMB(r.wearTotal)) : '')
+      + ' · ' + (r.depByPrinter || []).length + ' 台机',
+    income: RMB(t.totalInc) + ' · 服务分 ' + fmtInt(r.totalScore || 0),
+    incomeHint: '投资 ' + (r.rate * 100).toFixed(1) + '%',
+    pl: sgn(t.totalPL),
+    advance: '待收回 ' + RMB(advIn) + ' · 待补 ' + RMB(advOut),
+    redist: (r.transfers || []).length + ' 笔 · 共 ' + RMB(suggest),
+    transfer: '已录 ' + RMB(recorded) + ' · ' + _validTransfers(m).length + ' 笔'
+      + (left > 1 ? (' · 还差 ' + RMB(left)) : ' · 已结清'),
+    /* Σgap ≡ 0（Σnet ≡ 0），「还差多少」只在「实际转账」那行有意义，别在这里重复一遍 */
+    realpl: '实际 ' + sgn(t.totalActual),
+  };
+}
+
+/* 记完一笔转账只重绘了 #dashRealPL 等小块 —— 摘要行上的数字也要跟着走，否则"还差"留在旧值上。 */
+function _applyFoldSums(map) {
+  Object.keys(map).forEach(function (k) {
+    var sec = document.getElementById('cs-' + k);
+    if (!sec) return;
+    var sum = sec.querySelector('.cs-sum');
+    if (sum) sum.innerHTML = map[k];
+  });
+}
+
+document.addEventListener('click', function (ev) {
+  var el = ev.target;
+  while (el && el.nodeType === 1) {
+    if (el.classList && el.classList.contains('cs-head')) break;
+    el = el.parentNode;
+  }
+  if (!el || el.nodeType !== 1 || !el.classList || !el.classList.contains('cs-head')) return;
+  var sec = el.parentNode;
+  if (!sec || !sec.getAttribute) return;
+  var willOpen = sec.getAttribute('data-open') === '0';
+  sec.setAttribute('data-open', willOpen ? '1' : '0');
+  el.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  foldSet(String(sec.id).replace(/^cs-/, ''), willOpen);
+  _syncFoldCount();
+});
+
 function dashVerdictHTML(m, r, ustate) {
   var v = (r && r.view) || null;
   if (!v) return '';
@@ -6947,6 +7157,7 @@ function _refreshDashSummary() {
   /* v7.11-C：结论卡里写着「还差多少」，转账一改就必须跟着变（它没有输入框 ⇒ 可整块重绘） */
   var vd = $('#dashVerdict');
   if (vd) vd.innerHTML = dashVerdictHTML(m, r, usageStateOfMonth(currentKey));
+  _applyFoldSums(_foldSums(r, m));   /* v7.12：摘要行上的"已录/还差"也要跟着走 */
   var g = $('#dashTransferGaps');
   if (g) g.innerHTML = transferGapChipsHTML(m, r, unlocked.transfer ? '' : ' disabled');
   var p = $('#dashRealPL');
