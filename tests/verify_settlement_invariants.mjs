@@ -377,6 +377,9 @@ try {
     if (ov) ov.classList.remove('show');
     window.switchTab('printers');
   });
+  /* 「本口径」区间选择器默认跟**当月**走，跨月后默认就变成下个月（打桩数据只在 10 月）
+     ⇒ 本口径页数恒 0，下面的 waitForFunction 必然超时。所以这里显式把口径钉到 2026-10。 */
+  await page.evaluate(() => window.onScopeTimeChange('m:2026-10'));
   await page.waitForFunction(() => {
     const sec = document.querySelector('#printer-usage');
     if (!sec) return false;

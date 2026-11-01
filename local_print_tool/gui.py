@@ -5229,6 +5229,7 @@ class MainWindow(QMainWindow):
                     _job.font_checked = False
                     _job.font_fp = ""
                     _job.missing_fonts = []
+                    _job.nonembedded_fonts = []
         except Exception:
             logger.debug("清空 cached_pdf 失败", exc_info=True)
         return True
@@ -8149,6 +8150,36 @@ class MainWindow(QMainWindow):
         return ((QColor("#4a3d14"), QColor("#ffd66b")) if dark
                 else (QColor("#fff3cd"), QColor("#8a6d00")))
 
+    def _font_tip_blocks(self, job) -> list:
+        """行 tooltip 里"字体"那几段（纯字符串、不碰控件 ⇒ 验收可以直接跑）。
+
+        两种"缺"分开写，各自给「原因 + 后果 + 怎么办」：
+        · 本机没装   → 装字体能救（装上再重新加文件，提示就没了）
+        · PDF 没嵌入 → 装字体救不了（字形不在文件里，只能让生成方重导带字形的 PDF）
+        2026-11-01 现场反馈：原来一句话把两者混成"没嵌入这些字体"，用户既不知道
+        该去装字体还是该找生成方，也不知道装字体到底有没有用。
+        """
+        _miss = [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
+        _ne = [str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()]
+        blocks = []
+        if _ne:
+            blocks.append(
+                "⚠ 这份 PDF 生成时没把字体嵌进文件（只写了字体名，没带字形）：\n"
+                + "\n".join(f"· {n}" for n in _ne[:8])
+                + ("\n…" if len(_ne) > 8 else "")
+                + "\n本机装了这个字体 ⇒ 打印时自动用它渲染（2026-11-01 起）；"
+                  "没装 ⇒ 用内置字形代替，笔画/字宽可能和屏幕上看到的不同。\n"
+                  "页数、位置、分页不受影响。要纸面与原件完全一致，"
+                  "最稳的还是让生成方重新导出「嵌入字体」的 PDF。")
+        if _miss:
+            blocks.append(
+                "⚠ 本机没装这些字体：\n"
+                + "\n".join(f"· {n}" for n in _miss[:8])
+                + ("\n…" if len(_miss) > 8 else "")
+                + "\n转换/打印时会用相近字体替换，字形、字宽、换行可能变样。\n"
+                  "把字体装上，再重新添加这个文件，提示就没了。")
+        return blocks
+
     def _queue_font_checks(self, jobs: list, tab_key: str = "") -> None:
         """给新加进来的文件排一次字体检查（只查能静态查的格式：.docx / .pdf）。
 
@@ -8183,6 +8214,7 @@ class MainWindow(QMainWindow):
             if not ok:
                 job.font_checked = True
                 job.missing_fonts = []
+                job.nonembedded_fonts = []
                 job.font_fp = fp
                 continue
             if getattr(job, "font_checked", False) and getattr(job, "font_fp", "") == fp:
@@ -8228,19 +8260,18 @@ class MainWindow(QMainWindow):
         装了字体就能解决。
         """
         try:
-            _is_pdf = os.path.splitext(str(file_path or ""))[1].lower() == ".pdf"
-            _ne = {str(x).strip().lower() for x in (nonembedded or []) if str(x).strip()}
-            _ne_names = [str(x) for x in (missing or []) if str(x).strip().lower() in _ne]
-            # 行上要标的是"这些字体印不对"，两种情况都算：
-            #   本机没装（docx 会被 Word 替换） + PDF 没嵌入（装了字体也没用，字形不在文件里）
-            _flag = list(dict.fromkeys([str(x) for x in (missing or []) if str(x).strip()]
-                                       + [str(x) for x in (nonembedded or []) if str(x).strip()]))
+            # 注意：这里不能拿 missing ∩ nonembedded 当"未嵌入"清单 —— 字体装上了 missing 就空了，
+            # 可"文件没嵌入"这件事照样成立（2026-11-01 现场：STSong 已装，PDF 仍未嵌入）。
+            _ne_names = [str(x) for x in (nonembedded or []) if str(x).strip()]
             hits = []
             for key, tab in (self._config.tabs or {}).items():
                 for idx, job in enumerate(getattr(tab, "jobs", None) or []):
                     if (getattr(job, "file_path", "") or "") != file_path:
                         continue
-                    job.missing_fonts = _flag
+                    # 两种"缺"分开存：本机没装的（能靠装字体救）与 PDF 自身没嵌入的
+                    # （装字体也救不了）—— tooltip 要按这两条分别说话，混在一起就有歧义。
+                    job.missing_fonts = [str(x) for x in (missing or []) if str(x).strip()]
+                    job.nonembedded_fonts = [str(x) for x in (nonembedded or []) if str(x).strip()]
                     job.font_checked = True
                     job.font_fp = fp or ""
                     if key == self._current_tab:
@@ -8250,15 +8281,18 @@ class MainWindow(QMainWindow):
                     self._fill_table_row(idx, job)
                 except Exception:
                     logger.debug("刷新字体检出行失败", exc_info=True)
-            if missing:
-                _names = "、".join(str(x) for x in list(missing)[:5])
-                _more = f" 等 {len(missing)} 种" if len(missing) > 5 else ""
-                if _is_pdf and _ne_names and len(_ne_names) == len(missing):
-                    self._log(f"🖋 {os.path.basename(file_path)} 这份 PDF 没把字体嵌进文件："
-                              f"{_names}{_more}（打印时会用替代字形，字形可能与屏幕上看到的不同）")
-                else:
-                    self._log(f"🖋 {os.path.basename(file_path)} 用到本机没有的字体："
-                              f"{_names}{_more}（打印效果可能与该文件原样不同）")
+            _name = os.path.basename(file_path)
+            if _ne_names:
+                _names = "、".join(str(x) for x in _ne_names[:5])
+                _more = f" 等 {len(_ne_names)} 种" if len(_ne_names) > 5 else ""
+                self._log(f"🖋 {_name} 这份 PDF 生成时没把字体嵌进文件：{_names}{_more}"
+                          "（本机装了这个字体会自动用它渲染；没装则用内置字形代替）")
+            _miss_only = [str(x) for x in (missing or []) if str(x).strip()]
+            if _miss_only:
+                _names = "、".join(_miss_only[:5])
+                _more = f" 等 {len(_miss_only)} 种" if len(_miss_only) > 5 else ""
+                self._log(f"🖋 {_name} 用到本机没有的字体：{_names}{_more}"
+                          "（转换/打印会被相近字体替换，装上字体后重新添加文件即可）")
         except Exception:
             logger.debug("字体检出回写失败", exc_info=True)
 
@@ -8306,6 +8340,8 @@ class MainWindow(QMainWindow):
                     _ne_names = [str(x) for x in font_check.pdf_nonembedded_fonts(path)
                                  if str(x).strip()]
                     _ne = {x.strip().lower() for x in _ne_names}
+                    # 顺手回写，让表格 tooltip 与闸门口径一致（行不会重画也不影响，下次重画即对齐）
+                    job.nonembedded_fonts = list(_ne_names)
                 except Exception:
                     _ne, _ne_names = set(), []
             # 要警的字体 = 本机没装 ∪ PDF 没嵌入。
@@ -8393,21 +8429,15 @@ class MainWindow(QMainWindow):
             # 列表任务用的是暂存副本（原件删掉/移动也不影响打印）→ 提示里给原件路径
             _tip = f"{_src}\n（打印使用暂存副本，原件删除/移动不影响打印）"
         name_item.setToolTip(_tip)
-        _miss = list(getattr(job, "missing_fonts", []) or [])
-        if _miss:
-            # 只提示、不拦：Word 会把缺的字体悄悄换成相近字体，打出来字形/字宽会变。
-            # 真正的拦截放在打印前（_font_gate 弹一次确认）—— 行上标黄是为了让操作员
-            # 在点「开始打印」之前就看见，而不是打完才发现排版不对。
-            # 这里**不读文件**（每行都查会拖慢整表重画），PDF 的"未嵌入"只按扩展名给个口径，
-            # 精确区分留给 _font_gate（那时才有必要多读一次）。
-            _is_pdf = str(getattr(job, "file_path", "") or "").lower().endswith(".pdf")
+        _miss = list(getattr(job, "missing_fonts", []) or [])        # 本机没装：装上就能救
+        _ne = list(getattr(job, "nonembedded_fonts", []) or [])      # 文件没嵌入：装字体救不了
+        if _miss or _ne:
+            # 只提示、不拦：真正的拦截放在打印前（_font_gate 弹一次确认）—— 行上标黄是为了
+            # 让操作员在点「开始打印」之前就看见，而不是打完才发现字形不对。
+            # 这里**不读文件**（每行都查会拖慢整表重画）：结论全部来自后台线程回写的两个字段。
+            # 文案见 _font_tip_blocks：两种"缺"分两段写，各自说清「怎么办」。
             name_item.setText(f"⚠️ {display}")
-            name_item.setToolTip(
-                _tip + ("\n\n⚠ 这份 PDF 没嵌入这些字体，打印时只能用替代字形：\n"
-                        if _is_pdf else
-                        "\n\n⚠ 本机没装这些字体，打印效果可能与文件原样不同：\n")
-                + "\n".join(f"· {n}" for n in _miss[:8])
-                + ("\n…" if len(_miss) > 8 else ""))
+            name_item.setToolTip(_tip + "\n\n" + "\n\n".join(self._font_tip_blocks(job)))
             _bg, _fg = self._font_theme_colors()
             name_item.setBackground(_bg)
             name_item.setForeground(_fg)
@@ -8417,16 +8447,34 @@ class MainWindow(QMainWindow):
         copies_item.setTextAlignment(Qt.AlignCenter)
         self._table.setItem(row, self.COL_COPIES, copies_item)
 
-        # 图片：双面无意义
+        # 单/双面：一律显示**生效值**，不是请求值。
+        # 生效口径与打印线程的 `PrintWorker._effective_duplex` 同一套规则：有效页数 == 1
+        # ⇒ 单页硬闸门按单面打（页数未知(0) 不算 1 页，保持请求值）。
+        # 2026-11-01 现场：「它明明是单张的，但是它显示的单双面配置却是双面短边翻转」——
+        # 1 页的横向 PDF 建 job 时按方向自动选了 short-edge，表格照抄 job.duplex 就显示
+        # 「双面(短边)」，可实际会按单面打。显示与生效不一致，操作员没法判断会不会翻面。
+        duplex_tip = ""
         if is_image:
             duplex_text = "—"
-        elif job.duplex == "on":
-            dm = "长边" if job.duplex_mode != "short-edge" else "短边"
-            duplex_text = f"双面({dm})"
         else:
-            duplex_text = "单面"
+            _asked_on = (getattr(job, "duplex", "off") or "off") == "on"
+            _eff_pages, _ = self._pages_effective(job)
+            if _eff_pages == 1:
+                duplex_text = "单面"
+                if _asked_on:
+                    duplex_tip = ("这一份按单面打印（不是双面）。\n"
+                                  "有效页数只有 1 页：一张纸的正反两面凑不出一对，双面请求\n"
+                                  "会让驱动先吐一张空白纸，所以打印线程一律降成单面。\n"
+                                  "价格也按「1 张单面」算。多页文件才会真的双面。")
+            elif _asked_on:
+                dm = "长边" if job.duplex_mode != "short-edge" else "短边"
+                duplex_text = f"双面({dm})"
+            else:
+                duplex_text = "单面"
         duplex_item = QTableWidgetItem(duplex_text)
         duplex_item.setTextAlignment(Qt.AlignCenter)
+        if duplex_tip:
+            duplex_item.setToolTip(duplex_tip)
         self._table.setItem(row, self.COL_DUPLEX, duplex_item)
 
         # 图片：页码范围无意义

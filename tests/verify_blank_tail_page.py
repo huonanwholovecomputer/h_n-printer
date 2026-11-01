@@ -7,7 +7,8 @@
   ③ 云端单只标不排（价格后端已定）；④ 排除掉的空白页不收钱（按排除后页数计价）。
 
 本脚本钉住：
-1. 检测口径：真空白页判空、中间空白页不误报、只有页脚页码的页**不算**空白、
+1. 检测口径：真空白页判空、中间空白页不误报、正文区有字的页不算空白、
+   **只有页码 / 只有页眉 / 页码+页眉条 的页算空白**（2026-11-01 用户需求）、
    扫描件整页白图判空、阈值附近不越界；
 2. 排除逻辑落到 page_range（唯一口径）：有效页数/计费/单页硬闸门随之变化，能恢复；
 3. GUI：⚠️ 出现在「页数」列、勾选框只在检测到时可点、勾/取消直接改 page_range 与费用；
@@ -38,7 +39,8 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import paths  # noqa: E402
-from pdf_printer import detect_trailing_blank_pages, page_is_blank  # noqa: E402
+from pdf_printer import (detect_trailing_blank_pages, page_is_blank,  # noqa: E402
+                         page_text_is_furniture)
 from printer_config import (PrintJob, TabSettings, _count_pages_in_range,  # noqa: E402
                             calc_cost, format_page_selection, split_tail_blank)
 
@@ -56,7 +58,8 @@ def check(name, cond, detail=""):
 
 # ══════════════ 夹具：用 PyMuPDF 造「指定第几页空白」的 PDF ══════════════
 def build_pdf(name, spec):
-    """spec: [(kind, ...)]，kind ∈ text / blank / footer / white_image / dot"""
+    """spec: [(kind, ...)]，kind ∈ text / blank / footer / header / header_rule /
+    body_bottom / body_mid / white_image / dot / box"""
     doc = fitz.open()
     for item in spec:
         page = doc.new_page(width=595, height=842)
@@ -64,7 +67,23 @@ def build_pdf(name, spec):
         if kind == "text":
             page.insert_text((72, 120), item[1], fontsize=14)
         elif kind == "footer":
-            page.insert_text((280, 800), "1", fontsize=9)   # 只有页码 = 有内容
+            # 只有页脚页码（2026-11-01 起：算空白，见 page_text_is_furniture）
+            page.insert_text((280, 800), "12", fontsize=9)
+        elif kind == "header":
+            # 只有页眉标题（不印正文）
+            page.insert_text((72, 40), "陕西省家庭经济困难学生认定暨国家教育资助申请表",
+                             fontsize=9)
+        elif kind == "header_rule":
+            # 页码 + 页眉标题 + 页眉下那条装饰横线（现场第 3 页就是这个长相）
+            page.draw_line(fitz.Point(72, 52), fitz.Point(523, 52), width=1)
+            page.insert_text((72, 40), "陕西省家庭经济困难学生认定暨国家教育资助申请表",
+                             fontsize=9)
+            page.insert_text((280, 800), "12", fontsize=9)
+        elif kind == "body_bottom":
+            # 正文区最后一行（Word 默认下边距 72pt ⇒ 正文落在页脚带以外）
+            page.insert_text((72, 760), "最后一行正文内容", fontsize=10)
+        elif kind == "body_mid":
+            page.insert_text((240, 420), "此页无正文", fontsize=10)
         elif kind == "white_image":
             pix = fitz.Pixmap(fitz.csGRAY, fitz.IRect(0, 0, 400, 560), False)
             pix.set_rect(pix.irect, (255,))
@@ -94,8 +113,27 @@ check("★ 中间的空白页不报（只查末尾连续）⇒ 0", detect_traili
       str(detect_trailing_blank_pages(p_mid)))
 
 p_footer = build_pdf("a_footer.pdf", [("text", "page1"), ("footer",)])
-check("★ 只印了页码的末页**不算**空白（有字就会出纸）⇒ 0",
-      detect_trailing_blank_pages(p_footer) == 0, str(detect_trailing_blank_pages(p_footer)))
+check("★ 只印了页码的末页算空白（2026-11-01 用户口径：只剩页码 = 空白页）⇒ 1",
+      detect_trailing_blank_pages(p_footer) == 1, str(detect_trailing_blank_pages(p_footer)))
+
+p_header = build_pdf("a_header.pdf", [("text", "page1"), ("header",)])
+check("★ 只印了页眉标题的末页算空白（同上口径：只剩页眉 = 空白页）⇒ 1",
+      detect_trailing_blank_pages(p_header) == 1, str(detect_trailing_blank_pages(p_header)))
+
+p_header_rule = build_pdf("a_header_rule.pdf", [("text", "page1"), ("header_rule",)])
+check("★ 页码 + 页眉标题 + 页眉装饰线（现场第 3 页长相）⇒ 1",
+      detect_trailing_blank_pages(p_header_rule) == 1,
+      str(detect_trailing_blank_pages(p_header_rule)))
+
+p_body_bottom = build_pdf("a_body_bottom.pdf", [("text", "page1"), ("body_bottom",)])
+check("★ 末页正文区最后一行有字（Word 默认下边距，正文在页脚带外）⇒ 0（不能误判）",
+      detect_trailing_blank_pages(p_body_bottom) == 0,
+      str(detect_trailing_blank_pages(p_body_bottom)))
+
+p_body_mid = build_pdf("a_body_mid.pdf", [("text", "page1"), ("body_mid",)])
+check("★ 末页正文区中间一行字（只有 5 个字、墨量极小）⇒ 0（正文区有字就是内容）",
+      detect_trailing_blank_pages(p_body_mid) == 0,
+      str(detect_trailing_blank_pages(p_body_mid)))
 
 p_scan = build_pdf("a_scan.pdf", [("text", "page1"), ("white_image",)])
 check("扫描件式「整页白图」末页判空白（栅格判据，不看有没有图）⇒ 1",
@@ -118,6 +156,22 @@ _doc = fitz.open(p_1blank)
 check("page_is_blank: 内容页 False / 空白页 True",
       page_is_blank(_doc[0]) is False and page_is_blank(_doc[2]) is True)
 _doc.close()
+
+# 家具口径的直接判据（2026-11-01）：判据函数本身也要能被单测到
+for _p, _label, _want_furn, _want_blank in [
+    (p_footer, "只有页码", True, True),
+    (p_header, "只有页眉", True, True),
+    (p_header_rule, "页码 + 页眉 + 装饰线", True, True),
+    (p_body_bottom, "正文区最后一行", False, False),
+    (p_body_mid, "正文区中间一行", False, False),
+    (p_mark, "40pt 方块（无字）", True, False),
+]:
+    _d = fitz.open(_p)
+    _pg = _d[-1]
+    _f, _b = page_text_is_furniture(_pg), page_is_blank(_pg)
+    check(f"page_text_is_furniture / page_is_blank：{_label} ⇒ furniture={_want_furn} blank={_want_blank}",
+          _f is _want_furn and _b is _want_blank, f"furniture={_f} blank={_b}")
+    _d.close()
 
 print("\n② 排除逻辑：结果只落到 page_range 上（唯一口径）")
 check("format_page_selection: {1,2,3,5} → \"1-3,5\"",

@@ -269,6 +269,37 @@ win._on_convert_finished(0, DOCX0, PDF1, 0, "portrait", "")
 check("★ ① 负例：page_count=0（未知）**不得**当成 1 页 → duplex 仍 'on'",
       jobs0[0].duplex == "on", f"{jobs0[0].duplex}")
 
+# ①b 表格「单/双面」列只显示**生效值**（2026-11-01 现场反馈）
+# 现场：1 页的横向 PDF 建 job 时按方向自动选了 short-edge，表格照抄 job.duplex 就显示
+# 「双面(短边)」，可单页硬闸门实际按单面打 —— 用户看到的是「明明是单张却写着双面短边」。
+print("\n=== ①b 表格显示的是生效值（1 页文件即使请求双面也显示「单面」）===")
+jobs_b = seed([
+    PrintJob(file_path=PDF1, copies=1, duplex="on", duplex_mode="short-edge",
+             page_count=1, orientation="landscape", display_name="单页横向.pdf"),
+    PrintJob(file_path=PDF2, copies=1, duplex="on", duplex_mode="short-edge",
+             page_count=2, orientation="landscape", display_name="两页横向.pdf"),
+    PrintJob(file_path=PDF1, copies=1, duplex="off", duplex_mode="long-edge",
+             page_count=1, orientation="landscape", display_name="单页单面.pdf"),
+])
+_dup0 = win._table.item(0, gui.MainWindow.COL_DUPLEX)
+_dup1 = win._table.item(1, gui.MainWindow.COL_DUPLEX)
+_dup2 = win._table.item(2, gui.MainWindow.COL_DUPLEX)
+check("★ ①b 1 页横向 PDF、请求双面短边 → 表格显示「单面」（请求值仍是 'on'）",
+      _dup0.text() == "单面" and jobs_b[0].duplex == "on",
+      f"cell={_dup0.text()!r} job.duplex={jobs_b[0].duplex}")
+check("★ ①b 悬停说明讲清为什么不是双面（有效页数 1 页 / 会先吐空白纸）",
+      "1 页" in _dup0.toolTip() and "空白" in _dup0.toolTip(),
+      repr(_dup0.toolTip())[:100])
+check("①b 费用列同口径：1 页按「1 张单面」计价（不是双面价）",
+      f"1张×{win._config.simplex_price:.2f}" in win._table.item(0, gui.MainWindow.COL_COST).text(),
+      f"{win._table.item(0, gui.MainWindow.COL_COST).text()!r}")
+check("①b 2 页横向 PDF、请求双面短边 → 照旧显示「双面(短边)」，没有多余提示",
+      _dup1.text() == "双面(短边)" and not _dup1.toolTip(),
+      f"cell={_dup1.text()!r} tip={_dup1.toolTip()!r}")
+check("①b 1 页 + 请求单面 → 「单面」，不弹「降级」说明（本来就没请求双面）",
+      _dup2.text() == "单面" and not _dup2.toolTip(),
+      f"cell={_dup2.text()!r} tip={_dup2.toolTip()!r}")
+
 # 攒批/无人值守闸门同口径（MainWindow 侧）
 win._config.printer_name = "Fake Manual"
 win._config.printer_profiles["Fake Manual"] = MANUAL

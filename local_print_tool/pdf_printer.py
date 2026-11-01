@@ -412,25 +412,96 @@ BLANK_PAGE_MAX_INK = 0.0002      # 暗像素占比门槛：A4@72dpi ≈ 100 px
 BLANK_PAGE_MIN_INK_PX = 40       # 绝对容差：再小的墨点按"扫描噪声/微小污点"算空白
 BLANK_SCAN_MAX_PAGES = 8         # 最多往回扫几页（末尾 1~2 页是常态）
 
+# ── 只剩"家具"的页也算空白（2026-11-01 用户需求）───────────────────────
+# 现场：学校系统导出的 3 页申请表，第 3 页正文没了，只留一个页脚页码「12」和页眉那条
+# 装饰横线。按"有文字就算有内容"的老口径，这一页不算空白 ⇒ 按双面打出去就是一张
+# 只有「12」的白纸。用户原话（2026-11-01）：「只存在一个页码的情况，或者只存在一个
+# 页眉的情况，也应该被判定为空白页」。
+# 判据只放宽到"页眉/页脚带里的少量文字"这一种情况，正文区有任何字都不算空白，
+# 墨量也另设上限 —— 宁可少判（多打一张白纸），也不能把真内容误排掉。
+BLANK_FURNITURE_BAND = 0.08          # 页眉/页脚带 = 页高上下各 8%（A4 ≈ 67 pt；
+                                     # Word 默认下边距 72 pt ⇒ 正文永远落在带外）
+BLANK_FURNITURE_MAX_CHARS = 40       # 全部家具文字的字数上限（页码 + 一行页眉标题 ≈ 30 字）
+BLANK_FURNITURE_MAX_LINE_CHARS = 30  # 单行上限：带上出现一整句/一段 ⇒ 当正文
+BLANK_FURNITURE_MAX_INK = 0.01       # 只剩家具时整页墨量上限（A4@72dpi ≈ 5000 px，挡大图）
+
+
+def page_text_is_furniture(page) -> bool:
+    """页面上的文字是否只有"家具"（页码 / 页眉 / 页脚），没有正文。
+
+    家具 = 全部非空文字都落在页高上下 BLANK_FURNITURE_BAND 的带内，且字数很少。
+    任何图片块、正文区里的字、带内一整段长文字 ⇒ 不是家具。读不出来一律按"有内容"
+    （fail-open：绝不因为解析失败把真内容当空白排掉）。
+    """
+    try:
+        pagedict = page.get_text("dict")
+        height = float(page.rect.height) or 1.0
+    except Exception:
+        return False
+    band = BLANK_FURNITURE_BAND * height
+    total = 0
+    for block in pagedict.get("blocks", []) or []:
+        if block.get("type", 0) != 0:
+            return False                 # 图片块：交给墨量判据，这里不当作家具
+        for line in block.get("lines", []) or []:
+            for span in line.get("spans", []) or []:
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
+                bbox = span.get("bbox") or (0, 0, 0, 0)
+                try:
+                    y0, y1 = float(bbox[1]), float(bbox[3])
+                except Exception:
+                    return False
+                if y0 >= band and y1 <= height - band:
+                    return False         # 正文区有字 ⇒ 有内容
+                if len(text) > BLANK_FURNITURE_MAX_LINE_CHARS:
+                    return False         # 带上出现一整段文字 ⇒ 当正文
+                total += len(text)
+                if total > BLANK_FURNITURE_MAX_CHARS:
+                    return False
+    return True
+
+
+def _ensure_system_fonts() -> None:
+    """在**任何** MuPDF 渲染之前装一次「未嵌入字体 → 本机同名字体」（幂等，失败静默）。
+
+    MuPDF 不查 Windows 字体表，未嵌入的 CJK 字体一律用内置兜底（观感=微软雅黑）。
+    接管钩子见 system_fonts.py；必须在第一次渲染前装好，否则那一页已经按兜底字形
+    进了字体缓存（2026-11-01 现场：操作员装了 STSong-Light 却打出黑体）。
+    """
+    try:
+        try:
+            from system_fonts import install as _install_system_fonts
+        except ImportError:
+            from .system_fonts import install as _install_system_fonts
+        _install_system_fonts()
+    except Exception:
+        pass
+
 
 def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
-    """这一页是不是"白纸一张"。只认两路判据（实测余量极大，见下）：
+    """这一页是不是"白纸一张"（打印口径：只会吐一张几乎全白的纸）。
 
-    · **页面文字为空** —— 有页脚页码、只有一两个字符都算有内容（那确实会印出来）；
-    · **72dpi 灰度栅格化后暗像素占比 < max_ink** —— 栅格看的是"最终印出来什么样"，
-      所以白底矩形、空图层、扫描件整页是图都不影响判定。
+    判据：
+    · **页面没有文字** —— 只看 72dpi 灰度栅格的暗像素占比 < max_ink；
+    · **只剩家具**（页码 / 页眉 / 页脚，见 page_text_is_furniture）—— 墨量也要很小
+      （< BLANK_FURNITURE_MAX_INK）才算空白；
+    · 正文区有任何文字、或墨量偏大 ⇒ 有内容。
 
     2026-10-28 现场标定（打印列表真实文件，A4@72dpi = 501832 px）：
       真空白页 0 个暗像素；最"空"的内容页 9483 个（1.89%，只有 191 个字符）；
-      普通内容页 8.8%~26.5%。门槛取 0.02%（≈100 px）离两头都有 100 倍余量。
+      普通内容页 8.8%~26.5%。纯文字门槛取 0.02%（≈100 px）离两头都有 100 倍余量。
+    2026-11-01 追加家具口径：只有页码「12」+ 页眉装饰线的末页墨量在 0.1% 量级，
+      离"最空内容页 1.89%"仍有 10 倍余量。
     """
     try:
-        if page.get_text("text").strip():
-            return False
+        has_text = bool(page.get_text("text").strip())
     except Exception:
         return False            # 连文字都读不出来 ⇒ 按"有内容"处理（fail-open，绝不误删）
     try:
         import fitz
+        _ensure_system_fonts()
         pix = page.get_pixmap(dpi=72, colorspace=fitz.csGRAY)
         data = pix.samples
     except Exception:
@@ -439,8 +510,11 @@ def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
         return True
     dark = sum(1 for v in data if v < 245)
     # 两道容差取大：占比口径（页面越大容差越大）+ 绝对值 40 px（≈1mm²，挡扫描噪点）。
-    # 任何**会印出来**的内容（一个字符/一条线/一个图章）都远超这个量级。
-    return dark <= max(float(BLANK_PAGE_MIN_INK_PX), float(max_ink) * len(data))
+    if not has_text:
+        return dark <= max(float(BLANK_PAGE_MIN_INK_PX), float(max_ink) * len(data))
+    if dark > float(BLANK_FURNITURE_MAX_INK) * len(data):
+        return False            # 字只有几个，但墨量不小（大图/粗框/整页底纹）⇒ 有内容
+    return page_text_is_furniture(page)
 
 
 def detect_trailing_blank_pages(pdf_path: str, max_scan: int = BLANK_SCAN_MAX_PAGES) -> int:
@@ -1334,6 +1408,7 @@ def _print_pdf_native(
     page_started = False  # P1-9: 是否已开始出纸（StartPage 已执行）
 
     try:
+        _ensure_system_fonts()      # 必须在第一页 get_pixmap 之前（MuPDF 字体缓存）
         doc = fitz.open(pdf_path)
         total_pages = len(doc)
         if total_pages == 0:

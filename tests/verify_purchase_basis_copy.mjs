@@ -35,12 +35,31 @@ function chk(name, cond, detail) {
   console.log(`[${cond ? 'PASS' : 'FAIL'}] ${name}` + (!cond && detail !== undefined ? `  -- ${detail}` : ''));
 }
 
-/* 打桩：两位成员 + 一笔垫付采购（采购人 ma），口径初始 = usage（对应用户截图里的选择） */
+/* v7.14 起页面默认月份 = 当月：垫付清算只渲染「选中月份里」的采购，写死 2026-10 会在
+   跨月（尤其月初那天）直接变成「当月暂无数据」而整块不渲染 —— 用例自己造出跨月变红。
+   所以月份一律取跑测试时的**当月**，采购日期取当月里不会跑到未来的那天（1~5 号）。 */
+const _now = new Date();
+const MONTH = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}`;
+const EXPENSE_DAY = String(Math.min(5, _now.getDate())).padStart(2, '0');
+const EXPENSE_DATE = `${MONTH}-${EXPENSE_DAY}`;
+
+/* 打桩：两位成员 + 一笔垫付采购（采购人 ma），口径初始 = usage（对应用户截图里的选择）
+ *
+ * ⚠ 必须同时给「当月订单」：v7.14 的垫付清算按**本月实际用量**分摊，当月一单都没有时
+ * `calcMonth` 走「本月用量 0 ⇒ 回退 AA 均摊」的兜底（`r.basisFallback`），表头如实写
+ * 「应均摊（本月用量 0，已回退）」—— 那是产品的正确行为，不是文案没同步。用例要验「按用量」
+ * 口径，就得让本月真有纸出来。日期同样取当月（写死月份跨月就变成空月份，见上）。 */
+const ORDERS = [{
+  id: 'o1', openid: 'local', owner_name: '霍楠', status: 'completed',
+  created_at: `${EXPENSE_DATE} 10:00:00`, source: 'local', received_client: 'R7000-1',
+  files: [{ status: 'sent', total_pages: 40, page_count: 20, copies: 2 }],
+}];
+
 const STORE = {
   config: { investRate: 0.05, scoreCap: 15, passwords: {}, purchaseBasis: 'usage',
             members: [{ id: 'ma', name: '霍楠', color: '#4472C4' }, { id: 'mb', name: '姚懿祥', color: '#548235' }],
             orderPrinterMap: {}, printers: [] },
-  records: { expenses: [{ id: 'e1', date: '2026-10-05', item: 'A4纸采购', amount: 99.67, payer: 'ma', kind: 'other' }],
+  records: { expenses: [{ id: 'e1', date: EXPENSE_DATE, item: 'A4纸采购', amount: 99.67, payer: 'ma', kind: 'other' }],
              income: [], scores: [], transfers: [] },
   notes: {}, meta: { version: 2 },
 };
@@ -66,8 +85,8 @@ const server = http.createServer((req, res) => {
   if (p === '/api/local/finance_auth/logout') return json(res, { success: true, revoked: true });
   if (p === '/api/proxy/finance/config') return json(res, { success: true, data: STORE });
   if (p === '/api/proxy/pricing') return json(res, { success: true, data: { simplex_price: 0.3, duplex_price: 0.4, cover_page_price: 0.1, delivery_percentages: {}, urgency_prices: {} } });
-  if (p === '/api/proxy/admin/statistics/months') return json(res, { success: true, data: { months: [{ month: '2026-10' }] } });
-  if (p === '/api/proxy/admin/statistics/revenue') return json(res, { success: true, data: { period: {}, revenue_summary: {}, by_user: [], orders: [] } });
+  if (p === '/api/proxy/admin/statistics/months') return json(res, { success: true, data: { months: [{ month: MONTH }] } });
+  if (p === '/api/proxy/admin/statistics/revenue') return json(res, { success: true, data: { period: {}, revenue_summary: {}, by_user: [], orders: ORDERS } });
   if (p === '/api/proxy/printer/devices') return json(res, { success: true, devices: [] });
   if (p === '/api/local/device') return json(res, { success: true, device: { client_id: 'R7000-1', device_name: 'R7000-AHP10', take_orders: true } });
   return json(res, { success: true, data: null });

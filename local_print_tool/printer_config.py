@@ -177,9 +177,14 @@ class PrintJob:
     # 有它才谈得上"恢复"，也让界面能区分"检测到空白"与"已经排掉了"。
     blank_undo_range: str | None = None
     # ── 字体缺失检测（2026-10-31 用户需求，见 font_check.py）──
-    # 本机没装、Word 会**静默替换**的字体名（印出来字形/字宽与原文件不同）。
-    # 只描述文件本身：不影响页数、不影响计费，打印前用它决定要不要弹确认。
+    # 两种"缺"分开存，别混成一个列表 —— 它们**处置办法完全不同**，混着显示就有歧义
+    # （2026-11-01 现场：tooltip 把"文件没嵌入"说成"没嵌入这些字体"，用户看不出该不该装字体）：
+    #   · missing_fonts      = 本机没装 ⇒ 装上就能救（docx 转换时 Word 会静默替换）；
+    #   · nonembedded_fonts  = 这份 PDF 生成时没把字形写进文件 ⇒ 装字体**也没用**，
+    #                          要完全一致只能让生成方重新导出。只对 .pdf 有意义。
+    # 两者都不影响页数/计费，只影响字形；打印前用它们决定要不要弹确认。
     missing_fonts: list[str] = field(default_factory=list)
+    nonembedded_fonts: list[str] = field(default_factory=list)
     font_checked: bool = False   # 查过就不再重复查（含"这种格式查不出"也算查过）
     font_fp: str = ""            # 查的时候的系统字体指纹，变了要重查
 
@@ -207,6 +212,7 @@ class PrintJob:
             "blank_tail": self.blank_tail,
             "blank_undo_range": self.blank_undo_range,
             "missing_fonts": list(self.missing_fonts),
+            "nonembedded_fonts": list(self.nonembedded_fonts),
             "font_checked": self.font_checked,
             "font_fp": self.font_fp,
             # cached_pdf 不持久化，每次启动重新生成
@@ -239,6 +245,8 @@ class PrintJob:
                               if isinstance(data.get("blank_undo_range"), str) else None),
             missing_fonts=[str(x) for x in (data.get("missing_fonts") or [])
                            if isinstance(x, str) and x.strip()][:20],
+            nonembedded_fonts=[str(x) for x in (data.get("nonembedded_fonts") or [])
+                               if isinstance(x, str) and x.strip()][:20],
             font_checked=bool(data.get("font_checked", False)),
             font_fp=str(data.get("font_fp", "") or ""),
         )

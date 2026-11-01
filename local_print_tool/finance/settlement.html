@@ -3858,7 +3858,11 @@ function _trendViewState() {
     if (r) {
       var end = r.end > todayStr() ? todayStr() : r.end;
       var trOrders = _cloudFilteredOrders();
-      gran = _trendGranularity(r.start, end);
+      /* 月口径恒按「日」聚合：月初 1 号时「本月」被裁到只剩一天，days<=1 会误判成 'hour'
+         —— 选了「月」却出现 00:00~23:00 的逐时轴，「点击柱下钻」提示也随之消失（2026-11-01 现场）。
+         单日 / 今天 / 自定义同一天才走逐时。 */
+      var granEnd = (_scopeTime.mode === 'month' && r.end > end) ? r.end : end;
+      gran = _trendGranularity(r.start, granEnd);
       if (gran === 'hour') {
         points = _computeHourlyTrend(trOrders, r.start);   // 单日：始终 24 柱（当天没单也留轴，便于逐时对照）
       } else {

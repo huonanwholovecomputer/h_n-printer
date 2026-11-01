@@ -94,8 +94,10 @@ check("calcMonth 接收 opts.amort：能摊销的整笔采购不计入本月，�
       and "exps = exps.filter(function (e) { return !isAmortizableExpense(e); });" in src
       and "exps.push({ id: a.id, date: m.key + '-01', item: a.item, amount: a.cents / 100," in src
       and "payer: a.payer, virtual: true, kind: a.kind, units: a.units });" in src)
+# v7.14：返回值里 expenses/amort 之后又多了 view（结算公式并入 secFold），
+# 原来钉的 "... amort };" 整句不再成立 —— 只钉「这两个字段在同一个 return 里交出」，别再钉尾随符号。
 check("calcMonth 返回 expenses（计费行）与 amort（摊销明细），页面不另算一份",
-      "expenses: exps, amort: amort };" in src)
+      "expenses: exps, amort: amort," in src)
 check("monthFromRecords 原样带上 kind / units（旧写法只挑 5 个字段会把耗材数量丢掉）",
       "payer: r.payer, kind: r.kind, units: r.units });" in src)
 check("结算入口 calcMonthWithUsage 带上 amort（loading / failed 时 rows 为空、state 明确）",
@@ -241,6 +243,11 @@ function calcSandbox(src) {
   snippet += '\n' + defOf('_filePagesOf');
   snippet += '\n' + defOf('_fileSheets');
   snippet += '\n' + defOf('_usageFromOrders');
+  /* v7.11（B1）：正常用量口径收敛成 _orderNormalUsage() 一个实现，_usageFromOrders 与 calcMonth
+     都调它，但它定义在「切片之外」—— 不补进来 B 组就以 `_orderNormalUsage is not defined`
+     中断（v7.14 那次的红就是这么来的）。它只依赖上面已补的 _filePagesOf / _fileSheets
+     与切片内的 NORMAL_EXCLUDED_STATUSES。 */
+  snippet += '\n' + defOf('_orderNormalUsage');
   snippet += '\n' + defOf('fmtInt');
   snippet += '\n' + defOf('consumableAmortSectionHTML');
   snippet += "\nfunction _orderMemberKey(o) { return (o && o.mid) ? ('member:' + o.mid) : 'local:none'; }";

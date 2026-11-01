@@ -67,8 +67,10 @@ check('废纸来源标注区分「人工 / 预估」',
       '<span class="tag b">预估</span>' in src and '<span class="tag g">人工</span>' in src)
 check('用纸统计有「未归属」行（成员被删 / 订单没绑成员时纸不能凭空消失）',
       ">未归属</td>" in src and 'orphanWaste' in src and 'orphanNormal' in src)
+# v7.12：明细区整批折成 secFold 折叠块，原来钉的「h += paperStatsSectionHTML(r, m);」直排行
+# 已经不存在了 —— 顺序判据改成看两个折叠块的先后（paper 必须排在 amort 之前）。
 check('用纸统计在「长期耗材摊销」之前渲染',
-      src.index('h += paperStatsSectionHTML(r, m);') < src.index('h += consumableAmortSectionHTML(r, m);'))
+      src.index("h += secFold('paper',") < src.index("h += secFold('amort',"))
 
 check('废纸人工值读的是 config.waste_paper（按月 × 成员）',
       'var bag = (STORE.config && STORE.config.waste_paper) || {};' in src and 'var mon = bag[key];' in src)
@@ -179,6 +181,9 @@ function wasteSandbox(src) {
   snippet += "\nfunction usageStateOfMonth(key) { return _usageCache[key] ? 'ready' : 'idle'; }";
   const need = ['esc', 'fmtInt', 'RMB', 'RMBneg', 'sanitizeColor', 'MC', 'MN',
     '_filePagesOf', '_fileSheets', '_usageMonthRange', '_usageEmpty', '_usageFromOrders',
+    /* v7.11（B1）：正常用量口径收敛进 _orderNormalUsage()，_usageFromOrders 调它；
+       它在「数据模型切片」之外，不补进来 Node 侧会以 `_orderNormalUsage is not defined` 崩。 */
+    '_orderNormalUsage',
     'wasteManualOf', 'wasteEstimateOf', 'wasteSheetsOf', '_applyWasteToUsage',
     'paperStatsSectionHTML', 'updWastePaper', 'consumableAmort'];
   const missing = [];
