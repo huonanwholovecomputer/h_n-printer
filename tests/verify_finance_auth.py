@@ -1563,6 +1563,15 @@ def s1_09_behavior():
         chk("并发上限生效：两条并发只放行 1 条，另一条立刻 503（不排队、不无限起线程）",
             sorted(x for x in results if isinstance(x, int)) == [200, 503] and slow.rejected >= 1,
             (results, slow.rejected))
+        # 上面这条是"实跑"判据，但它在坏实现上**只是偶发红**（约 3/4 概率）：顺着 unread 数据
+        # close() 时 Windows 会发 RST，把 503 冲成 ConnectionAborted。所以再补一条**静态**判据
+        # 盯住修复本身，别让后续重构把"读掉对端字节"删回去。
+        import inspect
+        _reject_src = inspect.getsource(ss._LimitedThreadingHTTPServer._reject_busy)
+        chk("503 拒绝路径先把对端字节读掉再 close（否则 Windows 发 RST 把 503 冲成 ConnectionAborted）",
+            "SHUT_WR" in _reject_src and "recv" in _reject_src
+            and _reject_src.index("recv") < _reject_src.rindex("close"),
+            _reject_src)
         chk("_StatsHandler 的连接级超时已设置（半开连接不会永远占线程）",
             0 < float(getattr(ss._StatsHandler, "timeout", 0) or 0) <= 120,
             getattr(ss._StatsHandler, "timeout", None))

@@ -311,10 +311,17 @@ def missing_fonts(used) -> list[str]:
 # ── .docx：解析 OOXML 里的原始字体名 ────────────────────────────────────────
 _RFONT_RE = re.compile(r"""w:(?:ascii|hAnsi|eastAsia|cs)\s*=\s*["']([^"']{1,80})["']""")
 _FONTNAME_RE = re.compile(r"""<w:font\b[^>]*\bw:name\s*=\s*["']([^"']{1,80})["']""")
+# 样式表：<w:style w:styleId="a0">…<w:basedOn w:val="a"/></w:style>，正文用 <w:pStyle w:val="a0"/>
+_STYLE_BLOCK_RE = re.compile(r"""<w:style\b([^>]*)>(.*?)</w:style>""", re.S)
+_STYLE_ID_RE = re.compile(r"""w:styleId\s*=\s*["']([^"']{1,80})["']""")
+_BASED_RE = re.compile(r"""<w:basedOn\b[^>]*\bw:val\s*=\s*["']([^"']{1,80})["']""")
+_USED_STYLE_RE = re.compile(r"""<w:(?:pStyle|rStyle|tblStyle)\b[^>]*\bw:val\s*=\s*["']([^"']{1,80})["']""")
+_DOCDEFAULT_RE = re.compile(r"""<w:docDefaults\b.*?</w:docDefaults>""", re.S)
 # 正文/页眉页脚/脚注/尾注/域：真正会落到纸上的内容都在这些部件里
 _BODY_PARTS = ("document.xml", "header", "footer", "footnotes.xml", "endnotes.xml",
                "comments.xml", "numbering.xml")
 _MAX_XML_BYTES = 64 * 1024 * 1024
+_STYLE_HOPS = 8
 
 
 def _docx_part_names(zf: zipfile.ZipFile, include_styles: bool) -> list[str]:
@@ -338,43 +345,93 @@ def _docx_part_names(zf: zipfile.ZipFile, include_styles: bool) -> list[str]:
     return out
 
 
+def _docx_style_fonts(styles_xml: str, used_ids: set[str]) -> list[str]:
+    """只捞「正文点名用到的样式」里的字体，沿 `basedOn` 链往上找，近的优先。
+
+    模板的 `styles.xml` 常驻一堆根本没用到的字体定义（标题 1、页眉横幅、表格样式…），
+    全并进来就是误报源；只有被 `<w:pStyle>/<w:rStyle>/<w:tblStyle>` 点过的才算数。
+    """
+    if not styles_xml or not used_ids:
+        return []
+    blocks: dict[str, tuple[list[str], str]] = {}
+    for attrs, body in _STYLE_BLOCK_RE.findall(styles_xml):
+        mid = _STYLE_ID_RE.search(attrs)
+        if not mid:
+            continue
+        based = _BASED_RE.search(body)
+        blocks[mid.group(1)] = (_RFONT_RE.findall(body), based.group(1) if based else "")
+    out: list[str] = []
+    for sid in used_ids:
+        name, hops = sid, 0
+        while name and hops < _STYLE_HOPS:
+            fonts, parent = blocks.get(name, ([], ""))
+            if fonts:
+                out.extend(fonts)
+                break
+            name, hops = parent, hops + 1
+    return out
+
+
 def fonts_in_docx(path: str) -> tuple[list[str], bool]:
     """返回 (用到的字体名列表, 是否解析成功)。
 
-    口径：`fontTable.xml` 的 `w:font w:name` 是 Word 实际登记用到的字体（最可靠）；
-    再并上正文/页眉页脚里的 `w:rFonts` 四属性。`styles.xml` 只在没有 fontTable 时才看 ——
-    模板里的样式表常驻一堆根本没用到的字体，并进来就是误报源。
+    口径（2026-11-01 修正）：**只认正文里真正落字的字体引用** ——
+      · 正文/页眉页脚/脚注/尾注的 `w:rFonts`；
+      · 这些部件点名用到的样式（`w:pStyle` / `w:rStyle` / `w:tblStyle`）沿 `basedOn` 链的 `w:rFonts`；
+      · `docDefaults` 里写死（不是 `*Theme` 主题引用）的默认字体。
+    `word/fontTable.xml` **一律不当用法**：Word 从模板起稿时会把主题字体整套登记进去
+    （Aptos / Aptos Display / 等线 / Calibri…），正文压根没用过 —— 2026-11-01 现场就是
+    正文只有宋体/楷体，却被报「本机没装 Aptos」。只有正文一个字体名都读不出来（空文档、
+    纯图片、域代码生成）时才退回 fontTable，免得彻底不吭声。
     """
-    used: list[str] = []
+    explicit: list[str] = []
+    style_fonts: list[str] = []
+    used_ids: set[str] = set()
+    ft_fonts: list[str] = []
     try:
         with zipfile.ZipFile(path) as zf:
             names = set(i.filename for i in zf.infolist())
-            have_ft = "word/fontTable.xml" in names
-            parts = _docx_part_names(zf, include_styles=not have_ft)
-            if have_ft:
-                parts = ["word/fontTable.xml"] + parts
             total = 0
-            for n in parts:
-                total += int(zf.getinfo(n).file_size or 0)
+            for n in _docx_part_names(zf, include_styles=False):
+                try:
+                    total += int(zf.getinfo(n).file_size or 0)
+                except KeyError:
+                    continue
                 if total > _MAX_XML_BYTES:
-                    logger.debug(f"docx 部件过大，只解析 fontTable: {path}")
+                    logger.debug(f"docx 部件过大，只解析已读部分: {path}")
                     break
                 try:
-                    raw = zf.read(n)
+                    text = zf.read(n).decode("utf-8", "ignore")
                 except (KeyError, OSError, zipfile.BadZipFile):
                     continue
-                text = raw.decode("utf-8", "ignore")
-                if n.rsplit("/", 1)[-1] == "fontTable.xml":
-                    used.extend(_FONTNAME_RE.findall(text))
-                else:
-                    used.extend(_RFONT_RE.findall(text))
+                explicit.extend(_RFONT_RE.findall(text))
+                used_ids.update(_USED_STYLE_RE.findall(text))
+            if "word/styles.xml" in names:
+                try:
+                    st = zf.read("word/styles.xml").decode("utf-8", "ignore")
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    st = ""
+                if st:
+                    style_fonts = _docx_style_fonts(st, used_ids)
+                    dd = _DOCDEFAULT_RE.search(st)
+                    if dd:
+                        style_fonts.extend(_RFONT_RE.findall(dd.group(0)))
+            if "word/fontTable.xml" in names:
+                try:
+                    ft_fonts = _FONTNAME_RE.findall(
+                        zf.read("word/fontTable.xml").decode("utf-8", "ignore"))
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    ft_fonts = []
     except (zipfile.BadZipFile, OSError) as e:
         logger.debug(f"docx 字体解析失败: {path} ({e})")
         return [], False
     # 在这里就把非字体名滤掉，别留到 missing_fonts 再滤：
     # `<w:lang w:eastAsia="zh-CN"/>` 和 `<w:rFonts .../>` 是同族属性，正则会把语言标签一起抓出来；
     # 让它漏进返回值，界面/日志上就会显示「用到的字体：zh-CN」这种鬼东西。
-    return list(dict.fromkeys(n for n in used if _is_real_font(n))), True
+    used = [n for n in explicit + style_fonts if _is_real_font(n)]
+    if not used:
+        used = [n for n in ft_fonts if _is_real_font(n)]
+    return list(dict.fromkeys(used)), True
 
 
 # ── .pdf：查 basefont，内嵌的不算缺 ─────────────────────────────────────────

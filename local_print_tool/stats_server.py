@@ -2426,7 +2426,13 @@ class _LimitedThreadingHTTPServer(ThreadingHTTPServer):
 
     @staticmethod
     def _reject_busy(request):
-        """直接在工作线程之外回 503（不读请求体），随后关闭连接。"""
+        """直接在工作线程之外回 503（不读请求体），随后关闭连接。
+
+        **必须先把对端已经发来的字节读掉再 close**：带着未读数据关闭 socket，Windows 会
+        发 RST，把刚写出的 503 一起冲掉 —— 客户端拿到的不是 503 而是 ConnectionAborted，
+        于是"繁忙"看起来像网络故障（验收脚本 2026-11-01 实测约半数复现）。
+        读取量有上限、超时 2 秒，绝不会因为对端不发数据而卡住。
+        """
         body = json.dumps({"success": False, "code": "server_busy",
                            "message": "本地服务繁忙（并发上限 %d），请稍后重试"
                                       % _MAX_CONCURRENT_REQUESTS},
@@ -2437,14 +2443,29 @@ class _LimitedThreadingHTTPServer(ThreadingHTTPServer):
                 b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n")
         try:
             request.settimeout(2)
+        except OSError:
+            pass
+        try:
             request.sendall(head + body)
         except OSError:
             pass
-        finally:
-            try:
-                request.close()
-            except OSError:
-                pass
+        try:
+            request.shutdown(socket.SHUT_WR)      # 先半关写：告诉对端"响应到此为止"
+        except OSError:
+            pass
+        # 把对端剩下的字节读掉（最多几个小包），否则 close() 会发 RST 冲掉 503
+        try:
+            left = 8
+            while left > 0:
+                if not request.recv(65536):
+                    break
+                left -= 1
+        except OSError:
+            pass
+        try:
+            request.close()
+        except OSError:
+            pass
 
     def handle_error(self, request, client_address):
         """超时/断连是正常现象（浏览器 keep-alive、用户关页），别刷 traceback。"""

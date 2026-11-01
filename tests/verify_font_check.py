@@ -62,24 +62,46 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  ❌ {name}{(' — ' + detail) if detail else ''}")
 
 
-def _make_docx(path: str, fonts: list[str], body_fonts: list[str]) -> None:
-    """造一个最小的 .docx（只要 fontTable 与 document.xml 里的 rFonts，够解析即可）。"""
+_W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+
+
+def _make_docx(path: str, fonts: list[str], body_fonts: list[str],
+               body_extra: str = "", styles_xml: str = "", theme_xml: str = "") -> None:
+    """造一个最小的 .docx（fontTable / document.xml 的 rFonts，可选 styles.xml 与 theme1.xml）。"""
     ft = "".join(f'<w:font w:name="{f}"/>' for f in fonts)
     rpr = "".join(f'<w:rFonts w:ascii="{f}" w:eastAsia="{f}"/>' for f in body_fonts)
     parts = {
         "word/fontTable.xml":
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            f'<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">{ft}</w:fonts>',
+            f'<w:fonts {_W_NS}>{ft}</w:fonts>',
         "word/document.xml":
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>'
+            f'<w:document {_W_NS}><w:body>'
             f'<w:p><w:pPr><w:rPr>{rpr}</w:rPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>'
             '<w:p><w:pPr><w:rPr><w:lang w:eastAsia="zh-CN"/></w:rPr></w:pPr></w:p>'
+            f'{body_extra}'
             '</w:body></w:document>',
     }
+    if styles_xml:
+        parts["word/styles.xml"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            f'<w:styles {_W_NS}>{styles_xml}</w:styles>')
+    if theme_xml:
+        parts["word/theme/theme1.xml"] = theme_xml
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         for name, data in parts.items():
             z.writestr(name, data)
+
+
+# Word 从默认模板起稿时的主题字体：majorFont=Aptos Display / minorFont=Aptos
+_THEME_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>'
+    '<a:fontScheme name="Office">'
+    '<a:majorFont><a:latin typeface="Aptos Display"/><a:ea typeface=""/></a:majorFont>'
+    '<a:minorFont><a:latin typeface="Aptos"/><a:ea typeface=""/></a:minorFont>'
+    '</a:fontScheme></a:themeElements></a:theme>'
+)
 
 
 def _make_pdf(path: str, text: str = "hello") -> None:
@@ -148,12 +170,51 @@ docx = os.path.join(tmp, "t.docx")
 _make_docx(docx, ["宋体", "测试缺字体XY", "Helvetica"], ["宋体", "测试缺字体XY"])
 used, ok = font_check.fonts_in_docx(docx)
 check("能解析 .docx", ok is True and bool(used), str(used))
-check("fontTable 里的字体被抓到", "测试缺字体XY" in used, str(used))
+check("正文写的字体被抓到", "测试缺字体XY" in used, str(used))
 check("正文字体被抓到", "宋体" in used, str(used))
 check("w:lang 的 zh-CN 没被当成字体", "zh-CN" not in used, str(used))
+check("只在 fontTable 里登记的字体不算用到（模板残留）", "Helvetica" not in used, str(used))
 _rep = font_check.check_file(docx)
 check("check_file 报出缺的那个字体", _rep["missing"] == ["测试缺字体XY"], str(_rep["missing"]))
 check("check_file 给出指纹", bool(_rep.get("fingerprint")))
+
+print("④b 现场复现：正文只有宋体/楷体，不许报主题字体 Aptos（2026-11-01）")
+_real = os.path.join(tmp, "theme.docx")
+_make_docx(_real, ["Aptos", "Aptos Display", "宋体", "楷体"], ["宋体", "楷体"],
+           theme_xml=_THEME_XML)
+_u, _ok = font_check.fonts_in_docx(_real)
+check("Aptos / Aptos Display 不算正文用到", _ok and "Aptos" not in _u and "Aptos Display" not in _u, str(_u))
+check("正文显式写的宋体/楷体照常报", "宋体" in _u and "楷体" in _u, str(_u))
+check("这份文件的 missing 是空（不再误报）", font_check.check_file(_real)["missing"] == [],
+      str(font_check.check_file(_real)["missing"]))
+
+print("④c 样式里写的字体：只有被正文点名用到的才算")
+_STYLES = (
+    '<w:docDefaults><w:rPrDefault><w:rPr>'
+    '<w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia"/>'
+    '</w:rPr></w:rPrDefault></w:docDefaults>'
+    '<w:style w:type="paragraph" w:styleId="BodyCN"><w:name w:val="正文"/>'
+    '<w:rPr><w:rFonts w:ascii="仿宋" w:eastAsia="仿宋"/></w:rPr></w:style>'
+    '<w:style w:type="paragraph" w:styleId="ChildCN"><w:name w:val="正文缩进"/>'
+    '<w:basedOn w:val="BodyCN"/><w:rPr><w:b/></w:rPr></w:style>'
+    '<w:style w:type="paragraph" w:styleId="NeverUsed"><w:name w:val="标题 1"/>'
+    '<w:rPr><w:rFonts w:ascii="本模板没用到的字体ZZ" w:eastAsia="本模板没用到的字体ZZ"/></w:rPr>'
+    '</w:style>'
+)
+_sty = os.path.join(tmp, "styles.docx")
+_make_docx(_sty, ["仿宋", "本模板没用到的字体ZZ", "Aptos"], [],
+           body_extra='<w:p><w:pPr><w:pStyle w:val="ChildCN"/></w:pPr><w:r><w:t>y</w:t></w:r></w:p>',
+           styles_xml=_STYLES, theme_xml=_THEME_XML)
+_u2, _ok2 = font_check.fonts_in_docx(_sty)
+check("样式（沿 basedOn 链）里写的字体被抓到", _ok2 and "仿宋" in _u2, str(_u2))
+check("没被正文点名的样式字体不算", "本模板没用到的字体ZZ" not in _u2, str(_u2))
+check("docDefaults 只写主题引用时不报主题字体", "Aptos" not in _u2, str(_u2))
+
+_ft_only = os.path.join(tmp, "ft_only.docx")
+_make_docx(_ft_only, ["仅登记字体QQ"], [])
+check("正文读不出字体名时退回 fontTable（免得不吭声）",
+      "仅登记字体QQ" in font_check.fonts_in_docx(_ft_only)[0],
+      str(font_check.fonts_in_docx(_ft_only)))
 
 print("⑤ .pdf 真解析")
 if not font_check.is_installed("Helvetica") and "helvetica" not in font_check._ALWAYS_OK:
@@ -216,6 +277,20 @@ check("脏数据不炸（非字符串项被丢掉）",
       printer_config.PrintJob.from_dict(
           {"file_path": docx, "missing_fonts": ["ok字体", 3, None, ""]}).missing_fonts == ["ok字体"])
 
+# 两种"缺"必须分开存（2026-11-01 现场：混成一个字段，行 tooltip 只能说一句含糊话）
+_jne = printer_config.PrintJob(file_path=ne_pdf, copies=1,
+                               nonembedded_fonts=["STSong-Light"], font_checked=True)
+_dne = _jne.to_dict()
+check("to_dict 带 nonembedded_fonts", _dne.get("nonembedded_fonts") == ["STSong-Light"],
+      str(_dne.get("nonembedded_fonts")))
+check("from_dict 还原 nonembedded_fonts",
+      printer_config.PrintJob.from_dict(_dne).nonembedded_fonts == ["STSong-Light"])
+check("nonembedded_fonts 脏数据同样被过滤",
+      printer_config.PrintJob.from_dict(
+          {"file_path": ne_pdf, "nonembedded_fonts": ["ok字体", 3, None, ""]}).nonembedded_fonts == ["ok字体"])
+check("默认两个列表互不共享（可变默认值的坑）",
+      printer_config.PrintJob(file_path=docx).nonembedded_fonts == [])
+
 print("⑨⑩ 打印前闸门（缺字体弹确认 / 自动线不弹）")
 try:
     import gui  # noqa: E402
@@ -230,6 +305,7 @@ if _has_gui:
         _font_gate = gui.MainWindow._font_gate
         _font_sync_epoch = gui.MainWindow._font_sync_epoch
         _font_theme_colors = gui.MainWindow._font_theme_colors
+        _font_tip_blocks = gui.MainWindow._font_tip_blocks
 
         def __init__(self):
             self.logs: list[str] = []
@@ -321,6 +397,69 @@ if _has_gui:
     finally:
         gui.QMessageBox.question = _orig_q
 
+    # ⑩b 回写与日志：两种"缺"必须分开说 —— 这正是 2026-11-01 现场反馈的歧义点
+    class _StubRow(_Stub):
+        _on_font_checked = gui.MainWindow._on_font_checked
+
+        def __init__(self, jobs):
+            super().__init__()
+            self._config = types.SimpleNamespace(tabs={"1": types.SimpleNamespace(jobs=jobs)})
+            self._current_tab = "1"
+            self.rows = []
+
+        def _fill_table_row(self, idx, job):
+            self.rows.append((idx, job))
+
+    _both = printer_config.PrintJob(file_path=ne_pdf, copies=1)
+    _sr = _StubRow([_both])
+    _sr._on_font_checked(ne_pdf, ["测试缺字体XY"], "fpX", ["STSong-Light"])
+    check("回写：本机没装的进 missing_fonts、未嵌入的进 nonembedded_fonts",
+          _both.missing_fonts == ["测试缺字体XY"]
+          and _both.nonembedded_fonts == ["STSong-Light"],
+          f"{_both.missing_fonts} / {_both.nonembedded_fonts}")
+    check("回写后只重画命中那一行", len(_sr.rows) == 1 and _sr.rows[0][0] == 0, str(_sr.rows))
+    _logtxt = "\n".join(_sr.logs)
+    check("日志把「文件没嵌入」与「本机没装」分成两条",
+          "没把字体嵌进文件" in _logtxt and "用到本机没有的字体" in _logtxt, _logtxt[:240])
+    check("未嵌入那条讲清「装了会自动用它、没装用内置字形」",
+          "本机装了这个字体会自动用它渲染" in _logtxt, _logtxt[:240])
+
+    # 关键：字体已经装好（missing 为空）时，未嵌入这件事照样得报 —— 否则用户以为没事了
+    _ne_only = printer_config.PrintJob(file_path=ne_pdf, copies=1)
+    _sr2 = _StubRow([_ne_only])
+    _sr2._on_font_checked(ne_pdf, [], "fpY", ["STSong-Light"])
+    check("missing 为空时仍报「没把字体嵌进文件」",
+          any("没把字体嵌进文件" in m for m in _sr2.logs), str(_sr2.logs))
+    check("missing 为空时不再说「本机没有的字体」",
+          not any("用到本机没有的字体" in m for m in _sr2.logs), str(_sr2.logs))
+    check("missing 为空时 nonembedded_fonts 仍被写上",
+          _ne_only.nonembedded_fonts == ["STSong-Light"], str(_ne_only.nonembedded_fonts))
+
+    # ⑩c 行 tooltip 文案（纯字符串）：两种"缺"各写一段，各说清该怎么办
+    _tip_both = "\n\n".join(_Stub()._font_tip_blocks(_both))
+    check("tooltip 里两种原因各占一段",
+          "这份 PDF 生成时没把字体嵌进文件" in _tip_both
+          and "本机没装这些字体" in _tip_both, _tip_both[:240])
+    check("tooltip 点名了两个字体名",
+          "STSong-Light" in _tip_both and "测试缺字体XY" in _tip_both, _tip_both[:240])
+    check("未嵌入那段说明「装了就用它渲染」并把重新导出列为最稳出路",
+          "本机装了这个字体 ⇒ 打印时自动用它渲染" in _tip_both
+          and "重新导出「嵌入字体」的 PDF" in _tip_both)
+    check("本机没装那段给了「装上再重新添加」的出路",
+          "把字体装上，再重新添加这个文件" in _tip_both)
+    check("未嵌入那段不再吓唬人（页数/位置/分页不受影响要说）",
+          "页数、位置、分页不受影响" in _tip_both)
+    _tip_ne = "\n\n".join(_Stub()._font_tip_blocks(_ne_only))
+    check("只有未嵌入时，tooltip 不出现「本机没装」误诊",
+          "本机没装这些字体" not in _tip_ne
+          and "本机装了这个字体 ⇒ 打印时自动用它渲染" in _tip_ne, _tip_ne[:240])
+    _tip_miss = "\n\n".join(_Stub()._font_tip_blocks(
+        printer_config.PrintJob(file_path=docx, copies=1, missing_fonts=["测试缺字体XY"])))
+    check("只有本机没装时，tooltip 不出现「没嵌入」误诊",
+          "没把字体嵌进文件" not in _tip_miss and "本机没装这些字体" in _tip_miss, _tip_miss[:240])
+    check("不缺字体时 tooltip 为空（不标黄、不加提示）",
+          _Stub()._font_tip_blocks(printer_config.PrintJob(file_path=docx, copies=1)) == [])
+
     print("⑪ GUI 接线（源码级断言：这些位置漏一处，功能等于没做）")
     _src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8", errors="replace").read()
     check("_start_print_worker 有 interactive 参数", "interactive: bool = True" in _src)
@@ -332,6 +471,8 @@ if _has_gui:
     _auto_sites = _src.count("interactive=False")
     check("自动打印线都传了 interactive=False（≥4 处）", _auto_sites >= 4, str(_auto_sites))
     check("_fill_table_row 里有缺字体标黄分支", 'name_item.setText(f"⚠️ {display}")' in _src)
+    check("行 tooltip 走 _font_tip_blocks（文案只留一份，别内联复制）",
+          "join(self._font_tip_blocks(job))" in _src)
     check("启动时会初始化字体检测", "self._init_font_check()" in _src)
     check("加文件后排队检查", "self._queue_font_checks(jobs[rows_before:]" in _src)
     check("字体变了会作废 PDF 缓存", "font_check.purge_pdf_cache()" in _src)
