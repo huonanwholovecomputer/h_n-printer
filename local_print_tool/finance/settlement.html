@@ -1673,43 +1673,129 @@ function _deviceOwnerOfOrder(o) {
   }
   return '';
 }
-/* 订单 → 打印机记录（或 null）：
-     ① client_id 精确绑定（且机器在役）；
-     ② 按「设备所有者 → 已知机型」找同名/同型号的在役机器；
-     ③ 订单没有设备号、且**只有一台**在役机 → 归它（单机店铺常态；绝不把别的设备的单塞给它）。 */
-function printerForOrder(o) {
-  /* 0) 人工指定优先：接单设备不决定用哪台打印机（一台设备可能接着好几台机，
-        也可能根本不是它打的），所以「这张单到底哪台机打的」允许在打印机列表里逐单指定。 */
-  var oid = String((o && (o.order_id != null ? o.order_id : o.id)) || '');
+/* v7.12：外部监视（本地监视）兜底机型 —— /api/local/external_prints 响应里的 default_printer
+   = 本机账本里页数最多的那台打印机。只在「这张单连打印队列名都没读到」时用它推断归属，
+   而且**绝不写配置**（不冒充人工指定，单元格里会标「推断」）。 */
+var _externalDefaultPrinter = '';
+/* 队列名归一化：spooler 的 pPrinterName 会带端口/重名后缀（"HP LaserJet 1020 (Copy 1)"），
+   归一后只留机型主体，用来和台账里的 name / model 比对。 */
+function _queueKeyOf(s) {
+  return String(s == null ? '' : s)
+    .replace(/\((?:copy|副本)\s*\d*\)/ig, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+/* 队列名 → 台账里的在役打印机（找不到返回 null）：
+     ① 精确：归一后与 name 或 model 相等；
+     ② 宽松：短的一方至少 8 个字符时按包含匹配（"HP LaserJet 1020 [USB001]"、
+        "HP LaserJet MFP M232-M237 (网络)" 这类带后缀的队列名也认得出）。 */
+function printerByQueueName(qname) {
+  var q = _queueKeyOf(qname);
+  if (!q) return null;
+  var act = getActivePrinters(), i, nm;
+  for (i = 0; i < act.length; i++) {
+    if (_queueKeyOf(act[i].name) === q || _queueKeyOf(act[i].model) === q) return act[i];
+  }
+  for (i = 0; i < act.length; i++) {
+    nm = _queueKeyOf(act[i].name);
+    if (nm.length >= 8 && q.length >= 8 && (q.indexOf(nm) >= 0 || nm.indexOf(q) >= 0)) return act[i];
+  }
+  return null;
+}
+/* 订单的行键 = orderPrinterMap 的键 = 「打印机」列下拉 onchange 传的那个值。
+   云端订单 id 本来就安全；外部单的 order_id 是 "ext:<job>:<时间>"（带冒号/空格），
+   safeId 会判非法 ⇒ 派生成 "ext-<job>-<时间的数字>"（同一份数据每次派生结果一致，可长期存配置）。 */
+function _orderKeyOf(o) {
+  var raw = String((o && (o.order_id != null ? o.order_id : o.id)) || '');
+  if (!raw) return '';
+  if (/^[A-Za-z0-9_-]+$/.test(raw)) return raw;
+  return 'ext-' + raw.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+/* 订单 → { printer, reason }。reason 说明归属是哪来的：
+     manual  人工指定（订单归属下拉）          client  接单设备精确绑定
+     queue   本地监视记录的打印队列名对上      owner   设备所有者 → 已知机型
+     single  在役只有这一台                    default 本机账本里最常用的那台（兜底推断）
+   前两个是硬绑定，其余都是推出来的 ⇒ 单元格里标「推断」。
+   阶梯顺序（改之前先读）：
+     ① 人工指定优先：接单设备不决定用哪台打印机（一台设备可能接着好几台机，
+        也可能根本不是它打的），所以「这张单到底哪台机打的」允许在打印机列表里逐单指定；
+     ② client_id 精确绑定（且机器在役）；
+     ③ 本地监视给的队列名 —— spooler 的 pPrinterName 是**实测值**，比"设备所有者 → 机型"
+        更硬（一台设备接着两台机时，队列名才是那台机）；外部单的 received_client 为空，
+        这一档就是它的主要归属依据；
+     ④ 按「设备所有者 → 已知机型」找同名/同型号的在役机器；
+     ⑤ 订单没有设备号、且**只有一台**在役机 → 归它（单机店铺常态；绝不把别的设备的单塞给它）。
+        例外：外部单明明报了队列名、却对不上台账任何一台 ⇒ 说明是另一台物理机器打的，
+        不再用「只有一台在役机」覆盖它（否则会把别的机的账算到这台头上）；
+     ⑥ 外部单连队列名都没有（老记录 / 拉不到 pPrinterName）⇒ 归「本机使用最多的打印机」。 */
+function printerResolutionForOrder(o) {
+  var oid = _orderKeyOf(o);
   var omap = (STORE.config.orderPrinterMap || {});
   if (oid && omap[oid]) {
     var picked = printerById(omap[oid]);
-    if (picked) return picked;
+    if (picked) return { printer: picked, reason: 'manual' };
   }
   var cid = String((o && o.received_client) || '');
   var bound = printerByClient(cid);
-  if (bound && bound.status !== 'retired') return bound;
+  if (bound && bound.status !== 'retired') return { printer: bound, reason: 'client' };
+  var qname = String((o && o.printer_name) || '').trim();
+  var qhit = printerByQueueName(qname);
+  if (qhit) return { printer: qhit, reason: 'queue' };
   var owner = _deviceOwnerOfOrder(o);
   var model = owner ? KNOWN_PRINTER_MODELS[owner] : '';
   if (model) {
     var hit = getActivePrinters().filter(function (p) { return p.name === model || p.model === model; });
-    if (hit.length) return hit[0];
+    if (hit.length) return { printer: hit[0], reason: 'owner' };
   }
-  if (!cid) {
+  if (!cid && !(o && o.external && qname)) {
     var act = getActivePrinters();
-    if (act.length === 1) return act[0];
+    if (act.length === 1) return { printer: act[0], reason: 'single' };
   }
-  return null;
+  if (o && o.external && !qname) {
+    var fb = printerByQueueName(_externalDefaultPrinter);
+    if (fb) return { printer: fb, reason: 'default' };
+  }
+  return { printer: null, reason: '' };
 }
-/* 订单 → 展示用机型名（未登记也能显示已知机型；都没有则 '') */
+/* 订单 → 打印机记录（或 null）。归属阶梯只有 printerResolutionForOrder 一份实现。 */
+function printerForOrder(o) { return printerResolutionForOrder(o).printer; }
+/* 这个归属是不是「推出来的」（人工指定 / 接单设备绑定以外都算） */
+function _printerReasonIsGuess(reason) {
+  return reason === 'owner' || reason === 'single' || reason === 'default';
+}
+/* 一句话说明归属来源（给 title 用；UI 文案里不许出现 markdown 星号） */
+function _printerReasonText(reason, name) {
+  if (reason === 'queue') return '按本地监视记录的打印队列名对上：' + name;
+  if (reason === 'owner') return '按设备所有者 → 已知机型推断：' + name;
+  if (reason === 'single') return '在役只有这一台打印机，归它：' + name;
+  if (reason === 'default') return '这张单没读到打印机名，按本机使用最多的 ' + name + ' 兜底';
+  if (reason === 'client') return '按接单设备绑定：' + name;
+  if (reason === 'manual') return '人工指定：' + name;
+  return String(name || '');
+}
+/* 订单 → 展示用机型名（未登记也能显示已知机型 / 队列名；都没有则 ''）。
+   guessed=true ⇒ 这台是推出来的（设备机型 / 单机 / 兜底都算），「打印机」列会标「推断」；
+   reason='queue-unregistered' ⇒ 名字来自本地监视的队列名，台账里没登记（照实显示、不提折旧）。 */
 function printerNameForOrder(o) {
-  var p = printerForOrder(o);
-  if (p) return { name: p.name, registered: true, client_id: p.client_id || '' };
+  var res = printerResolutionForOrder(o);
+  var p = res.printer;
+  if (p) {
+    return { name: p.name, registered: true, client_id: p.client_id || '',
+             guessed: _printerReasonIsGuess(res.reason), reason: res.reason };
+  }
+  var qname = String((o && o.printer_name) || '').trim();
+  if (qname) {
+    return { name: qname, registered: false, client_id: String((o && o.received_client) || ''),
+             guessed: true, reason: 'queue-unregistered' };
+  }
   var owner = _deviceOwnerOfOrder(o);
   if (owner && KNOWN_PRINTER_MODELS[owner]) {
-    return { name: KNOWN_PRINTER_MODELS[owner], registered: false, client_id: String(o.received_client || '') };
+    return { name: KNOWN_PRINTER_MODELS[owner], registered: false,
+             client_id: String((o && o.received_client) || ''), guessed: false, reason: 'owner-unregistered' };
   }
-  return { name: '', registered: false, client_id: String(o.received_client || '') };
+  return { name: '', registered: false, client_id: String((o && o.received_client) || ''),
+           guessed: false, reason: '' };
 }
 /* 人工指定某张单用了哪台打印机 —— 接单设备不决定打印机，以人确认为准。
    存 STORE.config.orderPrinterMap = { '<order_id>': '<printer_id>' }，随 finance 配置同步多设备。
@@ -1740,8 +1826,13 @@ function setOrderPrinter(orderKey, printerId) {
         所以「未识别 / 未登记」这类状态一律写进下拉自己的占位项里（+ 橙色边框），
         这样每一行的 select 宽度、位置完全一致。 */
 function printerPickerHTML(o, info) {
-  var oid = safeId(String((o && (o.order_id != null ? o.order_id : o.id)) || ''));
-  var cur = printerForOrder(o);
+  /* 行键必须和 printerResolutionForOrder 查的是同一把（外部单的 raw id 含冒号，safeId 会拒，
+     以前就因此在解锁态也拿不到下拉；_orderKeyOf 给出安全派生键，外部单同样能人工指定）。 */
+  var oid = _orderKeyOf(o);              // 行键：与归属阶梯同一把（外部单在这里也拿得到下拉）
+  var res = printerResolutionForOrder(o);
+  var cur = res.printer;
+  var guessed = _printerReasonIsGuess(res.reason);
+  var why = res.reason ? _printerReasonText(res.reason, cur ? cur.name : '') : '';
   /* 小标记（仅锁定态用：那时没有下拉，不存在把控件挤歪的问题） */
   function tag(txt, tip) {
     return '<span style="font-size:.7rem;color:var(--orange);margin-left:5px;white-space:nowrap"'
@@ -1749,11 +1840,18 @@ function printerPickerHTML(o, info) {
   }
   var unreg = !!(info && info.name && !info.registered && !cur);   // 认得出机型但台账没登记
   var unknown = !cur && !(info && info.name);                       // 完全认不出是哪台机
+  /* 下拉的 title：推断态如实说明来源（单元格里仍只有下拉一行，文案只进 title/占位项） */
+  var pickTip = unknown ? '自动认不出是哪台机打的 —— 在这里指定'
+    : (guessed ? why + ' —— 这是推断，选一台可改成人工资指定' : '人工指定这张单用了哪台打印机');
   if (!oid) return (info && info.name) ? esc(info.name) : tag('未识别', '这张单没有订单号，无法人工指定机型');
   if (!unlocked.orderprinter) {
     var nm = cur ? cur.name : ((info && info.name) || '');
     if (!nm) return tag('未识别', '认不出是哪台机打的：解锁「' + MODULE_NAMES.orderprinter + '」后可在这一格下拉指定');
-    return esc(nm) + (unreg ? tag('未登记', '按已知机型显示；台账里没登记 ⇒ 不提折旧') : '');
+    /* 「推断」= 不是人工指定、也不是接单设备绑定（设备机型 / 单机 / 本机最常用兜底）
+       —— 折旧摊到谁头上取决于它，所以必须一眼看得出这台是推出来的。 */
+    return esc(nm)
+      + (guessed ? tag('推断', why + '（解锁后可在这一格下拉人工指定）') : '')
+      + (unreg ? tag('未登记', '按已知机型显示；台账里没登记 ⇒ 不提折旧') : '');
   }
   /* 解锁态：状态写进占位项（宽度由「最宽的选项」决定、每行都一样 ⇒ 下拉列绝对竖直对齐） */
   var opts = [], listed = 0;
@@ -1769,7 +1867,7 @@ function printerPickerHTML(o, info) {
   else if (unreg) { ph = '未指定 · 按已知机型'; }
   var h = '<select onchange="setOrderPrinter(\'' + oid + '\',this.value)"'
     + ' style="font-size:.76rem;max-width:196px' + (warn ? ';border-color:var(--orange);color:var(--orange)' : '') + '"'
-    + ' title="' + (unknown ? '自动认不出是哪台机打的 —— 在这里指定' : '人工指定这张单用了哪台打印机') + '">';
+    + ' title="' + esc(pickTip) + '">';
   h += '<option value=""' + (!cur ? ' selected' : '') + '>' + ph + '</option>' + opts.join('');
   h += '</select>';
   return h;
@@ -3289,6 +3387,10 @@ function _fetchExternalOrders(range) {
       return res.json().catch(function () { return null; });           // 非 JSON 也当「没有」
     })
     .then(function (data) {
+      /* 兜底机型（本机账本里页数最多的那台，后端 most_used_printer 算好一起给）：
+         账本没记队列名的单靠它推断归属。后端没部署 / 老版本没这个字段 ⇒ 置空、不兜底。 */
+      var dp = (data && data.default_printer) || null;
+      _externalDefaultPrinter = (dp && dp.name) ? String(dp.name) : '';
       var list = (data && data.success && Array.isArray(data.orders)) ? data.orders : [];
       return list.filter(function (o) {
         // 契约兜底：id 必须是 ext: 前缀字符串、必须有排序/趋势要用的 created_at
@@ -6943,7 +7045,7 @@ function printerUsageSectionHTML(orders) {
   var totalPages = 0, totalDep = 0, totalSettlePages = 0, totalSettleDep = 0;
   names.forEach(function (n) { totalPages += perPrinter[n].pages; totalDep += perPrinter[n].dep; });
 
-  var h = '<div class="section" id="printer-usage"><h2>📈 本口径用量与折旧 <span class="hint">（本口径内每台机打了多少页、吃掉多少寿命价值 · 机型优先按人工指定，其次「默认设备」→ 已知机型兜底）</span></h2>';
+  var h = '<div class="section" id="printer-usage"><h2>📈 本口径用量与折旧 <span class="hint">（本口径内每台机打了多少页、吃掉多少寿命价值 · 机型优先按人工指定，其次「本地监视队列名」→「默认设备」→ 已知机型兜底）</span></h2>';
   /* v7.11：这里和「收支清算」的折旧块（calcMonth 的 D）**区间与来源本来就不同**，以前不说，
      用户看到同一个月两处页数不等就当成 bug。现在把差异显式写出来；能统一的部分（订单状态过滤、
      机型归属判据）已经统一，剩下「口径区间 / 是否含外部监视来源」是按设计不同的。 */
@@ -7021,8 +7123,10 @@ function printerUsageSectionHTML(orders) {
   }
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
     + (unlocked.orderprinter
-        ? '打印机列可直接下拉<b>人工指定</b>（接单设备不决定用哪台机，人工指定优先级最高）；未指定时按「默认设备」→ 已知机型表兜底。'
-        : '打印机列<b>默认锁定</b>（🔒 与上方台账共用同一把锁）：解锁后可逐单指定"这张单是哪台机打的"，未指定时按「默认设备」→ 已知机型表兜底。')
+        ? '打印机列可直接下拉<b>人工指定</b>（接单设备不决定用哪台机，人工指定优先级最高）；未指定时按「本地监视的打印队列名」→「默认设备」→ 已知机型表兜底。'
+        : '打印机列<b>默认锁定</b>（🔒 与上方台账共用同一把锁）：解锁后可逐单指定"这张单是哪台机打的"，未指定时按「本地监视的打印队列名」→「默认设备」→ 已知机型表兜底。')
+    + '本地监视记下的队列名是 spooler 的实测值，认不出机型时按本机账本里<b>页数最多的那台</b>兜底，'
+    + '这类推断出来的归属在打印机名后标<b>推断</b>（不是人工指定，解锁后可改）。'
     + '折旧 = 页数 × 每页成本（价格 ÷ 寿命页数），只对<b>已登记且在役</b>的机器计提；'
     + '已取消 / 已拒绝 / 预约中等<b>非正常用量</b>的订单不计页（与结算页的用量统计同一份排除表）。'
     + '寿命口径为<b>累计实测</b>且还没结算的机器显示「累计中」—— 总寿命未知，所以暂不计提（不是漏了），'

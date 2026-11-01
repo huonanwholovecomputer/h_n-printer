@@ -256,6 +256,9 @@ def _external_order_row(item, amount: float, owner_name: str) -> dict:
         "unsynced": False,
         "sync_status": "synced",
         "external": True,
+        # 队列名（spooler 的 pPrinterName，原样带过来，不做任何映射）：
+        # 结算页据此把「订单 → 打印机」认到具体那台机（两台在役时靠它区分）。
+        "printer_name": str(getattr(item, "printer", "") or ""),
         "files": [{
             "id": "ext-%d" % job_id,
             "file_name": str(getattr(item, "document", "") or ""),
@@ -272,6 +275,37 @@ def _external_order_row(item, amount: float, owner_name: str) -> dict:
             "total_sheets": sheets * copies,
         }],
     }
+
+
+def most_used_printer(items) -> dict:
+    """账本里「本机使用最多的打印机」——认不出机型时的兜底（结算页「订单 → 打印机」用）。
+
+    口径：只算已处理的记录（与明细同一口径）；按**页数**加权累加，同页数时订单多的优先；
+    队列名为空（拉不到 pPrinterName）或整条是虚拟打印机（PDF/OneNote 之类，纸没真出来）
+    的记录不投票。一条可用的都没有 ⇒ 返回空字典，前端据此不做任何兜底。
+
+    统计范围是**整本账**，不按查询区间切：某个订单都没打印的月份里也得有兜底机型，
+    否则同一份账在不同月份会给出不同答案。
+    """
+    import print_watch as _pw
+    tally = {}
+    for item in items or ():
+        if str(getattr(item, "status", "") or "") != _pw.STATUS_CONFIRMED:
+            continue
+        if bool(getattr(item, "printer_virtual", False)):
+            continue
+        name = str(getattr(item, "printer", "") or "").strip()
+        if not name:
+            continue
+        row = tally.get(name)
+        if row is None:
+            row = tally[name] = {"name": name, "pages": 0, "orders": 0}
+        row["pages"] += max(int(getattr(item, "pages", 0) or 0), 0)
+        row["orders"] += 1
+    if not tally:
+        return {}
+    best = max(tally.values(), key=lambda r: (r["pages"], r["orders"], r["name"]))
+    return {"name": best["name"], "pages": best["pages"], "orders": best["orders"]}
 
 
 def build_external_orders(items, simplex_price, duplex_price, owner_name: str = "",
@@ -318,6 +352,8 @@ def build_external_prints_payload(items, simplex_price, duplex_price, owner_name
         "simplex_price": float(simplex_price),
         "duplex_price": float(duplex_price),
         "owner_name": str(owner_name or ""),
+        # 兜底机型：明细里读不到队列名的订单由前端归到这一台上（并标「推断」）
+        "default_printer": most_used_printer(items),
     }
 
 

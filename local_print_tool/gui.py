@@ -108,7 +108,7 @@ import font_check  # 字体缺失检测（查源文件用到的字体、本机�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.41"
+APP_VERSION = "4.6.0"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -5145,7 +5145,9 @@ class MainWindow(QMainWindow):
             self._file_logger.addHandler(
                 daily_log.make_handler(self._log_dir, keep_days=daily_log.KEEP_LOG_DAYS,
                                        on_prune=_on_logs_pruned))
-        self._file_logger.info("HN 本地打印工具启动")
+        # 2026-11-01 用户要求：每次启动都把当前版本号写进日志文件 —— 自更新/覆盖安装之后
+        # 想确认「今天这一整天跑的到底是哪个版本」，直接翻 logs/YYYY-MM-DD.log 第一行就够。
+        self._file_logger.info(f"HN 本地打印工具启动 · 版本 v{APP_VERSION}")
 
         # ── 云端直连自检 ──
         # 本机若开着 Clash/mihomo 之类代理（HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 或系统代理），
@@ -5300,6 +5302,9 @@ class MainWindow(QMainWindow):
         self._print_starting: bool = False
         # 窗口关闭守卫：打印启动的 processEvents 等待期间窗口可能被关闭，置位后中止后续流程
         self._closing: bool = False
+        # 后台常驻（4.6.0）：关窗口 = 收回托盘，只有这条标志置位时才真的走退出流程。
+        # 置位入口只有三个：文件 → 退出、托盘 → 退出、更新安装前的自动退出（_quit_app）。
+        self._force_quit: bool = False
 
         self.setWindowTitle(f"HN 本地打印工具 v{APP_VERSION}")
         # 设置窗口图标
@@ -5310,6 +5315,9 @@ class MainWindow(QMainWindow):
         self.resize(1100, 720)
 
         self._setup_ui()
+        # 系统托盘（4.6.0 后台常驻）：必须建在 _setup_ui 之后 —— 右键菜单要镜像
+        # 文件菜单里的「外部打印监视」QAction（那边的勾选态是唯一真相）。
+        self._setup_tray()
         self._load_config_to_ui()
         # S2-03：Office 转换沙箱开关（配置默认 False；环境变量 HN_OFFICE_SANDBOX 可强制覆盖）
         try:
@@ -5809,8 +5817,22 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl(url))
 
     def _on_cloud_settings(self):
-        """打开云端连接设置对话框。"""
-        dlg = QDialog(self)
+        """打开云端连接设置对话框。
+
+        父窗口的选择有讲究（4.6.0 后台常驻后才露出这个坑）：
+          主窗口正常显示  → 沿用 `QDialog(self)`：对话框是它的所属窗，模态把主窗口一起锁住，
+                            关掉对话框就回到主窗口，最符合预期。
+          主窗口在托盘里 / 最小化 → **做成独立窗口**（parent=None）。父=self 而 self 不可见时，
+                            对话框是"隐藏窗口的所属窗"：Windows 不给它任务栏按钮，主窗口又不出来，
+                            万一抢不到前台，就成了一个看不见、却能拦住整个程序的模态框
+                            （模态期间托盘菜单也点不动，用户只能杀进程）。独立窗口自带任务栏
+                            按钮，一定找得回来；也不必为了改个 token 把整个主窗口弹起来。
+        """
+        standalone = (not self.isVisible()) or self.isMinimized()
+        dlg = QDialog(None if standalone else self)
+        if standalone:
+            # 独立窗口不继承主窗口图标，手动补上（任务栏/Alt+Tab 里还是本程序）
+            dlg.setWindowIcon(self.windowIcon())
         dlg.setWindowTitle("☁ 云端连接设置")
         dlg.setMinimumWidth(460)
         dlg.setModal(True)
@@ -6317,6 +6339,13 @@ class MainWindow(QMainWindow):
             ctypes.windll.shell32.ShellExecuteW(None, "open", cmd_path, None, None, 7)
         except Exception as e:
             logger.warning(f"自动重启失败: {e}")
+        # 本路径不走 closeEvent（直接 quit），托盘图标要自己收 —— 否则通知区留个点不开的残影。
+        # 新实例起来后会另建一个托盘图标。
+        try:
+            if getattr(self, "_tray", None) is not None:
+                self._tray.stop()
+        except Exception:
+            pass
         QApplication.quit()
 
     def _toggle_cloud_connection(self):
@@ -6512,7 +6541,9 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1200, self._restore_external_watch)
 
         exit_action = QAction("退出(&X)", self)
-        exit_action.triggered.connect(self.close)
+        # 4.6.0 后台常驻：菜单里的「退出」才是真退出，窗口右上角 X 只是收回托盘
+        #（同一个落点 _quit_app，与托盘菜单的「退出」一致，不另写一套收尾流程）
+        exit_action.triggered.connect(self._quit_app)
         file_menu.addAction(exit_action)
 
         # 主题菜单
@@ -6605,6 +6636,64 @@ class MainWindow(QMainWindow):
         # （此刻状态栏还没建，_refresh_offline_badge 只动菜单项；角标随后由
         #  _init_cloud_client → _refresh_offline_badge 补一次）
         self._refresh_offline_badge()
+
+    # ---- 系统托盘（后台常驻）----
+
+    def _setup_tray(self):
+        """建托盘图标 + 右键菜单（4.6.0 起：关窗口 = 收回托盘，程序继续在后台跑）。
+
+        图标用程序 LOGO（HN_printer.png，安装包里就有；.ico 只给安装程序用、不随包分发）。
+        托盘不可用时 self._tray 保持 None，closeEvent 退回旧行为「关窗口即退出」——
+        绝不能把程序藏进一个不存在的托盘里，变成"进程还在但人找不到"。
+        """
+        self._tray = None
+        try:
+            from tray_icon import TrayController
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "HN_printer.png")
+            icon = QIcon(icon_path) if os.path.isfile(icon_path) else self.windowIcon()
+            ctrl = TrayController(self, icon, APP_VERSION)
+            if ctrl.start():
+                self._tray = ctrl
+                self._log("🖥 已常驻系统托盘：关闭窗口不会退出进程，要退出请右键托盘图标 → 退出")
+            else:
+                ctrl.deleteLater()
+        except Exception as e:
+            logger.warning(f"创建系统托盘失败（关闭窗口仍按旧行为退出）: {e}")
+
+    def _minimize_to_tray(self):
+        """关窗口 → 收回托盘（云端接单 / 外部打印监视 / 预约出纸都不中断）。"""
+        self.hide()
+        if getattr(self, "_tray", None) is not None:
+            self._tray.notify_hidden()
+        self._log("🖥 窗口已收进系统托盘，程序继续在后台运行")
+
+    def _restore_from_tray(self):
+        """从托盘恢复主窗口（显示应用 / 双击图标 / 重复启动置前 共用）。"""
+        if self.isMinimized():
+            self.showNormal()
+        elif not self.isVisible():
+            self.show()
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_app(self):
+        """真正的退出（关窗口只是收回托盘）。
+
+        三个入口共用：文件 → 退出、托盘 → 退出、更新安装前自动退出。
+        窗口藏在托盘里时先叫回前台 —— 退出前的确认框（未完成标签页 / 打印进行中 /
+        攒批纸叠）都挂在主窗口上，弹在隐藏窗口后面等于没弹。
+        """
+        self._force_quit = True
+        if not self.isVisible():
+            self._restore_from_tray()
+        self.close()
+        # closeEvent 里任何一处 event.ignore()（用户改主意）都会把 _force_quit 复位，
+        # 走到这里还亮着 ⇒ 真的退：收掉托盘图标再退进程（否则通知区留残影）。
+        if self._force_quit:
+            if getattr(self, "_tray", None) is not None:
+                self._tray.stop()
+            QApplication.quit()
 
     # ---- 自更新（检查 / 下载 / 触发静默安装）----
 
@@ -6831,7 +6920,9 @@ class MainWindow(QMainWindow):
             self._update_dlg = None
         if kind == "ready":
             self._log(f"☁ 更新安装包已就绪 v{manifest.get('version', '')}，即将退出并自动安装...")
-            self.close()  # update.cmd 轮询到进程退出后执行静默安装并启动新版本
+            # 必须走 _quit_app：4.6.0 起裸 close() 只是收进托盘，update.cmd 等不到进程退出，
+            # 安装永远装不上。_quit_app 置 _force_quit 走完整退出流程。
+            self._quit_app()  # update.cmd 轮询到进程退出后执行静默安装并启动新版本
         elif kind == "download_fail":
             if getattr(self, '_update_cancelled', False):
                 QMessageBox.information(self, "更新已取消", "更新下载已取消。")
@@ -8899,6 +8990,45 @@ class MainWindow(QMainWindow):
             label.setEnabled(usable)
         self._edit_duplex_mode.setEnabled(usable)
         return usable
+
+    def _refresh_edit_panel_after_convert(self, row: int) -> None:
+        """PDF 转换完成 → 按这一行的最新事实重画右侧「编辑选中任务」面板。
+
+        为什么需要：转换期间面板显示的是**转换前**的事实 —— 页数还不知道（按 1 页口径），
+        于是「单/双面」被灰成单面、「排除末尾空白页」因为只剩 1 页而不可点、页码范围也没有
+        总页数可校验。转换完成后表格已经更新，面板却还停在那种「未转换」的样子
+        （2026-11-01 用户截图：选中的 docx 转完了，右侧面板仍是转换前状态）。
+
+        旧写法只在「单页归一化」（双面请求被自动改成单面）那一种分支里才调
+        `_on_table_selection()`，所以普通 Word 文件转换完成后永远等不到刷新。
+
+        这里只读 job 重画面板（`_on_table_selection` 不写回配置），并且：
+          · 选区已经不在这一行 → 什么都不做（面板显示的是别的行）；
+          · 标签页已冻结（打印后固定）→ 面板本来就不该再动；
+          · 用户此刻正把光标停在页码范围输入框里 → 把没提交的文本原样放回去，
+            别把他刚敲的 "3-5" 冲掉。
+        """
+        try:
+            if row not in set(self._selected_rows()):
+                return
+            if self._is_current_tab_frozen():
+                return
+            keep_range = ""
+            editing_range = False
+            widget = getattr(self, '_edit_page_range', None)
+            focus = QApplication.focusWidget()
+            if widget is not None and focus is not None:
+                editing_range = widget.isAncestorOf(focus)
+                if editing_range:
+                    keep_range = widget.get_ranges()
+            self._on_table_selection()
+            if editing_range and widget is not None:
+                widget.set_ranges(keep_range)
+        except Exception as e:      # 面板刷新失败绝不能把「转换已完成」这件事带崩
+            try:
+                logger.warning(f"转换完成后面板刷新失败（不影响转换结果）: {e}")
+            except Exception:
+                pass
 
     def _on_table_selection(self):
         """选中行变化 → 同步编辑面板（多选时面板显示选区第一行，改动作用于全部选中行）。"""
@@ -14827,12 +14957,10 @@ class MainWindow(QMainWindow):
         from single_instance import check_front_request
         if not check_front_request(self._front_event):
             return
-        # 恢复最小化状态 + 置顶激活（Windows 前台锁由本进程自身线程触发，可正常抢前台）
-        if self.isMinimized():
-            self.showNormal()
-        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
-        self.raise_()
-        self.activateWindow()
+        # 恢复最小化/收进托盘的状态 + 置顶激活（Windows 前台锁由本进程自身线程触发，可正常抢前台）
+        # 注意：4.6.0 起窗口可能是 hide() 收进托盘的，只 showNormal() 叫不回来 ——
+        # 统一走 _restore_from_tray（内部先 show() 再清最小化位）。
+        self._restore_from_tray()
         self._log("🪟 检测到重复启动，已将本窗口置于前台")
 
     def _check_scheduled_timeouts(self):
@@ -15391,6 +15519,16 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """关闭窗口时检查未完成任务，确认后保存并退出。"""
+        # ── 4.6.0 后台常驻：点窗口右上角 X = 收进系统托盘，**不是**退出 ──
+        # 收进托盘期间云端接单、外部打印监视、预约出纸都要继续跑，所以这里既不置
+        # _closing（打印启动 processEvents 的守卫），也不碰下面任何收尾逻辑。
+        # 真退出只有 _quit_app 一条路（文件→退出 / 托盘→退出 / 更新安装前），它会先
+        # 把 _force_quit 置位再 close() —— 所以本分支绝不能碰 _closing 之外的退出状态。
+        # 托盘不可用时 _tray 为 None，这里直接落回旧行为：关窗即退出。
+        if not self._force_quit and getattr(self, "_tray", None) is not None:
+            event.ignore()
+            self._minimize_to_tray()
+            return
         self._closing = True  # 打印启动等待（processEvents）期间检测到关窗 → 中止启动流程
         # 外部打印监视：退出前停线程 + 关 spooler 通知句柄（别指望进程退出时的隐式清理）
         self._stop_external_watch()
@@ -15417,6 +15555,7 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.Yes:
                 event.ignore()
                 self._closing = False
+                self._force_quit = False  # 用户改主意不退了：别让 _quit_app 误判成"已经退出"
                 return
             if self._stack_flush_worker is not None and self._stack_flush_worker.isRunning():
                 self._log("⏳ 等待整叠第 2 趟打印线程结束…")
@@ -15436,6 +15575,7 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.Cancel:
                 event.ignore()
                 self._closing = False  # 用户选择不退出，恢复打印启动流程
+                self._force_quit = False  # 同上：取消退出时复位真退出标志
                 return
             if reply == QMessageBox.No:
                 # 取消打印并退出：置取消标志 + 等待线程结束（5s 超时后 terminate 兜底）
@@ -15497,6 +15637,7 @@ class MainWindow(QMainWindow):
                 if reply != QMessageBox.Yes:
                     event.ignore()
                     self._closing = False  # 用户选择不退出，恢复打印启动流程
+                    self._force_quit = False  # 同上：取消退出时复位真退出标志
                     return
                 # 用户确认退出 → 通知后端放弃未打印的云端任务 + 本地预留订单，然后清空
                 # （已打印完成的 job 跳过，避免误放弃已完成订单）
@@ -15711,11 +15852,9 @@ class MainWindow(QMainWindow):
                     self._fill_table_row(target_row, jobs[target_row])
             self._recalc_row_cost(target_row)
             self._update_total_cost()
-            if _single_page_norm and target_row in self._selected_rows():
-                # 编辑面板此刻正显示这一行 → 同步（与 `_selection_traits` 同源：1 页文件的
-                # 「单/双面」控件本就该是灰的并显示单面）。它只读 job 重画面板、不写回，
-                # 不会碰用户刚改的其它输入。
-                self._on_table_selection()
+            # 转换完成 = 这一行的「页数/方向/末尾空白页」事实变了 → 编辑面板跟着重画一次。
+            # （旧写法只处理「单页归一化」这一种情况，于是 Word 转完面板还停在未转换的样子。）
+            self._refresh_edit_panel_after_convert(target_row)
 
         # 转换完成后存入 MD5 缓存（供后续同文件复用，避免重复转换）
         if cached_pdf and os.path.isfile(cached_pdf) and target_row < len(jobs):

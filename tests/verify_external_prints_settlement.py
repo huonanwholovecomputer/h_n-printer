@@ -45,14 +45,16 @@ TMP = tempfile.mkdtemp(prefix="hn_extprints_verify_")
 SIM, DUP = 0.3, 0.4
 
 # 契约里响应体的键（逐字符一致，不是"差不多"）
+# v7.12 起多了 default_printer（本机账本里页数最多的那台，认不出机型时的兜底）
 RESPONSE_KEYS = {"success", "orders", "count", "skipped",
-                 "simplex_price", "duplex_price", "owner_name"}
+                 "simplex_price", "duplex_price", "owner_name", "default_printer"}
 # 契约里订单行的键
+# v7.12 起多了 printer_name（本地监视记下的打印队列名，结算页据此认出是哪台机打的）
 ORDER_KEYS = {"order_id", "order_number", "created_at", "total_price",
               "total_page_count", "total_sheet_count", "owner_name",
               "is_admin_print", "source", "openid", "nickname", "auto_print",
               "schedule_mode", "delivery_enabled", "urgency", "cover_page",
-              "status", "unsynced", "sync_status", "external", "files"}
+              "status", "unsynced", "sync_status", "external", "printer_name", "files"}
 # 契约里 files[0] 的键
 FILE_KEYS = {"id", "file_name", "copies", "page_count", "duplex", "page_range",
              "total_price", "status", "is_free", "effective_pages", "sheets",
@@ -338,6 +340,7 @@ EXPECTED_ROW = {
     "unsynced": False,
     "sync_status": "synced",
     "external": True,
+    "printer_name": "HP LaserJet 1020",
     "files": [{
         "id": "ext-8", "file_name": "三页文档测试.pdf", "copies": 1, "page_count": 3,
         "duplex": "on", "page_range": "", "total_price": 0.7, "status": "sent",
@@ -373,6 +376,17 @@ check("⑨ 响应体的 count/skipped/单价/owner 与契约一致",
 check("⑨ files[0].duplex 是 'on'/'off' 原值（不是中文标签，前端按它折算张数）",
       _contract_row["files"][0]["duplex"] == "on"
       and _by_oid[oid_of(_sim2)]["files"][0]["duplex"] == "off", "")
+# v7.12：队列名字段随行带出（结算页「订单 → 打印机」靠它认出具体哪台机），
+# 顶层再给一个「本机使用最多的打印机」当兜底（账本里没记队列名的单归它）
+check("⑨ 行里的 printer_name 就是账本记的队列名（原样，不做映射）",
+      _contract_row["printer_name"] == "HP LaserJet 1020", repr(_contract_row["printer_name"]))
+check("⑨ 顶层 default_printer = {name, pages, orders}，按页数加权取本机最多的那台",
+      _contract_payload["default_printer"] == {"name": "HP LaserJet 1020", "pages": 3, "orders": 1},
+      json.dumps(_contract_payload["default_printer"], ensure_ascii=False))
+check("⑨ 账本为空 ⇒ default_printer 是空字典（没有可兜底的机型时前端不硬凑）",
+      ss.build_external_prints_payload([], SIM, DUP, "张三")["default_printer"] == {},
+      json.dumps(ss.build_external_prints_payload([], SIM, DUP, "张三")["default_printer"],
+                 ensure_ascii=False))
 
 # ══════════════════════════════════════════════════════════════════
 section("⑩ 文件明细与顶层金额一致（单条单文件）")
