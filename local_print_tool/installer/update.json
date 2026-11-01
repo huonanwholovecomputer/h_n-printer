@@ -1,9 +1,9 @@
 {
   "version": "4.5.41",
   "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.41.exe",
-  "md5": "PENDING",
-  "sha256": "PENDING",
+  "md5": "055e36befe5a1eb4212157f9d2117145",
+  "sha256": "8edb436f2f630c254f4bf21db74e51e5c28a8473b7fed7dce09adf535b414e1d",
   "notes": "v4.5.41：攒批列表与打印列表按场景自适应 —— 自动双面机只看「打印列表」（不再挂两块永远空的攒批表格，窗口从 1180x520 收到 860x320）；攒批与打印列表同时在场时窗口加高到 1180x700，「打印列表」占约 40%，并可用鼠标上下拖动分配高度（拖过一次就不再自动改回）；修复「状态」列宽度从来没生效（最长那句「第 1 趟进行中（攒批）」被截成「第 1 趟进行...」）；顶部 4 行说明收成一行，完整口径移入悬停提示。",
   "sig_algo": "ed25519",
-  "sig": "PENDING"
+  "sig": "3Kf1j8qoucuP77IkGk5gbS3NGE5pQOtccWp01oGpBnwvVNc7peEzHWClEF5eBrXa14acLlsVxkoNpud0qI2vCA=="
 }
