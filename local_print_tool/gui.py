@@ -37,6 +37,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QFont,
+    QFontDatabase,
     QColor,
     QIcon,
     QPainter,
@@ -102,6 +103,7 @@ from offline_sync import OfflineSync
 import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼容，详见 staging.py）
 import retention  # 本地副本生命周期：保留期清理 / 攒批 .keep 过期 / 启动扫描（见 retention.py）
 import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在这里）
+import font_check  # 字体缺失检测（查源文件用到的字体、本机缺哪些，见 font_check.py）
 
 logger = logging.getLogger(__name__)
 
@@ -2149,6 +2151,49 @@ def count_pending_print_jobs(printer_name: str = "") -> int:
         return len(jobs)
     except Exception:
         return -1
+
+
+class FontCheckWorker(QThread):
+    """后台查一批文件用到的字体、本机缺哪些（2026-10-31 用户需求）。
+
+    为什么不能在主线程查：
+      · .docx 解 zip 读 XML 约 10 ms，很快；
+      · .pdf 第一次要 `import fitz`（约 0.9 s，PyMuPDF 导入慢），热了以后 16 ms/份。
+    一次拖 20 个 PDF 进来就可能是十几秒 ⇒ 一律后台跑，查完回主线程刷新那一行。
+    任何异常都吞掉并当作"查不出"（`missing=[]`）：查字体绝不能变成打印的前置故障。
+    """
+
+    # (file_path, 本机缺的字体名列表, 查的时候的系统字体指纹, PDF 里没嵌入字形的字体名)
+    checked = Signal(str, list, str, list)
+
+    def __init__(self, file_paths: list[str], fingerprint: str, parent=None):
+        super().__init__(parent)
+        self._paths = list(file_paths or [])
+        self._fp = fingerprint or ""
+        self._cancelled = False
+
+    def cancel(self):
+        """协作式取消（退出/关窗时用；不 terminate）。"""
+        self._cancelled = True
+
+    def run(self):
+        for p in self._paths:
+            if self._cancelled:
+                return
+            missing: list = []
+            nonembedded: list = []
+            try:
+                _rep = font_check.check_file(p)
+                missing = list(_rep.get("missing") or [])
+                nonembedded = list(_rep.get("nonembedded") or [])
+            except Exception:
+                logger.debug("字体检查失败: %s", p, exc_info=True)
+            if self._cancelled:
+                return
+            try:
+                self.checked.emit(p, missing, self._fp, nonembedded)
+            except RuntimeError:
+                return          # 窗口已销毁
 
 
 class PrintWorker(QThread):
@@ -5092,6 +5137,9 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"启动清理 PDF 缓存失败: {e}")
 
+        # ── 字体缺失检测（2026-10-31）：登记本机字体 + 装/删字体后作废转换缓存 + 给已有任务排队查 ──
+        self._init_font_check()
+
         # ── 自更新：启动 4 秒后后台检查更新（不阻塞 UI，发现新版本才弹窗）──
         #    S1-02 改动 4（2026-10-23）：启动检查**只提示**——不自动下载、不生成 update.cmd、
         #    不静默安装。真正的下载/安装只能由用户在「帮助 → 检查更新」后明确点「立即更新」触发
@@ -5113,6 +5161,77 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_duplex_warned"):
             self._duplex_warned = ""
         self._warn_if_duplex_capability_unknown()
+
+    def _init_font_check(self) -> None:
+        """启动时的字体检测初始化（2026-10-31 用户需求）。
+
+        ① 把 Qt 认到的字族补进 font_check 的已装集合（GDI/注册表之外的兜底）；
+        ② 字体集合变过就作废 PDF 缓存（见 _font_sync_epoch）；
+        ③ 给上次退出时留下的任务排一次检查（它们的 font_checked 是旧指纹，可能已过期）。
+
+        不弹任何框：启动阶段弹模态会卡住整条启动流程，这里只记日志。
+        """
+        self._font_check_worker = None
+        self._font_check_queue = []
+        self._font_epoch_fp = ""
+        try:
+            font_check.set_installed(QFontDatabase.families())
+        except Exception:
+            logger.debug("QFontDatabase.families() 失败", exc_info=True)
+        self._font_sync_epoch()
+        try:
+            _all = []
+            for _tab in (self._config.tabs or {}).values():
+                _all.extend(getattr(_tab, "jobs", None) or [])
+            if _all:
+                self._queue_font_checks(_all)
+        except Exception:
+            logger.debug("排队字体检查失败", exc_info=True)
+
+    def _font_sync_epoch(self) -> bool:
+        """比对系统字体指纹：装/删过字体就作废转换缓存与所有检查结果。返回 True=变了。
+
+        为什么必须作废：Word 遇到缺字体是**静默替换**的，用户中途装上 `方正书宋_GBK` 后，
+        缓存里那份 PDF 还是拿宋体排的版 —— 不重转就等于"装了字体也没用"。
+        只删 PDF 不删索引：读侧 `_get_cached_pdf` 本来就先看文件在不在，索引留着能省一次解析。
+        """
+        try:
+            _rep = font_check.check_epoch()
+        except Exception:
+            logger.debug("字体指纹检查失败", exc_info=True)
+            return False
+        try:
+            self._font_epoch_fp = str(_rep.get("fingerprint") or "")
+        except Exception:
+            pass
+        if not _rep.get("changed"):
+            return False
+        _add = "、".join(list(_rep.get("added_names") or [])[:5])
+        _rm = "、".join(list(_rep.get("removed_names") or [])[:5])
+        _parts = []
+        if _add:
+            _parts.append(f"新增 {_add}")
+        if _rm:
+            _parts.append(f"移除 {_rm}")
+        self._log("🖋 检测到本机字体有变化"
+                  + (f"（{'；'.join(_parts)}）" if _parts else "")
+                  + "：已作废 PDF 转换缓存，下次打印会按新字体重新转换")
+        try:
+            _n = font_check.purge_pdf_cache()
+            if _n:
+                self._log(f"🖋 已删除 {_n} 个用旧字体排版的 PDF 缓存")
+        except Exception:
+            logger.debug("清理 PDF 缓存失败", exc_info=True)
+        try:
+            for _tab in (self._config.tabs or {}).values():
+                for _job in (getattr(_tab, "jobs", None) or []):
+                    _job.cached_pdf = ""
+                    _job.font_checked = False
+                    _job.font_fp = ""
+                    _job.missing_fonts = []
+        except Exception:
+            logger.debug("清空 cached_pdf 失败", exc_info=True)
+        return True
 
     # ---- 攒批：启动续打 ----
 
@@ -8014,6 +8133,238 @@ class MainWindow(QMainWindow):
         return base + f"\n⚠ 末尾有 {tail} 页空白（打出来就是白纸）。" \
                       f"勾选「排除末尾空白页」可排掉并重算价格。"
 
+    # ──────── 字体缺失检测（2026-10-31 用户需求，见 font_check.py）────────
+    # 三件事：
+    #   ① 文件用到的字体本机没装 ⇒ 表格文件名标黄 ⚠️（Word 会**静默替换**，字形/字宽变样）
+    #   ② 打印前确认一次（自动打印线只记日志、不弹模态 —— 那台机器要能无人值守）
+    #   ③ 用户中途装了字体 ⇒ 之前转出来的 PDF 是用替换字体排的，必须作废重转（_init_font_check）
+
+    def _font_theme_colors(self) -> tuple:
+        """(背景, 前景)：浅色=浅黄底深黄字；深色=暗黄底亮黄字。"""
+        try:
+            dark = bool(self._theme_manager
+                        and self._theme_manager.effective_theme == MODE_DARK)
+        except Exception:
+            dark = False
+        return ((QColor("#4a3d14"), QColor("#ffd66b")) if dark
+                else (QColor("#fff3cd"), QColor("#8a6d00")))
+
+    def _queue_font_checks(self, jobs: list, tab_key: str = "") -> None:
+        """给新加进来的文件排一次字体检查（只查能静态查的格式：.docx / .pdf）。
+
+        查不了的（图片/TXT/MD/旧 .doc）就地标 `font_checked=True`：它们要么没有字体概念，
+        要么得靠 COM 才拿得到（`<w:font>` 只存在于 docx 里）—— 标掉才不会每次加文件都重排队。
+        """
+        try:
+            fp = font_check.fonts_fingerprint()
+        except Exception:
+            return
+        queue = getattr(self, "_font_check_queue", None)
+        if queue is None:
+            queue = []
+            self._font_check_queue = queue
+        queued = {p for p, _k in queue}
+        running = getattr(self, "_font_check_worker", None)
+        if running is not None:
+            try:
+                if running.isRunning():
+                    queued |= set(getattr(running, "_paths", []) or [])
+            except RuntimeError:
+                pass
+        added = 0
+        for job in (jobs or []):
+            path = getattr(job, "file_path", "") or ""
+            if not path:
+                continue
+            try:
+                ok = font_check.checkable(path)
+            except Exception:
+                ok = False
+            if not ok:
+                job.font_checked = True
+                job.missing_fonts = []
+                job.font_fp = fp
+                continue
+            if getattr(job, "font_checked", False) and getattr(job, "font_fp", "") == fp:
+                continue
+            if path in queued:
+                continue
+            queued.add(path)
+            queue.append((path, tab_key or ""))
+            added += 1
+        if added:
+            self._pump_font_checks()
+
+    def _pump_font_checks(self) -> None:
+        """把排队的路径**一次性**交给一个后台线程（同时只跑一个，避免线程爆炸）。"""
+        try:
+            w = getattr(self, "_font_check_worker", None)
+            if w is not None and w.isRunning():
+                return
+        except RuntimeError:
+            pass
+        queue = getattr(self, "_font_check_queue", None) or []
+        if not queue:
+            return
+        batch = list(queue)
+        self._font_check_queue = []
+        try:
+            fp = font_check.fonts_fingerprint()
+        except Exception:
+            fp = ""
+        w = FontCheckWorker([p for p, _k in batch], fp, self)
+        w.checked.connect(self._on_font_checked)
+        w.finished.connect(self._pump_font_checks)
+        w.finished.connect(w.deleteLater)   # 每批一个线程对象，别攒着
+        self._font_check_worker = w
+        w.start()
+
+    def _on_font_checked(self, file_path: str, missing: list, fp: str,
+                         nonembedded: list | None = None) -> None:
+        """后台查完一份 → 回写任务对象，**只重画受影响的那一行**（整表重建会丢选区）。
+
+        `nonembedded`：PDF 里没有字形数据的字体 —— 这时"缺"不是本机没装，而是文件没嵌入，
+        打印时只能被替换（查看器有东方字体包所以屏幕上正常）。日志要分开说，别让人误以为
+        装了字体就能解决。
+        """
+        try:
+            _is_pdf = os.path.splitext(str(file_path or ""))[1].lower() == ".pdf"
+            _ne = {str(x).strip().lower() for x in (nonembedded or []) if str(x).strip()}
+            _ne_names = [str(x) for x in (missing or []) if str(x).strip().lower() in _ne]
+            # 行上要标的是"这些字体印不对"，两种情况都算：
+            #   本机没装（docx 会被 Word 替换） + PDF 没嵌入（装了字体也没用，字形不在文件里）
+            _flag = list(dict.fromkeys([str(x) for x in (missing or []) if str(x).strip()]
+                                       + [str(x) for x in (nonembedded or []) if str(x).strip()]))
+            hits = []
+            for key, tab in (self._config.tabs or {}).items():
+                for idx, job in enumerate(getattr(tab, "jobs", None) or []):
+                    if (getattr(job, "file_path", "") or "") != file_path:
+                        continue
+                    job.missing_fonts = _flag
+                    job.font_checked = True
+                    job.font_fp = fp or ""
+                    if key == self._current_tab:
+                        hits.append((idx, job))
+            for idx, job in hits:
+                try:
+                    self._fill_table_row(idx, job)
+                except Exception:
+                    logger.debug("刷新字体检出行失败", exc_info=True)
+            if missing:
+                _names = "、".join(str(x) for x in list(missing)[:5])
+                _more = f" 等 {len(missing)} 种" if len(missing) > 5 else ""
+                if _is_pdf and _ne_names and len(_ne_names) == len(missing):
+                    self._log(f"🖋 {os.path.basename(file_path)} 这份 PDF 没把字体嵌进文件："
+                              f"{_names}{_more}（打印时会用替代字形，字形可能与屏幕上看到的不同）")
+                else:
+                    self._log(f"🖋 {os.path.basename(file_path)} 用到本机没有的字体："
+                              f"{_names}{_more}（打印效果可能与该文件原样不同）")
+        except Exception:
+            logger.debug("字体检出回写失败", exc_info=True)
+
+    def _font_gate(self, flat_jobs: list, interactive: bool = True) -> bool:
+        """打印前拦一道：这批文件里有本机没装的字体就问一句。返回 False = 用户取消。
+
+        两种"缺"要分开讲，别混成一句话：
+          · `.docx` 缺字体＝本机没装这个字体，Word 转换时会静默替换（排版真的会变）；
+          · `.pdf` 没嵌入字体＝文件里只有字体名、没有字形数据，谁渲染谁替（查看器自带东方
+            字体包所以屏幕上正常，我们走 MuPDF 光栅化就换成内置无衬线兜底字形）。
+        所以这里**查源文件、不查转换后的 PDF**（对 docx 而言）：转换出来的 PDF 里写的已经是
+        替换后的字体名 —— 查它永远查不出缺字体。
+        """
+        # 会话中途装了/删了字体：旧缓存是按替换字体排的版 ⇒ 先作废再判定
+        try:
+            self._font_sync_epoch()
+        except Exception:
+            logger.debug("打印前字体指纹比对失败", exc_info=True)
+        try:
+            fp = font_check.fonts_fingerprint()
+        except Exception:
+            fp = ""
+        # [(显示名, 缺的字体名列表, 是不是 PDF, 其中没嵌入的字体名小写集合)]
+        entries: list = []
+        for job in (flat_jobs or []):
+            path = getattr(job, "file_path", "") or ""
+            if not path:
+                continue
+            need = not (getattr(job, "font_checked", False)
+                        and getattr(job, "font_fp", "") == fp)
+            if need:
+                try:
+                    if font_check.checkable(path):
+                        job.missing_fonts = list(
+                            font_check.check_file(path).get("missing") or [])
+                except Exception:
+                    logger.debug("打印前字体检查失败: %s", path, exc_info=True)
+                job.font_checked = True
+                job.font_fp = fp
+            _is_pdf = path.lower().endswith(".pdf")
+            _ne: set = set()
+            _ne_names: list = []
+            if _is_pdf:
+                try:                    # 只在 PDF 上多读一次，0.02s 量级
+                    _ne_names = [str(x) for x in font_check.pdf_nonembedded_fonts(path)
+                                 if str(x).strip()]
+                    _ne = {x.strip().lower() for x in _ne_names}
+                except Exception:
+                    _ne, _ne_names = set(), []
+            # 要警的字体 = 本机没装 ∪ PDF 没嵌入。
+            # 注意：**PDF 没嵌入的字体即使本机装了也照样替**（字形不在文件里，MuPDF 不查系统字体）
+            # ⇒ 这一路必须单独算，不能只靠 missing_fonts（用户装完字体后 missing 就空了）。
+            _miss = list(dict.fromkeys(
+                [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
+                + _ne_names))
+            if not _miss:
+                continue
+            # 用 list 而不是按显示名做 key：同名文件（两个「作业(1).docx」）不许互相顶掉
+            entries.append((job.display_name or os.path.basename(path), _miss, _is_pdf, _ne))
+        if not entries:
+            return True
+
+        def _all_nonembedded(_job_fonts, _ne) -> bool:
+            return bool(_ne) and all(str(f).strip().lower() in _ne for f in _job_fonts)
+
+        lines = []
+        for name, fonts, _is_pdf, _ne in entries[:6]:
+            _tag = "（PDF 未嵌入字体）" if (_is_pdf and _all_nonembedded(fonts, _ne)) else ""
+            lines.append(f"· {name}{_tag}：{'、'.join(str(f) for f in list(fonts)[:4])}"
+                         + (f" 等 {len(fonts)} 种" if len(fonts) > 4 else ""))
+        if len(entries) > 6:
+            lines.append(f"…共 {len(entries)} 个文件")
+        detail = "\n".join(lines)
+        _pure_pdf = all(_is_pdf and _all_nonembedded(fonts, _ne)
+                        for _n, fonts, _is_pdf, _ne in entries)
+        if _pure_pdf:
+            self._log("⚠ 下列 PDF 没有嵌入字体（文件里只有字体名，没有字形数据）：\n" + detail)
+            _intro = ("以下 PDF 生成时没有把字体嵌进文件里（文件里只有字体名，没有字形数据）：\n\n"
+                      + detail
+                      + "\n\n打印时只能用替代字形 —— 你在 PDF 查看器里看是正常的，是因为查看器"
+                        "自带那套字体；本工具走光栅化渲染，会换成另一套字形，所以纸上的字体"
+                        "可能和你屏幕上看到的不同。\n"
+                        "页数、位置、分页不受影响，只是字形不同。\n"
+                        "想让纸面完全一致：让生成方重新导出「嵌入字体」的 PDF，或用能自带该"
+                        "字体的阅读器直接打印这份文件。\n\n仍要继续打印吗？")
+        else:
+            self._log("⚠ 本机缺少下列字体（转换/渲染时会被相近字体替换，排版可能有出入）：\n"
+                      + detail)
+            _intro = ("以下文件用到了本机没有安装的字体：\n\n" + detail
+                      + "\n\nWord 转换 PDF 时会用相近字体替换（PDF 则看生成方有没有把字体嵌进去），"
+                        "打印结果的字形/字宽/换行可能与该文件原样不同。\n"
+                        "装好字体后重新添加文件（或重新转换）即可消除此提示。\n\n仍要继续打印吗？")
+        if not interactive:
+            # 自动打印线（云端自动开始 / 无障碍预约 / 空闲补打）**不许**弹模态：
+            # 无人值守时一个等不到人点的对话框能把整条队列堵到第二天。
+            self._log("▶ 自动打印任务：已记录字体问题，继续打印")
+            return True
+        reply = QMessageBox.question(
+            self, "字体缺失", _intro,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            self._log("🛑 用户取消打印：文件缺少字体")
+            return False
+        return True
+
     def _set_pages_cell(self, row: int, job) -> None:
         """只重写「页数」一格（页数后补 / 缓存命中时用；别整行重画，会丢选区）。"""
         item = self._table.item(row, self.COL_PAGES)
@@ -8042,6 +8393,24 @@ class MainWindow(QMainWindow):
             # 列表任务用的是暂存副本（原件删掉/移动也不影响打印）→ 提示里给原件路径
             _tip = f"{_src}\n（打印使用暂存副本，原件删除/移动不影响打印）"
         name_item.setToolTip(_tip)
+        _miss = list(getattr(job, "missing_fonts", []) or [])
+        if _miss:
+            # 只提示、不拦：Word 会把缺的字体悄悄换成相近字体，打出来字形/字宽会变。
+            # 真正的拦截放在打印前（_font_gate 弹一次确认）—— 行上标黄是为了让操作员
+            # 在点「开始打印」之前就看见，而不是打完才发现排版不对。
+            # 这里**不读文件**（每行都查会拖慢整表重画），PDF 的"未嵌入"只按扩展名给个口径，
+            # 精确区分留给 _font_gate（那时才有必要多读一次）。
+            _is_pdf = str(getattr(job, "file_path", "") or "").lower().endswith(".pdf")
+            name_item.setText(f"⚠️ {display}")
+            name_item.setToolTip(
+                _tip + ("\n\n⚠ 这份 PDF 没嵌入这些字体，打印时只能用替代字形：\n"
+                        if _is_pdf else
+                        "\n\n⚠ 本机没装这些字体，打印效果可能与文件原样不同：\n")
+                + "\n".join(f"· {n}" for n in _miss[:8])
+                + ("\n…" if len(_miss) > 8 else ""))
+            _bg, _fg = self._font_theme_colors()
+            name_item.setBackground(_bg)
+            name_item.setForeground(_fg)
         self._table.setItem(row, self.COL_FILE, name_item)
 
         copies_item = QTableWidgetItem(str(job.copies))
@@ -11666,7 +12035,8 @@ class MainWindow(QMainWindow):
             if not jobs:
                 continue
             self._log(f"▶ 纸叠已处理完，放行排队请求（{len(jobs)} 个文件）")
-            if not self._start_print_worker(list(jobs), tab_key=req.get("tab_key") or None):
+            if not self._start_print_worker(list(jobs), tab_key=req.get("tab_key") or None,
+                                            interactive=False):
                 # 启动失败（如打印机忙/取号中）→ 放回队首，下次再试
                 self._stack_wait.insert(0, req)
                 break
@@ -12878,10 +13248,13 @@ class MainWindow(QMainWindow):
         return [name for fp, name in names if fp in alive]
 
     def _start_print_worker(self, flat_jobs: list, tab_key: str | None = None,
-                            stack_entry: tuple | None = None) -> bool:
+                            stack_entry: tuple | None = None,
+                            interactive: bool = True) -> bool:
         """用给定的任务列表启动打印 Worker。返回 True=已启动，False=忙/被取消。
         tab_key：打印批次所属标签页（2026-12 无障碍后台打印用，默认当前前台标签页）。
-        stack_entry：(seq, 本单输出 PDF, rotate) —— 攒批模式的"第 1 趟单"，见 _start_stack_entry。"""
+        stack_entry：(seq, 本单输出 PDF, rotate) —— 攒批模式的"第 1 趟单"，见 _start_stack_entry。
+        interactive：能否弹确认框（字体缺失闸门用）。**自动打印线必须传 False** ——
+                     云端自动开始 / 无障碍预约 / 空闲补打是无人值守的，弹窗会把队列堵死。"""
         if not self._has_members():
             # 无成员禁止创建订单（订单必须归属某个成员）
             self._show_no_member_hint()
@@ -12943,9 +13316,19 @@ class MainWindow(QMainWindow):
                             return False
                     self._log(f"⚠ 文件「{j.display_name or os.path.basename(j.file_path)}」页码范围无效，将打印全部页")
 
+        # ── 字体缺失闸门（2026-10-31 用户需求）──────────────────────────────
+        # 位置讲究：必须在"冻结标签页 / 取号 / 上报订单"**之前** —— 用户在这里点取消，
+        # 这一单要原样退出；放后面会留下一张已冻结、已上报、实际没打的订单（现场最怕这个）。
+        if not self._font_gate(flat_jobs, interactive=interactive):
+            self._print_starting = False
+            try:
+                self._btn_start.setEnabled(True)
+            except (AttributeError, RuntimeError):
+                pass
+            return False
+
         self._flat_jobs = flat_jobs
-        self._sync_ui_to_config()
-        # 打印批次所属标签页：默认前台；无障碍后台打印时显式指定（冻结/附加服务/回报据此定位）
+        self._sync_ui_to_config()        # 打印批次所属标签页：默认前台；无障碍后台打印时显式指定（冻结/附加服务/回报据此定位）
         target_key = tab_key or self._current_tab
         self._printing_tab_key = target_key
 
@@ -13396,7 +13779,7 @@ class MainWindow(QMainWindow):
                 pending = [j for j in tab.jobs if not getattr(j, 'sent', False)]
                 if pending:
                     self._log(f"⚡ 打印机空闲，补打订单 #{order_id}（标签页 {tab_key}，{len(pending)} 个未打印文件）")
-                    if self._start_print_worker(pending, tab_key=tab_key):
+                    if self._start_print_worker(pending, tab_key=tab_key, interactive=False):
                         self._auto_print_retry.pop(0)
                     else:
                         # 🔴-B4-3：旧写法"先 pop 再启动"，启动失败（刚好又忙 / 正在取号）
@@ -13970,7 +14353,7 @@ class MainWindow(QMainWindow):
         # 只打印未完成（sent=False）的 job：追加到已有标签页时，已打印过的文件不重打
         if jobs:
             self._log(f"⚡ 自动开始打印标签页 {tab_key}（{len(jobs)} 个文件）")
-            if not self._start_print_worker(list(jobs), tab_key=tab_key):
+            if not self._start_print_worker(list(jobs), tab_key=tab_key, interactive=False):
                 # 🔴-B4-3：`jobs` 是"标签页里所有未 sent 的文件"（含上一批已进重试队列的）。
                 # 旧写法无条件 append ⇒ 同一订单会出现多条条目、task_ids 互相重叠 ⇒
                 # 补打时同一 task_id 被打两次（现场：#1062 上报"打印成功"两次）。
@@ -14281,7 +14664,7 @@ class MainWindow(QMainWindow):
             self._cleanup_scheduled_order(order_id, reason="需人工翻纸，转为人工打印")
             return
         if jobs:
-            if not self._start_print_worker(list(jobs), tab_key=st["tab_key"]):
+            if not self._start_print_worker(list(jobs), tab_key=st["tab_key"], interactive=False):
                 # 恰好此刻打印机变忙 → 不置 printed，10s 后重试（防丢失）
                 self._log(f"⏰ 预约单 #{order_id}: 打印机正忙，10s 后重试")
                 self._start_scheduled_print_timer(order_id, int(time.time()) + 10)
@@ -15513,6 +15896,9 @@ class MainWindow(QMainWindow):
             if staged_count:
                 _msg += f"（{staged_count} 个已复制到暂存副本，原件删除/移动不影响打印）"
             self._log(_msg)
+            # 字体缺失检测（2026-10-31）：只对新加的这批排后台检查，查完在 _on_font_checked 里
+            # 把缺字体的文件名标黄 ⚠️（查的是**源文件**，不是预转换出来的 PDF —— 理由见 _font_gate）
+            self._queue_font_checks(jobs[rows_before:], self._current_tab)
             # 只为**本次新增**的行启动预转换（rows_before 之前的行上次已处理过）。
             # 原先遍历整个 jobs ⇒ 添加第 N 个文件时把前 N-1 个全部重新渲染一遍（O(n²)，
             # 现场：7 个图片渲染 18+ 次、首个文件 50 秒内被渲染 4 次）。

@@ -1053,7 +1053,8 @@ class _FinWin:
     def _log(self, msg):
         pass
 
-    def _start_print_worker(self, jobs, tab_key=None):
+    def _start_print_worker(self, jobs, tab_key=None, interactive=True):
+        # interactive：自动打印线传 False（不弹字体缺失确认框）；桩要跟真签名对齐
         # 记录"补打开始时 worker 已经置空"——证明门是先开的，补打不是插队
         self.calls.append(("start_retry", self._worker is None))
         return self.start_result
@@ -1121,7 +1122,7 @@ check("★ 批次结束才置空 _worker 并补打排队订单（顺序：先开
 # ── 两条自动启动路径遇忙必须"排队/重试"，绝不插队 ──
 check("★ 无障碍自动打印：打印机忙 → 入 _auto_print_retry（不插队，批次结束后补打）",
       "self._auto_print_retry.append({" in src
-      and "if not self._start_print_worker(list(jobs), tab_key=tab_key):" in src)
+      and "if not self._start_print_worker(list(jobs), tab_key=tab_key, interactive=False):" in src)
 check("★ 预约打印：打印机忙 → 10 秒后重试（不插队、不丢单、不计入失败上限）",
       "打印机正忙，10s 后重试" in src
       and "_start_scheduled_print_timer(order_id, int(time.time()) + 10)" in src)

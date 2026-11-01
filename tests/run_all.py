@@ -31,6 +31,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TESTS = ROOT / "tests"
 
+# 控制台编码不一定是 UTF-8（GBK 装不下 ¥ / ❌ 这类字符）：打印失败摘要时别让 runner 自己
+# 崩在 UnicodeEncodeError 上 —— 那会把后面所有脚本的结果一并吞掉，看起来像"只跑了一半"。
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except (AttributeError, ValueError):   # 老解释器 / 被重定向成不可配置对象
+    pass
+
 # 「必须换环境跑」的脚本：默认跳过并打印原因（不计入失败）。
 # 判据来自脚本自身的 docstring（在服务器上跑 / 需后端依赖 / 需真实浏览器 / 需联网）。
 ENV_REQUIRED: dict[str, str] = {

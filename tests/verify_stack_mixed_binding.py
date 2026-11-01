@@ -178,7 +178,7 @@ check("★ 队列里没有被停住的请求（现场就是这里攒了 2 条）
 print("\n③ 防呆：队列里的请求一定有出路")
 _calls = []
 _orig_start = win._start_print_worker
-win._start_print_worker = lambda jobs, tab_key=None, stack_entry=None: (
+win._start_print_worker = lambda jobs, tab_key=None, stack_entry=None, interactive=True: (
     _calls.append((len(jobs), tab_key)) or True)
 
 win._park_print_request(field_jobs, "1", "桩：模拟被停在队列里")
