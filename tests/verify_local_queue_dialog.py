@@ -384,7 +384,7 @@ print("\n=== ⑥ 静态接线 ===")
 check("对话框有 set_local_queue setter", "def set_local_queue(" in SRC)
 check("主窗口把**纯数据**喂给 setter（对话框不摸 MainWindow 状态）",
       "dlg.set_local_queue(rows)" in SRC)
-check("第三块标题是「🖨 本机队列」", "🖨 本机队列" in SRC)
+check("第三块标题是「🖨 打印列表」（用户口径；旧名「本机队列」）", "🖨 打印列表" in SRC)
 check("LOCAL_COLS 常量存在", "LOCAL_COLS" in SRC)
 
 tick = _body("_stack_state_tick")

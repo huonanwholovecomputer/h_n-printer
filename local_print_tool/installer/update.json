@@ -1,9 +1,9 @@
 {
-  "version": "4.5.40",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.40.exe",
-  "md5": "4399b4ced6f5e98690e48fd0e29175ea",
-  "sha256": "f215b084cac4ee34cc2b32e6590110cfea9bb976637c460f428f57442b560943",
-  "notes": "v4.5.40：① 手动双面「第 1 趟」计时不再抢跑 —— 上一单还在出纸时点第二单，翻纸窗会等队列排空才开始计时，不会再让你提前翻纸；② Ctrl+Shift+T 打开「标签页管理」窗；③ 「本机队列」并入攒批队列常驻窗（进行中/等待中/预计完成）；④ 开始打印前若还有文件在统计页数，先等统计完再出纸（不再冻结标签页、不空转取号）；⑤ 日志只保留近 30 天（local_tool.log 与 finance_audit.log 永不清理）；⑥ 外部打印监视不再把 Windows 占位作业「本地下层文档」重复记账。收支清算：采购支出新增「所属打印机」列（硒鼓按所属机器本月页数摊销）；「用纸统计」每人可编辑「废纸」格，废纸计入本月用纸量。云端：接单设备支持置顶排序（离线不降级）；父单页数按子行汇总，修正个别订单少收费。",
+  "version": "4.5.41",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.5.41.exe",
+  "md5": "PENDING",
+  "sha256": "PENDING",
+  "notes": "v4.5.41：攒批列表与打印列表按场景自适应 —— 自动双面机只看「打印列表」（不再挂两块永远空的攒批表格，窗口从 1180x520 收到 860x320）；攒批与打印列表同时在场时窗口加高到 1180x700，「打印列表」占约 40%，并可用鼠标上下拖动分配高度（拖过一次就不再自动改回）；修复「状态」列宽度从来没生效（最长那句「第 1 趟进行中（攒批）」被截成「第 1 趟进行...」）；顶部 4 行说明收成一行，完整口径移入悬停提示。",
   "sig_algo": "ed25519",
-  "sig": "P6168dXj70v2zZ4tAysheYriKEU2wtfO+LdtIO6N4kdvmqOj6F0V2oPv1HI4BmDy2PpfcWrUbvJSDsDp7FbLBw=="
+  "sig": "PENDING"
 }

@@ -108,7 +108,7 @@ import font_check  # 字体缺失检测（查源文件用到的字体、本机�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.5.40"
+APP_VERSION = "4.5.41"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -1437,10 +1437,39 @@ class StackQueueDialog(QDialog):
     # 列宽只给「非文件」列：文件列一律 Stretch（文件名长短差别大，固定宽会把名字挤成省略号）
     LEFT_WIDTHS = [0, 108, 108, 52, 126]
     RIGHT_WIDTHS = [0, 92, 92, 124]
-    # 「本机队列」= 打印机当前在处理 + 本机已经受理还没开打的任务（含非攒批的单子）。
+    # 「打印列表」= 打印机当前在处理 + 本机已经受理还没开打的任务（含非攒批的单子，旧名"本机队列"）。
     # 列宽只给「非内容」列：内容列一律 Stretch（文件名长短差别大）。
     LOCAL_COLS = ["状态", "来源", "内容", "张数", "预计完成"]
-    LOCAL_WIDTHS = [136, 84, 0, 52, 92]
+    # 状态列：最长那句是「第 1 趟进行中（攒批）」= 144 px，加缩进与内边距要给到 200 才不截断
+    # （136px 会被截成「第 2 趟进行...」，把"哪一趟"这个最关键的信息吃掉）。
+    LOCAL_WIDTHS = [200, 84, 0, 52, 92]
+
+    # 完整口径说明（永远进 tooltip）；标题下那行只放**当前场景用得着**的一句。
+    # 2026-11-01 之前这里是 4 行长文常驻，占了窗口最宝贵的高度，而且三种机型/模式下
+    # 一字不差 —— 自动双面机的用户被迫读一整段"怎么攒批"。
+    HINT_FULL = (
+        "左栏＝已经攒进出纸槽的文件（第 1 趟已打，等第 2 趟）；右栏＝本机已经受理、"
+        "但还没能开打的文件（出纸槽被当前纸叠独占 / 容量不允许）——"
+        "不是云端排队列表，云端还没下发给本机的订单不会出现在这里；纸叠打完第 2 趟后"
+        "它们会自动放行。页号按「第 1 趟 / 第 2 趟」分列，每个文件的页号按它自己算"
+        "（不是整叠合并后的页码），[空] = 那一面没有内容，"
+        "程序会送一张空白纸（不能跳过：漏一张，后面整叠错位）。\n"
+        "下方「🖨 打印列表」＝打印机当前正在处理 + 本机已受理但还在排队的"
+        "全部任务（不止攒批单：普通/云端自动/预约都算），空闲时自动隐藏。")
+    # 「打印列表」在竖向分割里的**初始**占比（2026-11-01 用户要求 ≈40%：攒批两栏各三五行就够看，
+    # 队列常常同时挂着"第 2 趟进行中 + 排队 N 个"，1/4 高度会挤成一堆）。
+    # 只在操作员还没自己拖过竖分隔条时生效，拖过就一直沿用他的比例。
+    QUEUE_RATIO = 0.40
+
+    HINT_SHORT = {
+        "both": "左栏＝已打出第 1 趟、等第 2 趟的纸；右栏＝本机已受理、还没能开打的文件。"
+                "页号按每个文件自己算，[空]＝那一面没内容，会送一张空白纸。",
+        "left": "左栏＝已打出第 1 趟、等第 2 趟的纸。"
+                "页号按每个文件自己算，[空]＝那一面没内容，会送一张空白纸。",
+        "right": "右栏＝本机已受理、还没能开打的文件（出纸槽被前一个任务独占，打完就放行）。",
+        "local": "打印机正在处理 + 本机已受理、还在排队的所有任务"
+                 "（不止攒批单：普通/云端自动/预约都算）。",
+    }
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1449,6 +1478,17 @@ class StackQueueDialog(QDialog):
         self._stack = None
         self._busy = False
         self._sel = None
+        # 「此刻这块东西有没有内容」的四个输入：render()/set_local_queue() 各自回填，
+        # 再由 `_update_frame()` 统一决定标题/区块/按钮/提示/尺寸（同一个窗当两种东西用）。
+        self._entries: list = []
+        self._n_req = 0
+        self._stack_mode = False
+        self._stack_applicable = False
+        self._printing_text = ""
+        self._present = 0
+        self._original = 0
+        self._shape_sig = None
+        self._vsplit_user_moved = False   # 操作员自己拖过竖分隔条 ⇒ 之后不再自动改比例
 
         lay = QVBoxLayout(self)
         lay.setSpacing(6)
@@ -1461,17 +1501,10 @@ class StackQueueDialog(QDialog):
         self._summary.setWordWrap(True)
         lay.addWidget(self._summary)
 
-        self._hint = QLabel(
-            "左栏＝已经攒进出纸槽的文件（第 1 趟已打，等第 2 趟）；右栏＝<b>本机已经受理、"
-            "但还没能开打</b>的文件（出纸槽被当前纸叠独占 / 容量或装订方向不允许）——"
-            "不是云端排队列表，云端还没下发给本机的订单不会出现在这里；纸叠打完第 2 趟后"
-            "它们会自动放行。页号按「第 1 趟 / 第 2 趟」分列，<b>每个文件的页号按它自己算</b>"
-            "（不是整叠合并后的页码），<b>[空]</b> = 那一面没有内容，"
-            "程序会送一张空白纸（不能跳过：漏一张，后面整叠错位）。<br>"
-            "下方<b>「🖨 本机队列」</b>＝打印机当前正在处理 + 本机已受理但还在排队的"
-            "<b>全部</b>任务（不止攒批单：普通/云端自动/预约都算），空闲时自动隐藏。")
+        self._hint = QLabel("")
         self._hint.setWordWrap(True)
-        self._hint.setStyleSheet("font-size: 11px;")
+        self._hint.setStyleSheet("font-size: 11px; color: #5d6d7e;")
+        self._hint.setToolTip(self.HINT_FULL)
         lay.addWidget(self._hint)
 
         self._note = QLabel("")
@@ -1479,7 +1512,16 @@ class StackQueueDialog(QDialog):
         self._note.setStyleSheet("color: #e67e22;")
         lay.addWidget(self._note)
 
+        # 两块攒批栏都空、但"攒批"此刻仍然有意义时，用**一行灰字**交代，不再摆两个空表格
+        # （空表格既占高度又让人以为程序坏了）。
+        self._empty_line = QLabel("")
+        self._empty_line.setWordWrap(True)
+        self._empty_line.setStyleSheet("color: #7f8c8d; font-size: 12px;")
+        self._empty_line.setVisible(False)
+        lay.addWidget(self._empty_line)
+
         split = QSplitter(Qt.Horizontal)
+        self._split = split
         self._left_group = QGroupBox("🖐 已攒（第 1 趟已打，等第 2 趟）")
         _lg = QVBoxLayout(self._left_group)
         self._tree_left = self._make_tree(self.LEFT_COLS, self.LEFT_WIDTHS)
@@ -1493,17 +1535,29 @@ class StackQueueDialog(QDialog):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([660, 500])
-        lay.addWidget(split, 3)
 
-        # ── 第三块：本机队列（打印机忙时第二、第三个任务也要有总体队列视图）──
+        # ── 第三块：打印列表（打印机忙时第二、第三个任务也要有总体队列视图）──
         # 数据全部由主窗口组装成纯结构后经 `set_local_queue()` 喂进来（对话框不摸 MainWindow）。
         # 空闲时整块 `setVisible(False)`（不占位置、不闪），有内容才显示。
-        self._local_group = QGroupBox("🖨 本机队列")
+        self._local_group = QGroupBox("🖨 打印列表")
         _lq = QVBoxLayout(self._local_group)
         self._tree_local = self._make_tree(self.LOCAL_COLS, self.LOCAL_WIDTHS, stretch_col=2)
         _lq.addWidget(self._tree_local)
         self._local_group.setVisible(False)
-        lay.addWidget(self._local_group, 1)
+
+        # 攒批两块与「打印列表」之间**用鼠标拖动分配高度**（2026-11-01 用户要求：队列有时很短、
+        # 有时一长串，固定分割比永远不对）。两者一起塞进一个竖向 QSplitter。
+        self._vsplit = QSplitter(Qt.Vertical)
+        self._vsplit.setChildrenCollapsible(False)   # 拖到底也留一丝，不会再也抓不回来
+        self._vsplit.setHandleWidth(7)               # 抓手够宽，窄窗口下也点得中
+        self._vsplit.addWidget(split)
+        self._vsplit.addWidget(self._local_group)
+        self._vsplit.setStretchFactor(0, 3)
+        self._vsplit.setStretchFactor(1, 2)
+        # 拖过就记一笔：之后 `_reset_queue_ratio()` 一律让路，别把人家拖出来的高度抢回去。
+        self._vsplit.splitterMoved.connect(lambda *_: setattr(self, "_vsplit_user_moved", True))
+        self._vsplit.setSizes([330, 240])
+        lay.addWidget(self._vsplit, 1)
         self._local_rows: list = []
         self._local_sig = None
 
@@ -1543,7 +1597,9 @@ class StackQueueDialog(QDialog):
         hdr = t.header()
         hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(stretch_col, QHeaderView.Stretch)
-        for i in range(1, len(widths)):
+        # ⚠ 必须从 0 开始：只从 1 开始会让 `widths[0]` 永远不生效（第三块的「状态」列就是这么
+        # 被默认 100px 截成「第 1 趟进行...」的）。stretch_col 由上面那行接管，这里跳过即可。
+        for i in range(len(widths)):
             if i == stretch_col:
                 continue
             hdr.setSectionResizeMode(i, QHeaderView.Interactive)
@@ -1553,7 +1609,7 @@ class StackQueueDialog(QDialog):
     # ── 本机队列（第三块；主窗口组装好纯数据再喂进来）──
 
     def set_local_queue(self, rows=None):
-        """刷新「🖨 本机队列」区。
+        """刷新「🖨 打印列表」区（用户口径叫"打印列表"，旧名"本机队列"）。
 
         `rows` = list[dict]，每项 `{"state","source","content","sheets","eta","active"}`，
         `active=True` 表示"进行中"（含手动双面的「等待翻纸」，那一态算进行中而不是等待中）。
@@ -1573,11 +1629,12 @@ class StackQueueDialog(QDialog):
         self._local_rows = rows
         self._tree_local.clear()
         if not rows:
-            self._local_group.setVisible(False)
+            # 显隐交给 `_update_frame()` 统一裁决（它同时要看攒批两栏有没有内容）
+            self._update_frame()
             return
         n_active = sum(1 for r in rows if r.get("active"))
         n_wait = len(rows) - n_active
-        self._local_group.setTitle(f"🖨 本机队列 —— 进行中 {n_active} / 等待中 {n_wait}")
+        self._local_group.setTitle(f"🖨 打印列表 —— 进行中 {n_active} / 等待中 {n_wait}")
         for r in rows:
             it = QTreeWidgetItem([
                 str(r.get("state", "")), str(r.get("source", "")),
@@ -1585,9 +1642,11 @@ class StackQueueDialog(QDialog):
                 str(r.get("eta", "")),
             ])
             it.setForeground(0, QColor("#c0392b" if r.get("active") else "#7f8c8d"))
+            it.setToolTip(0, str(r.get("state", "")))
+            it.setToolTip(1, str(r.get("source", "")))
             it.setToolTip(2, str(r.get("content", "")))
             self._tree_local.addTopLevelItem(it)
-        self._local_group.setVisible(True)
+        self._update_frame()
 
     def local_queue_visible(self) -> bool:
         """本机队列区当前是否显示（测试与主窗口底栏读数共用；不用 isVisible，父窗没 show 时它恒为 False）。"""
@@ -1596,23 +1655,28 @@ class StackQueueDialog(QDialog):
     # ── 渲染（可反复调用：常驻窗随纸叠/排队实时刷新）──
 
     def render(self, stack, busy: bool = False, note: str = "",
-               wait_requests=None, printing_text: str = ""):
+               wait_requests=None, printing_text: str = "",
+               stack_mode: bool = False, stack_applicable: bool = False):
+        """刷新攒批两块（纸叠 / 排队）。
+
+        `stack_mode` / `stack_applicable` 只是**展示口径**：攒批此刻有没有意义，用来决定
+        这个窗要不要自称「攒批列表」（2026-11-01）。两者默认 False ⇒ 老调用方（验收脚本 /
+        预览脚本）行为不变：有纸叠就照常显示左右两栏。
+        """
         self._stack = stack
         self._busy = bool(busy)
         self._sel = None
+        self._stack_mode = bool(stack_mode)
+        self._stack_applicable = bool(stack_applicable)
+        self._printing_text = str(printing_text or "")
         entries = list(getattr(stack, "entries", None) or []) if stack is not None else []
+        requests = list(wait_requests or [])
+        self._entries = entries
+        self._n_req = len(requests)
         present = _stack_present_sheet_count(stack) if entries else 0
         original = _stack_original_sheet_count(stack) if entries else 0
-        taken = max(0, original - present)
-
-        if entries:
-            self._summary.setText(
-                f"🖐 攒批列表：本叠 {len(entries)} 单 / 已攒 {present} 张纸"
-                f"（第 1 趟共 {original} 张 − 已取走 {taken} 张）"
-                + (f" · {printing_text}" if printing_text else ""))
-        else:
-            self._summary.setText("🖐 攒批列表：还没有已攒的纸叠"
-                                  + (f" · {printing_text}" if printing_text else ""))
+        self._present = present
+        self._original = original
 
         hints = []
         if busy:
@@ -1626,13 +1690,12 @@ class StackQueueDialog(QDialog):
         self._note.setText("\n".join(hints))
 
         self._fill_left(entries)
-        self._fill_right(list(wait_requests or []))
-        n_req = len(wait_requests or [])
-        n_files = sum(len(r.get("jobs") or []) for r in (wait_requests or []))
+        self._fill_right(requests)
+        n_files = sum(len(r.get("jobs") or []) for r in requests)
         self._left_group.setTitle(
             f"🖐 已攒（第 1 趟已打，等第 2 趟）—— {len(entries)} 单 / {present} 张")
         self._right_group.setTitle(
-            f"⏳ 等待打印（还没入叠）—— {n_req} 个请求 / {n_files} 个文件")
+            f"⏳ 等待打印（还没入叠）—— {len(requests)} 个请求 / {n_files} 个文件")
         if entries and present <= 0:
             self._btn_start.setText("✅ 按成品收尾（第 2 趟无内容，不出纸）")
         else:
@@ -1642,6 +1705,178 @@ class StackQueueDialog(QDialog):
         self._btn_start.setEnabled(not busy and bool(entries))
         self._btn_abandon.setEnabled(not busy and bool(entries))
         self._update_take_button()
+        self._update_frame()
+
+    # ── 形状 / 身份自适应：同一个窗既能当「攒批列表」当「打印列表」──
+
+    def _has_local(self) -> bool:
+        return bool(self._local_rows)
+
+    def _update_frame(self):
+        """按"此刻哪些东西真的有内容"决定标题 / 区块 / 按钮 / 提示 / 尺寸。
+
+        2026-11-01 用户要求「三种机型/模式 × 单任务/多任务逐个模拟」后的定案：
+        以前三种场景长得一模一样 —— 自动双面的机器上永远是两块空表格 + 4 行「已攒/等待」
+        长文 + 三个灰死按钮，真正在打的那个任务挤在最下面一行，窗口还叫「攒批列表」。
+        现在：
+          · 攒批两块只在真有纸 / 真有排队时出现；攒批不适用（自动双面机）时整块收起；
+          · 攒批开着但还没攒到东西 ⇒ 一行灰字交代，不摆空表格；
+          · 打印列表有内容才出现，空则整块隐藏（原逻辑）；
+          · 标题随内容拼：「🖐 攒批列表 · 🖨 打印列表」/ 只剩一个时只写一个；
+          · 取走 / 开始第 2 趟 / 放弃整叠三个按钮只在真有纸叠时出现。
+        """
+        entries = list(self._entries)
+        has_local = self._has_local()
+        n_active = sum(1 for r in self._local_rows if r.get("active"))
+        n_wait = len(self._local_rows) - n_active
+        printing = self._printing_text
+        present, original = self._present, self._original
+        taken = max(0, original - present)
+
+        stack_part = bool(entries) or self._n_req > 0        # 攒批两块真的有人用
+        stack_relevant = stack_part or (self._stack_applicable and self._stack_mode)
+        show_left = bool(entries)
+        show_right = self._n_req > 0
+
+        # 攒批两块都空时的一句话（空表格换成一句话）。
+        # ⚠ 只在"攒批已经开着"或"整窗只剩这句话"时才说 —— 否则这个窗就是**打印列表**，
+        # 别在队列视图里塞攒批宣传（2026-11-01：off_single/off_multi 就是这么被塞脏的）。
+        empty_text = ""
+        if not show_left and not show_right:
+            if stack_relevant:
+                empty_text = ("攒批模式已开启，但还没有攒进文件 —— 打第 1 趟时只打奇数面，"
+                              "打完把整叠搬回进纸盒，再来这里点「开始打印第 2 趟」。")
+            elif not has_local:
+                if self._stack_applicable:
+                    empty_text = ("攒批模式没开。打开后第 1 趟只打奇数面，"
+                                  "人工把整叠搬回进纸盒，再点「开始打印第 2 趟」打偶数面。")
+                else:
+                    empty_text = ("这台打印机已确认支持自动双面，攒批不适用 —— "
+                                  "双面由打印机自己翻面，这里只显示排队中的任务。")
+        self._empty_line.setText(empty_text)
+        self._empty_line.setVisible(bool(empty_text))
+
+        self._left_group.setVisible(show_left)
+        self._right_group.setVisible(show_right)
+        self._split.setVisible(show_left or show_right)
+        if show_left and show_right:
+            self._split.setStretchFactor(0, 3)
+            self._split.setStretchFactor(1, 2)
+        elif show_left:
+            self._split.setStretchFactor(0, 1)
+            self._split.setStretchFactor(1, 0)
+        elif show_right:
+            self._split.setStretchFactor(0, 0)
+            self._split.setStretchFactor(1, 1)
+        self._local_group.setVisible(has_local)
+        self._vsplit.setVisible(show_left or show_right or has_local)
+
+        # 标题：有谁写谁
+        words = []
+        if stack_relevant:
+            words.append("🖐 攒批列表")
+        if has_local:
+            words.append("🖨 打印列表")
+        self.setWindowTitle(" · ".join(words) or "🖐 攒批列表")
+
+        # 汇总句：有纸叠讲纸叠，只有队列就讲队列，都没有说一句老话
+        if entries:
+            self._summary.setText(
+                f"🖐 攒批列表：本叠 {len(entries)} 单 / 已攒 {present} 张纸"
+                f"（第 1 趟共 {original} 张 − 已取走 {taken} 张）"
+                + (f" · {printing}" if printing else ""))
+        elif stack_relevant:
+            self._summary.setText("🖐 攒批列表：还没有攒进文件"
+                                  + (f" · {printing}" if printing else ""))
+        elif has_local:
+            self._summary.setText(
+                f"🖨 打印列表：进行中 {n_active} 个 / 等待中 {n_wait} 个"
+                + (f" · {printing}" if printing else ""))
+        else:
+            self._summary.setText("🖐 攒批列表：还没有已攒的纸叠"
+                                  + (f" · {printing}" if printing else ""))
+
+        # 提示句：只讲当前看得见的那些（完整口径在 tooltip 里）
+        if show_left and show_right:
+            key = "both"
+        elif show_left:
+            key = "left"
+        elif show_right:
+            key = "right"
+        elif has_local:
+            key = "local"
+        else:
+            key = ""
+        self._hint.setText(self.HINT_SHORT.get(key, ""))
+        self._hint.setVisible(bool(key))
+
+        # 三个"动纸"的按钮只在真有纸叠时出现（空纸叠时它们全是灰的死按钮，纯噪音）
+        for btn in (self._btn_take, self._btn_start, self._btn_abandon):
+            btn.setVisible(bool(entries))
+
+        self._apply_shape()
+
+    def _reset_queue_ratio(self):
+        """把竖向分割重置成上方 ≈60% / 「打印列表」≈40%（2026-11-01 用户要求）。
+
+        只在「打印列表」真有内容、且操作员还没自己拖过竖分隔条时动手 ——
+        2 秒心跳会反复走 `_update_frame()`，抢比例的话操作员拖一下就弹回去。
+        """
+        if self._vsplit_user_moved or not self._has_local():
+            return
+        total = self._vsplit.height()
+        if total <= 0:                       # 还没显示过（height=0），先按名义总高垫一份
+            total = 560
+        free = max(0, total - self._vsplit.handleWidth())
+        low = int(round(free * self.QUEUE_RATIO))
+        low = max(90, min(low, max(90, free - 90)))
+        self._vsplit.setSizes([free - low, low])
+
+    def _screen_cap_height(self) -> int:
+        """窗口最小高度不许超过屏幕可用高度（1366×768 的小本子上别把按钮顶到屏幕外）。"""
+        try:
+            scr = QApplication.primaryScreen()
+            avail = scr.availableGeometry().height() if scr is not None else 0
+        except Exception:
+            avail = 0
+        return max(360, avail - 120) if avail else 0
+
+    def _apply_shape(self):
+        """按在场区块数给窗口一个合适的**最小**尺寸（不再硬撑 1180×520 留一片空白）。
+
+        只在形状真的变了时动手，且只在"明显比目标大"时才缩 —— 否则会抢操作员手动拉过的尺寸。
+        """
+        n_panes = sum(1 for g in (self._left_group, self._right_group)
+                      if not g.isHidden())
+        has_local = self._has_local()
+        has_empty = bool(self._empty_line.text()) and not self._empty_line.isHidden()
+        sig = (n_panes, int(has_local), int(has_empty))
+        prev = self._shape_sig
+        if sig == prev:
+            return
+        self._shape_sig = sig
+        # 形状变了 ⇒ 重新按 6:4 分一次上下高度（操作员拖过的比例不碰）。
+        # 延迟一拍再分：setMinimumSize 把窗口撑高之后分割条才有新高度，当场分还是按旧高度算。
+        if has_local and not self._vsplit_user_moved:
+            self._reset_queue_ratio()
+            QTimer.singleShot(0, self._reset_queue_ratio)
+        # 两块攒批栏 + 打印列表同时在场是最挤的组合：520 高根本不够（上两栏各三五单、下队列
+        # 还挂着"第 2 趟进行中 + 排队 N 个"），2026-11-01 用户要求加高到 700，并把队列
+        # 初始占比提到 40%（见 QUEUE_RATIO）。
+        if n_panes >= 2:
+            w, h = (1180, 700) if has_local else (1180, 430)
+        elif n_panes == 1:
+            w, h = (980, 580) if has_local else (980, 340)
+        else:
+            w, h = (860, 320) if has_local else (760, 250)
+        if has_empty:
+            h += 30
+        cap = self._screen_cap_height()
+        if has_local and cap:
+            h = min(h, cap)
+        self.setMinimumSize(w, h)
+        if self.isVisible() and (self.width() > w + 40 or self.height() > h + 40):
+            self.resize(w, h)
 
     def _fill_left(self, entries: list):
         self._tree_left.clear()
@@ -1808,6 +2043,12 @@ class StackQueueDialog(QDialog):
     # 一整叠半成品与若干订单**离开视线**（旧写法只 hide，连一句提示都没有；操作员很容易
     # 以为"关掉就等于这叠不要了"，或者反过来以为"关掉订单就完成了"）。
     # 主窗口先弹三选确认（保留 / 放弃整叠=按失败收尾 / 取消），再决定 hide()。
+
+    def showEvent(self, ev):
+        """窗口真正显示出来之后，才拿得到真实的可用高度 —— 这里再按 40% 分一次。"""
+        super().showEvent(ev)
+        if self._has_local() and not self._vsplit_user_moved:
+            QTimer.singleShot(0, self._reset_queue_ratio)
 
     def closeEvent(self, ev):
         """点窗口 × / Esc：只发信号，是否真的隐藏由主窗口决定（它会调 hide()）。"""
@@ -12475,7 +12716,11 @@ class MainWindow(QMainWindow):
                              + list(getattr(self, "_stack_wait", []) or []))
             dlg.render(self._stack, busy=self._stack_busy(),
                        wait_requests=wait_requests,
-                       printing_text=self._stack_now_printing_text())
+                       printing_text=self._stack_now_printing_text(),
+                       # 只影响展示：攒批此刻有没有意义（决定这块窗自称「攒批列表」还是
+                       # 只剩「打印列表」，以及左右两栏/动纸按钮要不要出现）。
+                       stack_mode=self._stack_mode_on(),
+                       stack_applicable=self._stack_applicable())
         except Exception as e:      # 定时器/半初始化环境都要能安全调用
             logger.debug(f"攒批列表刷新失败: {type(e).__name__}: {e}")
         # 第三块「本机队列」跟着一起刷（同一份窗口、同一个 2 秒心跳；不新起定时器）
