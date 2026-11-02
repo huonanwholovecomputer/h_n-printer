@@ -1,8 +1,8 @@
 {
-  "version": "1.1.50",
-  "versionCode": 51,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.50.apk",
-  "md5": "26cac71885e7934e7834b3abbaf5e027",
-  "notes": "v1.1.50：① 接单设备支持置顶顺序 —— 常来的那台机器排在最前，离线设备自动排到在线之后（置顶排名在后台设置，App 按顺序展示）；② 隐私弹层按钮改为整行各半宽，更好点；③ 同步本轮云端修复（父单页数按子行汇总，个别订单不再少收费）。",
+  "version": "1.1.51",
+  "versionCode": 52,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.51.apk",
+  "md5": "a47427d4213b9efaf18a59ab4e07907e",
+  "notes": "v1.1.51：① 新增前端错误自动上报 —— App 崩溃或接口异常时会把脱敏后的信息回传服务器，出问题能查得到（只报错误，不碰你的文件内容）；② 页面资源与本轮云端修复同步。",
   "force": false
 }
