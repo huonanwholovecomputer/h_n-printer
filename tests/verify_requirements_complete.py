@@ -51,6 +51,8 @@ IMPORT_TO_PYPI = {
     "win32con": "pywin32",
     "win32gui": "pywin32",
     "win32print": "pywin32",
+    # 2026-11-02：xlsx_printer 的 Excel/WPS 进程收尾助手（_pid_*）用到 win32process
+    "win32process": "pywin32",
     "win32ui": "pywin32",
     # S1-05（2026-10-23）：财务完整性 HMAC 的密钥用 DPAPI 保护（win32crypt 属于 pywin32）
     "win32crypt": "pywin32",

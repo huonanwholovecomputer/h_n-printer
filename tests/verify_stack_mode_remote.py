@@ -14,13 +14,15 @@
 本脚本钉住的代码事实：
   ① 服务端忙闲闸门 `_stack_toggle_problem`（纯函数，各组合）；
   ② `/api/claiming_devices` 下发 stack_mode / stack_busy / stack_can_toggle / stack_reason；
-  ③ `POST /api/printer/stack_mode`：鉴权 / 权限 / 离线 / 忙 / 成功 / 设备端拒绝 / 超时；
+  ③ `POST /api/printer/stack_mode`：鉴权 / 权限 / 离线（2026-11 起改为**记录期望**、不再拒绝，
+     返回 pending=true，落 uploads/stack_intent.json，设备上线后比对下发）/ 忙 / 成功 / 设备端拒绝 / 超时；
   ④ socketio `stack_state` 上报通道（真实 test_client 连接）；
   ⑤ 三端静态接线：本地工具的忙闲口径与两侧同闸门、小程序与 APP 的展示与开关。
 
 用法: python tests/verify_stack_mode_remote.py   （exit 0 = 全部通过）
 """
 import io
+import json
 import os
 import shutil
 import sys
@@ -245,10 +247,42 @@ check("★ 能力未确认的设备 → 同样拦下（不给攒批入口）",
       j.get("success") is False and "不需要攒批" in (j.get("message") or ""), j.get("message"))
 backend.set_device_manual_capability(CID, False, "测试")
 
+# 2026-11 语义变更（用户要求：离家前先把攒批点好）：设备离线**不再拒绝**，改为把目标状态记成
+# 「期望」落盘（uploads/stack_intent.json，重启不丢），返回 pending=true；设备上线第一次上报
+# stack_state 时后端才比对「期望 vs 实际」，不一致才下发 set_stack_mode（reason=offline_intent）。
+# 落盘/重载/对账全链路见 tests/verify_stack_offline_intent.py；这里只钉住 POST 的对外契约。
 _online(False)
+fake.sent.clear()
 j = (post({"client_id": CID, "enable": True}).get_json() or {})
-check("★ 设备离线 → 拦下", j.get("success") is False and "离线" in (j.get("message") or ""),
-      j.get("message"))
+check("★ 设备离线 → 不再拒绝：success=true / pending=true / message 说明「已记录」",
+      j.get("success") is True and j.get("pending") is True
+      and "已记录" in (j.get("message") or "")
+      and "上线后自动应用" in (j.get("message") or ""), f"{j}")
+check("★ 离线时**不**给设备端下发指令（等上线后比对再发，避免白发一条）",
+      not [s for s in fake.sent if s["event"] == "set_stack_mode"],
+      f"sent={[s['event'] for s in fake.sent]}")
+intent_mem = backend._stack_intent_of(CID) or {}
+check("★ 离线期望已进内存（enable=True / applied=False / 带操作者与时间）",
+      intent_mem.get("enable") is True and intent_mem.get("applied") is False
+      and intent_mem.get("by") and intent_mem.get("ts"), intent_mem)
+intent_file = {}
+try:
+    with open(os.path.join(os.getcwd(), backend.STACK_INTENT_FILE), "r", encoding="utf-8") as _f:
+        intent_file = json.load(_f) or {}
+except (OSError, ValueError):
+    intent_file = {}
+check("★ 离线期望已落盘 stack_intent.json（applied=False，重启不丢）",
+      (intent_file.get(CID) or {}).get("enable") is True
+      and (intent_file.get(CID) or {}).get("applied") is False, intent_file)
+j2 = (post({"client_id": CID, "enable": False}).get_json() or {})
+intent2 = backend._stack_intent_of(CID) or {}
+check("★ 离线再点关闭 → 覆盖同一条期望（enable=False，不是再记一条）",
+      j2.get("pending") is True and intent2.get("enable") is False, intent2)
+# 复位期望，免得干扰后面的在线用例（在线成功切换本来也会清，这里显式清更好读）
+with backend._stack_intent_lock:
+    backend._stack_intent.pop(CID, None)
+    backend._stack_intent_dispatched.pop(CID, None)
+    backend._save_stack_intent_locked()
 
 _online(True)
 backend._set_stack_state(CID, False, True)

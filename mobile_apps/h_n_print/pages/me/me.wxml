@@ -518,6 +518,59 @@
       </view>
     </view>
 
+    <!-- 管理员：近 N 条订单（云端对所有管理员公开最近 N 条；N 由超管设置，默认 10，取接口 limit）
+         数据：GET /api/admin/recent_orders —— 进入页面拉一次，不轮询；失败静默保留上次数据 -->
+    <!-- 渲染条件：管理员且有数据；超管额外「没数据也显示」—— 否则一条订单都没有时，
+         连 ⚙ 设置（改 N）的入口都点不到。 -->
+    <view class="recent-orders-section admin-collapsible {{userRole === 'admin' && (recentOrders.length > 0 || isSuperAdmin) ? 'admin-expanded' : ''}}">
+      <view class="section-title">
+        <view class="section-bar"></view>
+        <text>近 {{recentOrdersLimit}} 条订单</text>
+        <text class="order-count">{{recentOrders.length}}</text>
+        <!-- 超管专属入口：只有超管能改 N（写接口 POST /api/admin/recent_orders_limit 仅 super_admin）。
+             判据用 isSuperAdmin —— 后端 compute_role() 把超管折叠成 admin，userRole === 'super_admin' 永不命中 -->
+        <text wx:if="{{isSuperAdmin}}" class="recent-orders-limit-btn" catchtap="onEditRecentOrdersLimit"
+              hover-class="tap-active">{{recentLimitEditor ? '收起' : '⚙ 设置'}}</text>
+        <text class="recent-orders-refresh" catchtap="onRefreshRecentOrders" hover-class="tap-active">{{recentOrdersLoading ? '刷新中…' : '刷新'}}</text>
+      </view>
+      <!-- 超管专属：N 编辑器（1..100，步进 + 数字输入），保存即 POST，成功后标题与列表立刻按新 N 刷新 -->
+      <view wx:if="{{isSuperAdmin && recentLimitEditor}}" class="recent-limit-editor">
+        <text class="recent-limit-label">显示最近</text>
+        <view class="recent-limit-stepper">
+          <text class="recent-limit-step" data-delta="-1" catchtap="onRecentOrdersLimitStep" hover-class="tap-active">−</text>
+          <input class="recent-limit-input" type="number" value="{{recentLimitDraft}}" maxlength="3"
+                 bindinput="onRecentOrdersLimitInput" />
+          <text class="recent-limit-step" data-delta="1" catchtap="onRecentOrdersLimitStep" hover-class="tap-active">+</text>
+        </view>
+        <text class="recent-limit-label">条</text>
+        <text class="recent-limit-save {{recentLimitSaving ? 'recent-limit-save-disabled' : ''}}"
+              catchtap="onSaveRecentOrdersLimit" hover-class="tap-active">{{recentLimitSaving ? '保存中…' : '保存'}}</text>
+        <text class="recent-limit-cancel" catchtap="onCancelRecentOrdersLimit" hover-class="tap-active">取消</text>
+      </view>
+      <view class="recent-orders-card">
+        <view wx:if="{{recentOrders.length === 0}}" class="recent-orders-empty">{{recentOrdersLoading ? '加载中…' : '暂无订单记录'}}</view>
+        <view wx:for="{{recentOrders}}" wx:key="order_id" class="recent-order-row">
+          <view class="recent-order-line">
+            <text class="order-number-label recent-order-number">{{item.order_number || ('#' + item.order_id)}}</text>
+            <text class="order-status status-{{item.status}}">{{item.statusText}}</text>
+            <text wx:if="{{item.is_admin_print}}" class="order-self-print-badge">👤自打</text>
+            <text class="recent-order-time">{{item.created_at}}</text>
+          </view>
+          <view class="recent-order-line">
+            <!-- 归属人：默认脱敏，点一下看完整昵称（catchtap 防冒泡） -->
+            <text class="recent-order-owner" data-owner="{{item.owner}}" catchtap="onRecentOrderOwnerTap">{{item.ownerText}}</text>
+            <text class="recent-order-stat">{{item.statText}}</text>
+            <!-- 金额：复用订单详情同款「复制价格」气泡（catchtap 防冒泡） -->
+            <view class="detail-price-tap recent-order-price" id="price-tap-r-{{item.order_id}}" data-id="r-{{item.order_id}}"
+                  catchtap="onPriceTap" hover-class="price-tap-hover" hover-start-time="0" hover-stay-time="100">
+              <text class="recent-order-amount">¥{{item.priceDisplay}}</text>
+              <text class="price-copy-icon">📋</text>
+            </view>
+          </view>
+        </view>
+      </view>
+    </view>
+
     <!-- 管理员：存储统计 -->
     <view class="storage-section admin-collapsible {{userRole === 'admin' && storageStats ? 'admin-expanded' : ''}}">
       <view class="section-title">
@@ -660,7 +713,7 @@
       <view class="price-pop-acts">
         <view class="price-pop-btn" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderPrice"
               hover-class="price-pop-btn-hover" hover-stay-time="80">复制价格</view>
-        <view class="price-pop-btn primary" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderDetailPrice"
+        <view wx:if="{{!pricePopRecent}}" class="price-pop-btn primary" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderDetailPrice"
               hover-class="price-pop-btn-hover" hover-stay-time="80">复制详细价格</view>
       </view>
     </view>

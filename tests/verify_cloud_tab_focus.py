@@ -246,7 +246,7 @@ check("清空已确认 → 被清空的云端任务已通知后端放弃（不�
       stub8.abandoned == [801], f"abandoned={stub8.abandoned}")
 check("清空按钮文案已恢复", "撤回清空" not in w8._btn_clear.text(), w8._btn_clear.text())
 
-print("\n=== ⑨ 静态：三个后台调用点都汇入同一漏斗（判据不会漏改）===")
+print("\n=== ⑨ 静态：后台建页点都汇入同一漏斗（判据不会漏改）===")
 src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
 check("判据唯一实现在 `_cloud_new_tab_should_focus`",
       src.count("def _cloud_new_tab_should_focus") == 1
@@ -257,8 +257,14 @@ check("漏斗内按 frozen / jobs 为空判定",
 check("`switch_tab=False` 时经判据提升",
       "if not switch_tab and self._cloud_new_tab_should_focus():" in src)
 _bg_calls = re.findall(r"_add_cloud_tasks_to_new_tab\(ready_tasks, switch_tab=False\)", src)
-check("三处后台调用点仍是 switch_tab=False（无障碍 + 预约两处）",
-      len(_bg_calls) == 3, f"count={len(_bg_calls)}")
+# 2026-11-02 起预约单「未到点不进标签页」：`_evaluate_scheduled_order` 就绪只标 queued，
+# 后台建页点从 3 处减为 2 处 —— 无障碍 `_process_auto_print_order` 与到点的
+# `_fire_scheduled_print`。两个入口都必须继续走 switch_tab=False 这个漏斗。
+check("两处后台调用点仍是 switch_tab=False（无障碍 + 预约到点）",
+      len(_bg_calls) == 2, f"count={len(_bg_calls)}")
+check("预约就绪不再建标签页（只标 queued）",
+      src.count('st["queued"] = True') == 1,
+      "`_evaluate_scheduled_order` 就绪分支应只有一处置 queued、且不建页")
 
 for w in (w1, w2, w3, w4, w5, w5b, w6, w7, w7b, w8):
     try:

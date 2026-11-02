@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -278,7 +279,9 @@ def _format_engine_label(ext: str) -> str:
     if ext in (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"):
         return "图片渲染"
     if ext in (".xls", ".xlsx"):
-        return "LibreOffice"
+        # 2026-11-02：表格走 Excel/WPS 自己的排版（ExportAsFixedFormat），
+        # 与用户在 Excel 里「打印」出来的结果一致；LibreOffice 只在两者都没装时兜底。
+        return "Excel"
     if ext == ".pdf":
         return "直接打印"
     return "—"
@@ -2371,6 +2374,14 @@ class _DeferManualDuplex(Exception):
 # （队列卡住 / 打印机离线）就按既有「队列没排空」口径继续，绝不把整个流程吊死。
 QUEUE_GATE_TIMEOUT_SEC = 120.0
 
+# 攒批第 1 趟开打前的「出纸槽静默期」（秒）：上一单刚出完纸，得给操作员时间把它拿走。
+# 2026-11-02 事故（订单 HN20261102-0003 判失败）：它的 2 张纸 08:19:08 刚交给 spooler，
+# 08:19:12 攒批第 1 趟就开打 —— 那 2 张还躺在出纸槽里，被整叠压住；08:21 人工翻纸时
+# 连它们一起翻面，背面印上了别人的内容（整单作废，用户 08:32 重传了一遍）。
+# 攒批的"出纸槽独占"（铁律①）只认内部账本 `_stack.count`，从不问物理槽里有没有刚出的纸
+# ⇒ 用 spooler 队列 + 这个静默期把缺口补上（只拦"作为新单入叠"，普通打印不受影响）。
+STACK_TRAY_SETTLE_SEC = 60.0
+
 
 def count_pending_print_jobs(printer_name: str = "") -> int:
     """打印队列里还有几个作业（**只读**：不发、不删、不暂停任何作业）。
@@ -4162,7 +4173,40 @@ class ConvertWorker(QThread):
             if self._cancelled:
                 self.finished.emit(self._row, self._file_path, "", 0, "")
                 return
-            if (ext in (".doc", ".docx") and self._engine != "libreoffice"
+            if ext in (".xls", ".xlsx"):
+                # 2026-11-02：表格交给 Excel/WPS 自己排版（Worksheet.ExportAsFixedFormat），
+                # 与用户在 Excel 里按「打印」得到的结果一致；代码**不得**改写页边距/缩放/
+                # 打印区域（见 xlsx_printer.py 模块说明）。
+                # 产物按「引擎身份」命名落盘：Excel / WPS / LibreOffice 的版式不同，
+                # 同一条缓存记录不能混用（缓存 key = md5 + _x{excel|wps|lo}）。
+                import xlsx_printer as _xp
+                if self._source_md5:
+                    _tmp_out = os.path.join(
+                        cache_dir, f".xlsx_{self._source_md5[:8]}_{os.getpid()}.pdf")
+                else:
+                    import tempfile as _tf
+                    _fd, _tmp_out = _tf.mkstemp(suffix=".pdf", prefix="_xlsx_")
+                    os.close(_fd)
+                try:
+                    _res = _xp.export_to_pdf(self._file_path, _tmp_out,
+                                             from_cloud=self._from_cloud,
+                                             allow_cloud_com=self._allow_cloud_com)
+                except Exception:
+                    # 失败不留半成品在 pdf_cache（.xlsx_*.pdf 会被当成孤儿文件）
+                    if os.path.isfile(_tmp_out):
+                        try:
+                            os.remove(_tmp_out)
+                        except OSError:
+                            pass
+                    raise
+                if self._source_md5:
+                    _target = os.path.join(
+                        cache_dir, _xp.cache_key(self._source_md5, "", _res.engine) + ".pdf")
+                    os.replace(_res.pdf_path, _target)
+                    temp_pdf = _target
+                else:
+                    temp_pdf = _res.pdf_path
+            elif (ext in (".doc", ".docx") and self._engine != "libreoffice"
                     and (not self._from_cloud or self._allow_cloud_com)):
                 # ⚠ 云端来源默认在上一行就被挡住（S1-04）：走 else 分支交给
                 #   converter.convert(from_cloud=True) ⇒ LibreOffice，绝不给 Word/WPS 机会。
@@ -5231,6 +5275,12 @@ class MainWindow(QMainWindow):
         # 防止第 2 趟期间混进新单后被一起当成品 report_success（🔴-3 的第二道防线）
         self._stack_flush_snapshot: list = []
         self._stack_pending_ctx: dict = {}   # 正在打第 1 趟的那一单的上下文（见 _start_stack_entry）
+        # 出纸槽里「刚出来、还没被拿走」的纸（2026-11-02 事故的闸门，见 _stack_tray_busy_reason）：
+        # `_last_tray_risk_ts` = 最近一次普通批次打完的时刻；排队重试用 `_stack_entry_retry_timer`。
+        self._last_tray_risk_ts: float = 0.0
+        self._stack_entry_retry_timer = QTimer(self)
+        self._stack_entry_retry_timer.setSingleShot(True)
+        self._stack_entry_retry_timer.timeout.connect(self._drain_stack_entry_queue)
         # 打印中保活：作业进行中每 60 秒刷新后端 locked_at（见 _tick_keepalive）
         self._keepalive_timer = QTimer(self)
         self._keepalive_timer.setInterval(60_000)
@@ -5325,6 +5375,12 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"应用转换沙箱开关失败: {e}")
         self._init_cloud_client()
+        # 恢复上次会话未打印的预约单（后端只重推 queued 任务，已 accept 的预约单重启后
+        # 不会再来一次 —— 不自己恢复就是静默丢单，见 2026-11-02 #951）
+        try:
+            self._load_scheduled_state()
+        except Exception as e:
+            logger.error(f"恢复预约单失败: {e}")
 
         # ── 启动日志：让日志区启动即有内容 ──
         # （打包版默认不内置服务器地址/令牌，未配云端时也明确提示用户，避免误以为日志功能异常）
@@ -5729,6 +5785,8 @@ class MainWindow(QMainWindow):
         self._cloud_client.printer_state.connect(self._on_cloud_printer_state)
         # 移动端远程切换「🖐 攒批模式」（2026-10）：云端下发 → 主线程校验忙闲后再执行
         self._cloud_client.stack_mode_requested.connect(self._on_remote_stack_mode)
+        # 云端**离线期望**补发（2026-11 需求 2）：reason=offline_intent，先比对本地再决定切不切
+        self._cloud_client.stack_intent_requested.connect(self._on_remote_stack_intent)
         # S1-01：本机专用 token 自签成功 / 被判失效 → 持久化或清除
         self._cloud_client.token_issued.connect(self._on_cloud_token_issued)
         self._cloud_client.token_invalid.connect(self._on_cloud_token_invalid)
@@ -6677,16 +6735,29 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _ensure_visible_for_close_dialog(self):
+        """退出流程要弹确认框之前，才把藏在托盘里的主窗口叫回前台。
+
+        为什么不再在 _quit_app 里无条件 `_restore_from_tray()`（2026-11-01 现场）：
+        用户从托盘点「退出」时，如果没有任何需要确认的东西（订单全打完 / 标签页全空），
+        程序只是"亮一下再死"—— 那个 show() 会闪出一个还没来得及重绘的白窗口，紧接着
+        进程退出（现场原话：「突然置于前台然后画面全白，然后退出」）。确认框都是主窗口的
+        子窗口，看不见父窗口等于没弹，所以只在真要问的时候才 show，别的路径一帧都不亮。
+        """
+        try:
+            if not self.isVisible():
+                self._restore_from_tray()
+        except Exception as e:
+            logger.debug(f"退出前恢复主窗口失败（继续退出）: {e}")
+
     def _quit_app(self):
         """真正的退出（关窗口只是收回托盘）。
 
         三个入口共用：文件 → 退出、托盘 → 退出、更新安装前自动退出。
-        窗口藏在托盘里时先叫回前台 —— 退出前的确认框（未完成标签页 / 打印进行中 /
-        攒批纸叠）都挂在主窗口上，弹在隐藏窗口后面等于没弹。
+        窗口藏在托盘里时**不**预先叫回前台 —— 只有 closeEvent 里真要弹确认框时才 show
+        （见 _ensure_visible_for_close_dialog；否则会闪一下白窗口）。
         """
         self._force_quit = True
-        if not self.isVisible():
-            self._restore_from_tray()
         self.close()
         # closeEvent 里任何一处 event.ignore()（用户改主意）都会把 _force_quit 复位，
         # 走到这里还亮着 ⇒ 真的退：收掉托盘图标再退进程（否则通知区留残影）。
@@ -7838,7 +7909,22 @@ class MainWindow(QMainWindow):
         return tab.frozen if tab else False
 
     def _set_current_jobs(self, jobs: list[PrintJob]):
-        """设置当前标签页的任务列表并保存配置。"""
+        """设置当前标签页的任务列表并保存配置。
+
+        🛑 2026-11-02 现场事故（HN20261102-0005 打了三份、0006/0007 一页未打）：
+        两个标签页**共用同一个 jobs 列表对象**时，在前台页点「开始打印」打出来的是
+        另一页的文件。根因在 `_on_convert_finished` 尾部把后台标签页的列表对象整表赋给
+        前台页（那里已加守卫）。这里再补一道硬防御：传进来的列表若正被**别的**标签页
+        持有，一律复制一份再存 —— 宁可在日志里喊一声，也绝不让两页共享同一份文件清单。
+        """
+        if isinstance(jobs, list):
+            for key, other in self._config.tabs.items():
+                if key != self._current_tab and other.jobs is jobs:
+                    logger.error(
+                        f"标签页 {self._current_tab} 与 {key} 试图共享同一份任务列表对象，"
+                        f"已复制一份隔离（调用方传错了列表，请查调用栈）")
+                    jobs = list(jobs)
+                    break
         if self._current_tab in self._config.tabs:
             self._config.tabs[self._current_tab].jobs = jobs
         self._save_config()
@@ -8913,6 +8999,32 @@ class MainWindow(QMainWindow):
             if self._copy_detail_btn:
                 self._copy_detail_btn.setEnabled(True)
 
+    def _reveal_in_explorer(self, path: str) -> bool:
+        """在资源管理器里打开所在文件夹，**并把这个文件选中**（右键菜单「打开文件位置」）。
+
+        旧实现是 `os.startfile(os.path.dirname(p))` —— 只开目录，文件还得自己在一屏几十个
+        文件里找（2026-11-01 用户现场）。Explorer 的 `/select,` 能直接高亮定位。
+        两个坑：① 必须把 `/select,"路径"` 拼成**一个**参数字符串交给 explorer，分开传会被
+        当成两个目标（反而打开"文档"库）；② explorer.exe 找不到目标时会自己打开"此电脑"
+        并返回成功，所以这里先自己校验文件存在。
+        失败一律退回"只打开目录"（fail-open：这个菜单永远不该点了没反应）。
+        """
+        p = os.path.abspath(str(path or ""))
+        if not p or not os.path.isfile(p):
+            return False
+        try:
+            if os.name == "nt":
+                subprocess.Popen(f'explorer /select,"{p}"')
+                return True
+        except Exception as e:
+            logger.debug(f"资源管理器 /select 失败，回退为打开目录: {e}")
+        try:
+            os.startfile(os.path.dirname(p))
+            return True
+        except Exception as e:
+            logger.debug(f"打开文件所在目录也失败（{p}）: {e}")
+            return False
+
     def _job_user_path(self, row: int, default: str = "") -> str:
         """返回该行任务对应的「用户可见路径」：优先原件（source_path），否则列表使用的路径。
         列表任务用的是暂存副本，双击打开/打开文件位置都应指向用户自己那份文件。"""
@@ -9434,9 +9546,9 @@ class MainWindow(QMainWindow):
             if name_item:
                 fp = self._job_user_path(anchor_row, name_item.data(Qt.UserRole) or "")
                 open_action = menu.addAction("📂 打开文件位置")
-                open_action.triggered.connect(lambda checked=False, p=fp: (
-                    os.startfile(os.path.dirname(p)) if p and os.path.isfile(p) else None
-                ))
+                open_action.setToolTip("在资源管理器中打开所在文件夹，并把这个文件选中")
+                open_action.triggered.connect(lambda checked=False, p=fp:
+                                              self._reveal_in_explorer(p))
                 menu.addSeparator()
 
         # 粘贴（标签页已固定时禁用）
@@ -9498,6 +9610,17 @@ class MainWindow(QMainWindow):
                 source_md5=getattr(job, 'source_md5', ''),
                 source_path=getattr(job, 'source_path', ''),
                 display_name=job.display_name,
+                # ── 检测结果照抄（同一个文件，结论不会变；页数未知的下面会重测）──
+                # 2026-11-01 现场 bug：以前这几项没传 ⇒ 复制到新标签页后末尾空白页的
+                # ⚠ 消失、右侧「排除末尾空白页（N 页）」灰掉，而 page_range（如 1-5）
+                # 照抄 —— 于是末尾空白页会被**悄悄打出来**，操作员完全看不出来。
+                blank_tail=int(getattr(job, 'blank_tail', 0) or 0),
+                blank_undo_range=getattr(job, 'blank_undo_range', None),
+                missing_fonts=list(getattr(job, 'missing_fonts', []) or []),
+                nonembedded_fonts=list(getattr(job, 'nonembedded_fonts', []) or []),
+                font_checked=bool(getattr(job, 'font_checked', False)),
+                # 字体指纹照抄：换了系统字体后指纹对不上会自动重查（见 font_check.py）
+                font_fp=getattr(job, 'font_fp', ''),
                 # ── 订单身份清零：新标签页 = 新订单（绝不继承旧单的号/云端 ID/完成标记）──
                 task_id=0,
                 order_id=0,
@@ -9522,6 +9645,28 @@ class MainWindow(QMainWindow):
                 job.orientation = info.get("orientation", "") or job.orientation
             except Exception as e:
                 logger.debug(f"复制到新标签页时读取 PDF 页数失败: {e}")
+
+        # 末尾空白页：在这个文件上**重新检测一次**（不继承旧结果）。
+        # 2026-11-01 现场 bug 的第二半：新标签页只要没跑检测就必然没有 ⚠。
+        # 重测而不是纯照抄，是因为旧标签页可能是修复前建的（blank_tail 记错了），
+        # 而 one-page 栅格化最多 8 页、几毫秒的事，宁可以这次的结果为准。
+        # ⚠ 只写 blank_tail（文件事实），**不**在这里调 split_tail_blank —— 排除是操作员的
+        # 动作（唯一入口 _set_blank_tail_excluded），自动路径只标不排（见验收 ⑥）。
+        for job in new_jobs:
+            path = getattr(job, 'file_path', '') or ''
+            if not path or os.path.splitext(path)[1].lower() != ".pdf":
+                continue
+            if job.page_count <= 0:
+                continue        # 连页数都不知道，检测没有意义（blank_tail 只用于末尾 N 页）
+            try:
+                tail = int(self._detect_blank_tail(path) or 0)
+            except Exception as e:
+                logger.debug(f"复制到新标签页时重测末尾空白页失败: {e}")
+                tail = int(getattr(job, 'blank_tail', 0) or 0)
+            job.blank_tail = max(0, min(tail, job.page_count))
+            if job.blank_tail <= 0:
+                # 没检出空白页 ⇒ 没有"已排除"可言（别留一个点了没反应的恢复态）
+                job.blank_undo_range = None
 
         new_key = self._next_tab_key()
         new_tab = self._make_new_tab()
@@ -10513,11 +10658,20 @@ class MainWindow(QMainWindow):
                     source_md5 = m.hexdigest()
             except Exception:
                 source_md5 = ""
-        # 检查本地 PDF 缓存（图片按方向后缀、docx 按转换引擎分开）
+        # 检查本地 PDF 缓存（图片按方向后缀、docx 按转换引擎分开、表格按表格引擎分开）
+        _ext_of_file = os.path.splitext(file_path)[1].lower()
         if source_md5:
             # 引擎后缀判定统一走 cache_engine_for（写/读/打印三侧同一口径）
             _cache_engine = cache_engine_for(file_path, engine)
-            if self._cloud_client:
+            if _ext_of_file in (".xls", ".xlsx"):
+                # 表格：缓存 key 带表格引擎身份（Excel / WPS / LibreOffice 版式不同），
+                # 由 xlsx_printer 按「当前可用引擎」优先级探测；只认当前仍可用引擎的产物。
+                import paths as _paths_x
+                import xlsx_printer as _xp
+                cached_pdf = _xp.find_cached_pdf(source_md5, image_orientation,
+                                                 cache_dir=_paths_x.pdf_cache_dir())
+                cached_meta = {}
+            elif self._cloud_client:
                 cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
                     source_md5, image_orientation, _cache_engine)
             else:
@@ -11076,7 +11230,7 @@ class MainWindow(QMainWindow):
 
     def _can_paste_files(self) -> bool:
         """检查剪贴板是否包含可粘贴的文件。"""
-        allowed = {".pdf", ".doc", ".docx", ".txt", ".md",
+        allowed = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".md",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         # 1. 来自文件管理器的 URL 列表
         # mimeData() 可能是 None（剪贴板无属主/远程会话/offscreen 平台）——不能直接解引用，
@@ -11134,7 +11288,7 @@ class MainWindow(QMainWindow):
 
     def _on_paste_files(self):
         """从剪贴板粘贴文件，支持文件管理器复制和纯文本路径。"""
-        allowed = {".pdf", ".doc", ".docx", ".txt", ".md",
+        allowed = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".md",
                    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         files: list[str] = []
         # S0-09：HTML 已永久不支持 —— 单独收集，给明确提示而不是默默忽略
@@ -11171,16 +11325,17 @@ class MainWindow(QMainWindow):
         elif not files:
             QMessageBox.information(self, "粘贴", "剪贴板中没有可识别的文件。\n\n"
                                     "请先在文件管理器中复制文件(Ctrl+C)，再来粘贴。\n"
-                                    "支持格式: PDF, Word(.doc/.docx), "
+                                    "支持格式: PDF, Word(.doc/.docx), 表格(.xls/.xlsx), "
                                     "文本(.txt/.md), 图片(.jpg/.png/.bmp等)")
 
     def _on_add_files(self):
         """通过文件对话框添加文件。"""
         file_filter = (
-            "所有支持格式 (*.pdf *.doc *.docx *.txt *.md"
+            "所有支持格式 (*.pdf *.doc *.docx *.xls *.xlsx *.txt *.md"
             " *.jpg *.jpeg *.png *.bmp *.gif *.webp);;"
             "PDF (*.pdf);;"
             "Word 文档 (*.doc *.docx);;"
+            "表格 (*.xls *.xlsx);;"
             "文本 (*.txt *.md);;"
             "图片 (*.jpg *.jpeg *.png *.bmp *.gif *.webp);;"
             "所有文件 (*.*)"
@@ -12067,13 +12222,25 @@ class MainWindow(QMainWindow):
             logger.debug(f"攒批忙闲判定失败（按空闲处理）: {e}")
         return ""
 
-    def _report_stack_state(self, note: str = ""):
-        """把本机攒批模式 + 忙闲报给云端（移动端据此显示状态、判断能否远程切换）。"""
+    def _report_stack_state(self, note: str = "", request_id: str = "",
+                            intent_applied: bool | None = None):
+        """把本机攒批模式 + 忙闲报给云端（移动端据此显示状态、判断能否远程切换）。
+
+        `request_id`/`intent_applied`（2026-11 需求 2）只在答复"离线期望"时才给：
+        True=期望已生效，False=这次没执行（云端保留期望下次再试），默认 None=常规心跳。
+        """
         cc = getattr(self, "_cloud_client", None)
         if cc is None or not hasattr(cc, "report_stack_state"):
             return
+        args = (self._stack_mode_on(), bool(self._stack_busy_reason()), note)
         try:
-            cc.report_stack_state(self._stack_mode_on(), bool(self._stack_busy_reason()), note)
+            cc.report_stack_state(*args, request_id=request_id, intent_applied=intent_applied)
+        except TypeError:
+            # 兼容只有 3 参签名的旧客户端 / 验收脚本里的 stub（新字段它们不认识）
+            try:
+                cc.report_stack_state(*args)
+            except Exception as e:
+                logger.debug(f"上报攒批状态失败: {e}")
         except Exception as e:
             logger.debug(f"上报攒批状态失败: {e}")
 
@@ -12110,38 +12277,126 @@ class MainWindow(QMainWindow):
         # `_sync_stack_button()` 在"一直打"的不变状态里不会动，读秒就会冻住。
         self._sync_stack_button()
 
-    def _on_remote_stack_mode(self, enable: bool, by: str = ""):
+    def _on_remote_stack_mode(self, enable: bool, by: str = "",
+                              intent_request_id: str | None = None):
         """（主线程）移动端下发的攒批模式切换。执行前**再自查一次**适用性与忙闲。
 
         适用性与服务端 `_stack_needs_manual_flip` 同口径：只对「不支持自动双面、需人工翻纸」的
         机型放行 —— 服务端镜像可能过期（用户刚把打印机换成自动双面的那台），设备端必须自己再拦一次。
+
+        2026-11 需求 2：`intent_request_id is not None` ⇒ 这是**离线时期望值的上线补发**
+        （云端 `set_stack_mode` 带 reason=offline_intent）。这种指令先跟本地
+        `duplex_stack_mode` 比对：一致就只回报（intent_applied=True），不一致才走既有切换
+        路径（忙闸门一个字不改，拒绝时回报 intent_applied=False，云端保留期望下次再试）。
         """
         want = bool(enable)
+        intent = intent_request_id is not None
+        rid = intent_request_id or ""
+        tag = "[stack_intent] " if intent else ""
         if want and not self._stack_applicable():
             why = self._stack_inapplicable_reason()
-            self._log(f"📱 移动端请求开启「🖐 攒批模式」被拒：{why}")
-            self._report_stack_state(f"未执行：{why}")
+            self._log(f"{tag}📱 移动端请求开启「🖐 攒批模式」被拒：{why}")
+            self._report_stack_state(f"未执行：{why}", request_id=rid,
+                                     intent_applied=False if intent else None)
+            return
+        if intent and bool(getattr(self._config, "duplex_stack_mode", False)) == want:
+            # 本地配置已经是期望值 —— 这条补发唯一要做的事就是让云端知道"落地了"
+            self._log(f"[stack_intent] 云端期望攒批={'开' if want else '关'}，"
+                      f"本地配置一致 → 无需切换，回报已生效")
+            self._report_stack_state(
+                f"已与云端一致（本地攒批模式{'已开' if want else '已关'}）",
+                request_id=rid, intent_applied=True)
             return
         has_entries = bool(getattr(getattr(self, "_stack", None), "entries", None))
         if (not want) and (not has_entries) and (not self._stack_busy()):
             # 与本地开关同口径：只剩排队的请求不算"忙"，关掉后立刻按普通打印放行
-            self._log(f"📱 移动端关闭「🖐 攒批模式」{f'（操作者：{by}）' if by else ''}")
-            self._apply_stack_mode(False, source="移动端")
+            self._log(f"{tag}📱 移动端关闭「🖐 攒批模式」{f'（操作者：{by}）' if by else ''}")
+            self._apply_stack_mode(False, source="移动端", request_id=rid, intent=intent)
             self._flush_stack_queues_as_normal()
             return
         busy = self._stack_busy_reason()
         if busy:
-            self._log(f"📱 移动端请求{'开启' if want else '关闭'}「🖐 攒批模式」被拒："
-                      f"打印机正忙（{busy}）")
-            self._report_stack_state(f"打印机正忙（{busy}），未执行")
+            if intent:
+                self._log(f"[stack_intent] 设备忙（{busy}），暂不切换，云端会保留期望下次再试")
+            else:
+                self._log(f"📱 移动端请求{'开启' if want else '关闭'}「🖐 攒批模式」被拒："
+                          f"打印机正忙（{busy}）")
+            self._report_stack_state(f"打印机正忙（{busy}），未执行", request_id=rid,
+                                     intent_applied=False if intent else None)
             return
         if want == self._stack_mode_on():
-            self._log("📱 移动端请求的攒批模式与当前一致，无需改动")
-            self._report_stack_state(f"状态未变（已是{'开启' if want else '关闭'}）")
+            self._log(f"{tag}📱 移动端请求的攒批模式与当前一致，无需改动")
+            self._report_stack_state(f"状态未变（已是{'开启' if want else '关闭'}）",
+                                     request_id=rid,
+                                     intent_applied=True if intent else None)
             return
         who = f"（操作者：{by}）" if by else ""
-        self._log(f"📱 移动端{'开启' if want else '关闭'}「🖐 攒批模式」{who}")
-        self._apply_stack_mode(want, source="移动端")
+        self._log(f"{tag}📱 移动端{'开启' if want else '关闭'}「🖐 攒批模式」{who}")
+        self._apply_stack_mode(want, source="移动端", request_id=rid, intent=intent)
+
+    def _on_remote_stack_intent(self, enable: bool, by: str = "", request_id: str = ""):
+        """（主线程）云端补发的「离线期望」→ 转给统一入口，带上 request_id 以便回报配对。"""
+        self._on_remote_stack_mode(enable, by, intent_request_id=request_id or "offline")
+
+    @staticmethod
+    def _stack_pending_from_state(state) -> tuple | None:
+        """从 printer_state / register 回包中取"云端待落地的攒批期望"。
+
+        返回 (enable, by, request_id)；没有待落地期望 → None。
+        兼容两种字段名（`stack_pending` / `stack_intent`）与两种形态：
+        bool（只有开/关）或 dict（{"enable"/"mode", "by", "request_id"}）。
+        顺序即优先级：先看 stack_pending，再兜底 stack_intent。
+        """
+        if not isinstance(state, dict):
+            return None
+        for key in ("stack_pending", "stack_intent", "stack_mode_pending"):
+            if key not in state:
+                continue
+            raw = state.get(key)
+            if raw is None or raw is False:
+                continue
+            if isinstance(raw, dict):
+                if raw.get("enable") is None and raw.get("mode") is None:
+                    continue
+                return (bool(raw.get("enable", raw.get("mode"))),
+                        str(raw.get("by") or ""), str(raw.get("request_id") or ""))
+            return (bool(raw), str(state.get("stack_pending_by") or ""),
+                    str(state.get("stack_pending_request_id") or ""))
+        return None
+
+    def _reconcile_stack_intent(self, state=None):
+        """连接建立后 / 收到接单状态时，把云端"离线期望"对账一次（2026-11 需求 2）。
+
+        不新造 HTTP 轮询：期望值只会跟着 `printer_state`（或 register 回包）到设备，
+        服务端没推就什么都不做（它会在连通后用 `set_stack_mode reason=offline_intent` 补发）。
+        同一条期望只处理一次（`_stack_intent_sig`）：心跳反复推同一个 stack_pending 时
+        不会每 2 秒刷一遍日志、也不会把"设备忙被拒"变成死循环；断开连接时清空该记号，
+        重连后允许再试一次。
+        """
+        try:
+            if state is None:
+                # 没带参数（连接建立时调用）→ 用缓存/客户端记着的最后一份接单状态
+                state = getattr(self, "_cloud_printer_state_cache", None)
+            if state is None:
+                state = getattr(getattr(self, "_cloud_client", None), "last_printer_state", None)
+            pending = self._stack_pending_from_state(state)
+            if pending is None:
+                # 没有待落地期望：什么都不做。记号**不**在这里清 —— 服务端清掉期望后
+                # 同一个 request_id 不该再被处理一遍；重连（connection_changed(False)）
+                # 或换一个新 request_id 才会重新尝试。
+                return
+            enable, by, rid = pending
+            sig = (bool(enable), rid or by)
+            if sig == getattr(self, "_stack_intent_sig", None):
+                return          # 同一条期望已经处理过
+            self._stack_intent_sig = sig
+            local = bool(getattr(self._config, "duplex_stack_mode", False))
+            self._log(f"[stack_intent] 上线对账：云端期望攒批={'开' if enable else '关'}"
+                      f"{f'（操作者：{by}）' if by else ''}，本地={'开' if local else '关'}"
+                      f" → {'一致，直接回报' if local == bool(enable) else '需要切换'}")
+            self._on_remote_stack_mode(enable, by, intent_request_id=rid or "reconcile")
+        except Exception as e:     # 信号/定时器路径绝不能抛
+            logger.debug(f"[stack_intent] 上线对账失败: {e}")
 
     def _uses_manual_duplex_job(self, job) -> bool:
         """单个任务是否要"程序自己分两趟 + 人工翻纸"（与 PrintWorker._uses_manual_duplex 同口径）。
@@ -12280,10 +12535,13 @@ class MainWindow(QMainWindow):
             return
         self._apply_stack_mode(want, source="本地")
 
-    def _apply_stack_mode(self, enable: bool, source: str = "本地"):
+    def _apply_stack_mode(self, enable: bool, source: str = "本地",
+                          request_id: str = "", intent: bool = False):
         """真正切换攒批模式（本地勾选框与移动端指令共用）：落盘 + 同步 UI + 上报云端。
 
         调用方已保证 `_stack_applicable()`（当前机型确实需要攒批）—— 本方法只管落盘与显示。
+        `request_id`/`intent`（2026-11 需求 2）：这条切换是在答复云端"离线期望"时回带 id，
+        并回报 intent_applied=True（云端据此清掉待落地期望）。
         """
         enable = bool(enable)
         self._config.duplex_stack_mode = enable
@@ -12312,7 +12570,9 @@ class MainWindow(QMainWindow):
         self._last_stack_sig = (self._stack_mode_on(), self._stack_busy_reason())
         self._report_stack_state(
             f"攒批模式已{'开启' if enable else '关闭'}"
-            + ("（来自移动端）" if source == "移动端" else ""))
+            + ("（来自移动端）" if source == "移动端" else ""),
+            request_id=request_id,
+            intent_applied=True if intent else None)
 
     def _on_stack_button(self):
         """点底部「🖐 攒批 N张/M单」：叫出**攒批列表**（常驻窗；模式开启时它本就在）。
@@ -12541,6 +12801,33 @@ class MainWindow(QMainWindow):
             return True, "", sheets, unknown
         return False, adm.message(self._stack), sheets, unknown
 
+    def _stack_tray_busy_reason(self) -> str:
+        """攒批第 1 趟能不能开打：出纸槽里有没有「刚出来、还没被拿走」的纸。
+
+        为什么必须有这道闸门（2026-11-02 事故）：`_stack_open_for_business()` 只看内部账本
+        `_stack.count` —— 账本空就认为出纸槽可用。但上一单（普通打印 / 无障碍补打）刚把纸
+        吐进槽里、操作员还没拿走时账本同样是空的 ⇒ 攒批第 1 趟的纸直接盖在它上面，人工
+        翻纸时一起翻过去，那几张纸的背面就印上了别人的内容（HN20261102-0003 整单作废）。
+
+        两条判据：① spooler 里还有作业（纸还在出）；② 普通批次刚打完不到
+        `STACK_TRAY_SETTLE_SEC`（纸出来了，但未必已被拿走）。
+        返回 "" = 可以开打；否则返回给人看的原因（调用方排队 + 定时重试，绝不静默丢单）。
+        """
+        # 主窗口的打印机名在配置里（`_config.printer_name`），不是 `_printer_name`
+        # —— 别照抄 Worker 的属性名，否则非 GUI 构造的窗口会 AttributeError。
+        _queue = getattr(getattr(self, "_config", None), "printer_name", "") or ""
+        _pending = count_pending_print_jobs(_queue)
+        if _pending > 0:
+            return f"打印队列里还有 {_pending} 个作业（上一单的纸还在出）"
+        try:
+            _age = time.time() - float(getattr(self, "_last_tray_risk_ts", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            _age = float(STACK_TRAY_SETTLE_SEC) + 1.0
+        if 0 <= _age < STACK_TRAY_SETTLE_SEC:
+            return (f"上一单 {int(_age)} 秒前刚打完，纸可能还在出纸槽里"
+                    f"（需静默 {int(STACK_TRAY_SETTLE_SEC)} 秒）")
+        return ""
+
     def _start_stack_entry(self, flat_jobs: list, tab_key: str) -> bool:
         """把这一批任务作为**新的一单**打进纸叠（只打第 1 趟）。
 
@@ -12565,6 +12852,14 @@ class MainWindow(QMainWindow):
             return self._queue_stack_entry(
                 flat_jobs, tab_key,
                 "上一单的第 1 趟还在打" if busy_worker else "正在启动上一单的打印")
+        # 打印机空闲 ≠ 出纸槽干净：上一单的纸可能还在槽里（2026-11-02 事故）⇒ 排队 + 5 秒重试，
+        # 不能让本单第 1 趟盖在别人的纸上（本单不丢，操作员不用重复点）。
+        _tray = self._stack_tray_busy_reason()
+        if _tray:
+            _queued = self._queue_stack_entry(flat_jobs, tab_key, _tray)
+            if _queued:
+                self._stack_entry_retry_timer.start(5000)
+            return _queued
         return self._begin_stack_entry(flat_jobs, tab_key, rotate)
 
     def _queue_stack_entry(self, flat_jobs: list, tab_key: str, reason: str) -> bool:
@@ -12621,6 +12916,14 @@ class MainWindow(QMainWindow):
                 jobs = kept
             if not jobs:
                 continue
+            # 打印机空出来了 ≠ 出纸槽干净（2026-11-02 事故）：上一单的纸可能还在槽里，
+            # 这时开打第 1 趟会把本单盖在别人的纸上 ⇒ 放回队首，5 秒后再试（本单不丢）。
+            _tray = self._stack_tray_busy_reason()
+            if _tray:
+                self._stack_entry_wait.insert(0, req)
+                self._log(f"⏸ 攒批排队：{_tray} —— 5 秒后自动重试（本单不丢）")
+                self._stack_entry_retry_timer.start(5000)
+                break
             ok, reason, _sheets, _unknown = self._admit_stack_entry(jobs)
             if not ok:
                 self._park_print_request(jobs, req.get("tab_key") or None, reason)
@@ -12630,6 +12933,9 @@ class MainWindow(QMainWindow):
                 self._log("⚠ 排队的攒批单启动失败，已移出队列"
                           "（文件还在对应标签页，可重新点「开始打印」）")
                 break
+        if not self._stack_entry_wait:
+            # 队列空了就别再空转（否则 5 秒后还会被定时器白唤醒一次）
+            self._stack_entry_retry_timer.stop()
 
     def _begin_stack_entry(self, flat_jobs: list, tab_key: str, rotate: bool) -> bool:
         """真正启动一单第 1 趟（`_stack_pending_ctx` 只在这里写，失败就地回滚）。"""
@@ -13041,17 +13347,34 @@ class MainWindow(QMainWindow):
                 "等待中（补打）", [], sheets_text="—", source="云端自动",
                 content=(f"订单 #{item.get('order_id', '?')} · {len(tids)} 个文件"
                          if tids else f"订单 #{item.get('order_id', '?')}"))
+        _now_ts = int(time.time())
         for oid, st in (getattr(self, "_scheduled_orders", None) or {}).items():
             try:
                 if st.get("printed"):
                     continue
                 n_files = len(st.get("ready") or {}) + len(st.get("pending") or {})
                 ts = int(st.get("target_ts") or 0)
-                eta = (datetime.fromtimestamp(ts).strftime("预约 %H:%M") if ts > 0 else "—")
+                if ts > 0:
+                    _left = ts - _now_ts
+                    _when = datetime.fromtimestamp(ts).strftime("%H:%M")
+                    if _left > 0:
+                        _mm, _ss = divmod(_left, 60)
+                        _hh, _mm = divmod(_mm, 60)
+                        _span = (f"{_hh} 小时 {_mm} 分" if _hh else
+                                 (f"{_mm} 分 {_ss} 秒" if _mm else f"{_ss} 秒"))
+                        eta = f"预约 {_when}（还剩 {_span}）"
+                    else:
+                        eta = f"预约 {_when}（已到点）"
+                else:
+                    eta = "—"
+                tab_key = st.get("tab_key")
+                if tab_key and (worker_running or flush_running):
+                    continue        # 已经在打了：由上面「进行中」那几行显示
+                state = "等待中（预约）" if not tab_key else "等待中（预约·已建页）"
             except Exception:
                 continue
             rows.append({
-                "state": "等待中（预约）", "source": "预约",
+                "state": state, "source": "预约",
                 "content": f"预约单 #{oid} · {n_files} 个文件",
                 "sheets": "—", "eta": eta, "active": False,
             })
@@ -14173,6 +14496,10 @@ class MainWindow(QMainWindow):
         total = success_count + fail_count
         status = "✅ 全部成功" if fail_count == 0 else f"⚠️ 成功 {success_count} / 失败 {fail_count}"
         self._status_label.setText(f"🔒 已完成：{status}（共 {total} 个任务）")
+        # 普通批次刚打完：纸已经进了出纸槽、但操作员未必马上拿走。记下时刻，攒批第 1 趟
+        # 在 STACK_TRAY_SETTLE_SEC 内不往这一槽里堆新纸（2026-11-02 事故，见该常量注释）。
+        # 攒批单的第 1 趟不走这里（上面已 return）—— 那些纸本来就是要留在槽里的。
+        self._last_tray_risk_ts = time.time()
 
         if fail_count > 0:
             QMessageBox.warning(
@@ -14829,6 +15156,8 @@ class MainWindow(QMainWindow):
             "timer": None, "print_timer": None,
             "frozen": False, "delayed_sent": False, "printed": False,
             "printed_ts": 0, "tab_key": None, "retry_count": 0,
+            # queued：文件已全部下载到本地、但还没到点（不进标签页，见 _evaluate_scheduled_order）
+            "queued": False,
         })
         if st["printed"]:
             self._log(f"⏰ 预约单 #{oid} 已开始打印，迟到的文件 {task.file_name} 将不再自动打印")
@@ -14843,6 +15172,8 @@ class MainWindow(QMainWindow):
         self._log(f"⏰ 预约单 #{oid}: 收到文件 {task.file_name}"
                   + (f"，目标 {self._fmt_sched(ts)}" if ts else ""))
         self._restart_scheduled_debounce(oid)
+        self._save_scheduled_state()
+        self._sync_scheduled_queue_window()
 
     def _update_scheduled_task(self, task: CloudTask):
         """预约单任务状态更新（下载完成/出错）。"""
@@ -14869,6 +15200,8 @@ class MainWindow(QMainWindow):
                       + (f"（{len(st['ready'])}/{total}）" if st["pending"] else ""))
             if not st["printed"]:
                 self._restart_scheduled_debounce(oid)
+            self._save_scheduled_state()
+            self._sync_scheduled_queue_window()
 
     def _restart_scheduled_debounce(self, order_id: int):
         """重启预约单 3s 防抖（新任务到达/就绪都会重置，静默后评估）。"""
@@ -14910,15 +15243,21 @@ class MainWindow(QMainWindow):
         if st["tab_key"] and not self._scheduled_tab_still_owns(order_id, st["tab_key"]):
             self._log(f"⚠ 预约单 #{order_id}: 标签页 {st['tab_key']} 已失效，重新建立标签页")
             st["tab_key"] = None
-        if not st["tab_key"]:
-            # 首次全部就绪 → 创建标签页（后续新增文件追加；2026-12 后台创建 —— 当前标签页
-            # 为空或已锁定时会切到新标签页，见 `_cloud_new_tab_should_focus`）。
+        if not st["tab_key"] and not st.get("queued"):
+            # 🛑 2026-11-02 用户纠正：**未到点的预约单不进标签页**。
+            # 只把文件下载到本地 + 在「云端任务列表」里显示「预约中」；到点由
+            # `_fire_scheduled_print` 现建标签页并立刻锁定。
+            # （旧实现此刻就建页 ⇒ 未到点的单子摆在工作区里，被误点「开始打印」
+            #   就会提前打出去；关掉工具还会被当成「放弃订单」上报后端。）
             # 注意：预约单不走 accept_order（会误把父订单标成 accepted），
             # 后端状态由 file_ready → waiting、start_printing → printing 驱动。
-            self._log(f"⏰ 预约单 #{order_id}: 全部 {len(ready_tasks)} 个文件就绪")
+            st["queued"] = True
+            self._log(f"⏰ 预约单 #{order_id}: 全部 {len(ready_tasks)} 个文件已下载到本地"
+                      f"（未到点，不进标签页；到点自动建页并锁定）")
             for t in ready_tasks:
                 self._mark_processed_task(t.task_id)
-            st["tab_key"] = self._add_cloud_tasks_to_new_tab(ready_tasks, switch_tab=False)
+            self._save_scheduled_state()
+            self._sync_scheduled_queue_window(force_show=True)
 
         if st["frozen"]:
             # 文件已全部就绪但仍在冻结：正常路径等后端 start_print 重设目标并解冻。
@@ -14949,6 +15288,7 @@ class MainWindow(QMainWindow):
         st["frozen"] = True
         st["delayed_sent"] = True
         self._log(f"⏰ 预约单 #{order_id}: 到点仍有 {len(pending)} 个文件未就绪，冻结等待")
+        self._save_scheduled_state()
         if self._cloud_client:
             self._cloud_client.report_download_delayed(order_id, list(pending.keys()))
 
@@ -15048,9 +15388,18 @@ class MainWindow(QMainWindow):
             self._log(f"⚠ 预约单 #{order_id}: 标签页 {st['tab_key']} 已失效，重新建立标签页")
             st["tab_key"] = None
         if not st["tab_key"]:
+            # 到点才建标签页（未到点不进标签页，见 `_evaluate_scheduled_order`），
+            # 建完立刻锁定：这一页只属于这一单，不允许再编辑/追加别的文件。
             for t in ready_tasks:
                 self._mark_processed_task(t.task_id)
             st["tab_key"] = self._add_cloud_tasks_to_new_tab(ready_tasks, switch_tab=False)
+            if not st["tab_key"]:
+                self._log(f"⚠ 预约单 #{order_id}: 到点建标签页失败，10s 后重试")
+                self._start_scheduled_print_timer(order_id, int(time.time()) + 10)
+                return
+            self._lock_scheduled_tab(order_id, st["tab_key"])
+            self._save_scheduled_state()
+            self._sync_scheduled_queue_window()
 
         # 打印机正忙 → 10s 后重试（最多 60 次 ≈ 10 分钟），保证预约单不丢
         if self._worker and self._worker.isRunning():
@@ -15076,6 +15425,22 @@ class MainWindow(QMainWindow):
 
         self._log(f"⚡ 无障碍预约打印：订单 #{order_id} 共 {len(ready_tasks)} 个文件，开始打印")
         jobs = [j for j in self._tab_jobs(st["tab_key"]) if not getattr(j, 'sent', False)]
+        # 到点才建页 ⇒ Word/Office 文件的转换（数页数）此刻才启动，必须等它转完再打：
+        # 否则会拿着 page_count=0 去算价/上报，甚至把「正在统计页数」当成空单。
+        _pending_stat = self._pending_page_count_stats(jobs)
+        if _pending_stat:
+            retry = st.get("retry_count", 0) + 1
+            st["retry_count"] = retry
+            if retry > 60:
+                self._log(f"⚠ 预约单 #{order_id}: 文件转换持续未完成，放弃自动打印并上报失败")
+                self._report_scheduled_failure(
+                    order_id, ready_tasks, "预约打印：文件转换超时")
+                self._cleanup_scheduled_order(order_id, reason="文件转换超时")
+                return
+            self._log(f"⏳ 预约单 #{order_id}: 还有 {len(_pending_stat)} 个文件在转换/统计页数，"
+                      f"3s 后重试（第 {retry} 次）")
+            self._start_scheduled_print_timer(order_id, int(time.time()) + 3)
+            return
         if jobs and self._hold_for_manual_duplex(jobs, st["tab_key"],
                                                  f"预约打印订单 #{order_id}"):
             # 不支持自动双面 + 含双面文件 → 挂起等人工（重试没意义：需要人翻纸）。
@@ -15093,6 +15458,8 @@ class MainWindow(QMainWindow):
             # 确认打印已启动后才置 printed（防假打印：忙时/空标签页不再标记成功）
             st["printed"] = True
             st["printed_ts"] = int(time.time())
+            # 打完了就从持久化里摘掉（重启后不该再把它当"待打印的预约单"恢复）
+            self._save_scheduled_state()
         else:
             # 标签页无文件（可能被清空/删除，或已被手动打完）→ 不置 printed、不上报。
             # P1（审计 2026-12）：原实现把 retry_count 重置为 0 —— 直接绕过 60 次上限，
@@ -15121,6 +15488,161 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.warning(f"预约单 #{order_id} 失败上报异常 (task={getattr(t, 'task_id', '?')}): {e}")
 
+    def _lock_scheduled_tab(self, order_id: int, tab_key: str):
+        """预约单到点建好的标签页立刻锁定：这一页只属于这一单，不许编辑/追加文件。"""
+        tab = self._config.tabs.get(tab_key)
+        if not tab:
+            return
+        tab.frozen = True
+        self._save_config()
+        try:
+            self._refresh_tab_display()
+        except Exception:
+            pass
+        self._log(f"🔒 标签页 {tab_key} 已固定（预约单 #{order_id} 到点自动锁定）")
+
+    # ── 预约单持久化（2026-11-02 现场事故）──────────────────────────────────
+    # 为什么必须落盘：后端 `fetch_and_lock_task` 只重推 **queued** 状态的任务，已 accept 的
+    # 预约单重启后不会再来一次（#951 就是这么消失的：00:04 收到、00:06 重启后无影无踪）。
+    # 关工具/崩溃后重开，未打印的预约单必须自己从本地恢复，到点照样打出来。
+
+    def _scheduled_state_path(self) -> str:
+        return os.path.join(paths.get_app_data_dir(), ".scheduled_orders.json")
+
+    @staticmethod
+    def _scheduled_task_state(task: CloudTask) -> dict:
+        """把 CloudTask 摊平成可 JSON 化的 dict。
+
+        ⚠ 不能直接用 `to_dict()`：它只导出 20 个字段，**丢掉** auto_print / schedule_mode /
+        scheduled_ts / remark / source / urgency / cover_page 等 —— 重启后预约单会退化成
+        「立即打印」单（甚至丢掉备注和加急标记）。
+        """
+        d = {}
+        try:
+            d = dict(task.to_dict())
+        except Exception:
+            d = {}
+        for attr in ("task_id", "order_id", "order_number", "file_name", "copies",
+                     "duplex", "page_range", "download_url", "created_at",
+                     "local_path", "status", "error_message", "source_md5",
+                     "image_orientation", "delivery_enabled", "delivery_location",
+                     "urgency", "cover_page", "cover_page_price", "owner_name",
+                     "is_admin_print", "uploader_is_admin", "bound_owner_name",
+                     "remark", "source", "auto_print", "schedule_mode",
+                     "scheduled_at", "scheduled_ts", "schedule_frozen",
+                     "retention_hours"):
+            try:
+                d[attr] = getattr(task, attr)
+            except Exception:
+                pass
+        return d
+
+    def _save_scheduled_state(self):
+        """把未打印的预约单写盘（已打印的不写：打印过就是终态，重启后不该再打一遍）。"""
+        try:
+            data = {}
+            for oid, st in self._scheduled_orders.items():
+                if st.get("printed"):
+                    continue
+                ready = [self._scheduled_task_state(t) for t in st["ready"].values()]
+                pending = [self._scheduled_task_state(t) for t in st["pending"].values()]
+                if not ready and not pending:
+                    continue
+                data[str(oid)] = {
+                    "target_ts": int(st.get("target_ts") or 0),
+                    "tasks": ready,
+                    "pending": pending,
+                    "queued": bool(st.get("queued")),
+                    "frozen": bool(st.get("frozen")),
+                }
+            path = self._scheduled_state_path()
+            if not data:
+                if os.path.isfile(path):
+                    os.remove(path)
+                return
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            logger.error(f"保存预约单状态失败: {e}")
+
+    def _load_scheduled_state(self):
+        """启动时恢复未打印的预约单（本地文件已不存在的任务跳过并记日志）。"""
+        if not self._cloud_client:
+            # 云端未启用：没有 CloudClient 就建不了标签页、取不了 PDF 缓存。
+            # 文件原样留着，下次启用云端后仍会恢复（绝不在这里删盘）。
+            return
+        path = self._scheduled_state_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"读取预约单状态失败（忽略并删除）: {e}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
+        restored = 0
+        for oid_s, item in (data or {}).items():
+            try:
+                oid = int(oid_s)
+            except (TypeError, ValueError):
+                continue
+            if not oid or oid in self._scheduled_orders:
+                continue
+            st = {
+                "target_ts": int(item.get("target_ts") or 0), "ready": {}, "pending": {},
+                "timer": None, "print_timer": None,
+                "frozen": bool(item.get("frozen")), "delayed_sent": False,
+                "printed": False, "printed_ts": 0, "tab_key": None, "retry_count": 0,
+                "queued": bool(item.get("queued")),
+            }
+            for src_key, bucket in (("tasks", "ready"), ("pending", "pending")):
+                for td in item.get(src_key) or []:
+                    try:
+                        t = CloudTask(dict(td))
+                    except Exception as e:
+                        logger.warning(f"恢复预约单 #{oid} 的任务失败: {e}")
+                        continue
+                    t.local_path = td.get("local_path") or ""
+                    t.status = td.get("status") or "ready"
+                    if not t.task_id:
+                        continue
+                    if t.local_path and not os.path.isfile(t.local_path):
+                        self._log(f"⚠ 预约单 #{oid}: 本地文件已不存在，跳过 {t.file_name}")
+                        continue
+                    st[bucket][t.task_id] = t
+            if not st["ready"] and not st["pending"]:
+                continue
+            self._scheduled_orders[oid] = st
+            restored += 1
+            self._log(f"♻ 已恢复预约单 #{oid}：{len(st['ready'])} 个文件就绪"
+                      + (f"，目标 {self._fmt_sched(st['target_ts'])}" if st["target_ts"] else ""))
+        if restored:
+            self._log(f"♻ 共恢复 {restored} 个未打印的预约单（关工具/崩溃都不会丢单）")
+            for oid in list(self._scheduled_orders.keys()):
+                self._evaluate_scheduled_order(oid)
+        self._sync_scheduled_queue_window()
+
+    def _sync_scheduled_queue_window(self, force_show: bool = False):
+        """预约状态变化 → 刷新「🖨 打印列表」里的「等待中（预约）」行。
+
+        未到点的预约单**只**在这里显示（不进标签页）；到点建页开打后由
+        `_fire_scheduled_print` 再刷一次，把这行从队列里摘掉。
+        `force_show=True`（有新单落队列时）把常驻窗叫出来 —— 用户要看得见它在排队。
+        """
+        try:
+            self._sync_local_queue()
+            if force_show:
+                # 复用既有可见性裁决：操作员主动收起的窗口不会被强行弹回来
+                self._sync_stack_list_visible()
+        except Exception as e:      # 定时器/信号路径绝不能抛
+            logger.debug(f"预约队列刷新失败: {type(e).__name__}: {e}")
+
     def _on_cloud_start_print(self, order_id: int, scheduled_ts: int, task_ids: list):
         """后端 start_print：到点兜底 / 冻结解除后重设目标。本地已自触发则幂等跳过。"""
         if not order_id:
@@ -15133,6 +15655,7 @@ class MainWindow(QMainWindow):
         if scheduled_ts:
             st["target_ts"] = scheduled_ts
         st["frozen"] = False
+        self._save_scheduled_state()      # 目标时间可能被后端改了，落盘保命
         if st["pending"]:
             # 仍有文件未就绪 → 继续等待（全部就绪后重新评估）
             self._restart_scheduled_debounce(order_id)
@@ -15149,6 +15672,9 @@ class MainWindow(QMainWindow):
                 t.stop()
         if reason:
             self._log(f"⏰ 预约单 #{order_id} 已结束: {reason}")
+        # 结束（打印完成/放弃/撤单）→ 从持久化里摘掉，重启后不该再打一遍
+        self._save_scheduled_state()
+        self._sync_scheduled_queue_window()
 
     def _cleanup_scheduled_orders_for_tab(self, tab_key: str, reason: str = "标签页已清空"):
         """清空/删除标签页时，联动清理指向该标签页的预约单状态机条目。"""
@@ -15232,6 +15758,7 @@ class MainWindow(QMainWindow):
         # ④ 预约单状态机（到点会自触发；调用方可能已清过，这里兜底）
         if order_id and self._scheduled_orders.pop(order_id, None) is not None:
             removed["scheduled"] = 1
+            self._save_scheduled_state()      # 撤单后重启不该再把它打出来
 
         if any(removed.values()):
             self._save_config()
@@ -15358,11 +15885,17 @@ class MainWindow(QMainWindow):
         if connected:
             # 攒批模式状态（2026-10）：一连上就先报一次，移动端立刻能看到「攒批中/未开」
             self._report_stack_state()
+            # 上线对账（2026-11 需求 2）：注册/接单状态里若带着离线期望就补落地，
+            # 没带就什么都不做（等服务端用 set_stack_mode reason=offline_intent 补发）。
+            self._reconcile_stack_intent()
             threading.Thread(
                 target=self._conn_sync_worker,
                 daemon=True,
                 name="cloud-conn-sync",
             ).start()
+        else:
+            # 断开 = 下一条连接可以重新尝试同一条离线期望
+            self._stack_intent_sig = None
 
     def _on_cloud_printer_state(self, state: dict):
         """（主线程）后端接单状态推送（PySide6 自动排队到主线程）。
@@ -15373,6 +15906,8 @@ class MainWindow(QMainWindow):
         if not isinstance(state, dict):
             return
         self._cloud_printer_state_cache = state
+        # 离线期望对账（2026-11 需求 2）：接单状态里带 stack_pending 时补落地一次
+        self._reconcile_stack_intent(state)
         # 本机所有者同步（授权页绑定后后端广播，本机立即生效，无需重启工具）
         owner = (state.get("owner_name") or "").strip()
         if owner and owner != (getattr(self._config, "cloud_owner_name", "") or "").strip():
@@ -15532,6 +16067,18 @@ class MainWindow(QMainWindow):
         self._closing = True  # 打印启动等待（processEvents）期间检测到关窗 → 中止启动流程
         # 外部打印监视：退出前停线程 + 关 spooler 通知句柄（别指望进程退出时的隐式清理）
         self._stop_external_watch()
+        # ── 预约单（未到点）：关工具**不算放弃**（2026-11-02 用户要求）──
+        # 新流程下未到点的预约单根本不在标签页里，下面那段"退出即放弃"的逻辑碰不到它们；
+        # 状态已落盘（.scheduled_orders.json），重启后自动恢复、到点照打。
+        _kept_sched = [oid for oid, st in (getattr(self, "_scheduled_orders", None) or {}).items()
+                       if not st.get("printed")]
+        if _kept_sched:
+            try:
+                self._save_scheduled_state()
+            except Exception as e:
+                logger.warning(f"退出前保存预约单状态失败: {e}")
+            self._log(f"⏰ 预约单 {'、'.join('#' + str(o) for o in _kept_sched)} 未到点，已保留"
+                      f"（关闭工具不算放弃；重启后继续，到点自动建页并锁定）")
         # 关闭云端任务列表窗口
         if self._cloud_task_window and self._cloud_task_window.isVisible():
             self._cloud_task_window.close()
@@ -15543,6 +16090,7 @@ class MainWindow(QMainWindow):
         if self._stack.entries or (self._stack_flush_worker is not None
                                    and self._stack_flush_worker.isRunning()):
             self._log("🖐 退出前检测到未完成的攒批纸叠")
+            self._ensure_visible_for_close_dialog()
             reply = QMessageBox.question(
                 self, "攒批还没打完第 2 趟",
                 f"出纸槽里有 {self._stack.count} 个打印任务 / {self._stack.total_sheets} 张纸"
@@ -15563,6 +16111,7 @@ class MainWindow(QMainWindow):
 
         # 打印进行中 → 询问用户：等待完成 / 取消打印 / 继续打印
         if self._worker is not None and self._worker.isRunning():
+            self._ensure_visible_for_close_dialog()
             reply = QMessageBox.question(
                 self, "打印正在进行",
                 "当前仍有打印任务正在进行。\n\n"
@@ -15628,6 +16177,7 @@ class MainWindow(QMainWindow):
                 self._current_tab = "1"
                 self._cleanup_orphan_pdf_cache(cache_jobs)
             else:
+                self._ensure_visible_for_close_dialog()
                 reply = QMessageBox.question(
                     self, "存在未完成的任务",
                     f"当前共有 {total_files} 个文件分布在 {len(self._config.tabs)} 个标签页中尚未打印。\n\n"
@@ -15763,6 +16313,18 @@ class MainWindow(QMainWindow):
 
     # ──────── 转换完成回调 ────────
 
+    @staticmethod
+    def _duplex_mode_for_orientation(orientation: str) -> str:
+        """双面翻转轴按**页面方向**推导（短边流程的唯一推导入口，2026-11 需求 4）。
+
+        横版内容（landscape）双面按**短边**翻，翻过来才是正的；竖版（portrait）按
+        **长边**翻（默认值）。方向未知（"" / "mixed"）时保守取长边 —— 与历史行为一致，
+        且 manual_duplex 的「长边才补偿第 2 趟 180°」口径匹配。
+
+        云端/本地落单与转换完成后的复核都用这一个函数，别在别处再手写一遍三元表达式。
+        """
+        return "short-edge" if (orientation or "").strip().lower() == "landscape" else "long-edge"
+
     def _on_convert_finished(self, row: int, file_path: str, cached_pdf: str, page_count: int,
                              orientation: str, tab_key: str = ""):
         """后台 PDF 转换完成 → 按 file_path 匹配行并更新标签页数据、表格。
@@ -15801,6 +16363,9 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
         _old_page_count = int(jobs[target_row].page_count or 0)
+        # 转换**前**的方向：`.doc` 落地时是 ""（完全未知），`.docx` 只有 XML 粗判 ——
+        # 复核翻转轴时要靠它还原"当时自动推导出来的是什么值"。
+        _old_orientation = str(jobs[target_row].orientation or "").strip().lower()
         jobs[target_row].cached_pdf = cached_pdf
         jobs[target_row].page_count = page_count
         jobs[target_row].orientation = orientation
@@ -15836,6 +16401,28 @@ class MainWindow(QMainWindow):
                       f"实际只打 1 页 → 自动改为单面"
                       f"（1 页双面物理上不可能，请求双面会让驱动多送一张空白纸）")
 
+        # ── 翻转轴复核：真实 PDF 到手后，方向可能跟落地时的猜测不一样 ──
+        # 落地时 `.doc` 完全没有方向（""）、`.docx` 只有 XML 粗判，duplex_mode 只能按
+        # 「横=短边 / 其它=长边」先猜一把（`_duplex_mode_for_orientation`）。短边双面的
+        # Word 没转 PDF 就下单，就是靠这一猜。转完才发现真方向 ⇒ 短边/长边必须按**新方向**
+        # 再来一次，否则竖版正文被猜成横向 → 按短边翻，第 2 趟整页是歪的。
+        # 只在"这一行还是自动推导值"时纠正：操作员在编辑面板显式选过的长/短边一律不动。
+        _axis_fixed = False
+        if (not _is_img) and orientation in ("portrait", "landscape"):
+            _auto_before = self._duplex_mode_for_orientation(_old_orientation)
+            _cur_mode = str(getattr(_job, "duplex_mode", "") or "").strip().lower()
+            if _cur_mode in ("", _auto_before):
+                _auto_after = self._duplex_mode_for_orientation(orientation)
+                if _auto_after != _cur_mode:
+                    _job.duplex_mode = _auto_after
+                    _axis_fixed = True
+                    _ori_cn = "横" if orientation == "landscape" else "竖"
+                    _axis_cn = "短边" if _auto_after == "short-edge" else "长边"
+                    self._log(f"  → {_job.display_name or os.path.basename(_job.file_path)} "
+                              f"实际是{_ori_cn}版 → 双面翻转轴改为「{_axis_cn}」"
+                              + ("（横向内容按短边翻，第 2 趟不补偿 180°）"
+                                 if _auto_after == "short-edge" else ""))
+
         self._save_config()
 
         # 仅当目标标签页是当前前台标签页时才更新表格（后台标签页表格不可见）
@@ -15846,9 +16433,10 @@ class MainWindow(QMainWindow):
                 ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
                 ori_text = ori_map.get(orientation, "")
                 self._table.item(target_row, self.COL_ORIENT).setText(ori_text)
-                if _single_page_norm:
-                    # 归一化改了 job.duplex → **整行重画**（双面列必须立刻显示「单面」；
-                    # 只改 COL_PAGES 会留下"表格写着双面、实际按单面打"的假象）。
+                if _single_page_norm or _axis_fixed:
+                    # 归一化改了 job.duplex / 复核改了 duplex_mode → **整行重画**
+                    # （双面列必须立刻显示「单面」或「短边」；只改 COL_PAGES 会留下
+                    #  "表格写着双面、实际按单面打"的假象）。
                     self._fill_table_row(target_row, jobs[target_row])
             self._recalc_row_cost(target_row)
             self._update_total_cost()
@@ -15867,10 +16455,31 @@ class MainWindow(QMainWindow):
                     pass
             # 存入 MD5 缓存索引（docx 按转换引擎分开缓存，避免 WPS 文档被 Word 渲染的错误 PDF 被复用）
             if job.source_md5:
-                # 写侧判定必须与读侧同一口径（原先只看 engine：图片/PDF/TXT 的 job.engine
-                # 默认就是 "word" ⇒ 写成 _eword 后缀，而读侧只按 .docx 加后缀 ⇒ 永不命中）
-                _cache_engine = cache_engine_for(job.file_path, getattr(job, 'engine', ''))
-                if self._cloud_client:
+                _job_ext = os.path.splitext(job.file_path)[1].lower()
+                if _job_ext in (".xls", ".xlsx"):
+                    # 表格：产物已经由 ConvertWorker 直接落在「引擎身份」命名的缓存路径上
+                    # （…_x{excel|wps|lo}.pdf），这里**只补索引条目**，不再搬家改名。
+                    # 必须写索引：retention.sweep_pdf_cache 会把「磁盘上有、索引里没有」的
+                    # PDF 当孤儿删掉，那样每单都要重跑一次 Excel（约 2 秒/单）。
+                    try:
+                        import paths as _paths
+                        import xlsx_printer as _xp
+                        _cdir = _paths.pdf_cache_dir()
+                        _key = os.path.splitext(os.path.basename(cached_pdf))[0]
+                        _tag = _key.rsplit("_x", 1)[-1] if "_x" in _key else ""
+                        _xp.upsert_cache_index(_cdir, _key, {
+                            "original_name": job.display_name or os.path.basename(job.file_path),
+                            "source_ext": _job_ext,
+                            "page_count": page_count,
+                            "engine": _tag,
+                            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    except Exception as e:
+                        self._log(f"  → 表格缓存索引写入失败: {e}")
+                elif self._cloud_client:
+                    # 写侧判定必须与读侧同一口径（原先只看 engine：图片/PDF/TXT 的 job.engine
+                    # 默认就是 "word" ⇒ 写成 _eword 后缀，而读侧只按 .docx 加后缀 ⇒ 永不命中）
+                    _cache_engine = cache_engine_for(job.file_path, getattr(job, 'engine', ''))
                     try:
                         self._cloud_client._save_pdf_to_cache(
                             job.source_md5, cached_pdf,
@@ -15904,7 +16513,17 @@ class MainWindow(QMainWindow):
                             _json.dump(idx, _f, ensure_ascii=False, indent=2)
                     except Exception as e:
                         self._log(f"  → 离线缓存保存失败: {e}")
-                self._set_current_jobs(jobs)  # 保存 source_md5 到配置
+                # 🛑 2026-11-02 现场事故（HN20261102-0005 打了三份、0006/0007 一页未打）：
+                # 这里原来无条件调 `_set_current_jobs(jobs)`，而 `jobs` 是**目标标签页**
+                # （tab_key）的列表对象 —— 后台标签页转换完成会把前台标签页的 jobs 整表
+                # 替换成这份对象，两页从此共享同一个 list。随后在前台页点「开始打印」，
+                # 打出来的是**另一个订单**的文件：08:18:35/38 两次 tab3 转换把 #956 的两个
+                # 文件分别灌进 tab6/tab7 ⇒ #956 打了 3 份，#1943/#1944 从未打印。
+                # 保存 source_md5 只需要把配置落盘，不需要（也绝不能）动当前页的 jobs。
+                if not tab_key or tab_key == self._current_tab:
+                    self._set_current_jobs(jobs)  # 保存 source_md5 到配置
+                else:
+                    self._save_config()
 
         # 转换完成后立刻保存副本到桌面
         if self._config.keep_temp_pdf and cached_pdf and os.path.isfile(cached_pdf):
@@ -16089,7 +16708,8 @@ class MainWindow(QMainWindow):
                 orientation = get_docx_orientation(task.local_path)
 
         is_image = ext in image_exts
-        duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
+        # 短边/长边只按**方向**推导（未知方向=长边）；转换完成后由 _on_convert_finished 复核
+        duplex_mode = self._duplex_mode_for_orientation(orientation)
 
         job = PrintJob(
             file_path=task.local_path or "",
@@ -16241,9 +16861,11 @@ class MainWindow(QMainWindow):
         就没了，原先要等到打印时才报「文件不存在」。原件路径记录在 job.source_path
         （界面显示与双击打开仍用原件）；副本的回收见 _sweep_staged_files()。
         """
-        # HTML/HTM 已移除；表格(xls/xlsx)在前端标记为不支持类型，不再本地打印
+        # HTML/HTM 已移除；表格 (.xls/.xlsx) 自 2026-11-02 起支持本地打印
+        # （Excel/WPS 自己的排版，见 xlsx_printer.py）。
         allowed_types = {
             ".pdf", ".doc", ".docx",
+            ".xls", ".xlsx",
             ".txt", ".md",
             ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
         }
@@ -16304,7 +16926,8 @@ class MainWindow(QMainWindow):
                 for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
                     if available.get(eng, False): engine = eng; break
             is_image = ext in image_exts
-            duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"
+            # 短边/长边只按**方向**推导（未知方向=长边）；转换完成后由 _on_convert_finished 复核
+            duplex_mode = self._duplex_mode_for_orientation(orientation)
 
             job = PrintJob(
                 file_path=work_path, copies=1,

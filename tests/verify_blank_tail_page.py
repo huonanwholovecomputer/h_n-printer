@@ -59,7 +59,8 @@ def check(name, cond, detail=""):
 # ══════════════ 夹具：用 PyMuPDF 造「指定第几页空白」的 PDF ══════════════
 def build_pdf(name, spec):
     """spec: [(kind, ...)]，kind ∈ text / blank / footer / header / header_rule /
-    body_bottom / body_mid / white_image / dot / box"""
+    body_bottom / body_mid / white_image / dot / box / title_straddle /
+    title_in_band_with_frame"""
     doc = fitz.open()
     for item in spec:
         page = doc.new_page(width=595, height=842)
@@ -79,6 +80,20 @@ def build_pdf(name, spec):
             page.insert_text((72, 40), "陕西省家庭经济困难学生认定暨国家教育资助申请表",
                              fontsize=9)
             page.insert_text((280, 800), "12", fontsize=9)
+        elif kind == "title_straddle":
+            # 2026-11-01 现场误判（示波器的使用.pdf 第 6 页）的 1:1 复刻：
+            # 整页一个边框 + 页脚「第 页」+ 一个 12pt 真标题坐 y0≈58.1/y1≈70.1，
+            # 而 A4 家具带 = 0.08×842 = 67.36 pt ⇒ 标题横跨带边界。
+            # 旧判据要求文字"完全落在正文区"才算内容 ⇒ 标题被当页眉 ⇒ 误判空白。
+            page.draw_rect(fitz.Rect(55.45, 28.75, 539.9, 780.6), width=1)
+            page.insert_text((79.8, 68), "2.思考题（课后完成）", fontsize=12)
+            page.insert_text((280, 832), "第 6 页", fontsize=9)
+        elif kind == "title_in_band_with_frame":
+            # 标题**完全落在家具带内**（y1≈48 < 67.36）+ 页脚，但页面有边框/竖线压在
+            # 正文区 ⇒ 只有「正文区墨量」那条判据能兜住（钉住 BLANK_FURNITURE_BODY_MAX_INK）
+            page.draw_rect(fitz.Rect(55.45, 28.75, 539.9, 780.6), width=1)
+            page.insert_text((79.8, 45), "2.思考题（课后完成）", fontsize=10)
+            page.insert_text((280, 832), "第 6 页", fontsize=9)
         elif kind == "body_bottom":
             # 正文区最后一行（Word 默认下边距 72pt ⇒ 正文落在页脚带以外）
             page.insert_text((72, 760), "最后一行正文内容", fontsize=10)
@@ -147,6 +162,17 @@ p_mark = build_pdf("a_mark.pdf", [("text", "page1"), ("box",)])
 check("★ 末页有 40pt 方块（≈1600 暗像素）⇒ 有内容，不判空白 ⇒ 0",
       detect_trailing_blank_pages(p_mark) == 0, str(detect_trailing_blank_pages(p_mark)))
 
+# 2026-11-01 现场误判（示波器的使用.pdf 第 6 页）：版本 4.6.0 把真标题判成页眉 ⇒ 末页当空白
+p_straddle = build_pdf("a_title_straddle.pdf", [("text", "page1"), ("title_straddle",)])
+check("★ 标题横跨家具带边界（现场 p6 复刻：y 58~70 / band 67.36）⇒ 0（有内容，绝不能误判空白）",
+      detect_trailing_blank_pages(p_straddle) == 0,
+      str(detect_trailing_blank_pages(p_straddle)))
+
+p_inband = build_pdf("a_title_in_band.pdf", [("text", "page1"), ("title_in_band_with_frame",)])
+check("★ 标题全在带内、但正文区有边框墨迹 ⇒ 0（正文区墨量判据兜住）",
+      detect_trailing_blank_pages(p_inband) == 0,
+      str(detect_trailing_blank_pages(p_inband)))
+
 p_none = build_pdf("a_none.pdf", [("text", "page1"), ("text", "page2")])
 check("全是内容 ⇒ 0", detect_trailing_blank_pages(p_none) == 0)
 check("读不了的文件 ⇒ 0（fail-open，绝不影响打印）",
@@ -165,6 +191,10 @@ for _p, _label, _want_furn, _want_blank in [
     (p_body_bottom, "正文区最后一行", False, False),
     (p_body_mid, "正文区中间一行", False, False),
     (p_mark, "40pt 方块（无字）", True, False),
+    (p_straddle, "标题横跨家具带（现场误判）", False, False),
+    # 文字全在带内 ⇒ 家具口径本身认为是"只剩家具"，但正文区有边框墨迹 ⇒ 仍不能算空白。
+    # 这一条钉住 page_is_blank 里的「正文区墨量」判据（删掉它必然变红）。
+    (p_inband, "标题全在带内 + 正文区边框", True, False),
 ]:
     _d = fitz.open(_p)
     _pg = _d[-1]

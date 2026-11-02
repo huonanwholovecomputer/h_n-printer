@@ -571,7 +571,7 @@ class FlingEngine {
     if (this._horizontalGesture) return;
     const cur = touches[0];
     const now = Date.now();
-    const ddy = cur.clientY - this._lastY;
+    let ddy = cur.clientY - this._lastY;
     // 嵌套滚动接力（与小程序 WXS scroll.wxs 同口径）：
     // ddy < 0 手指上滑（外层 y 增大 / 内层滚到底）；ddy > 0 手指下滑（外层 y 减小 / 内层滚到顶）。
     // 内层还能往手势方向滚 → 让原生滚；贴边 → 引擎接管外层；外层到边界反向 → 再交还内层。
@@ -580,12 +580,21 @@ class FlingEngine {
       if (this._nestedScroll) {
         const el = this._nestedScroll;
         const maxTop = el.scrollHeight - el.clientHeight;
-        const innerCanGo = ddy < 0 ? el.scrollTop < maxTop - 0.5 : el.scrollTop > 0.5;
-        if (innerCanGo) {
+        // room：内层在**本手势方向**上还剩多少行程（上滑剩到底的、下滑剩到顶的）
+        const room = ddy < 0 ? maxTop - el.scrollTop : el.scrollTop;
+        if (room >= Math.abs(ddy)) {
           this._lastY = cur.clientY;
           this._lastT = now;
-          return;
+          return;   // 这一帧内层自己吃得下 → 整帧交原生
         }
+        // 内层这一帧只能吃掉 room，剩下的由外层补：本帧位移仍是 1:1 跟手。
+        // （旧写法在 room < |ddy| 的这一帧整帧 return ⇒ 丢掉 |ddy|-room 的位移；下一帧才接管，
+        //   手感就是"到边界那一下卡一下、要再划一次"——用户反馈的正是这个。）
+        // 本帧内层仍会被原生滚到边界（passive 下拦不住，也不必拦：room 已按实计），
+        // 外层只补余量 ⇒ 两者相加正好 = 本帧真实位移，不叠加、不跳。
+        // Math.max(0, room)：内层若已被橡皮筋拉过边界（scrollTop 越界），余量按 0 计，
+        // 否则会把越界量当成"负余量"加回去，变成一次跳变。
+        ddy = ddy < 0 ? ddy + Math.max(0, room) : ddy - Math.max(0, room);
         this._nestedScroll = null; // 内层到边界 → 引擎接管
       } else if (this._nestedEl) {
         const el = this._nestedEl;
@@ -1528,8 +1537,14 @@ function renderDeviceList() {
 // 多任务合并翻纸纯属多余；能力未确认的也不给入口（2026-10 用户要求，三端同一条判据）。
 // ⚠ 这三个胶囊**互斥**（2026-10-27 用户要求：设备条必须只占一行、高度一致）：旧写法「需人工翻纸」
 //   与「攒批未开」同时出现，加上「开启攒批」按钮和「在线」，375px 一行放不下 ⇒ 换行 ⇒ 高度参差。
+//
+// 2026-11（需求：离线设备也能调攒批）：设备离线时服务端不再拒绝，而是返回 pending —— 攒批的
+// 目标状态已记在服务端，等设备上线自动应用。此时徽标换成一个**更短**的「🖐 待应用」（不是把
+// 「·待应用」拼在「攒批未开」后面：那样这一行在 375px 上会换行，破坏上面那条单行约束）。
 function stackBadgeHtml(d) {
   if (!d || d.auto_duplex !== false) return '';
+  // 离线期间下的指令还没落到设备上：栈里排队的是 pending 目标状态，显示「待应用」
+  if (d.stack_pending === true) return '<text class="device-state device-state-stack-pending">🖐 待应用</text>';
   if (d.stack_mode === true) return '<text class="device-state device-state-stack">🖐 攒批中</text>';
   if (d.stack_mode === false) return '<text class="device-state device-state-stack-off">🖐 攒批未开</text>';
   return '<text class="device-state device-state-manual">🖐 需人工翻纸</text>';
@@ -1541,11 +1556,13 @@ function isAdminRole() {
 }
 
 // 攒批模式远程开关：只对**需人工翻纸**的机型渲染，且仅 admin/super_admin（普通用户看不到可点
-// 控件，也不留空壳）；离线 / 服务端判「当前不可切换」/ 请求中 → 灰显禁用，点击只弹提示不请求
+// 控件，也不留空壳）；服务端判「当前不可切换」/ 请求中 → 灰显禁用，点击只弹提示不请求。
+// 2026-11（需求：离线设备也能调攒批）：**离线不再置灰** —— 离线时后端照样受理，返回
+// {success:true, pending:true} 把目标状态记下来，设备上线后自动应用（见 toggleStackMode）。
 function stackToggleBtnHtml(d) {
   if (!d || d.auto_duplex !== false) return '';
   if (!isAdminRole()) return '';
-  const disabled = d.online === false || d.stack_can_toggle === false || stackTogglingId === d.client_id;
+  const disabled = (d.online !== false && d.stack_can_toggle === false) || stackTogglingId === d.client_id;
   const label = d.stack_mode === true ? '关闭攒批' : '开启攒批';
   return `<view class="device-stack-btn${disabled ? ' device-stack-btn-disabled' : ''}" data-id="${esc(d.client_id)}">${label}</view>`;
 }
@@ -1555,6 +1572,9 @@ function stackToggleBtnHtml(d) {
 // 等人工翻纸打第二趟 / 有排队待打的请求）由服务端判定（stack_can_toggle / stack_reason），
 // 前端只做前置提示 + 请求转发，不复刻这套判定。
 // 该接口一律 HTTP 200，按 body 的 success 判断（失败时 message 即拦截原因）。
+// 2026-11（需求：离线设备也能调攒批）：离线不再在前端拦下 —— 后端对离线设备返回
+// {success:true, pending:true, message:'设备离线，已记录：上线后自动应用'}，目标状态存在服务端，
+// 设备上线后自动应用。前端据此把该行标记 stack_pending=true（徽标显示「🖐 待应用」）。
 async function toggleStackMode(clientId) {
   // 兜底：普通用户/游客即使状态异常也不放行
   if (!isAdminRole()) return;
@@ -1568,8 +1588,9 @@ async function toggleStackMode(clientId) {
     showToast('该设备支持自动双面（或双面能力未确认），不需要攒批模式', 2500);
     return;
   }
-  if (d.online === false) { showToast('设备离线，无法远程切换', 2000); return; }
-  if (d.stack_can_toggle === false) { showToast(d.stack_reason || '当前无法切换攒批模式', 2500); return; }
+  // 离线不再拦（后端已支持排队）：只有**在线**设备才吃服务端「当前不可切换」这条闸门；
+  // 离线设备哪怕列表里带着旧的 stack_can_toggle=false，也必须放行到请求，由后端记 pending。
+  if (d.online !== false && d.stack_can_toggle === false) { showToast(d.stack_reason || '当前无法切换攒批模式', 2500); return; }
   const enable = d.stack_mode !== true;
   stackTogglingId = clientId;
   renderDeviceList();
@@ -1585,7 +1606,14 @@ async function toggleStackMode(clientId) {
       // 成功后就地更新 claimingDevices 缓存里那一台，再刷新列表（就地更新，不整表重新拉取）
       const i = claimingDevices.findIndex(x => x.client_id === clientId);
       if (i >= 0) {
-        claimingDevices[i].stack_mode = data.stack_mode === true;
+        if (data.pending === true) {
+          // 设备离线：指令已入队，等它上线自动应用。**不改 stack_mode**（设备上的实际状态没变），
+          // 只置 stack_pending，让徽标显示「待应用」。
+          claimingDevices[i].stack_pending = true;
+        } else {
+          claimingDevices[i].stack_pending = false;
+          claimingDevices[i].stack_mode = data.stack_mode === true;
+        }
         claimingDevices[i].stack_busy = !!data.stack_busy;
       }
     }

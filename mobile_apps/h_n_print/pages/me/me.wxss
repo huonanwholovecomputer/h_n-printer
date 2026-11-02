@@ -402,6 +402,182 @@
   pointer-events: auto;
 }
 
+/* ── 「近 N 条订单」卡片（管理员）──
+   沿用 section-title / order-status / detail-price-tap，只有行布局是本卡片自己的；
+   N 上限 100（接口 range [1,100]），admin-expanded 的 3100rpx 会裁掉后半截 → 单独放大。 */
+.recent-orders-section.admin-expanded {
+  max-height: 12000rpx;
+}
+
+.recent-orders-refresh {
+  margin-left: auto;
+  font-size: 21rpx;
+  color: var(--blue);
+  padding: 4rpx 12rpx;
+  border-radius: var(--radius-sm);
+}
+
+/* 超管专属：N 编辑器入口（只对 isSuperAdmin 渲染）与 1..100 步进行 */
+.recent-orders-limit-btn {
+  margin-left: auto;
+  font-size: 21rpx;
+  color: var(--text-tertiary);
+  padding: 4rpx 10rpx;
+  border-radius: var(--radius-sm);
+}
+/* 入口在时由它吃 margin-left:auto，刷新退到后面 */
+.recent-orders-limit-btn + .recent-orders-refresh {
+  margin-left: 4rpx;
+}
+
+/* 空态：超管没有订单时也显示卡片（保留 ⚙ 设置入口），给一行说明而不是空白 */
+.recent-orders-empty {
+  padding: 20rpx 0;
+  text-align: center;
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+}
+
+.recent-limit-editor {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  margin: 0 0 12rpx;
+  padding: 12rpx 20rpx;
+  background: var(--bg-card);
+  border: 1rpx solid var(--separator);
+  border-radius: var(--radius-lg);
+}
+
+.recent-limit-label {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.recent-limit-stepper {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border: 1rpx solid var(--gray3);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.recent-limit-step {
+  width: 52rpx;
+  text-align: center;
+  font-size: 26rpx;
+  line-height: 52rpx;
+  color: var(--blue);
+}
+
+.recent-limit-input {
+  width: 88rpx;
+  height: 52rpx;
+  line-height: 52rpx;
+  text-align: center;
+  font-size: 24rpx;
+  color: var(--text-primary);
+  background: var(--bg-card);
+  border-left: 1rpx solid var(--gray3);
+  border-right: 1rpx solid var(--gray3);
+}
+
+.recent-limit-save {
+  margin-left: auto;
+  font-size: 22rpx;
+  font-weight: 600;
+  color: var(--blue);
+  padding: 6rpx 18rpx;
+  border: 1rpx solid var(--blue);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+.recent-limit-save-disabled {
+  color: var(--gray);
+  border-color: var(--gray3);
+}
+
+.recent-limit-cancel {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  padding: 6rpx 10rpx;
+  flex-shrink: 0;
+}
+
+.recent-orders-card {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 8rpx 24rpx;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: 1rpx solid var(--separator);
+}
+
+.recent-order-row {
+  padding: 14rpx 0;
+  border-bottom: 1rpx solid var(--separator);
+}
+.recent-order-row:last-child {
+  border-bottom: none;
+}
+
+.recent-order-line {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  min-width: 0;
+}
+.recent-order-line + .recent-order-line {
+  margin-top: 8rpx;
+}
+
+.recent-order-number {
+  font-size: 21rpx;
+  padding: 2rpx 10rpx;
+  margin: 0;
+  flex-shrink: 0;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-order-time {
+  margin-left: auto;
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.recent-order-owner {
+  font-size: 23rpx;
+  font-weight: 500;
+  color: var(--text-primary);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-order-stat {
+  font-size: 21rpx;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.recent-order-price {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.recent-order-amount {
+  font-size: 23rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
 .license-card, .storage-card {
   background: var(--bg-card);
   border-radius: var(--radius-lg);

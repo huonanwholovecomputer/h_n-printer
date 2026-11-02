@@ -206,7 +206,7 @@
 
           <!-- 文件保留与隐私（S2-08 / 2026-10-26 用户要求）：告知只在首次使用弹一次并永久记住，
                不再常驻整张卡片、也不每单重新勾选；日常只留这一行低存在感入口 -->
-          <div class="privacy-entry-row" id="privacyEntryRow">
+          <div class="privacy-entry-row card-preload" id="privacyEntryRow">
             <span class="privacy-entry-icon">🔒</span>
             <span class="privacy-entry-label">文件保留</span>
             <span class="privacy-entry-value" id="retentionEntryValue">遵从服务器管理</span>
@@ -385,6 +385,31 @@
 
           <!-- 管理员区块（各子块用 admin-collapsible 展开/收起，对齐小程序入场动画） -->
           <view id="adminSections">
+
+            <!-- 近 N 条订单（2026-11，仅管理员/超管可见；N 由超管设置、默认 10，随接口返回）
+                 数据：GET /api/admin/recent_orders —— 进入「我的」页按 30s 新鲜度拉一次，不轮询。
+                 每行：归属人（脱敏，点一下看真名）+ 时间 + 状态 + 文件/页数 + 可点复制的价格。 -->
+            <view class="license-section admin-collapsible" id="recentOrdersBlock">
+              <view class="section-title">
+                <view class="section-bar"></view>
+                <text id="recentOrdersTitle">近 10 条订单</text>
+                <text class="order-count" id="recentOrderCount" style="display:none">0</text>
+                <!-- 超管专属：N 的取值入口（1..100）。非超管由 JS 置 display:none（判据 state.isSuperAdmin，
+                     后端 compute_role 只返回 admin/user/guest，超管身份走 /api/login 的 is_super_admin）。 -->
+                <text class="recent-order-limit-entry" id="recentOrderLimitEntry" style="display:none">设置</text>
+              </view>
+              <!-- 超管的 N 步进器（就地展开，不做大弹窗）：− / 数值 / + / 保存 / 取消 -->
+              <view class="recent-order-limit-editor" id="recentOrderLimitEditor" style="display:none">
+                <text class="recent-order-limit-label">最近</text>
+                <view class="recent-order-limit-step" data-limit-step="-1">−</view>
+                <text class="recent-order-limit-value" id="recentOrderLimitValue">10</text>
+                <view class="recent-order-limit-step" data-limit-step="1">+</view>
+                <text class="recent-order-limit-label">条</text>
+                <view class="recent-order-limit-save" id="recentOrderLimitSave">保存</view>
+                <view class="recent-order-limit-cancel" id="recentOrderLimitCancel">取消</view>
+              </view>
+              <view class="recent-orders-card" id="recentOrderList"></view>
+            </view>
 
             <!-- 生成许可密钥 -->
             <view class="license-section admin-collapsible" id="adminBlockKeys">

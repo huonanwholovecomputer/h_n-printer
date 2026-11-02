@@ -201,6 +201,14 @@ class _StubScheduledWin:
     def _start_print_worker(self, jobs, tab_key=""):
         return True
 
+    def _pending_page_count_stats(self, jobs):
+        """桩：本用例不模拟 Word 转换，页数一律视为已统计完。
+        （2026-11-02 起 `_fire_scheduled_print` 到点建页后要等转换统计完再打。）"""
+        return []
+
+    def _save_scheduled_state(self):
+        pass
+
     def _scheduled_tab_still_owns(self, order_id, tab_key):
         """桩：本用例关心的是「标签页里没有文件」分支（`_tab_jobs` 返回 []），
         tab_key 的有效性由 tests/verify_scheduled_tab_cleanup.py 专门覆盖。

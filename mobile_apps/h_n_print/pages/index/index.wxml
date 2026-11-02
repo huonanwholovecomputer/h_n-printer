@@ -72,12 +72,16 @@
                 <text wx:if="{{item.stack_mode === true}}" class="device-state device-state-stack">🖐 攒批中</text>
                 <text wx:elif="{{item.stack_mode === false}}" class="device-state device-state-stack-off">🖐 攒批未开</text>
                 <text wx:else class="device-state device-state-manual">🖐 需人工翻纸</text>
+                <!-- 离线设备也能调攒批：云端先把目标状态记下来（stack_pending）→ 行内「待应用」，
+                     设备上线后先对齐攒批状态（服务端把 stack_mode 改成与云端指定一致） -->
+                <text wx:if="{{item.stack_pending}}" class="device-pending-badge">⏳ 待应用</text>
                 <!-- 远程开关：仅管理员/超管渲染（普通用户看不到可点控件，也不留空壳）；
-                     离线 / 服务端判「当前不可切换」→ 灰显禁用，点击只弹提示（catchtap 防冒泡选中设备） -->
+                     离线设备**不再灰死**（可点，服务端返回 pending）；只有服务端判「当前不可切换」
+                     （在线忙：正在打印/等翻纸/有排队）时才灰显禁用，点击只弹提示（catchtap 防冒泡选中设备） -->
                 <view
                   wx:if="{{userRole === 'admin' || userRole === 'super_admin'}}"
-                  class="device-stack-btn {{(item.online === false || item.stack_can_toggle === false || stackTogglingId === item.client_id) ? 'device-stack-btn-disabled' : ''}}"
-                  hover-class="{{(item.online === false || item.stack_can_toggle === false || stackTogglingId === item.client_id) ? 'none' : 'device-hover'}}"
+                  class="device-stack-btn {{((item.stack_can_toggle === false && item.online !== false) || stackTogglingId === item.client_id) ? 'device-stack-btn-disabled' : ''}}"
+                  hover-class="{{((item.stack_can_toggle === false && item.online !== false) || stackTogglingId === item.client_id) ? 'none' : 'device-hover'}}"
                   catchtap="onToggleStackMode"
                   data-index="{{index}}"
                 >{{item.stack_mode === true ? '关闭攒批' : '开启攒批'}}</view>
@@ -382,7 +386,7 @@
 
         <!-- 文件保留与隐私（S2-08 / 2026-10-26 用户要求）：告知只在首次使用弹一次并永久记住，
              不再常驻整张卡片、也不每单重新勾选；日常只留这一行低存在感入口（点开可改保留期 / 重看说明） -->
-        <view class="privacy-entry-row" bindtap="onOpenPrivacySheet" hover-class="privacy-entry-hover" hover-start-time="30" hover-stay-time="80">
+        <view class="privacy-entry-row {{entranceDone ? '' : (entered.privacy ? 'entrance-play' : 'card-preload')}}" bindtap="onOpenPrivacySheet" hover-class="privacy-entry-hover" hover-start-time="30" hover-stay-time="80">
           <text class="privacy-entry-icon">🔒</text>
           <text class="privacy-entry-label">文件保留</text>
           <text class="privacy-entry-value">{{retentionEntryText}}</text>
@@ -593,11 +597,16 @@
     <view class="sheet-title">选择时间</view>
     <view class="time-wheel-row">
       <!-- 官方 picker-view 滚轮（系统 picker 底层引擎）：贴合/惯性/边界全部原生，
-           value 指定选中索引，渲染层精确居中 → 零漂移、不过度滚动 -->
+           value 指定选中索引，渲染层精确居中 → 零漂移、不过度滚动。
+           慢滑/惯性：value 只在**松手（bindpickend）**同步一次；拖动中（bindchange，immediate-change
+           逐格触发）只更新派生索引做高亮 —— 拖动中写回 value 会让原生列被拽回该索引，
+           慢滑就变成「每次都定位回开始滑动的那个数字」。（见 index.js onTimeWheelChange 注释） -->
       <picker-view class="time-picker-view" value="{{timeWheelValue}}" immediate-change
                    mask-class="wheel-mask"
                    indicator-style="background: rgba(255,149,0,0.10); box-shadow: inset 0 1rpx 0 rgba(255,149,0,0.35), inset 0 -1rpx 0 rgba(255,149,0,0.35); border-radius: 12rpx;"
-                   bindchange="onTimeWheelChange">
+                   bindchange="onTimeWheelChange"
+                   bindpickstart="onTimeWheelPickStart"
+                   bindpickend="onTimeWheelPickEnd">
         <!-- 动态列：今天已过的时间直接从数组中删除（小时列从当前小时起，
              当前小时仅显示可用分钟；选中小时变化时分钟列级联重建） -->
         <picker-view-column>
@@ -626,7 +635,8 @@
       <picker-view class="time-picker-view" value="{{countdownWheelValue}}" immediate-change
                    mask-class="wheel-mask"
                    indicator-style="background: rgba(255,149,0,0.10); box-shadow: inset 0 1rpx 0 rgba(255,149,0,0.35), inset 0 -1rpx 0 rgba(255,149,0,0.35); border-radius: 12rpx;"
-                   bindchange="onCountdownWheelChange">
+                   bindchange="onCountdownWheelChange"
+                   bindpickend="onCountdownWheelPickEnd">
         <picker-view-column>
           <view wx:for="{{countdownMinItems}}" wx:key="*this"
                 class="wheel-item {{index === countdownMinWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>

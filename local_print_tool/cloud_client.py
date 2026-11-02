@@ -347,6 +347,27 @@ class CloudTask:
 
 # ---------- CloudClient ----------
 
+def parse_stack_command(data) -> dict:
+    """解析后端下发的 `set_stack_mode` 载荷（2026-11 攒批离线期望）。
+
+    `reason == "offline_intent"` 表示这不是"现在有人点了开关"，而是**用户离线时记下的
+    期望值**，设备一上线就补发过来（同一个事件，只在载荷里多一个 reason）。
+    这种指令设备端必须先跟本地 `duplex_stack_mode` 比对：一致就直接回报，
+    不一致才走既有切换路径（含"忙"闸门）—— 不能当成一次新的点击去执行。
+
+    返回 {"enable": bool, "by": str, "reason": str, "request_id": str, "intent": bool}
+    """
+    payload = dict(data) if isinstance(data, dict) else {}
+    reason = str(payload.get("reason") or "").strip()
+    return {
+        "enable": bool(payload.get("enable")),
+        "by": str(payload.get("by") or ""),
+        "reason": reason,
+        "request_id": str(payload.get("request_id") or ""),
+        "intent": reason == "offline_intent",
+    }
+
+
 class CloudClient(QObject):
     """云端打印任务客户端。
 
@@ -374,6 +395,8 @@ class CloudClient(QObject):
     auth_failed = Signal(str)             # 认证失败（含消息），GUI 可连接此信号提示用户
     printer_state = Signal(object)        # 接单状态 dict（is_active/active_owner_name/...）— 2026-11
     stack_mode_requested = Signal(bool, str)  # 移动端下发切换「🖐 攒批模式」：enable, 操作者 — 2026-10
+    # 云端**离线期望**补发（2026-11 需求 2）：reason=offline_intent 时走这条 —— enable, 操作者, request_id
+    stack_intent_requested = Signal(bool, str, str)
     # S1-01：启动时用迁移全局 TOKEN 换到本机专用 token（GUI 收到后写入 print_config 并持久化）
     token_issued = Signal(str, list)      # 新 token, scopes
     token_invalid = Signal()              # 本机 token 被吊销/失效 → GUI 清除已保存的本机 token
@@ -853,15 +876,24 @@ class CloudClient(QObject):
             return False
         return self._sio_emit("print_keepalive", {"task_ids": ids})
 
-    def report_stack_state(self, mode: bool, busy: bool, note: str = "") -> bool:
+    def report_stack_state(self, mode: bool, busy: bool, note: str = "",
+                           request_id: str = "", intent_applied: bool | None = None) -> bool:
         """上报本机「🖐 攒批模式」状态（2026-10）：连接成功后 + 每次状态/忙闲变化时调用。
 
         服务端只做镜像（给移动端展示「攒批中 / 攒批未开」）并用它校验远程切换请求 ——
         这是移动端看到的状态、以及「能不能远程改」的唯一数据来源。note 用于把拒绝原因带回移动端。
+
+        2026-11 需求 2：`request_id` 回带云端那条指令的 id（服务端在途请求靠它配对）；
+        `intent_applied` 只在这条状态是**对离线期望的答复**时给 —— True=期望已生效，
+        False=这次没执行（设备忙/机型不适用/正在打纸叠，云端保留期望下次再试），
+        None=与期望无关的常规心跳（不带这个字段，老后端/老客户端都不受影响）。
         """
-        return self._sio_emit("stack_state", {
-            "mode": bool(mode), "busy": bool(busy), "note": (note or "")[:120],
-        })
+        payload = {"mode": bool(mode), "busy": bool(busy), "note": (note or "")[:120]}
+        if request_id:
+            payload["request_id"] = str(request_id)[:64]
+        if intent_applied is not None:
+            payload["intent_applied"] = bool(intent_applied)
+        return self._sio_emit("stack_state", payload)
 
     # ── 离线状态同步 ──
 
@@ -1603,10 +1635,20 @@ class CloudClient(QObject):
 
             这里只把请求转给 GUI 主线程 —— 真正的忙闲校验与落盘在
             `MainWindow._on_remote_stack_mode`（执行前**再自查一次**，防服务端镜像过期导致的
-            竞态；本机忙时直接拒绝并把原因回报云端）。"""
-            payload = dict(data or {}) if isinstance(data, dict) else {}
-            enable = bool(payload.get("enable"))
-            by = str(payload.get("by") or "")
+            竞态；本机忙时直接拒绝并把原因回报云端）。
+
+            2026-11 需求 2：载荷带 `reason == "offline_intent"` 时表示**离线时记下的期望值**
+            在设备上线后补发。这种指令不是"现在有人点了开关"，设备端要先跟本地配置比对
+            （一致就只回报、不一致才切换），所以单独走 `stack_intent_requested` 信号。
+            """
+            cmd = parse_stack_command(data)
+            enable, by = cmd["enable"], cmd["by"]
+            if cmd["intent"]:
+                self.status_message.emit(
+                    f"[stack_intent] 云端补发离线期望：{'开启' if enable else '关闭'}"
+                    f"「🖐 攒批模式」（操作者：{by or '云端'}）")
+                self.stack_intent_requested.emit(enable, by, cmd["request_id"])
+                return
             self.status_message.emit(
                 f"📱 移动端请求{'开启' if enable else '关闭'}「🖐 攒批模式」")
             self.stack_mode_requested.emit(enable, by)

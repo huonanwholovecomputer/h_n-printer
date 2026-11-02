@@ -44,6 +44,7 @@ import paths  # noqa: E402
 from theme_manager import ThemeManager  # noqa: E402
 import gui as _gui  # noqa: E402
 import tray_icon  # noqa: E402
+from printer_config import PrintJob  # noqa: E402
 
 _gui.QMessageBox.question = staticmethod(lambda *a, **k: _gui.QMessageBox.Yes)
 _gui.QMessageBox.warning = staticmethod(lambda *a, **k: _gui.QMessageBox.Ok)
@@ -306,6 +307,73 @@ try:
           (not _win_b.isVisible()) and _quits == [1] and "hide" in _hidden
           and not _ctrl.is_started(),
           f"visible={_win_b.isVisible()} quits={_quits} hide={'hide' in _hidden}")
+
+    # ③-c 2026-11-01 现场：从托盘退出时"突然置于前台 + 画面全白 + 退出"
+    #   根因：旧 _quit_app **无条件**先 _restore_from_tray() 再 close()，而这次退出根本
+    #   没有要确认的东西（订单全打完/标签页全空）⇒ show() 闪一帧还没重绘的白窗口就退进程。
+    #   现改成"真要弹确认框之前才叫回前台"（_ensure_visible_for_close_dialog）。
+    _win_c = _gui.MainWindow(config_path=paths.config_path(), theme_manager=_tm)
+    _win_c.show()
+    app.processEvents()
+    _win_c.close()                      # 收进托盘：窗口隐藏，进程活着
+    app.processEvents()
+    check("[闪白] 前置：窗口确实藏在托盘里（隐藏、没退出）",
+          (not _win_c.isVisible()) and _win_c._force_quit is False)
+
+    _restores_c, _quits_c = [], []
+    _real_restore_c = _win_c._restore_from_tray
+
+    def _spy_restore_c():
+        _restores_c.append(1)
+        _real_restore_c()
+
+    _win_c._restore_from_tray = _spy_restore_c
+    _gui.QApplication.quit = staticmethod(lambda: _quits_c.append(1))
+    _win_c._quit_app()
+    app.processEvents()
+    check("[闪白] ★ 没有要确认的东西 ⇒ 退出时一帧都不亮（不再无谓 show()）",
+          _restores_c == [] and _quits_c == [1] and not _win_c.isVisible(),
+          f"restore={_restores_c} quits={_quits_c} visible={_win_c.isVisible()}")
+
+    # 反证：真有未完成的任务要确认时**必须**先把窗口叫回前台 —— 确认框是主窗口的子窗口，
+    # 弹在隐藏窗口后面等于没弹（旧注释里那条理由依然成立，不能被上面的修复弄丢）。
+    _win_d = _gui.MainWindow(config_path=paths.config_path(), theme_manager=_tm)
+    _win_d.show()
+    app.processEvents()
+    _win_d._config.tabs[_win_d._current_tab].jobs.append(
+        PrintJob(file_path=os.path.join(LOCAL_TOOL, "main.py"), sent=False))
+    _restores_d, _quits_d, _asked_d = [], [], []
+    _real_restore_d = _win_d._restore_from_tray
+
+    def _spy_restore_d():
+        _restores_d.append(1)
+        _real_restore_d()
+
+    _win_d._restore_from_tray = _spy_restore_d
+    _orig_question_c = _gui.QMessageBox.question
+
+    def _decline(*a, **k):
+        _asked_d.append(1)
+        return _gui.QMessageBox.No
+
+    _win_d.hide()
+    app.processEvents()
+    _gui.QMessageBox.question = staticmethod(_decline)
+    try:
+        _win_d._quit_app()
+        app.processEvents()
+        check("[闪白] ★ 真要弹确认框 ⇒ 先把窗口叫回前台（对话框不会被藏住）",
+              _asked_d == [1] and _restores_d == [1] and _win_d.isVisible(),
+              f"asked={_asked_d} restore={_restores_d} visible={_win_d.isVisible()}")
+        check("[闪白] 用户改主意「不退了」⇒ 进程没退、_force_quit 已复位",
+              _quits_d == [] and _win_d._force_quit is False and _win_d._closing is False,
+              f"quits={_quits_d} force={_win_d._force_quit} closing={_win_d._closing}")
+    finally:
+        _gui.QMessageBox.question = _orig_question_c
+    # 收尾：清空任务后正常退出，别把沙箱配置留在"有未完成任务"的状态
+    _win_d._config.tabs[_win_d._current_tab].jobs = []
+    _win_d._quit_app()
+    app.processEvents()
 finally:
     QSystemTrayIcon.isSystemTrayAvailable = _real_available
     QSystemTrayIcon.show = _orig_show

@@ -186,8 +186,8 @@ except OSError as e:
 # 两端各自的「攒批开关」函数体（请求体断言只在函数内做，避免误命中别处）
 mini_fn = fn_body(mini_js, "onToggleStackMode(e) {")
 app_fn = fn_body(app_js, "async function toggleStackMode(clientId) {")
-# 小程序就地写回 helper
-mini_apply = fn_body(mini_js, "_applyStackMode(index, clientId, data) {")
+# 小程序就地写回 helper（2026-11-02：新增 enable 形参 —— 离线 pending 时按云端目标值显示开关）
+mini_apply = fn_body(mini_js, "_applyStackMode(index, clientId, data, enable) {")
 # 小程序提示 helper（长 reason 走 modal 防 toast 截断）
 mini_tip = fn_body(mini_js, "_showStackTip(msg) {")
 # APP 管理员判定 + 开关控件渲染
@@ -282,8 +282,16 @@ check("两端请求中禁用防重复点击",
 
 # ==================== ⑦ 拦截提示文案 ====================
 print("\n=== ⑦ 前置拦截提示 ===")
-check("两端都有离线提示「设备离线，无法远程切换」",
-      "设备离线，无法远程切换" in mini_fn and "设备离线，无法远程切换" in app_fn)
+check("两端都只对**在线**设备吃 stack_can_toggle 闸门（离线放行给服务端记 pending）",
+      "device.online !== false && device.stack_can_toggle === false" in mini_fn
+      and "d.online !== false && d.stack_can_toggle === false" in app_fn)
+check("两端都不再有「离线直接拦下」的死分支（2026-11-02 起离线=记录期望）",
+      "设备离线，无法远程切换" not in mini_fn
+      and "设备离线，无法远程切换" not in app_fn)
+check("两端都消费 pending 响应（离线已记录 → 上线后自动应用）",
+      "data.pending === true" in mini_fn and "data.pending === true" in app_fn)
+check("两端都有「待应用」pending 角标",
+      "item.stack_pending" in mini_wxml and "stack_pending" in app_badge)
 check("两端按钮文案都有「开启攒批」与「关闭攒批」",
       "开启攒批" in mini_wxml and "关闭攒批" in mini_wxml
       and "开启攒批" in app_btn and "关闭攒批" in app_btn)

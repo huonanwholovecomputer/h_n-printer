@@ -9,6 +9,9 @@
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* overscroll-behavior: none 必须保留 —— Android WebView 的整页下拉刷新 / 橡皮筋靠它压住；
+   内层列表（.file-list-scroll / .wheel-viewport）的边界交接不走"放开滚动链"这条路，
+   而是各自 contain + FlingEngine 贴边接管（见两处注释）。 */
 html, body { height: 100%; overscroll-behavior: none; }
 view { display: block; }
 
@@ -1811,6 +1814,9 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
    与「需人工翻纸」三选一（互斥），保证每条设备恒定一行 */
 .device-state-stack { color: #e67e22; font-weight: 600; margin-right: 0.96cqw; }
 .device-state-stack-off { color: var(--gray); margin-right: 0.96cqw; }
+/* 离线设备刚下的攒批指令（服务端 {success:true,pending:true}）：指令已记录、等设备上线自动应用。
+   与「攒批中 / 攒批未开 / 需人工翻纸」互斥，保证每条设备仍恒定一行 */
+.device-state-stack-pending { color: #e67e22; font-weight: 600; margin-right: 0.96cqw; }
 /* 攒批模式远程开关（仅 admin/super_admin 渲染）：小胶囊按钮，禁用态灰显但保留可点（点了弹原因）。
    高度刻意钳在 2.52cqw×1.3+2×0.24cqw 内 —— 一旦比文字行高，带按钮的行就会比不带按钮的行高出一截。 */
 .device-stack-btn {
@@ -3324,6 +3330,9 @@ picker-view-column {
 .theme-dark .device-state-stack-off {
   color: var(--gray);
 }
+.theme-dark .device-state-stack-pending {
+  color: #FFA94D;
+}
 .theme-dark .device-stack-btn {
   color: var(--blue-light);
   border-color: rgba(64, 156, 255, 0.55);
@@ -3865,6 +3874,158 @@ picker-view-column {
   box-shadow: var(--glass-shadow-sm), var(--glass-rim);
   border: 0.12cqw solid var(--separator);
   transition: background-color 0.4s ease, color 0.35s ease, box-shadow 0.4s ease, border-color 0.4s ease;
+}
+
+/* ═══════════════ Recent Orders（近 N 条订单，仅管理员） ═══════════════ */
+/* 卡片容器：与 .license-card 同一套玻璃底，但内边距更扁（每行自带上下留白） */
+.recent-orders-card {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 1.2cqw 3.36cqw;
+  text-align: left;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: 0.12cqw solid var(--separator);
+}
+.recent-order-row {
+  padding: 2.16cqw 0;
+  border-bottom: 0.12cqw solid var(--separator);
+}
+.recent-order-row:last-child { border-bottom: none; }
+.recent-order-line {
+  display: flex;
+  align-items: center;
+  gap: 1.2cqw;
+  min-height: 3.6cqw;
+}
+.recent-order-line + .recent-order-line { margin-top: 0.72cqw; }
+/* 归属人：默认脱敏（owner_masked），点一下就地切成完整 owner。
+   下划线提示"可点"，但不做成蓝色链接——这一行是信息而不是跳转 */
+.recent-order-owner {
+  font-size: 2.88cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-bottom: 0.12cqw dashed var(--gray3);
+  -webkit-user-select: none;
+  user-select: none;
+}
+.recent-order-time {
+  font-size: 2.4cqw;
+  color: var(--text-quaternary);
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+/* 状态胶囊：颜色来自全局 .status-*（与订单卡同一份映射），这里只给胶囊底座 */
+.recent-order-status {
+  margin-left: auto;
+  padding: 0.24cqw 1.44cqw;
+  border-radius: 2.4cqw;
+  font-size: 2.4cqw;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.recent-order-meta {
+  flex: 1;
+  min-width: 0;
+  font-size: 2.4cqw;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 金额：点一下走既有复制价格气泡（openPricePop），📋 图标复用 .price-copy-icon */
+.recent-order-price {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.48cqw;
+  padding: 0.24cqw 0.96cqw;
+  border-radius: 1.2cqw;
+  font-family: var(--font-mono);
+  font-size: 2.88cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+.recent-order-price:active { background: var(--gray6); }
+.recent-order-empty {
+  padding: 2.4cqw 0;
+  text-align: center;
+  font-size: 2.64cqw;
+  color: var(--text-quaternary);
+}
+/* ── 超管设置 N（仅超级管理员；就地一行步进，不弹遮罩） ── */
+.recent-order-limit-entry {
+  margin-left: auto;
+  padding: 0.48cqw 1.44cqw;
+  border-radius: 2.4cqw;
+  background: rgba(0, 122, 255, 0.10);
+  color: var(--blue);
+  font-size: 2.4cqw;
+  font-weight: 600;
+  flex-shrink: 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.recent-order-limit-entry:active { background: rgba(0, 122, 255, 0.18); }
+.recent-order-limit-editor {
+  display: flex;
+  align-items: center;
+  gap: 1.2cqw;
+  margin-top: 1.2cqw;
+  padding: 0.96cqw 1.2cqw;
+  background: var(--gray6);
+  border-radius: var(--radius-md);
+}
+.recent-order-limit-label {
+  font-size: 2.4cqw;
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+.recent-order-limit-step {
+  width: 5.52cqw;
+  height: 5.52cqw;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--bg-card);
+  box-shadow: var(--glass-rim);
+  font-size: 3.6cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+.recent-order-limit-step:active { background: var(--gray5); }
+.recent-order-limit-value {
+  min-width: 6.48cqw;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 3.12cqw;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.recent-order-limit-save {
+  margin-left: auto;
+  padding: 0.48cqw 1.68cqw;
+  border-radius: 2.4cqw;
+  background: var(--blue);
+  color: #fff;
+  font-size: 2.4cqw;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.recent-order-limit-save-disabled { opacity: 0.5; pointer-events: none; }
+.recent-order-limit-cancel {
+  padding: 0.48cqw 1.68cqw;
+  border-radius: 2.4cqw;
+  border: 0.12cqw solid var(--separator);
+  color: var(--text-tertiary);
+  font-size: 2.4cqw;
+  flex-shrink: 0;
 }
 
 /* ═══════════════ License Key Generator ═══════════════ */
@@ -6305,13 +6466,17 @@ picker-view-column {
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-/* 滚轮选择器（picker-view 的 Web 替代：scroll-snap 贴合，item 88rpx、可视 440rpx） */
 .time-wheel-row {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 2.4cqw;
 }
+/* 滚轮选择器（picker-view 的 Web 替代：item 88rpx、可视 440rpx）
+   ⚠ 不用 CSS 的 scroll-snap-type: y mandatory：Chromium 会在每次松手时把惯性收敛到
+   最近吸附点 ⇒ 一次手势最多走一格，用户反馈的"滑动阻力感太大"就是它。
+   现在改为「原生自由滚动 + 手指/惯性静止 140ms 后 JS 吸附一格」（print.js buildWheel），
+   索引判定仍是"离视口中心最近的 item"，与 readWheelIndex() 同口径。 */
 .wheel-col {
   position: relative;
   width: 23.4cqw;
@@ -6322,7 +6487,10 @@ picker-view-column {
 .wheel-viewport {
   height: 100%;
   overflow-y: auto;
-  scroll-snap-type: y mandatory;
+  /* 内层滚到底不把滚动链抛给外层（弹层里没有别的滚动容器），也不做 overscroll 回弹，
+     否则回弹动画会和 JS 吸附抢 scrollTop */
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
   -ms-overflow-style: none;
   will-change: transform;   /* 同上：独立合成层，滚轮选择器滚动不重绘外层 */
@@ -6337,10 +6505,17 @@ picker-view-column {
   font-weight: 600;
   font-family: var(--font-mono);
   color: var(--text-tertiary);
-  scroll-snap-align: center;
   transition: color 0.15s;
 }
-.wheel-item.wheel-item-active { color: var(--text-primary); font-weight: 700; }
+/* ⚠ 前面给小程序 picker-view 写的 .wheel-item-active（在 .time-picker-view 那一块）会级联进来：
+   font-size:4.08cqw + 橙色 text-shadow。Web 滚轮里必须显式压回去，否则选中项比未选中项**更小**、
+   且带一圈小程序橙光。字号保持与非选中项一致（只靠颜色/字重区分，避免字宽变化引起跳动）。 */
+.wheel-item.wheel-item-active {
+  color: var(--text-primary);
+  font-weight: 700;
+  font-size: 4.32cqw;
+  text-shadow: none;
+}
 .wheel-indicator {
   position: absolute;
   top: 50%;
@@ -6422,6 +6597,15 @@ button {
    否则卡片溢出画到外层卡片/添加按钮上 */
 .file-list-scroll {
   overflow-y: auto;
+  /* 2026-11-02（用户：「滚到底后继续滑应由外层接管…这问题解决很久了」）：
+     内层一旦触底/到顶，Chromium 会**先给内层**做 overscroll 拉伸-回弹动画，再把滚动链交给
+     祖先；而外层 .scroller 是 FlingEngine 自绘（overflow:hidden + transform），原生链接到它
+     身上等于没接 ⇒ 观感就是"卡在列表底部、要多划一下才动"。
+     这里显式 contain：内层不产生任何 overscroll 效果、也不把链条往外抛，边界交接**完全**由
+     app.js FlingEngine 的贴边判定接管（贴边那一帧起由外层 transform 吃手势）⇒ 跟手、无回弹抖动。
+     ⚠ 不要改成 auto/none 组合去"放开"链条：外层不是真滚动容器，放开只会让浏览器先回弹再卡住。 */
+  overscroll-behavior-y: contain;
+  overscroll-behavior-x: contain;
   scrollbar-width: none;
   -ms-overflow-style: none;
   /* 独立合成层：内层滚动/回弹不再重绘外层那个被 JS transform 驱动的大层，

@@ -56,8 +56,10 @@ function checkStaticWiring() {
 
   check('小程序：常驻隐私卡片已移除（无 privacy-card / 无常驻勾选行）',
         !/privacy-card/.test(mpWxml) && !/privacy-consent-row/.test(mpWxml));
+  // 注意：class 上会挂入场动画的二态表达式（见 verify_mobile_print_entrance.py），
+  // 所以这里只钉「privacy-entry-row 这个类在、bindtap 在、文案插值在」，不钉 class 的整串等值。
   check('小程序：常驻只剩一行「文件保留」入口（bindtap 打开小弹层）',
-        /class="privacy-entry-row"/.test(mpWxml) && /bindtap="onOpenPrivacySheet"/.test(mpWxml)
+        /class="privacy-entry-row[\s"]/.test(mpWxml) && /bindtap="onOpenPrivacySheet"/.test(mpWxml)
         && /privacy-entry-value">\{\{retentionEntryText\}\}/.test(mpWxml));
   check('小程序：小弹层由 privacySheetVisible 控制，内含保留期选择 + 首次同意按钮',
         /wx:if="\{\{privacySheetVisible\}\}"/.test(mpWxml)
@@ -79,8 +81,9 @@ function checkStaticWiring() {
 
   check('APP：常驻隐私卡片已移除（无 privacy-card / 无常驻勾选行）',
         !/privacy-card/.test(appHtml) && !/privacy-consent-row/.test(appHtml));
+  // 同上：class 里可能多出入场动画的 preload 类，只钉类名 + id 的共存关系。
   check('APP：常驻只剩一行「文件保留」入口',
-        /class="privacy-entry-row" id="privacyEntryRow"/.test(appHtml)
+        /class="privacy-entry-row[^"]*"\s+id="privacyEntryRow"/.test(appHtml)
         && /id="retentionEntryValue"/.test(appHtml));
   check('APP：小弹层（privacySheet）内含保留期 chips + 同意按钮',
         /id="privacySheet"/.test(appHtml) && /id="retentionChips"/.test(appHtml)

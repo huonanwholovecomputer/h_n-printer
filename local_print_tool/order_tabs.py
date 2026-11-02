@@ -423,6 +423,9 @@ class FileCardWidget(QFrame):
                 self._icon_label.setText("📕")
             elif ext in (".doc", ".docx"):
                 self._icon_label.setText("📝")
+            elif ext in (".xls", ".xlsx"):
+                # 2026-11-02 起表格支持本地打印（走 Excel/WPS 自己的排版）
+                self._icon_label.setText("📊")
             else:
                 self._icon_label.setText("📄")
 
@@ -510,7 +513,6 @@ class FileCardList(QScrollArea):
 
     def _add_card(self, entry, calc_cost_fn, simplex_price, duplex_price):
         ext = os.path.splitext(entry.file_name)[1].lower()
-        is_excel = ext in (".xls", ".xlsx")
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
         is_image = ext in image_exts
 
@@ -519,9 +521,11 @@ class FileCardList(QScrollArea):
         cost_text = f"¥{cost:.2f}" if cost > 0 else "¥0.00"
 
         card = FileCardWidget(entry.file_path)
+        # 2026-11-02：表格 (.xls/.xlsx) 已支持本地打印（Excel/WPS 自己的排版），
+        # 不再走「⚠ Excel — contact admin」那条「不支持」路径。
         card.set_info(entry.file_name, entry.copies, entry.duplex,
                       entry.page_range, entry.page_count, entry.orientation,
-                      entry.engine, cost_text, cost, is_excel, is_image)
+                      entry.engine, cost_text, cost, False, is_image)
         card.fileContextMenuRequested.connect(
             lambda fp, pos: self._on_card_ctx(fp, pos))
 

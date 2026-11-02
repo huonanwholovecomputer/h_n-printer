@@ -312,8 +312,24 @@ check("没有 markdown 星号混进这两条界面文案",
       and "**" not in "⚠ 有 N 个文件页数未知，将按 0 页计费上报")
 
 _guards = [m.start() for m in re.finditer(r"_pending_page_count_stats\(", SRC)]
-check("_pending_page_count_stats 只有一个调用点（不散落）", len(_guards) == 2,
-      f"{len(_guards)} 处（含 def 本身）")
+_guards = [p for p in _guards if SRC[p - 4:p] != "def "]   # 排除 def 那一行
+
+
+def _enclosing_func(pos):
+    """返回 pos 所在的最内层 def 名（粗粒度但够用：找 pos 之前最近的 `    def `）。"""
+    head = SRC[:pos]
+    m = list(re.finditer(r"\n    def ([A-Za-z_][A-Za-z0-9_]*)", head))
+    return m[-1].group(1) if m else ""
+
+
+# 2026-11-02 起允许两个调用点，且**只允许**这两个（多一处就说明又有人绕过入口自己判）：
+#   · `_start_print_worker` —— 唯一的打印入口守卫（页数没统计完不开打）
+#   · `_fire_scheduled_print` —— 预约单到点才建页，Word 转换此刻才启动，必须等它转完
+#     （否则会拿 page_count=0 去算价/上报）。两者语义不同，不是重复实现。
+_guard_funcs = sorted(_enclosing_func(p) for p in _guards if _enclosing_func(p))
+check("_pending_page_count_stats 只在这两处被调用（入口守卫 + 预约到点等转换）",
+      _guard_funcs == ["_fire_scheduled_print", "_start_print_worker"],
+      f"{_guard_funcs}")
 
 print("\n" + ("PASS 全部通过" if ok_all else "FAIL 有失败项"))
 sys.exit(0 if ok_all else 1)

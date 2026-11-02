@@ -549,6 +549,58 @@ def save_security_config(cfg):
 # 模块加载即读取已保存的配置（若无则用默认值）
 _SECURITY = load_security_config()
 
+# -------- 「最近订单」条数（2026-11）--------
+# 管理端「最近 N 条订单」卡片显示多少条：默认 10，超管可在 1..100 之间调整。
+# 与防滥用阈值同款持久化（uploads/recent_orders_config.json：启动载入内存副本、保存即时生效），
+# 但**写权限只给超管**（见 /api/admin/recent_orders_limit；判据是 SUPER_ADMIN_OPENID，
+# 不是 compute_role —— compute_role 会把超管折叠成 "admin"，照抄 /api/admin/security 会让谁都改得动）。
+RECENT_ORDERS_CONFIG_FILE = os.path.join(UPLOAD_DIR, "recent_orders_config.json")
+DEFAULT_RECENT_ORDERS_LIMIT = 10
+RECENT_ORDERS_LIMIT_RANGE = (1, 100)
+_RECENT_ORDERS_LIMIT = DEFAULT_RECENT_ORDERS_LIMIT
+
+
+def load_recent_orders_config():
+    """加载「最近订单」条数（文件缺失/损坏/越界 → 回退默认 10）。
+
+    越界值也回退：手改文件写出 limit=99999 时，宁可显示默认 10 条，
+    也不让一张卡片把 /api/admin/recent_orders 变成全表扫描入口。
+    """
+    global _RECENT_ORDERS_LIMIT
+    limit = DEFAULT_RECENT_ORDERS_LIMIT
+    if os.path.exists(RECENT_ORDERS_CONFIG_FILE):
+        try:
+            with open(RECENT_ORDERS_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            v = data.get("limit") if isinstance(data, dict) else None
+            if (isinstance(v, int) and not isinstance(v, bool)
+                    and RECENT_ORDERS_LIMIT_RANGE[0] <= v <= RECENT_ORDERS_LIMIT_RANGE[1]):
+                limit = v
+        except (json.JSONDecodeError, OSError):
+            pass
+    _RECENT_ORDERS_LIMIT = limit
+    return limit
+
+
+def save_recent_orders_config(limit):
+    """保存「最近订单」条数并立即更新内存副本（原子写：临时文件 + os.replace）。
+
+    先落盘再改内存：写盘失败时旧值仍然有效，接口层能如实回 500，
+    不会出现"接口报错但内存已经变了、重启又变回去"的错位。
+    """
+    global _RECENT_ORDERS_LIMIT
+    limit = int(limit)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    tmp = RECENT_ORDERS_CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"limit": limit}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, RECENT_ORDERS_CONFIG_FILE)
+    _RECENT_ORDERS_LIMIT = limit
+
+
+# 模块加载即读取已保存的条数（若无/损坏则用默认值）
+_RECENT_ORDERS_LIMIT = load_recent_orders_config()
+
 # 已知扩展名 → 子目录映射
 EXT_DIR_MAP = {
     "pdf": "pdf", "doc": "doc", "docx": "docx", "xls": "xls", "xlsx": "xlsx",
@@ -1610,7 +1662,166 @@ def _stack_toggle_problem(client_id: str, enable=None) -> str:
     return ""
 
 
+# -------- 攒批模式「期望状态」（2026-11：离线也能先记下来，设备上线自动应用）--------
+# 现场口径：设备离线时移动端点攒批开关，原先直接拒绝；现在改成"记下期望，等它上线照办"。
+# 存 uploads/stack_intent.json：{client_id: {"enable": bool, "by": str, "by_role": str,
+#   "ts": "YYYY-MM-DD HH:MM:SS", "applied": bool}}；启动载入内存副本，写盘原子（临时文件 + os.replace）。
+# 语义：**期望**（人想让它变成什么），不是实际状态 —— 实际状态永远以设备端 `stack_state` 上报为准
+#   （printer_stack_state 只是镜像）。设备上线后第一次上报时比对：一致 → 清期望不下发；
+#   不一致 → 下发 set_stack_mode（reason=offline_intent）；设备忙/拒绝 → 保留期望，下次上线再试。
+STACK_INTENT_FILE = os.path.join(UPLOAD_DIR, "stack_intent.json")
+_stack_intent_lock = threading.RLock()
+_stack_intent = {}
+# 本次上线是否已为某设备下发过 offline_intent：{client_id: enable}
+# 用来打断「设备忙拒绝 → 再回报 stack_state → 又比对不一致 → 再下发」这条死循环；
+# 设备重连（on_connect）时清空 ⇒ 每次上线最多自动重试一次。
+_stack_intent_dispatched = {}
+
+
+def load_stack_intent():
+    """加载攒批期望状态（缺失/损坏 → 空；逐条清洗，脏条目直接丢掉而不是让整个文件失效）。"""
+    global _stack_intent
+    data = {}
+    if os.path.exists(STACK_INTENT_FILE):
+        try:
+            with open(STACK_INTENT_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            raw = {}
+        if isinstance(raw, dict):
+            for cid, ent in raw.items():
+                if (not isinstance(cid, str) or not cid or len(cid) > 64
+                        or not isinstance(ent, dict)):
+                    continue
+                enable = ent.get("enable")
+                if not isinstance(enable, bool):
+                    continue
+                data[cid] = {
+                    "enable": enable,
+                    "by": str(ent.get("by") or "")[:40],
+                    "by_role": str(ent.get("by_role") or "")[:20],
+                    "ts": str(ent.get("ts") or ""),
+                    "applied": bool(ent.get("applied")),
+                }
+    with _stack_intent_lock:
+        _stack_intent = data
+        _stack_intent_dispatched.clear()
+    if data:
+        print(f"[stack_intent] 已载入攒批期望 {len(data)} 条: {sorted(data)}")
+    return {k: dict(v) for k, v in data.items()}
+
+
+def _save_stack_intent_locked():
+    """把内存里的期望状态原子落盘（调用方必须持有 _stack_intent_lock）。"""
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    tmp = STACK_INTENT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_stack_intent, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STACK_INTENT_FILE)
+
+
+def _stack_intent_of(client_id: str):
+    """读某设备的攒批期望（没有 → None）。"""
+    with _stack_intent_lock:
+        ent = _stack_intent.get(client_id)
+        return dict(ent) if ent else None
+
+
+def _stack_intent_pending(client_id: str) -> bool:
+    """该设备是否有「待应用的攒批期望」（设备列表 / printer_state 下发用）。"""
+    with _stack_intent_lock:
+        return client_id in _stack_intent
+
+
+def _set_stack_intent(client_id, enable, by="", by_role="", applied=False) -> bool:
+    """记录/覆盖某设备的攒批期望并落盘；返回是否写盘成功（内存副本仍会更新）。"""
+    with _stack_intent_lock:
+        _stack_intent[client_id] = {
+            "enable": bool(enable),
+            "by": (by or "")[:40],
+            "by_role": (by_role or "")[:20],
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "applied": bool(applied),
+        }
+        try:
+            _save_stack_intent_locked()
+        except OSError as e:
+            print(f"[stack_intent] {client_id} 期望落盘失败（内存已更新）: {e}")
+            return False
+    print(f"[stack_intent] {client_id} 记录期望: {'开启' if enable else '关闭'}"
+          f"（by={by or '-'} / {by_role or '-'}）")
+    return True
+
+
+def _clear_stack_intent(client_id, why="") -> bool:
+    """清掉某设备的攒批期望（已应用/已一致/被在线指令取代）。"""
+    with _stack_intent_lock:
+        ent = _stack_intent.pop(client_id, None)
+        if ent is None:
+            return False
+        _stack_intent_dispatched.pop(client_id, None)
+        try:
+            _save_stack_intent_locked()
+        except OSError as e:
+            print(f"[stack_intent] {client_id} 清除期望落盘失败: {e}")
+    print(f"[stack_intent] {client_id} 清除攒批期望" + (f"（{why}）" if why else ""))
+    return True
+
+
+def _apply_stack_intent_on_online(client_id: str, sid: str = "") -> None:
+    """设备上线后拿到**新上报**的 stack_state 时，比对「期望 vs 实际」并落地。
+
+    为什么要等上报（而不是在 on_connect 里直接发）：连接瞬间镜像里是上次会话的旧值，
+    拿旧值比对会「一致就误清期望」或「不一致就白发一条」。`stack_state` 是设备刚上报的
+    真实状态，比它可靠。同一会话内最多自动下发一次（`_stack_intent_dispatched` 去重），
+    设备忙拒绝后保留期望，等下次上线再试（符合"设备是最终裁决者"的既有口径）。
+    """
+    ent = _stack_intent_of(client_id)
+    if not ent:
+        return
+    st = _stack_state_of(client_id)
+    want = bool(ent["enable"])
+    if st["mode"] is want:
+        _clear_stack_intent(client_id, f"上线后实际状态已一致：{'开启' if want else '关闭'}")
+        return
+    if not sid:
+        print(f"[stack_intent] {client_id} 有期望但当前无在线会话，暂不下发（下次上线再试）")
+        return
+    with _stack_intent_lock:
+        if _stack_intent_dispatched.get(client_id) is want:
+            keep = True
+        else:
+            keep = False
+    if keep:
+        print(f"[stack_intent] {client_id} 期望仍为{'开启' if want else '关闭'}，"
+              f"设备端尚未接受（忙/拒绝），保留期望待下次上线")
+        return
+    request_id = uuid.uuid4().hex[:8]
+    try:
+        socketio.emit("set_stack_mode",
+                      {"enable": want,
+                       "by": ent["by"] or "系统",
+                       "by_role": ent["by_role"] or "",
+                       "reason": "offline_intent",
+                       "request_id": request_id},
+                      to=sid)
+    except Exception as e:
+        print(f"[stack_intent] {client_id} 下发离线期望失败: {e}")
+        return
+    with _stack_intent_lock:
+        _stack_intent_dispatched[client_id] = want
+    actual = "开启" if st["mode"] else ("关闭" if st["mode"] is False else "未知")
+    print(f"[stack_intent] {client_id} 上线校验不一致（期望{'开启' if want else '关闭'}，"
+          f"实际{actual}）→ 已下发 set_stack_mode"
+          f"（reason=offline_intent, request_id={request_id}）")
+
+
+# 模块加载即读取已保存的期望（若无则空字典，不打印噪音）
+_stack_intent = load_stack_intent()
+
+
 # 推送后等待反馈的任务: { order_id: {"pushed_at": datetime, "client_id": str} }
+
 pushed_tasks = {}
 pushed_tasks_lock = threading.Lock()
 
@@ -2167,6 +2378,8 @@ def _printer_state_payload(client_id: str) -> dict:
         # 本机攒批模式镜像（2026-10：本地工具上报后这里回显，便于两端对齐）
         "stack_mode": _stack_state_of(client_id)["mode"],
         "stack_busy": _stack_state_of(client_id)["busy"],
+        # 2026-11：本机是否有一条"离线时期望"还没落地（设备端可据此提示"上线后自动应用"）
+        "stack_pending": _stack_intent_pending(client_id),
     }
 
 
@@ -4511,6 +4724,9 @@ def on_connect(auth=None):
         }
     join_room(client_id)
     _sid_to_client[request.sid] = client_id   # S1-07：on_ping 的 O(1) 映射
+    # 攒批「离线期望」：新会话允许自动重试一次（上一次会话里设备忙拒绝过的那条）
+    with _stack_intent_lock:
+        _stack_intent_dispatched.pop(client_id, None)
     print(f"[LINK] 打印机客户端已连接: {client_id}")
 
     # 上线即同步接单状态（本机是否接管 / 当前接管者是谁），供设备端 UI 与自动续接单判断
@@ -5183,6 +5399,11 @@ def on_stack_state(data):
         waiter.set()
     show = "开启" if mode else ("关闭" if mode is False else "未知")
     print(f"  [STACK] {client_id} 攒批模式={show} 忙={busy}" + (f"（{note}）" if note else ""))
+    # 离线期望落地：这次上报是设备端刚给的真实状态 ⇒ 现在比对「期望 vs 实际」最可靠
+    try:
+        _apply_stack_intent_on_online(client_id, sid=request.sid)
+    except Exception as e:
+        print(f"[stack_intent] {client_id} 上线校验出错（已忽略，不影响状态镜像）: {e}")
 
 
 @sio_event("print_keepalive")
@@ -8002,6 +8223,9 @@ def printer_devices():
             "first_seen": entry.get("first_seen", ""),
             "last_seen": entry.get("last_seen", ""),
             "is_active": is_claiming(cid),
+            # 攒批「离线期望」是否还没落地（2026-11）：true = 有人趁着离线点过开关，
+            # 设备上线后会自动应用；移动端据此显示"已记录，上线后自动应用"
+            "stack_pending": _stack_intent_pending(cid),
             # 自动双面能力（三态；授权页据此标注"需人工翻纸"）
             **_device_capability_fields(cid),
         })
@@ -8031,7 +8255,13 @@ def printer_stack_mode():
     实现：服务端先按镜像状态校验 → emit `set_stack_mode` 给该设备 → 等设备端回报（≤3s）
     → 用回报后的最新状态回复。设备端收到指令后会**再自查一次**（防两端状态竞态），
     最终「以设备端为准」。
-    一律 HTTP 200，靠 body 的 success 判断（前端只读 success / message / stack_mode / stack_busy）。
+    离线（2026-11）：不再拒绝 —— 记录「期望」（uploads/stack_intent.json，重启不丢），
+    返回 {"success": true, "pending": true, "message": "设备离线，已记录：上线后自动应用"}；
+    设备上线第一次上报 stack_state 时与期望比对，不一致就下发 `set_stack_mode`
+    （带 `"reason": "offline_intent"`），设备忙/拒绝则保留期望、下次上线再试。
+    ⚠ 离线路径**不校验忙闲**（状态未知），但仍要求该机型需要攒批；离线时也**不**下发任何指令。
+    一律 HTTP 200，靠 body 的 success 判断（前端只读 success / message / stack_mode / stack_busy，
+    离线时多读一个 pending）。
     """
     role = compute_role(getattr(g, "openid", "") or "")
     if role not in ("admin", "super_admin"):
@@ -8042,16 +8272,32 @@ def printer_stack_mode():
     if not client_id or enable is None:
         return jsonify({"success": False, "message": "参数不完整（需要 client_id 与 enable）"})
 
-    # 设备必须在线：离线设备无法立刻执行，直接拒绝（攒批状态是实时操作，不排队）
+    # 设备是否在线（心跳表）。离线不再直接拒绝 —— 见下面的期望记录分支。
     with printer_clients_lock:
         info = printer_clients.get(client_id)
     sid = info.get("sid") if info else None
     hb = info.get("heartbeat") if info else None
     online = bool(sid) and hb is not None and \
         (datetime.now() - hb).total_seconds() <= CLIENT_HEARTBEAT_TIMEOUT
+
+    # 设备离线（2026-11）：不再拒绝，改成记录「期望」——设备上线第一次上报 stack_state 时
+    # 由 _apply_stack_intent_on_online 比对并下发（reason=offline_intent）。
+    # ⚠ 离线路径**不校验忙闲**（设备状态未知，判不出来，用户口径就是"先记下来"）；
+    #   唯一保留的闸门是"该机型是否需要攒批"——自动双面/能力未确认的设备不留无意义的期望。
     if not online:
         st = _stack_state_of(client_id)
-        return jsonify({"success": False, "message": "设备离线，无法远程切换攒批模式",
+        if not _stack_needs_manual_flip(client_id):
+            print(f"[stack_intent] {client_id} 离线期望被拒：该机型不需要攒批")
+            return jsonify({"success": False,
+                            "message": _stack_toggle_problem(client_id, enable),
+                            "stack_mode": st["mode"], "stack_busy": st["busy"]})
+        by = operator_display_name(getattr(g, "openid", "")) or role
+        saved = _set_stack_intent(client_id, enable, by=by, by_role=role)
+        print(f"[stack_intent] {client_id} 设备离线 → 期望已记录"
+              f"（{'开启' if enable else '关闭'}，by={by}，落盘={'成功' if saved else '失败'}）"
+              f"，上线后自动应用")
+        return jsonify({"success": True, "pending": True,
+                        "message": "设备离线，已记录：上线后自动应用",
                         "stack_mode": st["mode"], "stack_busy": st["busy"]})
 
     problem = _stack_toggle_problem(client_id, enable)
@@ -8093,6 +8339,9 @@ def printer_stack_mode():
     msg = result.get("note") or ("攒批模式已开启" if enable else "攒批模式已关闭")
     if not ok and not result.get("note"):
         msg = "设备端拒绝了本次切换"
+    if ok:
+        # 在线指令已生效 ⇒ 之前那条离线期望没有存在意义了（否则下次上报还会被拿出来比对）
+        _clear_stack_intent(client_id, "在线指令已生效，清除离线期望")
     return jsonify({"success": bool(ok), "message": msg,
                     "stack_mode": st["mode"], "stack_busy": st["busy"]})
 
@@ -8198,6 +8447,9 @@ def claiming_devices():
             "stack_busy": st["busy"],
             "stack_can_toggle": bool(online) and not _stack_toggle_problem(cid),
             "stack_reason": ("设备离线" if not online else _stack_toggle_problem(cid)),
+            # 攒批「离线期望」是否还没落地（2026-11）：设备离线时点过开关 → true，
+            # 上线自动应用后清掉。移动端据此把开关置灰并显示"已记录，上线后自动应用"
+            "stack_pending": _stack_intent_pending(cid),
             # 置顶（2026-10）：pin_index 是「在生效顺序里的 0 基序位」，未置顶为 null（不是 -1：
             # 前端一律用 pin_index === 0 判默认选中，null/缺字段都能被它排除掉）。
             "pin": cid in pin_index_of,
@@ -10771,6 +11023,189 @@ def admin_security():
     # GET：返回当前阈值
     cfg = dict(_SECURITY)
     return jsonify({"success": True, **cfg})
+
+
+# ---------- 「最近 N 条订单」速览（2026-11）----------
+# 现场要一块"最近打了什么"的卡片：跨所有用户、只给最近 N 条、不提供翻页 —— 目的是让管理员
+# 一眼看到全站最新动态，而不是把 /api/orders 的权限放大成"能查全站历史"。N 由超管设置
+# （/api/admin/recent_orders_limit，默认 10，范围 1..100，落 uploads/recent_orders_config.json）。
+
+
+def _recent_orders_owner(row, profiles):
+    """订单「谁下的」显示名（脱敏由调用方用 _mask_person_name 做，这里给真名）。
+
+    · source='local'（本机打印工具直打）没有用户账号，owner 就是 orders.owner_name
+      （打印时盖章的成员名）；连这个都没有 → "本机打印"。
+    · 云端单（wechat/app）优先 users.nickname；没填昵称才退回 orders.owner_name
+      （那通常是执行打印的管理员），最后退回 openid 末四位。
+    """
+    source = str(row["source"] or "")
+    openid = str(row["openid"] or "")
+    owner_name = str(row["owner_name"] or "").strip()
+    if source == "local" or openid in ("", "local"):
+        return owner_name or "本机打印"
+    nick = str((profiles.get(openid) or {}).get("nickname") or "").strip()
+    if nick:
+        return nick
+    if owner_name:
+        return owner_name
+    return ("用户" + openid[-4:]) if len(openid) >= 4 else "微信用户"
+
+
+@app.route("/api/admin/recent_orders", methods=["GET"])
+@login_required
+def admin_recent_orders():
+    """全站最近 N 条订单（仅 admin/super_admin；只读，**不提供翻页**）。
+
+    查询参数 `?limit=` 可临时覆盖 N（夹在 1..100），但不改变超管设置的默认值。
+    返回字段（与移动端约定，勿改名）：
+      order_id / order_number / owner / owner_masked / created_at /
+      file_count / page_count / total_price / status / source / is_admin_print
+    · page_count = 有效页数合计（含份数）：与结算页订单明细同源，逐文件走
+      `_file_range_stats(...)`（内部只认 `_count_pages_in_range`，v7.2 唯一口径）；
+    · sheet_count = 纸张张数合计（双面折算）—— 附赠字段，方便前端显示"8 页 / 4 张"；
+    · total_price 直接读库值，**不重算**（重算会把人工改价/免单的历史单算歪）；
+    · status 用 aggregate_order_status 聚合子任务状态，取不到才退回 orders.status。
+    """
+    role = compute_role(getattr(g, "openid", "") or "")
+    if role != "admin":
+        return jsonify({"success": False, "message": "需要管理员权限"}), 403
+    if not _rate_limit_ok(f"recent_orders:{g.openid}", 60, 60):
+        return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
+
+    lo, hi = RECENT_ORDERS_LIMIT_RANGE
+    try:
+        limit = int(_RECENT_ORDERS_LIMIT)
+    except (TypeError, ValueError):
+        limit = DEFAULT_RECENT_ORDERS_LIMIT
+    limit = max(lo, min(hi, limit))
+    raw = (request.args.get("limit") or "").strip()
+    if raw:
+        try:
+            limit = max(lo, min(hi, int(raw)))
+        except ValueError:
+            return jsonify({"success": False,
+                            "message": f"limit 必须为整数（{lo}-{hi}）"}), 400
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, order_number, openid, owner_name, source, created_at, "
+            "copies, page_count, duplex, total_price, status, is_admin_print "
+            "FROM orders ORDER BY created_at DESC, id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        files_by_order = {r["id"]: [] for r in rows}
+        if files_by_order:
+            ids = list(files_by_order.keys())
+            ph = ",".join("?" * len(ids))
+            for f in conn.execute(
+                f"SELECT order_id, page_count, copies, duplex, page_range "
+                f"FROM order_files WHERE order_id IN ({ph}) ORDER BY order_id, id",
+                ids
+            ).fetchall():
+                files_by_order.setdefault(f["order_id"], []).append(dict(f))
+        profiles = {}
+        openids = sorted({str(r["openid"] or "") for r in rows
+                          if r["openid"] and str(r["openid"]) != "local"})
+        if openids:
+            # 昵称在独立的 users.db（orders.db 里没有 users 表）——与 revenue 明细同源
+            user_conn = get_user_db()
+            try:
+                ph = ",".join("?" * len(openids))
+                for u in user_conn.execute(
+                    f"SELECT openid, nickname FROM users WHERE openid IN ({ph})", openids
+                ).fetchall():
+                    profiles[u["openid"]] = {"nickname": u["nickname"] or ""}
+            finally:
+                user_conn.close()
+        orders = []
+        for r in rows:
+            oid = r["id"]
+            files = files_by_order.get(oid) or []
+            if files:
+                page_count = 0
+                sheet_count = 0
+                for f in files:
+                    st = _file_range_stats(f.get("page_count") or 1,
+                                           f.get("copies") or 1,
+                                           f.get("duplex") or "off",
+                                           f.get("page_range") or "")
+                    page_count += st["total_pages"]
+                    sheet_count += st["total_sheets"]
+            else:
+                # 老单 / 子任务被自动清理过的兜底：按订单自身字段算 1 个文件，口径同上
+                st = _file_range_stats(r["page_count"] or 1, r["copies"] or 1,
+                                       r["duplex"] or "off")
+                page_count = st["total_pages"]
+                sheet_count = st["total_sheets"]
+            owner = _recent_orders_owner(r, profiles)
+            orders.append({
+                "order_id": oid,
+                "order_number": r["order_number"] or "",
+                "owner": owner,
+                "owner_masked": _mask_person_name(owner) if owner else "",
+                "created_at": r["created_at"] or "",
+                "file_count": len(files) or 1,
+                "page_count": page_count,
+                "sheet_count": sheet_count,
+                "total_price": round(r["total_price"] or 0.0, 2),
+                "status": aggregate_order_status(conn, oid) or (r["status"] or ""),
+                "source": r["source"] or "wechat",
+                "is_admin_print": bool(r["is_admin_print"]),
+            })
+    finally:
+        conn.close()
+    print(f"[recent_orders] {getattr(g, 'openid', '')} 读取最近 {limit} 条订单"
+          f"（返回 {len(orders)} 条）")
+    return jsonify({"success": True, "limit": limit, "orders": orders})
+
+
+@app.route("/api/admin/recent_orders_limit", methods=["GET", "POST"])
+@login_required
+def admin_recent_orders_limit():
+    """「最近 N 条订单」的 N：GET 所有管理员可读，POST **仅超管**可写。
+
+    GET  → {"success": true, "limit": 10, "range": [1, 100]}
+    POST {"limit": 15} → 校验 1..100 → 原子落盘 uploads/recent_orders_config.json → 即时生效。
+    ⚠ compute_role 只返回 admin/user/guest（**超管被折叠成 admin**），所以"仅超管"必须用
+      SUPER_ADMIN_OPENID 判据；写成 role != "admin" 就等于"任何管理员都能改"（/api/admin/security
+      那种写法在放开给普通管理员用，不能照抄）。
+    """
+    role = compute_role(getattr(g, "openid", "") or "")
+    if role != "admin":
+        return jsonify({"success": False, "message": "需要管理员权限"}), 403
+    lo, hi = RECENT_ORDERS_LIMIT_RANGE
+    is_super = bool(SUPER_ADMIN_OPENID) and g.openid == SUPER_ADMIN_OPENID
+
+    if request.method == "POST":
+        if not is_super:
+            print(f"[recent_orders] {g.openid} 无权修改条数上限（仅超管）")
+            return jsonify({"success": False,
+                            "message": "仅超级管理员可以修改这个设置"}), 403
+        if not _rate_limit_ok(f"recent_orders_limit:{g.openid}", 20, 60):
+            return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
+        data = request.get_json(silent=True) or {}
+        raw = data.get("limit")
+        if raw is None or isinstance(raw, bool):
+            return jsonify({"success": False, "message": "limit 必须为整数"}), 400
+        try:
+            limit = int(raw)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "message": "limit 必须为整数"}), 400
+        if not (lo <= limit <= hi):
+            return jsonify({"success": False,
+                            "message": f"limit 范围: {lo}-{hi}"}), 400
+        try:
+            save_recent_orders_config(limit)
+        except OSError as e:
+            print(f"[recent_orders] 保存条数失败: {e}")
+            return jsonify({"success": False, "message": f"保存失败：{e}"}), 500
+        print(f"[recent_orders] 超管 {g.openid} 把「最近订单」条数改为 {limit}")
+        return jsonify({"success": True, "limit": limit, "range": [lo, hi],
+                        "message": f"已更新为最近 {limit} 条"})
+
+    return jsonify({"success": True, "limit": _RECENT_ORDERS_LIMIT, "range": [lo, hi]})
 
 
 # ==================== 统计与报表接口 ====================

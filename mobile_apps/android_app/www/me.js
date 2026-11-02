@@ -13,7 +13,7 @@ const SECURITY_DEFS = [
   { key: 'log_report_rate_limit', label: '日志上报上限', unit: '条/分', min: 1, max: 600, hint: '每IP每分钟' },
 ];
 
-const _adminLoadTimes = { keys: 0, tempUsers: 0, storage: 0, security: 0, admins: 0 };
+const _adminLoadTimes = { keys: 0, tempUsers: 0, storage: 0, security: 0, admins: 0, recentOrders: 0 };
 let _lastRoleForAdminLoad = null;
 
 // 角色进入 admin 时重置管理员模块加载时间戳：
@@ -76,6 +76,14 @@ const meState = {
   authorizedUsers: [],
   bindDevices: [],
   bindDevicesLoading: false,
+  // 「近 N 条订单」卡片（2026-11，仅管理员/超管）：N 由超管设置（接口回传，默认 10）
+  recentOrders: [],
+  recentOrdersLimit: 10,
+  recentOrdersLoading: false,
+  // 超管的 N 步进器状态（就地展开，不做大弹窗）
+  recentOrdersLimitEditing: false,
+  recentOrdersLimitDraft: 10,
+  recentOrdersLimitSaving: false,
   userOrdersView: { openid: '', nickname: '', source: '', orders: [], page: 1, perPage: 10, total: 0, totalPages: 0, expanded: {} },
 };
 
@@ -169,8 +177,13 @@ function refreshMeUI() {
     loadIfStale('tempUsers', loadTempUsers);
     loadIfStale('storage', loadStorageStats);
     loadIfStale('security', loadSecurityConfig);
+    // 「近 N 条订单」：每次进入「我的」页（refreshMeUI 的既有入口）按 30s 新鲜度拉一次；
+    // 非管理员在 loadRecentOrders 内部直接 return（不发请求），整块也保持收起。
+    loadIfStale('recentOrders', loadRecentOrders);
     if (state.isSuperAdmin) loadIfStale('admins', loadAdmins);
   }
+  // 超管的「设置 N」入口显隐（非超管置 none；切换身份/退出登录后也要跟着收回去）
+  renderRecentOrderLimitEditor();
   measureAll(150);
 }
 
@@ -195,6 +208,8 @@ function updateAdminCollapsed() {
   setBlock('adminBlockStorage', isAdmin && !!meState.storageStats);
   setBlock('adminBlockSecurity', isAdmin && !!meState.securityConfig);
   setBlock('adminBlockAuth', isAdmin);
+  // 「近 N 条订单」跟着管理员身份展开/收起（非管理员即使残留数据也不露出来）
+  setBlock('recentOrdersBlock', isAdmin);
   measureAll(150);
 }
 
@@ -347,6 +362,36 @@ function setupMeButtons() {
     if (priceTap) { e.stopPropagation(); openPricePop(priceTap, priceTap.dataset.priceCopy); return; }
     const card = e.target.closest('[data-order-id]');
     if (card) toggleOrder(parseInt(card.dataset.orderId, 10));
+  });
+  // 「近 N 条订单」卡片（仅管理员渲染）：价格 → 复用订单卡片的复制气泡；
+  // 归属人 → 脱敏/真名就地切换（不重渲染整块，避免动画/滚动位置跳动）
+  const recentList = document.getElementById('recentOrderList');
+  if (recentList) recentList.addEventListener('click', (e) => {
+    const priceEl = e.target.closest('[data-recent-price]');
+    if (priceEl) { e.stopPropagation(); openPricePop(priceEl, priceEl.dataset.recentPrice); return; }
+    const ownerEl = e.target.closest('[data-recent-owner]');
+    if (ownerEl) {
+      e.stopPropagation();
+      const masked = ownerEl.dataset.ownerMasked || '';
+      const full = ownerEl.dataset.ownerFull || '';
+      ownerEl.textContent = (ownerEl.textContent === full) ? masked : full;
+    }
+  });
+  // 超管专属：N 设置入口 + 就地步进器（−/+、保存、取消）。非超管的分支全在函数内再判一次。
+  const limitEntryEl = document.getElementById('recentOrderLimitEntry');
+  if (limitEntryEl) limitEntryEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!state.isSuperAdmin) return;
+    openRecentOrdersLimitEditor(!meState.recentOrdersLimitEditing);
+  });
+  const limitEditorEl = document.getElementById('recentOrderLimitEditor');
+  if (limitEditorEl) limitEditorEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!state.isSuperAdmin) return;
+    const step = e.target.closest('[data-limit-step]');
+    if (step) { stepRecentOrdersLimit(parseInt(step.dataset.limitStep, 10)); return; }
+    if (e.target.closest('#recentOrderLimitSave')) { saveRecentOrdersLimit(); return; }
+    if (e.target.closest('#recentOrderLimitCancel')) { openRecentOrdersLimitEditor(false); }
   });
   document.getElementById('ordersPageNumbers').addEventListener('click', (e) => {
     const num = e.target.closest('[data-page-num]');
@@ -1137,6 +1182,187 @@ function toggleOrder(id) {
   setTimeout(() => measureAll(320), 340);
 }
 
+/* ================= 近 N 条订单（管理员/超管，2026-11） =================
+   需求：管理员在「我的」页一眼看到最近 N 条**所有人**的订单（含归属人），价格可复制。
+   - 数据：GET /api/admin/recent_orders → { success, limit, orders:[{order_id, order_number,
+     owner, owner_masked, created_at, file_count, page_count, total_price, status, source,
+     is_admin_print}] }。limit 由超管在小程序端设置（默认 10），这里只读；
+     /api/admin/recent_orders_limit 是给设置面板用的，本卡片不拉。
+   - 触发：进入「我的」页走 refreshMeUI 的既有管理员分支 → loadIfStale('recentOrders', …)
+     （30s 新鲜度），与订单列表同一节奏，**不轮询**（APP 无下拉刷新，切 tab 即刷新）。
+   - 非管理员（含游客/普通用户）：整块 admin-collapsible 保持收起 + 这里直接 return，
+     一个请求都不发。超管在 compute_role 里也是 role==='admin'，所以判据只认 'admin'。
+   - 失败静默保留上一次渲染（管理员看板不该因为一次超时闪成空；loadIfStale 会清时间戳重试）。
+   - 复制价格直接复用订单卡片那套 openPricePop（同一气泡、同一剪贴板口径）：行数据登记进
+     _priceOrderById 的检索池即可，不另写一套剪贴板逻辑。 */
+
+// created_at 只显示「月-日 时:分」；格式不认识就原样显示（后端改格式也不会显示成空白）
+function _recentOrderTime(s) {
+  const m = String(s || '').match(/(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  return m ? (m[2] + '-' + m[3] + ' ' + m[4] + ':' + m[5]) : String(s || '');
+}
+
+// 订单来源只做展示，不改写订单来源字段（硬规矩：来源一致性，双端闸门）
+function _recentOrderSource(s) {
+  if (s === 'cloud') return '云端';
+  if (s === 'local') return '本地';
+  return '';
+}
+
+async function loadRecentOrders() {
+  if (state.role !== 'admin') return false;   // 非管理员：不发请求
+  if (meState.recentOrdersLoading) return false;
+  meState.recentOrdersLoading = true;
+  try {
+    const r = await api('/api/admin/recent_orders');
+    const data = (r && r.data) || {};
+    if (!data.success || !Array.isArray(data.orders)) return false;
+    const lim = Math.floor(Number(data.limit));
+    meState.recentOrdersLimit = (isFinite(lim) && lim > 0) ? lim : 10;
+    meState.recentOrders = data.orders.map(o => ({
+      // openPricePop 按 o.id 回查，所以把 order_id 映射成 id；价格/订单号口径与订单卡片一致
+      id: (o && o.order_id !== undefined) ? o.order_id : '',
+      order_number: (o && o.order_number) || '',
+      total_price: Number(o && o.total_price) || 0,
+      files: [],   // 契约不下发逐文件明细 → 「复制详细价格」只出标题+合计（不编造分项）
+      owner: (o && o.owner) || '',
+      owner_masked: (o && o.owner_masked) || '',
+      created_at: (o && o.created_at) || '',
+      file_count: Number(o && o.file_count) || 0,
+      page_count: Number(o && o.page_count) || 0,
+      status: (o && o.status) || '',
+      source: (o && o.source) || '',
+      is_admin_print: !!(o && o.is_admin_print),
+    }));
+    renderRecentOrders();
+    return true;
+  } catch (e) {
+    return false;   // 静默失败：保留上一次渲染
+  } finally {
+    meState.recentOrdersLoading = false;
+  }
+}
+
+function renderRecentOrders() {
+  const box = document.getElementById('recentOrderList');
+  if (!box) return;
+  const title = document.getElementById('recentOrdersTitle');
+  if (title) title.textContent = '近 ' + (meState.recentOrdersLimit || 10) + ' 条订单';
+  const rows = meState.recentOrders || [];
+  const count = document.getElementById('recentOrderCount');
+  if (count) {
+    count.textContent = String(rows.length);
+    count.style.display = rows.length ? '' : 'none';
+  }
+  box.innerHTML = rows.length
+    ? rows.map(recentOrderRowHTML).join('')
+    : '<view class="recent-order-empty">暂无订单</view>';
+  measureAll(150);
+}
+
+// 单行订单：归属人（脱敏；点一下看真名，再点回脱敏）+ 时间 + 状态 ／ 文件数·页数·来源 + 价格
+function recentOrderRowHTML(o) {
+  const masked = o.owner_masked || o.owner || '未知';
+  const full = o.owner || masked;
+  const stLabel = ORDER_STATUS_MAP[o.status] || o.status || '';
+  const meta = [];
+  if (o.file_count > 0) meta.push(o.file_count + ' 个文件');
+  if (o.page_count > 0) meta.push(o.page_count + ' 页');
+  if (o.is_admin_print) meta.push('管理员自打');
+  const src = _recentOrderSource(o.source);
+  if (src) meta.push(src);
+  return `<view class="recent-order-row">
+      <view class="recent-order-line">
+        <text class="recent-order-owner" data-recent-owner="${escHtml(String(o.id))}" data-owner-masked="${escHtml(masked)}" data-owner-full="${escHtml(full)}">${escHtml(masked)}</text>
+        <text class="recent-order-time">${escHtml(_recentOrderTime(o.created_at))}</text>
+        ${stLabel ? `<text class="recent-order-status ${orderStatusClass(o.status)}">${escHtml(stLabel)}</text>` : ''}
+      </view>
+      <view class="recent-order-line">
+        <text class="recent-order-meta">${escHtml(meta.join(' · ') || '—')}</text>
+        <view class="recent-order-price" data-recent-price="${escHtml(String(o.id))}">¥${_priceOrderTotal(o).toFixed(2)}<text class="price-copy-icon">📋</text></view>
+      </view>
+    </view>`;
+}
+
+/* ---------- 超管设置 N（1..100） ----------
+   用户原话「近{超管设置的数字（默认 10）}条订单」⇒ N 必须能改，不能只读接口值。
+   写接口 POST /api/admin/recent_orders_limit 只对超管开放（非超管 403）；入口本身也
+   只对超管渲染 —— 判据用 state.isSuperAdmin，**不能**写 role === 'super_admin'
+   （后端 compute_role() 只返回 admin/user/guest，超管身份走 /api/login 的 is_super_admin）。
+   保存失败保持旧值，只用轻提示，不弹遮罩。 */
+const RECENT_ORDER_LIMIT_MIN = 1;
+const RECENT_ORDER_LIMIT_MAX = 100;
+
+function _clampRecentOrdersLimit(n) {
+  const v = Math.round(Number(n));
+  if (!isFinite(v)) return RECENT_ORDER_LIMIT_MIN;
+  return Math.max(RECENT_ORDER_LIMIT_MIN, Math.min(RECENT_ORDER_LIMIT_MAX, v));
+}
+
+function renderRecentOrderLimitEditor() {
+  const isSuper = !!state.isSuperAdmin;
+  // 身份变了（退出登录 / 被降权）→ 编辑器强制收起，不能留个能点的空壳
+  if (!isSuper && meState.recentOrdersLimitEditing) meState.recentOrdersLimitEditing = false;
+  const entry = document.getElementById('recentOrderLimitEntry');
+  if (entry) entry.style.display = isSuper ? '' : 'none';
+  const editor = document.getElementById('recentOrderLimitEditor');
+  if (editor) editor.style.display = (isSuper && meState.recentOrdersLimitEditing) ? '' : 'none';
+  const value = document.getElementById('recentOrderLimitValue');
+  if (value) value.textContent = String(meState.recentOrdersLimitDraft);
+  const save = document.getElementById('recentOrderLimitSave');
+  if (save) save.classList.toggle('recent-order-limit-save-disabled', !!meState.recentOrdersLimitSaving);
+}
+
+function openRecentOrdersLimitEditor(open) {
+  if (!state.isSuperAdmin) return;   // 非超管：一个像素都不动
+  meState.recentOrdersLimitEditing = open !== false;
+  if (meState.recentOrdersLimitEditing) meState.recentOrdersLimitDraft = meState.recentOrdersLimit || 10;
+  renderRecentOrderLimitEditor();
+  measureAll(150);
+}
+
+function stepRecentOrdersLimit(delta) {
+  if (!state.isSuperAdmin) return;
+  meState.recentOrdersLimitDraft = _clampRecentOrdersLimit((meState.recentOrdersLimitDraft || 10) + (Number(delta) || 0));
+  renderRecentOrderLimitEditor();
+}
+
+async function saveRecentOrdersLimit() {
+  if (!state.isSuperAdmin) return false;
+  if (meState.recentOrdersLimitSaving) return false;
+  const limit = _clampRecentOrdersLimit(meState.recentOrdersLimitDraft);
+  meState.recentOrdersLimitSaving = true;
+  renderRecentOrderLimitEditor();
+  try {
+    const r = await api('/api/admin/recent_orders_limit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: limit }),
+    });
+    const data = (r && r.data) || {};
+    if (!data.success) {
+      // 失败保持旧值：不关编辑器、不改标题，只轻提示（403 / 400 都走这条）
+      showToast(data.message || '保存失败，请稍后重试', 2500);
+      return false;
+    }
+    const saved = _clampRecentOrdersLimit(data.limit === undefined ? limit : data.limit);
+    meState.recentOrdersLimit = saved;
+    meState.recentOrdersLimitDraft = saved;
+    meState.recentOrdersLimitEditing = false;
+    renderRecentOrders();            // 标题「近 N 条订单」立刻跟着 N 走
+    showToast(data.message || ('已更新为最近 ' + saved + ' 条'), 2000);
+    await loadRecentOrders();        // 按新 N 重拉一次（只这一次，不轮询）
+    return true;
+  } catch (e) {
+    showToast('网络错误，保存失败', 2500);
+    return false;
+  } finally {
+    meState.recentOrdersLimitSaving = false;
+    renderRecentOrderLimitEditor();
+    measureAll(150);
+  }
+}
+
 /* ================= 合计价格复制（Popconfirm 气泡） =================
    金额一律取订单**已定稿**的实收值（orders.total_price / order_files.total_price）——
    设备回报页数后后端会重算并回写，前端不再套单价，所以复制出去的就是页面上看到的数字。
@@ -1150,7 +1376,7 @@ function _priceOrderTotal(o) {
 }
 
 function _priceOrderById(id) {
-  const pools = [meState.orders];
+  const pools = [meState.orders, meState.recentOrders];
   const v = meState.userOrdersView;
   if (v && v.orders && v.orders.length) pools.push(v.orders);
   for (let i = 0; i < pools.length; i++) {

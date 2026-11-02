@@ -11,7 +11,11 @@
 - 支持自动/浅色/深色三态主题（与小程序同款渐变背景交叉淡入）
 - Capacitor 打包为原生 APK
 
-> 小程序 WXSS 更新后，重新运行 `node tools/wxss2web.mjs` 即可再生成 styles.css。
+> ⚠ `www/styles.css` **不是纯生成物**：它由 `tools/wxss2web.mjs` 打过底，但之后手工大改过约 2000 行
+> （几何口径、玻璃拟态、APP 专有卡片如「近 N 条订单」）。`node tools/wxss2web.mjs` **会直接覆盖它**，
+> 且该脚本不接受输出路径参数 —— 所以默认拒绝执行，必须显式加 `--force`。
+> 小程序 WXSS 改了要同步过来时，请**手工挑对应规则**贴进 `www/styles.css`（并同步 `tools/wxss2web.mjs`
+> 模板，否则下次谁重跑生成器又会把这些改动抹掉）；真要整份重生成，先 `git diff www/styles.css` 备份。
 
 ## 功能清单
 

@@ -321,6 +321,7 @@ const PRINT_ENTRANCE = [
   ['remarkCard', 0.35],
   ['autoPrintSection', 0.4],
   ['adminPrintSection', 0.5],
+  ['privacyEntryRow', 0.55],    // 文件保留一行：夹在管理员开关与提交按钮之间（2026-11-01 补入场）
   ['submitArea', 0.6],
 ];
 
@@ -341,7 +342,7 @@ function playCardEntrance(el) {
   el.addEventListener('animationend', done);
 }
 
-// 页面就绪：按页面加载时刻调度 7 张卡片入场；全部结束后清理入场类（切 tab 不重放）
+// 页面就绪：按页面加载时刻调度入场（表里逐项递增；含 deviceSelectCard 这种异步显隐的）；全部结束后清理入场类（切 tab 不重放）
 function pageReady() {
   if (_printEntrancePlayed) return;
   _printEntrancePlayed = true;
@@ -1740,9 +1741,19 @@ function refreshMinuteWheel(hourIdx, hourStart, curHour, minuteStart) {
   });
 }
 
-// 通用滚轮：scroll-snap 贴合
-// 索引判定用"item 中心到视口中心的距离最近"（与 scroll-snap-align:center 同一规则），
+// 通用滚轮：原生滚动 + 松手静止后吸附
+// 索引判定用"item 中心到视口中心的距离最近"（与吸附目标同一规则），
 // 不依赖间距测量，避免 offsetHeight/offsetTop 舍入在长列表累积误差导致高亮错位
+//
+// 2026-11-02（用户反馈：「滑动的时候阻力感太大」）根因：原来靠 CSS
+// `scroll-snap-type: y mandatory` 做吸附 —— Chromium 在**每次松手**时就把惯性收敛到最近的
+// 吸附点，一次手势几乎只走一格（划得越快越明显），这就是"粘手/阻力"的来源
+// （`scroll-snap-stop: always` 只会更硬；`y proximity` 也仍在松手那一瞬接管惯性）。
+// 现在改为**完全不做 CSS snap**：拖动与惯性 100% 交给原生滚动（轻扫即走、1:1 跟手），
+// 停下之后再由 JS 平滑吸附到最近一格的中央（轻扫过 5 格就停在第 5 格）。
+// 契约不变：readWheelIndex() / confirmScheduleTime() 仍按"item 中心离视口中心最近"取索引。
+const WHEEL_SNAP_IDLE_MS = 140;  // 手指/惯性静止多久后吸附（太快会在惯性里截断，太慢显得没收住）
+const WHEEL_SNAP_MAX_MS = 420;   // smooth 滚动兜底复位时间（环境不支持 smooth 时也要解锁）
 function buildWheel(wheelId, items, selectedIndex, onChange) {
   const col = document.getElementById(wheelId);
   col.innerHTML = `
@@ -1767,6 +1778,15 @@ function buildWheel(wheelId, items, selectedIndex, onChange) {
     }
     return best;
   };
+  // 第 i 项居中时该有的 scrollTop（与 centerItem 同一算法；布局未就绪返回 null 表示这轮跳过）
+  const targetTopFor = (i) => {
+    const list = vp.querySelectorAll('.wheel-item');
+    const el = list[i] || list[0];
+    if (!el) return null;
+    const h = el.offsetHeight;
+    if (!h) return null; // 布局未就绪（如弹窗还没显示），不吸附，等下一次 scroll
+    return Math.max(0, el.offsetTop + h / 2 - vp.clientHeight / 2);
+  };
   const centerItem = (i) => {
     const list = vp.querySelectorAll('.wheel-item');
     const el = list[i] || list[0];
@@ -1780,14 +1800,44 @@ function buildWheel(wheelId, items, selectedIndex, onChange) {
     if (!centerItem(i)) requestAnimationFrame(() => scrollTo(i));
   };
   scrollTo(selectedIndex);
-  let deb = null;
+  let deb = null;         // onChange 去抖（原逻辑：120ms）
+  let snapTimer = null;   // 静止吸附定时器
+  let snapping = false;   // 吸附动画进行中（期间不再重复排吸附，避免自己和自己抢 scrollTop）
+  let touching = false;   // 手指还在屏幕上（跟手优先，一律不吸附）
+  const prefersReducedMotion = () =>
+    !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  const cancelSnap = () => { if (snapTimer) { clearTimeout(snapTimer); snapTimer = null; } };
+  const snapToNearest = () => {
+    snapTimer = null;
+    if (touching) { snapping = false; return; }   // 手指又按下去了，让位
+    const idx = Math.max(0, Math.min(items.length - 1, nearestIndex()));
+    const target = targetTopFor(idx);
+    if (target === null || Math.abs(vp.scrollTop - target) < 0.5) { snapping = false; return; }
+    snapping = true;
+    try {
+      vp.scrollTo({ top: target, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    } catch (e) {
+      vp.scrollTop = target; // 老环境不支持 options 形式
+    }
+    // 兜底解锁：'auto' 分支或环境不吃 smooth 时，滚动可能不再发 scroll 事件
+    setTimeout(() => { snapping = false; }, WHEEL_SNAP_MAX_MS);
+  };
+  const scheduleSnap = () => {
+    cancelSnap();
+    snapTimer = setTimeout(snapToNearest, WHEEL_SNAP_IDLE_MS);
+  };
   const update = () => {
     const idx = Math.max(0, Math.min(items.length - 1, nearestIndex()));
     vp.querySelectorAll('.wheel-item').forEach((el, i) => el.classList.toggle('wheel-item-active', i === idx));
     if (deb) clearTimeout(deb);
     deb = setTimeout(() => { if (typeof onChange === 'function') onChange(idx); }, 120);
+    // 吸附只在"这段时间没有新的 scroll"之后触发：拖动/惯性每帧都有 scroll ⇒ 不会被打断
+    if (!touching && !snapping) scheduleSnap();
   };
   vp.addEventListener('scroll', update, { passive: true });
+  vp.addEventListener('touchstart', () => { touching = true; snapping = false; cancelSnap(); }, { passive: true });
+  vp.addEventListener('touchend', () => { touching = false; scheduleSnap(); }, { passive: true });
+  vp.addEventListener('touchcancel', () => { touching = false; scheduleSnap(); }, { passive: true });
 }
 
 function openScheduleCountdownPicker() {

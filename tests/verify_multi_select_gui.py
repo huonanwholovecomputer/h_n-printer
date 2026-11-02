@@ -88,10 +88,29 @@ win.resize(1400, 900)
 win.show()
 app.processEvents()
 
+def make_text_pdf(name: str, content_pages: int = 2, blank_tail: int = 1) -> str:
+    """真 PDF：前 content_pages 页有正文（一行字），末尾 blank_tail 页整页空白。
+
+    §5 后半段用它验「末尾空白页检测结果要跟着复制」：只有带正文的页才能让
+    detect_trailing_blank_pages 从末页往回停在第一张内容页上。
+    """
+    p = os.path.join(_SANDBOX, name)
+    doc = fitz.open()
+    for i in range(max(1, content_pages)):
+        page = doc.new_page()
+        page.insert_text((72, 120), f"page {i + 1}: content line", fontsize=14)
+    for _ in range(max(0, blank_tail)):
+        doc.new_page()
+    doc.save(p)
+    doc.close()
+    return p
+
+
 PA = make_pdf("A.pdf", 3)
 PB = make_pdf("B.pdf", 2)
 PC = make_pdf("C.pdf", 1)
 PD = make_pdf("D.pdf", 4)
+PE = make_text_pdf("E.pdf", content_pages=2, blank_tail=1)   # 3 页，末尾 1 页空白
 VIEWPORT = win._table.viewport()
 
 
@@ -191,6 +210,11 @@ check("右键落点收敛走 _select_only_row（不受按住的 Ctrl/Shift 影�
       "self._select_only_row(clicked_row)" in src)
 check("存在「添加到新标签页」菜单项与复制实现",
       "添加到新标签页" in src and "def _add_rows_to_new_tab" in src)
+check("「打开文件位置」真的定位到文件（explorer /select，而不是只开目录）",
+      'explorer /select,' in src and "def _reveal_in_explorer" in src
+      and "_reveal_in_explorer(p)" in src)
+check("复制路径没有偷偷调 split_tail_blank（排除只走 _set_blank_tail_excluded）",
+      src.count("split_tail_blank(") == 1)
 
 # ═══════════════ 1. 表格配置 ═══════════════
 
@@ -354,6 +378,48 @@ app.processEvents()
 check("页数未知的 PDF：复制时补出真实页数（3 页）",
       new_key is not None and win._config.tabs[new_key].jobs[0].page_count == 3,
       str(win._config.tabs[new_key].jobs[0].page_count if new_key else None))
+
+# ── 末尾空白页检测结果必须跟着复制（2026-11-01 现场：复制到新标签页后 ⚠ 消失，
+#    但页码范围 1-5 照样留着 ⇒ 操作员以为"没空白页了"，末页空白被悄悄打出来）
+jobs = [
+    PrintJob(file_path=PE, copies=1, duplex="off", page_count=3, page_range="",
+             orientation="portrait", engine="word", display_name="示波器的使用.pdf",
+             blank_tail=1,                       # 源标签页已检测到末尾 1 页空白（未排除）
+             missing_fonts=["宋体"], nonembedded_fonts=["宋体"],
+             font_checked=True, font_fp="fp-1"),
+    PrintJob(file_path=PE, copies=1, duplex="off", page_count=3, page_range="1-2",
+             orientation="portrait", engine="word", display_name="已排除空白页.pdf",
+             blank_tail=1, blank_undo_range=""),   # "" = 排除前是「全部」
+    PrintJob(file_path=PE, copies=1, duplex="off", page_count=3, page_range="",
+             orientation="portrait", engine="word", display_name="过期结果.pdf",
+             blank_tail=0),                        # 源结果过期/记错 ⇒ 复制时必须重测纠正
+]
+seed(jobs, frozen=True)
+select_rows([0, 1, 2])
+new_key = win._add_rows_to_new_tab([0, 1, 2])
+app.processEvents()
+n_tab = win._config.tabs.get(new_key) if new_key else None
+check("空白页：3 个文件都复制过来", n_tab is not None and len(n_tab.jobs) == 3,
+      str(len(n_tab.jobs) if n_tab else None))
+if n_tab and len(n_tab.jobs) == 3:
+    n0, n1, n2 = n_tab.jobs
+    p0 = win._table.item(0, win.COL_PAGES).text()
+    p1 = win._table.item(1, win.COL_PAGES).text()
+    p2 = win._table.item(2, win.COL_PAGES).text()
+    check("空白页：⚠ 跟着复制（未排除 ⇒ 仍显示 ⚠）",
+          n0.blank_tail == 1 and n0.blank_undo_range is None and "⚠" in p0
+          and "已排" not in p0, f"tail={n0.blank_tail} undo={n0.blank_undo_range!r} 格={p0!r}")
+    check("空白页：已排除状态原样保留（范围 1-2 + undo 空串 + ⚠已排）",
+          (n1.blank_tail, n1.page_range, n1.blank_undo_range) == (1, "1-2", "")
+          and "⚠已排" in p1, f"格={p1!r}")
+    check("空白页：源结果过期/记错时复制**重测**纠正（0 → 1）",
+          n2.blank_tail == 1 and "⚠" in p2, f"tail={n2.blank_tail} 格={p2!r}")
+    check("字体黄标跟着复制：非嵌入字体/已检查/指纹",
+          (n0.missing_fonts, n0.nonembedded_fonts, n0.font_checked, n0.font_fp)
+          == (["宋体"], ["宋体"], True, "fp-1"),
+          str((n0.missing_fonts, n0.nonembedded_fonts, n0.font_checked, n0.font_fp)))
+    check("字体列表是深拷贝（改副本不污染原标签页）",
+          n0.missing_fonts is not jobs[0].missing_fonts)
 
 # ═══════════════ 6. 文件丢失的容错 ═══════════════
 

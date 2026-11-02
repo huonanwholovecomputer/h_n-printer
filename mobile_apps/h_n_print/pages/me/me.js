@@ -99,6 +99,19 @@ Component({
       downloading: '文件传输中',
       waiting: '等待打印',
     },
+    // 管理员：「近 N 条订单」卡片（GET /api/admin/recent_orders）。
+    // N 由超管设置（默认 10），页面只显示后端返回的 limit；非管理员不渲染、不发请求；
+    // 失败静默保留上次数据（不弹错误遮罩）。
+    recentOrders: [],
+    recentOrdersLimit: 10,
+    recentOrdersLoading: false,
+    pricePopRecent: false,   // 气泡锚在「近 N 条订单」行：只有「复制价格」（无逐文件明细）
+    // 超管专属：N 编辑器（POST /api/admin/recent_orders_limit，只有 super_admin 能写）。
+    // 入口只对 isSuperAdmin 渲染 —— 后端 compute_role() 把超管折叠成 admin，
+    // 判 userRole === 'super_admin' 永远不命中。
+    recentLimitEditor: false,
+    recentLimitDraft: '',
+    recentLimitSaving: false,
     // 管理员：许可密钥 & 用户列表
     licenseMinutes: 1,
     minusDisabled: true,   // 独立字段避免 setData licenseMinutes 时模板重渲染打断 hover
@@ -246,6 +259,7 @@ Component({
           this.loadActiveKey(false)
           this.loadStorageStats()
           this.loadSecurityConfig()
+          this.loadRecentOrders()   // 「近 N 条订单」：进入页面拉一次（15s 内去重）
           if (this.data.isSuperAdmin) {
             this.loadAdmins()
           }
@@ -306,6 +320,7 @@ Component({
           this.loadActiveKey()
           this.loadStorageStats()
           this.loadSecurityConfig()
+          this.loadRecentOrders()   // 「近 N 条订单」：进入页面拉一次（15s 内去重）
           if (this.data.isSuperAdmin) {
             this.loadAdmins()
           }
@@ -1051,6 +1066,7 @@ Component({
             if (role === 'admin') {
               this.loadStorageStats()
               this.loadSecurityConfig()
+              this.loadRecentOrders()   // 角色刚确认为管理员（首次/刚被授权）→ 补拉一次
               this._startKeyPolling()
               if (isSuper) {
                 this.loadAdmins()
@@ -2673,12 +2689,192 @@ Component({
       setTimeout(() => this._scheduleMeasure(300), 300)
     },
 
+    // ==================== 管理员：「近 N 条订单」 ====================
+    // 云端对所有管理员公开最近 N 条订单（N 由超管设置，默认 10；以后端返回的 limit 为准）。
+    // 非管理员不渲染、不发请求；进入页面拉一次（15s 内不重复拉，避免切 tab 反复请求触发限流）；
+    // 失败静默保留上次数据（不弹错误遮罩），标题右侧「刷新」可手动重拉。
+
+    _normalizeRecentOrders(orders, limit) {
+      const list = Array.isArray(orders) ? orders : []
+      const cap = Math.max(1, Math.min(100, Number(limit) || 10))
+      return list.slice(0, cap).map((o) => {
+        const src = o || {}
+        const total = Math.round((Number(src.total_price) || 0) * 100) / 100
+        const files = Number(src.file_count) || 0
+        const pages = Number(src.page_count) || 0
+        return {
+          order_id: src.order_id,
+          order_number: src.order_number || '',
+          owner: src.owner || '',
+          // 归属人默认脱敏，点一下看完整昵称（owner）
+          ownerText: src.owner_masked || src.owner || '—',
+          created_at: src.created_at || '',
+          file_count: files,
+          page_count: pages,
+          statText: files + ' 文件 · ' + pages + ' 页',
+          total_price: total,
+          priceDisplay: total.toFixed(2),
+          status: src.status || '',
+          statusText: this.data.statusMap[src.status] || src.status || '—',
+          source: src.source || '',
+          is_admin_print: !!src.is_admin_print,
+        }
+      })
+    },
+
+    loadRecentOrders(force) {
+      // 只有管理员能看到这张卡片：非管理员连请求都不发（后端也会 403）
+      if (this.data.userRole !== 'admin' && wx.getStorageSync('userRole') !== 'admin') return
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      const now = Date.now()
+      if (!force && this._recentOrdersAt && (now - this._recentOrdersAt) < 15000) return
+      if (this._recentOrdersLoading) return
+      this._recentOrdersLoading = true
+      if (!this.data.recentOrdersLoading) this.setData({ recentOrdersLoading: true })
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/recent_orders',
+        method: 'GET',
+        header: {
+          'Authorization': 'Bearer ' + token
+        },
+        success: (res) => {
+          const d = (res && res.data) || {}
+          if (res && res.statusCode === 200 && d.success) {
+            this._recentOrdersAt = Date.now()
+            const limit = Math.max(1, Math.min(100, parseInt(d.limit, 10) || 10))
+            this.setData({
+              recentOrders: this._normalizeRecentOrders(d.orders, limit),
+              recentOrdersLimit: limit,
+              recentOrdersLoading: false,
+            }, () => this._scheduleMeasure(60))
+            return
+          }
+          // 静默失败：保留上次数据，不弹错误遮罩
+          this.setData({ recentOrdersLoading: false })
+        },
+        fail: () => {
+          this.setData({ recentOrdersLoading: false })
+        },
+        complete: () => {
+          this._recentOrdersLoading = false
+        },
+      })
+    },
+
+    onRefreshRecentOrders() {
+      if (this.data.recentOrdersLoading) return
+      this.loadRecentOrders(true)
+    },
+
+    // 归属人：列表里显示脱敏（owner_masked），点一下看完整昵称
+    onRecentOrderOwnerTap(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const full = ds.owner || ''
+      if (!full) {
+        wx.showToast({ title: '该订单未记录归属人', icon: 'none' })
+        return
+      }
+      wx.showModal({ title: '订单归属人', content: full, showCancel: false, confirmText: '知道了' })
+    },
+
+    // ---- 超管专属：改「近 N 条订单」的 N ----
+    // 后端 compute_role() 只返回 admin/user/guest，超管被折叠成 admin；
+    // 超管身份由 /api/me 的 isSuperAdmin 标记区分（**不要**判 userRole === 'super_admin'）。
+    // 写接口只允许超管：POST /api/admin/recent_orders_limit {"limit": n}（1..100）。
+    _canEditRecentLimit() {
+      return this.data.userRole === 'admin' && this.data.isSuperAdmin === true
+    },
+
+    onEditRecentOrdersLimit() {
+      if (!this._canEditRecentLimit()) return
+      const open = !this.data.recentLimitEditor
+      this.setData({
+        recentLimitEditor: open,
+        recentLimitDraft: open ? String(this.data.recentOrdersLimit || 10) : '',
+      })
+    },
+
+    onRecentOrdersLimitInput(e) {
+      const raw = (e && e.detail && e.detail.value != null) ? String(e.detail.value) : ''
+      // 只留数字：type="number" 在部分机型仍会带小数点/空格
+      this.setData({ recentLimitDraft: raw.replace(/[^0-9]/g, '') })
+    },
+
+    onRecentOrdersLimitStep(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const delta = Number(ds.delta) === -1 ? -1 : 1
+      const cur = parseInt(this.data.recentLimitDraft, 10)
+      const base = isNaN(cur) ? (this.data.recentOrdersLimit || 10) : cur
+      const next = Math.max(1, Math.min(100, base + delta))
+      this.setData({ recentLimitDraft: String(next) })
+    },
+
+    onSaveRecentOrdersLimit() {
+      if (!this._canEditRecentLimit()) return
+      if (this.data.recentLimitSaving) return
+      const n = parseInt(this.data.recentLimitDraft, 10)
+      if (isNaN(n) || n < 1 || n > 100) {
+        wx.showToast({ title: '请输入 1~100 的整数', icon: 'none' })
+        return
+      }
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      this.setData({ recentLimitSaving: true })
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/recent_orders_limit',
+        method: 'POST',
+        header: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token
+        },
+        data: { limit: n },
+        success: (res) => {
+          const d = (res && res.data) || {}
+          if (res && res.statusCode === 200 && d.success) {
+            const limit = Math.max(1, Math.min(100, parseInt(d.limit, 10) || n))
+            this.setData({
+              recentOrdersLimit: limit,
+              recentLimitEditor: false,
+              recentLimitDraft: '',
+              recentLimitSaving: false,
+            }, () => this._scheduleMeasure(60))
+            wx.showToast({ title: d.message || ('已更新为最近 ' + limit + ' 条'), icon: 'none' })
+            // 标题立刻跟着变；列表按新 N 重拉（force 跳过 15s 去重）
+            this.loadRecentOrders(true)
+            return
+          }
+          // 失败保持旧值：只轻提示，不弹遮罩
+          this.setData({ recentLimitSaving: false })
+          wx.showToast({ title: '保存失败，请稍后重试', icon: 'none' })
+        },
+        fail: () => {
+          this.setData({ recentLimitSaving: false })
+          wx.showToast({ title: '网络错误，保存失败', icon: 'none' })
+        },
+      })
+    },
+
+    onCancelRecentOrdersLimit() {
+      this.setData({ recentLimitEditor: false, recentLimitDraft: '' })
+    },
+
     // ==================== 合计价格复制（Popconfirm 气泡） ====================
     // 金额一律取订单**已定稿**的实收值（orders.total_price / order_files.total_price）：
     // 设备回报页数后后端会用 _recalc_prices_for_file 重算并回写这两处，前端不再自己套单价，
     // 复制出去的就是页面上看到的数字（避免「复制价 ≠ 实收价」）。
 
     _findOrderById(id) {
+      const key = String(id == null ? '' : id)
+      // 「近 N 条订单」行：data-id 带 r- 前缀 —— 这些订单不一定落在当前分页的 orders 里
+      if (key.indexOf('r-') === 0) {
+        const oid = key.slice(2)
+        const recent = this.data.recentOrders || []
+        for (let i = 0; i < recent.length; i++) {
+          if (recent[i] && String(recent[i].order_id) === oid) return recent[i]
+        }
+        return null
+      }
       const list = this.data.orders || []
       for (let i = 0; i < list.length; i++) {
         const o = list[i]
@@ -2723,6 +2919,8 @@ Component({
         this.setData({
           showPricePop: true,
           pricePopOrderId: id,
+          // 「近 N 条订单」行没有逐文件明细 → 气泡里只留「复制价格」
+          pricePopRecent: String(id).indexOf('r-') === 0,
           pricePopWidth: popW,
           pricePopLeft: left,
           pricePopCaretLeft: caret,

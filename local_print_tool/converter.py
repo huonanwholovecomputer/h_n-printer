@@ -101,7 +101,8 @@ _warm_word_running = False
 # MsoAutomationSecurity 枚举：3 = msoAutomationSecurityForceDisable（禁用所有宏，不提示）
 MSO_AUTOMATION_SECURITY_FORCE_DISABLE = 3
 
-# 只有这两种扩展名会走 Word/WPS COM（xls/ppt 一直走 LibreOffice）
+# 只有这两种扩展名会走 **Word/WPS 文档** COM（表格 .xls/.xlsx 走 Excel/WPS 表格 COM，
+# 见 `xlsx_printer.py`；.ppt/.pptx 仍只走 LibreOffice）。云端来源的表格同样强制 LibreOffice。
 COM_OFFICE_EXTS = (".doc", ".docx")
 
 # ── S2-03：Office 转换沙箱（默认关闭；默认值必须是 False）──
@@ -138,6 +139,9 @@ def should_sandbox(file_path: str, from_cloud: bool = False) -> bool:
       .doc/.docx；真机验证也证明它对 Word/WPS 基本无效）。要连它一起套，得把
       `allow_cloud_com` 传进来并重做 S2-03 的口径 —— 本批刻意没做；
     · xls/xlsx/ppt/pptx 本来就只走 LibreOffice 子进程（独立进程、无宏），不套；
+      （2026-11-02 起本地 xls/xlsx 改走 Excel/WPS 表格 COM，与 Word 同一类风险来源；
+       但 S2-03 沙箱只实现了 Word 文档路径，表格这边**尚未**接进沙箱 —— 刻意保持
+       `should_sandbox("a.xlsx") == False`，别让 worker 去跑它不认识的转换。）
     · 开关关闭 ⇒ 恒 False（对存量行为零影响）。
 
     ⚠ **worker 内部恒 False**（2026-10-25 真机验证后修）：沙箱 worker 是父进程用
@@ -773,6 +777,34 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
                 os.remove(temp_input)
             except OSError:
                 pass
+
+
+# ============================================================
+# 表格（.xls / .xlsx）→ PDF
+# ============================================================
+
+def _convert_xlsx_to_pdf(file_path: str, output_pdf: str,
+                         from_cloud: bool = False,
+                         allow_cloud_com: bool = False) -> None:
+    """表格文件 → PDF：**让 Excel/WPS 自己排版**（引擎链实现在 `xlsx_printer.py`）。
+
+    为什么不能自己排（2026-11-02 需求）：用户先在 Excel 里设好「边距 0.5cm / 页眉页脚 0 /
+    水平居中 / 调整所有列到一页」再打印，工具必须**完全复现**那份结果 —— 唯一可靠路径是
+    Excel 自己的 `Worksheet.ExportAsFixedFormat`。代码不得改写页边距/缩放/打印区域；
+    用 LibreOffice 或自绘都会与用户预览不一致（实测同一份 xlsx：Excel 4 页，LO 版式不同）。
+
+    引擎顺序由 xlsx_printer 决定：Excel → WPS(KET) → LibreOffice 兜底（兜底必写日志
+    「LibreOffice 兜底，版式可能与 Excel 不一致」）。云端顾客文件不在这里调用
+    （调用方会把云端的 .xls/.xlsx 继续交给 LibreOffice，见 `_convert_office_to_pdf`）。
+    """
+    import xlsx_printer  # noqa: PLC0415 —— 延迟 import：xlsx_printer 反过来要用本模块的
+    # _dispatch_ex / _com_uninitialize_quietly / _find_libreoffice / _convert_office_via_libreoffice
+
+    res = xlsx_printer.export_to_pdf(
+        file_path, output_pdf, from_cloud=from_cloud, allow_cloud_com=allow_cloud_com)
+    logger.info(
+        f"表格引擎: {res.engine_label}（活动工作表「{res.sheet}」，共 {res.sheet_count} 个工作表）"
+        f" → PDF 完成: {os.path.basename(output_pdf)}，耗时 {res.elapsed:.2f}s")
 
 
 # ============================================================
@@ -1812,7 +1844,12 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
       3. LibreOffice 无头模式 → 兜底
     .doc（老格式，无 last-editor 元数据）: Word → WPS → LibreOffice
 
-    其他 Office 格式 (.xls/.xlsx/.ppt/.pptx):
+    表格 (.xls/.xlsx)（2026-11-02）:
+      → 交给 Excel/WPS **自己排版**（`xlsx_printer.export_to_pdf`：Excel → WPS 表格 → LibreOffice），
+        只导出**活动工作表**（Excel 打印对话框默认范围）；代码不改写页边距/缩放/打印区域。
+      → 例外：云端来源的顾客文件（from_cloud 且未放行）仍走 LibreOffice，见上。
+
+    其他 Office 格式 (.ppt/.pptx):
       → LibreOffice 无头模式
 
     Args:
@@ -1830,6 +1867,16 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
             ⚠ **默认值必须是 False**：默认仍强制 LibreOffice，不给顾客文件任何 COM 机会。
     """
     ext = ext_of(file_path)
+
+    # ── 表格（.xls/.xlsx）：交给 Excel/WPS 自己排版（2026-11-02）──
+    # Excel 的「调整所有列到一页 / 0.5cm 边距 / 水平居中 / 打印区域」只有它自己能正确解释，
+    # 本工具**不得**自行改写这些设置；唯一可靠路径就是 `Worksheet.ExportAsFixedFormat`。
+    # 云端来源的顾客文件仍强制 LibreOffice（S1-04：绝不给 COM 宏/外链执行机会），
+    # 那是本次改动前就有的行为，走本函数末尾的 LibreOffice 分支。
+    if ext in (".xls", ".xlsx") and not (from_cloud and not allow_cloud_com):
+        _convert_xlsx_to_pdf(file_path, output_pdf, from_cloud=from_cloud,
+                             allow_cloud_com=allow_cloud_com)
+        return
 
     # ── 云端来源的 Office 文档：默认绝不交给 Word/WPS（S1-04）──
     # LibreOffice 无头转换不执行 VBA（也不跑 AutoOpen/Document_Open 宏），是这条链上

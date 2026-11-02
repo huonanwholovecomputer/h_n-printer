@@ -21,6 +21,10 @@ const FILE_CARD_HEIGHT_RPX = {
 }
 // .file-card 底部间距 margin-bottom: 12rpx
 const FILE_CARD_GAP_RPX = 12
+// FILE_CARD_HEIGHT_RPX 是**估算值**：实测比真实渲染高 4~7%（见 onFileListScroll 注释）。
+// 判定「内层文件列表是否真的可滚」时按中位误差折回真实高度 —— 直接用估值会把「刚好放得下」
+// 的列表误判成可滚：WXS 把滑动让给内层，内层又滚不动 ⇒ 页面纹丝不动（「卡在内部列表底部」）。
+const FILE_CARD_HEIGHT_EST_OVER = 1.055
 // 文本模式(页数未知)下，每多一个范围行在基础高度上额外增加的高度(rpx)：输入框56 + 行间距4
 const RANGE_LINE_EXTRA_RPX = 60
 
@@ -287,12 +291,13 @@ Component({
       extParams: '0.8s',
       autoPrint: '0.9s',
       adminPrint: '1.0s',
+      privacy: '1.05s',
       submit: '1.1s',
     },
     // 入场状态（JS 按页面加载时刻调度）：entered.x 到点置 true 播放；entranceDone 结束后清理类防切 tab 重放
     entered: {
       logo: false, statusBar: false, fileSection: false, extParams: false,
-      remark: false, autoPrint: false, adminPrint: false, submit: false,
+      remark: false, autoPrint: false, adminPrint: false, privacy: false, submit: false,
     },
     entranceDone: false,
     // 备注卡片高度（rpx）：随 textarea 行数平滑变化（外层 view transition）
@@ -861,8 +866,17 @@ Component({
       })
       const { windowWidth } = wx.getWindowInfo()
       const contentPx = Math.round(sumRpx * ((windowWidth || 375) / 750))
-      // 内层文件列表是否真的可滚（内容高 > 可视高）：可滚时 WXS 让位给原生
-      const listOverflow = contentPx > (this.data.fileListHeight || 0) + 1
+      // 文件增删/卡片高度变化 ⇒ 上次实测的内容高立刻作废。
+      // 否则删掉文件后 maxScroll 仍按旧的大内容算，atBottom 永远为 false，而内层已经不能滚了
+      // （滚不出 scroll 事件来纠正）→ WXS 把滑动让给内层、内层纹丝不动 = 页面卡住。
+      if (this._lastContentEst !== undefined && Math.abs(contentPx - this._lastContentEst) > 1) {
+        this._fileListRealPx = 0
+      }
+      this._lastContentEst = contentPx
+      // 内层文件列表是否真的可滚（内容高 > 可视高）：可滚时 WXS 让位给原生。
+      // 估值偏大 4~7% ⇒ 先折回真实高度再比，避免「刚好放得下」被判成可滚（见常量注释）。
+      const contentRealEst = Math.round(contentPx / FILE_CARD_HEIGHT_EST_OVER)
+      const listOverflow = contentRealEst > (this.data.fileListHeight || 0) + 1
       this._fileListContentPx = contentPx   // 常量估值（仅在拿不到真实 scrollHeight 时兜底）
       if (!listOverflow) {
         // 列表不可滚（内容没超过可视高，或文件被删空）→ 两个方向都视为"贴边"，
@@ -2421,11 +2435,11 @@ Component({
         this._showStackTip('该设备支持自动双面（或双面能力未确认），不需要攒批模式')
         return
       }
-      if (device.online === false) {
-        wx.showToast({ title: '设备离线，无法远程切换', icon: 'none', duration: 2000 })
-        return
-      }
-      if (device.stack_can_toggle === false) {
+      // 离线设备也允许调攒批（用户要求）：服务端只把「云端指定状态」记下来（pending:true），
+      // 设备上线后自行对齐（先确定攒批状态是否和云端指定一致）——所以这里**不再**拦截 online === false。
+      // stack_can_toggle=false 是**在线忙判定**（正在打印 / 等人工翻纸打第二趟 / 有排队待打），
+      // 离线设备不适用；离线放行后由服务端返回 pending 或拦截原因。
+      if (device.online !== false && device.stack_can_toggle === false) {
         this._showStackTip(device.stack_reason || '当前无法切换攒批模式')
         return
       }
@@ -2444,9 +2458,13 @@ Component({
         success: (res) => {
           this.setData({ stackTogglingId: '' })
           const data = (res && res.data) || {}
-          this._showStackTip(data.message || (data.success ? '操作成功' : '切换失败，请稍后重试'))
+          // 离线：云端已记录，设备上线后自动应用（message 缺省时用固定文案，别让用户以为没成功）
+          const msg = data.pending === true
+            ? (data.message || '已记录，设备上线后自动应用')
+            : (data.message || (data.success ? '操作成功' : '切换失败，请稍后重试'))
+          this._showStackTip(msg)
           if (!data.success) return
-          this._applyStackMode(index, clientId, data)
+          this._applyStackMode(index, clientId, data, enable)
         },
         fail: () => {
           this.setData({ stackTogglingId: '' })
@@ -2472,16 +2490,24 @@ Component({
     // 攒批模式成功后就地写回**本地那一台**设备：按 client_id 复核下标（列表可能已被刷新过），
     // 只走精确路径 setData（claimingDevices[i].xxx），不整表重渲染 —— 整表会让设备列表节点重建、
     // 打断点击/滚动。stack_mode 用服务端返回值，不用本地旧值 + enable 猜。
-    _applyStackMode(index, clientId, data) {
+    // pending=true（设备离线）：设备真实状态还没变，但云端已记下目标状态 → 按目标值显示 +
+    // stack_pending 角标「待应用」；设备上线后服务端会把 stack_mode 改成与云端指定一致。
+    _applyStackMode(index, clientId, data, enable) {
       const devices = this.data.claimingDevices || []
       let i = index
       if (!devices[i] || devices[i].client_id !== clientId) {
         i = devices.findIndex(d => d && d.client_id === clientId)
       }
       if (i < 0) return
+      const pending = data.pending === true
       const patch = {}
-      patch['claimingDevices[' + i + '].stack_mode'] = data.stack_mode === true
+      if (pending) {
+        patch['claimingDevices[' + i + '].stack_mode'] = enable === true
+      } else {
+        patch['claimingDevices[' + i + '].stack_mode'] = data.stack_mode === true
+      }
       patch['claimingDevices[' + i + '].stack_busy'] = !!data.stack_busy
+      patch['claimingDevices[' + i + '].stack_pending'] = pending
       this.setData(patch)
     },
 
@@ -2792,6 +2818,7 @@ Component({
         ['remark', 0.85],
         ['autoPrint', 0.9],
         ['adminPrint', 1.0],
+        ['privacy', 1.05],
         ['submit', 1.1],
       ]
       steps.forEach(([key, at]) => {
@@ -3125,6 +3152,12 @@ Component({
       const minuteItems = this._buildMinuteItems(hi, isToday, hourStart, minuteStart)
       if (mi >= minuteItems.length) mi = 0
       // value 由渲染层原生定位到选中项（系统 picker 同款引擎，精确居中）
+      // 慢滑/惯性修复的实例态（不进 data，避免无谓渲染）：
+      //   _wheelHi/_wheelMi = 原生列最近一次报告的索引（拖动中每跨一格更新）
+      //   _wheelCascadeHi   = 上一次「分钟列按小时重建」级联时的小时索引
+      this._wheelHi = hi
+      this._wheelMi = mi
+      this._wheelCascadeHi = hi
       this.setData({
         showScheduleTimePicker: true,
         hourItems,
@@ -3139,15 +3172,43 @@ Component({
       })
     },
 
-    // picker-view 滚动变化：索引由组件原生给出（贴合后精确值）
-    // 今天：小时变化 → 分钟列按新小时重建，分钟重置为该小时第一个可用分钟（级联）
+    // picker-view 滚动变化：索引由组件原生给出（immediate-change ⇒ 拖动中每跨一格触发一次）。
+    // ⚠「惯性/慢滑」病根就在这里：**拖动中绝不写回 timeWheelValue**。
+    // value 是「让原生列滚到该索引」的指令；拖动中写回 = 原生列被拽回该索引的中心，
+    // 用户看到的就是「先算出最终停在哪、直接把高亮定位到那个数字」；慢滑每跨一格都被拽一次，
+    // 表现成「每次都定位回开始滑动的那个数字、缓慢滑动无效」。value 只在松手（bindpickend）
+    // 同步一次 —— 那时轮子本来就在该索引上，写回不产生任何位移。
+    // 今天的小时列变化会改变分钟列长度 → 级联重建也推迟到松手（拖动中重建 minuteItems 会让
+    // 整棵 picker-view 子树重渲染，正在拖的列被重置回 value）。
     onTimeWheelChange(e) {
       const v = (e.detail && e.detail.value) || []
       if (v.length < 2) return
       const hi = v[0]
       const mi = v[1]
-      if (this.data.scheduleDayIndex === 0 && hi !== this.data.hourWheelIndex) {
+      this._wheelHi = hi
+      this._wheelMi = mi
+      // 只更新派生索引（决定 .wheel-item-active 高亮）→ 逐格跟手；不碰 value
+      if (hi !== this.data.hourWheelIndex || mi !== this.data.minuteWheelIndex) {
+        this.setData({ hourWheelIndex: hi, minuteWheelIndex: mi })
+      }
+    },
+
+    // 拖动开始：期间 onTimeWheelChange 只更派生索引，不写 value
+    onTimeWheelPickStart() {
+      this._wheelDragging = true
+    },
+
+    // 拖动结束（原生列已贴合最近项）：同步 value + 做级联。
+    // 级联与系统 picker 一致 —— 松手后才按新小时重建分钟列，分钟回到该小时第一个可用分钟。
+    onTimeWheelPickEnd() {
+      this._wheelDragging = false
+      const hi = this._wheelHi
+      const mi = this._wheelMi
+      if (typeof hi !== 'number' || typeof mi !== 'number') return
+      if (this.data.scheduleDayIndex === 0 && hi !== this._wheelCascadeHi) {
+        this._wheelCascadeHi = hi
         const minuteItems = this._buildMinuteItems(hi, true, this.data.hourStart, this.data.minuteStart)
+        this._wheelMi = 0
         this.setData({
           hourWheelIndex: hi,
           minuteWheelIndex: 0,
@@ -3156,7 +3217,11 @@ Component({
         })
         return
       }
-      this.setData({ hourWheelIndex: hi, minuteWheelIndex: mi })
+      this.setData({
+        hourWheelIndex: hi,
+        minuteWheelIndex: mi,
+        timeWheelValue: [hi, mi],
+      })
     },
 
     onConfirmScheduleTime() {
@@ -3185,6 +3250,8 @@ Component({
       if (this.data.modalClosing) return
       const mi = Math.min(Math.max(parseInt(this.data.countdownMin, 10) || 0, 0), 59)
       const si = Math.min(Math.max(parseInt(this.data.countdownSec, 10) || 0, 0), 59)
+      this._cdWheelMi = mi
+      this._cdWheelSi = si
       this.setData({
         showScheduleCountdownPicker: true,
         countdownMinWheelIndex: mi,
@@ -3193,13 +3260,30 @@ Component({
       })
     },
 
+    // 同「指定时间」滚轮：拖动中只更派生索引、**不写回 countdownWheelValue**
+    // （写回 = 让原生列滚到该索引 ⇒ 慢滑每跨一格被拽一次，缓慢滑动无效）
     onCountdownWheelChange(e) {
       const v = (e.detail && e.detail.value) || []
       if (v.length < 2) return
+      this._cdWheelMi = v[0]
+      this._cdWheelSi = v[1]
+      if (v[0] !== this.data.countdownMinWheelIndex || v[1] !== this.data.countdownSecWheelIndex) {
+        this.setData({
+          countdownMinWheelIndex: v[0],
+          countdownSecWheelIndex: v[1],
+        })
+      }
+    },
+
+    // 松手（已贴合最近项）才同步 value：此时写回不产生位移，下次再拖从贴合项起步
+    onCountdownWheelPickEnd() {
+      const mi = this._cdWheelMi
+      const si = this._cdWheelSi
+      if (typeof mi !== 'number' || typeof si !== 'number') return
       this.setData({
-        countdownMinWheelIndex: v[0],
-        countdownSecWheelIndex: v[1],
-        countdownWheelValue: [v[0], v[1]],
+        countdownMinWheelIndex: mi,
+        countdownSecWheelIndex: si,
+        countdownWheelValue: [mi, si],
       })
     },
 

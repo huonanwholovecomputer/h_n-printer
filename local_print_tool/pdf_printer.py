@@ -424,14 +424,26 @@ BLANK_FURNITURE_BAND = 0.08          # 页眉/页脚带 = 页高上下各 8%（A
 BLANK_FURNITURE_MAX_CHARS = 40       # 全部家具文字的字数上限（页码 + 一行页眉标题 ≈ 30 字）
 BLANK_FURNITURE_MAX_LINE_CHARS = 30  # 单行上限：带上出现一整句/一段 ⇒ 当正文
 BLANK_FURNITURE_MAX_INK = 0.01       # 只剩家具时整页墨量上限（A4@72dpi ≈ 5000 px，挡大图）
+# 正文区（上下家具带以外）的墨量上限 + 第二道判据：家具页的正文区应该是"干干净净"的。
+# 2026-11-01 现场误判（示波器的使用.pdf 第 6 页）：真标题「2.思考题（课后完成）」坐在
+# y=58.14 pt，而 A4 的家具带是 0.08×841.9 = 67.35 pt ⇒ 标题被当成"页眉文字"，全页只剩
+# 标题 + 页脚「第 页」，于是判成空白页（页数/价格都错，操作员还可能误勾排除）。
+# 光靠"文字必须完整落在带内"兜不住 —— 紧贴版心的标题会一脚踩进带里，所以再加一道
+# 墨量判据：正文区只要有一行字 / 一条表格框线（p6 实测 2169 px），就绝不是空白。
+BLANK_FURNITURE_BODY_MAX_INK = 0.0002  # A4@72dpi ≈ 100 px（另与 40 px 绝对下限取大）
 
 
 def page_text_is_furniture(page) -> bool:
     """页面上的文字是否只有"家具"（页码 / 页眉 / 页脚），没有正文。
 
-    家具 = 全部非空文字都落在页高上下 BLANK_FURNITURE_BAND 的带内，且字数很少。
-    任何图片块、正文区里的字、带内一整段长文字 ⇒ 不是家具。读不出来一律按"有内容"
-    （fail-open：绝不因为解析失败把真内容当空白排掉）。
+    家具 = 全部非空文字都**完整落在**页高上下 BLANK_FURNITURE_BAND 的带内，且字数很少。
+    任何图片块、正文区里的字、跨带边界的字、带内一整段长文字 ⇒ 不是家具。读不出来一律
+    按"有内容"（fail-open：绝不因为解析失败把真内容当空白排掉）。
+
+    2026-11-01 修正（现场误判）：原判据是「y0 >= band and y1 <= height - band ⇒ 有内容」，
+    即要求文字**完全落在正文区**才算内容；于是紧贴版心的标题（y0 已在顶部带内、y1 只超出
+    band 2.8 pt）被当成页眉，整页判成空白。现改为要求文字**完全落在带内**才算家具，
+    跨带边界一律算正文 —— 空白页上的页码/页眉本来也不会压到版心线上。
     """
     try:
         pagedict = page.get_text("dict")
@@ -453,14 +465,34 @@ def page_text_is_furniture(page) -> bool:
                     y0, y1 = float(bbox[1]), float(bbox[3])
                 except Exception:
                     return False
-                if y0 >= band and y1 <= height - band:
-                    return False         # 正文区有字 ⇒ 有内容
+                if not (y1 <= band or y0 >= height - band):
+                    return False         # 不在任何家具带内（压到版心/正文区）⇒ 有内容
                 if len(text) > BLANK_FURNITURE_MAX_LINE_CHARS:
                     return False         # 带上出现一整段文字 ⇒ 当正文
                 total += len(text)
                 if total > BLANK_FURNITURE_MAX_CHARS:
                     return False
     return True
+
+
+def _body_ink(data, width: int, height: int, dark_max: int = 245) -> int:
+    """72dpi 灰度栅格里"正文区"（上下家具带以外）的暗像素数。
+
+    家具带按页高比例算，与 page_text_is_furniture 同一口径（BLANK_FURNITURE_BAND）。
+    栅格按行存储（行索引 = y），所以只取中间那一段行做统计，带内整行跳过。
+    统计失败一律返回极大值 ⇒ 调用方判"有内容"（fail-open，绝不误排真内容）。
+    """
+    try:
+        if not data or width <= 0 or height <= 0:
+            return 1 << 30
+        band_rows = int(round(BLANK_FURNITURE_BAND * height))
+        band_rows = max(0, min(band_rows, height // 2))
+        start, end = band_rows * width, (height - band_rows) * width
+        if start >= end:
+            return 0                    # 带已占满整页（不可能，兜底）
+        return sum(1 for v in data[start:end] if v < dark_max)
+    except Exception:
+        return 1 << 30
 
 
 def _ensure_system_fonts() -> None:
@@ -486,7 +518,8 @@ def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
     判据：
     · **页面没有文字** —— 只看 72dpi 灰度栅格的暗像素占比 < max_ink；
     · **只剩家具**（页码 / 页眉 / 页脚，见 page_text_is_furniture）—— 墨量也要很小
-      （< BLANK_FURNITURE_MAX_INK）才算空白；
+      （< BLANK_FURNITURE_MAX_INK）、**正文区几乎没墨**（< BLANK_FURNITURE_BODY_MAX_INK）
+      才算空白；
     · 正文区有任何文字、或墨量偏大 ⇒ 有内容。
 
     2026-10-28 现场标定（打印列表真实文件，A4@72dpi = 501832 px）：
@@ -494,6 +527,8 @@ def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
       普通内容页 8.8%~26.5%。纯文字门槛取 0.02%（≈100 px）离两头都有 100 倍余量。
     2026-11-01 追加家具口径：只有页码「12」+ 页眉装饰线的末页墨量在 0.1% 量级，
       离"最空内容页 1.89%"仍有 10 倍余量。
+    2026-11-01 追加正文区墨量口径（修现场误判）：示波器的使用.pdf 第 6 页整页墨量
+      0.786%（家具上限内）、正文区 2169 px（正文区上限 251 px 的 8.6 倍）⇒ 判为有内容。
     """
     try:
         has_text = bool(page.get_text("text").strip())
@@ -514,6 +549,13 @@ def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
         return dark <= max(float(BLANK_PAGE_MIN_INK_PX), float(max_ink) * len(data))
     if dark > float(BLANK_FURNITURE_MAX_INK) * len(data):
         return False            # 字只有几个，但墨量不小（大图/粗框/整页底纹）⇒ 有内容
+    body_ink = _body_ink(data, int(getattr(pix, "width", 0) or 0),
+                         int(getattr(pix, "height", 0) or 0))
+    if body_ink > max(float(BLANK_PAGE_MIN_INK_PX),
+                      float(BLANK_FURNITURE_BODY_MAX_INK) * len(data)):
+        # 正文区有墨（一行字 / 表格框线 / 插图）⇒ 有内容。压在版心线上的标题只有这条
+        # 能兜住 —— 它的 bbox 已经一脚踩进家具带里了。
+        return False
     return page_text_is_furniture(page)
 
 

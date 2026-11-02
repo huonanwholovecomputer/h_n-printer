@@ -134,7 +134,12 @@ APP_ID_SNAPSHOT = {
     "orderList", "ordersEmpty", "ordersEndHint", "ordersNext", "ordersNextBottom",
     "ordersPageNumbers", "ordersPageNumbersBottom", "ordersPageSize", "ordersPageSizeArrow",
     "ordersPageSizeText", "ordersPager", "ordersPagerBottom", "ordersPrev", "ordersPrevBottom",
-    "page-me", "pageSizePicker", "redeemBtn", "redeemInput", "redeemPasteBtn", "retentionDaysMinus",
+    "page-me", "pageSizePicker",
+    # 2026-11-02 新增「近 N 条订单」卡片（管理员可见区）+ 超管改 N 的内联步进器
+    "recentOrderCount", "recentOrderLimitCancel", "recentOrderLimitEditor",
+    "recentOrderLimitEntry", "recentOrderLimitSave", "recentOrderLimitValue",
+    "recentOrderList", "recentOrdersBlock", "recentOrdersTitle",
+    "redeemBtn", "redeemInput", "redeemPasteBtn", "retentionDaysMinus",
     "retentionDaysPlus", "retentionDaysValue", "retentionHint", "retentionHoursMinus",
     "retentionHoursPlus", "retentionHoursValue", "roleLabel", "saveRetentionBtn", "saveSecurityBtn",
     "scrollContentMe", "scrollTopBtn", "scroller-me", "securityArrow", "securityDetail",
