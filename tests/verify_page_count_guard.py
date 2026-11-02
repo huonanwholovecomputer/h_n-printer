@@ -322,13 +322,18 @@ def _enclosing_func(pos):
     return m[-1].group(1) if m else ""
 
 
-# 2026-11-02 起允许两个调用点，且**只允许**这两个（多一处就说明又有人绕过入口自己判）：
+# 2026-11-02 起允许四个调用点，且**只允许**这四个（多一处就说明又有人绕过入口自己判）：
 #   · `_start_print_worker` —— 唯一的打印入口守卫（页数没统计完不开打）
 #   · `_fire_scheduled_print` —— 预约单到点才建页，Word 转换此刻才启动，必须等它转完
 #     （否则会拿 page_count=0 去算价/上报）。两者语义不同，不是重复实现。
+#   · `_process_auto_print_order` —— 无障碍单入队时判原因：页数没统计完 vs 打印机忙
+#     （`⚡ 打印机正忙…` 那条日志 2026-11-02 现场把人误导过一次，见 0023 单）
+#   · `_pump_auto_print_retry` —— 重试队列定时自驱前的预检（打不了就 2 秒后再来，
+#     不反复调 `_start_print_worker` 以免刷屏日志）。见 verify_auto_print_retry_pump.py
 _guard_funcs = sorted(_enclosing_func(p) for p in _guards if _enclosing_func(p))
-check("_pending_page_count_stats 只在这两处被调用（入口守卫 + 预约到点等转换）",
-      _guard_funcs == ["_fire_scheduled_print", "_start_print_worker"],
+check("_pending_page_count_stats 只在四处被调用（入口守卫 + 预约到点 + 无障碍入队判因 + 重试自驱预检）",
+      _guard_funcs == ["_fire_scheduled_print", "_process_auto_print_order",
+                       "_pump_auto_print_retry", "_start_print_worker"],
       f"{_guard_funcs}")
 
 print("\n" + ("PASS 全部通过" if ok_all else "FAIL 有失败项"))

@@ -1071,6 +1071,16 @@ class _FinWin:
     def _find_tab_key_by_order_id(self, _oid):
         return ""
 
+    def _drain_auto_print_retry(self):
+        # 2026-11-02：排空逻辑从 `_on_all_finished` 抽成独立函数（另加定时自驱），
+        # 替身直接把真实实现借过来跑 —— 判据/出队点仍只有一份，测的就是产品逻辑本身。
+        return gui.MainWindow._drain_auto_print_retry(self)
+
+    def _arm_auto_print_retry_timer(self, delay_ms=2000):
+        # 2026-11-02：排空逻辑抽成 `_drain_auto_print_retry`，末尾会 arm 定时器自驱。
+        # 本替身不需要定时器（队列已空/已出队），记下来供断言用。
+        self.calls.append(("arm_timer", bool(self._auto_print_retry)))
+
 
 # 真 worker 停在"等翻纸"：只记录提示、不回执（不 confirm）→ 线程阻塞在 _flip_event.wait()。
 # 必须用 QThread.start()（生产就是这样起的）：isRunning() 只对 QThread 自身有效；
@@ -1128,14 +1138,16 @@ check("★ 预约打印：打印机忙 → 10 秒后重试（不插队、不丢�
       and "_start_scheduled_print_timer(order_id, int(time.time()) + 10)" in src)
 # 🔴-B4-3 之后 `_on_all_finished` 内部有 3 个出队点（启动成功 / 已全打完 / 标签页已删除），
 # 所以"全局仅 1 处 pop"这个计数代理已过期。真正要钉的不变量是：
-# 「**没有任何**出队点落在 `_on_all_finished` 之外」—— 别处出队 = 有别的代码路径偷偷丢单。
-_body_fin = src.split("def _on_all_finished", 1)[1].split("\n    def ", 1)[0]
+# 「**所有**出队点都只在唯一的排空函数 `_drain_auto_print_retry` 里」——
+# 2026-11-02 起该函数被两路驱动（批次收尾 `_on_all_finished` / 定时自驱 `_pump_auto_print_retry`），
+# 但**出队判据仍然只有那一份**；别处出现 pop = 有别的代码路径偷偷丢单。
+_body_drain = src.split("def _drain_auto_print_retry", 1)[1].split("\n    def ", 1)[0]
 _pop_all = src.count("self._auto_print_retry.pop(0)")
-_pop_in = _body_fin.count("self._auto_print_retry.pop(0)")
-check("★ 补打队列只在 _on_all_finished 里出队（函数外零出队点 ⇒ 无静默丢单路径）",
+_pop_in = _body_drain.count("self._auto_print_retry.pop(0)")
+check("★ 补打队列只在 _drain_auto_print_retry 里出队（函数外零出队点 ⇒ 无静默丢单路径）",
       _pop_in >= 1 and _pop_all == _pop_in
-      and "self._worker = None" in _body_fin[:400],
-      f"函数内 {_pop_in} 处 / 全局 {_pop_all} 处")
+      and "self._worker = None" in src.split("def _on_all_finished", 1)[1][:400],
+      f"排空函数内 {_pop_in} 处 / 全局 {_pop_all} 处")
 _start_fn = src.split("def _start_print_worker")[1].split("\n    def ")[0]
 check("★ 手动「开始打印」也走同一道门（全文件只此一处构造+启动 PrintWorker）",
       src.count("worker = PrintWorker(") == 1

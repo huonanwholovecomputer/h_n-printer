@@ -262,6 +262,27 @@ def _installed_norm() -> set[str]:
     return keys
 
 
+def refresh_installed(qt_families=None) -> str:
+    """**强制重新枚举**本机字体，返回新的指纹（系统字体指纹口径见 fonts_fingerprint）。
+
+    为什么需要（2026-11-02 现场）：用户中途装好缺的字体、把文件重新加一遍，⚠ 提示照旧。
+    根因在本函数的两个缓存上 —— `_installed` 是进程内快照（GDI/注册表只在第一次枚举），
+    `_installed_norm_cache` 又按"原始集合 hash"缓存归一结果。只把 `_installed` 置空而
+    不一起作废归一缓存，指纹会照旧算成同一个值 ⇒ 调用方（`_queue_font_checks` 的
+    `font_fp == fp` 判据）认为"这个文件查过了"直接跳过 —— 装了字体也不会重新判定。
+
+    `qt_families`：GUI 侧传 `QFontDatabase.families()`（Qt 看得见、但个别字体 GDI 枚举
+    不到的家族名，与 `set_installed` 同一口径）。
+    """
+    global _installed, _installed_norm_cache
+    if qt_families:
+        set_installed(qt_families)   # 内部会把 _installed 置空
+    _installed = None
+    _installed_norm_cache = None
+    installed_fonts(refresh=True)
+    return fonts_fingerprint()
+
+
 def fonts_fingerprint() -> str:
     """系统字体指纹：装了/删了字体 ⇒ 变化。用来判定"旧转换缓存是否可信"。"""
     keys = sorted(_installed_norm())

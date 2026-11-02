@@ -5314,8 +5314,14 @@ class MainWindow(QMainWindow):
         self._cleared_jobs_backup: dict[str, list[PrintJob]] = {}
         # 已处理的云端任务 ID（防重复弹窗；跨重启持久化，防重启后重复打印）
         self._processed_cloud_tasks: set[int] = self._load_processed_tasks()
-        # 无障碍自动打印：打印机忙时暂存的重试队列（打印完成后自动补打）
+        # 无障碍自动打印：启动失败（打印机忙 / 页数还没统计完）时暂存的重试队列，
+        # 由 `_pump_auto_print_retry` 自己每 2 秒驱动排空（不再等下一批收尾）
         self._auto_print_retry: list[dict] = []
+        # 2026-11-02 现场 HN20261102-0023：这个队列原来**只在** `_on_all_finished`（上一批
+        # 打完的收尾）里被排空。可入队原因还有"页数还没统计完"——那时上一批早就打完了，
+        # 队列就没人问津，无障碍单要干等到下一次随便哪一批收尾（现场白等 2 分钟）。
+        # 于是加一个自己驱动的抽水定时器（单次定时器，见 `_arm_auto_print_retry_timer`）。
+        self._auto_print_retry_timer: QTimer | None = None
         # 已进入无障碍队列的 task_id（🔴-B4-1 幂等守卫）：`_processed_cloud_tasks` 只在
         # **真正处理后**才写，"下载完成 → 防抖到期"之间存在数秒窗口，期间任何重复
         # task_updated(ready)（SocketIO 重推 / HTTP 兜底 / 状态队列重放）都会再次入队并
@@ -8667,10 +8673,12 @@ class MainWindow(QMainWindow):
         """行 tooltip 里"字体"那几段（纯字符串、不碰控件 ⇒ 验收可以直接跑）。
 
         两种"缺"分开写，各自给「原因 + 后果 + 怎么办」：
-        · 本机没装   → 装字体能救（装上再重新加文件，提示就没了）
+        · 本机没装   → 装字体能救（装上再右键「🔄 重新转换」，提示就没了）
         · PDF 没嵌入 → 装字体救不了（字形不在文件里，只能让生成方重导带字形的 PDF）
         2026-11-01 现场反馈：原来一句话把两者混成"没嵌入这些字体"，用户既不知道
         该去装字体还是该找生成方，也不知道装字体到底有没有用。
+        2026-11-02 现场：装了字体、把文件重新添加一遍提示照旧（转换缓存与字体指纹都命中）
+        ⇒ 台词改成指路右键「🔄 重新转换」，那条路径会重新枚举字体并清掉转换缓存。
         """
         _miss = [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
         _ne = [str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()]
@@ -8690,7 +8698,7 @@ class MainWindow(QMainWindow):
                 + "\n".join(f"· {n}" for n in _miss[:8])
                 + ("\n…" if len(_miss) > 8 else "")
                 + "\n转换/打印时会用相近字体替换，字形、字宽、换行可能变样。\n"
-                  "把字体装上，再重新添加这个文件，提示就没了。")
+                  "把字体装上，再右键这份文件 → 🔄 重新转换，提示就没了。")
         return blocks
 
     def _queue_font_checks(self, jobs: list, tab_key: str = "") -> None:
@@ -9634,6 +9642,20 @@ class MainWindow(QMainWindow):
                 _rst.triggered.connect(
                     lambda checked=False, rs=list(_excluded):
                     self._set_blank_tail_excluded(rs, False))
+            # 重新转换（2026-11-02）：装完缺的字体后**强制**重转一遍并重查字体。
+            # 为什么不能只靠"重新添加文件"：转换缓存与字体指纹都会命中，见 _force_reconvert_rows。
+            reconvert_action = menu.addAction(
+                f"🔄 重新转换（{n} 个文件，重新检测字体）" if n > 1
+                else "🔄 重新转换（重新检测字体）")
+            reconvert_action.setEnabled(not frozen)
+            reconvert_action.setToolTip(
+                "丢掉这份文件的转换缓存、重新枚举本机字体，再重转一遍 PDF\n"
+                "（刚装上缺的字体时用它，⚠ 提示会按新的字体状态重判）"
+                if not frozen else
+                "灰色：已锁定的标签页是订单快照，重转会改页数与费用。\n"
+                "要重打请用「➕ 添加到新标签页」。")
+            reconvert_action.triggered.connect(
+                lambda checked=False, rs=list(rows): self._force_reconvert_rows(rs))
             menu.addSeparator()
             # 打开文件位置（只读，始终可用）
             anchor_row = clicked_row if clicked_row >= 0 else rows[0]
@@ -10842,6 +10864,118 @@ class MainWindow(QMainWindow):
                     if not w.wait(2000):
                         w.terminate()
                         w.wait(100)
+
+    def _force_reconvert_rows(self, rows) -> int:
+        """右键「🔄 重新转换」：丢掉转换缓存 + 重新枚举本机字体 + 强制重转 PDF 并重查字体。
+
+        为什么需要这个入口（2026-11-02 现场）：用户装上缺的字体、把文件**重新添加**一遍，
+        ⚠ 提示照旧。三处缓存叠在一起，谁都拦得住这一次重查：
+        ① `font_check.installed_fonts()` 是**进程内快照**，中途装的字体（HKCU 那类）不枚举；
+        ② 字体指纹因此没变 ⇒ `_queue_font_checks` 的 `font_fp == fp` 判据直接跳过；
+        ③ 转换产物还在 `pdf_cache` ⇒ 重新添加也走"缓存命中"分支，**PDF 根本不会重转**
+           （.docx 的字形/换行仍是装字体之前的排版）。
+        ⇒ 这里三样一起清：重新枚举字体 → 删掉这份文件的缓存 PDF → 重转 → 用新指纹重排队检查。
+
+        返回真正发起重转的文件数（查不了字体的格式照样重转，只是不会重查字体）。
+        """
+        jobs = self._get_current_jobs()
+        rows = sorted({r for r in (rows or [])
+                       if isinstance(r, int) and 0 <= r < len(jobs)})
+        if not rows:
+            return 0
+        if self._is_current_tab_frozen():
+            # 冻结标签页是已上报订单的账目快照，重转会改页数/费用，一律不做
+            self._log("🔒 标签页已锁定（订单已上报），不能重新转换")
+            return 0
+        # ① 重新枚举本机字体（唯一的真相更新点：后面的指纹/检查都以它为准）
+        try:
+            from PySide6.QtGui import QFontDatabase as _QFD
+            _fp = font_check.refresh_installed(_QFD.families())
+        except Exception:
+            logger.debug("重新枚举字体失败", exc_info=True)
+            try:
+                _fp = font_check.refresh_installed()
+            except Exception:
+                _fp = ""
+        redone = 0
+        for row in rows:
+            job = jobs[row]
+            path = getattr(job, "file_path", "") or ""
+            if not path:
+                continue
+            # ② 删缓存 PDF（别的标签页还在引用同一份缓存时别删，删了那单会重转）
+            self._purge_job_pdf_cache(job)
+            # ③ 字体状态清零 ⇒ 下面的 _queue_font_checks 必然重排队（不再被 font_fp 挡住）
+            job.font_checked = False
+            job.font_fp = ""
+            job.missing_fonts = []
+            job.nonembedded_fonts = []
+            try:
+                self._fill_table_row(row, job)   # 先把 ⚠ 擦掉，重查出来会再亮
+            except Exception:
+                logger.debug("擦除字体检出标记失败", exc_info=True)
+            redone += 1
+        if not redone:
+            return 0
+        try:
+            self._save_config()
+        except Exception:
+            logger.debug("保存配置失败", exc_info=True)
+        self._log(f"🔄 正在重新转换 {redone} 个文件"
+                  f"（已清转换缓存、重新枚举字体，字体指纹={(_fp or '?')[:8]}）")
+        # ④ 强制重转：缓存已删 ⇒ _start_convert_worker 必然走 ConvertWorker
+        for row in rows:
+            job = jobs[row]
+            path = getattr(job, "file_path", "") or ""
+            if not path:
+                continue
+            try:
+                self._start_convert_worker(row, path, self._resolve_engine(job),
+                                           tab_key=self._current_tab)
+            except Exception:
+                logger.debug("重新转换启动失败: %s", path, exc_info=True)
+                self._log(f"⚠ 重新转换失败: {os.path.basename(path)}")
+        # ⑤ 字体重查（新指纹 ⇒ 一定重排队；查不了的格式这里会被标成已查）
+        try:
+            self._queue_font_checks([jobs[r] for r in rows], tab_key=self._current_tab)
+        except Exception:
+            logger.debug("字体重查排队失败", exc_info=True)
+        return redone
+
+    def _purge_job_pdf_cache(self, job) -> bool:
+        """删掉这个任务引用的缓存 PDF（只在 `pdf_cache` 目录内、且没有别的任务引用时删）。
+
+        返回是否真的删了。索引文件（.json）一律不动：它只是"哪些 key 存在"的旁路缓存，
+        真入口是 `find_cached_pdf` 查文件，删 PDF 就足以让下一次转换重新生成。
+        """
+        path = getattr(job, "cached_pdf", "") or ""
+        try:
+            job.cached_pdf = ""
+        except Exception:
+            pass
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            import paths as _paths
+            _cache_dir = os.path.normcase(os.path.realpath(_paths.pdf_cache_dir()))
+        except Exception:
+            return False
+        _real = os.path.normcase(os.path.realpath(path))
+        if not _real.startswith(_cache_dir + os.sep):
+            # 不在 pdf_cache 里（例如用户直接拖进来的 PDF 原件）⇒ 绝不能删
+            return False
+        for tab in (getattr(self._config, "tabs", None) or {}).values():
+            for other in (getattr(tab, "jobs", None) or []):
+                if other is job:
+                    continue
+                if os.path.normcase(os.path.realpath(getattr(other, "cached_pdf", "") or "")) == _real:
+                    return False   # 还有别的任务在用它
+        try:
+            os.remove(path)
+            return True
+        except Exception:
+            logger.debug("删除缓存 PDF 失败: %s", path, exc_info=True)
+            return False
 
     def _cancel_all_convert_workers(self):
         """终止所有正在进行的 PDF 转换线程（协作式取消，2s 超时后 terminate 兜底）。"""
@@ -14640,6 +14774,30 @@ class MainWindow(QMainWindow):
 
         # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单（只打未完成的，已打的不重打）
         # 2026-12：补打保持后台（不切换前台标签页），与无障碍订单「后台创建标签页」一致
+        self._drain_auto_print_retry()
+
+        # 打印机空闲了 → 先接着打排队等第 1 趟的攒批单（连续堆纸），
+        # 再放行攒批期间被挡住的其它排队请求（纸叠已打完时才会真的开打）
+        self._drain_stack_entry_queue()
+        self._drain_stack_wait_queue()
+
+    # ──────── 无障碍自动打印重试队列（排空 / 自驱动抽水）────────
+
+    def _drain_auto_print_retry(self) -> bool:
+        """排空无障碍自动打印重试队列的**队首**：能启动 / 已无意义才出队，否则留队。
+
+        2026-11-02 从 `_on_all_finished` 里原样搬出来（判断逻辑一字未改），因为入队原因
+        不止"打印机忙"：**页数还没统计完**（`_pending_page_count_stats` 返回非空）同样会让
+        `_start_print_worker` 返回 False 而入队 —— 但那时上一批打印早就打完了，没人再来
+        调这个排空函数，订单只能干等到"下一次随便哪一批收尾"才被带出来。
+        现场 HN20261102-0023（无障碍 / auto_print=1 / schedule_mode=now / 5 个文件）：
+        13:38:01 入队（3 个 Office 文件还在转 PDF 数页数），13:40:00 才被上一批的收尾带出来
+        —— 白等 2 分钟，看着像"无障碍单没自动开打"。现在 `_pump_auto_print_retry()`
+        每 2 秒自己驱动一次，不必再等别人收尾。
+
+        返回 True = 队首已出队（开打了 / 本来就没用了）；False = 队列空或本次没能启动。
+        """
+        _before = len(self._auto_print_retry)
         if self._auto_print_retry:
             item = self._auto_print_retry[0]     # 先看队首：确认能启动才出队（防启动失败静默丢单）
             tab_key = item.get("tab_key", "")
@@ -14670,11 +14828,72 @@ class MainWindow(QMainWindow):
             else:
                 self._auto_print_retry.pop(0)
                 self._log(f"⚠ 重试订单 #{order_id} 标签页 {tab_key or '(已删除)'} 已无文件，跳过补打")
+        # 队列里还有下一单 → 继续自驱动（本次没启动成功也靠它再试，绝不静默留在队列里）
+        if self._auto_print_retry:
+            self._arm_auto_print_retry_timer()
+        return len(self._auto_print_retry) < _before
 
-        # 打印机空闲了 → 先接着打排队等第 1 趟的攒批单（连续堆纸），
-        # 再放行攒批期间被挡住的其它排队请求（纸叠已打完时才会真的开打）
-        self._drain_stack_entry_queue()
-        self._drain_stack_wait_queue()
+    def _pump_auto_print_retry(self) -> None:
+        """定时抽水：能打就打；此刻打不了（打印中 / 页数还在统计）就 2 秒后再来一次。
+
+        与 `_on_all_finished` 里那次排空的区别：那边是"上一批刚打完"的事件驱动，这边是
+        定时驱动 —— 专门覆盖"入队时打印机本来就空着、只是页数还没统计完"的情形
+        （2026-11-02 现场，见 `_drain_auto_print_retry` 的 docstring）。
+        预检放在这里（而不是让 `_start_print_worker` 反复返回 False）：它有副作用 ——
+        会在日志里刷「⏳ 还有 N 个文件正在统计页数」「已有打印任务正在进行」。
+        """
+        if not getattr(self, "_auto_print_retry", None):
+            return
+        try:
+            if ((self._worker is not None and self._worker.isRunning())
+                    or (self._stack_flush_worker is not None and self._stack_flush_worker.isRunning())
+                    or self._print_starting):
+                self._arm_auto_print_retry_timer()     # 打印机正忙 / 正在取号：下次 tick 再说
+                return
+            # 攒批模式（第 1 趟堆在出纸槽里等第 2 趟）期间绝不插新单 ——
+            # 「出纸槽独占」是攒批四铁律之一：插进去的纸会和整叠混在一起，第 2 趟页序全乱。
+            # 旧实现里重试队列只在批次收尾排空，天然避开了攒批；现在定时器自己驱动，
+            # 必须显式让路（`docs/攒批模式.md`）。
+            if (getattr(self, "_stack_pending_ctx", None)
+                    or getattr(getattr(self, "_stack", None), "entries", None)):
+                self._arm_auto_print_retry_timer()
+                return
+        except (AttributeError, RuntimeError):
+            pass
+        # 队首那单还有文件在转 PDF 数页数 → 等它们统计完（避免刷屏日志，也避免按 0 页上报）
+        item = self._auto_print_retry[0]
+        tab_key = item.get("tab_key", "")
+        order_id = item.get("order_id", 0)
+        tab = self._config.tabs.get(tab_key) if tab_key else None
+        if tab is None and order_id:
+            found = self._find_tab_key_by_order_id(order_id)
+            if found:
+                tab = self._config.tabs.get(found)
+        pending = [j for j in (tab.jobs if tab is not None else [])
+                   if not getattr(j, 'sent', False)]
+        if pending and self._pending_page_count_stats(pending):
+            self._arm_auto_print_retry_timer()
+            return
+        self._log(f"⚡ 自动打印重试队列：订单 #{order_id} 现在可以开打"
+                  f"（不再等下一批收尾，见 2026-11-02 现场）")
+        self._drain_auto_print_retry()
+        if self._auto_print_retry:
+            self._arm_auto_print_retry_timer()
+
+    def _arm_auto_print_retry_timer(self, delay_ms: int = 2000) -> None:
+        """`delay_ms` 后抽水一次（单次定时器；已经在跑就不重置，避免无限延后）。"""
+        try:
+            timer = getattr(self, "_auto_print_retry_timer", None)
+            if timer is not None and timer.isActive():
+                return
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self._pump_auto_print_retry)
+                self._auto_print_retry_timer = timer
+            timer.start(int(delay_ms))
+        except (AttributeError, RuntimeError):
+            pass
 
     def _on_about(self):
         """关于对话框。"""
@@ -15234,7 +15453,7 @@ class MainWindow(QMainWindow):
                         self._sync_edit_enabled(False)
                 return
 
-        # 自动开始打印（打印机忙时不静默丢弃 → 入重试队列，打印完成后自动补打）。
+        # 自动开始打印（启动失败时不静默丢弃 → 入重试队列，由抽水定时器自己重试）。
         # 只打印未完成（sent=False）的 job：追加到已有标签页时，已打印过的文件不重打
         if jobs:
             self._log(f"⚡ 自动开始打印标签页 {tab_key}（{len(jobs)} 个文件）")
@@ -15244,13 +15463,18 @@ class MainWindow(QMainWindow):
                 # 补打时同一 task_id 被打两次（现场：#1062 上报"打印成功"两次）。
                 # 改为按 order_id 合并：同一订单在重试队列里只保留一条，task_ids 取并集。
                 tids = [t.task_id for t in ready_tasks]
+                # 入队原因不止"打印机忙"：**页数还没统计完**（Office 正在转 PDF）同样会让
+                # `_start_print_worker` 返回 False。旧文案把两种原因一律写成"打印机正忙"，
+                # 2026-11-02 排查 HN20261102-0023 时就是这么被带偏的（见 `_drain_auto_print_retry`）。
+                _why = ("页数还没统计完（Office 正在转 PDF）"
+                        if self._pending_page_count_stats(list(jobs)) else "打印机正忙")
                 for it in self._auto_print_retry:
                     if it.get("order_id") == order_id:
                         for tid in tids:
                             if tid not in it["task_ids"]:
                                 it["task_ids"].append(tid)
                         it["tab_key"] = tab_key
-                        self._log(f"⚡ 打印机正忙，订单 #{order_id} 已在重试队列中，"
+                        self._log(f"⚡ {_why}，订单 #{order_id} 已在重试队列中，"
                                   f"本批文件已并入（共 {len(it['task_ids'])} 个文件）")
                         break
                 else:
@@ -15259,7 +15483,10 @@ class MainWindow(QMainWindow):
                         "tab_key": tab_key,
                         "task_ids": tids,
                     })
-                    self._log(f"⚡ 打印机正忙，订单 #{order_id} 已加入重试队列（打印完成后自动补打）")
+                    self._log(f"⚡ {_why}，订单 #{order_id} 已加入重试队列"
+                              f"（队列会自己重试，不必等下一批收尾）")
+                # 队列自己驱动排空：不再依赖"下一批打印收尾"这个可能永远不来/来得太晚的事件
+                self._arm_auto_print_retry_timer()
         else:
             # jobs 是"该标签页里还没 sent 的文件"，为空 ⇒ 文件都在、只是都已经打完并回报过。
             # 旧文案写「无文件，跳过」，与"标签页里其实有文件"的事实不符。

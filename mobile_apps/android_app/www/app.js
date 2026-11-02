@@ -1847,6 +1847,11 @@ function setupTabs() {
 }
 
 function initApp() {
+  // 前端日志上报：挂 window.onerror / unhandledrejection / fetch 失败兜底（见 www/logger.js）。
+  // 必须放在最前面 —— 后面任何一步初始化报错都能被 onerror 接住；logger 自身异常一律吞掉。
+  try {
+    if (window.HNLogger && typeof window.HNLogger.install === 'function') window.HNLogger.install();
+  } catch (e) { /* 日志挂了不能拖垮启动 */ }
   setupTabs();
   setupNav();
   setupPressFeedback();

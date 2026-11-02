@@ -445,8 +445,12 @@ if _has_gui:
     check("未嵌入那段说明「装了就用它渲染」并把重新导出列为最稳出路",
           "本机装了这个字体 ⇒ 打印时自动用它渲染" in _tip_both
           and "重新导出「嵌入字体」的 PDF" in _tip_both)
-    check("本机没装那段给了「装上再重新添加」的出路",
-          "把字体装上，再重新添加这个文件" in _tip_both)
+    # 2026-11-02：出路从「重新添加这个文件」改成右键「🔄 重新转换」——
+    # 因为重加文件走的是同一份转换缓存 + 同一份进程内字体缓存，
+    # 人装了字体也不会重判（`font_check.refresh_installed()` 才真的重枚举）。
+    check("本机没装那段给了「装上 → 右键重新转换」的出路",
+          "把字体装上" in _tip_both and "重新转换" in _tip_both
+          and "重新添加这个文件" not in _tip_both, _tip_both[:240])
     check("未嵌入那段不再吓唬人（页数/位置/分页不受影响要说）",
           "页数、位置、分页不受影响" in _tip_both)
     _tip_ne = "\n\n".join(_Stub()._font_tip_blocks(_ne_only))

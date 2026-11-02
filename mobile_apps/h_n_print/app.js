@@ -1,9 +1,14 @@
 // app.js
 const { CONFIG } = require('./utils/config')
 const { request } = require('./utils/request')   // D5 第 7 条：统一请求封装（401 自动续登重放）
+const logger = require('./utils/logger')         // 前端异常上报（POST /api/log/report，裸 wx.request）
 
 App({
   onLaunch() {
+    // 前端日志上报：接管 console.error 并起发送定时器（见 utils/logger.js）。
+    // 放在最前面 —— 后面主题初始化再出什么错，也还有上报通道；日志自身异常一律吞掉。
+    try { logger.install() } catch (e) { /* 日志挂了不能拖垮启动 */ }
+
     this.globalData._firstLaunch = true
 
     // 初始化主题：'auto' | 'light' | 'dark'
@@ -41,6 +46,19 @@ App({
       this.globalData._resumedFromBackground = true
     }
     this.globalData._firstLaunch = false
+  },
+
+  // 未捕获异常：小程序里 JS 报错不会崩页面，用户只看到"点了没反应"；这类错误平时
+  // 只进 console，线上根本查不到。这里送给后端（队列/限速/脱敏都在 logger 内部）。
+  onError(err) {
+    try { logger.logError(err) } catch (e) { /* 日志自身异常吞掉 */ }
+  },
+
+  // 未被 catch 的 Promise 拒绝（await 漏 try/catch 最常见）
+  onUnhandledRejection(res) {
+    try {
+      logger.logError('未处理的 Promise 拒绝', res && res.reason)
+    } catch (e) { /* 日志自身异常吞掉 */ }
   },
 
   // 根据 themeMode + _systemTheme 计算 isDarkMode

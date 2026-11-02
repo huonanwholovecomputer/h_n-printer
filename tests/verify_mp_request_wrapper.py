@@ -27,6 +27,11 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MP = os.path.join(REPO, "mobile_apps", "h_n_print")
 WRAPPER = os.path.join(MP, "utils", "request.js")
+# 唯一例外：错误上报器 `utils/logger.js`（2026-11-02 前端日志上报）。
+# 它上报的**正是**「401 / 登录态已坏 / 请求失败」这类错误 —— 走 utils/request 会被
+# 401→静默重登录→重放 放大成登录风暴，所以刻意直连 `wx.request`，且自己负责脱敏
+# （`?token=` / Authorization / 裸 Bearer / openid）。例外只认这一个精确路径。
+EXEMPT = {os.path.normcase(os.path.join(MP, "utils", "logger.js"))}
 
 ok_all = True
 
@@ -63,7 +68,8 @@ def audit(files, contents):
     if len(files) < 10:
         problems.append(f"扫描面异常：只扫到 {len(files)} 个 js（判定器可能已失效，判失败）")
     for p in files:
-        if os.path.normcase(p) == os.path.normcase(WRAPPER):
+        _key = os.path.normcase(p)
+        if _key == os.path.normcase(WRAPPER) or _key in EXEMPT:
             continue
         text = strip_comment_lines(contents.get(p, ""))
         hits = [i + 1 for i, ln in enumerate(text.split("\n")) if "wx.request(" in ln]
@@ -87,6 +93,17 @@ _problems = audit(files, contents)
 check("★ 除 utils/request.js 外，没有任何页面直接 wx.request", not _problems,
       "；".join(_problems))
 check("扫描面存活下限（≥10 个 js）", len(files) >= 10, f"{len(files)}")
+
+print("=== A2. 唯一例外：utils/logger.js（错误上报器）自身的护栏 ===")
+_logger = os.path.join(MP, "utils", "logger.js")
+_logger_src = contents.get(_logger, "")
+check("例外只有错误上报器一个文件（不许夹带页面）",
+      EXEMPT == {os.path.normcase(_logger)}, str([os.path.basename(p) for p in EXEMPT]))
+check("例外文件确实直连 wx.request（不是死代码占位）", "wx.request(" in _logger_src)
+check("例外文件自己做脱敏（token / Authorization / Bearer / openid 都要有）",
+      all(k in _logger_src for k in ("token", "Authorization", "Bearer", "openid")))
+check("例外文件不 require 统一封装（防 401 续登风暴，注释里说明过）",
+      "require('./request')" not in _logger_src and 'require("./request")' not in _logger_src)
 
 print("=== B. authorized-users 页接线 ===")
 _au = os.path.join(MP, "pages", "authorized-users", "authorized-users.js")
