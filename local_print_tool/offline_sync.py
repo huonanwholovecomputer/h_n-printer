@@ -65,6 +65,10 @@ class OfflineSync:
             import paths as _paths
             db_path = _paths.local_db_path()
         self.db_path = db_path
+        # 本机 client_id（GUI 在 _init_cloud_client 里赋值）：离线单补报时要带上它，
+        # 后端才能把订单的「接单设备」(orders.received_client) 写上；缺了就是空 ——
+        # 2026-11-02 现场 HN20261102-0011 结算页「接单设备」显示 —。
+        self.client_id: str = ""
         self._lock = threading.Lock()
         self._sync_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -210,6 +214,9 @@ class OfflineSync:
                 "is_admin_print": bool(is_admin_print),
                 # 备注（离线打印的订单重连后补报，不丢）
                 "remark": str(remark or "")[:100],
+                # 接单设备（后端 orders.received_client）：离线单也是本机打的，
+                # 空着会让结算页「接单设备」永远是「—」。未赋值时给空串（旧行为）。
+                "client_id": str(self.client_id or ""),
             }
             # S1-09：请求超时 10s（断网时不会把后台线程挂在半开连接上）
             # S1-01：token 走请求头（旧写法 ?token= 会落进日志/代理）

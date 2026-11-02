@@ -40,6 +40,7 @@ import socket
 import sqlite3
 import string
 import secrets
+import subprocess
 import sys
 import threading
 import time
@@ -12049,6 +12050,53 @@ if not _frontend_log.handlers:
 
 
 _FRONTEND_LOG_PATH = os.path.join(LOG_DIR, "frontend.log")
+# 单次「拉取后端日志」最多回 200KB（journald 里可能夹着超长行，别把内存和响应撑爆）
+_LOG_FETCH_MAX_BYTES = 200 * 1024
+# 读 journal 用的 unit 名（与 printer-backend.service 的 unit 一致）
+_JOURNAL_UNIT = os.environ.get("HN_JOURNAL_UNIT", "printer-backend")
+
+
+def _journalctl_exe() -> str:
+    """journalctl 的可执行路径。
+
+    ⚠ 服务单元的 `Environment=PATH=/home/printer-backend/venv/bin` 把系统 PATH 覆盖了，
+    所以**不能**只写 "journalctl" —— subprocess 会 FileNotFoundError（2026-11-02 现场：
+    端点回 0 字节，检查发现是 PATH 里没有 /usr/bin）。这里显式解析并兜底绝对路径。
+    """
+    p = shutil.which("journalctl")
+    if p:
+        return p
+    for cand in ("/usr/bin/journalctl", "/bin/journalctl", "/usr/sbin/journalctl"):
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def _journalctl_tail(lines: int) -> str:
+    """取 systemd journal 里本服务的最近 N 行 —— **后端日志的真相源**。
+
+    为什么需要兜底：`LOG_DIR/server.log` 只由 `printer_server` logger 写，而全仓没有任何
+    一处往这个 logger 打日志（2026-11-02 现场核查：该文件从 2026-08-03 起一直是 0 字节）；
+    gunicorn 的 access / error 日志走 stdout / stderr → journald。所以「拉取前后端日志」
+    只读文件时永远显示 0 字节，看上去像拉取失败。这里回落到 journalctl，并做 token 脱敏
+    （access_log_format 已去掉 query，但 journal 里别处仍可能带密钥）。
+    """
+    exe = _journalctl_exe()
+    if not exe:
+        return ""
+    try:
+        proc = subprocess.run(
+            [exe, "-u", _JOURNAL_UNIT, "-n", str(max(1, int(lines))),
+             "--no-pager", "--output=short-iso"],
+            capture_output=True, text=True, timeout=12,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return _scrub_secret(proc.stdout or "")
+
+
 _FRONTEND_LOG_MAX_BYTES = 50 * 1024 * 1024  # 超过 50MB 轮转（P1-6）
 
 
@@ -12128,15 +12176,21 @@ def log_fetch():
         tail = 500
     tail = max(0, tail)
     log_path = os.path.join(LOG_DIR, f"{log_type}.log")
-    if not os.path.exists(log_path):
-        return jsonify({"success": True, "size": 0, "content": ""})
-    with open(log_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    if tail == 0:
-        content = ""
-    else:
+    content = ""
+    source = "file"
+    if tail and os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
         content = "".join(lines[-tail:])
-    return jsonify({"success": True, "size": len(content.encode("utf-8")), "content": content})
+    # server.log 常年为空（没人往 printer_server logger 写）⇒ 回落 journald，
+    # 否则这个按钮永远只报「0 字节」，看着像网络问题。
+    if tail and log_type == "server" and not content.strip():
+        content = _journalctl_tail(tail)
+        source = "journald" if content.strip() else "file"
+    if len(content.encode("utf-8")) > _LOG_FETCH_MAX_BYTES:
+        content = content.encode("utf-8")[-_LOG_FETCH_MAX_BYTES:].decode("utf-8", "ignore")
+    return jsonify({"success": True, "size": len(content.encode("utf-8")),
+                    "content": content, "source": source})
 
 
 @app.route("/api/log/collect_all", methods=["POST"])

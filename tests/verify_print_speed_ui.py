@@ -107,6 +107,106 @@ check("announce 带上 gate_ratio / gate_extra（窗口据此算闸门）",
 check("闸门文案说明按百分比放行 + 可在「帮助 → 打印速度…」里调",
       '按「预估 {_ratio}%' in SRC and "放行比例与人工翻页时间可在「帮助 → 打印速度…」里调" in SRC)
 
+# ══════════════════════════════════════════════════════════════════════
+print("\\n=== ⑤ 能力适配：自动双面机型不能把这套设置当成可调项（2026-11-02） ===")
+auto = pc.PrinterProfile(auto_duplex=True, capability_source="manual",
+                         manual_duplex=False, verified_at="2026-10-30 19:55:00",
+                         speed_manual_a=13.0, gate_ratio=0.75, flip_ready_sec=20.0)
+d2 = gui.PrintSpeedDialog(None, auto, "HP LaserJet MFP M232-M237")
+check("自动双面 ⇒ 横幅说明「没有第 1 趟 / 翻纸放行、设置不生效」",
+      "自动双面" in d2._banner.text() and "不生效" in d2._banner.text(),
+      d2._banner.text())
+check("自动双面 ⇒ 两个设置组整体灰掉（第 1 趟耗时模型 / 翻纸放行）",
+      not d2._g_model.isEnabled() and not d2._g_gate.isEnabled())
+check("自动双面 ⇒ 测速 / 恢复自动学习灰掉（11 张纸测一个没人用的模型）",
+      not d2._btn_cal.isEnabled() and not d2._btn_reset.isEnabled()
+      and "没有用处" in d2._btn_cal.toolTip())
+check("自动双面 ⇒ 「保存」变「关闭」",
+      d2._btn_save.text() == "关闭" and d2._btn_save.isEnabled())
+_accepted = []
+d2.accepted.connect(lambda: _accepted.append(1))
+d2._btn_save.click()
+check("点「关闭」只走 reject（accept 才会触发主窗口 update_profile + 落盘）",
+      not _accepted, str(_accepted))
+check("自动双面 ⇒ 不再展示「完成回报早于出纸」（那句只对人工翻纸机型成立）",
+      d2._note is None)
+# 可见性要在 show() 之后判：布局在父窗口显示时可能把子控件重新显示出来
+d2.show()
+_app.processEvents()
+check("自动双面 ⇒ 「取消」不给（「关闭」已经等价于取消，不摆两个按钮）",
+      not d2._btn_cancel.isVisible())
+d2.close()
+
+un = pc.PrinterProfile(auto_duplex=None)
+d3 = gui.PrintSpeedDialog(None, un, "HP LaserJet MFP M232-M237")
+check("未确认 ⇒ 横幅提示先去「帮助 → 打印机双面能力…」盖章",
+      "未确认" in d3._banner.text() and "打印机双面能力…" in d3._banner.text(),
+      d3._banner.text())
+check("未确认 ⇒ 控件仍可调（盖章后可能就是要人工翻纸的机型）",
+      d3._g_gate.isEnabled() and d3._btn_cal.isEnabled()
+      and d3._btn_save.text() == "保存")
+d3.close()
+
+man = pc.PrinterProfile(auto_duplex=False, manual_duplex=True, capability_source="manual")
+d4 = gui.PrintSpeedDialog(None, man, "HP LaserJet 1020")
+check("人工翻纸 ⇒ 横幅说明现在就生效，控件全开",
+      "现在就生效" in d4._banner.text() and d4._g_gate.isEnabled()
+      and d4._btn_cal.isEnabled() and d4._btn_save.text() == "保存")
+d4.show()
+_app.processEvents()
+check("人工翻纸 ⇒ 仍然有「取消」（真的能撤销这次的改动）",
+      d4._btn_cancel.isVisible())
+d4.close()
+
+# ══════════════════════════════════════════════════════════════════════
+print("\\n=== ⑥ 主窗口入口：自动双面机型走只读说明窗 + 拒绝打 11 张纸 ===")
+from PySide6.QtWidgets import QMessageBox  # noqa: E402
+QMessageBox.information = staticmethod(lambda *a, **kw: QMessageBox.Ok)
+QMessageBox.warning = staticmethod(lambda *a, **kw: QMessageBox.Ok)
+QMessageBox.question = staticmethod(lambda *a, **kw: QMessageBox.Yes)
+
+import paths  # noqa: E402
+
+_spy = {}
+
+
+class _SpyDlg:
+    def __init__(self, parent=None, profile=None, queue_name=""):
+        _spy["cap"] = getattr(profile, "auto_duplex", "missing")
+        _spy["queue"] = queue_name
+
+    def exec(self):
+        return 0
+
+
+_orig_dlg = gui.PrintSpeedDialog
+gui.PrintSpeedDialog = _SpyDlg
+try:
+    win = gui.MainWindow(config_path=paths.config_path())
+    win._cloud_client = None
+    win._printer_profile = lambda: pc.PrinterProfile(auto_duplex=True,
+                                                     capability_source="manual")
+    saved = []
+    win._config.update_profile = lambda *a, **kw: saved.append((a, kw))
+    win._on_calibrate_speed()
+    check("自动双面 ⇒ 仍开说明窗（不静默无反应），队列名带过去",
+          _spy.get("cap") is True and bool(_spy.get("queue")), str(_spy))
+    check("自动双面 ⇒ 打开窗口不写档案", not saved, str(saved))
+
+    started = []
+
+    class _NoWorker:
+        def __init__(self, *a, **kw):
+            started.append(a)
+
+    gui.SpeedCalibrationWorker = _NoWorker
+    win._speed_cal_worker = None
+    win._start_speed_calibration()
+    check("自动双面 ⇒ 直接拒绝测速（连 worker 都不建、一张纸都不打）",
+          not started and win._speed_cal_worker is None, str(started))
+finally:
+    gui.PrintSpeedDialog = _orig_dlg
+
 print("\n" + "=" * 56)
 print("打印速度窗口验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")
 import shutil  # noqa: E402

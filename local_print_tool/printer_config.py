@@ -160,6 +160,11 @@ class PrintJob:
     order_number: str = ""   # 订单号（云端的来自后端，本地的在复制时生成）
     remark: str = ""         # 订单/任务备注（云端订单来自后端 remark；本地任务可自行填写，≤100 字）
     sent: bool = False       # 是否已打印完成（成功回报后置位，退出时不再放弃；持久化以扛异常退出重载）
+    # 实际打印完成时刻（"%Y-%m-%d %H:%M:%S"，成功回报那一刻写入，持久化）。
+    # 用途：离线打印的单在重连后**换号补报**时，created_at 必须用真实打印时间，
+    # 不能再用"补报那一刻"（2026-11-02 现场 HN20261102-0011：12:14:40 就打完的纸，
+    # 订单 created_at 被记成 12:15:15 的补报时刻，明细页看着像"刚下单就打印完"）。
+    finished_at: str = ""
     # 该任务是否「管理员自行打印」（云端 is_admin_print）。**已不参与**云端 Word 是否走 COM 的
     # 判定（2026-10-28：只看 uploader_is_admin，见 cloud_word_com_allowed）；保留它是因为
     # 「自打」仍决定结算归类（自打不计收益）与界面展示。
@@ -207,6 +212,7 @@ class PrintJob:
             "order_number": self.order_number,
             "remark": self.remark,
             "sent": self.sent,
+            "finished_at": self.finished_at,
             "admin_self_print": self.admin_self_print,
             "uploader_is_admin": self.uploader_is_admin,
             "blank_tail": self.blank_tail,
@@ -235,6 +241,7 @@ class PrintJob:
             display_name=data.get("display_name", ""),
             task_id=_num_or_default(data.get("task_id"), 0, int),
             sent=bool(data.get("sent", False)),
+            finished_at=str(data.get("finished_at", "") or ""),
             order_id=_num_or_default(data.get("order_id"), 0, int),
             order_number=data.get("order_number", ""),
             remark=str(data.get("remark", "") or ""),

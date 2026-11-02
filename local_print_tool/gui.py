@@ -2217,6 +2217,13 @@ class PrintSpeedDialog(QDialog):
       · 翻纸放行：放行比例（%）、人工翻页准备时间（秒）
         放行时刻 = 第 1 趟预估 × 比例 + 翻页准备时间
       · 底部：打印测速（1 张 + 10 张空白页，写进速度样本）/ 恢复自动学习 / 保存 / 取消
+
+    **能力适配（2026-11-02）**：这套参数唯一的使用者是 `ManualDuplexDialog` 的
+    「第 1 趟预估 / 翻纸放行闸门」，只存在于「程序自己分两趟 + 人工翻纸」的路径上。
+    机器若确认支持自动双面（`profile.auto_duplex is True`），双面由驱动一次成型、
+    没有第 1 趟、也没有翻纸，这些设置**一个都不生效**（改数值、打 11 张纸测速都是空转）。
+    所以窗口按能力三态改口：自动双面 ⇒ 只读说明窗（控件灰掉、保存变关闭、不写档案）；
+    未确认 ⇒ 提示先去「帮助 → 打印机双面能力…」盖章；人工翻纸 ⇒ 正常可调。
     """
 
     calibrate_requested = Signal()
@@ -2226,13 +2233,42 @@ class PrintSpeedDialog(QDialog):
         self.setWindowTitle("打印速度")
         self.setMinimumWidth(520)
         prof = profile or PrinterProfile()
+        # 能力三态：True=自动双面 / False=人工翻纸 / None=未确认
+        cap = prof.auto_duplex if isinstance(prof.auto_duplex, bool) else None
+        self._capability = cap
         lay = QVBoxLayout(self)
 
-        head = QLabel(
-            f"打印队列：<b>{queue_name or '(系统默认打印机)'}</b><br>"
-            f"当前模型：{prof.speed_summary()}")
+        if cap is True:
+            head_txt = (f"打印队列：<b>{queue_name or '(系统默认打印机)'}</b><br>"
+                        f"双面方式：{prof.summary()}")
+        else:
+            head_txt = (f"打印队列：<b>{queue_name or '(系统默认打印机)'}</b><br>"
+                        f"当前模型：{prof.speed_summary()}")
+            if cap is None:
+                head_txt += f"<br>双面能力：{prof.summary()}"
+        head = QLabel(head_txt)
         head.setWordWrap(True)
         lay.addWidget(head)
+
+        # ── 能力横幅：把「这套设置对谁生效」写在最上面 ──
+        if cap is True:
+            banner_txt = ("本机已确认「支持自动双面」：双面由驱动一次成型 —— 没有「第 1 趟」、"
+                          "也没有人工翻纸，所以下面这套设置对本机不生效"
+                          "（改了不影响打印，只在这份档案切回人工翻纸机型时才用得上）。")
+        elif cap is None:
+            banner_txt = ("双面能力未确认：这套「第 1 趟耗时 / 翻纸放行」只对没有自动双面器、"
+                          "必须人工翻纸的机型有效。若本机没有自动双面器，请先到"
+                          "「帮助 → 打印机双面能力…」盖章，否则双面会交给驱动程序自带的"
+                          "「双面打印说明」向导。")
+        else:
+            banner_txt = ("本机按「人工翻纸」口径打双面（程序自己分两趟）："
+                          "下面这套参数现在就生效。")
+        banner = QLabel(banner_txt)
+        banner.setWordWrap(True)
+        banner.setStyleSheet("color: %s; font-size: 11px;"
+                             % ("#7f8c8d" if cap is False else "#d68910"))
+        self._banner = banner
+        lay.addWidget(banner)
 
         # ── 第 1 趟耗时模型 ──
         g1 = QGroupBox("第 1 趟耗时模型（0 = 该分量仍用自动学习值）")
@@ -2286,12 +2322,25 @@ class PrintSpeedDialog(QDialog):
         self._ready.valueChanged.connect(self._sync_formula)
         self._sync_formula()
         lay.addWidget(g2)
+        self._g_model, self._g_gate = g1, g2   # 验收脚本据此检查能力适配（自动双面 ⇒ 整体灰掉）
+        if cap is True:
+            # 组标题自己也交代一句：自动双面的机器上，「第 1 趟 / 翻纸放行」根本不存在
+            g1.setTitle(g1.title().replace("（0 = 该分量仍用自动学习值）",
+                                           "· 仅人工翻纸机型用"))
+            g2.setTitle(g2.title().replace("（什么时候允许点「▶ 继续打第 2 趟」）",
+                                           "· 仅人工翻纸机型用"))
 
-        note = QLabel("提示：这台打印机的「完成」回报早于实机出纸（只回报「开始打印」），"
-                      "所以按钮按上面这套预估放行；放行前仍会显示还要等几秒。")
-        note.setWordWrap(True)
-        note.setStyleSheet("color: #7f8c8d; font-size: 11px;")
-        lay.addWidget(note)
+        # 这段「完成回报早于出纸」只对走人工翻纸的机组成立（驱动只回报「开始打印」），
+        # 自动双面机型根本不用预估放行 ⇒ 不展示，免得把别家打印机的行为说成事实。
+        note = None
+        if cap is not True:
+            note = QLabel("提示：这套预估只在「人工翻纸」时起作用 —— 若本机像 HP LaserJet 1020 "
+                          "那样只回报「开始打印」、不回报「纸打完」，按钮就按上面的预估放行；"
+                          "放行前仍会显示还要等几秒。")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+            lay.addWidget(note)
+        self._note = note
 
         row = QHBoxLayout()
         self._btn_cal = QPushButton("▶ 打印测速（1 张 + 10 张空白页）")
@@ -2303,14 +2352,33 @@ class PrintSpeedDialog(QDialog):
         self._btn_reset.clicked.connect(self._on_reset)
         row.addWidget(self._btn_reset)
         row.addStretch(1)
-        ok = QPushButton("保存")
+        ok = QPushButton("关闭" if cap is True else "保存")
         ok.setDefault(True)
-        ok.clicked.connect(self.accept)
         cancel = QPushButton("取消")
-        cancel.clicked.connect(self.reject)
+        if cap is True:
+            # 只读说明窗：走 reject，连一次 update_profile 都不发生（灰掉的控件不回写配置）
+            ok.setToolTip("本机是自动双面，这套设置对它不生效；关闭不会改动档案")
+            ok.clicked.connect(self.reject)
+        else:
+            ok.clicked.connect(self.accept)
+            cancel.clicked.connect(self.reject)
         row.addWidget(ok)
         row.addWidget(cancel)
         lay.addLayout(row)
+        self._btn_save = ok
+        if cap is True:
+            # 「关闭」已经等价于取消，再摆一个「取消」只是噪音；hide 放在 addWidget 之后，
+            # 免得布局在父窗口 show() 时又把它显示出来。
+            cancel.hide()
+        self._btn_cancel = cancel
+
+        # ── 自动双面机型：整套参数没有消费者 ⇒ 全部停用（保留数值只为换机时不用重填）──
+        if cap is True:
+            for w in (g1, g2, self._btn_cal, self._btn_reset):
+                w.setEnabled(False)
+            self._btn_cal.setToolTip("本机自动双面：没有「第 1 趟」，测速结果没有用处")
+            if note is not None:
+                note.setEnabled(False)
 
     def _sync_formula(self):
         self._formula.setText(
@@ -5744,6 +5812,25 @@ class MainWindow(QMainWindow):
 
     # ---- 云端连接 ----
 
+    def _local_client_id(self) -> str:
+        """本机 client_id（**离线也要有值**）：用来给上报的订单写「接单设备」。
+
+        云端已连上 ⇒ 直接用 CloudClient 的（与连接时上报后端的是同一个）；
+        未启用云端 / 断网 ⇒ 回落到同一个持久化 ID（`_get_persistent_client_id()` 与
+        CloudClient 内部算法同源：`%APPDATA%\\HN打印工具\\.client_id`，升级不变）。
+        """
+        try:
+            cid = getattr(self._cloud_client, "client_id", "") if self._cloud_client else ""
+        except Exception:
+            cid = ""
+        if cid:
+            return str(cid)
+        try:
+            return _get_persistent_client_id()
+        except Exception as e:  # 磁盘不可写等极端情况：宁可空着，也别让上报整体失败
+            logger.warning(f"client_id 取值失败: {e}")
+            return ""
+
     def _init_cloud_client(self):
         """初始化云打印客户端（根据配置决定是否自动连接）。
 
@@ -5752,6 +5839,12 @@ class MainWindow(QMainWindow):
         """
         # 初始化本地订单库（离线/本地模式订单都写这里，供本地订单统计）
         self._offline_sync = OfflineSync()
+        # 离线库补报同样要带本机 client_id（后端据此写「接单设备」，
+        # 见 mobile_apps/printer-backend/app.py:9478/9572）
+        try:
+            self._offline_sync.client_id = self._local_client_id()
+        except Exception:
+            pass
         # S1-09：启动即刷一次「📴 离线未同步」角标（上次运行遗留的未同步单要立刻看得见）
         self._refresh_offline_badge()
 
@@ -6625,7 +6718,9 @@ class MainWindow(QMainWindow):
         # 和原来的两点测速**全部塞进同一个窗口**，入口改名「打印速度…」。
         speed_action = QAction("打印速度…", self)
         speed_action.setToolTip("第 1 趟耗时模型（启动/预热、每张纸）+ 翻纸放行策略"
-                                "（按预估百分比放行、人工翻页准备时间）+ 一键测速")
+                                "（按预估百分比放行、人工翻页准备时间）+ 一键测速"
+                                "（只对「无自动双面器、需要人工翻纸」的机型生效；"
+                                "自动双面机型打开会看到说明）")
         speed_action.triggered.connect(self._on_calibrate_speed)
         help_menu.addAction(speed_action)
         duplex_cap_action = QAction("打印机双面能力…", self)
@@ -11009,6 +11104,13 @@ class MainWindow(QMainWindow):
                     # 备注取所属标签页（订单级）
                     _remark = next((t2.remark for t2 in self._config.tabs.values()
                                     if t2.remark and any(j.order_number == new_num for j in t2.jobs)), '')
+                    # created_at = 这单**真实打印完成**的时刻（PrintJob.finished_at），
+                    # 只有还没打印（仅预留）时才回落到当前时刻。
+                    # 2026-11-02 现场 HN20261102-0011：原来一律写 datetime.now()，于是
+                    # 12:14:40 离线打完的纸，订单 created_at/print_started_at 全变成 12:15:15
+                    # 的补报时刻 —— 明细页看着像"刚下单就打印完"，等待时长统计也失真。
+                    _created_at = next((getattr(j, "finished_at", "") for j in order_jobs
+                                        if getattr(j, "finished_at", "")), "")
                     payload = {
                         "order_number": new_num,
                         # v4.6：按本地是否已打印决定上报状态——仅复制价格未打印 → reserved（非空占位）；
@@ -11028,7 +11130,7 @@ class MainWindow(QMainWindow):
                             "duplex": j.duplex,
                             "page_range": j.page_range,
                         } for j in order_jobs],
-                        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "created_at": _created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                 elif self._offline_sync:
                     # 孤儿单：标签页已清理，从离线库行构造 payload
@@ -11038,6 +11140,10 @@ class MainWindow(QMainWindow):
                 if payload:
                     payload["owner_name"] = meta["owner_name"] or DEFAULT_OWNER_NAME
                     payload["is_admin_print"] = meta["is_admin_print"]
+                    # 接单设备：换号补报原先是**唯一**漏掉 client_id 上报路径
+                    # （后端 app.py:9478 取不到就警告，orders.received_client 永远空，
+                    # 结算页「接单设备」显示 —）。本机 id 云端未连接时也拿得到。
+                    payload["client_id"] = self._local_client_id()
                     resp = http_requests.post(
                         f"{self._cloud_client.api_url}/api/local_orders",
                         headers=auth_headers(self._cloud_client.auth_token),
@@ -11623,6 +11729,10 @@ class MainWindow(QMainWindow):
         if success:
             # 打印成功 → 标记已完成并立即持久化，异常退出重载后仍保留，退出时不再放弃
             job.sent = True
+            # 真实打印完成时刻：离线单重连后「换号补报」要用它当 created_at
+            # （否则后端把补报时刻当成打印时间，见 PrintJob.finished_at）。
+            if not getattr(job, "finished_at", ""):
+                job.finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._save_config()
         if not task_id:
             # 本地单（来源=本地，没有云端 task_id）：它的 `sent` 是**打印启动那一刻**由
@@ -11971,6 +12081,15 @@ class MainWindow(QMainWindow):
           ③ 原来那个两点测速收进同一个窗口，当它的一个按钮。
         方法名保持不变：`tests/verify_stack_gate_exclusive.py` ④ 直接调它验"纸叠未完成必须被拒"。
         """
+        prof = self._printer_profile()
+        if prof.auto_duplex is True:
+            # 自动双面机型没有「第 1 趟 / 翻纸放行」：这套设置对它零影响（速度模型与放行比例
+            # 的唯一消费者是 ManualDuplexDialog 的闸门，只在人工翻纸路径上存在）。仍开窗，
+            # 只为把"为什么用不上"当面说清；窗口是只读的 ⇒ 不必拦「打印机正忙 / 攒批未完成」。
+            dlg = PrintSpeedDialog(self, prof,
+                                   self._config.printer_name or "(系统默认打印机)")
+            dlg.exec()
+            return
         reason = self._speed_settings_block_reason()
         if reason == "打印机正忙":
             QMessageBox.information(self, "打印机正忙",
@@ -12017,6 +12136,15 @@ class MainWindow(QMainWindow):
 
         预估平时靠"每次真实打印自动采样"越用越准，但刚装好时没有样本；两点标定把这件事提前
         （11 张纸、单面、不需要人翻纸，远程也能做）。"""
+        prof = self._printer_profile()
+        if prof.auto_duplex is True:
+            # 自动双面机型上「第 1 趟耗时」没有消费者：这 11 张纸测出来的模型永远不会被用到。
+            QMessageBox.information(
+                self, "不需要测速",
+                "本机已确认「支持自动双面」：双面由驱动一次成型，没有「第 1 趟」、"
+                "也没有人工翻纸 ——" + chr(10) +
+                "这套预估对本机没有用处，不用打这 11 张纸。")
+            return
         reason = self._speed_settings_block_reason()
         if reason == "打印机正忙":
             QMessageBox.information(self, "现在不能测速", "打印机正忙，等它结束后再测速。")
@@ -14710,11 +14838,18 @@ class MainWindow(QMainWindow):
                             data = resp.json()
                             content = data.get("content", "")
                             size = data.get("size", 0)
-                            if size > 0 and content:
+                            source = data.get("source", "file")
+                            if content:
                                 dest = os.path.join(self._log_dir, f"remote_{log_type}.log")
                                 with open(dest, "w", encoding="utf-8") as f:
                                     f.write(content)
-                            results.append(f"{log_type}: {size} 字节")
+                            if content:
+                                # journald = 后端 gunicorn 的真实输出（server.log 常年空，
+                                # 后端会回落到 journalctl，见 app.py:_journalctl_tail）
+                                tag = "（journald）" if source == "journald" else ""
+                                results.append(f"{log_type}: {size} 字节{tag}")
+                            else:
+                                results.append(f"{log_type}: 无记录")
                         else:
                             results.append(f"{log_type}: 请求失败")
                     except Exception as e:
