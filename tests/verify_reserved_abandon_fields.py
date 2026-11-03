@@ -100,13 +100,13 @@ chk("SQL 用 COALESCE 回退 owner_name",
 
 print("=== A5. 整单合计行为（真实方法源码 + 假标签页）===")
 sys.path.insert(0, os.path.join(REPO, "local_print_tool"))
-from printer_config import calc_cost          # noqa: E402  真实计费函数
+from printer_config import calc_cost, job_simplex_pages   # noqa: E402  真实计费函数（含单面页收敛点）
 
 mt = re.search(r"    def _tab_total_price\(self, tab\) -> float:[\s\S]*?\n        return round\(total, 2\)\n", gui)
 chk("能从 gui.py 抽出 _tab_total_price 真实源码", mt is not None)
 if mt:
     import textwrap
-    ns = {"calc_cost": calc_cost}
+    ns = {"calc_cost": calc_cost, "job_simplex_pages": job_simplex_pages}
     exec(textwrap.dedent(mt.group(0)), ns)     # noqa: S102  故意执行真实源码
     tab_total_price = ns["_tab_total_price"]
 

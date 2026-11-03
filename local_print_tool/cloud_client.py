@@ -270,6 +270,9 @@ class CloudTask:
         "schedule_mode", "scheduled_at", "scheduled_ts", "schedule_frozen",
         # S1-03：服务端该文件的保留期（小时；0 = 服务端未指定，本地回落默认 24h）
         "retention_hours",
+        # 2026-11-02 用户需求：每文件的「封面单独打印」（所列页单面）与「排除末尾空白页」。
+        # 后端 order_files.simplex_pages / blank_tail_exclude → task_msg["options"] 下发。
+        "simplex_pages", "blank_tail_exclude",
     )
 
     def __init__(self, data: dict):
@@ -319,6 +322,11 @@ class CloudTask:
             self.retention_hours: int = int(data.get("retention_hours", 0) or 0)
         except (TypeError, ValueError):
             self.retention_hours = 0
+        # 2026-11-02：每文件的「封面单独打印」/「排除末尾空白页」（旧后端不下发 ⇒ 空/False，
+        # 行为与改动前完全一致）。空串 = 未启用；非空 = 用户填的页（如 "1,16-23"）。
+        self.simplex_pages: str = (options.get("simplex_pages", data.get("simplex_pages", "")) or "").strip()
+        self.blank_tail_exclude: bool = bool(options.get(
+            "blank_tail_exclude", data.get("blank_tail_exclude", False)))
 
     def to_dict(self) -> dict:
         return {
@@ -342,6 +350,8 @@ class CloudTask:
             "uploader_is_admin": self.uploader_is_admin,
             "bound_owner_name": self.bound_owner_name,
             "retention_hours": self.retention_hours,
+            "simplex_pages": self.simplex_pages,
+            "blank_tail_exclude": bool(self.blank_tail_exclude),
         }
 
 

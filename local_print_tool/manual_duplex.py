@@ -277,3 +277,97 @@ def rotate_second_for(second_rotate_180: bool, duplex_mode: str = "") -> bool:
 def expected_pairs(pages: list[int], duplex: bool = True) -> list[tuple[int | None, int | None]]:
     """验收用：这批页码**应该**形成的纸张配对（side_a, side_b）序列。"""
     return [(sh.side_a, sh.side_b) for sh in build_sheets([FilePlan("", list(pages), duplex)])]
+
+
+# ============================================================
+# 封面单独打印（2026-11-02 用户需求）：同一份文件里"部分页单面、其余双面"
+# ============================================================
+# 物理语义（与上面的 build_sheets 完全同源，不另立一套配对规则）：
+#   · 单面页 = 自己独占一张纸，背面留空；
+#   · 双面段 = 段内相邻两页配一张纸（段是"文档顺序上连续的双面页"），
+#     段尾落单的那一页背面留空；
+#   · 段与段之间**绝不跨段配对** —— 中间隔着单面页的纸，跨过去就把别人的内容
+#     印到那张单面纸的背面上了（= 串页，2026-10-21/2026-11-02 现场事故的同一类错）。
+# 例：31 页文件，第 1 页单面、2-15 双面、16-23 单面、24-31 双面
+#   → [1]/单面 + [2..15]/双面(7 张) + [16..23]/单面(8 张) + [24..31]/双面(4 张) = 20 张纸；
+#   第 1 趟: 1 2 4 6 8 10 12 14 16 17 18 19 20 21 22 23 24 26 28 30
+#   第 2 趟（逆序）: 31 29 27 25 〔空〕… 〔空〕 15 13 11 9 7 5 3 〔空〕
+
+def split_simplex_runs(pages, simplex_pages=()) -> list[tuple[list[int], bool]]:
+    """把有序页序列按"该页是否单面"切成连续段 → [(页列表, 是否双面)]。
+
+    Args:
+        pages: 本次要打的页（**已应用页码范围**、按文档顺序）。
+        simplex_pages: 其中要单面打印的页号集合（可迭代；不在 pages 里的会被自然忽略）。
+
+    Returns:
+        [(run_pages, duplex)]，顺序 = 文档顺序；单页的段 duplex=False，双面段掉到 1 页时
+        也返回 False（length-1 的"双面段"和单面纸在物理上是同一件事，别让它冒充双面）。
+    """
+    try:
+        sx = {int(p) for p in (simplex_pages or ())}
+    except (TypeError, ValueError):
+        sx = set()
+    runs: list[list[int]] = []
+    flags: list[bool] = []
+    for raw in pages or []:
+        try:
+            p = int(raw)
+        except (TypeError, ValueError):
+            continue
+        single = p in sx
+        if runs and flags[-1] == single:
+            runs[-1].append(p)
+        else:
+            runs.append([p])
+            flags.append(single)
+    return [(run, (not single) and len(run) > 1)
+            for run, single in zip(runs, flags)]
+
+
+def file_plans_for_pages(label: str, pages, duplex: bool = True, simplex_pages=(),
+                         second_rotate: bool | None = None) -> list[FilePlan]:
+    """一份文件 → 进 `plan_passes` 的 FilePlan 列表（封面单独打印的唯一入口）。
+
+    `duplex=False`（整份单面）或 simplex_pages 为空 ⇒ 照旧一条计划（老行为一字不改）。
+    需要混排时按 `split_simplex_runs` 切成多条计划 —— 每条都带同一 label（翻纸窗/日志里
+    仍是"这一份文件"），页号已在本份 PDF 里就地展开，调用方不要再加偏移。
+    """
+    pl = [int(p) for p in (pages or [])]
+    if not pl:
+        return []
+    if not duplex:
+        return [FilePlan(label, pl, False, second_rotate)]
+    runs = split_simplex_runs(pl, simplex_pages)
+    if all(dup for _run, dup in runs):
+        # 全段都是双面（= 没有单面页，或单面页只落在范围外）⇒ 保持老口径的一条计划
+        return [FilePlan(label, pl, True, second_rotate)]
+    return [FilePlan(label, list(run), bool(dup), second_rotate) for run, dup in runs]
+
+
+def count_sheets(pages, simplex_pages=()) -> int:
+    """这批页在纸叠里占几张纸（含单面页独张、双面段尾落单的那张）。
+
+    与 `build_sheets` 一致：双面段 n 页 = ceil(n/2) 张，单面页 = 每页 1 张。
+    """
+    n = 0
+    for run, dup in split_simplex_runs(pages, simplex_pages):
+        n += ((len(run) + 1) // 2) if dup else len(run)
+    return n
+
+
+def charge_units(pages, simplex_pages=()) -> tuple[int, int]:
+    """计费单元 → (双面张数, 单面张数)。
+
+    · 双面段每 2 页 = 1 张双面纸；尾部落单的那 1 页 = 1 张单面纸（背面留空）；
+    · 单面页每页 = 1 张单面纸。
+    与 `printer_config.calc_cost` 的老口径逐字一致（纯双面时就是 pairs/remainder）。
+    """
+    dup_sheets = single_sheets = 0
+    for run, dup in split_simplex_runs(pages, simplex_pages):
+        if dup:
+            dup_sheets += len(run) // 2
+            single_sheets += len(run) % 2
+        else:
+            single_sheets += len(run)
+    return dup_sheets, single_sheets

@@ -568,6 +568,44 @@
   line-height: 1.4;
 }
 
+/* 每文件两个开关（排除末尾空白页 / 封面单独打印）：一行标题 + 右侧 iOS 开关，下面一行说明 */
+.toggle-block {
+  margin-top: 6rpx;
+}
+.toggle-row {
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rpx;
+}
+.toggle-title {
+  font-size: 24rpx;
+  color: var(--text-secondary);
+  flex: 1;
+  min-width: 0;
+}
+.toggle-hint {
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+  line-height: 1.4;
+  margin-bottom: 10rpx;
+}
+/* 单面打印时「封面单独打印」无意义（契约 §1）：整行置灰，点击给轻提示 */
+.toggle-row-disabled {
+  opacity: 0.45;
+}
+.toggle-sw {
+  flex-shrink: 0;
+  margin-left: 12rpx;
+}
+/* 单面页输入区的标签比「范围」宽一点，避免两字标签把输入框挤窄 */
+.control-label-wide {
+  width: auto;
+  min-width: 72rpx;
+}
+.simplex-control {
+  margin-top: 2rpx;
+}
+
 /* 页数已知：范围网格摘要触发按钮 */
 .range-summary-trigger {
   flex: 1;

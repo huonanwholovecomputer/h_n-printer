@@ -238,6 +238,53 @@
                   <view class="duplex-opt {{item.duplex === 'on' ? 'opt-active' : ''}}" bindtap="onFileDuplexChange" data-index="{{index}}" data-value="on">双面</view>
                 </view>
               </view>
+
+              <!-- 每文件两个开关（契约 hn_simplex_blank_contract.md）：
+                   「排除末尾空白页」→ blank_tail_exclude；「封面单独打印」→ simplex_pages。
+                   开关只用 bindtap 切布尔值，不接 swDrag 那套滑动派发链（见 index.js onSwTouchEnd）。 -->
+              <view wx:if="{{!item.isImage && item.pageCount !== 1}}" class="toggle-block">
+                <view class="control-row toggle-row">
+                  <text class="toggle-title">排除末尾空白页</text>
+                  <view class="ios-switch toggle-sw {{item.excludeBlankTail ? 'switch-on' : ''}}"
+                        data-index="{{index}}" bindtap="onToggleExcludeBlankTail" hover-class="none">
+                    <view class="switch-thumb"></view>
+                  </view>
+                </view>
+                <view class="toggle-hint">出纸前由打印端检测并排除末尾连续空白页，费用按实际打印页数结算</view>
+
+                <view class="control-row toggle-row {{(item.duplex === 'off' || item.singlePage) ? 'toggle-row-disabled' : ''}}">
+                  <text class="toggle-title">封面单独打印</text>
+                  <view class="ios-switch toggle-sw {{item.simplexEnabled && item.duplex === 'on' && !item.singlePage ? 'switch-on' : ''}}"
+                        data-index="{{index}}" bindtap="onToggleSimplex" hover-class="none">
+                    <view class="switch-thumb"></view>
+                  </view>
+                </view>
+                <view class="toggle-hint">这几页每页各占一张纸（背面留空），按单面价计费</view>
+
+                <!-- 展开的单面页多行输入：与「页码范围」同一套交互（自动加行 / 标红 / 重叠检测） -->
+                <view wx:if="{{item.simplexEnabled && item.duplex === 'on' && !item.singlePage}}"
+                      class="control-row range-control-multi simplex-control">
+                  <text class="control-label control-label-wide">单面页</text>
+                  <view class="range-lines-wrap">
+                    <view wx:for="{{item.simplexLines}}" wx:for-item="line" wx:for-index="li" wx:key="li"
+                          class="range-line-row {{line.entering ? 'range-line-entering' : ''}}">
+                      <input
+                        class="input-ios range-line-input {{line.error ? 'range-input-err' : ''}}"
+                        type="text"
+                        value="{{line.value}}"
+                        focus="{{item.simplexFocusLine === li}}"
+                        placeholder="如 1 或 1,16-23"
+                        bindinput="onSimplexLineInput"
+                        bindfocus="onSimplexLineFocus"
+                        bindblur="onSimplexLineBlur"
+                        data-file-index="{{index}}"
+                        data-line-index="{{li}}"
+                      />
+                      <text wx:if="{{line.error}}" class="range-err-msg range-line-err">{{line.error}}</text>
+                    </view>
+                  </view>
+                </view>
+              </view>
             </view>
           </view>
           </scroll-view>

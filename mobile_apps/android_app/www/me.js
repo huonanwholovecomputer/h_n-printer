@@ -937,7 +937,16 @@ function normalizeOrder(o) {
       const pc = Number(f.page_count) || 0;
       const copies = Number(f.copies) || 1;
       const eff = typeof f.effective_pages === 'number' ? f.effective_pages : countPagesInRange(f.page_range, pc);
-      const perSheets = typeof f.sheets === 'number' ? f.sheets : (f.duplex === 'off' ? eff : Math.ceil(eff / 2));
+      // 张数口径（契约 §2）：S 按"该页是否属于 X"切段 —— 单面段每页 1 张 + 双面段两页 1 张，
+      // 「封面单独打印」的页各自独占一张。不能再简单 ceil(eff/2)，否则混排会少算张。
+      let perSheets;
+      if (typeof f.sheets === 'number') perSheets = f.sheets;
+      else if (f.duplex === 'off') perSheets = eff;
+      else if (typeof chargeUnits === 'function') {
+        const units = chargeUnits(pageRangeSet(f.page_range, pc), pageSetFrom(f.simplex_pages || '', pc, false, false));
+        perSheets = units.sheets;
+        if (!perSheets && eff > 0) perSheets = Math.ceil(eff / 2);   // 口径函数空转时退回老口径
+      } else perSheets = Math.ceil(eff / 2);                          // print.js 未加载时的兜底
       f.effectivePages = eff;
       f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies);
       f.pagesLine = copies + ' 份 × ' + eff + ' 页';
@@ -1023,6 +1032,8 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
           <text class="detail-file-copies">${f.pagesLine} | ${f.totalSheets} 张</text>
           <text class="detail-file-range">${f.duplex === 'on' ? '双面' : '单面'}</text>
           ${f.page_range ? `<text class="detail-file-range">范围: ${esc(f.page_range)}</text>` : ''}
+          ${f.simplex_pages ? `<text class="detail-file-range">单面页: ${esc(f.simplex_pages)}</text>` : ''}
+          ${Number(f.blank_tail_exclude) === 1 ? `<text class="detail-file-range">已排除末尾空白页</text>` : ''}
           ${(f.status === 'rejected' || f.status === 'failed') && f.reject_reason ? `<text class="file-reject-reason">${esc(f.reject_reason)}</text>` : ''}
         </view>
       </view>`;

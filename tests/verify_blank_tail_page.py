@@ -19,6 +19,7 @@
 """
 import io
 import os
+import re
 import sys
 import tempfile
 
@@ -360,15 +361,36 @@ check("变异自证：检测被换空后缓存命中的 blank_tail 必须是 0�
       _cj_mut.blank_tail == 0 and win._pages_cell_text(_cj_mut) == "3",
       f"blank_tail={_cj_mut.blank_tail} cell={win._pages_cell_text(_cj_mut)!r}")
 
-print("\n⑥ 云端单：只标不排（自动路径不许调用排除）")
+print("\n⑥ 云端单：只有顾客勾了「排除末尾空白页」才真排除（2026-11-02 新口径）")
+# 旧口径是「云端单一律只标不排」（价格后端已定）；2026-11-02 起顾客可以在小程序/APP
+# 按文件勾「排除末尾空白页」—— 勾了就必须真排除，并由设备回报 page_range_truncated
+# 让后端重算价格（排掉的空白页不收钱）。没勾的云端单仍然只标不排。
 _src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
-_cloud_block = _src.split("blank_tail=blank_tail,        # 末尾空白页")[0]
-check("云端建 job 的地方只写 blank_tail，没有 split_tail_blank",
-      "blank_tail=blank_tail,        # 末尾空白页" in _src
-      and "split_tail_blank" not in _cloud_block.split("def _build")[-1])
-check("自动排除在 add/convert/cloud 三条路径上都不存在（只有操作员动作才排）",
-      _src.count("split_tail_blank(") == 1,
-      f"出现 {_src.count('split_tail_blank(')} 次（应只在 _set_blank_tail_excluded 里）")
+check("⑥a 建 job 处仍写 blank_tail（UI 照旧标 ⚠）",
+      "blank_tail=blank_tail," in _src)
+check("⑥b 云端自动排除被顾客的开关把住（blank_tail_exclude）",
+      'if bool(getattr(task, "blank_tail_exclude", False))' in _src)
+check("⑥c split_tail_blank 只出现在两处：操作员勾选 + 云端按开关排除",
+      _src.count("split_tail_blank(") == 2,
+      f"出现 {_src.count('split_tail_blank(')} 次")
+# 逐处归属到所在函数：只允许这两个函数里出现
+_defs = [(m.start(), m.group(1)) for m in re.finditer(r"^    def (\w+)", _src, re.M)]
+
+
+def _owner(pos):
+    name = "?"
+    for start, n in _defs:
+        if start < pos:
+            name = n
+        else:
+            break
+    return name
+
+
+_callers = sorted({_owner(m.start()) for m in re.finditer(r"split_tail_blank\(", _src)})
+check("⑥d 排除只发生在「操作员勾选」与「云端带开关」两条路径",
+      set(_callers) <= {"_set_blank_tail_excluded", "_add_cloud_task_to_new_tab"},
+      f"实际所在函数={_callers}")
 
 print("\n⑦ 变异自证：把 split_tail_blank 换成空实现，⑤ 的断言必须变红")
 _orig = _gui.split_tail_blank

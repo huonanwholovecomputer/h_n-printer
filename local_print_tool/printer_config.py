@@ -48,6 +48,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+# 页序唯一真相（CLAUDE.md 硬规矩 #2）：计费/张数也要按**同一套摊纸规则**算，
+# 所以这里直接引它，不在本模块里另写一份配对/张数算式。
+import manual_duplex
+
 logger = logging.getLogger(__name__)
 
 
@@ -181,6 +185,16 @@ class PrintJob:
     # 已排除末尾空白页时 = 排除**前**的 page_range（"" = 当时是"全部"）；None = 没排除。
     # 有它才谈得上"恢复"，也让界面能区分"检测到空白"与"已经排掉了"。
     blank_undo_range: str | None = None
+    # ── 封面单独打印（2026-11-02 用户需求）──
+    # 「哪些页单面打、其余双面打」：simplex_enabled = 复选框勾没勾（UI 状态，勾了但没填
+    # 就等于没勾），simplex_pages = 要单面打的页（走与 page_range 同一套解析器，
+    # 允许 "1" / "1,16-23" 这种多段）。
+    # ⚠ 它**不**改写 page_range：本次要打的页仍由 page_range 决定，这里只是把其中一部分
+    #   页从"两页一张纸"改成"一页一张纸"（背面留空）。所以有效页数/计费/双面配对仍只
+    #   需要一处口径 —— 见 `manual_duplex.split_simplex_runs`（页序）与
+    #   `manual_duplex.charge_units`（计费）。
+    simplex_enabled: bool = False
+    simplex_pages: str = ""
     # ── 字体缺失检测（2026-10-31 用户需求，见 font_check.py）──
     # 两种"缺"分开存，别混成一个列表 —— 它们**处置办法完全不同**，混着显示就有歧义
     # （2026-11-01 现场：tooltip 把"文件没嵌入"说成"没嵌入这些字体"，用户看不出该不该装字体）：
@@ -217,6 +231,8 @@ class PrintJob:
             "uploader_is_admin": self.uploader_is_admin,
             "blank_tail": self.blank_tail,
             "blank_undo_range": self.blank_undo_range,
+            "simplex_enabled": self.simplex_enabled,
+            "simplex_pages": self.simplex_pages,
             "missing_fonts": list(self.missing_fonts),
             "nonembedded_fonts": list(self.nonembedded_fonts),
             "font_checked": self.font_checked,
@@ -250,6 +266,8 @@ class PrintJob:
             blank_tail=_num_or_default(data.get("blank_tail"), 0, int),
             blank_undo_range=(data.get("blank_undo_range")
                               if isinstance(data.get("blank_undo_range"), str) else None),
+            simplex_enabled=bool(data.get("simplex_enabled", False)),
+            simplex_pages=str(data.get("simplex_pages", "") or ""),
             missing_fonts=[str(x) for x in (data.get("missing_fonts") or [])
                            if isinstance(x, str) and x.strip()][:20],
             nonembedded_fonts=[str(x) for x in (data.get("nonembedded_fonts") or [])
@@ -351,6 +369,54 @@ def _count_pages_in_range(page_range: str, total_pages: int) -> int:
     pages = _parse_range_parts(raw, total_pages)
     return len(pages) if pages else total_pages
 
+
+def selected_pages(page_range: str, total_pages: int) -> list[int]:
+    """本次要打的页（升序、1-based）。空/非法范围 = 全部（与 `_count_pages_in_range` 同口径）。
+
+    为什么要有它：计费与页序都需要"**有顺序的**页序列"才能判断哪些页配对成一张纸
+    （封面单独打印），`_count_pages_in_range` 只给个数、`_parse_range_parts` 给的是 set。
+    """
+    total = int(total_pages or 0)
+    if total <= 0:
+        return []
+    raw = (page_range or "").strip()
+    raw = raw.replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
+    pages = _parse_range_parts(raw, total) if raw else set()
+    if not pages:                      # 空/非法范围 = 全部
+        pages = set(range(1, total + 1))
+    return sorted(pages)
+
+
+def simplex_page_set(page_range: str, total_pages: int,
+                     simplex_pages: str) -> set[int]:
+    """「要单面打的页」= 用户填的页 ∩ 本次页码范围。
+
+    范围外的页本来就不打，静默忽略（**不报错**）：操作员把页码范围从 1-31 改成 1-20 时，
+    那行"封面页 1,26"里的 26 不该变成挡打印的红叉 —— 它只是这次不生效。
+    """
+    selected = set(selected_pages(page_range, total_pages))
+    raw = (simplex_pages or "").strip()
+    if not selected or not raw:
+        return set()
+    raw = raw.replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
+    try:
+        return _parse_range_parts(raw, int(total_pages or 0)) & selected
+    except Exception:
+        return set()
+
+
+def job_simplex_pages(job) -> str:
+    """任务勾了「封面单独打印」才把单面页交给计价，否则空串 = 老口径。
+
+    收敛成一个函数的原因：`calc_cost` 的调用点有十几处（表格行、合计、上报 payload、
+    复制价格、费用明细…），**任何一处漏传**都会让"单价按封面单面算"只在一半地方生效 ——
+    账单对不上的经典来源。
+    """
+    if not getattr(job, "simplex_enabled", False):
+        return ""
+    return getattr(job, "simplex_pages", "") or ""
+
+
 def format_page_selection(pages) -> str:
     """页码集合 → 页码范围字符串（连续段压成 a-b）：{1,2,3,5} → "1-3,5"。
 
@@ -409,6 +475,64 @@ def split_tail_blank(page_range: str, page_count: int, blank_tail: int) -> tuple
     return format_page_selection(remaining), len(removable)
 
 
+def check_simplex_pages(page_range: str, total_pages: int, simplex_pages: str) -> tuple[str, str]:
+    """校验「封面单独打印」填的页码，返回 (归一化串, 打回原因)。
+
+    与后端 `_simplex_pages_checked()` **同一套判据与话术**：格式错 / 超出总页数 /
+    不在「页码范围」之内 ⇒ 返回原因，调用方据此把这一单打回（云端订单还会回报
+    `print_fail`），而不是静默按"整份双面"打出去 —— 顾客以为封面单面、实际把
+    封面和正文配在同一张纸上，出纸与价格都对不上。
+
+    与 `simplex_page_set()` 的分工：那个函数给**本地编辑**用（范围外静默忽略，
+    用户正在敲键盘不该弹错）；这个函数给**接收已提交订单**用（错了必须打回）。
+
+    空串 ⇒ ("", "")（未启用）；total_pages<=0（页数未知）时只查格式。
+    """
+    raw = (simplex_pages or "").strip()
+    if not raw:
+        return "", ""
+    text = raw.replace("、", ",").replace("，", ",").replace("；", ",").replace(" ", "")
+    pages: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a_s, b_s = part.split("-", 1)
+            try:
+                a, b = int(a_s), int(b_s)
+            except (TypeError, ValueError):
+                return "", f"「封面单独打印」页码格式不正确：{raw}（应为如 1-5 或 7）"
+            if a < 1 or b <= a:
+                return "", f"「封面单独打印」页码格式不正确：{raw}（应为如 1-5 或 7）"
+            pages.update(range(a, b + 1))
+        else:
+            try:
+                n = int(part)
+            except (TypeError, ValueError):
+                return "", f"「封面单独打印」页码格式不正确：{raw}（应为如 1-5 或 7）"
+            if n < 1:
+                return "", f"「封面单独打印」页码格式不正确：{raw}（应为如 1-5 或 7）"
+            pages.add(n)
+    if not pages:
+        return "", f"「封面单独打印」页码格式不正确：{raw}（应为如 1-5 或 7）"
+
+    total = int(total_pages or 0)
+    if total > 0:
+        over = sorted(p for p in pages if p > total)
+        if over:
+            return "", (f"「封面单独打印」第 {over[0]} 页超出文件总页数"
+                        f"（文件共 {total} 页）")
+    if total > 0 and (page_range or "").strip():
+        allowed = _parse_range_parts(page_range, total)
+        if allowed:
+            outside = sorted(pages - allowed)
+            if outside:
+                return "", (f"「封面单独打印」第 {outside[0]} 页不在页码范围"
+                            f"「{page_range.strip()}」内")
+    return format_page_selection(pages), ""
+
+
 def calc_cost(
     page_count: int,
     copies: int,
@@ -416,6 +540,7 @@ def calc_cost(
     simplex_price: float = 0.2,
     duplex_price: float = 0.3,
     page_range: str = "",
+    simplex_pages: str = "",
 ) -> tuple[float, str]:
     """
     计算打印费用（按纸张计费），返回 (金额, 计算式)。
@@ -423,35 +548,38 @@ def calc_cost(
     单价均为每张纸价格：
       - 单面: 1页 = 1张纸 → effective_pages 张 × simplex_price × copies
       - 双面: 2页 = 1张纸 → pairs 张 × duplex_price + remainder 张 × simplex_price
+
+    simplex_pages（封面单独打印）：其中列出的页改为**一页一张纸**（背面留空 ⇒ 单面价），
+    其余页照旧两页一张纸。计费单元由 `manual_duplex.charge_units` 统一算 —— 页序模块
+    怎么摊纸、这里就怎么收费，不另立一套算式。
     """
     if page_count <= 0:
         return 0.0, ""
 
-    effective = _count_pages_in_range(page_range, page_count)
-
-    if duplex == "on":
-        # 双面：每张纸印 2 页
-        pairs = effective // 2      # 双面纸张数
-        remainder = effective % 2   # 剩余单面纸张数
-        if remainder == 0:
-            # 纯双面：全部可配对
-            cost = pairs * duplex_price * copies
-            formula = f"{pairs}张×{duplex_price:.2f}"
-        elif pairs == 0:
-            # 单页：无双面纸张，仅单面计费
-            cost = remainder * simplex_price * copies
-            formula = f"{remainder}张×{simplex_price:.2f}"
-        else:
-            cost = (pairs * duplex_price + remainder * simplex_price) * copies
-            formula = f"{pairs}张×{duplex_price:.2f}+{remainder}张×{simplex_price:.2f}"
-        if copies > 1:
-            formula = f"({formula})×{copies}份"
-    else:
-        # 单面：每页即一张纸
+    if duplex != "on":
+        # 单面：每页即一张纸（填了"单面页"也无意义 —— 本来就全是单面）
+        effective = _count_pages_in_range(page_range, page_count)
         cost = effective * simplex_price * copies
         formula = f"{effective}张×{simplex_price:.2f}"
         if copies > 1:
             formula = f"({formula})×{copies}份"
+        return cost, formula
+
+    # 双面（可能混排"部分页单面"）：双面张 + 单面张
+    selected = selected_pages(page_range, page_count)
+    sx = simplex_page_set(page_range, page_count, simplex_pages)
+    pairs, remainder = manual_duplex.charge_units(selected, sx)
+    cost = (pairs * duplex_price + remainder * simplex_price) * copies
+    parts: list[str] = []
+    if pairs:
+        parts.append(f"{pairs}张×{duplex_price:.2f}")
+    if remainder:
+        parts.append(f"{remainder}张×{simplex_price:.2f}")
+    if not parts:
+        return 0.0, ""
+    formula = "+".join(parts)
+    if copies > 1:
+        formula = f"({formula})×{copies}份"
     return cost, formula
 
 
@@ -1529,7 +1657,7 @@ def generate_cover_page_pdf(
             cost, formula = calc_cost(
                 job.page_count, job.copies, job.duplex,
                 config.simplex_price, config.duplex_price,
-                job.page_range,
+                job.page_range, job_simplex_pages(job),
             )
             base_total += cost
             if job.page_count == 0:

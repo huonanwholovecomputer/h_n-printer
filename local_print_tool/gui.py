@@ -87,7 +87,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
 )
 
-from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, fit_print_speed, cloud_word_com_allowed, split_tail_blank
+from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, fit_print_speed, cloud_word_com_allowed, split_tail_blank, simplex_page_set, selected_pages, job_simplex_pages, check_simplex_pages
 from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
@@ -2553,6 +2553,9 @@ class PrintWorker(QThread):
     stack_entry_planned = Signal(object)
     # 本单第 1 趟结束：(seq, ok, message, 第 1 趟槽位数)
     stack_entry_done = Signal(int, bool, str, int)
+    # 本单第 1 趟**物理出纸**完成：(seq, 张数, 实测秒数)。
+    # 只有"后面还排着别的单"时才会发——那时 worker 不阻塞等出纸（见 stack_more_pending）。
+    stack_entry_drained = Signal(int, int, float)
 
     def __init__(
         self,
@@ -2568,6 +2571,7 @@ class PrintWorker(QThread):
         stack_out_pdf: str = "",
         stack_seq: int = 0,
         stack_rotate: bool = True,
+        stack_more_pending=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -2589,6 +2593,11 @@ class PrintWorker(QThread):
         self._stack_out_pdf = stack_out_pdf or ""
         self._stack_seq = int(stack_seq or 0)
         self._stack_rotate = bool(stack_rotate)
+        # 「后面还排着别的单吗」回调（主线程给的无参可调用对象，worker 线程里只读一个 bool）。
+        # 为真时攒批第 1 趟**不阻塞等物理出纸**：打完立刻收工、让下一单的第 1 趟马上进打印
+        # 队列（spooler 按提交顺序出纸，连续几单的第 1 趟本来就该叠在一起）。2026-11-02 用户
+        # 要求「允许提前把任务发送到打印机队列」，否则每单都要等上一单真打完才开下一单。
+        self._stack_more_pending = stack_more_pending
         # 翻纸回执：worker 发信号 → 主线程弹窗 → confirm_flip() 置事件
         self._flip_event = threading.Event()
         self._flip_continue = False
@@ -2673,6 +2682,12 @@ class PrintWorker(QThread):
         eff = int(n_pages or 0) or self._effective_pages(job)
         if eff == 1:
             return "off"
+        if ((getattr(job, "duplex", "off") or "off") == "on"
+                and self._simplex_covers_all(job)):
+            # 「封面单独打印」把**所有**要打的页都选成单面 = 纯单面：没有一张纸能配成
+            # 双面，硬走两趟只会第 2 趟整趟空白（白走纸、白翻一次）。交给驱动的单面
+            # 路径，合并作业也按单面成段（否则驱动会把相邻两页挤到一张纸上）。
+            return "off"
         return "on" if (getattr(job, "duplex", "off") or "off") == "on" else "off"
 
     def _driver_pairs_pages(self) -> bool:
@@ -2698,6 +2713,47 @@ class PrintWorker(QThread):
             pass
         return True
 
+    def _simplex_pages_of(self, job: PrintJob) -> set[int]:
+        """「封面单独打印」勾选的**单面页**（1-based，已与页码范围求交）。
+
+        没有勾选 / 页数未知 / 范围为空 ⇒ 空集（= 老行为，一个页序分支都不动）。
+        为什么要跟页码范围求交：页码范围和单面页是两份独立输入，后者合法但不生效的页
+        （比如把范围改成 2-31 后单面页里还留着 1）应该静默忽略，而不是让整单打不出来。
+        """
+        if not getattr(job, "simplex_enabled", False):
+            return set()
+        n = int(getattr(job, "page_count", 0) or 0)
+        if n <= 0:
+            return set()
+        try:
+            return simplex_page_set(getattr(job, "page_range", "") or "", n,
+                                    getattr(job, "simplex_pages", "") or "")
+        except Exception:
+            return set()
+
+    def _simplex_covers_all(self, job: PrintJob) -> bool:
+        """「封面单独打印」把**本单所有要打的页**都标成单面（= 等价于纯单面）。
+
+        这种情况必须按纯单面打：没有一张纸能凑出双面，硬走两趟只会第 2 趟整趟空白
+        （白走一遍纸、白翻一次纸）。31 页的文件勾了「1-31」就是这种边界，操作员填错
+        或"干脆全部单面"都会撞上。
+        """
+        if (getattr(job, "duplex", "off") or "off") != "on":
+            return False
+        sx = self._simplex_pages_of(job)
+        if not sx:
+            return False
+        n = int(getattr(job, "page_count", 0) or 0)
+        if n <= 0:
+            return False
+        try:
+            sel = set(selected_pages(getattr(job, "page_range", "") or "", n))
+        except Exception:
+            sel = set()
+        if not sel:
+            sel = set(range(1, n + 1))
+        return bool(sel) and sx >= sel
+
     def _uses_manual_duplex(self, job: PrintJob) -> bool:
         """该任务是否要走"程序自己分两趟 + 人工翻纸"。
 
@@ -2709,11 +2765,19 @@ class PrintWorker(QThread):
         （2026-10-18 曾试过在这里"页数未知时现数 PDF"：`verify_incident_single_page_duplex`
         的 G1/G2 是**故意**把"页数读不出来 + 手动档案 ⇒ 仍尝试两趟"钉死的——数不出来时
         宁可交给 `_print_one_job` 兜底，也不在这里替用户改判，已改回。）
+
+        「封面单独打印」（2026-11-02）：勾了单面页后，一张纸的两面不再是"相邻两页"——
+        驱动自己配对只会把封面和下一页配成一张纸。**只有程序自己分两趟**才能保证
+        「第 1 页单面、第 2-31 页双面」这类混排的空白占位页落在正确的槽位上，所以
+        只要存在"部分页单面"就一律走两趟（与机型无关：这类打印本来就要人工翻一次纸）。
         """
         p = self._manual_profile
         if int(_count_pages_in_range(getattr(job, "page_range", "") or "",
                                      int(getattr(job, "page_count", 0) or 0))) == 1:
             return False
+        if job.duplex == "on" and self._simplex_pages_of(job):
+            # 全部页都是单面 ⇒ 等价纯单面（见 `_simplex_covers_all`）：交给正常单面路径
+            return not self._simplex_covers_all(job)
         return bool(job.duplex == "on" and p is not None
                     and p.auto_duplex is False and p.manual_duplex)
 
@@ -3159,6 +3223,10 @@ class PrintWorker(QThread):
             n_sel = n_pages
         p = self._manual_profile
         driver_duplex = bool(p is None or p.auto_duplex)
+        # 「封面单独打印」⇒ 本单由程序自己分两趟（见 `_uses_manual_duplex`），驱动不配对：
+        # 每页各占一张纸，照 ceil(n/2) 算会少报一半。
+        if (job.duplex or "off") == "on" and self._simplex_pages_of(job):
+            driver_duplex = False
         return duplex_stack.sheets_for(
             n_sel, (job.duplex or "off") == "on" and driver_duplex,
             max(1, int(copies or 1)))
@@ -3331,7 +3399,11 @@ class PrintWorker(QThread):
         纸** ⇒ 直打纸照旧留着、还白打一张空白。独立审查用真纸堆物理模型复现过。
         """
         import pdf_printer as _pp
-        p = self._manual_profile
+        # 「封面单独打印」让**自动双面机型**也走这条"程序自己分两趟"的路（勾选框是通用
+        # 功能，不限于手动双面机型）。这类机器可能没有手动双面档案 ⇒ 用 PrinterProfile
+        # 的默认参数（first=odd / 逆序 / 第 2 趟转 180°），它本来就是按 LaserJet 1020 的
+        # 实测语义定的，对"整叠原样放回、face-down 出纸"的机器都成立。
+        p = self._manual_profile or PrinterProfile()
         # 本批的翻纸回执从头清空：这样"第 1 趟还在打时操作员就点了跳过"的预置答案能生效
         self._flip_continue = False
         self._flip_event.clear()
@@ -3345,6 +3417,7 @@ class PrintWorker(QThread):
             # 合并后的页码是**同一份文档**的连续页码：每个文件按自己的页码范围取页，再整体偏移
             file_plans, off = [], 0
             singles: list[str] = []
+            mixed: list[str] = []
             for _idx, job, path, _t in items:
                 n = count_pdf_pages(path)
                 if n <= 0:
@@ -3361,16 +3434,26 @@ class PrintWorker(QThread):
                 #     `len(sel) > 1` 只是为了让"哪个文件是单面文件"的日志/常驻窗文案准确，
                 #     别以为它守住了什么页序口径。
                 dup = ((getattr(job, "duplex", "off") or "off") == "on") and len(sel) > 1
+                # 「封面单独打印」：勾选的那几页一页一张纸（背面留空 ⇒ 第 2 趟对应槽位是空白
+                # 占位页），其余页照旧两两配成一张纸；两段可以互相穿插。段落切分/配对全在
+                # `manual_duplex.file_plans_for_pages` 里，本函数只把**合并后的全局页码**偏移
+                # 算对（第 2 趟按持久化的 file_plans 重建，段落信息不会丢）。
+                sx = self._simplex_pages_of(job) & set(sel)
+                if not dup:
+                    sx = set()          # 整份都单面：勾选框无意义，别把日志/页面文案写歪
                 if not dup and label not in singles:
                     singles.append(label)
+                elif sx and len(sx) < len(sel) and label not in mixed:
+                    mixed.append(label)
                 # 这份文件的第 2 面转不转，按**它自己**的装订方向算（横向文件是 short-edge、
                 # 竖版是 long-edge），而不是整批一个开关 —— 这是"整单只翻一次纸"的前提。
                 file_rot = (bool(rotate) if rotate is not None
                             else self._rotate_for_job(job))
                 for c in range(max(1, job.copies)):
-                    file_plans.append(manual_duplex.FilePlan(
-                        f"{label}（第{c + 1}份）" if job.copies > 1 else label,
-                        [off + x for x in sel], dup, file_rot))
+                    _lbl = f"{label}（第{c + 1}份）" if job.copies > 1 else label
+                    file_plans.extend(manual_duplex.file_plans_for_pages(
+                        _lbl, [off + x for x in sel], dup,
+                        [off + x for x in sorted(sx)], file_rot))
                 off += n
 
             plan = manual_duplex.plan_passes(file_plans, copies=1, first=p.first,
@@ -3383,6 +3466,7 @@ class PrintWorker(QThread):
             self.log_message.emit(
                 f"  → 手动双面批次：{len(items)} 个文件"
                 f"{f'（含 {len(singles)} 个单面文件，各占一张纸、背面留空）' if singles else ''}"
+                f"{f'（含 {len(mixed)} 个封面单独打印文件：所列页各占一张纸、其余页两两配对）' if mixed else ''}"
                 f" → {plan.sheet_count} 张纸，"
                 f"一次翻纸打两趟（{p.first}/{'逆序' if p.reverse_second else '正序'}/"
                 f"{self._rotate_summary(plan)}）")
@@ -3557,21 +3641,33 @@ class PrintWorker(QThread):
                 # 第 2 趟对应槽位是空白占位（只走纸不打墨），张数与旧写法完全相同，
                 # 只是 file_plans/日志不再谎称它是双面任务。
                 dup = ((getattr(job, "duplex", "off") or "off") == "on" and len(sel) > 1)
+                # 「封面单独打印」：勾选的页一页一张纸（背面留空 ⇒ 第 2 趟对应槽位是空白
+                # 占位页），其余页照旧两两配成一张纸，两段可互相穿插。段落切分在
+                # `manual_duplex.split_simplex_runs` 里做，这里只把合并后的**全局页码**
+                # 偏移算对；账本里每段一条 file_plan，第 2 趟重建页序时不会丢掉段落边界。
+                sx = self._simplex_pages_of(job) & set(sel)
+                if not dup:
+                    sx = set()          # 整份都单面：勾选框无意义
                 paths.append(path)
                 # 这份文件第 2 趟要不要 180° 补偿（长边/短边装订）——**逐文件**记进账本，
                 # 第 2 趟才能在同一叠里按各自方向补偿（2026-10-28 起不再要求整叠同向）。
                 _rot = self._rotate_for_job(job)
+                _runs = (manual_duplex.split_simplex_runs([off + x for x in sel],
+                                                          [off + x for x in sorted(sx)])
+                         if sx else [([off + x for x in sel], bool(dup))])
                 for c in range(max(1, int(job.copies or 1))):
-                    plans.append({
-                        "label": f"{label}（第{c + 1}份）" if int(job.copies or 1) > 1 else label,
-                        "pages": [off + x for x in sel],
-                        "second_rotate": bool(_rot),
-                        # 显示用：这份文件**自己**的页号（已应用页码范围）。
-                        # `pages` 是合并 PDF 里的页码（账本做页序要用），直接显示会让人看到
-                        # "第二个文件从第 6 页开始打"——2026-10-25 用户反馈的正是这个。
-                        "file_pages": list(sel),
-                        "duplex": dup,
-                    })
+                    _lbl = f"{label}（第{c + 1}份）" if int(job.copies or 1) > 1 else label
+                    for _pages_seg, _seg_dup in _runs:
+                        plans.append({
+                            "label": _lbl,
+                            "pages": list(_pages_seg),
+                            "second_rotate": bool(_rot),
+                            # 显示用：这份文件**自己**的页号（已应用页码范围）。
+                            # `pages` 是合并 PDF 里的页码（账本做页序要用），直接显示会让人看到
+                            # "第二个文件从第 6 页开始打"——2026-10-25 用户反馈的正是这个。
+                            "file_pages": [x - off for x in _pages_seg],
+                            "duplex": bool(_seg_dup),
+                        })
                 off += n
 
             ok, mmsg = _pp.merge_pdfs(paths, self._stack_out_pdf)
@@ -3638,6 +3734,21 @@ class PrintWorker(QThread):
                                            f"攒批第 1 趟失败: {msg1}", n1)
                 return False, f"攒批第 1 趟失败: {msg1}", n1
 
+            if self._stack_more_ahead():
+                # 后面还排着别的单 ⇒ **不在这里等物理出纸**：立刻把这一单交出去，
+                # 让下一单的第 1 趟马上进打印队列（spooler 按提交顺序出纸，连续几单的
+                # 第 1 趟本来就该叠在一起）。出纸这件事交给守护线程盯着回报。
+                # 现场诉求（2026-11-02）：攒批下同时点多个订单时，每单都要等上一单真的
+                # 打完（含 120s 出纸等待 + 余量）才开下一单，打印机空转等"打完信号"。
+                self.log_message.emit(
+                    f"  → 攒批第 {self._stack_seq} 单第 1 趟已送入打印队列（{n1} 张）——"
+                    f" 后面还排着别的单，直接接着打，出纸由后台核对")
+                self.stack_entry_done.emit(self._stack_seq, True,
+                                           f"第 1 趟完成（{plan.sheet_count} 张纸已堆入出纸槽）", n1)
+                self._spawn_stack_drain_watch(int(n1), _t_pass1)
+                return True, (f"攒批第 {self._stack_seq} 单第 1 趟已入队"
+                              f"（{plan.sheet_count} 张）"), n1
+
             w = wait_for_output(self._printer_name, pages=n1)
             self.log_message.emit(
                 f"  → 攒批第 {self._stack_seq} 单第 1 趟出纸（{n1} 张，排队 {w['queue_seconds']}s "
@@ -3656,6 +3767,8 @@ class PrintWorker(QThread):
                 self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
             self.stack_entry_done.emit(self._stack_seq, True,
                                        f"第 1 趟完成（{plan.sheet_count} 张纸已堆入出纸槽）", n1)
+            self.stack_entry_drained.emit(int(self._stack_seq), int(n1),
+                                          float(max(0.0, _elapsed1)))
             return True, f"攒批第 {self._stack_seq} 单第 1 趟完成（{plan.sheet_count} 张）", n1
         except Exception as e:
             # 任何异常都必须报一次 entry_done：主线程靠它解除"出纸槽被独占"的占位，
@@ -3674,6 +3787,56 @@ class PrintWorker(QThread):
                     os.remove(cover_pdf)
                 except OSError:
                     pass
+
+    def _stack_more_ahead(self) -> bool:
+        """后面是否还排着别的攒批单（主线程给的只读回调；没给就当没有）。"""
+        fn = self._stack_more_pending
+        if fn is None:
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+
+    def _spawn_stack_drain_watch(self, n1: int, t_pass1: float):
+        """后台盯"本单第 1 趟什么时候真的出完纸"，不占打印 worker。
+
+        「提前入队」模式下 worker 打完就返回（好让下一单立刻进打印队列），物理出纸只能
+        另开一个守护线程等；等到了再回报实测出纸速度（自动学习用）与"纸已落槽"。
+        这是旁路记账：任何异常都必须吞掉，绝不能影响打印主流程。
+        """
+        seq = int(self._stack_seq)
+        printer = self._printer_name
+
+        def _watch():
+            w = {"drained": False, "queue_seconds": 0.0, "margin_seconds": 0.0}
+            try:
+                w = wait_for_output(printer, pages=n1) or w
+            except Exception:
+                pass
+            try:
+                self.log_message.emit(
+                    f"  → 攒批第 {seq} 单第 1 趟出纸完成（{n1} 张，排队 "
+                    f"{w.get('queue_seconds', 0)}s + 余量 {w.get('margin_seconds', 0)}s）"
+                    f"—— 纸留在出纸槽里，别动")
+                if not w.get("drained"):
+                    self.log_message.emit(
+                        f"  ⚠ 打印队列 {w.get('queue_seconds', 0)}s 内没有排空（打印机离线/"
+                        f"卡纸/队列卡住？）—— 本单纸数只能人工核对；点「开始第 2 趟」前"
+                        f"务必数清进纸盒里的纸")
+                elapsed = (time.perf_counter() - t_pass1
+                           - float(w.get("margin_seconds", 0.0) or 0.0))
+                if elapsed > 0 and w.get("drained", True):
+                    self.duplex_speed_sample.emit(int(n1), float(elapsed))
+                self.stack_entry_drained.emit(seq, int(n1), float(max(0.0, elapsed)))
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=_watch, name=f"stack-drain-{seq}",
+                             daemon=True).start()
+        except Exception:
+            pass
 
     def run(self):
         """线程主函数：统一 PDF 打印流程（GDI 优先），精确到每面的进度条。"""
@@ -3696,17 +3859,14 @@ class PrintWorker(QThread):
                         n_pages = max(1, count_pdf_pages(job.file_path))
                     except Exception:
                         n_pages = 1
-                if self._stack_mode:
-                    # 攒批模式下**整单**都走两趟（单面文件的第 2 趟是空白占位纸）：
-                    # 物理面数 = 纸张数 × 2，且单面文件按「每页一张纸」而不是两页一张纸，
-                    # 用 sheets_for 才算得准，否则进度条会冲过 100%。
-                    _sel = _count_pages_in_range(job.page_range or "", n_pages) or n_pages
-                    sides = duplex_stack.sheets_for(
-                        _sel, (job.duplex or "off") == "on", max(1, job.copies)) * 2
-                elif self._uses_manual_duplex(job):
-                    # 手动双面不插副本分隔页，面数与 estimate_print_sides 不同（会超 100%）
-                    sides = estimate_manual_duplex_sides(
-                        n_pages, max(1, job.copies), job.page_range)
+                if self._stack_mode or self._uses_manual_duplex(job):
+                    # 攒批 / 手动双面都走两趟：物理面数 = 纸张数 × 2。张数一律用页序模块
+                    # 的同一套摊纸规则（单面文件每页一张纸、封面单独打印的页也各占一张纸），
+                    # 用 sheets_for/ceil 在混排时会少算 ⇒ 进度条冲过 100%。
+                    _sel = selected_pages(job.page_range or "", n_pages) or list(range(1, n_pages + 1))
+                    _dup = (job.duplex or "off") == "on"
+                    _sx = (self._simplex_pages_of(job) & set(_sel)) if _dup else set(_sel)
+                    sides = manual_duplex.count_sheets(_sel, _sx) * max(1, job.copies) * 2
                 else:
                     # 单双面口径必须与真正打印时一致（`_effective_duplex`）：1 页文件按单面算，
                     # 否则"1 页 + 多份 + 双面"会把 `estimate_print_sides` 里的副本分隔页也算
@@ -5349,6 +5509,11 @@ class MainWindow(QMainWindow):
         # 防止第 2 趟期间混进新单后被一起当成品 report_success（🔴-3 的第二道防线）
         self._stack_flush_snapshot: list = []
         self._stack_pending_ctx: dict = {}   # 正在打第 1 趟的那一单的上下文（见 _start_stack_entry）
+        # 「提前入队」在飞的攒批第 1 趟：{seq: 提交时刻}。2026-11-02 用户要求——攒批下连续
+        # 打多单时，不要"等上一单真打完才开下一单"，打完就交给 spooler，下一单立刻接着送。
+        # 这些作业在本叠自己的队列里，出纸顺序由 spooler 保证，所以 `_stack_tray_busy_reason`
+        # 允许"队列里剩的都是本叠自己的第 1 趟"这一段（见那边注释）。出纸完成时移除。
+        self._stack_inflight: dict[int, float] = {}
         # 出纸槽里「刚出来、还没被拿走」的纸（2026-11-02 事故的闸门，见 _stack_tray_busy_reason）：
         # `_last_tray_risk_ts` = 最近一次普通批次打完的时刻；排队重试用 `_stack_entry_retry_timer`。
         self._last_tray_risk_ts: float = 0.0
@@ -6774,6 +6939,16 @@ class MainWindow(QMainWindow):
         self._shortcut_ctrl_w = QShortcut(QKeySequence("Ctrl+W"), self)
         self._shortcut_ctrl_w.setContext(Qt.ApplicationShortcut)
         self._shortcut_ctrl_w.activated.connect(self._on_shortcut_close_tab)
+        # Ctrl+Enter = 开始打印（2026-11-02 用户要求）。落点与右下角「▶ 开始打印」按钮
+        # **完全等价**（同一个 _on_start_print：冻结页/空标签页/已在打印 都由它自己拦并记日志），
+        # 不另写一份启动逻辑。ApplicationShortcut ⇒ 焦点在表格/页码输入框/日志区时都能用；
+        # Keypad 的 Enter 也算（小键盘上按回车是常见习惯）。
+        self._shortcuts_start_print = []
+        for _key in ("Ctrl+Return", "Ctrl+Enter"):
+            _sc = QShortcut(QKeySequence(_key), self)
+            _sc.setContext(Qt.ApplicationShortcut)
+            _sc.activated.connect(self._on_start_print)
+            self._shortcuts_start_print.append(_sc)
         # Ctrl+Shift+T = 打开「📑 标签页管理」窗口（2026-10-30 用户要求），与点标签页那个
         # 数字（_tab_label.mousePressEvent）完全等价 —— 同一个落点 _show_tab_manager，
         # 不另写一份窗口代码。单独注册、**不并进上面的 _seq 循环**：那个循环的写法被
@@ -8322,7 +8497,7 @@ class MainWindow(QMainWindow):
                 total_pages = sum(j.page_count * j.copies for j in jobs)
                 total_cost = sum(calc_cost(j.page_count, j.copies, j.duplex,
                                            self._config.simplex_price, self._config.duplex_price,
-                                           j.page_range)[0] for j in jobs)
+                                           j.page_range, job_simplex_pages(j))[0] for j in jobs)
                 has_cloud = any(j.task_id > 0 for j in jobs)
                 source = "☁ 云端" if has_cloud else ("📂 本地" if file_count > 0 else "空")
                 # 取第一个非空订单号（云端任务有，本地任务在复制时生成）
@@ -8516,6 +8691,12 @@ class MainWindow(QMainWindow):
     def _rebuild_table(self):
         """用当前标签页的 jobs 重建表格。"""
         self._table.setRowCount(0)
+        # 表格换了主人（切页/新建/拖入/云端重建都会走这里）⇒ 编辑面板立刻"无主"。
+        # 只 setRowCount(0) 是不可靠的：本来就没选中行时它**不发** selectionChanged，
+        # 面板就会保留上一个标签页的范围文本（2026-11-02 用户报的"已锁定标签页里
+        # 出现第二个标签页的 2-31"）。所以这里显式清一刀。
+        self._clear_edit_panel()
+        self._sync_edit_enabled(False)
         for job in self._get_current_jobs():
             self._add_table_row(job)
         self._update_total_cost()
@@ -8631,6 +8812,8 @@ class MainWindow(QMainWindow):
         tail = int(getattr(job, "blank_tail", 0) or 0)
         mark = "" if tail <= 0 else (" ⚠" if getattr(job, "blank_undo_range", None) is None
                                      else " ⚠已排")
+        if getattr(job, "simplex_enabled", False) and (getattr(job, "simplex_pages", "") or "").strip():
+            mark += " ·封面单面"
         if eff == total:
             return str(total) + mark
         return f"{eff} (共 {total} 页)" + mark
@@ -8645,6 +8828,9 @@ class MainWindow(QMainWindow):
                 if eff == total else
                 f"文件共 {total} 页 · 页码范围 {rng}（实际打印 {eff} 页）")
         tail = int(getattr(job, "blank_tail", 0) or 0)
+        if getattr(job, "simplex_enabled", False) and (getattr(job, "simplex_pages", "") or "").strip():
+            base += (f"\n封面单独打印：第 {job.simplex_pages} 页各占一张纸、背面留空"
+                     f"（其余页两页一张纸，一次翻纸打两趟）。")
         if tail <= 0:
             return base
         if getattr(job, "blank_undo_range", None) is not None:
@@ -9035,7 +9221,7 @@ class MainWindow(QMainWindow):
         # 费用
         cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
                                   self._config.simplex_price, self._config.duplex_price,
-                                  job.page_range)
+                                  job.page_range, job_simplex_pages(job))
         if cost > 0:
             cost_text = f"{formula}=¥{cost:.2f}"
         elif job.page_count <= 0:
@@ -9059,7 +9245,7 @@ class MainWindow(QMainWindow):
         job = jobs[row]
         cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
                                   self._config.simplex_price, self._config.duplex_price,
-                                  job.page_range)
+                                  job.page_range, job_simplex_pages(job))
         if cost > 0:
             cost_text = f"{formula}=¥{cost:.2f}"
         elif job.page_count <= 0:
@@ -9081,7 +9267,7 @@ class MainWindow(QMainWindow):
         for job in jobs:
             cost, _ = calc_cost(job.page_count, job.copies, job.duplex,
                                 self._config.simplex_price, self._config.duplex_price,
-                                job.page_range)
+                                job.page_range, job_simplex_pages(job))
             base_total += cost
             if job.page_count <= 0:
                 all_known = False
@@ -9254,19 +9440,21 @@ class MainWindow(QMainWindow):
             grp.setTitle(f"编辑选中任务（{len(rows)} 个文件）" if len(rows) > 1
                          else "编辑选中任务")
         if not rows:
+            self._clear_edit_panel()
             self._sync_edit_enabled(False)
             return
-        # 标签页已固定时不允许编辑
-        if self._is_current_tab_frozen():
-            self._sync_edit_enabled(False)
-            return
+        # 标签页已固定时**照旧**按选中行刷新面板（只读展示），最后统一禁用；
+        # 旧写法在这里直接 return ⇒ 面板保留上一个标签页的内容（2026-11-02 用户报的
+        # 「已锁定标签页里出现第二个标签页的 2-31」就是这么来的）。
+        frozen = self._is_current_tab_frozen()
         row = min(rows)
         jobs = self._get_current_jobs()
         if row >= len(jobs):
+            self._clear_edit_panel()
             self._sync_edit_enabled(False)
             return
         job = jobs[row]
-        self._sync_edit_enabled(True)
+        self._sync_edit_enabled(not frozen)
 
         # 文件类型/页数判定（供下方同步与禁用逻辑共用）
         ext = os.path.splitext(job.file_path)[1].lower() if job.file_path else ""
@@ -9298,6 +9486,18 @@ class MainWindow(QMainWindow):
 
         self._edit_page_range.set_total_pages(job.page_count)
         self._edit_page_range.set_ranges(job.page_range)
+
+        # 封面单独打印：勾选态与页列表都跟着选中任务走；控件只在**本选区能选页码范围**时
+        # 才可用（多选 ⇒ 页码整体禁用，这里同理）。范围外的单面页交给 simplex_page_set
+        # 求交后忽略，所以这里不做任何"超范围"的自动清理（改了范围又能改回来）。
+        self._edit_simplex.blockSignals(True)
+        self._edit_simplex.setChecked(bool(getattr(job, "simplex_enabled", False)))
+        self._edit_simplex.blockSignals(False)
+        self._edit_simplex_pages.set_total_pages(job.page_count)
+        self._edit_simplex_pages.set_ranges(getattr(job, "simplex_pages", "") or "")
+        self._edit_simplex.setEnabled(range_usable and not any_img)
+        self._edit_simplex_pages.setVisible(self._edit_simplex.isChecked())
+        self._edit_simplex_pages.setEnabled(range_usable and not any_img)
 
         # 末尾空白页勾选框：检测到才可用；勾选态 = "已经排除过"（有 undo 范围）
         _tail = int(getattr(job, "blank_tail", 0) or 0)
@@ -9384,6 +9584,12 @@ class MainWindow(QMainWindow):
         self._edit_img_orientation.setEnabled(is_img)
         self._label_img_orientation.setEnabled(is_img)
 
+        if frozen:
+            # 冻结标签页只读：上面已经按事实刷新过内容（不写回、不改任务），这里整体禁用。
+            # 注意顺序 —— _sync_edit_enabled(False) 会把「选中文件」标签改成"未选中任务"，
+            # 所以它必须排在下面重设文件标签之前。
+            self._sync_edit_enabled(False)
+
         # 更新选中文件标签（云端任务显示原始文件名；路径软换行避免长临时路径撑宽面板）
         # 本地任务用暂存副本打印 → 路径显示用户原件，便于核对
         shown_name = job.display_name or os.path.basename(job.file_path)
@@ -9393,6 +9599,42 @@ class MainWindow(QMainWindow):
             f"路径: {_soft_wrap_text(shown_path)}"
         )
 
+    def _clear_edit_panel(self):
+        """把编辑面板里的页输入清空（表格没有选中行 = 面板无主时用）。
+
+        为什么需要它：面板是**纯视图**，唯一真值是 `job.page_range` / `job.simplex_pages`；
+        `_sync_edit_enabled(False)` 只负责置灰、**不清文本**，于是"上一个持有者"的页码范围
+        会一直挂在面板上，和表格那一列（读真值）自相矛盾 —— 这就是用户看到的
+        "已锁定标签页里出现第二个标签页的 2-31"。
+        `set_ranges()` 不触发 `rangesChanged`，所以清空不会反向写回任何任务。
+        """
+        for w in (getattr(self, "_edit_page_range", None),
+                  getattr(self, "_edit_simplex_pages", None)):
+            if w is None:
+                continue
+            try:
+                w.set_ranges("")
+            except Exception:
+                pass
+        chk = getattr(self, "_edit_simplex", None)
+        if chk is not None:
+            try:
+                chk.blockSignals(True)
+                chk.setChecked(False)
+            except Exception:
+                pass
+            finally:
+                try:
+                    chk.blockSignals(False)
+                except Exception:
+                    pass
+        pages_w = getattr(self, "_edit_simplex_pages", None)
+        if pages_w is not None:
+            try:
+                pages_w.setVisible(False)
+            except Exception:
+                pass
+
     def _sync_edit_enabled(self, enabled: bool):
         """统一启用/禁用编辑面板所有控件。"""
         if not hasattr(self, '_edit_widgets') or not self._edit_widgets:
@@ -9401,6 +9643,25 @@ class MainWindow(QMainWindow):
             w.setEnabled(enabled)
         if not enabled:
             self._selected_file_label.setText("(未选中任务)")
+
+    def _on_simplex_toggled(self, checked: bool):
+        """「封面单独打印」勾选框 → 显隐页列表 + 落盘到选中任务。
+
+        为什么勾上时默认填 "1"：这个功能 99% 的用法就是"第 1 页封面单面"（2026-11-02
+        用户原话）。留一个空列表会让"勾了但没生效"变成静默失败 —— 勾上就是"要单面打第 1 页"，
+        想改别的页直接覆盖即可。
+        """
+        rows = sorted(set(idx.row() for idx in self._table.selectedIndexes()))
+        if not rows or self._is_current_tab_frozen():
+            self._on_table_selection()      # 回滚到事实（冻结/无选区时不允许改）
+            return
+        if checked:
+            if not self._edit_simplex_pages.get_ranges().strip():
+                self._edit_simplex_pages.set_ranges("1")
+            self._edit_simplex_pages.setVisible(True)
+        else:
+            self._edit_simplex_pages.setVisible(False)
+        self._auto_apply_edit()
 
     def _on_remark_edited(self):
         """备注编辑 → 写入当前标签页（订单级）并保存（≤100 字）。
@@ -9479,6 +9740,12 @@ class MainWindow(QMainWindow):
         engine = ENGINE_BY_INDEX.get(self._edit_engine.currentIndex())   # None = 混合项/只读标签
         dpi_map = {0: 0, 1: 200, 2: 300, 3: 400, 4: 600}
         dpi = dpi_map.get(self._edit_dpi.currentIndex(), 0)
+        # 封面单独打印：**灰着的不写回**（多选/图片/冻结时控件是灰的，面板值没有共同含义）
+        simplex_on = bool(self._edit_simplex.isChecked())
+        simplex_valid = self._edit_simplex_pages.is_valid()
+        simplex_str = ",".join(
+            inp.text().strip() for inp in self._edit_simplex_pages._inputs
+            if inp.text().strip()) if simplex_valid else ""
 
         applied = []
         # 控件可用性按**整片选区**判定（与 _on_table_selection / _selection_traits 同一口径）：
@@ -9495,6 +9762,8 @@ class MainWindow(QMainWindow):
         # 提示行（分两趟打印 · 中途需翻纸）同理随「单/双面」收起/恢复
         self._update_duplex_label()
         range_editable = not multi
+        # 封面单独打印的可用性与「页码范围」同口径（多选禁用），另加"含图片禁用"
+        simplex_editable = range_editable and not any_img and self._edit_simplex.isEnabled()
         # 引擎：只有下拉**真的停在某个具体引擎**（Word/WPS/LibreOffice）且选区里有 Word 文件时
         # 才写回。「混合（各自保留）」项与只读标签（索引 0 的「图片渲染/直接打印」）都不写 ——
         # 后者若照索引 0 映射成 "word"，改个「份数」就把 WPS 文档静默改成 Word 渲染（串版）。
@@ -9530,6 +9799,14 @@ class MainWindow(QMainWindow):
                 if mode_editable:
                     job.duplex_mode = duplex_mode
             # else：双面控件灰着（选区含图片/单页）→ 这一行的双面设置原样保留
+
+            # 封面单独打印（2026-11-02）：只有"这份文件确实按双面打"时才有意义 ——
+            # 单面文件本来就是一页一张纸。取消勾选只关开关、**保留已填的页**，
+            # 再勾回来还是原来那几页（与「排除末尾空白页」的 blank_undo_range 同思路）。
+            _sx_editable = simplex_editable and job.duplex == "on"
+            job.simplex_enabled = bool(simplex_on and _sx_editable and simplex_valid)
+            if simplex_str and _sx_editable:
+                job.simplex_pages = simplex_str
 
             # 图片方向（仅图片可用）：方向变化后清掉已转换的缓存 PDF，打印时按新方向重渲染
             if is_img:
@@ -9719,6 +9996,10 @@ class MainWindow(QMainWindow):
                 duplex_mode=job.duplex_mode,
                 page_range=job.page_range,
                 page_count=job.page_count,
+                # 「封面单独打印」是**页参数**（和 page_range 一样只对这份文件成立），
+                # 复制到新标签页必须带走：否则新单会把封面和正文配到一张纸上。
+                simplex_enabled=bool(getattr(job, 'simplex_enabled', False)),
+                simplex_pages=getattr(job, 'simplex_pages', '') or "",
                 orientation=job.orientation,
                 engine=job.engine,
                 cached_pdf=cached if (cached and os.path.isfile(cached)) else "",
@@ -9880,6 +10161,31 @@ class MainWindow(QMainWindow):
         self._edit_duplex_mode.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_duplex_mode)
 
+        # ── 封面单独打印（2026-11-02 用户需求）────────────────────────────────
+        # 设计初衷：一份 31 页的习题想「第 1 页封面单面、2-31 页双面」。旧办法是在两个
+        # 标签页里分别打 1 与 2-31（两个订单、两次计费）。这里做成一个开关：
+        # 勾上 → 下面出现第二个"页码选择器"，填**要单面打的页**；其余页照旧两页一张纸。
+        # 允许单面页与双面页互相穿插（例如 1 单面 / 2-15 双面 / 16-23 单面 / 24-31 双面），
+        # 但不允许重叠 —— 一页不可能既单面又双面，重叠由两处拦住：
+        #   ① 本控件自己的行与行之间（RangeListWidget._check_all，红框 + 不可打印）
+        #   ② 与「页码范围」求交后静默忽略越界页（`printer_config.simplex_page_set`）
+        # 页序/空白占位页全部交给 manual_duplex.file_plans_for_pages（唯一真相）。
+        self._edit_simplex = ThemedCheckBox("封面单独打印",
+                                            theme_manager=self._theme_manager)
+        self._edit_simplex.setToolTip(
+            "勾上后，下面填写的页每页各占一张纸、背面留空（= 按单面纸计费），其余页两页一张纸。\n"
+            "典型用法：填 1 —— 第 1 页封面单面、其余双面。可以填多段，例如 1,16-23。\n"
+            "这些页必须落在「页码范围」之内；单面页与双面页可以互相穿插。\n"
+            "勾上后本单由程序自己分两趟打（全程单面 + 中途人工翻一次纸），因为相邻两页\n"
+            "不再是同一张纸的两面，驱动自己配对会把封面和正文配到一张纸上。")
+        self._edit_simplex.clicked.connect(self._on_simplex_toggled)
+        gl.addWidget(self._edit_simplex)
+
+        self._edit_simplex_pages = RangeListWidget()
+        self._edit_simplex_pages.rangesChanged.connect(self._auto_apply_edit)
+        self._edit_simplex_pages.setVisible(False)
+        gl.addWidget(self._edit_simplex_pages)
+
         # 页码范围
         self._label_range = QLabel("页码范围：")
         gl.addWidget(self._label_range)
@@ -9935,6 +10241,7 @@ class MainWindow(QMainWindow):
             label_copies, self._edit_copies,
             self._label_duplex, self._edit_duplex,
             self._label_duplex_mode, self._edit_duplex_mode,
+            self._edit_simplex, self._edit_simplex_pages,
             self._label_range, self._edit_page_range,
             self._edit_blank_tail,
             self._label_engine, self._edit_engine,
@@ -10053,6 +10360,7 @@ class MainWindow(QMainWindow):
 
         self._btn_start = QPushButton("▶ 开始打印")
         self._btn_start.setObjectName("btnStartPrint")
+        self._btn_start.setToolTip("开始打印当前标签页（快捷键 Ctrl+Enter）")
         self._btn_start.clicked.connect(self._on_start_print)
         layout.addWidget(self._btn_start)
 
@@ -11253,14 +11561,14 @@ class MainWindow(QMainWindow):
                         "remark": _remark,
                         "total_price": sum(calc_cost(j.page_count, j.copies, j.duplex,
                             self._config.simplex_price, self._config.duplex_price,
-                            j.page_range)[0] for j in order_jobs),
+                            j.page_range, job_simplex_pages(j))[0] for j in order_jobs),
                         "files": [{
                             "file_name": j.display_name or os.path.basename(j.file_path),
                             "copies": j.copies,
                             "page_count": j.page_count,
                             "cost": calc_cost(j.page_count, j.copies, j.duplex,
                                 self._config.simplex_price, self._config.duplex_price,
-                                j.page_range)[0],
+                                j.page_range, job_simplex_pages(j))[0],
                             "duplex": j.duplex,
                             "page_range": j.page_range,
                         } for j in order_jobs],
@@ -11334,7 +11642,7 @@ class MainWindow(QMainWindow):
         for j in (getattr(tab, "jobs", None) or []):
             cost, _ = calc_cost(j.page_count, j.copies, j.duplex,
                                 self._config.simplex_price, self._config.duplex_price,
-                                j.page_range or "")
+                                j.page_range or "", job_simplex_pages(j))
             total += cost
         try:
             total += tab.calc_extra_total(total, self._config) or 0.0
@@ -11368,7 +11676,7 @@ class MainWindow(QMainWindow):
         for j in jobs:
             cost = calc_cost(j.page_count, j.copies, j.duplex,
                 self._config.simplex_price, self._config.duplex_price,
-                j.page_range)[0]
+                j.page_range, job_simplex_pages(j))[0]
             total += cost
             files_data.append({
                 "file_name": j.display_name or os.path.basename(j.file_path),
@@ -12670,8 +12978,25 @@ class MainWindow(QMainWindow):
         p = self._printer_profile()
         if self._job_is_single_page(job):
             return False
+        if (getattr(job, "duplex", "off") or "off") == "on" and self._job_simplex_pages(job):
+            # 「封面单独打印」：相邻两页不再配对，只有程序自己分两趟才对得上纸（同
+            # PrintWorker._uses_manual_duplex 的口径）。
+            return True
         return bool((getattr(job, "duplex", "off") or "off") == "on"
                     and p.auto_duplex is False and p.manual_duplex)
+
+    def _job_simplex_pages(self, job) -> set[int]:
+        """任务勾选「封面单独打印」时要单面打的页（与页码范围求交后的集合）。"""
+        if not getattr(job, "simplex_enabled", False):
+            return set()
+        n = int(getattr(job, "page_count", 0) or 0)
+        if n <= 0:
+            return set()
+        try:
+            return simplex_page_set(getattr(job, "page_range", "") or "", n,
+                                    getattr(job, "simplex_pages", "") or "")
+        except Exception:
+            return set()
 
     def _stack_has_work(self) -> bool:
         """是否有纸叠正在累积 / 正在打第 2 趟（该状态下出纸槽被独占）。"""
@@ -13057,7 +13382,11 @@ class MainWindow(QMainWindow):
         ok_rot, rotate, rot_reason = self._request_rotate(jobs)
         if not ok_rot:                      # 现在恒为 True（保留分支给未来强约束）
             return False, rot_reason, 0, False
-        sheets, unknown = duplex_stack.estimate_jobs_sheets(jobs, _count_pages_in_range)
+        sheets, unknown = duplex_stack.estimate_jobs_sheets(
+            jobs, _count_pages_in_range,
+            simplex_of=self._job_simplex_pages,
+            pages_of=lambda j: selected_pages(getattr(j, "page_range", "") or "",
+                                              int(getattr(j, "page_count", 0) or 0)))
         adm = self._stack.admit(sheets, rotate, unknown)
         if adm.ok:
             return True, "", sheets, unknown
@@ -13080,7 +13409,20 @@ class MainWindow(QMainWindow):
         _queue = getattr(getattr(self, "_config", None), "printer_name", "") or ""
         _pending = count_pending_print_jobs(_queue)
         if _pending > 0:
-            return f"打印队列里还有 {_pending} 个作业（上一单的纸还在出）"
+            # 「提前入队」豁免（2026-11-02 用户要求）：攒批下连续打多单时，前面几单的第 1 趟
+            # 已经交给 spooler 但纸还在出（`_stack_inflight` 记着），队列里剩下的**全是本叠
+            # 自己的作业**——出纸顺序由 spooler 保证，本来就该连着堆进同一个出纸槽，没有
+            # "盖在别人纸上"的风险。只有出现 `_pending > 在飞数`（= 混进了外部作业）时才挡。
+            _inflight = 0
+            try:
+                _now = time.time()
+                for _seq, _ts in list(getattr(self, "_stack_inflight", {}).items()):
+                    if 0 <= _now - float(_ts) < 900.0:
+                        _inflight += 1
+            except Exception:
+                _inflight = 0
+            if not (_inflight > 0 and _pending <= _inflight):
+                return f"打印队列里还有 {_pending} 个作业（上一单的纸还在出）"
         try:
             _age = time.time() - float(getattr(self, "_last_tray_risk_ts", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -13290,6 +13632,13 @@ class MainWindow(QMainWindow):
     def _on_stack_entry_done(self, seq: int, ok: bool, message: str, sheets: int):
         """本单第 1 趟结束（成功/失败）。失败时整叠页序存疑，只标记、不自动放弃。"""
         entry = self._stack.find(seq)
+        if ok:
+            # 「提前入队」：作业已交 spooler，纸可能还没出完 → 记在飞清单里。`_stack_tray_busy_reason`
+            # 看到"队列里剩的都是本叠自己的第 1 趟"就放行，让下一单立刻接着送。
+            try:
+                self._stack_inflight[int(seq)] = time.time()
+            except Exception:
+                pass
         if entry is not None:
             entry.state = duplex_stack.STATE_DONE if ok else duplex_stack.STATE_FAILED
             if not ok:
@@ -13302,6 +13651,30 @@ class MainWindow(QMainWindow):
                       "请人工核对后再决定「开始第 2 趟」还是「放弃整叠」")
         self._sync_stack_button()
         self._refresh_stack_dialog()
+
+    def _on_stack_entry_drained(self, seq: int, sheets: int, elapsed: float):
+        """本单第 1 趟**物理出纸**完成（「提前入队」模式下由 worker 的守护线程回报）。
+
+        这里只做出纸记账：从在飞清单移除、刷新攒批列表、把出纸队列里排着的下一单接上。
+        实测出纸速度样本由 worker 自己发（`duplex_speed_sample`），不在这里重发，
+        避免同一趟记两次样本。
+        """
+        try:
+            self._stack_inflight.pop(int(seq), None)
+        except Exception:
+            pass
+        if elapsed > 0:
+            self._log(f"  → 攒批第 {seq} 单第 1 趟出纸完成（{sheets} 张，实测 {elapsed:.1f}s）")
+        try:
+            self._sync_stack_button()
+            self._refresh_stack_dialog()
+        except Exception:
+            pass
+        # 出纸完了 ⇒ 队列里下一单可以立刻接着送（本叠自己的第 1 趟本来就该连着堆）。
+        try:
+            self._drain_stack_entry_queue()
+        except Exception:
+            pass
 
     def _refresh_stack_dialog(self):
         """按当前纸叠状态刷新**攒批列表**（切第 1 趟/第 2 趟结束后都走这里）。"""
@@ -13468,7 +13841,10 @@ class MainWindow(QMainWindow):
         """
         try:
             sheets, unknown = duplex_stack.estimate_jobs_sheets(
-                list(jobs or []), _count_pages_in_range)
+                list(jobs or []), _count_pages_in_range,
+                simplex_of=self._job_simplex_pages,
+                pages_of=lambda j: selected_pages(getattr(j, "page_range", "") or "",
+                                                  int(getattr(j, "page_count", 0) or 0)))
         except Exception:
             return 0, "—"
         sheets = int(sheets or 0)
@@ -14397,7 +14773,7 @@ class MainWindow(QMainWindow):
         for j in flat_jobs:
             cost = calc_cost(j.page_count, j.copies, j.duplex,
                 self._config.simplex_price, self._config.duplex_price,
-                j.page_range)[0]
+                j.page_range, job_simplex_pages(j))[0]
             total += cost
             files_data.append({
                 "file_name": j.display_name or os.path.basename(j.file_path),
@@ -14478,6 +14854,7 @@ class MainWindow(QMainWindow):
             stack_out_pdf=_st_pdf,
             stack_seq=int(_st_seq or 0),
             stack_rotate=bool(_st_rot),
+            stack_more_pending=lambda: bool(getattr(self, "_stack_entry_wait", None)),
         )
         worker.progress.connect(self._on_progress)
         worker.log_message.connect(self._log)
@@ -14496,6 +14873,7 @@ class MainWindow(QMainWindow):
         if stack_entry:
             worker.stack_entry_planned.connect(self._on_stack_entry_planned)
             worker.stack_entry_done.connect(self._on_stack_entry_done)
+            worker.stack_entry_drained.connect(self._on_stack_entry_drained)
         self._worker = worker
         worker.start()
 
@@ -15206,6 +15584,8 @@ class MainWindow(QMainWindow):
             "<tr><td><b>Ctrl+V</b></td><td>粘贴文件</td></tr>"
             "<tr><td><b>Ctrl+T</b> / <b>Ctrl+N</b></td><td>新建标签页</td></tr>"
             "<tr><td><b>Ctrl+W</b></td><td>关闭当前标签页（未打印的先确认）</td></tr>"
+            "<tr><td><b>Ctrl+Enter</b></td>"
+            "<td>开始打印（等同右下角「▶ 开始打印」）</td></tr>"
             "<tr><td><b>Ctrl+Shift+T</b></td><td>标签页管理窗口（等同点标签页那个数字）</td></tr>"
             "<tr><td><b>←</b> / <b>→</b></td>"
             "<td>切换标签页（到两端即停，最右侧不新建；输入框里有焦点时是编辑光标）</td></tr>"
@@ -16648,7 +17028,7 @@ class MainWindow(QMainWindow):
         for i, job in enumerate(jobs, 1):
             cost, formula = calc_cost(job.page_count, job.copies, job.duplex,
                                        self._config.simplex_price, self._config.duplex_price,
-                                       job.page_range)
+                                       job.page_range, job_simplex_pages(job))
             display = job.display_name or os.path.basename(job.file_path)
             lines.append(f"{i}. {display}")
             lines.append(f"   {job.copies}x {'双面' if job.duplex=='on' else '单面'} 范围:{job.page_range or '全部'}")
@@ -16656,7 +17036,7 @@ class MainWindow(QMainWindow):
                 lines.append(f"   {formula} = ¥{cost:.2f}")
         total = sum(calc_cost(j.page_count, j.copies, j.duplex,
                               self._config.simplex_price, self._config.duplex_price,
-                              j.page_range)[0] for j in jobs)
+                              j.page_range, job_simplex_pages(j))[0] for j in jobs)
         # 与界面合计（_update_total_cost）口径一致：附加服务费（派送/加急/首页）
         tab = self._config.tabs.get(self._current_tab)
         extra = tab.calc_extra_total(total, self._config) if tab else 0.0
@@ -17073,12 +17453,52 @@ class MainWindow(QMainWindow):
         # 短边/长边只按**方向**推导（未知方向=长边）；转换完成后由 _on_convert_finished 复核
         duplex_mode = self._duplex_mode_for_orientation(orientation)
 
+        # ── 云端下发的两个每文件选项（2026-11-02 用户需求）────────────────────────
+        # 「排除末尾空白页」：顾客在小程序/APP 勾了 ⇒ 这里真排除（空白页判定只有本机有
+        # PyMuPDF，后端没有），排除后**立刻回报** page_range_truncated，后端据此重算价格
+        # （排除掉的空白页不收钱）。
+        # 「封面单独打印」：所列页一页一张纸；填错 / 超页数 / 不在范围内 ⇒ **打回**，
+        # 不能静默按整份双面打出去。
+        job_page_range = task.page_range or ""
+        job_blank_undo = None
+        if bool(getattr(task, "blank_tail_exclude", False)) and not is_image \
+                and page_count > 1 and blank_tail > 0:
+            _orig_range = job_page_range
+            _new_range, _cut = split_tail_blank(job_page_range, page_count, blank_tail)
+            if _cut > 0:
+                job_blank_undo = _orig_range
+                job_page_range = _new_range
+                self._log(f"✂ 云端订单 {task.order_number or ('#' + str(task.task_id))}："
+                          f"按顾客要求排除末尾 {_cut} 页空白页"
+                          f"（{_orig_range or '全部'} → {_new_range or '全部'}）")
+                if self._cloud_client:
+                    try:
+                        self._cloud_client.report_page_range_truncated(
+                            task.task_id, _orig_range or "", _new_range or "", page_count)
+                    except Exception as e:
+                        logger.warning(f"回报 page_range_truncated 失败 (task={task.task_id}): {e}")
+
+        simplex_raw = (getattr(task, "simplex_pages", "") or "").strip()
+        simplex_norm = ""
+        if simplex_raw and not is_image and (task.duplex or "on") == "on" \
+                and page_count > 0:
+            simplex_norm, _sx_issue = check_simplex_pages(job_page_range, page_count, simplex_raw)
+            if _sx_issue:
+                self._log(f"⛔ 云端订单 {task.order_number or ('#' + str(task.task_id))} 打回：{_sx_issue}")
+                if self._cloud_client:
+                    try:
+                        self._cloud_client.report_fail(task.task_id, _sx_issue)
+                        self._cloud_client.reject_task(task.task_id)
+                    except Exception as e:
+                        logger.warning(f"打回上报失败 (task={task.task_id}): {e}")
+                return new_key
+
         job = PrintJob(
             file_path=task.local_path or "",
             copies=task.copies if task.copies > 0 else 1,
             duplex="off" if is_image else (task.duplex or "on"),
             duplex_mode=duplex_mode,
-            page_range=task.page_range or "",
+            page_range=job_page_range,
             page_count=page_count,
             orientation=orientation,
             image_orientation=getattr(task, 'image_orientation', 'auto'),
@@ -17086,7 +17506,10 @@ class MainWindow(QMainWindow):
             task_id=task.task_id,
             order_id=task.order_id or 0,
             source_md5=source_md5,
-            blank_tail=blank_tail,        # 末尾空白页：**只标不排**（云端价格后端已定，见需求口径）
+            blank_tail=blank_tail,
+            blank_undo_range=job_blank_undo,
+            simplex_enabled=bool(simplex_norm),
+            simplex_pages=simplex_norm,
             display_name=task.file_name,  # 使用后端返回的原始文件名
             order_number=task.order_number,  # 云端订单号
             remark=getattr(task, 'remark', '') or '',  # 云端订单备注

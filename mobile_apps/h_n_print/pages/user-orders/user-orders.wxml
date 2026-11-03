@@ -223,6 +223,8 @@
                 <text class="detail-file-copies">{{f.pagesLine}} | {{f.totalSheets}} 张</text>
                 <text class="detail-file-range">{{f.duplex === 'on' ? '双面' : '单面'}}</text>
                 <text wx:if="{{f.page_range}}" class="detail-file-range">范围: {{f.page_range}}</text>
+                <text wx:if="{{f.simplex_pages}}" class="detail-file-range">单面页: {{f.simplex_pages}}</text>
+                <text wx:if="{{f.blank_tail_exclude}}" class="detail-file-range">已排除末尾空白页</text>
                 <text wx:if="{{(f.status === 'rejected' || f.status === 'failed') && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
             </view>

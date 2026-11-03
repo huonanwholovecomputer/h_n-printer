@@ -5,6 +5,14 @@ const { request } = require('../../utils/request')
 // 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
 const { countPagesInRange } = require('../../utils/pages')
 
+/* 双面摊纸的兜底张数（契约 §2「单面页每页一张 + 其余两页一张」）：实现在 utils/order_stats，
+   但它内部仍只用 utils/pages 的 pageRangeSet/chargeUnits（同一份口径，见该文件顶部说明）。
+   这里**延迟 require**：页面加载路径（复制价格/气泡定位等）用不到它，不必进首屏依赖。 */
+function _fallbackSheets(f, eff) {
+  const { fallbackSheets } = require('../../utils/order_stats')
+  return fallbackSheets(f, eff)
+}
+
 /* 文件张数/有效页数预处理（后端已返回时直接复用，缺失时前端兜底计算）：
    - effectivePages: 每份有效打印页数（范围过滤后）
    - totalSheets:    文件合计张数（含份数；单面每页 1 张、双面每 2 页 1 张，奇数页最后一张仍占 1 张）
@@ -13,7 +21,8 @@ function _enrichFileStat(f) {
   const pc = Number(f.page_count) || 0
   const copies = Number(f.copies) || 1
   const eff = typeof f.effective_pages === 'number' ? f.effective_pages : countPagesInRange(f.page_range, pc)
-  const perSheets = typeof f.sheets === 'number' ? f.sheets : (f.duplex === 'off' ? eff : Math.ceil(eff / 2))
+  // 张数：优先后端 sheets；缺失时同口径兜底（单面每页 1 张，双面按摊纸算）
+  const perSheets = typeof f.sheets === 'number' ? f.sheets : _fallbackSheets(f, eff)
   f.effectivePages = eff
   f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies)
   f.pagesLine = copies + ' 份 × ' + eff + ' 页'

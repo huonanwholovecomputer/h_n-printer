@@ -377,7 +377,11 @@ check("★ 批次不再按装订方向分组（旧的 groups.setdefault(self._ro
       "groups.setdefault(self._rotate_for_job" not in src_gui
       and "两种装订方向，将分" not in src_gui)
 check("★ 每个文件的 FilePlan 带上自己的补偿标志",
-      "self._rotate_for_job(job)" in src_gui and "dup, file_rot)" in src_gui)
+      "self._rotate_for_job(job)" in src_gui and "file_rot)" in src_gui
+      # 2026-11-02「封面单独打印」把 FilePlan 的构造收进 manual_duplex.file_plans_for_pages
+      # （一份文件可能切成多条计划），逐文件补偿标志作为最后一个参数传进去，仍然逐条生效。
+      and "FilePlan(label, list(run), bool(dup), second_rotate)" in src_md
+      and "FilePlan(label, pl, True, second_rotate)" in src_md)
 check("pass_rotate 是唯一出表的地方（print_plan_pass 用它）",
       "def pass_rotate" in src_md and 'getattr(plan, "pass_rotate"' in src_pp)
 

@@ -147,11 +147,14 @@ def sheets_for(pages: int, duplex: bool = True, copies: int = 1) -> int:
     return per * max(1, int(copies or 1))
 
 
-def estimate_jobs_sheets(jobs, count_selected=None) -> tuple[int, bool]:
+def estimate_jobs_sheets(jobs, count_selected=None, simplex_of=None, pages_of=None) -> tuple[int, bool]:
     """打印前估算一批任务占几张纸 → (张数, 是否有页数未知的文件)。
 
     count_selected(page_range, page_count) -> 实际要打的页数（调用方传，避免本模块依赖
     pdf_printer/printer_config 的解析口径；不传则用 page_count 原值）。
+    simplex_of(job) -> 该任务里"封面单独打印"的页集合；pages_of(job) -> 该任务实际要打的
+    页列表。两者都给了才按 `manual_duplex.count_sheets` 逐段算张数（单面页各占一张纸），
+    否则退回 ceil(n/2)（老口径）。传值而不在本模块解析，理由同上：口径只留一份。
 
     页数未知（云端 Word 还没分析出来，page_count=0）时按 1 页兜底并置 unknown=True：
     宁可**低估**（让这一单先打进来），也不要在没数据时把单子永久挡在队列里；
@@ -176,6 +179,22 @@ def estimate_jobs_sheets(jobs, count_selected=None) -> tuple[int, bool]:
                     sel = got
             except Exception:
                 sel = n
+        sx = set()
+        if simplex_of is not None and dup:
+            try:
+                sx = set(simplex_of(j) or ())
+            except Exception:
+                sx = set()
+        if sx and pages_of is not None:
+            # 混排（封面单独打印）：单面页与双面页能互相穿插 ⇒ 张数按段重算，
+            # 不能用 ceil(总页数/2)（31 页里 10 页单面时是 20 张，不是 16 张）。
+            try:
+                pages = [int(p) for p in (pages_of(j) or [])]
+            except Exception:
+                pages = []
+            if pages:
+                total += manual_duplex.count_sheets(pages, sx) * max(1, copies)
+                continue
         total += sheets_for(sel, dup, copies)
     return total, unknown
 

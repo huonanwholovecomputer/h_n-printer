@@ -7113,3 +7113,48 @@ body.theme-dark .crop-panel,
 .crop-btn {
   flex: 1;
 }
+
+/* ===== 「排除末尾空白页」/「封面单独打印」两个每文件开关（契约 2026-11-02 §6） =====
+   开关本体复用 .ios-switch / .switch-thumb（含深色态与 --sw-px 位移），这里只加文案排版；
+   这两行没有左侧 .control-label，改用"标题 + 说明"两行文案块，右侧开关不参与压缩。 */
+.file-switch-row {
+  align-items: center;
+}
+.file-switch-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.24cqw;
+}
+.file-switch-title {
+  font-size: 2.76cqw;
+  line-height: 1.3;
+  color: var(--text-primary);
+}
+.file-switch-desc {
+  font-size: 2.16cqw;
+  line-height: 1.35;
+  color: var(--text-tertiary);
+}
+.file-switch {
+  flex-shrink: 0;
+}
+/* 功能不生效（单面/单页/图片）：整行淡化，点击给提示（bindtap 里拦） */
+.file-switch-disabled {
+  opacity: 0.55;
+}
+/* 单面页多行输入：与「页码范围」输入框左对齐（control-label 宽 6.72 + gap 1.68 = 8.4cqw） */
+.simplex-editor {
+  padding-left: 8.4cqw;
+  margin-bottom: 1.2cqw;
+}
+.simplex-lines {
+  display: flex;
+  flex-direction: column;
+}
+/* 收起态：一行摘要（复用 .range-summary-trigger 视觉，去掉父级 flex:1 的假设） */
+.simplex-summary {
+  flex: none;
+  width: 100%;
+}

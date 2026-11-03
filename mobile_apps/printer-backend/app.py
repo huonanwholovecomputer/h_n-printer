@@ -3572,6 +3572,25 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
+    # v16（2026-11-02）：「封面单独打印」与「排除末尾空白页」—— 这两个选项原先只有本地
+    # 打印工具有，云端订单拿到设备端时直接丢失：顾客以为自己选了"封面单面"，实际按整份
+    # 双面出纸，价格与出纸两边都对不上。见 docs/云打印系统架构.md 的同名小节。
+    #   simplex_pages      ：需要**单面**打印的页（每页各占一张纸、背面留空），如 "1,16-23"
+    #   blank_tail_exclude ：1 = 设备端把文件末尾的连续空白页排除后再打，价格按排除后的
+    #                        页数重算（设备端回报 page_range_truncated 触发）
+    try:
+        _of_cols = [r[1] for r in conn.execute("PRAGMA table_info(order_files)").fetchall()]
+        for _col, _ddl in (
+            ("simplex_pages", "ALTER TABLE order_files ADD COLUMN simplex_pages TEXT DEFAULT ''"),
+            ("blank_tail_exclude", "ALTER TABLE order_files ADD COLUMN blank_tail_exclude INTEGER DEFAULT 0"),
+        ):
+            if _col not in _of_cols:
+                conn.execute(_ddl)
+                conn.commit()
+                print("  已添加 order_files.%s 列（封面单独打印 / 排除末尾空白页）" % _col)
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+
     # 确保历史打印机在设备注册表中（owner=姚懿祥），供「接单设备」列展示
     try:
         _dev = load_devices()
@@ -3820,13 +3839,180 @@ def generate_order_number():
 
 # ==================== 价格计算 ====================
 
-def calculate_price(page_count, duplex, page_range="", prices=None):
+# ---- 「封面单独打印」/「排除末尾空白页」的同口径工具（2026-11-02 用户需求） ----
+# 口径唯一来源：local_print_tool/manual_duplex.py 的 split_simplex_runs / charge_units。
+# 单面页各占一张纸（背面留空），其余页两页一张纸；双面段页数为奇数时末页按单面计费。
+# 后端 / 小程序 / APP / 本地工具必须算出**同一个张数与金额**，改这里先改口径文档。
+
+_SIMPLEX_MAX_CHARS = 500
+
+
+def _iter_range_tokens(raw):
+    """把 '1,2-3' 切成 [(start, end|None)]；无法解析的段以 (None, 原文) 返回。
+
+    与 _parse_page_range_set 的差别：那个是"打印够用"的宽松解析，会静默丢掉非法段；
+    「封面单独打印」的页填错了必须打回（否则顾客以为封面单面、实际整份双面还多收钱），
+    所以这里把非法段原样交回给调用方去决定。
+    """
+    out = []
+    text = str(raw or "").strip()
+    for ch in ("、", "，", "；", " ", "\u3000"):
+        text = text.replace(ch, ",")
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            try:
+                start, end = int(a), int(b)
+            except ValueError:
+                out.append((None, part))
+                continue
+            if start < 1 or end <= start:
+                out.append((None, part))
+                continue
+            out.append((start, end))
+        else:
+            try:
+                n = int(part)
+            except ValueError:
+                out.append((None, part))
+                continue
+            if n < 1:
+                out.append((None, part))
+                continue
+            out.append((n, None))
+    return out
+
+
+def _format_page_selection(pages):
+    """页集合 → '1,2,16-23'（升序、连续段合并）—— 与本地 format_page_selection 同口径。"""
+    nums = sorted({int(p) for p in pages})
+    if not nums:
+        return ""
+    parts = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(str(start) if start == prev else "%d-%d" % (start, prev))
+        start = prev = n
+    parts.append(str(start) if start == prev else "%d-%d" % (start, prev))
+    return ",".join(parts)
+
+
+def _selected_page_list(page_count, page_range=""):
+    """页码范围 → 升序页列表（空范围 / 全非法范围 = 全部页，与 _count_pages_in_range 一致）。"""
+    if page_count <= 0:
+        return []
+    if (page_range or "").strip():
+        pages = sorted(_parse_page_range_set(page_range, page_count))
+        if pages:
+            return pages
+    return list(range(1, page_count + 1))
+
+
+def _simplex_page_set(page_count, simplex_pages=""):
+    """「封面单独打印」页集合（宽松解析：用于已入库数据与统计，提交校验另走 _simplex_pages_checked）。"""
+    if page_count <= 0 or not (simplex_pages or "").strip():
+        return set()
+    return _parse_page_range_set(simplex_pages, page_count)
+
+
+def _charge_units(page_count, page_range="", simplex_pages=""):
+    """双面打印的纸张拆分 → (双面张数, 单面张数)。逐字对齐 manual_duplex.charge_units。
+
+    按"这一页是否属于单面页"把页码范围切成连续段：单面段每页一张（背面留空）；
+    双面段 len//2 张 + len%2 张单面收尾（末页另占一张纸）。
+    """
+    pages = _selected_page_list(page_count, page_range)
+    if not pages:
+        return (0, 0)
+    simplex = _simplex_page_set(page_count, simplex_pages)
+    dup = single = 0
+    i, n = 0, len(pages)
+    while i < n:
+        flag = pages[i] in simplex
+        j = i
+        while j < n and (pages[j] in simplex) == flag:
+            j += 1
+        seg = j - i
+        if flag:
+            single += seg
+        else:
+            dup += seg // 2
+            single += seg % 2
+        i = j
+    return (dup, single)
+
+
+def _simplex_pages_checked(raw, page_range, page_count, page_count_verified):
+    """校验并归一化「封面单独打印」页串 → (归一化字符串, 打回原因)。
+
+    打回原因（逐字，与本地工具提示同一套）：
+      「封面单独打印」页码格式不正确：{raw}（应为如 1-5 或 7）
+      「封面单独打印」第 {n} 页超出文件总页数（文件共 {pc} 页）
+      「封面单独打印」第 {n} 页不在页码范围「{range}」内
+    单面打印时该配置无意义，调用方负责跳过。
+    """
+    text = (raw or "").strip()[:_SIMPLEX_MAX_CHARS]
+    if not text:
+        return "", ""
+    tokens = _iter_range_tokens(text)
+    bad = [part for (start, part) in tokens if start is None]
+    if bad:
+        return "", "「封面单独打印」页码格式不正确：%s（应为如 1-5 或 7）" % bad[0]
+    pages = set()
+    for start, end in tokens:
+        if start is None:
+            continue
+        if end is None:
+            pages.add(start)
+        else:
+            pages.update(range(start, end + 1))
+    if not pages:
+        return "", "「封面单独打印」页码格式不正确：%s（应为如 1-5 或 7）" % text
+    if page_count_verified and page_count > 0:
+        over = sorted(p for p in pages if p > page_count)
+        if over:
+            return "", "「封面单独打印」第 %d 页超出文件总页数（文件共 %d 页）" % (over[0], page_count)
+        scope = set(_selected_page_list(page_count, page_range))
+        outside = sorted(p for p in pages if p not in scope)
+        if outside:
+            return "", ("「封面单独打印」第 %d 页不在页码范围「%s」内"
+                        % (outside[0], (page_range or "").strip()))
+    return _format_page_selection(pages), ""
+
+
+def _row_simplex_pages(row):
+    """从 sqlite3.Row / dict 里安全取 simplex_pages（老库/老查询没有该列时当空）。"""
+    try:
+        return (row["simplex_pages"] or "") if row["simplex_pages"] is not None else ""
+    except (IndexError, KeyError, TypeError):
+        return ""
+
+
+def _row_blank_tail_exclude(row):
+    """从 sqlite3.Row / dict 里安全取 blank_tail_exclude（缺列当 0）。"""
+    try:
+        return int(row["blank_tail_exclude"] or 0)
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
+
+
+
+def calculate_price(page_count, duplex, page_range="", prices=None, simplex_pages=""):
     """根据有效打印页数（范围过滤后）和双面模式计算价格（单份文件，不含份数倍率）。
     单面打印: simplex_price 元/页（默认 0.2）
     双面打印: duplex_price 元/张（默认 0.3，每张纸可印两页，奇数页最后一张按单面价计费）
     价格来源 pricing.json（与 /api/pricing、前端计费显示、本地打印工具一致，
     在「收支统计 → 设置」中统一维护）；读取失败回退默认 0.2/0.3。
     page_range 为空 → 按整份页数计。
+    simplex_pages：「封面单独打印」的页（每页各占一张纸、背面留空）。给了就按
+    「单面段每页一张 + 双面段两页一张」摊纸（见 _charge_units），与本地工具同口径；
+    留空时行为与老版本**逐字一致**（ceil(eff/2) 双面张 + 奇数末页单面）。
     prices：可选 (单面, 双面) 单价。批量计价（如 submit_order 的文件循环）应在循环外
     调一次 `_load_paper_prices()` 传进来，避免每个文件各走一次读盘/缓存查询。"""
     if page_count <= 0:
@@ -3834,9 +4020,12 @@ def calculate_price(page_count, duplex, page_range="", prices=None):
     simplex_price, duplex_price = prices or _load_paper_prices()
     effective = _count_pages_in_range(page_range or "", page_count)
     if duplex == "on":
-        sheets = math.ceil(effective / 2)
-        odd_pages = effective % 2
-        price = (sheets - odd_pages) * duplex_price + odd_pages * simplex_price
+        dup_sheets, single_sheets = _charge_units(page_count, page_range, simplex_pages)
+        if dup_sheets + single_sheets <= 0:
+            # 兜底：页数/范围异常时退回老口径，绝不因口径函数空转而算成 0 元
+            dup_sheets = math.ceil(effective / 2)
+            single_sheets = effective % 2
+        price = dup_sheets * duplex_price + single_sheets * simplex_price
     else:
         price = effective * simplex_price
     return round(price, 2)
@@ -4059,6 +4248,7 @@ def process_pending_orders():
         """
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
                of.copies, of.page_range, of.duplex, of.image_orientation,
+               of.simplex_pages, of.blank_tail_exclude,
                o.auto_print, o.target_client
         FROM order_files of
         JOIN orders o ON of.order_id = o.id
@@ -4135,7 +4325,9 @@ def process_pending_orders():
         pushed = push_print_task_to_client(of_id, file_id, file_name, copies, duplex,
                                            page_range, dest_client,
                                            auto_print=bool(row["auto_print"]),
-                                           image_orientation=row["image_orientation"] or "auto")
+                                           image_orientation=row["image_orientation"] or "auto",
+                                           simplex_pages=_row_simplex_pages(row),
+                                           blank_tail_exclude=_row_blank_tail_exclude(row))
         if pushed:
             continue
 
@@ -4155,6 +4347,7 @@ def process_scheduled_orders():
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
                of.copies, of.page_range, of.duplex, of.status AS of_status,
                of.operator_client, of.image_orientation,
+               of.simplex_pages, of.blank_tail_exclude,
                o.auto_print, o.schedule_mode, o.scheduled_at, o.schedule_frozen,
                o.target_client
         FROM order_files of
@@ -4216,7 +4409,9 @@ def process_scheduled_orders():
                                       schedule_mode=row["schedule_mode"],
                                       scheduled_at=row["scheduled_at"] or "",
                                       schedule_frozen=row["schedule_frozen"],
-                                      image_orientation=row["image_orientation"] or "auto")
+                                      image_orientation=row["image_orientation"] or "auto",
+                                      simplex_pages=_row_simplex_pages(row),
+                                      blank_tail_exclude=_row_blank_tail_exclude(row))
 
         elif row["of_status"] == "waiting":
             # 阶段②兜底：到点且未冻结 → 发 start_print（本地通常已自触发，幂等）
@@ -4253,7 +4448,7 @@ def process_scheduled_orders():
 def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, page_range, client_id,
                               auto_print=False, scheduled_download=False,
                               schedule_mode="now", scheduled_at="", schedule_frozen=0,
-                              image_orientation="auto"):
+                              image_orientation="auto", simplex_pages="", blank_tail_exclude=0):
     """通过 SocketIO 推送子任务 (order_files) 到指定打印机客户端。
     sub_task_id = order_files.id。
 
@@ -4361,6 +4556,10 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
             "duplex": duplex or "on",
             "page_range": page_range or "",
             "image_orientation": image_orientation or "auto",
+            # 2026-11-02：「封面单独打印」所列页 / 「排除末尾空白页」开关 —— 设备端据此
+            # 分两趟摊纸（单面页各占一张）并在真排除掉空白页后回报 page_range_truncated。
+            "simplex_pages": simplex_pages or "",
+            "blank_tail_exclude": int(blank_tail_exclude or 0),
         },
     }
 
@@ -5554,7 +5753,7 @@ def _recalc_prices_for_file(file_id, page_count):
     conn = get_db()
     try:
         rows = conn.execute(
-            "SELECT id, order_id, copies, duplex, page_range FROM order_files"
+            "SELECT id, order_id, copies, duplex, page_range, simplex_pages FROM order_files"
             " WHERE file_id = ? AND status NOT IN ('sent','failed','canceled','rejected','abandoned')",
             (file_id,),
         ).fetchall()
@@ -5562,7 +5761,8 @@ def _recalc_prices_for_file(file_id, page_count):
             return
         order_ids = set()
         for r in rows:
-            per_copy = calculate_price(page_count, r["duplex"] or "on", r["page_range"] or "")
+            per_copy = calculate_price(page_count, r["duplex"] or "on", r["page_range"] or "",
+                                       simplex_pages=_row_simplex_pages(r))
             new_total = round(per_copy * (r["copies"] or 1), 2)
             conn.execute(
                 "UPDATE order_files SET page_count = ?, total_price = ? WHERE id = ?",
@@ -5639,10 +5839,12 @@ def _sync_subtask_config(task_id, copies, duplex, page_range, page_count):
         conn.execute(f"UPDATE order_files SET {', '.join(set_parts)} WHERE id = ?", params)
         # 用更新后的值重算子任务价格
         cur = conn.execute(
-            "SELECT page_count, copies, duplex, page_range FROM order_files WHERE id = ?", (task_id,)
+            "SELECT page_count, copies, duplex, page_range, simplex_pages FROM order_files WHERE id = ?", (task_id,)
         ).fetchone()
         if cur:
-            per_copy = calculate_price(cur["page_count"] or 1, cur["duplex"] or "on", cur["page_range"] or "")
+            per_copy = calculate_price(cur["page_count"] or 1, cur["duplex"] or "on",
+                                       cur["page_range"] or "",
+                                       simplex_pages=_row_simplex_pages(cur))
             new_total = round(per_copy * (cur["copies"] or 1), 2)
             conn.execute("UPDATE order_files SET total_price = ? WHERE id = ?", (new_total, task_id))
             # 重算父订单总额（基础打印费 + 附加服务费，口径与 submit_order 一致）
@@ -5752,15 +5954,21 @@ def _count_pages_in_range(page_range: str, total_pages: int) -> int:
     return len(pages) if pages else total_pages
 
 
-def _file_range_stats(page_count, copies, duplex, page_range=""):
+def _file_range_stats(page_count, copies, duplex, page_range="", simplex_pages=""):
     """文件页数/纸张统计（口径与 calculate_price 一致，张数模型对齐本地工具 _fileSheets）：
     - effective_pages: 每份有效打印页数（页码范围过滤后，空范围 = 整份）
     - sheets:          每份纸张张数（单面每页 1 张；双面每 2 页 1 张，奇数页最后一张仍占 1 张）
     - total_pages:     文件合计页数 = 有效页数 × 份数
     - total_sheets:    文件合计张数 = 每份张数 × 份数
+    simplex_pages：「封面单独打印」页（每页各占一张纸）；非空时双面张数按
+    _charge_units 摊纸（不是 ceil(eff/2)：31 页里 9 页单面是 20 张，不是 16 张）。
     """
     eff = _count_pages_in_range(page_range or "", page_count)
-    sheets = math.ceil(eff / 2) if duplex == "on" else eff
+    if duplex == "on":
+        _dup, _single = _charge_units(page_count, page_range, simplex_pages)
+        sheets = (_dup + _single) if (_dup + _single) > 0 else math.ceil(eff / 2)
+    else:
+        sheets = eff
     return {
         "effective_pages": eff,
         "sheets": sheets,
@@ -5773,7 +5981,7 @@ def _validate_page_ranges_for_file(file_id: str, page_count: int):
     """检查使用指定文件的所有活跃子任务，若页码范围超出总页数则自动打回。"""
     conn = get_db()
     tasks = conn.execute(
-        "SELECT id, order_id, page_range FROM order_files"
+        "SELECT id, order_id, page_range, simplex_pages FROM order_files"
         " WHERE file_id = ? AND status IN ('queued', 'printing')",
         (file_id,),
     ).fetchall()
@@ -5787,6 +5995,19 @@ def _validate_page_ranges_for_file(file_id: str, page_count: int):
                 "UPDATE order_files SET status = 'rejected', reject_reason = ? WHERE id = ?",
                 (f"页码范围超出文件总页数（填写 {max_page} 页，文件共 {page_count} 页）", t["id"]),
             )
+            rejected += 1
+            rejected_order_ids.add(t["order_id"])
+            continue
+        # 「封面单独打印」的页同样要拿**真实页数**复核一遍：提交时若页数还没分析出来
+        # （page_count_verified=0）就没法校验，等设备端回报页数时在这里补打回。
+        _sim, _sim_reason = _simplex_pages_checked(
+            _row_simplex_pages(t), t["page_range"] or "", page_count, True)
+        if _sim_reason:
+            conn.execute(
+                "UPDATE order_files SET status = 'rejected', reject_reason = ? WHERE id = ?",
+                (_sim_reason, t["id"]),
+            )
+            print(f"  [REJECT] 页数验证时打回 simplex: {_sim_reason}")
             rejected += 1
             rejected_order_ids.add(t["order_id"])
 
@@ -5843,7 +6064,46 @@ def on_page_range_truncated(data):
             "UPDATE order_files SET page_range_original = ?, page_range_truncated = 1, page_range = ? WHERE id = ?",
             (original, effective, task_id),
         )
-        conn.commit()
+        # 2026-11-02：截断多半是「排除末尾空白页」造成的（有效页数变少）⇒ 必须按新页数
+        # 重算子任务价格与父订单总额，否则"排除掉的空白页不收钱"这句口径就落不了地。
+        _row = conn.execute(
+            "SELECT order_id, copies, duplex, page_range, page_count, simplex_pages"
+            " FROM order_files WHERE id = ?", (task_id,)
+        ).fetchone()
+        if _row:
+            _pc = max(int(_row["page_count"] or 0), int(total_pages or 0))
+            _sim = _row_simplex_pages(_row)
+            if _pc > 0 and _sim:
+                # 单面页可能整段落在被排掉的尾巴里 ⇒ 收敛到「新页码范围」上再计价
+                _keep = (_simplex_page_set(_pc, _sim)
+                         & set(_selected_page_list(_pc, _row["page_range"] or "")))
+                _sim = _format_page_selection(_keep)
+                conn.execute("UPDATE order_files SET simplex_pages = ? WHERE id = ?", (_sim, task_id))
+            _eff_pc = _pc if _pc > 0 else 1
+            _per_copy = calculate_price(_eff_pc, _row["duplex"] or "on",
+                                        _row["page_range"] or "", simplex_pages=_sim)
+            _new_total = round(_per_copy * (_row["copies"] or 1), 2)
+            conn.execute("UPDATE order_files SET total_price = ? WHERE id = ?", (_new_total, task_id))
+            _oid = _row["order_id"]
+            _sub_sum = conn.execute(
+                "SELECT COALESCE(SUM(total_price), 0) FROM order_files WHERE order_id = ?", (_oid,)
+            ).fetchone()[0]
+            _o = conn.execute(
+                "SELECT delivery_enabled, delivery_percentage, urgency_price, cover_page, cover_page_price"
+                " FROM orders WHERE id = ?", (_oid,)
+            ).fetchone()
+            if _o:
+                _delivery = (round(float(_sub_sum) * (_o["delivery_percentage"] or 0) / 100, 2)
+                             if _o["delivery_enabled"] else 0)
+                _urgency = float(_o["urgency_price"] or 0)
+                _cover = (round(float(_o["cover_page_price"] or 0) * _o["cover_page"], 2)
+                          if _o["cover_page"] else 0)
+                conn.execute(
+                    "UPDATE orders SET total_price = ? WHERE id = ?",
+                    (round(float(_sub_sum) + _urgency + _cover + _delivery, 2), _oid),
+                )
+            conn.commit()
+            print(f"  [PRICE] 截断后重算 子任务 #{task_id}: {_new_total} 元（simplex={_sim or '无'}）")
     finally:
         conn.close()
 
@@ -7519,12 +7779,36 @@ def _plan_order_files(conn, files_input, openid, default_duplex, schedule_mode, 
         # 读取每文件的双面设置（优先 files 数组中的值，其次顶层 duplex）
         f_duplex = f.get("duplex", default_duplex) or "on"
 
-        per_copy_price = calculate_price(page_count, f_duplex, f_page_range, prices=prices)
+        # 「封面单独打印」（2026-11-02 用户需求）：所列页各占一张纸、其余页两页一张纸。
+        # 页码填错 / 超出总页数 / 不在「页码范围」之内 ⇒ 该文件打回（不静默忽略：
+        # 否则顾客以为封面单面、实际按整份双面出纸，价格与出纸都对不上）。
+        f_simplex_pages = ""
+        _simplex_reason = ""
+        if f_duplex == "on":
+            f_simplex_pages, _simplex_reason = _simplex_pages_checked(
+                f.get("simplex_pages", "") or "", f_page_range, page_count, page_count_verified)
+            if _simplex_reason:
+                # 打回原因先存着，等 sub_status / reject_reason 初始化之后再落 ——
+                # 在这里直接赋值会被下面几行的初始化重置回 queued（实测踩过）。
+                print("  [REJECT] 提交时打回: %s simplex=%r %s"
+                      % (f_name, f.get("simplex_pages"), _simplex_reason))
+        # 「排除末尾空白页」：只认 0/1；真正的空白页判定在设备端（后端没有 PyMuPDF），
+        # 本地排除后立刻回报 page_range_truncated，后端据此重算价格。
+        f_blank_tail_exclude = 1 if str(f.get("blank_tail_exclude", 0)).strip() in ("1", "true", "True") else 0
+
+        per_copy_price = calculate_price(page_count, f_duplex, f_page_range, prices=prices,
+                                         simplex_pages=f_simplex_pages)
         total_price = round(per_copy_price * f_copies, 2)  # 始终计算真实价格，is_free 控制是否收费
         # 普通单从 queued 开始，由 push_print_task_to_client 原子锁定为 printing；
         # 预约单从 scheduled 开始，阶段①下发文件时为 downloading（不进 queued，避免被普通链路误分发）
         sub_status = "scheduled" if schedule_mode != "now" else "queued"
         reject_reason = ""
+
+        # 「封面单独打印」填错 ⇒ 打回（必须排在 sub_status / reject_reason 初始化之后，
+        # 否则会被上面两行重置；见 2026-11-02 实测）
+        if _simplex_reason and sub_status != "rejected":
+            sub_status = "rejected"
+            reject_reason = _simplex_reason
 
         # 若页数已确认，立即校验页码范围
         if page_count_verified and page_count > 0 and f_page_range:
@@ -7551,6 +7835,8 @@ def _plan_order_files(conn, files_input, openid, default_duplex, schedule_mode, 
             "status": sub_status,
             "duplex": f_duplex,
             "image_orientation": f_image_orientation,
+            "simplex_pages": f_simplex_pages,
+            "blank_tail_exclude": f_blank_tail_exclude,
             "reject_reason": reject_reason,
         })
     return plan
@@ -7825,11 +8111,13 @@ def submit_order():
                 )
             conn.execute(
                 """INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,
-                                            page_range, price_per_page, total_price, is_free, status, created_at, duplex, reject_reason, image_orientation)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                            page_range, price_per_page, total_price, is_free, status, created_at, duplex, reject_reason, image_orientation,
+                                            simplex_pages, blank_tail_exclude)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (order_id, item["file_id"], item["file_name"], item["copies"], item["page_count"],
                  item["page_range"], 0, item["total_price"], 0, item["status"], created_at,
-                 item["duplex"], item["reject_reason"], item["image_orientation"]),
+                 item["duplex"], item["reject_reason"], item["image_orientation"],
+                 item.get("simplex_pages", ""), item.get("blank_tail_exclude", 0)),
             )
             sub_task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             sub_tasks.append({
@@ -7841,6 +8129,8 @@ def submit_order():
                 "total_price": item["total_price"], "status": item["status"],
                 "duplex": item["duplex"],
                 "image_orientation": item["image_orientation"],
+                "simplex_pages": item.get("simplex_pages", ""),
+                "blank_tail_exclude": item.get("blank_tail_exclude", 0),
                 "reject_reason": item["reject_reason"],
             })
 
@@ -7946,14 +8236,18 @@ def submit_order():
                                                   scheduled_download=True,
                                                   schedule_mode=schedule_mode,
                                                   scheduled_at=scheduled_at,
-                                                  image_orientation=st.get("image_orientation", "auto")):
+                                                  image_orientation=st.get("image_orientation", "auto"),
+                                                  simplex_pages=st.get("simplex_pages", ""),
+                                                  blank_tail_exclude=st.get("blank_tail_exclude", 0)):
                         pushed_count += 1
                     continue
                 if push_print_task_to_client(st["id"], st["file_id"], st["file_name"],
                                               st["copies"], st.get("duplex", duplex),
                                               st.get("page_range", ""), client_id,
                                               auto_print=bool(auto_print),
-                                              image_orientation=st.get("image_orientation", "auto")):
+                                              image_orientation=st.get("image_orientation", "auto"),
+                                              simplex_pages=st.get("simplex_pages", ""),
+                                              blank_tail_exclude=st.get("blank_tail_exclude", 0)):
                     pushed_count += 1
                 # 🔴-11：此处原有 `UPDATE order_files SET status='queued' WHERE id=?` 的失败
                 # 回滚，已删除 —— push_print_task_to_client 对每种失败路径都自带**带状态守卫**
@@ -8797,6 +9091,7 @@ def get_orders():
         of_rows = conn.execute(
             """SELECT id, file_id, file_name, copies, page_count, page_range,
                       page_range_original, page_range_truncated,
+                      simplex_pages, blank_tail_exclude,
                       reject_reason,
                       total_price, is_free, status, created_at, duplex
                FROM order_files WHERE order_id = ? ORDER BY id ASC""",
@@ -8811,7 +9106,8 @@ def get_orders():
             for f in files:
                 # 有效页数/张数按页码范围折算（v1.1.21：指定页面选择时合计页数取所选页，不再用整份页数）
                 st = _file_range_stats(f["page_count"] or 0, f["copies"] or 1,
-                                       f["duplex"] or "on", f["page_range"] or "")
+                                       f["duplex"] or "on", f["page_range"] or "",
+                                       f.get("simplex_pages") or "")
                 f["effective_pages"] = st["effective_pages"]   # 每份有效打印页数（范围过滤后）
                 f["sheets"] = st["sheets"]                     # 每份纸张张数
                 f["total_pages"] = st["total_pages"]           # 文件合计页数（有效页数 × 份数）
@@ -8932,7 +9228,8 @@ def get_order_detail(order_id):
     of_rows = conn.execute(
         """SELECT of.id, of.file_id, of.file_name, of.copies, of.page_count,
                   of.page_range, of.page_range_original, of.page_range_truncated,
-                  of.total_price, of.is_free, of.status, of.duplex, of.image_orientation
+                  of.total_price, of.is_free, of.status, of.duplex, of.image_orientation,
+                  of.simplex_pages, of.blank_tail_exclude, of.reject_reason
            FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
         (order_id,),
     ).fetchall()
@@ -8969,7 +9266,8 @@ def get_order_detail(order_id):
         for f in files:
             # 有效页数/张数按页码范围折算（合计页数取所选页，不再用整份页数）
             st = _file_range_stats(f["page_count"] or 0, f["copies"] or 1,
-                                   f["duplex"] or "on", f["page_range"] or "")
+                                   f["duplex"] or "on", f["page_range"] or "",
+                                   f.get("simplex_pages") or "")
             f["effective_pages"] = st["effective_pages"]
             f["sheets"] = st["sheets"]
             f["total_pages"] = st["total_pages"]
@@ -9067,7 +9365,8 @@ def get_order_price(order_id):
     # 查询子任务价格明细
     of_rows = conn.execute(
         """SELECT of.id, of.file_name, of.copies, of.page_count, of.duplex, of.page_range,
-                  of.total_price, of.is_free, of.status
+                  of.total_price, of.is_free, of.status,
+                  of.simplex_pages, of.blank_tail_exclude
            FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
         (order_id,),
     ).fetchall()
@@ -9076,11 +9375,14 @@ def get_order_price(order_id):
     for of_row in of_rows:
         f = dict(of_row)
         # 附上单价明细（用于前端展示）
-        per_copy_price = calculate_price(f["page_count"], f.get("duplex", "on"), f.get("page_range", ""))
+        per_copy_price = calculate_price(f["page_count"], f.get("duplex", "on"),
+                                         f.get("page_range", ""),
+                                         simplex_pages=_row_simplex_pages(f))
         f["per_copy_price"] = per_copy_price
         # 附上有效页数/张数（供结算文案等展示，含页码范围折算）
         st = _file_range_stats(f["page_count"] or 0, f["copies"] or 1,
-                               f.get("duplex", "on"), f.get("page_range", "") or "")
+                               f.get("duplex", "on"), f.get("page_range", "") or "",
+                               _row_simplex_pages(f))
         f["effective_pages"] = st["effective_pages"]
         f["sheets"] = st["sheets"]
         f["total_pages"] = st["total_pages"]
@@ -11101,7 +11403,7 @@ def admin_recent_orders():
             ids = list(files_by_order.keys())
             ph = ",".join("?" * len(ids))
             for f in conn.execute(
-                f"SELECT order_id, page_count, copies, duplex, page_range "
+                f"SELECT order_id, page_count, copies, duplex, page_range, simplex_pages "
                 f"FROM order_files WHERE order_id IN ({ph}) ORDER BY order_id, id",
                 ids
             ).fetchall():
@@ -11131,7 +11433,8 @@ def admin_recent_orders():
                     st = _file_range_stats(f.get("page_count") or 1,
                                            f.get("copies") or 1,
                                            f.get("duplex") or "off",
-                                           f.get("page_range") or "")
+                                           f.get("page_range") or "",
+                                           f.get("simplex_pages") or "")
                     page_count += st["total_pages"]
                     sheet_count += st["total_sheets"]
             else:

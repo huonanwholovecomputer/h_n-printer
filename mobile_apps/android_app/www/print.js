@@ -447,6 +447,14 @@ function setupFileInput() {
         copies: 1,
         rangeLines: [{ value: '', error: '' }],
         pageRange: '',
+        // 「排除末尾空白页」/「封面单独打印」两个**每文件**开关（契约 2026-11-02）。
+        // 注意：与订单级 cover_page（打印首页信息附加费）毫无关系，别复用字段/文案。
+        excludeBlankTail: false,                        // → 提交体 blank_tail_exclude(0/1)
+        simplexEnabled: false,                          // → 提交体 simplex_pages（勾选且合法才传）
+        simplexLines: [{ value: '', error: '' }],       // 多行单面页输入（与 rangeLines 同一套交互）
+        simplexPages: '',                               // 校验后合并的 "1,16-23"（空 = 关闭）
+        simplexFocusLine: -1,                           // 待恢复焦点的行下标（-1 = 无），重绘后消费一次
+        simplexEditing: false,                          // 正在编辑（false 且已有值 → 收起成一行摘要）
         duplex: isImage ? 'off' : 'on',
         imageOrientation: 'auto',
         isImage, excelWarning: isUnsupported, unsupportedFormat: false,
@@ -575,6 +583,49 @@ function fileControlsHTML(f) {
           </view>` : ''}
         </view>
       </view>`;
+    // 「页码范围」下方两个每文件开关（契约 §6）。开关用独立的 data-file-sw + 专用点击监听，
+    // 不接入订单级 data-sw / bindSwitchDrags 那条滑动派发链（避免误伤订单级开关）。
+    const simplexOff = simplexDisabledFor(f);
+    html += `
+      <view class="control-row file-switch-row">
+        <view class="file-switch-text">
+          <text class="file-switch-title">排除末尾空白页</text>
+          <text class="file-switch-desc">出纸前由打印端检测并排除末尾连续空白页，费用按实际打印页数结算</text>
+        </view>
+        <view class="ios-switch file-switch ${f.excludeBlankTail ? 'switch-on' : ''}" data-file-sw="blank-tail" role="switch" aria-checked="${f.excludeBlankTail ? 'true' : 'false'}">
+          <view class="switch-thumb"></view>
+        </view>
+      </view>
+      <view class="control-row file-switch-row ${simplexOff ? 'file-switch-disabled' : ''}">
+        <view class="file-switch-text">
+          <text class="file-switch-title">封面单独打印</text>
+          <text class="file-switch-desc">${simplexOff ? '单面打印时该功能不生效' : '填写的页按单面出纸，其余页仍按上面的模式打印'}</text>
+        </view>
+        <view class="ios-switch file-switch ${f.simplexEnabled && !simplexOff ? 'switch-on' : ''}" data-file-sw="simplex" role="switch" aria-checked="${f.simplexEnabled && !simplexOff ? 'true' : 'false'}">
+          <view class="switch-thumb"></view>
+        </view>
+      </view>
+      ${(f.simplexEnabled && !simplexOff)
+        ? ((f.simplexEditing || !f.simplexPages)
+          ? `
+      <view class="simplex-editor">
+        <view class="simplex-lines">
+          ${(f.simplexLines || []).map((line, li) => `
+            <view class="range-line-row">
+              <input class="range-line-input ${line.error ? 'range-input-err' : ''}" data-action="simplex-line" data-line="${li}"
+                value="${escHtml(line.value)}" placeholder="如 1 或 1,16-23">
+              ${line.error ? `<text class="range-err-msg range-line-err">${escHtml(line.error)}</text>` : ''}
+            </view>`).join('')}
+        </view>
+      </view>`
+          : `
+      <view class="simplex-editor">
+        <view class="range-summary-trigger simplex-summary" data-action="edit-simplex">
+          <text class="range-summary-text">单面页: ${escHtml(f.simplexPages)}</text>
+          <text class="range-summary-arrow">›</text>
+        </view>
+      </view>`)
+        : ''}`;
     // 对齐小程序：模式行始终渲染，单页时收起淡出（保留过渡，卡片高度平滑变化）
     html += `
       <view class="control-row mode-row ${f.singlePage ? 'mode-row-collapsed' : ''}">
@@ -627,6 +678,16 @@ function renderFileList() {
   }
   recalcFileListHeight();
   bindToggleDrags();
+  // 单面页输入行重绘后恢复焦点/光标（整表 innerHTML 重建会丢 focus；只在本卡片可行时恢复）
+  printState.selectedFiles.forEach((f, i) => {
+    if (!f || !(f.simplexFocusLine >= 0)) return;
+    const card = container.children[i];
+    const inp = card ? card.querySelectorAll('[data-action="simplex-line"]')[f.simplexFocusLine] : null;
+    f.simplexFocusLine = -1;
+    if (inp) {
+      try { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); } catch (err) {}
+    }
+  });
 }
 
 // 模式/方向滑块：按住拖动（拖动中跟手，松手吸附到最近档位；纯点击仍走原切换）
@@ -1228,6 +1289,16 @@ function refreshSinglePage(idx) {
   renderFileList();
 }
 
+/* 「封面单独打印」是否不生效（契约 §1：duplex == 'off' 时 X 无意义，整份按单面算，且不落 simplex_pages）：
+   图片/Excel 不走范围逻辑；1 页文件固定单面；有效只选 1 页时模式被强制单面；用户自己选了「单面」。 */
+function simplexDisabledFor(f) {
+  if (!f) return true;
+  if (f.isImage || f.excelWarning || f.unsupportedFormat) return true;
+  if (f.pageCount === 1) return true;
+  if (f.singlePage) return true;
+  return (f.duplex || 'on') === 'off';
+}
+
 // 页数确认后：输入区/警告原地加收起类（CSS 过渡播放），摘要立即插入，延时整表重绘刷新文本
 function ensureRangeSummary(card, f) {
   const wrap = card.querySelector('.range-lines-wrap');
@@ -1279,6 +1350,8 @@ function normalizeAndValidateRangeLines(idx, smooth) {
   f.rangeLines = entries.map(e => ({ value: e.value, error: e.error })).concat([{ value: '', error: '' }]);
   f.pageRange = entries.filter(e => e.pages).map(e => e.value).join(',');
   f.singlePage = computeSinglePage(f);
+  // 页码范围变了 ⇒ 契约 §1 的 X ⊆ S 可能不再成立，顺手重算「封面单独打印」的标红
+  if (f.simplexEnabled) _normalizeAndValidateSimplexLines(f, false);
   const known = f.pageCountStatus === 'confirmed' && f.pageCount > 0;
   const singleChanged = prevSingle !== f.singlePage;
   const card = document.querySelectorAll('#fileList .file-card')[idx];
@@ -1305,6 +1378,55 @@ function normalizeAndValidateRangeLines(idx, smooth) {
   } else {
     renderFileList();
   }
+}
+
+/* 「封面单独打印」多行页码：校验 + 归一化（契约 §1、§6）。
+   · 格式错/超页数/两两重叠 → 与「页码范围」同一套文案（标红，不阻断他人）
+   · X ⊆ S：任何一页落在页码范围之外 → 标红「不在页码范围」（契约 §1 的硬约束）
+   · 合法且非空 → f.simplexPages = 各行原文 join(',')；否则 ''（提交时不传该功能）
+   collapse=true（失焦路径）且合法非空时收起成摘要行，与「页码范围」同一交互。 */
+function _normalizeAndValidateSimplexLines(f, collapse) {
+  if (!f) return;
+  const lines = f.simplexLines || [{ value: '', error: '' }];
+  const maxPages = f.pageCount || 0;
+  const pageSet = pageRangeSet(f.pageRange || '', maxPages);   // S（空范围 = 全部页）
+  const entries = [];
+  for (const line of lines) {
+    const v = (line.value || '').trim();
+    if (!v) continue;
+    // strict：任一段非法 → null（格式错误）；probe：不按总页数收窄，好判"请求了超页的页"
+    const pages = pageSetFrom(v, maxPages, true, true);
+    if (!pages) { entries.push({ value: v, pages: null, error: '格式错误（应为 1-5 或 7）' }); continue; }
+    if (maxPages > 0 && [...pages].some(p => p > maxPages)) {
+      entries.push({ value: v, pages: null, error: '超出总页数 ' + maxPages }); continue;
+    }
+    if (maxPages > 0 && [...pages].some(p => !pageSet.has(p))) {
+      entries.push({ value: v, pages: null, error: '不在页码范围' }); continue;
+    }
+    entries.push({ value: v, pages, error: '' });
+  }
+  for (let i = 0; i < entries.length; i++) {
+    if (!entries[i].pages) continue;
+    for (let j = i + 1; j < entries.length; j++) {
+      if (!entries[j].pages) continue;
+      if ([...entries[i].pages].some(p => entries[j].pages.has(p))) {
+        entries[i].error = '重叠: ' + entries[j].value;
+        entries[j].error = '重叠: ' + entries[i].value;
+        entries[i].pages = null;
+        entries[j].pages = null;
+      }
+    }
+  }
+  entries.sort((a, b) => {
+    if (!a.pages && !b.pages) return 0;
+    if (!a.pages) return 1;
+    if (!b.pages) return -1;
+    return Math.min(...a.pages) - Math.min(...b.pages);
+  });
+  f.simplexLines = entries.map(e => ({ value: e.value, error: e.error })).concat([{ value: '', error: '' }]);
+  const allOk = entries.length > 0 && entries.every(e => e.pages && !e.error);
+  f.simplexPages = allOk ? entries.map(e => e.value).join(',') : '';
+  if (collapse && allOk) f.simplexEditing = false;
 }
 
 /* ================= 页数网格选择 ================= */
@@ -2092,6 +2214,18 @@ function onSubmit() {
     if (f.pageCount === 1) continue;
     if ((f.rangeLines || []).some(line => line.error)) { showToast('"' + f.name + '" 页码范围有误'); return; }
   }
+  // 「封面单独打印」提交前本地阻断（契约 §6）：重算一遍（用户可能没失焦就点了提交），
+  // 任一行有 error（格式错/超页数/重叠/不在页码范围）即打回；空 = 功能关闭，不算错。
+  for (const f of files) {
+    if (f.excelWarning || f.unsupportedFormat) continue;
+    if (!f.simplexEnabled || simplexDisabledFor(f)) continue;
+    _normalizeAndValidateSimplexLines(f, false);
+    if ((f.simplexLines || []).some(line => line.error)) {
+      showToast('"' + f.name + '" 封面单独打印页码有误');
+      renderFileList();
+      return;
+    }
+  }
   const scheduleErr = validateSchedule();
   if (scheduleErr) { showToast(scheduleErr, 2500); return; }
   doSubmit(false);
@@ -2122,6 +2256,10 @@ function doSubmit(skipPageValidation) {
       page_range: (f.pageCount === 1) ? '' : (range || f.pageRange || ''),
       duplex: (f.isImage || f.pageCount === 1 || f.singlePage) ? 'off' : (f.duplex || 'on'),
       image_orientation: f.isImage ? (f.imageOrientation || 'auto') : 'auto',
+      // 「封面单独打印」：勾选且校验通过才传（空串 = 关闭）；单面/单页时按契约不落该值。
+      // 「排除末尾空白页」：始终 0/1 显式传，旧后端忽略未知键，不影响老客户端。
+      simplex_pages: (f.simplexEnabled && !simplexDisabledFor(f) && f.simplexPages) ? f.simplexPages : '',
+      blank_tail_exclude: f.excludeBlankTail ? 1 : 0,
     };
   });
 
@@ -2346,6 +2484,115 @@ function _rangeInt(s) {
   return Number.isSafeInteger(v) ? v : null;
 }
 
+/* ===== 「封面单独打印」/「排除末尾空白页」计费口径（契约 2026-11-02 第 1、2 节） =====
+
+   三端唯一口径：S = page_range 命中的页集合（空 = 全部页）；X = 解析(simplex_pages) ∩ S。
+   S 按"该页是否属于 X"切成连续段：单面段每页 1 张；双面段 floor(len/2) 张双面 +
+   len%2 张单面收尾。只镜像这一份算式（后端 app.py::_charge_units、
+   本地 local_print_tool/manual_duplex.py::charge_units 逐字同值）。
+
+   解析规则与下面的 countPagesInRange 逐字一致（去空格、`、，；`→`,`、每段 split('-', 1)、
+   区间收窄到 [1,total]、a<b 才成区间、a>b 且 a 长度>1 智能拆分、越界忽略）——
+   ⚠ 两处必须同步改，否则"提交前显示价"与"提交后实收价"会分叉（tests 有 Python 侧对拍）。 */
+
+/* 解析页码串 → Set（不做"空 = 全部页"兜底）。
+   strict=true：任一段非法即整串无效（返回 null）。
+   probe=true：不按 total 收窄，而是按 RANGE_SPAN_CAP 收窄，用来探测"请求了超过总页数的页"。
+   total <= 0（页数未知）时与 countPagesInRange 同口径一律返回空集，绝不放宽成"全份"。 */
+function pageSetFrom(rangeStr, total, strict, probe) {
+  const pages = new Set();
+  const t = Number(total) || 0;
+  const text = String(rangeStr == null ? '' : rangeStr);
+  if (!text.trim()) return pages;
+  const parts = text.replace(/ /g, '').replace(/[、，；]/g, ',').split(',');
+  let bad = false;
+  for (const rawPart of parts) {
+    const part = (rawPart || '').trim();
+    if (!part) continue;
+    const dash = part.indexOf('-');
+    if (dash >= 0) {
+      const a = part.slice(0, dash);
+      const b = part.slice(dash + 1);      // 只切一刀，对齐后端 split('-', 1)
+      const start = _rangeInt(a);
+      const end = _rangeInt(b);
+      if (start === null || end === null) { bad = true; continue; }
+      if (start < end) {
+        const hi = probe ? Math.min(end, start + RANGE_SPAN_CAP - 1) : Math.min(end, t);
+        for (let p = Math.max(1, start); p <= hi; p++) pages.add(p);
+      } else if (start > end && a.trim().length > 1) {
+        // '23-4' → {2,3,4}：'23' 的十位 2 单独成页，个位 3 与 4 连成区间
+        const prefix = _rangeInt(a.trim().slice(0, -1));
+        const last = _rangeInt(a.trim().slice(-1));
+        if (prefix === null || last === null || !(prefix < end)) { bad = true; continue; }
+        const hi = probe ? Math.min(end, last + RANGE_SPAN_CAP - 1) : Math.min(end, t);
+        for (let p = Math.max(last, 1); p <= hi; p++) pages.add(p);
+        if (prefix >= 1 && (probe || prefix <= t)) pages.add(prefix);
+      } else {
+        bad = true;
+      }
+    } else {
+      const n = _rangeInt(part);
+      if (n === null || n < 1 || (!probe && n > t)) { bad = true; continue; }
+      pages.add(n);
+    }
+  }
+  if (strict && bad) return null;
+  return pages;
+}
+
+/* 页码范围 → 页集合 S。空/全非法 → 全部页（与 后端 _selected_page_list 一致）；
+   页数未知（total <= 0）→ 空集（此时任何"全份"推算都是猜的）。 */
+function pageRangeSet(rangeStr, total) {
+  const t = Number(total) || 0;
+  if (t <= 0) return new Set();
+  const pages = pageSetFrom(rangeStr, t, false, false);
+  if (pages && pages.size) return pages;
+  const all = new Set();
+  for (let p = 1; p <= t; p++) all.add(p);
+  return all;
+}
+
+/* 计费单元 → { dupSheets, singleSheets, sheets }
+   纯函数：只吃两个 Set，不读 printState。X 自动与 S 求交（契约 §1 的 X ⊆ S）。 */
+function chargeUnits(pageSet, simplexSet) {
+  const all = (pageSet instanceof Set ? [...pageSet] : [...(pageSet || [])])
+    .filter(p => Number.isFinite(p)).sort((a, b) => a - b);
+  const sxRaw = (simplexSet instanceof Set) ? simplexSet : new Set(simplexSet || []);
+  const sx = new Set(all.filter(p => sxRaw.has(p)));   // X ⊆ S
+  let dupSheets = 0;
+  let singleSheets = 0;
+  let i = 0;
+  while (i < all.length) {
+    const isSx = sx.has(all[i]);
+    let j = i + 1;
+    // 段边界只认"是否属于 X"（与 manual_duplex.split_simplex_runs 一致），不看页号是否连号
+    while (j < all.length && sx.has(all[j]) === isSx) j++;
+    const len = j - i;
+    if (isSx) singleSheets += len;                                  // 单面页：每页 1 张
+    else { dupSheets += Math.floor(len / 2); singleSheets += len % 2; }
+    i = j;
+  }
+  return { dupSheets, singleSheets, sheets: dupSheets + singleSheets };
+}
+
+/* 页集合 → 升序、连续段合并的显示串："1,2,16-23"（空集 → ''）。 */
+function rangePages(pages) {
+  const list = (pages instanceof Set ? [...pages] : [...(pages || [])])
+    .filter(p => Number.isFinite(p)).sort((a, b) => a - b);
+  if (!list.length) return '';
+  const out = [];
+  let start = list[0];
+  let prev = list[0];
+  for (let i = 1; i < list.length; i++) {
+    const p = list[i];
+    if (p === prev + 1) { prev = p; continue; }
+    out.push(start === prev ? String(start) : start + '-' + prev);
+    start = prev = p;
+  }
+  out.push(start === prev ? String(start) : start + '-' + prev);
+  return out.join(',');
+}
+
 /* 有效打印页数：页码范围（如 '1-3,5'）过滤后的页数；空范围返回总页数。
 
    ⚠ 必须与后端 `_count_pages_in_range` / 本地 `_parse_range_parts` **严格同口径**，
@@ -2388,15 +2635,20 @@ function countPagesInRange(pageRange, total) {
   return pages.size || total;
 }
 
-function calcCost(pageCount, copies, duplex, pageRange) {
+function calcCost(pageCount, copies, duplex, pageRange, simplexPages) {
   // 单价取云端 pricing.json 同步值（loadPricing 刷新）；未同步时用与 pricing.json 一致的兜底值
   const simplex = printState.simplexPrice || FALLBACK_SIMPLEX_PRICE;
   const duplexP = printState.duplexPrice || FALLBACK_DUPLEX_PRICE;
   if (!pageCount || pageCount <= 0) return { cost: 0, formula: '?', known: false };
   const effective = countPagesInRange(pageRange, pageCount);   // 有效打印页数（范围过滤后）
   if (duplex === 'on') {
-    const pairs = Math.floor(effective / 2);
-    const remainder = effective % 2;
+    // 契约 §2：S 按"该页是否属于 X"切段 → 双面段 floor(len/2) 张 + len%2 张单面，
+    // X 的页每页 1 张单面。simplexPages 为空 ⇒ X = ∅ ⇒ 退化为老口径 pairs/remainder。
+    const pageSet = pageRangeSet(pageRange, pageCount);        // S（空范围 = 全部页）
+    const simplexSet = simplexPages ? pageSetFrom(simplexPages, pageCount, false, false) : new Set();
+    const units = chargeUnits(pageSet, simplexSet);
+    const pairs = units.dupSheets;
+    const remainder = units.singleSheets;
     let cost, innerFormula;
     if (remainder === 0) { cost = pairs * duplexP; innerFormula = pairs + '张×' + duplexP.toFixed(2); }
     else if (pairs === 0) { cost = remainder * simplex; innerFormula = remainder + '张×' + simplex.toFixed(2); }
@@ -2445,7 +2697,7 @@ function onCopyPrice() {
   let baseTotal = 0;
   let allKnown = true;
   d.files.forEach(f => {
-    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range);
+    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range, f.simplex_pages);
     baseTotal += r.cost;
     if (!r.known) allKnown = false;
   });
@@ -2476,12 +2728,15 @@ function onCopyDetailPrice() {
   let itemNum = 0;
   d.files.forEach(f => {
     itemNum++;
-    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range);
+    const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range, f.simplex_pages);
     const name = f.file_name || '未知文件';
     const duplexLabel = f.duplex === 'on' ? '双面' : '单面';
     const rangeLabel = f.page_range ? f.page_range + '页' : '全部页';
     lines.push(itemNum + '. ' + name);
     lines.push('   ' + f.copies + '份 | ' + duplexLabel + ' | ' + rangeLabel);
+    // 「封面单独打印」的页按单面出纸（契约 §2），明细里如实标出来
+    if (f.simplex_pages) lines.push('   单面页: ' + f.simplex_pages);
+    if (Number(f.blank_tail_exclude) === 1) lines.push('   已排除末尾空白页');
     if (r.cost > 0) { lines.push('   ' + r.formula + '=¥' + r.cost.toFixed(2)); allParts.push(r.cost.toFixed(2)); baseTotal += r.cost; }
     else lines.push('   💰 ?');
   });
@@ -2600,6 +2855,33 @@ function setupPrintButtons() {
     // 拖动结束后的 click 忽略（_dragHandled 由滑块拖动设置）
     const tg = e.target.closest('.duplex-toggle, .img-ori-toggle');
     if (tg && tg._dragHandled && Date.now() - tg._dragHandled < 500) { tg._dragHandled = 0; return; }
+    // 每文件的「排除末尾空白页 / 封面单独打印」开关：独立绑定，直接切布尔。
+    // 刻意**不接入**订单级 data-sw / bindSwitchDrags 的滑动派发链（那套按 id 白名单派发，
+    // 接进来会连带改动订单级开关的行为）。
+    const sw = e.target.closest('[data-file-sw]');
+    if (sw) {
+      const swCard = sw.closest('.file-card');
+      const swIdx = swCard ? Array.prototype.indexOf.call(swCard.parentNode.children, swCard) : -1;
+      const sf = printState.selectedFiles[swIdx];
+      if (!sf) return;
+      if (sw.dataset.fileSw === 'blank-tail') {
+        sf.excludeBlankTail = !sf.excludeBlankTail;          // → 提交体 blank_tail_exclude(0/1)
+      } else if (sw.dataset.fileSw === 'simplex') {
+        if (simplexDisabledFor(sf)) { showToast('单面打印时「封面单独打印」不生效'); return; }
+        sf.simplexEnabled = !sf.simplexEnabled;
+        if (sf.simplexEnabled) {
+          if (!sf.simplexLines || !sf.simplexLines.length) sf.simplexLines = [{ value: '', error: '' }];
+          // 已有合法值 → 先收成摘要行（点摘要再编辑）；否则直接展开空行并聚焦
+          sf.simplexEditing = !sf.simplexPages;
+          sf.simplexFocusLine = sf.simplexEditing ? 0 : -1;
+        } else {
+          sf.simplexEditing = false;
+          sf.simplexFocusLine = -1;
+        }
+      }
+      renderFileList();
+      return;
+    }
     const el = e.target.closest('[data-action]');
     if (!el) return;
     const card = el.closest('.file-card');
@@ -2615,9 +2897,33 @@ function setupPrintButtons() {
     else if (action === 'duplex') setDuplex(idx, el.dataset.value);
     else if (action === 'ori') setOrientation(idx, el.dataset.value);
     else if (action === 'open-range') openRangePicker(idx);
+    else if (action === 'edit-simplex') {
+      // 摘要行 → 展开多行输入（与「页码范围」的 open-range 同构，但没有网格选择器）
+      if (!f || simplexDisabledFor(f)) return;
+      f.simplexEditing = true;
+      f.simplexFocusLine = 0;
+      renderFileList();
+    }
   });
   list.addEventListener('input', (e) => {
     const t = e.target;
+    if (t.dataset.action === 'simplex-line') {
+      const sCard = t.closest('.file-card');
+      const sIdx = sCard ? Array.prototype.indexOf.call(sCard.parentNode.children, sCard) : -1;
+      const sLine = parseInt(t.dataset.line, 10);
+      const sf = printState.selectedFiles[sIdx];
+      if (!sf || !sf.simplexLines || !sf.simplexLines[sLine]) return;
+      sf.simplexLines[sLine].value = t.value;
+      sf.simplexLines[sLine].error = '';
+      // 填完自动多一行（与「页码范围」同一交互）
+      if (sLine === sf.simplexLines.length - 1 && t.value.trim()) {
+        sf.simplexLines.push({ value: '', error: '' });
+      }
+      sf.simplexEditing = true;
+      sf.simplexFocusLine = sLine;
+      renderFileList();
+      return;
+    }
     if (t.dataset.action !== 'range-line') return;
     const card = t.closest('.file-card');
     const idx = card ? Array.prototype.indexOf.call(card.parentNode.children, card) : -1;
@@ -2638,6 +2944,15 @@ function setupPrintButtons() {
       const card = t.closest('.file-card');
       const idx = card ? Array.prototype.indexOf.call(card.parentNode.children, card) : -1;
       setTimeout(() => normalizeAndValidateRangeLines(idx, true), 0);
+    } else if (t.dataset.action === 'simplex-line') {
+      const sCard = t.closest('.file-card');
+      const sIdx = sCard ? Array.prototype.indexOf.call(sCard.parentNode.children, sCard) : -1;
+      setTimeout(() => {
+        const sf = printState.selectedFiles[sIdx];
+        if (!sf || !sf.simplexEnabled) return;
+        _normalizeAndValidateSimplexLines(sf, true);   // collapse=true：合法则收起成摘要行
+        renderFileList();
+      }, 0);
     }
   }, true);
 

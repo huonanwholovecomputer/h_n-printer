@@ -3,6 +3,14 @@ const { CONFIG } = require('../../utils/config')
 const { request, createPollScheduler } = require('../../utils/request')
 // 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
 const { countPagesInRange } = require('../../utils/pages')
+
+/* 双面摊纸的兜底张数（契约 §2「单面页每页一张 + 其余两页一张」）：实现在 utils/order_stats，
+   但它内部仍只用 utils/pages 的 pageRangeSet/chargeUnits（同一份口径，见该文件顶部说明）。
+   这里**延迟 require**：页面加载路径（复制价格/气泡定位等）用不到它，不必进首屏依赖。 */
+function _fallbackSheets(f, eff) {
+  const { fallbackSheets } = require('../../utils/order_stats')
+  return fallbackSheets(f, eff)
+}
 // 头像裁剪的纯几何（fit/clamp/cropRect/zoomAt）：与 APP 的 www/avatar_crop.js 同一语义
 const avatarCrop = require('../../utils/avatar_crop')
 
@@ -30,7 +38,8 @@ function _enrichFileStat(f) {
   const pc = Number(f.page_count) || 0
   const copies = Number(f.copies) || 1
   const eff = typeof f.effective_pages === 'number' ? f.effective_pages : countPagesInRange(f.page_range, pc)
-  const perSheets = typeof f.sheets === 'number' ? f.sheets : (f.duplex === 'off' ? eff : Math.ceil(eff / 2))
+  // 张数：优先后端 sheets；缺失时同口径兜底（单面每页 1 张，双面按摊纸算）
+  const perSheets = typeof f.sheets === 'number' ? f.sheets : _fallbackSheets(f, eff)
   f.effectivePages = eff
   f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies)
   f.pagesLine = copies + ' 份 × ' + eff + ' 页'
@@ -2972,8 +2981,13 @@ Component({
         const duplexLabel = f.duplex === 'on' ? '双面' : '单面'
         const rangeLabel = f.page_range ? ('选 ' + f.page_range + ' 页') : '全部页'
         const pagesText = f.pagesLine || ((Number(f.copies) || 1) + ' 份')
+        // 契约：单面页 / 已排除末尾空白页进复制明细（字段空则不出现）
+        const extraLabels = []
+        if ((f.simplex_pages || '').trim()) extraLabels.push('单面页 ' + f.simplex_pages)
+        if (Number(f.blank_tail_exclude) || 0) extraLabels.push('已排除末尾空白页')
+        const extraText = extraLabels.length ? (' | ' + extraLabels.join(' | ')) : ''
         lines.push(itemNo + '. ' + (f.original_name || f.file_name || '未知文件'))
-        lines.push('   ' + pagesText + ' | ' + duplexLabel + ' | ' + rangeLabel + ' | ¥' + amount.toFixed(2))
+        lines.push('   ' + pagesText + ' | ' + duplexLabel + ' | ' + rangeLabel + extraText + ' | ¥' + amount.toFixed(2))
         if (amount > 0) parts.push(amount.toFixed(2))
       })
       const urgencyFee = Number(o.urgency_price) || 0

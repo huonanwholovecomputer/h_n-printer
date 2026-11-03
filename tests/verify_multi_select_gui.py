@@ -213,8 +213,27 @@ check("存在「添加到新标签页」菜单项与复制实现",
 check("「打开文件位置」真的定位到文件（explorer /select，而不是只开目录）",
       'explorer /select,' in src and "def _reveal_in_explorer" in src
       and "_reveal_in_explorer(p)" in src)
-check("复制路径没有偷偷调 split_tail_blank（排除只走 _set_blank_tail_excluded）",
-      src.count("split_tail_blank(") == 1)
+# 2026-11-02：云端订单可以在小程序/APP 勾「排除末尾空白页」⇒ 设备端多出第 2 条排除路径
+# （`_add_cloud_task_to_new_tab`），不是"偷偷排除"。这里钉死不变量：排除只发生在
+# 「操作员勾选」与「云端带开关」两个函数里，本地右键复制（`_add_rows_to_new_tab`）绝不掺和。
+_defs = [(m.start(), m.group(1)) for m in re.finditer(r"^    def (\w+)", src, re.M)]
+
+
+def _owner(pos):
+    name = "?"
+    for start, n in _defs:
+        if start < pos:
+            name = n
+        else:
+            break
+    return name
+
+
+_callers = {_owner(m.start()) for m in re.finditer(r"split_tail_blank\(", src)}
+check("复制路径没有偷偷调 split_tail_blank（排除只走「操作员勾选 / 云端带开关」两条路）",
+      "_add_rows_to_new_tab" not in _callers
+      and _callers <= {"_set_blank_tail_excluded", "_add_cloud_task_to_new_tab"},
+      f"实际所在函数={sorted(_callers)}")
 
 # ═══════════════ 1. 表格配置 ═══════════════
 
