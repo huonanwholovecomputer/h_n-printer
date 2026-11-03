@@ -1,9 +1,9 @@
 {
-  "version": "4.8.0",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.8.0.exe",
-  "md5": "48d6a40152e6007b6b9a1980393d67ae",
-  "sha256": "23e56cbe8ca4d671fd505e0d20b9601fed922480933c9a98a852dd499b5ee719",
-  "notes": "v4.8.0：① 新增「选项」菜单（打印速度、打印机双面能力、外部监视、账本、默认任务参数），常用设置不再散在各处；② 新增 xlsx 版式面板——Excel 的列宽/行高/颜色/边框按原样还原，复杂表格不再挤成一团；③ 打印纸张可选 A4/A3/A5/Letter/Legal/B5；④ 标签页显示订单创建时间与打印发起时间；⑤ 结算页：订单搜索高亮、价格可点按复制算式、状态原因悬停可见、去掉冗余的本月结论卡；⑥ 攒批开关随时可点（设备离线或忙也放行，显示「待应用」，上线后自动对齐）。",
+  "version": "4.6.2",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.2.exe",
+  "md5": "b585b26cdb2388112b131a3853176117",
+  "sha256": "0d3ec8e847e9c9e20a5e5184c4572e4ff7f481ec35021c4b79b48ed6597709b7",
+  "notes": "v4.6.2：① 新增「选项」菜单（打印速度、打印机双面能力、外部监视、账本、默认任务参数），常用设置不再散在各处；② 新增 xlsx 版式面板——Excel 的列宽/行高/颜色/边框按原样还原，复杂表格不再挤成一团；③ 打印纸张可选 A4/A3/A5/Letter/Legal/B5；④ 标签页显示订单创建时间与打印发起时间；⑤ 结算页：订单搜索高亮、价格可点按复制算式、状态原因悬停可见、去掉冗余的本月结论卡；⑥ 攒批开关随时可点（设备离线或忙也放行，显示「待应用」，上线后自动对齐）。",
   "sig_algo": "ed25519",
-  "sig": "+um2xLzyMHTjcMHvwAzUbxWOpM72sB7KUOCtpWJCs+Jdmcm7STSYYR8S6TQDGG+y6I5+C0Cbmbjf+q5OGFpHBA=="
+  "sig": "QrGFigLdFgAVTalYUEwfs5v5mmU+ExofksPcIftBvb4pxSU8lWDwq4xxREYxcOP6LSJRmj3THtGhPrN14LBjCw=="
 }
