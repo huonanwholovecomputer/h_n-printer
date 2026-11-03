@@ -1,9 +1,9 @@
 {
-  "version": "4.7.0",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.0.exe",
-  "md5": "a8d805d9553a29892b5d90b3566e6294",
-  "sha256": "2208adab13ef41c82878619537042771ff62a063e3d7cf7b78ddca6c35d2cc22",
-  "notes": "v4.7.0：① 新增「封面单独打印」——同一份文件里只让封面（或指定几页）走单面，其余页照旧双面，不用再为一张封面把文件拆开；费用按张分开算：单面页收单面价、双面页收双面价，预览与实收一致。② 新增「排除末尾空白页」——云端订单自动跳过文件末尾的连续空白页，不再白打空纸，空白页也不收费。③ 攒批出纸更顺——一叠交出去后不必干等出纸，下一单能立刻进队列，前叠还在打时不会被误判成「出纸槽被占」。④ 切换标签页后右侧任务参数不再残留上一页的页码范围/封面页；锁定的标签页只灰显、不回写。⑤ Ctrl+Enter 直接开始打印。",
+  "version": "4.8.0",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.8.0.exe",
+  "md5": "48d6a40152e6007b6b9a1980393d67ae",
+  "sha256": "23e56cbe8ca4d671fd505e0d20b9601fed922480933c9a98a852dd499b5ee719",
+  "notes": "v4.8.0：① 新增「选项」菜单（打印速度、打印机双面能力、外部监视、账本、默认任务参数），常用设置不再散在各处；② 新增 xlsx 版式面板——Excel 的列宽/行高/颜色/边框按原样还原，复杂表格不再挤成一团；③ 打印纸张可选 A4/A3/A5/Letter/Legal/B5；④ 标签页显示订单创建时间与打印发起时间；⑤ 结算页：订单搜索高亮、价格可点按复制算式、状态原因悬停可见、去掉冗余的本月结论卡；⑥ 攒批开关随时可点（设备离线或忙也放行，显示「待应用」，上线后自动对齐）。",
   "sig_algo": "ed25519",
-  "sig": "xGqlw0Jt6X7KI90G2duauqiI1lbOyg2sHLCwhPCEaHIsqiI3/8T1Vlwm2vQ6i4Ira3EuIiQ8R1tA1aqg1O7bBg=="
+  "sig": "+um2xLzyMHTjcMHvwAzUbxWOpM72sB7KUOCtpWJCs+Jdmcm7STSYYR8S6TQDGG+y6I5+C0Cbmbjf+q5OGFpHBA=="
 }
