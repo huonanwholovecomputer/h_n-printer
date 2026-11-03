@@ -65,26 +65,29 @@
               <!-- 需人工翻纸 + 攒批状态合成**一个**胶囊（2026-10-27 用户要求：接单设备条高度不一致，
                    必须缩到一行）。旧写法「🖐 需人工翻纸」+「攒批未开」+「开启攒批」+「在线」四个块
                    在 375px 上放不下 ⇒ flex-wrap 换行，列表里每条高度都不一样（有的两行有的三行）。
-                   判据不变：攒批只对「无自动双面器」的机型渲染（auto_duplex === false，三端同一条），
-                   stack_mode 三态：true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=从未上报
-                   → 只显示「需人工翻纸」。三个胶囊互斥出现，行内宽度因此恒定。 -->
+                   判据不变：攒批只对「无自动双面器」的机型渲染（auto_duplex === false，三端同一条）。
+                   2026-11 需求 2：三态改读 stack_view（后端 stack_desired，缺字段回退 stack_mode，
+                   由 index.js 的 _normalizeDeviceStack 归一）：
+                     true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null=从未上报 → 「需人工翻纸」。
+                   胶囊显示的是**期望值** —— 与设备真实状态不一致时旁边挂「⏳ 待应用」。 -->
               <block wx:if="{{item.auto_duplex === false}}">
-                <text wx:if="{{item.stack_mode === true}}" class="device-state device-state-stack">🖐 攒批中</text>
-                <text wx:elif="{{item.stack_mode === false}}" class="device-state device-state-stack-off">🖐 攒批未开</text>
+                <text wx:if="{{item.stack_view === true}}" class="device-state device-state-stack">🖐 攒批中</text>
+                <text wx:elif="{{item.stack_view === false}}" class="device-state device-state-stack-off">🖐 攒批未开</text>
                 <text wx:else class="device-state device-state-manual">🖐 需人工翻纸</text>
-                <!-- 离线设备也能调攒批：云端先把目标状态记下来（stack_pending）→ 行内「待应用」，
-                     设备上线后先对齐攒批状态（服务端把 stack_mode 改成与云端指定一致） -->
+                <!-- 离线/设备忙都能改攒批：云端记下目标状态（stack_pending）→ 行内「⏳ 待应用」，
+                     设备 stack_state 回报并对齐后由服务端清掉（期间一直显示，直到确认） -->
                 <text wx:if="{{item.stack_pending}}" class="device-pending-badge">⏳ 待应用</text>
-                <!-- 远程开关：仅管理员/超管渲染（普通用户看不到可点控件，也不留空壳）；
-                     离线设备**不再灰死**（可点，服务端返回 pending）；只有服务端判「当前不可切换」
-                     （在线忙：正在打印/等翻纸/有排队）时才灰显禁用，点击只弹提示（catchtap 防冒泡选中设备） -->
+                <!-- 远程开关：仅管理员/超管渲染（普通用户看不到可点控件，也不留空壳）。
+                     2026-11 需求 2：**在线忙也不再灰死**（允许随时切换，服务端记账后在设备空闲时下发）；
+                     只有本机请求在飞行中时灰显（同 stackTogglingId 防重复点击）。
+                     按钮文案读期望值：期望已开 → 「关闭攒批」，否则「开启攒批」 -->
                 <view
                   wx:if="{{userRole === 'admin' || userRole === 'super_admin'}}"
-                  class="device-stack-btn {{((item.stack_can_toggle === false && item.online !== false) || stackTogglingId === item.client_id) ? 'device-stack-btn-disabled' : ''}}"
-                  hover-class="{{((item.stack_can_toggle === false && item.online !== false) || stackTogglingId === item.client_id) ? 'none' : 'device-hover'}}"
+                  class="device-stack-btn {{stackTogglingId === item.client_id ? 'device-stack-btn-disabled' : ''}}"
+                  hover-class="{{stackTogglingId === item.client_id ? 'none' : 'device-hover'}}"
                   catchtap="onToggleStackMode"
                   data-index="{{index}}"
-                >{{item.stack_mode === true ? '关闭攒批' : '开启攒批'}}</view>
+                >{{item.stack_view === true ? '关闭攒批' : '开启攒批'}}</view>
               </block>
               <text class="device-state {{item.online ? 'device-state-on' : 'device-state-off'}}">{{item.online ? '在线' : '离线'}}</text>
             </view>

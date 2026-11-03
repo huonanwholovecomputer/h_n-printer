@@ -603,6 +603,16 @@ button {
 
 /* BUG2: 头像 <img> 裁剪（对齐小程序 image mode="aspectFill"） */
 .avatar { object-fit: cover; }
+
+/* ⚠ 2026-11（用户需求 1·2·3·9）新增的 APP 专属样式**不在**上面这段里，而是直接写进了
+   www/styles.css 对应规则之后。重跑本脚本（--force）会把它们抹掉，必须手工贴回：
+     · .device-pending-badge（「⏳ 待应用」角标）
+     · .device-order-sheet / .myfiles-sheet 加宽（79.2cqw + max-width:92cqw）
+     · .myfiles-list / .myfile-row 整行宽 + border-box（修文字出界）
+     · 「最近订单」整段：#view-recent-orders 汇总行 / 分页 / .ro-row 三行卡 / 空态
+     · .status-reason-tap 虚线可点 + .status-pop-mask/.status-pop 异常原因气泡
+     · .status-timeout 琥珀色（浅色 + 深色两套）
+   查法：git diff www/styles.css | grep 2026-11 （重跑前先存这份 diff 备用）。
 `;
 
 let all = WEB_BASE;

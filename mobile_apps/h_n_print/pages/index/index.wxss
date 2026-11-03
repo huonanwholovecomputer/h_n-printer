@@ -282,7 +282,13 @@
   border: 1rpx solid rgba(230, 126, 34, 0.45);
   border-radius: 8rpx;
 }
+/* 加宽（2026-11 需求 1）：默认 .modal-sheet 540rpx 里「设备名 + 在线/离线 + 置顶 + ↑↓」
+   挤在一行，设备名被压到只剩几个字。这里只加宽本弹窗，上限 calc(100vw - 48rpx)，
+   窄屏不贴边、圆角居中不变。 */
 .device-order-sheet {
+  width: 660rpx;
+  max-width: calc(100vw - 48rpx);
+  box-sizing: border-box;
   max-height: 76vh;
 }
 .device-order-hint {

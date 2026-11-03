@@ -200,7 +200,12 @@
           <view class="order-card-main">
             <text class="order-filename">{{item.order_number || ('#' + item.id)}}</text>
             <text class="order-source-tag {{item.source === 'local' ? 'tag-local' : 'tag-cloud'}}">{{item.source === 'local' ? '🖨 本地' : '☁ 云端'}}</text>
-            <text class="order-status status-{{item.status}} {{item.isExcel && item.status === 'sent' ? 'status-delivered' : ''}}">{{item.isExcel && item.status === 'sent' ? '已送达' : (statusMap[item.status] || item.status)}}</text>
+            <!-- #9：异常终态（failed/timeout/canceled/rejected/abandoned）的状态文字可点，
+                 弹出原因气泡；不可点时不绑事件（catchtap 防冒泡到卡片把详情收起） -->
+            <text wx:if="{{item.statusReasonTappable}}"
+                  class="order-status status-{{item.status}} status-reason-tap"
+                  id="status-tap-{{item.id}}" data-id="{{item.id}}" catchtap="onStatusReasonTap">{{statusMap[item.status] || item.status}}</text>
+            <text wx:else class="order-status status-{{item.status}} {{item.isExcel && item.status === 'sent' ? 'status-delivered' : ''}}">{{item.isExcel && item.status === 'sent' ? '已送达' : (statusMap[item.status] || item.status)}}</text>
             <text wx:if="{{item.is_admin_print}}" class="order-self-print-badge">👤自打</text>
           </view>
           <text class="order-number-label">{{item.file_summary || item.file}}</text>
@@ -520,20 +525,19 @@
       </view>
     </view>
 
-    <!-- 管理员：近 N 条订单（云端对所有管理员公开最近 N 条；N 由超管设置，默认 10，取接口 limit）
-         数据：GET /api/admin/recent_orders —— 进入页面拉一次，不轮询；失败静默保留上次数据 -->
-    <!-- 渲染条件：管理员且有数据；超管额外「没数据也显示」—— 否则一条订单都没有时，
-         连 ⚙ 设置（改 N）的入口都点不到。 -->
-    <view class="recent-orders-section admin-collapsible {{userRole === 'admin' && (recentOrders.length > 0 || isSuperAdmin) ? 'admin-expanded' : ''}}">
+    <!-- 管理员：最近订单（#3：从「我」页内嵌列表改成独立卡片 → 点进 pages/recent-orders 独立页）。
+         入口位置与加载逻辑保留：本页仍拉一次 /api/admin/recent_orders，只为了显示条数与 N；
+         真正的分页列表在独立页（page / per_page 10/20/50/100、总数、上一页/下一页/页码）。
+         N 由超管设置（默认 10），页面只显示后端返回的 limit；非管理员不渲染、不发请求。 -->
+    <view class="recent-orders-section admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}">
       <view class="section-title">
         <view class="section-bar"></view>
         <text>近 {{recentOrdersLimit}} 条订单</text>
-        <text class="order-count">{{recentOrders.length}}</text>
+        <text wx:if="{{recentOrders.length > 0}}" class="order-count">{{recentOrders.length}}</text>
         <!-- 超管专属入口：只有超管能改 N（写接口 POST /api/admin/recent_orders_limit 仅 super_admin）。
              判据用 isSuperAdmin —— 后端 compute_role() 把超管折叠成 admin，userRole === 'super_admin' 永不命中 -->
         <text wx:if="{{isSuperAdmin}}" class="recent-orders-limit-btn" catchtap="onEditRecentOrdersLimit"
               hover-class="tap-active">{{recentLimitEditor ? '收起' : '⚙ 设置'}}</text>
-        <text class="recent-orders-refresh" catchtap="onRefreshRecentOrders" hover-class="tap-active">{{recentOrdersLoading ? '刷新中…' : '刷新'}}</text>
       </view>
       <!-- 超管专属：N 编辑器（1..100，步进 + 数字输入），保存即 POST，成功后标题与列表立刻按新 N 刷新 -->
       <view wx:if="{{isSuperAdmin && recentLimitEditor}}" class="recent-limit-editor">
@@ -549,27 +553,14 @@
               catchtap="onSaveRecentOrdersLimit" hover-class="tap-active">{{recentLimitSaving ? '保存中…' : '保存'}}</text>
         <text class="recent-limit-cancel" catchtap="onCancelRecentOrdersLimit" hover-class="tap-active">取消</text>
       </view>
-      <view class="recent-orders-card">
-        <view wx:if="{{recentOrders.length === 0}}" class="recent-orders-empty">{{recentOrdersLoading ? '加载中…' : '暂无订单记录'}}</view>
-        <view wx:for="{{recentOrders}}" wx:key="order_id" class="recent-order-row">
-          <view class="recent-order-line">
-            <text class="order-number-label recent-order-number">{{item.order_number || ('#' + item.order_id)}}</text>
-            <text class="order-status status-{{item.status}}">{{item.statusText}}</text>
-            <text wx:if="{{item.is_admin_print}}" class="order-self-print-badge">👤自打</text>
-            <text class="recent-order-time">{{item.created_at}}</text>
-          </view>
-          <view class="recent-order-line">
-            <!-- 归属人：默认脱敏，点一下看完整昵称（catchtap 防冒泡） -->
-            <text class="recent-order-owner" data-owner="{{item.owner}}" catchtap="onRecentOrderOwnerTap">{{item.ownerText}}</text>
-            <text class="recent-order-stat">{{item.statText}}</text>
-            <!-- 金额：复用订单详情同款「复制价格」气泡（catchtap 防冒泡） -->
-            <view class="detail-price-tap recent-order-price" id="price-tap-r-{{item.order_id}}" data-id="r-{{item.order_id}}"
-                  catchtap="onPriceTap" hover-class="price-tap-hover" hover-start-time="0" hover-stay-time="100">
-              <text class="recent-order-amount">¥{{item.priceDisplay}}</text>
-              <text class="price-copy-icon">📋</text>
-            </view>
-          </view>
+      <view class="recent-orders-entry" catchtap="onOpenRecentOrders" hover-class="tap-active"
+            hover-start-time="0" hover-stay-time="100">
+        <text class="recent-orders-entry-icon">🧾</text>
+        <view class="recent-orders-entry-main">
+          <text class="recent-orders-entry-title">查看最近订单</text>
+          <text class="recent-orders-entry-desc">全部管理员的最近 {{recentOrdersLimit}} 条，支持分页翻看</text>
         </view>
+        <text class="recent-orders-entry-arrow">›</text>
       </view>
     </view>
 
@@ -721,6 +712,31 @@
     </view>
   </view>
 
+  <!-- 异常状态原因 Popconfirm（#9）：与价格气泡同一套定位 —— 在 page-root 外 + position:fixed，
+       否则会被订单卡片 .order-card-detail 的 overflow:hidden / max-height 裁掉，
+       也会被 .scroll-content 的 translateY 变换层带偏。按钮：复制 / 关闭。 -->
+  <view wx:if="{{showStatusPop}}" class="price-pop-mask {{isDarkMode ? 'theme-dark' : ''}}"
+        catchtap="onCloseStatusPop" catchtouchmove="noop">
+    <view class="price-pop status-pop {{statusPopBelow ? 'price-pop-below' : 'price-pop-above'}}"
+          style="left: {{statusPopLeft}}px; width: {{statusPopWidth}}px; {{statusPopBelow ? 'top:' + statusPopTop + 'px;' : 'bottom:' + statusPopBottom + 'px;'}}"
+          catchtap="noop">
+      <view class="price-pop-caret" style="left: {{statusPopCaretLeft}}px;"></view>
+      <view class="price-pop-head">
+        <text class="price-pop-icon">⚠️</text>
+        <text class="price-pop-title">异常原因</text>
+      </view>
+      <scroll-view scroll-y class="status-pop-text-wrap">
+        <text class="status-pop-text">{{statusPopText}}</text>
+      </scroll-view>
+      <view class="price-pop-acts">
+        <view class="price-pop-btn primary" catchtap="onCopyStatusReason"
+              hover-class="price-pop-btn-hover" hover-stay-time="80">复制</view>
+        <view class="price-pop-btn" catchtap="onCloseStatusPop"
+              hover-class="price-pop-btn-hover" hover-stay-time="80">关闭</view>
+      </view>
+    </view>
+  </view>
+
   <!-- S2-08（D-7）：我的文件（查看保留期 + 删除；在 page-root 外，不参与「我」页布局顺序） -->
   <view wx:if="{{showMyFiles}}" class="modal-mask {{myFilesClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCloseMyFiles">
     <view class="modal-sheet myfiles-sheet" catchtap="noop">
@@ -748,7 +764,6 @@
       </view>
     </view>
   </view>
-\n
 
 
   <!-- 头像裁剪（2026-10-27 用户要求）：选图/取微信头像之后先裁剪再上传。

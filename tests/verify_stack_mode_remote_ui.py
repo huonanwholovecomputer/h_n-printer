@@ -108,7 +108,8 @@ def obj_after(text, marker):
 # ==================== 判据（全部以「源码文本」为输入，便于变异自证） ====================
 
 def has_stack_fields(src):
-    return all(k in src for k in ("stack_mode", "stack_can_toggle", "stack_reason"))
+    """2026-11 需求 2：期望值口径改为 stack_desired + stack_pending（stack_mode 仅作回退）。"""
+    return all(k in src for k in ("stack_mode", "stack_desired", "stack_pending"))
 
 
 def has_endpoint(src):
@@ -198,12 +199,12 @@ app_badge = fn_body(app_js, "function stackBadgeHtml(d) {")
 # ==================== ① 新增 4 字段的消费 ====================
 print("=== ① 攒批字段（stack_mode / stack_can_toggle / stack_reason）===")
 check("小程序 JS 消费三字段", has_stack_fields(mini_js))
-check("小程序 WXML 消费 stack_mode + stack_can_toggle",
-      "stack_mode" in mini_wxml and "stack_can_toggle" in mini_wxml)
+check("小程序 WXML 消费 stack_view + stack_pending（期望值 + 待应用角标）",
+      "item.stack_view" in mini_wxml and "item.stack_pending" in mini_wxml)
 check("APP app.js 消费三字段", has_stack_fields(app_js))
-check("两端都判定 stack_can_toggle === false（禁用）+ 用 stack_reason 做提示",
-      "stack_can_toggle === false" in mini_js and "stack_reason" in mini_fn
-      and "stack_can_toggle === false" in app_js and "stack_reason" in app_fn)
+check("两端都不再用 stack_can_toggle 在前端拦截（准入判定只留服务端，2026-11 需求 2）",
+      "stack_can_toggle === false" not in mini_fn
+      and "stack_can_toggle === false" not in app_fn)
 check("两端都读取 stack_busy（与服务端状态保持一致）",
       "stack_busy" in mini_apply and "stack_busy" in app_fn)
 
@@ -239,11 +240,12 @@ check("APP 点击入口也有管理员兜底", "if (!isAdminRole()) return;" in 
 print("\n=== ④ 状态徽标（攒批中 / 攒批未开）===")
 check("小程序 WXML 同时有「🖐 攒批中」与「攒批未开」", has_badges(mini_wxml))
 check("APP app.js 同时有「🖐 攒批中」与「攒批未开」", has_badges(app_js))
-check("小程序用三态判定（true → 攒批中 / false → 攒批未开 / null → 不渲染）",
-      "item.stack_mode === true" in mini_wxml and "wx:elif=\"{{item.stack_mode === false}}\"" in mini_wxml)
-check("APP 用三态判定（null 直接返回空串 → 不渲染）",
-      "d.stack_mode === true" in app_badge and "d.stack_mode === false" in app_badge
-      and "return '';" in app_badge)
+check("小程序用三态判定（stack_view：true → 攒批中 / false → 攒批未开 / null → 不渲染）",
+      "item.stack_view === true" in mini_wxml and "wx:elif=\"{{item.stack_view === false}}\"" in mini_wxml)
+check("APP 用三态判定（stackDesiredOf：true → 攒批中 / false → 攒批未开 / null → 需人工翻纸）",
+      "stackDesiredOf(d)" in app_badge
+      and "desired === true" in app_badge and "desired === false" in app_badge
+      and "device-state-manual" in app_badge)
 check("新增独立 class：device-state-stack / device-state-stack-off",
       "device-state-stack" in mini_wxml and "device-state-stack-off" in mini_wxml
       and "device-state-stack" in app_js and "device-state-stack-off" in app_js
@@ -272,8 +274,9 @@ check("小程序按 client_id 复核下标（列表可能已被刷新）",
 check("小程序成功分支调用就地写回（未整表 setData claimingDevices）",
       "this._applyStackMode(" in mini_fn
       and "claimingDevices: devices" not in mini_fn)
-check("APP 更新 claimingDevices 缓存后再 renderDeviceList()",
-      "claimingDevices[i].stack_mode = data.stack_mode === true" in app_fn
+check("APP 更新 claimingDevices 缓存的期望值（stack_view/stack_pending）后再 renderDeviceList()",
+      "claimingDevices[i].stack_view = view;" in app_fn
+      and "claimingDevices[i].stack_pending = pending;" in app_fn
       and "renderDeviceList();" in app_fn)
 check("两端请求中禁用防重复点击",
       "if (this.data.stackTogglingId) return" in mini_fn
@@ -282,9 +285,8 @@ check("两端请求中禁用防重复点击",
 
 # ==================== ⑦ 拦截提示文案 ====================
 print("\n=== ⑦ 前置拦截提示 ===")
-check("两端都只对**在线**设备吃 stack_can_toggle 闸门（离线放行给服务端记 pending）",
-      "device.online !== false && device.stack_can_toggle === false" in mini_fn
-      and "d.online !== false && d.stack_can_toggle === false" in app_fn)
+check("两端都放行离线/繁忙（不再用 online 做前置拦截）",
+      "online !== false && " not in mini_fn and "online !== false && " not in app_fn)
 check("两端都不再有「离线直接拦下」的死分支（2026-11-02 起离线=记录期望）",
       "设备离线，无法远程切换" not in mini_fn
       and "设备离线，无法远程切换" not in app_fn)
@@ -295,8 +297,9 @@ check("两端都有「待应用」pending 角标",
 check("两端按钮文案都有「开启攒批」与「关闭攒批」",
       "开启攒批" in mini_wxml and "关闭攒批" in mini_wxml
       and "开启攒批" in app_btn and "关闭攒批" in app_btn)
-check("繁忙/不可切换时把服务端 stack_reason 原样弹出（两端同口径）",
-      "device.stack_reason || " in mini_fn and "d.stack_reason || " in app_fn)
+check("两端都回写「待应用」期望值（stack_pending 来自响应，读不到时退回 pending 标记）",
+      "data.stack_pending !== undefined" in mini_apply
+      and "stack_pending = pending" in app_fn)
 check("小程序长拦截文案不被 toast 两行截断（>18 字走 wx.showModal 全文显示）",
       "_showStackTip(" in mini_fn and "msg.length > 18" in mini_tip
       and "wx.showModal(" in mini_tip and "showCancel: false" in mini_tip
@@ -329,9 +332,9 @@ print("\n=== ⑨ 变异自证：抹掉关键标记 → 同一条判据必须转�
 check("[变异自证] ① 端点判据：抹掉 /api/printer/stack_mode → 假",
       not has_endpoint(blank(mini_js, "/api/printer/stack_mode"))
       and not has_endpoint(blank(app_js, "/api/printer/stack_mode")))
-check("[变异自证] ② 字段判据：抹掉 stack_can_toggle → 假",
-      not has_stack_fields(blank(mini_js, "stack_can_toggle"))
-      and not has_stack_fields(blank(app_js, "stack_can_toggle")))
+check("[变异自证] ② 字段判据：抹掉 stack_desired → 假",
+      not has_stack_fields(blank(mini_js, "stack_desired"))
+      and not has_stack_fields(blank(app_js, "stack_desired")))
 check("[变异自证] ③ 角色判据：抹掉 super_admin → 假",
       not has_admin_role(blank(mini_js, "super_admin"))
       and not has_admin_role(blank(app_js, "super_admin")))

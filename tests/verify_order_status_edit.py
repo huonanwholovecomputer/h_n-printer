@@ -131,17 +131,21 @@ chk("点状态标签 stopPropagation（否则会同时展开文件明细）",
 # A4 写路径
 chk("提交打到 /api/proxy/admin/order_status（POST）",
     re.search(r"fetch\('/api/proxy/admin/order_status', \{\s*\n\s*method: 'POST'", html) is not None)
+# v7.15：body 多了可选 `by`（标记人，写 orders.manual_status_by/manual_status_at，
+# 供状态标签 tooltip 显示「谁在什么时候标的」）。判据意图不变：order_id 必须是字符串化的
+# 规范十进制 id，status 必须随 body 提交；`by` 是附加字段，允许存在也允许缺省。
 chk("提交带 order_id 与 status",
-    re.search(r"body: JSON\.stringify\(\{ order_id: String\(oid\), status: status \}\)", html) is not None)
+    re.search(r"body: JSON\.stringify\(\{ order_id: String\(oid\), status: status(?:, by: by)? \}\)", html) is not None)
 chk("失败不落地（success 校验失败即 return，不改本地状态）",
     re.search(r"if \(!\(res && res\.success\)\) \{ toast\('❌ '[\s\S]{0,200}?return; \}[\s\S]{0,900}?o\.status = status;", html) is not None)
 chk("本地落地同时改文件级状态（金额/收益/KPI 都由文件状态现算）",
     re.search(r"o\.status = status;\s*\n\s*\(o\.files \|\| \[\]\)\.forEach\(function \(f\) \{ f\.status = status; \}\);", html) is not None)
 # v7.5：`o.status = status;` 与 `renderCloud()` 之间多了「用量缓存失效」一行（共同出资机的折旧
-# 只统计 sent 子任务，状态订正会改变本月用纸量）⇒ 距离上限从 300 放宽到 600 字符，
-# 判据意图不变：落地后必须整页重绘。
+# 只统计 sent 子任务，状态订正会改变本月用纸量）⇒ 距离上限从 300 放宽到 600 字符。
+# v7.15：又多了「标记人/标记时间落地」一段（manual_status_by / manual_status_at，含 files 回写），
+# 再放宽到 1200 字符。判据意图不变：落地后必须整页重绘。
 chk("落地后重绘整页（renderCloud）→ KPI/图表/明细按新状态重算",
-    re.search(r"o\.status = status;[\s\S]{0,600}?renderCloud\(\);", html) is not None)
+    re.search(r"o\.status = status;[\s\S]{0,1200}?renderCloud\(\);", html) is not None)
 chk("防重复提交（_orderStatusSaving 闸门）",
     "_orderStatusSaving" in html and re.search(r"if \(_orderStatusSaving\) \{ toast", html) is not None)
 chk("重绘订单区块会收起菜单（菜单挂 body，不随区块替换）",

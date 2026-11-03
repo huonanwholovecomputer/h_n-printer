@@ -983,12 +983,17 @@ function initScrollEngines() {
     ['authorized', 'scroller-authorized', 'scrollContentAuthorized'],
     ['bind', 'scroller-bind', 'scrollContentBind'],
     ['userOrders', 'scroller-user-orders', 'scrollContentUserOrders'],
+    ['recentOrders', 'scroller-recent-orders', 'scrollContentRecentOrders'],
   ];
   overlayScrollers.forEach(([key, scId, ctId]) => {
     const sc = document.getElementById(scId);
     const ct = document.getElementById(ctId);
     if (sc && ct && !scrollEngines[key]) {
       const opts = {};
+      if (key === 'recentOrders') {
+        // 滚动即收起每页条数下拉（fixed 下拉的定位是按下拉打开那一刻算的，滚动后必然错位）
+        opts.onScroll = () => { if (typeof closeRoPageSizePicker === 'function') closeRoPageSizePicker(); };
+      }
       if (key === 'userOrders') {
         // 滚动即收起每页条数下拉（对齐"我的打印任务"的 closePageSizePicker，避免 fixed 下拉错位）
         opts.onScroll = () => { if (typeof closeUoPageSizePicker === 'function') closeUoPageSizePicker(); };
@@ -1032,6 +1037,8 @@ function switchTab(tab) {
   if (typeof closePageSizePicker === 'function') closePageSizePicker();
   // 「合计价格复制」气泡同理（tab 栏 z-index 高于气泡遮罩，不关会跟到另一页）
   if (typeof closePricePop === 'function') closePricePop();
+  if (typeof closeStatusReasonPop === 'function') closeStatusReasonPop();
+  if (typeof closeRoPageSizePickerIfOpen === 'function') closeRoPageSizePickerIfOpen();
 
   // tab 栏立即更新选中态 + 点击图标弹跳
   document.querySelectorAll('.tab-item').forEach(t => {
@@ -1195,6 +1202,15 @@ window.hnHandleBack = function () {
     return true;
   }
   if (typeof closePageSizePicker === 'function') closePageSizePicker();
+  // 价格气泡 / 异常原因气泡是自绘的 fixed 层（不是 .modal-mask），返回键要先收掉它们
+  if (document.querySelector('.status-pop-mask')) {
+    if (typeof closeStatusReasonPop === 'function') closeStatusReasonPop();
+    return true;
+  }
+  if (document.querySelector('.price-pop-mask')) {
+    if (typeof closePricePop === 'function') closePricePop();
+    return true;
+  }
   const subVisible = [...document.querySelectorAll('.view')].some(v => v.style.display !== 'none');
   if (subVisible) {
     hideView();
@@ -1389,6 +1405,7 @@ const ORDER_STATUS_MAP = {
   offline_unknown: '断线未知',
   sent: '已完成',
   failed: '失败',
+  timeout: '超时',
   abandoned: '放弃打印',
   rejected: '被打回',
   canceled: '已取消',
@@ -1485,7 +1502,7 @@ async function loadClaimingDevices() {
   try {
     const r = await api('/api/claiming_devices');
     const devices = (r.data && r.data.success && r.data.devices) ? r.data.devices : [];
-    claimingDevices = devices;
+    claimingDevices = devices.map(normalizeDeviceStack);
     const pinFirst = devices.find(d => d.pin === true && d.pin_index === 0) ||
                      devices.find(d => d.pin === true) || null;
     const onlineOne = devices.find(d => d.online);
@@ -1504,6 +1521,34 @@ async function loadClaimingDevices() {
     /* 静默失败，保留上次列表 */
     return false;  // S1-09：失败 → 轮询退避
   }
+}
+
+// 攒批三态的归一（2026-11 需求 2，与小程序 index.js 的 _normalizeDeviceStack 同一份口径）：
+//   stack_view    = 期望值 true/false/null（null=从未上报 → 「需人工翻纸」）
+//                   ← 后端 C4 的 stack_desired；缺字段（旧后端）时回退 stack_mode
+//   stack_pending = 后端 C4 的 stack_pending（期望值已记下、设备还没对齐）
+// 只影响渲染与按钮文案，不代表设备真实状态。
+function normalizeDeviceStack(d) {
+  if (!d || !d.client_id) return d;
+  let view;
+  if (d.stack_desired === true || d.stack_desired === false) view = d.stack_desired;
+  else if (d.stack_mode === true || d.stack_mode === false) view = d.stack_mode;
+  else view = null;
+  return Object.assign({}, d, {
+    stack_view: view,
+    stack_pending: d.stack_pending === true,
+  });
+}
+
+// 攒批开关的目标态：已开 → 点它就是关；未开/从未上报 → 点它是开。
+// 用期望值（stack_view）而不是设备实际状态（stack_mode）：离线连续点两次时，
+// 第二次必须基于第一次记下的期望值取反，否则会连发两个相同的 enable。
+function stackDesiredOf(d) {
+  if (!d) return null;
+  if (d.stack_view === true || d.stack_view === false) return d.stack_view;
+  // 没走 normalizeDeviceStack 的原样对象（服务端回包 / 旧缓存）也认 stack_desired
+  if (d.stack_desired === true || d.stack_desired === false) return d.stack_desired;
+  return (d.stack_mode === true) ? true : (d.stack_mode === false ? false : null);
 }
 
 function renderDeviceList() {
@@ -1531,23 +1576,26 @@ function renderDeviceList() {
   ).join('');
 }
 
-// 攒批模式状态徽标（stack_mode 三态）：true=攒批中（醒目）/ false=攒批未开（弱化灰）/
-// null（该设备从未上报，状态未知）→ 只显示「🖐 需人工翻纸」。
+// 攒批模式状态徽标（三态，2026-11 需求 2 改读**期望值** stack_view）：
+// true=攒批中（醒目）/ false=攒批未开（弱化灰）/ null（该设备从未上报，状态未知）→「🖐 需人工翻纸」。
 // ⚠ 攒批只对「需人工翻纸」的机型（auto_duplex === false）渲染 —— 自动双面的机器一次成型，
 // 多任务合并翻纸纯属多余；能力未确认的也不给入口（2026-10 用户要求，三端同一条判据）。
 // ⚠ 这三个胶囊**互斥**（2026-10-27 用户要求：设备条必须只占一行、高度一致）：旧写法「需人工翻纸」
 //   与「攒批未开」同时出现，加上「开启攒批」按钮和「在线」，375px 一行放不下 ⇒ 换行 ⇒ 高度参差。
+//   现在多了「⏳ 待应用」角标，靠 .device-item 的 flex-wrap:nowrap + .device-label 省略号保持单行。
 //
-// 2026-11（需求：离线设备也能调攒批）：设备离线时服务端不再拒绝，而是返回 pending —— 攒批的
-// 目标状态已记在服务端，等设备上线自动应用。此时徽标换成一个**更短**的「🖐 待应用」（不是把
-// 「·待应用」拼在「攒批未开」后面：那样这一行在 375px 上会换行，破坏上面那条单行约束）。
+// 2026-11（需求 2）：徽标显示**目标状态**（stack_desired / 归一后的 stack_view），旁边挂
+// 「⏳ 待应用」直到设备 stack_state 回报对齐（服务端清 stack_pending）。这样离线改完能看出
+// 「改成了什么、还没生效」，而不是只有一句「待应用」。
 function stackBadgeHtml(d) {
   if (!d || d.auto_duplex !== false) return '';
-  // 离线期间下的指令还没落到设备上：栈里排队的是 pending 目标状态，显示「待应用」
-  if (d.stack_pending === true) return '<text class="device-state device-state-stack-pending">🖐 待应用</text>';
-  if (d.stack_mode === true) return '<text class="device-state device-state-stack">🖐 攒批中</text>';
-  if (d.stack_mode === false) return '<text class="device-state device-state-stack-off">🖐 攒批未开</text>';
-  return '<text class="device-state device-state-manual">🖐 需人工翻纸</text>';
+  const desired = stackDesiredOf(d);
+  let html;
+  if (desired === true) html = '<text class="device-state device-state-stack">🖐 攒批中</text>';
+  else if (desired === false) html = '<text class="device-state device-state-stack-off">🖐 攒批未开</text>';
+  else html = '<text class="device-state device-state-manual">🖐 需人工翻纸</text>';
+  if (d.stack_pending === true) html += '<text class="device-pending-badge">⏳ 待应用</text>';
+  return html;
 }
 
 // 管理员/超管判定（攒批模式远程开关只对他们渲染）
@@ -1556,25 +1604,24 @@ function isAdminRole() {
 }
 
 // 攒批模式远程开关：只对**需人工翻纸**的机型渲染，且仅 admin/super_admin（普通用户看不到可点
-// 控件，也不留空壳）；服务端判「当前不可切换」/ 请求中 → 灰显禁用，点击只弹提示不请求。
-// 2026-11（需求：离线设备也能调攒批）：**离线不再置灰** —— 离线时后端照样受理，返回
-// {success:true, pending:true} 把目标状态记下来，设备上线后自动应用（见 toggleStackMode）。
+// 控件，也不留空壳）。
+// 2026-11（需求 2）：**允许随时切换**（在线 / 离线 / 设备忙都放行）—— 旧的
+// `online !== false && stack_can_toggle === false` 置灰已删除；那套准入判定只在服务端，
+// 服务端忙时也照样记账（stack_desired/stack_pending），设备空闲后自动下发。
+// 只有本机请求在飞行中（stackTogglingId）才灰显，防重复点击。
 function stackToggleBtnHtml(d) {
   if (!d || d.auto_duplex !== false) return '';
   if (!isAdminRole()) return '';
-  const disabled = (d.online !== false && d.stack_can_toggle === false) || stackTogglingId === d.client_id;
-  const label = d.stack_mode === true ? '关闭攒批' : '开启攒批';
+  const disabled = stackTogglingId === d.client_id;
+  const label = stackDesiredOf(d) === true ? '关闭攒批' : '开启攒批';
   return `<view class="device-stack-btn${disabled ? ' device-stack-btn-disabled' : ''}" data-id="${esc(d.client_id)}">${label}</view>`;
 }
 
-// 攒批模式（多任务合并翻纸）远程开关：只对「需人工翻纸」的机型（auto_duplex === false）开放；
-// 开启需「当前未开攒批 + 打印机空闲」，关闭需「当前已开攒批 + 打印机空闲」；繁忙（正在打印 /
-// 等人工翻纸打第二趟 / 有排队待打的请求）由服务端判定（stack_can_toggle / stack_reason），
-// 前端只做前置提示 + 请求转发，不复刻这套判定。
+// 攒批模式（多任务合并翻纸）远程开关：只对「需人工翻纸」的机型（auto_duplex === false）开放。
 // 该接口一律 HTTP 200，按 body 的 success 判断（失败时 message 即拦截原因）。
-// 2026-11（需求：离线设备也能调攒批）：离线不再在前端拦下 —— 后端对离线设备返回
-// {success:true, pending:true, message:'设备离线，已记录：上线后自动应用'}，目标状态存在服务端，
-// 设备上线后自动应用。前端据此把该行标记 stack_pending=true（徽标显示「🖐 待应用」）。
+// 2026-11（需求 2）：离线 / 设备忙都能改；后端把目标状态记在 stack_desired 并回 stack_pending=true，
+// 设备 stack_state 回报后自动对齐（对齐成功才清 pending ⇒ 前端一直显示「⏳ 待应用」）。
+// 离线反复切换以**最后一次**为准：enable 由期望值取反 + 请求中不并发。
 async function toggleStackMode(clientId) {
   // 兜底：普通用户/游客即使状态异常也不放行
   if (!isAdminRole()) return;
@@ -1588,10 +1635,7 @@ async function toggleStackMode(clientId) {
     showToast('该设备支持自动双面（或双面能力未确认），不需要攒批模式', 2500);
     return;
   }
-  // 离线不再拦（后端已支持排队）：只有**在线**设备才吃服务端「当前不可切换」这条闸门；
-  // 离线设备哪怕列表里带着旧的 stack_can_toggle=false，也必须放行到请求，由后端记 pending。
-  if (d.online !== false && d.stack_can_toggle === false) { showToast(d.stack_reason || '当前无法切换攒批模式', 2500); return; }
-  const enable = d.stack_mode !== true;
+  const enable = stackDesiredOf(d) !== true;
   stackTogglingId = clientId;
   renderDeviceList();
   try {
@@ -1606,14 +1650,16 @@ async function toggleStackMode(clientId) {
       // 成功后就地更新 claimingDevices 缓存里那一台，再刷新列表（就地更新，不整表重新拉取）
       const i = claimingDevices.findIndex(x => x.client_id === clientId);
       if (i >= 0) {
-        if (data.pending === true) {
-          // 设备离线：指令已入队，等它上线自动应用。**不改 stack_mode**（设备上的实际状态没变），
-          // 只置 stack_pending，让徽标显示「待应用」。
-          claimingDevices[i].stack_pending = true;
-        } else {
-          claimingDevices[i].stack_pending = false;
-          claimingDevices[i].stack_mode = data.stack_mode === true;
-        }
+        const pending = (data.stack_pending !== undefined)
+          ? (data.stack_pending === true)
+          : (data.pending === true);
+        let view;
+        if (data.stack_desired === true || data.stack_desired === false) view = data.stack_desired;
+        else if (pending) view = enable === true;      // 期望值已记下、设备还没对齐
+        else view = data.stack_mode === true;          // 已落到设备上
+        claimingDevices[i].stack_pending = pending;
+        claimingDevices[i].stack_view = view;
+        claimingDevices[i].stack_mode = view;
         claimingDevices[i].stack_busy = !!data.stack_busy;
       }
     }
@@ -1878,6 +1924,7 @@ function initApp() {
   ensureLogin().then(() => refreshSession()).finally(() => {
     if (typeof initPrintPage === 'function') initPrintPage();
     if (typeof initMePage === 'function') initMePage();
+    if (typeof initRecentOrdersView === 'function') initRecentOrdersView();
   });
 }
 

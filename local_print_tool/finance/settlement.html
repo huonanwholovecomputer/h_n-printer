@@ -382,6 +382,29 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .st-menu-item.cur { background: rgba(79,110,247,.10); cursor: default; }
 .st-menu-cur { color: var(--muted); font-size: .7rem; }
 .type-grid .st-edit.can { padding: 0; }
+/* v7.15：订单明细搜索 —— 输入即筛（只筛已加载的订单），命中片段淡黄底纹。
+   底纹必须同时给亮/暗两套：暗色主题下 #fff3b0 当文字底会刺眼，改成半透明暖黄。 */
+.orders-tools { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+.orders-search { display: inline-flex; align-items: center; gap: 6px; background: var(--card-2); border: 1px solid var(--border-strong); border-radius: 9px; padding: 0 8px; }
+.orders-search input { border: none; background: transparent; color: var(--text); font-family: inherit; font-size: .8rem; padding: 6px 0; width: 176px; outline: none; }
+.orders-search .clr { border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: .9rem; padding: 0 2px; line-height: 1; }
+.orders-search .clr:hover { color: var(--text); }
+mark.hit { background: #fff3b0; color: #3b2f00; border-radius: 3px; padding: 0 1px; }
+[data-theme="dark"] mark.hit { background: rgba(255,235,130,.55); color: #fff; }
+/* 订正「标记人」下拉（随订正请求一起提交，后端记进 manual_status_by） */
+.st-by { display: inline-flex; align-items: center; gap: 6px; font-size: .76rem; color: var(--muted); white-space: nowrap; }
+.st-by select { padding: 5px 8px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--card); color: var(--text); font-size: .76rem; max-width: 132px; }
+/* 价格气泡（订单总额 / 明细金额左键点击）：fixed 定位，点外部关闭；层级高于状态菜单（220） */
+#priceMenu { position: fixed; z-index: 230; min-width: 172px; padding: 5px; background: var(--card); border: 1px solid var(--border-strong); border-radius: 11px; box-shadow: 0 12px 30px rgba(0,0,0,.22); }
+#priceMenu .pm-title { font-size: .7rem; color: var(--muted); padding: 4px 8px 6px; line-height: 1.5; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+#priceMenu .pm-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 8px; border: none; background: transparent; border-radius: 8px; cursor: pointer; font-size: .8rem; color: var(--text); text-align: left; font-family: inherit; }
+#priceMenu .pm-item:hover { background: rgba(79,110,247,.14); }
+.price-copy { cursor: pointer; text-decoration: underline dotted rgba(127,127,127,.6); text-underline-offset: 3px; }
+.price-copy:hover { filter: brightness(1.1); }
+/* timeout=超时：琥珀色（与 failed 的红、offline_unknown 的黄区分开） */
+.tag.st-timeout { background: #FFF8E1; color: #B45309; }
+[data-theme="dark"] .tag.st-timeout { background: rgba(245,158,11,.18); color: #FBBF24; }
+.status-dot.timeout { background: #F59E0B; }
 
 /* v24：管理员订单统计 —— 自打/接单比例条 */
 .ratio-bar { display: inline-flex; width: 90px; height: 10px; border-radius: 5px; overflow: hidden; background: rgba(127,127,127,.15); margin-right: 8px; vertical-align: -1px; }
@@ -3211,17 +3234,19 @@ function _refreshCloudChartTheme() {
 var STATUS_LABELS = {
   sent: '已完成', printing: '待添加', queued: '排队中', failed: '失败', canceled: '已取消',
   rejected: '被打回', abandoned: '放弃打印', offline_unknown: '断线未知',
+  /* v7.15：超时（设备长时间没回报结果，需人工核对）—— 只展示与筛选，不进人工订正白名单 */
+  timeout: '超时',
   accepted: '已添加', reserved: '已预留',
   scheduled: '已预约', waiting: '等待打印', downloading: '文件传输中',
   /* S1-09：本地离线库里的单**还没有同步到云端**（synced=0）—— 不能显示成「已完成」，
      否则钱还没进云端账，结算页的「已完成/已入账」就虚增。rejected = 云端业务拒收（4xx）。 */
   unsynced: '⏳ 离线未同步', unsynced_rejected: '⚠️ 云端拒收'
 };
-var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown', scheduled: 'st-scheduled', waiting: 'st-waiting', downloading: 'st-downloading', unsynced: 'st-unsynced', unsynced_rejected: 'st-unsynced-rejected' };
+var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown', timeout: 'st-timeout', scheduled: 'st-scheduled', waiting: 'st-waiting', downloading: 'st-downloading', unsynced: 'st-unsynced', unsynced_rejected: 'st-unsynced-rejected' };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 function statusClass(s) { return STATUS_CLASSES[s] || ''; }
 var CHART_COLORS = {
-  status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', reserved: '#F57F17', scheduled: '#F57F17', waiting: '#00897B', downloading: '#1565C0', unsynced: '#6D4C41', unsynced_rejected: '#AD1457' },
+  status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', timeout: '#F59E0B', reserved: '#F57F17', scheduled: '#F57F17', waiting: '#00897B', downloading: '#1565C0', unsynced: '#6D4C41', unsynced_rejected: '#AD1457' },
   palette: ['#4f6ef7', '#34a853', '#f59e0b', '#8b5cf6', '#d97706', '#16a34a', '#e11d48', '#38bdf8', '#f472b6', '#a855f7', '#14b8a6', '#f97316']
 };
 function _statusColor(s) { return CHART_COLORS.status[s] || '#9ca3af'; }
@@ -3256,20 +3281,26 @@ var _cloudTrendMetric = 'revenue';        // 'revenue' | 'count' | 'pages' | 'fi
 var _cloudStatusFilter = 'all';           // 'all' | 'active' | 'abnormal' | 具体状态
 var _ordersPage = 1, _ordersPerPage = 20; // 订单明细分页（参考小程序/APP 打印任务分页）
 var _ORDERS_PAGE_OPTIONS = [10, 20, 50, 100];
+/* v7.15：订单明细搜索词（文件名 / 备注，大小写不敏感）。只筛「当前已加载」的订单，
+   不触发重新拉数；分页与列表跟着变，KPI / 图表 / 页脚统计仍用 filteredOrders（口径不变）。 */
+var _ordersSearch = '';
 var _cloudCompare = null, _cloudCompareMonth = null, _cloudCompareLoading = false;  // 上月环比（懒加载+缓存，仅自然月口径）
 var _cloudDataFetchedAt = null;           // 最近一次成功同步时间
 var _ddOpen = null;                       // 口径栏多选下拉展开项：'members' | 'sources' | null
 /* 状态分组（v5）：进行中/待处理 / 异常 */
 /* S1-09：⏳ 离线未同步算「待处理」（还等联网补报）；⚠️ 云端拒收算「异常」（要人工重试/核对） */
 var _ACTIVE_STATUS = { queued: 1, printing: 1, accepted: 1, reserved: 1, scheduled: 1, waiting: 1, downloading: 1, unsynced: 1 };
-var _ABNORMAL_STATUS = { failed: 1, rejected: 1, abandoned: 1, offline_unknown: 1, unsynced_rejected: 1 };
+/* v7.15：timeout=超时也归「异常」（设备没回报结果，要人工核对），否则这类单既不算进行中、
+   也不算异常，会在「总数 = 完成+进行中+异常+取消」的恒等式里凭空消失。 */
+var _ABNORMAL_STATUS = { failed: 1, rejected: 1, abandoned: 1, offline_unknown: 1, unsynced_rejected: 1, timeout: 1 };
 function _statusGroups(st) {
   st = st || {};
   var done = st.sent || 0;
   var printingNow = st.printing || 0;
   var pending = (st.queued || 0) + (st.scheduled || 0) + (st.waiting || 0) + (st.downloading || 0) + (st.accepted || 0) + (st.reserved || 0);
   var working = printingNow + pending;
-  var abnormal = (st.failed || 0) + (st.rejected || 0) + (st.abandoned || 0) + (st.offline_unknown || 0);
+  var abnormal = (st.failed || 0) + (st.rejected || 0) + (st.abandoned || 0) + (st.offline_unknown || 0)
+    + (st.timeout || 0) + (st.unsynced_rejected || 0);
   var canceled = st.canceled || 0;
   var total = done + working + abnormal + canceled;
   var rate = total > canceled ? Math.round(done / (total - canceled) * 100) : 0;
@@ -4511,6 +4542,72 @@ function _isExternalOrder(oid) {
   var o = _findCloudOrder(key);
   return !!(o && o.source === 'external');
 }
+/* ==================== v7.15：订正「标记人」 + 状态原因 Tooltip ====================
+   为什么要有标记人：后端把人工订正记成 manual_status_by / manual_status_at，订单明细
+   悬停状态标签要能回答「谁在什么时候把它改成了这个状态」。页面里没有登录身份，
+   所以取「收支结算」里那套成员名单（用户要求：名字用成员名单里的名字，不用云端昵称），
+   记住上次选择；没有成员时下拉禁用、by 传空串（tooltip 退回后端 status_reason）。 */
+var MANUAL_BY_KEY = 'finance.manualStatusBy.v1';
+function _memberNames() {
+  return getMembers().map(function (m) { return String((m && m.name) || '').trim(); })
+    .filter(function (n) { return !!n; });
+}
+/* 当前标记人：localStorage 里记的名字仍在本期成员名单中就用它，否则退回第一个成员；无成员返回 '' */
+function _manualStatusBy() {
+  var names = _memberNames();
+  if (!names.length) return '';
+  var saved = '';
+  try { saved = localStorage.getItem(MANUAL_BY_KEY) || ''; } catch (e) { saved = ''; }
+  return names.indexOf(saved) >= 0 ? saved : names[0];
+}
+function _manualBySelectHTML() {
+  var names = _memberNames(), cur = _manualStatusBy();
+  if (!names.length) return '<select disabled title="成员名单为空：先在设置里添加成员，订正记录才能落到具体的人"><option>未设置标记人</option></select>';
+  var h = '<select title="订正订单状态时，把这次操作记在这个成员名下（后端 manual_status_by）" onchange="onManualStatusBy(this.value)">';
+  names.forEach(function (n) {
+    h += '<option value="' + esc(n) + '"' + (n === cur ? ' selected' : '') + '>' + esc(n) + '</option>';
+  });
+  return h + '</select>';
+}
+function onManualStatusBy(name) {
+  name = String(name || '').trim();
+  if (_memberNames().indexOf(name) < 0) return;
+  try { localStorage.setItem(MANUAL_BY_KEY, name); } catch (e) {}
+  toast('🖊 标记人已设为 ' + name);
+}
+/* 时间戳统一成 YYYY-MM-DD HH:MM:SS（后端可能给 ISO 带 T，或带毫秒/时区，一律截到秒） */
+function _fmtStamp(v) {
+  var s = String(v || '').trim();
+  if (!s) return '';
+  s = s.replace('T', ' ');
+  return s.length >= 19 ? s.substring(0, 19) : s;
+}
+function _nowStamp() {
+  var d = new Date(), p = function (n) { return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+/* 订正接口若回传了标记时间就用服务器的（多端一致），没回传才用本地时间兜底 */
+function _pickManualAt(res) {
+  if (!res || typeof res !== 'object') return '';
+  var cands = [res.manual_status_at, res.at,
+    res.data && res.data.manual_status_at, res.data && res.data.at];
+  for (var i = 0; i < cands.length; i++) { var s = _fmtStamp(cands[i]); if (s) return s; }
+  return '';
+}
+/* 状态标签悬浮文案（订单行与文件行共用）：
+   ① 有人工订正 → 「谁在什么时候被标记为什么」（Lead 指定文案）；
+   ② 否则用后端下发的 status_reason（订单级）；文件行没有该字段时用子任务级 reject_reason；
+   ③ 都没有 → 通用说明。三段都不得为空，避免出现空 tooltip。 */
+function _statusTip(o, st) {
+  o = o || {}; st = st || o.status;
+  var label = statusLabel(st);
+  var by = String(o.manual_status_by || '').trim();
+  if (by) return by + '在' + (_fmtStamp(o.manual_status_at) || '未知时间') + '被标记为' + label;
+  var reason = String(o.status_reason || o.reject_reason || '').trim();
+  if (reason) return label + '：' + reason;
+  return '当前状态：' + label;
+}
 /* 「状态」表头的锁定开关 HTML（本地模式不渲染） */
 function _orderStatusLockHTML() {
   if (FINANCE_MODE === 'local') return '';
@@ -4696,8 +4793,11 @@ function openOrderStatusMenu(ev, oid) {
       (cur ? '<span class="st-menu-cur">✓ 当前</span>' : '') + '</button>';
   });
   if (!(ORDER_FIXABLE_STATUSES.indexOf(o.status) >= 0)) {
-    html += '<div class="st-menu-cur" style="padding:6px 8px;line-height:1.5">当前「' +
-      esc(statusLabel(o.status)) + '」不是终态，订正为下列状态后才算最终结果</div>';
+    /* timeout 是终态（设备后续回报成功会自动救回 sent），别把它说成「还没结束」 */
+    var _hint = o.status === 'timeout'
+      ? '当前「超时」是终态，仍可人工订正为下列状态；设备之后回报打印成功会自动改回已完成'
+      : '当前「' + esc(statusLabel(o.status)) + '」不是终态，订正为下列状态后才算最终结果';
+    html += '<div class="st-menu-cur" style="padding:6px 8px;line-height:1.5">' + _hint + '</div>';
   }
   m.innerHTML = html;
   document.body.appendChild(m);
@@ -4735,9 +4835,12 @@ function applyOrderStatus(oid, status) {
   if (o.status === status) { toast('状态已是「' + statusLabel(status) + '」'); return; }
   if (_orderStatusSaving) { toast('上一次订正正在提交，请稍候'); return; }
   _orderStatusSaving = true;
+  /* v7.15：带上「标记人」—— 后端据此写 orders.manual_status_by / manual_status_at，
+     订单明细悬停状态标签即可回答「谁在什么时候改的」。没有成员名单时传空串（后端忽略）。 */
+  var by = _manualStatusBy();
   fetch('/api/proxy/admin/order_status', {
     method: 'POST', headers: apiHeaders(),
-    body: JSON.stringify({ order_id: String(oid), status: status })
+    body: JSON.stringify({ order_id: String(oid), status: status, by: by })
   }).then(function (r) { return r.json(); }).then(function (res) {
     _orderStatusSaving = false;
     if (!(res && res.success) && _writeAuthProblem(res)) return;
@@ -4747,6 +4850,13 @@ function applyOrderStatus(oid, status) {
        因此不必整页重新拉数（那会把操作者正在看的页面刷成加载态）。 */
     o.status = status;
     (o.files || []).forEach(function (f) { f.status = status; });
+    /* 本地同步标记人/标记时间，tooltip 立刻显示「谁在什么时候改的」；
+       时间优先用服务器回传的（多端一致），没回传才用本地时间兜底。 */
+    if (by) {
+      o.manual_status_by = by;
+      o.manual_status_at = _pickManualAt(res) || _nowStamp();
+      (o.files || []).forEach(function (f) { f.manual_status_by = by; f.manual_status_at = o.manual_status_at; });
+    }
     _scopeCache = {};   // 口径缓存整体失效：切回旧口径不该看到订正前状态（见函数头说明）
     /* v7.4：用量与折旧只统计 status='sent' 的子任务，状态订正会改变"这个月用掉多少纸"，
        缓存的用量必须一起作废，否则结算页会继续按订正前的页数计提折旧。 */
@@ -4792,13 +4902,40 @@ function _cloudFilteredOrders() {
   });
   return orders;
 }
-/* 当前订单列表：成员/来源过滤后再按状态筛选（与 renderCloud 原逻辑一致） */
+/* 当前订单列表：成员/来源过滤后再按状态筛选（与 renderCloud 原逻辑一致），最后叠加搜索词 */
 function _currentOrderList() {
   var list = _cloudFilteredOrders();
   if (_cloudStatusFilter === 'active') list = list.filter(function (o) { return !!_ACTIVE_STATUS[o.status]; });
   else if (_cloudStatusFilter === 'abnormal') list = list.filter(function (o) { return !!_ABNORMAL_STATUS[o.status]; });
   else if (_cloudStatusFilter !== 'all') list = list.filter(function (o) { return o.status === _cloudStatusFilter; });
+  var q = _ordersSearchQuery();
+  if (q) list = list.filter(function (o) { return _orderSearchHit(o, q); });
   return list;
+}
+/* v7.15：搜索命中判据 —— 只看文件名字与订单备注（任务要求的两个字段），大小写不敏感子串。
+   空词恒真（= 不过滤），保证清空搜索后立刻回到全部订单。 */
+function _orderSearchHit(o, q) {
+  q = q || '';
+  if (!q) return true;
+  var hay = String((o && o.remark) || '');
+  ((o && o.files) || []).forEach(function (f) { hay += ' ' + String((f && f.file_name) || ''); });
+  return hay.toLowerCase().indexOf(q) >= 0;
+}
+function _ordersSearchQuery() { return String(_ordersSearch || '').trim().toLowerCase(); }
+/* 把纯文本按搜索词分段转义，命中段包 <mark class="hit">。
+   两件事必须同时成立：① 每一段都先过 esc()，文件名/备注里的 <img onerror> 不会被当标签执行；
+   ② 只高亮命中的那几段，未命中的原文保持原样（不是整行变黄）。q 必须已小写。 */
+function _hlText(text, q) {
+  var s = String(text == null ? '' : text);
+  if (!q) return esc(s);
+  var low = s.toLowerCase(), out = '', i = 0;
+  for (;;) {
+    var p = low.indexOf(q, i);
+    if (p < 0) { out += esc(s.slice(i)); break; }
+    out += esc(s.slice(i, p)) + '<mark class="hit">' + esc(s.slice(p, p + q.length)) + '</mark>';
+    i = p + q.length;
+  }
+  return out;
 }
 /* 页码数组（带省略号，参考小程序 getPageNumbers） */
 function _ordersPageNumbers(current, total) {
@@ -4850,13 +4987,22 @@ function _renderOrderListHTML() {
   var colW = _orderColWidths(typeUsed);
 
   var h = '<div class="section" id="cloud-orders"><h2>📋 订单明细 <span class="hint">' + total + ' 条，时间倒序 · 自打/放弃/取消/打回/失败/⏳离线未同步/⚠️云端拒收订单金额仅展示、不计入收益 · 带 <b>*</b> 的金额含未计入收益的部分</span>';
-  h += '<span style="margin-left:auto"><select onchange="onCloudStatusFilter(this.value)" style="padding:6px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.8rem">';
+  /* v7.15：h2 右侧工具条 = 搜索（文件名/备注，输入即筛）+ 标记人（随订正提交）+ 状态筛选。
+     搜索只影响下面这张表（_currentOrderList），KPI/趋势/图表/页脚仍走 filteredOrders，口径不动。 */
+  h += '<span class="orders-tools">';
+  h += '<span class="orders-search">🔍<input id="ordersSearchInput" type="search" placeholder="搜文件名 / 备注" value="' + esc(_ordersSearch) + '" oninput="onOrdersSearch(this.value)">';
+  if (_ordersSearch) h += '<button type="button" class="clr" title="清空搜索" onclick="onOrdersSearch(\'\')">✕</button>';
+  h += '</span>';
+  if (FINANCE_MODE !== 'local') h += '<span class="st-by">标记人' + _manualBySelectHTML() + '</span>';
+  h += '<select onchange="onCloudStatusFilter(this.value)" style="padding:6px 10px;border:1px solid var(--border-strong);border-radius:9px;background:var(--card);color:var(--text);font-size:.8rem">';
   h += '<option value="all"' + (_cloudStatusFilter === 'all' ? ' selected' : '') + '>全部状态</option>';
   h += '<option value="active"' + (_cloudStatusFilter === 'active' ? ' selected' : '') + '>🟢 进行中/待处理</option>';
   h += '<option value="abnormal"' + (_cloudStatusFilter === 'abnormal' ? ' selected' : '') + '>🔴 异常</option>';
   Object.keys(statusCount).sort(function (a, b) { return statusCount[b] - statusCount[a]; }).forEach(function (s) {
     h += '<option value="' + esc(s) + '"' + (_cloudStatusFilter === s ? ' selected' : '') + '>' + esc(statusLabel(s)) + ' (' + statusCount[s] + ')</option>';
   });
+  /* timeout 不在后端默认状态白名单里 → 动态列表可能没有它；静态补一项，保证筛选入口始终存在 */
+  if (!statusCount.timeout) h += '<option value="timeout"' + (_cloudStatusFilter === 'timeout' ? ' selected' : '') + '>超时 (0)</option>';
   h += '</select></span></h2>';
   h += _ordersPagerHTML(_ordersPage, totalPages, total, true);
   if (!pageOrders.length) {
@@ -4943,12 +5089,13 @@ function _renderOrderListHTML() {
       h += '<td class="l ell" title="' + esc(who) + (addr ? ' · ' + esc(addr) : '') + '">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
       /* 状态列：锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头，点开即选终态（v7.0）。
          点状态标签时要拦住行点击（否则会同时展开文件明细）。 */
-      var _stTag = '<span class="tag ' + esc(statusClass(o.status)) + '">' + esc(statusLabel(o.status)) + '</span>';
+      var _stTag = '<span class="tag ' + esc(statusClass(o.status)) + '" title="' + esc(_statusTip(o, o.status)) + '">' + esc(statusLabel(o.status)) + '</span>';
       h += '<td style="white-space:nowrap">' + (_orderStatusEditable(oidS)
         ? '<span class="st-edit can" title="点击订正订单状态" onclick="event.stopPropagation();openOrderStatusMenu(event,\'' + oidS + '\')">' +
             _stTag + '<button type="button" class="st-caret" tabindex="-1">▾</button></span>'
         : _stTag) + '</td>';
-      h += '<td style="font-weight:700;color:' + revColor + '" title="' + _amtTip + '">' + RMB(showAmt) +
+      /* 金额格：左键点金额弹价格气泡（复制价格 / 复制详细价格）；stopPropagation 防止顺带展开文件行 */
+      h += '<td style="font-weight:700;color:' + revColor + '" title="' + _amtTip + '"><span class="price-copy" title="点击复制价格" onclick="event.stopPropagation();openPriceMenu(event,\'' + oidS + '\',-1)">' + RMB(showAmt) + '</span>' +
         (_partial ? '<span style="color:var(--muted);font-weight:400">*</span>' : '') + '</td>';
       h += '<td>' + o.files_count + '</td>';
       h += '<td title="有效打印页数（按页码范围折算，已含份数）">' + (_orderPages(o) || 0) + '</td>';
@@ -4968,13 +5115,13 @@ function _renderOrderListHTML() {
       if (o.files && o.files.length) {
         h += '<tr class="file-expand' + (isExp ? ' open' : '') + '" data-suborder="' + oidS + '"><td colspan="13" class="file-expand-cell"><div class="file-expand-body"><div class="file-expand-inner">';
         if (o.remark) {
-          h += '<div class="order-remark" title="订单备注">📝 备注：' + esc(o.remark) + '</div>';
+          h += '<div class="order-remark" title="订单备注">📝 备注：' + _hlText(o.remark, _ordersSearchQuery()) + '</div>';
         }
         h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span title="有效打印页数（按页码范围折算）">页数</span><span title="有效纸张张数（按页码范围折算，含份数）">张数</span><span>单/双面</span><span>状态</span></div>';
-        o.files.forEach(function (f) {
+        o.files.forEach(function (f, _fi) {
           h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + (f.reject_reason ? ' · ' + esc(f.reject_reason) : '') + '">';
-          h += '<span class="fn">📄 ' + esc(f.file_name) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
-          h += '<span style="font-weight:700;color:' + revColor + '">' + RMB(parseCents(f.total_price)) + '</span>';
+          h += '<span class="fn">📄 ' + _hlText(f.file_name, _ordersSearchQuery()) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
+          h += '<span style="font-weight:700;color:' + revColor + '"><span class="price-copy" title="点击复制价格" onclick="event.stopPropagation();openPriceMenu(event,\'' + oidS + '\',' + _fi + ')">' + RMB(parseCents(f.total_price)) + '</span></span>';
           h += '<span>' + f.copies + '份</span>';
           // 页数 = **有效打印页数**（折页码范围）；括号注明文件本身共几页（两者不同才标）。
           // 例：2 页的 Word 只打第 1 页 → 「1页 (共2页)」，与金额 ¥0.30（单面 1 页）一致。
@@ -4988,7 +5135,7 @@ function _renderOrderListHTML() {
             + '</span>';
           h += '<span>' + _fileSheets(f) + '张</span>';
           h += '<span>' + (f.duplex === 'off' ? '单面' : '双面') + '</span>';
-          h += '<span><span class="tag ' + esc(statusClass(f.status)) + '">' + esc(statusLabel(f.status)) + '</span></span>';
+          h += '<span><span class="tag ' + esc(statusClass(f.status)) + '" title="' + esc(_statusTip(f, f.status)) + '">' + esc(statusLabel(f.status)) + '</span></span>';
           h += '</div>';
         });
         h += '</div></div></td></tr>';
@@ -5034,6 +5181,269 @@ function onOrdersPerPage(v) {
   _ordersPerPage = n;
   _ordersPage = 1;
   _rerenderOrdersOnly(true);
+}
+/* ==================== v7.15：订单明细搜索（输入即筛） ====================
+   只筛「当前已加载」的订单（文件名 / 备注），不重新拉数；列表与分页跟着变，
+   KPI / 趋势 / 图表 / 页脚统计仍用 filteredOrders —— 搜索不改结算口径。
+   重绘后把焦点与光标还给输入框，连续打字不会断。 */
+function onOrdersSearch(v) {
+  _ordersSearch = String(v == null ? '' : v);
+  _ordersPage = 1;
+  var old = document.getElementById('ordersSearchInput');
+  var caret = (old && old.selectionStart != null) ? old.selectionStart : null;
+  _rerenderOrdersOnly();
+  var el = document.getElementById('ordersSearchInput');
+  if (!el) return;
+  el.focus();
+  try {
+    var p = caret == null ? el.value.length : Math.min(caret, el.value.length);
+    el.setSelectionRange(p, p);
+  } catch (e) {}
+}
+
+/* ==================== v7.15：价格气泡 + 两种复制格式 ====================
+   格式唯一真相是本地打印工具的复制按钮（gui.py 的 _on_copy_total / _on_copy_detail），
+   这里逐字复刻：单行 `{订单号} — ¥{金额}`（em dash 两侧空格、两位小数）；
+   详细 `订单号: X` / 14 个短横线 / `计费明细` / 14 个短横线 / 每文件三行 / 可选附加服务费 /
+   14 个短横线 / `💰合计: ¥x.xx`。金额一律取订单/文件已定稿的 total_price，不在页面重算。 */
+var PRICE_DASH = '--------------';   // 14 个短横线
+function _findOrderByRowKey(k) {
+  k = String(k == null ? '' : k);
+  if (!k) return null;
+  var list = (_cloudData && _cloudData.orders) || [];
+  for (var i = 0; i < list.length; i++) {
+    var o = list[i];
+    if (!o) continue;
+    if (String(o.order_id) === k) return o;
+    if (o.source === 'external' && _externalRowKey(o.order_id) === k) return o;
+  }
+  return null;
+}
+/* 订单实收金额（分）：total_price 已定稿就直接用；老订单没有 total_price 才退回子任务合计 */
+function _orderFinalCents(o) {
+  if (!o) return 0;
+  var tp = o.total_price;
+  if (tp !== null && tp !== undefined && String(tp).trim() !== '') return parseCents(tp);
+  return _orderNominalAmount(o);
+}
+/* 文件行公式（#5）：**逐字复刻**本地打印工具 printer_config.calc_cost 与移动端的算式语法
+   —— `{n}张×{单价}`、双面 `{a}张×{DP}+{b}张×{SP}`、copies>1 再包 `(...)×{copies}份`。
+   单价取「云端 pricing.json（/api/proxy/pricing）→ 本地 STORE 配置 → pricing.json 权威默认」，
+   拉不到时用 0.30/0.40（与 pricing.json 一致；下面 DEFAULT_PRICING 的 0.2/0.3 是老默认，别用）。
+   算出来的价与实收对不上（历史单价/人工改价/封面混排）时**不编算式**，只写实收金额 ——
+   复制出去的数字必须就是页面上的数字。 */
+var PRICE_FALLBACK_SIMPLEX = 0.30;
+var PRICE_FALLBACK_DUPLEX = 0.40;
+var _priceRulesCache = null;
+function _setPriceRules(p) {
+  p = p || {};
+  var sp = Number(p.simplex_price), dp = Number(p.duplex_price);
+  _priceRulesCache = {
+    simplex_price: (isFinite(sp) && sp > 0) ? sp : PRICE_FALLBACK_SIMPLEX,
+    duplex_price: (isFinite(dp) && dp > 0) ? dp : PRICE_FALLBACK_DUPLEX,
+  };
+}
+function _priceRules() {
+  if (!_priceRulesCache) {
+    var p = (STORE.config && STORE.config.pricing) || {};
+    var sp = Number(p.simplex_price), dp = Number(p.duplex_price);
+    if ((isFinite(sp) && sp > 0) || (isFinite(dp) && dp > 0)) _setPriceRules(p);
+    else _setPriceRules(null);
+  }
+  return _priceRulesCache;
+}
+/* 云端模式：定价权威在服务器（设置页可改），拿到后刷新缓存。失败静默用当前值。 */
+function _loadPriceRules() {
+  if (FINANCE_MODE !== 'cloud') { _setPriceRules((STORE.config && STORE.config.pricing) || null); return; }
+  if (_cloudPricing) { _setPriceRules(_cloudPricing); return; }
+  fetch('/api/proxy/pricing', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!(res && res.success)) return;
+      _cloudPricing = res.pricing || {};
+      _setPriceRules(_cloudPricing);
+    })
+    .catch(function () {});
+}
+/* 单面页/双面页摊纸 → (双面张, 单面张)，与 manual_duplex.charge_units 同口径：
+   指定「单面页」的各占 1 张，其余两页一张，奇数页尾张占 1 张。 */
+function _chargeUnitsOf(eff, simplexPages) {
+  var n = Number(eff) || 0;
+  if (simplexPages && String(simplexPages).trim()) {
+    var set = {}, parts = String(simplexPages).split(',');
+    for (var k = 0; k < parts.length; k++) {
+      var seg = String(parts[k]).trim();
+      if (!seg) continue;
+      var mm = seg.split('-');
+      var a = parseInt(mm[0], 10), b = mm.length > 1 ? parseInt(mm[1], 10) : a;
+      if (!isFinite(a) || !isFinite(b)) continue;
+      for (var i = a; i <= b; i++) set[i] = true;
+    }
+    var simplex = 0;
+    for (var j = 1; j <= n; j++) if (set[j]) simplex++;
+    var rest = Math.max(0, n - simplex);
+    return { pairs: simplex + Math.floor(rest / 2), remainder: rest % 2 };
+  }
+  return { pairs: Math.floor(n / 2), remainder: n % 2 };
+}
+/* 复原算式 → {cost, formula}（cost 已含份数，用于与实收比对；对不上就不展示算式） */
+function _fileCalc(f) {
+  f = f || {};
+  var rules = _priceRules();
+  var sp = rules.simplex_price, dp = rules.duplex_price;
+  var pages = _filePages(f) || 0;
+  var copies = parseInt(f.copies, 10) || 1;
+  if (pages <= 0) return { cost: 0, formula: '' };
+  var cost = 0, formula = '';
+  if (f.duplex === 'on') {
+    var units = _chargeUnitsOf(pages, f.simplex_pages);
+    var parts = [];
+    if (units.pairs > 0) { parts.push(units.pairs + '张×' + dp.toFixed(2)); cost += units.pairs * dp; }
+    if (units.remainder > 0) { parts.push(units.remainder + '张×' + sp.toFixed(2)); cost += units.remainder * sp; }
+    formula = parts.join('+');
+  } else {
+    formula = pages + '张×' + sp.toFixed(2);
+    cost = pages * sp;
+  }
+  if (!formula) return { cost: 0, formula: '' };
+  cost = Math.round(cost * copies * 100) / 100;
+  if (copies > 1) formula = '(' + formula + ')×' + copies + '份';
+  return { cost: cost, formula: formula };
+}
+/* 单行复制：`{订单号} — ¥{金额}`（em dash U+2014，两侧各一个空格，与本地工具一致） */
+function _priceLineText(o) {
+  var num = String((o && (o.order_number || ('#' + o.order_id))) || '');
+  return num + ' — ' + RMB(_orderFinalCents(o));
+}
+/* 详细复制：逐字复刻本地打印工具 _on_copy_detail 的行序与缩进 */
+function _priceDetailText(o) {
+  o = o || {};
+  var num = String(o.order_number || ('#' + o.order_id));
+  var lines = [];
+  if (num) { lines.push('订单号: ' + num); lines.push(PRICE_DASH); }
+  lines.push('计费明细');
+  lines.push(PRICE_DASH);
+  var files = o.files || [], sum = 0;
+  files.forEach(function (f, i) {
+    lines.push((i + 1) + '. ' + String(f.file_name || ''));
+    lines.push('   ' + (parseInt(f.copies, 10) || 1) + 'x ' +
+      (f.duplex === 'off' ? '单面' : '双面') + ' 范围:' + (f.page_range || '全部'));
+    var c = parseCents(f.total_price);
+    sum += c;
+    if (c > 0) {
+      var calc = _fileCalc(f);
+      // 算式复算价与实收一致才给算式；对不上（历史单价/人工改价）只写实收金额
+      if (calc.formula && Math.abs(calc.cost * 100 - c) <= 0.5) {
+        lines.push('   ' + calc.formula + ' = ¥' + formatCents(c));
+      } else {
+        lines.push('   ¥' + formatCents(c));
+      }
+    }
+  });
+  var total = _orderFinalCents(o);
+  var extra = total - sum;    // 派送 / 加急 / 首页等订单级附加服务费
+  // 与移动端同口径：残差确实由「派送百分比 + 加急 + 首页」解释得通才写这一行，
+  // 人工改过价的历史单不替操作员编一条不存在的收费理由。
+  var extrasEnabled = !!(Number(o.delivery_enabled) || Number(o.urgency_price) > 0 || Number(o.cover_page));
+  var deliveryCost = Number(o.delivery_enabled)
+    ? Math.round(sum * (Number(o.delivery_percentage) || 0)) / 100
+    : 0;
+  var expectedExtra = Math.round((deliveryCost
+    + (Number(o.urgency_price) || 0)
+    + (Number(o.cover_page) ? (Number(o.cover_page_price) || 0) * Number(o.cover_page) : 0)) * 100) / 100;
+  if (extra > 0 && extrasEnabled && Math.abs(extra - expectedExtra) <= 1.1) {
+    lines.push('附加服务费: ¥' + formatCents(extra));
+  }
+  lines.push(PRICE_DASH);
+  lines.push('💰合计: ¥' + formatCents(total));
+  return lines.join('\n');
+}
+/* 写剪贴板：优先异步 Clipboard API，失败（http/无权限/旧内核）退回 textarea + execCommand */
+function _copyText(text, okMsg) {
+  text = String(text == null ? '' : text);
+  var done = function () { toast(okMsg || '✅ 已复制', 'success'); };
+  var fallback = function () {
+    var ta = null;
+    try {
+      ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, text.length);
+      var ok = document.execCommand && document.execCommand('copy');
+      if (ok) { done(); return; }
+    } catch (e) {
+      /* 落到下面统一报错 */
+    } finally {
+      if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
+    }
+    toast('❌ 复制失败，请手动选择文本', 'error');
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, fallback);
+  } else {
+    fallback();
+  }
+}
+function closePriceMenu() {
+  var m = document.getElementById('priceMenu');
+  if (m && m.parentNode) m.parentNode.removeChild(m);
+  document.removeEventListener('click', _priceMenuOutside, true);
+}
+function _priceMenuOutside(ev) {
+  var m = document.getElementById('priceMenu');
+  if (!m) { document.removeEventListener('click', _priceMenuOutside, true); return; }
+  if (ev && m.contains(ev.target)) return;
+  closePriceMenu();
+}
+/* 打开价格气泡：rowKey 是订单行 key（云端=order_id，外部=extrow-…），fileIdx=-1 表示整单 */
+function openPriceMenu(ev, rowKey, fileIdx) {
+  ev = ev || window.event;
+  if (ev && ev.preventDefault) ev.preventDefault();
+  var o = _findOrderByRowKey(rowKey);
+  if (!o) { toast('❌ 订单已不在当前列表，请刷新后重试', 'error'); return; }
+  closeOrderStatusMenu();   // 两个浮层不同时开，避免互相压住
+  closePriceMenu();
+  var idx = parseInt(fileIdx, 10);
+  var f = (idx >= 0 && o.files && o.files[idx]) ? o.files[idx] : null;
+  var cents = f ? parseCents(f.total_price) : _orderFinalCents(o);
+  var title = String(o.order_number || ('#' + o.order_id));
+  var m = document.createElement('div');
+  m.id = 'priceMenu';
+  m._priceOrder = o;
+  m._priceFile = f;
+  m._priceCents = cents;
+  m.innerHTML = '<div class="pm-title">' + esc(title) + (f ? ' · 本文件 ' : ' · 实收 ') + RMB(cents) + '</div>' +
+    '<button type="button" class="pm-item" onclick="copyPrice(false)">📋 复制价格</button>' +
+    '<button type="button" class="pm-item" onclick="copyPrice(true)">🧾 复制详细价格</button>';
+  document.body.appendChild(m);
+  /* 贴住被点的金额：默认在下方 8px，右/下越界就翻到上方/左侧 */
+  var r = (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect) ? ev.currentTarget.getBoundingClientRect() : null;
+  var x = r ? r.left : (ev && ev.clientX) || 12;
+  var y = r ? r.bottom + 8 : (ev && ev.clientY) || 12;
+  var w = m.offsetWidth || 190, hh = m.offsetHeight || 96;
+  if (x + w > window.innerWidth - 10) x = Math.max(10, window.innerWidth - w - 10);
+  if (y + hh > window.innerHeight - 10) y = Math.max(10, (r ? r.top : y) - hh - 8);
+  m.style.left = x + 'px';
+  m.style.top = y + 'px';
+  setTimeout(function () { document.addEventListener('click', _priceMenuOutside, true); }, 0);
+}
+function copyPrice(detail) {
+  var m = document.getElementById('priceMenu');
+  if (!m) return;
+  var o = m._priceOrder, f = m._priceFile, cents = m._priceCents;
+  if (!o) { closePriceMenu(); return; }
+  if (detail) {
+    _copyText(_priceDetailText(o), '✅ 已复制详细价格');
+  } else {
+    var num = String(o.order_number || ('#' + o.order_id));
+    _copyText(num + ' — ' + RMB(f ? cents : _orderFinalCents(o)), '✅ 已复制价格');
+  }
+  closePriceMenu();
 }
 
 /* 成员映射 */
@@ -6252,10 +6662,10 @@ function renderDash() {
     : (r.basis === 'usage' ? '均摊（未取到用量）' : ('均摊 · ' + r.memberCount + ' 人'));
   /* v7.9：采购支出里含多少「长期耗材本月摊销」—— 购买月不再整笔计入，这一行让人一眼对上 */
   var amortSub = (r.amort && r.amort.totalCents > 0) ? (' · 含耗材摊销 ' + RMB(r.amort.totalCents)) : '';
-  /* v7.11-C：本月结论卡放在最前面 —— 先给「多少钱 / 谁给谁 / 为什么 / 还差多少」，
-     再往下才是可以逐项核对的明细（明细块的数字全部来自同一个 view）。 */
+  /* v7.15：删除「本月结论」卡 —— 结论类文案（谁该给谁 / 为什么是这个数 / 临时口径提示）
+     已在下方 KPI 读数带、转出转入状态条与明细区里各就各位，不再重复一整块结论卡。
+     ustate 仍要给 dashBannerHTML 与 playSettledEntrance 用，保留。 */
   var ustate = usageStateOfMonth(currentKey);
-  h += '<div id="dashVerdict">' + dashVerdictHTML(m, r, ustate) + '</div>';
 
   h += dashKpiHTML(r, totalPL, basisLabel, amortSub);
 
@@ -6265,7 +6675,7 @@ function renderDash() {
 
   /* v7.12：明细区一律折成「一行摘要」（点开才摊明细）。
      收起态就是这张表最该看的那两个数，扫一眼不必滚屏；展开态才是逐项可核对的表。
-     默认全部收起：结论卡 + KPI 已经回答了"多少钱"，明细只在要核对时打开。 */
+     默认全部收起：KPI 读数带已经回答了"多少钱"，明细只在要核对时打开。 */
   h += foldBarHTML();
   var FS = _foldSums(r, m);
   h += secFold('expense', { title: '🧾 采购支出', hint: basisLabel, sum: FS.expense },
@@ -6315,13 +6725,6 @@ function renderDash() {
 /* v7.11（B3）：收支清算「KPI 四卡」区块 —— 从 renderDash 里拆出来的纯块函数。
    只读 calcMonth 的返回值（r）与传入的展示上下文，**不做第二份计算 / 取整**；
    主函数只负责编排顺序（拆块前后 DOM 逐字节相同，见 _tmp_finance/dash_snapshot.mjs）。 */
-/* ══════════════════════════════════════════════════════════════════════════
-   v7.11-C：本月结论卡 —— 用户真正想知道的三件事，一屏说完
-     ① 这个月团队到底赚了/亏了多少（账面口径，已扣折旧）
-     ② 谁该给谁多少钱、还差多少（直接读建议转账 + 合法实转，不另算）
-     ③ 为什么是这个数、这一屏的数字按什么口径算（临时口径必须自曝）
-   所有数字来自 calcMonth 的 r.view；本函数只排版，不参与任何计算。
-   ══════════════════════════════════════════════════════════════════════════ */
 /* ==================== v7.12 明细区折叠 ====================
    收起/展开是纯 DOM 属性切换（data-open），不重绘整页 —— 这样动效不会被 re-render 打断，
    输入框也不会丢焦点。状态存 localStorage：同一台机器上下次打开还是你上次的样子。 */
@@ -6423,7 +6826,7 @@ function _foldSums(r, m) {
     paper: '正常 ' + fmtInt(normalSheets) + ' 张 · 废纸 ' + fmtInt(u.wasteTotal || 0) + ' 张',
     amort: (amort.totalCents > 0 ? ('本月 ' + RMB(amort.totalCents) + ' · ' + lots.length + ' 批') : '本月 ¥0.00 · 无在摊批次'),
     amortHint: amortHint,
-    /* 只写团队成本（= 结论卡里被扣掉的那笔折旧）；损耗费是成员之间互相补的，单列不混算 */
+    /* 只写团队成本（= KPI 本月盈亏里被扣掉的那笔折旧）；损耗费是成员之间互相补的，单列不混算 */
     dep: (r.depTotal > 0 ? ('团队 −' + RMB(r.depTotal)) : '团队 ¥0.00')
       + ((r.wearTotal || 0) > 0 ? (' · 损耗费 ' + RMB(r.wearTotal)) : '')
       + ' · ' + (r.depByPrinter || []).length + ' 台机',
@@ -6468,105 +6871,6 @@ document.addEventListener('click', function (ev) {
 });
 
 
-function dashVerdictHTML(m, r, ustate) {
-  var v = (r && r.view) || null;
-  if (!v) return '';
-  var t = v.totals, cal = v.caliber;
-  var h = '<div class="section" id="dashVerdictCard">';
-  h += '<h2>🧭 本月结论 <span class="hint">（先看结论：多少钱 · 谁给谁 · 为什么 · 还差多少）</span></h2>';
-
-  /* ① 一句话：赚亏多少 */
-  var plTxt = t.totalPL >= 0
-    ? '本月团队净赚 <b class="pos">+' + RMB(t.totalPL) + '</b>'
-    : '本月团队净亏 <b class="neg">' + RMB(-t.totalPL) + '</b>';
-  h += '<div style="font-size:1.02rem;line-height:1.75;margin:2px 0 8px">' + plTxt
-    + '（账面口径）：代收 <b>' + RMB(t.totalInc) + '</b> − 采购 <b>' + RMB(t.totalExp) + '</b>'
-    + ' − 折旧 <b>' + RMB(t.depTotal) + '</b>'
-    + (t.wearSum !== 0 ? '；另有损耗费在成员之间互相补偿 ' + RMB(t.wearSum) + '（合计 0，不影响团队）' : '')
-    + '。</div>';
-
-  /* ② 该谁给谁：建议转账逐条对照「实际已经转了多少」 */
-  var _vt = _validTransfers(m);
-  /* 同一对（付款人→收款人）可能有多笔建议（如「结算转账」+「损耗费」），而实际转账只记了「谁给谁多少钱」，
-     没有分到具体哪一笔。所以**按对汇总后再逐笔冲抵**：先冲第一笔，冲不完的留到下一笔。
-     不能每笔各自减一遍全额（那样同一笔钱会被抵扣两次，「还差」合计会凭空变小）。
-     tt.amount 已是「分」（calcMonth 统一下来的），只有人工录入的 x.amount 才是「元」字符串。 */
-  var _pairDone = {};
-  _vt.forEach(function (x) { var k = x.from + '|' + x.to; _pairDone[k] = (_pairDone[k] || 0) + parseCents(x.amount); });
-  var rows = (r.transfers || []).map(function (tt) {
-    var k = tt.from + '|' + tt.to;
-    var pool = _pairDone[k] || 0;
-    var amt = tt.amount || 0;
-    var used = Math.min(pool, amt);
-    _pairDone[k] = pool - used;
-    return { t: tt, done: used, left: amt - used };
-  });
-  var leftSum = 0, openCnt = 0;
-  rows.forEach(function (x) { if (x.left > 1) { leftSum += x.left; openCnt++; } });
-  h += '<div style="font-weight:700;margin:10px 0 6px">该谁给谁</div>';
-  if (!rows.length) {
-    h += '<div style="color:var(--muted);font-size:.9rem">✅ 账面完全平衡，本月不需要转账。</div>';
-  } else {
-    rows.slice(0, 4).forEach(function (x) {
-      var tag = x.left > 1
-        ? '<span class="tag y">还差 ' + RMB(x.left) + '</span>'
-        : '<span class="tag g">已结清</span>';
-      h += '<div style="font-size:.9rem;line-height:1.95">'
-        + '<span class="member-tag" style="background:' + sanitizeColor(MC(x.t.from)) + '">' + esc(MN(x.t.from)) + '</span>'
-        + ' <span class="arrow">→</span> '
-        + '<span class="member-tag" style="background:' + sanitizeColor(MC(x.t.to)) + '">' + esc(MN(x.t.to)) + '</span> '
-        + '<b>' + RMB(x.t.amount) + '</b> '        /* 建议转账的 amount 已是「分」，别再 parseCents */
-        + (x.t.kind === 'wear' ? '<span class="tag p">损耗费</span> ' : '')
-        + tag + '</div>';
-    });
-    if (rows.length > 4) {
-      h += '<div style="color:var(--muted);font-size:.84rem">还有 ' + (rows.length - 4) + ' 笔（见下方「实际转账」）</div>';
-    }
-    h += '<div style="font-size:.88rem;margin-top:2px">共 ' + rows.length + ' 笔，已结清 ' + (rows.length - openCnt) + ' 笔'
-      + (openCnt
-          ? '，<b class="neg">还差 ' + RMB(leftSum) + '</b>（' + openCnt + ' 笔没到位）'
-          : '，<b class="pos">全部到位</b>')
-      + '。</div>';
-  }
-
-  /* ③ 为什么是这个数 */
-  h += '<div style="font-weight:700;margin:12px 0 4px">为什么是这个数</div>';
-  h += '<ul style="margin:0 0 6px 18px;padding:0;font-size:.88rem;line-height:1.85">';
-  h += '<li>采购 ' + RMB(t.totalExp) + '：' + (cal.useUsage
-      ? '按<b>用量</b>摊 —— 本月共 ' + fmtInt(r.usageTotal) + ' 页，各人只出自己的页数比例'
-      : '按<b>人头</b>均摊 —— ' + r.memberCount + ' 人平分，打多打少不影响')
-    + (cal.basisFallback ? '；<span class="pos">⚠ 本月用量为 0 页，已临时回退均摊</span>' : '') + '。</li>';
-  h += '<li>折旧 ' + RMB(t.depTotal) + '：' + (t.depTotal > 0
-      ? (r.depByPrinter || []).length + ' 台在役机器按本月页数计提（<b>非现金成本</b>：机器钱没进采购账，所以扣盈亏但不进转账）'
-      : '本月没有需要计提的在役机器') + '。</li>';
-  if (t.wearTotal > 0) {
-    h += '<li>损耗费 ' + RMB(t.wearTotal) + '：共同出资的机器只按「谁用得多」在成员之间互相补偿，团队不重复承担这笔成本。</li>';
-  }
-  h += '</ul>';
-
-  /* ④ 当前口径：把所有降级/异常摊开说，别让人以为是准的 */
-  var badges = [];
-  badges.push(cal.useUsage ? '<span class="tag g">按用量分摊</span>' : '<span class="tag b">按人头均摊</span>');
-  if (ustate === 'loading' || ustate === 'idle') badges.push('<span class="tag y">用量统计中</span>');
-  else if (ustate === 'failed') badges.push('<span class="tag y">用量取不到 · 折旧按 ¥0</span>');
-  if (cal.basisFallback) badges.push('<span class="tag y">用量 0 · 已回退均摊</span>');
-  if (cal.amortState === 'loading') badges.push('<span class="tag y">耗材摊销统计中 · 暂按整笔</span>');
-  else if (cal.amortState === 'failed') badges.push('<span class="tag y">耗材摊销失败 · 暂按整笔</span>');
-  else if (cal.amortState === 'ready') badges.push('<span class="tag g">耗材摊销已就绪</span>');
-  if (cal.amortUncovered > 0) badges.push('<span class="tag y">' + cal.amortUncovered + ' 台机硒鼓没库存可摊</span>');
-  if (cal.depUnallocated > 0) badges.push('<span class="tag y">折旧 ' + RMB(cal.depUnallocated) + ' 无主</span>');
-  if (cal.depPagesUnattributed > 0) badges.push('<span class="tag y">' + fmtInt(cal.depPagesUnattributed) + ' 页归属不到成员</span>');
-  if (cal.pagesUnregisteredPrinter > 0) badges.push('<span class="tag y">' + fmtInt(cal.pagesUnregisteredPrinter) + ' 页台账没这台机</span>');
-  if (cal.orphanPayerExp > 0) badges.push('<span class="tag y">' + RMB(cal.orphanPayerExp) + ' 是已删成员垫付</span>');
-  var degraded = badges.join('').indexOf('tag y') >= 0;
-  h += '<div style="font-size:.86rem;line-height:1.95">当前口径：' + badges.join(' ')
-    + (degraded
-        ? '<div style="margin-top:2px;color:var(--orange)">⚠ 这是<b>临时口径</b>：带黄色标签的那几项没算准（多为用量/摊销还没取回来），看金额时请把它们的影响扣掉。</div>'
-        : '<span style="color:var(--muted)">（各项都已取到，金额是准的）</span>')
-    + '</div>';
-  h += '</div>';
-  return h;
-}
 function dashKpiHTML(r, totalPL, basisLabel, amortSub) {
   var h = '';
   h += '<div class="kpi-grid">';
@@ -7266,9 +7570,6 @@ function _refreshDashSummary() {
   var m = monthFromRecords(currentKey);
   var r = calcMonthWithUsage(currentKey);
   var totalPL = r.view.totals.totalPL;
-  /* v7.11-C：结论卡里写着「还差多少」，转账一改就必须跟着变（它没有输入框 ⇒ 可整块重绘） */
-  var vd = $('#dashVerdict');
-  if (vd) vd.innerHTML = dashVerdictHTML(m, r, usageStateOfMonth(currentKey));
   _applyFoldSums(_foldSums(r, m));   /* v7.12：摘要行上的"已录/还差"也要跟着走 */
   var g = $('#dashTransferGaps');
   if (g) g.innerHTML = transferGapChipsHTML(m, r, unlocked.transfer ? '' : ' disabled');
@@ -9875,6 +10176,8 @@ function replayOfflinePending() {
   // 需要时立即进强制改密流程（D-5 拍板接受的操作摩擦）；随后再加载数据。
   try { checkFinanceSetup(); } catch (e) {}
   loadConfig();
+  // #5：复制价格算式要用权威单价（云端 pricing.json 可能与本地 STORE 不同）——先取一次，失败用默认
+  try { _loadPriceRules(); } catch (e) {}
 })();
 </script>
 </body>

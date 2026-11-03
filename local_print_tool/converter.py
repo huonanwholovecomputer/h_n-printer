@@ -785,26 +785,37 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
 
 def _convert_xlsx_to_pdf(file_path: str, output_pdf: str,
                          from_cloud: bool = False,
-                         allow_cloud_com: bool = False) -> None:
-    """表格文件 → PDF：**让 Excel/WPS 自己排版**（引擎链实现在 `xlsx_printer.py`）。
+                         allow_cloud_com: bool = False,
+                         print_options=None) -> None:
+    """表格文件 → PDF（引擎链实现在 `xlsx_printer.py`）。
 
-    为什么不能自己排（2026-11-02 需求）：用户先在 Excel 里设好「边距 0.5cm / 页眉页脚 0 /
-    水平居中 / 调整所有列到一页」再打印，工具必须**完全复现**那份结果 —— 唯一可靠路径是
-    Excel 自己的 `Worksheet.ExportAsFixedFormat`。代码不得改写页边距/缩放/打印区域；
-    用 LibreOffice 或自绘都会与用户预览不一致（实测同一份 xlsx：Excel 4 页，LO 版式不同）。
+    默认（`print_options=None`）：**让 Excel/WPS 自己排版**。用户先在 Excel 里设好
+    「边距 0.5cm / 页眉页脚 0 / 水平居中 / 调整所有列到一页」再打印，工具必须**完全复现**
+    那份结果 —— 唯一可靠路径是 Excel 自己的 `Worksheet.ExportAsFixedFormat`，这条路径上
+    代码不改写页边距/缩放/打印区域；用 LibreOffice 或自绘都会与用户预览不一致。
+
+    显式 `print_options`（GUI 打印选项面板）：只把选项写进 `xlsx_printer` 内部的**临时副本**
+    的 PageSetup，源文件一个字节都不改；选项同时进 PDF 缓存键（改边距不会命中旧 PDF）。
 
     引擎顺序由 xlsx_printer 决定：Excel → WPS(KET) → LibreOffice 兜底（兜底必写日志
-    「LibreOffice 兜底，版式可能与 Excel 不一致」）。云端顾客文件不在这里调用
-    （调用方会把云端的 .xls/.xlsx 继续交给 LibreOffice，见 `_convert_office_to_pdf`）。
+    「LibreOffice 兜底，版式可能与 Excel 不一致」；带 print_options 时还会明写设置未生效）。
+    云端顾客文件不在这里调用（调用方会把云端的 .xls/.xlsx 继续交给 LibreOffice，
+    见 `_convert_office_to_pdf`）。
     """
     import xlsx_printer  # noqa: PLC0415 —— 延迟 import：xlsx_printer 反过来要用本模块的
     # _dispatch_ex / _com_uninitialize_quietly / _find_libreoffice / _convert_office_via_libreoffice
 
     res = xlsx_printer.export_to_pdf(
-        file_path, output_pdf, from_cloud=from_cloud, allow_cloud_com=allow_cloud_com)
+        file_path, output_pdf, from_cloud=from_cloud, allow_cloud_com=allow_cloud_com,
+        print_options=print_options)
     logger.info(
         f"表格引擎: {res.engine_label}（活动工作表「{res.sheet}」，共 {res.sheet_count} 个工作表）"
         f" → PDF 完成: {os.path.basename(output_pdf)}，耗时 {res.elapsed:.2f}s")
+    if res.print_options and not res.options_honored:
+        logger.warning(
+            f"表格页面设置未全部生效（{res.engine_label}）："
+            f"{', '.join(k for k, ok in res.options_applied.items() if not ok) or '该引擎不支持 print_options'}"
+            "；PDF 可能与打印选项面板不一致")
 
 
 # ============================================================
@@ -1831,7 +1842,8 @@ def _sanitize_office_refs(func):
 @_sanitize_office_refs
 def _convert_office_to_pdf(file_path: str, output_pdf: str,
                            from_cloud: bool = False,
-                           allow_cloud_com: bool = False) -> None:
+                           allow_cloud_com: bool = False,
+                           print_options=None) -> None:
     """
     Office 文档 → PDF（多引擎智能降级）。
 
@@ -1844,10 +1856,13 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
       3. LibreOffice 无头模式 → 兜底
     .doc（老格式，无 last-editor 元数据）: Word → WPS → LibreOffice
 
-    表格 (.xls/.xlsx)（2026-11-02）:
-      → 交给 Excel/WPS **自己排版**（`xlsx_printer.export_to_pdf`：Excel → WPS 表格 → LibreOffice），
-        只导出**活动工作表**（Excel 打印对话框默认范围）；代码不改写页边距/缩放/打印区域。
-      → 例外：云端来源的顾客文件（from_cloud 且未放行）仍走 LibreOffice，见上。
+    表格 (.xls/.xlsx)（2026-11-02；2026-11-03 起支持显式 print_options）:
+      → 默认交给 Excel/WPS **自己排版**（`xlsx_printer.export_to_pdf`：Excel → WPS 表格 →
+        LibreOffice），默认只导出**活动工作表**（Excel 打印对话框默认范围）。
+      → 显式传 `print_options` 时（GUI 打印选项面板），改用面板版式：纸张/方向/页边距/
+        页眉页脚/居中/缩放/打印区域写进**临时副本**的 PageSetup，源文件不动；选项进缓存键。
+      → 例外：云端来源的顾客文件（from_cloud 且未放行）仍走 LibreOffice，见上
+        （LibreOffice 不认这些设置，日志里会明写未生效）。
 
     其他 Office 格式 (.ppt/.pptx):
       → LibreOffice 无头模式
@@ -1865,17 +1880,26 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
             为 True 时云端 .doc/.docx 走与本地文件相同的 COM 降级链（仍带
             AutomationSecurity=3 / DisplayAlerts=0 / UpdateLinksAtOpen=False 硬化）。
             ⚠ **默认值必须是 False**：默认仍强制 LibreOffice，不给顾客文件任何 COM 机会。
+        print_options: 表格专用的页面设置字典（见 `xlsx_printer` 模块 docstring）。
+            None（默认）⇒ 旧行为逐字节一致；非 None ⇒ 只在表格临时副本上应用并进缓存键。
+            非表格格式忽略此参数。
     """
     ext = ext_of(file_path)
 
-    # ── 表格（.xls/.xlsx）：交给 Excel/WPS 自己排版（2026-11-02）──
-    # Excel 的「调整所有列到一页 / 0.5cm 边距 / 水平居中 / 打印区域」只有它自己能正确解释，
-    # 本工具**不得**自行改写这些设置；唯一可靠路径就是 `Worksheet.ExportAsFixedFormat`。
+    # ── 表格（.xls/.xlsx）：交给 Excel/WPS 自己排版（默认），显式 print_options 时按面板版式 ──
+    # 默认路径 Excel 的「调整所有列到一页 / 0.5cm 边距 / 水平居中 / 打印区域」只有它自己能
+    # 正确解释，本工具不自行改写；用户显式给了 print_options 才在临时副本上写 PageSetup。
     # 云端来源的顾客文件仍强制 LibreOffice（S1-04：绝不给 COM 宏/外链执行机会），
     # 那是本次改动前就有的行为，走本函数末尾的 LibreOffice 分支。
+    if print_options and ext in (".xls", ".xlsx") and from_cloud and not allow_cloud_com:
+        logger.warning(
+            "云端来源的表格强制走 LibreOffice，print_options 设置未生效"
+            "（LibreOffice 不认页边距/缩放/打印范围设置）"
+            f" ({os.path.basename(file_path)})")
     if ext in (".xls", ".xlsx") and not (from_cloud and not allow_cloud_com):
         _convert_xlsx_to_pdf(file_path, output_pdf, from_cloud=from_cloud,
-                             allow_cloud_com=allow_cloud_com)
+                             allow_cloud_com=allow_cloud_com,
+                             print_options=print_options)
         return
 
     # ── 云端来源的 Office 文档：默认绝不交给 Word/WPS（S1-04）──
@@ -2176,7 +2200,7 @@ class UniversalConverter:
 
     def convert(self, file_path: str, output_pdf: str | None = None,
                 image_orientation: str = "auto", from_cloud: bool = False,
-                allow_cloud_com: bool = False) -> str:
+                allow_cloud_com: bool = False, print_options=None) -> str:
         """
         将文件转换为 PDF。
 
@@ -2195,6 +2219,9 @@ class UniversalConverter:
                 **页数分析路径也传它**：分析用的引擎必须与打印一致，否则回报的页数
                 可能小于实际排出来的（2026-10-28 前的"永远不传"让管理员文档的分析与
                 打印各用一套引擎）。
+            print_options: **表格专用**的页面设置字典（`xlsx_printer` 模块 docstring）。
+                None（默认）⇒ 表格走旧行为（Excel 自己排版、旧缓存命中）；非 None ⇒ 表格
+                按面板版式在临时副本上应用 PageSetup，并纳入 PDF 缓存键。非表格格式忽略。
 
         Returns:
             生成的 PDF 文件路径
@@ -2208,6 +2235,11 @@ class UniversalConverter:
             raise FileNotFoundError(f"文件不存在: {file_path}")
 
         ext = ext_of(file_path)
+
+        # print_options 只对表格有意义（docx 没有 PageSetup 语义）；其它格式一律按 None
+        # 处理，避免把 xlsx 的选项顺手塞进 docx 转换链（也让沙箱分支不必关心它）。
+        if ext not in (".xls", ".xlsx"):
+            print_options = None
 
         # PDF 无需转换
         if ext == ".pdf":
@@ -2236,10 +2268,27 @@ class UniversalConverter:
             if convert_func is _convert_image_to_pdf:
                 convert_func(file_path, output_pdf, image_orientation)
             elif convert_func is _convert_office_to_pdf:
+                # print_options 只在**显式传入**时才进调用（None ⇒ 旧调用形态逐字不变，
+                # 老调用方/旧缓存路径行为不变；静态接线判据也按这个形态核对）。
+                def _call_office_convert():
+                    if print_options is None:
+                        convert_func(file_path, output_pdf, from_cloud=from_cloud,
+                                     allow_cloud_com=allow_cloud_com)
+                    else:
+                        convert_func(file_path, output_pdf, from_cloud=from_cloud,
+                                     allow_cloud_com=allow_cloud_com,
+                                     print_options=print_options)
+
                 # S2-03：本地 Office 文件优先在 Job Object 隔离 worker 里转换（默认关闭）。
                 # 注意「失败闭环」：沙箱**跑起来后**失败/超时绝不回退进程内转换（恶意文档
                 # 正是靠"卡死 → 回退"把风险带回主进程）；只有沙箱本身不可用才回退。
                 if should_sandbox(file_path, from_cloud=from_cloud):
+                    if print_options is not None:
+                        # 沙箱 worker 是独立进程、只接 image_orientation，页面设置没有通道：
+                        # 与其静默丢掉用户的面板设置，不如明说"未生效"（与 LibreOffice 兜底同口径）。
+                        logger.warning(
+                            "隔离转换沙箱不支持表格页面设置：print_options 设置未生效，"
+                            f"本次 PDF 按文件自带版式导出 ({os.path.basename(file_path)})")
                     import office_sandbox  # noqa: PLC0415
                     _res = office_sandbox.run_office_conversion(
                         file_path, output_pdf, image_orientation=image_orientation)
@@ -2249,8 +2298,7 @@ class UniversalConverter:
                         return output_pdf
                     if _res.status == "unavailable":
                         logger.warning(f"转换沙箱不可用，回退进程内转换: {_res.error}")
-                        convert_func(file_path, output_pdf, from_cloud=from_cloud,
-                                     allow_cloud_com=allow_cloud_com)
+                        _call_office_convert()
                     else:
                         raise RuntimeError(
                             f"隔离转换失败（{_res.status}）：{_res.error}。"
@@ -2258,8 +2306,7 @@ class UniversalConverter:
                 else:
                     # S1-04：来源标记只影响 Office 转换引擎的选择（云端 → LibreOffice）
                     # 2026-10-26 方案 B：管理员自打单可按本机策略放行 COM（allow_cloud_com）
-                    convert_func(file_path, output_pdf, from_cloud=from_cloud,
-                                 allow_cloud_com=allow_cloud_com)
+                    _call_office_convert()
             else:
                 convert_func(file_path, output_pdf)
 

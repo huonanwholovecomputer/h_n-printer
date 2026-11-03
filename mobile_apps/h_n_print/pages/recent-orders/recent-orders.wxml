@@ -1,0 +1,135 @@
+<!-- pages/recent-orders/recent-orders.wxml -->
+<page-meta></page-meta>
+<navigation-bar title="{{pageTitle}}" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
+<view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
+<wxs module="scroll" src="../../utils/scroll.wxs"></wxs>
+
+<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
+  <view class="scroller"
+        prop="{{scrollConfig}}" change:prop="{{scroll.onConfig}}"
+        cmd="{{scrollCmd}}" change:cmd="{{scroll.onCmd}}"
+        bindtouchstart="{{scroll.touchstart}}"
+        bindtouchmove="{{scroll.touchmove}}"
+        bindtouchend="{{scroll.touchend}}"
+        bindtouchcancel="{{scroll.touchend}}">
+    <view class="scroll-content">
+      <view class="container">
+
+        <!-- 无权限：不是管理员就别让用户对着空白页猜 -->
+        <view wx:if="{{noPermission}}" class="ro-empty ro-empty-deny">
+          <text class="ro-empty-icon">🔒</text>
+          <text class="ro-empty-title">仅管理员可查看</text>
+          <text class="ro-empty-desc">最近订单是管理者视角的全局列表，普通用户请到「我的打印任务」查看自己的订单。</text>
+        </view>
+
+        <block wx:else>
+          <!-- 顶部：总量 + 每页条数 + 页码 -->
+          <view class="ro-summary">
+            <view class="ro-summary-main">
+              <text class="ro-summary-title">最近订单</text>
+              <text class="ro-summary-meta" wx:if="{{!loading && !loadError}}">共 {{totalOrders}} 条 · 第 {{currentPage}}/{{totalPages}} 页</text>
+              <text class="ro-summary-meta" wx:elif="{{loading}}">加载中…</text>
+            </view>
+            <view class="ro-refresh" hover-class="tap-active" bindtap="onRefresh">↻ 刷新</view>
+          </view>
+
+          <view class="ro-pagebar" wx:if="{{!loadError && totalOrders > 0}}">
+            <view class="ro-pagesize" hover-class="tap-active" catchtap="onTogglePageSizePicker">
+              <text class="ro-pagesize-text">每页 {{perPage}} 条</text>
+              <text class="ro-pagesize-caret">▾</text>
+              <view wx:if="{{showPageSizePicker}}" class="ro-pagesize-menu">
+                <view wx:for="{{pageOptions}}" wx:key="*this"
+                      class="ro-pagesize-item {{item === perPage ? 'is-active' : ''}}"
+                      data-size="{{item}}" catchtap="onSelectPageSize">{{item}} 条</view>
+              </view>
+            </view>
+
+            <view class="ro-page-nav">
+              <view class="ro-page-btn {{currentPage <= 1 ? 'is-disabled' : ''}}" catchtap="onPrevPage">上一页</view>
+              <view class="ro-page-numbers">
+                <view wx:for="{{pageNumbers}}" wx:key="*this"
+                      class="ro-page-num {{item === '...' ? 'is-gap' : ''}} {{item === currentPage ? 'is-active' : ''}}"
+                      data-page="{{item}}" catchtap="onPageChange">{{item}}</view>
+              </view>
+              <view class="ro-page-btn {{currentPage >= totalPages ? 'is-disabled' : ''}}" catchtap="onNextPage">下一页</view>
+            </view>
+          </view>
+
+          <!-- 列表 -->
+          <view wx:if="{{loadError}}" class="ro-empty">
+            <text class="ro-empty-icon">⚠️</text>
+            <text class="ro-empty-title">{{loadError}}</text>
+            <view class="ro-empty-btn" hover-class="tap-active" catchtap="onRefresh">重试</view>
+          </view>
+
+          <view wx:elif="{{loading && orders.length === 0}}" class="ro-loading">
+            <view class="ro-spinner"></view>
+            <text class="ro-loading-text">加载中…</text>
+          </view>
+
+          <view wx:elif="{{orders.length === 0}}" class="ro-empty">
+            <text class="ro-empty-icon">🗂</text>
+            <text class="ro-empty-title">还没有订单</text>
+            <text class="ro-empty-desc">所有管理员提交过的订单会出现在这里。</text>
+          </view>
+
+          <view wx:else class="ro-list">
+            <view wx:for="{{orders}}" wx:key="order_id" class="ro-row">
+              <view class="ro-row-line1">
+                <text class="ro-order-no">{{item.order_number || '—'}}</text>
+                <!-- #9：异常状态文字可点，弹原因气泡 -->
+                <text wx:if="{{item.statusReasonTappable}}"
+                      class="order-status status-{{item.status}} status-reason-tap"
+                      id="ro-status-tap-{{item.order_id}}"
+                      data-id="{{item.order_id}}"
+                      catchtap="onStatusReasonTap">{{item.statusText}} ⓘ</text>
+                <text wx:else class="order-status status-{{item.status}}">{{item.statusText}}</text>
+                <text wx:if="{{item.is_admin_print}}" class="ro-self-badge">管理员自打</text>
+              </view>
+
+              <view class="ro-row-line2">
+                <text class="ro-owner" data-owner="{{item.owner}}" catchtap="onOwnerTap">👤 {{item.ownerText}}</text>
+                <text class="ro-time">{{item.timeShort}}</text>
+              </view>
+
+              <view class="ro-row-line3">
+                <text class="ro-stat">{{item.statText}}</text>
+                <text class="ro-price-tap" data-id="{{item.order_id}}" catchtap="onPriceCopy">¥{{item.priceDisplay}}</text>
+              </view>
+            </view>
+          </view>
+
+          <!-- 底部翻页（长列表翻到底不用滚回顶部） -->
+          <view class="ro-pagebar ro-pagebar-bottom" wx:if="{{!loadError && totalPages > 1}}">
+            <view class="ro-page-btn {{currentPage <= 1 ? 'is-disabled' : ''}}" catchtap="onPrevPage">上一页</view>
+            <text class="ro-page-indicator">{{currentPage}} / {{totalPages}}</text>
+            <view class="ro-page-btn {{currentPage >= totalPages ? 'is-disabled' : ''}}" catchtap="onNextPage">下一页</view>
+          </view>
+        </block>
+
+      </view>
+    </view>
+  </view>
+</view>
+
+<!-- #9 原因气泡：必须在 page-root 之外 + position:fixed。
+     page-root 有 overflow:hidden，气泡若在里面会被裁掉；
+     而 .scroll-content 是 translateY 变换层，fixed 元素若在它内部会相对变换层定位（跟着滚走）。 -->
+<view wx:if="{{showStatusPop}}" class="ro-pop-mask" catchtap="onCloseStatusPop" catchtouchmove="noop"></view>
+<view wx:if="{{showStatusPop}}"
+      class="ro-pop {{statusPopBelow ? 'ro-pop-below' : 'ro-pop-above'}}"
+      style="left:{{statusPopLeft}}px;width:{{statusPopWidth}}px;{{statusPopBelow ? 'top:' + statusPopTop + 'px' : 'bottom:' + statusPopBottom + 'px'}}"
+      catchtap="noop">
+  <view class="ro-pop-caret" style="left:{{statusPopCaretLeft}}px"></view>
+  <view class="ro-pop-head">
+    <text class="ro-pop-icon">⚠️</text>
+    <text class="ro-pop-title">异常原因</text>
+  </view>
+  <scroll-view scroll-y class="ro-pop-text-wrap">
+    <text class="ro-pop-text">{{statusPopText}}</text>
+  </scroll-view>
+  <view class="ro-pop-acts">
+    <view class="ro-pop-btn primary" hover-class="ro-pop-btn-hover" catchtap="onCopyStatusReason">复制</view>
+    <view class="ro-pop-btn" hover-class="ro-pop-btn-hover" catchtap="onCloseStatusPop">关闭</view>
+  </view>
+</view>

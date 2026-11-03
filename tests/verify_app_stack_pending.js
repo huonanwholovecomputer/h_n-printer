@@ -9,9 +9,9 @@
  *
  * 前端口径（本文件验收的就是它）：
  *   1) 离线设备的攒批开关**不再灰死**（disabled 仍由「在线 + 服务端不可切换」与「请求中」决定）；
- *   2) 响应带 pending:true ⇒ 该设备标 stack_pending，徽标显示「🖐 待应用」；
- *      **不改 stack_mode**（设备上的真实状态没变），等上线后服务端回填；
- *   3) 徽标三态仍互斥单行（375px 不能换行，见 app.js 里那段注释）；
+ *   2) 响应带 pending:true ⇒ 该设备标 stack_pending，徽标旁边挂「⏳ 待应用」；
+ *      徽标本身显示**目标状态**（后端 C4 的 stack_desired，缺字段回退 stack_mode）；
+ *   3) 徽标三态仍互斥单行（375px 不能换行，见 app.js 里那段注释），待应用是独立角标；
  *   4) 离线不再弹「设备离线，无法远程切换」。
  *
  * 用真实 www/app.js 里抽出来的四个函数，在桩环境里跑（APP 无真浏览器可自动化）。
@@ -39,7 +39,7 @@ const css = fs.readFileSync(APP_CSS, 'utf8');
 /* ============================================================
    一、从真实 app.js 抽取「攒批」这一组函数
    ============================================================ */
-const START = 'function stackBadgeHtml(d) {';
+const START = 'function normalizeDeviceStack(d) {';
 const END_MARK = "  stackTogglingId = '';\n  renderDeviceList();\n}";
 function extractStackBlock() {
   const start = appJs.indexOf(START);
@@ -83,6 +83,7 @@ function loadStackModule() {
     };
   `;
   const sandbox = { console, Math, JSON, Date, Object, Array, String, Number, Boolean, Promise, setTimeout, clearTimeout };
+  sandbox.document = { getElementById: () => null, querySelectorAll: () => [] };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(prelude + '\n' + block + '\n' + harness, sandbox, { filename: 'stack(extracted)' });
@@ -108,15 +109,19 @@ if (!loaded) {
   check('① 抽取到的源码含 pending 分支', /stack_pending === true/.test(loaded.block));
 
   const pendingBadge = H.stackBadgeHtml(badAutoDuplex({ stack_pending: true, stack_mode: false }));
-  check('② pending=true 显示「🖐 待应用」', /待应用/.test(pendingBadge), pendingBadge);
-  check('③ pending 徽标带专用 class device-state-stack-pending',
-        /device-state-stack-pending/.test(pendingBadge), pendingBadge);
-  check('④ pending 时不再同时显示「攒批未开」（三态互斥、单行）',
-        !/攒批未开/.test(pendingBadge) && !/攒批中/.test(pendingBadge), pendingBadge);
+  check('② pending=true 挂「⏳ 待应用」角标', /待应用/.test(pendingBadge), pendingBadge);
+  check('③ 待应用是独立角标 device-pending-badge（不顶替状态胶囊）',
+        /device-pending-badge/.test(pendingBadge), pendingBadge);
+  check('④ pending + 期望值=false ⇒ 同时显示「攒批未开」（看得出改成了什么）',
+        /攒批未开/.test(pendingBadge) && !/攒批中/.test(pendingBadge), pendingBadge);
 
   const pendingWhileOn = H.stackBadgeHtml(badAutoDuplex({ stack_pending: true, stack_mode: true }));
-  check('⑤ pending 优先于 stack_mode=true（离线关攒批也该显示待应用）',
-        /待应用/.test(pendingWhileOn) && !/攒批中/.test(pendingWhileOn), pendingWhileOn);
+  check('⑤ pending + 期望值=true ⇒ 「攒批中」+ 待应用',
+        /攒批中/.test(pendingWhileOn) && /待应用/.test(pendingWhileOn), pendingWhileOn);
+
+  const desiredWins = H.stackBadgeHtml(badAutoDuplex({ stack_desired: true, stack_mode: false }));
+  check('⑤b stack_desired 优先于 stack_mode（设备还没对齐时显示目标态）',
+        /攒批中/.test(desiredWins), desiredWins);
 
   check('⑥ stack_mode=true → 攒批中',
         /device-state-stack"/.test(H.stackBadgeHtml(badAutoDuplex({ stack_mode: true }))));
@@ -144,8 +149,8 @@ if (!loaded) {
         !/device-stack-btn-disabled/.test(offlineBlockedBtn), offlineBlockedBtn);
 
   const onlineBusyBtn = H.stackToggleBtnHtml(badAutoDuplex({ online: true, stack_can_toggle: false }));
-  check('④ 在线 + 服务端不可切换 → 仍灰显（这条闸门保留）',
-        /device-stack-btn-disabled/.test(onlineBusyBtn), onlineBusyBtn);
+  check('④ 在线 + 服务端不可切换 → 也不再灰显（随时可切，忙时后端记 pending）',
+        !/device-stack-btn-disabled/.test(onlineBusyBtn), onlineBusyBtn);
 
   check('⑤ 超管（role=super_admin）也能看到开关', (H.setRole('super_admin'),
         /device-stack-btn/.test(H.stackToggleBtnHtml(badAutoDuplex({ online: false })))));
@@ -186,15 +191,16 @@ if (!loaded) {
     const afterPending = H.getDevices()[0];
     check('⑤ pending 响应 ⇒ 设备标记 stack_pending=true', afterPending.stack_pending === true,
           JSON.stringify(afterPending));
-    check('⑥ pending 时**不改** stack_mode（设备真实状态没变）', afterPending.stack_mode === false);
+    check('⑥ pending 时 stack_view 写成目标态 true', afterPending.stack_view === true,
+          JSON.stringify(afterPending));
     check('⑦ pending 后徽标显示「待应用」', /待应用/.test(H.stackBadgeHtml(afterPending)));
 
     /* ② 再来一次：pending 态重复点击仍按当前 stack_mode 推导 enable（幂等，不是反向开关） */
     H.reset();
     H.setResponse({ data: { success: true, pending: true } });
     await H.toggleStackMode('dev-1');
-    check('⑧ pending 后重复点击仍是 enable=true（幂等重发，不会误判成关闭）',
-          H.calls().length === 1 && JSON.parse(H.calls()[0].opts.body).enable === true,
+    check('⑧ pending（待应用）后再点 ⇒ 按目标态取反 = enable=false（以最后一次为准）',
+          H.calls().length === 1 && JSON.parse(H.calls()[0].opts.body).enable === false,
           H.calls().length ? H.calls()[0].opts.body : '');
 
     /* ③ 在线设备正常切换：pending 清除、stack_mode 落地 */
@@ -208,13 +214,15 @@ if (!loaded) {
     check('⑪ 在线成功 ⇒ stack_busy 同步', online.stack_busy === false);
     check('⑫ 成功后徽标变「攒批中」', /攒批中/.test(H.stackBadgeHtml(online)));
 
-    /* ④ 在线 + 服务端不可切换：仍然前端拦下、不发请求 */
+    /* ④ 在线 + 服务端不可切换：也放行（需求 2），由后端记 pending */
     H.reset();
     H.setDevices([badAutoDuplex({ online: true, stack_can_toggle: false, stack_reason: '正在打印，暂不能切换' })]);
+    H.setResponse({ data: { success: true, stack_pending: true, stack_desired: true, message: '打印机正忙，已记录' } });
     await H.toggleStackMode('dev-1');
-    check('⑬ 在线不可切换：不发请求', H.calls().length === 0);
-    check('⑭ 在线不可切换：提示服务端原因',
-          H.toasts().some(t => /正在打印/.test(t.msg)), H.toasts().map(t => t.msg).join(' | '));
+    check('⑬ 在线不可切换：仍发请求（不再前端拦截）',
+          H.calls().length === 1 && JSON.parse(H.calls().length ? H.calls()[0].opts.body : '{}').client_id === 'dev-1');
+    check('⑭ 在线不可切换：toast 用后端文案，而不是前端编的原因',
+          H.toasts().some(t => /已记录/.test(t.msg)), H.toasts().map(t => t.msg).join(' | '));
 
     /* ⑤ 自动双面机：仍有前置提示 */
     H.reset();
@@ -251,6 +259,8 @@ if (!loaded) {
     check('② 深色模式有对应提亮规则', darkIdx > 0);
     check('③ 待应用徽标沿用信息橙 #e67e22（与「攒批中」同色系）',
           /\.device-state-stack-pending\s*\{[^}]*#e67e22/.test(css));
+    check('③b 新角标 .device-pending-badge 有独立样式（橙色、不换行）',
+          /\.device-pending-badge\s*\{[^}]*e67e22/.test(css));
     check('④ app.js 里已删除「设备离线，无法远程切换」这句拦截',
           !/设备离线，无法远程切换/.test(appJs));
     check('⑤ 前端没有新增轮询/pending 定时器（pending 只靠列表返回）',

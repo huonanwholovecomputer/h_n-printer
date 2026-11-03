@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 """验收 · xlsx/xls 打印：必须完全复现 Excel 自己的打印结果
 
-依据（2026-11-02 需求）：用户的工作流是在 Excel 里设好「边距 0.5cm / 页眉页脚 0 /
-水平居中 / 调整所有列到一页」再打印，本地打印工具必须**完全复现 Excel 自己的打印结果**。
-唯一可靠路径 = Excel / WPS 的 `Worksheet.ExportAsFixedFormat`（让 Office 自己排版）；
-本工具**不得**自行改写页边距 / 缩放 / 打印区域 / 水平居中。
+依据（2026-11-03 修订，取代 2026-11-02 的「绝不改写版式」口径）：用户的工作流是在 Excel 里
+设好版式再打印，本地打印工具**默认必须完全复现 Excel 自己的打印结果** —— 唯一可靠路径 =
+Excel / WPS 的 `Worksheet.ExportAsFixedFormat`（让 Office 自己排版）。
+只有 GUI 显式传 `print_options`（打印选项面板：纸张/方向/页边距/页眉页脚/居中/缩放/打印区域）
+时才写 `PageSetup`，而且**只写在 export_to_pdf 复制出来的临时副本上**（ReadOnly 打开、
+Close(SaveChanges=False) ⇒ 用户源文件 md5 不变）；`print_options=None`（老调用方 / 旧缓存
+路径）行为与旧版逐字节一致，旧缓存照常命中。选项进缓存键，改页边距不会命中旧版式的 PDF。
+逐项降级要记账：引擎不支持时必须明说「设置未生效」（见 tests/verify_xlsx_print_options.py）。
 
 本脚本判据
-  A. 静态接线：converter 把 .xls/.xlsx 交给 xlsx_printer；云端来源仍强制 LibreOffice；
-     源码里没有任何 PageSetup 写操作（只读）；导出参数 Type=0 / IgnorePrintAreas=False /
+  A. 静态接线：converter 把 .xls/.xlsx 交给 xlsx_printer 并透传 print_options；云端来源仍
+     强制 LibreOffice（且提示选项未生效）；PageSetup 写入只封在 _apply_print_options* 里、
+     且仅 print_options 非 None 时调用；选项进缓存键；导出参数 Type=0 / IgnorePrintAreas=False /
      OpenAfterPublish=False；引擎优先级 Excel→WPS→LibreOffice；LibreOffice 兜底必须落
      日志「LibreOffice 兜底，版式可能与 Excel 不一致」；缓存 key 含引擎身份；
      GUI（文件类型白名单 / 引擎标签 / 转换 worker / 缓存读写）与文件卡片接线。
@@ -255,15 +260,34 @@ chk("云端来源的表格不被 COM 分流（仍落到 LibreOffice，S1-04 口�
     re.search(r'if ext in \("\.xls", "\.xlsx"\) and not \(from_cloud and not allow_cloud_com\)',
               conv_src) is not None)
 
-# —— 绝不改写打印设置：源码里不许出现 PageSetup 赋值 ——
+# —— 改写打印设置的唯一入口：_apply_print_options*，且只在显式传 print_options 时调用 ——
+# 这里守的是「新契约」（2026-11-03），不是「允许随便改版式」：三条铁律落成可红断言 ——
+#   ① 没有散落的 `ws.PageSetup.X = v`，写入只经 setattr(ps, name, value)（失败能记账/降级）
+#   ② 只有 print_options 非 None 才走到写入（None ⇒ 旧路径零改动，旧缓存照常命中）
+#   ③ 版式只落在 export_to_pdf 复制出来的临时副本上（源文件 ReadOnly 打开、不保存）
 WRITE_PAGE_RE = re.compile(
     r"\.(?:LeftMargin|RightMargin|TopMargin|BottomMargin|HeaderMargin|FooterMargin|"
     r"Zoom|FitToPagesWide|FitToPagesTall|PrintArea|PrintTitleRows|PrintTitleColumns|"
     r"CenterHorizontally|CenterVertically|Orientation|PaperSize|PrintHeadings|"
     r"PrintGridlines)\s*=[^=]")
-chk("xlsx_printer 里没有任何 PageSetup 写操作（只让 Excel 自己排版）",
+chk("没有散落的 PageSetup 直接赋值（改写版式只能走 _apply_print_options_on_sheet 的 setattr）",
     WRITE_PAGE_RE.search(xsl_src) is None,
     WRITE_PAGE_RE.search(xsl_src).group(0) if WRITE_PAGE_RE.search(xsl_src) else "")
+chk("PageSetup 写入统一用 setattr(ps, name, value)（逐项记账，不支持时能点名降级）",
+    "setattr(ps, name, value)" in xsl_src)
+chk("print_options=None ⇒ 不调用 _apply_print_options（旧路径逐字节不变）",
+    re.search(r"if options is not None:\s*\n(?:.*\n){0,4}?\s+\w+\s*=\s*_apply_print_options\(",
+              xsl_src) is not None)
+chk("选项进缓存键（cache_key / find_cached_pdf 都接 print_options；改页边距换缓存）",
+    'def cache_key(source_md5: str, image_orientation: str = "", engine: str = "",' in xsl_src
+    and re.search(r"def find_cached_pdf\(.*?print_options", xsl_src, re.S) is not None)
+chk("版式只写在临时副本上（ReadOnly 打开 + Close(SaveChanges=False)）",
+    re.search(r"ReadOnly\s*=\s*True", xsl_src) is not None
+    and re.search(r"Close\(\s*SaveChanges\s*=\s*False", xsl_src) is not None)
+chk("LibreOffice 不认这些参数时必须明说「设置未生效」",
+    "页边距/缩放/打印范围设置" in xsl_src and "未生效" in xsl_src)
+chk("converter 把 print_options 透传给 xlsx_printer（GUI 面板 → 转换链路）",
+    "print_options=print_options" in conv_src)
 chk("xlsx_printer 不调用 PrintOut（走 ExportAsFixedFormat 而不是真打印机）",
     "PrintOut" not in xsl_src)
 chk("xlsx_printer 从不把 Excel 设成可见",

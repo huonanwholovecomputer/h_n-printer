@@ -594,7 +594,7 @@ try {
      C 组的判据不是「数字对不对」（那是 A 组），而是「页面还有没有自己算」：
        ① view 六组行 + totals 必须与 calcMonth 顶层字段逐个同源（页面照抄即可）；
        ② view.redist 的三列相加必须恒等于「建议转账」用的 net（把碰巧一致变成不变量）；
-       ③ 结论卡必须真的从 view 读，且降级时自己说出来。 */
+       ③ 结论卡删除后，降级仍必须在状态条 / KPI 副标题里自己说出来（不许假装准）。 */
   await goMonth('2026-10');
   const c1 = await page.evaluate(() => {
     const r = window.calcMonthWithUsage('2026-10');
@@ -655,6 +655,8 @@ try {
   const c2 = await page.evaluate(() => {
     const box = document.querySelector('#dashVerdict');
     const card = document.querySelector('#dashVerdictCard');
+    /* v7.15：结论卡已删除 —— 原卡里的两条数字校验落到仍渲染转账建议的明细区上 */
+    const tabTxt = String((document.querySelector('#tab-dash') || { textContent: '' }).textContent || '').replace(/\s+/g, '');
     const txt = box ? String(box.textContent || '').replace(/\s+/g, '') : '';
     const r = window.calcMonthWithUsage('2026-10');
     const yuan = (c) => (Math.round(c) / 100).toFixed(2);
@@ -683,28 +685,30 @@ try {
     });
     let doneSum = 0;
     vt.forEach((x) => { doneSum += (parseCents(x.amount) || 0); });
-    const amtMiss = (r.transfers || []).filter((t) => txt.indexOf(yuan(t.amount || 0)) < 0).length;
+    const amtMiss = (r.transfers || []).filter((t) => tabTxt.indexOf(yuan(t.amount || 0)) < 0).length;
     return {
-      hasBox: !!box, hasCard: !!card, txt: txt.slice(0, 400),
-      hasFour: ['本月结论', '该谁给谁', '为什么是这个数', '当前口径'].every((k) => txt.indexOf(k) >= 0),
+      hasBox: !!box, hasCard: !!card, txt: tabTxt,
       kpiPL: kpiPL, totalPL: r.view.totals.totalPL,
       footActual: footActual, totalActual: r.view.totals.totalActual,
       leftSum: leftSum, open: open, amtMiss: amtMiss, transferCnt: (r.transfers || []).length,
       suggestSum: suggestSum, doneSum: doneSum,
-      saysLeft: txt.indexOf('还差') >= 0, leftTxt: yuan(leftSum),
+      /* 「还差」两个字也出现在区块说明文案里（「已转 / 还差」会立即重算），
+         所以这里只认后面紧跟金额的 chips 文案：还差 ¥x.xx */
+      saysLeft: tabTxt.indexOf('还差¥') >= 0, leftTxt: yuan(leftSum),
     };
   });
-  chk('C2 收支清算顶部有「本月结论」卡（四段齐：赚亏 / 该谁给谁 / 为什么 / 当前口径）',
-      c2.hasBox && c2.hasCard && c2.hasFour, c2.txt);
-  chk('C2 结论卡里的「该谁给谁」逐笔金额与建议转账一致（不是另抄一份数字）',
+  chk('C2 收支清算不再有「本月结论」卡（v7.15 删除；dashVerdictHTML 一并移除，不留死函数）',
+      !c2.hasBox && !c2.hasCard && !/function\s+dashVerdictHTML\s*\(/.test(src),
+      { hasBox: c2.hasBox, hasCard: c2.hasCard, txt: c2.txt });
+  chk('C2 「该谁给谁」逐笔金额与建议转账一致（渲染在转账建议里，不是另抄一份数字）',
       c2.amtMiss === 0, { miss: c2.amtMiss, transfers: c2.transferCnt });
-  chk('C2 结论卡「还差」合计 == 各笔未到位之和（与「实际转账」的缺口同源，同一笔钱不被抵扣两次）',
+  chk('C2 「还差」合计 == 各笔未到位之和（与「实际转账」的缺口同源，同一笔钱不被抵扣两次）',
       c2.open === 0 ? c2.saysLeft === false : (c2.saysLeft && c2.txt.indexOf(c2.leftTxt) >= 0),
-      { leftSum: c2.leftSum, open: c2.open, leftTxt: c2.leftTxt });
+      { leftSum: c2.leftSum, open: c2.open, leftTxt: c2.leftTxt, saysLeft: c2.saysLeft });
   chk('C2 「还差」合计 == 建议合计 − 已转合计（按对分配，不多扣也不少扣）',
       c2.leftSum === c2.suggestSum - c2.doneSum,
       { leftSum: c2.leftSum, suggestSum: c2.suggestSum, doneSum: c2.doneSum });
-  chk('C2 结论卡与 KPI / 实际盈亏合计同源：KPI 本月盈亏 == totals.totalPL，实际盈亏合计 == totals.totalActual',
+  chk('C2 页面读数与 view 同源：KPI 本月盈亏 == totals.totalPL，实际盈亏合计 == totals.totalActual',
       c2.kpiPL === c2.totalPL && centsOf(c2.footActual) === c2.totalActual,
       { kpiPL: c2.kpiPL, totalPL: c2.totalPL, footActual: c2.footActual, totalActual: c2.totalActual });
 
@@ -726,25 +730,25 @@ try {
       && (cBodies.dashRedistHTML || '').indexOf('incomeAdj + adv + wear') < 0,
       { hasRowTransfer: (cBodies.dashRedistHTML || '').indexOf('row.transfer') >= 0,
         hasInlineSum: (cBodies.dashRedistHTML || '').indexOf('incomeAdj + adv + wear') >= 0 });
-  chk('C3 renderDash 里挂了结论卡锚点 #dashVerdict，且 dashVerdictHTML() 存在',
-      /id="dashVerdict"/.test(sliceFn(src, 'renderDash') || '')
-      && /function\s+dashVerdictHTML\s*\(/.test(src),
+  chk('C3 renderDash 不再挂结论卡锚点 #dashVerdict，dashVerdictHTML() 已删除（v7.15）',
+      !/id="dashVerdict"/.test(sliceFn(src, 'renderDash') || '')
+      && !/function\s+dashVerdictHTML\s*\(/.test(src),
       { inDash: /id="dashVerdict"/.test(sliceFn(src, 'renderDash') || ''), hasFn: /function\s+dashVerdictHTML\s*\(/.test(src) });
-  chk('C3 改一行转账后结论卡也会刷新（_refreshDashSummary 里挂 #dashVerdict）',
-      /#dashVerdict/.test(sliceFn(src, '_refreshDashSummary') || ''),
+  chk('C3 结论卡删除后 _refreshDashSummary 不再引用 #dashVerdict（不留无效重绘）',
+      !/#dashVerdict/.test(sliceFn(src, '_refreshDashSummary') || ''),
       (sliceFn(src, '_refreshDashSummary') || '').slice(0, 200));
 
-  /* C4 反向：11 月用量为 0 ⇒ 结论卡必须自己说「已回退均摊 / 临时口径」，不许假装准 */
+  /* C4 反向：11 月用量为 0 ⇒ 页面必须自己说「已回退均摊 / 临时口径」，不许假装准（v7.15 起在状态条 + KPI 副标题） */
   await goMonth('2026-11');
   const c4 = await page.evaluate(() => {
-    const txt = (document.querySelector('#dashVerdict') || { textContent: '' }).textContent.replace(/\s+/g, '');
+    const txt = String((document.querySelector('#tab-dash') || { textContent: '' }).textContent || '').replace(/\s+/g, '');
     const r = window.calcMonthWithUsage('2026-11');
     return { txt: txt.slice(0, 300), fallback: r.view.caliber.basisFallback,
-             useUsage: r.view.caliber.useUsage, hasBack: txt.indexOf('回退') >= 0,
-             hasHead: txt.indexOf('按人头均摊') >= 0, hasWarn: txt.indexOf('临时口径') >= 0 };
+             useUsage: r.view.caliber.useUsage, hasBanner: txt.indexOf('本次按均摊计算') >= 0,
+             hasSub: txt.indexOf('均摊（未取到用量）') >= 0 };
   });
-  chk('C4 11 月（用量 0、已回退均摊）结论卡把降级说出来：按人头均摊 + 已回退 + ⚠ 临时口径',
-      c4.fallback === true && c4.useUsage === false && c4.hasBack && c4.hasHead && c4.hasWarn, c4);
+  chk('C4 11 月（用量 0、已回退均摊）页面把降级说出来：状态条「本次按均摊计算」+ KPI 副标题「均摊（未取到用量）」',
+      c4.fallback === true && c4.useUsage === false && c4.hasBanner && c4.hasSub, c4);
 
   /* ══ 13. v7.12 折叠版式：明细区收起成「一行摘要」，展开才是明细 ══
      判据不是"好不好看"，而是三件事：
@@ -782,7 +786,7 @@ try {
       fold.keys);
   chk('v7.12 默认全部收起（收敛态才叫"抓得住重点"）', fold.open === 0 && fold.aria === true, JSON.stringify({ open: fold.open, aria: fold.aria }));
   chk('v7.12 收起态 body 高度都是 0（不是靠 overflow 视觉隐藏）', fold.bodyH.every((h) => h < 1), fold.bodyH);
-  chk('v7.12 收起后整页 < 1600px（改版前 4987px：结论卡 + KPI + 10 行摘要就够看完）',
+  chk('v7.12 收起后整页 < 1600px（改版前 4987px：结论卡 + KPI + 10 行摘要就够看完；v7.15 删卡后只会更短）',
       fold.height > 0 && fold.height < 1600, fold.height + 'px');
   chk('v7.12 标题上移到摘要行（块内 h2 隐藏，但仍留在 DOM 里给脚本按文案查）', fold.h2hidden);
   chk('v7.12 工具条写着「已收起 N / 11 块」且与实际一致',

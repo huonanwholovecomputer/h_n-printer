@@ -1,24 +1,51 @@
 # -*- coding: utf-8 -*-
 """
-xlsx_printer.py — 表格文件（.xls / .xlsx）→ PDF：**让 Excel/WPS 自己排版**
+xlsx_printer.py — 表格文件（.xls / .xlsx）→ PDF：**默认让 Excel/WPS 自己排版**
 
-用户的工作流不是"在工具里再排版一次"，而是先在 Excel 里设好「边距 0.5cm / 页眉页脚 0 /
-水平居中 / 调整所有列到一页」再按 Ctrl+P。所以本工具**必须完全复现 Excel 自己的打印结果**，
-唯一可靠路径就是 Excel/WPS COM 的 `ExportAsFixedFormat`：缩放/页边距/打印区域/分页全由
-Excel 自己算，代码**不得**自行改写页边距、缩放比例、打印区域（一改就与用户看到的预览不一致）。
+默认口径（`print_options=None`，也是既有 GUI 的调用方式）：用户的工作流不是"在工具里再排版
+一次"，而是先在 Excel 里设好「边距 0.5cm / 页眉页脚 0 / 水平居中 / 调整所有列到一页」再按
+Ctrl+P。所以默认**必须完全复现 Excel 自己的打印结果**，唯一可靠路径就是 Excel/WPS COM 的
+`ExportAsFixedFormat`：缩放/页边距/打印区域/分页全由文件自己（Excel/WPS 解释）决定，这条路径
+上代码**不得**写任何 PageSetup（一改就与用户看到的预览不一致，也会让旧缓存对不上）。
+
+显式口径（只有调用方**显式传入 `print_options` 字典**时才发生）：把它当作"本次打印的期望
+版式"，在导出前逐项写进 `PageSetup`（纸张 / 方向 / 页边距 / 页眉页脚 / 居中 / 缩放或
+「调整为 N 页」/ 打印区域）。三条铁律：
+
+  1. **只写在临时副本上**：`export_to_pdf` 本来就把源文件复制进 tempfile 目录再交 COM，
+     PageSetup 只作用于那份副本；工作簿以 `ReadOnly=True` 打开、`Close(SaveChanges=False)`，
+     用户源文件的字节一个都不变（`tests/verify_xlsx_print_options.py` 用 md5 守这条）。
+  2. **只写受支持的属性，逐项记账**：每一项单独 try/except，失败记进
+     `ExportResult.options_applied` 并在日志里点名「X 设置未生效（该引擎/版本不支持）」。
+     Excel 与 WPS 的 `PageSetup` 覆盖面不同（WPS 缺 FitToPages* / PrintArea 的某些组合），
+     绝不允许"设了但没生效却一声不响"。
+  3. **选项进缓存键**：改页边距必须换一份缓存，否则会命中旧 PDF。`cache_key(...,
+     print_options=…)` 追加 `_o{选项签名}`；`print_options=None` 时 key 逐字符与旧版相同，
+     旧缓存照常命中（升级不动存量缓存）。
+
+选项字典（全部可选；缺省按 GUI 打印选项面板的默认值补齐，见 `DEFAULT_PRINT_OPTIONS`，
+由 `normalize_print_options` 归一化）：
+`paper`(A4/A3/A5/Letter/Legal/B5 → PaperSize 9/8/11/1/5/13；含 GUI 面板的 A5，
+不让它静默退化成 A4)、`orientation`(portrait/landscape)、
+`margin_top_cm`/`margin_bottom_cm`/`margin_left_cm`/`margin_right_cm`(cm，内部 ×72/2.54 转 pt)、
+`header_cm`/`footer_cm`、`center_h`/`center_v`(bool)、`fit`(none/sheet/cols/rows)、
+`scale`(10–400)、`print_range`(active/workbook/selection/ignore_area)。
+`print_range="workbook"` 是唯一会用 `Workbook.ExportAsFixedFormat` 导全部工作表的取值
+（默认仍是「活动工作表」，见下）。
 
 引擎优先级：Excel → WPS(表格) → LibreOffice 兜底。兜底会**明写日志**「版式可能与 Excel
 不一致」—— LibreOffice 不认 Excel 的全部排版语义（分页/窄边距/缩放常有偏差），它只是
-"装不上 Excel 时别让用户白跑一趟"的最后一档。
+"装不上 Excel 时别让用户白跑一趟"的最后一档。LibreOffice **不接受** `print_options`：
+带选项降级时日志里会额外写一句「页边距/缩放/打印范围设置未生效」，不允许假装生效。
 
-导出粒度 = **活动工作表**（Excel 打印对话框的默认范围「打印活动工作表」）：
+导出粒度（默认）= **活动工作表**（Excel 打印对话框的默认范围「打印活动工作表」）：
 `Workbook.ExportAsFixedFormat` 会导出**全部**工作表，实测一个两工作表的工作簿导出 17 页，
-而用户手里的参照 PDF 只有 5 页（正是活动工作表那一张）⇒ 一律导 `wb.ActiveSheet`。
+而用户手里的参照 PDF 只有 5 页（正是活动工作表那一张）⇒ 默认导 `wb.ActiveSheet`。
 日志里写清导出的 sheet 名与工作簿里一共几个 sheet，让人能核对"为什么只打了这几页"。
 
 缓存身份：同一个 xlsx 用 Excel 与用 LibreOffice 导出的版式不同，**不能混用缓存**。
-key 形态 `{md5}[_方向]_x{engine}`（`_xexcel` / `_xwps` / `_xlo`），读侧按引擎优先级探测
-**当前仍可用的**引擎产物（Excel 卸载后就跳过 `_xexcel` 旧的，重新用 WPS 转）。
+key 形态 `{md5}[_方向]_x{engine}[_o{选项签名}]`（`_xexcel` / `_xwps` / `_xlo`），读侧按引擎
+优先级探测**当前仍可用的**引擎产物（Excel 卸载后就跳过 `_xexcel` 旧的，重新用 WPS 转）。
 
 安全（S1-04 同一口径）：
   · 本地文件：Excel/WPS COM，实例用 `DispatchEx` 私有进程 + 打开前硬化
@@ -36,6 +63,8 @@ key 形态 `{md5}[_方向]_x{engine}`（`_xexcel` / `_xwps` / `_xlo`），读侧
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -99,6 +128,10 @@ class ExportResult:
     fallback: bool = False      # 是否走了兜底引擎（LibreOffice）
     hardened: dict = field(default_factory=dict)   # 逐项硬化结果（没有 COM 时为空）
     elapsed: float = 0.0
+    # 本次生效的页面设置（归一化后的字典；没传 print_options 时为空 = 旧行为）
+    print_options: dict = field(default_factory=dict)
+    # 逐项记账 {属性名: 是否真的写进去了}；LibreOffice 兜底为本引擎不支持 ⇒ 空
+    options_applied: dict = field(default_factory=dict)
 
     @property
     def engine_label(self) -> str:
@@ -107,6 +140,13 @@ class ExportResult:
     @property
     def cache_tag(self) -> str:
         return CACHE_TAGS.get(self.engine, "")
+
+    @property
+    def options_honored(self) -> bool:
+        """请求了 print_options 时，是否每一项都真的生效（没请求 → True）。"""
+        if not self.print_options:
+            return True
+        return bool(self.options_applied) and all(self.options_applied.values())
 
 
 # ============================================================
@@ -209,15 +249,196 @@ def reset_probe_cache() -> None:
 
 
 # ============================================================
-# PDF 缓存 key（含引擎身份）
+# 页面设置选项（print_options）—— 只有显式传入时才碰 PageSetup
 # ============================================================
 
-def cache_key(source_md5: str, image_orientation: str = "", engine: str = "") -> str:
-    """表格文件的 PDF 缓存 key：`{md5}[_方向]_x{引擎}`。
+# 纸张名 → Excel `PageSetup.PaperSize` 常量
+# （xlPaperA4=9 / A3=8 / A5=11 / Letter=1 / Legal=5 / B5=13）
+# A5 是 GUI 面板也会给出的取值（printer_config.PAPER_SIZES），必须有映射：
+# 少一项就会静默回退 A4，用户选 A5 打出 A4 —— 这类"设了没生效"正是契约禁止的。
+PAPER_SIZES = {"A4": 9, "A3": 8, "A5": 11, "Letter": 1, "Legal": 5, "B5": 13}
+
+# 方向 → `PageSetup.Orientation`（xlPortrait=1 / xlLandscape=2）
+ORIENTATIONS = {"portrait": 1, "landscape": 2}
+
+# 缩放口径：none = 固定百分比；sheet/cols/rows = 「调整为 N 页」的各维度
+FIT_MODES = ("none", "sheet", "cols", "rows")
+
+# 打印范围：active = 活动工作表（默认，与旧行为一致）；workbook = 全部工作表；
+# selection = COM 侧拿不到真实选区 ⇒ 用 ActiveSheet.UsedRange 顶替；ignore_area = 清空 PrintArea
+PRINT_RANGES = ("active", "workbook", "selection", "ignore_area")
+
+# cm → pt：PageSetup 的 *Margin 单位是磅，1 inch = 72 pt
+CM_TO_PT = 72.0 / 2.54
+
+# 归一化默认值（Lead 2026-11-03 定稿，与 GUI 打印选项面板默认值同一份口径）：
+# A4 纵向；页边距四边 1cm；页眉/页脚 0；水平居中开、垂直居中关；
+# 缩放「将所有列调整为一页」(fit=cols)；打印范围「活动工作表」。
+# 注意：`scale` 只在 fit="none" 时才生效（fit≠none 时 COM 走 FitToPages*，Zoom=False）。
+DEFAULT_PRINT_OPTIONS = {
+    "paper": "A4",
+    "orientation": "portrait",
+    "margin_top_cm": 1.0,
+    "margin_bottom_cm": 1.0,
+    "margin_left_cm": 1.0,
+    "margin_right_cm": 1.0,
+    "header_cm": 0.0,
+    "footer_cm": 0.0,
+    "center_h": True,
+    "center_v": False,
+    "fit": "cols",
+    "scale": 100,
+    "print_range": "active",
+}
+
+_MARGIN_MIN_CM = 0.0
+_MARGIN_MAX_CM = 20.0          # 超过 A4 短边的"边距"没有意义，钳住防 COM 抛错
+_SCALE_MIN, _SCALE_MAX = 10, 400   # Excel 允许的缩放百分比范围
+
+_TRUE_WORDS = {"1", "true", "yes", "on", "y", "是", "开", "打开"}
+_FALSE_WORDS = {"0", "false", "no", "off", "n", "否", "关", "关闭", ""}
+
+
+def _choice_name(value, table: dict, default: str, field_name: str) -> str:
+    """把取值按不区分大小写对到 table 的规范名；对不上就回退默认并打日志。"""
+    if value is None:
+        return default
+    text = str(value).strip()
+    if not text:
+        return default
+    for name in table:
+        if name.lower() == text.lower():
+            return name
+    logger.warning(f"print_options[{field_name}]={value!r} 不是支持的取值（{sorted(table)}），回退 {default}")
+    return default
+
+
+def _as_cm(value, default: float, field_name: str) -> float:
+    """页边距：转 float、钳 0–20cm、保留 2 位（保证选项签名可复现）。"""
+    if value is None:
+        return default
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        logger.warning(f"print_options[{field_name}]={value!r} 不是数字，回退 {default:g}cm")
+        return default
+    if num != num or num in (float("inf"), float("-inf")):   # NaN / inf
+        logger.warning(f"print_options[{field_name}]={value!r} 不是有限数，回退 {default:g}cm")
+        return default
+    return round(max(_MARGIN_MIN_CM, min(_MARGIN_MAX_CM, num)), 2)
+
+
+def _as_scale(value) -> int:
+    if value is None:
+        return DEFAULT_PRINT_OPTIONS["scale"]
+    try:
+        num = int(round(float(value)))
+    except (TypeError, ValueError):
+        logger.warning(f"print_options[scale]={value!r} 不是数字，回退 100")
+        return 100
+    return max(_SCALE_MIN, min(_SCALE_MAX, num))
+
+
+def _as_bool(value, default: bool = False, field_name: str = "") -> bool:
+    """真值解析：字符串 "false"/"0"/"关" 必须得 False（`bool("false")` 是 True，坑）。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _TRUE_WORDS:
+        return True
+    if text in _FALSE_WORDS:
+        return False
+    logger.warning(f"print_options[{field_name}]={value!r} 无法当布尔值，回退 {default}")
+    return default
+
+
+def normalize_print_options(print_options) -> dict | None:
+    """把 `print_options` 归一化成一份可复现的字典；**None 原样返回 None**。
+
+    返回 None 是唯一的"走旧路径"信号：调用方完全不碰 PageSetup，缓存 key 也不加选项后缀，
+    因此 `None` 与旧版逐字节一致、旧缓存仍命中。非 dict 的误传（字符串/True…）打 warning
+    后同样返回 None —— 宁可退回旧行为，也不猜用户想改什么。
+    """
+    if print_options is None:
+        return None
+    if not isinstance(print_options, dict):
+        logger.warning(f"print_options 不是字典（{type(print_options).__name__}），按未传处理（不改版式）")
+        return None
+    raw = print_options
+    known = set(DEFAULT_PRINT_OPTIONS)
+    unknown = sorted(str(k) for k in raw if k not in known)
+    if unknown:
+        logger.debug(f"print_options 忽略未知键: {', '.join(unknown)}")
+    return {
+        "paper": _choice_name(raw.get("paper"), PAPER_SIZES, DEFAULT_PRINT_OPTIONS["paper"], "paper"),
+        "orientation": _choice_name(raw.get("orientation"), ORIENTATIONS,
+                                    DEFAULT_PRINT_OPTIONS["orientation"], "orientation"),
+        "margin_top_cm": _as_cm(raw.get("margin_top_cm"), DEFAULT_PRINT_OPTIONS["margin_top_cm"], "margin_top_cm"),
+        "margin_bottom_cm": _as_cm(raw.get("margin_bottom_cm"), DEFAULT_PRINT_OPTIONS["margin_bottom_cm"], "margin_bottom_cm"),
+        "margin_left_cm": _as_cm(raw.get("margin_left_cm"), DEFAULT_PRINT_OPTIONS["margin_left_cm"], "margin_left_cm"),
+        "margin_right_cm": _as_cm(raw.get("margin_right_cm"), DEFAULT_PRINT_OPTIONS["margin_right_cm"], "margin_right_cm"),
+        "header_cm": _as_cm(raw.get("header_cm"), DEFAULT_PRINT_OPTIONS["header_cm"], "header_cm"),
+        "footer_cm": _as_cm(raw.get("footer_cm"), DEFAULT_PRINT_OPTIONS["footer_cm"], "footer_cm"),
+        "center_h": _as_bool(raw.get("center_h"), DEFAULT_PRINT_OPTIONS["center_h"], "center_h"),
+        "center_v": _as_bool(raw.get("center_v"), DEFAULT_PRINT_OPTIONS["center_v"], "center_v"),
+        "fit": _choice_name(raw.get("fit"), {k: k for k in FIT_MODES},
+                            DEFAULT_PRINT_OPTIONS["fit"], "fit"),
+        "scale": _as_scale(raw.get("scale")),
+        "print_range": _choice_name(raw.get("print_range"), {k: k for k in PRINT_RANGES},
+                                    DEFAULT_PRINT_OPTIONS["print_range"], "print_range"),
+    }
+
+
+def options_signature(print_options) -> str:
+    """选项签名的稳定短哈希（8 位十六进制）；None/空字典 ⇒ `""`（旧 key 形态）。"""
+    if not print_options:
+        return ""
+    try:
+        payload = json.dumps(print_options, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"))
+    except (TypeError, ValueError):
+        logger.warning("print_options 无法序列化，缓存 key 不加选项签名")
+        return ""
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
+
+
+def describe_print_options(options: dict | None) -> str:
+    """一行人话（日志用），例如 `A4 纵向 边距 上/下 1cm 左/右 1cm 所有列调整为一页`。"""
+    if not options:
+        return "（默认，不改版式）"
+    orient = "纵向" if options.get("orientation") == "portrait" else "横向"
+    fit = options.get("fit")
+    if fit == "none":
+        fit_text = f"缩放 {options.get('scale')}%"
+    else:
+        fit_text = {"sheet": "调整为 1 页宽×1 页高", "cols": "调整为 1 页宽",
+                    "rows": "调整为 1 页高"}.get(str(fit), f"调整为 {fit}")
+    return (
+        f"{options.get('paper')} {orient}，边距 上/下 {options.get('margin_top_cm')!s}/"
+        f"{options.get('margin_bottom_cm')!s}cm 左/右 {options.get('margin_left_cm')!s}/"
+        f"{options.get('margin_right_cm')!s}cm，页眉/页脚 {options.get('header_cm')!s}/"
+        f"{options.get('footer_cm')!s}cm，{fit_text}，打印范围={options.get('print_range')}"
+    )
+
+
+# ============================================================
+# PDF 缓存 key（含引擎身份 + 页面设置签名）
+# ============================================================
+
+def cache_key(source_md5: str, image_orientation: str = "", engine: str = "",
+              print_options=None) -> str:
+    """表格文件的 PDF 缓存 key：`{md5}[_方向]_x{引擎}[_o{选项签名}]`。
 
     方向后缀规则与 `cloud_client.pdf_cache_key` **同一真相**（延迟 import，取不到时按
     同一条规则本地实现）；引擎后缀用表格专用的 `_x…`，不与 docx 的 `_e…` 混用，
     也就不会被 `_purge_stale_engine_entries`（只清非 docx 的 `_eword/_ewps`）误删。
+
+    `print_options` 非 None 时追加 `_o{签名}`：改页边距/缩放/打印区域必须换一份缓存，
+    否则会命中按旧版式导出的 PDF。传 None 时 key 与旧版**逐字符相同**，存量缓存照常命中。
     """
     md5 = str(source_md5 or "")
     if not md5:
@@ -230,15 +451,19 @@ def cache_key(source_md5: str, image_orientation: str = "", engine: str = "") ->
         if image_orientation in ("landscape", "portrait"):
             base = f"{base}_{image_orientation}"
     tag = CACHE_TAGS.get(str(engine or ""), "")
-    return f"{base}_x{tag}" if tag else base
+    if tag:
+        base = f"{base}_x{tag}"
+    sig = options_signature(normalize_print_options(print_options))
+    return f"{base}_o{sig}" if sig else base
 
 
 def find_cached_pdf(source_md5: str, image_orientation: str = "",
-                    cache_dir: str = "") -> str | None:
+                    cache_dir: str = "", print_options=None) -> str | None:
     """按引擎优先级找一份**当前仍可用引擎**产出的缓存 PDF；没有则 None。
 
     只探测可用引擎：Excel 卸载后 `_xexcel` 的旧产物不能再用（版式与现有引擎不一致），
     直接跳过并让上层重新转换。文件头必须是 %PDF（半截/损坏的缓存视为未命中）。
+    `print_options` 参与 key：带选项时只命中"同一套选项"导出的那份，不会拿到旧版式。
     """
     if not source_md5:
         return None
@@ -250,7 +475,8 @@ def find_cached_pdf(source_md5: str, image_orientation: str = "",
         except Exception:  # noqa: BLE001
             return None
     for eng in live_engines():
-        path = os.path.join(cdir, cache_key(source_md5, image_orientation, eng) + ".pdf")
+        path = os.path.join(cdir, cache_key(source_md5, image_orientation, eng, print_options) + ".pdf")
+
         if not os.path.isfile(path):
             continue
         try:
@@ -579,10 +805,157 @@ def _export_worksheet_pdf(ws, abs_out: str) -> None:
         ws.ExportAsFixedFormat(0, abs_out, 0, True, False)
 
 
-def _export_with_com(engine: str, abs_src: str, abs_out: str) -> ExportResult:
-    """用 Excel / WPS 的 COM 导出活动工作表。失败抛异常（由调用方决定是否降级）。"""
+def _export_workbook_pdf(wb, abs_out: str) -> None:
+    """把**整个工作簿**导出成 PDF（只有 `print_options["print_range"]=="workbook"` 走这里）。
+
+    导出参数与 `_export_worksheet_pdf` 完全一致（Type=0 / Quality=0 /
+    IgnorePrintAreas=False 尊重各表自己的打印区域 / OpenAfterPublish=False），只是对象从
+    Worksheet 换成 Workbook —— 顺序是 Excel 打印对话框的「打印整个工作簿」。
+    """
+    try:
+        wb.ExportAsFixedFormat(
+            Type=0, Filename=abs_out, Quality=0,
+            IncludeDocProperties=True, IgnorePrintAreas=False, OpenAfterPublish=False)
+    except TypeError:
+        # 老 WPS 不认关键字参数：位置参数顺序同上（From/To 省略）
+        wb.ExportAsFixedFormat(0, abs_out, 0, True, False)
+    except AttributeError as e:
+        # 有些 WPS 版本只有 Worksheet.ExportAsFixedFormat，没有 Workbook 级：别让用户看到
+        # 一句没头没脑的 AttributeError —— 明说"整本导出不支持"以及怎么绕。
+        raise XlsxExportError(
+            "该引擎的 Workbook 不支持整本导出（ExportAsFixedFormat）："
+            "请把打印范围改成「活动工作表」，或换 Excel 重试"
+            f"（原始错误: {e}）") from e
+
+
+def _apply_print_options_on_sheet(ws, options: dict, label: str = "") -> dict[str, bool]:
+    """把一套归一化选项写进**一个**工作表的 `PageSetup`；返回 `{属性名: 是否生效}`。
+
+    每项单独 try/except：Excel 与 WPS 的 PageSetup 覆盖面不同（WPS 缺 FitToPages* 的某些
+    组合、PrintArea 赋值偶发不支持），一项失败不能让整次导出失败，但必须逐项记账 + 打日志，
+    绝不允许「设了却没生效」无声通过。
+    """
+    applied: dict[str, bool] = {}
+    try:
+        ps = ws.PageSetup
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"{label}: 取不到 PageSetup，本轮页面设置整体未生效: {e}")
+        return {"PageSetup": False}
+    if ps is None:
+        logger.warning(f"{label}: PageSetup 为空，本轮页面设置整体未生效")
+        return {"PageSetup": False}
+
+    def put(name: str, value) -> None:
+        try:
+            setattr(ps, name, value)
+            applied[name] = True
+        except Exception as e:  # noqa: BLE001
+            applied[name] = False
+            logger.warning(f"{label}: PageSetup.{name} 设置未生效（该引擎/版本不支持）: {e}")
+
+    # 纸张 / 方向
+    put("PaperSize", PAPER_SIZES[options["paper"]])
+    put("Orientation", ORIENTATIONS[options["orientation"]])
+
+    # 页边距：cm → pt（Excel 的 PageSetup.*Margin 单位是磅）
+    put("TopMargin", round(options["margin_top_cm"] * CM_TO_PT, 4))
+    put("BottomMargin", round(options["margin_bottom_cm"] * CM_TO_PT, 4))
+    put("LeftMargin", round(options["margin_left_cm"] * CM_TO_PT, 4))
+    put("RightMargin", round(options["margin_right_cm"] * CM_TO_PT, 4))
+    put("HeaderMargin", round(options["header_cm"] * CM_TO_PT, 4))
+    put("FooterMargin", round(options["footer_cm"] * CM_TO_PT, 4))
+
+    # 居中
+    put("CenterHorizontally", bool(options["center_h"]))
+    put("CenterVertically", bool(options["center_v"]))
+
+    # 缩放：fit="none" ⇒ 固定百分比；其余 ⇒ FitToPages*（Zoom=False 即"自动缩放"）。
+    # 先关 FitToPages* 再设 Zoom，反过来在某些版本会被忽略。
+    fit = options["fit"]
+    if fit == "none":
+        put("FitToPagesWide", False)
+        put("FitToPagesTall", False)
+        put("Zoom", int(options["scale"]))
+    else:
+        put("Zoom", False)
+        put("FitToPagesWide", 1 if fit in ("sheet", "cols") else False)
+        put("FitToPagesTall", 1 if fit in ("sheet", "rows") else False)
+
+    # 打印区域：active/workbook 保持文件里已有的（尊重用户设置）；ignore_area 清空；
+    # selection 在 COM 侧拿不到真实选区 ⇒ 用已用区域顶替并在日志里说明。
+    print_range = options["print_range"]
+    if print_range == "ignore_area":
+        put("PrintArea", "")
+    elif print_range == "selection":
+        try:
+            address = str(ws.UsedRange.Address)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{label}: 取不到 UsedRange.Address，selection 打印范围未生效（不写 PrintArea）: {e}")
+            applied["PrintArea"] = False
+        else:
+            logger.info(f"{label}: print_range=selection，COM 侧没有真实选区，用整张已用区域 {address} 顶替")
+            put("PrintArea", address)
+    return applied
+
+
+def _apply_print_options(wb, options: dict, label: str = "") -> dict[str, bool]:
+    """在**临时副本**的工作簿上应用页面设置；返回逐项记账（多表时任一失败即 False）。
+
+    写哪些表：`print_range=="workbook"` 时要导出全部工作表 ⇒ 全部写；否则只写参与导出的
+    活动工作表（与 `_export_with_com` 的导出粒度同一真相）。集合取不到 `Worksheets` 时
+    退回 `Sheets`（老 WPS），再取不到就只写活动工作表。
+    """
+    sheets: list = []
+    if options.get("print_range") == "workbook":
+        coll = None
+        try:
+            coll = wb.Worksheets
+        except Exception:  # noqa: BLE001
+            try:
+                coll = wb.Sheets
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{label}: 取不到工作表集合，页面设置只作用于活动工作表: {e}")
+        if coll is not None:
+            try:
+                count = int(coll.Count)
+            except Exception:  # noqa: BLE001
+                count = 0
+            for i in range(1, count + 1):
+                try:
+                    sheets.append(coll.Item(i) if hasattr(coll, "Item") else coll(i))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"{label}: 取第 {i} 个工作表失败（跳过它的页面设置）: {e}")
+    if not sheets:
+        try:
+            sheets = [wb.ActiveSheet]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{label}: 取不到活动工作表，页面设置未生效: {e}")
+            return {"ActiveSheet": False}
+
+    applied: dict[str, bool] = {}
+    for ws in sheets:
+        sheet_name = ""
+        try:
+            sheet_name = str(ws.Name)
+        except Exception:  # noqa: BLE001
+            sheet_name = ""
+        one = _apply_print_options_on_sheet(ws, options, f"{label}「{sheet_name}」" if sheet_name else label)
+        for k, ok in one.items():
+            # 汇总时去掉工作表前缀：多表里任一表写失败即记 False（options_honored 据此为 False）
+            applied[k] = applied.get(k, True) and ok
+    return applied
+
+
+def _export_with_com(engine: str, abs_src: str, abs_out: str,
+                     print_options=None) -> ExportResult:
+    """用 Excel / WPS 的 COM 导出工作表（或整本）。失败抛异常（由调用方决定是否降级）。
+
+    `print_options` 为 None 时**完全不碰 PageSetup**（与旧版逐字节一致的路径）；非 None 时
+    只写进此时 COM 打开的临时副本（`export_to_pdf` 复制出来的那份），源文件不动。
+    """
     import pythoncom  # noqa: PLC0415
 
+    options = normalize_print_options(print_options)
     label = engine_label(engine)
     t0 = time.time()
     pythoncom.CoInitialize()   # P1 口径：与 converter 一致，finally 无条件配对反初始化
@@ -614,14 +987,30 @@ def _export_with_com(engine: str, abs_src: str, abs_out: str) -> ExportResult:
         except Exception:  # noqa: BLE001
             sheet_name = ""
 
-        _export_worksheet_pdf(ws, abs_out)
+        options_applied: dict[str, bool] = {}
+        whole_book = bool(options) and options.get("print_range") == "workbook"
+        if options is not None:
+            logger.info(f"{label} 应用页面设置（只作用于临时副本）: {describe_print_options(options)}")
+            options_applied = _apply_print_options(wb, options, label)
+            failed = sorted(k for k, ok in options_applied.items() if not ok)
+            if failed:
+                logger.warning(
+                    f"{label} 以下页面设置未生效（该引擎/版本不支持，导出的 PDF 可能与设定不符）: "
+                    f"{', '.join(failed)}")
+
+        if whole_book:
+            _export_workbook_pdf(wb, abs_out)
+            sheet_name = f"全部 {sheet_count} 个工作表" if sheet_count else "全部工作表"
+        else:
+            _export_worksheet_pdf(ws, abs_out)
 
         if not os.path.isfile(abs_out) or os.path.getsize(abs_out) <= 0:
             raise XlsxExportError(f"{label} 报告成功但没有生成 PDF: {os.path.basename(abs_src)}")
-        if sheet_count > 1:
+        if sheet_count > 1 and not whole_book:
             logger.warning(
                 f"{label} 导出的是活动工作表「{sheet_name}」（该工作簿共 {sheet_count} 个工作表）。"
-                f"Excel 默认打印范围就是活动工作表；若用户要打其它表，请在 Excel 里切到那张表另存。"
+                f"Excel 默认打印范围就是活动工作表；若用户要打其它表，请在 Excel 里切到那张表另存，"
+                f"或显式传 print_options={{'print_range': 'workbook'}}。"
                 f" ({os.path.basename(abs_src)})")
         logger.info(
             f"{label} → PDF 完成: sheet=「{sheet_name}」({sheet_count} 个工作表)，"
@@ -629,7 +1018,9 @@ def _export_with_com(engine: str, abs_src: str, abs_out: str) -> ExportResult:
         return ExportResult(engine=engine, pdf_path=abs_out, sheet=sheet_name,
                             sheet_count=sheet_count,
                             fallback=(engine == "libreoffice"),
-                            hardened=applied, elapsed=time.time() - t0)
+                            hardened=applied, elapsed=time.time() - t0,
+                            print_options=dict(options or {}),
+                            options_applied=dict(options_applied))
     finally:
         if wb is not None:
             try:
@@ -666,17 +1057,29 @@ def _export_with_com(engine: str, abs_src: str, abs_out: str) -> ExportResult:
             pass
 
 
-def _export_with_libreoffice(abs_src: str, abs_out: str) -> ExportResult:
-    """LibreOffice 兜底：**版式可能与 Excel 不一致**（日志里明写，别让人以为是同一结果）。"""
+def _export_with_libreoffice(abs_src: str, abs_out: str, print_options=None) -> ExportResult:
+    """LibreOffice 兜底：**版式可能与 Excel 不一致**（日志里明写，别让人以为是同一结果）。
+
+    LibreOffice 不认 `print_options`：带选项降级时必须再补一句「设置未生效」，
+    否则用户会以为页边距/缩放真的按面板生效了。
+    """
+    options = normalize_print_options(print_options)
     logger.warning(
         "LibreOffice 兜底，版式可能与 Excel 不一致（缩放/页边距/分页的解释不同；"
         "并且 LibreOffice 导出的是全部工作表，Excel 默认只打活动工作表）。"
         f" ({os.path.basename(abs_src)})")
+    if options is not None:
+        logger.warning(
+            "LibreOffice 不接受页边距/缩放/打印范围设置：print_options 设置未生效，"
+            f"本次 PDF 不是按面板版式导出的（{describe_print_options(options)}）。"
+            "若必须按此版式出纸，请安装 Microsoft Excel 或 WPS。"
+            f" ({os.path.basename(abs_src)})")
     import converter  # noqa: PLC0415
     converter._convert_office_via_libreoffice(abs_src, abs_out)
     if not os.path.isfile(abs_out) or os.path.getsize(abs_out) <= 0:
         raise XlsxExportError(f"LibreOffice 没有生成 PDF: {os.path.basename(abs_src)}")
-    return ExportResult(engine="libreoffice", pdf_path=abs_out, fallback=True)
+    return ExportResult(engine="libreoffice", pdf_path=abs_out, fallback=True,
+                        print_options=dict(options or {}), options_applied={})
 
 
 # ============================================================
@@ -685,8 +1088,9 @@ def _export_with_libreoffice(abs_src: str, abs_out: str) -> ExportResult:
 
 def export_to_pdf(file_path: str, output_pdf: str | None = None, *,
                   from_cloud: bool = False, allow_cloud_com: bool = False,
-                  prefer_engine: str = "") -> ExportResult:
-    """表格文件 → PDF（Excel 自己排版）。
+                  prefer_engine: str = "", print_options=None,
+                  engine: str = "") -> ExportResult:
+    """表格文件 → PDF（默认 Excel 自己排版；显式 print_options 才按面板版式）。
 
     Args:
         file_path: 源文件（.xls/.xlsx）。**只读**打开，绝不修改它。
@@ -695,9 +1099,14 @@ def export_to_pdf(file_path: str, output_pdf: str | None = None, *,
             （不给 COM 任何宏/外链执行机会，与 Word/PDF 同一条 S1-04 口径）。
         allow_cloud_com: 「管理员上传」放行位（口径见 printer_config.cloud_word_com_allowed）。
         prefer_engine: 指定首选引擎（"excel"/"wps"/"libreoffice"），其余仍按优先级降级。
+        print_options: **显式**的页面设置字典（见模块 docstring）。None ⇒ 与旧版逐字节一致的
+            行为，完全不碰 PageSetup、缓存 key 也不带选项后缀；非 None ⇒ 归一化后只写进
+            临时副本，LibreOffice 兜底会明写「设置未生效」。
+        engine: `prefer_engine` 的兼容别名（GUI 调用方两个名字都用过）。
 
     Returns:
-        ExportResult（engine / pdf_path / sheet / sheet_count / fallback / hardened / elapsed）
+        ExportResult（engine / pdf_path / sheet / sheet_count / fallback / hardened / elapsed /
+        print_options / options_applied；`options_honored` 判断设置是否真的全部生效）
 
     Raises:
         XlsxExportError: 预检失败（加密/损坏/空文件）或所有引擎都失败。
@@ -706,6 +1115,9 @@ def export_to_pdf(file_path: str, output_pdf: str | None = None, *,
         raise XlsxExportError(f"文件不存在: {file_path}")
     if not is_xlsx(file_path):
         raise XlsxExportError(f"不是表格文件（xls/xlsx）: {file_path}")
+
+    options = normalize_print_options(print_options)
+    prefer = str(prefer_engine or engine or "")
 
     created_temp = False
     out = output_pdf
@@ -717,7 +1129,8 @@ def export_to_pdf(file_path: str, output_pdf: str | None = None, *,
 
     validate_xlsx(file_path)
 
-    # 工作副本：COM 打开期间不加锁用户文件；同时剥掉 MOTW（受保护视图）
+    # 工作副本：COM 打开期间不加锁用户文件；同时剥掉 MOTW（受保护视图）。
+    # print_options 的 PageSetup 也只写在这份副本上 ⇒ 源文件字节不变。
     temp_input = ""
     try:
         ext = os.path.splitext(file_path)[1]
@@ -734,8 +1147,8 @@ def export_to_pdf(file_path: str, output_pdf: str | None = None, *,
                         f" ({os.path.basename(file_path)})")
         else:
             order = list(ENGINE_ORDER)
-            if str(prefer_engine or "") in order:
-                order = [prefer_engine] + [e for e in order if e != prefer_engine]
+            if prefer in order:
+                order = [prefer] + [e for e in order if e != prefer]
 
         errors: list[str] = []
         for eng in order:
@@ -744,10 +1157,16 @@ def export_to_pdf(file_path: str, output_pdf: str | None = None, *,
                 continue
             try:
                 if eng == "libreoffice":
-                    return _export_with_libreoffice(src, out)
+                    # 旧调用形态（不传 print_options=None）保持不变：老测试桩/老调用方兼容
+                    if options is None:
+                        return _export_with_libreoffice(src, out)
+                    return _export_with_libreoffice(src, out, print_options=options)
                 logger.info(f"引擎选择: {engine_label(eng)}（原生导出版式，与 Excel 打印一致）"
                             f" ({os.path.basename(file_path)})")
-                res = _export_with_com(eng, src, out)
+                if options is None:
+                    res = _export_with_com(eng, src, out)
+                else:
+                    res = _export_with_com(eng, src, out, print_options=options)
                 _verify_product(out)
                 return res
             except Exception as e:  # noqa: BLE001 —— 逐级降级，最后一档才报错
@@ -797,8 +1216,10 @@ def _verify_product(path: str) -> None:
 
 def export_and_cache_tag(file_path: str, output_pdf: str | None = None, *,
                          from_cloud: bool = False, allow_cloud_com: bool = False,
-                         prefer_engine: str = "") -> tuple[str, ExportResult]:
+                         prefer_engine: str = "", print_options=None,
+                         engine: str = "") -> tuple[str, ExportResult]:
     """`export_to_pdf` 的便捷形式：返回 `(pdf_path, result)`（省得调用方取 .pdf_path）。"""
     res = export_to_pdf(file_path, output_pdf, from_cloud=from_cloud,
-                        allow_cloud_com=allow_cloud_com, prefer_engine=prefer_engine)
+                        allow_cloud_com=allow_cloud_com, prefer_engine=prefer_engine,
+                        print_options=print_options, engine=engine)
     return res.pdf_path, res

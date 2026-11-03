@@ -408,7 +408,8 @@
                 <view class="recent-order-limit-save" id="recentOrderLimitSave">保存</view>
                 <view class="recent-order-limit-cancel" id="recentOrderLimitCancel">取消</view>
               </view>
-              <view class="recent-orders-card" id="recentOrderList"></view>
+              <!-- 入口卡（内容由 me.js renderRecentOrders 注入；点击进独立页翻页） -->
+              <view id="recentOrderList"></view>
             </view>
 
             <!-- 生成许可密钥 -->
@@ -669,6 +670,68 @@
               </view>
             </view>
             <view class="end-hint" id="userOrdersEndHint" style="display:none">
+              <text class="end-hint-text">-- 没有更多内容啦 --</text>
+            </view>
+          </view>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 子视图：最近订单（管理员，2026-11 需求 #3） =====
+       原「我」页内嵌的「最近 N 条订单」搬到这里，支持真正的分页
+       （GET /api/admin/recent_orders?page=&per_page=）：行内金额点一下复制
+       「订单号 — ¥金额」，异常终态文字点一下弹原因气泡。 -->
+  <div class="page-root view" id="view-recent-orders" style="display:none">
+    <div class="scroller" id="scroller-recent-orders">
+      <div class="scroll-content" id="scrollContentRecentOrders">
+        <div class="container">
+
+          <!-- 非管理员：后端也会 403，这里先给个明白的空态，别让人对着白屏猜 -->
+          <view class="empty-state" id="roNoPermission" style="display:none">
+            <view class="empty-illustration"><text class="empty-icon">🔒</text></view>
+            <text class="empty-title">仅管理员可查看</text>
+            <text class="empty-desc">最近订单是管理者视角的全局列表；普通用户请到「我的打印任务」查看自己的订单。</text>
+          </view>
+
+          <view class="orders-section" id="roSection">
+
+            <!-- 汇总：共 N 条 · 第 x/y 页 + 刷新 -->
+            <view class="orders-summary" id="roSummary" style="display:none">
+              <text class="summary-text" id="roSummaryText"></text>
+              <view class="ro-refresh" id="roRefresh">↻ 刷新</view>
+            </view>
+
+            <!-- 顶部：每页条数 + 页码（结构与「我的打印任务」一致） -->
+            <view class="orders-pagination-bar" id="roPager" style="display:none">
+              <view class="page-size-selector" id="roPageSizeSelector">
+                <text class="page-size-text" id="roPageSizeText">20条/页</text>
+                <text class="page-size-arrow" id="roPageSizeArrow">▼</text>
+                <view class="page-size-dropdown" id="roPageSizeDropdown">
+                  <view class="page-size-option" data-size="10">10 条/页</view>
+                  <view class="page-size-option option-active" data-size="20">20 条/页</view>
+                  <view class="page-size-option" data-size="50">50 条/页</view>
+                  <view class="page-size-option" data-size="100">100 条/页</view>
+                </view>
+              </view>
+              <view class="page-nav">
+                <view class="page-btn" id="roPrev">‹</view>
+                <view class="page-numbers" id="roPageNumbers"></view>
+                <view class="page-btn" id="roNext">›</view>
+              </view>
+            </view>
+
+            <view id="roList"></view>
+
+            <!-- 底部：页码 + 没有更多 -->
+            <view class="orders-pagination-bar pagination-bottom" id="roPagerBottom" style="display:none">
+              <view class="page-nav">
+                <view class="page-btn" id="roPrevBottom">‹</view>
+                <view class="page-numbers" id="roPageNumbersBottom"></view>
+                <view class="page-btn" id="roNextBottom">›</view>
+              </view>
+            </view>
+            <view class="end-hint" id="roEndHint" style="display:none">
               <text class="end-hint-text">-- 没有更多内容啦 --</text>
             </view>
           </view>
@@ -981,6 +1044,7 @@
 <script src="print.js"></script>
 <script src="avatar_crop.js"></script>
 <script src="me.js"></script>
+<script src="recent-orders.js"></script>
 
 <!-- 头像裁剪（2026-10-27 用户要求）：选图后先裁剪再上传；见 www/me.js / avatar_crop.js -->
 <view class="modal-mask crop-mask" id="cropMask" style="display:none">

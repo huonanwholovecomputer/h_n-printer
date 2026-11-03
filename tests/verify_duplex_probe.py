@@ -617,9 +617,10 @@ check("Sumatra 路径仍不被用于终止型双面失败（print_pdf 提前返�
 check("★ pages_override 时禁用 Sumatra 降级（源码级）",
       "sumatra = None if pages_override is not None else _find_sumatra_pdf()" in src)
 # 2026-10-27：两条透传调用多了 rotate_slots / landscape_fill（逐面 180° 补偿 + 横向页转 90°），
+# 2026-11-03：末尾又多了 paper（纸张大小，需求 #11 跨文件全局设置），
 # 判据改成"压缩空白后两条调用都以同一串参数结尾"，比钉死某个换行更耐用。
 _flat = " ".join(src.split())
-_TAIL = "pages_override, rotate_180, rotate_slots, landscape_fill)"
+_TAIL = "pages_override, rotate_180, rotate_slots, landscape_fill, paper)"
 check("★ pages_override 与旋转参数透传到 _print_pdf_native 和 _print_via_loop（两条调用都在）",
       _flat.count(_TAIL) >= 2 and src.count("pages_override") >= 8,
       f"tail={_flat.count(_TAIL)}, pages_override={src.count('pages_override')}")

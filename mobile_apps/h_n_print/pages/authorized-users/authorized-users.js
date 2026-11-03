@@ -40,6 +40,7 @@ Component({
       offline_unknown: '断线未知',
       sent: '已完成',
       failed: '失败',
+      timeout: '超时',
       abandoned: '放弃打印',
       rejected: '被打回',
       canceled: '已取消',

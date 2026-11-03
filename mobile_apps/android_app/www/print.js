@@ -2687,6 +2687,9 @@ function priceCopyToast(base) {
   return printState.pricingLoaded ? base : base + '（未同步云端定价，按内置兜底单价计算）';
 }
 
+// 分隔线：与本地打印工具一样是 14 个 ASCII 短横线（不是 U+2500 制表线）
+const PRICE_DASH_LINE = '-'.repeat(14);
+
 function onCopyPrice() {
   const d = printState._lastOrderResult;
   if (!d || !d.files) return;
@@ -2708,8 +2711,10 @@ function onCopyPrice() {
   if (p.deliveryEnabled) total += pyRound2(baseTotal * p.deliveryPercent / 100);
   total += p.urgencyPrice;
   if (p.coverPage) total += p.coverPagePrice;
+  // 与本地打印工具 _on_copy_total 一致：`{订单号} — ¥{金额}`（无订单号只写金额）
   const prefix = allKnown ? '' : '≈ ';
-  const amount = ((d.order_number || '') + ' ').trim() + prefix + '¥' + total.toFixed(2);
+  const money = prefix + '¥' + total.toFixed(2);
+  const amount = d.order_number ? (d.order_number + ' — ' + money) : money;
   copyText(amount, priceCopyToast('已复制价格'));
 }
 
@@ -2720,50 +2725,34 @@ function onCopyDetailPrice() {
   const guard = checkPriceFiles(d.files);
   if (guard.invalid) { showAlert('价格暂不可复制', guard.message, '知道了'); return; }
   const p = orderEchoParams();
-  const lines = ['计费明细'];
-  if (d.order_number) lines.push(d.order_number);
-  lines.push('─'.repeat(14));
-  const allParts = [];
+  const lines = [];
+  // 与本地打印工具 _on_copy_detail 同格式（分隔线用 ASCII 短横线，14 个）
+  if (d.order_number) { lines.push('订单号: ' + d.order_number); lines.push(PRICE_DASH_LINE); }
+  lines.push('计费明细');
+  lines.push(PRICE_DASH_LINE);
   let baseTotal = 0;
   let itemNum = 0;
+  let allKnown = true;
   d.files.forEach(f => {
     itemNum++;
     const r = calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range, f.simplex_pages);
+    if (!r.known) allKnown = false;
     const name = f.file_name || '未知文件';
     const duplexLabel = f.duplex === 'on' ? '双面' : '单面';
-    const rangeLabel = f.page_range ? f.page_range + '页' : '全部页';
+    const rangeLabel = String(f.page_range || '').trim() || '全部';
     lines.push(itemNum + '. ' + name);
-    lines.push('   ' + f.copies + '份 | ' + duplexLabel + ' | ' + rangeLabel);
-    // 「封面单独打印」的页按单面出纸（契约 §2），明细里如实标出来
-    if (f.simplex_pages) lines.push('   单面页: ' + f.simplex_pages);
-    if (Number(f.blank_tail_exclude) === 1) lines.push('   已排除末尾空白页');
-    if (r.cost > 0) { lines.push('   ' + r.formula + '=¥' + r.cost.toFixed(2)); allParts.push(r.cost.toFixed(2)); baseTotal += r.cost; }
-    else lines.push('   💰 ?');
+    lines.push('   ' + (f.copies || 1) + 'x ' + duplexLabel + ' 范围:' + rangeLabel);
+    if (r.cost > 0) { lines.push('   ' + r.formula + ' = ¥' + r.cost.toFixed(2)); baseTotal += r.cost; }
+    else if (!r.known) lines.push('   (页数待确定)');
   });
-  // 派送：未勾选 → 整行不出现（编号也不占位，避免出现「3. 派送：否」这种没选的附加服务）
-  if (p.deliveryEnabled) {
-    itemNum++;
-    const deliveryCost = pyRound2(baseTotal * p.deliveryPercent / 100);   // 与后端同口径取整到分
-    if (p.deliveryPercent > 0 && deliveryCost > 0) {
-      lines.push(itemNum + '. 派送：是 | ' + p.deliveryLocation + ' ' + p.deliveryPercent.toFixed(1) + '% | ￥' + deliveryCost.toFixed(2));
-      allParts.push(deliveryCost.toFixed(2));
-    } else lines.push(itemNum + '. 派送：是 | ' + p.deliveryLocation + '免费');
-  }
-  // 优先级：附加价格为 0（未加价，如默认「低」）→ 整行不出现、编号也不占位
-  // （与未勾选的派送/首页同口径：既然不加钱，「优先级：低 | ￥0」列进明细只是噪声）
-  if (p.urgencyPrice > 0) {
-    itemNum++;
-    lines.push(itemNum + '. 优先级：' + p.urgency + ' | ￥' + p.urgencyPrice.toFixed(2));
-    allParts.push(p.urgencyPrice.toFixed(2));
-  }
-  if (p.coverPage) {
-    itemNum++;
-    lines.push(itemNum + '. 打印首页信息 | ' + p.coverPagePrice.toFixed(2));
-    allParts.push(p.coverPagePrice.toFixed(2));
-  }
-  const totalSum = allParts.reduce((s, x) => s + parseFloat(x), 0);
-  lines.push('─'.repeat(14));
-  lines.push('💰合计: ' + (allParts.join('+') || '0') + '=￥' + totalSum.toFixed(2));
+  // 附加服务费 = 派送（与后端同口径取整到分）+ 加急 + 首页，合并成一行（与本地工具一致）
+  let extra = 0;
+  if (p.deliveryEnabled) extra += pyRound2(baseTotal * p.deliveryPercent / 100);
+  extra += p.urgencyPrice || 0;
+  if (p.coverPage) extra += p.coverPagePrice || 0;
+  if (extra > 0) lines.push('附加服务费: ¥' + extra.toFixed(2));
+  lines.push(PRICE_DASH_LINE);
+  lines.push('💰合计: ' + (allKnown ? '' : '≈ ') + '¥' + (baseTotal + extra).toFixed(2));
   copyText(lines.join('\n'), priceCopyToast('已复制详细价格'));
 }
 

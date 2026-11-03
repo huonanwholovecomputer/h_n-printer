@@ -360,6 +360,9 @@ function setupMeButtons() {
     // 合计价格 → 复制气泡（Popconfirm）。必须挡在卡片折叠之前，否则点价格会把详情收起
     const priceTap = e.target.closest('[data-price-copy]');
     if (priceTap) { e.stopPropagation(); openPricePop(priceTap, priceTap.dataset.priceCopy); return; }
+    // 异常状态文字 → 原因气泡（同样必须挡在折叠之前）
+    const reasonTap = e.target.closest('[data-status-reason]');
+    if (reasonTap) { e.stopPropagation(); openStatusReasonPop(reasonTap, reasonTap.dataset.statusReason); return; }
     const card = e.target.closest('[data-order-id]');
     if (card) toggleOrder(parseInt(card.dataset.orderId, 10));
   });
@@ -1099,7 +1102,9 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
           ${o.source === 'local'
             ? '<text class="order-source-tag tag-local">🖨 本地</text>'
             : '<text class="order-source-tag tag-cloud">☁ 云端</text>'}
-          <text class="order-status ${statusCls}">${esc(statusText)}</text>
+          ${isReasonStatus(o.status)
+            ? `<text class="order-status ${statusCls} status-reason-tap" data-status-reason="${o.id}">${esc(statusText)} ⓘ</text>`
+            : `<text class="order-status ${statusCls}">${esc(statusText)}</text>`}
           ${o.is_admin_print ? '<text class="order-self-print-badge">👤自打</text>' : ''}
         </view>
         <text class="order-number-label">${esc(o.file_summary || o.file || '')}</text>
@@ -1265,34 +1270,18 @@ function renderRecentOrders() {
     count.textContent = String(rows.length);
     count.style.display = rows.length ? '' : 'none';
   }
-  box.innerHTML = rows.length
-    ? rows.map(recentOrderRowHTML).join('')
-    : '<view class="recent-order-empty">暂无订单</view>';
-  measureAll(150);
-}
-
-// 单行订单：归属人（脱敏；点一下看真名，再点回脱敏）+ 时间 + 状态 ／ 文件数·页数·来源 + 价格
-function recentOrderRowHTML(o) {
-  const masked = o.owner_masked || o.owner || '未知';
-  const full = o.owner || masked;
-  const stLabel = ORDER_STATUS_MAP[o.status] || o.status || '';
-  const meta = [];
-  if (o.file_count > 0) meta.push(o.file_count + ' 个文件');
-  if (o.page_count > 0) meta.push(o.page_count + ' 页');
-  if (o.is_admin_print) meta.push('管理员自打');
-  const src = _recentOrderSource(o.source);
-  if (src) meta.push(src);
-  return `<view class="recent-order-row">
-      <view class="recent-order-line">
-        <text class="recent-order-owner" data-recent-owner="${escHtml(String(o.id))}" data-owner-masked="${escHtml(masked)}" data-owner-full="${escHtml(full)}">${escHtml(masked)}</text>
-        <text class="recent-order-time">${escHtml(_recentOrderTime(o.created_at))}</text>
-        ${stLabel ? `<text class="recent-order-status ${orderStatusClass(o.status)}">${escHtml(stLabel)}</text>` : ''}
+  // 2026-11 #3：列表搬进独立子视图（支持真正的分页），这里只留一张入口卡 ——
+  // 位置不变、加载逻辑不变，点进去看全部。
+  const limit = meState.recentOrdersLimit || 10;
+  box.innerHTML = `<view class="recent-orders-entry" onclick="openRecentOrdersView()">
+      <text class="recent-orders-entry-icon">🧾</text>
+      <view class="recent-orders-entry-main">
+        <text class="recent-orders-entry-title">查看最近订单</text>
+        <text class="recent-orders-entry-desc">全部管理员的最近 ${limit} 条${rows.length ? '，当前取到 ' + rows.length + ' 条' : ''}，支持分页翻看</text>
       </view>
-      <view class="recent-order-line">
-        <text class="recent-order-meta">${escHtml(meta.join(' · ') || '—')}</text>
-        <view class="recent-order-price" data-recent-price="${escHtml(String(o.id))}">¥${_priceOrderTotal(o).toFixed(2)}<text class="price-copy-icon">📋</text></view>
-      </view>
+      <text class="recent-orders-entry-arrow">›</text>
     </view>`;
+  measureAll(150);
 }
 
 /* ---------- 超管设置 N（1..100） ----------
@@ -1382,12 +1371,203 @@ async function saveRecentOrdersLimit() {
 
 let _pricePopEl = null;
 
+/* ---------- #5 价格文案 / #9 异常原因：常量与纯函数 ---------- */
+
+// 分隔线：ASCII 短横线 ×14（对齐 local_print_tool/gui.py 的 "-"*14，不是 U+2500 的 ─）
+const PRICE_DASH = '-'.repeat(14);
+// 单价兜底：与 pricing.json 权威值一致（0.3/页 单面、0.4/张 双面）
+const PRICE_FALLBACK = { simplex: 0.30, duplex: 0.40 };
+let _priceRulesCache = null;
+
+// 云端定价（页面内缓存一次）。失败就用兜底值 —— 复制价格不能因为一次网络抖动就罢工。
+async function ensurePriceRules() {
+  if (_priceRulesCache) return _priceRulesCache;
+  try {
+    const r = await api('/api/pricing');
+    const p = (r && r.data && r.data.pricing) || {};
+    const simplex = Number(p.simplex_price);
+    const duplex = Number(p.duplex_price);
+    _priceRulesCache = {
+      simplex: simplex > 0 ? simplex : PRICE_FALLBACK.simplex,
+      duplex: duplex > 0 ? duplex : PRICE_FALLBACK.duplex,
+    };
+  } catch (e) {
+    _priceRulesCache = { simplex: PRICE_FALLBACK.simplex, duplex: PRICE_FALLBACK.duplex };
+  }
+  return _priceRulesCache;
+}
+
+// "1-3,5" → 页码集合（超出 maxPage 的忽略）
+function _pricePageSet(spec, maxPage) {
+  const set = new Set();
+  String(spec || '').split(',').forEach(part => {
+    const s = part.trim();
+    if (!s) return;
+    const m = s.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) {
+      const a = parseInt(m[1], 10);
+      const b = parseInt(m[2], 10);
+      for (let p = Math.min(a, b); p <= Math.max(a, b); p++) {
+        if (p >= 1 && p <= maxPage) set.add(p);
+      }
+    } else if (/^\d+$/.test(s)) {
+      const p = parseInt(s, 10);
+      if (p >= 1 && p <= maxPage) set.add(p);
+    }
+  });
+  return set;
+}
+
+/* 计费公式：克隆 local_print_tool/printer_config.py 的 calc_cost。
+   单面 `N张×sp`；双面 `pairs张×dp`(+`+rem张×sp`)；copies>1 包成 `(公式)×N份`。
+   「封面单独打印」的单面页各占一张（与 charge_units 同口径），所以先把单面页剥出来。 */
+function _priceFormula(f, rules) {
+  const copies = Number(f.copies) || 1;
+  const eff = typeof f.effectivePages === 'number' ? f.effectivePages
+    : (typeof f.effective_pages === 'number' ? f.effective_pages : (Number(f.page_count) || 0));
+  if (eff <= 0) return null;
+  // 兼容两种规则对象：{simplex,duplex}（ensurePriceRules）与 {simplex_price,duplex_price}（/api/pricing 原样）
+  const sp = Number(rules.simplex != null ? rules.simplex : rules.simplex_price) || PRICE_FALLBACK.simplex;
+  const dp = Number(rules.duplex != null ? rules.duplex : rules.duplex_price) || PRICE_FALLBACK.duplex;
+  let pairs;
+  let remainder;
+  const simplexSpec = String(f.simplex_pages || '').trim();
+  if (simplexSpec) {
+    const pc = Number(f.page_count) || eff;
+    const all = _pricePageSet(f.page_range || '', pc);
+    const simplexSet = _pricePageSet(simplexSpec, pc);
+    let simplexCount = 0;
+    simplexSet.forEach(p => { if (!all.size || all.has(p)) simplexCount++; });
+    const rest = Math.max(0, eff - simplexCount);
+    pairs = Math.floor(rest / 2);
+    remainder = simplexCount + (rest % 2);
+  } else if (f.duplex === 'off') {
+    pairs = 0;
+    remainder = eff;
+  } else {
+    pairs = Math.floor(eff / 2);
+    remainder = eff % 2;
+  }
+  const parts = [];
+  if (pairs) parts.push(pairs + '张×' + dp.toFixed(2));
+  if (remainder) parts.push(remainder + '张×' + sp.toFixed(2));
+  if (!parts.length) return null;
+  const inner = parts.join('+');
+  return {
+    formula: copies > 1 ? '(' + inner + ')×' + copies + '份' : inner,
+    cost: Math.round((pairs * dp + remainder * sp) * copies * 100) / 100,
+  };
+}
+
+// 单行：`订单号 — ¥金额`（em dash 两侧空格）；无订单号只写金额
+function buildPriceSimpleText(o) {
+  const no = String((o && o.order_number) || '').trim();
+  const amount = '¥' + _priceOrderTotal(o).toFixed(2);
+  return no ? no + ' — ' + amount : amount;
+}
+
+/* ---------- #9 异常状态原因 ---------- */
+const REASON_STATUSES = ['failed', 'timeout', 'canceled', 'rejected', 'abandoned'];
+const REASON_FALLBACK_TEXT = '该订单未提供具体原因';
+
+function _fmtStatusTime(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return '';
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3] + ' ' + m[4] + ':' + m[5] + ':' + m[6];
+  return s;
+}
+
+function isReasonStatus(status) {
+  return REASON_STATUSES.indexOf(status) >= 0;
+}
+
+// 人工订正记录优先（谁在什么时候改的），其次后端 status_reason，最后兜底文案
+function orderStatusReasonText(o) {
+  if (!o) return REASON_FALLBACK_TEXT;
+  const by = String(o.manual_status_by || '').trim();
+  const label = ORDER_STATUS_MAP[o.status] || o.status || '异常状态';
+  if (by) return by + '在' + (_fmtStatusTime(o.manual_status_at) || '—') + '被标记为' + label;
+  const reason = String(o.status_reason || '').trim();
+  return reason || REASON_FALLBACK_TEXT;
+}
+
+let _statusPopEl = null;
+
+function closeStatusReasonPop() {
+  if (_statusPopEl) {
+    _statusPopEl.remove();
+    _statusPopEl = null;
+  }
+}
+
+/* 原因气泡：挂在 body 末尾 + position:fixed。
+   订单卡片的 .order-card-detail 有 overflow:hidden/max-height，滚动层 .scroll-content 是
+   translateY 变换层 —— 气泡若放在卡片里会被裁，放在变换层里会跟着滚走。 */
+function openStatusReasonPop(anchor, orderId) {
+  closeStatusReasonPop();
+  if (!anchor) return;
+  const o = _priceOrderById(orderId);
+  const text = orderStatusReasonText(o);
+  const mask = document.createElement('div');
+  mask.className = 'status-pop-mask';
+  mask.innerHTML =
+    '<div class="status-pop" role="dialog">' +
+      '<div class="status-pop-head"><span class="status-pop-icon">⚠️</span>' +
+        '<span class="status-pop-title">异常原因</span></div>' +
+      '<div class="status-pop-text"></div>' +
+      '<div class="status-pop-acts">' +
+        '<button type="button" class="status-pop-btn primary" data-status-act="copy">复制</button>' +
+        '<button type="button" class="status-pop-btn" data-status-act="close">关闭</button>' +
+      '</div>' +
+      '<div class="status-pop-caret"></div>' +
+    '</div>';
+  document.body.appendChild(mask);
+  _statusPopEl = mask;
+  mask.querySelector('.status-pop-text').textContent = text;
+
+  const pop = mask.querySelector('.status-pop');
+  const caret = mask.querySelector('.status-pop-caret');
+  const rect = anchor.getBoundingClientRect();
+  const winW = window.innerWidth || 375;
+  const w = Math.min(300, winW - 24);
+  pop.style.width = w + 'px';
+  const center = rect.left + rect.width / 2;
+  const left = Math.max(8, Math.min(center - w / 2, winW - w - 8));
+  pop.style.left = left + 'px';
+  caret.style.left = Math.max(16, Math.min(center - left, w - 16)) + 'px';
+  const ph = pop.offsetHeight || 120;
+  let top = rect.top - ph - 12;
+  let below = false;
+  if (top < 8) { below = true; top = rect.bottom + 12; }
+  pop.style.top = top + 'px';
+  pop.classList.toggle('status-pop-below', below);
+
+  mask.addEventListener('click', (ev) => {
+    const act = ev.target.closest ? ev.target.closest('[data-status-act]') : null;
+    if (act) {
+      ev.stopPropagation();
+      if (act.dataset.statusAct === 'copy') {
+        const cur = _priceOrderById(orderId) || o;
+        closeStatusReasonPop();
+        copyText(orderStatusReasonText(cur), '已复制原因');
+      } else {
+        closeStatusReasonPop();
+      }
+      return;
+    }
+    closeStatusReasonPop();
+  });
+  mask.addEventListener('touchmove', (ev) => ev.preventDefault(), { passive: false });
+}
+
 function _priceOrderTotal(o) {
   return Math.round((Number(o && o.total_price) || 0) * 100) / 100;
 }
 
 function _priceOrderById(id) {
-  const pools = [meState.orders, meState.recentOrders];
+  // 最近订单独立页的行对象也要能被反查（复制价格 / 原因气泡都按 id 取订单）
+  const pools = [meState.orders, meState.recentOrders, meState.recentOrderRows];
   const v = meState.userOrdersView;
   if (v && v.orders && v.orders.length) pools.push(v.orders);
   for (let i = 0; i < pools.length; i++) {
@@ -1397,69 +1577,56 @@ function _priceOrderById(id) {
   return null;
 }
 
-// 详细价格文本：逐文件 + 附加服务 + 合计（金额全部取订单已定稿的实收值）
-function buildPriceDetailText(o) {
-  const lines = ['计费明细'];
-  if (o.order_number) lines.push(o.order_number);
-  lines.push('─'.repeat(14));
+/* 详细价格文本（结构与本机打印工具 Ctrl+Shift+C 逐行一致）：
+   订单号 + 14 短横线 + 计费明细 + 14 短横线 + 每文件三行 + 附加服务费 + 14 短横线 + 合计。
+   金额一律写实收（订单/文件已定稿的 total_price）；算式只是"这笔钱怎么来的"的解释，
+   与实收差超过 1 分（历史单改价、人工订正）就只写金额，不编算式。 */
+function buildPriceDetailText(o, rules) {
   const total = _priceOrderTotal(o);
-  const parts = [];
+  const no = String((o && o.order_number) || '').trim();
+  const lines = [];
+  if (no) { lines.push('订单号: ' + no); lines.push(PRICE_DASH); }
+  lines.push('计费明细');
+  lines.push(PRICE_DASH);
+
   let itemNo = 0;
   let baseTotal = 0;
   (o.files || []).forEach(f => {
     itemNo++;
-    const amount = Number(f.total_price) || 0;
+    const amount = Math.round((Number(f.total_price) || 0) * 100) / 100;
     baseTotal += amount;
+    const name = f.original_name || f.file_name || '未知文件';
     const duplexLabel = f.duplex === 'on' ? '双面' : '单面';
-    const rangeLabel = f.page_range ? ('选 ' + f.page_range + ' 页') : '全部页';
-    const pagesText = f.pagesLine || ((Number(f.copies) || 1) + ' 份');
-    lines.push(itemNo + '. ' + (f.original_name || f.file_name || '未知文件'));
-    lines.push('   ' + pagesText + ' | ' + duplexLabel + ' | ' + rangeLabel + ' | ¥' + amount.toFixed(2));
-    if (amount > 0) parts.push(amount.toFixed(2));
-  });
-  const urgencyFee = Number(o.urgency_price) || 0;
-  if (urgencyFee > 0) {
-    itemNo++;
-    lines.push(itemNo + '. 优先级：' + (o.urgency || '中') + ' | ￥' + urgencyFee.toFixed(2));
-    parts.push(urgencyFee.toFixed(2));
-  }
-  const coverCount = Number(o.cover_page) || 0;
-  const coverFee = coverCount > 0
-    ? Math.round((Number(o.cover_page_price) || 0) * coverCount * 100) / 100
-    : 0;
-  if (coverFee > 0) {
-    itemNo++;
-    lines.push(itemNo + '. 打印首页信息 | ' + coverFee.toFixed(2));
-    parts.push(coverFee.toFixed(2));
-  }
-  if (Number(o.delivery_enabled)) {
-    itemNo++;
-    const pct = Number(o.delivery_percentage) || 0;
-    const loc = o.delivery_location || '未指定地点';
-    // 派送费取残差：后端父订单价 = round(文件小计 + 加急 + 首页 + round(文件小计 × 百分比/100, 2), 2)，
-    // 每项都是两位小数 ⇒ 残差即实收派送费。前端不重写取整口径（Math.round 与 Python round
-    // 在 .5 边界会差 1 分），也保证与实收一致。
-    const deliveryFee = Math.max(0, Math.round((total - baseTotal - urgencyFee - coverFee) * 100) / 100);
-    // 残差与「小计 × 百分比」相差一分以内才算可信：历史单被人工改过价时不把差额乱归因到派送
-    const feeSane = Math.abs(deliveryFee - baseTotal * pct / 100) <= 0.011;
-    if (deliveryFee > 0 && feeSane) {
-      lines.push(itemNo + '. 派送：是 | ' + loc + ' ' + pct + '% | ￥' + deliveryFee.toFixed(2));
-      parts.push(deliveryFee.toFixed(2));
-    } else if (feeSane) {
-      lines.push(itemNo + '. 派送：是 | ' + loc + '（免费）');
-    } else {
-      // 实收对不上「小计 × 百分比」：只写百分比，不猜金额（合计仍按实收）
-      lines.push(itemNo + '. 派送：是 | ' + loc + ' ' + pct + '%');
+    const rangeLabel = String(f.page_range || '').trim() || '全部';
+    lines.push(itemNo + '. ' + name);
+    lines.push('   ' + (Number(f.copies) || 1) + 'x ' + duplexLabel + ' 范围:' + rangeLabel);
+    if (amount > 0) {
+      const calc = rules ? _priceFormula(f, rules) : null;
+      if (calc && Math.abs(calc.cost - amount) <= 0.005) {
+        lines.push('   ' + calc.formula + ' = ¥' + amount.toFixed(2));
+      } else {
+        lines.push('   ¥' + amount.toFixed(2));
+      }
     }
+  });
+
+  // 附加服务费 = 实收 − 文件小计（派送 + 加急 + 首页，与本地工具 calc_extra_total 同口径）。
+  // 只在这一单真的勾了附加服务、且残差与算式对得上时才写：人工改过价的历史单若把差额
+  // 写成「附加服务费」，等于替操作员编了一条不存在的收费理由。
+  const extra = Math.round((total - baseTotal) * 100) / 100;
+  const extrasEnabled = !!(Number(o.delivery_enabled) || Number(o.urgency_price) > 0 || Number(o.cover_page));
+  const deliveryCost = Number(o.delivery_enabled)
+    ? Math.round(baseTotal * (Number(o.delivery_percentage) || 0)) / 100
+    : 0;
+  const expectedExtra = Math.round((deliveryCost
+    + (Number(o.urgency_price) || 0)
+    + (Number(o.cover_page) ? (Number(o.cover_page_price) || 0) * Number(o.cover_page) : 0)) * 100) / 100;
+  if (extra > 0 && extrasEnabled && Math.abs(extra - expectedExtra) <= 0.011) {
+    lines.push('附加服务费: ¥' + extra.toFixed(2));
   }
-  lines.push('─'.repeat(14));
-  const sum = Math.round(parts.reduce((s, p) => s + parseFloat(p), 0) * 100) / 100;
-  // 逐项相加与实收一致 → 给出算式；不一致（历史数据/人工调整）只写实收合计，不编算式
-  if (parts.length && Math.abs(sum - total) < 0.005) {
-    lines.push('💰合计: ' + parts.join('+') + '=￥' + total.toFixed(2));
-  } else {
-    lines.push('💰合计: ￥' + total.toFixed(2));
-  }
+
+  lines.push(PRICE_DASH);
+  lines.push('💰合计: ¥' + total.toFixed(2));
   return lines.join('\n');
 }
 
@@ -1513,11 +1680,14 @@ function openPricePop(anchor, orderId) {
       ev.stopPropagation();
       const cur = _priceOrderById(orderId) || o;   // 点下去那一刻再取一次，避免轮询后价格过期
       const simple = act.dataset.priceAct === 'simple';
-      const text = simple
-        ? ((cur.order_number ? cur.order_number + ' ' : '') + '¥' + _priceOrderTotal(cur).toFixed(2))
-        : buildPriceDetailText(cur);
       closePricePop();
-      copyText(text, simple ? '已复制价格' : '已复制详细价格');
+      if (simple) {
+        // 简略：订单号 + em dash + 金额（与本地工具 Ctrl+C 同格式）
+        copyText(buildPriceSimpleText(cur), '已复制价格');
+      } else {
+        // 详细要算「N张×单价」的算式 → 先确保拿到云端定价（页面内只请求一次）
+        ensurePriceRules().then(rules => copyText(buildPriceDetailText(cur, rules), '已复制详细价格'));
+      }
       return;
     }
     closePricePop();
@@ -3030,4 +3200,4 @@ function deleteMyFile(fileId, name) {
 
 /* ================= 启动 ================= */
 
-window.addEventListener('pagehide', () => { closePricePop(); stopOrderPolling(); stopUserOrdersPolling(); stopKeyPolling(); stopTempCountdown(); });
+window.addEventListener('pagehide', () => { closePricePop(); closeStatusReasonPop(); stopOrderPolling(); stopUserOrdersPolling(); stopKeyPolling(); stopTempCountdown(); });

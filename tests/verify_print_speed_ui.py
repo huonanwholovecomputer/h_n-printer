@@ -104,8 +104,8 @@ check("窗口对话返回的 dict 能直接喂给 update_profile（键名与档�
 print("\n=== ④ 主窗口把档案参数传进翻纸窗 ===")
 check("announce 带上 gate_ratio / gate_extra（窗口据此算闸门）",
       "gate_ratio=prof.gate_ratio, gate_extra=prof.flip_ready_sec" in SRC)
-check("闸门文案说明按百分比放行 + 可在「帮助 → 打印速度…」里调",
-      '按「预估 {_ratio}%' in SRC and "放行比例与人工翻页时间可在「帮助 → 打印速度…」里调" in SRC)
+check("闸门文案说明按百分比放行 + 可在「选项 → 打印速度…」里调",
+      '按「预估 {_ratio}%' in SRC and "放行比例与人工翻页时间可在「选项 → 打印速度…」里调" in SRC)
 
 # ══════════════════════════════════════════════════════════════════════
 print("\\n=== ⑤ 能力适配：自动双面机型不能把这套设置当成可调项（2026-11-02） ===")

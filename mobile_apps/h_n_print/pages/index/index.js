@@ -2487,6 +2487,25 @@ Component({
       })
     },
 
+    // 攒批三态的归一（2026-11 需求 2）：WXML 里只能做等值比较，判定集中放这里。
+    //   stack_view    = 期望值 true/false/null（null=该设备从未上报 → 「需人工翻纸」）
+    //                   ← 后端 C4 的 stack_desired（true/false/null）
+    //                   ← 缺字段（旧后端 / 旧客户端）时回退 stack_mode（true/false/null 同义）
+    //   stack_pending = 后端 C4 的 stack_pending；缺字段时沿用旧口径（false）
+    // 这两个字段只影响渲染与按钮文案，不代表设备真实状态 —— 真实状态对齐后服务端会清 pending。
+    _normalizeDeviceStack(d) {
+      if (!d || !d.client_id) return d
+      const hasDesired = (d.stack_desired === true || d.stack_desired === false)
+      let view
+      if (hasDesired) view = d.stack_desired
+      else if (d.stack_mode === true || d.stack_mode === false) view = d.stack_mode
+      else view = null
+      return Object.assign({}, d, {
+        stack_view: view,
+        stack_pending: d.stack_pending === true,
+      })
+    },
+
     // 可接单设备列表（多设备接单）：全部启用接单的设备（含离线）。
     // 服务端已排好序，返回顺序**就是**展示顺序：置顶组在前（按 pin_index 升序，组内完全不看在线）
     // → 未置顶组在线优先 → client_id。每台带 pin:boolean 与 pin_index:int(0 基)|null。
@@ -2522,7 +2541,10 @@ Component({
             this._deviceChosenByUser = false   // 重置出来的仍是自动选择
           }
           const _devCountBefore = (this.data.claimingDevices || []).length
-          this.setData({ claimingDevices: devices, selectedDeviceId: selected })
+          this.setData({
+            claimingDevices: devices.map(d => this._normalizeDeviceStack(d)),
+            selectedDeviceId: selected,
+          })
           // 「选择接单设备」卡按 claimingDevices.length 显隐：出现/消失会整块改内容高
           // （Chromium 实测单卡 ≈153px）。以前这条路径完全不重测 ⇒ maxY 停在旧值，
           // 滚到底就多出一块空白（现场 2026-10-25）。只在张数变化时测，免得轮询每轮都测。
@@ -2676,9 +2698,14 @@ Component({
     // 攒批模式（多任务合并翻纸）远程开关：仅管理员/超管可点（界面同样只对二者渲染），
     // 且**只对「需人工翻纸」的机型**（auto_duplex === false）—— 自动双面的机器一次成型，
     // 攒批纯属多余（界面整个攒批区块都不渲染，这里是兜底）。
-    // 准入由服务端判定 —— 开启需「当前未开攒批 + 打印机空闲」，关闭需「当前已开攒批 + 打印机空闲」；
-    // 繁忙（正在打印 / 等人工翻纸打第二趟 / 有排队待打的请求）时服务端给出 stack_can_toggle=false
-    // 与 stack_reason，此处只做前置提示 + 请求转发，不在前端复刻这套判定。
+    //
+    // 2026-11 需求 2：**允许随时切换**（在线 / 离线 / 设备忙都放行）。
+    //   - 旧实现里 `online !== false && stack_can_toggle === false` 直接拦截并弹 stack_reason，
+    //     用户想「先排上队、等设备空了再应用」做不到 —— 那套准入判定只保留在服务端；
+    //   - 离线反复切换：以**最后一次**为准（服务端写覆盖先写，前端只保证 enable 由
+    //     「当前期望值」取反，且请求中不并发 —— 见 stackTogglingId）；
+    //   - 期望值口径：stack_desired（后端 C4 新增，true/false/null=从未上报）优先，
+    //     缺字段时回退 stack_mode（旧后端/旧客户端行为完全不变）。
     onToggleStackMode(e) {
       // 兜底：普通用户/游客即使状态异常也不放行
       const role = this.data.userRole
@@ -2693,15 +2720,13 @@ Component({
         this._showStackTip('该设备支持自动双面（或双面能力未确认），不需要攒批模式')
         return
       }
-      // 离线设备也允许调攒批（用户要求）：服务端只把「云端指定状态」记下来（pending:true），
-      // 设备上线后自行对齐（先确定攒批状态是否和云端指定一致）——所以这里**不再**拦截 online === false。
-      // stack_can_toggle=false 是**在线忙判定**（正在打印 / 等人工翻纸打第二趟 / 有排队待打），
-      // 离线设备不适用；离线放行后由服务端返回 pending 或拦截原因。
-      if (device.online !== false && device.stack_can_toggle === false) {
-        this._showStackTip(device.stack_reason || '当前无法切换攒批模式')
-        return
-      }
-      const enable = device.stack_mode !== true
+      // 期望值取反（不是「已生效值」取反）：离线连续点两次「开启/关闭」时，
+      // 第二次必须基于第一次记下的期望值，否则会连着发两个相同的 enable。
+      // stack_view 由 _normalizeDeviceStack 归一出（stack_desired → stack_mode 回退）。
+      const desiredNow = (device.stack_view === undefined)
+        ? (device.stack_mode === true)
+        : (device.stack_view === true)
+      const enable = !desiredNow
       const clientId = device.client_id
       this.setData({ stackTogglingId: clientId })
       // 该接口一律 HTTP 200，只看 body 的 success（失败时 message 即拦截原因）
@@ -2747,9 +2772,14 @@ Component({
 
     // 攒批模式成功后就地写回**本地那一台**设备：按 client_id 复核下标（列表可能已被刷新过），
     // 只走精确路径 setData（claimingDevices[i].xxx），不整表重渲染 —— 整表会让设备列表节点重建、
-    // 打断点击/滚动。stack_mode 用服务端返回值，不用本地旧值 + enable 猜。
-    // pending=true（设备离线）：设备真实状态还没变，但云端已记下目标状态 → 按目标值显示 +
-    // stack_pending 角标「待应用」；设备上线后服务端会把 stack_mode 改成与云端指定一致。
+    // 打断点击/滚动。
+    //
+    // 2026-11 需求 2（三态 + 「待应用」）：
+    //   stack_view   = 期望值（stack_desired，缺字段回退 stack_mode）—— 设备条胶囊与按钮文案都读它；
+    //   stack_pending= 期望值与设备实际不一致（离线写覆盖先写 / 设备忙保留期望），
+    //                  设备 stack_state 回报并对齐后服务端才会清掉 ⇒ 期间一直显示「⏳ 待应用」。
+    // 回写口径：pending 时用我们刚发出的 enable 作为期望值；否则用服务端回显（stack_desired 优先，
+    // 再退 stack_mode），绝不用「本地旧值 + enable」去猜。
     _applyStackMode(index, clientId, data, enable) {
       const devices = this.data.claimingDevices || []
       let i = index
@@ -2757,13 +2787,20 @@ Component({
         i = devices.findIndex(d => d && d.client_id === clientId)
       }
       if (i < 0) return
-      const pending = data.pending === true
-      const patch = {}
-      if (pending) {
-        patch['claimingDevices[' + i + '].stack_mode'] = enable === true
+      const pending = (data.stack_pending !== undefined)
+        ? (data.stack_pending === true)
+        : (data.pending === true)
+      let view
+      if (data.stack_desired === true || data.stack_desired === false) {
+        view = data.stack_desired
+      } else if (pending) {
+        view = enable === true
       } else {
-        patch['claimingDevices[' + i + '].stack_mode'] = data.stack_mode === true
+        view = data.stack_mode === true
       }
+      const patch = {}
+      patch['claimingDevices[' + i + '].stack_view'] = view
+      patch['claimingDevices[' + i + '].stack_mode'] = view
       patch['claimingDevices[' + i + '].stack_busy'] = !!data.stack_busy
       patch['claimingDevices[' + i + '].stack_pending'] = pending
       this.setData(patch)
@@ -4050,7 +4087,40 @@ Component({
       return this.data.pricingLoaded ? base : base + '（未同步云端定价，按内置兜底单价计算）'
     },
 
-    // ---- 复制价格（简略：仅金额，对齐本地工具 Ctrl+C）----
+    /* 附加服务费（派送 / 加急 / 首页）——「复制价格」与「复制详细价格」共用同一口径，
+       两处各算一遍最容易出现「简略金额 ≠ 详细金额」。
+       派送费与后端同口径：先按 Python round 取整到分再相加
+       （后端 app.py submit_order 里就是 round(base * pct / 100, 2)），
+       否则「提交前显示价」会比实收价高/低 1 分。 */
+    _priceExtrasOf(echo, baseTotal) {
+      const src = echo || {}
+      const deliveryEnabled = src.delivery_enabled != null ? !!Number(src.delivery_enabled) : this.data.deliveryEnabled
+      // 金额一律取云端定价配置（loadPricing 同步自 /api/pricing，随轮询刷新），不采用提交回显
+      const deliveryLocation = src.delivery_location != null ? src.delivery_location : this.data.deliveryLocation
+      const deliveryPercent = (this.data.deliveryPercentages[deliveryLocation] != null)
+        ? this.data.deliveryPercentages[deliveryLocation]
+        : this.data.deliveryPercent
+      const urgency = src.urgency != null ? src.urgency : this.data.urgency
+      const urgencyPrice = (this.data.urgencyPrices[urgency] != null)
+        ? this.data.urgencyPrices[urgency]
+        : this.data.urgencyPrice
+      const coverPage = src.cover_page != null ? !!Number(src.cover_page) : this.data.coverPage
+      const coverPagePrice = this.data.coverPagePrice
+      const deliveryCost = deliveryEnabled ? pyRound2(baseTotal * deliveryPercent / 100) : 0
+      return {
+        deliveryEnabled,
+        deliveryLocation,
+        deliveryPercent,
+        urgency,
+        urgencyPrice: urgencyPrice || 0,
+        coverPage,
+        coverPagePrice: coverPagePrice || 0,
+        deliveryCost,
+        extra: deliveryCost + (urgencyPrice || 0) + (coverPage ? (coverPagePrice || 0) : 0),
+      }
+    },
+
+    // ---- 复制价格（简略：`订单号 — ¥金额`，与本地工具 Ctrl+C 逐字一致）----
 
     onCopyPrice() {
       const d = this._lastOrderResult
@@ -4061,18 +4131,6 @@ Component({
       if (guard.invalid) { this._warnPriceInvalid(guard.message); return }
       // 开关/选项取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
       const echo = d.data || {}
-      const deliveryEnabled = echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : this.data.deliveryEnabled
-      // 金额一律取云端定价配置（loadPricing 同步自 /api/pricing，随轮询刷新），不采用提交回显
-      const deliveryLocation = echo.delivery_location != null ? echo.delivery_location : this.data.deliveryLocation
-      const deliveryPercent = (this.data.deliveryPercentages[deliveryLocation] != null)
-        ? this.data.deliveryPercentages[deliveryLocation]
-        : this.data.deliveryPercent
-      const urgency = echo.urgency != null ? echo.urgency : this.data.urgency
-      const urgencyPrice = (this.data.urgencyPrices[urgency] != null)
-        ? this.data.urgencyPrices[urgency]
-        : this.data.urgencyPrice
-      const coverPage = echo.cover_page != null ? !!Number(echo.cover_page) : this.data.coverPage
-      const coverPagePrice = this.data.coverPagePrice
 
       let baseTotal = 0
       let allKnown = true
@@ -4081,27 +4139,20 @@ Component({
         baseTotal += r.cost
         if (!r.known) allKnown = false
       })
+      const total = baseTotal + this._priceExtrasOf(echo, baseTotal).extra
 
-      let total = baseTotal
-      if (deliveryEnabled) {
-        // 派送费与后端同口径：先按 Python round 取整到分再相加
-        // （后端 app.py submit_order 里就是 round(base * pct / 100, 2)），
-        // 否则「提交前显示价」会比实收价高/低 1 分。
-        total += pyRound2(baseTotal * deliveryPercent / 100)
-      }
-      total += urgencyPrice
-      if (coverPage) total += coverPagePrice
-
-      const orderNumber = d.order_number || ''
-      const prefix = allKnown ? '' : '≈ '
-      const amount = (orderNumber ? orderNumber + ' ' : '') + prefix + '¥' + total.toFixed(2)
+      // 与本地打印工具 Ctrl+C 同格式：`订单号 — ¥金额`；没有订单号时只复制金额。
+      // 页数没算完（allKnown=false）时金额只是估算，用 ≈ 如实标出，不假装精确。
+      const amount = (allKnown ? '' : '≈ ') + '¥' + total.toFixed(2)
+      const orderNumber = String(d.order_number || '').trim()
+      const text = orderNumber ? orderNumber + ' — ' + amount : amount
       wx.setClipboardData({
-        data: amount,
+        data: text,
         success: () => wx.showToast({ title: this._priceCopyToast('已复制价格'), icon: 'success' })
       })
     },
 
-    // ---- 复制详细价格（对齐本地工具 Ctrl+Shift+C）----
+    // ---- 复制详细价格（结构同本地工具 Ctrl+Shift+C）----
 
     onCopyDetailPrice() {
       const d = this._lastOrderResult
@@ -4110,90 +4161,45 @@ Component({
       // 与「复制价格」同口径：页数未完成计算 → 明细里的金额同样是错的，不复制、只提示
       const guard = this._checkPriceFiles(files)
       if (guard.invalid) { this._warnPriceInvalid(guard.message); return }
-      const orderNumber = d.order_number || ''
-      // 开关/选项取后端回显（d.data = 提交参数原样回显），避免界面状态在提交后变化导致复制价格失真
       const echo = d.data || {}
-      const deliveryEnabled = echo.delivery_enabled != null ? !!Number(echo.delivery_enabled) : this.data.deliveryEnabled
-      const deliveryLocation = echo.delivery_location != null ? echo.delivery_location : this.data.deliveryLocation
-      // 金额一律取云端定价配置（loadPricing 同步自 /api/pricing，随轮询刷新），不采用提交回显
-      const deliveryPercent = (this.data.deliveryPercentages[deliveryLocation] != null)
-        ? this.data.deliveryPercentages[deliveryLocation]
-        : this.data.deliveryPercent
-      const urgency = echo.urgency != null ? echo.urgency : this.data.urgency
-      const urgencyPrice = (this.data.urgencyPrices[urgency] != null)
-        ? this.data.urgencyPrices[urgency]
-        : this.data.urgencyPrice
-      const coverPage = echo.cover_page != null ? !!Number(echo.cover_page) : this.data.coverPage
-      const coverPagePrice = this.data.coverPagePrice
-      const lines = ['计费明细']
-      if (orderNumber) lines.push(orderNumber)
-      lines.push('─'.repeat(14))
-      const allParts = []
-      let baseTotal = 0
-      let itemNum = 0
+      const orderNumber = String(d.order_number || '').trim()
+      // 分隔线用 ASCII 短横线 ×14（对齐 gui.py 的 "-"*14，不是 U+2500 的 ─）
+      const DASH = '-'.repeat(14)
+      const lines = []
+      if (orderNumber) { lines.push('订单号: ' + orderNumber); lines.push(DASH) }
+      lines.push('计费明细')
+      lines.push(DASH)
 
+      let baseTotal = 0
+      let allKnown = true
+      let itemNum = 0
       files.forEach(f => {
         itemNum++
         const r = this._calcCost(f.page_count || 0, f.copies || 1, f.duplex || 'on', f.page_range, f.simplex_pages || '')
+        baseTotal += r.cost
+        if (!r.known) allKnown = false
         const name = f.file_name || '未知文件'
         const duplexLabel = f.duplex === 'on' ? '双面' : '单面'
-        const rangeLabel = f.page_range ? f.page_range + '页' : '全部页'
-
+        // 本地工具打印原始范围串（如 1-5），空串表示整份全部页
+        const rangeLabel = String(f.page_range || '').trim() || '全部'
         lines.push(itemNum + '. ' + name)
-        lines.push('   ' + f.copies + '份 | ' + duplexLabel + ' | ' + rangeLabel)
-        // 契约：文件行追加「单面页 / 已排除末尾空白页」（字段空则不显示）
-        if ((f.simplex_pages || '').trim()) lines.push('   单面页: ' + f.simplex_pages)
-        if (Number(f.blank_tail_exclude) || 0) lines.push('   已排除末尾空白页')
-        if (r.cost > 0) {
-          lines.push('   ' + r.formula + '=¥' + r.cost.toFixed(2))
-          allParts.push(r.cost.toFixed(2))
-          baseTotal += r.cost
-        } else {
-          lines.push('   💰 ?')
-        }
+        lines.push('   ' + (f.copies || 1) + 'x ' + duplexLabel + ' 范围:' + rangeLabel)
+        // cost<=0（页数未知）时本地工具不写算式行，这里同样不写，避免出现「? = ¥0.00」
+        if (r.cost > 0) lines.push('   ' + r.formula + ' = ¥' + r.cost.toFixed(2))
       })
 
-      // 派送：未勾选 → 整行不出现（编号也不占位，避免出现「3. 派送：否」这种没选的附加服务）
-      if (deliveryEnabled) {
-        itemNum++
-        const loc = deliveryLocation
-        const pct = deliveryPercent
-        const deliveryCost = pyRound2(baseTotal * pct / 100)   // 与后端同口径取整到分
-        if (pct > 0 && deliveryCost > 0) {
-          lines.push(itemNum + '. 派送：是 | ' + loc + ' ' + pct.toFixed(1) + '% | ￥' + deliveryCost.toFixed(2))
-          allParts.push(deliveryCost.toFixed(2))
-        } else {
-          lines.push(itemNum + '. 派送：是 | ' + loc + '免费')
-        }
-      }
+      // 附加服务费合并成一行（对齐本地工具 tab.calc_extra_total：派送 + 加急 + 首页）
+      const extras = this._priceExtrasOf(echo, baseTotal)
+      if (extras.extra > 0) lines.push('附加服务费: ¥' + extras.extra.toFixed(2))
 
-      // 优先级：附加价格为 0（未加价，如默认「低」）→ 整行不出现、编号也不占位
-      // （与未勾选的派送/首页同口径：既然不加钱，「优先级：低 | ￥0」列进明细只是噪声）
-      const urgPrice = urgencyPrice
-      if (urgPrice > 0) {
-        itemNum++
-        lines.push(itemNum + '. 优先级：' + urgency + ' | ￥' + urgPrice.toFixed(2))
-        allParts.push(urgPrice.toFixed(2))
-      }
-
-      // 首页：未勾选 → 整行不出现
-      if (coverPage) {
-        itemNum++
-        lines.push(itemNum + '. 打印首页信息 | ' + coverPagePrice.toFixed(2))
-        allParts.push(coverPagePrice.toFixed(2))
-      }
-
-      // 合计
-      const totalSum = allParts.reduce((s, p) => s + parseFloat(p), 0)
-      const formula = allParts.join('+') || '0'
-      lines.push('─'.repeat(14))
-      lines.push('💰合计: ' + formula + '=￥' + totalSum.toFixed(2))
-
+      lines.push(DASH)
+      lines.push('💰合计: ' + (allKnown ? '' : '≈ ') + '¥' + (baseTotal + extras.extra).toFixed(2))
       wx.setClipboardData({
         data: lines.join('\n'),
         success: () => wx.showToast({ title: this._priceCopyToast('已复制详细价格'), icon: 'success' })
       })
     },
+
 
     // ==================== 文件预览（零后端依赖）====================
 

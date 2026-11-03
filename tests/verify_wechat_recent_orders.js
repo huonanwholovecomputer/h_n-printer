@@ -187,6 +187,13 @@ function runStaticChecks() {
   const js = fs.readFileSync(ME_JS, 'utf8');
   const wxml = fs.readFileSync(ME_WXML, 'utf8');
   const wxss = fs.readFileSync(ME_WXSS, 'utf8');
+  const APP_JSON = path.join(REPO, 'mobile_apps', 'h_n_print', 'app.json');
+  const RO_DIR = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'recent-orders');
+  const appJson = fs.readFileSync(APP_JSON, 'utf8');
+  const roJs = fs.readFileSync(path.join(RO_DIR, 'recent-orders.js'), 'utf8');
+  const roWxml = fs.readFileSync(path.join(RO_DIR, 'recent-orders.wxml'), 'utf8');
+  const roWxss = fs.readFileSync(path.join(RO_DIR, 'recent-orders.wxss'), 'utf8');
+  const roJson = fs.readFileSync(path.join(RO_DIR, 'recent-orders.json'), 'utf8');
 
   check('me.js 有 loadRecentOrders（进入页面拉一次）', /loadRecentOrders\s*\(/.test(js));
   check('me.js 有 onRefreshRecentOrders（手动刷新）', /onRefreshRecentOrders\s*\(/.test(js));
@@ -218,21 +225,43 @@ function runStaticChecks() {
   check('WXML：管理员门控 userRole === \'admin\'', /recent-orders-section[\s\S]{0,200}userRole === 'admin'/.test(wxml));
   check('WXML：标题动态「近 {{recentOrdersLimit}} 条订单」',
         wxml.indexOf('近 {{recentOrdersLimit}} 条订单') >= 0);
-  check('WXML：每行显示归属人 + catchtap 看完整 owner',
-        /recent-order-owner[^>]*data-owner="\{\{item\.owner\}\}"[^>]*catchtap="onRecentOrderOwnerTap"/.test(wxml));
-  check('WXML：每行显示文件数·页数', /recent-order-stat">\{\{item\.statText\}\}/.test(wxml));
-  check('WXML：金额 data-id 带 r- 前缀（走近 N 条独立查找）',
-        /data-id="r-\{\{item\.order_id\}\}"/.test(wxml));
-  check('WXML：金额点击复用 onPriceTap + 既有气泡样式 detail-price-tap',
-        /detail-price-tap recent-order-price[\s\S]{0,200}catchtap="onPriceTap"/.test(wxml));
-  check('WXML：近 N 条行隐藏「复制详细价格」（无逐文件明细）',
+  check('WXML：近 N 条改成入口卡（列表搬到独立页 recent-orders）',
+        /recent-orders-entry[\s\S]{0,240}catchtap="onOpenRecentOrders"/.test(wxml));
+  check('WXML：入口卡标题「查看最近订单」', wxml.indexOf('recent-orders-entry-title">查看最近订单') >= 0);
+  check('WXML：入口卡说明带动态 N',
+        /recent-orders-entry-desc">全部管理员的最近 \{\{recentOrdersLimit\}\} 条/.test(wxml));
+  check('js：入口卡 onOpenRecentOrders → /pages/recent-orders/recent-orders',
+        /onOpenRecentOrders\s*\([^)]*\)\s*\{[\s\S]{0,200}urll?\s*:\s*'\/pages\/recent-orders\/recent-orders'/.test(js)
+        || js.indexOf("'/pages/recent-orders/recent-orders'") >= 0);
+  check('WXML：内嵌列表已移除（无 recent-order-row / price-tap-r-）',
+        wxml.indexOf('recent-order-row') < 0 && wxml.indexOf('price-tap-r-') < 0);
+  check('WXML：价格气泡仍按来源隐藏「复制详细价格」',
         /wx:if="\{\{!pricePopRecent\}\}"[\s\S]{0,120}onCopyOrderDetailPrice/.test(wxml));
-  check('WXML：刷新入口 onRefreshRecentOrders', wxml.indexOf('catchtap="onRefreshRecentOrders"') >= 0);
-  check('WXML：超管没数据也渲染卡片（否则 ⚙ 设置点不到）',
-        /recentOrders\.length > 0 \|\| isSuperAdmin/.test(wxml));
-  check('WXML：空态一行说明（不是空白卡片）',
-        /recent-orders-empty/.test(wxml) && /暂无订单记录/.test(wxml));
-
+  check('app.json 注册 pages/recent-orders/recent-orders',
+        appJson.indexOf('"pages/recent-orders/recent-orders"') >= 0);
+  check('新页 json：navigationStyle custom + navigation-bar 组件',
+        /"navigationStyle"\s*:\s*"custom"/.test(roJson) && /navigation-bar/.test(roJson));
+  check('新页 js：调 /api/admin/recent_orders 且带 page/per_page',
+        roJs.indexOf("'/api/admin/recent_orders'") >= 0
+        && /data:\s*\{\s*page:\s*[\s\S]{0,60}per_page:/.test(roJs));
+  check('新页 js：per_page 白名单 10/20/50/100', /\[10,\s*20,\s*50,\s*100\]/.test(roJs));
+  check('新页 js：总数 total → totalPages 换算', /Math\.ceil\(\s*total(Safe)?\s*\/\s*perPage\s*\)/.test(roJs));
+  check('新页 js：上一页/下一页/页码 + 页码算法',
+        /onPrevPage\s*\(/.test(roJs) && /onNextPage\s*\(/.test(roJs)
+        && /onPageChange\s*\(/.test(roJs) && /getPageNumbers\s*\(/.test(roJs));
+  check('新页 js：非管理员直接空态（noPermission，不发请求）',
+        /noPermission/.test(roJs) && /role !== 'admin'/.test(roJs));
+  check('新页 js：statusMap 含 timeout=超时', /timeout\s*:\s*'超时'/.test(roJs));
+  check('新页 wxml：分页条 + 页码 + 条数下拉',
+        roWxml.indexOf('ro-pagebar') >= 0 && roWxml.indexOf('pageNumbers') >= 0
+        && roWxml.indexOf('onSelectPageSize') >= 0);
+  check('新页 wxml：金额行点击复制价格（onPriceCopy）', /onPriceCopy/.test(roWxml));
+  check('新页 wxml：异常状态可点（onStatusReasonTap）', /onStatusReasonTap/.test(roWxml));
+  check('新页 wxss：气泡 fixed（出 page-root，不被 scroll-content 变换层裁）',
+        /\.ro-pop-mask\s*\{[^}]*position:\s*fixed/.test(roWxss)
+        && /\.ro-pop\s*\{[^}]*position:\s*fixed/.test(roWxss));
+  check('新页 wxss：状态色含 timeout（橙，区别于 failed 红）',
+        /\.status-timeout\s*\{[^}]*#EF6C00/.test(roWxss));
   check('WXSS：卡片样式就位（不引入新色板，全走既有变量）',
         /\.recent-orders-card\s*\{/.test(wxss) && /\.recent-order-row\s*\{/.test(wxss)
         && /\.recent-order-amount\s*\{/.test(wxss));
@@ -370,8 +399,8 @@ function runBehaviorChecks() {
 
   page.data.showPricePop = false;
   page.onCopyOrderPrice({ currentTarget: { dataset: { id: 'r-7' } } });
-  check('⑨复制文本格式 = 订单号 + 空格 + ¥金额（复用既有口径）',
-        calls.clipboard[0] === 'HN-0007 ¥3.50', JSON.stringify(calls.clipboard[0]));
+  check('⑨复制文本格式 = `订单号 — ¥金额`（对齐本地工具 _on_copy_total）',
+        calls.clipboard[0] === 'HN-0007 — ¥3.50', JSON.stringify(calls.clipboard[0]));
   check('⑨toast 文案「已复制价格」（复用 _copyText）',
         (calls.toasts[0] || {}).title === '已复制价格', JSON.stringify(calls.toasts[0]));
 

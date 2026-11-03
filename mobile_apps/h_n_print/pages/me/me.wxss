@@ -507,6 +507,49 @@
   flex-shrink: 0;
 }
 
+/* #3：最近订单入口卡（原来的内嵌列表搬进 pages/recent-orders 独立页；
+   下面 .recent-order-* 条目样式保留 —— 独立页复用同一套行样式，视觉不断层） */
+.recent-orders-entry {
+  display: flex;
+  align-items: center;
+  gap: 16rpx;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  padding: 22rpx 24rpx;
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: 1rpx solid var(--separator);
+}
+.recent-orders-entry-icon {
+  font-size: 34rpx;
+  flex-shrink: 0;
+}
+.recent-orders-entry-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4rpx;
+}
+.recent-orders-entry-title {
+  font-size: 27rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.recent-orders-entry-desc {
+  font-size: 21rpx;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recent-orders-entry-arrow {
+  font-size: 30rpx;
+  color: var(--text-quaternary);
+  flex-shrink: 0;
+}
+
 .recent-orders-card {
   background: var(--bg-card);
   border-radius: var(--radius-lg);
@@ -1589,6 +1632,9 @@
 .status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
 .status-sent      { background-color: #E8F5E9; color: #2E7D32; }
 .status-failed    { background-color: #FFEBEE; color: #C62828; }
+/* 超时（后端 C1 新状态）：橙/琥珀，与 failed 的红明确区分 —— 「超时」是可重试的异常，
+   「失败」是已被拒绝的结果，混成一个颜色会让人误判要不要重下单 */
+.status-timeout   { background-color: #FFF3E0; color: #EF6C00; }
 .status-abandoned { background-color: #F3E5F5; color: #7B1FA2; }
 .status-reserved  { background-color: #FFF8E1; color: #F57F17; }
 .status-rejected  { background-color: #FFF3E0; color: #E65100; }
@@ -1695,6 +1741,7 @@
 .detail-price-value.status-offline_unknown,
 .detail-price-value.status-sent,
 .detail-price-value.status-failed,
+.detail-price-value.status-timeout,
 .detail-price-value.status-abandoned,
 .detail-price-value.status-reserved,
 .detail-price-value.status-rejected,
@@ -1821,6 +1868,27 @@
 }
 .theme-dark .price-tap-hover {
   background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* ── #9 异常状态原因 Popconfirm ──
+   复用 .price-pop 外壳（fixed 定位、投影、箭头、深色模式全都现成），这里只补正文样式：
+   原因可能是一整段话，给一个 40vh 上限的滚动区，避免气泡长到屏幕外把按钮顶走。 */
+.status-reason-tap {
+  text-decoration: underline dashed;
+  text-underline-offset: 4rpx;
+}
+.status-pop {
+  max-width: 86vw;
+}
+.status-pop-text-wrap {
+  max-height: 40vh;
+  margin-bottom: 16rpx;
+}
+.status-pop-text {
+  font-size: 24rpx;
+  line-height: 1.6;
+  color: var(--text-primary);
+  word-break: break-all;
 }
 
 /* File rows in detail */
@@ -2215,21 +2283,36 @@
   font-size: 32rpx;
   color: var(--text-tertiary);
 }
+/* 加宽（2026-11 需求 1）：默认 .modal-sheet 只有 540rpx，长文件名/「大小 · 到期时间」在
+   scroll-view 里横向顶出去，看起来像文字出界。这里只加宽「我的文件」一个弹窗，
+   上限仍是 calc(100vw - 48rpx)，窄屏不贴边、圆角居中不变。 */
 .myfiles-sheet {
+  width: 660rpx;
+  max-width: calc(100vw - 48rpx);
+  box-sizing: border-box;
   max-height: 76vh;
 }
+/* ⚠ 根因不是缺省略号，而是 .modal-sheet 是 align-items:center 的纵向 flex：
+   width:auto 的中间层先按内容宽（max-content）收缩，scroll-view 被最长文件名撑宽、
+   再溢出 540rpx 的卡片（同 app.wxss .modal-buttons 注释里的老坑）。
+   所以列表与行必须显式整行宽 + border-box，省略号才生效。 */
 .myfiles-list {
+  width: 100%;
+  box-sizing: border-box;
   max-height: 46vh;
 }
 .myfile-row {
   display: flex;
   align-items: center;
+  width: 100%;
+  box-sizing: border-box;
   padding: 18rpx 0;
   border-bottom: 1rpx solid rgba(120, 120, 128, 0.18);
 }
 .myfile-main {
   flex: 1;
   min-width: 0;
+  overflow: hidden;
 }
 .myfile-name {
   display: block;
@@ -2239,11 +2322,16 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 时间一行在小屏也可能过长（「12.3 MB · 2026-11-30 23:59 到期」）：
+   同样钳成单行省略，不再把行撑宽 */
 .myfile-meta {
   display: block;
   margin-top: 4rpx;
   font-size: 21rpx;
   color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .myfile-del {
   margin-left: 16rpx;

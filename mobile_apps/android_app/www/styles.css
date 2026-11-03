@@ -1017,6 +1017,7 @@ body {
 .theme-dark .status-offline_unknown { background-color: rgba(255, 213, 79, 0.15); color: #FFD54F; }
 .theme-dark .status-sent { background-color: rgba(129, 199, 132, 0.15); color: #81C784; }
 .theme-dark .status-failed { background-color: rgba(229, 115, 115, 0.15); color: #E57373; }
+.theme-dark .status-timeout { background-color: rgba(255, 167, 38, 0.18); color: #FFB74D; }
 .theme-dark .status-abandoned { background-color: rgba(186, 104, 200, 0.15); color: #BA68C8; }
 .theme-dark .status-reserved { background-color: rgba(255, 213, 79, 0.15); color: #FFD54F; }
 .theme-dark .status-rejected { background-color: rgba(255, 179, 77, 0.15); color: #FFB74D; }
@@ -1817,6 +1818,19 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
 /* 离线设备刚下的攒批指令（服务端 {success:true,pending:true}）：指令已记录、等设备上线自动应用。
    与「攒批中 / 攒批未开 / 需人工翻纸」互斥，保证每条设备仍恒定一行 */
 .device-state-stack-pending { color: #e67e22; font-weight: 600; margin-right: 0.96cqw; }
+/* 2026-11 需求 2：期望值已记下、设备还没对齐 → 目标态胶囊旁挂「⏳ 待应用」，直到 stack_state 回报。
+   与小程序 index.wxss 的 .device-pending-badge 同款（橙色小字，不抢目标态的主视觉）。 */
+.device-pending-badge {
+  flex-shrink: 0;
+  margin-right: 0.96cqw;
+  padding: 0.12cqw 0.96cqw;
+  font-size: 2.28cqw;
+  line-height: 1.3;
+  color: #e67e22;
+  font-weight: 600;
+  background: rgba(230, 126, 34, 0.14);
+  border-radius: 0.72cqw;
+}
 /* 攒批模式远程开关（仅 admin/super_admin 渲染）：小胶囊按钮，禁用态灰显但保留可点（点了弹原因）。
    高度刻意钳在 2.52cqw×1.3+2×0.24cqw 内 —— 一旦比文字行高，带按钮的行就会比不带按钮的行高出一截。 */
 .device-stack-btn {
@@ -1862,7 +1876,12 @@ html.theme-vt, html.theme-vt *, html.theme-vt *::before, html.theme-vt *::after 
   color: var(--blue);
   font-weight: 600;
 }
+/* 加宽（2026-11 需求 1，与小程序 index.wxss 同步）：默认 64.8cqw 里「设备名 + 在线/离线 +
+   置顶 + ↑↓」挤一行，设备名被压到只剩几个字。 */
 .device-order-sheet {
+  width: 79.2cqw;
+  max-width: 92cqw;
+  box-sizing: border-box;
   max-height: 76vh;
 }
 .device-order-hint {
@@ -5030,6 +5049,8 @@ picker-view-column {
 .status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
 .status-sent      { background-color: #E8F5E9; color: #2E7D32; }
 .status-failed    { background-color: #FFEBEE; color: #C62828; }
+/* v6.1：超时是"可重试的异常"，用琥珀色与"真失败"的红区分开 */
+.status-timeout   { background-color: #FFF3E0; color: #EF6C00; }
 .status-abandoned { background-color: #F3E5F5; color: #7B1FA2; }
 .status-reserved  { background-color: #FFF8E1; color: #F57F17; }
 .status-rejected  { background-color: #FFF3E0; color: #E65100; }
@@ -6974,7 +6995,13 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   font-size: 4.27cqw;
   color: var(--text-tertiary);
 }
+/* 加宽（2026-11 需求 1，与小程序 me.wxss 的 .myfiles-sheet 同步）：默认 .modal-sheet 只有
+   64.8cqw，长文件名 /「大小 · 到期时间」在列表里横向顶出去。只加宽「我的文件」一个弹窗，
+   上限 92cqw 保证窄屏不贴边、圆角居中不变。1rpx ≈ 0.12cqw（540rpx = 64.8cqw）。 */
 .myfiles-sheet {
+  width: 79.2cqw;
+  max-width: 92cqw;
+  box-sizing: border-box;
   max-height: 76vh;
 }
 .myfiles-title {
@@ -6985,19 +7012,26 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   display: block;
   margin-bottom: 2.13cqw;
 }
+/* ⚠ 根因不是缺省略号：.modal-sheet 是 align-items:center 的纵向 flex，width:auto 的中间层
+   先按内容宽收缩 ⇒ 列表被最长文件名撑宽再溢出卡片。列表与行必须显式整行宽 + border-box。 */
 .myfiles-list {
+  width: 100%;
+  box-sizing: border-box;
   max-height: 46vh;
   overflow-y: auto;
 }
 .myfile-row {
   display: flex;
   align-items: center;
+  width: 100%;
+  box-sizing: border-box;
   padding: 2.4cqw 0;
   border-bottom: 0.13cqw solid rgba(120, 120, 128, 0.18);
 }
 .myfile-main {
   flex: 1;
   min-width: 0;
+  overflow: hidden;
 }
 .myfile-name {
   display: block;
@@ -7012,6 +7046,9 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   margin-top: 0.53cqw;
   font-size: 2.8cqw;
   color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .myfile-del {
   margin-left: 2.13cqw;
@@ -7158,3 +7195,143 @@ body.theme-dark .crop-panel,
   flex: none;
   width: 100%;
 }
+
+
+/* ═══════════════ 最近订单（管理员子视图，2026-11 需求 #3） ═══════════════ */
+
+/* 「我」页入口卡：原来内嵌的最近 N 条列表换成一整行入口（点击进独立页翻页） */
+.recent-orders-entry {
+  display: flex;
+  align-items: center;
+  gap: 2.4cqw;
+  padding: 2.88cqw 3.36cqw;
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: 0.12cqw solid var(--separator);
+  text-align: left;
+}
+.recent-orders-entry:active { background: var(--gray6); }
+.recent-orders-entry-icon { font-size: 4.32cqw; flex-shrink: 0; }
+.recent-orders-entry-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.48cqw; }
+.recent-orders-entry-title { font-size: 3.12cqw; font-weight: 600; color: var(--text-primary); }
+.recent-orders-entry-desc {
+  font-size: 2.4cqw; color: var(--text-tertiary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.recent-orders-entry-arrow { font-size: 3.36cqw; color: var(--text-quaternary); flex-shrink: 0; }
+
+/* 汇总行：共 N 条 · 第 x/y 页 + 刷新 */
+#view-recent-orders .orders-summary {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 2.4cqw; text-align: left;
+}
+#view-recent-orders .summary-text {
+  flex: 1; min-width: 0; font-size: 2.64cqw; color: var(--text-quaternary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#view-recent-orders .ro-refresh {
+  flex-shrink: 0; padding: 0.72cqw 2.16cqw; border-radius: 2.4cqw; font-size: 2.4cqw;
+  color: var(--text-secondary); background: var(--glass-regular);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+}
+#view-recent-orders .ro-refresh:active { background: var(--gray6); }
+
+#view-recent-orders .status-text { font-size: 3.12cqw; color: var(--text-tertiary); }
+#view-recent-orders .empty-state { display: flex; flex-direction: column; align-items: center; padding: 14.4cqw 0; }
+#view-recent-orders .empty-illustration { margin-bottom: 2.88cqw; }
+#view-recent-orders .empty-icon { font-size: 9.6cqw; }
+#view-recent-orders .empty-title {
+  font-size: 3.36cqw; font-weight: 600; color: var(--text-secondary); margin-bottom: 1.44cqw;
+}
+#view-recent-orders .empty-desc {
+  font-size: 2.88cqw; color: var(--text-tertiary); text-align: center; line-height: 1.6; max-width: 63.6cqw;
+}
+
+#view-recent-orders .page-btn, #view-recent-orders .page-num, #view-recent-orders .page-ellipsis {
+  min-width: 6.24cqw; height: 6.24cqw; display: flex; align-items: center; justify-content: center;
+  border-radius: var(--radius-sm); font-size: 2.88cqw; color: var(--text-secondary);
+  background: var(--glass-regular); box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+}
+#view-recent-orders .page-btn:active, #view-recent-orders .page-num:active { background: rgba(0, 0, 0, 0.04); }
+#view-recent-orders .page-btn-disabled { color: var(--text-quaternary) !important; pointer-events: none; }
+#view-recent-orders .page-num-active {
+  background: var(--blue) !important; color: #fff !important; font-weight: 600;
+  box-shadow: 0 0.24cqw 0.96cqw rgba(0, 122, 255, 0.3);
+}
+
+/* 行：三行式（单号/状态 · 归属人/时间 · 统计/金额），金额点一下复制 */
+.ro-row {
+  padding: 2.4cqw 3.36cqw; margin-bottom: 1.68cqw; text-align: left;
+  background: var(--bg-card); border-radius: var(--radius-lg);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+  border: 0.12cqw solid var(--separator);
+}
+.ro-row-line1, .ro-row-line2, .ro-row-line3 { display: flex; align-items: center; gap: 1.2cqw; min-width: 0; }
+.ro-row-line1 + .ro-row-line2, .ro-row-line2 + .ro-row-line3 { margin-top: 0.72cqw; }
+.ro-order-no {
+  font-size: 2.88cqw; font-weight: 600; color: var(--text-primary); font-family: var(--font-mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.ro-self-badge {
+  flex-shrink: 0; font-size: 2.4cqw; font-weight: 600; padding: 0.24cqw 1.44cqw;
+  border-radius: 2.4cqw; background: rgba(30, 102, 245, 0.10); color: #1e66f5;
+}
+.ro-owner {
+  font-size: 2.88cqw; font-weight: 600; color: var(--text-primary); max-width: 60%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  border-bottom: 0.12cqw dashed var(--gray3);
+}
+.ro-time {
+  margin-left: auto; flex-shrink: 0; font-size: 2.4cqw; color: var(--text-quaternary);
+  font-family: var(--font-mono);
+}
+.ro-stat {
+  flex: 1; min-width: 0; font-size: 2.4cqw; color: var(--text-tertiary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ro-price-tap {
+  margin-left: auto; flex-shrink: 0; font-size: 2.88cqw; font-weight: 600;
+  color: var(--text-primary); font-family: var(--font-mono);
+  padding: 0.24cqw 1.2cqw; border-radius: 1.44cqw;
+}
+.ro-price-tap:active { background: var(--gray6); }
+
+/* 异常状态文字可点（虚线，不喧哗） */
+.status-reason-tap { text-decoration: underline dashed; text-underline-offset: 0.48cqw; cursor: pointer; }
+
+/* 异常原因气泡：page-root 外 + fixed（与价格气泡同款约束，避免被 overflow:hidden 裁掉） */
+.status-pop-mask { position: fixed; inset: 0; z-index: 10000; background: transparent; }
+.status-pop {
+  position: fixed; box-sizing: border-box;
+  width: min(300px, calc(100vw - 24px));
+  padding: 3.36cqw 3.6cqw 3.12cqw;
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  z-index: 10001;
+}
+.status-pop-caret {
+  position: absolute; width: 0; height: 0;
+  border-left: 1.44cqw solid transparent; border-right: 1.44cqw solid transparent;
+}
+.status-pop:not(.status-pop-below) .status-pop-caret { bottom: -1.2cqw; border-top: 1.2cqw solid var(--bg-card); }
+.status-pop.status-pop-below .status-pop-caret { top: -1.2cqw; border-bottom: 1.2cqw solid var(--bg-card); }
+.status-pop-head { display: flex; align-items: center; gap: 1.2cqw; margin-bottom: 1.92cqw; }
+.status-pop-icon { font-size: 3.36cqw; }
+.status-pop-title { font-size: 2.88cqw; font-weight: 600; color: var(--text-primary); }
+.status-pop-text {
+  display: block; font-size: 2.64cqw; line-height: 1.6; color: var(--text-primary);
+  word-break: break-all; max-height: 40vh; overflow-y: auto; margin-bottom: 2.4cqw;
+}
+.status-pop-acts { display: flex; gap: 1.68cqw; }
+.status-pop-btn {
+  flex: 1; text-align: center; padding: 1.44cqw 0; border-radius: var(--radius-sm);
+  font-size: 2.64cqw; color: var(--text-secondary); background: var(--glass-regular);
+  box-shadow: var(--glass-shadow-sm), var(--glass-rim);
+}
+.status-pop-btn.primary { color: #fff; background: var(--blue); }
+.status-pop-btn:active { opacity: 0.82; }
+.theme-dark .status-pop { background: #2a2a2e; }
+.theme-dark .status-pop:not(.status-pop-below) .status-pop-caret { border-top-color: #2a2a2e; }
+.theme-dark .status-pop.status-pop-below .status-pop-caret { border-bottom-color: #2a2a2e; }

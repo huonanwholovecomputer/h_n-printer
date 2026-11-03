@@ -8,11 +8,15 @@
  * 口径（本脚本钉死）：
  *   ① 点击「¥xx.xx」→ 气泡出现在**价格上方**（上方放不下翻到下方、箭头朝上），
  *      再点一次价格收起；点气泡外（透明 mask）收起；复制成功后收起；
- *   ② 「复制价格」= 订单号 + 空格 + ¥金额，与首页提交成功弹窗里的「复制价格」同格式；
- *   ③ 「复制详细价格」= 逐文件（份 × 页 | 单/双面 | 页码范围 | 实收小计）+ 附加服务
- *      （加急 / 首页 / 派送，派送费 = round(文件小计 × 百分比 / 100, 2)，与后端
- *      submit_order 同口径）+ 合计；金额一律取订单**已定稿**的实收值，前端不重算单价；
- *   ④ 逐项相加 ≠ 订单实收时只写实收合计，**不编算式**；
+ *   ② 「复制价格」= `{订单号} — ¥{金额}`（em dash + 两侧空格；无订单号只 `¥金额`），
+ *      与本地打印工具 gui.py:_on_copy_total 逐字一致；
+ *   ③ 「复制详细价格」= 本地打印工具 gui.py:_on_copy_detail 的逐字格式：
+ *      `订单号: {号}` / 14 个 ASCII 短横线 / `计费明细` / 短横线 /
+ *      每文件 `1. 文件名` + `   {份数}x 双面|单面 范围:{范围或全部}` + `   {计费公式} = ¥{实收}` /
+ *      （有附加服务费时）`附加服务费: ¥x.xx` / 短横线 / `💰合计: ¥{实收}`。
+ *      计费公式按 calc_cost 形状复算（`3张×0.40`、`(…)x2份`），但**金额永远是订单实收值**；
+ *   ④ 算式复算 ≠ 实收（历史单价/人工改价）→ 该文件只写 `¥{实收}`，不编算式；
+ *      附加服务费只在「真的勾了附加服务且残差与算式一致」时才写，其余只给实收合计；
  *   ⑤ 气泡在 page-root 外 + position:fixed —— 订单卡片 `.order-card-detail` 有
  *      overflow:hidden / max-height，气泡放在卡片里会被裁掉；
  *   ⑥ 两端（微信小程序 / Android APP）同款，且切 tab、订单刷新、卡片收起时气泡自动收起。
@@ -92,10 +96,21 @@ function loadMiniProgram() {
     clearInterval: () => {},
     require: (dep) => {
       if (dep.indexOf('utils/config') >= 0) return { CONFIG: { BASE_URL: 'https://example.invalid' } };
-      if (dep.indexOf('utils/pages') >= 0) return { countPagesInRange: () => 1 };
+      if (dep.indexOf('utils/pages') >= 0) {
+        // 计费算式要用真实页数：无范围时 = page_count（与 utils/pages 口径一致）
+        return { countPagesInRange: (range, count) => (range ? 0 : (Number(count) || 0)) };
+      }
       if (dep.indexOf('utils/avatar_crop') >= 0) return AVATAR_CROP_MOD;
       if (dep.indexOf('utils/request') >= 0) {
-        return { request: () => {}, createPollScheduler: () => ({ start() {}, stop() {} }) };
+        return {
+          // 详细价格要先拿单价才能写算式：pricing 请求同步回调（0.3/0.4 = pricing.json 权威值）
+          request: (opts) => {
+            if (opts && typeof opts.url === 'string' && opts.url.indexOf('/api/pricing') >= 0) {
+              opts.success({ statusCode: 200, data: { success: true, pricing: { simplex_price: 0.3, duplex_price: 0.4 } } });
+            }
+          },
+          createPollScheduler: () => ({ start() {}, stop() {} }),
+        };
       }
       throw new Error('shim 未提供的 require: ' + dep);
     },
@@ -199,8 +214,14 @@ function runMiniProgram() {
   calls.clipboard.length = 0; calls.toast.length = 0;
   ctx = makeCtx(component, [order]);
   ctx.onCopyOrderPrice({ currentTarget: { dataset: { id: order.id } } });
-  check('③ 复制价格 = 订单号 + 空格 + ¥金额（与首页同格式）',
-        calls.clipboard[0] === 'HN20261025-0013 ¥3.80', `got=${JSON.stringify(calls.clipboard[0])}`);
+  check('③ 复制价格 = `{订单号} — ¥金额`（与本地打印工具 Ctrl+C 同格式）',
+        calls.clipboard[0] === 'HN20261025-0013 — ¥3.80', `got=${JSON.stringify(calls.clipboard[0])}`);
+  // 没有订单号 → 只复制金额（不留下孤零零的破折号）
+  calls.clipboard.length = 0;
+  const noNumber = makeOrder({ order_number: '' });
+  ctx = makeCtx(component, [noNumber]);
+  ctx.onCopyOrderPrice({ currentTarget: { dataset: { id: noNumber.id } } });
+  check('③ 无订单号时只复制 `¥金额`', calls.clipboard[0] === '¥3.80', `got=${JSON.stringify(calls.clipboard[0])}`);
   check('③ 复制后气泡收起 + 成功 toast', ctx.data.showPricePop === false && calls.toast[0] === '已复制价格');
 
   // ④ 复制详细价格（无附加服务：逐文件 + 合计算式）
@@ -208,16 +229,27 @@ function runMiniProgram() {
   ctx = makeCtx(component, [order]);
   ctx.onCopyOrderDetailPrice({ currentTarget: { dataset: { id: order.id } } });
   const detail = calls.clipboard[0] || '';
-  check('④ 详细价格含标题/订单号/三个文件', detail.indexOf('计费明细') === 0
-        && detail.indexOf('HN20261025-0013') > 0
-        && detail.indexOf('示波器的使用.pdf') > 0
-        && detail.indexOf('数据结构-第3次.docx') > 0
-        && detail.indexOf('示波器数据表格.pdf') > 0);
-  check('④ 每个文件带「份 × 页 | 单/双面 | 页码 | 实收小计」',
-        detail.indexOf('2 份 × 6 页 | 双面 | 全部页 | ¥2.40') > 0
-        && detail.indexOf('2 份 × 1 页 | 单面 | 全部页 | ¥0.60') > 0);
-  check('④ 合计算式 = 2.40+0.80+0.60=￥3.80（金额取自订单实收值）',
-        detail.indexOf('💰合计: 2.40+0.80+0.60=￥3.80') > 0, detail.split('\n').slice(-1)[0]);
+  const DASH = '-'.repeat(14);
+  const detailLines = detail.split('\n');
+  check('④ 详细价格 = 本地工具逐字结构（订单号 → 短横线 → 计费明细 → 短横线）',
+        detailLines[0] === '订单号: HN20261025-0013'
+        && detailLines[1] === DASH
+        && detailLines[2] === '计费明细'
+        && detailLines[3] === DASH,
+        JSON.stringify(detailLines.slice(0, 4)));
+  check('④ 三个文件都列出（`1. 原名` 连续编号）',
+        detail.indexOf('1. 示波器的使用.pdf') > 0
+        && detail.indexOf('2. 数据结构-第3次.docx') > 0
+        && detail.indexOf('3. 示波器数据表格.pdf') > 0);
+  check('④ 每个文件带「份数x 单/双面 范围:…」+ 计费公式行',
+        detail.indexOf('   2x 双面 范围:全部') > 0
+        && detail.indexOf('   2x 单面 范围:全部') > 0
+        && detail.indexOf('   (3张×0.40)×2份 = ¥2.40') > 0
+        && detail.indexOf('   (1张×0.30)×2份 = ¥0.60') > 0,
+        detailLines.join(' / '));
+  check('④ 合计 = 订单实收值（不拿逐项相加当合计）',
+        detail.indexOf('💰合计: ¥3.80') > 0 && detailLines[detailLines.length - 2] === DASH,
+        detailLines.slice(-2).join(' / '));
   check('④ 详细价格复制后气泡收起 + toast', ctx.data.showPricePop === false
         && calls.toast[0] === '已复制详细价格');
 
@@ -233,12 +265,10 @@ function runMiniProgram() {
   const d2 = calls.clipboard[0] || '';
   // 后端算式：total = round(3.80 + 0.30 + 0.20 + round(3.80 × 10 / 100, 2), 2) = 4.68
   // 前端取残差 4.68 − 3.80 − 0.30 − 0.20 = 0.38（不重写取整口径，.5 边界不会与后端差 1 分）
-  check('⑤ 派送费 = 实收残差（与后端 round(文件小计 × 百分比 / 100, 2) 同值）',
-        d2.indexOf('派送：是 | 1号楼北楼 10% | ￥0.38') > 0, d2);
-  check('⑤ 加急 / 首页分别按实收值列出', d2.indexOf('优先级：高 | ￥0.30') > 0
-        && d2.indexOf('打印首页信息 | 0.20') > 0);
-  check('⑤ 合计 = 2.40+0.80+0.60+0.30+0.20+0.38=￥4.68',
-        d2.indexOf('💰合计: 2.40+0.80+0.60+0.30+0.20+0.38=￥4.68') > 0, d2.split('\n').slice(-1)[0]);
+  check('⑤ 附加服务费合并成一行（派送 0.38 + 加急 0.30 + 首页 0.20 = 0.88）',
+        d2.indexOf('附加服务费: ¥0.88') > 0, d2);
+  check('⑤ 合计 = 订单实收值 4.68', d2.indexOf('💰合计: ¥4.68') > 0
+        && d2.split('\n').slice(-1)[0] === '💰合计: ¥4.68', d2.split('\n').slice(-1)[0]);
 
   // ⑥ 逐项相加 ≠ 订单实收（历史数据/人工调整）→ 只写实收合计，不编算式
   const mismatch = makeOrder({ total_price: 9.99 });
@@ -246,8 +276,10 @@ function runMiniProgram() {
   ctx = makeCtx(component, [mismatch]);
   ctx.onCopyOrderDetailPrice({ currentTarget: { dataset: { id: mismatch.id } } });
   const d3 = calls.clipboard[0] || '';
-  check('⑥ 口径不一致时只给实收合计（不编算式）',
-        d3.indexOf('💰合计: ￥9.99') > 0 && d3.indexOf('=￥9.99') < 0, d3.split('\n').slice(-1)[0]);
+  check('⑥ 口径不一致时只给实收合计（不编算式、也不编附加服务费理由）',
+        d3.split('\n').slice(-1)[0] === '💰合计: ¥9.99'
+        && d3.indexOf('附加服务费') < 0
+        && d3.indexOf('=¥9.99') < 0, d3.split('\n').slice(-1)[0]);
 
   // ⑥b 派送单被人工改过价 → 残差与「小计 × 百分比」差太多，派送行不写金额、合计仍按实收
   const oddDelivery = makeOrder({
@@ -257,10 +289,9 @@ function runMiniProgram() {
   ctx = makeCtx(component, [oddDelivery]);
   ctx.onCopyOrderDetailPrice({ currentTarget: { dataset: { id: oddDelivery.id } } });
   const d4 = calls.clipboard[0] || '';
-  check('⑥b 残差不可信时不把差额归因到派送（派送行无金额，合计=实收）',
-        d4.indexOf('派送：是 | 1号楼北楼 10%\n') > 0
-        && d4.indexOf('派送：是 | 1号楼北楼 10% | ￥') < 0
-        && d4.indexOf('💰合计: ￥9.99') > 0, d4.split('\n').slice(-2).join(' / '));
+  check('⑥b 残差与算式对不上时不把差额归因到附加服务（整行不出现，合计=实收）',
+        d4.indexOf('附加服务费') < 0
+        && d4.split('\n').slice(-1)[0] === '💰合计: ¥9.99', d4.split('\n').slice(-2).join(' / '));
 
   // ⑦ 订单不在当前页 → 不复制、不崩
   calls.clipboard.length = 0;
@@ -378,35 +409,37 @@ function runApp() {
         && /detail-price-tap[\s\S]{0,260}price-copy-icon[\s\S]{0,40}📋/.test(html),
         (html.match(/detail-price-tap[^>]*>/) || [''])[0]);
 
-  const simple = ((order.order_number ? order.order_number + ' ' : '') + '¥' + Number(order.total_price).toFixed(2));
-  check('APP「复制价格」文本与小程序同格式', simple === 'HN20261025-0013 ¥3.80', simple);
+  const simple = g.buildPriceSimpleText(order);
+  check('APP「复制价格」= `{订单号} — ¥金额`（与小程序/本地工具同格式）',
+        simple === 'HN20261025-0013 — ¥3.80', simple);
 
-  const detail = g.buildPriceDetailText(order);
+  const RULES = { simplex: 0.3, duplex: 0.4 };
+  const DASH = '-'.repeat(14);
+  const detail = g.buildPriceDetailText(order, RULES);
+  const dLines = detail.split('\n');
   check('APP「复制详细价格」与小程序逐行同款（无附加服务时）',
-        detail.indexOf('计费明细') === 0
-        && detail.indexOf('2 份 × 6 页 | 双面 | 全部页 | ¥2.40') > 0
-        && detail.indexOf('💰合计: 2.40+0.80+0.60=￥3.80') > 0, detail.split('\n').slice(-1)[0]);
+        dLines[0] === '订单号: HN20261025-0013' && dLines[1] === DASH
+        && dLines[2] === '计费明细' && dLines[3] === DASH
+        && detail.indexOf('   2x 双面 范围:全部') > 0
+        && detail.indexOf('   (3张×0.40)×2份 = ¥2.40') > 0
+        && dLines.slice(-1)[0] === '💰合计: ¥3.80', dLines.join(' / '));
 
   const withExtras = makeOrder({
     total_price: 4.68, urgency: '高', urgency_price: 0.3,
     cover_page: 2, cover_page_price: 0.1,
     delivery_enabled: 1, delivery_location: '1号楼北楼', delivery_percentage: 10,
   });
-  const d2 = g.buildPriceDetailText(withExtras);
-  check('APP 附加服务与后端同口径（派送 0.38 / 加急 0.30 / 首页 0.20）',
-        d2.indexOf('派送：是 | 1号楼北楼 10% | ￥0.38') > 0
-        && d2.indexOf('优先级：高 | ￥0.30') > 0
-        && d2.indexOf('打印首页信息 | 0.20') > 0
-        && d2.indexOf('💰合计: 2.40+0.80+0.60+0.30+0.20+0.38=￥4.68') > 0);
-  const d3 = g.buildPriceDetailText(makeOrder({ total_price: 9.99 }));
-  check('APP 口径不一致时只给实收合计', d3.indexOf('💰合计: ￥9.99') > 0 && d3.indexOf('=￥9.99') < 0);
+  const d2 = g.buildPriceDetailText(withExtras, RULES);
+  check('APP 附加服务费合并成一行（0.38 + 0.30 + 0.20 = 0.88）+ 合计取实收',
+        d2.indexOf('附加服务费: ¥0.88') > 0 && d2.indexOf('💰合计: ¥4.68') > 0);
+  const d3 = g.buildPriceDetailText(makeOrder({ total_price: 9.99 }), RULES);
+  check('APP 口径不一致时只给实收合计（无附加服务费行）',
+        d3.indexOf('附加服务费') < 0 && d3.split('\n').slice(-1)[0] === '💰合计: ¥9.99');
   const d4 = g.buildPriceDetailText(makeOrder({
     total_price: 9.99, delivery_enabled: 1, delivery_location: '1号楼北楼', delivery_percentage: 10,
-  }));
-  check('APP 残差不可信时派送行不写金额（不把差额归因到派送）',
-        d4.indexOf('派送：是 | 1号楼北楼 10%\n') > 0
-        && d4.indexOf('派送：是 | 1号楼北楼 10% | ￥') < 0
-        && d4.indexOf('💰合计: ￥9.99') > 0);
+  }), RULES);
+  check('APP 残差不可信时不把差额归因到附加服务',
+        d4.indexOf('附加服务费') < 0 && d4.split('\n').slice(-1)[0] === '💰合计: ¥9.99');
 }
 
 /* ============================================================
@@ -444,14 +477,18 @@ function checkCrossClient() {
   section('两端一致性');
   const mp = fs.readFileSync(MP_ME_JS, 'utf8');
   const app = fs.readFileSync(APP_ME_JS, 'utf8');
-  const labels = ['计费明细', '复制价格', '复制详细价格', '💰合计', '优先级：', '打印首页信息', '派送：是'];
+  const labels = ['计费明细', '复制价格', '复制详细价格', '💰合计', '附加服务费', '订单号: ', '范围:'];
   labels.forEach((label) => {
     check(`两端都有「${label}」文案`, mp.indexOf(label) > 0 && app.indexOf(label) > 0);
   });
-  check('两端都用订单实收值（total_price），不在「我」页重算单价',
-        mp.indexOf('f.total_price') > 0 && app.indexOf('f.total_price') > 0
-        && !/simplexPrice|duplexPrice/.test(mp.slice(mp.indexOf('onCopyOrderDetailPrice'), mp.indexOf('onDetailCancelOrder')))
-        && !/simplexPrice|duplexPrice/.test(app.slice(app.indexOf('buildPriceDetailText('), app.indexOf('function closePricePop'))));
+  // 单价只用来拼「计费公式」文案，金额永远写实收值：逐文件 f.total_price、合计订单 total_price。
+  // 两边都不许出现「用单价重算合计」的写法（那会和页面上的数字打架）。
+  check('两端金额一律取实收（逐文件 f.total_price / 合计 total_price）',
+        /Math\.round\(\(Number\(f\.total_price\)/.test(mp) && /f\.total_price/.test(app)
+        && mp.indexOf("'💰合计: ¥' + total.toFixed(2)") > 0
+        && app.indexOf("'💰合计: ¥' + total.toFixed(2)") > 0
+        && !/baseTotal \+ /.test(mp.slice(mp.indexOf('_priceDetailLines'), mp.indexOf('onPriceTap')))
+        && !/baseTotal \+ /.test(app.slice(app.indexOf('function buildPriceDetailText'), app.indexOf('function closePricePop'))));
 }
 
 try {

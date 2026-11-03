@@ -450,8 +450,8 @@ check("★ 小程序：攒批状态徽标文案 + 深色样式",
       and ("theme-dark" in open(os.path.join(REPO, "mobile_apps", "h_n_print", "pages",
                                              "index", "index.wxss"), encoding="utf-8").read()))
 
-check("★ APP：设备列表用到 stack_mode / stack_can_toggle / stack_reason",
-      all(k in apk_app for k in ("stack_mode", "stack_can_toggle", "stack_reason")))
+check("★ APP：设备列表用到 stack_mode / stack_desired / stack_pending（需求 2：准入只在服务端，APP 不再置灰）",
+      all(k in apk_app for k in ("stack_mode", "stack_desired", "stack_pending")))
 check("★ APP：调 POST /api/printer/stack_mode 且带 client_id + enable",
       "/api/printer/stack_mode" in apk_app and "client_id" in apk_app and "enable" in apk_app)
 check("★ APP：管理员角色判定",

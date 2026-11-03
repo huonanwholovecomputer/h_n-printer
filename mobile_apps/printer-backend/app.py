@@ -558,6 +558,8 @@ _SECURITY = load_security_config()
 RECENT_ORDERS_CONFIG_FILE = os.path.join(UPLOAD_DIR, "recent_orders_config.json")
 DEFAULT_RECENT_ORDERS_LIMIT = 10
 RECENT_ORDERS_LIMIT_RANGE = (1, 100)
+# 2026-11：翻页模式只接受这几档每页条数（与结算页/前端下拉框对齐，避免任意值把响应撑大）
+RECENT_ORDERS_PER_PAGE_CHOICES = (10, 20, 50, 100)
 _RECENT_ORDERS_LIMIT = DEFAULT_RECENT_ORDERS_LIMIT
 
 
@@ -1673,10 +1675,16 @@ def _stack_toggle_problem(client_id: str, enable=None) -> str:
 STACK_INTENT_FILE = os.path.join(UPLOAD_DIR, "stack_intent.json")
 _stack_intent_lock = threading.RLock()
 _stack_intent = {}
-# 本次上线是否已为某设备下发过 offline_intent：{client_id: enable}
-# 用来打断「设备忙拒绝 → 再回报 stack_state → 又比对不一致 → 再下发」这条死循环；
-# 设备重连（on_connect）时清空 ⇒ 每次上线最多自动重试一次。
+# 下发去重 + 重试冷却：{client_id: {"enable": bool, "at": datetime, "count": int}}
+# 用来打断「设备拒绝 → 再回报 stack_state → 又比对不一致 → 再下发」这条死循环。
+# 2026-11 口径变更：不再是「每次上线最多试一次」（那样设备端升级前/偶发拒绝就永远不重试），
+# 改成**可重试**：期望仍在、设备空闲、仍不一致时，距上次下发超过
+# STACK_INTENT_RETRY_COOLDOWN_SEC 秒就再发一次；设备接受（mode == 期望）即清期望。
+# 设备重连（on_connect）时清空该设备的记录 ⇒ 上线立刻可以再试一次（不等冷却）。
 _stack_intent_dispatched = {}
+# 两次自动下发之间的最小间隔（秒）：防抖（设备反复回报 state 时不至于刷屏）+ 给设备端留
+# 出「拒绝并回报原因」的时间窗。设备端每次拒绝后仍保留期望，只是要等冷却结束再试。
+STACK_INTENT_RETRY_COOLDOWN_SEC = 20
 
 
 def load_stack_intent():
@@ -1734,6 +1742,19 @@ def _stack_intent_pending(client_id: str) -> bool:
         return client_id in _stack_intent
 
 
+def _stack_desired_of(client_id: str):
+    """该设备攒批的**期望**值：True / False / None（= 没有人留下未落地的期望）。
+
+    与 stack_pending 的分工：pending 只回答"有没有期望"，desired 回答"期望是什么"。
+    设备列表 / printer_state 两个都下发，前端据此区分「期望开启但设备还没照办」
+    （desired=True + pending=True + mode=False）与「期望关闭」这两种完全不同的高亮。
+    """
+    ent = _stack_intent_of(client_id)
+    if not ent:
+        return None
+    return bool(ent.get("enable"))
+
+
 def _set_stack_intent(client_id, enable, by="", by_role="", applied=False) -> bool:
     """记录/覆盖某设备的攒批期望并落盘；返回是否写盘成功（内存副本仍会更新）。"""
     with _stack_intent_lock:
@@ -1774,8 +1795,16 @@ def _apply_stack_intent_on_online(client_id: str, sid: str = "") -> None:
 
     为什么要等上报（而不是在 on_connect 里直接发）：连接瞬间镜像里是上次会话的旧值，
     拿旧值比对会「一致就误清期望」或「不一致就白发一条」。`stack_state` 是设备刚上报的
-    真实状态，比它可靠。同一会话内最多自动下发一次（`_stack_intent_dispatched` 去重），
-    设备忙拒绝后保留期望，等下次上线再试（符合"设备是最终裁决者"的既有口径）。
+    真实状态，比它可靠。
+
+    2026-11（可重试，取代旧的「每次上线最多一次」）：
+      · 实际 == 期望 → 清期望（已达成，没别的可做）；
+      · 设备忙 → **期望一律保留、绝不清掉**；本会话第一次比对仍下发一次（让设备自己裁决：
+        设备端的 toggle 闸门会拒并回 note，服务器不自作主张替设备判死），之后靠冷却不重发；
+      · 距上次下发 < STACK_INTENT_RETRY_COOLDOWN_SEC → 先不发（防抖，等设备端把上一条
+        处理完并回报）；冷却过后仍不一致 → 再发，直到设备接受或人改主意；
+      · 后写覆盖先写：期望变了（dispatched 里的 enable 与当前期望不同）⇒ 立刻按新期望发，
+        不受冷却限制（人的新指令优先）。
     """
     ent = _stack_intent_of(client_id)
     if not ent:
@@ -1789,14 +1818,19 @@ def _apply_stack_intent_on_online(client_id: str, sid: str = "") -> None:
         print(f"[stack_intent] {client_id} 有期望但当前无在线会话，暂不下发（下次上线再试）")
         return
     with _stack_intent_lock:
-        if _stack_intent_dispatched.get(client_id) is want:
-            keep = True
-        else:
-            keep = False
-    if keep:
-        print(f"[stack_intent] {client_id} 期望仍为{'开启' if want else '关闭'}，"
-              f"设备端尚未接受（忙/拒绝），保留期望待下次上线")
-        return
+        rec = dict(_stack_intent_dispatched.get(client_id) or {})
+    if rec and rec.get("enable") is want:
+        at = rec.get("at")
+        age = (datetime.now() - at).total_seconds() if isinstance(at, datetime) else 1e9
+        if age < STACK_INTENT_RETRY_COOLDOWN_SEC:
+            print(f"[stack_intent] {client_id} 期望仍为{'开启' if want else '关闭'}，"
+                  f"距上次下发 {age:.0f}s（冷却 {STACK_INTENT_RETRY_COOLDOWN_SEC}s）"
+                  f"→ 本轮不重发，保留期望"
+                  + ("（设备正忙，期望保留到空闲）" if st["busy"] else ""))
+            return
+    if st["busy"]:
+        print(f"[stack_intent] {client_id} 期望{'开启' if want else '关闭'}待应用，"
+              f"设备正忙 → 先下发一次由设备裁决，期望保留到设备接受")
     request_id = uuid.uuid4().hex[:8]
     try:
         socketio.emit("set_stack_mode",
@@ -1810,7 +1844,11 @@ def _apply_stack_intent_on_online(client_id: str, sid: str = "") -> None:
         print(f"[stack_intent] {client_id} 下发离线期望失败: {e}")
         return
     with _stack_intent_lock:
-        _stack_intent_dispatched[client_id] = want
+        _stack_intent_dispatched[client_id] = {
+            "enable": want,
+            "at": datetime.now(),
+            "count": int(rec.get("count") or 0) + 1 if rec.get("enable") is want else 1,
+        }
     actual = "开启" if st["mode"] else ("关闭" if st["mode"] is False else "未知")
     print(f"[stack_intent] {client_id} 上线校验不一致（期望{'开启' if want else '关闭'}，"
           f"实际{actual}）→ 已下发 set_stack_mode"
@@ -2381,6 +2419,8 @@ def _printer_state_payload(client_id: str) -> dict:
         "stack_busy": _stack_state_of(client_id)["busy"],
         # 2026-11：本机是否有一条"离线时期望"还没落地（设备端可据此提示"上线后自动应用"）
         "stack_pending": _stack_intent_pending(client_id),
+        # 2026-11：期望值本身（true/false/null）—— 设备端据此显示"期望开启，等待应用"
+        "stack_desired": _stack_desired_of(client_id),
     }
 
 
@@ -3086,6 +3126,8 @@ def init_db():
             price_per_page   REAL    DEFAULT 0.25,
             total_price      REAL    DEFAULT 0,
             is_free          INTEGER DEFAULT 0,
+            manual_status_by TEXT    DEFAULT '',
+            manual_status_at TEXT    DEFAULT '',
             FOREIGN KEY (file_id) REFERENCES files(id)
         )
         """
@@ -3297,6 +3339,21 @@ def init_db():
         ("schedule_mode", "TEXT", "'now'"),      # now | at | countdown
         ("scheduled_at", "TEXT", "''"),          # 绝对时间 "%Y-%m-%d %H:%M:%S"，仅预约单有值
         ("schedule_frozen", "INTEGER", "0"),     # 1 = 到点文件未就绪，已冻结暂停
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type} DEFAULT {default}")
+            conn.commit()
+            print(f"  已添加 orders.{col} 列")
+        except sqlite3.OperationalError:
+            pass
+
+    # v21 迁移（2026-11）：人工订正留痕 —— 谁在什么时候把订单订正成了终态。
+    # 为什么另开两列而不是复用 reject_reason：订正人/订正时间属于**订单级审计**，
+    # reject_reason 是子任务级的"为什么没打出来"；两者在订单详情里并排展示（status_reason
+    # 由子任务 reject_reason 汇总而来），混在一列会让"设备迟到成功救回"时的清理逻辑失真。
+    for col, col_type, default in [
+        ("manual_status_by", "TEXT", "''"),   # 订正操作者昵称（≤32 字符，空 = 非人工订正）
+        ("manual_status_at", "TEXT", "''"),   # 订正时刻（服务器时间 YYYY-MM-DD HH:MM:SS）
     ]:
         try:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type} DEFAULT {default}")
@@ -4054,11 +4111,20 @@ def _load_paper_prices() -> tuple[float, float]:
 
 # ==================== 订单状态聚合 ====================
 
-# 状态优先级：失败 > 打印中/排队中 > 已完成 > 被打回 > 已取消
+# 状态优先级：超时/失败 > 打印中/排队中 > 已完成 > 被打回 > 已取消
 # 用于把多个子任务 (order_files) 的状态聚合为父订单 (orders) 的状态
-_STATUS_PRIORITY = {"failed": 9, "printing": 8, "waiting": 7, "accepted": 6,
+# 2026-11：新增 "timeout"（超时）—— 与 failed 同列（优先级 9），结算口径里也按失败处理，
+# 但**不**进 NO_LONGER_PRINTABLE_STATUSES：设备迟到的 print_success 仍能把它救回 sent。
+_STATUS_PRIORITY = {"timeout": 9, "failed": 9, "printing": 8, "waiting": 7, "accepted": 6,
                     "downloading": 5, "offline_unknown": 5, "scheduled": 4, "queued": 4,
                     "sent": 3, "abandoned": 2, "rejected": 1, "canceled": 0}
+
+# 「超时」状态（2026-11）：设备已确认但迟迟不回报 / 断线未回报 / 排队过期 —— 判定为
+# "这一单不会再有结果了"，与 failed 一样是终态（结算里算失败、不再参与推送与排队）。
+# ⚠ 但**不是** NO_LONGER_PRINTABLE_STATUSES：设备是最终裁决者，迟到的 print_success
+#   仍按 on_print_success 的白名单把它救回 sent（现场：断线恢复后补打成功的那单）。
+TIMEOUT_STATUS = "timeout"
+
 
 # 「这单不该再有纸出来」的终态（2026-10-18 审查 🔴 的统一判据 = 「云端不要再主动让它打印」）。
 # 人工订正成这三种状态后：① 必须通知设备端停止/丢弃在飞队列（admin_order_status →
@@ -4073,9 +4139,13 @@ def aggregate_order_status(conn, order_id):
     """根据 order_files 的状态聚合父订单状态：
     - 全部 sent → sent
     - 全部 rejected → rejected
-    - 任一 failed → failed（其余继续）
-    - 否则取优先级最高者（printing 优先于 queued）
+    - 混合终态：用户主动取消优先 > 超时 > 已完成 > 断线未知 > 已确认 > 被打回 > 打回失败
+    - 其余取优先级最高者（printing 优先于 queued；timeout/failed 优先级 9）
     - 无子任务时保持原状态
+
+    2026-11：timeout（超时）是终态但不是 NO_LONGER_PRINTABLE —— 进"混合终态"集合是为了
+    让它参与聚合（否则会被当成活跃状态取 max）；与 failed 一样**压过 sent**：一个子任务
+    超时、另一个打印完成时，父单显示"超时"（整单并未真正完成，不能给顾客看"已完成"）。
     """
     rows = conn.execute(
         "SELECT status FROM order_files WHERE order_id = ?", (order_id,)
@@ -4087,12 +4157,16 @@ def aggregate_order_status(conn, order_id):
         return "sent"
     if all(s == "rejected" for s in statuses):
         return "rejected"
-    if all(s in ("sent", "accepted", "offline_unknown", "abandoned", "canceled", "rejected") for s in statuses):
+    if all(s in ("sent", "accepted", "offline_unknown", "abandoned", "canceled", "rejected",
+                 "timeout") for s in statuses):
         # 混合终态：用户主动取消优先于已完成——
         # 已取消订单即使有部分文件在取消前已打印完成，父订单仍显示"已取消"
         #（否则取消后迟到的 print_success 会把聚合状态刷回 sent，用户看到"已完成"）
         if any(s == "canceled" for s in statuses):
             return "canceled"
+        # 超时压过「已完成」：部分超时 + 部分完成 ≠ 整单完成（与 failed 同口径）
+        if any(s == "timeout" for s in statuses):
+            return "timeout"
         if any(s == "sent" for s in statuses):
             return "sent"
         if any(s == "offline_unknown" for s in statuses):
@@ -4105,7 +4179,8 @@ def aggregate_order_status(conn, order_id):
             return "rejected"
         return "canceled"
     # 取优先级最高的非终态
-    active = [s for s in statuses if s not in ("sent", "accepted", "offline_unknown", "abandoned", "canceled", "rejected")]
+    active = [s for s in statuses if s not in ("sent", "accepted", "offline_unknown",
+                                               "abandoned", "canceled", "rejected", "timeout")]
     if not active:
         return "sent"
     return max(active, key=lambda s: _STATUS_PRIORITY.get(s, 0))
@@ -4119,6 +4194,24 @@ def refresh_order_status(conn, order_id):
             "UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id)
         )
     return new_status
+
+
+def order_status_reason(conn, order_id):
+    """订单级「为什么没打出来」：取该订单子任务里**第一条非空** reject_reason（无则 ''）。
+
+    为什么要订单级的一个字段：订单详情/结算明细展示的是父订单的状态（聚合值），
+    但原因只存在于子任务行上。前端拿到 status='timeout' 却没有任何一句话解释，用户只能猜；
+    给一个订单级的 status_reason（子任务级 reject_reason 照旧保留，一个文件一条原因），
+    列表页/详情页一行就能显示。多文件订单只取第一条：真要看每个文件的原因，
+    前端仍可读 order.files[i].reject_reason。
+    """
+    row = conn.execute(
+        "SELECT reject_reason FROM order_files WHERE order_id = ?"
+        " AND reject_reason IS NOT NULL AND TRIM(reject_reason) != ''"
+        " ORDER BY id ASC LIMIT 1",
+        (order_id,),
+    ).fetchone()
+    return (row["reject_reason"] or "").strip() if row else ""
 
 
 def calc_wait_seconds(created_at, print_started_at):
@@ -4142,10 +4235,12 @@ def calc_wait_seconds(created_at, print_started_at):
 
 
 def expire_stale_queued_orders():
-    """防滥用：淘汰排队超过 queued_timeout_hours 的子任务（标记 failed 并刷新父订单状态）。
+    """防滥用：淘汰排队超过 queued_timeout_hours 的子任务（标记 timeout 并刷新父订单状态）。
     目的：释放被 queued 状态钉住的磁盘文件——cleanup_expired_files 会跳过活跃状态
     （含 queued）引用的文件；若无打印机认领，攻击者可用排队订单让文件永驻服务器。
-    超时淘汰后状态变为 failed（非活跃状态），清理任务即可删除对应文件。"""
+    超时淘汰后状态变为 timeout（非活跃状态），清理任务即可删除对应文件。
+    2026-11：原先标 failed，与"打印失败"混为一谈（探测里看不出是排队过期）；
+    改标 timeout 并写 reject_reason，用户/结算看到的是"超时"而不是"失败"。"""
     timeout_hours = _SECURITY["queued_timeout_hours"]
     if timeout_hours <= 0:
         return
@@ -4163,8 +4258,9 @@ def expire_stale_queued_orders():
         order_ids = set()
         for r in rows:
             conn.execute(
-                "UPDATE order_files SET status = 'failed', reject_reason = ? WHERE id = ?",
-                (f"排队超过 {timeout_hours} 小时未打印，已自动取消", r["id"]),
+                "UPDATE order_files SET status = ?, reject_reason = ? WHERE id = ?",
+                (TIMEOUT_STATUS,
+                 f"排队超过 {timeout_hours} 小时未打印，已超时取消", r["id"]),
             )
             order_ids.add(r["order_id"])
         for oid in order_ids:
@@ -4312,10 +4408,13 @@ def process_pending_orders():
         if not file_path:
             print(f"  [FAIL] 子任务 #{of_id}: 文件不存在")
             conn = get_db()
+            # 2026-11：失败必须带原因（用户/结算页要看得出"为什么没打"），
+            # 这条不是超时（文件真的没了），所以保持 failed 而不是 timeout。
             _retry_on_lock(
                 conn.execute,
-                "UPDATE order_files SET status = 'failed' WHERE id = ? AND status = 'queued'",
-                (of_id,),
+                "UPDATE order_files SET status = 'failed', reject_reason = ?"
+                " WHERE id = ? AND status = 'queued'",
+                ("订单文件已失效（服务器上找不到该文件），无法打印，请联系客服重传", of_id),
             )
             refresh_order_status(conn, order_id)
             _retry_on_lock(conn.commit)
@@ -4390,12 +4489,13 @@ def process_scheduled_orders():
             frow = conn.execute("SELECT path FROM files WHERE id = ?", (file_id,)).fetchone()
             conn.close()
             if not frow or not os.path.exists(frow["path"]):
-                # 文件已被清理 → 标记失败
+                # 文件已被清理 → 标记失败（2026-11：必须写原因，否则用户只看到"失败"）
                 conn = get_db()
                 _retry_on_lock(
                     conn.execute,
-                    "UPDATE order_files SET status = 'failed' WHERE id = ? AND status = 'scheduled'",
-                    (row["of_id"],),
+                    "UPDATE order_files SET status = 'failed', reject_reason = ?"
+                    " WHERE id = ? AND status = 'scheduled'",
+                    ("预约订单的文件已被清理，无法打印，请联系客服重传", row["of_id"]),
                 )
                 refresh_order_status(conn, order_id)
                 _retry_on_lock(conn.commit)
@@ -4680,7 +4780,12 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
 
 
 def check_printing_timeout():
-    """检查超过超时时间未反馈的 printing/accepted 子任务 (order_files)，标记为失败并聚合父订单。
+    """检查超过超时时间未反馈的 printing/accepted/offline_unknown 子任务 (order_files)，
+    标记为 **timeout（超时）** 并聚合父订单。
+
+    2026-11 口径变更：这三条超时路径原先一律标 failed —— 用户看到「失败」却没有任何原因，
+    分不清「打印机坏了」「纸没出来」还是「纯粹没人管/设备掉线」。现在统一标 timeout，
+    并且**每条都写 reject_reason**（订单详情/结算页直接展示给用户）。
 
     P1-8 超时判定（按是否已被客户端 accept 区分）：
     - 未 accept（status='printing'，打印机端窗口等待用户确认）：**不再判失败**——
@@ -4689,6 +4794,10 @@ def check_printing_timeout():
       重新推送，直到打印机确认/打回/用户取消（或排队超 queued_timeout_hours 被淘汰）。
     - 已 accept（status='accepted'）：accept 时刻（locked_at，由 accept_order 刷新）起算 3 分钟
       （PRINT_FEEDBACK_TIMEOUT）；locked_at 距今不足 3 分钟 → 跳过（仍在反馈窗口内）。
+      ⚠ 这条就是现场「添加到本地十来分钟还没打，订单被判失败」的真实落点之一：客户端
+      accept 之后若用户没点开始打印（job 只进了标签页、不在保活集合里），locked_at 不再被
+      print_keepalive 刷新，3 分钟后就落到这里。
+    - 断线未知（status='offline_unknown'）：accept 时刻起算 OFFLINE_UNKNOWN_TIMEOUT（30 分钟）。
     """
     now = datetime.now()
     timeout_sub_tasks = []
@@ -4719,8 +4828,9 @@ def check_printing_timeout():
             if (now - la_dt).total_seconds() > PRINT_FEEDBACK_TIMEOUT:
                 timeout_sub_tasks.append(r["id"])
 
-        # 3) offline_unknown（断线未知）：客户端断线且未回报结果，超时后保守标记 failed
-        #    （方案 B：不自动重新入队，避免重复打印；用户可在订单列表看到失败后手动重发）
+        # 3) offline_unknown（断线未知）：客户端断线且未回报结果，超时后保守标 timeout
+        #    （方案 B：不自动重新入队，避免重复打印；用户可在订单列表看到超时后手动重发。
+        #     ⚠ 不是 failed：结果未知 ≠ 确定没打出来，设备迟到的 print_success 仍能救回 sent）
         off_rows = conn.execute(
             "SELECT id, order_id, locked_at FROM order_files WHERE status = 'offline_unknown'"
         ).fetchall()
@@ -4734,11 +4844,11 @@ def check_printing_timeout():
                 continue
             if (now - la_dt).total_seconds() <= OFFLINE_UNKNOWN_TIMEOUT:
                 continue
-            print(f"  [FAIL] 子任务 #{r['id']}: 断线未知超过 {OFFLINE_UNKNOWN_TIMEOUT // 60} 分钟，标记为失败")
+            print(f"  [TIMEOUT] 子任务 #{r['id']}: 断线未知超过 {OFFLINE_UNKNOWN_TIMEOUT // 60} 分钟，标记为超时")
             conn.execute(
-                "UPDATE order_files SET status = 'failed', locked_at = '',"
-                " reject_reason = '打印机断线，打印结果未知，已超时标记失败' WHERE id = ?",
-                (r["id"],),
+                "UPDATE order_files SET status = ?, locked_at = '',"
+                " reject_reason = '打印机断线，打印结果未知，已超时' WHERE id = ?",
+                (TIMEOUT_STATUS, r["id"]),
             )
             refresh_order_status(conn, r["order_id"])
             conn.commit()
@@ -4766,11 +4876,13 @@ def check_printing_timeout():
                 if la_dt and (now - la_dt).total_seconds() < PRINT_FEEDBACK_TIMEOUT:
                     print(f"  [INFO] 子任务 #{sub_task_id}: 刚被 accept，仍在反馈窗口内，跳过")
                     continue
-            print(f"  [FAIL] 子任务 #{sub_task_id}: 已确认但超时未反馈，标记为失败")
+            print(f"  [TIMEOUT] 子任务 #{sub_task_id}: 已确认但超时未反馈，标记为超时")
             conn.execute(
-                "UPDATE order_files SET status = 'failed', locked_at = '',"
-                " reject_reason = '打印机已确认但超时未反馈打印结果' WHERE id = ? AND status = 'accepted'",
-                (sub_task_id,),
+                "UPDATE order_files SET status = ?, locked_at = '',"
+                " reject_reason = ? WHERE id = ? AND status = 'accepted'",
+                (TIMEOUT_STATUS,
+                 "打印机已确认，但 3 分钟内未开始打印/未回报结果，已超时",
+                 sub_task_id),
             )
             refresh_order_status(conn, of_row["order_id"])
             conn.commit()
@@ -5217,18 +5329,27 @@ def on_print_success(data):
     # 场景：订正/取消发生在设备离线期间，这台机照旧把纸打了出来并如实回报成功；纸确实出来了，
     # 账就该算（人工订正只保证"云端不再主动让它打印"，不否定设备已出纸的事实）。
     # 反过来说：设备**没**打出来时根本不会有成功回报，所以这条放行不会凭空把取消单算成收益。
-    # reject_reason：凡是从"失败/打回/取消/放弃"翻成 sent 都要清掉（旧文案会误导以为这单没成）。
+    # reject_reason：凡是从"失败/超时/打回/取消/放弃"翻成 sent 都要清掉（旧文案会误导以为这单没成）。
     conn.execute(
         "UPDATE order_files SET reject_reason = '' WHERE id = ?"
-        " AND status IN ('failed', 'rejected', 'canceled', 'abandoned')",
+        " AND status IN ('failed', 'timeout', 'rejected', 'canceled', 'abandoned')",
         (task_id,),
     )
     conn.execute(
-        "UPDATE order_files SET status = 'sent', locked_at = '' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued', 'failed', 'canceled', 'abandoned', 'rejected')",
+        "UPDATE order_files SET status = 'sent', locked_at = '' WHERE id = ? AND status IN ('printing', 'accepted', 'offline_unknown', 'waiting', 'downloading', 'queued', 'failed', 'timeout', 'canceled', 'abandoned', 'rejected')",
         (task_id,),
     )
     # 获取父订单 ID 并刷新聚合状态
     if row:
+        # 2026-11：设备把「失败/超时/取消/放弃/打回」翻成 sent 时（救回），订单级的人工订正
+        # 留痕也一并清掉 —— 这单已由设备最终裁决，再显示"由 XX 订正为失败"会误导用户与结算。
+        # 只在这几种"救回"场景清；人工订正成 sent 的记录不会被一次迟到的成功回报抹掉。
+        if (prev_status in ("failed", TIMEOUT_STATUS)
+                or prev_status in NO_LONGER_PRINTABLE_STATUSES):
+            conn.execute(
+                "UPDATE orders SET manual_status_by = '', manual_status_at = '' WHERE id = ?",
+                (row["order_id"],),
+            )
         refresh_order_status(conn, row["order_id"])
         # 归属标记：本地打印工具回报成功时附带操作管理员姓名（订单号右侧下拉选择）。
         # 云端订单为顾客订单（is_admin_print 保持 0），仅盖章 owner_name；
@@ -5258,6 +5379,10 @@ def on_print_success(data):
         # 2026-09 的既有决定：3 分钟反馈超时把任务误判 failed 后，迟到的成功回报就是
         # 「纸确实出来了」的证据 ⇒ 救回 sent。人工订正为 failed 的订单同样适用，别加拦截。
         print(f"  [FIX] print_success 子任务 #{task_id} 由 failed 救回 sent（迟到的成功回报）")
+    elif prev_status == TIMEOUT_STATUS:
+        # 2026-11：超时（timeout）与 failed 同口径 —— 迟到的成功回报照样救回 sent，
+        # 因为 timeout 的本意是"结果未知"，而不是"确定没打出来"。
+        print(f"  [FIX] print_success 子任务 #{task_id} 由 timeout 救回 sent（迟到的成功回报）")
 
     with pushed_tasks_lock:
         pushed_tasks.pop(task_id, None)
@@ -5465,7 +5590,7 @@ def on_download_delayed(data):
     if not bad_basis and not chk_rows:
         act_rows = conn_chk.execute(
             "SELECT id FROM order_files WHERE order_id = ?"
-            " AND status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')",
+            " AND status NOT IN ('sent', 'failed', 'timeout', 'canceled', 'rejected', 'abandoned')",
             (order_id,),
         ).fetchall()
         owned = any(_subtask_ownership(_r["id"], client_id, conn=conn_chk)[0]
@@ -5754,7 +5879,7 @@ def _recalc_prices_for_file(file_id, page_count):
     try:
         rows = conn.execute(
             "SELECT id, order_id, copies, duplex, page_range, simplex_pages FROM order_files"
-            " WHERE file_id = ? AND status NOT IN ('sent','failed','canceled','rejected','abandoned')",
+            " WHERE file_id = ? AND status NOT IN ('sent','failed','timeout','canceled','rejected','abandoned')",
             (file_id,),
         ).fetchall()
         if not rows:
@@ -8521,6 +8646,9 @@ def printer_devices():
             # 攒批「离线期望」是否还没落地（2026-11）：true = 有人趁着离线点过开关，
             # 设备上线后会自动应用；移动端据此显示"已记录，上线后自动应用"
             "stack_pending": _stack_intent_pending(cid),
+            # 期望值本身（true/false/null）：与 stack_pending 配对，前端据此区分
+            # 「期望开启但未落地」与「期望关闭但未落地」（2026-11）
+            "stack_desired": _stack_desired_of(cid),
             # 自动双面能力（三态；授权页据此标注"需人工翻纸"）
             **_device_capability_fields(cid),
         })
@@ -8745,6 +8873,9 @@ def claiming_devices():
             # 攒批「离线期望」是否还没落地（2026-11）：设备离线时点过开关 → true，
             # 上线自动应用后清掉。移动端据此把开关置灰并显示"已记录，上线后自动应用"
             "stack_pending": _stack_intent_pending(cid),
+            # 期望值本身（true/false/null）：与 stack_pending 配对，前端据此区分
+            # 「期望开启但未落地」与「期望关闭但未落地」（2026-11）
+            "stack_desired": _stack_desired_of(cid),
             # 置顶（2026-10）：pin_index 是「在生效顺序里的 0 基序位」，未置顶为 null（不是 -1：
             # 前端一律用 pin_index === 0 判默认选中，null/缺字段都能被它排除掉）。
             "pin": cid in pin_index_of,
@@ -9071,7 +9202,7 @@ def get_orders():
                urgency, urgency_price, cover_page, cover_page_price, pickup_address,
                schedule_mode, scheduled_at, schedule_frozen,
                source, owner_name, is_admin_print, remark, print_started_at,
-               received_client, target_client
+               received_client, target_client, manual_status_by, manual_status_at
         FROM orders
         WHERE {where_clause}
         ORDER BY id DESC
@@ -9155,6 +9286,11 @@ def get_orders():
         order["total_pages"] = total_pages
         order["total_sheets"] = total_sheets
         order["file_summary"] = file_summary
+        # 订单级失败/超时原因（与 /api/order/<id> 详情同口径：第一条非空 reject_reason）。
+        # 列表页据此显示一行原因，避免用户只看到"失败"却不知道为什么。
+        order["status_reason"] = next(
+            (str(f.get("reject_reason") or "").strip()
+             for f in files if str(f.get("reject_reason") or "").strip()), "")
         # 向前端保持一致：旧字段仍保留（兼容性），但语义标注为聚合值
         order["file"] = file_summary
         order["copies"] = total_copies
@@ -9209,7 +9345,8 @@ def get_order_detail(order_id):
                o.pickup_address,
                o.schedule_mode, o.scheduled_at, o.schedule_frozen,
                o.owner_name, o.is_admin_print, o.remark, o.print_started_at,
-               o.received_client, o.target_client
+               o.received_client, o.target_client,
+               o.manual_status_by, o.manual_status_at
         FROM orders o
         WHERE o.id = ? AND o.openid = ?
         """,
@@ -9281,6 +9418,8 @@ def get_order_detail(order_id):
         order["total_sheets"] = total_sheets
         # 用聚合状态
         order["status"] = aggregate_order_status(conn, order_id) or order["status"]
+        # 订单级失败原因（子任务级 reject_reason 仍逐个保留在 files 里）
+        order["status_reason"] = order_status_reason(conn, order_id)
     else:
         # 旧数据降级
         conn2 = get_db()
@@ -9316,6 +9455,8 @@ def get_order_detail(order_id):
         order["total_copies"] = legacy_copies
         order["total_pages"] = legacy_st["total_pages"]
         order["total_sheets"] = legacy_st["total_sheets"]
+        # 老单没有子任务行 → 没有失败原因可汇总（字段照给，前端不用判 undefined）
+        order["status_reason"] = ""
 
     # 关联临时许可密钥（每个订单消费的密钥）
     user_conn = get_user_db()
@@ -9454,7 +9595,7 @@ def cancel_order():
             # 覆盖预约单的 scheduled/downloading/waiting（到点前也允许取消）
             sub_tasks = conn.execute(
                 "SELECT id, operator_client FROM order_files WHERE order_id = ?"
-                " AND status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')",
+                " AND status NOT IN ('sent', 'failed', 'timeout', 'canceled', 'rejected', 'abandoned')",
                 (order_id,),
             ).fetchall()
 
@@ -9463,7 +9604,7 @@ def cancel_order():
             # 避免取消不完整导致已取消订单被 process_scheduled_orders 重新下发/卡死。
             conn.execute(
                 "UPDATE order_files SET status = 'canceled', locked_at = '' WHERE order_id = ?"
-                " AND status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')",
+                " AND status NOT IN ('sent', 'failed', 'timeout', 'canceled', 'rejected', 'abandoned')",
                 (order_id,),
             )
             conn.execute(
@@ -9767,6 +9908,15 @@ def local_orders():
     files = data.get("files", [])
     total_price = data.get("total_price", 0)
     created_at = data.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    # created_at 口径（2026-11，硬规矩）：**created_at = 订单首次生成（首次与服务器交互）时刻，
+    # 此后不可覆盖**。它只在 INSERT 时写入：
+    #   · /api/next_order_number 预留单 → 服务器 now；
+    #   · 本地工具离线首同步（本接口 INSERT 分支）→ 允许用 payload 里的 created_at。
+    # 已存在的行（预留单转正式单 / 重复上报）**一律不写 created_at** —— 否则同一张单的
+    # "下单时间"会随每次上报漂移：等待时长（print_started_at − created_at）、按日期统计与
+    # 结算区间都跟着变，甚至出现负等待。
+    # 与 2026-11-02 的 finished_at 口径取舍：finished_at（打印完成时刻）允许设备上报覆盖，
+    # 因为它描述的是"最后一次真的出纸"的物理事实；created_at 是账期归属的锚点，不能被改写。
     # 订单归属标记（本地工具订单号右侧下拉 + 勾选框）
     owner_name = (data.get("owner_name", "") or "").strip()
     is_admin_print = data.get("is_admin_print")
@@ -9834,12 +9984,14 @@ def local_orders():
                     "ignored": True,
                 })
 
-            # 更新占位记录为正式订单（reserved 占位 → reserved 完整 或 sent），并覆盖备注
+            # 更新占位记录为正式订单（reserved 占位 → reserved 完整 或 sent），并覆盖备注。
+            # ⚠ 刻意**不写 created_at**（2026-11）：订单首次生成时刻不可被重复上报改写，
+            # 详见本函数开头 created_at 口径注释。重复上报只更新内容，不动时间锚点。
             conn.execute(
                 """UPDATE orders SET file = ?, total_price = ?, status = ?,
-                                     created_at = ?, source = 'local', remark = ?
+                                     source = 'local', remark = ?
                    WHERE id = ?""",
-                (order_file_label, total_price, status, created_at, remark, order_id),
+                (order_file_label, total_price, status, remark, order_id),
             )
             # 归属标记：本地工具上报时随订单写入（缺失则默认占位名/管理员自行打印，
             # 与历史无标记订单的处理保持一致）
@@ -9984,17 +10136,20 @@ def local_order_status():
                     pass
                 return jsonify({"success": True, "changed": False, "ignored": True,
                                 "message": "该订单属于云端订单，已忽略（终态由 task 回报决定）"})
-            if old_status in ("canceled", "abandoned", "rejected"):
+            if old_status in ("canceled", "abandoned", "rejected", "timeout"):
                 conn.rollback()
                 return jsonify({"success": True, "changed": False, "order_id": order_id,
-                                "message": f"订单已是人工终态 {old_status}，不覆盖"})
+                                "message": f"订单已是终态 {old_status}，不覆盖"})
             if old_status == "failed":
                 conn.rollback()
                 return jsonify({"success": True, "changed": False, "order_id": order_id,
                                 "message": "订单已是失败态"})
+            # 2026-11：客户端带上来的失败原因落进子任务 reject_reason —— 原先解析了却直接丢弃，
+            # 用户只看到"打印失败"四个字，查不出是缺纸、卡纸还是驱动报错。
             conn.execute(
-                "UPDATE order_files SET status = 'failed', locked_at = '' WHERE order_id = ?",
-                (order_id,),
+                "UPDATE order_files SET status = 'failed', locked_at = '', reject_reason = ?"
+                " WHERE order_id = ?",
+                (reason, order_id),
             )
             conn.execute("UPDATE orders SET status = 'failed' WHERE id = ?", (order_id,))
             conn.commit()
@@ -11123,13 +11278,13 @@ def _storage_live_subtasks():
     try:
         rows = conn.execute(
             """SELECT status, COUNT(*) AS n FROM order_files
-               WHERE status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')
+               WHERE status NOT IN ('sent', 'failed', 'timeout', 'canceled', 'rejected', 'abandoned')
                GROUP BY status ORDER BY n DESC"""
         ).fetchall()
         samples = [r[0] for r in conn.execute(
             """SELECT DISTINCT o.order_number FROM order_files of
                JOIN orders o ON of.order_id = o.id
-               WHERE of.status NOT IN ('sent', 'failed', 'canceled', 'rejected', 'abandoned')
+               WHERE of.status NOT IN ('sent', 'failed', 'timeout', 'canceled', 'rejected', 'abandoned')
                  AND o.order_number != ''
                ORDER BY of.id DESC LIMIT 5"""
         ).fetchall()]
@@ -11358,12 +11513,19 @@ def _recent_orders_owner(row, profiles):
 @app.route("/api/admin/recent_orders", methods=["GET"])
 @login_required
 def admin_recent_orders():
-    """全站最近 N 条订单（仅 admin/super_admin；只读，**不提供翻页**）。
+    """全站订单：默认最近 N 条；带 `page`（或 `per_page`）时按页返回（仅 admin/super_admin；只读）。
 
-    查询参数 `?limit=` 可临时覆盖 N（夹在 1..100），但不改变超管设置的默认值。
+    查询参数：
+      · `limit=`  —— 临时覆盖"默认条数" N（夹在 1..100），不改变超管设置的默认值；
+      · `page=`   —— 1 起；**带上它就切到翻页模式**，返回体里多 total/page/per_page/total_pages；
+      · `per_page=` —— 每页条数，只接受 10/20/50/100，缺省 = 超管设置的默认条数（limit）。
+    兼容性（2026-11 新增翻页）：**不带 page 时返回结构不变**（{success, limit, orders}），
+    只额外多一个 total —— 老前端读 orders/limit 完全不受影响，不需要跟版。
+
     返回字段（与移动端约定，勿改名）：
       order_id / order_number / owner / owner_masked / created_at /
       file_count / page_count / total_price / status / source / is_admin_print
+      + status_reason（订单级第一条非空 reject_reason）/ manual_status_by / manual_status_at
     · page_count = 有效页数合计（含份数）：与结算页订单明细同源，逐文件走
       `_file_range_stats(...)`（内部只认 `_count_pages_in_range`，v7.2 唯一口径）；
     · sheet_count = 纸张张数合计（双面折算）—— 附赠字段，方便前端显示"8 页 / 4 张"；
@@ -11390,20 +11552,58 @@ def admin_recent_orders():
             return jsonify({"success": False,
                             "message": f"limit 必须为整数（{lo}-{hi}）"}), 400
 
+    # ── 翻页参数（2026-11）──
+    # 只要出现 page/per_page 就进翻页模式；两个都不带 = 老行为（最近 limit 条）。
+    paging = ("page" in request.args) or ("per_page" in request.args)
+    page = 1
+    per_page = limit
+    if paging:
+        raw_page = (request.args.get("page") or "1").strip()
+        try:
+            page = int(raw_page)
+        except ValueError:
+            return jsonify({"success": False, "message": "page 必须为整数（从 1 起）"}), 400
+        if page < 1:
+            return jsonify({"success": False, "message": "page 必须 ≥ 1"}), 400
+        raw_pp = (request.args.get("per_page") or "").strip()
+        if raw_pp:
+            try:
+                per_page = int(raw_pp)
+            except ValueError:
+                return jsonify({"success": False,
+                                "message": "per_page 只能取 10/20/50/100"}), 400
+            if per_page not in RECENT_ORDERS_PER_PAGE_CHOICES:
+                return jsonify({"success": False,
+                                "message": "per_page 只能取 10/20/50/100"}), 400
+        # 越界页不报错：返回空列表 + 真实 total_pages，前端自己收敛页码
+        offset = (page - 1) * per_page
+
     conn = get_db()
     try:
-        rows = conn.execute(
-            "SELECT id, order_number, openid, owner_name, source, created_at, "
-            "copies, page_count, duplex, total_price, status, is_admin_print "
-            "FROM orders ORDER BY created_at DESC, id DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
+        total = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        if paging:
+            rows = conn.execute(
+                "SELECT id, order_number, openid, owner_name, source, created_at, "
+                "copies, page_count, duplex, total_price, status, is_admin_print, "
+                "manual_status_by, manual_status_at "
+                "FROM orders ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (per_page, offset)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, order_number, openid, owner_name, source, created_at, "
+                "copies, page_count, duplex, total_price, status, is_admin_print, "
+                "manual_status_by, manual_status_at "
+                "FROM orders ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
         files_by_order = {r["id"]: [] for r in rows}
         if files_by_order:
             ids = list(files_by_order.keys())
             ph = ",".join("?" * len(ids))
             for f in conn.execute(
-                f"SELECT order_id, page_count, copies, duplex, page_range, simplex_pages "
+                f"SELECT order_id, page_count, copies, duplex, page_range, simplex_pages, "
+                f"reject_reason "
                 f"FROM order_files WHERE order_id IN ({ph}) ORDER BY order_id, id",
                 ids
             ).fetchall():
@@ -11457,12 +11657,25 @@ def admin_recent_orders():
                 "status": aggregate_order_status(conn, oid) or (r["status"] or ""),
                 "source": r["source"] or "wechat",
                 "is_admin_print": bool(r["is_admin_print"]),
+                # 2026-11：订单级原因 + 人工订正留痕（与订单详情/结算明细同口径）
+                "status_reason": next(
+                    (str(f.get("reject_reason") or "").strip()
+                     for f in files if str(f.get("reject_reason") or "").strip()), ""),
+                "manual_status_by": r["manual_status_by"] or "",
+                "manual_status_at": r["manual_status_at"] or "",
             })
     finally:
         conn.close()
+    if paging:
+        total_pages = (total + per_page - 1) // per_page if per_page > 0 else 0
+        print(f"[recent_orders] {getattr(g, 'openid', '')} 读取第 {page}/{total_pages} 页"
+              f"（per_page={per_page}，返回 {len(orders)} 条 / 全站 {total} 条）")
+        return jsonify({"success": True, "orders": orders, "total": total, "page": page,
+                        "per_page": per_page, "total_pages": total_pages,
+                        "limit": per_page})
     print(f"[recent_orders] {getattr(g, 'openid', '')} 读取最近 {limit} 条订单"
           f"（返回 {len(orders)} 条）")
-    return jsonify({"success": True, "limit": limit, "orders": orders})
+    return jsonify({"success": True, "limit": limit, "total": total, "orders": orders})
 
 
 @app.route("/api/admin/recent_orders_limit", methods=["GET", "POST"])
@@ -11713,6 +11926,12 @@ def admin_order_status():
     new_status = raw_status.strip() if isinstance(raw_status, str) else ""
     if new_status not in MANUAL_FIX_STATUSES:
         return jsonify({"success": False, "message": "不允许改为该状态"}), 400
+    # 2026-11：订正人留痕（可选字段 by，≤32 字符）。空/缺省 = ''（不记录操作者，
+    # 兼容老版本前端只发 {order_id, status} 的请求体）。超长直接截断而不是 400 ——
+    # 昵称类字段不值得为长度把整次订正打回。
+    raw_by = data.get("by")
+    by = raw_by.strip()[:32] if isinstance(raw_by, str) else ""
+    fixed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     files_updated = 0
     old_status = ""
@@ -11746,7 +11965,13 @@ def admin_order_status():
                 (new_status, order_id),
             )
             files_updated = cur.rowcount or 0
-            conn.execute("UPDATE orders SET status = ? WHERE id = ?", (new_status, order_id))
+            # 订单级人工订正留痕（2026-11）：谁、什么时候把这单订正成了终态。
+            # 与子任务 status 同事务写入 —— 半截成功（改了状态没记人）在审计上更糟。
+            conn.execute(
+                "UPDATE orders SET status = ?, manual_status_by = ?, manual_status_at = ?"
+                " WHERE id = ?",
+                (new_status, by, fixed_at, order_id),
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -11755,7 +11980,7 @@ def admin_order_status():
             conn.close()
 
     print(f"  [FIX] 订单 #{order_id} 状态人工订正: {old_status} → {new_status}"
-          f"（子任务 {files_updated} 个）")
+          f"（子任务 {files_updated} 个，操作者：{by or '未记录'}）")
     if new_status in NO_LONGER_PRINTABLE_STATUSES:
         # 「这单不该再有纸出来」⇒ 必须通知设备端清掉在飞队列（否则照打、账是终态、零日志）
         _notify_order_no_longer_printable(order_id, new_status, task_ids,
@@ -11767,6 +11992,8 @@ def admin_order_status():
         "status": new_status,
         "previous_status": old_status,
         "files_updated": files_updated,
+        "manual_status_by": by,
+        "manual_status_at": fixed_at,
     })
 
 
@@ -11875,7 +12102,9 @@ def admin_statistics_revenue():
     if status_param:
         allowed_statuses = [s.strip() for s in status_param.split(",") if s.strip()]
     else:
-        allowed_statuses = ["sent", "printing", "queued", "failed", "offline_unknown"]
+        # 2026-11：默认口径把 timeout（超时）与 failed 同列 —— 结算里都算"没有成功入账"，
+        # 明细行各自带 status_reason 区分原因
+        allowed_statuses = ["sent", "printing", "queued", "failed", "timeout", "offline_unknown"]
 
     conn = get_db()
     # 构建状态占位符
@@ -11904,7 +12133,8 @@ def admin_statistics_revenue():
                    o.auto_print, o.schedule_mode, o.scheduled_at,
                    o.delivery_percentage, o.urgency_price, o.cover_page_price,
                    o.pickup_address, o.remark, o.print_started_at,
-                   o.received_client, o.target_client
+                   o.received_client, o.target_client,
+                   o.manual_status_by, o.manual_status_at
             FROM orders o
             LEFT JOIN order_files of ON o.id = of.order_id AND of.status IN ({status_placeholders})
             WHERE o.created_at >= ? AND o.created_at <= ?
@@ -12008,14 +12238,14 @@ def admin_statistics_revenue():
                 continue
             if f["status"] == "sent":
                 paid_revenue += f["total_price"]
-            elif f["status"] not in ("canceled", "abandoned", "rejected", "failed"):
+            elif f["status"] not in ("canceled", "abandoned", "rejected", "failed", "timeout"):
                 receivable += f["total_price"]
         # 订单级附加服务费（派送/加急/首页费）= 父订单 total_price − 全部子任务费。
         # 仅当订单存在「有效文件」（非取消/放弃/打回/失败）时计入，且按有效文件状态整体
         # 归入已入账（全部 sent）/ 应收未收（有未 sent）；自打订单 / 无有效文件（如整单放弃）不计。
         extra_fee = max(0.0, (row["total_price"] or 0.0) - all_file_sum.get(oid, 0.0))
         if extra_fee > 0 and not is_self_print and files:
-            active_files = [f for f in files if f["status"] == "sent" or f["status"] not in ("canceled", "abandoned", "rejected", "failed")]
+            active_files = [f for f in files if f["status"] == "sent" or f["status"] not in ("canceled", "abandoned", "rejected", "failed", "timeout")]
             if active_files:
                 if all(f["status"] == "sent" for f in active_files):
                     paid_revenue += extra_fee
@@ -12058,6 +12288,12 @@ def admin_statistics_revenue():
             "revenue": round(paid_revenue, 2),
             "receivable": round(receivable, 2),
             "free_files": free_files,
+            # 2026-11：订单级原因与人工订正留痕 —— 结算明细里"为什么这单没钱/为什么状态被改"
+            # 一眼可见（子任务级原因仍逐个在 files[i].reject_reason）。
+            "status_reason": next((str(f.get("reject_reason") or "").strip()
+                                   for f in files if str(f.get("reject_reason") or "").strip()), ""),
+            "manual_status_by": row["manual_status_by"] or "",
+            "manual_status_at": row["manual_status_at"] or "",
             "files": files,
         })
 
@@ -12141,7 +12377,9 @@ def admin_statistics_owners():
     if status_param:
         allowed_statuses = [s.strip() for s in status_param.split(",") if s.strip()]
     else:
-        allowed_statuses = ["sent", "printing", "queued", "failed", "offline_unknown"]
+        # 2026-11：默认口径把 timeout（超时）与 failed 同列 —— 结算里都算"没有成功入账"，
+        # 明细行各自带 status_reason 区分原因
+        allowed_statuses = ["sent", "printing", "queued", "failed", "timeout", "offline_unknown"]
 
     conn = get_db()
     status_placeholders = ",".join("?" for _ in allowed_statuses)
@@ -12318,7 +12556,7 @@ def cleanup_abandoned_reserved_orders():
             conn.execute(
                 "UPDATE order_files SET status = 'abandoned'"
                 " WHERE order_id IN (SELECT id FROM orders WHERE status = 'abandoned'"
-                "   AND created_at < ?) AND status NOT IN ('sent', 'failed', 'canceled')",
+                "   AND created_at < ?) AND status NOT IN ('sent', 'failed', 'timeout', 'canceled')",
                 (cutoff,),
             )
             conn.commit()

@@ -90,6 +90,17 @@ class TabSettings:
     # /api/next_order_number 都带同一个值。上次响应丢包（服务端已建占位单、客户端却按超时
     # 回落本地临时号）时，重连换号能拿回**同一个号**，不会在云端留下一个空的「已预留」订单。
     order_req_id: str = ""
+    # ── 订单时间（2026-11 用户需求 #7）────────────────────────────────────────
+    # created_at = **本标签页这张订单第一次生成订单号的时刻**（"%Y-%m-%d %H:%M:%S"）。
+    #   一旦写入就**不可变**：复制合计/换号补报/云端补报都只能读它，不得用"当前时间"
+    #   或 PrintJob.finished_at 覆盖 —— 否则同一张订单的"创建时间"会随着复制/补报而漂移，
+    #   结算页的时间趋势与"下单→打印"耗时全部失真（2026-11-02 HN20261102-0011 的旧写法
+    #   就用 finished_at 当 created_at，看起来像"刚下单就打完"）。
+    #   云端接单的任务由后端下发时间（task.created_at），同样只写一次。
+    # started_at = **第一次真正开始打印**的时刻（本地点开打 / 云端 start_printing 回报）。
+    #   只记录第一次；重打/续打不覆盖（否则"打印发起"会一直跳到最后一趟）。
+    created_at: str = ""
+    started_at: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -105,6 +116,8 @@ class TabSettings:
             "manual_duplex_pending": self.manual_duplex_pending,
             "remark": self.remark,
             "order_req_id": self.order_req_id,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
         }
 
     @classmethod
@@ -126,6 +139,10 @@ class TabSettings:
             manual_duplex_pending=_bool_or_default(data.get("manual_duplex_pending"), False),
             remark=str(data.get("remark", "") or ""),
             order_req_id=str(data.get("order_req_id", "") or ""),
+            # 旧配置没有这两个键 ⇒ 空串（界面显示 "—"），不是"当前时间"：
+            # 凭空补一个时间等于伪造历史，宁可显示未知。
+            created_at=str(data.get("created_at", "") or ""),
+            started_at=str(data.get("started_at", "") or ""),
         )
 
     def calc_extra_total(self, base_total: float, config: "PrinterConfig") -> float:
@@ -195,6 +212,14 @@ class PrintJob:
     #   `manual_duplex.charge_units`（计费）。
     simplex_enabled: bool = False
     simplex_pages: str = ""
+    # ── Excel（.xls/.xlsx）版式覆盖（2026-11 用户需求 #10）──
+    # 右侧面板收集的打印版式（页边距/方向/纸张/居中/缩放/打印范围），**只对表格文件有意义**，
+    # 其它文件类型忽略。空 dict = 用户没为这个任务改过 ⇒ 用全局「默认任务参数」，
+    # 若全局也没配过则转换时不传 print_options（旧行为，版式不变）。
+    # 键名与 xlsx_printer 的 print_options 一致（paper/orientation/margin_*_cm/header_cm/
+    # footer_cm/center_h/center_v/fit/scale/print_range），见 resolve_xlsx_print_options。
+    # 持久化 + 复制：这些是"用户为这份文件选定的版式"，重启/复制任务必须原样带走。
+    xlsx_options: dict = field(default_factory=dict)
     # ── 字体缺失检测（2026-10-31 用户需求，见 font_check.py）──
     # 两种"缺"分开存，别混成一个列表 —— 它们**处置办法完全不同**，混着显示就有歧义
     # （2026-11-01 现场：tooltip 把"文件没嵌入"说成"没嵌入这些字体"，用户看不出该不该装字体）：
@@ -233,6 +258,7 @@ class PrintJob:
             "blank_undo_range": self.blank_undo_range,
             "simplex_enabled": self.simplex_enabled,
             "simplex_pages": self.simplex_pages,
+            "xlsx_options": dict(self.xlsx_options or {}),
             "missing_fonts": list(self.missing_fonts),
             "nonembedded_fonts": list(self.nonembedded_fonts),
             "font_checked": self.font_checked,
@@ -268,6 +294,8 @@ class PrintJob:
                               if isinstance(data.get("blank_undo_range"), str) else None),
             simplex_enabled=bool(data.get("simplex_enabled", False)),
             simplex_pages=str(data.get("simplex_pages", "") or ""),
+            # 只保留已知键（手改配置塞进来的垃圾键不进引擎），未知/坏值让归一函数兜住。
+            xlsx_options=_coerce_xlsx_options(data.get("xlsx_options")),
             missing_fonts=[str(x) for x in (data.get("missing_fonts") or [])
                            if isinstance(x, str) and x.strip()][:20],
             nonembedded_fonts=[str(x) for x in (data.get("nonembedded_fonts") or [])
@@ -632,6 +660,182 @@ def _dict_or_default(value, default: dict):
     if isinstance(value, dict) and value:
         return value
     return default
+
+
+# ── 默认任务参数（2026-11 用户需求 #11b / #10）───────────────────────────────
+# 「选项 → 默认任务参数…」里配的这一份是**跨文件类型**的默认值：
+#   · `PrinterConfig.paper_size` 由打印管线直接吃（PrintWorker → pdf_printer.print_pdf /
+#     print_plan_pass 的 `paper=`），Word / PDF / 图片全部走同一条路；
+#   · `PrinterConfig.default_task_options` 里的版式项（页边距/缩放/打印范围/方向/居中）
+#     供 xlsx 面板与转换引擎用；Excel 之外的文件类型不认这些项（Word/PDF 保持原排版）。
+# 语义约定（**改这里之前先想清楚**）：
+#   · `default_task_options` 为空 = 用户从未配置过 ⇒ 引擎侧维持旧行为
+#     （xlsx 不传 print_options、"未修改时行为与现在完全一致"）；
+#   · 只要它非空，就按**整份归一后的默认值**用（缺项补内置默认，不半份生效）；
+#   · paper 是唯一的例外：它有自己的标量字段 project 级别常驻，默认 A4。
+DEFAULT_PAPER_SIZE = "A4"
+PAPER_SIZES = ("A4", "A3", "A5", "Letter", "Legal", "B5")
+
+
+def normalize_paper_size(value) -> str:
+    """纸张大小归一：只认 PAPER_SIZES 里的取值，其余（含空/None/坏值）→ A4。
+
+    大小写与空格不敏感（配置是纯文本，用户可能手写成 "a4" / "letter"）。
+    """
+    raw = str(value or "").strip().replace(" ", "")
+    if not raw:
+        return DEFAULT_PAPER_SIZE
+    for name in PAPER_SIZES:
+        if raw.lower() == name.lower():
+            return name
+    return DEFAULT_PAPER_SIZE
+
+
+# 内置默认（用户没配过时的显示值与 xlsx 默认值来源）：
+# 纸张 A4 / 边距上下左右 1cm、页眉页脚 0 / 水平居中开、垂直居中关 /
+# 将所有列调整为一页 / 双面 + 长边翻转 / 纵向 —— 与用户口径逐项对应。
+DEFAULT_TASK_OPTIONS: dict = {
+    "duplex": "on",                 # "on" | "off"
+    "duplex_mode": "long-edge",     # "long-edge" | "short-edge"
+    "paper": DEFAULT_PAPER_SIZE,
+    "orientation": "portrait",      # "portrait" | "landscape"
+    "margin_top_cm": 1.0,
+    "margin_bottom_cm": 1.0,
+    "margin_left_cm": 1.0,
+    "margin_right_cm": 1.0,
+    "header_cm": 0.0,
+    "footer_cm": 0.0,
+    "center_h": True,
+    "center_v": False,
+    "fit": "cols",                  # "none" | "sheet" | "cols" | "rows"
+    "scale": 100,                   # 10..400，仅 fit == "none" 时生效（自定义缩放）
+    "print_range": "active",        # "active" | "workbook" | "selection" | "ignore_area"
+    "dpi": 0,                       # 0 = 跟随全局（render_dpi）
+    "image_orientation": "auto",    # "auto" | "landscape" | "portrait"
+    "blank_tail": False,            # 排除末尾空白页
+    "simplex_enabled": False,       # 封面单独打印
+    "simplex_pages": "",            # 封面单独打印的页（"1" / "1,16-23"）
+}
+
+TASK_OPTION_FITS = ("none", "sheet", "cols", "rows")
+TASK_OPTION_RANGES = ("active", "workbook", "selection", "ignore_area")
+
+
+def _choice_or_default(value, choices, default: str) -> str:
+    """枚举字段归一：小写比较，不在白名单 → default（配置被手改也不炸）。"""
+    raw = str(value or "").strip().lower()
+    return raw if raw in choices else default
+
+
+def normalize_task_options(raw) -> dict:
+    """把（可能残缺/被手改坏的）默认任务参数字典归一成**完整**一份并夹住取值范围。
+
+    返回的必是所有键都在的 dict —— 上层（默认参数对话框、xlsx 面板、转换透传）都假定
+    键齐；缺键补 DEFAULT_TASK_OPTIONS 的同名项。
+    """
+    src = raw if isinstance(raw, dict) else {}
+    d = DEFAULT_TASK_OPTIONS
+    return {
+        "duplex": _choice_or_default(src.get("duplex"), ("on", "off"), d["duplex"]),
+        "duplex_mode": _choice_or_default(src.get("duplex_mode"),
+                                          ("long-edge", "short-edge"), d["duplex_mode"]),
+        "paper": normalize_paper_size(src.get("paper")),
+        "orientation": _choice_or_default(src.get("orientation"),
+                                          ("portrait", "landscape"), d["orientation"]),
+        "margin_top_cm": _coerce_num(src.get("margin_top_cm"), d["margin_top_cm"], 0.0, 20.0),
+        "margin_bottom_cm": _coerce_num(src.get("margin_bottom_cm"),
+                                        d["margin_bottom_cm"], 0.0, 20.0),
+        "margin_left_cm": _coerce_num(src.get("margin_left_cm"), d["margin_left_cm"], 0.0, 20.0),
+        "margin_right_cm": _coerce_num(src.get("margin_right_cm"),
+                                       d["margin_right_cm"], 0.0, 20.0),
+        "header_cm": _coerce_num(src.get("header_cm"), d["header_cm"], 0.0, 10.0),
+        "footer_cm": _coerce_num(src.get("footer_cm"), d["footer_cm"], 0.0, 10.0),
+        "center_h": _bool_or_default(src.get("center_h"), d["center_h"]),
+        "center_v": _bool_or_default(src.get("center_v"), d["center_v"]),
+        "fit": _choice_or_default(src.get("fit"), TASK_OPTION_FITS, d["fit"]),
+        "scale": int(_coerce_num(src.get("scale"), d["scale"], 10.0, 400.0)),
+        "print_range": _choice_or_default(src.get("print_range"), TASK_OPTION_RANGES,
+                                          d["print_range"]),
+        "dpi": int(_coerce_num(src.get("dpi"), d["dpi"], 0.0, 1200.0)),
+        "image_orientation": _choice_or_default(src.get("image_orientation"),
+                                                ("auto", "landscape", "portrait"),
+                                                d["image_orientation"]),
+        "blank_tail": _bool_or_default(src.get("blank_tail"), d["blank_tail"]),
+        "simplex_enabled": _bool_or_default(src.get("simplex_enabled"), d["simplex_enabled"]),
+        "simplex_pages": str(src.get("simplex_pages") or "")[:200],
+    }
+
+
+def resolve_task_options(raw) -> dict:
+    """配置里存的默认任务参数 → 完整一份（空/缺 = 内置默认）。
+
+    注意它**不**表达"用户是否配置过"：那个判断请用 `PrinterConfig.task_options_customized()`
+    —— 两者混用就会把"从未配置"误当成"用户选过默认值"，从而改变旧行为。
+    """
+    return normalize_task_options(raw if isinstance(raw, dict) else {})
+
+
+def task_options_to_print_options(opts) -> dict:
+    """默认任务参数 → xlsx 引擎的 print_options（键名与 task-5 契约逐字一致）。
+
+    只挑 Excel PageSetup 认得的项：纸张/方向/四项页边距/页眉页脚/居中/缩放/打印范围。
+    其余（duplex/dpi/图片方向/空白页…）不属于版式，不往里塞。
+    """
+    o = resolve_task_options(opts)
+    return {
+        "paper": o["paper"],
+        "orientation": o["orientation"],
+        "margin_top_cm": o["margin_top_cm"],
+        "margin_bottom_cm": o["margin_bottom_cm"],
+        "margin_left_cm": o["margin_left_cm"],
+        "margin_right_cm": o["margin_right_cm"],
+        "header_cm": o["header_cm"],
+        "footer_cm": o["footer_cm"],
+        "center_h": o["center_h"],
+        "center_v": o["center_v"],
+        "fit": o["fit"],
+        "scale": o["scale"],
+        "print_range": o["print_range"],
+    }
+
+
+def resolve_xlsx_print_options(default_task_options, job_options) -> dict | None:
+    """任务级 xlsx 版式 → `print_options`；**None = 不传**（引擎走旧行为，不改版式）。
+
+    优先级：任务自己存过的 `PrintJob.xlsx_options` > 全局「默认任务参数」> None。
+    为什么最后要能返回 None：用户从没碰过这些设置时，Excel 出来的版式必须与改动前
+    **逐像素一致**（老用户升级后不该发现"表格变样了"）；只有显式配过才接管版式。
+    """
+    base = default_task_options if isinstance(default_task_options, dict) else {}
+    own = job_options if isinstance(job_options, dict) else {}
+    if not own and not base:
+        return None
+    if own:
+        merged = resolve_task_options(base)
+        merged.update(own)
+        return task_options_to_print_options(merged)
+    return task_options_to_print_options(base)
+
+
+# xlsx 引擎认得的版式键（与 task-5 契约一致；面板只写这一套，读配置时也只留这一套）。
+XLSX_OPTION_KEYS = (
+    "paper", "orientation",
+    "margin_top_cm", "margin_bottom_cm", "margin_left_cm", "margin_right_cm",
+    "header_cm", "footer_cm", "center_h", "center_v",
+    "fit", "scale", "print_range",
+)
+
+
+def _coerce_xlsx_options(value) -> dict:
+    """PrintJob.xlsx_options 容错解析：空/非 dict → {}（= 跟随全局默认）。
+
+    非空则**归一成完整一套**并只保留 XLSX_OPTION_KEYS —— 面板总是写全套，但配置可能被
+    手改，给引擎的必须永远是干净、夹过范围的 13 个键。
+    """
+    if not isinstance(value, dict) or not value:
+        return {}
+    norm = normalize_task_options(value)
+    return {k: norm[k] for k in XLSX_OPTION_KEYS}
 
 
 # ── 第 1 趟耗时预估（两参数线性模型 T(n) ≈ a + b·n）────────────────────────────
@@ -1230,6 +1434,31 @@ class PrinterConfig:
     # 勾上后本地工具订阅本机 spooler 作业事件，把"绕过本工具"的打印记进 external_prints.json。
     # 默认 False：老配置文件没有这个键 ⇒ 保持关，且不影响其他默认值。
     external_watch_enabled: bool = False
+    # ---- 纸张大小（2026-11 用户需求 #11c：**跨文件类型**的全局默认）----
+    # 打印管线直接吃它：PrintWorker → pdf_printer.print_pdf / print_plan_pass 的 paper=，
+    # 所以 Word / PDF / 图片 全部按同一个纸张出纸；xlsx 的 print_options["paper"] 同源。
+    # 旧配置没有这个键 ⇒ 回落 A4（与改动前"打印机默认纸"在标准 A4 机上是同一结果，
+    # 且显式 A4 比空串更可预期：驱动默认纸被改成 A3 时不会静默放大）。
+    paper_size: str = DEFAULT_PAPER_SIZE
+    # ---- 默认任务参数（2026-11 用户需求 #11b）----
+    # 「选项 → 默认任务参数…」保存的**跨文件类型**默认版式（见 DEFAULT_TASK_OPTIONS）。
+    # 语义：空 dict = 用户从未配置过 ⇒ 引擎侧维持旧行为（xlsx 不传 print_options）。
+    # 非空则整份归一后使用（缺项补内置默认）。由 normalize_task_options 收口。
+    default_task_options: dict = field(default_factory=dict)
+
+    def task_options(self) -> dict:
+        """解析后的默认任务参数（键齐、夹过范围），paper 与 self.paper_size 同源。"""
+        opts = resolve_task_options(self.default_task_options)
+        opts["paper"] = normalize_paper_size(self.paper_size or opts.get("paper"))
+        return opts
+
+    def task_options_customized(self) -> bool:
+        """用户是否**显式**配过默认任务参数（False ⇒ 引擎必须维持旧行为）。"""
+        return isinstance(self.default_task_options, dict) and bool(self.default_task_options)
+
+    def xlsx_print_options(self, job_options=None) -> dict | None:
+        """某任务的 xlsx print_options；None = 不传（不改版式）。见 resolve_xlsx_print_options。"""
+        return resolve_xlsx_print_options(self.default_task_options, job_options)
 
     def get_profile(self, printer_name: str = "") -> PrinterProfile:
         """取某台打印机的档案（缺省用 self.printer_name）；没有则返回默认档案（不落盘）。"""
@@ -1286,6 +1515,9 @@ class PrinterConfig:
             # 攒批模式开关（多任务合并翻纸）
             "duplex_stack_mode": self.duplex_stack_mode,
             "external_watch_enabled": self.external_watch_enabled,
+            # 纸张大小 + 默认任务参数（老配置没有这两个键 ⇒ A4 / {}，零回归）
+            "paper_size": normalize_paper_size(self.paper_size),
+            "default_task_options": dict(self.default_task_options or {}),
         }
 
     @classmethod
@@ -1302,6 +1534,12 @@ class PrinterConfig:
                 tabs[k] = TabSettings.from_dict(v)
             if not tabs:
                 tabs = {"1": TabSettings()}
+        # 纸张大小：老配置可能只有 default_task_options.paper（或都没有 ⇒ A4）。
+        # 两处都有时以 paper_size 为准（它是打印管线的直接来源）。
+        _paper_raw = data.get("paper_size")
+        if _paper_raw is None:
+            _opts_raw = data.get("default_task_options")
+            _paper_raw = _opts_raw.get("paper") if isinstance(_opts_raw, dict) else None
         return cls(
             printer_name=data.get("printer_name", ""),
             duplex_mode=data.get("duplex_mode", "long-edge"),
@@ -1350,6 +1588,13 @@ class PrinterConfig:
             duplex_stack_mode=_bool_or_default(data.get("duplex_stack_mode"), False),
             # 外部打印监视（老配置没有这个键 → 关，零回归）
             external_watch_enabled=_bool_or_default(data.get("external_watch_enabled"), False),
+            # 纸张大小（老配置没有这个键 → A4；坏值/不在白名单 → A4，不抛异常）
+            paper_size=normalize_paper_size(_paper_raw),
+            # 默认任务参数（老配置没有这个键 → 空 dict = 从未配置 ⇒ 引擎维持旧行为；
+            # 非空则整份归一，坏值回落内置默认）
+            default_task_options=(normalize_task_options(data.get("default_task_options"))
+                                  if _dict_or_default(data.get("default_task_options"), {})
+                                  else {}),
         )
 
     def save(self, path: str) -> None:

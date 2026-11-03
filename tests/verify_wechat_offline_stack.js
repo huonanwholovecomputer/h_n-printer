@@ -73,8 +73,10 @@ function runStatic() {
   check('①旧行为已删除：不再「设备离线就 toast 并 return」',
         toggle.length > 100 && toggle.indexOf('设备离线，无法远程切换') < 0
         && !/if \(device\.online === false\)\s*\{/.test(toggle));
-  check('②在线忙判定只对在线设备生效（device.online !== false && stack_can_toggle === false）',
-        /device\.online !== false && device\.stack_can_toggle === false/.test(toggle));
+  check('②旧「在线忙才拦」判据已删除（随时可切，状态不一致交后端记 pending）',
+        toggle.indexOf('stack_can_toggle') < 0, toggle.slice(0, 60));
+  check('②切换方向取「当前期望值」的反面（stack_view 优先，缺字段回退 stack_mode）',
+        /stack_view/.test(toggle) && /const enable = !desiredNow/.test(toggle));
   check('③pending 分支：文案缺省时用「已记录，设备上线后自动应用」',
         /data\.pending === true/.test(toggle)
         && toggle.indexOf("'已记录，设备上线后自动应用'") >= 0);
@@ -88,8 +90,9 @@ function runStatic() {
   check('⑥WXML：按钮 disabled 不再包含 item.online === false',
         /device-stack-btn-disabled/.test(wxml)
         && !/\(item\.online === false \|\| item\.stack_can_toggle === false/.test(wxml));
-  check('⑥WXML：disabled 判据 = 在线且不可切 / 本机正在请求',
-        /item\.stack_can_toggle === false && item\.online !== false/.test(wxml));
+  check('⑥WXML：disabled 判据只剩「本机正在请求」（不按在线/可切置灰）',
+        /stackTogglingId === item\.client_id/.test(wxml)
+        && wxml.indexOf('item.stack_can_toggle === false && item.online !== false') < 0);
   check('⑦WXML：stack_pending 时显示「待应用」角标',
         /wx:if="\{\{item\.stack_pending\}\}"[\s\S]{0,120}待应用/.test(wxml));
   check('⑧WXSS：角标样式与既有 .device-pin-badge 同档（21rpx / line-height 1.3 / flex-shrink 0）',
@@ -257,13 +260,18 @@ function runBehavior() {
   check('③离线 + can_toggle=false：仍发请求（离线不适用在线忙判定）', calls.requests.length === 1,
         'req=' + calls.requests.length);
 
-  /* ④ 在线设备忙：仍置灰并给出完整原因（行为不变） */
+  /* ④ 在线设备忙：也允许切换（2026-11 需求 2），状态不一致由后端记 pending */
   page.data.claimingDevices = [device({ online: true, stack_can_toggle: false, stack_reason: '打印机正忙（正在打印 / 等待人工翻纸打第二趟 / 有排队待打的请求）' })];
   h.reset();
+  h.setResponse({ statusCode: 200, data: { success: true, stack_pending: true, stack_desired: true, stack_busy: true, message: '打印机正忙，已记录' } });
   tap(page, 0);
-  check('④在线忙：不发请求', calls.requests.length === 0);
-  check('④在线忙：长原因走 modal（完整可读）', calls.modal.length === 1
-        && /打印机正忙/.test((calls.modal[0] || {}).content || ''), JSON.stringify(calls.modal[0]));
+  check('④在线忙：仍发请求（不再前端拦截）', calls.requests.length === 1, 'req=' + calls.requests.length);
+  check('④在线忙：stack_desired 优先决定胶囊/开关', page.data.claimingDevices[0].stack_view === true,
+        String(page.data.claimingDevices[0].stack_view));
+  check('④在线忙：stack_pending=true（渲染「⏳ 待应用」）', page.data.claimingDevices[0].stack_pending === true);
+  check('④在线忙：stack_busy 按服务端回写', page.data.claimingDevices[0].stack_busy === true);
+  check('④在线忙：提示只在 toast（不再弹遮罩）', calls.modal.length === 0
+        && (calls.toast[0] || {}).title === '打印机正忙，已记录', JSON.stringify(calls.toast[0]));
 
   /* ⑤ 在线设备正常切换：行为不变（用服务端回写值，清 pending） */
   page.data.claimingDevices = [device({ online: true, stack_mode: false, stack_pending: true })];

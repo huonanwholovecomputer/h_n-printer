@@ -269,9 +269,11 @@ check("cloud_client.py 页数分析：converter.convert(..., from_cloud=True[+ a
       _cloud_analysis_passes_from_cloud(CLOUD_SRC))
 
 check("gui.py ConvertWorker 接收 from_cloud/allow_cloud_com；未放行时云端不走 COM",
+      # 只钉到 allow_cloud_com 为止：它后面可能还会长新参数（2026-11 加了 print_options），
+      # 判据不该因为加了一个默认参数就假红。
       bool(re.search(r"def __init__\(self,\s*row:\s*int,\s*file_path:\s*str,\s*engine:\s*str,"
                      r"\s*source_md5:\s*str\s*=\s*\"\",\s*\n\s*from_cloud:\s*bool\s*=\s*False,"
-                     r"\s*allow_cloud_com:\s*bool\s*=\s*False\)", GUI_SRC))
+                     r"\s*allow_cloud_com:\s*bool\s*=\s*False", GUI_SRC))
       and "self._from_cloud" in GUI_SRC
       and bool(re.search(r"not self\._from_cloud or self\._allow_cloud_com", GUI_SRC))
       and bool(re.search(r"self\._allow_cloud_com\s*=\s*bool\(allow_cloud_com\)", GUI_SRC)))

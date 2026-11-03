@@ -9,8 +9,9 @@
  *   ① 点「¥xx.xx」→ 气泡出现，且它挂在 body 下（不在 .order-card-detail 里，不会被 overflow 裁）
  *   ② 气泡底边在价格顶边上方 12px（Popconfirm 语义：锚在触发元素上方）
  *   ③ 点价格不会把订单卡片收起（stopPropagation：详情仍展开）
- *   ④ 「复制价格」→ 剪贴板 = 订单号 + 空格 + ¥金额；气泡收起
- *   ⑤ 「复制详细价格」→ 剪贴板含逐文件小计与合计；气泡收起
+ *   ④ 「复制价格」→ 剪贴板 = `{订单号} — ¥金额`（em dash，与本地工具 gui.py:_on_copy_total 一致）；气泡收起
+ *   ⑤ 「复制详细价格」→ 剪贴板 = 本地工具 gui.py:_on_copy_detail 逐字格式（订单号 / 14 短横线 /
+ *      计费明细 / 每文件两行 + 算式 / 合计）；气泡收起
  *   ⑥ 点 mask（气泡外）→ 收起
  *   ⑦ 上方放不下 → 翻到价格下方（.price-pop-below）
  *   ⑧ 深色模式下气泡仍有背景色（不是透明）
@@ -220,8 +221,10 @@ await page.locator('[data-price-act="simple"]').click();
 await page.waitForTimeout(100);
 check('④ 「复制价格」后气泡收起', await page.locator('.price-pop').count() === 0);
 const clip1 = await page.evaluate(() => navigator.clipboard.readText());
-check('④ 剪贴板 = 订单号 + 空格 + ¥金额（与小程序同格式）',
-      clip1 === 'HN20261025-0013 ¥3.80', JSON.stringify(clip1));
+// WebView 剪贴板里换行是 CRLF（copyText 为 Android 粘贴做的规范化），比较前统一
+const clipNorm = clip1.replace(/\r\n/g, '\n');
+check('④ 剪贴板 = `{订单号} — ¥金额`（em dash，与本地打印工具 Ctrl+C 逐字一致）',
+      clipNorm === 'HN20261025-0013 — ¥3.80', JSON.stringify(clip1));
 
 /* ── ⑤ 复制详细价格 ───────────────────────────────────────────────── */
 await page.locator('#orderList .detail-price-tap').first().click();
@@ -229,14 +232,26 @@ await page.waitForSelector('.price-pop', { state: 'visible' });
 await page.locator('[data-price-act="detail"]').click();
 await page.waitForTimeout(100);
 const clip2 = await page.evaluate(() => navigator.clipboard.readText());
+const detailNorm = clip2.replace(/\r\n/g, '\n');
+const detailLines = detailNorm.split('\n');
+const DASH14 = '-'.repeat(14);
 check('⑤ 「复制详细价格」后气泡收起', await page.locator('.price-pop').count() === 0);
-check('⑤ 剪贴板含逐文件小计（0.80 等实收值）与订单号',
-      clip2.indexOf('计费明细') === 0 && clip2.indexOf('HN20261025-0013') > 0
-      && clip2.indexOf('2 份 × 6 页 | 双面 | 全部页 | ¥2.40') > 0,
-      JSON.stringify(clip2.split('\n').slice(0, 4)));
-check('⑤ 剪贴板合计给出算式（2.40+0.80+0.60=￥3.80，金额=订单实收）',
-      clip2.indexOf('💰合计: 2.40+0.80+0.60=￥3.80') > 0,
-      clip2.split('\n').slice(-1)[0]);
+check('⑤ 详细价格逐字对齐本地工具（订单号 / 14 短横线 / 计费明细 / 逐文件两行 + 算式）',
+      detailLines[0] === '订单号: HN20261025-0013'
+      && detailLines[1] === DASH14
+      && detailLines[2] === '计费明细'
+      && detailLines[3] === DASH14
+      && detailNorm.indexOf('1. 示波器的使用.pdf') > 0
+      && detailNorm.indexOf('   2x 双面 范围:全部') > 0
+      && detailNorm.indexOf('   (3张×0.40)×2份 = ¥2.40') > 0
+      && detailNorm.indexOf('   (1张×0.30)×2份 = ¥0.60') > 0
+      && detailNorm.indexOf('|') < 0 && detailNorm.indexOf('￥') < 0,
+      JSON.stringify(detailLines.slice(0, 8)));
+check('⑤ 合计是订单实收、无附加服务费行（夹具未勾附加服务）',
+      detailLines[detailLines.length - 2] === DASH14
+      && detailLines[detailLines.length - 1] === '💰合计: ¥3.80'
+      && detailNorm.indexOf('附加服务费') < 0,
+      JSON.stringify(detailLines.slice(-3)));
 
 /* ── ⑥ 点 mask 收起 ───────────────────────────────────────────────── */
 await page.locator('#orderList .detail-price-tap').first().click();

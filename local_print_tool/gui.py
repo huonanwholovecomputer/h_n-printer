@@ -88,6 +88,12 @@ from PySide6.QtWidgets import (
 )
 
 from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, fit_print_speed, cloud_word_com_allowed, split_tail_blank, simplex_page_set, selected_pages, job_simplex_pages, check_simplex_pages
+# 默认任务参数（2026-11 用户需求 #11b/#10）：纸张/页边距/缩放/打印范围的跨引擎默认值。
+# 归一与折叠逻辑全在 printer_config 里（纯函数、可单测），gui 只负责界面与透传。
+from printer_config import (DEFAULT_TASK_OPTIONS, DEFAULT_PAPER_SIZE, PAPER_SIZES, XLSX_OPTION_KEYS,
+                            normalize_paper_size, normalize_task_options,
+                            resolve_task_options, resolve_xlsx_print_options,
+                            task_options_to_print_options)
 from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
@@ -213,6 +219,78 @@ def _soft_wrap_text(text: str) -> str:
     for sep in ("\\", "/", "_", "-"):
         text = text.replace(sep, sep + "​")
     return text
+
+
+def _now_stamp() -> str:
+    """订单时间字段的统一时间戳（本地时区 "%Y-%m-%d %H:%M:%S"）。
+
+    单独抽一处的理由：创建/发起时间都要能被 tests 用同一格式断言，散落各处
+    `datetime.now().strftime(...)` 迟早有一处格式不同（少一位/带 T），对账就出错。
+    """
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _order_time_variants(prefix: str, value: str) -> list[str]:
+    """把时间戳展开成**由长到短**的候选文案：窄窗口退化为"省略秒"而不是裁掉数字。
+
+    返回 `[完整, 去秒, 仅日期]`（无值时只有 "前缀 —"）。
+    """
+    val = str(value or "").strip()
+    if not val:
+        return [f"{prefix} —"]
+    out = [f"{prefix} {val}"]
+    if len(val) >= 19 and val[10] in " T":
+        out.append(f"{prefix} {val[:16]}")      # 省略秒
+        out.append(f"{prefix} {val[:10]}")      # 只剩日期
+    elif len(val) >= 10:
+        out.append(f"{prefix} {val[:10]}")
+    return out
+
+
+class _TimeVariantsLabel(QLabel):
+    """单行只读标签：宽度不够时**换用更短的候选文案**，仍不够才用 … 截断。
+
+    为什么不直接用 QLabel：主窗口很窄时标签会撑破 tab 行（或者反过来把 −/+ 按钮挤走）。
+    也不做成"省略秒"的静态切换 —— 那要看窗口宽度，而 QLabel 本身没有 elide 能力。
+    注意：本类在 resizeEvent 里 setText，任何异常都会让 PySide6 6.11 在槽里崩掉进程，
+    所以 _apply 全程 try/except 兜住（见 CLAUDE.md 的 6.11 崩溃教训）。
+    """
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._variants: list[str] = [""]
+        self.setWordWrap(False)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setTextInteractionFlags(Qt.NoTextInteraction)
+
+    def set_variants(self, variants) -> None:
+        cands = [str(v) for v in (variants or []) if str(v)]
+        self._variants = cands or [""]
+        self._apply()
+
+    def full_text(self) -> str:
+        return self._variants[0] if self._variants else ""
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply()
+
+    def _apply(self) -> None:
+        try:
+            fm = self.fontMetrics()
+            width = max(0, self.width() - 2)
+            chosen = self._variants[-1] if self._variants else ""
+            for cand in self._variants:
+                if fm.horizontalAdvance(cand) <= width:
+                    chosen = cand
+                    break
+            else:
+                chosen = fm.elidedText(chosen, Qt.ElideRight, width)
+            if chosen != self.text():
+                self.setText(chosen)
+        except Exception:
+            pass
 
 
 class ThemedCheckBox(QCheckBox):
@@ -872,7 +950,7 @@ class ManualDuplexDialog(QDialog):
         self._flip_gate_at = 0.0       # 闸门时刻（第 1 趟第几秒，0 = 无闸门）
         self._flip_text = ""           # 翻纸说明（闸门期间先存着，到点再铺到详情里）
         self._flip_timeout = 0         # 翻纸确认超时（同上）
-        # 放行策略（来自打印队列档案：「帮助 → 打印速度…」可调）
+        # 放行策略（来自打印队列档案：「选项 → 打印速度…」可调）
         self._gate_ratio = self.FLIP_GATE_RATIO
         self._gate_extra = 0.0
 
@@ -891,7 +969,7 @@ class ManualDuplexDialog(QDialog):
     # 2026-10-20 用户反馈：旧口径「预估 − 5 秒」不合适 —— **纸越多，预估误差越大**，
     # 固定 5 秒在大批量上要么太保守（白等）、要么偏早。改为**按比例放行**：
     #     放行时刻 = 第 1 趟预估 × gate_ratio（默认 50%） + flip_ready_sec（人工翻页准备时间）
-    # 两个参数都进「帮助 → 打印速度…」由操作员调（`PrinterProfile.gate_ratio/flip_ready_sec`）。
+    # 两个参数都进「选项 → 打印速度…」由操作员调（`PrinterProfile.gate_ratio/flip_ready_sec`）。
     FLIP_GATE_RATIO = 0.5         # 默认：预估完成 50% 后允许点「继续打第 2 趟」
     FLIP_GATE_MIN_SEC = 1.0       # 算出来 < 1 秒的闸门没有意义，直接放行
 
@@ -902,7 +980,7 @@ class ManualDuplexDialog(QDialog):
 
         闸门时刻 = 预估 × ratio + extra（extra = 人工翻页准备时间，默认 0）：
         ratio 默认 50%（用户口径「预估时间完成 50% 之后允许点击」），可在
-        「帮助 → 打印速度…」里改。预估为空/0 或算出 < 1 秒 ⇒ 不设闸门。"""
+        「选项 → 打印速度…」里改。预估为空/0 或算出 < 1 秒 ⇒ 不设闸门。"""
         est = float(estimate or 0.0)
         if est <= 0:
             return 0.0
@@ -1130,7 +1208,7 @@ class ManualDuplexDialog(QDialog):
             f"⏳ 预估第 1 趟共 {format_duration(est)}，按「预估 {_ratio}%"
             + (f" + 翻页准备 {_extra:.0f} 秒" if _extra > 0 else "")
             + f"」放行，还有 {math.ceil(left)} 秒")
-        self._countdown.setToolTip("放行比例与人工翻页时间可在「帮助 → 打印速度…」里调")
+        self._countdown.setToolTip("放行比例与人工翻页时间可在「选项 → 打印速度…」里调")
         note = ("（打印机的「完成」回报早于实机出纸，计时与按钮都以预估为准；"
                 "这笔回报不会被写进速度样本）")
         self._pass1_hint.setText(f"{self._speed_hint}\n{note}".strip() if self._speed_hint
@@ -2083,7 +2161,7 @@ _FIRST_ITEMS = ["奇数页先打（成品叠最上面是第 1 页）", "偶数�
 
 
 class PrinterDuplexCapabilityDialog(QDialog):
-    """帮助 → 打印机双面能力…：给**当前打印队列**盖一个三态能力章 + 手动双面参数。
+    """选项 → 打印机双面能力…：给**当前打印队列**盖一个三态能力章 + 手动双面参数。
 
     参数默认值是 HP LaserJet 1020 的实机校准结论（first=odd / 逆序 / 180° 补偿），
     换机型照抄会错 —— 对话框里写明了这一点，并要求填"校准人"留痕。
@@ -2205,7 +2283,7 @@ class PrinterDuplexCapabilityDialog(QDialog):
 
 
 class PrintSpeedDialog(QDialog):
-    """帮助 → 打印速度：**一个窗口装下所有与"第 1 趟耗时/翻纸放行"有关的设置**。
+    """选项 → 打印速度…：**一个窗口装下所有与"第 1 趟耗时/翻纸放行"有关的设置**。
 
     2026-10-20 用户要求：
       ① 放行口径从「预估 − 5 秒」改成「预估 × 比例」（纸越多误差越大，固定秒数不合适）；
@@ -2223,7 +2301,7 @@ class PrintSpeedDialog(QDialog):
     机器若确认支持自动双面（`profile.auto_duplex is True`），双面由驱动一次成型、
     没有第 1 趟、也没有翻纸，这些设置**一个都不生效**（改数值、打 11 张纸测速都是空转）。
     所以窗口按能力三态改口：自动双面 ⇒ 只读说明窗（控件灰掉、保存变关闭、不写档案）；
-    未确认 ⇒ 提示先去「帮助 → 打印机双面能力…」盖章；人工翻纸 ⇒ 正常可调。
+    未确认 ⇒ 提示先去「选项 → 打印机双面能力…」盖章；人工翻纸 ⇒ 正常可调。
     """
 
     calibrate_requested = Signal()
@@ -2258,7 +2336,7 @@ class PrintSpeedDialog(QDialog):
         elif cap is None:
             banner_txt = ("双面能力未确认：这套「第 1 趟耗时 / 翻纸放行」只对没有自动双面器、"
                           "必须人工翻纸的机型有效。若本机没有自动双面器，请先到"
-                          "「帮助 → 打印机双面能力…」盖章，否则双面会交给驱动程序自带的"
+                          "「选项 → 打印机双面能力…」盖章，否则双面会交给驱动程序自带的"
                           "「双面打印说明」向导。")
         else:
             banner_txt = ("本机按「人工翻纸」口径打双面（程序自己分两趟）："
@@ -2398,6 +2476,275 @@ class PrintSpeedDialog(QDialog):
             "gate_ratio": round(float(self._ratio.value()) / 100.0, 2),
             "flip_ready_sec": round(float(self._ready.value()), 0),
         }
+
+
+# ── 默认任务参数 / xlsx 任务面板共用的下拉文案 ────────────────────────────────
+# 两个入口（选项 → 默认任务参数…、右侧任务参数面板的表格模块）必须说同一套话、排同一个
+# 顺序，否则"将所有列调整为一页"在两处显示成两个说法，用户会以为是两回事。
+# 顺序与 printer_config 的 TASK_OPTION_FITS / TASK_OPTION_RANGES 逐位对应。
+FIT_LABELS = ("无缩放", "将工作表调整为一页", "将所有列调整为一页", "将所有行调整为一页")
+FIT_VALUES = ("none", "sheet", "cols", "rows")
+RANGE_LABELS = ("活动工作表", "整个工作簿", "选定区域", "忽略打印区域")
+RANGE_VALUES = ("active", "workbook", "selection", "ignore_area")
+IMAGE_ORIENT_LABELS = ("自动方向", "横向", "竖向")
+IMAGE_ORIENT_VALUES = ("auto", "landscape", "portrait")
+ORIENTATION_LABELS = ("纵向", "横向")
+ORIENTATION_VALUES = ("portrait", "landscape")
+
+
+def _combo(labels) -> "QComboBox":
+    """按文案列表建下拉。
+
+    注意：`QComboBox(list)` **不是**合法构造签名（PySide6 直接 TypeError），
+    必须先建空控件再 addItems —— 收口成一个函数，免得再踩。
+    """
+    box = QComboBox()
+    box.addItems([str(x) for x in labels])
+    return box
+
+
+def _index_of(values, value, default: int = 0) -> int:
+    """枚举值 → 下拉索引（配置被手改/枚举改过也不越界）。"""
+    try:
+        return list(values).index(value)
+    except (TypeError, ValueError):
+        return default
+
+
+class DefaultTaskOptionsDialog(QDialog):
+    """选项 → 默认任务参数…：**跨文件类型**的全局打印默认值（2026-11-03 用户需求 #11b）。
+
+    这一窗口配的是"所有任务的默认值"，不是某一个任务的参数：
+
+      · 打印方式：单/双面、双面模式 —— 与任务面板同口径（单页硬闸门仍然优先，
+        真正生效值由 `_effective_duplex()` 判，这里只是默认请求值）；
+      · 页面：纸张大小（A4/A3/A5/Letter/Legal/B5，**对 Word/PDF/图片/表格全部生效**）、
+        方向、四边页边距、页眉页脚、水平/垂直居中；
+      · 缩放与打印范围：无缩放 / 将工作表调整为一页 / 所有列一页 / 所有行一页 + 自定义
+        百分比，活动工作表 / 整个工作簿 / 选定区域 / 忽略打印区域；
+      · 其它：DPI、图片方向、排除末尾空白页、封面单独打印。
+
+    语义（**别改**）：用户从没打开过这个窗口并保存 ⇒ `PrinterConfig.default_task_options`
+    保持空 dict ⇒ xlsx 引擎拿到 print_options=None ⇒ 版式与改动前逐像素一致。点过一次
+    「保存」之后才整份接管（缺项按内置默认补齐）。纸张大小是例外：它有自己的标量字段
+    `paper_size`，任何时候都参与打印（默认 A4 = 旧行为）。
+    """
+
+    def __init__(self, parent=None, options=None, paper_size: str = "",
+                 theme_manager=None):
+        super().__init__(parent)
+        self._theme_manager = theme_manager
+        self.setWindowTitle("默认任务参数")
+        self.setMinimumWidth(560)
+        opts = resolve_task_options(options or {})
+        if paper_size:
+            opts["paper"] = normalize_paper_size(paper_size)
+        lay = QVBoxLayout(self)
+
+        head = QLabel("这里是所有文件类型的默认打印参数：没有单独改过的任务都按这一份打印。"
+                      "全部保持默认值时，打印结果与此前完全一致。")
+        head.setWordWrap(True)
+        head.setStyleSheet("font-size: 11px; color: #7f8c8d;")
+        lay.addWidget(head)
+
+        # ── ① 打印方式 ──
+        g1 = QGroupBox("打印方式")
+        f1 = QFormLayout(g1)
+        self._duplex = _combo(["双面打印", "单面打印"])
+        _disable_combo_wheel(self._duplex)
+        self._duplex.setCurrentIndex(0 if opts["duplex"] == "on" else 1)
+        self._duplex.setToolTip("默认按双面还是单面打印；单页文件仍强制单面（单页双面硬闸门）")
+        f1.addRow("单/双面：", self._duplex)
+        self._duplex_mode = _combo(["长边翻转", "短边翻转"])
+        _disable_combo_wheel(self._duplex_mode)
+        self._duplex_mode.setCurrentIndex(0 if opts["duplex_mode"] == "long-edge" else 1)
+        self._duplex_mode.setToolTip("双面时的翻转方向（装订在长边还是短边）")
+        f1.addRow("双面模式：", self._duplex_mode)
+        lay.addWidget(g1)
+
+        # ── ② 页面 ──
+        g2 = QGroupBox("页面（纸张大小对所有文件类型生效）")
+        f2 = QFormLayout(g2)
+        self._paper = _combo(PAPER_SIZES)
+        _disable_combo_wheel(self._paper)
+        self._paper.setCurrentIndex(_index_of(PAPER_SIZES, opts["paper"]))
+        self._paper.setToolTip("Word / PDF / 图片 / 表格统一用这个纸张大小；"
+                               "打印驱动不支持时只告警，不阻断出纸")
+        f2.addRow("纸张大小：", self._paper)
+        self._orientation = _combo(ORIENTATION_LABELS)
+        _disable_combo_wheel(self._orientation)
+        self._orientation.setCurrentIndex(_index_of(ORIENTATION_VALUES, opts["orientation"]))
+        self._orientation.setToolTip("纸张方向；图片任务仍可在任务参数里单独指定方向")
+        f2.addRow("纸张方向：", self._orientation)
+
+        self._margin_spins: dict = {}
+        for key, label in (("margin_top_cm", "页边距 上："),
+                           ("margin_bottom_cm", "页边距 下："),
+                           ("margin_left_cm", "页边距 左："),
+                           ("margin_right_cm", "页边距 右：")):
+            sp = QDoubleSpinBox()
+            sp.setRange(0.0, 20.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(0.1)
+            sp.setSuffix(" cm")
+            sp.setValue(float(opts[key]))
+            sp.setToolTip("表格版式的页边距；Word/PDF 的排版由文档自己决定，不受这一项影响")
+            self._margin_spins[key] = sp
+            f2.addRow(label, sp)
+
+        self._header = QDoubleSpinBox()
+        self._header.setRange(0.0, 10.0)
+        self._header.setDecimals(2)
+        self._header.setSingleStep(0.1)
+        self._header.setSuffix(" cm")
+        self._header.setValue(float(opts["header_cm"]))
+        f2.addRow("页眉：", self._header)
+        self._footer = QDoubleSpinBox()
+        self._footer.setRange(0.0, 10.0)
+        self._footer.setDecimals(2)
+        self._footer.setSingleStep(0.1)
+        self._footer.setSuffix(" cm")
+        self._footer.setValue(float(opts["footer_cm"]))
+        f2.addRow("页脚：", self._footer)
+
+        center_row = QHBoxLayout()
+        self._center_h = ThemedCheckBox("水平居中", theme_manager=theme_manager)
+        self._center_h.setChecked(bool(opts["center_h"]))
+        self._center_h.setToolTip("内容在纸张左右方向居中")
+        center_row.addWidget(self._center_h)
+        self._center_v = ThemedCheckBox("垂直居中", theme_manager=theme_manager)
+        self._center_v.setChecked(bool(opts["center_v"]))
+        self._center_v.setToolTip("内容在纸张上下方向居中（默认关：顶齐更省纸）")
+        center_row.addWidget(self._center_v)
+        center_row.addStretch(1)
+        f2.addRow("居中：", center_row)
+        lay.addWidget(g2)
+
+        # ── ③ 缩放与打印范围 ──
+        g3 = QGroupBox("缩放与打印范围")
+        f3 = QFormLayout(g3)
+        self._fit = _combo(FIT_LABELS)
+        _disable_combo_wheel(self._fit)
+        self._fit.setCurrentIndex(_index_of(FIT_VALUES, opts["fit"]))
+        self._fit.setToolTip("表格缩放方式：整页一页 / 所有列压一页 / 所有行压一页 / 不缩放")
+        f3.addRow("缩放：", self._fit)
+        self._scale = QSpinBox()
+        self._scale.setRange(10, 400)
+        self._scale.setSingleStep(5)
+        self._scale.setSuffix(" %")
+        self._scale.setValue(int(opts["scale"]))
+        self._scale.setToolTip("自定义缩放百分比，只在「缩放」选「无缩放」时使用")
+        f3.addRow("自定义缩放：", self._scale)
+        self._range = _combo(RANGE_LABELS)
+        _disable_combo_wheel(self._range)
+        self._range.setCurrentIndex(_index_of(RANGE_VALUES, opts["print_range"]))
+        self._range.setToolTip("表格打印范围；Word/PDF/图片不受这一项影响")
+        f3.addRow("打印范围：", self._range)
+        self._fit.currentIndexChanged.connect(self._sync_scale_enabled)
+        self._sync_scale_enabled()
+        lay.addWidget(g3)
+
+        # ── ④ 其它 ──
+        g4 = QGroupBox("其它")
+        f4 = QFormLayout(g4)
+        self._dpi = _combo(["跟随全局(默认)", "高速(200)", "标清(300)", "清晰(400)", "高清(600)"])
+        _disable_combo_wheel(self._dpi)
+        _dpi_choices = (0, 200, 300, 400, 600)
+        self._dpi.setCurrentIndex(_index_of(_dpi_choices, int(opts["dpi"])))
+        self._dpi.setToolTip("渲染 DPI；「跟随全局」= 用主界面上那个 DPI 设置")
+        f4.addRow("DPI：", self._dpi)
+        self._image_orientation = _combo(IMAGE_ORIENT_LABELS)
+        _disable_combo_wheel(self._image_orientation)
+        self._image_orientation.setCurrentIndex(
+            _index_of(IMAGE_ORIENT_VALUES, opts["image_orientation"]))
+        f4.addRow("图片方向：", self._image_orientation)
+        self._blank_tail = ThemedCheckBox("默认排除末尾空白页", theme_manager=theme_manager)
+        self._blank_tail.setChecked(bool(opts["blank_tail"]))
+        f4.addRow("", self._blank_tail)
+        self._simplex = ThemedCheckBox("默认封面单独打印", theme_manager=theme_manager)
+        self._simplex.setChecked(bool(opts["simplex_enabled"]))
+        self._simplex.setToolTip("勾上后，封面的那几页走单面，正文走双面")
+        f4.addRow("", self._simplex)
+        self._simplex_pages = QLineEdit(str(opts["simplex_pages"] or ""))
+        self._simplex_pages.setPlaceholderText("单独打印的页，例如 1 或 1,16-23（留空=不启用）")
+        f4.addRow("封面页：", self._simplex_pages)
+        lay.addWidget(g4)
+        self._groups = (g1, g2, g3, g4)
+
+        row = QHBoxLayout()
+        self._btn_reset = QPushButton("恢复默认")
+        self._btn_reset.setToolTip("把这一窗口的所有项恢复成内置默认（保存后才生效）")
+        self._btn_reset.clicked.connect(self._on_reset)
+        row.addWidget(self._btn_reset)
+        row.addStretch(1)
+        btn_ok = QPushButton("保存")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_ok)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        row.addWidget(btn_cancel)
+        lay.addLayout(row)
+        self._btn_save, self._btn_cancel = btn_ok, btn_cancel
+
+    def _sync_scale_enabled(self, *_args) -> None:
+        """「无缩放」之外，自定义百分比没有消费者 ⇒ 灰掉（灰掉的控件不回写配置）。"""
+        try:
+            self._scale.setEnabled(FIT_VALUES[max(0, self._fit.currentIndex())] == "none")
+        except Exception:
+            logger.debug("同步缩放可用态失败", exc_info=True)
+
+    def _on_reset(self) -> None:
+        try:
+            d = DEFAULT_TASK_OPTIONS
+            self._duplex.setCurrentIndex(0 if d["duplex"] == "on" else 1)
+            self._duplex_mode.setCurrentIndex(0 if d["duplex_mode"] == "long-edge" else 1)
+            self._paper.setCurrentIndex(_index_of(PAPER_SIZES, d["paper"]))
+            self._orientation.setCurrentIndex(_index_of(ORIENTATION_VALUES, d["orientation"]))
+            for key, sp in self._margin_spins.items():
+                sp.setValue(float(d[key]))
+            self._header.setValue(float(d["header_cm"]))
+            self._footer.setValue(float(d["footer_cm"]))
+            self._center_h.setChecked(bool(d["center_h"]))
+            self._center_v.setChecked(bool(d["center_v"]))
+            self._fit.setCurrentIndex(_index_of(FIT_VALUES, d["fit"]))
+            self._scale.setValue(int(d["scale"]))
+            self._range.setCurrentIndex(_index_of(RANGE_VALUES, d["print_range"]))
+            self._dpi.setCurrentIndex(_index_of((0, 200, 300, 400, 600), int(d["dpi"])))
+            self._image_orientation.setCurrentIndex(
+                _index_of(IMAGE_ORIENT_VALUES, d["image_orientation"]))
+            self._blank_tail.setChecked(bool(d["blank_tail"]))
+            self._simplex.setChecked(bool(d["simplex_enabled"]))
+            self._simplex_pages.setText(str(d["simplex_pages"] or ""))
+            self._sync_scale_enabled()
+        except Exception:
+            logger.debug("恢复默认任务参数失败", exc_info=True)
+
+    def values(self) -> dict:
+        """窗口现值 → 一份完整的默认任务参数字典（键与 DEFAULT_TASK_OPTIONS 一致）。"""
+        dpi_choices = (0, 200, 300, 400, 600)
+        out = {
+            "duplex": "on" if self._duplex.currentIndex() == 0 else "off",
+            "duplex_mode": "long-edge" if self._duplex_mode.currentIndex() == 0 else "short-edge",
+            "paper": PAPER_SIZES[max(0, self._paper.currentIndex())],
+            "orientation": ORIENTATION_VALUES[max(0, self._orientation.currentIndex())],
+            "header_cm": round(float(self._header.value()), 2),
+            "footer_cm": round(float(self._footer.value()), 2),
+            "center_h": bool(self._center_h.isChecked()),
+            "center_v": bool(self._center_v.isChecked()),
+            "fit": FIT_VALUES[max(0, self._fit.currentIndex())],
+            "scale": int(self._scale.value()),
+            "print_range": RANGE_VALUES[max(0, self._range.currentIndex())],
+            "dpi": dpi_choices[max(0, self._dpi.currentIndex())],
+            "image_orientation": IMAGE_ORIENT_VALUES[
+                max(0, self._image_orientation.currentIndex())],
+            "blank_tail": bool(self._blank_tail.isChecked()),
+            "simplex_enabled": bool(self._simplex.isChecked()),
+            "simplex_pages": self._simplex_pages.text().strip()[:200],
+        }
+        for key, sp in self._margin_spins.items():
+            out[key] = round(float(sp.value()), 2)
+        return normalize_task_options(out)
 
 
 class SpeedCalibrationWorker(QThread):
@@ -2572,6 +2919,7 @@ class PrintWorker(QThread):
         stack_seq: int = 0,
         stack_rotate: bool = True,
         stack_more_pending=None,
+        paper: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -2593,6 +2941,10 @@ class PrintWorker(QThread):
         self._stack_out_pdf = stack_out_pdf or ""
         self._stack_seq = int(stack_seq or 0)
         self._stack_rotate = bool(stack_rotate)
+        # 纸张大小（2026-11 用户需求 #11c）：全局默认（打印配置 paper_size，默认 A4），
+        # 逐趟透传给 pdf_printer 的 paper= —— Word / PDF / 图片 都按同一纸张出纸。
+        # 空串 = 沿用打印机默认（旧行为，仅当调用方没给值时）。
+        self._paper = (paper or "").strip()
         # 「后面还排着别的单吗」回调（主线程给的无参可调用对象，worker 线程里只读一个 bool）。
         # 为真时攒批第 1 趟**不阻塞等物理出纸**：打完立刻收工、让下一单的第 1 趟马上进打印
         # 队列（spooler 按提交顺序出纸，连续几单的第 1 趟本来就该叠在一起）。2026-11-02 用户
@@ -3033,6 +3385,7 @@ class PrintWorker(QThread):
                 progress_callback=self._group_progress_callback(
                     task_ref, base_offset, total_sides + extra_sides),
                 dpi=int(group[0]["dpi"] or 0),
+                paper=self._paper,
             )
             if ok:
                 self.log_message.emit(f"  ✓ {msg}")
@@ -3177,6 +3530,7 @@ class PrintWorker(QThread):
             orientation=orientation,
             progress_callback=job_progress,
             dpi=dpi,
+            paper=self._paper,
         )
 
     def _rotate_for_job(self, job: PrintJob) -> bool:
@@ -3514,7 +3868,8 @@ class PrintWorker(QThread):
             ok1, msg1 = print_plan_pass(plan, merged, self._printer_name, 1,
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset, map1),
-                                        landscape_fill=bool(getattr(p, "landscape_fill", True)))
+                                        landscape_fill=bool(getattr(p, "landscape_fill", True)),
+                                        paper=self._paper)
             if not ok1:
                 return False, f"手动双面第 1 趟失败: {msg1}", n1
             # 第 1 趟的纸已经压进出纸槽了：台账往前推 —— 下一批（长短边混排拆出的第 2 批）
@@ -3564,7 +3919,8 @@ class PrintWorker(QThread):
             ok2, msg2 = print_plan_pass(plan, merged, self._printer_name, 2,
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset + n1, map2),
-                                        landscape_fill=bool(getattr(p, "landscape_fill", True)))
+                                        landscape_fill=bool(getattr(p, "landscape_fill", True)),
+                                        paper=self._paper)
             if not ok2:
                 return False, f"手动双面第 2 趟失败: {msg2}（第 1 趟已打出）", plan.total_sides
             return True, (f"手动双面完成（{len(items)} 个文件 / {plan.sheet_count} 张纸 / 2 趟，"
@@ -3725,7 +4081,8 @@ class PrintWorker(QThread):
             ok1, msg1 = print_plan_pass(plan, self._stack_out_pdf, self._printer_name, 1,
                                         second_rotate_180=self._stack_rotate,
                                         progress_callback=_cb(base_offset, map1),
-                                        landscape_fill=bool(getattr(p, "landscape_fill", True)))
+                                        landscape_fill=bool(getattr(p, "landscape_fill", True)),
+                                        paper=self._paper)
             if self._cancelled:
                 self.stack_entry_done.emit(self._stack_seq, False, "已取消", n1)
                 return False, "已取消", n1
@@ -3943,6 +4300,7 @@ class PrintWorker(QThread):
                             orientation="portrait",
                             progress_callback=None,
                             dpi=self._render_dpi,
+                            paper=self._paper,
                         )
                         if cover_ok:
                             self.log_message.emit(f"  ✓ 首页: {cover_msg}")
@@ -4295,12 +4653,14 @@ class DuplexFlushWorker(QThread):
     done = Signal(bool, str, int)     # (ok, message, 第 2 趟打印面数)
 
     def __init__(self, stack, batch_dir: str, printer_name: str,
-                 dpi: int = 0, parent=None):
+                 dpi: int = 0, paper: str = "", parent=None):
         super().__init__(parent)
         self._stack = stack
         self._batch_dir = batch_dir
         self._printer_name = printer_name
         self._dpi = int(dpi or 0)
+        # 纸张大小：与 PrintWorker 同源（全局默认），整叠第 2 趟也必须用同一张纸
+        self._paper = (paper or "").strip()
 
     def run(self):
         import pdf_printer as _pp
@@ -4349,7 +4709,7 @@ class DuplexFlushWorker(QThread):
             ok2, msg2 = print_plan_pass(
                 plan, merged, self._printer_name, 2,
                 second_rotate_180=True,
-                progress_callback=_on_side, dpi=self._dpi)
+                progress_callback=_on_side, dpi=self._dpi, paper=self._paper)
             if not ok2:
                 self.done.emit(False, f"整叠第 2 趟失败：{msg2}", total)
                 return
@@ -4381,7 +4741,18 @@ class ConvertWorker(QThread):
         # 2026-10-26 隐式规则：管理员自打 + 管理员上传时由调用方置 True，
         # 允许云端 Word 走 COM（仍带硬化）。默认 False = 顾客文件永远强制 LibreOffice。
         self._allow_cloud_com = bool(allow_cloud_com)
+        # 表格版式（2026-11 用户需求 #10）：None = **不碰 PageSetup**（旧行为，Excel 自己排版）。
+        # 只有用户在右侧表格面板里动过（或全局默认任务参数配过）才会是 dict。
+        # 注意：**故意不放进构造参数表** —— tests/verify_office_automation_security.py
+        # 用正则钉死了上面那行签名（云端必须传 from_cloud/allow_cloud_com），
+        # 末尾多一个参数就会打红那条安全验收。用 set_print_options() 注入。
+        self._print_options: dict | None = None
         self._cancelled = False
+
+    def set_print_options(self, print_options):
+        """注入表格版式参数（None/空 dict = 完全不碰版式）。必须在 start() 之前调用。"""
+        _opts = dict(print_options) if isinstance(print_options, dict) else None
+        self._print_options = _opts or None
 
     def cancel(self):
         """协作式取消：置标志，run() 各阶段检查后优雅退出（替代 terminate 强杀）。"""
@@ -4418,7 +4789,9 @@ class ConvertWorker(QThread):
                 try:
                     _res = _xp.export_to_pdf(self._file_path, _tmp_out,
                                              from_cloud=self._from_cloud,
-                                             allow_cloud_com=self._allow_cloud_com)
+                                             allow_cloud_com=self._allow_cloud_com,
+                                             # 版式：None ⇒ 引擎完全不碰 PageSetup（旧行为）
+                                             print_options=self._print_options)
                 except Exception:
                     # 失败不留半成品在 pdf_cache（.xlsx_*.pdf 会被当成孤儿文件）
                     if os.path.isfile(_tmp_out):
@@ -4428,8 +4801,12 @@ class ConvertWorker(QThread):
                             pass
                     raise
                 if self._source_md5:
+                    # 缓存 key 必须带上版式签名（xlsx_printer.cache_key 支持 _o{签名}）：
+                    # 同一份表格按两套页边距各导一次是两份不同的 PDF，共用一个 key 会拿错版。
                     _target = os.path.join(
-                        cache_dir, _xp.cache_key(self._source_md5, "", _res.engine) + ".pdf")
+                        cache_dir,
+                        _xp.cache_key(self._source_md5, "", _res.engine,
+                                      self._print_options) + ".pdf")
                     os.replace(_res.pdf_path, _target)
                     temp_pdf = _target
                 else:
@@ -5472,6 +5849,8 @@ class MainWindow(QMainWindow):
             self._current_tab = next(iter(self._config.tabs.keys()))
         # 撤回备份（每个标签独立）
         self._cleared_jobs_backup: dict[str, list[PrintJob]] = {}
+        # 清空时一并暂存的订单时间（created_at, started_at）—— 供 5 秒内「撤回清空」还原
+        self._cleared_times_backup: dict[str, tuple[str, str]] = {}
         # 已处理的云端任务 ID（防重复弹窗；跨重启持久化，防重启后重复打印）
         self._processed_cloud_tasks: set[int] = self._load_processed_tasks()
         # 无障碍自动打印：启动失败（打印机忙 / 页数还没统计完）时暂存的重试队列，
@@ -6844,6 +7223,30 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        exit_action = QAction("退出(&X)", self)
+        # 4.6.0 后台常驻：菜单里的「退出」才是真退出，窗口右上角 X 只是收回托盘
+        #（同一个落点 _quit_app，与托盘菜单的「退出」一致，不另写一套收尾流程）
+        exit_action.triggered.connect(self._quit_app)
+        file_menu.addAction(exit_action)
+
+        # 选项菜单（2026-11-03 用户要求）：把「打印速度…」「打印机双面能力…」（原在帮助菜单）
+        # 与「外部打印监视」「外部打印账本…」（原在文件菜单）**整块迁到**这里，和新增的
+        # 「默认任务参数…」放在一起 —— 这五项都是"改设置"，不再散落在文件/帮助两个语义无关的菜单里。
+        # 迁移只搬入口位置：QAction 对象、信号连接、托盘镜像（tray_icon 读 self._ext_print_action）
+        # 与快捷键注册一律原样保留，行为零变化。
+        options_menu = mb.addMenu("选项(&O)")
+
+        # 默认任务参数：纸张大小 / 页边距 / 方向 / 缩放 / 打印范围等**跨文件类型**的全局默认。
+        # 没动过时各项默认值与 4.x 的行为完全一致（A4 / 1cm 页边距 / 水平居中 / 所有列一页 /
+        # 双面 / 纵向），旧 print_config.json 缺这些键也按这套默认值回落。
+        default_task_action = QAction("默认任务参数…(&D)", self)
+        default_task_action.setToolTip("纸张大小、页边距、页面方向、缩放与打印范围等默认值；"
+                                       "Word/PDF/图片/表格全部沿用（不改就是旧行为）")
+        default_task_action.triggered.connect(self._on_default_task_options)
+        options_menu.addAction(default_task_action)
+
+        options_menu.addSeparator()
+
         # 外部打印监视（A 档最小版）：勾上 = 订阅本机 spooler，绕过本工具的作业一律记账（不阻断）。
         # 连接放在 setChecked 之后：启动恢复时不会再触发一次 toggled（否则重复起一次线程）。
         self._ext_print_action = QAction("外部打印监视(&W)", self)
@@ -6852,21 +7255,34 @@ class MainWindow(QMainWindow):
         self._ext_print_action.setToolTip("检测操作员/顾客绕过本工具直接发到打印机的作业并记账"
                                           "（只记账，不阻断出纸）")
         self._ext_print_action.toggled.connect(self._on_external_watch_toggled)
-        file_menu.addAction(self._ext_print_action)
+        options_menu.addAction(self._ext_print_action)
 
         ext_ledger_action = QAction("外部打印账本…(&E)", self)
         ext_ledger_action.setToolTip("查看检测到的外部打印、补录页数"
                                      "（HP LaserJet 1020 这类机型拿不到页数时靠它）、导出 CSV")
         ext_ledger_action.triggered.connect(self._open_external_prints_dialog)
-        file_menu.addAction(ext_ledger_action)
+        options_menu.addAction(ext_ledger_action)
+
+        options_menu.addSeparator()
+
+        # 2026-10-20 用户要求：把「启动/预热」「每张纸」「翻纸放行比例」「人工翻页准备时间」
+        # 和原来的两点测速**全部塞进同一个窗口**，入口改名「打印速度…」。
+        # 2026-11-03：入口从帮助菜单迁到选项菜单（设置类都归这里），action 与槽不变。
+        speed_action = QAction("打印速度…", self)
+        speed_action.setToolTip("第 1 趟耗时模型（启动/预热、每张纸）+ 翻纸放行策略"
+                                "（按预估百分比放行、人工翻页准备时间）+ 一键测速"
+                                "（只对「无自动双面器、需要人工翻纸」的机型生效；"
+                                "自动双面机型打开会看到说明）")
+        speed_action.triggered.connect(self._on_calibrate_speed)
+        options_menu.addAction(speed_action)
+        duplex_cap_action = QAction("打印机双面能力…", self)
+        duplex_cap_action.setToolTip("给当前打印队列盖「支持/不支持自动双面」的章："
+                                     "不支持则改用程序自己的两趟控制器（人工翻纸），"
+                                     "不再走驱动程序自带的「双面打印说明」向导")
+        duplex_cap_action.triggered.connect(self._on_printer_duplex_capability)
+        options_menu.addAction(duplex_cap_action)
         # 窗口建完后按配置恢复监视线程（延迟一下：订阅失败也不能卡住启动）
         QTimer.singleShot(1200, self._restore_external_watch)
-
-        exit_action = QAction("退出(&X)", self)
-        # 4.6.0 后台常驻：菜单里的「退出」才是真退出，窗口右上角 X 只是收回托盘
-        #（同一个落点 _quit_app，与托盘菜单的「退出」一致，不另写一套收尾流程）
-        exit_action.triggered.connect(self._quit_app)
-        file_menu.addAction(exit_action)
 
         # 主题菜单
         if self._theme_manager is not None:
@@ -6885,21 +7301,8 @@ class MainWindow(QMainWindow):
         log_action = QAction("日志(&L)", self)
         log_action.triggered.connect(self._on_show_log_manager)
         help_menu.addAction(log_action)
-        # 2026-10-20 用户要求：把「启动/预热」「每张纸」「翻纸放行比例」「人工翻页准备时间」
-        # 和原来的两点测速**全部塞进同一个窗口**，入口改名「打印速度…」。
-        speed_action = QAction("打印速度…", self)
-        speed_action.setToolTip("第 1 趟耗时模型（启动/预热、每张纸）+ 翻纸放行策略"
-                                "（按预估百分比放行、人工翻页准备时间）+ 一键测速"
-                                "（只对「无自动双面器、需要人工翻纸」的机型生效；"
-                                "自动双面机型打开会看到说明）")
-        speed_action.triggered.connect(self._on_calibrate_speed)
-        help_menu.addAction(speed_action)
-        duplex_cap_action = QAction("打印机双面能力…", self)
-        duplex_cap_action.setToolTip("给当前打印队列盖「支持/不支持自动双面」的章："
-                                     "不支持则改用程序自己的两趟控制器（人工翻纸），"
-                                     "不再走驱动程序自带的「双面打印说明」向导")
-        duplex_cap_action.triggered.connect(self._on_printer_duplex_capability)
-        help_menu.addAction(duplex_cap_action)
+        # 「打印速度…」「打印机双面能力…」已迁到「选项」菜单（2026-11-03），帮助菜单只留
+        # 说明类入口：快捷键 / 自检 / 日志 / 检查更新 / 关于。
         help_menu.addSeparator()
         self._update_action = QAction("检查更新(&U)", self)
         self._update_action.triggered.connect(lambda: self._start_update_check(manual=True))
@@ -7538,6 +7941,26 @@ class MainWindow(QMainWindow):
         tab_row.addWidget(self._tab_btn_cleanup_empty)
         tab_row.addStretch()
 
+        # ── 订单时间（2026-11 用户需求 #7）──
+        # 两个**只读**标签放在 stretch 之后（不挤占 −/+/🗑 按钮），右对齐贴着标签页工具条末端；
+        # 窄窗口时 _TimeVariantsLabel 自动退化：完整 → 省略秒 → 只有日期（不撑破布局）。
+        # 数据源是 TabSettings.created_at / started_at（持久化），创建时间一经写入不可变。
+        self._tab_created_label = _TimeVariantsLabel()
+        self._tab_created_label.setObjectName("tabTimeLabel")
+        self._tab_created_label.setToolTip(
+            "本标签页订单第一次生成订单号的时刻（固定不变，复制/换号补报都不会改写）")
+        self._tab_started_label = _TimeVariantsLabel()
+        self._tab_started_label.setObjectName("tabTimeLabel")
+        self._tab_started_label.setToolTip(
+            "本标签页订单第一次真正开始打印的时刻（重打/续打不再刷新）")
+        _time_font = QFont()
+        _time_font.setPointSize(9)
+        for _lbl in (self._tab_created_label, self._tab_started_label):
+            _lbl.setFont(_time_font)
+            _lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            tab_row.addWidget(_lbl)
+        self._tab_time_labels_ready = True
+
         layout.addLayout(tab_row)
 
         # 刷新标签页显示状态
@@ -7986,6 +8409,8 @@ class MainWindow(QMainWindow):
             abandoned = self._abandon_tab_jobs(tab, skip=keep_jobs)
             tab.jobs = []
             tab.frozen = False
+            # 文件已清空 ⇒ 这张订单到此为止：创建/发起时间一起作废，下一单重新计时
+            self._reset_tab_order_times(key)
             self._cleanup_scheduled_orders_for_tab(key, reason="标签页已清空")
             self._drop_auto_print_retry_for_tab(key)
             self._cleanup_orphan_pdf_cache(abandoned)
@@ -8165,8 +8590,37 @@ class MainWindow(QMainWindow):
         # 备注框：随标签页刷新加载订单备注（首个非空）；冻结时锁定编辑
         self._load_remark_editor(tab)
 
+        # 订单创建 / 打印发起时间（#7）：只读展示，数据源是 TabSettings 的持久化字段
+        self._refresh_tab_time_labels(tab)
+
         # 打印机能力标注（双面是否=手动翻纸）随标签页/打印机变化同步
         self._update_duplex_label()
+
+    def _refresh_tab_time_labels(self, tab=None) -> None:
+        """刷新标签页工具条右侧的「订单创建 / 打印发起」两个只读标签。
+
+        ⚠ 处于 _setup_file_table 可见之前的一次 _refresh_tab_display 调用里，标签还没建好
+        （它们建在 _setup_file_table 尾部、紧接着就是 refresh）—— 用 hasattr 挡一下，
+        否则启动即 AttributeError（PySide6 6.11 在 __init__ 里抛会直接崩，没有 traceback）。
+        """
+        if not getattr(self, "_tab_time_labels_ready", False):
+            return
+        try:
+            if tab is None:
+                tab = self._config.tabs.get(self._current_tab)
+            created = str(getattr(tab, "created_at", "") or "") if tab else ""
+            started = str(getattr(tab, "started_at", "") or "") if tab else ""
+            self._tab_created_label.set_variants(_order_time_variants("订单创建：", created))
+            self._tab_started_label.set_variants(_order_time_variants("打印发起：", started))
+            self._tab_created_label.setToolTip(
+                "订单创建：" + (created or " — ") +
+                "\n本标签页订单第一次生成订单号的时刻。一经写入不可变：复制合计、"
+                "换号补报、离线补报都不会改写它。")
+            self._tab_started_label.setToolTip(
+                "打印发起：" + (started or " — ") +
+                "\n本标签页订单第一次真正开始打印的时刻（重打/续打不再刷新）。")
+        except Exception as e:                     # 槽内异常会崩进程，宁可不刷也不能抛
+            logger.debug(f"刷新订单时间标签失败: {e}")
 
     def _get_current_jobs(self) -> list[PrintJob]:
         """返回当前标签页的任务列表。"""
@@ -9584,6 +10038,9 @@ class MainWindow(QMainWindow):
         self._edit_img_orientation.setEnabled(is_img)
         self._label_img_orientation.setEnabled(is_img)
 
+        # 表格版式面板（仅表格文件出现）：显隐/填值/启停都按**整片选区**判定
+        self._sync_xlsx_panel(jobs, sorted(rows), frozen)
+
         if frozen:
             # 冻结标签页只读：上面已经按事实刷新过内容（不写回、不改任务），这里整体禁用。
             # 注意顺序 —— _sync_edit_enabled(False) 会把「选中文件」标签改成"未选中任务"，
@@ -9634,6 +10091,16 @@ class MainWindow(QMainWindow):
                 pages_w.setVisible(False)
             except Exception:
                 pass
+        # 表格版式面板：没有选中任务 ⇒ 整块收起（否则上一个持有者的版式会挂在面板上）
+        self._xlsx_panel_shown = False
+        for w in (getattr(self, "_xlsx_sep_top", None),
+                  getattr(self, "_xlsx_box", None),
+                  getattr(self, "_xlsx_sep_bottom", None)):
+            if w is not None:
+                try:
+                    w.setVisible(False)
+                except Exception:
+                    pass
 
     def _sync_edit_enabled(self, enabled: bool):
         """统一启用/禁用编辑面板所有控件。"""
@@ -9643,6 +10110,159 @@ class MainWindow(QMainWindow):
             w.setEnabled(enabled)
         if not enabled:
             self._selected_file_label.setText("(未选中任务)")
+
+    # ── 表格版式面板（2026-11 用户需求 #10）──────────────────────────────────
+    # 面板**只收集参数**：真正改 PageSetup 的是表格引擎（转换时写临时副本），本工具从不动
+    # 用户那份 xlsx。参数存 `PrintJob.xlsx_options`（空 = 跟随「选项 → 默认任务参数」）。
+    def _job_is_spreadsheet(self, job) -> bool:
+        """该任务是不是表格文件（.xls/.xlsx）。"""
+        fp = getattr(job, "file_path", "") or ""
+        return os.path.splitext(fp)[1].lower() in (".xls", ".xlsx")
+
+    def _spreadsheet_jobs(self, jobs, rows) -> list:
+        """选区里的表格任务（按行号升序）。"""
+        return [j for j in self._selection_jobs(jobs, rows) if self._job_is_spreadsheet(j)]
+
+    def _effective_xlsx_options(self, job) -> dict:
+        """该任务实际生效的表格版式（任务自己的 > 全局默认），归一后的完整 dict。"""
+        base = self._config.task_options()
+        merged = dict(base)
+        own = getattr(job, "xlsx_options", {}) or {}
+        if isinstance(own, dict):
+            for k in list(base.keys()):
+                if k in own:
+                    merged[k] = own[k]
+        return normalize_task_options(merged)
+
+    def _xlsx_panel_values(self) -> dict:
+        """面板控件当前值 → 表格引擎认的那一组键（纯读，不写任何状态）。
+
+        与 `printer_config.task_options_to_print_options` 同一套键名（13 个），
+        这样写进 `job.xlsx_options` 的东西能原样喂给 `export_to_pdf(print_options=...)`。
+        """
+        margins = {}
+        for key, sp in (getattr(self, "_xlsx_margins", None) or {}).items():
+            margins[key] = round(float(sp.value()), 2)
+        opts = {
+            "paper": self._xlsx_paper.currentText().strip() or DEFAULT_PAPER_SIZE,
+            "orientation": ORIENTATION_VALUES[
+                _index_of(ORIENTATION_LABELS, self._xlsx_orientation.currentText())],
+            "header_cm": round(float(self._xlsx_header.value()), 2),
+            "footer_cm": round(float(self._xlsx_footer.value()), 2),
+            "center_h": bool(self._xlsx_center_h.isChecked()),
+            "center_v": bool(self._xlsx_center_v.isChecked()),
+            "fit": FIT_VALUES[_index_of(FIT_LABELS, self._xlsx_fit.currentText())],
+            "scale": int(self._xlsx_scale.value()),
+            "print_range": RANGE_VALUES[
+                _index_of(RANGE_LABELS, self._xlsx_range.currentText())],
+        }
+        opts.update(margins)
+        return task_options_to_print_options(opts)
+
+    def _sync_xlsx_scale_enabled(self):
+        """「自定义缩放」只在缩放方式选「无缩放」时可用（其余档位百分比没有意义）。"""
+        try:
+            _scale = getattr(self, "_xlsx_scale", None)
+            if _scale is None:
+                return
+            _fit_none = (self._xlsx_fit.currentIndex() == 0)   # FIT_VALUES[0] == "none"
+            # 面板整体被灰掉（冻结标签页 / 没有表格选中）时，缩放也不能单独亮着
+            _panel_on = bool(getattr(self, "_xlsx_panel_shown", False)
+                             and self._xlsx_fit.isEnabled())
+            _scale.setEnabled(_fit_none and _panel_on)
+        except Exception:
+            logger.debug("表格版式：自定义缩放可用性刷新失败", exc_info=True)
+
+    def _on_xlsx_fit_changed(self, *_args):
+        """缩放方式切换 → 自定义百分比的可用性跟着变，再把面板值落到任务上。"""
+        try:
+            self._sync_xlsx_scale_enabled()
+        except Exception:
+            logger.debug("表格版式：缩放联动失败", exc_info=True)
+        self._auto_apply_edit()
+
+    def _on_xlsx_follow_default(self):
+        """「跟随默认」：清掉这些任务自己的版式设置，改用全局默认（并作废旧 PDF）。"""
+        try:
+            if self._is_current_tab_frozen():
+                return
+            rows = self._selected_rows()
+            jobs = self._get_current_jobs()
+            sheet_rows = [r for r in rows
+                          if r < len(jobs) and self._job_is_spreadsheet(jobs[r])]
+            if not sheet_rows:
+                return
+            for r in sheet_rows:
+                job = jobs[r]
+                if dict(getattr(job, "xlsx_options", {}) or {}):
+                    job.xlsx_options = {}
+                    job.cached_pdf = ""      # 旧版式的 PDF 作废
+            self._set_current_jobs(jobs)
+            self._on_table_selection()       # 面板重填成"跟随默认"后的值
+        except Exception as e:
+            logger.debug(f"表格版式：恢复默认失败: {e}", exc_info=True)
+
+    def _sync_xlsx_panel(self, jobs=None, rows=None, frozen: bool = False):
+        """按选区同步表格版式面板：显隐 / 填值 / 启停（填值不写回，灰着的不写回）。"""
+        try:
+            if not hasattr(self, "_xlsx_box"):
+                return
+            if jobs is None:
+                jobs = self._get_current_jobs()
+            if rows is None:
+                rows = self._selected_rows()
+            sheet_jobs = self._spreadsheet_jobs(jobs, rows)
+            show = bool(sheet_jobs)
+            # 记一份"面板此刻该不该出现"的状态：`isVisible()` 在主窗口还没 show、或父控件被
+            # 折叠时是 False，靠它判"能不能写回"会误判（该写的没写 / 不该写的写了）。
+            self._xlsx_panel_shown = show
+            for w in (self._xlsx_sep_top, self._xlsx_box, self._xlsx_sep_bottom):
+                w.setVisible(show)
+            if not show:
+                return
+            opts = self._effective_xlsx_options(sheet_jobs[0])
+            # 依次载入（每个控件都 blockSignals：只展示，不触发写回）
+            for key, sp in (self._xlsx_margins or {}).items():
+                sp.blockSignals(True)
+                sp.setValue(float(opts.get(key, 1.0) or 0.0))
+                sp.blockSignals(False)
+            for widget, key, lo, hi in ((self._xlsx_header, "header_cm", 0.0, 10.0),
+                                        (self._xlsx_footer, "footer_cm", 0.0, 10.0)):
+                widget.blockSignals(True)
+                widget.setValue(max(lo, min(hi, float(opts.get(key, 0.0) or 0.0))))
+                widget.blockSignals(False)
+            self._xlsx_paper.blockSignals(True)
+            self._xlsx_paper.setCurrentIndex(
+                _index_of(PAPER_SIZES, str(opts.get("paper", DEFAULT_PAPER_SIZE))))
+            self._xlsx_paper.blockSignals(False)
+            self._xlsx_orientation.blockSignals(True)
+            self._xlsx_orientation.setCurrentIndex(
+                _index_of(ORIENTATION_VALUES, str(opts.get("orientation", "portrait"))))
+            self._xlsx_orientation.blockSignals(False)
+            self._xlsx_center_h.blockSignals(True)
+            self._xlsx_center_h.setChecked(bool(opts.get("center_h", True)))
+            self._xlsx_center_h.blockSignals(False)
+            self._xlsx_center_v.blockSignals(True)
+            self._xlsx_center_v.setChecked(bool(opts.get("center_v", False)))
+            self._xlsx_center_v.blockSignals(False)
+            self._xlsx_fit.blockSignals(True)
+            self._xlsx_fit.setCurrentIndex(_index_of(FIT_VALUES, str(opts.get("fit", "cols"))))
+            self._xlsx_fit.blockSignals(False)
+            self._xlsx_scale.blockSignals(True)
+            self._xlsx_scale.setValue(int(max(10, min(400, int(opts.get("scale", 100) or 100)))))
+            self._xlsx_scale.blockSignals(False)
+            self._xlsx_range.blockSignals(True)
+            self._xlsx_range.setCurrentIndex(
+                _index_of(RANGE_VALUES, str(opts.get("print_range", "active"))))
+            self._xlsx_range.blockSignals(False)
+
+            _enable = not frozen
+            for w in (getattr(self, "_xlsx_widgets", None) or []):
+                w.setEnabled(_enable)
+            if _enable:
+                self._sync_xlsx_scale_enabled()
+        except Exception as e:
+            logger.debug(f"表格版式面板同步失败: {e}", exc_info=True)
 
     def _on_simplex_toggled(self, checked: bool):
         """「封面单独打印」勾选框 → 显隐页列表 + 落盘到选中任务。
@@ -9746,6 +10366,11 @@ class MainWindow(QMainWindow):
         simplex_str = ",".join(
             inp.text().strip() for inp in self._edit_simplex_pages._inputs
             if inp.text().strip()) if simplex_valid else ""
+        # 表格版式（2026-11）：面板在显示且没被灰掉时才读——灰着的不写回。
+        # 用 `_xlsx_panel_shown`（_sync_xlsx_panel 写的状态）而不是 isVisible()，理由见那里。
+        _xlsx_visible = bool(getattr(self, "_xlsx_panel_shown", False))
+        xlsx_new = self._xlsx_panel_values() if _xlsx_visible else None
+        xlsx_default = task_options_to_print_options(self._config.task_options())
 
         applied = []
         # 控件可用性按**整片选区**判定（与 _on_table_selection / _selection_traits 同一口径）：
@@ -9821,6 +10446,16 @@ class MainWindow(QMainWindow):
 
             # DPI
             job.dpi = dpi
+
+            # 表格版式：只写表格文件（同一片选区里混着 docx 时别把版式塞给它们）。
+            # 值恰好等于全局默认 ⇒ 存 {}（继续"跟随默认"，将来改默认它也跟着走）；
+            # 版式真的变了 ⇒ 作废旧 PDF，下次打印按新参数重新导出。
+            if xlsx_new is not None and self._job_is_spreadsheet(job):
+                _before = task_options_to_print_options(self._effective_xlsx_options(job))
+                job.xlsx_options = {} if xlsx_new == xlsx_default else dict(xlsx_new)
+                _after = task_options_to_print_options(self._effective_xlsx_options(job))
+                if _after != _before:
+                    job.cached_pdf = ""
 
         # 更新表格行显示：**整行重画**（份数/单双面/页码范围/引擎/费用）。
         # 只调 _recalc_row_cost() 会留下「面板 2 份、表格 1 份」的错位（2026-10 现场报的 bug）；
@@ -10161,6 +10796,136 @@ class MainWindow(QMainWindow):
         self._edit_duplex_mode.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_duplex_mode)
 
+        # ── 表格版式（2026-11 用户需求 #10）──────────────────────────────────
+        # 只在选区里有表格（.xls/.xlsx）时出现，用上下两条分隔线与上面那组参数分开。
+        # 面板**只收集参数**：真正的 PageSetup 由表格引擎在转换时写进**临时副本**
+        # （xlsx_printer.export_to_pdf(print_options=...)），本工具从不改用户那份 xlsx。
+        # 「任务自己的 xlsx_options」为空 = 跟随「选项 → 默认任务参数」那套全局默认；
+        # 两处都没配过 ⇒ 引擎完全不碰 PageSetup（旧行为，版式逐像素不变）。
+        self._xlsx_sep_top = QFrame()
+        self._xlsx_sep_top.setFrameShape(QFrame.HLine)
+        self._xlsx_sep_top.setFrameShadow(QFrame.Sunken)
+        gl.addWidget(self._xlsx_sep_top)
+
+        self._xlsx_box = QWidget()
+        _xl = QVBoxLayout(self._xlsx_box)
+        _xl.setContentsMargins(0, 0, 0, 0)
+        _xl.setSpacing(6)
+
+        self._label_xlsx = QLabel("表格版式（仅表格文件）")
+        self._label_xlsx.setObjectName("sectionHint")
+        self._label_xlsx.setWordWrap(True)
+        _xl.addWidget(self._label_xlsx)
+
+        _xform = QFormLayout()
+        _xform.setContentsMargins(0, 0, 0, 0)
+        _xform.setSpacing(4)
+        # 页边距（cm）：与 Excel「页面布局 → 页边距」同名同序
+        self._xlsx_margins: dict = {}
+        for _key, _cap in (("margin_top_cm", "页边距 上"), ("margin_bottom_cm", "页边距 下"),
+                           ("margin_left_cm", "页边距 左"), ("margin_right_cm", "页边距 右")):
+            _sp = QDoubleSpinBox()
+            _sp.setRange(0.0, 20.0)
+            _sp.setDecimals(2)
+            _sp.setSingleStep(0.1)
+            _sp.setSuffix(" cm")
+            _sp.setToolTip("表格打印的页边距（厘米）；只对表格文件生效")
+            _sp.valueChanged.connect(self._auto_apply_edit)
+            self._xlsx_margins[_key] = _sp
+            _xform.addRow(_cap + "：", _sp)
+        self._xlsx_header = QDoubleSpinBox()
+        self._xlsx_header.setRange(0.0, 10.0)
+        self._xlsx_header.setDecimals(2)
+        self._xlsx_header.setSingleStep(0.1)
+        self._xlsx_header.setSuffix(" cm")
+        self._xlsx_header.setToolTip("页眉距纸张上边缘的距离")
+        self._xlsx_header.valueChanged.connect(self._auto_apply_edit)
+        _xform.addRow("页眉：", self._xlsx_header)
+        self._xlsx_footer = QDoubleSpinBox()
+        self._xlsx_footer.setRange(0.0, 10.0)
+        self._xlsx_footer.setDecimals(2)
+        self._xlsx_footer.setSingleStep(0.1)
+        self._xlsx_footer.setSuffix(" cm")
+        self._xlsx_footer.setToolTip("页脚距纸张下边缘的距离")
+        self._xlsx_footer.valueChanged.connect(self._auto_apply_edit)
+        _xform.addRow("页脚：", self._xlsx_footer)
+
+        self._xlsx_orientation = _combo(ORIENTATION_LABELS)
+        _disable_combo_wheel(self._xlsx_orientation)
+        self._xlsx_orientation.setToolTip("表格的纸张方向")
+        self._xlsx_orientation.currentIndexChanged.connect(self._auto_apply_edit)
+        _xform.addRow("纸张方向：", self._xlsx_orientation)
+
+        self._xlsx_paper = _combo(PAPER_SIZES)
+        _disable_combo_wheel(self._xlsx_paper)
+        self._xlsx_paper.setToolTip("表格的纸张大小；与全局默认纸张同源")
+        self._xlsx_paper.currentIndexChanged.connect(self._auto_apply_edit)
+        _xform.addRow("纸张大小：", self._xlsx_paper)
+
+        _xcenter = QHBoxLayout()
+        self._xlsx_center_h = ThemedCheckBox("水平居中", theme_manager=self._theme_manager)
+        self._xlsx_center_h.setToolTip("表格内容在纸张左右方向居中")
+        self._xlsx_center_h.clicked.connect(self._auto_apply_edit)
+        _xcenter.addWidget(self._xlsx_center_h)
+        self._xlsx_center_v = ThemedCheckBox("垂直居中", theme_manager=self._theme_manager)
+        self._xlsx_center_v.setToolTip("表格内容在纸张上下方向居中")
+        self._xlsx_center_v.clicked.connect(self._auto_apply_edit)
+        _xcenter.addWidget(self._xlsx_center_v)
+        _xcenter.addStretch(1)
+        _xform.addRow("居中：", _xcenter)
+
+        self._xlsx_fit = _combo(FIT_LABELS)
+        _disable_combo_wheel(self._xlsx_fit)
+        self._xlsx_fit.setToolTip("表格缩放方式；选「无缩放」时用下面的自定义百分比")
+        self._xlsx_fit.currentIndexChanged.connect(self._on_xlsx_fit_changed)
+        _xform.addRow("缩放：", self._xlsx_fit)
+
+        self._xlsx_scale = QSpinBox()
+        self._xlsx_scale.setRange(10, 400)
+        self._xlsx_scale.setSingleStep(5)
+        self._xlsx_scale.setSuffix(" %")
+        self._xlsx_scale.setToolTip("自定义缩放百分比（只在缩放选「无缩放」时使用）")
+        self._xlsx_scale.valueChanged.connect(self._auto_apply_edit)
+        _xform.addRow("自定义缩放：", self._xlsx_scale)
+
+        self._xlsx_range = _combo(RANGE_LABELS)
+        _disable_combo_wheel(self._xlsx_range)
+        self._xlsx_range.setToolTip("表格打印范围（活动工作表 / 整个工作簿 / 选定区域 / 忽略打印区域）")
+        self._xlsx_range.currentIndexChanged.connect(self._auto_apply_edit)
+        _xform.addRow("打印范围：", self._xlsx_range)
+        _xl.addLayout(_xform)
+
+        self._xlsx_follow_btn = QPushButton("跟随默认")
+        self._xlsx_follow_btn.setToolTip("清掉这个任务自己的版式设置，改用「选项 → 默认任务参数」里那套")
+        self._xlsx_follow_btn.clicked.connect(self._on_xlsx_follow_default)
+        _xl.addWidget(self._xlsx_follow_btn)
+
+        self._xlsx_note = QLabel("前次转换的 PDF 会作废：改版式后下一次打印按新参数重新导出（不改原文件）")
+        self._xlsx_note.setObjectName("sectionHint")
+        self._xlsx_note.setWordWrap(True)
+        _xl.addWidget(self._xlsx_note)
+        gl.addWidget(self._xlsx_box)
+
+        self._xlsx_sep_bottom = QFrame()
+        self._xlsx_sep_bottom.setFrameShape(QFrame.HLine)
+        self._xlsx_sep_bottom.setFrameShadow(QFrame.Sunken)
+        gl.addWidget(self._xlsx_sep_bottom)
+
+        # 默认整块隐藏（没有表格选中时不该占位置）
+        for _w in (self._xlsx_sep_top, self._xlsx_box, self._xlsx_sep_bottom):
+            _w.setVisible(False)
+
+        # 表格版式面板里"能被禁用"的控件（供 _sync_xlsx_panel / _sync_edit_enabled 统一置灰）
+        self._xlsx_widgets = [
+            self._label_xlsx,
+            self._xlsx_header, self._xlsx_footer,
+            self._xlsx_orientation, self._xlsx_paper,
+            self._xlsx_center_h, self._xlsx_center_v,
+            self._xlsx_fit, self._xlsx_scale, self._xlsx_range,
+            self._xlsx_follow_btn,
+        ]
+        self._xlsx_widgets.extend(list(self._xlsx_margins.values()))
+
         # ── 封面单独打印（2026-11-02 用户需求）────────────────────────────────
         # 设计初衷：一份 31 页的习题想「第 1 页封面单面、2-31 页双面」。旧办法是在两个
         # 标签页里分别打 1 与 2-31（两个订单、两次计费）。这里做成一个开关：
@@ -10248,6 +11013,8 @@ class MainWindow(QMainWindow):
             label_dpi, self._edit_dpi,
             self._label_img_orientation, self._edit_img_orientation,
         ]
+        # 表格版式那组控件一起纳入统一置灰（选中非表格文件时它们整块是隐藏的）
+        self._edit_widgets.extend(getattr(self, "_xlsx_widgets", None) or [])
         for w in self._edit_widgets:
             w.setEnabled(False)
 
@@ -11085,6 +11852,22 @@ class MainWindow(QMainWindow):
                 source_md5 = ""
         # 检查本地 PDF 缓存（图片按方向后缀、docx 按转换引擎分开、表格按表格引擎分开）
         _ext_of_file = os.path.splitext(file_path)[1].lower()
+        # ── 表格版式（2026-11 用户需求 #10）──────────────────────────────────
+        # 只有表格文件才有 print_options；任务自己存过 xlsx_options 就用它，否则用
+        # 「选项 → 默认任务参数」那套全局默认；两处都没配过 ⇒ None ⇒ 引擎完全不碰
+        # PageSetup（与改动前逐像素一致）。**读缓存也带上它**：版式不同 ⇒ 缓存 key 不同，
+        # 否则改完页边距打印会命中按旧版式导出的那份 PDF（版式静默不生效）。
+        _print_options = None
+        if _ext_of_file in (".xls", ".xlsx"):
+            try:
+                _job_for_opts = jobs[row] if (row < len(jobs)
+                                              and jobs[row].file_path == file_path) else None
+                _print_options = resolve_xlsx_print_options(
+                    self._config.default_task_options,
+                    getattr(_job_for_opts, "xlsx_options", {}) if _job_for_opts else {})
+            except Exception:
+                logger.debug("解析表格版式失败，按不传处理", exc_info=True)
+                _print_options = None
         if source_md5:
             # 引擎后缀判定统一走 cache_engine_for（写/读/打印三侧同一口径）
             _cache_engine = cache_engine_for(file_path, engine)
@@ -11094,7 +11877,8 @@ class MainWindow(QMainWindow):
                 import paths as _paths_x
                 import xlsx_printer as _xp
                 cached_pdf = _xp.find_cached_pdf(source_md5, image_orientation,
-                                                 cache_dir=_paths_x.pdf_cache_dir())
+                                                 cache_dir=_paths_x.pdf_cache_dir(),
+                                                 print_options=_print_options)
                 cached_meta = {}
             elif self._cloud_client:
                 cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
@@ -11153,6 +11937,9 @@ class MainWindow(QMainWindow):
         self._cancel_convert_worker_for_path(file_path)
         worker = ConvertWorker(row, file_path, engine, source_md5, from_cloud=from_cloud,
                                allow_cloud_com=allow_cloud_com)
+        # 表格版式：构造签名不动（老安全验收用正则钉死它），转换前单独注入
+        if _print_options:
+            worker.set_print_options(_print_options)
         worker.finished.connect(
             lambda r, fp, pdf, pc, ori, tk=tab_key: self._on_convert_finished(r, fp, pdf, pc, ori, tk))
         self._convert_workers.append(worker)
@@ -11394,6 +12181,62 @@ class MainWindow(QMainWindow):
                 logger.debug(f"保存取号幂等键失败（不影响取号）: {e}")
         return rid
 
+    def _mark_order_created(self, tab_key: str = "", when: str = "") -> str:
+        """记录并返回本标签页订单的**创建时间**；已有值原样返回（**不可覆盖**）。
+
+        #7 契约：订单创建时间 = 本标签页**第一次生成订单号**的时刻，落 TabSettings.created_at
+        （持久化，重启后仍在）。之后无论复制合计、换号补报、离线补报、重打，都只读不写 ——
+        结算页的时间趋势和"下单→打印"耗时才有唯一口径。
+        返回空串只在标签页不存在时（极端情况），调用方仍可继续用空值上报。
+        """
+        try:
+            key = tab_key or self._current_tab
+            tab = self._config.tabs.get(key)
+            if tab is None:
+                return when or ""
+            exists = str(getattr(tab, "created_at", "") or "")
+            if exists:
+                return exists
+            tab.created_at = (when or _now_stamp())
+            return tab.created_at
+        except Exception as e:              # 槽内异常会崩进程（6.11），这里只降级
+            logger.debug(f"记录订单创建时间失败: {e}")
+            return when or ""
+
+    def _mark_print_started(self, tab_key: str = "", when: str = "") -> str:
+        """记录并返回本标签页**第一次真正开始打印**的时刻；已有值不覆盖（重打不刷新）。"""
+        try:
+            key = tab_key or self._current_tab
+            tab = self._config.tabs.get(key)
+            if tab is None:
+                return when or ""
+            exists = str(getattr(tab, "started_at", "") or "")
+            if exists:
+                return exists
+            tab.started_at = (when or _now_stamp())
+            return tab.started_at
+        except Exception as e:
+            logger.debug(f"记录打印发起时间失败: {e}")
+            return when or ""
+
+    def _reset_tab_order_times(self, tab_key: str = "") -> None:
+        """清空标签页（或把文件删光）时把订单创建/发起时间一并清掉。
+
+        #7 契约的配套：一个标签页在同一时刻只属于一张订单。不清的话，
+        「清空 → 再拖文件 → 取到新订单号」会沿用上一单的 created_at，
+        界面上显示"创建时间"比新单早得多，上报给后端的 created_at 也是错的
+        （结算页的"下单→打印"耗时跟着失真）。所以清空 = 这单结束了，
+        时间和单号一起作废；下一单从零开始计时。
+        """
+        try:
+            tab = self._config.tabs.get(tab_key or self._current_tab)
+            if tab is None:
+                return
+            tab.created_at = ""
+            tab.started_at = ""
+        except Exception as e:              # 槽内异常会崩进程（6.11），这里只降级
+            logger.debug(f"清空标签页订单时间失败: {e}")
+
     def _ensure_order_number(self) -> str:
         """确保当前标签页有订单号。连线时从后端获取，离线时生成本地临时号（-L 前缀）。"""
         jobs = self._get_current_jobs()
@@ -11447,6 +12290,8 @@ class MainWindow(QMainWindow):
                 if self._current_tab == tab_key:
                     for j in jobs: j.order_number = order_number
                     self._set_current_jobs(jobs)
+                    # 订单创建时间（#7）：第一次拿到正式号的那一刻，写一次就不再变
+                    self._mark_order_created(tab_key)
                     self._refresh_tab_display()
                     self._log(f"📋 已分配订单号: {order_number}")
                 return order_number
@@ -11455,6 +12300,8 @@ class MainWindow(QMainWindow):
         for j in jobs:
             j.order_number = order_number
         self._set_current_jobs(jobs)
+        # 离线号也是"订单第一次生成"⇒ 同样写创建时间（换正式号时**不改**它）
+        self._mark_order_created()
         self._refresh_tab_display()
         self._log(f"📋 已分配本地订单号: {order_number}（连线后将自动同步）")
         return order_number
@@ -11546,13 +12393,19 @@ class MainWindow(QMainWindow):
                     # 备注取所属标签页（订单级）
                     _remark = next((t2.remark for t2 in self._config.tabs.values()
                                     if t2.remark and any(j.order_number == new_num for j in t2.jobs)), '')
-                    # created_at = 这单**真实打印完成**的时刻（PrintJob.finished_at），
-                    # 只有还没打印（仅预留）时才回落到当前时刻。
-                    # 2026-11-02 现场 HN20261102-0011：原来一律写 datetime.now()，于是
-                    # 12:14:40 离线打完的纸，订单 created_at/print_started_at 全变成 12:15:15
-                    # 的补报时刻 —— 明细页看着像"刚下单就打印完"，等待时长统计也失真。
-                    _created_at = next((getattr(j, "finished_at", "") for j in order_jobs
-                                        if getattr(j, "finished_at", "")), "")
+                    # created_at（#7 契约）：**优先用订单所属标签页的创建时间** ——
+                    # 那是订单第一次生成订单号的时刻，写一次就不再变；换号补报只是"把号换成
+                    # 正式号"，绝不是"订单在这一刻才诞生"。
+                    # 旧实现拿 PrintJob.finished_at 当 created_at（2026-11-02 HN20261102-0011
+                    # 的修法），方向是对的但口径仍错：它记的是**打完**的时刻，不是下单时刻，
+                    # 明细页会显示"下单即完成"。finished_at 只在标签页已清理（孤儿单）时兜底，
+                    # 再不行才回落到"现在"。
+                    _tab_created = next((str(t2.created_at) for t2 in self._config.tabs.values()
+                                         if getattr(t2, "created_at", "")
+                                         and any(j.order_number == new_num for j in t2.jobs)), "")
+                    _created_at = _tab_created or next(
+                        (getattr(j, "finished_at", "") for j in order_jobs
+                         if getattr(j, "finished_at", "")), "")
                     payload = {
                         "order_number": new_num,
                         # v4.6：按本地是否已打印决定上报状态——仅复制价格未打印 → reserved（非空占位）；
@@ -11689,9 +12542,15 @@ class MainWindow(QMainWindow):
         tab_extra = tab.calc_extra_total(total, self._config) if tab else 0.0
         total_price = round(total + tab_extra, 2)
         remark = (tab.remark or '')
+        # 订单创建时间（#7）：**只认本标签页的创建时间**，绝不拿 PrintJob.finished_at 或
+        # "现在"顶上 —— reserved 上报会在复制金额、补报、同步时反复触发，一旦用了可变的
+        # 时间源，同一张订单的 created_at 会随每次上报漂移（旧实现在换号补报里就犯过这个错）。
+        # 标签页还没有创建时间（老配置/极端路径）时补写一次，随后固定。
+        created_at = self._mark_order_created(self._current_tab)
         payload = {
             "order_number": order_number,
             "status": "reserved",
+            "created_at": created_at,
             "total_price": total_price,
             "files": files_data,
             "owner_name": (tab.owner_name or ""),
@@ -12111,6 +12970,8 @@ class MainWindow(QMainWindow):
     def _on_undo_expired(self):
         """撤回超时 → 确认清空，通知后端放弃被清空的云端任务。"""
         jobs = self._cleared_jobs_backup.pop(self._current_tab, [])
+        # 清空已确认：暂存的时间戳作废（下一单重新计时，不沿用这单的创建时间）
+        self._cleared_times_backup.pop(self._current_tab, None)
         self._abandon_jobs(jobs)
         self._restore_clear_button()
         if jobs:
@@ -12130,6 +12991,8 @@ class MainWindow(QMainWindow):
         if self._clear_undo_timer.isActive():
             self._clear_undo_timer.stop()
         jobs = self._cleared_jobs_backup.pop(self._current_tab, [])
+        # 撤回已取消（用户直接加了新文件）= 清空确认，暂存时间戳同样作废
+        self._cleared_times_backup.pop(self._current_tab, None)
         self._abandon_jobs(jobs)
         self._restore_clear_button()
         if jobs:
@@ -12309,13 +13172,53 @@ class MainWindow(QMainWindow):
                       f"若本机没有自动双面器（HP LaserJet 1018/1020/1022 这类驱动会虚报支持），"
                       f"实际走的是驱动程序自带的「双面打印说明」向导（偶数页先打 → 提示翻纸 → "
                       f"再打奇数页），单页文件还可能先吐一张空白页。"
-                      f"请用「帮助 → 打印机双面能力…」盖章，改用程序自己的两趟控制器"
+                      f"请用「选项 → 打印机双面能力…」盖章，改用程序自己的两趟控制器"
                       f"（全程单面、只翻一次纸、第 2 趟自动 180° 补偿）。")
         except Exception as e:      # 启动早期/半初始化的验收环境都要能安全调用
             logger.debug(f"双面能力提示失败（忽略）: {e}")
 
+    def _on_default_task_options(self):
+        """选项 → 默认任务参数…：改跨文件类型的全局打印默认值（纸张/页边距/缩放/范围…）。
+
+        两件事分开存、各自独立生效（见 printer_config 的 DEFAULT_TASK_OPTIONS 注释）：
+          · `paper_size`：标量，打印管线直接吃（PrintWorker → print_pdf/print_plan_pass 的
+            paper=），默认 A4 = 旧行为；
+          · `default_task_options`：版式项，给 xlsx 引擎的 print_options，也是新增文件的初值
+            （DPI / 图片方向 / 排除末尾空白页 / 封面单独打印）；**空 = 从未配置**，
+            引擎走旧行为（不传 print_options、新任务字段仍按原逻辑推导），
+            所以"没动过的人升级后看不出差别"。
+        保存后立刻落盘（下一批打印生效）；不打纸、不动任何已存在的任务。
+        """
+        try:
+            dlg = DefaultTaskOptionsDialog(
+                self,
+                options=(self._config.default_task_options or {}),
+                paper_size=self._config.paper_size,
+                theme_manager=self._theme_manager)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            vals = dlg.values()
+            self._config.paper_size = normalize_paper_size(vals.get("paper"))
+            # 只存**与出厂默认不同**的键（差量），不存整份：
+            #   · 空 dict = 从未配置 = 引擎接到 None = 旧行为，这是"没动过的人升级后看不出差别"的依据；
+            #   · 稀疏存储还能保住"没配过的键=按文件自动推导"（例如 duplex_mode 是按页面方向推的、
+            #     blank_tail 是按 PDF 末尾检测的）。存整份等于把这些自动推导一律钉死成默认值。
+            self._config.default_task_options = {
+                k: v for k, v in vals.items() if DEFAULT_TASK_OPTIONS.get(k) != v
+            }
+            self._save_config()
+            self._log(f"⚙ 默认任务参数已保存：纸张 {self._config.paper_size}"
+                      f"／{'双面' if vals.get('duplex') == 'on' else '单面'}"
+                      f"／{ORIENTATION_LABELS[_index_of(ORIENTATION_VALUES, vals.get('orientation'))]}"
+                      f"／页边距 {vals.get('margin_left_cm')}cm（下一批打印生效）")
+        except Exception as e:
+            # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
+            logger.exception("保存默认任务参数失败")
+            QMessageBox.warning(self, "默认任务参数",
+                                f"保存失败：{type(e).__name__}: {e}")
+
     def _on_printer_duplex_capability(self):
-        """帮助 → 打印机双面能力…：给当前队列盖三态章 + 手动双面参数。
+        """选项 → 打印机双面能力…：给当前队列盖三态章 + 手动双面参数。
 
         人工结论（capability_source="manual"）**优先于自动探测且不被探测覆盖** ——
         这正是老机型（驱动虚报支持）唯一可靠的判据来源。此前只能敲命令行建档案，
@@ -12515,7 +13418,7 @@ class MainWindow(QMainWindow):
         return ""
 
     def _on_calibrate_speed(self):
-        """帮助 → **打印速度…**：一个窗口里装下所有"第 1 趟耗时 / 翻纸放行"设置。
+        """选项 → 打印速度…：一个窗口里装下所有"第 1 趟耗时 / 翻纸放行"设置。
 
         2026-10-20 用户要求（原入口是"点一下就打 11 张纸的测速"）：
           ① 启动/预热时间、每张纸耗时 —— 机器量不准的分量允许人工填；
@@ -12733,7 +13636,7 @@ class MainWindow(QMainWindow):
         if ad is True:
             return f"「{queue}」已确认支持自动双面（双面一次成型，不需要攒批）"
         return (f"「{queue}」的双面能力未确认（攒批只对「已确认不支持自动双面、"
-                f"双面需人工翻纸」的机型开放；请先用「帮助 → 打印机双面能力…」盖章）")
+                f"双面需人工翻纸」的机型开放；请先用「选项 → 打印机双面能力…」盖章）")
 
     def _stack_mode_on(self) -> bool:
         """攒批模式**当前是否真的生效**：配置开着 + 当前打印机确实需要攒批。
@@ -14202,6 +15105,11 @@ class MainWindow(QMainWindow):
         self._stack_flush_snapshot = list(self._stack.entries)
         w = DuplexFlushWorker(self._stack, bdir, self._config.printer_name,
                               dpi=self._config.render_dpi)
+        # 纸张大小（跨文件类型全局默认，2026-11 #11c）：用属性赋值而不是构造关键字，
+        # 因为验收脚本里的 DuplexFlushWorker 桩只认 (stack, batch_dir, printer_name, dpi)；
+        # 真实类在 __init__ 里总会建好 self._paper（默认 "" = 沿用打印机默认纸）。
+        if hasattr(w, "_paper"):
+            w._paper = self._config.paper_size
         w.progress.connect(self._on_progress)
         w.log_message.connect(self._log)
         w.done.connect(self._on_stack_flush_done)
@@ -14758,14 +15666,18 @@ class MainWindow(QMainWindow):
         tab = self._config.tabs.get(target_key)
         if tab:
             tab.frozen = True
+        # ── 订单创建 / 打印发起时间（2026-11 用户需求 #7）────────────────────
+        # created_at 在这里**兜底**写入（正常情况下复制合计/取号那一刻就写过了），
+        # 且 _mark_order_created 只在空值时写 —— 已存在的时间戳一律原样保留，
+        # 否则"打完一单再来一次"会把同一张订单的创建时间不断往后推。
+        created_at = self._mark_order_created(target_key)
+        # 打印发起 = 第一次真正开打的时刻（重打/续打不刷新）
+        self._mark_print_started(target_key)
         self._save_config()
         self._refresh_tab_display()
         self._log(f"🔒 标签页 {target_key} 已固定，打印完成后不可编辑")
         # 立即禁用「开始打印」按钮：取号/上报的等待窗口内用户也能看到打印已开始
         self._btn_start.setEnabled(False)
-
-        from datetime import datetime
-        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # 构造文件数据（在线/离线共用）
         files_data = []
@@ -14855,6 +15767,8 @@ class MainWindow(QMainWindow):
             stack_seq=int(_st_seq or 0),
             stack_rotate=bool(_st_rot),
             stack_more_pending=lambda: bool(getattr(self, "_stack_entry_wait", None)),
+            # 纸张大小：跨文件类型的全局默认（配置里没有这个键的老配置 ⇒ A4）
+            paper=self._config.paper_size,
         )
         worker.progress.connect(self._on_progress)
         worker.log_message.connect(self._log)
@@ -17366,6 +18280,13 @@ class MainWindow(QMainWindow):
             tab_settings.cover_page_price = task.cover_page_price
             # v4.6：云端订单备注 → 标签页级备注（编辑面板显示，可修改后覆盖上报）
             tab_settings.remark = getattr(task, 'remark', '') or ''
+            # ── 订单创建时间（#7）：云端订单的创建时间**以后端下发为准** ──
+            # 顾客在小程序下单那一刻才是真实的下单时间；本地收到任务可能晚几分钟（重连、
+            # 下载排队），用"收到任务的时刻"会让结算页的等待时长凭空变短。
+            # 后端没给（旧版本）才留空，等第一次要号/开打时补写。
+            _cloud_created = str(getattr(task, 'created_at', '') or '').strip()
+            if _cloud_created:
+                tab_settings.created_at = _cloud_created
             # v24.1：云端订单若由管理员在前端标记"管理员自行打印"→ 预勾选并沿用归属人；
             # 否则为顾客订单（不是管理员自行打印），归属人默认当前机位管理员。
             # v5.24：顾客订单标签页归属 = 下单用户绑定的成员名（bound_owner_name，后端反查
@@ -17384,6 +18305,14 @@ class MainWindow(QMainWindow):
         else:
             # 追加到已存在的订单标签页（switch_tab=False 时 _current_tab 未切换，须显式用 existing_key）
             new_key = existing_key if existing_key is not None else self._current_tab
+
+        # 追加到老标签页时补一次后端下发的创建时间（该字段是 2026-11 新增的，
+        # 之前建的标签页 created_at 为空；订单创建时间仍只写一次，已有值不动）
+        _ctab = self._config.tabs.get(new_key)
+        if _ctab is not None and not getattr(_ctab, "created_at", ""):
+            _cloud_created2 = str(getattr(task, 'created_at', '') or '').strip()
+            if _cloud_created2:
+                _ctab.created_at = _cloud_created2
 
         ext = os.path.splitext(task.local_path)[1].lower() if task.local_path else ""
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
@@ -17557,6 +18486,12 @@ class MainWindow(QMainWindow):
         # 不立即通知后端放弃：等撤回窗口(5s)过期或确认后才放弃，
         # 避免用户在 5 秒内点"撤回"后订单已被后端标记为放弃
         self._cleared_jobs_backup[self._current_tab] = list(jobs)
+        # 订单时间也一起暂存：撤回时还原，不撤回就随这单一起作废（下一单新时间）
+        _tab_cleared = self._config.tabs.get(self._current_tab)
+        self._cleared_times_backup[self._current_tab] = (
+            str(getattr(_tab_cleared, "created_at", "") or ""),
+            str(getattr(_tab_cleared, "started_at", "") or ""))
+        self._reset_tab_order_times(self._current_tab)
         self._set_current_jobs([])
         # 预约单指向该标签页 → 联动清理状态机（防到点打印空标签页/假打印）
         self._cleanup_scheduled_orders_for_tab(self._current_tab, reason="标签页已清空")
@@ -17573,11 +18508,17 @@ class MainWindow(QMainWindow):
 
     def _on_undo_clear(self):
         """撤回清空操作（按钮点击）。"""
-        # 先取备份，再取消定时器（cancel 也会 pop，所以先取）
+        # 先取备份，再取消定时器（cancel 也会 pop，所以先取；时间戳同理）
         backup = self._cleared_jobs_backup.pop(self._current_tab, None)
+        _times = self._cleared_times_backup.pop(self._current_tab, None)
         self._cancel_undo_if_active()
         if backup:
             self._set_current_jobs(backup)
+            # 时间随任务一起还原：撤回 = 这单没被清掉，创建/发起时间仍然是原来那一刻
+            if _times:
+                _tab_undo = self._config.tabs.get(self._current_tab)
+                if _tab_undo is not None:
+                    _tab_undo.created_at, _tab_undo.started_at = _times
             self._rebuild_table()
             self._update_total_cost()
             self._refresh_tab_display()
@@ -17613,6 +18554,9 @@ class MainWindow(QMainWindow):
                 self._cancel_undo_if_active()
                 del jobs[row]
         self._set_current_jobs(jobs)
+        # 全删光了 ⇒ 这张订单结束（下次加文件是新单新时间；只剩部分文件时订单不变，时间保留）
+        if not jobs:
+            self._reset_tab_order_times()
         self._rebuild_table()
         self._update_total_cost()
         self._refresh_tab_display()
@@ -17711,16 +18655,29 @@ class MainWindow(QMainWindow):
                 for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
                     if available.get(eng, False): engine = eng; break
             is_image = ext in image_exts
+            # 「选项 → 默认任务参数…」的差量默认值（主窗口级配置，整批共用；空 dict = 从未配置）
+            _custom = dict(self._config.default_task_options or {})
             # 短边/长边只按**方向**推导（未知方向=长边）；转换完成后由 _on_convert_finished 复核
             duplex_mode = self._duplex_mode_for_orientation(orientation)
 
             job = PrintJob(
                 file_path=work_path, copies=1,
                 source_path=src,  # 用户原件路径（显示/打开文件用；副本丢失时按此重建）
-                duplex="off" if is_image else "on",
-                duplex_mode=duplex_mode,
+                # 「选项 → 默认任务参数…」只存**改过的键**（差量）。键不在 dict 里 = 该项仍按
+                # 原有逻辑推导/检测，所以没配过的人（dict 为空）逐项行为与改动前完全一致：
+                # ● 双面：图片仍强制单面（既有规矩），文本/PDF 才吃默认值；
+                duplex="off" if is_image else (str(_custom.get("duplex") or "on")),
+                # ● 双面模式：没配过就保留按页面方向推导的结果（配置一次长边不会永久钉死长边）；
+                duplex_mode=str(_custom.get("duplex_mode") or "") or duplex_mode,
                 page_count=page_count, orientation=orientation, engine=engine,
-                blank_tail=blank_tail,
+                # ● 排除末尾空白页：没配过就保留 PDF 末尾空白页的自动检测结果；
+                blank_tail=1 if _custom.get("blank_tail") else blank_tail,
+                dpi=int(_custom.get("dpi") or 0),  # 0 = 跟随全局 DPI
+                image_orientation=str(_custom.get("image_orientation") or "auto"),
+                # ● 封面单独打印：与 UI 同一口径 —— 勾了但页范围是空的等于没勾；
+                simplex_enabled=(bool(_custom.get("simplex_enabled"))
+                                 and bool(str(_custom.get("simplex_pages") or "").strip())),
+                simplex_pages=str(_custom.get("simplex_pages") or ""),
             )
             jobs.append(job)
 

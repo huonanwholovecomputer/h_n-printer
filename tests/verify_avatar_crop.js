@@ -189,7 +189,9 @@ check('★ APP：任何一步失败都退回上传原图（drawImage 抛错 / �
 check('★ APP：上传入口没变（POST /api/profile + FormData avatar）',
   /xhr\.open\('POST', BASE_URL \+ '\/api\/profile'\)/.test(appJs) && /fd\.append\('avatar', file\)/.test(appJs));
 check('★ APP：index.html 先加载 avatar_crop.js 再加载 me.js',
-  appHtml.indexOf('avatar_crop.js') > 0 && appHtml.indexOf('avatar_crop.js') < appHtml.indexOf('me.js'));
+  // 只比 <script src=…> 的位置：正文注释里提到 me.js 不应影响判据
+  appHtml.indexOf('<script src="avatar_crop.js">') > 0
+  && appHtml.indexOf('<script src="avatar_crop.js">') < appHtml.indexOf('<script src="me.js">'));
 check('★ APP：index.html 有裁剪弹层（cropMask / cropBox / cropImg / cropZoom / 两个按钮）',
   ['id="cropMask"', 'id="cropBox"', 'id="cropImg"', 'id="cropZoom"', 'id="cropCancel"', 'id="cropOk"']
     .every((s) => appHtml.indexOf(s) > 0));

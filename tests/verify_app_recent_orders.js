@@ -84,85 +84,156 @@ check('⑨ 价格分支先于归属人分支（价格在第二行，避免误触
       delegSrc.indexOf('data-recent-price') < delegSrc.indexOf("closest('[data-recent-owner]')"));
 
 /* ============================================================
-   三、行为：抽取真实函数在桩环境里跑
+   三、me.js：内嵌列表 → 入口卡（#3 改造后）
    ============================================================ */
-function extractOrdersBlock() {
-  const start = meJs.indexOf('function _recentOrderTime(s) {');
-  const end = meJs.indexOf('// 详细价格文本：逐文件');
-  if (start < 0 || end < 0 || end <= start) return null;
-  return meJs.slice(start, end);
-}
-function extractFn(src, marker) {
-  const start = src.indexOf(marker);
-  if (start < 0) return '';
-  const end = src.indexOf('\n}', start);
-  if (end < 0) return '';
-  return src.slice(start, end + 2);
-}
+section('三、me.js 近 N 条订单改成入口卡');
+const rosJs = fs.readFileSync(path.join(APP_WWW, 'recent-orders.js'), 'utf8');
+const css = fs.readFileSync(path.join(APP_WWW, 'styles.css'), 'utf8');
+const renderSrc = meJs.slice(meJs.indexOf('function renderRecentOrders'), meJs.indexOf('function _clampRecentOrdersLimit'));
+check('① renderRecentOrders 渲染入口卡并调 openRecentOrdersView',
+      /recent-orders-entry[\s\S]{0,800}openRecentOrdersView\(\)/.test(renderSrc),
+      (renderSrc.match(/openRecentOrdersView[^\n]*/) || [''])[0]);
+check('② 入口卡标题「查看最近订单」+ 说明带动态 N',
+      renderSrc.indexOf('查看最近订单') >= 0 && /全部管理员的最近/.test(renderSrc));
+check('③ 行渲染器 recentOrderRowHTML 已移除（列表搬到独立页）',
+      !/function recentOrderRowHTML/.test(meJs));
+check('④ 标题与数量徽标仍按接口 limit 更新',
+      /recentOrdersTitle/.test(renderSrc) && /recentOrderCount/.test(renderSrc));
+check('⑤ 入口卡不再挂行内价格/归属人交互',
+      renderSrc.indexOf('data-recent-price') < 0 && renderSrc.indexOf('data-recent-owner') < 0);
 
-function loadOrdersModule() {
-  const block = extractOrdersBlock();
-  if (!block) return null;
+/* ============================================================
+   四、最近订单子视图接线（index.html / app.js / styles.css）
+   ============================================================ */
+section('四、子视图接线');
+const viewStart = html.indexOf('id="view-recent-orders"');
+const viewEnd = html.indexOf('<!-- ===== Tab 栏');
+const viewHtml = viewStart > 0 && viewEnd > viewStart ? html.slice(viewStart, viewEnd) : '';
+check('① index.html 有 #view-recent-orders 子视图根', viewStart > 0);
+check('② 复用同一套滚动引擎骨架（scroller + scroll-content）',
+      viewHtml.indexOf('id="scroller-recent-orders"') > 0 &&
+      viewHtml.indexOf('id="scrollContentRecentOrders"') > 0);
+check('③ 容器 id 齐全（汇总/列表/顶底分页/空态/下拉）',
+      ['roNoPermission', 'roSection', 'roSummary', 'roSummaryText', 'roPager', 'roPageNumbers',
+       'roPrev', 'roNext', 'roList', 'roPagerBottom', 'roPageNumbersBottom', 'roPrevBottom',
+       'roNextBottom', 'roEndHint', 'roRefresh', 'roPageSizeSelector', 'roPageSizeDropdown',
+       'roPageSizeText', 'roPageSizeArrow'].every((id) => viewHtml.indexOf('id="' + id + '"') >= 0),
+      viewHtml ? 'len=' + viewHtml.length : 'no view');
+check('④ 条数下拉 10/20/50/100 四个选项',
+      ['10', '20', '50', '100'].every((n) => viewHtml.indexOf('data-size="' + n + '"') >= 0));
+check('⑤ recent-orders.js 已挂载且在 me.js 之后',
+      html.indexOf('src="recent-orders.js"') > html.indexOf('src="me.js"') &&
+      html.indexOf('src="recent-orders.js"') > 0);
+check('⑥ app.js 注册滚动引擎 recentOrders',
+      /\[\s*'recentOrders'\s*,\s*'scroller-recent-orders'\s*,\s*'scrollContentRecentOrders'\s*\]/.test(appJs));
+check('⑦ 启动时调用 initRecentOrdersView()', /initRecentOrdersView\(\)/.test(appJs));
+check('⑧ 返回键/切 tab 收起原因气泡与条数下拉',
+      /closeStatusReasonPop\(\)/.test(appJs) && /closeRoPageSizePickerIfOpen\(\)/.test(appJs));
+check('⑨ styles.css 有入口卡与行样式',
+      ['.recent-orders-entry {', '.ro-row {', '.ro-price-tap {', '.ro-owner {']
+        .every((s) => css.indexOf(s) >= 0));
+check('⑩ styles.css 有 .status-timeout（橙，区别于 failed 红）',
+      /\.status-timeout\s*\{[^}]*#EF6C00/.test(css));
+check('⑪ styles.css 原因气泡 fixed + 出变换层',
+      /\.status-pop-mask\s*\{[^}]*position:\s*fixed/.test(css) && /\.status-pop\s*\{[^}]*position:\s*fixed/.test(css));
+
+/* ============================================================
+   五、行为：把真实 recent-orders.js 放进桩环境跑
+   ============================================================ */
+function loadRecentOrdersViewModule() {
   const statusMapSrc = (appJs.match(/const ORDER_STATUS_MAP = \{[\s\S]*?\};/) || [''])[0];
-  const statusCls = extractFn(meJs, 'function orderStatusClass(status)');
+  const statusCls = (() => {
+    const s = meJs.indexOf('function orderStatusClass(status)');
+    const e = meJs.indexOf('\n}', s);
+    return s >= 0 && e > s ? meJs.slice(s, e + 2) : '';
+  })();
   const prelude = `
-    const state = { role: 'admin', isSuperAdmin: false };
-    const meState = {
-      orders: [], recentOrders: [], recentOrdersLimit: 10, recentOrdersLoading: false,
-      recentOrdersLimitEditing: false, recentOrdersLimitDraft: 10, recentOrdersLimitSaving: false,
-      userOrdersView: { orders: [] },
-    };
-    let apiCalls = [];
-    let nextResponse = { data: { success: true, limit: 10, orders: [] } };
-    let measureCalls = 0;
-    const toasts = [];
+    const state = { role: 'admin' };
+    const meState = { orders: [], recentOrders: [], recentOrderRows: [], recentOrdersLimit: 10 };
     const els = {};
     function mkEl(id) {
       const cls = {};
       return {
-        id: id, textContent: '', innerHTML: '', style: { display: '' }, _id: id, _cls: cls,
+        id: id, innerHTML: '', textContent: '', style: { display: '' }, dataset: {}, _cls: cls,
         classList: {
           toggle(name, on) { cls[name] = !!on; },
           add(name) { cls[name] = true; },
           remove(name) { delete cls[name]; },
           contains(name) { return !!cls[name]; },
         },
+        addEventListener() {},
+        closest() { return null; },
       };
     }
-    function getEl(id) { if (!els[id]) els[id] = mkEl(id); return els[id]; }
-    const document = { getElementById: getEl };
+    const document = {
+      getElementById(id) { if (!els[id]) els[id] = mkEl(id); return els[id]; },
+      querySelectorAll() { return []; },
+      addEventListener() {},
+    };
+    const _ls = {};
+    const localStorage = {
+      getItem(k) { return Object.prototype.hasOwnProperty.call(_ls, k) ? _ls[k] : null; },
+      setItem(k, v) { _ls[k] = String(v); },
+    };
+    let apiCalls = [];
+    let nextResponse = { status: 200, data: { success: true, total: 0, orders: [] } };
+    let measureCalls = 0;
+    const views = [];
+    const copied = [];
+    const reasons = [];
+    const ddOpened = [];
+    let closedStatus = 0;
+    let closedPrice = 0;
+    async function api(path, opts) { apiCalls.push({ path: path, opts: opts }); return nextResponse; }
+    function showView(id, title) { views.push({ id: id, title: title }); }
     function measureAll() { measureCalls++; }
-    function showToast(msg, ms) { toasts.push({ msg: msg, ms: ms }); }
+    function copyText(text, msg) { copied.push({ text: text, msg: msg }); }
+    function openStatusReasonPop(el, id) { reasons.push({ id: id }); }
+    function closeStatusReasonPop() { closedStatus++; }
+    function closePricePop() { closedPrice++; }
+    function openDropdownFixed(dd, trigger) { ddOpened.push({ dd: dd, trigger: trigger }); }
     function escHtml(s) {
       return String(s == null ? '' : s)
         .replace(/&/g, '&amp;').replace(/</g, '&lt;')
         .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
-    async function api(path, opts) { apiCalls.push({ path: path, opts: opts }); return nextResponse; }
+    function buildPriceSimpleText(o) { return (o && o.order_number ? o.order_number + ' — ' : '') + '¥' + Number(o.total_price || 0).toFixed(2); }
+    function isReasonStatus(status) { return ['failed', 'timeout', 'canceled', 'rejected', 'abandoned'].indexOf(status) >= 0; }
+    const scrollEngines = { recentOrders: { y: 300, maxY: 240, _scrolled: null, measure() {}, scrollTo(y, d) { this._scrolled = { y: y, d: d }; this.y = y; } } };
     ${statusMapSrc}
     ${statusCls}
   `;
   const harness = `
     globalThis.__H = {
-      setRole: (r) => { state.role = r; },
-      setSuper: (v) => { state.isSuperAdmin = !!v; },
-      setResponse: (r) => { nextResponse = r; },
-      reset: () => { apiCalls.length = 0; measureCalls = 0; toasts.length = 0; },
-      calls: () => apiCalls,
-      toasts: () => toasts,
+      roState: roState,
       els: els,
-      meState: meState,
-      loadRecentOrders: loadRecentOrders,
-      renderRecentOrders: renderRecentOrders,
-      recentOrderRowHTML: recentOrderRowHTML,
-      _recentOrderTime: _recentOrderTime,
-      _priceOrderById: _priceOrderById,
-      _priceOrderTotal: _priceOrderTotal,
-      renderRecentOrderLimitEditor: renderRecentOrderLimitEditor,
-      openRecentOrdersLimitEditor: openRecentOrdersLimitEditor,
-      stepRecentOrdersLimit: stepRecentOrdersLimit,
-      saveRecentOrdersLimit: saveRecentOrdersLimit,
-      _clampRecentOrdersLimit: _clampRecentOrdersLimit,
+      calls: () => apiCalls,
+      copied: () => copied,
+      reasons: () => reasons,
+      views: () => views,
+      ddOpened: () => ddOpened,
+      closed: () => ({ status: closedStatus, price: closedPrice }),
+      measureCalls: () => measureCalls,
+      scrollEngine: () => scrollEngines.recentOrders,
+      reset() { apiCalls = []; copied.length = 0; reasons.length = 0; views.length = 0; ddOpened.length = 0; measureCalls = 0; },
+      setRole(r) { state.role = r; },
+      setResponse(r) { nextResponse = r; },
+      storage: _ls,
+      openRecentOrdersView: openRecentOrdersView,
+      loadRecentOrdersView: loadRecentOrdersView,
+      roDecorate: roDecorate,
+      roShortTime: roShortTime,
+      roRowHTML: roRowHTML,
+      renderRecentOrdersView: renderRecentOrdersView,
+      roPageNumbersHTML: roPageNumbersHTML,
+      selectRoPageSize: selectRoPageSize,
+      changeRoPage: changeRoPage,
+      roOwnerTap: roOwnerTap,
+      roPriceTap: roPriceTap,
+      roPerPageInitial: roPerPageInitial,
+      toggleRoPageSizePicker: toggleRoPageSizePicker,
+      closeRoPageSizePickerIfOpen: closeRoPageSizePickerIfOpen,
+      PER_PAGE_KEY: RO_PER_PAGE_KEY,
     };
   `;
   const sandbox = {
@@ -171,8 +242,8 @@ function loadOrdersModule() {
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
-  vm.runInContext(prelude + '\n' + block + '\n' + harness, sandbox, { filename: 'recentOrders(extracted)' });
-  return { H: vm.runInContext('__H', sandbox), block };
+  vm.runInContext(prelude + '\n' + rosJs + '\n' + harness, sandbox, { filename: 'recent-orders(web)' });
+  return vm.runInContext('__H', sandbox);
 }
 
 const ORDER = {
@@ -189,250 +260,196 @@ const ORDER = {
   is_admin_print: true,
 };
 
-(async () => {
-  const loaded = loadOrdersModule();
-  if (!loaded) {
-    check('可从 me.js 抽取近 N 条订单区块', false);
-    console.log('\n❌ 1 项失败');
-    process.exit(1);
-    return;
-  }
-  const H = loaded.H;
+const tick = () => new Promise((r) => setTimeout(r, 0));
 
-  section('三、可见性与请求时机');
+(async () => {
+  const H = loadRecentOrdersViewModule();
+
+  section('五、可见性与请求契约');
   H.setRole('user');
   H.reset();
-  H.setResponse({ data: { success: true, limit: 10, orders: [ORDER] } });
-  let ok = await H.loadRecentOrders();
-  check('① 普通用户：不发请求（role !== admin 直接 return）', H.calls().length === 0 && ok === false);
-
-  H.setRole('guest');
-  await H.loadRecentOrders();
-  check('② 游客：同样不发请求', H.calls().length === 0);
+  H.openRecentOrdersView();
+  check('① 非管理员：noPermission 空态，不发请求',
+        H.roState.noPermission === true && H.calls().length === 0, 'calls=' + H.calls().length);
+  check('② 非管理员：仍进入子视图（而不是停在「我」页）',
+        H.views().length === 1 && H.views()[0].id === 'view-recent-orders',
+        JSON.stringify(H.views()[0]));
+  check('③ 空态节点显示、列表区隐藏',
+        H.els.roNoPermission.style.display === '' && H.els.roSection.style.display === 'none');
 
   H.setRole('admin');
+  H.setResponse({ status: 200, data: { success: true, total: 45, orders: [ORDER] } });
   H.reset();
-  await H.loadRecentOrders();
-  check('③ 管理员：恰好发一次 GET /api/admin/recent_orders',
-        H.calls().length === 1 && H.calls()[0].path === '/api/admin/recent_orders',
-        JSON.stringify(H.calls().map(c => c.path)));
+  H.openRecentOrdersView();
+  await tick();
+  check('④ 管理员：进入即拉第 1 页（page/per_page 上屏）',
+        H.calls().length === 1 && H.calls()[0].path === '/api/admin/recent_orders?page=1&per_page=20',
+        JSON.stringify(H.calls().map((c) => c.path)));
+  check('⑤ 标题传「最近订单」', H.views()[0].title === '最近订单');
+  check('⑥ total=45 / perPage=20 → 3 页',
+        H.roState.total === 45 && H.roState.totalPages === 3, H.roState.totalPages + '');
+  check('⑦ 汇总文案「共 45 条 · 第 1/3 页」',
+        H.els.roSummaryText.textContent === '共 45 条 · 第 1/3 页', H.els.roSummaryText.textContent);
+  check('⑧ 行数据留在 roState.orders（价格/原因气泡反查）',
+        H.roState.orders.length === 1, 'orders=' + H.roState.orders.length);
 
-  section('四、渲染内容');
-  const box = H.els.recentOrderList;
-  const title = H.els.recentOrdersTitle;
-  const count = H.els.recentOrderCount;
-  check('① 标题显示后端给的 N（10）', title.textContent === '近 10 条订单', title.textContent);
-  check('② 数量徽标显示条数并恢复显示',
-        count.textContent === '1' && count.style.display === '', `${count.textContent}/${count.style.display}`);
-  check('③ 渲染出 1 行订单', (box.innerHTML.match(/recent-order-row/g) || []).length === 1);
-
-  check('④ 归属人显示脱敏名 owner_masked', box.innerHTML.includes('>张*</text>'),
-        (box.innerHTML.match(/recent-order-owner[^>]*>[^<]*/) || [''])[0]);
-  check('⑤ 行内 data-owner-full 带真名（点击才显示，不一开始就露出）',
-        /data-owner-full="&lt;b&gt;张三&lt;\/b&gt;"/.test(box.innerHTML),
+  section('六、渲染内容');
+  const box = H.els.roList;
+  check('① 渲染 1 行 .ro-row', (box.innerHTML.match(/ro-row"/g) || []).length >= 1);
+  check('② 订单号上屏', box.innerHTML.indexOf('HN20261102001') >= 0);
+  check('③ 归属人显示脱敏名', box.innerHTML.indexOf('👤 张*') >= 0,
+        (box.innerHTML.match(/ro-owner[^>]*>[^<]*/) || [''])[0]);
+  check('④ 真名进 data-owner-full 且被转义', /data-owner-full="&lt;b&gt;张三&lt;\/b&gt;"/.test(box.innerHTML),
         (box.innerHTML.match(/data-owner-full="[^"]*"/) || [''])[0]);
-  check('⑥ 真名被 escHtml 转义（不会当 HTML 执行）', !box.innerHTML.includes('<b>张三</b>'));
-  check('⑦ 时间格式化成 MM-DD HH:MM', box.innerHTML.includes('11-02 10:05'));
-  check('⑧ 状态用中文标签 + 既有 status class',
-        /recent-order-status status-sent">已完成</.test(box.innerHTML),
-        (box.innerHTML.match(/recent-order-status[^>]*>[^<]*/) || [''])[0]);
-  check('⑨ 价格两位小数 + ¥', box.innerHTML.includes('¥12.30'),
-        (box.innerHTML.match(/¥[\d.]+/) || [''])[0]);
-  check('⑩ 价格行带 data-recent-price（用于复用复制气泡）',
-        /data-recent-price="ord-1"/.test(box.innerHTML));
-  check('⑪ 价格旁有既有 📋 图标', box.innerHTML.includes('price-copy-icon'));
-  check('⑫ meta 拼出 文件数/页数/管理员自打/来源',
-        box.innerHTML.includes('3 个文件 · 5 页 · 管理员自打 · 云端'),
-        (box.innerHTML.match(/recent-order-meta">([^<]*)/) || [''])[1]);
-  check('⑬ 数据登记进 meState（供 _priceOrderById 回查）',
-        H.meState.recentOrders.length === 1 && String(H.meState.recentOrders[0].id) === 'ord-1');
+  check('⑤ 真名不会当 HTML 执行', box.innerHTML.indexOf('<b>张三</b>') < 0);
+  check('⑥ 时间 MM-DD HH:MM', box.innerHTML.indexOf('11-02 10:05') >= 0);
+  check('⑦ 状态中文 + status class', /order-status status-sent">已完成</.test(box.innerHTML),
+        (box.innerHTML.match(/order-status[^>]*>[^<]*/) || [''])[0]);
+  check('⑧ 金额两位小数', box.innerHTML.indexOf('¥12.30') >= 0);
+  check('⑨ 金额行带 data-ro-price（点击复制）', /data-ro-price="ord-1"/.test(box.innerHTML));
+  check('⑩ 文件数·页数 meta', box.innerHTML.indexOf('3 文件 · 5 页') >= 0);
+  check('⑪ 管理员自打徽标', box.innerHTML.indexOf('ro-self-badge') >= 0);
 
-  section('五、复制价格复用既有气泡');
-  const hit = H._priceOrderById('ord-1');
-  check('① _priceOrderById 能在近 N 条订单池里命中（openPricePop 才不 return）', !!hit,
-        JSON.stringify(hit && { id: hit.id, n: hit.order_number }));
-  check('② 命中项带 order_number / total_price（气泡两种文案都靠它）',
-        hit && hit.order_number === 'HN20261102001' && H._priceOrderTotal(hit) === 12.3);
-  check('③ 气泡依赖的 copyText 文案未被改写（已复制价格 / 已复制详细价格）',
-        meJs.includes("'已复制价格'") && meJs.includes("'已复制详细价格'"));
+  section('七、边界：空列表 / 失败 / 无 total');
+  H.setResponse({ status: 200, data: { success: true, total: 0, orders: [] } });
+  await H.loadRecentOrdersView();
+  check('① 空列表显示空态文案，汇总隐藏',
+        H.els.roList.innerHTML.indexOf('还没有订单') >= 0 && H.els.roSummary.style.display === 'none');
+  check('② 空列表时 totalPages 兜底 1', H.roState.totalPages === 1);
 
-  section('六、边界：limit 缺省 / 空列表 / 失败保留 / 并发去重');
-  H.reset();
-  H.setResponse({ data: { success: true, orders: [ORDER] } });
-  await H.loadRecentOrders();
-  check('① 响应没给 limit 时兜底 10', H.els.recentOrdersTitle.textContent === '近 10 条订单',
-        H.els.recentOrdersTitle.textContent);
+  H.setResponse({ status: 200, data: { success: true, orders: [ORDER] } });
+  await H.loadRecentOrdersView();
+  check('③ 后端不给 total：退化为本页条数、单页',
+        H.roState.total === 1 && H.roState.totalPages === 1);
 
-  H.reset();
-  H.setResponse({ data: { success: true, limit: 25, orders: [] } });
-  await H.loadRecentOrders();
-  check('② N 跟随后端（25）', H.els.recentOrdersTitle.textContent === '近 25 条订单');
-  check('③ 空列表显示「暂无订单」并隐藏数量徽标',
-        H.els.recentOrderList.innerHTML.includes('暂无订单') && H.els.recentOrderCount.style.display === 'none',
-        H.els.recentOrderList.innerHTML.trim());
+  H.setResponse({ status: 500, data: { success: false, message: '仅管理员可见' } });
+  await H.loadRecentOrdersView();
+  check('④ 失败写内联提示（不弹遮罩）',
+        H.els.roList.innerHTML.indexOf('仅管理员可见') >= 0, H.els.roList.innerHTML.slice(0, 80));
 
+  section('八、分页交互');
+  H.setResponse({ status: 200, data: { success: true, total: 45, orders: [ORDER] } });
+  H.roState.perPage = 20;
+  H.roState.page = 1;
+  H.roState.totalPages = 3;
   H.reset();
-  H.setResponse({ data: { success: true, limit: 7, orders: [ORDER] } });
-  await H.loadRecentOrders();
-  const beforeTitle = H.els.recentOrdersTitle.textContent;
-  const beforeHtml = H.els.recentOrderList.innerHTML;
+  H.changeRoPage(3);
+  await tick();
+  check('① 跳第 3 页发 page=3',
+        H.calls().length === 1 && H.calls()[0].path.indexOf('page=3') >= 0,
+        JSON.stringify(H.calls().map((c) => c.path)));
+  check('② 回顶（滚动引擎收到 scrollTo）', !!H.scrollEngine()._scrolled,
+        JSON.stringify(H.scrollEngine()._scrolled));
   H.reset();
-  H.setResponse({ data: { success: false } });
-  const bad = await H.loadRecentOrders();
-  check('④ 失败（success:false）返回 false 且保留旧数据/旧标题',
-        bad === false && H.els.recentOrdersTitle.textContent === beforeTitle &&
-        H.els.recentOrderList.innerHTML === beforeHtml,
-        'title=' + H.els.recentOrdersTitle.textContent);
+  H.changeRoPage(9);
+  await tick();
+  check('③ 越界页码不发请求', H.calls().length === 0);
+  H.reset();
+  H.changeRoPage(3);
+  await tick();
+  check('④ 点当前页不发请求（不重复拉）', H.calls().length === 0);
 
   H.reset();
-  H.setResponse({ data: { success: true, limit: 10, orders: [ORDER] } });
-  const p1 = H.loadRecentOrders();
-  const p2 = H.loadRecentOrders();
-  await Promise.all([p1, p2]);
-  check('⑤ 并发调用只发一次请求（loading 去重）', H.calls().length === 1, 'calls=' + H.calls().length);
-  check('⑥ 请求结束后 loading 复位', H.meState.recentOrdersLoading === false);
+  H.selectRoPageSize(50);
+  await tick();
+  check('⑤ 切条数：perPage=50、回到第 1 页',
+        H.roState.perPage === 50 && H.roState.page === 1, H.roState.perPage + '/' + H.roState.page);
+  check('⑥ 切条数写 localStorage（下次进入沿用）', H.storage[H.PER_PAGE_KEY] === '50',
+        JSON.stringify(H.storage));
+  check('⑦ 切条数后按新 per_page 重拉', H.calls().length === 1 && H.calls()[0].path.indexOf('per_page=50') >= 0,
+        JSON.stringify(H.calls().map((c) => c.path)));
+  H.reset();
+  H.selectRoPageSize(33);
+  await tick();
+  check('⑧ 非法条数被忽略（白名单 10/20/50/100）', H.calls().length === 0 && H.roState.perPage === 50);
+
+  section('九、页码算法');
+  H.roState.totalPages = 3;
+  H.roState.page = 2;
+  const p3 = H.roPageNumbersHTML();
+  check('① 3 页全列（1/2/3）',
+        p3.indexOf('data-ro-page="1"') >= 0 && p3.indexOf('data-ro-page="2"') >= 0
+        && p3.indexOf('data-ro-page="3"') >= 0);
+  check('② 当前页高亮 page-num-active', /page-num page-num-active" data-ro-page="2"/.test(p3),
+        (p3.match(/page-num-active[^>]*>[^<]*/) || [''])[0]);
+  H.roState.totalPages = 10;
+  H.roState.page = 5;
+  const p10 = H.roPageNumbersHTML();
+  check('③ 多页折叠成 1 … 4 5 6 … 10',
+        p10.indexOf('data-ro-page="1"') >= 0 && p10.indexOf('data-ro-page="10"') >= 0
+        && p10.indexOf('page-ellipsis') >= 0
+        && p10.indexOf('data-ro-page="4"') >= 0 && p10.indexOf('data-ro-page="6"') >= 0,
+        (p10.match(/data-ro-page="\d+"/g) || []).join(','));
+  check('④ 折叠时不列 3/7', p10.indexOf('data-ro-page="3"') < 0 && p10.indexOf('data-ro-page="7"') < 0);
+
+  section('十、行交互（价格复制 / 归属人 / 异常原因）');
+  H.roState.orders = [H.roDecorate(Object.assign({}, ORDER, { status: 'failed', total_price: 3.5 }))];
+  H.roState.page = 1;
+  H.roState.totalPages = 1;
+  H.renderRecentOrdersView();
+  const failedHtml = H.els.roList.innerHTML;
+  check('① 异常状态可点（status-reason-tap + data-ro-status）',
+        failedHtml.indexOf('status-reason-tap') >= 0 && /data-ro-status="ord-1"/.test(failedHtml));
+  check('② 异常状态带 ⓘ 提示', failedHtml.indexOf('ⓘ') >= 0);
+  check('③ timeout 中文标签 = 超时',
+        H.roRowHTML(Object.assign({}, ORDER, { status: 'timeout' })).indexOf('超时') >= 0);
+  check('④ 正常状态不可点',
+        H.roRowHTML(Object.assign({}, ORDER, { status: 'sent' })).indexOf('status-reason-tap') < 0);
 
   H.reset();
-  H.setResponse({ data: { success: true, limit: 10, orders: [{ ...ORDER, created_at: '难以解析' }] } });
-  await H.loadRecentOrders();
-  check('⑦ 时间解析不了时原样显示（不显示空白）',
-        H.els.recentOrderList.innerHTML.includes('难以解析'));
-
-  /* ============================================================
-     七、超管设置 N（用户原话「近{超管设置的数字（默认10）}条订单」）
-     ============================================================ */
-  section('七、超管设置 N：静态接线与契约');
-  check('① index.html 有「设置」入口 #recentOrderLimitEntry（默认隐藏）',
-        /id="recentOrderLimitEntry"[^>]*style="display:\s*none"/.test(html) ||
-        /style="display:\s*none"[^>]*id="recentOrderLimitEntry"/.test(html));
-  const blockHtml = (html.match(/<view class="license-section admin-collapsible" id="recentOrdersBlock">[\s\S]*?<view class="recent-orders-card"/) || [''])[0];
-  check('② 入口在「近 N 条订单」卡片内、标题栏里',
-        blockHtml.includes('recentOrderLimitEntry') && blockHtml.indexOf('recentOrderLimitEntry') > blockHtml.indexOf('section-title'));
-  check('③ 步进器 #recentOrderLimitEditor 与 ± 步进按钮在同一卡片内',
-        blockHtml.includes('recentOrderLimitEditor') &&
-        (blockHtml.match(/data-limit-step="-1"/g) || []).length === 1 &&
-        (blockHtml.match(/data-limit-step="1"/g) || []).length === 1);
-  check('④ 步进器有保存/取消与数值位', blockHtml.includes('recentOrderLimitSave') &&
-        blockHtml.includes('recentOrderLimitCancel') && blockHtml.includes('recentOrderLimitValue'));
-
-  /* 只截「超管设置 N」自己那段源码做静态判据，避免全文其它地方的同名写法干扰 */
-  const limitSrc = (meJs.match(/\/\* ---------- 超管设置 N[\s\S]*?\/\* ================= 合计价格复制/) || [''])[0];
-  /* 去掉注释再判：注释里正写着「不能写 role === 'super_admin'」这种反例说明 */
-  const limitCode = limitSrc.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  check('⑤ 超管判据用 state.isSuperAdmin（不是 role === "super_admin"）',
-        /state\.isSuperAdmin/.test(limitCode) && !/role\s*===?\s*'super_admin'/.test(limitCode),
-        (limitCode.match(/state\.isSuperAdmin/g) || []).length + ' 处');
-  check('⑥ POST 路径 /api/admin/recent_orders_limit + method POST + body 字段名 limit',
-        limitSrc.includes("api('/api/admin/recent_orders_limit'") &&
-        /method:\s*'POST'/.test(limitSrc) &&
-        /JSON\.stringify\(\{\s*limit:\s*limit\s*\}\)/.test(limitSrc));
-  check('⑦ 1..100 的边界写死在前端（越界先夹紧再发）',
-        /RECENT_ORDER_LIMIT_MIN\s*=\s*1/.test(limitSrc) && /RECENT_ORDER_LIMIT_MAX\s*=\s*100/.test(limitSrc));
-  check('⑧ 不弹遮罩：这段不用 openModal / modal-mask，只用 showToast',
-        !/openModal|modal-mask|price-pop-mask/.test(limitSrc));
-  check('⑨ 入口/步进器的事件绑定在 setupMeButtons 里',
-        /getElementById\('recentOrderLimitEntry'\)[\s\S]{0,200}?addEventListener\('click'/.test(meJs) &&
-        /getElementById\('recentOrderLimitEditor'\)[\s\S]{0,300}?addEventListener\('click'/.test(meJs));
-  check('⑩ styles.css 有入口/步进器样式', /\.recent-order-limit-entry\s*\{/.test(fs.readFileSync(path.join(APP_WWW, 'styles.css'), 'utf8')));
-
-  section('八、超管设置 N：行为');
+  H.roPriceTap('ord-1');
+  check('⑤ 点金额复制 `订单号 — ¥金额`',
+        H.copied().length === 1 && H.copied()[0].text === 'HN20261102001 — ¥3.50',
+        JSON.stringify(H.copied()[0] || {}));
+  check('⑥ 复制 toast「已复制价格」', (H.copied()[0] || {}).msg === '已复制价格');
   H.reset();
-  H.setRole('admin');
-  H.setSuper(false);
-  H.meState.recentOrdersLimit = 10;
-  H.renderRecentOrderLimitEditor();
-  check('① 非超管：入口 display:none', H.els.recentOrderLimitEntry.style.display === 'none',
-        'display=' + H.els.recentOrderLimitEntry.style.display);
-  H.openRecentOrdersLimitEditor(true);
-  check('② 非超管：点了也打不开步进器', H.meState.recentOrdersLimitEditing === false &&
-        H.els.recentOrderLimitEditor.style.display === 'none');
+  H.roPriceTap('ord-404');
+  check('⑦ 未知订单不复制（不误写剪贴板）', H.copied().length === 0);
+
+  const ownerEl = { dataset: { ownerFull: '张三（真名）', ownerMasked: '张*' }, textContent: '👤 张*' };
+  H.roOwnerTap(ownerEl);
+  check('⑧ 点归属人切到真名', ownerEl.textContent === '👤 张三（真名）', ownerEl.textContent);
+  H.roOwnerTap(ownerEl);
+  check('⑨ 再点切回脱敏名', ownerEl.textContent === '👤 张*', ownerEl.textContent);
+
+  section('十一、时间格式化');
+  check('① ISO 时间 → MM-DD HH:MM', H.roShortTime('2026-11-02T10:05:31') === '11-02 10:05',
+        H.roShortTime('2026-11-02T10:05:31'));
+  check('② 空格分隔也认', H.roShortTime('2026-11-02 10:05') === '11-02 10:05');
+  check('③ 解析不了原样返回', H.roShortTime('难以解析') === '难以解析');
+  check('④ 空值给空串', H.roShortTime(null) === '');
+  const dec = H.roDecorate({ order_id: 9, total_price: '4.5', status: 'queued' });
+  check('⑤ roDecorate 补 id（供 _priceOrderById 反查）', dec.id === 9);
+  check('⑥ 金额两位小数', dec.priceDisplay === '4.50', dec.priceDisplay);
+  check('⑦ 无归属人显示 —', dec.ownerText === '—', dec.ownerText);
+  check('⑧ meta 用 0 兜底', dec.statText === '0 文件 · 0 页', dec.statText);
+
+  section('十二、条数下拉（fixed，逃出 transform 层）');
+  H.roState.perPage = 20;
+  H.roState.showPageSizePicker = false;
   H.reset();
-  const denied = await H.saveRecentOrdersLimit();
-  check('③ 非超管：不会发 POST（后端 403 也不会被触发）', denied === false && H.calls().length === 0);
+  H.toggleRoPageSizePicker();
+  check('① 打开下拉走 openDropdownFixed（不靠 absolute）', H.ddOpened().length === 1);
+  check('② 状态置为展开、文案同步', H.roState.showPageSizePicker === true
+        && H.els.roPageSizeText.textContent === '20条/页', H.els.roPageSizeText.textContent);
+  H.closeRoPageSizePickerIfOpen();
+  check('③ 退出时收起', H.roState.showPageSizePicker === false);
 
-  H.setSuper(true);
-  H.renderRecentOrderLimitEditor();
-  check('④ 超管：入口显示', H.els.recentOrderLimitEntry.style.display === '');
-  H.openRecentOrdersLimitEditor(true);
-  check('⑤ 超管：点开步进器，数值初值 = 当前 N',
-        H.els.recentOrderLimitEditor.style.display === '' &&
-        H.els.recentOrderLimitValue.textContent === '10',
-        H.els.recentOrderLimitValue.textContent);
-
-  H.stepRecentOrdersLimit(1);
-  check('⑥ + 一次 = 11', H.els.recentOrderLimitValue.textContent === '11');
-  H.stepRecentOrdersLimit(-1);
-  check('⑦ − 一次回到 10', H.els.recentOrderLimitValue.textContent === '10');
-  H.meState.recentOrdersLimitDraft = 100;
-  H.stepRecentOrdersLimit(1);
-  check('⑧ 上界 100 夹紧', H.meState.recentOrdersLimitDraft === 100);
-  H.meState.recentOrdersLimitDraft = 1;
-  H.stepRecentOrdersLimit(-1);
-  check('⑨ 下界 1 夹紧', H.meState.recentOrdersLimitDraft === 1);
-  check('⑩ 非法值兜底为 1', H._clampRecentOrdersLimit('abc') === 1);
-  check('⑪ 小数四舍五入', H._clampRecentOrdersLimit('7.6') === 8);
-
-  /* 保存成功：POST 用返回 limit 刷新标题、收起编辑器、再按新 N 重拉一次列表 */
-  H.reset();
-  H.meState.recentOrdersLimitDraft = 12;
-  H.meState.recentOrdersLimitEditing = true;
-  H.setResponse({ data: { success: true, limit: 12, range: [1, 100], message: '已更新为最近 12 条' } });
-  const okSave = await H.saveRecentOrdersLimit();
-  const post = H.calls()[0];
-  check('⑫ 保存发 POST 且 body 为 {"limit":12}',
-        !!post && post.path === '/api/admin/recent_orders_limit' && post.opts.method === 'POST' &&
-        post.opts.body === JSON.stringify({ limit: 12 }),
-        post ? post.opts.body : 'no call');
-  check('⑬ 保存成功后编辑器收起', H.meState.recentOrdersLimitEditing === false &&
-        H.els.recentOrderLimitEditor.style.display === 'none');
-  check('⑭ 保存成功用返回的 limit 立刻刷新标题', H.els.recentOrdersTitle.textContent === '近 12 条订单',
-        H.els.recentOrdersTitle.textContent);
-  check('⑮ 保存成功 toast 用后端 message',
-        H.toasts().some(t => /已更新为最近 12 条/.test(t.msg)), H.toasts().map(t => t.msg).join(' | '));
-  check('⑯ 保存成功后再按新 N 拉一次列表（POST + GET 共 2 次）',
-        H.calls().length === 2 && H.calls()[1].path === '/api/admin/recent_orders',
-        H.calls().map(c => c.path).join(','));
-  check('⑰ 返回值 true', okSave === true);
-
-  /* 保存失败（403）：保持旧值、不关编辑器、不重拉 */
-  H.reset();
-  H.meState.recentOrdersLimit = 12;
-  H.meState.recentOrdersLimitDraft = 30;
-  H.meState.recentOrdersLimitEditing = true;
-  H.setResponse({ status: 403, data: { success: false, message: '仅超级管理员可修改' } });
-  const badSave = await H.saveRecentOrdersLimit();
-  check('⑱ 保存失败返回 false', badSave === false);
-  check('⑲ 保存失败保持旧 N（不进 meState.recentOrdersLimit）', H.meState.recentOrdersLimit === 12);
-  check('⑳ 保存失败不重拉列表（只发了一次 POST）',
-        H.calls().length === 1, H.calls().map(c => c.path).join(','));
-  check('㉑ 保存失败编辑器仍开着（方便改个数重试）', H.meState.recentOrdersLimitEditing === true);
-  check('㉒ 保存失败只轻提示，用后端 message',
-        H.toasts().some(t => /仅超级管理员可修改/.test(t.msg)), H.toasts().map(t => t.msg).join(' | '));
-
-  /* 身份降级：入口/编辑器立刻收回 */
-  H.setSuper(false);
-  H.renderRecentOrderLimitEditor();
-  check('㉓ 掉超管身份后入口收回且编辑器强制关闭',
-        H.els.recentOrderLimitEntry.style.display === 'none' &&
-        H.meState.recentOrdersLimitEditing === false &&
-        H.els.recentOrderLimitEditor.style.display === 'none');
-
-  /* ===== 九、生成器模板同步（防止重跑 wxss2web.mjs 静默抹掉卡片样式）===== */
-  section('九、生成器模板同步');
+  /* ===== 十三、生成器模板同步（防止重跑 wxss2web.mjs 静默抹掉卡片样式）===== */
+  section('十三、生成器模板同步');
   const GEN = path.join(REPO, 'mobile_apps', 'android_app', 'tools', 'wxss2web.mjs');
   const genSrc = fs.readFileSync(GEN, 'utf8');
-  check('㉔ 生成器模板里有 .recent-orders-card（重跑生成器不会抹掉卡片样式）',
+  check('① 生成器模板里有 .recent-orders-card（重跑生成器不会抹掉卡片样式）',
         genSrc.includes('.recent-orders-card {'));
-  check('㉕ 生成器模板里有 .recent-order-limit-entry（超管设置入口样式）',
+  check('② 生成器模板里有 .recent-order-limit-entry（超管设置入口样式）',
         genSrc.includes('.recent-order-limit-entry {'));
-  check('㉖ 生成器模板里有 .device-state-stack-pending（离线待应用徽标）',
+  check('③ 生成器模板里有 .device-state-stack-pending（离线待应用徽标）',
         genSrc.includes('.device-state-stack-pending {'));
-  check('㉗ 生成器模板里有 .recent-order-row / -meta / -price / -empty 全套',
+  check('④ 生成器模板里有 .recent-order-row / -meta / -price / -empty 全套',
         ['.recent-order-row {', '.recent-order-meta {', '.recent-order-price {', '.recent-order-empty {']
           .every((s) => genSrc.includes(s)));
-  // 模板是 JS 模板字符串：注释里出现反引号会提前闭合模板，生成器直接语法错
   const genWheelSeg = genSrc.slice(genSrc.indexOf('.time-wheel-row {'), genSrc.indexOf('.wheel-indicator {'));
-  check('㉘ 生成器模板滚轮段内没有反引号（模板字符串安全）',
+  check('⑤ 生成器模板滚轮段内没有反引号（模板字符串安全）',
         genWheelSeg.length > 0 && genWheelSeg.indexOf('`') === -1);
 
   console.log('\n' + (failures === 0 ? '✅ 全部通过' : `❌ ${failures} 项失败`));

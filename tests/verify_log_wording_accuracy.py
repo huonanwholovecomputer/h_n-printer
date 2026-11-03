@@ -112,7 +112,7 @@ check("……不再出现「或」（不糊成二选一）", "或" not in r_auto
 win._printer_profile = lambda: PrinterProfile()          # 空档案 = 能力未确认
 r_un = win._stack_inapplicable_reason()
 check("能力未确认 → 说「双面能力未确认」并指路去盖章",
-      "双面能力未确认" in r_un and "帮助 → 打印机双面能力" in r_un, r_un)
+      "双面能力未确认" in r_un and "选项 → 打印机双面能力" in r_un, r_un)
 check("……两句原因互不相同（没被糊成一句）", r_auto != r_un)
 
 win._printer_profile = lambda: PrinterProfile(auto_duplex=False, manual_duplex=True)

@@ -1,0 +1,509 @@
+/* pages/recent-orders/recent-orders.wxss */
+/* 「最近订单」独立页（#3）：列表 + 分页 + 异常原因气泡（#9）+ 复制价格（#5）。
+   样式刻意与「我」页同族（同一套卡片/状态色/气泡），只是这里是独立页面。 */
+
+/* ── 滚动引擎三件套（与 user-orders 一致；scroll-content 不加 will-change） ── */
+.scroller {
+  flex: 1;
+  height: 100vh;
+  overflow: hidden;
+  position: relative;
+  min-height: 0;
+  background-color: var(--bg-primary);
+}
+
+.scroll-content {
+}
+
+.container {
+  padding: 20rpx 32rpx;
+  padding-bottom: calc(60rpx + env(safe-area-inset-bottom));
+  box-sizing: border-box;
+}
+
+.tap-active {
+  opacity: 0.62;
+}
+
+/* ── 顶部汇总 ── */
+.ro-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20rpx;
+}
+
+.ro-summary-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ro-summary-title {
+  font-size: 34rpx;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+.ro-summary-meta {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  margin-top: 6rpx;
+}
+
+.ro-refresh {
+  flex-shrink: 0;
+  font-size: 24rpx;
+  color: var(--blue);
+  padding: 10rpx 20rpx;
+  border-radius: 999rpx;
+  background-color: rgba(0, 122, 255, 0.08);
+}
+
+/* ── 分页条 ── */
+.ro-pagebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16rpx;
+  margin-bottom: 18rpx;
+}
+
+.ro-pagebar-bottom {
+  margin-top: 24rpx;
+  margin-bottom: 0;
+  padding-top: 18rpx;
+  border-top: 1rpx solid var(--separator);
+}
+
+.ro-pagesize {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6rpx;
+  font-size: 22rpx;
+  color: var(--text-secondary);
+  background-color: var(--bg-card);
+  border: 1rpx solid var(--separator);
+  border-radius: 14rpx;
+  padding: 10rpx 16rpx;
+}
+
+.ro-pagesize-caret {
+  font-size: 18rpx;
+  color: var(--text-tertiary);
+}
+
+/* 下拉挂在 .ro-pagesize 上：分页条在页面顶部，向下展开不会被 .scroller 的 overflow 裁到 */
+.ro-pagesize-menu {
+  position: absolute;
+  top: calc(100% + 8rpx);
+  left: 0;
+  z-index: 20;
+  min-width: 100%;
+  padding: 8rpx 0;
+  border-radius: 16rpx;
+  background-color: var(--bg-card);
+  border: 1rpx solid var(--separator);
+  box-shadow: 0 12rpx 32rpx rgba(0, 0, 0, 0.14);
+}
+
+.ro-pagesize-item {
+  padding: 14rpx 24rpx;
+  font-size: 24rpx;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.ro-pagesize-item.is-active {
+  color: var(--blue);
+  font-weight: 600;
+  background-color: rgba(0, 122, 255, 0.08);
+}
+
+.ro-page-nav {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  min-width: 0;
+}
+
+.ro-page-btn {
+  flex-shrink: 0;
+  font-size: 22rpx;
+  color: var(--text-secondary);
+  background-color: var(--bg-card);
+  border: 1rpx solid var(--separator);
+  border-radius: 14rpx;
+  padding: 10rpx 16rpx;
+}
+
+.ro-page-btn.is-disabled {
+  opacity: 0.38;
+}
+
+.ro-page-numbers {
+  display: flex;
+  align-items: center;
+  gap: 6rpx;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ro-page-num {
+  min-width: 46rpx;
+  height: 46rpx;
+  line-height: 46rpx;
+  text-align: center;
+  font-size: 22rpx;
+  border-radius: 12rpx;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
+.ro-page-num.is-active {
+  background-color: var(--blue);
+  color: #fff;
+  font-weight: 600;
+}
+
+.ro-page-num.is-gap {
+  color: var(--text-quaternary);
+}
+
+.ro-page-indicator {
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+
+/* ── 列表 ── */
+.ro-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14rpx;
+}
+
+.ro-row {
+  background-color: var(--bg-card);
+  border-radius: 20rpx;
+  padding: 22rpx 24rpx;
+  box-shadow: var(--shadow-sm, 0 2rpx 10rpx rgba(0, 0, 0, 0.05));
+}
+
+.ro-row-line1 {
+  display: flex;
+  align-items: center;
+  gap: 10rpx;
+  min-width: 0;
+}
+
+.ro-order-no {
+  font-family: var(--font-mono);
+  font-size: 23rpx;
+  font-weight: 600;
+  color: var(--blue);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.ro-self-badge {
+  flex-shrink: 0;
+  font-size: 19rpx;
+  font-weight: 600;
+  padding: 3rpx 12rpx;
+  border-radius: 18rpx;
+  background-color: rgba(30, 102, 245, 0.10);
+  color: #1e66f5;
+}
+
+.ro-row-line2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12rpx;
+  margin-top: 10rpx;
+  font-size: 22rpx;
+  color: var(--text-secondary);
+}
+
+.ro-owner {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.ro-time {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 20rpx;
+  color: var(--text-quaternary);
+}
+
+.ro-row-line3 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12rpx;
+  margin-top: 10rpx;
+}
+
+.ro-stat {
+  font-size: 21rpx;
+  color: var(--text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.ro-price-tap {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 26rpx;
+  font-weight: 700;
+  color: var(--text-primary);
+  padding: 2rpx 8rpx;
+  border-radius: 8rpx;
+}
+
+/* ── 状态标签（页面级 wxss，必须自己带一份，「我」页的样式不外溢） ── */
+.order-status {
+  font-size: 20rpx;
+  font-weight: 600;
+  padding: 4rpx 14rpx;
+  border-radius: 20rpx;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.status-queued    { background-color: #FFF3E0; color: #E65100; }
+.status-printing  { background-color: #E3F2FD; color: #1565C0; }
+.status-accepted  { background-color: #E3F2FD; color: #1565C0; }
+.status-offline_unknown { background-color: #FFF8E1; color: #F57F17; }
+.status-sent      { background-color: #E8F5E9; color: #2E7D32; }
+.status-failed    { background-color: #FFEBEE; color: #C62828; }
+/* 超时：橙/琥珀，与 failed 的红区分（超时可重试，失败是已定结果） */
+.status-timeout   { background-color: #FFF3E0; color: #EF6C00; }
+.status-abandoned { background-color: #F3E5F5; color: #7B1FA2; }
+.status-reserved  { background-color: #FFF8E1; color: #F57F17; }
+.status-rejected  { background-color: #FFF3E0; color: #E65100; }
+.status-canceled  { background-color: #F5F5F5; color: #9E9E9E; }
+.status-scheduled { background-color: #FFF8E1; color: #F57F17; }
+.status-downloading { background-color: #E3F2FD; color: #1565C0; }
+.status-waiting   { background-color: #FFF3E0; color: #E65100; }
+.status-delivered { background-color: #E8F5E9; color: #2E7D32; }
+
+/* 可点的异常状态：虚下划线告诉用户「这里能点」 */
+.status-reason-tap {
+  text-decoration: underline dashed;
+  text-underline-offset: 4rpx;
+}
+
+/* ── 空态 / 加载 ── */
+.ro-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 80rpx 40rpx;
+  background-color: var(--bg-card);
+  border-radius: 20rpx;
+}
+
+.ro-empty-icon {
+  font-size: 56rpx;
+  margin-bottom: 16rpx;
+}
+
+.ro-empty-title {
+  font-size: 27rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ro-empty-desc {
+  font-size: 22rpx;
+  line-height: 1.6;
+  color: var(--text-tertiary);
+  margin-top: 10rpx;
+}
+
+.ro-empty-btn {
+  margin-top: 22rpx;
+  font-size: 24rpx;
+  color: #fff;
+  background-color: var(--blue);
+  border-radius: 999rpx;
+  padding: 12rpx 34rpx;
+}
+
+.ro-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 80rpx 0;
+}
+
+.ro-spinner {
+  width: 44rpx;
+  height: 44rpx;
+  border-radius: 50%;
+  border: 4rpx solid var(--separator);
+  border-top-color: var(--blue);
+  animation: roSpin 0.8s linear infinite;
+}
+
+@keyframes roSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.ro-loading-text {
+  margin-top: 16rpx;
+  font-size: 22rpx;
+  color: var(--text-tertiary);
+}
+
+/* ══════════ #9 异常原因气泡 ══════════
+   fixed + z-index 10000（高于 tabBar 9999）：气泡挂在 page-root 外，
+   不受 .page-root/overflow:hidden 裁剪，也不吃 .scroll-content 的 translateY。 */
+.ro-pop-mask {
+  position: fixed;
+  inset: 0;
+  background-color: transparent;
+  z-index: 10000;
+}
+
+.ro-pop {
+  position: fixed;
+  z-index: 10001;
+  box-sizing: border-box;
+  padding: 22rpx 24rpx 20rpx;
+  border-radius: 20rpx;
+  background-color: var(--bg-card);
+  box-shadow: 0 18rpx 48rpx rgba(0, 0, 0, 0.22);
+  animation: roPopIn 0.18s ease;
+}
+
+@keyframes roPopIn {
+  from { opacity: 0; transform: translateY(6rpx) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.ro-pop-caret {
+  position: absolute;
+  width: 0;
+  height: 0;
+  margin-left: -10rpx;
+  border-left: 10rpx solid transparent;
+  border-right: 10rpx solid transparent;
+}
+
+.ro-pop-above .ro-pop-caret {
+  bottom: -8rpx;
+  border-top: 10rpx solid var(--bg-card);
+}
+
+.ro-pop-below .ro-pop-caret {
+  top: -8rpx;
+  border-bottom: 10rpx solid var(--bg-card);
+}
+
+.ro-pop-head {
+  display: flex;
+  align-items: center;
+  gap: 8rpx;
+  margin-bottom: 12rpx;
+}
+
+.ro-pop-icon {
+  font-size: 24rpx;
+}
+
+.ro-pop-title {
+  font-size: 24rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ro-pop-text-wrap {
+  max-height: 40vh;
+  margin-bottom: 16rpx;
+}
+
+.ro-pop-text {
+  font-size: 24rpx;
+  line-height: 1.6;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.ro-pop-acts {
+  display: flex;
+  gap: 12rpx;
+}
+
+.ro-pop-btn {
+  flex: 1;
+  text-align: center;
+  font-size: 24rpx;
+  font-weight: 600;
+  padding: 14rpx 0;
+  border-radius: 14rpx;
+  color: var(--text-secondary);
+  background-color: var(--bg-secondary, rgba(0, 0, 0, 0.05));
+}
+
+.ro-pop-btn.primary {
+  color: #fff;
+  background-color: var(--blue);
+}
+
+.ro-pop-btn-hover {
+  opacity: 0.72;
+}
+
+/* ── 深色模式 ── */
+.theme-dark .ro-row,
+.theme-dark .ro-empty,
+.theme-dark .ro-pagesize,
+.theme-dark .ro-page-btn,
+.theme-dark .ro-pop {
+  background-color: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.10);
+  box-shadow: none;
+}
+
+.theme-dark .ro-pagesize-menu {
+  background-color: #2a2a2e;
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+.theme-dark .ro-pop-above .ro-pop-caret { border-top-color: #2a2a2e; }
+.theme-dark .ro-pop-below .ro-pop-caret { border-bottom-color: #2a2a2e; }
+.theme-dark .ro-pop { background-color: #2a2a2e; }
+.theme-dark .ro-pop-btn { background-color: rgba(255, 255, 255, 0.10); }
+.theme-dark .ro-pop-btn.primary { background-color: var(--blue); }
+.theme-dark .ro-refresh { background-color: rgba(0, 122, 255, 0.16); }
+.theme-dark .status-queued,
+.theme-dark .status-rejected,
+.theme-dark .status-waiting,
+.theme-dark .status-timeout { background-color: rgba(255, 152, 0, 0.18); color: #FFB74D; }
+.theme-dark .status-failed { background-color: rgba(198, 40, 40, 0.20); color: #EF9A9A; }
+.theme-dark .status-sent,
+.theme-dark .status-delivered { background-color: rgba(46, 125, 50, 0.20); color: #A5D6A7; }
+.theme-dark .status-canceled { background-color: rgba(255, 255, 255, 0.10); color: #BDBDBD; }
+.theme-dark .status-printing,
+.theme-dark .status-accepted,
+.theme-dark .status-downloading { background-color: rgba(21, 101, 192, 0.20); color: #90CAF9; }
+.theme-dark .status-offline_unknown,
+.theme-dark .status-reserved,
+.theme-dark .status-scheduled { background-color: rgba(245, 127, 23, 0.18); color: #FFCC80; }
+.theme-dark .status-abandoned { background-color: rgba(123, 31, 162, 0.20); color: #CE93D8; }

@@ -1208,6 +1208,7 @@ def print_pdf(
     rotate_180: bool = False,
     rotate_slots: Optional[list[bool]] = None,
     landscape_fill: bool = True,
+    paper: str = "",
 ) -> tuple[bool, str]:
     """
     静默打印 PDF 文件。
@@ -1232,6 +1233,11 @@ def print_pdf(
                     覆盖 rotate_180。手动双面一个批次里长边/短边混排就靠它（见 _print_pdf_native）。
         landscape_fill: 横向页整页转 90° 铺满纸张（默认开；纵向纸上打横向页不再缩到 49%）。
                     打印机的纸横向进纸时可传 False。
+        paper: 纸张大小（"A4"/"A3"/"A5"/"Letter"/"Legal"/"B5"，"" = 沿用打印机默认）。
+                    跨文件类型的全局设置（需求 #11）：走 DEVMODE 的 dmPaperSize，Word/PDF/图片
+                    等所有经 pdf_printer 出纸的路径都受它约束；xlsx 另有 PageSetup.PaperSize
+                    由引擎侧设置，两处取值口径一致。SumatraPDF 降级路径无法设置纸张，
+                    会在日志里明确声明"纸张设置未生效"。
 
     Returns:
         (success, message)
@@ -1304,7 +1310,7 @@ def print_pdf(
         print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range,
                                     copies, orientation, progress_callback, dpi, pages_override,
-                                    rotate_180, rotate_slots, landscape_fill)
+                                    rotate_180, rotate_slots, landscape_fill, paper)
         if ok:
             print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
@@ -1333,6 +1339,10 @@ def print_pdf(
         if sumatra:
             print(f"[打印] 方案2: 降级为 SumatraPDF ({sumatra})")
             logger.info(f"原生 GDI 失败，降级 SumatraPDF: {sumatra}")
+            if paper:
+                logger.warning(f"SumatraPDF 降级：纸张大小 {paper} 未生效（Sumatra 命令行不支持设定纸张，"
+                               f"只能按 PDF 页面尺寸走驱动默认纸）")
+                print(f"[打印] ⚠ SumatraPDF 无法设置纸张（{paper}），本次按打印机默认纸输出")
             ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback)
             if ok:
                 print(f"[打印] ✓ 成功 ({msg})")
@@ -1344,7 +1354,7 @@ def print_pdf(
         print("[打印] 方案3: 应用层循环打印（兜底）...")
         ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies,
                                   orientation, progress_callback, dpi, pages_override, rotate_180,
-                                  rotate_slots, landscape_fill)
+                                  rotate_slots, landscape_fill, paper)
         print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
         return ok, msg
     else:
@@ -1364,6 +1374,7 @@ def print_plan_pass(
     progress_callback: Callable[[int, int], None] | None = None,
     dpi: int = 0,
     landscape_fill: bool = True,
+    paper: str = "",
 ) -> tuple[bool, str]:
     """按 manual_duplex.PrintPlan 打印第 which 趟（1/2）。
 
@@ -1380,6 +1391,7 @@ def print_plan_pass(
       本参数退化为"整趟默认/兜底"（传 False = 这一趟整体不转）。这样同一批次里长边/短边
       可以混排，不必再拆成两批各翻一次纸。
     landscape_fill：横向页整页转 90° 铺满纸张（见 plan_page_draw），随打印机档案走。
+    paper：纸张大小（"A4"/"A3"/…/""=打印机默认），见 print_pdf。
     """
     which = 2 if int(which) == 2 else 1
     slots = plan.pass_page_indices(which)
@@ -1399,6 +1411,7 @@ def print_plan_pass(
         rotate_slots=rotate_slots,
         progress_callback=progress_callback, dpi=dpi,
         landscape_fill=landscape_fill,
+        paper=paper,
     )
 
 
@@ -1416,6 +1429,7 @@ def _print_pdf_native(
     rotate_180: bool = False,
     rotate_slots: Optional[list[bool]] = None,
     landscape_fill: bool = True,
+    paper: str = "",
 ) -> tuple[bool, str]:
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
@@ -1434,6 +1448,8 @@ def _print_pdf_native(
                 只能把混排拆成两批、多翻一次纸（2026-10-27 现场 HN20261027-0004）。
     landscape_fill: 横向页要不要整页转 90° 铺满纸张（见 plan_page_draw）。默认开：
                 纵向纸上打横向页，缩放居中只占纸张 49%，读起来像"横向文件打成了竖的"。
+    paper: 纸张大小（"A4"/"A3"/"A5"/"Letter"/"Legal"/"B5"/""=驱动默认）。经 DEVMODE
+                dmPaperSize + DM_PAPERSIZE 生效，DocumentProperties 校验后回读实际值。
     """
     import fitz
 
@@ -1484,7 +1500,7 @@ def _print_pdf_native(
 
         # -- 获取配置好双面和方向的 DEVMODE --
         print(f"[GDI] 获取打印机 DEVMODE...")
-        devmode, applied_duplex = _get_printer_devmode(printer, duplex, duplex_mode, orientation)
+        devmode, applied_duplex = _get_printer_devmode(printer, duplex, duplex_mode, orientation, paper)
 
         # -- 创建打印机 DC（有 DEVMODE 则通过 win32gui.ResetDC 应用）--
         hdc = win32ui.CreateDC()
@@ -1751,7 +1767,34 @@ def _print_pdf_native(
                 pass
 
 
-def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orientation: str = ""):
+# DMPAPER_* 取值（win32con.DMPAPER_A4 等常量在部分 pywin32 版本里缺失，这里写死标准值）
+DMPAPER_BY_NAME = {
+    "A4": 9,      # DMPAPER_A4
+    "A3": 8,      # DMPAPER_A3
+    "A5": 11,     # DMPAPER_A5
+    "LETTER": 1,  # DMPAPER_LETTER
+    "LEGAL": 5,   # DMPAPER_LEGAL
+    "B5": 13,     # DMPAPER_B5
+}
+
+
+def normalize_paper_name(paper: str) -> str:
+    """纸张名归一化：去空格、转大写；接受 "A4"/"a4"/"A4(210x297)"/"B5纸" 这类写法。
+
+    返回 DMPAPER_BY_NAME 的键，不认识（含空字符串）返回 ""（= 不设纸张，沿用驱动默认）。
+    """
+    raw = (paper or "").strip().upper().replace(" ", "")
+    if not raw:
+        return ""
+    for name in DMPAPER_BY_NAME:
+        if raw == name or raw.startswith(name + "(") or raw.startswith(name + "（") \
+                or raw.startswith(name + "纸"):
+            return name
+    return ""
+
+
+def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orientation: str = "",
+                         paper: str = ""):
     """
     获取并配置打印机的 DEVMODE 结构。
 
@@ -1760,6 +1803,7 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orien
         duplex: 'on' | 'off'
         duplex_mode: 'long-edge' | 'short-edge'
         orientation: 'portrait' | 'landscape' | '' (空=使用默认)
+        paper: 'A4' | 'A3' | 'A5' | 'Letter' | 'Legal' | 'B5' | '' (空=沿用驱动默认纸张)
 
     Returns:
         (devmode, applied_duplex)
@@ -1805,12 +1849,29 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orien
                 devmode.Fields |= win32con.DM_ORIENTATION  # P1-8: 显式置位方向字段
             new_orient = getattr(devmode, 'Orientation', 0)
 
+            # -- 纸张大小设置（跨文件类型全局设置，需求 #11）--
+            # dmPaperSize + DM_PAPERSIZE：Word/PDF/图片等所有经 pdf_printer 出纸的路径
+            # 都受这一个字段约束；xlsx 走 PageSetup.PaperSize（引擎侧），取值口径相同。
+            paper_name = normalize_paper_name(paper)
+            old_paper = getattr(devmode, 'PaperSize', 0)
+            if paper_name:
+                devmode.PaperSize = DMPAPER_BY_NAME[paper_name]
+                devmode.Fields |= win32con.DM_PAPERSIZE
+                dm_flags |= win32con.DM_PAPERSIZE
+            elif paper:
+                logger.warning(f"DEVMODE: 不认识的纸张大小 {paper!r}，按驱动默认纸打印")
+                print(f"[DEVMODE] ⚠ 不认识的纸张大小 {paper!r}，按驱动默认纸打印")
+            new_paper = getattr(devmode, 'PaperSize', old_paper)
+
             print(f"[DEVMODE] 打印机: {printer_name}")
             print(f"[DEVMODE] 双面设置: {duplex_map.get(old_duplex, f'未知({old_duplex})')} → {duplex_map.get(new_duplex, f'未知({new_duplex})')}")
             if orientation:
                 print(f"[DEVMODE] 方向设置: {orient_map.get(old_orient, f'未知({old_orient})')} → {orient_map.get(new_orient, f'未知({new_orient})')}")
+            if paper_name:
+                print(f"[DEVMODE] 纸张设置: {old_paper} → {new_paper} ({paper_name} = DMPAPER {DMPAPER_BY_NAME[paper_name]})")
             logger.info(f"DEVMODE: OpenPrinter={printer_name}, Duplex {old_duplex}→{new_duplex}, "
-                        f"Orientation {old_orient}→{new_orient} (orientation='{orientation}')")
+                        f"Orientation {old_orient}→{new_orient} (orientation='{orientation}'), "
+                        f"Paper {old_paper}→{new_paper} (paper='{paper}')")
 
             # DocumentProperties 验证/合并 DEVMODE
             # P1-8: DM_OUT_BUFFER 模式下驱动校验结果直接写回 devmode 缓冲，
@@ -1833,6 +1894,13 @@ def _get_printer_devmode(printer_name: str, duplex: str, duplex_mode: str, orien
                 print(f"[DEVMODE] ⚠ 驱动把 Duplex 改回 {duplex_map.get(applied_duplex, applied_duplex)}"
                       f"（请求 {duplex_map.get(new_duplex, new_duplex)}）—— 该设置在驱动侧未生效")
                 logger.warning(f"DEVMODE: 驱动改回 Duplex={applied_duplex}（请求 {new_duplex}）")
+
+            # 纸张同理：驱动可能把不支持的纸型换回默认纸（例如只装 A4 纸盒时请求 A3）
+            applied_paper = getattr(devmode, "PaperSize", None)
+            if paper_name and applied_paper != DMPAPER_BY_NAME[paper_name]:
+                print(f"[DEVMODE] ⚠ 驱动把纸张改回 {applied_paper}（请求 {paper_name} = "
+                      f"{DMPAPER_BY_NAME[paper_name]}）—— 该设置在驱动侧未生效")
+                logger.warning(f"DEVMODE: 驱动改回 PaperSize={applied_paper}（请求 {paper_name}）")
 
             # 驱动校验后的 devmode 缓冲，供 ResetDC 使用
             return devmode, applied_duplex
@@ -2051,6 +2119,7 @@ def _print_via_loop(
     rotate_180: bool = False,
     rotate_slots: Optional[list[bool]] = None,
     landscape_fill: bool = True,
+    paper: str = "",
 ) -> tuple[bool, str]:
     """终极兜底：应用层循环打印，每次只打 1 份。成功率最高。
 
@@ -2061,7 +2130,7 @@ def _print_via_loop(
         print(f"[循环打印] 第 {i + 1}/{copies} 份...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range,
                                     1, orientation, progress_callback, dpi, pages_override,
-                                    rotate_180, rotate_slots, landscape_fill)
+                                    rotate_180, rotate_slots, landscape_fill, paper)
         if not ok:
             print(f"[循环打印] ✗ 第 {i + 1} 份失败: {msg}")
             # 双面不可用是终止型失败：原样上抛，别被改写成"第 N 份失败"而丢掉语义

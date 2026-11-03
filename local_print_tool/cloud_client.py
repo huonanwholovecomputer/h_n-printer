@@ -136,7 +136,7 @@ MAX_AUTH_FAIL_RETRIES = 6      # auth_fail 最大自动重连次数，之后停�
 # 人工订正通知（order_canceled 且 reason=="manual_fix"）用它把后端 status 翻成中文再入文案，
 # 避免把英文状态名直接露给操作员。
 ORDER_STATUS_LABELS_CN = {
-    "sent": "已完成", "failed": "失败", "canceled": "已取消", "rejected": "被打回",
+    "sent": "已完成", "failed": "失败", "timeout": "超时", "canceled": "已取消", "rejected": "被打回",
     "abandoned": "放弃打印", "printing": "待添加", "queued": "排队中",
     "accepted": "已添加", "reserved": "已预留", "offline_unknown": "断线未知",
     "scheduled": "已预约", "waiting": "等待打印", "downloading": "文件传输中",
