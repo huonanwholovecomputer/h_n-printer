@@ -1,8 +1,8 @@
 {
-  "version": "1.1.51",
-  "versionCode": 52,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.51.apk",
-  "md5": "a47427d4213b9efaf18a59ab4e07907e",
-  "notes": "v1.1.51：① 新增前端错误自动上报 —— App 崩溃或接口异常时会把脱敏后的信息回传服务器，出问题能查得到（只报错误，不碰你的文件内容）；② 页面资源与本轮云端修复同步。",
+  "version": "1.1.52",
+  "versionCode": 53,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.52.apk",
+  "md5": "a57602b8cc42b96b0d585af366e5dc4e",
+  "notes": "v1.1.52：① 新增「封面单独打印」与「排除末尾空白页」两个开关（与小程序、电脑端同一口径）；② 订单里的张数与费用按新口径显示：单面页按单面价、双面页按双面价；③ 页面资源与本轮电脑端修复同步。",
   "force": false
 }
