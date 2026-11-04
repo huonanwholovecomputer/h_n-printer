@@ -29,6 +29,9 @@
               <text class="ro-summary-title">最近订单</text>
               <text class="ro-summary-meta" wx:if="{{!loading && !loadError}}">共 {{totalOrders}} 条 · 第 {{currentPage}}/{{totalPages}} 页</text>
               <text class="ro-summary-meta" wx:elif="{{loading}}">加载中…</text>
+              <!-- #1：条数上限来自「我」页的设置，这里明示，免得管理员以为更早的订单丢了。
+                   必须是独立 wx:if（不能插进上面 if/elif 链中间，否则 wx:elif 失去配对）。 -->
+              <text class="ro-summary-meta" wx:if="{{!loading && !loadError && serverTotalOrders > totalOrders}}">全站共 {{serverTotalOrders}} 条，按设置只显示最近 {{recentLimit}} 条</text>
             </view>
             <view class="ro-refresh" hover-class="tap-active" bindtap="onRefresh">↻ 刷新</view>
           </view>
@@ -114,22 +117,26 @@
 
 <!-- #9 原因气泡：必须在 page-root 之外 + position:fixed。
      page-root 有 overflow:hidden，气泡若在里面会被裁掉；
-     而 .scroll-content 是 translateY 变换层，fixed 元素若在它内部会相对变换层定位（跟着滚走）。 -->
-<view wx:if="{{showStatusPop}}" class="ro-pop-mask" catchtap="onCloseStatusPop" catchtouchmove="noop"></view>
-<view wx:if="{{showStatusPop}}"
-      class="ro-pop {{statusPopBelow ? 'ro-pop-below' : 'ro-pop-above'}}"
-      style="left:{{statusPopLeft}}px;width:{{statusPopWidth}}px;{{statusPopBelow ? 'top:' + statusPopTop + 'px' : 'bottom:' + statusPopBottom + 'px'}}"
-      catchtap="noop">
-  <view class="ro-pop-caret" style="left:{{statusPopCaretLeft}}px"></view>
-  <view class="ro-pop-head">
-    <text class="ro-pop-icon">⚠️</text>
-    <text class="ro-pop-title">异常原因</text>
-  </view>
-  <scroll-view scroll-y class="ro-pop-text-wrap">
-    <text class="ro-pop-text">{{statusPopText}}</text>
-  </scroll-view>
-  <view class="ro-pop-acts">
-    <view class="ro-pop-btn primary" hover-class="ro-pop-btn-hover" catchtap="onCopyStatusReason">复制</view>
-    <view class="ro-pop-btn" hover-class="ro-pop-btn-hover" catchtap="onCloseStatusPop">关闭</view>
+     而 .scroll-content 是 translateY 变换层，fixed 元素若在它内部会相对变换层定位（跟着滚走）。
+     #3：theme-dark 挂在遮罩上、气泡作为它的子节点（与「我」页 .price-pop-mask 同构），
+     深色 CSS 变量才作用到气泡；以前气泡和遮罩同级且没有 theme-dark，--bg-card/--text-primary
+     退回 page 的浅色值 → 深色主题下白底黑字。 -->
+<view wx:if="{{showStatusPop}}" class="ro-pop-mask {{isDarkMode ? 'theme-dark' : ''}}"
+      catchtap="onCloseStatusPop" catchtouchmove="noop">
+  <view class="ro-pop {{statusPopBelow ? 'ro-pop-below' : 'ro-pop-above'}}"
+        style="left:{{statusPopLeft}}px;width:{{statusPopWidth}}px;{{statusPopBelow ? 'top:' + statusPopTop + 'px' : 'bottom:' + statusPopBottom + 'px'}}"
+        catchtap="noop">
+    <view class="ro-pop-caret" style="left:{{statusPopCaretLeft}}px"></view>
+    <view class="ro-pop-head">
+      <text class="ro-pop-icon">⚠️</text>
+      <text class="ro-pop-title">异常原因</text>
+    </view>
+    <scroll-view scroll-y class="ro-pop-text-wrap">
+      <text class="ro-pop-text">{{statusPopText}}</text>
+    </scroll-view>
+    <view class="ro-pop-acts">
+      <view class="ro-pop-btn primary" hover-class="ro-pop-btn-hover" catchtap="onCopyStatusReason">复制</view>
+      <view class="ro-pop-btn" hover-class="ro-pop-btn-hover" catchtap="onCloseStatusPop">关闭</view>
+    </view>
   </view>
 </view>

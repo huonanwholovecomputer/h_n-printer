@@ -2875,7 +2875,9 @@ Component({
 
     // #3：最近订单改成独立页（分页列表在新页面里拉；本页只保留条数与「⚙ 设置」入口）
     onOpenRecentOrders() {
-      wx.navigateTo({ url: '/pages/recent-orders/recent-orders' })
+      // #2：必须走带返回标记的导航 —— 否则回到本页时读到上次的 _tabFrom===0，
+      // 会播「从右滑入」的 page-enter-right；这里和其它二级页一样只做 fade。
+      this._navigateWithAnimation('/pages/recent-orders/recent-orders')
     },
 
     onRefreshRecentOrders() {
@@ -3020,7 +3022,8 @@ Component({
       const by = String(o.manual_status_by || '').trim()
       const label = (this.data.statusMap && this.data.statusMap[o.status]) || o.status || '异常状态'
       if (by) {
-        const at = _fmtStatusTime(o.manual_status_at) || '—'
+        // 与「最近订单」页 / settlement.html 同一口径：缺时间写「未知时间」，不出现破折号
+        const at = _fmtStatusTime(o.manual_status_at) || '未知时间'
         return by + '在' + at + '被标记为' + label
       }
       const reason = String(o.status_reason || '').trim()

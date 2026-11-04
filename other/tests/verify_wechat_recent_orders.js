@@ -230,9 +230,8 @@ function runStaticChecks() {
   check('WXML：入口卡标题「查看最近订单」', wxml.indexOf('recent-orders-entry-title">查看最近订单') >= 0);
   check('WXML：入口卡说明带动态 N',
         /recent-orders-entry-desc">全部管理员的最近 \{\{recentOrdersLimit\}\} 条/.test(wxml));
-  check('js：入口卡 onOpenRecentOrders → /pages/recent-orders/recent-orders',
-        /onOpenRecentOrders\s*\([^)]*\)\s*\{[\s\S]{0,200}urll?\s*:\s*'\/pages\/recent-orders\/recent-orders'/.test(js)
-        || js.indexOf("'/pages/recent-orders/recent-orders'") >= 0);
+  check('js：入口卡 onOpenRecentOrders 走 _navigateWithAnimation（返回本页纯淡入，不播位移）',
+        /onOpenRecentOrders\s*\([^)]*\)\s*\{[\s\S]{0,400}_navigateWithAnimation\(\s*'\/pages\/recent-orders\/recent-orders'\s*\)/.test(js));
   check('WXML：内嵌列表已移除（无 recent-order-row / price-tap-r-）',
         wxml.indexOf('recent-order-row') < 0 && wxml.indexOf('price-tap-r-') < 0);
   check('WXML：价格气泡仍按来源隐藏「复制详细价格」',
@@ -245,7 +244,14 @@ function runStaticChecks() {
         roJs.indexOf("'/api/admin/recent_orders'") >= 0
         && /data:\s*\{\s*page:\s*[\s\S]{0,60}per_page:/.test(roJs));
   check('新页 js：per_page 白名单 10/20/50/100', /\[10,\s*20,\s*50,\s*100\]/.test(roJs));
-  check('新页 js：总数 total → totalPages 换算', /Math\.ceil\(\s*total(Safe)?\s*\/\s*perPage\s*\)/.test(roJs));
+  check('新页 js：先取 /api/admin/recent_orders_limit 再拉列表（#1：首屏不闪全站订单）',
+        roJs.indexOf('/api/admin/recent_orders_limit') >= 0
+        && roJs.indexOf('/api/admin/recent_orders_limit') < roJs.indexOf("'/api/admin/recent_orders'"));
+  check('新页 js：total 先按「最近 N 条」截断，再换算 totalPages',
+        /const cappedTotal = Math\.min\(totalSafe, cap\)/.test(roJs)
+        && /Math\.ceil\(\s*cappedTotal\s*\/\s*perPage\s*\)/.test(roJs));
+  check('新页 js：本页行按上限截断（slice(0, cappedTotal - offset)）',
+        /\.slice\(0, Math\.max\(0, cappedTotal - offset\)\)/.test(roJs));
   check('新页 js：上一页/下一页/页码 + 页码算法',
         /onPrevPage\s*\(/.test(roJs) && /onNextPage\s*\(/.test(roJs)
         && /onPageChange\s*\(/.test(roJs) && /getPageNumbers\s*\(/.test(roJs));
@@ -257,6 +263,14 @@ function runStaticChecks() {
         && roWxml.indexOf('onSelectPageSize') >= 0);
   check('新页 wxml：金额行点击复制价格（onPriceCopy）', /onPriceCopy/.test(roWxml));
   check('新页 wxml：异常状态可点（onStatusReasonTap）', /onStatusReasonTap/.test(roWxml));
+  check('新页 wxml：#3 原因气泡是 .theme-dark 遮罩的子节点（深色变量才能作用到白底/文字）',
+        /class="ro-pop-mask \{\{isDarkMode \? 'theme-dark' : ''\}\}"/.test(roWxml)
+        && roWxml.indexOf('class="ro-pop-mask') < roWxml.indexOf('class="ro-pop ')
+        && roWxml.indexOf('wx:if="{{showStatusPop}}"') === roWxml.lastIndexOf('wx:if="{{showStatusPop}}"'));
+  check('新页 js：#4 _decorate 透传 manual_status_by/at + status_reason（否则永远走兜底文案）',
+        /manual_status_by:\s*src\.manual_status_by/.test(roJs)
+        && /manual_status_at:\s*src\.manual_status_at/.test(roJs)
+        && /status_reason:\s*src\.status_reason/.test(roJs));
   check('新页 wxss：气泡 fixed（出 page-root，不被 scroll-content 变换层裁）',
         /\.ro-pop-mask\s*\{[^}]*position:\s*fixed/.test(roWxss)
         && /\.ro-pop\s*\{[^}]*position:\s*fixed/.test(roWxss));

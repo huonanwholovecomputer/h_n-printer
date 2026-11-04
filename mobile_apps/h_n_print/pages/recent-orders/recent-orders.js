@@ -18,6 +18,11 @@ const REASON_FALLBACK_TEXT = '该订单未提供具体原因'
 const PER_PAGE_OPTIONS = [10, 20, 50, 100]
 const PER_PAGE_KEY = 'recentOrdersPerPage'   // 用户选过的每页条数（跨页面记忆）
 
+// 「最近 N 条」上限：超管在「我」页配置（/api/admin/recent_orders_limit），所有管理员可读。
+// 本页只展示最近 N 条（分页也只在这 N 条里翻）；读不到配置时按 10 兜底，与「我」页一致。
+const DEFAULT_RECENT_LIMIT = 10
+const RECENT_LIMIT_MAX = 100
+
 // 订单时间戳 → YYYY-MM-DD HH:MM:SS（manual_status_at 展示用；认不出格式就原样返回）
 function _fmtStatusTime(v) {
   const s = String(v == null ? '' : v).trim()
@@ -61,6 +66,10 @@ Component({
     currentPage: 1,
     perPage: 20,
     totalOrders: 0,
+    // 后端全站总量（不受「最近 N 条」限制）：只在汇总行里提示「全站共 X 条」，用于解释为什么看不到更早的订单
+    serverTotalOrders: 0,
+    // 超管在「我」页配的「最近 N 条」上限；0 = 还没取到（首次进入先取配置再拉列表，避免先闪一次全站订单）
+    recentLimit: 0,
     totalPages: 0,
     pageNumbers: [],
     pageOptions: PER_PAGE_OPTIONS,
@@ -116,7 +125,7 @@ Component({
         this.setData({ noPermission: true, loading: false })
         return
       }
-      this.loadOrders()
+      this.loadLimitAndOrders()
     },
     detached() {
       this._destroyScrollEngine()
@@ -196,6 +205,49 @@ Component({
 
     // ==================== 数据 ====================
 
+    // 先取「最近 N 条」上限，再拉列表：顺序不能反 —— 否则首屏会先按全站总量渲染一次，
+    // 用户会看到「全部订单」闪一下（这正是 #1 的现象）。刷新按钮也走这里，让设置改动立即生效。
+    loadLimitAndOrders() {
+      if (this._limitLoading) return
+      // 没 token 连设置都不问（与 loadOrders 的登录守卫一致，避免空 Authorization 打一趟 401）
+      if (!wx.getStorageSync('token')) {
+        this.setData({ loading: false, loadError: '登录已过期，请重新进入小程序' })
+        return
+      }
+      this._limitLoading = true
+      this.setData({ loading: true, loadError: '' })
+      this._fetchRecentLimit((limit) => {
+        this._limitLoading = false
+        this.setData({ recentLimit: limit }, () => this.loadOrders())
+      })
+    },
+
+    // GET /api/admin/recent_orders_limit：所有管理员可读（写权限才限超管）。
+    // 读不到就按默认 10 兜底，绝不退回「全站所有订单」。
+    _fetchRecentLimit(done) {
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/recent_orders_limit',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + wx.getStorageSync('token') },
+        success: (res) => {
+          const d = (res && res.data) || {}
+          const n = parseInt(d.limit, 10)
+          if (res && res.statusCode === 200 && d.success && isFinite(n) && n >= 1) {
+            done(Math.min(n, RECENT_LIMIT_MAX))
+          } else {
+            done(DEFAULT_RECENT_LIMIT)
+          }
+        },
+        fail: () => done(DEFAULT_RECENT_LIMIT),
+      })
+    },
+
+    // 当前生效的条数上限（data 里还没取到配置时按默认值，保证任何调用路径都有确定行为）
+    _recentLimitCap() {
+      const n = parseInt(this.data.recentLimit, 10)
+      return isFinite(n) && n >= 1 ? Math.min(n, RECENT_LIMIT_MAX) : DEFAULT_RECENT_LIMIT
+    },
+
     // silent=true：翻页/回页的静默刷新（不闪加载态、不清空已有列表）
     loadOrders(silent) {
       const token = wx.getStorageSync('token')
@@ -208,28 +260,50 @@ Component({
       this._hasLoaded = true
       if (!silent) this.setData({ loading: true, loadError: '' })
 
+      const perPage = this.data.perPage
+      const cap = this._recentLimitCap()
+      // 在请求前就把页码夹进「上限内的页数」：N 比每页条数还小时只有一页，
+      // 避免为第 2 页发一次必然返回空数组的请求。
+      const capPages = Math.max(1, Math.ceil(cap / perPage))
+      const reqPage = Math.min(this.data.currentPage, capPages)
+
       request({
         url: CONFIG.BASE_URL + '/api/admin/recent_orders',
         method: 'GET',
         header: { 'Authorization': 'Bearer ' + token },
-        data: { page: this.data.currentPage, per_page: this.data.perPage },
+        data: { page: reqPage, per_page: perPage },
         success: (res) => {
           this._loading = false
           if (res.statusCode === 200 && res.data && res.data.success) {
-            const rows = (res.data.orders || []).map((o) => this._decorate(o))
             const total = Number(res.data.total)
-            const perPage = this.data.perPage
             // 旧版后端（不带 total）退化成单页：total 取本页条数，页数只有 1，
             // 「下一页」自然禁用 —— 至少不会出现 NaN 页码或永远转圈。
-            const totalSafe = isFinite(total) && total >= 0 ? total : rows.length
-            const totalPages = Math.max(1, Math.ceil(totalSafe / perPage))
-            const page = Math.min(this.data.currentPage, totalPages)
+            const totalSafe = isFinite(total) && total >= 0 ? total : (res.data.orders || []).length
+            // #1 真因：后端分页返回的是**全站** total，且 paging 模式不认 limit；
+            // 所以「最近 N 条」必须由前端截断 —— 只保留最近 N 条，分页也按 N 算页数。
+            const cappedTotal = Math.min(totalSafe, cap)
+            const offset = (reqPage - 1) * perPage
+            // N 落在本页中间时本页条数不足 perPage，多出来的（比 N 更早的）订单直接丢掉
+            const rows = (res.data.orders || [])
+              .slice(0, Math.max(0, cappedTotal - offset))
+              .map((o) => this._decorate(o))
+            const totalPages = Math.max(1, Math.ceil(cappedTotal / perPage))
+            const page = Math.min(reqPage, totalPages)
+            // 全站总量比 cap 还小（后端数据被清理过）：页码可能已越界，回第 1 页重拉一次
+            if (page !== reqPage) {
+              this.setData({ currentPage: page }, () => {
+                this._syncPageNumbers()
+                this.loadOrders(true)
+              })
+              return
+            }
             this.setData({
               orders: rows,
               loading: false,
               loadError: '',
               currentPage: page,
-              totalOrders: totalSafe,
+              totalOrders: cappedTotal,
+              serverTotalOrders: totalSafe,
               totalPages,
             }, () => {
               this._syncPageNumbers()
@@ -275,6 +349,11 @@ Component({
         statusReasonTappable: REASON_STATUSES.indexOf(status) >= 0,
         source: src.source || '',
         is_admin_print: !!src.is_admin_print,
+        // #4：人工订正留痕 / 失败原因必须原样透传 —— 这里以前只挑展示字段，
+        // _statusReasonText() 永远读不到 manual_status_by，只能落到兜底文案。
+        status_reason: src.status_reason || '',
+        manual_status_by: src.manual_status_by || '',
+        manual_status_at: src.manual_status_at || '',
       }
       order.statusReasonText = this._statusReasonText(order)
       return order
@@ -286,7 +365,8 @@ Component({
       const by = String(o.manual_status_by || '').trim()
       const label = (this.data.statusMap && this.data.statusMap[o.status]) || o.status || '异常状态'
       if (by) {
-        const at = _fmtStatusTime(o.manual_status_at) || '—'
+        // 与 settlement.html 的 title 口径一致：缺时间时写「未知时间」，不出现空串/破折号
+        const at = _fmtStatusTime(o.manual_status_at) || '未知时间'
         return by + '在' + at + '被标记为' + label
       }
       const reason = String(o.status_reason || '').trim()
@@ -303,9 +383,10 @@ Component({
     },
 
     onRefresh() {
+      // 刷新时连「最近 N 条」配置一起重取：超管刚改过设置，这里不用退出页面就能生效
       this.setData({ currentPage: 1 }, () => {
         this._syncPageNumbers()
-        this.loadOrders()
+        this.loadLimitAndOrders()
       })
     },
 
@@ -380,6 +461,9 @@ Component({
     onCloseStatusPop() {
       if (this.data.showStatusPop) this.setData({ showStatusPop: false })
     },
+
+    // 气泡本体的 catchtap 需要真实存在的方法才能拦住冒泡（否则点正文会穿透到遮罩把气泡关掉）
+    noop() {},
 
     onCopyStatusReason() {
       const text = this.data.statusPopText || ''

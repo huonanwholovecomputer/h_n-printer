@@ -1487,7 +1487,8 @@ function orderStatusReasonText(o) {
   if (!o) return REASON_FALLBACK_TEXT;
   const by = String(o.manual_status_by || '').trim();
   const label = ORDER_STATUS_MAP[o.status] || o.status || '异常状态';
-  if (by) return by + '在' + (_fmtStatusTime(o.manual_status_at) || '—') + '被标记为' + label;
+  // 缺时间与小程序「我的订单」/「最近订单」/ settlement.html 同口径：写「未知时间」
+  if (by) return by + '在' + (_fmtStatusTime(o.manual_status_at) || '未知时间') + '被标记为' + label;
   const reason = String(o.status_reason || '').trim();
   return reason || REASON_FALLBACK_TEXT;
 }

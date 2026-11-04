@@ -254,13 +254,18 @@ section('四、最近订单独立页（分页 / 总数 / 行渲染）');
     /catchtap="onOpenRecentOrders"/.test(meWxml) && meWxml.indexOf('查看最近订单') > 0);
   check('「我」页不再内嵌订单行（recent-order-row / price-tap-r- 均已移除）',
     meWxml.indexOf('recent-order-row') < 0 && meWxml.indexOf('price-tap-r-') < 0);
-  check('入口跳 /pages/recent-orders/recent-orders',
-    /navigateTo\(\{\s*url:\s*'\/pages\/recent-orders\/recent-orders'/.test(meJs));
+  check('入口走 _navigateWithAnimation 跳 /pages/recent-orders/recent-orders（返回「我」页只播淡入）',
+    /_navigateWithAnimation\(\s*'\/pages\/recent-orders\/recent-orders'\s*\)/.test(meJs));
   check('app.json 注册了新页面', read(F.mpAppJson).indexOf('pages/recent-orders/recent-orders') > 0);
 
   // 管理员进入 → 立刻按 page=1 / per_page=20 拉数据
   const p1 = loadRecentOrdersPage({ role: 'admin' });
+  // 2026-11-03 #1：进页面先读「最近 N 条」设置，再按 page/per_page 拉列表；
+  // 这里让 N=45 = 全站总量，后面的分页断言（3 页、[1,2,3]）仍成立。
   p1.respond = (opts) => {
+    if (opts.url.indexOf('/api/admin/recent_orders_limit') >= 0) {
+      return opts.success({ statusCode: 200, data: { success: true, limit: 45 } });
+    }
     opts.success({
       statusCode: 200,
       data: {
@@ -274,14 +279,18 @@ section('四、最近订单独立页（分页 / 总数 / 行渲染）');
   };
   let ctx = makeCtx(p1.component);
   ctx.attached ? ctx.attached() : p1.component.lifetimes.attached.call(ctx);
-  check('管理员进入即请求 /api/admin/recent_orders（带 Authorization）',
-    p1.requests.length === 1
-    && p1.requests[0].url === 'https://mp.invalid/api/admin/recent_orders'
+  check('管理员进入先读设置 N（/api/admin/recent_orders_limit，带 Authorization）',
+    p1.requests.length === 2
+    && p1.requests[0].url === 'https://mp.invalid/api/admin/recent_orders_limit'
     && /^Bearer /.test(p1.requests[0].header.Authorization),
     p1.requests.length ? p1.requests[0].url : 'no request');
-  check('第一次请求必带 page=1 + per_page=20（后端 C5：不带 page 是旧结构）',
-    p1.requests.length === 1 && p1.requests[0].data.page === 1 && p1.requests[0].data.per_page === 20,
-    JSON.stringify(p1.requests.length ? p1.requests[0].data : null));
+  check('再拉 /api/admin/recent_orders（带 Authorization）',
+    p1.requests.length === 2
+    && p1.requests[1].url === 'https://mp.invalid/api/admin/recent_orders'
+    && /^Bearer /.test(p1.requests[1].header.Authorization));
+  check('列表请求必带 page=1 + per_page=20（后端 C5：不带 page 是旧结构）',
+    p1.requests.length === 2 && p1.requests[1].data.page === 1 && p1.requests[1].data.per_page === 20,
+    JSON.stringify(p1.requests.length ? p1.requests[1].data : null));
   check('total=45 / perPage=20 ⇒ 3 页，总数 45',
     ctx.data.totalPages === 3 && ctx.data.totalOrders === 45,
     `pages=${ctx.data.totalPages} total=${ctx.data.totalOrders}`);
@@ -301,7 +310,7 @@ section('四、最近订单独立页（分页 / 总数 / 行渲染）');
   p1.respond = (opts) => opts.success({ statusCode: 200, data: { success: true, total: 45, orders: [] } });
   ctx.onNextPage();
   check('下一页 → currentPage=2 并重新请求 page=2',
-    ctx.data.currentPage === 2 && p1.requests.length === 2 && p1.requests[1].data.page === 2,
+    ctx.data.currentPage === 2 && p1.requests.length === 3 && p1.requests[2].data.page === 2,
     `page=${ctx.data.currentPage} reqs=${p1.requests.length}`);
 
   // 每页条数：记忆到 storage；非法值忽略；同值只收起
