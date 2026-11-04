@@ -29,9 +29,13 @@ Ctrl+P。所以默认**必须完全复现 Excel 自己的打印结果**，唯一
 不让它静默退化成 A4)、`orientation`(portrait/landscape)、
 `margin_top_cm`/`margin_bottom_cm`/`margin_left_cm`/`margin_right_cm`(cm，内部 ×72/2.54 转 pt)、
 `header_cm`/`footer_cm`、`center_h`/`center_v`(bool)、`fit`(none/sheet/cols/rows)、
-`scale`(10–400)、`print_range`(active/workbook/selection/ignore_area)。
+`scale`(10–400)、`print_range`(active/workbook/ignore_area；旧的 selection 已废弃、回退 active)、
+`worksheet`(要打印的工作表名；"" = 跟随文件上次保存的活动工作表)。
 `print_range="workbook"` 是唯一会用 `Workbook.ExportAsFixedFormat` 导全部工作表的取值
 （默认仍是「活动工作表」，见下）。
+
+指定了 `worksheet` 时，导出前用 `_select_worksheet` 切到那张表（找不到就回退活动工作表并
+记 warning）；不指定时行为与旧版逐字节相同。`print_range="workbook"` 时忽略该键。
 
 引擎优先级：Excel → WPS(表格) → LibreOffice 兜底。兜底会**明写日志**「版式可能与 Excel
 不一致」—— LibreOffice 不认 Excel 的全部排版语义（分页/窄边距/缩放常有偏差），它只是
@@ -73,6 +77,7 @@ import threading
 import time
 import zipfile
 from dataclasses import dataclass, field
+from xml.etree import ElementTree
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +185,87 @@ def engine_label(engine: str) -> str:
     return ENGINE_LABELS.get(str(engine or ""), str(engine or ""))
 
 
+# ============================================================
+# 工作表名清单（GUI 的「工作表」下拉框用；不启动 Office、不加新依赖）
+# ============================================================
+
+_SHEET_NAME_CACHE: dict = {}
+_SHEET_NAME_LOCK = threading.Lock()
+_SHEET_NAME_CACHE_MAX = 64
+_WORKBOOK_XML_MAX_BYTES = 4 * 1024 * 1024   # workbook.xml 正常只有几 KB；超限当异常文件
+
+
+def list_worksheet_names(file_path: str, include_hidden: bool = False) -> list[str] | None:
+    """只读一个表格文件里有哪些工作表 → 名字列表（按工作簿里的标签顺序）；读不出返回 None。
+
+    为什么自己拆 zip 而不用 openpyxl：openpyxl **不是**本项目的依赖（requirements.txt 里没有，
+    门店干净机器装上也没有），为了填一个下拉框引入新依赖不划算。xlsx/xlsm 本质是 zip，
+    表名清单就在 `xl/workbook.xml` 的 <sheets> 里，用标准库 zipfile + ElementTree 读几 KB
+    即可 —— 更快的是不启动 Excel/WPS（COM 起一个实例要好几秒，下拉框撑不住）。
+
+    为什么默认跳过隐藏表：Excel 的打印范围下拉框里也不列隐藏表，且隐藏表**无法**
+    `Activate()`（会抛 1004）。列出来让用户选，等于给他一个"选了却回退到别的表"的坑。
+
+    `.xls`（BIFF 老二进制）不是 zip：返回 None —— 面板只显示「跟随文件的活动工作表」，
+    引擎那条路径与改动前完全一致（老格式照样能打，只是不能选表）。
+
+    结果按 (绝对路径, 修改时间纳秒, 大小) 缓存：面板每次刷新选区都会问一遍表名，
+    同一份文件反复解 zip 没必要；文件一改（mtime/大小变）自然换新条目。
+    """
+    path = str(file_path or "")
+    if not path or not is_xlsx(path) or not os.path.isfile(path):
+        return None
+    try:
+        st = os.stat(path)
+        key = (os.path.abspath(path), int(getattr(st, "st_mtime_ns", 0)),
+               int(st.st_size), bool(include_hidden))
+    except OSError as e:
+        logger.debug(f"读表名清单：取文件信息失败 {path}: {e}")
+        return None
+    with _SHEET_NAME_LOCK:
+        cached = _SHEET_NAME_CACHE.get(key)
+        if cached is not None:
+            return list(cached)
+    names: list[str] | None = None
+    try:
+        with zipfile.ZipFile(path) as zf:
+            try:
+                info = zf.getinfo("xl/workbook.xml")
+            except KeyError:
+                # .xls 换了扩展名 / 加密文件 / 残缺包：当作读不出，回退旧行为
+                logger.debug(f"读表名清单：{os.path.basename(path)} 里没有 xl/workbook.xml")
+                return None
+            if info.file_size > _WORKBOOK_XML_MAX_BYTES:
+                logger.debug(f"读表名清单：xl/workbook.xml 过大（{info.file_size} 字节），跳过")
+                return None
+            root = ElementTree.fromstring(zf.read("xl/workbook.xml"))
+        found: list[str] = []
+        # 命名空间前缀各版本可能不同（有的引擎写 x:sheet），所以按本地名比，别写死 URI
+        for el in root.iter():
+            if not isinstance(el.tag, str) or el.tag.rsplit("}", 1)[-1] != "sheet":
+                continue
+            name = el.get("name")
+            if not name:
+                continue
+            state = str(el.get("state") or "").strip().lower()
+            hidden = state in ("hidden", "veryhidden")
+            if hidden and not include_hidden:
+                continue
+            found.append(name)
+        names = found
+    except (OSError, zipfile.BadZipFile, ElementTree.ParseError) as e:
+        logger.debug(f"读表名清单失败（{os.path.basename(path)}）: {e}")
+        return None
+    except Exception as e:  # noqa: BLE001 —— 任何解析异常都不该挡住用户选文件
+        logger.debug(f"读表名清单异常（{os.path.basename(path)}）: {e}")
+        return None
+    with _SHEET_NAME_LOCK:
+        if len(_SHEET_NAME_CACHE) >= _SHEET_NAME_CACHE_MAX:
+            _SHEET_NAME_CACHE.clear()   # 简单粗暴：条目极少，整批丢比精细 LRU 划算
+        _SHEET_NAME_CACHE[key] = list(names)
+    return names
+
+
 def progid_available(prog_id: str, use_cache: bool = True) -> bool:
     """只查注册表判断 COM ProgID 是否注册（不启动 COM，毫秒级）。"""
     global _probe_cache
@@ -264,9 +350,12 @@ ORIENTATIONS = {"portrait": 1, "landscape": 2}
 # 缩放口径：none = 固定百分比；sheet/cols/rows = 「调整为 N 页」的各维度
 FIT_MODES = ("none", "sheet", "cols", "rows")
 
-# 打印范围：active = 活动工作表（默认，与旧行为一致）；workbook = 全部工作表；
-# selection = COM 侧拿不到真实选区 ⇒ 用 ActiveSheet.UsedRange 顶替；ignore_area = 清空 PrintArea
-PRINT_RANGES = ("active", "workbook", "selection", "ignore_area")
+# 打印范围：active = 活动工作表（默认，与旧行为一致，尊重文件里已有的打印区域）；
+# workbook = 全部工作表；ignore_area = 清空 PrintArea（按已用区域整张打）。
+# 2026-11-03 删掉 "selection"：Excel 的「选定区域」是会话内的高亮选区、不存进文件，COM 无人
+# 值守打开时拿不到真实选区，旧实现是拿 UsedRange 顶替 ⇒ 效果等于 active，还会覆盖文件里
+# 自带的打印区域。老配置仍可能存着这个值，会在这里回退成 active（下面 normalize 的日志会写）。
+PRINT_RANGES = ("active", "workbook", "ignore_area")
 
 # cm → pt：PageSetup 的 *Margin 单位是磅，1 inch = 72 pt
 CM_TO_PT = 72.0 / 2.54
@@ -275,6 +364,7 @@ CM_TO_PT = 72.0 / 2.54
 # A4 纵向；页边距四边 1cm；页眉/页脚 0；水平居中开、垂直居中关；
 # 缩放「将所有列调整为一页」(fit=cols)；打印范围「活动工作表」。
 # 注意：`scale` 只在 fit="none" 时才生效（fit≠none 时 COM 走 FitToPages*，Zoom=False）。
+# worksheet："" = 跟随文件上次保存的活动工作表（默认）；非空 = 导出前激活那张表。
 DEFAULT_PRINT_OPTIONS = {
     "paper": "A4",
     "orientation": "portrait",
@@ -289,6 +379,7 @@ DEFAULT_PRINT_OPTIONS = {
     "fit": "cols",
     "scale": 100,
     "print_range": "active",
+    "worksheet": "",
 }
 
 _MARGIN_MIN_CM = 0.0
@@ -356,6 +447,19 @@ def _as_bool(value, default: bool = False, field_name: str = "") -> bool:
     return default
 
 
+def _as_sheet_name(value) -> str:
+    """工作表名：非字符串/空白 → `""`（= 跟随文件上次保存的活动工作表）。
+
+    这里**不**校验"表是否真的存在"：本模块拿到 options 时还没打开工作簿，而且文件可能被
+    改名/删表，只有 `_activate_worksheet` 在打开之后才判得准。名字原样保留，对不上时由
+    那一步回退活动工作表并记 warning —— 绝不在这里把用户的选择悄悄抹成默认。
+    长度上限 120（Excel 表名上限 31，这里只为防止异常配置串无限增长）。
+    """
+    if not isinstance(value, str):
+        return ""
+    return value.strip()[:120]
+
+
 def normalize_print_options(print_options) -> dict | None:
     """把 `print_options` 归一化成一份可复现的字典；**None 原样返回 None**。
 
@@ -390,15 +494,23 @@ def normalize_print_options(print_options) -> dict | None:
         "scale": _as_scale(raw.get("scale")),
         "print_range": _choice_name(raw.get("print_range"), {k: k for k in PRINT_RANGES},
                                     DEFAULT_PRINT_OPTIONS["print_range"], "print_range"),
+        "worksheet": _as_sheet_name(raw.get("worksheet")),
     }
 
 
 def options_signature(print_options) -> str:
-    """选项签名的稳定短哈希（8 位十六进制）；None/空字典 ⇒ `""`（旧 key 形态）。"""
+    """选项签名的稳定短哈希（8 位十六进制）；None/空字典 ⇒ `""`（旧 key 形态）。
+
+    `worksheet` 为空（跟随活动工作表）时从签名里剔掉：这个键是后加的，剔掉才能让"从没选过
+    工作表"的任务缓存 key 与旧版逐字符相同 —— 升级不该让存量 PDF 缓存全部作废重转。
+    """
     if not print_options:
         return ""
     try:
-        payload = json.dumps(print_options, sort_keys=True, ensure_ascii=False,
+        payload_options = print_options
+        if isinstance(print_options, dict) and not print_options.get("worksheet"):
+            payload_options = {k: v for k, v in print_options.items() if k != "worksheet"}
+        payload = json.dumps(payload_options, sort_keys=True, ensure_ascii=False,
                              separators=(",", ":"))
     except (TypeError, ValueError):
         logger.warning("print_options 无法序列化，缓存 key 不加选项签名")
@@ -417,11 +529,15 @@ def describe_print_options(options: dict | None) -> str:
     else:
         fit_text = {"sheet": "调整为 1 页宽×1 页高", "cols": "调整为 1 页宽",
                     "rows": "调整为 1 页高"}.get(str(fit), f"调整为 {fit}")
+    sheet_text = ""
+    if options.get("worksheet"):
+        sheet_text = f"，工作表「{options.get('worksheet')}」"
     return (
         f"{options.get('paper')} {orient}，边距 上/下 {options.get('margin_top_cm')!s}/"
         f"{options.get('margin_bottom_cm')!s}cm 左/右 {options.get('margin_left_cm')!s}/"
         f"{options.get('margin_right_cm')!s}cm，页眉/页脚 {options.get('header_cm')!s}/"
         f"{options.get('footer_cm')!s}cm，{fit_text}，打印范围={options.get('print_range')}"
+        f"{sheet_text}"
     )
 
 
@@ -881,29 +997,86 @@ def _apply_print_options_on_sheet(ws, options: dict, label: str = "") -> dict[st
         put("FitToPagesWide", 1 if fit in ("sheet", "cols") else False)
         put("FitToPagesTall", 1 if fit in ("sheet", "rows") else False)
 
-    # 打印区域：active/workbook 保持文件里已有的（尊重用户设置）；ignore_area 清空；
-    # selection 在 COM 侧拿不到真实选区 ⇒ 用已用区域顶替并在日志里说明。
+    # 打印区域：active/workbook 保持文件里已有的（尊重用户设置）；ignore_area 清空。
+    # （旧的 selection 分支已于 2026-11-03 删除：拿不到真实选区，它是用 UsedRange 顶替的。）
     print_range = options["print_range"]
     if print_range == "ignore_area":
         put("PrintArea", "")
-    elif print_range == "selection":
-        try:
-            address = str(ws.UsedRange.Address)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"{label}: 取不到 UsedRange.Address，selection 打印范围未生效（不写 PrintArea）: {e}")
-            applied["PrintArea"] = False
-        else:
-            logger.info(f"{label}: print_range=selection，COM 侧没有真实选区，用整张已用区域 {address} 顶替")
-            put("PrintArea", address)
     return applied
 
 
-def _apply_print_options(wb, options: dict, label: str = "") -> dict[str, bool]:
+def _find_worksheet(wb, name: str):
+    """按表名在已打开的工作簿里找 Worksheet 对象；找不到/名字为空 → None。
+
+    先试 `Worksheets(name)` 的按名索引（COM 原生、支持「2024」「1-2月」这类名字），
+    再退回遍历 `Name` 比较（个别引擎的按名索引对空格/引号会抛错；Excel 表名本身不区分
+    大小写，所以比较时忽略大小写）。
+    """
+    key = str(name or "").strip()
+    if not key:
+        return None
+    for coll_attr in ("Worksheets", "Sheets"):
+        try:
+            coll = getattr(wb, coll_attr)
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            return coll(key)
+        except Exception:  # noqa: BLE001 —— 按名索引不到就退到遍历
+            pass
+        try:
+            count = int(coll.Count)
+        except Exception:  # noqa: BLE001
+            count = 0
+        for i in range(1, count + 1):
+            try:
+                obj = coll.Item(i) if hasattr(coll, "Item") else coll(i)
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                if str(obj.Name).strip().lower() == key.lower():
+                    return obj
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
+def _select_worksheet(wb, name: str, label: str = ""):
+    """选中要打印的工作表 → `(sheet, activated)`；没指定/找不到 → `(None, False)`。
+
+    为什么要真的 `Activate()`：紧跟其后的 `_apply_print_options`（取 `wb.ActiveSheet`）与
+    `_export_worksheet_pdf(ws)` 都以"当前活动表"为准，不切过去就会变成"按表 2 的版式导表 1"。
+    切表还能让 `ExportResult.sheet` / 日志里的表名与用户选的一致。
+
+    找不到这张表（文件改名/删表/配置被手改）：回退活动工作表 + 记 warning，**不能**静默。
+    找到但引擎拒绝激活（隐藏表会抛 1004，只读状态偶尔也会）：仍然返回该表对象，调用方把
+    版式与导出都直接落到它身上 —— Excel 允许对隐藏表 `ExportAsFixedFormat`，不需要它变成
+    活动表。这条路上日志要明确"这一点是猜的"吗？不用：版式与导出目标同一张表，结果正确。
+    """
+    key = str(name or "").strip()
+    if not key:
+        return None, False
+    ws = _find_worksheet(wb, key)
+    if ws is None:
+        logger.warning(f"{label}: 工作簿里没有名为「{key}」的工作表，回退活动工作表"
+                       f"（文件可能改名/删表了，请在表格版式里重选）")
+        return None, False
+    try:
+        ws.Activate()
+        return ws, True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"{label}: 无法激活工作表「{key}」（隐藏表或引擎限制），"
+                       f"改为直接导出该表、版式也写到它身上: {e}")
+        return ws, False
+
+
+def _apply_print_options(wb, options: dict, label: str = "", target=None) -> dict[str, bool]:
     """在**临时副本**的工作簿上应用页面设置；返回逐项记账（多表时任一失败即 False）。
 
     写哪些表：`print_range=="workbook"` 时要导出全部工作表 ⇒ 全部写；否则只写参与导出的
-    活动工作表（与 `_export_with_com` 的导出粒度同一真相）。集合取不到 `Worksheets` 时
-    退回 `Sheets`（老 WPS），再取不到就只写活动工作表。
+    那张表 —— 有 `target`（用户在面板里选了工作表）就写它，没选就写活动工作表，与
+    `_export_with_com` 的导出粒度同一真相。集合取不到 `Worksheets` 时退回 `Sheets`
+    （老 WPS），再取不到就只写活动工作表。
     """
     sheets: list = []
     if options.get("print_range") == "workbook":
@@ -925,6 +1098,8 @@ def _apply_print_options(wb, options: dict, label: str = "") -> dict[str, bool]:
                     sheets.append(coll.Item(i) if hasattr(coll, "Item") else coll(i))
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"{label}: 取第 {i} 个工作表失败（跳过它的页面设置）: {e}")
+    elif target is not None:
+        sheets = [target]
     if not sheets:
         try:
             sheets = [wb.ActiveSheet]
@@ -989,9 +1164,21 @@ def _export_with_com(engine: str, abs_src: str, abs_out: str,
 
         options_applied: dict[str, bool] = {}
         whole_book = bool(options) and options.get("print_range") == "workbook"
+        # 用户选了具体工作表（且不是"整个工作簿"）⇒ 先切过去：下面的 PageSetup 写入与
+        # ExportAsFixedFormat 都认"当前活动表"，切过去这两步才落到同一张表上。
+        # 整簿导出时忽略该键（打全部表，切换哪张都没有意义）。
+        target_ws = None
+        if options is not None and not whole_book:
+            target_ws, _activated = _select_worksheet(wb, options.get("worksheet"), label)
+            if target_ws is not None:
+                ws = target_ws
+                try:
+                    sheet_name = str(ws.Name)
+                except Exception:  # noqa: BLE001
+                    sheet_name = str(options.get("worksheet") or "")
         if options is not None:
             logger.info(f"{label} 应用页面设置（只作用于临时副本）: {describe_print_options(options)}")
-            options_applied = _apply_print_options(wb, options, label)
+            options_applied = _apply_print_options(wb, options, label, target=target_ws)
             failed = sorted(k for k, ok in options_applied.items() if not ok)
             if failed:
                 logger.warning(
@@ -1006,11 +1193,11 @@ def _export_with_com(engine: str, abs_src: str, abs_out: str,
 
         if not os.path.isfile(abs_out) or os.path.getsize(abs_out) <= 0:
             raise XlsxExportError(f"{label} 报告成功但没有生成 PDF: {os.path.basename(abs_src)}")
-        if sheet_count > 1 and not whole_book:
+        if sheet_count > 1 and not whole_book and target_ws is None:
             logger.warning(
                 f"{label} 导出的是活动工作表「{sheet_name}」（该工作簿共 {sheet_count} 个工作表）。"
-                f"Excel 默认打印范围就是活动工作表；若用户要打其它表，请在 Excel 里切到那张表另存，"
-                f"或显式传 print_options={{'print_range': 'workbook'}}。"
+                f"Excel 默认打印范围就是活动工作表；要打别的表请在表格版式里选「工作表」，"
+                f"或显式传 print_options={{'print_range': 'workbook'}} 导整本。"
                 f" ({os.path.basename(abs_src)})")
         logger.info(
             f"{label} → PDF 完成: sheet=「{sheet_name}」({sheet_count} 个工作表)，"
@@ -1074,6 +1261,11 @@ def _export_with_libreoffice(abs_src: str, abs_out: str, print_options=None) -> 
             f"本次 PDF 不是按面板版式导出的（{describe_print_options(options)}）。"
             "若必须按此版式出纸，请安装 Microsoft Excel 或 WPS。"
             f" ({os.path.basename(abs_src)})")
+        if options.get("worksheet"):
+            logger.warning(
+                f"LibreOffice 不支持指定工作表：本次仍导出全部工作表，"
+                f"「{options.get('worksheet')}」这个选择没有生效"
+                f" ({os.path.basename(abs_src)})")
     import converter  # noqa: PLC0415
     converter._convert_office_via_libreoffice(abs_src, abs_out)
     if not os.path.isfile(abs_out) or os.path.getsize(abs_out) <= 0:

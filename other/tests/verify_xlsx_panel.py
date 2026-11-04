@@ -4,7 +4,8 @@
 需求（用户 2026-11）：
 1. 选中表格（.xls/.xlsx）时，右侧「双面模式」下方出现新模块，上下各一条分隔线。
 2. 模块含：页边距（上/下/左/右 cm）、页眉/页脚 cm、纸张方向、纸张大小、水平/垂直居中、
-   缩放（无缩放 / 调整为一页 / 所有列一页 / 所有行一页 + 自定义百分比）、打印范围四档。
+   缩放（无缩放 / 调整为一页 / 所有列一页 / 所有行一页 + 自定义百分比）、打印范围三档
+   （2026-11-03 去掉「选定区域」：Excel 的选区是会话内状态，COM 无人值守拿不到）。
 3. 值存 `PrintJob.xlsx_options`（持久化、可复制）；面板只收集参数，转换时才传给引擎。
 4. 多选按**整片选区**规则启停：混合选区里只写表格任务；灰掉（冻结）时一律不写回。
 5. 传引擎的键名必须与 task-5 契约逐字一致（print_options）。
@@ -29,7 +30,10 @@ sys.path.insert(0, LOCAL_TOOL)
 os.chdir(LOCAL_TOOL)
 
 import paths  # noqa: E402
-from PySide6.QtWidgets import QApplication, QFrame  # noqa: E402
+from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QWheelEvent  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QFrame, QFormLayout,  # noqa: E402
+                               QScrollArea, QAbstractSpinBox)
 
 app = QApplication.instance() or QApplication([])
 
@@ -92,10 +96,12 @@ check("水平/垂直居中都是 ThemedCheckBox",
 check("缩放是四档下拉 + 自定义百分比输入",
       win._xlsx_fit.count() == 4 and win._xlsx_scale.minimum() == 10
       and win._xlsx_scale.maximum() == 400)
-check("打印范围四档（活动工作表/整个工作簿/选定区域/忽略打印区域）",
-      win._xlsx_range.count() == 4
+check("打印范围三档（活动工作表/整个工作簿/忽略打印区域，选定区域已删）",
+      win._xlsx_range.count() == 3
       and win._xlsx_range.itemText(0) == "活动工作表"
-      and win._xlsx_range.itemText(3) == "忽略打印区域")
+      and win._xlsx_range.itemText(2) == "忽略打印区域"
+      and "选定区域" not in [win._xlsx_range.itemText(i)
+                             for i in range(win._xlsx_range.count())])
 check("面板文案没有 markdown 星号",
       not any("**" in w.text() for w in win._xlsx_box.findChildren(_gui.QLabel))
       and not any("**" in w.toolTip() for w in win._xlsx_box.findChildren(_gui.QLabel)))
@@ -212,6 +218,114 @@ check("引擎侧签名确实收 print_options（export_to_pdf / find_cached_pdf 
                                       encoding="utf-8").read())
 check("两处都没配过 ⇒ None ⇒ 引擎完全不碰版式（老用户行为不变）",
       resolve_xlsx_print_options({}, {}) is None)
+# 2026-11-03：删除「选定区域」这一档（见 RANGE_LABELS 上方注释）。老配置里残留的
+# "selection" 必须落成 active —— 绝不能掉到全局默认，否则默认设成「整个工作簿」的用户，
+# 老任务会突然变成导全部工作表（那正是删这一档想避免的"无声改行为"）。
+check("老配置 print_range=selection ⇒ 任务级归一成 active",
+      (resolve_xlsx_print_options({}, {"print_range": "selection"}) or {})
+      .get("print_range") == "active",
+      str(resolve_xlsx_print_options({}, {"print_range": "selection"})))
+check("老配置 selection 也不会继承全局默认（默认=workbook 时仍落 active）",
+      (resolve_xlsx_print_options({"print_range": "workbook"},
+                                  {"print_range": "selection"}) or {})
+      .get("print_range") == "active")
+check("削掉一档后引擎端白名单同步（PRINT_RANGES 不含 selection）",
+      "selection" not in xp.PRINT_RANGES and "selection" not in
+      _gui.RANGE_VALUES, f"{xp.PRINT_RANGES} / {_gui.RANGE_VALUES}")
+
+print("\n=== ⑨ 纯输入框 + 不再撑宽面板（2026-11-03 用户要求） ===")
+# 用户原话：「上下箭头删掉吧，纯输入框即可。以及注意表格版式（仅表格文件）这个模块的最小
+# 宽度是不是没有和其他的模块保持一致，发生了板面剪切。」两条都要钉住：
+#   ① 七个数字控件不许画上下箭头（数值校验/两位小数/单位后缀仍由 QAbstractSpinBox 保证）；
+#   ② 模块的出现不许抬升右侧参数面板的最小宽度（旧的两列式 QFormLayout 让它独占 248px）。
+_spins = ([win._xlsx_margins[k] for k in ("margin_top_cm", "margin_bottom_cm",
+                                          "margin_left_cm", "margin_right_cm")]
+          + [win._xlsx_header, win._xlsx_footer, win._xlsx_scale])
+check("七个数控控件都去掉了上下箭头（NoButtons）",
+      all(sp.buttonSymbols() == QAbstractSpinBox.NoButtons for sp in _spins),
+      str([sp.buttonSymbols() for sp in _spins]))
+check("仍然不是裸输入框：范围/两位小数/单位后缀都还在",
+      win._xlsx_margins["margin_top_cm"].decimals() == 2
+      and win._xlsx_margins["margin_top_cm"].suffix() == " cm"
+      and win._xlsx_margins["margin_top_cm"].minimum() == 0.0
+      and win._xlsx_margins["margin_top_cm"].maximum() == 20.0
+      and win._xlsx_scale.suffix() == " %" and win._xlsx_scale.minimum() == 10
+      and win._xlsx_scale.maximum() == 400)
+check("标签在上、控件在下（WrapAllRows，与份数/单双面等模块同一排版）",
+      any(fl.rowWrapPolicy() == QFormLayout.WrapAllRows
+          for fl in win._xlsx_box.findChildren(QFormLayout)))
+_sp_top = win._xlsx_margins["margin_top_cm"]
+_v0 = _sp_top.value()
+QApplication.sendEvent(
+    _sp_top,
+    QWheelEvent(QPointF(6, 6), QPointF(_sp_top.mapToGlobal(QPoint(6, 6))),
+                QPoint(0, 0), QPoint(0, 120), Qt.NoButton, Qt.NoModifier,
+                Qt.NoScrollPhase, False))
+check("滚轮压在页边距输入框上不改数值（转发给面板滚动）", _sp_top.value() == _v0,
+      f"{_v0} -> {_sp_top.value()}")
+_sw = win._xlsx_box
+while _sw is not None and not isinstance(_sw, QScrollArea):
+    _sw = _sw.parentWidget()
+check("表格版式面板挂在 QScrollArea 里（下面的宽度判据才有意义）", _sw is not None)
+win.show()
+QApplication.processEvents()
+_content = _sw.widget()
+# 判据 1：模块自己的最小宽度要和面板里其它模块同量级（最宽的其它控件是 DPI 下拉 126）。
+# 旧的两列式 + 带箭头 + 长文案下拉是 166/248，比其它模块都宽 ⇒ 面板一窄就裁它。
+_other_w = max(win._edit_dpi.minimumSizeHint().width(),
+               win._edit_engine.minimumSizeHint().width())
+check("模块最小宽度与面板其它模块同量级（≤ 最宽者 +8）",
+      win._xlsx_box.minimumSizeHint().width() <= _other_w + 8,
+      f"模块 {win._xlsx_box.minimumSizeHint().width()} vs 其它最宽 {_other_w}")
+# 判据 2：整块面板的最小宽度不再被这个模块顶到 248（旧口径）。真机（windows 平台 + 中文字体）
+# 实测 148 = DPI 下拉 126 + 组框边距 22，比默认面板宽度 180 还窄 ⇒ 内容整块放得下、不出现
+# 横向滚动条（用户现场「板面剪切」的直接症状）。offscreen 没有中文字体、度量偏大，所以这里
+# 用 200 这个上限做回归闸门，真机具体值由下面的 extra 打出来。
+check("面板最小宽度已降下来（≤ 200，旧口径 248；真机实测 148 < 默认面板宽 180）",
+      _content.minimumSizeHint().width() <= 200,
+      f"面板内容最小 {_content.minimumSizeHint().width()}（真机 148 / 旧口径 248）")
+
+check("面板最小宽度不再由表格版式模块决定（= 其它模块的 148 量级）",
+      _content.minimumSizeHint().width() <= _other_w + 22 + 8,
+      f"面板内容最小 {_content.minimumSizeHint().width()}（旧口径 248）")
+
+print("\\n=== ⑩ 面板拖到最窄也不出横向滚动条（2026-11-03 用户第二次现场） ===")
+# 用户原话：「当任务参数面板缩小到最小时，底部会出现滚动条 … 让任务面板变为最小时，
+# 不会出现滚动条。」旧代码把容器最小宽度砍到 minimumSizeHint 的一半，面板到最窄时
+# 视口 134px < 内容 148px ⇒ 底部横向滚动条。现在最小宽度 = 内容最小宽度 + 边框/竖滚动条。
+_panel = win._edit_panel
+_edit_sw = win._edit_scroll
+_check_sw = _panel.parentWidget()
+check("面板的最小宽度给足了自身 chrome（内容最小宽度 + 边框/竖滚动条）",
+      _panel.minimumWidth() >= _content.minimumSizeHint().width() + 12,
+      f"面板最小 {_panel.minimumWidth()} vs 内容 {_content.minimumSizeHint().width()}")
+
+
+def _shrink_panel_to_min():
+    """把右侧面板拖到它自己的最小宽度（模拟用户拖到最窄）。"""
+    _tot = sum(_check_sw.sizes())
+    _check_sw.setSizes([max(1, _tot - _panel.minimumWidth()), _panel.minimumWidth()])
+    QApplication.processEvents()
+
+
+_shrink_panel_to_min()
+check("面板拖到最窄后不出横向滚动条",
+      not _edit_sw.horizontalScrollBar().isVisible(),
+      f"视口 {_edit_sw.viewport().width()} / 内容 {_content.width()}")
+check("面板拖到最窄后内容没被横向裁切（内容宽度 ≥ 其最小宽度）",
+      _content.width() >= _content.minimumSizeHint().width(),
+      f"内容 {_content.width()} vs 最小 {_content.minimumSizeHint().width()}")
+# 变异自证：把最小宽度故意调小 30px，再看滚动条是否真的会冒出来（证明上面两条不是恒真）
+_keep_min = _panel.minimumWidth()
+_panel.setMinimumWidth(max(80, _keep_min - 30))
+_shrink_panel_to_min()
+_mutated_hbar = _edit_sw.horizontalScrollBar().isVisible()
+_panel.setMinimumWidth(_keep_min)
+_shrink_panel_to_min()
+check("变异自证：最小宽度调小 30px 时横向滚动条确实会出现",
+      _mutated_hbar and not _edit_sw.horizontalScrollBar().isVisible(),
+      f"调小后 hbar={_mutated_hbar}，恢复后 hbar={_edit_sw.horizontalScrollBar().isVisible()}")
+
 
 win._cloud_client = None
 win.close()

@@ -392,17 +392,21 @@ res, wb, app, out = _run_com({"print_range": "ignore_area"}, out_name="area_igno
 eq("print_range=ignore_area ⇒ PrintArea=''（清空）",
     wb.ActiveSheet._ps.writes.get("PrintArea"), "")
 
+# 2026-11-03：「选定区域」已从支持列表删除（Excel 的选区是会话内状态，COM 无人值守打开
+# 时拿不到，旧实现只能拿 UsedRange 顶替、还会覆盖文件自带的打印区域）。老配置里可能还存着
+# 这个值 ⇒ 必须回退成 active（= 不写 PrintArea），而不是悄悄用整张已用区域盖掉打印区域。
 with LogCapture() as cap:
     res, wb, app, out = _run_com({"print_range": "selection"}, out_name="area_selection.pdf")
-eq("print_range=selection ⇒ PrintArea=UsedRange.Address",
-    wb.ActiveSheet._ps.writes.get("PrintArea"), "$A$1:$F$20")
-chk("selection 在日志里说明「COM 侧没有真实选区，用已用区域顶替」",
-    "selection" in cap.text and "没有真实选区" in cap.text, cap.text[:200])
+chk("老配置 print_range=selection ⇒ 回退 active、不写 PrintArea（不覆盖文件里的打印区域）",
+    "PrintArea" not in wb.ActiveSheet._ps.writes, str(wb.ActiveSheet._ps.writes))
+eq("归一化后的 print_options 里是 active", res.print_options.get("print_range"), "active")
+chk("日志明写「不是支持的取值」+ 回退 active（不静默丢弃）",
+    "print_range" in cap.text and "回退 active" in cap.text, cap.text[:300])
 
 chk("选项全部生效 ⇒ ExportResult.options_honored=True",
     res.options_honored and all(res.options_applied.values()), str(res.options_applied))
 chk("ExportResult 带回归一化后的 print_options（便于 GUI/日志核对）",
-    res.print_options.get("paper") == "A4" and res.print_options.get("print_range") == "selection")
+    res.print_options.get("paper") == "A4" and res.print_options.get("print_range") == "active")
 
 # ============================================================
 # C. workbook 导出分支（打印整个工作簿）

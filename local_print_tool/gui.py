@@ -176,22 +176,41 @@ def _sort_urgency_keys(keys) -> list:
     return known + rest
 
 
+class _WheelToScrollAreaFilter(QObject):
+    """把控件上的滚轮事件转发给最近的 QScrollArea（找不到就吞掉）。
+
+    QComboBox / QAbstractSpinBox 默认会吃掉滚轮：在可滚动的参数面板里，滚轮压在下拉框或
+    数字框上就变成「改值」（换档位、页边距 ±0.1），面板反而不滚 —— 等于「一滚就改参数」。
+    两种控件共用这一个过滤器（父对象挂到被过滤的控件上，生命周期与之相同）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel:
+            # 查找最近的 QScrollArea 并转发滚轮事件
+            w = obj.parent()
+            while w is not None:
+                if isinstance(w, QScrollArea):
+                    QApplication.sendEvent(w.viewport(), event)
+                    return True
+                w = w.parent()
+            return True  # 找不到 ScrollArea 则吞掉
+        return super().eventFilter(obj, event)
+
+
 def _disable_combo_wheel(combo: QComboBox) -> None:
     """禁止 QComboBox 响应鼠标滚轮事件，改为转发给父 QScrollArea 实现滚动。"""
-    class _WheelBlocker(QObject):
-        def eventFilter(self, obj, event):
-            if event.type() == QEvent.Wheel:
-                # 查找最近的 QScrollArea 并转发滚轮事件
-                w = obj.parent()
-                while w is not None:
-                    if isinstance(w, QScrollArea):
-                        QApplication.sendEvent(w.viewport(), event)
-                        return True
-                    w = w.parent()
-                return True  # 找不到 ScrollArea 则吞掉
-            return super().eventFilter(obj, event)
+    combo.installEventFilter(_WheelToScrollAreaFilter(combo))
 
-    combo.installEventFilter(_WheelBlocker(combo))
+
+def _disable_spin_wheel(spin: QAbstractSpinBox) -> None:
+    """禁止数字输入框响应鼠标滚轮（与 _disable_combo_wheel 同一套转发行为）。
+
+    数字框被滚一下就改值、还顺手写回任务参数，比下拉框更该拦（2026-11-03）。
+    """
+    spin.installEventFilter(_WheelToScrollAreaFilter(spin))
 
 
 class _OwnerComboRefreshFilter(QObject):
@@ -2484,8 +2503,16 @@ class PrintSpeedDialog(QDialog):
 # 顺序与 printer_config 的 TASK_OPTION_FITS / TASK_OPTION_RANGES 逐位对应。
 FIT_LABELS = ("无缩放", "将工作表调整为一页", "将所有列调整为一页", "将所有行调整为一页")
 FIT_VALUES = ("none", "sheet", "cols", "rows")
-RANGE_LABELS = ("活动工作表", "整个工作簿", "选定区域", "忽略打印区域")
-RANGE_VALUES = ("active", "workbook", "selection", "ignore_area")
+# 打印范围（2026-11-03 去掉「选定区域」）：Excel 的「选定区域」= 打印那一刻**眼下高亮的
+# 单元格**，是会话内状态、不会存进 xlsx；本工具在后台用 COM 无人值守打开文件，根本没有
+# 「用户选区」这回事 —— 旧实现只能拿 UsedRange 顶替，效果等于「活动工作表」，却还会把
+# 文件里自带的打印区域覆盖掉。删掉这一档，老配置里的 "selection" 由引擎回退成 "active"。
+RANGE_LABELS = ("活动工作表", "整个工作簿", "忽略打印区域")
+RANGE_VALUES = ("active", "workbook", "ignore_area")
+# 「工作表」下拉的第一项（= 不选表）。它不是 RANGE_VALUES 那种枚举，而是"文件里现有哪些表"
+# 的动态列表的第一项；文案里**不放**文件名，因为文件名已经显示在任务行上，重复只会把
+# QComboBox 撑宽。
+XLSX_WORKSHEET_FOLLOW_LABEL = "跟随文件"
 IMAGE_ORIENT_LABELS = ("自动方向", "横向", "竖向")
 IMAGE_ORIENT_VALUES = ("auto", "landscape", "portrait")
 ORIENTATION_LABELS = ("纵向", "横向")
@@ -2521,7 +2548,7 @@ class DefaultTaskOptionsDialog(QDialog):
       · 页面：纸张大小（A4/A3/A5/Letter/Legal/B5，**对 Word/PDF/图片/表格全部生效**）、
         方向、四边页边距、页眉页脚、水平/垂直居中；
       · 缩放与打印范围：无缩放 / 将工作表调整为一页 / 所有列一页 / 所有行一页 + 自定义
-        百分比，活动工作表 / 整个工作簿 / 选定区域 / 忽略打印区域；
+        百分比，活动工作表 / 整个工作簿 / 忽略打印区域；
       · 其它：DPI、图片方向、排除末尾空白页、封面单独打印。
 
     语义（**别改**）：用户从没打开过这个窗口并保存 ⇒ `PrinterConfig.default_task_options`
@@ -2589,6 +2616,8 @@ class DefaultTaskOptionsDialog(QDialog):
             sp.setSuffix(" cm")
             sp.setValue(float(opts[key]))
             sp.setToolTip("表格版式的页边距；Word/PDF 的排版由文档自己决定，不受这一项影响")
+            # 纯输入框：去掉上下箭头（与右侧「任务参数」面板同一口径，2026-11-03）
+            sp.setButtonSymbols(QAbstractSpinBox.NoButtons)
             self._margin_spins[key] = sp
             f2.addRow(label, sp)
 
@@ -2598,6 +2627,7 @@ class DefaultTaskOptionsDialog(QDialog):
         self._header.setSingleStep(0.1)
         self._header.setSuffix(" cm")
         self._header.setValue(float(opts["header_cm"]))
+        self._header.setButtonSymbols(QAbstractSpinBox.NoButtons)
         f2.addRow("页眉：", self._header)
         self._footer = QDoubleSpinBox()
         self._footer.setRange(0.0, 10.0)
@@ -2605,6 +2635,7 @@ class DefaultTaskOptionsDialog(QDialog):
         self._footer.setSingleStep(0.1)
         self._footer.setSuffix(" cm")
         self._footer.setValue(float(opts["footer_cm"]))
+        self._footer.setButtonSymbols(QAbstractSpinBox.NoButtons)
         f2.addRow("页脚：", self._footer)
 
         center_row = QHBoxLayout()
@@ -10137,8 +10168,9 @@ class MainWindow(QMainWindow):
     def _xlsx_panel_values(self) -> dict:
         """面板控件当前值 → 表格引擎认的那一组键（纯读，不写任何状态）。
 
-        与 `printer_config.task_options_to_print_options` 同一套键名（13 个），
-        这样写进 `job.xlsx_options` 的东西能原样喂给 `export_to_pdf(print_options=...)`。
+        与 `printer_config.task_options_to_print_options` 同一套键名（14 个，含 2026-11-03
+        新增的 `worksheet`），这样写进 `job.xlsx_options` 的东西能原样喂给
+        `export_to_pdf(print_options=...)`。
         """
         margins = {}
         for key, sp in (getattr(self, "_xlsx_margins", None) or {}).items():
@@ -10155,9 +10187,52 @@ class MainWindow(QMainWindow):
             "scale": int(self._xlsx_scale.value()),
             "print_range": RANGE_VALUES[
                 _index_of(RANGE_LABELS, self._xlsx_range.currentText())],
+            # 用 itemData 而不是 currentText：第一项（跟随）的文案是给人看的，数据是 ""
+            "worksheet": str(self._xlsx_worksheet.currentData() or ""),
         }
         opts.update(margins)
         return task_options_to_print_options(opts)
+
+    def _sync_xlsx_worksheet_items(self, job, wanted: str = ""):
+        """把「工作表」下拉填成**这个文件里真实存在**的表名，并选中 `wanted`（任务里存的选择）。
+
+        列表来源是文件本身（`xlsx_printer.list_worksheet_names`，解 zip 读表名，不启动
+        Excel）；读不出表名（.xls 老格式 / 加密 / 损坏 / 文件已被移走）时只留「跟随」一项 ——
+        宁可让用户看到"这项没得选"，也不要摆一堆猜的表名。
+
+        为什么以 `sheet_jobs[0]` 的文件为准：`_sync_xlsx_panel` 本来就是"按选区第一个表格
+        任务填值"（其它版式项同一条规则）；多选不同文件时面板只可能显示一份列表，这里不
+        另起一套规则。
+
+        存着的表名不在列表里（文件改名/删表）时**仍然显示出来**并标注"已没有这张表"：
+        否则面板会跳回"跟随"，用户以为选择还在，实际导出时引擎按旧名字回退到活动工作表 ——
+        这就是"选了 A 却打 B"的静默错版，必须让他看见。
+        """
+        combo = getattr(self, "_xlsx_worksheet", None)
+        if combo is None:
+            return
+        wanted = str(wanted or "")
+        names: list[str] = []
+        fp = str(getattr(job, "file_path", "") or "")
+        if fp:
+            try:
+                import xlsx_printer as _xp      # 延迟 import：gui 顶部不引引擎（既有口径）
+                names = list(_xp.list_worksheet_names(fp) or [])
+            except Exception as e:  # noqa: BLE001 —— 列不出表名不该挡住面板
+                logger.debug(f"表格版式：读取工作表名失败（{fp}）: {e}")
+        stale = bool(wanted) and wanted not in names
+        combo.blockSignals(True)                 # 只展示，不触发写回
+        try:
+            combo.clear()
+            combo.addItem(XLSX_WORKSHEET_FOLLOW_LABEL, "")
+            for name in names:
+                combo.addItem(name, name)
+            if stale:
+                combo.addItem(f"{wanted}（文件里已没有这张表）", wanted)
+            idx = combo.findData(wanted) if wanted else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
 
     def _sync_xlsx_scale_enabled(self):
         """「自定义缩放」只在缩放方式选「无缩放」时可用（其余档位百分比没有意义）。"""
@@ -10218,6 +10293,9 @@ class MainWindow(QMainWindow):
             self._xlsx_panel_shown = show
             for w in (self._xlsx_sep_top, self._xlsx_box, self._xlsx_sep_bottom):
                 w.setVisible(show)
+            # 这块的出现/消失会改变面板内容的最小宽度 ⇒ 面板最小宽度跟着重算，
+            # 否则最窄时（或非表格文件时）纵向滚动条/横向滚动条判断会对不上。
+            self._sync_edit_panel_min_width()
             if not show:
                 return
             opts = self._effective_xlsx_options(sheet_jobs[0])
@@ -10255,6 +10333,9 @@ class MainWindow(QMainWindow):
             self._xlsx_range.setCurrentIndex(
                 _index_of(RANGE_VALUES, str(opts.get("print_range", "active"))))
             self._xlsx_range.blockSignals(False)
+            # 工作表：先把列表重填成这个文件里真实存在的表（含已存但已不存在的旧名字），
+            # 再选中任务存的那张。blockSignals 保证只展示、不触发写回。
+            self._sync_xlsx_worksheet_items(sheet_jobs[0], str(opts.get("worksheet") or ""))
 
             _enable = not frozen
             for w in (getattr(self, "_xlsx_widgets", None) or []):
@@ -10819,50 +10900,71 @@ class MainWindow(QMainWindow):
 
         _xform = QFormLayout()
         _xform.setContentsMargins(0, 0, 0, 0)
-        _xform.setSpacing(4)
+        _xform.setSpacing(6)
+        # 排版口径：**标签在上、控件在下**，与面板其余模块（份数 / 单双面 / 双面模式 / DPI…）
+        # 完全一致。旧写法是「标签在左、控件在右」：标签列（最长「页边距 上：」）和控件列的
+        # 最小宽度叠在一起，模块最小宽度 248px，比面板里任何其它模块都宽 ⇒ 它单独决定了
+        # 右侧面板的最小宽度，窗口一窄就从右边缘把内容裁掉（2026-11-03 用户现场截图）。
+        # WrapAllRows 之后模块最小宽度 = max(标签, 控件) ≈ 其它模块的一行控件，不再撑宽面板
+        # （验收：other/tests/verify_xlsx_panel.py ⑨「模块最小宽度与面板其它模块同量级」）。
+        _xform.setRowWrapPolicy(QFormLayout.WrapAllRows)
+        _xform.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        _xform.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # 控件一律「宽度听面板的」：下拉框按最长条目报最小宽度（「缩放」那档 155px），
+        # 于是模块最小宽度仍然是 166、比面板里其它模块（最宽 DPI 126）都宽 ⇒ 面板一窄
+        # 就轮到它被裁。与同一面板的 selectedFileLabel / 备注框**同策略**：水平
+        # QSizePolicy.Ignored + minimumWidth(0)，宽度完全由面板给。
+        def _fit_width(w: QWidget) -> QWidget:
+            w.setMinimumWidth(0)
+            w.setSizePolicy(QSizePolicy.Ignored, w.sizePolicy().verticalPolicy())
+            return w
+        # 纯输入框（2026-11-03 用户要求）：这一组数字全部去掉上下箭头 —— 数值范围、两位
+        # 小数、「cm」后缀仍由 QDoubleSpinBox 保证，只是不再画那两个按钮（顺带每行省掉
+        # ~16px 最小宽度，配合上面的两行式排版不再撑宽面板）。滚轮也一并禁掉：面板可滚动，
+        # 滚轮压在数字框上原本会「滚一下就改页边距」并立刻写回任务。
+        def _cm_spin(lo: float, hi: float, tip: str) -> QDoubleSpinBox:
+            sp = QDoubleSpinBox()
+            sp.setRange(lo, hi)
+            sp.setDecimals(2)
+            sp.setSingleStep(0.1)
+            sp.setSuffix(" cm")
+            sp.setToolTip(tip)
+            sp.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            _disable_spin_wheel(sp)
+            sp.valueChanged.connect(self._auto_apply_edit)
+            return sp
+
         # 页边距（cm）：与 Excel「页面布局 → 页边距」同名同序
         self._xlsx_margins: dict = {}
         for _key, _cap in (("margin_top_cm", "页边距 上"), ("margin_bottom_cm", "页边距 下"),
                            ("margin_left_cm", "页边距 左"), ("margin_right_cm", "页边距 右")):
-            _sp = QDoubleSpinBox()
-            _sp.setRange(0.0, 20.0)
-            _sp.setDecimals(2)
-            _sp.setSingleStep(0.1)
-            _sp.setSuffix(" cm")
-            _sp.setToolTip("表格打印的页边距（厘米）；只对表格文件生效")
-            _sp.valueChanged.connect(self._auto_apply_edit)
+            _sp = _cm_spin(0.0, 20.0, "表格打印的页边距（厘米）；只对表格文件生效")
             self._xlsx_margins[_key] = _sp
             _xform.addRow(_cap + "：", _sp)
-        self._xlsx_header = QDoubleSpinBox()
-        self._xlsx_header.setRange(0.0, 10.0)
-        self._xlsx_header.setDecimals(2)
-        self._xlsx_header.setSingleStep(0.1)
-        self._xlsx_header.setSuffix(" cm")
-        self._xlsx_header.setToolTip("页眉距纸张上边缘的距离")
-        self._xlsx_header.valueChanged.connect(self._auto_apply_edit)
+        self._xlsx_header = _cm_spin(0.0, 10.0, "页眉距纸张上边缘的距离")
         _xform.addRow("页眉：", self._xlsx_header)
-        self._xlsx_footer = QDoubleSpinBox()
-        self._xlsx_footer.setRange(0.0, 10.0)
-        self._xlsx_footer.setDecimals(2)
-        self._xlsx_footer.setSingleStep(0.1)
-        self._xlsx_footer.setSuffix(" cm")
-        self._xlsx_footer.setToolTip("页脚距纸张下边缘的距离")
-        self._xlsx_footer.valueChanged.connect(self._auto_apply_edit)
+        self._xlsx_footer = _cm_spin(0.0, 10.0, "页脚距纸张下边缘的距离")
         _xform.addRow("页脚：", self._xlsx_footer)
 
-        self._xlsx_orientation = _combo(ORIENTATION_LABELS)
+        self._xlsx_orientation = _fit_width(_combo(ORIENTATION_LABELS))
         _disable_combo_wheel(self._xlsx_orientation)
         self._xlsx_orientation.setToolTip("表格的纸张方向")
         self._xlsx_orientation.currentIndexChanged.connect(self._auto_apply_edit)
         _xform.addRow("纸张方向：", self._xlsx_orientation)
 
-        self._xlsx_paper = _combo(PAPER_SIZES)
+        self._xlsx_paper = _fit_width(_combo(PAPER_SIZES))
         _disable_combo_wheel(self._xlsx_paper)
         self._xlsx_paper.setToolTip("表格的纸张大小；与全局默认纸张同源")
         self._xlsx_paper.currentIndexChanged.connect(self._auto_apply_edit)
         _xform.addRow("纸张大小：", self._xlsx_paper)
 
-        _xcenter = QHBoxLayout()
+        # 居中行：两个复选框并排本来就报 166px（80+80+间距），比其它模块都宽；外面套一层
+        # 「宽度听面板的」容器，换来整块不再决定面板最小宽度。上下叠放而不是并排：面板能拖到
+        # 150px 视口，并排时每个复选框各要 80px，「垂直居中」会被切掉半个字（2026-11-03 截图）。
+        _xlsx_center_row = _fit_width(QWidget())
+        _xcenter = QVBoxLayout(_xlsx_center_row)
+        _xcenter.setContentsMargins(0, 0, 0, 0)
+        _xcenter.setSpacing(2)
         self._xlsx_center_h = ThemedCheckBox("水平居中", theme_manager=self._theme_manager)
         self._xlsx_center_h.setToolTip("表格内容在纸张左右方向居中")
         self._xlsx_center_h.clicked.connect(self._auto_apply_edit)
@@ -10871,10 +10973,9 @@ class MainWindow(QMainWindow):
         self._xlsx_center_v.setToolTip("表格内容在纸张上下方向居中")
         self._xlsx_center_v.clicked.connect(self._auto_apply_edit)
         _xcenter.addWidget(self._xlsx_center_v)
-        _xcenter.addStretch(1)
-        _xform.addRow("居中：", _xcenter)
+        _xform.addRow("居中：", _xlsx_center_row)
 
-        self._xlsx_fit = _combo(FIT_LABELS)
+        self._xlsx_fit = _fit_width(_combo(FIT_LABELS))
         _disable_combo_wheel(self._xlsx_fit)
         self._xlsx_fit.setToolTip("表格缩放方式；选「无缩放」时用下面的自定义百分比")
         self._xlsx_fit.currentIndexChanged.connect(self._on_xlsx_fit_changed)
@@ -10885,14 +10986,33 @@ class MainWindow(QMainWindow):
         self._xlsx_scale.setSingleStep(5)
         self._xlsx_scale.setSuffix(" %")
         self._xlsx_scale.setToolTip("自定义缩放百分比（只在缩放选「无缩放」时使用）")
+        # 同上面那组 cm 输入：纯输入框，不画上下箭头，也不吃滚轮
+        self._xlsx_scale.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        _disable_spin_wheel(self._xlsx_scale)
         self._xlsx_scale.valueChanged.connect(self._auto_apply_edit)
         _xform.addRow("自定义缩放：", self._xlsx_scale)
 
-        self._xlsx_range = _combo(RANGE_LABELS)
+        self._xlsx_range = _fit_width(_combo(RANGE_LABELS))
         _disable_combo_wheel(self._xlsx_range)
-        self._xlsx_range.setToolTip("表格打印范围（活动工作表 / 整个工作簿 / 选定区域 / 忽略打印区域）")
+        self._xlsx_range.setToolTip("表格打印范围（活动工作表 = 尊重文件里的打印区域 / 整个工作簿 / "
+                                    "忽略打印区域 = 清掉打印区域、按已用区域打）")
         self._xlsx_range.currentIndexChanged.connect(self._auto_apply_edit)
         _xform.addRow("打印范围：", self._xlsx_range)
+
+        # 工作表（2026-11-03 用户需求）：默认「跟随文件的活动工作表」，即与在 Excel 里直接
+        # Ctrl+P 打出来的那张表一致 —— 没改过这一项的老用户出纸与改动前逐字节相同。
+        # 选项列表来自**文件本身**（xlsx_printer.list_worksheet_names 只解 zip 读表名，
+        # 不启动 Excel：COM 起一个实例要好几秒，下拉框等不起）；没选中表格、或 .xls 老格式
+        # 读不出表名时只剩"跟随"一项。必须复用 _fit_width，否则最长的表名（Excel 上限 31
+        # 字符）会把面板最小宽度顶回 166+，整块面板被挤到出横向滚动条。
+        self._xlsx_worksheet = _fit_width(_combo([XLSX_WORKSHEET_FOLLOW_LABEL]))
+        _disable_combo_wheel(self._xlsx_worksheet)
+        self._xlsx_worksheet.setToolTip(
+            "这张表格要打哪个工作表（列表就是这个文件里有的表）。"
+            "默认「跟随文件」= 打文件上次保存时的那张活动工作表，与在 Excel 里直接打印一致；"
+            "打印范围选「整个工作簿」时本项不生效（打全部表）。")
+        self._xlsx_worksheet.currentIndexChanged.connect(self._auto_apply_edit)
+        _xform.addRow("工作表：", self._xlsx_worksheet)
         _xl.addLayout(_xform)
 
         self._xlsx_follow_btn = QPushButton("跟随默认")
@@ -10922,6 +11042,7 @@ class MainWindow(QMainWindow):
             self._xlsx_orientation, self._xlsx_paper,
             self._xlsx_center_h, self._xlsx_center_v,
             self._xlsx_fit, self._xlsx_scale, self._xlsx_range,
+            self._xlsx_worksheet,
             self._xlsx_follow_btn,
         ]
         self._xlsx_widgets.extend(list(self._xlsx_margins.values()))
@@ -11036,6 +11157,9 @@ class MainWindow(QMainWindow):
         remark_gl = QVBoxLayout(remark_gb)
         remark_gl.setContentsMargins(8, 8, 8, 8)
         self._label_remark = QLabel("订单备注（选填，最多 100 字；云端订单自动同步）")
+        # 面板可以拖到 ~170px 宽，这行不换行就会被右侧裁掉半句（2026-11-03 现场截图），
+        # 换行后窄面板下也是完整一句话。
+        self._label_remark.setWordWrap(True)
         self._label_remark.setObjectName("sectionHint")
         remark_gl.addWidget(self._label_remark)
         self._edit_remark = QPlainTextEdit()
@@ -11057,13 +11181,45 @@ class MainWindow(QMainWindow):
         v_splitter.setSizes([580, 60])       # 初始：参数区占满，备注区约两行（≈60px），可拖拽调高
         layout.addWidget(v_splitter, 1)
 
-        # 最小宽度限制：右侧面板受内部控件 minimumSizeHint 累积影响，会把水平 splitter
-        # 撑得比期望宽（左侧文件表格被压缩）。显式把容器最小宽度压到其当前最小尺寸提示的
-        # 一半（保证内容可用前提下，面板更窄、表格获得更多空间）。
-        _hint_w = container.minimumSizeHint().width()
-        container.setMinimumWidth(max(100, _hint_w // 2))
+        # 最小宽度：右侧面板的最小宽度必须 ≥「滚动内容的最小宽度 + 竖滚动条 + 边框」。
+        # 旧代码把最小宽度砍到 `_hint_w // 2`（为了多给左侧文件表格腾空间），代价是面板拖到
+        # 最窄时视口只剩 134px、而内容要 148px ⇒ 底部冒出横向滚动条（2026-11-03 用户现场）。
+        # 现在改成「内容真需要多少就多少」，并在显隐变化后重算（见 _sync_edit_panel_min_width）。
+        self._edit_scroll = scroll
+        self._edit_scroll_content = scroll_content
+        self._edit_panel = container
+        self._sync_edit_panel_min_width()
 
         return container
+
+    def _sync_edit_panel_min_width(self) -> None:
+        """把右侧任务参数面板的最小宽度对齐到「内容真正需要的最小宽度」。
+
+        为什么不用 `minimumSizeHint().width() // 2` 那种写法：面板是可滚动区域，砍半之后
+        内容比视口宽，Qt 就画一条横向滚动条 —— 参数面板变最窄时底部永远挂着一条，
+        看起来像布局坏了。表格版式模块（仅表格文件）出现/消失会改变内容最小宽度，
+        所以表选择变化时也要重算一次。"""
+        content = getattr(self, "_edit_scroll_content", None)
+        scroll = getattr(self, "_edit_scroll", None)
+        panel = getattr(self, "_edit_panel", None)
+        if content is None or scroll is None or panel is None:
+            return
+        lay = content.layout()
+        if lay is not None:
+            lay.invalidate()   # 显隐刚变过：先让布局重新算，minimumSizeHint 才是新的
+            lay.activate()
+        # 面板减去滚动视口的那部分宽度 = 面板布局左右边距 + 滚动区边框 + 竖向滚动条。
+        # 少算这几像素就会在最窄时冒横向滚动条，所以再留 2px 给不同 DPI 的取整。
+        margin = 0
+        panel_lay = panel.layout()
+        if panel_lay is not None:
+            m = panel_lay.contentsMargins()
+            margin = m.left() + m.right()
+        chrome = (margin
+                  + scroll.frameWidth() * 2
+                  + scroll.verticalScrollBar().sizeHint().width()
+                  + 2)
+        panel.setMinimumWidth(content.minimumSizeHint().width() + chrome)
 
     def _setup_button_bar(self) -> QHBoxLayout:
         """底部按钮栏。"""
