@@ -70,6 +70,11 @@ ENV_REQUIRED: dict[str, str] = {
     "verify_order_status_edit_adversarial.mjs": "需 Playwright / 真实浏览器（同一功能的对抗式 UI 探针："
                                                 "控制台绕过、本地模式跨库 id、零请求判据的变异自证；"
                                                 "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
+    # 2026-11-04 现场：中文输入法打不进订单搜索框 —— 组字期间不许重绘，只能靠真实 DOM
+    # 派发 compositionstart/end + input 才验证得了（静态 grep 看不出输入框有没有被换掉）。
+    "verify_settlement_search_ime.mjs": "需 Playwright / 真实浏览器（输入法组字期间搜索框会不会被重绘"
+                                        "换掉，只能靠真实 DOM 事件 + 节点同一性判定；"
+                                        "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",
     "verify_finance_setup_merge_render.mjs": "需 Playwright / 真实浏览器（「首次设置按钮常驻」与"
                                             "「未解锁就弹合并且必定 403」两处 UI 逻辑只能靠真实渲染量："
                                             "桩后端 + 真实 settlement.html，并渲染 HEAD 旧版作反向自证；"

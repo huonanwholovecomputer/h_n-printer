@@ -3290,6 +3290,13 @@ var _ORDERS_PAGE_OPTIONS = [10, 20, 50, 100];
 /* v7.15：订单明细搜索词（文件名 / 备注，大小写不敏感）。只筛「当前已加载」的订单，
    不触发重新拉数；分页与列表跟着变，KPI / 图表 / 页脚统计仍用 filteredOrders（口径不变）。 */
 var _ordersSearch = '';
+/* 2026-11-04 现场：中文输入法打不进搜索框（英文能打、粘贴正常）。
+   根因是「输入即筛」每次 input 都把整个 #cloud-orders 的 outerHTML 换掉 —— 输入框本身
+   跟着被重建，而输入法正在组字时元素消失 = 那串拼音连同候选一起被丢掉，于是只有中文进不去。
+   两道锁：① 组字期间（compositionstart→compositionend）只记词、绝不重绘；
+          ② 同一搜索词不重复重绘（compositionend 之后浏览器往往还会补一个 input）。 */
+var _ordersSearchComposing = false;
+var _ordersSearchRendered = null;   // 上一次真正画进 DOM 的搜索词（null = 还没画过）
 var _cloudCompare = null, _cloudCompareMonth = null, _cloudCompareLoading = false;  // 上月环比（懒加载+缓存，仅自然月口径）
 var _cloudDataFetchedAt = null;           // 最近一次成功同步时间
 var _ddOpen = null;                       // 口径栏多选下拉展开项：'members' | 'sources' | null
@@ -5209,6 +5216,7 @@ function _rerenderOrdersOnly(scroll) {
   var el = document.getElementById('cloud-orders');
   if (!el || !_cloudData) return;
   el.outerHTML = _renderOrderListHTML();
+  _ordersSearchRendered = _ordersSearch;   // 记住真正画进 DOM 的词（去重判据，见 onOrdersSearch）
   if (scroll) _scrollToOffset('cloud-orders');
 }
 /* 分页事件（参考小程序 onPageChange/onPrevPage/onNextPage/onSelectPageSize） */
@@ -5243,9 +5251,14 @@ function onOrdersPerPage(v) {
    只筛「当前已加载」的订单（文件名 / 备注），不重新拉数；列表与分页跟着变，
    KPI / 趋势 / 图表 / 页脚统计仍用 filteredOrders —— 搜索不改结算口径。
    重绘后把焦点与光标还给输入框，连续打字不会断。 */
-function onOrdersSearch(v) {
+function onOrdersSearch(v, fromComposition) {
   _ordersSearch = String(v == null ? '' : v);
   _ordersPage = 1;
+  /* 组字中：只把词记下来，绝不重绘（重绘会把输入框换掉 → 输入法丢字）。 */
+  if (_ordersSearchComposing && !fromComposition) return;
+  /* 同一个词已经画进 DOM 了就不再重画（compositionend 后浏览器常补发一个 input，
+     不清这个判据就会「打一个字重绘两次」，光标跳、输入法候选也容易跟着乱）。 */
+  if (_ordersSearchRendered !== null && _ordersSearch === _ordersSearchRendered) return;
   var old = document.getElementById('ordersSearchInput');
   var caret = (old && old.selectionStart != null) ? old.selectionStart : null;
   _rerenderOrdersOnly();
@@ -5257,6 +5270,23 @@ function onOrdersSearch(v) {
     el.setSelectionRange(p, p);
   } catch (e) {}
 }
+/* 输入法组字起止：只认搜索框（事件挂在 document 上 —— 输入框会被重绘换掉，
+   直接绑在元素上的监听活不过一次重绘）。 */
+document.addEventListener('compositionstart', function (e) {
+  if (e && e.target && e.target.id === 'ordersSearchInput') _ordersSearchComposing = true;
+}, true);
+document.addEventListener('compositionend', function (e) {
+  if (!e || !e.target || e.target.id !== 'ordersSearchInput') return;
+  _ordersSearchComposing = false;
+  /* 用 setTimeout(0) 让紧随其后的原生 input 事件先跑一遍；它没跑（某些输入法/浏览器
+     在候选上屏后不再补 input）时，这里补一次，保证「打完字列表就筛」。 */
+  var el = e.target;
+  var val = el ? el.value : '';
+  setTimeout(function () {
+    if (_ordersSearchComposing) return;
+    onOrdersSearch(val, true);
+  }, 0);
+}, true);
 
 /* ==================== v7.15：价格气泡 + 两种复制格式 ====================
    格式唯一真相是本地打印工具的复制按钮（gui.py 的 _on_copy_total / _on_copy_detail），
