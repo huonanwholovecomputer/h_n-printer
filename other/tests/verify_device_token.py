@@ -28,6 +28,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -230,7 +231,10 @@ H.chk("★ 客户端 token 一律走请求头（源码里不再有 params={\"tok
       and "ws_url}?token=" not in cc_src
       and "?token={self.token}" not in cc_src)
 H.chk("auth_headers() 是唯一入口，CloudClient._auth_headers 复用它",
-      "def auth_headers(token: str) -> dict:" in cc_src
+      # 2026-11-03：签名多了可选的 client_id（请求头带设备身份，见 X-Client-Id 契约），
+      # 用正则匹配"函数还在、参数兼容"而不是钉死旧字符串。
+      re.search(r"def auth_headers\(token: str(?:, client_id: str = \"\")?\) -> dict:", cc_src)
+      is not None
       and "return auth_headers(self.auth_token)" in cc_src)
 H.chk("★ Socket.IO 握手带请求头（polling 走 session 默认头 + WS 升级走 websocket_extra_options）",
       "http_session=self._make_sio_session()" in cc_src
@@ -255,7 +259,9 @@ H.chk("配置字段 cloud_device_token 可往返（to_dict / from_dict）",
       and '"cloud_device_token": self.cloud_device_token' in pc_src
       and 'cloud_device_token=data.get("cloud_device_token", "")' in pc_src)
 H.chk("离线补报也用请求头（offline_sync 无 query token）",
-      "headers=_auth_headers(token)" in os_src)
+      # 2026-11-03：调用点带上 client_id（X-Client-Id 兜底），仍必须是 _auth_headers 入口
+      re.search(r"headers=_auth_headers\(token(?:, *[^)]*)?\)", os_src) is not None
+      and "_auth_headers(token" in os_src)
 
 # ============================================================
 # E. 客户端行为（真实 CloudClient + 本机假 HTTP 服务）
@@ -436,7 +442,7 @@ print("\n=== F. 客户端变异自证（auth_headers 返回空 → 请求不再�
 _mut_dir = tempfile.mkdtemp(prefix="hn_devtok_mut_")
 with open(os.path.join(LOCAL_TOOL, "cloud_client.py"), "r", encoding="utf-8") as f:
     _cc_src = f.read()
-_anchor = 'return {"X-Printer-Token": token} if token else {}'
+_anchor = 'h = {"X-Printer-Token": token} if token else {}'
 if _cc_src.count(_anchor) != 1:
     raise AssertionError("变异锚点未命中: %r" % _anchor)
 with open(os.path.join(_mut_dir, "cloud_client.py"), "w", encoding="utf-8") as f:

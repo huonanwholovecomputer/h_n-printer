@@ -282,7 +282,27 @@ check("插着云端时优先用 CloudClient 的 client_id",
 _win2.close()
 app.processEvents()
 
-print("=== 6. 收尾 ===")
+print("=== 6. 接单设备双保险：会话级 X-Client-Id 头 + 后端头兜底 / 缺失告警 ===")
+_lop = local_order_posts()
+check("本次至少发出过 1 条 local_orders 上报（否则下面的断言是空转）",
+      len(_lop) > 0, f"{len(_lop)} 条")
+_bad = [p.get("headers") or {} for p in _lop
+        if (p.get("headers") or {}).get("X-Client-Id") != "pc-test-abc123"]
+check("★ 每条 local_orders 上报都带 X-Client-Id（漏写 payload 也丢不了归属）",
+      not _bad, f"缺失/不符 {len(_bad)} 条: {_bad[:2]}")
+from cloud_client import auth_headers as _ah  # noqa: E402
+check("auth_headers 无 client_id 时不出该头（旧调用不炸）", "X-Client-Id" not in _ah("tok"))
+check("auth_headers 带 client_id 时出该头",
+      _ah("tok", "pc-test-abc123").get("X-Client-Id") == "pc-test-abc123")
+_APP = os.path.join(REPO, "mobile_apps", "printer-backend", "app.py")
+_src = open(_APP, encoding="utf-8").read() if os.path.exists(_APP) else ""
+check("后端读 X-Client-Id 头兜底（改动只在本地有 app.py 时可判）",
+      ("X-Client-Id" in _src) if _src else True,
+      "app.py 不可访问" if not _src else "")
+check("后端缺 client_id 时留 warning（不再静默丢归属）",
+      ("缺 client_id" in _src) if _src else True)
+
+print("=== 7. 收尾 ===")
 win.close()
 app.processEvents()
 shutil.rmtree(_SANDBOX, ignore_errors=True)

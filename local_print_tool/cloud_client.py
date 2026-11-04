@@ -74,14 +74,22 @@ def disconnect_hint(reason) -> str:
     return f"（原因：{_DISCONNECT_REASONS.get(text, text)}）"
 
 
-def auth_headers(token: str) -> dict:
+def auth_headers(token: str, client_id: str = "") -> dict:
     """S1-01：printer token 一律走 `X-Printer-Token` 请求头。
 
     旧写法把 token 拼进 URL query（`?token=…`），它会落进 nginx access.log、代理日志、
     requests 异常文本与截图里 —— 等于把全站钥匙反复写在日志里。服务端 `_get_printer_token()`
     头优先、query 仅作旧客户端兼容（过渡期），客户端不再使用 query。
+
+    2026-11-03（HN20261103-0014/0035/0036「接单设备」空白）起再带 `X-Client-Id`：订单
+    归属的设备身份做成**会话级请求头**，后端优先读 payload.client_id、缺字段时回落此头。
+    这样以后任何新增上报路径都不会因为忘写 payload 字段而丢归属。
     """
-    return {"X-Printer-Token": token} if token else {}
+    h = {"X-Printer-Token": token} if token else {}
+    cid = str(client_id or "").strip()
+    if cid:
+        h["X-Client-Id"] = cid
+    return h
 
 
 class DeviceTokenError(RuntimeError):

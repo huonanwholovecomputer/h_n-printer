@@ -9929,7 +9929,15 @@ def local_orders():
     # 订单备注（≤100 字）
     remark = str(data.get("remark", "") or "")[:100]
     # 接收设备（多设备接单）：本地工具上报本机 client_id，用于记录订单「接单设备」
+    # 2026-11-03（HN20261103-0014/0035/0036 三单归属空白）加一道兜底：payload 里没有
+    # client_id 时回落请求头 `X-Client-Id`（客户端会话级设备身份）。旧客户端两条都缺，
+    # 下面 sent 分支会记一条 warning，不再静默丢归属。
     report_client_id = (data.get("client_id") or "").strip()
+    if not report_client_id:
+        try:
+            report_client_id = (request.headers.get("X-Client-Id") or "").strip()
+        except Exception:
+            report_client_id = ""
 
     if not order_number or not files:
         return jsonify({"success": False, "message": "缺少 order_number 或 files"}), 400
@@ -10029,6 +10037,22 @@ def local_orders():
                     "UPDATE orders SET received_client = COALESCE(NULLIF(received_client, ''), ?) WHERE id = ?",
                     (report_client_id, order_id),
                 )
+            else:
+                # 上报里没有任何设备身份 ⇒ 这单的「接单设备」永远补不回来（上面的幂等返回
+                # 挡住了后续任何重试）。以前这里完全静默，2026-11-03 三单空白只能靠翻
+                # gunicorn 日志倒推；现在留一条可 grep 的 warning，直接点名订单号。
+                try:
+                    _rc = conn.execute(
+                        "SELECT received_client FROM orders WHERE id = ?", (order_id,)
+                    ).fetchone()
+                    if not (_rc["received_client"] or "").strip():
+                        app.logger.warning(
+                            "local_orders 收到 sent 上报但缺 client_id（接单设备将为空）: "
+                            "order_number=%s status=%s keys=%s",
+                            order_number, status, sorted(data.keys()),
+                        )
+                except Exception:
+                    pass
 
         # 子任务状态：预留单用 'reserved'（不进 queued 推送链路，聚合也不污染为 sent），
         # 打印完成上报用 'sent'

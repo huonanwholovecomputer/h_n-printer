@@ -21,13 +21,19 @@ from printer_config import DEFAULT_OWNER_NAME
 logger = logging.getLogger(__name__)
 
 
-def _auth_headers(token: str) -> dict:
+def _auth_headers(token: str, client_id: str = "") -> dict:
     """S1-01：printer token 走 `X-Printer-Token` 头（不再拼 URL query）。
 
     与 `cloud_client.auth_headers()` 同一口径；本模块故意不 import cloud_client
     （那会连带引入 PySide6，离线库层面保持无 Qt 依赖）。
+
+    `X-Client-Id`：订单归属的设备身份（后端 `X-Client-Id` 兜底，2026-11-03 起）。
     """
-    return {"X-Printer-Token": token} if token else {}
+    h = {"X-Printer-Token": token} if token else {}
+    cid = str(client_id or "").strip()
+    if cid:
+        h["X-Client-Id"] = cid
+    return h
 
 # S1-09（客户端韧性）：**离线单永不放弃**。
 # 旧行为：retry_count 到 5 次就再也不会被扫到（SYNC 查询里 `retry_count < 5`），离线单
@@ -220,7 +226,8 @@ class OfflineSync:
             }
             # S1-09：请求超时 10s（断网时不会把后台线程挂在半开连接上）
             # S1-01：token 走请求头（旧写法 ?token= 会落进日志/代理）
-            resp = http_requests.post(url, headers=_auth_headers(token), json=payload, timeout=10)
+            resp = http_requests.post(url, headers=_auth_headers(token, self.client_id),
+                                      json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
                 logger.info(f"[SYNC] 上传成功: {order_number}")
                 return True, False, ""

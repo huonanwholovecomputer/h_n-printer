@@ -12435,13 +12435,14 @@ class MainWindow(QMainWindow):
                 if payload:
                     payload["owner_name"] = meta["owner_name"] or DEFAULT_OWNER_NAME
                     payload["is_admin_print"] = meta["is_admin_print"]
-                    # 接单设备：换号补报原先是**唯一**漏掉 client_id 上报路径
-                    # （后端 app.py:9478 取不到就警告，orders.received_client 永远空，
-                    # 结算页「接单设备」显示 —）。本机 id 云端未连接时也拿得到。
+                    # 接单设备：换号补报原先是**唯一**漏掉 client_id 上报路径（HN20261102-0011）。
+                    # 2026-11-03 又栽了一次同类（HN20261103-0014/0035/0036，旧客户端没带
+                    # client_id）：payload 字段 + 会话级 `X-Client-Id` 头双写，后端头兜底。
                     payload["client_id"] = self._local_client_id()
                     resp = http_requests.post(
                         f"{self._cloud_client.api_url}/api/local_orders",
-                        headers=auth_headers(self._cloud_client.auth_token),
+                        headers=auth_headers(self._cloud_client.auth_token,
+                                             self._local_client_id()),
                         json=payload,
                         timeout=10,
                     )
@@ -12571,7 +12572,7 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.post(
                     f"{api_url}/api/local_orders",
-                    headers=auth_headers(token),
+                    headers=auth_headers(token, getattr(client, "client_id", "")),
                     json=payload, timeout=10,
                 )
                 if resp.ok and resp.json().get("success"):
@@ -15925,7 +15926,7 @@ class MainWindow(QMainWindow):
             try:
                 resp = http_requests.post(
                     f"{api_url}/api/local_orders",
-                    headers=auth_headers(token),
+                    headers=auth_headers(token, client.client_id),
                     json={
                         "order_number": num,
                         "status": "sent",
