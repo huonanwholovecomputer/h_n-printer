@@ -6099,8 +6099,19 @@ class MainWindow(QMainWindow):
         #    不静默安装。真正的下载/安装只能由用户在「帮助 → 检查更新」后明确点「立即更新」触发
         #    （见 _on_update_check_result 的 manual 分支与 updater.prepare_update(user_confirmed=True)）。
         self._update_checking: bool = False
+        self._update_check_quiet: bool = False
+        self._update_pending_version: str = ""
         self._updateCheckDone.connect(self._on_update_check_result)
         QTimer.singleShot(4000, lambda: self._start_update_check(manual=False))
+        # 2026-11-03：桌面工具是**常驻进程**，只在启动时查一次 ⇒ 起床后一直收不到发布。
+        # 现场：DESKTOP-EJGEB1V 从 4.6.0 起数天没升（08:20 提示过 4.6.1，点「稍后」后
+        # 再也不查），补报路径一直是旧的、丢接单设备。改为每 2 小时静默复检一次：
+        # 只更新「帮助 → 检查更新 ⬆ 有新版本 vX」菜单标记 + 日志，不弹窗、不打断打印。
+        self._updateRecheckTimer = QTimer(self)
+        self._updateRecheckTimer.setInterval(2 * 60 * 60 * 1000)
+        self._updateRecheckTimer.timeout.connect(
+            lambda: self._start_update_check(manual=False, quiet=True))
+        self._updateRecheckTimer.start()
 
         # ── 攒批续打：上次退出/崩溃时出纸槽里还留着一叠没打第 2 趟的纸 ──
         # 放到启动末尾（UI/日志就绪）再问，避免弹窗盖住启动日志。
@@ -7484,13 +7495,25 @@ class MainWindow(QMainWindow):
         if action is None:
             return
         action.setEnabled(not busy)
-        action.setText(label if busy else "检查更新(&U)")
+        if busy:
+            action.setText(label)
+            return
+        # 2026-11-03：查到新版本却在菜单里「隐身」= 操作员永远想不起来点。
+        # 桌面常驻进程可能好几天不重启（现场：DESKTOP-EJGEB1V 跑着 4.6.0，
+        # 08:20 看到 4.6.1 提示后一直没升，12:51 的补报仍丢归属）。菜单文案常驻标记。
+        pending = str(getattr(self, '_update_pending_version', '') or '')
+        action.setText(f"检查更新(&U) ⬆ 有新版本 v{pending}" if pending else "检查更新(&U)")
 
-    def _start_update_check(self, manual: bool = False):
-        """启动检查更新（后台线程，结果经 _updateCheckDone 信号回主线程）。"""
+    def _start_update_check(self, manual: bool = False, quiet: bool = False):
+        """启动检查更新（后台线程，结果经 _updateCheckDone 信号回主线程）。
+
+        `quiet=True`：后台周期复检（每 2 小时）——只更新菜单标记 + 写日志，**不弹窗**，
+        不打断正在进行的打印。启动检查（manual=False 且 quiet=False）仍弹一次提示窗。
+        """
         if self._update_checking:
             return
         self._update_checking = True
+        self._update_check_quiet = bool(quiet)
         self._set_update_menu_state(True, "检查更新中...")
         if manual:
             self._log("☁ 正在检查更新...")
@@ -7530,6 +7553,14 @@ class MainWindow(QMainWindow):
     def _on_update_check_result(self, result):
         kind, manifest, manual = result
         self._update_checking = False
+        quiet = bool(getattr(self, '_update_check_quiet', False))
+        self._update_check_quiet = False
+        # 菜单标记：有新版本就常驻显示；确认已是最新/没有清单则清掉
+        if kind == "available" and isinstance(manifest, dict):
+            self._update_pending_version = str(manifest.get("version") or "")
+        elif kind in ("latest", "none", "error", "rejected", "manifest_error"):
+            if kind in ("latest", "none"):
+                self._update_pending_version = ""
         if kind in ("ready", "download_fail"):
             self._on_update_ready(result)
             return
@@ -7541,6 +7572,11 @@ class MainWindow(QMainWindow):
             msg = f"发现新版本 v{version}（当前 v{APP_VERSION}）"
             if notes:
                 msg += f"\n\n更新说明：\n{notes}"
+            if quiet:
+                # 周期复检：不弹窗（可能正在打印），只留菜单标记 + 日志
+                self._log(f"⬆ 后台检查发现新版本 v{version}（当前 v{APP_VERSION}），"
+                          f"点「帮助 → 检查更新」升级")
+                return
             if manual:
                 # S1-02 改动 4（2026-10-23）：只有**这一次明确点击**才允许进入下载 → 生成
                 # update.cmd（/VERYSILENT 静默安装）。默认按钮是「稍后」：回车/直接关窗
