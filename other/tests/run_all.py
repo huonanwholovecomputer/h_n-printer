@@ -46,6 +46,8 @@ ENV_REQUIRED: dict[str, str] = {
     "verify_http_heartbeat_channel.py": "需在服务器上跑（导入真实 app）",
     "verify_gthread_websocket.py": "需后端依赖环境（本机起独立小应用 5099）",
     "verify_apk_published.py": "需联网比对线上清单与 APK",
+    "verify_xlsx_worksheet_real_com.py": "需本机装 Excel 真引擎（起独立 Excel 实例导 PDF，约 30 秒；"
+                                         "--all 或直接 python 可跑）",
     # S2-12 容量压测全系列（约 7 分钟、起本地服务与 16 条长连接）：默认跳过，
     # 手动跑 `python other/tests/staging/99_run_all.py`（快速守门已由 verify_capacity_staging.py 覆盖）
     "99_run_all.py": "容量压测全系列（约 7 分钟），手动跑 other/tests/staging/99_run_all.py",
