@@ -360,15 +360,19 @@ try:
         _real_restore_d()
 
     _win_d._restore_from_tray = _spy_restore_d
-    _orig_question_c = _gui.QMessageBox.question
+    # 2026-11-04：退出确认框从 QMessageBox.question 换成了自绘 QDialog
+    # （单页「去到这个标签页」/ 多页「打开标签页管理器」）。本段只桩「问用户」那一步 ——
+    # 验的是「弹框前有没有把窗口叫回前台」，不是框长什么样（框见
+    # other/tests/verify_quit_unfinished_tabs.py）。
+    _orig_ask_c = _gui.MainWindow._ask_unfinished_tabs
 
-    def _decline(*a, **k):
+    def _decline(self, info):
         _asked_d.append(1)
-        return _gui.QMessageBox.No
+        return "cancel"
 
     _win_d.hide()
     app.processEvents()
-    _gui.QMessageBox.question = staticmethod(_decline)
+    _gui.MainWindow._ask_unfinished_tabs = _decline
     try:
         _win_d._quit_app()
         app.processEvents()
@@ -379,7 +383,7 @@ try:
               _quits_d == [] and _win_d._force_quit is False and _win_d._closing is False,
               f"quits={_quits_d} force={_win_d._force_quit} closing={_win_d._closing}")
     finally:
-        _gui.QMessageBox.question = _orig_question_c
+        _gui.MainWindow._ask_unfinished_tabs = _orig_ask_c
     # 收尾：清空任务后正常退出，别把沙箱配置留在"有未完成任务"的状态
     _win_d._config.tabs[_win_d._current_tab].jobs = []
     _win_d._quit_app()

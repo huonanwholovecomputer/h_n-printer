@@ -34,6 +34,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     QUrl,
     QItemSelectionModel,
+    QSize,
 )
 from PySide6.QtGui import (
     QAction,
@@ -85,6 +86,7 @@ from PySide6.QtWidgets import (
     QStyleOptionButton,
     QCheckBox,
     QFormLayout,
+    QDialogButtonBox,
 )
 
 from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _count_pages_in_range, DEFAULT_OWNER_NAME, PLACEHOLDER_OWNER_NAMES, FALLBACK_OWNER_NAME, PrinterProfile, format_duration, fit_print_speed, cloud_word_com_allowed, split_tail_blank, simplex_page_set, selected_pages, job_simplex_pages, check_simplex_pages
@@ -280,8 +282,28 @@ class _TimeVariantsLabel(QLabel):
         self._variants: list[str] = [""]
         self.setWordWrap(False)
         self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        # 2026-11-04 现场：原来是 Ignored 策略（sizeHint 被当 0）→ 布局把两个标签压成
+        # width=0、text=""，用户从来看不见它们（「明明提过但界面上没有」的真凶）。
+        # 现在按 Preferred 给真实 sizeHint（完整文案宽度），最小宽度只留最短档 ——
+        # 宽了就显示完整时间，窄了由 _apply 退化成「省略秒 / 仅日期」，不会撑破工具条。
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self.setTextInteractionFlags(Qt.NoTextInteraction)
+
+    def _text_px(self, text: str) -> int:
+        try:
+            return self.fontMetrics().horizontalAdvance(text) + 2
+        except Exception:
+            return 0
+
+    def sizeHint(self) -> QSize:
+        base = super().sizeHint()
+        text = self._variants[0] if self._variants else ""
+        return QSize(max(self._text_px(text), 0), base.height())
+
+    def minimumSizeHint(self) -> QSize:
+        base = super().minimumSizeHint()
+        text = min(self._variants, key=len) if self._variants else ""
+        return QSize(self._text_px(text), base.height())
 
     def set_variants(self, variants) -> None:
         cands = [str(v) for v in (variants or []) if str(v)]
@@ -8022,9 +8044,14 @@ class MainWindow(QMainWindow):
             "本标签页订单第一次真正开始打印的时刻（重打/续打不再刷新）")
         _time_font = QFont()
         _time_font.setPointSize(9)
-        for _lbl in (self._tab_created_label, self._tab_started_label):
+        # 两个标签之间留 8px：时间标签右侧紧贴工具条末端，左边界靠 stretch 推过去，
+        # 互相之间不留空会连成「…09:12:33打印发起：…」这样一串。
+        tab_row.addSpacing(10)
+        for _i, _lbl in enumerate((self._tab_created_label, self._tab_started_label)):
             _lbl.setFont(_time_font)
             _lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if _i:
+                tab_row.addSpacing(8)
             tab_row.addWidget(_lbl)
         self._tab_time_labels_ready = True
 
@@ -8192,6 +8219,26 @@ class MainWindow(QMainWindow):
         # F3: 向左切换后，删除序号更大的空标签页
         if delta < 0:
             self._cleanup_empty_tabs(after_key=self._current_tab)
+
+    def _goto_tab(self, key: str) -> bool:
+        """切到**指定**标签页（退出确认框「去到这个标签页」的落点）。
+
+        `_switch_tab()` 只认 ±1，这里要按 key 直达；key 不在配置里（刚好被清理/重编号）
+        就返回 False，调用方不必再管。
+        """
+        key = str(key or "")
+        if key not in self._config.tabs:
+            return False
+        if key == self._current_tab:
+            return True
+        self._cancel_undo_if_active()      # 撤回备份属于旧标签页（与 _switch_tab 同口径）
+        self._current_tab = key
+        self._config.active_tab = key
+        self._save_config()
+        self._rebuild_table()
+        self._refresh_tab_display()
+        self._sync_edit_enabled(False)
+        return True
 
     def _has_empty_tabs_except_current(self) -> bool:
         """检查是否存在非当前标签页的空标签页。"""
@@ -17901,6 +17948,154 @@ class MainWindow(QMainWindow):
 
     # ---- 关闭事件 ----
 
+    def _unfinished_tabs_info(self) -> list:
+        """退出前盘点：哪些标签页还有**没打印完成**的文件。
+
+        返回 `[{"key","files","total","order_number","owner_name"}...]`（按标签页顺序）。
+        files = 未打印文件数（job.sent 为假）；total = 该页文件总数（含已打印）。
+        只列 files > 0 的页 —— 全部打完的页不该出现在退出提示里。
+        """
+        out = []
+        for key in self._sorted_tab_keys(self._config.tabs):
+            tab = self._config.tabs.get(key)
+            if tab is None:
+                continue
+            jobs = list(tab.jobs or [])
+            if not jobs:
+                continue
+            pending = [j for j in jobs if not getattr(j, "sent", False)]
+            if not pending:
+                continue
+            order_number = ""
+            for j in jobs:
+                if getattr(j, "order_number", ""):
+                    order_number = str(j.order_number)
+                    break
+            out.append({
+                "key": str(key),
+                "files": len(pending),
+                "total": len(jobs),
+                "order_number": order_number,
+                "owner_name": str(getattr(tab, "owner_name", "") or ""),
+            })
+        return out
+
+    def _unfinished_tabs_text(self, info: list) -> str:
+        """未打印标签页确认框的正文（单页 / 多页两套口径，纯文本便于单测）。"""
+        keys = [it["key"] for it in info]
+        pending_total = sum(int(it["files"]) for it in info)
+        tab_total = len(self._config.tabs)
+        if len(info) == 1:
+            it = info[0]
+            who = ""
+            if it.get("order_number"):
+                who = f"（订单 {it['order_number']}）"
+            elif it.get("owner_name"):
+                who = f"（{it['owner_name']}）"
+            head = (f"标签页 {it['key']}{who} 还有 {it['files']} 个文件没有打印完成"
+                    f"（该页共 {it['total']} 个文件）。")
+            goto_hint = f"去到这个标签页 = 不退出，并切换到标签页 {it['key']}"
+        else:
+            head = (f"有 {len(info)} 个标签页还有没打印完的文件：标签页 "
+                    f"{'、'.join(keys)}（共 {pending_total} 个文件）。")
+            goto_hint = "打开标签页管理器 = 不退出，并打开标签页管理器逐页查看"
+        lines = [
+            head,
+            "",
+            f"确定 = 清空全部 {tab_total} 个标签页并退出"
+            "（未打印的文件不会保留；这些云端订单会被标记为已放弃）",
+            "取消 = 不退出，回到程序继续操作",
+            goto_hint,
+        ]
+        return "\n".join(lines)
+
+    def _build_unfinished_tabs_dialog(self, info: list):
+        """构造（不弹出）退出前「还有未打印文件」的确认框。
+
+        返回 `(dlg, buttons, decision)`：
+        - buttons 的键是 goto（单页）/ manager（多页）/ ok / cancel；
+        - decision = {"value": "cancel"}，按钮点下去就写进它（同时 accept/reject 窗口）。
+        把「造窗」和「弹窗」拆开，验收脚本才能在离屏环境下检查文案、点按钮、断言分支，
+        不必真的 exec() 一个模态窗把进程卡住。
+        """
+        single = len(info) == 1
+        dlg = QDialog(self)
+        dlg.setWindowTitle("存在未完成的任务")
+        dlg.setMinimumWidth(460)
+        dlg.setModal(True)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        text = QLabel(self._unfinished_tabs_text(info))
+        text.setWordWrap(True)
+        text.setObjectName("unfinishedTabsText")
+        layout.addWidget(text)
+
+        box = QDialogButtonBox(dlg)
+        if single:
+            b_other = box.addButton("去到这个标签页", QDialogButtonBox.ActionRole)
+            b_other.setObjectName("unfinishedGotoBtn")
+        else:
+            b_other = box.addButton("打开标签页管理器", QDialogButtonBox.ActionRole)
+            b_other.setObjectName("unfinishedManagerBtn")
+        b_ok = box.addButton("确定", QDialogButtonBox.AcceptRole)
+        b_ok.setObjectName("unfinishedOkBtn")
+        b_cancel = box.addButton("取消", QDialogButtonBox.RejectRole)
+        b_cancel.setObjectName("unfinishedCancelBtn")
+        layout.addWidget(box)
+
+        other_choice = "goto" if single else "manager"
+        buttons = {other_choice: b_other, "ok": b_ok, "cancel": b_cancel}
+        decision = {"value": "cancel"}
+
+        def _pick(choice: str, accept: bool):
+            def _slot():
+                decision["value"] = choice
+                if accept:
+                    dlg.accept()
+                else:
+                    dlg.reject()
+            return _slot
+
+        b_other.clicked.connect(_pick(other_choice, True))
+        b_ok.clicked.connect(_pick("quit", True))
+        b_cancel.clicked.connect(_pick("cancel", False))
+        return dlg, buttons, decision
+
+    def _interactive_ui_available(self) -> bool:
+        """当前 Qt 平台能不能真的弹出「有人点」的按钮。
+
+        `offscreen` / `minimal` 是验收脚本与批量探针的无头平台：没有真人点按钮，
+        模态 exec() 只会把进程卡死（历史上这一步是被桩掉的 QMessageBox.question 直接答「是」）。
+        所以无头平台按「确认退出」处理，与旧行为一致；生产（windows）永远走真弹窗。
+        """
+        try:
+            name = str(QApplication.platformName() or "").lower()
+        except Exception:
+            return False
+        return name not in ("offscreen", "minimal")
+
+    def _ask_unfinished_tabs(self, info: list) -> str:
+        """弹出确认框，返回 "goto" / "manager" / "quit"（= 确定）/ "cancel"。
+
+        关窗（Esc / 右上角 ✕）按取消处理 —— 退出是不可逆动作，默认必须是「不退出」。
+        """
+        if not info:
+            return "quit"
+        if not self._interactive_ui_available():
+            self._log("🖥 无头（离屏）环境没有可点按钮：未打印提醒按「确定」处理")
+            return "quit"
+        dlg, _buttons, decision = self._build_unfinished_tabs_dialog(info)
+        try:
+            dlg.exec()
+        finally:
+            try:
+                dlg.deleteLater()
+            except Exception:
+                pass
+        return decision["value"]
+
     def closeEvent(self, event):
         """关闭窗口时检查未完成任务，确认后保存并退出。"""
         # ── 4.6.0 后台常驻：点窗口右上角 X = 收进系统托盘，**不是**退出 ──
@@ -18026,17 +18221,19 @@ class MainWindow(QMainWindow):
                 self._current_tab = "1"
                 self._cleanup_orphan_pdf_cache(cache_jobs)
             else:
+                # 2026-11-04 用户要求：退出提示要说清「哪一页 / 几页」并给出直达入口。
+                # 单页 → 「去到这个标签页」；多页 → 「打开标签页管理器」；两边都有 确定/取消。
                 self._ensure_visible_for_close_dialog()
-                reply = QMessageBox.question(
-                    self, "存在未完成的任务",
-                    f"当前共有 {total_files} 个文件分布在 {len(self._config.tabs)} 个标签页中尚未打印。\n\n"
-                    "退出将清空全部标签页，确定退出吗？",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-                )
-                if reply != QMessageBox.Yes:
+                _unfinished = self._unfinished_tabs_info()
+                _choice = self._ask_unfinished_tabs(_unfinished)
+                if _choice != "quit":
                     event.ignore()
                     self._closing = False  # 用户选择不退出，恢复打印启动流程
                     self._force_quit = False  # 同上：取消退出时复位真退出标志
+                    if _choice == "goto" and _unfinished:
+                        self._goto_tab(_unfinished[0]["key"])
+                    elif _choice == "manager":
+                        self._show_tab_manager()
                     return
                 # 用户确认退出 → 通知后端放弃未打印的云端任务 + 本地预留订单，然后清空
                 # （已打印完成的 job 跳过，避免误放弃已完成订单）
