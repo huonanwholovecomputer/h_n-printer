@@ -395,7 +395,13 @@ mark.hit { background: #fff3b0; color: #3b2f00; border-radius: 3px; padding: 0 1
 .st-by { display: inline-flex; align-items: center; gap: 6px; font-size: .76rem; color: var(--muted); white-space: nowrap; }
 .st-by select { padding: 5px 8px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--card); color: var(--text); font-size: .76rem; max-width: 132px; }
 /* 价格气泡（订单总额 / 明细金额左键点击）：fixed 定位，点外部关闭；层级高于状态菜单（220） */
-#priceMenu { position: fixed; z-index: 230; min-width: 172px; padding: 5px; background: var(--card); border: 1px solid var(--border-strong); border-radius: 11px; box-shadow: 0 12px 30px rgba(0,0,0,.22); }
+#priceMenu { position: fixed; z-index: 230; min-width: 172px; padding: 5px; background: var(--card); border: 1px solid var(--border-strong); border-radius: 11px; box-shadow: 0 12px 30px rgba(0,0,0,.22);
+  animation: pmIn .16s cubic-bezier(.2,.9,.3,1.25) both; }
+/* 弹出 / 收起：关键帧终点必须是 transform:none（不写 translateY(0)）—— 带 fill 时残留的
+   transform 会让气泡变成层叠上下文、相对自己定位（结算页下拉层被盖住就是这么踩出来的）。 */
+@keyframes pmIn { from { opacity: 0; transform: translateY(-4px) scale(.94); } to { opacity: 1; transform: none; } }
+#priceMenu.pm-closing { animation: pmOut .13s ease both; pointer-events: none; }
+@keyframes pmOut { from { opacity: 1; transform: none; } to { opacity: 0; transform: translateY(-3px) scale(.96); } }
 #priceMenu .pm-title { font-size: .7rem; color: var(--muted); padding: 4px 8px 6px; line-height: 1.5; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
 #priceMenu .pm-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 8px; border: none; background: transparent; border-radius: 8px; cursor: pointer; font-size: .8rem; color: var(--text); text-align: left; font-family: inherit; }
 #priceMenu .pm-item:hover { background: rgba(79,110,247,.14); }
@@ -4518,19 +4524,25 @@ function _toggleOrderExpand(oid) {
    里管理，默认 123456）→ 变成 🔓，此时每个订单的状态标签才带小箭头，点标签直接选正确状态、
    改动立即写库生效；再点 🔓 回到 🔒（箭头与菜单一起收起，防误触）。
    只列出**终态**（与后端 MANUAL_FIX_STATUSES 同源）：改成排队中/打印中会被推送与预约调度
-   重新捡起来打印 —— 页面上的「订正」不该有这个副作用，后端白名单也不放行。 */
+   重新捡起来打印 —— 页面上的「订正」不该有这个副作用，后端白名单也不放行。
+  v7.16（2026-11-03 用户要求「外部监视的订单改不了状态？需要允许调整状态」）：**外部监视单也
+  可以订正**了，但写的是本地账本的 manual_status 字段（POST /api/local/external_prints/status），
+  不是云端 orders 写接口 —— 它们不在云端 orders 表里。白名单仍是同一份终态清单。 */
 var ORDER_FIXABLE_STATUSES = ['sent', 'failed', 'abandoned', 'canceled', 'rejected'];
-/* 可编辑判据：云端模式 + 已解锁 + 订单 id 合法（本地模式订单库存本地库、无对应写接口，保持只读）。
-   id 合法判据 = **规范十进制**（`/^[0-9]+$/`），与后端 `re.fullmatch(r"[0-9]+")` 同源：
+/* 可编辑判据：云端模式 + 已解锁 + id 合法（本地模式订单库存本地库、无对应写接口，保持只读）。
+   云端单的 id 合法判据 = **规范十进制**（`/^[0-9]+$/`），与后端 `re.fullmatch(r"[0-9]+")` 同源：
    内联 onclick 里的 id 已是引号字符串（不再当 JS 表达式求值），但 `'1e3'`/`'12-34'`/`'01'`
-   这类写法仍会过旧的 safeId 字母白名单；只认十进制才能保证「页面能点的 id」==「后端认的 id」。 */
+   这类写法仍会过旧的 safeId 字母白名单；只认十进制才能保证「页面能点的 id」==「后端认的 id」。
+   外部监视单不是这套 id（行 key = `extrow-…`、raw id = `ext:<作业号>:<检测时间>`），
+   由本地账本接口按 raw id 认，所以判据在 `_isExternalOrder` 处分岔。 */
 function _orderStatusEditable(oidS) {
   if (FINANCE_MODE === 'local' || !unlocked.orderstatus || !oidS) return false;
-  if (!/^[0-9]+$/.test(String(oidS))) return false;
-  /* v7.3：外部打印监视订单**永不**可订正 —— 它们不在云端 orders 表里（写库接口根本找不到这单），
-     所以这里显式再挡一条，别指望「id 带前缀、过不了十进制正则」这一条默契能一直成立。 */
-  if (_isExternalOrder(oidS)) return false;
-  return true;
+  /* v7.16：外部打印监视单**可以**订正了 —— 但走本地账本接口（/api/local/external_prints/status），
+     不是云端 orders 写接口（它们根本不在云端 orders 表里，云端写库接口找不到这单）。
+     所以判据在这里分岔：外部单认 `ext:` 前缀 / 合并进来的行 key，云端单仍然只认规范十进制 id
+     （`'1e3'`/`'12-34'`/`'01'` 这类写法不能混进云端写接口）。 */
+  if (_isExternalOrder(oidS)) return true;
+  return /^[0-9]+$/.test(String(oidS));
 }
 /* 是否外部监视订单（三种判据都认）：本次合并进来的 id / 行 key → 契约前缀兜底 → 最后按订单对象核对
    source（_findCloudOrder 是线性查找，只在前面两条都没命中时才用，避免逐行渲染时白跑）。 */
@@ -4641,9 +4653,13 @@ function toggleOrderStatusLock() {
    误改就是账目错，所以它也要锁在同一把锁里。 */
 var ORDER_FIXABLE_TYPES = ['receive', 'self'];
 function _orderTypeLabel(t) { return t === 'self' ? '👤自打' : '🤝接单'; }
-/* 可编辑判据与状态**同源**（云端 + 已解锁 + id 规范十进制 + 非外部监视订单）：
-   一把锁管两列，判据也只该有一份 —— 外部订单在 _orderStatusEditable 里就被挡住了，这里自然同样挡住 */
-function _orderTypeEditable(oidS) { return _orderStatusEditable(oidS); }
+/* 可编辑判据与状态**同源**（云端 + 已解锁 + 非外部监视订单）：
+   一把锁管两列，判据也只该有一份 —— 但外部监视单**没有**「订单类型」这个概念
+   （云端 /api/admin/order_type 里没有这单，本地账本也不存类型），
+   所以类型列对外部单保持只读，其余与状态列同源。 */
+function _orderTypeEditable(oidS) {
+  return _isExternalOrder(oidS) ? false : _orderStatusEditable(oidS);
+}
 function _orderTypeLockHTML() {
   if (FINANCE_MODE === 'local') return '';
   var on = !!unlocked.orderstatus;
@@ -4742,6 +4758,9 @@ function _findCloudOrder(oid) {
   var list = (_cloudData && _cloudData.orders) || [];
   for (var i = 0; i < list.length; i++) {
     if (String(list[i].order_id) === String(oid)) return list[i];
+    /* v7.16：外部监视单进内联事件的是安全行 key（data-order=_externalRowKey），
+       订正菜单/写接口都按行 key 找单 —— 只按 order_id 比对会找不到这单、菜单直接不弹。 */
+    if (list[i].source === 'external' && _externalRowKey(list[i].order_id) === String(oid)) return list[i];
   }
   return null;
 }
@@ -4838,6 +4857,9 @@ function applyOrderStatus(oid, status) {
   /* v7.15：带上「标记人」—— 后端据此写 orders.manual_status_by / manual_status_at，
      订单明细悬停状态标签即可回答「谁在什么时候改的」。没有成员名单时传空串（后端忽略）。 */
   var by = _manualStatusBy();
+  /* v7.16：外部监视单不在云端 orders 表里 → 写本地账本（监视进程的 external_prints.json），
+     不能往云端写接口发（后端会 404「订单不存在」）。两条路都只做乐观更新 + 重绘。 */
+  if (_isExternalOrder(oid)) return _applyExternalOrderStatus(o, status, by);
   fetch('/api/proxy/admin/order_status', {
     method: 'POST', headers: apiHeaders(),
     body: JSON.stringify({ order_id: String(oid), status: status, by: by })
@@ -4869,6 +4891,41 @@ function applyOrderStatus(oid, status) {
     toast('❌ 网络错误，状态未改动', 'error', true);
   });
 }
+
+/* v7.16：外部监视单的状态订正 —— 写本地账本（POST /api/local/external_prints/status），
+   不是云端写接口。raw id（`ext:<作业号>:<检测时间>`）留在 o.order_id 里，行 key 只是 DOM 里的
+   安全写法，所以这里一律用 raw id 发请求（后端唯一解析入口 parse_external_order_id）。
+   成功后的落地方式与云端分支**完全一致**：收益/页数都是从 _cloudData.orders 现算的，
+   把订单级与文件级状态同步过来即等价于账本里的新状态；口径缓存与用量缓存一起作废。 */
+function _applyExternalOrderStatus(o, status, by) {
+  fetch('/api/local/external_prints/status', {
+    method: 'POST', headers: apiHeaders(),
+    body: JSON.stringify({ order_id: String(o.order_id || ''), status: status, by: by })
+  }).then(function (r) { return r.json(); }).then(function (res) {
+    _orderStatusSaving = false;
+    if (!(res && res.success) && _writeAuthProblem(res)) return;
+    if (!(res && res.success)) { toast('❌ ' + ((res && res.message) || '订正失败'), 'error', true); return; }
+    o.status = status;
+    (o.files || []).forEach(function (f) { f.status = status; });
+    if (by) {
+      o.manual_status_by = by;
+      o.manual_status_at = _pickManualAt(res) || _nowStamp();
+      (o.files || []).forEach(function (f) {
+        f.manual_status_by = by;
+        f.manual_status_at = o.manual_status_at;
+      });
+    }
+    _scopeCache = {};
+    invalidateUsage();
+    toast('✅ 订单 ' + (o.order_number || o.order_id) + ' 状态已改为「' + statusLabel(status) + '」', 'success');
+    renderCloud();
+    _scrollToOffset('cloud-orders');
+  }).catch(function () {
+    _orderStatusSaving = false;
+    toast('❌ 网络错误，状态未改动', 'error', true);
+  });
+}
+
 
 /* ==================== v5.16：订单明细分页（参考小程序/APP 打印任务分页） ====================
    分页为纯前端切片（数据已整体缓存在 _cloudData.orders）；
@@ -5389,10 +5446,51 @@ function _copyText(text, okMsg) {
     fallback();
   }
 }
-function closePriceMenu() {
+var _pmCloseTimer = null;
+/* 收起价格气泡：先播 130ms 收起动效再移除节点（reduced-motion / 不支持 classList 时直接移除）。
+   immediate=true 只给「马上要换一个气泡」用：等动画会闪，也会被旧定时器连新气泡一起删掉。 */
+function closePriceMenu(immediate) {
   var m = document.getElementById('priceMenu');
-  if (m && m.parentNode) m.parentNode.removeChild(m);
   document.removeEventListener('click', _priceMenuOutside, true);
+  _priceMenuUnbind();
+  if (!m || !m.parentNode) return;
+  if (_pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
+  if (immediate === true || !m.classList || _prefersReduced()) {
+    m.parentNode.removeChild(m);
+    return;
+  }
+  if (m.classList.contains('pm-closing')) return;   /* 已在收起：别重复挂定时器 */
+  m.classList.add('pm-closing');
+  _pmCloseTimer = setTimeout(function () {
+    _pmCloseTimer = null;
+    if (m.parentNode) m.parentNode.removeChild(m);
+  }, 130);
+}
+/* —— 「在气泡之外滑动就收起」——
+   气泡是 fixed 定位、贴着被点的那个金额，底下表格一滚它就跟金额错位，所以滚动（窗口 / 明细表
+   横向）、滚轮、触控滑动一律收起。用 capture 才能收到 .table-wrap 这类内层容器的滚动（scroll
+   不冒泡，但捕获阶段会经过 window）；气泡自己的滑动不算。 */
+function _priceMenuBindScroll() {
+  window.addEventListener('scroll', _priceMenuOnScroll, true);
+  window.addEventListener('wheel', _priceMenuOnSlide, { passive: true, capture: true });
+  window.addEventListener('touchmove', _priceMenuOnSlide, { passive: true, capture: true });
+}
+function _priceMenuUnbind() {
+  window.removeEventListener('scroll', _priceMenuOnScroll, true);
+  window.removeEventListener('wheel', _priceMenuOnSlide, { passive: true, capture: true });
+  window.removeEventListener('touchmove', _priceMenuOnSlide, { passive: true, capture: true });
+}
+function _priceMenuOnScroll(ev) {
+  var m = document.getElementById('priceMenu');
+  if (!m) { _priceMenuUnbind(); return; }
+  if (ev && ev.target && m.contains && m.contains(ev.target)) return;
+  closePriceMenu();
+}
+function _priceMenuOnSlide(ev) {
+  var m = document.getElementById('priceMenu');
+  if (!m) { _priceMenuUnbind(); return; }
+  if (ev && m.contains && m.contains(ev.target)) return;
+  closePriceMenu();
 }
 function _priceMenuOutside(ev) {
   var m = document.getElementById('priceMenu');
@@ -5407,7 +5505,9 @@ function openPriceMenu(ev, rowKey, fileIdx) {
   var o = _findOrderByRowKey(rowKey);
   if (!o) { toast('❌ 订单已不在当前列表，请刷新后重试', 'error'); return; }
   closeOrderStatusMenu();   // 两个浮层不同时开，避免互相压住
-  closePriceMenu();
+  /* 立刻换：收起动效不能挡住下一次弹出（否则旧定时器会把新气泡一起删掉） */
+  if (_pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
+  closePriceMenu(true);
   var idx = parseInt(fileIdx, 10);
   var f = (idx >= 0 && o.files && o.files[idx]) ? o.files[idx] : null;
   var cents = f ? parseCents(f.total_price) : _orderFinalCents(o);
@@ -5426,11 +5526,17 @@ function openPriceMenu(ev, rowKey, fileIdx) {
   var x = r ? r.left : (ev && ev.clientX) || 12;
   var y = r ? r.bottom + 8 : (ev && ev.clientY) || 12;
   var w = m.offsetWidth || 190, hh = m.offsetHeight || 96;
+  var below = true;    /* 默认贴着金额下方展开 ⇒ 收起/弹出都从左上角长出来 */
   if (x + w > window.innerWidth - 10) x = Math.max(10, window.innerWidth - w - 10);
-  if (y + hh > window.innerHeight - 10) y = Math.max(10, (r ? r.top : y) - hh - 8);
+  if (y + hh > window.innerHeight - 10) { y = Math.max(10, (r ? r.top : y) - hh - 8); below = false; }
+  m.style.transformOrigin = below ? 'top left' : 'bottom left';
   m.style.left = x + 'px';
   m.style.top = y + 'px';
-  setTimeout(function () { document.addEventListener('click', _priceMenuOutside, true); }, 0);
+  setTimeout(function () {
+    if (!m.parentNode) return;   /* 打开后立刻又被关掉（复制/换气泡）就别再挂监听 */
+    document.addEventListener('click', _priceMenuOutside, true);
+    _priceMenuBindScroll();
+  }, 0);
 }
 function copyPrice(detail) {
   var m = document.getElementById('priceMenu');

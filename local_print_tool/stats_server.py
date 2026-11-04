@@ -185,7 +185,7 @@ def load_external_print_items(path: str = "") -> list:
     """
     try:
         import print_watch as _pw
-        store = _pw.ExternalPrintStore(path)
+        store = _pw.ExternalPrintStore(path or EXTERNAL_LEDGER_OVERRIDE)
         ledger = getattr(store, "path", "") or path
         if ledger and not os.path.exists(ledger):
             logger.warning("外部打印账本不存在（%s），按空账本返回", os.path.basename(ledger))
@@ -194,6 +194,75 @@ def load_external_print_items(path: str = "") -> list:
     except Exception as e:
         logger.warning("读取外部打印账本失败（%s），按空账本返回", type(e).__name__)
         return []
+
+
+# ═══ v7.16：外部监视单的**订单状态订正**（写在本地账本，不经云端） ═══
+# 为什么要有：外部监视单不在云端 orders 表里（云端写库接口根本找不到这单），但结算页把它们
+# 并进「订单明细」之后，操作员需要能把「其实没打出来」的作业标成失败/取消等终态 ——
+# 否则收益与用量口径永远按 sent 计提。做法：账本里加 manual_status* 三个字段，行序列化时
+# 用它覆盖 status（见 _external_order_row），**不碰**监视流程自己的 status（待处理/已确认/已忽略）。
+EXTERNAL_LEDGER_OVERRIDE = ""        # 只给验收脚本用：指向临时账本；空 = 真实 %APPDATA% 账本
+
+
+def parse_external_order_id(order_id) -> tuple | None:
+    """`ext:<job_id>:<detected_at>` → (job_id, detected_at)；不合法返回 None。
+
+    生成规则在 `_external_order_row`（order_id 字段），这里是**唯一**解析入口：
+    job_id 必须是十进制、detected_at 必须非空 —— 与前端 `_isExternalOrder` 的 `ext:` 前缀判据、
+    以及订单明细里 raw id 的形态一致。
+    """
+    s = str(order_id or "")
+    if not s.startswith("ext:"):
+        return None
+    job_raw, sep, detected = s[4:].partition(":")
+    if not sep or not job_raw.isdigit():
+        return None
+    detected = detected.strip()
+    if not detected:
+        return None
+    return int(job_raw), detected
+
+
+def set_external_order_status(store, order_id, status, by: str = "", at: str = "") -> tuple:
+    """把一条外部监视单的**订单状态**订正为终态（纯逻辑，不碰 HTTP / 不碰云端）。
+
+    返回 (ok, code, message, info)。ok=True 时 info 含 order_id / status /
+    previous_status / manual_status_by / manual_status_at（直接回给页面做乐观更新）。
+    只接受终态白名单（print_watch.MANUAL_STATUSES ≈ 云端 MANUAL_FIX_STATUSES），
+    只认「已被确认为已处理」的记录 —— 待处理的作业连钱都还没算，谈不上订正结算状态。
+    """
+    import print_watch as _pw
+    st = str(status or "").strip()
+    if st not in _pw.MANUAL_STATUSES:
+        return (False, "bad_status",
+                "不允许订正为「%s」（只允许终态：%s）"
+                % (st or "空", " / ".join(_pw.MANUAL_STATUSES)), {})
+    parsed = parse_external_order_id(order_id)
+    if parsed is None:
+        return (False, "bad_order_id",
+                "外部订单号格式非法（应为 ext:<作业号>:<检测时间>）", {})
+    job_id, detected_at = parsed
+    items = store.load(force=True)       # 强制读盘：监视进程可能刚往账本里写过
+    for idx, item in enumerate(items):
+        if int(getattr(item, "job_id", 0) or 0) != job_id:
+            continue
+        if str(getattr(item, "detected_at", "") or "") != detected_at:
+            continue
+        if str(getattr(item, "status", "") or "") != _pw.STATUS_CONFIRMED:
+            return (False, "not_confirmed",
+                    "该作业还没被确认为已处理，不能订正订单状态", {})
+        previous = str(getattr(item, "manual_status", "") or "") or "sent"
+        updated = store.set_manual_status(idx, st, by=by, at=str(at or "") or _iso_now())
+        if updated is None:              # 理论上不可能（刚 load 过），兜个底别 500
+            return (False, "not_found", "账本里找不到该订单", {})
+        return (True, "", "", {
+            "order_id": "ext:%d:%s" % (job_id, detected_at),
+            "status": st,
+            "previous_status": previous,
+            "manual_status_by": str(getattr(updated, "manual_status_by", "") or ""),
+            "manual_status_at": str(getattr(updated, "manual_status_at", "") or ""),
+        })
+    return (False, "not_found", "账本里找不到该订单（可能已被清理）", {})
 
 
 def load_external_prices():
@@ -234,6 +303,15 @@ def _external_order_row(item, amount: float, owner_name: str) -> dict:
     clock = detected_at[11:19].replace(":", "")
     order_number = ("EXT-%s-%s-%d" % (day, clock, job_id)
                     if len(day) == 8 and len(clock) == 6 else "EXT-%d" % job_id)
+    # v7.16：结算页可以对**外部监视单**做人工状态订正（本地账本的 manual_status 字段）。
+    # 没订正过 = sent（监视流程认定纸已经打出来了）；订正过就按人工值，结算页的收益/用量
+    # 口径只认子任务 status='sent'，所以改成 failed 等终态就等于不计这笔钱。
+    manual_status = str(getattr(item, "manual_status", "") or "")
+    if manual_status not in _pw.MANUAL_STATUSES:
+        manual_status = ""
+    order_status = manual_status or "sent"
+    manual_status_by = str(getattr(item, "manual_status_by", "") or "")
+    manual_status_at = str(getattr(item, "manual_status_at", "") or "")
     return {
         # 带前缀的字符串：**绝不是纯数字**（本地/云端订单 id 是整数，纯数字会让前端按 id 去重/取数）
         "order_id": "ext:%d:%s" % (job_id, detected_at),
@@ -252,7 +330,9 @@ def _external_order_row(item, amount: float, owner_name: str) -> dict:
         "delivery_enabled": False,
         "urgency": "低",
         "cover_page": False,
-        "status": "sent",                  # 已处理 = 纸已经打出来了
+        "status": order_status,            # 已处理 = 纸已经打出来了；被人工订正过则用订正后的终态
+        "manual_status_by": manual_status_by,
+        "manual_status_at": manual_status_at,
         "unsynced": False,
         "sync_status": "synced",
         "external": True,
@@ -267,7 +347,9 @@ def _external_order_row(item, amount: float, owner_name: str) -> dict:
             "duplex": duplex,
             "page_range": "",
             "total_price": round(float(amount), 2),
-            "status": "sent",
+            "status": order_status,
+            "manual_status_by": manual_status_by,
+            "manual_status_at": manual_status_at,
             "is_free": False,
             "effective_pages": pages,
             "sheets": sheets,
@@ -490,6 +572,9 @@ FINANCE_WRITE_MODULES = {
     "/api/proxy/printer/capability": "auth",
     "/api/local/data": None,
     "/api/local/bindings": None,
+    # v7.16：外部监视单的状态订正写本地账本 —— 与云端订单订正同一个模块令牌，
+    # 页面上是同一个锁（🔒 订单状态），不能出现「解锁了云端订正却能偷偷改本地账本之外」
+    "/api/local/external_prints/status": "orderstatus",
 }
 # 不需要会话的 POST（登录/首次设置/登出：它们本身就是"换会话"的动作）
 FINANCE_AUTH_OPEN_PATHS = frozenset({
@@ -1816,6 +1901,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/data":
             return self._handle_post_data()
 
+        # 外部监视单的状态订正（写本地账本，见 set_external_order_status）
+        if path == "/api/local/external_prints/status":
+            return self._handle_post_external_status()
+
         # 未知
         self._send_json({"success": False, "message": "未找到"}, 404)
 
@@ -2386,6 +2475,49 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                                         getattr(self, "token", ""))
         self._send_json(build_external_prints_payload(
             items, simplex_price, duplex_price, owner_name, start_date, end_date))
+
+    def _handle_post_external_status(self):
+        """POST /api/local/external_prints/status —— 外部监视单的订单状态订正。
+
+        请求体：{"order_id": "ext:<job_id>:<detected_at>", "status": "failed", "by": "霍楠"}
+        守卫：启动令牌门 + 财务写会话（`FINANCE_WRITE_MODULES` 里的 orderstatus 模块，
+        在 `do_POST` 里已校验，本方法不再重复判 —— 但也**不**放宽）。
+        语义：只写账本的 manual_status*（不改监视状态）；成功返回旧状态供页面做乐观更新。
+        每条都进审计（event=external_order_fix，含 order_id/前后状态/标记人），失败也记。
+        """
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except (ValueError, UnicodeDecodeError):
+            return self._send_json({"success": False, "code": "bad_json",
+                                    "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return self._send_json({"success": False, "code": "bad_json",
+                                    "message": "请求体必须是对象"}, 400)
+        order_id = body.get("order_id")
+        status = body.get("status")
+        by = str(body.get("by") or "").strip()[:32]
+        try:
+            import print_watch as _pw
+            store = _pw.ExternalPrintStore(EXTERNAL_LEDGER_OVERRIDE)
+            ok, code, message, info = set_external_order_status(
+                store, order_id, status, by=by)
+        except Exception as e:              # 账本损坏/磁盘满：明确 500，绝不假装成功
+            logger.error("订正外部监视单状态失败: %s", type(e).__name__)
+            return self._send_json({"success": False, "code": "internal_error",
+                                    "message": "账本写入失败（%s）" % type(e).__name__}, 500)
+        self._fin().audit("external_order_fix", module="orderstatus",
+                          fields={"order_id": str(order_id or "")[:64],
+                                  "status": str(status or "")[:16],
+                                  "before": info.get("previous_status", ""),
+                                  "by": by},
+                          extra={"success": ok, "code": code or "ok"})
+        if not ok:
+            http_status = 404 if code == "not_found" else 400
+            return self._send_json({"success": False, "code": code,
+                                    "message": message}, http_status)
+        out = {"success": True, "message": "状态已订正"}
+        out.update(info)
+        self._send_json(out)
 
     def _handle_post_data(self):
         """写入本地数据文件：路径固定为默认数据文件（不支持客户端指定路径），

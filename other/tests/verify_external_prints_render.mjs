@@ -5,7 +5,8 @@
  *       ① 来源列显示新标签「外部监视」（独立配色，不与其他三色撞）；
  *       ② 类型列按现有「接单」槽渲染（不新增类型槽）；
  *       ③ 金额/收益计入（KPI 涨这一笔），用户列归到设备所有者；
- *       ④ 该行状态/类型**点不出**订正菜单（它不在云端 orders 表里，改不了）；
+ *       ④ 状态列可订正（v7.16 起：写本地账本 /api/local/external_prints/status），
+ *          类型列仍不可订正（外部单没有「订单类型」这个概念）；
  *       ⑤ 「来源」筛选可单独只看外部作业；
  *       ⑥ 外部数据源 500 / 挂住时页面照常渲染云端订单（绝不白屏、不弹错）。
  *
@@ -131,11 +132,25 @@ const json = (res, obj) => { res.writeHead(200, { 'Content-Type': 'application/j
 /* 外部端点行为：empty / ok / ok_unbound / error(500) / hang(永不响应) */
 let EXT_MODE = 'empty';
 const extHits = [];          // 收到的 /api/local/external_prints 查询（断言带上了日期参数）
+const extStatusWrites = [];  // 收到的 /api/local/external_prints/status 订正请求（v7.16）
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://127.0.0.1');
   const p = decodeURIComponent(u.pathname);
   if (p.startsWith('/api/')) {
     if (p === '/api/health') return json(res, { success: true, cloud: true });
+    if (p === '/api/local/external_prints/status') {
+      /* v7.16：外部监视单的状态订正走本地账本写接口（不是云端 orders 写接口）。
+         这里只记录请求并回 success，供 ④6 断言「点菜单项真的打到这条路由、参数对不对」。 */
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      return req.on('end', () => {
+        let payload = null;
+        try { payload = JSON.parse(body || '{}'); } catch (e) { payload = { parse_error: String(e) }; }
+        extStatusWrites.push(payload);
+        return json(res, { success: true, message: '状态已订正', order_id: payload.order_id,
+                           status: payload.status, previous_status: 'sent' });
+      });
+    }
     if (p === '/api/local/external_prints') {
       extHits.push({ start: u.searchParams.get('start_date'), end: u.searchParams.get('end_date') });
       if (EXT_MODE === 'hang') return;     // 挂住：页面必须照常渲染云端订单（⑥ 的强版本）
@@ -330,7 +345,7 @@ try {
   /* ④ 订正闸门 */
   const gate = await page.evaluate(() => {
     window.unlocked = window.unlocked || {};
-    window.unlocked.orderstatus = true;          // 直接解锁，专测「外部订单仍然点不出菜单」
+    window.unlocked.orderstatus = true;          // 直接解锁，专测「外部订单的类型列仍然点不出菜单」
     window._rerenderOrdersOnly();
     return {
       extStatus: window._orderStatusEditable('ext:8:2026-10-28 18:00:13'),
@@ -343,21 +358,22 @@ try {
   s = await snap();
   const isExtRow = (i) => s.orderNos[i] === 'EXT-20261028-180013-8';
   chk('④1 解锁后云端订单每行都有状态/类型订正入口（说明解锁确实生效，不是整体不可点）',
-    s.statusEdit.filter((n) => n === 1).length === 3 && s.typeEdit.filter((n) => n === 1).length === 3,
+    s.statusEdit.filter((n, i) => n === 1 && !isExtRow(i)).length === 3 &&
+    s.typeEdit.filter((n, i) => n === 1 && !isExtRow(i)).length === 3,
     JSON.stringify({ statusEdit: s.statusEdit, typeEdit: s.typeEdit }));
-  chk('④2 外部订单的状态/类型列都没有 .st-edit / .st-caret（即使已解锁）',
-    extRowIdx >= 0 && s.statusEdit[extRowIdx] === 0 && s.statusCaret[extRowIdx] === 0 &&
+  chk('④2 外部订单**状态列**有 .st-edit/.st-caret（v7.16 起可订正），类型列仍然没有',
+    extRowIdx >= 0 && s.statusEdit[extRowIdx] === 1 && s.statusCaret[extRowIdx] === 1 &&
     s.typeEdit[extRowIdx] === 0 && s.typeCaret[extRowIdx] === 0,
     JSON.stringify({ statusEdit: s.statusEdit, typeEdit: s.typeEdit, extRowIdx, isExt: s.orderNos.map(isExtRow) }));
-  chk('④3 点外部订单的状态标签弹不出订正菜单',
+  chk('④3 点外部订单的状态标签能弹出订正菜单（白名单与云端单同一份终态）',
     await (async () => {
       await page.click(extSel + ' td:nth-child(5)');
       await page.waitForTimeout(200);
-      const has = !!(await page.$('#stMenu'));
-      await page.keyboard.press('Escape');
-      return !has;
+      const items = await page.$$eval('#stMenu .st-menu-item', (els) => els.map((e) => e.textContent.trim()));
+      await page.evaluate(() => window.closeOrderStatusMenu && window.closeOrderStatusMenu());
+      return items.length === 5 && items.some((t) => t.indexOf('已取消') >= 0 || t.indexOf('取消') >= 0);
     })());
-  chk('④4 点外部订单的类型标签也弹不出菜单（两列同一把闸门）',
+  chk('④4 点外部订单的类型标签仍弹不出菜单（类型列对外部单只读）',
     await (async () => {
       await page.click(extSel + ' td:nth-child(10)');
       await page.waitForTimeout(200);
@@ -365,10 +381,35 @@ try {
       await page.keyboard.press('Escape');
       return !has;
     })());
-  chk('④5 闸门自身：_orderStatusEditable / _orderTypeEditable 对 ext: id 直接返回 false，对数字 id 返回 true',
-    gate.extStatus === false && gate.extType === false &&
+  chk('④5 闸门自身：_orderStatusEditable 对 ext: id 返回 true，_orderTypeEditable 仍是 false；云端单两列都 true',
+    gate.extStatus === true && gate.extType === false &&
     gate.cloudStatus === true && gate.cloudType === true,
     JSON.stringify(gate));
+  /* ④6 v7.16 端到端：菜单项点击 → 打本地账本写接口（不是云端写接口）→ 乐观更新 + 口径重算 */
+  const kpiBeforeFix = s.kpi;
+  await page.evaluate(() => { window.unlocked.orderstatus = true; window._rerenderOrdersOnly(); });
+  await page.waitForTimeout(200);
+  await page.click(extSel + ' td:nth-child(5)');
+  await page.waitForTimeout(200);
+  const items = await page.$$eval('#stMenu .st-menu-item', (els) => els.map((e) => e.textContent.trim()));
+  const failIdx = items.findIndex((t) => t.indexOf('失败') >= 0 || t.indexOf('打回') >= 0 || t.indexOf('已取消') >= 0);
+  if (failIdx >= 0) {
+    await page.click('#stMenu .st-menu-item:nth-child(' + (failIdx + 1) + ')');
+    await page.waitForTimeout(600);
+  }
+  const afterFix = await snap();
+  const extRowAfter = afterFix.orderNos.indexOf('EXT-20261028-180013-8');
+  const extStatusTxt = (await page.evaluate((sel) =>
+    (document.querySelector(sel + ' td:nth-child(5)') || {}).textContent || '', extSel)).trim();
+  chk('④6 点「非已完成」状态后：打到 /api/local/external_prints/status（不是云端 order_status），参数是 raw ext: id',
+    extStatusWrites.length === 1 &&
+    String(extStatusWrites[0].order_id).indexOf('ext:') === 0 &&
+    /^(failed|canceled|abandoned|rejected)$/.test(String(extStatusWrites[0].status)),
+    JSON.stringify(extStatusWrites));
+  chk('④7 该行状态标签就地变成新状态，且金额不再计入 KPI（v7.16 只改 files[].status，口径自动退出）',
+    extRowAfter >= 0 && extStatusTxt !== '已完成' && afterFix.kpi === kpiBeforeFix - 70,
+    JSON.stringify({ statusTxt: extStatusTxt, kpi: [kpiBeforeFix, afterFix.kpi], extRowAfter,
+                     amount: afterFix.amounts[extRowAfter] }));
 
   /* 截图（带时间戳，存 截图展示/外部监视订单明细/） */
   const shot = path.join(OUT_DIR, '外部监视订单明细-' + STAMP + '.png');

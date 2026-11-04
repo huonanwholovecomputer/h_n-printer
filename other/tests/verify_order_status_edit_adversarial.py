@@ -770,6 +770,9 @@ chk("openOrderStatusMenu 用的是同一个同源守卫（_orderStatusEditable�
 # 2026-10-30：v7.3 把 `_orderStatusEditable` 从「单行 && 表达式」改写成「早返回 + 外部单守卫」，
 # 旧正则（要求 `return FINANCE_MODE !== 'local' && ...;` 一整行）必然失配 —— 源码是对的，
 # 是判据形态过期。改成「取函数体，三条判据都在、且都在 return true 之前」。
+# 2026-11-03：v7.16 把外部单从「永不订正」翻转成「走本地账本接口可订正」（用户要求），
+# 守卫形态变成「外部单 return true + 云端单仍只认十进制」。判据按新形态同步：
+# 外部单**必须放行**，十进制那道闸门仍然只管云端单。
 def _editable_body(src):
     i = src.find("function _orderStatusEditable(oidS) {")
     if i < 0:
@@ -782,17 +785,21 @@ def _editable_ok(src):
     b = _editable_body(src)
     return (bool(b) and "FINANCE_MODE === 'local'" in b
             and "unlocked.orderstatus" in b
+            and "if (_isExternalOrder(oidS)) return true;" in b
             and "/^[0-9]+$/.test(String(oidS))" in b
-            and b.count("return false") >= 2)
+            and b.count("return false") >= 1)
 
 
-chk("_orderStatusEditable 同时要求「非 local + 已解锁 + id 是规范十进制」",
+chk("_orderStatusEditable 同时要求「非 local + 已解锁 + 外部单走本地账本放行 / 云端单 id 是规范十进制」",
     _editable_ok(html)
     and "/^[0-9]+$/.test(String(oidS))" in html)
 chk("[自证] 静态变异：_orderStatusEditable 去掉 FINANCE_MODE 判据（退回只判 unlocked）→ 上式转红",
     not _editable_ok(html.replace(
         "if (FINANCE_MODE === 'local' || !unlocked.orderstatus || !oidS) return false;",
         "if (!unlocked.orderstatus || !oidS) return false;")))
+chk("[自证] 静态变异：外部单分支退回 return false（v7.3 的「永不订正」）→ 上式转红",
+    not _editable_ok(html.replace("if (_isExternalOrder(oidS)) return true;",
+                                  "if (_isExternalOrder(oidS)) return false;")))
 chk("local 模式锁开关不渲染（表头没有入口）",
     re.search(r"function _orderStatusLockHTML\(\) \{\s*\n\s*if \(FINANCE_MODE === 'local'\) return '';",
               html) is not None)
@@ -814,7 +821,7 @@ chk("前端可选状态集合 == 菜单渲染集合（ORDER_FIXABLE_STATUSES 单
 # 真正让内联表达式不可达的理由是「order_id 只认规范十进制」，所以升级为 chk，
 # 盯前端同款闸门（与后端 re.fullmatch(r"[0-9]+") 同源）；缺了它 = 非规范十进制 id 可能被当表达式。
 _DECIMAL_ID_GATE = re.compile(
-    r"function _orderStatusEditable\(oidS\)\s*\{[\s\S]{0,600}?/\^\[0-9\]\+\$/")
+    r"function _orderStatusEditable\(oidS\)\s*\{[\s\S]{0,1600}?/\^\[0-9\]\+\$/")
 chk("★ _orderStatusEditable 只认十进制 id（/^[0-9]+$/，与后端 re.fullmatch 同源）"
     "—— 行内 onclick 不可达的**真正**理由（safeId 字母白名单放行 '1e3'/'12-34'，不构成理由）",
     _DECIMAL_ID_GATE.search(html) is not None)

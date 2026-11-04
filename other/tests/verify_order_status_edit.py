@@ -105,8 +105,9 @@ chk("锁定态同时收起状态菜单（closeOrderStatusMenu）",
     re.search(r"function closeOrderStatusMenu\(\)[\s\S]{0,200}?m\.remove\(\)", html) is not None)
 
 # A3 解锁后才有小箭头 / 点击入口（锁定态点状态什么都不发生）
-# 判据按**语义**取函数体里的三道闸门，不钉代码形状：2026-10-28 起该函数由单行 return 改成多行守卫
-# （新增「外部监视订单永不订正」那条），写死单行形状会让正当改动误报红。
+# 判据按**语义**取函数体里的几道闸门，不钉代码形状：2026-10-28 起该函数由单行 return 改成多行守卫
+# （先加「外部监视订单永不订正」，2026-11-03 v7.16 又改成「外部单走本地账本接口，仍可订正」），
+# 写死单行形状会让正当改动误报红。
 _status_gate = re.search(r"function _orderStatusEditable\(oidS\) \{([\s\S]*?)\n\}", html)
 _gate_body = _status_gate.group(1) if _status_gate else ""
 _gate_ok = (
@@ -118,8 +119,11 @@ _gate_ok = (
 )
 chk("行内状态单元格由 _orderStatusEditable 门控（仅云端 + 已解锁 + id 合法）",
     _gate_ok, _gate_body.strip()[:120])
-chk("外部监视订单永不订正（它们不在云端 orders 表里，写库接口根本找不到这单）",
-    re.search(r"_isExternalOrder\(oidS\)[\s\S]{0,40}?return false", _gate_body) is not None,
+# v7.16（2026-11-03 用户要求「外部监视的订单改不了状态？需要允许调整状态」）：外部监视单**可以**
+# 订正了 —— 它们不在云端 orders 表里，所以走本地账本的 /api/local/external_prints/status，
+# 闸门在 _isExternalOrder 处分岔为 true（白名单仍是同一份终态清单）。
+chk("外部监视订单也可订正（v7.16：改走本地账本接口 /api/local/external_prints/status）",
+    re.search(r"_isExternalOrder\(oidS\)[\s\S]{0,40}?return true", _gate_body) is not None,
     _gate_body.strip()[:160])
 chk("小箭头 st-caret 只出现在可编辑分支里",
     re.search(r"_orderStatusEditable\(oidS\)[\s\S]{0,400}?st-caret", html) is not None)
@@ -270,8 +274,10 @@ chk("类型表头挂 _orderTypeLockHTML()（锁在表头，不是每行）",
 chk("类型锁按钮走**同一个** toggleOrderStatusLock（不另开一把锁/不另要一次密码）",
     re.search(r"function _orderTypeLockHTML\(\)[\s\S]{0,700}?onclick=\"event\.stopPropagation\(\);toggleOrderStatusLock\(\)\"",
               html) is not None)
-chk("类型可编辑判据与状态同源（_orderTypeEditable → _orderStatusEditable）",
-    re.search(r"function _orderTypeEditable\(oidS\) \{ return _orderStatusEditable\(oidS\); \}", html) is not None)
+chk("类型可编辑判据与状态同源，但外部监视单仍不可改类型（_orderTypeEditable → 外部单 false，"
+    "其余委托 _orderStatusEditable）",
+    re.search(r"function _orderTypeEditable\(oidS\) \{\s*return _isExternalOrder\(oidS\) \? false : "
+              r"_orderStatusEditable\(oidS\);", html) is not None)
 chk("前端只允许 receive/self（与后端 MANUAL_FIX_ORDER_TYPES 同源）",
     re.search(r"var ORDER_FIXABLE_TYPES = \['receive', 'self'\];", html) is not None
     and re.search(r'MANUAL_FIX_ORDER_TYPES = \("receive", "self"\)', app_src) is not None)

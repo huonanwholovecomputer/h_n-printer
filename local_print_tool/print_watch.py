@@ -53,6 +53,14 @@ STATUS_CONFIRMED = "confirmed"
 STATUS_IGNORED = "ignored"
 VALID_STATUSES = (STATUS_NEW, STATUS_CONFIRMED, STATUS_IGNORED)
 
+# 收支清算「订单明细」里的人工状态订正（**订单状态**，与上面的监视状态是两回事）：
+# 监视状态回答「这条作业算不算一笔账」，订单状态回答「这笔账算不算已打印完成」——
+# 结算页的收益/用量口径只认子任务 status='sent'，所以订正成 failed 等状态就等于不计这笔钱。
+# 只放**终态**，且必须与云端后端 MANUAL_FIX_STATUSES、settlement.html ORDER_FIXABLE_STATUSES
+# 是同一份清单（改成排队中/打印中会被推送与预约调度重新捡起来打印）；
+# other/tests/verify_order_status_edit.py 与 verify_external_prints_settlement.py 会红。
+MANUAL_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected")
+
 SOURCE_AUTO = "auto"                    # 驱动/spooler 自己报的页数
 SOURCE_CONFIRMED = "confirmed"          # 人工补录
 SOURCE_UNKNOWN = "unknown"              # 谁也报不出来（1020 打满页数时的常态）
@@ -325,6 +333,11 @@ class ExternalPrint:
     detected_at: str = ""
     printer_virtual: bool = False
     status: str = STATUS_NEW
+    # 人工订正过的**订单状态**（"" = 没订正过，展示时按 sent 处理）。
+    # 与 status 正交：status 管监视流程（待处理/已确认/已忽略），这里管结算口径。
+    manual_status: str = ""
+    manual_status_by: str = ""            # 标记人（结算页成员名单里的名字）
+    manual_status_at: str = ""            # 订正时间（服务器本地时间，ISO 秒级）
 
     def key(self) -> tuple[str, int, str]:
         return (self.printer, int(self.job_id), self.detected_at)
@@ -366,6 +379,13 @@ class ExternalPrint:
             item.color = COLOR_UNKNOWN
         if item.status not in VALID_STATUSES:
             item.status = STATUS_NEW
+        # 订正状态只认白名单里的终态：账本被手改/旧版本写入脏值时一律当「没订正过」，
+        # 绝不让一个来路不明的状态流到结算口径里
+        item.manual_status = str(item.manual_status or "")
+        if item.manual_status not in MANUAL_STATUSES:
+            item.manual_status = ""
+        item.manual_status_by = str(item.manual_status_by or "")
+        item.manual_status_at = str(item.manual_status_at or "")
         item.printer_virtual = bool(item.printer_virtual)
         return item
 
@@ -650,6 +670,19 @@ class ExternalPrintStore:
         if status not in VALID_STATUSES:
             raise ValueError(f"未知状态: {status}")
         return self._mutate(index, status=status)
+
+    def set_manual_status(self, index: int, status: str, by: str = "",
+                          at: str = "") -> Optional[ExternalPrint]:
+        """结算页「订单明细」的状态订正：只写 manual_status*，**不碰**监视状态 status。
+
+        摄入路径（PrintJobWatcher 扫到已处理作业）只写 status，订正只写 manual_status，
+        两条写路径互不覆盖：下次监视刷新不会把人工订正刷掉。
+        """
+        if status not in MANUAL_STATUSES:
+            raise ValueError(f"不允许订正为: {status}")
+        return self._mutate(index, manual_status=status,
+                            manual_status_by=str(by or "").strip(),
+                            manual_status_at=str(at or ""))
 
     def _mutate(self, index: int, **changes) -> Optional[ExternalPrint]:
         with self._lock:

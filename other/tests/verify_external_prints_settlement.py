@@ -50,15 +50,18 @@ RESPONSE_KEYS = {"success", "orders", "count", "skipped",
                  "simplex_price", "duplex_price", "owner_name", "default_printer"}
 # 契约里订单行的键
 # v7.12 起多了 printer_name（本地监视记下的打印队列名，结算页据此认出是哪台机打的）
+# v7.16 起多了 manual_status_by / manual_status_at（结算页对外部监视单的人工状态订正留痕）
 ORDER_KEYS = {"order_id", "order_number", "created_at", "total_price",
               "total_page_count", "total_sheet_count", "owner_name",
               "is_admin_print", "source", "openid", "nickname", "auto_print",
               "schedule_mode", "delivery_enabled", "urgency", "cover_page",
-              "status", "unsynced", "sync_status", "external", "printer_name", "files"}
-# 契约里 files[0] 的键
+              "status", "unsynced", "sync_status", "external", "printer_name",
+              "manual_status_by", "manual_status_at", "files"}
+# 契约里 files[0] 的键（v7.16 起同样带 manual_status_by / manual_status_at：
+# 结算页的金额与用量只认 files[].status，订正必须落到文件级才会真的不计钱）
 FILE_KEYS = {"id", "file_name", "copies", "page_count", "duplex", "page_range",
              "total_price", "status", "is_free", "effective_pages", "sheets",
-             "total_pages", "total_sheets"}
+             "total_pages", "total_sheets", "manual_status_by", "manual_status_at"}
 
 
 def check(name, cond, detail=""):
@@ -341,11 +344,13 @@ EXPECTED_ROW = {
     "sync_status": "synced",
     "external": True,
     "printer_name": "HP LaserJet 1020",
+    "manual_status_by": "",
+    "manual_status_at": "",
     "files": [{
         "id": "ext-8", "file_name": "三页文档测试.pdf", "copies": 1, "page_count": 3,
         "duplex": "on", "page_range": "", "total_price": 0.7, "status": "sent",
         "is_free": False, "effective_pages": 3, "sheets": 2, "total_pages": 3,
-        "total_sheets": 2,
+        "total_sheets": 2, "manual_status_by": "", "manual_status_at": "",
     }],
 }
 check("⑨ 订单行与契约样例**整行相等**（键与值一起对）",
@@ -353,11 +358,11 @@ check("⑨ 订单行与契约样例**整行相等**（键与值一起对）",
       "" if _contract_row == EXPECTED_ROW else json.dumps(
           {k: _contract_row.get(k) for k in sorted(set(EXPECTED_ROW) | set(_contract_row))},
           ensure_ascii=False)[:400])
-check("⑨ 顶层键集合逐字符一致（21 个，多一个少一个都算不一致）",
+check("⑨ 顶层键集合逐字符一致（24 个，多一个少一个都算不一致）",
       set(_contract_row) == ORDER_KEYS,
       "缺 " + str(sorted(ORDER_KEYS - set(_contract_row)))
       + " 多 " + str(sorted(set(_contract_row) - ORDER_KEYS)))
-check("⑨ files[0] 键集合逐字符一致（13 个）",
+check("⑨ files[0] 键集合逐字符一致（15 个）",
       set(_contract_row["files"][0]) == FILE_KEYS,
       "缺 " + str(sorted(FILE_KEYS - set(_contract_row["files"][0])))
       + " 多 " + str(sorted(set(_contract_row["files"][0]) - FILE_KEYS)))
@@ -440,7 +445,8 @@ check("⑪ owner 查询走共享 Session + _PROXY_TIMEOUT + X-Printer-Token 请�
       and '"X-Printer-Token": token' in _src
       and "timeout=_PROXY_TIMEOUT" in _src, "")
 check("⑪ 账本读取用 print_watch.ExternalPrintStore（不另写一份 JSON 解析）",
-      "ExternalPrintStore(path)" in _src and "def _read_file" not in _handler_src, "")
+      "_pw.ExternalPrintStore(path or EXTERNAL_LEDGER_OVERRIDE)" in _src
+      and "def _read_file" not in _handler_src, "")
 
 # ══════════════════════════════════════════════════════════════════
 section("⑫ handler 胶水层：解析 start_date/end_date 并只序列化一次（仍不发真网）")
