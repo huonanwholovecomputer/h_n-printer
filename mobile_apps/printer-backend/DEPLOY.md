@@ -77,7 +77,7 @@ chown -R www-data:www-data /opt/printer-backend
 > `nginx-http.conf` / `nginx-https.conf` **已刻意不含该 location**（原配置有，现已删除），
 > 升级时也**别加回来**；确需内部重定向才用 `internal;`。
 > 文件下发一律走后端鉴权路由（`/api/file/<id>` 带归属校验、`/api/avatar?openid=…`）。
-> 守护脚本：`python tests/verify_nginx_uploads.py`。
+> 守护脚本：`python other/tests/verify_nginx_uploads.py`。
 
 ---
 
@@ -206,7 +206,7 @@ bash /home/printer-backend/backup.sh
   `worker_class` 不是 eventlet 后可以 `pip uninstall eventlet`。
 - 发布前跑一次 CVE 扫描：`pip install pip-audit && pip-audit -r requirements.txt`
   （离线环境会失败，属于预期；联网机器上必须跑过）。
-- 验收：`python tests/verify_dependencies.py`（锁版本 / 无 eventlet / import 与依赖对齐 + 变异自证）。
+- 验收：`python other/tests/verify_dependencies.py`（锁版本 / 无 eventlet / import 与依赖对齐 + 变异自证）。
 
 ---
 
@@ -296,7 +296,7 @@ curl -s "http://127.0.0.1:5000/api/printer/devices?token=$TOKEN"
 - 冒烟脚本（如 `verify_deploy_smoke.py`）**跑完要删掉自己注册的设备**
   （`POST /api/printer/devices/delete`），中途失败也要在 `finally` 里清。
 - 连过生产后自查一次授权页：有没有多出陌生设备（这一步能立刻发现脚本泄漏）。
-- 验收：`python tests/verify_device_cleanup.py`（识别不误伤 / 隐藏与计数 / dry-run 不落盘 /
+- 验收：`python other/tests/verify_device_cleanup.py`（识别不误伤 / 隐藏与计数 / dry-run 不落盘 /
   在线与盖章设备跳过 / 删除同步清接单记录 / 定时任务幂等 / 页面按钮接线）。
 
 ---
@@ -364,10 +364,10 @@ curl -sS -o /dev/null -w '%{http_code}\n' "https://hn-space.cn/socket.io/?EIO=4&
 ## 13. 运行时切换（S3-01：gevent）— 可选，默认不启用
 
 **为什么有这个开关**：threading + gthread `threads=16` 时，**每条 WebSocket 连接占住一个
-worker 线程**。S2-12 压测（`tests/staging/08_staging_tiers.py`）实测：15 条连接就把 16 个
+worker 线程**。S2-12 压测（`other/tests/staging/08_staging_tiers.py`）实测：15 条连接就把 16 个
 worker 占满、HTTP 全线超时；按 §11.2 `required_threads = ceil(在线设备×2.5)+4`，
 3 台需 12（够）、6 台需 19、10 台需 29。gevent 把一条连接降为一个 greenlet，不再占 OS 线程：
-**48 条连接时 `/api/ping` 仍全部 200、OS 线程只有 3 条**（`tests/staging/09_gevent_runtime.py`，
+**48 条连接时 `/api/ping` 仍全部 200、OS 线程只有 3 条**（`other/tests/staging/09_gevent_runtime.py`，
 对照同一台机器上 gthread 16 线程 + 24 条连接 ⇒ HTTP 全超时）。
 
 ### 切换 / 回滚（只改一个环境变量）
@@ -398,7 +398,7 @@ async_mode=gevent，交叉组合会重演 2026-09 那次 eventlet/gthread 混用
 journalctl -u printer-backend -n 30 | grep -E "Booting worker|gevent|gthread"
 
 # 3) 线上冒烟（与 S0 相同）：匿名握手 403、设备能连、HTTP 拉单保活
-python tests/verify_deploy_smoke.py          # 在本机跑（scp 到服务器，见脚本说明）
+python other/tests/verify_deploy_smoke.py          # 在本机跑（scp 到服务器，见脚本说明）
 curl -sS -o /dev/null -w '%{http_code}\n' "https://hn-space.cn/socket.io/?EIO=4&transport=polling"  # 403
 
 # 4) 关键业务：门店机重连后接一单，确认打印成功回报（这是 gevent 下 SQLite/推送路径的实机验证）
@@ -419,7 +419,7 @@ curl -sS -o /dev/null -w '%{http_code}\n' "https://hn-space.cn/socket.io/?EIO=4&
    某个任务里出现**长时间阻塞的 C 调用**（如一次性扫描巨大目录），同样会卡住事件循环。
    任务侧保持"小而频繁"的既有口径即可。
 4. **调试体验**：所有请求在一条 OS 线程里跑，`py-spy dump` 只能看到 hub；排查卡死优先看
-   `/api/ping` 是否还响应 + greenlet 数（`tests/staging/srv.py` 的 `/stats`）。
+   `/api/ping` 是否还响应 + greenlet 数（`other/tests/staging/srv.py` 的 `/stats`）。
 
 ### 什么时候该切
 

@@ -10,7 +10,7 @@
   · 凭据轮换：读 `ops/credential_rotation.py` 的 status（只 import，不重算规则）；
   · CVE：读 `ops/reports/cve-*.json`（最新一份；SKIP 不等于干净）；
   · 高可用：读 `ops/reports/ha_*.json`（RTO/RPO 实测 vs 目标）；
-  · DDoS 三档回归：读 `tests/staging/results/99_run_all.json`；
+  · DDoS 三档回归：读 `other/tests/staging/results/99_run_all.json`；
   · run_all：解析 `--run-all-log` 的 `结果：PASS n/n` 与退出码；
   · 审计统计：**subprocess 调** `ops/audit_query.py --stats --json`（模块不存在就写「缺失」，
     绝不直接 import 一个还没落地的模块）。
@@ -24,7 +24,7 @@
     python ops/quarterly_ops_report.py --period 2026-Q4 --release-gate
     python ops/quarterly_ops_report.py --period 2026-Q4 \
         --rotation-registry /tmp/reg.json --reports-dir /tmp/reports \
-        --staging-result tests/staging/results/99_run_all.json \
+        --staging-result other/tests/staging/results/99_run_all.json \
         --run-all-log /tmp/run_all.log --audit-query /tmp/audit_query.py \
         --out /tmp/q.md
 
@@ -47,7 +47,7 @@ BACKEND = os.path.dirname(HERE)
 REPO = os.path.dirname(os.path.dirname(BACKEND))
 DEFAULT_REPORTS = os.path.join(HERE, "reports")
 DEFAULT_ROTATION = os.path.join(HERE, "credential_rotation.json")
-DEFAULT_STAGING = os.path.join(REPO, "tests", "staging", "results", "99_run_all.json")
+DEFAULT_STAGING = os.path.join(REPO, "other", "tests", "staging", "results", "99_run_all.json")
 DEFAULT_AUDIT_QUERY = os.path.join(HERE, "audit_query.py")
 
 CVE_MAX_AGE_DAYS = 30          # CVE 报告新鲜度（发布门判据）
@@ -399,7 +399,7 @@ def gather_run_all(log_path: str, exit_code) -> dict:
     m = re.search(r"结果：PASS\s+(\d+)\s*/\s*(\d+)", text) or \
         re.search(r"PASS\s+(\d+)\s*/\s*(\d+)", text)
     if not m:
-        out["reason"] = "日志里找不到 `结果：PASS n/n` 汇总行（不是 tests/run_all.py 的输出？）"
+        out["reason"] = "日志里找不到 `结果：PASS n/n` 汇总行（不是 other/tests/run_all.py 的输出？）"
         return out
     out["passed"] = int(m.group(1))
     out["total"] = int(m.group(2))
@@ -877,8 +877,8 @@ def render_report(period: str, ev: dict, blockers: list, args, now: dt.datetime)
     else:
         A("**缺失**：%s" % (st.get("reason") or ""))
         A("")
-        A("应执行：`python tests/staging/99_run_all.py`（隔离副本，约 7 分钟），"
-          "结果落 `tests/staging/results/99_run_all.json`。")
+        A("应执行：`python other/tests/staging/99_run_all.py`（隔离副本，约 7 分钟），"
+          "结果落 `other/tests/staging/results/99_run_all.json`。")
     A("")
 
     # ── 7. run_all ──
@@ -897,7 +897,7 @@ def render_report(period: str, ev: dict, blockers: list, args, now: dt.datetime)
         A("应执行（PYTHONPATH 必须置空）：")
         A("")
         A("```bash")
-        A('PYTHONPATH= PYTHONUTF8=1 "<python>" tests/run_all.py | tee /tmp/run_all.log')
+        A('PYTHONPATH= PYTHONUTF8=1 "<python>" other/tests/run_all.py | tee /tmp/run_all.log')
         A("```")
         A("")
         A("然后把该日志用 `--run-all-log` 传回本脚本。")
@@ -912,7 +912,7 @@ def render_report(period: str, ev: dict, blockers: list, args, now: dt.datetime)
     A("2. CVE 有 **%d 天内**的干净扫描报告（SKIP/缺失/有漏洞均阻断）；" % CVE_MAX_AGE_DAYS)
     A("3. HA 演练有 **%d 天内**的 ok 报告，且 RTO ≤ 目标、RPO ≤ 目标；" % HA_MAX_AGE_DAYS)
     A("4. staging DDoS 回归结果存在且无失败脚本；")
-    A("5. `tests/run_all.py` 通过（PASS n/n，退出码 0）。")
+    A("5. `other/tests/run_all.py` 通过（PASS n/n，退出码 0）。")
     A("")
     if blockers:
         A("**结论：未通过（exit %d）** —— %d 项阻断：" % (1, len(blockers)))
@@ -1000,11 +1000,11 @@ def build_manual_list(ev: dict, args) -> list:
     if ha.get("available") and (ha.get("rto_ok") is False or ha.get("rpo_ok") is False):
         out.append("RTO/RPO 未达标：按 §11.4 复核 warm standby / 备份频率")
     if not st.get("available"):
-        out.append("跑 `python tests/staging/99_run_all.py` 产出 DDoS 三档回归证据")
+        out.append("跑 `python other/tests/staging/99_run_all.py` 产出 DDoS 三档回归证据")
     elif st.get("failed"):
         out.append("staging 失败脚本需修复后复跑：%s" % ", ".join(st["failed"]))
     if not ra.get("available"):
-        out.append("跑 `python tests/run_all.py` 并把输出留档（`--run-all-log` 引用）")
+        out.append("跑 `python other/tests/run_all.py` 并把输出留档（`--run-all-log` 引用）")
     elif not ra.get("ok"):
         out.append("run_all 未通过（%s）：修复后全量复跑" % (ra.get("reason") or ""))
     if not au.get("available"):
@@ -1028,7 +1028,7 @@ def build_next_actions(ev: dict, blockers: list) -> list:
     else:
         out.append("HA：保持季度演练节奏，并把本次 RTO/RPO 与上季度对比看趋势")
     out.append("DDoS：设备数接近扩容阈值（在线 >6 / 注册 >10）时提前跑 "
-               "`tests/staging/99_run_all.py` 三档复核，不等季度")
+               "`other/tests/staging/99_run_all.py` 三档复核，不等季度")
     out.append("审计：季度末抽查 10 条文件访问记录，确认「谁/何时/哪个文件」可追溯")
     out.append("Tabletop：下季度换 2 个新场景（如备份被删、域名/证书失效）演练")
     if blockers:
@@ -1056,9 +1056,9 @@ def main(argv=None) -> int:
     ap.add_argument("--ha-report", default="", help="指定 HA 报告（默认取最新 ha_*.json）")
     ap.add_argument("--cve-report", default="", help="指定 CVE 报告（默认取最新 cve-*.json）")
     ap.add_argument("--staging-result", default=DEFAULT_STAGING,
-                    help="staging 结果（默认 tests/staging/results/99_run_all.json）")
+                    help="staging 结果（默认 other/tests/staging/results/99_run_all.json）")
     ap.add_argument("--run-all-log", default="",
-                    help="tests/run_all.py 的输出日志（可选；解析 PASS n/n 与退出码）")
+                    help="other/tests/run_all.py 的输出日志（可选；解析 PASS n/n 与退出码）")
     ap.add_argument("--run-all-exit", type=int, default=None,
                     help="run_all 的退出码（可选；不传则从日志里找 [exit code: N]）")
     ap.add_argument("--audit-query", default=DEFAULT_AUDIT_QUERY,
