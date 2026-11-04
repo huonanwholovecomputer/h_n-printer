@@ -1,9 +1,9 @@
 {
-  "version": "4.6.2",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.2.exe",
-  "md5": "b585b26cdb2388112b131a3853176117",
-  "sha256": "0d3ec8e847e9c9e20a5e5184c4572e4ff7f481ec35021c4b79b48ed6597709b7",
-  "notes": "v4.6.2：① 新增「选项」菜单（打印速度、打印机双面能力、外部监视、账本、默认任务参数），常用设置不再散在各处；② 新增 xlsx 版式面板——Excel 的列宽/行高/颜色/边框按原样还原，复杂表格不再挤成一团；③ 打印纸张可选 A4/A3/A5/Letter/Legal/B5；④ 标签页显示订单创建时间与打印发起时间；⑤ 结算页：订单搜索高亮、价格可点按复制算式、状态原因悬停可见、去掉冗余的本月结论卡；⑥ 攒批开关随时可点（设备离线或忙也放行，显示「待应用」，上线后自动对齐）。",
+  "version": "4.6.3",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.3.exe",
+  "md5": "2c71ba7c8696fa0abc46ec58088b3426",
+  "sha256": "22bf07dcde1a68f062614aadd27c71a28796630f301ab9e64b4c705c0b4982e5",
+  "notes": "v4.6.3：① 退出程序时若还有文件没打完，弹窗会说清是哪个标签页，并可直接「去到这个标签页」或打开标签页管理器；② 修复标签页切换按钮右侧的「订单创建 / 打印发起」时间一直不显示的问题（此前被布局挤成 0 宽）；③ 结算页订单搜索支持中文输入法（组字期间不再把输入框重绘换掉）；④ 外部打印监视里的单据可手动订正为 已送出 / 打印失败 / 放弃 / 取消 / 已拒绝，金额与用量随之不计入；⑤ xlsx 可选「活动工作表」，任务参数面板在窄窗口下不再出现横向滚动条；⑥ 常驻托盘时每 2 小时静默复查更新，有新版本在菜单里标出。",
   "sig_algo": "ed25519",
-  "sig": "QrGFigLdFgAVTalYUEwfs5v5mmU+ExofksPcIftBvb4pxSU8lWDwq4xxREYxcOP6LSJRmj3THtGhPrN14LBjCw=="
+  "sig": "Zb5ZqWJGtlbF0GFODoYvjThuyPD7dexpI8HNVhC1FPXJ5P5cPx11htPAKUDAuK9/3FnJL6MVnQdsxXSlPgEFBw=="
 }
