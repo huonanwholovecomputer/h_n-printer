@@ -16316,6 +16316,45 @@ class MainWindow(QMainWindow):
                 self._cloud_client.report_start_printing(oid, tids)
         return True
 
+    def _cache_local_order_locally(self, order_number: str, files_data, total_price,
+                                   created_at: str, tab, *, reason: str = "") -> bool:
+        """把「还没换到云端号」的订单先落进本地离线库（防丢单）。
+
+        2026-11-04 现场（L0006~L0009）：在线但**取号失败**时走 -L 临时号，旧代码不写离线库，
+        只靠"标签页里那批 job"在重连后换号；用户把已完成的标签页删掉（很常见），
+        换号的路就断了 —— 这四单至今没有云端记录，`offline_orders` 里也是空的（结算页缺单）。
+        所以任何 -L 兜底都必须立刻落一份本地副本：换号失败还有补报这条路，删标签页也不丢。
+        已经是云端号（不含 -L）时什么都不做（幂等，重复调用只存一次）。
+        """
+        num = str(order_number or "").strip()
+        if not num or self._offline_sync is None:
+            return False
+        _up = num.upper()
+        if "-L" not in _up and not _up.startswith("LOCAL-"):
+            return False
+        try:
+            if self._offline_sync.find_pending_by_number(num):
+                return False           # 同一个号已经存过
+            self._offline_sync.save_order_offline(
+                order_number=num,
+                files_data=files_data,
+                total_price=total_price,
+                created_at=created_at,
+                owner_name=(tab.owner_name if tab else ""),
+                is_admin_print=bool(tab.is_admin_print) if tab else True,
+                remark=(tab.remark if tab else ''),
+            )
+            self._log(f"📴 本地单已缓存（{reason or '取号未成功'}）：{num} "
+                      f"({len(files_data)} 个文件，换到云端号后自动补报)")
+            try:
+                self._refresh_offline_badge()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            self._log(f"⚠️ 本地单缓存失败({num}): {e}")
+            return False
+
     def _acquire_order_number_and_upload(
         self, flat_jobs, files_data, total_price, extra_fields, tab, created_at, online,
     ) -> tuple[str, bool]:
@@ -16391,6 +16430,16 @@ class MainWindow(QMainWindow):
                 # 超时兜底：本地临时号，连线后自动换正式号
                 self._log(f"⚠️ 订单号获取超时（>{ORDER_NUMBER_WAIT_S}s），改用本地临时号")
                 result["order_number"] = self._generate_local_order_number_l()
+                # 兜底单必须落本地库：否则用户删掉这个已完成的标签页，这单就再没有换号的路
+                self._cache_local_order_locally(
+                    result["order_number"], files_data, total_price, created_at, tab,
+                    reason="取号超时")
+            else:
+                # 取号失败时 net 分支也会回 -L 临时号（见 _acquire_order_number_and_upload_net），
+                # 这里统一补一次本地落库（已是云端号时该函数自己跳过）
+                self._cache_local_order_locally(
+                    result.get("order_number") or "", files_data, total_price,
+                    created_at, tab, reason="取号失败")
             return result.get("order_number") or "", bool(result.get("uploaded", False))
         finally:
             self._print_starting = False
@@ -16496,12 +16545,29 @@ class MainWindow(QMainWindow):
                 data = resp.json()
                 if data.get("success"):
                     order_number = data.get("order_number", "")
+                else:
+                    # 200 但业务失败（token 失效/设备未授权/后台限流…）以前完全静默，
+                    # 现场只能从"怎么又变成 -L 了"反推。留一行原文便于事后定位。
+                    logger.warning(
+                        f"取号被云端拒绝（HTTP {resp.status_code}）："
+                        f"{str(data.get('message') or data)[:200]}")
+                    self._cloudConnSyncLog.emit(
+                        f"⚠ 云端拒绝发号：{str(data.get('message') or '未知原因')[:80]}")
+            else:
+                # 非 2xx：状态码 + 响应正文前 200 字（502/网关错误常带 HTML）
+                logger.warning(
+                    f"取号失败：HTTP {resp.status_code} {str(getattr(resp, 'text', '') or '')[:200]}")
+                self._cloudConnSyncLog.emit(
+                    f"⚠ 云端发号失败：HTTP {resp.status_code}（将用本地临时号先打）")
         except Exception as e:
             logger.warning(f"获取云端订单号失败: {e}")
+            self._cloudConnSyncLog.emit(f"⚠ 云端发号异常：{e}（将用本地临时号先打）")
 
         if not order_number:
             # 获取订单号失败，回退到本地临时号（-L，连线后自动换正式号）
             order_number = self._generate_local_order_number_l()
+            # 这一单会先落本地离线库（见 _cache_local_order_locally）——不许静默丢
+            logger.info(f"取号失败，改用本地临时号 {order_number}（换到云端号后自动补报）")
 
         # 上传订单信息到后端（将 reserved 占位更新为 sent）
         return {"order_number": order_number, "uploaded": _upload(order_number)}

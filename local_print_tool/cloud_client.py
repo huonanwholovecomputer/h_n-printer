@@ -13,6 +13,7 @@ cloud_client.py — 云打印任务接收模块
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
@@ -253,6 +254,59 @@ def resolve_download_name(task_file_name: str, content_disposition: str = "",
         rest = name[1:]
         return f"{base}.{rest}" if rest else base + ".dat"
     return name
+
+
+# ---------- 下载重试（瞬时网络错误）----------
+# 2026-11-04 现场：早上 08:19 两单（#2310 / #2311）下载时分别撞上
+#   SSLError(SSLEOFError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] ...'))
+#   ConnectionResetError(10054, '远程主机强迫关闭了一个现有的连接。')
+# 旧代码只重试「MD5 不一致」，网络一抖就直接判死（任务 error + 上报打印失败），
+# 用户那边表现为「打印机自己的电脑断开了一个远程连接」。店里网络本来就会抖
+# （VPN/代理/校园网聚合都会掐掉长连接），所以下载要把**瞬时**错误和真正的 4xx
+# 业务拒绝分开：瞬时错误退避重试，4xx 立刻放弃（文件没了就是没了，重试没意义）。
+_DOWNLOAD_NET_ATTEMPTS = 4          # 含首次，最多 4 次（约 1+3+6=10s 额外等待）
+_DOWNLOAD_NET_BACKOFF = (1.0, 3.0, 6.0)
+
+
+class _DownloadMD5Mismatch(ValueError):
+    """下载完成但 MD5 与后端声明不一致（内容级错误，不是网络抖动）。"""
+
+
+def _is_transient_download_error(err: BaseException) -> bool:
+    """判断下载异常是「网络抖动」（可重试）还是「别再试了」。"""
+    if isinstance(err, _DownloadMD5Mismatch):
+        return True                      # 内容不一致也值得再下一次（旧行为就是重试一次）
+    # HTTP 状态要先判：requests 的 RequestException 继承 IOError（= OSError），
+    # 放到 OSError 分支后面会被当成"磁盘错误"直接放弃（408/5xx 就再也重试不了）。
+    status = getattr(getattr(err, "response", None), "status_code", None)
+    if isinstance(status, int):
+        # 408/425/429 与 5xx 是"服务端/链路暂时不行"；其余 4xx 是业务拒绝
+        return status in (408, 425, 429) or status >= 500
+    if isinstance(err, (http_requests.exceptions.ConnectionError,
+                        http_requests.exceptions.Timeout,
+                        http_requests.exceptions.ChunkedEncodingError,
+                        http_requests.exceptions.ContentDecodingError,
+                        ConnectionError, TimeoutError, socket.timeout)):
+        # SSLError / ConnectionResetError / ChunkedEncodingError 都落在这些类型里
+        return True
+    if isinstance(err, OSError):
+        # 裸 OSError 只在**网络型 errno** 时重试；磁盘写满/无权限重试没意义
+        _net_errnos = {getattr(errno, n) for n in (
+            "ECONNRESET", "ECONNABORTED", "EPIPE", "ETIMEDOUT", "ENETDOWN",
+            "ENETUNREACH", "EHOSTUNREACH", "ENOTCONN") if hasattr(errno, n)}
+        return getattr(err, "errno", None) in _net_errnos
+    return False
+
+
+def _purge_partial(path: str) -> None:
+    """删掉失败/重试前残留的半截文件（不抛异常）。"""
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 # ---------- CloudTask 数据结构 ----------
@@ -1858,75 +1912,14 @@ class CloudClient(QObject):
                     return
 
         dest: str = ""
+        _dest_holder: list[str] = [""]
         # P0-2: 后端 pull/push payload 若提供 source_md5，下载完成后比对校验
         # （后端需在 pull/push payload 中带上 source_md5 字段才能启用该校验）
         expected_md5 = task.source_md5
         try:
             self.status_message.emit(f"☁ 开始下载 #{task_id}: {task.file_name}")
-            for attempt in range(2):
-                if attempt > 0:
-                    self.status_message.emit(f"☁ MD5 校验失败，重新下载 #{task_id}（第 2 次尝试）")
-                resp = http_requests.get(url, timeout=120, stream=True)
-                resp.raise_for_status()
-
-                # 文件名：**优先用任务自带的名字**（推送 payload 里就是对的），响应头只在
-                # 任务名叫不出来时兜底。别再无条件改用响应头：Flask 对非 ASCII 名只给
-                # ASCII 兜底（中文被吃光、只剩 ".pdf"），而真名在 filename*= 里 ——
-                # 老写法无条件取第一个 filename=，于是中文名云端订单必然打成"不支持的文件类型"。
-                original_name = resolve_download_name(
-                    task.file_name, resp.headers.get("Content-Disposition", ""), task_id)
-                if not original_name:
-                    original_name = f"cloud_task_{task_id}.dat"
-
-                # 下载到程序暂存目录（%APPDATA%\HN打印工具\file_cache\cloud_<task_id>\）：
-                # 不再用 %TEMP% —— 临时目录被磁盘清理/安全软件清理或重启后文件会消失，
-                # 而预约打印可能数小时后才到点；暂存目录里的文件同样受 GUI 按引用清理保护。
-                dest = ""
-                try:
-                    cand = staging.cloud_download_path(task_id, original_name)
-                    if staging.ensure_dir_for(cand):
-                        dest = cand
-                    else:
-                        logger.warning("暂存子目录不可用，回退下载到系统临时目录")
-                except Exception as e:
-                    logger.warning(f"暂存目录不可用，回退下载到系统临时目录: {e}")
-                if not dest:
-                    dest = os.path.join(tempfile.gettempdir(), f"hn_cloud_{task_id}_{original_name}")
-                # 标记「使用中」：下载/写缓存期间即使触发暂存清扫也不删（防刚下好就被清掉）
-                staging.reserve(dest)
-
-                total = int(resp.headers.get("content-length", 0))
-                downloaded = 0
-
-                md5_hasher = hashlib.md5()
-                with open(dest, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        f.write(chunk)
-                        md5_hasher.update(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            progress = int(downloaded / total * 100)
-                            if progress != task.download_progress:
-                                task.download_progress = progress
-                                self.task_updated.emit(task)
-
-                # 计算本地 MD5（校验通过后才写入 task，供后续缓存查找）
-                source_md5 = md5_hasher.hexdigest()
-                if expected_md5 and source_md5 != expected_md5:
-                    # P0-2: 与后端声明不一致 —— 删除半截文件，重试一次
-                    try:
-                        os.remove(dest)
-                    except OSError:
-                        pass
-                    if attempt == 0:
-                        logger.warning(
-                            f"任务 #{task_id} MD5 校验失败（期望 {expected_md5}，实际 {source_md5}），重试一次")
-                        task.download_progress = 0
-                        continue
-                    raise ValueError(
-                        f"MD5 校验失败: 期望 {expected_md5}，实际 {source_md5}（重试后仍不一致）")
-                break
-
+            dest, source_md5, original_name = self._download_with_retry(
+                task, task_id, url, expected_md5, _dest_holder)
             task.source_md5 = source_md5
 
             # P1: 幽灵任务检查 —— 下载期间任务已被取消/打回（从 _pending_tasks 移除），
@@ -1971,17 +1964,124 @@ class CloudClient(QObject):
             task.error_message = str(e)
             # P1: 失败路径删除残留的半截文件；成功路径文件保留给打印用，
             # 打印完成后由 GUI 侧的按引用清扫（_sweep_staged_files）负责回收
-            if dest:
-                try:
-                    if os.path.isfile(dest):
-                        os.remove(dest)
-                except OSError:
-                    pass
+            # （重试过程中每次落盘的 dest 记在 _dest_holder 里，这里要连它一起清）
+            for _p in (dest, _dest_holder[0]):
+                if _p:
+                    _purge_partial(_p)
             self.task_updated.emit(task)
             self.status_message.emit(f"☁ 下载失败 #{task.task_id}: {e}")
         finally:
             # 下载结束（成功已挂到 task.local_path / 失败已删除）→ 解除「使用中」标记
-            staging.unreserve(dest)
+            staging.unreserve(_dest_holder[0] or dest)
+
+    # ── 下载：单次尝试 + 退避重试 ──
+
+    def _download_once(self, task: CloudTask, task_id: int, url: str,
+                       expected_md5: str, dest_holder: list[str]) -> tuple[str, str, str]:
+        """下载一次到暂存目录，返回 `(dest, md5, original_name)`。
+
+        网络异常原样抛出（交给 `_download_with_retry` 判断能不能重试）；
+        MD5 与后端声明不一致抛 `_DownloadMD5Mismatch`。
+        `dest_holder[0]` 始终指向最后一次落盘路径，供调用方清理半截文件。
+        """
+        resp = http_requests.get(url, timeout=120, stream=True)
+        resp.raise_for_status()
+
+        # 文件名：**优先用任务自带的名字**（推送 payload 里就是对的），响应头只在
+        # 任务名叫不出来时兜底。别再无条件改用响应头：Flask 对非 ASCII 名只给
+        # ASCII 兜底（中文被吃光、只剩 ".pdf"），而真名在 filename*= 里 ——
+        # 老写法无条件取第一个 filename=，于是中文名云端订单必然打成"不支持的文件类型"。
+        original_name = resolve_download_name(
+            task.file_name, resp.headers.get("Content-Disposition", ""), task_id)
+        if not original_name:
+            original_name = f"cloud_task_{task_id}.dat"
+
+        # 下载到程序暂存目录（%APPDATA%\\HN打印工具\\file_cache\\cloud_<task_id>\\）：
+        # 不再用 %TEMP% —— 临时目录被磁盘清理/安全软件清理或重启后文件会消失，
+        # 而预约打印可能数小时后才到点；暂存目录里的文件同样受 GUI 按引用清理保护。
+        dest = ""
+        try:
+            cand = staging.cloud_download_path(task_id, original_name)
+            if staging.ensure_dir_for(cand):
+                dest = cand
+            else:
+                logger.warning("暂存子目录不可用，回退下载到系统临时目录")
+        except Exception as e:
+            logger.warning(f"暂存目录不可用，回退下载到系统临时目录: {e}")
+        if not dest:
+            dest = os.path.join(tempfile.gettempdir(), f"hn_cloud_{task_id}_{original_name}")
+        dest_holder[0] = dest
+        # 标记「使用中」：下载/写缓存期间即使触发暂存清扫也不删（防刚下好就被清掉）
+        staging.reserve(dest)
+
+        total = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+
+        md5_hasher = hashlib.md5()
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                md5_hasher.update(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    progress = int(downloaded / total * 100)
+                    if progress != task.download_progress:
+                        task.download_progress = progress
+                        self.task_updated.emit(task)
+
+        # 计算本地 MD5（校验通过后才写入 task，供后续缓存查找）
+        source_md5 = md5_hasher.hexdigest()
+        if expected_md5 and source_md5 != expected_md5:
+            # P0-2: 与后端声明不一致 —— 删掉半截文件，交给调用方决定重下一次
+            _purge_partial(dest)
+            raise _DownloadMD5Mismatch(
+                f"MD5 校验失败: 期望 {expected_md5}，实际 {source_md5}")
+        return dest, source_md5, original_name
+
+    def _download_with_retry(self, task: CloudTask, task_id: int, url: str,
+                             expected_md5: str,
+                             dest_holder: list[str]) -> tuple[str, str, str]:
+        """下载并处理两类可恢复错误：MD5 不一致（重试 1 次）、瞬时网络中断（退避重试）。
+
+        2026-11-04 起：网络抖动不再直接判死任务（旧行为见模块顶部 `_DOWNLOAD_NET_ATTEMPTS`
+        的现场说明）。4xx 业务拒绝、磁盘错误等**不重试**，立刻抛给上层走失败上报。
+        """
+        md5_tries = 0
+        net_tries = 0
+        while True:
+            try:
+                return self._download_once(task, task_id, url, expected_md5, dest_holder)
+            except _DownloadMD5Mismatch as e:
+                md5_tries += 1
+                if md5_tries >= 2:
+                    raise ValueError(f"{e}（重试后仍不一致）")
+                logger.warning(f"任务 #{task_id} {e}，重试一次")
+                self.status_message.emit(
+                    f"☁ MD5 校验失败，重新下载 #{task_id}（第 2 次尝试）")
+                task.download_progress = 0
+                continue
+            except Exception as e:
+                transient = _is_transient_download_error(e)
+                if not transient or net_tries >= _DOWNLOAD_NET_ATTEMPTS - 1:
+                    raise
+                # 任务在等待期间被取消/打回 → 没必要再下
+                if task.task_id not in self._pending_tasks:
+                    raise
+                delay = _DOWNLOAD_NET_BACKOFF[min(net_tries, len(_DOWNLOAD_NET_BACKOFF) - 1)]
+                net_tries += 1
+                logger.warning(
+                    f"任务 #{task_id} 下载中断（{type(e).__name__}: {e}），"
+                    f"{delay:g}s 后第 {net_tries + 1}/{_DOWNLOAD_NET_ATTEMPTS} 次尝试")
+                self.status_message.emit(
+                    f"☁ 网络中断，{delay:g}s 后重试 #{task_id}"
+                    f"（{net_tries + 1}/{_DOWNLOAD_NET_ATTEMPTS}）: {e}")
+                _purge_partial(dest_holder[0])
+                dest_holder[0] = ""
+                task.download_progress = 0
+                time.sleep(delay)
+
 
     def _report_file_ready_if_scheduled(self, task: CloudTask):
         """预约单文件下载完成 → 上报 file_ready（后端 downloading→waiting，冻结时自动解除）。
