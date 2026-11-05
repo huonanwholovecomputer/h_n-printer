@@ -9323,6 +9323,173 @@ def _target_openid_arg() -> str:
     return val
 
 
+@app.route("/api/printer/orders", methods=["GET"])
+@require_printer_scope("admin")
+def printer_orders_view():
+    """智能助手（小印）查看云端订单数据 —— 只读、**不限时间**。
+
+    为什么单独开一个口：`/api/orders`、`/api/admin/recent_orders` 都走 `@login_required`
+    （微信用户/管理员会话），本地打印工具手里只有**设备 token**，拿不到用户会话；
+    而它正是打印现场那台机器，让小印经由它看订单是最短的一条路。
+
+    鉴权：printer token 且必须有 admin scope（与其它 /api/printer/* 管理口同一把闸门）。
+    只读：没有任何写路径 —— 不改状态、不改金额、不通知设备。
+
+    查询参数（全部可省；**默认不按时间过滤 = 全量历史**）：
+      order    订单号精确（HN20261105-0015）或 order_id；
+      status   逗号分隔的聚合状态（sent,failed,timeout,abandoned,canceled…）；
+      source   wechat / app / local（local 的别名 cloud = wechat）；
+      owner    归属名模糊匹配（orders.owner_name）；
+      file     文件名模糊匹配（order_files.file_name）；
+      since    起始时间（含），YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS；
+      until    截止时间（含）；
+      limit    1..1000，默认 200；offset 默认 0。
+
+    返回：{success, total, limit, offset, since, until, orders, summary}
+      · total/summary 都是**过滤后、分页前**的统计；
+      · summary = {orders, amount, by_status, by_source, first_at, last_at}；
+      · orders 每项字段与「最近订单」卡片一致（页数/张数/金额同一份口径）。
+    """
+    client_key = ((request.headers.get("X-Client-Id") or "").strip()
+                  or (request.remote_addr or ""))
+    if not _rate_limit_ok(f"printer_orders:{client_key}", 60, 60):
+        return jsonify({"success": False, "message": "请求过于频繁，请稍后再试"}), 429
+
+    def _norm_time(raw, is_until):
+        """把 YYYY-MM-DD / YYYY-MM-DD HH:MM / 完整时间统一成 created_at 的存储格式。"""
+        text = str(raw or "").strip()
+        if not text:
+            return ""
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+            if fmt == "%Y-%m-%d":
+                # 只给日期时：since 取当天 00:00:00，until 取当天 23:59:59（含整天）
+                dt = dt.replace(hour=23 if is_until else 0,
+                                minute=59 if is_until else 0,
+                                second=59 if is_until else 0)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        raise ValueError(text)
+
+    try:
+        since = _norm_time(request.args.get("since"), False)
+        until = _norm_time(request.args.get("until"), True)
+    except ValueError as e:
+        return jsonify({"success": False,
+                        "message": f"时间格式不对：{e}（用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS）"}), 400
+    try:
+        limit = int(request.args.get("limit") or 200)
+    except ValueError:
+        return jsonify({"success": False, "message": "limit 必须是整数"}), 400
+    limit = max(1, min(1000, limit))
+    try:
+        offset = int(request.args.get("offset") or 0)
+    except ValueError:
+        return jsonify({"success": False, "message": "offset 必须是整数"}), 400
+    offset = max(0, offset)
+
+    where, params = [], []
+    order_arg = (request.args.get("order") or "").strip()
+    if order_arg:
+        if order_arg.isdigit():
+            where.append("id = ?")
+            params.append(int(order_arg))
+        else:
+            where.append("order_number = ?")
+            params.append(order_arg)
+    src = (request.args.get("source") or "").strip().lower()
+    if src in ("wechat", "app", "local"):
+        where.append("source = ?")
+        params.append(src)
+    elif src == "cloud":
+        where.append("source = 'wechat'")
+    owner_kw = (request.args.get("owner") or "").strip()
+    if owner_kw:
+        where.append("owner_name LIKE ?")
+        params.append(f"%{owner_kw}%")
+    if since:
+        where.append("created_at >= ?")
+        params.append(since)
+    if until:
+        where.append("created_at <= ?")
+        params.append(until)
+    file_kw = (request.args.get("file") or "").strip()
+    if file_kw:
+        where.append("id IN (SELECT order_id FROM order_files WHERE file_name LIKE ?)")
+        params.append(f"%{file_kw}%")
+    status_filter = [s.strip() for s in (request.args.get("status") or "").split(",") if s.strip()]
+
+    sql = ("SELECT id, order_number, openid, owner_name, source, created_at, copies, "
+           "page_count, duplex, total_price, status, is_admin_print, manual_status_by, "
+           "manual_status_at FROM orders")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC, id DESC"
+
+    conn = get_db()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        files_by_order = {}
+        ids = [r["id"] for r in rows]
+        for i in range(0, len(ids), 500):      # SQLite 老版本变量上限 999，分批查
+            chunk = ids[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            for f in conn.execute(
+                f"SELECT order_id, page_count, copies, duplex, page_range, simplex_pages, "
+                f"reject_reason, file_name FROM order_files WHERE order_id IN ({ph}) "
+                f"ORDER BY order_id, id", chunk
+            ).fetchall():
+                files_by_order.setdefault(f["order_id"], []).append(dict(f))
+        profiles = {}
+        openids = sorted({str(r["openid"] or "") for r in rows
+                          if r["openid"] and str(r["openid"]) != "local"})
+        if openids:
+            # 昵称在独立的 users.db（orders.db 里没有 users 表）
+            user_conn = get_user_db()
+            try:
+                for i in range(0, len(openids), 500):
+                    chunk = openids[i:i + 500]
+                    ph = ",".join("?" * len(chunk))
+                    for u in user_conn.execute(
+                        f"SELECT openid, nickname FROM users WHERE openid IN ({ph})", chunk
+                    ).fetchall():
+                        profiles[u["openid"]] = {"nickname": u["nickname"] or ""}
+            finally:
+                user_conn.close()
+        orders = [_order_view_dict(conn, r, files_by_order.get(r["id"]) or [], profiles)
+                  for r in rows]
+    finally:
+        conn.close()
+
+    if status_filter:
+        # 状态是**聚合**出来的（一个订单多个子任务），只能在组装后过滤，不能在 SQL 里筛
+        orders = [o for o in orders if o["status"] in status_filter]
+
+    by_status = {}
+    by_source = {}
+    for o in orders:
+        by_status[o["status"]] = by_status.get(o["status"], 0) + 1
+        by_source[o["source"]] = by_source.get(o["source"], 0) + 1
+    summary = {
+        "orders": len(orders),
+        "amount": round(sum(o["total_price"] for o in orders), 2),
+        "by_status": by_status,
+        "by_source": by_source,
+        "first_at": orders[-1]["created_at"] if orders else "",
+        "last_at": orders[0]["created_at"] if orders else "",
+    }
+    total = len(orders)
+    page_orders = orders[offset:offset + limit]
+    print(f"[printer_orders] {client_key} 查询订单 total={total}"
+          f"（since={since or '-'} until={until or '-'} "
+          f"status={','.join(status_filter) or '-'}）→ 返回 {len(page_orders)} 条")
+    return jsonify({"success": True, "total": total, "limit": limit, "offset": offset,
+                    "since": since, "until": until,
+                    "orders": page_orders, "summary": summary})
+
+
 @app.route("/api/orders", methods=["GET"])
 @login_required
 def get_orders():
@@ -11752,6 +11919,75 @@ def _recent_orders_owner(row, profiles):
     return ("用户" + openid[-4:]) if len(openid) >= 4 else "微信用户"
 
 
+def _order_view_dict(conn, r, files, profiles):
+    """把一行 orders + 它的子任务行组装成一张「订单卡」（最近订单 / 小印查看接口共用）。
+
+    口径唯一（硬规矩 7）：页数/张数走 `_file_range_stats`（v7.2 唯一口径），
+    金额读库值不重算（重算会把人工改价/免单的历史单算歪），
+    状态用 `aggregate_order_status` 聚合子任务，取不到才退回 orders.status。
+    """
+    oid = r["id"]
+    file_rows = []
+    if files:
+        page_count = 0
+        sheet_count = 0
+        for f in files:
+            st = _file_range_stats(f.get("page_count") or 1,
+                                   f.get("copies") or 1,
+                                   f.get("duplex") or "off",
+                                   f.get("page_range") or "",
+                                   f.get("simplex_pages") or "")
+            page_count += st["total_pages"]
+            sheet_count += st["total_sheets"]
+            _name = str(f.get("file_name") or "").strip() or "未命名文件"
+            _dup = str(f.get("duplex") or "off").strip().lower()
+            file_rows.append({
+                "file_name": _name,
+                "copies": int(f.get("copies") or 1),
+                "page_count": st["total_pages"],
+                "sheet_count": st["total_sheets"],
+                "duplex": "on" if _dup not in ("", "off", "0", "false", "none") else "off",
+                "duplex_label": "单面" if _dup in ("", "off", "0", "false", "none") else "双面",
+            })
+    else:
+        # 老单 / 子任务被自动清理过的兜底：按订单自身字段算 1 个文件，口径同上
+        st = _file_range_stats(r["page_count"] or 1, r["copies"] or 1,
+                               r["duplex"] or "off")
+        page_count = st["total_pages"]
+        sheet_count = st["total_sheets"]
+        _dup0 = str(r["duplex"] or "off").strip().lower()
+        file_rows = [{
+            "file_name": "订单文件",
+            "copies": int(r["copies"] or 1),
+            "page_count": st["total_pages"],
+            "sheet_count": st["total_sheets"],
+            "duplex": "on" if _dup0 not in ("", "off", "0", "false", "none") else "off",
+            "duplex_label": "单面" if _dup0 in ("", "off", "0", "false", "none") else "双面",
+        }]
+    owner = _recent_orders_owner(r, profiles)
+    return {
+        "order_id": oid,
+        "order_number": r["order_number"] or "",
+        "owner": owner,
+        "owner_masked": _mask_person_name(owner) if owner else "",
+        "created_at": r["created_at"] or "",
+        "file_count": len(files) or 1,
+        "page_count": page_count,
+        "sheet_count": sheet_count,
+        "files": file_rows,
+        "total_price": round(r["total_price"] or 0.0, 2),
+        "status": aggregate_order_status(conn, oid) or (r["status"] or ""),
+        "source": r["source"] or "wechat",
+        "is_admin_print": bool(r["is_admin_print"]),
+        # 2026-11：订单级原因 + 人工订正留痕（与订单详情/结算明细同口径）
+        "status_reason": next(
+            (str(f.get("reject_reason") or "").strip()
+             for f in files if str(f.get("reject_reason") or "").strip()), ""),
+        "manual_status_by": r["manual_status_by"] or "",
+        "manual_status_at": r["manual_status_at"] or "",
+    }
+
+
 @app.route("/api/admin/recent_orders", methods=["GET"])
 @login_required
 def admin_recent_orders():
@@ -11845,7 +12081,7 @@ def admin_recent_orders():
             ph = ",".join("?" * len(ids))
             for f in conn.execute(
                 f"SELECT order_id, page_count, copies, duplex, page_range, simplex_pages, "
-                f"reject_reason "
+                f"reject_reason, file_name, file_id "
                 f"FROM order_files WHERE order_id IN ({ph}) ORDER BY order_id, id",
                 ids
             ).fetchall():
@@ -11864,48 +12100,9 @@ def admin_recent_orders():
                     profiles[u["openid"]] = {"nickname": u["nickname"] or ""}
             finally:
                 user_conn.close()
-        orders = []
-        for r in rows:
-            oid = r["id"]
-            files = files_by_order.get(oid) or []
-            if files:
-                page_count = 0
-                sheet_count = 0
-                for f in files:
-                    st = _file_range_stats(f.get("page_count") or 1,
-                                           f.get("copies") or 1,
-                                           f.get("duplex") or "off",
-                                           f.get("page_range") or "",
-                                           f.get("simplex_pages") or "")
-                    page_count += st["total_pages"]
-                    sheet_count += st["total_sheets"]
-            else:
-                # 老单 / 子任务被自动清理过的兜底：按订单自身字段算 1 个文件，口径同上
-                st = _file_range_stats(r["page_count"] or 1, r["copies"] or 1,
-                                       r["duplex"] or "off")
-                page_count = st["total_pages"]
-                sheet_count = st["total_sheets"]
-            owner = _recent_orders_owner(r, profiles)
-            orders.append({
-                "order_id": oid,
-                "order_number": r["order_number"] or "",
-                "owner": owner,
-                "owner_masked": _mask_person_name(owner) if owner else "",
-                "created_at": r["created_at"] or "",
-                "file_count": len(files) or 1,
-                "page_count": page_count,
-                "sheet_count": sheet_count,
-                "total_price": round(r["total_price"] or 0.0, 2),
-                "status": aggregate_order_status(conn, oid) or (r["status"] or ""),
-                "source": r["source"] or "wechat",
-                "is_admin_print": bool(r["is_admin_print"]),
-                # 2026-11：订单级原因 + 人工订正留痕（与订单详情/结算明细同口径）
-                "status_reason": next(
-                    (str(f.get("reject_reason") or "").strip()
-                     for f in files if str(f.get("reject_reason") or "").strip()), ""),
-                "manual_status_by": r["manual_status_by"] or "",
-                "manual_status_at": r["manual_status_at"] or "",
-            })
+        orders = [_order_view_dict(conn, r, files_by_order.get(r["id"]) or [],
+                  profiles)
+                  for r in rows]
     finally:
         conn.close()
     if paging:

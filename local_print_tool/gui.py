@@ -113,6 +113,8 @@ import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼�
 import retention  # 本地副本生命周期：保留期清理 / 攒批 .keep 过期 / 启动扫描（见 retention.py）
 import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在这里）
 import font_check  # 字体缺失检测（查源文件用到的字体、本机缺哪些，见 font_check.py）
+import agent_api  # 智能助手（DSH）控制接口的传输层：回环 HTTP + 令牌 + 线程到主线程的泵
+import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打印，复用既有入口与计费口径）
 
 logger = logging.getLogger(__name__)
 
@@ -6039,6 +6041,13 @@ class MainWindow(QMainWindow):
         # ── 云端客户端 ──
         self._cloud_client: CloudClient | None = None
         self._stats_server: StatsServer | None = None  # 收支清算统计 HTTP 服务器
+        # 智能助手（DSH）控制接口：回环 HTTP + 令牌，op 全在主线程由 _agent_api_timer 泵执行
+        # （见 agent_api.py / agent_ops.py）。默认启用，可在「选项 → 智能助手接口」关掉。
+        self._agent_api: agent_api.AgentApiServer | None = None
+        self._agent_ops: agent_ops.AgentOps | None = None
+        self._agent_api_timer = QTimer(self)
+        self._agent_api_timer.setInterval(40)
+        self._agent_api_timer.timeout.connect(self._pump_agent_api)
         self._cloud_tasks: dict[int, CloudTask] = {}  # task_id → CloudTask
         self._cloud_task_window: CloudTaskListWindow | None = None
         self._offline_sync: OfflineSync | None = None  # 初始化在 _init_cloud_client 之后
@@ -7409,8 +7418,22 @@ class MainWindow(QMainWindow):
                                      "不再走驱动程序自带的「双面打印说明」向导")
         duplex_cap_action.triggered.connect(self._on_printer_duplex_capability)
         options_menu.addAction(duplex_cap_action)
+
+        options_menu.addSeparator()
+
+        # 智能助手接口（2026-11）：给本机 DSH 私人打印助手留的可编程入口。
+        # 默认开（只监听 127.0.0.1 + 令牌），关掉即时停止监听。
+        self._agent_api_action = QAction("🤖 智能助手接口", self)
+        self._agent_api_action.setCheckable(True)
+        self._agent_api_action.setChecked(bool(agent_api.is_enabled()))
+        self._agent_api_action.toggled.connect(self._on_agent_api_toggled)
+        options_menu.addAction(self._agent_api_action)
+        self._refresh_agent_action_text()
+
         # 窗口建完后按配置恢复监视线程（延迟一下：订阅失败也不能卡住启动）
         QTimer.singleShot(1200, self._restore_external_watch)
+        # 控制接口：等主窗口完全就绪再起（配置/定时器都在前面装好了）
+        QTimer.singleShot(1600, self._start_agent_api)
 
         # 主题菜单
         if self._theme_manager is not None:
@@ -8951,6 +8974,101 @@ class MainWindow(QMainWindow):
                 self._log("⚠ 外部打印监视未能自动恢复（可在「文件」菜单里手动开启）")
         except Exception as e:
             self._log(f"⚠ 外部打印监视恢复失败：{e}")
+
+    # ──────── 智能助手接口（DSH 控制口，见 agent_api.py / agent_ops.py）────────
+    # 为什么放在主线程泵：配置、表格、打印 Worker 都不是线程安全的，HTTP 线程只排队，
+    # 真正执行由 40ms 的 QTimer 在主线程做（`_pump_agent_api`）。关掉开关 = 停止监听。
+
+    def _agent_api_state(self) -> dict:
+        return agent_api.read_state()
+
+    def _start_agent_api(self, announce: bool = False) -> bool:
+        """按开关启动控制接口。失败只记日志（绝不挡住程序启动）。"""
+        if self._agent_api is not None and self._agent_api.running:
+            return True
+        if not agent_api.is_enabled():
+            return False
+        try:
+            self._agent_ops = agent_ops.AgentOps(self, app_version=APP_VERSION)
+            preferred = int((self._agent_api_state().get("port") or 0)
+                            or agent_api.DEFAULT_PORT)
+            server = agent_api.AgentApiServer(self._agent_ops, port=preferred,
+                                              app_version=APP_VERSION)
+            port = server.start()
+        except Exception as e:
+            logger.warning(f"[agent-api] 启动失败: {e}")
+            self._log(f"⚠ 智能助手接口未能启动：{e}")
+            self._set_agent_action_checked(False)
+            self._agent_api = None
+            return False
+        self._agent_api = server
+        self._agent_api_timer.start()
+        self._set_agent_action_checked(True)   # 真起来了就把菜单勾上（可能在启动后由代码拉起）
+        self._refresh_agent_action_text()
+        if announce:
+            self._log(f"🤖 智能助手接口已启动：http://127.0.0.1:{port}"
+                      f"（令牌在同一目录的 agent_api.json）")
+        return True
+
+    def _stop_agent_api(self) -> None:
+        """停止控制接口（退出前一定要走这里：别指望进程退出时的隐式清理）。"""
+        self._agent_api_timer.stop()
+        server, self._agent_api = self._agent_api, None
+        if server is not None:
+            try:
+                server.stop()
+            except Exception as e:
+                logger.debug(f"[agent-api] 停止异常: {e}")
+        self._refresh_agent_action_text()      # 勾选状态是用户意图，这里只刷新文案/提示
+
+    def _pump_agent_api(self) -> None:
+        """主线程泵：执行排队中的控制接口调用（一次最多 32 条，防长时间占住界面）。"""
+        server = self._agent_api
+        if server is None:
+            return
+        try:
+            server.pump()
+        except Exception as e:            # 泵本身出错也绝不能把 QTimer 打死
+            logger.exception(f"[agent-api] 泵异常: {e}")
+
+    def _set_agent_action_checked(self, checked: bool) -> None:
+        action = getattr(self, "_agent_api_action", None)
+        if action is None:
+            return
+        action.blockSignals(True)
+        action.setChecked(bool(checked))
+        action.blockSignals(False)
+        self._refresh_agent_action_text()
+
+    def _refresh_agent_action_text(self) -> None:
+        """菜单项文案/提示跟着实际状态走（端口在状态文件里，操作员点开就能核对）。"""
+        action = getattr(self, "_agent_api_action", None)
+        if action is None:
+            return
+        server = self._agent_api
+        running = bool(server is not None and server.running)
+        action.setText("🤖 智能助手接口" + (f"（运行中 · 端口 {server.port}）" if running else ""))
+        action.setToolTip("允许本机的智能助手（DSH 私人打印助手）通过本机回环端口接管建单："
+                          "新建标签页、加入文件、改份数/单双面/页码范围/附加服务、开始打印。\n"
+                          "只监听 127.0.0.1，且调用方必须带上令牌"
+                          f"（{agent_api.STATE_FILENAME}）；关掉即时生效。")
+
+    def _on_agent_api_toggled(self, checked: bool) -> None:
+        try:
+            agent_api.set_enabled(bool(checked))
+        except Exception as e:
+            logger.warning(f"[agent-api] 写入开关失败: {e}")
+        if checked:
+            if not self._start_agent_api(announce=True):
+                self._set_agent_action_checked(False)
+                self._log("⚠ 智能助手接口启动失败，已在本次运行内关闭")
+                return
+            self._log("🤖 已启用智能助手接口（本机回环，需令牌）")
+        else:
+            if self._agent_api is not None:
+                self._log("🤖 已关闭智能助手接口")
+            self._stop_agent_api()
+        self._refresh_agent_action_text()
 
     def _on_external_watch_log(self, message: str):
         """监视线程的一行日志（Signal → 主线程）。"""
@@ -18437,6 +18555,8 @@ class MainWindow(QMainWindow):
         self._closing = True  # 打印启动等待（processEvents）期间检测到关窗 → 中止启动流程
         # 外部打印监视：退出前停线程 + 关 spooler 通知句柄（别指望进程退出时的隐式清理）
         self._stop_external_watch()
+        # 智能助手接口：同理由我们自己关掉（HTTP 线程是 daemon，但端口要立刻放出来）
+        self._stop_agent_api()
         # ── 预约单（未到点）：关工具**不算放弃**（2026-11-02 用户要求）──
         # 新流程下未到点的预约单根本不在标签页里，下面那段"退出即放弃"的逻辑碰不到它们；
         # 状态已落盘（.scheduled_orders.json），重启后自动恢复、到点照打。
