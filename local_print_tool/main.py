@@ -5,10 +5,12 @@ main.py — HN 本地打印工具 程序入口
 
 from __future__ import annotations
 
+import faulthandler
 import logging
 import os
 import sys
 import threading
+import time
 
 # 确保本地模块可以导入
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -155,6 +157,73 @@ def load_stylesheet(path: str) -> str:
         return ""
 
 
+# ═══════════════════════════════════════════════════════════════
+# 崩溃取证（2026-11-04 现场）
+# ═══════════════════════════════════════════════════════════════
+# 现场：13:28:57 本地工具规划完一批手动双面（3 个文件 / 3 张纸）后就**直接消失**，
+# 日志停在那两行「第 1 趟 / 第 2 趟」上，用户看到的是一次崩溃退出。事后取证：
+#   · logs/crash_traceback.txt 不存在（Python 层异常一个都没走到 excepthook）；
+#   · 应用事件日志里没有任何 Application Error / WER 记录，CrashDumps 里也没有新 dump
+#     —— 本机 WER 是 HKLM ...\Windows Error Reporting\Disabled = 1（全局关掉）。
+# 结论：这是一次**原生层**的死亡（GDI 打印 / 驱动 / fitz / Pillow 那一段），Python 和
+# 系统都没有留下任何栈，只能靠程序自己。
+# 所以这里补两层自我取证，都不改变业务行为：
+#   ① faulthandler：访问违例（0xC0000005）等致命信号到来时，把**所有线程**的 Python 栈
+#      追加写进 logs/crash_faulthandler.log（不依赖 WER，也不依赖 excepthook）；
+#   ② threading.excepthook：后台线程里没被捕获的异常以前直接蒸发（云端下载 / 上报 /
+#      页数分析全是后台线程，GUI 主线程看不到），现在落盘 + 进当日日志。
+_CRASH_FH = None          # 保活：faulthandler 只在文件对象上持弱引用，被 GC 就静默失效
+
+
+def install_crash_handlers(logger=None) -> str:
+    """启用 faulthandler 与线程 excepthook，返回 faulthandler 文件路径（失败返回 ""）。"""
+    global _CRASH_FH
+    try:
+        fh_path = os.path.join(paths.logs_dir(), "crash_faulthandler.log")
+    except Exception:
+        fh_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "crash_faulthandler.log")
+
+    # ① faulthandler —— 致命信号 → 全线程的 Python 栈
+    if _CRASH_FH is None:
+        try:
+            _CRASH_FH = open(fh_path, "a", encoding="utf-8", errors="replace")
+            _CRASH_FH.write(f"\n===== 进程启动 {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"(pid={os.getpid()}) =====\n")
+            _CRASH_FH.flush()
+            faulthandler.enable(file=_CRASH_FH, all_threads=True)
+            if logger:
+                logger.info(f"崩溃取证已启用（致命信号栈 → {fh_path}）")
+        except Exception as e:
+            _CRASH_FH = None
+            if logger:
+                logger.warning(f"启用 faulthandler 失败（崩溃取证能力受限）: {e}")
+
+    # ② 后台线程未捕获异常 → 落盘 + 当日日志（原来一声不响地蒸发）
+    def _thread_excepthook(args):
+        name = getattr(getattr(args, "thread", None), "name", "?")
+        text = "".join(__import__("traceback").format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback))
+        line = (f"\n=== 线程异常 at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"(thread={name}) ===\n{text}=== END ===\n")
+        try:
+            if _CRASH_FH is not None:
+                _CRASH_FH.write(line)
+                _CRASH_FH.flush()
+        except Exception:
+            pass
+        if logger:
+            logger.error(f"后台线程 {name} 未捕获异常: {args.exc_type.__name__}: "
+                         f"{args.exc_value}")
+        try:
+            print(line, file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+    threading.excepthook = _thread_excepthook
+    return fh_path if _CRASH_FH is not None else ""
+
+
 def main():
     """主函数。"""
     # ── 强制 UTF-8 输出（打包后 Windows 默认 stdout/stderr 为 GBK，
@@ -206,6 +275,13 @@ def main():
 
     setup_logging()
     logger = logging.getLogger("main")
+
+    # ── 崩溃取证：faulthandler + 后台线程 excepthook（2026-11-04 打印中无声消失那次）──
+    # 必须在任何工作线程（云端连接、转换、打印）起来之前装好，否则它们的栈抓不到。
+    try:
+        install_crash_handlers(logger)
+    except Exception as e:
+        logger.warning(f"崩溃取证安装失败（不影响使用）: {e}")
 
     # ── 单实例锁：已有实例在运行时，通知其将窗口置于前台，本实例直接退出 ──
     from single_instance import acquire

@@ -1505,6 +1505,10 @@ def _print_pdf_native(
         # -- 创建打印机 DC（有 DEVMODE 则通过 win32gui.ResetDC 应用）--
         hdc = win32ui.CreateDC()
         hdc.CreatePrinterDC(printer)
+        # 崩溃取证面包屑（2026-11-04）：13:28:57 那批手动双面在"规划完成"之后进程直接消失，
+        # 而 GDI 段绝大多数输出走的是 print()（打包版 console=False ⇒ 直接进黑洞），
+        # 日志里完全没有打印进度。这几行 logger.info 就是下次能定位到"死在第几面"的证据。
+        logger.info(f"GDI: 打印机 DC 已创建（{printer}），准备提交 {len(render_seq)} 面")
 
         if devmode is not None:
             try:
@@ -1590,6 +1594,7 @@ def _print_pdf_native(
         hdc.StartDoc(title)
         started = True
         print(f"[GDI] StartDoc 完成，开始逐页渲染...")
+        logger.info(f"GDI: StartDoc 已提交（作业名 {title}），共 {len(render_seq)} 面")
 
         from PIL import Image, ImageWin
 
@@ -1634,6 +1639,7 @@ def _print_pdf_native(
                 blank_dib.draw(hdc.GetHandleOutput(), (0, 0, printable_w, printable_h))
                 hdc.EndPage()
                 print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (空白占位页)")
+                logger.info(f"GDI: 第 {page_seq}/{total_sides} 面已送出（空白占位页）")
                 if progress_callback:
                     progress_callback(page_seq, total_sides)
                 continue
@@ -1726,11 +1732,14 @@ def _print_pdf_native(
                 _tags.append("转180°补偿")
             print(f"[GDI]   ✓ 第 {page_seq}/{total_sides} 面 (PDF p.{page_idx + 1})"
                   + (f" 〔{'/'.join(_tags)}〕" if _tags else ""))
+            logger.info(f"GDI: 第 {page_seq}/{total_sides} 面已送出（PDF p.{page_idx + 1}"
+                        + (f"，{'/'.join(_tags)}" if _tags else "") + "）")
             if progress_callback:
                 progress_callback(page_seq, total_sides)
 
         hdc.EndDoc()
         started = False
+        logger.info("GDI: EndDoc 完成，作业已交给 spooler")
         total_pages_printed = len(pages_to_print) * copies
         msg = f"打印成功 (GDI, {len(render_seq)} 面)"
         if needs_separator:
