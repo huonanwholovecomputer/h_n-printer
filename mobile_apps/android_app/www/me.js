@@ -1084,7 +1084,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
         <view class="detail-row"><text class="detail-label">合计张数</text><text class="detail-value">${o.isExcel ? '不适用' : (o.totalSheetsDisplay + ' 张')}</text></view>
       </view>
       ${licenseRows}
-      ${(o.files && o.files.length) ? `<view class="detail-section"><view class="detail-section-title">文件列表 (${o.files.length})</view>${fileRows}</view>` : ''}
+      ${(o.files && o.files.length) ? `<view class="detail-section"><view class="detail-section-title">文件列表 (${o.files.length})${o.files.length > 5 ? '<text class="detail-files-hint">· 列表可上下滑动</text>' : ''}</view><view class="detail-files-scroll">${fileRows}</view></view>` : ''}
       ${extRows}
       ${remarkRows}
       <view class="detail-section">

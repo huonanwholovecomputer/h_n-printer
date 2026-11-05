@@ -512,6 +512,20 @@
   opacity: 1;
 }
 
+/* 文件列表自己的滚动框（2026-11-04 现场：一个任务 10+ 个文件时，后半截被上面这个
+   max-height 裁掉、永远看不到）。上限按「约 5 行文件」定，超出的在框内滑动；
+   文件只有一两行时高度随内容，不会留白。 */
+.detail-files-scroll {
+  max-height: 480rpx;
+  box-sizing: border-box;
+}
+.detail-files-hint {
+  margin-left: 8rpx;
+  font-size: 20rpx;
+  font-weight: 400;
+  color: var(--text-quaternary);
+}
+
 .detail-divider {
   height: 1rpx;
   background-color: var(--separator);

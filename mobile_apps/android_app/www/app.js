@@ -515,8 +515,8 @@ class FlingEngine {
   // ---- 触摸拖动 ----
 
   onTouchStart(e) {
-    // 内层可滚动列表（文件列表 / 滚轮选择器）：能滚时交给原生（同小程序 WXS 的口径）
-    const nestedEl = (e.target && e.target.closest && e.target.closest('.file-list-scroll, .wheel-viewport')) || null;
+    // 内层可滚动列表（文件列表 / 滚轮选择器 / 订单详情里的文件列表）：能滚时交给原生（同小程序 WXS 的口径）
+    const nestedEl = (e.target && e.target.closest && e.target.closest('.file-list-scroll, .wheel-viewport, .detail-files-scroll')) || null;
     this._nestedScroll = nestedEl;
     // 本手势起于内层：外层滚到边界后反向拖拽时交还内层（双向接力）
     this._nestedEl = nestedEl;
@@ -897,7 +897,7 @@ class FlingEngine {
   // ---- 桌面滚轮：1:1 直滚 + 边界回弹 ----
 
   onWheel(e) {
-    const nested = e.target && e.target.closest ? e.target.closest('.file-list-scroll, .wheel-viewport') : null;
+    const nested = e.target && e.target.closest ? e.target.closest('.file-list-scroll, .wheel-viewport, .detail-files-scroll') : null;
     if (nested) {
       const maxTop = nested.scrollHeight - nested.clientHeight;
       const atBottom = nested.scrollTop >= maxTop - 0.5;

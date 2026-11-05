@@ -5106,6 +5106,22 @@ picker-view-column {
   opacity: 1;
 }
 
+/* 文件列表自己的滚动框（对齐小程序 2026-11-04：一个任务 10+ 个文件时，后半截被上面这个
+   max-height 裁掉、永远看不到）。上限约 5 行文件，超出的在框内滑动；
+   文件只有一两行时高度随内容，不会留白。 */
+.detail-files-scroll {
+  max-height: 64cqw;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.detail-files-hint {
+  margin-left: 0.8cqw;
+  font-size: 2.2cqw;
+  font-weight: 400;
+  color: var(--text-quaternary);
+}
+
 .detail-divider {
   height: 0.12cqw;
   background-color: var(--separator);

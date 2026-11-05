@@ -154,6 +154,10 @@ Component({
   },
 
   methods: {
+    // 空handler：文件列表的 catchtouchmove 用它把手势终止在这一层，
+    // 不让事件冒泡到外层 .scroller 的 WXS 滚动引擎（引擎会 preventDefault，原生 scroll-view 就滚不动了）
+    noop() {},
+
     // ==================== WXS 滚动引擎（视图层直驱，0 setData） ====================
     _initScrollEngine() {
       this._scrollerH = 0

@@ -210,7 +210,14 @@
 
           <!-- 文件列表 -->
           <view wx:if="{{item.files && item.files.length > 0}}" class="detail-section">
-            <view class="detail-section-title">文件列表 ({{item.files.length}})</view>
+            <view class="detail-section-title">文件列表 ({{item.files.length}})<text wx:if="{{item.files.length > 5}}" class="detail-files-hint">· 列表可上下滑动</text></view>
+            <!-- 文件多时列表在自己的框里滚动：卡片整体高度被 detail-expanded 的 max-height 限死，
+                 不再把后半截文件裁掉（「一个任务 10+ 个文件」现场）。
+                 catchtouchmove 是必需的：本页外层 .scroller 挂着 WXS 滚动引擎，它的 touchmove
+                 会 preventDefault（返回 false），原生 scroll-view 就再也滚不动了 —— 用 catch
+                 把事件终止在这一层，让原生滚动接管。（代价：手指起于列表内时页面不跟着滚，
+                 抬手再来一次即可；文件列表最多 5 行高，可接受。） -->
+            <scroll-view scroll-y class="detail-files-scroll" catchtouchmove="noop">
             <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
@@ -228,6 +235,7 @@
                 <text wx:if="{{(f.status === 'rejected' || f.status === 'failed') && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
             </view>
+            </scroll-view>
           </view>
 
           <!-- 附加服务 -->
