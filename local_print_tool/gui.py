@@ -10603,6 +10603,9 @@ class MainWindow(QMainWindow):
         xlsx_default = task_options_to_print_options(self._config.task_options())
 
         applied = []
+        # 转换引擎被改过的行（行号, 旧引擎）：循环结束后按新引擎重新转 PDF。
+        # 只记**真的变了**的行 —— 改份数/双面也会走到这里，不记就会每次面板变动都重转一遍。
+        engine_switched: list[tuple[int, str]] = []
         # 控件可用性按**整片选区**判定（与 _on_table_selection / _selection_traits 同一口径）：
         # · 选区里有图片/单页文件 → 双面控件是灰的 ⇒ **绝不能**按面板值写 duplex：面板此时被迫
         #   显示「单面」，照写会把同批的多页文件静默改成单面（改了用户没点过的参数）。
@@ -10672,6 +10675,9 @@ class MainWindow(QMainWindow):
             # 引擎（仅 Word 文件有意义；其余格式引擎显示为转换方式，不写回 job.engine）
             is_word = os.path.splitext(job.file_path)[1].lower() in (".doc", ".docx") if job.file_path else False
             if is_word and engine_editable:
+                if (job.engine or "") != engine:
+                    # 引擎换了 ⇒ 已转好的 PDF 是旧引擎的产物，必须作废重转（见下方方法）
+                    engine_switched.append((row, job.engine or ""))
                 job.engine = engine
 
             # DPI
@@ -10695,6 +10701,105 @@ class MainWindow(QMainWindow):
         self._update_total_cost()
         # 实时保存配置
         self._set_current_jobs(jobs)
+        # 引擎切换 ⇒ 按新引擎重新转换（必须在 `_set_current_jobs` 之后：重转回调按
+        # file_path 找行，配置先落地才不会把旧 job 写回去）
+        if engine_switched:
+            self._restart_convert_for_engine_change(engine_switched)
+
+    def _restart_convert_for_engine_change(self, rows_with_old_engine) -> int:
+        """转换引擎被改过 → 作废旧 PDF 并按新引擎重新转换。
+
+        为什么必须重转（2026-11-04 用户需求）：引擎只决定「转 PDF 那一步」由谁排版，
+        而 PDF 在文件落地时就已经转好、挂在 `job.cached_pdf` 上。只改 `job.engine`
+        不碰这份产物 ⇒ 面板写着 Word、实际打印的还是 WPS 转出来的那份；页数/方向/费用
+        也全停在旧引擎的排版上（`.doc` 更硬：它的缓存 key 不带引擎后缀，再查一次缓存
+        还会把旧 PDF 命中回来）。
+
+        `rows_with_old_engine`：[(行号, 旧引擎)]，只含**真的换了引擎**的行 —— 改份数/
+        双面等参数不会走到这里，否则每点一次面板都要重转一遍全部文件。
+
+        返回真正发起重转的文件数。
+        """
+        jobs = self._get_current_jobs()
+        pending = sorted({(int(r), str(old or "")) for r, old in (rows_with_old_engine or [])
+                          if isinstance(r, int) and 0 <= r < len(jobs)})
+        if not pending:
+            return 0
+        labels = {"word": "Word", "wps": "WPS", "libreoffice": "LibreOffice"}
+        started = 0
+        for row, old_engine in pending:
+            job = jobs[row]
+            path = getattr(job, "file_path", "") or ""
+            if not path:
+                continue
+            new_engine = self._resolve_engine(job)
+            # ① 旧产物：新引擎会命中同一文件名时**必须删文件**，否则 _start_convert_worker
+            #    又走缓存命中分支，等于没重转（判定见 _invalidate_pdf_for_engine）。
+            self._invalidate_pdf_for_engine(job, old_engine, new_engine)
+            # ② 页数归零：旧页数是旧引擎排版出来的。重转期间「开始打印」必须等新页数
+            #    （_pending_page_count_stats：页数 0 + 线程仍在跑 ⇒ 拦住并提示），否则
+            #    用户此刻点打印，PrintWorker 会拿「没有缓存的这一行」自己转一次，
+            #    走的是自动降级链，未必是刚选的那个引擎。
+            job.page_count = 0
+            job.blank_tail = 0
+            try:
+                self._fill_table_row(row, job)
+            except Exception:
+                logger.debug("引擎切换后重画行失败", exc_info=True)
+            # ③ 按新引擎重转（云端任务能不能用 Office COM 仍由 ConvertWorker 内的 S1-04 闸门判定）
+            _from_cloud = int(getattr(job, "task_id", 0) or 0) > 0
+            try:
+                self._start_convert_worker(
+                    row, path, new_engine, tab_key=self._current_tab,
+                    from_cloud=_from_cloud,
+                    allow_cloud_com=bool(_from_cloud and self._cloud_com_allowed(job)))
+                started += 1
+            except Exception:
+                logger.debug("引擎切换后重新转换启动失败: %s", path, exc_info=True)
+                self._log(f"⚠ 切换引擎后重新转换失败: {os.path.basename(path)}")
+        if started:
+            try:
+                self._update_total_cost()
+            except Exception:
+                logger.debug("重转后刷新合计失败", exc_info=True)
+            _names = "/".join(sorted({labels.get(self._resolve_engine(jobs[r]), "?")
+                                      for r, _old in pending}))
+            self._log(f"🔄 转换引擎已改为「{_names}」，正在重新转换 {started} 个文件")
+        return started
+
+    def _invalidate_pdf_for_engine(self, job, old_engine: str, new_engine: str) -> bool:
+        """作废这个任务引用的缓存 PDF（切引擎时用）。返回是否真的删了文件。
+
+        判定方式：按**新引擎**重算一次缓存文件名 ——
+        · 与旧 `cached_pdf` 同名 ⇒ 新引擎的下一次缓存查询会直接命中这份旧产物，必须删文件
+          （`.doc`、LibreOffice、图片、表格都是"一份源文件一个 key"，不带引擎身份）；
+        · 不同名 ⇒ `.docx` 的 `_eword`/`_ewps` 分引擎缓存。只清引用、留文件：切回原引擎
+          时还能直接命中，不必再开一次 Word/WPS。
+        算不出 key（没有 MD5 / 路径异常）时按"会命中"处理 —— 宁可多转一次，也不能把旧引擎
+        的排版当成新引擎的产物打出去。
+        """
+        cached = getattr(job, "cached_pdf", "") or ""
+        if not cached or not os.path.isfile(cached):
+            job.cached_pdf = ""
+            return False
+        _md5 = getattr(job, "source_md5", "") or ""
+        _same_key = True
+        if _md5:
+            try:
+                _expected = pdf_cache_key(
+                    _md5,
+                    getattr(job, "image_orientation", "auto") or "",
+                    cache_engine_for(getattr(job, "file_path", "") or "", new_engine)) + ".pdf"
+                _same_key = (os.path.normcase(os.path.basename(cached))
+                             == os.path.normcase(_expected))
+            except Exception:
+                _same_key = True
+        if not _same_key:
+            job.cached_pdf = ""
+            return False
+        logger.debug("引擎切换（%s→%s）：删除旧引擎产物 %s",
+                     old_engine or "?", new_engine, os.path.basename(cached))
+        return self._purge_job_pdf_cache(job)
 
     def _selected_rows(self) -> list[int]:
         """表格当前选中的行号（升序、去重）。多选时含全部选中行。"""

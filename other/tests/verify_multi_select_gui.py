@@ -621,6 +621,16 @@ check("多选时页码范围的写回被挡住（各文件范围原样保留）"
 # ═══════════════ 10. 转换引擎在多选下的显示与写回 ═══════════════
 # 现场提问：选区里同时有图片 / Word 文档 / WPS 文档时，引擎下拉显示什么？会不会影响所有文件？
 print("=== 10. 转换引擎：多选下的显示与写回 ===")
+
+# 2026-11-04 起「面板改引擎」会**真的发起重新转换**（需求：切换引擎必须自动重转）。
+# 本节只验面板的显示/写回语义，不能在这里起 Word/WPS COM 线程 —— 本节的 .docx 是假文件
+# （只写 4 字节魔数），真转必失败，且线程会活到进程退出，Qt 直接 abort
+# （实测：QThread: Destroyed while thread '' is still running、退出码 127）。
+# 真重转行为由 other/tests/verify_engine_switch_reconvert.py 验收。
+_real_start_convert = win._start_convert_worker
+_engine_converts = []
+win._start_convert_worker = lambda row, path, engine, **kw: _engine_converts.append(
+    (row, os.path.basename(path), engine))
 PDOCX_W = os.path.join(_SANDBOX, "word编辑.docx")
 PDOCX_S = os.path.join(_SANDBOX, "wps编辑.docx")
 for _p in (PDOCX_W, PDOCX_S):
@@ -716,6 +726,11 @@ select_rows([1])
 check("单选（引擎一致）：下拉回到 3 项、没有「混合」项",
       win._edit_engine.count() == 3 and win._edit_engine.currentText() == "WPS",
       f"count={win._edit_engine.count()} text={win._edit_engine.currentText()}")
+
+check("切引擎会发起重新转换（只对真的换了引擎的 .docx，且按新引擎转）",
+      _engine_converts == [(2, "word编辑.docx", "wps"), (1, "word编辑.docx", "wps")],
+      str(_engine_converts))
+win._start_convert_worker = _real_start_convert      # 还原，别影响后面的用例
 
 # ⑤ 引擎可用性灰度：只读标签不该被 Word 的可用性连带灰掉（且重建下拉后仍保持灰度）
 import converter as _conv  # noqa: E402
