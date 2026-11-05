@@ -164,9 +164,11 @@ def _net_acquire(existing, files, total, extra, tab, created, request_id=""):
 class _FakeClient:
     def __init__(self):
         self.api_url = "https://example.test"
-        self.token = "tok"
-        self.auth_token = "tok"
-        self.device_token = ""
+        # 刻意让「全局 token」与「本机设备 token」不同：2026-11-04 服务端轮换后全局 token 已失效，
+        # 取号/上报必须用 auth_token（本机设备 token），用 token 会 403 → 每单退化成 -L。
+        self.token = "GLOBAL-STALE"
+        self.auth_token = "DEVICE-OK"
+        self.device_token = "DEVICE-OK"
         self.client_id = "pc-test"
         self.last_printer_state = {}
         self.take_orders = False
@@ -212,6 +214,12 @@ check("取到云端号", num == "HN20261025-0001", f"{num}")
 check("★ 取号请求带 request_id（就是该标签页那把键）",
       bool(_gets) and _gets[0]["params"].get("request_id") == rid1,
       f"{_gets[0]['params'] if _gets else None}")
+check("★ 取号带本机设备 token（X-Printer-Token 头；全局 token 已失效，用它会 403）",
+      bool(_gets) and (_gets[0]["headers"] or {}).get("X-Printer-Token") == "DEVICE-OK",
+      f"{_gets[0]['headers'] if _gets else None}")
+check("★ 取号不再把 token 拼进 URL query（会进 nginx 日志）",
+      bool(_gets) and "token" not in (_gets[0]["params"] or {}),
+      f"{_gets[0]['params'] if _gets else None}")
 check("订单号写回 job", win._config.tabs["1"].jobs[0].order_number == num, "")
 _n = len(HTTP.gets)
 win._ensure_order_number()
@@ -234,6 +242,10 @@ check("★ 取号 URL 带 request_id", bool(HTTP.gets)
 check("随后按这个号上报 /api/local_orders（status=sent）",
       bool(HTTP.posts) and HTTP.posts[0]["json"].get("order_number") == "HN20261025-0002"
       and HTTP.posts[0]["json"].get("status") == "sent", f"{HTTP.posts[:1]}")
+check("★ 上报也用本机设备 token（全局 token 会让「订单已上云」这条整条失败）",
+      bool(HTTP.posts)
+      and (HTTP.posts[0]["headers"] or {}).get("X-Printer-Token") == "DEVICE-OK",
+      f"{(HTTP.posts[0]['headers'] if HTTP.posts else None)}")
 
 print("\n=== ④b 上一轮留下了本地临时号：不当云端号上报，先取号（同一把键能拿回旧占位号）===")
 HTTP.gets.clear()

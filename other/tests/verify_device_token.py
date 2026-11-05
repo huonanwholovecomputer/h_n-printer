@@ -228,6 +228,9 @@ pc_src = _read_local("printer_config.py")
 H.chk("★ 客户端 token 一律走请求头（源码里不再有 params={\"token\" / URL 里的 ?token=）",
       'params={"token"' not in cc_src and 'params={"token"' not in gui_src
       and 'params={"token"' not in os_src
+      # 2026-11-05：旧写法把 token 塞进 params 的字典字面量里（`{**{"token": token}}`），
+      # 上面那个锚点抓不到 —— 结果取号一直用已失效的全局 token，每单 403 退化成 -L。
+      and '"token": token' not in gui_src
       and "ws_url}?token=" not in cc_src
       and "?token={self.token}" not in cc_src)
 H.chk("auth_headers() 是唯一入口，CloudClient._auth_headers 复用它",

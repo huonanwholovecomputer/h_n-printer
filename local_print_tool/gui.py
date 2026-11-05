@@ -119,7 +119,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.6.4"
+APP_VERSION = "4.6.5"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -13183,7 +13183,8 @@ class MainWindow(QMainWindow):
             "cover_page_price": (tab.cover_page_price if tab else self._config.cover_page_price),
         }
         api_url = client.api_url or ""
-        token = client.token or ""
+        # S1-01：本机设备 token 优先（全局 token 2026-11-04 轮换后已失效，见取号处注释）
+        token = client.auth_token or ""
 
         def _net():
             try:
@@ -13715,7 +13716,8 @@ class MainWindow(QMainWindow):
         if "-L" in upper or upper.startswith("LOCAL-"):
             return
         api_url = (client.api_url or "").rstrip("/")
-        token = client.token or ""
+        # S1-01：本机设备 token 优先（全局 token 2026-11-04 轮换后已失效，见取号处注释）
+        token = client.auth_token or ""
         if not api_url or not token:
             return
         payload = {
@@ -16576,7 +16578,11 @@ class MainWindow(QMainWindow):
         """
         client = self._cloud_client
         api_url = client.api_url if client else ""
-        token = client.token if client else ""
+        # S1-01：一律用**本机设备 token**（`auth_token`＝device_token 优先、缺失才回退全局 token）。
+        # 2026-11-04 服务端轮换了全局 TOKEN（旧值 403「token 无效」），这里若还读 `client.token`，
+        # 每一单取号都会 403 → 退化成 -L 本地号，只能等下次启动换号才上云（现场 2026-11-04/05
+        # 全天如此）。换号路径 gui.py:12973 早已用 auth_token，所以同一接口在那里能成功。
+        token = client.auth_token if client else ""
         order_number = ""
         uploaded = False
 
@@ -16650,12 +16656,14 @@ class MainWindow(QMainWindow):
         # 预留即带当前标签页归属，避免上报失败时占位单无归属
         # request_id：取号幂等键。响应丢包时服务端其实已经建好占位单，凭这把钥匙重试能拿回
         # **同一个号**（否则每次重试都新建占位单 → 云端一堆空的「已预留」）。
-        _params = {**{"token": token}, **self._current_owner_params()}
+        # token 走请求头（S0-06：query 里的 token 会进 nginx 访问日志）；params 只放业务字段。
+        _params = self._current_owner_params()
         if request_id:
             _params["request_id"] = request_id
         try:
             resp = http_requests.get(
                 f"{api_url}/api/next_order_number",
+                headers=auth_headers(token, getattr(client, "client_id", "")),
                 params=_params,
                 timeout=5,
             )
@@ -16675,8 +16683,13 @@ class MainWindow(QMainWindow):
                 # 非 2xx：状态码 + 响应正文前 200 字（502/网关错误常带 HTML）
                 logger.warning(
                     f"取号失败：HTTP {resp.status_code} {str(getattr(resp, 'text', '') or '')[:200]}")
+                # 401/403 = 凭据问题，不是网络问题：不给提示的话现场只会看到"每单都变 -L"，
+                # 而 token 失效要靠人点「重新签发本机 token」才能恢复（2026-11-04 轮换现场）。
+                _hint = ""
+                if resp.status_code in (401, 403):
+                    _hint = "，token 已失效：设置里点「🔑 重新签发本机 token」"
                 self._cloudConnSyncLog.emit(
-                    f"⚠ 云端发号失败：HTTP {resp.status_code}（将用本地临时号先打）")
+                    f"⚠ 云端发号失败：HTTP {resp.status_code}{_hint}（将用本地临时号先打）")
         except Exception as e:
             logger.warning(f"获取云端订单号失败: {e}")
             self._cloudConnSyncLog.emit(f"⚠ 云端发号异常：{e}（将用本地临时号先打）")

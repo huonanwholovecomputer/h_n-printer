@@ -188,6 +188,9 @@ _orig_http = _gui.http_requests
 _gui.http_requests = _FakeHttp
 win._cloud_client = types.SimpleNamespace(
     client_id="cid-1", api_url="http://127.0.0.1:9", token="tok",
+    # 真 CloudClient 的 auth_token = device_token or token；2026-11-05 起取号/上报一律读它，
+    # 桩对象必须照抄这个接口，否则「用了全局 token」这类回归就测不出来（这里刻意设为不同值）。
+    auth_token="dev-tok", device_token="dev-tok",
     is_connected=lambda: True)
 tab.jobs[0].order_number = "HN20261103-9001"
 tab.jobs[0].finished_at = "1999-01-01 00:00:00"      # 旧实现的错误来源
