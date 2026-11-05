@@ -101,6 +101,13 @@ class TabSettings:
     #   只记录第一次；重打/续打不覆盖（否则"打印发起"会一直跳到最后一趟）。
     created_at: str = ""
     started_at: str = ""
+    # first_added_at = **本标签页第一次添加文件的时刻**（"%Y-%m-%d %H:%M:%S"，2026-11 用户改口径）。
+    #   工具条上原来显示的是 created_at（「订单创建」），但它和「打印发起」几乎同时，
+    #   对操作者没有信息量；改成「首次添加：…」后看的是这一列。
+    #   ⚠ created_at 的语义**没有变**（仍是第一次生成订单号的时刻，云端账期锚点），
+    #   只是不再显示在工具条上，仍按原样上报。
+    #   只记录第一次；清空标签页（文件删光）时一并作废，下一单从零开始计时。
+    first_added_at: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -118,6 +125,7 @@ class TabSettings:
             "order_req_id": self.order_req_id,
             "created_at": self.created_at,
             "started_at": self.started_at,
+            "first_added_at": self.first_added_at,
         }
 
     @classmethod
@@ -143,6 +151,9 @@ class TabSettings:
             # 凭空补一个时间等于伪造历史，宁可显示未知。
             created_at=str(data.get("created_at", "") or ""),
             started_at=str(data.get("started_at", "") or ""),
+            # 旧配置没有这个键 ⇒ 空串（界面显示 "—"）：不知道第一次添加是什么时候，
+            # 就不假装知道（这和上面两个时间戳同一口径）。
+            first_added_at=str(data.get("first_added_at", "") or ""),
         )
 
     def calc_extra_total(self, base_total: float, config: "PrinterConfig") -> float:

@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
-"""验收脚本 · 订单「创建时间 / 打印发起时间」（task-4 #7，GUI 集成，offscreen）
+"""验收脚本 · 标签页「首次添加 / 打印发起时间」（task-4 #7 + 2026-11 改口径，GUI 集成，offscreen）
 
 需求（用户 2026-11）：
-1. 标签页工具条右侧显示两个**只读**时间：「订单创建：YYYY-MM-DD HH:MM:SS」与
+1. 标签页工具条右侧显示两个**只读**时间：「首次添加：YYYY-MM-DD HH:MM:SS」与
    「打印发起：…」；没有值时显示「—」；窄窗口时允许退化（省略秒 → 只留日期）但不能出界。
-2. 创建时间 = 本标签页订单**第一次生成订单号**的时刻，存 `TabSettings.created_at`，
-   持久化、重启后仍在；**一经写入不可变** —— 复制合计、换号补报、离线补报、重打都不得改写。
-3. 打印发起时间 = 第一次真正开始打印的时刻，存 `TabSettings.started_at`，同样不可覆盖。
-4. 修掉旧 bug：预留上报（复制合计）曾拿 `PrintJob.finished_at` 当 created_at，
+   （原先是「订单创建：…」，用户 2026-11-04 指出它和「打印发起」基本同一秒、没有信息量，
+   改成「首次添加」= 该标签页第一次加进文件的时刻。）
+2. 首次添加时间 = 本标签页**第一次添加文件**的时刻，存 `TabSettings.first_added_at`，
+   持久化、重启后仍在；**一经写入不可变**（再加文件不刷新），清空列表后清零。
+3. 订单创建时间 = 本标签页订单**第一次生成订单号**的时刻，仍存 `TabSettings.created_at`
+   并照旧上报云端（账期/等待时长锚点），只是不再显示在工具条上。
+4. 打印发起时间 = 第一次真正开始打印的时刻，存 `TabSettings.started_at`，同样不可覆盖。
+5. 修掉旧 bug：预留上报（复制合计）曾拿 `PrintJob.finished_at` 当 created_at，
    导致同一张订单的时间随每次上报漂移。
 
     python tests/verify_order_time_labels.py     # exit 0 = 全绿
@@ -65,12 +69,12 @@ def check(name, cond, extra=""):
 # ══════════════════════════════════════════════════════════════════════════
 print("\n=== ① 纯函数：时间文案的三档退化 ===")
 check("无值 ⇒ 单个「前缀 + —」，不伪造时间",
-      _gui._order_time_variants("订单创建：", "") == ["订单创建： —"],
-      str(_gui._order_time_variants("订单创建：", "")))
-_v = _gui._order_time_variants("订单创建：", "2026-11-03 14:25:30")
+      _gui._order_time_variants("首次添加：", "") == ["首次添加： —"],
+      str(_gui._order_time_variants("首次添加：", "")))
+_v = _gui._order_time_variants("首次添加：", "2026-11-03 14:25:30")
 check("有值 ⇒ 完整 / 省略秒 / 仅日期 三档",
-      _v == ["订单创建： 2026-11-03 14:25:30", "订单创建： 2026-11-03 14:25",
-             "订单创建： 2026-11-03"], str(_v))
+      _v == ["首次添加： 2026-11-03 14:25:30", "首次添加： 2026-11-03 14:25",
+             "首次添加： 2026-11-03"], str(_v))
 check("_now_stamp() 是 19 字符的本地时间戳",
       re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", _gui._now_stamp()) is not None,
       _gui._now_stamp())
@@ -82,7 +86,7 @@ check("set_variants 后默认显示完整值", _lbl.full_text() == _v[0], _lbl.f
 _lbl.resize(60, 18)
 _after = _lbl.text()
 check("压到 60px 后显示的是更短的档（或省略号），且不超长",
-      len(_after) <= len(_v[0]) and _after.startswith("订单创建："), _after)
+      len(_after) <= len(_v[0]) and _after.startswith("首次添加："), _after)
 _lbl.deleteLater()
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -94,7 +98,7 @@ tab.jobs = [PrintJob(file_path=r"C:\tmp\a.pdf", page_count=2)]
 win._set_current_jobs(tab.jobs)
 win._refresh_tab_display()
 
-check("标签页工具条上有「订单创建」「打印发起」两个只读标签",
+check("标签页工具条上有「首次添加」「打印发起」两个只读标签",
       hasattr(win, "_tab_created_label") and hasattr(win, "_tab_started_label"))
 check("初始没有值 ⇒ 两个标签都显示「—」（不显示假时间）",
       win._tab_created_label.full_text().endswith("—")
@@ -103,18 +107,38 @@ check("初始没有值 ⇒ 两个标签都显示「—」（不显示假时间�
 check("文案里没有 markdown 星号",
       "**" not in win._tab_created_label.toolTip()
       and "**" not in win._tab_started_label.toolTip())
+check("左边的标签文案是「首次添加：」（2026-11 用户改口径，不再是「订单创建」）",
+      "首次添加：" in win._tab_created_label.full_text()
+      and "订单创建" not in win._tab_created_label.full_text(),
+      win._tab_created_label.full_text())
 
-stamp = win._mark_order_created(tab_key)
+stamp = win._mark_tab_first_added(tab_key)
 win._refresh_tab_display()
-check("写入创建时间后标签立刻显示该时间",
+check("写入首次添加时间后标签立刻显示该时间",
       stamp and stamp in win._tab_created_label.full_text(),
       win._tab_created_label.full_text())
-check("创建时间落进 TabSettings.created_at（持久化来源）", tab.created_at == stamp)
+check("首次添加时间落进 TabSettings.first_added_at（持久化来源）", tab.first_added_at == stamp)
+
+print("\n=== ③b 订单创建时间照旧记录，但不再占用工具条 ===")
+_created = win._mark_order_created(tab_key)
+check("created_at 仍会写入（云端账期/等待时长的锚点，语义没变）",
+      _created and tab.created_at == _created)
+check("工具条不显示 created_at（显示的是 first_added_at）",
+      tab.first_added_at == stamp and stamp in win._tab_created_label.full_text()
+      and "订单创建" not in win._tab_created_label.full_text(),
+      win._tab_created_label.full_text())
+check("源码口径：标签取的是 first_added_at，前缀是「首次添加：」",
+      '_order_time_variants("首次添加：", first)' in SRC
+      and 'first = str(getattr(tab, "first_added_at", "") or "")' in SRC)
 
 print("\n=== ④ 不可覆盖：再标记一次不改写（复制合计/重打/换号都走这条路） ===")
 again = win._mark_order_created(tab_key, when="1999-01-01 00:00:00")
-check("created_at 已有值时原样返回，不覆盖", again == stamp and tab.created_at == stamp,
-      f"{again} vs {stamp}")
+check("created_at 已有值时原样返回，不覆盖", again == _created and tab.created_at == _created,
+      f"{again} vs {_created}")
+_again_first = win._mark_tab_first_added(tab_key, when="1999-01-01 00:00:00")
+check("first_added_at 同样不可覆盖（再加文件不刷新）",
+      _again_first == stamp and tab.first_added_at == stamp,
+      f"{_again_first} vs {stamp}")
 
 started = win._mark_print_started(tab_key)
 win._refresh_tab_display()
@@ -128,13 +152,16 @@ print("\n=== ⑤ 持久化：存盘再加载，时间还在 ===")
 win._save_config()
 win2 = MainWindow(config_path=paths.config_path())
 tab2 = win2._config.tabs.get(tab_key)
-check("重新加载配置后 created_at 仍在", tab2 is not None and tab2.created_at == stamp,
+check("重新加载配置后 created_at 仍在", tab2 is not None and tab2.created_at == _created,
       getattr(tab2, "created_at", None))
+check("重新加载配置后 first_added_at 仍在", tab2 is not None and tab2.first_added_at == stamp,
+      getattr(tab2, "first_added_at", None))
 check("重新加载配置后 started_at 仍在", tab2 is not None and tab2.started_at == started,
       getattr(tab2, "started_at", None))
-check("旧配置（没有这两个键）加载不报错、不伪造时间",
+check("旧配置（没有这几个键）加载不报错、不伪造时间",
       TabSettings.from_dict({"jobs": []}).created_at == ""
-      and TabSettings.from_dict({"jobs": []}).started_at == "")
+      and TabSettings.from_dict({"jobs": []}).started_at == ""
+      and TabSettings.from_dict({"jobs": []}).first_added_at == "")
 win2.close()
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -177,7 +204,7 @@ finally:
 check("预留上报真的发出去了（测试前提）", len(posted) == 1, f"{len(posted)} 次")
 _payload = posted[0] if posted else {}
 check("payload.created_at 是标签页创建时间，不是 finished_at",
-      _payload.get("created_at") == stamp and _payload.get("created_at") != "1999-01-01 00:00:00",
+      _payload.get("created_at") == _created and _payload.get("created_at") != "1999-01-01 00:00:00",
       str(_payload.get("created_at")))
 check("payload 仍带 order_number / status=reserved",
       _payload.get("order_number") == "HN20261103-9001" and _payload.get("status") == "reserved")
@@ -199,6 +226,12 @@ check("云端接单标签页写入后端下发的 created_at",
 check("开打时同时记 created_at（兜底）与 started_at",
       "created_at = self._mark_order_created(target_key)" in SRC
       and "self._mark_print_started(target_key)" in SRC)
+check("本地加文件：只有「加之前这一页是空的」才写 first_added_at（老配置不伪造时间）",
+      "if rows_before == 0:" in SRC
+      and "self._mark_tab_first_added(self._current_tab)" in SRC)
+check("云端任务落地：这一页拿到第一条任务时写 first_added_at",
+      "if len(self._config.tabs[new_key].jobs) == 1:" in SRC
+      and "self._mark_tab_first_added(new_key)" in SRC)
 
 print("\n=== ⑧ 两个标签不挤占按钮：顺序在 stretch 之后，且不被添加到按钮区 ===")
 check("时间标签加在 tab_row.addStretch() 之后（右侧、不参与按钮排布）",
@@ -213,23 +246,25 @@ print("\n=== ①⓪ 新订单新时间：清空/删光复位，撤回还原 ==="
 tab = win._config.tabs[win._current_tab]      # ⑤ 之后配置对象可能已被重新加载，重新取当前页
 tab.created_at = "2026-11-03 10:00:00"
 tab.started_at = "2026-11-03 10:05:00"
+tab.first_added_at = "2026-11-03 09:55:00"
 tab.frozen = False
 win._set_current_jobs([PrintJob(file_path=r"C:\tmp\a.pdf", page_count=2,
                                 order_number="HN20261103-0001")])
 win._rebuild_table()
 win._on_clear_list()
-check("清空标签页 ⇒ 创建/发起时间一起清掉（否则下一单会沿用上一单的创建时间）",
-      tab.created_at == "" and tab.started_at == "",
-      f"created={tab.created_at!r} started={tab.started_at!r}")
+check("清空标签页 ⇒ 首次添加/创建/发起时间一起清掉（否则下一单会沿用上一单的时间）",
+      tab.created_at == "" and tab.started_at == "" and tab.first_added_at == "",
+      f"first={tab.first_added_at!r} created={tab.created_at!r} started={tab.started_at!r}")
 win._on_undo_clear()
-check("5 秒内撤回清空 ⇒ 时间原样还原（这单没被清掉）",
-      tab.created_at == "2026-11-03 10:00:00" and tab.started_at == "2026-11-03 10:05:00",
-      f"created={tab.created_at!r} started={tab.started_at!r}")
+check("5 秒内撤回清空 ⇒ 三个时间原样还原（这单没被清掉）",
+      tab.created_at == "2026-11-03 10:00:00" and tab.started_at == "2026-11-03 10:05:00"
+      and tab.first_added_at == "2026-11-03 09:55:00",
+      f"first={tab.first_added_at!r} created={tab.created_at!r} started={tab.started_at!r}")
 win._table.selectRow(0)
 win._on_remove_selected()
 check("把文件全删光 ⇒ 时间复位，下一单重新计时",
-      tab.created_at == "" and tab.started_at == "",
-      f"created={tab.created_at!r} started={tab.started_at!r} jobs={len(tab.jobs)}")
+      tab.created_at == "" and tab.started_at == "" and tab.first_added_at == "",
+      f"first={tab.first_added_at!r} created={tab.created_at!r} started={tab.started_at!r} jobs={len(tab.jobs)}")
 check("Ctrl+W 清空最后一个标签页也会复位时间",
       SRC.split("tab.frozen = False")[1][:320].find("_reset_tab_order_times(key)") >= 0)
 

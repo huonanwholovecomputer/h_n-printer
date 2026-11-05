@@ -167,7 +167,10 @@ print("\n=== ⑦ 回归：标签页右侧两个时间标签在真窗口里真的
 win._current_tab = "2"
 win._config.active_tab = "2"
 win._set_current_jobs(win._config.tabs["2"].jobs)
-created = win._mark_order_created("2")
+# 2026-11 用户改口径：左边那格显示「首次添加」（第一次添加文件的时刻），
+# 不再是「订单创建」（created_at 照旧记录/上报，只是不占用工具条）。
+first_added = win._mark_tab_first_added("2")
+win._mark_order_created("2")
 started = win._mark_print_started("2")
 win._refresh_tab_display()
 win.resize(1400, 900)
@@ -175,12 +178,16 @@ app.processEvents()
 for _ in range(3):
     app.processEvents()
 
-for label_name, stamp in (("_tab_created_label", created), ("_tab_started_label", started)):
+for label_name, stamp in (("_tab_created_label", first_added), ("_tab_started_label", started)):
     lbl = getattr(win, label_name)
     check(f"{label_name} 宽度 > 0（不是被压成 0 的隐形标签）", lbl.width() > 0, str(lbl.width()))
     check(f"{label_name} 画出来的文字非空", bool(lbl.text().strip()), repr(lbl.text()))
-    check(f"{label_name} 显示完整时间（{stamp}）", stamp in lbl.text(), lbl.text())
+    check(f"{label_name} 显示完整时间（{stamp}）", bool(stamp) and stamp in lbl.text(), lbl.text())
     check(f"{label_name} sizeHint 有真实宽度", lbl.sizeHint().width() > 0, str(lbl.sizeHint().width()))
+
+check("左边那格的文案是「首次添加」（不再是「订单创建」）",
+      win._tab_created_label.text().startswith("首次添加"),
+      win._tab_created_label.text())
 
 win.resize(900, 700)
 app.processEvents()

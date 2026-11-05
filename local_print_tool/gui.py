@@ -8097,11 +8097,13 @@ class MainWindow(QMainWindow):
         # ── 订单时间（2026-11 用户需求 #7）──
         # 两个**只读**标签放在 stretch 之后（不挤占 −/+/🗑 按钮），右对齐贴着标签页工具条末端；
         # 窄窗口时 _TimeVariantsLabel 自动退化：完整 → 省略秒 → 只有日期（不撑破布局）。
-        # 数据源是 TabSettings.created_at / started_at（持久化），创建时间一经写入不可变。
+        # 左边显示「首次添加」（TabSettings.first_added_at：本页第一次加进文件的时刻），
+        # 右边「打印发起」（started_at）。原先是「订单创建」（created_at），但它和打印发起
+        # 基本同时，看不出信息量（2026-11 用户反馈）；created_at 本身仍照旧记录并上报。
         self._tab_created_label = _TimeVariantsLabel()
         self._tab_created_label.setObjectName("tabTimeLabel")
         self._tab_created_label.setToolTip(
-            "本标签页订单第一次生成订单号的时刻（固定不变，复制/换号补报都不会改写）")
+            "本标签页第一次添加文件的时刻（固定不变，加过就一直显示这个时间）")
         self._tab_started_label = _TimeVariantsLabel()
         self._tab_started_label.setObjectName("tabTimeLabel")
         self._tab_started_label.setToolTip(
@@ -8770,14 +8772,14 @@ class MainWindow(QMainWindow):
         # 备注框：随标签页刷新加载订单备注（首个非空）；冻结时锁定编辑
         self._load_remark_editor(tab)
 
-        # 订单创建 / 打印发起时间（#7）：只读展示，数据源是 TabSettings 的持久化字段
+        # 首次添加 / 打印发起时间（#7）：只读展示，数据源是 TabSettings 的持久化字段
         self._refresh_tab_time_labels(tab)
 
         # 打印机能力标注（双面是否=手动翻纸）随标签页/打印机变化同步
         self._update_duplex_label()
 
     def _refresh_tab_time_labels(self, tab=None) -> None:
-        """刷新标签页工具条右侧的「订单创建 / 打印发起」两个只读标签。
+        """刷新标签页工具条右侧的「首次添加 / 打印发起」两个只读标签。
 
         ⚠ 处于 _setup_file_table 可见之前的一次 _refresh_tab_display 调用里，标签还没建好
         （它们建在 _setup_file_table 尾部、紧接着就是 refresh）—— 用 hasattr 挡一下，
@@ -8788,14 +8790,14 @@ class MainWindow(QMainWindow):
         try:
             if tab is None:
                 tab = self._config.tabs.get(self._current_tab)
-            created = str(getattr(tab, "created_at", "") or "") if tab else ""
+            first = str(getattr(tab, "first_added_at", "") or "") if tab else ""
             started = str(getattr(tab, "started_at", "") or "") if tab else ""
-            self._tab_created_label.set_variants(_order_time_variants("订单创建：", created))
+            self._tab_created_label.set_variants(_order_time_variants("首次添加：", first))
             self._tab_started_label.set_variants(_order_time_variants("打印发起：", started))
             self._tab_created_label.setToolTip(
-                "订单创建：" + (created or " — ") +
-                "\n本标签页订单第一次生成订单号的时刻。一经写入不可变：复制合计、"
-                "换号补报、离线补报都不会改写它。")
+                "首次添加：" + (first or " — ") +
+                "\n本标签页第一次添加文件的时刻。一经写入不可变：后面再拖文件、"
+                "重打、换号补报都不会改写它；清空列表（文件删光）后清零，下一单重新计时。")
             self._tab_started_label.setToolTip(
                 "打印发起：" + (started or " — ") +
                 "\n本标签页订单第一次真正开始打印的时刻（重打/续打不再刷新）。")
@@ -12653,6 +12655,8 @@ class MainWindow(QMainWindow):
         #7 契约：订单创建时间 = 本标签页**第一次生成订单号**的时刻，落 TabSettings.created_at
         （持久化，重启后仍在）。之后无论复制合计、换号补报、离线补报、重打，都只读不写 ——
         结算页的时间趋势和"下单→打印"耗时才有唯一口径。
+        ⚠ 2026-11 起工具条左边显示的是「首次添加」（first_added_at，见 _mark_tab_first_added），
+        这个 created_at 不再出现在界面上，但**照旧记录并上报云端**，语义一点没变。
         返回空串只在标签页不存在时（极端情况），调用方仍可继续用空值上报。
         """
         try:
@@ -12667,6 +12671,34 @@ class MainWindow(QMainWindow):
             return tab.created_at
         except Exception as e:              # 槽内异常会崩进程（6.11），这里只降级
             logger.debug(f"记录订单创建时间失败: {e}")
+            return when or ""
+
+    def _mark_tab_first_added(self, tab_key: str = "", when: str = "") -> str:
+        """记录并返回本标签页**第一次添加文件**的时刻；已有值原样返回（不覆盖）。
+
+        2026-11 用户改口径：工具条左边那个标签原来显示「订单创建」（created_at），
+        但订单号是点「开始打印」才要的，和「打印发起」基本同一秒，看不出信息量。
+        现在它显示这个 `first_added_at` —— 该标签页第一次把文件加进来的时刻，
+        也就是"这一单什么时候开始的"。
+
+        ⚠ created_at 不动：它仍是第一次生成订单号的时刻，是云端账期/等待时长的锚点
+        （见 verify_created_at_immutable.py），只是不再显示在工具条上。
+
+        只在**之前是空页**时由调用方写入：老配置里有文件但没有这个字段 ⇒ 留空显示「—」，
+        不拿"现在"伪造一个过去的时间（中间可能有几小时）。
+        """
+        try:
+            key = tab_key or self._current_tab
+            tab = self._config.tabs.get(key)
+            if tab is None:
+                return when or ""
+            exists = str(getattr(tab, "first_added_at", "") or "")
+            if exists:
+                return exists
+            tab.first_added_at = (when or _now_stamp())
+            return tab.first_added_at
+        except Exception as e:              # 槽内异常会崩进程（6.11），这里只降级
+            logger.debug(f"记录首次添加时间失败: {e}")
             return when or ""
 
     def _mark_print_started(self, tab_key: str = "", when: str = "") -> str:
@@ -12686,13 +12718,13 @@ class MainWindow(QMainWindow):
             return when or ""
 
     def _reset_tab_order_times(self, tab_key: str = "") -> None:
-        """清空标签页（或把文件删光）时把订单创建/发起时间一并清掉。
+        """清空标签页（或把文件删光）时把首次添加/订单创建/打印发起时间一并清掉。
 
         #7 契约的配套：一个标签页在同一时刻只属于一张订单。不清的话，
         「清空 → 再拖文件 → 取到新订单号」会沿用上一单的 created_at，
         界面上显示"创建时间"比新单早得多，上报给后端的 created_at 也是错的
         （结算页的"下单→打印"耗时跟着失真）。所以清空 = 这单结束了，
-        时间和单号一起作废；下一单从零开始计时。
+        时间和单号一起作废；下一单从零开始计时（「首次添加」同理）。
         """
         try:
             tab = self._config.tabs.get(tab_key or self._current_tab)
@@ -12700,6 +12732,7 @@ class MainWindow(QMainWindow):
                 return
             tab.created_at = ""
             tab.started_at = ""
+            tab.first_added_at = ""
         except Exception as e:              # 槽内异常会崩进程（6.11），这里只降级
             logger.debug(f"清空标签页订单时间失败: {e}")
 
@@ -19090,6 +19123,10 @@ class MainWindow(QMainWindow):
             uploader_is_admin=bool(getattr(task, 'uploader_is_admin', False)),
         )
         self._config.tabs[new_key].jobs.append(job)
+        # 首次添加时间（2026-11 用户口径）：云端订单的文件落地到这一页 = 这一页第一次有文件。
+        # 只在"刚 append 进去的是第一条"时写，同一订单后续文件不会改写它。
+        if len(self._config.tabs[new_key].jobs) == 1:
+            self._mark_tab_first_added(new_key)
 
         # Word 文件：缓存未命中时才启动转换（传真实行号，job 已 append；
         # 回调改为按 file_path 匹配，行号仅作快速路径提示；tab_key 定位目标标签页）
@@ -19131,7 +19168,8 @@ class MainWindow(QMainWindow):
         _tab_cleared = self._config.tabs.get(self._current_tab)
         self._cleared_times_backup[self._current_tab] = (
             str(getattr(_tab_cleared, "created_at", "") or ""),
-            str(getattr(_tab_cleared, "started_at", "") or ""))
+            str(getattr(_tab_cleared, "started_at", "") or ""),
+            str(getattr(_tab_cleared, "first_added_at", "") or ""))
         self._reset_tab_order_times(self._current_tab)
         self._set_current_jobs([])
         # 预约单指向该标签页 → 联动清理状态机（防到点打印空标签页/假打印）
@@ -19155,11 +19193,13 @@ class MainWindow(QMainWindow):
         self._cancel_undo_if_active()
         if backup:
             self._set_current_jobs(backup)
-            # 时间随任务一起还原：撤回 = 这单没被清掉，创建/发起时间仍然是原来那一刻
+            # 时间随任务一起还原：撤回 = 这单没被清掉，首次添加/创建/发起时间仍然是原来那一刻
             if _times:
                 _tab_undo = self._config.tabs.get(self._current_tab)
                 if _tab_undo is not None:
-                    _tab_undo.created_at, _tab_undo.started_at = _times
+                    _tab_undo.created_at, _tab_undo.started_at = _times[0], _times[1]
+                    if len(_times) > 2:      # 2026-11 新增「首次添加」，旧备份只有两个值
+                        _tab_undo.first_added_at = _times[2]
             self._rebuild_table()
             self._update_total_cost()
             self._refresh_tab_display()
@@ -19327,6 +19367,10 @@ class MainWindow(QMainWindow):
             self._warn_html_unsupported(html_rejected)
 
         if len(jobs) > rows_before:
+            # 首次添加时间（2026-11 用户口径）：只有"加之前这一页是空的"才算首次 ——
+            # 老配置里已有文件却没有这个字段时不补写，免得把"现在"当成几小时前的时刻。
+            if rows_before == 0:
+                self._mark_tab_first_added(self._current_tab)
             self._set_current_jobs(jobs)
             self._rebuild_table()
             self._refresh_tab_display()
