@@ -210,6 +210,47 @@ check("样式（沿 basedOn 链）里写的字体被抓到", _ok2 and "仿宋" i
 check("没被正文点名的样式字体不算", "本模板没用到的字体ZZ" not in _u2, str(_u2))
 check("docDefaults 只写主题引用时不报主题字体", "Aptos" not in _u2, str(_u2))
 
+print("④d 2026-11-04 现场：整篇靠主题字体排（Office 365 新模板，fontTable 里还有一堆没用过的）")
+# 真实文件的样子：正文/样式没有一个显式字体名，全是 w:asciiTheme="minorHAnsi"；
+# fontTable 里却登记着 Aptos / Aptos Display / Arial / Times New Roman（模板残留）。
+_DD_THEME = (
+    '<w:docDefaults><w:rPrDefault><w:rPr>'
+    '<w:rFonts w:asciiTheme="minorHAnsi" w:hAnsiTheme="minorHAnsi" w:eastAsiaTheme="minorEastAsia"/>'
+    '</w:rPr></w:rPrDefault></w:docDefaults>'
+)
+_theme_only = os.path.join(tmp, "theme_only.docx")
+_make_docx(_theme_only, ["Aptos", "Aptos Display", "Arial", "Times New Roman"], [],
+           styles_xml=_DD_THEME, theme_xml=_THEME_XML,
+           body_extra='<w:p><w:pPr><w:rPr><w:rFonts w:hint="eastAsia"/></w:rPr></w:pPr>'
+                      '<w:r><w:t>正文</w:t></w:r></w:p>')
+_u3, _ok3 = font_check.fonts_in_docx(_theme_only)
+check("主题引用解析成真名（minorHAnsi → Aptos）", _ok3 and _u3 == ["Aptos"], str(_u3))
+check("没用过的 Aptos Display / Arial / Times New Roman 不算正文用到",
+      all(x not in _u3 for x in ("Aptos Display", "Arial", "Times New Roman")), str(_u3))
+check("这份文件不再误报缺字体", font_check.check_file(_theme_only)["missing"] == [],
+      str(font_check.check_file(_theme_only)["missing"]))
+
+print("④e Word 自带云字体豁免（Aptos 族）；豁免不能一刀切")
+check("Aptos 全族不算缺（Word 转出的 PDF 里嵌的就是它）",
+      font_check.missing_fonts(["Aptos", "Aptos Display", "Aptos Mono", "Aptos Light"]) == [],
+      str(font_check.missing_fonts(["Aptos", "Aptos Display"])))
+check("豁免只针对 Word 自带字族，别的字照报",
+      font_check.missing_fonts(["Aptos", "假字体族XY"]) == ["假字体族XY"],
+      str(font_check.missing_fonts(["Aptos", "假字体族XY"])))
+_THEME_MISS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>'
+    '<a:fontScheme name="Office">'
+    '<a:majorFont><a:latin typeface="缺字体族主题XY"/><a:ea typeface=""/></a:majorFont>'
+    '<a:minorFont><a:latin typeface="缺字体族主题XY"/><a:ea typeface=""/></a:minorFont>'
+    '</a:fontScheme></a:themeElements></a:theme>'
+)
+_theme_miss = os.path.join(tmp, "theme_miss.docx")
+_make_docx(_theme_miss, ["宋体"], [], styles_xml=_DD_THEME, theme_xml=_THEME_MISS)
+check("主题字体是真缺的照样报（解析主题不是把嘴堵上）",
+      font_check.check_file(_theme_miss)["missing"] == ["缺字体族主题XY"],
+      str(font_check.check_file(_theme_miss)["missing"]))
+
 _ft_only = os.path.join(tmp, "ft_only.docx")
 _make_docx(_ft_only, ["仅登记字体QQ"], [])
 check("正文读不出字体名时退回 fontTable（免得不吭声）",

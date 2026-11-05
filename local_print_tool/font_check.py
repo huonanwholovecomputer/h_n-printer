@@ -71,6 +71,14 @@ _ALWAYS_OK = {
     "calibri", "cambria", "segoeui", "tahoma", "verdana", "georgia",
 }
 
+# Word/Microsoft 365 **自带但不进系统字体表**的字族（云端字体，按需下载到 Office 私有缓存）。
+# 系统字体枚举（GDI + 注册表）看不见它们，但 Word 自己拿得到 —— 实测 Word 转出的 PDF
+# 里确实嵌了 Aptos 字形，版式不受影响。不豁免就会变成「每个用新模板的 docx 都报缺字体」。
+# 2026-11-04 现场：三页文档测试.docx（Office 365 新默认主题）被报「本机没装 Aptos / Aptos Display」。
+_WORD_CLOUD_FAMILIES = (
+    "aptos",  # 2023 起 Word 的默认正文/标题西文字体（替代 Calibri），含 Display/Mono/Serif/Narrow
+)
+
 _JUNK_NAMES = {"", "-", "unknown", "default", "normal", "(未设置)", "none", "auto"}
 
 # 语言标签误命中：`<w:lang w:eastAsia="zh-CN"/>` 也会被 w:eastAsia 正则抓到，必须剔掉
@@ -296,18 +304,23 @@ def is_installed(name: str) -> bool:
     return not _missing_key(_norm(name))
 
 
+def _is_word_cloud(key: str) -> bool:
+    """Word 自带（云端/私有）字族：系统字体表里查不到，但 Word 一定拿得到（见 _WORD_CLOUD_FAMILIES）。"""
+    return any(key == p or key.startswith(p) for p in _WORD_CLOUD_FAMILIES)
+
+
 def _missing_key(key: str) -> bool:
     """归一 key 是否算"本机缺"。
 
     家族名已装时，「家族名 + 字重」（等线 Light / 方正黑体_GBK Bold / Segoe UI Light）按
     有字重处理 —— Word 会拿同族渲染，版式一致；否则中文 Word 文档几乎人人弹「缺 等线 Light」。
     """
-    if not key or key in _installed_norm() or key in _ALWAYS_OK:
+    if not key or key in _installed_norm() or key in _ALWAYS_OK or _is_word_cloud(key):
         return False
     for tail in _STYLE_TAILS:
         if key.endswith(tail) and len(key) > len(tail):
             base = key[:-len(tail)].strip()
-            if base and (base in _installed_norm() or base in _ALWAYS_OK):
+            if base and (base in _installed_norm() or base in _ALWAYS_OK or _is_word_cloud(base)):
                 return False
     return True
 
@@ -343,6 +356,15 @@ _BODY_PARTS = ("document.xml", "header", "footer", "footnotes.xml", "endnotes.xm
                "comments.xml", "numbering.xml")
 _MAX_XML_BYTES = 64 * 1024 * 1024
 _STYLE_HOPS = 8
+
+# 主题字体引用：`w:asciiTheme="minorHAnsi"` —— 不是字体名，真名在 word/theme/theme1.xml 里
+_THEME_ATTR_RE = re.compile(
+    r"""w:(?:asciiTheme|hAnsiTheme|eastAsiaTheme|cstheme)\s*=\s*["']([^"']{1,40})["']""")
+# Word 的主题 token → theme1.xml 里的槽位
+_THEME_ROLE = {
+    "majorascii": "mj-lt", "majorhansi": "mj-lt", "majoreastasia": "mj-ea", "majorbidi": "mj-cs",
+    "minorascii": "mn-lt", "minorhansi": "mn-lt", "minoreastasia": "mn-ea", "minorbidi": "mn-cs",
+}
 
 
 def _docx_part_names(zf: zipfile.ZipFile, include_styles: bool) -> list[str]:
@@ -393,22 +415,81 @@ def _docx_style_fonts(styles_xml: str, used_ids: set[str]) -> list[str]:
     return out
 
 
+def _docx_style_theme_tokens(styles_xml: str, used_ids: set[str]) -> list[str]:
+    """样式里**真正会被用到**的主题字体引用（`docDefaults` + 点名的样式，沿 basedOn 链）。
+
+    不能整份 styles.xml 抓：模板里「标题 1」等样式常年写着 `majorHAnsi`，正文没用过它，
+    抓进来就会把 Aptos Display 算成正文用到的字体（2026-11-04 现场那份 docx 就是这样）。
+    """
+    if not styles_xml:
+        return []
+    out: list[str] = []
+    dd = _DOCDEFAULT_RE.search(styles_xml)
+    if dd:
+        out.extend(_THEME_ATTR_RE.findall(dd.group(0)))
+    if not used_ids:
+        return out
+    blocks: dict[str, tuple[str, str]] = {}
+    for attrs, body in _STYLE_BLOCK_RE.findall(styles_xml):
+        mid = _STYLE_ID_RE.search(attrs)
+        if not mid:
+            continue
+        based = _BASED_RE.search(body)
+        blocks[mid.group(1)] = (body, based.group(1) if based else "")
+    for sid in used_ids:
+        name, hops = sid, 0
+        while name and hops < _STYLE_HOPS:
+            body, parent = blocks.get(name, ("", ""))
+            if body:
+                toks = _THEME_ATTR_RE.findall(body)
+                if toks:
+                    out.extend(toks)
+                    break
+            name, hops = parent, hops + 1
+    return out
+
+
+def _theme_font_map(theme_xml: str) -> dict[str, str]:
+    """`word/theme/theme1.xml` → {"mj-lt": "Aptos Display", "mn-lt": "Aptos", "mn-ea": "等线", …}。
+
+    `typeface` 为空表示「跟随系统默认」（Word 里 East Asian 主题常年是空的），
+    这种槽位不进表 —— 拿空字符串去比对系统字体表只会得出个假结论。
+    """
+    out: dict[str, str] = {}
+    if not theme_xml:
+        return out
+    for kind, block in re.findall(r"<a:(majorFont|minorFont)>(.*?)</a:\1>", theme_xml, re.S):
+        prefix = "mj" if kind == "majorFont" else "mn"
+        for tag, slot in (("latin", "lt"), ("ea", "ea"), ("cs", "cs")):
+            m = re.search(rf"<a:{tag}\b[^>]*\btypeface=\"([^\"]*)\"", block)
+            if m and m.group(1).strip():
+                out[f"{prefix}-{slot}"] = m.group(1).strip()
+    return out
+
+
 def fonts_in_docx(path: str) -> tuple[list[str], bool]:
     """返回 (用到的字体名列表, 是否解析成功)。
 
-    口径（2026-11-01 修正）：**只认正文里真正落字的字体引用** ——
+    口径（2026-11-01 修正，2026-11-04 补主题字体）：**只认正文里真正落字的字体引用** ——
       · 正文/页眉页脚/脚注/尾注的 `w:rFonts`；
       · 这些部件点名用到的样式（`w:pStyle` / `w:rStyle` / `w:tblStyle`）沿 `basedOn` 链的 `w:rFonts`；
-      · `docDefaults` 里写死（不是 `*Theme` 主题引用）的默认字体。
-    `word/fontTable.xml` **一律不当用法**：Word 从模板起稿时会把主题字体整套登记进去
+      · `docDefaults` / 样式里的 `w:asciiTheme` 这类**主题引用**（按 `theme1.xml` 换成真名）；
+      · `docDefaults` 里写死的默认字体。
+    `word/fontTable.xml` **只当最后兜底**：Word 从模板起稿时会把主题字体整套登记进去
     （Aptos / Aptos Display / 等线 / Calibri…），正文压根没用过 —— 2026-11-01 现场就是
-    正文只有宋体/楷体，却被报「本机没装 Aptos」。只有正文一个字体名都读不出来（空文档、
-    纯图片、域代码生成）时才退回 fontTable，免得彻底不吭声。
+    正文只有宋体/楷体，却被报「本机没装 Aptos」。
+
+    2026-11-04 现场（三页文档测试.docx，Office 365 新模板）：正文/样式一个显式字体名都没有，
+    全靠 `w:asciiTheme="minorHAnsi"` ⇒ 老逻辑「读不出名字」直接退回整张 fontTable，
+    把从没用过的 Aptos Display / Arial / Times New Roman 一起报成缺。现在先解析主题，
+    查不到真名才退回 fontTable，免得把模板登记的无关字体当成正文用法。
     """
     explicit: list[str] = []
     style_fonts: list[str] = []
     used_ids: set[str] = set()
     ft_fonts: list[str] = []
+    theme_tokens: list[str] = []
+    theme_xml = ""
     try:
         with zipfile.ZipFile(path) as zf:
             names = set(i.filename for i in zf.infolist())
@@ -426,6 +507,7 @@ def fonts_in_docx(path: str) -> tuple[list[str], bool]:
                 except (KeyError, OSError, zipfile.BadZipFile):
                     continue
                 explicit.extend(_RFONT_RE.findall(text))
+                theme_tokens.extend(_THEME_ATTR_RE.findall(text))
                 used_ids.update(_USED_STYLE_RE.findall(text))
             if "word/styles.xml" in names:
                 try:
@@ -434,9 +516,15 @@ def fonts_in_docx(path: str) -> tuple[list[str], bool]:
                     st = ""
                 if st:
                     style_fonts = _docx_style_fonts(st, used_ids)
+                    theme_tokens.extend(_docx_style_theme_tokens(st, used_ids))
                     dd = _DOCDEFAULT_RE.search(st)
                     if dd:
                         style_fonts.extend(_RFONT_RE.findall(dd.group(0)))
+            if "word/theme/theme1.xml" in names:
+                try:
+                    theme_xml = zf.read("word/theme/theme1.xml").decode("utf-8", "ignore")
+                except (KeyError, OSError, zipfile.BadZipFile):
+                    theme_xml = ""
             if "word/fontTable.xml" in names:
                 try:
                     ft_fonts = _FONTNAME_RE.findall(
@@ -446,10 +534,21 @@ def fonts_in_docx(path: str) -> tuple[list[str], bool]:
     except (zipfile.BadZipFile, OSError) as e:
         logger.debug(f"docx 字体解析失败: {path} ({e})")
         return [], False
+    # 主题引用 → 真字体名（同一批 token 只查一次；未解析到的 token 直接丢掉）
+    theme_fonts: list[str] = []
+    if theme_tokens:
+        tmap = _theme_font_map(theme_xml)
+        for tok in theme_tokens:
+            slot = _THEME_ROLE.get(tok.strip().lower())
+            if slot and tmap.get(slot):
+                theme_fonts.append(tmap[slot])
     # 在这里就把非字体名滤掉，别留到 missing_fonts 再滤：
     # `<w:lang w:eastAsia="zh-CN"/>` 和 `<w:rFonts .../>` 是同族属性，正则会把语言标签一起抓出来；
     # 让它漏进返回值，界面/日志上就会显示「用到的字体：zh-CN」这种鬼东西。
     used = [n for n in explicit + style_fonts if _is_real_font(n)]
+    if not used:
+        # 整篇靠主题字体排（Office 365 新模板默认就是这种）：只有这时候才轮到主题真名
+        used = [n for n in theme_fonts if _is_real_font(n)]
     if not used:
         used = [n for n in ft_fonts if _is_real_font(n)]
     return list(dict.fromkeys(used)), True
