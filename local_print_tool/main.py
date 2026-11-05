@@ -304,6 +304,19 @@ def main():
     missing = check_dependencies()
     app = QApplication(sys.argv)
 
+    # ── Qt 自带文案中文化（确认框的 Yes/No/Cancel、标准按钮、右键菜单、补录框）──
+    # 必须在建任何 QWidget 之前装：Qt 在控件构造时就取了翻译，晚装不会重译已建好的控件。
+    # 详见 i18n_zh.py（qtbase_zh_CN 由 PySide6 自带，PyInstaller 的 Qt hook 会一起打进包）。
+    try:
+        from i18n_zh import install_qt_chinese
+
+        if install_qt_chinese(app):
+            logger.info("已加载 Qt 简体中文翻译（确认框按钮为中文）")
+        else:
+            logger.warning("未找到 Qt 中文翻译文件：确认框按钮可能仍是英文")
+    except Exception as e:
+        logger.warning(f"安装 Qt 简体中文翻译失败（确认框按钮可能仍是英文）: {e}")
+
     # 安装 Qt 消息过滤器，屏蔽已知无害警告
     global _qt_default_handler
     _qt_default_handler = qInstallMessageHandler(_qt_message_filter)
