@@ -314,9 +314,16 @@ check("gui.py 打印兜底转换：按 job.task_id 判定云端来源后传 from
                          r"\s*getattr\(job,\s*\"uploader_is_admin\",\s*False\)\)",
                          GUI_SRC, re.S)))
 
+# 语义：本地添加/打印这两条路必须**不**传云端开关。2026-11 起该调用多了 tab_key 参数
+# （转换结果要回到发起转换的那个标签页），所以判据改成"抓到这次调用、且里面没有云端关键字"，
+# 而不是钉死整行字面量 —— 否则加一个无关关键字参数就会假红。
+_local_calls = re.findall(
+    r"self\._start_convert_worker\(\s*i,\s*job\.file_path,\s*job\.engine\b([^)]*)\)",
+    GUI_SRC)
 check("gui.py 本地添加文件路径**不传** from_cloud（保持本地语义）",
-      bool(re.search(r"self\._start_convert_worker\(i,\s*job\.file_path,\s*job\.engine\)\s*$",
-                     GUI_SRC, re.M)))
+      bool(_local_calls) and all(("from_cloud" not in t and "allow_cloud_com" not in t)
+                                 for t in _local_calls),
+      f"calls={_local_calls}")
 
 
 # ============================================================

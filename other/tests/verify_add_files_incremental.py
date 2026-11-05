@@ -61,11 +61,13 @@ win = gui.MainWindow(config_path=paths.config_path())
 # 桩：记录每次被要求预转换的行号（不真正转换）
 calls = []          # 当前小节用（会被 clear）
 total_calls = []    # 全流程累计，用于"没有任何行被处理两次"的整表判据
+tab_keys = []       # 2026-11：添加文件时必须显式带 tab_key（转换结果要回到发起的那一页）
 
 
-def _stub(row, file_path, engine="word"):
+def _stub(row, file_path, engine="word", tab_key="", **kw):
     calls.append(row)
     total_calls.append(row)
+    tab_keys.append(tab_key)
 
 
 win._start_convert_worker = _stub
@@ -81,6 +83,11 @@ check("累计触发次数 == 新增文件数（4）", len(calls) == 4,
 check("没有任何一行被重复预转换（O(n²) 的直接判据）",
       len(calls) == len(set(calls)), f"重复行={[r for r in calls if calls.count(r) > 1]}")
 check("被转换的正是 4 个新增行 0,1,2,3", sorted(calls) == [0, 1, 2, 3], f"{sorted(calls)}")
+# 2026-11：`_add_files_to_table` 必须把「发起转换时所在标签页」传给 worker，不能留空让
+# 回调时再去取"当前前台页"（切页/新建页会把晚到的结果丢到别的页，见
+# verify_convert_robustness.py ①）。
+check("预转换带了 tab_key（不是空串）", all(t == win._current_tab for t in tab_keys),
+      f"tab_keys={tab_keys} cur={win._current_tab}")
 
 print("\n=== 2. 只增不重：再加 1 个文件后，旧行不再被碰 ===")
 calls.clear()

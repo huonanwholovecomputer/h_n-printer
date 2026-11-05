@@ -131,6 +131,35 @@ SCHEDULED_SELF_HEAL_S = 30
 # 取号慢不该拦住出纸。⚠ 别调回 30：这是现场"卡 30 秒不打印"的直接原因。
 ORDER_NUMBER_WAIT_S = 4
 
+# 同时进行的 PDF 转换线程上限（2026-11 现场：一次拖入 28 个文件 = 28 个 Word 实例一起跑）。
+# 每个 .doc/.docx 转换都会拉起一个自己的 WINWORD.EXE（converter 用 DispatchEx 私有实例），
+# 并发一多就抢内存、抢字体缓存、抢 Normal.dotm，个别文件能卡几十秒甚至直接失败 ——
+# 现场表现就是"转换完成了但那一行的页数一直没补上"。Word 本来就是串行干活的，
+# 限成小并发 + 排队，总耗时几乎不变，稳定性差很多。见 `_convert_slots()`。
+CONVERT_CONCURRENCY = 3
+
+# 「这次转换是被取消的」哨兵页数（2026-11）。取消 != 失败：取消不该在日志里留「转换失败」，
+# 也不该触发自动重试 —— 用户在清空标签页/退出时取消的转换会有几十个，别自己刷自己。
+# ConvertWorker 用 -1 报告取消，`_on_convert_finished` 见到就静默返回。
+CONVERT_CANCELLED = -1
+
+# 转换并发闸门（进程内所有 ConvertWorker 共用一个）。懒建是为了让验收脚本能用
+# 环境变量 HN_CONVERT_CONCURRENCY 把上限调小来验证"确实限住了"。
+_CONVERT_SLOTS: "threading.Semaphore | None" = None
+
+
+def _convert_slots() -> threading.Semaphore:
+    """取（必要时创建）全局转换并发闸门。上限 = HN_CONVERT_CONCURRENCY（1~8）或 CONVERT_CONCURRENCY。"""
+    global _CONVERT_SLOTS
+    if _CONVERT_SLOTS is None:
+        n = CONVERT_CONCURRENCY
+        try:
+            n = max(1, min(8, int(os.environ.get("HN_CONVERT_CONCURRENCY") or n)))
+        except (TypeError, ValueError):
+            pass
+        _CONVERT_SLOTS = threading.Semaphore(n)
+    return _CONVERT_SLOTS
+
 # 无障碍自动打印的防抖窗口（毫秒）。同一订单的文件是**逐个下载完成**推送的，间隔可达数秒；
 # 原来的 3000ms 会被"击穿"——每批先到的文件立即被当成整单处理并把队列 pop 清空
 # （🔴-B4-2 现场实测：订单 #535 的 11 个文件分 7 批打印、同一订单号被上报 4 次）。
@@ -4812,6 +4841,25 @@ class ConvertWorker(QThread):
         self._cancelled = True
 
     def run(self):
+        """线程入口：先排队抢一个转换槽位，再真正转换（并发上限见 `_convert_slots()`）。
+
+        2026-11 现场（一次拖入 28 个文件）：改动前 28 个 worker 同时各拉一个
+        WINWORD.EXE，个别文件转换卡住/失败 ⇒ 那一行的页数永远补不上。限并发后
+        排队等槽位的线程仍可协作式取消（不会把"清空标签页"卡住 2 秒以上）。"""
+        if self._cancelled:
+            self.finished.emit(self._row, self._file_path, "", CONVERT_CANCELLED, "")
+            return
+        slot = _convert_slots()
+        while not slot.acquire(timeout=0.1):
+            if self._cancelled:
+                self.finished.emit(self._row, self._file_path, "", CONVERT_CANCELLED, "")
+                return
+        try:
+            self._run_convert()
+        finally:
+            slot.release()
+
+    def _run_convert(self):
         from converter import _convert_via_word_com, _convert_via_wps_com, get_converter
         from pdf_printer import get_pdf_info
         import paths as _paths
@@ -4823,7 +4871,7 @@ class ConvertWorker(QThread):
         try:
             ext = os.path.splitext(self._file_path)[1].lower()
             if self._cancelled:
-                self.finished.emit(self._row, self._file_path, "", 0, "")
+                self.finished.emit(self._row, self._file_path, "", CONVERT_CANCELLED, "")
                 return
             if ext in (".xls", ".xlsx"):
                 # 2026-11-02：表格交给 Excel/WPS 自己排版（Worksheet.ExportAsFixedFormat），
@@ -4893,6 +4941,10 @@ class ConvertWorker(QThread):
                                              allow_cloud_com=self._allow_cloud_com)
         except Exception:
             # Word/WPS 引擎失败，降级到 LibreOffice
+            # 2026-11：这条降级以前是**完全静默**的，失败只体现在界面上那个 "?" ——
+            # 现场出了问题连日志都查不到。现在两级失败都留痕。
+            logger.warning("PDF 转换失败，降级 LibreOffice：%s",
+                           os.path.basename(self._file_path), exc_info=True)
             if (ext in (".doc", ".docx") and self._engine != "libreoffice"
                     and (not self._from_cloud or self._allow_cloud_com)):
                 try:
@@ -4905,16 +4957,28 @@ class ConvertWorker(QThread):
                     temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud,
                                                  allow_cloud_com=self._allow_cloud_com)
                 except Exception:
+                    logger.warning("PDF 转换彻底失败：%s",
+                                   os.path.basename(self._file_path), exc_info=True)
                     self.finished.emit(self._row, self._file_path, "", 0, "")
                     return
             else:
+                logger.warning("PDF 转换彻底失败：%s",
+                               os.path.basename(self._file_path), exc_info=True)
                 self.finished.emit(self._row, self._file_path, "", 0, "")
                 return
         if self._cancelled:
-            self.finished.emit(self._row, self._file_path, "", 0, "")
+            self.finished.emit(self._row, self._file_path, "", CONVERT_CANCELLED, "")
             return
 
-        info = get_pdf_info(temp_pdf)
+        # 2026-11：这一步以前在 try 之外 —— 它一抛异常，run() 就直接炸掉，
+        # `finished` 永不 emit ⇒ 那一行永远停在 "?"，而且连线程异常都没有日志。
+        try:
+            info = get_pdf_info(temp_pdf)
+        except Exception:
+            logger.warning("PDF 已转换但读不出页数：%s",
+                           os.path.basename(self._file_path), exc_info=True)
+            self.finished.emit(self._row, self._file_path, "", 0, "")
+            return
         self.finished.emit(self._row, self._file_path, temp_pdf, info["page_count"], info["orientation"])
 
 
@@ -8142,6 +8206,8 @@ class MainWindow(QMainWindow):
         self._copy_total_timer.timeout.connect(self._reset_copy_button)
         total_row.addWidget(self._copy_total_btn)
         self._convert_workers: list[ConvertWorker] = []
+        # 每个 file_path 的自动重试次数（2026-11，见 _schedule_convert_retry）
+        self._convert_retries: dict[str, int] = {}
         self._copy_detail_btn = QPushButton("📋 复制计费明细")
         self._copy_detail_btn.setVisible(False)
         self._copy_detail_btn.clicked.connect(self._on_copy_detail)
@@ -12068,6 +12134,12 @@ class MainWindow(QMainWindow):
         tab_key（2026-12）：目标标签页（无障碍后台创建时定位 job；空 = 当前前台标签页）。
         from_cloud（S1-04）：云端任务 ⇒ Office 文档强制 LibreOffice，不走 Word/WPS COM。
         allow_cloud_com（2026-10-26 隐式规则）：仅「管理员自打 + 管理员上传」才 True。"""
+        # 2026-11：**在这里就把目标标签页钉死**。以前空 tab_key 的含义是"等回调时再取当前
+        # 前台标签页"，于是用户只要在转换途中切页或点「＋ 新建标签页」（现场 21:33:12 就干了），
+        # 晚到的结果就会按**别的标签页**去找行：找不到 ⇒ 静默丢弃 + 删掉刚转好的 PDF ⇒
+        # 原来那一行的页数永远停在 "?"。转换属于"发起它的那个标签页"，取页时机不能延后。
+        # （other/tests/verify_convert_robustness.py 数字：改动前 13 个文件全丢、缓存全删。）
+        tab_key = tab_key or self._current_tab
         # 计算源文件 MD5 并检查 PDF 缓存
         source_md5 = ""
         image_orientation = "auto"
@@ -12198,6 +12270,56 @@ class MainWindow(QMainWindow):
                     if not w.wait(2000):
                         w.terminate()
                         w.wait(100)
+
+    def _schedule_convert_retry(self, file_path: str, tab_key: str = "",
+                                delay_ms: int = 1500) -> bool:
+        """转换失败后自动重试一次（2026-11）。
+
+        为什么要重试：批量添加时多个 Word 实例同时抢内存/字体缓存/Normal.dotm，
+        个别文件会瞬时失败 —— 同样的文件单独转一次就成功。改动前这种失败在界面上
+        只是留一个 "?"，操作员只能手工重加，日志里还查不到原因。
+
+        约束：同一路径**最多重试 1 次**（`self._convert_retries` 计数，进程内），
+        免得真正损坏的文件把界面拖进无限重转；打印进行中不重试（别跟打印抢 Word）；
+        重试前再确认这一行还在、页数仍然未知。返回是否排上了定时器。
+        """
+        if not file_path:
+            return False
+        _key = os.path.normcase(os.path.abspath(file_path))
+        if self._convert_retries.get(_key, 0) >= 1:
+            return False
+        self._convert_retries[_key] = self._convert_retries.get(_key, 0) + 1
+        _tk = tab_key or self._current_tab
+        _max_defer = 20          # 打印中最多让路 20 次（×1.5s ≈ 30s），之后记一条日志放弃
+
+        def _do(attempt: int = 1):
+            try:
+                if self._worker is not None and self._worker.isRunning():
+                    # 打印中先让路：重试要起 Word，别跟正在出纸的作业抢引擎。
+                    # 以前这里直接 return，等于把这次重试**静默丢掉**（页数就永远 "?"）。
+                    if attempt < _max_defer:
+                        QTimer.singleShot(delay_ms, lambda: _do(attempt + 1))
+                    else:
+                        self._log(f"⚠ 打印占用转换引擎，已跳过重试："
+                                  f"{os.path.basename(file_path)}（页数仍未知，可右键重新转换）")
+                    return
+                jobs = self._tab_jobs(_tk)
+            except Exception:
+                return
+            for i, j in enumerate(jobs):
+                try:
+                    if os.path.normcase(os.path.abspath(j.file_path or "")) != _key:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if int(j.page_count or 0) > 0:
+                    return          # 已经被别的路径补上了
+                self._log(f"🔁 重试转换：{os.path.basename(j.file_path)}")
+                self._start_convert_worker(i, j.file_path, j.engine, tab_key=_tk)
+                return
+
+        QTimer.singleShot(delay_ms, _do)
+        return True
 
     def _force_reconvert_rows(self, rows) -> int:
         """右键「🔄 重新转换」：丢掉转换缓存 + 重新枚举本机字体 + 强制重转 PDF 并重查字体。
@@ -18376,8 +18498,14 @@ class MainWindow(QMainWindow):
         """后台 PDF 转换完成 → 按 file_path 匹配行并更新标签页数据、表格。
 
         多文件订单并发转换时行号可能错位，统一按 file_path 找行：
-        row 处恰好匹配直接回写，否则扫描全部 job；找不到（文件已被删除）→ 丢弃结果只清理旧缓存。
+        row 处恰好匹配直接回写，否则扫描全部 job；找不到（文件已被删除）→ 丢弃结果并留日志。
         tab_key（2026-12）：目标标签页（无障碍后台创建时定位；空 = 当前前台标签页）。"""
+        tab_key = tab_key or self._current_tab
+        # 取消 ≠ 失败（2026-11）：清空标签页/退出时会一次性取消几十个 worker，它们都用
+        # CONVERT_CANCELLED 报告。这种结果既不该留「转换失败」日志，也不该触发重试 ——
+        # 行通常已经不在了，安静收场即可。
+        if page_count == CONVERT_CANCELLED:
+            return
         # 按 file_path 匹配行
         jobs = self._tab_jobs(tab_key)
         target_row = None
@@ -18389,16 +18517,34 @@ class MainWindow(QMainWindow):
                     target_row = i
                     break
         if target_row is None:
-            # 文件已被删除 → 丢弃转换结果，仅清理产生的缓存文件
+            # 文件已被删除（或结果落到了别的标签页）→ 丢弃这次结果。
+            # 2026-11：以前这里是**完全静默**的，还会把刚转好的 PDF 删掉 —— 现场"页数一直
+            # 不更新"就查无实据。现在留一条日志；只有临时文件才删，pdf_cache 里的产物留着
+            # （下次加同一个文件还能命中，删了等于白转一次）。
+            self._log(f"⚠ 转换结果无对应行，已忽略：{os.path.basename(file_path or '')}"
+                      f"（标签页 {tab_key}）")
             if cached_pdf and os.path.isfile(cached_pdf):
+                _in_cache = False
                 try:
-                    os.remove(cached_pdf)
-                except OSError:
-                    pass
+                    import paths as _paths_c
+                    _in_cache = os.path.dirname(os.path.abspath(cached_pdf)).lower() == \
+                        os.path.abspath(_paths_c.pdf_cache_dir()).lower()
+                except Exception:
+                    _in_cache = False
+                if not _in_cache:
+                    try:
+                        os.remove(cached_pdf)
+                    except OSError:
+                        pass
             return
         if not cached_pdf:
             if (not tab_key or tab_key == self._current_tab) and target_row < self._table.rowCount():
                 self._table.item(target_row, self.COL_PAGES).setText("?")
+            # 2026-11：失败以前只体现成界面上一个 "?"，日志里一个字都没有。
+            # 现在留痕 + 一次自动重试（多数失败是并发抢 Word 进程导致的瞬时失败）。
+            self._log(f"⚠ 转换失败，页数未知：{os.path.basename(file_path or '')}"
+                      f"（稍后自动重试一次）")
+            self._schedule_convert_retry(file_path, tab_key)
             return
 
         jobs = self._tab_jobs(tab_key)
@@ -19095,4 +19241,6 @@ class MainWindow(QMainWindow):
                 if ext != ".pdf":
                     # 所有非 PDF 文件都在添加时预转换为 PDF 并缓存（图片/TXT/Word 等）
                     # 这样崩溃恢复后即使源文件不可用，缓存 PDF 仍可用于打印
-                    self._start_convert_worker(i, job.file_path, job.engine)
+                    # tab_key 显式传当前页（2026-11）：转换结果必须回到"加文件的那个标签页"
+                    self._start_convert_worker(i, job.file_path, job.engine,
+                                               tab_key=self._current_tab)
