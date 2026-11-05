@@ -31,8 +31,10 @@ if _GEVENT:                                                    # pragma: no cove
             "HN_RUNTIME=gevent 但未安装 gevent：pip install -r requirements.txt") from _e
 
 import copy
+import glob
 import hashlib
 import hmac
+import io
 import json
 import logging
 import shutil
@@ -42,6 +44,7 @@ import string
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -1027,6 +1030,9 @@ def _purge_file_after_print(file_id):
     finally:
         conn.close()
 
+    # 2026-11：文件没了，预览缓存也不该留着（否则 uploads/previews 只增不减）
+    _drop_previews(file_id)
+
     if path and not shared:
         try:
             rel = os.path.relpath(path, UPLOAD_DIR)
@@ -1297,6 +1303,7 @@ def cleanup_expired_files():
         _ref_ids = path_refs.get(_norm_path) if _norm_path else None
         if _ref_ids and len(_ref_ids - {file_id}) > 0:
             conn.execute("UPDATE files SET path = '', size = 0 WHERE id = ?", (file_id,))
+            _drop_previews(file_id)
             _ref_ids.discard(file_id)
             deleted_count += 1
             shared_skipped += 1
@@ -1325,6 +1332,7 @@ def cleanup_expired_files():
 
         # 清空 files 表中的路径（保留记录本身，下轮清理时作为幽灵删除）
         conn.execute("UPDATE files SET path = '', size = 0 WHERE id = ?", (file_id,))
+        _drop_previews(file_id)
         deleted_count += 1
 
     conn.commit()
@@ -6882,7 +6890,7 @@ def list_my_files():
             "SELECT COUNT(*) FROM files WHERE openid = ? AND path != ''", (g.openid,)
         ).fetchone()[0]
         rows = conn.execute(
-            """SELECT id, original_name, size, created_at, page_count, retention_hours
+            """SELECT id, original_name, size, created_at, page_count, retention_hours, path
                FROM files WHERE openid = ? AND path != ''
                ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
             (g.openid, per_page, offset),
@@ -6910,8 +6918,23 @@ def list_my_files():
         # order_files.file_name（提交订单时客户端带上来的），按「该文件最近一次下单用过的
         # 名字」兜底；字段名仍叫 original_name，前端（小程序/APP）不用改。
         display_names = {}
+        # 2026-11「我的文件」详情页需求：每个文件要能显示「所属订单」。
+        # 取该文件**最近一次**被下单时用的订单（order_files.id 倒序第一条），
+        # 与 display_names 同一套口径（都是「最近一次下单」），前端不需要再查一次。
+        order_info = {}
         if ids:
             _ph2 = ",".join("?" for _ in ids)
+            for r in conn.execute(
+                f"SELECT of1.file_id AS fid, o.id AS oid, o.order_number AS onum "
+                f"FROM order_files of1 LEFT JOIN orders o ON o.id = of1.order_id "
+                f"WHERE of1.file_id IN ({_ph2}) ORDER BY of1.id DESC", tuple(ids),
+            ).fetchall():
+                _fid = r["fid"]
+                if _fid and _fid not in order_info:
+                    order_info[_fid] = {
+                        "order_id": int(r["oid"] or 0),
+                        "order_number": (r["onum"] or "").strip(),
+                    }
             for r in conn.execute(
                 f"SELECT file_id, file_name FROM order_files WHERE file_id IN ({_ph2}) "
                 f"AND file_name != '' ORDER BY id DESC", tuple(ids),
@@ -6960,6 +6983,14 @@ def list_my_files():
             "retention_label": retention_label,
             "auto_delete_at": auto_delete_at,
             "in_active_order": r["id"] in busy_ids,
+            # 2026-11：详情页需要「所属订单」与「预览图」两件事
+            "order_id": (order_info.get(r["id"]) or {}).get("order_id", 0),
+            "order_number": (order_info.get(r["id"]) or {}).get("order_number", ""),
+            "has_preview": _has_preview_for(r["original_name"] or r["path"] or ""),
+            # 前端（小程序 <image>/APP <img>）不能带 Authorization 头 ⇒ 预览鉴权支持 ?token=，
+            # 拼接方式是 `<base>/api/file_preview/<id>?token=<登录token>`，前端自己拼。
+            "preview_url": (f"/api/file_preview/{r['id']}"
+                            if _has_preview_for(r["original_name"] or r["path"] or "") else ""),
         })
     # S3-04：列表成功记一条（只记本页条数，不逐条记 file_id —— 否则一次列表放大 50 倍）
     _audit_file_access("list", "ok", openid=g.openid, actor="user", count=len(out))
@@ -6971,6 +7002,193 @@ def list_my_files():
         "per_page": per_page,
         "has_more": (page * per_page) < total,
     })
+
+
+# ==================== 文件预览图（2026-11「我的文件」详情页） ====================
+#
+# 需求（用户原话）：「云端保存该文件的 1024×1024 jpg 图片，需按需显示」。
+# 落地口径：
+#   · **懒生成**：第一次请求才渲染，结果落盘缓存到 `uploads/previews/<file_id>_<mtime>.jpg`，
+#     之后直接 send_file（不动原文件、不重复解码、mtime 变了自动换新文件）；
+#   · 只有**图片类 + PDF** 有预览图；doc/docx/xls/xlsx/ppt 等一律 `has_preview=False`，
+#     前端显示类型图标即可 —— 服务端没有 Office 渲染能力，也不该为此引入外来二进制；
+#   · PDF 光栅化按能力降级：PyMuPDF(fitz) → poppler 的 pdftoppm → 都没有就 415。
+#     前端收到 415 **静默退回图标**（预览图是锦上添花，不是错误弹窗）；
+#   · 鉴权：小程序的 <image src> 与 WebView 的 <img> 都带不了请求头 ⇒ 本端点接受
+#     `Authorization: Bearer` **或** `?token=`，校验走同一个 `_load_login_token`
+#     （撤销/过期/签名判据与 login_required 不分叉），并且**只放行属主或管理员**
+#     （与 `/api/file/<id>` 下载同口径）。
+PREVIEW_DIR = os.path.join(UPLOAD_DIR, "previews")
+PREVIEW_MAX_PX = 1024                      # 长边像素上限（需求写的就是 1024×1024）
+_PREVIEW_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")
+
+
+def _has_preview_for(name_or_path: str) -> bool:
+    """这个文件名/路径有没有可见预览图（图片类 + PDF）。"""
+    ext = os.path.splitext(str(name_or_path or ""))[1].lower()
+    return ext in _PREVIEW_IMAGE_EXTS or ext == ".pdf"
+
+
+def _openid_for_media() -> str:
+    """媒体端点（<image src> 用）的登录判定：请求头优先，其次 ?token=。
+
+    返回空串 = 未登录/凭证失效（过期、撤销、坏签名在这一层**不区分**，
+    与 login_required 一致：不外泄失败原因）。
+    """
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        token = (request.args.get("token") or request.args.get("access_token") or "").strip()
+    if not token:
+        return ""
+    try:
+        return _load_login_token(token)
+    except Exception:  # noqa: BLE001  任何凭证异常都当未登录
+        return ""
+
+
+def _preview_cache_path(file_id: str, mtime_token: str) -> str:
+    """缓存文件名：只留 id 的安全字符（防目录穿越），mtime 当版本号。"""
+    safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64] or "x"
+    safe_mt = re.sub(r"[^0-9]", "", str(mtime_token))[:20] or "0"
+    return os.path.join(PREVIEW_DIR, f"{safe_id}_{safe_mt}.jpg")
+
+
+def _flatten_to_rgb(im):
+    """任意模式（RGBA/LA/P/CMYK…）压成白底 RGB —— JPEG 存不了透明通道。"""
+    from PIL import Image, ImageOps            # 函数内导入：PIL 缺失不影响后端启动
+    im = ImageOps.exif_transpose(im)
+    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+        rgba = im.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
+    return im.convert("RGB")
+
+
+def _render_image_preview(src_path: str) -> bytes:
+    """图片 → 1024 以内 JPEG bytes。只缩不放（小图保持原样，避免糊）。"""
+    from PIL import Image
+    with Image.open(src_path) as im:
+        im = _flatten_to_rgb(im)
+        im.thumbnail((PREVIEW_MAX_PX, PREVIEW_MAX_PX), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=82, optimize=True)
+        return buf.getvalue()
+
+
+def _render_pdf_preview(src_path: str) -> bytes:
+    """PDF 第 1 页 → 1024 以内 JPEG bytes。能力降级：PyMuPDF → pdftoppm → 抛 RuntimeError。"""
+    try:
+        import fitz                            # PyMuPDF（可选依赖）
+    except ImportError:
+        fitz = None
+    if fitz is not None:
+        with fitz.open(src_path) as doc:
+            if doc.page_count <= 0:
+                raise RuntimeError("PDF 没有页面")
+            page = doc.load_page(0)
+            w = float(page.rect.width) or 1.0
+            h = float(page.rect.height) or 1.0
+            zoom = min(PREVIEW_MAX_PX / w, PREVIEW_MAX_PX / h, 4.0)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            return pix.tobytes("jpeg")
+    exe = shutil.which("pdftoppm")
+    if not exe:
+        raise RuntimeError("服务端没有 PDF 光栅化能力（缺 PyMuPDF 与 pdftoppm）")
+    tmpdir = tempfile.mkdtemp(prefix="hn_prev_")
+    try:
+        subprocess.run(
+            [exe, "-f", "1", "-l", "1", "-scale-to", str(PREVIEW_MAX_PX),
+             "-jpeg", "-singlefile", src_path, os.path.join(tmpdir, "page")],
+            timeout=60, check=False, capture_output=True)
+        hits = sorted(glob.glob(os.path.join(tmpdir, "page*.jpg")))
+        if not hits:
+            raise RuntimeError("pdftoppm 没有输出页面")
+        return _render_image_preview(hits[0])   # 再统一压到 1024 以内
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _drop_previews(file_id: str) -> None:
+    """删掉某个文件的全部预览缓存（文件被删除/过期清理时调用）。失败只打日志。"""
+    try:
+        safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64]
+        if not safe_id or not os.path.isdir(PREVIEW_DIR):
+            return
+        for p in glob.glob(os.path.join(PREVIEW_DIR, f"{safe_id}_*.jpg")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception as e:  # noqa: BLE001  清理失败不影响主流程
+        print(f"  [PREVIEW] 清理预览缓存失败 {file_id}: {e}")
+
+
+@app.route("/api/file_preview/<file_id>", methods=["GET"])
+def file_preview(file_id):
+    """文件预览图（≤1024×1024 JPEG）。见本节顶部的口径说明。
+
+    返回：
+      · 200 + image/jpeg —— 命中缓存或刚生成；
+      · 404 —— 文件不存在/已清理；
+      · 403 —— 不是你的文件（管理员可看）；
+      · 415 —— 该类型没有预览图 / 服务端渲染不了 PDF（前端静默退回图标）。
+    """
+    openid = _openid_for_media()
+    if not openid:
+        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, original_name, path, openid FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor="user")
+        return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
+    owner = str(row["openid"] or "")
+    if owner != openid and not is_admin(openid):
+        _audit_file_access("preview", "denied", file_id=file_id, openid=openid, actor="user")
+        return jsonify({"success": False, "message": "无权查看该文件"}), 403
+    rel_path = (row["path"] or "").strip()
+    src_path = os.path.join(UPLOAD_DIR, rel_path) if rel_path else ""
+    if not rel_path or not os.path.isfile(src_path):
+        _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor="user")
+        return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
+    display = row["original_name"] or src_path
+    if not _has_preview_for(display):
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
+                           ext=os.path.splitext(display)[1].lower().lstrip("."))
+        return jsonify({"success": False, "message": "该类型没有预览图"}), 415
+    try:
+        mtime_token = str(int(os.path.getmtime(src_path)))
+    except OSError:
+        mtime_token = "0"
+    cache_path = _preview_cache_path(file_id, mtime_token)
+    if os.path.isfile(cache_path):
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
+        return send_file(cache_path, mimetype="image/jpeg", max_age=86400, conditional=True)
+    ext = os.path.splitext(display)[1].lower()
+    try:
+        data = _render_pdf_preview(src_path) if ext == ".pdf" else _render_image_preview(src_path)
+    except Exception as e:  # noqa: BLE001  预览失败绝不 500
+        print(f"  [PREVIEW] 生成失败 file_id={file_id} ext={ext}: {e}")
+        data = None
+    if not data:
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
+                           ext=ext.lstrip("."))
+        return jsonify({"success": False, "message": "该文件暂时没有预览图"}), 415
+    try:
+        os.makedirs(PREVIEW_DIR, exist_ok=True)
+        with open(cache_path, "wb") as fh:
+            fh.write(data)
+    except OSError as e:
+        # 缓存写不进去也照样回图（磁盘满/权限问题时不让预览彻底不可用）
+        print(f"  [PREVIEW] 写缓存失败 {cache_path}: {e}")
+    _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
+    return send_file(io.BytesIO(data), mimetype="image/jpeg", max_age=86400)
 
 
 @app.route("/api/admin/file_audit", methods=["GET"])
