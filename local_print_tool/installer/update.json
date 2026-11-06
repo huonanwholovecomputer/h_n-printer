@@ -1,9 +1,9 @@
 {
-  "version": "4.6.6",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.6.exe",
-  "md5": "3f8e5f098593baa13c418709c45b3064",
-  "sha256": "d3e376d73c7a2ff5692f49551d004bf51599cb350a28d83f821cdba3ea572568",
-  "notes": "v4.6.6：① 右下角「📴 离线未同步」角标、文件菜单里的同一项、离线订单窗，现在会跟着同步结果立刻更新 —— 以前要等 60 秒定时器，手动点「重试」后也不必自己再刷新。② 图片在右侧面板改「图片方向」后，文件列表的「方向」列当场变成新方向，并按新方向重新生成 PDF（以前列表还写着旧方向、打印却是对的）；表格版式的「选定区域」「跟随默认」以及设置里的「默认任务参数」改动后同样会重新转换，页数与费用跟着更新。③ 表格文件新增「选定区域」打印：在「表格版式」里填 A1:F20 这类地址就只打这一块，源文件不会被改；任务面板、命令行与智能助手接口都支持。",
+  "version": "4.6.7",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.7.exe",
+  "md5": "c724bd748bb97a3d1ba60a9920c9dc03",
+  "sha256": "95cf2c410e3c8142daa29352752ef064f95239932879b25dd470cc9c77ae2c71",
+  "notes": "v4.6.7：修「选项 → 默认任务参数…」里那六格空白 —— 页边距（上、下、左、右）、页眉、页脚。数值一直都在、打印也一直按它生效，只是被主题样式压成了 1px 画不出来，看着像窗口卡死；右侧「表格版式」面板里同款的尺寸输入框、云任务列表的「自动关闭」时分框一并修好。这些数字框依旧不带上下箭头，滚轮也不会改数，其余功能不变。",
   "sig_algo": "ed25519",
-  "sig": "nSG4lRpNa3uvm021Rt4eUSr18eQDbVb5qa2iPLQAZa/pIAZugiie5owjW1E7bIZEPfvJp88nwS90snH5ozT+Cw=="
+  "sig": "YxBaVIs4Img5fvXMtFU6SMh9JFuhLafOQp93iArJ4SteRiBnAsQuhvVgPeeGoG7PEMT/ClupsBSshrbT/WsaBg=="
 }
