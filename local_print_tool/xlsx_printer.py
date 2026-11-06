@@ -29,8 +29,16 @@ Ctrl+P。所以默认**必须完全复现 Excel 自己的打印结果**，唯一
 不让它静默退化成 A4)、`orientation`(portrait/landscape)、
 `margin_top_cm`/`margin_bottom_cm`/`margin_left_cm`/`margin_right_cm`(cm，内部 ×72/2.54 转 pt)、
 `header_cm`/`footer_cm`、`center_h`/`center_v`(bool)、`fit`(none/sheet/cols/rows)、
-`scale`(10–400)、`print_range`(active/workbook/ignore_area；旧的 selection 已废弃、回退 active)、
+`scale`(10–400)、`print_range`(active/workbook/ignore_area/selection)、
+`selection`(选定区域的 A1 地址，可带工作表前缀，如 `A1:F20` / `Sheet1!A1:F20` /
+`'我的表'!A1:F20` / `A1:B2,D5:E9`；只在 `print_range="selection"` 时生效)、
 `worksheet`(要打印的工作表名；"" = 跟随文件上次保存的活动工作表)。
+
+`print_range="selection"` 由调用方**显式给出**区域地址（GUI 面板 / 小印智能助手）。
+Excel 的「选定区域」是会话内的临时状态、不存进文件，无人值守 COM 打开时拿不到——所以这里
+从 `selection` 键取值，写 `PageSetup.PrintArea`；地址为空/不合法时**不写 PrintArea**、
+记 warning 并把该项记为未生效（`options_honored=False`），绝不拿 UsedRange 顶替，也不清掉
+文件自带的打印区域。`selection` 里写明了工作表、`worksheet` 又没选时，按前者的表导出。
 `print_range="workbook"` 是唯一会用 `Workbook.ExportAsFixedFormat` 导全部工作表的取值
 （默认仍是「活动工作表」，见下）。
 
@@ -71,6 +79,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -352,10 +361,11 @@ FIT_MODES = ("none", "sheet", "cols", "rows")
 
 # 打印范围：active = 活动工作表（默认，与旧行为一致，尊重文件里已有的打印区域）；
 # workbook = 全部工作表；ignore_area = 清空 PrintArea（按已用区域整张打）。
-# 2026-11-03 删掉 "selection"：Excel 的「选定区域」是会话内的高亮选区、不存进文件，COM 无人
-# 值守打开时拿不到真实选区，旧实现是拿 UsedRange 顶替 ⇒ 效果等于 active，还会覆盖文件里
-# 自带的打印区域。老配置仍可能存着这个值，会在这里回退成 active（下面 normalize 的日志会写）。
-PRINT_RANGES = ("active", "workbook", "ignore_area")
+# selection = 只打 `selection` 给出的 A1 区域（地址由调用方显式提供，2026-11-06 由小印智能
+# 助手的需求重新加回）。注意：Excel 的「选定区域」是会话内状态、不存进文件，无人值守 COM
+# 拿不到；旧实现（2026-11-03 删除）是拿 UsedRange 顶替 ⇒ 等于 active 还覆盖文件打印区域。
+# 现在的契约是"地址必须由调用方给出"，拿不到就记未生效，绝不再猜。
+PRINT_RANGES = ("active", "workbook", "ignore_area", "selection")
 
 # cm → pt：PageSetup 的 *Margin 单位是磅，1 inch = 72 pt
 CM_TO_PT = 72.0 / 2.54
@@ -379,6 +389,7 @@ DEFAULT_PRINT_OPTIONS = {
     "fit": "cols",
     "scale": 100,
     "print_range": "active",
+    "selection": "",
     "worksheet": "",
 }
 
@@ -460,6 +471,71 @@ def _as_sheet_name(value) -> str:
     return value.strip()[:120]
 
 
+# 选定区域的 A1 地址：单元格 / 区域 / 整列 / 整行（可多段，逗号分隔）。
+# 不在这里校验行列上限（XFD / 1048576）：越界地址交给 Excel 自己拒绝并记「PrintArea 未生效」，
+# 这里只挡明显不是地址的字符串（如「选中区域」「C:\a.xlsx」「今天的数据」）。
+_ADDRESS_PART_RE = re.compile(
+    r"(?:"
+    r"\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?"   # A1 / A1:F20
+    r"|\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}"                  # A:F
+    r"|\$?\d+:\$?\d+"                                      # 1:20
+    r")"
+)
+
+
+def split_selection_ref(raw) -> tuple[str, str]:
+    """把「选定区域」拆成 `(工作表名, A1 地址)`；没有表名前缀时工作表名为 `""`。
+
+    支持名称框/文件里最常见的写法：`A1:F20`、`Sheet1!A1:F20`、`'我的 表'!A1:F20`、
+    `'[Book1.xlsx]Sheet1'!A1:F20`、`A1:B2,D5:E9`。表名里的 `''` 是 Excel 的转义写法
+    （真名含一个单引号）；`[...]` 前缀是「工作簿名」，不是表名，剥掉。
+    地址原样返回（含 `$`），是否合法由 `is_selection_address` 判。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return "", ""
+    sheet, sep, addr = text.rpartition("!")
+    if not sep:
+        return "", text
+    sheet = sheet.strip()
+    if len(sheet) >= 2 and sheet.startswith("'") and sheet.endswith("'"):
+        sheet = sheet[1:-1].replace("''", "'")
+    if sheet.startswith("[") and "]" in sheet:
+        sheet = sheet.split("]", 1)[1]
+    return sheet.strip(), addr.strip()
+
+
+def is_selection_address(raw) -> bool:
+    """`raw` 是否是合法的「选定区域」写法（可带表名前缀、可多段）。空串 ⇒ False。"""
+    _sheet, addr = split_selection_ref(raw)
+    if not addr:
+        return False
+    parts = [p.strip() for p in addr.split(",")]
+    return bool(parts) and all(p and _ADDRESS_PART_RE.fullmatch(p) for p in parts)
+
+
+def _as_selection(value) -> str:
+    """选定区域地址归一化：去空白、规整逗号/感叹号两侧空格、限长；**不校验合法性**。
+
+    不合法（或为空）时保留原样，让引擎在真正写 `PrintArea` 时记 warning + 该项未生效 ——
+    归一化阶段把值悄悄丢掉，用户只会看到"设了没反应"，这是本项目明令禁止的。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        logger.warning(f"print_options[selection]={value!r} 不是地址字符串，按未设置处理")
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s*,\s*", ",", text)
+    text = re.sub(r"\s*!\s*", "!", text)
+    if len(text) > 300:
+        logger.warning(f"print_options[selection] 超长（{len(text)} 字符），截断到 300")
+        text = text[:300].strip()
+    return text
+
+
 def normalize_print_options(print_options) -> dict | None:
     """把 `print_options` 归一化成一份可复现的字典；**None 原样返回 None**。
 
@@ -477,7 +553,7 @@ def normalize_print_options(print_options) -> dict | None:
     unknown = sorted(str(k) for k in raw if k not in known)
     if unknown:
         logger.debug(f"print_options 忽略未知键: {', '.join(unknown)}")
-    return {
+    norm = {
         "paper": _choice_name(raw.get("paper"), PAPER_SIZES, DEFAULT_PRINT_OPTIONS["paper"], "paper"),
         "orientation": _choice_name(raw.get("orientation"), ORIENTATIONS,
                                     DEFAULT_PRINT_OPTIONS["orientation"], "orientation"),
@@ -494,22 +570,32 @@ def normalize_print_options(print_options) -> dict | None:
         "scale": _as_scale(raw.get("scale")),
         "print_range": _choice_name(raw.get("print_range"), {k: k for k in PRINT_RANGES},
                                     DEFAULT_PRINT_OPTIONS["print_range"], "print_range"),
+        "selection": _as_selection(raw.get("selection")),
         "worksheet": _as_sheet_name(raw.get("worksheet")),
     }
+    if norm["print_range"] == "selection":
+        if not norm["selection"]:
+            logger.warning("print_options 打印范围选了「选定区域」但没给 selection 地址："
+                           "本次按文件已有打印区域导出，该设置记为未生效")
+        elif not is_selection_address(norm["selection"]):
+            logger.warning(f"print_options[selection]={norm['selection']!r} 不是合法的 A1 区域"
+                           "（例 A1:F20 / Sheet1!A1:F20 / A1:B2,D5:E9）：该项记为未生效")
+    return norm
 
 
 def options_signature(print_options) -> str:
     """选项签名的稳定短哈希（8 位十六进制）；None/空字典 ⇒ `""`（旧 key 形态）。
 
-    `worksheet` 为空（跟随活动工作表）时从签名里剔掉：这个键是后加的，剔掉才能让"从没选过
-    工作表"的任务缓存 key 与旧版逐字符相同 —— 升级不该让存量 PDF 缓存全部作废重转。
+    `worksheet` / `selection` 为空时从签名里剔掉：这两个键是后加的，剔掉才能让"从没选过
+    工作表/区域"的任务缓存 key 与旧版逐字符相同 —— 升级不该让存量 PDF 缓存全部作废重转。
     """
     if not print_options:
         return ""
     try:
         payload_options = print_options
-        if isinstance(print_options, dict) and not print_options.get("worksheet"):
-            payload_options = {k: v for k, v in print_options.items() if k != "worksheet"}
+        if isinstance(print_options, dict):
+            payload_options = {k: v for k, v in print_options.items()
+                               if not (k in ("worksheet", "selection") and not v)}
         payload = json.dumps(payload_options, sort_keys=True, ensure_ascii=False,
                              separators=(",", ":"))
     except (TypeError, ValueError):
@@ -529,6 +615,12 @@ def describe_print_options(options: dict | None) -> str:
     else:
         fit_text = {"sheet": "调整为 1 页宽×1 页高", "cols": "调整为 1 页宽",
                     "rows": "调整为 1 页高"}.get(str(fit), f"调整为 {fit}")
+    range_text = {"active": "活动表", "workbook": "整个工作簿",
+                  "ignore_area": "忽略打印区域（按已用区域）",
+                  "selection": "选定区域"}.get(str(options.get("print_range")),
+                                               str(options.get("print_range")))
+    if options.get("print_range") == "selection" and options.get("selection"):
+        range_text = f"{range_text} {options.get('selection')}"
     sheet_text = ""
     if options.get("worksheet"):
         sheet_text = f"，工作表「{options.get('worksheet')}」"
@@ -536,7 +628,7 @@ def describe_print_options(options: dict | None) -> str:
         f"{options.get('paper')} {orient}，边距 上/下 {options.get('margin_top_cm')!s}/"
         f"{options.get('margin_bottom_cm')!s}cm 左/右 {options.get('margin_left_cm')!s}/"
         f"{options.get('margin_right_cm')!s}cm，页眉/页脚 {options.get('header_cm')!s}/"
-        f"{options.get('footer_cm')!s}cm，{fit_text}，打印范围={options.get('print_range')}"
+        f"{options.get('footer_cm')!s}cm，{fit_text}，打印范围={range_text}"
         f"{sheet_text}"
     )
 
@@ -997,11 +1089,24 @@ def _apply_print_options_on_sheet(ws, options: dict, label: str = "") -> dict[st
         put("FitToPagesWide", 1 if fit in ("sheet", "cols") else False)
         put("FitToPagesTall", 1 if fit in ("sheet", "rows") else False)
 
-    # 打印区域：active/workbook 保持文件里已有的（尊重用户设置）；ignore_area 清空。
-    # （旧的 selection 分支已于 2026-11-03 删除：拿不到真实选区，它是用 UsedRange 顶替的。）
+    # 打印区域：active/workbook 保持文件里已有的（尊重用户设置）；ignore_area 清空；
+    # selection 写调用方给出的 A1 地址（地址为空/非法时**不写**，记本次未生效 ——
+    # 绝不拿 UsedRange 顶替、也不清掉文件自带的打印区域）。
     print_range = options["print_range"]
     if print_range == "ignore_area":
         put("PrintArea", "")
+    elif print_range == "selection":
+        _sel_sheet, area = split_selection_ref(options.get("selection"))
+        if not options.get("selection"):
+            applied["PrintArea"] = False
+            logger.warning(f"{label}: 打印范围选了「选定区域」，但没有区域地址，未写 PrintArea"
+                           "（仍按文件已有的打印区域导出）")
+        elif not is_selection_address(options.get("selection")):
+            applied["PrintArea"] = False
+            logger.warning(f"{label}: 选定区域 {options.get('selection')!r} 不是合法的 A1 区域，"
+                           "未写 PrintArea（仍按文件已有的打印区域导出）")
+        else:
+            put("PrintArea", area)
     return applied
 
 
@@ -1168,14 +1273,29 @@ def _export_with_com(engine: str, abs_src: str, abs_out: str,
         # ExportAsFixedFormat 都认"当前活动表"，切过去这两步才落到同一张表上。
         # 整簿导出时忽略该键（打全部表，切换哪张都没有意义）。
         target_ws = None
+        want_sheet = ""
         if options is not None and not whole_book:
-            target_ws, _activated = _select_worksheet(wb, options.get("worksheet"), label)
+            want_sheet = options.get("worksheet") or ""
+            # 「选定区域」可以自带表名前缀（Sheet1!A1:F20 / '我的表'!A1:F20）。工作表没选时
+            # 就用它；两边都写了又不一致时以工作表选择为准，但必须明确警告（不许悄悄二选一）。
+            if options.get("print_range") == "selection":
+                sel_sheet, _sel_addr = split_selection_ref(options.get("selection"))
+                if sel_sheet and not want_sheet:
+                    want_sheet = sel_sheet
+                    logger.info(f"{label}: 选定区域写明了工作表「{sel_sheet}」，按该表导出")
+                elif sel_sheet and want_sheet.strip().lower() != sel_sheet.strip().lower():
+                    logger.warning(
+                        f"{label}: 选定区域写的是「{sel_sheet}」表，但工作表选的是「{want_sheet}」；"
+                        f"按「{want_sheet}」导出，区域地址仍取选定区域（请把两处统一）")
+            target_ws, _activated = _select_worksheet(wb, want_sheet, label)
             if target_ws is not None:
                 ws = target_ws
                 try:
                     sheet_name = str(ws.Name)
                 except Exception:  # noqa: BLE001
-                    sheet_name = str(options.get("worksheet") or "")
+                    sheet_name = str(want_sheet or "")
+        elif whole_book and options is not None and options.get("selection"):
+            logger.warning(f"{label}: 打印范围是「整个工作簿」，选定区域 {options.get('selection')!r} 被忽略")
         if options is not None:
             logger.info(f"{label} 应用页面设置（只作用于临时副本）: {describe_print_options(options)}")
             options_applied = _apply_print_options(wb, options, label, target=target_ws)
@@ -1265,6 +1385,11 @@ def _export_with_libreoffice(abs_src: str, abs_out: str, print_options=None) -> 
             logger.warning(
                 f"LibreOffice 不支持指定工作表：本次仍导出全部工作表，"
                 f"「{options.get('worksheet')}」这个选择没有生效"
+                f" ({os.path.basename(abs_src)})")
+        if options.get("print_range") == "selection":
+            logger.warning(
+                f"LibreOffice 不支持「选定区域」：本次仍按文件已有打印区域导出，"
+                f"{options.get('selection')!r} 这个区域没有生效"
                 f" ({os.path.basename(abs_src)})")
     import converter  # noqa: PLC0415
     converter._convert_office_via_libreoffice(abs_src, abs_out)

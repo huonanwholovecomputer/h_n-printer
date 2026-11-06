@@ -4,8 +4,9 @@
 需求（用户 2026-11）：
 1. 选中表格（.xls/.xlsx）时，右侧「双面模式」下方出现新模块，上下各一条分隔线。
 2. 模块含：页边距（上/下/左/右 cm）、页眉/页脚 cm、纸张方向、纸张大小、水平/垂直居中、
-   缩放（无缩放 / 调整为一页 / 所有列一页 / 所有行一页 + 自定义百分比）、打印范围三档
-   （2026-11-03 去掉「选定区域」：Excel 的选区是会话内状态，COM 无人值守拿不到）。
+   缩放（无缩放 / 调整为一页 / 所有列一页 / 所有行一页 + 自定义百分比）、打印范围四档
+   （2026-11-06 按用户要求加回「选定区域」：Excel 的选区是会话内状态、无人值守 COM 拿不到，
+   所以地址由调用方显式给出 —— 面板输入框或小印接口 xlsx_options.selection）。
 3. 值存 `PrintJob.xlsx_options`（持久化、可复制）；面板只收集参数，转换时才传给引擎。
 4. 多选按**整片选区**规则启停：混合选区里只写表格任务；灰掉（冻结）时一律不写回。
 5. 传引擎的键名必须与 task-5 契约逐字一致（print_options）。
@@ -96,12 +97,11 @@ check("水平/垂直居中都是 ThemedCheckBox",
 check("缩放是四档下拉 + 自定义百分比输入",
       win._xlsx_fit.count() == 4 and win._xlsx_scale.minimum() == 10
       and win._xlsx_scale.maximum() == 400)
-check("打印范围三档（活动工作表/整个工作簿/忽略打印区域，选定区域已删）",
-      win._xlsx_range.count() == 3
+check("打印范围四档（活动工作表/整个工作簿/忽略打印区域/选定区域）",
+      win._xlsx_range.count() == 4
       and win._xlsx_range.itemText(0) == "活动工作表"
       and win._xlsx_range.itemText(2) == "忽略打印区域"
-      and "选定区域" not in [win._xlsx_range.itemText(i)
-                             for i in range(win._xlsx_range.count())])
+      and win._xlsx_range.itemText(3) == "选定区域")
 check("面板文案没有 markdown 星号",
       not any("**" in w.text() for w in win._xlsx_box.findChildren(_gui.QLabel))
       and not any("**" in w.toolTip() for w in win._xlsx_box.findChildren(_gui.QLabel)))
@@ -116,6 +116,20 @@ check("选中 pdf ⇒ 面板不出现", win._xlsx_panel_shown is False and win._
 win._table.selectRow(0)                     # xlsx
 win._on_table_selection()
 check("选中 xlsx ⇒ 面板出现", win._xlsx_panel_shown is True and not win._xlsx_box.isHidden())
+check("打印范围默认「活动工作表」⇒ 选定区域地址框置灰",
+      isinstance(win._xlsx_selection, _gui.QLineEdit)
+      and not win._xlsx_selection.isEnabled())
+win._xlsx_range.setCurrentText("选定区域")
+check("切到「选定区域」⇒ 地址框可填", win._xlsx_selection.isEnabled())
+check("切档立即写回任务（print_range=selection）",
+      tab.jobs[0].xlsx_options.get("print_range") == "selection")
+win._xlsx_selection.setText("A1:B2")
+win._xlsx_selection.editingFinished.emit()
+check("填地址（失焦提交）⇒ 写进 xlsx_options.selection",
+      (tab.jobs[0].xlsx_options or {}).get("selection") == "A1:B2")
+win._xlsx_range.setCurrentText("活动工作表")
+check("切回其它档 ⇒ selection 清空（别让残留地址进缓存 key）",
+      not (tab.jobs[0].xlsx_options or {}).get("selection"))
 win._clear_edit_panel()
 check("无选区 ⇒ 面板收起（不残留上一个任务的版式）",
       win._xlsx_panel_shown is False and win._xlsx_box.isHidden())
@@ -135,7 +149,7 @@ tab.jobs[0].cached_pdf = r"C:\cache\old.pdf"
 win._xlsx_margins["margin_top_cm"].setValue(2.5)
 opts = tab.jobs[0].xlsx_options
 check("改页边距 ⇒ 写进 xlsx_options", abs(opts.get("margin_top_cm", 0) - 2.5) < 1e-6, str(opts))
-check("写进去的正好是引擎认的那 13 个键", set(opts) == set(XLSX_OPTION_KEYS), str(sorted(opts)))
+check("写进去的正好是引擎认的那套键", set(opts) == set(XLSX_OPTION_KEYS), str(sorted(opts)))
 check("版式变了 ⇒ 旧缓存 PDF 作废（下次打印重转）", tab.jobs[0].cached_pdf == "",
       tab.jobs[0].cached_pdf)
 check("非表格任务没被牵连", tab.jobs[1].xlsx_options == {} and tab.jobs[2].xlsx_options == {})
@@ -218,20 +232,21 @@ check("引擎侧签名确实收 print_options（export_to_pdf / find_cached_pdf 
                                       encoding="utf-8").read())
 check("两处都没配过 ⇒ None ⇒ 引擎完全不碰版式（老用户行为不变）",
       resolve_xlsx_print_options({}, {}) is None)
-# 2026-11-03：删除「选定区域」这一档（见 RANGE_LABELS 上方注释）。老配置里残留的
-# "selection" 必须落成 active —— 绝不能掉到全局默认，否则默认设成「整个工作簿」的用户，
-# 老任务会突然变成导全部工作表（那正是删这一档想避免的"无声改行为"）。
-check("老配置 print_range=selection ⇒ 任务级归一成 active",
+# 2026-11-06：按用户要求把「选定区域」加回（小印智能助手给地址）。语义与 11-03 删它时
+# 不同：任务级 selection **不再被悄悄降级成 active** —— 地址缺失/写错时引擎会明确记
+# 「PrintArea 未生效」并保留文件原有打印区域，不会替用户拿 UsedRange 顶替。
+check("任务级 print_range=selection 原样保留（不再降级成 active）",
       (resolve_xlsx_print_options({}, {"print_range": "selection"}) or {})
-      .get("print_range") == "active",
+      .get("print_range") == "selection",
       str(resolve_xlsx_print_options({}, {"print_range": "selection"})))
-check("老配置 selection 也不会继承全局默认（默认=workbook 时仍落 active）",
-      (resolve_xlsx_print_options({"print_range": "workbook"},
-                                  {"print_range": "selection"}) or {})
-      .get("print_range") == "active")
-check("削掉一档后引擎端白名单同步（PRINT_RANGES 不含 selection）",
-      "selection" not in xp.PRINT_RANGES and "selection" not in
-      _gui.RANGE_VALUES, f"{xp.PRINT_RANGES} / {_gui.RANGE_VALUES}")
+check("带地址时地址原样进 print_options",
+      (resolve_xlsx_print_options({}, {"print_range": "selection",
+                                       "selection": "A1:F20"}) or {})
+      .get("selection") == "A1:F20")
+check("「选定区域」只在表格面板（全局默认参数仍是三档），引擎白名单同步",
+      "selection" in xp.PRINT_RANGES and "selection" not in _gui.RANGE_VALUES
+      and "selection" in _gui.XLSX_RANGE_VALUES
+      and "selection" in xp.DEFAULT_PRINT_OPTIONS)
 
 print("\n=== ⑨ 纯输入框 + 不再撑宽面板（2026-11-03 用户要求） ===")
 # 用户原话：「上下箭头删掉吧，纯输入框即可。以及注意表格版式（仅表格文件）这个模块的最小

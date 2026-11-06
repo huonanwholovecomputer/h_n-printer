@@ -81,6 +81,23 @@ def make_file(name, body=b"hello\n"):
     return path
 
 
+def make_xlsx(name, sheet_titles=("Sheet1",)):
+    """造一个真 .xlsx（助手接口只验参数落盘与校验，不真导 PDF）。"""
+    path = os.path.join(SRC, name)
+    try:
+        from openpyxl import Workbook
+        wb = Workbook()
+        wb.active.title = sheet_titles[0]
+        for title in sheet_titles[1:]:
+            wb.create_sheet(title)
+        wb.active["A1"] = "x"
+        wb.save(path)
+    except Exception:
+        with open(path, "wb") as f:
+            f.write(b"PK\x05\x06" + b"\x00" * 18)
+    return path
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # ① 传输层：真 HTTP 服务器 + 假 executor
 # ══════════════════════════════════════════════════════════════════════════
@@ -403,6 +420,70 @@ try:
     check("②o 重复添加同一文件被明确拒绝", False)
 except agent_api.AgentOpError as e:
     check("②o 重复添加同一文件被明确拒绝（rejected）", e.code == "rejected", e.message)
+
+# ── 表格版式（xlsx_options）：2026-11-06 起助手可以直接指定「选定区域」 ──
+# Excel 的选区是会话内状态、无人值守 COM 读不到，所以由调用方显式给地址；
+# 接口只负责落盘 + 校验，真正写 PageSetup.PrintArea 在 xlsx_printer 里（另有专项验收）。
+XLSX = make_xlsx("表格.xlsx", ("Sheet1", "Sheet2"))
+
+r = ops("files.add", {"tab": tab_key, "paths": [XLSX],
+                      "options": {"xlsx_options": {"print_range": "selection",
+                                                   "selection": "A1:F20"}}})
+xj = r["jobs"][0]
+xj_index = len(win._config.tabs[tab_key].jobs) - 1
+check("②p 表格文件可带 xlsx_options（选定区域 A1:F20）",
+      (xj.get("xlsx_options") or {}).get("print_range") == "selection"
+      and (xj.get("xlsx_options") or {}).get("selection") == "A1:F20",
+      json.dumps(xj, ensure_ascii=False)[:300])
+check("②p2 摘要回填真正生效的版式（selection 解析后能看到）",
+      (xj.get("xlsx_print_options") or {}).get("print_range") == "selection"
+      and (xj.get("xlsx_print_options") or {}).get("selection") == "A1:F20",
+      json.dumps(xj.get("xlsx_print_options"), ensure_ascii=False))
+check("②p3 版式不进页码范围（通用字段没被带偏）", xj.get("page_range") == "")
+
+# 改版式 ⇒ 旧 PDF 缓存必须作废（否则还打旧版式那份）
+win._config.tabs[tab_key].jobs[xj_index].cached_pdf = os.path.join(SRC, "fake.pdf")
+r = ops("files.update", {"tab": tab_key, "index": xj_index,
+                         "xlsx_options": {"print_range": "selection",
+                                          "selection": "Sheet2!B2:C9",
+                                          "worksheet": "Sheet2"}})
+check("②q 改「选定区域」地址 + 表名落盘，缓存的旧 PDF 被清掉",
+      (r.get("xlsx_options") or {}).get("selection") == "Sheet2!B2:C9"
+      and (r.get("xlsx_options") or {}).get("worksheet") == "Sheet2"
+      and win._config.tabs[tab_key].jobs[xj_index].cached_pdf == "",
+      json.dumps(r.get("xlsx_options"), ensure_ascii=False))
+
+
+def _xlsx_reject(name, xlsx_options, index=None, extra=None):
+    idx = xj_index if index is None else index
+    params = {"tab": tab_key, "index": idx, "xlsx_options": xlsx_options}
+    params.update(extra or {})
+    try:
+        ops("files.update", params)
+        check(name, False)
+    except agent_api.AgentOpError as e:
+        check(name, e.code == "invalid", f"{e.code}: {e.message}")
+
+
+_xlsx_reject("②r 只说选定区域、不给地址 → invalid",
+             {"print_range": "selection"})
+_xlsx_reject("②s 地址非法（A1:??）→ invalid",
+             {"print_range": "selection", "selection": "A1:??"})
+_xlsx_reject("②t 范围不是选定区域却给地址 → invalid",
+             {"print_range": "active", "selection": "A1:B2"})
+_xlsx_reject("②u 未知版式键 → invalid", {"foo": 1})
+_xlsx_reject("②v xlsx_options 只对表格文件生效（PDF 上给 → invalid）",
+             {"print_range": "selection", "selection": "A1:B2"}, index=0,
+             extra={"copies": 5})
+check("②v2 被拒时同一次请求里的 copies 也没落进任务（不留半改）",
+      win._config.tabs[tab_key].jobs[0].copies == 2,
+      f"copies={win._config.tabs[tab_key].jobs[0].copies}")
+
+r = ops("files.update", {"tab": tab_key, "index": xj_index, "xlsx_options": {}})
+check("②w 传空 xlsx_options ⇒ 回到跟随默认（存储里不残留旧区域）",
+      not (r.get("xlsx_options") or {})
+      and not (win._config.tabs[tab_key].jobs[xj_index].xlsx_options or {}),
+      json.dumps(r.get("xlsx_options"), ensure_ascii=False))
 
 # 附加服务：派送 / 加急 / 首页
 r = ops("tabs.update", {"tab": tab_key, "delivery_enabled": True,

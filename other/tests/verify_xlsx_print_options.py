@@ -392,21 +392,52 @@ res, wb, app, out = _run_com({"print_range": "ignore_area"}, out_name="area_igno
 eq("print_range=ignore_area ⇒ PrintArea=''（清空）",
     wb.ActiveSheet._ps.writes.get("PrintArea"), "")
 
-# 2026-11-03：「选定区域」已从支持列表删除（Excel 的选区是会话内状态，COM 无人值守打开
-# 时拿不到，旧实现只能拿 UsedRange 顶替、还会覆盖文件自带的打印区域）。老配置里可能还存着
-# 这个值 ⇒ 必须回退成 active（= 不写 PrintArea），而不是悄悄用整张已用区域盖掉打印区域。
-with LogCapture() as cap:
-    res, wb, app, out = _run_com({"print_range": "selection"}, out_name="area_selection.pdf")
-chk("老配置 print_range=selection ⇒ 回退 active、不写 PrintArea（不覆盖文件里的打印区域）",
-    "PrintArea" not in wb.ActiveSheet._ps.writes, str(wb.ActiveSheet._ps.writes))
-eq("归一化后的 print_options 里是 active", res.print_options.get("print_range"), "active")
-chk("日志明写「不是支持的取值」+ 回退 active（不静默丢弃）",
-    "print_range" in cap.text and "回退 active" in cap.text, cap.text[:300])
+# 2026-11-03 的「回退 active」契约已随 2026-11-06 加回「选定区域」作废：
+# 现在 selection 保留、地址缺失时由引擎明确记「未生效」（见下面 selection 段）。
 
 chk("选项全部生效 ⇒ ExportResult.options_honored=True",
     res.options_honored and all(res.options_applied.values()), str(res.options_applied))
 chk("ExportResult 带回归一化后的 print_options（便于 GUI/日志核对）",
-    res.print_options.get("paper") == "A4" and res.print_options.get("print_range") == "active")
+    res.print_options.get("paper") == "A4"
+    and res.print_options.get("print_range") == "ignore_area")
+
+# 2026-11-06：按用户要求把「选定区域」加回 —— Excel 的选区仍是会话内状态、无人值守 COM
+# 读不到，所以**地址由调用方显式给出**（面板输入框 / 小印接口 xlsx_options.selection），
+# 引擎只负责写进临时副本的 PrintArea。读不到就明说「未生效」，绝不拿 UsedRange 顶替。
+res, wb, app, out = _run_com({"print_range": "selection", "selection": "A1:F20"},
+                             out_name="area_selection.pdf")
+eq("print_range=selection + 地址 ⇒ PrintArea 正是这块区域",
+   wb.ActiveSheet._ps.writes.get("PrintArea"), "A1:F20")
+chk("地址被引擎接受 ⇒ PrintArea 记「已生效」",
+    res.options_applied.get("PrintArea") is True, str(res.options_applied))
+eq("归一化后的 print_options 里仍是 selection",
+   res.print_options.get("print_range"), "selection")
+
+wb_sel = StubWorkbook(names=("S1", "S2", "S3"), active="S2")
+res, wb, app, out = _run_com({"print_range": "selection", "selection": "S2!B2:C9",
+                              "worksheet": "S2"},
+                             wb=wb_sel, out_name="area_selection_sheet.pdf")
+chk("地址带表名（S2!B2:C9）⇒ 打在那张表上、PrintArea 只写地址部分",
+    wb.sheets[1]._ps.writes.get("PrintArea") == "B2:C9"
+    and "PrintArea" not in wb.sheets[0]._ps.writes,
+    f"S1={wb.sheets[0]._ps.writes.get('PrintArea')!r} "
+    f"S2={wb.sheets[1]._ps.writes.get('PrintArea')!r}")
+
+with LogCapture() as cap:
+    res, wb, app, out = _run_com({"print_range": "selection"}, out_name="area_missing.pdf")
+chk("selection 没给地址 ⇒ 不写 PrintArea（不拿 UsedRange 顶替、也不清掉文件自带区域）",
+    "PrintArea" not in wb.ActiveSheet._ps.writes, str(wb.ActiveSheet._ps.writes))
+chk("没地址 ⇒ 记账 PrintArea=False 且日志点名「选定区域」",
+    res.options_applied.get("PrintArea") is False and "选定区域" in cap.text,
+    f"applied={res.options_applied} log={cap.text[:200]}")
+
+with LogCapture() as cap:
+    res, wb, app, out = _run_com({"print_range": "selection", "selection": "A1:??"},
+                                 out_name="area_bad.pdf")
+chk("非法地址 ⇒ 同样不写 PrintArea，日志点名这个地址",
+    "PrintArea" not in wb.ActiveSheet._ps.writes
+    and "A1:??" in cap.text and res.options_applied.get("PrintArea") is False,
+    f"writes={wb.ActiveSheet._ps.writes} log={cap.text[:200]}")
 
 # ============================================================
 # C. workbook 导出分支（打印整个工作簿）

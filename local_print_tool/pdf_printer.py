@@ -255,19 +255,26 @@ def _page_needs_dither(page) -> bool:
 # PDF 信息读取
 # ============================================================
 
-def get_image_info(image_path: str) -> dict:
+def get_image_info(image_path: str, orientation: str = "auto") -> dict:
     """
     读取图片尺寸信息，返回页数和方向。
-    单张图片始终为 1 页，方向由宽高比决定（已应用 EXIF 方向，
-    避免手机竖拍照片因原始像素为横而被误判成横向）。
+
+    单张图片始终为 1 页。`orientation` 与 `converter._convert_image_to_pdf` 同一口径：
+      · "auto"（默认）/ 其它值 —— 方向由宽高比决定（已应用 EXIF 方向，避免手机竖拍
+        照片因原始像素为横而被误判成横向）；
+      · "landscape" / "portrait" —— 面板「图片方向」显式指定的方向，页面就按这个方向出
+        （横图选"竖向"时 PDF 是竖版、内容缩小居中，这里必须回报竖版，否则文件列表里的
+        方向列和转出来的 PDF 不一致 —— 2026-11-06 用户现场）。
     """
     try:
         from PIL import Image, ImageOps
         img = Image.open(image_path)
         img = ImageOps.exif_transpose(img)   # 应用 EXIF 旋转，拿到真实显示尺寸
         w, h = img.size
-        orientation = "landscape" if w > h else "portrait"
-        return {"page_count": 1, "orientation": orientation}
+        if str(orientation or "auto").strip().lower() in ("landscape", "portrait"):
+            return {"page_count": 1, "orientation": str(orientation).strip().lower()}
+        _ori = "landscape" if w > h else "portrait"
+        return {"page_count": 1, "orientation": _ori}
     except Exception as e:
         logger.warning(f"读取图片信息失败 ({image_path}): {e}")
         return {"page_count": 0, "orientation": ""}

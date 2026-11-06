@@ -2556,12 +2556,14 @@ class PrintSpeedDialog(QDialog):
 # 顺序与 printer_config 的 TASK_OPTION_FITS / TASK_OPTION_RANGES 逐位对应。
 FIT_LABELS = ("无缩放", "将工作表调整为一页", "将所有列调整为一页", "将所有行调整为一页")
 FIT_VALUES = ("none", "sheet", "cols", "rows")
-# 打印范围（2026-11-03 去掉「选定区域」）：Excel 的「选定区域」= 打印那一刻**眼下高亮的
-# 单元格**，是会话内状态、不会存进 xlsx；本工具在后台用 COM 无人值守打开文件，根本没有
-# 「用户选区」这回事 —— 旧实现只能拿 UsedRange 顶替，效果等于「活动工作表」，却还会把
-# 文件里自带的打印区域覆盖掉。删掉这一档，老配置里的 "selection" 由引擎回退成 "active"。
+# 打印范围：两个入口共用前三档文案。2026-11-06 按用户要求把小印智能助手的场景加回
+# 「选定区域」—— 但它只出现在**表格任务面板**（不是全局默认参数）：Excel 的选区是会话内
+# 高亮状态、不存进文件，无人值守 COM 拿不到，所以地址必须由调用方显式给出（面板输入框 /
+# 小印的 xlsx_options.selection），引擎只负责把它写进临时副本的 PrintArea。
 RANGE_LABELS = ("活动工作表", "整个工作簿", "忽略打印区域")
 RANGE_VALUES = ("active", "workbook", "ignore_area")
+XLSX_RANGE_LABELS = RANGE_LABELS + ("选定区域",)
+XLSX_RANGE_VALUES = RANGE_VALUES + ("selection",)
 # 「工作表」下拉的第一项（= 不选表）。它不是 RANGE_VALUES 那种枚举，而是"文件里现有哪些表"
 # 的动态列表的第一项；文案里**不放**文件名，因为文件名已经显示在任务行上，重复只会把
 # QComboBox 撑宽。
@@ -5869,6 +5871,7 @@ class MainWindow(QMainWindow):
     _ownerComboRefreshed = Signal()   # 成员名单同步完成 → 主线程刷新归属下拉
     _tabDisplayRefresh = Signal()     # 后台同步中换号完成后 → 主线程刷新标签页显示
     _pricingSynced = Signal()         # 打印价格同步完成（可能来自后台线程）→ 主线程刷新 UI
+    _offlineStateChanged = Signal()   # 本地订单库变了（可能来自后台同步线程）→ 主线程刷角标/明细窗
     _updateCheckDone = Signal(object) # 自更新后台线程 → 主线程结果 (kind, manifest, manual)
     _updateProgress = Signal(int, int) # 更新下载进度（已下载, 总大小）→ 主线程进度弹窗
 
@@ -6532,6 +6535,15 @@ class MainWindow(QMainWindow):
             self._offline_sync.client_id = self._local_client_id()
         except Exception:
             pass
+        # 2026-11-06：本地订单库一变就让界面跟上（角标 / 文件菜单项 / 离线订单窗）。
+        # 后台同步线程与连线同步线程都在非 GUI 线程里写库，这里只 emit 信号，由 Qt 排队回主线程。
+        # 注意：必须注册在下面的 `if not self._config.cloud_enabled:` 之前 —— 本地模式下
+        # 落在离线库的单同样要立刻反映到角标上。
+        try:
+            self._offlineStateChanged.connect(self._on_offline_state_changed)
+            self._offline_sync.set_change_callback(self._offlineStateChanged.emit)
+        except Exception:
+            logger.debug("注册离线订单变更回调失败", exc_info=True)
         # S1-09：启动即刷一次「📴 离线未同步」角标（上次运行遗留的未同步单要立刻看得见）
         self._refresh_offline_badge()
 
@@ -7079,7 +7091,9 @@ class MainWindow(QMainWindow):
         if sync is None:
             return
         api_url = getattr(client, "api_url", "") if client else ""
-        token = getattr(client, "token", "") if client else ""
+        # 统一用 auth_token（本机专用 token 换发后 client.token 可能是旧的全局 token，
+        # 2026-11-04 现场 403 就是这么来的；取号路径 _acquire_order_number_and_upload_net 同样口径）
+        token = (getattr(client, "auth_token", "") or getattr(client, "token", "")) if client else ""
         if not api_url or not token:
             self._log("⚠️ 云端未配置/未连接：离线订单暂时无法重试（恢复连接后会自动补报）")
             return
@@ -7099,8 +7113,26 @@ class MainWindow(QMainWindow):
                 self._cloudConnSyncLog.emit(f"⚠️ 离线订单手动重试失败: {e}")
 
         threading.Thread(target=_net, daemon=True).start()
-        # 主线程稍后刷新角标/明细（网络结果可能还没回来，角标会在 60s 定时器里再对齐）
+        # 网络结果回来后由 _offlineStateChanged 立刻刷新（这里先对齐一次，重置状态本身也要显示）
         QTimer.singleShot(2500, self._after_offline_retry)
+
+    def _on_offline_state_changed(self):
+        """本地订单库变化（主线程槽）：把「📴 离线未同步」相关的显示全部对齐。
+
+        触发来源：后台自动同步线程、连线后的同步线程、手动重试、落本地单、换号、清库。
+        `OfflineSync` 只发信号（见 `set_change_callback`），真正的控件动作都在这里做。
+        """
+        try:
+            self._refresh_offline_badge()
+        except Exception:
+            logger.debug("刷新离线角标失败", exc_info=True)
+        try:
+            self._reload_offline_dialog()
+        except Exception:
+            logger.debug("刷新离线订单窗失败", exc_info=True)
+        # 标签页上的「📋 订单号」不在这里刷：换号路径自己会 emit `_tabDisplayRefresh`，
+        # 而 `_refresh_tab_display()` 会重填备注编辑器等控件，后台同步顺手调它会把
+        # 用户正在输入的备注/参数冲掉。
 
     def _after_offline_retry(self):
         self._refresh_offline_badge()
@@ -9954,10 +9986,19 @@ class MainWindow(QMainWindow):
         self._table.setItem(row, self.COL_PAGES, pages_item)
 
         # 方向
+        # 图片：面板「图片方向」显式选了横/竖就以它为准 —— 那一档是**请求**方向，
+        #   转换完成后 job.orientation 才跟上（重转要几百毫秒）。只读 job.orientation 的话，
+        #   改完方向的那一瞬间列表还写着旧方向，用户以为没生效（2026-11-06 现场）。
+        #   未显式指定（auto）时仍按转换结果（EXIF 修正后的宽高比）显示。
         ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}
-        ori_text = ori_map.get(job.orientation, "")
+        _ori = job.orientation
+        if is_image and (getattr(job, "image_orientation", "auto") or "auto") in ("landscape", "portrait"):
+            _ori = job.image_orientation
+        ori_text = ori_map.get(_ori, "")
         ori_item = QTableWidgetItem(ori_text)
         ori_item.setTextAlignment(Qt.AlignCenter)
+        if is_image and _ori != job.orientation:
+            ori_item.setToolTip("已按面板「图片方向」改为该方向，正在重新生成 PDF…")
         self._table.setItem(row, self.COL_ORIENT, ori_item)
 
         # 打印引擎（仅 Word 文件显示；非 Word 文件显示 "—"）
@@ -10437,13 +10478,15 @@ class MainWindow(QMainWindow):
     def _xlsx_panel_values(self) -> dict:
         """面板控件当前值 → 表格引擎认的那一组键（纯读，不写任何状态）。
 
-        与 `printer_config.task_options_to_print_options` 同一套键名（14 个，含 2026-11-03
-        新增的 `worksheet`），这样写进 `job.xlsx_options` 的东西能原样喂给
+        与 `printer_config.task_options_to_print_options` 同一套键名（15 个，含 `worksheet`
+        与 2026-11-06 重新加回的 `selection`），这样写进 `job.xlsx_options` 的东西能原样喂给
         `export_to_pdf(print_options=...)`。
         """
         margins = {}
         for key, sp in (getattr(self, "_xlsx_margins", None) or {}).items():
             margins[key] = round(float(sp.value()), 2)
+        print_range = XLSX_RANGE_VALUES[
+            _index_of(XLSX_RANGE_LABELS, self._xlsx_range.currentText())]
         opts = {
             "paper": self._xlsx_paper.currentText().strip() or DEFAULT_PAPER_SIZE,
             "orientation": ORIENTATION_VALUES[
@@ -10454,8 +10497,11 @@ class MainWindow(QMainWindow):
             "center_v": bool(self._xlsx_center_v.isChecked()),
             "fit": FIT_VALUES[_index_of(FIT_LABELS, self._xlsx_fit.currentText())],
             "scale": int(self._xlsx_scale.value()),
-            "print_range": RANGE_VALUES[
-                _index_of(RANGE_LABELS, self._xlsx_range.currentText())],
+            "print_range": print_range,
+            # 只有选了「选定区域」才把地址落进任务：其它档位留着上一条地址只会让缓存 key
+            # 无谓地变来变去（引擎也只在 selection 档读它）。
+            "selection": (str(self._xlsx_selection.text()).strip()
+                          if print_range == "selection" else ""),
             # 用 itemData 而不是 currentText：第一项（跟随）的文案是给人看的，数据是 ""
             "worksheet": str(self._xlsx_worksheet.currentData() or ""),
         }
@@ -10525,6 +10571,62 @@ class MainWindow(QMainWindow):
             logger.debug("表格版式：缩放联动失败", exc_info=True)
         self._auto_apply_edit()
 
+    def _sync_xlsx_selection_enabled(self):
+        """「选定区域」地址框只在打印范围选「选定区域」时可用（其余档位它没有意义）。"""
+        try:
+            edit = getattr(self, "_xlsx_selection", None)
+            if edit is None:
+                return
+            _is_selection = (self._xlsx_range.currentIndex()
+                             == _index_of(XLSX_RANGE_VALUES, "selection"))
+            # 面板整体被灰掉（冻结标签页 / 没有表格选中）时，地址框也不能单独亮着
+            _panel_on = bool(getattr(self, "_xlsx_panel_shown", False)
+                             and self._xlsx_range.isEnabled())
+            edit.setEnabled(_is_selection and _panel_on)
+            self._mark_xlsx_selection_state()
+        except Exception:
+            logger.debug("表格版式：选定区域可用性刷新失败", exc_info=True)
+
+    def _on_xlsx_range_changed(self, *_args):
+        """打印范围切换 → 选定区域地址框的可用性跟着变，再把面板值落到任务上。"""
+        try:
+            self._sync_xlsx_selection_enabled()
+        except Exception:
+            logger.debug("表格版式：打印范围联动失败", exc_info=True)
+        self._auto_apply_edit()
+
+    def _mark_xlsx_selection_state(self):
+        """地址不合法时给输入框红边（只提示、不拦输入；引擎那边同样会记「未生效」）。
+
+        Excel 的 PrintArea 写非法地址会抛错并被逐项记账成 False，用户在日志里才看得到；
+        面板这一层先给个肉眼可见的提示，避免「填了没生效」还得翻日志。
+        """
+        try:
+            edit = getattr(self, "_xlsx_selection", None)
+            if edit is None:
+                return
+            text = edit.text().strip()
+            if not text:
+                edit.setStyleSheet("")
+                return
+            try:
+                import xlsx_printer as _xp      # 延迟 import：与面板其它地方同一口径
+                ok = _xp.is_selection_address(text)
+            except Exception:  # noqa: BLE001 —— 判不了就别乱涂红
+                ok = True
+            edit.setStyleSheet("" if ok else "QLineEdit { border: 1px solid #e64553; }")
+        except Exception:
+            logger.debug("表格版式：选定区域地址校验提示失败", exc_info=True)
+
+    def _on_xlsx_selection_edited(self, *_args):
+        """地址框文本变化 → 只刷新合法性提示（写回在 editingFinished，别每敲一字就存盘）。"""
+        self._mark_xlsx_selection_state()
+
+    def _on_xlsx_selection_committed(self):
+        """地址框编辑完成（失焦/回车）→ 校验提示 + 落到选中任务。"""
+        self._mark_xlsx_selection_state()
+        self._auto_apply_edit()
+
     def _on_xlsx_follow_default(self):
         """「跟随默认」：清掉这些任务自己的版式设置，改用全局默认（并作废旧 PDF）。"""
         try:
@@ -10536,13 +10638,19 @@ class MainWindow(QMainWindow):
                           if r < len(jobs) and self._job_is_spreadsheet(jobs[r])]
             if not sheet_rows:
                 return
+            _changed = []
             for r in sheet_rows:
                 job = jobs[r]
                 if dict(getattr(job, "xlsx_options", {}) or {}):
                     job.xlsx_options = {}
                     job.cached_pdf = ""      # 旧版式的 PDF 作废
+                    _changed.append(r)
             self._set_current_jobs(jobs)
             self._on_table_selection()       # 面板重填成"跟随默认"后的值
+            if _changed:
+                # 改回默认版式 ⇒ 立刻按默认参数重导：页数/方向都是导出结果，
+                # 只清 cached_pdf 会让列表一直停在旧版式的值（等下次打印才对）。
+                self._schedule_render_reconvert(_changed)
         except Exception as e:
             logger.debug(f"表格版式：恢复默认失败: {e}", exc_info=True)
 
@@ -10600,8 +10708,13 @@ class MainWindow(QMainWindow):
             self._xlsx_scale.blockSignals(False)
             self._xlsx_range.blockSignals(True)
             self._xlsx_range.setCurrentIndex(
-                _index_of(RANGE_VALUES, str(opts.get("print_range", "active"))))
+                _index_of(XLSX_RANGE_VALUES, str(opts.get("print_range", "active"))))
             self._xlsx_range.blockSignals(False)
+            # 选定区域地址（"A1:F20" / "Sheet1!A1:F20"）：只展示，不写回；可用性见
+            # _sync_xlsx_selection_enabled（选了「选定区域」才亮）。
+            self._xlsx_selection.blockSignals(True)
+            self._xlsx_selection.setText(str(opts.get("selection") or ""))
+            self._xlsx_selection.blockSignals(False)
             # 工作表：先把列表重填成这个文件里真实存在的表（含已存但已不存在的旧名字），
             # 再选中任务存的那张。blockSignals 保证只展示、不触发写回。
             self._sync_xlsx_worksheet_items(sheet_jobs[0], str(opts.get("worksheet") or ""))
@@ -10611,6 +10724,7 @@ class MainWindow(QMainWindow):
                 w.setEnabled(_enable)
             if _enable:
                 self._sync_xlsx_scale_enabled()
+                self._sync_xlsx_selection_enabled()
         except Exception as e:
             logger.debug(f"表格版式面板同步失败: {e}", exc_info=True)
 
@@ -10726,6 +10840,10 @@ class MainWindow(QMainWindow):
         # 转换引擎被改过的行（行号, 旧引擎）：循环结束后按新引擎重新转 PDF。
         # 只记**真的变了**的行 —— 改份数/双面也会走到这里，不记就会每次面板变动都重转一遍。
         engine_switched: list[tuple[int, str]] = []
+        # 2026-11-06：改了「会进 PDF 的渲染参数」的行（图片方向 / 表格版式）。
+        # 旧写法只把 cached_pdf 清空、等下次打印才重渲染，于是表格里的页数/方向/费用
+        # 一直停在旧值（用户现场：「右侧面板改了图片方向，文件列表的方向没变，但打印是对的」）。
+        render_changed: list[int] = []
         # 控件可用性按**整片选区**判定（与 _on_table_selection / _selection_traits 同一口径）：
         # · 选区里有图片/单页文件 → 双面控件是灰的 ⇒ **绝不能**按面板值写 duplex：面板此时被迫
         #   显示「单面」，照写会把同批的多页文件静默改成单面（改了用户没点过的参数）。
@@ -10786,11 +10904,14 @@ class MainWindow(QMainWindow):
             if simplex_str and _sx_editable:
                 job.simplex_pages = simplex_str
 
-            # 图片方向（仅图片可用）：方向变化后清掉已转换的缓存 PDF，打印时按新方向重渲染
+            # 图片方向（仅图片可用）：方向变了 ⇒ 旧 PDF 作废 + 按新方向重转。
+            # 只清 cached_pdf 不够：列表里的「方向/页数/费用」都是转换结果回写的，
+            # 不重转就一直显示旧方向（2026-11-06 用户现场），故记进 render_changed。
             if is_img:
                 if img_ori != getattr(job, 'image_orientation', 'auto'):
                     job.image_orientation = img_ori
                     job.cached_pdf = ""   # 旧方向 PDF 失效
+                    render_changed.append(row)
 
             # 引擎（仅 Word 文件有意义；其余格式引擎显示为转换方式，不写回 job.engine）
             is_word = os.path.splitext(job.file_path)[1].lower() in (".doc", ".docx") if job.file_path else False
@@ -10805,13 +10926,14 @@ class MainWindow(QMainWindow):
 
             # 表格版式：只写表格文件（同一片选区里混着 docx 时别把版式塞给它们）。
             # 值恰好等于全局默认 ⇒ 存 {}（继续"跟随默认"，将来改默认它也跟着走）；
-            # 版式真的变了 ⇒ 作废旧 PDF，下次打印按新参数重新导出。
+            # 版式真的变了 ⇒ 作废旧 PDF 并按新版式重转（页数/方向会随版式变，见 render_changed）。
             if xlsx_new is not None and self._job_is_spreadsheet(job):
                 _before = task_options_to_print_options(self._effective_xlsx_options(job))
                 job.xlsx_options = {} if xlsx_new == xlsx_default else dict(xlsx_new)
                 _after = task_options_to_print_options(self._effective_xlsx_options(job))
                 if _after != _before:
                     job.cached_pdf = ""
+                    render_changed.append(row)
 
         # 更新表格行显示：**整行重画**（份数/单双面/页码范围/引擎/费用）。
         # 只调 _recalc_row_cost() 会留下「面板 2 份、表格 1 份」的错位（2026-10 现场报的 bug）；
@@ -10825,6 +10947,99 @@ class MainWindow(QMainWindow):
         # file_path 找行，配置先落地才不会把旧 job 写回去）
         if engine_switched:
             self._restart_convert_for_engine_change(engine_switched)
+        # 图片方向 / 表格版式变了 ⇒ 同样按新参数重转（页数、方向列、费用都靠它更新）
+        if render_changed:
+            self._schedule_render_reconvert(render_changed)
+
+    def _schedule_render_reconvert(self, rows, tab_key: str = "") -> None:
+        """把「渲染参数变了、需要按新参数重转 PDF」的行排到本轮事件处理结束之后。
+
+        为什么延后一拍（2026-11-06）：这些改动都发生在控件回调里（`_auto_apply_edit`、
+        「跟随默认」、「默认任务参数」），当场起转换线程会 ① 与同一个回调里还没跑完的
+        `_set_current_jobs` / `_fill_table_row` 抢同一行；② 连点几下「方向/版式」就为
+        同一个文件起好几次转换（每个 ConvertWorker 都要拉一次 COM/导出）。延到事件循环
+        下一轮后，本轮所有写回都已落盘，多次改动还会合并成一次重转。
+
+        `tab_key` 缺省 = 当前前台标签页；别的标签页的行也能排（转换回调按 tab_key 回写）。
+        """
+        tk = tab_key or self._current_tab
+        pend = dict(getattr(self, "_pending_render_rows", None) or {})
+        bucket = set(pend.get(tk) or ())
+        for r in (rows or []):
+            if isinstance(r, int):
+                bucket.add(int(r))
+        if bucket:
+            pend[tk] = bucket
+        self._pending_render_rows = pend
+        if getattr(self, "_render_scheduled", False):
+            return
+        self._render_scheduled = True
+        QTimer.singleShot(0, self._flush_render_reconvert)
+
+    def _flush_render_reconvert(self) -> int:
+        """`_schedule_render_reconvert` 的落地实现：把攒下的行合并成一次重转。"""
+        self._render_scheduled = False
+        pend = dict(getattr(self, "_pending_render_rows", None) or {})
+        self._pending_render_rows = {}
+        if not pend:
+            return 0
+        try:
+            return self._restart_convert_for_render_change(pend)
+        except Exception:
+            logger.debug("按新渲染参数重转失败", exc_info=True)
+            return 0
+
+    def _restart_convert_for_render_change(self, pending) -> int:
+        """改完「进 PDF 的渲染参数」（图片方向 / 表格版式）后按新参数重转。
+
+        `pending`：`{标签页: {行号}}`（前台页由 `_auto_apply_edit` 填，全局默认参数变化时
+        才会一次带上多个标签页）。与 `_restart_convert_for_engine_change` 同一形态，
+        区别在作废判据：这两类参数都参与缓存 key（图片方向进
+        `pdf_cache_key(source_md5, image_orientation, engine)`；表格版式则把 print_options
+        一起喂进 xlsx 的缓存查询），新参数 ⇒ 新文件名 ⇒
+        `_start_convert_worker` 不会命中旧产物，所以不必像引擎那样判断要不要删文件；
+        旧产物留着，改回去还能免重转命中。
+
+        返回真正发起重转的文件数。
+        """
+        started = 0
+        for tab_key in sorted(pending):
+            jobs = self._tab_jobs(tab_key)
+            _is_current = (tab_key == self._current_tab)
+            for row in sorted(pending[tab_key]):
+                if not (0 <= row < len(jobs)):
+                    continue
+                job = jobs[row]
+                path = getattr(job, "file_path", "") or ""
+                if not path:
+                    continue
+                # 页数归零：重转期间「开始打印」按页数闸门等新结果；前台页顺手重画该行
+                # （非前台页的表不是当前这张表，碰 `_fill_table_row` 会写错行）。
+                # 图片恒为 1 页，方向改了页数也不会变 ⇒ 不归零，免得列表闪一下 "?"。
+                if os.path.splitext(path)[1].lower() not in self.IMAGE_EXTS:
+                    job.page_count = 0
+                if _is_current:
+                    try:
+                        self._fill_table_row(row, job)
+                    except Exception:
+                        logger.debug("重画待重转行失败", exc_info=True)
+                _from_cloud = int(getattr(job, "task_id", 0) or 0) > 0
+                try:
+                    self._start_convert_worker(
+                        row, path, self._resolve_engine(job),
+                        tab_key=tab_key,
+                        from_cloud=_from_cloud,
+                        allow_cloud_com=bool(_from_cloud and self._cloud_com_allowed(job)),
+                    )
+                except Exception:
+                    logger.debug("按新参数重转启动失败: %s", path, exc_info=True)
+                    self._log(f"⚠ 重新渲染失败: {os.path.basename(path)}")
+                    continue
+                started += 1
+        if started:
+            self._update_total_cost()
+            self._log(f"🔄 渲染参数已改，正在重新转换 {started} 个文件")
+        return started
 
     def _restart_convert_for_engine_change(self, rows_with_old_engine) -> int:
         """转换引擎被改过 → 作废旧 PDF 并按新引擎重新转换。
@@ -11366,12 +11581,29 @@ class MainWindow(QMainWindow):
         self._xlsx_scale.valueChanged.connect(self._auto_apply_edit)
         _xform.addRow("自定义缩放：", self._xlsx_scale)
 
-        self._xlsx_range = _fit_width(_combo(RANGE_LABELS))
+        self._xlsx_range = _fit_width(_combo(XLSX_RANGE_LABELS))
         _disable_combo_wheel(self._xlsx_range)
-        self._xlsx_range.setToolTip("表格打印范围（活动工作表 = 尊重文件里的打印区域 / 整个工作簿 / "
-                                    "忽略打印区域 = 清掉打印区域、按已用区域打）")
-        self._xlsx_range.currentIndexChanged.connect(self._auto_apply_edit)
+        self._xlsx_range.setToolTip(
+            "表格打印范围（活动工作表 = 尊重文件里的打印区域 / 整个工作簿 / "
+            "忽略打印区域 = 清掉打印区域、按已用区域打 / 选定区域 = 只打下面填的那块区域）")
+        self._xlsx_range.currentIndexChanged.connect(self._on_xlsx_range_changed)
         _xform.addRow("打印范围：", self._xlsx_range)
+
+        # 选定区域（2026-11-06 按用户要求加回；小印智能助手也会直接填这一项）：
+        # Excel 的「选区」是会话内高亮状态、不存进文件，无人值守 COM 拿不到 —— 所以这里
+        # 收的是**地址文本**（A1 或带表名），引擎把它写进临时副本的 PrintArea，源文件不动。
+        # 留空/写错时不替用户猜（不拿 UsedRange 顶替），引擎会记「该项未生效」并提示。
+        self._xlsx_selection = _fit_width(QLineEdit())
+        self._xlsx_selection.setPlaceholderText("A1:F20 或 Sheet1!A1:F20")
+        self._xlsx_selection.setClearButtonEnabled(True)
+        self._xlsx_selection.setToolTip(
+            "只打印这块区域，例：A1:F20（当前工作表）/ Sheet1!A1:F20（指定工作表）/ "
+            "A1:B2,D5:E9（多块区域，逗号分隔）。\n"
+            "打印范围选「选定区域」时才生效；区域写错/为空时按文件原有打印区域导出并在日志里提示。\n"
+            "小印智能助手可经接口直接填这一项（xlsx_options.selection）。")
+        self._xlsx_selection.textChanged.connect(self._on_xlsx_selection_edited)
+        self._xlsx_selection.editingFinished.connect(self._on_xlsx_selection_committed)
+        _xform.addRow("选定区域：", self._xlsx_selection)
 
         # 工作表（2026-11-03 用户需求）：默认「跟随文件的活动工作表」，即与在 Excel 里直接
         # Ctrl+P 打出来的那张表一致 —— 没改过这一项的老用户出纸与改动前逐字节相同。
@@ -11416,6 +11648,7 @@ class MainWindow(QMainWindow):
             self._xlsx_orientation, self._xlsx_paper,
             self._xlsx_center_h, self._xlsx_center_v,
             self._xlsx_fit, self._xlsx_scale, self._xlsx_range,
+            self._xlsx_selection,
             self._xlsx_worksheet,
             self._xlsx_follow_btn,
         ]
@@ -13810,6 +14043,8 @@ class MainWindow(QMainWindow):
         保存后立刻落盘（下一批打印生效）；不打纸、不动任何已存在的任务。
         """
         try:
+            # 版式默认值的旧快照（判断这次到底有没有改到"会进 PDF"的那几个键）
+            _layout_before = task_options_to_print_options(self._config.task_options())
             dlg = DefaultTaskOptionsDialog(
                 self,
                 options=(self._config.default_task_options or {}),
@@ -13826,11 +14061,33 @@ class MainWindow(QMainWindow):
             self._config.default_task_options = {
                 k: v for k, v in vals.items() if DEFAULT_TASK_OPTIONS.get(k) != v
             }
+            # 版式默认值（纸张/方向/页边距/缩放/范围/选哪张表…）变了 ⇒ 队列里「跟随默认」
+            # 的表格文件**必须按新版式重导**。旧代码只改配置、缓存 PDF 原样留着，于是
+            # 「改了页边距/纸张，打出来还是老版式」，列表里的页数/方向也停在旧值
+            # （2026-11-06 用户要求全面检查这类"改了配置但没重渲染"的问题）。
+            _stale: dict[str, set] = {}
+            try:
+                if task_options_to_print_options(self._config.task_options()) != _layout_before:
+                    for _tk, _tab in (self._config.tabs or {}).items():
+                        if getattr(_tab, "frozen", False):
+                            continue          # 冻结页是已上报订单的账目快照，一律不动
+                        for _i, _job in enumerate(getattr(_tab, "jobs", []) or []):
+                            if not self._job_is_spreadsheet(_job):
+                                continue
+                            if dict(getattr(_job, "xlsx_options", {}) or {}):
+                                continue      # 自己有版式：跟自己的走，不受全局默认影响
+                            _job.cached_pdf = ""
+                            _job.page_count = 0
+                            _stale.setdefault(_tk, set()).add(_i)
+            except Exception:
+                logger.debug("表格版式默认值变化后作废旧 PDF 失败", exc_info=True)
             self._save_config()
             self._log(f"⚙ 默认任务参数已保存：纸张 {self._config.paper_size}"
                       f"／{'双面' if vals.get('duplex') == 'on' else '单面'}"
                       f"／{ORIENTATION_LABELS[_index_of(ORIENTATION_VALUES, vals.get('orientation'))]}"
                       f"／页边距 {vals.get('margin_left_cm')}cm（下一批打印生效）")
+            for _tk, _rows in sorted(_stale.items()):
+                self._schedule_render_reconvert(_rows, tab_key=_tk)
         except Exception as e:
             # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
             logger.exception("保存默认任务参数失败")
@@ -19247,7 +19504,10 @@ class MainWindow(QMainWindow):
                 info = get_pdf_info(task.local_path); page_count = info["page_count"]; orientation = info["orientation"]
                 blank_tail = self._detect_blank_tail(task.local_path)
             elif ext in image_exts:
-                info = get_image_info(task.local_path); page_count = info["page_count"]; orientation = info["orientation"]
+                # 显式方向（云端任务自带）优先：横图选"竖向"时 PDF 是竖版，列表也得显示竖版
+                info = get_image_info(task.local_path,
+                                      str(getattr(task, "image_orientation", "") or "auto"))
+                page_count = info["page_count"]; orientation = info["orientation"]
             elif ext == ".docx":
                 orientation = get_docx_orientation(task.local_path)
 
@@ -19519,13 +19779,18 @@ class MainWindow(QMainWindow):
             existing_sources.add(src_key)
 
             page_count = 0; orientation = ""; blank_tail = 0
+            # 「选项 → 默认任务参数…」的差量默认值（主窗口级配置，整批共用；空 dict = 从未配置）
+            # 提前到这里：图片的方向列要按**默认图片方向**判，否则「默认横向」下加一张竖图，
+            # 列表先显示"竖"、转换完又变"横"（2026-11-06 用户要求这类显示不一致一并修掉）。
+            _custom = dict(self._config.default_task_options or {})
             if ext == ".pdf":
                 info = get_pdf_info(work_path); page_count = info["page_count"]; orientation = info["orientation"]
                 blank_tail = self._detect_blank_tail(work_path)
             elif ext == ".docx":
                 orientation = get_docx_orientation(work_path)
             elif ext in image_exts:
-                info = get_image_info(work_path); page_count = info["page_count"]; orientation = info["orientation"]
+                info = get_image_info(work_path, str(_custom.get("image_orientation") or "auto"))
+                page_count = info["page_count"]; orientation = info["orientation"]
             engine = "word"
             if ext in (".doc", ".docx"):
                 from converter import _read_docx_last_editor, get_available_engines
@@ -19535,8 +19800,6 @@ class MainWindow(QMainWindow):
                 for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
                     if available.get(eng, False): engine = eng; break
             is_image = ext in image_exts
-            # 「选项 → 默认任务参数…」的差量默认值（主窗口级配置，整批共用；空 dict = 从未配置）
-            _custom = dict(self._config.default_task_options or {})
             # 短边/长边只按**方向**推导（未知方向=长边）；转换完成后由 _on_convert_finished 复核
             duplex_mode = self._duplex_mode_for_orientation(orientation)
 

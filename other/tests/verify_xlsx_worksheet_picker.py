@@ -111,9 +111,9 @@ def make_book(path, sheets, use_ns=True, tag_prefix=""):
 
 
 # ============================================================
-# ① 选项层：14 个键，worksheet 贯穿 task_options / print_options / XLSX_OPTION_KEYS
+# ① 选项层：15 个键，selection 与 worksheet 贯穿 task_options / print_options / XLSX_OPTION_KEYS
 # ============================================================
-print("\n=== ① 选项层：worksheet 是第 14 个键（默认空 = 跟随活动工作表） ===")
+print("\n=== ① 选项层：selection / worksheet 是后加的两个键（默认空 = 跟随文件） ===")
 
 eq("DEFAULT_TASK_OPTIONS 有 worksheet 且默认空（跟随）",
    pc.DEFAULT_TASK_OPTIONS.get("worksheet"), "")
@@ -136,7 +136,7 @@ eq("不认识的表名原样保留（不在这里抹成 ''，交给引擎回退 
 
 _own = resolve_xlsx_print_options({}, {"worksheet": "报表"}) or {}
 eq("resolve_xlsx_print_options 把任务级 worksheet 带出来", _own.get("worksheet"), "报表")
-check("任务级只选工作表（其它都默认）⇒ 输出仍是完整 14 键",
+check("任务级只选工作表（其它都默认）⇒ 输出仍是完整全套键",
       set(_own) == set(XLSX_OPTION_KEYS), f"{sorted(_own)}")
 check("两处都没配过 ⇒ None（引擎完全不碰版式，老用户行为不变）",
       resolve_xlsx_print_options({}, {}) is None)
@@ -151,7 +151,7 @@ eq("引擎侧 worksheet=非字符串 ⇒ ''",
 eq("引擎侧 worksheet 去空格", X.normalize_print_options({"worksheet": " 数据 "}).get("worksheet"), "数据")
 eq("引擎侧 worksheet 超长截断 120",
    len(X.normalize_print_options({"worksheet": "x" * 300}).get("worksheet")), 120)
-check("引擎收到 XLSX_OPTION_KEYS 全套 ⇒ 一个键都不丢（14 键）",
+check("引擎收到 XLSX_OPTION_KEYS 全套 ⇒ 一个键都不丢（全套键）",
       set(X.normalize_print_options({k: 1 for k in XLSX_OPTION_KEYS})) == set(XLSX_OPTION_KEYS))
 
 # ============================================================
@@ -159,7 +159,8 @@ check("引擎收到 XLSX_OPTION_KEYS 全套 ⇒ 一个键都不丢（14 键）",
 # ============================================================
 print("\n=== ② 缓存签名：没选工作表 ⇒ 签名与加键前逐字符相同 ===")
 
-_old_payload = {k: v for k, v in X.DEFAULT_PRINT_OPTIONS.items() if k != "worksheet"}
+_old_payload = {k: v for k, v in X.DEFAULT_PRINT_OPTIONS.items()
+                if k not in ("worksheet", "selection")}
 _old_sig = hashlib.md5(
     json.dumps(_old_payload, sort_keys=True, ensure_ascii=False,
                separators=(",", ":")).encode("utf-8")).hexdigest()[:8]
@@ -548,7 +549,7 @@ eq("没动下拉 ⇒ 任务不落 worksheet（仍是跟随默认）",
 _combo.setCurrentIndex(_combo.findData("数据"))
 _opts = tab.jobs[0].xlsx_options
 eq("选「数据」⇒ 写进 PrintJob.xlsx_options", _opts.get("worksheet"), "数据")
-check("★ 写回的是完整 14 键（引擎认的那套）", set(_opts) == set(XLSX_OPTION_KEYS),
+check("★ 写回的是完整全套键（引擎认的那套）", set(_opts) == set(XLSX_OPTION_KEYS),
       f"{sorted(_opts)}")
 check("非表格任务没被牵连", tab.jobs[1].xlsx_options == {} and tab.jobs[2].xlsx_options == {})
 

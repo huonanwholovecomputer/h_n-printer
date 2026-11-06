@@ -84,6 +84,11 @@ class OfflineSync:
         self._sync_target: tuple[str, str] = ("", "")
         # S1-09：上一轮同步有没有遇到网络错误（后台循环据此做 1.5× 指数退避）
         self._last_cycle_network_ok = True
+        # 2026-11-06：本地订单库「发生变化」回调（None = 没人监听）。
+        # GUI 在 _init_cloud_client 里注册：回调里只做 Qt 信号 emit，由 Qt 排队回主线程
+        # 刷「📴 离线未同步」角标 / 文件菜单项 / 离线订单窗。后台同步线程与连线同步
+        # 线程都不是 GUI 线程，回调里**绝不能**直接碰控件。
+        self._change_cb = None
         self._init_db()
 
     # ── 数据库初始化 ──
@@ -128,6 +133,30 @@ class OfflineSync:
             conn.commit()
             conn.close()
 
+    # ── 变更通知（GUI 刷新用） ──
+
+    def set_change_callback(self, callback):
+        """注册「本地订单库发生变化」回调（`callback()` 无参）。
+
+        为什么要有这个钩子（2026-11-06 现场）：后台同步线程成功上报后什么都不通知 GUI，
+        右下角「📴 离线未同步 N」只能等 60 秒定时器才变；离线订单窗更是要手点刷新。
+        现在每个写库动作结束后调一次 `_notify_change()`，GUI 立刻刷角标/菜单项/明细窗。
+
+        回调可能在**任意线程**（后台同步 daemon 线程）里被调用 ⇒ 实现里只能做
+        Qt 信号 emit，绝不能直接碰控件。传 None 取消注册。
+        """
+        self._change_cb = callback if callable(callback) else None
+
+    def _notify_change(self):
+        """数据变了：叫醒注册者（注册者自己负责线程安全）。异常一律吞掉——通知失败不该影响业务。"""
+        cb = getattr(self, "_change_cb", None)
+        if not cb:
+            return
+        try:
+            cb()
+        except Exception:
+            logger.debug("离线订单变更回调失败", exc_info=True)
+
     # ── 保存离线订单 ──
 
     def save_order_offline(
@@ -164,6 +193,7 @@ class OfflineSync:
             conn.commit()
             conn.close()
         logger.info(f"[OFFLINE] 任务已缓存: {order_number} ({len(files_data)} 个文件)")
+        self._notify_change()
         return order_number
 
     # ── 上传单个订单 ──
@@ -285,6 +315,7 @@ class OfflineSync:
 
         logger.info(f"[SYNC] 检测到 {len(rows)} 个待同步离线任务...")
         synced_count = 0
+        rejected_count = 0
 
         for db_id, order_number, files_json, total_price, created_at, owner_name, is_admin_print, remark in rows:
             ok, rejected, err = self._upload_order_detail(
@@ -311,6 +342,7 @@ class OfflineSync:
                         "next_retry_at = 0, last_error = ?, status = ? WHERE id = ?",
                         (err or "云端拒收", STATUS_REJECTED, db_id),
                     )
+                    rejected_count += 1
                 else:
                     # 指数退避：按"本轮之后"的重试次数算等待时间
                     cur = conn.execute(
@@ -327,6 +359,10 @@ class OfflineSync:
 
         if synced_count > 0:
             logger.info(f"[SYNC] 本次同步成功 {synced_count}/{len(rows)} 个任务")
+        # 角标 / 文件菜单项 / 离线订单窗立刻跟着变（不必等 60s 定时器，见 set_change_callback）
+        # 只对"未同步数变了"的情况通知：纯网络失败只改退避时间，界面数字没变。
+        if synced_count > 0 or rejected_count > 0:
+            self._notify_change()
         # P2: 定期清理 synced=1 且创建超过 30 天的旧行（每 100 次调用清理一次）
         self._sync_cycles += 1
         if self._sync_cycles >= 100:
@@ -505,6 +541,7 @@ class OfflineSync:
             conn.close()
         if n > 0:
             logger.info(f"[SYNC] 已重置 {n} 条离线订单的重试状态（手动重试）")
+            self._notify_change()
         return n
 
     def list_pending_orders(self, like: str = "") -> list:
@@ -555,19 +592,24 @@ class OfflineSync:
             conn.commit()
             n = cur.rowcount
             conn.close()
+        if n > 0:
+            self._notify_change()
         return n
 
     def mark_synced(self, order_number: str) -> None:
         """把指定订单号的待同步行标记为已同步（换号流程上报成功后调用）。"""
         with self._lock:
             conn = sqlite3.connect(self.db_path)
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE offline_orders SET synced = 1, status = ?, next_retry_at = 0, "
                 "last_error = '' WHERE order_number = ? AND synced = 0",
                 (STATUS_SYNCED, order_number),
             )
             conn.commit()
+            n = cur.rowcount
             conn.close()
+        if n > 0:
+            self._notify_change()
 
     def clear_all(self) -> int:
         """清空本地订单库全部记录（关闭云端 / 订单已全部上云时调用）。"""
@@ -579,6 +621,7 @@ class OfflineSync:
             conn.close()
         if n > 0:
             logger.info(f"[OFFLINE] 已清空本地订单库 {n} 条记录")
+            self._notify_change()
         return n
 
     def clear_synced(self) -> int:

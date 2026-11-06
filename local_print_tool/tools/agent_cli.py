@@ -15,6 +15,8 @@ agent_cli.py — 命令行调用本地打印工具的「智能助手接口」（
     python tools/agent_cli.py add --tab 2 --file "D:/微信/作业.pdf" --duplex on --copies 2
     python tools/agent_cli.py add --new-tab --file a.pdf --file b.docx --remark "3 号楼 201"
     python tools/agent_cli.py set --tab 2 --index 0 --page-range "1-3,5"
+    python tools/agent_cli.py set --tab 2 --index 0 --xlsx-selection "A1:F20"
+    python tools/agent_cli.py add --new-tab --file 表.xlsx --xlsx-range selection --xlsx-selection "Sheet2!B2:H30"
     python tools/agent_cli.py get --tab 2
     python tools/agent_cli.py rm --tab 2 --index 1
     python tools/agent_cli.py print --tab 2 --yes
@@ -73,6 +75,21 @@ def _job_options(args) -> dict:
         opts["remark"] = args.remark
     if args.name is not None:
         opts["display_name"] = args.name
+    # 表格版式（只对 .xls/.xlsx 有效）：收成一包，与服务端 xlsx_options 同一套键。
+    # 只给了地址、没给范围时自动补 print_range=selection —— 「填了地址就是想打这块」是
+    # 唯一没有歧义的理解；反过来只给 range=selection 却没地址，服务端会明确报错。
+    xlsx = {}
+    for attr, key in (("xlsx_range", "print_range"), ("xlsx_selection", "selection"),
+                      ("xlsx_sheet", "worksheet"), ("xlsx_paper", "paper"),
+                      ("xlsx_orientation", "orientation"), ("xlsx_fit", "fit"),
+                      ("xlsx_scale", "scale")):
+        value = getattr(args, attr, None)
+        if value is not None:
+            xlsx[key] = value
+    if xlsx:
+        if str(xlsx.get("selection") or "").strip() and not xlsx.get("print_range"):
+            xlsx["print_range"] = "selection"
+        opts["xlsx_options"] = xlsx
     return opts
 
 
@@ -136,6 +153,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dpi", type=int, choices=[0, 200, 300, 400, 600])
     s.add_argument("--name")
     s.add_argument("--remark")
+
+    # 表格版式：add / set 共用同一组开关（与面板、与 files.* 的 xlsx_options 一一对应）
+    for node in (a, s):
+        node.add_argument("--xlsx-range",
+                          choices=["active", "workbook", "ignore_area", "selection"],
+                          help="表格打印范围；selection=只打 --xlsx-selection 那块区域")
+        node.add_argument("--xlsx-selection",
+                          help='选定区域地址，如 "A1:F20" / "Sheet1!A1:F20" / "A1:B2,D5:E9"')
+        node.add_argument("--xlsx-sheet", help="只打这张工作表（空=跟随文件的活动表）")
+        node.add_argument("--xlsx-paper", help="纸张大小，如 A4")
+        node.add_argument("--xlsx-orientation", choices=["portrait", "landscape"])
+        node.add_argument("--xlsx-fit", choices=["none", "sheet", "cols", "rows"],
+                          help="缩放方式：none=用 --xlsx-scale / sheet=一页宽高 / cols / rows")
+        node.add_argument("--xlsx-scale", type=int, help="缩放百分比 10~400（fit=none 时生效）")
 
     r = sub.add_parser("rm", help="移除某个文件")
     r.add_argument("--tab")

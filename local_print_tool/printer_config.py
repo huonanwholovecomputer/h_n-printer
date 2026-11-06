@@ -720,7 +720,11 @@ DEFAULT_TASK_OPTIONS: dict = {
     "center_v": False,
     "fit": "cols",                  # "none" | "sheet" | "cols" | "rows"
     "scale": 100,                   # 10..400，仅 fit == "none" 时生效（自定义缩放）
-    "print_range": "active",        # "active" | "workbook" | "ignore_area"（"selection" 已废弃）
+    "print_range": "active",        # "active" | "workbook" | "ignore_area" | "selection"
+    # 「选定区域」的 A1 地址（如 A1:F20 / Sheet1!A1:F20 / '我的表'!A1:F20 / A1:B2,D5:E9）。
+    # 只在 print_range == "selection" 时生效；由表格版式面板或小印智能助手显式给出 ——
+    # Excel 的选区是会话内状态，引擎无人值守时拿不到，绝不猜（为空/非法 ⇒ 记未生效）。
+    "selection": "",
     # 要打印哪张工作表："" = 跟随文件上次保存的活动工作表（默认，与改动前逐像素一致）；
     # 其它值 = 表名（引擎在导出前激活它）。print_range == "workbook" 时忽略本项。
     "worksheet": "",
@@ -732,7 +736,7 @@ DEFAULT_TASK_OPTIONS: dict = {
 }
 
 TASK_OPTION_FITS = ("none", "sheet", "cols", "rows")
-TASK_OPTION_RANGES = ("active", "workbook", "ignore_area")   # "selection" 于 2026-11-03 废弃
+TASK_OPTION_RANGES = ("active", "workbook", "ignore_area", "selection")
 
 
 def _choice_or_default(value, choices, default: str) -> str:
@@ -756,6 +760,22 @@ def _coerce_sheet_name(value) -> str:
     return value.strip()[:120]
 
 
+def _coerce_selection(value) -> str:
+    """选定区域地址归一：去空白、规整逗号/感叹号两侧空格、限长；**不校验地址合法性**。
+
+    合法性只有引擎（`xlsx_printer.is_selection_address`）和智能助手接口在写入时判得准；
+    这里若把对不上的地址悄悄抹成 ""，用户会看到「选了选定区域却打了整张表」还不明原因。
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    text = ",".join(part.strip() for part in text.split(","))
+    text = "!".join(part.strip() for part in text.split("!"))
+    return text[:300]
+
+
 def normalize_task_options(raw) -> dict:
     """把（可能残缺/被手改坏的）默认任务参数字典归一成**完整**一份并夹住取值范围。
 
@@ -764,13 +784,6 @@ def normalize_task_options(raw) -> dict:
     """
     src = raw if isinstance(raw, dict) else {}
     d = DEFAULT_TASK_OPTIONS
-    # 2026-11-03：「选定区域」这一档已从界面和引擎里删除（Excel 的选区是会话内状态，COM
-    # 无人值守打开时拿不到，旧实现等于 active 还会覆盖文件自带的打印区域）。老配置里残留的
-    # "selection" 一律按 active 处理，**不能**掉到全局默认 —— 否则一个把默认设成「整个工作簿」
-    # 的用户，老任务会突然变成导全部工作表。
-    _print_range_raw = src.get("print_range")
-    if isinstance(_print_range_raw, str) and _print_range_raw.strip().lower() == "selection":
-        _print_range_raw = "active"
     return {
         "duplex": _choice_or_default(src.get("duplex"), ("on", "off"), d["duplex"]),
         "duplex_mode": _choice_or_default(src.get("duplex_mode"),
@@ -790,8 +803,9 @@ def normalize_task_options(raw) -> dict:
         "center_v": _bool_or_default(src.get("center_v"), d["center_v"]),
         "fit": _choice_or_default(src.get("fit"), TASK_OPTION_FITS, d["fit"]),
         "scale": int(_coerce_num(src.get("scale"), d["scale"], 10.0, 400.0)),
-        "print_range": _choice_or_default(_print_range_raw, TASK_OPTION_RANGES,
+        "print_range": _choice_or_default(src.get("print_range"), TASK_OPTION_RANGES,
                                           d["print_range"]),
+        "selection": _coerce_selection(src.get("selection")),
         "worksheet": _coerce_sheet_name(src.get("worksheet")),
         "dpi": int(_coerce_num(src.get("dpi"), d["dpi"], 0.0, 1200.0)),
         "image_orientation": _choice_or_default(src.get("image_orientation"),
@@ -817,7 +831,8 @@ def task_options_to_print_options(opts) -> dict:
 
     只挑 Excel PageSetup 认得的项：纸张/方向/四项页边距/页眉页脚/居中/缩放/打印范围；
     外加 `worksheet`（选哪张表——它不是 PageSetup 属性，而是导出前激活哪张表的依据，
-    但同样由「表格版式」面板产出、同样进缓存键，所以一起放在这套键里）。
+    但同样由「表格版式」面板产出、同样进缓存键，所以一起放在这套键里）和 `selection`
+    （「选定区域」的 A1 地址，引擎把它写进 PrintArea；同样进缓存键）。
     其余（duplex/dpi/图片方向/空白页…）不属于版式，不往里塞。
     """
     o = resolve_task_options(opts)
@@ -835,6 +850,7 @@ def task_options_to_print_options(opts) -> dict:
         "fit": o["fit"],
         "scale": o["scale"],
         "print_range": o["print_range"],
+        "selection": o["selection"],
         "worksheet": o["worksheet"],
     }
 
@@ -859,13 +875,14 @@ def resolve_xlsx_print_options(default_task_options, job_options) -> dict | None
 
 # xlsx 引擎认得的版式键（与 task-5 契约一致；面板只写这一套，读配置时也只留这一套）。
 # worksheet（选哪张工作表）是 2026-11-03 新加的第 14 个键；值为 "" 表示"跟随文件上次
-# 保存的活动工作表"，`xlsx_printer.options_signature` 会把空值剔掉，所以没选过表的
-# 任务缓存 key 与旧版逐字符相同，存量 PDF 缓存照常命中。
+# 保存的活动工作表"。selection（选定区域的 A1 地址）是 2026-11-06 重新加回的第 15 个键。
+# 这两项的空值都会被 `xlsx_printer.options_signature` 剔掉，所以没选过表/区域的任务
+# 缓存 key 与旧版逐字符相同，存量 PDF 缓存照常命中。
 XLSX_OPTION_KEYS = (
     "paper", "orientation",
     "margin_top_cm", "margin_bottom_cm", "margin_left_cm", "margin_right_cm",
     "header_cm", "footer_cm", "center_h", "center_v",
-    "fit", "scale", "print_range", "worksheet",
+    "fit", "scale", "print_range", "selection", "worksheet",
 )
 
 
@@ -873,7 +890,7 @@ def _coerce_xlsx_options(value) -> dict:
     """PrintJob.xlsx_options 容错解析：空/非 dict → {}（= 跟随全局默认）。
 
     非空则**归一成完整一套**并只保留 XLSX_OPTION_KEYS —— 面板总是写全套，但配置可能被
-    手改，给引擎的必须永远是干净、夹过范围的 14 个键。
+    手改，给引擎的必须永远是干净、夹过范围的 15 个键。
     """
     if not isinstance(value, dict) or not value:
         return {}

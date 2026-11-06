@@ -29,8 +29,16 @@ op 清单（params 都是 JSON 对象）
     tabs.clear      {tab}               → 清空标签页里的文件（保留标签页）
     tabs.print      {tab, confirm:true} → 开始打印（需显式确认）
     files.add       {paths, tab?, new_tab?, options?, switch?}
-    files.update    {tab, index, ...选项}
+    files.update    {tab, index, ...选项}   # ...选项 同 files.add 的 options
     files.remove    {tab, index}
+
+files.add / files.update 的 options（除 xlsx_options 外都是顶层字段）
+--------------------------------------------------------------------
+    copies  duplex  duplex_mode  page_range  simplex_enabled  simplex_pages
+    display_name  remark  engine  dpi  image_orientation
+    xlsx_options    {…表格版式…}，只对 .xls/.xlsx 有效；键见 docs/智能助手控制接口.md。
+                    「选定区域」= {"print_range": "selection", "selection": "A1:F20"}，
+                    地址可带工作表名（Sheet1!A1:F20）或多块（A1:B2,D5:E9）。
     cloud.orders    {order?, status?, source?, owner?, file?, since?, until?, limit?, offset?}
                                      → 云端订单数据（只读、不限时间；走设备 token）
 """
@@ -67,7 +75,14 @@ MAX_FILES_PER_CALL = 50
 DELIVERY_FIELDS = ("delivery_enabled", "delivery_location", "urgency", "cover_page",
                    "cover_page_price", "owner_name", "is_admin_print", "remark")
 JOB_FIELDS = ("copies", "duplex", "duplex_mode", "page_range", "simplex_enabled",
-              "simplex_pages", "display_name", "remark", "engine", "dpi", "image_orientation")
+              "simplex_pages", "display_name", "remark", "engine", "dpi", "image_orientation",
+              # 表格版式（2026-11-06）：整包一个 dict，键就是 pc.XLSX_OPTION_KEYS。
+              # 为什么收成一包而不是拍平成 15 个顶层字段：这 15 个键的合法值与界面面板
+              # 一一对应、还会一起进 PDF 缓存 key，合成一包才能「要么全对要么全拒」，
+              # 也避免与 page_range（页码范围）在名字上被模型混淆。
+              "xlsx_options")
+# 只有表格文件吃 xlsx_options；其它格式给了就报错，不做静默忽略（模型会以为自己设成了）
+XLSX_EXTS = (".xls", ".xlsx")
 
 
 def _as_int(value, name: str) -> int:
@@ -214,6 +229,12 @@ class AgentOps:
             "engine": getattr(job, "engine", ""),
             "dpi": int(getattr(job, "dpi", 0) or 0),
             "image_orientation": getattr(job, "image_orientation", "auto"),
+            # 表格版式：xlsx_options = 这个任务自己存过的覆盖（空 = 跟随全局默认）；
+            # xlsx_print_options = 打印那一刻真正给引擎的那一套（含选区地址），没有配置时 None。
+            "xlsx_options": dict(getattr(job, "xlsx_options", None) or {}),
+            "xlsx_print_options": pc.resolve_xlsx_print_options(
+                getattr(self.cfg, "default_task_options", None),
+                getattr(job, "xlsx_options", None)),
             "cost": round(cost, 2),
             "order_id": getattr(job, "order_id", None),
         }
@@ -498,6 +519,7 @@ class AgentOps:
             raise AgentOpError("invalid", f"没有可改的字段（可用: {', '.join(JOB_FIELDS)}）")
         self._check_job_options(options)
         job = tab.jobs[index]
+        self._require_xlsx_job(job, options)
         self._apply_job_options(job, options)
         self._save(key, tab.jobs)
         self._refresh_rows(key, tab.jobs, [index])
@@ -623,6 +645,81 @@ class AgentOps:
     # 单文件参数（与界面编辑面板同一口径）
     # ══════════════════════════════════════════════════════════════════
 
+    def _check_xlsx_options(self, value) -> None:
+        """校验表格版式参数（`job.xlsx_options` 那一套，15 个键）。
+
+        校验分两层：先按声明类型/范围逐项挡（错误消息直接指到 `xlsx_options.<键>`），
+        再交给 `printer_config._coerce_xlsx_options` 归一一次 —— 归一后的值才是真正写进
+        任务、真正进缓存 key 的那份，**用归一结果做跨字段判据**才不会出现「原始值合法、
+        归一后却丢了」的漏网。特别是「选定区域」：地址必须现在就能被引擎识别，否则用户
+        选了这一档、打印时才发现没生效，纸已经按整张表出去了。
+        """
+        if value in (None, {}):
+            return
+        if not isinstance(value, dict):
+            raise AgentOpError("invalid", "xlsx_options 必须是 JSON 对象（键见文档）")
+        unknown = set(value) - set(pc.XLSX_OPTION_KEYS)
+        if unknown:
+            raise AgentOpError("invalid",
+                               f"xlsx_options 里有未知键: {', '.join(sorted(unknown))}"
+                               f"（可用: {', '.join(pc.XLSX_OPTION_KEYS)}）")
+        for key in ("paper", "orientation", "fit", "print_range", "worksheet", "selection"):
+            if key in value and not isinstance(value[key], str):
+                raise AgentOpError("invalid", f"xlsx_options.{key} 必须是字符串")
+        for key, (low, high) in (("margin_top_cm", (0.0, 20.0)),
+                                 ("margin_bottom_cm", (0.0, 20.0)),
+                                 ("margin_left_cm", (0.0, 20.0)),
+                                 ("margin_right_cm", (0.0, 20.0)),
+                                 ("header_cm", (0.0, 10.0)),
+                                 ("footer_cm", (0.0, 10.0)),
+                                 ("scale", (10.0, 400.0))):
+            if key not in value:
+                continue
+            try:
+                num = float(value[key])
+            except (TypeError, ValueError):
+                raise AgentOpError("invalid", f"xlsx_options.{key} 必须是数字（收到 {value[key]!r}）")
+            if not (low <= num <= high):
+                raise AgentOpError("invalid",
+                                   f"xlsx_options.{key} 超出范围 {low:g}~{high:g}（收到 {num:g}）")
+        for key in ("center_h", "center_v"):
+            if key in value and not isinstance(value[key], bool):
+                raise AgentOpError("invalid", f"xlsx_options.{key} 必须是 true / false")
+
+        norm = pc._coerce_xlsx_options(value)      # 归一后才是真正生效的一套
+        print_range = str(norm.get("print_range") or "active")
+        selection = str(norm.get("selection") or "")
+        if print_range == "selection":
+            if not selection:
+                raise AgentOpError(
+                    "invalid",
+                    "print_range 选 selection（选定区域）时必须同时给 selection 地址，"
+                    "例如 {\"xlsx_options\": {\"print_range\": \"selection\", "
+                    "\"selection\": \"A1:F20\"}}")
+            import xlsx_printer as xp              # 晚导入：纯标准库模块，这里只借地址解析
+            if not xp.is_selection_address(selection):
+                raise AgentOpError(
+                    "invalid",
+                    f"selection 地址无法识别: {selection!r}"
+                    f"（例 A1:F20 / Sheet1!A1:F20 / A1:B2,D5:E9）")
+        elif selection:
+            raise AgentOpError(
+                "invalid",
+                f"xlsx_options.selection 只在 print_range=selection 时有意义"
+                f"（当前 print_range={print_range}）")
+
+    @staticmethod
+    def _require_xlsx_job(job, options) -> None:
+        """`xlsx_options` 只对表格文件有效；在写任何字段之前先判，避免"份数已改、版式报错"。"""
+        if "xlsx_options" not in options:
+            return
+        ext = _norm_ext(job.file_path or getattr(job, "source_path", "") or "")
+        if ext not in XLSX_EXTS:
+            name = getattr(job, "display_name", "") or os.path.basename(job.file_path or "")
+            raise AgentOpError("invalid",
+                               f"「{name}」不是表格文件（{ext or '无扩展名'}），"
+                               f"xlsx_options 只对 .xls/.xlsx 生效")
+
     def _check_job_options(self, options) -> None:
         if options in (None, {}):
             return
@@ -658,6 +755,8 @@ class AgentOps:
         for k in ("display_name", "remark"):
             if k in options and not isinstance(options[k], str):
                 raise AgentOpError("invalid", f"{k} 必须是字符串")
+        if "xlsx_options" in options:
+            self._check_xlsx_options(options["xlsx_options"])
 
     def _apply_job_options(self, job, options: dict) -> None:
         """把 options 写进 job，并做与界面编辑面板相同的归一化。
@@ -730,6 +829,14 @@ class AgentOps:
                 job.simplex_enabled = False
                 if raw:
                     job.simplex_pages = raw   # 与界面一致：取消勾选只关开关，留住页码
+        if "xlsx_options" in options:
+            self._require_xlsx_job(job, options)
+            new_opts = pc._coerce_xlsx_options(options["xlsx_options"])
+            old_opts = dict(getattr(job, "xlsx_options", None) or {})
+            job.xlsx_options = new_opts
+            # 版式任一键变了就必须重导 PDF：缓存里的那份还是旧纸张/旧区域
+            if new_opts != old_opts:
+                rebuild_pdf = True
         if rebuild_pdf:
             job.cached_pdf = ""
 
