@@ -152,6 +152,43 @@ check("改纸张与页边距能读出来（保存的是控件值，不是初始�
 dlg._on_reset()
 check("「恢复默认」把控件退回默认值", dlg.values()["paper"] == "A4"
       and abs(dlg.values()["margin_top_cm"] - 1.0) < 1e-6)
+
+print("\n=== ③b 页边距/页眉/页脚在主题 QSS 下真的能看见（2026-11-06 用户现场回归） ===")
+# 用户照片：「默认任务参数」窗口的页边距/页眉/页脚六格整片空白，问「这里貌似卡了？」。
+# 根因不是卡死，是 Qt 的 QStyleSheetStyle：应用了主题 QSS + buttonSymbols=NoButtons 时，
+# CC_SpinBox/SC_SpinBoxEditField 只返回 1px，lineEdit 跟着 1px —— 值都在控件里，就是画不出。
+# 修法：保留 UpDownArrows，用控件级 QSS 把按钮压成 0 宽（gui._hide_spin_buttons）。
+from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox  # noqa: E402
+
+
+def _edit_field_width(sp):
+    opt = QStyleOptionSpinBox()
+    opt.initFrom(sp)
+    opt.buttonSymbols = sp.buttonSymbols()
+    return sp.style().subControlRect(QStyle.CC_SpinBox, opt,
+                                     QStyle.SC_SpinBoxEditField, sp).width()
+
+
+_prev_qss = app.styleSheet()
+app.setStyleSheet(io.open(os.path.join(LOCAL_TOOL, "styles_dark.qss"),
+                          encoding="utf-8").read())
+dlg.show()
+QApplication.processEvents()
+_fields = [dlg._margin_spins[k] for k in ("margin_top_cm", "margin_bottom_cm",
+                                          "margin_left_cm", "margin_right_cm")]
+_fields += [dlg._header, dlg._footer]
+check("六个 cm 输入框在主题 QSS 下编辑区真有宽度（≥40px；NoButtons 时只有 1px）",
+      all(_edit_field_width(sp) >= 40 and sp.lineEdit().width() >= 40 for sp in _fields),
+      str([(_edit_field_width(sp), sp.lineEdit().width()) for sp in _fields]))
+# 变异自证：把同一只控件切回 NoButtons，编辑区必须塌成 1px —— 判据不是恒真。
+_fields[0].setButtonSymbols(_gui.QAbstractSpinBox.NoButtons)
+QApplication.processEvents()
+_bad_edit_w = _edit_field_width(_fields[0])
+_fields[0].setButtonSymbols(_gui.QAbstractSpinBox.UpDownArrows)
+app.setStyleSheet(_prev_qss)
+QApplication.processEvents()
+check("变异自证：切回 NoButtons 时编辑区塌成 1px（主题 QSS 下数值完全看不见）",
+      _bad_edit_w <= 1, f"edit={_bad_edit_w}")
 dlg.close()
 
 print("\n=== ④ 保存链路：写进 print_config.json 并能读回 ===")

@@ -34,7 +34,8 @@ import paths  # noqa: E402
 from PySide6.QtCore import QPoint, QPointF, Qt  # noqa: E402
 from PySide6.QtGui import QWheelEvent  # noqa: E402
 from PySide6.QtWidgets import (QApplication, QFrame, QFormLayout,  # noqa: E402
-                               QScrollArea, QAbstractSpinBox)
+                               QScrollArea, QAbstractSpinBox,
+                               QStyle, QStyleOptionSpinBox)
 
 app = QApplication.instance() or QApplication([])
 
@@ -256,9 +257,14 @@ print("\n=== ⑨ 纯输入框 + 不再撑宽面板（2026-11-03 用户要求） 
 _spins = ([win._xlsx_margins[k] for k in ("margin_top_cm", "margin_bottom_cm",
                                           "margin_left_cm", "margin_right_cm")]
           + [win._xlsx_header, win._xlsx_footer, win._xlsx_scale])
-check("七个数控控件都去掉了上下箭头（NoButtons）",
-      all(sp.buttonSymbols() == QAbstractSpinBox.NoButtons for sp in _spins),
-      str([sp.buttonSymbols() for sp in _spins]))
+# 2026-11-06 改判据：**不许再用 NoButtons**。主题 QSS + NoButtons 时 Qt 把编辑区算成
+# 1px（CC_SpinBox/SC_SpinBoxEditField 返回 width=1），值永远画不出来 —— 用户现场「默认
+# 任务参数」的页边距/页眉/页脚整片空白、看着像卡死（照片见 docs 里的空白页边距截图）。
+# 正确做法：保留 UpDownArrows，用控件级 QSS 把按钮压成 0 宽（真机/offscreen 都复现过）。
+check("七个数字控件是「纯输入框」但不用 NoButtons（UpDownArrows + 控件级压零）",
+      all(sp.buttonSymbols() == QAbstractSpinBox.UpDownArrows
+          and "up-button" in sp.styleSheet() for sp in _spins),
+      str([(sp.buttonSymbols(), bool(sp.styleSheet())) for sp in _spins]))
 check("仍然不是裸输入框：范围/两位小数/单位后缀都还在",
       win._xlsx_margins["margin_top_cm"].decimals() == 2
       and win._xlsx_margins["margin_top_cm"].suffix() == " cm"
@@ -285,6 +291,32 @@ check("表格版式面板挂在 QScrollArea 里（下面的宽度判据才有意
 win.show()
 QApplication.processEvents()
 _content = _sw.widget()
+
+
+# 2026-11-06 现场回归闸门：真机截图里页边距/页眉/页脚六格整片空白、看着像卡死。
+# 根因是「主题 QSS + NoButtons」把编辑区算成 1px（值仍在控件里，只是画不出来）。
+def _edit_field_width(sp: QAbstractSpinBox) -> int:
+    opt = QStyleOptionSpinBox()
+    opt.initFrom(sp)
+    opt.buttonSymbols = sp.buttonSymbols()
+    return sp.style().subControlRect(QStyle.CC_SpinBox, opt,
+                                     QStyle.SC_SpinBoxEditField, sp).width()
+
+
+_sp_geo = win._xlsx_margins["margin_top_cm"]
+_edit_w = _edit_field_width(_sp_geo)
+check("页边距输入框的编辑区真有宽度（≥40px；用 NoButtons 时只有 1px）",
+      _edit_w >= 40 and _sp_geo.lineEdit().width() >= 40,
+      f"edit={_edit_w} lineEdit={_sp_geo.lineEdit().width()} 控件宽 {_sp_geo.width()}")
+# 变异自证：同一只控件临时切回 NoButtons，编辑区必须塌成 1px —— 证明上面那条判据不是恒真。
+_sp_geo.setButtonSymbols(QAbstractSpinBox.NoButtons)
+QApplication.processEvents()
+_bad_w = _edit_field_width(_sp_geo)
+_sp_geo.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+QApplication.processEvents()
+check("变异自证：切回 NoButtons 时编辑区确实塌成 1px",
+      _bad_w <= 1 and _edit_field_width(_sp_geo) >= 40,
+      f"NoButtons edit={_bad_w}，恢复后 edit={_edit_field_width(_sp_geo)}")
 # 判据 1：模块自己的最小宽度要和面板里其它模块同量级（最宽的其它控件是 DPI 下拉 126）。
 # 旧的两列式 + 带箭头 + 长文案下拉是 166/248，比其它模块都宽 ⇒ 面板一窄就裁它。
 _other_w = max(win._edit_dpi.minimumSizeHint().width(),

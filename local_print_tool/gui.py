@@ -119,7 +119,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.6.6"
+APP_VERSION = "4.6.7"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -244,6 +244,29 @@ def _disable_spin_wheel(spin: QAbstractSpinBox) -> None:
     数字框被滚一下就改值、还顺手写回任务参数，比下拉框更该拦（2026-11-03）。
     """
     spin.installEventFilter(_WheelToScrollAreaFilter(spin))
+
+
+# 「纯输入框」的按键隐藏规则：控件级 QSS，只把这一只数字框的上下箭头压成 0 宽。
+# **别改用 setButtonSymbols(QAbstractSpinBox.NoButtons)**：Qt 的 QStyleSheetStyle 在
+# 「应用了主题 QSS + NoButtons」时把编辑区算成 1px（CC_SpinBox/SC_SpinBoxEditField 返回
+# width=1，lineEdit 也跟着 1px），数值永远画不出来 —— 2026-11-06 用户现场：默认任务参数
+# 窗口的页边距/页眉/页脚六格整片空白，看着像卡死。与 QSS 里的 padding 无关（去掉 padding
+# 照样 1px），只跟「有 QSS + NoButtons」这个组合有关。
+# 保留 UpDownArrows + 按钮宽高为 0：编辑区按正常宽度算，键盘步进/校验语义不变，
+# 主题其余样式仍从 app 级 QSS 继承（不能用全局规则，否则「自定义缩放」等该带箭头的也会被压平）。
+_NO_BUTTONS_QSS = (
+    "QAbstractSpinBox::up-button, QAbstractSpinBox::down-button,"
+    "QAbstractSpinBox::up-arrow, QAbstractSpinBox::down-arrow"
+    " { width: 0px; height: 0px; border: none; background: transparent; }")
+
+
+def _hide_spin_buttons(spin: QAbstractSpinBox) -> None:
+    """把数字框变成纯输入框：不画上下箭头（按钮压成 0 宽，**不是** NoButtons）。
+
+    验收：other/tests/verify_options_menu.py 会检查编辑区宽度 —— 用了 NoButtons 就是 1px。
+    """
+    spin.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
+    spin.setStyleSheet(_NO_BUTTONS_QSS)
 
 
 class _OwnerComboRefreshFilter(QObject):
@@ -2672,7 +2695,7 @@ class DefaultTaskOptionsDialog(QDialog):
             sp.setValue(float(opts[key]))
             sp.setToolTip("表格版式的页边距；Word/PDF 的排版由文档自己决定，不受这一项影响")
             # 纯输入框：去掉上下箭头（与右侧「任务参数」面板同一口径，2026-11-03）
-            sp.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            _hide_spin_buttons(sp)
             self._margin_spins[key] = sp
             f2.addRow(label, sp)
 
@@ -2682,7 +2705,7 @@ class DefaultTaskOptionsDialog(QDialog):
         self._header.setSingleStep(0.1)
         self._header.setSuffix(" cm")
         self._header.setValue(float(opts["header_cm"]))
-        self._header.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        _hide_spin_buttons(self._header)
         f2.addRow("页眉：", self._header)
         self._footer = QDoubleSpinBox()
         self._footer.setRange(0.0, 10.0)
@@ -2690,7 +2713,7 @@ class DefaultTaskOptionsDialog(QDialog):
         self._footer.setSingleStep(0.1)
         self._footer.setSuffix(" cm")
         self._footer.setValue(float(opts["footer_cm"]))
-        self._footer.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        _hide_spin_buttons(self._footer)
         f2.addRow("页脚：", self._footer)
 
         center_row = QHBoxLayout()
@@ -5386,7 +5409,7 @@ class CloudTaskListWindow(QDialog):
         auto_row = QHBoxLayout()
         auto_row.addWidget(QLabel("自动关闭：待确认任务清空后"))
         self._auto_minutes = QSpinBox()
-        self._auto_minutes.setButtonSymbols(QSpinBox.NoButtons)  # 与主界面输入框一致：隐藏加减箭头
+        _hide_spin_buttons(self._auto_minutes)  # 与主界面输入框一致：隐藏加减箭头
         self._auto_minutes.setRange(0, 60)
         self._auto_minutes.setValue(5)
         self._auto_minutes.setSuffix(" 分钟")
@@ -5394,7 +5417,7 @@ class CloudTaskListWindow(QDialog):
         self._auto_minutes.valueChanged.connect(self._on_auto_close_changed)
         auto_row.addWidget(self._auto_minutes)
         self._auto_seconds = QSpinBox()
-        self._auto_seconds.setButtonSymbols(QSpinBox.NoButtons)  # 与主界面输入框一致：隐藏加减箭头
+        _hide_spin_buttons(self._auto_seconds)  # 与主界面输入框一致：隐藏加减箭头
         self._auto_seconds.setRange(0, 59)
         self._auto_seconds.setValue(0)
         self._auto_seconds.setSuffix(" 秒")
@@ -11518,7 +11541,7 @@ class MainWindow(QMainWindow):
             sp.setSingleStep(0.1)
             sp.setSuffix(" cm")
             sp.setToolTip(tip)
-            sp.setButtonSymbols(QAbstractSpinBox.NoButtons)
+            _hide_spin_buttons(sp)
             _disable_spin_wheel(sp)
             sp.valueChanged.connect(self._auto_apply_edit)
             return sp
@@ -11576,7 +11599,7 @@ class MainWindow(QMainWindow):
         self._xlsx_scale.setSuffix(" %")
         self._xlsx_scale.setToolTip("自定义缩放百分比（只在缩放选「无缩放」时使用）")
         # 同上面那组 cm 输入：纯输入框，不画上下箭头，也不吃滚轮
-        self._xlsx_scale.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        _hide_spin_buttons(self._xlsx_scale)
         _disable_spin_wheel(self._xlsx_scale)
         self._xlsx_scale.valueChanged.connect(self._auto_apply_edit)
         _xform.addRow("自定义缩放：", self._xlsx_scale)
