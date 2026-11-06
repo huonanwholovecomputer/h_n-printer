@@ -218,6 +218,16 @@ PDF 等后端可直接数页的类型：上传时即用 pypdf 数页返回；`/a
 
 ---
 
+## 语音助手「小印」（附属项目）
+
+本地打印工具配了一个语音入口：说一句「小印」或按热键（默认 `Ctrl+Alt+J`），屏幕底部弹出浮窗开始听，本机识别成文字后送进 DSH 的一个固定会话，回答贴回同一个窗里。它围着这套系统的产物转：只读台账 `ledger.db` 与打印机日志（**只读不写**），用来回答「这份文件是谁发的」「这个群该不该查」这类问题；没有那套数据，它就退化成外接 DSH 会话的语音开麦工具。
+
+- 仓库：[huonanwholovecomputer/dsh-voice-copilot](https://github.com/huonanwholovecomputer/dsh-voice-copilot)
+- 安装：复制 `cordis.patch.example.yml` 为 `cordis.patch.yml`（改 `dataDir` / `agentPreset` / `cwd` 三个值），再用 `dsh plugin --profile <profile> add <本目录>` 装成 bundle，重启桌面端浮窗自动起来
+- 仓库不含唤醒词/识别模型（`models/`，约 2 GB）与本机路径配置（`.gitignore` 挡在外面），换机器要自己拷
+
+---
+
 ## 开发
 
 ### 本地打印工具
