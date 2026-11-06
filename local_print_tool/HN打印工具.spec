@@ -41,7 +41,11 @@ a = Analysis(
     # 根因：pymupdf.table → pandas → networkx/scipy → torch 级联，加上 numpy/llvmlite 等，把安装包从 110MB 撑到 231MB。
     # 已核实安全：应用自身与保留依赖(PySide6/PyMuPDF/PyPDF2/reportlab/python-docx/requests)均不 import numpy；
     #   pymupdf 仅在 to_pandas() 内惰性用 pandas（本工具不做表格提取）；engineio/socketio 对 aiohttp 为 try 保护导入（同步客户端走 requests）。
+    # 2026-11-06：PyMuPDF 2.0 新增 pymupdf.layout / pymupdf4llm（版面分析、OCR），它们顶层 import cv2，
+    #   打包会把整份 opencv（_internal/cv2 ≈ 112MB 的 DLL）塞进安装包，安装包从 70MB 涨到 100MB。
+    #   本工具的图片处理只走 PIL（converter._convert_image_to_pdf），全仓库不 import cv2，故直接排除。
     excludes=['torch', 'tensorflow', 'jax', 'onnx', 'onnxruntime',
+              'cv2',
               'scipy', 'pandas', 'numpy',
               'networkx', 'numba', 'llvmlite',
               'matplotlib', 'sympy', 'mpmath', 'ml_dtypes', 'contourpy',
