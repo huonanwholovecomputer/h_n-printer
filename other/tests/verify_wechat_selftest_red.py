@@ -27,10 +27,10 @@ CASES = [
         os.path.join(REPO, "other", "tests", "verify_wechat_recent_orders.js"),
     ),
     (
-        "②离线攒批：恢复「设备离线就直接 return」的旧拦截",
+        "②离线攒批：恢复「设备离线就直接 return」的旧拦截（2026-11 已放开，随时可切）",
         os.path.join(MP, "pages", "index", "index.js"),
-        "if (device.online !== false && device.stack_can_toggle === false) {",
-        "if (device.online === false) { return }\n      if (device.online !== false && device.stack_can_toggle === false) {",
+        "      const index = e.currentTarget.dataset.index\n      const device = (this.data.claimingDevices || [])[index]",
+        "      if (((this.data.claimingDevices || [])[e.currentTarget.dataset.index] || {}).online === false) return\n      const index = e.currentTarget.dataset.index\n      const device = (this.data.claimingDevices || [])[index]",
         os.path.join(REPO, "other", "tests", "verify_wechat_offline_stack.js"),
     ),
     (
@@ -41,18 +41,18 @@ CASES = [
         os.path.join(REPO, "other", "tests", "verify_wechat_wheel.js"),
     ),
     (
-        "④嵌套滚动：去掉「内容变化后作废旧实测高」",
-        os.path.join(MP, "pages", "index", "index.js"),
-        "      if (this._lastContentEst !== undefined && Math.abs(contentPx - this._lastContentEst) > 1) {\n        this._fileListRealPx = 0\n      }",
-        "      // (自证：故意去掉作废)",
+        "④嵌套滚动：把「内层到边后的余量交给外层」去掉（内层吃完就吃掉整帧）",
+        os.path.join(MP, "utils", "scroll.wxs"),
+        "      var rest = need - take;",
+        "      var rest = 0;",
         os.path.join(REPO, "other", "tests", "verify_wechat_nested_scroll.js"),
     ),
     (
-        "④嵌套滚动：listOverflow 改回用原始估值（不折算 4~7% 误差）",
-        os.path.join(MP, "pages", "index", "index.js"),
-        "const contentRealEst = Math.round(contentPx / FILE_CARD_HEIGHT_EST_OVER)\n      const listOverflow = contentRealEst > (this.data.fileListHeight || 0) + 1",
-        "const contentRealEst = contentPx\n      const listOverflow = contentRealEst > (this.data.fileListHeight || 0) + 1",
-        os.path.join(REPO, "other", "tests", "verify_wechat_nested_scroll.js"),
+        "④嵌套滚动：外层贴边判定的方向反过来（上滑却去比 minY）",
+        os.path.join(MP, "utils", "scroll.wxs"),
+        "  return state.y <= state.minY + 0.5;",
+        "  return state.maxY > 0 && state.y >= state.maxY - 0.5;",
+        os.path.join(REPO, "other", "tests", "verify_nested_scroll_handoff.js"),
     ),
 ]
 

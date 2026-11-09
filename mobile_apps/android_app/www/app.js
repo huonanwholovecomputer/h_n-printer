@@ -422,6 +422,11 @@ class FlingEngine {
     this.el.style.overflow = 'hidden';
     this.el.style.touchAction = 'pan-y';
 
+    // 内层滚动行程的手势内估计（见 onTouchStart；NaN/undefined 一律按 0 处理）
+    this._nestMax = 0;
+    this._nestEst = 0;
+    this._nestDir = 0;
+
     this._debouncedMeasure = () => {
       if (this._measureTimer) clearTimeout(this._measureTimer);
       this._measureTimer = setTimeout(() => { this._measureTimer = null; this.measure(); }, 100);
@@ -522,6 +527,13 @@ class FlingEngine {
     this._nestedEl = nestedEl;
     // 起手在内层且内层真能滚 → 本手势改用 passive touchmove（内层走合成器线程，不卡）
     this._usePassiveNested(!!nestedEl && (nestedEl.scrollHeight - nestedEl.clientHeight) > 1);
+    // 内层行程的**手势内累计估计**（2026-11-09）：touchmove 里读到的 el.scrollTop 是上一帧的值
+    // （WebView 的滚动由合成器线程异步应用），直接拿它算「还剩多少行程」会少算 ⇒ 贴边那一帧
+    // 内层还在滚、外层也按"没行程了"接管 ⇒ 内外层同时位移（现场：「滑列表整页跟着动」）。
+    // 所以起手记一份估计值，之后按本手势方向的消耗量累加；反向拖动时才回读真实 scrollTop 校准。
+    this._nestMax = nestedEl ? Math.max(0, nestedEl.scrollHeight - nestedEl.clientHeight) : 0;
+    this._nestEst = nestedEl ? Math.max(0, Math.min(this._nestMax, nestedEl.scrollTop || 0)) : 0;
+    this._nestDir = 0;
     const touches = e.touches || [];
     if (touches.length > 0) {
       this._startX = touches[0].clientX;
@@ -575,14 +587,24 @@ class FlingEngine {
     // 嵌套滚动接力（与小程序 WXS scroll.wxs 同口径）：
     // ddy < 0 手指上滑（外层 y 增大 / 内层滚到底）；ddy > 0 手指下滑（外层 y 减小 / 内层滚到顶）。
     // 内层还能往手势方向滚 → 让原生滚；贴边 → 引擎接管外层；外层到边界反向 → 再交还内层。
-    // 只在真正位移（>=0.5px）时判定：ddy≈0 的重复事件不能当成"贴边"，否则列表滚到一半就被抢走。
-    if (Math.abs(ddy) >= 0.5) {
+    // 门槛用 ddy !== 0（不再是 >=0.5）：累计估计要靠每一帧的位移推进，慢速拖动时单帧常小于
+    // 0.5px，若把这些帧跳过，估计值会明显落后于真实 scrollTop ⇒ 贴边时多出一段"内层不动、
+    // 外层也不动"的死区。ddy === 0 的重复事件直接跳过（不推进、不判定）。
+    if (ddy !== 0) {
       if (this._nestedScroll) {
         const el = this._nestedScroll;
-        const maxTop = el.scrollHeight - el.clientHeight;
+        const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        // 手势内累计估计（见 onTouchStart 里的注释）：只有方向反转时才回读真实值校准
+        const dir = ddy < 0 ? 1 : -1;
+        if (this._nestDir && dir !== this._nestDir) {
+          this._nestEst = el.scrollTop;
+        }
+        this._nestDir = dir;
+        const est = Math.max(0, Math.min(maxTop, this._nestEst));
         // room：内层在**本手势方向**上还剩多少行程（上滑剩到底的、下滑剩到顶的）
-        const room = ddy < 0 ? maxTop - el.scrollTop : el.scrollTop;
+        const room = ddy < 0 ? maxTop - est : est;
         if (room >= Math.abs(ddy)) {
+          this._nestEst = Math.max(0, Math.min(maxTop, est - ddy));
           this._lastY = cur.clientY;
           this._lastT = now;
           return;   // 这一帧内层自己吃得下 → 整帧交原生
@@ -595,16 +617,21 @@ class FlingEngine {
         // Math.max(0, room)：内层若已被橡皮筋拉过边界（scrollTop 越界），余量按 0 计，
         // 否则会把越界量当成"负余量"加回去，变成一次跳变。
         ddy = ddy < 0 ? ddy + Math.max(0, room) : ddy - Math.max(0, room);
+        this._nestEst = ddy < 0 ? maxTop : 0;
         this._nestedScroll = null; // 内层到边界 → 引擎接管
       } else if (this._nestedEl) {
         const el = this._nestedEl;
         const outerBlocked = ddy > 0
           ? this.y <= this.minY + 0.5
           : (this.maxY > 0 && this.y >= this.maxY - 0.5);
-        const maxTop = el.scrollHeight - el.clientHeight;
-        const innerCanReturn = ddy > 0 ? el.scrollTop > 0.5 : el.scrollTop < maxTop - 0.5;
+        const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        // 交还判据同样用手势内估计：外层接管期间真实 scrollTop 可能被惯性带着漂移
+        const est = Math.max(0, Math.min(maxTop, this._nestEst));
+        const innerCanReturn = ddy > 0 ? est > 0.5 : est < maxTop - 0.5;
         if (outerBlocked && innerCanReturn) {
           this._nestedScroll = el; // 交还内层（本帧不 preventDefault → 原生继续滚）
+          this._nestEst = est;
+          this._nestDir = 0;
           this._lastY = cur.clientY;
           this._lastT = now;
           return;
@@ -635,6 +662,7 @@ class FlingEngine {
     this._trackId = null;
     this._nestedScroll = null;
     this._nestedEl = null;
+    this._nestDir = 0;               // 手势内累计估计只在本手势内有效
     this._usePassiveNested(false);   // 手势结束恢复非 passive 监听（外层惯性仍需 preventDefault）
     this.startPhysics();
   }

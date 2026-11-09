@@ -57,11 +57,11 @@ function ensureState(state) {
     state.prevFlingVel = 0;
     state.lastFlingT = 0;
     state.spring = null;
-    state.nested = false;
-    state.nestedAllowed = false;
-    state.listOverflow = false;
-    state.listAtTop = true;
-    state.listAtBottom = false;
+    // 内层滚动框（订单详情的文件列表 / 打印页的文件列表）：由本文件直驱 translateY
+    state.nbSel = '';          // 逻辑层下发：内层滚动框选择器（'' = 本页没有内层列表）
+    state.nbTrackSel = '';     // 逻辑层下发：内层内容 track 选择器
+    state.nb = null;           // 本次手势命中的内层框 { idx, box, track, y, maxY, v, active, lastT }
+    state.nbRun = false;       // 内层惯性循环在跑
     state.touching = false;
     state.cbBucket = -1;
     state.closePicker = false;
@@ -447,6 +447,132 @@ function startPhysics(state, owner) {
   startDecel(state, owner);
 }
 
+// ---- 内层滚动框（订单详情的文件列表 / 打印页的文件列表）----
+// 为什么内层不再交给原生 scroll-view 自己滚（2026-11-09 现场，用户报了一个月）：
+//   ① 详情列表只有 max-height（高度随内容、到上限封顶），scroll-view 拿不到确定高度就不会
+//      在内部滚动，只会被外层 `.order-card-detail` 的 overflow:hidden 裁掉 —— 第 6 个文件
+//      永远看不到（旧版 hint 写着「列表可上下滑动」却滑不动）；
+//   ② 原生框滚到边之后没有任何回调能「把事件交还外层」：加 catchtouchmove 会把 touchmove
+//      整个吃掉（外层再也拿不到滚动），不 catch 又会在贴边后继续被内层吞掉。现场表现就是
+//      「滑到底/顶，整个页面不跟着动」。
+// 所以内层内容包一层 track，由本文件 setStyle 直驱 translateY（与页面同一套物理），
+// 偏移与边界全部来自两个 rect，**不需要**逻辑层 bindscroll → setData → change:prop 的三跳同步。
+// 规则（一次手势内）：内层先吃 → 内层贴边后余量立刻交给外层 → 反向外层贴边再交还内层。
+// 末段由谁消费，抬手后的惯性就归谁；内层惯性撞边后余速交给外层继续翻页。
+function rectBottom(r) {
+  return typeof r.bottom === 'number' ? r.bottom : r.top + (r.height || 0);
+}
+
+function rectRight(r) {
+  return typeof r.right === 'number' ? r.right : r.left + (r.width || 0);
+}
+
+// 命中内层滚动框：逐个量框与 track 的 rect
+// （同一页可能同时展开多张订单卡，selectComponent 只能拿到第一个，必须用 selectAllComponents）
+// 触点落在框内、且内容确实超框才算命中；命中后 y = 框顶 - 内容顶 = 当前的内部偏移。
+function measureNested(state, owner, point) {
+  if (!state.nbSel) return null;
+  var boxes = null;
+  if (typeof owner.selectAllComponents === 'function') {
+    boxes = owner.selectAllComponents(state.nbSel);
+  } else if (typeof owner.selectComponent === 'function') {
+    var single = owner.selectComponent(state.nbSel);
+    if (single) boxes = [single];
+  }
+  if (!boxes || !boxes.length) return null;
+  for (var i = 0; i < boxes.length; i++) {
+    var box = boxes[i];
+    if (!box || typeof box.getBoundingClientRect !== 'function') continue;
+    var br = box.getBoundingClientRect();
+    if (!br || !(br.height > 0)) continue;
+    if (point.clientY < br.top || point.clientY > rectBottom(br)) continue;
+    if (point.clientX < br.left || point.clientX > rectRight(br)) continue;
+    var track = null;
+    if (state.nbTrackSel && typeof box.selectComponent === 'function') {
+      track = box.selectComponent(state.nbTrackSel);
+    }
+    if (!track || typeof track.getBoundingClientRect !== 'function') continue;
+    var tr = track.getBoundingClientRect();
+    if (!tr || !(tr.height > 0)) continue;
+    var maxY = tr.height - br.height;
+    if (maxY < 1) return null;      // 内容没超框 → 本框不可滚，整页照常滚
+    var o = br.top - tr.top;
+    if (o !== o || o < 0) o = 0;    // NaN 防御
+    if (o > maxY) o = maxY;
+    return { idx: i, box: box, track: track, y: o, maxY: maxY, v: 0, active: true, lastT: 0 };
+  }
+  return null;
+}
+
+function nbApply(state, owner) {
+  var nb = state.nb;
+  if (!nb || !nb.track) return;
+  nb.track.setStyle({ transform: 'translateY(' + (-nb.y) + 'px)' });
+}
+
+// 内层吃掉 need（>0 内容下移，<0 内容上移），返回实际吃掉的量
+function nbEat(nb, need) {
+  var room = need > 0 ? nb.maxY - nb.y : nb.y;
+  if (room <= 0.0001) return 0;
+  var take = need > 0 ? Math.min(need, room) : -Math.min(-need, room);
+  nb.y += take;
+  if (nb.y < 0) nb.y = 0;
+  if (nb.y > nb.maxY) nb.y = nb.maxY;
+  return take;
+}
+
+// 外层在该方向上是否已经到边（到边才允许把滚动交还内层，否则一次手势里会来回跳）
+// need > 0 = 手指上滑（外层 y 增大，往底部走）；need < 0 = 手指下滑（外层 y 减小，往顶部走）
+function outerAtEdge(state, need) {
+  if (need > 0) return state.maxY > 0 && state.y >= state.maxY - 0.5;
+  return state.y <= state.minY + 0.5;
+}
+
+// 内层自己的惯性（与页面同一套幂律摩擦）：撞到内层边界后，剩下的速度交给外层继续翻，
+// 这样「短列表只有几十像素行程」的场合也不会出现"一抬手就整段停住"的断裂感。
+function startNbDecel(state, owner, nb) {
+  state.running = false;
+  state.inDecel = false;
+  state.spring = null;
+  state.nbRun = true;
+  nb.lastT = getDate().getTime();
+  owner.requestAnimationFrame(function () { nbDecelTick(state, owner, nb); });
+}
+
+function nbDecelTick(state, owner, nb) {
+  if (!state.nbRun) return;
+  var now = getDate().getTime();
+  var dt = Math.max(1, now - nb.lastT);
+  nb.lastT = now;
+  var speed = Math.abs(nb.v);
+  var k = CFG.friction;
+  if (speed < CFG.lowSpeedThreshold) k *= CFG.lowSpeedFactor;
+  nb.v -= sign(nb.v) * k * Math.pow(speed, CFG.power) * dt;
+  nb.y += nb.v * dt;
+  if (nb.y < 0 || nb.y > nb.maxY) {
+    nb.y = nb.y < 0 ? 0 : nb.maxY;
+    nbApply(state, owner);
+    var carry = nb.v;
+    nb.v = 0;
+    state.nbRun = false;
+    state.nb = nb;
+    // 余速交给外层（方向语义一致：nb.v > 0 = 内容上移 = 外层 y 增大）
+    if (Math.abs(carry) >= CFG.stopVelocity && state.maxY > state.minY) {
+      state.vel = carry;
+      startDecel(state, owner);
+    }
+    return;
+  }
+  if (Math.abs(nb.v) < CFG.stopVelocity) {
+    nb.v = 0;
+    state.nbRun = false;
+    nbApply(state, owner);
+    return;
+  }
+  nbApply(state, owner);
+  owner.requestAnimationFrame(function () { nbDecelTick(state, owner, nb); });
+}
+
 module.exports = {
   // 逻辑层 setData(scrollConfig) → 视图层同步滚动边界（低频，不走每帧）
   onConfig: function (newValue, oldValue, ownerInstance, instance) {
@@ -458,10 +584,11 @@ module.exports = {
     state.maxY = newValue.maxY || 0;
     state.scrollerH = newValue.scrollerH || 0;
     state.contentH = newValue.contentH || 0;
-    state.listOverflow = !!newValue.listOverflow;
-    // 内层列表贴边状态（逻辑层 bindscroll 同步）：null/undefined 时保持原值，避免误判成"贴边"导致抢滚
-    if (newValue.listAtTop !== undefined) state.listAtTop = !!newValue.listAtTop;
-    if (newValue.listAtBottom !== undefined) state.listAtBottom = !!newValue.listAtBottom;
+    // 内层滚动框选择器（订单详情 / 打印页的文件列表）：由视图层直驱，不再需要逻辑层
+    // 用 bindscroll → setData → change:prop 三跳同步「贴顶/贴底」——那三跳就是贴边判定的死区：
+    // 内层已经到底，视图层还拿到旧的「可滚」，于是这一帧谁都不动（用户说的「滑到底页面不跟着走」）。
+    if (newValue.nestedSel !== undefined) state.nbSel = newValue.nestedSel || '';
+    if (newValue.nestedTrackSel !== undefined) state.nbTrackSel = newValue.nestedTrackSel || '';
     state.closePicker = !!newValue.closePicker;
     // 底部留白（px）：逻辑层显式下发（_bottomPad + _tabOverlayPx）；老页面配置里没有这个
     // 字段时，从这一次的 maxY 反推一次（maxY = contentH - scrollerH + pad）并记住 ——
@@ -533,20 +660,11 @@ module.exports = {
     if (state.closePicker) {
       ownerInstance.callMethod('onWxsTouchStart', {});
     }
-    // 内层有界文件列表：触点落在其可视区内且列表确实可滚 → 让给原生
-    state.nested = false;
-    state.nestedAllowed = false;
-    if (state.listOverflow) {
-      var list = ownerInstance.selectComponent('.file-list-scroll');
-      if (list) {
-        var rect = list.getBoundingClientRect();
-        if (rect && t0.clientY >= rect.top && t0.clientY <= rect.bottom) {
-          state.nested = true;
-          // 记住"本手势起于内层列表"：外层滚到边界后反向拖拽时要能交还内层（双向滚动接力）
-          state.nestedAllowed = true;
-        }
-      }
-    }
+    // 内层滚动框：触点落在框内且内容确实超框 → 本手势由内层先消费
+    // （逐个量 rect；同一页可能同时展开多张订单卡，measureNested 会跳过不可滚的框）
+    state.nbRun = false;
+    state.nb = null;
+    state.nb = measureNested(state, ownerInstance, t0);
   },
   touchmove: function (event, ownerInstance) {
     var state = ownerInstance.getState();
@@ -574,31 +692,41 @@ module.exports = {
     var ddy = t0.clientY - state.lastY;
     var dt = Math.max(1, now - state.lastT);
     // ---- 嵌套滚动接力（内层文件列表 ↔ 外层页面）----
-    // ddy < 0：手指上滑（内容上移，外层 y 增大 / 内层滚到底）
-    // ddy > 0：手指下滑（内容下移，外层 y 减小 / 内层滚到顶）
-    // 判据全部来自逻辑层同步的贴边状态与当前 y，不需要内层 scrollTop（WXS 读不到）。
-    if (state.nested) {
-      if (ddy === 0) { state.lastY = t0.clientY; state.lastT = now; return true; }
-      // 内层还能往手势方向滚 → 继续让给原生
-      var innerCanGo = ddy < 0 ? !state.listAtBottom : !state.listAtTop;
-      if (innerCanGo) {
+    // ddy < 0：手指上滑（内容上移：外层 y 增大 / 内层偏移增大）
+    // ddy > 0：手指下滑（内容下移：外层 y 减小 / 内层偏移减小）
+    // 逐帧规则：内层先吃本帧位移，吃不下（到边）的余量在同一帧交给外层；
+    // 反过来，外层已经到边时把位移交还内层。两边位置都是精确量出来的，
+    // 不依赖任何逻辑层同步的贴边状态 ⇒ 没有死区，也不会双倍位移。
+    // 门槛用 ddy !== 0（不是 >0.5px）：慢速拖动单帧位移常常不到 1px，
+    // 若把这些帧跳过，它们会整帧落进外层分支 ⇒ 内层还在滚、外层也动 = 双部位移。
+    if (ddy === 0) {
+      state.lastY = t0.clientY;
+      state.lastT = now;
+      return true;
+    }
+    if (state.nb) {
+      var nb = state.nb;
+      var need = -ddy;
+      var take = 0;
+      if (nb.active || outerAtEdge(state, need)) {
+        take = nbEat(nb, need);
+      }
+      if (take !== 0) {
+        nbApply(state, ownerInstance);
+        nb.active = true;
+      }
+      var rest = need - take;
+      if (rest === 0) {
+        // 内层吃下整帧：外层一动不动（用户要的「先滚列表」）
+        state.vel = state.vel * 0.6 + (-ddy / dt) * 0.4;
         state.lastY = t0.clientY;
         state.lastT = now;
+        pushSample(state, now, t0.clientY);
         return true;
       }
-      state.nested = false; // 内层已贴边 → 外层接管（同一次手势内无缝续滚，不再卡在列表里）
-    } else if (state.nestedAllowed && ddy !== 0) {
-      // 反向接力：外层已到边界、且手势方向回到内层能滚的方向 → 交还内层
-      var outerBlocked = ddy > 0
-        ? state.y <= state.minY + 0.5
-        : (state.maxY > 0 && state.y >= state.maxY - 0.5);
-      var innerCanReturn = ddy > 0 ? !state.listAtTop : !state.listAtBottom;
-      if (outerBlocked && innerCanReturn) {
-        state.nested = true;
-        state.lastY = t0.clientY;
-        state.lastT = now;
-        return true;
-      }
+      // 内层到边：余量交给外层续滚（只给余量，不是整帧）
+      nb.active = false;
+      ddy = -rest;
     }
     if (Math.abs(ddy) > 0.5) state.moved = true;
     state.y -= ddy;
@@ -622,8 +750,17 @@ module.exports = {
       return;
     }
     state.trackId = -1;
-    state.nested = false;
-    state.nestedAllowed = false;
+    // 谁吃下最后一帧，抬手后的惯性就归谁（内层自己滑，外层不动）
+    var nb = state.nb;
+    if (nb && nb.active) {
+      estimateReleaseVel(state);
+      nb.v = Math.max(-CFG.maxVelocity, Math.min(CFG.maxVelocity, state.vel));
+      state.vel = 0;
+      if (Math.abs(nb.v) >= CFG.stopVelocity) {
+        startNbDecel(state, ownerInstance, nb);
+      }
+      return;
+    }
     startPhysics(state, ownerInstance);
   },
   onCmd: function (newValue, oldValue, ownerInstance, instance) {

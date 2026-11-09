@@ -928,6 +928,23 @@ function unbindWechatAccount() {
 /* ================= 订单 ================= */
 
 // 订单数据加工（价格/文件大小/isExcel），加载与轮询共用，保证"已送达"等判断不丢字段
+/* 订单级「合计页数 / 合计份数 / 合计张数」的展示文案（2026-11-07 用户要求，与小程序同口径）。
+   历史口径：Excel 订单一律写「不适用」——那是页数分析还不覆盖表格的年代（后端只给兜底 1 页，
+   显示出来是假数）。现在表格也会经本地工具回报真实页数（order_files.page_count →
+   后端 effective_pages / total_pages / total_sheets），再一律「不适用」就是把已知信息藏起来。
+   改为数据驱动：后端给了数就显示；确实未知（page_count=0 ⇒ total_* 也是 0）才写「不适用」，
+   绝不拿兜底的 1 页充数。Excel 与其它格式走同一条规则，不再按扩展名分叉。 */
+function orderTotalsText(o) {
+  const pages = Number(o.total_pages) || 0;
+  const copies = Number(o.total_copies) || Number(o.copies) || 0;
+  const sheets = Number(o.total_sheets) || Number(o.totalSheetsDisplay) || 0;
+  return {
+    pages: pages > 0 ? pages + ' 页' : '不适用',
+    copies: copies > 0 ? copies + ' 份' : '不适用',
+    sheets: sheets > 0 ? sheets + ' 张' : '不适用',
+  };
+}
+
 function normalizeOrder(o) {
   o.totalPriceDisplay = Number(o.total_price || 0).toFixed(2);
   if (o.files) {
@@ -962,6 +979,11 @@ function normalizeOrder(o) {
   } else {
     o.totalSheetsDisplay = '0';
   }
+  // 合计页数/份数/张数（数据驱动；Excel 不再一律「不适用」）
+  const totalsText = orderTotalsText(o);
+  o.statPages = totalsText.pages;
+  o.statCopies = totalsText.copies;
+  o.statSheets = totalsText.sheets;
   return o;
 }
 
@@ -1079,9 +1101,9 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
         <view class="detail-row"><text class="detail-label">接单设备</text><text class="detail-value">${o.received_label ? esc(o.received_label) : '—'}</text></view>
         <view class="detail-row"><text class="detail-label">提交时间</text><text class="detail-value">${esc(o.created_at || '')}</text></view>
         <view class="detail-row"><text class="detail-label">开始打印</text><text class="detail-value">${o.print_started_at ? esc(o.print_started_at) : '—'}</text></view>
-        <view class="detail-row"><text class="detail-label">合计页数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_pages || (o.page_count * o.copies)) + ' 页')}</text></view>
-        <view class="detail-row"><text class="detail-label">合计份数</text><text class="detail-value">${o.isExcel ? '不适用' : ((o.total_copies || o.copies) + ' 份')}</text></view>
-        <view class="detail-row"><text class="detail-label">合计张数</text><text class="detail-value">${o.isExcel ? '不适用' : (o.totalSheetsDisplay + ' 张')}</text></view>
+        <view class="detail-row"><text class="detail-label">合计页数</text><text class="detail-value">${o.statPages}</text></view>
+        <view class="detail-row"><text class="detail-label">合计份数</text><text class="detail-value">${o.statCopies}</text></view>
+        <view class="detail-row"><text class="detail-label">合计张数</text><text class="detail-value">${o.statSheets}</text></view>
       </view>
       ${licenseRows}
       ${(o.files && o.files.length) ? `<view class="detail-section"><view class="detail-section-title">文件列表 (${o.files.length})${o.files.length > 5 ? '<text class="detail-files-hint">· 列表可上下滑动</text>' : ''}</view><view class="detail-files-scroll">${fileRows}</view></view>` : ''}
@@ -1109,9 +1131,9 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
         </view>
         <text class="order-number-label">${esc(o.file_summary || o.file || '')}</text>
         <view class="order-card-meta">
-          <text class="order-card-stat">📄 ${o.isExcel ? '不适用' : ((o.total_pages || (o.page_count * o.copies)) + ' 页')}</text>
-          <text class="order-card-stat">📋 ${o.isExcel ? '不适用' : ((o.total_copies || o.copies) + ' 份')}</text>
-          <text class="order-card-stat">🖨 ${o.isExcel ? '不适用' : (o.totalSheetsDisplay + ' 张')}</text>
+          <text class="order-card-stat">📄 ${o.statPages}</text>
+          <text class="order-card-stat">📋 ${o.statCopies}</text>
+          <text class="order-card-stat">🖨 ${o.statSheets}</text>
         </view>
         <view class="order-card-footer">
           <text class="order-created">${esc(o.created_at || '')}</text>
@@ -1370,6 +1392,8 @@ async function saveRecentOrdersLimit() {
    也不会被订单卡片的 overflow:hidden / max-height 裁剪。 */
 
 let _pricePopEl = null;
+let _pricePopDocClose = null;   // 气泡打开期间挂在 document/window 上的「失去焦点即关闭」监听，收起时一并摘掉
+let _pricePopScrollArmed = false;   // 打开瞬间可能还有排队中的 scroll 事件（滚动锚定 / 滚入视口收尾），两帧后才认
 
 /* ---------- #5 价格文案 / #9 异常原因：常量与纯函数 ---------- */
 
@@ -1567,15 +1591,28 @@ function _priceOrderTotal(o) {
 }
 
 function _priceOrderById(id) {
-  // 最近订单独立页的行对象也要能被反查（复制价格 / 原因气泡都按 id 取订单）
-  const pools = [meState.orders, meState.recentOrders, meState.recentOrderRows];
+  /* 反查顺序与选中规则（2026-11-09 修「复制详细价格只剩合计」）：
+     · 「最近订单」独立页 / 「近 N 条订单」的行对象也要能被反查（复制价格 / 原因气泡都按 id 取订单），
+       但**那些行按契约只有标题 + 合计**（GET /api/admin/recent_orders 不下发逐文件明细，
+       见 loadRecentOrders 里 `files: []` 的注释）。
+     · 同一个 id 可能同时出现在「用户订单子视图」的完整行和最近订单的缓存行里（两处都登记 id）。
+       以前是「先到先得」，缓存行先被命中 ⇒ 用户订单里点「复制详细价格」只剩标题和合计。
+     · 现在：正在看的用户订单列表优先；其余池子若有多个同 id 命中，**带逐文件明细的那条优先**，
+       都没明细才退回缓存行（此时复制详细价格本来就只该出标题+合计，不编造分项）。 */
+  const pools = [];
   const v = meState.userOrdersView;
   if (v && v.orders && v.orders.length) pools.push(v.orders);
+  pools.push(meState.orders, meState.recentOrderRows, meState.recentOrders);
+  let fallback = null;
   for (let i = 0; i < pools.length; i++) {
-    const hit = (pools[i] || []).filter(o => o && String(o.id) === String(id))[0];
-    if (hit) return hit;
+    const hits = (pools[i] || []).filter(o => o && String(o.id) === String(id));
+    for (let j = 0; j < hits.length; j++) {
+      const hit = hits[j];
+      if (hit.files && hit.files.length) return hit;
+      if (!fallback) fallback = hit;
+    }
   }
-  return null;
+  return fallback;
 }
 
 /* 详细价格文本（结构与本机打印工具 Ctrl+Shift+C 逐行一致）：
@@ -1632,6 +1669,10 @@ function buildPriceDetailText(o, rules) {
 }
 
 function closePricePop() {
+  if (_pricePopDocClose) {
+    _pricePopDocClose();
+    _pricePopDocClose = null;
+  }
   if (_pricePopEl) {
     _pricePopEl.remove();
     _pricePopEl = null;
@@ -1643,7 +1684,7 @@ function openPricePop(anchor, orderId) {
   const o = _priceOrderById(orderId);
   if (!o || !anchor) return;
   const mask = document.createElement('div');
-  mask.className = 'price-pop-mask';
+  mask.className = 'price-pop-mask is-pass-through';
   mask.innerHTML =
     '<div class="price-pop" role="dialog">' +
       '<div class="price-pop-head"><span class="price-pop-icon">📋</span>' +
@@ -1693,8 +1734,28 @@ function openPricePop(anchor, orderId) {
     }
     closePricePop();
   });
-  // 气泡打开时屏蔽背景滚动（与小程序 catchtouchmove 同口径）
-  mask.addEventListener('touchmove', (ev) => ev.preventDefault(), { passive: false });
+  // 气泡不是模态：遮罩 is-pass-through（pointer-events:none）→ 手势照常落到页面上，
+  // 滑动/滚动都正常。所以「失去焦点即关闭」得自己听：页面任何一次 touchstart 或开始滚动都收起。
+  // 注意绝不能改回 touchmove preventDefault —— 那正是「气泡一开页面被锁住」的来源（2026-11-09 用户反馈）。
+  const onDocTouchStart = (ev) => {
+    if (_pricePopEl && ev.target && _pricePopEl.contains(ev.target)) return;
+    closePricePop();
+  };
+  const onDocScroll = () => { if (!_pricePopScrollArmed) return; closePricePop(); };
+  // 刚打开时先别认 scroll：Playwright / WebView 点完常会补发一两个排队中的 scroll，
+  // 那会把刚弹出的气泡立刻关掉（真实手指点击不会，但不能赌）
+  _pricePopScrollArmed = false;
+  const armScrollClose = () => { _pricePopScrollArmed = true; };
+  requestAnimationFrame(() => requestAnimationFrame(armScrollClose));
+  document.addEventListener('touchstart', onDocTouchStart, { capture: true, passive: true });
+  document.addEventListener('mousedown', onDocTouchStart, { capture: true });   // 桌面/浏览器预览：鼠标也算失去焦点
+  window.addEventListener('scroll', onDocScroll, { capture: true, passive: true });
+  _pricePopDocClose = () => {
+    _pricePopScrollArmed = false;
+    document.removeEventListener('touchstart', onDocTouchStart, { capture: true });
+    document.removeEventListener('mousedown', onDocTouchStart, { capture: true });
+    window.removeEventListener('scroll', onDocScroll, { capture: true });
+  };
 }
 
 function changeOrdersPage(page) {

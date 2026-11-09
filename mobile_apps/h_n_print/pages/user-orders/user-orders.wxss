@@ -1,5 +1,7 @@
 /** user-orders.wxss — Apple-style order list page **/
 
+@import "../../utils/price_pop.wxss";
+
 /* ── Root & Container（WXS 自定义滚动，与 index/me 一致）── */
 .scroller {
   flex: 1;
@@ -518,6 +520,13 @@
 .detail-files-scroll {
   max-height: 480rpx;
   box-sizing: border-box;
+  /* 内层框由 utils/scroll.wxs 直驱：框自己裁剪，内容整块 translateY 移动
+     （不再是原生 scroll-view —— 它拿不到确定高度、也交还不了滚动） */
+  overflow: hidden;
+  position: relative;
+}
+.detail-files-track {
+  will-change: transform;
 }
 .detail-files-hint {
   margin-left: 8rpx;

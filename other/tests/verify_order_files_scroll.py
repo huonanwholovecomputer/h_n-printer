@@ -11,15 +11,18 @@
 **唯一不受限生长**的部分 —— 文件一多就把容器顶穿，撑出去的部分被 overflow 裁掉。
 
 修法两端一起（同源逻辑，两边都改才算改完）：
-  · 小程序：文件列表进 `<scroll-view scroll-y class="detail-files-scroll">`，滚动框上限约 5 行；
-            同时把 me 页 `.detail-expanded` 的 2000rpx 抬到 3000rpx（与 user-orders 页对齐）。
+  · 小程序：文件列表进 `<view class="detail-files-scroll">` + `<view class="detail-files-track">`
+            两层（2026-11-09 改：不再是原生 scroll-view）。框负责裁剪（overflow:hidden + max-height
+            约 5 行），轨由 utils/scroll.wxs 直驱 translateY —— 因为原生 scroll-view 的内层滚动手势
+            会被外层 WXS 引擎的 preventDefault 吞掉，只能靠 catchtouchmove 兜住，代价是
+            「滚到底/顶就卡住、页面不接管」。改成 WXS 直驱后，内层滚到边界，余量在同一帧交给页面。
   · APP：`me.js` 的 fileRows 外面包一层 `<view class="detail-files-scroll">`，CSS 给
-            `max-height` + `overflow-y: auto`。
+            `max-height` + `overflow-y: auto`；手势接力在 FlingEngine 里做。
   · 文件多（> 5）时在标题后面补一句「· 列表可上下滑动」，让用户知道里面还能滑。
 
 ## 判据
 
-① 两端文件列表都被独立滚动框包住（顺序：标题 → 滚动框开 → wx:for 行 → 滚动框关 → 区块关）
+① 两端文件列表都被独立滚动框包住（小程序：标题 → 框开 → 轨开 → wx:for 行 → 轨关 → 框关）
 ② 滚动框有高度上限（小程序 max-height / APP max-height + overflow-y:auto），且**不是**固定 height
    （固定 height 会让 1~2 个文件的订单留一大块空白）
 ③ 详情容器的展开上限 ≥ 3000rpx（me 页原 2000rpx 是这次被裁的直接原因；user-orders 早已 3000）
@@ -86,14 +89,17 @@ for wxml_path, wxss_path, tag in PAGES:
 
     check(f'[{tag}] 找到文件列表区块', bool(blk))
     i_title = blk.find('detail-section-title')
-    m_open = re.search(r'<scroll-view[^>]*class="detail-files-scroll"[^>]*>', blk)
+    m_open = re.search(r'<view[^>]*class="detail-files-scroll"[^>]*>', blk)
     i_open = m_open.start() if m_open else -1
+    m_track = re.search(r'<view[^>]*class="detail-files-track"[^>]*>', blk)
+    i_track = m_track.start() if m_track else -1
     i_for = blk.find('wx:for="{{item.files}}"')
-    i_close = blk.find('</scroll-view>')
     i_end = blk.rfind('</view>')
-    check(f'[{tag}] ① 文件列表被 <scroll-view scroll-y> 包住（标题 → 开 → 行 → 关 顺序正确）',
-          -1 < i_title < i_open < i_for < i_close < i_end,
-          f'title={i_title} open={i_open} for={i_for} close={i_close} end={i_end}')
+    check(f'[{tag}] ① 文件列表被 view 框 + view 轨包住（标题 → 框 → 轨 → 行 顺序正确）',
+          -1 < i_title < i_open < i_track < i_for < i_end,
+          f'title={i_title} box={i_open} track={i_track} for={i_for} end={i_end}')
+    check(f'[{tag}] ① 内层不再是原生 <scroll-view>（手势不再需要 catchtouchmove 兜住）',
+          '<scroll-view' not in blk)
 
     rule = css_rule(wxss, '.detail-files-scroll')
     mh = re.search(r'max-height\s*:\s*(\d+(?:\.\d+)?)rpx', rule)
@@ -107,13 +113,22 @@ for wxml_path, wxss_path, tag in PAGES:
     check(f'[{tag}] ③ 详情展开上限 ≥ 3000rpx（文件列表已自带滚动框，容器只需容下静态内容）',
           bool(mh2) and int(mh2.group(1)) >= 3000, exp.strip() or '(缺规则)')
 
-    # ⑥ 手势接线：外层 .scroller 挂着 WXS 滚动引擎，它的 touchmove 会 preventDefault
-    #    （返回 false）→ 原生 scroll-view 再也滚不动。列表必须 catchtouchmove 把事件终止在这一层。
-    check(f'[{tag}] ⑥ 列表 catchtouchmove="noop"（不让 WXS 引擎 preventDefault 吞掉原生滚动）',
-          '<scroll-view scroll-y class="detail-files-scroll" catchtouchmove="noop">' in blk)
+    # ⑥ 手势接线（2026-11-09 新契约）：内层框由 utils/scroll.wxs 直驱，逻辑层只负责
+    #    下发两个选择器；内层滚到边界时余量当帧交给页面，反向页面到顶再交还内层。
+    #    因此内层**不能**再挂 catchtouchmove（挂了 WXS 就收不到这一层的手势）。
+    check(f'[{tag}] ⑥ 内层框没有 catchtouchmove（手势要能被 WXS 逐帧结算）',
+          'catchtouchmove' not in (m_open.group(0) if m_open else ''))
     page_js = read(os.path.join(MP, 'pages', tag, tag + '.js'))
-    check(f'[{tag}] ⑥ noop handler 存在（catchtouchmove 指向它）',
-          re.search(r'\n\s*noop\s*\(\s*\)\s*\{\s*\}', page_js) is not None)
+    check(f'[{tag}] ⑥ scrollConfig 下发 nestedSel / nestedTrackSel',
+          re.search(r"nestedSel:\s*'\.detail-files-scroll'", page_js) is not None
+          and re.search(r"nestedTrackSel:\s*'\.detail-files-track'", page_js) is not None)
+    check(f'[{tag}] ⑥ 文件列表不再往 WXS 推 listOverflow（贴边不再靠逻辑层）',
+          'listOverflow' not in page_js)
+    track_rule = css_rule(wxss, '.detail-files-track')
+    check(f'[{tag}] ⑥ .detail-files-track 规则存在（will-change: transform）',
+          'will-change' in track_rule or 'transform' in track_rule, track_rule.strip() or '(缺规则)')
+    check(f'[{tag}] ⑥ 内层框 overflow:hidden（track 位移不溢出框外）',
+          'overflow: hidden' in rule, rule.strip() or '(缺规则)')
 
     # ⑤ 标签配平
     opens = len(re.findall(r'<view\b', wxml))
@@ -160,13 +175,13 @@ check('[APP] ⑥ FlingEngine.onWheel 同样认这个类（桌面滚轮不再把�
 
 # ════════════════════ ⑥ 变异自证 ════════════════════
 def mutated_is_red(src):
-    """把滚动框拆掉（= 改回旧结构），① 必须变红。"""
-    broken = re.sub(r'<scroll-view[^>]*class="detail-files-scroll"[^>]*>', '', src)
+    """把轨道层拆掉（列表退回「框里直接塞行」），① 必须变红。"""
+    broken = re.sub(r'<view\s+class="detail-files-track"\s*>', '', src)
     blk = block_of(broken)
     i_title = blk.find('detail-section-title')
     i_open = blk.find('class="detail-files-scroll"')
-    i_close = blk.find('</scroll-view>')
-    return not (-1 < i_title < i_open < i_close)
+    i_track = blk.find('class="detail-files-track"')
+    return not (-1 < i_title < i_open < i_track)
 
 
 check('⑥ 变异自证：拆掉滚动框后 ① 判据确实变红',

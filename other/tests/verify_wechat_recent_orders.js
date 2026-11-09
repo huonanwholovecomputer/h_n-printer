@@ -60,6 +60,21 @@ function setByPath(obj, key, val) {
   }
 }
 
+/* utils/price_copy.js：文案唯一实现（2026-11-09 从 me.js 抽出，两页共用）——真实加载它，
+   只把它的 './pages' 依赖换成同一份页数 shim，避免 me.js 的依赖被静默放过。 */
+const PRICE_COPY_MOD = (() => {
+  const cp = path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'price_copy.js');
+  const m = { exports: {} };
+  new Function('module', 'exports', 'require', fs.readFileSync(cp, 'utf8'))(m, m.exports, (dep) => {
+    if (dep === './pages') return { countPagesInRange: () => 1 };
+    throw new Error('utils/price_copy.js unexpected require: ' + dep);
+  });
+  if (typeof m.exports.priceDetailLines !== 'function') {
+    throw new Error('utils/price_copy.js 未导出 priceDetailLines（复制详细价格会失效）');
+  }
+  return m.exports;
+})();
+
 /* ---------------- 加载真实 pages/me/me.js（Component 模式） ---------------- */
 function loadMePage() {
   const src = fs.readFileSync(ME_JS, 'utf8');
@@ -99,6 +114,7 @@ function loadMePage() {
         };
       }
       if (p.indexOf('utils/pages') >= 0) return { countPagesInRange: () => 1 };
+      if (p.indexOf('utils/price_copy') >= 0) return PRICE_COPY_MOD;
       if (p.indexOf('utils/avatar_crop') >= 0) return {};
       throw new Error('unexpected require: ' + p);
     },

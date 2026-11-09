@@ -102,9 +102,14 @@
             <text wx:if="{{badgeCount > 0 || badgeExiting}}" class="section-header-badge {{badgeEntering ? 'entering' : ''}} {{badgeBouncing ? 'bouncing' : ''}} {{badgeExiting ? 'exiting' : ''}}">{{badgeCount || 1}}</text>
           </view>
 
-          <!-- File Cards（有界原生滚动：避免卡片堆高撑破外层 transform GPU 层的微信布局上限）-->
-          <!-- bindscroll：把内层列表的边界状态（贴顶/贴底）同步给 WXS 引擎，用于「内层滚到边 → 外层接管」的滚动接力 -->
-          <scroll-view class="file-list-scroll" scroll-y enhanced show-scrollbar="{{false}}" style="height: {{fileListHeight}}px;" bindscroll="onFileListScroll">
+          <!-- File Cards（有界滚动框：避免卡片堆高撑破外层 transform GPU 层的微信布局上限）-->
+          <!-- 不再是原生 scroll-view：外层 .scroller 由 WXS 滚动引擎驱动（touchmove 会 preventDefault），
+               原生框滚到边之后没人能接管（现场：「列表滑到底，整个页面不跟着动」）。改成 view + 内层
+               track，由 utils/scroll.wxs 直驱 translateY —— 内层到边当帧把余量交给外层，外层到顶再交还
+               内层；偏移与边界全靠 selectAllComponents + getBoundingClientRect 量出来，不再需要
+               bindscroll → setData → change:prop 三跳同步贴边（那三跳就是死区）。 -->
+          <view class="file-list-scroll" style="height: {{fileListHeight}}px;">
+            <view class="file-list-track">
           <view
             wx:for="{{selectedFiles}}"
             wx:key="_uid"
@@ -290,7 +295,8 @@
               </view>
             </view>
           </view>
-          </scroll-view>
+          </view>
+          </view>
 
           <!-- Add file button -->
           <button class="add-file-btn {{btnPulse ? 'pulsing' : ''}}" bindtap="onChooseFile" hover-class="tap-active">

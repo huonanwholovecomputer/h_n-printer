@@ -77,37 +77,68 @@ function setByPath(obj, key, val) {
    ============================================================ */
 function loadWxsEngine() {
   const src = fs.readFileSync(WXS, 'utf8');
+  // 可控时钟：惯性/回弹是逐帧循环，必须能推进时间才能断言（否则 dt 恒 0 永远跑不完）
+  const clock = { t: 1700000000000 };
   const sandbox = {
     console,
     Math, JSON, String, Number, Object, Array, isNaN, parseInt, parseFloat,
-    getDate: () => ({ getTime: () => Date.now() }),
+    getDate: () => ({ getTime: () => clock.t }),
+    requestAnimationFrame: () => 0,
     module: { exports: {} },
   };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(src, sandbox, { filename: 'scroll.wxs' });
-  return sandbox.module.exports;
+  const exp = sandbox.module.exports;
+  exp._clock = clock;
+  return exp;
 }
 
-/* 桩 ownerInstance：逻辑层同步配置 → 引擎状态；selectComponent 返回桩组件 */
-function makeWxsOwner(engine, cfg) {
-  const state = {};
-  const moved = [];
-  const inner = {
-    getBoundingClientRect: () => ({ top: 200, bottom: 500, left: 0, right: 375 }),
+/* 内层滚动框桩：box（裁剪框）+ track（内容轨）。
+ * track 的 rect 跟着 setStyle 写进来的 translateY 走 —— 这样「新开一次手势重新量」时
+ * 量到的起点就是上一次手势滚到的位置，与真机一致。 */
+function makeBox(top, height, trackH, y0) {
+  const body = {
+    _y: y0 || 0,
+    setStyle(s) {
+      const m = s && typeof s.transform === 'string'
+        && /translateY\((-?[\d.]+)px\)/.exec(s.transform);
+      if (m) body._y = -parseFloat(m[1]);
+    },
+    getBoundingClientRect: () => ({
+      top: top - body._y, bottom: top - body._y + trackH, height: trackH,
+      left: 0, right: 375, width: 375,
+    }),
   };
-  const content = { setStyle: (s) => moved.push(s.transform) };
+  return {
+    getBoundingClientRect: () => ({
+      top, bottom: top + height, height, left: 0, right: 375, width: 375,
+    }),
+    // 轨道选择器随页面不同（.detail-files-track / .file-list-track），桩按后缀认
+    selectComponent: (sel) => (/track$/.test(String(sel || '')) ? body : null),
+    _body: body,
+  };
+}
+
+/* 桩 ownerInstance：逻辑层同步配置 → 引擎状态；selectAllComponents 返回内层框桩 */
+function makeWxsOwner(engine, cfg, boxes) {
+  const state = {};
+  const rendered = [];
+  const ns = (cfg && cfg.nestedSel) || '.detail-files-scroll';   // 本页下发的内层框选择器
+  const content = { setStyle: (s) => rendered.push(s.transform) };
   const owner = {
     getState: () => state,
-    requestAnimationFrame: () => 0,   // 不跑物理循环：断言只针对拖拽期的位移
+    requestAnimationFrame: (cb) => (owner._rafs.push(cb), owner._rafs.length),
     callMethod: () => {},
     selectComponent: (sel) => {
-      if (sel === '.file-list-scroll') return inner;
       if (sel === '.scroll-content') return content;
       if (sel === '.logo-wrap' || sel === '.header-area') return { setStyle() {} };
+      if (sel === ns) return (boxes || [])[0] || null; // 退路：单框
       return null;
     },
-    _moved: moved,
+    selectAllComponents: (sel) => (sel === ns ? (boxes || []) : []),
+    _rendered: rendered,
+    _rafs: [],
   };
   engine.onConfig(cfg, null, owner, null);
   return owner;
@@ -119,86 +150,139 @@ function wxsTouch(engine, owner, type, clientY, clientX) {
   return engine[type](ev, owner);
 }
 
+/* 逐帧推进物理循环（惯性/回弹都挂在 owner.requestAnimationFrame 上） */
+function runFrames(owner, engine, n) {
+  for (let i = 0; i < n && owner._rafs.length; i++) {
+    engine._clock.t += 16;                     // 一帧 16ms，与真机一致
+    const cbs = owner._rafs;
+    owner._rafs = [];
+    cbs.forEach((cb) => cb());
+  }
+}
+
 function runWxsTests() {
-  section('小程序 WXS 引擎（utils/scroll.wxs 真实代码）');
+  section('小程序 WXS 引擎（utils/scroll.wxs 真实代码）：内层框先吃、余量给外层');
   const engine = loadWxsEngine();
   check('scroll.wxs 可在桩环境加载并导出事件处理器',
         engine && typeof engine.touchstart === 'function' && typeof engine.touchmove === 'function'
         && typeof engine.onConfig === 'function');
 
-  const CFG_BASE = {
+  const CFG = {
     minY: 0, maxY: 1000, scrollerH: 600, contentH: 1600,
-    listOverflow: true, listAtTop: false, listAtBottom: false,
+    nestedSel: '.detail-files-scroll', nestedTrackSel: '.detail-files-track',
   };
+  const mk = (boxes) => makeWxsOwner(engine, CFG, boxes);
 
-  /* ① 内层未贴边：手势全给内层，外层一动不动 */
-  let owner = makeWxsOwner(engine, CFG_BASE);
-  let st = owner.getState();
-  wxsTouch(engine, owner, 'touchstart', 300);
-  check('①触点落在列表内 → 让位内层（nested=true）', st.nested === true);
-  let ret = wxsTouch(engine, owner, 'touchmove', 280);   // 手指上滑 20px
-  check('①内层未贴底：touchmove 不拦截（返回 true 交原生）', ret === true, 'ret=' + ret);
-  check('①内层未贴底：外层位移为 0（页面不动）', st.y === 0, 'y=' + st.y);
+  /* ① 内层滚得动：本帧整帧给内层，外层一动不动（用户要的「先滚列表」） */
+  let b = makeBox(200, 300, 800, 120);          // 框高 300、内容轨 800 ⇒ 行程 500，当前偏 120
+  let o = mk([b]);
+  let st = o.getState();
+  wxsTouch(engine, o, 'touchstart', 300);
+  check('①触点落在内层框内 → 量出行程与当前位置',
+        !!st.nb && st.nb.maxY === 500 && Math.round(st.nb.y) === 120,
+        st.nb ? `maxY=${st.nb.maxY} y=${st.nb.y}` : 'nb=null');
+  let ret = wxsTouch(engine, o, 'touchmove', 280);            // 手指上滑 20px
+  check('①内层吃得下：不拦原生、不动外层（return true）', ret === true && st.y === 0, `ret=${ret} y=${st.y}`);
+  check('①内层吃得下：内层轨自己 translateY 了 20px',
+        Math.round(b._body._y) === 140, 'trackY=' + b._body._y);
 
-  /* ② 内层贴底 + 手指继续上滑 → 外层接管（本次增量生效，再叠加一次也生效） */
-  engine.onConfig(Object.assign({}, CFG_BASE, { listAtBottom: true }), null, owner, null);
-  ret = wxsTouch(engine, owner, 'touchmove', 260);       // 再上滑 20px
-  check('②内层贴底：外层接管（touchmove 返回 false，preventDefault）', ret === false, 'ret=' + ret);
-  check('②内层贴底：外层按本次增量位移 20px', Math.round(st.y) === 20, 'y=' + st.y);
-  ret = wxsTouch(engine, owner, 'touchmove', 200);       // 继续上滑 60px
-  check('②接管后持续跟手（60px 增量继续生效）', ret === false && Math.round(st.y) === 80, 'y=' + st.y);
-  wxsTouch(engine, owner, 'touchend', 200);
+  /* ② 贴底当帧：内层只吃剩下的 10px，余量 10px 同帧交给外层 */
+  let b2 = makeBox(200, 300, 800, 490);
+  o = mk([b2]); st = o.getState();
+  wxsTouch(engine, o, 'touchstart', 300);
+  ret = wxsTouch(engine, o, 'touchmove', 280);
+  check('②内层贴底：余量交给外层（只给余量，不是整帧）',
+        ret === false && Math.round(st.y) === 10 && Math.round(st.nb.y) === 500,
+        `ret=${ret} y=${st.y} nbY=${st.nb.y}`);
+  ret = wxsTouch(engine, o, 'touchmove', 260);               // 内层已到底，整帧给外层
+  check('②继续上滑：外层持续跟手', ret === false && Math.round(st.y) === 30, 'y=' + st.y);
 
-  /* ③ 内层贴顶 + 手指下滑 → 外层接管（页面往上滚） */
-  owner = makeWxsOwner(engine, Object.assign({}, CFG_BASE, { listAtTop: true }));
-  st = owner.getState();
-  // 先把页面滚到中间，便于观察"往下滚"的位移
-  engine.onConfig(Object.assign({}, CFG_BASE, { listAtTop: true }), null, owner, null);
-  st.y = 300;
-  wxsTouch(engine, owner, 'touchstart', 300);
-  ret = wxsTouch(engine, owner, 'touchmove', 320);       // 手指下滑 20px
-  check('③内层贴顶 + 手指下滑：外层接管', ret === false, 'ret=' + ret);
-  check('③外层按本次增量向上滚 20px（y: 300 → 280）', Math.round(st.y) === 280, 'y=' + st.y);
-  wxsTouch(engine, owner, 'touchend', 320);
+  /* ③ 反向：外层在中间时手指下滑 → 外层自己滚（内层不动） */
+  st.y = 30;
+  ret = wxsTouch(engine, o, 'touchmove', 280);               // 手指下滑 20px
+  check('③外层不在顶：下滑由外层自己吃', ret === false && Math.round(st.y) === 10, 'y=' + st.y);
 
-  /* ④ 反向接力：外层已在顶部(0)、手指继续下滑、内层未贴顶 → 交还内层 */
-  owner = makeWxsOwner(engine, Object.assign({}, CFG_BASE, { listAtTop: false, listAtBottom: true }));
-  st = owner.getState();
-  wxsTouch(engine, owner, 'touchstart', 300);
-  wxsTouch(engine, owner, 'touchmove', 280);             // 手指上滑：内层贴底 → 外层接管
-  check('④接力前：外层已接管且开始位移', st.nested === false && st.y > 0, 'y=' + st.y);
-  st.y = 0;                                             // 模拟外层滚回顶部
-  engine.onConfig(Object.assign({}, CFG_BASE, { listAtTop: false, listAtBottom: true }), null, owner, null);
-  ret = wxsTouch(engine, owner, 'touchmove', 300);       // 手指下滑
-  check('④外层到顶 + 内层未贴顶：交还内层（返回 true，不拦截）', ret === true, 'ret=' + ret);
-  check('④交还后外层不再位移（y 保持 0）', st.y === 0, 'y=' + st.y);
-  wxsTouch(engine, owner, 'touchend', 300);
+  /* ④ 外层到顶 + 继续下滑 → 交还内层（双向接力） */
+  st.y = 0;
+  ret = wxsTouch(engine, o, 'touchmove', 300);
+  check('④外层到顶：位移交还内层（return true，外层不动）',
+        ret === true && st.y === 0 && Math.round(st.nb.y) === 480,
+        `ret=${ret} y=${st.y} nbY=${st.nb.y}`);
+  wxsTouch(engine, o, 'touchend', 300);
 
-  /* ⑤ 列表不可滚（listOverflow=false）→ 外层直接接管，不让位 */
-  owner = makeWxsOwner(engine, Object.assign({}, CFG_BASE, { listOverflow: false }));
-  st = owner.getState();
-  wxsTouch(engine, owner, 'touchstart', 300);
-  check('⑤列表不可滚：不设 nested', st.nested === false);
-  ret = wxsTouch(engine, owner, 'touchmove', 280);
-  check('⑤列表不可滚：外层直接跟手 20px', ret === false && Math.round(st.y) === 20, 'y=' + st.y);
-  wxsTouch(engine, owner, 'touchend', 280);
+  /* ⑤ 慢速拖动（单帧 0.3px）也必须先给内层：旧实现按 >0.5px 过滤，整帧会漏进外层 */
+  let b5 = makeBox(200, 300, 800, 120);
+  o = mk([b5]); st = o.getState();
+  wxsTouch(engine, o, 'touchstart', 300);
+  ret = wxsTouch(engine, o, 'touchmove', 290);              // 先过 5px 方向锁
+  check('⑤起手 10px 由内层吃掉', ret === true && Math.round(b5._body._y) === 130, 'trackY=' + b5._body._y);
+  ret = wxsTouch(engine, o, 'touchmove', 289.7);            // 单帧 0.3px
+  check('⑤亚像素帧（0.3px）仍由内层消费，外层不动',
+        ret === true && st.y === 0 && Math.abs(b5._body._y - 130.3) < 0.01,
+        `ret=${ret} y=${st.y} trackY=${b5._body._y}`);
+  wxsTouch(engine, o, 'touchend', 289.7);
 
-  /* ⑥ 触点落在列表外（如页头）→ 外层直接接管 */
-  owner = makeWxsOwner(engine, CFG_BASE);
-  st = owner.getState();
-  wxsTouch(engine, owner, 'touchstart', 100);            // 列表 rect 200~500 之外
-  check('⑥列表外起手：不设 nested', st.nested === false);
-  ret = wxsTouch(engine, owner, 'touchmove', 80);
-  check('⑥列表外起手：外层跟手 20px', ret === false && Math.round(st.y) === 20, 'y=' + st.y);
-  wxsTouch(engine, owner, 'touchend', 80);
+  /* ⑥ 内层不可滚（内容没超框）→ 量不出框 → 外层直接接管 */
+  o = mk([makeBox(200, 300, 300, 0)]); st = o.getState();
+  wxsTouch(engine, o, 'touchstart', 300);
+  check('⑥内层不可滚：不接管手势', st.nb === null);
+  ret = wxsTouch(engine, o, 'touchmove', 280);
+  check('⑥内层不可滚：外层直接跟手 20px', ret === false && Math.round(st.y) === 20, 'y=' + st.y);
+  wxsTouch(engine, o, 'touchend', 280);
 
-  /* ⑦ ddy=0 的重复事件不能误判成"贴边"而抢滚 */
-  owner = makeWxsOwner(engine, CFG_BASE);
-  st = owner.getState();
-  wxsTouch(engine, owner, 'touchstart', 300);
-  ret = wxsTouch(engine, owner, 'touchmove', 300);       // 位移 0
-  check('⑦ddy=0 时仍让位内层（不抢滚）', ret === true && st.nested === true && st.y === 0, 'y=' + st.y);
-  wxsTouch(engine, owner, 'touchend', 300);
+  /* ⑦ 触点落在框外（页头/卡片标题）→ 外层直接接管 */
+  o = mk([makeBox(200, 300, 800, 120)]); st = o.getState();
+  wxsTouch(engine, o, 'touchstart', 100);
+  check('⑦框外起手：不接管', st.nb === null);
+  ret = wxsTouch(engine, o, 'touchmove', 80);
+  check('⑦框外起手：外层跟手 20px', ret === false && Math.round(st.y) === 20, 'y=' + st.y);
+  wxsTouch(engine, o, 'touchend', 80);
+
+  /* ⑧ ddy=0 的重复事件：不推进、不抢滚、不拦原生 */
+  o = mk([makeBox(200, 300, 800, 120)]); st = o.getState();
+  wxsTouch(engine, o, 'touchstart', 300);
+  ret = wxsTouch(engine, o, 'touchmove', 300);
+  check('⑧ddy=0：不误判成贴边、外层不动、不拦原生', ret === true && st.y === 0, `ret=${ret} y=${st.y}`);
+  wxsTouch(engine, o, 'touchend', 300);
+
+  /* ⑨ me 页可同时展开多张订单卡：触点命中哪个框就滚哪个，绝不串卡 */
+  const bA = makeBox(100, 200, 600, 50);
+  const bB = makeBox(400, 200, 600, 0);
+  o = mk([bA, bB]); st = o.getState();
+  wxsTouch(engine, o, 'touchstart', 500);                    // 落在第二个框里
+  check('⑨两个可滚框：按触点选中第二个', !!st.nb && st.nb.idx === 1, st.nb ? 'idx=' + st.nb.idx : 'nb=null');
+  wxsTouch(engine, o, 'touchmove', 480);
+  check('⑨只滚被命中的那个框（另一个原地不动）',
+        Math.round(bB._body._y) === 20 && Math.round(bA._body._y) === 50,
+        `A=${bA._body._y} B=${bB._body._y}`);
+  wxsTouch(engine, o, 'touchend', 480);
+
+  /* ⑩ 抬手后：谁吃下最后一帧谁走惯性 —— 内层自己滑，外层不动 */
+  let b10 = makeBox(200, 300, 800, 100);
+  o = mk([b10]); st = o.getState();
+  const drag = (y) => { engine._clock.t += 16; return wxsTouch(engine, o, 'touchmove', y); };
+  wxsTouch(engine, o, 'touchstart', 300);
+  drag(280); drag(260); drag(240);
+  wxsTouch(engine, o, 'touchend', 240);
+  check('⑩抬手：惯性归内层（nbRun=true、外层速度清零）',
+        st.nbRun === true && st.vel === 0, `nbRun=${st.nbRun} vel=${st.vel}`);
+  runFrames(o, engine, 2);                     // 只跑前两帧：内层还有 340px 行程
+  check('⑩惯性开头只动内层（轨继续前进、外层位移仍是 0）',
+        b10._body._y > 160 && st.y === 0, `trackY=${b10._body._y} y=${st.y}`);
+  runFrames(o, engine, 120);                   // 跑到停：撞底后余速交外层（见 ⑪）
+
+  /* ⑪ 内层惯性撞到底 → 剩下的速度交给外层（不做"滚到边就地停死"） */
+  let b11 = makeBox(200, 300, 800, 480);        // 离底只剩 20px
+  o = mk([b11]); st = o.getState();
+  const drag11 = (y) => { engine._clock.t += 16; return wxsTouch(engine, o, 'touchmove', y); };
+  wxsTouch(engine, o, 'touchstart', 300);
+  drag11(280); drag11(260);
+  wxsTouch(engine, o, 'touchend', 260);
+  runFrames(o, engine, 120);
+  check('⑪内层惯性撞底：余速把外层带起来（外层位移 > 0）',
+        st.y > 0, 'y=' + st.y);
+  check('⑪交棒后内层停在底（钳在 maxY）',
+        Math.round(st.nb.y) === 500, 'nbY=' + st.nb.y);
 }
 
 /* ============================================================
@@ -296,15 +380,18 @@ function runFlingTests() {
   check('①内层未贴底：不 preventDefault（交原生）', ev._prevented === false);
   check('①内层未贴底：外层位移 0', g.y === 0, 'y=' + g.y);
 
-  /* ② 内层贴底 → 外层接管（本手势起于内层可滚列表 → 走 passive，故不调 preventDefault；
+  /* ② 内层已贴底（起手时就在底）→ 手指继续上滑，外层接管
+        （本手势起于内层可滚列表 → 走 passive，故不调 preventDefault；
         边界处内层本就滚不动、祖先也不可滚，原生无动作，不冲突） */
-  inner.scrollTop = 1500;                                      // maxTop = 1800-300 = 1500
-  ev = appTouch(g, 'touchmove', 260, innerTarget(inner));
+  ({ g } = mkEngine());
+  const inner2 = fakeEl({ scrollTop: 1500, scrollHeight: 1800, clientHeight: 300 });  // maxTop=1500
+  appTouch(g, 'touchstart', 300, innerTarget(inner2));
+  ev = appTouch(g, 'touchmove', 280, innerTarget(inner2));
   check('②内层贴底：外层接管（passive 手势无需 preventDefault）',
         ev._prevented === false && Math.round(g.y) === 20, `y=${g.y} prevented=${ev._prevented}`);
-  ev = appTouch(g, 'touchmove', 200, innerTarget(inner));
+  ev = appTouch(g, 'touchmove', 220, innerTarget(inner2));
   check('②接管后持续跟手（+60px）', Math.round(g.y) === 80, 'y=' + g.y);
-  appTouch(g, 'touchend', 200, innerTarget(inner));
+  appTouch(g, 'touchend', 220, innerTarget(inner2));
 
   /* ③ 内层贴顶 + 手指下滑 → 外层接管 */
   ({ g } = mkEngine());
@@ -348,7 +435,7 @@ function runFlingTests() {
   /* ⑦ 卡顿修复：起手在内层可滚动列表 → 本手势改用 passive touchmove
      （祖先挂着非 passive touchmove 会让内层滚动只能走主线程 → 滑到列表区域很卡） */
   ({ g } = mkEngine());
-  const inner7 = fakeEl({ scrollTop: 0, scrollHeight: 1800, clientHeight: 300 });
+  const inner7 = fakeEl({ scrollTop: 1480, scrollHeight: 1800, clientHeight: 300 });
   check('⑦初始为非 passive touchmove 监听',
         !!g.el._listeners.touchmove && g.el._listeners.touchmove.passive === false,
         JSON.stringify(g.el._listeners.touchmove));
@@ -357,14 +444,13 @@ function runFlingTests() {
         g._passiveNested === true && !!g.el._listeners.touchmove
         && g.el._listeners.touchmove.passive === true,
         JSON.stringify(g.el._listeners.touchmove));
-  ev = appTouch(g, 'touchmove', 280, innerTarget(inner7));   // 内层还能滚 → 让原生
+  ev = appTouch(g, 'touchmove', 280, innerTarget(inner7));   // 内层还剩 20px：让原生
   check('⑦passive 模式下内层能滚时不动外层、也不调 preventDefault',
         g.y === 0 && ev._prevented === false, 'y=' + g.y);
-  inner7.scrollTop = 1500;                                   // 内层到底
-  ev = appTouch(g, 'touchmove', 260, innerTarget(inner7));
+  ev = appTouch(g, 'touchmove', 250, innerTarget(inner7));   // 内层已到底：外层接管
   check('⑦passive 模式下内层到底：外层仍被驱动（边界处原生无动作，无需 cancel）',
-        Math.round(g.y) === 20 && ev._prevented === false, 'y=' + g.y);
-  appTouch(g, 'touchend', 260, innerTarget(inner7));
+        Math.round(g.y) === 30 && ev._prevented === false, 'y=' + g.y);
+  appTouch(g, 'touchend', 250, innerTarget(inner7));
   check('⑦手势结束恢复非 passive 监听',
         g._passiveNested === false && g.el._listeners.touchmove.passive === false,
         JSON.stringify(g.el._listeners.touchmove));
@@ -432,10 +518,36 @@ function loadMiniProgramPage() {
 }
 
 function runMiniProgramEdgeTests() {
-  section('小程序 index.js（真实代码）：内层贴边判定');
-  const page = loadMiniProgramPage();
+  section('小程序三页：内层框结构 + 选择器下发（真实源码）');
+  const MP = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages');
+  const rd = (p) => fs.readFileSync(path.join(MP, p), 'utf8');
+  const meWxml = rd('me/me.wxml'), meWxss = rd('me/me.wxss'), meJs = rd('me/me.js');
+  const uoWxml = rd('user-orders/user-orders.wxml'), uoWxss = rd('user-orders/user-orders.wxss');
+  const uoJs = rd('user-orders/user-orders.js');
 
-  /* 5 张 image 卡：常量估值 312.8rpx/张（实测仅 290.3），估值内容高 > 真实 → 列表可滚且被 85vh 封顶 */
+  check('me：文件列表是 view 框 + view 轨（不再是原生 scroll-view）',
+        /class="detail-files-scroll"[\s\S]{0,200}?<view class="detail-files-track"/.test(meWxml)
+        && !/<scroll-view[^>]*detail-files-scroll/.test(meWxml));
+  check('me：不再用 catchtouchmove 兜内层（手势全交给 WXS）',
+        !/scroll-view[^>]*catchtouchmove="noop"/.test(meWxml)
+        && !/catchtouchmove="noop"[^>]*detail-files/.test(meWxml));
+  check('me.wxss：内层框 overflow:hidden（由 track transform 驱动）',
+        /\.detail-files-scroll \{[\s\S]{0,160}?overflow: hidden;/.test(meWxss));
+  check('me.js：scrollConfig 下发 nestedSel/nestedTrackSel',
+        /nestedSel: '\.detail-files-scroll'/.test(meJs)
+        && /nestedTrackSel: '\.detail-files-track'/.test(meJs));
+
+  check('user-orders：同构（view 框 + view 轨、无 scroll-view）',
+        /class="detail-files-scroll"[\s\S]{0,200}?<view class="detail-files-track"/.test(uoWxml)
+        && !/<scroll-view[^>]*detail-files-scroll/.test(uoWxml));
+  check('user-orders.wxss：内层框 overflow:hidden',
+        /\.detail-files-scroll \{[\s\S]{0,160}?overflow: hidden;/.test(uoWxss));
+  check('user-orders.js：scrollConfig 下发 nestedSel/nestedTrackSel',
+        /nestedSel: '\.detail-files-scroll'/.test(uoJs)
+        && /nestedTrackSel: '\.detail-files-track'/.test(uoJs));
+
+  /* 首页（打印页）文件列表：同样是 view 框 + view 轨，高度仍由 fileListHeight 封顶 */
+  const page = loadMiniProgramPage();
   const mkFile = (i) => ({
     _uid: i + 1, name: 'p' + i + '.png', size: 2048, path: '/tmp/p' + i + '.png', sizeDisplay: '2.0',
     fileId: 'F' + i, uploading: false, progress: 100, failed: false, copies: 1, pageRange: '',
@@ -446,112 +558,81 @@ function runMiniProgramEdgeTests() {
   page.data.selectedFiles = [0, 1, 2, 3, 4].map(mkFile);
   page._fileListPx = 0;
   page._recalcFileListHeight();
-  // 结束高度补间（真实使用中用户滚动前动画已播完）：直接落到位再推配置
-  const settleHeight = () => {
-    if (page._fileListTween) { clearTimeout(page._fileListTween); page._fileListTween = null }
-    page.data.fileListHeight = page._fileListPx;
-    page._pushScrollConfig();
-  };
-  settleHeight();
+  if (page._fileListTween) { clearTimeout(page._fileListTween); page._fileListTween = null; }
+  page.data.fileListHeight = page._fileListPx;
+  page._pushScrollConfig();
 
-  const viewH = page.data.fileListHeight;
-  const estContent = page._fileListContentPx;
-  const estMax = Math.max(0, estContent - viewH);
-  check('列表可滚（估值内容高 > 可视高）', page.data.scrollConfig.listOverflow === true,
-        `contentPx=${estContent} viewH=${viewH}`);
-  check('估值 maxScroll > 0（说明确实用到了内容高估值）', estMax > 10, 'estMax=' + estMax);
+  const mpJs = fs.readFileSync(MP_JS, 'utf8');
+  check('index.js：scrollConfig 下发 .file-list-scroll / .file-list-track',
+        page.data.scrollConfig.nestedSel === '.file-list-scroll'
+        && page.data.scrollConfig.nestedTrackSel === '.file-list-track',
+        JSON.stringify({ s: page.data.scrollConfig.nestedSel, t: page.data.scrollConfig.nestedTrackSel }));
+  check('index.js：不再往 WXS 推 listOverflow/listAtTop/listAtBottom（贴边逐帧量，不靠逻辑层）',
+        page.data.scrollConfig.listOverflow === undefined
+        && page.data.scrollConfig.listAtTop === undefined
+        && page.data.scrollConfig.listAtBottom === undefined);
+  check('index.js：删掉了 bindscroll 那套贴边同步（onFileListScroll/_refreshListEdges）',
+        !/onFileListScroll/.test(mpJs) && !/_refreshListEdges/.test(mpJs));
+  check('index.js：不再查内层 scrollOffset（选择器查询里只剩外层几何）',
+        !/file-list-scroll'\)\.scrollOffset\(\)/.test(mpJs));
+  check('index.js：作废了估算高折算常量（贴边不再靠估值）',
+        !/FILE_CARD_HEIGHT_EST_OVER/.test(mpJs));
+  check('index：列表高度仍有上限（内容超出才需要内层滚）',
+        page.data.fileListHeight > 0 && page._fileListPx === page.data.fileListHeight,
+        `h=${page.data.fileListHeight} px=${page._fileListPx}`);
 
-  /* 真实内容高比估值小 7%（实测偏差）→ 真实 maxScroll 明显小于估值 maxScroll */
-  const realContent = Math.round(estContent * 0.93);
-  const realMax = Math.max(0, realContent - viewH);
-  check('真实 maxScroll 比估值小（正是"滚到底也判不出到底"的根因）', realMax < estMax - 5,
-        `realMax=${realMax} estMax=${estMax}`);
-
-  /* ① 修复后：滚到真实底部（带真实 scrollHeight）→ 判定到底，并把 listAtBottom 推给 WXS */
-  page._listAtTop = true;
-  page._listAtBottom = false;
-  page.onFileListScroll({ detail: { scrollTop: realMax, scrollHeight: realContent, scrollWidth: 0 } });
-  check('①滚到真实底部（用 scrollHeight 判定）→ listAtBottom=true',
-        page._listAtBottom === true, `listAtBottom=${page._listAtBottom} scrollTop=${realMax}`);
-  check('①scrollConfig 已同步 listAtBottom=true（WXS 据此把滚动交给外层）',
-        page.data.scrollConfig.listAtBottom === true);
-
-  /* ② 反证：不带真实 scrollHeight（退回常量估值）时，同一 scrollTop 判不出到底 —— 旧实现的 bug */
-  page._listAtTop = true;
-  page._listAtBottom = false;
-  page._fileListRealPx = 0;
-  page.onFileListScroll({ detail: { scrollTop: realMax, scrollHeight: 0, scrollWidth: 0 } });
-  check('②反证：只用常量估值 → 同一位置 listAtBottom 仍为 false（旧行为，接力失效）',
-        page._listAtBottom === false, 'estMax=' + estMax + ' scrollTop=' + realMax);
-
-  /* ③ 反过来：滚到顶部（scrollTop=0）→ listAtTop=true，用于"外层到顶交还内层" */
-  page._listAtTop = false;
-  page._listAtBottom = true;
-  page.onFileListScroll({ detail: { scrollTop: 0, scrollHeight: realContent } });
-  check('③滚到顶部 → listAtTop=true / listAtBottom=false',
-        page._listAtTop === true && page._listAtBottom === false);
-
-  /* ④ 把推出来的 config 喂给真实 WXS 引擎：内层贴底后继续上滑 → 外层接管 */
-  page.onFileListScroll({ detail: { scrollTop: realMax, scrollHeight: realContent } });  // 回到"贴底"状态
-  check('④喂 WXS 前配置确为 listAtBottom=true', page.data.scrollConfig.listAtBottom === true);
+  /* 端到端：首页真实 config 喂真实 WXS → 内层先滚、外层不动 */
   const engine = loadWxsEngine();
+  const h = page.data.fileListHeight;
+  const box = makeBox(200, h, h + 300, 0);
   const owner = makeWxsOwner(engine, Object.assign({}, page.data.scrollConfig, {
     minY: 0, maxY: 600, scrollerH: 800, contentH: 1400,
-  }));
+  }), [box]);
   const st = owner.getState();
   wxsTouch(engine, owner, 'touchstart', 300);
-  const ret = wxsTouch(engine, owner, 'touchmove', 270);
-  check('④端到端：配置带 listAtBottom=true → 内层触点起手也能让外层接管',
-        ret === false && st.y > 0, `ret=${ret} y=${st.y}`);
-  wxsTouch(engine, owner, 'touchend', 270);
-
-  /* ⑤ 列表不可滚（只 1 个文件）→ 两个方向都视为贴边，WXS 立刻把滚动交给外层 */
-  page.data.selectedFiles = [mkFile(0)];
-  page._fileListPx = 0;
-  page._recalcFileListHeight();
-  settleHeight();
-  check('⑤内容不足一屏：listOverflow=false 且 listAtTop/listAtBottom 都为 true',
-        page.data.scrollConfig.listOverflow === false
-        && page.data.scrollConfig.listAtTop === true && page.data.scrollConfig.listAtBottom === true,
-        JSON.stringify({ overflow: page.data.scrollConfig.listOverflow, top: page.data.scrollConfig.listAtTop, bottom: page.data.scrollConfig.listAtBottom }));
+  check('端到端：首页 config 能被 WXS 认出来（量到行程 300px）', !!st.nb && st.nb.maxY === 300,
+        st.nb ? 'maxY=' + st.nb.maxY : 'nb=null');
+  const ret = wxsTouch(engine, owner, 'touchmove', 280);
+  check('端到端：内层吃得下时页面不动', ret === true && st.y === 0 && Math.round(box._body._y) === 20,
+        `ret=${ret} y=${st.y} trackY=${box._body._y}`);
+  wxsTouch(engine, owner, 'touchend', 280);
 }
 
 /* ============================================================
-   四、接线核对（逻辑层/模板/样式的配套改动）
+   四、接线核对（模板/样式/引擎的配套改动）
    ============================================================ */
 function runWiringChecks() {
-  section('接线核对（小程序逻辑层 + 两端 touch-action）');
-  const mpJs = fs.readFileSync(MP_JS, 'utf8');
-  const mpWxml = fs.readFileSync(MP_WXML, 'utf8');
+  section('接线核对（WXS 契约 + APP 引擎）');
+  const wxs = fs.readFileSync(WXS, 'utf8');
   const appJs = fs.readFileSync(APP_JS, 'utf8');
   const css = fs.readFileSync(APP_CSS, 'utf8');
 
-  check('小程序：scroll-view 绑 bindscroll 同步内层边界',
-        /class="file-list-scroll"[\s\S]{0,200}bindscroll="onFileListScroll"/.test(mpWxml));
-  check('小程序：scrollConfig 带 listAtTop/listAtBottom',
-        /listAtTop: !!this\._listAtTop/.test(mpJs) && /listAtBottom: !!this\._listAtBottom/.test(mpJs));
-  check('小程序：onFileListScroll → _refreshListEdges（仅翻转时 setData）',
-        /onFileListScroll\(e\) \{/.test(mpJs) && /_refreshListEdges\(/.test(mpJs));
-  check('小程序：_measure 同步查询内层 scrollOffset（内容增减后边界不失效）',
-        /\.file-list-scroll'\)\.scrollOffset\(\)/.test(mpJs));
-  check('小程序：贴边判定用滚动事件的真实 scrollHeight（不再只靠常量估值）',
-        /_refreshListEdges\(d\.scrollTop, d\.scrollHeight\)/.test(mpJs)
-        && /this\._fileListRealPx = real/.test(mpJs));
-  check('小程序：内容不足一屏时两边都置贴边（外层立即接管）',
-        /if \(!listOverflow\) \{[\s\S]{0,200}this\._listAtBottom = true/.test(mpJs));
-  check('小程序：初始 config/state 带边界字段',
-        /listOverflow: false, listAtTop: true, listAtBottom: false/.test(mpJs)
-        && /state\.listAtTop = true;/.test(fs.readFileSync(WXS, 'utf8')));
+  check('WXS：不再消费 listOverflow/listAtTop/listAtBottom',
+        !/newValue\.listOverflow/.test(wxs) && !/newValue\.listAtTop/.test(wxs)
+        && !/newValue\.listAtBottom/.test(wxs));
+  check('WXS：onConfig 消费 nestedSel/nestedTrackSel',
+        /newValue\.nestedSel/.test(wxs) && /newValue\.nestedTrackSel/.test(wxs));
+  check('WXS：按触点逐个量框（selectAllComponents，多卡不串）',
+        /selectAllComponents/.test(wxs) && /function measureNested/.test(wxs));
+  check('WXS：内外层位移同帧结算（内层吃剩的余量给外层）',
+        /var rest = need - take;/.test(wxs) && /ddy = -rest;/.test(wxs));
+  check('WXS：内层惯性撞边把余速交给外层',
+        /function startNbDecel/.test(wxs) && /state\.vel = carry/.test(wxs));
 
   check('APP：.scroller.js-scroll 的 touch-action 不再是 none（改 pan-y）',
         /\.scroller\.js-scroll \{[\s\S]{0,200}touch-action: pan-y;/.test(css)
         && !/\.scroller\.js-scroll \{[\s\S]{0,200}touch-action: none;/.test(css));
   check('APP：FlingEngine 内联 touchAction 同步改 pan-y',
         /this\.el\.style\.touchAction = 'pan-y'/.test(appJs));
-  check('APP：内层滚动容器仍保持原生纵向滚动（.file-list-scroll/.wheel-viewport）',
+  check('APP：内层滚动容器保持原生纵向滚动（详情列表也带 overscroll-behavior）',
         /\.file-list-scroll \{[\s\S]{0,120}overflow-y: auto;/.test(css)
-        && /\.wheel-viewport \{[\s\S]{0,160}overflow-y: auto;/.test(css));
+        && /\.detail-files-scroll \{[\s\S]{0,200}overflow-y: auto;/.test(css));
+  check('APP：引擎用手势内累计估计代替实时 scrollTop（消除贴边死区）',
+        /this\._nestEst/.test(appJs) && /const est = Math\.max\(0, Math\.min\(maxTop, this\._nestEst\)\);/.test(appJs));
+  check('APP：慢速拖动（<0.5px/帧）也推进估计值',
+        /if \(ddy !== 0\) \{/.test(appJs));
 }
+
 
 /* ============================================================ */
 runWxsTests();

@@ -51,6 +51,32 @@ const PAGES_MOD = loadModule('utils/pages.js', 'countPagesInRange');
 // 头像裁剪几何（me.js 2026-10 起 require 的模块）：**真实加载**，文件缺失/语法错直接抛，
 // 不做"空对象桩" —— 否则 me.js 一旦依赖它的导出就会被静默放过。
 const AVATAR_CROP_MOD = loadModule('utils/avatar_crop.js');
+/* 摊纸兜底（utils/order_stats）：me.js 的 _enrichFileStat 在缺 sheets 字段时用它。
+   2026-11 起轮询「结构变化 → 全量刷新」也走 _normalizeOrderRow，于是这条路径第一次会 require
+   到它；同样真实加载（它自己只 require './pages'，把真实 pages 模块喂进去）。 */
+const ORDER_STATS_MOD = (() => {
+  const src = fs.readFileSync(path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'order_stats.js'), 'utf8');
+  const m = { exports: {} };
+  new Function('module', 'exports', 'require', src)(m, m.exports, (dep) => {
+    if (dep === './pages') return PAGES_MOD;
+    throw new Error('utils/order_stats.js 意外 require 了 ' + dep);
+  });
+  if (typeof m.exports.fallbackSheets !== 'function') {
+    throw new Error('utils/order_stats.js 未导出 fallbackSheets（me.js 的张数兜底会失效）');
+  }
+  return m.exports;
+})();
+
+/* utils/price_copy.js：文案唯一实现（2026-11-09 从 me.js 抽出）—— 真实加载，'./pages' 用同一份 shim */
+const PRICE_COPY_MOD = (() => {
+  const p = path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'price_copy.js');
+  const m = { exports: {} };
+  new Function('module', 'exports', 'require', fs.readFileSync(p, 'utf8'))(m, m.exports, (dep) => {
+    if (dep === './pages') return PAGES_MOD;
+    throw new Error('utils/price_copy.js 意外 require 了 ' + dep);
+  });
+  return m.exports;
+})();
 
 /** 载入真实 me.js，返回 { methods, captured: {lastOpts} } */
 function loadMe() {
@@ -69,6 +95,8 @@ function loadMe() {
       if (dep.endsWith('utils/config')) return CONFIG_MOD;
       if (dep.endsWith('utils/pages')) return PAGES_MOD;
       if (dep.endsWith('utils/avatar_crop')) return AVATAR_CROP_MOD;
+      if (dep.endsWith('utils/order_stats')) return ORDER_STATS_MOD;
+      if (dep.endsWith('utils/price_copy')) return PRICE_COPY_MOD;
       if (dep.endsWith('utils/request')) {
         return { request: (opts) => { captured.lastOpts = opts; } };
       }

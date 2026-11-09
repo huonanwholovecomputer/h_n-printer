@@ -35,6 +35,13 @@ const APP_ME_JS = path.join(REPO, 'mobile_apps', 'android_app', 'www', 'me.js');
 const APP_APP_JS = path.join(REPO, 'mobile_apps', 'android_app', 'www', 'app.js');
 const APP_CSS = path.join(REPO, 'mobile_apps', 'android_app', 'www', 'styles.css');
 const MP_ME_JSON = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'me', 'me.json');
+/* 2026-11-09：文案/算式抽成 utils/price_copy.js，「我」页与 user-orders 子视图共用；
+   气泡样式抽成 utils/price_pop.wxss，两页 @import。下面的守卫脚本据此改读这三处。 */
+const MP_PRICE_COPY_JS = path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'price_copy.js');
+const MP_PRICE_POP_WXSS = path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'price_pop.wxss');
+const MP_USER_JS = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'user-orders', 'user-orders.js');
+const MP_USER_WXML = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'user-orders', 'user-orders.wxml');
+const MP_USER_WXSS = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'user-orders', 'user-orders.wxss');
 
 let failures = 0;
 function check(name, cond, detail) {
@@ -54,6 +61,24 @@ const AVATAR_CROP_MOD = (() => {
   if (typeof m.exports.fitState !== 'function' || typeof m.exports.cropRect !== 'function') {
     throw new Error('utils/avatar_crop.js 未导出 fitState/cropRect（头像裁剪几何变了？）');
   }
+  return m.exports;
+})();
+
+/* utils/price_copy.js 是文案与算式的唯一实现：**真实加载**它（不是桩），
+   只把它的 './pages' 依赖换成与 loadMiniProgram 同口径的页数 shim。
+   这样「两个页面都走同一份实现」这件事本身也在被验证。 */
+const PRICE_COPY_MOD = (() => {
+  const p = MP_PRICE_COPY_JS;
+  const m = { exports: {} };
+  new Function('module', 'exports', 'require', fs.readFileSync(p, 'utf8'))(m, m.exports, (dep) => {
+    if (dep === './pages') {
+      return { countPagesInRange: (range, count) => (range ? 0 : (Number(count) || 0)) };
+    }
+    throw new Error('utils/price_copy.js 意外 require 了 ' + dep);
+  });
+  ['priceLine', 'priceDetailLines', 'createPriceRulesGetter', 'orderTotal'].forEach((k) => {
+    if (typeof m.exports[k] !== 'function') throw new Error('utils/price_copy.js 未导出 ' + k);
+  });
   return m.exports;
 })();
 
@@ -101,6 +126,7 @@ function loadMiniProgram() {
         return { countPagesInRange: (range, count) => (range ? 0 : (Number(count) || 0)) };
       }
       if (dep.indexOf('utils/avatar_crop') >= 0) return AVATAR_CROP_MOD;
+      if (dep.indexOf('price_copy') >= 0) return PRICE_COPY_MOD;
       if (dep.indexOf('utils/request') >= 0) {
         return {
           // 详细价格要先拿单价才能写算式：pricing 请求同步回调（0.3/0.4 = pricing.json 权威值）
@@ -300,11 +326,20 @@ function runMiniProgram() {
   check('⑦ 找不到订单 → 不写剪贴板且气泡收起',
         calls.clipboard.length === 0 && ctx.data.showPricePop === false);
 
-  // ⑧ 点 mask 关闭
+  // ⑧ 点气泡外（页面 touchstart 捕获）→ 收起
   ctx = makeCtx(component, [order]);
   ctx.data.showPricePop = true;
   ctx.onClosePricePop();
-  check('⑧ 点气泡外（mask）→ 收起', ctx.data.showPricePop === false);
+  check('⑧ 点气泡外 → 收起', ctx.data.showPricePop === false);
+
+  // ⑧b 2026-11-09 用户反馈：气泡是「非模态」的，页面一碰（含滑动）就先收起，
+  //     手势本身照常交给 WXS 滚动引擎 —— 不能再靠 catchtouchmove 把整页锁住。
+  ctx = makeCtx(component, [order]);
+  ctx.data.showPricePop = true;
+  ctx.onPricePopDismiss();
+  check('⑧b 页面 touchstart（capture）→ 收起气泡', ctx.data.showPricePop === false);
+  ctx.onPricePopDismiss();
+  check('⑧b2 已收起时重复触发不报错、状态不变', ctx.data.showPricePop === false);
 }
 
 /* ============================================================
@@ -313,7 +348,8 @@ function runMiniProgram() {
 function checkMiniProgramMarkup() {
   section('小程序 me.wxml / me.wxss 接线');
   const wxml = fs.readFileSync(MP_ME_WXML, 'utf8');
-  const wxss = fs.readFileSync(MP_ME_WXSS, 'utf8');
+  // 气泡样式已抽到 utils/price_pop.wxss（两页 @import）：检查「页面 + 共用样式」合并后的结果
+  const wxss = fs.readFileSync(MP_ME_WXSS, 'utf8') + '\n' + fs.readFileSync(MP_PRICE_POP_WXSS, 'utf8');
   const js = fs.readFileSync(MP_ME_JS, 'utf8');
 
   check('价格可点：id 供测量 + data-id + catchtap（不冒泡收起卡片）',
@@ -328,18 +364,31 @@ function checkMiniProgramMarkup() {
   check('气泡在 page-root 外（在 modals 区、我的文件弹窗之前）',
         popIdx > 0 && modalIdx > 0 && popIdx > modalIdx && popIdx < myFilesIdx,
         `pop=${popIdx} modal=${modalIdx} myfiles=${myFilesIdx}`);
-  check('气泡是「点外部关闭」的 mask + 两个按钮（复制价格 / 复制详细价格）',
-        /class="price-pop-mask[\s\S]{0,600}catchtap="onClosePricePop"/.test(wxml)
+  check('价格气泡不是模态：遮罩 is-pass-through（不参与命中测试）+ 两个按钮',
+        /class="price-pop-mask is-pass-through[^>]*>/.test(wxml)
         && wxml.indexOf('catchtap="onCopyOrderPrice"') > 0
         && wxml.indexOf('catchtap="onCopyOrderDetailPrice"') > 0
         && wxml.indexOf('>复制价格<') > 0
         && wxml.indexOf('>复制详细价格<') > 0);
+  check('价格遮罩上不许再挂 catchtouchmove / catchtap（那正是把页面锁住的写法）',
+        !/class="price-pop-mask is-pass-through[^>]*catchtouchmove/.test(wxml)
+        && !/class="price-pop-mask is-pass-through[^>]*catchtap=/.test(wxml));
+  check('页面 page-root 用 capture-bind:touchstart 收起气泡（滑动=先关再滚）',
+        /class="page-root[\s\S]{0,200}?capture-bind:touchstart="onPricePopDismiss"/.test(wxml));
+  // wxml 里挂的处理器必须在 JS 里真实存在（写错名字微信只会静默告警）
+  const dismissBinding = (wxml.match(/capture-bind:touchstart="([^"]+)"/) || [])[1] || '';
+  check('page-root 挂的 touchstart 处理器在 me.js 里存在且是函数',
+        dismissBinding === 'onPricePopDismiss'
+        && /^\s*onPricePopDismiss\(\)\s*\{/m.test(fs.readFileSync(MP_ME_JS, 'utf8')));
   check('气泡内点击不穿透（气泡自身 catchtap="noop"）',
         /class="price-pop \{\{pricePopBelow[\s\S]{0,400}catchtap="noop"/.test(wxml));
 
   check('WXSS：mask 与气泡都是 position:fixed（逃出 translateY 变换层 + 不被卡片裁剪）',
         /\.price-pop-mask\s*\{[^}]*position:\s*fixed/.test(wxss)
         && /\.price-pop\s*\{[^}]*position:\s*fixed/.test(wxss));
+  check('WXSS：is-pass-through 遮罩 pointer-events:none，气泡 pointer-events:auto',
+        /\.price-pop-mask\.is-pass-through\s*\{[^}]*pointer-events:\s*none/.test(wxss)
+        && /\.price-pop\s*\{[^}]*pointer-events:\s*auto/.test(wxss));
   check('WXSS：箭头默认朝下、翻到下方时朝上',
         /\.price-pop-above \.price-pop-caret\s*\{[^}]*bottom:/.test(wxss)
         && /\.price-pop-below \.price-pop-caret\s*\{[^}]*top:/.test(wxss));
@@ -462,6 +511,20 @@ function checkAppWiring() {
   check('切 tab（app.js switchTab）收起气泡', /closePricePop/.test(app));
   check('pagehide 收起气泡', /pagehide'[\s\S]{0,80}closePricePop\(\)/.test(me));
 
+  // 只看 openPricePop 函数体（状态原因气泡仍是模态，它那条 touchmove preventDefault 是对的）
+  const openPopBody = (me.match(/function openPricePop\([\s\S]*?\n}/) || [''])[0];
+  check('APP 价格气泡非模态：遮罩 is-pass-through，且不再 touchmove preventDefault',
+        /mask\.className = 'price-pop-mask is-pass-through'/.test(openPopBody)
+        && openPopBody.length > 500
+        && !/addEventListener\('touchmove'/.test(openPopBody));
+  check('APP 失去焦点即关闭：touchstart/mousedown capture + 任一滚动收起',
+        /document\.addEventListener\('touchstart', onDocTouchStart, \{ capture: true, passive: true \}\)/.test(me)
+        && /document\.addEventListener\('mousedown', onDocTouchStart, \{ capture: true \}\)/.test(me)
+        && /window\.addEventListener\('scroll', onDocScroll, \{ capture: true, passive: true \}\)/.test(me));
+  check('APP CSS：.price-pop-mask.is-pass-through 不吃指针、不锁触摸；气泡自己可点',
+        /\.price-pop-mask\.is-pass-through\s*\{[^}]*pointer-events:\s*none[^}]*touch-action:\s*auto/.test(css)
+        && /\.price-pop\s*\{[^}]*pointer-events:\s*auto/.test(css));
+
   check('styles.css：气泡 fixed + 上下两种箭头 + 深色覆盖',
         /\.price-pop-mask\s*\{[^}]*position:\s*fixed/.test(css)
         && /\.price-pop\s*\{[^}]*position:\s*fixed/.test(css)
@@ -471,30 +534,274 @@ function checkAppWiring() {
 }
 
 /* ============================================================
+   四·补、APP「复制详细价格」反查不得被「最近订单」缓存行抢走
+   ------------------------------------------------------------
+   现场 bug（2026-11-09 用户 HN20261108-0009）：在「管理管理员 → 某人任务」子视图里点
+   「复制详细价格」，复制出来只有 订单号 / 计费明细 / 合计，逐文件三行全没了。
+   根因：/api/admin/recent_orders 按契约**不下发逐文件明细**，me.js 把它们登记成 `files: []`
+   的行并且把 order_id 映射成 id；`_priceOrderById` 按 id 反查且「先到先得」，
+   于是同一个订单被最近订单的缓存行命中 ⇒ buildPriceDetailText 没有文件可写。
+   本段钉住：同一 id 在多个池子里出现时，**带 files 的完整行必须赢**；
+   只有缓存行可用时才退回它（那时只剩标题+合计是设计口径，不许编造分项）。
+   ============================================================ */
+function checkAppPriceLookupPools() {
+  section('APP 价格反查池（最近订单缓存行不得抢走完整行）');
+  const g = loadAppMe();
+  const order = makeOrder();            // id=3，3 个文件，合计 ¥3.80
+  check('夹具订单 id=3 且带 3 个文件', order.id === 3 && order.files.length === 3);
+  // 「最近订单」缓存行：同一 id，只有标题 + 合计（与 loadRecentOrders 里的映射同形状）
+  const cachedRow = {
+    id: order.id, order_number: order.order_number, total_price: order.total_price,
+    files: [], owner: '姚懿祥', owner_masked: '姚**', created_at: order.created_at,
+    file_count: 3, page_count: 10, status: order.status, source: 'local', is_admin_print: false,
+  };
+  // 两个池子都登记同一个 id：完整行在用户订单子视图，缓存行在「近 N 条订单」
+  g.meStateRef = null;
+  vm.runInContext('meState.orders = []; meState.recentOrderRows = [];'
+    + ' meState.recentOrders = [__cached];'
+    + ' meState.userOrdersView = { orders: [__full] };',
+    Object.assign(g, { __cached: cachedRow, __full: order }));
+  const hit = vm.runInContext('_priceOrderById(3)', g);
+  check('同 id 时反查命中的是带 files 的完整行', !!(hit && hit.files && hit.files.length === 3),
+        hit ? ('files=' + ((hit.files || []).length)) : 'null');
+  const detail = g.buildPriceDetailText(hit, { simplex: 0.3, duplex: 0.4 });
+  check('「复制详细价格」逐文件三行齐全（不再只剩合计）',
+        detail.indexOf('1. 示波器的使用.pdf') > 0
+        && detail.indexOf('2. 数据结构-第3次.docx') > 0
+        && detail.indexOf('3. 示波器数据表格.pdf') > 0
+        && detail.split('\n').slice(-1)[0] === '💰合计: ¥3.80',
+        detail.split('\n').slice(4, 6).join(' / '));
+
+  // 反向：只有缓存行可用（例如刚打开 APP，还没进过用户订单子视图）→ 退回缓存行，
+  // 详细价格就只剩标题+合计 —— 这是设计口径（不编造分项），不是本 bug 的回归。
+  vm.runInContext('meState.userOrdersView = { orders: [] };', g);
+  const hit2 = vm.runInContext('_priceOrderById(3)', g);
+  check('只有缓存行可用时退回缓存行（不报错、不编造）',
+        !!(hit2 && hit2.id === 3 && (hit2.files || []).length === 0));
+  const detail2 = g.buildPriceDetailText(hit2, { simplex: 0.3, duplex: 0.4 });
+  check('缓存行兜底时只剩标题+合计（14 短横线 结构不变）',
+        detail2.indexOf('计费明细') > 0 && detail2.indexOf('. ') < 0
+        && detail2.split('\n').slice(-1)[0] === '💰合计: ¥3.80');
+
+  // 「带明细优先」独立于池子顺序：完整行排在**更后面的池子**里也必须赢
+  // （池顺序只是顺带优化；真正的判据是「有 files 的行优先」，否则换个池子顺序又会复发）
+  vm.runInContext('meState.orders = [__cached]; meState.userOrdersView = { orders: [] };'
+    + ' meState.recentOrderRows = []; meState.recentOrders = [__full];', g);
+  const hit3 = vm.runInContext('_priceOrderById(3)', g);
+  check('完整行在后面的池子里也优先于前面的缓存行（不靠池子顺序）',
+        !!(hit3 && hit3.files && hit3.files.length === 3),
+        hit3 ? ('files=' + ((hit3.files || []).length)) : 'null');
+}
+
+/* ============================================================
    五、跨端一致性：两端文案/字段名不得漂移
    ============================================================ */
 function checkCrossClient() {
-  section('两端一致性');
-  const mp = fs.readFileSync(MP_ME_JS, 'utf8');
+  section('两端一致性（小程序两个页面共用 utils/price_copy.js）');
+  const pc = fs.readFileSync(MP_PRICE_COPY_JS, 'utf8');
+  const meJs = fs.readFileSync(MP_ME_JS, 'utf8');
+  const userJs = fs.readFileSync(MP_USER_JS, 'utf8');
+  // 小程序侧的全部源：两个页面 + 共用实现（文案只允许出现在后者）
+  const mp = meJs + '\n' + userJs + '\n' + pc;
   const app = fs.readFileSync(APP_ME_JS, 'utf8');
   const labels = ['计费明细', '复制价格', '复制详细价格', '💰合计', '附加服务费', '订单号: ', '范围:'];
   labels.forEach((label) => {
     check(`两端都有「${label}」文案`, mp.indexOf(label) > 0 && app.indexOf(label) > 0);
   });
-  // 单价只用来拼「计费公式」文案，金额永远写实收值：逐文件 f.total_price、合计订单 total_price。
-  // 两边都不许出现「用单价重算合计」的写法（那会和页面上的数字打架）。
+  // 单价只用来拼「计费公式」文案，金额永远写实收值：逐文件 f.total_price、合计 total_price。
   check('两端金额一律取实收（逐文件 f.total_price / 合计 total_price）',
-        /Math\.round\(\(Number\(f\.total_price\)/.test(mp) && /f\.total_price/.test(app)
-        && mp.indexOf("'💰合计: ¥' + total.toFixed(2)") > 0
+        /Math\.round\(\(Number\(f\.total_price\)/.test(pc) && /f\.total_price/.test(app)
+        && pc.indexOf("'💰合计: ¥' + total.toFixed(2)") > 0
         && app.indexOf("'💰合计: ¥' + total.toFixed(2)") > 0
-        && !/baseTotal \+ /.test(mp.slice(mp.indexOf('_priceDetailLines'), mp.indexOf('onPriceTap')))
+        && !/baseTotal \+ /.test(pc.slice(pc.indexOf('function priceDetailLines'), pc.indexOf('function createPriceRulesGetter')))
         && !/baseTotal \+ /.test(app.slice(app.indexOf('function buildPriceDetailText'), app.indexOf('function closePricePop'))));
+
+  // ── 单源守卫（2026-11-09）──
+  // 文案/算式只许有一份实现。历史教训：mission 里多份副本各自漂移（utils/pages.js 顶部
+  // 记的是同一类事故；这里是它的价格版）。
+  // 只认「真的在拼这段文案」的代码（注释里提一句不算副本）
+  check('「计费明细」只在 utils/price_copy.js 里被写进文本',
+        pc.indexOf("lines.push('计费明细')") > 0
+        && meJs.indexOf("lines.push('计费明细')") < 0
+        && userJs.indexOf("lines.push('计费明细')") < 0);
+  check('14 短横线 / 💰合计 的拼接也只在共用实现里',
+        meJs.indexOf("'-'.repeat(14)") < 0 && userJs.indexOf("'-'.repeat(14)") < 0
+        && meJs.indexOf('💰合计: ¥') < 0 && userJs.indexOf('💰合计: ¥') < 0
+        && pc.indexOf("PRICE_DASH = '-'.repeat(14)") > 0);
+  check('两个页面 require 同一份实现（不是各拼一份）',
+        /require\('\.\.\/\.\.\/utils\/price_copy'\)/.test(meJs)
+        && /require\('\.\.\/\.\.\/utils\/price_copy'\)/.test(userJs));
+  check('气泡样式只有 utils/price_pop.wxss 一份，两页都 @import',
+        fs.readFileSync(MP_ME_WXSS, 'utf8').indexOf('utils/price_pop.wxss') > 0
+        && fs.readFileSync(MP_USER_WXSS, 'utf8').indexOf('utils/price_pop.wxss') > 0
+        && fs.readFileSync(MP_ME_WXSS, 'utf8').indexOf('.price-pop-mask') < 0
+        && fs.readFileSync(MP_USER_WXSS, 'utf8').indexOf('.price-pop-mask') < 0
+        && fs.readFileSync(MP_PRICE_POP_WXSS, 'utf8').indexOf('.price-pop-mask') > 0);
+}
+
+/* ============================================================
+   四、小程序 pages/user-orders（管理管理员 → 某人任务 子视图）
+   ------------------------------------------------------------
+   现场问题（2026-11-09 用户）：这个子视图的价格行原来是**纯文本**，压根没有复制入口
+   （与「上传没上传」无关，是功能没做）。现在它和「我」页共用 utils/price_copy.js：
+   价格可点 → 同一套气泡 → 同一份文案。本段钉住接线，并**实际跑一遍**两个入口的文本一致。
+   ============================================================ */
+function loadMiniProgramUserOrders() {
+  const src = fs.readFileSync(MP_USER_JS, 'utf8');
+  const captured = { component: null, toast: [], clipboard: [] };
+  const sandbox = {
+    console,
+    JSON, Math, Date, Object, Array, String, Number, Boolean, Error, Promise, Set, Map,
+    parseInt, parseFloat, isNaN, isFinite,
+    setTimeout: () => 0,
+    clearTimeout: () => {},
+    setInterval: () => 0,
+    clearInterval: () => {},
+    require: (dep) => {
+      if (dep.indexOf('utils/config') >= 0) return { CONFIG: { BASE_URL: 'https://example.invalid' } };
+      if (dep.indexOf('utils/pages') >= 0) {
+        return { countPagesInRange: (range, count) => (range ? 0 : (Number(count) || 0)) };
+      }
+      if (dep.indexOf('utils/request') >= 0) {
+        return {
+          request: (opts) => {
+            if (opts && typeof opts.url === 'string' && opts.url.indexOf('/api/pricing') >= 0) {
+              opts.success({ statusCode: 200, data: { success: true, pricing: { simplex_price: 0.3, duplex_price: 0.4 } } });
+            }
+          },
+          createPollScheduler: () => ({ start() {}, stop() {} }),
+        };
+      }
+      if (dep.indexOf('price_copy') >= 0) return PRICE_COPY_MOD;
+      if (dep.indexOf('order_stats') >= 0) return { fallbackSheets: () => 0 };
+      throw new Error('shim 未提供的 require: ' + dep);
+    },
+    wx: {
+      getStorageSync: () => '',
+      setStorageSync: () => {},
+      removeStorageSync: () => {},
+      getWindowInfo: () => ({ windowWidth: 375, windowHeight: 800, safeArea: { bottom: 800 } }),
+      getSystemInfoSync: () => ({ windowWidth: 375, windowHeight: 800, platform: 'devtools' }),
+      showToast: (o) => captured.toast.push(o && o.title),
+      setClipboardData: (o) => {
+        captured.clipboard.push(o && o.data);
+        if (o && o.success) o.success({});
+      },
+      createSelectorQuery: () => {
+        const q = { select: () => q, boundingClientRect: () => q, exec: () => {} };
+        return q;
+      },
+      nextTick: (fn) => fn && fn(),
+    },
+    getApp: () => ({ globalData: {} }),
+    Component: (cfg) => { captured.component = cfg; },
+    Page: (cfg) => { captured.component = cfg; },
+  };
+  sandbox.global = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox, { filename: 'user-orders.js' });
+  if (!captured.component || !captured.component.methods) {
+    throw new Error('user-orders.js 未暴露 Component.methods（夹具需同步更新）');
+  }
+  return { component: captured.component, calls: captured };
+}
+
+function checkMiniProgramUserOrders() {
+  section('小程序 pages/user-orders（管理入口 → 某人任务）价格复制');
+  const wxml = fs.readFileSync(MP_USER_WXML, 'utf8');
+  const js = fs.readFileSync(MP_USER_JS, 'utf8');
+
+  check('价格行可点：id 供测量 + data-id + catchtap（不冒泡去收卡片）',
+        wxml.indexOf('id="price-tap-{{item.id}}"') > 0
+        && /class="detail-price-tap"[\s\S]{0,300}catchtap="onPriceTap"/.test(wxml)
+        && wxml.indexOf('class="price-copy-icon"') > 0);
+  // 气泡必须在 page-root 外：否则被 .scroll-content 的 translateY / 卡片 overflow 裁剪
+  const popIdx = wxml.indexOf('class="price-pop-mask');
+  const pageRootIdx = wxml.lastIndexOf('class="page-root');
+  check('气泡在 page-root 外（fixed 定位才不被滚动层/卡片裁剪）',
+        popIdx > 0 && pageRootIdx > 0 && popIdx > pageRootIdx, `pop=${popIdx} root=${pageRootIdx}`);
+  check('价格气泡不是模态：遮罩 is-pass-through（与「我」页同口径）',
+        /class="price-pop-mask is-pass-through[^>]*>/.test(wxml)
+        && !/class="price-pop-mask is-pass-through[^>]*catchtouchmove/.test(wxml)
+        && !/class="price-pop-mask is-pass-through[^>]*catchtap=/.test(wxml)
+        && /class="page-root[\s\S]{0,200}?capture-bind:touchstart="onPricePopDismiss"/.test(wxml)
+        && wxml.indexOf('catchtap="onCopyOrderPrice"') > 0
+        && wxml.indexOf('catchtap="onCopyOrderPrice"') > 0
+        && wxml.indexOf('catchtap="onCopyOrderDetailPrice"') > 0
+        && wxml.indexOf('>复制价格<') > 0
+        && wxml.indexOf('>复制详细价格<') > 0);
+  check('气泡内点击不穿透（气泡自身 catchtap="noop"）',
+        /class="price-pop \{\{pricePopBelow[\s\S]{0,300}catchtap="noop"/.test(wxml));
+  const wxss = fs.readFileSync(MP_USER_WXSS, 'utf8') + '\n' + fs.readFileSync(MP_PRICE_POP_WXSS, 'utf8');
+  check('WXSS：mask 与气泡都是 position:fixed（共用样式已 @import）',
+        /\.price-pop-mask\s*\{[^}]*position:\s*fixed/.test(wxss)
+        && /\.price-pop\s*\{[^}]*position:\s*fixed/.test(wxss));
+  const uoDismiss = (wxml.match(/capture-bind:touchstart="([^"]+)"/) || [])[1] || '';
+  check('user-orders：page-root 挂的 touchstart 处理器在 JS 里存在',
+        uoDismiss === 'onPricePopDismiss' && /^\s*onPricePopDismiss\(\)\s*\{/m.test(js));
+  check('JS：换页 / 刷新 / 展开卡片都收起气泡',
+        /currentPage: page, showPricePop: false/.test(js)
+        && /expandedOrders: expanded, showPricePop: false/.test(js)
+        && /\/\/ 换页\/刷新[^\n]*\n\s*showPricePop: false/.test(js));
+
+  // ── 行为：同一订单在两个入口复制出的文本必须逐字相同 ──
+  const { component, calls } = loadMiniProgramUserOrders();
+  check('新增方法齐全（onPriceTap / 两个复制 / 关闭 / 找单 / 剪贴板）',
+        ['onPriceTap', 'onClosePricePop', 'onCopyOrderPrice', 'onCopyOrderDetailPrice',
+         '_orderById', '_copyPriceText'].every((k) => typeof component.methods[k] === 'function'));
+
+  const order = makeOrder();
+  const data = JSON.parse(JSON.stringify(component.data || {}));
+  data.orders = [order];
+  const ctx = { data };
+  ctx.setData = (patch, cb) => { Object.assign(ctx.data, patch); if (cb) cb(); };
+  ctx.createSelectorQuery = () => {
+    const q = { select: () => q, boundingClientRect: () => q, exec: (cb) => { if (cb) cb([null]); } };
+    return q;
+  };
+  Object.keys(component.methods).forEach((k) => { ctx[k] = component.methods[k].bind(ctx); });
+
+  const LF = String.fromCharCode(10);
+  const expected = PRICE_COPY_MOD.priceDetailLines(order, { simplex_price: 0.3, duplex_price: 0.4 }).join(LF);
+
+  calls.clipboard.length = 0;
+  ctx.onCopyOrderDetailPrice({ currentTarget: { dataset: { id: order.id } } });
+  const got = calls.clipboard[0] || '';
+  check('子视图「复制详细价格」与「我」页逐字相同（同一份实现）', got === expected,
+        JSON.stringify(got.split(LF).slice(0, 4)));
+  check('三个文件子项都在（现场 bug 的回归锚点：以前只有标题+合计）',
+        got.split(LF).filter((l) => /^\d+\. /.test(l)).length === 3, JSON.stringify(got));
+  check('末行是实收合计', got.split(LF).slice(-1)[0] === '💰合计: ¥3.80');
+
+  calls.clipboard.length = 0;
+  ctx.onCopyOrderPrice({ currentTarget: { dataset: { id: order.id } } });
+  check('子视图「复制价格」= `{订单号} — ¥金额`',
+        calls.clipboard[0] === 'HN20261025-0013 — ¥3.80', JSON.stringify(calls.clipboard[0]));
+  check('复制成功后气泡收起', ctx.data.showPricePop === false);
+
+  // 展开/收起卡片、换页时会收起气泡（避免气泡悬在已换掉的列表上）
+  ctx.data.showPricePop = true;
+  ctx.onClosePricePop();
+  check('点气泡外 → 收起', ctx.data.showPricePop === false);
+  ctx.data.showPricePop = true;
+  ctx.onPricePopDismiss();
+  check('页面 touchstart（capture）→ 收起（与「我」页同一套非模态行为）',
+        ctx.data.showPricePop === false);
+
+  // 订单不在当前页 → 不复制、不崩
+  calls.clipboard.length = 0;
+  ctx.onCopyOrderPrice({ currentTarget: { dataset: { id: 999 } } });
+  check('找不到订单 → 不写剪贴板且气泡收起',
+        calls.clipboard.length === 0 && ctx.data.showPricePop === false);
 }
 
 try {
   runMiniProgram();
   checkMiniProgramMarkup();
+  checkMiniProgramUserOrders();
   runApp();
+  checkAppPriceLookupPools();
   checkAppWiring();
   checkCrossClient();
 } catch (e) {

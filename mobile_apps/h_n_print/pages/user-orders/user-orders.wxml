@@ -3,7 +3,8 @@
 <navigation-bar title="{{pageTitle}}" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
 <wxs module="scroll" src="../../utils/scroll.wxs"></wxs>
-<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
+<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}"
+      capture-bind:touchstart="onPricePopDismiss">
 
 <view class="scroller"
       prop="{{scrollConfig}}"
@@ -142,15 +143,10 @@
             <text class="order-status status-{{item.status}}">{{statusMap[item.status] || item.status}}</text>
           </view>
           <text class="order-number-label">{{item.file_summary || item.file}}</text>
-          <view wx:if="{{item.isExcel}}" class="order-card-meta">
-            <text class="order-card-stat">📄 不适用</text>
-            <text class="order-card-stat">📋 不适用</text>
-            <text class="order-card-stat">🖨 不适用</text>
-          </view>
-          <view wx:else class="order-card-meta">
-            <text class="order-card-stat">📄 {{item.total_pages || (item.page_count * item.copies)}} 页</text>
-            <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份</text>
-            <text class="order-card-stat">🖨 {{item.totalSheetsDisplay}} 张</text>
+          <view class="order-card-meta">
+            <text class="order-card-stat">📄 {{item.statPages}}</text>
+            <text class="order-card-stat">📋 {{item.statCopies}}</text>
+            <text class="order-card-stat">🖨 {{item.statSheets}}</text>
           </view>
           <view class="order-card-footer">
             <text class="order-created">{{item.created_at}}</text>
@@ -179,15 +175,15 @@
             </view>
             <view class="detail-row">
               <text class="detail-label">合计页数</text>
-              <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_pages || (item.page_count * item.copies)) + ' 页'}}</text>
+              <text class="detail-value">{{item.statPages}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计份数</text>
-              <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_copies || item.copies) + ' 份'}}</text>
+              <text class="detail-value">{{item.statCopies}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计张数</text>
-              <text class="detail-value">{{item.isExcel ? '不适用' : item.totalSheetsDisplay + ' 张'}}</text>
+              <text class="detail-value">{{item.statSheets}}</text>
             </view>
           </view>
 
@@ -213,11 +209,12 @@
             <view class="detail-section-title">文件列表 ({{item.files.length}})<text wx:if="{{item.files.length > 5}}" class="detail-files-hint">· 列表可上下滑动</text></view>
             <!-- 文件多时列表在自己的框里滚动：卡片整体高度被 detail-expanded 的 max-height 限死，
                  不再把后半截文件裁掉（「一个任务 10+ 个文件」现场）。
-                 catchtouchmove 是必需的：本页外层 .scroller 挂着 WXS 滚动引擎，它的 touchmove
-                 会 preventDefault（返回 false），原生 scroll-view 就再也滚不动了 —— 用 catch
-                 把事件终止在这一层，让原生滚动接管。（代价：手指起于列表内时页面不跟着滚，
-                 抬手再来一次即可；文件列表最多 5 行高，可接受。） -->
-            <scroll-view scroll-y class="detail-files-scroll" catchtouchmove="noop">
+                 这里不再是原生 scroll-view：外层 .scroller 由 WXS 滚动引擎驱动（touchmove 会
+                 preventDefault），原生框滚到边之后没有任何回调能接管 ⇒ 现场「列表滑到底/顶，
+                 整个页面不跟着动」。改成 view + 内层 track，由 utils/scroll.wxs 直驱 translateY：
+                 内层到边当帧把余量交给外层，外层到顶再交还内层（双向接力），不需要逻辑层同步贴边。 -->
+            <view class="detail-files-scroll">
+              <view class="detail-files-track">
             <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
@@ -235,7 +232,8 @@
                 <text wx:if="{{(f.status === 'rejected' || f.status === 'failed') && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
             </view>
-            </scroll-view>
+              </view>
+            </view>
           </view>
 
           <!-- 附加服务 -->
@@ -263,11 +261,17 @@
             </view>
           </view>
 
-          <!-- 价格 -->
+          <!-- 价格（可点：与「我」页同一套气泡 —— 复制价格 / 复制详细价格。
+               id 供 createSelectorQuery 量位置；catchtap 免得点价格把卡片收起/展开。
+               文案与算式口径在 utils/price_copy.js，两页共用一份，勿在页面里再拼一遍） -->
           <view class="detail-section">
             <view class="detail-row detail-price-row">
               <text class="detail-label">合计价格</text>
-              <text class="detail-price-value status-{{item.status}}{{item.is_admin_print && item.status === 'sent' ? ' is-self-sent' : ''}}">¥{{item.totalPriceDisplay}}</text>
+              <view class="detail-price-tap" id="price-tap-{{item.id}}" data-id="{{item.id}}"
+                    catchtap="onPriceTap" hover-class="price-tap-hover" hover-stay-time="80">
+                <text class="detail-price-value status-{{item.status}}{{item.is_admin_print && item.status === 'sent' ? ' is-self-sent' : ''}}">¥{{item.totalPriceDisplay}}</text>
+                <text class="price-copy-icon">📋</text>
+              </view>
             </view>
           </view>
 
@@ -305,4 +309,25 @@
     </view>
   </view>
 </view>
+</view>
+
+<!-- 合计价格复制气泡（与「我」页同一套：在 page-root 外 + position:fixed。
+     气泡锚在「合计价格」上方；上方放不下时由 onPriceTap 翻到下方，箭头朝上。
+     文案口径在 utils/price_copy.js，两处入口共用一份） -->
+<view wx:if="{{showPricePop}}" class="price-pop-mask is-pass-through {{isDarkMode ? 'theme-dark' : ''}}">
+  <view class="price-pop {{pricePopBelow ? 'price-pop-below' : 'price-pop-above'}}"
+        style="left: {{pricePopLeft}}px; width: {{pricePopWidth}}px; {{pricePopBelow ? 'top:' + pricePopTop + 'px;' : 'bottom:' + pricePopBottom + 'px;'}}"
+        catchtap="noop">
+    <view class="price-pop-caret" style="left: {{pricePopCaretLeft}}px;"></view>
+    <view class="price-pop-head">
+      <text class="price-pop-icon">📋</text>
+      <text class="price-pop-title">复制这份订单的价格</text>
+    </view>
+    <view class="price-pop-acts">
+      <view class="price-pop-btn" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderPrice"
+            hover-class="price-pop-btn-hover" hover-stay-time="80">复制价格</view>
+      <view class="price-pop-btn primary" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderDetailPrice"
+            hover-class="price-pop-btn-hover" hover-stay-time="80">复制详细价格</view>
+    </view>
+  </view>
 </view>

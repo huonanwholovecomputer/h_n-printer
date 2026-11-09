@@ -141,6 +141,21 @@ let MOD_EXPORTS={}, MOD_ERR=null;
 try{ const m={exports:{}}; new Function('module','exports',PAGES_SRC)(m,m.exports); MOD_EXPORTS=m.exports; }
 catch(e){ MOD_ERR=String(e.message); }
 
+// ---- 2026-11-09：me.js / user-orders.js 都 require('../../utils/price_copy')（价格复制文案的
+//      唯一实现）。这里真实加载它，只把它的 './pages' 依赖接到同一份模块导出上；
+//      否则 require 兜底返回 {request(){}} 会让页面在加载阶段就抛
+//      "priceCopy.createPriceRulesGetter is not a function"，本测试会误判成「页面取不到口径」。 ----
+let PRICE_COPY_EXPORTS={}, PRICE_COPY_ERR=null;
+try{
+  const src=fs.readFileSync(process.argv[5],'utf8');
+  const m={exports:{}};
+  new Function('module','exports','require',src)(m,m.exports,(d)=>{
+    if(String(d).indexOf('pages')>=0) return MOD_EXPORTS;
+    throw new Error('price_copy 意外 require '+d);
+  });
+  PRICE_COPY_EXPORTS=m.exports;
+}catch(e){ PRICE_COPY_ERR=String(e.message); }
+
 function EL(){return {innerHTML:'',textContent:'',value:'',style:{},dataset:{},classList:{add(){},remove(){},toggle(){},contains(){return false}},querySelector:()=>null,querySelectorAll:()=>[],appendChild(){},addEventListener(){},removeEventListener(){},getBoundingClientRect:()=>({height:0,width:0,top:0,left:0}),parentNode:null,children:[],focus(){},blur(){}};}
 const B={console:{log(){},warn(){},error(){}},JSON,Math,Date,Object,Array,String,Number,Boolean,Error,TypeError,RangeError,Promise,Set,Map,WeakMap,WeakSet,Symbol,parseInt,parseFloat,isNaN,isFinite,setTimeout,clearTimeout,setInterval,clearInterval,RegExp,Function,ArrayBuffer,Uint8Array,decodeURIComponent,encodeURIComponent};
 function newCtx(){
@@ -157,6 +172,7 @@ function newCtx(){
   m.require=p=>{
     const s=String(p);
     if(s.indexOf('utils/pages')>=0) return MOD_EXPORTS;
+    if(s.indexOf('utils/price_copy')>=0) return PRICE_COPY_EXPORTS;
     if(s.indexOf('config')>=0) return {CONFIG:{BASE_URL:''}};
     return {request:()=>{}};
   };
@@ -217,6 +233,12 @@ TMP = tempfile.mkdtemp(prefix="hn_range_")
 PROBE = os.path.join(TMP, "probe.js")
 open(PROBE, "w", encoding="utf-8").write(PROBE_JS)
 PAGES_SRC_FILE = os.path.join(TMP, "pages_src.js")
+# 2026-11-09：pages/me/me.js 与 pages/user-orders/user-orders.js 都 require('../../utils/price_copy')
+# （价格复制文案的唯一实现）。probe 按「与 pages_src.js 同目录」找 price_copy.js —— 这里把**真实源码**
+# 写进临时目录；缺失时写成空文件，probe 会如实抛在 require 环节，而不是被静默兜底成 {}。
+_PRICE_COPY_ABS = os.path.join(MINI, "utils", "price_copy.js")
+open(os.path.join(TMP, "price_copy.js"), "w", encoding="utf-8").write(
+    open(_PRICE_COPY_ABS, encoding="utf-8").read() if os.path.exists(_PRICE_COPY_ABS) else "")
 TARGETS_FILE = os.path.join(TMP, "targets.json")
 CASES_FILE = os.path.join(TMP, "cases.json")
 open(CASES_FILE, "w", encoding="utf-8").write(json.dumps(RANGE_CASES))
@@ -229,7 +251,8 @@ def run_probe(pages_src, targets, cases_file=CASES_FILE, timeout=60):
     open(TARGETS_FILE, "w", encoding="utf-8").write(
         json.dumps([{"name": n, "file": f} for n, f in targets]))
     t0 = time.time()
-    r = subprocess.run(["node", PROBE, PAGES_SRC_FILE, TARGETS_FILE, cases_file],
+    r = subprocess.run(["node", PROBE, PAGES_SRC_FILE, TARGETS_FILE, cases_file,
+                        os.path.join(TMP, "price_copy.js")],
                        capture_output=True, text=True, encoding="utf-8", timeout=timeout)
     dt = time.time() - t0
     if r.returncode != 0 or not r.stdout.strip():

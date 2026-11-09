@@ -22,10 +22,6 @@ const FILE_CARD_HEIGHT_RPX = {
 }
 // .file-card 底部间距 margin-bottom: 12rpx
 const FILE_CARD_GAP_RPX = 12
-// FILE_CARD_HEIGHT_RPX 是**估算值**：实测比真实渲染高 4~7%（见 onFileListScroll 注释）。
-// 判定「内层文件列表是否真的可滚」时按中位误差折回真实高度 —— 直接用估值会把「刚好放得下」
-// 的列表误判成可滚：WXS 把滑动让给内层，内层又滚不动 ⇒ 页面纹丝不动（「卡在内部列表底部」）。
-const FILE_CARD_HEIGHT_EST_OVER = 1.055
 // 文本模式(页数未知)下，每多一个范围行在基础高度上额外增加的高度(rpx)：输入框56 + 行间距4
 const RANGE_LINE_EXTRA_RPX = 60
 // 每文件两个开关（「排除末尾空白页」/「封面单独打印」）在所有有控件的卡片上都渲染：
@@ -235,9 +231,13 @@ Component({
     countdownMinWheelIndex: 5,
     countdownSecWheelIndex: 0,
     countdownWheelValue: [5, 0],
-    // listAtTop/listAtBottom：内层文件列表是否已贴顶/贴底（bindscroll 同步）——
-    // WXS 引擎据此实现「内层滚到边界 → 外层接管」的滚动接力，避免手势卡死在列表里
-    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false, listAtTop: true, listAtBottom: false },
+    // 内层文件列表（文件卡片列表）：由 utils/scroll.wxs 直驱 translateY —— 内层到边当帧把余量
+    // 交给外层页面、外层到顶再交还内层。偏移与边界全靠两个 rect 量出来，不再需要 bindscroll →
+    // setData → change:prop 三跳同步贴边状态（那三跳就是「滑到底页面不跟着动」的死区）。
+    scrollConfig: {
+      minY: 0, maxY: 0, scrollerH: 0, contentH: 0,
+      nestedSel: '.file-list-scroll', nestedTrackSel: '.file-list-track',
+    },
     // 滑块拖动状态：segDrag = 分段滑块指示条位移百分比（>=0 拖动中），swDrag = 开关拇指位移 px（>=0 拖动中）
     segDrag: {},
     swDrag: {},
@@ -834,15 +834,8 @@ Component({
       this._scrollerH = 0
       this._contentH = 0
       this._contentEst = 0   // 估算累积高度，兜底微信容器上限
-      this._fileListPx = 0   // 文件列表累计占用高度（有界 scroll-view，达到上限后不再增长）
+      this._fileListPx = 0   // 文件列表累计占用高度（有界滚动框，达到上限后不再增长）
       this._maxY = 0
-
-      // 内层文件列表边界状态（供 WXS 判断「是否该把滚动让回外层」）
-      //   _fileListContentPx = 卡片高度常量累加（估算）；_fileListRealPx = 滚动事件里的真实 scrollHeight（权威）
-      this._listAtTop = true
-      this._listAtBottom = false
-      this._fileListContentPx = 0
-      this._fileListRealPx = 0
 
       this._measureTimer = null  // 去抖测量句柄
 
@@ -885,25 +878,7 @@ Component({
       })
       const { windowWidth } = wx.getWindowInfo()
       const contentPx = Math.round(sumRpx * ((windowWidth || 375) / 750))
-      // 文件增删/卡片高度变化 ⇒ 上次实测的内容高立刻作废。
-      // 否则删掉文件后 maxScroll 仍按旧的大内容算，atBottom 永远为 false，而内层已经不能滚了
-      // （滚不出 scroll 事件来纠正）→ WXS 把滑动让给内层、内层纹丝不动 = 页面卡住。
-      if (this._lastContentEst !== undefined && Math.abs(contentPx - this._lastContentEst) > 1) {
-        this._fileListRealPx = 0
-      }
-      this._lastContentEst = contentPx
-      // 内层文件列表是否真的可滚（内容高 > 可视高）：可滚时 WXS 让位给原生。
-      // 估值偏大 4~7% ⇒ 先折回真实高度再比，避免「刚好放得下」被判成可滚（见常量注释）。
-      const contentRealEst = Math.round(contentPx / FILE_CARD_HEIGHT_EST_OVER)
-      const listOverflow = contentRealEst > (this.data.fileListHeight || 0) + 1
-      this._fileListContentPx = contentPx   // 常量估值（仅在拿不到真实 scrollHeight 时兜底）
-      if (!listOverflow) {
-        // 列表不可滚（内容没超过可视高，或文件被删空）→ 两个方向都视为"贴边"，
-        // WXS 会立刻把滚动交给外层；同时作废上次实测内容高，避免残留旧值
-        this._listAtTop = true
-        this._listAtBottom = true
-        this._fileListRealPx = 0
-      }
+      this._fileListContentPx = contentPx   // 卡片高度常量累加（只作诊断/调试用）
       // rev 自增：scrollConfig 的其余字段相同时（比如切 tab 回来 maxY 没变），
       // change:prop 观察器不会触发 —— 而"内联 transform 与 state.y 失同步"要靠
       // onConfig 里的那次 applyRender 收敛。带一个恒变的 rev 保证每次推送都被消费。
@@ -920,39 +895,11 @@ Component({
           //  或最后一段滚不到）。这里显式下发，避免 WXS 反推。
           // （|| 0：_pushScrollConfig 若早于 _initScrollEngine 被调用，别把 NaN 推下去）
           padPx: (this._bottomPad || 0) + (this._tabOverlayPx || 0),
-          listOverflow,
-          // 内层列表是否贴顶/贴底：贴边后继续同向拖拽 → WXS 把滚动交给外层；
-          // 反向回到外层边界 → 再交还内层（双向滚动接力）
-          listAtTop: !!this._listAtTop,
-          listAtBottom: !!this._listAtBottom,
+          // 内层文件列表选择器（WXS 直驱；每次推送都带上，保证视图层始终知道内层框在哪）
+          nestedSel: '.file-list-scroll',
+          nestedTrackSel: '.file-list-track',
         },
       })
-    },
-
-    // 内层文件列表滚动：同步「贴顶/贴底」状态到 WXS 引擎（仅在翻转时 setData，滚动过程几乎零开销）
-    onFileListScroll(e) {
-      const d = (e && e.detail) || {}
-      // 必须用滚动事件里的真实 scrollHeight 判定是否到底 —— 卡片高度常量是**估算值**
-      // （实测比真实渲染高 4~7%），拿常量算 maxScroll 会永远差一截，atBottom 恒为 false
-      // → 内层滚到底后外层永远不接管（"滑动列表带不动页面"的根因）。
-      this._refreshListEdges(d.scrollTop, d.scrollHeight)
-    },
-
-    // 依据内层列表当前 scrollTop 刷新贴边状态；变化时才推 scrollConfig。
-    // realContentH：滚动事件给的权威内容高（缺失/为 0 时退回上次实测值，再退回常量估值）
-    _refreshListEdges(scrollTop, realContentH) {
-      const top = Math.max(0, Number(scrollTop) || 0)
-      const viewH = this.data.fileListHeight || 0
-      const real = Number(realContentH) || 0
-      if (real > 0) this._fileListRealPx = real
-      const contentPx = this._fileListRealPx || this._fileListContentPx || 0
-      const maxScroll = Math.max(0, contentPx - viewH)
-      const atTop = top <= 0.5
-      const atBottom = contentPx > 0 && viewH > 0 && top >= maxScroll - 0.5
-      if (atTop === this._listAtTop && atBottom === this._listAtBottom) return
-      this._listAtTop = atTop
-      this._listAtBottom = atBottom
-      this._pushScrollConfig()
     },
 
     // WXS 分桶回调（每 100px 一次），供回顶按钮等阈值类 UI 使用；本页暂不消费
@@ -998,8 +945,6 @@ Component({
       const q = this.createSelectorQuery()
       q.select('.scroller').boundingClientRect()
       q.select('.scroll-content').boundingClientRect()
-      // 内层列表当前滚动位置：内容增减/列表高度变化后同步贴边状态（bindscroll 不一定会再触发）
-      q.select('.file-list-scroll').scrollOffset()
       q.exec((res) => {
         if (!res || !res[0] || !res[1]) return
         const vp = res[0].height || 0
@@ -1015,8 +960,6 @@ Component({
         this._contentH = ch > 0 ? ch : this._contentEst
         this._maxY = Math.max(0, this._contentH - vp + this._bottomPad + this._tabOverlayPx)
         this._pushScrollConfig()
-        const listOffset = res[2] || {}
-        if (typeof listOffset.scrollTop === 'number') this._refreshListEdges(listOffset.scrollTop)
       })
     },
 

@@ -262,6 +262,50 @@ if (!loaded) {
   appTouch(g, 'touchmove', 300, innerTarget(inner)); // ddy = 0
   check('⑭ ddy=0 不抢内层滚动', g._nestedScroll === inner && g.y === 0, 'y=' + g.y);
   appTouch(g, 'touchend', 300, innerTarget(inner));
+
+  /* 场景 I：「我」页订单详情 6 个文件 —— 内层只有 46px 行程（5 行可视、6 行内容）。
+     现场观感是「一滑列表，整页跟着一起动」：内层行程太短，手势大部分时间都在滚页面。
+     判据：整段手势的位移总量必须 = 手指行程（46 归内层 + 余量归外层），既不丢帧也不双倍。 */
+  g = mkEngine();
+  inner = fakeEl({ scrollTop: 0, scrollHeight: 296, clientHeight: 250 }); // maxTop = 46
+  appTouch(g, 'touchstart', 300, innerTarget(inner));
+  const seenOuter = [];
+  for (let i = 0; i < 7; i++) {
+    appTouch(g, 'touchmove', 300 - (i + 1) * 10, innerTarget(inner)); // 每帧上滑 10px
+    seenOuter.push(Math.round(g.y));
+  }
+  check('⑮ 46px 小行程：前 4 帧页面纹丝不动（内层还没到底）',
+        JSON.stringify(seenOuter.slice(0, 4)) === '[0,0,0,0]', JSON.stringify(seenOuter.slice(0, 4)));
+  check('⑯ 46px 小行程：到底后只补余量（70px 手指行程 ⇒ 页面 24px）',
+        Math.round(g.y) === 24, 'y=' + g.y);
+  check('⑰ 估计值被钳在内层行程内（不会越界多送）',
+        g._nestEst === 46, 'est=' + g._nestEst);
+  appTouch(g, 'touchend', 240, innerTarget(inner));
+
+  /* 场景 I2：合成器滞后（scrollTop 读到的还是旧值）时不能出现死区。
+     模拟：手指已经推了 50px、scrollTop 仍返回 0。旧实现每帧都按 room=maxTop 让位，
+     于是 46px 之后每一帧都给内层（而内层已经到边）⇒ 页面不动 = 用户说的「卡在列表底部」。
+     新实现按手势内累计估计推进，第 5 帧起余量归页面。 */
+  g = mkEngine();
+  const lagEl = fakeEl({ scrollTop: 0, scrollHeight: 296, clientHeight: 250 });
+  Object.defineProperty(lagEl, 'scrollTop', { value: 0, writable: true });   // 恒为 0（滞后）
+  appTouch(g, 'touchstart', 300, innerTarget(lagEl));
+  for (let i = 0; i < 6; i++) appTouch(g, 'touchmove', 300 - (i + 1) * 10, innerTarget(lagEl));
+  check('⑱ 合成器滞后时不死区：60px 行程 ⇒ 页面拿到 14px（60 - 46）',
+        Math.round(g.y) === 14, 'y=' + g.y);
+  appTouch(g, 'touchend', 240, innerTarget(lagEl));
+
+  /* 场景 J：慢速拖动（<0.5px/帧）也要推进估计值，否则贴边时内外都不动 */
+  g = mkEngine();
+  inner = fakeEl({ scrollTop: 0, scrollHeight: 400, clientHeight: 250 });  // maxTop 150
+  appTouch(g, 'touchstart', 300, innerTarget(inner));
+  appTouch(g, 'touchmove', 290, innerTarget(inner));    // 先过方向锁（10px）
+  appTouch(g, 'touchmove', 289.7, innerTarget(inner));  // 0.3px/帧
+  appTouch(g, 'touchmove', 289.4, innerTarget(inner));
+  check('⑲ 慢速拖动：亚像素帧仍归内层（外层 y=0）', g.y === 0, 'y=' + g.y);
+  check('⑳ 慢速拖动：估计值按 0.3px 粒度累积（不是整帧丢弃）',
+        Math.abs(g._nestEst - 10.6) < 0.001, 'est=' + g._nestEst);
+  appTouch(g, 'touchend', 289.4, innerTarget(inner));
 }
 
 /* ============================================================

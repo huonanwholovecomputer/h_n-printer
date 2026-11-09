@@ -4,6 +4,12 @@ const { CONFIG } = require('../../utils/config')
 const { request } = require('../../utils/request')
 // 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
 const { countPagesInRange } = require('../../utils/pages')
+/* 「复制价格 / 复制详细价格」文案与算式的**唯一实现**：与「我」页共用 utils/price_copy.js
+   （管理入口进来的这个子视图以前没有复制入口 —— 2026-11-09 用户报的现场问题）。
+   勿在本文件拼第二份：守卫脚本 other/tests/verify_price_copy_popconfirm.js。 */
+const priceCopy = require('../../utils/price_copy')
+// 单价（/api/pricing）带进程内缓存：本页与「我」页各自一份，口径相同
+const _getPriceRules = priceCopy.createPriceRulesGetter(request, CONFIG)
 
 /* 双面摊纸的兜底张数（契约 §2「单面页每页一张 + 其余两页一张」）：实现在 utils/order_stats，
    但它内部仍只用 utils/pages 的 pageRangeSet/chargeUnits（同一份口径，见该文件顶部说明）。
@@ -27,6 +33,52 @@ function _enrichFileStat(f) {
   f.totalSheets = typeof f.total_sheets === 'number' ? f.total_sheets : (perSheets * copies)
   f.pagesLine = copies + ' 份 × ' + eff + ' 页'
   return f
+}
+
+/* 订单级「合计页数 / 合计份数 / 合计张数」的展示文案（2026-11-07 用户要求）。
+   历史口径：Excel 订单一律写「不适用」——那是页数分析还不覆盖表格的年代（后端只给兜底 1 页，
+   显示出来是假数）。现在表格也会经本地工具回报真实页数（order_files.page_count →
+   后端 effective_pages / total_pages / total_sheets），再一律「不适用」就是把已知信息藏起来。
+   改为数据驱动：后端给了数就显示；确实未知（page_count=0 ⇒ total_* 也是 0）才写「不适用」，
+   绝不拿兜底的 1 页充数。Excel 与其它格式走同一条规则，不再按扩展名分叉。 */
+function _orderTotalsText(o) {
+  const pages = Number(o.total_pages) || 0
+  const copies = Number(o.total_copies) || Number(o.copies) || 0
+  const sheets = Number(o.total_sheets) || Number(o.totalSheetsDisplay) || 0
+  return {
+    pages: pages > 0 ? pages + ' 页' : '不适用',
+    copies: copies > 0 ? copies + ' 份' : '不适用',
+    sheets: sheets > 0 ? sheets + ' 张' : '不适用',
+  }
+}
+
+/* 订单行预处理（列表加载与轮询「结构变化 → 全量刷新」共用）：价格文本 / 文件列统计 /
+   isExcel 标记 / 合计页数·份数·张数文案。
+   轮询那条分支必须也过这一遍：它在结构变化时整片替换 orders，派生字段（statPages 等）不重算
+   就会全丢，卡片上三个数字变成空白。 */
+function _normalizeOrderRow(order) {
+  order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+  if (order.files) {
+    order.files.forEach(f => {
+      f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
+      const name = (f.original_name || f.file_name || '').toLowerCase()
+      f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx')
+      _enrichFileStat(f)
+    })
+    order.isExcel = order.files.length > 0 && order.files.every(f => f.isExcel)
+    const totalSheets = typeof order.total_sheets === 'number'
+      ? order.total_sheets
+      : order.files.reduce((s, f) => s + (f.totalSheets || 0), 0)
+    order.totalSheetsDisplay = String(totalSheets)
+  } else {
+    order.totalSheetsDisplay = '0'
+  }
+  // 合计页数/份数/张数（数据驱动；Excel 不再一律「不适用」）
+  const totalsText = _orderTotalsText(order)
+  order.statPages = totalsText.pages
+  order.statCopies = totalsText.copies
+  order.statSheets = totalsText.sheets
+  return order
 }
 
 Component({
@@ -66,12 +118,26 @@ Component({
     // 展开状态
     expandedOrders: {},
 
+    // 合计价格复制气泡（与「我」页同一套：fixed 定位在 page-root 外，坐标由 onPriceTap 量出来）
+    showPricePop: false,
+    pricePopOrderId: '',
+    pricePopWidth: 0,
+    pricePopLeft: 0,
+    pricePopCaretLeft: 0,
+    pricePopBottom: 0,
+    pricePopTop: 0,
+    pricePopBelow: false,
+
     // 被查看用户的卡片信息（从管理入口跳转后显示）
     userDetail: null,
     showLicenseDetail: false,
 
     // WXS 引擎：滚动边界 + 程序化滚动命令（对齐“我”页面）
-    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false },
+    scrollConfig: {
+      minY: 0, maxY: 0, scrollerH: 0, contentH: 0,
+      // 内层滚动框（订单详情里的文件列表）：由 utils/scroll.wxs 直驱，双向接力到外层页面
+      nestedSel: '.detail-files-scroll', nestedTrackSel: '.detail-files-track',
+    },
     scrollCmd: null,
 
     statusMap: {
@@ -154,8 +220,8 @@ Component({
   },
 
   methods: {
-    // 空handler：文件列表的 catchtouchmove 用它把手势终止在这一层，
-    // 不让事件冒泡到外层 .scroller 的 WXS 滚动引擎（引擎会 preventDefault，原生 scroll-view 就滚不动了）
+    // 空handler：订单卡内的状态气泡（catchtouchmove）用它把手势终止在气泡层，
+    // 不让事件冒泡到外层 .scroller 的 WXS 滚动引擎（气泡里是可滚的文本，不能带着页面一起滚）
     noop() {},
 
     // ==================== WXS 滚动引擎（视图层直驱，0 setData） ====================
@@ -209,7 +275,8 @@ Component({
           maxY: Math.round(this._maxY || 0),
           scrollerH: this._scrollerH || 0,
           contentH: this._contentH || 0,
-          listOverflow: false,
+          nestedSel: '.detail-files-scroll',
+          nestedTrackSel: '.detail-files-track',
         },
       })
     },
@@ -249,9 +316,9 @@ Component({
           // 轮询成功即自愈：清除上次的加载失败提示（对齐 APP 轮询自恢复）
           if (this.data.loadError) this.setData({ loadError: '' })
           const newOrders = (res.data.orders || [])
-          // 格式化价格
+          // 格式化价格 + 派生合计字段
           newOrders.forEach(order => {
-            order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+            _normalizeOrderRow(order)
           })
           const oldOrders = this.data.orders || []
           // 仅更新变化的 status 字段，避免整列表重渲染
@@ -320,24 +387,9 @@ Component({
         success: (res) => {
           if (res.statusCode === 200 && res.data && res.data.success) {
             const newOrders = (res.data.orders || [])
-            // 预处理文件大小显示
+            // 预处理文件大小显示（WXML 不支持 .toFixed()）
             newOrders.forEach(order => {
-              order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
-              if (order.files) {
-                order.files.forEach(f => {
-                  f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
-                  const name = (f.original_name || f.file_name || '').toLowerCase()
-                  f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx')
-                  _enrichFileStat(f)
-                })
-                order.isExcel = order.files.length > 0 && order.files.every(f => f.isExcel)
-                const totalSheets = typeof order.total_sheets === 'number'
-                  ? order.total_sheets
-                  : order.files.reduce((s, f) => s + (f.totalSheets || 0), 0)
-                order.totalSheetsDisplay = String(totalSheets)
-              } else {
-                order.totalSheetsDisplay = '0'
-              }
+              _normalizeOrderRow(order)
             })
 
             const total = res.data.total || 0
@@ -345,6 +397,8 @@ Component({
               orders: newOrders,
               loading: false,
               loadError: '',
+              // 换页/刷新后旧气泡指向的订单可能已不在这一页：先收起
+              showPricePop: false,
               totalOrders: total,
               totalPages: Math.ceil(total / this.data.perPage),
             }, () => {
@@ -404,7 +458,7 @@ Component({
     onPageChange(e) {
       const page = parseInt(e.currentTarget.dataset.page, 10)
       if (page < 1 || page > this.data.totalPages || page === this.data.currentPage) return
-      this.setData({ currentPage: page }, () => {
+      this.setData({ currentPage: page, showPricePop: false }, () => {
         this._syncPageNumbers()
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
         this._scrollToOrdersSection()
@@ -413,7 +467,7 @@ Component({
 
     onPrevPage() {
       if (this.data.currentPage <= 1) return
-      this.setData({ currentPage: this.data.currentPage - 1 }, () => {
+      this.setData({ currentPage: this.data.currentPage - 1, showPricePop: false }, () => {
         this._syncPageNumbers()
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
         this._scrollToOrdersSection()
@@ -422,7 +476,7 @@ Component({
 
     onNextPage() {
       if (this.data.currentPage >= this.data.totalPages) return
-      this.setData({ currentPage: this.data.currentPage + 1 }, () => {
+      this.setData({ currentPage: this.data.currentPage + 1, showPricePop: false }, () => {
         this._syncPageNumbers()
         this.loadOrders(this.data.viewOpenid, this.data.sourceFilter)
         this._scrollToOrdersSection()
@@ -452,6 +506,99 @@ Component({
       })
     },
 
+    // ==================== 合计价格复制（气泡 + 两种文案） ====================
+    // 文案 / 算式 / 单价兜底全在 utils/price_copy.js；这里只做「量位置 → 弹气泡 → 写剪贴板」。
+
+    // 点击「¥xx.xx」→ 在价格处弹出气泡（再点一次收起）。
+    // 气泡在 page-root 外、position:fixed：既逃出 scroll-content 的 translateY 变换层，
+    // 也不会被订单卡片的 overflow:hidden / max-height 裁剪。
+    onPriceTap(e) {
+      const id = e.currentTarget.dataset.id
+      if (this.data.showPricePop && String(this.data.pricePopOrderId) === String(id)) {
+        this.setData({ showPricePop: false })
+        return
+      }
+      const win = (typeof wx.getWindowInfo === 'function' ? wx.getWindowInfo() : null) || {}
+      const winW = win.windowWidth || 375
+      const winH = win.windowHeight || 667
+      const popW = Math.min(Math.round(winW * 0.74), winW - 24)
+      const q = this.createSelectorQuery()
+      q.select('#price-tap-' + id).boundingClientRect()
+      q.exec((res) => {
+        const rect = res && res[0]
+        if (!rect) return
+        // 水平：气泡右边对齐价格右边，再夹在视口内；箭头指向价格中心
+        const left = Math.max(8, Math.min(rect.right - popW, winW - popW - 8))
+        const caret = Math.max(18, Math.min(rect.left + rect.width / 2 - left, popW - 18))
+        this.setData({
+          showPricePop: true,
+          pricePopOrderId: id,
+          pricePopWidth: popW,
+          pricePopLeft: left,
+          pricePopCaretLeft: caret,
+          // 垂直：气泡底边锚在价格上方 12px（高度未知也可用，向上自然长高）
+          pricePopBottom: Math.max(8, winH - rect.top + 12),
+          pricePopTop: rect.bottom + 12,
+          pricePopBelow: false,
+        }, () => {
+          // 价格贴近屏幕顶部、上方放不下 → 翻到价格下方，箭头朝上
+          const q2 = this.createSelectorQuery()
+          q2.select('.price-pop').boundingClientRect()
+          q2.exec((r2) => {
+            const b = r2 && r2[0]
+            if (b && b.top < 8) this.setData({ pricePopBelow: true })
+          })
+        })
+      })
+    },
+
+    // 价格气泡是「非模态」的：遮罩 pointer-events:none（不挡滚动），失去焦点即关闭。
+    // page-root 的 capture-bind:touchstart 落到这里 —— 点/滑页面任何地方都先收起气泡，
+    // 手势本身照常交给 .scroller 的 WXS 滚动引擎（不能用 catchtouchmove，那会锁住页面）。
+    onPricePopDismiss() {
+      if (this.data.showPricePop) this.setData({ showPricePop: false })
+    },
+
+    onClosePricePop() {
+      if (this.data.showPricePop) this.setData({ showPricePop: false })
+    },
+
+    // 复制价格（简略：`{订单号} — ¥{金额}`，与本地打印工具 Ctrl+C 同格式）
+    onCopyOrderPrice(e) {
+      const o = this._orderById(e.currentTarget.dataset.id)
+      this.setData({ showPricePop: false })
+      if (!o) return
+      this._copyPriceText(priceCopy.priceLine(o), '已复制价格')
+    },
+
+    // 复制详细价格（逐文件 + 附加服务费 + 合计，与本地打印工具 Ctrl+Shift+C 同格式）
+    onCopyOrderDetailPrice(e) {
+      const o = this._orderById(e.currentTarget.dataset.id)
+      this.setData({ showPricePop: false })
+      if (!o) return
+      _getPriceRules((rules) => {
+        this._copyPriceText(
+          priceCopy.priceDetailLines(o, rules).join(String.fromCharCode(10)),
+          '已复制详细价格')
+      })
+    },
+
+    _orderById(id) {
+      const rows = this.data.orders || []
+      for (let i = 0; i < rows.length; i++) {
+        if (String(rows[i].id) === String(id)) return rows[i]
+      }
+      return null
+    },
+
+    _copyPriceText(text, toastTitle) {
+      wx.setClipboardData({
+        data: text,
+        success: () => wx.showToast({ title: toastTitle, icon: 'success' }),
+        fail: () => wx.showToast({ title: '复制失败', icon: 'none' }),
+      })
+    },
+
     // ==================== 订单卡片 ====================
 
     onOrderTap(e) {
@@ -462,7 +609,7 @@ Component({
       } else {
         expanded[orderId] = true
       }
-      this.setData({ expandedOrders: expanded })
+      this.setData({ expandedOrders: expanded, showPricePop: false })
       this._scheduleMeasure()
       // 详情展开/收起有 0.3s max-height 动画：过渡中途先跟一版（缩小白屏窗口），
       // 动画结束后再测最终值（引擎收到变小的 maxY 会平滑滚动到新边界，不跳变）

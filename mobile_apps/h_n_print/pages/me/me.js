@@ -3,6 +3,11 @@ const { CONFIG } = require('../../utils/config')
 const { request, createPollScheduler } = require('../../utils/request')
 // 页码范围口径的**唯一实现**（勿在本文件再写一份）——见 utils/pages.js 顶部注释
 const { countPagesInRange } = require('../../utils/pages')
+// 「复制价格 / 复制详细价格」文案口径的**唯一实现**（与 user-orders 子视图共用）——
+// 见 utils/price_copy.js 顶部注释；守卫脚本 other/tests/verify_price_copy_popconfirm.js。
+const priceCopy = require('../../utils/price_copy')
+// 单价（/api/pricing）带进程内缓存：两个入口各自持一份即可，口径相同
+const _getPriceRules = priceCopy.createPriceRulesGetter(request, CONFIG)
 
 /* 双面摊纸的兜底张数（契约 §2「单面页每页一张 + 其余两页一张」）：实现在 utils/order_stats，
    但它内部仍只用 utils/pages 的 pageRangeSet/chargeUnits（同一份口径，见该文件顶部说明）。
@@ -46,6 +51,53 @@ function _enrichFileStat(f) {
   return f
 }
 
+/* 订单级「合计页数 / 合计份数 / 合计张数」的展示文案（2026-11-07 用户要求）。
+   历史口径：Excel 订单一律写「不适用」——那是页数分析还不覆盖表格的年代（后端只给兜底 1 页，
+   显示出来是假数）。现在表格也会经本地工具回报真实页数（order_files.page_count →
+   后端 effective_pages / total_pages / total_sheets），再一律「不适用」就是把已知信息藏起来。
+   改为数据驱动：后端给了数就显示；确实未知（page_count=0 ⇒ total_* 也是 0）才写「不适用」，
+   绝不拿兜底的 1 页充数。Excel 与其它格式走同一条规则，不再按扩展名分叉。 */
+function _orderTotalsText(o) {
+  const pages = Number(o.total_pages) || 0
+  const copies = Number(o.total_copies) || Number(o.copies) || 0
+  const sheets = Number(o.total_sheets) || Number(o.totalSheetsDisplay) || 0
+  return {
+    pages: pages > 0 ? pages + ' 页' : '不适用',
+    copies: copies > 0 ? copies + ' 份' : '不适用',
+    sheets: sheets > 0 ? sheets + ' 张' : '不适用',
+  }
+}
+
+/* 订单行预处理（列表加载与轮询「结构变化 → 全量刷新」共用）：价格文本 / 文件列统计 /
+   isExcel 标记 / 合计页数·份数·张数文案。
+   轮询那条分支必须也过这一遍：它在结构变化时整片替换 orders，派生字段（statPages 等）不重算
+   就会全丢，卡片上三个数字变成空白。 */
+function _normalizeOrderRow(order) {
+  order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+  if (order.files) {
+    order.files.forEach(f => {
+      f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
+      const name = (f.original_name || f.file_name || '').toLowerCase()
+      f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx')
+      _enrichFileStat(f)
+    })
+    order.isExcel = order.files.length > 0 && order.files.every(f => f.isExcel)
+    // 合计张数（后端 total_sheets 优先，缺失时按文件张数求和兜底）
+    const totalSheets = typeof order.total_sheets === 'number'
+      ? order.total_sheets
+      : order.files.reduce((s, f) => s + (f.totalSheets || 0), 0)
+    order.totalSheetsDisplay = String(totalSheets)
+  } else {
+    order.totalSheetsDisplay = '0'
+  }
+  // 合计页数/份数/张数（数据驱动；Excel 不再一律「不适用」）
+  const totalsText = _orderTotalsText(order)
+  order.statPages = totalsText.pages
+  order.statCopies = totalsText.copies
+  order.statSheets = totalsText.sheets
+  return order
+}
+
 /* ===== 异常状态原因（#9）===== */
 // 这些是「终态且应能解释原因」的状态：状态文字可点，弹出 Popconfirm 显示原因/订正记录。
 // sent（已完成）不算异常；queued/printing 等中间态也不弹（它们没有原因可讲）。
@@ -69,62 +121,9 @@ function _fmtStatusTime(v) {
    详细：订单号 / 14 短横线 / 计费明细 / 14 短横线 / 每文件三行 / 附加服务费 / 14 短横线 / 💰合计
    金额一律取「实收」（orders.total_price、order_files[].total_price）——设备回报页数后
    后端已重算回写，前端不重算金额，只按 calc_cost 的口径**复原算式**给人看。 */
-const PRICE_DASH = '-'.repeat(14)
-const PRICE_FALLBACK_SIMPLEX = 0.30   // 与 pricing.json 权威值一致；/api/pricing 拉不到时才用
-const PRICE_FALLBACK_DUPLEX = 0.40
-
-function _money(n) {
-  return (Math.round((Number(n) || 0) * 100) / 100).toFixed(2)
-}
-
-// 单面页/双面页的摊纸张数（与后端 manual_duplex.charge_units 同口径）：
-// 指定了「单面页」的那些页各占 1 张，其余页两页一张，奇数页最后一张占 1 张。
-function _chargeUnitsOf(eff, simplexPages) {
-  const n = Number(eff) || 0
-  if (simplexPages && String(simplexPages).trim()) {
-    const set = {}
-    String(simplexPages).split(',').forEach((part) => {
-      const seg = String(part).trim()
-      if (!seg) return
-      const mm = seg.split('-')
-      const a = parseInt(mm[0], 10)
-      const b = mm.length > 1 ? parseInt(mm[1], 10) : a
-      if (!isFinite(a) || !isFinite(b)) return
-      for (let i = a; i <= b; i++) set[i] = true
-    })
-    let simplex = 0
-    for (let i = 1; i <= n; i++) if (set[i]) simplex++
-    const rest = Math.max(0, n - simplex)
-    return { pairs: simplex + Math.floor(rest / 2), remainder: rest % 2 }
-  }
-  return { pairs: Math.floor(n / 2), remainder: n % 2 }
-}
-
-/* 复原 calc_cost 的算式（local_print_tool/printer_config.py:536-583）：
-   - 单面：`{eff}张×{sp}`；双面：`{pairs}张×{dp}`（+`+{rem}张×{sp}`）
-   - copies>1 时整体包成 `({formula})×{copies}份` */
-function _calcCostFormula(f, eff, rules) {
-  const sp = Number(rules && rules.simplex_price) || PRICE_FALLBACK_SIMPLEX
-  const dp = Number(rules && rules.duplex_price) || PRICE_FALLBACK_DUPLEX
-  const copies = Number(f.copies) || 1
-  const pages = Number(eff) || 0
-  if (pages <= 0) return { cost: 0, formula: '' }
-  let cost = 0
-  let formula = ''
-  if (f.duplex === 'on') {
-    const units = _chargeUnitsOf(pages, f.simplex_pages)
-    const parts = []
-    if (units.pairs > 0) { parts.push(units.pairs + '张×' + dp.toFixed(2)); cost += units.pairs * dp }
-    if (units.remainder > 0) { parts.push(units.remainder + '张×' + sp.toFixed(2)); cost += units.remainder * sp }
-    formula = parts.join('+')
-  } else {
-    formula = pages + '张×' + sp.toFixed(2)
-    cost = pages * sp
-  }
-  cost = cost * copies
-  if (copies > 1) formula = '(' + formula + ')×' + copies + '份'
-  return { cost: cost, formula: formula }
-}
+/* 「复制价格 / 复制详细价格」的文案与算式已移到 utils/price_copy.js（与 user-orders 共用），
+   本文件不再保留第二份：PRICE_DASH / _money / _chargeUnitsOf / _calcCostFormula 均已删除。
+   页面这边只负责气泡定位、深层剪贴板调用与按钮状态。 */
 
 Component({
   data: {
@@ -242,7 +241,13 @@ Component({
     // 管理员：许可密钥轮询定时器（内部状态，非响应式）
     _keyPollTimer: null,
     showScrollTop: false,   // 回顶按钮显隐（WXS 分桶回调驱动）
-    scrollConfig: { minY: 0, maxY: 0, scrollerH: 0, contentH: 0, listOverflow: false, closePicker: true },
+    scrollConfig: {
+      minY: 0, maxY: 0, scrollerH: 0, contentH: 0,
+      // 内层滚动框（订单详情里的文件列表）：由 utils/scroll.wxs 直驱 translateY，
+      // 到边当帧把余量交给外层页面、外层到顶再交还（双向接力）。选择器只在首次下发。
+      nestedSel: '.detail-files-scroll', nestedTrackSel: '.detail-files-track',
+      closePicker: true,
+    },
     scrollCmd: null,        // WXS 程序化滚动命令（回顶 / 滚到订单区）
     // 任务卡展开状态: { [orderId]: true }
     expandedOrders: {},
@@ -570,7 +575,7 @@ Component({
           if (changed) {
             // 结构变化（增删订单），做全量刷新但保留展开状态
             newOrders.forEach(order => {
-              order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+              _normalizeOrderRow(order)
               order.statusReasonTappable = REASON_STATUSES.indexOf(order.status) >= 0
               order.statusReasonText = this._statusReasonText(order)
             })
@@ -674,7 +679,9 @@ Component({
           // 底部留白（px）：WXS 用它 + 真实内容高/视口高自己重算 maxY（与首页同口径）
           // （|| 0：_pushScrollConfig 若早于 _initScrollEngine 被调用，别把 NaN 推下去）
           padPx: (this._bottomPad || 0) + (this._tabOverlayPx || 0),
-          listOverflow: false,
+          // 内层滚动框选择器（每次也带上：onConfig 只在首帧见过它一次，丢了就退化成不可滚）
+          nestedSel: '.detail-files-scroll',
+          nestedTrackSel: '.detail-files-track',
           closePicker: true,   // 触摸开始时通知逻辑层收起分页下拉
         },
       })
@@ -2612,23 +2619,7 @@ Component({
             // 预处理文件大小显示（WXML 不支持 .toFixed()）
             const newOrders = (res.data.orders || [])
             newOrders.forEach(order => {
-              order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
-              if (order.files) {
-                order.files.forEach(f => {
-                  f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
-                  const name = (f.original_name || f.file_name || '').toLowerCase()
-                  f.isExcel = name.endsWith('.xls') || name.endsWith('.xlsx')
-                  _enrichFileStat(f)
-                })
-                order.isExcel = order.files.length > 0 && order.files.every(f => f.isExcel)
-                // 合计张数（后端 total_sheets 优先，缺失时按文件张数求和兜底）
-                const totalSheets = typeof order.total_sheets === 'number'
-                  ? order.total_sheets
-                  : order.files.reduce((s, f) => s + (f.totalSheets || 0), 0)
-                order.totalSheetsDisplay = String(totalSheets)
-              } else {
-                order.totalSheetsDisplay = '0'
-              }
+              _normalizeOrderRow(order)
               // #9：终态非 sent 的订单，状态文字可点 → 原因气泡。
               // 后端未升级时没有 status_reason/manual_status_* 字段 → 走通用文案，入口仍然可点。
               order.statusReasonTappable = REASON_STATUSES.indexOf(order.status) >= 0
@@ -3089,94 +3080,23 @@ Component({
       this._copyText(text, '已复制原因')
     },
 
-    /* ==================== #5 价格复制文案 ==================== */
-    // 口径与本地打印工具 gui.py 的 Ctrl+C / Ctrl+Shift+C 逐字一致：
-    //   单行 `{订单号} — ¥{金额}`（em dash 两侧空格），无订单号只 `¥{金额}`；
-    //   详细见 _priceDetailLines()。金额仍是**实收**（total_price），算式只用来解释它。
+    /* ==================== #5 价格复制（文案口径在 utils/price_copy.js） ==================== */
+    // 文案与算式**只有一份实现**：`utils/price_copy.js`（「我」页与 user-orders 子视图共用同一份）。
+    // 页面这边只留：单价取值的进程内缓存、订单对象 → 文本、剪贴板调用。
+    //   简略：`{订单号} — ¥{金额}`（= 本地工具 Ctrl+C）
+    //   详细：订单号 / -×14 / 计费明细 / -×14 / 每文件 3 行 / [附加服务费] / -×14 / 💰合计
+    // 金额一律取**实收**（total_price），算式只用来解释它。
 
-    // 单价取 /api/pricing（pricing.json 权威，随后端改价生效）；拉不到用兜底常量，不阻塞复制。
     _withPriceRules(cb) {
-      const cached = this._priceRules
-      if (cached) { cb(cached); return }
-      const fallback = { simplex_price: PRICE_FALLBACK_SIMPLEX, duplex_price: PRICE_FALLBACK_DUPLEX }
-      request({
-        url: CONFIG.BASE_URL + '/api/pricing',
-        method: 'GET',
-        success: (res) => {
-          let rules = fallback
-          if (res.statusCode === 200 && res.data && res.data.success && res.data.pricing) {
-            const p = res.data.pricing
-            rules = {
-              simplex_price: p.simplex_price != null ? Number(p.simplex_price) : PRICE_FALLBACK_SIMPLEX,
-              duplex_price: p.duplex_price != null ? Number(p.duplex_price) : PRICE_FALLBACK_DUPLEX,
-            }
-          }
-          this._priceRules = rules
-          cb(rules)
-        },
-        fail: () => { this._priceRules = fallback; cb(fallback) },
-      })
+      _getPriceRules(cb)
     },
 
-    // 单行：`{订单号} — ¥{金额}`
     _priceLine(o) {
-      const amount = '¥' + this._orderTotal(o).toFixed(2)
-      const no = String((o && o.order_number) || '').trim()
-      return no ? (no + ' — ' + amount) : amount
+      return priceCopy.priceLine(o)
     },
 
-    // 详细多行（与 local_print_tool/gui.py:_on_copy_detail 同结构）：
-    //   订单号: {号} / -×14 / 计费明细 / -×14 / 每个文件 3 行 / 附加服务费 / -×14 / 💰合计
     _priceDetailLines(o, rules) {
-      const lines = []
-      const no = String(o.order_number || '').trim()
-      if (no) {
-        lines.push('订单号: ' + no)
-        lines.push(PRICE_DASH)
-      }
-      lines.push('计费明细')
-      lines.push(PRICE_DASH)
-      const total = this._orderTotal(o)
-      let baseTotal = 0
-      let itemNo = 0
-      ;(o.files || []).forEach((f) => {
-        itemNo++
-        const amount = Math.round((Number(f.total_price) || 0) * 100) / 100
-        baseTotal += amount
-        const copies = Number(f.copies) || 1
-        const eff = typeof f.effectivePages === 'number'
-          ? f.effectivePages
-          : (typeof f.effective_pages === 'number'
-            ? f.effective_pages
-            : countPagesInRange(f.page_range, f.page_count))
-        lines.push(itemNo + '. ' + (f.original_name || f.file_name || '未知文件'))
-        lines.push('   ' + copies + 'x ' + (f.duplex === 'on' ? '双面' : '单面') + ' 范围:' + (f.page_range || '全部'))
-        const calc = _calcCostFormula(f, eff, rules)
-        // 算式复算的价与实收一致才给算式；对不上（历史单价/人工改价/首页混排）只写实收金额，
-        // 绝不编一个和实收不一致的算式 —— 复制出去的数字必须就是页面上的数字。
-        if (calc.formula && Math.abs(calc.cost - amount) <= 0.005) {
-          lines.push('   ' + calc.formula + ' = ¥' + amount.toFixed(2))
-        } else {
-          lines.push('   ¥' + amount.toFixed(2))
-        }
-      })
-      // 附加服务费 = 实收 − 文件小计（派送 + 加急 + 首页）。只在这一单真的勾了附加服务、
-      // 且残差与「文件小计 × 派送百分比 + 加急 + 首页」对得上时才写这一行：
-      // 人工改过价的历史单如果把差额写成「附加服务费」，等于替操作员编了一条不存在的收费理由。
-      const extra = Math.round((total - baseTotal) * 100) / 100
-      const extrasEnabled = !!(Number(o.delivery_enabled) || Number(o.urgency_price) > 0 || Number(o.cover_page))
-      const deliveryCost = Number(o.delivery_enabled)
-        ? Math.round(baseTotal * (Number(o.delivery_percentage) || 0)) / 100
-        : 0
-      const expectedExtra = Math.round((deliveryCost
-        + (Number(o.urgency_price) || 0)
-        + (Number(o.cover_page) ? (Number(o.cover_page_price) || 0) * Number(o.cover_page) : 0)) * 100) / 100
-      if (extra > 0 && extrasEnabled && Math.abs(extra - expectedExtra) <= 0.011) {
-        lines.push('附加服务费: ¥' + extra.toFixed(2))
-      }
-      lines.push(PRICE_DASH)
-      lines.push('💰合计: ¥' + total.toFixed(2))
-      return lines
+      return priceCopy.priceDetailLines(o, rules)
     },
 
     // 点击「¥xx.xx」→ 在价格处弹出气泡（再点一次收起）。
@@ -3222,6 +3142,13 @@ Component({
           })
         })
       })
+    },
+
+    // 价格气泡是「非模态」的：遮罩 pointer-events:none（不挡滚动），失去焦点即关闭。
+    // page-root 的 capture-bind:touchstart 落到这里 —— 点/滑页面任何地方都先收起气泡，
+    // 手势本身照常交给 .scroller 的 WXS 滚动引擎（不能用 catchtouchmove，那会锁住页面）。
+    onPricePopDismiss() {
+      if (this.data.showPricePop) this.setData({ showPricePop: false })
     },
 
     onClosePricePop() {

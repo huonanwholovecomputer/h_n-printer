@@ -5215,8 +5215,17 @@ picker-view-column {
   z-index: 10000;
   touch-action: none;
 }
+/* 价格气泡不是模态：is-pass-through 让遮罩不参与命中测试、也不锁触摸（否则一开气泡整页
+   既不能滚也不能滑走）。APP 与小程序同一口径（小程序见 utils/price_pop.wxss）。
+   状态原因气泡仍用模态遮罩（.status-pop-mask），不要加这个类。 */
+.price-pop-mask.is-pass-through {
+  pointer-events: none;
+  touch-action: auto;
+}
 .price-pop {
   position: fixed;
+  /* 遮罩 pointer-events:none 时气泡自己得能点 */
+  pointer-events: auto;
   box-sizing: border-box;
   padding: 2.64cqw 2.88cqw 2.4cqw;
   border-radius: var(--radius-lg);

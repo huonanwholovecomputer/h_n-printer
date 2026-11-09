@@ -12,7 +12,8 @@
   <text>{{themeMode === 'auto' ? '🌓' : (themeMode === 'dark' ? '🌙' : '☀️')}}</text>
 </view>
 
-<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}">
+<view class="page-root {{pageSlide}} {{pageExit}} {{isDarkMode ? 'theme-dark' : ''}}"
+      capture-bind:touchstart="onPricePopDismiss">
   <!-- 返回顶部按钮（右下角） -->
   <view class="scroll-top-btn {{showScrollTop ? 'scroll-top-visible' : ''}}" bindtap="onScrollToTop" hover-class="tap-active">
     <view class="scroll-top-arrow">
@@ -209,15 +210,10 @@
             <text wx:if="{{item.is_admin_print}}" class="order-self-print-badge">👤自打</text>
           </view>
           <text class="order-number-label">{{item.file_summary || item.file}}</text>
-          <view wx:if="{{item.isExcel}}" class="order-card-meta">
-            <text class="order-card-stat">📄 不适用</text>
-            <text class="order-card-stat">📋 不适用</text>
-            <text class="order-card-stat">🖨 不适用</text>
-          </view>
-          <view wx:else class="order-card-meta">
-            <text class="order-card-stat">📄 {{item.total_pages || (item.page_count * item.copies)}} 页</text>
-            <text class="order-card-stat">📋 {{item.total_copies || item.copies}} 份</text>
-            <text class="order-card-stat">🖨 {{item.totalSheetsDisplay}} 张</text>
+          <view class="order-card-meta">
+            <text class="order-card-stat">📄 {{item.statPages}}</text>
+            <text class="order-card-stat">📋 {{item.statCopies}}</text>
+            <text class="order-card-stat">🖨 {{item.statSheets}}</text>
           </view>
           <view class="order-card-footer">
             <text class="order-created">{{item.created_at}}</text>
@@ -246,15 +242,15 @@
             </view>
             <view class="detail-row">
               <text class="detail-label">合计页数</text>
-              <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_pages || (item.page_count * item.copies)) + ' 页'}}</text>
+              <text class="detail-value">{{item.statPages}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计份数</text>
-              <text class="detail-value">{{item.isExcel ? '不适用' : (item.total_copies || item.copies) + ' 份'}}</text>
+              <text class="detail-value">{{item.statCopies}}</text>
             </view>
             <view class="detail-row">
               <text class="detail-label">合计张数</text>
-              <text class="detail-value">{{item.isExcel ? '不适用' : item.totalSheetsDisplay + ' 张'}}</text>
+              <text class="detail-value">{{item.statSheets}}</text>
             </view>
           </view>
 
@@ -280,11 +276,13 @@
             <view class="detail-section-title">文件列表 ({{item.files.length}})<text wx:if="{{item.files.length > 5}}" class="detail-files-hint">· 列表可上下滑动</text></view>
             <!-- 文件多时列表在自己的框里滚动：卡片整体高度被 detail-expanded 的 max-height 限死，
                  不再把后半截文件裁掉（「一个任务 10+ 个文件」现场）。
-                 catchtouchmove 是必需的：本页外层 .scroller 挂着 WXS 滚动引擎，它的 touchmove
-                 会 preventDefault（返回 false），原生 scroll-view 就再也滚不动了 —— 用 catch
-                 把事件终止在这一层，让原生滚动接管。（代价：手指起于列表内时页面不跟着滚，
-                 抬手再来一次即可；文件列表最多 5 行高，可接受。） -->
-            <scroll-view scroll-y class="detail-files-scroll" catchtouchmove="noop">
+                 这里不再是原生 scroll-view：外层 .scroller 由 WXS 滚动引擎驱动（touchmove 会
+                 preventDefault），原生框滚到边之后没有任何回调能接管 ⇒ 现场「列表滑到底/顶，
+                 整个页面不跟着动」。改成 view + 内层 track，由 utils/scroll.wxs 直驱 translateY：
+                 内层到边当帧把余量交给外层，外层到顶再交还内层（双向接力），不需要逻辑层同步贴边。
+                 同一页可同时展开多张订单卡，WXS 用 selectAllComponents 逐个量 rect 命中，不会串卡。 -->
+            <view class="detail-files-scroll">
+              <view class="detail-files-track">
             <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
@@ -302,7 +300,8 @@
                 <text wx:if="{{(f.status === 'rejected' || f.status === 'failed') && f.reject_reason}}" class="file-reject-reason">{{f.reject_reason}}</text>
               </view>
             </view>
-            </scroll-view>
+              </view>
+            </view>
           </view>
 
           <!-- 附加服务 -->
@@ -701,8 +700,7 @@
 
   <!-- 合计价格复制 Popconfirm（在 page-root 外：fixed 才真正相对视口定位，
        也逃出订单卡片的 overflow:hidden / max-height 裁剪；气泡锚在「合计价格」上方/下方） -->
-  <view wx:if="{{showPricePop}}" class="price-pop-mask {{isDarkMode ? 'theme-dark' : ''}}"
-        catchtap="onClosePricePop" catchtouchmove="noop">
+  <view wx:if="{{showPricePop}}" class="price-pop-mask is-pass-through {{isDarkMode ? 'theme-dark' : ''}}">
     <view class="price-pop {{pricePopBelow ? 'price-pop-below' : 'price-pop-above'}}"
           style="left: {{pricePopLeft}}px; width: {{pricePopWidth}}px; {{pricePopBelow ? 'top:' + pricePopTop + 'px;' : 'bottom:' + pricePopBottom + 'px;'}}"
           catchtap="noop">

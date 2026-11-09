@@ -253,12 +253,52 @@ check('⑤ 合计是订单实收、无附加服务费行（夹具未勾附加服
       && detailNorm.indexOf('附加服务费') < 0,
       JSON.stringify(detailLines.slice(-3)));
 
-/* ── ⑥ 点 mask 收起 ───────────────────────────────────────────────── */
+/* ── ⑥ 非模态：点气泡外收起、滚动不被锁（2026-11-09 用户反馈） ─────── */
 await page.locator('#orderList .detail-price-tap').first().click();
 await page.waitForSelector('.price-pop', { state: 'visible' });
-await page.locator('.price-pop-mask').click({ position: { x: 8, y: 8 } });
-await page.waitForTimeout(100);
-check('⑥ 点气泡外（mask）→ 收起', await page.locator('.price-pop').count() === 0);
+// 遮罩是 is-pass-through（pointer-events:none）：它不吃指针，点下去命中的是页面本身，
+// 由文档级 touchstart/mousedown 监听收起 —— 这也是「点别处就关」的真实路径
+const passThrough = await page.evaluate(() => {
+  const mask = document.querySelector('.price-pop-mask');
+  const cs = getComputedStyle(mask);
+  return { pe: cs.pointerEvents, popPe: getComputedStyle(document.querySelector('.price-pop')).pointerEvents };
+});
+check('⑥ 遮罩不吃指针（pointer-events:none）、气泡自己可点',
+      passThrough.pe === 'none' && passThrough.popPe === 'auto',
+      JSON.stringify(passThrough));
+await page.mouse.click(12, 300);
+await page.waitForTimeout(150);
+check('⑥ 点气泡外任意处 → 收起', await page.locator('.price-pop').count() === 0);
+
+const scrollBefore = await page.evaluate(() => {
+  const box = document.querySelector('#page-me .scroll-content') || document.querySelector('.scroll-content');
+  const sc = document.querySelector('#page-me .scroller') || document.querySelector('.scroller');
+  return { wy: window.scrollY, box: box ? box.style.transform : '', top: sc ? sc.scrollTop : 0 };
+});
+await page.locator('#orderList .detail-price-tap').first().click();
+await page.waitForSelector('.price-pop', { state: 'visible' });
+// 真实触摸滑动（这一页是 WXS 触摸滚动引擎，滚轮不动它；之前就是遮罩吃掉 touchmove 把页面锁死）
+const cdp = await context.newCDPSession(page);
+await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: 195, y: 600 }] });
+for (let i = 1; i <= 6; i++) {
+  await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: 195, y: 600 - i * 40 }] });
+  await page.waitForTimeout(16);
+}
+await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+await page.waitForTimeout(350);
+const scrollAfter = await page.evaluate(() => {
+  const box = document.querySelector('#page-me .scroll-content') || document.querySelector('.scroll-content');
+  const sc = document.querySelector('#page-me .scroller') || document.querySelector('.scroller');
+  return { wy: window.scrollY, box: box ? box.style.transform : '', top: sc ? sc.scrollTop : 0,
+           pops: document.querySelectorAll('.price-pop').length };
+});
+const moved = scrollAfter.wy !== scrollBefore.wy
+  || scrollAfter.box !== scrollBefore.box
+  || scrollAfter.top !== scrollBefore.top;
+check('⑥ 气泡打开时页面还能滚（触摸滑动不被遮罩锁住），且一滑就收起',
+      moved && scrollAfter.pops === 0,
+      `before=${JSON.stringify(scrollBefore)} after=${JSON.stringify(scrollAfter)}`);
 
 /* ── ⑦ 上方放不下 → 翻到下方（真实几何：把价格滚到视口顶部附近） ──── */
 await page.evaluate(() => {

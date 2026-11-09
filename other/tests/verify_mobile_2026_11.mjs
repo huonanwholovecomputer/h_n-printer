@@ -204,6 +204,17 @@ function makeCtx(component, extra) {
   return ctx;
 }
 
+/* utils/price_copy.js（2026-11-09 从 me.js 抽出的「复制价格/详细价格」文案唯一实现）：
+   真实加载；它的 './pages' 依赖接成与各沙箱同口径的页数 shim。 */
+const PRICE_COPY_MOD = (() => {
+  const m = { exports: {} };
+  new Function('module', 'exports', 'require', read(path.join(MP, 'utils', 'price_copy.js')))(m, m.exports, (dep) => {
+    if (dep === './pages') return { countPagesInRange: (range, count) => (range ? 0 : (Number(count) || 0)) };
+    throw new Error('utils/price_copy.js 意外 require 了 ' + dep);
+  });
+  return m.exports;
+})();
+
 function loadRecentOrdersPage({ role = 'admin', token = 'tk' } = {}) {
   const captured = { component: null, requests: [], clipboard: [], toasts: [], modals: [], storage: {} };
   captured.storage.userRole = role;
@@ -222,6 +233,7 @@ function loadRecentOrdersPage({ role = 'admin', token = 'tk' } = {}) {
           createPollScheduler: () => ({ start() {}, stop() {} }),
         };
       }
+      if (dep.indexOf('utils/price_copy') >= 0) return PRICE_COPY_MOD;
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {
@@ -391,6 +403,7 @@ function loadMpMeJs() {
           createPollScheduler: () => ({ start() {}, stop() {} }),
         };
       }
+      if (dep.indexOf('utils/price_copy') >= 0) return PRICE_COPY_MOD;
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {
@@ -521,7 +534,8 @@ section('五、异常状态原因气泡（文本 + 复制 + 定位）');
 section('六、气泡结构 / fixed 定位（不被 overflow 裁剪）');
 {
   const mpWxml = read(F.mpMeWxml);
-  const mpWxss = read(F.mpMeWxss);
+  // 2026-11-09：价格气泡样式抽到 utils/price_pop.wxss（两个页面 @import）——读「页面 + 共用样式」
+  const mpWxss = read(F.mpMeWxss) + '\n' + read(path.join(MP, 'utils', 'price_pop.wxss'));
   const mpRoWxml = read(F.mpRoWxml);
   const mpRoWxss = read(F.mpRoWxss);
 

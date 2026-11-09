@@ -392,10 +392,17 @@
 }
 
 /* 文件卡片列表：显式高度驱动（index.js 按每文件类型实测常量累加设置 fileListHeight，上限 ≈ 85vh / 3~4 个卡片）。
-   scroll-view 需要显式高度才能真正裁剪溢出卡片并内部滚动；仅 max-height 在微信中会把溢出卡片
-   画到下方元素上，导致与“添加文件”按钮重叠。 */
+   高度必须显式给出才能真正裁剪溢出卡片；仅 max-height 在微信中会把溢出卡片画到下方元素上，
+   导致与“添加文件”按钮重叠。
+   2026-11-09 起不再是原生 scroll-view：内容整块放进 .file-list-track，由 utils/scroll.wxs
+   直驱 translateY（原生框滚到边后没人能接管，现场表现是「列表滑到底页面不跟着动」）。 */
 .file-list-scroll {
   box-sizing: border-box;
+  overflow: hidden;
+  position: relative;
+}
+.file-list-track {
+  will-change: transform;
 }
 
 .inline-header {
