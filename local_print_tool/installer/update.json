@@ -1,9 +1,9 @@
 {
-  "version": "4.6.7",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.7.exe",
-  "md5": "c724bd748bb97a3d1ba60a9920c9dc03",
-  "sha256": "95cf2c410e3c8142daa29352752ef064f95239932879b25dd470cc9c77ae2c71",
-  "notes": "v4.6.7：修「选项 → 默认任务参数…」里那六格空白 —— 页边距（上、下、左、右）、页眉、页脚。数值一直都在、打印也一直按它生效，只是被主题样式压成了 1px 画不出来，看着像窗口卡死；右侧「表格版式」面板里同款的尺寸输入框、云任务列表的「自动关闭」时分框一并修好。这些数字框依旧不带上下箭头，滚轮也不会改数，其余功能不变。",
+  "version": "4.6.8",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.8.exe",
+  "md5": "884a1664dc4efa0977eecc2b1d182bc3",
+  "sha256": "bc994eac27565d2f7055e58dd2ae4715dbf7d86dd9d39953da8ee92fc5784293",
+  "notes": "v4.6.8：①「Excel 表格」直打更省事 —— 打开工作簿会自动读出每张表的打印区域并默认选中（表里没设打印区域就取有内容的范围），也可以自己改；② 手动双面第 2 趟按钮改成按时间预估放行：本机打印机只回报「开始打印」、等不到「打完」，以前按钮会一直灰着（现场 4 个文件 8 张纸，31 秒时仍写「等待第 1 趟打完」），现在到预估放行时刻就能点。",
   "sig_algo": "ed25519",
-  "sig": "YxBaVIs4Img5fvXMtFU6SMh9JFuhLafOQp93iArJ4SteRiBnAsQuhvVgPeeGoG7PEMT/ClupsBSshrbT/WsaBg=="
+  "sig": "8/bfZfc2cWn0gdWuU8MmKK9Zdi74w5pR9cGdPlKbM6PGckdo1sxQdKHGTz4wXI16tfaOcaqRPzOLGAb+pCy2DQ=="
 }
