@@ -119,7 +119,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.6.8"
+APP_VERSION = "4.6.9"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -6536,12 +6536,21 @@ class MainWindow(QMainWindow):
         self._stack.batch_id = os.path.basename(bdir)
         self._stack.printer_name = self._config.printer_name
         self._sync_stack_button()
-        # 攒批不再复用「手动双面」窗：恢复后把攒批列表叫出来，第 2 趟从列表按钮发起
-        dlg = self._ensure_stack_queue_dialog()
-        self._refresh_stack_queue()
-        self._show_stack_queue_dialog(dlg)
-        self._log("🖐 已恢复上次的攒批纸叠，点「▶ 开始打印第 2 趟」继续（清单："
-                  f"{duplex_stack.manifest_path(bdir)}）")
+        # 攒批不再复用「手动双面」窗：恢复后把攒批列表叫出来，第 2 趟从列表按钮发起。
+        # 「🖨 打印列表自动弹出」关掉时**不叫出来**（用户明确不要自动弹），只把入口
+        # 指给操作员 —— 这一叠还等着第 2 趟，别让人以为没恢复。
+        if self._print_list_auto_show():
+            dlg = self._ensure_stack_queue_dialog()
+            self._refresh_stack_queue()
+            self._show_stack_queue_dialog(dlg)
+            self._log("🖐 已恢复上次的攒批纸叠，点「▶ 开始打印第 2 趟」继续（清单："
+                      f"{duplex_stack.manifest_path(bdir)}）")
+        else:
+            self._refresh_stack_queue()
+            self._log("🖐 已恢复上次的攒批纸叠（清单："
+                      f"{duplex_stack.manifest_path(bdir)}）；"
+                      "「🖨 打印列表自动弹出」已关 ⇒ 点底部「🖐 攒批 …」打开列表，"
+                      "再点「▶ 开始打印第 2 趟」继续")
 
     def _finish_stack_entries_offline(self, st, ok: bool = False, message: str = ""):
         """收尾一个**没有活的 job 对象**的遗留纸叠（只有清单快照）。
@@ -12029,6 +12038,23 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
+        # ── 「🖨 打印列表」自动弹出开关（2026-11 用户需求）──
+        # 那个常驻窗（攒批列表 + 本机队列）在"有任务在打 / 有活排队 / 出纸槽里有纸叠等
+        # 第 2 趟"时会自己出现；有用户嫌每次打印都弹一下很烦 ⇒ 给主界面一个开关控制
+        # 自动弹出。关掉 = 绝不自动弹出，窗口只在操作员点底部
+        # 「🖨 打印中 N · 排队 M」/「🖐 攒批 …」时打开；空闲时两种设置都照样自动收起。
+        # 纯显示偏好（不参与任何打印/攒批闸门）⇒ 永远可见、不灰。
+        self._chk_print_list_auto = ThemedCheckBox(
+            "🖨 打印列表自动弹出", theme_manager=self._theme_manager)
+        self._chk_print_list_auto.setToolTip(
+            "勾上（默认）：有任务在打 / 排队 / 出纸槽里有纸叠等第 2 趟时，"
+            "自动弹出「打印列表」窗口。\n"
+            "取消：不再自动弹出；要看队列时点底部「🖨 打印中 N · 排队 M」"
+            "（或「🖐 攒批 …」）手动打开。\n"
+            "两种设置下，空闲（没在打、没排队、没纸叠）后窗口都会自动收起。")
+        self._chk_print_list_auto.toggled.connect(self._on_print_list_auto_toggled)
+        layout.addWidget(self._chk_print_list_auto)
+
         # ── 攒批模式（多任务合并翻纸，2026-10）──
         # 只对「无自动双面器、需人工翻纸」的机型有意义（HP LaserJet 1020 等）：
         # 开启后需手动双面的打印请求不再各自翻一次纸，第 1 趟连续打进同一叠，
@@ -12054,8 +12080,9 @@ class MainWindow(QMainWindow):
         # （`N张/M单（已取走 R）`），点它 = 把被收起的列表重新叫出来。
         self._btn_stack = QPushButton("🖐 攒批列表")
         self._btn_stack.setToolTip(
-            "打开「攒批列表」：看已攒（等第 2 趟）与还在排队等着打印的文件，\n"
-            "第 2 趟也从那个窗口发起。只有出纸槽里有纸叠时这一项才出现。")
+            "打开「打印列表」：看正在打印 / 排队中的任务，以及已攒（等第 2 趟）的纸。\n"
+            "第 2 趟也从那个窗口发起。只在真有纸叠或排队任务时出现。\n"
+            "关掉「🖨 打印列表自动弹出」后，这里是打开窗口的唯一入口。")
         self._btn_stack.clicked.connect(self._on_stack_button)
         self._btn_stack.setVisible(False)
         layout.addWidget(self._btn_stack)
@@ -12099,6 +12126,10 @@ class MainWindow(QMainWindow):
         self._chk_stack_mode.blockSignals(True)
         self._chk_stack_mode.setChecked(bool(self._config.duplex_stack_mode))
         self._chk_stack_mode.blockSignals(False)
+        # 「打印列表」自动弹出开关（配置 → UI；同样屏蔽信号，加载不落盘）
+        self._chk_print_list_auto.blockSignals(True)
+        self._chk_print_list_auto.setChecked(bool(self._config.print_list_auto_show))
+        self._chk_print_list_auto.blockSignals(False)
         self._sync_stack_button()
 
         # 全局渲染 DPI
@@ -16011,6 +16042,33 @@ class MainWindow(QMainWindow):
         except Exception as e:      # 定时器路径绝不能抛
             logger.debug(f"本机队列刷新失败: {type(e).__name__}: {e}")
 
+    def _print_list_auto_show(self) -> bool:
+        """「🖨 打印列表」窗口是否自动弹出（主界面「🖨 打印列表自动弹出」开关）。
+
+        默认 True ⇒ 与 2026-11 之前完全一致（有纸叠 / 有任务在打时自己出现）。
+        用户关掉后只禁「自动出现」这一件事：窗口仍可点底部入口手动打开，
+        空闲后也仍然自动收起；不参与打印 / 攒批 / 排队任何闸门。
+        """
+        return bool(getattr(self._config, "print_list_auto_show", True))
+
+    def _on_print_list_auto_toggled(self, checked: bool):
+        """主界面「🖨 打印列表自动弹出」开关：纯显示偏好，当场生效并落盘。"""
+        want = bool(checked)
+        self._config.print_list_auto_show = want
+        self._save_config()
+        # 这是**明示**操作：把"操作员主动收起"的标记清掉，让下面的裁决立刻按新设置生效
+        # （否则重新打开开关后，还得等下一次状态变化窗口才回来）。
+        self._stack_list_user_closed = False
+        if want:
+            self._log("🖨 打印列表：已开启自动弹出（有任务 / 纸叠时自己出现）")
+        else:
+            dlg = getattr(self, "_stack_queue_dialog", None)
+            if dlg is not None and dlg.isVisible():
+                dlg.hide()              # 当场收起：开关的反馈必须立刻可见
+            self._log("🖨 打印列表：已关闭自动弹出 —— 要看队列时点底部"
+                      "「🖨 打印中 N · 排队 M」或「🖐 攒批 …」打开")
+        self._sync_stack_list_visible()
+
     def _sync_stack_list_visible(self):
         """攒批模式开启 ⇒ 攒批列表**常驻**（2026-10-20 用户要求）；关闭 ⇒ 收起。
 
@@ -16020,6 +16078,10 @@ class MainWindow(QMainWindow):
           · 操作员**主动**关掉的窗口不在这里强行弹回来（`_stack_list_user_closed`）——
             旧写法每次 `_sync_stack_button()` 都会把它重新 show 出来，"关闭"形同虚设；
             点底部 🖐、切开关、有新单入叠时清标记（那些场景确实该让它出现）。
+
+        第三条（2026-11 用户需求）：主界面「🖨 打印列表自动弹出」关掉 ⇒ 本方法**绝不**
+        主动 show，只保留"没内容了自动收起"；窗口显隐交给操作员（底部
+        「🖨 打印中 N · 排队 M」/「🖐 攒批 …」是手动入口）。开着（默认）时与旧行为一致。
         """
         dlg = getattr(self, "_stack_queue_dialog", None)
         mode_on = self._stack_mode_on()
@@ -16031,6 +16093,16 @@ class MainWindow(QMainWindow):
             has_local = bool(self._local_queue_rows())
         except Exception:
             has_local = False
+        # 「🖨 打印列表自动弹出」关掉 ⇒ 绝不主动 show（用户 2026-11：每次打印都弹一下很烦）。
+        # 只留"没内容了自动收起"；已经手动打开着的窗口照旧实时刷新（内容不能停在旧状态）。
+        if not self._print_list_auto_show():
+            if not mode_on and not has_entries and not has_local:
+                if dlg is not None and dlg.isVisible():
+                    dlg.hide()
+                return
+            if dlg is not None and dlg.isVisible():
+                self._refresh_stack_queue()
+            return
         if not mode_on and not has_entries and not has_local:
             if dlg is not None and dlg.isVisible():
                 dlg.hide()

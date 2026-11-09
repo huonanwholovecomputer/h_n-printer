@@ -20,7 +20,7 @@
 ; 安装目录用英文 C:\Program Files\h_n printer（避免中文路径兼容问题）。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "4.6.7"
+  #define MyAppVersion "4.6.9"
 #endif
 
 [Setup]

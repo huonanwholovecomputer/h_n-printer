@@ -1490,6 +1490,13 @@ class PrinterConfig:
     # 连续打进同一叠（出纸槽），人工一次性确认后统一打第 2 趟。见 duplex_stack.py。
     # 攒批期间其余打印请求（单面订单/自动打印/测速）一律排队——插进纸叠会串页。
     duplex_stack_mode: bool = False
+    # ---- 「🖨 打印列表」窗口是否自动弹出（2026-11 用户需求）----
+    # 那个常驻窗（StackQueueDialog：攒批列表 + 本机队列）在有纸叠 / 有任务在打时
+    # 会自己出现，用户觉得「每次打印都弹一下」很烦 ⇒ 主界面给一个开关控制自动弹出。
+    # True（默认，老配置没有这个键也是它）⇒ 维持原行为，零回归；
+    # False ⇒ 绝不自动弹出，只在操作员点底部入口时打开；空闲时照旧自动收起。
+    # 纯显示偏好：不参与打印 / 攒批 / 排队任何闸门。
+    print_list_auto_show: bool = True
     # ---- 外部打印监视（A 档最小版：只检测 + 记账，不阻断，见 print_watch.py）----
     # 勾上后本地工具订阅本机 spooler 作业事件，把"绕过本工具"的打印记进 external_prints.json。
     # 默认 False：老配置文件没有这个键 ⇒ 保持关，且不影响其他默认值。
@@ -1574,6 +1581,8 @@ class PrinterConfig:
             "printer_profiles": {k: v.to_dict() for k, v in self.printer_profiles.items()},
             # 攒批模式开关（多任务合并翻纸）
             "duplex_stack_mode": self.duplex_stack_mode,
+            # 「打印列表」窗口是否自动弹出（老配置没有这个键 ⇒ True，零回归）
+            "print_list_auto_show": self.print_list_auto_show,
             "external_watch_enabled": self.external_watch_enabled,
             # 纸张大小 + 默认任务参数（老配置没有这两个键 ⇒ A4 / {}，零回归）
             "paper_size": normalize_paper_size(self.paper_size),
@@ -1646,6 +1655,8 @@ class PrinterConfig:
                               if isinstance(v, dict)},
             # 攒批模式开关（老配置没有这个键 → 关，零回归）
             duplex_stack_mode=_bool_or_default(data.get("duplex_stack_mode"), False),
+            # 「打印列表」窗口自动弹出（老配置没有这个键 → 开，与改动前行为一致）
+            print_list_auto_show=_bool_or_default(data.get("print_list_auto_show"), True),
             # 外部打印监视（老配置没有这个键 → 关，零回归）
             external_watch_enabled=_bool_or_default(data.get("external_watch_enabled"), False),
             # 纸张大小（老配置没有这个键 → A4；坏值/不在白名单 → A4，不抛异常）
