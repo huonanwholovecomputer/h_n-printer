@@ -1,9 +1,9 @@
 {
-  "version": "4.6.8",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.8.exe",
-  "md5": "884a1664dc4efa0977eecc2b1d182bc3",
-  "sha256": "bc994eac27565d2f7055e58dd2ae4715dbf7d86dd9d39953da8ee92fc5784293",
-  "notes": "v4.6.8：①「Excel 表格」直打更省事 —— 打开工作簿会自动读出每张表的打印区域并默认选中（表里没设打印区域就取有内容的范围），也可以自己改；② 手动双面第 2 趟按钮改成按时间预估放行：本机打印机只回报「开始打印」、等不到「打完」，以前按钮会一直灰着（现场 4 个文件 8 张纸，31 秒时仍写「等待第 1 趟打完」），现在到预估放行时刻就能点。",
+  "version": "4.6.9",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.9.exe",
+  "md5": "5cf131b0d3f7879f45064ff363ffd8c5",
+  "sha256": "0b61183271c83bd2b41518bc213ddb1dde814ff2e77a698d9085a9402be73c76",
+  "notes": "v4.6.9：主界面底部新增「🖨 打印列表自动弹出」开关 —— 以前每次打印，那个任务列表窗口都会自己弹出来，现在可以关掉：取消勾选后它不再自动出现（包括启动时恢复上次没打完的攒批纸叠），需要看队列时点底部「🖨 打印中 N · 排队 M」或「🖐 攒批 …」手动打开；两种设置下打完后都会自动收起。默认保持勾选，与以前的习惯一致。",
   "sig_algo": "ed25519",
-  "sig": "8/bfZfc2cWn0gdWuU8MmKK9Zdi74w5pR9cGdPlKbM6PGckdo1sxQdKHGTz4wXI16tfaOcaqRPzOLGAb+pCy2DQ=="
+  "sig": "lyHAxuShH7H63K5Aa+naC8ZVjnruRuo9dCs9U7LuGZSvKEvwsDPZ10bHVxl+ad8xCsopVDfKdNW/gtiF9cKeBA=="
 }
