@@ -41,6 +41,9 @@ files.add / files.update 的 options（除 xlsx_options 外都是顶层字段）
                     地址可带工作表名（Sheet1!A1:F20）或多块（A1:B2,D5:E9）。
     cloud.orders    {order?, status?, source?, owner?, file?, since?, until?, limit?, offset?}
                                      → 云端订单数据（只读、不限时间；走设备 token）
+    cloud.order_owner {order, user?/openid?, by?}
+                                     → 调整云端订单归属用户（必须操作员当场输财务密码；
+                                       走收支清算代理，密码不落盘）
 """
 
 from __future__ import annotations
@@ -642,6 +645,248 @@ class AgentOps:
         }
 
     # ══════════════════════════════════════════════════════════════════
+    # 云端订单归属调整（唯一需要「人在场」的写路径）
+    # ══════════════════════════════════════════════════════════════════
+
+    # 弹窗最多等这么久：必须明显短于 agent_api 的 60s 调用超时，否则调用方先收到
+    # 504、操作员随后才输完密码，动作照样落地，结果就对不上了。
+    APPROVAL_TIMEOUT_SEC = 30.0
+    APPROVAL_HTTP_TIMEOUT = 20.0
+
+    def op_cloud_order_owner(self, params: dict) -> dict:
+        """调整一张云端订单的归属用户（改 `orders.openid`，不是本地展示归属）。
+
+        params: `order`（订单号或 order_id）、目标用户二选一 —— `user`（昵称 /
+        openid）或 `openid`；可选 `by`（留痕操作人，默认「智能助手」）。
+
+        安全模型：助手手里只有设备 token，直连后端就能改，所以本 op **故意不直连**，
+        而是走本地收支清算代理 —— 必须由操作员在弹窗里输入财务密码，密码只用于换一次
+        `orderstatus` 会话，用完立即作废；密码不落盘、不进日志。
+        """
+        started = time.monotonic()
+        raw_order = params.get("order", params.get("order_id"))
+        if not isinstance(raw_order, str) or not raw_order.strip():
+            raise AgentOpError("invalid", "order 必须是订单号或 order_id（非空字符串）")
+        order_ref = raw_order.strip()
+
+        raw_openid = params.get("openid")
+        raw_user = params.get("user")
+        if raw_openid is not None and not isinstance(raw_openid, str):
+            raise AgentOpError("invalid", "openid 必须是字符串")
+        if raw_user is not None and not isinstance(raw_user, str):
+            raise AgentOpError("invalid", "user 必须是字符串")
+        openid_arg = (raw_openid or "").strip()
+        user_arg = (raw_user or "").strip()
+        if bool(openid_arg) == bool(user_arg):
+            raise AgentOpError("invalid", "openid 与 user 必须且只能给一个")
+
+        by = params.get("by")
+        by = by.strip()[:32] if isinstance(by, str) else "智能助手"
+        by = by or "智能助手"
+
+        client, api_url, token = self._cloud_ready()
+        client_id = str(getattr(client, "client_id", "") or "")
+
+        orders = self.op_cloud_orders({"order": order_ref, "limit": 5}).get("orders") or []
+        pick = self._match_single_order(orders, order_ref)
+        oid = pick.get("order_id")
+        if not oid:
+            raise AgentOpError("cloud_error", "云端订单卡缺少 order_id")
+        if str(pick.get("source") or "") == "local":
+            raise AgentOpError("invalid", "本地订单没有云端用户归属，不能这样改")
+
+        target = self._resolve_owner_target(api_url, token, client_id,
+                                            openid_arg, user_arg)
+
+        pwd = self._ask_finance_password(pick, target)
+        if not pwd:
+            raise AgentOpError("approval_denied",
+                               "操作员未批准本次归属调整（取消或等待超时）")
+
+        server = self._ensure_stats_server()
+        if str(getattr(server, "finance_mode", "")) != "cloud":
+            raise AgentOpError("cloud_off", "收支清算当前为本地模式，无法调整云端订单归属")
+
+        # 调用方（agent_api HTTP 线程）默认只等 60s；这里把「开始写」卡在 38s 内，
+        # 再留 20s 给代理 HTTP（代理自身读超时 15s） —— 否则会出现「调用方已收到 timeout、动作却照样落地」。
+        if time.monotonic() - started > 38.0:
+            raise AgentOpError("approval_denied",
+                               "操作员批准得太晚，本次未改动（请重新发起）")
+
+        unlocked = server.finance.unlock("orderstatus", pwd)
+        if not unlocked.get("ok"):
+            code = str(unlocked.get("code") or "")
+            msg = str(unlocked.get("message") or "财务密码校验失败")
+            if code in ("needs_setup", "default_password"):
+                raise AgentOpError("needs_setup",
+                                   msg + "（请先在「收支清算 → 设置 → 敏感模块密码」里设置）")
+            raise AgentOpError("wrong_password", msg)
+
+        session = str(unlocked.get("session") or "")
+        try:
+            resp = self._http_post_json(
+                f"{server.url}/api/proxy/admin/order_user",
+                {"order_id": str(oid), "openid": target["openid"], "by": by},
+                {"X-Launch-Token": server.launch_token, "X-Finance-Session": session},
+                timeout=self.APPROVAL_HTTP_TIMEOUT)
+        finally:
+            # 这次会话只为一次写入而换，用完立刻作废（页面自己的会话不受影响）
+            try:
+                server.finance.revoke_session(session)
+            except Exception:
+                pass
+
+        if not resp.get("success", False):
+            raise AgentOpError("cloud_error",
+                               str(resp.get("message") or "代理拒绝了本次调整"))
+
+        out = {
+            "order_id": resp.get("order_id") or oid,
+            "order_number": pick.get("order_number") or "",
+            "previous_openid": str(resp.get("previous_openid") or ""),
+            "openid": str(resp.get("openid") or target["openid"]),
+            "nickname": str(resp.get("nickname") or target.get("nickname") or ""),
+            "manual_user_by": str(resp.get("manual_user_by") or by),
+            "manual_user_at": str(resp.get("manual_user_at") or ""),
+        }
+        try:
+            self.win._log(f"🤖 助手调整订单 {out['order_number'] or ('#' + str(out['order_id']))} "
+                          f"的归属用户：{pick.get('owner') or out['previous_openid'] or '(空)'} → "
+                          f"{out['nickname'] or out['openid']}")
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _match_single_order(orders, ref: str) -> dict:
+        if not orders:
+            raise AgentOpError("not_found", f"没找到订单 {ref}")
+        exact = [o for o in orders
+                 if str(o.get("order_number") or "") == ref
+                 or str(o.get("order_id") or "") == ref]
+        if len(exact) == 1:
+            return exact[0]
+        if len(orders) == 1:
+            return orders[0]
+        raise AgentOpError("invalid", f"订单 {ref} 匹配到 {len(orders)} 张，请给完整订单号")
+
+    def _resolve_owner_target(self, api_url: str, token: str, client_id: str,
+                              openid_arg: str, user_arg: str) -> dict:
+        """把「目标用户」解析成 openid：先取云端可调整名单（revenue 里同一份）。"""
+        today = time.strftime("%Y-%m-%d")
+        body = self._http_get_json(f"{api_url}/api/admin/statistics/revenue",
+                                   {"start_date": today, "end_date": today},
+                                   token, client_id)
+        payload = body.get("data") if isinstance(body.get("data"), dict) else body
+        users = payload.get("assignable_users") or []
+        if not isinstance(users, list):
+            users = []
+
+        def _label(u):
+            nick = str(u.get("nickname") or "").strip() or "未命名"
+            oid = str(u.get("openid") or "")
+            return f"{nick}（{oid[:8]}…）" if oid else nick
+
+        if openid_arg:
+            for u in users:
+                if str(u.get("openid") or "") == openid_arg:
+                    return {"openid": openid_arg,
+                            "nickname": str(u.get("nickname") or "")}
+            raise AgentOpError("not_found",
+                               f"目标用户 {openid_arg} 不在可调整名单里（已移除/设备账号除外）")
+
+        needle = user_arg.casefold()
+        hits = []
+        for u in users:
+            nick = str(u.get("nickname") or "")
+            oid = str(u.get("openid") or "")
+            if oid == user_arg or (nick and nick.casefold() == needle):
+                hits = [u]
+                break
+            if nick and needle in nick.casefold():
+                hits.append(u)
+        if not hits:
+            raise AgentOpError("not_found", f"没找到用户「{user_arg}」")
+        if len(hits) > 1:
+            names = "、".join(_label(u) for u in hits[:8])
+            raise AgentOpError("invalid",
+                               f"「{user_arg}」匹配到多个用户：{names}（请给更完整的昵称或 openid）")
+        return {"openid": str(hits[0].get("openid") or ""),
+                "nickname": str(hits[0].get("nickname") or "")}
+
+    def _ask_finance_password(self, order: dict, target: dict) -> str:
+        """弹窗要财务密码；取消/超时返回空串（由调用方转成 approval_denied）。"""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QInputDialog, QLineEdit
+
+        num = order.get("order_number") or ("#" + str(order.get("order_id") or ""))
+        label = (
+            f"订单 {num}\n"
+            f"当前用户：{order.get('owner') or '（未知）'}\n"
+            f"改为：{target.get('nickname') or target.get('openid')}\n\n"
+            f"请输入财务密码批准（{int(self.APPROVAL_TIMEOUT_SEC)} 秒内有效）。\n"
+            "密码只用于这一次调整，不会保存。"
+        )
+        dlg = QInputDialog(self.win)
+        dlg.setWindowTitle("智能助手：调整订单归属")
+        dlg.setLabelText(label)
+        dlg.setTextEchoMode(QLineEdit.Password)
+        dlg.setOkButtonText("确认调整")
+        dlg.setCancelButtonText("拒绝")
+        timer = QTimer(dlg)
+        timer.setSingleShot(True)
+        timer.timeout.connect(dlg.reject)
+        timer.start(int(self.APPROVAL_TIMEOUT_SEC * 1000))
+        ok = dlg.exec() == QInputDialog.Accepted
+        timer.stop()
+        return (dlg.textValue() or "").strip() if ok else ""
+
+    def _ensure_stats_server(self):
+        ensure = getattr(self.win, "_ensure_stats_server", None)
+        if ensure is None:
+            raise AgentOpError("finance_error", "打印工具版本过旧：缺少收支清算服务入口")
+        try:
+            return ensure()
+        except AgentOpError:
+            raise
+        except Exception as exc:
+            raise AgentOpError("finance_error",
+                               f"本地收支清算服务启动失败：{type(exc).__name__}: {exc}")
+
+    def _http_post_json(self, url: str, payload: dict, headers: dict,
+                        timeout: float = 10.0) -> dict:
+        """主线程里发一次本地 POST（后台线程跑网络，主线程泵事件），口径同 `_http_get_json`。"""
+        box: dict = {}
+
+        def _worker():
+            try:
+                resp = http_requests.post(url, json=payload, headers=headers, timeout=timeout)
+                box["status"] = resp.status_code
+                try:
+                    box["data"] = resp.json()
+                except ValueError:
+                    box["text"] = (resp.text or "")[:300]
+            except Exception as exc:
+                box["error"] = f"{type(exc).__name__}: {exc}"
+
+        th = threading.Thread(target=_worker, name="agent-finance-post", daemon=True)
+        th.start()
+        from PySide6.QtCore import QCoreApplication, QEventLoop
+        deadline = time.monotonic() + timeout + 2.0
+        while th.is_alive() and time.monotonic() < deadline:
+            QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            time.sleep(0.02)
+        if th.is_alive():
+            raise AgentOpError("finance_timeout", "本地财务服务没有响应")
+        if "error" in box:
+            raise AgentOpError("finance_error", f"连不上本地财务服务：{box['error']}")
+        data = box.get("data")
+        if not isinstance(data, dict):
+            raise AgentOpError("finance_error",
+                               f"本地财务服务返回非 JSON（HTTP {box.get('status')}）")
+        return data
+
+    # ══════════════════════════════════════════════════════════════════
     # 单文件参数（与界面编辑面板同一口径）
     # ══════════════════════════════════════════════════════════════════
 
@@ -862,4 +1107,5 @@ _OPS = {
     "files.update": AgentOps.op_files_update,
     "files.remove": AgentOps.op_files_remove,
     "cloud.orders": AgentOps.op_cloud_orders,
+    "cloud.order_owner": AgentOps.op_cloud_order_owner,
 }

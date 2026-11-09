@@ -462,9 +462,12 @@ def _make_handler():
                     status = 503        # 程序正在退出，让调用方等它起来
                 elif code in ("not_found", "unknown_op"):
                     status = 404
+                elif code in ("approval_denied", "wrong_password"):
+                    status = 403        # 人没批准 / 财务密码不对：不是状态问题，是权限问题
                 elif code in ("frozen", "busy", "cloud_locked",
                               "confirm_required", "no_member", "pages_pending",
-                              "print_blocked"):
+                              "print_blocked", "needs_setup", "finance_error",
+                              "finance_timeout"):
                     status = 409        # 状态冲突：请求本身没错，是「现在不能做」
             self._send(status, resp)
 

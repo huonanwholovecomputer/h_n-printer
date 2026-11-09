@@ -3370,6 +3370,19 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    # v22 迁移（2026-11）：订单**归属用户**人工调整的留痕 —— 与 v21 同款理由：
+    # 谁在什么时候把这一单改到了哪个用户名下（空 = 非人工调整；审计列不复用 reject_reason）。
+    for col, col_type, default in [
+        ("manual_user_by", "TEXT", "''"),   # 调整操作者昵称（≤32 字符）
+        ("manual_user_at", "TEXT", "''"),   # 调整时刻（服务器时间 YYYY-MM-DD HH:MM:SS）
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type} DEFAULT {default}")
+            conn.commit()
+            print(f"  已添加 orders.{col} 列")
+        except sqlite3.OperationalError:
+            pass
+
     # v5 迁移：订单文件子任务表（一次提交可包含多个文件，每个文件独立份数/状态）
     conn.execute(
         """
@@ -12514,6 +12527,117 @@ def admin_order_type():
     })
 
 
+# 2026-11 用户需求：订单明细「用户」列也要能快捷调整（与「状态」同一把锁 / 同一个密码）。
+# 与状态/类型订正的区别（别照抄状态那一套）：
+#   · 改的是 orders.openid —— 订单的**实际归属用户**，小程序 / APP 的「我的订单」随新 openid 变；
+#   · 不碰任何 status / locked_at / 子任务状态、不通知设备：纸打没打、还能不能打，一点没变；
+#   · 只接云端订单（当前 openid 非空且 != 'local'），目标 openid 必须已存在于 users 表；
+#   · files.openid 是「这份副本的上传者」（S2-05 起每次上传各自一行），**不跟着改** ——
+#     那是上传者归属与保留期配额的事实记录，跟着改等于篡改审计。
+@app.route("/api/admin/order_user", methods=["POST"])
+@require_printer_scope("admin")
+def admin_order_user():
+    """收支清算页人工调整订单所属用户（需 printer token）。
+
+    校验与 /api/admin/order_status 同一套（dict 守卫 / 规范十进制 id / db_lock +
+    BEGIN IMMEDIATE）—— 两处口径一致，畸形请求一律 fail-closed，绝不 500。
+    """
+    try:
+        data = request.get_json(silent=True)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    token = _get_printer_token() or str(data.get("token") or "")
+    if not _authenticate_printer(token):
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    raw_id = data.get("order_id")
+    if raw_id is None or raw_id == "":
+        return jsonify({"success": False, "message": "缺少 order_id"}), 400
+    if isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+        return jsonify({"success": False, "message": "order_id 不合法"}), 400
+    s_id = raw_id if isinstance(raw_id, str) else str(raw_id)
+    if not re.fullmatch(r"[0-9]+", s_id) or (len(s_id) > 1 and s_id[0] == "0"):
+        return jsonify({"success": False, "message": "order_id 不合法"}), 400
+
+    raw_openid = data.get("openid")
+    new_openid = raw_openid.strip() if isinstance(raw_openid, str) else ""
+    if (not new_openid or len(new_openid) > 128
+            or new_openid == "local" or new_openid.startswith("dev_")
+            or not re.fullmatch(r"[A-Za-z0-9_.\-]+", new_openid)):
+        return jsonify({"success": False, "message": "目标用户不合法"}), 400
+
+    by = data.get("by")
+    by = by.strip()[:32] if isinstance(by, str) else ""
+    fixed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 目标用户必须真实存在：把订单转给一个没人能登录的 openid，等于让这单从所有
+    # 「我的订单」里消失（旧用户看不到、新用户不存在）—— 这才是这次调整最危险的失败态。
+    user_conn = get_user_db()
+    try:
+        target = user_conn.execute(
+            "SELECT openid, nickname FROM users WHERE openid = ?", (new_openid,)
+        ).fetchone()
+    finally:
+        user_conn.close()
+    if not target:
+        return jsonify({"success": False, "message": "目标用户不存在"}), 404
+    new_nickname = (target["nickname"] or "").strip()
+
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT openid FROM orders WHERE id = ?", (s_id,)
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return jsonify({"success": False, "message": "订单不存在"}), 404
+            prev_openid = row["openid"] or ""
+            if prev_openid == "local":
+                conn.rollback()
+                return jsonify({"success": False,
+                                "message": "本地归属订单不支持改云端用户"}), 400
+            if prev_openid == new_openid:
+                conn.commit()
+                return jsonify({
+                    "success": True,
+                    "message": "订单已属于该用户",
+                    "order_id": s_id,
+                    "openid": new_openid,
+                    "nickname": new_nickname,
+                    "previous_openid": prev_openid,
+                    "manual_user_by": by,
+                    "manual_user_at": "",
+                })
+            conn.execute(
+                "UPDATE orders SET openid = ?, manual_user_by = ?, manual_user_at = ? "
+                "WHERE id = ?",
+                (new_openid, by, fixed_at, s_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    print(f"  [FIX] 订单 #{s_id} 归属用户人工调整: {prev_openid} → {new_openid}"
+          f"（by={by or '-'}）")
+    return jsonify({
+        "success": True,
+        "message": "订单所属用户已调整",
+        "order_id": s_id,
+        "openid": new_openid,
+        "nickname": new_nickname,
+        "previous_openid": prev_openid,
+        "manual_user_by": by,
+        "manual_user_at": fixed_at,
+    })
+
+
 @app.route("/api/admin/statistics/revenue", methods=["GET"])
 @require_printer_scope("admin")
 def admin_statistics_revenue():
@@ -12573,7 +12697,8 @@ def admin_statistics_revenue():
                    o.delivery_percentage, o.urgency_price, o.cover_page_price,
                    o.pickup_address, o.remark, o.print_started_at,
                    o.received_client, o.target_client,
-                   o.manual_status_by, o.manual_status_at
+                   o.manual_status_by, o.manual_status_at,
+                   o.manual_user_by, o.manual_user_at
             FROM orders o
             LEFT JOIN order_files of ON o.id = of.order_id AND of.status IN ({status_placeholders})
             WHERE o.created_at >= ? AND o.created_at <= ?
@@ -12733,6 +12858,9 @@ def admin_statistics_revenue():
                                    for f in files if str(f.get("reject_reason") or "").strip()), ""),
             "manual_status_by": row["manual_status_by"] or "",
             "manual_status_at": row["manual_status_at"] or "",
+            # v7.18：订单归属用户的人工调整留痕（用户列 tooltip 显示"谁在何时改的归属"）
+            "manual_user_by": row["manual_user_by"] or "",
+            "manual_user_at": row["manual_user_at"] or "",
             "files": files,
         })
 
@@ -12782,6 +12910,29 @@ def admin_statistics_revenue():
 
     conn.close()
 
+    # 2026-11：订单「用户」列人工调整的候选名单 —— 只列真实用户（排除设备账号 dev_* 与
+    # 已移除账号），否则菜单里会出现一堆点不进去的名字。用户表很小，一次带走即可，
+    # 不必为此单开一个代理 GET 接口（少一条白名单 = 少一个 fail-open 面）。
+    assignable_users = []
+    try:
+        user_conn = get_user_db()
+        assignable_rows = user_conn.execute(
+            """SELECT openid, nickname, role FROM users
+               WHERE openid != '' AND openid != 'local'
+                 AND substr(openid, 1, 4) != 'dev_'
+                 AND (removed_at IS NULL OR removed_at = '')
+               ORDER BY nickname COLLATE NOCASE, openid
+               LIMIT 500"""
+        ).fetchall()
+        user_conn.close()
+        assignable_users = [
+            {"openid": r["openid"], "nickname": r["nickname"] or "",
+             "role": r["role"] or "guest"}
+            for r in assignable_rows
+        ]
+    except Exception:
+        assignable_users = []
+
     return jsonify({
         "success": True,
         "data": {
@@ -12789,6 +12940,7 @@ def admin_statistics_revenue():
             "revenue_summary": revenue_summary,
             "by_user": by_user,
             "orders": orders,
+            "assignable_users": assignable_users,
         },
     })
 

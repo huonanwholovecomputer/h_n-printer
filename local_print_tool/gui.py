@@ -6744,19 +6744,19 @@ class MainWindow(QMainWindow):
         else:
             logger.info("云端功能未启用或未配置令牌：不启动后台订单同步")
 
-    def _on_open_finance(self, tab: str = ""):
-        """打开收支清算页面：云端模式与本地模式共用同一个 settlement.html，
-        由 stats_server 注入 finance_mode 决定数据/配置的存储来源。
-        本地模式（cloud_enabled=False）：配置/数据存本地 print_data.json。
-        云端模式：存云端 finance/config；加载时若本地+云端都有真实数据则弹「合并」同步询问。
-        tab 可选：'settings' 深链到「设置」标签（无成员引导用）。"""
+    def _ensure_stats_server(self):
+        """按当前配置拿到（必要时启动）本地收支清算服务。
+
+        抽出来给两条路共用：人手打开页面（`_on_open_finance`），以及智能助手 op
+        `cloud.order_owner` 需要借用同一个代理 + 财务密码门。
+        """
         finance_mode = "cloud" if self._config.cloud_enabled else "local"
         # 2026-11：本机设备信息注入 stats_server，供收支清算「授权」页展示本设备/绑定所有者
         import socket as _socket
         device_name = _socket.gethostname()[:64]
         client_id = self._cloud_client.client_id if self._cloud_client else _get_persistent_client_id()
         take_orders = bool(self._config.cloud_take_orders)
-        # 如果已启动则直接打开，否则先启动
+        # 如果已启动则直接复用，否则先启动
         if self._stats_server is None:
             self._stats_server = StatsServer(
                 api_url=self._config.cloud_api_url,
@@ -6777,6 +6777,16 @@ class MainWindow(QMainWindow):
                 self._stats_server.finance_mode = "cloud"
             else:
                 self._stats_server.finance_mode = "local"
+        return self._stats_server
+
+    def _on_open_finance(self, tab: str = ""):
+        """打开收支清算页面：云端模式与本地模式共用同一个 settlement.html，
+        由 stats_server 注入 finance_mode 决定数据/配置的存储来源。
+        本地模式（cloud_enabled=False）：配置/数据存本地 print_data.json。
+        云端模式：存云端 finance/config；加载时若本地+云端都有真实数据则弹「合并」同步询问。
+        tab 可选：'settings' 深链到「设置」标签（无成员引导用）。"""
+        finance_mode = "cloud" if self._config.cloud_enabled else "local"
+        self._ensure_stats_server()
 
         # S2-10 ①：启动令牌**不再进地址栏**（它会留在浏览器历史/截图/Referer 里）。
         # 每次打开向 StatsServer 要一个**一次性 nonce**（短 TTL + 用过即废，重放 403）；

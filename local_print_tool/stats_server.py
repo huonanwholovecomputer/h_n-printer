@@ -492,6 +492,7 @@ _PROXY_PREFIX = "/api/proxy"
 _PROXY_ALLOWED_TARGETS = frozenset({
     "/api/admin/order_status",
     "/api/admin/order_type",
+    "/api/admin/order_user",
     "/api/admin/statistics/months",
     "/api/admin/statistics/revenue",
     "/api/finance/config",
@@ -564,6 +565,8 @@ CRED_KEY = "_finance_credentials"
 FINANCE_WRITE_MODULES = {
     "/api/proxy/admin/order_status": "orderstatus",
     "/api/proxy/admin/order_type": "orderstatus",
+    # v7.18：订单「用户」列改归属 —— 与状态/类型共用同一把锁与同一个密码模块
+    "/api/proxy/admin/order_user": "orderstatus",
     "/api/proxy/finance/config": None,
     "/api/proxy/pricing": "settings",
     "/api/proxy/printer/bind_owner": "auth",
@@ -1439,6 +1442,8 @@ def _extract_proxy_body(resp) -> dict:
     回执字段；v7.0 订单状态订正——此前被白名单静默剥掉，页面拿不到改了几条、原来是什么状态）。
     额外透传 order_type / previous_order_type / is_admin_print（/api/admin/order_type 的回执；
     v7.1 订单类型订正——同款白名单问题，不补就「改成功但页面不知道原来是什么类型」）。
+    v7.18 额外透传 openid / nickname / previous_openid / manual_user_by / manual_user_at
+    （/api/admin/order_user 的回执——页面要用新昵称刷新那一格、并在 tooltip 里显示标记人）。
     一律「响应当中有才透传」，不存在时不填空值（语义同上面几个）。"""
     try:
         data = resp.json()
@@ -1470,6 +1475,11 @@ def _extract_proxy_body(resp) -> dict:
         out["files_updated"] = data["files_updated"]
     # v7.1 订单类型订正的回执（与上面同一条规矩：有才透传）
     for _k in ("order_type", "previous_order_type", "is_admin_print"):
+        if _k in data:
+            out[_k] = data[_k]
+    # v7.18 订单归属用户调整的回执（order_user）：新用户 / 新昵称 / 原用户 / 标记人与时刻
+    for _k in ("openid", "nickname", "previous_openid",
+               "manual_user_by", "manual_user_at"):
         if _k in data:
             out[_k] = data[_k]
     return out
@@ -2109,10 +2119,15 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         ok = bool(result.get("success")) if isinstance(result, dict) else False
         body = payload if isinstance(payload, dict) else {}
         try:
-            if target_path.endswith("/order_status") or target_path.endswith("/order_type"):
+            _is_user = target_path.endswith("/order_user")
+            if (target_path.endswith("/order_status")
+                    or target_path.endswith("/order_type") or _is_user):
                 is_status = target_path.endswith("/order_status")
-                field = "status" if is_status else "order_type"
-                before = result.get("previous_status" if is_status else "previous_order_type")
+                field = ("openid" if _is_user
+                         else ("status" if is_status else "order_type"))
+                before = result.get(("previous_openid" if _is_user
+                                     else ("previous_status" if is_status
+                                           else "previous_order_type")))
                 sec.audit("order_fix", module="orderstatus",
                           fields={"order_id": body.get("order_id"), field: body.get(field),
                                   "before": before},

@@ -209,9 +209,22 @@ try:
     check("  字段缺失时不凭空补（「有才透传」，沿用既有白名单语义）",
           not any(k in _min for k in ("order_id", "status", "previous_status", "files_updated")),
           str(_min))
-    _leak = _ss._extract_proxy_body(_FakeResp({"success": True, "token": "secret", "openid": "x"}))
+    # v7.18 起 openid/nickname/previous_openid/manual_user_* 是 /api/admin/order_user 的
+    # 正式回执字段（用户列改归属），不能再拿 openid 当「白名单外」的探针 —— 换成确实
+    # 不属于任何回执的字段，判据仍是「透传是白名单制、不退化成整体透传」。
+    _leak = _ss._extract_proxy_body(_FakeResp({"success": True, "token": "secret",
+                                               "avatar_url": "x"}))
     check("  白名单外字段仍被剥掉（没有退化成整体透传）",
-          "token" not in _leak and "openid" not in _leak, str(_leak))
+          "token" not in _leak and "avatar_url" not in _leak, str(_leak))
+    _ou = _ss._extract_proxy_body(_FakeResp({"success": True, "order_id": "7", "openid": "o1",
+                                             "nickname": "张三", "previous_openid": "o2",
+                                             "manual_user_by": "李四",
+                                             "manual_user_at": "2026-11-09 10:00:00"}))
+    check("★ v7.18 用户改归属回执透传（openid/nickname/previous_openid/manual_user_*）",
+          _ou.get("openid") == "o1" and _ou.get("nickname") == "张三"
+          and _ou.get("previous_openid") == "o2"
+          and _ou.get("manual_user_by") == "李四"
+          and _ou.get("manual_user_at") == "2026-11-09 10:00:00", str(_ou))
     _err = _ss._extract_proxy_body(_FakeResp(RuntimeError("boom"), 502))
     check("  非 JSON 响应仍转通用错误且带上 HTTP 码（错误路径零回归）",
           _err.get("success") is False and "502" in (_err.get("message") or ""), str(_err))

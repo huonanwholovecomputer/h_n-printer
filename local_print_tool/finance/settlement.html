@@ -4440,7 +4440,7 @@ var ORDER_COL_DEVICE = { min: 200, full: 320 };
    所以类型列宽度、腾出宽度与表 min-width 的口径一字未动（tests/verify_order_table_columns.mjs 的
    FIXED_W 仍成立），只是把宽度从「装数字的列」挪给了「装 4 个字标签的列」。 */
 var ORDER_FIXED_COLS = [
-  ['', 34], ['订单号', 140], ['来源', 88], ['用户', 104], ['状态', 84, 'status'],
+  ['', 34], ['订单号', 140], ['来源', 88], ['用户', 104, 'user'], ['状态', 84, 'status'],
   ['金额', 88], ['文件', 56], ['页数', 82], ['张数', 80]
 ];
 var ORDER_FIXED_W = ORDER_FIXED_COLS.reduce(function (a, c) { return a + c[1]; }, 0);
@@ -4640,9 +4640,10 @@ function _orderStatusLockHTML() {
    任一边解锁两边一起变 🔓、再点任一边两边一起锁定。锁按钮自己只负责翻转这一份状态。 */
 function toggleOrderStatusLock() {
   if (unlocked.orderstatus) {
-    unlocked.orderstatus = false;      // 解锁 → 锁定：箭头与菜单一起收起（两列都收）
+    unlocked.orderstatus = false;      // 解锁 → 锁定：箭头与菜单一起收起（三列都收）
     closeOrderStatusMenu();
     closeOrderTypeMenu();
+    closeOrderUserMenu();
     toast('🔒 订单状态/类型订正已锁定');
     _rerenderOrdersOnly();
     return;
@@ -4683,6 +4684,7 @@ function closeOrderTypeMenu() {
 /* 类型选择菜单：只列接单/自打两种（与后端 MANUAL_FIX_ORDER_TYPES 同源） */
 function openOrderTypeMenu(ev, oid) {
   if (ev && ev.stopPropagation) ev.stopPropagation();
+  closeOrderUserMenu();
   /* 与状态列同一套行为：同一单的菜单已开着 → 再点收起 */
   var same = document.getElementById('tyMenu');
   if (same && same.getAttribute('data-oid') === String(oid)) {
@@ -4771,12 +4773,156 @@ function _findCloudOrder(oid) {
   }
   return null;
 }
+/* ==================== v7.18：订单「用户」列调整归属（与「状态」同一把锁） ====================
+   用户要求（2026-11-09）：用户列照状态列的做法加锁 + 可改，快捷把这一单转给另一位用户。
+   与状态/类型订正的差别：这里改的是订单**归属**（orders.openid），小程序 / APP 的「我的订单」
+   跟着变；状态、来源、打印作业、子任务一律不碰（后端 /api/admin/order_user 同此口径）。
+   本地单与外部监视单没有云端归属，保持只读。 */
+function _orderUserEditable(oidS) {
+  if (FINANCE_MODE === 'local' || !unlocked.orderstatus || !oidS) return false;
+  if (_isExternalOrder(oidS)) return false;
+  if (!/^[0-9]+$/.test(String(oidS))) return false;
+  var o = _findCloudOrder(oidS);
+  return !!(o && o.openid && o.openid !== 'local');
+}
+function _orderUserLockHTML() {
+  if (FINANCE_MODE === 'local') return '';
+  var on = !!unlocked.orderstatus;
+  return ' <button type="button" class="st-lock' + (on ? ' on' : '') + '"' +
+    ' title="' + (on ? '订单用户已解锁（与「状态」共用这把锁），点击锁定'
+                    : '订单用户已锁定；点击输入密码解锁后，可调整这一单所属用户') + '"' +
+    ' onclick="event.stopPropagation();toggleOrderStatusLock()">' + (on ? '🔓' : '🔒') + '</button>';
+}
+/* 候选名单 = 当前用户（置顶、标「✓ 当前」）+ 云端随 revenue 下发的真实用户（排除设备账号）。
+   当前用户不在名单里（例如已移除账号）也要能看见自己，所以先 unshift 再补池子。 */
+function _orderUserCandidates(o) {
+  var list = [];
+  var seen = {};
+  var cur = (o && o.openid) ? String(o.openid) : '';
+  var pool = (_cloudData && _cloudData.assignable_users) || [];
+  if (cur) {
+    list.push({ openid: cur, nickname: (o && o.nickname) || '', cur: true });
+    seen[cur] = true;
+  }
+  pool.forEach(function (u) {
+    var k = (u && u.openid) ? String(u.openid) : '';
+    if (!k || seen[k]) return;
+    seen[k] = true;
+    list.push({ openid: k, nickname: u.nickname || '', cur: false });
+  });
+  return list;
+}
+function closeOrderUserMenu() {
+  var m = document.getElementById('usMenu');
+  if (m) m.remove();
+  document.removeEventListener('click', _stMenuOutside);
+}
+/* 用户选择菜单：openid 不拼进 HTML（只传序号），避免昵称/ID 里的引号破坏内联事件 */
+function openOrderUserMenu(ev, oid) {
+  if (ev && ev.stopPropagation) ev.stopPropagation();
+  var same = document.getElementById('usMenu');
+  if (same && same.getAttribute('data-oid') === String(oid)) {
+    closeOrderUserMenu();
+    return;
+  }
+  closeOrderStatusMenu();
+  closeOrderTypeMenu();
+  closeOrderUserMenu();
+  if (!_orderUserEditable(oid)) {
+    if (FINANCE_MODE === 'local') toast('❌ 本地模式下不支持调整订单用户', 'error');
+    else toast(oid ? '🔒 请先解锁订单状态/类型订正' : '❌ 订单 id 不合法', 'error');
+    return;
+  }
+  var o = _findCloudOrder(oid);
+  if (!o) return;
+  var list = _orderUserCandidates(o);
+  if (list.length <= 1) {
+    toast('ℹ️ 暂无可调整的用户（用户表里还没有其他可用账号）');
+    return;
+  }
+  var anchor = (ev && ev.currentTarget) || (ev && ev.target) || null;
+  var m = document.createElement('div');
+  m.className = 'st-menu';
+  m.id = 'usMenu';
+  m.setAttribute('data-oid', String(oid));   /* toggle 判据：同一单再点就收起 */
+  var html = '';
+  var limit = Math.min(list.length, 200);
+  for (var i = 0; i < limit; i++) {
+    var u = list[i];
+    var label = u.nickname || (u.openid ? String(u.openid).substring(0, 8) + '…' : '未命名');
+    html += '<button type="button" class="st-menu-item' + (u.cur ? ' cur' : '') + '"' +
+      (u.cur ? ' disabled' : '') +
+      ' onclick="applyOrderUser(\'' + esc(String(oid)) + '\',' + i + ')">' +
+      '<span class="ell" style="max-width:150px">' + esc(label) + '</span>' +
+      (u.cur ? '<span class="st-menu-cur">✓ 当前</span>' : '') + '</button>';
+  }
+  if (list.length > limit) {
+    html += '<div class="st-menu-cur" style="padding:6px 8px">仅显示前 ' + limit + ' 位用户</div>';
+  }
+  m.innerHTML = html;
+  m.style.maxHeight = '320px';
+  m.style.overflowY = 'auto';
+  document.body.appendChild(m);
+  var r = (anchor && anchor.getBoundingClientRect) ? anchor.getBoundingClientRect()
+                                                   : { left: 20, top: 60, bottom: 80 };
+  var mw = m.offsetWidth, mh = m.offsetHeight;
+  var left = Math.max(8, Math.min(r.left, (window.innerWidth || 1024) - mw - 8));
+  var top = r.bottom + 6;
+  if (top + mh > (window.innerHeight || 768) - 8) top = Math.max(8, r.top - mh - 6);
+  m.style.left = left + 'px';
+  m.style.top = top + 'px';
+  /* 本轮点击不再触发「点外部关闭」（延后一拍注册监听） */
+  setTimeout(function () { document.addEventListener('click', _stMenuOutside); }, 0);
+}
+var _orderUserSaving = false;
+/* 提交：只改归属；成功后本地改 openid/nickname/manual_user_* 并整页重绘（成员归组、
+   by_user、成员胶囊一起按新归属重算），失败什么都不改。 */
+function applyOrderUser(oid, idx) {
+  closeOrderUserMenu();
+  if (!_orderUserEditable(oid) || _orderUserSaving) return;
+  var o = _findCloudOrder(oid);
+  if (!o) return;
+  var list = _orderUserCandidates(o);
+  var pick = list[idx];
+  if (!pick || pick.cur) return;
+  _orderUserSaving = true;
+  var by = _manualStatusBy();
+  fetch('/api/proxy/admin/order_user', {
+    method: 'POST',
+    headers: apiHeaders(),
+    body: JSON.stringify({ order_id: String(oid), openid: pick.openid, by: by })
+  }).then(function (r) { return r.json(); }).then(function (res) {
+    _orderUserSaving = false;
+    if (!(res && res.success) && _writeAuthProblem(res)) return;
+    if (!res || !res.success) {
+      toast('❌ ' + ((res && res.message) || '调整失败，订单归属未改动'), 'error', true);
+      return;
+    }
+    o.openid = res.openid || pick.openid;
+    o.nickname = (res.nickname != null ? res.nickname : pick.nickname) || '';
+    if (by) {
+      o.manual_user_by = res.manual_user_by || by;
+      o.manual_user_at = res.manual_user_at || _nowStamp();
+    }
+    _scopeCache = {};
+    invalidateUsage();
+    toast('✅ 订单 ' + (o.order_number || ('#' + oid)) + ' 已转给「' +
+          (o.nickname || pick.nickname || String(o.openid).substring(0, 8)) + '」', 'success');
+    renderCloud();
+    _scrollToOffset('cloud-orders');
+  }).catch(function () {
+    _orderUserSaving = false;
+    toast('❌ 网络错误，订单归属未改动', 'error', true);
+  });
+}
 function _stMenuOutside(e) {
-  // 一把锁 / 两个菜单：点外部时各自判断（关掉状态菜单不应顺手改类型菜单的可见性反之亦然）
+  // 一把锁 / 三个菜单：点外部时各自判断（关掉状态菜单不应顺手改别的菜单的可见性，反之亦然）
   var m = document.getElementById('stMenu');
   if (m && e.target !== m && !m.contains(e.target)) closeOrderStatusMenu();
   var tm = document.getElementById('tyMenu');
   if (tm && e.target !== tm && !tm.contains(e.target)) closeOrderTypeMenu();
+  var um = document.getElementById('usMenu');
+  if (um && e.target !== um && !um.contains(e.target)) closeOrderUserMenu();
 }
 function closeOrderStatusMenu() {
   var m = document.getElementById('stMenu');
@@ -4789,6 +4935,7 @@ function closeOrderStatusMenu() {
    也不该有订正入口）。真正拦住写请求的是 applyOrderStatus，这里是同一道闸门的前置。 */
 function openOrderStatusMenu(ev, oid) {
   if (ev && ev.stopPropagation) ev.stopPropagation();
+  closeOrderUserMenu();
   /* 同一单的菜单已经开着 → 再点一次 = 收起（toggle）。
      旧写法每次都先 close 再 open，点同一个标签永远只是重开，用户没法"点一下关掉"。 */
   var same = document.getElementById('stMenu');
@@ -5035,7 +5182,8 @@ function _ordersPagerHTML(cur, totalPages, total, top) {
 }
 /* 订单明细完整区块（h2 + 状态筛选 + 分页 + 表格），renderCloud 与局部刷新共用 */
 function _renderOrderListHTML() {
-  closeOrderStatusMenu();   // 重绘即收起状态选择菜单（菜单挂在 body 上，不随本区块一起被替换）
+  closeOrderStatusMenu();
+  closeOrderUserMenu();   // 重绘即收起状态选择菜单（菜单挂在 body 上，不随本区块一起被替换）
   var listOrders = _currentOrderList();
   var total = listOrders.length;
   var totalPages = Math.max(1, Math.ceil(total / _ordersPerPage));
@@ -5076,7 +5224,8 @@ function _renderOrderListHTML() {
        「状态」列表头额外挂订单状态订正的锁定开关（v7.0，默认 🔒） */
     var hcols = ORDER_FIXED_COLS.map(function (c) {
       return '<th style="width:' + c[1] + 'px">' + c[0] +
-        (c[2] === 'status' ? _orderStatusLockHTML() : '') + '</th>';
+        (c[2] === 'status' ? _orderStatusLockHTML() : '') +
+        (c[2] === 'user' ? _orderUserLockHTML() : '') + '</th>';
     }).join('');
     hcols += '<th style="width:' + colW.type + 'px">类型' + _orderTypeLockHTML() +
              '</th><th style="width:' + colW.time + 'px">时间</th>' +
@@ -5150,7 +5299,19 @@ function _renderOrderListHTML() {
       h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
       h += '<td style="white-space:nowrap"><span class="' + srcCls + '"' +
         (srcTip ? ' title="' + srcTip + '"' : '') + '>' + srcTxt + '</span></td>';
-      h += '<td class="l ell" title="' + esc(who) + (addr ? ' · ' + esc(addr) : '') + '">' + (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who)) + '</td>';
+      /* v7.18：用户列与状态列同一把锁 —— 锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头，
+         点开即选另一位用户（改的是订单归属 orders.openid，小程序/APP「我的订单」跟着变）。
+         本地单与外部监视单没有云端归属，保持只读。 */
+      var _userTag = (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who));
+      var _userTip = esc(who) + (addr ? ' · ' + esc(addr) : '');
+      if (o.manual_user_by) {
+        _userTip += ' · ' + esc(o.manual_user_by) + '于' +
+          esc(_fmtStamp(o.manual_user_at) || '未知时间') + '调整归属';
+      }
+      h += '<td class="l ell" title="' + _userTip + '">' + (_orderUserEditable(oidS)
+        ? '<span class="st-edit can" title="点击调整所属用户" onclick="event.stopPropagation();openOrderUserMenu(event,\'' + oidS + '\')">' +
+            _userTag + '<button type="button" class="st-caret" tabindex="-1">▾</button></span>'
+        : _userTag) + '</td>';
       /* 状态列：锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头，点开即选终态（v7.0）。
          点状态标签时要拦住行点击（否则会同时展开文件明细）。 */
       var _stTag = '<span class="tag ' + esc(statusClass(o.status)) + '" title="' + esc(_statusTip(o, o.status)) + '">' + esc(statusLabel(o.status)) + '</span>';
@@ -8741,7 +8902,9 @@ function renderSettings() {
     if (k === 'orderstatus') {
       h += '<div style="margin:-2px 0 8px 2px;font-size:.76rem;color:var(--muted)">' +
            '这一把密码同时管订单明细的<b>「状态」</b>与<b>「类型」</b>两把锁：在任意一列解锁，另一列同时解锁；' +
-           '类型只允许在「🤝接单 / 👤自打」之间订正（自打不计入收益）。</div>';
+           '类型只允许在「🤝接单 / 👤自打」之间订正（自打不计入收益）。' +
+           '订单「用户」列也归这把密码管：解锁后点用户标签即可改这一单的归属，' +
+           '小程序 / APP 的「我的订单」会跟着变；它不改状态、来源与打印作业，本地单与外部监视单没有此入口。</div>';
     }
     if (k === 'orderprinter') {
       h += '<div style="margin:-2px 0 8px 2px;font-size:.76rem;color:var(--muted)">' +
@@ -10096,6 +10259,14 @@ function renderAbout() {
     + '「按用量分摊」的权重仍是出纸<b>页数</b>，不因废纸改变。'
     + '⑤ 为了让预估拿得到「失败 / 放弃打印 / 已取消」的订单，用量接口改为按全部状态取数后在前端分口径统计'
     + '（正常用量仍只算真正出纸的完成单，与旧口径一致）。</p>' +
+    '<p style="margin-top:10px">v7.18：<b>订单「用户」列可改归属</b> —— '
+    + '① 「收支清算」订单明细的「用户」表头新增 🔒 开关，与「状态 / 类型」共用同一个密码：'
+    + '解锁后点一位用户的标签，从名单里选另一位用户，即可把这一单转给他；'
+    + '改完小程序 / APP 的「我的订单」立即跟着变。'
+    + '② 这一操作只改<b>订单归属</b>：不碰订单状态、不碰打印作业，也不改文件的上传者记录'
+    + '（保留期配额仍按上传者算）。'
+    + '③ 只能转给服务器上真实存在的用户；本地任务与外部监视订单没有云端归属，保持只读。'
+    + '④ 每次调整都会记下操作人与时间，鼠标悬停用户标签即可看到。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
