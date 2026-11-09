@@ -39,6 +39,9 @@ Excel 的「选定区域」是会话内的临时状态、不存进文件，无�
 从 `selection` 键取值，写 `PageSetup.PrintArea`；地址为空/不合法时**不写 PrintArea**、
 记 warning 并把该项记为未生效（`options_honored=False`），绝不拿 UsedRange 顶替，也不清掉
 文件自带的打印区域。`selection` 里写明了工作表、`worksheet` 又没选时，按前者的表导出。
+地址框**预填**什么由调用方决定：GUI 面板在框为空时用 `default_selection_area(文件, 表名)`
+取文件自己的默认区域（打印区域 → 已用区域 → 上次保存的选区）填进去，让人能直接打或顺手改。
+那只是**建议值**，落不落进 `PageSetup.PrintArea` 仍只看 `selection` 键 —— 本模块不猜当前选区。
 `print_range="workbook"` 是唯一会用 `Workbook.ExportAsFixedFormat` 导全部工作表的取值
 （默认仍是「活动工作表」，见下）。
 
@@ -79,6 +82,7 @@ import hashlib
 import json
 import logging
 import os
+import posixpath
 import re
 import shutil
 import tempfile
@@ -631,6 +635,249 @@ def describe_print_options(options: dict | None) -> str:
         f"{options.get('footer_cm')!s}cm，{fit_text}，打印范围={range_text}"
         f"{sheet_text}"
     )
+
+
+# ============================================================
+# 文件「默认选定区域」地址（GUI 地址框预填用；只解 zip，不启动 Office）
+# ============================================================
+
+# 用户 2026-11-07 需求：打印范围切到「选定区域」时，地址框不能是空白 —— 要显示这个表格文件
+# 默认的区域，让人能直接按它打、也能在它上面改。和 `list_worksheet_names` 同一个理由：面板
+# 要即时响应，绝不能为了一次预填去起 Excel/WPS 实例（几秒起，还会抢用户的文档）。
+#
+# 读法（按可信度排序，逐级回退）：
+#   ① 文件自带的打印区域 definedName `_xlnm.Print_Area`（按 localSheetId 对上目标表）——
+#      这是文件作者亲手划定的「要打印的那块」，最接近"文档默认的选定区域"；
+#   ② 工作表 XML 的 `<dimension ref="A1:F20">`——Excel/WPS 保存时都会写，即「已用区域」；
+#   ③ sheetViews 里最后保存的选区 `<selection sqref="A1:F20">`（前两级都读不出时兜底）。
+# 三条都只读文件、不改文件；读不出（.xls 老格式 / 加密 / 残缺包 / 空表）返回 ""，面板保持
+# 空白 —— **引擎口径一点没变**：地址为空就不写 PrintArea、记为未生效、绝不拿 UsedRange 顶替。
+# 本函数只负责把建议值显示出来，是否真的写进 PageSetup 仍由 print_options["selection"] 决定。
+_DEFAULT_AREA_CACHE: dict = {}
+_DEFAULT_AREA_LOCK = threading.Lock()
+_DEFAULT_AREA_CACHE_MAX = 64
+_SHEET_XML_MAX_BYTES = 16 * 1024 * 1024   # 单张工作表 XML 正常几十~几百 KB；超限当异常文件
+
+
+def _read_package_xml(zf: "zipfile.ZipFile", name: str, max_bytes: int):
+    """读包内一个 XML 部件 → 根节点；不存在/过大/解析失败 ⇒ None（记 debug，不抛）。"""
+    try:
+        info = zf.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > max_bytes:
+        logger.debug(f"读默认区域：{name} 过大（{info.file_size} 字节），跳过")
+        return None
+    try:
+        return ElementTree.fromstring(zf.read(name))
+    except (ElementTree.ParseError, OSError, RuntimeError) as e:
+        logger.debug(f"读默认区域：解析 {name} 失败: {e}")
+        return None
+
+
+def _local_tag(el) -> str:
+    """元素/属性的本地名（去掉 `{namespace}` 前缀）。"""
+    tag = getattr(el, "tag", "")
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _split_area_list(text) -> "list[str]":
+    """按**引号感知**的逗号拆多块区域：`'a,b'!A1:B2,C3:D4` → ["'a,b'!A1:B2", "C3:D4"]。"""
+    parts: "list[str]" = []
+    buf: "list[str]" = []
+    quoted = False
+    for ch in str(text or ""):
+        if ch == "'":
+            quoted = not quoted
+            buf.append(ch)
+        elif ch == "," and not quoted:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _clean_area_text(raw) -> str:
+    """Excel 写法的区域 → 输入框里的写法（`$A$1:$F$20` → `A1:F20`）；取不出合法地址 ⇒ ""。
+
+    绝对引用符号 `$` 在「打印区域」语境里没有意义，去掉更好读也更好改；多块区域用逗号连。
+    """
+    addrs: "list[str]" = []
+    for part in _split_area_list(raw):
+        _sheet, addr = split_selection_ref(part)
+        addr = str(addr or "").replace("$", "").strip()
+        if addr:
+            addrs.append(addr)
+    text = ",".join(addrs)
+    return text if is_selection_address(text) else ""
+
+
+def _workbook_sheet_index(zf: "zipfile.ZipFile", wb) -> "list[tuple[str, str]]":
+    """workbook.xml（+ 它的 rels）→ [(工作表名, 包内 XML 路径)]，顺序与 Excel 标签一致。"""
+    rels: "dict[str, str]" = {}
+    rel_root = _read_package_xml(zf, "xl/_rels/workbook.xml.rels", _WORKBOOK_XML_MAX_BYTES)
+    if rel_root is not None:
+        for el in rel_root.iter():
+            if _local_tag(el) != "Relationship":
+                continue
+            rid = str(el.get("Id") or "")
+            target = str(el.get("Target") or "")
+            if not rid or not target:
+                continue
+            path = target if target.startswith("/") else "/xl/" + target
+            rels[rid] = posixpath.normpath(path).lstrip("/")
+    sheets: "list[tuple[str, str]]" = []
+    for el in wb.iter():
+        if _local_tag(el) != "sheet":
+            continue
+        name = str(el.get("name") or "")
+        rid = ""
+        for key, value in el.attrib.items():
+            if str(key).rsplit("}", 1)[-1] == "id":      # r:id（relationships 命名空间）
+                rid = str(value or "")
+                break
+        sheets.append((name, rels.get(rid, "")))
+    return sheets
+
+
+def _active_sheet_index(wb) -> int:
+    """文件上次保存的活动工作表下标（workbookView/@activeTab）；读不出 ⇒ 0。"""
+    for el in wb.iter():
+        if _local_tag(el) == "workbookView":
+            try:
+                return max(0, int(el.get("activeTab") or 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _print_area_by_sheet(wb) -> "tuple[dict[int, str], str]":
+    """workbook.xml 里的打印区域定义 → ({工作表下标: 区域原文}, 工作簿级区域原文)。"""
+    per_sheet: "dict[int, str]" = {}
+    workbook_wide = ""
+    for el in wb.iter():
+        if _local_tag(el) != "definedName":
+            continue
+        name = str(el.get("name") or "").strip()
+        if not name.lower().replace("_xlnm.", "").endswith("print_area"):
+            continue
+        value = "".join(el.itertext()).strip()
+        if not value:
+            continue
+        scope = el.get("localSheetId")
+        try:
+            idx = int(scope) if scope not in (None, "") else -1
+        except (TypeError, ValueError):
+            idx = -1
+        if idx < 0:
+            workbook_wide = workbook_wide or value
+        else:
+            per_sheet.setdefault(idx, value)     # 同表多条定义时取第一条（Excel 也只用一条）
+    return per_sheet, workbook_wide
+
+
+def _print_area_text(value, target_name: str) -> str:
+    """打印区域原文 → 输入框写法；区域写的是**别的表**（跨表定义）就宁可不填。"""
+    kept: "list[str]" = []
+    for part in _split_area_list(value):
+        sheet, addr = split_selection_ref(part)
+        if sheet and target_name and sheet.strip().casefold() != target_name.strip().casefold():
+            logger.debug(f"读默认区域：打印区域写在别的表上（{sheet!r}），忽略")
+            return ""
+        clean = _clean_area_text(addr)
+        if not clean:
+            return ""
+        kept.append(clean)
+    return ",".join(kept)
+
+
+def _sheet_default_area(zf: "zipfile.ZipFile", sheet_path: str) -> str:
+    """工作表 XML 里的「已用区域」(dimension) 或最后保存的选区 (selection/@sqref)。"""
+    if not sheet_path:
+        return ""
+    root = _read_package_xml(zf, sheet_path, _SHEET_XML_MAX_BYTES)
+    if root is None:
+        return ""
+    dim = ""
+    for el in root.iter():
+        if _local_tag(el) == "dimension":
+            dim = _clean_area_text(el.get("ref"))
+            if dim:                     # dimension 在 XML 最前面，命中就不必再扫
+                return dim
+    for el in root.iter():
+        if _local_tag(el) == "selection":
+            sqref = _clean_area_text(str(el.get("sqref") or "").replace(" ", ","))
+            if sqref:
+                return sqref
+    return ""
+
+
+def _resolve_default_area(zf: "zipfile.ZipFile", wb, worksheet: str) -> str:
+    """打印区域 → 已用区域 → 保存的选区；目标表取 worksheet，找不到就跟活动表。"""
+    sheets = _workbook_sheet_index(zf, wb)
+    if not sheets:
+        return ""
+    names = [name for name, _path in sheets]
+    wanted = str(worksheet or "").strip()
+    target = -1
+    if wanted:
+        for i, name in enumerate(names):
+            if name == wanted:
+                target = i
+                break
+    if target < 0:                       # 没指定 / 表名对不上（改名、删表）⇒ 跟活动表
+        target = _active_sheet_index(wb)
+    target = max(0, min(target, len(sheets) - 1))
+    per_sheet, workbook_wide = _print_area_by_sheet(wb)
+    area = _print_area_text(per_sheet.get(target) or workbook_wide, names[target])
+    if area:
+        return area
+    return _sheet_default_area(zf, sheets[target][1])
+
+
+def default_selection_area(file_path: str, worksheet: str = "") -> str:
+    """这个表格文件「默认的选定区域」地址（A1 写法，如 `A1:F20`）；读不出 ⇒ ""。
+
+    给 GUI 的「选定区域」输入框预填用（2026-11-07 用户要求：切到该档不许还空着）。只解 zip、
+    不启动任何 Office 实例，毫秒级；结果按 (路径, mtime, 大小, 表名) 缓存 64 条，同一份文件
+    反复切换打印范围不会重复解析。`.xls` 老格式不是 zip ⇒ 返回 ""（填不了，但引擎照旧能用
+    用户手填的地址）。
+
+    优先级：文件自带打印区域 → 工作表已用区域(dimension) → 上次保存的选区(sqref) → ""。
+    返回值可能与文件的**实际分页**不完全一致（打印区域只是声明，单元格里可以有内容在区域外），
+    所以它只是预填值：用户看一眼就能改成想要的范围，引擎也只在 selection 键非空时才写
+    PageSetup.PrintArea。
+    """
+    path = str(file_path or "")
+    if not path or not is_xlsx(path) or not os.path.isfile(path):
+        return ""
+    try:
+        stat = os.stat(path)
+        key = (os.path.abspath(path), int(getattr(stat, "st_mtime_ns", 0)),
+               int(stat.st_size), str(worksheet or ""))
+    except OSError as e:
+        logger.debug(f"读默认区域：取文件信息失败 {path}: {e}")
+        return ""
+    with _DEFAULT_AREA_LOCK:
+        if key in _DEFAULT_AREA_CACHE:
+            return _DEFAULT_AREA_CACHE[key]
+    value = ""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            wb = _read_package_xml(zf, "xl/workbook.xml", _WORKBOOK_XML_MAX_BYTES)
+            if wb is not None:
+                value = _resolve_default_area(zf, wb, worksheet)
+    except (OSError, zipfile.BadZipFile) as e:
+        logger.debug(f"读默认区域失败（{os.path.basename(path)}）: {e}")
+    except Exception as e:                                     # noqa: BLE001
+        logger.debug(f"读默认区域异常（{os.path.basename(path)}）: {e}")
+    with _DEFAULT_AREA_LOCK:
+        if len(_DEFAULT_AREA_CACHE) >= _DEFAULT_AREA_CACHE_MAX:
+            _DEFAULT_AREA_CACHE.clear()   # 与工作表名缓存同口径：条目极少，整批丢更划算
+        _DEFAULT_AREA_CACHE[key] = value
+    return value
 
 
 # ============================================================

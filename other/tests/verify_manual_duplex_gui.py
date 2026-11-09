@@ -1323,6 +1323,70 @@ _dlg9._pass1_tick()
 check("冻结后再 tick 也不会继续走", _dlg9._pass1.text() == _frozen_text)
 _dlg9._elapsed_sec = _elapsed9_orig
 
+# ── ★ 纯时间放行（2026-11-09 现场：4 文件 8 张纸，31 秒时按钮仍「等待第 1 趟打完」）──────
+# 用户口径第三次重申：打印机回报的"打完"不可信，第 2 趟按钮**只按时间预估**；
+# 回报只是"提前知道"，不是放行的前提。worker 的 flip_required 在整批渲染+送端口后才发，
+# 多文件批次里会晚于闸门 —— 那时窗口必须已经能点。
+_dlg_t = gui.ManualDuplexDialog()
+_dlg_t_evts = []
+_dlg_t.continue_requested.connect(lambda: _dlg_t_evts.append("go"))
+_dlg_t.set_speed_hint("启动 ≈8s + 每张 ≈5.6s · 基于最近 2 次实测")
+_dlg_t.announce("纯时间放行", sheets=8, estimate_sec=51.0)     # 闸门 = 25.5s，没收到任何回报
+_dlg_t._elapsed_sec = lambda: 26.0
+_dlg_t._pass1_tick()          # 界面自己数着闸门（真实运行时由 _pass1_timer 每 0.5 秒调）
+check("★ 没收到打印机回报、只到预估闸门时刻 → 按钮自己放行（不再等信号）",
+      _dlg_t._mode == "flip" and _dlg_t._btn_go.isEnabled()
+      and "按预估已到放行时刻" in _dlg_t._status.text()
+      and "已打完" not in _dlg_t._status.text(),
+      f"{_dlg_t._mode} | {_dlg_t._status.text()}")
+check("★ 纯时间放行的文案说实话（没回报就不谎称打完）+ 提示里写明不采信完成信号",
+      "没等到打印机的「打完」回报" in _dlg_t._pass1_hint.text()
+      or "不采信完成信号" in _dlg_t._pass1_hint.text(),
+      _dlg_t._pass1_hint.text().replace("\n", " / "))
+_dlg_t._pass1_tick()
+check("放行后继续 tick 不重复放行、计时冻结在闸门时刻（等权威值覆盖）",
+      _dlg_t._mode == "flip" and _dlg_t._pass1_done and _dlg_t._pass1_frozen_by_gate
+      and abs(_dlg_t._pass1_final - 26.0) < 0.01,
+      f"{_dlg_t._mode} {_dlg_t._pass1_final}")
+_dlg_t.freeze_pass1(51.0)
+check("★ 权威实测（程序侧 51 秒）到了覆盖闸门时刻冻结值（不能把 26 秒学进速度模型）",
+      abs(_dlg_t._pass1_final - 51.0) < 0.01 and not _dlg_t._pass1_frozen_by_gate
+      and "用时 00:51" in _dlg_t._pass1.text(), _dlg_t._pass1.text())
+_dlg_t.set_flippable("翻纸说明", 600)      # 迟到很久的回报
+check("★ 迟到的回报不改状态（窗口早已可点，不重复放行）",
+      _dlg_t._mode == "flip" and _dlg_t._btn_go.isEnabled() and _dlg_t_evts == [],
+      f"{_dlg_t._mode} {_dlg_t_evts}")
+_dlg_t._on_go()
+_dlg_t.set_flippable("更迟的回报", 600)
+check("★ 已点继续（第 2 趟打印中）后再来回报 → 绝不把窗口拉回可翻纸（否则第 2 趟打两遍）",
+      _dlg_t._mode == "pass2" and _dlg_t_evts == ["go"],
+      f"{_dlg_t._mode} {_dlg_t_evts}")
+
+# 信号比闸门早到 → 仍按闸门等（不提前放行），到点后文案才说"已打完"
+_dlg_early = gui.ManualDuplexDialog()
+_dlg_early.announce("早回报", sheets=16, estimate_sec=43.0)
+_dlg_early.set_flippable("翻纸说明", 600)
+check("信号早到 → 进闸门等待（按钮仍禁用，绝不提前翻）",
+      _dlg_early._mode == "flip_gate" and not _dlg_early._btn_go.isEnabled(),
+      _dlg_early._mode)
+_dlg_early._elapsed_sec = lambda: 43.5
+_dlg_early._tick()
+check("闸门到点 + 回报已到 → 文案是「第 1 趟已打完」",
+      _dlg_early._mode == "flip" and "已打完" in _dlg_early._status.text(),
+      _dlg_early._status.text())
+
+# 超大批次：闸门按 worker 默认等待上限（600s）钳制，信号没到也一样
+_dlg_big = gui.ManualDuplexDialog()
+_dlg_big.announce("超大批次没靠回报", sheets=400, estimate_sec=1200.0)
+check("★ 没收到回报也能算出闸门，且钳在 worker 等待上限内（600s）",
+      abs(_dlg_big._flip_gate_for_now() - 600.0) < 0.01,
+      f"{_dlg_big._flip_gate_for_now()}")
+_dlg_big._elapsed_sec = lambda: 601.0
+_dlg_big._pass1_tick()
+check("★ 超大批次到点也能纯时间放行（不靠 worker 那笔回报）",
+      _dlg_big._mode == "flip" and _dlg_big._btn_go.isEnabled(),
+      _dlg_big._mode)
+
 _dlg_huge = gui.ManualDuplexDialog()
 _dlg_huge.announce("超大批次", sheets=400, estimate_sec=1200.0)
 _dlg_huge.set_flippable("翻纸说明", 600)

@@ -17,6 +17,7 @@ import io
 import os
 import sys
 import tempfile
+import zipfile
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace",
                               line_buffering=True)
@@ -372,6 +373,167 @@ _shrink_panel_to_min()
 check("变异自证：最小宽度调小 30px 时横向滚动条确实会出现",
       _mutated_hbar and not _edit_sw.horizontalScrollBar().isVisible(),
       f"调小后 hbar={_mutated_hbar}，恢复后 hbar={_edit_sw.horizontalScrollBar().isVisible()}")
+
+
+print("\n=== ⑪ 「选定区域」空框预填文件默认区域（2026-11-07 用户要求） ===")
+# 用户原话：「选择选定区域时，出现的选定区域输入框中需要显示当前 Excel 文档默认的选定
+# 区域是什么，而不是空白。」⇒ 切到第 4 档且地址框为空时，用文件自己的区域填上：
+# 打印区域 → 已用区域(dimension) → 上次保存的选区(sqref) → 读不出就仍然留空。
+_XLSX_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_BOOK_DIR = tempfile.mkdtemp(prefix="hn_xlsxpanel_prefill_")
+
+
+def _make_xlsx(path, sheets=("Sheet1",), areas=None, global_area="", dimension="", sqref=""):
+    """造一个最小 xlsx：workbook.xml(+rels) + 每个表一份 worksheet.xml（不启动 Excel）。
+
+    areas = {工作表下标: "区域原文"} → 写 `_xlnm.Print_Area`（带 localSheetId）；
+    dimension / sqref 只塞进第 1 张表（够覆盖预填的三级回退）。
+    """
+    rels = "".join(f'<Relationship Id="rId{i + 1}" Type="{_REL_NS}/worksheet" '
+                   f'Target="worksheets/sheet{i + 1}.xml"/>' for i in range(len(sheets)))
+    entries = "".join(f'<sheet name="{name}" sheetId="{i + 1}" r:id="rId{i + 1}"/>'
+                      for i, name in enumerate(sheets))
+    names = []
+    for idx, raw in (areas or {}).items():
+        names.append(f'<definedName name="_xlnm.Print_Area" localSheetId="{idx}">{raw}'
+                     f'</definedName>')
+    if global_area:
+        names.append(f'<definedName name="_xlnm.Print_Area">{global_area}</definedName>')
+    wb = ('<?xml version="1.0" encoding="UTF-8"?>'
+          f'<workbook xmlns="{_XLSX_NS}" xmlns:r="{_REL_NS}">'
+          '<workbookView activeTab="0"/>'
+          f'<sheets>{entries}</sheets>'
+          f'{"<definedNames>" + "".join(names) + "</definedNames>" if names else ""}'
+          '</workbook>')
+    rels_xml = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                f'relationships">{rels}</Relationships>')
+    dim = f'<dimension ref="{dimension}"/>' if dimension else ""
+    views = ('<sheetViews><sheetView workbookViewId="0">'
+             f'<selection sqref="{sqref}"/></sheetView></sheetViews>') if sqref else ""
+    body = ('<?xml version="1.0" encoding="UTF-8"?>'
+            f'<worksheet xmlns="{_XLSX_NS}">{dim}{views}<sheetData/></worksheet>')
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("xl/workbook.xml", wb)
+        z.writestr("xl/_rels/workbook.xml.rels", rels_xml)
+        for i in range(len(sheets)):
+            z.writestr(f"xl/worksheets/sheet{i + 1}.xml", body)
+    return path
+
+
+_book_area = _make_xlsx(os.path.join(_BOOK_DIR, "area.xlsx"),
+                        areas={0: "Sheet1!$A$1:$F$20"}, dimension="A1:Z99")
+check("预填①：文件自带打印区域优先于已用区域（`$` 去掉，`Sheet1!` 前缀剥掉）",
+      xp.default_selection_area(_book_area) == "A1:F20",
+      repr(xp.default_selection_area(_book_area)))
+
+_book_dim = _make_xlsx(os.path.join(_BOOK_DIR, "dim.xlsx"), dimension="A1:H50")
+check("预填②：没有打印区域 ⇒ 取已用区域（<dimension ref>）",
+      xp.default_selection_area(_book_dim) == "A1:H50",
+      repr(xp.default_selection_area(_book_dim)))
+
+_book_sq = _make_xlsx(os.path.join(_BOOK_DIR, "sq.xlsx"), sqref="B2:D9")
+check("预填③：连 dimension 都没有 ⇒ 取上次保存的选区（selection/@sqref）",
+      xp.default_selection_area(_book_sq) == "B2:D9",
+      repr(xp.default_selection_area(_book_sq)))
+
+_book_none = _make_xlsx(os.path.join(_BOOK_DIR, "none.xlsx"))
+check("预填④：三级都读不出 ⇒ 返回空（面板保持空白，绝不编一个地址出来）",
+      xp.default_selection_area(_book_none) == "",
+      repr(xp.default_selection_area(_book_none)))
+
+_book_multi = _make_xlsx(os.path.join(_BOOK_DIR, "multi.xlsx"),
+                         areas={0: "Sheet1!$A$1:$B$2,Sheet1!$D$1:$E$5"})
+check("预填⑤：多块打印区域用逗号连起来（引号感知拆分，不会切坏 'a,b'!A1）",
+      xp.default_selection_area(_book_multi) == "A1:B2,D1:E5",
+      repr(xp.default_selection_area(_book_multi)))
+
+_book_quoted = _make_xlsx(os.path.join(_BOOK_DIR, "quoted.xlsx"), sheets=("销售 报表",),
+                          areas={0: "'销售 报表'!$A$1:$C$3"})
+check("预填⑤b：带空格/引号的表名照样对得上（去引号后再比表名）",
+      xp.default_selection_area(_book_quoted, "销售 报表") == "A1:C3",
+      repr(xp.default_selection_area(_book_quoted, "销售 报表")))
+
+_xls_path = os.path.join(_BOOK_DIR, "old.xls")
+with open(_xls_path, "wb") as f:
+    f.write(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")     # .xls 的 OLE 魔数，不是 zip
+check("预填⑥：.xls 老格式解不了 zip ⇒ 返回空（引擎仍可用手填地址），且不抛异常",
+      xp.default_selection_area(_xls_path) == "",
+      repr(xp.default_selection_area(_xls_path)))
+
+_book_two = _make_xlsx(os.path.join(_BOOK_DIR, "two.xlsx"), sheets=("台账", "汇总"),
+                       areas={1: "汇总!$B$2:$C$9"}, dimension="A1:A9")
+check("预填⑦：打印区域按工作表区分（指定「汇总」⇒ 取它的打印区域）",
+      xp.default_selection_area(_book_two, "汇总") == "B2:C9",
+      repr(xp.default_selection_area(_book_two, "汇总")))
+check("预填⑦b：指定「台账」⇒ 取那张表的已用区域（不是别的表的打印区域）",
+      xp.default_selection_area(_book_two, "台账") == "A1:A9",
+      repr(xp.default_selection_area(_book_two, "台账")))
+check("预填⑦c：表名对不上（改名/删表）⇒ 跟随活动表，不抛异常",
+      xp.default_selection_area(_book_two, "早就删掉的老表") == "A1:A9",
+      repr(xp.default_selection_area(_book_two, "早就删掉的老表")))
+
+# —— 面板层：切到第 4 档只填空框，写回仍走 _auto_apply_edit ——
+win._set_current_jobs([PrintJob(file_path=_book_area, page_count=1)])
+win._rebuild_table()
+win._table.selectRow(0)
+win._on_table_selection()
+check("面包①：初始档位「活动工作表」+ 地址框为空（老口径，不动）",
+      win._xlsx_panel_shown is True
+      and win._xlsx_range.currentText() == "活动工作表"
+      and win._xlsx_selection.text() == "",
+      f"{win._xlsx_range.currentText()!r} / {win._xlsx_selection.text()!r}")
+win._xlsx_range.setCurrentText("选定区域")
+check("面包②：切到「选定区域」⇒ 地址框自动填成文件默认区域（不再是空白）",
+      win._xlsx_selection.text() == "A1:F20", repr(win._xlsx_selection.text()))
+check("面包③：预填的值与这一轮面板值一起写回任务（selection 落进 xlsx_options）",
+      (win._get_current_jobs()[0].xlsx_options or {}).get("selection") == "A1:F20",
+      repr(win._get_current_jobs()[0].xlsx_options))
+win._xlsx_selection.setText("B2:C3")
+win._xlsx_selection.editingFinished.emit()
+win._xlsx_range.setCurrentText("活动工作表")
+win._xlsx_range.setCurrentText("选定区域")
+check("面包④：用户/助手填过的地址不会被预填覆盖",
+      win._xlsx_selection.text() == "B2:C3"
+      and (win._get_current_jobs()[0].xlsx_options or {}).get("selection") == "B2:C3",
+      f"{win._xlsx_selection.text()!r} / "
+      f"{(win._get_current_jobs()[0].xlsx_options or {}).get('selection')!r}")
+
+win._set_current_jobs([PrintJob(file_path=_book_none, page_count=1)])
+win._rebuild_table()
+win._table.selectRow(0)
+win._on_table_selection()
+win._xlsx_range.setCurrentText("活动工作表")
+win._xlsx_selection.setText("")
+win._xlsx_range.setCurrentText("选定区域")
+check("面包⑤：文件里没有默认区域 ⇒ 仍然留空，且不往任务里写脏值",
+      win._xlsx_selection.text() == ""
+      and not (win._get_current_jobs()[0].xlsx_options or {}).get("selection"),
+      f"{win._xlsx_selection.text()!r} / "
+      f"{(win._get_current_jobs()[0].xlsx_options or {}).get('selection')!r}")
+
+win._set_current_jobs([PrintJob(file_path=_book_two, page_count=1)])
+win._rebuild_table()
+win._table.selectRow(0)
+win._on_table_selection()
+win._xlsx_range.setCurrentText("选定区域")     # 新任务的默认档位是「活动工作表」，先切到第 4 档
+win._xlsx_worksheet.blockSignals(True)
+win._xlsx_worksheet.setCurrentIndex(win._xlsx_worksheet.findData("汇总"))
+win._xlsx_worksheet.blockSignals(False)
+win._xlsx_selection.setText("")
+check("面包⑥：预填跟着「工作表」选择走（选了「汇总」就填它的打印区域）",
+      win._prefill_xlsx_selection() is True and win._xlsx_selection.text() == "B2:C9",
+      repr(win._xlsx_selection.text()))
+
+win._set_current_jobs([PrintJob(file_path=_book_area, page_count=1),
+                       PrintJob(file_path=r"C:\tmp\c.pdf", page_count=1)])
+win._rebuild_table()
+win._table.selectRow(1)                     # pdf
+win._on_table_selection()
+check("面包⑦：面板没显示（选区不是表格）时预填不动作、不抛异常",
+      win._xlsx_panel_shown is False and win._prefill_xlsx_selection() is False)
+win._xlsx_range.setCurrentText("活动工作表")
 
 
 win._cloud_client = None

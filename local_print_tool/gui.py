@@ -965,6 +965,7 @@ class ManualDuplexDialog(QDialog):
 
     continue_requested = Signal()   # 操作员确认已翻纸 → 继续第 2 趟
     skip_requested = Signal()       # 操作员跳过本任务（或超时/关窗）
+    flip_gate_opened = Signal()     # 闸门按**时间**到点放行（不依赖打印机的回报）→ 主窗把本窗立起来
     # ⚠ 本窗**只管单任务**手动双面。攒批（多任务合并翻纸）不走这个窗口：第 1 趟不弹窗、
     #   不计时，第 2 趟由「攒批列表」的「▶ 开始打印第 2 趟」+ 落机对账对话框发起
     #   （2026-10-20 用户要求：攒批第一趟弹这个窗、还从第一趟就开始计时，完全是复用旧窗导致的误伤）。
@@ -1037,6 +1038,7 @@ class ManualDuplexDialog(QDialog):
         self._pass1_est = 0.0
         self._pass1_final = 0.0
         self._pass1_done = False       # 用显式标志，别拿 0.0 当"还没冻结"（0 秒也是合法结果）
+        self._pass1_frozen_by_gate = False  # 这份冻结值是"闸门到点先记的"（等权威实测覆盖）
         self._pass1_timer = QTimer(self)
         self._pass1_timer.timeout.connect(self._pass1_tick)
 
@@ -1045,6 +1047,7 @@ class ManualDuplexDialog(QDialog):
         self._flip_gate_at = 0.0       # 闸门时刻（第 1 趟第几秒，0 = 无闸门）
         self._flip_text = ""           # 翻纸说明（闸门期间先存着，到点再铺到详情里）
         self._flip_timeout = 0         # 翻纸确认超时（同上）
+        self._flip_reported = False     # 打印机的"第 1 趟回报"到没到（只影响文案，不影响放行）
         # 放行策略（来自打印队列档案：「选项 → 打印速度…」可调）
         self._gate_ratio = self.FLIP_GATE_RATIO
         self._gate_extra = 0.0
@@ -1067,6 +1070,14 @@ class ManualDuplexDialog(QDialog):
     # 两个参数都进「选项 → 打印速度…」由操作员调（`PrinterProfile.gate_ratio/flip_ready_sec`）。
     FLIP_GATE_RATIO = 0.5         # 默认：预估完成 50% 后允许点「继续打第 2 趟」
     FLIP_GATE_MIN_SEC = 1.0       # 算出来 < 1 秒的闸门没有意义，直接放行
+    # ★ 2026-11-09 用户第三次重申（现场：4 文件 8 张纸，31 秒时按钮仍写「等待第 1 趟打完」）：
+    #   「打印机返回的打印完成状态在这个情况下并不可信……只考时间预估来控制这个第二趟按钮」。
+    #   本窗据此**自己按时间放行**（`_pass1_tick` → `_open_flip_gate(by_time=True)`），
+    #   worker 的 `flip_required` 只是"提前知道打完"，不是放行的前提。历史坑：69523ff 首版是
+    #   "收到回报立刻放行"；aa4cefe 加了闸门但**仍然要求先收到回报**，于是回报一迟到按钮就
+    #   永远灰着 —— 这个行为已经反复横跳两次，别再改回"信号驱动"。验收见
+    #   `other/tests/verify_manual_duplex_gui.py` 的「纯时间放行」段。
+    FLIP_WAIT_DEFAULT_SEC = 600   # worker 等翻纸回执的默认上限（PrintWorker.FLIP_TIMEOUT_SEC）
 
     @classmethod
     def flip_gate_at(cls, estimate: float, ratio: float | None = None,
@@ -1136,12 +1147,25 @@ class ManualDuplexDialog(QDialog):
         return head
 
     def _pass1_tick(self):
-        """每 0.5 秒刷新；第 1 趟已冻结（_pass1_done）就停在那里，不再继续走。"""
+        """每 0.5 秒刷新；第 1 趟已冻结（_pass1_done）就停在那里，不再继续走。
+
+        ★ 2026-11-09（用户第三次强调，见 `FLIP_GATE_RATIO` 上方注释）：第 2 趟按钮
+        **只按时间预估放行**，不能等打印机的完成信号。worker 的 `flip_required` 是在整批
+        第 1 趟**全部文件渲染+送端口**之后才发的（`_ask_operator_to_flip`），多文件批次里
+        它会落到「预估 50%」之后 —— 那时窗口停在「① 正在打印第 1 趟」、按钮永远是灰的
+        （现场：4 文件 8 张纸，31 秒 / 预估 51 秒，按钮仍写「等待第 1 趟打完」）。
+        所以这里自己数着闸门：mode=="pass1" 且已到放行时刻 ⇒ 直接放行；打印机的回报到了
+        只是「提前知道」，不是放行的前提。
+        """
         if self._mode == "waiting":
             return      # 等待上一个任务：本态计时器应当是停的，万一被 tick 也绝不许显示「已用」
         elapsed = self._pass1_final if self._pass1_done else self._elapsed_sec()
         self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done))
         self._pass1.setStyleSheet(f"color: {self.pass1_color(elapsed, self._pass1_est)};")
+        if self._mode == "pass1" and not self._pass1_done:
+            gate = self._flip_gate_for_now()
+            if gate > 0 and elapsed >= gate:
+                self._open_flip_gate(by_time=True)
 
     def freeze_pass1(self, seconds: float | None = None):
         """冻结第 1 趟计时。传 seconds 时用**程序实测的权威值**（worker 报的），
@@ -1150,9 +1174,13 @@ class ManualDuplexDialog(QDialog):
         为什么要以实测为准：界面时钟会受主线程卡顿、窗口动画、我们自己的静置余量影响；
         程序实测（第 1 趟开打 → 纸出完）才是"这台打印机真正花的时间"，两者不一致时
         以实测为准，并把差值记下来（主线程卡顿/时序异常的证据）。"""
-        if self._pass1_done:
+        if self._pass1_done and not self._pass1_frozen_by_gate:
+            return
+        if self._pass1_done and seconds is None:
+            # 已按闸门时刻冻结过：界面时钟不比它更权威，别用一次兜底调用把数值改掉
             return
         self._pass1_done = True
+        self._pass1_frozen_by_gate = False
         self._pass1_timer.stop()
         local = self._elapsed_sec()
         try:
@@ -1173,6 +1201,22 @@ class ManualDuplexDialog(QDialog):
         """内部用：界面时钟兜底冻结（保留最终用时，供操作员核对）；重复调用无副作用。"""
         self.freeze_pass1(None)
 
+    def _freeze_pass1_at_gate(self):
+        """纯时间放行时先冻结计时（默认路径走 `_pass1_freeze`）。
+
+        与 `_pass1_freeze` 的区别只有一个标志：`_pass1_frozen_by_gate=True` —— 等 worker 的
+        权威实测（程序侧"第 1 趟开打 → 纸出完"）到了，`freeze_pass1(seconds)` 允许覆盖它。
+        不这样做的话，闸门时刻（预估值的一半）会被当成第 1 趟真实用时写进速度样本，
+        模型越学越短、闸门跟着一起失效（2026-10-18~19 现场就是这样崩的）。
+        """
+        if self._pass1_done:
+            return
+        self._pass1_done = True
+        self._pass1_frozen_by_gate = True
+        self._pass1_final = self._elapsed_sec()
+        self._pass1_timer.stop()
+        self._pass1_tick()
+
     # ── 状态切换（全部由 worker 信号 / 本窗按钮驱动）──
 
     def _apply_batch_params(self, sheets, estimate_sec, gate_ratio, gate_extra):
@@ -1190,6 +1234,8 @@ class ManualDuplexDialog(QDialog):
         self._pass1_est = float(estimate_sec or 0.0)
         self._pass1_final = 0.0
         self._pass1_done = False
+        self._pass1_frozen_by_gate = False
+        self._flip_reported = False
         self._flip_gate_at = 0.0
         self._left = 0                  # 翻纸确认倒计时：本批还没开始（闸门到点才起算）
 
@@ -1259,20 +1305,46 @@ class ManualDuplexDialog(QDialog):
         self._pass1_hint.setText(self._speed_hint)
         self._pass1.setToolTip(self._speed_hint)
 
-    def set_flippable(self, text: str, timeout_sec: int):
-        """第 1 趟**回报**出纸。按时预估还没到点（打印机提前回报）就先不放开按钮。
+    def _flip_gate_for_now(self) -> float:
+        """本批的"继续打第 2 趟"放行时刻（0 = 不设闸门）。
 
-        "回报"不等于"打完"：主机型打印机只回报数据送进端口。放行时刻见 `flip_gate_at`。"""
-        self._flip_text = text
-        self._flip_timeout = max(1, int(timeout_sec))
+        与 `set_flippable` 走同一条公式（`flip_gate_at`），差别只在钳制用的超时值：
+        信号还没到时 `_flip_timeout` 是 0，就按 worker 的默认等待上限钳；
+        闸门绝不能把操作员拖到 worker 的「等翻纸」超时之后（超时按"半成品失败"收尾、纸白打）。
+        """
         gate = self.flip_gate_at(getattr(self, "_pass1_est", 0.0),
                                  getattr(self, "_gate_ratio", None),
                                  getattr(self, "_gate_extra", 0.0))
-        # 闸门绝不能把操作员拖到 worker 的「等翻纸」超时之后（超时按"半成品失败"收尾、
-        # 纸白打）：极端大批次（预估 >10 分钟 ≈ 175 张以上）才可能撞到，但撞上就是真失败。
-        # worker 的等待是 FLIP_TIMEOUT_SEC + FLIP_GRACE_SEC（600 + 30），这里是它的保守下限。
-        if gate > 0 and self._flip_timeout > 0:
-            gate = min(gate, float(self._flip_timeout))
+        if gate > 0:
+            cap = float(self._flip_timeout or self.FLIP_WAIT_DEFAULT_SEC)
+            gate = min(gate, cap)
+        return gate
+
+    def set_flippable(self, text: str, timeout_sec: int):
+        """第 1 趟**回报**出纸。按时预估还没到点（打印机提前回报）就先不放开按钮。
+
+        "回报"不等于"打完"：主机型打印机只回报数据送进端口。放行时刻见 `flip_gate_at`。
+
+        ★ 2026-11-09：这个回报**不是放行的必要条件** —— 闸门到点由 `_pass1_tick` 自己放行
+        （`_open_flip_gate(by_time=True)`）。回报迟到时窗口早就可点了；回报到了只是提前
+        知道。所以这里对模式有守卫：
+          · 已按时间放行（flip）/ 已点继续（pass2）/ 已跳过（skipped）：一律不改状态 ——
+            否则迟到的回报会把窗口从「③ 正在打印第 2 趟」拉回可翻纸，重复 emit
+            continue_requested（第 2 趟会被打两遍）。
+        """
+        # idle/waiting 只是"兜底入口"（正常流程 announce 先到）；pass2/skipped/done 一律拒绝，
+        # 否则迟到的回报会把已经打完第 2 趟的窗口拉回可翻纸。
+        if self._mode not in ("idle", "waiting", "pass1", "flip_gate", "flip"):
+            return
+        self._flip_text = text
+        self._flip_timeout = max(1, int(timeout_sec))
+        self._flip_reported = True
+        if self._mode == "flip":
+            # 时间闸门已经放行了：只补上真实超时值（若默认 600 还一动不动），不改状态/不重开
+            if self._left >= self.FLIP_WAIT_DEFAULT_SEC - 1:
+                self._left = max(1, int(self._flip_timeout))
+            return
+        gate = self._flip_gate_for_now()
         # 手上要是已经有一笔**可信**的实测（不早于闸门）⇒ 第 1 趟确实打完了，直接放行
         measured_done = bool(gate > 0 and self._pass1_done and self._pass1_final >= gate)
         if gate > 0 and not measured_done and self._elapsed_sec() + 0.5 < gate:
@@ -1309,23 +1381,43 @@ class ManualDuplexDialog(QDialog):
         self._pass1_hint.setText(f"{self._speed_hint}\n{note}".strip() if self._speed_hint
                                  else note)
 
-    def _open_flip_gate(self):
+    def _open_flip_gate(self, by_time: bool = False):
         """闸门到点（或本来就无需闸门）：允许翻纸 + 冻结计时 + 开始翻纸确认倒计时。
 
         冻结用的是**界面实时时钟**：此时那笔提前回报（1~2 秒）没资格代表第 1 趟用时
-        （真实用时还在走，见 `is_early_signal`）。"""
+        （真实用时还在走，见 `is_early_signal`）。
+
+        by_time=True：**没有**等到打印机的完成回报、纯按预估到点放行（2026-11-09 用户口径
+        「只考时间预估」）。文案必须说实话 —— 纸可能还在出，所以不写「已打完」，只写
+        「按预估已到放行时刻…请确认纸已出齐」。冻结值先记界面时钟，worker 的权威实测到了
+        再覆盖（`_pass1_frozen_by_gate`，免得把闸门时刻当成第 1 趟用时学进速度模型）。
+        """
         self._flip_gate_at = 0.0
-        self._pass1_freeze()
+        if by_time:
+            self._freeze_pass1_at_gate()
+            self._status.setText(
+                "② 按预估已到放行时刻 —— 请确认纸已出齐、翻纸，然后点「继续打第 2 趟」")
+            self._btn_go.setText("▶ 继续打第 2 趟")
+            if self._speed_hint:
+                self._pass1_hint.setText(
+                    f"{self._speed_hint}\n（没等到打印机的「打完」回报：本机只回报「开始打印」，"
+                    "按钮按预估放行、不采信完成信号）")
+        else:
+            self._pass1_freeze()
+            self._status.setText("② 第 1 趟已打完 —— 请翻纸，然后点「继续打第 2 趟」")
+            self._btn_go.setText("▶ 继续打第 2 趟")
+            if self._speed_hint:
+                self._pass1_hint.setText(self._speed_hint)
         self._mode = "flip"
-        self._status.setText("② 第 1 趟已打完 —— 请翻纸，然后点「继续打第 2 趟」")
         self._detail.setText(self._flip_text)
-        self._btn_go.setText("▶ 继续打第 2 趟")
         self._btn_go.setEnabled(True)
-        self._left = max(1, int(self._flip_timeout or 600))
+        self._left = max(1, int(self._flip_timeout or self.FLIP_WAIT_DEFAULT_SEC))
         self._tick()
         self._timer.start(1000)
-        if self._speed_hint:
-            self._pass1_hint.setText(self._speed_hint)
+        if by_time:
+            # 操作员可能在闸门开之前就把窗关了/最小化了；纯时间放行没有 worker 信号来
+            # "再弹一次"，所以这里自己通知主窗（signal 路径由 _on_flip_required 负责显示）。
+            self.flip_gate_opened.emit()
 
     def finish(self, text: str = ""):
         """批次结束：收起窗口（稍候自动关，避免一直盖在屏幕上）。"""
@@ -1345,9 +1437,10 @@ class ManualDuplexDialog(QDialog):
     def _tick(self):
         if self._mode == "flip_gate":
             # 等闸门到点：**不**扣翻纸确认倒计时（那 10 分钟从"真的能翻纸"那一刻才算），
-            # 也不看打印机的回报（它只回报开始打印）。
+            # 也不看打印机的回报（它只回报开始打印）。by_time 只决定文案措辞：
+            # 没收到回报就老实说"按预估放行"，别谎称"已打完"。
             if self._elapsed_sec() >= self._flip_gate_at:
-                self._open_flip_gate()
+                self._open_flip_gate(by_time=not self._flip_reported)
             else:
                 self._paint_flip_gate()
             return
@@ -10610,12 +10703,78 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.debug("表格版式：选定区域可用性刷新失败", exc_info=True)
 
+    def _xlsx_default_selection_address(self, job) -> str:
+        """这个表格任务的文件「默认选定区域」地址（读不出 ⇒ ""）。
+
+        读的是**文件自己**（打印区域 → 已用区域 → 上次保存的选区），由
+        `xlsx_printer.default_selection_area` 解 zip 拿到，不启动 Excel/WPS：面板要即时
+        响应，起一个 COM 实例得几秒、还会抢用户正开着的文档。工作表取面板上选的那张
+        （「跟随」时传 ""，引擎自己跟活动表），这样预填的地址与真正要导出的那张表对得上。
+        """
+        try:
+            fp = str(getattr(job, "file_path", "") or "")
+            if not fp:
+                return ""
+            import xlsx_printer as _xp      # 延迟 import：gui 顶部不引引擎（既有口径）
+            combo = getattr(self, "_xlsx_worksheet", None)
+            sheet = str(combo.currentData() or "") if combo is not None else ""
+            return str(_xp.default_selection_area(fp, sheet) or "")
+        except Exception as e:  # noqa: BLE001 —— 预填失败不该挡住面板
+            logger.debug(f"表格版式：读取默认选定区域失败: {e}")
+            return ""
+
+    def _prefill_xlsx_selection(self) -> bool:
+        """「选定区域」地址框空着时，用文件默认区域填上；返回是否真的填了。
+
+        2026-11-07 用户要求：打印范围切到「选定区域」时输入框不能是空白 —— 空白让人
+        无从下手（得自己回想 Excel 里到底写到哪一格），而文件里本来就存着这个信息。
+
+        三条边界，都是"不许帮倒忙"：
+          · 只填空框：用户手填的、小印助手经接口填的一律不动（那是他的决定）；
+          · **只填第一行的表格文件**：面板本来就按选区第一个任务显示值，预填同一条规则
+            （多选不同文件时预填也只会落到第一份文件的区域上，随后 `_auto_apply_edit`
+            会把它写到整片选区 —— 与手填地址的行为完全一致，用户看得见也能改）；
+          · 读不出（.xls 老格式/加密/空表）就保持空白，绝不拿"看着像"的区域顶替。
+        """
+        try:
+            edit = getattr(self, "_xlsx_selection", None)
+            if edit is None or not edit.isEnabled():
+                return False
+            if str(edit.text()).strip():
+                return False                     # 已有值：绝不覆盖
+            if not bool(getattr(self, "_xlsx_panel_shown", False)):
+                return False
+            sheet_jobs = self._spreadsheet_jobs(self._get_current_jobs(), self._selected_rows())
+            if not sheet_jobs:
+                return False
+            area = self._xlsx_default_selection_address(sheet_jobs[0])
+            if not area:
+                return False
+            edit.blockSignals(True)              # 预填只落值，不触发一次额外的写回
+            try:
+                edit.setText(area)
+            finally:
+                edit.blockSignals(False)
+            self._mark_xlsx_selection_state()
+            return True
+        except Exception:
+            logger.debug("表格版式：选定区域预填失败", exc_info=True)
+            return False
+
     def _on_xlsx_range_changed(self, *_args):
         """打印范围切换 → 选定区域地址框的可用性跟着变，再把面板值落到任务上。"""
         try:
             self._sync_xlsx_selection_enabled()
         except Exception:
             logger.debug("表格版式：打印范围联动失败", exc_info=True)
+        # 切到「选定区域」且框还空着 → 预填文件自己的默认区域（2026-11-07 用户要求）。
+        # 必须在 _auto_apply_edit 之前：填进去的值要和这一轮其它面板值一起写进任务，
+        # 否则会先落一次空 selection（白清缓存、白重渲染），再补一次带地址的。
+        try:
+            if self._xlsx_range.currentIndex() == _index_of(XLSX_RANGE_VALUES, "selection"):
+                self._prefill_xlsx_selection()
+        except Exception:
+            logger.debug("表格版式：选定区域预填失败", exc_info=True)
         self._auto_apply_edit()
 
     def _mark_xlsx_selection_state(self):
@@ -11616,6 +11775,8 @@ class MainWindow(QMainWindow):
         # Excel 的「选区」是会话内高亮状态、不存进文件，无人值守 COM 拿不到 —— 所以这里
         # 收的是**地址文本**（A1 或带表名），引擎把它写进临时副本的 PrintArea，源文件不动。
         # 留空/写错时不替用户猜（不拿 UsedRange 顶替），引擎会记「该项未生效」并提示。
+        # 但**空框**要预填文件默认区域（2026-11-07 用户要求）：_prefill_xlsx_selection 只在
+        # 切到本档且框为空时填一次，填的是文件自己的区域，用户/助手填过的一律不动。
         self._xlsx_selection = _fit_width(QLineEdit())
         self._xlsx_selection.setPlaceholderText("A1:F20 或 Sheet1!A1:F20")
         self._xlsx_selection.setClearButtonEnabled(True)
@@ -11623,7 +11784,9 @@ class MainWindow(QMainWindow):
             "只打印这块区域，例：A1:F20（当前工作表）/ Sheet1!A1:F20（指定工作表）/ "
             "A1:B2,D5:E9（多块区域，逗号分隔）。\n"
             "打印范围选「选定区域」时才生效；区域写错/为空时按文件原有打印区域导出并在日志里提示。\n"
-            "小印智能助手可经接口直接填这一项（xlsx_options.selection）。")
+            "小印智能助手可经接口直接填这一项（xlsx_options.selection）。\n"
+            "切到本档时若框还空着，会自动填入这个文件默认的区域（文件自带的打印区域，"
+            "没有则填已用区域），可随手改。")
         self._xlsx_selection.textChanged.connect(self._on_xlsx_selection_edited)
         self._xlsx_selection.editingFinished.connect(self._on_xlsx_selection_committed)
         _xform.addRow("选定区域：", self._xlsx_selection)
@@ -14204,6 +14367,8 @@ class MainWindow(QMainWindow):
             dlg = ManualDuplexDialog(self)
             dlg.continue_requested.connect(self._on_duplex_continue)
             dlg.skip_requested.connect(self._on_duplex_skip)
+            # 纯时间放行（2026-11-09）：闸门到点时若窗口被关了/最小化了，这里把它重新立起来
+            dlg.flip_gate_opened.connect(lambda: self._show_duplex_dialog(dlg))
             self._duplex_dialog = dlg
             # 翻纸窗是置顶常驻窗：它盖着的 QMessageBox 会**永久空白**（见 _MsgBoxAboveFlipWindow
             # 顶部现场记录）。装一个应用级事件过滤器，翻纸窗可见时给消息框补置顶。
@@ -14283,9 +14448,11 @@ class MainWindow(QMainWindow):
                       f"（预估 {format_duration(dlg._pass1_est)}）—— 打印机只回报「开始打印」，"
                       f"这笔实测不可信：不冻结计时、不写速度样本")
             return
-        # ① 先用权威值冻结窗口计时（信号按发射顺序先于此处的 flip_required，所以窗口最终显示的就是它）
+        # ① 先用权威值冻结窗口计时（信号按发射顺序先于此处的 flip_required，所以窗口最终显示的就是它）。
+        #    已经按闸门时刻"先冻结"过的（_pass1_frozen_by_gate）也要用权威值覆盖：
+        #    闸门时刻只是"能点了"，不是第 1 趟真实用时。
         try:
-            if dlg is not None and not dlg._pass1_done:
+            if dlg is not None:
                 dlg.freeze_pass1(seconds)
         except Exception:
             pass
