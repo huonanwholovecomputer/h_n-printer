@@ -4455,6 +4455,52 @@ def process_pending_orders():
         print(f"  [WAIT] 子任务 #{of_id}: 推送失败，保持排队")
 
 
+# ── 预约单 start_print 兜底推送的节流状态（2026-11-10 现场 HN20261110-0005）──────────
+# 症状：一张预约单到点后每 30 秒收到一次「开始打印指令」，却一次也没打出来，日志刷到几百行。
+# 根因链（三段都真实存在，改任何一段都要一起看）：
+#   ① 本机是手动双面机型（HP LaserJet 1020）。预约单到点命中 `_hold_for_manual_duplex()`
+#      后**故意挂起**（顾客按双面付了钱，没人翻纸就不能打），并结束自己的预约状态机；
+#   ② 服务端这边子任务仍是 waiting、scheduled_at 已过、未冻结 ⇒ 每 30 秒发一次兜底 start_print；
+#   ③ 设备端状态机已结束 ⇒ 收到只记一行「收到开始打印指令」就丢弃。于是**指令永远无效、推送永远不停**
+#      —— 现场看上去就是「开始打印指令失效」，其实是一直在被重发。
+# 设备端目前**没有**「我挂起了，别再发」的回执通道（新增要动协议 + 双端版本兼容），
+# 所以服务端按次数退避：前 10 次（≈5 分钟）保持 30 秒节奏（覆盖设备重启/时钟偏差的兜底），
+# 之后每 10 分钟一次，到上限就停发并只打一行日志。订单仍是 waiting ⇒ 人工点「开始打印」照常能打、
+# 打完照常回报成功（设备是最终裁决者）。**别改成「到点一次就把子任务判失败」**：那会让一张
+# 只是等人翻纸的单子变成「打印失败」，顾客要重下单。
+_START_PRINT_FAST_LIMIT = 10        # 前 10 次保持 30 秒节奏
+_START_PRINT_SLOW_GAP = 600         # 之后每 10 分钟一次
+_START_PRINT_MAX = 16               # 一共最多 16 次（≈ 5 分钟 + 100 分钟）
+_start_print_attempts = {}          # of_id -> {"n": int, "last": float, "stopped": bool}
+_start_print_lock = threading.Lock()
+
+
+def _start_print_push_due(of_id, now_ts):
+    """这次扫描要不要给该子任务发 start_print。返回 (是否发, 是否刚停发)。"""
+    with _start_print_lock:
+        st = _start_print_attempts.setdefault(
+            int(of_id), {"n": 0, "last": 0.0, "stopped": False})
+        if st["stopped"]:
+            return False, False
+        if st["n"] >= _START_PRINT_MAX:
+            st["stopped"] = True
+            return False, True
+        gap = 30 if st["n"] < _START_PRINT_FAST_LIMIT else _START_PRINT_SLOW_GAP
+        if st["last"] and (now_ts - st["last"]) < gap - 1:   # -1 容忍扫描抖动
+            return False, False
+        st["n"] += 1
+        st["last"] = now_ts
+        return True, False
+
+
+def _forget_start_print_attempts(keep_ids):
+    """子任务离开 waiting（打出来了 / 作废 / 取消）⇒ 丢掉它的节流计数，别让内存无限涨。"""
+    with _start_print_lock:
+        for k in list(_start_print_attempts):
+            if k not in keep_ids:
+                _start_print_attempts.pop(k, None)
+
+
 def process_scheduled_orders():
     """预约订单扫描（每 30s）：
     - scheduled 子任务（阶段①文件尚未下发，如提交时打印机离线）→ 有在线客户端时下发文件（downloading）
@@ -4480,11 +4526,14 @@ def process_scheduled_orders():
     ).fetchall()
     conn.close()
     if not rows:
+        # 没有待下发/待兜底的子任务 ⇒ 节流计数全部作废（否则「单子已打完」之后这份 dict 会一直挂着）
+        _forget_start_print_attempts(set())
         return
 
     active_printer = get_active_printer_client()  # 兜底：未指定目标时任一在线接单设备
     online = set(get_active_clients())
     now = datetime.now()
+    seen_waiting = set()   # 本轮仍是 waiting 的子任务（离开 waiting 的清掉节流计数）
 
     for row in rows:
         order_id = row["order_id"]
@@ -4536,6 +4585,7 @@ def process_scheduled_orders():
 
         elif row["of_status"] == "waiting":
             # 阶段②兜底：到点且未冻结 → 发 start_print（本地通常已自触发，幂等）
+            seen_waiting.add(int(row["of_id"]))
             if row["schedule_frozen"]:
                 continue
             sat = row["scheduled_at"] or ""
@@ -4555,6 +4605,15 @@ def process_scheduled_orders():
                 sid = info["sid"] if info else None
             if not sid:
                 continue
+            # 兜底重发要节流（见 _start_print_push_due 顶部现场记录）：设备端可能已经挂起等人工
+            # 翻纸并结束了状态机，此时每 30 秒重发只会让「指令无效」看起来像故障、日志无限刷。
+            _due, _just_stopped = _start_print_push_due(row["of_id"], time.time())
+            if not _due:
+                if _just_stopped:
+                    print(f"  [SKIP] 预约单 #{row['of_id']}: start_print 兜底已重发 "
+                          f"{_START_PRINT_MAX} 次仍无动静，停止重发"
+                          f"（子任务保持 waiting：人工点「开始打印」照常可打、打完照常回报成功）")
+                continue
             try:
                 socketio.emit("start_print", {
                     "order_id": order_id,
@@ -4564,6 +4623,8 @@ def process_scheduled_orders():
                 }, to=sid)
             except Exception as e:
                 print(f"  [FAIL] 预约单 #{row['of_id']} start_print 兜底推送失败: {e}")
+
+    _forget_start_print_attempts(seen_waiting)
 
 
 def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, page_range, client_id,

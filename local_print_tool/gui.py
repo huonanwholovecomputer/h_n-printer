@@ -6609,6 +6609,11 @@ class MainWindow(QMainWindow):
         #   "tab_key": str | None,     # 已创建的标签页
         # }
         self._scheduled_orders: dict[int, dict] = {}
+        # 后端 start_print 落空时的「讲原因」节流：order_id -> 上次讲的时间戳。
+        # 后端对停在 waiting 的子任务每 30 秒重发一次兜底指令（见 app.process_scheduled_orders），
+        # 而本机可能早就把这条预约结束了（最常见：手动双面机型，到点挂起等人工翻纸，
+        # 见 _hold_for_manual_duplex）。同一单 10 分钟只讲一次，否则日志会被刷屏。
+        self._start_print_ignored_ts: dict[int, float] = {}
         # 本会话被用户取消的订单 ID（P2-9）：push 与 cancel 并发时 socket 事件可能乱序，
         # 迟到的 print_task 不得重新注册预约状态机/自动打印队列，防止打印已取消订单
         self._cloud_canceled_orders: set[int] = set()
@@ -19619,6 +19624,7 @@ class MainWindow(QMainWindow):
             return
         st = self._scheduled_orders.get(order_id)
         if not st:
+            self._explain_ignored_start_print(order_id, task_ids)
             return
         if st["printed"]:
             return
@@ -19631,6 +19637,48 @@ class MainWindow(QMainWindow):
             self._restart_scheduled_debounce(order_id)
         else:
             self._evaluate_scheduled_order(order_id)
+
+    def _explain_ignored_start_print(self, order_id: int, task_ids: list):
+        """后端 start_print 落空时讲清「为什么没打」，同一单 10 分钟只讲一次。
+
+        为什么需要这一段（2026-11-10 现场 HN20261110-0005）：预约单到点遇到**手动双面机型**
+        时本机是故意挂起的 —— `_hold_for_manual_duplex()` 亮 ⏸、不回报失败，随后
+        `_cleanup_scheduled_order(..., "需人工翻纸，转为人工打印")` 把预约状态机结束了。
+        此后服务端每 30 秒重发一次兜底 start_print（子任务还停在 waiting），而这台机器
+        已经没有状态机可驱动，只能丢弃。旧实现丢得完全无声：日志里只有「收到开始打印指令」
+        反复出现、没有任何结果，现场看起来就是「开始打印指令失效」，还容易误判成后端没发。
+        这里只把真实原因写清楚，**不改变行为**：绝不因为收到兜底指令就自动开打 ——
+        双面单必须有人翻纸，自动开打会把纸打废（`_hold_for_manual_duplex` 的整个理由）。
+        """
+        now = time.time()
+        if now - self._start_print_ignored_ts.get(order_id, 0.0) < 600:
+            return      # 服务端还在每 30 秒重发，同一单 10 分钟讲一次就够
+        self._start_print_ignored_ts[order_id] = now
+        tids = {int(t) for t in (task_ids or []) if t}
+        hit_jobs = []
+        pending_hold = False
+        for tab in self._config.tabs.values():
+            for j in tab.jobs:
+                jt = getattr(j, "task_id", 0) or 0
+                jo = getattr(j, "order_id", 0) or 0
+                if (jt and jt in tids) or (jo and jo == order_id):
+                    hit_jobs.append(j)
+                    if (not getattr(j, "sent", False)
+                            and getattr(tab, "manual_duplex_pending", False)):
+                        pending_hold = True
+        if not hit_jobs:
+            self._log(f"☁ 预约单 #{order_id} 收到开始打印指令，但本机已无这单的任务"
+                      f"（可能已人工打印 / 已取消 / 已清理）—— 指令忽略")
+        elif all(getattr(j, "sent", False) for j in hit_jobs):
+            self._log(f"☁ 预约单 #{order_id} 收到开始打印指令，但本机这单已经打完并回报成功"
+                      f" —— 忽略迟到的指令")
+        elif pending_hold:
+            self._log(f"☁ 预约单 #{order_id} 收到开始打印指令，但本单已转为人工打印："
+                      f"含双面文件、当前打印机不支持自动双面，本机挂起等人工点「开始打印」并翻纸"
+                      f" —— 自动指令不会再开打（服务端仍在重发，落空即忽略）")
+        else:
+            self._log(f"☁ 预约单 #{order_id} 收到开始打印指令，但本机这单不在预约队列里"
+                      f"（状态机已结束）—— 需要人工点「开始打印」")
 
     def _cleanup_scheduled_order(self, order_id: int, reason: str = ""):
         """清理预约单状态机（失败/取消/超时未使用）。已打印的订单保留状态防迟到文件二次打印。"""
