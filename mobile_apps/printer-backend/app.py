@@ -13478,10 +13478,33 @@ def admin_statistics_revenue():
                LIMIT 500"""
         ).fetchall()
         user_conn.close()
+        # 2026-11-10 现场：候选名单里混进了「第一次登录就被自动分配占位昵称、之后从没下过单」
+        # 的账号（如 user_s0iaj5b0）—— 结算页的「用户」列本来只该出现能对得上账的人。
+        # 判据：占位昵称（user_ + 8 位小写字母数字，见首次登录那段生成规则）**且**名下没有任何
+        # 有效订单。两个条件缺一不可：真下过单的占位昵称要保留（不然老订单的归属人消失）。
+        _placeholder_nick = re.compile(r"^user_[a-z0-9]{8}$")
+        _order_openids: set = set()
+        _orders_known = False
+        try:
+            _main_conn = get_db()
+            _order_rows = _main_conn.execute(
+                """SELECT DISTINCT openid FROM orders
+                   WHERE openid != '' AND status NOT IN ('canceled', 'abandoned', 'rejected')"""
+            ).fetchall()
+            _main_conn.close()
+            _order_openids = {r["openid"] for r in _order_rows}
+            _orders_known = True
+        except Exception as e:
+            # 查不到订单就**别过滤**：宁可多列一个名字，也不能把真实用户从名单里吞掉。
+            print(f"[WARN] 统计用户订单数失败，候选名单不做占位账号过滤：{e}")
+            _orders_known = False
         assignable_users = [
             {"openid": r["openid"], "nickname": r["nickname"] or "",
              "role": r["role"] or "guest"}
             for r in assignable_rows
+            if not (_orders_known
+                    and _placeholder_nick.match(str(r["nickname"] or ""))
+                    and r["openid"] not in _order_openids)
         ]
     except Exception:
         assignable_users = []

@@ -18097,10 +18097,33 @@ class MainWindow(QMainWindow):
                         })
                     else:
                         self._cloud_client.report_fail(tid, entry_msg)
+                elif not tid:
+                    # 本地单（没有云端 task_id）找不到 job ⇒ 没有第二条路能把它标成「已完成」。
+                    # 2026-11-10 现场（HN20261109-0008/0009）：第 2 趟明明打完了，只因为入叠时
+                    # 记的 tab_key 对不上，找不到 job 就一声不响地跳过 —— 退出时仍弹
+                    # 「还有没打印完的文件」，并把这几张已经出槽的纸按「放弃打印」上报。
+                    # 纸已经出来了就不能让程序装作没打：这里必须留痕（能补救的只有人工核对）。
+                    self._log(f"⚠ 攒批收尾：整叠里这一份（{t.get('display_name') or '未命名'}）"
+                              f"在标签页 {entry.tab_key or '（空）'} 里找不回任务记录 —— "
+                              f"纸已经打出来了，但这一单没法自动标成「已完成」；"
+                              f"请别直接退程序（退出会把它当「放弃打印」上报），"
+                              f"先在新标签页里核对该文件，必要时手工补打")
         self._tick_keepalive(force=True)
 
     def _find_job_for_stack_task(self, entry, task: dict):
-        """按 task_id / 文件路径把纸叠清单里的任务找回成活的 PrintJob（找不到返回 None）。"""
+        """按 task_id / 文件路径把纸叠清单里的任务找回成活的 PrintJob（找不到返回 None）。
+
+        2026-11-10 现场（HN20261109-0008/0009）：攒批第 2 趟**打完了**，两单的纸都出槽了，
+        但退出时仍被判「没打印完成」并当成放弃上报 —— 因为收尾时按 `entry.tab_key` 去那一页里
+        找 job，号一错（标签页重编号 / ctx 丢号 / 该页被清空重建）就**一个都找不到**，
+        而本地单没有 task_id 可以兜底找回，于是 `sent` 永远是假：纸出来了、账没结、退出还报放弃。
+
+        所以查找要**逐级放宽**，并且最后一级找不到时由调用方留痕（绝不静默）：
+          ① task_id（云端单最可靠）；
+          ② 入叠时记下的那一页里按 file_path 比；
+          ③ 全部标签页按 file_path 比（号错了也能找回来）；
+          ④ 全部标签页按显示名比（暂存副本被重建、路径变了，但人看到的还是同一份文件）。
+        """
         tid = int(task.get("task_id") or 0)
         if tid:
             for tab in self._config.tabs.values():
@@ -18108,11 +18131,25 @@ class MainWindow(QMainWindow):
                     if int(getattr(job, "task_id", 0) or 0) == tid:
                         return job
         keys = {k[1] for k in (entry.job_keys or []) if len(k) > 1 and k[1]}
+        own = self._config.tabs.get(getattr(entry, "tab_key", "") or "")
         if keys:
-            tab = self._config.tabs.get(entry.tab_key)
-            for job in (getattr(tab, "jobs", None) or []):
+            for job in (getattr(own, "jobs", None) or []):
                 if job.file_path in keys:
                     return job
+            for tab in self._config.tabs.values():
+                if tab is own:
+                    continue
+                for job in (getattr(tab, "jobs", None) or []):
+                    if job.file_path in keys:
+                        return job
+        name = str(task.get("display_name") or "").strip()
+        if name:
+            for tab in self._config.tabs.values():
+                for job in (getattr(tab, "jobs", None) or []):
+                    shown = str(getattr(job, "display_name", "") or
+                                os.path.basename(getattr(job, "file_path", "") or "")).strip()
+                    if shown and shown == name:
+                        return job
         return None
 
     # ── 打印中保活（后端 3 分钟反馈超时 / 5 分钟孤儿回退的解药）──
