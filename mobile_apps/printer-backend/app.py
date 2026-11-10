@@ -1878,6 +1878,14 @@ ACCEPT_WAIT_TIMEOUT = 600        # 推送后未被 accept 的任务（打印机�
 # 断线未知超时秒数（30 分钟）：客户端断线后任务置 offline_unknown，等待原客户端重连回报；
 # 超时仍未解决 → 保守标记 failed（方案 B：不重复打印，用户可手动重发）
 OFFLINE_UNKNOWN_TIMEOUT = 1800
+# 预约单「下载不动」的判定（🔴14）：push 时写过 locked_at，但客户端心跳还在、进度早就不动。
+# 设备连着网却永远传不完时，子任务会挂在 downloading 上——既不打印也不失败、零日志。
+# 30 分钟没刷新 locked_at ⇒ 回退 scheduled 重下（重下是幂等的，不会重复出纸）。
+DOWNLOAD_STALL_TIMEOUT = 1800
+# 预约单「冻结」的自愈上限（🔴13）：文件迟迟没到齐 ⇒ schedule_frozen=1、scheduled_at=''，
+# 而唯一的解冻点是 file_ready；该事件可能永远不再来（设备掉线/上传失败），订单就永久冻结。
+# 冻结超过该时长：全就绪就解冻重排，否则把没就绪的那几份标 timeout，让订单有结论。
+FROZEN_STUCK_TIMEOUT = 1800
 
 def get_active_clients():
     """返回心跳未超时的客户端 ID 列表"""
@@ -3347,6 +3355,8 @@ def init_db():
         ("schedule_mode", "TEXT", "'now'"),      # now | at | countdown
         ("scheduled_at", "TEXT", "''"),          # 绝对时间 "%Y-%m-%d %H:%M:%S"，仅预约单有值
         ("schedule_frozen", "INTEGER", "0"),     # 1 = 到点文件未就绪，已冻结暂停
+        # 冻结发生的时刻（🔴13 自愈用）：旧行没有值 ⇒ 用 scheduled_at/created_at 兜底判断
+        ("schedule_frozen_at", "TEXT", "''"),
     ]:
         try:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {col_type} DEFAULT {default}")
@@ -4360,6 +4370,95 @@ def expire_stale_scheduled_orders():
     print(f"[SCHEDULER] 已超时取消 {len(rows)} 个长期未打印的预约子任务（> {timeout_hours} 小时）")
 
 
+def release_stuck_frozen_orders():
+    """冻结的预约单自愈（2026-11-10 体检 🔴13）。
+
+    现场：`on_download_delayed` 把订单置 ``schedule_frozen=1, scheduled_at=''``，而**唯一的解冻点**
+    是 `on_file_ready` 里「父单冻结 + 该单所有子任务都就绪」那一段。可只要设备掉线 / 上传失败 /
+    这个事件从此不再来，订单就永久冻结：`process_scheduled_orders` 见冻结直接 continue、
+    `expire_stale_scheduled_orders` 只扫 scheduled/waiting（downloading 扫不到），
+    于是既不打印也不失败，零日志、无入口 —— 顾客只会看到「预约到点了但没打」。
+
+    自愈口径（冻结超过 ``FROZEN_STUCK_TIMEOUT``）：
+      * 所有子任务已就绪 ⇒ 直接解冻并重排到 now+30s（等价于迟到的 file_ready），发 start_print；
+      * 还有没就绪的 ⇒ 把这几份标 ``timeout`` 并写明原因（**不是 failed**：设备日后真打出来
+        仍能被 print_success 救回），然后解冻，让订单有个结论、文件也进入正常清理流程。
+    旧数据没有 ``schedule_frozen_at`` ⇒ 退回 ``scheduled_at`` / ``created_at`` 判断，不至于永远漏掉。
+    """
+    cutoff_str = (datetime.now() - timedelta(seconds=FROZEN_STUCK_TIMEOUT)).strftime("%Y-%m-%d %H:%M:%S")
+    resume = []          # [(order_id, target_str, ready_task_ids)]
+    resolved = []        # [(order_id, n_timeout)]
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            rows = conn.execute(
+                """SELECT id, schedule_frozen_at, scheduled_at, created_at
+                   FROM orders
+                   WHERE COALESCE(schedule_frozen, 0) = 1
+                     AND schedule_mode != 'now'
+                     AND status NOT IN ('canceled', 'abandoned', 'rejected', 'sent', 'timeout')""",
+            ).fetchall()
+            if rows:
+                conn.execute("BEGIN IMMEDIATE")
+            for o in rows:
+                oid = o["id"]
+                basis = (str(o["schedule_frozen_at"] or "") or str(o["scheduled_at"] or "")
+                         or str(o["created_at"] or ""))
+                if not basis or basis >= cutoff_str:
+                    continue
+                if _all_subtasks_ready(conn, oid):
+                    target_str = (datetime.now() + timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S")
+                    conn.execute(
+                        "UPDATE orders SET schedule_frozen = 0, schedule_frozen_at = '',"
+                        " scheduled_at = ? WHERE id = ?",
+                        (target_str, oid),
+                    )
+                    ready = [r["id"] for r in conn.execute(
+                        "SELECT id FROM order_files WHERE order_id = ? AND status = 'waiting'",
+                        (oid,)).fetchall()]
+                    resume.append((oid, target_str, ready))
+                else:
+                    stuck = conn.execute(
+                        "SELECT id FROM order_files WHERE order_id = ?"
+                        " AND status IN ('scheduled', 'downloading')",
+                        (oid,)).fetchall()
+                    for r in stuck:
+                        conn.execute(
+                            "UPDATE order_files SET status = ?, reject_reason = ?, locked_at = ''"
+                            " WHERE id = ? AND status IN ('scheduled', 'downloading')",
+                            (TIMEOUT_STATUS,
+                             f"预约到点后文件 {FROZEN_STUCK_TIMEOUT // 60} 分钟内一直没就绪（设备没传上来），"
+                             "已超时取消这一份",
+                             r["id"]),
+                        )
+                    conn.execute(
+                        "UPDATE orders SET schedule_frozen = 0, schedule_frozen_at = '' WHERE id = ?",
+                        (oid,),
+                    )
+                    refresh_order_status(conn, oid)
+                    resolved.append((oid, len(stuck)))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    for oid, target_str, ready in resume:
+        print(f"[UNFREEZE] 订单 #{oid} 冻结超过 {FROZEN_STUCK_TIMEOUT // 60} 分钟但文件已就绪，"
+              f"解冻并重设 {target_str}")
+        if ready:
+            try:
+                emit("start_print", {"order_id": oid, "task_ids": ready,
+                                     "scheduled_at": target_str,
+                                     "scheduled_ts": _iso_to_ts(target_str)})
+            except Exception as e:
+                print(f"  [WARN] 解冻后发 start_print 失败: {e}")
+    for oid, n in resolved:
+        print(f"[UNFREEZE] 订单 #{oid} 冻结超过 {FROZEN_STUCK_TIMEOUT // 60} 分钟、{n} 份文件仍没传上来，"
+              f"已标超时并解冻（设备日后真打出来仍可救回 sent）")
+
+
 # ==================== 原子任务领取 ====================
 
 
@@ -5188,35 +5287,64 @@ def recover_orphaned_printing_tasks():
 
 
 def recover_stale_downloading():
-    """预约单兜底：downloading 子任务的领取客户端已不在线（如服务端重启漏了 disconnect
-    事件）→ 回退 scheduled，等 process_scheduled_orders 重新下发。基于客户端在线状态判断，
-    避免误伤慢速大文件下载。"""
+    """预约单兜底：downloading 子任务回退 scheduled，等 process_scheduled_orders 重新下发。
+
+    两条判据（2026-11-10 体检 🔴14）：
+
+    1) 领取的客户端**已不在线**（服务端重启漏了 disconnect 事件等）；
+    2) 客户端**心跳还在但下载早就不动了** —— push 时写过 ``locked_at``，旧实现全文件没人读它
+       这个字段，于是「设备连着网、文件永远传不完」会把子任务挂到天荒地老：
+       顾客的预约单既不打印也不失败，零日志、无入口。
+
+    只有 1) 时，网络抖一下、或者 200MB 的文件慢慢传，都会被误伤；加上 2) 才能既不误杀慢速
+    下载、又不会永久卡死。回退时清 ``operator_client`` 和 ``locked_at``，重新排队等于给
+    设备一次重试机会（同一份文件重下是幂等的，不涉及重复出纸）。"""
     conn = get_db()
     rows = conn.execute(
-        "SELECT id, order_id, operator_client FROM order_files WHERE status = 'downloading'"
+        "SELECT id, order_id, operator_client, locked_at FROM order_files WHERE status = 'downloading'"
     ).fetchall()
     conn.close()
     if not rows:
         return
 
     active = set(get_active_clients())
+    now_dt = datetime.now()
     with db_lock:
         conn2 = get_db_conn()
         try:
             conn2.execute("BEGIN IMMEDIATE")
-            changed = False
+            off_count = 0
+            stall_count = 0
             for r in rows:
-                if r["operator_client"] not in active:
-                    # 状态守卫：SELECT 在锁外读取，防止与 cancel 竞态把已取消子任务翻回 scheduled
-                    conn2.execute(
-                        "UPDATE order_files SET status = 'scheduled', operator_client = '' WHERE id = ? AND status = 'downloading'",
-                        (r["id"],),
-                    )
+                _oc = r["operator_client"] or ""
+                _lk = r["locked_at"] or ""
+                _stalled = False
+                if _lk:
+                    try:
+                        _lk_dt = datetime.strptime(_lk, "%Y-%m-%d %H:%M:%S")
+                        _stalled = (now_dt - _lk_dt).total_seconds() > DOWNLOAD_STALL_TIMEOUT
+                    except ValueError:
+                        _stalled = False
+                if _oc in active and not _stalled:
+                    continue
+                # 状态守卫：SELECT 在锁外读取，防止与 cancel 竞态把已取消子任务翻回 scheduled
+                cur = conn2.execute(
+                    "UPDATE order_files SET status = 'scheduled', operator_client = '', locked_at = ''"
+                    " WHERE id = ? AND status = 'downloading'",
+                    (r["id"],),
+                )
+                if cur.rowcount:
                     refresh_order_status(conn2, r["order_id"])
-                    changed = True
+                    if _oc in active:
+                        stall_count += 1
+                    else:
+                        off_count += 1
             conn2.commit()
-            if changed:
-                print(f"[RECOVER] {len(rows)} 个 downloading 子任务的客户端已不在线，回退 scheduled")
+            if off_count:
+                print(f"[RECOVER] {off_count} 个 downloading 子任务的客户端已不在线，回退 scheduled")
+            if stall_count:
+                print(f"[RECOVER] {stall_count} 个 downloading 子任务在线但 {DOWNLOAD_STALL_TIMEOUT // 60}"
+                      f" 分钟没有任何进度（locked_at 未刷新），回退 scheduled 重下")
         except Exception:
             conn2.rollback()
             raise
@@ -5629,6 +5757,10 @@ def on_print_success(data):
         _purge_file_after_print(row["file_id"])
 
     print(f"  [OK] 子任务 #{task_id}: 客户端确认打印成功")
+    # 🔴-D20：回执。python-socketio 的 emit 是"塞进缓冲就返回"，链路半开（后端重启/代理抖动）
+    # 时客户端既收不到异常也收不到回应 ⇒ 它以为报上去了，3 分钟后 check_printing_timeout
+    # 把这一单判 failed，纸却已经被顾客拿走。回一个 ack，客户端 15 秒收不到就转离线队列重放。
+    emit("print_success_ack", {"task_id": task_id})
 
 
 @sio_event("print_fail")
@@ -5696,6 +5828,10 @@ def on_print_fail(data):
 
     with pushed_tasks_lock:
         pushed_tasks.pop(task_id, None)
+
+    # 🔴-D20：与 print_success 同口径 —— 回执让客户端知道"云端真的处理了这次失败回报"，
+    # 15 秒收不到就转离线队列重放（半开链路下 emit 不会抛异常）。
+    emit("print_fail_ack", {"task_id": task_id})
 
 
 # ==================== 预约打印（无障碍打印的预约形式） ====================
@@ -5773,7 +5909,8 @@ def on_file_ready(data):
                     new_target = datetime.now() + timedelta(seconds=30)
                     new_target_str = new_target.strftime("%Y-%m-%d %H:%M:%S")
                     conn.execute(
-                        "UPDATE orders SET schedule_frozen = 0, scheduled_at = ? WHERE id = ?",
+                        "UPDATE orders SET schedule_frozen = 0, schedule_frozen_at = '',"
+                        " scheduled_at = ? WHERE id = ?",
                         (new_target_str, order_id),
                     )
                     resume_target = new_target_str
@@ -5848,8 +5985,9 @@ def on_download_delayed(data):
             # 父订单已取消 → 不再冻结（子任务已取消，无需续排）
             if o and o["schedule_mode"] != "now" and o["status"] != "canceled":
                 conn.execute(
-                    "UPDATE orders SET schedule_frozen = 1, scheduled_at = '' WHERE id = ?",
-                    (order_id,),
+                    "UPDATE orders SET schedule_frozen = 1, schedule_frozen_at = ?, scheduled_at = ''"
+                    " WHERE id = ?",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), order_id),
                 )
             conn.commit()
         except Exception:
@@ -10190,7 +10328,13 @@ def cancel_order():
     P2-9：允许取消预约单（scheduled/downloading/waiting）——用户预约了打印，
     到点前应能反悔；且取消时一次性把所有未终结子任务（含预约单的
     scheduled/downloading/waiting）置为 canceled，避免取消不完整导致
-    process_scheduled_orders 把已取消订单的文件重新下发/打印。"""
+    process_scheduled_orders 把已取消订单的文件重新下发/打印。
+
+    2026-11-10 体检（🔴15 / 🟡9）：再放开 accepted / offline_unknown / timeout 三种父状态。
+    以前顾客在这三种「打印机已确认/断线未知/已超时」状态下点取消，会得到
+    「任务状态为 accepted，无法取消」——纸可能根本没出来，人却只能找客服手工改库。
+    口径不变：取消只是把**还没终结**的子任务置 canceled 并通知设备清队列；
+    设备是最终裁决者 —— 它若真把纸打出来了，迟到的 print_success 仍覆盖 canceled 为 sent。"""
     data = request.get_json()
     if not data:
         return jsonify({"success": False, "message": "请提供 JSON 数据"}), 400
@@ -10215,7 +10359,8 @@ def cancel_order():
             if row["openid"] != g.openid:
                 return jsonify({"success": False, "message": "无权操作此任务"}), 403
 
-            if row["status"] not in ("queued", "printing", "waiting", "downloading", "scheduled"):
+            if row["status"] not in ("queued", "printing", "waiting", "downloading", "scheduled",
+                                     "accepted", "offline_unknown", "timeout"):
                 return jsonify({"success": False, "message": f"任务状态为 {row['status']}，无法取消"}), 400
 
             # 查询被取消的子任务 ID 和已连接的打印机客户端。
@@ -10237,6 +10382,13 @@ def cancel_order():
             conn.execute(
                 "UPDATE orders SET status = 'canceled' WHERE id = ?",
                 (order_id,),
+            )
+            # 🔴-D15：上面那条只动「非终态」，timeout 是终态但**没出纸** —— 顾客点取消
+            # 就是想让这单闭嘴（不然列表里一直挂着「超时」）。只把 timeout 翻成 canceled，
+            # sent（真打出来了）/ failed / rejected / abandoned 一概不碰。
+            conn.execute(
+                "UPDATE order_files SET status = 'canceled' WHERE order_id = ? AND status = ?",
+                (order_id, TIMEOUT_STATUS),
             )
             conn.commit()
         except Exception:
@@ -13728,6 +13880,9 @@ if __name__ == "__main__":
     scheduler.add_job(purge_test_devices, "interval", minutes=30, id="purge_test_devices")
     # 🔴-B10：改价失败的单在这里补算（幂等，算完清 needs_repricing）
     scheduler.add_job(resync_pending_prices, "interval", minutes=10, id="resync_prices")
+    # 🔴-D13：冻结的预约单自愈（file_ready 从此不来的情形），冻结超 30 分钟就解冻/标超时
+    scheduler.add_job(release_stuck_frozen_orders, "interval", minutes=5,
+                      id="release_stuck_frozen")
     scheduler.start()
     print("定时扫描已启动（任务扫描每 30s，预约扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
 

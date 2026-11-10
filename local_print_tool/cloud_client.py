@@ -553,6 +553,10 @@ class CloudClient(QObject):
         self._auth_fail_stop = False       # auth_fail 达到最大重试次数后停止自动重连
         self._stability_timer: threading.Timer | None = None  # 连接稳定 N 秒后清零退避计数
         self._last_replay_attempt = 0.0    # status_queue 重放退避时间戳（60s 间隔）
+        # 🔴-D20：等云端回执的 print_success / print_fail（task_id → {status, payload, ts}）。
+        # python-socketio 的 emit 只是"塞进缓冲"，链路半开时既不抛异常也没有回应 ——
+        # 不登记就永远不知道服务端到底收没收到（现场：纸被拿走了，账上 3 分钟后判失败）。
+        self._pending_ack: dict[int, dict] = {}
         self._replay_lock = threading.Lock()  # 重放退避门闩锁，防 GUI/后台线程并发重复重放
         # status_queue.json 读-改-写锁：_queue_status_sync 由 GUI 线程调用、
         # sync_pending_statuses 由连接线程调用，两者都是「整文件覆盖写」——
@@ -856,6 +860,8 @@ class CloudClient(QObject):
             try:
                 self._sio.emit("print_success", payload)
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印成功")
+                # 🔴-D20：emit 不抛异常 ≠ 云端收到。登记待回执，15 秒没 ack 就转离线队列重放。
+                self._register_pending_ack(task_id, "sent", payload)
                 return
             except Exception as e:
                 # P0-4: 在线上报 emit 异常也走离线队列兜底，避免状态丢失
@@ -869,6 +875,8 @@ class CloudClient(QObject):
             try:
                 self._sio.emit("print_fail", {"task_id": task_id, "error": error})
                 self.status_message.emit(f"☁ 任务 #{task_id} 上报: 打印失败 — {error}")
+                # 🔴-D20：同 report_success，等云端 print_fail_ack
+                self._register_pending_ack(task_id, "failed", {"error": error})
                 return
             except Exception as e:
                 # P0-4: 同 report_success，发送失败转入离线队列兜底
@@ -1070,6 +1078,60 @@ class CloudClient(QObject):
                 logger.warning(f"status_queue 超过 {STATUS_QUEUE_MAX} 条，丢弃最旧 {dropped} 条")
             self._write_status_queue_locked(queue)
         self.status_message.emit(f"☁ 状态同步已暂存: 订单 #{order_id} → {status}")
+
+    # ── 上报回执（🔴-D20） ──
+
+    ACK_TIMEOUT_SEC = 15.0
+
+    def _register_pending_ack(self, task_id: int, status: str, payload: dict | None) -> None:
+        """登记一次「已经 emit、还没确认云端收到」的上报。
+
+        15 秒内没等到 ``print_success_ack`` / ``print_fail_ack`` 就把它按离线队列重放：
+        半开链路（后端重启、代理抖动）下 emit 不会抛异常，而 ``check_printing_timeout``
+        3 分钟后会把这一单判 failed —— 纸已经被顾客拿走了，账上却没这笔。
+        """
+        key = int(task_id or 0)
+        if not key:
+            return
+        with self._status_queue_lock:
+            self._pending_ack[key] = {
+                "status": status,
+                "payload": dict(payload or {}),
+                "ts": time.time(),
+            }
+        t = threading.Timer(self.ACK_TIMEOUT_SEC, self._check_ack_timeout, args=(key,))
+        t.daemon = True
+        t.start()
+
+    def _clear_pending_ack(self, task_id) -> None:
+        """云端回了回执：撤掉这条待确认的上报。"""
+        try:
+            key = int(task_id or 0)
+        except (TypeError, ValueError):
+            return
+        with self._status_queue_lock:
+            item = self._pending_ack.pop(key, None)
+        if item:
+            logger.info(f"任务 #{key} 的上报已收到云端回执（{item.get('status')}）")
+
+    def _check_ack_timeout(self, task_id: int) -> None:
+        """15 秒没回执 ⇒ 当作"没送到"，转离线队列（重连后重放，payload 原样带上）。"""
+        with self._status_queue_lock:
+            item = self._pending_ack.pop(int(task_id or 0), None)
+        if not item:
+            return
+        status = str(item.get("status") or "")
+        if status not in ("sent", "failed"):
+            return
+        logger.warning(f"任务 #{task_id} 的 {status} 上报 {self.ACK_TIMEOUT_SEC:.0f} 秒没有云端回执，"
+                       f"转入离线队列重放")
+        try:
+            self.status_message.emit(
+                f"☁ 任务 #{task_id}：{self.ACK_TIMEOUT_SEC:.0f} 秒没收到云端回执，"
+                f"已转入离线队列（重连后自动补报）")
+        except Exception:
+            pass
+        self._queue_status_sync(0, status, task_id=task_id, payload=item.get("payload") or {})
 
     def _try_status_sync(self, order_id: int, status: str) -> bool:
         """尝试同步状态到后端，失败则加入离线队列。返回是否成功。"""
@@ -1752,6 +1814,20 @@ class CloudClient(QObject):
         @sio.on("pong")
         def _on_pong():
             pass
+
+        # 🔴-D20：print_success / print_fail 的回执。收到就撤掉待确认登记，
+        # 没收到（半开链路）则由 ACK_TIMEOUT_SEC 计时器转离线队列重放。
+        @sio.on("print_success_ack")
+        def _on_print_success_ack(data):
+            if self._sio is not sio:
+                return  # 旧连接的迟到回调
+            self._clear_pending_ack((data or {}).get("task_id"))
+
+        @sio.on("print_fail_ack")
+        def _on_print_fail_ack(data):
+            if self._sio is not sio:
+                return
+            self._clear_pending_ack((data or {}).get("task_id"))
 
         @sio.on("auth_fail")
         def _on_auth_fail(data):
