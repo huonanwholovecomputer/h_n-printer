@@ -1,9 +1,9 @@
 {
-  "version": "4.6.9",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.9.exe",
-  "md5": "5cf131b0d3f7879f45064ff363ffd8c5",
-  "sha256": "0b61183271c83bd2b41518bc213ddb1dde814ff2e77a698d9085a9402be73c76",
-  "notes": "v4.6.9：主界面底部新增「🖨 打印列表自动弹出」开关 —— 以前每次打印，那个任务列表窗口都会自己弹出来，现在可以关掉：取消勾选后它不再自动出现（包括启动时恢复上次没打完的攒批纸叠），需要看队列时点底部「🖨 打印中 N · 排队 M」或「🖐 攒批 …」手动打开；两种设置下打完后都会自动收起。默认保持勾选，与以前的习惯一致。",
+  "version": "4.6.10",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.10.exe",
+  "md5": "1349f6e1754440fe0f198c09baecc897",
+  "sha256": "1e7e637f7fa7ba7de1aa8cd84947195299c8cd81cf3376886f35911cdeb6ae3f",
+  "notes": "v4.6.10：两处「纸打了、程序不认账」的修复。① 攒批整叠第 2 趟打完后，如果那一页被删过或重编号过，程序会认不回这叠纸，退出时弹「还有没打印完的文件」并把这些单按「放弃打印」上报 —— 现在标签页重编号时，纸叠清单里的归属页会一起搬；真的找不回也会明确告诉你哪一份要人工核对，不再静默。② 结算页「用户」下拉里不再出现从没下过单的自动生成占位昵称（user_xxxxxxxx）。",
   "sig_algo": "ed25519",
-  "sig": "lyHAxuShH7H63K5Aa+naC8ZVjnruRuo9dCs9U7LuGZSvKEvwsDPZ10bHVxl+ad8xCsopVDfKdNW/gtiF9cKeBA=="
+  "sig": "3I4MtEtd2lZeESz6TttmYe9BR+i1C59qM2cG441TaAjzcxgVpejJChBeFgcc06rj1kJsfaGD9qW0PXm2bXrCBw=="
 }
