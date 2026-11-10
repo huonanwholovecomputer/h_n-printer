@@ -11567,6 +11567,30 @@ class MainWindow(QMainWindow):
             reconvert_action.triggered.connect(
                 lambda checked=False, rs=list(rows): self._force_reconvert_rows(rs))
             menu.addSeparator()
+            # 预览转换好的 PDF（2026-11-09 用户需求）：只读操作，锁定标签页也照常可用。
+            # 灰度只用便宜判据（有缓存产物 / 原件就是 PDF / 页数已知 ⇒ 曾转换成功）；
+            # 真正的缓存查找放到点击时 —— 那要算 MD5，不能在每次右键时对每行都做。
+            _pv_rows = [r for r in rows if r < len(_jobs_now)
+                        and self._preview_pdf_available(_jobs_now[r])]
+            _pv_n = len(_pv_rows)
+            preview_action = menu.addAction(
+                f"👁 预览 PDF（{n} 个文件）" if n > 1 else "👁 预览 PDF")
+            preview_action.setEnabled(_pv_n > 0)
+            if _pv_n == 0:
+                preview_action.setToolTip(
+                    "灰色：这份文件还没有转换好的 PDF。\n"
+                    "如果页数显示「?」，说明正在转换或转换失败 —— 等转换完成，"
+                    "或用右键「🔄 重新转换」后再试。")
+            elif _pv_n < n:
+                preview_action.setToolTip(
+                    f"用系统默认程序打开转换好的 PDF（选中的 {n} 个里 {_pv_n} 个已转换完成）。\n"
+                    "其余的还在转换、或没有可用的 PDF；源文件不受影响")
+            else:
+                preview_action.setToolTip(
+                    "用系统默认程序打开这份文件转换好的 PDF\n"
+                    "（就是排好版式、真正要打印的那份；源文件不受影响）")
+            preview_action.triggered.connect(
+                lambda checked=False, rs=list(rows): self._preview_pdf_rows(rs))
             # 打开文件位置（只读，始终可用）
             anchor_row = clicked_row if clicked_row >= 0 else rows[0]
             name_item = self._table.item(anchor_row, self.COL_FILE)
@@ -11584,6 +11608,121 @@ class MainWindow(QMainWindow):
         paste_action.triggered.connect(self._on_paste_files)
 
         return menu
+
+    def _preview_pdf_available(self, job: PrintJob) -> bool:
+        """这份任务此刻有没有可预览的 PDF（**便宜判据**，右键构造菜单时每行都要算）。
+
+        ① 本会话已经转换好的 cached_pdf 还在；
+        ② 原件本身就是 PDF（不需要转换）；
+        ③ 页数已知（>0）⇒ 它成功转过一次；重启后 cached_pdf 是空的（不持久化），
+           点击时再按缓存 key 把产物找回来（见 _preview_pdf_source）。
+        """
+        cached = getattr(job, "cached_pdf", "") or ""
+        if cached and os.path.isfile(cached):
+            return True
+        src = getattr(job, "file_path", "") or ""
+        if src and os.path.splitext(src)[1].lower() == ".pdf" and os.path.isfile(src):
+            return True
+        return int(getattr(job, "page_count", 0) or 0) > 0
+
+    def _preview_pdf_source(self, job: PrintJob) -> str:
+        """返回这份任务「转换好的 PDF」的路径；没有就返回 ""。只读，不改 job 状态。
+
+        重启后 cached_pdf 为空（不持久化），这里按与 _start_convert_worker **同一套**
+        缓存 key（方向后缀 / 引擎后缀 / 表格版式）去 pdf_cache 里找回来 —— 否则
+        「重启后想先看一眼再打印」永远是灰的。
+        """
+        cached = getattr(job, "cached_pdf", "") or ""
+        if cached and os.path.isfile(cached):
+            return cached
+        src = getattr(job, "file_path", "") or ""
+        if not src or not os.path.isfile(src):
+            return ""
+        ext = os.path.splitext(src)[1].lower()
+        if ext == ".pdf":
+            return src
+        source_md5 = getattr(job, "source_md5", "") or ""
+        if not source_md5:
+            try:
+                if self._cloud_client:
+                    source_md5 = self._cloud_client._compute_md5_file(src)
+                else:
+                    import hashlib
+                    m = hashlib.md5()
+                    with open(src, "rb") as f:
+                        for chunk in iter(lambda: f.read(65536), b""):
+                            m.update(chunk)
+                    source_md5 = m.hexdigest()
+            except Exception:
+                logger.debug("预览 PDF：计算源文件 MD5 失败 %s", src, exc_info=True)
+                return ""
+        if not source_md5:
+            return ""
+        try:
+            import paths as _paths
+            image_orientation = getattr(job, "image_orientation", "auto") or "auto"
+            if ext in (".xls", ".xlsx"):
+                import xlsx_printer as _xp
+                _print_options = resolve_xlsx_print_options(
+                    self._config.default_task_options,
+                    getattr(job, "xlsx_options", {}) or {})
+                return (_xp.find_cached_pdf(source_md5, image_orientation,
+                                            cache_dir=_paths.pdf_cache_dir(),
+                                            print_options=_print_options) or "")
+            _cache_engine = cache_engine_for(src, self._resolve_engine(job))
+            path = os.path.join(_paths.pdf_cache_dir(),
+                                pdf_cache_key(source_md5, image_orientation,
+                                              _cache_engine) + ".pdf")
+            return path if os.path.isfile(path) else ""
+        except Exception:
+            logger.debug("预览 PDF：查找转换产物失败 %s", src, exc_info=True)
+            return ""
+
+    def _preview_pdf_rows(self, rows) -> int:
+        """右键「预览 PDF」：用系统默认程序打开这些行转换好的 PDF，返回实际打开的文件数。
+
+        打不开的（还在转换 / 转换失败 / 缓存被清理）不弹窗打断批量操作，只记一行日志；
+        一个都没打开时才弹提示说清下一步。同一份 PDF 只开一个窗口（多行可能同源）。
+        """
+        jobs = self._get_current_jobs()
+        rows = sorted({r for r in (rows or [])
+                       if isinstance(r, int) and 0 <= r < len(jobs)})
+        opened = 0
+        missing: list[str] = []
+        seen_paths: set[str] = set()
+        for row in rows:
+            job = jobs[row]
+            src = getattr(job, "file_path", "") or ""
+            name = (getattr(job, "display_name", "") or os.path.basename(src) or "?")
+            path = self._preview_pdf_source(job)
+            if not path:
+                missing.append(name)
+                continue
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen_paths:      # 同一份 PDF（多行内容相同）只开一个窗口
+                opened += 1
+                continue
+            seen_paths.add(key)
+            try:
+                os.startfile(path)
+                opened += 1
+            except Exception as e:
+                logger.debug("预览 PDF：打开失败 %s", path, exc_info=True)
+                self._log(f"⚠ 预览 PDF 失败：{name}（{e}）")
+                missing.append(name)
+        if opened:
+            msg = f"👁 预览 PDF：已用默认程序打开 {opened} 个"
+            if missing:
+                msg += f"；{len(missing)} 个没有可用的 PDF"
+            self._log(msg)
+        elif missing:
+            QMessageBox.information(
+                self, "预览 PDF",
+                "还没有可预览的转换产物：\n"
+                + "、".join(missing[:5]) + ("…" if len(missing) > 5 else "")
+                + "\n\n如果页数显示「?」，说明 PDF 正在转换或转换失败；\n"
+                  "等转换完成后再试，或用右键「🔄 重新转换」。")
+        return opened
 
     def _add_rows_to_new_tab(self, rows) -> str | None:
         """把选中行**复制**到新标签页并切换过去（原标签页原样不动）。
