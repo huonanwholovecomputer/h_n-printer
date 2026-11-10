@@ -12563,10 +12563,27 @@ def admin_order_user():
 
     raw_openid = data.get("openid")
     new_openid = raw_openid.strip() if isinstance(raw_openid, str) else ""
-    if (not new_openid or len(new_openid) > 128
-            or new_openid == "local" or new_openid.startswith("dev_")
-            or not re.fullmatch(r"[A-Za-z0-9_.\-]+", new_openid)):
-        return jsonify({"success": False, "message": "目标用户不合法"}), 400
+    raw_owner = data.get("owner_name")
+    new_owner = raw_owner.strip() if isinstance(raw_owner, str) else ""
+    # v7.19：两种归属口径互斥 —— 云端订单改 openid（真的转给某个账号），本地订单改
+    # owner_name（只改变展示归属，不涉及登录）。同时给或都不给一律 fail-closed。
+    if new_openid and new_owner:
+        return jsonify({"success": False, "message": "openid 与 owner_name 只能二选一"}), 400
+    if not new_openid and not new_owner:
+        return jsonify({"success": False,
+                        "message": "缺少目标用户（openid 或 owner_name）"}), 400
+    if new_openid:
+        if (len(new_openid) > 128
+                or new_openid == "local" or new_openid.startswith("dev_")
+                or not re.fullmatch(r"[A-Za-z0-9_.\-]+", new_openid)):
+            return jsonify({"success": False, "message": "目标用户不合法"}), 400
+        target = None
+    else:
+        # 所属人只是一个展示名（统计/分账按它分组），没有账号可校验；只挡空值、
+        # 超长和控制字符，避免把不可见字符写进 /api/admin/statistics/owners 的分组键。
+        if (len(new_owner) > 32 or not new_owner
+                or re.search(r"[\x00-\x1f]", new_owner)):
+            return jsonify({"success": False, "message": "目标所属人不合法"}), 400
 
     by = data.get("by")
     by = by.strip()[:32] if isinstance(by, str) else ""
@@ -12574,32 +12591,70 @@ def admin_order_user():
 
     # 目标用户必须真实存在：把订单转给一个没人能登录的 openid，等于让这单从所有
     # 「我的订单」里消失（旧用户看不到、新用户不存在）—— 这才是这次调整最危险的失败态。
-    user_conn = get_user_db()
-    try:
-        target = user_conn.execute(
-            "SELECT openid, nickname FROM users WHERE openid = ?", (new_openid,)
-        ).fetchone()
-    finally:
-        user_conn.close()
-    if not target:
-        return jsonify({"success": False, "message": "目标用户不存在"}), 404
-    new_nickname = (target["nickname"] or "").strip()
+    new_nickname = ""
+    if new_openid:
+        user_conn = get_user_db()
+        try:
+            target = user_conn.execute(
+                "SELECT openid, nickname FROM users WHERE openid = ?", (new_openid,)
+            ).fetchone()
+        finally:
+            user_conn.close()
+        if not target:
+            return jsonify({"success": False, "message": "目标用户不存在"}), 404
+        new_nickname = (target["nickname"] or "").strip()
 
     with db_lock:
         conn = get_db_conn()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT openid FROM orders WHERE id = ?", (s_id,)
+                "SELECT openid, owner_name FROM orders WHERE id = ?", (s_id,)
             ).fetchone()
             if not row:
                 conn.rollback()
                 return jsonify({"success": False, "message": "订单不存在"}), 404
             prev_openid = row["openid"] or ""
+            prev_owner = row["owner_name"] or ""
             if prev_openid == "local":
+                # 本地归属订单没有可转的账号：只允许改展示所属人（owner_name）。
+                if not new_owner:
+                    conn.rollback()
+                    return jsonify({"success": False,
+                                    "message": "本地归属订单不支持改云端用户，"
+                                               "只能调整所属人"}), 400
+                if prev_owner == new_owner:
+                    conn.commit()
+                    return jsonify({
+                        "success": True,
+                        "message": "订单已属于该所属人",
+                        "order_id": s_id,
+                        "owner_name": new_owner,
+                        "previous_owner_name": prev_owner,
+                        "manual_user_by": by,
+                        "manual_user_at": "",
+                    })
+                conn.execute(
+                    "UPDATE orders SET owner_name = ?, manual_user_by = ?, "
+                    "manual_user_at = ? WHERE id = ?",
+                    (new_owner, by, fixed_at, s_id),
+                )
+                conn.commit()
+                print(f"  [FIX] 订单 #{s_id} 归属人人工调整: {prev_owner} → {new_owner}"
+                      f"（by={by or '-'}）")
+                return jsonify({
+                    "success": True,
+                    "message": "订单所属人已调整",
+                    "order_id": s_id,
+                    "owner_name": new_owner,
+                    "previous_owner_name": prev_owner,
+                    "manual_user_by": by,
+                    "manual_user_at": fixed_at,
+                })
+            if new_owner:
                 conn.rollback()
                 return jsonify({"success": False,
-                                "message": "本地归属订单不支持改云端用户"}), 400
+                                "message": "云端订单请用 openid 调整所属用户"}), 400
             if prev_openid == new_openid:
                 conn.commit()
                 return jsonify({

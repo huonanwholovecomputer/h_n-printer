@@ -9,7 +9,9 @@
   · 改的是 orders.openid —— 订单的**实际归属用户**，小程序 / APP 的「我的订单」跟着变；
   · 不碰 status / locked_at / order_files / 设备通知，也不改 files.openid（上传者与保留期配额）；
   · 与状态/类型共用 unlocked.orderstatus 与同一个密码模块（不新增 PASSWORD_KEYS 项）；
-  · 只接云端订单；目标 openid 必须已存在于 users 表（否则这单会从所有人的「我的订单」里消失）。
+  · 两种归属口径（v7.19 补齐本地单）：
+      云端订单改 orders.openid —— 目标 openid 必须已存在于 users 表；
+      本地来源订单（openid === 'local'）改 orders.owner_name —— 只改展示归属，不涉及登录。
 
 本脚本分两部分：
 
@@ -82,6 +84,10 @@ chk("_orderUserEditable 存在且覆盖本地模式 / 外部监视单 / 非十�
     and "/^[0-9]+$/" in _gate_body
     and "unlocked.orderstatus" in _gate_body,
     _gate_body.strip()[:160])
+chk("本地来源单（openid='local'）不再被可编辑判据挡掉（v7.19）",
+    "return !!(o && o.openid);" in _gate_body
+    and "o.openid !== 'local'" not in _gate_body,
+    _gate_body.strip()[-80:])
 chk("用户列的可编辑分支才渲染 st-caret 小箭头",
     re.search(r"_orderUserEditable\(oidS\)[\s\S]{0,400}?st-caret", html) is not None)
 chk("用户标签 onclick 调 openOrderUserMenu",
@@ -104,9 +110,17 @@ chk("列表重绘时先收状态菜单、再收用户菜单（菜单挂在 body 
 # A5 提交：走代理写接口，成功后本地改 openid/nickname + 清缓存 + 重绘
 chk("applyOrderUser 走 /api/proxy/admin/order_user（POST）",
     re.search(r"fetch\('/api/proxy/admin/order_user', \{\s*\n\s*method: 'POST'", html) is not None)
-chk("POST body = {order_id, openid, by}",
-    re.search(r"body: JSON\.stringify\(\{ order_id: String\(oid\), openid: pick\.openid, by: by \}\)",
-              html) is not None)
+chk("POST body 按归属口径二选一：云端 openid / 本地 owner_name",
+    re.search(r"var payload = \{ order_id: String\(oid\), by: by \};", html) is not None
+    and re.search(r"if \(isLocal\) payload\.owner_name = pick\.name;", html) is not None
+    and re.search(r"else payload\.openid = pick\.openid;", html) is not None
+    and "body: JSON.stringify(payload)" in html)
+chk("本地单候选人来自身份名单 + 历史归属人（_localOwnerCandidates）",
+    re.search(r"function _localOwnerCandidates\(o\)", html) is not None
+    and re.search(r"String\(\(o && o\.openid\) \|\| ''\) === 'local'\) return _localOwnerCandidates\(o\)",
+                  html) is not None
+    and re.search(r"\(getMembers\(\) \|\| \[\]\)\.forEach", html) is not None
+    and re.search(r"o\.owner_name = res\.owner_name \|\| pick\.name;", html) is not None)
 chk("成功后本地改 openid 与 nickname",
     re.search(r"o\.openid = res\.openid \|\| pick\.openid;[\s\S]{0,200}?o\.nickname =", html) is not None)
 chk("成功后清 _scopeCache 并 invalidateUsage（成员归组/KPI 一起重算）",
@@ -138,6 +152,18 @@ chk("后端拒绝 local / dev_ / 非法字符 openid",
     and re.search(r"re\.fullmatch\(r\"\[A-Za-z0-9_\.\\-\]\+\", new_openid\)", app_src) is not None)
 chk("后端要求目标用户必须存在于 users 表",
     re.search(r"SELECT openid, nickname FROM users WHERE openid = \?", app_src) is not None)
+# v7.19：本地来源订单改 owner_name（只改展示归属；绝不写 order_files）
+chk("后端本地单分支 UPDATE orders.owner_name",
+    "UPDATE orders SET owner_name = ?, manual_user_by = ?, " in app_src
+    and "只允许改展示所属人" in app_src)
+chk("本地单改 openid 仍 400、云端单带 owner_name 也 400",
+    "只能调整所属人" in app_src and "云端订单请用 openid 调整所属用户" in app_src)
+chk("owner_name 与 openid 二选一 + 长度/控制字符校验",
+    "openid 与 owner_name 只能二选一" in app_src
+    and "len(new_owner) > 32" in app_src
+    and re.search(r"re\.search\(r\"\[\\x00-\\x1f\]\", new_owner\)", app_src) is not None)
+chk("本地单分支提交后再回执（不把改动留在未提交事务里）",
+    re.search(r"UPDATE orders SET owner_name =[\s\S]{0,400}?conn\.commit\(\)", app_src) is not None)
 chk("revenue 下发 assignable_users 且排除设备账号",
     re.search(r"assignable_users", app_src) is not None
     and re.search(r"substr\(openid, 1, 4\) != 'dev_'", app_src) is not None)
@@ -149,12 +175,16 @@ chk("_PROXY_ALLOWED_TARGETS 登记 /api/admin/order_user",
     '"/api/admin/order_user"' in stats_src)
 chk("FINANCE_WRITE_MODULES 把 order_user 归到 orderstatus 模块",
     re.search(r'"/api/proxy/admin/order_user": "orderstatus"', stats_src) is not None)
-chk("回执透传补 openid / previous_openid / manual_user_by",
+chk("回执透传补 openid / owner_name / previous_* / manual_user_by",
     re.search(r'for _k in \("openid", "nickname", "previous_openid",\s*\n\s*'
+              r'"owner_name", "previous_owner_name",\s*\n\s*'
               r'"manual_user_by", "manual_user_at"\)', stats_src) is not None)
 chk("审计扩成 status/type/user 三分支且 user 记 before=previous_openid",
     re.search(r'target_path\.endswith\("/order_user"\)', stats_src) is not None
     and re.search(r'previous_openid', stats_src) is not None)
+chk("v7.19 审计：本地单摘要记 owner_name / previous_owner_name",
+    'field = "owner_name" if body.get("owner_name") else "openid"' in stats_src
+    and '"previous_owner_name" if field == "owner_name"' in stats_src)
 
 # ============================================================================
 print("\n=== B. 行为验收（真实 Flask + 真实 SQLite）===")
@@ -210,10 +240,18 @@ def mk_order(openid="wx-old-openid-0001", status="sent", number="HN-USER-1"):
     return oid
 
 
+def set_owner(oid, name):
+    conn = backend.get_db()
+    conn.execute("UPDATE orders SET owner_name = ? WHERE id = ?", (name, oid))
+    conn.commit()
+    conn.close()
+
+
 def state(oid):
     conn = backend.get_db()
     o = conn.execute(
-        "SELECT openid, status, manual_user_by, manual_user_at FROM orders WHERE id = ?",
+        "SELECT openid, owner_name, status, manual_user_by, manual_user_at"
+        " FROM orders WHERE id = ?",
         (oid,)).fetchone()
     files = conn.execute(
         "SELECT status, locked_at FROM order_files WHERE order_id = ? ORDER BY id",
@@ -283,11 +321,43 @@ chk("同 openid 仍 200 成功（不报错、不重写留痕）", r.status_code 
     and j.get("success") is True and j.get("previous_openid") == NEW, j)
 chk("幂等提交不覆盖原留痕（manual_user_by 仍是管理员A）", st2["manual_user_by"] == "管理员A", st2)
 
-print("\n-- B5 本地归属订单（openid='local'）无此入口 --")
+print("\n-- B5 本地归属订单：改 openid 依旧拒绝（不能把本地单变成云端单） --")
 oid_local = mk_order(openid="local", number="HN-USER-LOCAL")
+set_owner(oid_local, "张老三")
+before_local = state(oid_local)
 r = post({"order_id": oid_local, "openid": NEW})
-chk("local 单 → 400 且归属未变", r.status_code == 400
-    and state(oid_local)[0]["openid"] == "local", r.get_json())
+chk("local 单 + openid → 400 且归属未变", r.status_code == 400
+    and state(oid_local) == before_local, r.get_json())
+
+print("\n-- B5b 本地归属订单：改 owner_name（v7.19 新增入口） --")
+for bad_owner in ("", "   ", "x" * 33, "\u0001张三"):
+    r = post({"order_id": oid_local, "owner_name": bad_owner})
+    chk("非法 owner_name %r → 400 且库未动" % (bad_owner[:8],), r.status_code == 400
+        and state(oid_local) == before_local, r.get_json())
+r = post({"order_id": oid_local, "openid": NEW, "owner_name": "李四"})
+chk("openid 与 owner_name 同时给 → 400", r.status_code == 400, r.get_json())
+
+r = post({"order_id": oid_local, "owner_name": "李四", "by": "管理员C"})
+j = r.get_json()
+st, files = state(oid_local)
+chk("本地单改成功 200", r.status_code == 200 and j.get("success") is True, j)
+chk("owner_name 已改、openid 仍是 local", st["owner_name"] == "李四"
+    and st["openid"] == "local", st)
+chk("回执带 owner_name / previous_owner_name", j.get("owner_name") == "李四"
+    and j.get("previous_owner_name") == "张老三", j)
+chk("留痕 manual_user_by / manual_user_at 已写", st["manual_user_by"] == "管理员C"
+    and bool(st["manual_user_at"]), st)
+chk("订单状态与子任务一点没动", st["status"] == "sent"
+    and files == [("sent", "2026-11-09 10:00:00")], (st, files))
+
+print("\n-- B5c 本地单幂等 + 云端单带 owner_name 拒绝 --")
+r = post({"order_id": oid_local, "owner_name": "李四", "by": "管理员D"})
+j = r.get_json()
+chk("本地单同所属人重复提交 → 200 且不重写留痕", r.status_code == 200
+    and j.get("success") is True and j.get("previous_owner_name") == "李四"
+    and state(oid_local)[0]["manual_user_by"] == "管理员C", j)
+r = post({"order_id": oid, "owner_name": "李四"})
+chk("云端单带 owner_name → 400", r.status_code == 400, r.get_json())
 
 print("\n-- B6 订单不存在 --")
 r = post({"order_id": 99999999, "openid": NEW})
@@ -307,6 +377,10 @@ uids = [u.get("openid") for u in users]
 chk("assignable_users 含新旧用户", OLD in uids and NEW in uids, uids)
 chk("assignable_users 排除设备账号与已移除账号",
     not any(str(x).startswith("dev_") for x in uids) and "wx-removed-0003" not in uids, uids)
+row_local = next((o for o in orders if str(o.get("order_id")) == str(oid_local)), None)
+chk("revenue 里本地单的 owner_name 跟着改（openid 仍是 local）", row_local is not None
+    and row_local.get("owner_name") == "李四"
+    and row_local.get("openid") == "local", row_local)
 
 shutil.rmtree(TMP, ignore_errors=True)
 

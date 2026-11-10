@@ -1444,6 +1444,8 @@ def _extract_proxy_body(resp) -> dict:
     v7.1 订单类型订正——同款白名单问题，不补就「改成功但页面不知道原来是什么类型」）。
     v7.18 额外透传 openid / nickname / previous_openid / manual_user_by / manual_user_at
     （/api/admin/order_user 的回执——页面要用新昵称刷新那一格、并在 tooltip 里显示标记人）。
+    v7.19 追加 owner_name / previous_owner_name：本地来源订单没有云端账号，回执只能给
+    展示所属人（页面据此刷新「用户」列、空着就退回本地 pick，不至于显示成 undefined）。
     一律「响应当中有才透传」，不存在时不填空值（语义同上面几个）。"""
     try:
         data = resp.json()
@@ -1478,7 +1480,9 @@ def _extract_proxy_body(resp) -> dict:
         if _k in data:
             out[_k] = data[_k]
     # v7.18 订单归属用户调整的回执（order_user）：新用户 / 新昵称 / 原用户 / 标记人与时刻
+    # v7.19 本地来源订单走 owner_name（展示所属人），回执字段一并透传
     for _k in ("openid", "nickname", "previous_openid",
+               "owner_name", "previous_owner_name",
                "manual_user_by", "manual_user_at"):
         if _k in data:
             out[_k] = data[_k]
@@ -2123,11 +2127,16 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             if (target_path.endswith("/order_status")
                     or target_path.endswith("/order_type") or _is_user):
                 is_status = target_path.endswith("/order_status")
-                field = ("openid" if _is_user
-                         else ("status" if is_status else "order_type"))
-                before = result.get(("previous_openid" if _is_user
-                                     else ("previous_status" if is_status
-                                           else "previous_order_type")))
+                if _is_user:
+                    # v7.19：本地来源单改的是 owner_name，云端单改 openid —— 摘要里的
+                    # 字段名与「改前值」都要跟着口径走，否则审计里只剩一个 None。
+                    field = "owner_name" if body.get("owner_name") else "openid"
+                    before = result.get("previous_owner_name" if field == "owner_name"
+                                        else "previous_openid")
+                else:
+                    field = "status" if is_status else "order_type"
+                    before = result.get("previous_status" if is_status
+                                        else "previous_order_type")
                 sec.audit("order_fix", module="orderstatus",
                           fields={"order_id": body.get("order_id"), field: body.get(field),
                                   "before": before},

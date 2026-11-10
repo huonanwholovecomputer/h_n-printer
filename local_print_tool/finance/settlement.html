@@ -4773,17 +4773,19 @@ function _findCloudOrder(oid) {
   }
   return null;
 }
-/* ==================== v7.18：订单「用户」列调整归属（与「状态」同一把锁） ====================
+/* ==================== v7.18 / v7.19：订单「用户」列调整归属（与「状态」同一把锁） ====================
    用户要求（2026-11-09）：用户列照状态列的做法加锁 + 可改，快捷把这一单转给另一位用户。
-   与状态/类型订正的差别：这里改的是订单**归属**（orders.openid），小程序 / APP 的「我的订单」
-   跟着变；状态、来源、打印作业、子任务一律不碰（后端 /api/admin/order_user 同此口径）。
-   本地单与外部监视单没有云端归属，保持只读。 */
+   与状态/类型订正的差别：这里改的是订单**归属**，状态、来源、打印作业、子任务一律不碰。
+   - 云端订单：改 orders.openid，小程序 / APP 的「我的订单」跟着变；
+   - 本地来源订单（openid === 'local'）：没有云端账号可转，改 orders.owner_name 展示所属人
+     （v7.19 补齐 —— 此前本地单整列只读，用户反馈「本地打印订单不支持调整所属人」）。
+   外部监视单没有归属可调（设备所有者由账本记），保持只读。 */
 function _orderUserEditable(oidS) {
   if (FINANCE_MODE === 'local' || !unlocked.orderstatus || !oidS) return false;
   if (_isExternalOrder(oidS)) return false;
   if (!/^[0-9]+$/.test(String(oidS))) return false;
   var o = _findCloudOrder(oidS);
-  return !!(o && o.openid && o.openid !== 'local');
+  return !!(o && o.openid);
 }
 function _orderUserLockHTML() {
   if (FINANCE_MODE === 'local') return '';
@@ -4794,8 +4796,11 @@ function _orderUserLockHTML() {
     ' onclick="event.stopPropagation();toggleOrderStatusLock()">' + (on ? '🔓' : '🔒') + '</button>';
 }
 /* 候选名单 = 当前用户（置顶、标「✓ 当前」）+ 云端随 revenue 下发的真实用户（排除设备账号）。
-   当前用户不在名单里（例如已移除账号）也要能看见自己，所以先 unshift 再补池子。 */
+   当前用户不在名单里（例如已移除账号）也要能看见自己，所以先 unshift 再补池子。
+   v7.19：本地来源订单没有账号，候选按「展示名」给（当前所属人 + 成员名单 + 数据里出现过的
+   本地归属人），这样才转得回去、也不会转给一个界面上不存在的名字。 */
 function _orderUserCandidates(o) {
+  if (String((o && o.openid) || '') === 'local') return _localOwnerCandidates(o);
   var list = [];
   var seen = {};
   var cur = (o && o.openid) ? String(o.openid) : '';
@@ -4809,6 +4814,24 @@ function _orderUserCandidates(o) {
     if (!k || seen[k]) return;
     seen[k] = true;
     list.push({ openid: k, nickname: u.nickname || '', cur: false });
+  });
+  return list;
+}
+/* v7.19：本地订单的候选所属人（只有展示名，没有 openid）。顺序 = 当前 → 成员名单 → 已出现过的
+   本地归属人；这样当前单不会因为「成员名单为空」而无法调整，也不会把历史归属人弄丢。 */
+function _localOwnerCandidates(o) {
+  var list = [];
+  var seen = {};
+  function add(name, cur) {
+    name = String(name == null ? '' : name).trim();
+    if (!name || seen[name]) return;
+    seen[name] = true;
+    list.push({ name: name, cur: !!cur });
+  }
+  add((o && o.owner_name) || '', true);
+  (getMembers() || []).forEach(function (m) { add(m && m.name, false); });
+  ((_cloudData && _cloudData.orders) || []).forEach(function (x) {
+    if (String((x && x.openid) || '') === 'local') add(x && x.owner_name, false);
   });
   return list;
 }
@@ -4837,7 +4860,9 @@ function openOrderUserMenu(ev, oid) {
   if (!o) return;
   var list = _orderUserCandidates(o);
   if (list.length <= 1) {
-    toast('ℹ️ 暂无可调整的用户（用户表里还没有其他可用账号）');
+    toast('ℹ️ ' + (String(o.openid || '') === 'local'
+      ? '暂无可调整的所属人（先在「设置 → 成员」里加人）'
+      : '暂无可调整的用户（用户表里还没有其他可用账号）'));
     return;
   }
   var anchor = (ev && ev.currentTarget) || (ev && ev.target) || null;
@@ -4849,7 +4874,8 @@ function openOrderUserMenu(ev, oid) {
   var limit = Math.min(list.length, 200);
   for (var i = 0; i < limit; i++) {
     var u = list[i];
-    var label = u.nickname || (u.openid ? String(u.openid).substring(0, 8) + '…' : '未命名');
+    var label = u.name || u.nickname ||
+      (u.openid ? String(u.openid).substring(0, 8) + '…' : '未命名');
     html += '<button type="button" class="st-menu-item' + (u.cur ? ' cur' : '') + '"' +
       (u.cur ? ' disabled' : '') +
       ' onclick="applyOrderUser(\'' + esc(String(oid)) + '\',' + i + ')">' +
@@ -4875,8 +4901,8 @@ function openOrderUserMenu(ev, oid) {
   setTimeout(function () { document.addEventListener('click', _stMenuOutside); }, 0);
 }
 var _orderUserSaving = false;
-/* 提交：只改归属；成功后本地改 openid/nickname/manual_user_* 并整页重绘（成员归组、
-   by_user、成员胶囊一起按新归属重算），失败什么都不改。 */
+/* 提交：只改归属；成功后本地改归属字段（云端 openid/nickname、本地 owner_name）与
+   manual_user_* 并整页重绘（成员归组、by_user、成员胶囊一起按新归属重算），失败什么都不改。 */
 function applyOrderUser(oid, idx) {
   closeOrderUserMenu();
   if (!_orderUserEditable(oid) || _orderUserSaving) return;
@@ -4885,12 +4911,16 @@ function applyOrderUser(oid, idx) {
   var list = _orderUserCandidates(o);
   var pick = list[idx];
   if (!pick || pick.cur) return;
-  _orderUserSaving = true;
+  var isLocal = String(o.openid || '') === 'local';
   var by = _manualStatusBy();
+  var payload = { order_id: String(oid), by: by };
+  if (isLocal) payload.owner_name = pick.name;
+  else payload.openid = pick.openid;
+  _orderUserSaving = true;
   fetch('/api/proxy/admin/order_user', {
     method: 'POST',
     headers: apiHeaders(),
-    body: JSON.stringify({ order_id: String(oid), openid: pick.openid, by: by })
+    body: JSON.stringify(payload)
   }).then(function (r) { return r.json(); }).then(function (res) {
     _orderUserSaving = false;
     if (!(res && res.success) && _writeAuthProblem(res)) return;
@@ -4898,16 +4928,23 @@ function applyOrderUser(oid, idx) {
       toast('❌ ' + ((res && res.message) || '调整失败，订单归属未改动'), 'error', true);
       return;
     }
-    o.openid = res.openid || pick.openid;
-    o.nickname = (res.nickname != null ? res.nickname : pick.nickname) || '';
+    var shown;
+    if (isLocal) {
+      o.owner_name = res.owner_name || pick.name;
+      shown = o.owner_name;
+    } else {
+      o.openid = res.openid || pick.openid;
+      o.nickname = (res.nickname != null ? res.nickname : pick.nickname) || '';
+      shown = o.nickname || pick.nickname || String(o.openid).substring(0, 8);
+    }
     if (by) {
       o.manual_user_by = res.manual_user_by || by;
       o.manual_user_at = res.manual_user_at || _nowStamp();
     }
     _scopeCache = {};
     invalidateUsage();
-    toast('✅ 订单 ' + (o.order_number || ('#' + oid)) + ' 已转给「' +
-          (o.nickname || pick.nickname || String(o.openid).substring(0, 8)) + '」', 'success');
+    toast('✅ 订单 ' + (o.order_number || ('#' + oid)) + ' 已转给「' + shown + '」' +
+          (isLocal ? '（本地归属）' : ''), 'success');
     renderCloud();
     _scrollToOffset('cloud-orders');
   }).catch(function () {
@@ -5299,17 +5336,19 @@ function _renderOrderListHTML() {
       h += '<td class="l ell" style="font-family:monospace;font-size:.8rem">' + esc(o.order_number || '#' + o.order_id) + '</td>';
       h += '<td style="white-space:nowrap"><span class="' + srcCls + '"' +
         (srcTip ? ' title="' + srcTip + '"' : '') + '>' + srcTxt + '</span></td>';
-      /* v7.18：用户列与状态列同一把锁 —— 锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头，
-         点开即选另一位用户（改的是订单归属 orders.openid，小程序/APP「我的订单」跟着变）。
-         本地单与外部监视单没有云端归属，保持只读。 */
+      /* v7.18：用户列与状态列同一把锁 —— 锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头。
+         云端单点开选另一位用户（改 orders.openid）；v7.19 起本地来源单也能点开，改的是
+         orders.owner_name（展示所属人）。外部监视单没有归属可调，保持只读。 */
       var _userTag = (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who));
       var _userTip = esc(who) + (addr ? ' · ' + esc(addr) : '');
       if (o.manual_user_by) {
         _userTip += ' · ' + esc(o.manual_user_by) + '于' +
           esc(_fmtStamp(o.manual_user_at) || '未知时间') + '调整归属';
       }
+      var _userEditTip = String(o.openid || '') === 'local'
+        ? '点击调整所属人（本地归属）' : '点击调整所属用户';
       h += '<td class="l ell" title="' + _userTip + '">' + (_orderUserEditable(oidS)
-        ? '<span class="st-edit can" title="点击调整所属用户" onclick="event.stopPropagation();openOrderUserMenu(event,\'' + oidS + '\')">' +
+        ? '<span class="st-edit can" title="' + _userEditTip + '" onclick="event.stopPropagation();openOrderUserMenu(event,\'' + oidS + '\')">' +
             _userTag + '<button type="button" class="st-caret" tabindex="-1">▾</button></span>'
         : _userTag) + '</td>';
       /* 状态列：锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头，点开即选终态（v7.0）。
