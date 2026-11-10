@@ -9644,6 +9644,130 @@ class MainWindow(QMainWindow):
         except Exception:
             return 0
 
+    # ── 云端顾客勾的每文件选项：**后置落地**（2026-11-09 现场）──────────────────
+    # 根因：Word 文件落地时还没有 PDF ⇒ `page_count` 与 `blank_tail` 都是 0，
+    # `_add_cloud_task_to_new_tab` 的两段条件（页数 >1 才排空白页、页数 >0 才校封面页）
+    # 一律不成立，顾客的要求被**静默丢掉** —— 勾了「排除末尾空白页」，Word 文件照样把
+    # 末尾空白页打出来（用户就是这么报的）。所以请求要记在 job 上，等转换完成
+    # （`_on_convert_finished` 拿到真实 PDF）再由 `_apply_cloud_file_options` 落地一次。
+    # PDF 上传 / 命中缓存的落地那一刻就已处理完，这两个方法里的 guard 保证幂等。
+    def _cloud_exclude_blank_tail(self, job, total_pages: int = 0) -> int:
+        """把顾客勾的「排除末尾空白页」落到 page_range，返回排掉页数。
+
+        排除**只落到 page_range 上**（`split_tail_blank`），不新建"要少打几页"的第二口径：
+        有效页数/计费/单页硬闸门/手动双面配对都只认 `_count_pages_in_range`。
+        已排过（blank_undo_range 非 None）或页数/空白页还不知道时不动作（幂等）。
+        """
+        if not bool(getattr(job, "blank_tail_exclude", False)):
+            return 0
+        if getattr(job, "blank_undo_range", None) is not None:
+            return 0
+        total = int(total_pages or getattr(job, "page_count", 0) or 0)
+        tail = int(getattr(job, "blank_tail", 0) or 0)
+        if total <= 1 or tail <= 0:
+            return 0
+        orig = getattr(job, "page_range", "") or ""
+        new_range, cut = split_tail_blank(orig, total, tail)
+        if cut <= 0:
+            return 0
+        job.blank_undo_range = orig
+        job.page_range = new_range
+        _label = getattr(job, "order_number", "") or ("#" + str(getattr(job, "task_id", 0) or 0))
+        self._log(f"✂ 云端订单 {_label}：按顾客要求排除末尾 {cut} 页空白页"
+                  f"（{orig or '全部'} → {new_range or '全部'}）")
+        # 空白页判定只有本机有（PyMuPDF），后端据此重算价格 —— 排掉的空白页不收钱。
+        if self._cloud_client and int(getattr(job, "task_id", 0) or 0) > 0:
+            try:
+                self._cloud_client.report_page_range_truncated(
+                    job.task_id, orig or "", new_range or "", total)
+            except Exception as e:
+                logger.warning(f"回报 page_range_truncated 失败 (task={job.task_id}): {e}")
+        return cut
+
+    def _cloud_apply_simplex(self, job) -> str:
+        """把顾客填的「封面单独打印」校验后落到 job，返回打回原因（"" = 通过 / 待定）。
+
+        判据与话术同 `check_simplex_pages`（与后端逐字一致）。页数未知（Office 还没转换）
+        返回 "" 且保留 `simplex_request`，等转换完成再校验；单面订单里该项无意义，直接丢弃。
+        """
+        raw = (getattr(job, "simplex_request", "") or "").strip()
+        if not raw:
+            return ""
+        if int(getattr(job, "task_id", 0) or 0) <= 0:
+            job.simplex_request = ""
+            return ""
+        if (getattr(job, "duplex", "on") or "on") != "on":
+            job.simplex_request = ""
+            return ""
+        total = int(getattr(job, "page_count", 0) or 0)
+        if total <= 0:
+            return ""
+        norm, issue = check_simplex_pages(getattr(job, "page_range", "") or "", total, raw)
+        if issue:
+            return issue
+        job.simplex_enabled = bool(norm)
+        job.simplex_pages = norm
+        job.simplex_request = ""
+        if norm:
+            _label = getattr(job, "order_number", "") or ("#" + str(getattr(job, "task_id", 0) or 0))
+            self._log(f"🖨 云端订单 {_label}：已按顾客要求把第 {norm} 页改为单面打印")
+        return ""
+
+    def _apply_cloud_file_options(self, job) -> bool:
+        """落地/转换完成后处理顾客的两个每文件开关，返回 False = 已打回（调用方别再动该行）。
+
+        唯一后置落地点：`_add_cloud_task_to_new_tab`（页数已知时）与 `_on_convert_finished`
+        （页数刚回来时）都调它 —— 后者正是原先漏掉的那一步。
+        """
+        if job is None or int(getattr(job, "task_id", 0) or 0) <= 0:
+            return True
+        ext = os.path.splitext(getattr(job, "file_path", "") or "")[1].lower()
+        if ext in self.IMAGE_EXTS:
+            # 图片单页渲染，两项都无意义（与落地时同一判据）
+            job.blank_tail_exclude = False
+            job.simplex_request = ""
+            return True
+        self._cloud_exclude_blank_tail(job)
+        issue = self._cloud_apply_simplex(job)
+        if issue:
+            self._reject_cloud_job(job, issue)
+            return False
+        return True
+
+    def _cloud_reject_task(self, task_id: int, order_number: str, reason: str) -> None:
+        """云端任务打回：留痕 + 报失败 + 拒单（话术与落地路径同一套）。"""
+        self._log(f"⛔ 云端订单 {order_number or ('#' + str(task_id))} 打回：{reason}")
+        if self._cloud_client:
+            try:
+                self._cloud_client.report_fail(task_id, reason)
+                self._cloud_client.reject_task(task_id)
+            except Exception as e:
+                logger.warning(f"打回上报失败 (task={task_id}): {e}")
+
+    def _reject_cloud_job(self, job, reason: str) -> None:
+        """转换完成后才发现顾客配置不合格 ⇒ 打回并**从本页撤下该文件**。
+
+        绝不能让错配置出纸（顾客以为封面单面、实际配在双面里），也不能像落地时那样
+        "一行都不建"——文件已经进了标签页，只能撤下来（同页其它文件不受影响）。
+        """
+        self._cloud_reject_task(int(getattr(job, "task_id", 0) or 0),
+                               getattr(job, "order_number", "") or "", reason)
+        for key, tab in list(self._config.tabs.items()):
+            keep = [j for j in tab.jobs if j is not job]
+            if len(keep) == len(tab.jobs):
+                continue
+            tab.jobs = keep
+            self._save_config()
+            if key == self._current_tab:
+                self._rebuild_table()
+            self._refresh_tab_display()
+            try:
+                self._cleanup_orphan_pdf_cache([job])
+            except Exception:
+                pass
+            self._log(f"  → 已从标签页 {key} 撤下该文件（同页其它文件不受影响）")
+            return
+
     def _set_blank_tail_excluded(self, rows, exclude: bool) -> int:
         """把选中的行「排除 / 恢复」末尾空白页，返回实际改动的行数。
 
@@ -9676,6 +9800,9 @@ class MainWindow(QMainWindow):
                     continue
                 job.page_range = job.blank_undo_range or ""
                 job.blank_undo_range = None
+                # 人工恢复 = 否决顾客的「排除末尾空白页」：清掉请求位，否则换引擎重转
+                # 又会被 `_apply_cloud_file_options` 自动排一次，操作员改了等于白改。
+                job.blank_tail_exclude = False
             touched.append(r)
 
         if not touched:
@@ -19428,7 +19555,8 @@ class MainWindow(QMainWindow):
         jobs[target_row].page_count = page_count
         jobs[target_row].orientation = orientation
         # 末尾空白页检测：只在**真实 PDF 到手**之后才谈得上（.doc/.docx 的页是转换出来的）。
-        # 只标不排：排除动作由操作员勾选「排除末尾空白页」（见 _set_blank_tail_excluded）。
+        # 这里只标不排；排除动作有两个入口：操作员勾选（_set_blank_tail_excluded）与
+        # 云端顾客的要求（下面紧接着的 _apply_cloud_file_options，2026-11-09）。
         jobs[target_row].blank_tail = self._detect_blank_tail(cached_pdf)
         # 换引擎重转 ⇒ 页数可能变。旧的"排除范围"是按旧页数算出来的，对不上就是错页，
         # 所以先还原成排除前的范围再按新页数重标（宁可让操作员再勾一次）。
@@ -19438,6 +19566,14 @@ class MainWindow(QMainWindow):
             jobs[target_row].blank_undo_range = None
             self._log(f"↩ 页数变化（{_old_page_count}→{page_count}）："
                       f"已还原末尾空白页的排除，请重新确认")
+
+        # ── 顾客勾的每文件开关：Word 文件到这里才第一次有 PDF ──
+        # 落地时 page_count/blank_tail 都是 0 ⇒ 「排除末尾空白页」与「封面单独打印」当场
+        # 做不了（原先就是这样被静默丢掉的）。这里补落地一次；幂等 guard 在
+        # `_apply_cloud_file_options` 里（已排过 / 页数仍未知 ⇒ 不重复动作）。
+        if not self._apply_cloud_file_options(jobs[target_row]):
+            # 顾客填的封面页校验不合格 ⇒ 已打回并撤下该文件，这一行不用再更新
+            return
 
         # ── 单页归一化：有效页数 == 1 的本地文件一律改单面（2026-10-17 现场事故）──
         # 现场：单页 docx 的 job.duplex="on"（print_config.json 里 page_count=1）→ 日志
@@ -19793,46 +19929,17 @@ class MainWindow(QMainWindow):
         # （排除掉的空白页不收钱）。
         # 「封面单独打印」：所列页一页一张纸；填错 / 超页数 / 不在范围内 ⇒ **打回**，
         # 不能静默按整份双面打出去。
-        job_page_range = task.page_range or ""
-        job_blank_undo = None
-        if bool(getattr(task, "blank_tail_exclude", False)) and not is_image \
-                and page_count > 1 and blank_tail > 0:
-            _orig_range = job_page_range
-            _new_range, _cut = split_tail_blank(job_page_range, page_count, blank_tail)
-            if _cut > 0:
-                job_blank_undo = _orig_range
-                job_page_range = _new_range
-                self._log(f"✂ 云端订单 {task.order_number or ('#' + str(task.task_id))}："
-                          f"按顾客要求排除末尾 {_cut} 页空白页"
-                          f"（{_orig_range or '全部'} → {_new_range or '全部'}）")
-                if self._cloud_client:
-                    try:
-                        self._cloud_client.report_page_range_truncated(
-                            task.task_id, _orig_range or "", _new_range or "", page_count)
-                    except Exception as e:
-                        logger.warning(f"回报 page_range_truncated 失败 (task={task.task_id}): {e}")
-
+        # ⚠ 2026-11-09：Word 文件落地时**还没有 PDF**（page_count/blank_tail 都是 0），
+        #   这两个动作当场做不了 ⇒ 请求记在 job 上（blank_tail_exclude / simplex_request），
+        #   转换完成时由 `_apply_cloud_file_options` 再落地一次。页数已知（PDF/缓存命中）
+        #   就在下面当场落地，路径与话术完全不变。
         simplex_raw = (getattr(task, "simplex_pages", "") or "").strip()
-        simplex_norm = ""
-        if simplex_raw and not is_image and (task.duplex or "on") == "on" \
-                and page_count > 0:
-            simplex_norm, _sx_issue = check_simplex_pages(job_page_range, page_count, simplex_raw)
-            if _sx_issue:
-                self._log(f"⛔ 云端订单 {task.order_number or ('#' + str(task.task_id))} 打回：{_sx_issue}")
-                if self._cloud_client:
-                    try:
-                        self._cloud_client.report_fail(task.task_id, _sx_issue)
-                        self._cloud_client.reject_task(task.task_id)
-                    except Exception as e:
-                        logger.warning(f"打回上报失败 (task={task.task_id}): {e}")
-                return new_key
-
         job = PrintJob(
             file_path=task.local_path or "",
             copies=task.copies if task.copies > 0 else 1,
             duplex="off" if is_image else (task.duplex or "on"),
             duplex_mode=duplex_mode,
-            page_range=job_page_range,
+            page_range=task.page_range or "",
             page_count=page_count,
             orientation=orientation,
             image_orientation=getattr(task, 'image_orientation', 'auto'),
@@ -19841,9 +19948,12 @@ class MainWindow(QMainWindow):
             order_id=task.order_id or 0,
             source_md5=source_md5,
             blank_tail=blank_tail,
-            blank_undo_range=job_blank_undo,
-            simplex_enabled=bool(simplex_norm),
-            simplex_pages=simplex_norm,
+            blank_undo_range=None,
+            simplex_enabled=False,
+            simplex_pages="",
+            # 顾客要求（待落地）：图片两项都无意义，与下面 is_image 判定同一口径
+            blank_tail_exclude=bool(getattr(task, "blank_tail_exclude", False)) and not is_image,
+            simplex_request="" if is_image else simplex_raw,
             display_name=task.file_name,  # 使用后端返回的原始文件名
             order_number=task.order_number,  # 云端订单号
             remark=getattr(task, 'remark', '') or '',  # 云端订单备注
@@ -19853,6 +19963,14 @@ class MainWindow(QMainWindow):
             admin_self_print=bool(getattr(task, 'is_admin_print', False)),
             uploader_is_admin=bool(getattr(task, 'uploader_is_admin', False)),
         )
+        if not is_image:
+            # 页数已知时当场落地（空白页先排，封面页的"是否在范围内"要按新范围判）
+            self._cloud_exclude_blank_tail(job, page_count)
+            _sx_issue = self._cloud_apply_simplex(job)
+            if _sx_issue:
+                # 老口径：坏配置不建行（标签页里一行都不落），直接打回
+                self._cloud_reject_task(task.task_id, task.order_number, _sx_issue)
+                return new_key
         self._config.tabs[new_key].jobs.append(job)
         # 首次添加时间（2026-11 用户口径）：云端订单的文件落地到这一页 = 这一页第一次有文件。
         # 只在"刚 append 进去的是第一条"时写，同一订单后续文件不会改写它。

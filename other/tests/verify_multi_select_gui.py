@@ -232,7 +232,7 @@ def _owner(pos):
 _callers = {_owner(m.start()) for m in re.finditer(r"split_tail_blank\(", src)}
 check("复制路径没有偷偷调 split_tail_blank（排除只走「操作员勾选 / 云端带开关」两条路）",
       "_add_rows_to_new_tab" not in _callers
-      and _callers <= {"_set_blank_tail_excluded", "_add_cloud_task_to_new_tab"},
+      and _callers <= {"_set_blank_tail_excluded", "_cloud_exclude_blank_tail"},
       f"实际所在函数={sorted(_callers)}")
 
 # ═══════════════ 1. 表格配置 ═══════════════

@@ -118,6 +118,18 @@ class CloudStub:
     def reject_task(self, task_id):
         self.rejected.append(task_id)
 
+    # `_start_convert_worker` 在测试里被桩掉，但 `_on_convert_finished` 收尾会写 MD5 缓存
+    def _compute_md5_file(self, path):
+        import hashlib
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _save_pdf_to_cache(self, *a, **kw):
+        pass
+
 
 def new_win(stub=None):
     w = gui.MainWindow(config_path=paths.config_path())
@@ -259,6 +271,80 @@ t7b = cc.CloudTask({"task_id": 72})
 check("⑦c 旧后端不传 ⇒ 空/False", t7b.simplex_pages == "" and t7b.blank_tail_exclude is False)
 check("⑦d 字段在 __slots__ 里（不会再 AttributeError）",
       "simplex_pages" in cc.CloudTask.__slots__ and "blank_tail_exclude" in cc.CloudTask.__slots__)
+
+# ── ⑧/⑨ 2026-11-09 现场反馈：Word 文件勾了「自动检测末尾空白页并排除」却不生效 ──
+# 根因：.doc/.docx 落地时还**没有 PDF**（page_count=0、blank_tail=0），两个开关当场做不了，
+# 原先直接静默丢掉；转换是异步的，`_on_convert_finished` 里从不补落地。两个开关的请求
+# 现在记在 job 上（blank_tail_exclude / simplex_request），转换完成时由
+# `_apply_cloud_file_options` 再落地一次。
+_DOCX = os.path.join(_SANDBOX, "order.docx")
+with open(_DOCX, "wb") as _f:
+    _f.write(b"PK\x03\x04dummy docx for test")
+
+
+class DocxTask(FakeTask):
+    """Word 订单：落地时页数未知（本地还没有 PDF）。"""
+
+    def __init__(self, **kw):
+        super().__init__(pdf=_DOCX, **kw)
+        self.file_name = "作业.docx"
+
+
+print("\n=== ⑧ Word 文件：转换完成后补落地（2026-11-09）===")
+stub8 = CloudStub()
+w8 = new_win(stub8)
+_conv_calls = []
+w8._start_convert_worker = lambda *a, **kw: _conv_calls.append(a)
+key8 = w8._add_cloud_tasks_to_new_tab([DocxTask(task_id=81, order_id=701,
+                                               blank_tail_exclude=True, simplex_pages="1")])
+jobs8 = w8._config.tabs[key8].jobs
+check("⑧a Word 文件照旧落地（页数未知）",
+      len(jobs8) == 1 and jobs8[0].page_count == 0,
+      [(len(jobs8), jobs8[0].page_count if jobs8 else None)])
+if jobs8:
+    j8 = jobs8[0]
+    check("⑧b 顾客要求先记在 job 上、不丢",
+          j8.blank_tail_exclude is True and j8.simplex_request == "1",
+          (j8.blank_tail_exclude, j8.simplex_request))
+    check("⑧c 页数未知时不动 page_range", j8.page_range == "", j8.page_range)
+    check("⑧d 页数未知时也不误报截断", stub8.truncated == [], stub8.truncated)
+check("⑧e 已发起后台转换", bool(_conv_calls))
+
+if jobs8:
+    # 转换完成 = 第一次拿到真实 PDF；32 页里末尾 2 页空白
+    w8._on_convert_finished(0, _DOCX, PDF_31, 31, "portrait", key8)
+    j8 = w8._config.tabs[key8].jobs[0]
+    check("⑧f 转换完成后自动排除末尾 2 页空白（1-31 → 1-29）",
+          j8.page_range == "1-29", j8.page_range)
+    check("⑧g 记了可一键恢复的原范围", j8.blank_undo_range == "", j8.blank_undo_range)
+    check("⑧h 回报了一次 page_range_truncated",
+          stub8.truncated == [(81, "", "1-29", 31)], stub8.truncated)
+    check("⑧i 「封面单独打印」也补落地",
+          j8.simplex_enabled is True and j8.simplex_pages == "1",
+          (j8.simplex_enabled, j8.simplex_pages))
+    check("⑧j 请求已消费，不会重复落地", j8.simplex_request == "", j8.simplex_request)
+    # 幂等：换引擎重转/再回调一次，不重复切
+    w8._on_convert_finished(0, _DOCX, PDF_31, 31, "portrait", key8)
+    j8 = w8._config.tabs[key8].jobs[0]
+    check("⑧k 重转再回调不重复排除", j8.page_range == "1-29" and len(stub8.truncated) == 1,
+          (j8.page_range, stub8.truncated))
+
+print("\n=== ⑨ Word 文件封面页填错：转换完成时才打回并撤下 ===")
+stub9 = CloudStub()
+w9 = new_win(stub9)
+w9._start_convert_worker = lambda *a, **kw: None
+key9 = w9._add_cloud_tasks_to_new_tab([DocxTask(task_id=91, order_id=702,
+                                               simplex_pages="1,99")])
+check("⑨a 页数未知时先不下结论（文件先落地等转换）",
+      len(w9._config.tabs[key9].jobs) == 1, len(w9._config.tabs[key9].jobs))
+w9._on_convert_finished(0, _DOCX, PDF_31, 31, "portrait", key9)
+check("⑨b 转换完成后打回并带原因",
+      bool(stub9.failed) and stub9.failed[0][0] == 91
+      and "超出文件总页数" in stub9.failed[0][1], stub9.failed)
+check("⑨c 已 reject_task", stub9.rejected == [91], stub9.rejected)
+check("⑨d 该文件已从标签页撤下（不静默按整份双面打）",
+      all(len(t.jobs) == 0 for t in w9._config.tabs.values()),
+      {k: len(v.jobs) for k, v in w9._config.tabs.items()})
 
 print()
 if ok_all:

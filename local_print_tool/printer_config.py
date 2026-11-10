@@ -223,6 +223,18 @@ class PrintJob:
     #   `manual_duplex.charge_units`（计费）。
     simplex_enabled: bool = False
     simplex_pages: str = ""
+    # ── 云端顾客勾的两个每文件开关的「待落地请求」（2026-11-09）──
+    # Office（.doc/.docx）云端订单落地时**还没有 PDF**：页数与末尾空白页都要等转换完成才知道，
+    # 所以顾客勾的这两项不能只在落地那一刻处理一次 —— 先记在 job 上，转换完成
+    # （gui.`_on_convert_finished` → `_apply_cloud_file_options`）再落地。
+    #   · blank_tail_exclude：顾客要求排除末尾空白页。落地后仍保持 True —— 换引擎重转把
+    #     page_range 还原（页数变了）时还要再排一次；操作员右键「↩ 恢复末尾空白页」= 人工
+    #     否决顾客要求，`_set_blank_tail_excluded` 会把它清成 False，此后重转不再自动排。
+    #   · simplex_request：顾客填的「封面单独打印」原始页串（**未校验**）。页数已知并通过
+    #     `check_simplex_pages` 后落到 simplex_enabled/simplex_pages，随后清空（打回也清空）。
+    # 本地任务两者恒为 False/""，行为零变化。
+    blank_tail_exclude: bool = False
+    simplex_request: str = ""
     # ── Excel（.xls/.xlsx）版式覆盖（2026-11 用户需求 #10）──
     # 右侧面板收集的打印版式（页边距/方向/纸张/居中/缩放/打印范围），**只对表格文件有意义**，
     # 其它文件类型忽略。空 dict = 用户没为这个任务改过 ⇒ 用全局「默认任务参数」，
@@ -269,6 +281,8 @@ class PrintJob:
             "blank_undo_range": self.blank_undo_range,
             "simplex_enabled": self.simplex_enabled,
             "simplex_pages": self.simplex_pages,
+            "blank_tail_exclude": bool(self.blank_tail_exclude),
+            "simplex_request": self.simplex_request,
             "xlsx_options": dict(self.xlsx_options or {}),
             "missing_fonts": list(self.missing_fonts),
             "nonembedded_fonts": list(self.nonembedded_fonts),
@@ -305,6 +319,8 @@ class PrintJob:
                               if isinstance(data.get("blank_undo_range"), str) else None),
             simplex_enabled=bool(data.get("simplex_enabled", False)),
             simplex_pages=str(data.get("simplex_pages", "") or ""),
+            blank_tail_exclude=bool(data.get("blank_tail_exclude", False)),
+            simplex_request=str(data.get("simplex_request", "") or ""),
             # 只保留已知键（手改配置塞进来的垃圾键不进引擎），未知/坏值让归一函数兜住。
             xlsx_options=_coerce_xlsx_options(data.get("xlsx_options")),
             missing_fonts=[str(x) for x in (data.get("missing_fonts") or [])

@@ -369,7 +369,8 @@ _src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
 check("⑥a 建 job 处仍写 blank_tail（UI 照旧标 ⚠）",
       "blank_tail=blank_tail," in _src)
 check("⑥b 云端自动排除被顾客的开关把住（blank_tail_exclude）",
-      'if bool(getattr(task, "blank_tail_exclude", False))' in _src)
+      'if not bool(getattr(job, "blank_tail_exclude", False)):' in _src
+      and 'blank_tail_exclude=bool(getattr(task, "blank_tail_exclude", False))' in _src)
 check("⑥c split_tail_blank 只出现在两处：操作员勾选 + 云端按开关排除",
       _src.count("split_tail_blank(") == 2,
       f"出现 {_src.count('split_tail_blank(')} 次")
@@ -389,7 +390,7 @@ def _owner(pos):
 
 _callers = sorted({_owner(m.start()) for m in re.finditer(r"split_tail_blank\(", _src)})
 check("⑥d 排除只发生在「操作员勾选」与「云端带开关」两条路径",
-      set(_callers) <= {"_set_blank_tail_excluded", "_add_cloud_task_to_new_tab"},
+      set(_callers) <= {"_set_blank_tail_excluded", "_cloud_exclude_blank_tail"},
       f"实际所在函数={_callers}")
 
 print("\n⑦ 变异自证：把 split_tail_blank 换成空实现，⑤ 的断言必须变红")
