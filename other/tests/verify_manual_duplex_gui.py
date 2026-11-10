@@ -123,7 +123,8 @@ class Rec:
         self.waited = []
         self.logs = []
         self.progress = []
-        self.finished = []
+        self.finished = []       # [(idx, ok, msg)] —— job_finished（真成功/真失败）
+        self.stalled = []        # [(idx, msg, 台账记录)] —— job_stalled（半成品：只打了第 1 趟）
         self.plan_labels = []    # [{sheets:[(标签,a,b)], slots:{纸序:标签}}]
         # 每一趟**真正提交的那份批次 PDF** 的逐页文本（核"单面文件真的并进来了吗"）
         self.plan_pages = []     # [[页文本…], [页文本…]]（第 1 趟 / 第 2 趟）
@@ -231,6 +232,8 @@ def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
     w.log_message.connect(rec.logs.append)
     w.progress.connect(lambda c, t, s: rec.progress.append((c, t, s)))
     w.job_finished.connect(lambda i, ok, msg: rec.finished.append((i, ok, msg)))
+    w.job_stalled.connect(
+        lambda i, msg, record: rec.stalled.append((i, msg, record)))
     w.all_finished.connect(lambda a, b: rec.all_finished.append((a, b)))
     w.duplex_announce.connect(rec.announce.append)
     w.duplex_finished.connect(lambda _t: setattr(rec, "finished_evt", rec.finished_evt + 1))
@@ -841,16 +844,125 @@ check("★ 并批异常·前面已有成功：成功的那份照常回报，失�
       f"{rec_bad2.finished} {rec_bad2.all_finished}")
 
 # ============================================================
-# ② 跳过（第 1 趟出纸后）→ 第 2 趟绝不打
+# ② 跳过（第 1 趟出纸后）→ 第 2 趟绝不打，但**不判失败**：记进「半成品补救」台账
 # ============================================================
 print("\n=== ② 操作员选择「跳过本任务」===")
+import duplex_remedy  # noqa: E402  （台账：%APPDATA% 已被沙箱化，见文件头）
+_pending_before = len(duplex_remedy.pending())
 rec = run_worker([make_job(PDF5), make_job(PDF3)], MANUAL, flip_answer=False)
 check("★ 跳过时只打了第 1 趟（绝不再打第 2 趟）",
       len(rec.plan_pass) == 1 and rec.plan_pass[0][0] == 1, f"{[p[0] for p in rec.plan_pass]}")
-check("★ 两个任务都判失败，且说明纸是半成品",
-      len(rec.finished) == 2 and all(ok is False for _i, ok, _m in rec.finished)
-      and all("半成品" in m for _i, _ok, m in rec.finished),
-      f"{rec.finished[0][2] if rec.finished else ''}")
+check("★ 跳过不算「失败」：两个任务都发 job_stalled，job_finished 一个都不发",
+      len(rec.stalled) == 2 and not rec.finished, f"{rec.finished} / {len(rec.stalled)}")
+check("★ 失败计数不加：all_finished 报 (0,0)（原实现会报 (0,2) 并弹「打印完成（有错误）」）",
+      rec.all_finished == [(0, 0)], f"{rec.all_finished}")
+check("★ 半成品落进台账：新增 1 条 pending 记录",
+      len(duplex_remedy.pending()) == _pending_before + 1,
+      f"{_pending_before} → {len(duplex_remedy.pending())}")
+_rec = rec.stalled[0][2] if rec.stalled else {}
+# ⚠ 断言必须看**落盘的那一条**，不能只看 worker 手里那份 dict：`add()` 会走
+# `_normalize()`，字段名/形状写错时内存里的 dict 是好的、盘上的记录却是残的
+# （真出过：页序计划与 PDF 路径被 _normalize 判成"没有 id 的损坏记录"整条丢掉，
+#  结果台账里只剩时间/状态，永远补不了第 2 趟）。tests/verify_duplex_remedy.py 也钉这条。
+_stored = duplex_remedy.get(_rec.get("id") or "") if _rec else None
+check("★ 盘上确实有这条记录，且字段完整（不是只有 id/时间）",
+      _stored is not None
+      and bool(_stored.get("file_plans")) and bool(_stored.get("items"))
+      and bool(_stored.get("pdf")),
+      f"{sorted(_stored) if _stored else None}")
+_first_pages = rec.plan_pass[0][3] if rec.plan_pass else []
+# 期望张数独立算一遍（不引用被测实现）：5 页 → 3 张（1/2、3/4、5/空白），
+# 3 页 → 2 张（1/2、3/空白），合计 5 张、10 面。
+_exp_sheets = 3 + 2
+check("★ 台账记录：张数/面数与这一批一致（PDF5+PDF3 = 5 张纸、10 面）",
+      int(_stored.get("sheet_count") or 0) == _exp_sheets
+      and int(_stored.get("total_sides") or 0) == _exp_sheets * 2,
+      f"sheets={_stored.get('sheet_count')} sides={_stored.get('total_sides')} 期望 {_exp_sheets}/{_exp_sheets * 2}")
+check("★ 半成品 PDF 已复制进台账目录（临时合并文件随后被删，也能补第 2 趟）",
+      bool(_stored.get("pdf")) and os.path.isfile(_stored.get("pdf") or "")
+      and os.path.dirname(_stored.get("pdf") or "") == duplex_remedy.store_root(),
+      f"{_stored.get('pdf')}")
+_plan = duplex_remedy.build_plan(_stored) if _stored else None
+check("★ 台账能重建出同一份页序：第 1 趟与当场提交的逐项相同",
+      _plan is not None and _plan.pass_pages(1) == _first_pages,
+      f"台账 {(_plan.pass_pages(1) if _plan else None)} / 当场 {_first_pages}")
+check("★ 台账重建的第 2 趟正好是每张纸的背面（面数相等、页号互不重叠）",
+      _plan is not None
+      and len(_plan.pass_pages(2)) == len(_plan.pass_pages(1))
+      and set(p for p in _plan.pass_pages(1) if p is not None)
+      & set(p for p in _plan.pass_pages(2) if p is not None) == set(),
+      f"{(_plan.pass_pages(2) if _plan else None)}")
+check("★ 文案说清后续怎么办：说明纸是半成品 + 指向「半成品补救」",
+      all("半成品" in m for _i, m, _r in rec.stalled)
+      and all("半成品补救" in m for _i, m, _r in rec.stalled),
+      f"{rec.stalled[0][1] if rec.stalled else ''}")
+
+# ============================================================
+# ②b 补救动作：▶ 补打第 2 趟只打第 2 趟；🖨 整单重打把两趟都重来
+# ============================================================
+print("\n=== ②b 补救动作（补打第 2 趟 / 整单重打）===")
+_plan_now = duplex_remedy.build_plan(_stored)
+rec_r = Rec()
+done_p2 = []
+_w = gui.DuplexRemedyWorker(dict(_stored), mode="pass2",
+                            printer_name="Fake Print", paper="A4", dpi=200)
+_w.log_message.connect(rec_r.logs.append)
+_w.flip_required.connect(lambda t, _s: (rec_r.flip.append(t), _w.confirm_flip(True)))
+_w.done.connect(lambda ok, msg, rid: done_p2.append((ok, msg, rid)))
+_restore = patched(rec_r)
+try:
+    _w.run()
+finally:
+    _restore()
+check("★ 补打第 2 趟：只提交第 2 趟（绝不再打一遍第 1 趟，白纸不重来）",
+      [p[0] for p in rec_r.plan_pass] == [2], f"{[p[0] for p in rec_r.plan_pass]}")
+check("★ 补打第 2 趟的页序 = 台账重建的第 2 趟（含空白占位、0-based 交给渲染层）",
+      bool(rec_r.plan_pass) and rec_r.plan_pass[0][2] == _plan_now.pass_page_indices(2),
+      f"{rec_r.plan_pass[0][2] if rec_r.plan_pass else None} / {_plan_now.pass_page_indices(2)}")
+check("★ 补打前**必须**先确认纸已放回纸盘 2（发过 flip_required，不是对着空纸盘打）",
+      len(rec_r.flip) == 1, f"{len(rec_r.flip)} 次提示")
+check("★ 补打成功：done(True, …, 记录 id)（主界面据此把记录转 resolved）",
+      len(done_p2) == 1 and done_p2[0][0] is True and done_p2[0][2] == _stored.get("id"),
+      f"{done_p2}")
+
+rec_r2 = Rec()
+done_rp = []
+_w2 = gui.DuplexRemedyWorker(dict(_stored), mode="reprint",
+                             printer_name="Fake Print", paper="A4", dpi=200)
+_w2.log_message.connect(rec_r2.logs.append)
+_w2.flip_required.connect(lambda t, _s: (rec_r2.flip.append(t), _w2.confirm_flip(True)))
+_w2.done.connect(lambda ok, msg, rid: done_rp.append((ok, msg, rid)))
+_restore = patched(rec_r2)
+try:
+    _w2.run()
+finally:
+    _restore()
+check("★ 整单重打：第 1 趟 → 等翻纸 → 第 2 趟，两趟都重新打（纸叠乱了时的唯一出路）",
+      [p[0] for p in rec_r2.plan_pass] == [1, 2]
+      and len(rec_r2.flip) == 1
+      and done_rp and done_rp[0][0] is True,
+      f"趟={[p[0] for p in rec_r2.plan_pass]} / 提示 {len(rec_r2.flip)} / {done_rp}")
+
+# 纸盘没确认 → 一张都不许出（宁可记录留着，也不能把半成品变成一叠废纸）
+rec_r3 = Rec()
+done_nf = []
+_w3 = gui.DuplexRemedyWorker(dict(_stored), mode="pass2",
+                             printer_name="Fake Print", paper="A4", dpi=200)
+_w3.flip_required.connect(lambda _t, _s: _w3.confirm_flip(False))
+_w3.done.connect(lambda ok, msg, rid: done_nf.append((ok, msg, rid)))
+_w3.FLIP_GRACE_SEC = 0
+_w3.FLIP_TIMEOUT_SEC = 0
+_restore = patched(rec_r3)
+try:
+    _w3.run()
+finally:
+    _restore()
+check("★ 没有确认纸已就位 → 什么都不打，且 done(False) 说明「记录保留」",
+      not rec_r3.plan_pass and done_nf and done_nf[0][0] is False
+      and "保留" in (done_nf[0][1] if done_nf else ""),
+      f"{done_nf}")
+check("★ 没打成功时台账记录仍是 pending（不会因为一次没确认就把活丢掉）",
+      any(r["id"] == _stored.get("id") for r in duplex_remedy.pending()))
 
 # ============================================================
 # ③ 第 1 趟还在打时就点「跳过」→ 预置答案立刻生效（不必等 10 分钟）
@@ -858,9 +970,10 @@ check("★ 两个任务都判失败，且说明纸是半成品",
 print("\n=== ③ 第 1 趟打印期间就点跳过（预置答案）===")
 rec = run_worker([make_job(PDF5)], MANUAL, flip_answer=None, timeout=9999,
                  on_announce=lambda w: w.confirm_flip(False))
-check("★ 立刻按跳过收尾（没有干等超时）",
-      rec.elapsed < 5 and len(rec.plan_pass) == 1 and rec.finished[0][1] is False,
-      f"耗时 {rec.elapsed:.2f}s, plan_pass={len(rec.plan_pass)}")
+check("★ 立刻按跳过收尾（没有干等超时），且只打了第 1 趟",
+      rec.elapsed < 5 and len(rec.plan_pass) == 1, f"耗时 {rec.elapsed:.2f}s, plan_pass={len(rec.plan_pass)}")
+check("★ 预置跳过同样进「半成品补救」（不是当场判失败）",
+      len(rec.stalled) == 1 and not rec.finished, f"{rec.finished} / {len(rec.stalled)}")
 
 # ============================================================
 # ④ 零回归：单面 / 自动双面 / 能力未确认
@@ -1636,6 +1749,13 @@ check("★ 翻纸按钮按预估比例放行（早回报既不冻结计时、也
       and "gate_ratio=prof.gate_ratio" in src
       and "dlg.is_early_signal(seconds)" in src
       and "self._mode = \"flip_gate\"" in src)
+check("★ 半成品补救在跑时禁止新单启动（插单会与第 2 趟串页）",
+      "_remedy_worker is not None and self._remedy_worker.isRunning()" in
+      src.split("def _start_print_worker", 1)[1].split("    def ", 1)[0])
+check("★ 补救失败时按『是否已送印』升级 stage（开打过背面 → 只能整单重打/作废）",
+      "self._printed_any = True" in src
+      and "_stage = duplex_remedy.STAGE_PASS2_PARTIAL" in src
+      and "_w.wait(5000)" in src)
 
 print("\n" + "=" * 56)
 print("手动双面 GUI 集成验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

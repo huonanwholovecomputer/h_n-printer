@@ -197,6 +197,13 @@ class PrintJob:
     # 不能再用"补报那一刻"（2026-11-02 现场 HN20261102-0011：12:14:40 就打完的纸，
     # 订单 created_at 被记成 12:15:15 的补报时刻，明细页看着像"刚下单就打印完"）。
     finished_at: str = ""
+    # 半成品补救记录号（duplex_remedy 台账里的 id，"" = 正常任务）。
+    # 非空 = 这一单的纸**只打了第 1 趟**（操作员跳过翻纸 / 翻纸超时 / 第 2 趟失败），
+    # 等操作员在「⚠ 半成品补救…」里补打第 2 趟或作废。必须持久化：
+    #   · 重启后这一单不能被"补打队列"当普通未完成任务捡起来重打（会再出一遍第 1 趟，
+    #     纸叠里就多出一套只有单面的纸，第 2 趟必然串页）；
+    #   · 也不能在退出时被 `_abandon_jobs` 报成"放弃打印"（纸其实已经打了一半）。
+    remedy_pending: str = ""
     # 该任务是否「管理员自行打印」（云端 is_admin_print）。**已不参与**云端 Word 是否走 COM 的
     # 判定（2026-10-28：只看 uploader_is_admin，见 cloud_word_com_allowed）；保留它是因为
     # 「自打」仍决定结算归类（自打不计收益）与界面展示。
@@ -275,6 +282,7 @@ class PrintJob:
             "remark": self.remark,
             "sent": self.sent,
             "finished_at": self.finished_at,
+            "remedy_pending": str(self.remedy_pending or ""),
             "admin_self_print": self.admin_self_print,
             "uploader_is_admin": self.uploader_is_admin,
             "blank_tail": self.blank_tail,
@@ -309,6 +317,7 @@ class PrintJob:
             task_id=_num_or_default(data.get("task_id"), 0, int),
             sent=bool(data.get("sent", False)),
             finished_at=str(data.get("finished_at", "") or ""),
+            remedy_pending=str(data.get("remedy_pending", "") or ""),
             order_id=_num_or_default(data.get("order_id"), 0, int),
             order_number=data.get("order_number", ""),
             remark=str(data.get("remark", "") or ""),
