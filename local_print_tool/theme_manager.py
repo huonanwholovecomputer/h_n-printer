@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime
 
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import QApplication
@@ -139,13 +140,35 @@ class ThemeManager(QObject):
                 self._save_setting()
                 logger.info(f"主题设置文件不存在，已自动创建默认设置: {self._settings_path}")
         except Exception as e:
-            logger.warning(f"加载主题设置失败: {e}，使用默认值")
+            # 🟡13：坏文件以前只 warning 一句就放着 —— 下次启动继续坏、继续用默认值，
+            # 用户「选了深色、重启又变浅色」永远查不出原因。这里把它挪走并重建成默认，
+            # 至少让状态稳定下来（下次保存就写一份干净的）。
+            logger.warning(f"加载主题设置失败: {e}，使用默认值并重建配置文件")
+            try:
+                if os.path.isfile(self._settings_path):
+                    bad = f"{self._settings_path}.corrupt-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                    os.replace(self._settings_path, bad)
+                    logger.warning(f"已把损坏的主题设置另存为: {bad}")
+            except Exception as e2:
+                logger.warning(f"备份损坏的主题设置失败: {e2}")
+            try:
+                self._save_setting()
+            except Exception:
+                pass
 
     def _save_setting(self) -> None:
-        """保存用户偏好到 JSON 文件。"""
+        """保存用户偏好到 JSON 文件（原子写：tmp + fsync + os.replace）。
+
+        🟡13：原来是直接 `open(..., "w")` 覆盖 —— 写到一半断电/磁盘满就留下半截
+        JSON，下次启动解析失败、静默退回默认值（用户会以为「主题自己变回去了」）。
+        """
         try:
             os.makedirs(os.path.dirname(self._settings_path) or ".", exist_ok=True)
-            with open(self._settings_path, "w", encoding="utf-8") as f:
+            tmp = f"{self._settings_path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"theme_mode": self._mode}, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._settings_path)
         except Exception as e:
             logger.warning(f"保存主题设置失败: {e}")

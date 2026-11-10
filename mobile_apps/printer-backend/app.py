@@ -3763,6 +3763,12 @@ def init_db():
     #   'no such column: retention_hours'（2026-10-23 首次部署实测撞到）。
     _cleanup_once_on_startup()
 
+    # 🟡3：把上次进程的「兜底 start_print 重发了多少次 / 是否已停发」读回来。
+    # 不读回来，后端一重启就重新开始刷 16 次 —— 对一张永远不接单的预约单毫无意义。
+    _start_print_loaded = _load_start_print_attempts()
+    if _start_print_loaded:
+        print(f"  [SCHEDULER] 已恢复 {_start_print_loaded} 个预约单的兜底重发计数")
+
 # ==================== 订单号生成 ====================
 
 @app.route("/api/next_order_number", methods=["GET"])
@@ -4298,18 +4304,35 @@ def expire_stale_queued_orders():
     with db_lock:
         conn = get_db_conn()
         rows = conn.execute(
-            "SELECT id, order_id FROM order_files WHERE status = 'queued' AND created_at < ?",
+            "SELECT id, order_id, operator_client FROM order_files"
+            " WHERE status = 'queued' AND created_at < ?",
             (cutoff_str,),
         ).fetchall()
         if not rows:
             conn.close()
             return
+        # 🟡10：淘汰时要写清「是没人接单，还是设备一直不在线」。
+        # 以前一律写「排队超过 N 小时未打印」，用户看到只会以为系统卡了，
+        # 实际最常见的根因是那台机器根本没开机 —— 排查方向完全不同。
+        try:
+            _online_now = set(get_active_clients() or [])
+        except Exception:
+            _online_now = set()
         order_ids = set()
         for r in rows:
+            _oc = str(r["operator_client"] or "")
+            if _oc and _oc not in _online_now:
+                _why = f"（目标设备「{_oc}」期间一直不在线）"
+            elif _oc and _oc in _online_now:
+                _why = f"（目标设备「{_oc}」在线但一直没接这一单）"
+            elif not _online_now:
+                _why = "（期间没有任何接单设备在线：请检查设备是否开机/登录）"
+            else:
+                _why = "（当时有设备在线，但没有设备认领这一单）"
             conn.execute(
                 "UPDATE order_files SET status = ?, reject_reason = ? WHERE id = ?",
                 (TIMEOUT_STATUS,
-                 f"排队超过 {timeout_hours} 小时未打印，已超时取消", r["id"]),
+                 f"排队超过 {timeout_hours} 小时未打印{_why}，已超时取消", r["id"]),
             )
             order_ids.add(r["order_id"])
         for oid in order_ids:
@@ -4643,8 +4666,70 @@ _start_print_attempts = {}          # of_id -> {"n": int, "last": float, "stoppe
 _start_print_lock = threading.Lock()
 
 
+def _start_print_state_path():
+    """兜底重发计数落盘位置（与 orders.db 同目录，独立小 JSON）。"""
+    return os.path.join(os.path.dirname(DATABASE) or ".", "start_print_attempts.json")
+
+
+def _load_start_print_attempts():
+    """启动时读回上次的兜底重发计数（🟡3）。
+
+    为什么要落盘：这份计数原来只在进程内存里 —— 后端一重启，「已经重发 16 次、
+    决定停发」这件事就忘了，对同一张永远不接单的预约单重新再刷 16 轮（每轮都有
+    一条日志、一条 socket）。落盘之后重启不会重置上限，也不会把"已停发"丢掉。
+    """
+    try:
+        with open(_start_print_state_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return 0
+        with _start_print_lock:
+            for k, v in data.items():
+                try:
+                    _of_id = int(k)
+                    _n = int((v or {}).get("n") or 0)
+                    _last = float((v or {}).get("last") or 0.0)
+                    _stopped = bool((v or {}).get("stopped"))
+                except (TypeError, ValueError):
+                    continue
+                if _n <= 0 and not _stopped:
+                    continue
+                _start_print_attempts[_of_id] = {"n": _n, "last": _last,
+                                                 "stopped": _stopped}
+        return len(_start_print_attempts)
+    except FileNotFoundError:
+        return 0
+    except Exception as e:      # 坏文件/没权限都不能挡住调度器起来
+        print(f"  [SCHEDULER] 兜底重发计数读取失败（当作从零开始）: {e}")
+        return 0
+
+
+def _save_start_print_attempts():
+    """把兜底重发计数写盘（原子替换；调用方已持锁或接受轻微竞态）。"""
+    try:
+        with _start_print_lock:
+            data = {str(k): {"n": int(v.get("n") or 0),
+                             "last": float(v.get("last") or 0.0),
+                             "stopped": bool(v.get("stopped"))}
+                    for k, v in _start_print_attempts.items()}
+        path = _start_print_state_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"  [SCHEDULER] 兜底重发计数写盘失败（不影响本轮发送）: {e}")
+
+
 def _start_print_push_due(of_id, now_ts):
-    """这次扫描要不要给该子任务发 start_print。返回 (是否发, 是否刚停发)。"""
+    """这次扫描要不要给该子任务发 start_print。返回 (是否发, 是否刚停发)。
+
+    🟡3：判定"该发"之后**先不计数** —— 上层真正 emit 成功才调
+    `_mark_start_print_sent()`。以前 `st["n"] += 1` 写在返回之前，发送失败
+    （设备刚掉、socket 层抛错）也算一次，16 次上限被白白烧掉。
+    """
     with _start_print_lock:
         st = _start_print_attempts.setdefault(
             int(of_id), {"n": 0, "last": 0.0, "stopped": False})
@@ -4656,17 +4741,29 @@ def _start_print_push_due(of_id, now_ts):
         gap = 30 if st["n"] < _START_PRINT_FAST_LIMIT else _START_PRINT_SLOW_GAP
         if st["last"] and (now_ts - st["last"]) < gap - 1:   # -1 容忍扫描抖动
             return False, False
+        return True, False
+
+
+def _mark_start_print_sent(of_id, now_ts):
+    """真正发出去了才计数（见 `_start_print_push_due` 的说明）。"""
+    with _start_print_lock:
+        st = _start_print_attempts.setdefault(
+            int(of_id), {"n": 0, "last": 0.0, "stopped": False})
         st["n"] += 1
         st["last"] = now_ts
-        return True, False
+    _save_start_print_attempts()
 
 
 def _forget_start_print_attempts(keep_ids):
     """子任务离开 waiting（打出来了 / 作废 / 取消）⇒ 丢掉它的节流计数，别让内存无限涨。"""
+    changed = False
     with _start_print_lock:
         for k in list(_start_print_attempts):
             if k not in keep_ids:
                 _start_print_attempts.pop(k, None)
+                changed = True
+    if changed:
+        _save_start_print_attempts()
 
 
 def resync_pending_prices():
@@ -4841,6 +4938,8 @@ def process_scheduled_orders():
                     "scheduled_at": sat,
                     "scheduled_ts": _iso_to_ts(sat),
                 }, to=sid)
+                # 🟡3：真的发出去了才记一次（发射抛异常不烧额度）
+                _mark_start_print_sent(row["of_id"], time.time())
             except Exception as e:
                 print(f"  [FAIL] 预约单 #{row['of_id']} start_print 兜底推送失败: {e}")
 
@@ -13180,8 +13279,11 @@ def admin_statistics_revenue():
             # 有效口径（v7.2）：页数/张数一律按**页码范围折算**后下发，前端只展示不再自行折算
             # ——页数 = 实际要打的页（折范围）、张数 = 实际出纸张数（单面每页 1 张 / 双面每 2 页 1 张）。
             # 与 calculate_price / _file_range_stats 同源，避免结算页与金额对不上。
+            # 🟡2：simplex_pages（封面单独打印的页）必须一起传，否则 `_charge_units` 摊不出来
+            # ——31 页里 9 页单面是 20 张，不传就按 ceil(31/2)=16 张少算 4 张。
             _st = _file_range_stats(of_row["page_count"] or 0, of_row["copies"] or 1,
-                                    of_row["duplex"] or "on", of_row["page_range"] or "")
+                                    of_row["duplex"] or "on", of_row["page_range"] or "",
+                                    _row_simplex_pages(of_row))
             files_by_order[oid].append({
                 "id": of_row["id"],
                 "file_name": of_row["file_name"],
@@ -13536,29 +13638,21 @@ def admin_statistics_months():
 
 
 def recover_stale_printing_tasks():
-    """启动时清理孤立的 printing 子任务。
+    """启动时（Gunicorn `post_worker_init`）的 printing 残留检查。
 
-    pushed_tasks（记录已推送待回报的子任务）是内存结构，进程重启后会丢失。
-    若上次进程在 emit 之后、回报之前崩溃，order_files 会永久停留在
-    'printing' 而无人处理（表现：队列里有任务但打印机不动，或每次拉取都重复
-    处理）。这里把所有 printing 子任务重置为 queued，让定时扫描/拉取接口
-    重新分发。客户端的幂等处理（pull 后立即标记 printing）可防止重复打印。"""
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id, order_id FROM order_files WHERE status = 'printing'"
-    ).fetchall()
-    count = 0
-    for row in rows:
-        conn.execute(
-            "UPDATE order_files SET status = 'queued' WHERE id = ?", (row["id"],)
-        )
-        refresh_order_status(conn, row["order_id"])
-        count += 1
-    conn.commit()
-    conn.close()
-    if count > 0:
-        print(f"  [RECOVER] 重置 {count} 个孤立 printing 子任务为 queued")
-    return count
+    🟡11（2026-11-10 体检）：这里原来是**无条件**把所有 `printing` 翻回 `queued`，
+    既不看设备是否还在打、也不清 `operator_client`。后果：后端一重启，正好赶上某台
+    设备在打一叠手动双面/攒批，任务被判成「崩溃残留」重推 → 同一批纸再出一遍。
+
+    现在一律交给 `recover_orphaned_printing_tasks()`：它按「锁多久没刷新 + 设备是否
+    在线 + 30 分钟硬上限」判断，在线且未超上限的任务留给设备自己收尾。
+    保留这个函数名是因为 `gunicorn_config.post_worker_init()` 直接 import 它。
+    """
+    try:
+        recover_orphaned_printing_tasks()
+    except Exception as e:
+        print(f"  [RECOVER] 启动时 printing 残留检查失败（不阻塞启动）: {e}")
+    return 0
 
 
 # ==================== 定时任务调度器（模块级，供 Gunicorn worker 钩子引用）========

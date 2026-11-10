@@ -136,15 +136,28 @@ _sent = 0
 _first_gap_ok = True
 for i in range(12):
     if backend._start_print_push_due(_id, _t)[0]:
+        # 🟡3 起：判定「该发」不再自增，只有真正 emit 成功才记一次
+        backend._mark_start_print_sent(_id, _t)
         _sent += 1
     _t += 30.0
 check("30 秒节奏下前 10 次都发得出去", _sent >= 10, f"实际 {_sent} 次")
+check("计数与「发送成功」次数一致，且已经落盘（🟡3：重启不重刷）",
+      backend._start_print_attempts.get(_id, {}).get("n") == _sent
+      and os.path.isfile(backend._start_print_state_path()),
+      f"n={backend._start_print_attempts.get(_id, {}).get('n')} sent={_sent}")
+_n_probe = backend._start_print_attempts.get(_id, {}).get("n", 0)
+backend._start_print_push_due(_id, 1_000_000.0 + 30.0 * 30)
+check("只判定不计数（判定一次不该烧掉一次额度）",
+      backend._start_print_attempts.get(_id, {}).get("n", 0) == _n_probe,
+      f"n={backend._start_print_attempts.get(_id, {}).get('n')}")
 # 第 11、12 次必须已经切到 600 秒慢速档：30 秒推进不再有发
 _t = 1_000_000.0 + 30.0 * 10
 _due11, _ = backend._start_print_push_due(_id, _t)
 check("第 11 次不再按 30 秒发（切到 600 秒慢速档）", _due11 is False, f"_due11={_due11}")
 _due11b, _ = backend._start_print_push_due(_id, _t + 601.0)
 check("过了 600 秒才再发一次", _due11b is True, f"_due11b={_due11b}")
+if _due11b:
+    backend._mark_start_print_sent(_id, _t + 601.0)
 # 一路推到封顶
 _t = _t + 601.0
 _sent2 = 0
@@ -154,6 +167,7 @@ for _ in range(30):
     _t += 601.0
     _due, _just = backend._start_print_push_due(_id, _t)
     if _due:
+        backend._mark_start_print_sent(_id, _t)
         _sent2 += 1
     if _just:
         _just_stopped_count += 1

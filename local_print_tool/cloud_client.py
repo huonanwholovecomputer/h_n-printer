@@ -1072,10 +1072,24 @@ class CloudClient(QObject):
             queue = self._read_status_queue_locked()
             queue.append(item)
             # P2: 队列无上限保护 —— 超过 STATUS_QUEUE_MAX 条时丢弃最旧
+            # 🟡-E2：丢的是**订单的最终状态**（sent/failed/abandoned），丢了云端就永远
+            # 不知道这单打没打出来；所以不能只写一行 logger（界面上看不见），要报到人眼前。
             if len(queue) > STATUS_QUEUE_MAX:
-                dropped = len(queue) - STATUS_QUEUE_MAX
+                _dropped_items = queue[:len(queue) - STATUS_QUEUE_MAX]
+                dropped = len(_dropped_items)
                 queue = queue[dropped:]
+                _labels = []
+                for _d in _dropped_items[:5]:
+                    _d = _d or {}
+                    if _d.get("order_id"):
+                        _labels.append(f"订单 #{_d.get('order_id')}→{_d.get('status')}")
+                    elif _d.get("task_id"):
+                        _labels.append(f"任务 #{_d.get('task_id')}→{_d.get('status')}")
                 logger.warning(f"status_queue 超过 {STATUS_QUEUE_MAX} 条，丢弃最旧 {dropped} 条")
+                self.status_message.emit(
+                    f"⚠ 状态同步队列已满（{STATUS_QUEUE_MAX} 条），丢弃了最旧的 {dropped} 条"
+                    f"（{'、'.join(_labels)}{'…' if dropped > 5 else ''}）—— 这些订单的最终状态"
+                    "云端可能还不知道，请到「文件 → 离线未同步订单」里核对")
             self._write_status_queue_locked(queue)
         self.status_message.emit(f"☁ 状态同步已暂存: 订单 #{order_id} → {status}")
 

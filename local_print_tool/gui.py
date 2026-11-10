@@ -3085,6 +3085,8 @@ class PrintWorker(QThread):
     job_stalled = Signal(int, str, object)
     all_finished = Signal(int, int)            # (success_count, fail_count)
     error_occurred = Signal(str)               # 全局错误
+    # 首页（封面）没打出来：纸里少一页，必须在界面上留痕（🟡-E4，2026-11-10）
+    cover_failed = Signal(str)
     # 图片转换后缓存信号：worker 只写 PDF 文件，主线程补索引
     # (source_md5, cached_path, name, ext, page_count, image_orientation)
     pdf_cached = Signal(str, str, str, str, int, str)
@@ -3357,13 +3359,15 @@ class PrintWorker(QThread):
         except Exception:
             return 0.0
 
-    def _ask_operator_to_flip(self, plan, tray_foreign: int = 0) -> bool:
+    def _ask_operator_to_flip(self, plan, tray_foreign: int = 0, warn: str = "") -> bool:
         """请操作员翻纸：发信号 → 等主线程回执。超时/取消/跳过都返回 False。
 
         tray_foreign：本轮打印在**本批之前**已落进出纸槽、还压在本批下面的张数
         （直打的单面文件 / 首页 / 上一批）。>0 时文案必须把"槽里总数"与"只翻最上面
         N 张"说清楚 —— 否则操作员照"从出纸槽中取出纸叠"整叠搬进纸盘 2，多出来的纸
         就永远出不来了（被后续作业当白纸用掉，且全程无任何日志）。
+        warn：出纸核对没通过时（队列没排空 / 卡纸）追加的醒目提示 —— 这时"应有 N 张"
+        本身就不确定，必须让操作员先数清再翻（🟡6）。
         """
         if self._cancelled:
             return False
@@ -3392,6 +3396,9 @@ class PrintWorker(QThread):
             + "⚠ 翻纸期间不要让别的打印任务插进来（其它程序的手动打印、本工具别的任务都算）：\n"
             + "   第 2 趟要接着这叠纸打，中间插单就会串页。"
         )
+        if warn:
+            # 出纸核对没通过（队列没排空/卡纸/缺纸）：纸数本身不确定，先让人数清
+            text = f"⚠ {warn}\n\n" + text
         # ⚠ 这里绝不能重置 `_flip_continue`、也不能 clear 事件：翻纸窗的「▶ 继续打第 2 趟」
         # 按时间闸门（硬规矩 12）在这个函数**之前**就已经可点 —— 操作员的回答会比它先到。
         # 2026-11-10 现场：14:54:13 点了「继续」，本函数立刻把回答抹成 False，而事件已被
@@ -4043,6 +4050,8 @@ class PrintWorker(QThread):
         p = self._manual_profile or PrinterProfile()
         # 本批的补救记录从头清空：上一批的半成品绝不能串进这一批的收尾判据
         self._stalled_record = None
+        # 🟡-E3：台账写失败时要把合批 PDF 留在固定目录，那一次 finally 不能删它
+        self._keep_merged_pdf = False
         # 本批的翻纸回执从头清空：这样"第 1 趟还在打时操作员就点了跳过"的预置答案能生效
         self._flip_continue = False
         self._flip_event.clear()
@@ -4140,11 +4149,35 @@ class PrintWorker(QThread):
                             "  ⚠ 半成品 PDF 没能存进台账目录 —— 只能整单重打，无法只补第 2 趟")
                     return rec
                 except Exception as e:
-                    # 台账写不进去也不能把"纸已经打了"这件事藏起来；退回旧口径按失败报，
-                    # 至少操作员会看到「纸叠是半成品，请人工处理」。
+                    # 台账写不进去也不能把「纸已经打了」这件事藏起来，更不能按失败上报
+                    # （云端会以为一张都没打，重推时整单再出一遍）。取舍：
+                    #   · 不写台账、但把合批 PDF 复制到一个固定目录并留在记录里；
+                    #   · 上层照常发 job_stalled（**不** job_finished(False)）⇒ 云端不会被误导；
+                    #   · 不设 remedy_pending（没有台账行可补打），操作员按日志里的路径人工重打。
+                    _fallback = ""
+                    try:
+                        import shutil as _shutil
+                        _fb_dir = os.path.join(paths.get_app_data_dir(), "duplex_pending_pdf")
+                        os.makedirs(_fb_dir, exist_ok=True)
+                        _fallback = os.path.join(
+                            _fb_dir,
+                            f"stall-fallback-{time.strftime('%Y%m%d-%H%M%S')}.pdf")
+                        _shutil.copyfile(merged, _fallback)
+                        self._keep_merged_pdf = True     # finally 里不要删
+                    except Exception:
+                        _fallback = ""
                     self.log_message.emit(
-                        f"  ⚠ 半成品台账记录失败（{type(e).__name__}: {e}）→ 按失败处理")
-                    return None
+                        f"  ⚠ 半成品台账记录失败（{type(e).__name__}: {e}）"
+                        f" → 不按失败上报（避免云端重推后整单再出一遍）；"
+                        + (f"合批 PDF 已留到：{_fallback}" if _fallback
+                           else "合批 PDF 也没能留下（磁盘满/无权限）"))
+                    self.log_message.emit(
+                        "  → 这一批的纸是半成品：请人工核对纸叠后重打（这一单不会被自动重推）")
+                    self._stalled_record = {
+                        "id": "", "reason": reason, "stage": stage,
+                        "fallback": _fallback,
+                    }
+                    return self._stalled_record
 
             self.log_message.emit(
                 f"  → 手动双面批次：{len(items)} 个文件"
@@ -4222,6 +4255,17 @@ class PrintWorker(QThread):
                 return False, "已取消", n1
 
             w = wait_for_output(self._printer_name, pages=n1)
+            # 🟡6：队列没排空 = 纸不一定全出来了（离线/卡纸/缺纸）。以前这里只把这条事实
+            # 用在不写速度样本上，翻纸提示照旧说"应有 N 张，数够再翻" —— 操作员数不够 N 张
+            # 时没有任何退路（照翻就串页，不翻只能干等超时）。现在把不确定直接摆到提示窗上。
+            _drained = bool(w.get("drained", False))
+            _drain_warn = ""
+            if not _drained:
+                _drain_warn = (
+                    f"打印队列 {w.get('queue_seconds', 0)}s 内没有排空（打印机离线 / 卡纸 / 缺纸？）"
+                    f" —— 第 1 趟的 {plan.sheet_count} 张纸可能没全出来：先数清再翻；"
+                    f"少一张就点「跳过」，这一批会记入「半成品补救」，等纸补齐后再补打第 2 趟")
+                self.log_message.emit("  ⚠ " + _drain_warn)
             if tray_foreign > 0:
                 self.log_message.emit(
                     f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
@@ -4251,7 +4295,7 @@ class PrintWorker(QThread):
                         "  ⚠ 出纸等待超时（队列没排空）→ 本次实测不写进速度样本")
 
             self._pass_state = "等待翻纸"
-            if not self._ask_operator_to_flip(plan, tray_foreign):
+            if not self._ask_operator_to_flip(plan, tray_foreign, warn=_drain_warn):
                 if self._cancelled:
                     _reason = f"已取消（第 1 趟已打出 {plan.sheet_count} 张纸）"
                 else:
@@ -4285,10 +4329,12 @@ class PrintWorker(QThread):
             self._pass_state = ""
             self.duplex_finished.emit("手动双面批次结束")
             try:
-                if os.path.isfile(merged):
+                # 🟡-E3：台账写失败时合批 PDF 已复制到固定目录（记录里带路径），这里别删
+                if not getattr(self, "_keep_merged_pdf", False) and os.path.isfile(merged):
                     os.remove(merged)
             except OSError:
                 pass
+            self._keep_merged_pdf = False
             for _idx, job, _path, temp_pdf in items:
                 self._cleanup_temp_pdf(job, temp_pdf)
 
@@ -4542,14 +4588,26 @@ class PrintWorker(QThread):
                 if elapsed > 0 and w.get("drained", True):
                     self.duplex_speed_sample.emit(int(n1), float(elapsed))
                 self.stack_entry_drained.emit(seq, int(n1), float(max(0.0, elapsed)))
-            except Exception:
-                pass
+            except Exception as e:
+                # 旁路记账不能影响打印，但也不能一声不吭（🟡6）：以前这里全吞，
+                # 现场"纸数对不上"时日志里既没有成功也没有失败，只剩一个空洞。
+                try:
+                    self.log_message.emit(
+                        f"  ⚠ 攒批第 {seq} 单的出纸核对异常（{type(e).__name__}: {e}）"
+                        f"—— 本单纸数只能人工核对")
+                except Exception:
+                    pass
 
         try:
             threading.Thread(target=_watch, name=f"stack-drain-{seq}",
                              daemon=True).start()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self.log_message.emit(
+                    f"  ⚠ 攒批第 {seq} 单的出纸核对线程没能启动（{type(e).__name__}: {e}）"
+                    f"—— 出纸张数请人工核对")
+            except Exception:
+                pass
 
     def run(self):
         """线程主函数：统一 PDF 打印流程（GDI 优先），精确到每面的进度条。"""
@@ -4664,10 +4722,13 @@ class PrintWorker(QThread):
                             self._tray_sheets += 1
                         else:
                             self.log_message.emit(f"  ✗ 首页打印失败: {cover_msg}")
+                            self.cover_failed.emit(f"首页打印失败：{cover_msg}")
                 else:
                     self.log_message.emit("  ✗ 首页生成失败")
+                    self.cover_failed.emit("首页生成失败（首页配置或模板出错）")
             except Exception as e:
                 self.log_message.emit(f"  ✗ 首页生成异常: {e}")
+                self.cover_failed.emit(f"首页生成异常：{type(e).__name__}: {e}")
             finally:
                 # 清理临时首页 PDF（攒批模式除外：它还要被合并进本单）
                 if cover_pdf_path and os.path.isfile(cover_pdf_path) and not cover_consumed:
@@ -5428,6 +5489,25 @@ class DuplexRemedyWorker(QThread):
             self.done.emit(True, f"{_what}（{plan.sheet_count} 张纸）", rid)
         except Exception as e:
             self.done.emit(False, f"补救异常：{type(e).__name__}: {e}", rid)
+
+
+def _pdf_cache_usable(path: str) -> bool:
+    """pdf_cache 里那份 PDF 能不能当真命中用（🟡7，2026-11-10 体检）。
+
+    离线分支原来只写 `os.path.isfile(cached_pdf)`：转换中途断电/磁盘满会留下
+    0 字节或半截文件，于是「缓存命中」把一页都没写成的文件拿去打印/报页数 ——
+    在线分支（cloud_client._get_cached_pdf）和 Excel 分支都会验 %PDF 头并自愈，
+    这里对齐同一条判据：存在、不算太小、开头是 %PDF-。
+    """
+    try:
+        if not path or not os.path.isfile(path):
+            return False
+        if os.path.getsize(path) < 1024:
+            return False
+        with open(path, "rb") as f:
+            return f.read(5) == b"%PDF-"
+    except OSError:
+        return False
 
 
 class ConvertWorker(QThread):
@@ -7736,6 +7816,18 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logger.debug(f"刷新离线角标失败: {e}")
                 n, rejected = 0, 0
+            # 🟡-E2：队列满丢单是「整张离线订单没了」，不能只留一行 logger。
+            # take_queue_drop_note() 取走即清空 ⇒ 只讲一次，不会随角标每次刷新刷屏。
+            try:
+                _drop_note = sync.take_queue_drop_note() if hasattr(sync, "take_queue_drop_note") else ""
+            except Exception:
+                _drop_note = ""
+            if _drop_note:
+                self._log(_drop_note)
+                try:
+                    self.statusBar().showMessage("⚠ 离线队列已满：有离线订单被丢弃，请核对", 15000)
+                except Exception:
+                    pass
         if action is not None:
             action.setVisible(n > 0)
         if btn is None:
@@ -8167,6 +8259,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1600, self._start_agent_api)
         # 半成品补救：启动时查一遍上次留下的半成品（纸可能还在出纸槽/纸盘里）
         QTimer.singleShot(2000, self._check_duplex_remedy_startup)
+        # 配置读坏了要让人知道（体检 🟡8）：load() 已把价格/打印机/纸张退回默认值
+        QTimer.singleShot(2400, self._check_config_load_errors)
 
         # 主题菜单
         if self._theme_manager is not None:
@@ -9183,11 +9277,9 @@ class MainWindow(QMainWindow):
                 continue
             if getattr(job, 'sent', False):
                 continue
-            if job.order_id > 0:
-                self._cloud_client.abandon_order_to_server(job.order_id)
-            elif job.task_id > 0:
-                self._cloud_client.abandon_order_to_server(job.task_id)
-            elif job.order_number and "-L" not in job.order_number:
+            if self._abandon_cloud_job(job):
+                continue
+            if job.order_number and "-L" not in job.order_number:
                 self._cloud_client.abandon_reserved_order(
                     job.order_number, self._tab_total_price(tab_entry),
                     owner_name=(tab_entry.owner_name or ""),
@@ -9937,6 +10029,45 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             return False
+
+    def _check_config_load_errors(self) -> None:
+        """配置读坏了 → 启动时把「已退回默认值」告诉用户（体检 🟡8）。
+
+        `PrinterConfig.load()` 遇到坏 JSON 会改名成 .corrupt-<ts> 再返回默认配置：
+        价格、打印机、纸张、双面档案全变回默认。以前只写一条 logger.warning，
+        界面上完全没有痕迹 —— 操作员只会觉得「今天打印价格不对」。
+        """
+        try:
+            import printer_config as _pc
+            notes = list(getattr(_pc, "CONFIG_LOAD_ERRORS", []) or [])
+            if not notes:
+                return
+            try:
+                _pc.CONFIG_LOAD_ERRORS.clear()      # 只讲一次
+            except Exception:
+                pass
+            self._log("⚠ 配置文件有问题，本次启动已改用默认配置：")
+            for n in notes[:5]:
+                self._log("   · " + str(n))
+            if len(notes) > 5:
+                self._log(f"   · …另有 {len(notes) - 5} 条")
+            try:
+                self.statusBar().showMessage(
+                    "⚠ 配置已退回默认值（价格/打印机可能不对，请核对后重新保存）", 30000)
+            except Exception:
+                pass
+            _detail = "\n".join(str(n) for n in notes[:8])
+            QMessageBox.warning(
+                self, "配置被重置了",
+                "启动时读不出配置文件，已改用默认配置：价格、打印机、纸张设置都回到了默认值。\n\n"
+                f"{_detail}\n\n"
+                "损坏的原文件已经另存为 .corrupt-<时间戳>（与配置文件同目录），需要的话可以找回来。"
+            )
+        except Exception as e:
+            try:
+                logger.warning(f"检查配置读取错误失败: {e}")
+            except Exception:
+                pass
 
     def _on_config_save_failed(self, detail: str) -> None:
         """配置写盘失败 → 主线程提示（限频 60 秒，一次故障只提醒一次）。"""
@@ -13749,8 +13880,17 @@ class MainWindow(QMainWindow):
                 _print_options = resolve_xlsx_print_options(
                     self._config.default_task_options,
                     getattr(_job_for_opts, "xlsx_options", {}) if _job_for_opts else {})
-            except Exception:
-                logger.debug("解析表格版式失败，按不传处理", exc_info=True)
+            except Exception as e:
+                # 🟡12：这里以前只有 logger.debug —— 用户设的缩放/选定的表格区域解析失败后
+                # 就"按不传处理"，打印出来跟设置不一样，界面上一个字都没有。
+                logger.warning(f"解析表格版式失败，本文件按「不传版式」处理（缩放/区域设置不会生效）: {e}",
+                               exc_info=True)
+                try:
+                    self._log(
+                        f"  ⚠ 表格版式解析失败（{os.path.basename(file_path)}）："
+                        f"这一份会按「不传版式」打印，你在选项里设的缩放/区域不会生效（{e}）")
+                except Exception:
+                    pass
                 _print_options = None
         if source_md5:
             # 引擎后缀判定统一走 cache_engine_for（写/读/打印三侧同一口径）
@@ -13774,7 +13914,18 @@ class MainWindow(QMainWindow):
                 cached_pdf = os.path.join(
                     cache_dir, pdf_cache_key(source_md5, image_orientation, _cache_engine) + ".pdf")
                 cached_meta = {}
-                if not os.path.isfile(cached_pdf):
+                if not _pdf_cache_usable(cached_pdf):
+                    # 坏/空/半截的缓存不能当命中：删掉再走一次真正的转换（🟡7）
+                    if os.path.isfile(cached_pdf):
+                        try:
+                            self._log("⚠ 离线缓存不可用（空文件 / 不是 PDF / 转换中途断了），"
+                                      f"已删除并重新转换：{os.path.basename(cached_pdf)}")
+                        except Exception:
+                            pass
+                        try:
+                            os.remove(cached_pdf)
+                        except OSError:
+                            pass
                     cached_pdf = None
             if cached_pdf:
                 from pdf_printer import get_pdf_info as _gpi
@@ -14418,8 +14569,18 @@ class MainWindow(QMainWindow):
                             # （/api/local_orders 只认"已完成"，没有失败分支）
                             if self._offline_sync.is_print_failed(new_num):
                                 self._report_order_failed_after_sync(new_num)
-            except Exception:
-                pass
+                    else:
+                        # 🟡-E2：换号补报失败原来被 `except Exception: pass` 吞掉 ——
+                        # 界面上这单还是"已换号"，云端却从没收到。至少要留一行能查的话。
+                        self._cloudConnSyncLog.emit(
+                            f"⚠ 换号补报失败（{new_num}）：HTTP "
+                            f"{getattr(resp, 'status_code', '?')} "
+                            f"{str(getattr(resp, 'text', '') or '')[:120]}"
+                            " —— 订单仍留在离线库里，稍后会自动重试")
+            except Exception as e:
+                self._cloudConnSyncLog.emit(
+                    f"⚠ 换号补报异常（{new_num}）：{type(e).__name__}: {e}"
+                    " —— 订单仍留在离线库里，稍后会自动重试")
 
     def _report_order_failed_after_sync(self, order_number: str):
         """离线单换号补报成功后，按「本地其实没打出来」回落成 failed（后台线程内调用）。"""
@@ -14843,6 +15004,35 @@ class MainWindow(QMainWindow):
             return  # 让输入框/下拉框/数字框自己处理方向键
         self._switch_tab(delta, create_at_end=False)
 
+    def _abandon_cloud_job(self, job) -> bool:
+        """按 **order_id** 通知后端放弃这一个云端任务的订单；返回「是否已处理完」。
+
+        为什么不能退而用 task_id：`order_files.id`（task_id）与 `orders.id` 各自自增，
+        两张表里同号是常态 —— 把 task_id 填进 `abandon_order_to_server(order_id)`
+        会把**另一位顾客的同号订单**整单标成「放弃打印」（他的纸还在队列里，就被判没打）。
+        旧的五处 `elif job.task_id > 0: abandon_order_to_server(job.task_id)` 就是这个 bug。
+
+        返回 False 只有一种情况：这不是云端任务、而是**本地预留订单**（只有 -L 单号），
+        调用方接着用 `abandon_reserved_order()` 处理。
+        """
+        if not self._cloud_client:
+            return True
+        oid = int(getattr(job, 'order_id', 0) or 0)
+        if oid > 0:
+            self._cloud_client.abandon_order_to_server(oid)
+            return True
+        tid = int(getattr(job, 'task_id', 0) or 0)
+        if tid > 0:
+            self._log(
+                f"⚠ 任务 #{tid} 只有 task_id、没有 order_id —— 放弃通知已跳过："
+                "task_id 与 order_id 各自自增，拿 task_id 当 order_id 会把另一张订单"
+                "整单标成「放弃打印」")
+            return True
+        order_number = str(getattr(job, 'order_number', '') or '')
+        if order_number and "-L" not in order_number:
+            return False        # 本地预留订单 → 由调用方 abandon_reserved_order()
+        return True             # 本地单（无云端归属）：没有可放弃的东西
+
     def _abandon_jobs(self, jobs):
         """通知后端放弃未打印的云端任务（已完成的跳过）。"""
         if not self._cloud_client:
@@ -14854,10 +15044,7 @@ class MainWindow(QMainWindow):
             # 以为一张都没打。留给补救窗去补打或作废，那两处才决定它的最终状态。
             if str(getattr(job, 'remedy_pending', '') or '').strip():
                 continue
-            if job.order_id > 0:
-                self._cloud_client.abandon_order_to_server(job.order_id)
-            elif job.task_id > 0:
-                self._cloud_client.abandon_order_to_server(job.task_id)
+            self._abandon_cloud_job(job)
 
     # ──────── 暂存副本（工作副本）引用与清理 ────────
     # 添加文件时每个原件都会复制一份到 %APPDATA%\HN打印工具\file_cache（staging.py），
@@ -15035,6 +15222,28 @@ class MainWindow(QMainWindow):
     #   ② 任务挂 `remedy_pending`，禁止被当作普通未完成任务重打（重打会把第 1 趟
     #      再出一遍，纸叠里多一套单面纸，之后补第 2 趟必然串页）；
     #   ③ 由本窗口的「⚠ 半成品补救…」接手：补打第 2 趟 / 整单重打 / 作废。
+    def _on_cover_failed(self, msg: str):
+        """首页（封面）没打出来：留痕、上状态栏、攒进批次收尾结论（🟡-E4）。
+
+        以前这里只在日志里打一行「✗ 首页打印失败」，整批照样报「全部成功」——
+        纸里少一页，收单的人只有翻日志才知道。这一页是单面单独打的一张，
+        丢了不会让后面的文件错位，所以不必整批失败，但必须让人看见。
+        """
+        text = str(msg or "").strip() or "首页（封面）没打出来"
+        self._log("⚠ 首页（封面）没打出来：" + text)
+        try:
+            self.statusBar().showMessage("⚠ 首页没打出来：这一单缺封面，请人工补打", 30000)
+        except (AttributeError, RuntimeError):
+            pass
+        notes = getattr(self, "_cover_failed_notes", None)
+        if not isinstance(notes, list):
+            notes = []
+            self._cover_failed_notes = notes
+        notes.append(text)
+        # 只留最近 20 条，避免长时间运行后无限增长
+        if len(notes) > 20:
+            del notes[:-20]
+
     def _on_job_stalled(self, idx: int, message: str, record):
         """某个任务「只打了第 1 趟」：不判失败，挂到补救台账上等人补打。"""
         flat_jobs = getattr(self, '_flat_jobs', [])
@@ -18334,6 +18543,8 @@ class MainWindow(QMainWindow):
         # 「半成品」：第 1 趟打出、第 2 趟没打（跳过/超时/失败）。**不是失败**，
         # 由补救窗接手续打 —— 见 DuplexRemedyDialog / duplex_remedy。
         worker.job_stalled.connect(self._on_job_stalled)
+        # 首页（封面）没打出来：整批照打，但这一单缺第一页 —— 不能只留一行日志
+        worker.cover_failed.connect(self._on_cover_failed)
         worker.all_finished.connect(self._on_all_finished)
         worker.pdf_cached.connect(self._on_pdf_cached)
         worker.flip_required.connect(self._on_flip_required)
@@ -18687,6 +18898,14 @@ class MainWindow(QMainWindow):
 
         total = success_count + fail_count
         status = "✅ 全部成功" if fail_count == 0 else f"⚠️ 成功 {success_count} / 失败 {fail_count}"
+        # 🟡-E4：首页（封面）没打出来时，整批的「成功」是真的（文件都出来了），
+        # 但这一单缺一页纸 —— 不能只在日志里留一句。这里把它带进收尾结论。
+        _cover_notes = list(getattr(self, "_cover_failed_notes", []) or [])
+        if _cover_notes:
+            status += f"／⚠️ 首页未打出 {len(_cover_notes)} 次"
+            self._log("⚠ 首页（封面）没打出来：" + "；".join(_cover_notes[-3:])
+                      + " —— 其余文件已照常打印，请人工补打这一页")
+            self._cover_failed_notes = []
         if getattr(self, "_batch_stalled", False):
             # 「跳过」不是失败：这批里有一单只出了第 1 趟的纸，既没打错也没打完。
             # 所以不能报「全部成功」（纸只有一半），也不能报「失败」（纸打了一半）。
@@ -18721,6 +18940,15 @@ class MainWindow(QMainWindow):
             )
         else:
             self._log(f"🔒 全部 {total} 个任务已完成打印并回报成功！标签页已锁定。")
+            if _cover_notes:
+                QMessageBox.warning(
+                    self, "打印完成（缺首页）",
+                    f"全部 {total} 个任务处理完毕。\n\n"
+                    f"⚠️ 其中 {len(_cover_notes)} 次「首页（封面）」没打出来，"
+                    f"这些单的纸缺第一页：\n"
+                    + "\n".join(f"· {_n}" for _n in _cover_notes[-5:])
+                    + "\n\n其余文件已照常打印 —— 需要的话请人工补打首页。"
+                )
 
         # 无障碍自动打印重试队列：打印机空闲后补打忙时丢弃的订单（只打未完成的，已打的不重打）
         # 2026-12：补打保持后台（不切换前台标签页），与无障碍订单「后台创建标签页」一致
@@ -20807,10 +21035,7 @@ class MainWindow(QMainWindow):
                     for job in backup_jobs:
                         if getattr(job, 'sent', False):
                             continue
-                        if job.order_id > 0 and self._cloud_client:
-                            self._cloud_client.abandon_order_to_server(job.order_id)
-                        elif job.task_id > 0 and self._cloud_client:
-                            self._cloud_client.abandon_order_to_server(job.task_id)
+                        self._abandon_cloud_job(job)
                 self._config.tabs = {"1": self._make_new_tab()}
                 self._config.active_tab = "1"
                 self._current_tab = "1"
@@ -20850,11 +21075,9 @@ class MainWindow(QMainWindow):
                             # 之后设备真打出来也救不回；而这里本来就是"再打一遍"的先决条件）
                             continue
                         all_abandoned.append(job)
-                        if job.order_id > 0 and self._cloud_client:
-                            self._cloud_client.abandon_order_to_server(job.order_id)
-                        elif job.task_id > 0 and self._cloud_client:
-                            self._cloud_client.abandon_order_to_server(job.task_id)
-                        elif job.order_number and "-L" not in job.order_number and self._cloud_client:
+                        if self._abandon_cloud_job(job):
+                            continue
+                        if job.order_number and "-L" not in job.order_number and self._cloud_client:
                             # 本地预留订单（仅获取了订单号但未提交打印）→ 标记为放弃，并补记价格
                             # 金额传整单合计（不是本文件的价）+ 归属/自打标记
                             self._cloud_client.abandon_reserved_order(
@@ -20867,10 +21090,7 @@ class MainWindow(QMainWindow):
                         if getattr(job, 'sent', False):
                             continue
                         all_abandoned.append(job)
-                        if job.order_id > 0 and self._cloud_client:
-                            self._cloud_client.abandon_order_to_server(job.order_id)
-                        elif job.task_id > 0 and self._cloud_client:
-                            self._cloud_client.abandon_order_to_server(job.task_id)
+                        self._abandon_cloud_job(job)
                 self._config.tabs = {"1": self._make_new_tab()}
                 self._config.active_tab = "1"
                 self._current_tab = "1"
@@ -21572,10 +21792,7 @@ class MainWindow(QMainWindow):
                 job = jobs[row]
                 if getattr(job, 'sent', False):
                     continue
-                if job.order_id > 0 and self._cloud_client:
-                    self._cloud_client.abandon_order_to_server(job.order_id)
-                elif job.task_id > 0 and self._cloud_client:
-                    self._cloud_client.abandon_order_to_server(job.task_id)
+                self._abandon_cloud_job(job)
         # 取消被移除文件的转换 worker（防完成后回调写回已删除行/残留缓存）
         for row in rows:
             if row < len(jobs):

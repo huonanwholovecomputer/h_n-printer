@@ -2767,9 +2767,45 @@ function calcMonth(m, opts) {
 
 /* ==================== 保存 ==================== */
 var _saveTimer = null;
+var _saveDirty = false;          /* 有改动还没落盘（🟡1） */
+var _tabTouchKey = 'finance_tab_touch';
 function save() {
+  _saveDirty = true;
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(function () { _doSave(false); }, 250);
+}
+
+/* 体检 🟡1：这个页面原来只有 250ms 防抖的自动保存 ——
+   ① 改完最后一笔立刻关页/切页，那 250ms 里的改动谁也不会再看见；
+   ② 同一个账本在第二个标签页里打开，两边各自整份覆盖云端，互相不知道。
+   这里补两件事：离开页面前把未保存的改动塞进离线暂存（下次打开会问要不要重放），
+   以及监听另一个标签页的保存动作、提示本页重载（避免用旧数据覆盖新数据）。 */
+function _flushBeforeUnload() {
+  if (!_saveDirty) return;
+  try { localStorage.setItem('finance_offline_pending', JSON.stringify(STORE)); } catch (e) {}
+  _saveDirty = false;
+}
+window.addEventListener('pagehide', _flushBeforeUnload);
+window.addEventListener('beforeunload', _flushBeforeUnload);
+window.addEventListener('storage', function (ev) {
+  if (!ev || ev.key !== _tabTouchKey || !ev.newValue) return;
+  var d = null;
+  try { d = JSON.parse(ev.newValue); } catch (e) { return; }
+  var mine = (STORE && STORE.meta && STORE.meta.version) || 0;
+  if (d && d.v && d.v > mine) {
+    toast('⚠️ 另一个标签页刚保存了账本（服务器 v' + d.v + '）：本页数据已过期，' +
+          '继续改会把它覆盖掉，请刷新后重做', 'error', true);
+  } else {
+    toast('⚠️ 另一个标签页也在改这份账本：两边互相覆盖的风险很高，建议只留一个标签页', 'error');
+  }
+});
+function _announceTabSave() {
+  try {
+    localStorage.setItem(_tabTouchKey, JSON.stringify({
+      t: Date.now(),
+      v: (STORE && STORE.meta && STORE.meta.version) || 0
+    }));
+  } catch (e) {}
 }
 /* 保存请求携带 client_version，响应返回 server_version；
    若 server_version > client_version + 1 说明期间有其他设备写入 → 弹冲突确认（覆盖则强制保存）。
@@ -2786,6 +2822,8 @@ function _doSave(force) {
     // 本地模式：配置/数据存本地 print_data.json
     _saveToLocalFile(STORE).then(function (r) {
       if (!r.ok) { toast('⚠️ 本地保存失败', 'error'); return; }
+      _saveDirty = false;
+      _announceTabSave();
       var ind = $('#storageFilePath');
       if (ind) ind.textContent = '📁 本地 · 已保存';
       // 本地无并发冲突，版本号自增
@@ -2802,6 +2840,8 @@ function _doSave(force) {
     }
     var ind = $('#storageFilePath');
     if (ind) ind.textContent = '☁ 云端 · 已保存';
+    _saveDirty = false;
+    _announceTabSave();
     if (!force && r.conflict) {
       /* 体检 🔴8：revision 冲突不能只有一个「覆盖」按钮 —— 那等于把别台设备刚记的账
          整份抹掉。这里给两个明确选择：以云端为准（重载）或强制覆盖本机这份。 */

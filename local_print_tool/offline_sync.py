@@ -89,6 +89,9 @@ class OfflineSync:
         # 刷「📴 离线未同步」角标 / 文件菜单项 / 离线订单窗。后台同步线程与连线同步
         # 线程都不是 GUI 线程，回调里**绝不能**直接碰控件。
         self._change_cb = None
+        # 🟡-E2：队列满了丢单这件事必须走到人眼前（原来只有一行 logger）。
+        # 存一条待取走的话，GUI 每次刷新角标时 take 一次（take 完清空，只讲一次）。
+        self._queue_drop_note: str = ""
         self._init_db()
 
     # ── 数据库初始化 ──
@@ -197,6 +200,11 @@ class OfflineSync:
             if cur.rowcount > 0:
                 logger.warning(
                     f"[OFFLINE] 离线队列超过 {OFFLINE_QUEUE_MAX} 条，已丢弃最旧 {cur.rowcount} 条")
+                # 丢掉的是**整张离线订单**（含价格与文件清单），且不会自动补报
+                # ⇒ 留一条给 GUI 报给人看，而不是只写日志。
+                self._queue_drop_note = (
+                    f"⚠ 离线队列已满（{OFFLINE_QUEUE_MAX} 条），丢弃了最旧的 {cur.rowcount} 条离线订单"
+                    " —— 这些单不会自动补报，请到「文件 → 离线未同步订单」核对")
             conn.commit()
             conn.close()
         logger.info(f"[OFFLINE] 任务已缓存: {order_number} ({len(files_data)} 个文件)")
@@ -445,6 +453,13 @@ class OfflineSync:
             self._sync_thread = None
 
     # ── 工具方法 ──
+
+    def take_queue_drop_note(self) -> str:
+        """取走「队列满丢单」的那句提示（取一次就清空 ⇒ 界面上只讲一次，不刷屏）。"""
+        _note = str(getattr(self, "_queue_drop_note", "") or "")
+        if _note:
+            self._queue_drop_note = ""
+        return _note
 
     def pending_count(self) -> int:
         """返回尚未同步的离线订单数量（S1-09：**不按重试次数过滤**，永不放弃）。"""

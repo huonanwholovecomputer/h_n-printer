@@ -57,7 +57,21 @@ print("=== A. 静态接线 ===")
 #    v4.5.18（🔴-B2）：三个标签页删除/清空入口（删除单个 / 清空全部 / 删除已完成）的
 #    放弃逻辑已收敛为公共方法 `_abandon_tab_jobs`，调用点由 3 处变为 2 处
 #    （公共方法 + 退出清理 closeEvent）。语义等价，断言改为「每个调用点都满足」。
-sites = [m.start() for m in re.finditer(r"abandon_reserved_order\(", gui)]
+# 真正调用该函数的位置（用 AST 取，别用正则：docstring/注释里提到函数名不算调用点，
+# 2026-11-11 批次 E 的 `_abandon_cloud_job` 说明文字里就写了这个函数名）
+import ast as _ast
+
+_offsets = [0]
+for _line in gui.splitlines(True):
+    _offsets.append(_offsets[-1] + len(_line))
+sites = []
+for _node in _ast.walk(_ast.parse(gui)):
+    if isinstance(_node, _ast.Call):
+        _fn = _node.func
+        _fn_name = _fn.attr if isinstance(_fn, _ast.Attribute) else getattr(_fn, "id", "")
+        if _fn_name == "abandon_reserved_order":
+            sites.append(_offsets[_node.lineno - 1] + _node.col_offset)
+sites.sort()
 chk("gui.py 预留放弃调用点 ≥2（三处标签页入口已合并为 _abandon_tab_jobs）",
     len(sites) >= 2, "实际 %d 处" % len(sites))
 tabtotal = 0

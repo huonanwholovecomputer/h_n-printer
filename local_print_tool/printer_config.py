@@ -54,6 +54,13 @@ import manual_duplex
 
 logger = logging.getLogger(__name__)
 
+# 最近一次「配置读坏了、已退回默认值」的说明（🟡8，2026-11-10 体检）。
+# 为什么需要：`load()` 读到坏 JSON 时会改名成 .corrupt-<ts> 再返回一份默认配置 ——
+# 价格、打印机、纸张、双面档案全回到默认。以前只写一条 logger.warning，界面上
+# 什么都没有：操作员看到的是「今天价格不对」，而不是「配置被重置了」。
+# GUI 启动后把这里的内容念给用户听，念完清空（避免每次重画都弹）。
+CONFIG_LOAD_ERRORS: list[str] = []
+
 
 # ---- 订单归属默认占位名（仅遗留兼容） ----
 # v4.2：归属名单不再预置占位姓名。成员名单一律来自收支统计的成员管理
@@ -1761,6 +1768,7 @@ class PrinterConfig:
         except (json.JSONDecodeError, OSError, ValueError, TypeError, AttributeError) as e:
             logger.warning(f"加载配置失败 ({path}): {e}，将使用默认配置")
             # 损坏文件改名保留为 .corrupt-{时间戳}（不删除，便于排查），下次启动自动重建
+            backup_path = ""
             try:
                 backup_path = f"{path}.corrupt-{datetime.now().strftime('%Y%m%d%H%M%S')}"
                 shutil.move(path, backup_path)
@@ -1771,6 +1779,14 @@ class PrinterConfig:
             # 配置文件被写坏 ≠ 档案没了：档案独立存活，照样读回来（否则一次手改坏配置
             # 就把"这台机器不支持自动双面"的事实变成"未确认"，双面又走驱动虚报路径）
             broken.printer_profiles = _read_profiles_store(_profiles_path_for(path))[0]
+            # 🟡8：把这件事留到界面上说 —— 价格/打印机/纸张都已经回到默认值了。
+            try:
+                CONFIG_LOAD_ERRORS.append(
+                    f"配置文件读取失败，已改用默认配置：{path}（{e}）；"
+                    f"损坏的原文件已另存为：{backup_path or '（备份失败，原文件可能已被覆盖）'}"
+                )
+            except Exception:
+                pass
             return broken
 
 
