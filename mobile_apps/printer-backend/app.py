@@ -4291,6 +4291,57 @@ def expire_stale_queued_orders():
     print(f"[SECURITY] 已淘汰 {len(rows)} 个排队超时子任务（> {timeout_hours} 小时）")
 
 
+def expire_stale_scheduled_orders():
+    """预约单到点后长期没有任何设备把它打出来 ⇒ 超时取消，释放磁盘文件。
+
+    2026-11-10 体检（🔴12）：`expire_stale_queued_orders()` 只扫 queued，而 scheduled / waiting
+    出现在 `cleanup_expired_files()` 的 active_statuses 里 —— 于是「预约到点、目标设备永远不出现」
+    这一单会无限期把文件钉在服务器上：既不打、也不清理、也不会超时。现场 HN20261110-0005
+    就是这类（客户端挂起后状态机已结束，服务端子任务一直 waiting）。
+
+    计时基准：`orders.scheduled_at`（到点之后才开始计时——提前几天下一周后的预约是正常用法，
+    绝不能按 created_at 判），为空时退回子任务 `created_at`。阈值沿用
+    `security.queued_timeout_hours`，与排队超时同一把尺子。
+
+    口径：只改 scheduled / waiting 两种「还没开始打」的状态；标 `timeout`（不是 failed，
+    结算页显示「超时」）+ 写 reject_reason。timeout **不在** NO_LONGER_PRINTABLE_STATUSES，
+    所以设备日后真把纸打出来并回报成功时，仍按 on_print_success 白名单救回 sent。
+    """
+    timeout_hours = _SECURITY["queued_timeout_hours"]
+    if timeout_hours <= 0:
+        return
+    cutoff_str = (datetime.now() - timedelta(hours=timeout_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    with db_lock:
+        conn = get_db_conn()
+        rows = conn.execute(
+            """SELECT of.id, of.order_id
+               FROM order_files of
+               JOIN orders o ON of.order_id = o.id
+               WHERE of.status IN ('scheduled', 'waiting')
+                 AND o.schedule_mode != 'now'
+                 AND o.status NOT IN ('canceled', 'abandoned', 'rejected')
+                 AND COALESCE(NULLIF(o.scheduled_at, ''), of.created_at) < ?""",
+            (cutoff_str,),
+        ).fetchall()
+        if not rows:
+            conn.close()
+            return
+        order_ids = set()
+        for r in rows:
+            conn.execute(
+                "UPDATE order_files SET status = ?, reject_reason = ? WHERE id = ?",
+                (TIMEOUT_STATUS,
+                 f"预约到点后 {timeout_hours} 小时仍未打印（设备未接单），已超时取消",
+                 r["id"]),
+            )
+            order_ids.add(r["order_id"])
+        for oid in order_ids:
+            refresh_order_status(conn, oid)
+        conn.commit()
+        conn.close()
+    print(f"[SCHEDULER] 已超时取消 {len(rows)} 个长期未打印的预约子任务（> {timeout_hours} 小时）")
+
+
 # ==================== 原子任务领取 ====================
 
 
@@ -4972,6 +5023,11 @@ def check_printing_timeout():
         conn.close()
 
 
+# 🔴-A5：printing 任务的硬上限。设备仍在线时先把 5 分钟回退窗口放宽到这个时长，
+# 超过它才认定「在线但卡死」并回退 queued（见 recover_orphaned_printing_tasks）。
+_ORPHAN_ONLINE_GRACE_MIN = 30
+
+
 def recover_orphaned_printing_tasks():
     """扫描超过 5 分钟仍处于 printing 的任务，检查文件是否存在：
     - 文件存在 → 回退为 queued（让其他打印机重试）
@@ -4983,12 +5039,26 @@ def recover_orphaned_printing_tasks():
     created_at 附近的锁定，但 created_at 是创建时间不会变——实际问题是 created_at 很久
     的任务若被反复回退/重推，会立刻被回收造成无限循环；locked_at 只在锁定瞬间写入，
     回退时清空（locked_at=''），新锁定重新写入，语义正确且兼容旧数据（'' 视为未锁定，
-    直接按超时处理）。"""
+    直接按超时处理）。
+
+    🔴-A5（2026-11-10 体检）：**领取任务的那台设备还在线、且锁定时间还在硬上限内，就不许
+    回退**。旧逻辑只看 locked_at 超过 5 分钟 —— 而现场一次手动双面/攒批动辄十分钟，只要
+    保活断了几拍（网络抖动、切网、客户端卡在 COM 转换），这里就会把「纸正在这张一叠里、
+    第 2 趟还没开始」的任务回退 queued 再推给别的设备打一遍：同一份文件出两次纸，订单状态
+    来回翻转。参照 `recover_stale_downloading()` 的在线判据，这里给它补上：
+      · 设备离线（或 operator_client 为空，历史数据）→ 照旧 5 分钟回退（真孤儿）；
+      · 设备在线 → 继续等，直到 locked_at 超过 `_ORPHAN_ONLINE_GRACE_MIN` 分钟（硬上限）
+        才回退 —— 在线却半小时毫无动静，说明它卡死了、纸也不可能还在出，此时回退/重推才是
+        正确处置。
+    · 文件已被清理（path 不存在）仍然立刻判 failed：没有重出纸的风险，早失败早通知。
+    """
     cutoff_time = (datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    hard_cutoff = (datetime.now() - timedelta(minutes=_ORPHAN_ONLINE_GRACE_MIN)).strftime(
+        "%Y-%m-%d %H:%M:%S")
     with db_lock:
         conn = get_db_conn()
         rows = conn.execute(
-            """SELECT of.id, of.order_id, of.file_id, f.path
+            """SELECT of.id, of.order_id, of.file_id, of.operator_client, of.locked_at, f.path
                FROM order_files of
                LEFT JOIN files f ON of.file_id = f.id
                WHERE of.status = 'printing' AND (of.locked_at = '' OR of.locked_at < ?)""",
@@ -4998,14 +5068,24 @@ def recover_orphaned_printing_tasks():
             conn.close()
             return
 
+        online = set(get_active_clients())
+
         reset_ids = []  # → queued（文件还在）
         fail_ids = []   # → failed（文件已删）
+        kept_ids = []   # 在线设备的在飞作业：先不动（避免重复出纸）
         for r in rows:
             file_path = r["path"]
-            if file_path and os.path.isfile(file_path):
-                reset_ids.append(r["id"])
-            else:
+            if not (file_path and os.path.isfile(file_path)):
                 fail_ids.append(r["id"])
+                continue
+            _oc = str(r["operator_client"] or "")
+            _lk = str(r["locked_at"] or "")
+            if _oc and _oc in online and _lk and _lk >= hard_cutoff:
+                # 设备还在线、锁定时间还在硬上限内：它多半真的在打（手动双面等翻纸 / 攒批
+                # 整叠第 2 趟）。回退 queued 会被别的设备再打一遍。
+                kept_ids.append(r["id"])
+                continue
+            reset_ids.append(r["id"])
 
         if reset_ids:
             placeholders = ",".join("?" for _ in reset_ids)
@@ -5028,6 +5108,9 @@ def recover_orphaned_printing_tasks():
         conn.commit()
         conn.close()
 
+        if kept_ids:
+            print(f"[ORPHAN] {len(kept_ids)} 个 printing 任务的设备仍在线（未超 "
+                  f"{_ORPHAN_ONLINE_GRACE_MIN} 分钟硬上限），本轮不回退")
         if reset_ids:
             print(f"[ORPHAN] 已回收 {len(reset_ids)} 个孤儿 printing 任务 → queued")
         if fail_ids:
@@ -13537,6 +13620,10 @@ if __name__ == "__main__":
     scheduler.add_job(recover_stale_downloading, "interval", minutes=2, id="recover_stale_downloads")
     scheduler.add_job(cleanup_abandoned_reserved_orders, "interval", minutes=5, id="cleanup_reserved")
     scheduler.add_job(expire_stale_queued_orders, "interval", minutes=10, id="expire_stale_queued")
+    # 🔴-A4：预约单到点后长期没人打出来（目标设备一直不出现）也要超时取消，否则
+    # scheduled/waiting 在 cleanup_expired_files 里算「活跃」⇒ 文件永久钉在服务器上。
+    scheduler.add_job(expire_stale_scheduled_orders, "interval", minutes=10,
+                      id="expire_stale_scheduled")
     # 测试设备（联调/冒烟脚本注册的 debug-* 等）离线后自动清掉，避免授权页越积越多
     scheduler.add_job(purge_test_devices, "interval", minutes=30, id="purge_test_devices")
     scheduler.start()

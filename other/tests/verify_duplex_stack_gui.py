@@ -546,9 +546,18 @@ _n_ka = len(win._cloud_client.keepalive)
 check("★ 保活真的发给后端（含纸叠两单与排队的单）",
       _n_ka >= 1 and {101, 103, 102, 104, 105} <= set(win._cloud_client.keepalive[-1]),
       f"{win._cloud_client.keepalive[-1] if _n_ka else None}")
-win._tick_keepalive()          # 集合没变 → 不重复发
-check("★ 集合没变时不重复保活（不空转刷后端）",
+win._tick_keepalive()          # 刚发过、集合没变、不到 45 秒 → 不重复发
+check("★ 集合没变且刚发过时不重复保活（不空转刷后端）",
       len(win._cloud_client.keepalive) == _n_ka)
+# 🔴-A5：集合没变也必须按节奏重申 —— 否则手动双面/攒批等人翻纸的十分钟里后端
+#         会以为设备死了（3 分钟判失败、5 分钟当孤儿回退 queued 重推 ⇒ 重复出纸）。
+win._keepalive_last_ts -= (win._KEEPALIVE_RESEND_SEC + 1)
+win._tick_keepalive()
+check("★ 集合没变但已过重申间隔 → 必须再发一次保活（长作业不被判死/重推）",
+      len(win._cloud_client.keepalive) == _n_ka + 1
+      and {101, 103, 102, 104, 105} <= set(win._cloud_client.keepalive[-1]),
+      f"{len(win._cloud_client.keepalive)} 次")
+_n_ka = len(win._cloud_client.keepalive)
 jobE = make_job(PDF2, "on", name="E.pdf", task_id=106, order_id=16)
 win._config.tabs["1"].jobs = [jobA, jobC, jobE]
 _prep()

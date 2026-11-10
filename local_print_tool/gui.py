@@ -6599,6 +6599,9 @@ class MainWindow(QMainWindow):
         self._stack_state_timer.timeout.connect(self._stack_state_tick)
         self._stack_state_timer.start()
         self._keepalive_last: tuple = ()     # 上次实际发送的任务集合（变了才立刻补发一次）
+        # 🔴-A5：同一集合也按这个间隔重申保活（服务端 3 分钟没动静就判失败，45 秒留足余量）
+        self._keepalive_last_ts: float = 0.0
+        self._KEEPALIVE_RESEND_SEC: float = 45.0
         # 无障碍后台打印：当前打印批次所属的标签页 key（后台创建时不切换前台；
         # 打印启动/回报/冻结据此定位标签页，空 = 前台标签页）
         self._printing_tab_key: str = ""
@@ -9408,8 +9411,14 @@ class MainWindow(QMainWindow):
             self._tab_btn_cleanup_empty.setEnabled(self._has_empty_tabs_except_current())
 
         # 冻结时禁用打印和清空按钮（_setup_file_table 阶段按钮尚未创建）
+        # ⏸ 唯一例外：预约单因「手动双面需人工翻纸」挂起时，程序自己叫用户点「开始打印」，
+        # 就不能再把按钮灰掉（2026-11-10 HN20261110-0005 死路）。
+        _hold_start = bool(is_frozen and self._tab_manual_hold_startable(tab))
         if hasattr(self, '_btn_start'):
-            self._btn_start.setEnabled(not is_frozen)
+            self._btn_start.setEnabled(not is_frozen or _hold_start)
+            self._btn_start.setToolTip(
+                "这一页是预约单挂起等人工翻纸：点这里开始打第 1 趟（打完会提示翻纸）"
+                if _hold_start else "开始打印当前标签页（快捷键 Ctrl+Enter）")
         if hasattr(self, '_btn_clear'):
             self._btn_clear.setEnabled(not is_frozen)
 
@@ -9475,6 +9484,22 @@ class MainWindow(QMainWindow):
         """检查当前标签页是否已固定（打印后锁定，不可编辑）。"""
         tab = self._config.tabs.get(self._current_tab)
         return tab.frozen if tab else False
+
+    def _tab_manual_hold_startable(self, tab) -> bool:
+        """⏸ 挂起等人工翻纸的标签页虽然已锁定（🔒），也必须允许人工点「开始打印」。
+
+        为什么必须留这道口子（2026-11-10 现场 HN20261110-0005）：预约单到点会在
+        `_lock_scheduled_tab()` 里先把标签页冻住，紧接着 `_hold_for_manual_duplex()`
+        又把它挂起、并在日志里写「请人工点「开始打印」」—— 而 `_on_start_print()` 开头
+        就是「已固定 ⇒ 不能重复打印」，按钮也是灰的。程序让人去做一件它自己会拒绝的事，
+        这一单只能靠「复制文件到新标签页」才打得出来。挂起态必须可开打。
+        """
+        if tab is None or not bool(getattr(tab, "manual_duplex_pending", False)):
+            return False
+        try:
+            return any(not bool(getattr(j, "sent", False)) for j in (tab.jobs or []))
+        except Exception:
+            return False
 
     def _set_current_jobs(self, jobs: list[PrintJob]):
         """设置当前标签页的任务列表并保存配置。
@@ -17645,7 +17670,14 @@ class MainWindow(QMainWindow):
         为什么需要：`check_printing_timeout` 对已 accept 的子任务按 locked_at 起算 3 分钟
         判失败、`recover_orphaned_printing_tasks` 把超 5 分钟的 printing 回退 queued 重推
         （→ 重复打印）；而手动双面/攒批一次作业远超 3 分钟。
-        集合没变化时**不重复发**（避免空转刷后端），force=True 时无论如何发一次。
+
+        🔴-A5（2026-11-10 体检）：**只要还在作业里就必须按节奏重申**，不能「集合没变就不发」。
+        旧写法只在「保活任务集合变化」时发一次 —— 一单手动双面（第 1 趟打完等人翻纸，动辄
+        十分钟）集合一直不变 ⇒ 60 秒后不再刷新 locked_at ⇒ 后端 3 分钟判失败、5 分钟把它当
+        孤儿回退 queued 重推 ⇒ 已经出过的纸再出一遍、订单来回翻转。
+        现在的口径：集合变化 ⇒ 立刻发；集合没变 ⇒ 每 `_KEEPALIVE_RESEND_SEC` 秒重申一次
+        （定时器本来就是 60 秒一跳，所以实际上等于「作业期间每分钟一次」）。
+        force=True 时无论如何发一次（重连/开打/收尾这些关键时刻）。
         """
         try:
             ids = self._collect_keepalive_tasks()
@@ -17653,9 +17685,13 @@ class MainWindow(QMainWindow):
             return
         if not ids:
             self._keepalive_last = ()
+            self._keepalive_last_ts = 0.0
             return
         key = tuple(sorted(ids))
-        if not force and key == tuple(self._keepalive_last):
+        now = time.time()
+        _last_ts = float(getattr(self, "_keepalive_last_ts", 0.0) or 0.0)
+        if (not force and key == tuple(self._keepalive_last)
+                and (now - _last_ts) < self._KEEPALIVE_RESEND_SEC):
             return
         client = getattr(self, "_cloud_client", None)
         if client is None:
@@ -17663,6 +17699,7 @@ class MainWindow(QMainWindow):
         try:
             if client.report_keepalive(list(ids)):
                 self._keepalive_last = key
+                self._keepalive_last_ts = now
         except Exception as e:
             logger.debug("保活发送失败: %s", e)
 
@@ -19191,7 +19228,20 @@ class MainWindow(QMainWindow):
                 self._cloud_client.report_fail(task.task_id, f"下载失败: {task.error_message}")
                 self._cloud_client.reject_task(task.task_id)
             self._cloud_tasks.pop(task.task_id, None)
-            self._cleanup_scheduled_order(oid, reason="文件下载失败")
+            # 🔴-A3（2026-11-10 体检）：一份文件下载失败不许把**整单**扔掉。
+            # 旧写法直接 `_cleanup_scheduled_order(...)` ⇒ 这一单在同一页里的其它文件
+            # 连状态机带标签页一起消失（顾客付了钱、机器空转、日志只有一行「下载失败」）。
+            # 现在：失败的那份单独回报失败并打回，其余照打；确实一份都不剩才收尾。
+            if not st["pending"] and not st["ready"]:
+                self._cleanup_scheduled_order(oid, reason="文件下载失败（本单已无剩余可打文件）")
+                return
+            _left = len(st["ready"]) + len(st["pending"])
+            self._log(f"⏰ 预约单 #{oid}: 失败的是这一份，其余 {_left} 份照常打印"
+                      f"（失败已单独回报）")
+            self._save_scheduled_state()
+            self._sync_scheduled_queue_window()
+            if not st["printed"]:
+                self._restart_scheduled_debounce(oid)
             return
         if task.status == "ready":
             st["pending"].pop(task.task_id, None)
@@ -19555,6 +19605,10 @@ class MainWindow(QMainWindow):
                     "pending": pending,
                     "queued": bool(st.get("queued")),
                     "frozen": bool(st.get("frozen")),
+                    # 🔴-A2（2026-11-10）：标签页归属必须一起落盘。丢了它，重启后到点会重走
+                    # 「建标签页」流程，把已经落地成表格行的文件再 append 一遍（同一文件两行、
+                    # 打两遍、按两份收钱）。读取时仍要用 `_scheduled_tab_still_owns()` 复核。
+                    "tab_key": str(st.get("tab_key") or ""),
                 }
             path = self._scheduled_state_path()
             if not data:
@@ -19599,7 +19653,11 @@ class MainWindow(QMainWindow):
                 "target_ts": int(item.get("target_ts") or 0), "ready": {}, "pending": {},
                 "timer": None, "print_timer": None,
                 "frozen": bool(item.get("frozen")), "delayed_sent": False,
-                "printed": False, "printed_ts": 0, "tab_key": None, "retry_count": 0,
+                "printed": False, "printed_ts": 0,
+                # 🔴-A2：恢复标签页归属（旧版本状态文件里没有这个字段 ⇒ 空串 ⇒ 到点重建，
+                # 但重建路径已有 task_id 去重兜底，不会再落两行）
+                "tab_key": (str(item.get("tab_key") or "") or None),
+                "retry_count": 0,
                 "queued": bool(item.get("queued")),
             }
             for src_key, bucket in (("tasks", "ready"), ("pending", "pending")):
@@ -20918,6 +20976,22 @@ class MainWindow(QMainWindow):
             if _cloud_created2:
                 _ctab.created_at = _cloud_created2
 
+        # 🔴-A2（2026-11-10 体检）：同一个 task 只能在一页里占一行。
+        # 现场成因：预约单状态机（`_scheduled_state.json`）与配置文件（tabs + jobs）是两处
+        # 各自落盘的，重启后两边都会恢复；`_load_scheduled_state()` 恢复出的 `tab_key` 是空的
+        # ⇒ 到点走「建标签页」路径 → `_find_tab_for_order()` 命中**已经有一行的**旧页 →
+        # 无条件 append ⇒ 同一文件两行、打印两遍、按两份收钱。这里按 task_id 认人。
+        if task.task_id:
+            _tkey = new_key
+            for _j in (self._config.tabs[_tkey].jobs or []):
+                if int(getattr(_j, "task_id", 0) or 0) == int(task.task_id):
+                    self._log(
+                        f"☁ 云端任务 #{task.task_id} 已在标签页 {_tkey}（重复下发/重启重放），"
+                        f"不重复添加")
+                    if switch_tab:
+                        self._focus_cloud_tab(_tkey)
+                    return _tkey
+
         ext = os.path.splitext(task.local_path)[1].lower() if task.local_path else ""
         image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
         # 仅使用任务自带的 source_md5（后端 MD5 索引提供），不再主线程计算大文件 MD5（防 UI 冻结）；
@@ -21163,8 +21237,13 @@ class MainWindow(QMainWindow):
     def _on_start_print(self):
         """开始打印当前标签页的所有文件。"""
         if self._is_current_tab_frozen():
-            self._log("🔒 该标签页已固定，不能重复打印")
-            return
+            _tab = self._config.tabs.get(self._current_tab)
+            if not self._tab_manual_hold_startable(_tab):
+                self._log("🔒 该标签页已固定，不能重复打印")
+                return
+            # ⏸ 预约单挂起等人工翻纸：锁着只是不许改单，人工开打必须放行
+            # （2026-11-10 HN20261110-0005：日志让人点「开始打印」，程序自己拒绝）。
+            self._log("▶ 预约单挂起后的人工开打：第 1 趟打完后会弹窗提示翻纸（第 2 趟）")
         jobs = self._get_current_jobs()
         if not jobs:
             self._log("当前标签页没有文件可以打印")
