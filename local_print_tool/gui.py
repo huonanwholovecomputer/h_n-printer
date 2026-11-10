@@ -5489,7 +5489,8 @@ class ConvertWorker(QThread):
             slot.release()
 
     def _run_convert(self):
-        from converter import _convert_via_word_com, _convert_via_wps_com, get_converter
+        from converter import (_convert_via_word_com, _convert_via_wps_com, get_converter,
+                               _pdf_product_ok)
         from pdf_printer import get_pdf_info
         import paths as _paths
 
@@ -5564,6 +5565,20 @@ class ConvertWorker(QThread):
                     _convert_via_wps_com(self._file_path, temp_pdf)
                 else:
                     _convert_via_word_com(self._file_path, temp_pdf)
+                # 2026-11-10（体检 🔴16）：COM 会「静默成功」——不抛异常，但写出来的是
+                # 0 字节 / 半截 / 根本不是 PDF。上面这条直转分支以前写完就当真，只读页数；
+                # 读失败也只 warning + emit(0)、**不删文件** ⇒ 坏 PDF 永久占据这个缓存 key，
+                # 之后每次打印都命中它，谁也不会有第二次转换机会。
+                # 产物校验复用 converter 的同一份实现（链内外各写一套迟早漂移）。
+                if not _pdf_product_ok(temp_pdf):
+                    logger.warning("docx 直转产物无效（空 / 非 PDF），已丢弃并降级 LibreOffice：%s",
+                                   os.path.basename(self._file_path))
+                    try:
+                        if temp_pdf and os.path.isfile(temp_pdf):
+                            os.remove(temp_pdf)
+                    except OSError:
+                        pass
+                    raise RuntimeError("docx 直转产物无效（空 / 非 PDF）")
             else:
                 converter = get_converter()
                 temp_pdf = converter.convert(self._file_path, from_cloud=self._from_cloud,
@@ -5606,6 +5621,14 @@ class ConvertWorker(QThread):
         except Exception:
             logger.warning("PDF 已转换但读不出页数：%s",
                            os.path.basename(self._file_path), exc_info=True)
+            # 2026-11-10（体检 🔴16）：读不出页数的产物同样会永久占着缓存 key。
+            # 只在「确实不是一份像样的 PDF」时删（%PDF 头 + 非空），
+            # 免得把「PyMuPDF 恰好读不了、但打印机能吃」的文件当垃圾清掉。
+            try:
+                if temp_pdf and os.path.isfile(temp_pdf) and not _pdf_product_ok(temp_pdf):
+                    os.remove(temp_pdf)
+            except OSError:
+                pass
             self.finished.emit(self._row, self._file_path, "", 0, "")
             return
         self.finished.emit(self._row, self._file_path, temp_pdf, info["page_count"], info["orientation"])
@@ -6495,6 +6518,7 @@ class MainWindow(QMainWindow):
     _cloudConnSyncLog = Signal(str)   # 后台同步网络 → 主线程 _log 的安全通道
     _ownerComboRefreshed = Signal()   # 成员名单同步完成 → 主线程刷新归属下拉
     _tabDisplayRefresh = Signal()     # 后台同步中换号完成后 → 主线程刷新标签页显示
+    _configSaveFailed = Signal(str)   # 配置写盘失败（任意线程）→ 主线程提示（体检 🔴18）
     _pricingSynced = Signal()         # 打印价格同步完成（可能来自后台线程）→ 主线程刷新 UI
     _offlineStateChanged = Signal()   # 本地订单库变了（可能来自后台同步线程）→ 主线程刷角标/明细窗
     _updateCheckDone = Signal(object) # 自更新后台线程 → 主线程结果 (kind, manifest, manual)
@@ -6508,6 +6532,10 @@ class MainWindow(QMainWindow):
         # 与主线程会并发写同一份 print_config.json，save() 的 tmp+os.replace 只保证
         # 单次写不撕裂，不保证并发调用不互相覆盖，故在此串行化。
         self._config_save_lock = threading.Lock()
+        # 体检 🔴18：配置写盘失败的提示通道必须在**构造期**就接上（以前挂在
+        # _setup_cloud_client 里，云端没启用时这条路根本不存在，失败就彻底无声）。
+        self._config_save_fail_ts: float = 0.0
+        self._configSaveFailed.connect(self._on_config_save_failed)
         self._worker: Optional[PrintWorker] = None
         # ── 手动双面「半成品补救」（2026-11-10）──
         # 翻纸被跳过/超时/第 2 趟失败时，这一单的纸只出了一半；这里保存补打线程、
@@ -8496,7 +8524,8 @@ class MainWindow(QMainWindow):
     def _update_download_worker(self, manifest: dict):
         """后台：下载安装包（带进度回调）→ MD5 校验 → 写 update.cmd → 最小化运行。"""
         try:
-            from updater import prepare_update, write_update_cmd, _run_cmd_minimized
+            from updater import (prepare_update, write_update_cmd, write_update_note,
+                                 _run_cmd_minimized)
             import sys as _sys
 
             def _progress(downloaded: int, total: int):
@@ -8532,6 +8561,13 @@ class MainWindow(QMainWindow):
                                     allow_silent_install=True):
                 self._updateCheckDone.emit(("download_fail", None, False))
                 return
+            # 体检 🔴17：在**启动安装器之前**把「这次更新怎么回滚」写下来。
+            # 安装器会先删程序目录，装失败时程序已经不在了，唯一还活着的就是这个说明。
+            _note = write_update_note(os.path.dirname(setup_path), APP_VERSION,
+                                      str(manifest.get("version") or ""),
+                                      setup_path, install_dir)
+            if _note:
+                self._log(f"☁ 已写回滚说明：{_note}")
             if not _run_cmd_minimized(cmd_path):
                 self._updateCheckDone.emit(("download_fail", None, False))
                 return
@@ -9892,7 +9928,33 @@ class MainWindow(QMainWindow):
             return True
         except Exception as e:
             logger.warning(f"自动保存配置失败: {e}")
+            # 2026-11-10（体检 🔴18）：这里以前只 warning + return False，而 48 处调用点
+            # 没有一处检查返回值 ⇒ 改价格/改档案/改标签页写盘失败时界面显示已改、磁盘还是
+            # 旧值，重启回旧值且毫无提示。现在改成：失败必须让人看见（状态栏红字 + 日志），
+            # 并按 60 秒限频，避免后台同步每 10 秒刷一次把状态栏占死。
+            try:
+                self._configSaveFailed.emit(str(e))
+            except Exception:
+                pass
             return False
+
+    def _on_config_save_failed(self, detail: str) -> None:
+        """配置写盘失败 → 主线程提示（限频 60 秒，一次故障只提醒一次）。"""
+        import time as _time
+        now = _time.time()
+        if now - float(getattr(self, "_config_save_fail_ts", 0.0) or 0.0) < 60.0:
+            return
+        self._config_save_fail_ts = now
+        msg = (f"⚠ 配置没能写进磁盘（{detail}）—— 界面上改的设置，重启后会回到旧值。"
+               f"请检查磁盘空间/权限：{self._config_path}")
+        try:
+            self._log(msg)
+        except Exception:
+            pass
+        try:
+            self.statusBar().showMessage("⚠ 配置未能保存（重启会丢设置）", 15000)
+        except Exception:
+            pass
 
     def _cleanup_orphan_pdf_cache(self, abandoned_jobs: list):
         """放弃订单后清理不再被任何活跃任务引用的 PDF 缓存。

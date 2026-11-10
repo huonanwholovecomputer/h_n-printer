@@ -1012,6 +1012,21 @@ function _saveToServer(data, force) {
     })
     .catch(function (e) { return { ok: false, message: String(e) }; });
 }
+/* 体检 🔴8（2026-11-10）：保存撞上修订号冲突时，让人明确选「以云端为准」还是「强制覆盖」。
+   返回 Promise<'force'|'reload'|null>；null = 用户关掉弹框，本机改动留在页面上、不保存。 */
+function _handleSaveConflict(r) {
+  var sv = (r && typeof r.server_version === 'number') ? r.server_version : 0;
+  var cv = (STORE && STORE.meta && typeof STORE.meta.version === 'number') ? STORE.meta.version : 0;
+  return openChoice('⚠ 云端账本已被其他设备改过',
+    '<p style="margin:0 0 10px">服务器现在是 <b>v' + sv + '</b>，本机这次是基于 <b>v' + cv + '</b> 改的 —— 中间有别的设备（或另一个标签页）保存过。</p>'
+    + '<p style="margin:0;color:var(--muted)">「以云端为准」会放弃本机这次未保存的改动并重新加载；'
+    + '「强制覆盖」会把本机这份整本写上去，别台设备刚才的改动随之丢失。拿不准就先点「先不保存」。</p>',
+    [
+      { text: '以云端为准（重新加载）', value: 'reload', cls: 'pri' },
+      { text: '强制覆盖云端', value: 'force', cls: 'danger' },
+      { text: '先不保存', value: null, cls: 'ghost' }
+    ]);
+}
 function _loadFromServer() {
   return fetch('/api/proxy/finance/config', { headers: apiHeaders() })
     .then(function (r) { return r.json(); })
@@ -2788,8 +2803,14 @@ function _doSave(force) {
     var ind = $('#storageFilePath');
     if (ind) ind.textContent = '☁ 云端 · 已保存';
     if (!force && r.conflict) {
-      openConfirm('云端数据已被其他设备修改（服务器 v' + r.server_version + '），是否覆盖？', '覆盖').then(function (ok) {
-        if (ok) _doSave(true);
+      /* 体检 🔴8：revision 冲突不能只有一个「覆盖」按钮 —— 那等于把别台设备刚记的账
+         整份抹掉。这里给两个明确选择：以云端为准（重载）或强制覆盖本机这份。 */
+      _handleSaveConflict(r).then(function (act) {
+        if (act === 'force') _doSave(true);
+        else if (act === 'reload') {
+          toast('🔄 已改为以云端版本为准，本机这次未保存的改动被放弃', 'error');
+          setTimeout(function () { location.reload(); }, 500);
+        }
       });
     }
   });
@@ -2847,6 +2868,43 @@ function openModal(opts) {
 }
 function openConfirm(message, confirmText) {
   return openModal({ title: '⚠️ 确认操作', body: '<p style="margin:0;color:var(--muted)">' + esc(message) + '</p>', confirmText: confirmText || '确定', cancelText: '取消', danger: true });
+}
+/* 多选一确认框（体检 🔴8/9/10，2026-11-10）：冲突处理必须让人**明确选**——
+   「整份覆盖」与「以云端为准」是两件不同的事，用一个是/否的确认框问不出来。
+   buttons: [{text, value, cls}]，返回被点按钮的 value；点遮罩关闭返回 null。 */
+function openChoice(title, bodyHtml, buttons) {
+  return new Promise(function (resolve) {
+    var root = $('#modalRoot');
+    if (!root) { resolve(null); return; }
+    var m = document.createElement('div');
+    m.className = 'modal-backdrop';
+    var h = '<div class="modal-card" role="dialog">';
+    h += '<h3>' + (title || '请选择') + '</h3>';
+    h += '<div class="modal-body">' + (bodyHtml || '') + '</div>';
+    h += '<div class="modal-actions">';
+    (buttons || []).forEach(function (b, i) {
+      h += '<button class="btn ' + (b.cls || 'ghost') + '" data-ix="' + i + '">' + esc(b.text || '') + '</button>';
+    });
+    h += '</div></div>';
+    m.innerHTML = h;
+    root.appendChild(m);
+    requestAnimationFrame(function () { m.classList.add('in'); });
+    var done = false;
+    function close(val) {
+      if (done) return;
+      done = true;
+      m.classList.remove('in');
+      setTimeout(function () { m.remove(); }, 190);
+      resolve(val);
+    }
+    m.addEventListener('click', function (e) { if (e.target === m) close(null); });
+    m.querySelectorAll('[data-ix]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var b = (buttons || [])[Number(btn.dataset.ix)] || {};
+        close(typeof b.value === 'undefined' ? null : b.value);
+      });
+    });
+  });
 }
 
 /* ==================== 密码解锁（S1-05：服务端校验 + 会话） ==================== */
@@ -8879,21 +8937,84 @@ function exportData() { downloadJSON(STORE, '打印项目_清算备份_' + today
 function importData(e) {
   var file = e.target.files[0];
   if (!file) return;
+  _importFileName = file.name || '';
   confirmUnlockSettings(function () {
     var reader = new FileReader();
     reader.onload = function (ev) {
       try {
         var data = JSON.parse(ev.target.result);
         if (!data.records && !data.months) throw new Error('格式错误');
-        STORE = migrateConfig(sanitizeStore(data));   // 导入即净化 name/id/color
-        currentKey = currentMonthKey();
-        save();
-        renderAll();
-        toast('✅ 已导入 ' + allMonthKeys().length + ' 个月', 'success');
+        _applyImportedData(data);
       } catch (err) { toast('❌ 导入失败：' + err.message, 'error'); }
     };
     reader.readAsText(file);
   });
+  try { e.target.value = ''; } catch (e2) {}   // 允许再次选同一个文件
+}
+/* 体检 🔴10（2026-11-10）：导入是**整本替换**，旧实现直接 `STORE = sanitize(data)` 就 renderAll，
+   没有任何备份与确认 —— 选错文件＝全天账目当场消失（sanitizeStore 还会静默跳过成员对不上的
+   流水，只 console.warn）。现在：先净化出候选 → 出一份「会丢什么/会换来什么」的摘要 → 二次确认
+   → 确认后先把当前账本备份进 localStorage，再替换。 */
+function _storeCounts(store) {
+  var rec = (store && store.records) || {};
+  var n = 0;
+  ['expenses', 'income', 'scores', 'transfers'].forEach(function (k) { n += (rec[k] || []).length; });
+  var m = (store && store.months) || {};
+  return { records: n, months: Object.keys(m).length };
+}
+function _applyImportedData(data) {
+  /* 注意顺序：sanitizeStore 会**就地**过滤 data 里的流水（成员/日期不合法的整条删掉），
+     所以「原始条数」必须在净化之前数，否则差量永远是 0、跳过的流水一条都报不出来。 */
+  var rawRec = (data && data.records) || {};
+  var rawN = 0;
+  ['expenses', 'income', 'scores', 'transfers'].forEach(function (k) { rawN += (rawRec[k] || []).length; });
+  var cand = migrateConfig(sanitizeStore(data));
+  var cur = _storeCounts(STORE);
+  var next = _storeCounts(cand);
+  var skipped = Math.max(0, rawN - next.records);
+  var warn = skipped > 0
+    ? '<p style="margin:8px 0 0;color:#b45309">⚠ 文件里有 ' + skipped + ' 条流水对不上现有成员/打印机，导入时会被跳过。</p>'
+    : '';
+  var stamp = Date.now();
+  var backupKey = 'finance_import_backup_' + stamp;
+  openChoice('📥 确认导入（整本替换）',
+    '<p style="margin:0 0 10px">文件：<b>' + esc(fileNameOfCurrentImport()) + '</b></p>'
+    + '<p style="margin:0">当前账本：<b>' + cur.months + '</b> 个月 / <b>' + cur.records + '</b> 条流水<br>'
+    + '导入后：<b>' + next.months + '</b> 个月 / <b>' + next.records + '</b> 条流水</p>'
+    + '<p style="margin:8px 0 0;color:var(--muted)">导入是整本替换，当前账本会先备份到本机（'
+    + '<code>' + backupKey + '</code>），确认后可从这里还原。</p>'
+    + warn,
+    [
+      { text: '确认导入', value: 'go', cls: 'danger' },
+      { text: '取消', value: null, cls: 'ghost' }
+    ]).then(function (act) {
+      if (act !== 'go') { toast('已取消导入，账本未改动', 'success'); return; }
+      try { localStorage.setItem(backupKey, JSON.stringify(STORE)); } catch (e3) {
+        toast('❌ 备份当前账本失败（本机存储已满？），为安全起见不导入', 'error');
+        return;
+      }
+      STORE = cand;
+      currentKey = currentMonthKey();
+      save();
+      renderAll();
+      toast('✅ 已导入 ' + next.months + ' 个月，原账本已备份（' + backupKey + '）', 'success');
+    });
+}
+/* 导入确认框里要显示文件名 —— input 的 value 在 onload 里已经拿不到了，统一记一份。 */
+var _importFileName = '';
+function fileNameOfCurrentImport() { return _importFileName || '（所选文件）'; }
+/* 把某一份导入备份还原回来（控制台/救援用）：restoreImportBackup('finance_import_backup_…') */
+function restoreImportBackup(key) {
+  try {
+    var raw = localStorage.getItem(key);
+    if (!raw) { toast('找不到备份：' + key, 'error'); return false; }
+    STORE = migrateConfig(sanitizeStore(JSON.parse(raw)));
+    currentKey = currentMonthKey();
+    save();
+    renderAll();
+    toast('已还原备份 ' + key, 'success');
+    return true;
+  } catch (e4) { toast('还原失败：' + e4.message, 'error'); return false; }
 }
 function resetData() {
   confirmUnlockSettings(function () {
@@ -10489,16 +10610,50 @@ function finishLoad(hadCloud) {
   if (hadCloud) toast('✅ 已加载云端配置（' + monthRecordCount(currentKey) + ' 条当月记录）');
   else toast('ℹ️ 欢迎使用，请在「记账」录入数据');
 }
+/* 体检 🔴9（2026-11-10）：离线暂存**不能**无条件整份盖回云端。
+   旧实现：`STORE = pending; save()` —— 离线那会儿存的是整本快照，只要期间别的设备记过账，
+   一重连就把人家那一笔抹掉，而且没有任何提示。现在先比修订号：
+     · 云端版本 <= 暂存版本（没人动过）→ 直接重放；
+     · 云端更新（别台设备写过）→ 弹三选，交给人决定。 */
 function replayOfflinePending() {
-  try {
-    var raw = localStorage.getItem('finance_offline_pending');
-    if (!raw) return;
-    var pending = JSON.parse(raw);
-    localStorage.removeItem('finance_offline_pending');
-    STORE = migrateConfig(sanitizeStore(pending));
-    save();
-    toast('🔄 已恢复本地暂存数据并重新保存', 'success');
-  } catch (e2) { /* 暂存数据损坏则直接丢弃 */ }
+  var raw = null;
+  try { raw = localStorage.getItem('finance_offline_pending'); } catch (e0) { return; }
+  if (!raw) return;
+  var pending = null;
+  try { pending = JSON.parse(raw); } catch (e1) {
+    localStorage.removeItem('finance_offline_pending');   // 坏数据直接丢，别每次启动都卡这儿
+    return;
+  }
+  if (!pending || typeof pending !== 'object') { localStorage.removeItem('finance_offline_pending'); return; }
+  var pendV = (pending.meta && typeof pending.meta.version === 'number') ? pending.meta.version : 0;
+  var curV = (STORE && STORE.meta && typeof STORE.meta.version === 'number') ? STORE.meta.version : 0;
+  if (curV > pendV) { _askOfflineReplay(pending, pendV, curV); return; }
+  _applyOfflinePending(pending);
+}
+function _applyOfflinePending(pending) {
+  localStorage.removeItem('finance_offline_pending');
+  STORE = migrateConfig(sanitizeStore(pending));
+  save();
+  toast('🔄 已恢复本地暂存数据并重新保存', 'success');
+}
+function _askOfflineReplay(pending, pendV, curV) {
+  openChoice('🔄 发现未同步的本地暂存',
+    '<p style="margin:0 0 10px">离线期间存下的改动（v' + pendV + '）还没上传，但云端已经被其他设备改到 <b>v' + curV + '</b>。</p>'
+    + '<p style="margin:0;color:var(--muted)">用暂存覆盖会丢掉云端那次改动；丢弃则只保留云端版本。'
+    + '拿不准就选「稍后再说」—— 暂存会一直留在本机，下次打开还会再问。</p>',
+    [
+      { text: '用本地暂存覆盖云端', value: 'use', cls: 'danger' },
+      { text: '丢弃本地暂存', value: 'drop', cls: 'ghost' },
+      { text: '稍后再说', value: 'later', cls: 'pri' }
+    ]).then(function (act) {
+      if (act === 'use') _applyOfflinePending(pending);
+      else if (act === 'drop') {
+        localStorage.removeItem('finance_offline_pending');
+        toast('已丢弃本地暂存，保留云端版本', 'success');
+      } else {
+        toast('⚠ 本地暂存仍保留在这台机器上，下次打开会再问', 'error');
+      }
+    });
 }
 
 (function () {

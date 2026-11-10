@@ -3699,6 +3699,19 @@ def init_db():
         """
     )
 
+    # 体检 🔴8（2026-11-10）：收支清算配置多端并发写，需要**服务端单调修订号**才能判冲突。
+    # 旧实现只有 data/updated_at，而前端 `_saveToServer` 等的是 `res.server_version` ——
+    # save_finance_config 从不返回它 ⇒ `conflict` 恒 false、冲突确认框永远不弹，
+    # 两台设备（或同一人两个标签页）同时改账就是「后保存的把先保存的整份覆盖」。
+    try:
+        _fc_cols = [r[1] for r in conn.execute("PRAGMA table_info(finance_config)").fetchall()]
+        if "rev" not in _fc_cols:
+            conn.execute("ALTER TABLE finance_config ADD COLUMN rev INTEGER DEFAULT 0")
+            conn.commit()
+            print("  已添加 finance_config.rev 列（多端并发写的修订号）")
+    except sqlite3.OperationalError:
+        pass
+
     # ===== S2-01：高频查询补索引（原来只有幂等键那一条唯一索引，其余全是全表扫）=====
     # 依据：安全加固计划 §S2-01 / DDoS 报告 R5。逐条对应真实热点查询：
     #   · orders(openid, id)    —— /api/orders 默认路径 `WHERE openid=? ORDER BY id DESC`；
@@ -10362,15 +10375,17 @@ def get_finance_config():
         return jsonify({"success": False, "message": "token 无效"}), 403
     conn = get_db()
     try:
-        row = conn.execute("SELECT data FROM finance_config WHERE id = 1").fetchone()
+        row = conn.execute(
+            "SELECT data, COALESCE(rev, 0) AS rev FROM finance_config WHERE id = 1").fetchone()
     finally:
         conn.close()
     if row and row["data"]:
         try:
-            return jsonify({"success": True, "data": json.loads(row["data"])})
+            return jsonify({"success": True, "data": json.loads(row["data"]),
+                            "server_version": int(row["rev"] or 0)})
         except Exception:
             return jsonify({"success": False, "message": "配置数据损坏"}), 500
-    return jsonify({"success": True, "data": None})
+    return jsonify({"success": True, "data": None, "server_version": 0})
 
 
 @app.route("/api/finance/config", methods=["POST"])
@@ -10388,19 +10403,28 @@ def save_finance_config():
     with db_lock:
         conn = get_db()
         try:
+            # 体检 🔴8（2026-11-10）：每次成功保存都把 rev +1，并**返回**新修订号。
+            # 前端 `_saveToServer` 拿它和本地 clientVersion 比：`server_version > clientVersion + 1`
+            # 就说明期间有别的设备写过 —— 这时必须由人来选「重新加载云端」还是「强制覆盖」，
+            # 不能像以前那样静默整份覆盖（后端不返回 server_version 时前端 conflict 恒 false）。
             conn.execute(
-                "INSERT INTO finance_config (id, data, updated_at) VALUES (1, ?, ?) "
-                "ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+                "INSERT INTO finance_config (id, data, updated_at, rev) VALUES (1, ?, ?, 1) "
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data, "
+                "updated_at = excluded.updated_at, "
+                "rev = COALESCE(finance_config.rev, 0) + 1",
                 (json.dumps(payload, ensure_ascii=False),
                  datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             )
             conn.commit()
+            _rev_row = conn.execute(
+                "SELECT COALESCE(rev, 0) FROM finance_config WHERE id = 1").fetchone()
+            _rev = int(_rev_row[0]) if _rev_row else 0
         except Exception:
             conn.rollback()
             raise
         finally:
             conn.close()
-    return jsonify({"success": True, "message": "配置已保存"})
+    return jsonify({"success": True, "server_version": _rev, "message": "配置已保存"})
 
 
 @app.route("/api/abandon_order", methods=["POST"])

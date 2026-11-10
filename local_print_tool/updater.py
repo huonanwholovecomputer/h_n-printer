@@ -54,6 +54,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -713,6 +714,48 @@ def download_setup(url: str, expected_hash: str, dest_dir: str,
 # update.cmd（改动 4：静默安装必须由用户明确点击触发）
 # ============================================================================
 
+def write_update_note(ready_dir: str, old_version: str, new_version: str,
+                      setup_path: str, install_dir: str = "") -> str:
+    """在更新目录写一份「这次更新怎么回滚」的说明（**每次更新覆盖写**），返回路径。
+
+    2026-11-10（体检 🔴17）：`update.cmd` 的 `:install_failed` 分支只 `start` exe，
+    而 `installer/HN打印工具.iss:66-69` 的 `[InstallDelete]` 会先删 `_internal` 与 exe ⇒
+    装失败（比如 UAC 被拒/被杀软拦）之后**程序已经不存在**，`start` 什么也启动不了，
+    用户看到的是「程序没了，也没有任何说明」。这份说明是在**启动安装器之前**由主程序
+    写下的，所以即使安装器把程序目录清空，它还在（在 %LOCALAPPDATA% 的更新目录里）。"""
+    root = os.path.dirname(os.path.abspath(ready_dir))
+    path = os.path.join(root, ROLLBACK_NOTE_NAME)
+    previous_dir = os.path.join(root, "previous")
+    target = install_dir or r"C:\Program Files\h_n printer"
+    text = (
+        "HN 打印工具 · 本次更新的回滚说明\r\n"
+        "====================================================\r\n"
+        f"更新时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\r\n"
+        f"从版本：{old_version or '（未知）'}  →  目标版本：{new_version or '（未知）'}\r\n"
+        f"安装包：{setup_path}\r\n"
+        f"安装目录：{target}\r\n"
+        f"上一版安装包目录：{previous_dir}\r\n"
+        "\r\n"
+        "如果更新之后程序打不开 / 图标消失 / 报错：\r\n"
+        f"  1. 打开这个目录：{previous_dir}\r\n"
+        f"     （里面是上一版 {old_version or '旧版本'} 的安装包，只保留 1 份）\r\n"
+        "  2. 手动运行那个安装包，安装位置选上面的「安装目录」：\r\n"
+        f'     h_n-printer_setup_*.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /DIR="{target}"\r\n'
+        "  3. 装完再打开程序；联网后它会重新提示升级（更新器只升不降，这是正常的）。\r\n"
+        "\r\n"
+        "如果没有上一版安装包（previous\\ 为空），就用发布者提供的旧版安装包重装，"
+        "并把本文件一起发给发布者。\r\n"
+    )
+    try:
+        os.makedirs(root, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        return path
+    except OSError as e:
+        logger.warning(f"写更新回滚说明失败（安装失败时就没有说明书了）: {e}")
+        return ""
+
+
 def write_update_cmd(setup_path: str, exe_path: str, cmd_path: str,
                      start_cmd: str = "", install_dir: str = "",
                      allow_silent_install: bool = False) -> bool:
@@ -745,6 +788,8 @@ def write_update_cmd(setup_path: str, exe_path: str, cmd_path: str,
     # _archive_previous 只在那次下载前 ready\ 里恰好有别的 exe 时才有东西可归档）。
     ready_dir = os.path.dirname(os.path.abspath(setup_path))
     previous_dir = os.path.join(os.path.dirname(ready_dir), "previous")
+    note_path = os.path.join(os.path.dirname(ready_dir), ROLLBACK_NOTE_NAME)
+    failed_note = os.path.join(os.path.dirname(ready_dir), "INSTALL_FAILED.txt")
     lines = [
         "@echo off",
         # 本文件按 GBK 写（含中文路径）；显式固定代码页，避免它被从 UTF-8 控制台
@@ -770,8 +815,15 @@ def write_update_cmd(setup_path: str, exe_path: str, cmd_path: str,
         f'move /y "{setup_path}" "{previous_dir}" >nul',
         "goto done",
         ":install_failed",
-        "rem 安装失败（如 UAC 拒绝）：保留安装包供下次检查更新复用，不删除；重新启动程序",
-        "rem 需要回滚时看更新目录的 ROLLBACK_README.txt（previous\\ 里有上一版安装包）",
+        "rem 安装失败（如 UAC 拒绝/被杀软拦）：先写说明（程序目录可能已被安装器清空）",
+        "rem 2026-11-10（体检 🔴17）：以前这里只有 start，而 .iss 的 [InstallDelete] 已经删掉了",
+        "rem exe 与 _internal ⇒ start 什么也启动不了，用户只看到「程序没了、没有任何说明」。",
+        f'echo 更新安装失败：目标版本没装上，程序目录可能已被清空。> "{failed_note}"',
+        f'echo.>> "{failed_note}"',
+        f'echo 安装包："{setup_path}">> "{failed_note}"',
+        f'echo 上一版安装包目录："{previous_dir}">> "{failed_note}"',
+        f'echo 手动回滚步骤见："{note_path}">> "{failed_note}"',
+        f'if exist "{note_path}" start "" notepad "{note_path}"',
         start_cmd,
         ":done",
         "del \"%~f0\"",
