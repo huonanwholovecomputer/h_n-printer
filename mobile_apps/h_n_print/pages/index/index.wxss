@@ -595,6 +595,8 @@
   color: var(--text-secondary);
   flex: 1;
   min-width: 0;
+  /* 2026-11-09：文案加长成「自动检测末尾空白页并排除」，窄机型允许折两行 */
+  line-height: 1.35;
 }
 .toggle-hint {
   font-size: 20rpx;

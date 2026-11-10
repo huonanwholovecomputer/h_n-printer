@@ -248,11 +248,11 @@
               </view>
 
               <!-- 每文件两个开关（契约 hn_simplex_blank_contract.md）：
-                   「排除末尾空白页」→ blank_tail_exclude；「封面单独打印」→ simplex_pages。
+                   「自动检测末尾空白页并排除」→ blank_tail_exclude；「封面单独打印」→ simplex_pages。
                    开关只用 bindtap 切布尔值，不接 swDrag 那套滑动派发链（见 index.js onSwTouchEnd）。 -->
               <view wx:if="{{!item.isImage && item.pageCount !== 1}}" class="toggle-block">
                 <view class="control-row toggle-row">
-                  <text class="toggle-title">排除末尾空白页</text>
+                  <text class="toggle-title">自动检测末尾空白页并排除</text>
                   <view class="ios-switch toggle-sw {{item.excludeBlankTail ? 'switch-on' : ''}}"
                         data-index="{{index}}" bindtap="onToggleExcludeBlankTail" hover-class="none">
                     <view class="switch-thumb"></view>

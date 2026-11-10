@@ -449,7 +449,7 @@ function setupFileInput() {
         pageRange: '',
         // 「排除末尾空白页」/「封面单独打印」两个**每文件**开关（契约 2026-11-02）。
         // 注意：与订单级 cover_page（打印首页信息附加费）毫无关系，别复用字段/文案。
-        excludeBlankTail: false,                        // → 提交体 blank_tail_exclude(0/1)
+        excludeBlankTail: true,                         // 自动检测末尾空白页并排除（默认开）→ blank_tail_exclude(0/1)
         simplexEnabled: false,                          // → 提交体 simplex_pages（勾选且合法才传）
         simplexLines: [{ value: '', error: '' }],       // 多行单面页输入（与 rangeLines 同一套交互）
         simplexPages: '',                               // 校验后合并的 "1,16-23"（空 = 关闭）
@@ -589,7 +589,7 @@ function fileControlsHTML(f) {
     html += `
       <view class="control-row file-switch-row">
         <view class="file-switch-text">
-          <text class="file-switch-title">排除末尾空白页</text>
+          <text class="file-switch-title">自动检测末尾空白页并排除</text>
           <text class="file-switch-desc">出纸前由打印端检测并排除末尾连续空白页，费用按实际打印页数结算</text>
         </view>
         <view class="ios-switch file-switch ${f.excludeBlankTail ? 'switch-on' : ''}" data-file-sw="blank-tail" role="switch" aria-checked="${f.excludeBlankTail ? 'true' : 'false'}">

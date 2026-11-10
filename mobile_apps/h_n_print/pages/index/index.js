@@ -1196,7 +1196,7 @@ Component({
               rangeFocusLine: -1,   // 正在聚焦的行号（-1=无）→ 驱动 <input focus>
               rangeEditing: false,  // 焦点确实落在本文件的范围输入区（只由 bindblur 清）
               // 契约（hn_simplex_blank_contract.md）两个每文件配置项：
-              excludeBlankTail: false,   // 排除末尾空白页 → 提交 blank_tail_exclude: 1
+              excludeBlankTail: true,    // 自动检测末尾空白页并排除（默认开）→ 提交 blank_tail_exclude: 1
               simplexEnabled: false,     // 封面单独打印开关
               simplexLines: [{value: '', error: ''}],  // 单面页多行输入（与 rangeLines 同构）
               simplexFocusLine: -1,
