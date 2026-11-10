@@ -3491,6 +3491,55 @@ class PrintWorker(QThread):
         return True, (f"已合并 {len(items or [])} 份 PDF{extra} → "
                       f"{os.path.basename(out_path)}")
 
+    def _keep_partial_group(self, group: list[dict], merged: str,
+                            merged_ids: set, reason: str) -> Optional[dict]:
+        """合并作业"打了一部分就失败"→ 落「半成品补救」台账（返回记录，失败返回 None）。
+
+        为什么不复用 `_keep_stall`：那个是手动双面批次的（有 `PrintPlan`、能重建两趟页序）。
+        合并作业是**一整组单面/双面文件打成一个作业**，失败点在中间，哪几张纸出来了、
+        是哪个文件的，程序无法可靠还原 —— 所以这里记 `STAGE_PASS2_PARTIAL`（"这叠纸不能
+        再补打"），只保留 PDF 证据与任务快照，补救窗对它会**禁用「补打第 2 趟」**、
+        只留「整单重打 / 作废」。硬凑一份页序去"补打"反而是猜。
+        """
+        try:
+            rid = duplex_remedy.make_id([r.get("id") for r in duplex_remedy.load_all()])
+            pdf_copy = ""
+            if merged and os.path.isfile(merged):
+                pdf_copy = duplex_remedy.keep_pdf(str(merged), rid)
+            items = []
+            for _rec in group:
+                if _rec.get("idx") not in merged_ids:
+                    continue
+                _job = _rec.get("job")
+                items.append({
+                    "idx": _rec.get("idx"),
+                    "tab_key": str(getattr(_job, "tab_key", "") or ""),
+                    "task_id": int(getattr(_job, "task_id", 0) or 0),
+                    "order_id": int(getattr(_job, "order_id", 0) or 0),
+                    "order_number": str(getattr(_job, "order_number", "") or ""),
+                    "display_name": str(getattr(_job, "display_name", "") or ""),
+                    "file_path": str(getattr(_job, "file_path", "") or ""),
+                    "copies": int(getattr(_job, "copies", 1) or 1),
+                    "duplex": str(getattr(_job, "duplex", "off") or "off"),
+                    "page_range": str(getattr(_job, "page_range", "") or ""),
+                    "page_count": int(getattr(_job, "page_count", 0) or 0),
+                })
+            rec = duplex_remedy.make_record(
+                stage=duplex_remedy.STAGE_PASS2_PARTIAL,
+                reason="合并作业打了一部分后失败：" + str(reason)[:300],
+                printer=self._printer_name,
+                paper=self._paper,
+                dpi=self._render_dpi,
+                items=items,
+                pdf=pdf_copy,
+            )
+            rec["id"] = rid
+            saved = duplex_remedy.add(rec)
+            return saved or None
+        except Exception as e:
+            self.log_message.emit(f"  ⚠ 半成品台账记录失败（{type(e).__name__}: {e}）")
+            return None
+
     def _print_merged_group(self, group: list[dict],
                             base_offset: int, total_sides: int) -> tuple[dict, int]:
         """把**连续同参数**的若干文件合并成**一个打印作业**打出去。
@@ -3613,7 +3662,18 @@ class PrintWorker(QThread):
             if ok:
                 self.log_message.emit(f"  ✓ {msg}")
             else:
-                self.log_message.emit(f"  ✗ 打印失败: {msg}")
+                # 🔴-B6（2026-11-10 体检）：合并作业打了一半失败 —— 这是"纸已经出来一部分"
+                # 的事实，绝不能再让上层/云端当成"什么都没打"去整组重打（已出的页会再出一遍）。
+                _partial = pdf_printer.is_partial(msg)
+                self.log_message.emit(
+                    f"  ✗ 打印失败: {pdf_printer.strip_partial(msg) if _partial else msg}")
+                if _partial:
+                    _prec = self._keep_partial_group(group, merged, merged_ids, str(msg))
+                    self.log_message.emit(
+                        "  ⚠ 这一组已经打出了前面几页（纸在出纸槽里）—— 不会自动整组重打；"
+                        + ("已记入「半成品补救」：请人工核对纸张后决定「整单重打」或「作废」"
+                           if _prec is not None else
+                           "半成品台账没记上，请人工核对该组文件已出纸多少再决定"))
             out = {i: (ok, msg) for i in merged_ids}
             if solo:
                 # 读不出页数的那些**单独打、单独报**（绝不能因为"没并进合并件"就当它成功了）。
@@ -4140,6 +4200,15 @@ class PrintWorker(QThread):
                                         landscape_fill=bool(getattr(p, "landscape_fill", True)),
                                         paper=self._paper)
             if not ok1:
+                # 🔴-B5（2026-11-10 体检）：第 1 趟**失败**时也要推台账 —— 驱动可能已经
+                # 送出/弹出前几页（一部分纸在槽里、一部分没出），而这一支原来直接 return，
+                # 后面的批次就以为槽是空的 → 翻纸时把别人的纸算成本批的，整叠错位。
+                # 宁可多算（下次提示「下面还有 N 张」），不能少算。
+                self._tray_sheets = max(int(getattr(self, "_tray_sheets", 0) or 0),
+                                        tray_foreign + n1)
+                self.log_message.emit(
+                    f"  ⚠ 第 1 趟没打完（{msg1}）—— 出纸槽里可能有 {n1} 张里的前几张，"
+                    "请清掉再重打")
                 return False, f"手动双面第 1 趟失败: {msg1}", n1
             # 第 1 趟的纸已经压进出纸槽了：台账往前推 —— 下一批（长短边混排拆出的第 2 批）
             # 翻纸时就该把这一批的纸算成"槽里已有的"
@@ -14283,8 +14352,42 @@ class MainWindow(QMainWindow):
                     if resp.ok and resp.json().get("success"):
                         if self._offline_sync:
                             self._offline_sync.mark_synced(new_num)
+                            # 🔴-B9：这一单在本地其实打印失败过 → 补报成功后立刻回落成 failed
+                            # （/api/local_orders 只认"已完成"，没有失败分支）
+                            if self._offline_sync.is_print_failed(new_num):
+                                self._report_order_failed_after_sync(new_num)
             except Exception:
                 pass
+
+    def _report_order_failed_after_sync(self, order_number: str):
+        """离线单换号补报成功后，按「本地其实没打出来」回落成 failed（后台线程内调用）。"""
+        client = self._cloud_client
+        num = str(order_number or "").strip()
+        if client is None or not num:
+            return
+        api_url = (client.api_url or "").rstrip("/")
+        token = client.auth_token or ""
+        if not api_url or not token:
+            return
+
+        def _net():
+            try:
+                resp = http_requests.post(
+                    f"{api_url}/api/local_order_status",
+                    headers=auth_headers(token, self._local_client_id()),
+                    json={"order_number": num, "status": "failed",
+                          "reason": "离线期间本地打印失败（重连补报后自动回落）",
+                          "client_id": self._local_client_id()},
+                    timeout=10,
+                )
+                ok = bool(resp.ok and resp.json().get("success"))
+                self._cloudConnSyncLog.emit(
+                    (f"☁ 离线单 {num} 已回落为「失败」（本地实际没打出来）" if ok else
+                     f"⚠ 离线单 {num} 回落失败：HTTP {getattr(resp, 'status_code', 0)}"))
+            except Exception as e:
+                self._cloudConnSyncLog.emit(f"⚠ 离线单 {num} 回落失败：{e}")
+
+        threading.Thread(target=_net, daemon=True).start()
 
     @staticmethod
     def _build_files_payload_from_db_row(row) -> dict:
@@ -15251,6 +15354,16 @@ class MainWindow(QMainWindow):
             return
         upper = order_number.upper()
         if "-L" in upper or upper.startswith("LOCAL-"):
+            # 🔴-B9（2026-11-10 体检）：离线单（-L 号）此时云端还没有这笔单，报不上去；
+            # 但"没打出来"这件事必须留痕 —— 否则重连补报会按"已完成"落地（没出纸却记账）。
+            # 记到离线库的 print_failed 列，换号补报成功后再回落成 failed。
+            if self._offline_sync is not None:
+                try:
+                    self._offline_sync.mark_print_failed(order_number, message)
+                    self._log(f"📴 离线订单 {order_number} 本地打印失败已记下："
+                              "重连补报后会自动回落成「失败」")
+                except Exception as e:
+                    logger.warning(f"标记离线订单打印失败失败: {e}")
             return
         api_url = (client.api_url or "").rstrip("/")
         # S1-01：本机设备 token 优先（全局 token 2026-11-04 轮换后已失效，见取号处注释）
@@ -17368,6 +17481,79 @@ class MainWindow(QMainWindow):
         if text and label is not None:
             label.setText(text)
 
+    def _keep_stack_stall(self, entries: list, bdir: str, reason: str) -> dict | None:
+        """把「整叠第 2 趟失败」的半成品落进「半成品补救」台账；返回记录，失败返回 None。
+
+        留的是什么：整叠合并 PDF 的副本（各单 PDF 按加入顺序再拼一遍，页号偏移与
+        `duplex_stack.file_plans()` 完全一致）+ 每单的任务快照 + 页序参数。补救窗据此
+        只补第 2 趟（`plan_passes` 重建页序，不另算一套配对）。
+
+        为什么不让它返回 None 就静默失败：返回 None 时调用方会退回旧口径（按失败上报 +
+        删批次目录）。那条路对顾客是"钱收了、纸没有"，所以失败时至少要留一行日志说明。
+
+        任何异常都吞掉并返回 None —— 补救台账是**附加**能力，不能因为它坏了就连累收尾。
+        """
+        try:
+            import pdf_printer as _pp
+            pdfs = list(self._stack.entry_pdfs(bdir))
+            missing = [p for p in pdfs if not os.path.isfile(p)]
+            if not pdfs or missing:
+                self._log(f"⚠ 攒批半成品台账：各单 PDF 不全（缺 {len(missing)} 份）"
+                          " → 只能按失败收尾")
+                return None
+            rid = duplex_remedy.make_id([r.get("id") for r in duplex_remedy.load_all()])
+            merged = os.path.join(
+                tempfile.gettempdir(),
+                f"hn_stack_stall_{os.getpid()}_{int(time.time() * 1000)}.pdf")
+            _mok, _mmsg = _pp.merge_pdfs(pdfs, merged)
+            if not _mok:
+                self._log(f"⚠ 攒批半成品台账：合并 PDF 失败（{_mmsg}）→ 只能按失败收尾")
+                return None
+            pdf_copy = duplex_remedy.keep_pdf(merged, rid)
+            try:
+                os.remove(merged)
+            except OSError:
+                pass
+            if not pdf_copy:
+                self._log("⚠ 攒批半成品台账：半成品 PDF 没能存进台账目录"
+                          " → 只能按失败收尾")
+                return None
+            plan = self._stack.build_plan()
+            items = []
+            for _e in entries:
+                for _t in (_e.tasks or []):
+                    if not isinstance(_t, dict):
+                        continue
+                    _it = dict(_t)
+                    _it.setdefault("tab_key", str(getattr(_e, "tab_key", "") or ""))
+                    items.append(_it)
+            rec = duplex_remedy.make_record(
+                stage=duplex_remedy.STAGE_PASS1_DONE,
+                reason=reason,
+                printer=self._config.printer_name,
+                paper=self._config.paper_size,
+                rotate_mode=(duplex_remedy.ROTATE_PER_FILE if self._stack.rotate is None
+                             else duplex_remedy.ROTATE_FIXED),
+                rotate=bool(self._stack.rotate),
+                first=self._stack.first,
+                reverse_second=self._stack.reverse_second,
+                second_rotate_180=True,
+                sheet_count=plan.sheet_count,
+                total_sides=plan.total_sides,
+                file_plans=self._stack.file_plans(),
+                items=items,
+                pdf=pdf_copy,
+            )
+            rec["id"] = rid
+            saved = duplex_remedy.add(rec)
+            if not saved or not str(saved.get("id") or ""):
+                self._log("⚠ 攒批半成品台账：写入失败 → 只能按失败收尾")
+                return None
+            return saved
+        except Exception as e:
+            self._log(f"⚠ 攒批半成品台账记录失败（{type(e).__name__}: {e}）→ 只能按失败收尾")
+            return None
+
     def _on_stack_flush_done(self, ok: bool, msg: str, sides: int):
         """整叠第 2 趟结束（成功/失败）→ 统一收尾所有单的任务。
 
@@ -17389,22 +17575,52 @@ class MainWindow(QMainWindow):
             final_msg = (msg if ok else
                          f"攒批第 2 趟失败：{msg} —— 整叠是半成品，请人工处理")
             empty_pass2 = (self._stack_second_pass_slots() == 0)
-            if ok and empty_pass2:
+            bdir = self._stack_batch_dir()
+            # 🔴-B1（2026-11-10 体检）：第 2 趟失败**不再删证据、不再判失败**。
+            # 旧写法失败与成功走同一段收尾：`_finish_stack_entries(entries, False, …)` 之后
+            # 无条件 `discard_batch(bdir)` —— 把整叠清单与各单 PDF 当场删掉，然后按失败上报
+            # 云端（云端重推 ⇒ 已出过的纸再出一遍）。纸在出纸槽里、PDF 已经没了、
+            # 也没有任何补打入口：手动双面那条路径早有 `_keep_stall`，攒批这条反而是"毁尸灭迹"。
+            # 现在失败先落「半成品补救」台账（整叠合并件 + 每单任务快照），清单与批次目录都留着，
+            # 由补救窗决定补打第 2 趟 / 整单重打 / 作废。
+            _stalled_rec = None
+            if not ok:
+                _stalled_rec = self._keep_stack_stall(entries, bdir, str(final_msg))
+            if _stalled_rec is not None:
+                self._log("⚠ 整叠是半成品 —— 已记入「半成品补救」"
+                          f"（{_stalled_rec.get('id')}）：清单与各单 PDF 都留着，"
+                          "可稍后「补打第 2 趟」或「整单重打」")
+                for _entry in entries:
+                    for _t in (_entry.tasks or []):
+                        _job = self._find_job_for_stack_task(_entry, _t)
+                        if _job is not None:
+                            _job.remedy_pending = str(_stalled_rec.get("id") or "")
+                self._save_config()
+            elif ok and empty_pass2:
                 self._finish_stack_entries_split(entries, final_msg)
             else:
                 self._finish_stack_entries(entries, ok, final_msg)
-            bdir = self._stack_batch_dir()
             self._stack.clear()
-            duplex_stack.discard_batch(bdir)
+            if _stalled_rec is None:
+                duplex_stack.discard_batch(bdir)
             self._sync_stack_button()
             # 这一叠到此为止（成功/失败都不再有第 2 趟进度）→ 进度条收满格
             self._finish_stack_progress(
                 "" if ok else f"⏹ 攒批未完成：{str(msg)[:70]}")
             if not ok:
-                QMessageBox.warning(
-                    self, "攒批第 2 趟失败",
-                    f"{msg}\n\n出纸槽/纸盘里的纸可能是半成品，请人工核对后再处理。\n"
-                    f"相关打印任务已按失败上报（未标记完成）。")
+                # 🔴-B1：落了台账的那一叠**没有**按失败上报 —— 文案不能再这么说，
+                # 否则操作员会以为订单已经判死、去重下单（其实是可补救的）。
+                if _stalled_rec is not None:
+                    QMessageBox.warning(
+                        self, "攒批第 2 趟失败（已留证据，可补救）",
+                        f"{msg}\n\n出纸槽/纸盘里的纸可能是半成品，请人工核对。\n"
+                        f"这一叠没有按失败上报：清单和各单 PDF 都留着，"
+                        f"请用 选项 → ⚠ 半成品补救… 选择「补打第 2 趟 / 整单重打 / 作废」。")
+                else:
+                    QMessageBox.warning(
+                        self, "攒批第 2 趟失败",
+                        f"{msg}\n\n出纸槽/纸盘里的纸可能是半成品，请人工核对后再处理。\n"
+                        f"相关打印任务已按失败上报（未标记完成）。")
         finally:
             self._drain_stack_wait_queue()
 
@@ -17577,6 +17793,14 @@ class MainWindow(QMainWindow):
             entry_ok = bool(ok or product_only)
             entry_msg = (message if entry_ok == ok else
                          "第 1 趟即成品（该单的纸已被操作员取走，无需第 2 趟）")
+            # 🔴-B2（2026-11-10 体检）：第 1 趟**打失败**的单不许被整叠的成功顺带报成功。
+            # 旧写法 `entry_ok = bool(ok or product_only)`：只要整叠第 2 趟成功，里面混着的
+            # 失败单也会 report_success —— 顾客那边显示"已完成"，实际那一单的纸是废纸/没出，
+            # 而且云端以为打完了、不会再重推（钱收了、纸没有）。
+            if str(getattr(entry, "state", "") or "") == duplex_stack.STATE_FAILED:
+                entry_ok = False
+                entry_msg = ("第 1 趟打印失败（这一单的纸没有正常出纸/只出了一部分），"
+                             "整叠第 2 趟不包含它 —— 请重打这一单")
             for t in (entry.tasks or []):
                 tid = int(t.get("task_id") or 0)
                 if tid and tid in done_tasks:
@@ -20313,6 +20537,57 @@ class MainWindow(QMainWindow):
             return False
         return name not in ("offscreen", "minimal")
 
+    def _keep_interrupt_stall(self, jobs: list, tray_sheets: int = 0) -> str:
+        """「取消打印并退出」时把正在打的这批落进「半成品补救」台账，返回记录 id（失败返回 ""）。
+
+        这里只能记 stage=`pass2_partial`：进程马上就要被杀掉，哪几张纸真的出来了、
+        已经打到第几面，只有出纸槽知道。所以不给"补打第 2 趟"的承诺，只保留
+        「这叠纸是半成品」的事实 + 任务快照，让人决定整单重打还是作废。
+        """
+        try:
+            items = []
+            for _j in (jobs or []):
+                _fc = str(getattr(_j, "file_path", "") or "")
+                if not _fc and not int(getattr(_j, "task_id", 0) or 0):
+                    continue
+                items.append({
+                    "tab_key": str(getattr(_j, "tab_key", "") or ""),
+                    "task_id": int(getattr(_j, "task_id", 0) or 0),
+                    "order_id": int(getattr(_j, "order_id", 0) or 0),
+                    "order_number": str(getattr(_j, "order_number", "") or ""),
+                    "display_name": str(getattr(_j, "display_name", "") or ""),
+                    "file_path": _fc,
+                    "copies": int(getattr(_j, "copies", 1) or 1),
+                    "duplex": str(getattr(_j, "duplex", "off") or "off"),
+                    "page_range": str(getattr(_j, "page_range", "") or ""),
+                    "page_count": int(getattr(_j, "page_count", 0) or 0),
+                })
+            if not items:
+                return ""
+            _n = max(0, int(tray_sheets or 0))
+            rid = duplex_remedy.make_id([r.get("id") for r in duplex_remedy.load_all()])
+            rec = duplex_remedy.make_record(
+                stage=duplex_remedy.STAGE_PASS2_PARTIAL,
+                reason=(f"打印过程中选择「取消打印并退出」（出纸槽里可能已有 {_n} 张纸）"
+                        if _n else
+                        "打印过程中选择「取消打印并退出」（可能已有纸出来）"),
+                printer=self._config.printer_name,
+                paper=self._config.paper_size,
+                dpi=int(self._config.render_dpi or 0),
+                tray_foreign=_n,
+                items=items,
+                pdf="",
+            )
+            rec["id"] = rid
+            if not duplex_remedy.add(rec):
+                return ""
+            self._log(f"⚠ 已把这批未打完的任务记入「半成品补救」（{rid}）："
+                      "纸先别动，重启后到 选项 → ⚠ 半成品补救… 处理")
+            return rid
+        except Exception as e:
+            self._log(f"⚠ 半成品补救台账记录失败（{type(e).__name__}: {e}）")
+            return ""
+
     def _ask_unfinished_tabs(self, info: list) -> str:
         """弹出确认框，返回 "goto" / "manager" / "quit"（= 确定）/ "cancel"。
 
@@ -20412,6 +20687,25 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.No:
                 # 取消打印并退出：置取消标志 + 等待线程结束（5s 超时后 terminate 兜底）
                 self._log("🛑 用户选择取消打印并退出")
+                # 🔴-B5（2026-11-10 体检）：**先留证据，再杀人。**
+                # 旧写法 `cancel()` + 断开 `all_finished` + 5 秒后 `terminate()`，然后一路
+                # `_abandon_jobs` 把这些单按"放弃打印"报给云端 —— 可纸已经在出纸槽里了
+                # （手动双面第 1 趟 / 攒批第 1 趟 / 合并作业打到一半），云端标 abandoned 后
+                # 设备再报成功也救不回半成品，操作员也没有任何"从哪一叠接着打"的入口。
+                # 现在：把这批正在打的任务记进「半成品补救」台账（stage=pass2_partial：
+                # 已经出过纸，不能再补第 2 趟，只能整单重打或作废），并给 job 打 remedy_pending，
+                # 下面那段放弃逻辑就会跳过它们（云端不标 abandoned，纸留给人处理）。
+                try:
+                    _w = self._worker
+                    _snap = list(getattr(_w, "_jobs", None) or [])
+                    _tray = int(getattr(_w, "_tray_sheets", 0) or 0)
+                    _rid = self._keep_interrupt_stall(_snap, _tray)
+                    if _rid:
+                        for _j in _snap:
+                            _j.remedy_pending = _rid
+                        self._save_config()
+                except Exception as e:
+                    self._log(f"⚠ 退出前记录半成品失败（{type(e).__name__}: {e}）")
                 self._worker.cancel()
                 try:
                     self._worker.all_finished.disconnect(self._on_all_finished)
@@ -20488,6 +20782,11 @@ class MainWindow(QMainWindow):
                             continue  # 已打印完成，不放弃
                         if int(getattr(job, 'task_id', 0) or 0) in _stack_task_ids:
                             continue  # 攒批纸叠里的一单：半成品，保留订单等续打第 2 趟
+                        if str(getattr(job, 'remedy_pending', '') or '').strip():
+                            # 🔴-B5：打印到一半被强行取消的单（已记「半成品补救」）——
+                            # 纸在出纸槽里，绝不按"放弃打印"上报（云端一标 abandoned，
+                            # 之后设备真打出来也救不回；而这里本来就是"再打一遍"的先决条件）
+                            continue
                         all_abandoned.append(job)
                         if job.order_id > 0 and self._cloud_client:
                             self._cloud_client.abandon_order_to_server(job.order_id)

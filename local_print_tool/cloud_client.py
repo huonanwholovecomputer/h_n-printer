@@ -861,7 +861,7 @@ class CloudClient(QObject):
                 # P0-4: 在线上报 emit 异常也走离线队列兜底，避免状态丢失
                 logger.warning(f"上报 print_success 失败，转入离线队列: {e}")
         # python-socketio 的 emit 无确认回调，无法感知服务器是否收到，只能检测抛异常
-        self._queue_status_sync(0, "sent", task_id=task_id)
+        self._queue_status_sync(0, "sent", task_id=task_id, payload=payload)
 
     def report_fail(self, task_id: int, error: str):
         """上报打印失败到云端。断线或发送失败时暂存离线队列，联网后补报。"""
@@ -873,7 +873,8 @@ class CloudClient(QObject):
             except Exception as e:
                 # P0-4: 同 report_success，发送失败转入离线队列兜底
                 logger.warning(f"上报 print_fail 失败，转入离线队列: {e}")
-        self._queue_status_sync(0, "failed", task_id=task_id)
+        self._queue_status_sync(0, "failed", task_id=task_id,
+                                payload={"error": error})
 
     # ── 预约打印上报 ──
 
@@ -1042,7 +1043,8 @@ class CloudClient(QObject):
             item.get("order_id"), item.get("status"),
             item.get("task_id"), item.get("queued_at"))
 
-    def _queue_status_sync(self, order_id: int, status: str, task_id: int = 0):
+    def _queue_status_sync(self, order_id: int, status: str, task_id: int = 0,
+                           payload: dict | None = None):
         """离线时将状态变更暂存到本地队列。task_id 供 sent/failed 回放时精确定位子任务。
 
         🔴-2 联动：整个「读-追加-写」在 _status_queue_lock 内完成。原实现无锁，
@@ -1052,6 +1054,12 @@ class CloudClient(QObject):
                 "queued_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
         if task_id:
             item["task_id"] = task_id
+        # 🔴-B8（2026-11-10 体检）：**把原始 payload 一起存下来**。
+        # 旧实现只存 task_id，重放时发 `{"task_id": …}` —— 后端拿不到 copies / duplex /
+        # page_range / page_count / owner_name / is_admin_print，只能按"原订单配置"重算：
+        # 操作员实际按单面打的单会被按双面收费、页码范围也不算，账单和纸对不上。
+        if isinstance(payload, dict) and payload:
+            item["payload"] = dict(payload)
         with self._status_queue_lock:
             queue = self._read_status_queue_locked()
             queue.append(item)
@@ -1127,8 +1135,12 @@ class CloudClient(QObject):
                 if self._sio and self._connected:
                     try:
                         task_id = item["task_id"]
+                        # 🔴-B8：重放**原样**发回当初那份 payload（含实际 copies/duplex/
+                        # page_range/page_count/owner_name/is_admin_print），不能只发 task_id。
+                        _replay = dict(item.get("payload") or {})
+                        _replay["task_id"] = task_id
                         self._sio.emit("print_success" if status == "sent" else "print_fail",
-                                      {"task_id": task_id})
+                                       _replay)
                         settled.add(self._status_item_key(item))
                     except Exception:
                         remaining.append(item)

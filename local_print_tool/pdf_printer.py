@@ -21,6 +21,29 @@ logger = logging.getLogger(__name__)
 # P1-9: 标记 GDI 打印已中途出纸（StartPage 已执行）。带此前缀的失败消息不得再降级整单重打。
 MID_PRINT_MARKER = "[已出纸] "
 
+# 🔴-B6（2026-11-10 体检）：同一个事实必须能**传过这一层**。
+# 旧实现拿到 `MID_PRINT_MARKER` 后把前缀剥掉就返回了（`return False, reason`）—— 上层
+# （`gui.PrintWorker._print_merged_group` / `run()`）只看得到一句普通失败，于是照旧"整组
+# 判失败 → 云端重推 → 重打整组"，已经出过的页再出一遍（顾客拿到两份、其中一份只有一半）。
+# 现在统一用 PARTIAL_MARKER 往外传，上层用 `is_partial()` 判定：纸已经出来了一部分，
+# 只能落台账/人工核对，绝不能再自动重打。
+PARTIAL_MARKER = "[部分出纸] "
+
+
+def is_partial(msg) -> bool:
+    """失败消息是否表示"已经有一部分纸真的打出来了"（新老两种标记都认）。"""
+    _m = str(msg or "")
+    return _m.startswith(PARTIAL_MARKER) or _m.startswith(MID_PRINT_MARKER)
+
+
+def strip_partial(msg) -> str:
+    """去掉"部分出纸"标记，留下给人看的原因。"""
+    _m = str(msg or "")
+    for _mk in (PARTIAL_MARKER, MID_PRINT_MARKER):
+        if _m.startswith(_mk):
+            return _m[len(_mk):]
+    return _m
+
 # P0(2026-10): 标记"驱动不接受双面设置"。带此前缀的失败消息不得降级到 Sumatra/循环——
 # 那些路径同样依赖驱动，只会静默单面出纸，等于把"没双面却报成功"换个地方重演。
 DUPLEX_UNSUPPORTED_MARKER = "[双面不可用] "
@@ -1328,7 +1351,9 @@ def print_pdf(
             reason = msg[len(MID_PRINT_MARKER):]
             logger.error(f"GDI 打印中途失败（部分页面已出纸），为防重复页不再降级整单重打: {reason}")
             print(f"[打印] ✗ GDI 打印中途失败（部分页面已出纸），为避免重复页不再降级整单重打: {reason}")
-            return False, reason
+            # 🔴-B6：把"部分出纸"这个事实原样传给调用方（剥掉就等于让上层重新变成
+            # "什么都没打"，进而整组重打 —— 已在出纸槽里的那几张就白打了/重复了）。
+            return False, PARTIAL_MARKER + reason
 
         # P0(2026-10): 驱动不接受双面 → 终止，不降级。Sumatra(`duplexlong`)与循环兜底同样
         # 依赖驱动，降级过去只会单面出纸还报成功（正是要消灭的"假成功"）。

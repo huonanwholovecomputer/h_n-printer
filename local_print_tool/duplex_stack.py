@@ -896,6 +896,13 @@ class DuplexStack:
         plans: list = []
         off = 0
         for e in self.entries:
+            # 🔴-B2（2026-11-10 体检）：**第 1 趟打失败的单不进第 2 趟页序**。
+            # 那种单的纸要么根本没出、要么只出了一部分（整叠随后被标 tainted），它的槽位
+            # 已经在合并 PDF 里占着偏移；把它当"在叠"打过去，后面的单会整体错位 ——
+            # 第 2 趟的背面内容打到别人的纸上（一次失败污染整叠）。
+            if str(getattr(e, "state", "") or "") == STATE_FAILED:
+                off += max(0, int(e.page_count or 0))
+                continue
             for fp in e.active_plans():
                 pages = [off + int(p) for p in (fp.get("pages") or [])]
                 if not pages:

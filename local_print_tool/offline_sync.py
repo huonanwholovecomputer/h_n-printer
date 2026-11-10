@@ -126,6 +126,13 @@ class OfflineSync:
                 conn.execute("ALTER TABLE offline_orders ADD COLUMN next_retry_at REAL DEFAULT 0")
             if "last_error" not in cols:
                 conn.execute("ALTER TABLE offline_orders ADD COLUMN last_error TEXT DEFAULT ''")
+            # 🔴-B9（2026-11-10 体检）：离线订单"其实没打出来"必须留痕。
+            # 离线单（-L 号）在本地就打印失败时，旧实现 `_report_local_order_failed()` 直接
+            # return（云端还没有这笔单，报不上去），重连补报走 /api/local_orders 一律按
+            # "已完成"落地 —— 没出纸却记账。现在失败写进这一列，重连补报成功后立刻再用
+            # /api/local_order_status 把它改成 failed（后端那条路本来就有）。
+            if "print_failed" not in cols:
+                conn.execute("ALTER TABLE offline_orders ADD COLUMN print_failed INTEGER DEFAULT 0")
             # 旧库回填：synced=1 的行 status 必须是 'synced'（否则会被当成"未同步"再上报一次）
             conn.execute(
                 f"UPDATE offline_orders SET status = '{STATUS_SYNCED}' "
@@ -595,6 +602,48 @@ class OfflineSync:
         if n > 0:
             self._notify_change()
         return n
+
+    def mark_print_failed(self, order_number: str, reason: str = "") -> bool:
+        """标记离线订单「本地打印失败」（重连补报后要再回报成 failed）。
+
+        只写标记，不动 status：这一单仍然要补报（云端得先有这笔单，才能被改成 failed）。
+        """
+        num = str(order_number or "").strip()
+        if not num:
+            return False
+        try:
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
+                cur = conn.execute(
+                    "UPDATE offline_orders SET print_failed = 1, last_error = ? "
+                    "WHERE order_number = ?",
+                    (str(reason or "")[:300], num))
+                conn.commit()
+                hit = cur.rowcount
+                conn.close()
+            if hit:
+                logger.info(f"[OFFLINE] 已标记打印失败: {num}")
+                self._notify_change()
+            return bool(hit)
+        except Exception as e:
+            logger.warning(f"[OFFLINE] 标记打印失败失败 ({num}): {e}")
+            return False
+
+    def is_print_failed(self, order_number: str) -> bool:
+        """这一单在本地是否打印失败过（重连补报后需要回落成 failed）。"""
+        num = str(order_number or "").strip()
+        if not num:
+            return False
+        try:
+            with self._lock:
+                conn = sqlite3.connect(self.db_path)
+                row = conn.execute(
+                    "SELECT print_failed FROM offline_orders WHERE order_number = ? "
+                    "ORDER BY id DESC LIMIT 1", (num,)).fetchone()
+                conn.close()
+            return bool(row and int(row[0] or 0))
+        except Exception:
+            return False
 
     def mark_synced(self, order_number: str) -> None:
         """把指定订单号的待同步行标记为已同步（换号流程上报成功后调用）。"""

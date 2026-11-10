@@ -3661,6 +3661,11 @@ def init_db():
         for _col, _ddl in (
             ("simplex_pages", "ALTER TABLE order_files ADD COLUMN simplex_pages TEXT DEFAULT ''"),
             ("blank_tail_exclude", "ALTER TABLE order_files ADD COLUMN blank_tail_exclude INTEGER DEFAULT 0"),
+            # 🔴-B10（2026-11-10 体检）：实际打印配置同步失败必须留痕，等重算补丁来收。
+            # 旧写法：on_print_success 先把子任务 commit 成 sent，随后 _sync_subtask_config()
+            # 里改价异常被 `except: print + rollback()` 吞掉 —— 而 _recalc_prices_for_file 的
+            # SQL 又跳过终态，于是这一单永远停在"估价"，重推/补算都不会再来。
+            ("needs_repricing", "ALTER TABLE order_files ADD COLUMN needs_repricing INTEGER DEFAULT 0"),
         ):
             if _col not in _of_cols:
                 conn.execute(_ddl)
@@ -4550,6 +4555,58 @@ def _forget_start_print_attempts(keep_ids):
         for k in list(_start_print_attempts):
             if k not in keep_ids:
                 _start_print_attempts.pop(k, None)
+
+
+def resync_pending_prices():
+    """把 needs_repricing=1 的子任务按**当前**配置重算价格，并汇总父订单总额。
+
+    为什么需要它（🔴-B10，2026-11-10 体检）：`_sync_subtask_config()` 是"设备回报实际
+    打印配置后改价"的唯一入口，它整段在一个 try 里 —— 任何一步抛异常就 rollback，
+    而调用方 `on_print_success` 早已把子任务 commit 成 sent，`_recalc_prices_for_file`
+    又只处理非终态，于是这单永远停在估价。现在失败时打 needs_repricing=1，由这个
+    10 分钟一次的扫描补算（幂等：算完清标记；失败保持标记下轮再来）。
+    """
+    fixed = 0
+    try:
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT id, order_id, page_count, copies, duplex, page_range, simplex_pages"
+            " FROM order_files WHERE COALESCE(needs_repricing, 0) = 1 LIMIT 200"
+        ).fetchall()
+        for row in rows:
+            try:
+                per_copy = calculate_price(row["page_count"] or 1, row["duplex"] or "on",
+                                           row["page_range"] or "",
+                                           simplex_pages=_row_simplex_pages(row))
+                new_total = round(per_copy * (row["copies"] or 1), 2)
+                conn.execute("UPDATE order_files SET total_price = ?, needs_repricing = 0"
+                             " WHERE id = ?", (new_total, row["id"]))
+                oid = row["order_id"]
+                sub_sum = conn.execute(
+                    "SELECT COALESCE(SUM(total_price), 0) FROM order_files WHERE order_id = ?",
+                    (oid,)).fetchone()[0]
+                o = conn.execute(
+                    "SELECT delivery_enabled, delivery_percentage, urgency_price,"
+                    " cover_page, cover_page_price FROM orders WHERE id = ?", (oid,)).fetchone()
+                if o:
+                    delivery_fee = (round(float(sub_sum) * (o["delivery_percentage"] or 0) / 100, 2)
+                                    if o["delivery_enabled"] else 0)
+                    urgency_fee = float(o["urgency_price"] or 0)
+                    cover_fee = (round(float(o["cover_page_price"] or 0) * o["cover_page"], 2)
+                                 if o["cover_page"] else 0)
+                    parent_total = round(float(sub_sum) + urgency_fee + cover_fee + delivery_fee, 2)
+                    conn.execute("UPDATE orders SET total_price = ? WHERE id = ?",
+                                 (parent_total, oid))
+                fixed += 1
+            except Exception as e:
+                print(f"  [REPRICE] 子任务 #{row['id']} 重算失败（下轮再试）: {e}")
+        conn.commit()
+        conn.close()
+        if fixed:
+            print(f"  [REPRICE] 已补算 {fixed} 个子任务的实价")
+    except Exception as e:
+        print(f"  [REPRICE] 扫描待补算子任务失败: {e}")
+    return fixed
 
 
 def process_scheduled_orders():
@@ -6163,6 +6220,21 @@ def _sync_subtask_config(task_id, copies, duplex, page_range, page_count):
     except Exception as e:
         print(f"  [WARN] 子任务配置同步失败: {e}")
         conn.rollback()
+        # 🔴-B10：回滚掉之后这一单的价格就停在估价上了（sent 已是终态，_recalc 不会再碰它）。
+        # 至少把"待重算"标记落盘，交给 resync_pending_prices() 慢慢补 —— 不能让一次
+        # 改价失败变成永久错账（顾客看到的价和实际纸张不符）。
+        try:
+            _c2 = get_db()
+            _c2.execute("UPDATE order_files SET needs_repricing = 1 WHERE id = ?", (task_id,))
+            _c2.commit()
+            print(f"  [WARN] 子任务 #{task_id} 已标记 needs_repricing=1，等待定时重算")
+        except Exception as e2:
+            print(f"  [WARN] 标记 needs_repricing 失败: {e2}")
+        finally:
+            try:
+                _c2.close()
+            except Exception:
+                pass
     finally:
         conn.close()
 
@@ -12392,6 +12464,10 @@ def statistics_my():
 # 只允许改成**终态**：queued/printing/waiting 等非终态是任务分发与预约调度的工作状态，
 # 人工把订单改成它们会让 push/pull/预约调度重新把这张单捡起来打印 —— 页面上的「订正」
 # 不该有这个副作用，后端用白名单一并拦下（前端只列出这几项，两侧同源）。
+# 🔴-B7（2026-11-10 体检）：`timeout` 也是终态，必须可人工订正。
+# 预约单到点后设备一直没接单 → 后端 expire_stale_scheduled_orders() 把它置 timeout
+# （一张纸都没出，revenue 里也排除它）。若操作员后来手工打出来了，只能靠这里订正成 sent，
+# 否则那笔钱永远是 0、订单永远停在"超时"。前端 ORDER_FIXABLE_STATUSES 是同一份清单。
 MANUAL_FIX_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected")
 
 
@@ -13626,6 +13702,8 @@ if __name__ == "__main__":
                       id="expire_stale_scheduled")
     # 测试设备（联调/冒烟脚本注册的 debug-* 等）离线后自动清掉，避免授权页越积越多
     scheduler.add_job(purge_test_devices, "interval", minutes=30, id="purge_test_devices")
+    # 🔴-B10：改价失败的单在这里补算（幂等，算完清 needs_repricing）
+    scheduler.add_job(resync_pending_prices, "interval", minutes=10, id="resync_prices")
     scheduler.start()
     print("定时扫描已启动（任务扫描每 30s，预约扫描每 30s，超时检查每 60s，预留订单清理每 5min）")
 

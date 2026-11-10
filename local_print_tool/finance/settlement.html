@@ -4174,7 +4174,12 @@ function undoTrendDrill() {
          excludeSelf=true 时金额/待处理计数全部跳过；订单明细表展示时仍用原样金额。 */
 /* S1-09：unsynced / unsynced_rejected 也排除在收益统计之外 —— 这两态的钱还没被云端确认，
    计入「云端收益记录」（= 已入账 + 应收未收）就是虚增。它们在明细里照常可见、可筛选。 */
-var _EXCLUDE_STATUS = { canceled: 1, abandoned: 1, rejected: 1, failed: 1,
+/* 🔴-B7（2026-11-10 体检）：`timeout` 必须和**后端 revenue 口径**一致。
+   后端统计（printer-backend/app.py 的 revenue 聚合）早就把 `timeout` 排除在外（设备到点没接单、
+   一张纸都没出 ⇒ 不该算收入），而这里漏了它 —— 于是同一笔单在结算页"算应收 8.00 元"、
+   在云端收益里是 0，页面还把它当"待处理文件"一直挂着（实测：timeout 单 payable=8.00 /
+   pendingFiles=1）。现在前端也排除：没出纸就不算钱。 */
+var _EXCLUDE_STATUS = { canceled: 1, abandoned: 1, rejected: 1, failed: 1, timeout: 1,
                         unsynced: 1, unsynced_rejected: 1 };
 function _orderMoney(o, excludeSelf) {
   var m = { paid: 0, receivable: 0, record: 0, free: 0, pendingFiles: 0 };
@@ -4535,6 +4540,9 @@ function _toggleOrderExpand(oid) {
   v7.16（2026-11-03 用户要求「外部监视的订单改不了状态？需要允许调整状态」）：**外部监视单也
   可以订正**了，但写的是本地账本的 manual_status 字段（POST /api/local/external_prints/status），
   不是云端 orders 写接口 —— 它们不在云端 orders 表里。白名单仍是同一份终态清单。 */
+/* 🔴-B7：`timeout` 也是终态（后端 MANUAL_FIX_STATUSES 同一份清单）。
+   加它进来才能人工订正：预约单到点设备掉线、纸其实没打 ⇒ 保持 timeout；
+   操作员手工打出来了 ⇒ 订正成 sent（否则那笔钱永远是 0）。 */
 var ORDER_FIXABLE_STATUSES = ['sent', 'failed', 'abandoned', 'canceled', 'rejected'];
 /* 可编辑判据：云端模式 + 已解锁 + id 合法（本地模式订单库存本地库、无对应写接口，保持只读）。
    云端单的 id 合法判据 = **规范十进制**（`/^[0-9]+$/`），与后端 `re.fullmatch(r"[0-9]+")` 同源：
