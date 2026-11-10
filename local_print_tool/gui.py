@@ -120,7 +120,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.6.9"
+APP_VERSION = "4.6.10"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -9201,6 +9201,53 @@ class MainWindow(QMainWindow):
         # 原实现漏了这一处 —— 队列里残留旧 key，标签页删除/重编号后旧 key 可能
         # 恰好对上**另一个**标签页，补打时会把别的订单的文件打出来（计费错误）。
         self._remap_auto_print_retry(key_map)
+        # 2026-11-10 现场（HN20261109-0008 / -0009）：纸叠清单里也记着 tab_key，
+        # 标签页删除/重编号后旧 key 一个都对不上 ⇒ 第 2 趟打完仍判「没打印完」。
+        self._remap_stack_tab_keys(key_map)
+
+    def _remap_stack_tab_keys(self, key_map: dict) -> int:
+        """标签页重编号后同步「纸叠清单 + 攒批排队 + 进行中上下文」里的 tab_key。
+
+        纸已经在出纸槽里的时候，标签页被删/被重编号是常态（清空一页、删一页，编号从 1 重排）。
+        纸叠清单里的 `tab_key` 是收尾时找回 `PrintJob` 的第一把钥匙：钥匙对不上，
+        整叠第 2 趟明明打完了，也会因为 `sent` 没被置真而判成「未打印完成」，
+        退出时还会把这叠纸按「放弃打印」上报（2026-11-09 晚现场就是这么丢的账）。
+
+        映射不到的（那一页真的被删了）置空 —— 收尾会退到按文件路径/显示名兜底，
+        **绝不保留旧 key 去撞重新编号后的另一页**（否则会把别人的单标成完成）。
+        """
+        changed = 0
+        for entry in (getattr(self._stack, "entries", None) or []):
+            old_key = str(getattr(entry, "tab_key", "") or "")
+            if not old_key:
+                continue
+            new_key = key_map.get(old_key, "")
+            if new_key != old_key:
+                entry.tab_key = new_key
+                changed += 1
+        for item in list(getattr(self, "_stack_wait", None) or []) + \
+                list(getattr(self, "_stack_entry_wait", None) or []):
+            old_key = str(item.get("tab_key") or "")
+            if old_key and old_key in key_map:
+                item["tab_key"] = key_map[old_key]
+        ctx = getattr(self, "_stack_pending_ctx", None) or {}
+        if ctx:
+            old_key = str(ctx.get("tab_key") or "")
+            if old_key and old_key in key_map:
+                ctx["tab_key"] = key_map[old_key]
+        cur_tab = str(getattr(self, "_printing_tab_key", "") or "")
+        if cur_tab and cur_tab in key_map:
+            self._printing_tab_key = key_map[cur_tab]
+        if changed:
+            try:
+                bdir = self._stack_batch_dir()
+                if bdir and os.path.isdir(bdir):
+                    duplex_stack.save_manifest(bdir, self._stack)
+            except Exception as e:
+                self._log(f"⚠ 纸叠清单重编号后写盘失败（{type(e).__name__}: {e}）"
+                          f" —— 崩溃续打可能读不到新的归属页")
+            self._log(f"🔧 标签页重编号：已同步纸叠清单里 {changed} 单的归属页")
+        return changed
 
     def _remap_auto_print_retry(self, key_map: dict) -> None:
         """标签页重编号后同步重映射 `_auto_print_retry` 队列中的 tab_key。
