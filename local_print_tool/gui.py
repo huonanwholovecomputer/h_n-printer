@@ -3392,11 +3392,22 @@ class PrintWorker(QThread):
             + "⚠ 翻纸期间不要让别的打印任务插进来（其它程序的手动打印、本工具别的任务都算）：\n"
             + "   第 2 趟要接着这叠纸打，中间插单就会串页。"
         )
-        self._flip_continue = False
+        # ⚠ 这里绝不能重置 `_flip_continue`、也不能 clear 事件：翻纸窗的「▶ 继续打第 2 趟」
+        # 按时间闸门（硬规矩 12）在这个函数**之前**就已经可点 —— 操作员的回答会比它先到。
+        # 2026-11-10 现场：14:54:13 点了「继续」，本函数立刻把回答抹成 False，而事件已被
+        # set ⇒ wait() 秒返回、按「跳过」处理：纸刚出槽就被判成半成品（日志里
+        # 「⏸ 等待人工翻纸」紧接「⚠ 本批是半成品」）。
         self.log_message.emit(f"⏸ 等待人工翻纸（最多 {self.FLIP_TIMEOUT_SEC // 60} 分钟）…")
         self.flip_required.emit(text, self.FLIP_TIMEOUT_SEC)
-        # 事件在批次开始时已清空（_print_manual_batch）；这里不能再 clear ——
-        # 否则操作员在第 1 趟打印期间就点了「跳过」的预置答案会被抹掉，白等 10 分钟。
+        if self._flip_event.is_set():
+            # 已经回答过了（第 1 趟还在等出纸时就点了继续/跳过）：不再等，按那个回答走。
+            if self._cancelled:
+                return False
+            self.log_message.emit(
+                "▶ 翻纸已提前确认（点「继续」时本趟还在等出纸）—— 直接打第 2 趟"
+                if self._flip_continue else
+                "⏭ 翻纸已提前选择跳过 —— 本批按半成品处理，可稍后补救")
+            return bool(self._flip_continue)
         if not self._flip_event.wait(self.FLIP_TIMEOUT_SEC + self.FLIP_GRACE_SEC):
             self.log_message.emit("⚠ 翻纸提示长时间无人确认，按「跳过本任务」处理")
             return False
@@ -5253,9 +5264,17 @@ class DuplexRemedyWorker(QThread):
             f"3. 点「继续打第 2 趟」——随后打印 {p2}。\n\n"
             "⚠ 翻纸期间不要让别的打印任务插进来：第 2 趟要接着这叠纸打，中间插单就会串页。"
         )
-        self._flip_continue = False
+        # 与 PrintWorker._ask_operator_to_flip 同一条坑：整单重打的第 1 趟还在等出纸时
+        # 操作员就可能已经在闸门到点后点了「继续」，这里不许把它抹掉。
         self.log_message.emit(f"⏸ 等待人工翻纸（最多 {self.FLIP_TIMEOUT_SEC // 60} 分钟）…")
         self.flip_required.emit(text, self.FLIP_TIMEOUT_SEC)
+        if self._flip_event.is_set():
+            if self._cancelled:
+                return False
+            self.log_message.emit(
+                "▶ 翻纸已提前确认 —— 直接打第 2 趟" if self._flip_continue
+                else "⏭ 翻纸已提前选择跳过 —— 本次重打中止（半成品记录保留）")
+            return bool(self._flip_continue)
         if not self._flip_event.wait(self.FLIP_TIMEOUT_SEC + self.FLIP_GRACE_SEC):
             self.log_message.emit("⚠ 翻纸提示长时间无人确认 → 本次重打中止（半成品记录保留）")
             return False
@@ -5279,9 +5298,16 @@ class DuplexRemedyWorker(QThread):
             f"3. 点「▶ 继续打第 2 趟」——随后打印背面 {p2}。\n\n"
             "⚠ 顺序必须与第 1 趟完全一致：动过顺序就会串页，只能整单重打或作废。"
         )
-        self._flip_continue = False
+        # 同上：补打的就位确认也可能被提前点掉（闸门到点就点），不许在这里抹掉。
         self.log_message.emit(f"⏸ 请把纸叠放进纸盘 2，然后点「继续打第 2 趟」（最多 {self.FLIP_TIMEOUT_SEC // 60} 分钟）…")
         self.flip_required.emit(text, self.FLIP_TIMEOUT_SEC)
+        if self._flip_event.is_set():
+            if self._cancelled:
+                return False
+            self.log_message.emit(
+                "▶ 纸已就位（提前确认）—— 直接补打第 2 趟" if self._flip_continue
+                else "⏭ 已取消本次补打（提前选择跳过）—— 半成品记录保留")
+            return bool(self._flip_continue)
         if not self._flip_event.wait(self.FLIP_TIMEOUT_SEC + self.FLIP_GRACE_SEC):
             self.log_message.emit("⚠ 长时间无人确认 → 本次补打中止（半成品记录保留，随时可再试）")
             return False

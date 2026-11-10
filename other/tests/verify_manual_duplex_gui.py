@@ -125,6 +125,7 @@ class Rec:
         self.progress = []
         self.finished = []       # [(idx, ok, msg)] —— job_finished（真成功/真失败）
         self.stalled = []        # [(idx, msg, 台账记录)] —— job_stalled（半成品：只打了第 1 趟）
+        self.flip_pre = []       # [True/False] —— 出纸等待期间操作员就点了继续/跳过（预置答案）
         self.plan_labels = []    # [{sheets:[(标签,a,b)], slots:{纸序:标签}}]
         # 每一趟**真正提交的那份批次 PDF** 的逐页文本（核"单面文件真的并进来了吗"）
         self.plan_pages = []     # [[页文本…], [页文本…]]（第 1 趟 / 第 2 趟）
@@ -134,7 +135,7 @@ class Rec:
         self.raised = None       # worker.run() 逃出来的异常（None = 干净退出）
 
 
-def patched(rec, fail_merge_at=None):
+def patched(rec, fail_merge_at=None, on_wait=None):
     # 打印队列探测也桩掉：本机真实 spooler 里有别人的作业时，这个脚本会被
     # 「等上一个任务出完」那道闸门拖住（本脚本验的是页序/并批，不是闸门本身 ——
     # 闸门由 tests/verify_duplex_timing_gate.py 专门验）。
@@ -193,6 +194,10 @@ def patched(rec, fail_merge_at=None):
 
     def _wait_for_output(printer, pages=0, **kw):
         rec.waited.append(pages)
+        if on_wait is not None:
+            # 模拟操作员在翻纸闸门到点后立刻点按钮 —— 此刻本趟还在等出纸（现场就是这样：
+            # 14:54:13 点了「继续」，紧接着才打「第 1 趟出纸」那行）。
+            on_wait()
         return {"drained": True, "queue_seconds": 0.0, "margin_seconds": 2.0,
                 "peak_jobs": 0, "detail": ""}
 
@@ -219,7 +224,8 @@ def make_job(path, duplex="on", copies=1, mode="long-edge", name="", page_count=
 
 
 def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
-               cover=False, fail_merge_at=None, printer_name="Fake Print"):
+               cover=False, fail_merge_at=None, printer_name="Fake Print",
+               early_answer=None):
     rec = Rec()
     w = gui.PrintWorker(jobs=jobs, printer_name=printer_name, duplex_mode="long-edge",
                         keep_temp_pdf=False, render_dpi=200, manual_duplex_profile=profile,
@@ -242,7 +248,12 @@ def run_worker(jobs, profile, flip_answer=True, on_announce=None, timeout=None,
     if flip_answer is not None:
         w.flip_required.connect(
             lambda text, sec: (rec.flip.append(text), w.confirm_flip(flip_answer)))
-    restore = patched(rec, fail_merge_at=fail_merge_at)
+    on_wait = None
+    if early_answer is not None:
+        def on_wait():
+            rec.flip_pre.append(bool(early_answer))
+            w.confirm_flip(bool(early_answer))
+    restore = patched(rec, fail_merge_at=fail_merge_at, on_wait=on_wait)
     t0 = time.time()
     try:
         w.run()
@@ -842,6 +853,33 @@ check("★ 并批异常·前面已有成功：成功的那份照常回报，失�
       and sorted((i, ok) for i, ok, _m in rec_bad2.finished) == [(0, False), (1, True)]
       and rec_bad2.all_finished == [(1, 1)],
       f"{rec_bad2.finished} {rec_bad2.all_finished}")
+
+# ============================================================
+# ①i ★回答比提问先到：翻纸闸门按时间放行（硬规矩 12），操作员在第 1 趟
+#     还没出完纸时就点了「继续」—— 这个回答必须被采纳，不能当成「跳过」
+#     （2026-11-10 现场：14:54:13 点继续，紧接着日志就判「半成品」）
+# ============================================================
+print("\n=== ①i 提前点「继续」不能当成跳过 ===")
+rec = run_worker([make_job(PDF5)], MANUAL, flip_answer=None, early_answer=True)
+check("★ 提前点「继续」→ 必须真的打第 2 趟（两趟都在）",
+      [p[0] for p in rec.plan_pass] == [1, 2],
+      f"plan_pass={[p[0] for p in rec.plan_pass]}")
+check("★ 提前点「继续」→ 任务成功、不进半成品台账",
+      bool(rec.finished) and rec.finished[0][1] is True and not rec.stalled,
+      f"finished={rec.finished} stalled={len(rec.stalled)}")
+check("★ 日志把这次说成「提前确认」，而不是「无人确认/按跳过处理」",
+      any("翻纸已提前确认" in x for x in rec.logs)
+      and not any("长时间无人确认" in x for x in rec.logs),
+      f"{[x for x in rec.logs if '翻纸' in x][:3]}")
+
+print("\n=== ①j 提前点「跳过」必须立刻按半成品收尾（不能被当成继续）===")
+rec = run_worker([make_job(PDF5)], MANUAL, flip_answer=None, early_answer=False)
+check("★ 提前点「跳过」→ 只打第 1 趟 + 落台账",
+      [p[0] for p in rec.plan_pass] == [1] and len(rec.stalled) == 1
+      and not rec.finished,
+      f"plan_pass={[p[0] for p in rec.plan_pass]} stalled={len(rec.stalled)}")
+check("★ 提前点「跳过」→ 出纸槽台账不白等（第 1 趟照常等出纸）",
+      rec.waited == [3], f"{rec.waited}")
 
 # ============================================================
 # ② 跳过（第 1 趟出纸后）→ 第 2 趟绝不打，但**不判失败**：记进「半成品补救」台账
