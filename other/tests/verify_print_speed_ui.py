@@ -43,6 +43,7 @@ def check(name, cond, detail=""):
 
 
 SRC = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+PC_SRC = open(os.path.join(LOCAL_TOOL, "printer_config.py"), encoding="utf-8").read()
 
 # ══════════════════════════════════════════════════════════════════════
 print("=== ① 窗口把四类设置装在一起 ===")
@@ -104,8 +105,14 @@ check("窗口对话返回的 dict 能直接喂给 update_profile（键名与档�
 print("\n=== ④ 主窗口把档案参数传进翻纸窗 ===")
 check("announce 带上 gate_ratio / gate_extra（窗口据此算闸门）",
       "gate_ratio=prof.gate_ratio, gate_extra=prof.flip_ready_sec" in SRC)
-check("闸门文案说明按百分比放行 + 可在「选项 → 打印速度…」里调",
-      '按「预估 {_ratio}%' in SRC and "放行比例与人工翻页时间可在「选项 → 打印速度…」里调" in SRC)
+# 2026-11-11：第 2 趟放行改成"只认操作员点击"，翻纸窗里那套"按预估 X% 放行、还有 N 秒"
+# 的闸门文案已经删了（`_paint_flip_gate` 整个方法不存在）。这里的判据随之改成
+# "闸门参数还在档案里、还能在「选项 → 打印速度…」里调，但不再决定放行"。
+check("翻纸窗不再宣传按百分比自动放行（2026-11-11 起由操作员点按钮决定）",
+      '按「预估 {_ratio}%' not in SRC and "放行比例与人工翻页时间可在「选项 → 打印速度…」里调" not in SRC)
+check("预估/翻页准备时间仍由档案提供（gate_ratio / flip_ready_sec 仍可调，只当参考信息）",
+      "gate_ratio=prof.gate_ratio, gate_extra=prof.flip_ready_sec" in SRC
+      and "def gate_unlock_seconds(" in PC_SRC)
 
 # ══════════════════════════════════════════════════════════════════════
 print("\\n=== ⑤ 能力适配：自动双面机型不能把这套设置当成可调项（2026-11-02） ===")

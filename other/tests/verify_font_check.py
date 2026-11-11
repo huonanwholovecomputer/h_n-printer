@@ -522,6 +522,49 @@ if _has_gui:
     check("加文件后排队检查", "self._queue_font_checks(jobs[rows_before:]" in _src)
     check("字体变了会作废 PDF 缓存", "font_check.purge_pdf_cache()" in _src)
 
+    check("打印前闸门走 selective（只清引用、不删 PDF）",
+          "self._font_sync_epoch(selective=True)" in _src)
+    _gate_body = _src.split("def _font_gate(", 1)[1].split("\n    def ", 1)[0]
+    check("打印前闸门里**不调** purge_pdf_cache（2026-11-11 现场：删了 34 份 PDF ⇒ 预览失效）",
+          "purge_pdf_cache" not in _gate_body)
+
+    # ⑫ selective 的行为级验收：只清"用到变更字体"那几个，其余 cached_pdf 一动不动，
+    #    并且**一个 PDF 文件都不删**（删文件 = 预览失效，2026-11-11 现场）。
+    print("⑫ selective 作废：只清引用、不删文件")
+    _tabs = {}
+    _hit = printer_config.PrintJob(file_path=docx, copies=1, page_count=1)
+    _hit.cached_pdf = os.path.join(_SANDBOX, "hit.pdf")
+    _hit.missing_fonts = ["华文琥珀"]
+    _miss = printer_config.PrintJob(file_path=docx, copies=1, page_count=1)
+    _miss.cached_pdf = os.path.join(_SANDBOX, "miss.pdf")
+    _miss.missing_fonts = ["别的字体"]
+    _tab = types.SimpleNamespace(jobs=[_hit, _miss])
+    _tabs["1"] = _tab
+
+    _sel = _Stub()
+    _sel._config = types.SimpleNamespace(tabs=_tabs)
+    _calls = {"purge": 0}
+    _orig_epoch = font_check.check_epoch
+    _orig_purge = font_check.purge_pdf_cache
+    font_check.check_epoch = lambda *a, **k: {
+        "fingerprint": "fp-x", "changed": True,
+        "added_names": ["华文琥珀"], "removed_names": []}
+    font_check.purge_pdf_cache = lambda *a, **k: (_calls.__setitem__("purge", _calls["purge"] + 1) or 0)
+    try:
+        _changed = _sel._font_sync_epoch(selective=True)
+    finally:
+        font_check.check_epoch = _orig_epoch
+        font_check.purge_pdf_cache = _orig_purge
+    check("selective 返回 True（确实变了）", _changed is True, str(_changed))
+    check("selective 一次 purge_pdf_cache 都不调（绝不删 PDF 文件）",
+          _calls["purge"] == 0, str(_calls))
+    check("用到变更字体的文件：cached_pdf 被清空（下次按新字体重转）",
+          _hit.cached_pdf == "", repr(_hit.cached_pdf))
+    check("没用到变更字体的文件：cached_pdf 原样保留（预览照常可用）",
+          _miss.cached_pdf.endswith("miss.pdf"), repr(_miss.cached_pdf))
+    check("两个文件的 font_checked 都重置（下次打印前按新指纹重查）",
+          _hit.font_checked is False and _miss.font_checked is False)
+
 print("")
 if FAILED:
     print(f"❌ 失败 {len(FAILED)} 条 / 通过 {PASSED} 条")

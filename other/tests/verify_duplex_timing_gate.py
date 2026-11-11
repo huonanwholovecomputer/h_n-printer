@@ -179,14 +179,15 @@ dlg.announce("本单 3 张纸，第 1 趟：1 3 5", sheets=3, estimate_sec=42.0,
              gate_ratio=0.5, gate_extra=0.0)
 _t = dlg._pass1.text()
 check("mode == pass1", dlg._mode == "pass1", dlg._mode)
-check("状态文案切回「① 正在打印第 1 趟」", "正在打印第 1 趟" in dlg._status.text(),
+check("状态文案切回「① 正在送第 1 趟」", "正在送第 1 趟" in dlg._status.text(),
       dlg._status.text())
 check("★ A2 起跑后已用从 0 开始（已用 00:00）", "已用 00:00" in _t, _t)
 check("★ A2 起跑后给出预计（预计 00:42）", "预计 00:42" in _t, _t)
 check("★ A2 起跑后第 1 趟计时器在跑", dlg._pass1_timer.isActive() is True)
 check("★ A2 起跑后已用秒数是真时钟（< 1 秒），不是把等待时长算进来",
       dlg._elapsed_sec() < 1.0, f"{dlg._elapsed_sec():.2f}s")
-check("★ A2 起跑后按钮文案回到「等第 1 趟打完」", "等第 1 趟打完" in dlg._btn_go.text(),
+check("★ A2 起跑后按钮立刻可点（2026-11-11 起：这一趟打没打完由操作员说了算）",
+      dlg._btn_go.isEnabled() is True and "纸出齐就点" in dlg._btn_go.text(),
       dlg._btn_go.text())
 dlg.finish("done")
 dlg.hide()
@@ -227,6 +228,17 @@ def stubbed(rec, pending=0, gate_wait=None, pass1_wait=None, gate_sleep=0.0):
             ("print_pdf", "print_plan_pass", "wait_for_output", "get_converter",
              "count_pending_print_jobs")}
     orig_merge = pdf_printer.merge_pdfs
+    _orig_wait_pass1 = gui.PrintWorker._wait_pass1_output
+
+    def _wait_pass1(self_w, pages, timeout=120.0):
+        """2026-11-11 起第 1 趟出纸等待走这个（可被打断的轮询）。
+        本脚本的 `count_pending_print_jobs` 桩恒返回 pending，真函数会一直轮询到 120 秒。"""
+        rec.waited.append(pages)
+        # 默认给 0.2 秒"送完数据 → 队列空"：>0 才会发速度样本，<0.5 才证得"不含等待"。
+        out = dict(pass1_wait or {"drained": True, "queue_seconds": 0.2,
+                                  "interrupted": False, "detail": ""})
+        out.setdefault("interrupted", False)
+        return out
 
     def _print_plan_pass(plan, path, printer, which, **kw):
         rec.plan_pass.append(which)
@@ -248,12 +260,14 @@ def stubbed(rec, pending=0, gate_wait=None, pass1_wait=None, gate_sleep=0.0):
     gui.wait_for_output = _wait
     gui.get_converter = lambda: object()
     gui.count_pending_print_jobs = lambda printer="": pending
+    gui.PrintWorker._wait_pass1_output = _wait_pass1
     pdf_printer.merge_pdfs = orig_merge
     try:
         yield
     finally:
         for k, v in orig.items():
             setattr(gui, k, v)
+        gui.PrintWorker._wait_pass1_output = _orig_wait_pass1
         pdf_printer.merge_pdfs = orig_merge
 
 

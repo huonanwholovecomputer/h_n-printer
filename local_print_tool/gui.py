@@ -120,7 +120,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.6.10"
+APP_VERSION = "4.6.11"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -1071,13 +1071,16 @@ class ManualDuplexDialog(QDialog):
     # 两个参数都进「选项 → 打印速度…」由操作员调（`PrinterProfile.gate_ratio/flip_ready_sec`）。
     FLIP_GATE_RATIO = 0.5         # 默认：预估完成 50% 后允许点「继续打第 2 趟」
     FLIP_GATE_MIN_SEC = 1.0       # 算出来 < 1 秒的闸门没有意义，直接放行
-    # ★ 2026-11-09 用户第三次重申（现场：4 文件 8 张纸，31 秒时按钮仍写「等待第 1 趟打完」）：
-    #   「打印机返回的打印完成状态在这个情况下并不可信……只考时间预估来控制这个第二趟按钮」。
-    #   本窗据此**自己按时间放行**（`_pass1_tick` → `_open_flip_gate(by_time=True)`），
-    #   worker 的 `flip_required` 只是"提前知道打完"，不是放行的前提。历史坑：69523ff 首版是
-    #   "收到回报立刻放行"；aa4cefe 加了闸门但**仍然要求先收到回报**，于是回报一迟到按钮就
-    #   永远灰着 —— 这个行为已经反复横跳两次，别再改回"信号驱动"。验收见
-    #   `other/tests/verify_manual_duplex_gui.py` 的「纯时间放行」段。
+    # ★ 2026-11-11 用户第四次定口径（现场：打印机断电+USB 连着时点了打印，进程卡死；
+    #   同时「第 2 趟」的按钮在等系统打印队列）：
+    #   「第一趟的打印结束信号应该由我决定，我什么时候按下开始第二趟什么时候就是第一趟
+    #     结束了，而不是由系统打印队列决定。」
+    #   ⇒ 放行条件只有一个：**操作员点「▶ 继续打第 2 趟」**。时间预估退成参考信息
+    #     （`flip_gate_at` 保留，只用于文案/旧验收），worker 的 `flip_required`（= 第 1 趟
+    #     数据全送出去了）只负责把"10 分钟无人确认就按跳过处理"的倒计时起跑。
+    #   历史：69523ff "收到回报立刻放行" → aa4cefe 加时间闸门 → 2026-11-09 改成"只按时间
+    #   预估放行" → 2026-11-11 改成"只按操作员点击"。别再改回信号驱动或定时放行。
+    #   验收见 `other/tests/verify_manual_duplex_gui.py` 的「操作员放行」段。
     FLIP_WAIT_DEFAULT_SEC = 600   # worker 等翻纸回执的默认上限（PrintWorker.FLIP_TIMEOUT_SEC）
 
     @classmethod
@@ -1150,23 +1153,18 @@ class ManualDuplexDialog(QDialog):
     def _pass1_tick(self):
         """每 0.5 秒刷新；第 1 趟已冻结（_pass1_done）就停在那里，不再继续走。
 
-        ★ 2026-11-09（用户第三次强调，见 `FLIP_GATE_RATIO` 上方注释）：第 2 趟按钮
-        **只按时间预估放行**，不能等打印机的完成信号。worker 的 `flip_required` 是在整批
-        第 1 趟**全部文件渲染+送端口**之后才发的（`_ask_operator_to_flip`），多文件批次里
-        它会落到「预估 50%」之后 —— 那时窗口停在「① 正在打印第 1 趟」、按钮永远是灰的
-        （现场：4 文件 8 张纸，31 秒 / 预估 51 秒，按钮仍写「等待第 1 趟打完」）。
-        所以这里自己数着闸门：mode=="pass1" 且已到放行时刻 ⇒ 直接放行；打印机的回报到了
-        只是「提前知道」，不是放行的前提。
+        ★ 2026-11-11（用户第四次定口径，见 `FLIP_GATE_RATIO` 上方注释）：第 2 趟按钮
+        **既不等打印机的完成回报，也不按时间放行** —— 按钮从窗口出现那刻就可点，
+        第 1 趟什么时候算打完由操作员看纸判定。这里只负责刷新计时文案与配色。
         """
         if self._mode == "waiting":
             return      # 等待上一个任务：本态计时器应当是停的，万一被 tick 也绝不许显示「已用」
         elapsed = self._pass1_final if self._pass1_done else self._elapsed_sec()
         self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done))
         self._pass1.setStyleSheet(f"color: {self.pass1_color(elapsed, self._pass1_est)};")
-        if self._mode == "pass1" and not self._pass1_done:
-            gate = self._flip_gate_for_now()
-            if gate > 0 and elapsed >= gate:
-                self._open_flip_gate(by_time=True)
+        # ★ 2026-11-11 起这里**不再**按时间自动放行（原来到点就直接切「可翻纸」）：
+        #   第 2 趟什么时候开始只由操作员点按钮决定，见 `announce()` 里的用户口径。
+        #   计时器继续走，直到操作员点「继续」才冻结。
 
     def freeze_pass1(self, seconds: float | None = None):
         """冻结第 1 趟计时。传 seconds 时用**程序实测的权威值**（worker 报的），
@@ -1282,11 +1280,18 @@ class ManualDuplexDialog(QDialog):
         self._timer.stop()
         self._mode = "pass1"
         self._apply_batch_params(sheets, estimate_sec, gate_ratio, gate_extra)
-        self._status.setText("① 正在打印第 1 趟…（程序自己分两趟，中途只需要翻一次纸）")
+        self._status.setText(
+            "① 正在送第 1 趟…（程序自己分两趟，中途只需要翻一次纸）—— "
+            "纸数够、出齐就点「继续打第 2 趟」：这一趟打没打完由你说了算，程序不等打印队列")
         self._detail.setText(text)
         self._countdown.setText("")
-        self._btn_go.setText("▶ 继续打第 2 趟（等第 1 趟打完）")
-        self._btn_go.setEnabled(False)
+        # ★ 2026-11-11 用户口径（这一处已经来回改过三次，动它之前先读下面这段注释）：
+        #   「第一趟的打印结束信号应该由我决定，我什么时候按下开始第二趟什么时候就是
+        #     第一趟结束了，而不是由系统打印队列决定。」
+        #   ⇒ 按钮**一出现就可点**。时间预估只当参考信息；既不按时间放行（2026-11-09 口径），
+        #     也不等打印机的完成回报 / 打印队列排空（更早的两种口径）。
+        self._btn_go.setText("▶ 继续打第 2 趟（纸出齐就点）")
+        self._btn_go.setEnabled(True)
         self._btn_skip.setText("⏭ 跳过本任务")
         self._btn_skip.setEnabled(True)
         # ★ 第 1 趟计时从**真正开始送纸**这一刻起（不是"窗口出现"那一刻）：上一批次没结束时
@@ -1322,16 +1327,14 @@ class ManualDuplexDialog(QDialog):
         return gate
 
     def set_flippable(self, text: str, timeout_sec: int):
-        """第 1 趟**回报**出纸。按时预估还没到点（打印机提前回报）就先不放开按钮。
+        """worker 报告"第 1 趟的数据全送进打印队列了" —— 起跑"10 分钟无人确认=跳过"倒计时。
 
-        "回报"不等于"打完"：主机型打印机只回报数据送进端口。放行时刻见 `flip_gate_at`。
-
-        ★ 2026-11-09：这个回报**不是放行的必要条件** —— 闸门到点由 `_pass1_tick` 自己放行
-        （`_open_flip_gate(by_time=True)`）。回报迟到时窗口早就可点了；回报到了只是提前
-        知道。所以这里对模式有守卫：
-          · 已按时间放行（flip）/ 已点继续（pass2）/ 已跳过（skipped）：一律不改状态 ——
-            否则迟到的回报会把窗口从「③ 正在打印第 2 趟」拉回可翻纸，重复 emit
-            continue_requested（第 2 趟会被打两遍）。
+        ★ 这个回报**既不是放行的必要条件，也不是充分条件**（2026-11-11 口径）：按钮在
+        `announce()` 那一刻就可点，第 1 趟何时结束由操作员点「继续」决定；回报到了只负责
+        把倒计时起跑（也给界面补一句"数据已全部送出"的措辞）。
+        守卫：`flip`（已可翻）/`pass2`（已点继续）/`skipped`/`done` 一律不改状态 ——
+        否则迟到的回报会把「③ 正在打印第 2 趟」拉回可翻纸，重复 emit continue_requested
+        （第 2 趟会被打两遍）。
         """
         # idle/waiting 只是"兜底入口"（正常流程 announce 先到）；pass2/skipped/done 一律拒绝，
         # 否则迟到的回报会把已经打完第 2 趟的窗口拉回可翻纸。
@@ -1345,80 +1348,39 @@ class ManualDuplexDialog(QDialog):
             if self._left >= self.FLIP_WAIT_DEFAULT_SEC - 1:
                 self._left = max(1, int(self._flip_timeout))
             return
-        gate = self._flip_gate_for_now()
-        # 手上要是已经有一笔**可信**的实测（不早于闸门）⇒ 第 1 趟确实打完了，直接放行
-        measured_done = bool(gate > 0 and self._pass1_done and self._pass1_final >= gate)
-        if gate > 0 and not measured_done and self._elapsed_sec() + 0.5 < gate:
-            self._flip_gate_at = gate
-            self._left = 0              # 闸门期间**不**扣翻纸确认倒计时（到点才起算）
-            self._mode = "flip_gate"
-            self._paint_flip_gate()
-            self._timer.start(500)      # 闸门期间半秒一刷（自己数着，不看打印机的回报）
-            return
+        # 2026-11-11 起没有"闸门"这一态了：worker 说"第 1 趟的数据全送进打印队列了"，
+        # 这里只把"10 分钟无人确认 ⇒ 按跳过处理"的倒计时起跑；按钮在 `announce()` 那一刻
+        # 就已经可点（第 1 趟何时结束由操作员点「继续」决定）。
         self._open_flip_gate()
 
-    def _paint_flip_gate(self):
-        """闸门未开时的文案：说清"为什么还不能翻"和"还要等多久"。"""
-        left = max(0.0, self._flip_gate_at - self._elapsed_sec())
-        est = float(getattr(self, "_pass1_est", 0.0) or 0.0)
-        self._status.setText(
-            "② 第 1 趟还在出纸：打印机只回报「开始打印」、不回报「打完」—— "
-            "按预估等到点再翻纸")
-        self._detail.setText(self._flip_text)
-        self._btn_go.setText(f"▶ 继续打第 2 趟（还要等 {math.ceil(left)} 秒）")
-        self._btn_go.setEnabled(False)
-        self._btn_skip.setText("⏭ 跳过本任务")
-        self._btn_skip.setEnabled(True)
-        self._countdown.setStyleSheet("color: #e67e22;")
-        _ratio = int(round(float(getattr(self, "_gate_ratio", self.FLIP_GATE_RATIO)) * 100))
-        _extra = float(getattr(self, "_gate_extra", 0.0) or 0.0)
-        self._countdown.setText(
-            f"⏳ 预估第 1 趟共 {format_duration(est)}，按「预估 {_ratio}%"
-            + (f" + 翻页准备 {_extra:.0f} 秒" if _extra > 0 else "")
-            + f"」放行，还有 {math.ceil(left)} 秒")
-        self._countdown.setToolTip("放行比例与人工翻页时间可在「选项 → 打印速度…」里调")
-        note = ("（打印机的「完成」回报早于实机出纸，计时与按钮都以预估为准；"
-                "这笔回报不会被写进速度样本）")
-        self._pass1_hint.setText(f"{self._speed_hint}\n{note}".strip() if self._speed_hint
-                                 else note)
+    def _open_flip_gate(self):
+        """允许翻纸：起跑翻纸确认倒计时（10 分钟无人确认 ⇒ 按跳过处理）。
 
-    def _open_flip_gate(self, by_time: bool = False):
-        """闸门到点（或本来就无需闸门）：允许翻纸 + 冻结计时 + 开始翻纸确认倒计时。
-
-        冻结用的是**界面实时时钟**：此时那笔提前回报（1~2 秒）没资格代表第 1 趟用时
-        （真实用时还在走，见 `is_early_signal`）。
-
-        by_time=True：**没有**等到打印机的完成回报、纯按预估到点放行（2026-11-09 用户口径
-        「只考时间预估」）。文案必须说实话 —— 纸可能还在出，所以不写「已打完」，只写
-        「按预估已到放行时刻…请确认纸已出齐」。冻结值先记界面时钟，worker 的权威实测到了
-        再覆盖（`_pass1_frozen_by_gate`，免得把闸门时刻当成第 1 趟用时学进速度模型）。
+        ⚠ 这里**不冻结第 1 趟计时**：第 1 趟什么时候算结束 = 操作员点「继续」那一刻
+        （2026-11-11 口径），冻结在 `_on_go` 里做（用 `_freeze_pass1_at_gate`，这样 worker
+        的权威实测 `freeze_pass1(seconds)` 到了还能覆盖界面时钟）。
         """
         self._flip_gate_at = 0.0
-        if by_time:
-            self._freeze_pass1_at_gate()
-            self._status.setText(
-                "② 按预估已到放行时刻 —— 请确认纸已出齐、翻纸，然后点「继续打第 2 趟」")
-            self._btn_go.setText("▶ 继续打第 2 趟")
-            if self._speed_hint:
-                self._pass1_hint.setText(
-                    f"{self._speed_hint}\n（没等到打印机的「打完」回报：本机只回报「开始打印」，"
-                    "按钮按预估放行、不采信完成信号）")
-        else:
-            self._pass1_freeze()
-            self._status.setText("② 第 1 趟已打完 —— 请翻纸，然后点「继续打第 2 趟」")
-            self._btn_go.setText("▶ 继续打第 2 趟")
-            if self._speed_hint:
-                self._pass1_hint.setText(self._speed_hint)
+        # ⚠ 计时**不在这里冻结**：第 1 趟什么时候算结束 = 操作员点「继续」那一刻
+        #   （2026-11-11 口径）。冻结交给 `_on_go`（用 `_freeze_pass1_at_gate`，这样
+        #   worker 的权威实测 `freeze_pass1(seconds)` 到了还能覆盖界面时钟）。
+        self._status.setText(
+            "② 第 1 趟的数据已全部送进打印队列 —— 请确认纸已出齐、翻纸，"
+            "然后点「继续打第 2 趟」")
+        if self._speed_hint:
+            self._pass1_hint.setText(
+                f"{self._speed_hint}\n（这台打印机只回报「开始打印」、不回报「打完」："
+                "按钮随时可点，纸出齐没出齐由你看）")
+        self._btn_go.setText("▶ 继续打第 2 趟")
         self._mode = "flip"
         self._detail.setText(self._flip_text)
         self._btn_go.setEnabled(True)
         self._left = max(1, int(self._flip_timeout or self.FLIP_WAIT_DEFAULT_SEC))
         self._tick()
         self._timer.start(1000)
-        if by_time:
-            # 操作员可能在闸门开之前就把窗关了/最小化了；纯时间放行没有 worker 信号来
-            # "再弹一次"，所以这里自己通知主窗（signal 路径由 _on_flip_required 负责显示）。
-            self.flip_gate_opened.emit()
+        # 操作员可能在按钮亮起来之前就把窗关了/最小化了；这里自己通知主窗把窗立起来
+        # （不依赖 worker 的 flip_required —— 2026-11-11 起按钮不等那个回报）。
+        self.flip_gate_opened.emit()
 
     def finish(self, text: str = ""):
         """批次结束：收起窗口（稍候自动关，避免一直盖在屏幕上）。"""
@@ -1436,15 +1398,6 @@ class ManualDuplexDialog(QDialog):
         QTimer.singleShot(1500, self.close)
 
     def _tick(self):
-        if self._mode == "flip_gate":
-            # 等闸门到点：**不**扣翻纸确认倒计时（那 10 分钟从"真的能翻纸"那一刻才算），
-            # 也不看打印机的回报（它只回报开始打印）。by_time 只决定文案措辞：
-            # 没收到回报就老实说"按预估放行"，别谎称"已打完"。
-            if self._elapsed_sec() >= self._flip_gate_at:
-                self._open_flip_gate(by_time=not self._flip_reported)
-            else:
-                self._paint_flip_gate()
-            return
         if self._mode != "flip":
             return
         self._left -= 1
@@ -1457,9 +1410,15 @@ class ManualDuplexDialog(QDialog):
             f"⏳ 还有 {self._left // 60} 分 {self._left % 60} 秒（超时按跳过处理）")
 
     def _on_go(self):
-        if self._mode != "flip":
+        # 「第 1 趟结束」的判据就是这一次点击（2026-11-11 用户口径）——所以 pass1 态
+        # （第 1 趟还在送数据/纸还在出）也允许点，点了就立刻往下走第 2 趟。
+        if self._mode not in ("pass1", "flip", "flip_gate"):
             return
         self._timer.stop()
+        if not self._pass1_done:
+            # 用 `_freeze_pass1_at_gate`：frozen_by_gate=True ⇒ worker 的权威实测
+            # （`duplex_speed_sample` → `freeze_pass1(seconds)`）到了还能覆盖它。
+            self._freeze_pass1_at_gate()
         self._mode = "pass2"
         self._status.setText("③ 正在打印第 2 趟…（请勿再动纸叠）")
         self._countdown.setText("")
@@ -1484,8 +1443,10 @@ class ManualDuplexDialog(QDialog):
         self.skip_requested.emit()
 
     def closeEvent(self, ev):
-        # 还没确认就关窗 → 视为跳过（不能让关窗把第 2 趟放过去）；闸门期间同理
-        if self._mode in ("flip", "flip_gate"):
+        # 还没点「继续」就关窗 → 视为跳过（不能让关窗把第 2 趟放过去）。
+        # "pass1" 也算：2026-11-11 起按钮在第 1 趟还在出纸时就可点，关窗同样是一次明确的
+        # "我不打第 2 趟了"表态，必须记跳过（否则 worker 会一直等到 10 分钟超时）。
+        if self._mode in ("pass1", "flip", "flip_gate"):
             self._on_skip()
         super().closeEvent(ev)
 
@@ -3359,6 +3320,49 @@ class PrintWorker(QThread):
         except Exception:
             return 0.0
 
+    def _wait_pass1_output(self, pages: int, timeout: float = 120.0) -> dict:
+        """第 1 趟送完后等纸出完 —— **操作员一点「继续」就立刻结束等待**。
+
+        2026-11-11 用户口径：第 1 趟什么时候算打完由操作员决定，不由系统打印队列决定。
+        所以这里不再是原来那句死等 `pdf_printer.wait_for_output()`（它会一直堵到 spooler
+        排空/超时，打印机离线时还要白等到超时），改成 0.2 秒粒度轮询，三个出口：
+
+          · 队列空了            → drained=True（正常路径；`queue_seconds` 就是第 1 趟出纸耗时）
+          · 操作员点了继续/跳过  → interrupted=True，立刻返回（按他的表态走，不再等）
+          · 探测不了/等待超时    → drained=False（detail 里写原因，由调用方决定怎么提示）
+
+        返回 {"drained","queue_seconds","interrupted","detail"}。
+        """
+        t0 = time.perf_counter()
+        try:
+            _timeout = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            _timeout = 120.0
+        deadline = t0 + _timeout
+        detail = ""
+        while True:
+            if self._cancelled:
+                return {"drained": False, "queue_seconds": time.perf_counter() - t0,
+                        "interrupted": True, "detail": "cancelled"}
+            if self._flip_event.is_set():
+                return {"drained": False, "queue_seconds": time.perf_counter() - t0,
+                        "interrupted": True, "detail": "operator"}
+            # 只读探测（count_pending_print_jobs 内部 OpenPrinter/EnumJobs/ClosePrinter，
+            # 不发、不删、不暂停任何作业）。返回 -1 = 探测不了（打印机离线/换了默认队列）
+            # —— 与旧口径一致：**不为一次探测失败干等**，直接当"没排空"返回。
+            pending = count_pending_print_jobs(self._printer_name)
+            if pending == 0:
+                return {"drained": True, "queue_seconds": time.perf_counter() - t0,
+                        "interrupted": False, "detail": ""}
+            if pending < 0:
+                return {"drained": False, "queue_seconds": time.perf_counter() - t0,
+                        "interrupted": False, "detail": "EnumJobs 探测失败（打印机离线？）"}
+            if time.perf_counter() >= deadline:
+                return {"drained": False, "queue_seconds": time.perf_counter() - t0,
+                        "interrupted": False,
+                        "detail": f"等 {int(pages or 0)} 张纸超时（{_timeout:.0f}s 队列没排空）"}
+            time.sleep(0.2)
+
     def _ask_operator_to_flip(self, plan, tray_foreign: int = 0, warn: str = "") -> bool:
         """请操作员翻纸：发信号 → 等主线程回执。超时/取消/跳过都返回 False。
 
@@ -4254,13 +4258,23 @@ class PrintWorker(QThread):
                                    f"第 2 趟未打 —— 已记入「半成品补救」，可稍后补打"), n1
                 return False, "已取消", n1
 
-            w = wait_for_output(self._printer_name, pages=n1)
+            # 第 1 趟的数据已经全交给打印队列了。**纸出完没有由操作员判断**：他一点
+            # 「继续打第 2 趟」就算第 1 趟结束（2026-11-11 用户要求；旧口径是死等 spooler
+            # 排空，打印机离线时还会白等到超时）。这个等待随时可被那次点击打断，只承担两件事：
+            #   ① 给「应有 N 张纸」一个事后诊断（数不够就先别翻）；
+            #   ② 量一笔**不掺操作员手速**的第 1 趟用时（写速度样本）。
+            w = self._wait_pass1_output(n1)
             # 🟡6：队列没排空 = 纸不一定全出来了（离线/卡纸/缺纸）。以前这里只把这条事实
             # 用在不写速度样本上，翻纸提示照旧说"应有 N 张，数够再翻" —— 操作员数不够 N 张
             # 时没有任何退路（照翻就串页，不翻只能干等超时）。现在把不确定直接摆到提示窗上。
             _drained = bool(w.get("drained", False))
+            _interrupted = bool(w.get("interrupted", False))
             _drain_warn = ""
-            if not _drained:
+            if _interrupted:
+                self.log_message.emit(
+                    f"  ▶ 操作员先点了「继续」（第 1 趟送出口 {w.get('queue_seconds', 0.0):.1f}s）"
+                    " —— 第 1 趟到此为止，不再等打印队列排空")
+            elif not _drained:
                 _drain_warn = (
                     f"打印队列 {w.get('queue_seconds', 0)}s 内没有排空（打印机离线 / 卡纸 / 缺纸？）"
                     f" —— 第 1 趟的 {plan.sheet_count} 张纸可能没全出来：先数清再翻；"
@@ -4268,26 +4282,30 @@ class PrintWorker(QThread):
                 self.log_message.emit("  ⚠ " + _drain_warn)
             if tray_foreign > 0:
                 self.log_message.emit(
-                    f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
+                    f"  → 第 1 趟出纸（队列 {w['queue_seconds']:.1f}s）："
                     f"出纸槽里共应有 {plan.sheet_count + tray_foreign} 张纸 —— 最上面 "
                     f"{plan.sheet_count} 张是本批的，下面 {tray_foreign} 张不要动")
             else:
                 self.log_message.emit(
-                    f"  → 第 1 趟出纸（队列 {w['queue_seconds']}s + 余量 {w['margin_seconds']}s）："
+                    f"  → 第 1 趟出纸（队列 {w['queue_seconds']:.1f}s）："
                     f"出纸槽里应有 {plan.sheet_count} 张纸，请数够再翻")
-            # 第 1 趟实测 = **权威时刻**：起点在第 1 趟开打前、终点在"纸出完"（下一行才开始等人翻纸），
-            # 所以操作员按不按「继续」都不影响它，不会越等越长。扣掉我们自己加的静置余量
-            # （那段是保守等待，不是打印机花的时间）。异常样本由 add_speed_sample 内部丢弃。
-            _elapsed1 = time.perf_counter() - _t_pass1 - float(w.get("margin_seconds", 0.0) or 0.0)
+            # 第 1 趟实测 = 送完数据 → 队列排空（`_wait_pass1_output` 量到的 queue_seconds）。
+            # 不掺操作员手速（他从"纸出齐"到点「继续」的时间不计入），也不再扣静置余量
+            # （那个余量随 wait_for_output 一起退了）。异常样本由 add_speed_sample 内部丢弃。
+            _elapsed1 = float(w.get("queue_seconds", 0.0) or 0.0)
             if _elapsed1 > 0:
                 _est1 = self._estimate_first_pass(n1)
                 self.log_message.emit(
                     f"  ⏱ 第 1 趟实测 {_elapsed1:.1f}s（{n1} 张，预估 {_est1:.1f}s）"
                     f"（是否写进速度样本由主线程按物理可信度判定，见紧跟着的一条）")
-                if w.get("drained", True):
+                if _drained:
                     # 一个信号两个用途：① 主线程写档案自动学习；② 常驻窗按这个权威值冻结计时
                     # （界面自己那个时钟只做兜底：信号没到（异常路径）时它照样能冻结）
                     self.duplex_speed_sample.emit(int(n1), float(_elapsed1))
+                elif _interrupted:
+                    self.log_message.emit(
+                        "  ⚠ 操作员先点了「继续」（队列还没排空）→ 这段时长代表不了纸出完，"
+                        "本次实测不写进速度样本")
                 else:
                     # 队列 120s 内没排空 = 这段"实测"里混着我们的出纸等待超时，不是打印机耗时；
                     # 写进档案会把预估拉长到十几秒/张（打印机离线/卡纸时尤其明显）。
@@ -6848,6 +6866,8 @@ class MainWindow(QMainWindow):
         self._print_starting: bool = False
         # 窗口关闭守卫：打印启动的 processEvents 等待期间窗口可能被关闭，置位后中止后续流程
         self._closing: bool = False
+        # 真退出走完 closeEvent 的收尾了吗（_quit_app 用它判断 close() 是否被模态窗吞掉）
+        self._close_done: bool = False
         # 后台常驻（4.6.0）：关窗口 = 收回托盘，只有这条标志置位时才真的走退出流程。
         # 置位入口只有三个：文件 → 退出、托盘 → 退出、更新安装前的自动退出（_quit_app）。
         self._force_quit: bool = False
@@ -7000,8 +7020,15 @@ class MainWindow(QMainWindow):
         except Exception:
             logger.debug("排队字体检查失败", exc_info=True)
 
-    def _font_sync_epoch(self) -> bool:
+    def _font_sync_epoch(self, selective: bool = False) -> bool:
         """比对系统字体指纹：装/删过字体就作废转换缓存与所有检查结果。返回 True=变了。
+
+        selective=True（打印前闸门用）：**只清内存里的 cached_pdf 引用，绝不删 PDF 文件**。
+        2026-11-11 现场：18:22:14 点「开始打印」→ 这里发现新装了字体「华文琥珀」→
+        `purge_pdf_cache()` 把 pdf_cache 里 34 份 PDF（含刚预览过的那两个表格）全删了 ⇒
+        ① 预览立刻失效（弹「还没有可预览的转换产物」）；② 打印路径只能把三个文件重转一遍。
+        现在只清"确实用到新增/移除字体"那些文件的 cached_pdf（它们本来就该按新字体重排），
+        其余原样保留 ⇒ 预览随时可用，重转产物落回同一个 key 覆盖旧文件。
 
         为什么必须作废：Word 遇到缺字体是**静默替换**的，用户中途装上 `方正书宋_GBK` 后，
         缓存里那份 PDF 还是拿宋体排的版 —— 不重转就等于"装了字体也没用"。
@@ -7025,6 +7052,32 @@ class MainWindow(QMainWindow):
             _parts.append(f"新增 {_add}")
         if _rm:
             _parts.append(f"移除 {_rm}")
+        if selective:
+            _changed = {str(x).strip().lower()
+                        for x in (list(_rep.get("added_names") or [])
+                                  + list(_rep.get("removed_names") or []))
+                        if str(x).strip()}
+            _n = 0
+            try:
+                for _tab in (self._config.tabs or {}).values():
+                    for _job in (getattr(_tab, "jobs", None) or []):
+                        _fonts = {str(x).strip().lower()
+                                  for x in (list(getattr(_job, "missing_fonts", []) or [])
+                                            + list(getattr(_job, "nonembedded_fonts", []) or []))
+                                  if str(x).strip()}
+                        if getattr(_job, "cached_pdf", "") and (_fonts & _changed):
+                            _job.cached_pdf = ""
+                            _n += 1
+                        # 字体集合变了：下一次打印前要按新指纹重新查一遍缺字体
+                        _job.font_checked = False
+                        _job.font_fp = ""
+            except Exception:
+                logger.debug("作废 cached_pdf 引用失败", exc_info=True)
+            self._log("🖋 检测到本机字体有变化"
+                      + (f"（{'；'.join(_parts)}）" if _parts else "")
+                      + (f"：{_n} 个文件会按新字体重新转换（旧 PDF 保留，预览不受影响）"
+                         if _n else "：现有 PDF 缓存都没用到这些字体，不必重转"))
+            return True
         self._log("🖋 检测到本机字体有变化"
                   + (f"（{'；'.join(_parts)}）" if _parts else "")
                   + "：已作废 PDF 转换缓存，下次打印会按新字体重新转换")
@@ -8370,6 +8423,13 @@ class MainWindow(QMainWindow):
             if ctrl.start():
                 self._tray = ctrl
                 self._log("🖥 已常驻系统托盘：关闭窗口不会退出进程，要退出请右键托盘图标 → 退出")
+                # 2026-11-11 现场（用户报「标签页管理器开着时从托盘退出，程序直接消失、订单还留着」）：
+                # Qt 默认 quitOnLastWindowClosed=True —— 主窗常驻托盘时是不可见的，最后可见的那个
+                # 对话框（标签页管理器 / 未完成确认框）一关，Qt 就直接结束事件循环，
+                # closeEvent 里「还有没打完的 / 放弃上报 / 保存配置」一步都没机会走。
+                # 常驻期间必须关掉它：真退出只有 _quit_app 一条路（它自己 QApplication.quit()）。
+                # 托盘不可用时这条不执行，仍保持默认值（关窗即退出，不会留下"没有窗口的进程"）。
+                QApplication.setQuitOnLastWindowClosed(False)
             else:
                 ctrl.deleteLater()
         except Exception as e:
@@ -8407,6 +8467,34 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.debug(f"退出前恢复主窗口失败（继续退出）: {e}")
 
+    def _close_modal_dialogs_for_quit(self):
+        """真退出前先收掉模态子窗（标签页管理器等 exec() 中的对话框）。
+
+        为什么必须先收（2026-11-11 现场）：这些窗是主窗的子窗，`exec()` 把事件循环占在
+        它们自己那一层；此时 `close()` 的收尾（未完成确认 / 放弃上报 / 保存配置）要么被挡住，
+        要么刚跑完 Qt 就按「最后可见窗口关了」把进程结束 —— 表现就是"程序直接没了、订单还在"。
+        关掉它们 = 操作员在点「退出」时也已经同意离开这一层，收尾流程随即接管。
+        """
+        try:
+            dlg = getattr(self, "_tab_manager_dialog", None)
+            if dlg is not None and dlg.isVisible():
+                dlg.reject()
+        except (AttributeError, RuntimeError):
+            pass
+        # 兜底：任何还活着的模态窗（未完成确认、补录、半成品补救…）一并收掉。
+        # 上面已经 reject 过的不再重复；最多收 5 个，防死循环。
+        try:
+            for _ in range(5):
+                modal = QApplication.activeModalWidget()
+                if modal is None or modal is self:
+                    break
+                if hasattr(modal, "reject"):
+                    modal.reject()
+                else:
+                    modal.close()
+        except (AttributeError, RuntimeError):
+            pass
+
     def _quit_app(self):
         """真正的退出（关窗口只是收回托盘）。
 
@@ -8414,8 +8502,17 @@ class MainWindow(QMainWindow):
         窗口藏在托盘里时**不**预先叫回前台 —— 只有 closeEvent 里真要弹确认框时才 show
         （见 _ensure_visible_for_close_dialog；否则会闪一下白窗口）。
         """
+        # 2026-11-11 现场：标签页管理器（exec() 模态窗）开着时从托盘退出，程序直接消失、
+        # 标签页与订单原样留在配置里。模态循环还占着事件循环，主窗的 close() 走不完收尾。
+        # 所以先把模态子窗收掉（等于点「关闭」），再让 closeEvent 正常跑确认流程。
+        self._close_modal_dialogs_for_quit()
         self._force_quit = True
+        self._close_done = False
         self.close()
+        if self._force_quit and not self._close_done:
+            # close() 没能把 closeEvent 走完（还有别的 exec() 模态窗）→ 再收一次、再试一次
+            self._close_modal_dialogs_for_quit()
+            self.close()
         # closeEvent 里任何一处 event.ignore()（用户改主意）都会把 _force_quit 复位，
         # 走到这里还亮着 ⇒ 真的退：收掉托盘图标再退进程（否则通知区留残影）。
         if self._force_quit:
@@ -10861,9 +10958,10 @@ class MainWindow(QMainWindow):
         所以这里**查源文件、不查转换后的 PDF**（对 docx 而言）：转换出来的 PDF 里写的已经是
         替换后的字体名 —— 查它永远查不出缺字体。
         """
-        # 会话中途装了/删了字体：旧缓存是按替换字体排的版 ⇒ 先作废再判定
+        # 会话中途装了/删了字体：旧缓存是按替换字体排的版 ⇒ 只作废这些文件的
+        # cached_pdf 引用（**不删文件**：删了预览就再也打不开，2026-11-11 现场）。
         try:
-            self._font_sync_epoch()
+            self._font_sync_epoch(selective=True)
         except Exception:
             logger.debug("打印前字体指纹比对失败", exc_info=True)
         try:
@@ -17136,6 +17234,10 @@ class MainWindow(QMainWindow):
                 "page_range": it.get("page_range") or "",
                 "page_count": int(it.get("page_count") or 0),
                 "display_name": it.get("display_name") or "",
+                # 2026-11-11：逐份记下路径/页数用的就是这一份 —— 收尾时按它精确找回 job。
+                # 以前只有 entry.job_keys（整张单的全部路径），多文件单的每个任务都会命中
+                # 同一个 job，剩下的那份永远不置 sent ⇒ 退出时被当成"没打印完"。
+                "file_path": it.get("file_path") or "",
             } for it in items],
             job_keys=[(it.get("task_id") or 0, it.get("file_path") or "") for it in items],
         )
@@ -17909,9 +18011,11 @@ class MainWindow(QMainWindow):
                           f"（{_stalled_rec.get('id')}）：清单与各单 PDF 都留着，"
                           "可稍后「补打第 2 趟」或「整单重打」")
                 for _entry in entries:
+                    _used: set[int] = set()
                     for _t in (_entry.tasks or []):
-                        _job = self._find_job_for_stack_task(_entry, _t)
+                        _job = self._find_job_for_stack_task(_entry, _t, used=_used)
                         if _job is not None:
+                            _used.add(id(_job))
                             _job.remedy_pending = str(_stalled_rec.get("id") or "")
                 self._save_config()
             elif ok and empty_pass2:
@@ -18119,14 +18223,17 @@ class MainWindow(QMainWindow):
                 entry_ok = False
                 entry_msg = ("第 1 趟打印失败（这一单的纸没有正常出纸/只出了一部分），"
                              "整叠第 2 趟不包含它 —— 请重打这一单")
+            used_ids: set[int] = set()   # 同一单里两份任务绝不许落到同一个 job 上（2026-11-11）
             for t in (entry.tasks or []):
                 tid = int(t.get("task_id") or 0)
                 if tid and tid in done_tasks:
                     continue
                 if tid:
                     done_tasks.add(tid)
-                job = self._find_job_for_stack_task(entry, t)
+                job = self._find_job_for_stack_task(entry, t, used=used_ids)
                 if job is not None:
+                    # 占住它：下一个任务换别的 job（以前按整单路径集合比，两个文件都命中第一个）
+                    used_ids.add(id(job))
                     self._report_job_result(job, entry_ok, entry_msg, tab_key=entry.tab_key,
                                             owner_name=t.get("owner_name", ""),
                                             is_admin_print=bool(t.get("is_admin_print", False)))
@@ -18157,7 +18264,7 @@ class MainWindow(QMainWindow):
                               f"先在新标签页里核对该文件，必要时手工补打")
         self._tick_keepalive(force=True)
 
-    def _find_job_for_stack_task(self, entry, task: dict):
+    def _find_job_for_stack_task(self, entry, task: dict, used: set | None = None):
         """按 task_id / 文件路径把纸叠清单里的任务找回成活的 PrintJob（找不到返回 None）。
 
         2026-11-10 现场（HN20261109-0008/0009）：攒批第 2 趟**打完了**，两单的纸都出槽了，
@@ -18172,31 +18279,51 @@ class MainWindow(QMainWindow):
           ④ 全部标签页按显示名比（暂存副本被重建、路径变了，但人看到的还是同一份文件）。
         """
         tid = int(task.get("task_id") or 0)
-        if tid:
-            for tab in self._config.tabs.values():
-                for job in (tab.jobs or []):
-                    if int(getattr(job, "task_id", 0) or 0) == tid:
-                        return job
-        keys = {k[1] for k in (entry.job_keys or []) if len(k) > 1 and k[1]}
-        own = self._config.tabs.get(getattr(entry, "tab_key", "") or "")
-        if keys:
-            for job in (getattr(own, "jobs", None) or []):
-                if job.file_path in keys:
-                    return job
-            for tab in self._config.tabs.values():
-                if tab is own:
-                    continue
+        used = used if used is not None else set()
+
+        def _free(job) -> bool:
+            """这一份还能不能领：同一单里已经领过的 job 不许再来一次（2026-11-11）。"""
+            return job is not None and id(job) not in used
+
+        def _iter_jobs():
+            """先本单那一页、后全部标签页（号错了也能找回来）。"""
+            own = self._config.tabs.get(getattr(entry, "tab_key", "") or "")
+            tabs = ([own] if own is not None else []) + [
+                t for t in self._config.tabs.values() if t is not own]
+            for tab in tabs:
                 for job in (getattr(tab, "jobs", None) or []):
-                    if job.file_path in keys:
-                        return job
+                    yield job
+
+        if tid:
+            for job in _iter_jobs():
+                if int(getattr(job, "task_id", 0) or 0) == tid and _free(job):
+                    return job
+        # ① 逐份记下的文件路径（2026-11-11 起清单里就有；旧清单没有这一项）
+        tpath = str(task.get("file_path") or "")
+        if tpath:
+            for job in _iter_jobs():
+                if (getattr(job, "file_path", "") or "") == tpath and _free(job):
+                    return job
+        # ② 逐份记下的显示名（暂存副本被重建、路径变了，人看到的还是同一份文件）
         name = str(task.get("display_name") or "").strip()
         if name:
-            for tab in self._config.tabs.values():
-                for job in (getattr(tab, "jobs", None) or []):
-                    shown = str(getattr(job, "display_name", "") or
-                                os.path.basename(getattr(job, "file_path", "") or "")).strip()
-                    if shown and shown == name:
+            for job in _iter_jobs():
+                shown = str(getattr(job, "display_name", "") or
+                            os.path.basename(getattr(job, "file_path", "") or "")).strip()
+                if shown and shown == name and _free(job):
+                    return job
+        # ③ 退回"入叠那一页记下的全部路径"（旧清单只有这一层）。⚠ 必须带 used 过滤、
+        #    并优先还没置 sent 的那一个：以前这里对整单的每个任务都返回同一个 job，
+        #    多文件单只有第一份被标成已完成，其余的退出时被当成"没打印完"。
+        keys = {k[1] for k in (entry.job_keys or []) if len(k) > 1 and k[1]}
+        if keys:
+            cands = [job for job in _iter_jobs()
+                     if (getattr(job, "file_path", "") or "") in keys and _free(job)]
+            if cands:
+                for job in cands:
+                    if not getattr(job, "sent", False):
                         return job
+                return cands[0]
         return None
 
     # ── 打印中保活（后端 3 分钟反馈超时 / 5 分钟孤儿回退的解药）──
@@ -21207,6 +21334,8 @@ class MainWindow(QMainWindow):
         if self._stats_server:
             self._stats_server.stop()
 
+        # 走到这里说明「确认退出」的收尾确实跑完了（_quit_app 据此判断 close() 是否生效）
+        self._close_done = True
         super().closeEvent(event)
 
 

@@ -224,6 +224,41 @@ def install_crash_handlers(logger=None) -> str:
     return fh_path if _CRASH_FH is not None else ""
 
 
+# ═══════════════════════════════════════════════════════════════
+# 打印原生模块预热（2026-11-11 现场卡死）
+# ═══════════════════════════════════════════════════════════════
+# 现场：打印机断电、但 USB 还连着，点「开始打印」后整个进程**无声消失**（应用日志
+# 从 20:57:11 直接空白到 21:03 重启），用户看到的就是"卡死"。
+# 取证（logs/crash_faulthandler.log，20:55:05 那次）：
+#   · 打印线程：`<frozen importlib._bootstrap> create_module` ←
+#     `pdf_printer.py:1490 in _print_pdf_native`（该函数体里才 `import win32print /
+#     win32ui / win32con` —— 惰性 import 全在打印线程上）
+#   · 主线程：`Garbage-collecting` ← `enum.py` 建类 ← `gui.py:1286 in announce()`
+#   ⇒ 打印线程在**首次加载 pywin32 原生扩展**（win32ui 会初始化 MFC），同一刻主线程在
+#     垃圾回收里分配对象 ⇒ 访问违例（0xC0000005），Python 层没有 traceback。
+# 修法：所有原生扩展都在**主线程、任何 QThread 起来之前**加载完；打印线程里那些
+#      `import win32print/win32ui/win32con` 就退化成查 sys.modules 的 no-op，不再是
+#      "边打边加载 C 扩展"。打印路径一行都没改（惰性 import 保留，兼容不装 pywin32 的场景）。
+_PRELOAD_MODULES = ("fitz", "win32print", "win32con", "pywintypes", "win32api",
+                    "win32ui", "win32gui")
+
+
+def preload_native_modules(logger=None) -> list:
+    """主线程预热打印路径会用到的原生扩展，返回加载失败的模块名（空列表 = 全好）。"""
+    failed: list = []
+    for name in _PRELOAD_MODULES:
+        try:
+            __import__(name)
+        except Exception as e:      # 缺 pywin32 / 没有显示器环境等都不该拦住启动
+            failed.append(name)
+            if logger:
+                logger.warning(f"预热 {name} 失败（打印路径可能退化）: "
+                               f"{type(e).__name__}: {e}")
+    if logger and not failed:
+        logger.info("打印原生模块已预热（" + " / ".join(_PRELOAD_MODULES) + "）")
+    return failed
+
+
 def main():
     """主函数。"""
     # ── 强制 UTF-8 输出（打包后 Windows 默认 stdout/stderr 为 GBK，
@@ -282,6 +317,14 @@ def main():
         install_crash_handlers(logger)
     except Exception as e:
         logger.warning(f"崩溃取证安装失败（不影响使用）: {e}")
+
+    # ── 原生扩展主线程预热（2026-11-11 打印中 access violation 那次）──
+    # 必须在 QApplication/MainWindow（会起 QThread）之前：让 win32ui 的 MFC 初始化与
+    # 其它 C 扩展的加载都发生在主线程，打印线程里就只剩查表。
+    try:
+        preload_native_modules(logger)
+    except Exception as e:
+        logger.warning(f"打印原生模块预热失败（不影响使用）: {e}")
 
     # ── 单实例锁：已有实例在运行时，通知其将窗口置于前台，本实例直接退出 ──
     from single_instance import acquire

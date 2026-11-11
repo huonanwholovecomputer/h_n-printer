@@ -157,18 +157,61 @@ check("⑤-a 云端单找不到 job → 仍 report_success(401)",
 check("⑤-b 云端单不走「本地留痕」分支（它有 task_id 兜底）",
       not any("找不回任务记录" in s for s in w5._logs), f"{w5._logs}")
 
+print("== ⑦ 一单两个文件：两份都要标成已完成（2026-11-11 现场） ==")
+# 现场：tab1/2/3 都是「6 页那份 sent=True / 1 页那份 sent=False」成对出现。
+# 原因是收尾按「整单全部路径」比，两个任务都命中第一个 job。
+w7 = new_win()
+ja = make_job("e1")          # 6 页那份
+jb = make_job("e2")          # 1 页那份
+w7._config.tabs["1"].jobs = [ja, jb]
+e7 = make_entry("1", 7, [ja, jb])
+for _t in e7.tasks:          # 模拟旧清单：tasks 里还没有 file_path
+    _t.pop("file_path", None)
+w7._finish_stack_entries([e7], True, "ok")
+check("⑦-a 两份都标成已完成（不许只有第一份）",
+      ja.sent is True and jb.sent is True, f"a={ja.sent} b={jb.sent}")
+check("⑦-b 两份都标成已完成时不留「找不回」告警（一单两份都在本页）",
+      not any("找不回任务记录" in s for s in w7._logs), f"{w7._logs}")
+
+# 新清单形态：tasks 自带 file_path ⇒ 逐份精确命中（哪怕两个 job 的显示名一样）
+w7b = new_win()
+jc = make_job("e3")
+jd = make_job("e4")
+jd.display_name = jc.display_name            # 显示名撞车，只能靠路径区分
+w7b._config.tabs["1"].jobs = [jc, jd]
+e7b = make_entry("1", 8, [jc, jd])
+for _t, _j in zip(e7b.tasks, (jc, jd)):
+    _t["file_path"] = _j.file_path
+w7b._finish_stack_entries([e7b], True, "ok")
+check("⑦-c 显示名撞车也能靠逐份 file_path 各归各",
+      jc.sent is True and jd.sent is True, f"c={jc.sent} d={jd.sent}")
+
 print("== ⑥ 源码层 ==")
 _src = io.open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
 _find = _src.split("def _find_job_for_stack_task", 1)[1].split("\n    def ", 1)[0]
 check("⑥-a 查找顺序第一级是 task_id", "getattr(job, \"task_id\"" in _find)
-check("⑥-b 有「全部标签页按路径」的兜底层",
-      "for tab in self._config.tabs.values():" in _find and _find.count("file_path in keys") >= 2,
-      f"count={_find.count('file_path in keys')}")
+check("⑥-b 有「先本单那一页、后全部标签页」的遍历（_iter_jobs）",
+      "def _iter_jobs()" in _find and "own = self._config.tabs.get(getattr(entry, \"tab_key\"" in _find,
+      "缺 _iter_jobs / own 页优先")
+check("⑥-b2 先按逐份 file_path、再按逐份显示名，整单 keys 只做兜底",
+      'tpath = str(task.get("file_path")' in _find
+      and 'in keys' in _find and "_iter_jobs()" in _find,
+      "缺逐份路径一级或整单 keys 兜底")
+check("⑥-b3 同一单里领过的 job 不许再领一次（used 集合）",
+      "_free(job)" in _find and "id(job) not in used" in _find,
+      "缺 used 去重")
+check("⑥-b4 整单 keys 兜底时优先还没置 sent 的那一个",
+      "if not getattr(job, \"sent\", False):" in _find,
+      "兜底层没优先挑未完成的")
 check("⑥-c 有「按显示名」的最后一级",
       "display_name" in _find and "shown == name" in _find)
 _fin = _src.split("def _finish_stack_entries(self", 1)[1].split("\n    def ", 1)[0]
 check("⑥-d 收尾对「本地单找不到 job」有留痕分支", "elif not tid:" in _fin)
 check("⑥-e 留痕文案含「找不回任务记录」", "找不回任务记录" in _fin)
+check("⑥-f 收尾按「逐份、不重复」找回（传 used 并占位）",
+      "used=used_ids" in _fin and "used_ids.add(id(job))" in _fin, "缺 used 传递/占位")
+check("⑥-g 入叠清单逐份记下 file_path（旧清单只有 entry.job_keys）",
+      '"file_path": it.get("file_path") or ""' in _src, "tasks 里没有 file_path")
 
 print()
 if _fails:
