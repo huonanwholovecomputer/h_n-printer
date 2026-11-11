@@ -1,9 +1,9 @@
 {
-  "version": "4.6.10",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.10.exe",
-  "md5": "1349f6e1754440fe0f198c09baecc897",
-  "sha256": "1e7e637f7fa7ba7de1aa8cd84947195299c8cd81cf3376886f35911cdeb6ae3f",
-  "notes": "v4.6.10：两处「纸打了、程序不认账」的修复。① 攒批整叠第 2 趟打完后，如果那一页被删过或重编号过，程序会认不回这叠纸，退出时弹「还有没打印完的文件」并把这些单按「放弃打印」上报 —— 现在标签页重编号时，纸叠清单里的归属页会一起搬；真的找不回也会明确告诉你哪一份要人工核对，不再静默。② 结算页「用户」下拉里不再出现从没下过单的自动生成占位昵称（user_xxxxxxxx）。",
+  "version": "4.6.11",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.11.exe",
+  "md5": "d71d13eccd187ee78702df87baa4872a",
+  "sha256": "955b6cfb5defc18ed8a94a5a5c99d86f077260a9fa202c01dbb3de0b32521d4c",
+  "notes": "v4.6.11：五处现场问题的修复。① 手动双面第 2 趟不再等程序判定：窗口一出现按钮就能点，你按下它的那一刻就是第 1 趟结束（第 1 趟还没出完纸时点也算数），程序不再等打印队列排空、也不再按预估时间自己放行。② 修好了「Excel 预览在点开始打印后失效」：原因是打印前的字体检查把 PDF 缓存整批删掉了，现在改成只作废受影响的条目、不删文件，预览与打印复用同一份产物，不会再莫名其妙重转一遍。③ 修好了打印机断电（USB 还连着）时点打印会让程序整个消失的问题：改为启动时先把打印相关的系统组件加载好。④ 攒批里一个订单有多个文件时，收尾只把第一份标成「已完成」，其余被当成没打印 ⇒ 退出时误弹「还有没打印完的文件」。现在逐份认领、一份只标一次。⑤ 标签页管理器开着时从托盘点退出，程序会直接消失、订单原样留在标签页里（确认框与放弃上报都没执行）。现在退出一定先走确认流程，选择「取消」就真的不退出。",
   "sig_algo": "ed25519",
-  "sig": "3I4MtEtd2lZeESz6TttmYe9BR+i1C59qM2cG441TaAjzcxgVpejJChBeFgcc06rj1kJsfaGD9qW0PXm2bXrCBw=="
+  "sig": "iV0uc3qbg2vAjlGfYm1HNW8/twEc6jXE6IOrb5uxxCp8kL6joI1Flj8SM61FcCQkgyzuBsX+MrGhF7+SUM2gAw=="
 }
