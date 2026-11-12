@@ -7045,13 +7045,23 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   max-height: 46vh;
   overflow-y: auto;
 }
+/* 2026-11-12：行内可展开详情 ⇒ 行本身改成 block，flex 下移到 .myfile-head。
+   （原来的 flex 行会把详情挤到右侧、宽度被「删除」胶囊吃掉） */
 .myfile-row {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 2.16cqw 0;
+  border-bottom: 0.13cqw solid rgba(120, 120, 128, 0.18);
+}
+.myfile-row-open {
+  background: rgba(120, 120, 128, 0.06);
+}
+.myfile-head {
   display: flex;
   align-items: center;
   width: 100%;
   box-sizing: border-box;
-  padding: 2.4cqw 0;
-  border-bottom: 0.13cqw solid rgba(120, 120, 128, 0.18);
 }
 .myfile-main {
   flex: 1;
@@ -7090,6 +7100,72 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   font-size: 2.8cqw;
   color: var(--text-tertiary);
   background: rgba(120, 120, 128, 0.14);
+}
+/* ===== 行内详情（2026-11-12 用户要求：点文件 → 卡片内看时间/大小/1024 预览图）===== */
+.myfile-caret {
+  margin-left: 1.2cqw;
+  /* 右留 0.8cqw：行没有左右内边距，不留箭头会贴着卡片边缘被裁掉半个 */
+  margin-right: 0.8cqw;
+  font-size: 2.4cqw;
+  color: var(--text-tertiary);
+}
+.myfile-detail {
+  margin-top: 1.68cqw;
+  padding: 1.92cqw 2.16cqw;
+  border-radius: 1.92cqw;
+  background: rgba(120, 120, 128, 0.08);
+}
+.myfile-preview-wrap {
+  width: 100%;
+  box-sizing: border-box;
+}
+/* 1024×1024 的 JPEG 原图按 aspectFit 缩进卡片：固定高度 + 灰底，避免纵横比不同的
+   PDF 页/照片把卡片撑高到看不见下面的字段 */
+.myfile-preview {
+  display: block;
+  width: 100%;
+  height: 36cqw;
+  border-radius: 1.44cqw;
+  background: rgba(120, 120, 128, 0.10);
+  object-fit: contain;
+}
+.myfile-preview-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 21.6cqw;
+  border-radius: 1.44cqw;
+  background: rgba(120, 120, 128, 0.10);
+}
+.myfile-preview-icon {
+  font-size: 6.24cqw;
+}
+.myfile-preview-tip {
+  margin-top: 0.96cqw;
+  padding: 0 2.4cqw;
+  font-size: 2.4cqw;
+  color: var(--text-tertiary);
+  text-align: center;
+}
+.myfile-kv {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-top: 1.2cqw;
+}
+.myfile-k {
+  flex: none;
+  font-size: 2.52cqw;
+  color: var(--text-tertiary);
+}
+.myfile-v {
+  flex: 1;
+  margin-left: 2.4cqw;
+  font-size: 2.52cqw;
+  color: var(--text-primary);
+  text-align: right;
+  word-break: break-all;
 }
 .myfiles-more {
   padding: 2.13cqw 0;

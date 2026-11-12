@@ -64,6 +64,9 @@ ENV_REQUIRED: dict[str, str] = {
     "verify_me_layout_render.mjs": "需 Playwright / 真实浏览器（「我」页首屏到底能看到什么、区块谁先谁后"
                                    "只能靠真实渲染量：桩后端 + 真实 www/，并同时渲染 git HEAD 的旧版作对照；"
                                    "--all 或直接 node 可跑）",
+    "verify_myfile_detail_render.mjs": "需 Playwright / 真实浏览器（「我的文件」点行展开后的行高变化、"
+                                       "1024 预览图是否真解码、详情有没有横向溢出，只能靠真实布局量："
+                                       "桩后端 + 真实 www/；--all 或直接 node 可跑）",
     "verify_order_status_edit_render.mjs": "需 Playwright / 真实浏览器（订单状态订正的解锁弹窗、"
                                           "箭头渲染与订正后 KPI 变化只能靠真实渲染 + 真实 Web Crypto 校验；"
                                           "桩后端 + 真实 settlement.html；--all 或直接 node 可跑）",

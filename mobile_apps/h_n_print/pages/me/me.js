@@ -170,6 +170,8 @@ Component({
     myFilesLoading: false,
     myFilesPage: 0,
     myFilesTotal: 0,
+    // 2026-11-12：当前展开详情的文件 id（同一时间只展开一个；空串 = 全部收起）
+    myFilesDetailId: '',
     pageSizeDropdownLeft: 0,   // 分页下拉 fixed 定位（viewport 坐标）
     pageSizeDropdownTop: 0,
     statusMap: {
@@ -1589,7 +1591,8 @@ Component({
     // 删除我的文件入口：GET /api/my_files 列出自己的文件（含保留期与到期时间），
     // DELETE /api/file/<id> 真正删除（服务端再判属主/活跃订单，409 时提示等订单结束）。
     onOpenMyFiles() {
-      this.setData({ showMyFiles: true, myFilesClosing: false })
+      // 每次打开都从「全部收起」开始：上次展开的那一行可能已经被删/已换页
+      this.setData({ showMyFiles: true, myFilesClosing: false, myFilesDetailId: '' })
       this.loadMyFiles(true)
     },
 
@@ -1606,16 +1609,46 @@ Component({
       return (n / (1024 * 1024)).toFixed(1) + ' MB'
     },
 
+    // 2026-11-12（用户要求）：点一行 → 在该行卡片**内部**展开详情（上传时间 / 大小 / 页数 /
+    // 所属订单 / 1024 预览图）。预览图是 <image src>，带不了 Authorization 头 ⇒ 用后端
+    // 支持的 ?token= 拼在 URL 上（app.py「文件预览图」一节）；has_preview=false 的类型
+    // （doc/docx/xls/ppt…）根本不发请求，直接显示类型图标 —— 后端没有 Office 渲染能力。
+    _myFileTypeIcon(name) {
+      const ext = String(name || '').toLowerCase().split('.').pop()
+      if (ext === 'pdf') return '📕'
+      if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff'].indexOf(ext) >= 0) return '🖼'
+      if (['doc', 'docx'].indexOf(ext) >= 0) return '📘'
+      if (['xls', 'xlsx'].indexOf(ext) >= 0) return '📗'
+      if (['ppt', 'pptx'].indexOf(ext) >= 0) return '📙'
+      return '📄'
+    },
+
     _decorateMyFile(f) {
       const hours = Number(f.retention_hours) || 0
       const retentionText = f.retention_label || (hours < 0
         ? '打印完成后立即删除'
         : (hours > 0 ? ('保留 ' + (hours >= 24 && hours % 24 === 0 ? (hours / 24) + ' 天' : hours + ' 小时')) : '不自动删除'))
       const expireText = f.auto_delete_at ? ('将于 ' + f.auto_delete_at + ' 自动删除') : retentionText
+      const previewPath = String(f.preview_url || '')
+      const token = (wx.getStorageSync('token') || '')
+      const previewUrl = (f.has_preview !== false && previewPath)
+        ? (CONFIG.BASE_URL + previewPath + (previewPath.indexOf('?') >= 0 ? '&' : '?') +
+           'token=' + encodeURIComponent(token))
+        : ''
+      const pages = Number(f.page_count) || 0
       return Object.assign({}, f, {
         sizeText: this._fmtFileSize(f.size),
         retentionText: retentionText,
         expireText: expireText,
+        previewUrl: previewUrl,
+        previewFailed: false,
+        previewTip: f.has_preview === false
+          ? '该类型没有预览图（仅图片与 PDF 有）'
+          : '预览图暂不可用（服务端渲染不了该文件）',
+        typeIcon: this._myFileTypeIcon(f.original_name),
+        createdAtText: f.created_at ? String(f.created_at) : '未知',
+        pageCountText: pages > 0 ? (pages + ' 页') : '',
+        orderText: f.order_number ? String(f.order_number) : '未下单（仅上传）',
       })
     },
 
@@ -1652,6 +1685,28 @@ Component({
       this.loadMyFiles(false)
     },
 
+    // 点行 = 展开/收起该行详情（同一时间只展开一个；再点同一行收起）
+    onToggleMyFileDetail(e) {
+      const fileId = (e && e.currentTarget && e.currentTarget.dataset)
+        ? (e.currentTarget.dataset.id || '') : ''
+      if (!fileId) return
+      this.setData({
+        myFilesDetailId: this.data.myFilesDetailId === fileId ? '' : fileId,
+      })
+    },
+
+    // 预览图加载失败（415 / 403 / 网络）→ 静默退回类型图标，不弹错误框：
+    // 预览图是锦上添花，不能因为它把整行详情搞红。
+    onMyFilePreviewError(e) {
+      const fileId = (e && e.currentTarget && e.currentTarget.dataset)
+        ? (e.currentTarget.dataset.id || '') : ''
+      if (!fileId) return
+      const list = (this.data.myFiles || []).map(f => (
+        f.file_id === fileId ? Object.assign({}, f, { previewFailed: true }) : f
+      ))
+      this.setData({ myFiles: list })
+    },
+
     onDeleteMyFile(e) {
       const fileId = e.currentTarget.dataset.id
       const name = e.currentTarget.dataset.name || '该文件'
@@ -1666,7 +1721,11 @@ Component({
             const d = (res && res.data) || {}
             if (res.statusCode === 200 && d.success) {
               const list = (this.data.myFiles || []).filter(f => f.file_id !== fileId)
-              this.setData({ myFiles: list, myFilesTotal: Math.max(0, (Number(this.data.myFilesTotal) || 1) - 1) })
+              this.setData({
+                myFiles: list,
+                myFilesTotal: Math.max(0, (Number(this.data.myFilesTotal) || 1) - 1),
+                myFilesDetailId: this.data.myFilesDetailId === fileId ? '' : this.data.myFilesDetailId,
+              })
               wx.showToast({ title: '已删除', icon: 'success' })
             } else {
               wx.showToast({ title: (d && d.message) || '删除失败，请稍后重试', icon: 'none', duration: 2500 })

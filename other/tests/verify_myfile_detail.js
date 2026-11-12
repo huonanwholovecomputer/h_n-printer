@@ -1,0 +1,399 @@
+/* eslint-disable */
+/**
+ * 「我的文件」点开看详情（小程序 + APP）· 验收
+ *
+ * 用户要求（2026-11-12 原话）：「在移动端的云端文件管理那里，需要支持点击文件列表中的
+ * 文件然后在卡片内展示该文件的详细信息，比如时间、大小、1024x1024 略缩图等信息。」
+ *
+ * 背景（为什么现在才有）：后端 2026-11-05 那批（commit 9a7f24f）只落了后端 ——
+ *   GET /api/file_preview/<id>（懒生成、≤1024×1024 JPEG、?token= 鉴权）+
+ *   /api/my_files 每项补 order_id / order_number / has_preview / preview_url，
+ *   当次提交里明确写着「前端（小程序/APP 详情页）下一轮接」。前端一直没接 ⇒ 用户点了没反应。
+ *
+ * 本脚本钉住的是「接上了」的四件事：
+ *   ① 点行展开/收起（同一时间只展开一行；点「删除」不触发展开；点详情内部不收起）；
+ *   ② 详情内容：上传时间 / 大小 / 页数 / 所属订单 / 保留期 / 状态；
+ *   ③ 1024 预览图：has_preview 且 preview_url 才拼 <image src>/<img src>，必须带
+ *     ?token=（<image>/<img> 带不了 Authorization 头）；失败/无能力时静默退回类型图标；
+ *   ④ 两端样式盘得住：行改 block、头部 flex 下移、预览图固定高度。
+ *
+ * 运行：node other/tests/verify_myfile_detail.js
+ */
+const fs = require('fs');
+const path = require('path');
+
+const REPO = path.resolve(__dirname, '..', '..');
+const MP = path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'me');
+const APP = path.join(REPO, 'mobile_apps', 'android_app', 'www');
+const BACKEND = path.join(REPO, 'mobile_apps', 'printer-backend', 'app.py');
+
+let failures = 0;
+function check(name, cond, detail) {
+  if (!cond) failures++;
+  console.log('[' + (cond ? 'PASS' : 'FAIL') + '] ' + name + (detail ? '  -- ' + detail : ''));
+}
+
+const read = (p) => fs.readFileSync(p, 'utf8');
+const MP_JS = read(path.join(MP, 'me.js'));
+const MP_WXML = read(path.join(MP, 'me.wxml'));
+const MP_WXSS = read(path.join(MP, 'me.wxss'));
+const APP_ME_JS = read(path.join(APP, 'me.js'));
+const APP_APP_JS = read(path.join(APP, 'app.js'));
+const APP_INDEX = read(path.join(APP, 'index.html'));
+const APP_CSS = read(path.join(APP, 'styles.css'));
+const APP_PY = read(BACKEND);
+
+/* ---------- 工具：从真实源码里抠函数体（不用正则猜边界，按花括号配平） ---------- */
+function extractFn(src, name) {
+  // 形态 A：function name(...) { ... }（APP 端）
+  let idx = src.indexOf('function ' + name + '(');
+  if (idx >= 0) return sliceBraced(src, idx);
+  // 形态 B：小程序 Page 对象里的简写方法 name(...) { ... }
+  const re = new RegExp('(^|\\n)(\\s*)' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(', 'g');
+  const m = re.exec(src);
+  if (!m) return '';
+  const start = m.index + m[1].length + m[2].length;
+  return 'function ' + sliceBraced(src, start);
+}
+function sliceBraced(src, idx) {
+  let i = src.indexOf('{', idx);
+  if (i < 0) return '';
+  let depth = 0;
+  for (let j = i; j < src.length; j++) {
+    const c = src[j];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return src.slice(idx, j + 1);
+    }
+  }
+  return '';
+}
+
+/* 取某选择器的声明块（按整行/逗号分隔精确匹配，避免 .myfile-row 命中 .myfile-row-open） */
+function decl(css, selector) {
+  const lines = css.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const sels = lines[i].split(',').map((s) => s.trim().replace(/{$/, '').trim());
+    if (!sels.includes(selector)) continue;
+    let body = '';
+    for (let j = i + 1; j < lines.length; j++) {
+      body += lines[j] + '\n';
+      if (lines[j].includes('}')) return body;
+    }
+    return body;
+  }
+  return null;
+}
+
+/* ==================== 1) 小程序：模板接线 ==================== */
+console.log('\n--- 1) 小程序 me.wxml：行内展开 ---');
+
+/* 把 myFiles 那条 wx:for 的整块抠出来（从 wx:for 起，到 </scroll-view> 前） */
+const listStart = MP_WXML.indexOf('class="myfiles-list"');
+const listEnd = MP_WXML.indexOf('</scroll-view>', listStart);
+const rowBlock = (listStart >= 0 && listEnd > listStart) ? MP_WXML.slice(listStart, listEnd) : '';
+
+check('找到「我的文件」列表块', !!rowBlock && rowBlock.length > 200,
+  rowBlock ? rowBlock.length + ' 字符' : '**没找到 .myfiles-list / scroll-view**');
+check('行绑定 bindtap="onToggleMyFileDetail"',
+  /bindtap="onToggleMyFileDetail"/.test(rowBlock));
+check('行带 data-id（展开/收起按文件 id 认行）',
+  /data-id="\{\{item\.file_id\}\}"/.test(rowBlock));
+check('行 class 随展开态切换（myfile-row-open）',
+  /myfile-row \{\{myFilesDetailId === item\.file_id \? 'myfile-row-open' : ''\}\}/.test(rowBlock));
+check('「删除」仍是 catchtap（点删除不触发展开/收起）',
+  /class="myfile-del"\s+catchtap="onDeleteMyFile"/.test(rowBlock));
+check('详情块 wx:if 只对被点开的那一行渲染',
+  /wx:if="\{\{myFilesDetailId === item\.file_id\}\}"\s+class="myfile-detail"/.test(rowBlock));
+check('详情区自身 catchtap="noop"（点详情内部不收起）',
+  /class="myfile-detail"\s+catchtap="noop"/.test(rowBlock));
+check('详情紧跟在 .myfile-row 内部（不是另开一张卡）',
+  /<view class="myfile-head">[\s\S]*<\/view>\s*<view wx:if="\{\{myFilesDetailId === item\.file_id\}\}"\s+class="myfile-detail"/.test(rowBlock));
+check('<image> 用 previewUrl + aspectFit + binderror 静默降级',
+  /<image[^>]*class="myfile-preview"[^>]*src="\{\{item\.previewUrl\}\}"/.test(rowBlock) &&
+  /<image[^>]*mode="aspectFit"/.test(rowBlock) &&
+  /binderror="onMyFilePreviewError"/.test(rowBlock) &&
+  /data-id="\{\{item\.file_id\}\}"/.test(rowBlock));
+check('无预览能力时走 fallback 图标块（不是空框）',
+  /class="myfile-preview-fallback"/.test(rowBlock) &&
+  /item\.previewFailed/.test(rowBlock));
+
+const detailKvs = ['上传时间', '文件大小', '所属订单', '保留期', '状态'];
+for (const k of detailKvs) {
+  check('详情含「' + k + '」字段', new RegExp('<text class="myfile-k">' + k + '</text>').test(rowBlock));
+}
+check('页数按需显示（pageCountText 不存在就不占一行）',
+  /wx:if="\{\{item\.pageCountText\}\}"/.test(rowBlock));
+check('有展开箭头（▾/▴），用户知道这行能点',
+  /class="myfile-caret"/.test(rowBlock) && /▴|▾/.test(rowBlock));
+
+/* ==================== 2) 小程序：装饰函数与交互行为 ==================== */
+console.log('\n--- 2) 小程序 me.js：decorate / 展开 / 预览失败 ---');
+
+const mpBody = [
+  extractFn(MP_JS, '_fmtFileSize'),
+  extractFn(MP_JS, '_myFileTypeIcon'),
+  extractFn(MP_JS, '_decorateMyFile'),
+  extractFn(MP_JS, 'onToggleMyFileDetail'),
+  extractFn(MP_JS, 'onMyFilePreviewError'),
+].filter(Boolean).join('\n\n');
+
+check('抠到 5 个函数（_fmtFileSize/_myFileTypeIcon/_decorateMyFile/onToggleMyFileDetail/onMyFilePreviewError）',
+  mpBody.split('function ').length - 1 === 5, mpBody ? 'ok' : '**抽取失败**');
+
+const MP_TOKEN = 'tok+9/1';
+const wxStub = { getStorageSync: (k) => (k === 'token' ? MP_TOKEN : '') };
+const CONFIG_STUB = { BASE_URL: 'https://api.test' };
+const mpApi = new Function('wx', 'CONFIG',
+  mpBody + '\nreturn { _fmtFileSize: _fmtFileSize, _myFileTypeIcon: _myFileTypeIcon, ' +
+  '_decorateMyFile: _decorateMyFile, onToggleMyFileDetail: onToggleMyFileDetail, ' +
+  'onMyFilePreviewError: onMyFilePreviewError };')(wxStub, CONFIG_STUB);
+
+/* Page 实例：_decorateMyFile 里用 this._fmtFileSize / this._myFileTypeIcon，
+   所以这两个必须先挂上去（真实页面里它们是同一个 Page 对象上的方法） */
+const mpCtx = {
+  data: { myFiles: [], myFilesDetailId: '' },
+  setData(o) { Object.assign(this.data, o); },
+  _fmtFileSize: mpApi._fmtFileSize,
+  _myFileTypeIcon: mpApi._myFileTypeIcon,
+};
+
+const pdfFile = mpApi._decorateMyFile.call(mpCtx, {
+  file_id: '7', original_name: '作业.pdf', size: 2048, page_count: 3,
+  created_at: '2026-11-12 20:01:00', has_preview: true,
+  preview_url: '/api/file_preview/7', order_number: 'HN20261112-0001',
+  retention_hours: 24, auto_delete_at: '2026-11-13 20:01:00',
+});
+check('PDF：previewUrl 拼上 ?token=（并且 URL 编码 + /）',
+  pdfFile.previewUrl === 'https://api.test/api/file_preview/7?token=' + encodeURIComponent(MP_TOKEN),
+  pdfFile.previewUrl);
+check('PDF：上传时间/页数/所属订单/大小 都解出来',
+  pdfFile.createdAtText === '2026-11-12 20:01:00' && pdfFile.pageCountText === '3 页' &&
+  pdfFile.orderText === 'HN20261112-0001' && pdfFile.sizeText === '2.0 KB',
+  [pdfFile.createdAtText, pdfFile.pageCountText, pdfFile.orderText, pdfFile.sizeText].join(' | '));
+check('PDF：类型图标 📕，previewFailed 初始 false',
+  pdfFile.typeIcon === '📕' && pdfFile.previewFailed === false);
+
+const docxFile = mpApi._decorateMyFile.call(mpCtx, {
+  file_id: '8', original_name: 'a.docx', size: 100, page_count: 0,
+  created_at: '2026-11-01 10:00:00', has_preview: false, preview_url: '',
+});
+check('docx：没有预览图 ⇒ previewUrl 为空（不发请求）+ 图标 📘',
+  docxFile.previewUrl === '' && docxFile.typeIcon === '📘');
+check('docx：提示写明「仅图片与 PDF 有」', docxFile.previewTip.indexOf('仅图片与 PDF') >= 0,
+  docxFile.previewTip);
+check('无页数 ⇒ pageCountText 空串（详情不占一行）', docxFile.pageCountText === '');
+check('无订单 ⇒ 所属订单显示「未下单（仅上传）」', docxFile.orderText === '未下单（仅上传）');
+check('无 created_at ⇒ 显示「未知」（不是 undefined）', mpApi._decorateMyFile.call(mpCtx, {
+  file_id: '9', original_name: 'x.pdf', has_preview: true, preview_url: '/api/file_preview/9',
+}).createdAtText === '未知');
+
+const legacy = mpApi._decorateMyFile.call(mpCtx, {
+  file_id: '10', original_name: 'x.pdf', has_preview: undefined,
+  preview_url: '/api/file_preview/10',
+});
+check('老后端没 has_preview 字段时仍拼预览 URL（!== false 口径，不会一升级就丢预览）',
+  legacy.previewUrl.indexOf('/api/file_preview/10') > 0, legacy.previewUrl);
+
+/* 展开/收起：再点同一行收起，点别行切换 */
+mpCtx.data.myFiles = [pdfFile, docxFile];
+mpCtx.data.myFilesDetailId = '';
+const ev = (id) => ({ currentTarget: { dataset: { id } } });
+mpApi.onToggleMyFileDetail.call(mpCtx, ev('7'));
+check('点行 → 展开（myFilesDetailId = 7）', mpCtx.data.myFilesDetailId === '7');
+mpApi.onToggleMyFileDetail.call(mpCtx, ev('7'));
+check('再点同一行 → 收起（空串）', mpCtx.data.myFilesDetailId === '');
+mpApi.onToggleMyFileDetail.call(mpCtx, ev('7'));
+mpApi.onToggleMyFileDetail.call(mpCtx, ev('8'));
+check('点另一行 → 切换（只展开一个）', mpCtx.data.myFilesDetailId === '8');
+mpApi.onToggleMyFileDetail.call(mpCtx, ev(''));
+check('没有 data-id 的事件被忽略（不把状态弄成空字符串以外的怪值）',
+  mpCtx.data.myFilesDetailId === '8');
+
+/* 预览图失败：只把那一条退回图标，展开态与其它行不变 */
+mpCtx.data.myFiles = [
+  mpApi._decorateMyFile.call(mpCtx, { file_id: '7', original_name: 'a.pdf', has_preview: true, preview_url: '/api/file_preview/7' }),
+  mpApi._decorateMyFile.call(mpCtx, { file_id: '8', original_name: 'b.pdf', has_preview: true, preview_url: '/api/file_preview/8' }),
+];
+mpCtx.data.myFilesDetailId = '7';
+mpApi.onMyFilePreviewError.call(mpCtx, ev('7'));
+check('预览失败 ⇒ 该行 previewFailed=true（退回图标，不弹错误）',
+  mpCtx.data.myFiles[0].previewFailed === true);
+check('预览失败不影响别的行', mpCtx.data.myFiles[1].previewFailed === false);
+check('预览失败不收起详情', mpCtx.data.myFilesDetailId === '7');
+
+check('删除成功的分支里会把已删文件的展开态清掉',
+  /myFilesDetailId: this\.data\.myFilesDetailId === fileId \? '' : this\.data\.myFilesDetailId/.test(MP_JS));
+check('每次打开「我的文件」都从全部收起开始',
+  /showMyFiles: true, myFilesClosing: false, myFilesDetailId: ''/.test(MP_JS));
+
+/* ==================== 3) APP：装饰 / 渲染 / 点击 ==================== */
+console.log('\n--- 3) APP www/me.js：decorate / render / click ---');
+
+const escHtmlSrc = extractFn(APP_APP_JS, 'escHtml');
+const appBody = [
+  escHtmlSrc,
+  extractFn(APP_ME_JS, 'fmtMyFileSize'),
+  extractFn(APP_ME_JS, 'myFileTypeIcon'),
+  extractFn(APP_ME_JS, 'decorateMyFile'),
+  extractFn(APP_ME_JS, 'myfileKv'),
+  extractFn(APP_ME_JS, 'renderMyFiles'),
+  extractFn(APP_ME_JS, 'toggleMyFileDetail'),
+  extractFn(APP_ME_JS, 'myFilePreviewError'),
+  extractFn(APP_ME_JS, 'setupMyFiles'),
+].filter(Boolean).join('\n\n');
+
+check('抠到 8 个函数（含 escHtml）', appBody.split('function ').length - 1 === 9,
+  (appBody.split('function ').length - 1) + ' 个');
+
+const APP_TOKEN = 'tok+9/1';
+const appState = { token: APP_TOKEN, deleteCalls: [] };
+const meState = { myFiles: [], myFilesDetailId: '', myFilesLoading: false, myFilesTotal: 0, myFilesPage: 1 };
+const els = {};
+const documentStub = {
+  getElementById(id) {
+    if (!els[id]) els[id] = {
+      id, style: {}, textContent: '', innerHTML: '', _handlers: {},
+      addEventListener(ev, fn) { this._handlers[ev] = fn; },
+    };
+    return els[id];
+  },
+};
+const deleteStub = (id) => appState.deleteCalls.push(id);
+
+const appApi = new Function('document', 'state', 'BASE_URL', 'meState', 'deleteMyFile', 'showToast',
+  appBody +
+  '\nreturn { fmtMyFileSize: fmtMyFileSize, myFileTypeIcon: myFileTypeIcon, decorateMyFile: decorateMyFile, ' +
+  'myfileKv: myfileKv, renderMyFiles: renderMyFiles, toggleMyFileDetail: toggleMyFileDetail, ' +
+  'myFilePreviewError: myFilePreviewError, setupMyFiles: setupMyFiles, escHtml: escHtml };')(
+  documentStub, appState, 'https://api.test', meState, deleteStub, () => {});
+
+const appPdf = appApi.decorateMyFile({
+  file_id: '7', original_name: '作业.pdf', size: 2048, page_count: 3,
+  created_at: '2026-11-12 20:01:00', has_preview: true,
+  preview_url: '/api/file_preview/7', order_number: 'HN20261112-0001',
+  retention_hours: 24, auto_delete_at: '2026-11-13 20:01:00',
+});
+check('APP：previewUrl 用 state.token 拼 ?token=',
+  appPdf.previewUrl === 'https://api.test/api/file_preview/7?token=' + encodeURIComponent(APP_TOKEN),
+  appPdf.previewUrl);
+check('APP：时间/页数/订单同口径',
+  appPdf.createdAtText === '2026-11-12 20:01:00' && appPdf.pageCountText === '3 页' &&
+  appPdf.orderText === 'HN20261112-0001');
+check('APP：docx 无预览 ⇒ 空 URL + 📘',
+  appApi.decorateMyFile({ file_id: '8', original_name: 'a.docx', has_preview: false }).previewUrl === '' &&
+  appApi.decorateMyFile({ file_id: '8', original_name: 'a.docx', has_preview: false }).typeIcon === '📘');
+
+/* 渲染：收起态 */
+meState.myFiles = [appPdf];
+meState.myFilesDetailId = '';
+appApi.renderMyFiles();
+const htmlClosed = els['myFilesList'].innerHTML;
+check('APP 渲染（收起）：有 myfile-head / myfile-caret ▾，没有 myfile-detail',
+  htmlClosed.indexOf('myfile-head') >= 0 && htmlClosed.indexOf('▾') >= 0 &&
+  htmlClosed.indexOf('myfile-detail') < 0, htmlClosed.slice(0, 80));
+check('APP 渲染（收起）：行带 data-file-id（点击 handler 靠它认行）',
+  /class="myfile-row" data-file-id="7"/.test(htmlClosed), htmlClosed.slice(0, 120));
+
+/* 渲染：展开态 */
+meState.myFilesDetailId = '7';
+appApi.renderMyFiles();
+const htmlOpen = els['myFilesList'].innerHTML;
+check('APP 渲染（展开）：myfile-detail + 上传时间/大小/所属订单/保留期/状态',
+  ['myfile-detail', '上传时间', '文件大小', '所属订单', '保留期', '状态'].every((s) => htmlOpen.indexOf(s) >= 0));
+check('APP 渲染（展开）：<img class="myfile-preview" src=...token=...>',
+  /<img class="myfile-preview" src="https:\/\/api\.test\/api\/file_preview\/7\?token=[^"]+"/.test(htmlOpen));
+check('APP 渲染（展开）：onerror 回退钩子带 file_id',
+  htmlOpen.indexOf("onerror=\"myFilePreviewError('7')\"") >= 0);
+check('APP 渲染（展开）：箭头变 ▴ + 行加 myfile-row-open',
+  htmlOpen.indexOf('▴') >= 0 && htmlOpen.indexOf('myfile-row-open') >= 0);
+
+/* 渲染：无预览能力的类型走 fallback */
+meState.myFiles = [appApi.decorateMyFile({ file_id: '8', original_name: 'a.docx', has_preview: false })];
+meState.myFilesDetailId = '8';
+appApi.renderMyFiles();
+const htmlNoPrev = els['myFilesList'].innerHTML;
+check('APP 渲染（无预览）：fallback 图标 + 提示，且没有 <img>',
+  htmlNoPrev.indexOf('myfile-preview-fallback') >= 0 &&
+  htmlNoPrev.indexOf('仅图片与 PDF') >= 0 && htmlNoPrev.indexOf('<img') < 0);
+
+/* 渲染：预览加载失败后同一行退回 fallback */
+meState.myFiles = [appApi.decorateMyFile({
+  file_id: '7', original_name: 'a.pdf', has_preview: true, preview_url: '/api/file_preview/7',
+})];
+meState.myFilesDetailId = '7';
+appApi.myFilePreviewError('7');
+check('APP：预览失败 ⇒ 该行退回 fallback（且不弹错误）',
+  els['myFilesList'].innerHTML.indexOf('myfile-preview-fallback') >= 0);
+
+/* 点击分派：行 → 展开；详情内 → 不收起；删除胶囊 → 只删不展开 */
+appApi.setupMyFiles();
+const listEl = els['myFilesList'];
+check('setupMyFiles 装上了 click 监听', typeof listEl._handlers.click === 'function');
+/* 假 element：closest 按选择器返回自己 */
+function fakeTarget(classes) {
+  const self = {
+    classes,
+    closest(sel) {
+      const want = sel.replace('.', '');
+      return classes.indexOf(want) >= 0 ? self : null;
+    },
+    dataset: { fileId: '7', fileName: '作业.pdf' },
+  };
+  return self;
+}
+appState.deleteCalls = [];
+meState.myFilesDetailId = '';
+listEl._handlers.click({ target: fakeTarget(['myfile-row']) });
+check('点行（不碰详情/删除）⇒ 展开该行', meState.myFilesDetailId === '7');
+listEl._handlers.click({ target: fakeTarget(['myfile-detail']) });
+check('点详情内部 ⇒ 不收起（对应小程序 catchtap="noop"）', meState.myFilesDetailId === '7');
+listEl._handlers.click({ target: fakeTarget(['myfile-del']) });
+check('点「删除」⇒ 只走删除，不改展开态',
+  appState.deleteCalls.length === 1 && appState.deleteCalls[0] === '7' && meState.myFilesDetailId === '7');
+check('删除成功的分支会清掉该文件的展开态',
+  /if \(meState\.myFilesDetailId === fileId\) meState\.myFilesDetailId = ''/.test(APP_ME_JS));
+check('每次打开「我的文件」都从全部收起开始',
+  /function openMyFiles\(\) \{\n\s*\/\/[^\n]*\n\s*meState\.myFilesDetailId = '';/.test(APP_ME_JS));
+
+/* ==================== 4) 样式：两端都要「行读得下详情」 ==================== */
+console.log('\n--- 4) 样式（小程序 wxss / APP css）---');
+for (const [where, css, rowOpenPad, headFlex] of [
+  ['小程序 me.wxss', MP_WXSS, /padding:\s*18rpx 0/, /display:\s*flex/],
+  ['APP styles.css', APP_CSS, /padding:\s*2\.16cqw 0/, /display:\s*flex/],
+]) {
+  const row = decl(css, '.myfile-row');
+  const head = decl(css, '.myfile-head');
+  check(where + ' .myfile-row 改成 block（详情才能占下一行）',
+    !!row && /display:\s*block/.test(row) && rowOpenPad.test(row), row ? row.replace(/\s+/g, ' ').trim() : '**缺失**');
+  check(where + ' .myfile-head 接管 flex', !!head && headFlex.test(head) && /align-items:\s*center/.test(head));
+  const preview = decl(css, '.myfile-preview');
+  check(where + ' .myfile-preview 固定高度 + 不撑开卡片',
+    !!preview && /height:\s*\d/.test(preview) && /width:\s*100%/.test(preview),
+    preview ? preview.replace(/\s+/g, ' ').trim() : '**缺失**');
+  check(where + ' .myfile-detail 有内边距/圆角（详情是一张内嵌小卡）',
+    /padding:/.test(decl(css, '.myfile-detail') || '') && /border-radius:/.test(decl(css, '.myfile-detail') || ''));
+}
+check('APP .myfile-preview 还写了 object-fit: contain（img 不走 aspectFit）',
+  /object-fit:\s*contain/.test(decl(APP_CSS, '.myfile-preview') || ''));
+
+/* ==================== 5) 后端契约：1024 + token 鉴权仍在 ==================== */
+console.log('\n--- 5) 后端契约（别让前端拼的 URL 落空）---');
+check('后端 PREVIEW_MAX_PX = 1024（用户要求的 1024×1024）',
+  /PREVIEW_MAX_PX = 1024/.test(APP_PY));
+check('后端有 GET /api/file_preview/<file_id>',
+  /@app\.route\("\/api\/file_preview\/<file_id>"/.test(APP_PY));
+check('预览端点接受 ?token=（<image>/<img> 带不了请求头）',
+  /request\.args\.get\("token"\)/.test(APP_PY) && /def _openid_for_media/.test(APP_PY));
+check('/api/my_files 每项回 has_preview + preview_url',
+  /"has_preview": _has_preview_for/.test(APP_PY) && /"preview_url":/.test(APP_PY));
+check('/api/my_files 每项回 order_number（详情里的「所属订单」）',
+  /"order_number":/.test(APP_PY));
+check('没有预览能力时后端回 415（前端据此静默退回图标）',
+  /_has_preview_for/.test(APP_PY) && /415/.test(APP_PY));
+
+/* ==================== 汇总 ==================== */
+console.log('\n' + (failures === 0 ? '全部通过 ✅（我的文件：点行看详情 + 1024 预览图，两端）'
+  : ('失败 ' + failures + ' 条 ❌')));
+process.exit(failures === 0 ? 0 : 1);

@@ -54,6 +54,8 @@ const meState = {
   myFilesPage: 0,
   myFilesTotal: 0,
   myFilesLoading: false,
+  // 2026-11-12：当前展开详情的文件 id（同一时间只展开一个；空串 = 全部收起）
+  myFilesDetailId: '',
   _lastDataLoad: 0,
   _orderPollTimer: null,
   _keyPollTimer: null,
@@ -3157,13 +3159,40 @@ function setupMyFiles() {
   if (!list || list._wired) return;
   list._wired = true;
   list.addEventListener('click', (e) => {
-    const del = e.target && e.target.closest ? e.target.closest('.myfile-del') : null;
-    if (!del) return;
-    deleteMyFile(del.dataset.fileId, del.dataset.fileName);
+    const t = e.target;
+    if (!t || !t.closest) return;
+    const del = t.closest('.myfile-del');
+    if (del) {
+      deleteMyFile(del.dataset.fileId, del.dataset.fileName);
+      return;
+    }
+    // 详情区内部点击不收行（小程序端对应 catchtap="noop"）
+    if (t.closest('.myfile-detail')) return;
+    const row = t.closest('.myfile-row');
+    if (row && row.dataset.fileId) toggleMyFileDetail(row.dataset.fileId);
   });
 }
 
+/* 点行 = 展开/收起该行详情（2026-11-12 用户要求：点文件 → 卡片内看时间/大小/1024 预览图） */
+function toggleMyFileDetail(fileId) {
+  if (!fileId) return;
+  meState.myFilesDetailId = meState.myFilesDetailId === fileId ? '' : fileId;
+  renderMyFiles();
+}
+
+/* 预览图加载失败（415 该类型没有 / 403 / 网络）→ 静默退回类型图标，不弹错误：
+   预览图是锦上添花，不能因为它把整行详情搞红。 */
+function myFilePreviewError(fileId) {
+  if (!fileId) return;
+  const f = (meState.myFiles || []).find(x => x.file_id === fileId);
+  if (!f || f.previewFailed) return;
+  f.previewFailed = true;
+  renderMyFiles();
+}
+
 function openMyFiles() {
+  // 每次打开都从「全部收起」开始：上次展开的那一行可能已经被删/已换页
+  meState.myFilesDetailId = '';
   openModal('myFilesModal');
   loadMyFiles(true);
 }
@@ -3175,6 +3204,16 @@ function fmtMyFileSize(bytes) {
   return (n / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+function myFileTypeIcon(name) {
+  const ext = String(name || '').toLowerCase().split('.').pop();
+  if (ext === 'pdf') return '📕';
+  if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'tif', 'tiff'].indexOf(ext) >= 0) return '🖼';
+  if (['doc', 'docx'].indexOf(ext) >= 0) return '📘';
+  if (['xls', 'xlsx'].indexOf(ext) >= 0) return '📗';
+  if (['ppt', 'pptx'].indexOf(ext) >= 0) return '📙';
+  return '📄';
+}
+
 function decorateMyFile(f) {
   const hours = Number(f.retention_hours) || 0;
   const retentionText = f.retention_label || (hours < 0
@@ -3182,10 +3221,32 @@ function decorateMyFile(f) {
     : (hours > 0
       ? ('保留 ' + (hours >= 24 && hours % 24 === 0 ? (hours / 24) + ' 天' : hours + ' 小时'))
       : '不自动删除'));
+  // 预览图：<img> 带不了 Authorization 头 ⇒ 用后端支持的 ?token=（与小程序同一拼法）
+  const previewPath = String(f.preview_url || '');
+  const previewUrl = (f.has_preview !== false && previewPath)
+    ? (BASE_URL + previewPath + (previewPath.indexOf('?') >= 0 ? '&' : '?') +
+       'token=' + encodeURIComponent(state.token || ''))
+    : '';
+  const pages = Number(f.page_count) || 0;
   return Object.assign({}, f, {
     sizeText: fmtMyFileSize(f.size),
     expireText: f.auto_delete_at ? ('将于 ' + f.auto_delete_at + ' 自动删除') : retentionText,
+    retentionText: retentionText,
+    previewUrl: previewUrl,
+    previewFailed: false,
+    previewTip: f.has_preview === false
+      ? '该类型没有预览图（仅图片与 PDF 有）'
+      : '预览图暂不可用（服务端渲染不了该文件）',
+    typeIcon: myFileTypeIcon(f.original_name),
+    createdAtText: f.created_at ? String(f.created_at) : '未知',
+    pageCountText: pages > 0 ? (pages + ' 页') : '',
+    orderText: f.order_number ? String(f.order_number) : '未下单（仅上传）',
   });
+}
+
+function myfileKv(k, v) {
+  return '<view class="myfile-kv"><text class="myfile-k">' + escHtml(k) + '</text>' +
+    '<text class="myfile-v">' + escHtml(v == null ? '' : String(v)) + '</text></view>';
 }
 
 function loadMyFiles(reset) {
@@ -3226,15 +3287,37 @@ function renderMyFiles() {
   if (loading) loading.style.display = (meState.myFilesLoading && !meState.myFiles.length) ? '' : 'none';
   if (empty) empty.style.display = (!meState.myFilesLoading && !meState.myFiles.length) ? '' : 'none';
   list.innerHTML = meState.myFiles.map(f => {
+    const open = meState.myFilesDetailId === f.file_id;
     const action = f.in_active_order
       ? '<text class="myfile-busy">打印中</text>'
       : '<text class="myfile-del" data-file-id="' + escHtml(f.file_id) + '" data-file-name="' +
         escHtml(f.original_name || '') + '">删除</text>';
-    return '<view class="myfile-row">' +
-      '<view class="myfile-main">' +
-        '<text class="myfile-name">' + escHtml(f.original_name || '未命名文件') + '</text>' +
-        '<text class="myfile-meta">' + escHtml(f.sizeText + ' · ' + f.expireText) + '</text>' +
-      '</view>' + action + '</view>';
+    const preview = (!f.previewFailed && f.previewUrl)
+      ? '<img class="myfile-preview" src="' + escHtml(f.previewUrl) + '" alt=""' +
+        ' onerror="myFilePreviewError(\'' + escHtml(String(f.file_id)) + '\')">'
+      : '<view class="myfile-preview-fallback"><text class="myfile-preview-icon">' +
+        escHtml(f.typeIcon || '📄') + '</text><text class="myfile-preview-tip">' +
+        escHtml(f.previewTip || '') + '</text></view>';
+    const detail = open
+      ? ('<view class="myfile-detail">' +
+          '<view class="myfile-preview-wrap">' + preview + '</view>' +
+          myfileKv('上传时间', f.createdAtText) +
+          myfileKv('文件大小', f.sizeText) +
+          (f.pageCountText ? myfileKv('页数', f.pageCountText) : '') +
+          myfileKv('所属订单', f.orderText) +
+          myfileKv('保留期', f.expireText) +
+          myfileKv('状态', f.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除') +
+         '</view>')
+      : '';
+    return '<view class="myfile-row' + (open ? ' myfile-row-open' : '') + '"' +
+        ' data-file-id="' + escHtml(f.file_id) + '">' +
+      '<view class="myfile-head">' +
+        '<view class="myfile-main">' +
+          '<text class="myfile-name">' + escHtml(f.original_name || '未命名文件') + '</text>' +
+          '<text class="myfile-meta">' + escHtml(f.sizeText + ' · ' + f.expireText) + '</text>' +
+        '</view>' + action +
+        '<text class="myfile-caret">' + (open ? '▴' : '▾') + '</text>' +
+      '</view>' + detail + '</view>';
   }).join('');
   if (more) {
     more.style.display = (!meState.myFilesLoading && meState.myFilesTotal > meState.myFiles.length) ? '' : 'none';
@@ -3251,6 +3334,7 @@ function deleteMyFile(fileId, name) {
       if (r.status === 200 && d.success) {
         meState.myFiles = (meState.myFiles || []).filter(f => f.file_id !== fileId);
         meState.myFilesTotal = Math.max(0, (Number(meState.myFilesTotal) || 1) - 1);
+        if (meState.myFilesDetailId === fileId) meState.myFilesDetailId = '';
         renderMyFiles();
         showToast('已删除');
       } else {
