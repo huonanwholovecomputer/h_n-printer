@@ -1315,6 +1315,26 @@ try:
           win2._stack_pending_ctx.get("tab_key") == "1",
           f"ctx={win2._stack_pending_ctx}")
 
+    # ── 排队可见态（2026-11-12 用户反馈：排队之后按钮和标签页毫无变化，被读成"点了没反应"）──
+    # 排队**不是冻结**：这一单还没取号、没上报，按钮换文案但必须保持可点（再点=按新清单更新）。
+    win2._current_tab = "2"
+    win2._refresh_tab_display()
+    check("★ 排队中：按钮显示「⏳ 已排队」且仍可点（再点=按当前清单更新排队）",
+          "已排队" in win2._btn_start.text() and win2._btn_start.isEnabled()
+          and "本页已排队" in (win2._btn_start.toolTip() or ""),
+          f"{win2._btn_start.text()} / enabled={win2._btn_start.isEnabled()}")
+    check("★ 排队中：标签页徽标 ⏳ + 附加服务行提示同口径，且没有冻结（文件仍可增删）",
+          win2._tab_state_badge.text() == "⏳"
+          and win2._tab_scope_badge.text() == "⏳"
+          and win2._config.tabs["2"].frozen is False
+          and "已排队" in (win2._tab_scope_label.toolTip() or ""),
+          f"badge={win2._tab_state_badge.text()} frozen={win2._config.tabs['2'].frozen}")
+    win2._current_tab = "1"
+    win2._refresh_tab_display()
+    check("★ 排队态按标签页归属：正在打的页仍是 🔒、按钮不可点",
+          win2._tab_state_badge.text() == "🔒" and not win2._btn_start.isEnabled(),
+          f"badge={win2._tab_state_badge.text()} enabled={win2._btn_start.isEnabled()}")
+
     _prep(win2)
     ok_q2b = win2._start_print_worker([jobQ2], tab_key="2")
     check("★ 同一单重复点 → 只在原条目上更新，不排第二份（避免同一单打两遍）",
@@ -1332,6 +1352,11 @@ try:
     check("★ 自动接上的第 2 单已把上下文换成自己的标签页（收尾归属不串单）",
           win2._stack_pending_ctx.get("tab_key") == "2",
           f"ctx={win2._stack_pending_ctx}")
+    win2._current_tab = "2"
+    win2._refresh_tab_display()
+    check("★ 放行后不再停在「⏳ 已排队」（排队条目已消费 → 按钮回到真实状态）",
+          "已排队" not in win2._btn_start.text(), win2._btn_start.text())
+    win2._current_tab = "1"
 
     # 排队窗口里操作员把文件从标签页删了（这一单还没冻结）→ 不能再印已看不见的文件
     jobQ3 = make_job(PDF2, "on", name="Q3.pdf", task_id=1103, order_id=503)

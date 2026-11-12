@@ -1243,6 +1243,15 @@ class _FinWin:
         # 替身直接把真实实现借过来跑 —— 判据/出队点仍只有一份，测的就是产品逻辑本身。
         return gui.MainWindow._drain_auto_print_retry(self)
 
+    def _drain_auto_print_retry_once(self):
+        # 2026-11-12：真实现拆成「重入闸门（_drain_auto_print_retry）+ 真排空（_once）」两层，
+        # 闸门里用 self 调 _once ⇒ 替身也要有同名方法，否则 AttributeError（真机上是崩溃）。
+        return gui.MainWindow._drain_auto_print_retry_once(self)
+
+    def _pop_retry_head(self, item):
+        # 2026-11-12：出队只认队首对象身份（治嵌套事件循环重入时的空队列弹出）。
+        return gui.MainWindow._pop_retry_head(self, item)
+
     def _arm_auto_print_retry_timer(self, delay_ms=2000):
         # 2026-11-02：排空逻辑抽成 `_drain_auto_print_retry`，末尾会 arm 定时器自驱。
         # 本替身不需要定时器（队列已空/已出队），记下来供断言用。
@@ -1305,16 +1314,21 @@ check("★ 预约打印：打印机忙 → 10 秒后重试（不插队、不丢�
       and "_start_scheduled_print_timer(order_id, int(time.time()) + 10)" in src)
 # 🔴-B4-3 之后 `_on_all_finished` 内部有 3 个出队点（启动成功 / 已全打完 / 标签页已删除），
 # 所以"全局仅 1 处 pop"这个计数代理已过期。真正要钉的不变量是：
-# 「**所有**出队点都只在唯一的排空函数 `_drain_auto_print_retry` 里」——
-# 2026-11-02 起该函数被两路驱动（批次收尾 `_on_all_finished` / 定时自驱 `_pump_auto_print_retry`），
-# 但**出队判据仍然只有那一份**；别处出现 pop = 有别的代码路径偷偷丢单。
-_body_drain = src.split("def _drain_auto_print_retry", 1)[1].split("\n    def ", 1)[0]
+# 「**所有**出队点都只在唯一的排空实现里」——
+# 2026-11-02 起排空被两路驱动（批次收尾 `_on_all_finished` / 定时自驱 `_pump_auto_print_retry`）；
+# 2026-11-12 起为治「嵌套事件循环重入 ⇒ pop 空队列 ⇒ 进程崩溃」又拆成两层：
+#   `_drain_auto_print_retry`（重入闸门，薄壳）→ `_drain_auto_print_retry_once`（真排空）。
+# 出队本身全部收敛到 `_pop_retry_head`（只认队首身份），别处出现裸 pop = 有路径偷偷丢单/能崩。
+_body_once = src.split("def _drain_auto_print_retry_once", 1)[1].split("\n    def ", 1)[0]
+_body_pop = src.split("def _pop_retry_head", 1)[1].split("\n    def ", 1)[0]
 _pop_all = src.count("self._auto_print_retry.pop(0)")
-_pop_in = _body_drain.count("self._auto_print_retry.pop(0)")
-check("★ 补打队列只在 _drain_auto_print_retry 里出队（函数外零出队点 ⇒ 无静默丢单路径）",
-      _pop_in >= 1 and _pop_all == _pop_in
+_pop_in = _body_pop.count("self._auto_print_retry.pop(0)")
+check("★ 补打队列只在 _pop_retry_head 里出队（函数外零出队点 ⇒ 无静默丢单路径）",
+      _pop_in == 1 and _pop_all == _pop_in
+      and src.count("self._pop_retry_head(") >= 4
+      and "self._pop_retry_head(" in _body_once
       and "self._worker = None" in src.split("def _on_all_finished", 1)[1][:400],
-      f"排空函数内 {_pop_in} 处 / 全局 {_pop_all} 处")
+      f"出队函数内 {_pop_in} 处 / 全局 {_pop_all} 处 / 调用点 {src.count('self._pop_retry_head(')} 个")
 _start_fn = src.split("def _start_print_worker")[1].split("\n    def ")[0]
 check("★ 手动「开始打印」也走同一道门（全文件只此一处构造+启动 PrintWorker）",
       src.count("worker = PrintWorker(") == 1
@@ -1570,6 +1584,11 @@ class _LearnWin:
 
     def _log(self, msg):
         self.logs.append(msg)
+
+    def _record_speed_sample(self, sheets, seconds, label=""):
+        # 2026-11-12：写档案的那段从 `_on_duplex_speed_sample` 抽成了这个共用方法
+        # （第 2 趟的实测也走它）。假宿主不是 MainWindow 子类，按未绑定调用挂上即可。
+        return gui.MainWindow._record_speed_sample(self, sheets, seconds, label)
 
 
 # 主线程收到"权威实测"后：先用它冻结窗口计时，再写档案

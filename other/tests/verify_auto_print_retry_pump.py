@@ -276,6 +276,52 @@ check("⑥a 入队日志区分「页数还没统计完」与「打印机正忙�
 check("⑥b 旧文案「打印完成后自动补打」不再出现（它正是「要等下一批收尾」的病根）",
       "打印完成后自动补打" not in _src)
 
+# ═══════════════ ⑦ 重入安全：嵌套事件循环里再进来一次不许把队列 pop 空 ═══════════════
+# 2026-11-12 现场 HN20261112-0023（云端 status=timeout、结算页里没有它）：
+# 21:25:05 开始打印，21:25:30 进程崩掉，crash_traceback.txt 写的是
+#   IndexError: pop from empty list   （gui.py:_pump_auto_print_retry → _drain_auto_print_retry）
+# 触发链：`_start_print_worker` 取订单号时 processEvents 跑嵌套事件循环，嵌套里另一条路径
+# 已经把队首处理掉，外层回来照旧 pop(0) ⇒ 空队列弹出 ⇒ Qt 槽里抛异常 = 整个进程被杀。
+reset([{"order_id": 974, "tab_key": "1", "task_ids": [1971]}])
+seed([job_of("a.pdf")])
+_STARTED7 = []
+_depth7 = {"n": 0}
+
+
+def _reentrant_start(jobs, tab_key=None, interactive=True, stack_entry=None):
+    _STARTED7.append([getattr(j, "display_name", "") for j in jobs])
+    _depth7["n"] += 1
+    if _depth7["n"] == 1:
+        # 模拟 processEvents 期间嵌套进来的另一个排空者（_on_all_finished / 抽水定时器）
+        _gui.MainWindow._drain_auto_print_retry(win)
+        _gui.MainWindow._drain_auto_print_retry(win)
+    return True
+
+
+win._start_print_worker = _reentrant_start
+try:
+    win._drain_auto_print_retry()
+    _err7 = ""
+except Exception as e:                                  # noqa: BLE001
+    _err7 = f"{type(e).__name__}: {e}"
+check("⑦a ★ 嵌套排空不再 IndexError: pop from empty list（2026-11-12 崩溃点）",
+      not _err7, _err7)
+check("⑦b 队首只出队一次、队列清空", win._auto_print_retry == [], str(win._auto_print_retry))
+check("⑦c 嵌套那次直接退让 ⇒ 同一单只启动一次（不会重复出纸）",
+      len(_STARTED7) == 1, str(_STARTED7))
+check("⑦d 重入闸门用完复位", getattr(win, "_auto_retry_draining", "missing") is False,
+      str(getattr(win, "_auto_retry_draining", "missing")))
+
+# ⑦e 出队只认「队首还是我这一条」
+reset([{"order_id": 1}, {"order_id": 2}])
+_head = win._auto_print_retry[0]
+_other = {"order_id": 2}
+check("⑦e 传进来的不是队首 ⇒ 不弹（另一条路径已换过队，不能误删）",
+      win._pop_retry_head(_other) is False and len(win._auto_print_retry) == 2)
+check("⑦f 是队首 ⇒ 弹掉并返回 True",
+      win._pop_retry_head(_head) is True and win._auto_print_retry == [{"order_id": 2}])
+check("⑦g 队列已空时再弹不抛异常", win._pop_retry_head({"order_id": 9}) is False)
+
 print()
 print("=" * 60)
 print("全部通过 ✅" if ok_all else "存在失败 ❌")

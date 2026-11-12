@@ -423,8 +423,14 @@ check("PrintWorker 有 _pass_state（两趟状态只读展示）",
 check("_pass_state 只在 _print_manual_batch 里赋值 4 处（两趟 + 翻纸 + 清空）",
       _body("_print_manual_batch").count("self._pass_state =") == 4,
       f"{_body('_print_manual_batch').count('self._pass_state =')} 处")
-check("_pass_state 只在 __init__ 里初始化一次",
-      SRC.count('self._pass_state = ""') == 2,
+# 2026-11-12：新增「等上一批第 2 趟出完」的闸门（pass2_watch），它在自己的方法里
+# 也要写状态栏 + finally 清空 —— 所以复位点从 2 处变成 3 处（__init__ + 两处 finally）。
+check("_pass_state 新增「等待上一批第 2 趟」（插单闸门，队列窗读它显示）",
+      SRC.count('self._pass_state = "等待上一批第 2 趟"') == 1
+      and "_wait_prev_pass2_gate" in SRC,
+      f"{SRC.count('_wait_prev_pass2_gate')} 处")
+check("_pass_state 的复位点 3 处：__init__ + _print_manual_batch + 插单闸门",
+      SRC.count('self._pass_state = ""') == 3,
       f"{SRC.count('self._pass_state = ' + chr(34) + chr(34))} 处")
 
 rows_src = _body("_local_queue_rows")

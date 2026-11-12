@@ -3470,7 +3470,11 @@ function monthRange(month) {
 function selectedStatuses() {
   // 状态固定为全量（已移除状态过滤 UI）；收益统计仍只计已完成(sent)，订单数/构成按全部状态展示
   // v5：补入预约/待打印/下载中（scheduled/waiting/downloading），与后端父子订单模型对齐
-  return ['sent', 'printing', 'queued', 'failed', 'canceled', 'rejected', 'accepted', 'abandoned', 'reserved', 'offline_unknown', 'scheduled', 'waiting', 'downloading'];
+  // ⚠ 这份清单一旦带 status= 发给后端，后端就**只按这份清单过滤**（后端自己的默认白名单见
+  //   mobile_apps/printer-backend/app.py 的 admin_statistics_revenue()）。
+  //   2026-11-12 现场：这里漏了 timeout ⇒ HN20261112-0023（超时单）在明细里凭空消失，
+  //   而标签页/手机端都有它。新型号状态一律**先加到这里**，再去改展示逻辑。
+  return ['sent', 'printing', 'queued', 'failed', 'timeout', 'canceled', 'rejected', 'accepted', 'abandoned', 'reserved', 'offline_unknown', 'scheduled', 'waiting', 'downloading'];
 }
 /* 快捷区间 → 向前推的天数（含今天） */
 var _SPAN_DAYS = { '7d': 6, '30d': 29, '90d': 89, '1y': 364 };
@@ -5356,7 +5360,8 @@ function _renderOrderListHTML() {
   Object.keys(statusCount).sort(function (a, b) { return statusCount[b] - statusCount[a]; }).forEach(function (s) {
     h += '<option value="' + esc(s) + '"' + (_cloudStatusFilter === s ? ' selected' : '') + '>' + esc(statusLabel(s)) + ' (' + statusCount[s] + ')</option>';
   });
-  /* timeout 不在后端默认状态白名单里 → 动态列表可能没有它；静态补一项，保证筛选入口始终存在 */
+  /* 超时单已在取数清单里（selectedStatuses 含 timeout）⇒ 正常情况下动态列表就会带上它；
+     这里静态补一项只是兜底：当前口径区间内没有超时单时，筛选入口仍然存在 */
   if (!statusCount.timeout) h += '<option value="timeout"' + (_cloudStatusFilter === 'timeout' ? ' selected' : '') + '>超时 (0)</option>';
   h += '</select></span></h2>';
   h += _ordersPagerHTML(_ordersPage, totalPages, total, true);
