@@ -3173,11 +3173,70 @@ function setupMyFiles() {
   });
 }
 
-/* 点行 = 展开/收起该行详情（2026-11-12 用户要求：点文件 → 卡片内看时间/大小/1024 预览图） */
+/* 点行 = 展开/收起该行详情（2026-11-12 用户要求：点文件 → 卡片内看时间/大小/1024 预览图）
+
+   2026-11-13 用户要求 1「加上展开和收起动画」：这里是真 DOM，直接量高度做过渡，
+   动画结束才把 height 改回 auto / 才把节点从 innerHTML 里删掉。
+   （小程序端同一套行为，见 pages/me/me.js 的 _openMyFileDetail） */
+let myfileAnimTimer = null;
+
+function myfileRowEl(fileId) {
+  const list = document.getElementById('myFilesList');
+  // 没有真实查询能力（单测假 DOM）就当成"找不到行"：上层退回同步状态切换
+  if (!list || !fileId || typeof list.querySelectorAll !== 'function') return null;
+  const rows = list.querySelectorAll('.myfile-row');
+  for (let i = 0; i < rows.length; i += 1) {
+    if (rows[i].getAttribute('data-file-id') === String(fileId)) return rows[i];
+  }
+  return null;
+}
+
+function closeMyFileDetailAnimated(done) {
+  if (myfileAnimTimer) { clearTimeout(myfileAnimTimer); myfileAnimTimer = null; }
+  const row = myfileRowEl(meState.myFilesDetailId);
+  const detail = row ? row.querySelector('.myfile-detail') : null;
+  const finish = () => {
+    meState.myFilesDetailId = '';
+    renderMyFiles();
+    if (typeof done === 'function') done();
+  };
+  if (!detail) { finish(); return; }
+  // 先把「当前高度」钉成具体 px：height:auto → 0 之间没有可插值的起点
+  detail.style.height = detail.offsetHeight + 'px';
+  detail.style.opacity = '1';
+  void detail.offsetHeight;                       // 强制回流，别让浏览器把两次改动合并掉
+  requestAnimationFrame(() => {
+    detail.style.height = '0px';
+    detail.style.opacity = '0';
+    myfileAnimTimer = setTimeout(finish, 260);
+  });
+}
+
 function toggleMyFileDetail(fileId) {
   if (!fileId) return;
-  meState.myFilesDetailId = meState.myFilesDetailId === fileId ? '' : fileId;
+  if (meState.myFilesDetailId === fileId) { closeMyFileDetailAnimated(); return; }
+  if (myfileAnimTimer) { clearTimeout(myfileAnimTimer); myfileAnimTimer = null; }
+  meState.myFilesDetailId = fileId;
   renderMyFiles();
+  const row = myfileRowEl(fileId);
+  const detail = row ? row.querySelector('.myfile-detail') : null;
+  if (!detail) return;
+  const card = detail.querySelector('.myfile-detail-card');
+  const h = card ? card.offsetHeight : detail.scrollHeight;
+  detail.style.height = '0px';
+  detail.style.opacity = '0';
+  void detail.offsetHeight;
+  requestAnimationFrame(() => {
+    detail.style.height = h + 'px';
+    detail.style.opacity = '1';
+    myfileAnimTimer = setTimeout(() => {
+      myfileAnimTimer = null;
+      // 收尾改 auto：预览图加载完把内容撑高时不会留白/裁字
+      const still = myfileRowEl(fileId);
+      const el = still ? still.querySelector('.myfile-detail') : null;
+      if (el) el.style.height = 'auto';
+    }, 260);
+  });
 }
 
 /* 预览图加载失败（415 该类型没有 / 403 / 网络）→ 静默退回类型图标，不弹错误：
@@ -3234,9 +3293,10 @@ function decorateMyFile(f) {
     retentionText: retentionText,
     previewUrl: previewUrl,
     previewFailed: false,
+    // 2026-11-13：后端已能渲染 Office（soffice 转 PDF 取第 1 页），提示语同步改口径
     previewTip: f.has_preview === false
-      ? '该类型没有预览图（仅图片与 PDF 有）'
-      : '预览图暂不可用（服务端渲染不了该文件）',
+      ? '该类型暂不支持预览图（图片 / PDF / Word / Excel / PPT 可以）'
+      : '预览图暂不可用，可稍后重试',
     typeIcon: myFileTypeIcon(f.original_name),
     createdAtText: f.created_at ? String(f.created_at) : '未知',
     pageCountText: pages > 0 ? (pages + ' 页') : '',
@@ -3300,6 +3360,7 @@ function renderMyFiles() {
         escHtml(f.previewTip || '') + '</text></view>';
     const detail = open
       ? ('<view class="myfile-detail">' +
+          '<view class="myfile-detail-card">' +
           '<view class="myfile-preview-wrap">' + preview + '</view>' +
           myfileKv('上传时间', f.createdAtText) +
           myfileKv('文件大小', f.sizeText) +
@@ -3307,7 +3368,7 @@ function renderMyFiles() {
           myfileKv('所属订单', f.orderText) +
           myfileKv('保留期', f.expireText) +
           myfileKv('状态', f.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除') +
-         '</view>')
+         '</view></view>')
       : '';
     return '<view class="myfile-row' + (open ? ' myfile-row-open' : '') + '"' +
         ' data-file-id="' + escHtml(f.file_id) + '">' +
@@ -3316,7 +3377,7 @@ function renderMyFiles() {
           '<text class="myfile-name">' + escHtml(f.original_name || '未命名文件') + '</text>' +
           '<text class="myfile-meta">' + escHtml(f.sizeText + ' · ' + f.expireText) + '</text>' +
         '</view>' + action +
-        '<text class="myfile-caret">' + (open ? '▴' : '▾') + '</text>' +
+        '<text class="myfile-caret' + (open ? ' myfile-caret-open' : '') + '">▾</text>' +
       '</view>' + detail + '</view>';
   }).join('');
   if (more) {

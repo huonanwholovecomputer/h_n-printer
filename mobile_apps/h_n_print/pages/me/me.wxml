@@ -767,41 +767,45 @@
             </view>
             <view wx:if="{{item.in_active_order}}" class="myfile-busy">打印中</view>
             <view wx:else class="myfile-del" catchtap="onDeleteMyFile" data-id="{{item.file_id}}" data-name="{{item.original_name}}">删除</view>
-            <text class="myfile-caret">{{myFilesDetailId === item.file_id ? '▴' : '▾'}}</text>
+            <!-- 2026-11-13：箭头改成固定字形 + CSS 旋转，展开/收起有旋转动画（不再换 ▴/▾ 两个字符） -->
+            <text class="myfile-caret {{myFilesDetailId === item.file_id ? 'myfile-caret-open' : ''}}">▾</text>
           </view>
-          <view wx:if="{{myFilesDetailId === item.file_id}}" class="myfile-detail" catchtap="noop">
-            <view class="myfile-preview-wrap">
-              <image wx:if="{{item.previewUrl && !item.previewFailed}}"
-                     class="myfile-preview" src="{{item.previewUrl}}" mode="aspectFit"
-                     binderror="onMyFilePreviewError" data-id="{{item.file_id}}" />
-              <view wx:else class="myfile-preview-fallback">
-                <text class="myfile-preview-icon">{{item.typeIcon}}</text>
-                <text class="myfile-preview-tip">{{item.previewTip}}</text>
+          <view wx:if="{{myFilesDetailId === item.file_id}}" class="myfile-detail" catchtap="noop"
+                style="{{myFilesDetailStyle}}">
+            <view class="myfile-detail-card">
+              <view class="myfile-preview-wrap">
+                <image wx:if="{{item.previewUrl && !item.previewFailed}}"
+                       class="myfile-preview" src="{{item.previewUrl}}" mode="aspectFit"
+                       binderror="onMyFilePreviewError" data-id="{{item.file_id}}" />
+                <view wx:else class="myfile-preview-fallback">
+                  <text class="myfile-preview-icon">{{item.typeIcon}}</text>
+                  <text class="myfile-preview-tip">{{item.previewTip}}</text>
+                </view>
               </view>
-            </view>
-            <view class="myfile-kv">
-              <text class="myfile-k">上传时间</text>
-              <text class="myfile-v">{{item.createdAtText}}</text>
-            </view>
-            <view class="myfile-kv">
-              <text class="myfile-k">文件大小</text>
-              <text class="myfile-v">{{item.sizeText}}</text>
-            </view>
-            <view wx:if="{{item.pageCountText}}" class="myfile-kv">
-              <text class="myfile-k">页数</text>
-              <text class="myfile-v">{{item.pageCountText}}</text>
-            </view>
-            <view class="myfile-kv">
-              <text class="myfile-k">所属订单</text>
-              <text class="myfile-v">{{item.orderText}}</text>
-            </view>
-            <view class="myfile-kv">
-              <text class="myfile-k">保留期</text>
-              <text class="myfile-v">{{item.expireText}}</text>
-            </view>
-            <view class="myfile-kv">
-              <text class="myfile-k">状态</text>
-              <text class="myfile-v">{{item.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除'}}</text>
+              <view class="myfile-kv">
+                <text class="myfile-k">上传时间</text>
+                <text class="myfile-v">{{item.createdAtText}}</text>
+              </view>
+              <view class="myfile-kv">
+                <text class="myfile-k">文件大小</text>
+                <text class="myfile-v">{{item.sizeText}}</text>
+              </view>
+              <view wx:if="{{item.pageCountText}}" class="myfile-kv">
+                <text class="myfile-k">页数</text>
+                <text class="myfile-v">{{item.pageCountText}}</text>
+              </view>
+              <view class="myfile-kv">
+                <text class="myfile-k">所属订单</text>
+                <text class="myfile-v">{{item.orderText}}</text>
+              </view>
+              <view class="myfile-kv">
+                <text class="myfile-k">保留期</text>
+                <text class="myfile-v">{{item.expireText}}</text>
+              </view>
+              <view class="myfile-kv">
+                <text class="myfile-k">状态</text>
+                <text class="myfile-v">{{item.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除'}}</text>
+              </view>
             </view>
           </view>
         </view>

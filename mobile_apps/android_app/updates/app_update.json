@@ -1,8 +1,8 @@
 {
-  "version": "1.1.57",
-  "versionCode": 58,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.57.apk",
-  "md5": "52e825edca44b560a76ed7b63cdd61bc",
-  "notes": "v1.1.57：「自动检测末尾空白页并排除」现在默认开启（以前得自己勾一下）—— 传 Word/PDF/图片默认就会去掉末尾多余的白纸，不会再莫名多打一页；两端文案统一成「自动检测末尾空白页并排除」；图片和只有 1 页的文件照旧不显示这块开关。重印/回填的旧订单仍按当时的设置来，不会被改写。另外：「我 → 我的文件」现在点一行就能在卡片里展开详情（上传时间 / 文件大小 / 页数 / 所属订单 / 保留期 / 状态，图片和 PDF 还带一张 1024 的预览图）。",
+  "version": "1.1.58",
+  "versionCode": 59,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.58.apk",
+  "md5": "fbdd3cb9fd3cace758f29fd17c267166",
+  "notes": "v1.1.58：「我 → 我的文件」展开/收起现在有动画了 —— 点一行从行头平滑展开、再点收起，收起后不留空位；预览图不再只支持图片和 PDF，Word / Excel / PPT 也会显示首页缩略图（服务端转 PDF 后再取第一页，1024 宽）。不支持的类型会直接说明「该类型暂不支持预览图（图片 / PDF / Word / Excel / PPT 可以）」。",
   "force": false
 }

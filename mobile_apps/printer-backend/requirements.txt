@@ -27,6 +27,10 @@ python-socketio==5.16.3
 pypdf==6.21.2
 gunicorn==22.0.0
 Pillow==13.0.0
+# 2026-11-13：「我的文件」缩略图覆盖 Office（soffice 转 PDF 后光栅化第 1 页）
+# 需要 PyMuPDF；它纯 wheel、无额外重依赖（2.x 会拖 onnxruntime/numpy，别用）。
+# 没装也不影响启动：_render_pdf_preview 会退回 pdftoppm 或直接 415。
+pymupdf==1.26.7
 # S3-01（2026-10-24）：可选运行时。设置 `HN_RUNTIME=gevent` 时启用
 # （gunicorn worker_class=gevent + Flask-SocketIO async_mode=gevent + monkey-patch）。
 # 不设该环境变量时它只是「装了不用」：启动不导入 gevent，行为与 gthread 完全一致。

@@ -7053,6 +7053,8 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   box-sizing: border-box;
   padding: 2.16cqw 0;
   border-bottom: 0.13cqw solid rgba(120, 120, 128, 0.18);
+  /* 2026-11-13：展开时行底色渐显（原来是瞬间变色） */
+  transition: background-color 200ms ease;
 }
 .myfile-row-open {
   background: rgba(120, 120, 128, 0.06);
@@ -7108,8 +7110,19 @@ body.theme-dark #view-user-orders .page-size-dropdown {
   margin-right: 0.8cqw;
   font-size: 2.4cqw;
   color: var(--text-tertiary);
+  transition: transform 220ms cubic-bezier(0.22, 0.61, 0.36, 1);
 }
+/* 展开时箭头原地转 180°（▾ → ▴ 的动画版） */
+.myfile-caret-open {
+  transform: rotate(180deg);
+}
+/* 2026-11-13 用户要求 1「加上展开和收起动画」：外层只管裁切和高度过渡（高度由 JS 量出），
+   内层才是那张灰底小卡 —— padding/圆角不参与高度动画，收起时不会留一条灰边。 */
 .myfile-detail {
+  overflow: hidden;
+  transition: height 240ms cubic-bezier(0.22, 0.61, 0.36, 1), opacity 180ms ease;
+}
+.myfile-detail-card {
   margin-top: 1.68cqw;
   padding: 1.92cqw 2.16cqw;
   border-radius: 1.92cqw;

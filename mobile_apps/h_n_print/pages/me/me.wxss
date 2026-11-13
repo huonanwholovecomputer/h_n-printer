@@ -2221,6 +2221,8 @@
   box-sizing: border-box;
   padding: 18rpx 0;
   border-bottom: 1rpx solid rgba(120, 120, 128, 0.18);
+  /* 2026-11-13：展开时行底色渐显（原来是瞬间变色） */
+  transition: background-color 200ms ease;
 }
 .myfile-row-open {
   background: rgba(120, 120, 128, 0.06);
@@ -2278,8 +2280,20 @@
   margin-right: 6rpx;
   font-size: 20rpx;
   color: var(--text-tertiary);
+  transition: transform 220ms cubic-bezier(0.22, 0.61, 0.36, 1);
 }
+/* 展开时箭头原地转 180°（▾ → ▴ 的动画版） */
+.myfile-caret-open {
+  transform: rotate(180deg);
+}
+/* 2026-11-13 用户要求 1「加上展开和收起动画」：
+   外层只负责裁切与高度过渡，高度由 JS 量出真实值写进 style（内容高度随字段行数变化，
+   CSS 里没法写死）；内层才是那张灰底小卡，它的 padding/圆角不受动画影响。 */
 .myfile-detail {
+  overflow: hidden;
+  transition: height 240ms cubic-bezier(0.22, 0.61, 0.36, 1), opacity 180ms ease;
+}
+.myfile-detail-card {
   margin-top: 14rpx;
   padding: 16rpx 18rpx;
   border-radius: 16rpx;

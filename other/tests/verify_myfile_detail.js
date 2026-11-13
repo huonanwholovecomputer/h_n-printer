@@ -125,38 +125,49 @@ for (const k of detailKvs) {
 }
 check('页数按需显示（pageCountText 不存在就不占一行）',
   /wx:if="\{\{item\.pageCountText\}\}"/.test(rowBlock));
-check('有展开箭头（▾/▴），用户知道这行能点',
-  /class="myfile-caret"/.test(rowBlock) && /▴|▾/.test(rowBlock));
+/* 2026-11-13：箭头固定 ▾ + CSS 旋转（class 里多了展开态），不再是 ▴/▾ 换字形 */
+check('有展开箭头（▾，展开时 .myfile-caret-open 转 180°）',
+  /class="myfile-caret[ "{]/.test(rowBlock) && /▾/.test(rowBlock) &&
+  /myfile-caret-open/.test(rowBlock));
 
 /* ==================== 2) 小程序：装饰函数与交互行为 ==================== */
 console.log('\n--- 2) 小程序 me.js：decorate / 展开 / 预览失败 ---');
 
-const mpBody = [
-  extractFn(MP_JS, '_fmtFileSize'),
-  extractFn(MP_JS, '_myFileTypeIcon'),
-  extractFn(MP_JS, '_decorateMyFile'),
-  extractFn(MP_JS, 'onToggleMyFileDetail'),
-  extractFn(MP_JS, 'onMyFilePreviewError'),
-].filter(Boolean).join('\n\n');
+/* 2026-11-13：展开/收起改成"量高度 + 过渡"，onToggleMyFileDetail 拆成了几个 helper，
+   所以这里要一起抠出来并挂到 mpCtx（true 页面里它们是同一个 Page 对象上的方法）。 */
+const mpFnNames = [
+  '_fmtFileSize', '_myFileTypeIcon', '_decorateMyFile',
+  '_myFileDetailStyle', '_clearMyFileDetailTimer', '_nextFrame',
+  '_measureMyFileDetailCard', '_openMyFileDetail', '_closeMyFileDetail',
+  'onToggleMyFileDetail', 'onMyFilePreviewError',
+];
+const mpBody = mpFnNames.map((n) => extractFn(MP_JS, n)).filter(Boolean).join('\n\n');
 
-check('抠到 5 个函数（_fmtFileSize/_myFileTypeIcon/_decorateMyFile/onToggleMyFileDetail/onMyFilePreviewError）',
-  mpBody.split('function ').length - 1 === 5, mpBody ? 'ok' : '**抽取失败**');
+check('抠到 ' + mpFnNames.length + ' 个函数（装饰 + 展开/收起动画链路）',
+  mpBody.split('function ').length - 1 === mpFnNames.length,
+  (mpBody.split('function ').length - 1) + '/' + mpFnNames.length + ' 个');
 
 const MP_TOKEN = 'tok+9/1';
 const wxStub = { getStorageSync: (k) => (k === 'token' ? MP_TOKEN : '') };
 const CONFIG_STUB = { BASE_URL: 'https://api.test' };
 const mpApi = new Function('wx', 'CONFIG',
-  mpBody + '\nreturn { _fmtFileSize: _fmtFileSize, _myFileTypeIcon: _myFileTypeIcon, ' +
-  '_decorateMyFile: _decorateMyFile, onToggleMyFileDetail: onToggleMyFileDetail, ' +
-  'onMyFilePreviewError: onMyFilePreviewError };')(wxStub, CONFIG_STUB);
+  mpBody + '\nreturn { ' + mpFnNames.map((n) => n + ': ' + n).join(', ') + ' };')(wxStub, CONFIG_STUB);
 
 /* Page 实例：_decorateMyFile 里用 this._fmtFileSize / this._myFileTypeIcon，
    所以这两个必须先挂上去（真实页面里它们是同一个 Page 对象上的方法） */
 const mpCtx = {
-  data: { myFiles: [], myFilesDetailId: '' },
-  setData(o) { Object.assign(this.data, o); },
+  data: { myFiles: [], myFilesDetailId: '', myFilesDetailStyle: '' },
+  setData(o, cb) { Object.assign(this.data, o); if (typeof cb === 'function') cb(); },
+  // 单测没有真实节点：wxStub 没有 createSelectorQuery ⇒ 量高度走"量到 0"的护栏分支，
+  // 展开/收起在测试里等价于瞬时状态切换（动画本身另有源码断言钉住）。
   _fmtFileSize: mpApi._fmtFileSize,
   _myFileTypeIcon: mpApi._myFileTypeIcon,
+  _myFileDetailStyle: mpApi._myFileDetailStyle,
+  _clearMyFileDetailTimer: mpApi._clearMyFileDetailTimer,
+  _nextFrame: mpApi._nextFrame,
+  _measureMyFileDetailCard: mpApi._measureMyFileDetailCard,
+  _openMyFileDetail: mpApi._openMyFileDetail,
+  _closeMyFileDetail: mpApi._closeMyFileDetail,
 };
 
 const pdfFile = mpApi._decorateMyFile.call(mpCtx, {
@@ -175,14 +186,17 @@ check('PDF：上传时间/页数/所属订单/大小 都解出来',
 check('PDF：类型图标 📕，previewFailed 初始 false',
   pdfFile.typeIcon === '📕' && pdfFile.previewFailed === false);
 
+/* 2026-11-13 起 Office（doc/docx/xls/xlsx/ppt/pptx）后端也能出预览图了，
+   所以"没有预览能力"的夹具换成 .txt（这类文件仍是 has_preview:false）。 */
 const docxFile = mpApi._decorateMyFile.call(mpCtx, {
-  file_id: '8', original_name: 'a.docx', size: 100, page_count: 0,
+  file_id: '8', original_name: 'a.txt', size: 100, page_count: 0,
   created_at: '2026-11-01 10:00:00', has_preview: false, preview_url: '',
 });
-check('docx：没有预览图 ⇒ previewUrl 为空（不发请求）+ 图标 📘',
-  docxFile.previewUrl === '' && docxFile.typeIcon === '📘');
-check('docx：提示写明「仅图片与 PDF 有」', docxFile.previewTip.indexOf('仅图片与 PDF') >= 0,
-  docxFile.previewTip);
+check('txt：没有预览图 ⇒ previewUrl 为空（不发请求）+ 图标 📄',
+  docxFile.previewUrl === '' && docxFile.typeIcon === '📄');
+check('txt：提示写明支持图片 / PDF / Word / Excel / PPT',
+  docxFile.previewTip.indexOf('Word / Excel / PPT') >= 0 &&
+  docxFile.previewTip.indexOf('图片') >= 0, docxFile.previewTip);
 check('无页数 ⇒ pageCountText 空串（详情不占一行）', docxFile.pageCountText === '');
 check('无订单 ⇒ 所属订单显示「未下单（仅上传）」', docxFile.orderText === '未下单（仅上传）');
 check('无 created_at ⇒ 显示「未知」（不是 undefined）', mpApi._decorateMyFile.call(mpCtx, {
@@ -232,20 +246,20 @@ check('每次打开「我的文件」都从全部收起开始',
 console.log('\n--- 3) APP www/me.js：decorate / render / click ---');
 
 const escHtmlSrc = extractFn(APP_APP_JS, 'escHtml');
+const appFnNames = [
+  'fmtMyFileSize', 'myFileTypeIcon', 'decorateMyFile', 'myfileKv',
+  'myfileRowEl', 'closeMyFileDetailAnimated', 'toggleMyFileDetail',
+  'renderMyFiles', 'myFilePreviewError', 'setupMyFiles',
+];
 const appBody = [
   escHtmlSrc,
-  extractFn(APP_ME_JS, 'fmtMyFileSize'),
-  extractFn(APP_ME_JS, 'myFileTypeIcon'),
-  extractFn(APP_ME_JS, 'decorateMyFile'),
-  extractFn(APP_ME_JS, 'myfileKv'),
-  extractFn(APP_ME_JS, 'renderMyFiles'),
-  extractFn(APP_ME_JS, 'toggleMyFileDetail'),
-  extractFn(APP_ME_JS, 'myFilePreviewError'),
-  extractFn(APP_ME_JS, 'setupMyFiles'),
+  'let myfileAnimTimer = null;',
+  ...appFnNames.map((n) => extractFn(APP_ME_JS, n)),
 ].filter(Boolean).join('\n\n');
 
-check('抠到 8 个函数（含 escHtml）', appBody.split('function ').length - 1 === 9,
-  (appBody.split('function ').length - 1) + ' 个');
+check('抠到 ' + appFnNames.length + ' 个函数（含 escHtml）',
+  appBody.split('function ').length - 1 === appFnNames.length + 1,
+  (appBody.split('function ').length - 1) + '/' + (appFnNames.length + 1) + ' 个');
 
 const APP_TOKEN = 'tok+9/1';
 const appState = { token: APP_TOKEN, deleteCalls: [] };
@@ -264,9 +278,7 @@ const deleteStub = (id) => appState.deleteCalls.push(id);
 
 const appApi = new Function('document', 'state', 'BASE_URL', 'meState', 'deleteMyFile', 'showToast',
   appBody +
-  '\nreturn { fmtMyFileSize: fmtMyFileSize, myFileTypeIcon: myFileTypeIcon, decorateMyFile: decorateMyFile, ' +
-  'myfileKv: myfileKv, renderMyFiles: renderMyFiles, toggleMyFileDetail: toggleMyFileDetail, ' +
-  'myFilePreviewError: myFilePreviewError, setupMyFiles: setupMyFiles, escHtml: escHtml };')(
+  '\nreturn { ' + appFnNames.map((n) => n + ': ' + n).join(', ') + ', escHtml: escHtml };')(
   documentStub, appState, 'https://api.test', meState, deleteStub, () => {});
 
 const appPdf = appApi.decorateMyFile({
@@ -281,9 +293,9 @@ check('APP：previewUrl 用 state.token 拼 ?token=',
 check('APP：时间/页数/订单同口径',
   appPdf.createdAtText === '2026-11-12 20:01:00' && appPdf.pageCountText === '3 页' &&
   appPdf.orderText === 'HN20261112-0001');
-check('APP：docx 无预览 ⇒ 空 URL + 📘',
-  appApi.decorateMyFile({ file_id: '8', original_name: 'a.docx', has_preview: false }).previewUrl === '' &&
-  appApi.decorateMyFile({ file_id: '8', original_name: 'a.docx', has_preview: false }).typeIcon === '📘');
+check('APP：txt 无预览 ⇒ 空 URL + 📄（Office 现在是可预览类型）',
+  appApi.decorateMyFile({ file_id: '8', original_name: 'a.txt', has_preview: false }).previewUrl === '' &&
+  appApi.decorateMyFile({ file_id: '8', original_name: 'a.txt', has_preview: false }).typeIcon === '📄');
 
 /* 渲染：收起态 */
 meState.myFiles = [appPdf];
@@ -306,17 +318,17 @@ check('APP 渲染（展开）：<img class="myfile-preview" src=...token=...>',
   /<img class="myfile-preview" src="https:\/\/api\.test\/api\/file_preview\/7\?token=[^"]+"/.test(htmlOpen));
 check('APP 渲染（展开）：onerror 回退钩子带 file_id',
   htmlOpen.indexOf("onerror=\"myFilePreviewError('7')\"") >= 0);
-check('APP 渲染（展开）：箭头变 ▴ + 行加 myfile-row-open',
-  htmlOpen.indexOf('▴') >= 0 && htmlOpen.indexOf('myfile-row-open') >= 0);
+check('APP 渲染（展开）：箭头加 myfile-caret-open（CSS 转 180°）+ 行加 myfile-row-open',
+  htmlOpen.indexOf('myfile-caret-open') >= 0 && htmlOpen.indexOf('myfile-row-open') >= 0);
 
 /* 渲染：无预览能力的类型走 fallback */
-meState.myFiles = [appApi.decorateMyFile({ file_id: '8', original_name: 'a.docx', has_preview: false })];
+meState.myFiles = [appApi.decorateMyFile({ file_id: '8', original_name: 'a.txt', has_preview: false })];
 meState.myFilesDetailId = '8';
 appApi.renderMyFiles();
 const htmlNoPrev = els['myFilesList'].innerHTML;
 check('APP 渲染（无预览）：fallback 图标 + 提示，且没有 <img>',
   htmlNoPrev.indexOf('myfile-preview-fallback') >= 0 &&
-  htmlNoPrev.indexOf('仅图片与 PDF') >= 0 && htmlNoPrev.indexOf('<img') < 0);
+  htmlNoPrev.indexOf('Word / Excel / PPT') >= 0 && htmlNoPrev.indexOf('<img') < 0);
 
 /* 渲染：预览加载失败后同一行退回 fallback */
 meState.myFiles = [appApi.decorateMyFile({
@@ -372,11 +384,40 @@ for (const [where, css, rowOpenPad, headFlex] of [
   check(where + ' .myfile-preview 固定高度 + 不撑开卡片',
     !!preview && /height:\s*\d/.test(preview) && /width:\s*100%/.test(preview),
     preview ? preview.replace(/\s+/g, ' ').trim() : '**缺失**');
-  check(where + ' .myfile-detail 有内边距/圆角（详情是一张内嵌小卡）',
-    /padding:/.test(decl(css, '.myfile-detail') || '') && /border-radius:/.test(decl(css, '.myfile-detail') || ''));
+  /* 2026-11-13：内边距/圆角挪到内层 .myfile-detail-card —— 外层只做高度裁剪，
+     否则收起动画结束时 padding 会把卡片留成一条灰边。 */
+  check(where + ' .myfile-detail-card 有内边距/圆角（详情是一张内嵌小卡）',
+    /padding:/.test(decl(css, '.myfile-detail-card') || '') &&
+    /border-radius:/.test(decl(css, '.myfile-detail-card') || ''));
+  check(where + ' .myfile-detail 只做高度裁剪（overflow:hidden + height 过渡）',
+    /overflow:\s*hidden/.test(decl(css, '.myfile-detail') || '') &&
+    /transition:[^;]*height\s+240ms/.test(decl(css, '.myfile-detail') || ''),
+    (decl(css, '.myfile-detail') || '**缺失**').replace(/\s+/g, ' ').trim());
+  check(where + ' 展开时箭头旋转（.myfile-caret-open rotate 180deg）',
+    /transition:[^;]*transform/.test(decl(css, '.myfile-caret') || '') &&
+    /rotate\(180deg\)/.test(decl(css, '.myfile-caret-open') || ''));
+  check(where + ' 行底色随展开渐显（.myfile-row 有 background-color 过渡）',
+    /transition:[^;]*background-color/.test(row || ''));
 }
 check('APP .myfile-preview 还写了 object-fit: contain（img 不走 aspectFit）',
   /object-fit:\s*contain/.test(decl(APP_CSS, '.myfile-preview') || ''));
+
+/* ==================== 4.5) 展开/收起动画（2026-11-13 用户要求 1） ==================== */
+console.log('\n--- 4.5) 展开/收起动画 ---');
+check('小程序：展开先落 height:0 那一帧，再量真实高度',
+  /_openMyFileDetail\(fileId\)[\s\S]*?_myFileDetailStyle\(0, 0\)[\s\S]*?_measureMyFileDetailCard[\s\S]*?_myFileDetailStyle\(h, 1\)/.test(MP_JS));
+check('小程序：动画收尾把 height 改回 auto（预览图撑高不留白）',
+  /_myFileDetailStyle\(null, 1\)/.test(MP_JS));
+check('小程序：收起先钉 px 再归零，过渡结束才清 myFilesDetailId',
+  /_closeMyFileDetail\(\)[\s\S]*?_myFileDetailStyle\(h, 1\)[\s\S]*?_myFileDetailStyle\(0, 0\)[\s\S]*?myFilesDetailId: ''/.test(MP_JS));
+check('小程序：量不到高度时同步收起（单测/老基础库不至于关不掉）',
+  /if \(!h\) \{[\s\S]*?myFilesDetailId: ''/.test(MP_JS));
+check('APP：展开 0 → 实测高度 → 260ms 后 height:auto',
+  /toggleMyFileDetail\(fileId\)[\s\S]*?style\.height = '0px'[\s\S]*?style\.height = h \+ 'px'[\s\S]*?style\.height = 'auto'/.test(APP_ME_JS));
+check('APP：收起动画走完才重渲染（节点不是瞬间消失）',
+  /closeMyFileDetailAnimated\(done\)[\s\S]*?style\.height = '0px'[\s\S]*?setTimeout\(finish, 260\)/.test(APP_ME_JS));
+check('APP：没有真实 DOM 查询能力时退回同步切换（假 DOM 单测不炸）',
+  /typeof list\.querySelectorAll !== 'function'/.test(APP_ME_JS));
 
 /* ==================== 5) 后端契约：1024 + token 鉴权仍在 ==================== */
 console.log('\n--- 5) 后端契约（别让前端拼的 URL 落空）---');

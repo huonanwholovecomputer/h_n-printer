@@ -172,6 +172,8 @@ Component({
     myFilesTotal: 0,
     // 2026-11-12：当前展开详情的文件 id（同一时间只展开一个；空串 = 全部收起）
     myFilesDetailId: '',
+    // 展开/收起动画用：JS 量出的高度写进这个行内 style（如 'height:auto;opacity:1;'）
+    myFilesDetailStyle: '',
     pageSizeDropdownLeft: 0,   // 分页下拉 fixed 定位（viewport 坐标）
     pageSizeDropdownTop: 0,
     statusMap: {
@@ -1592,7 +1594,7 @@ Component({
     // DELETE /api/file/<id> 真正删除（服务端再判属主/活跃订单，409 时提示等订单结束）。
     onOpenMyFiles() {
       // 每次打开都从「全部收起」开始：上次展开的那一行可能已经被删/已换页
-      this.setData({ showMyFiles: true, myFilesClosing: false, myFilesDetailId: '' })
+      this.setData({ showMyFiles: true, myFilesClosing: false, myFilesDetailId: '', myFilesDetailStyle: '' })
       this.loadMyFiles(true)
     },
 
@@ -1642,9 +1644,10 @@ Component({
         expireText: expireText,
         previewUrl: previewUrl,
         previewFailed: false,
+        // 2026-11-13：后端已能渲染 Office（soffice 转 PDF 取第 1 页），提示语同步改口径
         previewTip: f.has_preview === false
-          ? '该类型没有预览图（仅图片与 PDF 有）'
-          : '预览图暂不可用（服务端渲染不了该文件）',
+          ? '该类型暂不支持预览图（图片 / PDF / Word / Excel / PPT 可以）'
+          : '预览图暂不可用，可稍后重试',
         typeIcon: this._myFileTypeIcon(f.original_name),
         createdAtText: f.created_at ? String(f.created_at) : '未知',
         pageCountText: pages > 0 ? (pages + ' 页') : '',
@@ -1686,12 +1689,98 @@ Component({
     },
 
     // 点行 = 展开/收起该行详情（同一时间只展开一个；再点同一行收起）
+    //
+    // 2026-11-13 用户要求 1「加上展开和收起动画」。小程序没有 FLIP，只能手量高度：
+    //   展开：先渲染 height:0 那一帧 → 量 .myfile-detail-card 真实高度 → 过渡到该高度
+    //         → 过渡结束改成 height:auto（预览图加载完把内容撑高时不会留白/裁字）；
+    //   收起：先量当前 px（此时可能已是 auto）→ 下一帧归零 → 过渡结束才真正卸载节点。
+    // 旧写法 wx:if 直接挂载/卸载 = 瞬间出现/消失，正是要补的那段。
+    _myFileDetailStyle(height, opacity) {
+      return (height === null ? 'height:auto;' : ('height:' + height + 'px;')) +
+        'opacity:' + (opacity ? 1 : 0) + ';'
+    },
+
+    _clearMyFileDetailTimer() {
+      if (this._myFileDetailTimer) {
+        clearTimeout(this._myFileDetailTimer)
+        this._myFileDetailTimer = null
+      }
+    },
+
+    _nextFrame(cb) {
+      if (typeof wx.nextTick === 'function') wx.nextTick(cb)
+      else setTimeout(cb, 16)
+    },
+
+    _measureMyFileDetailCard(cb) {
+      // 没有测量能力（单测桩 / 老基础库）就当量到 0：上层会退回"瞬时展开收起"，
+      // 动画是视觉层，绝不能因为量不到高度把状态卡住。
+      if (typeof wx.createSelectorQuery !== 'function') { cb(0); return }
+      wx.createSelectorQuery()
+        .select('.myfile-detail-card')
+        .boundingClientRect((rect) => cb(rect && rect.height ? Math.ceil(rect.height) : 0))
+        .exec()
+    },
+
+    _openMyFileDetail(fileId) {
+      this._clearMyFileDetailTimer()
+      this.setData({
+        myFilesDetailId: fileId,
+        myFilesDetailStyle: this._myFileDetailStyle(0, 0),
+      })
+      // 必须等"高度 0"这一帧真的渲染出来再量，否则量到的还是 0
+      this._nextFrame(() => {
+        if (this.data.myFilesDetailId !== fileId) return
+        this._measureMyFileDetailCard((h) => {
+          if (this.data.myFilesDetailId !== fileId) return
+          if (!h) {
+            // 量不到（极端情况）：别把内容锁在 0 高度，直接给 auto
+            this.setData({ myFilesDetailStyle: this._myFileDetailStyle(null, 1) })
+            return
+          }
+          this.setData({ myFilesDetailStyle: this._myFileDetailStyle(h, 1) })
+          this._myFileDetailTimer = setTimeout(() => {
+            this._myFileDetailTimer = null
+            if (this.data.myFilesDetailId === fileId) {
+              this.setData({ myFilesDetailStyle: this._myFileDetailStyle(null, 1) })
+            }
+          }, 260)
+        })
+      })
+    },
+
+    _closeMyFileDetail() {
+      this._clearMyFileDetailTimer()
+      this._measureMyFileDetailCard((h) => {
+        if (!h) {
+          // 量不到高度（单测桩/极端情况）：直接收起，别让它卡在"关不掉"的状态
+          this.setData({ myFilesDetailId: '', myFilesDetailStyle: '' })
+          return
+        }
+        // 先把 height:auto 钉成具体 px，否则 auto → 0 没有可插值的起点
+        this.setData({ myFilesDetailStyle: this._myFileDetailStyle(h, 1) })
+        this._nextFrame(() => {
+          this.setData({ myFilesDetailStyle: this._myFileDetailStyle(0, 0) })
+          this._myFileDetailTimer = setTimeout(() => {
+            this._myFileDetailTimer = null
+            this.setData({ myFilesDetailId: '', myFilesDetailStyle: '' })
+          }, 260)
+        })
+      })
+    },
+
     onToggleMyFileDetail(e) {
       const fileId = (e && e.currentTarget && e.currentTarget.dataset)
         ? (e.currentTarget.dataset.id || '') : ''
       if (!fileId) return
-      this.setData({
-        myFilesDetailId: this.data.myFilesDetailId === fileId ? '' : fileId,
+      if (this.data.myFilesDetailId === fileId) {
+        this._closeMyFileDetail()
+        return
+      }
+      // 换了另一行：上一行的详情直接换掉（不做"先收再开"两段动画，操作更跟手）
+      this._clearMyFileDetailTimer()
+      this.setData({ myFilesDetailId: '', myFilesDetailStyle: '' }, () => {
+        this._openMyFileDetail(fileId)
       })
     },
 

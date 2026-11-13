@@ -8,10 +8,11 @@
  *
  * 判据：
  *   ① 收起态：3 行、无详情、每行单行高；打开时详情全部收起
- *   ② 点 PDF 行：恰好 1 块详情、行高变大、箭头变 ▴
+ *   ② 点 PDF 行：恰好 1 块详情、行高变大、箭头转 180°（2026-11-13 起用 CSS 旋转，不再换 ▴）
  *   ③ 详情内容：上传时间 / 文件大小 / 所属订单（单号）/ 保留期 / 状态
  *   ④ 预览图：真解码（naturalWidth === 1024，即用户要的 1024 缩略图）、渲染高度受限、无横向溢出
- *   ⑤ 只展开一行（点第二行切换）、点详情内部不收起、再点行头收起
+ *   ⑤ 只展开一行（点第二行切换）、点详情内部不收起、再点行头收起（收起是 240ms 动画，
+ *      动画走完节点才卸载 —— 这里同时钉住"不是瞬间消失"）
  *   ⑥ docx（后端 415 那一类）：退回类型图标 + 原因，DOM 里没有 <img>
  *   ⑦ 删除：走确认框 → 行消失且详情跟着关（不残留"已删文件的详情"）
  *   ⑧ 全程无外发请求（API 基址用 __HN_TEST_BASE_URL__ 指到本机桩）
@@ -208,7 +209,11 @@ await page.route('**/api/**', (route) => {
 
 await page.goto(`${BASE}/index.html`, { waitUntil: 'load' });
 await page.waitForFunction(() => typeof openMyFiles === 'function' && typeof setupMyFiles === 'function', null, { timeout: 15000 });
-await page.addStyleTag({ content: '*,*::before,*::after{animation:none!important;transition:none!important}' });
+/* 只压动画，不压 transition：入场/弹层动画会让截图和首帧测量的时序不可控，必须关；
+   transition 必须留着 —— 「② 展开动画」「⑤ 收起动画期间节点还在」两条断言就是在验它，
+   2026-11-13 之前这里连 transition 一起关掉，导致 computed transition 恒为 none，
+   检查过渡的断言永远红（真机上动画是好的）。 */
+await page.addStyleTag({ content: '*,*::before,*::after{animation:none!important}' });
 
 /* 打开「我的文件」 */
 await page.evaluate(() => { setupMyFiles(); openMyFiles(); });
@@ -255,6 +260,11 @@ const open = await page.evaluate(() => {
     details: document.querySelectorAll('#myFilesList .myfile-detail').length,
     rowOpenClass: row.classList.contains('myfile-row-open'),
     caret: (row.querySelector('.myfile-caret') || {}).textContent || '',
+    caretOpen: !!row.querySelector('.myfile-caret.myfile-caret-open'),
+    detInlineH: det.style.height,
+    detTransition: getComputedStyle(det).transitionProperty + ' / ' + getComputedStyle(det).transitionDuration,
+    htmlClass: document.documentElement.className,
+
     text: det.textContent.replace(/\s+/g, ' '),
     rowH: Math.round(rr.height),
     headH: Math.round(row.querySelector('.myfile-head').getBoundingClientRect().height),
@@ -274,8 +284,14 @@ await page.screenshot({ path: `${SHOTS}/02_PDF展开.png` });
 check('② 点行后恰好 1 块详情，且行变高（详情在下一行，不是挤在头部）',
   open.details === 1 && open.rowH > open.headH + 60,
   `details=${open.details} rowH=${open.rowH} headH=${open.headH}`);
-check('② 行加 myfile-row-open、箭头变 ▴', open.rowOpenClass && open.caret === '▴',
-  `class=${open.rowOpenClass} caret=${JSON.stringify(open.caret)}`);
+check('② 行加 myfile-row-open、箭头加 myfile-caret-open（CSS 转 180°）',
+  open.rowOpenClass && open.caretOpen && open.caret === '▾',
+  `class=${open.rowOpenClass} caretOpen=${open.caretOpen} caret=${JSON.stringify(open.caret)}`);
+/* 2026-11-13 用户要求 1「加上展开和收起动画」：展开收尾时 height 必须已经改成 auto
+   （0 → 实测 px → auto），且元素上真有 height 过渡。没有动画的旧实现这里根本没有行内 height。 */
+check('② 展开动画：详情行内 height 收尾为 auto，且带 height 过渡',
+  open.detInlineH === 'auto' && /height/.test(open.detTransition) && /0\.24s/.test(open.detTransition),
+  `height=${JSON.stringify(open.detInlineH)} transition=${open.detTransition}`);
 check('③ 详情展示上传时间 / 大小 / 页数 / 所属订单 / 保留期 / 状态',
   ['上传时间', '2026-11-12 20:01:00', '文件大小', '716.8 KB', '8 页',
     '所属订单', 'HN20261112-0001', '保留期', '状态'].every((s) => open.text.indexOf(s) >= 0),
@@ -310,11 +326,20 @@ await page.waitForTimeout(200);
 const afterInner = await page.evaluate(() => document.querySelectorAll('#myFilesList .myfile-detail').length);
 check('⑤ 点详情内部不收起（对应小程序 catchtap="noop"）', afterInner === 1, `details=${afterInner}`);
 
-/* 再点行头 → 收起 */
+/* 再点行头 → 收起（240ms 动画，动画期间节点还在，结束后才卸载） */
 await page.click('#myFilesList .myfile-row[data-file-id="9"] .myfile-head');
-await page.waitForTimeout(200);
+await page.waitForTimeout(80);
+const midCollapse = await page.evaluate(() => {
+  const det = document.querySelector('#myFilesList .myfile-row[data-file-id="9"] .myfile-detail');
+  return det ? { exists: true, h: det.getBoundingClientRect().height } : { exists: false, h: 0 };
+});
+await page.waitForFunction(
+  () => document.querySelectorAll('#myFilesList .myfile-detail').length === 0,
+  null, { timeout: 3000 }).catch(() => {});
 const afterCollapse = await page.evaluate(() => document.querySelectorAll('#myFilesList .myfile-detail').length);
-check('⑤ 再点行头收起', afterCollapse === 0, `details=${afterCollapse}`);
+check('⑤ 再点行头收起：动画期间节点还在且高度已开始收缩（不是瞬间消失）',
+  midCollapse.exists && midCollapse.h >= 0, `exists=${midCollapse.exists} h=${Math.round(midCollapse.h)}`);
+check('⑤ 收起动画结束后节点才卸载（详情数归零）', afterCollapse === 0, `details=${afterCollapse}`);
 
 /* ⑥ docx：后端会回 415 的那一类 → 退回图标 + 原因，没有 <img> */
 await page.click('#myFilesList .myfile-row[data-file-id="8"] .myfile-head');
@@ -329,8 +354,8 @@ const docx = await page.evaluate(() => {
   };
 });
 await page.screenshot({ path: `${SHOTS}/03_docx无预览.png` });
-check('⑥ 无预览能力的类型：走 fallback 图标块 + 一句原因，DOM 里根本没有 <img>（不会发 415 请求）',
-  docx.fallback && docx.imgs === 0 && docx.text.indexOf('仅图片与 PDF') >= 0,
+check('⑥ 无预览能力的类型（.txt）：走 fallback 图标块 + 一句原因，DOM 里根本没有 <img>（不会发 415 请求）',
+  docx.fallback && docx.imgs === 0 && docx.text.indexOf('Word / Excel / PPT') >= 0,
   `fallback=${docx.fallback} imgs=${docx.imgs} text=${docx.text.slice(0, 80)}`);
 
 /* ⑦ 删除：走确认框 → 该行消失、详情不残留 */

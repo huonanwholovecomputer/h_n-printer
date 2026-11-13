@@ -273,6 +273,27 @@ AVATAR_DIR = os.path.join(UPLOAD_DIR, "avatars")
 MD5_INDEX_FILE = os.path.join(UPLOAD_DIR, "md5_index.json")
 RETENTION_CONFIG_FILE = os.path.join(UPLOAD_DIR, "retention_config.json")
 
+def _resolve_files_path(stored_path: str) -> str:
+    """把 `files.path` 变成真实可访问的路径（两种历史形态都认）。
+
+    2026-11-13 修的真 bug：上传时 `file_path = os.path.join(UPLOAD_DIR, subdir, saved_name)`
+    ⇒ `files.path` 里**已经带 uploads/ 前缀**（如 `uploads/docx/x.docx`）。旧代码又拼了一次
+    `UPLOAD_DIR` ⇒ 前缀被拼了两遍（uploads 套 uploads）恒不存在 ⇒ `/api/file_preview/<id>` 对**所有类型**
+    都回 404（用户看到的"怎么都没有缩略图"一直是这个，不是渲染能力问题）。
+    这里：绝对路径原样返回；相对路径先按原样试，不存在才补 UPLOAD_DIR 前缀（兼容更老的库）。
+    """
+    p = str(stored_path or "").strip()
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return p
+    direct = os.path.normpath(p)
+    if os.path.isfile(direct):
+        return direct
+    alt = os.path.normpath(os.path.join(UPLOAD_DIR, direct))
+    return alt if os.path.isfile(alt) else direct
+
+
 
 # ===== S2-11（DS-20）：日志脱敏助手 =====
 # 日志进 journald（会留 30 天、可被 collect_all 打包回传），所以**顾客原文件名与绝对路径
@@ -288,7 +309,7 @@ _PATH_IN_TEXT_RE = re.compile(r"(?:[A-Za-z]:\[^\s'\"<>]+|/(?:[\w.\-]+/)*[\w.\-]+
 
 
 def _redact_paths(text: str) -> str:
-    """把一段文本里的绝对路径（C:\... 或 /a/b/c）替换成 <path>。
+    """把一段文本里的绝对路径（C:\\... 或 /a/b/c）替换成 <path>。
 
     用于异常文本：`str(e)` 经常带完整路径（OSError/FileNotFoundError），而异常文本会进
     journald 并被「日志管理」打包回传。只留诊断用的类名 + 少量上下文，路径不落盘。"""
@@ -7177,8 +7198,7 @@ def get_file_page(file_id):
     if page_count <= 0 and not verified:
         ext = os.path.splitext(row["original_name"] or "")[1].lower()
         if ext and ext not in (".doc", ".docx"):
-            rel_path = row["path"] or ""
-            fpath = os.path.join(UPLOAD_DIR, rel_path) if rel_path else ""
+            fpath = _resolve_files_path(row["path"])
             if fpath and os.path.exists(fpath):
                 new_count = get_file_page_count(fpath, ext.lstrip("."))
                 if new_count > 0:
@@ -7489,10 +7509,15 @@ def list_my_files():
 # 落地口径：
 #   · **懒生成**：第一次请求才渲染，结果落盘缓存到 `uploads/previews/<file_id>_<mtime>.jpg`，
 #     之后直接 send_file（不动原文件、不重复解码、mtime 变了自动换新文件）；
-#   · 只有**图片类 + PDF** 有预览图；doc/docx/xls/xlsx/ppt 等一律 `has_preview=False`，
-#     前端显示类型图标即可 —— 服务端没有 Office 渲染能力，也不该为此引入外来二进制；
-#   · PDF 光栅化按能力降级：PyMuPDF(fitz) → poppler 的 pdftoppm → 都没有就 415。
-#     前端收到 415 **静默退回图标**（预览图是锦上添花，不是错误弹窗）；
+#   · 覆盖面（2026-11-13 追加「缩略图尽量显示一下」后从「图片 + PDF」扩到 Office）：
+#       图片类 → PIL 直读；PDF → PyMuPDF，兜底 pdftoppm；
+#       Word/Excel/PPT（doc docx xls xlsx ppt pptx）→ LibreOffice 转 PDF 再取第 1 页。
+#       txt/csv/md 仍然 `has_preview=False`（纯文本没有"首页"可言，前端显示类型图标）；
+#   · **能力探测而非硬依赖**：没装 soffice / PyMuPDF 的部署照样启动，只是对应类型回落 415。
+#     不许为了预览图让后端起不来（预览图是锦上添花，不是启动前置条件）；
+#   · **串行 + 超时 + 负缓存**：soffice 一次转换 2~5 秒、峰值内存约 200MB，本机只有 2GB
+#     ⇒ 全局一把锁（同时只跑一个 soffice）、120 秒硬超时、失败结果 10 分钟内不再重试；
+#   · 前端收到 415 **静默退回图标**（不是错误弹窗）；
 #   · 鉴权：小程序的 <image src> 与 WebView 的 <img> 都带不了请求头 ⇒ 本端点接受
 #     `Authorization: Bearer` **或** `?token=`，校验走同一个 `_load_login_token`
 #     （撤销/过期/签名判据与 login_required 不分叉），并且**只放行属主或管理员**
@@ -7500,12 +7525,19 @@ def list_my_files():
 PREVIEW_DIR = os.path.join(UPLOAD_DIR, "previews")
 PREVIEW_MAX_PX = 1024                      # 长边像素上限（需求写的就是 1024×1024）
 _PREVIEW_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")
+# Office 家族：必须同时落在 UPLOAD_EXT_WHITELIST 里（见本文件"上传校验"一节）
+_PREVIEW_OFFICE_EXTS = (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
+_PREVIEW_OFFICE_TIMEOUT = 120              # 秒；soffice 卡死时不能把 gunicorn 线程一起拖住
+_PREVIEW_FAIL_TTL = 600                    # 秒；同一 (file_id, mtime) 渲染失败后 10 分钟内不重试
+_PREVIEW_RENDER_LOCK = threading.Lock()    # 全局串行：2GB 内存同时起两个 soffice 会打到 swap
+_preview_fail_cache = {}                   # {(file_id, mtime): (过期时间戳, 失败原因)}
+_soffice_path = None                       # None=还没探过；""=探过但没有；其它=可执行路径
 
 
 def _has_preview_for(name_or_path: str) -> bool:
-    """这个文件名/路径有没有可见预览图（图片类 + PDF）。"""
+    """这个文件名/路径有没有可见预览图（图片类 + PDF + Office 文档）。"""
     ext = os.path.splitext(str(name_or_path or ""))[1].lower()
-    return ext in _PREVIEW_IMAGE_EXTS or ext == ".pdf"
+    return ext in _PREVIEW_IMAGE_EXTS or ext == ".pdf" or ext in _PREVIEW_OFFICE_EXTS
 
 
 def _openid_for_media() -> str:
@@ -7524,6 +7556,7 @@ def _openid_for_media() -> str:
         return _load_login_token(token)
     except Exception:  # noqa: BLE001  任何凭证异常都当未登录
         return ""
+
 
 
 def _preview_cache_path(file_id: str, mtime_token: str) -> str:
@@ -7589,6 +7622,128 @@ def _render_pdf_preview(src_path: str) -> bytes:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _soffice_bin() -> str:
+    """LibreOffice 可执行文件的路径（懒探测一次；没有就返回空串，绝不抛）。
+
+    ⚠ systemd 单元里 `Environment=PATH=/home/printer-backend/venv/bin` 是**唯一**的 PATH
+    （加固时故意清掉了系统路径），`shutil.which("soffice")` 在 gunicorn 里恒返回 None ——
+    2026-11-13 线上实测就踩了这个：apt 装的 /usr/bin/soffice 明明在，预览却报
+    「服务端没有 Office 渲染能力（缺 LibreOffice）」。所以 which 之后必须再查固定路径。
+    """
+    global _soffice_path
+    if _soffice_path is None:
+        hit = ""
+        for name in ("soffice", "libreoffice"):
+            try:
+                found = shutil.which(name)
+            except Exception:  # noqa: BLE001
+                found = None
+            if found:
+                hit = found
+                break
+        if not hit:
+            # 常见安装位置（apt / snap / 官方 tar 包）
+            for cand in ("/usr/bin/soffice", "/usr/bin/libreoffice",
+                         "/usr/lib/libreoffice/program/soffice",
+                         "/opt/libreoffice/program/soffice",
+                         "/snap/bin/libreoffice"):
+                try:
+                    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                        hit = cand
+                        break
+                except OSError:
+                    continue
+        _soffice_path = hit
+    return _soffice_path
+
+
+def _preview_fail_hit(key) -> bool:
+    """这个 (file_id, mtime) 10 分钟内是不是已经失败过（别让用户每点一次都重转一遍）。"""
+    item = _preview_fail_cache.get(key)
+    if not item:
+        return False
+    if item[0] <= time.time():
+        _preview_fail_cache.pop(key, None)
+        return False
+    return True
+
+
+def _preview_fail_note(key, reason) -> None:
+    # 只留最近 500 条：这是"别重复重试"的短路缓存，不是业务数据
+    if len(_preview_fail_cache) > 500:
+        _preview_fail_cache.clear()
+    _preview_fail_cache[key] = (time.time() + _PREVIEW_FAIL_TTL, str(reason)[:200])
+
+
+# 表格导出：整张表压进一页（缩略图上能看出表格形状，而不是只看到被切掉的左上角）
+_CALC_ONE_PAGE_FILTER = (
+    'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}'
+)
+
+
+def _soffice_to_pdf(exe: str, src_path: str, outdir: str, filter_spec: str) -> str:
+    """跑一次 soffice 转换，成功返回输出 PDF 路径，失败返回空串（绝不抛）。"""
+    profile = os.path.join(outdir, "profile")
+    os.makedirs(profile, exist_ok=True)
+    # 每次调用一个独立 profile：共享 profile 被上一个进程锁住时 soffice 会直接退出
+    # （表现成"没有输出文件"的假失败）；HOME 指到可写 tmpdir，避免 root 的 HOME 不可写。
+    env = dict(os.environ)
+    env["HOME"] = outdir
+    # ⚠ /usr/bin/soffice 是个 shell 包装脚本，内部要 dirname/basename/sed/grep/uname 才能算出
+    # oosplash 的位置；systemd 单元里 PATH 只有 venv/bin ⇒ 它们全都找不到，soffice 以 127 退出
+    # （2026-11-13 线上实测：报「LibreOffice 没有输出 PDF」），所以这里必须补齐系统路径。
+    path_parts = [p for p in (os.path.dirname(exe) or "",) + tuple(
+        os.environ.get("PATH", "").split(os.pathsep)) if p]
+    for extra in ("/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        if extra not in path_parts:
+            path_parts.append(extra)
+    env["PATH"] = os.pathsep.join(path_parts)
+    if not _PREVIEW_RENDER_LOCK.acquire(timeout=_PREVIEW_OFFICE_TIMEOUT):
+        raise RuntimeError("Office 转换排队超时（有别的文件正在转）")
+    try:
+        subprocess.run(
+            [exe, "--headless", "--norestore", "--invisible", "--nologo",
+             "--nodefault", "--nolockcheck", "--nofirststartwizard",
+             "-env:UserInstallation=file://" + profile,
+             "--convert-to", filter_spec, "--outdir", outdir, src_path],
+            timeout=_PREVIEW_OFFICE_TIMEOUT, check=False,
+            capture_output=True, env=env)
+    finally:
+        _PREVIEW_RENDER_LOCK.release()
+    pdfs = sorted(glob.glob(os.path.join(outdir, "*.pdf")))
+    return pdfs[0] if pdfs else ""
+
+
+def _render_office_preview(src_path: str) -> bytes:
+    """Office 文档第 1 页 → 1024 以内 JPEG bytes。
+
+    路径：soffice --headless --convert-to pdf → 复用 _render_pdf_preview 取第 1 页。
+    没有 LibreOffice / PyMuPDF 就抛 RuntimeError（上层回落 415，前端显示类型图标）。
+    """
+    exe = _soffice_bin()
+    if not exe:
+        raise RuntimeError("服务端没有 Office 渲染能力（缺 LibreOffice）")
+    ext = os.path.splitext(src_path)[1].lower()
+    # 表格先试"整表一页"，老 LibreOffice 不认这个过滤器选项 ⇒ 再退回普通导出
+    filters = ["pdf"]
+    if ext in (".xls", ".xlsx"):
+        filters = [_CALC_ONE_PAGE_FILTER, "pdf"]
+    tmpdir = tempfile.mkdtemp(prefix="hn_office_")
+    try:
+        pdf_path = ""
+        for i, spec in enumerate(filters):
+            outdir = os.path.join(tmpdir, "out%d" % i)
+            os.makedirs(outdir, exist_ok=True)
+            pdf_path = _soffice_to_pdf(exe, src_path, outdir, spec)
+            if pdf_path:
+                break
+        if not pdf_path:
+            raise RuntimeError("LibreOffice 没有输出 PDF（文件损坏或格式不支持）")
+        return _render_pdf_preview(pdf_path)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _drop_previews(file_id: str) -> None:
     """删掉某个文件的全部预览缓存（文件被删除/过期清理时调用）。失败只打日志。"""
     try:
@@ -7612,7 +7767,8 @@ def file_preview(file_id):
       · 200 + image/jpeg —— 命中缓存或刚生成；
       · 404 —— 文件不存在/已清理；
       · 403 —— 不是你的文件（管理员可看）；
-      · 415 —— 该类型没有预览图 / 服务端渲染不了 PDF（前端静默退回图标）。
+      · 415 —— 该类型没有预览图 / 服务端暂时渲染不了（PDF、Office 同此；
+               前端静默退回类型图标，不是错误弹窗）。
     """
     openid = _openid_for_media()
     if not openid:
@@ -7631,9 +7787,8 @@ def file_preview(file_id):
     if owner != openid and not is_admin(openid):
         _audit_file_access("preview", "denied", file_id=file_id, openid=openid, actor="user")
         return jsonify({"success": False, "message": "无权查看该文件"}), 403
-    rel_path = (row["path"] or "").strip()
-    src_path = os.path.join(UPLOAD_DIR, rel_path) if rel_path else ""
-    if not rel_path or not os.path.isfile(src_path):
+    src_path = _resolve_files_path(row["path"])
+    if not src_path or not os.path.isfile(src_path):
         _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor="user")
         return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
     display = row["original_name"] or src_path
@@ -7650,10 +7805,22 @@ def file_preview(file_id):
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
         return send_file(cache_path, mimetype="image/jpeg", max_age=86400, conditional=True)
     ext = os.path.splitext(display)[1].lower()
+    fail_key = (str(file_id), mtime_token)
+    if _preview_fail_hit(fail_key):
+        # 刚失败过（典型：损坏的 docx / 服务器内存吃紧）：这次不再重试，直接回落图标。
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
+                           ext=ext.lstrip("."))
+        return jsonify({"success": False, "message": "该文件暂时没有预览图"}), 415
     try:
-        data = _render_pdf_preview(src_path) if ext == ".pdf" else _render_image_preview(src_path)
+        if ext == ".pdf":
+            data = _render_pdf_preview(src_path)
+        elif ext in _PREVIEW_OFFICE_EXTS:
+            data = _render_office_preview(src_path)
+        else:
+            data = _render_image_preview(src_path)
     except Exception as e:  # noqa: BLE001  预览失败绝不 500
         print(f"  [PREVIEW] 生成失败 file_id={file_id} ext={ext}: {e}")
+        _preview_fail_note(fail_key, e)
         data = None
     if not data:
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
