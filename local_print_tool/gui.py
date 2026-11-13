@@ -12913,7 +12913,11 @@ class MainWindow(QMainWindow):
         ① 本会话已经转换好的 cached_pdf 还在；
         ② 原件本身就是 PDF（不需要转换）；
         ③ 页数已知（>0）⇒ 它成功转过一次；重启后 cached_pdf 是空的（不持久化），
-           点击时再按缓存 key 把产物找回来（见 _preview_pdf_source）。
+           点击时再按缓存 key 把产物找回来（见 _preview_pdf_source）；
+        ④ 源文件**可转换**（md/txt/csv/Office/图片…）但那三种都不成立 —— 2026-11-13
+           用户现场：md 的页数云端永远分析不出来（页数分析只覆盖 pdf/doc/docx），
+           所以第一次打印之前「预览 PDF」一直是灰的，看着就像"md 不支持预览"。
+           现在点下去先现转一份（`_preview_queue_convert`），转完自动打开。
         """
         cached = getattr(job, "cached_pdf", "") or ""
         if cached and os.path.isfile(cached):
@@ -12921,7 +12925,36 @@ class MainWindow(QMainWindow):
         src = getattr(job, "file_path", "") or ""
         if src and os.path.splitext(src)[1].lower() == ".pdf" and os.path.isfile(src):
             return True
-        return int(getattr(job, "page_count", 0) or 0) > 0
+        if int(getattr(job, "page_count", 0) or 0) > 0:
+            return True
+        # ④ 还没转换过，但这份源文件**可以**转换 ⇒ 允许点（点击时现转，见 _preview_pdf_rows）
+        return self._preview_pdf_convertible(job)
+
+    def _preview_pdf_convertible(self, job: PrintJob) -> bool:
+        """这份源文件能不能「现转一份 PDF」给我们看（转换器认得的扩展名 + 文件还在）。
+
+        与 `_preview_pdf_available` 分开写：那个回答"现在就能打开吗"，这个回答"值得让用户
+        等几秒吗"。扩展名一律问 `UniversalConverter.CONVERSION_MAP`，不另外维护白名单
+        （多维护一份就会跟转换器漂移：能打却不能预览）。
+        """
+        src = getattr(job, "file_path", "") or ""
+        if not src or not os.path.isfile(src):
+            return False
+        ext = os.path.splitext(src)[1].lower()
+        if not ext:
+            return False
+        exts = getattr(self, "_preview_convertible_exts_cache", None)
+        if exts is None:
+            try:
+                from converter import UniversalConverter
+                # CONVERSION_MAP 是**实例**属性（__init__ 里 _init_conversion_map 才填）
+                # —— 直接读类属性会拿到空表，判据就永远 False（这个坑当场踩过）。
+                exts = frozenset(UniversalConverter().CONVERSION_MAP.keys())
+            except Exception:  # noqa: BLE001
+                logger.debug("取转换器扩展名表失败", exc_info=True)
+                exts = frozenset()
+            self._preview_convertible_exts_cache = exts
+        return ext in exts
 
     def _preview_pdf_source(self, job: PrintJob) -> str:
         """返回这份任务「转换好的 PDF」的路径；没有就返回 ""。只读，不改 job 状态。
@@ -12994,7 +13027,12 @@ class MainWindow(QMainWindow):
             name = (getattr(job, "display_name", "") or os.path.basename(src) or "?")
             path = self._preview_pdf_source(job)
             if not path:
-                missing.append(name)
+                # 2026-11-13：页数未知（md/txt/csv 这类云端不分析页数的）以前一律当"没有
+                # 产物"，现场表现就是「md 不支持预览 PDF」。可转换的源文件现在现转一份。
+                if self._preview_queue_convert(row, job, name):
+                    queued.append(name)
+                else:
+                    missing.append(name)
                 continue
             key = os.path.normcase(os.path.abspath(path))
             if key in seen_paths:      # 同一份 PDF（多行内容相同）只开一个窗口
@@ -13012,7 +13050,11 @@ class MainWindow(QMainWindow):
             msg = f"👁 预览 PDF：已用默认程序打开 {opened} 个"
             if missing:
                 msg += f"；{len(missing)} 个没有可用的 PDF"
+            if queued:
+                msg += f"；{len(queued)} 个正在转换"
             self._log(msg)
+        elif queued:
+            pass
         elif missing:
             QMessageBox.information(
                 self, "预览 PDF",
@@ -13021,6 +13063,61 @@ class MainWindow(QMainWindow):
                 + "\n\n如果页数显示「?」，说明 PDF 正在转换或转换失败；\n"
                   "等转换完成后再试，或用右键「🔄 重新转换」。")
         return opened
+
+    def _preview_queue_convert(self, row: int, job: PrintJob, name: str) -> bool:
+        """「预览 PDF」发现还没有产物时，现转一份；转完自动用默认程序打开。
+
+        走的是**和打印同一条**转换链路（`_start_convert_worker` ⇒ ConvertWorker ⇒ 沙箱），
+        不另写一套 —— 否则预览看到的版式可能和真正打出来的不是同一份。返回 True = 已排队。
+        """
+        if not self._preview_pdf_convertible(job):
+            return False
+        src = getattr(job, "file_path", "") or ""
+        key = os.path.normcase(os.path.abspath(src))
+        pending = getattr(self, "_preview_convert_pending", None)
+        if pending is None:
+            pending = {}
+            self._preview_convert_pending = pending
+        pending[key] = name
+        try:
+            before = len(self._convert_workers)
+            _from_cloud = int(getattr(job, "task_id", 0) or 0) > 0
+            self._start_convert_worker(
+                row, src, self._resolve_engine(job), tab_key=self._current_tab,
+                from_cloud=_from_cloud,
+                allow_cloud_com=bool(_from_cloud and self._cloud_com_allowed(job)))
+            if len(self._convert_workers) > before:
+                # 额外挂一个槽：转完直接打开（不动 _on_convert_finished 的既有语义）
+                self._convert_workers[-1].finished.connect(self._preview_convert_finished)
+        except Exception as e:  # noqa: BLE001
+            pending.pop(key, None)
+            logger.debug("预览 PDF：发起转换失败 %s", src, exc_info=True)
+            self._log(f"⚠ 预览 PDF：转换没能启动（{name}）：{e}")
+            return False
+        # 每条都留一行：用户点了「预览 PDF」却几秒没动静时，日志里得能看出"它在转"，
+        # 而不是像旧版那样只弹一句"还没有可预览的转换产物"。
+        self._log(f"⏳ 正在转换用于预览的 PDF：{name}（转好会自动打开）")
+        return True
+
+    def _preview_convert_finished(self, row: int, file_path: str, cached_pdf: str,
+                                  page_count: int, orientation: str) -> None:
+        """现转的预览产物好了（由 `_preview_queue_convert` 挂上来的额外槽）。"""
+        pending = getattr(self, "_preview_convert_pending", None)
+        if not pending:
+            return
+        key = os.path.normcase(os.path.abspath(file_path or ""))
+        name = pending.pop(key, "")
+        if not name:
+            return
+        if not cached_pdf or not os.path.isfile(cached_pdf):
+            self._log(f"⚠ 预览 PDF 转换失败：{name}")
+            return
+        try:
+            os.startfile(cached_pdf)
+            self._log(f"👁 预览 PDF：已用默认程序打开 {name}")
+        except Exception as e:  # noqa: BLE001
+            logger.debug("预览 PDF：打开失败 %s", cached_pdf, exc_info=True)
+            self._log(f"⚠ 预览 PDF 失败：{name}（{e}）")
 
     def _add_rows_to_new_tab(self, rows) -> str | None:
         """把选中行**复制**到新标签页并切换过去（原标签页原样不动）。

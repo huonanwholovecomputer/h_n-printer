@@ -15,7 +15,8 @@ a = Analysis(
     # file_cache / duplex_stack / logs / pdf_cache 等，见 paths.py）一律不得出现在这里 ——
     # 两份 .spec 与 .iss 的 Excludes 都由 tests/verify_installer_excludes.py 与 paths.py 做集合比对。
     # （theme_settings.json 已移除：它按 paths.py 属用户数据，主题缺失时程序按默认主题启动。）
-    datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('finance/settlement.html', 'finance'), ('finance/chart.umd.min.js', 'finance')],
+    datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('finance/settlement.html', 'finance'), ('finance/chart.umd.min.js', 'finance'), ('assets/katex', 'assets/katex')],  # assets/katex：md 里的 LaTeX（katex.min.js + auto-render.min.js + 内联字体的 css）
+    # 漏收 = 打包版公式静默回落成原始 TeX 文本（converter._katex_assets 抛错后走 wkhtmltopdf 兜底）
     hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client'],
     hookspath=[],
     hooksconfig={},

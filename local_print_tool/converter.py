@@ -16,6 +16,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1620,6 +1621,154 @@ def _convert_html_to_pdf(html_path_or_content: str, output_pdf: str, is_content:
     logger.info(f"HTML → PDF 完成: {output_pdf}")
 
 
+# ============================================================
+# Markdown 里的 LaTeX 公式（2026-11-13 用户反馈：md 不支持 LaTeX）
+# ============================================================
+# 现场问题：`03_题库_解析几何.md` 里的 $\frac{x^2}{a^2}+\frac{y^2}{b^2}=1$ 被原样打进
+# PDF —— python-markdown 不解析 TeX，而 HTML→PDF 那条路带 `--disable-javascript`
+# （S0-09 的安全口径），MathJax / KaTeX 这类前端方案根本跑不起来。
+# 现在的做法：**只在这份 Markdown 确实含公式时**改用「无头浏览器（Edge / Chrome）+ 本地
+# KaTeX」渲染；不含公式的文档继续走 wkhtmltopdf（更快，也是现场跑了一年多的路径）。
+# KaTeX 的 js / css / 字体随程序分发（assets/katex/，woff2 字体已内联成 data: URI）⇒
+# 转换过程不访问外网、不依赖本机装 Node，也不读顾客机上任何文件。
+# 安全口径不变：`_scan_unsafe_html` 已先拒 <script>/on…=/file:/iframe 等危险语法，
+# `_strip_remote_refs` 再剥远程引用；浏览器里唯一会执行的脚本就是我们注入的 KaTeX。
+
+_MD_MATH_RES = (
+    re.compile(r"\$\$.+?\$\$", re.S),
+    re.compile(r"\\\[.+?\\\]", re.S),
+    re.compile(r"\\\(.+?\\\)", re.S),
+    re.compile(r"(?<![\\$])\$[^$\n]+?\$"),
+)
+
+_KATEX_ASSET_CACHE: dict[str, str] = {}
+
+_MATH_PAGE_CSS = """
+@page { size: A4; margin: 12mm 12mm; }
+html, body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+.katex-display { margin: 0.55em 0; }
+.katex { font-size: 1.02em; }
+"""
+
+_MATH_RENDER_JS = (
+    "renderMathInElement(document.body,{delimiters:["
+    "{left:'$$',right:'$$',display:true},"
+    "{left:'\\\\[',right:'\\\\]',display:true},"
+    "{left:'$',right:'$',display:false},"
+    "{left:'\\\\(',right:'\\\\)',display:false}],"
+    "throwOnError:false,strict:false,trust:false});"
+)
+
+
+def _md_has_math(md_text: str) -> bool:
+    """这份 Markdown 里有没有 LaTeX 公式（粗判，宁宽勿漏：漏判只是退回老行为）。"""
+    if not md_text:
+        return False
+    return any(rx.search(md_text) for rx in _MD_MATH_RES)
+
+
+def _asset_path(*parts: str) -> str:
+    """随程序分发的静态资产（源码运行 = 本文件同级 assets/；打包 = _MEIPASS）。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "assets", *parts)
+
+
+def _katex_assets() -> tuple[str, str, str]:
+    """读取 KaTeX 资产（进程内只读一次）；缺文件抛 RuntimeError。"""
+    if not _KATEX_ASSET_CACHE:
+        wanted = {
+            "css": _asset_path("katex", "katex-inline.css"),
+            "js": _asset_path("katex", "katex.min.js"),
+            "auto": _asset_path("katex", "auto-render.min.js"),
+        }
+        for label, path in wanted.items():
+            if not os.path.isfile(path):
+                raise RuntimeError(f"缺少 KaTeX 资源（{label}）: {path}")
+            with open(path, "r", encoding="utf-8") as f:
+                _KATEX_ASSET_CACHE[label] = f.read()
+    return (_KATEX_ASSET_CACHE["css"], _KATEX_ASSET_CACHE["js"],
+            _KATEX_ASSET_CACHE["auto"])
+
+
+def _find_headless_browser() -> str:
+    """找可用的无头浏览器（Edge 优先，其次 Chrome）。找不到返回 ""。
+
+    为什么用浏览器而不是继续用 wkhtmltopdf：wkhtmltopdf 走的是老 QtWebKit，而且我们的
+    命令行固定 `--disable-javascript`（顾客文档里的脚本一律不执行）；KaTeX 是前端库，
+    没有 JS 引擎就没有公式。Edge 在 Windows 10/11 上是系统自带组件，比"再装一个转换器"
+    更现实；找不到浏览器时退回纯文本公式（不阻断打印）。
+    """
+    env = (os.environ.get("HN_PRINT_BROWSER") or "").strip()
+    if env and os.path.isfile(env):
+        return env
+    candidates = [
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def _convert_math_html_to_pdf(html: str, output_pdf: str) -> None:
+    """含公式的 Markdown HTML → PDF（无头浏览器 + 本地 KaTeX，全程离线）。"""
+    browser = _find_headless_browser()
+    if not browser:
+        raise RuntimeError(
+            "没有可用的无头浏览器（Microsoft Edge / Google Chrome），无法渲染 LaTeX 公式")
+    katex_css, katex_js, katex_auto = _katex_assets()
+    # 远程引用照旧剥掉：浏览器同样不该替顾客去外网取图/取样式（内网探测 / 打点）
+    html, n_remote = _strip_remote_refs(html)
+    if n_remote:
+        logger.warning(f"已移除 {n_remote} 处外部引用（远程图片/CSS/跳转）："
+                       f"转换过程不访问外网，相关图片不会打印")
+    html = html.replace(
+        "</head>",
+        f"<style>{katex_css}</style><style>{_MATH_PAGE_CSS}</style></head>", 1)
+    html = html.replace(
+        "</body>",
+        f"<script>{katex_js}</script><script>{katex_auto}</script>"
+        f"<script>{_MATH_RENDER_JS}</script></body>", 1)
+    out_abs = os.path.abspath(output_pdf)
+    with tempfile.TemporaryDirectory(prefix="_mdmath_") as td:
+        page_path = os.path.join(td, "page.html")
+        with open(page_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        cmd = [
+            browser,
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--mute-audio",
+            "--hide-scrollbars",
+            "--virtual-time-budget=15000",
+            f"--user-data-dir={os.path.join(td, 'profile')}",
+            "--no-pdf-header-footer",
+            "--print-to-pdf-no-header",
+            f"--print-to-pdf={out_abs}",
+            "file:///" + page_path.replace("\\", "/"),
+        ]
+        logger.info(f"公式渲染：{os.path.basename(browser)} 无头模式渲染 PDF（超时 150s）")
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=150)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"无头浏览器渲染失败 (rc={result.returncode}): "
+                f"{(result.stderr or '').strip()[:300]}")
+    if not _pdf_product_ok(output_pdf):
+        raise RuntimeError("无头浏览器没有产出可用的 PDF（产物为空或不是 PDF）")
+
+
 def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
     """Markdown → HTML → PDF（S0-09：转换前做危险语法扫描 + 本地图片内联）。"""
     import markdown
@@ -1651,6 +1800,16 @@ def _convert_markdown_to_pdf(file_path: str, output_pdf: str) -> None:
     _scan_unsafe_html(html)  # 先拒危险语法（file:/脚本/事件处理器…），再谈图片
     # 本地相对路径图片内联成 data: URI —— 必须做在转换**之前**（附录 A-7）
     html = _inline_local_images(html, os.path.dirname(os.path.abspath(file_path)))
+
+    # 2026-11-13：含 LaTeX 公式时改走「无头浏览器 + 本地 KaTeX」；否则保持 wkhtmltopdf。
+    if _md_has_math(md_text):
+        try:
+            _convert_math_html_to_pdf(html, output_pdf)
+            logger.info(f"Markdown（含 LaTeX 公式）→ PDF 完成: {output_pdf}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"公式渲染失败，回落到纯文本公式输出（公式会保留原始 LaTeX 写法）：{e}")
 
     _convert_html_to_pdf(html, output_pdf, is_content=True)
     logger.info(f"Markdown → PDF 完成: {output_pdf}")

@@ -172,8 +172,11 @@ check("★ 降级链内两处都判产物（Word / WPS 各一次）",
       str(_CODE.count("if _pdf_product_ok(output_pdf):")))
 check("★ 链外旧写法已消失（不再直接 getsize == 0）",
       "os.path.getsize(output_pdf) == 0" not in _CODE)
-check("★ 链外改用同一实现（convert_to_pdf 末尾也调 _pdf_product_ok）",
-      _CODE.count("_pdf_product_ok(output_pdf)") == 3,
+# 4 处：降级链两支（wps/lo）+ convert_to_pdf 末尾 + Markdown 公式渲染
+# （2026-11-13 新增无头浏览器渲染，产物同样要过这同一道校验 —— 浏览器静默失败时
+#  不能把空文件/MHTML 当 PDF 往下传）
+check("★ 链外改用同一实现（convert_to_pdf 末尾 + 无头浏览器公式渲染都过 _pdf_product_ok）",
+      _CODE.count("_pdf_product_ok(output_pdf)") == 4,
       str(_CODE.count("_pdf_product_ok(output_pdf)")))
 check("★ 无效产物会被丢弃（降级前先删残次品）",
       _CODE.count("_discard_invalid_pdf(output_pdf)") == 2,

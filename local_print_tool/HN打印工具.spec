@@ -17,7 +17,8 @@ a = Analysis(
     # tests/verify_installer_excludes.py 与 paths.py 做集合比对。
     # （theme_settings.json 曾同时出现在这里与 Excludes 里，自相矛盾：它按 paths.py 属用户数据，
     #   已从 datas 移除 —— 主题设置丢失时程序按默认主题启动。）
-    datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('finance/settlement.html', 'finance'), ('finance/chart.umd.min.js', 'finance')],
+    datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('finance/settlement.html', 'finance'), ('finance/chart.umd.min.js', 'finance'), ('assets/katex', 'assets/katex')],  # assets/katex：md 里的 LaTeX（katex.min.js + auto-render.min.js + 内联字体的 css）
+    # 漏收 = 打包版公式静默回落成原始 TeX 文本（converter._katex_assets 抛错后走 wkhtmltopdf 兜底）
     # S1-02 更新链加固（2026-10-23）：updater.py 用 cryptography 校验 update.json 的
     # ed25519 签名，是**延迟 import**（点「检查更新」时才进）—— PyInstaller 的静态分析
     # 看不到它，必须显式列；漏收 = 打包后门店机一检查更新就 ImportError（新版收不到更新，

@@ -166,16 +166,27 @@ check("②b 打开的就是转换好的缓存产物", bool(_STARTFILE_CALLS)
       str(_STARTFILE_CALLS))
 check("②c 日志里留了一行（用户可回溯）", "预览 PDF" in win._log_text.toPlainText())
 
-# ═══════════════ ③ 还没有 PDF：灰掉 + tooltip 说清下一步 ═══════════════
+# ═══════════════ ③ 还没有 PDF：能现转的照旧可点（2026-11-13 改），真转不了的才灰 ═══════════════
+# 改口径的原因：md/txt/csv 的页数云端永远分析不出来（页数分析只覆盖 pdf/doc/docx），
+# 旧判据「cached_pdf / 原件是 PDF / page_count>0」三条都不成立 ⇒ 这类文件第一次打印之前
+# 永远预览不了，用户的理解就是「md 不支持预览 PDF」。现在加了第 ④ 条「源文件可转换」。
 TODO = make_source("还在转换.docx")
 seed([job_of(TODO, "", page_count=0)])
 menu3 = menu_for_selection()
 pv3 = preview_action(menu3)
-check("③a 没有产物且页数未知 ⇒ 菜单项仍在但灰掉",
-      pv3 is not None and not pv3.isEnabled())
-check("③b 灰掉时 tooltip 解释原因并指路「重新转换」",
-      pv3 is not None and "重新转换" in (pv3.toolTip() or ""),
-      pv3.toolTip() if pv3 else "")
+check("③a 没有产物但源文件可转换（docx）⇒ 菜单可点，点了先现转",
+      pv3 is not None and pv3.isEnabled())
+
+# 反过来：源文件在、但转换器不认这个扩展名 ⇒ 仍然灰掉，且 tooltip 要指路「重新转换」
+NOPE = make_source("奇怪格式.xyz", b"not convertible")
+seed([job_of(NOPE, "", page_count=0)])
+menu3b = menu_for_selection()
+pv3b = preview_action(menu3b)
+check("③b 不可转换的源文件 + 页数未知 ⇒ 菜单项仍在但灰掉",
+      pv3b is not None and not pv3b.isEnabled())
+check("③c 灰掉时 tooltip 解释原因并指路「重新转换」",
+      pv3b is not None and "重新转换" in (pv3b.toolTip() or ""),
+      pv3b.toolTip() if pv3b else "")
 
 # ═══════════════ ④ 原件本身就是 PDF ⇒ 直接预览原件 ═══════════════
 SRC_PDF = make_source("原件.pdf", b"%PDF-1.4\n% original\n")
