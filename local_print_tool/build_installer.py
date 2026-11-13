@@ -1,7 +1,7 @@
 """build_installer.py — 构建本地打印工具一体化安装包
 
 用法: python build_installer.py [--skip-pyinstaller]
-产物: dist/h_n-printer_setup_{版本}.exe
+产物: dist/h_n-printer_setup_v{版本}.exe（2026-11-13 起版本号前加 v，如 h_n-printer_setup_v4.6.13.exe）
 
 流程: PyInstaller(API, 规避中文 argv 传参问题) → Inno Setup(ISCC, subprocess UTF-16 传参)
 依赖: Inno Setup 7 (ISCC.exe)；--skip-pyinstaller 跳过重新打包（dist 已是最新时）
@@ -21,6 +21,11 @@ _ISCC_CANDIDATES = (
     r"C:\Program Files\Inno Setup 7\ISCC.exe",
     r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
 )
+
+
+def _setup_fname(version: str) -> str:
+    """安装包文件名（与 .iss 的 OutputBaseFilename 同口径，用于复核产物确实生成）。"""
+    return f"h_n-printer_setup_v{version}.exe"
 
 
 def _read_app_version() -> str:
@@ -62,7 +67,12 @@ def main() -> None:
     version = _read_app_version()
     print(f"==> 2/2 Inno Setup 打包安装包 v{version}")
     _inno_build(version)
-    print(f"BUILD OK: dist/h_n-printer_setup_{version}.exe")
+    setup = os.path.join(ROOT, "dist", _setup_fname(version))
+    if not os.path.isfile(setup):
+        # ISCC 覆盖「删除悬挂态」的旧同名产物时会静默不输出，必须自己复核产物
+        print(f"BUILD FAILED: 未生成 {setup}（同名旧产物可能处于删除悬挂态，换 /F<新名> 重试）")
+        sys.exit(1)
+    print(f"BUILD OK: {setup} ({os.path.getsize(setup):,} B)")
 
 
 if __name__ == "__main__":

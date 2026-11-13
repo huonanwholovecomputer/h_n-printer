@@ -90,11 +90,20 @@ def take(lines, a, b):
 MOVE_UNDO = (('other/tests/', 'tests/'), ('other/tools/', 'tools/'),
              ('other/logs/', 'logs/'), ('other/_tmp_staging', '_tmp_staging'))
 
+# 2026-11-13 安装包文件名加 v 前缀（用户要求 h_n-printer_setup_{版本}.exe →
+# h_n-printer_setup_v{版本}.exe）。基线是改名前的原文，对账时把两侧的 v 前缀归一掉再比 ——
+# 仍然是逐字对账（少一个字照样红），只是把「计划内改名」与「内容丢失」区分开。
+RENAME_UNDO = re.compile(r'h_n-printer_setup_v(?=[0-9{])')
+
 
 def unshift_move(text):
     for new, old in MOVE_UNDO:
         text = text.replace(new, old)
     return text
+
+
+def canon(text):
+    return RENAME_UNDO.sub('h_n-printer_setup_', unshift_move(text))
 
 
 def verify_pair(tag, base_path, plan, crlf_ok=False):
@@ -150,7 +159,7 @@ def verify_pair(tag, base_path, plan, crlf_ok=False):
         for a, b in ranges:
             seg = take(lines, a, b)
             total_bytes += sum(len(l.encode()) for l in seg.split('\n') if l.strip())
-            p = unshift_move(text).find(unshift_move(seg))
+            p = canon(text).find(canon(seg))
             if p < 0:
                 c_ok = False
                 detail.append('%s 少了第 %d-%d 行' % (rel, a, b))

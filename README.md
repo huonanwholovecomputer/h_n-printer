@@ -103,7 +103,7 @@ python main.py
 
 ```bash
 cd local_print_tool
-python build_installer.py            # 产出 dist/h_n-printer_setup_{版本}.exe
+python build_installer.py            # 产出 dist/h_n-printer_setup_v{版本}.exe
 python build_installer.py --skip-pyinstaller   # dist 已是最新时跳过重打包
 ```
 

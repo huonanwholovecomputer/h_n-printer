@@ -1,7 +1,7 @@
 ; HN打印工具 一体化安装包（Inno Setup 7）
 ; 构建：python ..\build_installer.py（推荐，自动从 gui.py 读 APP_VERSION 传入）
 ;   或  ISCC.exe /DMyAppVersion=4.5.7 HN打印工具.iss
-; 输出：..\dist\h_n-printer_setup_{版本}.exe
+; 输出：..\dist\h_n-printer_setup_v{版本}.exe（2026-11-13 起版本号前加 v，如 h_n-printer_setup_v4.6.13.exe）
 ;
 ; ⚠ 用户数据（云端配置/主题/收支/离线库/暂存副本/攒批账本/缓存/日志）统一存
 ;   %APPDATA%\HN打印工具（见 paths.py），安装包里**不应**有任何一项。
@@ -39,7 +39,8 @@ DefaultDirName={autopf}\h_n printer
 DefaultGroupName=HN打印工具
 UninstallDisplayIcon={app}\HN打印工具.exe
 OutputDir=..\dist
-OutputBaseFilename=h_n-printer_setup_{#MyAppVersion}
+; 文件名带 v 前缀（用户 2026-11-13 要求）；COS 对象名与清单 url 必须与这里逐字符一致。
+OutputBaseFilename=h_n-printer_setup_v{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
