@@ -1009,6 +1009,9 @@ class ManualDuplexDialog(QDialog):
         _pf.setPointSize(_pf.pointSize() + 2)
         self._pass1.setFont(_pf)
         self._pass1.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # 2026-11-13：文案里多了「打印实测 + 等你翻纸已 …」之后会超出一行，允许换行，
+        # 否则窗口最小宽 600px 时右半句被裁掉（截图里就裁过）。
+        self._pass1.setWordWrap(True)
         lay.addWidget(self._pass1)
 
         self._pass1_hint = QLabel("")
@@ -1046,6 +1049,10 @@ class ManualDuplexDialog(QDialog):
         self._pass1_final = 0.0
         self._pass1_done = False       # 用显式标志，别拿 0.0 当"还没冻结"（0 秒也是合法结果）
         self._pass1_frozen_by_gate = False  # 这份冻结值是"闸门到点先记的"（等权威实测覆盖）
+        # 2026-11-13：worker 报来的「打印实测」（数据全送出去 / 队列排空的程序侧耗时）。
+        # 只用来 ①写速度样本 ②在计时文案里并列显示 —— **不冻结计时**，第 1 趟何时结束
+        # 只由操作员点「继续」决定（他要走过去把纸叠搬回进纸盒，这段也算第 1 趟）。
+        self._pass1_measured = 0.0
         self._pass1_timer = QTimer(self)
         self._pass1_timer.timeout.connect(self._pass1_tick)
         # 「批次结束 → 稍候自动关窗」的定时器。用可取消的 QTimer 而不是 singleShot：
@@ -1158,14 +1165,33 @@ class ManualDuplexDialog(QDialog):
         except (TypeError, ValueError):
             return False
 
-    def _pass1_text(self, elapsed: float, *, final: bool = False) -> str:
+    def _pass1_text(self, elapsed: float, *, final: bool = False,
+                    measured: float = 0.0) -> str:
+        """第 1 趟计时文案 —— 这里必须分清两个「用时」，别再混成一个数。
+
+        ★ 2026-11-13 用户现场：「第一趟的打印貌似还是会接受到打印的完成信号，然后计时终止了
+        ……用户的点击代表着用户已经把纸张转移到入纸口，这一步包含了移动花费的时间。」
+          · 打印实测 measured：worker 报的「数据全送出去 / 队列排空」的程序侧耗时
+            （速度样本只学它，绝不掺操作员手速 —— 否则模型越学越短）；
+          · 界面用时 elapsed：从第 1 趟开打走到**现在**。操作员点「继续」才算这一趟结束，
+            其中包含他从出纸槽把纸叠搬回进纸盒的时间（真实的人工节拍，正是用户要计的那段）。
+        未点继续时两者并列显示；点继续后把「翻纸移动」折进括号，一眼看得出差在哪。
+        """
         est = getattr(self, "_pass1_est", 0.0)
+        measured = float(measured or 0.0)
         head = f"⏱ 第 1 趟{'用时' if final else '已用'} {format_duration(elapsed)}"
         if est > 0:
             head += f" / 预计 {format_duration(est)}"
-        if est > 0 and elapsed > est:
-            over = int(elapsed - est)
-            head += f"（超出 {over} 秒）"
+        basis = measured if measured > 0 else float(elapsed)
+        if est > 0 and basis > est:
+            head += f"（超出 {int(basis - est)} 秒）"
+        moving = max(0.0, float(elapsed) - measured) if measured > 0 else 0.0
+        if measured > 0 and final and moving >= 1.0:
+            head += (f"（打印实测 {format_duration(measured)}"
+                     f" + 翻纸移动 {format_duration(moving)}）")
+        elif measured > 0 and not final:
+            head += (f" · 打印实测 {format_duration(measured)}，"
+                     f"等你翻纸已 {format_duration(moving)}（纸出齐就点继续）")
         return head
 
     def _pass1_tick(self):
@@ -1191,11 +1217,33 @@ class ManualDuplexDialog(QDialog):
         if self._mode == "waiting":
             return      # 等待上一个任务：本态计时器应当是停的，万一被 tick 也绝不许显示「已用」
         elapsed = self._pass1_final if self._pass1_done else self._elapsed_sec()
-        self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done))
-        self._pass1.setStyleSheet(f"color: {self.pass1_color(elapsed, self._pass1_est)};")
+        measured = float(getattr(self, "_pass1_measured", 0.0) or 0.0)
+        self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done,
+                                            measured=measured))
+        # 配色按「打印实测」判（2026-11-13）：操作员站在出纸槽前搬纸的那几十秒，
+        # 不该把计时染成"超出预估"的红色 —— 那段时间是人工节拍，不是打印机慢。
+        basis = measured if (measured > 0 and not self._pass1_done) else elapsed
+        self._pass1.setStyleSheet(f"color: {self.pass1_color(basis, self._pass1_est)};")
         # ★ 2026-11-11 起这里**不再**按时间自动放行（原来到点就直接切「可翻纸」）：
         #   第 2 趟什么时候开始只由操作员点按钮决定，见 `announce()` 里的用户口径。
         #   计时器继续走，直到操作员点「继续」才冻结。
+
+    def note_pass1_measured(self, seconds: float):
+        """记下 worker 报来的**打印实测**（第 1 趟数据全送出去 / 打印队列排空的耗时）。
+
+        ★ 2026-11-13 起这里**不再冻结计时**（用户现场：还没点「继续」，计时就停在 01:58）：
+        那一笔只代表"纸打完了"，第 1 趟的结束时刻仍是操作员点「继续」那一下 —— 他要走过去
+        把纸叠搬回进纸盒，这段时间（翻纸移动）也属于第 1 趟的真实节拍。冻结交给 `_on_go`。
+        这一笔的用处只有两个：①写速度样本（不掺手速）②在计时文案里并列显示。
+        """
+        try:
+            v = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if v <= 0:
+            return
+        self._pass1_measured = v
+        self._pass1_tick()
 
     def freeze_pass1(self, seconds: float | None = None):
         """冻结第 1 趟计时。传 seconds 时用**程序实测的权威值**（worker 报的），
@@ -1265,6 +1313,7 @@ class ManualDuplexDialog(QDialog):
         self._pass1_final = 0.0
         self._pass1_done = False
         self._pass1_frozen_by_gate = False
+        self._pass1_measured = 0.0
         self._flip_reported = False
         self._flip_gate_at = 0.0
         self._left = 0                  # 翻纸确认倒计时：本批还没开始（闸门到点才起算）
@@ -2709,8 +2758,13 @@ class PrintSpeedDialog(QDialog):
 
     窗口内容：
       · 第 1 趟耗时模型：启动/预热（秒）、每张纸（秒）—— 0 = 该分量用自动学习值；
-      · 翻纸放行：放行比例（%）、人工翻页准备时间（秒）
-        放行时刻 = 第 1 趟预估 × 比例 + 翻页准备时间
+      · 完成回报门槛：放行比例（%）、人工翻页准备时间（秒）
+        门槛 = 第 1 趟预估 × 比例 + 翻页准备时间
+        （2026-11-13：这两个数**不再决定第 2 趟何时能点** —— 按钮一直可点、只认操作员点击。
+         它们现在只用来判断打印机那句「打完了」可不可信：早于门槛的完成回报按假信号忽略，
+         既不冻结计时也不写进学习样本。）
+      · 窗口底部还有一块**只读结果区**：生效模型、自动学习值、按当前参数推算的典型张数、
+        完成回报门槛、最近一次实测 —— 用户不用去翻日志就知道这些数字算出了什么。
       · 底部：打印测速（1 张 + 10 张空白页，写进速度样本）/ 恢复自动学习 / 保存 / 取消
 
     **能力适配（2026-11-02）**：这套参数唯一的使用者是 `ManualDuplexDialog` 的
@@ -2728,6 +2782,7 @@ class PrintSpeedDialog(QDialog):
         self.setWindowTitle("打印速度")
         self.setMinimumWidth(520)
         prof = profile or PrinterProfile()
+        self._prof = prof          # 结果区（_sync_result）要按档案里的实测样本现算
         # 能力三态：True=自动双面 / False=人工翻纸 / None=未确认
         cap = prof.auto_duplex if isinstance(prof.auto_duplex, bool) else None
         self._capability = cap
@@ -2789,7 +2844,7 @@ class PrintSpeedDialog(QDialog):
         lay.addWidget(g1)
 
         # ── 翻纸放行 ──
-        g2 = QGroupBox("翻纸放行（什么时候允许点「▶ 继续打第 2 趟」）")
+        g2 = QGroupBox("完成回报门槛（判断打印机那句「打完了」可不可信）")
         f2 = QFormLayout(g2)
         self._ratio = QSpinBox()
         self._ratio.setRange(0, 100)
@@ -2797,8 +2852,10 @@ class PrintSpeedDialog(QDialog):
         self._ratio.setSuffix(" %")
         self._ratio.setValue(int(round(float(prof.gate_ratio if prof.gate_ratio is not None
                                              else 0.5) * 100)))
-        self._ratio.setToolTip("第 1 趟预估完成到这个比例就放开按钮（默认 50%）。"
-                               "纸越多、预估误差越大，固定提前 5 秒不再合适。")
+        self._ratio.setToolTip("门槛 = 第 1 趟预估 × 这个比例 + 人工翻页准备时间。"
+                               "比门槛更早到达的「完成」回报一律当假信号（HP LaserJet 1020 "
+                               "这类机器只回报「开始打印」）。它不再决定第 2 趟何时能点 —— "
+                               "按钮从窗口出现那刻起就能点，什么时候算打完由你按。")
         f2.addRow("放行比例：", self._ratio)
         self._ready = QDoubleSpinBox()
         self._ready.setRange(0.0, 3600.0)
@@ -2806,8 +2863,8 @@ class PrintSpeedDialog(QDialog):
         self._ready.setSingleStep(5.0)
         self._ready.setSuffix(" 秒")
         self._ready.setValue(float(prof.flip_ready_sec or 0.0))
-        self._ready.setToolTip("第 1 趟打完后，留给操作员走过去把纸叠搬回进纸盒的时间。"
-                               "这段是人工经验，机器量不出来，所以允许手填。")
+        self._ready.setToolTip("操作员从出纸槽把纸叠搬回进纸盒要多久（人工经验，机器量不出来）。"
+                               "它现在加在「完成回报门槛」上，也在结果区里算进典型张数的对比。")
         f2.addRow("人工翻页准备时间：", self._ready)
         self._formula = QLabel("")
         self._formula.setWordWrap(True)
@@ -2817,21 +2874,31 @@ class PrintSpeedDialog(QDialog):
         self._ready.valueChanged.connect(self._sync_formula)
         self._sync_formula()
         lay.addWidget(g2)
+
+        # ── 结果区（2026-11-13 用户要求：实际算出来的数要显示在窗口里）──
+        self._result = QLabel("")
+        self._result.setWordWrap(True)
+        self._result.setStyleSheet("font-size: 11px; color: #7f8c8d;")
+        lay.addWidget(self._result)
+        for _w in (self._a, self._b, self._ratio, self._ready):
+            _w.valueChanged.connect(self._sync_result)
+        self._sync_result()
         self._g_model, self._g_gate = g1, g2   # 验收脚本据此检查能力适配（自动双面 ⇒ 整体灰掉）
         if cap is True:
             # 组标题自己也交代一句：自动双面的机器上，「第 1 趟 / 翻纸放行」根本不存在
             g1.setTitle(g1.title().replace("（0 = 该分量仍用自动学习值）",
                                            "· 仅人工翻纸机型用"))
-            g2.setTitle(g2.title().replace("（什么时候允许点「▶ 继续打第 2 趟」）",
+            g2.setTitle(g2.title().replace("（判断打印机那句「打完了」可不可信）",
                                            "· 仅人工翻纸机型用"))
 
         # 这段「完成回报早于出纸」只对走人工翻纸的机组成立（驱动只回报「开始打印」），
         # 自动双面机型根本不用预估放行 ⇒ 不展示，免得把别家打印机的行为说成事实。
         note = None
         if cap is not True:
-            note = QLabel("提示：这套预估只在「人工翻纸」时起作用 —— 若本机像 HP LaserJet 1020 "
-                          "那样只回报「开始打印」、不回报「纸打完」，按钮就按上面的预估放行；"
-                          "放行前仍会显示还要等几秒。")
+            note = QLabel("提示：这套预估只在「人工翻纸」时起作用，用途有两个 —— "
+                          "①算窗口里那句「预计 mm:ss」；②判断打印机那句「打完了」可不可信"
+                          "（本机若像 HP LaserJet 1020 只回报「开始打印」，早于门槛的回报一律"
+                          "当假信号）。第 2 趟什么时候开始只由你点「▶ 继续打第 2 趟」决定。")
             note.setWordWrap(True)
             note.setStyleSheet("color: #7f8c8d; font-size: 11px;")
             lay.addWidget(note)
@@ -2877,14 +2944,68 @@ class PrintSpeedDialog(QDialog):
 
     def _sync_formula(self):
         self._formula.setText(
-            f"放行时刻 = 第 1 趟预估 × {self._ratio.value()}%"
+            f"回报门槛 = 第 1 趟预估 × {self._ratio.value()}%"
             + (f" + {self._ready.value():.0f} 秒（人工翻页准备）"
                if self._ready.value() > 0 else "")
-            + "；算出来不足 1 秒时直接放行。")
+            + "；早于它的完成回报按假信号忽略（第 2 趟只认你点按钮）。")
+
+    def _sync_result(self):
+        """把「这几个数到底算出了什么」直接摆在窗口里（2026-11-13 用户要求）。
+
+        四类参数各自的消费者只有一处：`PrinterProfile.estimate_first_pass` /
+        `ManualDuplexDialog.flip_gate_at`。以前它们算出来的数只出现在下一批的计时文案里，
+        操作员在窗口里改了半天也不知道改的是什么 ⇒ 这里现算给他看。
+        """
+        try:
+            from printer_config import usable_speed_samples
+        except Exception:                     # 老版本/被裁掉的档案模块：退回不分类
+            def usable_speed_samples(samples):
+                return list(samples or [])
+        prof = getattr(self, "_prof", None) or PrinterProfile()
+        ma, mb = float(self._a.value()), float(self._b.value())
+        fit_a, fit_b = fit_print_speed(prof.speed_samples)
+        eff_a = ma if ma > 0 else fit_a
+        eff_b = mb if mb > 0 else fit_b
+        used = len(usable_speed_samples(prof.speed_samples))
+        ratio = float(self._ratio.value()) / 100.0
+        ready = float(self._ready.value())
+
+        def est(n):
+            return eff_a + eff_b * n
+
+        def gate(n):
+            return est(n) * ratio + ready
+
+        lines = [
+            f"生效模型：启动 ≈{eff_a:.1f} 秒 + 每张 ≈{eff_b:.2f} 秒"
+            + ("（含手动覆盖）" if (ma > 0 or mb > 0) else "（全部来自自动学习）"),
+            (f"自动学习：启动 ≈{fit_a:.1f} 秒 + 每张 ≈{fit_b:.2f} 秒 · 用 {used} 条实测拟合"
+             if used else "自动学习：还没有实测样本，正在用出厂默认值"),
+            "按当前参数推算（第 1 趟打印）："
+            + " · ".join(f"{n} 张 ≈ {format_duration(est(n))}" for n in (1, 10, 26, 50)),
+            (f"完成回报门槛（26 张）：≈ {format_duration(gate(26))}"
+             f"（= 预估 × {self._ratio.value()}% + {ready:.0f} 秒）：比它更早到的"
+             "「打完了」回报按假信号忽略，不冻结计时、不进学习样本"),
+        ]
+        samples = [x for x in (prof.speed_samples or [])
+                   if isinstance(x, (list, tuple)) and len(x) >= 2]
+        if samples:
+            try:
+                n0, t0 = int(samples[-1][0]), float(samples[-1][1])
+                lines.append(f"最近一次实测：{n0} 张 / {format_duration(t0)}"
+                             f"（这条也参与了上面的拟合）")
+            except (TypeError, ValueError):
+                pass
+        lines.append("第 2 趟什么时候开始只由你点「▶ 继续打第 2 趟」决定 —— 这套参数不参与放行")
+        self._result.setText("\n".join(lines))
 
     def _on_reset(self):
         self._a.setValue(0.0)
         self._b.setValue(0.0)
+        try:
+            self._sync_result()
+        except Exception:
+            pass
 
     def values(self) -> dict:
         return {
@@ -16576,7 +16697,7 @@ class MainWindow(QMainWindow):
     def _on_duplex_speed_sample(self, sheets: int, seconds: float):
         """第 1 趟**实测**（程序侧权威值，与操作员按不按按钮无关）→ 两用：
 
-        ① 常驻窗按它冻结计时（界面时钟只做兜底）；
+        ① 常驻窗按它标注「打印实测」（**不冻结计时**：第 1 趟何时结束由操作员点「继续」决定）；
         ② 写进本机打印队列档案自动学习（真实作业就是最好的样本，零额外用纸；
            异常样本由 add_speed_sample 内部丢弃）。
 
@@ -16594,12 +16715,12 @@ class MainWindow(QMainWindow):
                       f"（预估 {format_duration(dlg._pass1_est)}）—— 打印机只回报「开始打印」，"
                       f"这笔实测不可信：不冻结计时、不写速度样本")
             return
-        # ① 先用权威值冻结窗口计时（信号按发射顺序先于此处的 flip_required，所以窗口最终显示的就是它）。
-        #    已经按闸门时刻"先冻结"过的（_pass1_frozen_by_gate）也要用权威值覆盖：
-        #    闸门时刻只是"能点了"，不是第 1 趟真实用时。
+        # ① 只把这一笔记进窗口做**并列显示**，**不冻结计时**（2026-11-13 用户现场：
+        #    还没点「继续」，计时却停在 01:58 —— 那是这笔打印实测，不是第 1 趟结束）。
+        #    第 1 趟何时结束只由操作员点击决定；他搬纸那段时间也算进去（见 note_pass1_measured）。
         try:
             if dlg is not None:
-                dlg.freeze_pass1(seconds)
+                dlg.note_pass1_measured(seconds)
         except Exception:
             pass
         # ② 学习（与第 2 趟实测共用同一套写入，见 _record_speed_sample）

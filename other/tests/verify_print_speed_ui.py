@@ -72,6 +72,38 @@ check("测速按钮通过信号交给主窗口（窗口自己不打纸）",
 dlg.close()
 
 # ══════════════════════════════════════════════════════════════════════
+print("\n=== ①b 结果区：实际算出来的数要摆在窗口里（2026-11-13 用户要求）===")
+# 用户原话：「这些预填的数字在实际的时间计算过程中有什么作用呢？实际计算出的数字是不是
+# 应该在打印速度界面中显示出来呢？」⇒ 窗口底部必须现算给他看：生效模型 / 自动学习 /
+# 典型张数的第 1 趟预估 / 完成回报门槛 / 最近一次实测。
+prof_r = pc.PrinterProfile(speed_manual_a=7.0, speed_manual_b=5.6,
+                           gate_ratio=0.6, flip_ready_sec=5.0,
+                           speed_samples=[[26, 118.0], [10, 60.0]])
+dr = gui.PrintSpeedDialog(None, prof_r, "HP LaserJet 1020")
+txt = dr._result.text()
+check("结果区给出「生效模型」（手动填的值优先，一眼看出是手动还是自动）",
+      "7.0 秒" in txt and "5.60 秒" in txt and "含手动覆盖" in txt, txt)
+check("结果区同时给出自动学习的拟合值与参与拟合的样本条数",
+      "自动学习" in txt and "2 条实测" in txt, txt)
+check("结果区按当前参数推算典型张数（26 张 = 7.0 + 5.60×26 ≈ 02:32）",
+      "26 张 ≈ 02:32" in txt and "10 张 ≈ 01:03" in txt, txt)
+check("结果区给出完成回报门槛（26 张：02:32 × 60% + 5 秒 ≈ 01:36）",
+      "完成回报门槛" in txt and "01:36" in txt and "26 张" in txt, txt)
+check("结果区给出最近一次实测（档案里最后一条样本：10 张 / 01:00）",
+      "最近一次实测：10 张 / 01:00" in txt, txt)
+check("结果区说清「第 2 趟只认你点按钮」（这套参数不参与放行）",
+      "只由你点" in txt and "不参与放行" in txt, txt)
+dr._ratio.setValue(100)
+check("改比例后结果区实时重算（门槛按 100% 走）",
+      "× 100%" in dr._result.text() and dr._result.text() != txt, dr._result.text())
+dr._a.setValue(0.0)
+check("把启动清零 ⇒ 生效模型里的启动分量退回自动学习的拟合值（每张纸仍是手填的 5.60）",
+      "启动 ≈23.8 秒" in dr._result.text()
+      and "每张 ≈5.60 秒" in dr._result.text()
+      and "含手动覆盖" in dr._result.text(), dr._result.text())
+dr.close()
+
+# ══════════════════════════════════════════════════════════════════════
 print("\n=== ② 菜单入口与保存链路 ===")
 check("帮助菜单改名「打印速度…」并仍走 _on_calibrate_speed",
       'QAction("打印速度…"' in SRC and "speed_action.triggered.connect(self._on_calibrate_speed)" in SRC

@@ -1600,9 +1600,20 @@ _dlg_learn = gui.ManualDuplexDialog()
 _dlg_learn.announce("学习用", sheets=10, estimate_sec=43.0)
 _lw_dlg = _LearnWin(_learn_cfg2, _cfg9b, dialog=_dlg_learn)
 gui.MainWindow._on_duplex_speed_sample(_lw_dlg, 10, 43.0)
-check("★ 主线程拿实测值冻结窗口计时（界面时钟只兜底），显示的就是程序实测",
-      _dlg_learn._pass1_done and abs(_dlg_learn._pass1_final - 43.0) < 0.01
-      and "用时 00:43" in _dlg_learn._pass1.text(), _dlg_learn._pass1.text())
+# 2026-11-13 用户现场：「还没点继续，计时就停在 01:58」—— 那一笔是打印实测，不是第 1 趟结束。
+# 口径：实测只标注、不冻结；第 1 趟何时结束＝操作员点击（含搬纸那段）。
+check("★ 主线程收到打印实测 → 只标注、不冻结计时（第 1 趟何时结束仍由操作员点「继续」决定）",
+      not _dlg_learn._pass1_done and _dlg_learn._pass1_timer.isActive()
+      and abs(_dlg_learn._pass1_measured - 43.0) < 0.01
+      and "打印实测 00:43" in _dlg_learn._pass1.text()
+      and "已用" in _dlg_learn._pass1.text(), _dlg_learn._pass1.text())
+_dlg_learn._elapsed_sec = lambda: 58.0          # 操作员搬完纸才点，界面时钟已经 58 秒
+_dlg_learn._on_go()
+check("★ 点「继续」才冻结：用时＝界面时钟（含翻纸移动），文案并列给出打印实测与移动耗时",
+      _dlg_learn._pass1_done and abs(_dlg_learn._pass1_final - 58.0) < 0.01
+      and "用时 00:58" in _dlg_learn._pass1.text()
+      and "打印实测 00:43" in _dlg_learn._pass1.text()
+      and "翻纸移动 00:15" in _dlg_learn._pass1.text(), _dlg_learn._pass1.text())
 check("同一笔实测也写进了档案（一个信号两用）",
       gui.PrinterConfig.load(_cfg9b).get_profile("Fake Print").speed_samples == [[10, 43.0]])
 
