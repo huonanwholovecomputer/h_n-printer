@@ -17,6 +17,7 @@ const TAP_PX = 30;          // 两次 tap 的位移容差（超过就算两次�
 const SWIPE_PX = 45;        // 未放大时的翻页阈值
 const SWIPE_RATIO = 1.2;    // 横向位移要明显大于纵向才算翻页
 const ANIM_MS = 220;        // 双击放大/还原的过渡时长（与 WXSS 的 transition 一致）
+const SLIDE_MS = 180;       // 翻页：淡出/滑出的时长（与 WXSS 里 .pv-slide 的 transition 一致）
 
 /* 一次只有一个全屏层，手势中间态放模块级即可 */
 const g = {
@@ -33,6 +34,7 @@ const g = {
   lastTapX: 0,
   lastTapY: 0,
   animTimer: null,
+  seq: 0,          // 翻页动画序号：连点/快速滑动时只让最后一次动画落地
 };
 
 function initialData() {
@@ -48,8 +50,30 @@ function initialData() {
       y: 0,
       animating: false,
       failed: false,
+      topPad: 0,        // 顶部两件套（✕ / 页码）的 px 间距，见 topPadPx()
+      prevUrl: '',      // 翻页时正在滑出的旧图（双层交叉用，动画结束即清空）
+      swapping: false,  // true ⇒ 两层都在，按 swapDir 播 keyframes
+      swapDir: 1,       // 1 = 往后翻（新图从右进），-1 = 往前翻（新图从左进）
     },
   };
+}
+
+/* 顶部安全区（2026-11-13 用户真机截图：✕ 与页码被系统状态栏压住）。
+   微信里 env(safe-area-inset-top) 在多数机型/devtools 上取到 0，而全屏层是 fixed 铺满屏幕，
+   所以这里用 statusBarHeight 现算一版 px，模板用行内 style 盖过 WXSS 的兜底值。 */
+function topPadPx() {
+  let sb = 0;
+  try {
+    if (typeof wx.getWindowInfo === 'function') {
+      sb = Number((wx.getWindowInfo() || {}).statusBarHeight) || 0;
+    } else if (typeof wx.getSystemInfoSync === 'function') {
+      sb = Number((wx.getSystemInfoSync() || {}).statusBarHeight) || 0;
+    }
+  } catch (e) {
+    sb = 0;
+  }
+  if (!(sb > 0)) sb = 24;   // 拿不到就按常见状态栏高度兜底，宁可多让一点
+  return Math.round(sb + 12);
 }
 
 function viewSize() {
@@ -122,6 +146,7 @@ function open(ctx, urls, index) {
   g.mode = '';
   g.moved = false;
   g.lastTapAt = 0;
+  g.seq += 1;
   ctx.setData({
     pv: {
       visible: true,
@@ -134,6 +159,10 @@ function open(ctx, urls, index) {
       y: 0,
       animating: false,
       failed: false,
+      topPad: topPadPx(),
+      prevUrl: '',
+      swapping: false,
+      swapDir: 1,
     },
   });
 }
@@ -143,27 +172,46 @@ function close(ctx) {
   g.mode = '';
   g.moved = false;
   g.lastTapAt = 0;
-  ctx.setData({ 'pv.visible': false, 'pv.animating': false });
+  g.seq += 1;
+  ctx.setData({ 'pv.visible': false, 'pv.animating': false, 'pv.swapping': false, 'pv.prevUrl': '' });
 }
 
+/* 翻页：旧图留在 .pv-slide-old 上滑出淡出，新图从另一侧滑入淡入（双层交叉，200ms）。
+   2026-11-13 用户反馈「左右切换是直接切换的，太生硬」。
+   index/url 是同步切换的（验收脚本与页码都按同步语义断言），动画只存在于 DOM 层：
+   旧图那一层的 keyframes 结束后（SLIDE_MS）才把 pv.swapping 置回 false。 */
 function page(ctx, delta) {
   const pv = ctx.data.pv || {};
   const list = pv.urls || [];
   if (list.length < 2) return;
-  const next = Math.max(0, Math.min(list.length - 1, (pv.index || 0) + delta));
-  if (next === pv.index) return;
+  const cur = Number(pv.index) || 0;
+  const next = Math.max(0, Math.min(list.length - 1, cur + delta));
+  if (next === cur) return;
+  const dir = next > cur ? 1 : -1;
   clearAnimTimer();
+  const seq = (g.seq += 1);
   g.mode = '';
   g.lastTapAt = 0;
+  g.startPt = null;
   ctx.setData({
     'pv.index': next,
     'pv.url': list[next],
+    'pv.prevUrl': list[cur],
+    'pv.swapping': true,
+    'pv.swapDir': dir,
     'pv.failed': false,
     'pv.scale': 1,
     'pv.x': 0,
     'pv.y': 0,
     'pv.animating': false,
   });
+  g.animTimer = setTimeout(function () {
+    if (seq !== g.seq) return;
+    g.animTimer = null;
+    try {
+      ctx.setData({ 'pv.swapping': false, 'pv.prevUrl': '' });
+    } catch (e) { /* 页面已卸载 */ }
+  }, SLIDE_MS + 20);
 }
 
 /* 双击：1 倍 ⇄ 2.5 倍，以点按位置为锚（用 translate+scale 换算，见 setTransform 的注释） */
@@ -304,4 +352,5 @@ module.exports = {
   touchMove: touchMove,
   touchEnd: touchEnd,
   touchCancel: touchCancel,
+  topPadPx: topPadPx,
 };

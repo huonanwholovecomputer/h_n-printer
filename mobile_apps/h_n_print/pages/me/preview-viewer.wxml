@@ -8,19 +8,27 @@
         catchtouchmove="onPvTouchMove"
         bindtouchend="onPvTouchEnd"
         bindtouchcancel="onPvTouchCancel">
-    <image class="pv-img {{pv.failed ? 'pv-img-hidden' : ''}}"
-           src="{{pv.url}}"
-           mode="aspectFit"
-           style="transform: translate3d({{pv.x}}px, {{pv.y}}px, 0) scale({{pv.scale}}); transition: {{pv.animating ? 'transform 220ms cubic-bezier(0.22,0.61,0.36,1)' : 'none'}};"
-           binderror="onPvImageError"></image>
+    <!-- 翻页动画（2026-11-13）：旧图这一层滑出淡出，下面那张滑入淡入；image 自己的 transform 仍只关缩放/拖动 -->
+    <view wx:if="{{pv.swapping && pv.prevUrl}}"
+          class="pv-slide pv-slide-old {{pv.swapDir > 0 ? 'pv-slide-out-next' : 'pv-slide-out-prev'}}">
+      <image class="pv-img pv-img-static" src="{{pv.prevUrl}}" mode="aspectFit"></image>
+    </view>
+    <view class="pv-slide {{pv.swapping ? (pv.swapDir > 0 ? 'pv-slide-in-next' : 'pv-slide-in-prev') : ''}}">
+      <image class="pv-img {{pv.failed ? 'pv-img-hidden' : ''}}"
+             src="{{pv.url}}"
+             mode="aspectFit"
+             style="transform: translate3d({{pv.x}}px, {{pv.y}}px, 0) scale({{pv.scale}}); transition: {{pv.animating ? 'transform 220ms cubic-bezier(0.22,0.61,0.36,1)' : 'none'}};"
+             binderror="onPvImageError"></image>
+    </view>
     <view wx:if="{{pv.failed}}" class="pv-fail">这张预览图还没生成好，稍后再试</view>
-    <view class="pv-bar">
+    <!-- 顶部两件套用 px 行内间距让开系统状态栏（safe-area 在微信里多半是 0） -->
+    <view class="pv-bar" style="top: {{pv.topPad}}px;">
       <text class="pv-count">{{pv.index + 1}} / {{pv.count}}</text>
     </view>
     <view class="pv-hint">
       <text>{{pv.count > 1 ? '双击放大 · 双指捏合 · 左右滑动翻页' : '双击放大 · 双指捏合'}}</text>
     </view>
-    <view class="pv-close" catchtap="onPvClose">✕</view>
+    <view class="pv-close" style="top: {{pv.topPad}}px;" catchtap="onPvClose">✕</view>
     <view wx:if="{{pv.count > 1}}"
           class="pv-nav pv-prev {{pv.index <= 0 ? 'pv-nav-off' : ''}}"
           catchtap="onPvPrev">‹</view>

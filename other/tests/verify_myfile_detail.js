@@ -179,7 +179,7 @@ const wxStub = {
   // 全屏预览改成自绘层（utils/preview_viewer.js），不再调 wx.previewImage；
   // 这里只留 getWindowInfo，手势按 375×667 的窗口算锚点/边界。
   previewImage: (opt) => previewCalls.push(opt),
-  getWindowInfo: () => ({ windowWidth: 375, windowHeight: 667 }),
+  getWindowInfo: () => ({ windowWidth: 375, windowHeight: 667, statusBarHeight: 47 }),
 };
 const CONFIG_STUB = { BASE_URL: 'https://api.test' };
 const reqCalls = [];
@@ -493,6 +493,59 @@ check('WXSS：全屏层铺满 + 过渡只在 pv.animating 时生效（拖动跟�
   check('全屏关闭按钮在左上角、不压微信胶囊（right 已删、left + safe-area）',
     /left:\s*24rpx/.test(closeBlock) && /safe-area-inset-top/.test(closeBlock) &&
     !/right:/.test(closeBlock), closeBlock.replace(/\s+/g, ' '));
+}
+
+/* ==================== 2.7) 顶部让开系统状态栏 + 左右翻页动画（2026-11-13 晚用户三条） ==================== */
+console.log('\n--- 2.7) 顶部让开状态栏 / APP 底部文案 / 左右翻页动画 ---');
+{
+  // ① 顶部两件套下移：微信里 env(safe-area-inset-top) 多半取 0，必须用 statusBarHeight 现算
+  mpApi.onOpenMyFilePreview.call(mpCtx, { currentTarget: { dataset: { id: '21', page: 0, index: 0 } } });
+  check('顶部间距按 statusBarHeight 现算（47 + 12 = 59px，不是 0）',
+    mpCtx.data.pv.topPad === 59, 'topPad=' + mpCtx.data.pv.topPad);
+  check('模板：页码与 ✕ 都用行内 topPad 定位（不再只靠 safe-area）',
+    /<view class="pv-bar" style="top: \{\{pv\.topPad\}\}px;">/.test(PV_WXML) &&
+    /<view class="pv-close" style="top: \{\{pv\.topPad\}\}px;"/.test(PV_WXML));
+
+  // ② 翻页动画：双层交叉（旧图留 pv.prevUrl 滑出，新图滑入）
+  const beforeUrl = mpCtx.data.pv.url;
+  const beforeIdx2 = mpCtx.data.pv.index;
+  mpApi.onPvTouchStart.call(mpCtx, { touches: [{ clientX: 300, clientY: 300 }] });
+  mpApi.onPvTouchMove.call(mpCtx, { touches: [{ clientX: 280, clientY: 302 }] });
+  mpApi.onPvTouchEnd.call(mpCtx, { touches: [], changedTouches: [{ clientX: 200, clientY: 302 }] });
+  check('左滑：页码同步 +1（状态不延后，动画只在 DOM 层）',
+    mpCtx.data.pv.index === beforeIdx2 + 1, 'index=' + mpCtx.data.pv.index);
+  check('左滑：带上「正在滑出的旧图」与方向（swapDir=1，swapping=true）',
+    mpCtx.data.pv.swapping === true && mpCtx.data.pv.swapDir === 1 &&
+    mpCtx.data.pv.prevUrl === beforeUrl,
+    'prevUrl=' + String(mpCtx.data.pv.prevUrl).slice(-24));
+  mpApi.onPvTouchStart.call(mpCtx, { touches: [{ clientX: 200, clientY: 300 }] });
+  mpApi.onPvTouchMove.call(mpCtx, { touches: [{ clientX: 220, clientY: 302 }] });
+  mpApi.onPvTouchEnd.call(mpCtx, { touches: [], changedTouches: [{ clientX: 320, clientY: 302 }] });
+  check('右滑：方向反过来（swapDir=-1）', mpCtx.data.pv.swapDir === -1,
+    'swapDir=' + mpCtx.data.pv.swapDir);
+  check('模板：旧图单独一层 + 新图按方向滑入',
+    /class="pv-slide pv-slide-old \{\{pv\.swapDir > 0 \? 'pv-slide-out-next' : 'pv-slide-out-prev'\}\}"/.test(PV_WXML) &&
+    /pv-slide-in-next/.test(PV_WXML) && /pv-slide-in-prev/.test(PV_WXML));
+  check('WXSS：四组翻页 keyframes 都在（进出各两个方向）',
+    /@keyframes pvOutNext/.test(MP_WXSS) && /@keyframes pvOutPrev/.test(MP_WXSS) &&
+    /@keyframes pvInNext/.test(MP_WXSS) && /@keyframes pvInPrev/.test(MP_WXSS));
+  mpApi.onPvClose.call(mpCtx);
+
+  // ③ APP 端：底部提示文案 + 同款两层交叉 animation
+  check('APP：全屏层底部补了「双击放大 · 双指捏合 · 左右滑动翻页」',
+    /id="pfvHint">双击放大 · 双指捏合 · 左右滑动翻页</.test(APP_INDEX));
+  check('APP：模板里有旧图层 #pfvImgOld（两层交叉才可能不闪）',
+    /id="pfvFrameOld"/.test(APP_INDEX) && /id="pfvImgOld"/.test(APP_INDEX));
+  const appPfvShow = (APP_ME_JS.match(/function pfvShowPage\([\s\S]*?\n\}/) || [''])[0];
+  check('APP：翻页走两层交叉（旧图 .pfv-out-*、新图 .pfv-in-*，240ms 后收旧层）',
+    /pfv-frame-show/.test(appPfvShow) && /pfv-out-next/.test(appPfvShow) &&
+    /pfv-in-next/.test(appPfvShow) && /pfvSlideTimer = setTimeout/.test(appPfvShow));
+  check('APP：样式里有 .pfv-frame-old / .pfv-hint 与四组 keyframes',
+    /\.pfv-frame-old\s*\{/.test(APP_CSS) && /\.pfv-hint\s*\{/.test(APP_CSS) &&
+    /@keyframes pfvInNext/.test(APP_CSS) && /@keyframes pfvOutPrev/.test(APP_CSS));
+  check('APP：顶部两件套也往下让（close 14px、bar 18px + --safe-top，兜底 safe-area）',
+    /top: calc\(14px \+ var\(--safe-top, env\(safe-area-inset-top, 0px\)\)\)/.test(APP_CSS) &&
+    /padding: calc\(18px \+ var\(--safe-top, env\(safe-area-inset-top, 0px\)\)\) 56px 18px 16px/.test(APP_CSS));
 }
 
 mpCtx.data.myFiles = [multi];

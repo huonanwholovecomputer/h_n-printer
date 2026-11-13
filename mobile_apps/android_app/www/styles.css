@@ -7701,6 +7701,46 @@ body.theme-dark .crop-panel,
   overflow: hidden;
 }
 
+/* 翻页包裹层：只做左右位移 + 淡入淡出（2026-11-13 用户：直接切换太生硬） */
+.pfv-frame {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  will-change: transform, opacity;
+}
+
+/* 旧图那一层：默认不占位，只有 .pfv-frame-show 时才显示并播滑出动画 */
+.pfv-frame-old {
+  display: none;
+  z-index: 1;
+}
+
+.pfv-frame-old.pfv-frame-show { display: flex; }
+.pfv-frame-old img { transition: none; }
+
+.pfv-in-next { animation: pfvInNext 200ms cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.pfv-in-prev { animation: pfvInPrev 200ms cubic-bezier(0.22, 0.61, 0.36, 1) both; }
+.pfv-out-next { animation: pfvOutNext 180ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards; }
+.pfv-out-prev { animation: pfvOutPrev 180ms cubic-bezier(0.22, 0.61, 0.36, 1) forwards; }
+
+@keyframes pfvInNext {
+  from { transform: translate3d(22%, 0, 0); opacity: 0; }
+}
+
+@keyframes pfvInPrev {
+  from { transform: translate3d(-22%, 0, 0); opacity: 0; }
+}
+
+@keyframes pfvOutNext {
+  to { transform: translate3d(-22%, 0, 0); opacity: 0; }
+}
+
+@keyframes pfvOutPrev {
+  to { transform: translate3d(22%, 0, 0); opacity: 0; }
+}
+
 .pfv-stage img {
   display: block;
   max-width: 100%;
@@ -7727,7 +7767,7 @@ body.theme-dark .crop-panel,
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: calc(14px + env(safe-area-inset-top, 0px)) 56px 18px 16px;
+  padding: calc(18px + var(--safe-top, env(safe-area-inset-top, 0px))) 56px 18px 16px;
   pointer-events: none;
   color: #fff;
   background: linear-gradient(180deg, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0));
@@ -7752,7 +7792,9 @@ body.theme-dark .crop-panel,
 
 .pfv-close {
   position: absolute;
-  top: calc(10px + env(safe-area-inset-top, 0px));
+  /* 2026-11-13：与顶部页码一起再往下让一点。优先用 app.js 注入的 --safe-top
+     （原生状态栏高度；Android WebView 里 env(safe-area-inset-top) 常常是 0）。 */
+  top: calc(14px + var(--safe-top, env(safe-area-inset-top, 0px)));
   right: 10px;
   z-index: 3;
   display: flex;
@@ -7791,6 +7833,18 @@ body.theme-dark .crop-panel,
 .pfv-next { right: 6px; }
 .pfv-prev:active,
 .pfv-next:active { background: rgba(255, 255, 255, 0.26); }
+
+.pfv-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(18px + var(--safe-bottom, env(safe-area-inset-bottom, 0px)));
+  z-index: 2;
+  text-align: center;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.52);
+  pointer-events: none;
+}
 
 .pfv-loading {
   position: absolute;

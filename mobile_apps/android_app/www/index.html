@@ -1083,12 +1083,19 @@
         <view class="pfv-spinner"></view>
         <text id="pfvLoadingText">正在加载预览图…</text>
       </view>
-      <img class="pfv-img" id="pfvImg" alt="预览图" />
+      <!-- 翻页动画：旧图放 #pfvFrameOld 滑出淡出，当前页放 #pfvFrame 滑入淡入（2026-11-13） -->
+      <view class="pfv-frame pfv-frame-old" id="pfvFrameOld">
+        <img class="pfv-img" id="pfvImgOld" alt="" />
+      </view>
+      <view class="pfv-frame" id="pfvFrame">
+        <img class="pfv-img" id="pfvImg" alt="预览图" />
+      </view>
     </view>
     <view class="pfv-bar">
       <text class="pfv-title" id="pfvTitle">预览</text>
       <text class="pfv-count" id="pfvCount">1 / 1</text>
     </view>
+    <view class="pfv-hint" id="pfvHint">双击放大 · 双指捏合 · 左右滑动翻页</view>
     <view class="pfv-prev" id="pfvPrev">‹</view>
     <view class="pfv-next" id="pfvNext">›</view>
     <view class="pfv-close" id="pfvClose">✕</view>

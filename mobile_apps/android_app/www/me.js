@@ -3879,11 +3879,36 @@ function pfvUpdateBar() {
 }
 
 /* 全屏层换页：重置缩放/位移，重新拉这一页（底下的缩略图跟着翻到同一页） */
+/* 左右翻页的过渡（2026-11-13：用户说直接换图「太生硬」）。
+   两层交叉：#pfvFrameOld 放旧图滑出淡出，#pfvFrame 里的新图滑入淡入，220ms 后收起旧层。
+   状态（page/pages/scale/x/y）是同步切换的，动画只发生在 DOM 层。 */
+let pfvSlideTimer = null;
+
+function pfvFrameReset() {
+  if (pfvSlideTimer) {
+    clearTimeout(pfvSlideTimer);
+    pfvSlideTimer = null;
+  }
+  const frame = document.getElementById('pfvFrame');
+  if (frame) {
+    frame.classList.remove('pfv-in-next', 'pfv-in-prev');
+  }
+  const oldFrame = document.getElementById('pfvFrameOld');
+  if (oldFrame) {
+    oldFrame.classList.remove('pfv-frame-show', 'pfv-out-next', 'pfv-out-prev');
+  }
+}
+
 function pfvShowPage(page) {
   const f = previewFileOf(pfvState.fileId);
   if (!f) return;
   const pages = previewPagesOf(f, previewStateOf(pfvState.fileId));
+  const cur = Math.min(Math.max(1, Math.floor(Number(pfvState.page) || 1)), pages);
   const next = Math.min(Math.max(1, Math.floor(Number(page) || 1)), pages);
+  const dir = next > cur ? 1 : -1;
+  const img = document.getElementById('pfvImg');
+  const oldSrc = (img && img.getAttribute('src')) || '';
+  // ① 同步换页（页码/缩放立即按新页算）
   pfvState.page = next;
   pfvState.pages = pages;
   pfvState.scale = 1;
@@ -3891,13 +3916,36 @@ function pfvShowPage(page) {
   pfvState.y = 0;
   const mask = document.getElementById('pfvMask');
   if (mask) mask.classList.remove('pfv-loaded');
-  const img = document.getElementById('pfvImg');
   if (img) {
     img.style.visibility = 'hidden';
     img.setAttribute('src', previewShotUrl(f, next));
   }
   pfvApplyTransform();
   pfvUpdateBar();
+  if (next === cur) return;
+  // ② 旧图滑出淡出
+  const oldFrame = document.getElementById('pfvFrameOld');
+  const oldImg = document.getElementById('pfvImgOld');
+  if (oldFrame && oldImg && oldSrc) {
+    oldImg.setAttribute('src', oldSrc);
+    oldFrame.classList.remove('pfv-out-next', 'pfv-out-prev');
+    oldFrame.classList.add('pfv-frame-show');
+    void oldFrame.offsetWidth;
+    oldFrame.classList.add(dir > 0 ? 'pfv-out-next' : 'pfv-out-prev');
+  }
+  // ③ 新图滑入淡入
+  const frame = document.getElementById('pfvFrame');
+  if (frame) {
+    frame.classList.remove('pfv-in-next', 'pfv-in-prev');
+    void frame.offsetWidth;
+    frame.classList.add(dir > 0 ? 'pfv-in-next' : 'pfv-in-prev');
+  }
+  if (pfvSlideTimer) clearTimeout(pfvSlideTimer);
+  pfvSlideTimer = setTimeout(function () {
+    pfvSlideTimer = null;
+    if (frame) frame.classList.remove('pfv-in-next', 'pfv-in-prev');
+    if (oldFrame) oldFrame.classList.remove('pfv-frame-show', 'pfv-out-next', 'pfv-out-prev');
+  }, 240);
   const st = previewStateOf(pfvState.fileId);
   if ((Number(st.page) || 1) !== next) {
     st.page = next;
@@ -3925,6 +3973,7 @@ function openPreviewViewer(fileId, page) {
     mask.classList.add('pfv-open');
     mask.style.display = 'flex';
   }
+  pfvFrameReset();
   const img = document.getElementById('pfvImg');
   if (img) {
     img.style.visibility = 'hidden';
@@ -3946,6 +3995,7 @@ function closePreviewViewer() {
     mask.classList.remove('pfv-loaded');
     mask.style.display = 'none';
   }
+  pfvFrameReset();
   const img = document.getElementById('pfvImg');
   if (img) {
     img.style.visibility = 'hidden';

@@ -412,6 +412,50 @@ check('⑩ 点缩略图打开全屏层，页码与当前页一致、图片就是
   full1.shown && full1.count.trim() === '1 / 3' && /[?&]page=1/.test(full1.imgSrc),
   `shown=${full1.shown} count=${JSON.stringify(full1.count)} src=${full1.imgSrc}`);
 
+const pvUi = await page.evaluate(() => {
+  const bar = document.querySelector('.pfv-bar');
+  const hint = document.getElementById('pfvHint');
+  const close = document.getElementById('pfvClose');
+  return {
+    hint: ((hint && hint.textContent) || '').trim(),
+    hintShown: !!hint && getComputedStyle(hint).display !== 'none' && hint.getBoundingClientRect().height > 0,
+    barPadTop: parseFloat(getComputedStyle(bar).paddingTop) || 0,
+    closeTop: parseFloat(getComputedStyle(close).top) || 0,
+    hintBottom: hint ? Math.round(window.innerHeight - hint.getBoundingClientRect().bottom) : -1,
+  };
+});
+check('⑩a APP 全屏层底部补了操作提示，且顶部两件套下移让开状态栏',
+  pvUi.hintShown && /双击放大/.test(pvUi.hint) && /左右滑动翻页/.test(pvUi.hint) &&
+  pvUi.barPadTop >= 18 && pvUi.closeTop >= 14 && pvUi.hintBottom >= 0,
+  `hint=${JSON.stringify(pvUi.hint)} barPadTop=${pvUi.barPadTop} closeTop=${pvUi.closeTop} hintBottom=${pvUi.hintBottom}`);
+
+/* 翻页动画：两层交叉（直接调 pfvShowPage 才能在同一帧里读到类名） */
+const pvAnim = await page.evaluate(() => {
+  pfvShowPage(2);
+  const frame = document.getElementById('pfvFrame');
+  const oldFrame = document.getElementById('pfvFrameOld');
+  return {
+    inNext: frame.classList.contains('pfv-in-next'),
+    oldShown: oldFrame.classList.contains('pfv-frame-show'),
+    oldIsPrevPage: /[?&]page=1/.test(document.getElementById('pfvImgOld').getAttribute('src') || ''),
+    count: (document.getElementById('pfvCount') || {}).textContent || '',
+  };
+});
+await page.waitForTimeout(340);
+const pvSettled = await page.evaluate(() => ({
+  inNext: document.getElementById('pfvFrame').classList.contains('pfv-in-next'),
+  oldShown: document.getElementById('pfvFrameOld').classList.contains('pfv-frame-show'),
+  count: (document.getElementById('pfvCount') || {}).textContent || '',
+}));
+check('⑩b 翻页是两层交叉淡入（不是瞬间换图），240ms 后自动收旧层',
+  pvAnim.inNext && pvAnim.oldShown && pvAnim.oldIsPrevPage && pvAnim.count.trim() === '2 / 3' &&
+  !pvSettled.inNext && !pvSettled.oldShown && pvSettled.count.trim() === '2 / 3',
+  `anim=${JSON.stringify(pvAnim)} settled=${JSON.stringify(pvSettled)}`);
+
+/* 回到第 1 页，继续走「点 › 翻页」的按钮路径 */
+await page.evaluate(() => pfvShowPage(1));
+await page.waitForTimeout(260);
+
 await page.click('#pfvNext');
 await page.waitForTimeout(220);
 const full2 = await page.evaluate(() => (document.getElementById('pfvCount') || {}).textContent || '');
