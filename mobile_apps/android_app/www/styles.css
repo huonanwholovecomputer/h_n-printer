@@ -7651,6 +7651,27 @@ body.theme-dark .crop-panel,
   color: var(--text-secondary);
 }
 
+/* 本地打单 / 云端副本已清理：没有预览图，摊开这单的打印参数（2026-11-13） */
+.myfile-detail-title {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.myfile-local-tip {
+  display: block;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(120, 120, 128, 0.10);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
 /* ---------- 全屏查看层（自绘 overlay：捏合缩放 / 双击缩放 / 单指拖动 / 左右翻页） ---------- */
 .pfv-mask {
   position: fixed;

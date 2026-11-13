@@ -1803,11 +1803,68 @@ Component({
     },
 
     // 订单卡片「文件列表」→ 文件详情弹窗（GET /api/file_detail/<id>，与列表项同形状）
+    /* 订单卡片里那一行文件对象（详情弹窗拿它兜底：没有云端文件时也要把打印参数摊开） */
+    _orderFileAt(orderId, findex) {
+      const orders = this.data.orders || []
+      const order = orders.find(o => String(o.id) === String(orderId))
+      if (!order || !order.files) return null
+      const f = order.files[Number(findex)]
+      return f || null
+    },
+
+    /* 本地打单 / 云端副本已被清理：没有预览图，但这一行的打印参数还在这张单上。
+       2026-11-13 晚用户报「我的打印任务里点任意文件都提示该文件已清理」——
+       根因是本地打单的 order_files.file_id 本来就是空的（生产库 2000+ 行），
+       以前这里一律弹「已清理」，等于把已知信息也藏了。 */
+    _localFileDetail(f, reason) {
+      const file = f || {}
+      const name = file.original_name || file.file_name || '未知文件'
+      const copies = Number(file.copies) || 1
+      const pages = Number(file.page_count) || 0
+      const eff = Number(file.effective_pages) || pages
+      const sheets = Number(file.total_sheets) || 0
+      // order_files.status 的词表跟订单一样：sent 才是"已完成"（success 只在旧数据里出现）
+      const statusMap = {
+        pending: '待打印', queued: '排队中', printing: '打印中',
+        sent: '已完成', success: '已完成', failed: '打印失败', rejected: '已拒绝',
+        cancelled: '已取消', canceled: '已取消', timeout: '超时', abandoned: '放弃打印',
+        downloading: '文件传输中', waiting: '等待打印', scheduled: '已预约', reserved: '已预留',
+      }
+      const rows = [
+        { k: '份数 / 页数', v: file.pagesLine || (copies + ' 份 × ' + eff + ' 页') },
+      ]
+      if (sheets > 0) rows.push({ k: '合计张数', v: sheets + ' 张' })
+      rows.push({ k: '单双面', v: file.duplex === 'on' ? '双面' : '单面' })
+      if (file.page_range) rows.push({ k: '页码范围', v: file.page_range })
+      if (file.simplex_pages) rows.push({ k: '单面页', v: file.simplex_pages })
+      if (file.blank_tail_exclude) rows.push({ k: '末尾空白页', v: '已排除' })
+      if (file.status) rows.push({ k: '打印状态', v: statusMap[file.status] || file.status })
+      if (file.reject_reason) rows.push({ k: '退回原因', v: file.reject_reason })
+      return {
+        local_only: true,
+        original_name: name,
+        typeIcon: this._myFileTypeIcon(name),
+        localNote: reason === 'cleaned'
+          ? '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。'
+          : '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。',
+        localRows: rows,
+      }
+    },
+
     onOpenOrderFileDetail(e) {
-      const fileId = (e && e.currentTarget && e.currentTarget.dataset)
-        ? (e.currentTarget.dataset.id || '') : ''
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const fileId = ds.id || ''
+      const rowFile = this._orderFileAt(ds.oid, ds.findex)
+      const showLocal = (reason) => this.setData({
+        fileDetailVisible: true,
+        fileDetailClosing: false,
+        fileDetailLoading: false,
+        fileDetail: this._localFileDetail(rowFile, reason),
+      })
       if (!fileId) {
-        wx.showToast({ title: '该文件已清理', icon: 'none' })
+        // 本地打单：没有云端文件，但打印参数还在这单上，别再说「已清理」
+        if (rowFile) showLocal('local')
+        else wx.showToast({ title: '这行没有可查看的文件', icon: 'none' })
         return
       }
       this.setData({
@@ -1825,12 +1882,17 @@ Component({
             const item = this._decorateMyFile(d.file)
             this.setData({ fileDetail: item, fileDetailLoading: false })
             this._prepareMyFilePreview(item, (patch) => this._patchFileDetail(() => patch))
+          } else if (rowFile) {
+            // 云端副本被清理/无权看：退回「只有打印参数」的那一版，不再弹一句「已清理」就完事
+            showLocal('cleaned')
           } else {
             this.setData({ fileDetailLoading: false })
             wx.showToast({ title: (d && d.message) || '文件不存在或已清理', icon: 'none' })
           }
         },
         fail: () => {
+          // 网络断了也别把已知的参数藏起来：有这行数据就摊开参数面板（说明是网络问题）
+          if (rowFile) { showLocal('cleaned'); return }
           this.setData({ fileDetailLoading: false })
           wx.showToast({ title: '网络异常，请重试', icon: 'none' })
         },

@@ -454,6 +454,35 @@ check('⑪ 弹窗里同一份详情卡也是多页（复用，不是另写一份
   sheet.counter.trim() === '1 / 3', JSON.stringify(sheet.counter));
 await page.evaluate(() => closeOrderFileDetail());
 await page.waitForTimeout(250);
+
+/* ⑪.5 本地打单（order_files.file_id 为空，生产库 2000+ 行）→ 打「参数面板」，不是「已清理」
+   2026-11-13 用户报：「我的打印任务」里点任意文件都提示「该文件已被清理」。 */
+await page.evaluate(() => openLocalOrderFile({
+  file_name: '放弃医保承诺书.doc', copies: 2, page_count: 3, total_sheets: 2,
+  duplex: 'on', page_range: '1-3', status: 'sent', total_price: 1.2,
+}, 'local'));
+await page.waitForTimeout(250);
+const localPanel = await page.evaluate(() => {
+  const m = document.getElementById('myFileDetailModal');
+  const body = document.getElementById('myFileDetailBody');
+  return {
+    shown: getComputedStyle(m).display !== 'none',
+    text: body ? body.textContent.replace(/\s+/g, ' ') : '',
+    rows: document.querySelectorAll('#myFileDetailBody .myfile-kv').length,
+    tip: (document.querySelector('#myFileDetailBody .myfile-local-tip') || {}).textContent || '',
+  };
+});
+await page.screenshot({ path: `${SHOTS}/07_本地打单参数面板.png` });
+check('⑪.5 本地打单没有云端副本：弹出的是参数面板（份数/张数/单双面/状态），不是「已清理」',
+  localPanel.shown && localPanel.rows >= 4 &&
+    localPanel.text.indexOf('2 份 × 3 页') >= 0 && localPanel.text.indexOf('双面') >= 0 &&
+    localPanel.text.indexOf('已完成') >= 0 && localPanel.tip.indexOf('本地打单') >= 0 &&
+    localPanel.text.indexOf('已清理或不存在') < 0 &&
+    localPanel.text.indexOf('该文件已清理') < 0,
+  `shown=${localPanel.shown} rows=${localPanel.rows} tip=${localPanel.tip.slice(0, 40)} text=${localPanel.text.slice(0, 100)}`);
+await page.evaluate(() => closeOrderFileDetail());
+await page.waitForTimeout(250);
+
 /* 收尾把这行也收起来，否则下面的删除断言会看到「详情还在」（它属于 7，不属于被删的 8） */
 await page.click('#myFilesList .myfile-row[data-file-id="7"] .myfile-head');
 await page.waitForFunction(

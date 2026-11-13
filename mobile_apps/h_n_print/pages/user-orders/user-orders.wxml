@@ -1,4 +1,7 @@
 <!--user-orders.wxml — 查看指定用户/来源的订单列表-->
+<!-- 2026-11-13 晚：管理入口打开的这页也要能点文件看详情/缩略图，卡片模板与「我」页共用
+     （<import> 只取对方文件里的 <template>，不会把 me.wxml 的页面结构带进来）。 -->
+<import src="../me/me.wxml" />
 <page-meta></page-meta>
 <navigation-bar title="{{pageTitle}}" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
@@ -215,7 +218,9 @@
                  内层到边当帧把余量交给外层，外层到顶再交还内层（双向接力），不需要逻辑层同步贴边。 -->
             <view class="detail-files-scroll">
               <view class="detail-files-track">
-            <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row">
+            <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row"
+                  bindtap="onOpenOrderFileDetail"
+                  data-id="{{f.file_id}}" data-oid="{{item.id}}" data-findex="{{index}}">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
                 <view class="detail-file-tags">
@@ -328,6 +333,27 @@
             hover-class="price-pop-btn-hover" hover-stay-time="80">复制价格</view>
       <view class="price-pop-btn primary" data-id="{{pricePopOrderId}}" catchtap="onCopyOrderDetailPrice"
             hover-class="price-pop-btn-hover" hover-stay-time="80">复制详细价格</view>
+    </view>
+  </view>
+</view>
+
+<!-- 文件详情弹窗（与「我」页同源：myfileDetailCard 模板 + me/myfile-detail.wxss）
+     放在 page-root 外，理由同上：.scroll-content 是变换层。 -->
+<view wx:if="{{fileDetailVisible}}" class="modal-mask {{fileDetailClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCloseFileDetail">
+  <view class="modal-sheet filedetail-sheet" catchtap="noop">
+    <text class="title-medium" style="margin-bottom: 8rpx;">文件详情</text>
+    <view wx:if="{{fileDetailLoading}}" class="status-box">
+      <text class="status-text">加载中...</text>
+    </view>
+    <view wx:elif="{{!fileDetail}}" class="status-box">
+      <text class="status-text">文件不存在或已清理</text>
+    </view>
+    <view wx:else class="filedetail-body">
+      <text class="filedetail-name">{{fileDetail.original_name}}</text>
+      <template is="myfileDetailCard" data="{{f: fileDetail, scope: 'detail'}}" />
+    </view>
+    <view class="modal-buttons">
+      <button class="btn-secondary modal-half-btn" bindtap="onCloseFileDetail" hover-class="tap-active">关闭</button>
     </view>
   </view>
 </view>

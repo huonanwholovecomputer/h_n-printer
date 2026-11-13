@@ -1,3 +1,4 @@
+@import "../me/myfile-detail.wxss";
 /** user-orders.wxss — Apple-style order list page **/
 
 @import "../../utils/price_pop.wxss";

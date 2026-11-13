@@ -379,8 +379,10 @@ function setupMeButtons() {
     if (fileTap) {
       e.stopPropagation();
       const fid = fileTap.dataset.orderFile || '';
-      if (fid) openOrderFileDetail(fid);
-      else showToast('该文件已清理');
+      const rowFile = findOrderFile(fileTap.dataset.orderOid, fileTap.dataset.orderFindex);
+      if (fid) openOrderFileDetail(fid, rowFile);
+      else if (rowFile) openLocalOrderFile(rowFile, 'local');
+      else showToast('这行没有可查看的文件');
       return;
     }
     const card = e.target.closest('[data-order-id]');
@@ -491,6 +493,17 @@ function setupMeButtons() {
     // 同一张订单卡片模板：合计价格也可复制（管理员在「用户订单」子视图里同样能用）
     const priceTap = e.target.closest('[data-price-copy]');
     if (priceTap) { e.stopPropagation(); openPricePop(priceTap, priceTap.dataset.priceCopy); return; }
+    // 文件行 → 文件详情弹窗（与「我的打印任务」同一份实现；必须挡在卡片折叠之前）
+    const fileTap = e.target.closest('[data-order-file]');
+    if (fileTap) {
+      e.stopPropagation();
+      const fid = fileTap.dataset.orderFile || '';
+      const rowFile = findOrderFile(fileTap.dataset.orderOid, fileTap.dataset.orderFindex);
+      if (fid) openOrderFileDetail(fid, rowFile);
+      else if (rowFile) openLocalOrderFile(rowFile, 'local');
+      else showToast('这行没有可查看的文件');
+      return;
+    }
     const card = e.target.closest('[data-order-id]');
     if (card) toggleUserOrdersOrder(parseInt(card.dataset.orderId, 10));
   });
@@ -1063,12 +1076,14 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
         || o.status === 'downloading' || o.status === 'scheduled');
   // 详情区常驻渲染、用 detail-expanded 类切换（对齐小程序：展开/收起均有过渡动画）
   let fileRows = '';
-  (o.files || []).forEach(f => {
+  (o.files || []).forEach((f, fi) => {
     // 2026-11-13：文件行可点 → 打开该文件的独立详情弹窗（字段见 openOrderFileDetail）。
-    // 没有 file_id 的老数据标 data-order-file=""（空串），点了只给 toast「该文件已清理」。
+    // 没有 file_id 的空串行 = 本地打单（云端本来就没有这份文件），点了走「本地面板」，
+    // 展示这行的份数/张数/单双面/状态 —— 参数都在 order_files 里，别再弹「已清理」。
     const rowFid = f.file_id ? String(f.file_id) : '';
     fileRows += `
-      <view class="detail-file-row${rowFid ? ' detail-file-row-tap' : ''}" data-order-file="${esc(rowFid)}">
+      <view class="detail-file-row detail-file-row-tap" data-order-file="${esc(rowFid)}"
+            data-order-oid="${esc(String(o.id == null ? '' : o.id))}" data-order-findex="${fi}">
         <view class="detail-file-info">
           <text class="detail-file-name">${esc(f.original_name || f.file_name || '')}</text>
           <view class="detail-file-tags">
@@ -1083,7 +1098,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
           ${f.simplex_pages ? `<text class="detail-file-range">单面页: ${esc(f.simplex_pages)}</text>` : ''}
           ${Number(f.blank_tail_exclude) === 1 ? `<text class="detail-file-range">已排除末尾空白页</text>` : ''}
           ${(f.status === 'rejected' || f.status === 'failed') && f.reject_reason ? `<text class="file-reject-reason">${esc(f.reject_reason)}</text>` : ''}
-          ${rowFid ? '<text class="detail-file-open-tip">详情 ›</text>' : ''}
+          <text class="detail-file-open-tip">详情 ›</text>
         </view>
       </view>`;
   });
@@ -3666,9 +3681,76 @@ function setPreviewPage(fileId, page) {
 /* ---------------- 订单「文件列表」→ 文件详情弹窗 ---------------- */
 
 /* 打开某个文件的详情弹窗：#myFileDetailBody 装的就是「我的文件」那张详情卡（同一模板） */
-function openOrderFileDetail(fileId) {
+/* 从本页两份订单列表里按「单号 + 下标」找回那一行文件参数（本地打单没有 file_id） */
+function findOrderFile(orderId, findex) {
+  const oid = String(orderId == null ? '' : orderId);
+  const idx = Number(findex);
+  const pools = [meState.orders || [], (meState.userOrdersView && meState.userOrdersView.orders) || []];
+  for (let p = 0; p < pools.length; p += 1) {
+    const pool = pools[p];
+    for (let i = 0; i < pool.length; i += 1) {
+      if (String(pool[i].id) !== oid) continue;
+      const files = pool[i].files || [];
+      if (!isNaN(idx) && idx >= 0 && idx < files.length) return files[idx];
+      return null;
+    }
+  }
+  return null;
+}
+
+/* order_files.status 的词表：ORDER_STATUS_MAP 是"订单级"的，这里补上文件级常见的
+   pending / success（旧数据）与 canceled 两种拼法，避免面板里直接印英文状态码 */
+const LOCAL_FILE_STATUS_TEXT = {
+  pending: '待打印', queued: '排队中', printing: '打印中',
+  sent: '已完成', success: '已完成', failed: '打印失败', rejected: '已拒绝',
+  cancelled: '已取消', canceled: '已取消', timeout: '超时', abandoned: '放弃打印',
+  downloading: '文件传输中', waiting: '等待打印', scheduled: '已预约', reserved: '已预留',
+};
+
+/* 本地打单 / 云端副本已清理：没有图，但这一单的打印参数还在 —— 直接摊开给人看 */
+function localFilePanelHTML(rowFile, reason) {
+  const f = rowFile || {};
+  const name = f.original_name || f.file_name || '未知文件';
+  const copies = Number(f.copies) || 1;
+  const pages = Number(f.page_count) || 0;
+  const eff = Number(f.effective_pages) || pages;
+  const sheets = Number(f.total_sheets) || 0;
+  let rows = myfileKv('份数 / 页数', f.pagesLine || (copies + ' 份 × ' + eff + ' 页'));
+  if (sheets > 0) rows += myfileKv('合计张数', sheets + ' 张');
+  rows += myfileKv('单双面', f.duplex === 'on' ? '双面' : '单面');
+  if (f.page_range) rows += myfileKv('页码范围', f.page_range);
+  if (f.simplex_pages) rows += myfileKv('单面页', f.simplex_pages);
+  if (Number(f.blank_tail_exclude) === 1) rows += myfileKv('末尾空白页', '已排除');
+  if (f.status) rows += myfileKv('打印状态', (LOCAL_FILE_STATUS_TEXT[f.status] || ORDER_STATUS_MAP[f.status] || f.status));
+  if (f.reject_reason) rows += myfileKv('退回原因', f.reject_reason);
+  if (f.total_price != null && Number(f.total_price) > 0) {
+    rows += myfileKv('这一行金额', '¥' + Number(f.total_price).toFixed(2));
+  }
+  const note = (reason === 'cleaned')
+    ? '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。'
+    : '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。';
+  return '<view class="myfile-detail-card">' +
+    '<text class="myfile-detail-title">' + escHtml(name) + '</text>' +
+    '<text class="myfile-local-tip">' + escHtml(note) + '</text>' + rows + '</view>';
+}
+
+function openLocalOrderFile(rowFile, reason) {
+  meState.fileDetailId = '';
+  meState.fileDetailFile = null;
+  meState.fileDetailLoading = false;
+  const body = document.getElementById('myFileDetailBody');
+  if (body) body.innerHTML = localFilePanelHTML(rowFile, reason);
+  openModal('myFileDetailModal');
+}
+
+function openOrderFileDetail(fileId, rowFile) {
   const id = String(fileId == null ? '' : fileId);
-  if (!id) { showToast('该文件已清理'); return; }
+  // 没有 file_id（本地打单）：不请求接口，直接摊开这行的参数
+  if (!id) {
+    if (rowFile) { openLocalOrderFile(rowFile, 'local'); return; }
+    showToast('这行没有可查看的文件');
+    return;
+  }
   meState.fileDetailId = id;
   meState.fileDetailFile = null;
   meState.fileDetailLoading = true;
@@ -3683,6 +3765,9 @@ function openOrderFileDetail(fileId) {
     const got = (d.success && d.file) ? decorateMyFile(d.file) : null;
     if (!(r && r.status === 200) || !got) {
       meState.fileDetailFile = null;
+      // 403/404：文件过了保留期或被删。这单的参数还查得到 —— 退到本地面板并说明原因，
+      // 而不是只给一句「文件已清理或不存在」（用户 2026-11-13 报的就是这个观感）。
+      if (rowFile) { openLocalOrderFile(rowFile, 'cleaned'); return; }
       const b = document.getElementById('myFileDetailBody');
       if (b) {
         b.innerHTML = '<text class="myfile-detail-tip">' +
@@ -3701,6 +3786,7 @@ function openOrderFileDetail(fileId) {
   }).catch(() => {
     if (seq !== myFileDetailSeq) return;
     meState.fileDetailLoading = false;
+    if (rowFile) { openLocalOrderFile(rowFile, 'cleaned'); return; }
     const b3 = document.getElementById('myFileDetailBody');
     if (b3) b3.innerHTML = '<text class="myfile-detail-tip">网络异常，请稍后重试</text>';
     showToast('网络异常，请重试');

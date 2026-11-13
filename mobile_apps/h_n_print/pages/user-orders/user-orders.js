@@ -8,6 +8,9 @@ const { countPagesInRange } = require('../../utils/pages')
    （管理入口进来的这个子视图以前没有复制入口 —— 2026-11-09 用户报的现场问题）。
    勿在本文件拼第二份：守卫脚本 other/tests/verify_price_copy_popconfirm.js。 */
 const priceCopy = require('../../utils/price_copy')
+/* 文件详情卡（预览图 + 参数）的字段装配：「我」页与这里共用一份，模板也只有一份
+   （pages/me/me.wxml 的 myfileDetailCard）。2026-11-13 晚用户要求管理入口同样可展开看详情。 */
+const fileDetailCard = require('../../utils/file_detail_card')
 // 单价（/api/pricing）带进程内缓存：本页与「我」页各自一份，口径相同
 const _getPriceRules = priceCopy.createPriceRulesGetter(request, CONFIG)
 
@@ -156,6 +159,12 @@ Component({
       downloading: '文件传输中',
       waiting: '等待打印',
     },
+
+    // 文件详情弹窗（2026-11-13 晚：从管理入口「打卡 → 某人的任务」点文件也能看缩略图与参数）
+    fileDetailVisible: false,
+    fileDetailClosing: false,
+    fileDetailLoading: false,
+    fileDetail: null,
   },
 
   lifetimes: {
@@ -683,6 +692,173 @@ Component({
       if (pages.length !== prev.length || pages.some((p, i) => p !== prev[i])) {
         this.setData({ pageNumbers: pages })
       }
+    },
+
+
+    // ==================== 文件详情弹窗（与「我」页同一份模板） ====================
+    // 取本页 orders 里某单的第 findex 个文件行（本地打单没有云端 file_id，参数全在这行上）
+    _uoFileAt(orderId, findex) {
+      const orders = this.data.orders || []
+      const idx = Number(findex)
+      for (let i = 0; i < orders.length; i++) {
+        if (String(orders[i].id) !== String(orderId)) continue
+        const files = orders[i].files || []
+        if (!isNaN(idx) && idx >= 0 && idx < files.length) return files[idx]
+        break
+      }
+      return null
+    },
+
+    // 没有云端副本时：用这单的打印参数拼一张只读面板（不请求任何接口）
+    _uoShowLocal(rowFile, reason) {
+      this.setData({
+        fileDetailVisible: true,
+        fileDetailClosing: false,
+        fileDetailLoading: false,
+        fileDetail: fileDetailCard.localDetail(rowFile, reason),
+      })
+    },
+
+    onOpenOrderFileDetail(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const fileId = ds.id ? String(ds.id) : ''
+      const rowFile = this._uoFileAt(ds.oid, ds.findex)
+      // 本地打单（order_files.file_id 为空）：云端没有这份文件，但参数有 —— 不再弹「该文件已清理」
+      if (!fileId) {
+        if (rowFile) { this._uoShowLocal(rowFile, 'local'); return }
+        wx.showToast({ title: '这行没有可查看的文件', icon: 'none' })
+        return
+      }
+      const token = wx.getStorageSync('token')
+      if (!token) {
+        wx.showToast({ title: '请先登录', icon: 'none' })
+        return
+      }
+      this.setData({
+        fileDetailVisible: true,
+        fileDetailClosing: false,
+        fileDetailLoading: true,
+        fileDetail: null,
+      })
+      request({
+        url: CONFIG.BASE_URL + '/api/file_detail/' + encodeURIComponent(fileId),
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        success: (res) => {
+          const data = res.data || {}
+          if (res.statusCode === 200 && data.success && data.file) {
+            const detail = fileDetailCard.decorate(data.file, { baseUrl: CONFIG.BASE_URL, token })
+            this.setData({ fileDetail: detail, fileDetailLoading: false })
+            this._prepareFilePreview(detail)
+            return
+          }
+          // 403/404：文件已过保留期或被删 —— 这单的参数还查得到，就展示参数并说明原因
+          if (rowFile) { this._uoShowLocal(rowFile, 'cleaned'); return }
+          this.setData({ fileDetailLoading: false, fileDetailVisible: false })
+          wx.showToast({ title: res.statusCode === 403 ? '无权查看该文件' : '该文件已被清理', icon: 'none' })
+        },
+        fail: () => {
+          if (rowFile) { this._uoShowLocal(rowFile, 'cleaned'); return }
+          this.setData({ fileDetailLoading: false, fileDetailVisible: false })
+          wx.showToast({ title: '加载失败，请重试', icon: 'none' })
+        },
+      })
+    },
+
+    // 页数纠偏：列表预览图只给第 1 页，Office 转 PDF 后页数会变多（后端 meta 才知道真页数），
+    // 所以每个文件问一次 /info（带 token 查参数），拿到 pages 后重建 shots
+    _prepareFilePreview(item) {
+      if (!item || item.local_only || !item.file_id) return
+      const fid = String(item.file_id)
+      if (item.has_preview === false) return
+      const asked = this._fileDetailInfoAsked || (this._fileDetailInfoAsked = {})
+      if (asked[fid]) return
+      asked[fid] = true
+      const token = wx.getStorageSync('token')
+      if (!token) return
+      request({
+        url: CONFIG.BASE_URL + '/api/file_preview/' + encodeURIComponent(fid) +
+          '/info?token=' + encodeURIComponent(token),
+        method: 'GET',
+        timeout: 20000, // 首张要现渲染（Word/Excel 1~2s），12s 默认超时留足余量
+        success: (res) => {
+          const data = res.data || {}
+          if (res.statusCode !== 200 || !data.success) return
+          const cur = this.data.fileDetail
+          if (!cur || cur.local_only || String(cur.file_id) !== fid) return
+          const pages = Math.max(1, Number(data.pages) || 1)
+          const built = fileDetailCard.shots(CONFIG.BASE_URL, token, fid, pages,
+            cur.previewIndex || 0, cur.previewShots)
+          this.setData({
+            'fileDetail.previewShots': built.shots,
+            'fileDetail.previewIndex': built.index,
+            'fileDetail.previewPages': built.shots.length,
+            'fileDetail.previewTip': '',
+          })
+        },
+      })
+    },
+
+    // 翻页：只给当前页 ±1 页真发请求（12 页上限）
+    onMyFilePreviewChange(e) {
+      const detail = this.data.fileDetail
+      if (!detail || detail.local_only) return
+      const index = Number(e && e.detail && e.detail.current) || 0
+      const keep = detail.previewShots || []
+      const built = fileDetailCard.shots(CONFIG.BASE_URL, wx.getStorageSync('token'),
+        detail.file_id, keep.length || 1, index, keep)
+      this.setData({
+        'fileDetail.previewIndex': built.index,
+        'fileDetail.previewShots': built.shots,
+      })
+    },
+
+    onMyFilePreviewLoad(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const index = Number(ds.index)
+      if (isNaN(index)) return
+      const detail = this.data.fileDetail
+      if (!detail || !detail.previewShots || !detail.previewShots[index]) return
+      this.setData({
+        ['fileDetail.previewShots[' + index + '].loaded']: true,
+        'fileDetail.previewLoading': false,
+      })
+    },
+
+    onMyFilePreviewError(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const index = Number(ds.index)
+      if (isNaN(index)) return
+      const detail = this.data.fileDetail
+      if (!detail || !detail.previewShots || !detail.previewShots[index]) return
+      const patch = {}
+      patch['fileDetail.previewShots[' + index + '].failed'] = true
+      patch['fileDetail.previewShots[' + index + '].loaded'] = false
+      const anyOk = (detail.previewShots || []).some((s, i) => i !== index && s.loaded)
+      if (!anyOk) patch['fileDetail.previewLoading'] = false
+      this.setData(patch)
+    },
+
+    // 全屏：小程序直接交给 wx.previewImage（原生双指缩放 + 左右翻页）
+    onOpenMyFilePreview(e) {
+      const detail = this.data.fileDetail
+      if (!detail || detail.local_only) return
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const shots = detail.previewShots || []
+      const index = Number(ds.index)
+      const base = isNaN(index) ? 0 : index
+      const urls = shots.map(s => s.url)
+      if (!urls.length) return
+      wx.previewImage({ urls, current: urls[base] || urls[0] })
+    },
+
+    onCloseFileDetail() {
+      if (this._uoFileDetailTimer) clearTimeout(this._uoFileDetailTimer)
+      this.setData({ fileDetailClosing: true })
+      this._uoFileDetailTimer = setTimeout(() => {
+        this._uoFileDetailTimer = null
+        this.setData({ fileDetailVisible: false, fileDetailClosing: false, fileDetail: null })
+      }, 200)
     },
   },
 })

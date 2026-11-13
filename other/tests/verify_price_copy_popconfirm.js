@@ -674,6 +674,18 @@ function loadMiniProgramUserOrders() {
       }
       if (dep.indexOf('price_copy') >= 0) return PRICE_COPY_MOD;
       if (dep.indexOf('order_stats') >= 0) return { fallbackSheets: () => 0 };
+      // 2026-11-13 晚：user-orders 页新增「订单文件详情弹窗」，复用 me 页的公共装配模块
+      if (dep.indexOf('file_detail_card') >= 0) {
+        return {
+          PREVIEW_MAX_PAGES: 12,
+          fmtSize: (n) => String(Number(n) || 0) + ' B',
+          typeIcon: () => '📄',
+          previewUrl: () => 'https://example.invalid/preview',
+          shots: (baseUrl, token, fileId, total) => ({ shots: [], index: 0 }),
+          decorate: (f) => Object.assign({}, f || {}),
+          localDetail: () => ({ local_only: true, localRows: [], localNote: '' }),
+        };
+      }
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {

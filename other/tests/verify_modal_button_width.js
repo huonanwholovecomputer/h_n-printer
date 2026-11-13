@@ -162,7 +162,7 @@ for (const f of wxmlFiles) {
   }
 }
 // 2026-11-13：me 页新增「订单文件详情」弹窗（.filedetail-sheet）⇒ me 5 个，合计 16
-check('扫到全部 modal-sheet 弹层（index 11 + me 5 = 16 个）', scanned === 16, '实际 ' + scanned + ' 个');
+check('扫到全部 modal-sheet 弹层（index 11 + me 5 + user-orders 1 = 17 个）', scanned === 17, '实际 ' + scanned + ' 个');
 for (const line of inventory) console.log('  ' + line);
 
 /* ---------- 6) 变异自证：把修复摘掉，静态断言必须转红 ---------- */

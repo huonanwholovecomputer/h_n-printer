@@ -36,7 +36,9 @@ function check(name, cond, detail) {
 const read = (p) => fs.readFileSync(p, 'utf8');
 const MP_JS = read(path.join(MP, 'me.js'));
 const MP_WXML = read(path.join(MP, 'me.wxml'));
-const MP_WXSS = read(path.join(MP, 'me.wxss'));
+/* 2026-11-13 晚：详情卡的样式抽到 me/myfile-detail.wxss（两个页面共用），
+   断言一律对「两份拼接」做，别再只看 me.wxss。 */
+const MP_WXSS = read(path.join(MP, 'me.wxss')) + '\n' + read(path.join(MP, 'myfile-detail.wxss'));
 const APP_ME_JS = read(path.join(APP, 'me.js'));
 const APP_APP_JS = read(path.join(APP, 'app.js'));
 const APP_INDEX = read(path.join(APP, 'index.html'));
@@ -157,6 +159,7 @@ const mpFnNames = [
   '_patchMyFile', '_patchFileDetail', '_prepareMyFilePreview',
   'onMyFilePreviewLoad', 'onMyFilePreviewChange', 'onOpenMyFilePreview',
   'onOpenOrderFileDetail', 'onCloseFileDetail',
+  '_orderFileAt', '_localFileDetail',
 ];
 const mpBody = mpFnNames.map((n) => extractFn(MP_JS, n)).filter(Boolean).join('\n\n');
 
@@ -189,6 +192,8 @@ const mpCtx = {
   _myFileTypeIcon: mpApi._myFileTypeIcon,
   // 订单文件详情弹窗里也用 _decorateMyFile 修饰（同一套字段）
   _decorateMyFile: mpApi._decorateMyFile,
+  _orderFileAt: mpApi._orderFileAt,
+  _localFileDetail: mpApi._localFileDetail,
   _myFileDetailStyle: mpApi._myFileDetailStyle,
   _clearMyFileDetailTimer: mpApi._clearMyFileDetailTimer,
   _nextFrame: mpApi._nextFrame,
@@ -287,8 +292,8 @@ check('WXSS：骨架横扫动画 + 真图淡入 + 多页 420rpx 高度',
   /background-size:\s*400%/.test(MP_WXSS) &&
   /\.myfile-preview-loaded\s*\{[^}]*opacity:\s*1/.test(MP_WXSS) &&
   /\.myfile-preview-swiper\s*\{[^}]*height:\s*420rpx/.test(MP_WXSS));
-check('订单卡「文件列表」行可点开详情（bindtap + data-id=f.file_id）',
-  /class="detail-file-row"\s+bindtap="onOpenOrderFileDetail" data-id="\{\{f\.file_id\}\}"/.test(MP_WXML));
+check('订单卡「文件列表」行可点开详情（bindtap + data-id=f.file_id + 单号/下标）',
+  /class="detail-file-row"[\s\S]{0,240}?bindtap="onOpenOrderFileDetail"[\s\S]{0,240}?data-id="\{\{f\.file_id\}\}"/.test(MP_WXML));
 check('文件详情弹窗独立存在（filedetail-sheet + /api/file_detail/）',
   /class="modal-sheet filedetail-sheet"/.test(MP_WXML) && /\/api\/file_detail\//.test(MP_JS));
 check('弹窗关闭走 200ms 动画后再卸载（fileDetailClosing）',
