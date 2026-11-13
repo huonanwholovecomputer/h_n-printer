@@ -1,8 +1,8 @@
 {
-  "version": "1.1.58",
-  "versionCode": 59,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.58.apk",
-  "md5": "fbdd3cb9fd3cace758f29fd17c267166",
-  "notes": "v1.1.58：「我 → 我的文件」展开/收起现在有动画了 —— 点一行从行头平滑展开、再点收起，收起后不留空位；预览图不再只支持图片和 PDF，Word / Excel / PPT 也会显示首页缩略图（服务端转 PDF 后再取第一页，1024 宽）。不支持的类型会直接说明「该类型暂不支持预览图（图片 / PDF / Word / Excel / PPT 可以）」。",
+  "version": "1.1.59",
+  "versionCode": 60,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.59.apk",
+  "md5": "eaabfe4067b55967ca469bdfc825ca73",
+  "notes": "v1.1.59：① 缩略图上传时就生成并存在云端（跟随文件自动删除），点开基本不用等，加载时有一条扫光骨架动画；② 预览图支持多页了 —— 左右滑动翻页，页码显示「2 / 3」（最多 12 页，Office 转 PDF 后多出来的页也能看到）；③ 点预览图进全屏：双指放大缩小、双击放大/还原（1~5 倍）、左右滑动翻页；④ 订单卡片「文件列表」里的文件也能点开详情弹窗了，内容与「我的文件」完全一致。",
   "force": false
 }

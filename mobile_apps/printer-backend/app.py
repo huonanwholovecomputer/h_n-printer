@@ -7363,6 +7363,118 @@ def delete_my_file(file_id):
     return jsonify({"success": True, "file_id": file_id, "message": "已删除"})
 
 
+def _my_file_item(row, display_name: str, order_item: dict, busy: bool,
+                  global_hours: int) -> dict:
+    """一行 files 记录 + 上下文 → 列表项（`/api/my_files` 与 `/api/file_detail` 共用）。
+
+    两个接口必须同形状：订单卡片里的「文件列表」点开的详情弹窗要跟「我的文件」
+    长得一模一样（用户 2026-11-13 原话「行为与文件管理界面一致，可复用代码逻辑」）。
+    """
+    own_hours = int(row["retention_hours"] or 0)
+    immediate = own_hours == IMMEDIATE_DELETE_RETENTION_HOURS
+    eff_hours = own_hours if own_hours > 0 else global_hours
+    auto_delete_at = ""
+    if not immediate and eff_hours > 0 and row["created_at"]:
+        try:
+            auto_delete_at = (datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
+                              + timedelta(hours=eff_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            auto_delete_at = ""
+    if immediate:
+        retention_label = "打印完成后立即删除"
+    elif eff_hours > 0:
+        retention_label = (
+            f"保留 {eff_hours // 24} 天"
+            if eff_hours >= 24 and eff_hours % 24 == 0
+            else f"保留 {eff_hours} 小时"
+        )
+    else:
+        retention_label = "不自动删除"
+    name_or_path = row["original_name"] or row["path"] or ""
+    has_preview = _has_preview_for(name_or_path)
+    return {
+        "file_id": row["id"],
+        # 展示名：老客户端上传留下的微信临时名（tmp_<hex>.pdf）用
+        # order_files.file_name（该文件最近一次下单用的名字）兜底；没有下单记录时照实回。
+        "original_name": display_name,
+        # 原始落库值（诊断用：想区分「这行到底存了什么」时看它）
+        "stored_original_name": row["original_name"],
+        "size": int(row["size"] or 0),
+        "page_count": int(row["page_count"] or 0),
+        "created_at": row["created_at"],
+        "retention_hours": -1 if immediate else eff_hours,
+        "retention_mode": "immediate" if immediate else "server",
+        "retention_label": retention_label,
+        "auto_delete_at": auto_delete_at,
+        "in_active_order": bool(busy),
+        # 2026-11：详情页需要「所属订单」与「预览图」两件事
+        "order_id": int((order_item or {}).get("order_id") or 0),
+        "order_number": (order_item or {}).get("order_number", "") or "",
+        "has_preview": has_preview,
+        # 2026-11-13：多页预览的页数（0=前端要再问 /api/file_preview/<id>/info）
+        "preview_pages": _preview_pages_hint(row["id"], name_or_path,
+                                             int(row["page_count"] or 0)),
+        # 前端（小程序 <image>/APP <img>）不能带 Authorization 头 ⇒ 预览鉴权支持 ?token=，
+        # 拼接方式是 `<base>/api/file_preview/<id>?token=<登录token>`，前端自己拼。
+        "preview_url": (f"/api/file_preview/{row['id']}" if has_preview else ""),
+    }
+
+
+def _file_detail_payload(conn, row, global_hours: int) -> dict:
+    """单个文件的详情项（补齐「最近一次下单用的名字/订单」「是否被活跃订单占用」）。"""
+    fid = row["id"]
+    active_statuses = ('queued', 'printing', 'accepted', 'reserved',
+                       'scheduled', 'waiting', 'downloading')
+    _sp = ",".join("?" for _ in active_statuses)
+    busy = bool(conn.execute(
+        f"SELECT 1 FROM order_files WHERE file_id = ? AND status IN ({_sp}) LIMIT 1",
+        (fid, *active_statuses)).fetchone())
+    if not busy:
+        busy = bool(conn.execute(
+            f"SELECT 1 FROM orders WHERE file_id = ? AND status IN ({_sp}) LIMIT 1",
+            (fid, *active_statuses)).fetchone())
+    name_row = conn.execute(
+        "SELECT file_name FROM order_files WHERE file_id = ? AND file_name != '' "
+        "ORDER BY id DESC LIMIT 1", (fid,)).fetchone()
+    order_row = conn.execute(
+        "SELECT of1.file_id AS fid, o.id AS oid, o.order_number AS onum "
+        "FROM order_files of1 LEFT JOIN orders o ON o.id = of1.order_id "
+        "WHERE of1.file_id = ? ORDER BY of1.id DESC LIMIT 1", (fid,)).fetchone()
+    order_item = {}
+    if order_row is not None:
+        order_item = {"order_id": int(order_row["oid"] or 0),
+                      "order_number": (order_row["onum"] or "").strip()}
+    display = ((name_row["file_name"] or "").strip() if name_row is not None else "") \
+        or row["original_name"]
+    return _my_file_item(row, display, order_item, busy, global_hours)
+
+
+@app.route("/api/file_detail/<file_id>", methods=["GET"])
+@login_required
+def get_file_detail(file_id):
+    """单个文件的详情（与 `/api/my_files` 列表项**同一形状**）。
+
+    用途：订单卡片里「文件列表」点一行 → 独立详情弹窗（用户 2026-11-13 需求 4：
+    「行为与文件管理界面一致，可复用代码逻辑」）。前端拿到的字段与「我的文件」
+    完全一样，所以小程序 / APP 都复用同一套详情渲染。
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            """SELECT id, original_name, size, created_at, page_count, retention_hours,
+                      path, openid FROM files WHERE id = ?""", (file_id,)).fetchone()
+        if row is None:
+            return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
+        if (row["openid"] or "") != g.openid and not is_admin(g.openid):
+            return jsonify({"success": False, "message": "无权查看该文件"}), 403
+        cfg = load_retention_config()
+        global_hours = int(cfg.get("days", 0) or 0) * 24 + int(cfg.get("hours", 0) or 0)
+        item = _file_detail_payload(conn, row, global_hours)
+    finally:
+        conn.close()
+    return jsonify({"success": True, "file": item})
+
+
 @app.route("/api/my_files", methods=["GET"])
 @login_required
 def list_my_files():
@@ -7445,52 +7557,9 @@ def list_my_files():
     finally:
         conn.close()
 
-    out = []
-    for r in rows:
-        own_hours = int(r["retention_hours"] or 0)
-        immediate = own_hours == IMMEDIATE_DELETE_RETENTION_HOURS
-        eff_hours = own_hours if own_hours > 0 else global_hours
-        auto_delete_at = ""
-        if not immediate and eff_hours > 0 and r["created_at"]:
-            try:
-                auto_delete_at = (datetime.strptime(r["created_at"], "%Y-%m-%d %H:%M:%S")
-                                  + timedelta(hours=eff_hours)).strftime("%Y-%m-%d %H:%M:%S")
-            except (TypeError, ValueError):
-                auto_delete_at = ""
-        if immediate:
-            retention_label = "打印完成后立即删除"
-        elif eff_hours > 0:
-            retention_label = (
-                f"保留 {eff_hours // 24} 天"
-                if eff_hours >= 24 and eff_hours % 24 == 0
-                else f"保留 {eff_hours} 小时"
-            )
-        else:
-            retention_label = "不自动删除"
-        out.append({
-            "file_id": r["id"],
-            # 展示名：老客户端上传留下的微信临时名（tmp_<hex>.pdf）用
-            # order_files.file_name（该文件最近一次下单用的名字）兜底；没有下单记录时照实回。
-            "original_name": display_names.get(r["id"]) or r["original_name"],
-            # 原始落库值（诊断用：想区分「这行到底存了什么」时看它）
-            "stored_original_name": r["original_name"],
-            "size": int(r["size"] or 0),
-            "page_count": int(r["page_count"] or 0),
-            "created_at": r["created_at"],
-            "retention_hours": -1 if immediate else eff_hours,
-            "retention_mode": "immediate" if immediate else "server",
-            "retention_label": retention_label,
-            "auto_delete_at": auto_delete_at,
-            "in_active_order": r["id"] in busy_ids,
-            # 2026-11：详情页需要「所属订单」与「预览图」两件事
-            "order_id": (order_info.get(r["id"]) or {}).get("order_id", 0),
-            "order_number": (order_info.get(r["id"]) or {}).get("order_number", ""),
-            "has_preview": _has_preview_for(r["original_name"] or r["path"] or ""),
-            # 前端（小程序 <image>/APP <img>）不能带 Authorization 头 ⇒ 预览鉴权支持 ?token=，
-            # 拼接方式是 `<base>/api/file_preview/<id>?token=<登录token>`，前端自己拼。
-            "preview_url": (f"/api/file_preview/{r['id']}"
-                            if _has_preview_for(r["original_name"] or r["path"] or "") else ""),
-        })
+    out = [_my_file_item(r, display_names.get(r["id"]) or r["original_name"],
+                         order_info.get(r["id"]) or {}, r["id"] in busy_ids, global_hours)
+           for r in rows]
     # S3-04：列表成功记一条（只记本页条数，不逐条记 file_id —— 否则一次列表放大 50 倍）
     _audit_file_access("list", "ok", openid=g.openid, actor="user", count=len(out))
     return jsonify({
@@ -7532,6 +7601,12 @@ _PREVIEW_FAIL_TTL = 600                    # 秒；同一 (file_id, mtime) 渲�
 _PREVIEW_RENDER_LOCK = threading.Lock()    # 全局串行：2GB 内存同时起两个 soffice 会打到 swap
 _preview_fail_cache = {}                   # {(file_id, mtime): (过期时间戳, 失败原因)}
 _soffice_path = None                       # None=还没探过；""=探过但没有；其它=可执行路径
+# 2026-11-13（用户要求）：上传即把缩略图/首页预览**暂存**下来（跟着文件保留期一起删），
+# 并且支持多页预览。原来只懒生成第 1 页 ⇒ 用户点开 Word 要等 2 秒、且只能看第一页。
+PREVIEW_MAX_PAGES = 12                     # 上传时预生成的页数上限（更多页按需单页生成）
+_PREVIEW_LOCK_GUARD = threading.Lock()
+_preview_page_locks = {}
+_preview_meta_index_cache = {}                   # file_id -> Lock（同一文件别并发跑两个 soffice）
 
 
 def _has_preview_for(name_or_path: str) -> bool:
@@ -7559,11 +7634,123 @@ def _openid_for_media() -> str:
 
 
 
-def _preview_cache_path(file_id: str, mtime_token: str) -> str:
-    """缓存文件名：只留 id 的安全字符（防目录穿越），mtime 当版本号。"""
+def _preview_stem(file_id: str, mtime_token: str) -> str:
+    """预览缓存文件的公共前缀：只留 id 的安全字符（防目录穿越），mtime 当版本号。"""
     safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64] or "x"
     safe_mt = re.sub(r"[^0-9]", "", str(mtime_token))[:20] or "0"
-    return os.path.join(PREVIEW_DIR, f"{safe_id}_{safe_mt}.jpg")
+    return f"{safe_id}_{safe_mt}"
+
+
+def _preview_cache_path(file_id: str, mtime_token: str, page: int = 1) -> str:
+    """第 1 页沿用旧文件名（历史缓存继续命中）；第 N 页加 `_pN` 后缀。"""
+    stem = _preview_stem(file_id, mtime_token)
+    page = int(page or 1)
+    if page <= 1:
+        return os.path.join(PREVIEW_DIR, f"{stem}.jpg")
+    return os.path.join(PREVIEW_DIR, f"{stem}_p{page}.jpg")
+
+
+def _preview_pdf_path(file_id: str, mtime_token: str) -> str:
+    """Office 转换出来的中间 PDF：多页翻页靠它，避免每翻一页重跑一次 soffice。"""
+    return os.path.join(PREVIEW_DIR, f"{_preview_stem(file_id, mtime_token)}.pdf")
+
+
+def _preview_meta_path(file_id: str, mtime_token: str) -> str:
+    """页数元信息（{pages, rendered}）——让「我的文件」列表能直接给出总页数，不触发生成。"""
+    return os.path.join(PREVIEW_DIR, f"{_preview_stem(file_id, mtime_token)}.json")
+
+
+def _read_preview_meta(file_id: str, mtime_token: str) -> dict:
+    try:
+        with open(_preview_meta_path(file_id, mtime_token), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_preview_meta(file_id: str, mtime_token: str, pages: int, rendered: int) -> None:
+    path = _preview_meta_path(file_id, mtime_token)
+    try:
+        os.makedirs(PREVIEW_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"pages": int(pages), "rendered": int(rendered)}, fh)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"  [PREVIEW] 写元信息失败 {file_id}: {e}")
+
+
+def _preview_lock_for(file_id: str):
+    """每个文件一把锁：并发点开同一文件时只跑一次 soffice / PyMuPDF。"""
+    with _PREVIEW_LOCK_GUARD:
+        if len(_preview_page_locks) > 500:      # 这只是"别重复干活"的短锁，不是业务数据
+            _preview_page_locks.clear()
+        lock = _preview_page_locks.get(file_id)
+        if lock is None:
+            lock = threading.Lock()
+            _preview_page_locks[file_id] = lock
+        return lock
+
+
+def _preview_meta_index() -> dict:
+    """PREVIEW_DIR 里的 {file_id: 真实页数} 快照（目录 mtime 变了才重建）。
+
+    列表一次要给 N 个文件算页数，逐文件 glob 是 O(N × 缓存文件数)；这里整目录扫一次
+    并缓存，预热/删除会改目录 mtime ⇒ 自动失效。
+    """
+    global _preview_meta_index_cache
+    try:
+        stamp = os.stat(PREVIEW_DIR).st_mtime_ns
+    except OSError:
+        return {}
+    cached = _preview_meta_index_cache
+    if cached and cached.get("dir") == PREVIEW_DIR and cached.get("stamp") == stamp:
+        return cached.get("map") or {}
+    index = {}
+    try:
+        names = os.listdir(PREVIEW_DIR)
+    except OSError:
+        return {}
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        # 文件名是 <safe_id>_<mtime>.json；safe_id 本身可能带下划线，从右边切
+        safe_id = name.rsplit("_", 1)[0]
+        if not safe_id:
+            continue
+        try:
+            with open(os.path.join(PREVIEW_DIR, name), "r", encoding="utf-8") as fh:
+                pages = int((json.load(fh) or {}).get("pages") or 0)
+        except Exception:  # noqa: BLE001  坏 meta 当没有
+            continue
+        if pages > 0:
+            index[safe_id] = max(index.get(safe_id, 0), pages)
+    _preview_meta_index_cache = {"dir": PREVIEW_DIR, "stamp": stamp, "map": index}
+    return index
+
+
+def _preview_pages_hint(file_id: str, name_or_path: str, page_count_hint: int = 0) -> int:
+    """列表里能直接给前端的页数（**不触发生成**）。
+
+    优先级：图片恒 1 页 → 预热写下的 meta.pages（真实渲染页数，Office 转成 PDF 后
+    可能比 files.page_count 多，样例 docx page_count=2 实际 3 页）→ files.page_count。
+    """
+    if not _has_preview_for(name_or_path):
+        return 0
+    ext = os.path.splitext(str(name_or_path or ""))[1].lower()
+    if ext in _PREVIEW_IMAGE_EXTS:
+        return 1
+    try:
+        safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64]
+        if safe_id:
+            pages = int(_preview_meta_index().get(safe_id) or 0)
+            if pages > 0:
+                return pages
+    except Exception:  # noqa: BLE001  读不到 meta 就退回 page_count
+        pass
+    hint = int(page_count_hint or 0)
+    return hint if hint > 0 else 0
 
 
 def _flatten_to_rgb(im):
@@ -7589,17 +7776,21 @@ def _render_image_preview(src_path: str) -> bytes:
         return buf.getvalue()
 
 
-def _render_pdf_preview(src_path: str) -> bytes:
-    """PDF 第 1 页 → 1024 以内 JPEG bytes。能力降级：PyMuPDF → pdftoppm → 抛 RuntimeError。"""
+def _render_pdf_page_bytes(pdf_path: str, page_index: int) -> bytes:
+    """PDF 第 page_index 页（0 基）→ 长边 ≤ PREVIEW_MAX_PX 的 JPEG bytes。
+
+    能力降级：PyMuPDF → pdftoppm → 抛 RuntimeError（上层回落 415）。
+    """
+    page_index = max(0, int(page_index or 0))
     try:
         import fitz                            # PyMuPDF（可选依赖）
     except ImportError:
         fitz = None
     if fitz is not None:
-        with fitz.open(src_path) as doc:
+        with fitz.open(pdf_path) as doc:
             if doc.page_count <= 0:
                 raise RuntimeError("PDF 没有页面")
-            page = doc.load_page(0)
+            page = doc.load_page(min(page_index, doc.page_count - 1))
             w = float(page.rect.width) or 1.0
             h = float(page.rect.height) or 1.0
             zoom = min(PREVIEW_MAX_PX / w, PREVIEW_MAX_PX / h, 4.0)
@@ -7610,9 +7801,10 @@ def _render_pdf_preview(src_path: str) -> bytes:
         raise RuntimeError("服务端没有 PDF 光栅化能力（缺 PyMuPDF 与 pdftoppm）")
     tmpdir = tempfile.mkdtemp(prefix="hn_prev_")
     try:
+        n = page_index + 1
         subprocess.run(
-            [exe, "-f", "1", "-l", "1", "-scale-to", str(PREVIEW_MAX_PX),
-             "-jpeg", "-singlefile", src_path, os.path.join(tmpdir, "page")],
+            [exe, "-f", str(n), "-l", str(n), "-scale-to", str(PREVIEW_MAX_PX),
+             "-jpeg", "-singlefile", pdf_path, os.path.join(tmpdir, "page")],
             timeout=60, check=False, capture_output=True)
         hits = sorted(glob.glob(os.path.join(tmpdir, "page*.jpg")))
         if not hits:
@@ -7620,6 +7812,24 @@ def _render_pdf_preview(src_path: str) -> bytes:
         return _render_image_preview(hits[0])   # 再统一压到 1024 以内
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _pdf_page_total(pdf_path: str) -> int:
+    """PDF 总页数（读不出来就当 1 页 —— 预览是锦上添花，不能让翻页把接口拖红）。"""
+    try:
+        import fitz
+    except ImportError:
+        return 1
+    try:
+        with fitz.open(pdf_path) as doc:
+            return max(1, int(doc.page_count))
+    except Exception:  # noqa: BLE001
+        return 1
+
+
+def _render_pdf_preview(src_path: str) -> bytes:
+    """PDF 第 1 页 → 1024 以内 JPEG bytes（兼容旧调用）。"""
+    return _render_pdf_page_bytes(src_path, 0)
 
 
 def _soffice_bin() -> str:
@@ -7714,12 +7924,14 @@ def _soffice_to_pdf(exe: str, src_path: str, outdir: str, filter_spec: str) -> s
     return pdfs[0] if pdfs else ""
 
 
-def _render_office_preview(src_path: str) -> bytes:
-    """Office 文档第 1 页 → 1024 以内 JPEG bytes。
+def _ensure_office_pdf(src_path: str, cache_path: str) -> str:
+    """Office → PDF（结果落 cache_path 并复用）。失败抛 RuntimeError（上层回落 415）。
 
-    路径：soffice --headless --convert-to pdf → 复用 _render_pdf_preview 取第 1 页。
-    没有 LibreOffice / PyMuPDF 就抛 RuntimeError（上层回落 415，前端显示类型图标）。
+    多页预览必须复用同一份中间 PDF：soffice 一次转换 2~5 秒，每翻一页重跑一次
+    等于把 2GB 内存的机器按在地上摩擦。
     """
+    if cache_path and os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+        return cache_path
     exe = _soffice_bin()
     if not exe:
         raise RuntimeError("服务端没有 Office 渲染能力（缺 LibreOffice）")
@@ -7739,9 +7951,140 @@ def _render_office_preview(src_path: str) -> bytes:
                 break
         if not pdf_path:
             raise RuntimeError("LibreOffice 没有输出 PDF（文件损坏或格式不支持）")
-        return _render_pdf_preview(pdf_path)
+        if not cache_path:
+            raise RuntimeError("缺少中间 PDF 缓存路径")
+        os.makedirs(os.path.dirname(cache_path) or PREVIEW_DIR, exist_ok=True)
+        try:
+            shutil.copyfile(pdf_path, cache_path)
+        except OSError as e:
+            raise RuntimeError("无法缓存 Office 转换结果: %s" % e)
+        return cache_path
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _render_office_preview(src_path: str) -> bytes:
+    """Office 文档第 1 页 → 1024 以内 JPEG bytes（兼容旧调用；多页走 _render_preview_page）。"""
+    if not _soffice_bin():
+        raise RuntimeError("服务端没有 Office 渲染能力（缺 LibreOffice）")
+    tmpdir = tempfile.mkdtemp(prefix="hn_office_prev_")
+    try:
+        pdf_path = _ensure_office_pdf(src_path, os.path.join(tmpdir, "cache.pdf"))
+        return _render_pdf_page_bytes(pdf_path, 0)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _preview_pdf_for(src_path: str, ext: str, file_id: str, mtime_token: str) -> str:
+    """把可预览文件变成一份（可缓存的）PDF：PDF 原样用，Office 走 soffice 并缓存结果。"""
+    if ext == ".pdf":
+        return src_path
+    return _ensure_office_pdf(src_path, _preview_pdf_path(file_id, mtime_token))
+
+
+def _render_preview_page(src_path: str, display_name: str, file_id: str,
+                         mtime_token: str, page_index: int) -> bytes:
+    """任意可预览文件第 page_index 页（0 基）→ JPEG bytes。"""
+    ext = os.path.splitext(display_name or src_path)[1].lower()
+    if ext in _PREVIEW_IMAGE_EXTS:
+        if page_index > 0:
+            raise RuntimeError("图片只有一页")
+        return _render_image_preview(src_path)
+    pdf_path = _preview_pdf_for(src_path, ext, file_id, mtime_token)
+    return _render_pdf_page_bytes(pdf_path, page_index)
+
+
+def _preview_total_pages(src_path: str, display_name: str, file_id: str,
+                         mtime_token: str) -> int:
+    """总页数：图片 1 页；PDF/Office 取光栅化源（Office 会顺带把中间 PDF 缓存下来）。"""
+    ext = os.path.splitext(display_name or src_path)[1].lower()
+    if ext in _PREVIEW_IMAGE_EXTS:
+        return 1
+    return _pdf_page_total(_preview_pdf_for(src_path, ext, file_id, mtime_token))
+
+
+def _prewarm_previews(file_id: str) -> bool:
+    """生成前 PREVIEW_MAX_PAGES 页 + 页数元信息（同一文件只跑一次）。
+
+    2026-11-13 用户要求：「暂存的云端文件同时需要暂存一份略缩图，略缩图也服从
+    云端的自动删除处理」。上传成功后后台线程调这里；用户点开详情就是秒开。
+    失败只打日志（`[PREVIEW]`），绝不把上传/列表搞红。
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, original_name, path FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None or not row["path"]:
+        return False
+    src_path = _resolve_files_path(row["path"])
+    if not src_path or not os.path.isfile(src_path):
+        return False
+    display = row["original_name"] or src_path
+    if not _has_preview_for(display):
+        return False
+    try:
+        mtime_token = str(int(os.path.getmtime(src_path)))
+    except OSError:
+        mtime_token = "0"
+    if _read_preview_meta(file_id, mtime_token).get("pages"):
+        return True                      # 已预热过（同 mtime）
+    lock = _preview_lock_for(file_id)
+    if not lock.acquire(blocking=False):
+        # 别的线程正在生成：等它（最多 30 秒），别重复跑 soffice
+        if not lock.acquire(timeout=30):
+            return False
+        lock.release()
+        return bool(_read_preview_meta(file_id, mtime_token).get("pages"))
+    try:
+        if _read_preview_meta(file_id, mtime_token).get("pages"):
+            return True
+        total = _preview_total_pages(src_path, display, file_id, mtime_token)
+        limit = max(1, min(total, PREVIEW_MAX_PAGES))
+        os.makedirs(PREVIEW_DIR, exist_ok=True)
+        rendered = 0
+        for i in range(limit):
+            cache_path = _preview_cache_path(file_id, mtime_token, i + 1)
+            if os.path.isfile(cache_path):
+                rendered += 1
+                continue
+            try:
+                data = _render_preview_page(src_path, display, file_id, mtime_token, i)
+            except Exception as e:      # noqa: BLE001  单页失败不影响其它页
+                print(f"  [PREVIEW] 预热第 {i + 1} 页失败 file_id={file_id}: {e}")
+                break
+            try:
+                with open(cache_path, "wb") as fh:
+                    fh.write(data)
+                rendered += 1
+            except OSError as e:
+                print(f"  [PREVIEW] 写缓存失败 {cache_path}: {e}")
+                break
+        _write_preview_meta(file_id, mtime_token, total, rendered)
+        print(f"  [PREVIEW] 已预热 {_redact_filename(display)} 共 {total} 页"
+              f"（已生成 {rendered} 页）")
+        return True
+    finally:
+        lock.release()
+
+
+def _spawn_preview_prewarm(file_id: str, display_name: str) -> None:
+    """上传成功后起一个后台线程预热预览（不阻塞上传响应）。"""
+    if not _has_preview_for(display_name or ""):
+        return
+
+    def _run():
+        try:
+            _prewarm_previews(file_id)
+        except Exception as e:          # noqa: BLE001  后台线程绝不能把异常漏进主流程
+            print(f"  [PREVIEW] 预热异常 file_id={file_id}: {e}")
+
+    try:
+        threading.Thread(target=_run, name="preview-prewarm", daemon=True).start()
+    except Exception as e:              # noqa: BLE001
+        print(f"  [PREVIEW] 无法启动预热线程 file_id={file_id}: {e}")
 
 
 def _drop_previews(file_id: str) -> None:
@@ -7750,7 +8093,8 @@ def _drop_previews(file_id: str) -> None:
         safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64]
         if not safe_id or not os.path.isdir(PREVIEW_DIR):
             return
-        for p in glob.glob(os.path.join(PREVIEW_DIR, f"{safe_id}_*.jpg")):
+        # 2026-11-13：缓存里不止 .jpg 了（多页 JPEG / Office 中间 PDF / 页数元信息）
+        for p in glob.glob(os.path.join(PREVIEW_DIR, f"{safe_id}_*")):
             try:
                 os.remove(p)
             except OSError:
@@ -7759,20 +8103,16 @@ def _drop_previews(file_id: str) -> None:
         print(f"  [PREVIEW] 清理预览缓存失败 {file_id}: {e}")
 
 
-@app.route("/api/file_preview/<file_id>", methods=["GET"])
-def file_preview(file_id):
-    """文件预览图（≤1024×1024 JPEG）。见本节顶部的口径说明。
+def _preview_request_context(file_id, openid):
+    """预览类端点的公共前置：鉴权后的属主判定、物理文件、类型。
 
-    返回：
-      · 200 + image/jpeg —— 命中缓存或刚生成；
-      · 404 —— 文件不存在/已清理；
-      · 403 —— 不是你的文件（管理员可看）；
-      · 415 —— 该类型没有预览图 / 服务端暂时渲染不了（PDF、Office 同此；
-               前端静默退回类型图标，不是错误弹窗）。
+    返回 dict（`row/src_path/display/mtime_token`）；不满足时返回 Flask 响应元组
+    （404/403/415），调用方直接 `return` 出去。
+    ⚠ 成功分支**绝不能**返回 tuple：调用方用 `isinstance(ctx, tuple)` 判断"这是错误响应"，
+      两边都是 tuple 时视图会把 ctx 当响应元组交给 Flask ⇒ 500
+      `TypeError: The view function did not return a valid response tuple.`
+      （2026-11-13 线上真踩：所有预览请求一律 500）
     """
-    openid = _openid_for_media()
-    if not openid:
-        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
     conn = get_db()
     try:
         row = conn.execute(
@@ -7800,26 +8140,56 @@ def file_preview(file_id):
         mtime_token = str(int(os.path.getmtime(src_path)))
     except OSError:
         mtime_token = "0"
-    cache_path = _preview_cache_path(file_id, mtime_token)
+    return {"row": row, "src_path": src_path, "display": display,
+            "mtime_token": mtime_token}
+
+
+def _send_preview_file(path: str, page_no: int, pages: int):
+    """发图 + 页码/总页数响应头（多页 swiper 用得到）。"""
+    resp = send_file(path, mimetype="image/jpeg", max_age=86400, conditional=True)
+    resp.headers["X-Preview-Page"] = str(int(page_no))
+    resp.headers["X-Preview-Pages"] = str(int(pages))
+    return resp
+
+
+@app.route("/api/file_preview/<file_id>", methods=["GET"])
+def file_preview(file_id):
+    """文件预览图（≤1024×1024 JPEG）。见本节顶部的口径说明。
+
+    参数：`page`（1 基，默认 1）—— 多页文档翻页用（2026-11-13 用户要求支持多页）。
+    返回：
+      · 200 + image/jpeg —— 命中缓存或刚生成；响应头 X-Preview-Page / X-Preview-Pages；
+      · 404 —— 文件不存在/已清理；
+      · 403 —— 不是你的文件（管理员可看）；
+      · 415 —— 该类型没有预览图 / 服务端暂时渲染不了（前端静默退回类型图标）。
+    """
+    openid = _openid_for_media()
+    if not openid:
+        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
+    ctx = _preview_request_context(file_id, openid)
+    if isinstance(ctx, tuple):
+        return ctx
+    src_path = ctx["src_path"]
+    display = ctx["display"]
+    mtime_token = ctx["mtime_token"]
+    page_no = request.args.get("page", 1, type=int) or 1
+    page_no = max(1, min(999, int(page_no)))
+    meta = _read_preview_meta(file_id, mtime_token)
+    cache_path = _preview_cache_path(file_id, mtime_token, page_no)
     if os.path.isfile(cache_path):
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
-        return send_file(cache_path, mimetype="image/jpeg", max_age=86400, conditional=True)
+        return _send_preview_file(cache_path, page_no, int(meta.get("pages") or page_no))
     ext = os.path.splitext(display)[1].lower()
-    fail_key = (str(file_id), mtime_token)
+    fail_key = (str(file_id), mtime_token, int(page_no))
     if _preview_fail_hit(fail_key):
         # 刚失败过（典型：损坏的 docx / 服务器内存吃紧）：这次不再重试，直接回落图标。
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
                            ext=ext.lstrip("."))
         return jsonify({"success": False, "message": "该文件暂时没有预览图"}), 415
     try:
-        if ext == ".pdf":
-            data = _render_pdf_preview(src_path)
-        elif ext in _PREVIEW_OFFICE_EXTS:
-            data = _render_office_preview(src_path)
-        else:
-            data = _render_image_preview(src_path)
+        data = _render_preview_page(src_path, display, file_id, mtime_token, page_no - 1)
     except Exception as e:  # noqa: BLE001  预览失败绝不 500
-        print(f"  [PREVIEW] 生成失败 file_id={file_id} ext={ext}: {e}")
+        print(f"  [PREVIEW] 生成失败 file_id={file_id} page={page_no} ext={ext}: {e}")
         _preview_fail_note(fail_key, e)
         data = None
     if not data:
@@ -7833,8 +8203,46 @@ def file_preview(file_id):
     except OSError as e:
         # 缓存写不进去也照样回图（磁盘满/权限问题时不让预览彻底不可用）
         print(f"  [PREVIEW] 写缓存失败 {cache_path}: {e}")
+    pages = int(meta.get("pages") or 0)
+    if not pages:
+        try:
+            pages = _preview_total_pages(src_path, display, file_id, mtime_token)
+        except Exception:  # noqa: BLE001
+            pages = page_no
+        _write_preview_meta(file_id, mtime_token, pages, 1)
     _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
-    return send_file(io.BytesIO(data), mimetype="image/jpeg", max_age=86400)
+    resp = send_file(io.BytesIO(data), mimetype="image/jpeg", max_age=86400)
+    resp.headers["X-Preview-Page"] = str(int(page_no))
+    resp.headers["X-Preview-Pages"] = str(int(pages))
+    return resp
+
+
+@app.route("/api/file_preview/<file_id>/info", methods=["GET"])
+def file_preview_info(file_id):
+    """预览元信息（总页数）：先把前 N 页预热出来，再回 `{success, pages, rendered}`。
+
+    前端在展开详情时调用它 —— 拿到 pages 就能渲染多页 swiper；预热本身也在这里
+    兜底（老文件上传时还没有预热机制）。渲染不了的类型回 415（前端显示类型图标）。
+    """
+    openid = _openid_for_media()
+    if not openid:
+        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
+    ctx = _preview_request_context(file_id, openid)
+    if isinstance(ctx, tuple):
+        return ctx
+    mtime_token = ctx["mtime_token"]
+    try:
+        _prewarm_previews(file_id)
+    except Exception as e:  # noqa: BLE001  预热失败不 500：前端回落类型图标
+        print(f"  [PREVIEW] 预热失败 file_id={file_id}: {e}")
+    meta = _read_preview_meta(file_id, mtime_token)
+    pages = int(meta.get("pages") or 0)
+    if pages <= 0:
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
+        return jsonify({"success": False, "message": "该文件暂时没有预览图"}), 415
+    _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
+    return jsonify({"success": True, "pages": pages,
+                    "rendered": int(meta.get("rendered") or 0)})
 
 
 @app.route("/api/admin/file_audit", methods=["GET"])
@@ -8659,6 +9067,10 @@ def upload_file():
     )
     conn.commit()
     conn.close()
+
+    # 2026-11-13（用户要求）：上传即把缩略图/首页预览预生成并暂存下来（跟着文件
+    # 保留期一起删）。后台线程做，不拖慢上传响应。
+    _spawn_preview_prewarm(file_id, display_name)
 
     # 对需要本地工具分析的文档格式，请求直连的打印客户端下载并分析页数
     # 但若同 MD5 已有验证页数，跳过分析

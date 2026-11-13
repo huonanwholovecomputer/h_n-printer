@@ -260,9 +260,11 @@ H.chk("C0 基线：上传存真实名 + 列表回真实名（探针本身可信�
       (proc.stdout or "")[-400:])
 
 # C1. 变异：my_files 不再用 order_files 兜底
+# 2026-11-13：/api/my_files 的条目改由 _my_file_item(row, display_name, ...) 统一产出，
+# 兜底（display_names 优先）搬到调用点，变异锚点跟着搬。
 tmpm, dstm = H.mutated_copy([(
-    '            "original_name": display_names.get(r["id"]) or r["original_name"],',
-    '            "original_name": r["original_name"],',
+    'display_names.get(r["id"]) or r["original_name"],',
+    'r["original_name"],',
 )], prefix="hn_origname_mut1_")
 proc = H.run_probe(dstm, PROBE_BODY)
 H.chk("★ C1 变异（my_files 不兜底）⇒ 列表回的是 tmp_ 名（判据能红）",

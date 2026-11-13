@@ -18,6 +18,9 @@ function _fallbackSheets(f, eff) {
 }
 // 头像裁剪的纯几何（fit/clamp/cropRect/zoomAt）：与 APP 的 www/avatar_crop.js 同一语义
 const avatarCrop = require('../../utils/avatar_crop')
+// 「我的文件」预览图最多展示前多少页（与后端 app.py 的 PREVIEW_MAX_PAGES 对齐：
+// 后端预热也只生成这么多页，再往后的页没有缓存，点开会现生成、明显慢）
+const PREVIEW_MAX_PAGES = 12
 
 function _initIsDark() {
   try {
@@ -174,6 +177,11 @@ Component({
     myFilesDetailId: '',
     // 展开/收起动画用：JS 量出的高度写进这个行内 style（如 'height:auto;opacity:1;'）
     myFilesDetailStyle: '',
+    // 2026-11-13 用户要求 4：订单卡片「文件列表」点开的文件详情弹窗（独立弹窗，同源模板）
+    fileDetailVisible: false,
+    fileDetailClosing: false,
+    fileDetailLoading: false,
+    fileDetail: null,
     pageSizeDropdownLeft: 0,   // 分页下拉 fixed 定位（viewport 坐标）
     pageSizeDropdownTop: 0,
     statusMap: {
@@ -1638,11 +1646,21 @@ Component({
            'token=' + encodeURIComponent(token))
         : ''
       const pages = Number(f.page_count) || 0
+      // 2026-11-13 用户要求 1/2/3：多页预览 + 加载骨架 + 点开全屏。
+      // preview_pages 是后端给的页数提示（图片恒 1，Office/PDF 取真实页数）；
+      // 后端没分析出页数时为 0，展开时再问 /api/file_preview/<id>/info。
+      const previewPages = Math.max(0, Number(f.preview_pages) || 0)
       return Object.assign({}, f, {
         sizeText: this._fmtFileSize(f.size),
         retentionText: retentionText,
         expireText: expireText,
         previewUrl: previewUrl,
+        previewPages: previewPages,
+        previewShots: previewUrl
+          ? [this._myFilePreviewShot(this._myFilePreviewUrl(f.file_id, 1), 1, true)]
+          : [],
+        previewIndex: 0,
+        previewLoading: !!previewUrl,
         previewFailed: false,
         // 2026-11-13：后端已能渲染 Office（soffice 转 PDF 取第 1 页），提示语同步改口径
         previewTip: f.has_preview === false
@@ -1653,6 +1671,180 @@ Component({
         pageCountText: pages > 0 ? (pages + ' 页') : '',
         orderText: f.order_number ? String(f.order_number) : '未下单（仅上传）',
       })
+    },
+
+    // 单页预览图地址：<BASE>/api/file_preview/<id>?token=..&page=N（<image> 带不了 Bearer 头）
+    _myFilePreviewUrl(fileId, page) {
+      const token = (wx.getStorageSync('token') || '')
+      return CONFIG.BASE_URL + '/api/file_preview/' + encodeURIComponent(fileId) +
+        '?token=' + encodeURIComponent(token) + '&page=' + (Number(page) || 1)
+    },
+
+    _myFilePreviewShot(url, page, ready) {
+      return { page: Number(page) || 1, url: url, ready: !!ready, loaded: false, failed: false }
+    },
+
+    // 只让当前页 ±1 页真的发请求：一份 12 页的 PDF 不该一展开就拉 12 张图
+    _myFilePreviewShots(fileId, total, index, keepLoaded) {
+      const n = Math.max(1, Math.min(PREVIEW_MAX_PAGES, Number(total) || 1))
+      const cur = Number(index) || 0
+      const old = {}
+      ;(keepLoaded || []).forEach((s) => { old[s.page] = s })
+      const shots = []
+      for (let p = 1; p <= n; p++) {
+        const prev = old[p]
+        shots.push({
+          page: p,
+          url: this._myFilePreviewUrl(fileId, p),
+          ready: prev ? !!prev.ready : Math.abs(p - 1 - cur) <= 1,
+          loaded: prev ? !!prev.loaded : false,
+          failed: prev ? !!prev.failed : false,
+        })
+      }
+      return shots
+    },
+
+    // 更新「我的文件」列表里的某个文件（详情弹窗走 _patchFileDetail）
+    _patchMyFile(fileId, fn) {
+      const list = (this.data.myFiles || []).map((f) => (
+        f.file_id === fileId ? Object.assign({}, f, fn(f) || {}) : f
+      ))
+      this.setData({ myFiles: list })
+    },
+
+    _patchFileDetail(fn) {
+      const cur = this.data.fileDetail
+      if (!cur) return
+      this.setData({ fileDetail: Object.assign({}, cur, fn(cur) || {}) })
+    },
+
+    // 展开详情时才准备预览：已知页数直接用，未知再问 /info（后端会顺带预热前几页）
+    _prepareMyFilePreview(item, apply) {
+      if (!item || item.has_preview === false || !item.previewUrl) return
+      const fileId = item.file_id
+      const pages = Math.max(0, Number(item.preview_pages) || 0)
+      const total = pages > 0 ? Math.min(pages, PREVIEW_MAX_PAGES) : 1
+      apply({
+        previewShots: this._myFilePreviewShots(fileId, total, 0, item.previewShots),
+        previewIndex: 0,
+        previewLoading: true,
+        previewFailed: false,
+      })
+      // 页数一律向 info 端点核对一次（本页生命周期内缓存）：
+      // files.page_count 是页数分析的结果，Office 转成 PDF 后**可能比它多**
+      // （线上样例：page_count=2 的 docx 实际 3 页），只信它会让多页少一页。
+      // 已核对过的文件不再重复请求；info 顺带把前 12 页预热出来。
+      this._previewInfoCache = this._previewInfoCache || {}
+      if (this._previewInfoCache[fileId]) return
+      request({
+        url: CONFIG.BASE_URL + '/api/file_preview/' + encodeURIComponent(fileId) +
+          '/info?token=' + encodeURIComponent(wx.getStorageSync('token') || ''),
+        method: 'GET',
+        success: (res) => {
+          const d = (res && res.data) || {}
+          if (res.statusCode !== 200 || !d.success) return
+          const n = Math.min(PREVIEW_MAX_PAGES, Number(d.pages) || 0)
+          this._previewInfoCache[fileId] = n || 1
+          if (n <= 1) return
+          const cur = Number(item.preview_pages) || 0
+          if (cur === n) return
+          apply({
+            previewShots: this._myFilePreviewShots(fileId, n, 0, item.previewShots),
+            previewPages: n,
+          })
+        },
+      })
+    },
+
+    // 预览图加载完：淡入（CSS opacity 过渡），骨架撤掉
+    onMyFilePreviewLoad(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const page = Number(ds.page) || 1
+      const apply = (fn) => (ds.scope === 'detail'
+        ? this._patchFileDetail(fn)
+        : this._patchMyFile(ds.id || '', fn))
+      apply((f) => ({
+        previewLoading: false,
+        previewShots: (f.previewShots || []).map((s) => (
+          s.page === page ? Object.assign({}, s, { loaded: true, failed: false }) : s
+        )),
+      }))
+    },
+
+    // 翻页：更新页码，并把相邻页标成 ready（预取，不让用户看着空白等）
+    onMyFilePreviewChange(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const index = Number(e && e.detail && e.detail.current) || 0
+      const apply = (fn) => (ds.scope === 'detail'
+        ? this._patchFileDetail(fn)
+        : this._patchMyFile(ds.id || '', fn))
+      apply((f) => ({
+        previewIndex: index,
+        previewShots: (f.previewShots || []).map((s, i) => (
+          Math.abs(i - index) <= 1 && !s.ready ? Object.assign({}, s, { ready: true }) : s
+        )),
+      }))
+    },
+
+    // 点预览图 → 全屏。小程序原生 wx.previewImage 自带双指缩放 + 左右翻页，
+    // 比自己画浮层可靠；urls 里带上全部已切片的页，current 指定当前页。
+    onOpenMyFilePreview(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const item = ds.scope === 'detail'
+        ? this.data.fileDetail
+        : (this.data.myFiles || []).find((f) => f.file_id === ds.id)
+      if (!item) return
+      const shots = (item.previewShots || []).filter((s) => s.url)
+      if (!shots.length) return
+      const urls = shots.map((s) => s.url)
+      const idx = Math.max(0, Math.min(urls.length - 1, Number(ds.index) || 0))
+      if (typeof wx.previewImage !== 'function') return
+      wx.previewImage({ urls: urls, current: urls[idx] })
+    },
+
+    // 订单卡片「文件列表」→ 文件详情弹窗（GET /api/file_detail/<id>，与列表项同形状）
+    onOpenOrderFileDetail(e) {
+      const fileId = (e && e.currentTarget && e.currentTarget.dataset)
+        ? (e.currentTarget.dataset.id || '') : ''
+      if (!fileId) {
+        wx.showToast({ title: '该文件已清理', icon: 'none' })
+        return
+      }
+      this.setData({
+        fileDetailVisible: true,
+        fileDetailClosing: false,
+        fileDetailLoading: true,
+        fileDetail: null,
+      })
+      request({
+        url: CONFIG.BASE_URL + '/api/file_detail/' + encodeURIComponent(fileId),
+        method: 'GET',
+        success: (res) => {
+          const d = (res && res.data) || {}
+          if (res.statusCode === 200 && d.success && d.file) {
+            const item = this._decorateMyFile(d.file)
+            this.setData({ fileDetail: item, fileDetailLoading: false })
+            this._prepareMyFilePreview(item, (patch) => this._patchFileDetail(() => patch))
+          } else {
+            this.setData({ fileDetailLoading: false })
+            wx.showToast({ title: (d && d.message) || '文件不存在或已清理', icon: 'none' })
+          }
+        },
+        fail: () => {
+          this.setData({ fileDetailLoading: false })
+          wx.showToast({ title: '网络异常，请重试', icon: 'none' })
+        },
+      })
+    },
+
+    onCloseFileDetail() {
+      if (this.data.fileDetailClosing) return
+      this.setData({ fileDetailClosing: true })
+      setTimeout(() => this.setData({
+        fileDetailVisible: false,
+        fileDetailClosing: false,
+        fileDetail: null,
+      }), 200)
     },
 
     loadMyFiles(reset) {
@@ -1728,6 +1920,11 @@ Component({
         myFilesDetailId: fileId,
         myFilesDetailStyle: this._myFileDetailStyle(0, 0),
       })
+      // 预览图要在卡片挂载后就开始准备（多页 + 骨架），否则动画结束后才看到一块灰
+      const item = (this.data.myFiles || []).find((f) => f.file_id === fileId)
+      if (item) {
+        this._prepareMyFilePreview(item, (patch) => this._patchMyFile(fileId, () => patch))
+      }
       // 必须等"高度 0"这一帧真的渲染出来再量，否则量到的还是 0
       this._nextFrame(() => {
         if (this.data.myFilesDetailId !== fileId) return
@@ -1787,13 +1984,21 @@ Component({
     // 预览图加载失败（415 / 403 / 网络）→ 静默退回类型图标，不弹错误框：
     // 预览图是锦上添花，不能因为它把整行详情搞红。
     onMyFilePreviewError(e) {
-      const fileId = (e && e.currentTarget && e.currentTarget.dataset)
-        ? (e.currentTarget.dataset.id || '') : ''
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const fileId = ds.id || ''
       if (!fileId) return
-      const list = (this.data.myFiles || []).map(f => (
-        f.file_id === fileId ? Object.assign({}, f, { previewFailed: true }) : f
-      ))
-      this.setData({ myFiles: list })
+      const page = Number(ds.page) || 1
+      const apply = (fn) => (ds.scope === 'detail'
+        ? this._patchFileDetail(fn)
+        : this._patchMyFile(fileId, fn))
+      apply((f) => {
+        const shots = (f.previewShots || []).map((s) => (
+          s.page === page ? Object.assign({}, s, { failed: true, loaded: false }) : s
+        ))
+        // 多页时某一页坏掉不该把整块预览换成占位图，只有一页可用都没有才退回类型图标
+        const anyOk = shots.some((s) => s.ready && !s.failed)
+        return { previewShots: shots, previewLoading: false, previewFailed: !anyOk }
+      })
     },
 
     onDeleteMyFile(e) {

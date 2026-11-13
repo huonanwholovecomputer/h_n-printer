@@ -283,7 +283,8 @@
                  同一页可同时展开多张订单卡，WXS 用 selectAllComponents 逐个量 rect 命中，不会串卡。 -->
             <view class="detail-files-scroll">
               <view class="detail-files-track">
-            <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row">
+            <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row"
+                  bindtap="onOpenOrderFileDetail" data-id="{{f.file_id}}">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
                 <view class="detail-file-tags">
@@ -772,41 +773,9 @@
           </view>
           <view wx:if="{{myFilesDetailId === item.file_id}}" class="myfile-detail" catchtap="noop"
                 style="{{myFilesDetailStyle}}">
-            <view class="myfile-detail-card">
-              <view class="myfile-preview-wrap">
-                <image wx:if="{{item.previewUrl && !item.previewFailed}}"
-                       class="myfile-preview" src="{{item.previewUrl}}" mode="aspectFit"
-                       binderror="onMyFilePreviewError" data-id="{{item.file_id}}" />
-                <view wx:else class="myfile-preview-fallback">
-                  <text class="myfile-preview-icon">{{item.typeIcon}}</text>
-                  <text class="myfile-preview-tip">{{item.previewTip}}</text>
-                </view>
-              </view>
-              <view class="myfile-kv">
-                <text class="myfile-k">上传时间</text>
-                <text class="myfile-v">{{item.createdAtText}}</text>
-              </view>
-              <view class="myfile-kv">
-                <text class="myfile-k">文件大小</text>
-                <text class="myfile-v">{{item.sizeText}}</text>
-              </view>
-              <view wx:if="{{item.pageCountText}}" class="myfile-kv">
-                <text class="myfile-k">页数</text>
-                <text class="myfile-v">{{item.pageCountText}}</text>
-              </view>
-              <view class="myfile-kv">
-                <text class="myfile-k">所属订单</text>
-                <text class="myfile-v">{{item.orderText}}</text>
-              </view>
-              <view class="myfile-kv">
-                <text class="myfile-k">保留期</text>
-                <text class="myfile-v">{{item.expireText}}</text>
-              </view>
-              <view class="myfile-kv">
-                <text class="myfile-k">状态</text>
-                <text class="myfile-v">{{item.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除'}}</text>
-              </view>
-            </view>
+            <!-- 2026-11-13 用户要求 4「复用代码逻辑」：详情卡抽成模板，
+                 行内展开与订单卡片里的文件详情弹窗用同一份（见文件末尾 template）。 -->
+            <template is="myfileDetailCard" data="{{f: item, scope: 'list'}}" />
           </view>
         </view>
       </scroll-view>
@@ -817,6 +786,28 @@
     </view>
   </view>
 
+
+  <!-- 2026-11-13 用户要求 4：未过期文件在订单卡片「文件列表」里也能点开看详情。
+       独立弹窗、内容与「我的文件」行内详情完全同源（myfileDetailCard 模板）。
+       放在 page-root 外：me 页 .scroll-content 有 transform，放里面 fixed 会被裁/跟着滚。 -->
+  <view wx:if="{{fileDetailVisible}}" class="modal-mask {{fileDetailClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}" catchtap="onCloseFileDetail">
+    <view class="modal-sheet filedetail-sheet" catchtap="noop">
+      <text class="title-medium" style="margin-bottom: 8rpx;">文件详情</text>
+      <view wx:if="{{fileDetailLoading}}" class="status-box">
+        <text class="status-text">加载中...</text>
+      </view>
+      <view wx:elif="{{!fileDetail}}" class="status-box">
+        <text class="status-text">文件不存在或已清理</text>
+      </view>
+      <view wx:else class="filedetail-body">
+        <text class="filedetail-name">{{fileDetail.original_name}}</text>
+        <template is="myfileDetailCard" data="{{f: fileDetail, scope: 'detail'}}" />
+      </view>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" bindtap="onCloseFileDetail" hover-class="tap-active">关闭</button>
+      </view>
+    </view>
+  </view>
 
   <!-- 头像裁剪（2026-10-27 用户要求）：选图/取微信头像之后先裁剪再上传。
        放在 page-root 外 + position:fixed —— me 页的 .scroll-content 有 translateY 变换层，
@@ -841,3 +832,69 @@
       <canvas type="2d" id="cropCanvas" class="crop-canvas"></canvas>
     </view>
   </view>
+
+
+<!-- ==================== 文件详情卡（行内 + 弹窗共用） ====================
+     2026-11-13 用户要求：
+       1) 缩略图加载时播加载动画 ⇒ 预览区底层铺 shimmer 骨架，真图 opacity 0→1 淡入盖住；
+       2) 点预览图全屏看大图（小程序走 wx.previewImage，原生双指缩放 + 左右翻页）；
+       3) 之前只能看第 1 页 ⇒ 改成 swiper，页数由后端 preview_pages 给出（未知再问 /info）。
+     模板里只读 f.xxx，事件都带 data-id + data-scope，两个宿主（行内列表 / 弹窗）共用一套 JS。 -->
+<template name="myfileDetailCard">
+  <view class="myfile-detail-card">
+    <view class="myfile-preview-wrap">
+      <block wx:if="{{f.has_preview !== false && !f.previewFailed}}">
+        <view wx:if="{{f.previewLoading}}" class="myfile-preview-skeleton">
+          <view class="myfile-skeleton-bar"></view>
+          <view class="myfile-skeleton-bar short"></view>
+          <view class="myfile-skeleton-bar"></view>
+          <text class="myfile-skeleton-tip">正在生成预览图…</text>
+        </view>
+        <swiper wx:if="{{f.previewShots.length}}" class="myfile-preview-swiper"
+                bindchange="onMyFilePreviewChange" data-id="{{f.file_id}}" data-scope="{{scope}}">
+          <swiper-item wx:for="{{f.previewShots}}" wx:for-item="shot" wx:key="page">
+            <image wx:if="{{shot.ready}}"
+                   class="myfile-preview {{shot.loaded ? 'myfile-preview-loaded' : ''}}"
+                   src="{{shot.url}}" mode="aspectFit"
+                   bindload="onMyFilePreviewLoad" binderror="onMyFilePreviewError"
+                   bindtap="onOpenMyFilePreview"
+                   data-id="{{f.file_id}}" data-scope="{{scope}}"
+                   data-page="{{shot.page}}" data-index="{{index}}" />
+            <view wx:else class="myfile-preview-skeleton page">
+              <view class="myfile-skeleton-bar"></view>
+            </view>
+          </swiper-item>
+        </swiper>
+        <view wx:if="{{f.previewShots.length > 1}}" class="myfile-preview-pager">{{f.previewIndex + 1}} / {{f.previewShots.length}} · 点击看大图</view>
+      </block>
+      <view wx:else class="myfile-preview-fallback">
+        <text class="myfile-preview-icon">{{f.typeIcon}}</text>
+        <text class="myfile-preview-tip">{{f.previewTip}}</text>
+      </view>
+    </view>
+    <view class="myfile-kv">
+      <text class="myfile-k">上传时间</text>
+      <text class="myfile-v">{{f.createdAtText}}</text>
+    </view>
+    <view class="myfile-kv">
+      <text class="myfile-k">文件大小</text>
+      <text class="myfile-v">{{f.sizeText}}</text>
+    </view>
+    <view wx:if="{{f.pageCountText}}" class="myfile-kv">
+      <text class="myfile-k">页数</text>
+      <text class="myfile-v">{{f.pageCountText}}</text>
+    </view>
+    <view class="myfile-kv">
+      <text class="myfile-k">所属订单</text>
+      <text class="myfile-v">{{f.orderText}}</text>
+    </view>
+    <view class="myfile-kv">
+      <text class="myfile-k">保留期</text>
+      <text class="myfile-v">{{f.expireText}}</text>
+    </view>
+    <view class="myfile-kv">
+      <text class="myfile-k">状态</text>
+      <text class="myfile-v">{{f.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除'}}</text>
+    </view>
+  </view>
+</template>

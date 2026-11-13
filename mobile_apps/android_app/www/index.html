@@ -1062,5 +1062,37 @@
     </view>
   </view>
 </view>
+  <!-- 订单「文件列表」点一行 → 该文件的详情弹窗（2026-11-13）。
+       放在 .app-frame 之外：订单卡有 overflow:hidden + max-height，落在里面的弹层会被裁掉
+       （价格气泡、头像裁剪层都栽过同一个坑），所以这一层必须挂在页面根节点下。 -->
+  <view class="modal-mask" id="myFileDetailModal" style="display:none">
+    <view class="modal-sheet myfile-detail-sheet">
+      <text class="title-medium">文件详情</text>
+      <view class="myfile-detail-body" id="myFileDetailBody"></view>
+      <view class="modal-buttons">
+        <button class="btn-secondary modal-half-btn" data-close-myfile-detail type="button">关闭</button>
+      </view>
+    </view>
+  </view>
+
+  <!-- 全屏预览（自绘 overlay；APP 里没有 wx.previewImage）：
+       双指捏合缩放、双击放大/还原、放大后单指拖动、左右滑动翻页、✕ 或点背景关闭。 -->
+  <view class="pfv-mask" id="pfvMask">
+    <view class="pfv-stage" id="pfvStage">
+      <view class="pfv-loading" id="pfvLoading">
+        <view class="pfv-spinner"></view>
+        <text id="pfvLoadingText">正在加载预览图…</text>
+      </view>
+      <img class="pfv-img" id="pfvImg" alt="预览图" />
+    </view>
+    <view class="pfv-bar">
+      <text class="pfv-title" id="pfvTitle">预览</text>
+      <text class="pfv-count" id="pfvCount">1 / 1</text>
+    </view>
+    <view class="pfv-prev" id="pfvPrev">‹</view>
+    <view class="pfv-next" id="pfvNext">›</view>
+    <view class="pfv-close" id="pfvClose">✕</view>
+  </view>
+
 </body>
 </html>

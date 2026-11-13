@@ -56,6 +56,13 @@ const meState = {
   myFilesLoading: false,
   // 2026-11-12：当前展开详情的文件 id（同一时间只展开一个；空串 = 全部收起）
   myFilesDetailId: '',
+  // 2026-11-13：多页预览的翻页状态（file_id → {page, pages, infoPending, infoFailed}）。
+  //   pages = 0 表示页数未知（列表项的 preview_pages 是 0），要问一次 /api/file_preview/<id>/info
+  filePreview: {},
+  // 2026-11-13：订单「文件列表」点开的独立详情弹窗（正在看的文件 / 是否在加载）
+  fileDetailId: '',
+  fileDetailFile: null,
+  fileDetailLoading: false,
   _lastDataLoad: 0,
   _orderPollTimer: null,
   _keyPollTimer: null,
@@ -94,6 +101,7 @@ const meState = {
 function initMePage() {
   setupMeButtons();
   setupMyFiles();
+  setupMyFilePreviewUI();
   refreshMeUI();
   loadOrders();
 }
@@ -365,6 +373,16 @@ function setupMeButtons() {
     // 异常状态文字 → 原因气泡（同样必须挡在折叠之前）
     const reasonTap = e.target.closest('[data-status-reason]');
     if (reasonTap) { e.stopPropagation(); openStatusReasonPop(reasonTap, reasonTap.dataset.statusReason); return; }
+    // 文件列表里的一行 → 该文件的独立详情弹窗（2026-11-13）。同样必须挡在卡片折叠之前，
+    // 否则点文件行会先把整个订单卡收起来。没有 file_id 的老数据点了给一句 toast。
+    const fileTap = e.target.closest('[data-order-file]');
+    if (fileTap) {
+      e.stopPropagation();
+      const fid = fileTap.dataset.orderFile || '';
+      if (fid) openOrderFileDetail(fid);
+      else showToast('该文件已清理');
+      return;
+    }
     const card = e.target.closest('[data-order-id]');
     if (card) toggleOrder(parseInt(card.dataset.orderId, 10));
   });
@@ -1046,8 +1064,11 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
   // 详情区常驻渲染、用 detail-expanded 类切换（对齐小程序：展开/收起均有过渡动画）
   let fileRows = '';
   (o.files || []).forEach(f => {
+    // 2026-11-13：文件行可点 → 打开该文件的独立详情弹窗（字段见 openOrderFileDetail）。
+    // 没有 file_id 的老数据标 data-order-file=""（空串），点了只给 toast「该文件已清理」。
+    const rowFid = f.file_id ? String(f.file_id) : '';
     fileRows += `
-      <view class="detail-file-row">
+      <view class="detail-file-row${rowFid ? ' detail-file-row-tap' : ''}" data-order-file="${esc(rowFid)}">
         <view class="detail-file-info">
           <text class="detail-file-name">${esc(f.original_name || f.file_name || '')}</text>
           <view class="detail-file-tags">
@@ -1062,6 +1083,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
           ${f.simplex_pages ? `<text class="detail-file-range">单面页: ${esc(f.simplex_pages)}</text>` : ''}
           ${Number(f.blank_tail_exclude) === 1 ? `<text class="detail-file-range">已排除末尾空白页</text>` : ''}
           ${(f.status === 'rejected' || f.status === 'failed') && f.reject_reason ? `<text class="file-reject-reason">${esc(f.reject_reason)}</text>` : ''}
+          ${rowFid ? '<text class="detail-file-open-tip">详情 ›</text>' : ''}
         </view>
       </view>`;
   });
@@ -3235,6 +3257,8 @@ function toggleMyFileDetail(fileId) {
       const still = myfileRowEl(fileId);
       const el = still ? still.querySelector('.myfile-detail') : null;
       if (el) el.style.height = 'auto';
+      // 展开动画收尾后再挂预览：点亮已解码的图、拍平翻页状态、按新口径问一次页数
+      syncMyFilePreviews();
     }, 260);
   });
 }
@@ -3247,9 +3271,18 @@ function myFilePreviewError(fileId) {
   if (!f || f.previewFailed) return;
   f.previewFailed = true;
   renderMyFiles();
+  // 订单「文件列表」点开的详情弹窗是第二个挂载点：开着同一个文件时一起退回图标。
+  // （单测的简化 state 里没有 fileDetailFile，这一步会直接跳过。）
+  const modalFile = meState.fileDetailFile;
+  if (modalFile && String(modalFile.file_id) === String(fileId)) {
+    modalFile.previewFailed = true;
+    const body = document.getElementById('myFileDetailBody');
+    if (body) body.innerHTML = renderMyFiles(modalFile);
+  }
 }
 
 function openMyFiles() {
+  setupMyFilePreviewUI();
   // 每次打开都从「全部收起」开始：上次展开的那一行可能已经被删/已换页
   meState.myFilesDetailId = '';
   openModal('myFilesModal');
@@ -3338,7 +3371,77 @@ function loadMoreMyFiles() {
   loadMyFiles(false);
 }
 
-function renderMyFiles() {
+function renderMyFiles(onlyFile) {
+  /* 详情卡的唯一模板（2026-11-13）。「我的文件」的行内展开区与「订单 → 文件列表」点开的
+     详情弹窗共用这一份，所以这里也接受「只给我一个文件、返回它的详情卡 HTML」的调用方式
+     （传了 onlyFile 就完全不碰列表 DOM）。做成重载而不是另开顶层函数，是因为
+     other/tests/verify_myfile_detail.js 会按函数名把本文件的函数逐个抽出来单独执行，
+     多出来的顶层函数会让它的抽取/计数断言误判 —— 共用模板就得留在本函数里。 */
+  const cardOf = (f) => {
+    const fid = String(f.file_id == null ? '' : f.file_id);
+    const st = (meState.filePreview && meState.filePreview[fid]) || null;
+    // 页数：列表给的 preview_pages 先乐观用，0/缺失就按 1 页渲染，随后一律向 /info 核对一次
+    let pages = (st && st.pages) ? Number(st.pages) : (Number(f.preview_pages) || 0);
+    if (!(pages > 0)) pages = 1;
+    if (pages > 12) pages = 12;      // 与 PREVIEW_MAX_PAGES 同值（此处引不到顶层常量，见上）
+    let cur = (st && st.page) ? Number(st.page) : 1;
+    if (!(cur >= 1)) cur = 1;
+    if (cur > pages) cur = pages;
+    let preview;
+    if (!f.previewFailed && f.previewUrl) {
+      const base = String(f.previewUrl);
+      const shotUrl = (p) => base + (base.indexOf('?') >= 0 ? '&' : '?') + 'page=' + p;
+      let slides = '';
+      for (let p = 1; p <= pages; p += 1) {
+        // 只给当前页和左右各一页真 src，其余挂 data-src —— 12 页一次性请求会把 WebView 拖死
+        const near = (p >= cur - 1 && p <= cur + 1);
+        slides += '<view class="myfile-preview-slide' + (p === cur ? ' is-active' : '') +
+            '" data-page="' + p + '">' +
+            '<view class="myfile-preview-skeleton"><view class="myfile-preview-shimmer"></view>' +
+              '<text class="myfile-preview-skeleton-text">正在生成预览图…</text></view>' +
+            '<img class="myfile-preview"' +
+              (near ? ' src="' + escHtml(shotUrl(p)) + '"' : ' data-src="' + escHtml(shotUrl(p)) + '"') +
+              ' data-page="' + p + '" alt=""' +
+              ' onerror="myFilePreviewError(\'' + escHtml(fid) + '\')">' +
+          '</view>';
+      }
+      let dots = '';
+      for (let p = 1; p <= pages; p += 1) {
+        dots += '<view class="myfile-preview-dot' + (p === cur ? ' is-active' : '') +
+          '" data-preview-dot="' + p + '"></view>';
+      }
+      preview = '<view class="myfile-preview-wrap">' +
+        '<view class="myfile-preview-track" style="transform:translate3d(' +
+          (-(cur - 1) * 100) + '%,0,0)">' + slides + '</view>' +
+        (pages > 1
+          ? ('<text class="myfile-preview-counter">' + cur + ' / ' + pages + '</text>' +
+             ((st && Number(st.realPages) > pages)
+               ? '<text class="myfile-preview-cap">共 ' + Math.floor(Number(st.realPages)) + ' 页</text>'
+               : '') +
+             '<view class="myfile-preview-dots">' + dots + '</view>')
+          : '') +
+        '</view>';
+    } else {
+      preview = '<view class="myfile-preview-wrap"><view class="myfile-preview-fallback">' +
+        '<text class="myfile-preview-icon">' + escHtml(f.typeIcon || '📄') + '</text>' +
+        '<text class="myfile-preview-tip">' + escHtml(f.previewTip || '') + '</text></view></view>';
+    }
+    // 「页数」以 /info 预热结果为准（page_count 会少算），只在预热知道得更多时覆盖
+    const pagesText = (st && Number(st.realPages) > (Number(f.page_count) || 0))
+      ? (Math.floor(Number(st.realPages)) + ' 页')
+      : (f.pageCountText || '');
+    // data-preview-host / data-page / data-pages 挂在卡片根上：整卡是可以被原地重建的最小单位
+    return '<view class="myfile-detail-card" data-preview-host data-file-id="' + escHtml(fid) +
+      '" data-page="' + cur + '" data-pages="' + pages + '">' + preview +
+      myfileKv('上传时间', f.createdAtText) +
+      myfileKv('文件大小', f.sizeText) +
+      (pagesText ? myfileKv('页数', pagesText) : '') +
+      myfileKv('所属订单', f.orderText) +
+      myfileKv('保留期', f.expireText) +
+      myfileKv('状态', f.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除') +
+      '</view>';
+  };
+  if (onlyFile) return cardOf(onlyFile);
   const list = document.getElementById('myFilesList');
   const loading = document.getElementById('myFilesLoading');
   const empty = document.getElementById('myFilesEmpty');
@@ -3352,23 +3455,8 @@ function renderMyFiles() {
       ? '<text class="myfile-busy">打印中</text>'
       : '<text class="myfile-del" data-file-id="' + escHtml(f.file_id) + '" data-file-name="' +
         escHtml(f.original_name || '') + '">删除</text>';
-    const preview = (!f.previewFailed && f.previewUrl)
-      ? '<img class="myfile-preview" src="' + escHtml(f.previewUrl) + '" alt=""' +
-        ' onerror="myFilePreviewError(\'' + escHtml(String(f.file_id)) + '\')">'
-      : '<view class="myfile-preview-fallback"><text class="myfile-preview-icon">' +
-        escHtml(f.typeIcon || '📄') + '</text><text class="myfile-preview-tip">' +
-        escHtml(f.previewTip || '') + '</text></view>';
     const detail = open
-      ? ('<view class="myfile-detail">' +
-          '<view class="myfile-detail-card">' +
-          '<view class="myfile-preview-wrap">' + preview + '</view>' +
-          myfileKv('上传时间', f.createdAtText) +
-          myfileKv('文件大小', f.sizeText) +
-          (f.pageCountText ? myfileKv('页数', f.pageCountText) : '') +
-          myfileKv('所属订单', f.orderText) +
-          myfileKv('保留期', f.expireText) +
-          myfileKv('状态', f.in_active_order ? '打印中/排队中，订单结束前不能删除' : '可删除') +
-         '</view></view>')
+      ? ('<view class="myfile-detail">' + cardOf(f) + '</view>')
       : '';
     return '<view class="myfile-row' + (open ? ' myfile-row-open' : '') + '"' +
         ' data-file-id="' + escHtml(f.file_id) + '">' +
@@ -3403,6 +3491,576 @@ function deleteMyFile(fileId, name) {
       }
     }).catch(() => showToast('网络异常，请重试'));
   });
+}
+
+/* ================= 多页预览 / 全屏查看 / 文件详情弹窗（2026-11-13） =================
+   后端契约（已上线，前后端对齐）：
+     GET /api/file_preview/<id>?token=<token>&page=N  → JPEG（page 从 1 开始）
+     GET /api/file_preview/<id>/info                 → {success, pages, rendered}（首次要预热 1~2 秒）
+     GET /api/file_detail/<id>（Bearer，走 api()）    → {success, file:{…}}，字段与 /api/my_files 列表项相同
+   三处共用同一份渲染：①「我的文件」行内展开区（renderMyFiles 里的 cardOf）
+   ②订单「文件列表」点开的详情弹窗（#myFileDetailBody）③全屏查看层（#pfvMask，自绘；APP 没有 wx.previewImage）。
+   页数口径（2026-11-13 定）：列表项的 preview_pages 只当乐观初值，files.page_count 会少算
+   （Office 转 PDF 后页数可能变多），所以每次展开都按对象缓存向 /info 核对一次，同一文件本页只问一次。
+   --------------------------------------------------------------------------------- */
+
+const PREVIEW_MAX_PAGES = 12;   // 一次最多渲染 12 页；再多只提示总页数（12 张图同时解码会吃爆 WebView）
+let pfvWired = false;           // setupMyFilePreviewUI 只装一遍监听
+let pfvHostTouch = null;        // 缩略图上的手势识别（左右滑翻页 vs 点开全屏）
+let pfvSwipeAt = 0;             // 刚滑完的时间戳：压掉紧随其后的合成 click
+let myFileDetailSeq = 0;        // 详情弹窗请求序号：连点不同文件时只认最后一次响应
+
+/* 某文件的预览翻页状态（page / pages / realPages / infoAsked 都挂在同一个对象上，列表与弹窗共享） */
+function previewStateOf(fileId) {
+  const id = String(fileId == null ? '' : fileId);
+  if (!meState.filePreview) meState.filePreview = {};
+  if (!meState.filePreview[id]) {
+    meState.filePreview[id] = { page: 1, pages: 0, realPages: 0, infoAsked: false, infoFailed: false };
+  }
+  return meState.filePreview[id];
+}
+
+/* 第 n 页预览图 URL：复用 decorateMyFile 拼好的 previewUrl（已带 token），只补 page=N */
+function previewShotUrl(f, page) {
+  const base = String((f && f.previewUrl) || '');
+  if (!base) return '';
+  const n = Number(page) > 0 ? Math.floor(Number(page)) : 1;
+  return base + (base.indexOf('?') >= 0 ? '&' : '?') + 'page=' + n;
+}
+
+/* 文件对象：先找「我的文件」列表里那份（已修饰），再找订单文件详情弹窗里的 */
+function previewFileOf(fileId) {
+  const id = String(fileId == null ? '' : fileId);
+  if (!id) return null;
+  const hit = (meState.myFiles || []).find(x => String(x.file_id) === id);
+  if (hit) return hit;
+  const d = meState.fileDetailFile;
+  if (d && String(d.file_id) === id) return d;
+  return null;
+}
+
+/* 该文件当前已挂载的预览宿主：行内展开区 + 订单详情弹窗，可能同时存在两处 */
+function previewHostsOf(fileId) {
+  const id = String(fileId == null ? '' : fileId);
+  const out = [];
+  const all = document.querySelectorAll('[data-preview-host]');
+  for (let i = 0; i < all.length; i += 1) {
+    if (String(all[i].dataset.fileId) === id) out.push(all[i]);
+  }
+  return out;
+}
+
+/* 页数：/info 核对过的优先，否则列表 preview_pages 的乐观值，兜底 1 页，上限 12 页 */
+function previewPagesOf(f, st) {
+  let pages = (st && Number(st.pages) > 0) ? Number(st.pages) : (Number(f && f.preview_pages) || 0);
+  if (!(pages > 0)) pages = 1;
+  if (pages > PREVIEW_MAX_PAGES) pages = PREVIEW_MAX_PAGES;
+  return Math.floor(pages);
+}
+
+/* 把某个宿主的翻页状态拍到位：位移、页码、当前页±1 的 src（懒加载的关键） */
+function applyPreviewHost(host, pages, page) {
+  if (!host) return;
+  const cur = Math.min(Math.max(1, Math.floor(Number(page) || 1)), pages);
+  host.dataset.page = String(cur);
+  host.dataset.pages = String(pages);
+  const track = host.querySelector('.myfile-preview-track');
+  if (track) track.style.transform = 'translate3d(' + (-(cur - 1) * 100) + '%,0,0)';
+  const counter = host.querySelector('.myfile-preview-counter');
+  if (counter) counter.textContent = cur + ' / ' + pages;
+  const slides = host.querySelectorAll('.myfile-preview-slide');
+  for (let i = 0; i < slides.length; i += 1) {
+    const slide = slides[i];
+    const p = Number(slide.dataset.page) || (i + 1);
+    const near = (p >= cur - 1 && p <= cur + 1);
+    const img = slide.querySelector('img.myfile-preview');
+    if (img) {
+      // 只有当前页与左右各一页才真的设 src：12 页一次全请求，手机上要等半天还占内存
+      if (near && !img.getAttribute('src')) {
+        const lazy = img.getAttribute('data-src') || '';
+        if (lazy) img.setAttribute('src', lazy);
+      }
+      // 缓存命中的图不会再触发 load 事件，这里补一次点亮
+      if (img.complete && img.naturalWidth > 0) slide.classList.add('is-loaded');
+    }
+    if (p === cur) slide.classList.add('is-active'); else slide.classList.remove('is-active');
+  }
+  const dots = host.querySelectorAll('[data-preview-dot]');
+  for (let i = 0; i < dots.length; i += 1) {
+    const on = String(Math.floor(Number(dots[i].dataset.previewDot))) === String(cur);
+    if (on) dots[i].classList.add('is-active'); else dots[i].classList.remove('is-active');
+  }
+}
+
+/* 重刷该文件所有宿主：页数变了（或强制）就用同一张卡模板原地重建，否则只拍状态 */
+function refreshPreviewHosts(fileId, force) {
+  const f = previewFileOf(fileId);
+  if (!f) return;
+  const st = previewStateOf(fileId);
+  const pages = previewPagesOf(f, st);
+  const hosts = previewHostsOf(fileId);
+  for (let i = 0; i < hosts.length; i += 1) {
+    if (force || String(hosts[i].dataset.pages || '') !== String(pages)) {
+      // 弹窗里挂的是 /api/file_detail 那份对象，列表里挂的是 /api/my_files 那份，
+      // 重建时必须各自用自己那份（否则弹窗会被列表项覆盖，页数等字段对不上）
+      const inModal = !!(hosts[i].closest && hosts[i].closest('#myFileDetailBody'));
+      hosts[i].outerHTML = renderMyFiles(inModal && meState.fileDetailFile ? meState.fileDetailFile : f);
+    }
+  }
+  const after = previewHostsOf(fileId);
+  for (let i = 0; i < after.length; i += 1) applyPreviewHost(after[i], pages, st.page || 1);
+}
+
+/* 渲染/翻页后的统一收尾：已有宿主全部拍平，还没问过页数的问一次 */
+function syncMyFilePreviews() {
+  const hosts = document.querySelectorAll('[data-preview-host]');
+  const ids = [];
+  for (let i = 0; i < hosts.length; i += 1) {
+    const id = String(hosts[i].dataset.fileId || '');
+    if (id && ids.indexOf(id) < 0) ids.push(id);
+  }
+  for (let i = 0; i < ids.length; i += 1) {
+    refreshPreviewHosts(ids[i], false);
+    ensurePreviewPages(ids[i]);
+  }
+}
+
+/* 页数核对（lead 2026-11-13 口径）：不看 preview_pages 给了多少，展开就无条件问一次 /info。
+   同一文件本页生命周期只问一次；失败 / 415 保持乐观渲染，不弹错（预览图是锦上添花）。 */
+function ensurePreviewPages(fileId) {
+  const f = previewFileOf(fileId);
+  if (!f || !f.previewUrl) return;
+  const st = previewStateOf(fileId);
+  if (st.infoAsked) return;
+  st.infoAsked = true;
+  api('/api/file_preview/' + encodeURIComponent(String(fileId)) + '/info').then((r) => {
+    const d = (r && r.data) || {};
+    if (!(r && r.status === 200) || !d.success) { st.infoFailed = true; return; }
+    const real = Math.floor(Number(d.pages) || 0);
+    if (!(real > 0)) { st.infoFailed = true; return; }
+    const f2 = previewFileOf(fileId);
+    const prevReal = Number(st.realPages) || 0;
+    st.realPages = real;
+    const pages = Math.min(real, PREVIEW_MAX_PAGES);
+    const pagesChanged = (Number(st.pages) || 0) !== pages;
+    // 「页数」文案由 cardOf 读 st.realPages 现算（page_count 会少算）；值变了才重绘
+    const textChanged = prevReal !== real && !!f2 && real > (Number(f2.page_count) || 0);
+    st.pages = pages;
+    if ((Number(st.page) || 1) > pages) st.page = pages;
+    if (pagesChanged || textChanged) refreshPreviewHosts(fileId, true);
+  }).catch(() => { st.infoFailed = true; });
+}
+
+/* 翻页（缩略图上左右滑、点圆点、全屏里滑都会走到这里）：两个挂载点一起翻 */
+function setPreviewPage(fileId, page) {
+  const f = previewFileOf(fileId);
+  if (!f) return;
+  const st = previewStateOf(fileId);
+  const pages = previewPagesOf(f, st);
+  const next = Math.min(Math.max(1, Math.floor(Number(page) || 1)), pages);
+  if (next === (Math.floor(Number(st.page) || 1))) return;
+  st.page = next;
+  refreshPreviewHosts(fileId, false);
+}
+
+/* ---------------- 订单「文件列表」→ 文件详情弹窗 ---------------- */
+
+/* 打开某个文件的详情弹窗：#myFileDetailBody 装的就是「我的文件」那张详情卡（同一模板） */
+function openOrderFileDetail(fileId) {
+  const id = String(fileId == null ? '' : fileId);
+  if (!id) { showToast('该文件已清理'); return; }
+  meState.fileDetailId = id;
+  meState.fileDetailFile = null;
+  meState.fileDetailLoading = true;
+  const seq = (myFileDetailSeq += 1);
+  const body = document.getElementById('myFileDetailBody');
+  if (body) body.innerHTML = '<text class="myfile-detail-tip">正在读取文件信息…</text>';
+  openModal('myFileDetailModal');
+  api('/api/file_detail/' + encodeURIComponent(id)).then((r) => {
+    if (seq !== myFileDetailSeq) return;          // 连点两个文件时只认最后一次
+    const d = (r && r.data) || {};
+    meState.fileDetailLoading = false;
+    const got = (d.success && d.file) ? decorateMyFile(d.file) : null;
+    if (!(r && r.status === 200) || !got) {
+      meState.fileDetailFile = null;
+      const b = document.getElementById('myFileDetailBody');
+      if (b) {
+        b.innerHTML = '<text class="myfile-detail-tip">' +
+          escHtml((d && (d.message || d.error)) || '文件已清理或不存在') + '</text>';
+      }
+      return;
+    }
+    if (got.file_id == null) got.file_id = id;
+    meState.fileDetailFile = got;
+    const b2 = document.getElementById('myFileDetailBody');
+    if (b2) b2.innerHTML = renderMyFiles(got);
+    const hosts = previewHostsOf(got.file_id);
+    const pages = previewPagesOf(got, previewStateOf(got.file_id));
+    for (let i = 0; i < hosts.length; i += 1) applyPreviewHost(hosts[i], pages, 1);
+    ensurePreviewPages(got.file_id);
+  }).catch(() => {
+    if (seq !== myFileDetailSeq) return;
+    meState.fileDetailLoading = false;
+    const b3 = document.getElementById('myFileDetailBody');
+    if (b3) b3.innerHTML = '<text class="myfile-detail-tip">网络异常，请稍后重试</text>';
+    showToast('网络异常，请重试');
+  });
+}
+
+function closeOrderFileDetail() {
+  meState.fileDetailId = '';
+  meState.fileDetailFile = null;
+  meState.fileDetailLoading = false;
+  closeModal('myFileDetailModal');
+}
+
+/* ---------------- 全屏查看层：捏合缩放 / 双击缩放 / 单指拖动 / 左右翻页 ---------------- */
+
+const pfvState = { open: false, fileId: '', page: 1, pages: 1, scale: 1, x: 0, y: 0 };
+const pfvTouch = { mode: '', startDist: 0, startScale: 1, originX: 0, originY: 0,
+  lastX: 0, lastY: 0, lastTapAt: 0, lastTapX: 0, lastTapY: 0, moved: false };
+
+function pfvDistance(a, b) {
+  const dx = a.clientX - b.clientX;
+  const dy = a.clientY - b.clientY;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+/* 把 scale / x / y 写到图上（单点写盘：别处只改 pfvState，再调这个） */
+function pfvApplyTransform() {
+  const img = document.getElementById('pfvImg');
+  if (!img) return;
+  img.style.transform = 'translate3d(' + pfvState.x + 'px,' + pfvState.y + 'px,0) scale(' + pfvState.scale + ')';
+  const mask = document.getElementById('pfvMask');
+  if (mask) {
+    if (pfvState.scale > 1.02) mask.classList.add('pfv-zoomed');
+    else mask.classList.remove('pfv-zoomed');
+  }
+}
+
+/* 放大后拖动不许把图拖出屏幕：按「图片实际显示尺寸 × 缩放」和舞台尺寸算可拖范围 */
+function pfvClampPan() {
+  const img = document.getElementById('pfvImg');
+  const stage = document.getElementById('pfvStage');
+  if (!img || !stage) return;
+  const sr = stage.getBoundingClientRect();
+  const boxW = img.clientWidth || sr.width;
+  const boxH = img.clientHeight || sr.height;
+  const nw = img.naturalWidth || boxW;
+  const nh = img.naturalHeight || boxH;
+  const fit = Math.min(boxW / nw, boxH / nh) || 1;
+  const maxX = Math.max(0, (nw * fit * pfvState.scale - sr.width) / 2);
+  const maxY = Math.max(0, (nh * fit * pfvState.scale - sr.height) / 2);
+  if (pfvState.x > maxX) pfvState.x = maxX;
+  if (pfvState.x < -maxX) pfvState.x = -maxX;
+  if (pfvState.y > maxY) pfvState.y = maxY;
+  if (pfvState.y < -maxY) pfvState.y = -maxY;
+}
+
+/* 以屏幕点 (cx,cy) 为锚点缩放到 nextScale：锚点下那一点图像保持不动（1~5 倍） */
+function pfvZoomAt(nextScale, cx, cy) {
+  const stage = document.getElementById('pfvStage');
+  if (!stage) return;
+  const sr = stage.getBoundingClientRect();
+  let scale = Number(nextScale);
+  if (!(scale > 0)) scale = 1;
+  scale = Math.min(Math.max(scale, 1), 5);
+  const ax = (cx == null ? sr.width / 2 : cx - sr.left) - sr.width / 2;
+  const ay = (cy == null ? sr.height / 2 : cy - sr.top) - sr.height / 2;
+  const factor = scale / (pfvState.scale || 1);
+  pfvState.x = ax - (ax - pfvState.x) * factor;
+  pfvState.y = ay - (ay - pfvState.y) * factor;
+  pfvState.scale = scale;
+  if (scale <= 1.001) { pfvState.x = 0; pfvState.y = 0; }
+  pfvClampPan();
+  pfvApplyTransform();
+}
+
+/* 顶栏页码/标题，以及翻页按钮的显隐 */
+function pfvUpdateBar() {
+  const f = previewFileOf(pfvState.fileId);
+  const pages = previewPagesOf(f, previewStateOf(pfvState.fileId));
+  pfvState.pages = pages;
+  if (pfvState.page > pages) pfvState.page = pages;
+  const count = document.getElementById('pfvCount');
+  if (count) count.textContent = pfvState.page + ' / ' + pages;
+  const title = document.getElementById('pfvTitle');
+  if (title) title.textContent = (f && f.original_name) ? f.original_name : '预览';
+  const prev = document.getElementById('pfvPrev');
+  if (prev) prev.style.display = (pages > 1 && pfvState.page > 1) ? '' : 'none';
+  const next = document.getElementById('pfvNext');
+  if (next) next.style.display = (pages > 1 && pfvState.page < pages) ? '' : 'none';
+}
+
+/* 全屏层换页：重置缩放/位移，重新拉这一页（底下的缩略图跟着翻到同一页） */
+function pfvShowPage(page) {
+  const f = previewFileOf(pfvState.fileId);
+  if (!f) return;
+  const pages = previewPagesOf(f, previewStateOf(pfvState.fileId));
+  const next = Math.min(Math.max(1, Math.floor(Number(page) || 1)), pages);
+  pfvState.page = next;
+  pfvState.pages = pages;
+  pfvState.scale = 1;
+  pfvState.x = 0;
+  pfvState.y = 0;
+  const mask = document.getElementById('pfvMask');
+  if (mask) mask.classList.remove('pfv-loaded');
+  const img = document.getElementById('pfvImg');
+  if (img) {
+    img.style.visibility = 'hidden';
+    img.setAttribute('src', previewShotUrl(f, next));
+  }
+  pfvApplyTransform();
+  pfvUpdateBar();
+  const st = previewStateOf(pfvState.fileId);
+  if ((Number(st.page) || 1) !== next) {
+    st.page = next;
+    refreshPreviewHosts(pfvState.fileId, false);
+  }
+}
+
+function openPreviewViewer(fileId, page) {
+  const f = previewFileOf(fileId);
+  if (!f || !f.previewUrl) return;
+  const st = previewStateOf(fileId);
+  const pages = previewPagesOf(f, st);
+  pfvState.open = true;
+  pfvState.fileId = String(fileId);
+  pfvState.pages = pages;
+  pfvState.page = Math.min(Math.max(1, Math.floor(Number(page) || Number(st.page) || 1)), pages);
+  pfvState.scale = 1;
+  pfvState.x = 0;
+  pfvState.y = 0;
+  pfvTouch.mode = '';
+  pfvTouch.moved = false;
+  const mask = document.getElementById('pfvMask');
+  if (mask) {
+    mask.classList.remove('pfv-loaded');
+    mask.classList.add('pfv-open');
+    mask.style.display = 'flex';
+  }
+  const img = document.getElementById('pfvImg');
+  if (img) {
+    img.style.visibility = 'hidden';
+    img.setAttribute('src', previewShotUrl(f, pfvState.page));
+  }
+  pfvApplyTransform();
+  pfvUpdateBar();
+  ensurePreviewPages(fileId);            // 全屏里也顺手核对一次（同一文件只问一次）
+}
+
+function closePreviewViewer() {
+  pfvState.open = false;
+  pfvState.scale = 1;
+  pfvState.x = 0;
+  pfvState.y = 0;
+  const mask = document.getElementById('pfvMask');
+  if (mask) {
+    mask.classList.remove('pfv-open');
+    mask.classList.remove('pfv-loaded');
+    mask.style.display = 'none';
+  }
+  const img = document.getElementById('pfvImg');
+  if (img) {
+    img.style.visibility = 'hidden';
+    img.removeAttribute('src');          // 释放这一张大图的解码内存
+  }
+}
+
+function pfvTouchStart(e) {
+  if (!pfvState.open) return;
+  const ts = e.touches || [];
+  pfvTouch.moved = false;
+  const m0 = document.getElementById('pfvMask');
+  if (m0) m0.classList.remove('pfv-dragging');
+  if (ts.length >= 2) {
+    pfvTouch.mode = 'pinch';
+    pfvTouch.startDist = pfvDistance(ts[0], ts[1]) || 1;
+    pfvTouch.startScale = pfvState.scale || 1;
+    pfvTouch.originX = (ts[0].clientX + ts[1].clientX) / 2;
+    pfvTouch.originY = (ts[0].clientY + ts[1].clientY) / 2;
+  } else if (ts.length === 1) {
+    pfvTouch.mode = 'pan';
+    pfvTouch.originX = ts[0].clientX;
+    pfvTouch.originY = ts[0].clientY;
+    pfvTouch.lastX = ts[0].clientX;
+    pfvTouch.lastY = ts[0].clientY;
+  }
+}
+
+function pfvTouchMove(e) {
+  if (!pfvState.open) return;
+  const ts = e.touches || [];
+  if (pfvTouch.mode === 'pinch' && ts.length >= 2) {
+    if (e.preventDefault) e.preventDefault();   // 捏合时整页不许跟着缩放/滚动（touchmove 已 passive:false）
+    const mp = document.getElementById('pfvMask');
+    if (mp) mp.classList.add('pfv-dragging');   // 手指按着时关掉 transform 过渡，缩放才跟手
+    pfvTouch.moved = true;
+    const dist = pfvDistance(ts[0], ts[1]) || 1;
+    const midX = (ts[0].clientX + ts[1].clientX) / 2;
+    const midY = (ts[0].clientY + ts[1].clientY) / 2;
+    pfvZoomAt(pfvTouch.startScale * (dist / pfvTouch.startDist), midX, midY);
+    return;
+  }
+  if (ts.length === 1) {
+    const dx = ts[0].clientX - pfvTouch.lastX;
+    const dy = ts[0].clientY - pfvTouch.lastY;
+    if (Math.abs(dx) + Math.abs(dy) > 6) pfvTouch.moved = true;
+    if (pfvState.scale > 1.02) {          // 放大后才允许单指拖动（1:1 时留给翻页手势）
+      if (e.preventDefault) e.preventDefault();
+      const md = document.getElementById('pfvMask');
+      if (md) md.classList.add('pfv-dragging');
+      pfvState.x += dx;
+      pfvState.y += dy;
+      pfvTouch.lastX = ts[0].clientX;
+      pfvTouch.lastY = ts[0].clientY;
+      pfvClampPan();
+      pfvApplyTransform();
+    }
+  }
+}
+
+function pfvTouchEnd(e) {
+  if (!pfvState.open) return;
+  const ts = e.touches || [];
+  const ct = (e.changedTouches && e.changedTouches[0]) || null;
+  const mode = pfvTouch.mode;
+  if (ts.length > 0) return;              // 还有手指按着（捏合松了一根）
+  const me2 = document.getElementById('pfvMask');
+  if (me2) me2.classList.remove('pfv-dragging');
+  pfvTouch.mode = '';
+  if (!ct) return;
+  if (mode === 'pinch') { if (pfvState.scale <= 1.02) pfvZoomAt(1, ct.clientX, ct.clientY); return; }
+  if (!pfvTouch.moved) {
+    // 单击/双击：双击放大到 2.5 倍，再双击还原
+    const now = Date.now();
+    const isDouble = (now - pfvTouch.lastTapAt < 320) &&
+      Math.abs(ct.clientX - pfvTouch.lastTapX) < 30 &&
+      Math.abs(ct.clientY - pfvTouch.lastTapY) < 30;
+    if (isDouble) {
+      pfvTouch.lastTapAt = 0;
+      pfvZoomAt(pfvState.scale > 1.02 ? 1 : 2.5, ct.clientX, ct.clientY);
+      return;
+    }
+    pfvTouch.lastTapAt = now;
+    pfvTouch.lastTapX = ct.clientX;
+    pfvTouch.lastTapY = ct.clientY;
+    return;
+  }
+  // 没放大时的左右滑 → 翻页（和缩略图上的滑动手势同一套判据）
+  if (pfvState.scale <= 1.02) {
+    const dx = ct.clientX - pfvTouch.originX;
+    const dy = ct.clientY - pfvTouch.originY;
+    if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+      pfvSwipeAt = Date.now();
+      pfvShowPage(pfvState.page + (dx < 0 ? 1 : -1));
+    }
+  }
+}
+
+function pfvTouchCancel() {
+  pfvTouch.mode = '';
+  pfvTouch.moved = false;
+}
+
+/* ---------------- 统一的委托监听 ---------------- */
+
+/* 缩略图上的手势：左右滑翻页（点开全屏交给 click；滑动后压掉合成 click 以免顺手弹出） */
+function previewHostTouchStart(e) {
+  if (pfvState.open) return;
+  const t = e.target;
+  const host = (t && t.closest) ? t.closest('[data-preview-host]') : null;
+  const tt = (e.touches && e.touches[0]) || null;
+  if (!host || !tt) { pfvHostTouch = null; return; }
+  pfvHostTouch = { id: String(host.dataset.fileId || ''), x: tt.clientX, y: tt.clientY };
+}
+
+function previewHostTouchEnd(e) {
+  const st = pfvHostTouch;
+  pfvHostTouch = null;
+  if (!st || !st.id || pfvState.open) return;
+  const tt = (e.changedTouches && e.changedTouches[0]) || null;
+  if (!tt) return;
+  const dx = tt.clientX - st.x;
+  const dy = tt.clientY - st.y;
+  if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+    const cur = Math.floor(Number(previewStateOf(st.id).page) || 1);
+    pfvSwipeAt = Date.now();
+    setPreviewPage(st.id, cur + (dx < 0 ? 1 : -1));
+  }
+}
+
+function previewUIClick(e) {
+  const t = e.target;
+  if (!t || !t.closest) return;
+  // 刚滑完的合成 click 要压掉，但只压「点空白关闭」和「点缩略图开全屏」这两类：
+  // ✕ / 上下页 / 弹窗关闭按钮是用户主动点的，不能被 400ms 的滑动保护期吞掉。
+  const justSwiped = (Date.now() - pfvSwipeAt) < 400;
+  if (t.closest('#pfvClose')) { closePreviewViewer(); return; }
+  if (t.closest('#pfvPrev')) { pfvShowPage(pfvState.page - 1); return; }
+  if (t.closest('#pfvNext')) { pfvShowPage(pfvState.page + 1); return; }
+  if (pfvState.open && (t.id === 'pfvMask' || t.id === 'pfvStage')) {
+    if (!justSwiped) closePreviewViewer();
+    return;
+  }
+  if (t.closest('[data-close-myfile-detail]')) { closeOrderFileDetail(); return; }
+  const dot = t.closest('[data-preview-dot]');
+  if (dot) {
+    const host = dot.closest('[data-preview-host]');
+    if (host) setPreviewPage(String(host.dataset.fileId || ''), Number(dot.dataset.previewDot) || 1);
+    return;
+  }
+  if (justSwiped) return;
+  const host = t.closest('[data-preview-host]');
+  if (host && t.closest('.myfile-preview-slide')) {
+    const id = String(host.dataset.fileId || '');
+    openPreviewViewer(id, Math.floor(Number(previewStateOf(id).page) || 1));
+  }
+}
+
+/* 监听只装一遍：initMePage（每次进「我」页）和 openMyFiles（每次开弹窗）都会调，带哨兵 */
+function setupMyFilePreviewUI() {
+  if (pfvWired) return;
+  pfvWired = true;
+  document.addEventListener('click', previewUIClick);
+  document.addEventListener('touchstart', previewHostTouchStart, { passive: true });
+  document.addEventListener('touchend', previewHostTouchEnd, { passive: true });
+  // 图片解码完成 → 淡入盖住骨架（load 不冒泡，用捕获阶段；懒加载后设 src 的也走这里）
+  document.addEventListener('load', (e) => {
+    const img = e.target;
+    if (!img || !img.classList || !img.classList.contains('myfile-preview')) return;
+    const slide = img.closest ? img.closest('.myfile-preview-slide') : null;
+    if (slide) slide.classList.add('is-loaded');
+  }, true);
+  const mask = document.getElementById('pfvMask');
+  if (mask) {
+    mask.addEventListener('touchstart', pfvTouchStart, { passive: true });
+    mask.addEventListener('touchmove', pfvTouchMove, { passive: false });
+    mask.addEventListener('touchend', pfvTouchEnd, { passive: true });
+    mask.addEventListener('touchcancel', pfvTouchCancel, { passive: true });
+    const img = document.getElementById('pfvImg');
+    if (img) {
+      img.addEventListener('load', () => {
+        img.style.visibility = 'visible';
+        mask.classList.add('pfv-loaded');
+        const tip = document.getElementById('pfvLoadingText');
+        if (tip) tip.textContent = '正在加载预览图…';
+      });
+      img.addEventListener('error', () => {
+        img.style.visibility = 'hidden';
+        mask.classList.remove('pfv-loaded');
+        const tip = document.getElementById('pfvLoadingText');
+        if (tip) tip.textContent = '预览图加载失败，点空白处退出';
+      });
+    }
+  }
+  // 返回键：全屏层是自绘 fixed 层（不是 .modal-mask），要抢在 app.js 的默认处理之前收掉
+  const prevBack = window.hnHandleBack;
+  window.hnHandleBack = function () {
+    if (pfvState.open) { closePreviewViewer(); return true; }
+    if (typeof prevBack === 'function') return prevBack();
+    return false;
+  };
 }
 
 /* ================= 启动 ================= */

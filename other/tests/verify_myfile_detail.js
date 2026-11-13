@@ -93,6 +93,17 @@ console.log('\n--- 1) 小程序 me.wxml：行内展开 ---');
 const listStart = MP_WXML.indexOf('class="myfiles-list"');
 const listEnd = MP_WXML.indexOf('</scroll-view>', listStart);
 const rowBlock = (listStart >= 0 && listEnd > listStart) ? MP_WXML.slice(listStart, listEnd) : '';
+/* 2026-11-13：详情卡抽成了 <template name="myfileDetailCard">（行内展开与订单文件详情弹窗
+   共用一份，用户要求 4「复用代码逻辑」），所以详情字段/预览结构的断言要连同模板一起看。 */
+const tplStart = MP_WXML.indexOf('<template name="myfileDetailCard">');
+const tplEnd = tplStart >= 0 ? MP_WXML.indexOf('</template>', tplStart) : -1;
+const tplBlock = (tplStart >= 0 && tplEnd > tplStart)
+  ? MP_WXML.slice(tplStart, tplEnd + '</template>'.length) : '';
+const detailBlock = rowBlock + '\n' + tplBlock;
+check('详情卡抽成模板 myfileDetailCard（行内与弹窗共用）', !!tplBlock,
+  tplBlock ? tplBlock.length + ' 字符' : '**没找到模板**');
+check('模板被行内详情 + 订单文件弹窗两处引用',
+  (MP_WXML.match(/<template is="myfileDetailCard"/g) || []).length === 2);
 
 check('找到「我的文件」列表块', !!rowBlock && rowBlock.length > 200,
   rowBlock ? rowBlock.length + ' 字符' : '**没找到 .myfiles-list / scroll-view**');
@@ -110,21 +121,22 @@ check('详情区自身 catchtap="noop"（点详情内部不收起）',
   /class="myfile-detail"\s+catchtap="noop"/.test(rowBlock));
 check('详情紧跟在 .myfile-row 内部（不是另开一张卡）',
   /<view class="myfile-head">[\s\S]*<\/view>\s*<view wx:if="\{\{myFilesDetailId === item\.file_id\}\}"\s+class="myfile-detail"/.test(rowBlock));
-check('<image> 用 previewUrl + aspectFit + binderror 静默降级',
-  /<image[^>]*class="myfile-preview"[^>]*src="\{\{item\.previewUrl\}\}"/.test(rowBlock) &&
-  /<image[^>]*mode="aspectFit"/.test(rowBlock) &&
-  /binderror="onMyFilePreviewError"/.test(rowBlock) &&
-  /data-id="\{\{item\.file_id\}\}"/.test(rowBlock));
+check('<image> 用 shot.url + aspectFit + bindload/binderror + data-page',
+  /<image[^>]*class="myfile-preview[^"]*"[^>]*src="\{\{shot\.url\}\}"/.test(tplBlock) &&
+  /<image[^>]*mode="aspectFit"/.test(tplBlock) &&
+  /bindload="onMyFilePreviewLoad"/.test(tplBlock) &&
+  /binderror="onMyFilePreviewError"/.test(tplBlock) &&
+  /data-page="\{\{shot\.page\}\}"/.test(tplBlock));
 check('无预览能力时走 fallback 图标块（不是空框）',
-  /class="myfile-preview-fallback"/.test(rowBlock) &&
-  /item\.previewFailed/.test(rowBlock));
+  /class="myfile-preview-fallback"/.test(tplBlock) &&
+  /f\.previewFailed/.test(tplBlock));
 
 const detailKvs = ['上传时间', '文件大小', '所属订单', '保留期', '状态'];
 for (const k of detailKvs) {
-  check('详情含「' + k + '」字段', new RegExp('<text class="myfile-k">' + k + '</text>').test(rowBlock));
+  check('详情含「' + k + '」字段', new RegExp('<text class="myfile-k">' + k + '</text>').test(detailBlock));
 }
 check('页数按需显示（pageCountText 不存在就不占一行）',
-  /wx:if="\{\{item\.pageCountText\}\}"/.test(rowBlock));
+  /wx:if="\{\{f\.pageCountText\}\}"/.test(detailBlock));
 /* 2026-11-13：箭头固定 ▾ + CSS 旋转（class 里多了展开态），不再是 ▴/▾ 换字形 */
 check('有展开箭头（▾，展开时 .myfile-caret-open 转 180°）',
   /class="myfile-caret[ "{]/.test(rowBlock) && /▾/.test(rowBlock) &&
@@ -140,6 +152,11 @@ const mpFnNames = [
   '_myFileDetailStyle', '_clearMyFileDetailTimer', '_nextFrame',
   '_measureMyFileDetailCard', '_openMyFileDetail', '_closeMyFileDetail',
   'onToggleMyFileDetail', 'onMyFilePreviewError',
+  // 2026-11-13 新增（多页 / 骨架 / 全屏 / 订单文件详情弹窗）
+  '_myFilePreviewUrl', '_myFilePreviewShot', '_myFilePreviewShots',
+  '_patchMyFile', '_patchFileDetail', '_prepareMyFilePreview',
+  'onMyFilePreviewLoad', 'onMyFilePreviewChange', 'onOpenMyFilePreview',
+  'onOpenOrderFileDetail', 'onCloseFileDetail',
 ];
 const mpBody = mpFnNames.map((n) => extractFn(MP_JS, n)).filter(Boolean).join('\n\n');
 
@@ -148,10 +165,18 @@ check('抠到 ' + mpFnNames.length + ' 个函数（装饰 + 展开/收起动画�
   (mpBody.split('function ').length - 1) + '/' + mpFnNames.length + ' 个');
 
 const MP_TOKEN = 'tok+9/1';
-const wxStub = { getStorageSync: (k) => (k === 'token' ? MP_TOKEN : '') };
+const previewCalls = [];
+const wxStub = {
+  getStorageSync: (k) => (k === 'token' ? MP_TOKEN : ''),
+  // 全屏预览：小程序原生 wx.previewImage（自带双指缩放 + 左右翻页）
+  previewImage: (opt) => previewCalls.push(opt),
+};
 const CONFIG_STUB = { BASE_URL: 'https://api.test' };
-const mpApi = new Function('wx', 'CONFIG',
-  mpBody + '\nreturn { ' + mpFnNames.map((n) => n + ': ' + n).join(', ') + ' };')(wxStub, CONFIG_STUB);
+const reqCalls = [];
+const requestStub = (opt) => { reqCalls.push(opt); if (requestStub.handler) requestStub.handler(opt); };
+const mpApi = new Function('wx', 'CONFIG', 'PREVIEW_MAX_PAGES', 'request',
+  mpBody + '\nreturn { ' + mpFnNames.map((n) => n + ': ' + n).join(', ') + ' };')(
+  wxStub, CONFIG_STUB, 12, requestStub);
 
 /* Page 实例：_decorateMyFile 里用 this._fmtFileSize / this._myFileTypeIcon，
    所以这两个必须先挂上去（真实页面里它们是同一个 Page 对象上的方法） */
@@ -162,12 +187,20 @@ const mpCtx = {
   // 展开/收起在测试里等价于瞬时状态切换（动画本身另有源码断言钉住）。
   _fmtFileSize: mpApi._fmtFileSize,
   _myFileTypeIcon: mpApi._myFileTypeIcon,
+  // 订单文件详情弹窗里也用 _decorateMyFile 修饰（同一套字段）
+  _decorateMyFile: mpApi._decorateMyFile,
   _myFileDetailStyle: mpApi._myFileDetailStyle,
   _clearMyFileDetailTimer: mpApi._clearMyFileDetailTimer,
   _nextFrame: mpApi._nextFrame,
   _measureMyFileDetailCard: mpApi._measureMyFileDetailCard,
   _openMyFileDetail: mpApi._openMyFileDetail,
   _closeMyFileDetail: mpApi._closeMyFileDetail,
+  _myFilePreviewUrl: mpApi._myFilePreviewUrl,
+  _myFilePreviewShot: mpApi._myFilePreviewShot,
+  _myFilePreviewShots: mpApi._myFilePreviewShots,
+  _patchMyFile: mpApi._patchMyFile,
+  _patchFileDetail: mpApi._patchFileDetail,
+  _prepareMyFilePreview: mpApi._prepareMyFilePreview,
 };
 
 const pdfFile = mpApi._decorateMyFile.call(mpCtx, {
@@ -237,10 +270,134 @@ check('预览失败 ⇒ 该行 previewFailed=true（退回图标，不弹错误�
 check('预览失败不影响别的行', mpCtx.data.myFiles[1].previewFailed === false);
 check('预览失败不收起详情', mpCtx.data.myFilesDetailId === '7');
 
+/* ==================== 2.5) 多页预览 / 加载骨架 / 全屏 / 订单文件详情弹窗 ==================== */
+console.log('\n--- 2.5) 多页预览 + 加载骨架 + 全屏 + 订单文件详情弹窗 ---');
+
+check('预览区用 swiper（一页一个 swiper-item）+ 页码角标',
+  /<swiper[^>]*class="myfile-preview-swiper"/.test(tplBlock) &&
+  /<swiper-item wx:for="\{\{f\.previewShots\}\}"/.test(tplBlock) &&
+  /myfile-preview-pager/.test(tplBlock));
+check('点预览图触发全屏（bindtap=onOpenMyFilePreview + data-scope 区分宿主）',
+  /bindtap="onOpenMyFilePreview"/.test(tplBlock) && /data-scope="\{\{scope\}\}"/.test(tplBlock));
+check('加载中显示骨架（previewLoading + shimmer 条 + 「正在生成预览图」）',
+  /f\.previewLoading/.test(tplBlock) && /myfile-preview-skeleton/.test(tplBlock) &&
+  /myfile-skeleton-bar/.test(tplBlock) && /正在生成预览图/.test(tplBlock));
+check('WXSS：骨架横扫动画 + 真图淡入 + 多页 420rpx 高度',
+  /@keyframes myfileShimmer/.test(MP_WXSS) &&
+  /background-size:\s*400%/.test(MP_WXSS) &&
+  /\.myfile-preview-loaded\s*\{[^}]*opacity:\s*1/.test(MP_WXSS) &&
+  /\.myfile-preview-swiper\s*\{[^}]*height:\s*420rpx/.test(MP_WXSS));
+check('订单卡「文件列表」行可点开详情（bindtap + data-id=f.file_id）',
+  /class="detail-file-row"\s+bindtap="onOpenOrderFileDetail" data-id="\{\{f\.file_id\}\}"/.test(MP_WXML));
+check('文件详情弹窗独立存在（filedetail-sheet + /api/file_detail/）',
+  /class="modal-sheet filedetail-sheet"/.test(MP_WXML) && /\/api\/file_detail\//.test(MP_JS));
+check('弹窗关闭走 200ms 动画后再卸载（fileDetailClosing）',
+  /fileDetailClosing: false/.test(MP_JS) && /onCloseFileDetail\(\)/.test(MP_JS));
+
+const multi = mpApi._decorateMyFile.call(mpCtx, {
+  file_id: '21', original_name: 'big.pdf', size: 1000, page_count: 9,
+  has_preview: true, preview_url: '/api/file_preview/21', preview_pages: 9,
+});
+check('修饰时先只放第 1 页（URL 带 &page=1）',
+  multi.previewShots.length === 1 && multi.previewShots[0].url.indexOf('&page=1') > 0,
+  JSON.stringify(multi.previewShots));
+check('has_preview 时 previewLoading 初始为 true（骨架先出）', multi.previewLoading === true);
+
+mpCtx.data.myFiles = [multi];
+const applied = [];
+mpApi._prepareMyFilePreview.call(mpCtx, multi, (p) => applied.push(p));
+const shotPatch = applied.length ? applied[applied.length - 1] : null;
+const shots = shotPatch ? shotPatch.previewShots : [];
+check('展开时按 preview_pages 切片，只有前 2 页 ready（不一次拉 9 张）',
+  shots.length === 9 && shots[0].ready === true && shots[1].ready === true &&
+  shots[2].ready === false, shots.map((s) => (s.ready ? 'R' : '-')).join(''));
+check('切片上限 12 页（与后端 PREVIEW_MAX_PAGES 对齐）',
+  mpApi._myFilePreviewShots.call(mpCtx, '21', 99, 0, []).length === 12);
+
+const unknown = mpApi._decorateMyFile.call(mpCtx, {
+  file_id: '22', original_name: 'x.docx', size: 1000, page_count: 0,
+  has_preview: true, preview_url: '/api/file_preview/22',
+});
+check('页数未知 ⇒ preview_pages=0（展开时再问 /info）', unknown.previewPages === 0);
+reqCalls.length = 0;
+let patched = null;
+mpApi._prepareMyFilePreview.call(mpCtx, unknown, (p) => { patched = p; });
+check('页数未知 ⇒ 调 /api/file_preview/<id>/info?token=',
+  reqCalls.length === 1 && reqCalls[0].url.indexOf('/api/file_preview/22/info?token=') > 0,
+  reqCalls.length ? reqCalls[0].url : '**没发请求**');
+reqCalls[0].success({ statusCode: 200, data: { success: true, pages: 4 } });
+check('/info 返回 4 页 ⇒ 切片补到 4 页', !!patched && patched.previewShots.length === 4,
+  patched ? String(patched.previewShots.length) : '**没有回调**');
+
+// 页数核对：files.page_count 会少算（Office 转 PDF 后页数可能变多，线上 2 页的 docx 实际 3 页），
+// 所以展开时**一律**向 /info 核对一次，但同一个文件只问一次。
+reqCalls.length = 0;
+mpApi._prepareMyFilePreview.call(mpCtx, unknown, () => {});
+check('已核对过的文件不再重复问 /info（说了就记住）', reqCalls.length === 0, reqCalls.length);
+check('源码：页数核对走 _previewInfoCache（每文件一次）',
+  /this\._previewInfoCache\s*=\s*this\._previewInfoCache\s*\|\|\s*\{\}/.test(MP_JS) &&
+  /this\._previewInfoCache\[fileId\]\s*=\s*n\s*\|\|\s*1/.test(MP_JS));
+
+mpCtx.data.myFiles = [multi];
+mpApi._prepareMyFilePreview.call(mpCtx, mpCtx.data.myFiles[0], (p) => {
+  mpCtx.data.myFiles = mpCtx.data.myFiles.map((f) => Object.assign({}, f, p));
+});
+mpApi.onMyFilePreviewLoad.call(mpCtx, { currentTarget: { dataset: { id: '21', page: '1', scope: 'list' } } });
+check('图片加载完 ⇒ previewLoading=false + 该页 loaded=true',
+  mpCtx.data.myFiles[0].previewLoading === false && mpCtx.data.myFiles[0].previewShots[0].loaded === true);
+mpApi.onMyFilePreviewChange.call(mpCtx, { currentTarget: { dataset: { id: '21', scope: 'list' } }, detail: { current: 5 } });
+check('翻到第 6 页 ⇒ previewIndex=5 且相邻页 ready（预取）',
+  mpCtx.data.myFiles[0].previewIndex === 5 &&
+  mpCtx.data.myFiles[0].previewShots[4].ready && mpCtx.data.myFiles[0].previewShots[5].ready &&
+  mpCtx.data.myFiles[0].previewShots[6].ready);
+previewCalls.length = 0;
+mpApi.onOpenMyFilePreview.call(mpCtx, { currentTarget: { dataset: { id: '21', scope: 'list', index: '5' } } });
+check('点图 ⇒ wx.previewImage（urls 全 9 页、current 第 6 页）',
+  previewCalls.length === 1 && previewCalls[0].urls.length === 9 &&
+  previewCalls[0].current === previewCalls[0].urls[5],
+  previewCalls.length ? 'urls=' + previewCalls[0].urls.length : '**没调 previewImage**');
+
+mpCtx.data.myFiles = [multi];
+mpCtx.data.myFiles = mpCtx.data.myFiles.map((f) => Object.assign({}, f, {
+  previewShots: mpApi._myFilePreviewShots.call(mpCtx, '21', 9, 0, f.previewShots),
+}));
+mpApi.onMyFilePreviewError.call(mpCtx, { currentTarget: { dataset: { id: '21', page: '1', scope: 'list' } } });
+check('多页时单页失败 ⇒ 仍留着预览块（previewFailed 保持 false）',
+  mpCtx.data.myFiles[0].previewFailed === false &&
+  mpCtx.data.myFiles[0].previewShots[0].failed === true);
+
+reqCalls.length = 0;
+mpCtx.data.fileDetail = null;
+mpApi.onOpenOrderFileDetail.call(mpCtx, { currentTarget: { dataset: { id: '7' } } });
+check('点订单文件行 ⇒ 打开弹窗并拉 /api/file_detail/7',
+  mpCtx.data.fileDetailVisible === true && mpCtx.data.fileDetailLoading === true &&
+  reqCalls.length === 1 && reqCalls[0].url === 'https://api.test/api/file_detail/7',
+  reqCalls.length ? reqCalls[0].url : '**没发请求**');
+reqCalls[0].success({
+  statusCode: 200,
+  data: {
+    success: true,
+    file: {
+      file_id: '7', original_name: '作业.pdf', size: 2048, page_count: 3,
+      created_at: '2026-11-12 20:01:00', has_preview: true,
+      preview_url: '/api/file_preview/7', preview_pages: 3, order_number: 'HN20261112-0001',
+    },
+  },
+});
+check('弹窗拿到数据 ⇒ 与列表同款修饰（sizeText/orderText/previewShots）',
+  mpCtx.data.fileDetailLoading === false && !!mpCtx.data.fileDetail &&
+  mpCtx.data.fileDetail.sizeText === '2.0 KB' &&
+  mpCtx.data.fileDetail.previewShots.length === 3 &&
+  mpCtx.data.fileDetail.orderText === 'HN20261112-0001');
+mpApi.onCloseFileDetail.call(mpCtx, {});
+check('关闭弹窗 ⇒ 先播 200ms 收起动画（fileDetailClosing）',
+  mpCtx.data.fileDetailClosing === true);
+
 check('删除成功的分支里会把已删文件的展开态清掉',
   /myFilesDetailId: this\.data\.myFilesDetailId === fileId \? '' : this\.data\.myFilesDetailId/.test(MP_JS));
 check('每次打开「我的文件」都从全部收起开始',
-  /showMyFiles: true, myFilesClosing: false, myFilesDetailId: ''/.test(MP_JS));
+  // 2026-11-13 晚：多了 myFilesDetailStyle（展开动画的行内高度），断言按字段集合而不是整串
+  /showMyFiles: true, myFilesClosing: false, myFilesDetailId: '', myFilesDetailStyle: ''/.test(MP_JS));
 
 /* ==================== 3) APP：装饰 / 渲染 / 点击 ==================== */
 console.log('\n--- 3) APP www/me.js：decorate / render / click ---');
@@ -367,7 +524,8 @@ check('点「删除」⇒ 只走删除，不改展开态',
 check('删除成功的分支会清掉该文件的展开态',
   /if \(meState\.myFilesDetailId === fileId\) meState\.myFilesDetailId = ''/.test(APP_ME_JS));
 check('每次打开「我的文件」都从全部收起开始',
-  /function openMyFiles\(\) \{\n\s*\/\/[^\n]*\n\s*meState\.myFilesDetailId = '';/.test(APP_ME_JS));
+  // 2026-11-13 晚：openMyFiles 开头多了 setupMyFilePreviewUI()，先断言「重置在开头 200 字符内且早于 openModal」
+  /function openMyFiles\(\) \{[\s\S]{0,200}?meState\.myFilesDetailId = '';[\s\S]{0,120}?openModal\('myFilesModal'\)/.test(APP_ME_JS));
 
 /* ==================== 4) 样式：两端都要「行读得下详情」 ==================== */
 console.log('\n--- 4) 样式（小程序 wxss / APP css）---');
@@ -427,8 +585,12 @@ check('后端有 GET /api/file_preview/<file_id>',
   /@app\.route\("\/api\/file_preview\/<file_id>"/.test(APP_PY));
 check('预览端点接受 ?token=（<image>/<img> 带不了请求头）',
   /request\.args\.get\("token"\)/.test(APP_PY) && /def _openid_for_media/.test(APP_PY));
-check('/api/my_files 每项回 has_preview + preview_url',
-  /"has_preview": _has_preview_for/.test(APP_PY) && /"preview_url":/.test(APP_PY));
+check('/api/my_files 每项回 has_preview + preview_pages + preview_url',
+  /def _my_file_item\(/.test(APP_PY) &&
+  /"has_preview": has_preview/.test(APP_PY) &&
+  /has_preview = _has_preview_for\(/.test(APP_PY) &&
+  /"preview_pages":/.test(APP_PY) &&
+  /"preview_url":/.test(APP_PY));
 check('/api/my_files 每项回 order_number（详情里的「所属订单」）',
   /"order_number":/.test(APP_PY));
 check('没有预览能力时后端回 415（前端据此静默退回图标）',

@@ -161,7 +161,8 @@ for (const f of wxmlFiles) {
     inventory.push(rel + ':' + blk.startLine + '  ' + (verdicts.join('；') || '仅直接子按钮（.btn-primary 自带 width:100%）'));
   }
 }
-check('扫到全部 modal-sheet 弹层（index 11 + me 4 = 15 个）', scanned === 15, '实际 ' + scanned + ' 个');
+// 2026-11-13：me 页新增「订单文件详情」弹窗（.filedetail-sheet）⇒ me 5 个，合计 16
+check('扫到全部 modal-sheet 弹层（index 11 + me 5 = 16 个）', scanned === 16, '实际 ' + scanned + ' 个');
 for (const line of inventory) console.log('  ' + line);
 
 /* ---------- 6) 变异自证：把修复摘掉，静态断言必须转红 ---------- */

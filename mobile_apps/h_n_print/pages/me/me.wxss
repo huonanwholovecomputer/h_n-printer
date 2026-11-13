@@ -2300,17 +2300,84 @@
   background: rgba(120, 120, 128, 0.08);
 }
 .myfile-preview-wrap {
+  position: relative;
   width: 100%;
   box-sizing: border-box;
+  border-radius: 12rpx;
+  overflow: hidden;
 }
-/* 1024×1024 的 JPEG 原图按 aspectFit 缩进卡片：固定高度 + 灰底，避免纵横比不同的
-   PDF 页/照片把卡片撑高到看不见下面的字段 */
+/* 2026-11-13 用户要求 3「支持多页面」：原来是单张 <image>，现在一页一个 swiper-item；
+   高度固定 420rpx，纵横比不同的 PDF 页/照片不会把卡片撑高到看不见下面的字段。 */
+.myfile-preview-swiper {
+  width: 100%;
+  height: 420rpx;
+  border-radius: 12rpx;
+  background: rgba(120, 120, 128, 0.10);
+}
 .myfile-preview {
   display: block;
   width: 100%;
-  height: 300rpx;
+  height: 420rpx;
   border-radius: 12rpx;
   background: rgba(120, 120, 128, 0.10);
+  /* 用户要求 1：真图加载完 220ms 淡入，把下面的骨架自然盖掉（零 JS 状态机） */
+  opacity: 0;
+  transition: opacity 220ms ease;
+}
+.myfile-preview-loaded {
+  opacity: 1;
+}
+/* 加载骨架：三条横扫的渐变条 + 一行小字。灰度跟着主题变量走，深色下不刺眼。 */
+.myfile-preview-skeleton {
+  position: absolute;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12rpx;
+  background: rgba(120, 120, 128, 0.10);
+}
+.myfile-preview-skeleton.page {
+  position: static;
+  width: 100%;
+  height: 420rpx;
+}
+.myfile-skeleton-bar {
+  width: 52%;
+  height: 16rpx;
+  margin-top: 18rpx;
+  border-radius: 8rpx;
+  background: linear-gradient(90deg, rgba(120, 120, 128, 0.14) 25%, rgba(120, 120, 128, 0.32) 37%, rgba(120, 120, 128, 0.14) 63%);
+  background-size: 400% 100%;
+  animation: myfileShimmer 1.25s ease-in-out infinite;
+}
+.myfile-skeleton-bar.short {
+  width: 32%;
+}
+.myfile-skeleton-tip {
+  margin-top: 22rpx;
+  font-size: 20rpx;
+  color: var(--text-tertiary);
+}
+@keyframes myfileShimmer {
+  0% { background-position: 100% 0; }
+  100% { background-position: 0 0; }
+}
+/* 页码角标：多页时才显示（点图可全屏，双指缩放） */
+.myfile-preview-pager {
+  position: absolute;
+  right: 12rpx;
+  bottom: 12rpx;
+  padding: 4rpx 14rpx;
+  border-radius: 999rpx;
+  font-size: 19rpx;
+  line-height: 1.6;
+  color: #FFFFFF;
+  background: rgba(0, 0, 0, 0.45);
 }
 .myfile-preview-fallback {
   display: flex;
@@ -2436,4 +2503,25 @@
   top: -9999px;
   width: 512px;
   height: 512px;
+}
+
+
+/* ==================== 订单卡片里的文件详情弹窗（2026-11-13） ==================== */
+.filedetail-sheet {
+  width: 660rpx;
+  max-width: calc(100vw - 48rpx);
+  box-sizing: border-box;
+  max-height: 80vh;
+}
+.filedetail-body {
+  width: 100%;
+  box-sizing: border-box;
+}
+.filedetail-name {
+  display: block;
+  margin: 8rpx 0 12rpx;
+  font-size: 26rpx;
+  font-weight: 600;
+  color: var(--text-primary);
+  word-break: break-all;
 }

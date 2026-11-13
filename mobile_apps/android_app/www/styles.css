@@ -7449,3 +7449,365 @@ body.theme-dark .crop-panel,
 .theme-dark .status-pop { background: #2a2a2e; }
 .theme-dark .status-pop:not(.status-pop-below) .status-pop-caret { border-top-color: #2a2a2e; }
 .theme-dark .status-pop.status-pop-below .status-pop-caret { border-bottom-color: #2a2a2e; }
+
+/* ================= 多页预览 / 全屏查看 / 文件详情弹窗（2026-11-13 手写追加） =================
+   这一段是 APP 端独有（小程序侧在 me.wxss 里各自实现），手写在生成文件末尾维护。
+   注意 1：不要在这里重新定义 `.myfile-preview {…}` / `.myfile-detail {…}` / `.myfile-row {…}`
+   这类被 other/tests/verify_myfile_detail.js 逐条断言过的裸选择器，只在复合选择器里覆盖。
+   注意 2：`.pfv-*` / `.myfile-detail-sheet` 是放在 .app-frame 之外的 fixed 层（订单卡
+   overflow:hidden + max-height 会把它裁掉，价格气泡 / 头像裁剪层都栽过这个坑），
+   框外没有容器查询上下文 ⇒ 这一段的尺寸一律用 px / %，不用 cqw。 */
+
+/* ---------- 缩略图：多页轨道 + 骨架屏 + 淡入 ---------- */
+.myfile-preview-wrap {
+  position: relative;
+  overflow: hidden;
+  touch-action: pan-y;          /* 横向滑动归自己（翻页），纵向留给页面滚动 */
+  border-radius: 1.44cqw;
+  background: rgba(120, 120, 128, 0.10);
+}
+
+.myfile-preview-track {
+  display: flex;
+  width: 100%;
+  will-change: transform;
+  transition: transform 260ms cubic-bezier(0.22, 0.61, 0.36, 1);
+}
+
+.myfile-preview-slide {
+  position: relative;
+  flex: 0 0 100%;
+  width: 100%;
+  height: 36cqw;
+  overflow: hidden;
+}
+
+.myfile-preview-slide > img {
+  position: relative;
+  background-color: transparent;   /* 底色交给 .myfile-preview-wrap，深色主题下不会露白边 */
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity 240ms ease;
+  -webkit-user-drag: none;
+}
+
+.myfile-preview-slide.is-loaded > img { opacity: 1; }
+
+/* 骨架屏：灰色渐变横扫 + 一行小字，图片解码完成（.is-loaded）后整块淡出 */
+.myfile-preview-skeleton {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: 1.44cqw;
+  background: rgba(120, 120, 128, 0.10);
+  opacity: 1;
+  transition: opacity 240ms ease;
+  pointer-events: none;
+}
+
+.myfile-preview-slide.is-loaded .myfile-preview-skeleton { opacity: 0; }
+
+.myfile-preview-shimmer {
+  position: absolute;
+  inset: 0;
+  /* 一道横向亮带扫过去（带宽比视口宽，任何一帧都看得见，不会出现"整片死灰"） */
+  background-image: linear-gradient(
+    100deg,
+    rgba(120, 120, 128, 0) 0%,
+    rgba(120, 120, 128, 0) 34%,
+    rgba(120, 120, 128, 0.20) 50%,
+    rgba(120, 120, 128, 0) 66%,
+    rgba(120, 120, 128, 0) 100%
+  );
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: myfileShimmer 1.4s ease-in-out infinite;
+}
+
+.myfile-preview-skeleton-text {
+  position: relative;
+  z-index: 1;
+  font-size: 2.4cqw;
+  color: var(--text-tertiary);
+}
+
+@keyframes myfileShimmer {
+  0% { background-position: 150% 0; }
+  100% { background-position: -50% 0; }
+}
+
+/* 页码「2 / 5」+ 总页数提示 + 圆点 */
+.myfile-preview-counter {
+  position: absolute;
+  right: 1.44cqw;
+  bottom: 1.44cqw;
+  z-index: 2;
+  padding: 0.24cqw 1.2cqw;
+  border-radius: 1.2cqw;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 2.24cqw;
+  line-height: 1.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.myfile-preview-cap {
+  position: absolute;
+  left: 1.44cqw;
+  bottom: 1.44cqw;
+  z-index: 2;
+  padding: 0.24cqw 1.2cqw;
+  border-radius: 1.2cqw;
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  font-size: 2.08cqw;
+  line-height: 1.6;
+}
+
+.myfile-preview-dots {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0.48cqw;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1.2cqw;
+  height: 2.4cqw;
+}
+
+.myfile-preview-dot {
+  width: 1.44cqw;
+  height: 1.44cqw;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 0 0.12cqw rgba(0, 0, 0, 0.22);
+  transition: transform 160ms ease, background-color 160ms ease;
+}
+
+.myfile-preview-dot.is-active {
+  background: #fff;
+  transform: scale(1.3);
+}
+
+/* 无障碍/性能：系统开了「减弱动态效果」就把横扫停掉，只留灰色底 */
+@media (prefers-reduced-motion: reduce) {
+  .myfile-preview-shimmer { animation: none; }
+  .myfile-preview-track { transition: none; }
+}
+
+/* ---------- 订单「文件列表」行：可点开详情 ---------- */
+.detail-file-row-tap { cursor: pointer; }
+.detail-file-row-tap:active { opacity: 0.86; }
+
+.detail-file-open-tip {
+  display: block;
+  font-size: 2.4cqw;
+  color: var(--blue);
+  opacity: 0.9;
+}
+
+/* ---------- 文件详情弹窗（订单「文件列表」点开；固定在页面根节点之外） ---------- */
+.myfile-detail-sheet {
+  width: 86%;
+  max-width: 380px;
+  padding: 20px 16px 14px;
+  border-radius: 18px;
+}
+
+.myfile-detail-body {
+  width: 100%;
+  max-height: 62vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 10px 0 4px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.myfile-detail-sheet .myfile-detail-card {
+  margin-top: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.myfile-detail-sheet .myfile-preview-slide { height: 46vw; max-height: 260px; }
+
+.myfile-detail-sheet .myfile-kv { margin-top: 6px; }
+.myfile-detail-sheet .myfile-k,
+.myfile-detail-sheet .myfile-v { font-size: 12px; line-height: 1.5; }
+
+.myfile-detail-tip {
+  display: block;
+  padding: 18px 0;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+/* ---------- 全屏查看层（自绘 overlay：捏合缩放 / 双击缩放 / 单指拖动 / 左右翻页） ---------- */
+.pfv-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 10020;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.94);
+  touch-action: none;            /* 缩放/拖动全归自己，整页不许跟着缩放滚动 */
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.pfv-mask.pfv-open { display: flex; opacity: 1; }
+
+.pfv-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.pfv-stage img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  transform-origin: 50% 50%;
+  transition: transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1);
+  will-change: transform;
+  visibility: hidden;
+  -webkit-user-drag: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 手指按着的时候关掉过渡，缩放/拖动才跟手 */
+.pfv-mask.pfv-dragging .pfv-stage img { transition: none; }
+
+.pfv-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: calc(14px + env(safe-area-inset-top, 0px)) 56px 18px 16px;
+  pointer-events: none;
+  color: #fff;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0));
+}
+
+.pfv-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.pfv-count {
+  flex: 0 0 auto;
+  font-size: 13px;
+  opacity: 0.86;
+  font-variant-numeric: tabular-nums;
+}
+
+.pfv-close {
+  position: absolute;
+  top: calc(10px + env(safe-area-inset-top, 0px));
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 19px;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.pfv-close:active { background: rgba(255, 255, 255, 0.30); }
+
+.pfv-prev,
+.pfv-next {
+  position: absolute;
+  top: 50%;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 58px;
+  margin-top: -29px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.pfv-prev { left: 6px; }
+.pfv-next { right: 6px; }
+.pfv-prev:active,
+.pfv-next:active { background: rgba(255, 255, 255, 0.26); }
+
+.pfv-loading {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  color: rgba(255, 255, 255, 0.86);
+  font-size: 13px;
+}
+
+.pfv-mask.pfv-loaded .pfv-loading { display: none; }
+
+.pfv-spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #fff;
+  animation: pfvSpin 0.8s linear infinite;
+}
+
+@keyframes pfvSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+/* 深色主题：卡片底色跟着走（白底 rgba 在深色下会发灰） */
+.theme-dark .myfile-detail-sheet .myfile-detail-card { background: rgba(255, 255, 255, 0.08); }
+.theme-dark .myfile-preview-wrap { background: rgba(255, 255, 255, 0.10); }
+.theme-dark .myfile-preview-skeleton { background: rgba(255, 255, 255, 0.06); }
+.theme-dark .myfile-preview-shimmer {
+  background-image: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0) 34%,
+    rgba(255, 255, 255, 0.16) 50%,
+    rgba(255, 255, 255, 0) 66%,
+    rgba(255, 255, 255, 0) 100%
+  );
+}

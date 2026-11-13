@@ -112,6 +112,8 @@ const FILES = [
     auto_delete_at: '2026-11-13 20:01:00', in_active_order: true,
     order_id: 88, order_number: 'HN20261112-0001',
     has_preview: true, preview_url: '/api/file_preview/7',
+    /* 故意少报：真实页数由 /info 纠偏（Office 转 PDF 后页数会变多，线上真实踩过） */
+    preview_pages: 1,
   },
   {
     file_id: '8', original_name: '大物A（2）第三次作业(2).docx', size: 51200,
@@ -142,6 +144,11 @@ function apiFor(rawUrl, method) {
     files = files.filter((f) => f.file_id !== id);
     return { success: true };
   }
+  if (u.startsWith('/api/file_detail/')) {
+    const id = decodeURIComponent(u.slice('/api/file_detail/'.length));
+    const f = files.find((x) => x.file_id === id);
+    return f ? { success: true, file: f } : { success: false, message: '文件不存在或已清理' };
+  }
   if (u === '/api/me') return { success: true, role: 'user', openid: 'dev_test', nickname: '验收' };
   return { success: true };
 }
@@ -150,6 +157,13 @@ function apiFor(rawUrl, method) {
 const server = http.createServer(async (req, res) => {
   const raw = req.url;
   const url = raw.split('?')[0];
+  /* /api/file_preview/<id>/info 一定要排在图片分支前面：它是 JSON，不是 JPEG */
+  if (/^\/api\/file_preview\/[^/]+\/info$/.test(url)) {
+    const id = url.split('/')[3];
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ success: true, pages: id === '7' ? 3 : 1, rendered: id === '7' ? 3 : 1 }));
+    return;
+  }
   if (url.startsWith('/api/file_preview/')) {
     res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
     res.end(PREVIEW_PNG);
@@ -357,6 +371,95 @@ await page.screenshot({ path: `${SHOTS}/03_docx无预览.png` });
 check('⑥ 无预览能力的类型（.txt）：走 fallback 图标块 + 一句原因，DOM 里根本没有 <img>（不会发 415 请求）',
   docx.fallback && docx.imgs === 0 && docx.text.indexOf('Word / Excel / PPT') >= 0,
   `fallback=${docx.fallback} imgs=${docx.imgs} text=${docx.text.slice(0, 80)}`);
+
+/* ⑨ 多页（2026-11-13 用户要求 3）：列表只给 1 页，/info 说 3 页 ⇒ 纠偏后出现翻页条 */
+await page.click('#myFilesList .myfile-row[data-file-id="7"] .myfile-head');
+await page.waitForFunction(() => document.querySelectorAll(
+  '#myFilesList .myfile-row[data-file-id="7"] .myfile-preview-slide').length === 3,
+null, { timeout: 6000 }).catch(() => {});
+await page.waitForTimeout(250);
+const multi = await page.evaluate(() => {
+  const row = document.querySelector('#myFilesList .myfile-row[data-file-id="7"]');
+  return {
+    slides: row.querySelectorAll('.myfile-preview-slide').length,
+    dots: row.querySelectorAll('[data-preview-dot]').length,
+    counter: (row.querySelector('.myfile-preview-counter') || {}).textContent || '',
+    srcs: [...row.querySelectorAll('img.myfile-preview')].map((i) => i.getAttribute('src')).filter(Boolean),
+  };
+});
+await page.screenshot({ path: `${SHOTS}/04_多页预览.png` });
+check('⑨ 页数按 /info 纠偏：1 页 → 3 页，出现 3 个 slide / 3 个圆点 / 页码「1 / 3」',
+  multi.slides === 3 && multi.dots === 3 && multi.counter.trim() === '1 / 3',
+  `slides=${multi.slides} dots=${multi.dots} counter=${JSON.stringify(multi.counter)}`);
+check('⑨ 只给相邻页真 src（多页不会一次把 12 张图全拉下来）',
+  multi.srcs.length >= 1 && multi.srcs.length <= 3 && multi.srcs.every((u) => /[?&]page=\d+/.test(u)),
+  `srcs=${multi.srcs.length}`);
+
+/* ⑩ 点图全屏（用户要求 2）：全屏层出现、页码跟当前页、✕ 关掉后回到缩略图 */
+await page.click('#myFilesList .myfile-row[data-file-id="7"] img.myfile-preview');
+await page.waitForFunction(() => {
+  const m = document.getElementById('pfvMask');
+  return m && getComputedStyle(m).display !== 'none';
+}, null, { timeout: 5000 });
+await page.waitForTimeout(200);
+const full1 = await page.evaluate(() => ({
+  shown: getComputedStyle(document.getElementById('pfvMask')).display !== 'none',
+  count: (document.getElementById('pfvCount') || {}).textContent || '',
+  imgSrc: document.getElementById('pfvImg').getAttribute('src') || '',
+}));
+await page.screenshot({ path: `${SHOTS}/05_全屏预览.png` });
+check('⑩ 点缩略图打开全屏层，页码与当前页一致、图片就是那一页',
+  full1.shown && full1.count.trim() === '1 / 3' && /[?&]page=1/.test(full1.imgSrc),
+  `shown=${full1.shown} count=${JSON.stringify(full1.count)} src=${full1.imgSrc}`);
+
+await page.click('#pfvNext');
+await page.waitForTimeout(220);
+const full2 = await page.evaluate(() => (document.getElementById('pfvCount') || {}).textContent || '');
+await page.click('#pfvClose');
+await page.waitForTimeout(280);
+const full3 = await page.evaluate(() => ({
+  shown: getComputedStyle(document.getElementById('pfvMask')).display !== 'none',
+  counter: (document.querySelector('#myFilesList .myfile-row[data-file-id="7"] .myfile-preview-counter') || {})
+    .textContent || '',
+}));
+check('⑩ 全屏里能翻页（‹ › 或滑动）且关掉后缩略图停在那一页',
+  full2.trim() === '2 / 3' && !full3.shown && full3.counter.trim() === '2 / 3',
+  `afterNext=${JSON.stringify(full2)} closed=${!full3.shown} thumb=${JSON.stringify(full3.counter)}`);
+
+/* ⑪ 订单卡片文件行 → 独立详情弹窗（用户要求 4）：挂在 body 下、内容与「我的文件」同源 */
+await page.evaluate(() => openOrderFileDetail('7'));
+await page.waitForFunction(() => {
+  const m = document.getElementById('myFileDetailModal');
+  const b = document.getElementById('myFileDetailBody');
+  return m && getComputedStyle(m).display !== 'none' && b && /上传时间/.test(b.textContent || '');
+}, null, { timeout: 6000 });
+await page.waitForTimeout(300);
+const sheet = await page.evaluate(() => {
+  const m = document.getElementById('myFileDetailModal');
+  const body = document.getElementById('myFileDetailBody');
+  return {
+    shown: getComputedStyle(m).display !== 'none',
+    onBody: m.parentElement === document.body,
+    inFrame: !!m.closest('.app-frame'),
+    text: body ? body.textContent.replace(/\s+/g, ' ') : '',
+    counter: (document.querySelector('#myFileDetailBody .myfile-preview-counter') || {}).textContent || '',
+  };
+});
+await page.screenshot({ path: `${SHOTS}/06_订单文件详情弹窗.png` });
+check('⑪ 订单文件行打开独立弹窗：挂在 body 下（不被订单卡 overflow 裁）、字段与「我的文件」同源',
+  sheet.shown && sheet.onBody && !sheet.inFrame &&
+    ['上传时间', '文件大小', '页数', '所属订单'].every((k) => sheet.text.indexOf(k) >= 0),
+  `shown=${sheet.shown} onBody=${sheet.onBody} inFrame=${sheet.inFrame} text=${sheet.text.slice(0, 90)}`);
+check('⑪ 弹窗里同一份详情卡也是多页（复用，不是另写一份）',
+  sheet.counter.trim() === '1 / 3', JSON.stringify(sheet.counter));
+await page.evaluate(() => closeOrderFileDetail());
+await page.waitForTimeout(250);
+/* 收尾把这行也收起来，否则下面的删除断言会看到「详情还在」（它属于 7，不属于被删的 8） */
+await page.click('#myFilesList .myfile-row[data-file-id="7"] .myfile-head');
+await page.waitForFunction(
+  () => document.querySelectorAll('#myFilesList .myfile-detail').length === 0,
+  null, { timeout: 3000 }).catch(() => {});
+await page.waitForTimeout(200);
 
 /* ⑦ 删除：走确认框 → 该行消失、详情不残留 */
 await page.click('#myFilesList .myfile-row[data-file-id="8"] .myfile-del');
