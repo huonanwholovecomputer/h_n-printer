@@ -467,6 +467,11 @@ try {
                      amount: afterFix.amounts[extRowAfter] }));
 
   /* 截图（带时间戳，存 截图展示/外部监视订单明细/） */
+  /* 解锁态单独留一张：外部单「用户 / 类型」两列都带 ▾ 的证据（v7.20） */
+  const shotUnlocked = path.join(OUT_DIR, '外部监视订单明细-解锁态-' + STAMP + '.png');
+  await page.locator('#cloud-orders').screenshot({ path: shotUnlocked });
+  chk('截图已生成（解锁态：外部单的用户/类型两列都带订正箭头）',
+    fs.existsSync(shotUnlocked) && fs.statSync(shotUnlocked).size > 5000, shotUnlocked);
   const shot = path.join(OUT_DIR, '外部监视订单明细-' + STAMP + '.png');
   await page.evaluate(() => { window.unlocked.orderstatus = false; window._rerenderOrdersOnly(); });
   await page.waitForTimeout(200);
