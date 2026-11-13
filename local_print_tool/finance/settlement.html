@@ -4566,7 +4566,9 @@ function _orderColWidths(used) {
 /* 单槽标签：key → HTML（空串 = 该订单未使用此服务，留空槽占位以保证跨订单对齐） */
 function _typeSlotTag(key, o, money) {
   if (key === 'mode') {
-    var oidT = safeId(o.order_id);
+    /* v7.20：判据与行内联事件都用**同一个**行 key —— 外部单的 order_id 是 `ext:8:2026-…`，
+       safeId() 会因冒号/空格判成非法并返回空串，导致类型列永远只读（用户报的就是这个）。 */
+    var oidT = _isExternalOrder(o.order_id) ? _externalRowKey(o.order_id) : safeId(o.order_id);
     var mtag = o.is_admin_print
       ? '<span class="tag b" title="管理员自行打印的订单（不计入收益）">👤自打</span>'
       : '<span class="tag g" title="顾客下单，接单打印（计入收益）">🤝接单</span>';
@@ -4771,12 +4773,12 @@ function toggleOrderStatusLock() {
    误改就是账目错，所以它也要锁在同一把锁里。 */
 var ORDER_FIXABLE_TYPES = ['receive', 'self'];
 function _orderTypeLabel(t) { return t === 'self' ? '👤自打' : '🤝接单'; }
-/* 可编辑判据与状态**同源**（云端 + 已解锁 + 非外部监视订单）：
-   一把锁管两列，判据也只该有一份 —— 但外部监视单**没有**「订单类型」这个概念
-   （云端 /api/admin/order_type 里没有这单，本地账本也不存类型），
-   所以类型列对外部单保持只读，其余与状态列同源。 */
+/* 可编辑判据与状态**同源**（云端 + 已解锁）：一把锁管两列，判据也只该有一份。
+   v7.20（2026-11-13 用户要求「本地监视的任务也要能调类型」）：外部监视单也有
+   「接单 / 自打」这个结算归类 —— 写在本地账本的 manual_type 里（self = 自打，
+   不计入收益），不再是整列只读。 */
 function _orderTypeEditable(oidS) {
-  return _isExternalOrder(oidS) ? false : _orderStatusEditable(oidS);
+  return _orderStatusEditable(oidS);
 }
 function _orderTypeLockHTML() {
   if (FINANCE_MODE === 'local') return '';
@@ -4853,6 +4855,11 @@ function applyOrderType(oid, type) {
   var cur = o.is_admin_print ? 'self' : 'receive';
   if (cur === type) { toast('类型已是「' + _orderTypeLabel(type) + '」'); return; }
   if (_orderTypeSaving) { toast('上一次订正正在提交，请稍候'); return; }
+  /* v7.20：外部监视单不在云端 orders 表里，类型写本地账本（与状态同一本账）。 */
+  if (_isExternalOrder(oid)) {
+    _orderTypeSaving = true;
+    return _applyExternalOrderMeta(o, null, type, function () { _orderTypeSaving = false; });
+  }
   _orderTypeSaving = true;
   fetch('/api/proxy/admin/order_type', {
     method: 'POST', headers: apiHeaders(),
@@ -4889,10 +4896,11 @@ function _findCloudOrder(oid) {
    - 云端订单：改 orders.openid，小程序 / APP 的「我的订单」跟着变；
    - 本地来源订单（openid === 'local'）：没有云端账号可转，改 orders.owner_name 展示所属人
      （v7.19 补齐 —— 此前本地单整列只读，用户反馈「本地打印订单不支持调整所属人」）。
-   外部监视单没有归属可调（设备所有者由账本记），保持只读。 */
+   v7.20（2026-11-13 用户要求「本地监视的任务也要能调用户」）：外部监视单也能转 ——
+   它没有云端账号，按「展示名」写本地账本的 manual_owner（与本地来源单同一条路）。 */
 function _orderUserEditable(oidS) {
   if (FINANCE_MODE === 'local' || !unlocked.orderstatus || !oidS) return false;
-  if (_isExternalOrder(oidS)) return false;
+  if (_isExternalOrder(oidS)) return true;   // v7.20：写账本 manual_owner，不再只读
   if (!/^[0-9]+$/.test(String(oidS))) return false;
   var o = _findCloudOrder(oidS);
   return !!(o && o.openid);
@@ -5023,6 +5031,11 @@ function applyOrderUser(oid, idx) {
   if (!pick || pick.cur) return;
   var isLocal = String(o.openid || '') === 'local';
   var by = _manualStatusBy();
+  /* v7.20：外部监视单写本地账本的 manual_owner（账本里没有 openid，只有展示名）。 */
+  if (_isExternalOrder(oid)) {
+    _orderUserSaving = true;
+    return _applyExternalOrderMeta(o, pick.name, null, function () { _orderUserSaving = false; });
+  }
   var payload = { order_id: String(oid), by: by };
   if (isLocal) payload.owner_name = pick.name;
   else payload.openid = pick.openid;
@@ -5060,6 +5073,42 @@ function applyOrderUser(oid, idx) {
   }).catch(function () {
     _orderUserSaving = false;
     toast('❌ 网络错误，订单归属未改动', 'error', true);
+  });
+}
+/* v7.20：外部监视单的「用户 / 类型」订正 —— 写本地账本（POST /api/local/external_prints/meta）。
+   与状态分支同构：成功后只做乐观落地（收益/页数都是从 _cloudData.orders 现算的，
+   把归属与 is_admin_print 同步过来即等价于账本里的新值），再整页重绘。
+   ownerName / orderType 只传要改的那一列（null = 不动）。done 用来清「正在提交」闸门。 */
+function _applyExternalOrderMeta(o, ownerName, orderType, done) {
+  var finish = (typeof done === 'function') ? done : function () {};
+  var payload = { order_id: String((o && o.order_id) || '') };
+  if (ownerName != null) payload.owner_name = String(ownerName);
+  if (orderType != null) payload.order_type = String(orderType);
+  fetch('/api/local/external_prints/meta', {
+    method: 'POST', headers: apiHeaders(), body: JSON.stringify(payload)
+  }).then(function (r) { return r.json(); }).then(function (res) {
+    finish();
+    if (!(res && res.success) && _writeAuthProblem(res)) return;
+    if (!(res && res.success)) { toast('❌ ' + ((res && res.message) || '订正失败'), 'error', true); return; }
+    var label = o.order_number || o.order_id;
+    if (ownerName != null) {
+      o.owner_name = res.owner_name || String(ownerName);
+      o.manual_owner = o.owner_name;
+      toast('✅ 订单 ' + label + ' 已转给「' + o.owner_name + '」（本地监视账本）', 'success');
+    }
+    if (orderType != null) {
+      o.is_admin_print = (String(orderType) === 'self');
+      o.manual_type = String(orderType);
+      toast('✅ 订单 ' + label + ' 类型已改为「' + _orderTypeLabel(orderType) + '」'
+        + (o.is_admin_print ? '（不计入收益）' : '（计入收益）'), 'success');
+    }
+    _scopeCache = {};
+    invalidateUsage();
+    renderCloud();
+    _scrollToOffset('cloud-orders');
+  }).catch(function () {
+    finish();
+    toast('❌ 网络错误，改动未保存', 'error', true);
   });
 }
 function _stMenuOutside(e) {
@@ -5449,15 +5498,18 @@ function _renderOrderListHTML() {
         (srcTip ? ' title="' + srcTip + '"' : '') + '>' + srcTxt + '</span></td>';
       /* v7.18：用户列与状态列同一把锁 —— 锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头。
          云端单点开选另一位用户（改 orders.openid）；v7.19 起本地来源单也能点开，改的是
-         orders.owner_name（展示所属人）。外部监视单没有归属可调，保持只读。 */
+         orders.owner_name（展示所属人）；v7.20 起外部监视单也能点开，写本地账本的
+         manual_owner（与本地单同一条候选名单）。 */
       var _userTag = (mo && mo.color ? '<span class="member-tag" style="background:' + sanitizeColor(mo.color) + ';font-size:.72rem;padding:2px 8px">' + esc(who) + '</span>' : esc(who));
       var _userTip = esc(who) + (addr ? ' · ' + esc(addr) : '');
       if (o.manual_user_by) {
         _userTip += ' · ' + esc(o.manual_user_by) + '于' +
           esc(_fmtStamp(o.manual_user_at) || '未知时间') + '调整归属';
       }
-      var _userEditTip = String(o.openid || '') === 'local'
-        ? '点击调整所属人（本地归属）' : '点击调整所属用户';
+      var _userEditTip = _isExternalOrder(oidS)
+        ? '点击调整这一单记在谁名下（本地监视账本）'
+        : (String(o.openid || '') === 'local'
+           ? '点击调整所属人（本地归属）' : '点击调整所属用户');
       h += '<td class="l ell" title="' + _userTip + '">' + (_orderUserEditable(oidS)
         ? '<span class="st-edit can" title="' + _userEditTip + '" onclick="event.stopPropagation();openOrderUserMenu(event,\'' + oidS + '\')">' +
             _userTag + '<button type="button" class="st-caret" tabindex="-1">▾</button></span>'

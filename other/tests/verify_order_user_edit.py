@@ -74,13 +74,14 @@ chk("锁图标默认 🔒、解锁后 🔓", "? '🔓' : '🔒'" in html)
 chk("PASSWORD_KEYS 没有被顺手加一个 orderuser（模块清单保持原样）",
     "orderuser" not in re.search(r"var PASSWORD_KEYS = \[[^\]]*\]", html).group(0))
 
-# A3 可编辑判据：本地/外部/非十进制一律不可改
+# A3 可编辑判据：本地模式 / 未解锁 / 非十进制 id 一律不可改；
+# 外部监视单 v7.20 起**可改**（写本地账本 manual_owner，与本地单同一条候选名单）
 _gate = re.search(r"function _orderUserEditable\(oidS\) \{([\s\S]*?)\n\}", html)
 _gate_body = _gate.group(1) if _gate else ""
-chk("_orderUserEditable 存在且覆盖本地模式 / 外部监视单 / 非十进制 id / 未解锁",
+chk("_orderUserEditable 存在且覆盖本地模式 / 未解锁 / 非十进制 id / 外部单放开",
     bool(_gate_body)
     and re.search(r"FINANCE_MODE === 'local'[\s\S]{0,160}?return false", _gate_body) is not None
-    and re.search(r"_isExternalOrder\(oidS\)[\s\S]{0,80}?return false", _gate_body) is not None
+    and re.search(r"_isExternalOrder\(oidS\)\)\s*return true", _gate_body) is not None
     and "/^[0-9]+$/" in _gate_body
     and "unlocked.orderstatus" in _gate_body,
     _gate_body.strip()[:160])

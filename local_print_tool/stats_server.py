@@ -265,6 +265,53 @@ def set_external_order_status(store, order_id, status, by: str = "", at: str = "
     return (False, "not_found", "账本里找不到该订单（可能已被清理）", {})
 
 
+def set_external_order_meta(store, order_id, owner=None, order_type=None) -> tuple:
+    """把一条外部监视单的「用户 / 类型」订正写进账本（纯逻辑，不碰 HTTP / 云端）。
+
+    返回 (ok, code, message, info)。ok=True 时 info 含 order_id / owner_name /
+    order_type（直接回给页面做乐观更新）。
+    与状态订正同一道门槛：只认「已被确认为已处理」的记录（待处理的连钱都没算，
+    谈不上归类）；类型只接受 receive / self（与云端白名单同源）。
+    owner / order_type 传 None = 这次不改那一列。
+    """
+    import print_watch as _pw
+    has_owner = owner is not None
+    has_type = order_type is not None
+    if not has_owner and not has_type:
+        return (False, "bad_request", "没有要修改的字段", {})
+    if has_type:
+        ot = str(order_type or "").strip()
+        if ot not in _pw.MANUAL_ORDER_TYPES:
+            return (False, "bad_type",
+                    "不允许改为「%s」（只允许：%s）"
+                    % (ot or "空", " / ".join(_pw.MANUAL_ORDER_TYPES)), {})
+    parsed = parse_external_order_id(order_id)
+    if parsed is None:
+        return (False, "bad_order_id",
+                "外部订单号格式非法（应为 ext:<作业号>:<检测时间>）", {})
+    job_id, detected_at = parsed
+    items = store.load(force=True)       # 强制读盘：监视进程可能刚往账本里写过
+    for idx, item in enumerate(items):
+        if int(getattr(item, "job_id", 0) or 0) != job_id:
+            continue
+        if str(getattr(item, "detected_at", "") or "") != detected_at:
+            continue
+        if str(getattr(item, "status", "") or "") != _pw.STATUS_CONFIRMED:
+            return (False, "not_confirmed",
+                    "该作业还没被确认为已处理，不能调整用户/类型", {})
+        updated = store.set_manual_meta(
+            idx, owner=(str(owner).strip()[:32] if has_owner else None),
+            order_type=(str(order_type).strip() if has_type else None))
+        if updated is None:              # 理论上不可能（刚 load 过），兜个底别 500
+            return (False, "not_found", "账本里找不到该订单", {})
+        return (True, "", "", {
+            "order_id": "ext:%d:%s" % (job_id, detected_at),
+            "owner_name": str(getattr(updated, "manual_owner", "") or ""),
+            "order_type": str(getattr(updated, "manual_type", "") or ""),
+        })
+    return (False, "not_found", "账本里找不到该订单（可能已被清理）", {})
+
+
 def load_external_prices():
     """外部打印的 (单面单价, 双面单价)，一律取配置（改价金额跟着变）。
 
@@ -312,6 +359,13 @@ def _external_order_row(item, amount: float, owner_name: str) -> dict:
     order_status = manual_status or "sent"
     manual_status_by = str(getattr(item, "manual_status_by", "") or "")
     manual_status_at = str(getattr(item, "manual_status_at", "") or "")
+    # v7.20：结算页可对**外部监视单**调整「用户 / 类型」（账本里的 manual_owner /
+    # manual_type）。账本没有账号，用户列按展示名覆盖设备所有者；类型 self = 自打，
+    # 结算口径里"自打不计收益"的判据就是 is_admin_print，所以这里必须一起翻。
+    manual_owner = str(getattr(item, "manual_owner", "") or "").strip()
+    manual_type = str(getattr(item, "manual_type", "") or "")
+    if manual_type not in _pw.MANUAL_ORDER_TYPES:
+        manual_type = ""
     return {
         # 带前缀的字符串：**绝不是纯数字**（本地/云端订单 id 是整数，纯数字会让前端按 id 去重/取数）
         "order_id": "ext:%d:%s" % (job_id, detected_at),
@@ -320,8 +374,10 @@ def _external_order_row(item, amount: float, owner_name: str) -> dict:
         "total_price": round(float(amount), 2),
         "total_page_count": pages * copies,
         "total_sheet_count": sheets * copies,
-        "owner_name": owner_name,
-        "is_admin_print": False,
+        "owner_name": manual_owner or owner_name,
+        "is_admin_print": manual_type == "self",
+        "manual_owner": manual_owner,
+        "manual_type": manual_type,
         "source": "external",
         "openid": "local",
         "nickname": "",
@@ -578,6 +634,8 @@ FINANCE_WRITE_MODULES = {
     # v7.16：外部监视单的状态订正写本地账本 —— 与云端订单订正同一个模块令牌，
     # 页面上是同一个锁（🔒 订单状态），不能出现「解锁了云端订正却能偷偷改本地账本之外」
     "/api/local/external_prints/status": "orderstatus",
+    # v7.20：用户/类型两列与状态共用同一把 🔒，写的是同一本账
+    "/api/local/external_prints/meta": "orderstatus",
 }
 # 不需要会话的 POST（登录/首次设置/登出：它们本身就是"换会话"的动作）
 FINANCE_AUTH_OPEN_PATHS = frozenset({
@@ -1919,8 +1977,59 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/external_prints/status":
             return self._handle_post_external_status()
 
+        # 外部监视单的「用户 / 类型」订正（同一本账，见 set_external_order_meta）
+        if path == "/api/local/external_prints/meta":
+            return self._handle_post_external_meta()
+
         # 未知
         self._send_json({"success": False, "message": "未找到"}, 404)
+
+    def _handle_post_external_meta(self):
+        """POST /api/local/external_prints/meta —— 外部监视单的用户/类型订正。
+
+        请求体：{"order_id": "ext:<job_id>:<detected_at>", "owner_name": "霍楠"}
+                或 {"order_id": "...", "order_type": "self"}
+        守卫：启动令牌门 + 财务写会话（orderstatus 模块，与状态订正同一把锁）。
+        语义：只写账本的 manual_owner / manual_type；成功返回订正后的值供页面落地。
+        每条都进审计（event=external_order_meta），失败也记。
+        """
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except (ValueError, UnicodeDecodeError):
+            return self._send_json({"success": False, "code": "bad_json",
+                                    "message": "请求体不是合法 JSON"}, 400)
+        if not isinstance(body, dict):
+            return self._send_json({"success": False, "code": "bad_json",
+                                    "message": "请求体必须是对象"}, 400)
+        order_id = body.get("order_id")
+        has_owner = "owner_name" in body
+        has_type = "order_type" in body
+        owner = str(body.get("owner_name") or "").strip()[:32] if has_owner else None
+        order_type = str(body.get("order_type") or "").strip() if has_type else None
+        if has_owner and not owner:
+            return self._send_json({"success": False, "code": "bad_owner",
+                                    "message": "所属人不能为空"}, 400)
+        try:
+            import print_watch as _pw
+            store = _pw.ExternalPrintStore(EXTERNAL_LEDGER_OVERRIDE)
+            ok, code, message, info = set_external_order_meta(
+                store, order_id, owner=owner, order_type=order_type)
+        except Exception as e:              # 账本损坏/磁盘满：明确 500，绝不假装成功
+            logger.error("订正外部监视单用户/类型失败: %s", type(e).__name__)
+            return self._send_json({"success": False, "code": "internal_error",
+                                    "message": "账本写入失败（%s）" % type(e).__name__}, 500)
+        self._fin().audit("external_order_meta", module="orderstatus",
+                          fields={"order_id": str(order_id or "")[:64],
+                                  "owner_name": str(owner or "")[:32],
+                                  "order_type": str(order_type or "")[:16]},
+                          extra={"success": ok, "code": code or "ok"})
+        if not ok:
+            http_status = 404 if code == "not_found" else 400
+            return self._send_json({"success": False, "code": code,
+                                    "message": message}, http_status)
+        out = {"success": True, "message": "已更新"}
+        out.update(info)
+        self._send_json(out)
 
     def do_DELETE(self):
         """删除本地数据（启动令牌门校验后路由到本地数据删除）。"""

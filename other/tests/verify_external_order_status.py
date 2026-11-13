@@ -361,6 +361,85 @@ finally:
 
 
 # ══════════════════════════════════════════════════════════════════
+section("⑤b v7.20：外部监视单「用户 / 类型」订正（HTTP 层）")
+# ══════════════════════════════════════════════════════════════════
+# 现场（2026-11-13 用户）：「本地监视的任务不能调整这两个内容？需要能够调整才行。」
+check("⑤b do_POST 里挂了 /api/local/external_prints/meta → _handle_post_external_meta",
+      re.search(r'path == "/api/local/external_prints/meta"', SERVER_SRC) is not None
+      and re.search(r'_handle_post_external_meta\(\)', SERVER_SRC) is not None)
+check("⑤b 元数据订正的写权限与状态订正同源（FINANCE_WRITE_MODULES → orderstatus）",
+      ss.FINANCE_WRITE_MODULES.get("/api/local/external_prints/meta") == "orderstatus",
+      repr(ss.FINANCE_WRITE_MODULES.get("/api/local/external_prints/meta")))
+
+
+def call_meta(body):
+    h = _FakeHandler(body)
+    ss._StatsHandler._handle_post_external_meta(h)
+    return h
+
+
+_path_m = write_ledger("http_meta", [
+    item(job_id=61, detected_at="2026-10-28 15:00:00"),
+    item(job_id=62, detected_at="2026-10-28 15:30:00", status=pw.STATUS_NEW),
+])
+_orig_override_m = ss.EXTERNAL_LEDGER_OVERRIDE
+ss.EXTERNAL_LEDGER_OVERRIDE = _path_m
+try:
+    _m1 = call_meta(json.dumps({"order_id": "ext:61:2026-10-28 15:00:00",
+                                "owner_name": "霍楠"}).encode("utf-8"))
+    _mp1, _mc1 = _m1.sent or ({}, None)
+    check("⑤b 改用户：200 + success + 回传 owner_name",
+          _mc1 == 200 and _mp1.get("success") is True and _mp1.get("owner_name") == "霍楠",
+          json.dumps({"code": _mc1, "payload": _mp1}, ensure_ascii=False))
+    check("⑤b 改用户也写审计：event=external_order_meta / module=orderstatus / 带 owner_name",
+          len(_m1.audits) == 1 and _m1.audits[0]["event"] == "external_order_meta"
+          and _m1.audits[0]["module"] == "orderstatus"
+          and _m1.audits[0]["fields"].get("owner_name") == "霍楠"
+          and _m1.audits[0]["extra"].get("success") is True,
+          json.dumps(_m1.audits, ensure_ascii=False))
+
+    _m2 = call_meta(json.dumps({"order_id": "ext:61:2026-10-28 15:00:00",
+                                "order_type": "self"}).encode("utf-8"))
+    _mp2, _mc2 = _m2.sent or ({}, None)
+    check("⑤b 改类型为自打：200 + order_type=self",
+          _mc2 == 200 and _mp2.get("order_type") == "self",
+          json.dumps({"code": _mc2, "payload": _mp2}, ensure_ascii=False))
+
+    _m3 = call_meta(json.dumps({"order_id": "ext:61:2026-10-28 15:00:00",
+                                "order_type": "canceled"}).encode("utf-8"))
+    _mp3, _mc3 = _m3.sent or ({}, None)
+    check("⑤b 非法类型：400 + code=bad_type", _mc3 == 400 and _mp3.get("code") == "bad_type",
+          json.dumps({"code": _mc3, "payload": _mp3}, ensure_ascii=False))
+
+    _m4 = call_meta(json.dumps({"order_id": "ext:61:2026-10-28 15:00:00",
+                                "owner_name": "   "}).encode("utf-8"))
+    _mp4, _mc4 = _m4.sent or ({}, None)
+    check("⑤b 空所属人：400 + code=bad_owner", _mc4 == 400 and _mp4.get("code") == "bad_owner",
+          json.dumps({"code": _mc4, "payload": _mp4}, ensure_ascii=False))
+
+    _m5 = call_meta(json.dumps({"order_id": "ext:62:2026-10-28 15:30:00",
+                                "owner_name": "霍楠"}).encode("utf-8"))
+    _mp5, _mc5 = _m5.sent or ({}, None)
+    check("⑤b 未确认的作业：400 + code=not_confirmed",
+          _mc5 == 400 and _mp5.get("code") == "not_confirmed",
+          json.dumps({"code": _mc5, "payload": _mp5}, ensure_ascii=False))
+
+    _m6 = call_meta(json.dumps({"order_id": "ext:999:2026-10-28 15:00:00",
+                                "order_type": "receive"}).encode("utf-8"))
+    _mp6, _mc6 = _m6.sent or ({}, None)
+    check("⑤b 找不到的单：404 + code=not_found", _mc6 == 404 and _mp6.get("code") == "not_found",
+          json.dumps({"code": _mc6, "payload": _mp6}, ensure_ascii=False))
+
+    _m7 = call_meta(b"{not json")
+    _mp7, _mc7 = _m7.sent or ({}, None)
+    check("⑤b 坏 JSON：400 + code=bad_json（不 500）",
+          _mc7 == 400 and _mp7.get("code") == "bad_json",
+          json.dumps({"code": _mc7, "payload": _mp7}, ensure_ascii=False))
+finally:
+    ss.EXTERNAL_LEDGER_OVERRIDE = _orig_override_m
+
+
+# ══════════════════════════════════════════════════════════════════
 section("⑥ 三处白名单同源（print_watch ↔ settlement.html ↔ 云端 app.py）")
 # ══════════════════════════════════════════════════════════════════
 _html = read_html()
@@ -380,9 +459,13 @@ check("⑥ 前端外部单的状态入口走本地账本接口（不是云端 or
       and "function _applyExternalOrderStatus(" in _html
       and re.search(r"if \(_isExternalOrder\(oid\)\) return _applyExternalOrderStatus\(", _html)
       is not None)
-check("⑥ 类型列对外部单仍只读（外部单没有「订单类型」这个概念）",
-      re.search(r"function _orderTypeEditable\(oidS\) \{\s*return _isExternalOrder\(oidS\) \? false : "
-                r"_orderStatusEditable\(oidS\);", _html) is not None)
+# v7.20（2026-11-13 用户要求「本地监视的任务也要能调类型」）：外部单不再是整列只读，
+# 类型写本地账本（manual_type），判据与状态同源。
+check("⑥ 类型列对外部单也可改（判据与状态同源，写本地账本）",
+      re.search(r"function _orderTypeEditable\(oidS\) \{\s*return _orderStatusEditable\(oidS\);",
+                _html) is not None
+      and "if (_isExternalOrder(oid)) {\n    _orderTypeSaving = true;\n"
+          "    return _applyExternalOrderMeta(o, null, type" in _html)
 
 
 # ══════════════════════════════════════════════════════════════════

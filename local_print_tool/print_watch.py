@@ -61,6 +61,11 @@ VALID_STATUSES = (STATUS_NEW, STATUS_CONFIRMED, STATUS_IGNORED)
 # other/tests/verify_order_status_edit.py 与 verify_external_prints_settlement.py 会红。
 MANUAL_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected")
 
+# 结算页「类型」列的人工归类（接单 / 自打）。只有两种，且与云端 MANUAL_FIX_ORDER_TYPES
+# （mobile_apps/printer-backend/app.py）和前端 ORDER_FIXABLE_TYPES 同一份清单：
+# 自打（self）= 不计入收益，改错就是账目错，所以它和状态共用同一把 🔒。
+MANUAL_ORDER_TYPES = ("receive", "self")
+
 SOURCE_AUTO = "auto"                    # 驱动/spooler 自己报的页数
 SOURCE_CONFIRMED = "confirmed"          # 人工补录
 SOURCE_UNKNOWN = "unknown"              # 谁也报不出来（1020 打满页数时的常态）
@@ -338,6 +343,11 @@ class ExternalPrint:
     manual_status: str = ""
     manual_status_by: str = ""            # 标记人（结算页成员名单里的名字）
     manual_status_at: str = ""            # 订正时间（服务器本地时间，ISO 秒级）
+    # 结算页对**外部监视单**的人工归类（2026-11-13 用户要求：本地监视的任务也要能调
+    # 「用户」「类型」两列）。与 manual_status 正交：那一个管结算状态，这两个管
+    #「这单记在谁名下」（账本里没有账号，只存展示名）与「接单 / 自打」。
+    manual_owner: str = ""
+    manual_type: str = ""                 # "receive"/"self"，"" = 没调过（按接单算）
 
     def key(self) -> tuple[str, int, str]:
         return (self.printer, int(self.job_id), self.detected_at)
@@ -386,6 +396,11 @@ class ExternalPrint:
             item.manual_status = ""
         item.manual_status_by = str(item.manual_status_by or "")
         item.manual_status_at = str(item.manual_status_at or "")
+        # 人工归类的脏值同样兜底：账本被手改/旧版本写入时不能让它流进结算口径
+        item.manual_owner = str(item.manual_owner or "").strip()
+        item.manual_type = str(item.manual_type or "")
+        if item.manual_type not in MANUAL_ORDER_TYPES:
+            item.manual_type = ""
         item.printer_virtual = bool(item.printer_virtual)
         return item
 
@@ -683,6 +698,24 @@ class ExternalPrintStore:
         return self._mutate(index, manual_status=status,
                             manual_status_by=str(by or "").strip(),
                             manual_status_at=str(at or ""))
+
+    def set_manual_meta(self, index: int, owner: Optional[str] = None,
+                        order_type: Optional[str] = None) -> Optional[ExternalPrint]:
+        """结算页「用户 / 类型」两列的订正：只写 manual_owner / manual_type。
+
+        与 set_manual_status 同构（都只写 manual_* 字段、都走 _mutate 的原子落地），
+        所以监视进程下次摄入新作业时不会把人工归类刷掉。
+        """
+        changes: dict = {}
+        if owner is not None:
+            changes["manual_owner"] = str(owner or "").strip()[:32]
+        if order_type is not None:
+            if str(order_type) not in MANUAL_ORDER_TYPES:
+                raise ValueError(f"不允许的类型: {order_type}")
+            changes["manual_type"] = str(order_type)
+        if not changes:
+            return None
+        return self._mutate(index, **changes)
 
     def _mutate(self, index: int, **changes) -> Optional[ExternalPrint]:
         with self._lock:

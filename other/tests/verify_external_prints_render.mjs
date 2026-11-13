@@ -6,7 +6,7 @@
  *       ② 类型列按现有「接单」槽渲染（不新增类型槽）；
  *       ③ 金额/收益计入（KPI 涨这一笔），用户列归到设备所有者；
  *       ④ 状态列可订正（v7.16 起：写本地账本 /api/local/external_prints/status），
- *          类型列仍不可订正（外部单没有「订单类型」这个概念）；
+ *          类型列 v7.20 起也可订正（写同一本账的 manual_type：接单 / 自打）；
  *       ⑤ 「来源」筛选可单独只看外部作业；
  *       ⑥ 外部数据源 500 / 挂住时页面照常渲染云端订单（绝不白屏、不弹错）。
  *
@@ -133,6 +133,7 @@ const json = (res, obj) => { res.writeHead(200, { 'Content-Type': 'application/j
 let EXT_MODE = 'empty';
 const extHits = [];          // 收到的 /api/local/external_prints 查询（断言带上了日期参数）
 const extStatusWrites = [];  // 收到的 /api/local/external_prints/status 订正请求（v7.16）
+const extMetaWrites = [];    // 收到的 /api/local/external_prints/meta 订正请求（v7.20 用户/类型）
 const server = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://127.0.0.1');
   const p = decodeURIComponent(u.pathname);
@@ -149,6 +150,20 @@ const server = http.createServer((req, res) => {
         extStatusWrites.push(payload);
         return json(res, { success: true, message: '状态已订正', order_id: payload.order_id,
                            status: payload.status, previous_status: 'sent' });
+      });
+    }
+    if (p === '/api/local/external_prints/meta') {
+      /* v7.20：外部监视单的「用户 / 类型」订正也写本地账本。这里只记录请求并回 success，
+         供 ④4b 断言「点类型菜单真的打到这条路由、参数对不对」。 */
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      return req.on('end', () => {
+        let payload = null;
+        try { payload = JSON.parse(body || '{}'); } catch (e) { payload = { parse_error: String(e) }; }
+        extMetaWrites.push(payload);
+        return json(res, { success: true, message: '已更新', order_id: payload.order_id,
+                           owner_name: payload.owner_name || '张三',
+                           order_type: payload.order_type || '' });
       });
     }
     if (p === '/api/local/external_prints') {
@@ -361,9 +376,9 @@ try {
     s.statusEdit.filter((n, i) => n === 1 && !isExtRow(i)).length === 3 &&
     s.typeEdit.filter((n, i) => n === 1 && !isExtRow(i)).length === 3,
     JSON.stringify({ statusEdit: s.statusEdit, typeEdit: s.typeEdit }));
-  chk('④2 外部订单**状态列**有 .st-edit/.st-caret（v7.16 起可订正），类型列仍然没有',
+  chk('④2 外部订单**状态列与类型列**都有 .st-edit/.st-caret（v7.16 状态可订正、v7.20 类型也可订正）',
     extRowIdx >= 0 && s.statusEdit[extRowIdx] === 1 && s.statusCaret[extRowIdx] === 1 &&
-    s.typeEdit[extRowIdx] === 0 && s.typeCaret[extRowIdx] === 0,
+    s.typeEdit[extRowIdx] === 1 && s.typeCaret[extRowIdx] === 1,
     JSON.stringify({ statusEdit: s.statusEdit, typeEdit: s.typeEdit, extRowIdx, isExt: s.orderNos.map(isExtRow) }));
   chk('④3 点外部订单的状态标签能弹出订正菜单（白名单与云端单同一份终态）',
     await (async () => {
@@ -373,18 +388,58 @@ try {
       await page.evaluate(() => window.closeOrderStatusMenu && window.closeOrderStatusMenu());
       return items.length === 5 && items.some((t) => t.indexOf('已取消') >= 0 || t.indexOf('取消') >= 0);
     })());
-  chk('④4 点外部订单的类型标签仍弹不出菜单（类型列对外部单只读）',
+  chk('④4 点外部订单的类型标签能弹菜单（接单 / 自打两项）',
     await (async () => {
       await page.click(extSel + ' td:nth-child(10)');
       await page.waitForTimeout(200);
-      const has = !!(await page.$('#tyMenu'));
-      await page.keyboard.press('Escape');
-      return !has;
+      const items = await page.$$eval('#tyMenu .st-menu-item', (els) => els.map((e) => e.textContent.trim()));
+      /* 必须真的关掉：openOrderTypeMenu 对「同一单再点一次」是 toggle（收起），
+         Escape 不关菜单 ⇒ 下一个 ④4b 的点击会把菜单收起来而不是打开。 */
+      await page.evaluate(() => window.closeOrderTypeMenu && window.closeOrderTypeMenu());
+      return items.length === 2 && items.some((t) => t.indexOf('自打') >= 0)
+        && items.some((t) => t.indexOf('接单') >= 0);
     })());
-  chk('④5 闸门自身：_orderStatusEditable 对 ext: id 返回 true，_orderTypeEditable 仍是 false；云端单两列都 true',
-    gate.extStatus === true && gate.extType === false &&
+  chk('④5 闸门自身：解锁后外部单两列都可订正（v7.20 起类型也放开），云端单两列都 true',
+    gate.extStatus === true && gate.extType === true &&
     gate.cloudStatus === true && gate.cloudType === true,
     JSON.stringify(gate));
+  /* ④4b v7.20 端到端：类型菜单点「自打」→ 写本地账本 manual_type=self → 该行退出收益 */
+  const kpiBeforeType = s.kpi;
+  await page.click(extSel + ' td:nth-child(10)');
+  await page.waitForTimeout(200);
+  const tyItems = await page.$$eval('#tyMenu .st-menu-item', (els) => els.map((e) => e.textContent.trim()));
+  const selfIdx = tyItems.findIndex((t) => t.indexOf('自打') >= 0);
+  if (selfIdx >= 0) {
+    await page.click('#tyMenu .st-menu-item:nth-child(' + (selfIdx + 1) + ')');
+    await page.waitForTimeout(700);
+  }
+  const afterSelf = await snap();
+  const selfRow = afterSelf.orderNos.indexOf('EXT-20261028-180013-8');
+  chk('④4b 点「自打」：打到 /api/local/external_prints/meta，body 是 raw ext: id + order_type=self',
+    extMetaWrites.length === 1
+    && String(extMetaWrites[0].order_id) === 'ext:8:2026-10-28 18:00:13'
+    && String(extMetaWrites[0].order_type) === 'self'
+    && !('owner_name' in extMetaWrites[0]),
+    JSON.stringify(extMetaWrites));
+  chk('④4c 该行类型标签变「自打」，金额退出 KPI（-70 分，与云端自打同口径）',
+    selfRow >= 0 && String(afterSelf.typeTags.length ? afterSelf.typeTags[selfRow].txt : '').indexOf('自打') >= 0
+    && afterSelf.kpi === kpiBeforeType - 70,
+    JSON.stringify({ kpi: [kpiBeforeType, afterSelf.kpi],
+                     tag: afterSelf.typeTags[selfRow] && afterSelf.typeTags[selfRow].txt }));
+  /* 改回「接单」：KPI 复原，后面的 ④6 才有可降的 70 分 */
+  await page.click(extSel + ' td:nth-child(10)');
+  await page.waitForTimeout(200);
+  const tyItems2 = await page.$$eval('#tyMenu .st-menu-item', (els) => els.map((e) => e.textContent.trim()));
+  const recvIdx = tyItems2.findIndex((t) => t.indexOf('接单') >= 0);
+  if (recvIdx >= 0) {
+    await page.click('#tyMenu .st-menu-item:nth-child(' + (recvIdx + 1) + ')');
+    await page.waitForTimeout(700);
+  }
+  const afterRecv = await snap();
+  chk('④4d 改回「接单」：再发一次 meta（order_type=receive），KPI 复原',
+    extMetaWrites.length === 2 && String(extMetaWrites[1].order_type) === 'receive'
+    && afterRecv.kpi === kpiBeforeType,
+    JSON.stringify({ writes: extMetaWrites, kpi: [kpiBeforeType, afterRecv.kpi] }));
   /* ④6 v7.16 端到端：菜单项点击 → 打本地账本写接口（不是云端写接口）→ 乐观更新 + 口径重算 */
   const kpiBeforeFix = s.kpi;
   await page.evaluate(() => { window.unlocked.orderstatus = true; window._rerenderOrdersOnly(); });

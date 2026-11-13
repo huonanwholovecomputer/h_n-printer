@@ -56,7 +56,9 @@ ORDER_KEYS = {"order_id", "order_number", "created_at", "total_price",
               "is_admin_print", "source", "openid", "nickname", "auto_print",
               "schedule_mode", "delivery_enabled", "urgency", "cover_page",
               "status", "unsynced", "sync_status", "external", "printer_name",
-              "manual_status_by", "manual_status_at", "files"}
+              "manual_status_by", "manual_status_at",
+              # v7.20（2026-11-13 用户要求）：外部监视单也能调整「用户 / 类型」
+              "manual_owner", "manual_type", "files"}
 # 契约里 files[0] 的键（v7.16 起同样带 manual_status_by / manual_status_at：
 # 结算页的金额与用量只认 files[].status，订正必须落到文件级才会真的不计钱）
 FILE_KEYS = {"id", "file_name", "copies", "page_count", "duplex", "page_range",
@@ -346,6 +348,8 @@ EXPECTED_ROW = {
     "printer_name": "HP LaserJet 1020",
     "manual_status_by": "",
     "manual_status_at": "",
+    "manual_owner": "",
+    "manual_type": "",
     "files": [{
         "id": "ext-8", "file_name": "三页文档测试.pdf", "copies": 1, "page_count": 3,
         "duplex": "on", "page_range": "", "total_price": 0.7, "status": "sent",
@@ -514,6 +518,114 @@ check("证据：4 条账本（new/页数未知 各一条）→ 明细 2 条、sk
                   "skipped": _evidence_payload["skipped"],
                   "order_numbers": [o["order_number"] for o in _evidence_payload["orders"]]},
                  ensure_ascii=False))
+
+# ══════════════════════════════════════════════════════════════════
+section("⑬ v7.20：外部监视单的「用户 / 类型」订正（写本地账本）")
+# ══════════════════════════════════════════════════════════════════
+# 现场（2026-11-13 用户）：「本地监视的任务不能调整这两个内容？需要能够调整才行。」
+# 做法与状态订正同构：写账本 manual_owner / manual_type；类型 self = 自打，不计入收益。
+
+
+def _meta_store(items_list):
+    """临时账本 + ExternalPrintStore（复用本文件已有的 write_ledger 口径）。"""
+    path = write_ledger("meta", items_list)
+    return pw.ExternalPrintStore(path), path
+
+
+_meta_items = [
+    item(21, document="甲.pdf", pages=2, duplex=pw.DUPLEX_OFF, copies=1,
+         status=pw.STATUS_CONFIRMED, detected_at="2026-10-29 09:00:00"),
+    item(22, document="乙.pdf", pages=3, duplex=pw.DUPLEX_ON, copies=1,
+         status=pw.STATUS_NEW, detected_at="2026-10-29 09:10:00"),
+    item(23, document="丙.pdf", pages=1, duplex=pw.DUPLEX_OFF, copies=1,
+         status=pw.STATUS_CONFIRMED, detected_at="2026-10-29 09:20:00"),
+]
+_store21, _path21 = _meta_store(_meta_items)
+_oid21 = "ext:21:2026-10-29 09:00:00"
+
+_ok, _code, _msg, _info = ss.set_external_order_meta(_store21, _oid21, owner="霍楠")
+check("⑬ 改「用户」成功，回传订正后的 owner_name",
+      _ok and _code == "" and _info.get("owner_name") == "霍楠", f"{_ok} {_code} {_info}")
+_reloaded = pw.ExternalPrintStore(_path21).load(force=True)
+check("⑬ 账本里真的落盘了 manual_owner（不是只改内存）",
+      [x.manual_owner for x in _reloaded if x.job_id == 21] == ["霍楠"],
+      str([(x.job_id, x.manual_owner) for x in _reloaded]))
+_meta_status = {x.job_id: (x.status, x.manual_status) for x in _reloaded}
+check("⑬ 改用户**不动**监视状态与人工状态（status / manual_status 都没被碰）",
+      _meta_status.get(21) == (pw.STATUS_CONFIRMED, "")
+      and _meta_status.get(22) == (pw.STATUS_NEW, "")
+      and _meta_status.get(23) == (pw.STATUS_CONFIRMED, ""), str(_meta_status))
+
+_ok, _code, _msg, _info = ss.set_external_order_meta(_store21, _oid21, order_type="self")
+check("⑬ 改「类型」为自打成功", _ok and _info.get("order_type") == "self", f"{_ok} {_code} {_info}")
+_rows21, _skipped21 = ss.build_external_orders(
+    pw.ExternalPrintStore(_path21).load(force=True), SIM, DUP, "张三")
+_by_job = {o["order_id"].split(":")[1]: o for o in _rows21}
+check("⑬ 自打 ⇒ 订单行 is_admin_print=True（结算页「自打不计收益」就认这个字段）",
+      _by_job["21"]["is_admin_print"] is True, str(_by_job["21"].get("is_admin_print")))
+check("⑬ 改过用户 ⇒ 行 owner_name 用账本里的 manual_owner 覆盖设备所有者",
+      _by_job["21"]["owner_name"] == "霍楠", _by_job["21"]["owner_name"])
+check("⑬ 没改过的单不受影响（owner 仍是设备所有者、仍是接单）",
+      _by_job["21"]["manual_type"] == "self"
+      and _by_job["23"]["is_admin_print"] is False
+      and _by_job["23"]["owner_name"] == "张三"
+      and _by_job["23"]["manual_owner"] == "" and _by_job["23"]["manual_type"] == "",
+      json.dumps({k: _by_job["23"].get(k) for k in
+                  ("is_admin_print", "owner_name", "manual_owner", "manual_type")},
+                 ensure_ascii=False))
+
+# 改回接单 + 换一个人：两条都改（同一个请求里也能只改一条）
+_ok, _code, _msg, _info = ss.set_external_order_meta(
+    _store21, _oid21, owner="姚懿祥", order_type="receive")
+_rows21b = ss.build_external_orders(pw.ExternalPrintStore(_path21).load(force=True), SIM, DUP, "张三")[0]
+# 明细按检测时间**倒序**（新单在上），所以按作业号取行，不能按下标
+_row21b = {o["order_id"].split(":")[1]: o for o in _rows21b}["21"]
+check("⑬ 一次改两列（用户 + 类型）都生效",
+      _ok and _info["owner_name"] == "姚懿祥" and _info["order_type"] == "receive"
+      and _row21b["owner_name"] == "姚懿祥" and _row21b["is_admin_print"] is False,
+      json.dumps({k: _row21b.get(k) for k in
+                  ("order_id", "owner_name", "is_admin_print", "manual_type")},
+                 ensure_ascii=False))
+
+# 守卫：非法类型 / 未确认 / 非法 id / 空请求
+_ok, _code, _msg, _ = ss.set_external_order_meta(_store21, _oid21, order_type="canceled")
+check("⑬ 只允许 receive / self（canceled 之类一律拒绝）",
+      (not _ok) and _code == "bad_type", f"{_ok} {_code}")
+_ok, _code, _msg, _ = ss.set_external_order_meta(
+    _store21, "ext:22:2026-10-29 09:10:00", owner="谁")
+check("⑬ 待处理（new）的作业不能调用户/类型",
+      (not _ok) and _code == "not_confirmed", f"{_ok} {_code}")
+_ok, _code, _msg, _ = ss.set_external_order_meta(_store21, "EXT-20261029-090000-21", owner="谁")
+check("⑬ 订单号必须是 ext:<作业号>:<检测时间>",
+      (not _ok) and _code == "bad_order_id", f"{_ok} {_code}")
+_ok, _code, _msg, _ = ss.set_external_order_meta(_store21, _oid21)
+check("⑬ 一个字段都不给 ⇒ 明确拒绝（不做无意义写盘）",
+      (not _ok) and _code == "bad_request", f"{_ok} {_code}")
+_ok, _code, _msg, _ = ss.set_external_order_meta(
+    _store21, "ext:999:2026-10-29 09:00:00", owner="谁")
+check("⑬ 账本里没有这单 ⇒ not_found", (not _ok) and _code == "not_found", f"{_ok} {_code}")
+
+# 静态接线：接口挂载 + 权限 + 前端两条 API
+check("⑬ POST /api/local/external_prints/meta 已挂载到 _handle_post_external_meta",
+      'if path == "/api/local/external_prints/meta":' in _src
+      and "return self._handle_post_external_meta()" in _src, "")
+check("⑬ 权限登记与状态订正同一模块（orderstatus，页面同一把 🔒）",
+      '"/api/local/external_prints/meta": "orderstatus",' in _src, "")
+check("⑬ handler 里有审计事件 external_order_meta",
+      '"external_order_meta"' in _src, "")
+with open(os.path.join("local_print_tool", "finance", "settlement.html"), "r",
+          encoding="utf-8") as _sf:
+    _html = _sf.read()
+check("⑬ 前端：用户列对外部单可编辑（_orderUserEditable 不再直接 return false）",
+      "if (_isExternalOrder(oidS)) return true;   // v7.20" in _html, "")
+check("⑬ 前端：类型列对外部单可编辑（_orderTypeEditable 与状态同源）",
+      "function _orderTypeEditable(oidS) {\n  return _orderStatusEditable(oidS);\n}" in _html, "")
+check("⑬ 前端：两条提交都走 /api/local/external_prints/meta",
+      "_applyExternalOrderMeta(o, null, type" in _html
+      and "_applyExternalOrderMeta(o, pick.name, null" in _html
+      and "'/api/local/external_prints/meta'" in _html, "")
+check("⑬ 前端：自打落地会翻 is_admin_print（收益口径立刻跟着变）",
+      "o.is_admin_print = (String(orderType) === 'self');" in _html, "")
 
 print("\n" + "=" * 78)
 print(f"PASS {PASSED} / FAIL {FAILED} / 共 {PASSED + FAILED} 条")

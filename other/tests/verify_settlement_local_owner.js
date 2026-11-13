@@ -2,7 +2,8 @@
  *
  * 背景（2026-11-09 用户反馈）：订单明细的「用户」列只有云端单能改，来源=本地 的订单整列
  * 只读，而现场大量订单是本地自打的（owner_name 是管理员/成员名）。本脚本钉住四件事：
- *   #1 可编辑判据：解锁后本地单可改；外部监视单/未解锁/非十进制 id 仍不可改；
+ *   #1 可编辑判据：解锁后本地单可改；外部监视单 v7.20 起也可改（写本地账本
+ *      manual_owner）；未解锁 / 非十进制云端 id 仍不可改；
  *   #2 本地单候选所属人 = 当前所属人（置顶）→ 成员名单 → 数据里出现过的其他归属人；
  *   #3 提交：本地单 body 只带 owner_name（绝不带 openid，否则后端会把本地单判成云端单），
  *      成功后本地把 owner_name 落到订单对象上、留痕字段跟着写；
@@ -100,6 +101,11 @@ const sandbox = {
 };
 sandbox.globalThis = sandbox;
 sandbox.self = sandbox;
+/* Chart.js 桩：renderCloud 会画图，Node 里没有 Chart 全局（v7.20 起本脚本会触发整页重绘） */
+sandbox.Chart = function Chart() {
+  return { data: { datasets: [], labels: [] }, options: {}, update() {}, destroy() {},
+           resize() {}, draw() {} };
+};
 vm.createContext(sandbox);
 try {
   vm.runInContext(js, sandbox, { filename: 'settlement.js' });
@@ -147,9 +153,11 @@ chk('未解锁：本地单不可改', run("_orderUserEditable('1')") === false);
 run('unlocked.orderstatus = true;');
 chk('解锁后：本地单可改（v7.19 放开）', run("_orderUserEditable('1')") === true);
 chk('解锁后：云端单仍可改', run("_orderUserEditable('3')") === true);
-chk('外部监视单始终不可改', run("_externalOrderIds['4'] = true; _orderUserEditable('4')") === false);
+chk('外部监视单也可改（v7.20：写本地账本 manual_owner）', run("_externalOrderIds['4'] = true; _orderUserEditable('4')") === true);
 run("delete _externalOrderIds['4'];");
-chk('非十进制 id 不可改', run("_orderUserEditable('ext:1:2')") === false);
+chk('非十进制、又不是外部单的 id 不可改', run("_orderUserEditable('1.0')") === false);
+chk('外部单的行 key（extrow-…）也可改（前端就是这么传的）',
+    run("_orderUserEditable('extrow-ext-1-2026-10-29-090000')") === true);
 
 /* ==================== #2 候选所属人 ==================== */
 console.log('--- #2 本地单候选：当前 → 成员名单 → 历史归属人 ---');
@@ -196,7 +204,57 @@ setTimeout(function () {
       ORDERS[2].openid === 'wx-def' && ORDERS[2].nickname === '小李',
       JSON.stringify({ openid: ORDERS[2].openid, nickname: ORDERS[2].nickname }));
 
-    console.log('\n' + (bad === 0 ? '✅ 全部通过' : '❌ ' + bad + ' 项失败'));
-    process.exit(bad === 0 ? 0 : 1);
+    /* ==================== #5 v7.20 外部监视单的用户 / 类型订正 ==================== */
+    console.log('--- #5 外部单：写 /api/local/external_prints/meta ---');
+    sandbox.__EXT = {
+      order_id: 'ext:4:2026-11-09 07:00:00', order_number: 'EXT-20261109-070000-4',
+      source: 'external', external: true, openid: 'local', owner_name: '甲成员',
+      is_admin_print: false, status: 'sent', total_price: 1.0, files_count: 1,
+      created_at: '2026-11-09 07:00:00', files: [],
+    };
+    // 不塞进 _cloudData.orders：外部单的 id 不是数字，renderCloud 会打「非法 ID 已忽略」；
+    // 这条路径本身只认传进来的订单对象（_applyExternalOrderMeta(o, …)）。
+    sandbox.__RESP = { success: true, owner_name: '乙成员' };
+    const _before5 = REQS.length;
+    run("_applyExternalOrderMeta(__EXT, '乙成员', null)");
+    setTimeout(function () {
+      const req5 = REQS.slice(_before5).filter(function (r) {
+        return r.url.indexOf('/external_prints/meta') >= 0; }).pop() || {};
+      let b5 = {};
+      try { b5 = JSON.parse(req5.body || '{}'); } catch (e) {}
+      chk('外部单改用户：POST /api/local/external_prints/meta（不是云端 order_user）',
+        req5.url === '/api/local/external_prints/meta', req5.url);
+      chk('body 带 raw ext: order_id 与 owner_name，且不带 openid/order_type',
+        b5.order_id === 'ext:4:2026-11-09 07:00:00' && b5.owner_name === '乙成员'
+        && !('openid' in b5) && !('order_type' in b5), req5.body);
+      chk('落地：订单 owner_name 与 manual_owner 一起更新',
+        sandbox.__EXT.owner_name === '乙成员' && sandbox.__EXT.manual_owner === '乙成员',
+        JSON.stringify({ o: sandbox.__EXT.owner_name, m: sandbox.__EXT.manual_owner }));
+
+      sandbox.__RESP = { success: true, order_type: 'self' };
+      const _before6 = REQS.length;
+      run("_applyExternalOrderMeta(__EXT, null, 'self')");
+      setTimeout(function () {
+        const req6 = REQS.slice(_before6).filter(function (r) {
+          return r.url.indexOf('/external_prints/meta') >= 0; }).pop() || {};
+        let b6 = {};
+        try { b6 = JSON.parse(req6.body || '{}'); } catch (e) {}
+        chk('外部单改类型：body 只带 order_type，不带 owner_name',
+          b6.order_type === 'self' && !('owner_name' in b6), req6.body);
+        chk('自打落地：is_admin_print=true、manual_type=self（收益口径立刻跟着变）',
+          sandbox.__EXT.is_admin_print === true && sandbox.__EXT.manual_type === 'self',
+          JSON.stringify({ a: sandbox.__EXT.is_admin_print, t: sandbox.__EXT.manual_type }));
+
+        sandbox.__RESP = { success: false, message: '账本写入失败' };
+        run("_applyExternalOrderMeta(__EXT, '甲成员', null)");
+        setTimeout(function () {
+          chk('接口失败时订单对象不被改动（不做假落地）',
+            sandbox.__EXT.owner_name === '乙成员', sandbox.__EXT.owner_name);
+
+          console.log('\n' + (bad === 0 ? '✅ 全部通过' : '❌ ' + bad + ' 项失败'));
+          process.exit(bad === 0 ? 0 : 1);
+        }, 20);
+      }, 20);
+    }, 20);
   }, 20);
 }, 20);

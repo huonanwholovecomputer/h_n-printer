@@ -274,10 +274,10 @@ chk("类型表头挂 _orderTypeLockHTML()（锁在表头，不是每行）",
 chk("类型锁按钮走**同一个** toggleOrderStatusLock（不另开一把锁/不另要一次密码）",
     re.search(r"function _orderTypeLockHTML\(\)[\s\S]{0,700}?onclick=\"event\.stopPropagation\(\);toggleOrderStatusLock\(\)\"",
               html) is not None)
-chk("类型可编辑判据与状态同源，但外部监视单仍不可改类型（_orderTypeEditable → 外部单 false，"
-    "其余委托 _orderStatusEditable）",
-    re.search(r"function _orderTypeEditable\(oidS\) \{\s*return _isExternalOrder\(oidS\) \? false : "
-              r"_orderStatusEditable\(oidS\);", html) is not None)
+chk("类型可编辑判据与状态同源（v7.20 起外部监视单也能改，写本地账本 manual_type）",
+    re.search(r"function _orderTypeEditable\(oidS\) \{\s*return _orderStatusEditable\(oidS\);",
+              html) is not None
+    and "return _applyExternalOrderMeta(o, null, type" in html)
 chk("前端只允许 receive/self（与后端 MANUAL_FIX_ORDER_TYPES 同源）",
     re.search(r"var ORDER_FIXABLE_TYPES = \['receive', 'self'\];", html) is not None
     and re.search(r'MANUAL_FIX_ORDER_TYPES = \("receive", "self"\)', app_src) is not None)
