@@ -213,9 +213,10 @@ check("存在「添加到新标签页」菜单项与复制实现",
 check("「打开文件位置」真的定位到文件（explorer /select，而不是只开目录）",
       'explorer /select,' in src and "def _reveal_in_explorer" in src
       and "_reveal_in_explorer(p)" in src)
-# 2026-11-02：云端订单可以在小程序/APP 勾「排除末尾空白页」⇒ 设备端多出第 2 条排除路径
-# （`_add_cloud_task_to_new_tab`），不是"偷偷排除"。这里钉死不变量：排除只发生在
-# 「操作员勾选」与「云端带开关」两个函数里，本地右键复制（`_add_rows_to_new_tab`）绝不掺和。
+# 排除末尾空白页的三条路：操作员勾选（`_set_blank_tail_excluded`）、云端顾客开关
+# （`_cloud_exclude_blank_tail`）、本地默认开启（`_auto_exclude_blank_tail`，2026-11-13）。
+# 这里钉死不变量：本地右键复制（`_add_rows_to_new_tab`）本身不直接调 `split_tail_blank`，
+# 它只是把行原样复制过去，随后由默认开关决定要不要排（见 §5 的行为断言）。
 _defs = [(m.start(), m.group(1)) for m in re.finditer(r"^    def (\w+)", src, re.M)]
 
 
@@ -230,9 +231,10 @@ def _owner(pos):
 
 
 _callers = {_owner(m.start()) for m in re.finditer(r"split_tail_blank\(", src)}
-check("复制路径没有偷偷调 split_tail_blank（排除只走「操作员勾选 / 云端带开关」两条路）",
+check("复制路径不直接调 split_tail_blank（排除只走「操作员勾选 / 云端开关 / 本地默认」三处）",
       "_add_rows_to_new_tab" not in _callers
-      and _callers <= {"_set_blank_tail_excluded", "_cloud_exclude_blank_tail"},
+      and _callers <= {"_set_blank_tail_excluded", "_cloud_exclude_blank_tail",
+                       "_auto_exclude_blank_tail"},
       f"实际所在函数={sorted(_callers)}")
 
 # ═══════════════ 1. 表格配置 ═══════════════
@@ -399,7 +401,9 @@ check("页数未知的 PDF：复制时补出真实页数（3 页）",
       str(win._config.tabs[new_key].jobs[0].page_count if new_key else None))
 
 # ── 末尾空白页检测结果必须跟着复制（2026-11-01 现场：复制到新标签页后 ⚠ 消失，
-#    但页码范围 1-5 照样留着 ⇒ 操作员以为"没空白页了"，末页空白被悄悄打出来）
+#    但页码范围 1-5 照样留着 ⇒ 操作员以为"没空白页了"，末页空白被悄悄打出来）。
+#    2026-11-13 起本地默认开启「排除末尾空白页」⇒ 副本按当前开关重排：没 optout 的
+#    真排掉（⚠已排），已排除的原样保留，手动恢复过（optout）的不再自动排。
 jobs = [
     PrintJob(file_path=PE, copies=1, duplex="off", page_count=3, page_range="",
              orientation="portrait", engine="word", display_name="示波器的使用.pdf",
@@ -412,27 +416,36 @@ jobs = [
     PrintJob(file_path=PE, copies=1, duplex="off", page_count=3, page_range="",
              orientation="portrait", engine="word", display_name="过期结果.pdf",
              blank_tail=0),                        # 源结果过期/记错 ⇒ 复制时必须重测纠正
+    PrintJob(file_path=PE, copies=1, duplex="off", page_count=3, page_range="",
+             orientation="portrait", engine="word", display_name="手动恢复过.pdf",
+             blank_tail=1, blank_tail_optout=True),   # 操作员否决过默认 ⇒ 复制也不排
 ]
 seed(jobs, frozen=True)
-select_rows([0, 1, 2])
-new_key = win._add_rows_to_new_tab([0, 1, 2])
+select_rows([0, 1, 2, 3])
+new_key = win._add_rows_to_new_tab([0, 1, 2, 3])
 app.processEvents()
 n_tab = win._config.tabs.get(new_key) if new_key else None
-check("空白页：3 个文件都复制过来", n_tab is not None and len(n_tab.jobs) == 3,
+check("空白页：4 个文件都复制过来", n_tab is not None and len(n_tab.jobs) == 4,
       str(len(n_tab.jobs) if n_tab else None))
-if n_tab and len(n_tab.jobs) == 3:
-    n0, n1, n2 = n_tab.jobs
+if n_tab and len(n_tab.jobs) == 4:
+    n0, n1, n2, n3 = n_tab.jobs
     p0 = win._table.item(0, win.COL_PAGES).text()
     p1 = win._table.item(1, win.COL_PAGES).text()
     p2 = win._table.item(2, win.COL_PAGES).text()
-    check("空白页：⚠ 跟着复制（未排除 ⇒ 仍显示 ⚠）",
-          n0.blank_tail == 1 and n0.blank_undo_range is None and "⚠" in p0
-          and "已排" not in p0, f"tail={n0.blank_tail} undo={n0.blank_undo_range!r} 格={p0!r}")
+    p3 = win._table.item(3, win.COL_PAGES).text()
+    check("空白页：未排除的副本按默认开启**真的排掉**（⚠已排 + 范围 1-2 + undo 空串）",
+          (n0.blank_tail, n0.page_range, n0.blank_undo_range) == (1, "1-2", "")
+          and "⚠已排" in p0, f"tail={n0.blank_tail} range={n0.page_range!r} "
+                             f"undo={n0.blank_undo_range!r} 格={p0!r}")
     check("空白页：已排除状态原样保留（范围 1-2 + undo 空串 + ⚠已排）",
           (n1.blank_tail, n1.page_range, n1.blank_undo_range) == (1, "1-2", "")
           and "⚠已排" in p1, f"格={p1!r}")
     check("空白页：源结果过期/记错时复制**重测**纠正（0 → 1）",
           n2.blank_tail == 1 and "⚠" in p2, f"tail={n2.blank_tail} 格={p2!r}")
+    check("空白页：手动恢复过（blank_tail_optout）的副本不再自动排（仍显示 ⚠）",
+          n3.blank_tail == 1 and n3.blank_undo_range is None and n3.page_range == ""
+          and "⚠" in p3 and "已排" not in p3,
+          f"tail={n3.blank_tail} undo={n3.blank_undo_range!r} 格={p3!r}")
     check("字体黄标跟着复制：非嵌入字体/已检查/指纹",
           (n0.missing_fonts, n0.nonembedded_fonts, n0.font_checked, n0.font_fp)
           == (["宋体"], ["宋体"], True, "fp-1"),

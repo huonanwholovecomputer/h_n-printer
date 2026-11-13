@@ -227,6 +227,11 @@ class PrintJob:
     # 已排除末尾空白页时 = 排除**前**的 page_range（"" = 当时是"全部"）；None = 没排除。
     # 有它才谈得上"恢复"，也让界面能区分"检测到空白"与"已经排掉了"。
     blank_undo_range: str | None = None
+    # 操作员**手动取消**过默认排除（「↩ 恢复末尾空白页」）⇒ True。
+    # 「默认排除末尾空白页」默认开启（2026-11-13），自动排除会落在加文件 / 转换完成 /
+    # 缓存命中三个入口；操作员的否决必须留住，否则重转一次又把末尾空白排掉了。
+    # 重新勾上「排除末尾空白页（N 页）」会清回 False。持久化：重启后仍尊重这个否决。
+    blank_tail_optout: bool = False
     # ── 封面单独打印（2026-11-02 用户需求）──
     # 「哪些页单面打、其余双面打」：simplex_enabled = 复选框勾没勾（UI 状态，勾了但没填
     # 就等于没勾），simplex_pages = 要单面打的页（走与 page_range 同一套解析器，
@@ -294,6 +299,7 @@ class PrintJob:
             "uploader_is_admin": self.uploader_is_admin,
             "blank_tail": self.blank_tail,
             "blank_undo_range": self.blank_undo_range,
+            "blank_tail_optout": bool(self.blank_tail_optout),
             "simplex_enabled": self.simplex_enabled,
             "simplex_pages": self.simplex_pages,
             "blank_tail_exclude": bool(self.blank_tail_exclude),
@@ -333,6 +339,7 @@ class PrintJob:
             blank_tail=_num_or_default(data.get("blank_tail"), 0, int),
             blank_undo_range=(data.get("blank_undo_range")
                               if isinstance(data.get("blank_undo_range"), str) else None),
+            blank_tail_optout=bool(data.get("blank_tail_optout", False)),
             simplex_enabled=bool(data.get("simplex_enabled", False)),
             simplex_pages=str(data.get("simplex_pages", "") or ""),
             blank_tail_exclude=bool(data.get("blank_tail_exclude", False)),
@@ -705,17 +712,20 @@ def _dict_or_default(value, default: dict):
     return default
 
 
-# ── 默认任务参数（2026-11 用户需求 #11b / #10）───────────────────────────────
-# 「选项 → 默认任务参数…」里配的这一份是**跨文件类型**的默认值：
-#   · `PrinterConfig.paper_size` 由打印管线直接吃（PrintWorker → pdf_printer.print_pdf /
-#     print_plan_pass 的 `paper=`），Word / PDF / 图片全部走同一条路；
+# ── 默认任务参数（2026-11 用户需求 #11b / #10；2026-11-13 收窄生效范围）──────
+# 「选项 → 默认任务参数…」里配的这一份是**表格与图片**的默认值（Word/PDF 不吃）：
+#   · `PrinterConfig.paper_size` 只在**表格 / 图片**出纸时交给打印管线
+#     （PrintWorker → pdf_printer.print_pdf / print_plan_pass 的 `paper=`）；
+#     Word / PDF 有自己的页面设置（纸张/方向/页边距都写在文档里），一律走驱动默认纸
+#     （paper=""），不让这里的 A4 去压它们的版面。
 #   · `PrinterConfig.default_task_options` 里的版式项（页边距/缩放/打印范围/方向/居中）
 #     供 xlsx 面板与转换引擎用；Excel 之外的文件类型不认这些项（Word/PDF 保持原排版）。
 # 语义约定（**改这里之前先想清楚**）：
 #   · `default_task_options` 为空 = 用户从未配置过 ⇒ 引擎侧维持旧行为
 #     （xlsx 不传 print_options、"未修改时行为与现在完全一致"）；
 #   · 只要它非空，就按**整份归一后的默认值**用（缺项补内置默认，不半份生效）；
-#   · paper 是唯一的例外：它有自己的标量字段 project 级别常驻，默认 A4。
+#   · paper 是唯一的例外：它有自己的标量字段 project 级别常驻，默认 A4；
+#     是否真的套用由 `effective_paper()` 按文件类型判定（见下）。
 DEFAULT_PAPER_SIZE = "A4"
 PAPER_SIZES = ("A4", "A3", "A5", "Letter", "Legal", "B5")
 
@@ -732,6 +742,35 @@ def normalize_paper_size(value) -> str:
         if raw.lower() == name.lower():
             return name
     return DEFAULT_PAPER_SIZE
+
+
+# ── 「页面设置」只对哪些文件生效（2026-11-13 用户口径）───────────────────────
+# 「默认任务参数 → 页面」里的纸张/方向/页边距是**转换页设置**：表格由引擎按它排版，
+# 图片由工具自己缩放居中；Word / PDF 的纸张、方向、页边距都写在文档里，再拿工具里的
+# A4 去覆盖只会让版面变形 —— 这两类一律用文档自带的页面设置（出纸时 paper=""）。
+PAGE_SETUP_EXTS = (
+    ".xls", ".xlsx",                                                    # 表格（xlsx print_options）
+    ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff",  # 图片
+)
+
+
+def page_setup_applies(file_path) -> bool:
+    """这份文件是否吃「页面设置」（表格 / 图片 ⇒ True；Word/PDF 等 ⇒ False）。"""
+    return str(file_path or "").strip().lower().endswith(PAGE_SETUP_EXTS)
+
+
+def effective_paper(paper, file_paths) -> str:
+    """这批文件出纸时该用的纸张大小；只要有一个成员不吃页面设置就返回 ""（驱动默认纸）。
+
+    为什么整批判而不是逐文件判：合并作业 / 手动双面一趟 / 攒批一叠在物理上都是**一个
+    PDF 一个 DEVMODE**，不可能一批纸里一半 A4 一半 A3。只要它不是"纯表格/图片"的批次，
+    就用驱动默认纸（= Word/PDF 自己的页面设置说了算），绝不能让 A4 去压它们的版面。
+    """
+    paths = [str(p or "") for p in (file_paths or [])]
+    if not paths or not all(page_setup_applies(p) for p in paths):
+        return ""
+    raw = str(paper or "").strip()
+    return normalize_paper_size(raw) if raw else ""
 
 
 # 内置默认（用户没配过时的显示值与 xlsx 默认值来源）：
@@ -762,7 +801,10 @@ DEFAULT_TASK_OPTIONS: dict = {
     "worksheet": "",
     "dpi": 0,                       # 0 = 跟随全局（render_dpi）
     "image_orientation": "auto",    # "auto" | "landscape" | "portrait"
-    "blank_tail": False,            # 排除末尾空白页
+    # 排除末尾空白页：**默认开启**（2026-11-13 用户口径，与移动端 excludeBlankTail 一致）。
+    # 加文件/转换完成/缓存命中时由 gui._auto_exclude_blank_tail 真正排掉（落到 page_range）；
+    # 操作员手动「↩ 恢复」后 job.blank_tail_optout=True，不再按默认自动重排。
+    "blank_tail": True,
     "simplex_enabled": False,       # 封面单独打印
     "simplex_pages": "",            # 封面单独打印的页（"1" / "1,16-23"）
 }
@@ -1533,9 +1575,11 @@ class PrinterConfig:
     # 勾上后本地工具订阅本机 spooler 作业事件，把"绕过本工具"的打印记进 external_prints.json。
     # 默认 False：老配置文件没有这个键 ⇒ 保持关，且不影响其他默认值。
     external_watch_enabled: bool = False
-    # ---- 纸张大小（2026-11 用户需求 #11c：**跨文件类型**的全局默认）----
-    # 打印管线直接吃它：PrintWorker → pdf_printer.print_pdf / print_plan_pass 的 paper=，
-    # 所以 Word / PDF / 图片 全部按同一个纸张出纸；xlsx 的 print_options["paper"] 同源。
+    # ---- 纸张大小（2026-11 用户需求 #11c；2026-11-13 收窄为**仅表格 / 图片**）----
+    # 打印时经 `effective_paper()` 判定：整批都是表格/图片才把它交给打印管线
+    # （PrintWorker → pdf_printer.print_pdf / print_plan_pass 的 paper=）；
+    # Word / PDF 用自己的页面设置，一律出驱动默认纸（paper=""）。xlsx 的
+    # print_options["paper"] 仍与它同源。
     # 旧配置没有这个键 ⇒ 回落 A4（与改动前"打印机默认纸"在标准 A4 机上是同一结果，
     # 且显式 A4 比空串更可预期：驱动默认纸被改成 A3 时不会静默放大）。
     paper_size: str = DEFAULT_PAPER_SIZE

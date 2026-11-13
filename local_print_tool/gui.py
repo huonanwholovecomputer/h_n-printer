@@ -95,7 +95,8 @@ from printer_config import PrinterConfig, PrintJob, TabSettings, calc_cost, _cou
 from printer_config import (DEFAULT_TASK_OPTIONS, DEFAULT_PAPER_SIZE, PAPER_SIZES, XLSX_OPTION_KEYS,
                             normalize_paper_size, normalize_task_options,
                             resolve_task_options, resolve_xlsx_print_options,
-                            task_options_to_print_options)
+                            task_options_to_print_options,
+                            PAGE_SETUP_EXTS, page_setup_applies, effective_paper)
 from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
@@ -3060,22 +3061,24 @@ def _index_of(values, value, default: int = 0) -> int:
 
 
 class DefaultTaskOptionsDialog(QDialog):
-    """选项 → 默认任务参数…：**跨文件类型**的全局打印默认值（2026-11-03 用户需求 #11b）。
+    """选项 → 默认任务参数…：表格与图片的全局打印默认值（2026-11-03 用户需求 #11b）。
 
     这一窗口配的是"所有任务的默认值"，不是某一个任务的参数：
 
       · 打印方式：单/双面、双面模式 —— 与任务面板同口径（单页硬闸门仍然优先，
         真正生效值由 `_effective_duplex()` 判，这里只是默认请求值）；
-      · 页面：纸张大小（A4/A3/A5/Letter/Legal/B5，**对 Word/PDF/图片/表格全部生效**）、
-        方向、四边页边距、页眉页脚、水平/垂直居中；
+      · 页面：纸张大小（A4/A3/A5/Letter/Legal/B5）、方向、四边页边距、页眉页脚、
+        水平/垂直居中 —— **只对表格与图片生效**（2026-11-13 用户口径）：表格由引擎按它
+        排版，图片由工具缩放居中；Word/PDF 的纸张/方向/页边距写在文档里，用文档自己的；
       · 缩放与打印范围：无缩放 / 将工作表调整为一页 / 所有列一页 / 所有行一页 + 自定义
         百分比，活动工作表 / 整个工作簿 / 忽略打印区域；
-      · 其它：DPI、图片方向、排除末尾空白页、封面单独打印。
+      · 其它：DPI、图片方向、排除末尾空白页（默认开启，与移动端一致）、封面单独打印。
 
     语义（**别改**）：用户从没打开过这个窗口并保存 ⇒ `PrinterConfig.default_task_options`
     保持空 dict ⇒ xlsx 引擎拿到 print_options=None ⇒ 版式与改动前逐像素一致。点过一次
     「保存」之后才整份接管（缺项按内置默认补齐）。纸张大小是例外：它有自己的标量字段
-    `paper_size`，任何时候都参与打印（默认 A4 = 旧行为）。
+    `paper_size`，常驻并默认 A4；是否真的套到打印上由 `effective_paper()` 按文件类型
+    判定（表格/图片才套，Word/PDF 走文档自带的页面设置）。
     """
 
     def __init__(self, parent=None, options=None, paper_size: str = "",
@@ -3089,8 +3092,9 @@ class DefaultTaskOptionsDialog(QDialog):
             opts["paper"] = normalize_paper_size(paper_size)
         lay = QVBoxLayout(self)
 
-        head = QLabel("这里是所有文件类型的默认打印参数：没有单独改过的任务都按这一份打印。"
-                      "全部保持默认值时，打印结果与此前完全一致。")
+        head = QLabel("这里是任务的默认打印参数：没有单独改过的任务都按这一份打印。"
+                      "页面设置（纸张/方向/页边距）只对表格与图片生效，"
+                      "Word/PDF 用文档自带的页面设置。")
         head.setWordWrap(True)
         head.setStyleSheet("font-size: 11px; color: #7f8c8d;")
         lay.addWidget(head)
@@ -3111,18 +3115,19 @@ class DefaultTaskOptionsDialog(QDialog):
         lay.addWidget(g1)
 
         # ── ② 页面 ──
-        g2 = QGroupBox("页面（纸张大小对所有文件类型生效）")
+        g2 = QGroupBox("页面（仅对表格与图片生效）")
         f2 = QFormLayout(g2)
         self._paper = _combo(PAPER_SIZES)
         _disable_combo_wheel(self._paper)
         self._paper.setCurrentIndex(_index_of(PAPER_SIZES, opts["paper"]))
-        self._paper.setToolTip("Word / PDF / 图片 / 表格统一用这个纸张大小；"
-                               "打印驱动不支持时只告警，不阻断出纸")
+        self._paper.setToolTip("表格与图片按这个纸张出纸；Word/PDF 用文档自带的页面设置，"
+                               "不受这一项影响。打印驱动不支持时只告警，不阻断出纸")
         f2.addRow("纸张大小：", self._paper)
         self._orientation = _combo(ORIENTATION_LABELS)
         _disable_combo_wheel(self._orientation)
         self._orientation.setCurrentIndex(_index_of(ORIENTATION_VALUES, opts["orientation"]))
-        self._orientation.setToolTip("纸张方向；图片任务仍可在任务参数里单独指定方向")
+        self._orientation.setToolTip("表格与图片的纸张方向；Word/PDF 用文档自带方向，"
+                                     "图片任务仍可在任务参数里单独指定方向")
         f2.addRow("纸张方向：", self._orientation)
 
         self._margin_spins: dict = {}
@@ -3136,7 +3141,8 @@ class DefaultTaskOptionsDialog(QDialog):
             sp.setSingleStep(0.1)
             sp.setSuffix(" cm")
             sp.setValue(float(opts[key]))
-            sp.setToolTip("表格版式的页边距；Word/PDF 的排版由文档自己决定，不受这一项影响")
+            sp.setToolTip("表格版式的页边距；图片固定 10mm 居中，"
+                          "Word/PDF 的排版由文档自己决定，都不受这一项影响")
             # 纯输入框：去掉上下箭头（与右侧「任务参数」面板同一口径，2026-11-03）
             _hide_spin_buttons(sp)
             self._margin_spins[key] = sp
@@ -3212,6 +3218,8 @@ class DefaultTaskOptionsDialog(QDialog):
         f4.addRow("图片方向：", self._image_orientation)
         self._blank_tail = ThemedCheckBox("默认排除末尾空白页", theme_manager=theme_manager)
         self._blank_tail.setChecked(bool(opts["blank_tail"]))
+        self._blank_tail.setToolTip("勾上后，加文件 / 转换完成时自动排掉末尾连续空白页，"
+                                    "页数与费用一并重算；手动取消过的那一单不会再被自动排除")
         f4.addRow("", self._blank_tail)
         self._simplex = ThemedCheckBox("默认封面单独打印", theme_manager=theme_manager)
         self._simplex.setChecked(bool(opts["simplex_enabled"]))
@@ -3540,6 +3548,17 @@ class PrintWorker(QThread):
         # 本批落进补救台账的记录（dict）—— `_print_manual_batch` 在"跳过/超时/第 2 趟失败"
         # 时写入，run() 据此发 `job_stalled` 而不是 `job_finished(False)`。每批开始清空。
         self._stalled_record = None
+
+    def _paper_for(self, jobs) -> str:
+        """这批 job 出纸时该用的纸张；只要有一个成员不吃页面设置就返回 ""（驱动默认纸）。
+
+        「默认任务参数 → 页面」的纸张只对**表格与图片**生效（2026-11-13 用户口径）；
+        Word/PDF 有文档自带的页面设置，不能让全局 A4 去压它们的版面。合并作业 / 手动
+        双面一趟 / 攒批一叠物理上都只有一个 DEVMODE，所以按**整批**判：混合批次走驱动
+        默认纸。封面页不走这里（那是工具自绘的 A4 页，仍用全局纸）。
+        """
+        paths = [getattr(j, "file_path", "") or "" for j in (jobs or []) if j is not None]
+        return effective_paper(self._paper, paths)
 
     # 翻纸提示的超时（秒）：主线程的弹窗自带倒计时，这里只多留一点余量兜底，
     # 保证 GUI 万一没响应时 worker 也不会永久挂住。
@@ -3939,7 +3958,8 @@ class PrintWorker(QThread):
                 stage=duplex_remedy.STAGE_PASS2_PARTIAL,
                 reason="合并作业打了一部分后失败：" + str(reason)[:300],
                 printer=self._printer_name,
-                paper=self._paper,
+                paper=self._paper_for([r.get("job") for r in group
+                                       if r.get("idx") in merged_ids]),
                 dpi=self._render_dpi,
                 items=items,
                 pdf=pdf_copy,
@@ -4068,7 +4088,7 @@ class PrintWorker(QThread):
                 progress_callback=self._group_progress_callback(
                     task_ref, base_offset, total_sides + extra_sides),
                 dpi=int(group[0]["dpi"] or 0),
-                paper=self._paper,
+                paper=self._paper_for([r.get("job") for r in mergeable]),
             )
             if ok:
                 self.log_message.emit(f"  ✓ {msg}")
@@ -4224,7 +4244,7 @@ class PrintWorker(QThread):
             orientation=orientation,
             progress_callback=job_progress,
             dpi=dpi,
-            paper=self._paper,
+            paper=self._paper_for([job]),
         )
 
     def _rotate_for_job(self, job: PrintJob) -> bool:
@@ -4524,6 +4544,9 @@ class PrintWorker(QThread):
         # 本批的翻纸回执从头清空：这样"第 1 趟还在打时操作员就点了跳过"的预置答案能生效
         self._flip_continue = False
         self._flip_event.clear()
+        # 本批只有一个 DEVMODE：整批都是表格/图片才套用全局纸张，混合批次走驱动默认纸
+        # （Word/PDF 用自己的页面设置，见 `_paper_for`）。第 1/2 趟与半成品台账同源。
+        _batch_paper = self._paper_for([it[1] for it in items])
         merged = os.path.join(tempfile.gettempdir(),
                               f"hn_duplex_batch_{os.getpid()}_{int(time.time() * 1000)}.pdf")
         try:
@@ -4596,7 +4619,7 @@ class PrintWorker(QThread):
                     pdf_copy = duplex_remedy.keep_pdf(merged, rid)
                     rec = duplex_remedy.make_record(
                         stage=stage, reason=reason, printer=self._printer_name,
-                        paper=self._paper, dpi=self._render_dpi,
+                        paper=_batch_paper, dpi=self._render_dpi,
                         rotate_mode=(duplex_remedy.ROTATE_FIXED if rotate is not None
                                      else duplex_remedy.ROTATE_PER_FILE),
                         rotate=bool(rotate), first=p.first,
@@ -4705,7 +4728,7 @@ class PrintWorker(QThread):
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset, map1),
                                         landscape_fill=bool(getattr(p, "landscape_fill", True)),
-                                        paper=self._paper)
+                                        paper=_batch_paper)
             if not ok1:
                 # 🔴-B5（2026-11-10 体检）：第 1 趟**失败**时也要推台账 —— 驱动可能已经
                 # 送出/弹出前几页（一部分纸在槽里、一部分没出），而这一支原来直接 return，
@@ -4811,7 +4834,7 @@ class PrintWorker(QThread):
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset + n1, map2),
                                         landscape_fill=bool(getattr(p, "landscape_fill", True)),
-                                        paper=self._paper)
+                                        paper=_batch_paper)
             if not ok2:
                 _rec = _keep_stall(f"第 2 趟失败: {msg2}",
                                    duplex_remedy.STAGE_PASS2_PARTIAL)
@@ -4952,6 +4975,8 @@ class PrintWorker(QThread):
 
             # **打印前**先把这一单报给主线程落进纸叠清单并写盘 —— 这样进程被杀/崩溃重启后，
             # 才知道出纸槽里那叠纸是由哪几单拼成的、第 2 趟该怎么打。
+            # 纸张按本单成员判（整叠第 2 趟只有一个 DEVMODE，主线程会取"各单一致才用"）。
+            _stack_paper = self._paper_for([it[1] for it in items])
             meta = self._stack_entry_meta(items)
             self.stack_entry_planned.emit({
                 "seq": self._stack_seq,
@@ -4964,6 +4989,7 @@ class PrintWorker(QThread):
                 # 本单打印时用的 first 约定（账本拿去判"这一份第 2 趟有没有内容"）
                 "first": p.first,
                 "rotate": bool(self._stack_rotate),
+                "paper": _stack_paper,
                 "items": meta,
                 "state": duplex_stack.STATE_PRINTING,
             })
@@ -4981,7 +5007,7 @@ class PrintWorker(QThread):
                                         second_rotate_180=self._stack_rotate,
                                         progress_callback=_cb(base_offset, map1),
                                         landscape_fill=bool(getattr(p, "landscape_fill", True)),
-                                        paper=self._paper)
+                                        paper=_stack_paper)
             if self._cancelled:
                 self.stack_entry_done.emit(self._stack_seq, False, "已取消", n1)
                 return False, "已取消", n1
@@ -11213,6 +11239,9 @@ class MainWindow(QMainWindow):
                     continue
                 job.blank_undo_range = getattr(job, "page_range", "") or ""
                 job.page_range = new_range
+                # 操作员显式要排 ⇒ 之前的手动否决作废（重新转换时按默认自动排），
+                # 免得"恢复过一次"永久焊死默认开关。
+                job.blank_tail_optout = False
             else:
                 if getattr(job, "blank_undo_range", None) is None:
                     continue
@@ -11221,6 +11250,9 @@ class MainWindow(QMainWindow):
                 # 人工恢复 = 否决顾客的「排除末尾空白页」：清掉请求位，否则换引擎重转
                 # 又会被 `_apply_cloud_file_options` 自动排一次，操作员改了等于白改。
                 job.blank_tail_exclude = False
+                # 同时也是否决了「默认排除末尾空白页」（2026-11-13 默认开启）：
+                # 记下来，之后转换完成/缓存命中都不再自动排（_auto_exclude_blank_tail）。
+                job.blank_tail_optout = True
             touched.append(r)
 
         if not touched:
@@ -11247,6 +11279,53 @@ class MainWindow(QMainWindow):
         if self._set_blank_tail_excluded(rows, bool(checked)) == 0:
             # 一个都没改（选区里没有可排的空白页 / 已经排过 / 标签页冻结）⇒ 勾选态回滚到事实
             self._on_table_selection()
+
+    def _auto_exclude_blank_tail(self, job) -> int:
+        """按「默认排除末尾空白页」把一份**本地**文件真正排掉末尾空白页，返回排掉页数。
+
+        三个入口调它：加文件（PDF 当场知道页数）、转换完成（Office 到这里才有真实 PDF）、
+        缓存命中（同样是有 PDF 的入口）。云端单不在这里处理 —— 顾客的请求位由
+        `_apply_cloud_file_options` 落地；两者互不覆盖（云端只看 blank_tail_exclude）。
+
+        为什么不再像旧代码那样只写 `blank_tail=1`：那会把"检测到的空白页数"伪造成 1，
+        既不真排除，又让行内「排除末尾空白页（1 页）」可点 ⇒ 误删真实末页。排除必须落到
+        page_range（有效页数/计费/单页闸门的唯一口径），检测结果仍留在 blank_tail 里显示。
+
+        操作员手动「↩ 恢复」过的单（blank_tail_optout=True）绝不再自动排 —— 否则重转一次
+        又把末尾空白页排掉，操作员的否决等于白做。
+        """
+        if job is None:
+            return 0
+        if int(getattr(job, "task_id", 0) or 0) > 0:
+            return 0                       # 云端单：顾客请求位负责，别抢
+        if int(getattr(job, "page_count", 0) or 0) <= 0:
+            return 0
+        if bool(getattr(job, "blank_tail_optout", False)):
+            return 0
+        if getattr(job, "blank_undo_range", None) is not None:
+            return 0
+        try:
+            enabled = bool(self._config.task_options().get("blank_tail"))
+        except Exception:
+            logger.debug("读取默认任务参数失败（跳过自动排除空白页）", exc_info=True)
+            return 0
+        if not enabled:
+            return 0
+        total = int(getattr(job, "page_count", 0) or 0)
+        tail = int(getattr(job, "blank_tail", 0) or 0)
+        if total <= 1 or tail <= 0:
+            return 0
+        orig = getattr(job, "page_range", "") or ""
+        new_range, cut = split_tail_blank(orig, total, tail)
+        if cut <= 0:
+            return 0
+        job.blank_undo_range = orig
+        job.page_range = new_range
+        _name = (getattr(job, "display_name", "")
+                 or os.path.basename(getattr(job, "file_path", "") or ""))
+        self._log(f"✂ 已按默认排除末尾 {cut} 页空白页：{_name}"
+                  f"（{orig or '全部'} → {new_range or '全部'}）")
+        return cut
 
     @staticmethod
     def _pages_effective(job) -> tuple:
@@ -13141,6 +13220,7 @@ class MainWindow(QMainWindow):
                        if isinstance(r, int) and 0 <= r < len(jobs)})
         opened = 0
         missing: list[str] = []
+        queued: list[str] = []
         seen_paths: set[str] = set()
         for row in rows:
             job = jobs[row]
@@ -13302,6 +13382,8 @@ class MainWindow(QMainWindow):
                 # 照抄 —— 于是末尾空白页会被**悄悄打出来**，操作员完全看不出来。
                 blank_tail=int(getattr(job, 'blank_tail', 0) or 0),
                 blank_undo_range=getattr(job, 'blank_undo_range', None),
+                # 人工否决「默认排除末尾空白页」也照抄 —— 否则复制一页就把它又排上了
+                blank_tail_optout=bool(getattr(job, 'blank_tail_optout', False)),
                 missing_fonts=list(getattr(job, 'missing_fonts', []) or []),
                 nonembedded_fonts=list(getattr(job, 'nonembedded_fonts', []) or []),
                 font_checked=bool(getattr(job, 'font_checked', False)),
@@ -13336,8 +13418,9 @@ class MainWindow(QMainWindow):
         # 2026-11-01 现场 bug 的第二半：新标签页只要没跑检测就必然没有 ⚠。
         # 重测而不是纯照抄，是因为旧标签页可能是修复前建的（blank_tail 记错了），
         # 而 one-page 栅格化最多 8 页、几毫秒的事，宁可以这次的结果为准。
-        # ⚠ 只写 blank_tail（文件事实），**不**在这里调 split_tail_blank —— 排除是操作员的
-        # 动作（唯一入口 _set_blank_tail_excluded），自动路径只标不排（见验收 ⑥）。
+        # ⚠ 只写 blank_tail（文件事实）；真正的排除统一由 `_auto_exclude_blank_tail`
+        # 按当前的「默认排除末尾空白页」开关落地（2026-11-13，默认开启）；
+        # 操作员手动恢复过的单会带 blank_tail_optout，复制后也不会被重排。
         for job in new_jobs:
             path = getattr(job, 'file_path', '') or ''
             if not path or os.path.splitext(path)[1].lower() != ".pdf":
@@ -13353,6 +13436,9 @@ class MainWindow(QMainWindow):
             if job.blank_tail <= 0:
                 # 没检出空白页 ⇒ 没有"已排除"可言（别留一个点了没反应的恢复态）
                 job.blank_undo_range = None
+            # 默认开启时复制出来的新单也要真排（2026-11-13）；已排过的/人工否决过的
+            # 由 _auto_exclude_blank_tail 自己跳过，不会重复裁。
+            self._auto_exclude_blank_tail(job)
 
         new_key = self._next_tab_key()
         new_tab = self._make_new_tab()
@@ -14722,6 +14808,9 @@ class MainWindow(QMainWindow):
                         jobs[match_row].blank_undo_range = None
                         self._log(f"↩ 页数变化（{_old_pages}→{page_count}）："
                                   f"已还原末尾空白页的排除，请重新确认")
+                    # 本地默认「排除末尾空白页」（2026-11-13 默认开启）：缓存命中同样是
+                    # "真实 PDF 到手"的入口，不能只在 _on_convert_finished 里排一次。
+                    self._auto_exclude_blank_tail(jobs[match_row])
                     self._save_config()
                     # 仅当目标标签页是当前前台标签页时更新表格（后台标签页表格不可见）
                     if not tab_key or tab_key == self._current_tab:
@@ -16134,7 +16223,9 @@ class MainWindow(QMainWindow):
         worker = DuplexRemedyWorker(
             rec, mode=mode,
             printer_name=(self._config.printer_name or ""),
-            paper=(self._config.paper_size or ""),
+            # 纸张以记录里那一批的 effective paper 为准（表格/图片才有纸，Word/PDF 为空 ⇒
+            # 驱动默认纸）。这里不再用全局 paper_size，否则补救一趟又会把 A4 压给 Word/PDF。
+            paper="",
             dpi=int(self._config.render_dpi or 0),
             parent=self)
         worker.progress.connect(self._on_progress)
@@ -16482,11 +16573,12 @@ class MainWindow(QMainWindow):
             logger.debug(f"双面能力提示失败（忽略）: {e}")
 
     def _on_default_task_options(self):
-        """选项 → 默认任务参数…：改跨文件类型的全局打印默认值（纸张/页边距/缩放/范围…）。
+        """选项 → 默认任务参数…：改表格与图片的全局打印默认值（纸张/页边距/缩放/范围…）。
 
         两件事分开存、各自独立生效（见 printer_config 的 DEFAULT_TASK_OPTIONS 注释）：
-          · `paper_size`：标量，打印管线直接吃（PrintWorker → print_pdf/print_plan_pass 的
-            paper=），默认 A4 = 旧行为；
+          · `paper_size`：标量，打印时经 `effective_paper()` 只套给**表格/图片**批次
+            （PrintWorker → print_pdf/print_plan_pass 的 paper=）；Word/PDF 一律 paper=""
+            用文档自带的页面设置。默认 A4；
           · `default_task_options`：版式项，给 xlsx 引擎的 print_options，也是新增文件的初值
             （DPI / 图片方向 / 排除末尾空白页 / 封面单独打印）；**空 = 从未配置**，
             引擎走旧行为（不传 print_options、新任务字段仍按原逻辑推导），
@@ -17915,6 +18007,7 @@ class MainWindow(QMainWindow):
             rotate=bool(payload.get("rotate", True)),
             created_at=duplex_stack.now_text(),
             pdf=payload.get("pdf", ""),
+            paper=str(payload.get("paper") or ""),
             first=str(payload.get("first") or duplex_stack.manual_duplex.FIRST_ODD),
             file_plans=list(payload.get("file_plans") or []),
             pass1_pages=list(payload.get("pass1_pages") or []),
@@ -18625,13 +18718,22 @@ class MainWindow(QMainWindow):
         # 冻结本次要收尾的整叠：第 2 趟期间即使有别的 entry 混进 _stack.entries，
         # 也不会被 _on_stack_flush_done 当成成品一起收尾（半成品当成品 = 白收钱 + 账目错）
         self._stack_flush_snapshot = list(self._stack.entries)
+        # 整叠第 2 趟物理上只有一个 DEVMODE：各单第 1 趟的纸张**全部一致**才沿用它，
+        # 混合/未知一律走驱动默认纸（各单的 paper 由 `_print_stack_pass1` 按
+        # "整单是否全是表格/图片"写进清单，见 `PrintWorker._paper_for`）。
+        _papers = {str(getattr(e, "paper", "") or "") for e in self._stack.entries}
+        _mixed_papers = len(_papers) > 1
+        _flush_paper = _papers.pop() if len(_papers) == 1 else ""
+        if _mixed_papers:
+            self._log("⚠ 整叠各单第 1 趟的纸张不一致（表格/图片与 Word/PDF 混排）"
+                      " —— 第 2 趟按驱动默认纸打印，请确认纸盒里是同一规格的纸")
         w = DuplexFlushWorker(self._stack, bdir, self._config.printer_name,
                               dpi=self._config.render_dpi)
-        # 纸张大小（跨文件类型全局默认，2026-11 #11c）：用属性赋值而不是构造关键字，
-        # 因为验收脚本里的 DuplexFlushWorker 桩只认 (stack, batch_dir, printer_name, dpi)；
-        # 真实类在 __init__ 里总会建好 self._paper（默认 "" = 沿用打印机默认纸）。
+        # 纸张大小用属性赋值而不是构造关键字，因为验收脚本里的 DuplexFlushWorker 桩
+        # 只认 (stack, batch_dir, printer_name, dpi)；真实类在 __init__ 里总会建好
+        # self._paper（默认 "" = 沿用打印机默认纸）。
         if hasattr(w, "_paper"):
-            w._paper = self._config.paper_size
+            w._paper = _flush_paper
         w.progress.connect(self._on_progress)
         w.log_message.connect(self._log)
         w.done.connect(self._on_stack_flush_done)
@@ -18701,11 +18803,13 @@ class MainWindow(QMainWindow):
                     _it = dict(_t)
                     _it.setdefault("tab_key", str(getattr(_e, "tab_key", "") or ""))
                     items.append(_it)
+            _papers = {str(getattr(_e, "paper", "") or "") for _e in entries}
             rec = duplex_remedy.make_record(
                 stage=duplex_remedy.STAGE_PASS1_DONE,
                 reason=reason,
                 printer=self._config.printer_name,
-                paper=self._config.paper_size,
+                # 补救要按"原样"补第 2 趟：各单纸张一致才沿用，混合走驱动默认纸
+                paper=(_papers.pop() if len(_papers) == 1 else ""),
                 rotate_mode=(duplex_remedy.ROTATE_PER_FILE if self._stack.rotate is None
                              else duplex_remedy.ROTATE_FIXED),
                 rotate=bool(self._stack.rotate),
@@ -21873,7 +21977,10 @@ class MainWindow(QMainWindow):
                         if _n else
                         "打印过程中选择「取消打印并退出」（可能已有纸出来）"),
                 printer=self._config.printer_name,
-                paper=self._config.paper_size,
+                # 这批可能混合文件类型：整批判，只有全是表格/图片才沿用全局纸张
+                paper=effective_paper(
+                    self._config.paper_size,
+                    [str(getattr(_j, "file_path", "") or "") for _j in (jobs or [])]),
                 dpi=int(self._config.render_dpi or 0),
                 tray_foreign=_n,
                 items=items,
@@ -22273,17 +22380,17 @@ class MainWindow(QMainWindow):
         jobs[target_row].page_count = page_count
         jobs[target_row].orientation = orientation
         # 末尾空白页检测：只在**真实 PDF 到手**之后才谈得上（.doc/.docx 的页是转换出来的）。
-        # 这里只标不排；排除动作有两个入口：操作员勾选（_set_blank_tail_excluded）与
-        # 云端顾客的要求（下面紧接着的 _apply_cloud_file_options，2026-11-09）。
+        # 这里只标；排除动作有三个入口：本地默认开关（下面的 _auto_exclude_blank_tail）、
+        # 云端顾客的要求（紧接着的 _apply_cloud_file_options）、操作员勾选。
         jobs[target_row].blank_tail = self._detect_blank_tail(cached_pdf)
         # 换引擎重转 ⇒ 页数可能变。旧的"排除范围"是按旧页数算出来的，对不上就是错页，
-        # 所以先还原成排除前的范围再按新页数重标（宁可让操作员再勾一次）。
+        # 所以先还原成排除前的范围再按新页数重标（默认开启时随后会自动重排）。
         if (jobs[target_row].blank_undo_range is not None
                 and int(page_count or 0) != _old_page_count):
             jobs[target_row].page_range = jobs[target_row].blank_undo_range or ""
             jobs[target_row].blank_undo_range = None
             self._log(f"↩ 页数变化（{_old_page_count}→{page_count}）："
-                      f"已还原末尾空白页的排除，请重新确认")
+                      f"已还原末尾空白页的排除，按当前开关重排")
 
         # ── 顾客勾的每文件开关：Word 文件到这里才第一次有 PDF ──
         # 落地时 page_count/blank_tail 都是 0 ⇒ 「排除末尾空白页」与「封面单独打印」当场
@@ -22292,6 +22399,12 @@ class MainWindow(QMainWindow):
         if not self._apply_cloud_file_options(jobs[target_row]):
             # 顾客填的封面页校验不合格 ⇒ 已打回并撤下该文件，这一行不用再更新
             return
+
+        # ── 本地默认「排除末尾空白页」（2026-11-13 默认开启）──
+        # 云端单的排除由上面的顾客请求位负责；本地单按默认开关真正排掉。放在这里是因为
+        # 下面的单页归一化马上要读 page_range（排完只剩 1 页 ⇒ 直接改单面）。
+        if self._auto_exclude_blank_tail(jobs[target_row]) > 0:
+            self._save_config()
 
         # ── 单页归一化：有效页数 == 1 的本地文件一律改单面（2026-10-17 现场事故）──
         # 现场：单页 docx 的 job.duplex="on"（print_config.json 里 page_count=1）→ 日志
@@ -22939,8 +23052,10 @@ class MainWindow(QMainWindow):
                 # ● 双面模式：没配过就保留按页面方向推导的结果（配置一次长边不会永久钉死长边）；
                 duplex_mode=str(_custom.get("duplex_mode") or "") or duplex_mode,
                 page_count=page_count, orientation=orientation, engine=engine,
-                # ● 排除末尾空白页：没配过就保留 PDF 末尾空白页的自动检测结果；
-                blank_tail=1 if _custom.get("blank_tail") else blank_tail,
+                # ● 排除末尾空白页：blank_tail 只存**检测结果**（文件事实）。默认开启的排除
+                #   由构造后的 _auto_exclude_blank_tail 真正落到 page_range 上（2026-11-13）；
+                #   旧代码在这里写 1 是伪造检测值，既不真排除又会误删真实末页。
+                blank_tail=blank_tail,
                 dpi=int(_custom.get("dpi") or 0),  # 0 = 跟随全局 DPI
                 image_orientation=str(_custom.get("image_orientation") or "auto"),
                 # ● 封面单独打印：与 UI 同一口径 —— 勾了但页范围是空的等于没勾；
@@ -22949,6 +23064,9 @@ class MainWindow(QMainWindow):
                 simplex_pages=str(_custom.get("simplex_pages") or ""),
             )
             jobs.append(job)
+            # 本地默认「排除末尾空白页」（默认开启）：PDF 当场有页数就先排掉；Office
+            # 要等转换完成（_on_convert_finished）或缓存命中再走同一条路。
+            self._auto_exclude_blank_tail(job)
 
         if html_rejected:
             # 拖入/粘贴/对话框选择 `.html/.htm`：明确告知不支持并给出替代路径

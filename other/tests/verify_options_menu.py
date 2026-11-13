@@ -127,9 +127,9 @@ check("默认纵向", v["orientation"] == "portrait", v["orientation"])
 check("默认水平居中开、垂直居中关", v["center_h"] is True and v["center_v"] is False)
 check("默认「将所有列调整为一页」", v["fit"] == "cols", v["fit"])
 check("默认打印范围 = 活动工作表", v["print_range"] == "active", v["print_range"])
-check("默认跟随全局 DPI / 自动图片方向 / 不排空白页 / 不启用封面单面",
+check("默认跟随全局 DPI / 自动图片方向 / 默认排除末尾空白页 / 不启用封面单面",
       v["dpi"] == 0 and v["image_orientation"] == "auto"
-      and v["blank_tail"] is False and v["simplex_enabled"] is False)
+      and v["blank_tail"] is True and v["simplex_enabled"] is False)
 check("纸张下拉是 A4/A3/A5/Letter/Legal/B5 六档", list(pc.PAPER_SIZES) ==
       ["A4", "A3", "A5", "Letter", "Legal", "B5"], str(pc.PAPER_SIZES))
 check("对话框里所有复选框都是 ThemedCheckBox",
@@ -249,15 +249,33 @@ check("纸张大小坏值/缺失都回落到 A4",
 check("to_dict → from_dict 往返不掉字段",
       pc.PrinterConfig.from_dict(fresh.to_dict()).to_dict() == fresh.to_dict())
 
-print("\n=== ⑥ 纸张贯通：PrintWorker 与表格引擎用同一份默认纸张 ===")
-check("PrintWorker 收到 paper 参数并透传给 print_pdf / print_plan_pass",
-      "paper: str = \"\"" in SRC and SRC.count("paper=self._paper") >= 5,
-      str(SRC.count("paper=self._paper")))
+print("\n=== ⑥ 纸张贯通：只对表格与图片生效，Word/PDF 用文档自带页面设置 ===")
+check("PrintWorker 收到 paper 参数，出纸前按整批文件类型门控",
+      "paper: str = \"\"" in SRC
+      and "def _paper_for(self, jobs)" in SRC
+      and "effective_paper(self._paper, paths)" in SRC
+      and SRC.count("paper=self._paper_for(") == 3,
+      f"paper=self._paper_for( ×{SRC.count('paper=self._paper_for(')}")
 check("构造 PrintWorker / DuplexFlushWorker 时传 config.paper_size",
       "paper=self._config.paper_size" in SRC)
 check("表格引擎的 print_options 也带 paper（同一默认值）",
       '"paper": o["paper"]' in io.open(os.path.join(LOCAL_TOOL, "printer_config.py"),
                                        encoding="utf-8").read())
+check("页面设置只认表格与图片（Word/PDF 不吃全局纸张）",
+      pc.page_setup_applies("a.xlsx") and pc.page_setup_applies("b.XLS")
+      and pc.page_setup_applies("c.JPG") and pc.page_setup_applies("d.png")
+      and not pc.page_setup_applies("e.docx") and not pc.page_setup_applies("f.pdf")
+      and not pc.page_setup_applies(""))
+check("整批判：混合批次走驱动默认纸",
+      pc.effective_paper("A3", ["a.xlsx", "b.jpg"]) == "A3"
+      and pc.effective_paper("A3", ["a.xlsx", "b.docx"]) == ""
+      and pc.effective_paper("A3", ["a.pdf"]) == ""
+      and pc.effective_paper("", ["a.xlsx"]) == ""
+      and pc.effective_paper("A3", []) == "",
+      f"{pc.effective_paper('A3', ['a.xlsx', 'b.jpg'])!r}/"
+      f"{pc.effective_paper('A3', ['a.xlsx', 'b.docx'])!r}")
+check("默认任务参数窗口写明页面设置只对表格与图片生效",
+      "仅对表格与图片生效" in SRC)
 
 win._cloud_client = None
 win.close()
@@ -266,11 +284,13 @@ print("\n=== ⑦ 默认任务参数作用到新增任务（差量存储：没配
 import fitz  # noqa: E402  （与 gui 读页数/末尾空白页同一条路径）
 
 
-def _make_pdf(name, pages=2):
+def _make_pdf(name, pages=2, blank_last=False):
     _p = os.path.join(_SANDBOX, name)
     _doc = fitz.open()
     for _i in range(pages):
         _pg = _doc.new_page()
+        if blank_last and _i == pages - 1:
+            continue                    # 末页留空 ⇒ 检测出 1 页末尾空白
         _pg.insert_text((72, 72), f"page {_i + 1}", fontsize=12)  # 有字 ⇒ 不是空白页
     _doc.save(_p)
     _doc.close()
@@ -303,16 +323,32 @@ check("没配过 ⇒ 排除末尾空白页仍是自动检测结果", _j1.blank_t
       f"{_j1.blank_tail} vs {_detected_tail}")
 check("没配过 ⇒ 封面单独打印仍是关", bool(_j1.simplex_enabled) is False, str(_j1.simplex_enabled))
 
+# 2026-11-13：本地与移动端一致，默认开启「排除末尾空白页」——不是只把 blank_tail 写成 1
+# （那会让它显示「排除末尾空白页（1 页）」却没真排），而是加文件当场把 page_range 裁掉。
+_pdf3 = _make_pdf("opts_blank_tail_on.pdf", pages=3, blank_last=True)
+_add_impl([_pdf3], None)
+_j1b = _win3._get_current_jobs()[-1]
+check("没配过 ⇒ 默认开启：末尾空白页已自动排掉（落到 page_range）",
+      _j1b.blank_tail == 1 and _j1b.page_range == "1-2"
+      and _j1b.blank_undo_range == "",
+      f"tail={_j1b.blank_tail} range={_j1b.page_range!r} undo={_j1b.blank_undo_range!r}")
+
 # —— 配过默认参数：只覆盖配过的键 ——
 _win3._config.default_task_options = {"dpi": 300, "duplex": "off", "duplex_mode": "short-edge",
-                                      "blank_tail": True, "image_orientation": "landscape",
+                                      "blank_tail": False, "image_orientation": "landscape",
                                       "simplex_enabled": True, "simplex_pages": "1"}
 _add_impl([_pdf2], None)
 _j2 = _win3._get_current_jobs()[-1]
 check("配过 DPI 300 ⇒ 新任务带 300", _j2.dpi == 300, str(_j2.dpi))
 check("配过单面 ⇒ 新任务 duplex=off", _j2.duplex == "off", _j2.duplex)
 check("配过双面模式 short-edge ⇒ 新任务跟着走", _j2.duplex_mode == "short-edge", _j2.duplex_mode)
-check("配过排除末尾空白页 ⇒ 新任务 blank_tail=1", int(_j2.blank_tail) == 1, str(_j2.blank_tail))
+# 默认值改成「开启」后，这条只剩「取消勾选」有信息量：不自动排，只按检测结果标 ⚠。
+_pdf4 = _make_pdf("opts_blank_tail_off.pdf", pages=3, blank_last=True)
+_add_impl([_pdf4], None)
+_j2b = _win3._get_current_jobs()[-1]
+check("取消勾选默认排除 ⇒ 新任务只标 ⚠、不改 page_range",
+      _j2b.blank_tail == 1 and _j2b.page_range == "" and _j2b.blank_undo_range is None,
+      f"tail={_j2b.blank_tail} range={_j2b.page_range!r} undo={_j2b.blank_undo_range!r}")
 check("配过图片方向 landscape ⇒ 新任务跟着走", _j2.image_orientation == "landscape")
 check("配过封面单独打印 + 页 1 ⇒ 新任务 simplex 开且带页范围",
       bool(_j2.simplex_enabled) is True and _j2.simplex_pages == "1",

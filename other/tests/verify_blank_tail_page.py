@@ -349,8 +349,21 @@ check("缓存确实命中（拿到缓存 PDF，且没新起转换线程）",
       f"cached={_cj.cached_pdf!r} 新线程={_new_workers}")
 check("★ 缓存命中的文件 blank_tail 也要有值（3 页末页空白 ⇒ 1）", _cj.blank_tail == 1,
       f"blank_tail={_cj.blank_tail}")
-check("★ 缓存命中的行「页数」列带 ⚠", win._pages_cell_text(_cj) == "3 ⚠",
+# 2026-11-13：默认开启 ⇒ 缓存命中这一步也要真排（不只是标 ⚠）。
+check("★ 缓存命中：默认开启 ⇒ 末尾空白页自动排掉", _cj.page_range == "1-2",
+      repr(_cj.page_range))
+check("★ 缓存命中的行「页数」列显示已排", win._pages_cell_text(_cj) == "2 (共 3 页) ⚠已排",
       win._pages_cell_text(_cj))
+
+# 默认关掉时保留旧口径「只标不排」——云端单/手动取消的场景要靠它。
+_saved_hits = dict(win._config.default_task_options or {})
+win._config.default_task_options = {**_saved_hits, "blank_tail": False}
+_cj_off, _ = _cache_hit_run()
+win._config.default_task_options = _saved_hits
+check("缓存命中：取消默认勾选 ⇒ 只标 ⚠、page_range 不动",
+      _cj_off.blank_tail == 1 and _cj_off.page_range == ""
+      and _cj_off.blank_undo_range is None,
+      f"tail={_cj_off.blank_tail} range={_cj_off.page_range!r}")
 
 # 变异自证：把检测换掉 ⇒ 上面两条「★」必须变红（证明读的是真调用，不是别处顺手写的值）
 _orig_detect = _gui.MainWindow._detect_blank_tail
@@ -371,8 +384,8 @@ check("⑥a 建 job 处仍写 blank_tail（UI 照旧标 ⚠）",
 check("⑥b 云端自动排除被顾客的开关把住（blank_tail_exclude）",
       'if not bool(getattr(job, "blank_tail_exclude", False)):' in _src
       and 'blank_tail_exclude=bool(getattr(task, "blank_tail_exclude", False))' in _src)
-check("⑥c split_tail_blank 只出现在两处：操作员勾选 + 云端按开关排除",
-      _src.count("split_tail_blank(") == 2,
+check("⑥c split_tail_blank 只出现在三处：操作员勾选 + 云端按开关 + 本地默认开启",
+      _src.count("split_tail_blank(") == 3,
       f"出现 {_src.count('split_tail_blank(')} 次")
 # 逐处归属到所在函数：只允许这两个函数里出现
 _defs = [(m.start(), m.group(1)) for m in re.finditer(r"^    def (\w+)", _src, re.M)]
@@ -389,8 +402,9 @@ def _owner(pos):
 
 
 _callers = sorted({_owner(m.start()) for m in re.finditer(r"split_tail_blank\(", _src)})
-check("⑥d 排除只发生在「操作员勾选」与「云端带开关」两条路径",
-      set(_callers) <= {"_set_blank_tail_excluded", "_cloud_exclude_blank_tail"},
+check("⑥d 排除只发生在「操作员勾选」「云端带开关」「本地默认开启」三条路径",
+      set(_callers) <= {"_set_blank_tail_excluded", "_cloud_exclude_blank_tail",
+                        "_auto_exclude_blank_tail"},
       f"实际所在函数={_callers}")
 
 print("\n⑦ 变异自证：把 split_tail_blank 换成空实现，⑤ 的断言必须变红")
@@ -404,6 +418,36 @@ _mutant_noop = (job2.page_range == "" and win._pages_cell_text(job2) == "3 ⚠")
 _gui.split_tail_blank = _orig
 check("变异体（空实现）下勾选不改变任何东西 ⇒ 说明 ⑤ 的量测是真的", _mutant_noop,
       f"page_range={job2.page_range!r} cell={win._pages_cell_text(job2)!r}")
+
+print("\n⑨ 默认开启（2026-11-13）：本地任务自动排除末尾空白页，手动恢复后不再重排")
+_saved_defaults = dict(win._config.default_task_options or {})
+win._config.default_task_options = {}          # 空 = 跟随默认值（blank_tail=True）
+try:
+    _j9 = PrintJob(file_path=p_1blank, page_count=3, duplex="on", blank_tail=1,
+                   display_name="default_tail.pdf")
+    _cut = win._auto_exclude_blank_tail(_j9)
+    check("默认开启 ⇒ 加文件/转换完成时自动排掉末尾空白页",
+          _cut == 1 and _j9.page_range == "1-2" and _j9.blank_undo_range == "",
+          f"cut={_cut} range={_j9.page_range!r} undo={_j9.blank_undo_range!r}")
+    check("已排过的不重复裁", win._auto_exclude_blank_tail(_j9) == 0
+          and _j9.page_range == "1-2", repr(_j9.page_range))
+    seed(_j9)
+    _touched = win._set_blank_tail_excluded([0], False)
+    check("手动恢复 ⇒ page_range 还原并记下 optout",
+          _touched == 1 and _j9.page_range == "" and _j9.blank_tail_optout is True,
+          f"touched={_touched} range={_j9.page_range!r} optout={_j9.blank_tail_optout}")
+    check("手动恢复后不再被默认重排", win._auto_exclude_blank_tail(_j9) == 0
+          and _j9.page_range == "")
+    _jc = PrintJob(file_path=p_1blank, page_count=3, duplex="on", blank_tail=1, task_id=9)
+    check("云端单不归默认开关管（仍只看顾客 blank_tail_exclude）",
+          win._auto_exclude_blank_tail(_jc) == 0 and _jc.page_range == "")
+    win._config.default_task_options = {"blank_tail": False}
+    _jo = PrintJob(file_path=p_1blank, page_count=3, duplex="on", blank_tail=1)
+    check("取消默认勾选 ⇒ 只标不排（保留给手动/云端场景）",
+          win._auto_exclude_blank_tail(_jo) == 0
+          and _jo.page_range == "" and _jo.blank_undo_range is None)
+finally:
+    win._config.default_task_options = _saved_defaults
 
 print("\n⑧ 真实现场文件（存在且能转换才算）")
 REAL = [

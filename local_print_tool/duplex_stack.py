@@ -317,6 +317,9 @@ class StackEntry:
     rotate: bool = True
     created_at: str = ""
     pdf: str = ""                  # 本单合并 PDF 的文件名（批次目录内）
+    # 本单第 1 趟出纸时用的纸张（"" = 驱动默认纸）。整叠的第 2 趟物理上只能一个
+    # DEVMODE ⇒ 主线程只在**各单一致**时沿用它，否则回落到驱动默认纸（见 gui._on_stack_flush）。
+    paper: str = ""
     # 单内文件计划（1-based、单内页码；重建第 2 趟的全局页序要用）。
     # 每项 = {label, pages, duplex[, file_pages]} —— `pages` 是**本单合并 PDF** 的页码
     # （第 2 趟还要再加各单偏移），`file_pages` 是这份文件**自己**的页号（已应用页码范围），
@@ -567,6 +570,7 @@ class StackEntry:
             "rotate": bool(self.rotate),
             "created_at": self.created_at,
             "pdf": self.pdf,
+            "paper": self.paper,
             "file_plans": [dict(fp) for fp in (self.file_plans or [])],
             "pass1_pages": [p if p is None else int(p) for p in (self.pass1_pages or [])],
             "pass2_pages": [p if p is None else int(p) for p in (self.pass2_pages or [])],
@@ -656,6 +660,7 @@ class StackEntry:
             rotate=_bool_or(d.get("rotate"), True),
             created_at=str(d.get("created_at", "") or ""),
             pdf=str(d.get("pdf", "") or ""),
+            paper=str(d.get("paper", "") or ""),
             file_plans=plans,
             pass1_pages=_int_or_none(d.get("pass1_pages")),
             pass2_pages=_int_or_none(d.get("pass2_pages")),
