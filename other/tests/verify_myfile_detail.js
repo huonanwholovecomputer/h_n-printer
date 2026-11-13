@@ -485,6 +485,15 @@ check('两页都挂同一份模板（me 页 + 管理入口页）',
 check('WXSS：全屏层铺满 + 过渡只在 pv.animating 时生效（拖动跟手）',
   /\.pv-mask\s*\{/.test(MP_WXSS) && /position:\s*fixed/.test(MP_WXSS) && /\.pv-img\s*\{/.test(MP_WXSS) &&
   /\.pv-close\s*\{/.test(MP_WXSS) && /\.pv-nav\s*\{/.test(MP_WXSS));
+{
+  // 2026-11-13 用户现场：「这个按钮的位置是不是有点太靠右上角了呢？」——原来 close 贴
+  // right:28rpx + top:20rpx，正好压在微信右上角的胶囊按钮上 ⇒ 钉住它待在左上角。
+  const closeBlock = ((MP_WXSS.match(/\.pv-close\s*\{[^}]*\}/) || [''])[0] || '')
+    .replace(/\/\*[\s\S]*?\*\//g, '');   // 去掉注释再看声明，免得注释里的旧值把断言带偏
+  check('全屏关闭按钮在左上角、不压微信胶囊（right 已删、left + safe-area）',
+    /left:\s*24rpx/.test(closeBlock) && /safe-area-inset-top/.test(closeBlock) &&
+    !/right:/.test(closeBlock), closeBlock.replace(/\s+/g, ' '));
+}
 
 mpCtx.data.myFiles = [multi];
 mpCtx.data.myFiles = mpCtx.data.myFiles.map((f) => Object.assign({}, f, {

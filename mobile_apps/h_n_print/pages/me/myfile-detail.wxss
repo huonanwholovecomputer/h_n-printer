@@ -221,9 +221,12 @@
 }
 
 .pv-close {
+  /* 2026-11-13 用户现场：原来固定在右上角（距右 28rpx、距顶 20rpx），正好压在微信的胶囊按钮
+     （「··· ⊙」）上，既难点又容易误触胶囊 ⇒ 挪到左上角（全屏预览的常规位置），
+     并让开状态栏：safe-area + 24rpx。 */
   position: absolute;
-  right: 28rpx;
-  top: calc(env(safe-area-inset-top) + 20rpx);
+  left: 24rpx;
+  top: calc(env(safe-area-inset-top) + 24rpx);
   width: 72rpx;
   height: 72rpx;
   border-radius: 50%;
