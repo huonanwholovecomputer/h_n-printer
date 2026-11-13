@@ -160,6 +160,11 @@ const mpFnNames = [
   'onMyFilePreviewLoad', 'onMyFilePreviewChange', 'onOpenMyFilePreview',
   'onOpenOrderFileDetail', 'onCloseFileDetail',
   '_orderFileAt', '_localFileDetail',
+  // 全屏预览层的延迟 require 入口（页面里 pvCore() 才去拉 utils/preview_viewer.js）
+  'pvCore',
+  // 2026-11-13 晚：全屏预览层改成自绘（用户要求双击放大），这 8 个是页面上的委托方法
+  'onPvTouchStart', 'onPvTouchMove', 'onPvTouchEnd', 'onPvTouchCancel',
+  'onPvClose', 'onPvPrev', 'onPvNext', 'onPvImageError',
 ];
 const mpBody = mpFnNames.map((n) => extractFn(MP_JS, n)).filter(Boolean).join('\n\n');
 
@@ -171,21 +176,52 @@ const MP_TOKEN = 'tok+9/1';
 const previewCalls = [];
 const wxStub = {
   getStorageSync: (k) => (k === 'token' ? MP_TOKEN : ''),
-  // 全屏预览：小程序原生 wx.previewImage（自带双指缩放 + 左右翻页）
+  // 全屏预览改成自绘层（utils/preview_viewer.js），不再调 wx.previewImage；
+  // 这里只留 getWindowInfo，手势按 375×667 的窗口算锚点/边界。
   previewImage: (opt) => previewCalls.push(opt),
+  getWindowInfo: () => ({ windowWidth: 375, windowHeight: 667 }),
 };
 const CONFIG_STUB = { BASE_URL: 'https://api.test' };
 const reqCalls = [];
 const requestStub = (opt) => { reqCalls.push(opt); if (requestStub.handler) requestStub.handler(opt); };
-const mpApi = new Function('wx', 'CONFIG', 'PREVIEW_MAX_PAGES', 'request',
+/* 全屏层实现（utils/preview_viewer.js）也要装进同一个作用域：页面里的 onPv* 都转发给它 */
+const PV_JS = read(path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'preview_viewer.js'));
+const pvViewer = new Function('wx', 'module', PV_JS + '\nreturn module.exports;')(wxStub, { exports: {} });
+/* 页面里用 pvCore() 延迟 require 预览层实现（不进首屏依赖），桩里照这个路径给回同一份模块 */
+const pvRequire = (dep) => {
+  if (String(dep).indexOf('preview_viewer') >= 0) return pvViewer;
+  throw new Error('沙箱不该 require: ' + dep);
+};
+const mpApi = new Function('wx', 'CONFIG', 'PREVIEW_MAX_PAGES', 'request', 'require',
   mpBody + '\nreturn { ' + mpFnNames.map((n) => n + ': ' + n).join(', ') + ' };')(
-  wxStub, CONFIG_STUB, 12, requestStub);
+  wxStub, CONFIG_STUB, 12, requestStub, pvRequire);
 
 /* Page 实例：_decorateMyFile 里用 this._fmtFileSize / this._myFileTypeIcon，
    所以这两个必须先挂上去（真实页面里它们是同一个 Page 对象上的方法） */
 const mpCtx = {
-  data: { myFiles: [], myFilesDetailId: '', myFilesDetailStyle: '' },
-  setData(o, cb) { Object.assign(this.data, o); if (typeof cb === 'function') cb(); },
+  data: { myFiles: [], myFilesDetailId: '', myFilesDetailStyle: '', pv: pvViewer.initialData().pv },
+  // 全屏层用 'pv.scale' 这种点路径 setData，桩要跟着走
+  setData(o, cb) {
+    Object.keys(o).forEach((k) => {
+      const parts = k.split('.');
+      if (parts.length === 1) { this.data[k] = o[k]; return; }
+      let cur = this.data;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (!cur[parts[i]]) cur[parts[i]] = {};
+        cur = cur[parts[i]];
+      }
+      cur[parts[parts.length - 1]] = o[k];
+    });
+    if (typeof cb === 'function') cb();
+  },
+  onPvTouchStart: mpApi.onPvTouchStart,
+  onPvTouchMove: mpApi.onPvTouchMove,
+  onPvTouchEnd: mpApi.onPvTouchEnd,
+  onPvTouchCancel: mpApi.onPvTouchCancel,
+  onPvClose: mpApi.onPvClose,
+  onPvPrev: mpApi.onPvPrev,
+  onPvNext: mpApi.onPvNext,
+  onPvImageError: mpApi.onPvImageError,
   // 单测没有真实节点：wxStub 没有 createSelectorQuery ⇒ 量高度走"量到 0"的护栏分支，
   // 展开/收起在测试里等价于瞬时状态切换（动画本身另有源码断言钉住）。
   _fmtFileSize: mpApi._fmtFileSize,
@@ -357,10 +393,98 @@ check('翻到第 6 页 ⇒ previewIndex=5 且相邻页 ready（预取）',
   mpCtx.data.myFiles[0].previewShots[6].ready);
 previewCalls.length = 0;
 mpApi.onOpenMyFilePreview.call(mpCtx, { currentTarget: { dataset: { id: '21', scope: 'list', index: '5' } } });
-check('点图 ⇒ wx.previewImage（urls 全 9 页、current 第 6 页）',
-  previewCalls.length === 1 && previewCalls[0].urls.length === 9 &&
-  previewCalls[0].current === previewCalls[0].urls[5],
-  previewCalls.length ? 'urls=' + previewCalls[0].urls.length : '**没调 previewImage**');
+check('点图 ⇒ 打开自绘全屏层（9 页、停在第 6 页，不再调 wx.previewImage）',
+  mpCtx.data.pv.visible === true && mpCtx.data.pv.count === 9 && mpCtx.data.pv.index === 5 &&
+  previewCalls.length === 0,
+  'visible=' + mpCtx.data.pv.visible + ' count=' + mpCtx.data.pv.count +
+  ' index=' + mpCtx.data.pv.index + ' previewImage=' + previewCalls.length);
+
+/* ==================== 2.6) 全屏层自绘手势：双击放大 / 捏合 / 拖动 / 滑页 ==================== */
+console.log('\n--- 2.6) 全屏预览层：双击放大（用户 2026-11-13 要求）/ 捏合 / 拖动 / 翻页 ---');
+function tapAt(x, y) {
+  const e = { touches: [], changedTouches: [{ clientX: x, clientY: y }] };
+  mpApi.onPvTouchStart.call(mpCtx, { touches: [{ clientX: x, clientY: y }] });
+  mpApi.onPvTouchEnd.call(mpCtx, e);
+}
+function pvReset() {
+  mpCtx.data.pv.scale = 1; mpCtx.data.pv.x = 0; mpCtx.data.pv.y = 0;
+}
+
+/* 双击（320ms 内两次 tap）⇒ 2.5 倍，且以点按处为锚 */
+pvReset();
+tapAt(100, 200);
+check('单击不放大（第一次 tap 只记时间）', Math.abs(mpCtx.data.pv.scale - 1) < 0.01,
+  'scale=' + mpCtx.data.pv.scale);
+tapAt(100, 200);
+check('双击 ⇒ 放大到 2.5 倍', Math.abs(mpCtx.data.pv.scale - 2.5) < 0.01,
+  'scale=' + mpCtx.data.pv.scale);
+check('放大锚点=点按处（左上区域 ⇒ 内容向右下偏移，符合 translate+scale 换算）',
+  Math.abs(mpCtx.data.pv.x - (1 - 2.5) * (100 - 187.5)) < 1 &&
+  Math.abs(mpCtx.data.pv.y - (1 - 2.5) * (200 - 333.5)) < 1,
+  'x=' + mpCtx.data.pv.x + ' y=' + mpCtx.data.pv.y);
+tapAt(100, 200); tapAt(100, 200);
+check('放大后再双击 ⇒ 还原 1 倍且回到中点', Math.abs(mpCtx.data.pv.scale - 1) < 0.01 &&
+  mpCtx.data.pv.x === 0 && mpCtx.data.pv.y === 0,
+  'scale=' + mpCtx.data.pv.scale + ' x=' + mpCtx.data.pv.x + ' y=' + mpCtx.data.pv.y);
+
+/* 两次 tap 间隔太久 ⇒ 不算双击 */
+pvReset();
+tapAt(120, 240);
+mpCtx.data.pv.scale = 1;
+mpApi.onPvTouchEnd.call(mpCtx, { touches: [], changedTouches: [{ clientX: 300, clientY: 400 }] });
+check('两次 tap 位置差很大 ⇒ 不当双击（第二次是滑页候选）', Math.abs(mpCtx.data.pv.scale - 1) < 0.01,
+  'scale=' + mpCtx.data.pv.scale);
+
+/* 两指捏合：100px → 200px 距离 ⇒ 2 倍 */
+pvReset();
+mpApi.onPvTouchStart.call(mpCtx, { touches: [{ clientX: 100, clientY: 300 }, { clientX: 200, clientY: 300 }] });
+mpApi.onPvTouchMove.call(mpCtx, { touches: [{ clientX: 50, clientY: 300 }, { clientX: 250, clientY: 300 }] });
+check('双指捏合 ⇒ 按两指间距比例放大（100→200px = 2 倍）', Math.abs(mpCtx.data.pv.scale - 2) < 0.01,
+  'scale=' + mpCtx.data.pv.scale);
+mpApi.onPvTouchMove.call(mpCtx, { touches: [{ clientX: 0, clientY: 300 }, { clientX: 800, clientY: 300 }] });
+check('捏合上限 5 倍（不会无限放大）', Math.abs(mpCtx.data.pv.scale - 5) < 0.01, 'scale=' + mpCtx.data.pv.scale);
+mpApi.onPvTouchEnd.call(mpCtx, { touches: [], changedTouches: [{ clientX: 400, clientY: 300 }] });
+
+/* 放大后单指拖动 */
+pvReset();
+mpCtx.data.pv.scale = 2;
+mpCtx.data.pv.x = 0; mpCtx.data.pv.y = 0;
+mpApi.onPvTouchStart.call(mpCtx, { touches: [{ clientX: 100, clientY: 300 }] });
+mpApi.onPvTouchMove.call(mpCtx, { touches: [{ clientX: 140, clientY: 300 }] });
+check('放大后单指拖动 ⇒ 平移跟手（+40px）', Math.abs(mpCtx.data.pv.x - 40) < 1, 'x=' + mpCtx.data.pv.x);
+mpApi.onPvTouchMove.call(mpCtx, { touches: [{ clientX: 900, clientY: 300 }] });
+check('平移被夹在图片边界内（不超过 (scale-1)*窗口宽/2）', Math.abs(mpCtx.data.pv.x - 187.5) < 1,
+  'x=' + mpCtx.data.pv.x);
+mpApi.onPvTouchEnd.call(mpCtx, { touches: [], changedTouches: [{ clientX: 900, clientY: 300 }] });
+
+/* 未放大时左滑 ⇒ 下一页 */
+pvReset();
+mpCtx.data.pv.index = 5;
+const beforeIdx = mpCtx.data.pv.index;
+mpApi.onPvTouchStart.call(mpCtx, { touches: [{ clientX: 300, clientY: 300 }] });
+mpApi.onPvTouchMove.call(mpCtx, { touches: [{ clientX: 280, clientY: 302 }] });
+mpApi.onPvTouchEnd.call(mpCtx, { touches: [], changedTouches: [{ clientX: 200, clientY: 302 }] });
+check('未放大时左滑 100px ⇒ 翻到下一页（且回到 1 倍）',
+  mpCtx.data.pv.index === beforeIdx + 1 && Math.abs(mpCtx.data.pv.scale - 1) < 0.01,
+  'index=' + mpCtx.data.pv.index + ' scale=' + mpCtx.data.pv.scale);
+
+/* 关掉全屏层 */
+mpApi.onPvClose.call(mpCtx);
+check('点 ✕ ⇒ 全屏层关闭（pv.visible=false）', mpCtx.data.pv.visible === false);
+
+/* 模板/样式断言：与 APP 的 #pfvMask 同款提示 */
+const PV_WXML = read(path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'me', 'preview-viewer.wxml'));
+check('全屏层模板：image 按 pv.scale/x/y 变形 + 双击提示 + 翻页按钮',
+  /transform: translate3d\(\{\{pv\.x\}\}px, \{\{pv\.y\}\}px, 0\) scale\(\{\{pv\.scale\}\}\)/.test(PV_WXML) &&
+  /双击放大/.test(PV_WXML) && /onPvPrev/.test(PV_WXML) && /onPvNext/.test(PV_WXML));
+check('两页都挂同一份模板（me 页 + 管理入口页）',
+  /<import src="\.\/preview-viewer\.wxml" \/>/.test(MP_WXML) &&
+  /<template is="previewViewer" data="\{\{pv: pv\}\}" \/>/.test(MP_WXML) &&
+  /<import src="\.\.\/me\/preview-viewer\.wxml" \/>/.test(read(path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'user-orders', 'user-orders.wxml'))) &&
+  /<template is="previewViewer" data="\{\{pv: pv\}\}" \/>/.test(read(path.join(REPO, 'mobile_apps', 'h_n_print', 'pages', 'user-orders', 'user-orders.wxml'))));
+check('WXSS：全屏层铺满 + 过渡只在 pv.animating 时生效（拖动跟手）',
+  /\.pv-mask\s*\{/.test(MP_WXSS) && /position:\s*fixed/.test(MP_WXSS) && /\.pv-img\s*\{/.test(MP_WXSS) &&
+  /\.pv-close\s*\{/.test(MP_WXSS) && /\.pv-nav\s*\{/.test(MP_WXSS));
 
 mpCtx.data.myFiles = [multi];
 mpCtx.data.myFiles = mpCtx.data.myFiles.map((f) => Object.assign({}, f, {

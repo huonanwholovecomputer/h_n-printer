@@ -1,0 +1,31 @@
+<!--preview-viewer.wxml — 全屏预览层（自绘：双击放大 / 双指捏合 / 放大后拖动 / 未放大时左右滑翻页）
+     me 页与 user-orders 页共用；状态与手势见 utils/preview_viewer.js（挂在页面的 data.pv 上）。
+     为什么不直接用 wx.previewImage：原生预览层的手势随微信版本/机型变，双击放大并不保证。 -->
+<template name="previewViewer">
+  <view wx:if="{{pv.visible}}"
+        class="pv-mask"
+        bindtouchstart="onPvTouchStart"
+        catchtouchmove="onPvTouchMove"
+        bindtouchend="onPvTouchEnd"
+        bindtouchcancel="onPvTouchCancel">
+    <image class="pv-img {{pv.failed ? 'pv-img-hidden' : ''}}"
+           src="{{pv.url}}"
+           mode="aspectFit"
+           style="transform: translate3d({{pv.x}}px, {{pv.y}}px, 0) scale({{pv.scale}}); transition: {{pv.animating ? 'transform 220ms cubic-bezier(0.22,0.61,0.36,1)' : 'none'}};"
+           binderror="onPvImageError"></image>
+    <view wx:if="{{pv.failed}}" class="pv-fail">这张预览图还没生成好，稍后再试</view>
+    <view class="pv-bar">
+      <text class="pv-count">{{pv.index + 1}} / {{pv.count}}</text>
+    </view>
+    <view class="pv-hint">
+      <text>{{pv.count > 1 ? '双击放大 · 双指捏合 · 左右滑动翻页' : '双击放大 · 双指捏合'}}</text>
+    </view>
+    <view class="pv-close" catchtap="onPvClose">✕</view>
+    <view wx:if="{{pv.count > 1}}"
+          class="pv-nav pv-prev {{pv.index <= 0 ? 'pv-nav-off' : ''}}"
+          catchtap="onPvPrev">‹</view>
+    <view wx:if="{{pv.count > 1}}"
+          class="pv-nav pv-next {{pv.index >= pv.count - 1 ? 'pv-nav-off' : ''}}"
+          catchtap="onPvNext">›</view>
+  </view>
+</template>

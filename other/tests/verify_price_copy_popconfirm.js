@@ -24,6 +24,14 @@
  * 用法：node tests/verify_price_copy_popconfirm.js     （exit 0 = 全绿）
  */
 const fs = require('fs');
+
+/* 2026-11-13 晚：全屏预览层抽成 utils/preview_viewer.js（双击放大/捏合/滑页），
+   me.js 与 user-orders.js 都 require 它。价格复制的验收只关心气泡逻辑，这里给个最小桩。 */
+const PV_VIEWER_STUB = {
+  initialData: () => ({ pv: { visible: false, url: '', urls: [], index: 0, count: 0, scale: 1, x: 0, y: 0, animating: false, failed: false } }),
+  open: () => {}, close: () => {}, page: () => {},
+  touchStart: () => {}, touchMove: () => {}, touchEnd: () => {}, touchCancel: () => {},
+};
 const path = require('path');
 const vm = require('vm');
 
@@ -138,6 +146,7 @@ function loadMiniProgram() {
           createPollScheduler: () => ({ start() {}, stop() {} }),
         };
       }
+      if (dep.indexOf('preview_viewer') >= 0) return PV_VIEWER_STUB;
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {
@@ -686,6 +695,7 @@ function loadMiniProgramUserOrders() {
           localDetail: () => ({ local_only: true, localRows: [], localNote: '' }),
         };
       }
+      if (dep.indexOf('preview_viewer') >= 0) return PV_VIEWER_STUB;
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {

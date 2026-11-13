@@ -106,7 +106,7 @@ check('文件行可点开详情（bindtap + data-id/oid/findex）',
   /data-findex="\{\{index\}\}"/.test(UO_WXML));
 check('弹窗在 page-root 之外（.scroll-content 是变换层，fixed 会被裁）',
   /class="modal-mask[\s\S]{0,1200}?filedetail-sheet/.test(UO_WXML) &&
-  /\n<view wx:if="\{\{fileDetailVisible\}\}"[\s\S]*?<\/view>\s*$/.test(UO_WXML));
+  /\n<view wx:if="\{\{fileDetailVisible\}\}"[\s\S]*?<\/view>\s*(?:<!--[\s\S]*?-->\s*)?<template is="previewViewer"/.test(UO_WXML));
 check('弹窗里用同一个 myfileDetailCard 模板',
   /<template is="myfileDetailCard"/.test(UO_WXML));
 check('样式复用 me/myfile-detail.wxss（不再各写一份）',
@@ -119,8 +119,16 @@ check('请求 /api/file_detail/<id> 带 Bearer 头；页数走 /info 纠偏',
   /\/api\/file_detail\/' \+ encodeURIComponent\(fileId\)/.test(UO_JS) &&
   /'Authorization': 'Bearer ' \+ token/.test(UO_JS) &&
   /\/api\/file_preview\/' \+ encodeURIComponent\(fid\) \+[\s\S]{0,40}?'\/info\?token='/.test(UO_JS));
-check('全屏交给 wx.previewImage（原生双指缩放 + 左右翻页）',
-  /wx\.previewImage\(\{ urls, current: urls\[base\] \|\| urls\[0\] \}\)/.test(UO_JS));
+check('全屏交给自绘预览层（双击放大 / 双指捏合 / 滑页），不再用 wx.previewImage',
+  /pvCore\(\)\.open\(this, urls, base\)/.test(UO_JS) && !/wx\.previewImage/.test(UO_JS) &&
+  /function pvCore\(\) \{/.test(UO_JS) &&
+  /return require\('\.\.\/\.\.\/utils\/preview_viewer'\)/.test(UO_JS) &&
+  ['onPvTouchStart', 'onPvTouchMove', 'onPvTouchEnd', 'onPvTouchCancel', 'onPvClose', 'onPvPrev', 'onPvNext']
+    .every((n) => new RegExp('\\n    ' + n + '\\([^)]*\\)\\s*\\{').test(UO_JS)));
+check('管理页同样挂全屏层模板（与「我」页同一份）',
+  /<import src="\.\.\/me\/preview-viewer\.wxml" \/>/.test(UO_WXML) &&
+  /<template is="previewViewer" data="\{\{pv: pv\}\}" \/>/.test(UO_WXML) &&
+  /pv: \{ visible: false, url: ''/.test(UO_JS));
 check('关闭走 200ms 动画后再卸载（与「我」页同节奏）',
   /fileDetailClosing: true/.test(UO_JS) && /\}, 200\)/.test(UO_JS));
 

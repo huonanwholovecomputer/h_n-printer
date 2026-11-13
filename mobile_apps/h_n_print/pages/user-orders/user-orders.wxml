@@ -2,6 +2,7 @@
 <!-- 2026-11-13 晚：管理入口打开的这页也要能点文件看详情/缩略图，卡片模板与「我」页共用
      （<import> 只取对方文件里的 <template>，不会把 me.wxml 的页面结构带进来）。 -->
 <import src="../me/me.wxml" />
+<import src="../me/preview-viewer.wxml" />
 <page-meta></page-meta>
 <navigation-bar title="{{pageTitle}}" back="{{true}}" color="{{isDarkMode ? 'white' : 'black'}}" background="transparent" extClass="{{isDarkMode ? 'theme-dark' : ''}}"></navigation-bar>
 <view class="theme-bg-layer {{isDarkMode ? 'bg-dark' : ''}}"></view>
@@ -357,3 +358,6 @@
     </view>
   </view>
 </view>
+
+<!-- 全屏预览层（与「我」页同一份模板/同一套手势） -->
+<template is="previewViewer" data="{{pv: pv}}" />

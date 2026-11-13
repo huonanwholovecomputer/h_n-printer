@@ -11,6 +11,11 @@ const priceCopy = require('../../utils/price_copy')
 /* 文件详情卡（预览图 + 参数）的字段装配：「我」页与这里共用一份，模板也只有一份
    （pages/me/me.wxml 的 myfileDetailCard）。2026-11-13 晚用户要求管理入口同样可展开看详情。 */
 const fileDetailCard = require('../../utils/file_detail_card')
+/* 全屏预览层（双击放大 / 双指捏合 / 滑页）延迟 require：只在点开大图时才用得到，
+   不该进页面首屏依赖；也让只抠本文件函数的验收脚本不必为它造桩。 */
+function pvCore() {
+  return require('../../utils/preview_viewer')
+}
 // 单价（/api/pricing）带进程内缓存：本页与「我」页各自一份，口径相同
 const _getPriceRules = priceCopy.createPriceRulesGetter(request, CONFIG)
 
@@ -92,6 +97,7 @@ Component({
   },
 
   data: {
+    pv: { visible: false, url: '', urls: [], index: 0, count: 0, scale: 1, x: 0, y: 0, animating: false, failed: false },   // 全屏预览层状态（见 utils/preview_viewer.js）
     pageSlide: 'page-init',
     pageExit: '',
     isDarkMode: wx.getStorageSync('isDarkMode') || false,
@@ -839,7 +845,7 @@ Component({
       this.setData(patch)
     },
 
-    // 全屏：小程序直接交给 wx.previewImage（原生双指缩放 + 左右翻页）
+    // 全屏：交给自绘预览层（双击放大 / 双指捏合 / 放大后拖动 / 左右滑翻页）
     onOpenMyFilePreview(e) {
       const detail = this.data.fileDetail
       if (!detail || detail.local_only) return
@@ -849,8 +855,19 @@ Component({
       const base = isNaN(index) ? 0 : index
       const urls = shots.map(s => s.url)
       if (!urls.length) return
-      wx.previewImage({ urls, current: urls[base] || urls[0] })
+      // 自绘全屏层（双击放大 / 双指捏合 / 左右滑翻页），与「我」页同一套
+      pvCore().open(this, urls, base)
     },
+
+    /* ---------------- 全屏预览层（模板 pages/me/preview-viewer.wxml） ---------------- */
+    onPvTouchStart(e) { pvCore().touchStart(this, e) },
+    onPvTouchMove(e) { pvCore().touchMove(this, e) },
+    onPvTouchEnd(e) { pvCore().touchEnd(this, e) },
+    onPvTouchCancel() { pvCore().touchCancel(this) },
+    onPvClose() { pvCore().close(this) },
+    onPvPrev() { pvCore().page(this, -1) },
+    onPvNext() { pvCore().page(this, 1) },
+    onPvImageError() { this.setData({ 'pv.failed': true }) },
 
     onCloseFileDetail() {
       if (this._uoFileDetailTimer) clearTimeout(this._uoFileDetailTimer)

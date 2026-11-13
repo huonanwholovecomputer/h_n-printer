@@ -18,6 +18,11 @@ function _fallbackSheets(f, eff) {
 }
 // 头像裁剪的纯几何（fit/clamp/cropRect/zoomAt）：与 APP 的 www/avatar_crop.js 同一语义
 const avatarCrop = require('../../utils/avatar_crop')
+/* 全屏预览层（双击放大 / 双指捏合 / 滑页）延迟 require：只在点开大图时才用得到，
+   不该进页面首屏依赖；也让只抠本文件函数的验收脚本不必为它造桩。 */
+function pvCore() {
+  return require('../../utils/preview_viewer')
+}
 // 「我的文件」预览图最多展示前多少页（与后端 app.py 的 PREVIEW_MAX_PAGES 对齐：
 // 后端预热也只生成这么多页，再往后的页没有缓存，点开会现生成、明显慢）
 const PREVIEW_MAX_PAGES = 12
@@ -130,6 +135,7 @@ function _fmtStatusTime(v) {
 
 Component({
   data: {
+    pv: { visible: false, url: '', urls: [], index: 0, count: 0, scale: 1, x: 0, y: 0, animating: false, failed: false },   // 全屏预览层状态（见 utils/preview_viewer.js）
     nickname: '',
     avatarUrl: '',
     // 头像裁剪（2026-10-27 用户要求）：取景几何全部走 utils/avatar_crop.js 的纯函数；
@@ -1786,8 +1792,9 @@ Component({
       }))
     },
 
-    // 点预览图 → 全屏。小程序原生 wx.previewImage 自带双指缩放 + 左右翻页，
-    // 比自己画浮层可靠；urls 里带上全部已切片的页，current 指定当前页。
+    // 点预览图 → 全屏。用自绘层（utils/preview_viewer.js）而不是 wx.previewImage：
+    // 原生预览层的手势随微信版本/机型变化，双击放大不保证（用户 2026-11-13 要求双击放大）。
+    // urls 里带上全部已切片的页，index 指定当前页。
     onOpenMyFilePreview(e) {
       const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
       const item = ds.scope === 'detail'
@@ -1798,9 +1805,20 @@ Component({
       if (!shots.length) return
       const urls = shots.map((s) => s.url)
       const idx = Math.max(0, Math.min(urls.length - 1, Number(ds.index) || 0))
-      if (typeof wx.previewImage !== 'function') return
-      wx.previewImage({ urls: urls, current: urls[idx] })
+      // 自绘全屏层（双击放大 / 双指捏合 / 左右滑翻页）——不再用 wx.previewImage：
+      // 原生预览层的双击放大随微信版本/机型而变，用户 2026-11-13 明确要求双击放大。
+      pvCore().open(this, urls, idx)
     },
+
+    /* ---------------- 全屏预览层（模板 pages/me/preview-viewer.wxml） ---------------- */
+    onPvTouchStart(e) { pvCore().touchStart(this, e) },
+    onPvTouchMove(e) { pvCore().touchMove(this, e) },
+    onPvTouchEnd(e) { pvCore().touchEnd(this, e) },
+    onPvTouchCancel() { pvCore().touchCancel(this) },
+    onPvClose() { pvCore().close(this) },
+    onPvPrev() { pvCore().page(this, -1) },
+    onPvNext() { pvCore().page(this, 1) },
+    onPvImageError() { this.setData({ 'pv.failed': true }) },
 
     // 订单卡片「文件列表」→ 文件详情弹窗（GET /api/file_detail/<id>，与列表项同形状）
     /* 订单卡片里那一行文件对象（详情弹窗拿它兜底：没有云端文件时也要把打印参数摊开） */
