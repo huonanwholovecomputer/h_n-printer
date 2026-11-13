@@ -37,6 +37,19 @@ const ONLY = (() => {
   return i >= 0 ? process.argv[i + 1] : '';
 })();
 
+/* ══════════════ 时间锚点（全部按「今天」算） ══════════════
+   页面默认口径是「本月」（_scopeTime.mode='month' → monthRange(currentMonthKey())），
+   早先这里把订单写死在 2026-10-01~10-18：一跨月重跑，看板就是空的（订单全在别的月）。
+   所以月份/日期一律按运行当天生成：本月 1 号 ~ 今天、月份清单给上月+本月。 */
+const NOW = new Date();
+const pad2 = (n) => String(n).padStart(2, '0');
+const TODAY = `${NOW.getFullYear()}-${pad2(NOW.getMonth() + 1)}-${pad2(NOW.getDate())}`;
+const CUR_MONTH = TODAY.slice(0, 7);
+const PREV_MONTH = (() => {
+  const d = new Date(NOW.getFullYear(), NOW.getMonth() - 1, 1);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+})();
+
 /* ══════════════ 虚构数据（README 三张图共用同一套人/设备/单号） ══════════════ */
 const MEMBERS = [
   { id: 'm1', name: '张伟', color: '#4472C4' },
@@ -82,14 +95,17 @@ function filePrice(pages, duplex) {
   return +(sheets * PRICING.duplex_price + odd * PRICING.simplex_price).toFixed(2);
 }
 
-/** 造一批订单：2026-10-01 ~ 2026-10-18（与页面默认的「本月」口径一致），覆盖各状态/来源/设备 */
+/** 造一批订单：本月 1 号 ~ 今天（与页面默认的「本月」口径一致），覆盖各状态/来源/设备 */
 function buildOrders() {
   const orders = [];
   let seq = 0;
-  for (let day = 0; day < 18; day++) {
-    const date = new Date(Date.UTC(2026, 9, 1 + day));       // 无时区漂移：按 UTC 生成再拼字符串
-    const ymd = date.toISOString().slice(0, 10).replace(/-/g, '');
-    const count = day % 7 === 5 || day % 7 === 6 ? 6 : 4;    // 周末多一点，趋势图有起伏
+  const days = NOW.getDate();                              // 本月已经过去几天（含今天）
+  for (let day = 0; day < days; day++) {
+    const date = new Date(NOW.getFullYear(), NOW.getMonth(), 1 + day);
+    const ymd = `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}`;
+    const dateStr = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+    const dow = date.getDay();
+    const count = dow === 0 || dow === 6 ? 6 : 4;          // 周末多一点，趋势图有起伏
     for (let k = 0; k < count; k++) {
       seq += 1;
       const status = STATUS_POOL[(seq * 7 + k) % STATUS_POOL.length];
@@ -112,7 +128,7 @@ function buildOrders() {
       const orderPrice = +files.reduce((s, f) => s + f.total_price, 0).toFixed(2);
       const hh = String(9 + (k % 9)).padStart(2, '0');
       const mm = String((seq * 13) % 60).padStart(2, '0');
-      const created = `${date.toISOString().slice(0, 10)} ${hh}:${mm}:${String((seq * 7) % 60).padStart(2, '0')}`;
+      const created = `${dateStr} ${hh}:${mm}:${String((seq * 7) % 60).padStart(2, '0')}`;
       const isAdmin = seq % 11 === 0;
       orders.push({
         order_id: 900000 + seq,
@@ -157,7 +173,7 @@ function api(path, qs, method) {
   if (path === '/api/proxy/finance/config') return { success: true, data: STORE, server_version: 2 };
   if (path === '/api/proxy/pricing') return { success: true, data: PRICING };
   if (path === '/api/proxy/admin/statistics/months')
-    return { success: true, data: { months: [{ month: '2026-09' }, { month: '2026-10' }] } };
+    return { success: true, data: { months: [{ month: PREV_MONTH }, { month: CUR_MONTH }] } };
   if (path === '/api/proxy/admin/statistics/revenue')
     return { success: true, data: { period: {}, revenue_summary: {}, by_user: [], orders: ORDERS } };
   if (path === '/api/proxy/admin/statistics/revenue/compare') return { success: true, data: { total: 0 } };
@@ -175,7 +191,7 @@ function api(path, qs, method) {
   if (path === '/api/me')
     return { success: true, role: 'admin', is_super_admin: true, openid: 'dev_demo',
              nickname: '张伟', license_info: { key: 'AB12CD34', type: 'admin', expired: false,
-             creator_nickname: '张伟', created_at: '2026-09-06 12:00:00', used_at: '2026-09-06 12:00:01',
+             creator_nickname: '张伟', created_at: `${PREV_MONTH}-06 12:00:00`, used_at: `${PREV_MONTH}-06 12:00:01`,
              expires_at: '—', validity_minutes: null } };
   if (path === '/api/profile')
     return { success: true, nickname: '张伟',
@@ -208,7 +224,7 @@ function api(path, qs, method) {
     })), hidden_test_devices: 0 };
   if (path === '/api/license/active')
     return { success: true, keys: [{ key: 'EF56GH78', type: 'temp', status: 'unused', expired: false,
-             countdownText: '5 分 00 秒', created_at: '2026-10-18 15:00:00' }] };
+             countdownText: '5 分 00 秒', created_at: `${TODAY} 15:00:00` }] };
   if (path === '/api/bind/devices') return { success: true, devices: [{ openid: 'dev_demo', nickname: '本机' }] };
   if (path === '/api/admin/temp_users') return { success: true, users: [] };
   if (path === '/api/admin/admins')
@@ -271,7 +287,7 @@ if (want('settlement')) {
   const cents = await page.evaluate(() =>
     _reconcileScope(_scopeRange(), _cloudData.orders).cloudByMember);
   STORE.records.income = Object.keys(cents).map((mid, i) => ({
-    id: 'inc' + (i + 1), date: '2026-10-18', memberId: mid, amount: +(cents[mid] / 100).toFixed(2),
+    id: 'inc' + (i + 1), date: TODAY, memberId: mid, amount: +(cents[mid] / 100).toFixed(2),
   }));
   console.log('    手动代收回填:', JSON.stringify(STORE.records.income));
   await page.reload({ waitUntil: 'load' });
@@ -298,6 +314,10 @@ if (want('print') || want('me')) {
       localStorage.setItem('hn_token', 'stub-token');
       localStorage.setItem('hn_theme_mode', 'dark');
       localStorage.setItem('hn_nickname', '张伟');
+      // 文件保留与隐私（S2-08）：从未同意过的设备首次进页面会弹告知层糊住整页，
+      // 这里预写「已同意」+「遵从服务器管理」，等价于老用户再次打开页面。
+      localStorage.setItem('hn_privacy_agreed_v1', '1');
+      localStorage.setItem('hn_retention_hours_v1', '0');
     } catch (e) { /* 忽略 */ }
   }, BASE);
   await page.route('**/api/**', (route) => route.request().url().startsWith(BASE)
@@ -310,7 +330,7 @@ if (want('print') || want('me')) {
    *  contentId 必须显式给：打印页与「我」页各有一个 scroll-content，隐藏的那个高度是 0，
    *  不能用 `A || B` 取（会永远量到第一个）。 */
   const longShot = async (path, maxH, contentId) => {
-    const m = await page.evaluate(([cap, cid]) => {
+    const measure = () => page.evaluate(([cap, cid]) => {
       const el = document.getElementById(cid);
       const nav = document.getElementById('navBar');
       const rect = el ? el.getBoundingClientRect().height : 0;
@@ -320,9 +340,18 @@ if (want('print') || want('me')) {
       return { content: Math.round(content), navH: Math.round(navH),
                h: Math.min(Math.round(content + navH + 100), cap) };   // +100：内容结尾躲开固定 tabBar
     }, [maxH, contentId]);
+    let m = await measure();
+    await page.setViewportSize({ width: 390, height: m.h });
+    // 文件列表高度按 innerHeight*0.85 封顶（print.js:883 recalcFileListHeight）：
+    // 视口拉长后要重算一次，否则 4 个文件仍按 844 高的窗口被裁成 3 个；列表长高后内容更高，再量一次。
+    await page.evaluate(() => {
+      if (typeof recalcFileListHeight === 'function') recalcFileListHeight();
+    });
+    await page.waitForTimeout(600);
+    m = await measure();
     console.log('    内容高度', m.content, '导航', m.navH, '→ 视口', m.h);
     await page.setViewportSize({ width: 390, height: m.h });
-    await page.waitForTimeout(700);
+    await page.waitForTimeout(600);
     await page.screenshot({ path, type: 'jpeg', quality: 90 });
     await page.setViewportSize({ width: 390, height: 844 });
   };

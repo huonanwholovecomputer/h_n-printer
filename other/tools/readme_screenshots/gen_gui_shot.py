@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 
@@ -42,7 +43,7 @@ os.chdir(LOCAL_TOOL)
 
 import paths  # noqa: E402
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QSplitter  # noqa: E402
 
 app = QApplication.instance() or QApplication([])
 
@@ -105,7 +106,9 @@ tm.set_mode(_theme.MODE_DARK)
 
 win = MainWindow(config_path=paths.config_path(), theme_manager=tm)
 win.setAttribute(Qt.WA_DontShowOnScreen, True)     # 布局照常算，但不真的弹窗
-win.resize(1500, 1010)
+# 1010 → 1180：4.6.x 右侧任务参数多了「封面单独打印」「排除末尾空白页」两行，
+# 1010 高时参数区被切成半行、备注框只剩一行半。高一点，整块面板看得全。
+win.resize(1500, 1180)
 win.show()
 app.processEvents()
 
@@ -125,14 +128,18 @@ SPECS = [
     ("实验数据表.xlsx",      5, 4, "off", ""),
 ]
 jobs = []
+# 订单号/原件路径跟着当天走：README 图不能永远是某一天的（旧图写死 2026-10-18）。
+_TODAY = datetime.now()
+_TODAY_STR = _TODAY.strftime("%Y-%m-%d")
+_ORDER_NO = "HN" + _TODAY.strftime("%Y%m%d") + "-0007"
 for i, (name, pages, copies, duplex, engine) in enumerate(SPECS):
     jobs.append(PrintJob(
         file_path=make_pdf(f"src{i}.pdf", pages),
         # source_path 只用于界面显示（“路径: …”那一行）：给一个像真订单的路径，
         # 免得 README 图上出现 %TEMP% 沙箱路径
-        source_path=os.path.join("D:\\打印订单\\2026-10-18", name),
+        source_path=os.path.join("D:\\打印订单\\" + _TODAY_STR, name),
         copies=copies, duplex=duplex, page_count=pages, orientation="portrait",
-        engine=engine, display_name=name, order_number="HN20261018-0007",
+        engine=engine, display_name=name, order_number=_ORDER_NO,
     ))
 
 tab = TabSettings(
@@ -186,14 +193,27 @@ win._table.selectRow(0)
 app.processEvents()
 
 # 日志区：写一段有代表性的模拟日志（真实时间戳会让图上看不出逻辑，这里用连续时刻）。
-# 只写 3 行：日志框默认高度正好放得下，多写会被裁在半行上。
+# 文件数/金额一律取界面真实读数 —— 旧版写死「8 个文件 ¥62.80」，而列表里是 12 个、合计 ¥101.20。
+_total_txt = win._total_label.text()
+_amount = _total_txt.split("¥")[-1].strip()
 LOG_LINES = [
     "[15:39:58] 🔌 已连接到云端服务器 · ☁ 本机正在接单",
-    "[15:40:07] 📂 已添加 8 个文件（工作副本已暂存），合计 ¥62.80",
+    f"[15:40:07] 📂 已添加 {len(SPECS)} 个文件（工作副本已暂存），合计 ¥{_amount}",
     "[15:40:15] 🖨 本批含双面文件，HP LaserJet 1020 需分两趟并提示翻纸",
 ]
 win._log_text.setPlainText("\n".join(LOG_LINES))
 
+# 取景微调（只影响截图，不改真实默认值）：
+#  ① 日志框默认 50px（gui.py:8657 setSizes([650, 50])）只放得下两行半 → 抬到 3 行高；
+#  ② 右侧「备注」默认 60px（gui.py:13861 setSizes([580, 60])）文字被下边框切掉 → 抬到三行输入框。
+for _sp in win.findChildren(QSplitter):
+    if _sp.count() != 2:
+        continue
+    _w = _sp.widget(1)
+    if _w is win._log_text:
+        _sp.setSizes([900, 84])
+    elif getattr(_w, "title", lambda: "")() == "备注":
+        _sp.setSizes([900, 140])
 app.processEvents()
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 pix = win.grab()

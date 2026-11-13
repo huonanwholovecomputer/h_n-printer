@@ -20,6 +20,19 @@ README 里的四张界面图**不是手工截的**，而是用真实界面 + 一
   四张图看起来才像同一家店。
 - **不要写真实的人名/微信昵称/头像/服务器地址**：这几张图是公开仓库的内容。
 - `sizeDisplay` 是**KB 数值**（模板自己拼 " KB"），别再传 `'1.8 MB'`。
+- **日期一律按运行当天派生，别写死**：结算页默认口径是**本自然月**
+  （`settlement.html` 的 `_scopeTime.mode='month'` → `monthRange(currentMonthKey())`），
+  生成器里的订单/单号/暂存路径都从 `NOW` 算（`buildOrders()` 造本月 1 号~今天）。
+  写死某个月重跑，跨月那天就是**一张空看板**；单号因此是 `HN<当天>-0007` 这种形式。
+- **移动端首次进页面会弹「文件保留与隐私」告知层**（S2-08）：生成器在 `addInitScript`
+  里预写 localStorage `hn_privacy_agreed_v1='1'` + `hn_retention_hours_v1='0'`，
+  否则整页被遮罩糊住、只能截到一个弹层。
+- **打印页文件列表高度受 `innerHeight*0.85` 封顶**（`print.js` 的 `recalcFileListHeight`）：
+  长截先拉长视口，再调一次 `recalcFileListHeight()` 并**重量一次内容高度**，
+  否则第 4 个文件仍被裁掉、截图底部还会漏出固定 tabBar。
+- **GUI 图的取景**：窗口按 1500×1180 出图（4.6.x 右侧多了「封面单独打印 / 排除末尾空白页」，
+  1010 高会把参数区切成半行）；出图前还把日志分隔条抬到能放下 3 行、备注区抬到 140px。
+  这些只是截图取景，**不改真实默认值**（`gui.py` 里仍是 50px / 60px）。
 - `/api/printer_status` 的 `active` 在**顶层**（不是 `data.active`）——app.js 的 `api()` 返回
   `{status, data: 整个 body}`，写错就永远显示「打印机离线」。
 - 手机页两个 `scroll-content`（`scrollContentPrint` / `scrollContentMe`）**不能**用
