@@ -1623,9 +1623,9 @@ body {
   transition: transform 120ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-/* 拖动与按下反馈（APP 2026-11-16 第二轮）：
-   手在栏体上左右拖 → 位移层跟手（.dragging 关掉 320ms 过渡），整排按 --tab-row-dx
-   弹性偏移（普通行程 18%，越界再压阻尼），形变层按行程 scaleX、origin 落在来向一侧。
+/* 拖动与按下反馈（APP 2026-11-16 第二轮，第三轮改为整条栏位移）：
+   手在栏体上左右拖 → 位移层跟手（.dragging 关掉 320ms 过渡），**整条悬浮栏**按 --tab-bar-dx
+   朝拖动方向错开（最大 10px，内部图标相对栏体不动），形变层按行程 scaleX、origin 落在来向一侧。
    松手过半格由 switchTab 接管（320ms 归位 + goo + wave + bump），没过半格自己弹回。
    点按格子先压 0.92（.press），松手船式回弹（.rebound，420ms 带 1.045 过冲）。 */
 .tab-bar {
@@ -1641,13 +1641,14 @@ body {
   transform-origin: var(--pill-origin, 50%) 50%;
   transition: none;
 }
-.tab-bar.dragging .tab-item {
-  transition: transform 90ms linear;
-  transform: translate3d(var(--tab-row-dx, 0px), 0, 0);
+/* 整条栏跟着走（不是内部图标各自平移）：位移量由 JS 夹在 ±10px */
+.tab-bar.dragging {
+  transform: translate3d(var(--tab-bar-dx, 0px), 0, 0);
+  transition: none;
 }
-.tab-bar.settling .tab-item {
-  transition: transform 340ms cubic-bezier(0.34, 1.56, 0.64, 1);
+.tab-bar.settling {
   transform: translate3d(0, 0, 0);
+  transition: transform 340ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 .tab-item.press {
   transition: transform 90ms cubic-bezier(0.4, 0, 0.2, 1);

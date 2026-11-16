@@ -1138,8 +1138,9 @@ function initTabThumb() {
    · 点按：按下压 0.92，松手船式回弹；同格点击才放 rebound，跨格交给 wave，
            两套 transform 动画不同时挂在一个格子上（会互相顶掉） */
 const TAB_RUBBER = 0.35;       // 越界阻尼：拖出栏体后的行程只剩 35%
-const TAB_ROW_FOLLOW = 0.18;   // 整排跟随比例（滑块跟满、tab 跟一点 → 错位感）
-const TAB_OVER_FOLLOW = 0.45;  // 越界那段整排跟得更明显（橡皮筋要有「拉得住」的手感）
+const TAB_BAR_FOLLOW = 0.12;   // 整条栏跟随比例（拖 60px 约走 7px）
+const TAB_BAR_OVER = 0.35;     // 越界那段整条栏跟得更明显（橡皮筋要有「拉得住」的手感）
+const TAB_BAR_MAX = 10;        // 整条栏最大位移（2026-11-16 用户口径：10px 就够了）
 const TAB_PILL_OVER = 0.028;   // 药丸越界最多再走 0.028 格（≈4px，正好把栏体左右那 1.2cqw 内缩走完）
                                // —— 再多药丸就探出玻璃栏的圆角轮廓了（截图实测）
 let _tabDrag = null;
@@ -1193,23 +1194,28 @@ function _tabDragMove(e) {
   let damped = raw;
   if (raw < 0) damped = raw * TAB_RUBBER;
   else if (raw > d.max) damped = d.max + (raw - d.max) * TAB_RUBBER;
-  // 位移层：越界时把药丸挡在玻璃栏内（栏体左右各留 1.2cqw 内缩，正好够走这一小段），
-  // 剩下的「拉不住」全部由整排偏移表达 —— 药丸探出圆角轮廓像画坏了
-  const frac = Math.max(-TAB_PILL_OVER, Math.min(d.max + TAB_PILL_OVER, damped));
-  const thumb = document.getElementById('tabThumb');
-  thumb.style.setProperty('--tab-i', String(frac));
-  // 整排跟随：普通行程按 18%，越界那段按 45%（方向和手指一致，不拿 raw 的余量反推，
-  // 否则往左拖会把整排往右推）
+  // 整条栏位移：普通行程按 12%，越界那段按 35%，整体夹在 ±TAB_BAR_MAX（用户口径 10px 足够）。
+  // 方向和手指一致；不拿 raw 的越界余量反推，否则往左拖会把栏往右推。
   const travelPx = (damped - d.i0) * d.step;
   const inRangePx = (Math.max(0, Math.min(d.max, damped)) - d.i0) * d.step;
   const overPx = travelPx - inRangePx;
-  bar.style.setProperty('--tab-row-dx',
-    (inRangePx * TAB_ROW_FOLLOW + overPx * TAB_OVER_FOLLOW).toFixed(2) + 'px');
+  const barDx = Math.max(-TAB_BAR_MAX, Math.min(TAB_BAR_MAX,
+    inRangePx * TAB_BAR_FOLLOW + overPx * TAB_BAR_OVER));
+  bar.style.setProperty('--tab-bar-dx', barDx.toFixed(2) + 'px');
+  // 位移层：栏自己挪了 barDx，药丸内部行程要扣掉这一段，屏幕上才仍然停在手指底下；
+  // 越界时把药丸挡在玻璃栏内（栏体左右各留 1.2cqw 内缩，正好够走这一小段），
+  // 剩下的「拉不住」全部由整条栏的位移表达 —— 药丸探出圆角轮廓像画坏了
+  const fracRaw = (travelPx - barDx) / d.step + d.i0;
+  const frac = Math.max(-TAB_PILL_OVER, Math.min(d.max + TAB_PILL_OVER, fracRaw));
+  const thumb = document.getElementById('tabThumb');
+  thumb.style.setProperty('--tab-i', String(frac));
   // 形变层：离最近格子越远拉得越长；越界时按越界量拉（origin 朝栏内，别把拉伸甩到栏外）
   const dist = Math.min(1, Math.abs(damped - Math.round(damped)) * 2);
   const overStretch = Math.min(0.12, Math.abs(overPx) / d.step * 0.6);
   bar.style.setProperty('--pill-scale', (1 + Math.max(0.12 * dist, overStretch)).toFixed(3));
-  bar.style.setProperty('--pill-origin', (raw < 0 || (raw <= d.max && dx >= 0) ? '0%' : '100%') + ' 50%');
+  // 只写 x：CSS 里已经是 var(--pill-origin, 50%) 50%，多写一个 y 会变成三值、
+  // 整条声明被丢弃 → origin 退回 50% 50%，拉伸就朝两边甩出栏外
+  bar.style.setProperty('--pill-origin', raw < 0 || (raw <= d.max && dx >= 0) ? '0%' : '100%');
 }
 
 function _tabDragEnd(ev, silent) {
@@ -1236,7 +1242,7 @@ function _tabDragEnd(ev, silent) {
   bar.classList.remove('dragging');
   bar.classList.add('settling');
   setTimeout(() => bar.classList.remove('settling'), 360);
-  bar.style.removeProperty('--tab-row-dx');
+  bar.style.removeProperty('--tab-bar-dx');
   bar.style.removeProperty('--pill-scale');
   bar.style.removeProperty('--pill-origin');
   const items = [...bar.querySelectorAll('.tab-item')];

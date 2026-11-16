@@ -112,8 +112,9 @@ check('拖动监听绑在 #tabBar 上，不绑 document（不抢页面手势）'
       !/document\.addEventListener\('pointer(down|move)', _tabDrag/.test(js));
 check('拖动时位移层关掉过渡（否则跟不上手指）',
       /\.tab-bar\.dragging \.tab-thumb \{ transition: none; \}/.test(css));
-check('整排弹性偏移与按下/回弹的规则都在',
-      /--tab-row-dx/.test(js) && /\.tab-bar\.dragging \.tab-item \{/.test(css) &&
+check('整条栏弹性偏移与按下/回弹的规则都在（位移落在 .tab-bar 上，不再挪栏内图标）',
+      /--tab-bar-dx/.test(js) && /\.tab-bar\.dragging \{/.test(css) &&
+      !/\.tab-bar\.dragging \.tab-item \{/.test(css) &&
       /\.tab-item\.press \{/.test(css) && /@keyframes tabPressRebound/.test(css) &&
       /tab-item\.rebound \{/.test(css));
 check('拖动过半格走 switchTab 复用既有归位，且抑制拖动收尾的冒泡 click',
@@ -312,7 +313,8 @@ const dragGeo = () => page.evaluate(() => {
   return {
     thumb: rect(thumb),
     frac: parseFloat(getComputedStyle(thumb).getPropertyValue('--tab-i')),
-    rowDx: parseFloat(getComputedStyle(bar).getPropertyValue('--tab-row-dx')) || 0,
+    barDx: parseFloat(getComputedStyle(bar).getPropertyValue('--tab-bar-dx')) || 0,
+    barL: bar.getBoundingClientRect().left,
     items: items.map((t) => Object.assign(rect(t), {
       press: t.classList.contains('press'),
       rebound: t.classList.contains('rebound'),
@@ -343,10 +345,14 @@ const dA = await dragGeo();
 check('拖动激活后进入 dragging（位移层过渡已关）', dA.dragging === true);
 check('位移层 1:1 跟手', Math.abs((dA.thumb.l - thumb0L) - 60) <= 2,
       'Δthumb=' + px1(dA.thumb.l - thumb0L) + 'px / 手指 60px');
-check('分数序号 = 位移 / 格距', Math.abs(dA.frac - 60 / stepPx) <= 0.03,
-      'frac=' + px1(dA.frac) + ' 期望=' + px1(60 / stepPx));
-check('整排 tab 弹向滑动方向（≈18% 跟随）', Math.abs((dA.items[0].l - item0L) - 60 * 0.18) <= 2,
-      'Δitem=' + px1(dA.items[0].l - item0L) + 'px');
+check('整条栏朝滑动方向错开（12%，最多 10px）',
+      Math.abs((dA.barL - barBox.x) - 60 * 0.12) <= 1.5 && Math.abs(dA.barL - barBox.x) <= 10,
+      'Δbar=' + px1(dA.barL - barBox.x) + 'px（手指 60px）');
+check('栏内图标相对栏体不动（动的是整条栏，不是各图标各自平移）',
+      Math.abs((dA.items[0].l - item0L) - (dA.barL - barBox.x)) <= 0.6,
+      'Δitem=' + px1(dA.items[0].l - item0L) + ' Δbar=' + px1(dA.barL - barBox.x));
+check('药丸内部行程扣掉整条栏位移（屏幕上仍停在手指下）',
+      Math.abs(dA.thumb.l - thumb0L - 60) <= 2, 'Δthumb(screen)=' + px1(dA.thumb.l - thumb0L));
 check('形变层沿行程拉伸（药丸变宽、位移层宽度不变）',
       dA.pill.w > restW * 1.04 && Math.abs(dA.thumb.w - thumb0W) <= 0.6,
       'pill.w=' + px1(dA.pill.w) + ' thumb.w=' + px1(dA.thumb.w));
@@ -356,9 +362,10 @@ await page.waitForTimeout(480);
 const dA2 = await dragGeo();
 check('未过半格松手 → 弹回原格', dA2.dataI === '0' && Math.abs(dA2.thumb.l - thumb0L) <= 1.5,
       'Δthumb=' + px1(dA2.thumb.l - thumb0L) + ' data-i=' + dA2.dataI);
-check('收尾后整排归零、dragging/settling 都收干净',
-      Math.abs(dA2.rowDx) < 0.6 && dA2.dragging === false && dA2.settling === false,
-      'rowDx=' + px1(dA2.rowDx));
+check('收尾后整条栏归零、dragging/settling 都收干净',
+      Math.abs(dA2.barL - barBox.x) < 0.6 && Math.abs(dA2.barDx) < 0.2 &&
+      dA2.dragging === false && dA2.settling === false,
+      'Δbar=' + px1(dA2.barL - barBox.x));
 
 /* B. 越界：往左拖出第 1 格，位移应被橡皮筋压到 35% */
 await page.mouse.move(cx0, cy);
@@ -367,13 +374,16 @@ await page.mouse.move(cx0 - 25, cy, { steps: 3 });
 await page.mouse.move(cx0 - 60, cy, { steps: 5 });
 await page.waitForTimeout(150);
 const dB = await dragGeo();
-check('左越界时药丸被挡在玻璃栏内（不探出圆角轮廓）',
-      dB.thumb.l >= barBox.x - 0.2 && dB.thumb.l <= barBox.x + 4,
-      'thumb.l=' + px1(dB.thumb.l) + ' bar.l=' + px1(barBox.x));
-check('越界量被压在 35% 以内（不是 1:1，也不会被拉走）', Math.abs(dB.thumb.l - thumb0L) <= 6,
-      'Δthumb=' + px1(dB.thumb.l - thumb0L) + 'px（手指 -60，无阻尼会是 -60）');
-check('越界时整排继续同向弹性偏移（拉扯感落在整排上）',
-      dB.rowDx < -6 && dB.rowDx > -16, 'rowDx=' + px1(dB.rowDx));
+// 越界时整条栏也一起挪了，判定要跟「挪过之后的栏体」比，而不是静止位置
+check('左越界时药丸仍被挡在玻璃栏内（不探出圆角轮廓）',
+      dB.thumb.l >= dB.barL - 0.2 && dB.thumb.l <= dB.barL + 4.4,
+      'thumb.l=' + px1(dB.thumb.l) + ' bar.l=' + px1(dB.barL));
+check('越界量被压在阻尼里（不是 1:1，也不会被拉走）',
+      dB.thumb.l - thumb0L <= -8 && dB.thumb.l - thumb0L >= -14,
+      'Δthumb(screen)=' + px1(dB.thumb.l - thumb0L) + 'px（手指 -60；整条栏 -7.35 + 栏内夹取 -4.07）');
+check('越界时整条栏继续同向错开（拉扯感落在栏体上，仍 ≤10px）',
+      dB.barL - barBox.x < -6 && dB.barL - barBox.x > -10,
+      'Δbar=' + px1(dB.barL - barBox.x) + 'px');
 await page.mouse.up();
 await page.waitForTimeout(480);
 const dB2 = await dragGeo();
@@ -473,6 +483,28 @@ await shot('light', 'print', '浅色_打印选中.png');
 await shot('light', 'me', '浅色_我选中.png');
 await shot('dark', 'me', '深色_我选中.png');
 await shot('dark', 'print', '深色_打印选中.png');
+
+/* 拖动中的两张：整条栏错开 + 药丸在手指下（静态图看不出这个，必须留证据） */
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(700);
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.mouse.move(cx0 + 34, cy, { steps: 4 });
+await page.mouse.move(cx0 + 60, cy, { steps: 5 });
+await page.waitForTimeout(180);
+await page.screenshot({ path: SHOTS + '/拖动中_右拖.png', clip: { x: 0, y: 640, width: 360, height: 160 } });
+console.log('  · 拖动中_右拖.png');
+await page.mouse.up();
+await page.waitForTimeout(480);
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.mouse.move(cx0 - 30, cy, { steps: 4 });
+await page.mouse.move(cx0 - 60, cy, { steps: 5 });
+await page.waitForTimeout(180);
+await page.screenshot({ path: SHOTS + '/拖动中_左越界.png', clip: { x: 0, y: 640, width: 360, height: 160 } });
+console.log('  · 拖动中_左越界.png');
+await page.mouse.up();
+await page.waitForTimeout(480);
 
 check('全程没有打到生产接口（只访问本地桩）', foreign.length === 0, foreign.slice(0, 3).join(' | '));
 
