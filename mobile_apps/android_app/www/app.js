@@ -1126,6 +1126,138 @@ function initTabThumb() {
   thumb.style.transition = '';
 }
 
+/* ── 拖动 / 按下反馈（APP 2026-11-16 第二轮）──────────────────────────────
+   只在 #tabBar 自己的命中面上起手：页面内容是它的兄弟节点，拖栏不会碰到页面里
+   那套横滑手势（gestureBus 挂在滚动内容上）。
+   · 位移层跟手：.dragging 里 transition:none，直接写分数 --tab-i（CSS 按
+     calc((100% + 2.4cqw) * var(--tab-i)) 落位，分数就是「格与格之间」）
+   · 形变层沿行程 scaleX，origin 落在来向一侧 —— 才像被手指拽着走
+   · 整排 tab 按 TAB_ROW_FOLLOW 跟随，越界按 TAB_RUBBER 阻尼（弹性偏移）
+   · 松手：过半格 → switchTab（复用 320ms 归位 + goo + wave + bump）
+           未过半格 → 写回原格，320ms 自己弹回去
+   · 点按：按下压 0.92，松手船式回弹；同格点击才放 rebound，跨格交给 wave，
+           两套 transform 动画不同时挂在一个格子上（会互相顶掉） */
+const TAB_RUBBER = 0.35;       // 越界阻尼：拖出栏体后的行程只剩 35%
+const TAB_ROW_FOLLOW = 0.18;   // 整排跟随比例（滑块跟满、tab 跟一点 → 错位感）
+const TAB_OVER_FOLLOW = 0.45;  // 越界那段整排跟得更明显（橡皮筋要有「拉得住」的手感）
+const TAB_PILL_OVER = 0.028;   // 药丸越界最多再走 0.028 格（≈4px，正好把栏体左右那 1.2cqw 内缩走完）
+                               // —— 再多药丸就探出玻璃栏的圆角轮廓了（截图实测）
+let _tabDrag = null;
+let _tabSuppressClickUntil = 0;
+
+function _tabStep(bar) {
+  const items = [...bar.querySelectorAll('.tab-item')];
+  if (items.length < 2) return 0;
+  const r0 = items[0].getBoundingClientRect();
+  const r1 = items[1].getBoundingClientRect();
+  return r1.left - r0.left;   // 一格步长 = 栏宽 / 格数（栏宽变化自动跟着走）
+}
+
+function _tabDragStart(e) {
+  const bar = document.getElementById('tabBar');
+  if (!bar || _tabSwitching || _tabDrag) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  const step = _tabStep(bar);
+  if (!step) return;
+  bar.classList.remove('settling');   // 上一次松手的回弹还没收完就接下一次拖
+  const item = e.target && e.target.closest ? e.target.closest('.tab-item') : null;
+  if (item) {
+    item.classList.remove('rebound');
+    item.classList.add('press');
+  }
+  _tabDrag = {
+    id: e.pointerId, x0: e.clientX, y0: e.clientY, i0: currentTabThumbIndex(),
+    step: step, max: bar.querySelectorAll('.tab-item').length - 1,
+    item: item, active: false,
+  };
+}
+
+function _tabDragMove(e) {
+  const d = _tabDrag;
+  if (!d || e.pointerId !== d.id) return;
+  const bar = document.getElementById('tabBar');
+  if (!bar) return;
+  const dx = e.clientX - d.x0;
+  const dy = e.clientY - d.y0;
+  if (!d.active) {
+    if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+    // 竖向意图让位：栏体上本来没有滚动，但方向锁定要和页面手势同一口径
+    if (Math.abs(dy) > Math.abs(dx)) { _tabDragEnd(e, true); return; }
+    d.active = true;
+    bar.classList.add('dragging');
+    if (d.item) d.item.classList.remove('press');
+    // 拖动真正开始后才抓指针：点在格子上时就抓会让 click 落到栏体上，普通点按就失效了
+    try { bar.setPointerCapture(d.id); } catch (err) { /* 老 WebView 不支持就算了 */ }
+  }
+  const raw = d.i0 + dx / d.step;
+  let damped = raw;
+  if (raw < 0) damped = raw * TAB_RUBBER;
+  else if (raw > d.max) damped = d.max + (raw - d.max) * TAB_RUBBER;
+  // 位移层：越界时把药丸挡在玻璃栏内（栏体左右各留 1.2cqw 内缩，正好够走这一小段），
+  // 剩下的「拉不住」全部由整排偏移表达 —— 药丸探出圆角轮廓像画坏了
+  const frac = Math.max(-TAB_PILL_OVER, Math.min(d.max + TAB_PILL_OVER, damped));
+  const thumb = document.getElementById('tabThumb');
+  thumb.style.setProperty('--tab-i', String(frac));
+  // 整排跟随：普通行程按 18%，越界那段按 45%（方向和手指一致，不拿 raw 的余量反推，
+  // 否则往左拖会把整排往右推）
+  const travelPx = (damped - d.i0) * d.step;
+  const inRangePx = (Math.max(0, Math.min(d.max, damped)) - d.i0) * d.step;
+  const overPx = travelPx - inRangePx;
+  bar.style.setProperty('--tab-row-dx',
+    (inRangePx * TAB_ROW_FOLLOW + overPx * TAB_OVER_FOLLOW).toFixed(2) + 'px');
+  // 形变层：离最近格子越远拉得越长；越界时按越界量拉（origin 朝栏内，别把拉伸甩到栏外）
+  const dist = Math.min(1, Math.abs(damped - Math.round(damped)) * 2);
+  const overStretch = Math.min(0.12, Math.abs(overPx) / d.step * 0.6);
+  bar.style.setProperty('--pill-scale', (1 + Math.max(0.12 * dist, overStretch)).toFixed(3));
+  bar.style.setProperty('--pill-origin', (raw < 0 || (raw <= d.max && dx >= 0) ? '0%' : '100%') + ' 50%');
+}
+
+function _tabDragEnd(ev, silent) {
+  const d = _tabDrag;
+  if (!d) return;
+  _tabDrag = null;
+  const bar = document.getElementById('tabBar');
+  if (!bar) return;
+  try { bar.releasePointerCapture(d.id); } catch (err) { /* 没抓住过就算了 */ }
+  if (d.item) d.item.classList.remove('press');
+  if (!d.active) {
+    // 纯点按：同格 → 船式回弹；跨格 → 交给 switchTab 的 wave（别两套同挂）
+    if (!silent && d.item && d.item.dataset.tab === currentTab) {
+      d.item.classList.remove('rebound');
+      void d.item.offsetWidth;
+      d.item.classList.add('rebound');
+      setTimeout(() => d.item.classList.remove('rebound'), 460);
+    }
+    return;
+  }
+  const thumb = document.getElementById('tabThumb');
+  const frac = parseFloat(thumb.style.getPropertyValue('--tab-i'));
+  const target = Math.max(0, Math.min(d.max, Math.round(isNaN(frac) ? d.i0 : frac)));
+  bar.classList.remove('dragging');
+  bar.classList.add('settling');
+  setTimeout(() => bar.classList.remove('settling'), 360);
+  bar.style.removeProperty('--tab-row-dx');
+  bar.style.removeProperty('--pill-scale');
+  bar.style.removeProperty('--pill-origin');
+  const items = [...bar.querySelectorAll('.tab-item')];
+  if (target !== d.i0 && items[target]) {
+    _tabSuppressClickUntil = Date.now() + 400;
+    switchTab(items[target].dataset.tab);
+  } else {
+    thumb.style.setProperty('--tab-i', String(d.i0));   // 没过半格：320ms 弹回原格
+  }
+}
+
+function initTabDrag() {
+  const bar = document.getElementById('tabBar');
+  if (!bar || bar.dataset.dragBound) return;
+  bar.dataset.dragBound = '1';
+  bar.addEventListener('pointerdown', _tabDragStart);
+  bar.addEventListener('pointermove', _tabDragMove);
+  bar.addEventListener('pointerup', _tabDragEnd);
+  bar.addEventListener('pointercancel', (e) => _tabDragEnd(e, true));   // 被系统打断：直接收摊，别弹回弹
+}
+
 // tab 切换：平铺推拉转场 —— 两页并排铺满内容区，旧页抽出、新页从对面推入，互不重叠
 function switchTab(tab) {
   if (tab === currentTab || _tabSwitching) return;
@@ -1993,7 +2125,10 @@ function setupPressFeedback() {
 
 function setupTabs() {
   document.querySelectorAll('.tab-item').forEach(item => {
-    item.addEventListener('click', () => switchTab(item.dataset.tab));
+    item.addEventListener('click', () => {
+      if (Date.now() < _tabSuppressClickUntil) return;   // 这一段是拖动收尾，别再补一次切换
+      switchTab(item.dataset.tab);
+    });
   });
 }
 
@@ -2005,6 +2140,7 @@ function initApp() {
   } catch (e) { /* 日志挂了不能拖垮启动 */ }
   setupTabs();
   initTabThumb();
+  initTabDrag();
   setupNav();
   setupPressFeedback();
   // 首屏入场由打印页各卡片的 .enter-XX 动画驱动（0.5s 起逐 0.1s 递增），

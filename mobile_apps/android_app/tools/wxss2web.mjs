@@ -617,6 +617,12 @@ button {
        @keyframes tabWave / .tab-icon-wrap.bump + @keyframes tabIconBump，
        以及 .tab-item 的 position/z-index 与 .icon-active 改 transparent。
        验收脚本 other/tests/verify_glass_tabbar.mjs 会读这批规则，贴回时别漏。
+    · 2026-11-16 第二轮（拖动 / 弹性偏移 / 按下回弹）：.tab-bar 的 touch-action:none 与
+        user-select:none、.tab-bar img 的 -webkit-user-drag:none（少了它拖图标会触发 Chrome
+        原生图片拖拽，pointermove 立刻被 pointercancel 掐断）、.tab-bar.dragging 下的
+        .tab-thumb / .tab-pill / .tab-item 三条（跟手关过渡 + --tab-row-dx + --pill-scale /
+        --pill-origin）、.tab-bar.settling .tab-item（340ms 弹性归零）、.tab-item.press
+        （scale .92）与 .tab-item.rebound + @keyframes tabPressRebound。
     查法：git diff www/styles.css | grep 2026-11 （重跑前先存这份 diff 备用）。
 `;
 

@@ -744,20 +744,22 @@
   <view class="tab-bar" id="tabBar">
     <!-- 玻璃滑块：位移层 .tab-thumb 只做 translate，形变层 .tab-pill 只做 scaleX。
          必须是两个元素 —— 合成到一个元素上时两条插值互相拉扯，滑块会被拉成畸形。
-         只响应点击，不做拖动（拖动会和页面左右滑退出手势打架）。
+         除点击外还能直接拖：按住栏体左右拖 → 位移层跟手、整排 tab 弹性偏移、
+         形变层沿行程拉伸；松手过半格吸附到相邻格（复用 switchTab 的 320ms 归位）。
+         拖动只在栏体自己的命中面上起手，页面内容是兄弟节点，不抢页面内的横滑手势。
          2026-11-16 落地，参数取自 .dsh/tmp_modediff/tabbar 的 demo。 -->
     <view class="tab-thumb" id="tabThumb" data-i="0">
       <view class="tab-pill" id="tabPill"><view class="tab-pill-gloss"></view></view>
     </view>
     <view class="tab-item" data-tab="print">
       <view class="tab-icon-wrap icon-active">
-        <img class="tab-icon" src="images/tab/print.png" alt="打印">
+        <img class="tab-icon" src="images/tab/print.png" alt="打印" draggable="false">
       </view>
       <text class="tab-text text-active">打印</text>
     </view>
     <view class="tab-item" data-tab="me">
       <view class="tab-icon-wrap">
-        <img class="tab-icon" src="images/tab/me.png" alt="我">
+        <img class="tab-icon" src="images/tab/me.png" alt="我" draggable="false">
       </view>
       <text class="tab-text">我</text>
     </view>

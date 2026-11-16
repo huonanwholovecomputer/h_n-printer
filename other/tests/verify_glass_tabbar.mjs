@@ -6,7 +6,9 @@
  *   ② 切换时只有位移 + 轻微拉伸，**落位宽度不变**（一旦有人把位移改回 left/width 动画，
  *      或把两层合并成一个元素，就会量到宽度变化 / 高度抖动）；
  *   ③ 药丸不探出玻璃栏的圆角轮廓；
- *   ④ 图标 bump 与整排 wave 真的被触发（而不是只加了 class 没有 keyframes）。
+ *   ④ 图标 bump 与整排 wave 真的被触发（而不是只加了 class 没有 keyframes）；
+ *   ⑤ 拖动真的跟手（1:1）、越界真的被橡皮筋压住、过半格才吸附、按下去真的先压缩再
+ *      船式回弹 —— 这几条只有真手势才量得出来，静态 grep 最多证明"写了 pointermove"。
  *
  * 探针自证：把 transform 钉死（模拟「滑块不动」的坏实现），点击「我」之后药丸
  * 若仍然落在第 1 格 —— 说明这个探针量的是真实位置，红/绿都有意义。
@@ -102,8 +104,20 @@ check('tabBar 高度仍是 13.2cqw（气泡避让的几何基准不许动）', t
 
 check('switchTab 会驱动滑块位移', /slideTabThumb\(/.test(js));
 check('启动时首帧定位，不从左边滑一遍', /initTabThumb\(\)/.test(js));
-check('滑块不做拖动（不与页面左右滑退出手势抢手势）',
-      !/tabThumb[\s\S]{0,120}pointermove/.test(js) && !/pointermove[\s\S]{0,120}tabThumb/.test(js));
+/* 拖动（2026-11-16 第二轮）：允许拖，但必须「只在栏体自己的命中面上起手」
+   —— 页面内容是 tabBar 的兄弟节点，拖栏不许把页面里那套横滑手势（gestureBus）带起来 */
+check('拖动监听绑在 #tabBar 上，不绑 document（不抢页面手势）',
+      /bar\.addEventListener\('pointerdown', _tabDragStart\)/.test(js) &&
+      /bar\.addEventListener\('pointermove', _tabDragMove\)/.test(js) &&
+      !/document\.addEventListener\('pointer(down|move)', _tabDrag/.test(js));
+check('拖动时位移层关掉过渡（否则跟不上手指）',
+      /\.tab-bar\.dragging \.tab-thumb \{ transition: none; \}/.test(css));
+check('整排弹性偏移与按下/回弹的规则都在',
+      /--tab-row-dx/.test(js) && /\.tab-bar\.dragging \.tab-item \{/.test(css) &&
+      /\.tab-item\.press \{/.test(css) && /@keyframes tabPressRebound/.test(css) &&
+      /tab-item\.rebound \{/.test(css));
+check('拖动过半格走 switchTab 复用既有归位，且抑制拖动收尾的冒泡 click',
+      /_tabSuppressClickUntil/.test(js) && /switchTab\(items\[target\]\.dataset\.tab\)/.test(js));
 check('旧的 .tab-hover 缩放不再叠加到图标弹跳上', !/classList\.add\('tab-hover'\)/.test(js));
 
 /* ── ② 渲染环境（桩后端 + 真实 www/） ──────────────────────────────── */
@@ -275,7 +289,174 @@ check('★ 坏实现下药丸真的不动（说明探针量的是真实位置，
       'pill.c=' + px1(centerOf(gp.pill)) + '（此时 data-i 已是 1，但药丸还在第 1 格）');
 await page.evaluate(() => document.getElementById('__probe_pin').remove());
 
-console.log('\n=== ⑥ 截图 ===');
+console.log('\n=== ⑥ 拖动：跟手 / 越界阻尼 / 过半格吸附 / 按下船式回弹 ===');
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(800);
+const barBox = await page.evaluate(() => {
+  const r = document.getElementById('tabBar').getBoundingClientRect();
+  return { x: r.left, y: r.top, w: r.width, h: r.height };
+});
+const stepPx = await page.evaluate(() => {
+  const items = document.querySelectorAll('.tab-item');
+  return items[1].getBoundingClientRect().left - items[0].getBoundingClientRect().left;
+});
+const dragGeo = () => page.evaluate(() => {
+  const rect = (el) => { const r = el.getBoundingClientRect(); return { l: r.left, r: r.right, w: r.width }; };
+  const bar = document.getElementById('tabBar');
+  const thumb = document.getElementById('tabThumb');
+  const items = [...document.querySelectorAll('.tab-item')];
+  const scaleOf = (el) => {
+    const m = getComputedStyle(el).transform.match(/matrix\(([^)]*)\)/);
+    return m ? parseFloat(m[1].split(',')[0]) : 1;
+  };
+  return {
+    thumb: rect(thumb),
+    frac: parseFloat(getComputedStyle(thumb).getPropertyValue('--tab-i')),
+    rowDx: parseFloat(getComputedStyle(bar).getPropertyValue('--tab-row-dx')) || 0,
+    items: items.map((t) => Object.assign(rect(t), {
+      press: t.classList.contains('press'),
+      rebound: t.classList.contains('rebound'),
+      scale: scaleOf(t),
+      amin: getComputedStyle(t).animationName,
+    })),
+    pill: rect(document.getElementById('tabPill')),
+    dragging: bar.classList.contains('dragging'),
+    settling: bar.classList.contains('settling'),
+    dataI: thumb.getAttribute('data-i'),
+    tab: typeof currentTab === 'string' ? currentTab : '',
+    meHidden: getComputedStyle(document.getElementById('page-me')).display === 'none',
+  };
+});
+const cx0 = barBox.x + barBox.w * 0.25;   // 第 1 格中心附近
+const cy = barBox.y + barBox.h / 2;
+const d0 = await dragGeo();
+const thumb0L = d0.thumb.l, thumb0W = d0.thumb.w, item0L = d0.items[0].l;
+console.log('  栏=' + px1(barBox.w) + 'px 格距=' + px1(stepPx) + 'px 药丸宽=' + px1(thumb0W) + 'px 起点x=' + px1(cx0));
+
+/* A. 小拖（不到半格）：跟手但不切页，松手弹回 */
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.mouse.move(cx0 + 20, cy, { steps: 3 });
+await page.mouse.move(cx0 + 60, cy, { steps: 5 });
+await page.waitForTimeout(150);   // 整排跟随带 90ms 过渡：等它落定再量，量的是稳态偏移
+const dA = await dragGeo();
+check('拖动激活后进入 dragging（位移层过渡已关）', dA.dragging === true);
+check('位移层 1:1 跟手', Math.abs((dA.thumb.l - thumb0L) - 60) <= 2,
+      'Δthumb=' + px1(dA.thumb.l - thumb0L) + 'px / 手指 60px');
+check('分数序号 = 位移 / 格距', Math.abs(dA.frac - 60 / stepPx) <= 0.03,
+      'frac=' + px1(dA.frac) + ' 期望=' + px1(60 / stepPx));
+check('整排 tab 弹向滑动方向（≈18% 跟随）', Math.abs((dA.items[0].l - item0L) - 60 * 0.18) <= 2,
+      'Δitem=' + px1(dA.items[0].l - item0L) + 'px');
+check('形变层沿行程拉伸（药丸变宽、位移层宽度不变）',
+      dA.pill.w > restW * 1.04 && Math.abs(dA.thumb.w - thumb0W) <= 0.6,
+      'pill.w=' + px1(dA.pill.w) + ' thumb.w=' + px1(dA.thumb.w));
+check('没松手就不切页', dA.meHidden === true && dA.tab === 'print');
+await page.mouse.up();
+await page.waitForTimeout(480);
+const dA2 = await dragGeo();
+check('未过半格松手 → 弹回原格', dA2.dataI === '0' && Math.abs(dA2.thumb.l - thumb0L) <= 1.5,
+      'Δthumb=' + px1(dA2.thumb.l - thumb0L) + ' data-i=' + dA2.dataI);
+check('收尾后整排归零、dragging/settling 都收干净',
+      Math.abs(dA2.rowDx) < 0.6 && dA2.dragging === false && dA2.settling === false,
+      'rowDx=' + px1(dA2.rowDx));
+
+/* B. 越界：往左拖出第 1 格，位移应被橡皮筋压到 35% */
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.mouse.move(cx0 - 25, cy, { steps: 3 });
+await page.mouse.move(cx0 - 60, cy, { steps: 5 });
+await page.waitForTimeout(150);
+const dB = await dragGeo();
+check('左越界时药丸被挡在玻璃栏内（不探出圆角轮廓）',
+      dB.thumb.l >= barBox.x - 0.2 && dB.thumb.l <= barBox.x + 4,
+      'thumb.l=' + px1(dB.thumb.l) + ' bar.l=' + px1(barBox.x));
+check('越界量被压在 35% 以内（不是 1:1，也不会被拉走）', Math.abs(dB.thumb.l - thumb0L) <= 6,
+      'Δthumb=' + px1(dB.thumb.l - thumb0L) + 'px（手指 -60，无阻尼会是 -60）');
+check('越界时整排继续同向弹性偏移（拉扯感落在整排上）',
+      dB.rowDx < -6 && dB.rowDx > -16, 'rowDx=' + px1(dB.rowDx));
+await page.mouse.up();
+await page.waitForTimeout(480);
+const dB2 = await dragGeo();
+check('越界松手 → 回第 1 格', dB2.dataI === '0' && Math.abs(dB2.thumb.l - thumb0L) <= 1.5);
+
+/* C. 竖向拖：方向锁定让位，滑块不许动 */
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.mouse.move(cx0 + 2, cy - 40, { steps: 5 });
+const dC = await dragGeo();
+check('竖向拖不激活滑块（方向锁定让位）',
+      dC.dragging === false && Math.abs(dC.thumb.l - thumb0L) <= 1.5);
+await page.mouse.up();
+await page.waitForTimeout(320);
+
+/* D. 点按：同格按下先压缩，松手船式回弹 */
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.waitForTimeout(130);
+const dD = await dragGeo();
+check('按下格子先压缩（scale ≈ 0.92）',
+      dD.items[0].press === true && Math.abs(dD.items[0].scale - 0.92) <= 0.02,
+      'press=' + dD.items[0].press + ' scale=' + dD.items[0].scale);
+await page.mouse.up();
+await page.waitForTimeout(70);
+const dD2 = await dragGeo();
+check('松手船式回弹（rebound 动画带过冲）',
+      dD2.items[0].rebound === true && /tabPressRebound/.test(dD2.items[0].amin),
+      'rebound=' + dD2.items[0].rebound + ' anim=' + dD2.items[0].amin);
+await page.waitForTimeout(520);
+const dD3 = await dragGeo();
+check('回弹收干净（class 不残留）', dD3.items.every((i) => !i.press && !i.rebound));
+
+/* E. 过半格松手 → 吸附相邻格并切页 */
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.mouse.move(cx0 + 50, cy, { steps: 4 });
+await page.mouse.move(cx0 + 110, cy, { steps: 6 });
+await page.mouse.up();
+await page.waitForTimeout(850);
+const dE = await dragGeo();
+check('过半格松手 → 吸附第 2 格并切到「我」页',
+      dE.dataI === '1' && dE.tab === 'me' && dE.meHidden === false &&
+      Math.abs(centerOf(dE.items[1]) - centerOf(dE.pill)) <= 2,
+      'data-i=' + dE.dataI + ' tab=' + dE.tab + ' pill.c=' + px1(centerOf(dE.pill)) +
+      ' slot2.c=' + px1(centerOf(dE.items[1])));
+
+/* F. 真机路径：触摸事件（CDP 派发 touch，Chrome 会合成 pointer 事件）——鼠标能拖不等于手指能拖 */
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(700);
+const cdp = await page.context().newCDPSession(page);
+await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true, maxTouchPoints: 1 });
+const t0 = await dragGeo();
+const scroll0 = await page.evaluate(() => window.scrollY);
+async function touch(type, x, y) {
+  await cdp.send('Input.dispatchTouchEvent', {
+    type,
+    touchPoints: type === 'touchEnd' ? [] : [{ x, y, id: 1 }],
+  });
+}
+await touch('touchStart', cx0, cy);
+for (const dx of [6, 18, 34, 52, 60]) {
+  await touch('touchMove', cx0 + dx, cy);
+  await page.waitForTimeout(24);
+}
+await page.waitForTimeout(160);
+const dF = await dragGeo();
+check('手指拖也能激活（touch → pointer 合成路径通）', dF.dragging === true && dF.tab === 'print',
+      'dragging=' + dF.dragging + ' tab=' + dF.tab);
+check('手指拖同样 1:1 跟手', Math.abs((dF.thumb.l - t0.thumb.l) - 60) <= 3,
+      'Δthumb=' + px1(dF.thumb.l - t0.thumb.l) + 'px / 手指 60px');
+check('触摸拖栏不把页面滚走（touch-action 生效）',
+      (await page.evaluate(() => window.scrollY)) === scroll0);
+await touch('touchEnd', cx0 + 60, cy);
+await page.waitForTimeout(480);
+const dF2 = await dragGeo();
+check('手指松手同样弹回原格、收干净',
+      dF2.dataI === '0' && dF2.dragging === false && Math.abs(dF2.thumb.l - t0.thumb.l) <= 1.5,
+      'data-i=' + dF2.dataI + ' Δthumb=' + px1(dF2.thumb.l - t0.thumb.l));
+await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+await cdp.detach();
+
+console.log('\n=== ⑦ 截图 ===');
 async function shot(mode, tab, file) {
   await page.evaluate((m) => {
     localStorage.setItem('hn_theme_mode', m);
