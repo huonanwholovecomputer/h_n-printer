@@ -52,7 +52,9 @@
   height: calc(100% - 14rpx);
   z-index: 1;
   pointer-events: none;   /* 命中面留给下面的 .tab-item，拖动不从药丸上起手 */
-  opacity: 0;             /* 首帧由视图层落位后再显形，避免「我」页新建实例闪一下第 1 格 */
+  /* 这里不能写 opacity: 0 之类的「先藏起来等视图层显形」：逻辑层每次 setData 都会重新下发
+     节点的 style，把视图层 setStyle 写的内联样式整条抹掉 ⇒ 表现为「一点药丸就没了」。
+     落位改由 WXML 上 data 兜底的 transform + 视图层逐帧覆盖（见 index.wxml / tabbar.wxs）。 */
   will-change: transform;
 }
 

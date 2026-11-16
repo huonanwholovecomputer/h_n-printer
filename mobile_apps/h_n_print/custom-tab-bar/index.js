@@ -10,6 +10,8 @@ Component({
     selected: 0,
     wave: false,
     cfg: null,
+    // 位移层由 data 兜底的落位（px）：视图层抹掉内联样式后的最后一道保险
+    thumbX: 0,
     list: [
       { text: '打印', icon: '/images/tab/print.png', pagePath: 'pages/index/index', active: true },
       { text: '我', icon: '/images/tab/me.png', pagePath: 'pages/me/me', active: false },
@@ -21,6 +23,7 @@ Component({
       this._handledTapAt = 0
       this._waveTimer = 0
       this._geo = null
+      this._quiet = false
       this._refresh()
     },
     detached() {
@@ -29,6 +32,13 @@ Component({
   },
   pageLifetimes: {
     show() { this._refresh() },
+  },
+  observers: {
+    // 页面会直接对 tabBar setData（提交时切 hideBorder、onShow 时切 selected）：
+    // 每次 setData 框架都会重新下发节点 style，把视图层写的位移整条抹掉，
+    // 所以这两个字段一变就补画一次（只重画，不动位置）。
+    hideBorder() { if (!this._quiet) this._repaint() },
+    selected() { if (!this._quiet) this._repaint() },
   },
   methods: {
     // 几何：一格多少 px、药丸允许探出多少（= 左右内缩 / 格宽）。与 index.wxss 的
@@ -67,12 +77,32 @@ Component({
       const patch = {
         selected: idx,
         dark,
-        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel: idx, rev: this._rev },
+        thumbX: idx * geo.step,
+        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel: idx, rev: this._rev, snap: true },
       }
+      this._markQuiet()
       this.data.list.forEach((item, i) => {
         if (item.active !== (i === idx)) patch['list[' + i + '].active'] = (i === idx)
       })
       this.setData(patch)
+    },
+
+    // 自己 setData 期间不要触发 observers 的补画（否则一次切换会多打一轮）
+    _markQuiet() {
+      this._quiet = true
+      const done = () => { this._quiet = false }
+      if (wx.nextTick) wx.nextTick(done)
+      else setTimeout(done, 0)
+    },
+
+    // 只把位置补画回来（不动 state.pill / state.sel）—— 用于 setData 抹掉内联样式之后
+    _repaint() {
+      const geo = this._geo || this._measure()
+      this._rev += 1
+      this.setData({
+        thumbX: (this.data.selected || 0) * geo.step,
+        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, rev: this._rev, snap: false },
+      })
     },
 
     // 兜底：视图层没接住这一下时（老基础库/JS 层事件）仍能切页。
@@ -116,15 +146,26 @@ Component({
       if (cp && typeof cp.animateExit === 'function' && !cp.animateExit(dir)) return
       wx.setStorageSync('_tabFrom', prev)
       wx.setStorageSync('_tabTo', index)
-      const patch = { selected: index, wave: true }
+      const geo = this._geo || this._measure()
+      this._rev += 1
+      const patch = {
+        selected: index,
+        wave: true,
+        thumbX: index * geo.step,
+        // 同一次 setData 里带上 cfg：框架重下发 style 之后立刻按视图层状态补画回来
+        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, rev: this._rev, snap: false },
+      }
       this.data.list.forEach((item, i) => {
         if (item.active !== (i === index)) patch['list[' + i + '].active'] = (i === index)
       })
+      this._markQuiet()
       this.setData(patch)
       if (this._waveTimer) clearTimeout(this._waveTimer)
       this._waveTimer = setTimeout(() => {
         this._waveTimer = 0
+        this._markQuiet()
         this.setData({ wave: false })
+        this._repaint()
       }, 700)
       // 200ms > 页面退出动画 160ms：药丸滑到位、页面滑出去之后再换页
       setTimeout(() => { wx.switchTab({ url: '/' + target.pagePath }) }, 200)

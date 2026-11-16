@@ -64,7 +64,7 @@ function makeOwner(engine, cfg) {
     _logs: logs,
     _calls: calls,
   };
-  if (cfg) engine.onConfig(cfg, null, owner);
+  if (cfg) engine.onConfig(Object.assign({ snap: true }, cfg), null, owner);
   return owner;
 }
 
@@ -119,7 +119,7 @@ function runContractTests() {
         ['touchstart', 'touchmove', 'touchend', 'touchcancel'].every(
           (k) => new RegExp('bind' + k + '="\\{\\{tabbar\\.' + k + '\\}\\}"').test(wxml)));
   check('wxml 位移层与玻璃块是两个元素（.tab-thumb > .tab-pill > .tab-pill-gloss）',
-        /<view class="tab-thumb">\s*<view class="tab-pill"><view class="tab-pill-gloss"><\/view><\/view>/.test(wxml));
+        /<view class="tab-thumb"[^>]*>\s*<view class="tab-pill"><view class="tab-pill-gloss"><\/view><\/view>/.test(wxml));
   check('wxml 两格仍是 flex 子项并带 data-index',
         /class="tab-item \{\{wave \? 'wave ' \+ \(index === 0 \? 'w0' : 'w1'\) : ''\}\}"/.test(wxml)
         && /data-index="\{\{index\}\}"/.test(wxml));
@@ -139,6 +139,11 @@ function runContractTests() {
         !/backdrop-filter/.test(barBlock) && !/background/.test(barBlock)
         && /backdrop-filter:\s*saturate\(180%\) blur\(14px\)/.test(block(wxss, '.tab-glass')));
   const thumbBlock = block(wxss, '.tab-thumb');
+  check('★ 位移层不能自带 opacity 显隐门（setData 重下发 style 会把视图层的写入抹掉 ⇒ 一点就消失）',
+        !/opacity:\s*0/.test(thumbBlock.replace(/\/\*[\s\S]*?\*\//g, '')));
+  check('★ 位移层有 data 兜底的落位（style 绑定 thumbX，被抹掉也落在正确格位）',
+        /class="tab-thumb" style="transform: translate3d\(\{\{thumbX\}\}px, 0, 0\)"/.test(wxml)
+        && /thumbX: idx \* geo\.step/.test(js) && /_repaint\(\)/.test(js));
   check('★ 位移层只平移：没有 scale / animation，pointer-events:none（命中面留给 tab-item）',
         !/scale/.test(thumbBlock) && !/animation/.test(thumbBlock)
         && /pointer-events:\s*none/.test(thumbBlock) && /will-change:\s*transform/.test(thumbBlock));
@@ -162,7 +167,8 @@ function runContractTests() {
         !/=>/.test(code) && !/\bconst\b/.test(code) && !/\blet\b/.test(code)
         && !/\u0060/.test(code) && !/\.\.\./.test(code) && !/\*\*/.test(code));
   check('★ 手势期间没有任何 setData（WXS 全逐帧 setStyle，逻辑层不参与）',
-        !/setData/.test(wxs) && /\.setStyle\(/.test(wxs));
+        !/setData/.test(wxs.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
+        && /\.setStyle\(/.test(wxs));
   check('几何参数由逻辑层下发（_measure：slot = barW / 2、inset 9rpx）',
         /const slot = barW \/ 2/.test(js) && /const inset = 9 \* pxPerRpx/.test(js)
         && /cfg: \{ step: geo\.step, maxIdx: geo\.maxIdx, over: geo\.over, sel: idx/.test(js));
@@ -178,7 +184,8 @@ function runSettleTests() {
   const o1 = makeOwner(engine, { step: GEO.step, maxIdx: 1, over: GEO.over, sel: 1 });
   check('页面出现在第 2 格：药丸直接落在 147.5px（不做「滑过来」）',
         Math.abs(pillX(o1) - 147.5) < 0.01, String(pillX(o1)));
-  check('首帧顺带显形（opacity 1）', lastStyle(o1, 'thumb').opacity === '1');
+  check('★ 位移层样式只由 transform 承载（不再靠视图层写死 opacity —— 那会被 setData 抹掉）',
+        lastStyle(o1, 'thumb').opacity === undefined);
   check('整条栏位移为 0', barX(o1) === 0, String(barX(o1)));
 
   const o2 = makeOwner(engine, { step: GEO.step, maxIdx: 1, over: GEO.over, sel: 0 });
@@ -327,10 +334,10 @@ function runRefreshTests() {
   const engine = loadEngine();
   const o = makeOwner(engine, { step: GEO.step, maxIdx: 1, over: GEO.over, sel: 0 });
   check('第 1 格起点 0px', Math.abs(pillX(o)) < 0.01, String(pillX(o)));
-  engine.onConfig({ step: GEO.step, maxIdx: 1, over: GEO.over, sel: 1, rev: 2 }, null, o);
+  engine.onConfig({ step: GEO.step, maxIdx: 1, over: GEO.over, sel: 1, rev: 2, snap: true }, null, o);
   check('★ 换到「我」页后新实例直接落在第 2 格（不从前一格滑）',
         Math.abs(pillX(o) - 147.5) < 0.01, String(pillX(o)));
-  engine.onConfig({ step: GEO.step, maxIdx: 1, over: GEO.over, sel: 0, rev: 3 }, null, o);
+  engine.onConfig({ step: GEO.step, maxIdx: 1, over: GEO.over, sel: 0, rev: 3, snap: true }, null, o);
   check('★ 换回「打印」页同理', Math.abs(pillX(o)) < 0.01, String(pillX(o)));
 }
 

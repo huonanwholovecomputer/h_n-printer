@@ -8,7 +8,7 @@
   change:cfg="{{tabbar.onConfig}}"
 >
   <view class="tab-glass">
-    <view class="tab-thumb">
+    <view class="tab-thumb" style="transform: translate3d({{thumbX}}px, 0, 0)">
       <view class="tab-pill"><view class="tab-pill-gloss"></view></view>
     </view>
 

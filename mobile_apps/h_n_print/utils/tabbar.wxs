@@ -42,25 +42,19 @@ function ensureState(state) {
   state.setB0 = 0;
   state.setB1 = 0;
   state.drag = null;
-  state.shown = false;
 }
 
 function num(v) {
   return (Math.round(v * 100) / 100) + '';
 }
 
-// 一次写到位：药丸位移 + 整条栏位移。首帧顺带显形（CSS 里 opacity: 0，
-// 避免「我」页新建实例时先闪一下第 1 格再跳到第 2 格）
+// 一次写到位：药丸位移 + 整条栏位移。
+// 只写 transform —— 显隐/落位不能靠视图层写死的样式：逻辑层 setData 会重新下发 style，
+// 把这里的 setStyle 整条抹掉（表现就是「一点药丸就没了」）。落位由 WXML 的 data 兜底。
 function render(state, owner) {
   var thumb = owner.selectComponent('.tab-thumb');
   if (thumb) {
-    var t = 'translate3d(' + num(state.pill * state.step) + 'px, 0, 0)';
-    if (state.shown) {
-      thumb.setStyle({ transform: t });
-    } else {
-      state.shown = true;
-      thumb.setStyle({ transform: t, opacity: '1' });
-    }
+    thumb.setStyle({ transform: 'translate3d(' + num(state.pill * state.step) + 'px, 0, 0)' });
   }
   var bar = owner.selectComponent('.tab-bar');
   if (bar) {
@@ -155,11 +149,15 @@ module.exports = {
     if (typeof newValue.maxIdx === 'number') state.maxIdx = newValue.maxIdx;
     if (typeof newValue.over === 'number' && newValue.over >= 0) state.over = newValue.over;
     if (typeof newValue.sel === 'number') state.sel = newValue.sel;
-    state.lagRun = false;
-    state.settling = false;
-    state.drag = null;
-    state.pill = state.sel;
-    state.barDx = 0;
+    // snap=true 才是「页面出现/切回，药丸直接落在选中格」；snap=false 只是重画
+    // （逻辑层 setData 抹掉了内联样式之后，用当前状态把样式补回来，不动位置）
+    if (newValue.snap || !oldValue) {   // 首个 cfg 也必须对齐（旧值为空 = 新建实例）
+      state.lagRun = false;
+      state.settling = false;
+      state.drag = null;
+      state.pill = state.sel;
+      state.barDx = 0;
+    }
     render(state, ownerInstance);
   },
 
