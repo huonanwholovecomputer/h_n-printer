@@ -249,10 +249,13 @@ check("两个按钮共用同一套两段式（先 dry_run 预览、确认后才�
 # 版本记录 div 实际落在「关于」页的 renderAbout() 里，锚进该函数体再取。
 _m_about = re.search(r"function renderAbout\(\) \{([\s\S]*?)\n\}", html)
 _about_body = _m_about.group(1) if _m_about else ""
-_m_ver = re.search(r">v(\d+)\.(\d+)</div>", _about_body)
-check("版本记录已写 v6.7（版本号只钉「不早于 v6.7」，不钉死具体值 —— "
+# 2026-11-16：标题版本号改为单一来源 var APP_VER（renderAbout 渲染它），原来在 renderAbout
+# 里找 `>vX.Y</div>` 字面量，改成 APP_VER 后就取不到了。
+_m_ver = re.search(r"var APP_VER = 'v(\d+)\.(\d+)';", html)
+check("版本记录已写 v6.7（版本号走 APP_VER 单一来源、「不早于 v6.7」，不钉死具体值 —— "
       "每加一版功能都会递增，钉死字面量会误报；已锚定 renderAbout 区块）",
       "v6.7：测试设备不再堆在授权页" in html
+      and "+ APP_VER +" in _about_body
       and _m_ver is not None and (int(_m_ver.group(1)), int(_m_ver.group(2))) >= (6, 7),
       "about_body=%d ver=%s" % (len(_about_body), _m_ver.groups() if _m_ver else None))
 check("离线却挂着接单记录时显示「接单中（离线）」并提示可删除清空",

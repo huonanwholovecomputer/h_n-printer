@@ -1208,6 +1208,9 @@ function mergeStores(localStore, cloudStore) {
 }
 
 /* ==================== 全局状态 ==================== */
+/* 版本号唯一来源：关于页标题 + 版本说明的最末条目都从它取。发版时只改这一处，
+   别再在 renderAbout 里写死字面量（2026-11-16 现场：标题还停在 v7.10，日志已到 v7.25）。 */
+var APP_VER = 'v7.26';
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
@@ -1636,7 +1639,7 @@ function getPurchaseBasis() { return STORE.config.purchaseBasis === 'usage' ? 'u
    而这恰恰是决定谁出多少钱的地方。均摊口径下的文案保持原样（零回归）。 */
 function purchaseBasisHint() {
   return getPurchaseBasis() === 'usage'
-    ? '（谁垫付了什么 · 按各人本月实际出纸页数分摊）'
+    ? '（谁垫付了什么 · A4 纸按出纸张数、硒鼓 / 其它按出纸页数分摊）'
     : '（谁垫付了什么，AA 均摊）';
 }
 
@@ -2408,8 +2411,11 @@ function calcMonth(m, opts) {
     exps = exps.filter(function (e) { return !isAmortizableExpense(e); });
     (amort.rows || []).forEach(function (a) {
       if (!(a.cents > 0)) return;
-      exps.push({ id: a.id, date: m.key + '-01', item: a.item, amount: a.cents / 100,
-                  amountCents: a.cents, payer: a.payer, virtual: true, kind: a.kind, units: a.units });
+      /* v7.26：摊销行带上「所属打印机」—— 硒鼓的分摊要按那台机自己的用量，不能拿全队页数 */
+      var _ve = { id: a.id, date: m.key + '-01', item: a.item, amount: a.cents / 100,
+                  amountCents: a.cents, payer: a.payer, virtual: true, kind: a.kind, units: a.units };
+      if (a.printerId) _ve.printer_id = a.printerId;
+      exps.push(_ve);
     });
   }
   var members = getMembers();
@@ -2450,7 +2456,11 @@ function calcMonth(m, opts) {
   var memberCount = members.length || 1;
 
   /* ══════════ v7.4：采购分摊口径（均摊 / 按用量）+ 设备折旧 ══════════
-     ① 采购分摊：'equal' 老口径（每人 1/n）；'usage' 按各成员本月**实际出纸页数**的比例。
+     ① 采购分摊：'equal' 老口径（每人 1/n）；'usage' 按各成员本月**实际用量**的比例。
+        v7.25：用量有两种计量单位 —— A4 纸按「出纸张数」（纸是按张买的：一张双面纸也只消耗一张纸），
+        硒鼓 / 其它采购按「出纸页数」（硒鼓寿命按页印，运费之类按占用页数摊）。
+        以前一律用页数 ⇒ 双面打得多的人被按约 1.5~2 倍权重摊了纸钱。各类别各自 apportionCents
+        一次再相加，Σ每人应摊 ≡ totalExp 仍然成立（整数分最大余数法不会因为拆开而漏分）。
         没有用量数据（未取到/当月零页）时**自动退回均摊**并标记 basisFallback，
         绝不用 0 权重算出一堆 0 元应摊（那会让"本月盈亏"凭空多出全额采购）。
      ② 设备折旧：每台在役打印机「本月它打的页数 × 每页成本」，按成员在这台机上的页数分摊
@@ -2464,9 +2474,58 @@ function calcMonth(m, opts) {
     members.forEach(function (mem) { usagePages[mem.id] = Math.max(0, Math.round(+usage.pagesByMember[mem.id] || 0)); });
   }
   members.forEach(function (mem) { usageTotal += (usagePages[mem.id] || 0); });
-  var useUsage = (basis === 'usage') && usageTotal > 0;
+  /* v7.25：张数用量（A4 纸的计量单位）。老缓存 / 老后端没有 sheetsByMember ⇒ 全 0，
+     下面按类别取权重时会自动退回「页」，不会静默摊成 0 元。 */
+  var usageSheets = {}, sheetsTotal = 0;
+  if (usage && usage.sheetsByMember) {
+    members.forEach(function (mem) { usageSheets[mem.id] = Math.max(0, Math.round(+usage.sheetsByMember[mem.id] || 0)); });
+  }
+  members.forEach(function (mem) { sheetsTotal += (usageSheets[mem.id] || 0); });
+  var useUsage = (basis === 'usage') && (usageTotal > 0 || sheetsTotal > 0);
   var basisFallback = (basis === 'usage') && !useUsage;
+  /* 旧字段：页数权重（仅向后兼容 / 展示用）。真正的权重按「每一笔支出」分别给，见下面的采购分摊循环。 */
   var purchaseWeights = members.map(function (mem) { return useUsage ? (usagePages[mem.id] || 0) : 1; });
+  /* 每个支出类别实际用了哪种权重：sheets = 按张 / pages = 按全队页 / pagesOnPrinter = 按那台机的页 / equal = 均摊 */
+  var purchaseUnits = { paper: 'equal', toner: 'equal', other: 'equal' };
+  var purchasePools = { paper: 0, toner: 0, other: 0 };
+  /* v7.26：每台机「各成员在这台机上的页数」。硒鼓是按机器买的 —— 买给 M232 的鼓只该由在
+     M232 上印过的人分摊；拿全队页数去摊，只用 1020 的人也在替 M232 的鼓出钱（现场就是这里不对）。
+     老缓存 / 老后端没有 pagesByMemberPrinter ⇒ 该机数据缺，下面自动退回全队页数。 */
+  var usageByPrinter = {};
+  if (usage && usage.pagesByMemberPrinter) {
+    Object.keys(usage.pagesByMemberPrinter).forEach(function (k) {
+      var bar = k.indexOf('|');
+      if (bar <= 0) return;
+      var mid = k.slice(0, bar), pid = k.slice(bar + 1);
+      var n = Math.max(0, Math.round(+usage.pagesByMemberPrinter[k] || 0));
+      if (!(n > 0)) return;
+      (usageByPrinter[pid] = usageByPrinter[pid] || {})[mid] = n;
+    });
+  }
+  /* 一笔采购按什么分摊？返回 { unit, weights }（weights 与 members 同序）；null = 没有任何用量可言。
+        A4 纸        → 各人本月出纸张数（纸按张买，双面也只一张）
+        指定机器的硒鼓 → 各人在**那台机**上的出纸页数
+        未指定的硒鼓 / 其它 → 全队出纸页数
+     再都没有 ⇒ 该类在该笔上均摊（不摊成 0 元）。 */
+  function _weightsFor(e) {
+    var kind = expenseKind(e);
+    var pid = kind === 'toner' ? expensePrinterId(e) : '';
+    if (kind === 'paper' && sheetsTotal > 0) {
+      return { unit: 'sheets', weights: members.map(function (mem) { return usageSheets[mem.id] || 0; }) };
+    }
+    if (kind === 'toner' && pid && usageByPrinter[pid]) {
+      var bag = usageByPrinter[pid], tot = 0;
+      members.forEach(function (mem) { tot += (bag[mem.id] || 0); });
+      if (tot > 0) {
+        return { unit: 'pagesOnPrinter', printerId: pid,
+                 weights: members.map(function (mem) { return bag[mem.id] || 0; }) };
+      }
+    }
+    if (usageTotal > 0) {
+      return { unit: 'pages', weights: members.map(function (mem) { return usagePages[mem.id] || 0; }) };
+    }
+    return null;
+  }
 
   /* ══════════ v7.5：设备寿命消耗的两种计费方式（所有者 ≠ 接单设备） ══════════
      ① team（团队共担）：机器钱没在「采购」里出现过（如 1020 是闫承翰自带的）⇒ 寿命消耗是
@@ -2599,8 +2658,49 @@ function calcMonth(m, opts) {
   /* 三处分摊一律走 apportionCents：Σ每人应摊 == totalExp、Σ投资回报 == investPool、
      Σ服务回报 == servicePool ⇒ Σnet == Σredist − totalExp − totalInc + totalExp == 0。
      服务池按分值加权（等权时 → 均分），替掉原来的「各自 Math.round」。
-     采购池的权重由上面的 purchaseWeights 给出（均摊时全 1，等价旧口径）。 */
-  var perPersonShare = apportionCents(totalExp, purchaseWeights, members);
+     采购池：v7.25 起按支出类别分别加权重（A4 纸＝张、硒鼓 / 其它＝页），每类单独
+     apportionCents 再相加 —— 每类各自守恒 ⇒ 合计仍 ≡ totalExp；均摊口径仍只分摊一次
+     （全 1 权重），数值与旧版逐分相同。 */
+  var perPersonShare = {}, purchaseItems = [];
+  function _pushPurchaseItem(e, unit, weights, part) {
+    purchaseItems.push({
+      id: e.id, item: e.item || '', kind: expenseKind(e), payer: e.payer,
+      amount: expenseAmountCents(e), unit: unit,
+      printerId: unit === 'pagesOnPrinter' ? expensePrinterId(e) : '',
+      alloc: members.map(function (mem, i) {
+        return { id: mem.id, w: unit === 'equal' ? 0 : (weights ? (weights[i] || 0) : 0),
+                 share: part[mem.id] || 0 };
+      })
+    });
+  }
+  if (!useUsage) {
+    /* 均摊，或选了按用量但一点用量都没取到（basisFallback）：保持旧口径，一次全 1 分摊 */
+    var _eqShare = apportionCents(totalExp, members.map(function () { return 1; }), members);
+    members.forEach(function (mem) { perPersonShare[mem.id] = _eqShare[mem.id] || 0; });
+    settledExps.forEach(function (e) { _pushPurchaseItem(e, 'equal', null, _eqShare); });
+  } else {
+    members.forEach(function (mem) { perPersonShare[mem.id] = 0; });
+    settledExps.forEach(function (e) {
+      var kind = expenseKind(e);
+      purchasePools[kind] += expenseAmountCents(e);
+      /* v7.26：每一笔采购各自取权重、各自 apportionCents ⇒ 每笔都守恒，合计仍 ≡ totalExp。
+         不再先把同类采购合成一个池子再摊 —— 池子会把「买给 M232 的鼓」和「全队共用的 A4 纸」
+         混成同一份权重，结果没在那台机上印过的人也在替那支鼓出钱（2026-11-16 现场问的就是这里）：
+           · A4 纸 → 各人出纸张数；买给哪台机无所谓，纸是全队共用的
+           · 指定了所属打印机的硒鼓 → 各人在**那台机**上的出纸页数（鼓是给这台机买的）
+           · 未指定机器的硒鼓 / 其它采购 → 各人全队出纸页数 */
+      var pick = _weightsFor(e);
+      var unit = pick ? pick.unit : 'equal';
+      var w = pick ? pick.weights : members.map(function () { return 1; });
+      var part = apportionCents(expenseAmountCents(e), w, members);
+      members.forEach(function (mem) { perPersonShare[mem.id] += (part[mem.id] || 0); });
+      if (purchaseUnits[kind] !== unit) purchaseUnits[kind] = purchaseUnits[kind] === 'equal' ? unit : 'mixed';
+      _pushPurchaseItem(e, unit, w, part);
+    });
+    /* 防漏：三类池子之和必须等于 totalExp（种类识别若有遗漏，余数全部归入 other，绝不让钱消失） */
+    var _pooled = purchasePools.paper + purchasePools.toner + purchasePools.other;
+    if (_pooled !== totalExp) purchasePools.other += (totalExp - _pooled);
+  }
   var investReturn = apportionCents(investPool, members.map(function () { return 1; }), members);
   var serviceReturn = apportionCents(servicePool, members.map(function (mem) {
     return totalScore > 0 ? (scoreTotals[mem.id] || 0) : 1;
@@ -2685,8 +2785,12 @@ function calcMonth(m, opts) {
   var view = {
     share: members.map(function (mem) {
       var w = useUsage ? (usagePages[mem.id] || 0) : 1;
-      return { id: mem.id, weight: w, pages: useUsage ? (usagePages[mem.id] || 0) : 0,
-               ratio: _wTotal > 0 ? w / _wTotal : 0,
+      /* v7.25：pages / sheets 两列都给出（A4 纸按张、硒鼓 / 其它按页）；
+         ratio 改为「该人应摊 ÷ 本月采购合计」—— 分类别加权重后已没有单一权重比可除。 */
+      return { id: mem.id, weight: w,
+               pages: useUsage ? (usagePages[mem.id] || 0) : 0,
+               sheets: useUsage ? (usageSheets[mem.id] || 0) : 0,
+               ratio: totalExp > 0 ? (perPersonShare[mem.id] || 0) / totalExp : 0,
                share: perPersonShare[mem.id] };
     }),
     income: members.map(function (mem) {
@@ -2739,7 +2843,8 @@ function calcMonth(m, opts) {
     investPool: investPool, servicePool: servicePool,
     redistTotal: _sumOf(view.income, "redist"),
     scoreTotal: totalScore, weightTotal: _wTotal,
-    pagesTotal: useUsage ? usageTotal : memberCount
+    pagesTotal: useUsage ? usageTotal : memberCount,
+    sheetsTotal: useUsage ? sheetsTotal : 0
   };
   /* 口径状态：只说「这次算的是不是临时口径」，页面据此写一句人话（不参与任何金额计算） */
   var _uncovKeys = 0;
@@ -2750,8 +2855,13 @@ function calcMonth(m, opts) {
       if (n > 0) _uncovKeys++;
     });
   }
+  /* v7.26：逐笔分摊明细（页面「每一笔采购摊给谁」表只用这份数据，不再自己算权重/比例） */
+  view.purchaseItems = purchaseItems;
+  view.printerPages = usageByPrinter;
   view.caliber = {
     basis: basis, useUsage: useUsage, basisFallback: basisFallback,
+    /* v7.25/7.26：每类支出实际用的权重单位（sheets / pages / pagesOnPrinter / mixed / equal）与各类池子（整数分） */
+    purchaseUnits: purchaseUnits, purchasePools: purchasePools,
     depUnallocated: depUnallocated || 0,
     depPagesUnattributed: depPagesUnattributed || 0,
     pagesUnregisteredPrinter: pagesUnregisteredPrinter,
@@ -2768,6 +2878,11 @@ function calcMonth(m, opts) {
            /* v7.4 新增：分摊口径与用量、设备折旧 */
            basis: basis, basisFallback: basisFallback, useUsage: useUsage,
            purchaseWeights: purchaseWeights, usagePages: usagePages, usageTotal: usageTotal,
+           /* v7.25：A4 纸按张、硒鼓 / 其它按页 —— 张数用量与各类池子一并给出去，页面不再自己算 */
+           usageSheets: usageSheets, sheetsTotal: sheetsTotal,
+           purchasePools: purchasePools, purchaseUnits: purchaseUnits,
+           /* v7.26：逐笔分摊明细（谁在哪个项目用了多少 → 应付多少）+ 每台机各成员页数 */
+           purchaseItems: purchaseItems, printerPages: usageByPrinter,
            depByMember: depByMember, depByPrinter: depByPrinter, depTotal: depTotal,
            depUnallocated: depUnallocated, depPagesUnattributed: depPagesUnattributed,
            pagesUnregisteredPrinter: pagesUnregisteredPrinter,
@@ -7026,7 +7141,8 @@ function paperStatsSectionHTML(r, m) {
     + '留空自动取这个预估，填了就按人工值（<b>0 与留空不同</b>：0 表示确认没有废纸）。'
     + '本月合计 <b>' + fmtInt(tn + tw) + ' 张</b>（正常 ' + fmtInt(tn) + ' + 废 ' + fmtInt(tw) + '）计入本月用纸量，A4 纸摊销按这个量算。'
     + (_manualCnt > 0 ? ' 其中 ' + _manualCnt + ' 人填了人工值。' : '')
-    + '<br>「按用量分摊」的权重仍是<b>出纸页数</b>（不是张数），废纸不改变它；废纸通过 A4 纸摊销的成本进入分摊。'
+    + '<br>「按用量分摊」里 A4 纸那笔钱按<b>出纸张数</b>摊、硒鼓 / 其它采购按<b>出纸页数</b>摊；'
+     + '废纸计入本月用纸量、改变 A4 纸摊销金额，但废纸本身<b>不进</b>任何人的分摊权重。'
     + '</div>';
   h += '</div>';
   return h;
@@ -7215,7 +7331,7 @@ function renderDash() {
      否则"赚了多少"会虚高（打印机越用越旧，那部分价值是实打实消耗掉的）。 */
   var totalPL = r.view.totals.totalPL;   /* v7.11-C：团队合计也只许从 view 读 */
   var basisLabel = r.useUsage
-    ? ('按用量分摊 · 共 ' + r.usageTotal + ' 页')
+    ? ('按用量分摊 · ' + (r.sheetsTotal > 0 ? '出纸 ' + fmtInt(r.sheetsTotal) + ' 张 / ' : '') + fmtInt(r.usageTotal) + ' 页')
     : (r.basis === 'usage' ? '均摊（未取到用量）' : ('均摊 · ' + r.memberCount + ' 人'));
   /* v7.9：采购支出里含多少「长期耗材本月摊销」—— 购买月不再整笔计入，这一行让人一眼对上 */
   var amortSub = (r.amort && r.amort.totalCents > 0) ? (' · 含耗材摊销 ' + RMB(r.amort.totalCents)) : '';
@@ -7504,19 +7620,63 @@ function dashShareHTML(r) {
   /* v7.11-C：行数据全部来自 calcMonth 的 view.share（权重 / 占比 / 应摊同一处算好），
      本函数只排版 —— 不再自己 Σ 权重、不再自己除比例。 */
   var v = r.view;
+  var _unitWord = { sheets: '张', pages: '页', pagesOnPrinter: '页' };
   h += '<div style="font-weight:700;margin:16px 0 8px">按' + (r.useUsage ? '用量' : '人头') + '分摊到人</div>';
-  h += '<div class="table-wrap"><table><thead><tr><th></th><th>本月出纸页数</th><th>分摊比例</th><th>应摊采购</th></tr></thead><tbody>';
+  /* ── v7.26：每一笔采购各摊各的（用户 2026-11-16 现场提问） ──
+     以前只给「每人合计」一张表，看起来像「把纸和鼓加起来按纸的比例重分」。
+     这里先把每笔采购的来龙去脉摊开：谁垫的、按什么计量、每个人都用了多少 → 该付多少。 */
+  if ((v.purchaseItems || []).length) {
+    h += '<div class="table-wrap"><table><thead><tr><th>采购项目</th><th>计量</th><th>金额</th><th>垫付人</th>';
+    v.share.forEach(function (row) {
+      h += '<th>' + esc(MN(row.id)) + '</th>';
+    });
+    h += '<th>合计</th></tr></thead><tbody>';
+    v.purchaseItems.forEach(function (it) {
+      var unitLabel = it.unit === 'sheets' ? '按张' : (it.unit === 'pagesOnPrinter' ? '按本机页' : (it.unit === 'pages' ? '按页' : '均摊'));
+      if (it.unit === 'pagesOnPrinter' && it.printerId) {
+        var pn = printerNameOf(it.printerId);
+        if (pn) unitLabel += '·' + esc(pn);
+      }
+      h += '<tr><td>' + esc(it.item) + '</td>';
+      h += '<td style="color:var(--muted)">' + unitLabel + '</td>';
+      h += '<td>' + RMB(it.amount) + '</td>';
+      h += '<td>' + esc(MN(it.payer)) + '</td>';
+      it.alloc.forEach(function (a) {
+        h += '<td>' + (it.unit === 'equal' ? '<span style="color:var(--muted)">—</span>'
+              : fmtInt(a.w) + ' ' + (_unitWord[it.unit] || '') + ' · ') + '<b class="neg">' + RMBneg(a.share) + '</b></td>';
+      });
+      h += '<td>−' + RMB(it.amount) + '</td></tr>';
+    });
+    h += '<tr class="tfoot"><td>合计</td><td></td><td>' + RMB(v.totals.totalExp) + '</td><td></td>';
+    v.share.forEach(function (row) { h += '<td class="neg">' + RMBneg(row.share) + '</td>'; });
+    h += '<td>−' + RMB(v.totals.totalExp) + '</td></tr>';
+    h += '</tbody></table></div>';
+    h += '<div style="margin:6px 0 0;font-size:.78rem;color:var(--muted)">'
+      + (r.useUsage
+          ? '每一笔各用自己的用量：<b>A4 纸按张</b>（全队共用）、<b>指定了所属打印机的硒鼓按那台机的页</b>（没用过这台机的人不摊）、'
+            + '<b>未指定机器的硒鼓 / 其它采购按全队页数</b>。「垫付人」是这笔钱的付款方，其余人应摊的部分转给他。'
+          : '均摊口径：每一笔都按人头平分。')
+      + '</div>';
+  }
+  h += '<div class="table-wrap"><table><thead><tr><th></th><th>出纸张数</th><th>出纸页数</th><th>分摊比例</th><th>应摊采购</th></tr></thead><tbody>';
   v.share.forEach(function (row) {
     h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(row.id)) + '">' + esc(MN(row.id)) + '</td>';
-    h += '<td>' + (r.useUsage ? row.pages + ' 页' : '<span style="color:var(--muted)">—</span>') + '</td>';
+    h += '<td>' + (r.useUsage ? fmtInt(row.sheets) + ' 张' : '<span style="color:var(--muted)">—</span>') + '</td>';
+    h += '<td>' + (r.useUsage ? fmtInt(row.pages) + ' 页' : '<span style="color:var(--muted)">—</span>') + '</td>';
     h += '<td>' + (row.ratio * 100).toFixed(1) + '%</td>';
     h += '<td class="neg" style="font-weight:700">' + RMBneg(row.share) + '</td></tr>';
   });
-  h += '<tr class="tfoot"><td>合计</td><td>' + (r.useUsage ? r.usageTotal + ' 页' : '—') + '</td><td>100%</td><td>−' + RMB(v.totals.totalExp) + '</td></tr>';
+  h += '<tr class="tfoot"><td>合计</td><td>' + (r.useUsage ? fmtInt(r.sheetsTotal) + ' 张' : '—') + '</td><td>'
+     + (r.useUsage ? fmtInt(r.usageTotal) + ' 页' : '—') + '</td><td>100%</td><td>−' + RMB(v.totals.totalExp) + '</td></tr>';
   h += '</tbody></table></div>';
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
     + (r.useUsage
-        ? '「用量」= 本月<b>实际出纸页数</b>（只算已完成的子任务，含自打 / 免费单 —— 纸确实用掉了）。口径可在「设置 → 采购分摊」里改为均摊。'
+        ? '「用量」= 本月<b>实际出纸量</b>（只算已完成的子任务，含自打 / 免费单 —— 纸确实用掉了）。'
+          + '权重<b>逐笔</b>取，不合并：A4 纸按<b>张数</b>（一张双面的纸只算一张；废纸只进用纸量、不进张数权重）；'
+          + '指定了所属打印机的硒鼓按<b>那台机的页数</b>；未指定机器的硒鼓 / 其它采购按<b>全队页数</b>'
+          + (r.purchaseUnits && r.purchaseUnits.paper === 'pages' && r.purchasePools && r.purchasePools.paper > 0
+              ? '（本月没有张数数据，A4 纸这笔暂按页数摊）' : '')
+          + '。口径可在「设置 → 采购分摊」里改为均摊。'
         : '当前为均摊口径。想按各人实际用纸比例出钱 → 「设置 → 采购分摊」切成<b>按用量</b>。')
     + (r.usage && r.usage.unattributedPages > 0 ? ' 另有 <b>' + r.usage.unattributedPages + ' 页</b>未归属成员（订单没绑定到成员），未计入任何人的用量。' : '')
     + '</div></div>';
@@ -8171,7 +8331,7 @@ function setPurchaseBasis(basis) {
     ensureUsage(currentKey, function () { renderCurrent(); });
   }
   renderCurrent();
-  toast(basis === 'usage' ? '✅ 采购改为按用量分摊（按各人实际出纸页数）' : '✅ 采购改为均摊', 'success');
+  toast(basis === 'usage' ? '✅ 采购改为按用量分摊（A4 纸按张、硒鼓 / 其它按页）' : '✅ 采购改为均摊', 'success');
 }
 
 /* ==================== TAB: 记账 ==================== */
@@ -9313,8 +9473,8 @@ function renderSettings() {
     + '<label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="radio" name="purchaseBasis" value="equal"'
     + (_purchaseBasis === 'equal' ? ' checked' : '') + ' onchange="setPurchaseBasis(\'equal\')"> 均摊（每人 1 / 人数）</label>'
     + '<label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="radio" name="purchaseBasis" value="usage"'
-    + (_purchaseBasis === 'usage' ? ' checked' : '') + ' onchange="setPurchaseBasis(\'usage\')"> 按用量（各人本月实际出纸页数比例）</label>'
-    + '<span style="color:var(--muted);font-size:.78rem">按用量时只算「已完成」子任务的页数（含自打 / 免费单）；当月总页数为 0 会自动退回均摊。'
+    + (_purchaseBasis === 'usage' ? ' checked' : '') + ' onchange="setPurchaseBasis(\'usage\')"> 按用量（A4 纸按出纸张数、硒鼓 / 其它采购按出纸页数）</label>'
+    + '<span style="color:var(--muted);font-size:.78rem">按用量时只算「已完成」子任务的页数 / 张数（含自打 / 免费单）；当月没有任何用量会自动退回均摊，某类缺对应数据时该类退回按页。'
     + '口径变化会影响所有月份的分摊结果。</span></div></div>';
   h += '</div>';
 
@@ -10513,7 +10673,7 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">v7.10</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">' + APP_VER + '</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -10636,6 +10796,27 @@ function renderAbout() {
     + '② 云端设备列表、本设备所有者绑定、自动双面能力标注仍只在云端模式提供（要读后端设备注册表），'
     + '本地模式不画这两块、也不发对应请求，绝不假装有数据；'
     + '③ 打印机台账 / 折旧 / 订单归属仍在「🖨️ 打印机折旧」页。</p>' +
+    '<p style="margin-top:10px">v7.25：<b>采购分摊按支出类别分计量单位</b> —— '
+    + '① 以前「按用量分摊」一律拿各人的<b>出纸页数</b>当权重，可 A4 纸是按<b>张</b>买的：'
+    + '一张双面的纸只消耗一张纸，却占两页，于是双面打得多的人被按约 1.5~2 倍权重摊了纸钱。'
+    + '现在按支出类别各用各的单位：<b>A4 纸按出纸张数</b>，<b>硒鼓 / 其它采购按出纸页数</b>'
+    + '（硒鼓寿命按页印，运费之类按占用页数摊）。'
+    + '② 「按用量分摊」表改为<b>出纸张数 / 出纸页数 / 分摊比例</b>三列并排，比例就是该人应摊 ÷ 本月采购合计；'
+    + '每类金额各自走整数分最大余数法再相加，<b>Σ每人应摊 ≡ 采购合计</b>照旧成立。'
+    + '③ 「设置 → 采购分摊」的选项与各处文案同步改写；某类缺对应数据时该类退回按页（老缓存 / 老后端不会摊成 0 元），'
+    + '连页数都没有时该类内部均摊。④ 均摊口径完全不变（仍是一次均摊，数值逐分相同），'
+    + '历史月份的「按用量」数字会跟着重算 —— 这与 v7.4 的选择同一性质。'
+    + '⑤ 顺带把本页<b>版本号收成单一来源</b>（<code>APP_VER</code>）：标题以前写死字面量，'
+    + '从 v7.10 起就没再跟上更新日志，标题与日志对不上。</p>' +
+    '<p style="margin-top:10px">v7.26：<b>每一笔采购各用各的用量权重</b> —— '
+    + '① 现场反馈：把纸和几支硒鼓的金额加起来、只按纸的比例重分，看不出「谁用了哪笔、该给垫付人多少钱」。'
+    + '现在采购分摊<b>不再先把同类合并成一个池子</b>，而是逐笔算：<b>A4 纸</b>按各人出纸张数；'
+    + '<b>指定了所属打印机的硒鼓</b>只摊给在这台机上印过的人（买给 M232 的鼓不再由只用 1020 的人分担）；'
+    + '<b>未指定机器的硒鼓 / 其它采购</b>按各人全队出纸页数。'
+    + '② 「按用量分摊到人」上方新增<b>逐笔明细表</b>：每行一笔采购（项目 / 计量 / 金额 / 垫付人），'
+    + '右侧给每个人「用了多少 → 该付多少」，末行是各人合计 —— 垫付人与应摊一目了然。'
+    + '③ 每笔各自走整数分最大余数法，<b>Σ每人应摊 ≡ 采购合计</b>仍成立；耗材摊销行会带上所属打印机。'
+    + '④ 历史月份的「按用量」数字会因此重算（与 v7.4 同性质），均摊口径不变。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

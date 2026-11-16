@@ -91,8 +91,15 @@ check("v7.13 的 JS 高度动画已删净（不再有 _formulaAnimRun / FORMULA_
       and "FORMULA_ANIM" not in src
       and "_isFormulaSummary" not in src)
 
-check("关于页版本号与更新日志都有 v7.3 段（版本号跟随最新，v7.3 的历史条目保留）",
-      ">v7.10</div>" in src and "v7.3：📐 结算公式说明块" in src)
+# 2026-11-16：版本号改成单一来源 var APP_VER（关于页标题渲染它）。原来这里钉 ">v7.10</div>"，
+# 结果标题从 v7.10 起就不再跟着版本说明递增了（现场：日志到 v7.25，标题还写 v7.10）。
+_m_ver = re.search(r"var APP_VER = '(v\d+(?:\.\d+)*)';", src)
+_VER = _m_ver.group(1) if _m_ver else ""
+_about = src.split("function renderAbout() {", 1)[1][:2000] if "function renderAbout() {" in src else ""
+check("关于页版本号由 APP_VER 单一来源渲染，且版本说明里有同号条目（v7.3 的历史条目保留）",
+      bool(_VER) and "+ APP_VER +" in _about
+      and (_VER + "：") in src and "v7.3：📐 结算公式说明块" in src,
+      "APP_VER=%r about_uses=%s" % (_VER, "+ APP_VER +" in _about))
 
 # ══════════════════════════════════════════════════════════════
 # B. 口径纪律：说明块里不许有第二份计算

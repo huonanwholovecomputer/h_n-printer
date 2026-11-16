@@ -127,8 +127,9 @@ check("解锁态下拉旁边不挂任何文字（状态写进占位项 + 橙色�
       _pk is not None
       and re.search(r"h \+= '</select>';\s*\n\s*return h;", _pk.group(1)) is not None
       and "未识别 · 请指定" in _pk.group(1) and "border-color:var(--orange)" in _pk.group(1))
-check("收支清算：🖨️ 设备折旧区块 + 采购分摊比例表",
-      "🖨️ 设备折旧" in src and "分摊到人" in src and "本月出纸页数" in src)
+check("收支清算：🖨️ 设备折旧区块 + 采购分摊比例表（v7.25 起张数 / 页数两列并排）",
+      "🖨️ 设备折旧" in src and "分摊到人" in src
+      and "出纸张数" in src and "出纸页数" in src)
 check("设置页：采购分摊 均摊/按用量 单选（走 setPurchaseBasis）",
       'name="purchaseBasis" value="equal"' in src and 'value="usage"' in src
       and "function setPurchaseBasis(basis) {" in src)
@@ -431,6 +432,39 @@ function usageOf(pages, perMember, perMemberPrinter) {
     JSON.stringify(clean.config.printers.map(p => p.id)));
 }
 
+/* ═════ B12：每一笔采购各用各的权重（v7.26；2026-11-16 现场：纸按张、指定机器的鼓只摊给用过那台机的人） ═════ */
+{
+  const sb = calcSandbox();
+  const p2 = Object.assign({}, PRINTER, { id: 'p2', name: 'HP LaserJet M232' });
+  sb.STORE = store2({
+    expenses: [
+      { id: 'e1', date: '2026-06-03', item: 'A4纸', amount: 30, payer: 'ma' },
+      { id: 'e2', date: '2026-06-04', item: '硒鼓', amount: 40, payer: 'mb', kind: 'toner', printer_id: 'p1' },
+      { id: 'e3', date: '2026-06-05', item: '硒鼓', amount: 20, payer: 'ma', kind: 'toner', printer_id: 'p2' },
+    ],
+  }, { purchaseBasis: 'usage', printers: [PRINTER, p2] });
+  const u = usageOf(400, { ma: 300, mb: 100 }, { 'ma|p1': 300, 'mb|p2': 100 });
+  u.sheetsByMember = { ma: 200, mb: 100 };
+  const r = sb.calcMonth(sb.monthFromRecords('2026-06'), { usage: u });
+  /* A4 纸 ¥30 按张 200:100 ⇒ 20 / 10；p1 的鼓 ¥40 只由在 p1 印过的 ma 承担 ⇒ 40 / 0；
+     p2 的鼓 ¥20 只由在 p2 印过的 mb 承担 ⇒ 0 / 20（旧池子口径会按全队 300:100 把 ¥60 摊成 45 / 15 ⇒ 65 / 25） */
+  P('B12 逐笔权重：A4 纸按张、指定机器的硒鼓只摊给在这台机上印过的人（¥60 / ¥30）',
+    r.perPersonShare.ma === 6000 && r.perPersonShare.mb === 3000,
+    r.perPersonShare.ma + '/' + r.perPersonShare.mb);
+  P('B12 Σ应摊 ≡ 本月采购合计（¥90）',
+    r.perPersonShare.ma + r.perPersonShare.mb === r.totalExp,
+    (r.perPersonShare.ma + r.perPersonShare.mb) + ' / ' + r.totalExp);
+  const items = (r.view && r.view.purchaseItems) || [];
+  const it2 = items.filter(x => x.id === 'e2')[0], it3 = items.filter(x => x.id === 'e3')[0];
+  P('B12 明细带计量单位：纸 = sheets、指定机器的鼓 = pagesOnPrinter',
+    items.length === 3 && items[0].unit === 'sheets'
+    && !!it2 && it2.unit === 'pagesOnPrinter' && !!it3 && it3.unit === 'pagesOnPrinter',
+    JSON.stringify(items.map(x => x.id + ':' + x.unit)));
+  P('B12 明细里 p1 的鼓由 ma 承担全额 ¥40、mb ¥0',
+    !!it2 && it2.alloc[0].share === 4000 && it2.alloc[1].share === 0,
+    it2 ? (it2.alloc[0].share + '/' + it2.alloc[1].share) : 'no item');
+}
+
 /* ═════ C：真实渲染（整页脚本 + fetch 桩 + 真实 renderDash） ═════ */
 (async () => {
   const els = {};
@@ -550,9 +584,14 @@ function usageOf(pages, perMember, perMemberPrinter) {
   let dash = els['#tab-dash'].innerHTML || '';
 
   P('C1 收支清算渲染出「🖨️ 设备折旧」区块', dash.indexOf('设备折旧') >= 0);
-  P('C2 用量口径生效：KPI 副行显示「按用量分摊 · 共 300 页」',
-    dash.indexOf('按用量分摊 · 共 300 页') >= 0,
+  /* v7.25：A4 纸按张、硒鼓 / 其它按页 ⇒ KPI 副行变成「按用量分摊 · [出纸 N 张 / ]300 页」。
+     这里只钉「按用量分摊 + 总页数」，不钉张数前缀（老缓存没有 sheetsByMember 时前缀不出现）。 */
+  P('C2 用量口径生效：KPI 副行显示「按用量分摊 · … 300 页」',
+    dash.indexOf('按用量分摊 · ') >= 0
+    && (dash.match(/按用量分摊[^<]*/) || [''])[0].indexOf('300 页') >= 0,
     (dash.match(/按用量分摊[^<]*/) || [''])[0]);
+  P('C2b 分摊表按 v7.25 拆成「出纸张数 / 出纸页数」两列（A4 纸按张、硒鼓 / 其它按页）',
+    dash.indexOf('出纸张数') >= 0 && dash.indexOf('出纸页数') >= 0);
   P('C3 采购按用量分摊：霍楠 200 页 / 姚懿祥 100 页 → ¥66.67 / ¥33.33',
     dash.indexOf('−¥66.67') >= 0 && dash.indexOf('−¥33.33') >= 0,
     (dash.match(/−¥6[0-9.]+|−¥3[0-9.]+/g) || []).join(','));
@@ -682,9 +721,11 @@ MUTANTS = [
     ("折旧不计入实际盈亏",
      " - (depByMember[mem.id] || 0);",
      " ;"),
+    # v7.25：分摊不再只读 purchaseWeights（改成按类别分别加权重）⇒ 变异锚点改钉 useUsage。
+    # 置 false 后一律走「全 1 均摊」，C2/C3 必须转红。
     ("采购不分摊（退回均摊）",
-     "var purchaseWeights = members.map(function (mem) { return useUsage ? (usagePages[mem.id] || 0) : 1; });",
-     "var purchaseWeights = members.map(function () { return 1; });"),
+     "var useUsage = (basis === 'usage') && (usageTotal > 0 || sheetsTotal > 0);",
+     "var useUsage = false;"),
     ("已知机型映射错位",
      "'霍楠': 'HP LaserJet 1020', '姚懿祥': 'HP LaserJet MFP M232-M237'",
      "'霍楠': 'HP LaserJet MFP M232-M237', '姚懿祥': 'HP LaserJet 1020'"),

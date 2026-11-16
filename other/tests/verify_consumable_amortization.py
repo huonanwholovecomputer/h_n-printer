@@ -103,8 +103,10 @@ check("用超库存记 uncovered（不凭空计费；v7.10 起单机桶另记 un
 check("calcMonth 接收 opts.amort：能摊销的整笔采购不计入本月，只合并摊销行",
       "var amort = opts.amort || null;" in src
       and "exps = exps.filter(function (e) { return !isAmortizableExpense(e); });" in src
-      and "exps.push({ id: a.id, date: m.key + '-01', item: a.item, amount: a.cents / 100," in src
-      and "payer: a.payer, virtual: true, kind: a.kind, units: a.units });" in src)
+      and "var _ve = { id: a.id, date: m.key + '-01', item: a.item, amount: a.cents / 100," in src
+      and "if (a.printerId) _ve.printer_id = a.printerId;" in src
+      and "payer: a.payer, virtual: true, kind: a.kind, units: a.units };" in src
+      and "exps.push(_ve);" in src)
 # v7.14：返回值里 expenses/amort 之后又多了 view（结算公式并入 secFold），
 # 原来钉的 "... amort };" 整句不再成立 —— 只钉「这两个字段在同一个 return 里交出」，别再钉尾随符号。
 check("calcMonth 返回 expenses（计费行）与 amort（摊销明细），页面不另算一份",

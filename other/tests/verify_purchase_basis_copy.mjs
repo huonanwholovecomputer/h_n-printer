@@ -5,7 +5,7 @@
  *    设置里选了「按用量」，页面却还写死「AA 均摊」，而这一步正好决定谁出多少钱。
  *
  * 需要钉住的三件事：
- *   ① 按用量口径：「手动记账 → 采购支出」小标题写「按各人本月实际出纸页数分摊」，不再出现「AA 均摊」；
+ *   ① 按用量口径：「手动记账 → 采购支出」小标题写「A4 纸按出纸张数、硒鼓 / 其它按出纸页数分摊」，不再出现「AA 均摊」；
  *   ② 均摊口径：文案原样保留（零回归，老用户界面不变）；
  *   ③ 「收支清算 → 垫付清算」第三列表头同样跟着口径走（按用量时不能把按用量算出来的数叫「应均摊」）。
  *
@@ -109,8 +109,9 @@ chk('打桩生效：配置里的采购口径 = usage', (await page.evaluate(() =
 await page.click('#tabNav button[data-tab="entry"]');
 await page.waitForTimeout(700);
 const entryUsage = await page.$eval('#tab-entry', (el) => el.innerText.replace(/\s+/g, ' ').trim());
-chk('按用量：「采购支出」小标题写「按各人本月实际出纸页数分摊」',
-  entryUsage.indexOf('按各人本月实际出纸页数分摊') >= 0, entryUsage.slice(0, 120));
+/* v7.25：A4 纸按张、硒鼓 / 其它按页 ⇒ 小标题同步改写（文案必须与设置里选的口径同步） */
+chk('按用量：「采购支出」小标题写「A4 纸按出纸张数、硒鼓 / 其它按出纸页数分摊」',
+  entryUsage.indexOf('A4 纸按出纸张数、硒鼓 / 其它按出纸页数分摊') >= 0, entryUsage.slice(0, 160));
 chk('按用量：不再出现写死的「AA 均摊」', entryUsage.indexOf('AA 均摊') < 0, entryUsage.slice(0, 120));
 await page.screenshot({ path: path.join(OUT_DIR, '01-手动记账-采购支出-按用量.png') });
 
@@ -128,7 +129,7 @@ await page.evaluate(() => { STORE.config.purchaseBasis = 'equal'; currentTab = '
 await page.waitForTimeout(500);
 const entryEqual = await page.$eval('#tab-entry', (el) => el.innerText.replace(/\s+/g, ' ').trim());
 chk('均摊：「采购支出」小标题回到「AA 均摊」', entryEqual.indexOf('AA 均摊') >= 0, entryEqual.slice(0, 120));
-chk('均摊：不再出现按用量的措辞', entryEqual.indexOf('按各人本月实际出纸页数分摊') < 0);
+chk('均摊：不再出现按用量的措辞', entryEqual.indexOf('A4 纸按出纸张数') < 0);
 await page.screenshot({ path: path.join(OUT_DIR, '03-手动记账-采购支出-均摊.png') });
 
 await page.evaluate(() => { currentTab = 'dash'; renderDash(); });

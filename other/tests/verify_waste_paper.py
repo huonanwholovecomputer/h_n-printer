@@ -109,8 +109,8 @@ check('migrateConfig 归一 waste_paper（脏数据不变成算不清的纸）',
       'if (!c.waste_paper || typeof c.waste_paper !== \'object\' || Array.isArray(c.waste_paper)) c.waste_paper = {};' in src)
 check('mergeStores 合并 waste_paper（月 × 成员并集）',
       'put(cc.waste_paper); put(lc.waste_paper);' in src)
-check('版本历史写了 v7.10 废纸口径',
-      '>v7.10</div>' in src and '废纸' in src)
+check('版本历史写了 v7.10 废纸口径（标题版本号已改由 APP_VER 渲染，这里钉日志条目）',
+      'v7.10：' in src and '废纸' in src)
 
 # ══════════════════════════════════════════════════════════════
 # B. 纯函数实测（Node VM）

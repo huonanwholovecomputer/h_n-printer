@@ -367,9 +367,12 @@ async function runScenario(mutate, withScreenshots) {
     && dash.consText.indexOf('140') < 0,
     dash.consText ? dash.consText.slice(0, 240) : '');
   const allocOf = (name) => dash.alloc.find((r) => r[0] === name) || [];
+  /* v7.25：表变成 成员 / 出纸张数 / 出纸页数 / 分摊比例 / 应摊采购 ⇒ 页数在 [2]、金额在 [4]。
+     本夹具是单面（页 = 张），所以金额仍是 −¥50.00 / −¥20.00。 */
   chk('⑨ 按用量分摊：霍楠 100 页 → −¥50.00、姚懿祥 40 页 → −¥20.00',
-    allocOf('霍楠')[1] === '100 页' && allocOf('霍楠')[3] === '−¥50.00'
-    && allocOf('姚懿祥')[1] === '40 页' && allocOf('姚懿祥')[3] === '−¥20.00',
+    allocOf('霍楠')[2] === '100 页' && allocOf('霍楠')[4] === '−¥50.00'
+    && allocOf('姚懿祥')[2] === '40 页' && allocOf('姚懿祥')[4] === '−¥20.00',
+    allocOf('霍楠').length ? 'zhang=' + allocOf('霍楠')[1] : 'no row',
     JSON.stringify(dash.alloc.map((r) => r.slice(0, 4))) + ' / ident=' + JSON.stringify(dash.ident) + ' / probe=' + JSON.stringify(dash.probe));
   chk('⑩ 三条恒等式仍成立：ΣN ≡ 0、ΣB ≡ ΣC ≡ Π = I − E − D',
     dash.ident && Math.abs(dash.ident.net) <= 1 && dash.ident.book === dash.ident.actual
