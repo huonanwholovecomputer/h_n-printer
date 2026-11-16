@@ -1049,7 +1049,12 @@ class ManualDuplexDialog(QDialog):
         self._pass1_est = 0.0
         self._pass1_final = 0.0
         self._pass1_done = False       # 用显式标志，别拿 0.0 当"还没冻结"（0 秒也是合法结果）
-        self._pass1_frozen_by_gate = False  # 这份冻结值是"闸门到点先记的"（等权威实测覆盖）
+        # 2026-11-15：冻结值恒为「操作员点继续」那一刻的界面时钟。这个标志只记录"是点击
+        # 冻结的"，**不再**用来放行 worker 实测覆盖数字 —— 那条通道正是现场"计时回退"的来源。
+        self._pass1_frozen_by_gate = False
+        # 本批至今**显示过**的最大已用秒数：冻结时用它做单调保护。时钟要是被中途 restart /
+        # 主线程卡顿拖慢了，已经显示过的数字也不许倒退（2026-11-15 用户现场报的就是"回退"）。
+        self._pass1_seen_max = 0.0
         # 2026-11-13：worker 报来的「打印实测」（数据全送出去 / 队列排空的程序侧耗时）。
         # 只用来 ①写速度样本 ②在计时文案里并列显示 —— **不冻结计时**，第 1 趟何时结束
         # 只由操作员点「继续」决定（他要走过去把纸叠搬回进纸盒，这段也算第 1 趟）。
@@ -1150,6 +1155,23 @@ class ManualDuplexDialog(QDialog):
         单独抽成一个方法是为了让验收脚本能把它换成任意时刻（不然要真等几十秒）。"""
         return self._t0.elapsed() / 1000.0
 
+    def _pass1_seen(self) -> float:
+        """本批至今**显示过**的最大已用秒数 —— 第 1 趟计时永远不许倒退。
+
+        2026-11-15 用户现场：点了「继续打第 2 趟」之后计时看起来"回退"了。根因是同一个数
+        有两个来源（界面时钟 / 程序实测），谁后到谁说了算。现在数字只有一个来源，这里再做
+        单调保护：只要某一秒已经画到界面上过，后面无论时钟被 restart 还是主线程卡顿，
+        读数都不会比它小（换批次时由 _apply_batch_params 归零）。
+        """
+        try:
+            now = float(self._elapsed_sec())
+        except (TypeError, ValueError):
+            now = 0.0
+        now = max(0.0, now)
+        if now > self._pass1_seen_max:
+            self._pass1_seen_max = now
+        return self._pass1_seen_max
+
     def is_early_signal(self, seconds: float) -> bool:
         """这笔"第 1 趟实测"是不是**早于闸门**的提前回报（打印机只回报"开始打印"）？
 
@@ -1217,7 +1239,9 @@ class ManualDuplexDialog(QDialog):
             return
         if self._mode == "waiting":
             return      # 等待上一个任务：本态计时器应当是停的，万一被 tick 也绝不许显示「已用」
-        elapsed = self._pass1_final if self._pass1_done else self._elapsed_sec()
+        # 冻结后就用冻结值（= 操作员点击那一刻）；冻结前走 _pass1_seen()（带单调保护，
+        # 时钟被中途 restart / 主线程卡顿也不许让读数倒退）。
+        elapsed = self._pass1_final if self._pass1_done else self._pass1_seen()
         measured = float(getattr(self, "_pass1_measured", 0.0) or 0.0)
         self._pass1.setText(self._pass1_text(elapsed, final=self._pass1_done,
                                             measured=measured))
@@ -1247,33 +1271,38 @@ class ManualDuplexDialog(QDialog):
         self._pass1_tick()
 
     def freeze_pass1(self, seconds: float | None = None):
-        """冻结第 1 趟计时。传 seconds 时用**程序实测的权威值**（worker 报的），
-        不传就用界面自己的时钟兜底（信号没到的异常路径，例如第 1 趟失败/取消）。
+        """冻结第 1 趟计时 —— 数字只有一个真相：**操作员点「继续」那一刻的界面时钟**。
 
-        为什么要以实测为准：界面时钟会受主线程卡顿、窗口动画、我们自己的静置余量影响；
-        程序实测（第 1 趟开打 → 纸出完）才是"这台打印机真正花的时间"，两者不一致时
-        以实测为准，并把差值记下来（主线程卡顿/时序异常的证据）。"""
-        if self._pass1_done and not self._pass1_frozen_by_gate:
-            return
-        if self._pass1_done and seconds is None:
-            # 已按闸门时刻冻结过：界面时钟不比它更权威，别用一次兜底调用把数值改掉
+        ★ 2026-11-15 用户现场（第 5 次定口径，版本表见 docs/手动双面.md）：点了「继续打
+        第 2 趟」之后计时器像是"回退"了（冻结出 04:45，比预估 04:52 还小）。查下来那一笔
+        确实就是「点击 − 开打」，但这条通道本来允许 worker 报来的"队列排空"实测把数字改小
+        （_pass1_frozen_by_gate 放行），谁后到谁说了算 —— 同一个数一会儿一个样。
+        用户定死：「需要采用我点击时的时间才对」。所以：
+          · 显示的数字永远是点击那一刻的界面时钟（带单调保护，见 _pass1_seen）；
+          · 程序实测（队列排空 = 纸打完了）只进 _pass1_measured，在文案里做括号拆分
+            「（打印实测 X + 翻纸移动 Y）」，**绝不再改数字**。
+        理由：操作员的点击才代表"他把纸叠搬回进纸盒"这一整段结束；队列排空只是纸出来了，
+        两者差的正是他走上走下那几十秒 —— 那是真实的人工节拍，不该被实测抹掉。
+        传 seconds 时它只当"实测值"用（worker 信号没到时的兜底标注），不参与数字。"""
+        try:
+            measured = float(seconds) if seconds is not None else 0.0
+        except (TypeError, ValueError):
+            measured = 0.0
+        # 实测只做标注：这一步与"冻结"无关，所以放在冻结判断之前 —— 哪怕计时早就按
+        # 操作员点击冻结了，这一笔也照样补进括号里（显示的数字不动）。
+        refreshed = False
+        if measured > 0 and float(getattr(self, "_pass1_measured", 0.0) or 0.0) <= 0:
+            self._pass1_measured = measured
+            refreshed = True
+        if self._pass1_done:
+            # 已经冻结过就**一个字节都不许改**：冻结值 = 操作员点击那一刻，是终值。
+            if refreshed:
+                self._pass1_tick()
             return
         self._pass1_done = True
         self._pass1_frozen_by_gate = False
         self._pass1_timer.stop()
-        local = self._elapsed_sec()
-        try:
-            authoritative = float(seconds) if seconds is not None else None
-        except (TypeError, ValueError):
-            authoritative = None
-        if authoritative is not None and authoritative >= 0:
-            if abs(local - authoritative) > 5.0:
-                self._pass1_hint.setText(
-                    f"{self._pass1_hint.text()}\n（界面计时与程序实测差 {abs(local - authoritative):.0f} 秒，"
-                    f"以程序实测 {format_duration(authoritative)} 为准）".strip())
-            self._pass1_final = authoritative
-        else:
-            self._pass1_final = local
+        self._pass1_final = self._pass1_seen()      # 点击时刻（含单调保护，不许倒退）
         self._pass1_tick()
 
     def _pass1_freeze(self):
@@ -1281,18 +1310,19 @@ class ManualDuplexDialog(QDialog):
         self.freeze_pass1(None)
 
     def _freeze_pass1_at_gate(self):
-        """纯时间放行时先冻结计时（默认路径走 `_pass1_freeze`）。
+        """按操作员点击冻结计时 —— 「▶ 继续打第 2 趟」被按下的那一刻就是第 1 趟的终点。
 
-        与 `_pass1_freeze` 的区别只有一个标志：`_pass1_frozen_by_gate=True` —— 等 worker 的
-        权威实测（程序侧"第 1 趟开打 → 纸出完"）到了，`freeze_pass1(seconds)` 允许覆盖它。
-        不这样做的话，闸门时刻（预估值的一半）会被当成第 1 趟真实用时写进速度样本，
-        模型越学越短、闸门跟着一起失效（2026-10-18~19 现场就是这样崩的）。
+        这是**主路径**（_on_go 里调用），不是"纯时间放行"：2026-11-11 起第 2 趟按钮只认
+        操作员点击（硬规矩 12），没有任何时间闸门会自动走到这里。
+        `_pass1_frozen_by_gate=True` 只是给这条来路留个标记（日志/排查用）；
+        2026-11-15 起它**不再**放行 worker 的实测覆盖数字 —— 冻结值就是终值，
+        实测只在括号里做标注，见 freeze_pass1() 的说明。
         """
         if self._pass1_done:
             return
         self._pass1_done = True
         self._pass1_frozen_by_gate = True
-        self._pass1_final = self._elapsed_sec()
+        self._pass1_final = self._pass1_seen()      # 点击时刻，带单调保护
         self._pass1_timer.stop()
         self._pass1_tick()
 
@@ -1315,6 +1345,7 @@ class ManualDuplexDialog(QDialog):
         self._pass1_done = False
         self._pass1_frozen_by_gate = False
         self._pass1_measured = 0.0
+        self._pass1_seen_max = 0.0        # 单调保护：换批次才归零
         self._flip_reported = False
         self._flip_gate_at = 0.0
         self._left = 0                  # 翻纸确认倒计时：本批还没开始（闸门到点才起算）
@@ -1498,13 +1529,13 @@ class ManualDuplexDialog(QDialog):
         """允许翻纸：起跑翻纸确认倒计时（10 分钟无人确认 ⇒ 按跳过处理）。
 
         ⚠ 这里**不冻结第 1 趟计时**：第 1 趟什么时候算结束 = 操作员点「继续」那一刻
-        （2026-11-11 口径），冻结在 `_on_go` 里做（用 `_freeze_pass1_at_gate`，这样 worker
-        的权威实测 `freeze_pass1(seconds)` 到了还能覆盖界面时钟）。
+        （2026-11-11 口径），冻结在 `_on_go` 里做（用 `_freeze_pass1_at_gate`）。
+        2026-11-15 起冻结值就是终值：worker 的实测只做括号标注，不再覆盖它。
         """
         self._flip_gate_at = 0.0
         # ⚠ 计时**不在这里冻结**：第 1 趟什么时候算结束 = 操作员点「继续」那一刻
-        #   （2026-11-11 口径）。冻结交给 `_on_go`（用 `_freeze_pass1_at_gate`，这样
-        #   worker 的权威实测 `freeze_pass1(seconds)` 到了还能覆盖界面时钟）。
+        #   （2026-11-11 口径）。冻结交给 `_on_go`（用 `_freeze_pass1_at_gate`），
+        #   冻结值即终值（2026-11-15），worker 实测只在括号里标注。
         self._status.setText(
             "② 第 1 趟的数据已全部送进打印队列 —— 请确认纸已出齐、翻纸，"
             "然后点「继续打第 2 趟」")
@@ -1576,8 +1607,8 @@ class ManualDuplexDialog(QDialog):
             return
         self._timer.stop()
         if not self._pass1_done:
-            # 用 `_freeze_pass1_at_gate`：frozen_by_gate=True ⇒ worker 的权威实测
-            # （`duplex_speed_sample` → `freeze_pass1(seconds)`）到了还能覆盖它。
+            # 用 `_freeze_pass1_at_gate`：点击那一刻即第 1 趟终点，冻结值就是终值；
+            # worker 的实测（duplex_speed_sample）只做括号标注，不再改数字（2026-11-15）。
             self._freeze_pass1_at_gate()
         self._mode = "pass2"
         self._status.setText("③ 正在打印第 2 趟…（请勿再动纸叠）")

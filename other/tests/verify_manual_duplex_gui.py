@@ -1477,7 +1477,7 @@ check("★ 过了预估、过了 10 分钟也绝不自动放行（界面只刷�
       _dlg_ann._mode == "pass1" and _dlg_ann._btn_go.isEnabled()
       and not _dlg_ann._pass1_done and _ann_evts == [],
       f"{_dlg_ann._mode} | done={_dlg_ann._pass1_done}")
-# 操作员点 → 立刻第 2 趟；第 1 趟计时在点击那一刻冻结（可被权威实测覆盖）
+# 操作员点 → 立刻第 2 趟；第 1 趟计时在点击那一刻冻结，而且这就是终值（2026-11-15 口径）
 _dlg_ann._on_go()
 check("★ 点「继续」= 第 1 趟结束：mode→pass2 + 发 continue_requested + 计时就地冻结",
       _dlg_ann._mode == "pass2" and _ann_evts == ["go"]
@@ -1485,13 +1485,44 @@ check("★ 点「继续」= 第 1 趟结束：mode→pass2 + 发 continue_reques
       and abs(_dlg_ann._pass1_final - 600.0) < 0.01,
       f"{_dlg_ann._mode} {_ann_evts} {_dlg_ann._pass1_final}")
 _dlg_ann.freeze_pass1(48.0)
-check("★ worker 的权威实测到了覆盖「点击时刻」那一笔（不把操作员手速学进速度模型）",
-      abs(_dlg_ann._pass1_final - 48.0) < 0.01 and "用时 00:48" in _dlg_ann._pass1.text(),
+check("★ 点击冻结即终值：worker 实测后到也只做括号标注，绝不把数字改小（现场「计时回退」）",
+      abs(_dlg_ann._pass1_final - 600.0) < 0.01
+      and "用时 10:00" in _dlg_ann._pass1.text()
+      and "打印实测 00:48" in _dlg_ann._pass1.text(),
       _dlg_ann._pass1.text())
 _dlg_ann.set_flippable("迟到的回报", 600)
 check("★ 第 2 趟开打后迟到的回报 → 不改状态、不重复 emit（否则第 2 趟打两遍）",
       _dlg_ann._mode == "pass2" and _ann_evts == ["go"],
       f"{_dlg_ann._mode} {_ann_evts}")
+
+# ── 2026-11-15 现场复现：点「继续」后计时"回退"（51 张 / 预估 04:52 / 点击时 04:45）──
+# 现场读数：预估 292.6s（04:52）、点击在开打后 285s（04:45）。用户口径：
+# 「需要采用我点击时的时间才对」—— 04:45 看着比预估小是因为预估偏高，不是回退。
+_dlg_mono = gui.ManualDuplexDialog()
+_dlg_mono.announce("回退复现", sheets=51, estimate_sec=292.6)
+_dlg_mono._elapsed_sec = lambda: 285.0
+_dlg_mono._pass1_tick()
+check("复现起点：显示「已用 04:45 / 预计 04:52」",
+      "已用 04:45" in _dlg_mono._pass1.text() and "预计 04:52" in _dlg_mono._pass1.text(),
+      _dlg_mono._pass1.text())
+_dlg_mono._elapsed_sec = lambda: 120.0        # 时钟被打回（restart / 主线程卡顿）
+_dlg_mono._pass1_tick()
+check("★ 时钟倒退也不许让读数变小（计时只增不减）",
+      "已用 04:45" in _dlg_mono._pass1.text(), _dlg_mono._pass1.text())
+_dlg_mono._on_go()
+check("★ 点击那一刻冻结成终值 04:45（比预估 04:52 小也不改 —— 那才是真实点击时刻）",
+      _dlg_mono._pass1_done and abs(_dlg_mono._pass1_final - 285.0) < 0.01
+      and "用时 04:45" in _dlg_mono._pass1.text(), _dlg_mono._pass1.text())
+_dlg_mono.note_pass1_measured(251.0)          # worker 的队列实测后到
+check("★ 队列实测后到只补括号（打印实测 04:11 + 翻纸移动 00:34），数字仍是 04:45",
+      abs(_dlg_mono._pass1_final - 285.0) < 0.01
+      and "用时 04:45" in _dlg_mono._pass1.text()
+      and "打印实测 04:11" in _dlg_mono._pass1.text()
+      and "翻纸移动 00:34" in _dlg_mono._pass1.text(), _dlg_mono._pass1.text())
+_dlg_mono.freeze_pass1(240.0)
+check("★ 冻结之后再调 freeze_pass1 也改不动数字（只可能补实测标注）",
+      abs(_dlg_mono._pass1_final - 285.0) < 0.01
+      and abs(_dlg_mono._pass1_measured - 251.0) < 0.01, _dlg_mono._pass1.text())
 
 # 回报先到（多文件批次里 flip_required 晚于"预估 50%"是常态）
 _dlg_rep = gui.ManualDuplexDialog()
@@ -1544,22 +1575,30 @@ check("★ 第 1 趟中途关窗 = 跳过（不会「关一下窗就把第 2 趟
 _dlg9.announce("第二批", sheets=3, estimate_sec=18.5)
 check("新批次复位重新计时",
       not _dlg9._pass1_done and "已用" in _dlg9._pass1.text() and _dlg9._pass1_timer.isActive())
-# 权威值冻结：worker 实测（程序侧）优先于界面时钟
+# 2026-11-15 口径：冻结值取界面时钟（含操作员搬纸那段），程序实测只进括号标注
+_dlg9._elapsed_sec = lambda: 45.0
 _dlg9.freeze_pass1(42.0)
-check("★ 窗口按**程序实测的权威值**冻结（不是界面自己数的），且换算成最终用时",
-      _dlg9._pass1_done and abs(_dlg9._pass1_final - 42.0) < 0.01
-      and "用时 00:42" in _dlg9._pass1.text(), _dlg9._pass1.text())
+check("★ 窗口按**操作员点击那一刻的界面时钟**冻结，程序实测只做括号拆分",
+      _dlg9._pass1_done and abs(_dlg9._pass1_final - 45.0) < 0.01
+      and "用时 00:45" in _dlg9._pass1.text()
+      and "打印实测 00:42" in _dlg9._pass1.text()
+      and "翻纸移动 00:03" in _dlg9._pass1.text(), _dlg9._pass1.text())
+del _dlg9._elapsed_sec           # 还原真实时钟，后面的用例继续用这个窗
 _dlg9.announce("第三批", sheets=3, estimate_sec=18.5)
 _dlg9.freeze_pass1(None)
 check("没有权威值时退回界面时钟兜底（照样能冻结）",
       _dlg9._pass1_done and _dlg9._pass1_final >= 0.0)
 _dlg9.announce("第四批", sheets=3, estimate_sec=18.5)
+_dlg9._elapsed_sec = lambda: 34.0
 _dlg9.freeze_pass1(30.0)          # 一笔不早于闸门（13.5s）的可信实测
 _dlg9.set_flippable("翻纸说明", 600)
 check("★ 手上已有可信实测时直接放行（闸门只挡提前回报，不挡真打完的）",
       _dlg9._pass1_done and _dlg9._mode == "flip" and _dlg9._btn_go.isEnabled()
-      and not _dlg9._pass1_timer.isActive() and abs(_dlg9._pass1_final - 30.0) < 0.01,
-      f"{_dlg9._mode} {_dlg9._pass1_final}")
+      and not _dlg9._pass1_timer.isActive()
+      and abs(_dlg9._pass1_final - 34.0) < 0.01
+      and abs(_dlg9._pass1_measured - 30.0) < 0.01,
+      f"{_dlg9._mode} {_dlg9._pass1_final} {_dlg9._pass1_measured}")
+del _dlg9._elapsed_sec
 _dlg9.finish("批次结束")
 check("收尾把计时器停掉", not _dlg9._pass1_timer.isActive())
 
