@@ -236,6 +236,41 @@ check("云端任务落地：这一页拿到第一条任务时写 first_added_at"
       "if len(self._config.tabs[new_key].jobs) == 1:" in SRC
       and "self._mark_tab_first_added(new_key)" in SRC)
 
+# ── 2026-11-16 现场：右键「➕ 添加到新标签页」复制出来的页，工具条「首次添加」是占位符「—」──
+print("\n=== ⑦b 从别的标签页复制文件到新标签页，也要写「首次添加」 ===")
+_copy_dir = tempfile.mkdtemp(prefix="hn_copy_")
+_copy_pdf = os.path.join(_copy_dir, "copied.pdf")
+with open(_copy_pdf, "wb") as _f:
+    _f.write(b"%PDF-1.4\n%%EOF\n")
+_src_key = win._current_tab
+_src_tab = win._config.tabs[_src_key]
+_src_tab.jobs = [PrintJob(file_path=_copy_pdf, page_count=2)]
+_src_tab.first_added_at = "2026-11-01 08:00:00"      # 上一张单的开始时刻
+win._set_current_jobs(_src_tab.jobs)
+win._rebuild_table()
+_new_key = win._add_rows_to_new_tab([0])
+_new_tab = win._config.tabs.get(_new_key or "")
+check("「添加到新标签页」成功（测试前提：复制出 1 个文件）",
+      bool(_new_key) and _new_tab is not None and len(_new_tab.jobs) == 1)
+check("新标签页写入了首次添加时间（不再显示占位符「—」）",
+      bool(getattr(_new_tab, "first_added_at", "")),
+      repr(getattr(_new_tab, "first_added_at", None)))
+check("新标签页的首次添加是「此刻」，不继承源标签页的旧时间",
+      _new_tab.first_added_at != "2026-11-01 08:00:00",
+      _new_tab.first_added_at)
+check("工具条上的「首次添加」立刻显示这个时间（不是「—」）",
+      _new_tab.first_added_at in win._tab_created_label.full_text()
+      and not win._tab_created_label.full_text().rstrip().endswith("—"),
+      win._tab_created_label.full_text())
+_copy_body = SRC.split("def _add_rows_to_new_tab")[1].split("def _setup_edit_panel")[0]
+check("源码口径：复制到新标签页时显式写 first_added_at",
+      "self._mark_tab_first_added(new_key)" in _copy_body)
+# 收尾：回到原来的标签页，别把 ⑧ 之后的断言带偏
+win._current_tab = _src_key
+win._config.active_tab = _src_key
+win._rebuild_table()
+win._refresh_tab_display()
+
 print("\n=== ⑧ 两个标签不挤占按钮：顺序在 stretch 之后，且不被添加到按钮区 ===")
 check("时间标签加在 tab_row.addStretch() 之后（右侧、不参与按钮排布）",
       SRC.index("tab_row.addStretch()") < SRC.index("self._tab_created_label = _TimeVariantsLabel()"))

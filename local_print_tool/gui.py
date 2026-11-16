@@ -13737,6 +13737,13 @@ class MainWindow(QMainWindow):
         new_tab.jobs = new_jobs
         self._config.tabs[new_key] = new_tab
 
+        # 首次添加时间（2026-11-16 用户现场）：这条路不经过"添加文件"那个入口
+        # （_on_files_added 的 rows_before == 0 分支），所以工具条上的「首次添加」一直停在
+        # 占位符「—」—— 用户看到的就是"这一页明明有文件，时间却不知道"。
+        # 文件是**刚刚**复制进来的 ⇒ 首次添加 = 此刻；绝不继承源标签页的 first_added_at
+        # （那属于上一张单的开始时刻，会让这一单看起来早了几小时）。
+        self._mark_tab_first_added(new_key)
+
         # 换标签页 = 撤回备份属于旧标签页（与 _switch_tab 同一口径）
         self._cancel_undo_if_active()
         self._current_tab = new_key
