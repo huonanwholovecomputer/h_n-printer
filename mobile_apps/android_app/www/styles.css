@@ -1528,8 +1528,90 @@ body {
   border-top-color: transparent;
 }
 
+/* ── 玻璃滑块（APP 2026-11-16；小程序 custom-tab-bar 暂未同步）──
+   位移层 .tab-thumb 只做 translate，形变层 .tab-pill 只做 scaleX。
+   两层必须是两个元素：合到一个元素上时 transform 的位移与 scale 两条插值
+   互相拉扯，滑块会被拉成畸形（demo 的硬结论，别合并）。
+   位移用 --tab-i（格子序号 0/1）驱动：步长 = 自身宽度 + 2×左右内缩，
+   所以药丸永远居中在格子正中，栏宽变化（cqw）自动跟着走。 */
+.tab-thumb {
+  position: absolute;
+  top: 0.9cqw;
+  left: 1.2cqw;
+  width: calc(50% - 2.4cqw);
+  height: calc(100% - 1.8cqw);
+  border-radius: 999px;
+  transform: translate3d(calc(var(--tab-i, 0) * (100% + 2.4cqw)), 0, 0);
+  transition: transform 320ms cubic-bezier(0.4, 0, 0.2, 1);
+  will-change: transform;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.tab-pill {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  transform-origin: 50% 50%;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(244, 246, 248, 0.86));
+  backdrop-filter: saturate(150%) blur(12px);
+  -webkit-backdrop-filter: saturate(150%) blur(12px);
+  box-shadow:
+    0 0.48cqw 1.92cqw rgba(30, 40, 70, 0.12),
+    0 0.12cqw 0.36cqw rgba(30, 40, 70, 0.08),
+    inset 0 0.12cqw 0.12cqw rgba(255, 255, 255, 0.95),
+    0 0 0 0.06cqw rgba(255, 255, 255, 0.6);
+}
+
+/* 玻璃高光：只画在药丸上，不参与形变 */
+.tab-pill-gloss {
+  position: absolute;
+  inset: 0.12cqw;
+  border-radius: inherit;
+  pointer-events: none;
+  background: radial-gradient(120% 90% at 30% 12%, rgba(255, 255, 255, 0.95), rgba(255, 255, 255, 0) 60%);
+  opacity: 0.7;
+}
+
+/* 形变：跨格时沿运动方向轻微拉长再收回（340ms） */
+.tab-pill.goo {
+  animation: tabPillGoo 340ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes tabPillGoo {
+  0%   { transform: scaleX(1); }
+  34%  { transform: scaleX(1.14); }
+  100% { transform: scaleX(1); }
+}
+
+/* 整排起伏：点任意 tab 都放一次，逐格错开 26ms（延迟由 app.js 写到 animation-delay） */
+.tab-bar.wave .tab-item {
+  animation: tabWave 460ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+
+@keyframes tabWave {
+  0%   { transform: translateY(0) scale(1); }
+  28%  { transform: translateY(1.5px) scale(0.93); }
+  62%  { transform: translateY(-1px) scale(1.035); }
+  100% { transform: translateY(0) scale(1); }
+}
+
+/* 图标到位后弹一下 + 轻微一转（取代旧的 .tab-hover 缩放） */
+.tab-icon-wrap.bump {
+  animation: tabIconBump 520ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@keyframes tabIconBump {
+  0%   { transform: rotate(-12deg) scale(0.84); }
+  45%  { transform: rotate(5deg) scale(1.08); }
+  72%  { transform: rotate(-2deg) scale(0.99); }
+  100% { transform: rotate(0) scale(1); }
+}
+
 .tab-item {
   flex: 1;
+  position: relative;
+  z-index: 2;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1563,8 +1645,10 @@ body {
   transition: background-color 0.2s ease;
 }
 
+/* 选中态的底衬已交给玻璃滑块（.tab-thumb / .tab-pill），这里只留类名
+   驱动图标不透明；再画一层蓝色圆角底会和药丸叠成双层高光 */
 .icon-active {
-  background-color: rgba(0, 122, 255, 0.08);
+  background-color: transparent;
 }
 
 .tab-icon {

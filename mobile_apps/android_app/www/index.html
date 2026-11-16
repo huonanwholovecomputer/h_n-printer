@@ -740,8 +740,15 @@
     </div>
   </div>
 
-  <!-- ===== Tab 栏（自定义 tabBar 复刻） ===== -->
+  <!-- ===== Tab 栏（自定义 tabBar 复刻 · 玻璃滑块） ===== -->
   <view class="tab-bar" id="tabBar">
+    <!-- 玻璃滑块：位移层 .tab-thumb 只做 translate，形变层 .tab-pill 只做 scaleX。
+         必须是两个元素 —— 合成到一个元素上时两条插值互相拉扯，滑块会被拉成畸形。
+         只响应点击，不做拖动（拖动会和页面左右滑退出手势打架）。
+         2026-11-16 落地，参数取自 .dsh/tmp_modediff/tabbar 的 demo。 -->
+    <view class="tab-thumb" id="tabThumb" data-i="0">
+      <view class="tab-pill" id="tabPill"><view class="tab-pill-gloss"></view></view>
+    </view>
     <view class="tab-item" data-tab="print">
       <view class="tab-icon-wrap icon-active">
         <img class="tab-icon" src="images/tab/print.png" alt="打印">

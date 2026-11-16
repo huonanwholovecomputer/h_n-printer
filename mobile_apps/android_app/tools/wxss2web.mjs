@@ -612,7 +612,12 @@ button {
      · 「最近订单」整段：#view-recent-orders 汇总行 / 分页 / .ro-row 三行卡 / 空态
      · .status-reason-tap 虚线可点 + .status-pop-mask/.status-pop 异常原因气泡
      · .status-timeout 琥珀色（浅色 + 深色两套）
-   查法：git diff www/styles.css | grep 2026-11 （重跑前先存这份 diff 备用）。
+   · 2026-11-16 玻璃滑块 Tab 栏（APP 专属，小程序未同步）：.tab-thumb 位移层 /
+       .tab-pill + .tab-pill-gloss 形变层 / @keyframes tabPillGoo / .tab-bar.wave +
+       @keyframes tabWave / .tab-icon-wrap.bump + @keyframes tabIconBump，
+       以及 .tab-item 的 position/z-index 与 .icon-active 改 transparent。
+       验收脚本 other/tests/verify_glass_tabbar.mjs 会读这批规则，贴回时别漏。
+    查法：git diff www/styles.css | grep 2026-11 （重跑前先存这份 diff 备用）。
 `;
 
 let all = WEB_BASE;

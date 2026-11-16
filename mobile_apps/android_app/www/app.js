@@ -1052,6 +1052,80 @@ let currentTab = 'print';
 let _tabSwitching = false;
 let _viewTransition = false;
 
+/* ── 玻璃滑块（APP 2026-11-16）─────────────────────────────────────────
+   #tabThumb 只做位移（CSS transition 320ms），#tabPill 只做 scaleX（goo 340ms）。
+   两层必须是两个元素：合到一个元素上时位移与缩放两条插值互相拉扯，滑块会被
+   拉成畸形（demo 的硬结论）。只响应点击，不做拖动 —— 拖动会和页面左右滑退出
+   手势打架（switchTab 的平铺推拉与 hideView 的右滑退出都在同一片区域）。 */
+let _tabWaveTimer = 0;
+
+// 格子序号：0 = 打印，1 = 我（找不到就退回 0，别让一个笔误把滑块丢到栏外）
+function _tabIndex(tab) {
+  const items = [...document.querySelectorAll('.tab-item')];
+  const i = items.findIndex(t => t.dataset.tab === tab);
+  return i < 0 ? 0 : i;
+}
+
+function currentTabThumbIndex() {
+  const thumb = document.getElementById('tabThumb');
+  return thumb ? (parseInt(thumb.getAttribute('data-i'), 10) || 0) : 0;
+}
+
+// 位移层：只改 --tab-i，过渡交给 CSS；跨格时让形变层拉一下
+function slideTabThumb(index) {
+  const thumb = document.getElementById('tabThumb');
+  if (!thumb) return;
+  const from = currentTabThumbIndex();
+  thumb.setAttribute('data-i', String(index));
+  thumb.style.setProperty('--tab-i', String(index));
+  const pill = document.getElementById('tabPill');
+  if (pill && index !== from) {
+    pill.classList.remove('goo');
+    void pill.offsetWidth;   // 强制重排，同一首屏连点也能重播动画
+    pill.classList.add('goo');
+  }
+}
+
+// 整排起伏：逐格错开 26ms，点任意 tab 都放一次
+function _waveTabBar() {
+  const bar = document.getElementById('tabBar');
+  if (!bar) return;
+  const items = [...bar.querySelectorAll('.tab-item')];
+  items.forEach((t, k) => { t.style.animationDelay = (k * 26) + 'ms'; });
+  bar.classList.remove('wave');
+  void bar.offsetWidth;
+  bar.classList.add('wave');
+  clearTimeout(_tabWaveTimer);
+  _tabWaveTimer = setTimeout(() => {
+    bar.classList.remove('wave');
+    items.forEach(t => { t.style.animationDelay = ''; });
+  }, 640);
+}
+
+// 图标弹跳：滑块先到位、图标再落（跨格延迟 170ms，同格点按立即弹）
+function _bumpTabIcon(item, delay) {
+  const wrap = item && item.querySelector('.tab-icon-wrap');
+  if (!wrap) return;
+  setTimeout(() => {
+    wrap.classList.remove('bump');
+    void wrap.offsetWidth;
+    wrap.classList.add('bump');
+    setTimeout(() => wrap.classList.remove('bump'), 580);
+  }, delay || 0);
+}
+
+// 首帧定位：不做过渡直接落位（否则启动时药丸会从左往右滑一遍）
+function initTabThumb() {
+  const thumb = document.getElementById('tabThumb');
+  if (!thumb) return;
+  const i = _tabIndex(currentTab);
+  thumb.style.transition = 'none';
+  thumb.setAttribute('data-i', String(i));
+  thumb.style.setProperty('--tab-i', String(i));
+  void thumb.offsetWidth;
+  thumb.style.transition = '';
+}
+
 // tab 切换：平铺推拉转场 —— 两页并排铺满内容区，旧页抽出、新页从对面推入，互不重叠
 function switchTab(tab) {
   if (tab === currentTab || _tabSwitching) return;
@@ -1068,7 +1142,11 @@ function switchTab(tab) {
   if (typeof closeStatusReasonPop === 'function') closeStatusReasonPop();
   if (typeof closeRoPageSizePickerIfOpen === 'function') closeRoPageSizePickerIfOpen();
 
-  // tab 栏立即更新选中态 + 点击图标弹跳
+  // tab 栏立即更新选中态：玻璃滑块位移 + 整排起伏 + 图标弹跳
+  //（旧的 .tab-hover 缩放已由 .tab-icon-wrap.bump 取代，别再加回来 —— 两套缩放会打架）
+  const _prevThumb = currentTabThumbIndex();
+  const _nextThumb = _tabIndex(tab);
+  slideTabThumb(_nextThumb);
   document.querySelectorAll('.tab-item').forEach(t => {
     const on = t.dataset.tab === tab;
     t.classList.toggle('active', on);
@@ -1076,11 +1154,10 @@ function switchTab(tab) {
     if (iconWrap) iconWrap.classList.toggle('icon-active', on);
     const txt = t.querySelector('.tab-text');
     if (txt) txt.classList.toggle('text-active', on);
-    if (on) {
-      t.classList.add('tab-hover');
-      setTimeout(() => t.classList.remove('tab-hover'), 400);
-    }
   });
+  _bumpTabIcon(document.querySelector('.tab-item[data-tab="' + tab + '"]'),
+               _prevThumb !== _nextThumb ? 170 : 0);
+  _waveTabBar();
 
   const printPage = document.getElementById('page-print');
   const mePage = document.getElementById('page-me');
@@ -1927,6 +2004,7 @@ function initApp() {
     if (window.HNLogger && typeof window.HNLogger.install === 'function') window.HNLogger.install();
   } catch (e) { /* 日志挂了不能拖垮启动 */ }
   setupTabs();
+  initTabThumb();
   setupNav();
   setupPressFeedback();
   // 首屏入场由打印页各卡片的 .enter-XX 动画驱动（0.5s 起逐 0.1s 递增），

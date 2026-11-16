@@ -1,0 +1,302 @@
+/* verify_glass_tabbar.mjs — APP 底部「玻璃滑块」Tab 栏（2026-11-16 落地）
+ *
+ * 为什么要渲染级验收：滑块是「位移层 + 形变层」两个 DOM 叠出来的，静态 grep 只能
+ * 证明代码里写了 transform，证不了：
+ *   ① 药丸真的落在当前选中格子的正中（而不是栏的两个端头）；
+ *   ② 切换时只有位移 + 轻微拉伸，**落位宽度不变**（一旦有人把位移改回 left/width 动画，
+ *      或把两层合并成一个元素，就会量到宽度变化 / 高度抖动）；
+ *   ③ 药丸不探出玻璃栏的圆角轮廓；
+ *   ④ 图标 bump 与整排 wave 真的被触发（而不是只加了 class 没有 keyframes）。
+ *
+ * 探针自证：把 transform 钉死（模拟「滑块不动」的坏实现），点击「我」之后药丸
+ * 若仍然落在第 1 格 —— 说明这个探针量的是真实位置，红/绿都有意义。
+ *
+ * 需要 Playwright + 本机 Chrome（run_all 里登记为「需真实浏览器」）。
+ */
+import { createRequire } from 'node:module';
+import http from 'node:http';
+import { readFile, mkdir } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import { extname, join, normalize } from 'node:path';
+
+const require = createRequire(import.meta.url);
+const { chromium } = require('C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+
+const REPO = 'D:/打印机项目';
+const APP_DIR = REPO + '/mobile_apps/android_app/www';
+const SHOTS = REPO + '/截图展示/玻璃滑块Tab栏';
+const CHROME = 'C:/Program Files/Google/Chrome/Application/chrome.exe';
+
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+               '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml',
+               '.json': 'application/json' };
+
+let failures = 0;
+function check(name, cond, detail) {
+  if (!cond) failures++;
+  console.log('[' + (cond ? 'PASS' : 'FAIL') + '] ' + name + (detail ? '  -- ' + detail : ''));
+}
+
+/* ── ① 静态：结构必须是「两层两元素」，动画必须只动 transform ───────────── */
+function cssRule(src, selector) {
+  const i = src.indexOf('\n' + selector + ' {');
+  if (i < 0) return '';
+  const open = src.indexOf('{', i);
+  const close = src.indexOf('}', open);
+  return close < 0 ? '' : src.slice(open + 1, close);
+}
+function cssBlock(src, anchor) {
+  const i = src.indexOf(anchor);
+  if (i < 0) return '';
+  const open = src.indexOf('{', i + anchor.length);
+  const close = src.indexOf('}', open);
+  return open < 0 || close < 0 ? '' : src.slice(open + 1, close);
+}
+const decl = (body, prop) => {
+  const m = body.match(new RegExp('(?:^|[;{\\s])' + prop + '\\s*:([^;]*)'));
+  return m ? m[1].trim() : '';
+};
+const px1 = (n) => Math.round(n * 100) / 100;
+
+console.log('=== ① 静态：位移层与形变层必须是两个元素，动画只动 transform ===');
+const html = readFileSync(APP_DIR + '/index.html', 'utf8');
+const css = readFileSync(APP_DIR + '/styles.css', 'utf8');
+const js = readFileSync(APP_DIR + '/app.js', 'utf8');
+
+const thumbOpen = html.search(/<view class="tab-thumb" id="tabThumb"[^>]*>/);
+const pillOpen = html.search(/<view class="tab-pill" id="tabPill"/);
+const thumbClose = html.indexOf('</view>', pillOpen);
+check('index.html 有位移层 #tabThumb', thumbOpen > 0);
+check('#tabPill 嵌在 #tabThumb 里面（两层两个元素）',
+      thumbOpen > 0 && pillOpen > thumbOpen && thumbClose > pillOpen,
+      'thumb@' + thumbOpen + ' pill@' + pillOpen);
+check('滑块节点在 .tab-bar 内、tab-item 之前（z 序与命中面都靠它）',
+      thumbOpen > html.indexOf('id="tabBar"') && thumbOpen < html.indexOf('class="tab-item"'));
+
+const thumbBody = cssRule(css, '.tab-thumb');
+const pillBody = cssRule(css, '.tab-pill');
+/* keyframes 里的每个百分比都是独立块，cssBlock 只会拿到第一个（0%），
+   所以这里取锚点后的一段窗口来比对峰值 */
+const gooAt = css.indexOf('@keyframes tabPillGoo');
+const gooKey = gooAt < 0 ? '' : css.slice(gooAt, gooAt + 260);
+check('取到了 .tab-thumb / .tab-pill 规则', !!thumbBody && !!pillBody);
+check('位移层只做 transform 过渡（320ms cubic-bezier(.4,0,.2,1)）',
+      /transform 320ms cubic-bezier\(0?\.4, 0, 0?\.2, 1\)/.test(thumbBody),
+      'transition: ' + decl(thumbBody, 'transition'));
+check('位移层不参与缩放/动画（scale 与 animation 都必须在形变层）',
+      !/scale/.test(thumbBody) && !/animation/.test(thumbBody));
+check('位移层用 --tab-i 驱动（不靠 left/width 动画）',
+      /--tab-i/.test(decl(thumbBody, 'transform')) && !/transition:[^;]*\bleft\b/.test(thumbBody),
+      'transform: ' + decl(thumbBody, 'transform'));
+const gooRule = cssRule(css, '.tab-pill.goo');
+check('形变层只做 scaleX（goo 340ms，峰值 1.14）',
+      /animation: tabPillGoo 340ms/.test(gooRule) && /scaleX\(1\.14\)/.test(gooKey)
+      && !/translate/.test(pillBody) && !/translate/.test(gooRule),
+      'goo: ' + (gooKey.match(/scaleX\([0-9.]+\)/g) || []).join(' '));
+check('整排 wave 与图标 bump 的 keyframes 都在',
+      /@keyframes tabWave/.test(css) && /@keyframes tabIconBump/.test(css)
+      && /\.tab-bar\.wave \.tab-item/.test(css) && /\.tab-icon-wrap\.bump/.test(css));
+/* 回归守门：气泡避让 tabBar 的验收读的就是这条高度（见 verify_toast_above_tabbar.mjs） */
+const tabBarHeight = decl(cssBlock(css, '/* ── Tab Bar ── */'), 'height');
+check('tabBar 高度仍是 13.2cqw（气泡避让的几何基准不许动）', tabBarHeight === '13.2cqw', 'height: ' + tabBarHeight);
+
+check('switchTab 会驱动滑块位移', /slideTabThumb\(/.test(js));
+check('启动时首帧定位，不从左边滑一遍', /initTabThumb\(\)/.test(js));
+check('滑块不做拖动（不与页面左右滑退出手势抢手势）',
+      !/tabThumb[\s\S]{0,120}pointermove/.test(js) && !/pointermove[\s\S]{0,120}tabThumb/.test(js));
+check('旧的 .tab-hover 缩放不再叠加到图标弹跳上', !/classList\.add\('tab-hover'\)/.test(js));
+
+/* ── ② 渲染环境（桩后端 + 真实 www/） ──────────────────────────────── */
+const MOCK = {
+  success: true, token: 'tok', openid: 'dev_test', nickname: '测试设备', role: 'admin',
+  devices: [], orders: [], files: [], users: [], admins: [], keys: [], total: 0, count: 0,
+  online: true, active: true, take_orders_online: true, active_client_id: 'pc-1',
+  claiming_devices: [], delivery_locations: ['1号楼北楼'], urgency_levels: ['低'],
+};
+
+const server = http.createServer(async (req, res) => {
+  const url = req.url.split('?')[0];
+  if (url.startsWith('/api/')) {
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+    if (url.startsWith('/api/pricing')) {
+      res.end(JSON.stringify({
+        success: true,
+        pricing: {
+          simplex_price: 0.3, duplex_price: 0.4, cover_page_price: 0.1,
+          delivery_locations: ['1号楼北楼'], delivery_percentages: { '1号楼北楼': 0 },
+          urgency_levels: ['低'], urgency_prices: { '低': 0 },
+        },
+      }));
+      return;
+    }
+    res.end(JSON.stringify(MOCK));
+    return;
+  }
+  const rel = normalize(url === '/' ? '/index.html' : url).replace(/^[\\/]+/, '');
+  try {
+    const body = await readFile(join(APP_DIR, rel));
+    res.writeHead(200, { 'Content-Type': MIME[extname(rel)] || 'application/octet-stream' });
+    res.end(body);
+  } catch (e) {
+    res.writeHead(404); res.end('not found');
+  }
+});
+
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+await mkdir(SHOTS, { recursive: true });
+
+const browser = await chromium.launch({ executablePath: CHROME });
+const page = await browser.newPage({ viewport: { width: 360, height: 800 }, deviceScaleFactor: 3 });
+page.on('pageerror', (e) => console.log('  [pageerror] ' + e.message));
+page.on('console', (m) => { if (m.type() === 'error') console.log('  [console.error] ' + m.text()); });
+
+const LOCAL_BASE = 'http://127.0.0.1:' + port;
+const foreign = [];
+page.on('request', (r) => {
+  const u = r.url();
+  if (!u.startsWith(LOCAL_BASE) && !u.startsWith('data:') && !u.startsWith('blob:')) foreign.push(u);
+});
+await page.addInitScript((base) => {
+  try {
+    window.__HN_TEST_BASE_URL__ = base;
+    localStorage.setItem('hn_theme_mode', 'light');
+  } catch (e) { /* 忽略 */ }
+}, LOCAL_BASE);
+await page.route('**/api/**', (route) => {
+  const url = route.request().url();
+  if (url.startsWith(LOCAL_BASE)) return route.continue();
+  return route.fulfill({ status: 200, contentType: 'application/json; charset=utf-8', body: JSON.stringify(MOCK) });
+});
+await page.goto(LOCAL_BASE + '/index.html', { waitUntil: 'load' });
+await page.waitForFunction(() => typeof switchTab === 'function' && !!document.getElementById('tabThumb'),
+                           null, { timeout: 15000 });
+await page.waitForTimeout(600);   // 首屏入场动画落定
+
+const geo = () => page.evaluate(() => {
+  const rect = (el) => { const r = el.getBoundingClientRect(); return { l: r.left, r: r.right, t: r.top, b: r.bottom, w: r.width, h: r.height }; };
+  const bar = rect(document.getElementById('tabBar'));
+  const pill = rect(document.getElementById('tabPill'));
+  const items = [...document.querySelectorAll('.tab-item')].map((t) => {
+    const wrap = t.querySelector('.tab-icon-wrap');
+    return Object.assign({ tab: t.dataset.tab, on: t.classList.contains('active'),
+                           bump: wrap.classList.contains('bump') },
+                         rect(t), { txt: rect(t.querySelector('.tab-text')) });
+  });
+  return { bar: bar, pill: pill, items: items, thumbI: document.getElementById('tabThumb').getAttribute('data-i'),
+           wave: document.getElementById('tabBar').classList.contains('wave'),
+           pillAmin: getComputedStyle(document.getElementById('tabPill')).animationName };
+});
+const centerOf = (r) => (r.l + r.r) / 2;
+
+console.log('\n=== ② 渲染（360×800 @3x）：药丸必须落在选中格子的正中 ===');
+const g0 = await geo();
+console.log('  tabBar=' + JSON.stringify({ l: px1(g0.bar.l), w: px1(g0.bar.w), h: px1(g0.bar.h) }) +
+            '  pill=' + JSON.stringify({ l: px1(g0.pill.l), w: px1(g0.pill.w), h: px1(g0.pill.h) }));
+const slot0 = g0.items[0];
+const restW = px1(g0.pill.w), restH = px1(g0.pill.h);
+
+check('初始（打印页）：药丸居中在第 1 格', Math.abs(centerOf(g0.pill) - centerOf(slot0)) <= 1.5,
+      'pill.c=' + px1(centerOf(g0.pill)) + ' slot1.c=' + px1(centerOf(slot0)));
+check('初始：data-i = 0（首帧定位生效）', g0.thumbI === '0', 'data-i=' + g0.thumbI);
+check('药丸整体在玻璃栏轮廓内（不探出圆角）',
+      g0.pill.l >= g0.bar.l - 0.5 && g0.pill.r <= g0.bar.r + 0.5
+      && g0.pill.t >= g0.bar.t - 0.5 && g0.pill.b <= g0.bar.b + 0.5,
+      'pill=[' + px1(g0.pill.l) + ',' + px1(g0.pill.r) + '] bar=[' + px1(g0.bar.l) + ',' + px1(g0.bar.r) + ']');
+check('药丸四周留白合理（每边 2~6px）',
+      (g0.bar.h - restH) / 2 >= 2 && (g0.bar.h - restH) / 2 <= 6,
+      'pill.h=' + restH + ' 栏高=' + px1(g0.bar.h));
+check('两个 tab 的文字都还在栏内（药丸不能挤掉标签）',
+      g0.items.every((it) => it.txt.b <= g0.bar.b + 0.5 && it.txt.t >= g0.bar.t - 0.5),
+      g0.items.map((it) => it.tab + ' txt=[' + px1(it.txt.t) + ',' + px1(it.txt.b) + ']').join(' | '));
+
+console.log('\n=== ③ 切换途中：只许位移与 scaleX（落位宽度恒定是重心）===');
+await page.evaluate(() => switchTab('me'));
+const samples = [];
+for (let k = 0; k < 6; k++) {
+  await page.waitForTimeout(k === 0 ? 60 : 55);
+  const g = await geo();
+  samples.push({ t: (k + 1) * 55, cx: centerOf(g.pill), w: px1(g.pill.w), h: px1(g.pill.h), goo: g.pillAmin });
+}
+await page.waitForTimeout(400);
+const g1 = await geo();
+const slot1Center = centerOf(g1.items[1]);
+console.log('  采样宽度: ' + samples.map((s) => s.w + 'px').join(' '));
+check('切换后药丸居中在第 2 格', Math.abs(centerOf(g1.pill) - slot1Center) <= 1.5,
+      'pill.c=' + px1(centerOf(g1.pill)) + ' slot2.c=' + px1(slot1Center));
+check('data-i 跟着走', g1.thumbI === '1', 'data-i=' + g1.thumbI);
+check('落位后宽度与初始完全一致（位移不是宽度动画）', Math.abs(px1(g1.pill.w) - restW) <= 0.5,
+      'rest=' + restW + ' now=' + px1(g1.pill.w));
+check('落位后高度与初始一致（没有残留 skew）', Math.abs(px1(g1.pill.h) - restH) <= 0.5,
+      'rest=' + restH + ' now=' + px1(g1.pill.h));
+check('拉伸峰值不超过 1.16 倍（goo 只轻拉，不能把药丸甩出格子）',
+      samples.every((s) => s.w <= restW * 1.16 + 0.5), samples.map((s) => px1(s.w / restW) + 'x').join(' '));
+check('位移过程中药丸始终在栏内', samples.every((s) => s.cx > g0.bar.l && s.cx < g0.bar.r));
+check('位置单调朝第 2 格走（没有来回弹）',
+      samples.every((s, i) => i === 0 || s.cx >= samples[i - 1].cx - 3),
+      samples.map((s) => px1(s.cx)).join(' -> '));
+check('goo 动画在切换窗口内确实起过（不是只有 CSS 没有触发）',
+      samples.some((s) => s.goo === 'tabPillGoo'), samples.map((s) => s.goo).join(','));
+
+console.log('\n=== ④ 点击反馈：wave 与图标 bump ===');
+await page.waitForTimeout(400);
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(60);
+const gw = await geo();
+check('点击后整排 wave 立即触发', gw.wave === true);
+/* 跨格时图标 bump 故意延后 170ms（滑块先到位、图标再落），所以要在窗口里取两次 */
+await page.waitForTimeout(180);
+const gb = await geo();
+const bumpAmin = await page.evaluate(() => {
+  const wrap = document.querySelector('.tab-item.active .tab-icon-wrap');
+  return wrap ? getComputedStyle(wrap).animationName : '';
+});
+check('被点中的格子图标带 bump', gb.items[0].bump === true,
+      'items=' + gb.items.map((i) => i.tab + ':' + i.bump).join(' '));
+check('bump 跑的是 tabIconBump（真的有 keyframes，不是只挂了个空 class）',
+      /tabIconBump/.test(bumpAmin), 'animationName=' + bumpAmin);
+await page.waitForTimeout(900);
+const gw2 = await geo();
+check('动画结束会收干净（class 不残留，不会卡在半途缩放）',
+      gw2.wave === false && gw2.items.every((i) => !i.bump));
+
+console.log('\n=== ⑤ 探针自证：把 transform 钉死（模拟滑块不动的坏实现）===');
+await page.evaluate(() => {
+  const tag = document.createElement('style');
+  tag.id = '__probe_pin';
+  tag.textContent = '.tab-thumb { transform: none !important; }';
+  document.head.appendChild(tag);
+});
+await page.evaluate(() => switchTab('me'));
+await page.waitForTimeout(600);
+const gp = await geo();
+check('★ 坏实现下药丸真的不动（说明探针量的是真实位置，不是 DOM 里的数字）',
+      Math.abs(centerOf(gp.pill) - centerOf(slot0)) <= 1.5 && gp.thumbI === '1',
+      'pill.c=' + px1(centerOf(gp.pill)) + '（此时 data-i 已是 1，但药丸还在第 1 格）');
+await page.evaluate(() => document.getElementById('__probe_pin').remove());
+
+console.log('\n=== ⑥ 截图 ===');
+async function shot(mode, tab, file) {
+  await page.evaluate((m) => {
+    localStorage.setItem('hn_theme_mode', m);
+    if (typeof applyTheme === 'function') applyTheme(m, { skipServer: true });
+  }, mode);
+  await page.evaluate((t) => switchTab(t), tab);
+  await page.waitForTimeout(800);
+  await page.screenshot({ path: SHOTS + '/' + file, clip: { x: 0, y: 640, width: 360, height: 160 } });
+  console.log('  · ' + file);
+}
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(700);
+await shot('light', 'print', '浅色_打印选中.png');
+await shot('light', 'me', '浅色_我选中.png');
+await shot('dark', 'me', '深色_我选中.png');
+await shot('dark', 'print', '深色_打印选中.png');
+
+check('全程没有打到生产接口（只访问本地桩）', foreign.length === 0, foreign.slice(0, 3).join(' | '));
+
+await browser.close();
+server.close();
+
+console.log('\n' + (failures ? '有 ' + failures + ' 项失败 ❌' : '全绿 ✅'));
+process.exit(failures ? 1 : 0);

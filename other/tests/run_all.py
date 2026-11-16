@@ -61,6 +61,9 @@ ENV_REQUIRED: dict[str, str] = {
                                       "同上，--all 或直接 node 可跑）",
     "verify_toast_above_tabbar.mjs": "需 Playwright / 真实浏览器（气泡与悬浮 tabBar 的真实几何只能靠"
                                      "真实布局量：注入 0/19/34/48px 安全区量矩形；--all 或直接 node 可跑）",
+    "verify_glass_tabbar.mjs": "需 Playwright / 真实浏览器（玻璃滑块的位移、拉伸峰值与落位宽度，"
+                               "wave/bump 的时序只能靠真实渲染量：桩后端 + 真实 www/；"
+                               "--all 或直接 node 可跑）",
     "verify_me_layout_render.mjs": "需 Playwright / 真实浏览器（「我」页首屏到底能看到什么、区块谁先谁后"
                                    "只能靠真实渲染量：桩后端 + 真实 www/，并同时渲染 git HEAD 的旧版作对照；"
                                    "--all 或直接 node 可跑）",
