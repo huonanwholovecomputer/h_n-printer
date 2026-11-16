@@ -1,8 +1,8 @@
 {
-  "version": "1.1.63",
-  "versionCode": 64,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.63.apk",
-  "md5": "f9382a4fd074511b8a104c4294ca0b0b",
-  "notes": "v1.1.63：底部 Tab 栏换成玻璃滑块 —— 选中项是一枚跟手的玻璃胶囊，切换时 320ms 滑到位并轻微拉伸，整排图标依次起伏、被选中的图标弹一下；栏高与底部安全区避让不变（提示气泡仍在栏上方）。",
+  "version": "1.1.64",
+  "versionCode": 65,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.64.apk",
+  "md5": "69664ea3d58b5b9ef06c334bb92ff403",
+  "notes": "v1.1.64：底部 Tab 栏的玻璃滑块现在能直接拖 —— 跟手滑动、松手吸附最近的 tab，拖过头有橡皮筋阻尼；拖动时整排图标朝滑动方向轻微错开，按下图标先压缩再带一点过冲弹回。栏高与底部安全区避让不变（提示气泡仍在栏上方）。",
   "force": false
 }
