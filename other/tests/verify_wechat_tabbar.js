@@ -25,6 +25,17 @@
  * 正好是用户录屏里那 2 帧。修法：_goTab 的 200ms 回调里先把本实例 thumbX 改成目标格再
  * switchTab（值就等于屏上位置，重下发无感）。
  *
+ * 2026-11-16 第 7 轮（用户截图：打印页高亮、药丸却在「我」上，一直不恢复）：
+ * 与第 4 轮同形，但这次药丸**不是**闪一下，而是稳稳定在错格 —— 说明补画被永久吞掉。
+ * 两条独立的病根：① 落位口径第 ② 层回读了 storage 的 _tabCur（跨启动持久化），冷启动/
+ * 新实例在页面栈还空的那一瞬会落到「上次那个格」—— 打印页、药丸在「我」；改成模块内存
+ * sessionCur（本次启动内的已落定格），冷启动从 -1 开始、绝不回读 storage。
+ * ② 页面 onShow 的 setData({selected}) 若恰好落在 _markQuiet() 与 wx.nextTick 清闸之间，
+ * 补画被吞且之后没有任何事件能纠回来 —— selected 观察者不再看 _quiet（已对上就不打
+ * setData），页面另在 setData 后主动调 syncPill()（同值 setData 观察者不开火那条路）。
+ * ③ 顺带补一条落地核对：_goTab 480ms 内 switchTab 没真落地（转场中重复点/低端机超时）时，
+ * 按真实 route 把药丸收回原格（_reconcile）。
+ *
  * 用法：node other/tests/verify_wechat_tabbar.js   （exit 0 = 全绿）
  */
 const fs = require('fs');
@@ -417,12 +428,18 @@ function loadController() {
     clearTimeout: () => {},
     __pages: [{ route: 'pages/index/index' }],
     __switchTo: '',
+    __ticks: [],
     wx: {
       getWindowInfo: () => ({ windowWidth: 375 }),
       getStorageSync: (k) => (k in store ? store[k] : ''),
       setStorageSync: (k, v) => { store[k] = v; },
       removeStorageSync: (k) => { delete store[k]; },
-      nextTick: (fn) => fn(),
+      // 队列化（不是立刻跑）：真机上 wx.nextTick 要等下一次渲染，页面 onShow 的 setData 完全可能
+      // 插在 _markQuiet() 与清闸之间 —— 那正是「补画被吞、药丸停在错误格」的现场，桩里必须能复现。
+      nextTick: (fn) => {
+        sandbox.__ticks.push(fn)
+        return sandbox.__ticks.length
+      },
       setBackgroundColor: () => {},
       setNavigationBarColor: () => {},
       switchTab: (o) => { sandbox.__switchTo = (o && o.url) || ''; },
@@ -448,6 +465,33 @@ function instantiate(def) {
     });
   };
   return inst;
+}
+
+// 观察者接线（七节之前的用例不看观察者；八节要复现「页面 setData → 补画」这条链）
+function instantiateWired(def) {
+  const inst = instantiate(def);
+  const observers = def.observers || {};
+  const prev = {};
+  Object.keys(observers).forEach((k) => { prev[k] = JSON.parse(JSON.stringify(inst.data[k] === undefined ? null : inst.data[k])); });
+  const rawSet = inst.setData;
+  inst.setData = function (patch) {
+    rawSet(patch);
+    Object.keys(observers).forEach((k) => {
+      if (!(k in inst.data)) return;
+      const now = JSON.stringify(inst.data[k] === undefined ? null : inst.data[k]);
+      if (now === JSON.stringify(prev[k])) return;
+      const old = prev[k];
+      prev[k] = inst.data[k];
+      observers[k].call(inst, inst.data[k], old);
+    });
+  };
+  return inst;
+}
+
+// 把排队中的 wx.nextTick 放掉（= 下一次渲染之后）
+function flushTicks(c) {
+  const queue = c.sandbox.__ticks.splice(0, c.sandbox.__ticks.length);
+  queue.forEach((fn) => fn());
 }
 
 function runInstanceTests() {
@@ -489,12 +533,15 @@ function runInstanceTests() {
   check('没有切页记录时按 route 落位（「我」→ 第 2 格）',
         i3.data.selected === 1 && Math.abs(i3.data.thumbX - 147.5) < 0.01, String(i3.data.thumbX));
 
-  /* 7-3b ★ route 拿不到（切页落地那一刻 page 栈还空）→ 按全局 _tabCur 落位。
+  /* 7-3b ★ route 拿不到（切页落地那一刻 page 栈还空）→ 按「本次启动已落定过的格」落位。
      迟到创建的那份实例（被隐藏的打印页）也走这条路，否则它会画回第 1 格叠在当前栏上，
-     看上去就是「切页几秒后药丸又闪一下」。 */
+     看上去就是「切页几秒后药丸又闪一下」。
+     注意口径：只用内存态（同一次启动内跨实例共享），**不读 storage** —— 那里是上一条命的值。 */
   const c3b = loadController();
-  c3b.store._tabCur = 1;
-  c3b.sandbox.__pages = [];
+  c3b.sandbox.__pages = [{ route: 'pages/me/me' }];
+  const first3b = instantiate(c3b.def);
+  c3b.def.pageLifetimes.show.call(first3b);      // 本次启动已落定第 2 格
+  c3b.sandbox.__pages = [];                       // 迟到创建的实例：栈还空
   const i3b = instantiate(c3b.def);
   c3b.def.pageLifetimes.show.call(i3b);
   check('★ route 拿不到时按全局 _tabCur 落位（迟到/隐藏页实例不会画回第 1 格）',
@@ -535,7 +582,8 @@ function runInstanceTests() {
   check('切页前落下目标格/源格/wave 时间戳',
         c6.store._tabWant === 1 && c6.store._tabFrom === 0 && c6.store._tabTo === 1
         && c6.store._tabWantAt > 0 && c6.store._tabWaveAt > 0, JSON.stringify(c6.store));
-  check('切页延迟 200ms（> 退出动画 160ms）', c6.timers.length === 1 && c6.timers[0].ms === 200,
+  check('切页延迟 200ms（> 退出动画 160ms），另排一条落地位核对',
+        c6.timers.length === 2 && c6.timers[0].ms === 200 && c6.timers[1].ms === 450,
         JSON.stringify(c6.timers.map((t) => t.ms)));
   c6.timers[0].fn();
   check('200ms 后真的 switchTab 到「我」', c6.sandbox.__switchTo === '/pages/me/me', c6.sandbox.__switchTo);
@@ -577,6 +625,85 @@ function runInstanceTests() {
         JSON.stringify(c7.store));
 }
 
+/* ---------------- 八、药丸停在错误格（用户现场：在打印页、药丸却在「我」） ---------------- */
+function runStaleTests() {
+  section('八、药丸停在错误格：任何落位顺序都必须收敛回真实页面');
+
+  const ctrlSrcNow = () => fs.readFileSync(path.join(TAB_DIR, 'index.js'), 'utf8');
+
+  /* 8-1 冷启动：上一条命留在 storage 里的 _tabCur 不得参与落位 */
+  const c1 = loadController();
+  c1.store._tabCur = 1;                       // 上一轮停在「我」
+  c1.sandbox.__pages = [];                    // 冷启动这一刻页面栈还没登记
+  const i1 = instantiateWired(c1.def);
+  c1.def.lifetimes.attached.call(i1);
+  check('★ 冷启动不读上一条命的 _tabCur（栈还空时退回本实例默认格）',
+        i1.data.selected === 0 && Math.abs(i1.data.thumbX) < 0.01,
+        JSON.stringify({ sel: i1.data.selected, thumbX: i1.data.thumbX }));
+  check('★ 静态：落位代码里不再出现 getStorageSync(\'_tabCur\')',
+        !/getStorageSync\('_tabCur'\)/.test(ctrlSrcNow()));
+
+  /* 8-2 现场那屏的复现：_refresh 落到第 2 格，页面 onShow 的 setData({selected:0})
+     正好插在 _quiet 还开着的时候 —— 以前补画被吞，屏上就是「打印高亮 + 药丸在『我』」。 */
+  const c2 = loadController();
+  c2.store._tabWant = 1;
+  c2.store._tabWantAt = Date.now();
+  c2.sandbox.__pages = [{ route: 'pages/me/me' }];
+  const i2 = instantiateWired(c2.def);
+  c2.def.lifetimes.attached.call(i2);
+  check('8-2 前置：先落到第 2 格',
+        i2.data.selected === 1 && Math.abs(i2.data.thumbX - 147.5) < 0.01,
+        JSON.stringify({ sel: i2.data.selected, thumbX: i2.data.thumbX }));
+  i2.setData({ selected: 0, 'list[0].active': true, 'list[1].active': false });
+  check('★ 页面声明 selected 与药丸不一致 → 即使 quiet 没清也立刻补画',
+        i2.data.selected === 0 && Math.abs(i2.data.thumbX) < 0.01 && i2.data.cfg.sel === 0,
+        JSON.stringify({ sel: i2.data.selected, thumbX: i2.data.thumbX, cfgSel: i2.data.cfg && i2.data.cfg.sel }));
+
+  /* 8-2b 页面 onShow 里主动 syncPill()：值是同一个（不触发观察者）时也要能收敛。
+     现场这条路最要命 —— _goTab 只挪了药丸没改 selected，页面再 setData({selected:0})
+     等于什么都没发生，观察者根本不开火。 */
+  const c3 = loadController();
+  c3.sandbox.__pages = [{ route: 'pages/index/index' }];
+  const i3 = instantiateWired(c3.def);
+  c3.def.lifetimes.attached.call(i3);
+  i3._goTab(1);                                // 用户点「我」：药丸乐观地先滑过去
+  i3.setData({ selected: 0, 'list[0].active': true, 'list[1].active': false });   // 值没变
+  check('8-2b 前置：值没变 → 药丸仍停在第 2 格（观察者不开火）',
+        Math.abs(i3.data.thumbX - 147.5) < 0.01, String(i3.data.thumbX));
+  if (typeof i3.syncPill === 'function') i3.syncPill();
+  check('★ 页面 onShow 调 syncPill() → 药丸按真实选中格收敛',
+        Math.abs(i3.data.thumbX) < 0.01 && i3.data.cfg.sel === 0,
+        JSON.stringify({ thumbX: i3.data.thumbX, cfgSel: i3.data.cfg && i3.data.cfg.sel }));
+
+  /* 8-3 switchTab 压根没落地：药丸已经乐观滑走，页面却还停在原格 */
+  const c4 = loadController();
+  c4.sandbox.__pages = [{ route: 'pages/index/index' }];
+  const i4 = instantiateWired(c4.def);
+  c4.def.lifetimes.attached.call(i4);
+  i4._goTab(1);
+  const sw = c4.timers.find((t) => t.ms === 200);
+  check('8-3 前置：200ms 后 switchTab 已发出', !!sw, JSON.stringify(c4.timers.map((t) => t.ms)));
+  if (sw) sw.fn();
+  const settle = c4.timers.find((t) => t.ms === 450);
+  check('★ 切页之后还排了一条落地位核对（否则 switchTab 失败时药丸永远停在『我』）',
+        !!settle, JSON.stringify(c4.timers.map((t) => t.ms)));
+  if (settle) {
+    settle.fn();                               // 页面栈仍停在 index ⇒ 切页没落地
+    check('★ 切页没落地 → 按真实 route 收回第 1 格，并清掉残留的 _tabWant',
+          i4.data.selected === 0 && Math.abs(i4.data.thumbX) < 0.01 && i4.data.cfg.sel === 0
+          && !('_tabWant' in c4.store),
+          JSON.stringify({ sel: i4.data.selected, thumbX: i4.data.thumbX, store: c4.store }));
+  }
+
+  /* 8-4 静态：两个 tab 页 onShow 声明选中格之后都要叫一次 syncPill() */
+  const ixSrc = fs.readFileSync(path.join(H5, 'pages', 'index', 'index.js'), 'utf8');
+  const meSrc = fs.readFileSync(path.join(H5, 'pages', 'me', 'me.js'), 'utf8');
+  check('★ 打印页 / 我页 onShow 里都调了 tabBar.syncPill()',
+        /tabBar\.syncPill\(\)/.test(ixSrc) && /tabBar\.syncPill\(\)/.test(meSrc),
+        (/tabBar\.syncPill\(\)/.test(ixSrc) ? 'index ✓' : 'index ✗') + ' / '
+        + (/tabBar\.syncPill\(\)/.test(meSrc) ? 'me ✓' : 'me ✗'));
+}
+
 runContractTests();
 runSettleTests();
 runDragTests();
@@ -584,6 +711,7 @@ runRubberTests();
 runReleaseTests();
 runRefreshTests();
 runInstanceTests();
+runStaleTests();
 
 console.log('\n' + '='.repeat(52));
 if (failures) {

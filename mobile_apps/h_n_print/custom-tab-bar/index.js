@@ -3,6 +3,10 @@
 // 2026-11-16：加玻璃滑块。几何与选中格由这里下发（cfg），拖动/滞后/吸附/船式起伏全部
 // 在视图层（utils/tabbar.wxs）逐帧完成 —— 手势期间逻辑层一次 setData 都不参与。
 // 这里只负责「要切页」这一刻：先让当前页播 160ms 退出动画，再 switchTab。
+// 本次启动期内的「已落定格」：同一次启动里多份 tabBar 实例（每个 tab 页各一份）共享。
+// 冷启动从 -1 开始，**绝不**回读 storage 里的 _tabCur —— 那里是上一条命留下的值，
+// 页面栈还空的那一瞬读到它，药丸就会落到上一次的格（现场：在打印页、药丸在「我」）。
+let sessionCur = -1
 Component({
   data: {
     hideBorder: false,
@@ -28,10 +32,12 @@ Component({
       this._waveTimer = 0
       this._geo = null
       this._quiet = false
+      this._settleTimer = 0
       this._refresh()
     },
     detached() {
       if (this._waveTimer) { clearTimeout(this._waveTimer); this._waveTimer = 0 }
+      if (this._settleTimer) { clearTimeout(this._settleTimer); this._settleTimer = 0 }
     },
   },
   pageLifetimes: {
@@ -42,7 +48,11 @@ Component({
     // 每次 setData 框架都会重新下发节点 style，把视图层写的位移整条抹掉，
     // 所以这两个字段一变就补画一次（只重画，不动位置）。
     hideBorder() { if (!this._quiet) this._repaint() },
-    selected() { if (!this._quiet) this._repaint() },
+    // 页面声明的选中格与药丸位置不一致就补画 —— 这里**不再看 _quiet**：
+    // 现场那次事故正是「页面 onShow 的 setData 恰好落在 _markQuiet() 与清闸之间」，
+    // 补画被吞掉，屏上停在「打印高亮 + 药丸在『我』」，且没有任何后续事件能纠回来。
+    // 已经对上（_refresh / _goTab 自己下发的那一次）就什么都不做，不会多打一轮 setData。
+    selected() { this.syncPill() },
   },
   methods: {
     // 几何：一格多少 px、药丸允许探出多少（= 左右内缩 / 格宽）。与 index.wxss 的
@@ -66,10 +76,10 @@ Component({
       const geo = this._measure()
       // 落位口径（第 6 轮，三层）：
       // ① route 命中哪一格就是哪一格（常规路径）；
-      // ② route 拿不到时（切 tab 落地那一刻 getCurrentPages() 可能还是空/旧页）读全局 _tabCur
-      //    （上一次落定的格）——**不要**回退到 data.selected：新实例的默认值是 0，那就是「药丸
-      //    画到左格」；迟到创建的那份实例（如被隐藏的打印页）同样画左格，叠在当前栏上就成了
-      //    「切页几秒后药丸又闪一下」；
+      // ② route 拿不到时（切 tab 落地那一刻 getCurrentPages() 可能还是空/旧页）用本次启动里
+      //    已落定过的格（模块内存 sessionCur）——**不要**回退到 data.selected：新实例的默认值
+      //    是 0，那就是「药丸画到左格」；迟到创建的那份实例（如被隐藏的打印页）同样画左格，
+      //    叠在当前栏上就成了「切页几秒后药丸又闪一下」；
       // ③ _goTab 在 1.5s 内记下的目标格优先于上面两层（它代表用户的最新意图）。
       let idx = -1
       let route = ''
@@ -82,12 +92,7 @@ Component({
         const found = this.data.list.findIndex((item) => item.pagePath === route)
         if (found >= 0) idx = found
       }
-      if (idx < 0) {
-        try {
-          const last = Number(wx.getStorageSync('_tabCur'))
-          if (last >= 0 && last <= this.data.list.length - 1) idx = last
-        } catch (e) {}
-      }
+      if (idx < 0 && sessionCur >= 0 && sessionCur <= this.data.list.length - 1) idx = sessionCur
       if (idx < 0) idx = this.data.selected
       // 切 tab 落地这一刻页面栈可能还没换成新页：route 仍是上一页，而且它会「命中」旧页那一格
       // （不是未命中），所以兜底不能只写在 found < 0 的分支里 —— 那正是「药丸先闪回打印、
@@ -98,6 +103,9 @@ Component({
         const at = Number(wx.getStorageSync('_tabWantAt') || 0)
         if (want >= 0 && want <= this.data.list.length - 1 && at && Date.now() - at < 1500) idx = want
       } catch (e) {}
+      // 落定之后就记住（本次启动内跨实例共享）——必须写在这里，不能写在上面 route 分支之后：
+      // _tabWant 会把 idx 改掉，记早了 sessionCur 就跟真正下发的格不一致。
+      sessionCur = idx
       let dark = false
       try { dark = !!(getApp().globalData && getApp().globalData.isDarkMode) } catch (e) {}
       // 只有「刚切 tab 落到本页」才播整排 wave；从子页返回不播，免得每回一次抖一下
@@ -123,7 +131,7 @@ Component({
         if (item.active !== (i === idx)) patch['list[' + i + '].active'] = (i === idx)
       })
       this.setData(patch)
-      try { wx.setStorageSync('_tabCur', idx) } catch (e) {}
+      try { wx.setStorageSync('_tabCur', idx) } catch (e) {}   // 仅诊断镜像，不作落位依据
       if (arriving) {
         // 收 wave 也是一次 setData：此时药丸已经停在选中格，抹掉再补画看不出差别
         if (this._waveTimer) clearTimeout(this._waveTimer)
@@ -154,13 +162,45 @@ Component({
     _repaint() {
       const geo = this._geo || this._measure()
       const sel = this.data.selected || 0
-      try { wx.setStorageSync('_tabCur', sel) } catch (e) {}
+      sessionCur = sel
+      try { wx.setStorageSync('_tabCur', sel) } catch (e) {}   // 仅诊断镜像，不作落位依据
       this._rev += 1
       this.setData({
         thumbX: sel * geo.step,
         thumbReady: true,
         cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel, rev: this._rev, snap: true },
       })
+    },
+
+    // 页面 onShow 声明完选中格之后主动对一次（公开方法，两个 tab 页都会调）。
+    // 为什么不能只靠 selected 观察者：_goTab 只挪药丸、不改 selected，页面随后
+    // setData({selected: 同一个值}) 等于什么都没发生，观察者压根不开火 —— 药丸就停在那儿了。
+    syncPill() {
+      const geo = this._geo || this._measure()
+      const sel = this.data.selected || 0
+      const want = sel * geo.step
+      if (Math.abs((Number(this.data.thumbX) || 0) - want) < 0.5) return
+      this._repaint()
+    },
+
+    // 切页到底落没落地：药丸是乐观先滑过去的，switchTab 可能压根没生效
+    // （转场中重复调用 / 页面正被隐藏 / 低端机超时）。那时页面栈还停在原格，
+    // syncPill 也救不了（页面 onShow 的 setData 值没变），只能按真实 route 把药丸收回来。
+    // pagePath 传的是**本实例所属那一页**（原页）：route 还是它 ⇒ switchTab 没落地。
+    _reconcile(pagePath) {
+      let route = ''
+      try {
+        const pages = getCurrentPages()
+        const cur = pages[pages.length - 1]
+        if (cur && cur.route) route = cur.route
+      } catch (e) { return }
+      if (!route || route !== pagePath) return
+      try {
+        wx.removeStorageSync('_tabWant')
+        wx.removeStorageSync('_tabWantAt')
+        wx.removeStorageSync('_tabWaveAt')
+      } catch (e) {}
+      this._refresh()
     },
 
     // 兜底：视图层没接住这一下时（老基础库/JS 层事件）仍能切页。
@@ -200,9 +240,10 @@ Component({
         wx.setStorageSync('_tabWaveAt', Date.now())
         wx.setStorageSync('_tabWant', index)
         wx.setStorageSync('_tabWantAt', Date.now())
-        // 目标格同时也是「全局当前格」：切页途中若有一份新实例被创建（如被隐藏的打印页），
+        // 目标格同时也是「本次启动的当前格」：切页途中若有一份新实例被创建（如被隐藏的打印页），
         // 它的 _refresh 拿不到 route，就会读这个值 —— 落在目标格，叠在当前栏上也看不出变化。
-        wx.setStorageSync('_tabCur', index)
+        sessionCur = index
+        wx.setStorageSync('_tabCur', index)   // 仅诊断镜像，不作落位依据
       } catch (e) {}
       const app = getApp()
       const isDark = app.globalData.isDarkMode
@@ -234,6 +275,16 @@ Component({
       setTimeout(() => {
         wx.switchTab({ url: '/' + target.pagePath })
       }, 200)
+      // 落地位核对（第 7 轮）：药丸是「乐观」先滑过去的，switchTab 有可能压根没落地
+      // （转场中重复调用 / 页面正被隐藏 / 低端机超时）。那时页面还停在原格，而它 onShow 的
+      // setData({selected: 上一个值}) 因为「值没变」不会触发补画 —— 屏上就是
+      // 「打印高亮 + 药丸在『我』」而且一直不恢复。450ms 后按真实 route 核一次。
+      const fromPath = (this.data.list[prev] && this.data.list[prev].pagePath) || ''
+      if (this._settleTimer) clearTimeout(this._settleTimer)
+      this._settleTimer = setTimeout(() => {
+        this._settleTimer = 0
+        this._reconcile(fromPath)
+      }, 450)
     },
   },
 })

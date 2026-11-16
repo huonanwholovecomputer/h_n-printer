@@ -393,6 +393,8 @@ Component({
           const tabBar = this.getTabBar && this.getTabBar()
           if (tabBar) {
             tabBar.setData({ selected: 1, 'list[0].active': false, 'list[1].active': true })
+            // 同一格 setData 不触发观察者（_goTab 只挪药丸、不改 selected），再主动对一次位置
+            if (typeof tabBar.syncPill === 'function') tabBar.syncPill()
           }
         } catch (e) {}
         this._scheduleMeasure()
@@ -455,6 +457,8 @@ Component({
         const tabBar = this.getTabBar && this.getTabBar()
         if (tabBar) {
           tabBar.setData({ selected: 1, 'list[0].active': false, 'list[1].active': true })
+          // 同一格 setData 不触发观察者（_goTab 只挪药丸、不改 selected），再主动对一次位置
+          if (typeof tabBar.syncPill === 'function') tabBar.syncPill()
         }
       } catch (e) {}
       this._scheduleMeasure()
