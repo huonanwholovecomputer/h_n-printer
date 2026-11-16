@@ -1,8 +1,8 @@
 {
-  "version": "1.1.68",
-  "versionCode": 69,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.68.apk",
-  "md5": "f76101aec88418a3afce48f540600f16",
-  "notes": "v1.1.68：Tab 栏切换动画可被打断——页面滑到一半反向切 tab 时，页面立刻从当前位置反方向滑回，不再等这一趟播完，点按与拖动松手同一口径。",
+  "version": "1.1.69",
+  "versionCode": 70,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.69.apk",
+  "md5": "683c6a0052a846d7b9f94356d37c0e43",
+  "notes": "v1.1.69：Tab 栏滑块的「脱手」手感——拖动时玻璃不再钉在手指下，而是略微落后地追上来，手一停它自己滑到位；只滞后位置，不拉伸不变形。",
   "force": false
 }
