@@ -309,18 +309,107 @@ def _is_word_cloud(key: str) -> bool:
     return any(key == p or key.startswith(p) for p in _WORD_CLOUD_FAMILIES)
 
 
+# ── PostScript 字体名 → 系统字族名 ──────────────────────────────────────────
+# PDF 的 BaseFont 写的是 **PostScript 名**，不是 Windows 里的字族名：
+#     TimesNewRomanPSMT / TimesNewRomanPS-BoldMT / TimesNewRomanPS-ItalicMT
+#     ArialMT / Arial-BoldMT / Helvetica-Bold / CourierNewPSMT
+# 而系统字体表里只有 Times New Roman / Arial / Courier New（注册表写的是
+# "Times New Roman (TrueType)"）。直接拿 PS 名去比 ⇒ 明明装了也判「没装」。
+# 2026-11-15 现场：用户把 TimesNewRomanPSMT.otf、ArialMT.ttf 都装好了，工具照旧报
+# 「本机没装这些字体：TimesNewRomanPS-BoldMT、Arial-BoldMT、ArialMT…」。
+# 归一规则：剥厂商后缀（PSMT/MT/PS）→ 把 "-BoldItalic" 这类样式词拆出来 →
+# 生成「族名」「族名+样式」候选。只在直接比对失败后才用，不会盖掉真实缺字体。
+_PS_VENDOR = ("psmt", "mt", "ps")
+_PS_STYLE_WORDS = ("bolditalic", "boldoblique", "italic", "oblique", "bold", "regular")
+
+
+def _strip_vendor(word: str) -> str:
+    """剥掉字族 token 尾巴上的厂商后缀：timesnewromanps → timesnewroman、arialmt → arial。"""
+    for suf in _PS_VENDOR:
+        if word.endswith(suf) and len(word) > len(suf) + 1:
+            return word[: -len(suf)]
+    return word
+
+
+def _ps_variants(key: str) -> list[str]:
+    """PostScript 名 → 可能是系统字族名的候选（不含 key 自身、已去空）。"""
+    if not key:
+        return []
+    head, sep, tail = key.partition("-")
+    out: list[str] = []
+    for suf in _PS_VENDOR:
+        if head.endswith(suf) and len(head) > len(suf) + 1:
+            out.append(head[: -len(suf)])
+            break
+    out.append(head)
+    style = tail if sep else ""
+    for suf in _PS_VENDOR:
+        if style.endswith(suf) and len(style) > len(suf):
+            style = style[: -len(suf)]
+            break
+    words: list[str] = []
+    for w in _PS_STYLE_WORDS:          # 长的先匹配（bolditalic 要在 bold 前）
+        if style.endswith(w) and len(style) > len(w):
+            words.append(w)
+            style = style[: -len(w)]
+            break
+    if style.endswith("bold") or style.endswith("italic"):
+        words.append(style)
+        style = ""
+    if style:
+        out.append(head + style)       # ArialRoundedMTBold 这类「族名里带字重」的，原样保留
+    if words:
+        for base in list(out):
+            out.extend(base + w for w in words)
+            out.append(base + "".join(words))
+    # 候选里的族名 token 可能还带着厂商后缀（timesnewromanps bold）——
+    # 再补一份剥掉后缀的（times new roman bold）：否则 _STYLE_TAILS 回退拿到的是
+    # 「timesnewromanps」，永远匹配不上系统里的 Times New Roman。
+    # 2026-11-15 现场：TimesNewRomanPS-BoldMT / -ItalicMT 就卡在这一跳上。
+    extra: list[str] = []
+    for c in list(out):
+        parts = c.split(" ")
+        if not parts:
+            continue
+        head2 = _strip_vendor(parts[0])
+        if head2 and head2 != parts[0]:
+            extra.append(" ".join([head2] + parts[1:]).strip())
+    out.extend(extra)
+    seen: set[str] = set()
+    res: list[str] = []
+    for c in out:
+        c = c.strip()
+        if c and c != key and c not in seen:
+            seen.add(c)
+            res.append(c)
+    return res
+
+
+def _known(key: str) -> bool:
+    """归一 key 是否指向一个「本机能用」的字族（已装 / 标准字体 / Word 云字体）。"""
+    return bool(key) and (key in _installed_norm() or key in _ALWAYS_OK
+                          or _is_word_cloud(key))
+
+
 def _missing_key(key: str) -> bool:
     """归一 key 是否算"本机缺"。
 
     家族名已装时，「家族名 + 字重」（等线 Light / 方正黑体_GBK Bold / Segoe UI Light）按
     有字重处理 —— Word 会拿同族渲染，版式一致；否则中文 Word 文档几乎人人弹「缺 等线 Light」。
     """
-    if not key or key in _installed_norm() or key in _ALWAYS_OK or _is_word_cloud(key):
+    if not key or _known(key):
         return False
     for tail in _STYLE_TAILS:
         if key.endswith(tail) and len(key) > len(tail):
             base = key[:-len(tail)].strip()
-            if base and (base in _installed_norm() or base in _ALWAYS_OK or _is_word_cloud(base)):
+            if _known(base):
+                return False
+    # PostScript 名（ArialMT / TimesNewRomanPS-BoldMT）→ 系统字族名再看一眼
+    for cand in _ps_variants(key):
+        if _known(cand):
+            return False
+        for tail in _STYLE_TAILS:
+            if cand.endswith(tail) and len(cand) > len(tail) and _known(cand[:-len(tail)]):
                 return False
     return True
 

@@ -116,6 +116,7 @@ import staging  # 添加文件的「工作副本」暂存（压缩包拖拽兼�
 import retention  # 本地副本生命周期：保留期清理 / 攒批 .keep 过期 / 启动扫描（见 retention.py）
 import paths    # 用户数据目录（攒批批次目录 duplex_stack_dir 在这里）
 import font_check  # 字体缺失检测（查源文件用到的字体、本机缺哪些，见 font_check.py）
+import font_install  # 字体文件安装：拷进用户字体目录 + 写 HKCU 注册表 + WM_FONTCHANGE（见 font_install.py）
 import agent_api  # 智能助手（DSH）控制接口的传输层：回环 HTTP + 令牌 + 线程到主线程的泵
 import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打印，复用既有入口与计费口径）
 
@@ -3452,6 +3453,180 @@ class FontCheckWorker(QThread):
                 self.checked.emit(p, missing, self._fp, nonembedded)
             except RuntimeError:
                 return          # 窗口已销毁
+
+
+# ── 字体缺失详情（2026-11-15 用户需求）────────────────────────────────────
+# 现场：用户按提示去网上找字体，可提示里的名字只能看不能抄（行 tooltip 一挪走就没了），
+# 而且「本机没装」和「PDF 没嵌入」两种缺混在一句话里 —— 不知道该搜谁、装了到底有没有用。
+# 这里给一份可整段复制的清单 + 一条装字体的捷径（拷进当前用户的字体目录）。
+
+
+def _font_help_names(job) -> tuple:
+    """(本机没装的名字, PDF 里没嵌入字形的名字)。"""
+    miss = [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
+    ne = [str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()]
+    return miss, ne
+
+
+def font_help_text(jobs) -> str:
+    """「字体缺失详情」正文（纯字符串 ⇒ 验收脚本可以直接断言，不用建控件）。"""
+    jobs = list(jobs or [])
+    body: list = []
+    for job in jobs:
+        miss, ne = _font_help_names(job)
+        if not miss and not ne:
+            continue
+        label = os.path.basename(getattr(job, "file_path", "") or "") or "（未知文件）"
+        body.append("■ " + label)
+        if miss:
+            body.append("  本机没装（装上就能救）：")
+            for n in miss:
+                body.append("    · " + n)
+        if ne:
+            body.append("  PDF 生成时没嵌进字形（装不装字体都改不了这一条）：")
+            for n in ne:
+                body.append("    · " + n)
+        body.append("")
+    lines = ["共 %d 个文件有字体提示。" % len(jobs), ""]
+    lines += body or ["（这些文件当前没有字体提示）", ""]
+    lines += [
+        "怎么补字体",
+        "1) 点下方「⧉ 复制字体名」：上面列出的名字会一起进剪贴板（每行一个）。",
+        "2) 拿去搜下载：搜「字体名 字体 ttf」就行（Google / GitHub / 字体站都可以）。",
+        "   要装名字对得上的那一份 —— 有的站把别的字体改名冒充：本机实测一份"
+        "「ArialMT.ttf」实际是 Bitstream Vera Sans，装上也没用。",
+        "3) 下载到 .ttf / .otf 后点「📂 安装字体文件…」：装进当前用户，不需要管理员。",
+        "4) 装完点「✅ 已装好，重新检查」，这一批文件的字体提示会按新字体重判。",
+        "",
+        "两点要知道",
+        "· 西文（Times New Roman / Arial 这一类）本工具不做替换（排版风险大）：PDF 没嵌入时"
+        "一律用内置等价字形，笔画略有差别，页数/分页不受影响。装齐字体主要解决中文"
+        "（宋体/黑体被换成无衬线兜底）和 .docx 的字体替换。",
+        "· 几十 KB 的字体多半是从 PDF 里抽出来的子集，只含那一份文件用到的字；"
+        "要通用就得装完整的正版字体。",
+    ]
+    return "\n".join(lines)
+
+
+class FontHelpDialog(QDialog):
+    """字体缺失详情窗：名字可复制 + 一键装字体文件 + 装完重新检查。
+
+    只负责展示与装文件；重判交给 MainWindow._font_recheck_jobs（要重新枚举字体 + 重排队）。
+    """
+
+    def __init__(self, parent, jobs, text: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("🖋 字体缺失详情")
+        self.resize(780, 600)
+        self._jobs = list(jobs or [])
+        self.recheck_requested = False      # 用户点了「已装好，重新检查」
+        self.installed_any = False          # 这次会话里确实装进了字体
+        self.view = QPlainTextEdit(self)
+        self.view.setReadOnly(True)
+        self.view.setPlainText(text or font_help_text(self._jobs))
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.btn_copy = QPushButton("⧉ 复制字体名", self)
+        self.btn_copy.setToolTip("把上面列出的所有字体名按行拷到剪贴板，直接粘到搜索框")
+        self.btn_install = QPushButton("📂 安装字体文件…", self)
+        self.btn_install.setToolTip(
+            "选下载好的 .ttf/.otf 文件，装进当前用户（拷到 "
+            "%LOCALAPPDATA%\\Microsoft\\Windows\\Fonts + 写 HKCU 注册表），不需要管理员")
+        self.btn_recheck = QPushButton("✅ 已装好，重新检查", self)
+        self.btn_recheck.setToolTip("按刚装的字体重排这批文件的字体提示")
+        self.btn_close = QPushButton("关闭", self)
+        self.btn_close.setDefault(True)
+        self.btn_copy.clicked.connect(self._copy_names)
+        self.btn_install.clicked.connect(self._install_files)
+        self.btn_recheck.clicked.connect(self._recheck)
+        self.btn_close.clicked.connect(self.reject)
+        lay = QVBoxLayout(self)
+        head = QLabel("缺的字体清单在下面，可以整段复制。装好字体后点「已装好，重新检查」。")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+        lay.addWidget(self.view, 1)
+        lay.addWidget(self.status)
+        row = QHBoxLayout()
+        row.addWidget(self.btn_copy)
+        row.addWidget(self.btn_install)
+        row.addWidget(self.btn_recheck)
+        row.addStretch(1)
+        row.addWidget(self.btn_close)
+        lay.addLayout(row)
+
+    def _all_names(self) -> list:
+        out: list = []
+        for job in self._jobs:
+            miss, ne = _font_help_names(job)
+            for n in list(miss) + list(ne):
+                if n not in out:
+                    out.append(n)
+        return out
+
+    def _copy_names(self) -> None:
+        names = self._all_names()
+        if not names:
+            self.status.setText("这些文件当前没有字体提示，没什么可复制的。")
+            return
+        try:
+            QApplication.clipboard().setText("\n".join(names))
+        except Exception:
+            logger.debug("复制字体名失败", exc_info=True)
+            self.status.setText("复制失败（剪贴板不可用），可以在正文里手动选中复制。")
+            return
+        self.status.setText("已复制 %d 个字体名到剪贴板 ✅" % len(names))
+
+    def _install_files(self) -> None:
+        """选文件 → 装进当前用户 → 把结果写进正文（用户能看见装到哪、有没有坑）。"""
+        try:
+            paths, _f = QFileDialog.getOpenFileNames(
+                self, "选择要安装的字体文件", "",
+                "字体文件 (*.ttf *.otf *.ttc *.otc);;所有文件 (*)")
+        except Exception:
+            paths = []
+        if not paths:
+            return
+        try:
+            plan = font_install.plan_install(list(paths))
+        except Exception:
+            plan = []
+        subsets = [str(it.get("name") or "") for it in plan
+                   if it.get("ok") and it.get("subset")]
+        try:
+            rep = font_install.install(list(paths))
+        except Exception as exc:
+            logger.debug("安装字体失败", exc_info=True)
+            QMessageBox.warning(self, "安装失败", "安装字体时出错：%s" % exc)
+            return
+        ok = [str(x) for x in (rep.get("installed") or [])]
+        skipped = [tuple(x) for x in (rep.get("skipped") or [])]
+        errors = [tuple(x) for x in (rep.get("errors") or [])]
+        msg: list = []
+        if ok:
+            msg.append("已装进当前用户：" + "、".join(ok))
+        if subsets:
+            msg.append("⚠ 这些文件只有几十 KB，多半是子集字体（只含那份文件用到的字），"
+                        "别的文件未必够用：" + "、".join([s for s in subsets if s]))
+        for _p, why in skipped:
+            msg.append("· 跳过 %s：%s" % (os.path.basename(str(_p)), why))
+        for _p, why in errors:
+            msg.append("· 失败 %s：%s" % (os.path.basename(str(_p)), why))
+        if not msg:
+            msg.append("没有装进任何字体。")
+        self.installed_any = bool(ok) or bool(skipped)
+        self.status.setText(msg[0])
+        self.view.appendPlainText("")
+        self.view.appendPlainText("── 安装结果 ──")
+        for line in msg:
+            self.view.appendPlainText(line)
+        if ok:
+            self.view.appendPlainText("已装好 ⇒ 点「✅ 已装好，重新检查」重判这批文件。")
+        else:
+            QMessageBox.warning(self, "安装失败", "\n".join(msg))
+
+    def _recheck(self) -> None:
+        self.recheck_requested = True
+        self.accept()
 
 
 class PrintWorker(QThread):
@@ -11460,7 +11635,10 @@ class MainWindow(QMainWindow):
                 + "\n".join(f"· {n}" for n in _miss[:8])
                 + ("\n…" if len(_miss) > 8 else "")
                 + "\n转换/打印时会用相近字体替换，字形、字宽、换行可能变样。\n"
-                  "把字体装上，再右键这份文件 → 🔄 重新转换，提示就没了。")
+                  "右键这份文件 → 🖋 字体缺失详情… 可以把字体名一键复制、直接装字体文件；\n"
+                  "装上后在那里面点「已装好，重新检查」，或右键 → 🔄 重新转换。\n"
+                  "注意：几十 KB 的字体多半是从 PDF 里抽出来的子集（只含那份文件用到的字），"
+                  "或干脆是别的字体改名冒充的 —— 装上也救不了别的文件。")
         return blocks
 
     def _queue_font_checks(self, jobs: list, tab_key: str = "") -> None:
@@ -11468,7 +11646,19 @@ class MainWindow(QMainWindow):
 
         查不了的（图片/TXT/MD/旧 .doc）就地标 `font_checked=True`：它们要么没有字体概念，
         要么得靠 COM 才拿得到（`<w:font>` 只存在于 docx 里）—— 标掉才不会每次加文件都重排队。
+
+        2026-11-15 现场：18:38 装完字体、18:43 加文件仍然报「本机没装」——
+        `refresh_installed()` 全仓只有右键「🔄 重新转换」那条路会调，进程内快照还是
+        启动那一刻的。这里补一次**节流枚举**（GDI 全量约 10 ms，别每个文件都来一趟）。
         """
+        try:
+            _now = time.monotonic()
+            _last = float(getattr(self, "_font_refresh_at", 0.0) or 0.0)
+            if _now - _last >= 0.5:
+                self._font_refresh_at = _now
+                font_check.refresh_installed(QFontDatabase.families())
+        except Exception:
+            logger.debug("字体枚举刷新失败（沿用旧快照）", exc_info=True)
         try:
             fp = font_check.fonts_fingerprint()
         except Exception:
@@ -11578,6 +11768,58 @@ class MainWindow(QMainWindow):
                           "（转换/打印会被相近字体替换，装上字体后重新添加文件即可）")
         except Exception:
             logger.debug("字体检出回写失败", exc_info=True)
+
+    def _open_font_help(self, rows) -> None:
+        """右键 → 🖋 字体缺失详情…（2026-11-15 用户需求：字体名要能复制、字体文件要能一键装）。"""
+        try:
+            jobs = self._get_current_jobs() or []
+        except Exception:
+            jobs = []
+        picked = [jobs[r] for r in (rows or []) if 0 <= int(r) < len(jobs)]
+        if not picked:
+            return
+        try:
+            dlg = FontHelpDialog(self, picked)
+        except Exception:
+            logger.debug("打开字体详情窗失败", exc_info=True)
+            return
+        dlg.exec()
+        if dlg.recheck_requested or dlg.installed_any:
+            self._font_recheck_jobs(picked)
+
+    def _font_recheck_jobs(self, jobs) -> None:
+        """重新枚举本机字体，再重查这一批文件的字体提示（装完字体后走这条路）。"""
+        try:
+            font_check.refresh_installed(QFontDatabase.families())
+        except Exception:
+            logger.debug("字体枚举刷新失败", exc_info=True)
+        self._font_refresh_at = time.monotonic()   # 别让 _queue_font_checks 立刻再枚举一遍
+        try:
+            all_jobs = self._get_current_jobs() or []
+        except Exception:
+            all_jobs = []
+        rows: list = []
+        fresh: list = []
+        for job in (jobs or []):
+            try:
+                job.font_checked = False
+                job.font_fp = ""
+            except Exception:
+                continue
+            try:
+                idx = all_jobs.index(job)
+            except ValueError:
+                continue
+            rows.append(idx)
+            fresh.append(job)
+        if fresh:
+            self._queue_font_checks(fresh, tab_key=self._current_tab)
+            for idx in rows:
+                try:
+                    self._fill_table_row(idx, all_jobs[idx])
+                except Exception:
+                    logger.debug("刷新字体检出行失败", exc_info=True)
+            self._log("🖋 已按当前已装字体重查 %d 个文件的字体提示" % len(fresh))
 
     def _font_gate(self, flat_jobs: list, interactive: bool = True) -> bool:
         """打印前拦一道：这批文件里有本机没装的字体就问一句。返回 False = 用户取消。
@@ -13095,6 +13337,25 @@ class MainWindow(QMainWindow):
                 "要重打请用「➕ 添加到新标签页」。")
             reconvert_action.triggered.connect(
                 lambda checked=False, rs=list(rows): self._force_reconvert_rows(rs))
+            # 字体缺失详情（2026-11-15 用户需求）：名字要能一键复制（方便去搜下载），
+            # 下载好的字体文件也要能直接装 —— 手动装字体是最容易出岔子的一步（UAC/HKCU）。
+            _fh_rows = [r for r in rows if r < len(_jobs_now)
+                        and (getattr(_jobs_now[r], "missing_fonts", None)
+                             or getattr(_jobs_now[r], "nonembedded_fonts", None))]
+            font_help_action = menu.addAction(
+                f"🖋 字体缺失详情（{len(_fh_rows)} 个文件）" if len(_fh_rows) > 1
+                else "🖋 字体缺失详情…")
+            font_help_action.setEnabled(bool(_fh_rows))
+            if not _fh_rows:
+                font_help_action.setToolTip(
+                    "这些文件当前没有字体提示。\n"
+                    "等行上出现 ⚠ 字体提示后，再用这里复制字体名 / 安装字体文件。")
+            else:
+                font_help_action.setToolTip(
+                    "把缺的字体名整段复制（方便去网上搜下载），也能直接装 .ttf/.otf 文件\n"
+                    "（装进当前用户，不需要管理员），装完在窗里点「已装好，重新检查」")
+            font_help_action.triggered.connect(
+                lambda checked=False, rs=list(_fh_rows): self._open_font_help(rs))
             menu.addSeparator()
             # 预览转换好的 PDF（2026-11-09 用户需求）：只读操作，锁定标签页也照常可用。
             # 灰度只用便宜判据（有缓存产物 / 原件就是 PDF / 页数已知 ⇒ 曾转换成功）；
