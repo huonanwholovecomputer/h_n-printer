@@ -172,6 +172,11 @@ function runContractTests() {
   check('几何参数由逻辑层下发（_measure：slot = barW / 2、inset 9rpx）',
         /const slot = barW \/ 2/.test(js) && /const inset = 9 \* pxPerRpx/.test(js)
         && /cfg: \{ step: geo\.step, maxIdx: geo\.maxIdx, over: geo\.over, sel: idx/.test(js));
+  const goTabSrc = js.slice(js.indexOf('_goTab(index) {'), js.indexOf('_goTab(index) {') + 1600)
+  check('★ 切页前不许 setData（框架重下发 style 会把视图层位移抹掉 ⇒ 滑块「闪现到另一侧」）',
+        !/setData\(/.test(goTabSrc), goTabSrc.length + 'B')
+  check('★ 选中态与 wave 交给切过去之后那一页的 _refresh（新实例自带正确落位）',
+        /arriving/.test(js) && /patch\.wave = true/.test(js) && /_tabWaveAt/.test(js))
   check('切页仍是「先播退出动画 → 200ms 后 switchTab」',
         /cp\.animateExit\(dir\)/.test(js) && /wx\.switchTab\(\{ url: '\/' \+ target\.pagePath \}\) \}, 200\)/.test(js));
 }

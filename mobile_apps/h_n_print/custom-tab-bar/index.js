@@ -73,6 +73,15 @@ Component({
       }
       let dark = false
       try { dark = !!(getApp().globalData && getApp().globalData.isDarkMode) } catch (e) {}
+      // 只有「刚切 tab 落到本页」才播整排 wave；从子页返回不播，免得每回一次抖一下
+      let arriving = false
+      try {
+        const at = Number(wx.getStorageSync('_tabWaveAt') || 0)
+        if (at && Date.now() - at < 1500) {
+          arriving = true
+          wx.removeStorageSync('_tabWaveAt')
+        }
+      } catch (e) {}
       this._rev += 1
       const patch = {
         selected: idx,
@@ -80,11 +89,25 @@ Component({
         thumbX: idx * geo.step,
         cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel: idx, rev: this._rev, snap: true },
       }
+      if (arriving) patch.wave = true
       this._markQuiet()
       this.data.list.forEach((item, i) => {
         if (item.active !== (i === idx)) patch['list[' + i + '].active'] = (i === idx)
       })
       this.setData(patch)
+      if (arriving) {
+        // 收 wave 也是一次 setData：此时药丸已经停在选中格，抹掉再补画看不出差别
+        if (this._waveTimer) clearTimeout(this._waveTimer)
+        this._waveTimer = setTimeout(() => {
+          this._waveTimer = 0
+          this._rev += 1
+          this._markQuiet()
+          this.setData({
+            wave: false,
+            cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, rev: this._rev, snap: false },
+          })
+        }, 700)
+      }
     },
 
     // 自己 setData 期间不要触发 observers 的补画（否则一次切换会多打一轮）
@@ -146,27 +169,11 @@ Component({
       if (cp && typeof cp.animateExit === 'function' && !cp.animateExit(dir)) return
       wx.setStorageSync('_tabFrom', prev)
       wx.setStorageSync('_tabTo', index)
-      const geo = this._geo || this._measure()
-      this._rev += 1
-      const patch = {
-        selected: index,
-        wave: true,
-        thumbX: index * geo.step,
-        // 同一次 setData 里带上 cfg：框架重下发 style 之后立刻按视图层状态补画回来
-        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, rev: this._rev, snap: false },
-      }
-      this.data.list.forEach((item, i) => {
-        if (item.active !== (i === index)) patch['list[' + i + '].active'] = (i === index)
-      })
-      this._markQuiet()
-      this.setData(patch)
-      if (this._waveTimer) clearTimeout(this._waveTimer)
-      this._waveTimer = setTimeout(() => {
-        this._waveTimer = 0
-        this._markQuiet()
-        this.setData({ wave: false })
-        this._repaint()
-      }, 700)
+      // 关键：这一路**不做任何 setData**。逻辑层 setData 会让框架重新下发节点 style，
+      // 把视图层正在做的位移整条抹掉 —— 表现就是「滑块滑到一侧后突然闪现到另一侧」。
+      // 选中态 / 整排 wave / 药丸落位全交给切过去之后那一页的 _refresh：
+      // 新页面的 tabBar 本来就是新建实例，不存在「旧实例要跟着改」这回事。
+      try { wx.setStorageSync('_tabWaveAt', Date.now()) } catch (e) {}
       // 200ms > 页面退出动画 160ms：药丸滑到位、页面滑出去之后再换页
       setTimeout(() => { wx.switchTab({ url: '/' + target.pagePath }) }, 200)
     },
