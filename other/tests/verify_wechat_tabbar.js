@@ -82,11 +82,15 @@ function makeOwner(engine, cfg) {
   return owner;
 }
 
+// 一次手势会分多次 setStyle（transform / transition 各写一条），真机上属性是合并的，
+// 所以这里也要按顺序合并同一个元素的全部 style，只取最后一条会读到没有 transform 的那条。
 function lastStyle(owner, key) {
-  for (let i = owner._logs.length - 1; i >= 0; i--) {
-    if (owner._logs[i].key === key) return owner._logs[i].s;
+  let out = null;
+  for (const rec of owner._logs) {
+    if (rec.key !== key) continue;
+    out = Object.assign(out || {}, rec.s);
   }
-  return null;
+  return out;
 }
 function pillX(owner) {
   const s = lastStyle(owner, 'thumb');
@@ -194,12 +198,16 @@ function runContractTests() {
   check('几何参数由逻辑层下发（_measure：slot = barW / 2、inset 9rpx）',
         /const slot = barW \/ 2/.test(js) && /const inset = 9 \* pxPerRpx/.test(js)
         && /cfg: \{ step: geo\.step, maxIdx: geo\.maxIdx, over: geo\.over, sel: idx/.test(js));
-  // 「切页前」= _goTab 开头到 200ms 定时器之间（定时器里那次 setData 是换页那一刻的，必须允许）
+  // 点按那一刻是**唯一**允许 setData 的地方（第 6 轮）：把目标格写进 data，由 .tab-thumb 的
+  // CSS 过渡滑过去。以前排在 200ms 之后、还跟在 switchTab 后面 —— 换页重下发 style 时用的仍是
+  // 上一格，于是「已经滑到『我』又闪回『打印』」。
   const goTabAt = js.indexOf('_goTab(index) {')
   const goTabTimerAt = js.indexOf('setTimeout(', goTabAt)
-  const goTabSrc = js.slice(goTabAt, goTabTimerAt > goTabAt ? goTabTimerAt : goTabAt + 1600)
-  check('★ 切页前不许 setData（框架重下发 style 会把视图层位移抹掉 ⇒ 滑块「闪现到另一侧」）',
-        !/setData\(/.test(goTabSrc.replace(/^\s*\/\/.*$/gm, '')), goTabSrc.length + 'B')
+  const goTabSrc = js.slice(goTabAt, goTabTimerAt > goTabAt ? goTabTimerAt : goTabAt + 2200)
+  check('★ 点按那一刻就把目标格写进 data，且全函数只有这一次 setData（quiet：视图层不再写 transform）',
+        (goTabSrc.replace(/^\s*\/\/.*$/gm, '').match(/setData\(/g) || []).length === 1
+        && /thumbX: index \* geo\.step/.test(goTabSrc) && /quiet: true/.test(goTabSrc),
+        goTabSrc.length + 'B')
   check('★ 选中态与 wave 交给切过去之后那一页的 _refresh（新实例自带正确落位）',
         /arriving/.test(js) && /patch\.wave = true/.test(js) && /_tabWaveAt/.test(js))
   const repaintSrc = js.slice(js.indexOf('_repaint() {'), js.indexOf('_repaint() {') + 700)
@@ -263,13 +271,9 @@ function runSettleTests() {
         JSON.stringify(o2._calls));
 
   runFrames(o2, engine, 2);
-  const mid = pillX(o2);
-  check('★ 药丸开始滑向被点的那一格（160ms 内先走一半，不是瞬移）',
-        mid > 20 && mid < 130, String(mid));
-  runFrames(o2, engine, 12);
-  check('★ 160ms 后精确落位 147.5px、整条栏回 0',
-        Math.abs(pillX(o2) - 147.5) < 0.01 && Math.abs(barX(o2)) < 0.01,
-        pillX(o2) + ' / ' + barX(o2));
+  check('★ 点按的滑行不再由视图层逐帧做（交给 data.thumbX + .tab-thumb 的 CSS 过渡，两处抢同一条 transform 就会抖）',
+        Math.abs(pillX(o2)) < 0.01, String(pillX(o2)));
+  check('★ 点按不排动画帧（松手不 settle，rAF 队列干净）', o2._rafs.length === 0, String(o2._rafs.length));
   check('吸附结束后不再留动画帧（rAF 队列清空）', o2._rafs.length === 0, String(o2._rafs.length));
 }
 
@@ -485,6 +489,18 @@ function runInstanceTests() {
   check('没有切页记录时按 route 落位（「我」→ 第 2 格）',
         i3.data.selected === 1 && Math.abs(i3.data.thumbX - 147.5) < 0.01, String(i3.data.thumbX));
 
+  /* 7-3b ★ route 拿不到（切页落地那一刻 page 栈还空）→ 按全局 _tabCur 落位。
+     迟到创建的那份实例（被隐藏的打印页）也走这条路，否则它会画回第 1 格叠在当前栏上，
+     看上去就是「切页几秒后药丸又闪一下」。 */
+  const c3b = loadController();
+  c3b.store._tabCur = 1;
+  c3b.sandbox.__pages = [];
+  const i3b = instantiate(c3b.def);
+  c3b.def.pageLifetimes.show.call(i3b);
+  check('★ route 拿不到时按全局 _tabCur 落位（迟到/隐藏页实例不会画回第 1 格）',
+        i3b.data.selected === 1 && Math.abs(i3b.data.thumbX - 147.5) < 0.01,
+        JSON.stringify({ sel: i3b.data.selected, thumbX: i3b.data.thumbX }));
+
   /* 7-4 过期的 _tabWant 不作数（否则很久以后回页面还会落错格） */
   const c4 = loadController();
   c4.store._tabWant = 1;
@@ -505,13 +521,17 @@ function runInstanceTests() {
         Math.abs(i5.data.thumbX - 147.5) < 0.01 && i5.data.thumbReady === true,
         i5.data.thumbX + ' / ' + i5.data.thumbReady);
 
-  /* 7-6 _goTab：切页途中零 setData、只写 storage，200ms 后才 switchTab */
+  /* 7-6 _goTab：点按那一刻就把目标格写进 data（第 6 轮），200ms 后才 switchTab */
   const c6 = loadController();
   const i6 = instantiate(c6.def);
   i6.data.selected = 0;
   i6._goTab(1);
-  check('★ 切页途中一次 setData 都没有（否则框架重下发 style ⇒ 滑块闪现到另一侧）',
-        i6.setDataCalls.length === 0, i6.setDataCalls.length + ' 次');
+  check('★ 点按那一刻就把目标格写进 data：只有一次 setData，thumbX=目标格 + quiet cfg',
+        i6.setDataCalls.length === 1
+        && Math.abs(Number(i6.setDataCalls[0].thumbX) - 147.5) < 0.01
+        && i6.setDataCalls[0].cfg && i6.setDataCalls[0].cfg.quiet === true
+        && i6.setDataCalls[0].cfg.sel === 1,
+        JSON.stringify(i6.setDataCalls));
   check('切页前落下目标格/源格/wave 时间戳',
         c6.store._tabWant === 1 && c6.store._tabFrom === 0 && c6.store._tabTo === 1
         && c6.store._tabWantAt > 0 && c6.store._tabWaveAt > 0, JSON.stringify(c6.store));
@@ -519,16 +539,20 @@ function runInstanceTests() {
         JSON.stringify(c6.timers.map((t) => t.ms)));
   c6.timers[0].fn();
   check('200ms 后真的 switchTab 到「我」', c6.sandbox.__switchTo === '/pages/me/me', c6.sandbox.__switchTo);
-  check('★ 换页那一次 setData 把本实例 thumbX 改成目标格（框架重下发 style 也拽不回上一格）',
-        i6.setDataCalls.length === 1 && Math.abs(Number(i6.setDataCalls[0].thumbX) - 147.5) < 0.01,
-        JSON.stringify(i6.setDataCalls));
+  check('★ 换页之后不再补 setData（药丸位置只由点按那一次下发决定）',
+        i6.setDataCalls.length === 1, i6.setDataCalls.length + ' 次');
 
   /* 7-6b 静态：改落位必须排在 switchTab 之前（顺序反了等于没改） */
   const ctrlSrc = fs.readFileSync(path.join(TAB_DIR, 'index.js'), 'utf8');
   const goSeg = ctrlSrc.slice(ctrlSrc.indexOf('_goTab(index) {'));
-  const iSet = goSeg.indexOf('setData({ thumbX: index * geo.step })');
+  const iSet = goSeg.indexOf('thumbX: index * geo.step');
   const iSw = goSeg.indexOf('wx.switchTab(');
-  check('★ 先改 thumbX 再 switchTab', iSet > 0 && iSw > 0 && iSet < iSw, iSet + ' < ' + iSw);
+  check('★ 先改 thumbX 再 switchTab（顺序反了等于没改）', iSet > 0 && iSw > 0 && iSet < iSw,
+        iSet + ' < ' + iSw);
+  check('★ 点按滑动的曲线与时长交给 CSS 过渡（.tab-thumb 有 160ms，与页面退出动画同长）',
+        /transition:\s*transform 160ms cubic-bezier\(0\.2, 0, 0, 1\)/.test(
+          fs.readFileSync(path.join(TAB_DIR, 'index.wxss'), 'utf8'))
+        && /SLIDE_MS:\s*160/.test(fs.readFileSync(WXS, 'utf8')));
 
   /* 7-6c ★ 有弹窗时 cp.animateExit 会自己接管切页并 return false —— 那条路上也必须已经落下 _tabWant，
      否则新页面的 tabBar 拿不到目标格、只能按旧 route 落 0，一帧后再被页面 onShow 拽回来（就是那 2 帧闪） */

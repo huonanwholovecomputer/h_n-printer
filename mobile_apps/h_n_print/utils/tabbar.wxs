@@ -20,7 +20,9 @@ var CFG = {
   RELEASE_MS: 340,
   RELEASE_EASE: 'cubic-bezier(0.34, 1.56, 0.64, 1)',   // 过冲曲线 —— 抬手弹起来那一下
   SETTLE_MS: 160,          // 松手后吸附到格位（与页面退出动画同长，切页不等它）
-  DRAG_LOCK: 4             // 方向锁定阈值（px）
+  DRAG_LOCK: 4,            // 方向锁定阈值（px）
+  SLIDE_MS: 160,           // 点按时药丸滑到目标格（CSS 过渡，与 index.wxss 的 .tab-thumb 同一曲线）
+  SLIDE_EASE: 'cubic-bezier(0.2, 0, 0, 1)'
 };
 
 function ensureState(state) {
@@ -131,6 +133,8 @@ function settleTick(state, owner) {
     state.barDx = state.setB1;
     state.settling = false;
     render(state, owner);
+    var thumb = owner.selectComponent('.tab-thumb');
+    if (thumb) thumb.setStyle({ transition: 'transform ' + CFG.SLIDE_MS + 'ms ' + CFG.SLIDE_EASE });
     return;
   }
   render(state, owner);
@@ -149,6 +153,16 @@ module.exports = {
     if (typeof newValue.maxIdx === 'number') state.maxIdx = newValue.maxIdx;
     if (typeof newValue.over === 'number' && newValue.over >= 0) state.over = newValue.over;
     if (typeof newValue.sel === 'number') state.sel = newValue.sel;
+    // quiet=true：逻辑层已经把「目标格」交给 CSS 过渡去滑（data 的 thumbX 一改就会滑过去），
+    // 视图层只同步自己的状态，**不要**再写一次 transform —— 那一下会把过渡打断成瞬移
+    if (newValue.quiet) {
+      state.lagRun = false;
+      state.settling = false;
+      state.drag = null;
+      state.pill = state.sel;
+      state.barDx = 0;
+      return;
+    }
     // snap=true 才是「页面出现/切回，药丸直接落在选中格」；snap=false 只是重画
     // （逻辑层 setData 抹掉了内联样式之后，用当前状态把样式补回来，不动位置）
     if (newValue.snap || !oldValue) {   // 首个 cfg 也必须对齐（旧值为空 = 新建实例）
@@ -187,6 +201,9 @@ module.exports = {
       moved: false
     };
     state.lagTarget = state.pill;
+    // 手势期间药丸必须 1:1 跟手，把 .tab-thumb 的 CSS 过渡临时掐掉（松手吸附结束时再还回去）
+    var thumb = ownerInstance.selectComponent('.tab-thumb');
+    if (thumb) thumb.setStyle({ transition: 'none' });
     pressDown(state, ownerInstance);
   },
 
@@ -245,8 +262,7 @@ module.exports = {
       settleTo(state, ownerInstance, state.sel);
       return;
     }
-    if (!d.moved) {                         // 纯点按：先让药丸滑向被点的那一格，再交给逻辑层切页
-      settleTo(state, ownerInstance, d.hit);
+    if (!d.moved) {                         // 纯点按：药丸的滑动交给逻辑层（改 data.thumbX → CSS 过渡）
       ownerInstance.callMethod('onTabTap', { index: d.hit });
       return;
     }

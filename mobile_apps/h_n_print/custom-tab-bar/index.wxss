@@ -65,6 +65,9 @@
      显隐统一走上面那句 .tab-glass.ready 的 class 门（data 驱动，setData 抹不掉）；
      落位由 WXML 上 data 兜底的 transform + 视图层逐帧覆盖（见 index.wxml / tabbar.wxs）。 */
   will-change: transform;
+  /* 点按滑到目标格：data.thumbX 一变就由这段过渡把药丸送过去（与页面退出动画同长）。
+     手势期间视图层会把这条 transition 临时写成 none，让药丸 1:1 跟手。 */
+  transition: transform 160ms cubic-bezier(0.2, 0, 0, 1);
 }
 
 .tab-pill {
