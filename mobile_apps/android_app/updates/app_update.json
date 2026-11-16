@@ -1,8 +1,8 @@
 {
-  "version": "1.1.64",
-  "versionCode": 65,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.64.apk",
-  "md5": "69664ea3d58b5b9ef06c334bb92ff403",
-  "notes": "v1.1.64：底部 Tab 栏的玻璃滑块现在能直接拖 —— 跟手滑动、松手吸附最近的 tab，拖过头有橡皮筋阻尼；拖动时整排图标朝滑动方向轻微错开，按下图标先压缩再带一点过冲弹回。栏高与底部安全区避让不变（提示气泡仍在栏上方）。",
+  "version": "1.1.65",
+  "versionCode": 66,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.65.apk",
+  "md5": "bbe7050f5bf6f96085f9b5168c8d8f78",
+  "notes": "v1.1.65：Tab 栏拖动改成「整条玻璃栏跟着手错开」（最多 10px），栏内图标不再各自平移；药丸仍停在手指底下，越界有阻尼，松手吸附最近的 tab。按下图标的压缩回弹与栏高、底部安全区避让都不变。",
   "force": false
 }
