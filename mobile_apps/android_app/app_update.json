@@ -1,8 +1,8 @@
 {
-  "version": "1.1.66",
-  "versionCode": 67,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.66.apk",
-  "md5": "049cc24cc166e79f61010db9bb3740f3",
-  "notes": "v1.1.66：图片、以及只有 1 页的文件不再显示也不上报「排除末尾空白页」——订单详情里那条「已排除末尾空白页」不会再挂在 1 页文件上了（多页文档照旧）。Tab 栏滑块的手感不变。",
+  "version": "1.1.67",
+  "versionCode": 68,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.67.apk",
+  "md5": "27bc91692ed07b71df289c971e377335",
+  "notes": "v1.1.67：底部 Tab 栏手感打磨——滑块改成硬质玻璃（只平移、不再拉伸），深色模式下是黑玻璃；点击或拖动整条栏时会轻微下沉再弹起（船式起伏）。",
   "force": false
 }
