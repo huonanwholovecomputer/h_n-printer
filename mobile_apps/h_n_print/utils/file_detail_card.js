@@ -141,7 +141,8 @@ function localDetail(rowFile, reason) {
   rows.push({ k: '单双面', v: f.duplex === 'on' ? '双面' : '单面' })
   if (f.page_range) rows.push({ k: '页码范围', v: f.page_range })
   if (f.simplex_pages) rows.push({ k: '单面页', v: f.simplex_pages })
-  if (f.blank_tail_exclude) rows.push({ k: '末尾空白页', v: '已排除' })
+  // 1 页（含所有图片）没有末尾空白页可排除，历史单里也照样不显示这一行
+  if (f.blank_tail_exclude && Number(f.page_count) > 1) rows.push({ k: '末尾空白页', v: '已排除' })
   if (f.status) rows.push({ k: '打印状态', v: STATUS_TEXT[f.status] || f.status })
   if (f.reject_reason) rows.push({ k: '退回原因', v: f.reject_reason })
   if (f.total_price != null && Number(f.total_price) > 0) {

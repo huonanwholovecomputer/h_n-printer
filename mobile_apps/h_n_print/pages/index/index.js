@@ -3802,8 +3802,8 @@ Component({
           image_orientation: f.isImage ? (f.imageOrientation || 'auto') : 'auto',
           // 契约 §1/§5：simplex_pages 空串=关闭；单面打印时一律空（后端按整份单面算，费用不变）
           simplex_pages: simplexPages,
-          // 排除末尾空白页：0/1 原样上报，单面/图片/1 页时也保留（由打印端决定是否有效）
-          blank_tail_exclude: f.excludeBlankTail ? 1 : 0,
+          // 排除末尾空白页：图片与 1 页文档不上报（详情卡不该显示「已排除」）
+          blank_tail_exclude: (!f.isImage && f.pageCount !== 1 && f.excludeBlankTail) ? 1 : 0,
         }
       })
 

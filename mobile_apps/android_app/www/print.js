@@ -2261,7 +2261,9 @@ function doSubmit(skipPageValidation) {
       // 「封面单独打印」：勾选且校验通过才传（空串 = 关闭）；单面/单页时按契约不落该值。
       // 「排除末尾空白页」：始终 0/1 显式传，旧后端忽略未知键，不影响老客户端。
       simplex_pages: (f.simplexEnabled && !simplexDisabledFor(f) && f.simplexPages) ? f.simplexPages : '',
-      blank_tail_exclude: f.excludeBlankTail ? 1 : 0,
+      // 图片与只有 1 页的文档没有「末尾空白页」可排：一律报 0，
+      // 否则详情卡会把「已排除末尾空白页」挂在 1 页文件上（2026-11-16）。
+      blank_tail_exclude: (!f.isImage && f.pageCount !== 1 && f.excludeBlankTail) ? 1 : 0,
     };
   });
 

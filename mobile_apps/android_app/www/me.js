@@ -1096,7 +1096,7 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
           <text class="detail-file-range">${f.duplex === 'on' ? '双面' : '单面'}</text>
           ${f.page_range ? `<text class="detail-file-range">范围: ${esc(f.page_range)}</text>` : ''}
           ${f.simplex_pages ? `<text class="detail-file-range">单面页: ${esc(f.simplex_pages)}</text>` : ''}
-          ${Number(f.blank_tail_exclude) === 1 ? `<text class="detail-file-range">已排除末尾空白页</text>` : ''}
+          ${(Number(f.blank_tail_exclude) === 1 && Number(f.page_count) > 1) ? `<text class="detail-file-range">已排除末尾空白页</text>` : ''}
           ${(f.status === 'rejected' || f.status === 'failed') && f.reject_reason ? `<text class="file-reject-reason">${esc(f.reject_reason)}</text>` : ''}
           <text class="detail-file-open-tip">详情 ›</text>
         </view>
@@ -3720,7 +3720,8 @@ function localFilePanelHTML(rowFile, reason) {
   rows += myfileKv('单双面', f.duplex === 'on' ? '双面' : '单面');
   if (f.page_range) rows += myfileKv('页码范围', f.page_range);
   if (f.simplex_pages) rows += myfileKv('单面页', f.simplex_pages);
-  if (Number(f.blank_tail_exclude) === 1) rows += myfileKv('末尾空白页', '已排除');
+  // 1 页（含所有图片）没有末尾空白页可排除，历史单里也照样不显示这一行
+  if (Number(f.blank_tail_exclude) === 1 && pages > 1) rows += myfileKv('末尾空白页', '已排除');
   if (f.status) rows += myfileKv('打印状态', (LOCAL_FILE_STATUS_TEXT[f.status] || ORDER_STATUS_MAP[f.status] || f.status));
   if (f.reject_reason) rows += myfileKv('退回原因', f.reject_reason);
   if (f.total_price != null && Number(f.total_price) > 0) {

@@ -1855,7 +1855,8 @@ Component({
       rows.push({ k: '单双面', v: file.duplex === 'on' ? '双面' : '单面' })
       if (file.page_range) rows.push({ k: '页码范围', v: file.page_range })
       if (file.simplex_pages) rows.push({ k: '单面页', v: file.simplex_pages })
-      if (file.blank_tail_exclude) rows.push({ k: '末尾空白页', v: '已排除' })
+      // 1 页（含所有图片）没有末尾空白页可排除，历史单里也照样不显示这一行
+      if (file.blank_tail_exclude && Number(file.page_count) > 1) rows.push({ k: '末尾空白页', v: '已排除' })
       if (file.status) rows.push({ k: '打印状态', v: statusMap[file.status] || file.status })
       if (file.reject_reason) rows.push({ k: '退回原因', v: file.reject_reason })
       return {
