@@ -1051,7 +1051,11 @@ function navBarHeight() {
 let currentTab = 'print';
 let _tabSwitching = false;
 let _tabPending = '';        // 正在切去的 tab（转场还没落定时；currentTab 要等落定才更新）
-let _tabQueuedTab = '';      // 转场途中松手想去别的格：等这一趟落定再接着走
+// 页面转场（2026-11-16 第七轮，用户口径「动画播到一半反向切 tab，动画要立刻反方向播」）：
+// 两页位置由一个进度 _pageQ 驱动，rAF 逐帧写 transform —— 目标一变就从当前位置调头，
+// 不再有「等这一趟播完再播反向」的排队（旧的 _tabQueuedTab 已删除）。
+let _pageQ = 0;              // 0 = 打印页在前，1 = 我页在前
+let _pageRaf = 0;            // 正在跑的 rAF 句柄（0 = 没在播）
 let _viewTransition = false;
 
 /* ── 玻璃滑块（APP 2026-11-16）─────────────────────────────────────────
@@ -1282,7 +1286,6 @@ function _tabDragEnd(ev, silent) {
   bar.classList.add('settling');
   setTimeout(() => bar.classList.remove('settling'), 360);
   bar.style.removeProperty('--tab-bar-dx');
-  _tabQueuedTab = '';      // 手指位置才是权威：排队里那趟作废，下面按 target 重新决定
   restoreThumb();   // 药丸重新拿回 CSS 过渡：从松手位置滑向目标格
   const targetTab = items[target] ? items[target].dataset.tab : '';
   if (!targetTab || target === destIdx) {
@@ -1290,12 +1293,8 @@ function _tabDragEnd(ev, silent) {
     return;
   }
   _tabSuppressClickUntil = Date.now() + 400;
-  if (_tabSwitching) {
-    // 页面正在播上一趟转场：先把药丸停在目标格，等这趟落定再播新的切换动画
-    _tabQueuedTab = targetTab;
-    thumb.style.setProperty('--tab-i', String(target));
-    return;
-  }
+  // 页面正在播上一趟转场也照样立刻接管：switchTab 会从当前进度就地反向，不再排到落定之后
+  thumb.style.setProperty('--tab-i', String(target));
   switchTab(targetTab);
 }
 
@@ -1309,14 +1308,104 @@ function initTabDrag() {
   bar.addEventListener('pointercancel', (e) => _tabDragEnd(e, true));   // 被系统打断：直接收摊，别弹回弹
 }
 
-// tab 切换：平铺推拉转场 —— 两页并排铺满内容区，旧页抽出、新页从对面推入，互不重叠
-function switchTab(tab) {
-  // 转场途中再点名：记下来等这趟落定再走 —— 不再「锁住不理」，滑块与点按始终有反馈
-  if (_tabSwitching) {
-    if (tab !== _tabPending) _tabQueuedTab = tab;
-    return;
+// tab 切换：平铺推拉转场 —— 两页并排铺满内容区，旧页抽出、新页从对面推入，互不重叠。
+// 2026-11-16 第七轮（用户口径「动画播到一半反向切 tab，动画应当立刻反方向播，而不是等这一趟
+// 播完再播反向」）：转场不再是一条 CSS 关键帧动画 + setTimeout，而是由连续进度 _pageQ
+// 驱动的 rAF 逐帧位移 —— 任何时刻再点名，都从当前位置直接调头（见 _pageSlideTo）。
+function _pageEase(t) {
+  // cubic-bezier(0.16, 1, 0.3, 1)：与原 CSS 动画同一条强 Ease-Out（先快后慢），保持手感一致
+  if (t <= 0) return 0;
+  if (t >= 1) return 1;
+  const x1 = 0.16, y1 = 1, x2 = 0.3, y2 = 1;
+  const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+  const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+  const sx = (u) => ((ax * u + bx) * u + cx) * u;
+  const sy = (u) => ((ay * u + by) * u + cy) * u;
+  const dx = (u) => (3 * ax * u + 2 * bx) * u + cx;
+  let u = t;
+  for (let k = 0; k < 6; k++) {
+    const err = sx(u) - t;
+    if (Math.abs(err) < 1e-5) break;
+    const d = dx(u);
+    if (Math.abs(d) < 1e-5) break;
+    u -= err / d;
   }
-  if (tab === currentTab) return;
+  u = Math.max(0, Math.min(1, u));
+  return sy(u);
+}
+
+// 两页的位置只由 _pageQ 决定：q=0 打印页贴左、我页在右外侧；q=1 我页贴左、打印页在左外侧。
+// 只写 transform/opacity，不碰 transition —— 逐帧位移必须是即时的。
+function _pagePaint(q) {
+  const printPage = document.getElementById('page-print');
+  const mePage = document.getElementById('page-me');
+  if (!printPage || !mePage) return;
+  printPage.style.transform = 'translate3d(' + (-q * 100).toFixed(3) + '%,0,0)';
+  mePage.style.transform = 'translate3d(' + ((1 - q) * 100).toFixed(3) + '%,0,0)';
+  printPage.style.opacity = (1 - q).toFixed(3);
+  mePage.style.opacity = q.toFixed(3);
+}
+
+function _pageSettle(tab) {
+  _pageRaf = 0;
+  _pageQ = tab === 'me' ? 1 : 0;
+  const printPage = document.getElementById('page-print');
+  const mePage = document.getElementById('page-me');
+  [printPage, mePage].forEach(p => {
+    if (!p) return;
+    p.classList.remove('page-push');
+    p.style.transition = '';
+    p.style.transform = '';
+    p.style.opacity = '';
+    p.style.top = '';
+  });
+  if (printPage) printPage.style.display = tab === 'me' ? 'none' : '';
+  if (mePage) mePage.style.display = tab === 'me' ? '' : 'none';
+  hideViews();
+  currentTab = tab;
+  _tabPending = '';
+  _tabSwitching = false;
+  updateThemeToggleVisibility();
+  if (tab === 'me' && typeof loadMeTab === 'function') loadMeTab();
+  if (tab === 'print' && typeof onPrintTabShown === 'function') onPrintTabShown();
+  measureAll();
+}
+
+// 从当前 _pageQ 滑向 targetQ。途中再调一次 = 取消旧 rAF、按当前位置重新起跑，
+// 时长按剩余距离算（观感与一整趟同速）—— 这就是「反向立刻播」的全部实现。
+function _pageSlideTo(targetQ, tab) {
+  const printPage = document.getElementById('page-print');
+  const mePage = document.getElementById('page-me');
+  if (!printPage || !mePage) return;
+  const navH = navBarHeight() + 'px';
+  [printPage, mePage].forEach(p => {
+    p.style.display = '';
+    p.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left');
+    p.classList.add('page-push');
+    p.style.top = navH;
+    p.style.transition = 'none';
+  });
+  if (_pageRaf) { cancelAnimationFrame(_pageRaf); _pageRaf = 0; }
+  const from = _pageQ;
+  const dist = Math.abs(targetQ - from);
+  if (dist < 0.002) { _pageSettle(tab); return; }
+  const dur = Math.max(140, 480 * dist);
+  const t0 = performance.now();
+  const step = (now) => {
+    const p = Math.min(1, (now - t0) / dur);
+    _pageQ = from + (targetQ - from) * _pageEase(p);
+    _pagePaint(_pageQ);
+    if (p < 1) { _pageRaf = requestAnimationFrame(step); return; }
+    _pageSettle(tab);
+  };
+  _pageRaf = requestAnimationFrame(step);
+}
+
+function switchTab(tab) {
+  // 已经在去这一格的路上：重复点名不重启动画
+  if (_tabSwitching && tab === _tabPending) return;
+  // 就停在这一页、也没在播转场：什么都不用做
+  if (!_tabSwitching && tab === currentTab) return;
   _tabSwitching = true;
   _tabPending = tab;
 
@@ -1348,59 +1437,16 @@ function switchTab(tab) {
                _prevThumb !== _nextThumb ? 170 : 0);
   _waveTabBar();
 
-  const printPage = document.getElementById('page-print');
-  const mePage = document.getElementById('page-me');
-  const exiting = tab === 'print' ? mePage : printPage;
-  const entering = tab === 'print' ? printPage : mePage;
-  // 离开打印页→左滑退出；离开我页→右滑退出（对齐 custom-tab-bar dir 逻辑）
-  const exitCls = exiting === printPage ? 'page-exit-left' : 'page-exit-right';
-  const enterCls = entering === mePage ? 'page-enter-right' : 'page-enter-left';
-
   // 标题立即切换（交叉过渡期间导航栏属于全局 UI，不随页面动画延迟）
   document.getElementById('navTitle').textContent = tab === 'print' ? '提交打印' : '我';
   document.getElementById('navBack').style.display = 'none';
   document.getElementById('tabBar').style.display = '';
 
-  // 平铺推拉转场：两页都脱离流式布局并排铺满内容区（page-push），
-  // 旧页向左/右抽出（滑出屏幕外）、新页从对面推入（屏幕外 → 0），全程不重叠
-  const navH = navBarHeight() + 'px';
-  entering.style.display = '';
-  entering.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
-  entering.style.top = navH;
-  void entering.offsetWidth;
-  entering.classList.add('page-push', enterCls);
-
-  exiting.classList.remove('page-exit-left', 'page-exit-right', 'page-fade-in', 'page-enter-right', 'page-enter-left', 'page-push');
-  exiting.style.top = navH;
-  void exiting.offsetWidth;
-  exiting.classList.add('page-push', exitCls);
-
-  // 主题按钮随 tab 切换同步播放滑入/滑出动画（与页面转场同时开始）
+  // 主题按钮随 tab 切换同步播放滑入/滑出动画（与页面转场同时开始，按目标页判定）
   updateThemeToggleVisibility(tab);
 
-  setTimeout(() => {
-    exiting.style.display = 'none';
-    exiting.classList.remove('page-push', exitCls);
-    exiting.style.top = '';
-    entering.classList.remove('page-push', enterCls);
-    entering.style.top = '';
-
-    hideViews();
-    currentTab = tab;
-    _tabPending = '';
-    _tabSwitching = false;
-    updateThemeToggleVisibility();
-    if (tab === 'me' && typeof loadMeTab === 'function') loadMeTab();
-    if (tab === 'print' && typeof onPrintTabShown === 'function') onPrintTabShown();
-    measureAll();
-    // 排队的那一趟：手还按在栏上就先压着（松手时以药丸位置为准），否则立刻接着播
-    const queued = _tabQueuedTab;
-    _tabQueuedTab = '';
-    if (queued && queued !== currentTab) {
-      if (_tabDrag) _tabQueuedTab = queued;
-      else switchTab(queued);
-    }
-  }, 480);
+  // 页面本身：从当前位置滑向 tab 对应的位置（转场途中再点名 = 就地反向，不排队）
+  _pageSlideTo(tab === 'me' ? 1 : 0, tab);
 }
 
 function switchToMe() {
@@ -1465,6 +1511,10 @@ function hideView() {
     document.getElementById('tabBar').style.display = '';
     currentTab = 'me';
     _tabSwitching = false;
+    // 子视图返回「我」页是另一套 CSS 关键帧转场：这里把进度状态对齐到「我页在前」
+    if (_pageRaf) { cancelAnimationFrame(_pageRaf); _pageRaf = 0; }
+    _pageQ = 1;
+    _tabPending = '';
     updateThemeToggleVisibility();
     if (typeof loadMeTab === 'function') loadMeTab();
     measureAll();

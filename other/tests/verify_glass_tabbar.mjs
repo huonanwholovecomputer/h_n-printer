@@ -9,7 +9,9 @@
  *   ④ 图标 bump 与整排 wave 真的被触发（而不是只加了 class 没有 keyframes）；
  *   ⑤ 拖动真的跟手（1:1）、越界真的被橡皮筋压住、过半格才吸附、按下去真的先压缩再
  *      船式回弹 —— 这几条只有真手势才量得出来，静态 grep 最多证明"写了 pointermove"；
- *   ⑥ 页面转场（480ms 平铺推拉）途中照样能起手拖、松手按药丸停止的位置决定切哪页。
+ *   ⑥ 页面转场（480ms 平铺推拉）途中照样能起手拖、松手按药丸停止的位置决定切哪页；
+ *   ⑦ 转场播到一半反向切 tab 时，页面动画必须**立刻从当前位置反方向播**。计时器落定式的
+ *      「等这一趟播完再播反向」一律算红 —— 那是第七轮之前的老口径。
  *
  * 探针自证：把 transform 钉死（模拟「滑块不动」的坏实现），点击「我」之后药丸
  * 若仍然落在第 1 格 —— 说明这个探针量的是真实位置，红/绿都有意义。
@@ -142,7 +144,20 @@ check('整条栏弹性偏移与按下/回弹的规则都在（位移落在 .tab-
       /tab-item\.rebound \{/.test(css));
 check('拖动过半格按药丸位置切页（复用 switchTab），且抑制拖动收尾的冒泡 click',
       /_tabSuppressClickUntil/.test(js) && /switchTab\(targetTab\)/.test(js) &&
-      /_tabQueuedTab/.test(js) && /_tabVisualIndex\(/.test(js));
+      /_tabVisualIndex\(/.test(js));
+/* 转场可打断（2026-11-16 第七轮）：进度驱动 + 就地反向，不能再有「排队等落定」 */
+const switchTabSrc = (() => {
+  const a = js.indexOf('function switchTab(tab) {');
+  const b = js.indexOf('function switchToMe()');
+  return a >= 0 && b > a ? js.slice(a, b) : '';
+})();
+check('★ 转场是进度驱动的 rAF（_pageQ / _pageSlideTo / _pageEase / _pagePaint 都在）',
+      /_pageQ/.test(js) && /_pageSlideTo\(/.test(js) && /_pageEase\(/.test(js) &&
+      /_pagePaint\(/.test(js));
+check('★ 转场不再排队等落定（没有 _tabQueuedTab，switchTab 里没有 setTimeout）',
+      !/_tabQueuedTab\s*=/.test(js) && switchTabSrc.length > 0 &&
+      !/setTimeout\(/.test(switchTabSrc),
+      'switchTab ' + switchTabSrc.length + 'B');
 check('旧的 .tab-hover 缩放不再叠加到图标弹跳上', !/classList\.add\('tab-hover'\)/.test(js));
 
 /* ── ② 渲染环境（桩后端 + 真实 www/） ──────────────────────────────── */
@@ -553,9 +568,49 @@ await page.waitForTimeout(120);
 await page.mouse.up();
 await page.waitForTimeout(1500);
 const dG3 = await dragGeo();
-check('★ 转场途中反向拖回去 → 等这一趟落定后按手指位置切回「打印」',
+check('★ 转场途中反向拖回去 → 松手就按手指位置切回「打印」（不再等这趟落定）',
       dG3.dataI === '0' && dG3.tab === 'print' && dG3.meHidden === true,
       'data-i=' + dG3.dataI + ' tab=' + dG3.tab + ' meHidden=' + dG3.meHidden);
+
+/* H. 反向打断（2026-11-16 第七轮）：转场播到一半反向点 tab，页面动画必须立刻从
+   当前位置往回转 —— 不是等这一趟播完再播反向（旧实现会等到 480ms 落定） */
+async function printTx() {
+  return await page.evaluate(() => {
+    const pp = document.getElementById('page-print');
+    const m = getComputedStyle(pp).transform;
+    let tx = 0;
+    if (m && m !== 'none') {
+      const nums = m.slice(m.indexOf('(') + 1).replace(')', '').split(',');
+      tx = parseFloat(nums[4]) || 0;
+    }
+    return { tx: tx, w: pp.getBoundingClientRect().width, tab: currentTab, pending: _tabPending };
+  });
+}
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(700);
+await page.evaluate(() => switchTab('me'));
+await page.waitForTimeout(150);
+const hA = await printTx();
+await page.screenshot({ path: SHOTS + '/转场中_去我_150ms.png', clip: { x: 0, y: 0, width: 360, height: 800 } });
+await page.evaluate(() => switchTab('print'));        // 反向：不等上一趟落定
+await page.waitForTimeout(70);
+const hB = await printTx();
+await page.screenshot({ path: SHOTS + '/转场中_反向_70ms.png', clip: { x: 0, y: 0, width: 360, height: 800 } });
+check('★ 转场播到一半反向切 tab：动画立刻从当前位置往回转',
+      hA.tx < -hA.w * 0.4 && hB.tx > hA.tx + hA.w * 0.15,
+      '150ms 时打印页 tx=' + px1(hA.tx) + 'px（' + px1(-hA.tx / hA.w * 100) + '%），' +
+      '反向 70ms 后 tx=' + px1(hB.tx) + 'px（回转 ' + px1(hB.tx - hA.tx) + 'px），' +
+      '当时 currentTab=' + hA.tab + ' pending=' + hA.pending);
+await page.waitForTimeout(900);
+const hC = await page.evaluate(() => ({
+  tab: currentTab, pending: _tabPending, switching: _tabSwitching,
+  meDisplay: document.getElementById('page-me').style.display,
+  printTx: document.getElementById('page-print').style.transform,
+}));
+check('反向打断能干净收尾：停在「打印」页、我页收起、状态复位',
+      hC.tab === 'print' && hC.pending === '' && hC.switching === false &&
+      hC.meDisplay === 'none' && hC.printTx === '',
+      JSON.stringify(hC));
 
 console.log('\n=== ⑦ 截图 ===');
 async function shot(mode, tab, file) {
