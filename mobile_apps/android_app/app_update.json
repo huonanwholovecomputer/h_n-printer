@@ -1,8 +1,8 @@
 {
-  "version": "1.1.62",
-  "versionCode": 63,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.62.apk",
-  "md5": "c416af1892bc6dfae7de99cb24f3fa2f",
-  "notes": "v1.1.62：① 支持 Excel 表格（.xls/.xlsx）打印，口径与本地打印工具一致（按工作簿自身的页面设置导出，纸张/缩放/页边距/打印区域都不改写）。② 表格页数改由本地打印工具按同一引擎分析后回填，多页表格不再按 1 页少收费；设备离线时显示「本地打印工具离线」提示而不是一直等待。③ 文件卡片不再对 .xls/.xlsx 显示「该文件类型不支持自动打印」。",
+  "version": "1.1.63",
+  "versionCode": 64,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.63.apk",
+  "md5": "f9382a4fd074511b8a104c4294ca0b0b",
+  "notes": "v1.1.63：底部 Tab 栏换成玻璃滑块 —— 选中项是一枚跟手的玻璃胶囊，切换时 320ms 滑到位并轻微拉伸，整排图标依次起伏、被选中的图标弹一下；栏高与底部安全区避让不变（提示气泡仍在栏上方）。",
   "force": false
 }
