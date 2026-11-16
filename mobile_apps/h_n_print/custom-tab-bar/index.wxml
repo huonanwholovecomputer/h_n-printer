@@ -1,16 +1,34 @@
 <!--custom-tab-bar/index.wxml-->
-<view class="tab-bar {{hideBorder ? 'border-hidden' : ''}}">
-  <view
-    wx:for="{{list}}"
-    wx:key="pagePath"
-    class="tab-item"
-    data-index="{{index}}"
-    bindtap="switchTab"
-    hover-class="tab-hover"
-  >
-    <view class="tab-icon-wrap {{item.active ? 'icon-active' : ''}}">
-      <image class="tab-icon" src="{{item.icon}}" />
+<!-- 结构与 APP 端一致：.tab-bar（整条栏位移）> .tab-glass（玻璃本体 / 船式起伏）
+     > .tab-thumb（位移层，只平移）> .tab-pill（玻璃块）。手势见 utils/tabbar.wxs -->
+<wxs module="tabbar" src="../utils/tabbar.wxs"></wxs>
+<view
+  class="tab-bar {{hideBorder ? 'border-hidden' : ''}} {{dark ? 'theme-dark' : ''}}"
+  cfg="{{cfg}}"
+  change:cfg="{{tabbar.onConfig}}"
+>
+  <view class="tab-glass">
+    <view class="tab-thumb">
+      <view class="tab-pill"><view class="tab-pill-gloss"></view></view>
     </view>
-    <text class="tab-text {{item.active ? 'text-active' : ''}}">{{item.text}}</text>
+
+    <view
+      wx:for="{{list}}"
+      wx:key="pagePath"
+      class="tab-item {{wave ? 'wave ' + (index === 0 ? 'w0' : 'w1') : ''}}"
+      data-index="{{index}}"
+      bindtap="switchTab"
+      hover-class="tab-hover"
+      hover-start-time="0"
+      bindtouchstart="{{tabbar.touchstart}}"
+      bindtouchmove="{{tabbar.touchmove}}"
+      bindtouchend="{{tabbar.touchend}}"
+      bindtouchcancel="{{tabbar.touchcancel}}"
+    >
+      <view class="tab-icon-wrap {{item.active ? 'icon-active' : ''}}">
+        <image class="tab-icon" src="{{item.icon}}" />
+      </view>
+      <text class="tab-text {{item.active ? 'text-active' : ''}}">{{item.text}}</text>
+    </view>
   </view>
 </view>

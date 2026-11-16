@@ -1,0 +1,274 @@
+// 底部 Tab 栏「玻璃滑块」的视图层引擎（WXS 事件响应 + setStyle + requestAnimationFrame）
+// 口径与 APP 端 mobile_apps/android_app/www/app.js 的 tab 栏一一对应：
+//   · .tab-thumb 是位移层 —— 只做平移，硬质玻璃，不缩放不拉伸
+//   · .tab-pill 是玻璃块本身，跟着位移层走
+//   · .tab-bar 在拖动时随手指位移，上限 10px（越界段跟得更多）
+//   · 药丸滞后跟随手指（时间常数 85ms）：手快时落后半个身位，手一停自己滑到位 —— 「脱手」感
+//   · 按下时整条玻璃缩到 0.965（船式起伏），抬手用过冲曲线弹回 1
+// 手势、逐帧动画、样式写入全在视图层完成，逻辑层只在「要切页」这一刻参与（callMethod）。
+// 注意：WXS 是 ES5 子集 —— 只能 var/function，状态全部放 getState()。
+
+var CFG = {
+  LAG_TAU: 85,             // 药丸滞后追赶的时间常数（ms）
+  BAR_MAX: 10,             // 整条栏的最大位移（px）
+  BAR_FOLLOW: 0.12,        // 栏内行程里整条栏跟随的比例（错位感，不是搬家）
+  BAR_FOLLOW_OVER: 0.35,   // 越界段的跟随比例（越大越「拽得动」）
+  RUBBER: 0.35,            // 药丸越界阻尼
+  PRESS_SCALE: 0.965,      // 按下时整条玻璃缩到多少
+  PRESS_MS: 110,
+  PRESS_EASE: 'cubic-bezier(0.4, 0, 0.2, 1)',
+  RELEASE_MS: 340,
+  RELEASE_EASE: 'cubic-bezier(0.34, 1.56, 0.64, 1)',   // 过冲曲线 —— 抬手弹起来那一下
+  SETTLE_MS: 160,          // 松手后吸附到格位（与页面退出动画同长，切页不等它）
+  DRAG_LOCK: 4             // 方向锁定阈值（px）
+};
+
+function ensureState(state) {
+  if (state.inited) return;
+  state.inited = true;
+  state.step = 0;          // 一格多少 px（逻辑层下发）
+  state.maxIdx = 1;
+  state.over = 0.028;      // 药丸允许探出格位的比例（= 左右内缩 / 格宽）
+  state.sel = 0;           // 逻辑层的选中格
+  state.pill = 0;          // 药丸当前渲染位置（格，小数）—— 这是唯一真相，不靠读样式
+  state.barDx = 0;         // 整条栏当前位移（px）
+  state.lagTarget = 0;     // 手指指向（格）
+  state.lagRun = false;
+  state.lagT = 0;
+  state.settling = false;
+  state.setT0 = 0;
+  state.setP0 = 0;
+  state.setP1 = 0;
+  state.setB0 = 0;
+  state.setB1 = 0;
+  state.drag = null;
+  state.shown = false;
+}
+
+function num(v) {
+  return (Math.round(v * 100) / 100) + '';
+}
+
+// 一次写到位：药丸位移 + 整条栏位移。首帧顺带显形（CSS 里 opacity: 0，
+// 避免「我」页新建实例时先闪一下第 1 格再跳到第 2 格）
+function render(state, owner) {
+  var thumb = owner.selectComponent('.tab-thumb');
+  if (thumb) {
+    var t = 'translate3d(' + num(state.pill * state.step) + 'px, 0, 0)';
+    if (state.shown) {
+      thumb.setStyle({ transform: t });
+    } else {
+      state.shown = true;
+      thumb.setStyle({ transform: t, opacity: '1' });
+    }
+  }
+  var bar = owner.selectComponent('.tab-bar');
+  if (bar) {
+    bar.setStyle({ transform: 'translate3d(' + num(state.barDx) + 'px, 0, 0)' });
+  }
+}
+
+function pressDown(state, owner) {
+  var glass = owner.selectComponent('.tab-glass');
+  if (!glass) return;
+  glass.setStyle({
+    transform: 'scale(' + CFG.PRESS_SCALE + ')',
+    transition: 'transform ' + CFG.PRESS_MS + 'ms ' + CFG.PRESS_EASE
+  });
+}
+
+function pressUp(state, owner) {
+  var glass = owner.selectComponent('.tab-glass');
+  if (!glass) return;
+  glass.setStyle({
+    transform: 'scale(1)',
+    transition: 'transform ' + CFG.RELEASE_MS + 'ms ' + CFG.RELEASE_EASE
+  });
+}
+
+// —— 滞后追赶：手指在动时目标每帧都在变，指数逼近永远朝最新目标，且永不过冲 ——
+function startLag(state, owner) {
+  if (state.lagRun) return;
+  state.lagRun = true;
+  state.lagT = getDate().getTime();
+  owner.requestAnimationFrame(function () { lagTick(state, owner); });
+}
+
+function lagTick(state, owner) {
+  if (!state.lagRun) return;
+  var now = getDate().getTime();
+  var dt = now - state.lagT;
+  if (dt < 0) dt = 0;
+  if (dt > 60) dt = 60;
+  state.lagT = now;
+  var k = 1 - Math.exp(-dt / CFG.LAG_TAU);
+  state.pill = state.pill + (state.lagTarget - state.pill) * k;
+  if (Math.abs(state.lagTarget - state.pill) < 0.0015) {
+    state.pill = state.lagTarget;
+    state.lagRun = false;
+    render(state, owner);
+    return;
+  }
+  render(state, owner);
+  owner.requestAnimationFrame(function () { lagTick(state, owner); });
+}
+
+// —— 松手吸附：药丸到目标格、整条栏回 0，160ms ease-out，两条一起收 ——
+function settleTo(state, owner, targetPill) {
+  state.lagRun = false;
+  state.setP0 = state.pill;
+  state.setP1 = targetPill;
+  state.setB0 = state.barDx;
+  state.setB1 = 0;
+  state.setT0 = getDate().getTime();
+  state.settling = true;
+  owner.requestAnimationFrame(function () { settleTick(state, owner); });
+}
+
+function settleTick(state, owner) {
+  if (!state.settling) return;
+  var p = (getDate().getTime() - state.setT0) / CFG.SETTLE_MS;
+  if (p > 1) p = 1;
+  var e = 1 - Math.pow(1 - p, 3);
+  state.pill = state.setP0 + (state.setP1 - state.setP0) * e;
+  state.barDx = state.setB0 + (state.setB1 - state.setB0) * e;
+  if (p >= 1) {
+    state.pill = state.setP1;
+    state.barDx = state.setB1;
+    state.settling = false;
+    render(state, owner);
+    return;
+  }
+  render(state, owner);
+  owner.requestAnimationFrame(function () { settleTick(state, owner); });
+}
+
+module.exports = {
+  // 逻辑层下发几何与选中格（页面出现/切回时）：药丸直接落在选中格 —— 新页面的 tabBar
+  // 是新建实例，不存在「从前一格滑过来」这回事
+  onConfig: function (newValue, oldValue, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state) return;
+    ensureState(state);
+    if (!newValue) return;
+    if (typeof newValue.step === 'number' && newValue.step > 0) state.step = newValue.step;
+    if (typeof newValue.maxIdx === 'number') state.maxIdx = newValue.maxIdx;
+    if (typeof newValue.over === 'number' && newValue.over >= 0) state.over = newValue.over;
+    if (typeof newValue.sel === 'number') state.sel = newValue.sel;
+    state.lagRun = false;
+    state.settling = false;
+    state.drag = null;
+    state.pill = state.sel;
+    state.barDx = 0;
+    render(state, ownerInstance);
+  },
+
+  touchstart: function (event, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state) return;
+    ensureState(state);
+    var touches = event.touches || [];
+    if (touches.length === 0) return;
+    var t0 = touches[0];
+    // 进行中的动画就地收尾：药丸的位置永远等于 state.pill，不靠读样式猜
+    state.lagRun = false;
+    state.settling = false;
+    var hit = 0;
+    if (event.currentTarget && event.currentTarget.dataset && event.currentTarget.dataset.index !== undefined) {
+      hit = Number(event.currentTarget.dataset.index);
+      if (isNaN(hit)) hit = 0;
+    }
+    state.drag = {
+      id: t0.identifier,
+      x0: t0.clientX,
+      y0: t0.clientY,
+      i0: state.pill,
+      hit: hit,
+      locked: false,
+      vertical: false,
+      moved: false
+    };
+    state.lagTarget = state.pill;
+    pressDown(state, ownerInstance);
+  },
+
+  touchmove: function (event, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state || !state.inited || !state.drag) return;
+    var touches = event.touches || [];
+    if (touches.length === 0) return;
+    var t0 = touches[0];
+    var d = state.drag;
+    if (t0.identifier !== d.id) return;
+    var dx = t0.clientX - d.x0;
+    var dy = t0.clientY - d.y0;
+    if (!d.locked) {
+      if (Math.abs(dx) < CFG.DRAG_LOCK && Math.abs(dy) < CFG.DRAG_LOCK) return;
+      d.locked = true;
+      if (Math.abs(dy) > Math.abs(dx)) { d.vertical = true; return; }   // 竖向手势让位，不拦页面滚动
+      d.moved = true;
+    }
+    if (d.vertical) return;
+    var step = state.step;
+    if (!step) return;
+    var raw = d.i0 + dx / step;                    // 手指指向（格，未阻尼）
+    var damped = raw;
+    if (raw < 0) damped = raw * CFG.RUBBER;
+    else if (raw > state.maxIdx) damped = state.maxIdx + (raw - state.maxIdx) * CFG.RUBBER;
+    var dampedPx = damped * step;
+    var inRange = dampedPx;
+    if (inRange < 0) inRange = 0;
+    if (inRange > state.maxIdx * step) inRange = state.maxIdx * step;
+    var overPx = dampedPx - inRange;
+    // 整条栏：栏内行程只跟一点点（错位），越界段跟得更多，绝对值不超过 10px
+    var barDx = (inRange - d.i0 * step) * CFG.BAR_FOLLOW + overPx * CFG.BAR_FOLLOW_OVER;
+    if (barDx > CFG.BAR_MAX) barDx = CFG.BAR_MAX;
+    if (barDx < -CFG.BAR_MAX) barDx = -CFG.BAR_MAX;
+    state.barDx = barDx;
+    // 药丸行程要扣掉整条栏的位移，再夹在栏内（左右各留一个内缩，硬质玻璃不出栏）
+    var frac = (dampedPx - barDx) / step;
+    var lo = -state.over;
+    var hi = state.maxIdx + state.over;
+    if (frac < lo) frac = lo;
+    if (frac > hi) frac = hi;
+    state.lagTarget = frac;
+    startLag(state, ownerInstance);
+    render(state, ownerInstance);
+  },
+
+  touchend: function (event, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state || !state.inited || !state.drag) return;
+    var d = state.drag;
+    state.drag = null;
+    state.lagRun = false;
+    pressUp(state, ownerInstance);
+    if (d.vertical) {                       // 竖向手势：位置不动，也不算点按
+      settleTo(state, ownerInstance, state.sel);
+      return;
+    }
+    if (!d.moved) {                         // 纯点按：先让药丸滑向被点的那一格，再交给逻辑层切页
+      settleTo(state, ownerInstance, d.hit);
+      ownerInstance.callMethod('onTabTap', { index: d.hit });
+      return;
+    }
+    var target = Math.round(state.lagTarget);
+    if (target < 0) target = 0;
+    if (target > state.maxIdx) target = state.maxIdx;
+    settleTo(state, ownerInstance, target);
+    if (target === state.sel) {
+      ownerInstance.callMethod('onTabDragBack', {});
+    } else {
+      ownerInstance.callMethod('onTabDragTo', { to: target, from: state.sel });
+    }
+  },
+
+  touchcancel: function (event, ownerInstance) {
+    var state = ownerInstance.getState();
+    if (!state || !state.inited) return;
+    state.drag = null;
+    state.lagRun = false;
+    pressUp(state, ownerInstance);
+    settleTo(state, ownerInstance, state.sel);
+  }
+};

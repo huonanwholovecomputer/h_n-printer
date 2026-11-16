@@ -1,5 +1,11 @@
 /* Apple Liquid Glass Custom Tab Bar — 低透明度 + 适度模糊 + 层次感 */
 
+/* 2026-11-16：加玻璃滑块。分层与 APP 端 mobile_apps/android_app/www/index.html 的 tabBar 对应：
+     .tab-bar   整条栏：拖动时随手指位移（≤10px，WXS 写 transform）
+     .tab-glass 玻璃本体：背景/模糊/阴影 + 船式起伏的 scale 都在这一层（与位移分开，互不覆盖）
+     .tab-thumb 位移层：只做平移，硬质玻璃 —— 不缩放、不拉伸
+     .tab-pill  玻璃块：渐变 + 三层阴影（深色模式是黑玻璃） */
+
 /* ── Tab Bar ── */
 .tab-bar {
   position: fixed;
@@ -7,6 +13,17 @@
   left: 80rpx;
   right: 80rpx;
   height: 110rpx;
+  z-index: 9999;
+  touch-action: none;
+}
+
+/* ── 玻璃本体 ── */
+.tab-glass {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   display: flex;
   /* 固定配色，不随主题变化，深色/浅色下都自然的玻璃效果 */
   background: rgba(255, 255, 255, 0.12);
@@ -18,14 +35,89 @@
     inset 0 1rpx 0 rgba(255, 255, 255, 0.20),
     inset 0 -1rpx 0 rgba(0, 0, 0, 0.04),
     0 0 0 0.5rpx rgba(0, 0, 0, 0.04);
-  z-index: 9999;
+  transform-origin: 50% 50%;
+  will-change: transform;
 }
 
-.tab-bar.border-hidden {
+.tab-bar.border-hidden .tab-glass {
   border-top-color: transparent;
 }
 
+/* ── 玻璃滑块 ── */
+.tab-thumb {
+  position: absolute;
+  left: 9rpx;
+  top: 7rpx;
+  width: calc(50% - 18rpx);
+  height: calc(100% - 14rpx);
+  z-index: 1;
+  pointer-events: none;   /* 命中面留给下面的 .tab-item，拖动不从药丸上起手 */
+  opacity: 0;             /* 首帧由视图层落位后再显形，避免「我」页新建实例闪一下第 1 格 */
+  will-change: transform;
+}
+
+.tab-pill {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: 999rpx;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(244, 246, 248, 0.86));
+  box-shadow:
+    0 4rpx 12rpx rgba(0, 0, 0, 0.10),
+    0 1rpx 2rpx rgba(0, 0, 0, 0.06),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.90),
+    inset 0 -1rpx 0 rgba(0, 0, 0, 0.04);
+}
+
+/* 玻璃高光：只占上沿一小条，别铺满（否则像塑料片） */
+.tab-pill-gloss {
+  position: absolute;
+  top: 2rpx;
+  left: 12rpx;
+  right: 12rpx;
+  height: 42%;
+  border-radius: 999rpx;
+  background: radial-gradient(120% 100% at 50% 0%, rgba(255, 255, 255, 0.85) 0%, rgba(255, 255, 255, 0) 70%);
+  opacity: 0.55;
+}
+
+/* ── 深色模式：黑玻璃（与 APP 端 .theme-dark .tab-pill 同一口径） ── */
+.theme-dark .tab-glass {
+  background: rgba(26, 26, 28, 0.50);
+  box-shadow:
+    0 8rpx 32rpx rgba(0, 0, 0, 0.36),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.10),
+    inset 0 -1rpx 0 rgba(0, 0, 0, 0.24),
+    0 0 0 0.5rpx rgba(255, 255, 255, 0.06);
+}
+
+.theme-dark .tab-pill {
+  background: linear-gradient(180deg, rgba(42, 42, 45, 0.96), rgba(12, 12, 14, 0.94));
+  box-shadow:
+    0 4rpx 14rpx rgba(0, 0, 0, 0.55),
+    0 1rpx 2rpx rgba(0, 0, 0, 0.40),
+    inset 0 1rpx 0 rgba(255, 255, 255, 0.10),
+    inset 0 -1rpx 0 rgba(0, 0, 0, 0.30);
+}
+
+.theme-dark .tab-pill-gloss {
+  opacity: 0.22;
+}
+
+.theme-dark .tab-text {
+  color: #98989D;
+}
+
+.theme-dark .text-active {
+  color: #409CFF;
+}
+
+/* ── 每一项 ── */
 .tab-item {
+  position: relative;
+  z-index: 2;             /* 图标/文字压在药丸上 */
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -48,6 +140,19 @@
   100% { transform: scale(1); }
 }
 
+/* 整排 wave：点按切换时两格先后压一下再弹回（stagger 26ms，460ms 过冲曲线） */
+.tab-item.wave {
+  animation: tabWave 0.46s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+.tab-item.wave.w0 { animation-delay: 0s; }
+.tab-item.wave.w1 { animation-delay: 0.026s; }
+@keyframes tabWave {
+  0%   { transform: scale(1); }
+  28%  { transform: scale(0.93) translateY(1.5px); }
+  62%  { transform: scale(1.035) translateY(-1px); }
+  100% { transform: scale(1); }
+}
+
 /* Icon container */
 .tab-icon-wrap {
   width: 64rpx;
@@ -60,8 +165,9 @@
   transition: background-color 0.2s ease;
 }
 
+/* 选中态底衬交给药丸，图标容器本身不再铺底（否则会盖住玻璃） */
 .icon-active {
-  background-color: rgba(0, 122, 255, 0.08);
+  background-color: transparent;
 }
 
 .tab-icon {
