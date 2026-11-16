@@ -1050,13 +1050,15 @@ function navBarHeight() {
 
 let currentTab = 'print';
 let _tabSwitching = false;
+let _tabPending = '';        // 正在切去的 tab（转场还没落定时；currentTab 要等落定才更新）
+let _tabQueuedTab = '';      // 转场途中松手想去别的格：等这一趟落定再接着走
 let _viewTransition = false;
 
 /* ── 玻璃滑块（APP 2026-11-16）─────────────────────────────────────────
    #tabThumb 只做位移（CSS transition 320ms），#tabPill 只做 scaleX（goo 340ms）。
    两层必须是两个元素：合到一个元素上时位移与缩放两条插值互相拉扯，滑块会被
-   拉成畸形（demo 的硬结论）。只响应点击，不做拖动 —— 拖动会和页面左右滑退出
-   手势打架（switchTab 的平铺推拉与 hideView 的右滑退出都在同一片区域）。 */
+   拉成畸形（demo 的硬结论）。拖动见下面「拖动 / 按下反馈」：手势只绑 #tabBar，
+   页面里的横滑手势挂在滚动内容上，两者不抢；转场进行中也能起手（2026-11-16 第三轮）。 */
 let _tabWaveTimer = 0;
 
 // 格子序号：0 = 打印，1 = 我（找不到就退回 0，别让一个笔误把滑块丢到栏外）
@@ -1154,22 +1156,44 @@ function _tabStep(bar) {
   return r1.left - r0.left;   // 一格步长 = 栏宽 / 格数（栏宽变化自动跟着走）
 }
 
+// 滑块此刻的「视觉」格序号：转场途中它正被 CSS 过渡带着走，data-i 已经指向终点，
+// 拿 data-i 当锚点会看到药丸瞬间跳过去。读 transform 里的 tx 才是手指底下的真实位置。
+function _tabVisualIndex(thumb, step, max) {
+  if (!thumb || !step) return 0;
+  const m = getComputedStyle(thumb).transform;
+  let tx = 0;
+  if (m && m !== 'none') {
+    const nums = m.slice(m.indexOf('(') + 1).replace(')', '').split(',');
+    tx = parseFloat(nums[4]) || 0;
+  }
+  const i = tx / step;
+  return Math.max(0, Math.min(max, isNaN(i) ? 0 : i));
+}
+
 function _tabDragStart(e) {
   const bar = document.getElementById('tabBar');
-  if (!bar || _tabSwitching || _tabDrag) return;
+  if (!bar || _tabDrag) return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   const step = _tabStep(bar);
   if (!step) return;
   bar.classList.remove('settling');   // 上一次松手的回弹还没收完就接下一次拖
+  // 关键：转场（switchTab 的 480ms 平铺推拉、或滑块的 320ms 归位）途中也允许起手 ——
+  // 直接把药丸冻在当前视觉位置，接着跟手；页面转场该怎么走还怎么走，松手时再按位置决定
+  const thumb = document.getElementById('tabThumb');
+  const maxSlot = bar.querySelectorAll('.tab-item').length - 1;
+  const i0 = _tabVisualIndex(thumb, step, maxSlot);
+  if (thumb) {
+    thumb.style.transition = 'none';
+    thumb.style.setProperty('--tab-i', String(i0));
+  }
   const item = e.target && e.target.closest ? e.target.closest('.tab-item') : null;
   if (item) {
     item.classList.remove('rebound');
     item.classList.add('press');
   }
   _tabDrag = {
-    id: e.pointerId, x0: e.clientX, y0: e.clientY, i0: currentTabThumbIndex(),
-    step: step, max: bar.querySelectorAll('.tab-item').length - 1,
-    item: item, active: false,
+    id: e.pointerId, x0: e.clientX, y0: e.clientY, i0: i0,
+    step: step, max: maxSlot, item: item, active: false,
   };
 }
 
@@ -1226,8 +1250,15 @@ function _tabDragEnd(ev, silent) {
   if (!bar) return;
   try { bar.releasePointerCapture(d.id); } catch (err) { /* 没抓住过就算了 */ }
   if (d.item) d.item.classList.remove('press');
+  const thumb = document.getElementById('tabThumb');
+  const items = [...bar.querySelectorAll('.tab-item')];
+  // 页面此刻认定的格：转场途中认 _tabPending（currentTab 要等落定才更新）
+  const destIdx = _tabIndex(_tabPending || currentTab);
+  const restoreThumb = () => { if (thumb) thumb.style.transition = ''; };
   if (!d.active) {
-    // 纯点按：同格 → 船式回弹；跨格 → 交给 switchTab 的 wave（别两套同挂）
+    // 纯点按：药丸回到页面认定的那一格（转场途中冻过，这里放回去接着过渡）
+    if (thumb) thumb.style.setProperty('--tab-i', String(destIdx));
+    restoreThumb();
     if (!silent && d.item && d.item.dataset.tab === currentTab) {
       d.item.classList.remove('rebound');
       void d.item.offsetWidth;
@@ -1236,7 +1267,6 @@ function _tabDragEnd(ev, silent) {
     }
     return;
   }
-  const thumb = document.getElementById('tabThumb');
   const frac = parseFloat(thumb.style.getPropertyValue('--tab-i'));
   const target = Math.max(0, Math.min(d.max, Math.round(isNaN(frac) ? d.i0 : frac)));
   bar.classList.remove('dragging');
@@ -1245,13 +1275,21 @@ function _tabDragEnd(ev, silent) {
   bar.style.removeProperty('--tab-bar-dx');
   bar.style.removeProperty('--pill-scale');
   bar.style.removeProperty('--pill-origin');
-  const items = [...bar.querySelectorAll('.tab-item')];
-  if (target !== d.i0 && items[target]) {
-    _tabSuppressClickUntil = Date.now() + 400;
-    switchTab(items[target].dataset.tab);
-  } else {
-    thumb.style.setProperty('--tab-i', String(d.i0));   // 没过半格：320ms 弹回原格
+  _tabQueuedTab = '';      // 手指位置才是权威：排队里那趟作废，下面按 target 重新决定
+  restoreThumb();   // 药丸重新拿回 CSS 过渡：从松手位置滑向目标格
+  const targetTab = items[target] ? items[target].dataset.tab : '';
+  if (!targetTab || target === destIdx) {
+    thumb.style.setProperty('--tab-i', String(destIdx));   // 没过半格 / 本来就在这格：滑回这一格
+    return;
   }
+  _tabSuppressClickUntil = Date.now() + 400;
+  if (_tabSwitching) {
+    // 页面正在播上一趟转场：先把药丸停在目标格，等这趟落定再播新的切换动画
+    _tabQueuedTab = targetTab;
+    thumb.style.setProperty('--tab-i', String(target));
+    return;
+  }
+  switchTab(targetTab);
 }
 
 function initTabDrag() {
@@ -1266,8 +1304,14 @@ function initTabDrag() {
 
 // tab 切换：平铺推拉转场 —— 两页并排铺满内容区，旧页抽出、新页从对面推入，互不重叠
 function switchTab(tab) {
-  if (tab === currentTab || _tabSwitching) return;
+  // 转场途中再点名：记下来等这趟落定再走 —— 不再「锁住不理」，滑块与点按始终有反馈
+  if (_tabSwitching) {
+    if (tab !== _tabPending) _tabQueuedTab = tab;
+    return;
+  }
+  if (tab === currentTab) return;
   _tabSwitching = true;
+  _tabPending = tab;
 
   // 切换前关闭打开的弹窗（对齐小程序 animateExit 中的处理）
   document.querySelectorAll('.modal-mask').forEach(m => {
@@ -1336,11 +1380,19 @@ function switchTab(tab) {
 
     hideViews();
     currentTab = tab;
+    _tabPending = '';
     _tabSwitching = false;
     updateThemeToggleVisibility();
     if (tab === 'me' && typeof loadMeTab === 'function') loadMeTab();
     if (tab === 'print' && typeof onPrintTabShown === 'function') onPrintTabShown();
     measureAll();
+    // 排队的那一趟：手还按在栏上就先压着（松手时以药丸位置为准），否则立刻接着播
+    const queued = _tabQueuedTab;
+    _tabQueuedTab = '';
+    if (queued && queued !== currentTab) {
+      if (_tabDrag) _tabQueuedTab = queued;
+      else switchTab(queued);
+    }
   }, 480);
 }
 

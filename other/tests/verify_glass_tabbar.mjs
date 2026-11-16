@@ -8,7 +8,8 @@
  *   ③ 药丸不探出玻璃栏的圆角轮廓；
  *   ④ 图标 bump 与整排 wave 真的被触发（而不是只加了 class 没有 keyframes）；
  *   ⑤ 拖动真的跟手（1:1）、越界真的被橡皮筋压住、过半格才吸附、按下去真的先压缩再
- *      船式回弹 —— 这几条只有真手势才量得出来，静态 grep 最多证明"写了 pointermove"。
+ *      船式回弹 —— 这几条只有真手势才量得出来，静态 grep 最多证明"写了 pointermove"；
+ *   ⑥ 页面转场（480ms 平铺推拉）途中照样能起手拖、松手按药丸停止的位置决定切哪页。
  *
  * 探针自证：把 transform 钉死（模拟「滑块不动」的坏实现），点击「我」之后药丸
  * 若仍然落在第 1 格 —— 说明这个探针量的是真实位置，红/绿都有意义。
@@ -117,8 +118,9 @@ check('整条栏弹性偏移与按下/回弹的规则都在（位移落在 .tab-
       !/\.tab-bar\.dragging \.tab-item \{/.test(css) &&
       /\.tab-item\.press \{/.test(css) && /@keyframes tabPressRebound/.test(css) &&
       /tab-item\.rebound \{/.test(css));
-check('拖动过半格走 switchTab 复用既有归位，且抑制拖动收尾的冒泡 click',
-      /_tabSuppressClickUntil/.test(js) && /switchTab\(items\[target\]\.dataset\.tab\)/.test(js));
+check('拖动过半格按药丸位置切页（复用 switchTab），且抑制拖动收尾的冒泡 click',
+      /_tabSuppressClickUntil/.test(js) && /switchTab\(targetTab\)/.test(js) &&
+      /_tabQueuedTab/.test(js) && /_tabVisualIndex\(/.test(js));
 check('旧的 .tab-hover 缩放不再叠加到图标弹跳上', !/classList\.add\('tab-hover'\)/.test(js));
 
 /* ── ② 渲染环境（桩后端 + 真实 www/） ──────────────────────────────── */
@@ -465,6 +467,48 @@ check('手指松手同样弹回原格、收干净',
       'data-i=' + dF2.dataI + ' Δthumb=' + px1(dF2.thumb.l - t0.thumb.l));
 await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
 await cdp.detach();
+
+/* G. 转场（480ms 平铺推拉）途中：滑块必须始终可滑，松手按药丸位置决定切哪页 */
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(700);
+await page.evaluate(() => switchTab('me'));      // 起一趟转场，不等它落定
+await page.waitForTimeout(120);
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.waitForTimeout(80);
+const dG0 = await dragGeo();            // 按下那一刻冻住的位置（转场跑了一半）
+await page.mouse.move(cx0 + 40, cy, { steps: 5 });
+await page.waitForTimeout(120);
+const dG = await dragGeo();
+check('★ 页面转场途中也能起手拖动（滑块不再被 _tabSwitching 锁死）',
+      dG.dragging === true, 'dragging=' + dG.dragging + ' tab=' + dG.tab);
+check('转场途中起手是「冻在当前视觉位置」再跟手（不跳到终点）',
+      (dG0.thumb.l - thumb0L) > 8 && (dG0.thumb.l - thumb0L) < stepPx - 8 &&
+      Math.abs(dG.thumb.l - dG0.thumb.l - 40) <= 3 && dG.thumb.l - thumb0L < stepPx - 4,
+      '冻结在 ' + px1(dG0.thumb.l - thumb0L) + 'px（应在 8~' + px1(stepPx - 8) +
+      ' 之间）→ 再跟手 ' + px1(dG.thumb.l - dG0.thumb.l) + 'px / 手指 40px，且仍没到终点');
+await page.mouse.up();
+await page.waitForTimeout(1100);
+const dG2 = await dragGeo();
+check('松手按药丸位置切页（拖过半格 → 落在第 2 格并切到「我」）',
+      dG2.dataI === '1' && dG2.tab === 'me' && dG2.meHidden === false,
+      'data-i=' + dG2.dataI + ' tab=' + dG2.tab);
+
+/* 反向：转场跑到一半把药丸拖回第 1 格，松手必须回到「打印」 */
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(700);
+await page.evaluate(() => switchTab('me'));
+await page.waitForTimeout(120);
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.mouse.move(cx0 - 90, cy, { steps: 5 });
+await page.waitForTimeout(120);
+await page.mouse.up();
+await page.waitForTimeout(1500);
+const dG3 = await dragGeo();
+check('★ 转场途中反向拖回去 → 等这一趟落定后按手指位置切回「打印」',
+      dG3.dataI === '0' && dG3.tab === 'print' && dG3.meHidden === true,
+      'data-i=' + dG3.dataI + ' tab=' + dG3.tab + ' meHidden=' + dG3.meHidden);
 
 console.log('\n=== ⑦ 截图 ===');
 async function shot(mode, tab, file) {
