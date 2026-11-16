@@ -623,10 +623,26 @@ button {
         .tab-thumb / .tab-pill 两条（跟手关过渡 + --pill-scale / --pill-origin）、
         .tab-item.press
         （scale .92）与 .tab-item.rebound + @keyframes tabPressRebound。
+        ※ 这一条里的 --pill-scale / --pill-origin 与 .tab-pill.goo 已在第五轮删掉
+        （滑块改成硬质玻璃，不再形变），重跑生成器时不要把它们贴回来。
     · 2026-11-16 第三轮（用户口径「10px 就够」：改成**整条栏位移**）：.tab-bar.dragging 自身的
         transform: translate3d(var(--tab-bar-dx,0px),0,0) + transition:none、.tab-bar.settling
         （340ms 弹性归零）。**不再有** .tab-bar.dragging .tab-item / .tab-bar.settling .tab-item
         这两条（旧版栏内每格各自平移，已废弃）。
+    · 2026-11-16 第五轮（硬质玻璃 + 深色黑玻璃）：
+        .tab-thumb 的 transition 改成 260ms cubic-bezier(0.2,0,0,1)（无过冲）；
+        .tab-bar.dragging .tab-pill 只留 transition:none（去掉 scaleX 那条）；
+        .tab-bar.settling 改成 220ms cubic-bezier(0.2,0,0,1)；
+        新增 .theme-dark .tab-pill（黑玻璃渐变 + 深色 box-shadow）、
+        .theme-dark .tab-pill-gloss、.theme-dark .text-active (#0A84FF)。
+        已删除 .tab-pill.goo 与 @keyframes tabPillGoo。
+    · 2026-11-16 第六轮（船式起伏，参个人网站证书 .cert-paper__stack.is-pressed）：
+        .tab-bar 加独立 scale: var(--tab-boat, 1) + transition: scale 110ms
+        cubic-bezier(0.4,0,0.2,1)（不能用 transform —— transform 被 --tab-bar-dx 占用）；
+        .tab-bar.boat → --tab-boat: 0.965；.tab-bar.boat-up + @keyframes tabBarBoat
+        （0.965 → 42% 1.012 → 1，560ms cubic-bezier(0.34,1.56,0.64,1)）；
+        .tab-bar.dragging / .tab-bar.settling 的 transition 各带上 scale 那一段
+        （原来 .dragging 是 transition:none，会把下沉也掐掉）。
     查法：git diff www/styles.css | grep 2026-11 （重跑前先存这份 diff 备用）。
 `;
 

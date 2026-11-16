@@ -78,29 +78,51 @@ check('滑块节点在 .tab-bar 内、tab-item 之前（z 序与命中面都靠�
 
 const thumbBody = cssRule(css, '.tab-thumb');
 const pillBody = cssRule(css, '.tab-pill');
-/* keyframes 里的每个百分比都是独立块，cssBlock 只会拿到第一个（0%），
-   所以这里取锚点后的一段窗口来比对峰值 */
-const gooAt = css.indexOf('@keyframes tabPillGoo');
-const gooKey = gooAt < 0 ? '' : css.slice(gooAt, gooAt + 260);
 check('取到了 .tab-thumb / .tab-pill 规则', !!thumbBody && !!pillBody);
-check('位移层只做 transform 过渡（320ms cubic-bezier(.4,0,.2,1)）',
-      /transform 320ms cubic-bezier\(0?\.4, 0, 0?\.2, 1\)/.test(thumbBody),
+check('位移层只做 transform 过渡（260ms cubic-bezier(.2,0,0,1)，无回弹）',
+      /transform 260ms cubic-bezier\(0?\.2, 0, 0, 1\)/.test(thumbBody),
       'transition: ' + decl(thumbBody, 'transition'));
 check('位移层不参与缩放/动画（scale 与 animation 都必须在形变层）',
       !/scale/.test(thumbBody) && !/animation/.test(thumbBody));
 check('位移层用 --tab-i 驱动（不靠 left/width 动画）',
       /--tab-i/.test(decl(thumbBody, 'transform')) && !/transition:[^;]*\bleft\b/.test(thumbBody),
       'transform: ' + decl(thumbBody, 'transform'));
-const gooRule = cssRule(css, '.tab-pill.goo');
-check('形变层只做 scaleX（goo 340ms，峰值 1.14）',
-      /animation: tabPillGoo 340ms/.test(gooRule) && /scaleX\(1\.14\)/.test(gooKey)
-      && !/translate/.test(pillBody) && !/translate/.test(gooRule),
-      'goo: ' + (gooKey.match(/scaleX\([0-9.]+\)/g) || []).join(' '));
+/* 硬质玻璃（2026-11-16 第五轮，用户口径「滑块不需要有弹性」）：滑块只有位移，没有形变 */
+check('★ 滑块不再有弹性：没有 goo keyframes、没有 .tab-pill.goo、没有 --pill-scale',
+      !/@keyframes tabPillGoo/.test(css) && !/\.tab-pill\.goo/.test(css)
+      && !/--pill-scale/.test(css) && !/--pill-origin/.test(css)
+      && !/animation/.test(pillBody) && !/scale/.test(pillBody),
+      'pill animation: ' + (decl(pillBody, 'animation') || 'none'));
+const darkPillCss = cssRule(css, '.theme-dark .tab-pill');
+const darkBg = decl(darkPillCss, 'background');
+const darkNums = (darkBg.match(/rgba?\((\d+), (\d+), (\d+)/g) || [])
+  .map((s) => s.match(/\d+/g).slice(0, 3).map(Number));
+check('★ 深色主题滑块是黑玻璃（背景三通道都 < 80）',
+      !!darkBg && darkNums.length >= 2 && darkNums.every((c) => c[0] < 80 && c[1] < 80 && c[2] < 80),
+      darkBg || '(缺 .theme-dark .tab-pill)');
 check('整排 wave 与图标 bump 的 keyframes 都在',
       /@keyframes tabWave/.test(css) && /@keyframes tabIconBump/.test(css)
       && /\.tab-bar\.wave \.tab-item/.test(css) && /\.tab-icon-wrap\.bump/.test(css));
 /* 回归守门：气泡避让 tabBar 的验收读的就是这条高度（见 verify_toast_above_tabbar.mjs） */
 const tabBarHeight = decl(cssBlock(css, '/* ── Tab Bar ── */'), 'height');
+
+/* 船式起伏（2026-11-16 第六轮）：整条栏用独立 scale 下沉 + 弹簧回弹，
+   不能挂在 transform 上 —— transform 已被 --tab-bar-dx 的拖动位移占用 */
+const boatRule = cssRule(css, '.tab-bar.boat');
+const boatAnim = cssRule(css, '.tab-bar.boat-up');
+const boatAt = css.indexOf('@keyframes tabBarBoat');
+const boatKey = boatAt < 0 ? '' : css.slice(boatAt, boatAt + 200);
+check('★ 船式起伏：.tab-bar 用独立 scale 属性（不抢 transform）',
+      /scale: var\(--tab-boat, 1\)/.test(cssBlock(css, '.tab-bar'))
+      && !/transform:.*scale\(/.test(cssBlock(css, '.tab-bar')),
+      'scale: var(--tab-boat, 1)');
+check('★ 按住时整条栏压到 0.965（与网站证书的按压同一个数）',
+      /--tab-boat: 0\.965/.test(boatRule), boatRule.replace(/\s+/g, ' ').slice(0, 80));
+check('★ 松手弹簧回弹：0.965 → 1.012 过冲 → 1（560ms 弹性曲线）',
+      /animation: tabBarBoat/.test(boatAnim)
+      && /scale: 0\.965/.test(boatKey) && /scale: 1\.012/.test(boatKey)
+      && /scale: 1;/.test(boatKey),
+      (boatKey.match(/scale: [0-9.]+/g) || []).join(' → '));
 check('tabBar 高度仍是 13.2cqw（气泡避让的几何基准不许动）', tabBarHeight === '13.2cqw', 'height: ' + tabBarHeight);
 
 check('switchTab 会驱动滑块位移', /slideTabThumb\(/.test(js));
@@ -246,14 +268,14 @@ check('落位后宽度与初始完全一致（位移不是宽度动画）', Math
       'rest=' + restW + ' now=' + px1(g1.pill.w));
 check('落位后高度与初始一致（没有残留 skew）', Math.abs(px1(g1.pill.h) - restH) <= 0.5,
       'rest=' + restH + ' now=' + px1(g1.pill.h));
-check('拉伸峰值不超过 1.16 倍（goo 只轻拉，不能把药丸甩出格子）',
-      samples.every((s) => s.w <= restW * 1.16 + 0.5), samples.map((s) => px1(s.w / restW) + 'x').join(' '));
+check('★ 切换途中药丸宽度恒定（硬质玻璃：全程不拉伸）',
+      samples.every((s) => Math.abs(s.w - restW) <= 0.6),
+      samples.map((s) => px1(s.w)).join(' '));
 check('位移过程中药丸始终在栏内', samples.every((s) => s.cx > g0.bar.l && s.cx < g0.bar.r));
 check('位置单调朝第 2 格走（没有来回弹）',
       samples.every((s, i) => i === 0 || s.cx >= samples[i - 1].cx - 3),
       samples.map((s) => px1(s.cx)).join(' -> '));
-check('goo 动画在切换窗口内确实起过（不是只有 CSS 没有触发）',
-      samples.some((s) => s.goo === 'tabPillGoo'), samples.map((s) => s.goo).join(','));
+
 
 console.log('\n=== ④ 点击反馈：wave 与图标 bump ===');
 await page.waitForTimeout(400);
@@ -304,10 +326,21 @@ const stepPx = await page.evaluate(() => {
   return items[1].getBoundingClientRect().left - items[0].getBoundingClientRect().left;
 });
 const dragGeo = () => page.evaluate(() => {
-  const rect = (el) => { const r = el.getBoundingClientRect(); return { l: r.left, r: r.right, w: r.width }; };
   const bar = document.getElementById('tabBar');
   const thumb = document.getElementById('tabThumb');
   const items = [...document.querySelectorAll('.tab-item')];
+  /* 船式起伏会让整条栏 scale 到 .965，getBoundingClientRect 拿到的就是缩过的坐标。
+     这里统一按栏的视觉缩放比还原成「未缩放」坐标系（缩放绕中心），
+     否则 60px 的拖动只会量到 57.9px，越界与栏内夹取那些断言全会被一个系数带偏。 */
+  const rawBar = bar.getBoundingClientRect();
+  const s = rawBar.width / bar.offsetWidth || 1;
+  const cx = rawBar.left + rawBar.width / 2;
+  const ux = (x) => cx - bar.offsetWidth / 2 + (x - rawBar.left) / s;
+  const rect = (el) => {
+    if (!el) return { l: 0, r: 0, w: 0 };
+    const r = el.getBoundingClientRect();
+    return { l: ux(r.left), r: ux(r.right), w: r.width / s };
+  };
   const scaleOf = (el) => {
     const m = getComputedStyle(el).transform.match(/matrix\(([^)]*)\)/);
     return m ? parseFloat(m[1].split(',')[0]) : 1;
@@ -316,7 +349,7 @@ const dragGeo = () => page.evaluate(() => {
     thumb: rect(thumb),
     frac: parseFloat(getComputedStyle(thumb).getPropertyValue('--tab-i')),
     barDx: parseFloat(getComputedStyle(bar).getPropertyValue('--tab-bar-dx')) || 0,
-    barL: bar.getBoundingClientRect().left,
+    barL: ux(rawBar.left),
     items: items.map((t) => Object.assign(rect(t), {
       press: t.classList.contains('press'),
       rebound: t.classList.contains('rebound'),
@@ -326,6 +359,7 @@ const dragGeo = () => page.evaluate(() => {
     pill: rect(document.getElementById('tabPill')),
     dragging: bar.classList.contains('dragging'),
     settling: bar.classList.contains('settling'),
+    boat: { down: bar.classList.contains('boat'), up: bar.classList.contains('boat-up'), scale: s },
     dataI: thumb.getAttribute('data-i'),
     tab: typeof currentTab === 'string' ? currentTab : '',
     meHidden: getComputedStyle(document.getElementById('page-me')).display === 'none',
@@ -355,10 +389,13 @@ check('栏内图标相对栏体不动（动的是整条栏，不是各图标各�
       'Δitem=' + px1(dA.items[0].l - item0L) + ' Δbar=' + px1(dA.barL - barBox.x));
 check('药丸内部行程扣掉整条栏位移（屏幕上仍停在手指下）',
       Math.abs(dA.thumb.l - thumb0L - 60) <= 2, 'Δthumb(screen)=' + px1(dA.thumb.l - thumb0L));
-check('形变层沿行程拉伸（药丸变宽、位移层宽度不变）',
-      dA.pill.w > restW * 1.04 && Math.abs(dA.thumb.w - thumb0W) <= 0.6,
-      'pill.w=' + px1(dA.pill.w) + ' thumb.w=' + px1(dA.thumb.w));
+check('★ 拖动中药丸宽度不变（硬质玻璃：只平移、不形变）',
+      Math.abs(dA.pill.w - restW) <= 0.6 && Math.abs(dA.thumb.w - thumb0W) <= 0.6,
+      'pill.w=' + px1(dA.pill.w) + ' rest=' + restW);
 check('没松手就不切页', dA.meHidden === true && dA.tab === 'print');
+check('★ 按住时整条栏下沉（scale ≈ 0.965，像一块硬玻璃被按下去）',
+      dA.boat.down === true && Math.abs(dA.boat.scale - 0.965) <= 0.005,
+      'scale=' + dA.boat.scale.toFixed(4) + ' boat=' + dA.boat.down);
 await page.mouse.up();
 await page.waitForTimeout(480);
 const dA2 = await dragGeo();
@@ -368,6 +405,11 @@ check('收尾后整条栏归零、dragging/settling 都收干净',
       Math.abs(dA2.barL - barBox.x) < 0.6 && Math.abs(dA2.barDx) < 0.2 &&
       dA2.dragging === false && dA2.settling === false,
       'Δbar=' + px1(dA2.barL - barBox.x));
+await page.waitForTimeout(260);   // 船式回弹 560ms 收尾
+const dBoat = await dragGeo();
+check('★ 松手后整条栏弹回原尺寸（scale 回到 1，boat / boat-up 收干净）',
+      Math.abs(dBoat.boat.scale - 1) <= 0.004 && dBoat.boat.down === false && dBoat.boat.up === false,
+      'scale=' + dBoat.boat.scale.toFixed(4));
 
 /* B. 越界：往左拖出第 1 格，位移应被橡皮筋压到 35% */
 await page.mouse.move(cx0, cy);
@@ -477,16 +519,21 @@ await page.mouse.move(cx0, cy);
 await page.mouse.down();
 await page.waitForTimeout(80);
 const dG0 = await dragGeo();            // 按下那一刻冻住的位置（转场跑了一半）
-await page.mouse.move(cx0 + 40, cy, { steps: 5 });
+/* 冻结点可能已经很靠近第 2 格（transition 260ms 比 320ms 跑得快），
+   行程按「离终点还剩多少」算，否则 frac 会被 1.028 的越界夹取吃掉，测到的跟手距离变小 */
+const roomPx = (1 + 0.028) * stepPx - (dG0.thumb.l - thumb0L);
+const dz = Math.max(8, Math.min(24, roomPx * 0.6));
+await page.mouse.move(cx0 + dz, cy, { steps: 5 });
 await page.waitForTimeout(120);
 const dG = await dragGeo();
 check('★ 页面转场途中也能起手拖动（滑块不再被 _tabSwitching 锁死）',
       dG.dragging === true, 'dragging=' + dG.dragging + ' tab=' + dG.tab);
 check('转场途中起手是「冻在当前视觉位置」再跟手（不跳到终点）',
       (dG0.thumb.l - thumb0L) > 8 && (dG0.thumb.l - thumb0L) < stepPx - 8 &&
-      Math.abs(dG.thumb.l - dG0.thumb.l - 40) <= 3 && dG.thumb.l - thumb0L < stepPx - 4,
+      Math.abs(dG.thumb.l - dG0.thumb.l - dz) <= 3 && dG.thumb.l - thumb0L < stepPx - 1,
       '冻结在 ' + px1(dG0.thumb.l - thumb0L) + 'px（应在 8~' + px1(stepPx - 8) +
-      ' 之间）→ 再跟手 ' + px1(dG.thumb.l - dG0.thumb.l) + 'px / 手指 40px，且仍没到终点');
+      ' 之间，离夹取端 ' + px1(roomPx) + 'px）→ 再跟手 ' + px1(dG.thumb.l - dG0.thumb.l) +
+      'px / 手指 ' + px1(dz) + 'px，且仍没到终点（终点 ' + px1(stepPx) + '）');
 await page.mouse.up();
 await page.waitForTimeout(1100);
 const dG2 = await dragGeo();
@@ -528,6 +575,17 @@ await shot('light', 'me', '浅色_我选中.png');
 await shot('dark', 'me', '深色_我选中.png');
 await shot('dark', 'print', '深色_打印选中.png');
 
+/* 深色模式实测：滑块必须变成黑玻璃（静态 CSS 对了也可能被别的规则盖掉） */
+const darkPillRt = await page.evaluate(() => {
+  const p = document.getElementById('tabPill');
+  if (!p) return { img: '', nums: [] };
+  const img = getComputedStyle(p).backgroundImage;
+  return { img, nums: (img.match(/\d+/g) || []).slice(0, 3).map(Number) };
+});
+check('★ 深色模式实测：滑块背景三通道都 < 80（黑玻璃，不是白药丸）',
+      darkPillRt.nums.length >= 3 && darkPillRt.nums.every((n) => n < 80),
+      'bg=' + String(darkPillRt.img).replace(/\s+/g, ' ').slice(0, 90));
+
 /* 拖动中的两张：整条栏错开 + 药丸在手指下（静态图看不出这个，必须留证据） */
 await page.evaluate(() => switchTab('print'));
 await page.waitForTimeout(700);
@@ -549,6 +607,21 @@ await page.screenshot({ path: SHOTS + '/拖动中_左越界.png', clip: { x: 0, 
 console.log('  · 拖动中_左越界.png');
 await page.mouse.up();
 await page.waitForTimeout(480);
+
+/* 按住瞬间：整条栏下沉（船式起伏的第一拍），松手后应当弹回原尺寸 */
+await page.evaluate(() => {
+  localStorage.setItem('hn_theme_mode', 'light');
+  if (typeof applyTheme === 'function') applyTheme('light', { skipServer: true });
+});
+await page.evaluate(() => switchTab('print'));
+await page.waitForTimeout(700);
+await page.mouse.move(cx0, cy);
+await page.mouse.down();
+await page.waitForTimeout(180);
+await page.screenshot({ path: SHOTS + '/按下_船式起伏.png', clip: { x: 0, y: 640, width: 360, height: 160 } });
+console.log('  · 按下_船式起伏.png');
+await page.mouse.up();
+await page.waitForTimeout(700);
 
 check('全程没有打到生产接口（只访问本地桩）', foreign.length === 0, foreign.slice(0, 3).join(' | '));
 

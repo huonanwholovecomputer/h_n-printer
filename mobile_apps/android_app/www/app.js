@@ -1055,7 +1055,8 @@ let _tabQueuedTab = '';      // 转场途中松手想去别的格：等这一趟
 let _viewTransition = false;
 
 /* ── 玻璃滑块（APP 2026-11-16）─────────────────────────────────────────
-   #tabThumb 只做位移（CSS transition 320ms），#tabPill 只做 scaleX（goo 340ms）。
+   #tabThumb 只做位移；#tabPill 是一块硬质玻璃 —— 不缩放、不拉伸（2026-11-16 第五轮，
+   用户口径「滑块不需要有弹性，要硬质玻璃的感觉」）。
    两层必须是两个元素：合到一个元素上时位移与缩放两条插值互相拉扯，滑块会被
    拉成畸形（demo 的硬结论）。拖动见下面「拖动 / 按下反馈」：手势只绑 #tabBar，
    页面里的横滑手势挂在滚动内容上，两者不抢；转场进行中也能起手（2026-11-16 第三轮）。 */
@@ -1080,12 +1081,6 @@ function slideTabThumb(index) {
   const from = currentTabThumbIndex();
   thumb.setAttribute('data-i', String(index));
   thumb.style.setProperty('--tab-i', String(index));
-  const pill = document.getElementById('tabPill');
-  if (pill && index !== from) {
-    pill.classList.remove('goo');
-    void pill.offsetWidth;   // 强制重排，同一首屏连点也能重播动画
-    pill.classList.add('goo');
-  }
 }
 
 // 整排起伏：逐格错开 26ms，点任意 tab 都放一次
@@ -1148,6 +1143,25 @@ const TAB_PILL_OVER = 0.028;   // 药丸越界最多再走 0.028 格（≈4px，
 let _tabDrag = null;
 let _tabSuppressClickUntil = 0;
 
+// 船式起伏（2026-11-16 第六轮，用户原话「整个 tab 受到点击或滑动时，都会有微微缩小和放大的
+// 弹簧效果，参考个人网站荣誉证书的点击缩小放大动画」）：按住时整条栏下沉，松手弹回并过冲。
+// 这一层只管**整条栏**；格子自己的 .press / .rebound（图标）保持原样，两层叠起来才像一块
+// 被按在桌面上的硬玻璃。scale 走 CSS 独立属性，和 --tab-bar-dx 的 transform 互不覆盖。
+let _tabBoatTimer = 0;
+function _tabBoatDown(bar) {
+  if (!bar) return;
+  clearTimeout(_tabBoatTimer);
+  bar.classList.remove('boat-up');
+  bar.classList.add('boat');
+}
+function _tabBoatUp(bar) {
+  if (!bar || !bar.classList.contains('boat')) return;
+  bar.classList.remove('boat');
+  bar.classList.add('boat-up');
+  clearTimeout(_tabBoatTimer);
+  _tabBoatTimer = setTimeout(() => bar.classList.remove('boat-up'), 620);
+}
+
 function _tabStep(bar) {
   const items = [...bar.querySelectorAll('.tab-item')];
   if (items.length < 2) return 0;
@@ -1177,6 +1191,7 @@ function _tabDragStart(e) {
   const step = _tabStep(bar);
   if (!step) return;
   bar.classList.remove('settling');   // 上一次松手的回弹还没收完就接下一次拖
+  _tabBoatDown(bar);                  // 按下去整条栏先沉一下（随后才可能是拖动）
   // 关键：转场（switchTab 的 480ms 平铺推拉、或滑块的 320ms 归位）途中也允许起手 ——
   // 直接把药丸冻在当前视觉位置，接着跟手；页面转场该怎么走还怎么走，松手时再按位置决定
   const thumb = document.getElementById('tabThumb');
@@ -1233,13 +1248,6 @@ function _tabDragMove(e) {
   const frac = Math.max(-TAB_PILL_OVER, Math.min(d.max + TAB_PILL_OVER, fracRaw));
   const thumb = document.getElementById('tabThumb');
   thumb.style.setProperty('--tab-i', String(frac));
-  // 形变层：离最近格子越远拉得越长；越界时按越界量拉（origin 朝栏内，别把拉伸甩到栏外）
-  const dist = Math.min(1, Math.abs(damped - Math.round(damped)) * 2);
-  const overStretch = Math.min(0.12, Math.abs(overPx) / d.step * 0.6);
-  bar.style.setProperty('--pill-scale', (1 + Math.max(0.12 * dist, overStretch)).toFixed(3));
-  // 只写 x：CSS 里已经是 var(--pill-origin, 50%) 50%，多写一个 y 会变成三值、
-  // 整条声明被丢弃 → origin 退回 50% 50%，拉伸就朝两边甩出栏外
-  bar.style.setProperty('--pill-origin', raw < 0 || (raw <= d.max && dx >= 0) ? '0%' : '100%');
 }
 
 function _tabDragEnd(ev, silent) {
@@ -1248,6 +1256,7 @@ function _tabDragEnd(ev, silent) {
   _tabDrag = null;
   const bar = document.getElementById('tabBar');
   if (!bar) return;
+  _tabBoatUp(bar);                    // 松手：整条栏弹簧回弹（点按与拖动同一口径）
   try { bar.releasePointerCapture(d.id); } catch (err) { /* 没抓住过就算了 */ }
   if (d.item) d.item.classList.remove('press');
   const thumb = document.getElementById('tabThumb');
@@ -1273,8 +1282,6 @@ function _tabDragEnd(ev, silent) {
   bar.classList.add('settling');
   setTimeout(() => bar.classList.remove('settling'), 360);
   bar.style.removeProperty('--tab-bar-dx');
-  bar.style.removeProperty('--pill-scale');
-  bar.style.removeProperty('--pill-origin');
   _tabQueuedTab = '';      // 手指位置才是权威：排队里那趟作废，下面按 target 重新决定
   restoreThumb();   // 药丸重新拿回 CSS 过渡：从松手位置滑向目标格
   const targetTab = items[target] ? items[target].dataset.tab : '';

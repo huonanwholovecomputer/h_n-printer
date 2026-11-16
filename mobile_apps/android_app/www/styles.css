@@ -1522,6 +1522,26 @@ body {
     inset 0 -0.12cqw 0 rgba(0, 0, 0, 0.04),
     0 0 0 0.06cqw rgba(0, 0, 0, 0.04);
   z-index: 9999;
+  /* 船式起伏（2026-11-16 第六轮）：整条栏像一块硬玻璃，按下去整体下沉 3.5%，
+     松手弹回并轻微过冲 —— 参个人网站证书 .cert-paper__stack.is-pressed 的
+     「按下 110ms 缩到 .965、抬手回弹」。
+     用独立的 scale 属性而**不是** transform：transform 已被 --tab-bar-dx 的拖动
+     位移占用，两者写在一起会互相覆盖；独立属性与 transform 相乘，正好叠加。 */
+  scale: var(--tab-boat, 1);
+  transition: scale 110ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 按住（点击或起手拖动）：整条栏压到 0.965 —— 和网站证书那一下同一个数 */
+.tab-bar.boat { --tab-boat: 0.965; }
+
+/* 松手：弹簧回弹，40% 处过冲到 1.012 再落回 1（cubic-bezier 的过冲在这条上会重复放大，
+   所以用 keyframes 明确写峰值，比纯 transition 更好控） */
+.tab-bar.boat-up { animation: tabBarBoat 560ms cubic-bezier(0.34, 1.56, 0.64, 1) both; }
+
+@keyframes tabBarBoat {
+  0% { scale: 0.965; }
+  42% { scale: 1.012; }
+  100% { scale: 1; }
 }
 
 .tab-bar.border-hidden {
@@ -1529,9 +1549,9 @@ body {
 }
 
 /* ── 玻璃滑块（APP 2026-11-16；小程序 custom-tab-bar 暂未同步）──
-   位移层 .tab-thumb 只做 translate，形变层 .tab-pill 只做 scaleX。
-   两层必须是两个元素：合到一个元素上时 transform 的位移与 scale 两条插值
-   互相拉扯，滑块会被拉成畸形（demo 的硬结论，别合并）。
+   位移层 .tab-thumb 只做 translate；.tab-pill 只是块玻璃底板，不缩放不拉伸
+   —— 用户口径（2026-11-16 第五轮）：「滑块不需要有弹性，给人硬质玻璃的感觉」。
+   两层仍是两个元素（位移与形变各归各的，别再合并回去）。
    位移用 --tab-i（格子序号 0/1）驱动：步长 = 自身宽度 + 2×左右内缩，
    所以药丸永远居中在格子正中，栏宽变化（cqw）自动跟着走。 */
 .tab-thumb {
@@ -1544,7 +1564,8 @@ body {
   /* 写法保持「数 × 长度」而不是「长度 × 数」：老 WebView（Chrome 80 系）只认前者。
      --tab-i 允许小数（拖动跟手时是格与格之间的插值），整数只是它的特例。 */
   transform: translate3d(calc((100% + 2.4cqw) * var(--tab-i, 0)), 0, 0);
-  transition: transform 320ms cubic-bezier(0.4, 0, 0.2, 1);
+  /* 硬质：260ms 起步快、末段收得干净，全程不冲过头（没有 1.56 那种回弹曲线） */
+  transition: transform 260ms cubic-bezier(0.2, 0, 0, 1);
   will-change: transform;
   pointer-events: none;
   z-index: 1;
@@ -1575,15 +1596,24 @@ body {
   opacity: 0.7;
 }
 
-/* 形变：跨格时沿运动方向轻微拉长再收回（340ms） */
-.tab-pill.goo {
-  animation: tabPillGoo 340ms cubic-bezier(0.22, 1, 0.36, 1);
+/* 深色主题：滑块是一块「黑玻璃」，压在 12% 白的栏体上 */
+.theme-dark .tab-pill {
+  background: linear-gradient(180deg, rgba(42, 42, 45, 0.96), rgba(12, 12, 14, 0.94));
+  box-shadow:
+    0 0.48cqw 1.92cqw rgba(0, 0, 0, 0.55),
+    0 0.12cqw 0.36cqw rgba(0, 0, 0, 0.4),
+    inset 0 0.12cqw 0.12cqw rgba(255, 255, 255, 0.16),
+    0 0 0 0.06cqw rgba(255, 255, 255, 0.12);
 }
 
-@keyframes tabPillGoo {
-  0%   { transform: scaleX(1); }
-  34%  { transform: scaleX(1.14); }
-  100% { transform: scaleX(1); }
+.theme-dark .tab-pill-gloss {
+  background: radial-gradient(120% 90% at 30% 12%, rgba(255, 255, 255, 0.55), rgba(255, 255, 255, 0) 60%);
+  opacity: 0.22;
+}
+
+/* 黑底上系统蓝偏暗，选中文字提亮一档 */
+.theme-dark .text-active {
+  color: #0A84FF;
 }
 
 /* 整排起伏：点任意 tab 都放一次，逐格错开 26ms（延迟由 app.js 写到 animation-delay） */
@@ -1624,9 +1654,9 @@ body {
 }
 
 /* 拖动与按下反馈（APP 2026-11-16 第二轮，第三轮改为整条栏位移）：
-   手在栏体上左右拖 → 位移层跟手（.dragging 关掉 320ms 过渡），**整条悬浮栏**按 --tab-bar-dx
-   朝拖动方向错开（最大 10px，内部图标相对栏体不动），形变层按行程 scaleX、origin 落在来向一侧。
-   松手过半格由 switchTab 接管（320ms 归位 + goo + wave + bump），没过半格自己弹回。
+   手在栏体上左右拖 → 位移层跟手（.dragging 关掉过渡），**整条悬浮栏**按 --tab-bar-dx
+   朝拖动方向错开（最大 10px，内部图标相对栏体不动）；药丸只平移，宽度全程不变（硬质玻璃）。
+   松手过半格由 switchTab 接管（260ms 归位 + wave + bump），没过半格按 220ms 直线滑回。
    点按格子先压 0.92（.press），松手船式回弹（.rebound，420ms 带 1.045 过冲）。 */
 .tab-bar {
   touch-action: none;
@@ -1636,19 +1666,16 @@ body {
 /* 图标是 <img>：Chrome 默认允许「拖图片」，一拖就发 pointercancel，手势当场断掉 */
 .tab-bar img { -webkit-user-drag: none; user-drag: none; }
 .tab-bar.dragging .tab-thumb { transition: none; }
-.tab-bar.dragging .tab-pill {
-  transform: scaleX(var(--pill-scale, 1));
-  transform-origin: var(--pill-origin, 50%) 50%;
-  transition: none;
-}
+.tab-bar.dragging .tab-pill { transition: none; }
 /* 整条栏跟着走（不是内部图标各自平移）：位移量由 JS 夹在 ±10px */
 .tab-bar.dragging {
   transform: translate3d(var(--tab-bar-dx, 0px), 0, 0);
-  transition: none;
+  /* 只封 transform 的过渡（拖动要 1:1 跟手）；scale 的 110ms 下沉仍然要走 */
+  transition: scale 110ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 .tab-bar.settling {
   transform: translate3d(0, 0, 0);
-  transition: transform 340ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  transition: transform 220ms cubic-bezier(0.2, 0, 0, 1), scale 110ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 .tab-item.press {
   transition: transform 90ms cubic-bezier(0.4, 0, 0.2, 1);
