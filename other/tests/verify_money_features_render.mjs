@@ -71,7 +71,9 @@ const STORE = {
       /* 11 月：只为让月份下拉里有 11 月 */
       { id: 'e4', date: '2026-11-02', item: '11月A4纸', kind: 'paper', units: 500, amount: 50, payer: 'ma' },
     ],
-    income: [], scores: [], transfers: [],
+    /* 2026-11-15：代收收入去掉了日期列（记录归属当前结算月），留一条记录验渲染 */
+    income: [{ id: 'i1', date: '2026-10-22', memberId: 'ma', amount: 377.6 }],
+    scores: [], transfers: [],
   },
   notes: {}, meta: { version: 1 },
 };
@@ -306,14 +308,19 @@ chk('A8 用量接口带上了 status 参数（否则拉不到「已取消/放弃
 /* 长期耗材摊销（需求 A 的展示层） */
 chk('A9 摊销表头新增「所属打印机」列', snap.amThs.indexOf('所属打印机') >= 0, JSON.stringify(snap.amThs));
 const tonerRow = snap.amRows.find((r) => r[0] && r[0].indexOf('硒鼓') >= 0) || [];
-chk('A10 硒鼓行的归属格写明「🖨 HP LaserJet MFP M232-M237 / 按该机本月 4 页摊」',
-    (tonerRow[1] || '').indexOf('HP LaserJet MFP M232-M237') >= 0 && (tonerRow[1] || '').indexOf('按该机本月 4 页摊') >= 0,
+/* 2026-11-15 口径变更：硒鼓页数 = 该机出纸页数 + 「打印失败」单没打出来的页数。
+   本夹具里 M232 10 月 sent 2 单共 4 页，另有一单 failed（total_pages 10）⇒ 4 + 10 = 14 页。 */
+chk('A10 硒鼓行的归属格写明「🖨 HP LaserJet MFP M232-M237 / 按该机本月 14 页摊（4 出纸 + 10 失败磨损）」',
+    (tonerRow[1] || '').indexOf('HP LaserJet MFP M232-M237') >= 0 && (tonerRow[1] || '').indexOf('按该机本月 14 页摊') >= 0,
     JSON.stringify(tonerRow.slice(0, 2)));
-chk('A11 本月摊销按「这台机 4 页」算：¥128.98 × 4 / 3000 = ¥0.17',
-    (tonerRow[8] || '').indexOf('0.17') >= 0, tonerRow[8]);
+chk('A11 本月摊销按「这台机 14 页」算：¥128.98 × 14 / 3000 = ¥0.60',
+    (tonerRow[8] || '').indexOf('0.60') >= 0, tonerRow[8]);
 chk('A12 摊销行文案写明按哪台机摊',
-    (await page.evaluate(() => document.body.innerText)).indexOf('硒鼓摊销（按 HP LaserJet MFP M232-M237 本月 4 页）') >= 0,
+    (await page.evaluate(() => document.body.innerText)).indexOf('硒鼓摊销（按 HP LaserJet MFP M232-M237 本月 14 页）') >= 0,
     '未在页面文案里找到按机摊销行');
+chk('A12b 摊销区块明说这段页数含失败单磨损（10 页）且取消/放弃不计',
+    (await page.evaluate(() => document.body.innerText)).indexOf('本月另有 10 页来自没打出来的失败单') >= 0,
+    '未找到失败单磨损提示行');
 const paperRow = snap.amRows.find((r) => r[0] && r[0].indexOf('A4纸') >= 0) || [];
 chk('A13 A4纸行仍按全队用纸量摊（不被打印机归属污染）',
     (paperRow[1] || '').indexOf('A4纸按全队') >= 0, JSON.stringify(paperRow.slice(0, 2)));
@@ -479,6 +486,45 @@ chk('D4 切回 10 月：李四的人工值 8 还在（按月存，不串月）',
     JSON.stringify(rowOf(snap, '李四')));
 
 await page.screenshot({ path: path.join(OUT_DIR, 'D_切换月份_' + STAMP + '.png'), fullPage: true });
+
+/* ══════════════════════════════════════════════════════════════
+   F. 代收收入：日期列已删，改成与「服务贡献评分」一致的左右两列
+   （2026-11-15 用户要求：「日期是没有价值的，直接删掉日期一列，
+     然后改为服务贡献评分这里的这种两侧对齐的布局」）
+   ══════════════════════════════════════════════════════════════ */
+console.log('\n════ F. 代收收入两列布局 ════');
+await goTab('entry');
+await page.waitForTimeout(800);
+const inc = await page.evaluate(() => {
+  const secs = [...document.querySelectorAll('.section')];
+  const sec = secs.find((s) => { const h = s.querySelector('h2'); return h && h.textContent.indexOf('代收收入') >= 0; });
+  if (!sec) return { found: false };
+  const ths = [...sec.querySelectorAll('thead th')].map((t) => t.textContent.trim());
+  const rows = [...sec.querySelectorAll('tbody tr')].map((tr) => ({
+    tags: [...tr.querySelectorAll('select,input')].map((e) => e.tagName.toLowerCase()),
+    amountType: (tr.querySelector('input[type=number]') || {}).type || '',
+    amount: (tr.querySelector('input[type=number]') || {}).value || '',
+  }));
+  return { found: true, ths, dateInputs: sec.querySelectorAll('input[type=date]').length, rows };
+});
+chk('F1 代收收入区块仍存在', !!inc.found);
+chk('F2 日期列已删除：表头只有「成员 / 金额（元） / 删除」',
+    inc.found && inc.ths.length === 3 && inc.ths[0] === '成员' && inc.ths[1] === '金额（元）'
+    && inc.ths.indexOf('日期') < 0, JSON.stringify(inc.ths));
+chk('F3 区块内一个日期输入框都没有（记录归属当前结算月）', inc.dateInputs === 0, String(inc.dateInputs));
+chk('F4 每行只有「成员下拉 + 金额输入」两个控件（左右两列，和评分表同构）',
+    inc.rows.length === 1 && inc.rows[0].tags.length === 2
+    && inc.rows[0].tags[0] === 'select' && inc.rows[0].amountType === 'number',
+    JSON.stringify(inc.rows));
+chk('F5 金额读数仍是那条记录（377.6）', inc.rows.length === 1 && inc.rows[0].amount === '377.6',
+    JSON.stringify(inc.rows[0] && inc.rows[0].amount));
+await page.evaluate(() => {
+  const secs = [...document.querySelectorAll('.section')];
+  const sec = secs.find((s) => { const h = s.querySelector('h2'); return h && h.textContent.indexOf('代收收入') >= 0; });
+  if (sec) sec.scrollIntoView();
+});
+await page.waitForTimeout(300);
+await page.screenshot({ path: path.join(OUT_DIR, 'F_代收收入两列布局_' + STAMP + '.png'), fullPage: true });
 
 chk('E1 全流程无 JS 报错', pageErrors.length === 0, JSON.stringify(pageErrors));
 chk('E2 全流程无外网请求', externalReq.length === 0, JSON.stringify(externalReq.slice(0, 3)));

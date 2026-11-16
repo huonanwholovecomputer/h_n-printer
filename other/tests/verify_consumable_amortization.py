@@ -83,6 +83,17 @@ check("逐日 FIFO：同一类型按采购日期排队、每天用量先喂最�
       and "var take = Math.min(lot.remaining, need);" in src)
 check("采购日之前不算这批的用量（逐日过滤）",
       "var days = Object.keys(dayMap).filter(function (d) { return d >= firstDate; }).sort();" in src)
+check("硒鼓磨损：失败单没打出来的页数单独记（pagesByDayWear / pagesByDayPrinterWear），取消 / 放弃不计",
+      "if (ost === 'failed' && (fst === 'failed' || fst === 'timeout')) wearPages += _filePagesOf(f);" in src
+      and "wearPages: wearPages," in src
+      and "var wearPages = nu.wearPages || 0;" in src
+      and "pagesByDayWear: {}, pagesByDayPrinterWear: {}," in src
+      and "u.pagesByDayPrinterWear[wk] = (u.pagesByDayPrinterWear[wk] || 0) + wearPages;" in src)
+check("硒鼓摊销把磨损页数并进逐日用量（只对 toner；A4纸张数口径不动）",
+      "if (kind === 'toner') {" in src
+      and "var wear = printerId ? (u.pagesByDayPrinterWear || {}) : (u.pagesByDayWear || {});" in src)
+check("摊销区块明说「打印失败单的磨损」（取消 / 放弃不计）",
+      "硒鼓页数含「打印失败」单的磨损" in src)
 check("每月金额 = 累计取整差（Σ各月恰好 = 采购价，不逐月四舍五入漂移）",
       "var cents = Math.round(lot.priceCents * cum / lot.units);" in src
       and "lot.months[mk] = { units: lot.perMonth[mk] || 0, cents: cents - prevCents, cumUnits: cum };" in src)
@@ -575,6 +586,60 @@ function runCases() {
   P('B12 11 月的采购支出 = 本月摊销 ¥50.00（整笔 ¥100 不在 11 月）', r11.totalExp === 5000, String(r11.totalExp));
 }
 
+/* ═════ B13：硒鼓磨损 —— 「打印失败」单没打出来的页数也算（2026-11-15 用户口径） ═════
+   用户原话：「把失败单的页数也算进硒鼓磨损（鼓确实被磨了，只是没出合格纸），
+   取消的和放弃的这种不需要管」。 */
+{
+  const sb = calcSandbox(js);
+  const WEAR_ORDERS = [
+    /* 正常单：sent 4 页 —— 只进正常用量 */
+    { created_at: '2026-11-13 09:00:00', mid: 'ma', files: [{ status: 'sent', total_pages: 4 }] },
+    /* 失败单：failed 子文件 6 页（试过、没成）+ queued 2 页（还没进打印，不算） */
+    { created_at: '2026-11-13 10:00:00', mid: 'ma', status: 'failed', files: [
+      { status: 'failed', total_pages: 6 }, { status: 'queued', total_pages: 2 }] },
+    /* 取消 / 放弃：一律不计磨损（可能压根没进纸） */
+    { created_at: '2026-11-13 11:00:00', mid: 'ma', status: 'canceled', files: [{ status: 'failed', total_pages: 30 }] },
+    { created_at: '2026-11-13 12:00:00', mid: 'ma', status: 'abandoned', files: [{ status: 'failed', total_pages: 40 }] },
+  ];
+  const u = sb._usageFromOrders(WEAR_ORDERS);
+  P('B13 磨损不顶高正常用量 KPI：pages 仍只算 sent（4 页）', u.pages === 4, JSON.stringify({ pages: u.pages }));
+  P('B13 失败单没打出来的 6 页进磨损（queued 不算；取消 / 放弃的 30+40 页也不算）',
+    u.pagesByDayWear['2026-11-13'] === 6, JSON.stringify(u.pagesByDayWear));
+
+  /* 100 元 / 1000 页 = 10 分/页 ⇒ 正常 4 + 磨损 6 = 10 页 ⇒ ¥1.00 */
+  const um = { '2026-11': { pagesByDay: u.pagesByDay, pagesByDayWear: u.pagesByDayWear,
+                            pagesByDayPrinter: u.pagesByDayPrinter,
+                            pagesByDayPrinterWear: u.pagesByDayPrinterWear,
+                            sheetsByDay: {} } };
+  const eWear = { id: 'e1', kind: 'toner', date: '2026-11-13', item: '硒鼓', amount: 100, units: 1000, payer: 'ma' };
+  const am = sb.consumableAmort([eWear], um, '2026-11');
+  P('B13 硒鼓摊销吃「正常 4 页 + 失败磨损 6 页」= 10 页 ⇒ 本月 ¥1.00',
+    am.rows.length === 1 && am.rows[0].units === 10 && am.rows[0].cents === 100, JSON.stringify(am.rows));
+  const eWear2 = Object.assign({}, eWear, { id: 'e2', date: '2026-11-14' });
+  const am2 = sb.consumableAmort([eWear2], um, '2026-11');
+  P('B13 磨损页数同样只算采购日之后：11-14 买的鼓不吃 11-13 的磨损',
+    am2.rows.length === 0, JSON.stringify(am2.rows));
+
+  /* 逐机表：printerForOrder 由测试桩指定（真实世界由设备绑定决定） */
+  const sb2 = calcSandbox(js);
+  sb2.printerForOrder = function () { return { id: 'p1', name: 'HP LaserJet 1020' }; };
+  const u2 = sb2._usageFromOrders(WEAR_ORDERS);
+  P('B13 逐机磨损表按 printerForOrder 归属（p1|2026-11-13 = 6 页）',
+    u2.pagesByDayPrinterWear['p1|2026-11-13'] === 6, JSON.stringify(u2.pagesByDayPrinterWear));
+
+  /* 区块要把这块页数说出来，别让人对着「本月 N 页」跟用量统计对不上。
+     ⚠ 区块读的是缓存读取器 usageOfMonth()（沙箱里是桩，恒 null）—— 这里按真身口径喂一份。 */
+  sb.STORE = store2({ expenses: [eWear] });
+  const mWear = sb.monthFromRecords('2026-11');
+  sb.usageOfMonth = function () { return { pagesByDayWear: { '2026-11-13': 6 }, sheetsByDay: {} }; };
+  const amWear = sb.consumableAmort([eWear], um, '2026-11');
+  amWear.state = 'ready';
+  const rWear = sb.calcMonth(mWear, { usage: usageOf({}), amort: amWear });
+  const hWear = sb.consumableAmortSectionHTML(rWear, mWear);
+  P('B13 摊销区块明说「硒鼓页数含打印失败单的磨损」，并点名取消 / 放弃不计',
+    hWear.indexOf('硒鼓页数含「打印失败」单的磨损') >= 0 && hWear.indexOf('取消 / 放弃') >= 0, hWear.slice(0, 300));
+}
+
 }
 try { runCases(); } catch (e) { P('B 组用例中断（异常本身即失败）', false, e && (e.message || String(e))); }
 
@@ -621,6 +686,15 @@ MUTANTS = [
     ("不封顶（用超库存也继续摊）",
      "var take = Math.min(lot.remaining, need);",
      "var take = need;"),
+    ("失败单的磨损页数不计入硒鼓（回到只算 sent）",
+     "if (ost === 'failed' && (fst === 'failed' || fst === 'timeout')) wearPages += _filePagesOf(f);",
+     "if (false) wearPages += _filePagesOf(f);"),
+    ("取消 / 放弃的单也算磨损（用户明确要求不算）",
+     "if (ost === 'failed' && (fst === 'failed' || fst === 'timeout')) wearPages += _filePagesOf(f);",
+     "if ((ost === 'failed' || ost === 'canceled' || ost === 'abandoned') && (fst === 'failed' || fst === 'timeout')) wearPages += _filePagesOf(f);"),
+    ("硒鼓摊销不再并入磨损页数",
+     "if (kind === 'toner') {\n        var wear = printerId",
+     "if (false) {\n        var wear = printerId"),
 ]
 for idx, (name, old, new) in enumerate(MUTANTS):
     if old not in src:

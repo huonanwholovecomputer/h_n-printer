@@ -2139,7 +2139,18 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             self._send_json({"success": True, "cloud": False, "message": "未配置云端地址"})
             return
         try:
-            resp = _get_proxy_session().get(f"{self.api_url}/api/ping", timeout=_PROXY_TIMEOUT)
+            # v7.23：健康探测**不复用连接池里的空闲连接**（Connection: close）。
+            # 页面每 30s 拨一次 /api/health，而 nginx keepalive_timeout 也正好是 30s：
+            # 池里那条连接的空闲时长恰好撞上服务端回收时限，nginx 已单向关闭时客户端
+            # 还在往上写，urllib3 读到 b'' 就抛 RemoteDisconnected（WARNING），随后重试
+            # 换一条新连接才 200 —— 功能没事，但每半小时就在控制台刷几条误导性告警。
+            # 探测频率只有 1 次 / 30s，每次重建 TLS 的代价可忽略；关连接后既不会留下
+            # 可被回收的空闲连接，也不会再出现"重试成功"的假故障。重试本身保留。
+            resp = _get_proxy_session().get(
+                f"{self.api_url}/api/ping",
+                timeout=_PROXY_TIMEOUT,
+                headers={"Connection": "close"},
+            )
             if resp.status_code == 200:
                 self._send_json({"success": True, "cloud": True})
             else:
@@ -2565,6 +2576,9 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                     "created_at": created_at or "",
                     "total_page_count": total_page_count,
                     "total_sheet_count": total_sheet_count,
+                    # v7.24：与云端 revenue 同构 —— 订单明细表的「文件」列直接读 files_count，
+                    # 本地单此前缺这个键 ⇒ 离线模式整列显示 undefined（云端接口 app.py 一直有）。
+                    "files_count": len(files),
                     "owner_name": owner_name or "",
                     "is_admin_print": bool(is_admin_print),
                     "source": "local",

@@ -201,7 +201,7 @@ main { max-width: var(--content-max); margin: 0 auto; padding: 20px 20px 60px; }
 table { width: 100%; border-collapse: collapse; font-size: .86rem; }
 th, td { padding: 10px 14px; text-align: center; border-bottom: 1px solid var(--border); }
 th { background: var(--card-2); font-weight: 600; font-size: .8rem; color: var(--muted); }
-td.l { text-align: left; }
+td.l, th.l { text-align: left; }   /* 表头也跟着左对齐：评分表的「评分项目」、代收收入的「成员」才不会悬在中间 */
 /* 采购表的「数量」格（v7.9）：单价 / 「填数量后按月摊销」那行小字**不参与行高**。
    2026-10-27 现场：黄字让「数量」格比同行其它格高出 13px，整格垂直居中时输入框被顶上去，
    与 日期 / 金额 / 代付人 那一排看得见的错位（用户截图框住的正是这里）。
@@ -2269,6 +2269,22 @@ function consumableAmort(purchases, usageByMonth, targetKey) {
         var raw = u[CONSUMABLE_KIND[kind].field] || {};
         Object.keys(raw).forEach(function (d1) { dm[d1] = (+raw[d1] || 0); });
       }
+      /* 2026-11-15：硒鼓还要吃「打印失败」单的磨损页数（_usageFromOrders 的 pagesByDayWear /
+         pagesByDayPrinterWear）。只对 toner 生效；A4纸 的张数口径不动。
+         取消 / 放弃 / 被打回的单不在那两张表里（判据在 _usageFromOrders）。 */
+      if (kind === 'toner') {
+        var wear = printerId ? (u.pagesByDayPrinterWear || {}) : (u.pagesByDayWear || {});
+        Object.keys(wear).forEach(function (k) {
+          var d2 = k;
+          if (printerId) {
+            var bar2 = k.indexOf('|');
+            if (bar2 <= 0 || k.slice(0, bar2) !== printerId) return;
+            d2 = k.slice(bar2 + 1);
+          }
+          if (monthKeyOf(d2) !== mk) return;
+          dm[d2] = (dm[d2] || 0) + (+wear[k] || 0);
+        });
+      }
       Object.keys(dm).forEach(function (d) {
         if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
         var n = Math.max(0, Math.round(+dm[d] || 0));
@@ -3408,7 +3424,9 @@ function _statusGroups(st) {
   st = st || {};
   var done = st.sent || 0;
   var printingNow = st.printing || 0;
-  var pending = (st.queued || 0) + (st.scheduled || 0) + (st.waiting || 0) + (st.downloading || 0) + (st.accepted || 0) + (st.reserved || 0);
+  /* v7.24：⏳ 离线未同步必须落在「进行中/待处理」里 —— 它既不是完成、也不是异常/取消，
+     漏掉会让「完成率 = done / (总数 - 取消)」凭空变成 100%（环形图明明还有一块未同步）。 */
+  var pending = (st.queued || 0) + (st.scheduled || 0) + (st.waiting || 0) + (st.downloading || 0) + (st.accepted || 0) + (st.reserved || 0) + (st.unsynced || 0);
   var working = printingNow + pending;
   var abnormal = (st.failed || 0) + (st.rejected || 0) + (st.abandoned || 0) + (st.offline_unknown || 0)
     + (st.timeout || 0) + (st.unsynced_rejected || 0);
@@ -6571,6 +6589,10 @@ function _usageEmpty(key) {
            pagesByDay: {}, sheetsByDay: {}, undatedPages: 0, undatedSheets: 0,
            unmatchedPrinterPages: 0, unattributedPages: 0, fetchedAt: '',
            pagesByDayPrinter: {}, sheetsByMember: {}, unattributedSheets: 0,
+           /* 2026-11-15：硒鼓「磨损页数」——只给「打印失败」的单补记（取消/放弃不算）。
+              与 pagesByDay / pagesByDayPrinter 分开存，免得把用量统计的 KPI 顶高；
+              amort 的 toner 分支会把这两张表并进去。 */
+           pagesByDayWear: {}, pagesByDayPrinterWear: {},
            waste: 0, wasteOrders: 0, wasteByMember: {}, wasteUnattributed: 0,
            wasteSheets: {}, wasteTotal: 0, wasteManualCount: 0, wasteUnattributedSheets: 0 };
 }
@@ -6599,14 +6621,23 @@ function _filePagesOf(f) {
    ⚠ 废纸（WASTE_PAPER_STATUSES 的未 sent 子文件）不在这里算：它的判据是另一套，
      且必须在 `excluded` 早退**之前**算完，留在调用处。 */
 function _orderNormalUsage(o) {
-  var pages = 0, sheets = 0, files = 0;
+  var pages = 0, sheets = 0, files = 0, wearPages = 0;
+  var ost = String((o && o.status) || '');
   ((o && o.files) || []).forEach(function (f) {
-    if ((f.status || '') !== 'sent') return;   // 只算真正打出来的子任务
-    pages += _filePagesOf(f);
-    sheets += _fileSheets(f);                  // v7.9：纸张张数（A4纸摊销用）
-    files++;
+    var fst = String((f && f.status) || '');
+    if (fst === 'sent') {                      // 只算真正打出来的子任务
+      pages += _filePagesOf(f);
+      sheets += _fileSheets(f);                // v7.9：纸张张数（A4纸摊销用）
+      files++;
+      return;
+    }
+    /* 2026-11-15 用户口径（原话：「把失败单的页数也算进硒鼓磨损（鼓确实被磨了，只是没出
+       合格纸），取消的和放弃的这种不需要管」）：父订单 failed 里那些「试过、没成」的子文件
+       （status = failed / timeout）照样磨硒鼓 —— 只算页数、只喂硒鼓摊销，
+       不进 pages/sheets KPI，也不进 A4 纸张数。queued / accepted 这类没进打印的不算。 */
+    if (ost === 'failed' && (fst === 'failed' || fst === 'timeout')) wearPages += _filePagesOf(f);
   });
-  return { pages: pages, sheets: sheets, files: files,
+  return { pages: pages, sheets: sheets, files: files, wearPages: wearPages,
            excluded: !!NORMAL_EXCLUDED_STATUSES[String((o && o.status) || '')] };
 }
 /* 订单数组 → 用量结构。打印机的归属统一走 printerForOrder()（绑定设备 → 已知机型 → 单机兜底），
@@ -6638,6 +6669,24 @@ function _usageFromOrders(orders) {
       u.wasteOrders += 1;
       if (mid) u.wasteByMember[mid] = (u.wasteByMember[mid] || 0) + waste;
       else u.wasteUnattributed += waste;
+    }
+    /* 2026-11-15 用户口径（现场原话：「把失败单的页数也算进硒鼓磨损，鼓确实被磨了，
+       只是没出合格纸；取消的和放弃的这种不需要管」）：
+       父订单 failed 里那些**试过但没打出来**的子文件（status = failed / timeout），
+       页数照样磨硒鼓 —— 单独记进 pagesByDayWear / pagesByDayPrinterWear，只喂硒鼓摊销。
+       · 已 sent 的子文件页数已计在正常用量里（这里不再加，避免重复）；
+       · queued / accepted 这类还没进打印的、以及 canceled / abandoned / rejected 一律不算
+         （取消/放弃的单可能压根没进纸）。
+       放在 `if (!pages && !sheets) return;` 之前：失败单通常一个 sent 文件都没有。 */
+    var wearPages = nu.wearPages || 0;   // 判据在 _orderNormalUsage（同一份口径，别在这里再遍历一遍）
+    if (wearPages > 0) {
+      var wday = _fmtDate(o.created_at);
+      if (wday) u.pagesByDayWear[wday] = (u.pagesByDayWear[wday] || 0) + wearPages;
+      var wp = printerForOrder(o);
+      if (wp && wday) {
+        var wk = wp.id + '|' + wday;
+        u.pagesByDayPrinterWear[wk] = (u.pagesByDayPrinterWear[wk] || 0) + wearPages;
+      }
     }
     /* 多取回来的终态单不参与正常用量（见 NORMAL_EXCLUDED_STATUSES 的注释：旧口径零回归） */
     if (nu.excluded) return;
@@ -7070,6 +7119,15 @@ function consumableAmortSectionHTML(r, m) {
             return '<b>' + esc(b.name || pid) + '</b> 本月 ' + fmtInt(b.monthUnits) + ' 页 / ' + RMB(b.monthCents);
           }).join(' · ')
         + '<span style="color:var(--muted)">（硒鼓是按打印机买的：一台机买的鼓只按这台机打的页数摊）</span></div>';
+    }
+    /* 2026-11-15 用户口径：失败单的页数也算进硒鼓磨损。把这块显式说出来，
+       否则「本月 N 页」会跟「用量统计」的页数对不上，像是算错了。 */
+    var _wearMonth = 0;
+    var _wearSrc = ((usageOfMonth(m.key) || {}).pagesByDayWear) || {};
+    Object.keys(_wearSrc).forEach(function (d) { if (monthKeyOf(d) === m.key) _wearMonth += (+_wearSrc[d] || 0); });
+    if (_wearMonth > 0) {
+      h += '<div style="margin-top:6px;font-size:.8rem;color:var(--muted)">🖨 硒鼓页数含「打印失败」单的磨损：本月另有 '
+        + fmtInt(_wearMonth) + ' 页来自没打出来的失败单（<b>取消 / 放弃</b>的单不计）。</div>';
     }
     /* v7.10：单机桶摊不掉 / 机器被删 的两类提示 */
     var _pmNameOf = {};
@@ -8204,20 +8262,23 @@ function renderEntry() {
   });
   h += '</div>';
   var disabledI = unlocked.income ? '' : ' disabled';
-  h += '<div class="table-wrap"><table><thead><tr><th>日期</th><th>成员</th><th>金额（元）</th><th></th></tr></thead><tbody>';
+  /* 2026-11-15 用户要求：代收收入的「日期」没有价值（记录本身就归属当前结算月），
+     删掉日期列，改成与「服务贡献评分」一致的左右两列布局：左侧成员、右侧金额。
+     记录日期仍在数据里（addInc 用 defaultDateFor(currentKey) 定月），只是不再可编辑；
+     月份归属由页面右上角的结算月决定，换月录入即归到那个月。 */
+  h += '<div class="table-wrap"><table><thead><tr><th class="l">成员</th><th>金额（元）</th><th></th></tr></thead><tbody>';
   dIncome.forEach(function (r) {
     var rid = safeId(r.id);
     if (!rid) return;   // 非法 ID 跳过该行（safeId 已 console.warn）
     h += '<tr>';
-    h += '<td><input type="date" value="' + esc(r.date) + '" onchange="updInc(\'' + rid + '\',\'date\',this.value)"' + disabledI + '></td>';
-    h += '<td><select onchange="updInc(\'' + rid + '\',\'memberId\',this.value)"' + disabledI + '>';
+    h += '<td class="l"><select onchange="updInc(\'' + rid + '\',\'memberId\',this.value)" style="width:300px"' + disabledI + '>';
     members.forEach(function (x) { h += '<option value="' + esc(x.id) + '"' + (r.memberId === x.id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; });
     h += '</select></td>';
-    h += '<td><input type="number" step="0.01" min="0" value="' + esc(r.amount) + '" onchange="updInc(\'' + rid + '\',\'amount\',+this.value)"' + disabledI + '></td>';
+    h += '<td><input type="number" step="0.01" min="0" value="' + esc(r.amount) + '" onchange="updInc(\'' + rid + '\',\'amount\',+this.value)" style="width:120px"' + disabledI + '></td>';
     h += '<td><button class="btn danger sm" onclick="delInc(\'' + rid + '\')"' + disabledI + '>✕</button></td>';
     h += '</tr>';
   });
-  if (!dIncome.length) h += '<tr><td colspan="4" style="color:var(--muted)">暂无代收记录</td></tr>';
+  if (!dIncome.length) h += '<tr><td colspan="3" style="color:var(--muted)">暂无代收记录</td></tr>';
   h += '</tbody></table></div>';
   h += '<button class="btn sm" style="margin-top:10px" onclick="addInc()"' + disabledI + '>+ 添加代收记录</button>';
   h += '</div>';
@@ -8509,6 +8570,11 @@ function fetchLocalScopeData(force) {
     .then(function (data) {
       _cloudLoading = false;
       if (data && data.success && data.data) {
+        /* v7.24：老版本后端（≤4.6.13）的 /api/local/orders 不带 files_count ⇒ 明细「文件」列
+           会整列 undefined。页面自己按 files 长度补齐（与云端表同口径），不依赖后端先升级。 */
+        ((data.data.orders) || []).forEach(function (o) {
+          if (o && (o.files_count === undefined || o.files_count === null)) o.files_count = (o.files || []).length;
+        });
         _cloudData = _mergeExternalOrders(data.data, _takePendingExternal(reqKey));
         _scopeCache[reqKey] = _cloudData;
         _scopeFailedKey = null;
@@ -10083,12 +10149,16 @@ function openPrinterSettle(id) {
 function renderAuth() {
   var el = $('#tab-auth');
   if (FINANCE_MODE === 'local') {
-    /* v7.6：打印机台账已搬到「🖨️ 打印机折旧」页（它本来就是本地数据，本地模式在那页照样维护）；
-       本页只剩"云端设备"这一件事 —— 本地模式没有，故整页只给一句说明 + 指路。 */
-    var hl = '<div class="section" style="padding:16px 20px"><div class="empty" style="padding:0"><h3 style="margin-bottom:4px">本地模式</h3>'
-      + '<p style="margin:0;font-size:.84rem;color:var(--muted)">本机信息与设备列表仅云端模式可用；'
-      + '<b>打印机台账 / 折旧 / 订单归属</b>已移到「🖨️ 打印机折旧」页（本地数据，本地模式同样可以维护）。</p></div></div>';
-    el.innerHTML = hl;
+    /* v7.22：本地模式也画「本机设备」卡片 —— /api/local/device 是纯本机快照，离线完全可取。
+       以前整页只有一句说明，离线用户会以为授权页在离线版里"没了"。
+       云端设备列表 / 所有者绑定 / 自动双面能力标注都依赖后端设备注册表 ⇒ 本地模式不画、
+       也不发那两条请求（loadAuthData 里 /api/proxy/printer/devices 会 404/超时）。
+       打印机台账 / 折旧 / 订单归属仍在「🖨️ 打印机折旧」页（本地数据）。 */
+    el.innerHTML = '<div class="section"><h2>💻 本设备 <span class="hint">（本机信息，来自本地打印工具 · 离线可读）</span></h2>'
+      + '<div id="auth-local-device" style="color:var(--muted)">加载中…</div>'
+      + '<div style="margin-top:10px;font-size:.78rem;color:var(--muted)">📡 <b>云端设备列表 / 本设备所有者 / 自动双面能力标注</b>需要云端模式（要连后端设备注册表）；'
+      + '🖨️ <b>打印机台账 / 折旧 / 订单归属</b>在「🖨️ 打印机折旧」页（本地数据，本地模式同样可以维护）。</div></div>';
+    loadLocalDeviceCard();
     return;
   }
   if (!unlocked.auth) {
@@ -10104,6 +10174,34 @@ function renderAuth() {
     + '<div style="margin-top:10px;font-size:.78rem;color:var(--muted)">🖨️ <b>打印机台账 / 折旧 / 订单归属</b>在「🖨️ 打印机折旧」页（独立密码，与授权模块分开）。</div></div>';
   el.innerHTML = h;
   loadAuthData(members);
+}
+
+function loadLocalDeviceCard() {
+  /* 本地模式的「💻 本设备」：只取 /api/local/device（本机快照，无需云端）。
+     接单状态是打印工具向后端确认过的实时值（后端不可达时回退本机快照），所以文案点明"本机快照"。 */
+  var box = $('#auth-local-device');
+  if (!box) return;
+  fetch('/api/local/device', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      var b = $('#auth-local-device');
+      if (!b) return;
+      var dev = res && res.device;
+      if (!dev || !dev.client_id) {
+        b.innerHTML = '<span style="color:var(--muted)">未取到本机设备标识（本机尚未注册 client_id）</span>';
+        return;
+      }
+      var h = '<div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center">';
+      h += '<div><span style="color:var(--muted);font-size:.8rem">计算机名称</span><div style="font-weight:700">' + esc(dev.device_name || dev.client_id) + '</div></div>';
+      h += '<div><span style="color:var(--muted);font-size:.8rem">设备 ID</span><div style="font-family:monospace;font-size:.78rem">' + esc(dev.client_id) + '</div></div>';
+      h += '<div><span style="color:var(--muted);font-size:.8rem">接单状态（本机快照）</span><div>' + (dev.take_orders ? '<span class="tag g">接单中</span>' : '<span class="tag">未接单</span>') + '</div></div>';
+      h += '</div>';
+      b.innerHTML = h;
+    })
+    .catch(function () {
+      var b = $('#auth-local-device');
+      if (b) b.innerHTML = '<span style="color:var(--muted)">本机设备信息获取失败</span>';
+    });
 }
 
 function loadAuthData(members) {
@@ -10532,6 +10630,12 @@ function renderAbout() {
     + '（保留期配额仍按上传者算）。'
     + '③ 只能转给服务器上真实存在的用户；本地任务与外部监视订单没有云端归属，保持只读。'
     + '④ 每次调整都会记下操作人与时间，鼠标悬停用户标签即可看到。</p>' +
+    '<p style="margin-top:10px">v7.22：<b>离线（本地）模式补齐「🔐 授权」页</b> —— '
+    + '① 本地模式不再隐藏「授权」入口，页内新增<b>「💻 本设备」</b>卡片（计算机名称 / 设备 ID / 接单状态，'
+    + '取自本地打印工具的 /api/local/device 快照，完全离线可读）；'
+    + '② 云端设备列表、本设备所有者绑定、自动双面能力标注仍只在云端模式提供（要读后端设备注册表），'
+    + '本地模式不画这两块、也不发对应请求，绝不假装有数据；'
+    + '③ 打印机台账 / 折旧 / 订单归属仍在「🖨️ 打印机折旧」页。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');
@@ -10758,12 +10862,11 @@ function _askOfflineReplay(pending, pendV, curV) {
   $$('#tabNav button').forEach(function (btn) {
     btn.addEventListener('click', function () { switchTab(this.dataset.tab); });
   });
-  // 本地模式：把「云端」页按钮改名为「本地订单」；「授权」模块仅云端模式可用 → 隐藏入口
+  // 本地模式：把「云端」页按钮改名为「本地订单」；「授权」页保留入口，但只显示本机设备信息
+  // （v7.22：离线也能核对本机设备标识。云端设备列表 / 所有者绑定 / 自动双面标注仍要云端模式）
   if (FINANCE_MODE === 'local') {
     var _cloudBtn = document.querySelector('#tabNav button[data-tab="cloud"]');
     if (_cloudBtn) _cloudBtn.innerHTML = '<span class="ico">📡</span>本地订单';
-    var _authBtn = document.querySelector('#tabNav button[data-tab="auth"]');
-    if (_authBtn) _authBtn.style.display = 'none';
   }
   $('#themeToggle').addEventListener('click', cycleThemeMode);
   // 返回顶部：滚动超过 200px 显示，点击平滑回到顶部
