@@ -149,6 +149,8 @@ function runContractTests() {
   const ch = nums ? nums.split(',').slice(0, 3).map((v) => parseInt(v, 10)) : [];
   check('★ 深色模式滑块是黑玻璃（三通道都 < 80）',
         ch.length === 3 && ch.every((v) => v < 80), ch.join(','));
+  check('★ 选中态的淡蓝底不再铺在图标上（底衬交给药丸；这条同时能识别「工具还在用旧 wxss」）',
+        /\.icon-active \{\s*background-color: transparent;/.test(wxss));
   check('★ 整排 wave：两格 stagger 26ms',
         /@keyframes tabWave/.test(wxss) && /\.tab-item\.wave\.w1 \{ animation-delay: 0\.026s/.test(wxss));
 

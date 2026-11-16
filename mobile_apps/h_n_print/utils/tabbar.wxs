@@ -176,7 +176,7 @@ module.exports = {
     var hit = 0;
     if (event.currentTarget && event.currentTarget.dataset && event.currentTarget.dataset.index !== undefined) {
       hit = Number(event.currentTarget.dataset.index);
-      if (isNaN(hit)) hit = 0;
+      if (hit !== hit) hit = 0;   // WXS 里不要依赖 isNaN，用自反性判定 NaN
     }
     state.drag = {
       id: t0.identifier,
