@@ -70,6 +70,15 @@ Component({
       if (route) {
         const found = this.data.list.findIndex((item) => item.pagePath === route)
         if (found >= 0) idx = found
+        // 切 tab 落地这一刻页面栈可能还没换成新页（route 仍是上一页）：
+        // 用 _goTab 记下的目标格兜底，免得药丸先落回旧格、再被页面的 setData 改回来
+        else {
+          try {
+            const want = Number(wx.getStorageSync('_tabWant'))
+            const at = Number(wx.getStorageSync('_tabWantAt') || 0)
+            if (want >= 0 && want <= this.data.list.length - 1 && at && Date.now() - at < 1500) idx = want
+          } catch (e) {}
+        }
       }
       let dark = false
       try { dark = !!(getApp().globalData && getApp().globalData.isDarkMode) } catch (e) {}
@@ -118,13 +127,17 @@ Component({
       else setTimeout(done, 0)
     },
 
-    // 只把位置补画回来（不动 state.pill / state.sel）—— 用于 setData 抹掉内联样式之后
+    // 页面直接对本组件 setData（onShow 切 selected、提交时切 hideBorder）之后，
+    // 框架会把节点样式重新下发、把视图层写的位移抹掉 —— 这里按逻辑层的 selected 重新落位。
+    // 注意 snap 必须为 true：snap:false 只是「按视图层的 state.pill 重画」，
+    // 一旦 state.pill 停在旧格（切页落地时页面栈还没换成新页），药丸就会一直停在上一个 tab 上。
     _repaint() {
       const geo = this._geo || this._measure()
+      const sel = this.data.selected || 0
       this._rev += 1
       this.setData({
-        thumbX: (this.data.selected || 0) * geo.step,
-        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, rev: this._rev, snap: false },
+        thumbX: sel * geo.step,
+        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel, rev: this._rev, snap: true },
       })
     },
 
@@ -173,7 +186,11 @@ Component({
       // 把视图层正在做的位移整条抹掉 —— 表现就是「滑块滑到一侧后突然闪现到另一侧」。
       // 选中态 / 整排 wave / 药丸落位全交给切过去之后那一页的 _refresh：
       // 新页面的 tabBar 本来就是新建实例，不存在「旧实例要跟着改」这回事。
-      try { wx.setStorageSync('_tabWaveAt', Date.now()) } catch (e) {}
+      try {
+        wx.setStorageSync('_tabWaveAt', Date.now())
+        wx.setStorageSync('_tabWant', index)
+        wx.setStorageSync('_tabWantAt', Date.now())
+      } catch (e) {}
       // 200ms > 页面退出动画 160ms：药丸滑到位、页面滑出去之后再换页
       setTimeout(() => { wx.switchTab({ url: '/' + target.pagePath }) }, 200)
     },

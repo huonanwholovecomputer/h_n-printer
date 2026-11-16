@@ -177,6 +177,11 @@ function runContractTests() {
         !/setData\(/.test(goTabSrc), goTabSrc.length + 'B')
   check('★ 选中态与 wave 交给切过去之后那一页的 _refresh（新实例自带正确落位）',
         /arriving/.test(js) && /patch\.wave = true/.test(js) && /_tabWaveAt/.test(js))
+  const repaintSrc = js.slice(js.indexOf('_repaint() {'), js.indexOf('_repaint() {') + 700)
+  check('★ 页面 setData 后按逻辑层 selected 重新落位（snap:true）—— 否则药丸停在上一格',
+        /snap: true/.test(repaintSrc) && /sel[,:]/.test(repaintSrc), repaintSrc.length + 'B')
+  check('★ 切页落地时页面栈可能还是旧页：idx 用 _tabWant 兜底',
+        /_tabWant/.test(js) && /_tabWantAt/.test(js))
   check('切页仍是「先播退出动画 → 200ms 后 switchTab」',
         /cp\.animateExit\(dir\)/.test(js) && /wx\.switchTab\(\{ url: '\/' \+ target\.pagePath \}\) \}, 200\)/.test(js));
 }
