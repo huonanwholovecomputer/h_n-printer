@@ -1130,8 +1130,8 @@ function initTabThumb() {
 /* ── 拖动 / 按下反馈（APP 2026-11-16 第二轮）──────────────────────────────
    只在 #tabBar 自己的命中面上起手：页面内容是它的兄弟节点，拖栏不会碰到页面里
    那套横滑手势（gestureBus 挂在滚动内容上）。
-   · 位移层跟手：.dragging 里 transition:none，直接写分数 --tab-i（CSS 按
-     calc((100% + 2.4cqw) * var(--tab-i)) 落位，分数就是「格与格之间」）
+   · 位移层滞后跟手：.dragging 里 transition:none，由 rAF 平滑追手指写的分数 --tab-i
+     （CSS 按 calc((100% + 2.4cqw) * var(--tab-i)) 落位，分数就是「格与格之间」）
    · 形变层沿行程 scaleX，origin 落在来向一侧 —— 才像被手指拽着走
    · 整排 tab 按 TAB_ROW_FOLLOW 跟随，越界按 TAB_RUBBER 阻尼（弹性偏移）
    · 松手：过半格 → switchTab（复用 320ms 归位 + goo + wave + bump）
@@ -1144,6 +1144,43 @@ const TAB_BAR_OVER = 0.35;     // 越界那段整条栏跟得更明显（橡皮�
 const TAB_BAR_MAX = 10;        // 整条栏最大位移（2026-11-16 用户口径：10px 就够了）
 const TAB_PILL_OVER = 0.028;   // 药丸越界最多再走 0.028 格（≈4px，正好把栏体左右那 1.2cqw 内缩走完）
                                // —— 再多药丸就探出玻璃栏的圆角轮廓了（截图实测）
+/* 「脱手」延迟（2026-11-16 第八轮，用户口径：「给滑块的滑动加点延迟，营造一种『脱手』的感觉」）：
+   拖动时药丸不再 1:1 钉在手指上，而是以 TAB_LAG_TAU 为时间常数追着手指走 —— 手快它落后
+   半个身位，手一停它自己滑到位；松手后再交给 CSS 过渡归位。只滞后平移，不缩放不形变
+   （滑块仍是硬质玻璃），也不改变「过半格」的判定（判定看手指指向，不看落后的显示位置）。 */
+const TAB_LAG_TAU = 85;        // 跟随时间常数（ms）：越小越贴手，越大越「飘」
+let _tabLagRaf = 0;
+let _tabLagTarget = 0;
+
+function _tabLagStop() {
+  if (_tabLagRaf) cancelAnimationFrame(_tabLagRaf);
+  _tabLagRaf = 0;
+}
+
+// 把 --tab-i 一帧一帧地拉向 target（指数逼近，永不过冲 ⇒ 硬质玻璃不会被拽变形）
+function _tabLagTo(target) {
+  _tabLagTarget = target;
+  if (_tabLagRaf) return;                    // 循环已经在跑：改目标就够，别起第二个
+  const thumb = document.getElementById('tabThumb');
+  if (!thumb) return;
+  let v = parseFloat(thumb.style.getPropertyValue('--tab-i')) || 0;
+  let last = performance.now();
+  const tick = (now) => {
+    const dt = Math.max(0, Math.min(64, now - last));
+    last = now;
+    v += (_tabLagTarget - v) * (1 - Math.exp(-dt / TAB_LAG_TAU));
+    if (Math.abs(_tabLagTarget - v) < 0.0015) {   // 追平就停帧，不让 rAF 空转
+      v = _tabLagTarget;
+      _tabLagRaf = 0;
+      thumb.style.setProperty('--tab-i', String(v));
+      return;
+    }
+    thumb.style.setProperty('--tab-i', String(v));
+    _tabLagRaf = requestAnimationFrame(tick);
+  };
+  _tabLagRaf = requestAnimationFrame(tick);
+}
+
 let _tabDrag = null;
 let _tabSuppressClickUntil = 0;
 
@@ -1201,6 +1238,7 @@ function _tabDragStart(e) {
   const thumb = document.getElementById('tabThumb');
   const maxSlot = bar.querySelectorAll('.tab-item').length - 1;
   const i0 = _tabVisualIndex(thumb, step, maxSlot);
+  _tabLagStop();                      // 起手先停掉上一位手指留下的追赶帧，冻在哪就是哪
   if (thumb) {
     thumb.style.transition = 'none';
     thumb.style.setProperty('--tab-i', String(i0));
@@ -1250,14 +1288,14 @@ function _tabDragMove(e) {
   // 剩下的「拉不住」全部由整条栏的位移表达 —— 药丸探出圆角轮廓像画坏了
   const fracRaw = (travelPx - barDx) / d.step + d.i0;
   const frac = Math.max(-TAB_PILL_OVER, Math.min(d.max + TAB_PILL_OVER, fracRaw));
-  const thumb = document.getElementById('tabThumb');
-  thumb.style.setProperty('--tab-i', String(frac));
+  _tabLagTo(frac);   // 药丸落后手指一点点再追上去 —— 「脱手」的手感就在这一层
 }
 
 function _tabDragEnd(ev, silent) {
   const d = _tabDrag;
   if (!d) return;
   _tabDrag = null;
+  _tabLagStop();                      // 停掉追赶帧，剩下的行程交给 CSS 过渡（松手后自己滑到位）
   const bar = document.getElementById('tabBar');
   if (!bar) return;
   _tabBoatUp(bar);                    // 松手：整条栏弹簧回弹（点按与拖动同一口径）
@@ -1280,7 +1318,9 @@ function _tabDragEnd(ev, silent) {
     }
     return;
   }
-  const frac = parseFloat(thumb.style.getPropertyValue('--tab-i'));
+  // 判定看手指最后指向的位置（_tabLagTarget），不看滞后的显示值：手一甩越过中线就该切页，
+  // 不能因为玻璃还落后几个像素把这一趟判成「没拖到」。
+  const frac = _tabLagTarget;
   const target = Math.max(0, Math.min(d.max, Math.round(isNaN(frac) ? d.i0 : frac)));
   bar.classList.remove('dragging');
   bar.classList.add('settling');

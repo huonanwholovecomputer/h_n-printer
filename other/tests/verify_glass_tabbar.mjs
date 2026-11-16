@@ -7,11 +7,14 @@
  *      或把两层合并成一个元素，就会量到宽度变化 / 高度抖动）；
  *   ③ 药丸不探出玻璃栏的圆角轮廓；
  *   ④ 图标 bump 与整排 wave 真的被触发（而不是只加了 class 没有 keyframes）；
- *   ⑤ 拖动真的跟手（1:1）、越界真的被橡皮筋压住、过半格才吸附、按下去真的先压缩再
- *      船式回弹 —— 这几条只有真手势才量得出来，静态 grep 最多证明"写了 pointermove"；
+ *   ⑤ 拖动真的追手（有滞后、手停后追平，而不是 1:1 硬钉）、越界真的被橡皮筋压住、
+ *      过半格才吸附、按下去真的先压缩再船式回弹 —— 这几条只有真手势才量得出来，
+ *      静态 grep 最多证明"写了 pointermove"；
  *   ⑥ 页面转场（480ms 平铺推拉）途中照样能起手拖、松手按药丸停止的位置决定切哪页；
  *   ⑦ 转场播到一半反向切 tab 时，页面动画必须**立刻从当前位置反方向播**。计时器落定式的
  *      「等这一趟播完再播反向」一律算红 —— 那是第七轮之前的老口径。
+ *   ⑧ 拖动时药丸必须**滞后**跟手（「脱手」手感），手停后自己追平；滞后只改显示位置，
+ *      不改「过半格」判定，也不许把药丸拉变形（硬质玻璃）。
  *
  * 探针自证：把 transform 钉死（模拟「滑块不动」的坏实现），点击「我」之后药丸
  * 若仍然落在第 1 格 —— 说明这个探针量的是真实位置，红/绿都有意义。
@@ -145,6 +148,13 @@ check('整条栏弹性偏移与按下/回弹的规则都在（位移落在 .tab-
 check('拖动过半格按药丸位置切页（复用 switchTab），且抑制拖动收尾的冒泡 click',
       /_tabSuppressClickUntil/.test(js) && /switchTab\(targetTab\)/.test(js) &&
       /_tabVisualIndex\(/.test(js));
+/* 脱手延迟（2026-11-16 第八轮）：药丸由 rAF 指数逼近追手指，不再 1:1 硬钉；
+   判定仍看手指指向（_tabLagTarget），松手时先停帧再把行程交给 CSS 过渡 */
+check('★ 滑块滞后跟随手指（「脱手」手感）：时间常数 + rAF 追赶 + 起手/松手停帧',
+      /const TAB_LAG_TAU = \d+/.test(js) && /function _tabLagTo\(/.test(js) &&
+      /_tabLagTo\(frac\)/.test(js) && /_tabLagStop\(\)/.test(js) &&
+      /const frac = _tabLagTarget;/.test(js),
+      '滞后只改显示位置，不改过半格判定');
 /* 转场可打断（2026-11-16 第七轮）：进度驱动 + 就地反向，不能再有「排队等落定」 */
 const switchTabSrc = (() => {
   const a = js.indexOf('function switchTab(tab) {');
@@ -386,15 +396,21 @@ const d0 = await dragGeo();
 const thumb0L = d0.thumb.l, thumb0W = d0.thumb.w, item0L = d0.items[0].l;
 console.log('  栏=' + px1(barBox.w) + 'px 格距=' + px1(stepPx) + 'px 药丸宽=' + px1(thumb0W) + 'px 起点x=' + px1(cx0));
 
-/* A. 小拖（不到半格）：跟手但不切页，松手弹回 */
+/* A. 小拖（不到半格）：滞后跟手但不切页，松手弹回 */
 await page.mouse.move(cx0, cy);
 await page.mouse.down();
 await page.mouse.move(cx0 + 20, cy, { steps: 3 });
 await page.mouse.move(cx0 + 60, cy, { steps: 5 });
-await page.waitForTimeout(150);   // 整排跟随带 90ms 过渡：等它落定再量，量的是稳态偏移
+await page.waitForTimeout(40);    // 只隔一帧多一点：药丸这时应该还落在手指后面
+const dLag = await dragGeo();
+const lagDelta = dLag.thumb.l - thumb0L;
+check('★ 脱手：手快时药丸落在手指后面（不硬钉在手指下）',
+      lagDelta > 4 && lagDelta < 60 - 8,
+      'Δthumb=' + px1(lagDelta) + 'px / 手指 60px（只跟上 ' + Math.round(lagDelta / 60 * 100) + '%）');
+await page.waitForTimeout(420);   // 手停住 → 药丸自己追上去
 const dA = await dragGeo();
 check('拖动激活后进入 dragging（位移层过渡已关）', dA.dragging === true);
-check('位移层 1:1 跟手', Math.abs((dA.thumb.l - thumb0L) - 60) <= 2,
+check('手停住后药丸追平手指（滞后只制造延迟，不丢行程）', Math.abs((dA.thumb.l - thumb0L) - 60) <= 2,
       'Δthumb=' + px1(dA.thumb.l - thumb0L) + 'px / 手指 60px');
 check('整条栏朝滑动方向错开（12%，最多 10px）',
       Math.abs((dA.barL - barBox.x) - 60 * 0.12) <= 1.5 && Math.abs(dA.barL - barBox.x) <= 10,
@@ -431,7 +447,7 @@ await page.mouse.move(cx0, cy);
 await page.mouse.down();
 await page.mouse.move(cx0 - 25, cy, { steps: 3 });
 await page.mouse.move(cx0 - 60, cy, { steps: 5 });
-await page.waitForTimeout(150);
+await page.waitForTimeout(420);   // 等药丸从滞后里追平（越界位移要量稳态）
 const dB = await dragGeo();
 // 越界时整条栏也一起挪了，判定要跟「挪过之后的栏体」比，而不是静止位置
 check('左越界时药丸仍被挡在玻璃栏内（不探出圆角轮廓）',
@@ -508,11 +524,11 @@ for (const dx of [6, 18, 34, 52, 60]) {
   await touch('touchMove', cx0 + dx, cy);
   await page.waitForTimeout(24);
 }
-await page.waitForTimeout(160);
+await page.waitForTimeout(420);   // 等滞后追平再量行程
 const dF = await dragGeo();
 check('手指拖也能激活（touch → pointer 合成路径通）', dF.dragging === true && dF.tab === 'print',
       'dragging=' + dF.dragging + ' tab=' + dF.tab);
-check('手指拖同样 1:1 跟手', Math.abs((dF.thumb.l - t0.thumb.l) - 60) <= 3,
+check('手指拖同样追平手指（滞后机制在 touch 路径上也生效）', Math.abs((dF.thumb.l - t0.thumb.l) - 60) <= 3,
       'Δthumb=' + px1(dF.thumb.l - t0.thumb.l) + 'px / 手指 60px');
 check('触摸拖栏不把页面滚走（touch-action 生效）',
       (await page.evaluate(() => window.scrollY)) === scroll0);
@@ -539,7 +555,7 @@ const dG0 = await dragGeo();            // 按下那一刻冻住的位置（转�
 const roomPx = (1 + 0.028) * stepPx - (dG0.thumb.l - thumb0L);
 const dz = Math.max(8, Math.min(24, roomPx * 0.6));
 await page.mouse.move(cx0 + dz, cy, { steps: 5 });
-await page.waitForTimeout(120);
+await page.waitForTimeout(420);   // 等滞后追平，量的才是最终跟手距离
 const dG = await dragGeo();
 check('★ 页面转场途中也能起手拖动（滑块不再被 _tabSwitching 锁死）',
       dG.dragging === true, 'dragging=' + dG.dragging + ' tab=' + dG.tab);
@@ -646,7 +662,12 @@ await page.evaluate(() => switchTab('print'));
 await page.waitForTimeout(700);
 await page.mouse.move(cx0, cy);
 await page.mouse.down();
-await page.mouse.move(cx0 + 34, cy, { steps: 4 });
+/* 脱手滞后：一步甩到 130px 后立刻截 —— 药丸这时还在后面追（滞后只在动态里看得见） */
+await page.mouse.move(cx0 + 130, cy);
+await page.waitForTimeout(16);
+await page.screenshot({ path: SHOTS + '/拖动中_滞后.png', clip: { x: 0, y: 640, width: 360, height: 160 } });
+console.log('  · 拖动中_滞后.png');
+await page.mouse.move(cx0 + 34, cy, { steps: 2 });
 await page.mouse.move(cx0 + 60, cy, { steps: 5 });
 await page.waitForTimeout(180);
 await page.screenshot({ path: SHOTS + '/拖动中_右拖.png', clip: { x: 0, y: 640, width: 360, height: 160 } });
