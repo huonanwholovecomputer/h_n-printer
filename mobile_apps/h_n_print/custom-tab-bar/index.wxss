@@ -43,6 +43,14 @@
   border-top-color: transparent;
 }
 
+/* 首帧显隐门（2026-11-16 第 4 轮）：新页面刚建出来的 tabBar 实例，first paint 时 data 还是
+   默认的 selected:0 / thumbX:0 —— 不看这一下就会看到「药丸在第 1 格闪一下、再跳回正确格」
+   （每切一次 tab 都有一次）。门开在 .tab-glass 的 class 上，由 data 的 thumbReady 驱动：
+   它和「正确落位 + cfg」在同一次 setData 里到达，所以显形即正确。前面那句「不能用 opacity
+   藏起来」说的是视图层内联 opacity（会被 setData 重下发 style 抹掉），class 不受影响。 */
+.tab-glass .tab-thumb { opacity: 0; }
+.tab-glass.ready .tab-thumb { opacity: 1; }
+
 /* ── 玻璃滑块 ── */
 .tab-thumb {
   position: absolute;
@@ -52,9 +60,10 @@
   height: calc(100% - 14rpx);
   z-index: 1;
   pointer-events: none;   /* 命中面留给下面的 .tab-item，拖动不从药丸上起手 */
-  /* 这里不能写 opacity: 0 之类的「先藏起来等视图层显形」：逻辑层每次 setData 都会重新下发
-     节点的 style，把视图层 setStyle 写的内联样式整条抹掉 ⇒ 表现为「一点药丸就没了」。
-     落位改由 WXML 上 data 兜底的 transform + 视图层逐帧覆盖（见 index.wxml / tabbar.wxs）。 */
+  /* 不要在本块写 opacity 显隐：这里是视图层逐帧 setStyle 的地盘，逻辑层每次 setData 都会
+     重新下发节点的 style，把内联样式整条抹掉 ⇒ 表现为「一点药丸就没了」。
+     显隐统一走上面那句 .tab-glass.ready 的 class 门（data 驱动，setData 抹不掉）；
+     落位由 WXML 上 data 兜底的 transform + 视图层逐帧覆盖（见 index.wxml / tabbar.wxs）。 */
   will-change: transform;
 }
 

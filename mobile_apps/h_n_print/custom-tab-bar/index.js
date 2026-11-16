@@ -12,6 +12,10 @@ Component({
     cfg: null,
     // 位移层由 data 兜底的落位（px）：视图层抹掉内联样式后的最后一道保险
     thumbX: 0,
+    // 首帧显隐门：新页面刚建出来的 tabBar 实例在拿到 cfg / 落位之前，药丸先不显形。
+    // 用 data 驱动的 class（不是视图层写的内联 opacity，那个会被 setData 抹掉），
+    // 只有 _refresh / _repaint 把「落位 + thumbReady」放进同一次 setData，才会一起显形。
+    thumbReady: false,
     list: [
       { text: '打印', icon: '/images/tab/print.png', pagePath: 'pages/index/index', active: true },
       { text: '我', icon: '/images/tab/me.png', pagePath: 'pages/me/me', active: false },
@@ -70,16 +74,16 @@ Component({
       if (route) {
         const found = this.data.list.findIndex((item) => item.pagePath === route)
         if (found >= 0) idx = found
-        // 切 tab 落地这一刻页面栈可能还没换成新页（route 仍是上一页）：
-        // 用 _goTab 记下的目标格兜底，免得药丸先落回旧格、再被页面的 setData 改回来
-        else {
-          try {
-            const want = Number(wx.getStorageSync('_tabWant'))
-            const at = Number(wx.getStorageSync('_tabWantAt') || 0)
-            if (want >= 0 && want <= this.data.list.length - 1 && at && Date.now() - at < 1500) idx = want
-          } catch (e) {}
-        }
       }
+      // 切 tab 落地这一刻页面栈可能还没换成新页：route 仍是上一页，而且它会「命中」旧页那一格
+      // （不是未命中），所以兜底不能只写在 found < 0 的分支里 —— 那正是「药丸先闪回打印、
+      // 再被页面 onShow 的 setData 拽回我」的现场：_refresh 落 0 → 两帧后 _repaint 落 1。
+      // 口径：_goTab 在 1.5s 内记下的目标格优先于 route（route 只在这 1.5s 之外才作数）。
+      try {
+        const want = Number(wx.getStorageSync('_tabWant'))
+        const at = Number(wx.getStorageSync('_tabWantAt') || 0)
+        if (want >= 0 && want <= this.data.list.length - 1 && at && Date.now() - at < 1500) idx = want
+      } catch (e) {}
       let dark = false
       try { dark = !!(getApp().globalData && getApp().globalData.isDarkMode) } catch (e) {}
       // 只有「刚切 tab 落到本页」才播整排 wave；从子页返回不播，免得每回一次抖一下
@@ -97,6 +101,7 @@ Component({
         dark,
         thumbX: idx * geo.step,
         cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel: idx, rev: this._rev, snap: true },
+        thumbReady: true,
       }
       if (arriving) patch.wave = true
       this._markQuiet()
@@ -137,6 +142,7 @@ Component({
       this._rev += 1
       this.setData({
         thumbX: sel * geo.step,
+        thumbReady: true,
         cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel, rev: this._rev, snap: true },
       })
     },

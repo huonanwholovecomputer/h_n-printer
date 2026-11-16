@@ -7,7 +7,7 @@
   cfg="{{cfg}}"
   change:cfg="{{tabbar.onConfig}}"
 >
-  <view class="tab-glass">
+  <view class="tab-glass {{thumbReady ? 'ready' : ''}}">
     <view class="tab-thumb" style="transform: translate3d({{thumbX}}px, 0, 0)">
       <view class="tab-pill"><view class="tab-pill-gloss"></view></view>
     </view>
@@ -25,10 +25,10 @@
       bindtouchend="{{tabbar.touchend}}"
       bindtouchcancel="{{tabbar.touchcancel}}"
     >
-      <view class="tab-icon-wrap {{item.active ? 'icon-active' : ''}}">
+      <view class="tab-icon-wrap {{item.active && thumbReady ? 'icon-active' : ''}}">
         <image class="tab-icon" src="{{item.icon}}" />
       </view>
-      <text class="tab-text {{item.active ? 'text-active' : ''}}">{{item.text}}</text>
+      <text class="tab-text {{item.active && thumbReady ? 'text-active' : ''}}">{{item.text}}</text>
     </view>
   </view>
 </view>

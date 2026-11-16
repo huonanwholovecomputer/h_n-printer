@@ -11,6 +11,14 @@
  * （每个 tab 页各持一份 tabBar 实例；wx.switchTab 原子）。切页仍是「旧页先播退出动画
  * 160ms → 200ms 后 switchTab」，本脚本钉的是这之内的手感与口径。
  *
+ * 2026-11-16 第 4 轮（用户录屏取证）：切到「我」落地后药丸先闪回「打印」再跳回来。
+ * 根因不是手势，是**落地那一刻的落位口径**：新页面 tabBar 实例的 _refresh 里
+ * getCurrentPages() 还是旧页（route=pages/index/index），而旧 route 会「命中」第 1 格，
+ * 于是把兜底（_tabWant）只写在「route 未命中」的分支里等于没生效 → 落 0，两帧后
+ * 被页面 onShow 的 setData(selected:1) → _repaint 拽回 1，看上去就是闪一下。
+ * 修法两条：① _tabWant（1.5s 内）优先于 route；② 另加 class 显隐门（thumbReady），
+ * 新实例在「落位 + cfg」那一次 setData 到达前不显形，first paint 的默认 0 也看不见。
+ *
  * 用法：node other/tests/verify_wechat_tabbar.js   （exit 0 = 全绿）
  */
 const fs = require('fs');
@@ -139,8 +147,16 @@ function runContractTests() {
         !/backdrop-filter/.test(barBlock) && !/background/.test(barBlock)
         && /backdrop-filter:\s*saturate\(180%\) blur\(14px\)/.test(block(wxss, '.tab-glass')));
   const thumbBlock = block(wxss, '.tab-thumb');
-  check('★ 位移层不能自带 opacity 显隐门（setData 重下发 style 会把视图层的写入抹掉 ⇒ 一点就消失）',
+  check('★ 位移层本身不带 opacity（视图层逐帧写 style，逻辑层 setData 会把它抹掉）',
         !/opacity:\s*0/.test(thumbBlock.replace(/\/\*[\s\S]*?\*\//g, '')));
+  check('★ 首帧显隐门开在 .tab-glass 的 class 上（data 驱动，setData 抹不掉）',
+        /\.tab-glass \.tab-thumb \{\s*opacity: 0;\s*\}/.test(wxss)
+        && /\.tab-glass\.ready \.tab-thumb \{\s*opacity: 1;\s*\}/.test(wxss)
+        && /class="tab-glass \{\{thumbReady \? 'ready' : ''\}\}"/.test(wxml)
+        && /thumbReady: false/.test(js) && /thumbReady: true/.test(js));
+  check('★ 首个 setData 之前连选中态文字/图标都不点亮（否则「打印」会闪蓝）',
+        /item\.active && thumbReady \? 'icon-active'/.test(wxml)
+        && /item\.active && thumbReady \? 'text-active'/.test(wxml));
   check('★ 位移层有 data 兜底的落位（style 绑定 thumbX，被抹掉也落在正确格位）',
         /class="tab-thumb" style="transform: translate3d\(\{\{thumbX\}\}px, 0, 0\)"/.test(wxml)
         && /thumbX: idx \* geo\.step/.test(js) && /_repaint\(\)/.test(js));
@@ -180,8 +196,29 @@ function runContractTests() {
   const repaintSrc = js.slice(js.indexOf('_repaint() {'), js.indexOf('_repaint() {') + 700)
   check('★ 页面 setData 后按逻辑层 selected 重新落位（snap:true）—— 否则药丸停在上一格',
         /snap: true/.test(repaintSrc) && /sel[,:]/.test(repaintSrc), repaintSrc.length + 'B')
-  check('★ 切页落地时页面栈可能还是旧页：idx 用 _tabWant 兜底',
-        /_tabWant/.test(js) && /_tabWantAt/.test(js))
+  const refreshSrc = js.slice(js.indexOf('_refresh() {'), js.indexOf('_markQuiet() {'))
+  // 括号深度扫描：注释与字符串里的括号不算
+  function braceDepthAt(src, needle) {
+    let depth = 0, quote = '', i = 0;
+    const end = src.indexOf(needle);
+    if (end < 0) return -1;
+    let inLine = false, inBlock = false;
+    for (; i < end; i++) {
+      const ch = src[i], nx = src[i + 1];
+      if (inLine) { if (ch === '\n') inLine = false; continue; }
+      if (inBlock) { if (ch === '*' && nx === '/') { inBlock = false; i++; } continue; }
+      if (quote) { if (ch === '\\') { i++; continue; } if (ch === quote) quote = ''; continue; }
+      if (ch === '/' && nx === '/') { inLine = true; i++; continue; }
+      if (ch === '/' && nx === '*') { inBlock = true; i++; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; continue; }
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+    }
+    return depth;
+  }
+  const wantDepth = braceDepthAt(refreshSrc, "wx.getStorageSync('_tabWant')")
+  check('★ 切页落地时页面栈可能还是旧页：_tabWant 优先于 route（不在 if (route) 的 else 里）',
+        /_tabWantAt/.test(js) && wantDepth === 2, 'depth=' + wantDepth);
   check('切页仍是「先播退出动画 → 200ms 后 switchTab」',
         /cp\.animateExit\(dir\)/.test(js) && /wx\.switchTab\(\{ url: '\/' \+ target\.pagePath \}\) \}, 200\)/.test(js));
 }
@@ -351,12 +388,144 @@ function runRefreshTests() {
   check('★ 换回「打印」页同理', Math.abs(pillX(o)) < 0.01, String(pillX(o)));
 }
 
+/* ---------------- 七、实例级：真跑 Component（复现「落地闪一下」） ---------------- */
+function loadController() {
+  const src = fs.readFileSync(path.join(TAB_DIR, 'index.js'), 'utf8');
+  const store = Object.create(null);
+  const timers = [];
+  let def = null;
+  const sandbox = {
+    console, Math, JSON, String, Number, Object, Array, Date,
+    Component: (d) => { def = d; },
+    getApp: () => ({ globalData: { isDarkMode: false } }),
+    getCurrentPages: () => sandbox.__pages,
+    setTimeout: (fn, ms) => (timers.push({ fn, ms }), timers.length),
+    clearTimeout: () => {},
+    __pages: [{ route: 'pages/index/index' }],
+    __switchTo: '',
+    wx: {
+      getWindowInfo: () => ({ windowWidth: 375 }),
+      getStorageSync: (k) => (k in store ? store[k] : ''),
+      setStorageSync: (k, v) => { store[k] = v; },
+      removeStorageSync: (k) => { delete store[k]; },
+      nextTick: (fn) => fn(),
+      setBackgroundColor: () => {},
+      setNavigationBarColor: () => {},
+      switchTab: (o) => { sandbox.__switchTo = (o && o.url) || ''; },
+    },
+  };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox, { filename: 'custom-tab-bar/index.js' });
+  return { def: def, store: store, sandbox: sandbox, timers: timers };
+}
+
+function instantiate(def) {
+  const inst = {};
+  Object.keys(def.methods).forEach((k) => { inst[k] = def.methods[k]; });
+  inst.data = JSON.parse(JSON.stringify(def.data));
+  inst.setDataCalls = [];
+  inst.setData = function (patch) {
+    inst.setDataCalls.push(patch);
+    Object.keys(patch).forEach((key) => {
+      const m = /^(\w+)\[(\d+)\]\.(\w+)$/.exec(key);
+      if (m) { inst.data[m[1]][Number(m[2])][m[3]] = patch[key]; return; }
+      inst.data[key] = patch[key];
+    });
+  };
+  return inst;
+}
+
+function runInstanceTests() {
+  section('七、实例级：落地那一刻药丸不闪（pageLifetimes.show → _refresh）');
+
+  /* 7-1 现场 bug：切到「我」落地时 getCurrentPages() 还是旧页（route=pages/index/index） */
+  const c1 = loadController();
+  c1.store._tabWant = 1;
+  c1.store._tabWantAt = Date.now();
+  c1.sandbox.__pages = [{ route: 'pages/index/index' }];   // 旧栈：命中第 1 格
+  const i1 = instantiate(c1.def);
+  c1.def.lifetimes.attached.call(i1);
+  check('★ 落地时页面栈还是旧页 → 直接落第 2 格（不先落 0 再被 onShow 拽回来）',
+        i1.data.selected === 1 && i1.data.cfg.sel === 1 && Math.abs(i1.data.thumbX - 147.5) < 0.01,
+        JSON.stringify({ selected: i1.data.selected, sel: i1.data.cfg.sel, thumbX: i1.data.thumbX }));
+  check('★ 落位与 thumbReady 在同一次 setData（显形即正确，first paint 的默认 0 看不见）',
+        i1.data.thumbReady === true && i1.setDataCalls.length === 1
+        && i1.setDataCalls[0].thumbReady === true && 'cfg' in i1.setDataCalls[0],
+        i1.setDataCalls.length + ' 次 setData');
+  check('选中态列表同一次 setData 带过去（文字/图标不会先点错格）',
+        i1.data.list[0].active === false && i1.data.list[1].active === true,
+        JSON.stringify([i1.data.list[0].active, i1.data.list[1].active]));
+
+  /* 7-2 反向：切回「打印」，落地时页面栈还是 me */
+  const c2 = loadController();
+  c2.store._tabWant = 0;
+  c2.store._tabWantAt = Date.now();
+  c2.sandbox.__pages = [{ route: 'pages/me/me' }];
+  const i2 = instantiate(c2.def);
+  c2.def.pageLifetimes.show.call(i2);
+  check('★ 切回「打印」落地时页面栈还是旧页 → 落第 1 格', i2.data.selected === 0
+        && Math.abs(i2.data.thumbX) < 0.01, String(i2.data.thumbX));
+
+  /* 7-3 没有 _tabWant（1.5s 外 / 直接打开页面）→ route 作数 */
+  const c3 = loadController();
+  c3.sandbox.__pages = [{ route: 'pages/me/me' }];
+  const i3 = instantiate(c3.def);
+  c3.def.pageLifetimes.show.call(i3);
+  check('没有切页记录时按 route 落位（「我」→ 第 2 格）',
+        i3.data.selected === 1 && Math.abs(i3.data.thumbX - 147.5) < 0.01, String(i3.data.thumbX));
+
+  /* 7-4 过期的 _tabWant 不作数（否则很久以后回页面还会落错格） */
+  const c4 = loadController();
+  c4.store._tabWant = 1;
+  c4.store._tabWantAt = Date.now() - 5000;
+  c4.sandbox.__pages = [{ route: 'pages/index/index' }];
+  const i4 = instantiate(c4.def);
+  const i4b = instantiate(c4.def);
+  c4.def.pageLifetimes.show.call(i4b);
+  check('★ 超过 1.5s 的 _tabWant 不作数（按 route 落第 1 格）', i4b.data.selected === 0,
+        String(i4b.data.selected));
+
+  /* 7-5 _repaint：页面直接 setData 之后补画，同时保持门是开的 */
+  const c5 = loadController();
+  const i5 = instantiate(c5.def);
+  i5.data.selected = 1;
+  i5._repaint();
+  check('★ _repaint 按逻辑层 selected 落位并保证 thumbReady（被 setData 抹掉后不会一直不显形）',
+        Math.abs(i5.data.thumbX - 147.5) < 0.01 && i5.data.thumbReady === true,
+        i5.data.thumbX + ' / ' + i5.data.thumbReady);
+
+  /* 7-6 _goTab：切页途中零 setData、只写 storage，200ms 后才 switchTab */
+  const c6 = loadController();
+  const i6 = instantiate(c6.def);
+  i6.data.selected = 0;
+  i6._goTab(1);
+  check('★ 切页途中一次 setData 都没有（否则框架重下发 style ⇒ 滑块闪现到另一侧）',
+        i6.setDataCalls.length === 0, i6.setDataCalls.length + ' 次');
+  check('切页前落下目标格/源格/wave 时间戳',
+        c6.store._tabWant === 1 && c6.store._tabFrom === 0 && c6.store._tabTo === 1
+        && c6.store._tabWantAt > 0 && c6.store._tabWaveAt > 0, JSON.stringify(c6.store));
+  check('切页延迟 200ms（> 退出动画 160ms）', c6.timers.length === 1 && c6.timers[0].ms === 200,
+        JSON.stringify(c6.timers.map((t) => t.ms)));
+  c6.timers[0].fn();
+  check('200ms 后真的 switchTab 到「我」', c6.sandbox.__switchTo === '/pages/me/me', c6.sandbox.__switchTo);
+
+  /* 7-7 同格点击不切页、不写 storage */
+  const c7 = loadController();
+  const i7 = instantiate(c7.def);
+  i7.data.selected = 1;
+  i7._goTab(1);
+  check('点当前格：不切页也不写 _tabWant', c7.timers.length === 0 && !('_tabWant' in c7.store),
+        JSON.stringify(c7.store));
+}
+
 runContractTests();
 runSettleTests();
 runDragTests();
 runRubberTests();
 runReleaseTests();
 runRefreshTests();
+runInstanceTests();
 
 console.log('\n' + '='.repeat(52));
 if (failures) {
