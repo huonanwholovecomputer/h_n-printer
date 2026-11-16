@@ -70,10 +70,22 @@ function makeBox(top, height, trackH, y0) {
   };
 }
 
-function makeWxsOwner(engine, cfg, boxes) {
+/* 真机口径的框桩：普通 view 的 ComponentDescriptor 上没有可用的子节点查询
+ * （selectComponent 只认自定义组件，普通 view 返回 null），所以这里**故意不给**
+ * box.selectComponent —— 引擎只能靠 owner.selectAllComponents(trackSel) 配对拿内容轨。
+ * 2026-11-15 现场：旧实现只在 box.selectComponent 上取轨 ⇒ 真机永远 nb=null，
+ * 内层列表完全锁死、外层永远接管（本次回归就是用它钉住的）。 */
+function makeStrictBox(top, height, trackH, y0) {
+  const box = makeBox(top, height, trackH, y0);
+  delete box.selectComponent;
+  return box;
+}
+
+function makeWxsOwner(engine, cfg, boxes, tracks) {
   const state = {};
   const rendered = [];
   const ns = (cfg && cfg.nestedSel) || '.detail-files-scroll';
+  const ts = (cfg && cfg.nestedTrackSel) || '.detail-files-track';
   const content = { setStyle: (s) => rendered.push(s.transform) };
   const owner = {
     getState: () => state,
@@ -84,7 +96,12 @@ function makeWxsOwner(engine, cfg, boxes) {
       if (sel === ns) return (boxes || [])[0] || null;
       return null;
     },
-    selectAllComponents: (sel) => (sel === ns ? (boxes || []) : []),
+    // 真机口径：owner 级能按 class 拿到普通节点，描述对象上才拿不到子节点
+    selectAllComponents: (sel) => {
+      if (sel === ns) return (boxes || []);
+      if (sel === ts) return (tracks || []);
+      return [];
+    },
     _rafs: [],
   };
   engine.onConfig(cfg, null, owner, null);
@@ -226,6 +243,37 @@ function runGestureTests() {
   check('只滚第二张卡的列表（A 不动、B +30）', a._body._y === 0 && b._body._y === 30,
         'A=' + a._body._y + ' B=' + b._body._y);
 
+  section('六B、真机口径：描述对象上没有子节点查询（owner 级配对）');
+  const engine6b = loadWxsEngine();
+  const sa = makeStrictBox(200, 250, 400, 0);
+  const sb = makeStrictBox(600, 250, 400, 0);
+  const owner6b = makeWxsOwner(engine6b, pageCfg(), [sa, sb], [sa._body, sb._body]);
+  const st6b = owner6b.getState();
+  engine6b.touchstart(ev(700), owner6b);
+  check('box.selectComponent 不存在时也能量到内层行程（不再恒为 null）',
+        !!st6b.nb && Math.round(st6b.nb.maxY) === 150 && st6b.nb.idx === 1,
+        st6b.nb ? 'idx=' + st6b.nb.idx + ' maxY=' + st6b.nb.maxY : 'nb=null');
+  drag(engine6b, owner6b, 700, [-10, -10, -10], () => {});
+  check('只滚第二张卡（A 不动、B +30、页面 0）',
+        sa._body._y === 0 && sb._body._y === 30 && st6b.y === 0,
+        'A=' + sa._body._y + ' B=' + sb._body._y + ' page=' + st6b.y);
+  lift(engine6b, owner6b, 700);
+
+  const engine6c = loadWxsEngine();
+  const c1 = makeStrictBox(200, 250, 400, 0);
+  const c2 = makeStrictBox(600, 250, 400, 0);
+  // 轨列表与框数量不一致（只展开了一张卡的轨）⇒ 必须按几何配对，不能按下标错配
+  const owner6c = makeWxsOwner(engine6c, pageCfg(), [c1, c2], [c2._body]);
+  const st6c = owner6c.getState();
+  engine6c.touchstart(ev(700), owner6c);
+  check('轨数量对不上时按几何配对到正确那张卡',
+        !!st6c.nb && st6c.nb.track === c2._body, st6c.nb ? 'idx=' + st6c.nb.idx : 'nb=null');
+  drag(engine6c, owner6c, 700, [-10, -10], () => {});
+  check('几何配对后滚的确实是第二张卡（C1 不动、C2 +20）',
+        c1._body._y === 0 && c2._body._y === 20,
+        'C1=' + c1._body._y + ' C2=' + c2._body._y);
+  lift(engine6c, owner6c, 700);
+
   section('七、内层不可滚 / 触点不在框上 / 慢速拖动');
   const engine7 = loadWxsEngine();
   const flat = makeBox(200, 250, 250, 0);   // 内容高 = 框高，行程 0
@@ -286,7 +334,19 @@ function runSourceChecks() {
         && !/newValue\.listAtBottom/.test(wxs));
   check('WXS 用 selectAllComponents 逐个量框（不是只认第一个）',
         /selectAllComponents/.test(wxs) && /function measureNested/.test(wxs));
+
+  // 2026-11-15 现场：真机编译报 ./utils/scroll.wxs:480:29 Unexpected token `e`
+  // —— 是 `var bestD = 1e9` 这种科学计数法（node 的 vm 照跑，只有微信 WXS 编译器拒收）。
+  // 所以源码级再守一道：去掉注释后，WXS 里不许出现科学计数法、ES6 语法、幂运算。
+  const code = wxs.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/\/\/.*$/gm, '');
+  check('WXS 无科学计数法（1e9 之类会让微信编译器报 Unexpected token）',
+        !/[0-9][eE][+-]?[0-9]/.test(code));
+  check('WXS 无 ES6 语法（箭头函数 / const / let / 模板串 / 展开）',
+        !/=>/.test(code) && !/\bconst\b/.test(code) && !/\blet\b/.test(code)
+        && !/`/.test(code) && !/\.\.\./.test(code));
+  check('WXS 无幂运算 **（ES5 没有）', !/\*\*/.test(code));
 }
+
 
 runGestureTests();
 runSourceChecks();

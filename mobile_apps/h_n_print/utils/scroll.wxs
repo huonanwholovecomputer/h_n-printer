@@ -467,9 +467,30 @@ function rectRight(r) {
   return typeof r.right === 'number' ? r.right : r.left + (r.width || 0);
 }
 
-// 命中内层滚动框：逐个量框与 track 的 rect
-// （同一页可能同时展开多张订单卡，selectComponent 只能拿到第一个，必须用 selectAllComponents）
+// 命中内层滚动框：逐个量框与 track 的 rect。
+// 两道坑都在「怎么拿到那条 track」上：
+//   ① 同一页可能同时展开多张订单卡 ⇒ 必须逐个框比对，不能只认第一个；
+//   ② 普通 view 的 ComponentDescriptor 上**没有可用的子节点查询**（真机返回 null）⇒
+//      只能 owner 级 selectAllComponents 取轨列表，再按文档序/几何与框配对。
 // 触点落在框内、且内容确实超框才算命中；命中后 y = 框顶 - 内容顶 = 当前的内部偏移。
+// 在 owner 级 track 列表里按几何找「属于这个框」的那条轨：
+// 内容轨的顶边一定落在框内（内层已滚动时顶边在框顶之上，最多偏 -maxY），
+// 所以判据是「与框纵向相交」，再取顶边离框顶最近的一条。
+function pickTrackByRect(tracks, br) {
+  var best = null, bestD = 999999999;   // 注意：WXS 不认 1e9 这种科学计数法（编译器报 Unexpected token e）
+  for (var j = 0; j < tracks.length; j++) {
+    var t = tracks[j];
+    if (!t || typeof t.getBoundingClientRect !== 'function') continue;
+    var tr = t.getBoundingClientRect();
+    if (!tr || !(tr.height > 0)) continue;
+    if (tr.top > rectBottom(br) + 2) continue;          // 完全在框下方
+    if (tr.top + tr.height < br.top - 2) continue;      // 完全在框上方
+    var d = Math.abs(tr.top - br.top);
+    if (d < bestD) { bestD = d; best = t; }
+  }
+  return best;
+}
+
 function measureNested(state, owner, point) {
   if (!state.nbSel) return null;
   var boxes = null;
@@ -480,6 +501,16 @@ function measureNested(state, owner, point) {
     if (single) boxes = [single];
   }
   if (!boxes || !boxes.length) return null;
+  // 内容轨在 owner 级取一次（文档序与「框」一一对应：每个框里恰好一条轨）。
+  // ⚠ 真机口径：描述对象上的 selectComponent 只能拿到**自定义组件**，普通 view 的
+  //   轨拿不到（返回 null/undefined）⇒ 旧写法 box.selectComponent(trackSel) 永远失败，
+  //   nb 恒为 null，内层一次都没接管过（现场：「内层列表完全锁住，外层永远接管」）。
+  //   所以主路径是 owner.selectAllComponents(trackSel) + 几何配对，box 通道只作兜底。
+  var tracks = null;
+  if (state.nbTrackSel && typeof owner.selectAllComponents === 'function') {
+    tracks = owner.selectAllComponents(state.nbTrackSel);
+    if (!tracks || !tracks.length) tracks = null;
+  }
   for (var i = 0; i < boxes.length; i++) {
     var box = boxes[i];
     if (!box || typeof box.getBoundingClientRect !== 'function') continue;
@@ -488,14 +519,24 @@ function measureNested(state, owner, point) {
     if (point.clientY < br.top || point.clientY > rectBottom(br)) continue;
     if (point.clientX < br.left || point.clientX > rectRight(br)) continue;
     var track = null;
-    if (state.nbTrackSel && typeof box.selectComponent === 'function') {
+    if (tracks) {
+      track = (tracks.length === boxes.length) ? tracks[i] : pickTrackByRect(tracks, br);
+      // 文档序配对也过一遍几何校验：数目一致但顺序/结构不符时（同页混合结构）不串轨
+      if (track) {
+        var pre = (typeof track.getBoundingClientRect === 'function') ? track.getBoundingClientRect() : null;
+        if (!pre || pre.top > rectBottom(br) + 2 || pre.top + (pre.height || 0) < br.top - 2) {
+          track = pickTrackByRect(tracks, br);
+        }
+      }
+    }
+    if (!track && state.nbTrackSel && typeof box.selectComponent === 'function') {
       track = box.selectComponent(state.nbTrackSel);
     }
     if (!track || typeof track.getBoundingClientRect !== 'function') continue;
     var tr = track.getBoundingClientRect();
     if (!tr || !(tr.height > 0)) continue;
     var maxY = tr.height - br.height;
-    if (maxY < 1) return null;      // 内容没超框 → 本框不可滚，整页照常滚
+    if (maxY < 1) continue;         // 内容没超框 → 本框不可滚，整页照常滚
     var o = br.top - tr.top;
     if (o !== o || o < 0) o = 0;    // NaN 防御
     if (o > maxY) o = maxY;
