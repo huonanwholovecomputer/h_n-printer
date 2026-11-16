@@ -174,11 +174,21 @@ Component({
     _goTab(index) {
       const target = this.data.list[index]
       if (!target || index === this.data.selected) return
+      const prev = this.data.selected
+      // 目标格必须先落盘：animateExit 在「有弹窗」时会自己接管切页（关弹窗 → switchTab），
+      // 不会回到下面这段 —— 那条路上的新页面 tabBar 拿不到 _tabWant，只能按旧 route 落 0，
+      // 一帧后再被页面 onShow 的 setData(selected) 拽回来，看上去就是药丸先闪回上一格。
+      try {
+        wx.setStorageSync('_tabFrom', prev)
+        wx.setStorageSync('_tabTo', index)
+        wx.setStorageSync('_tabWaveAt', Date.now())
+        wx.setStorageSync('_tabWant', index)
+        wx.setStorageSync('_tabWantAt', Date.now())
+      } catch (e) {}
       const app = getApp()
       const isDark = app.globalData.isDarkMode
       wx.setBackgroundColor({ backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7', backgroundColorTop: isDark ? '#1C1C1E' : '#F2F2F7', backgroundColorBottom: isDark ? '#1C1C1E' : '#F2F2F7' })
       wx.setNavigationBarColor({ frontColor: isDark ? '#ffffff' : '#000000', backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7' })
-      const prev = this.data.selected
       const dir = prev === 0 ? 'left' : 'right'
       let cp = null
       try {
@@ -186,19 +196,23 @@ Component({
         cp = pages[pages.length - 1]
       } catch (e) {}
       if (cp && typeof cp.animateExit === 'function' && !cp.animateExit(dir)) return
-      wx.setStorageSync('_tabFrom', prev)
-      wx.setStorageSync('_tabTo', index)
       // 关键：这一路**不做任何 setData**。逻辑层 setData 会让框架重新下发节点 style，
       // 把视图层正在做的位移整条抹掉 —— 表现就是「滑块滑到一侧后突然闪现到另一侧」。
       // 选中态 / 整排 wave / 药丸落位全交给切过去之后那一页的 _refresh：
       // 新页面的 tabBar 本来就是新建实例，不存在「旧实例要跟着改」这回事。
-      try {
-        wx.setStorageSync('_tabWaveAt', Date.now())
-        wx.setStorageSync('_tabWant', index)
-        wx.setStorageSync('_tabWantAt', Date.now())
-      } catch (e) {}
       // 200ms > 页面退出动画 160ms：药丸滑到位、页面滑出去之后再换页
-      setTimeout(() => { wx.switchTab({ url: '/' + target.pagePath }) }, 200)
+      setTimeout(() => {
+        // 走之前把「本实例的落位」改成目标格：药丸此刻已经滑到那里（视图层写的），
+        // 而 data 里的 thumbX 还停在旧格 —— 换页那一瞬框架若重下发本组件的 style，
+        // 就会按旧值把药丸拽回上一格，看上去正是「已经滑到『我』、又闪回『打印』」。
+        // 改 data 而不是内联样式：这个值此刻就等于屏上位置，重下发也看不出差别
+        // （动画已收完，不会被打回原形）。
+        try {
+          const geo = this._geo || this._measure()
+          this.setData({ thumbX: index * geo.step })
+        } catch (e) {}
+        wx.switchTab({ url: '/' + target.pagePath })
+      }, 200)
     },
   },
 })

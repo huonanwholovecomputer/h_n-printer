@@ -19,6 +19,12 @@
  * 修法两条：① _tabWant（1.5s 内）优先于 route；② 另加 class 显隐门（thumbReady），
  * 新实例在「落位 + cfg」那一次 setData 到达前不显形，first paint 的默认 0 也看不见。
  *
+ * 2026-11-16 第 5 轮（用户复核：闪仍在）：第 4 轮修的是「新实例落位」，漏了**旧实例的 data**。
+ * 拖/点切页时药丸是视图层 setStyle 挪过去的，旧实例 data.thumbX 还停在旧格；换页那一瞬
+ * 框架若重下发本组件的 style，就按旧值把药丸拽回上一格 —— 屏上顺序是「右 → 左 → 右」，
+ * 正好是用户录屏里那 2 帧。修法：_goTab 的 200ms 回调里先把本实例 thumbX 改成目标格再
+ * switchTab（值就等于屏上位置，重下发无感）。
+ *
  * 用法：node other/tests/verify_wechat_tabbar.js   （exit 0 = 全绿）
  */
 const fs = require('fs');
@@ -188,9 +194,12 @@ function runContractTests() {
   check('几何参数由逻辑层下发（_measure：slot = barW / 2、inset 9rpx）',
         /const slot = barW \/ 2/.test(js) && /const inset = 9 \* pxPerRpx/.test(js)
         && /cfg: \{ step: geo\.step, maxIdx: geo\.maxIdx, over: geo\.over, sel: idx/.test(js));
-  const goTabSrc = js.slice(js.indexOf('_goTab(index) {'), js.indexOf('_goTab(index) {') + 1600)
+  // 「切页前」= _goTab 开头到 200ms 定时器之间（定时器里那次 setData 是换页那一刻的，必须允许）
+  const goTabAt = js.indexOf('_goTab(index) {')
+  const goTabTimerAt = js.indexOf('setTimeout(', goTabAt)
+  const goTabSrc = js.slice(goTabAt, goTabTimerAt > goTabAt ? goTabTimerAt : goTabAt + 1600)
   check('★ 切页前不许 setData（框架重下发 style 会把视图层位移抹掉 ⇒ 滑块「闪现到另一侧」）',
-        !/setData\(/.test(goTabSrc), goTabSrc.length + 'B')
+        !/setData\(/.test(goTabSrc.replace(/^\s*\/\/.*$/gm, '')), goTabSrc.length + 'B')
   check('★ 选中态与 wave 交给切过去之后那一页的 _refresh（新实例自带正确落位）',
         /arriving/.test(js) && /patch\.wave = true/.test(js) && /_tabWaveAt/.test(js))
   const repaintSrc = js.slice(js.indexOf('_repaint() {'), js.indexOf('_repaint() {') + 700)
@@ -220,7 +229,8 @@ function runContractTests() {
   check('★ 切页落地时页面栈可能还是旧页：_tabWant 优先于 route（不在 if (route) 的 else 里）',
         /_tabWantAt/.test(js) && wantDepth === 2, 'depth=' + wantDepth);
   check('切页仍是「先播退出动画 → 200ms 后 switchTab」',
-        /cp\.animateExit\(dir\)/.test(js) && /wx\.switchTab\(\{ url: '\/' \+ target\.pagePath \}\) \}, 200\)/.test(js));
+        /cp\.animateExit\(dir\)/.test(js) && /\}, 200\)/.test(js)
+        && /wx\.switchTab\(\{ url: '\/' \+ target\.pagePath \}\)/.test(js));
 }
 
 /* ---------------- 二、落位 / 点按 ---------------- */
@@ -509,6 +519,30 @@ function runInstanceTests() {
         JSON.stringify(c6.timers.map((t) => t.ms)));
   c6.timers[0].fn();
   check('200ms 后真的 switchTab 到「我」', c6.sandbox.__switchTo === '/pages/me/me', c6.sandbox.__switchTo);
+  check('★ 换页那一次 setData 把本实例 thumbX 改成目标格（框架重下发 style 也拽不回上一格）',
+        i6.setDataCalls.length === 1 && Math.abs(Number(i6.setDataCalls[0].thumbX) - 147.5) < 0.01,
+        JSON.stringify(i6.setDataCalls));
+
+  /* 7-6b 静态：改落位必须排在 switchTab 之前（顺序反了等于没改） */
+  const ctrlSrc = fs.readFileSync(path.join(TAB_DIR, 'index.js'), 'utf8');
+  const goSeg = ctrlSrc.slice(ctrlSrc.indexOf('_goTab(index) {'));
+  const iSet = goSeg.indexOf('setData({ thumbX: index * geo.step })');
+  const iSw = goSeg.indexOf('wx.switchTab(');
+  check('★ 先改 thumbX 再 switchTab', iSet > 0 && iSw > 0 && iSet < iSw, iSet + ' < ' + iSw);
+
+  /* 7-6c ★ 有弹窗时 cp.animateExit 会自己接管切页并 return false —— 那条路上也必须已经落下 _tabWant，
+     否则新页面的 tabBar 拿不到目标格、只能按旧 route 落 0，一帧后再被页面 onShow 拽回来（就是那 2 帧闪） */
+  const c6c = loadController();
+  c6c.sandbox.__pages = [{ route: 'pages/index/index', animateExit: () => false }];
+  const i6c = instantiate(c6c.def);
+  i6c.data.selected = 0;
+  i6c._goTab(1);
+  check('★ 弹窗分支（animateExit 返回 false 自己 switchTab）也已经落下 _tabWant',
+        c6c.store._tabWant === 1 && c6c.store._tabWantAt > 0, JSON.stringify(c6c.store));
+  const iWant = goSeg.indexOf("wx.setStorageSync('_tabWant'");
+  const iExit = goSeg.indexOf('cp.animateExit(dir)');
+  check('★ 落 _tabWant 必须排在 animateExit 之前', iWant > 0 && iExit > 0 && iWant < iExit,
+        iWant + ' < ' + iExit);
 
   /* 7-7 同格点击不切页、不写 storage */
   const c7 = loadController();
