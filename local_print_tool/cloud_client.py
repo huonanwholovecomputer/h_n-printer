@@ -2595,7 +2595,11 @@ class CloudClient(QObject):
 
             # 3. 确定是否需要转换（**云端来源 ⇒ Office 默认强制 LibreOffice，S1-04**；
             #    唯一例外是管理员上传的文件，与打印侧同一口径，见 allow_cloud_com）
-            if ext in (".doc", ".docx"):
+            # 表格（2026-11-15 移动端支持 Excel）：与 Word 走同一条转换链 —— 打印侧
+            # cloud_client/gui 也是 converter.convert(from_cloud=…, allow_cloud_com=…)，
+            # 分析用哪个引擎、打印就用哪个（Excel COM 与 LibreOffice 的分页可能不同，
+            # 页数是计费输入，两边必须同源）。
+            if ext in (".doc", ".docx", ".xls", ".xlsx"):
                 if _canceled():
                     return
                 self.status_message.emit(f"☁ 页数分析: 转换 {file_name} → PDF ...")

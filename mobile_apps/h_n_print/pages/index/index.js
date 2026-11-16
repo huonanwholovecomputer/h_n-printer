@@ -50,8 +50,8 @@ function _fileCardTypeKey(file) {
 
 // 文件卡片实际高度（rpx）：基础类型高度 + 文本模式每多一个范围行的增量
 // + 两个开关行（含提示行）+「封面单独打印」展开后的单面页输入区。
-// 仅文本模式(页数未知)按范围行数累加；网格模式/整份1页/图片/Excel 的 rangeLines 不渲染为独立行，不计增量。
-// 但**开关行**在网格模式同样渲染（图片/Excel/整份1页没有控件区，不渲染）。
+// 仅文本模式(页数未知)按范围行数累加；网格模式/整份1页/图片/不支持格式 的 rangeLines 不渲染为独立行，不计增量。
+// 但**开关行**在网格模式同样渲染（图片/不支持格式/整份1页没有控件区，不渲染）。
 function _fileCardHeightRpx(file) {
   const base = FILE_CARD_HEIGHT_RPX[_fileCardTypeKey(file)] || 0
   const controlled = !file.excelWarning && !file.isImage && file.pageCount !== 1
@@ -132,17 +132,19 @@ const RANGE_SPAN_CAP = 10000
 
 /* ---- 页数可信度：复制价格的前置校验 -------------------------------------------
 
-   后端只对 PDF 能自己数页（pypdf）；Word / Markdown / TXT / CSV 都必须由**本地打印
-   工具**转换后才是真实页数，上传/提交时后端只能按 1 页兜底估算：
-     · Word（doc/docx）：上传时 files.page_count=0（等本地工具回报），提交订单时后端
-       取不到页数 → 按 1 页算价（app.py submit_order 的 `or 1`）；
+   后端只对 PDF 能自己数页（pypdf）；Word / Excel / Markdown / TXT / CSV 都必须由
+   **本地打印工具**转换后才是真实页数，上传/提交时后端只能按 1 页兜底估算：
+     · Word（doc/docx）、表格（xls/xlsx）：上传时 files.page_count=0（等本地工具回报），
+       提交订单时后端取不到页数 → 按 1 页算价（app.py submit_order 的 `or 1`）；
      · md / txt / csv：上传时被 get_file_page_count 直接按 1 页写入。
    于是接管设备离线（等不到页数回报）时，这类文件的页数是**假值**，价格算出来比实收少。
    对策：「复制价格 / 复制详细价格」前校验——只要有一个文件页数不可信就拒绝复制并提示。
    可信判据：page_count > 0 且（PDF/图片由后端直接数页 → 可信；上述类型必须
    page_count_verified=1，即本地打印工具转换回报过）。 */
-const PAGE_COUNT_LOCAL_EXTS = ['doc', 'docx', 'md', 'txt', 'csv']
-const PAGE_COUNT_LOCAL_TYPE_LABELS = { doc: 'Word', docx: 'Word', md: 'Markdown', txt: 'TXT', csv: 'CSV' }
+// 表格（xls/xlsx）也归「必须本地打印工具分析」一类：Excel/LibreOffice 分页只能由设备转出，
+// 服务端不数页；page_count>0 但 verified=0 的历史脏数据同样不可信（2026-11-15 Excel 接入）。
+const PAGE_COUNT_LOCAL_EXTS = ['doc', 'docx', 'md', 'txt', 'csv', 'xls', 'xlsx']
+const PAGE_COUNT_LOCAL_TYPE_LABELS = { doc: 'Word', docx: 'Word', md: 'Markdown', txt: 'TXT', csv: 'CSV', xls: '表格', xlsx: '表格' }
 
 /* 取小写扩展名（不含点）；无扩展名返回 ''。 */
 function _extLower(name) {
@@ -191,7 +193,7 @@ Component({
     priceInvalidHint: '',
     showAccessDeniedModal: false,
     showPageCountWarning: false,   // 页数未验证警告弹窗
-    showUnsupportedSkipModal: false,  // 存在不支持格式（Excel/PPT/CAD）→ 确认自动跳过的弹窗
+    showUnsupportedSkipModal: false,  // 存在不支持格式（PPT/CAD）→ 确认自动跳过的弹窗
     unsupportedSkipCount: 0,
     modalClosing: false,           // 弹窗关闭动画进行中
     userRole: '',
@@ -1013,7 +1015,7 @@ Component({
       this._scheduleMeasure(400)
     },
 
-    // 探测工具（一次性）：临时注入 图片/网格/网格单选/文本/文本单选/单页Word/Excel 七张「完整」卡片
+    // 探测工具（一次性）：临时注入 图片/网格/网格单选/文本/文本单选/单页Word/不支持格式 七张「完整」卡片
     // （fileId 已存在 → 控件/页数条全展开），实测各自精确高度输出到控制台，
     // 用于替换上方 FILE_CARD_HEIGHT_RPX 的硬编码值。
     // 调用：开发者工具控制台执行 getCurrentPages()[0]._probeCardHeights()
@@ -1038,7 +1040,8 @@ Component({
         mk({ name: '探测-文本单选.docx', fileId: 990007, isImage: false, pageCount: 0, pageCountStatus: 'analyzing', pageRange: '5', rangeLines: [{ value: '5', error: '' }], copies: 3, singlePage: true }),
         // 整份 1 页
         mk({ name: '探测-单页文档.docx', fileId: 990004, isImage: false, pageCount: 1, pageCountStatus: 'confirmed', duplex: 'off', copies: 3, singlePage: true }),
-        mk({ name: '探测-表格.xlsx', fileId: 990003, isImage: false, excelWarning: true, pageCount: 0, pageCountStatus: '' }),
+        // 「不支持格式」卡片（Excel 已支持，这里改用 PPT 作代表；key 仍叫 excel，与 measure_card_heights.mjs 对齐）
+        mk({ name: '探测-演示.ppt', fileId: 990003, isImage: false, excelWarning: true, pageCount: 0, pageCountStatus: '' }),
       ]
       // 临时撑开列表高度，确保 7 张卡片完整渲染（0 高度容器可能不产出布局）
       this.setData({ selectedFiles: probes, badgeCount: probes.length, fileListHeight: 1600 }, () => {
@@ -1083,8 +1086,9 @@ Component({
     _bumpForNewFile() {
       const { windowWidth, windowHeight } = wx.getWindowInfo()
       const rpxRatio = (windowWidth || 375) / 750
-      // 文件列表为有界原生 scroll-view（显式高度驱动，上限 ≈ 85vh / 3~4 个卡片）。
-      // 达到上限后新增文件只内部滚动、不再撑高页面，故 contentEst 不再增长。
+      // 文件列表是有界滚动框（显式高度驱动，上限 ≈ 85vh / 3~4 个卡片），但**不是原生
+      // scroll-view**：内层 .file-list-track 由 utils/scroll.wxs 直驱 translateY，
+      // 到边当帧把余量交给外层 .scroller。达到上限后新增文件只内部滚动、不再撑高页面。
       const listCapPx = Math.round((windowHeight || 800) * 0.85)
       const files = this.data.selectedFiles
       let sumRpx = 0
@@ -1136,10 +1140,13 @@ Component({
           const picked = (res.tempFiles || []).slice(0, remaining)
           if (!picked.length) return
           const imageExts = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
-          // 不支持自动打印的类型（可添加显示，但无法打印，需联系管理员）：Excel/PPT/CAD
-          const unsupportedExts = ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf']
+          // 不支持自动打印的类型（可添加显示，但无法打印，需联系管理员）：PPT/CAD
+          // 2026-11-15：Excel（.xls/.xlsx）转为**支持** —— 页数由本地打印工具用
+          // Excel/WPS 表格（顾客上传的走 LibreOffice，S1-04）转换后回报；版式（纸张/
+          // 缩放/页边距/打印区域）完全按工作簿自身的页面设置，与本地打印工具的默认口径一致。
+          const unsupportedExts = ['.ppt', '.pptx', '.dwg', '.dxf']
           // 可打印的支持格式（html/htm 已移除）
-          const supportedExts = ['.pdf', '.doc', '.docx', '.txt', '.csv', '.md',
+          const supportedExts = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.csv', '.md',
             '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif']
           let oversizeCount = 0
           let unknownCount = 0
@@ -1186,7 +1193,7 @@ Component({
               imageOrientation: 'auto',   // 图片打印方向: auto=自动 / landscape=横向 / portrait=竖向
               entering: true,
               removing: false,
-              excelWarning: item.isUnsupported,   // 不支持自动打印的类型（Excel/PPT/CAD）
+              excelWarning: item.isUnsupported,   // 不支持自动打印的类型（PPT/CAD）
               unsupportedFormat: false,   // 未知格式已在选择时拦截，不会到达此处
               isImage: item.isImage,
               pageCount: 0,
@@ -1350,7 +1357,7 @@ Component({
           imageOrientation: isImage ? (f.image_orientation || 'auto') : 'auto',
           entering: true,
           removing: false,
-          excelWarning: ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf'].indexOf(ext) !== -1,  // 与添加路径一致
+          excelWarning: ['.ppt', '.pptx', '.dwg', '.dxf'].indexOf(ext) !== -1,  // 与添加路径一致（Excel 已支持）
           unsupportedFormat: false,
           isImage: isImage,
           pageCount: Number(f.page_count) || 0,
@@ -1558,7 +1565,7 @@ Component({
           const file = this.data.selectedFiles[currentIndex]
           if (file && file.isImage) pageCount = 1
 
-          // 判断页数状态：PDF 直接确认，doc/docx 进入分析中
+          // 判断页数状态：PDF 等后端能数页的直接确认，doc/docx/xls/xlsx 进入分析中（等设备回报）
           let pageCountStatus = ''
           if (!file || !file.isImage) {
             pageCountStatus = pageCount > 0 ? 'confirmed' : 'analyzing'
@@ -1755,11 +1762,12 @@ Component({
               const files = this.data.selectedFiles
               if (files[fileIndex] && files[fileIndex].fileId === fileId) {
                 const currentStatus = files[fileIndex].pageCountStatus
-                // v4.4：仅 doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告；
-                // PDF 等后端可直接数页的类型保持「等待中」，后端未返回时正常等待即可
+                // v4.4：doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告；
+                // PDF 等后端可直接数页的类型保持「等待中」，后端未返回时正常等待即可。
+                // 2026-11-15：表格（xls/xlsx）与 Word 同类（设备端转换才能出页数），一并进这条判据。
                 const fname = files[fileIndex].name || ''
                 const fext = fname.indexOf('.') >= 0 ? fname.split('.').pop().toLowerCase() : ''
-                const needLocal = fext === 'doc' || fext === 'docx'
+                const needLocal = fext === 'doc' || fext === 'docx' || fext === 'xls' || fext === 'xlsx'
                 if (!printerOnline && needLocal) {
                   // 打印机离线 → 显示黄色警告；离线同样计数，避免无限轮询
                   if (currentStatus !== 'offline') {
@@ -3640,13 +3648,13 @@ Component({
         return
       }
 
-      // 检查是否有可打印的文件（排除 Excel/PPT/CAD 等不支持格式）
+      // 检查是否有可打印的文件（排除 PPT/CAD 等不支持格式）
       const printable = selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat)
       const unsupportedCount = selectedFiles.length - printable.length
       if (printable.length === 0) {        // 全部不支持 → 任务发起失败
         wx.showModal({
           title: '任务发起失败',
-          content: '所选文件均为不支持的文件格式（如 Excel/PPT/CAD），无法打印。请移除后重新选择，或联系管理员。',
+          content: '所选文件均为不支持的文件格式（如 PPT/CAD），无法打印。请移除后重新选择，或联系管理员。',
           showCancel: false,
           confirmText: '知道了',
         })
@@ -3733,7 +3741,7 @@ Component({
       }, 200)
     },
 
-    // 确认跳过不支持格式（Excel/PPT/CAD），提交其余可打印文件
+    // 确认跳过不支持格式（PPT/CAD），提交其余可打印文件
     onConfirmSkipUnsupported() {
       if (this.data.modalClosing) return
       this.setData({ modalClosing: true })
@@ -3761,7 +3769,7 @@ Component({
         return
       }
       const { selectedFiles } = this.data
-      // 提交时跳过不支持格式（Excel/PPT/CAD），仅提交可打印文件
+      // 提交时跳过不支持格式（PPT/CAD），仅提交可打印文件
       const printableFiles = selectedFiles.filter(f => !f.excelWarning && !f.unsupportedFormat)
 
       this.setData({ submitting: true })

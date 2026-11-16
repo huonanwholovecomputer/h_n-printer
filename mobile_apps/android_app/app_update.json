@@ -1,8 +1,8 @@
 {
-  "version": "1.1.61",
-  "versionCode": 62,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.61.apk",
-  "md5": "5c5361d6c426154765bf1a1cf3ae356e",
-  "notes": "v1.1.61：① 全屏预览顶部让开系统状态栏（关闭按钮与页码不再被状态栏压住）。② 左右翻页加过渡动画：旧页滑出、新页滑入，不再生硬直切。③ APP 全屏预览底部补上「双击放大 · 双指捏合 · 左右滑动翻页」提示。",
+  "version": "1.1.62",
+  "versionCode": 63,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.62.apk",
+  "md5": "c416af1892bc6dfae7de99cb24f3fa2f",
+  "notes": "v1.1.62：① 支持 Excel 表格（.xls/.xlsx）打印，口径与本地打印工具一致（按工作簿自身的页面设置导出，纸张/缩放/页边距/打印区域都不改写）。② 表格页数改由本地打印工具按同一引擎分析后回填，多页表格不再按 1 页少收费；设备离线时显示「本地打印工具离线」提示而不是一直等待。③ 文件卡片不再对 .xls/.xlsx 显示「该文件类型不支持自动打印」。",
   "force": false
 }

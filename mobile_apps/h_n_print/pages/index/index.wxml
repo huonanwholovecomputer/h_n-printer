@@ -107,7 +107,9 @@
                原生框滚到边之后没人能接管（现场：「列表滑到底，整个页面不跟着动」）。改成 view + 内层
                track，由 utils/scroll.wxs 直驱 translateY —— 内层到边当帧把余量交给外层，外层到顶再交还
                内层；偏移与边界全靠 selectAllComponents + getBoundingClientRect 量出来，不再需要
-               bindscroll → setData → change:prop 三跳同步贴边（那三跳就是死区）。 -->
+               bindscroll → setData → change:prop 三跳同步贴边（那三跳就是死区）。
+               量框量轨都走 owner 级（selectAllComponents），普通 view 的 ComponentDescriptor 上拿不到
+               子节点（2026-11-15 现场：靠描述对象取 track ⇒ 内层被锁死、外层永远接管）。 -->
           <view class="file-list-scroll" style="height: {{fileListHeight}}px;">
             <view class="file-list-track">
           <view
@@ -151,7 +153,7 @@
               </block>
               <block wx:elif="{{item.fileId}}">
                 <text class="status-label done">已上传</text>
-                <!-- 页数分析进度（非图片/Excel 文件）-->
+                <!-- 页数分析进度（非图片/不支持格式 文件）-->
                 <view wx:if="{{!item.isImage && !item.excelWarning && !item.unsupportedFormat && item.pageCountStatus === 'analyzing'}}" class="page-analysis-bar">
                   <view class="analysis-dot-pulse"></view>
                   <text class="analysis-text">正在分析页数，本地打印工具转换中…</text>
@@ -167,7 +169,7 @@
               </block>
             </view>
 
-            <!-- Per-file controls（上传中即显示，保证卡片高度按类型恒定；excel/不支持格式无控件区） -->
+            <!-- Per-file controls（上传中即显示，保证卡片高度按类型恒定；不支持格式无控件区） -->
             <view wx:if="{{!item.excelWarning && !item.unsupportedFormat}}" class="file-controls">
 
               <!-- Copies stepper -->
@@ -571,12 +573,12 @@
   </view>
 </view>
 
-<!-- 跳过不支持格式（Excel/PPT/CAD）确认弹窗 -->
+<!-- 跳过不支持格式（PPT/CAD）确认弹窗 -->
 <view wx:if="{{showUnsupportedSkipModal}}" class="modal-mask {{modalClosing ? 'modal-closing' : ''}} {{isDarkMode ? 'theme-dark' : ''}}">
   <view class="modal-sheet" catchtap="noop">
     <view class="modal-icon-wrap" style="background-color: rgba(255, 149, 0, 0.1); color: #FF9500;">⚠</view>
     <text class="title-medium" style="margin-bottom: 8rpx;">存在不支持的文件格式</text>
-    <text class="body-small" style="margin-bottom: 6rpx;">任务中存在 {{unsupportedSkipCount}} 个不支持的文件格式（Excel/PPT/CAD），</text>
+    <text class="body-small" style="margin-bottom: 6rpx;">任务中存在 {{unsupportedSkipCount}} 个不支持的文件格式（PPT/CAD），</text>
     <text class="body-small">提交时将自动跳过，仅打印其余文件。</text>
     <view class="modal-buttons">
       <button class="btn-secondary modal-half-btn" bindtap="onCancelSkipUnsupported" hover-class="tap-active">取消</button>

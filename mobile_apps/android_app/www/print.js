@@ -1,9 +1,11 @@
 /* HN Cloud Print — Android App 打印流程（与小程序 index 页视觉对齐） */
 
-const SUPPORTED_EXTS = ['.pdf', '.doc', '.docx', '.txt', '.csv', '.md',
+// 2026-11-15：Excel（.xls/.xlsx）转为支持 —— 页数由本地打印工具转换后回报，
+// 版式（纸张/缩放/页边距/打印区域）按工作簿自身的页面设置，与本地打印工具口径一致。
+const SUPPORTED_EXTS = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.txt', '.csv', '.md',
   '.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif'];
 const IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif'];
-const UNSUPPORTED_EXTS = ['.xls', '.xlsx', '.ppt', '.pptx', '.dwg', '.dxf'];
+const UNSUPPORTED_EXTS = ['.ppt', '.pptx', '.dwg', '.dxf'];
 const MAX_FILES = 20;
 const MAX_FILE_MB = 50;
 const MAX_POLL_ATTEMPTS = 60;
@@ -1199,10 +1201,10 @@ function startPageCountPoll(f, fileId) {
           stopPageCountPoll(f);
           return true;
         }
-        // v4.4：仅 doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告；
+        // v4.4：doc/docx 需要本地打印工具分析页数 → 离线时才提示黄色警告（2026-11-15 起表格 xls/xlsx 同列）；
         // PDF 等后端可直接数页的类型保持「等待中」，后端未返回时正常等待即可
         const fext = (f.name || '').includes('.') ? f.name.split('.').pop().toLowerCase() : '';
-        const needLocal = fext === 'doc' || fext === 'docx';
+        const needLocal = fext === 'doc' || fext === 'docx' || fext === 'xls' || fext === 'xlsx';
         f.pageCountStatus = (r.data.printer_online || !needLocal) ? 'analyzing' : 'offline';
         attempts++;
         if (attempts >= MAX_POLL_ATTEMPTS) stopPageCountPoll(f);
@@ -1290,7 +1292,7 @@ function refreshSinglePage(idx) {
 }
 
 /* 「封面单独打印」是否不生效（契约 §1：duplex == 'off' 时 X 无意义，整份按单面算，且不落 simplex_pages）：
-   图片/Excel 不走范围逻辑；1 页文件固定单面；有效只选 1 页时模式被强制单面；用户自己选了「单面」。 */
+   图片（单页渲染）不走范围逻辑；1 页文件固定单面；有效只选 1 页时模式被强制单面；用户自己选了「单面」。 */
 function simplexDisabledFor(f) {
   if (!f) return true;
   if (f.isImage || f.excelWarning || f.unsupportedFormat) return true;
@@ -2356,17 +2358,19 @@ function clearFilesAfterSuccess() {
 
 /* ---- 页数可信度：复制价格的前置校验（与小程序同口径）-------------------------
 
-   后端只对 PDF 能自己数页（pypdf）；Word / Markdown / TXT / CSV 都必须由**本地打印
-   工具**转换后才是真实页数，上传/提交时后端只能按 1 页兜底估算：
-     · Word（doc/docx）：上传时 page_count=0（等本地工具回报），提交订单时后端取不到
-       页数 → 按 1 页算价（app.py submit_order 的 `or 1`）；
+   后端只对 PDF 能自己数页（pypdf）；Word / Excel / Markdown / TXT / CSV 都必须由
+   **本地打印工具**转换后才是真实页数，上传/提交时后端只能按 1 页兜底估算：
+     · Word（doc/docx）、表格（xls/xlsx）：上传时 page_count=0（等本地工具回报），提交
+       订单时后端取不到页数 → 按 1 页算价（app.py submit_order 的 `or 1`）；
      · md / txt / csv：上传时被 get_file_page_count 直接按 1 页写入。
    于是接管设备离线（等不到页数回报）时，这类文件的页数是假值，价格比实收少算。
    对策：「复制价格 / 复制详细价格」前校验——只要有一个文件页数不可信就拒绝复制并提示。
    可信判据：page_count > 0 且（PDF/图片由后端直接数页 → 可信；上述类型必须
    page_count_verified=1，即本地打印工具转换回报过）。 */
-const PAGE_COUNT_LOCAL_EXTS = ['doc', 'docx', 'md', 'txt', 'csv'];
-const PAGE_COUNT_LOCAL_TYPE_LABELS = { doc: 'Word', docx: 'Word', md: 'Markdown', txt: 'TXT', csv: 'CSV' };
+// 表格（xls/xlsx）同属「必须本地打印工具分析」一类（2026-11-15 Excel 接入）：服务端不数页，
+// 未 verified 的页数一律不可信。
+const PAGE_COUNT_LOCAL_EXTS = ['doc', 'docx', 'md', 'txt', 'csv', 'xls', 'xlsx'];
+const PAGE_COUNT_LOCAL_TYPE_LABELS = { doc: 'Word', docx: 'Word', md: 'Markdown', txt: 'TXT', csv: 'CSV', xls: '表格', xlsx: '表格' };
 
 /** 取小写扩展名（不含点）；无扩展名返回 ''。 */
 function extLowerOf(name) {

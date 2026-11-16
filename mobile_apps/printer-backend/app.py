@@ -3021,11 +3021,15 @@ def get_file_page_count(file_path, file_type=None):
             print(f"  [PAGE] PDF 文件不在磁盘，默认按 1 页计算")
             return 1
 
-    # Word 文档：交本地打印工具转换计数（Word/WPS 比服务器 LibreOffice 更可靠）
-    if file_type in ("doc", "docx"):
+    # Word / 表格文档：交本地打印工具转换计数（Word/WPS、Excel/WPS 表格 比服务器
+    # LibreOffice 更可靠，且与**打印侧**的引擎同一口径 —— 分析用 LO、打印用 Excel 时
+    # 回报的页数会与实际出纸张数不符，那是计费输入）。
+    # 表格自 2026-11-15（移动端支持 Excel）并入本口径：此前落到下面的"默认 1 页"，
+    # 多页表格会被按 1 页少收费，页码区间校验也永远按 1 页判。
+    if file_type in ("doc", "docx", "xls", "xlsx"):
         name = os.path.basename(file_path) if file_path else "未知文件"
         print(f"  [PAGE] {file_type.upper()} {name}: 等待本地打印工具分析页数")
-        return 0  # 0 表示"待验证"，由本地打印工具通过 Word/WPS 转换后回报
+        return 0  # 0 表示"待验证"，由本地打印工具转换后回报
 
     # 图片文件：按 1 页计算
     if file_type in ("png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff", "tif"):
@@ -6849,7 +6853,9 @@ def _pending_page_analysis_rows(conn, limit: int = 20):
         " LEFT JOIN order_files of ON f.id = of.file_id"
         " WHERE f.page_count_verified = 0 AND f.path != ''"
         " AND (f.page_count = 0 OR lower(f.original_name) LIKE '%.doc'"
-        "      OR lower(f.original_name) LIKE '%.docx')"
+        "      OR lower(f.original_name) LIKE '%.docx'"
+        "      OR lower(f.original_name) LIKE '%.xls'"
+        "      OR lower(f.original_name) LIKE '%.xlsx')"
         " AND (of.id IS NULL OR of.status IN ('queued', 'printing', 'accepted'))"
         " LIMIT ?",
         (int(limit),),
@@ -7183,7 +7189,8 @@ def get_file_page(file_id):
     # doc/docx 只要 page_count_verified=0 就补推，哪怕 files.page_count 被历史兜底值写成 1
     # （否则「页数未知时提交」的 Word 会被永久冻结在 1 页）。
     if (printer_online and not row["page_count_verified"]
-            and ((row["page_count"] or 0) <= 0 or ext in (".doc", ".docx"))):
+            and ((row["page_count"] or 0) <= 0
+                 or ext in (".doc", ".docx", ".xls", ".xlsx"))):
         # 前端把当前选中的接单设备带上来 → 优先由它分析（用户选了哪台就哪台下载/转换）；
         # 目标设备离线时 _resolve_analysis_client 会退回订单目标/任一在线接单设备
         prefer_client = (request.args.get("target_client_id", "") or "").strip()[:64]
@@ -7197,7 +7204,7 @@ def get_file_page(file_id):
     verified = bool(row["page_count_verified"])
     if page_count <= 0 and not verified:
         ext = os.path.splitext(row["original_name"] or "")[1].lower()
-        if ext and ext not in (".doc", ".docx"):
+        if ext and ext not in (".doc", ".docx", ".xls", ".xlsx"):
             fpath = _resolve_files_path(row["path"])
             if fpath and os.path.exists(fpath):
                 new_count = get_file_page_count(fpath, ext.lstrip("."))
@@ -9075,7 +9082,7 @@ def upload_file():
     # 对需要本地工具分析的文档格式，请求直连的打印客户端下载并分析页数
     # 但若同 MD5 已有验证页数，跳过分析
     # prefer：前端当前选中的接单设备（用户选了哪台就哪台分析；离线则退回订单目标/任一在线接单设备）
-    if page_count == 0 and ext_lower in ("doc", "docx") and not cached_page_verified:
+    if page_count == 0 and ext_lower in ("doc", "docx", "xls", "xlsx") and not cached_page_verified:
         prefer_client = (request.form.get("target_client_id", "") or "").strip()[:64]
         request_page_analysis(file_id, display_name, prefer_client=prefer_client)
 
@@ -9143,7 +9150,7 @@ def _plan_order_files(conn, files_input, openid, default_duplex, schedule_mode, 
                     _computed = get_file_page_count(frow["path"], ext) or 0
                     if _computed > 0:
                         page_count = _computed
-                        page_count_verified = ext not in ("doc", "docx")
+                        page_count_verified = ext not in ("doc", "docx", "xls", "xlsx")
                         persist_pages = (page_count, page_count_verified)
                     else:
                         # 2026-10-17：页数未知时**只对本单按 1 页兜底计价**，绝不把兜底值
