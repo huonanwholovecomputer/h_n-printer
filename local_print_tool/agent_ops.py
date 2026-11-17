@@ -23,6 +23,7 @@ op 清单（params 都是 JSON 对象）
     status                              → 程序/打印机/忙碌状态
     tabs.list                           → 全部标签页摘要
     tabs.get        {tab}               → 单个标签页明细（含每个文件）
+    tabs.price_detail {tab}             → 计费明细原文 + 取号/建 reserved 预留单（=界面「复制计费明细」）
     tabs.create     {switch?}           → 新建标签页，返回 tab
     tabs.update     {tab, ...选项}      → 改附加服务/归属/备注
     tabs.delete     {tab, force?}       → 删除标签页
@@ -292,6 +293,53 @@ class AgentOps:
         data = self._brief(key, tab)
         data["jobs"] = [self._job_brief(i, j) for i, j in enumerate(tab.jobs)]
         return data
+
+    def op_tabs_price_detail(self, params: dict) -> dict:
+        """取「复制计费明细」那段原文，并为这一页落订单号 + reserved 预留单。
+
+        小印发价（桥 `print_price_detail`）走这一条：和界面按钮 `_on_copy_detail` 是**同一份**
+        GUI 逻辑（`MainWindow._price_detail_text`），所以未出纸也有正式单号，不再返回
+        "没单号的占位文本"（2026-11 用户要求）。与打印/开单一致，无成员时拒绝建单。
+        """
+        key, tab = self._tab(params.get("tab"))
+        if not tab.jobs:
+            raise AgentOpError("empty", f"标签页 {key} 里没有文件，没有可发的计费明细")
+        if not self.win._has_members():
+            raise AgentOpError(
+                "no_member",
+                "当前没有可用成员，不能创建订单：先在打印工具「文件 → 收支统计 → 设置」添加成员")
+        # 正在打印的页：只取现有单号拼文本，不取号也不重报 —— 上报会把云端已 sent 的单
+        # 打回 reserved（记录时点/状态全错）。
+        inflight: list = []
+        try:
+            inflight = list(self.win._tab_jobs_in_flight(key) or [])
+        except Exception:      # noqa: BLE001 —— 判定失败时按"不在打印"处理，与旧 body 一致
+            inflight = []
+        text, order_number = self.win._price_detail_text(key, create=not inflight)
+        total, unknown, _pages = self._total(tab)
+        try:
+            client = self.win._cloud_client
+            online = bool(client and client.is_connected() and client.api_url and client.auth_token)
+        except Exception:      # noqa: BLE001
+            online = False
+        upper = str(order_number or "").upper()
+        offline_number = bool(upper) and ("-L" in upper or upper.startswith("LOCAL-"))
+        self.win._log(f"🤖 助手取计费明细（标签页 {key}）：订单号 "
+                      f"{order_number or '(暂无单号)'}{'，预留单已建' if (online and not offline_number) else ''}")
+        return {
+            "tab": key,
+            "text": text,
+            "order_number": order_number,
+            "online": online,
+            "printing": bool(inflight),
+            # 云端已经把这一单建成 reserved 占位（取号即建单，随后 reserved 上报补明细）
+            "reserved": bool(order_number) and online and not offline_number,
+            "offline_number": offline_number,
+            "cost": total,
+            "files": len(tab.jobs),
+            "pages_unknown": unknown,
+            "owner_name": getattr(tab, "owner_name", "") or "",
+        }
 
     def op_tabs_create(self, params: dict) -> dict:
         prev = str(self.win._current_tab)
@@ -1098,6 +1146,7 @@ _OPS = {
     "status": AgentOps.op_status,
     "tabs.list": AgentOps.op_tabs_list,
     "tabs.get": AgentOps.op_tabs_get,
+    "tabs.price_detail": AgentOps.op_tabs_price_detail,
     "tabs.create": AgentOps.op_tabs_create,
     "tabs.update": AgentOps.op_tabs_update,
     "tabs.delete": AgentOps.op_tabs_delete,

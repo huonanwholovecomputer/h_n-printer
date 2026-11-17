@@ -398,6 +398,44 @@ try:
 except agent_api.AgentOpError as e:
     check("②l 封面页超出总页数被拒（invalid）", e.code == "invalid", e.message)
 
+# ── 发价（tabs.price_detail）：与界面「复制计费明细」同一份逻辑 ──
+# 2026-11 用户现场：先让小印发价、还没出纸时旧实现没有订单号。这个 op 必须先在打印工具里
+# 取号（云端同时建 reserved 预留单）再拼原文，文本与界面按钮逐字相同。
+pd = ops("tabs.price_detail", {"tab": tab_key})
+check("②Z1 发价返回明细原文 + 订单号",
+      pd["text"].startswith("订单号: ") and bool(pd["order_number"])
+      and "计费明细" in pd["text"] and "💰合计: ¥" in pd["text"],
+      pd["text"][:200])
+check("②Z2 离线时给 -L 临时号、且不谎报已预留",
+      pd["offline_number"] is True and pd["reserved"] is False
+      and "-L" in str(pd["order_number"]).upper(),
+      json.dumps({k: pd[k] for k in ("order_number", "online", "reserved", "offline_number")},
+                 ensure_ascii=False))
+check("②Z3 发价的合计与 tabs.get 同一口径",
+      abs(pd["cost"] - ops("tabs.get", {"tab": tab_key})["cost"]) < 1e-9,
+      f"{pd['cost']}")
+check("②Z4 单号已写回这一页的文件（后台页也不丢号）",
+      all(j.order_number == pd["order_number"] for j in win._config.tabs[tab_key].jobs))
+
+# 空页 / 无成员：和界面按钮一样拒绝（不替不存在的成员建单、不凭空发价）
+empty_tab = ops("tabs.create", {"switch": False})["tab"]
+try:
+    ops("tabs.price_detail", {"tab": empty_tab})
+    check("②Z5 空页发价被拒", False)
+except agent_api.AgentOpError as e:
+    check("②Z5 空页发价被拒（empty）", e.code == "empty", e.message)
+ops("tabs.delete", {"tab": empty_tab})
+
+_saved_admins = list(win._config.admin_names)
+win._config.admin_names = []
+try:
+    ops("tabs.price_detail", {"tab": tab_key})
+    check("②Z6 无成员时拒绝发价", False)
+except agent_api.AgentOpError as e:
+    check("②Z6 无成员时拒绝发价（no_member）", e.code == "no_member", e.message)
+finally:
+    win._config.admin_names = _saved_admins
+
 # 单页硬闸门：1 页文件无论怎么请求，双面一律 off（硬规矩 1）
 r = ops("files.add", {"tab": tab_key, "paths": [PDF1], "options": {"duplex": "on"}})
 check("②m 1 页文件请求双面 → 生效值 off（单页硬闸门）",
