@@ -97,14 +97,15 @@ function chargeUnits(pageSet, simplexSet) {
   const simp = (simplexSet instanceof Set) ? simplexSet : new Set(simplexSet || [])
   let dupSheets = 0
   let singleSheets = 0
-  // 连续段 = 页码连续 **且** X 归属相同（契约：按"该页是否属于 X"切段）。
-  // 只按页码连续切会把 [2..31] 当成一个双面段，16-23 的单面页就被算成双面张数了。
+  // 段边界**只认「该页是否属于 X」**，不看页号是否连号 —— 与后端 _charge_units
+  // （app.py:4076）、APP print.js:2575 逐字同口径。
+  // 2026-11-17 审计：这里原来多了一条「页号连号」判据，range='1,3,5' + simplex='1'
+  // 时本函数算出 3 张、后端实收按 2 张 ⇒ 确认页显示价恒高于实收（且没人会报错）。
   let i = 0
   while (i < pages.length) {
     const inX = simp.has(pages[i])
     let j = i
-    while (j + 1 < pages.length && pages[j + 1] === pages[j] + 1 &&
-           simp.has(pages[j + 1]) === inX) j++
+    while (j + 1 < pages.length && simp.has(pages[j + 1]) === inX) j++
     const len = j - i + 1
     if (inX) {
       singleSheets += len

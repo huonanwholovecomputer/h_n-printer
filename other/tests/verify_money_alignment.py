@@ -96,25 +96,23 @@ check("①-b 实跑口径：timeout 被排除、sent 不被排除",
       _j.get("timeout") == 1 and _j.get("failed") == 1
       and _j.get("canceled") == 1 and _j.get("sent") == 0, _j)
 
-print("── ② 人工订正清单：timeout 不进（沿用既有口径），前后端必须同一份 ──")
-_TERMINAL = ["sent", "failed", "abandoned", "canceled", "rejected"]
+print("── ② 人工订正清单：timeout 必须可订正（v7.19 推翻 v7.15），前后端同一份 ──")
+# 终态集 = 已经给出最终结果的状态。timeout 也是终态：设备可能其实出了纸、也可能确实没出，
+# 只有操作员知道 —— 它的营收恒为 0，不给订正入口这笔钱永远对不上（v7.19 决定）。
+_TERMINAL = ["sent", "failed", "abandoned", "canceled", "rejected", "timeout"]
 _fix = re.search(r"var ORDER_FIXABLE_STATUSES = \[([^\]]*)\]", HTML, re.S)
 _fix_src = _fix.group(1) if _fix else ""
-check("②-a 前端可订正清单去掉 timeout（timeout 是自动过期的终态，订正它等于伪造一次打印）",
-      "timeout" not in _fix_src, _fix_src)
+_fe_list = sorted(re.findall(r"['\"]([a-z_]+)['\"]", _fix_src))
+check("②-a 前端可订正清单含 timeout（超时单只有操作员知道到底出没出纸）",
+      "timeout" in _fe_list, _fe_list)
 _be_fix = re.search(r"MANUAL_FIX_STATUSES = \(([^)]*)\)", SRC_BE, re.S)
 _be_fix_src = _be_fix.group(1) if _be_fix else ""
-check("②-b 后端可订正清单同样不含 timeout", "timeout" not in _be_fix_src, _be_fix_src)
-check("②-b2 两份清单就是那五个终态（多一个少一个都不行）",
-      sorted(re.findall(r"['\"]([a-z_]+)['\"]", _fix_src)) == sorted(_TERMINAL)
-      and sorted(re.findall(r"['\"]([a-z_]+)['\"]", _be_fix_src)) == sorted(_TERMINAL),
-      (sorted(re.findall(r"['\"]([a-z_]+)['\"]", _fix_src)),
-       sorted(re.findall(r"['\"]([a-z_]+)['\"]", _be_fix_src))))
-check("②-c 前端与后端清单逐项一致",
-      sorted(re.findall(r"['\"]([a-z_]+)['\"]", _fix_src)) ==
-      sorted(re.findall(r"['\"]([a-z_]+)['\"]", _be_fix_src)),
-      (sorted(re.findall(r"['\"]([a-z_]+)['\"]", _fix_src)),
-       sorted(re.findall(r"['\"]([a-z_]+)['\"]", _be_fix_src))))
+_be_list = sorted(re.findall(r"['\"]([a-z_]+)['\"]", _be_fix_src))
+check("②-b 后端可订正清单同样含 timeout", "timeout" in _be_list, _be_list)
+check("②-b2 两份清单逐项相同，且都 ⊆ 终态集（活跃态一个都不许进：排队/打印中会被重新捡起来打）",
+      _fe_list == _be_list and bool(_fe_list) and set(_fe_list) <= set(_TERMINAL),
+      (_fe_list, _be_list, _TERMINAL))
+check("②-c 前端与后端清单逐项一致", _fe_list == _be_list, (_fe_list, _be_list))
 check("②-d 后端 revenue 口径也排除 timeout",
       "timeout" in SRC_BE.split("elif f[\"status\"] not in", 1)[-1][:200]
       if "elif f[\"status\"] not in" in SRC_BE else False)

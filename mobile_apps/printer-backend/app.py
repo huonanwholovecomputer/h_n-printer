@@ -2691,7 +2691,10 @@ def _check_device_secret(device_id, provided):
         secrets_map = _load_device_secrets()
         secrets_map[key] = {
             "secret_hash": _hash_device_secret(new_secret),
-            "issued_at_ts": now_ts,
+            # 首次签发时刻**保持不变**：宽限期只能从第一次签发起算一次。
+            # 2026-11-17 审计：这里原来写 now_ts，于是老客户端每登录一次就把 14 天
+            # 宽限往后推一次 —— 「宽限到期强制设备凭证」永远不会发生，fail-closed 名存实亡。
+            "issued_at_ts": issued_at,
             "last_used_at": now_ts,
             "rotated_for_legacy": True,
         }
@@ -13336,7 +13339,31 @@ def statistics_my():
 # 预约单到点后设备一直没接单 → 后端 expire_stale_scheduled_orders() 把它置 timeout
 # （一张纸都没出，revenue 里也排除它）。若操作员后来手工打出来了，只能靠这里订正成 sent，
 # 否则那笔钱永远是 0、订单永远停在"超时"。前端 ORDER_FIXABLE_STATUSES 是同一份清单。
-MANUAL_FIX_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected")
+# v7.19（2026-11-17 用户决定）：把 timeout 真正落进清单 —— 上面 🔴-B7 只是写了注释、代码没跟，
+# 清单里一直没有它，超时单在结算页点不出订正入口，那笔钱永远是 0。
+MANUAL_FIX_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected", "timeout")
+
+# 人工订正被「当前状态还不是终态」拦下时给操作员看的一句话（中文、无 markdown 星号 —— 硬规矩 8）。
+# 文案要让人自己判断下一步：活跃态的单会被分发/预约调度继续捡起来打印，等它结束再订正。
+_STATUS_LABELS_ZH = {"queued": "排队中", "printing": "打印中", "waiting": "等待打印",
+                     "downloading": "文件传输中", "scheduled": "已预约", "accepted": "已添加",
+                     "reserved": "已预留", "offline_unknown": "断线未知",
+                     "unsynced": "离线未同步"}
+
+
+def _manual_fix_reject_reason(cur_status, active_files=()):
+    """active_files = [(子任务状态, 子任务 id), ...]；父单活跃时传空。"""
+    def _lbl(st):
+        return "「%s」" % _STATUS_LABELS_ZH.get((st or "").strip(), (st or "").strip() or "未知")
+
+    if active_files:
+        _shown = "、".join(_lbl(s) for s, _ in list(active_files)[:4])
+        return ("这单还有 %d 个子任务没结束（%s），现在订正会和设备正在跑的作业打架：等它们都结束"
+                "（已完成 / 失败 / 放弃打印 / 已取消 / 被打回 / 超时）后再订正。"
+                % (len(active_files), _shown))
+    return ("订单当前状态是%s，不是终态，不能人工订正：还在排队、打印或预约的单会被任务分发与预约调度"
+            "继续捡起来打印，这时候改状态就成了「页面说已结束、机器还在出纸」。等它变成终态"
+            "（已完成 / 失败 / 放弃打印 / 已取消 / 被打回 / 超时）后再订正。" % _lbl(cur_status))
 
 
 def _notify_order_no_longer_printable(order_id, status, task_ids, owner_clients, target_client=""):
@@ -13489,17 +13516,46 @@ def admin_order_status():
                 return jsonify({"success": False, "message": "订单不存在"}), 404
             old_status = row["status"]
             target_client = (row["target_client"] or "").strip()
+            # v7.19（L1-2）：人工订正**只对已经结束的单开放** —— 前置判据是「当前状态是终态」，
+            # 终态集就是 MANUAL_FIX_STATUSES（两份清单同源，不再另立第三份）。
+            # 活跃态（排队中 / 打印中 / 等待打印 / 文件传输中 / 预约 / 待添加 / 断线未知…）意味着
+            # 任务分发（push/pull）或预约调度还会把这张单捡起来打印、设备可能正把纸打出来；
+            # 这时改状态等于「页面说已结束，机器还在出纸」——钱按终态算、纸照样出。
+            # 设备是订单的最终裁决者（硬规矩 6），人工只能补它已经报过的结果，不能抢跑。
+            if (old_status or "").strip() not in MANUAL_FIX_STATUSES:
+                conn.rollback()
+                return jsonify({
+                    "success": False,
+                    "error": _manual_fix_reject_reason(old_status),
+                    "message": _manual_fix_reject_reason(old_status),
+                    "current_status": old_status or "",
+                }), 409
             # 通知设备用的目标清单（在改写之前收集）：谁摸过这单 + 这单的目标设备。
             # 改写只动 status/locked_at，不碰 operator_client/last_operator_client，先后无差别。
+            # 子任务的状态一并读出来：父单是终态、但还有一个子任务在活跃态时同样不许订正 ——
+            # 聚合状态是刷出来的（aggregate_order_status），子任务还在跑就是「这单还在跑」。
+            _active_files = []
             for r in conn.execute(
-                "SELECT id, operator_client, last_operator_client FROM order_files WHERE order_id = ?",
+                "SELECT id, operator_client, last_operator_client, status FROM order_files"
+                " WHERE order_id = ?",
                 (order_id,),
             ).fetchall():
                 task_ids.append(r["id"])
+                if (r["status"] or "").strip() not in MANUAL_FIX_STATUSES:
+                    _active_files.append(((r["status"] or "").strip(), r["id"]))
                 for cid in (r["operator_client"], r["last_operator_client"]):
                     cid = (cid or "").strip()
                     if cid:
                         owner_clients.add(cid)
+            if _active_files:
+                conn.rollback()
+                return jsonify({
+                    "success": False,
+                    "error": _manual_fix_reject_reason(old_status, _active_files),
+                    "message": _manual_fix_reject_reason(old_status, _active_files),
+                    "current_status": old_status or "",
+                    "active_task_ids": [str(t) for _s, t in _active_files],
+                }), 409
             cur = conn.execute(
                 "UPDATE order_files SET status = ?, locked_at = '' WHERE order_id = ?",
                 (new_status, order_id),
@@ -13858,8 +13914,8 @@ def admin_statistics_revenue():
         of_placeholders = ",".join("?" for _ in order_ids)
         of_rows = conn.execute(
             f"""SELECT id, order_id, file_name, copies, page_count, duplex,
-                       page_range, total_price, status, created_at, image_orientation, is_free,
-                       reject_reason
+                       page_range, simplex_pages, total_price, status, created_at,
+                       image_orientation, is_free, reject_reason
                 FROM order_files
                 WHERE order_id IN ({of_placeholders})
                 ORDER BY order_id, id""",
@@ -13874,9 +13930,18 @@ def admin_statistics_revenue():
             # 与 calculate_price / _file_range_stats 同源，避免结算页与金额对不上。
             # 🟡2：simplex_pages（封面单独打印的页）必须一起传，否则 `_charge_units` 摊不出来
             # ——31 页里 9 页单面是 20 张，不传就按 ceil(31/2)=16 张少算 4 张。
-            _st = _file_range_stats(of_row["page_count"] or 0, of_row["copies"] or 1,
-                                    of_row["duplex"] or "on", of_row["page_range"] or "",
-                                    _row_simplex_pages(of_row))
+            # v7.19（L1-3）：这一列此前**没进 SELECT**（_row_simplex_pages 缺列静默返回空串），
+            # 于是"封面单独打印"的单按全双面摊纸，账和纸对不上。列已补上，并且单价一律走
+            # calculate_price（内部 _charge_units）——不在这里再写一份双面/单面摊纸公式。
+            _sim = _row_simplex_pages(of_row)
+            _pc = of_row["page_count"] or 0
+            _pr = of_row["page_range"] or ""
+            _dup_mode = (of_row["duplex"] or "on") == "on"
+            _st = _file_range_stats(_pc, of_row["copies"] or 1,
+                                    of_row["duplex"] or "on", _pr, _sim)
+            _calc_price = calculate_price(_pc, of_row["duplex"] or "on", _pr, simplex_pages=_sim)
+            _dup_units, _single_units = (_charge_units(_pc, _pr, _sim) if _dup_mode
+                                         else (0, _st["effective_pages"]))
             files_by_order[oid].append({
                 "id": of_row["id"],
                 "file_name": of_row["file_name"],
@@ -13884,6 +13949,12 @@ def admin_statistics_revenue():
                 "page_count": of_row["page_count"] or 0,
                 "duplex": of_row["duplex"] or "on",
                 "page_range": of_row["page_range"] or "",
+                # v7.19（L1-3）：结算页要用同一份摊纸结果复算算式 —— 直接下发 calculate_price
+                # 的单价与 _charge_units 的张数，前端只负责排文案，不再自己再算一遍。
+                "simplex_pages": _sim,
+                "calc_price": round(_calc_price, 2),
+                "calc_dup_sheets": _dup_units,
+                "calc_single_sheets": _single_units,
                 "image_orientation": of_row["image_orientation"] or "auto",
                 "total_price": round(of_row["total_price"] or 0.0, 2),
                 "status": of_row["status"],

@@ -289,9 +289,26 @@ def _push_has_no_increment(src):
             return True
     return False
 
+def _revenue_passes_simplex(src: str) -> bool:
+    """营收循环里 _file_range_stats 必须拿到 simplex_pages —— 内联写表达式、或先赋给变量都算。
+
+    2026-11-17 审计：这一处改成「先把 page_count/page_range/duplex/simplex 读进局部变量
+    (_pc/_pr/_sim) 再传」，旧判据写死了 of_row[\"page_count\"] 内联形态，于是判绿变判红。
+    判据只该问「第 5 个实参是不是 simplex」，不该规定实参怎么来的。
+    """
+    assign = re.search(r"\b(_\w+)\s*=\s*_row_simplex_pages\(of_row\)", src)
+    alias = assign.group(1) if assign else None
+    for call in re.finditer(r"_file_range_stats\(([^()]|\([^()]*\))*\)", src):
+        body = call.group(0)
+        if "_row_simplex_pages(of_row)" in body:
+            return True
+        if alias and re.search(r"[, (]\s*" + re.escape(alias) + r"\s*[,)]", body):
+            return True
+    return False
+
+
 check("⑬-a revenue 那处 _file_range_stats 已传 simplex_pages",
-      re.search(r'_file_range_stats\(of_row\["page_count"\][^)]*_row_simplex_pages\(of_row\)',
-                APP_SRC, re.S) is not None)
+      _revenue_passes_simplex(APP_SRC))
 check("⑬-b 兜底重发计数落盘：有 path/load/save 三个函数",
       all(k in APP_SRC for k in ("def _start_print_state_path(", "def _load_start_print_attempts(",
                                  "def _save_start_print_attempts(")))

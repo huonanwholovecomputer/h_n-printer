@@ -51,19 +51,13 @@ ENV_REQUIRED: dict[str, str] = {
     # S2-12 容量压测全系列（约 7 分钟、起本地服务与 16 条长连接）：默认跳过，
     # 手动跑 `python other/tests/staging/99_run_all.py`（快速守门已由 verify_capacity_staging.py 覆盖）
     "99_run_all.py": "容量压测全系列（约 7 分钟），手动跑 other/tests/staging/99_run_all.py",
-    "measure_card_heights.mjs": "需 Playwright / 真实浏览器",
-    "verify_dark_rail_contrast.mjs": "需 Playwright / 真实浏览器",
-    "verify_preview_render.mjs": "需 Playwright / 真实浏览器",
-    "verify_trend_hourly_render.mjs": "需 Playwright / 真实浏览器（本机已装："
-                                      "C:/Users/Administrator/.cache/codex-runtimes/codex-primary-runtime/"
-                                      "dependencies/node/node_modules/playwright；--all 或直接 node 可跑）",
+    # 2026-11-17 审计：下面几条曾被登记成"需 Playwright"，**实测直接 node 就 exit 0**（不需要
+    # Playwright）—— 过期理由会让脚本被静默跳过，等于没有守卫，已全部删除登记。
+    "verify_trend_hourly_render.mjs": "需 Playwright / 真实浏览器（--all 或直接 node 可跑）",
     "verify_order_table_columns.mjs": "需 Playwright / 真实浏览器（订单明细列宽只能靠真实布局量；"
                                       "同上，--all 或直接 node 可跑）",
     "verify_toast_above_tabbar.mjs": "需 Playwright / 真实浏览器（气泡与悬浮 tabBar 的真实几何只能靠"
                                      "真实布局量：注入 0/19/34/48px 安全区量矩形；--all 或直接 node 可跑）",
-    "verify_glass_tabbar.mjs": "需 Playwright / 真实浏览器（玻璃滑块的位移、拉伸峰值与落位宽度，"
-                               "wave/bump 的时序只能靠真实渲染量：桩后端 + 真实 www/；"
-                               "--all 或直接 node 可跑）",
     "verify_me_layout_render.mjs": "需 Playwright / 真实浏览器（「我」页首屏到底能看到什么、区块谁先谁后"
                                    "只能靠真实渲染量：桩后端 + 真实 www/，并同时渲染 git HEAD 的旧版作对照；"
                                    "--all 或直接 node 可跑）",
@@ -202,7 +196,8 @@ def run_one(path: Path, node: str | None, timeout: int) -> tuple[str, str, float
     ext = path.suffix.lower()
     if ext in JS_EXTS:
         if not node:
-            return "SKIP", "未找到 node，无法运行 JS 验收脚本", 0.0
+            # 69 个 JS 守卫靠 node 跑；缺 node 时若记 SKIP，整套会以"全绿"收场而实际什么都没验。
+            return "ERROR", "未找到 node：JS 验收脚本无法运行（环境缺陷，不是跳过）", 0.0
         cmd = [node, str(path)]
     elif ext in PY_EXTS:
         cmd = [sys.executable, str(path)]
@@ -242,7 +237,14 @@ def run_one(path: Path, node: str | None, timeout: int) -> tuple[str, str, float
         return "ERROR", f"{type(e).__name__}: {e}", time.time() - t0
 
     out = (proc.stdout or "") + (proc.stderr or "")
-    return ("OK" if proc.returncode == 0 else "FAIL"), out, time.time() - t0
+    if proc.returncode == 0:
+        # 脚本可以自己声明"本机环境不满足、这一轮没真的验过"：输出里带一行 [HN-SKIP] 原因。
+        # 这类脚本不算通过 —— 汇总里按 SKIP 计，且汇总行会写明跳过不等于通过。
+        for ln in out.splitlines():
+            if ln.startswith("[HN-SKIP]"):
+                return "SKIP", ln[len("[HN-SKIP]"):].strip() or "环境不满足", time.time() - t0
+        return "OK", out, time.time() - t0
+    return "FAIL", out, time.time() - t0
 
 
 def tail(text: str, lines: int = 25) -> str:
@@ -314,8 +316,12 @@ def main() -> int:
     bad = [r for r in results if r[1] in ("FAIL", "TIMEOUT", "ERROR")]
 
     print("-" * 78)
-    print(f"结果：PASS {len(ok)} / {total - len(skip) - len(red)}  "
-          f"（SKIP {len(skip)}，已知预期红 {len(red)}）   用时 {sum(r[3] for r in results):.1f}s")
+    print(f"结果：PASS {len(ok)} / {total}  "
+          f"（SKIP {len(skip)}，已知预期红 {len(red)}，失败 {len(bad)}）"
+          f"   用时 {sum(r[3] for r in results):.1f}s")
+    if skip or red:
+        print(f"      ⚠ 跳过 {len(skip)} 条、预期红 {len(red)} 条都**没有真的验过** —— "
+              f"它们不是通过项，别把 PASS {len(ok)} 读成全绿。")
     if bad:
         print("\n未通过：")
         for path, status, _out, _s in bad:

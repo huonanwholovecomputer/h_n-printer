@@ -213,8 +213,11 @@ chk('timeout 计入异常分组（总数恒等式不丢单）', (() => {
   const g = vm.runInContext(`_statusGroups({ sent: 1, timeout: 2, failed: 1 })`, sandbox);
   return g.abnormal === 3 && g.done === 1 && g.rate === 25;   // done 1 / (总数 4 - 取消 0)
 })());
-chk('ORDER_FIXABLE_STATUSES 不含 timeout（人工订正白名单不变）',
-  vm.runInContext(`ORDER_FIXABLE_STATUSES.indexOf('timeout')`, sandbox) === -1);
+chk('ORDER_FIXABLE_STATUSES 含 timeout 且只含终态（v7.19：超时单可人工订正）', (() => {
+  const list = vm.runInContext(`ORDER_FIXABLE_STATUSES.slice()`, sandbox);
+  const terminal = ['sent', 'failed', 'abandoned', 'canceled', 'rejected', 'timeout'];
+  return list.indexOf('timeout') >= 0 && list.every(s => terminal.indexOf(s) >= 0);
+})(), vm.runInContext(`ORDER_FIXABLE_STATUSES.join(',')`, sandbox));
 
 chk('标记人默认取成员名单第一个', vm.runInContext(`_manualStatusBy()`, sandbox) === '甲成员',
   vm.runInContext(`_manualStatusBy()`, sandbox));

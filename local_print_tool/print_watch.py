@@ -59,7 +59,9 @@ VALID_STATUSES = (STATUS_NEW, STATUS_CONFIRMED, STATUS_IGNORED)
 # 只放**终态**，且必须与云端后端 MANUAL_FIX_STATUSES、settlement.html ORDER_FIXABLE_STATUSES
 # 是同一份清单（改成排队中/打印中会被推送与预约调度重新捡起来打印）；
 # other/tests/verify_order_status_edit.py 与 verify_external_prints_settlement.py 会红。
-MANUAL_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected")
+# v7.19：timeout 也在内（超时单只有操作员知道到底出没出纸；页面菜单也列出它，
+# 账本这层不认的话点下来就是 ValueError）。
+MANUAL_STATUSES = ("sent", "failed", "abandoned", "canceled", "rejected", "timeout")
 
 # 结算页「类型」列的人工归类（接单 / 自打）。只有两种，且与云端 MANUAL_FIX_ORDER_TYPES
 # （mobile_apps/printer-backend/app.py）和前端 ORDER_FIXABLE_TYPES 同一份清单：
@@ -332,6 +334,10 @@ class ExternalPrint:
     pages: int = 0
     pages_source: str = SOURCE_UNKNOWN
     duplex: str = DUPLEX_UNKNOWN          # "on"/"off"/""（"" = DEVMODE 里没有或不认识，待人工确认）
+    # v7.19（L1-4）：「封面单独打印」的页（如 "1,3"），这些页双面模式下也各占 1 张单面纸。
+    # spooler 拿不到这个信息（它只知道总页数与单双面），由操作员在结算页补录后回写；
+    # 默认 "" = 老口径（整份按单双面摊纸），旧账本行读进来也不会崩。
+    simplex_pages: str = ""
     color: int = COLOR_UNKNOWN
     copies: int = 1
     size_bytes: int = 0
@@ -383,6 +389,8 @@ class ExternalPrint:
         item.duplex = str(item.duplex or DUPLEX_UNKNOWN)
         if item.duplex not in (DUPLEX_ON, DUPLEX_OFF, DUPLEX_UNKNOWN):
             item.duplex = DUPLEX_UNKNOWN
+        # 单面页串只做字符串兜底：计价时由 calc_cost 走同一份解析（不在这里再写一份）
+        item.simplex_pages = str(item.simplex_pages or "")
         # 旧账本里「1 页 + 双面」的历史记录同样按单面显示（写入路径已在 build_external/_mutate 归一）
         item.duplex = normalize_duplex(item.pages, item.duplex)
         if item.color not in (COLOR_UNKNOWN, COLOR_MONO, COLOR_COLOR):
@@ -416,6 +424,8 @@ def amount_for(item: ExternalPrint, simplex_price: float, duplex_price: float) -
     双面 2 页 1 张 × duplex_price + 余数 1 张 × simplex_price），所以这里直接调它，
     不另写一份。单价必须由调用方从 PrinterConfig 取（config.simplex_price / duplex_price）——
     硬编码默认值会让"配置改了价、账本金额不跟着变"。
+    v7.19（L1-4）：simplex_pages 必须透传 —— 否则「封面单独打印」的单会被当成整份双面，
+    账面金额低于实际出纸（page_range 外部打印拿不到，整份即全部页，正好留空）。
     """
     pages = _as_int(getattr(item, "pages", 0), 0)
     if pages <= 0 or str(getattr(item, "duplex", "") or "") not in (DUPLEX_ON, DUPLEX_OFF):
@@ -423,7 +433,8 @@ def amount_for(item: ExternalPrint, simplex_price: float, duplex_price: float) -
     copies = _as_int(getattr(item, "copies", 1), 1) or 1
     cost, _formula = calc_cost(pages, copies, str(item.duplex),
                                simplex_price=float(simplex_price),
-                               duplex_price=float(duplex_price))
+                               duplex_price=float(duplex_price),
+                               simplex_pages=str(getattr(item, "simplex_pages", "") or ""))
     return round(float(cost), 2)
 
 

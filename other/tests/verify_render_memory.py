@@ -632,7 +632,7 @@ def main() -> int:
     a = ap.parse_args()
 
     if sys.platform != "win32":
-        print("非 Windows：GDI 路径不适用，跳过（本机无打印子系统）")
+        print("[HN-SKIP] 非 Windows：GDI 路径不适用，跳过（本机无打印子系统）")
         return 0
     if a.blank_check:
         return blank_probe(a.native_dpi)

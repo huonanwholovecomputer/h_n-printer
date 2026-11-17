@@ -1,8 +1,8 @@
 {
-  "version": "1.1.69",
-  "versionCode": 70,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.69.apk",
-  "md5": "683c6a0052a846d7b9f94356d37c0e43",
-  "notes": "v1.1.69：Tab 栏滑块的「脱手」手感——拖动时玻璃不再钉在手指下，而是略微落后地追上来，手一停它自己滑到位；只滞后位置，不拉伸不变形。",
-  "force": false
+  "version":  "1.1.69",
+  "versionCode":  70,
+  "url":  "https://hn-space.cn/updates/h_n-printer_android_v1.1.69.apk",
+  "md5":  "ff10f7d960e3399eb483f9344cdc6c48",
+  "notes":  "v1.1.69：Tab 栏滑块的「脱手」手感——拖动时玻璃不再钉在手指下，而是略微落后地追上来，手一停它自己滑到位；只滞后位置，不拉伸不变形。",
+  "force":  false
 }

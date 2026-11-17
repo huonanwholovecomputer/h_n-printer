@@ -36,12 +36,12 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, os.path.join(REPO, "local_print_tool"))
 
 if os.name != "nt":
-    print("[SKIP] 非 Windows，没有 Excel COM")
+    print("[HN-SKIP] 非 Windows，没有 Excel COM")
     sys.exit(0)
 try:
     import win32com.client as win32  # noqa: PLC0415
 except Exception as e:  # noqa: BLE001
-    print(f"[SKIP] 没有 pywin32（{type(e).__name__}: {e}）")
+    print(f"[HN-SKIP] 没有 pywin32（{type(e).__name__}: {e}）")
     sys.exit(0)
 
 import xlsx_printer  # noqa: E402
@@ -71,7 +71,7 @@ src = os.path.join(tmp, "两份表.xlsx")
 try:
     excel = win32.DispatchEx("Excel.Application")
 except Exception as e:  # noqa: BLE001
-    print(f"[SKIP] 本机起不来 Excel COM（{type(e).__name__}: {e}）")
+    print(f"[HN-SKIP] 本机起不来 Excel COM（{type(e).__name__}: {e}）")
     sys.exit(0)
 
 excel.Visible = False

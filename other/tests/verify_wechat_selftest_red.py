@@ -64,28 +64,66 @@ def run(script):
     return p.returncode, fails
 
 
+JOURNAL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       ".wechat_selftest_journal.json")
+
+
+def _restore_journal():
+    """上次运行被硬杀（run_all 超时 = TerminateProcess，finally 根本不会执行）时，
+    源码会停留在"改坏"的样子，而没有任何脚本会告诉你。这里按落盘日志的原始字节写回去。"""
+    if not os.path.exists(JOURNAL):
+        return False
+    import base64
+    import json
+    with open(JOURNAL, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+    for path, b64 in saved.items():
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(b64))
+        print(f"[RESTORE] 上次被中断，已按原始字节还原：{path}")
+    os.remove(JOURNAL)
+    return True
+
+
+def _save_journal(saved):
+    import base64
+    import json
+    tmp = JOURNAL + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({p: base64.b64encode(b).decode() for p, b in saved.items()}, f)
+    os.replace(tmp, JOURNAL)
+
+
 def main():
     # 这个脚本会**临时改坏源码再还原**（为了证明验收判据能真红）。
     # 全量回归（tests/run_all.py）里默认跳过，避免与其它脚本交叉；要跑就显式给环境变量：
     #   WECHAT_SELFTEST=1 python tests/verify_wechat_selftest_red.py
+    if _restore_journal():
+        print("[RESTORE] 先恢复了上次被中断的改动，继续。")
     if os.environ.get("WECHAT_SELFTEST") != "1":
-        print("[SKIP] 真红自证会临时改坏源码再还原；设 WECHAT_SELFTEST=1 显式运行。")
+        print("[HN-SKIP] 真红自证默认不跑（会临时改坏小程序源码再还原）："
+              "这一轮「判据能不能真红」没有任何证据；设 WECHAT_SELFTEST=1 显式运行")
         return 0
 
     ok = True
     for name, fpath, old, new, script in CASES:
-        with open(fpath, "r", encoding="utf-8") as f:
-            src = f.read()
-        if src.count(old) != 1:
-            print(f"[SETUP-FAIL] {name}: 原文片段出现 {src.count(old)} 次（应为 1），跳过")
+        # 按**字节**读写：文本模式读会把 CRLF 折叠成 LF，还原时就把整个文件的行尾改掉
+        # （git 会显示成整文件改动），旧版就是这么静默污染源码的。
+        with open(fpath, "rb") as f:
+            raw = f.read()
+        crlf = b"\r\n" in raw
+        norm = raw.decode("utf-8").replace("\r\n", "\n")
+        if norm.count(old) != 1:
+            print(f"[SETUP-FAIL] {name}: 原文片段出现 {norm.count(old)} 次（应为 1），跳过")
             ok = False
             continue
-        fd, bak = tempfile.mkstemp(suffix=".bak")
-        os.close(fd)
-        shutil.copyfile(fpath, bak)
+        mutated = norm.replace(old, new, 1)
+        if crlf:
+            mutated = mutated.replace("\n", "\r\n")
+        _save_journal({fpath: raw})
         try:
-            with open(fpath, "w", encoding="utf-8", newline="") as f:
-                f.write(src.replace(old, new, 1))
+            with open(fpath, "wb") as f:
+                f.write(mutated.encode("utf-8"))
             code, fails = run(script)
             red = code == 1 and len(fails) > 0
             print(f"[{'RED-OK' if red else 'RED-FAIL'}] {name}  -> 脚本 exit={code}, 失败 {len(fails)} 项")
@@ -93,8 +131,10 @@ def main():
                 print("          " + ln)
             ok = ok and red
         finally:
-            shutil.copyfile(bak, fpath)
-            os.remove(bak)
+            with open(fpath, "wb") as f:
+                f.write(raw)
+            if os.path.exists(JOURNAL):
+                os.remove(JOURNAL)
         # 还原后必须重新变绿
         code, fails = run(script)
         green = code == 0

@@ -16,7 +16,7 @@
 // 复算价与实收对不上（历史单价 / 人工改价 / 首页混排）就只写金额，绝不编一条与实收不一致的算式。
 
 // 页码范围口径的**唯一实现**（勿在本文件再写第二份）——见 utils/pages.js 顶部注释
-const { countPagesInRange } = require('./pages')
+const { countPagesInRange, pageRangeSet, chargeUnits } = require('./pages')
 
 const PRICE_DASH = '-'.repeat(14)
 
@@ -27,27 +27,22 @@ function money(n) {
   return (Math.round((Number(n) || 0) * 100) / 100).toFixed(2)
 }
 
-// 单面页/双面页的摊纸张数（与后端 manual_duplex.charge_units 同口径）：
-// 指定了「单面页」的那些页各占 1 张，其余页两页一张，奇数页最后一张占 1 张。
+// 单面页/双面页的摊纸张数。**不再自带一份实现**（2026-11-17 审计）：
+// 这里原来按「单面页数 + 其余页数折半」算，与 backend app.py:_charge_units /
+// manual_duplex.charge_units / utils/pages.js 的「按该页是否属于 X 切段」不等价 ——
+// 例：S=[2,3,4,5,8]、X={4} 时后端 = 2 双面张 + 1 单面张，旧实现 = 3 双面张 0 单面张，
+// 单价不同（0.40 / 0.30）就复制出错的金额。现在直接复用 utils/pages.js 那一份。
 function chargeUnitsOf(eff, simplexPages) {
   const n = Number(eff) || 0
+  if (n <= 0) return { pairs: 0, remainder: 0 }
+  const pages = []
+  for (let i = 1; i <= n; i++) pages.push(i)
+  let set = new Set()
   if (simplexPages && String(simplexPages).trim()) {
-    const set = {}
-    String(simplexPages).split(',').forEach((part) => {
-      const seg = String(part).trim()
-      if (!seg) return
-      const mm = seg.split('-')
-      const a = parseInt(mm[0], 10)
-      const b = mm.length > 1 ? parseInt(mm[1], 10) : a
-      if (!isFinite(a) || !isFinite(b)) return
-      for (let i = a; i <= b; i++) set[i] = true
-    })
-    let simplex = 0
-    for (let i = 1; i <= n; i++) if (set[i]) simplex++
-    const rest = Math.max(0, n - simplex)
-    return { pairs: simplex + Math.floor(rest / 2), remainder: rest % 2 }
+    set = pageRangeSet(String(simplexPages), n)
   }
-  return { pairs: Math.floor(n / 2), remainder: n % 2 }
+  const u = chargeUnits(pages, set)
+  return { pairs: u.dupSheets, remainder: u.singleSheets }
 }
 
 /* 复原 calc_cost 的算式（local_print_tool/printer_config.py:536-583）：

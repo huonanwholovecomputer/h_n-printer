@@ -148,9 +148,10 @@ check("_STATUS_PRIORITY 有 timeout，且与 failed 同级",
 check("timeout **不**在 NO_LONGER_PRINTABLE_STATUSES（设备迟到成功仍可救回）",
       "timeout" not in backend.NO_LONGER_PRINTABLE_STATUSES,
       repr(backend.NO_LONGER_PRINTABLE_STATUSES))
-check("MANUAL_FIX_STATUSES 未被放宽（人工订正清单前后端同一份，不含 timeout）",
+check("MANUAL_FIX_STATUSES 含 timeout（v7.19：超时单同样是终态、必须能人工收口；"
+      "前后端仍是同一份清单）",
       tuple(backend.MANUAL_FIX_STATUSES) == ("sent", "failed", "abandoned", "canceled",
-                                             "rejected"),
+                                             "rejected", "timeout"),
       repr(backend.MANUAL_FIX_STATUSES))
 check("排队淘汰口径已改 timeout（不再冒充 failed）",
       "status = ?" in APP_SRC and "TIMEOUT_STATUS" in APP_SRC)

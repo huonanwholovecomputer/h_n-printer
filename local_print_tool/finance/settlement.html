@@ -3491,7 +3491,9 @@ function _refreshCloudChartTheme() {
 var STATUS_LABELS = {
   sent: '已完成', printing: '待添加', queued: '排队中', failed: '失败', canceled: '已取消',
   rejected: '被打回', abandoned: '放弃打印', offline_unknown: '断线未知',
-  /* v7.15：超时（设备长时间没回报结果，需人工核对）—— 只展示与筛选，不进人工订正白名单 */
+  /* v7.15：超时（设备长时间没回报结果，需人工核对）—— 展示与筛选之外也能人工订正；
+     v7.19 起它进了 ORDER_FIXABLE_STATUSES（原来只展示不订正，超时单的钱永远对不上）；
+     营收口径不变：timeout 仍计入「排除」，订正成 sent 之后才进账。 */
   timeout: '超时',
   accepted: '已添加', reserved: '已预留',
   scheduled: '已预约', waiting: '等待打印', downloading: '文件传输中',
@@ -4802,7 +4804,7 @@ function _toggleOrderExpand(oid) {
 /* 🔴-B7：`timeout` 也是终态（后端 MANUAL_FIX_STATUSES 同一份清单）。
    加它进来才能人工订正：预约单到点设备掉线、纸其实没打 ⇒ 保持 timeout；
    操作员手工打出来了 ⇒ 订正成 sent（否则那笔钱永远是 0）。 */
-var ORDER_FIXABLE_STATUSES = ['sent', 'failed', 'abandoned', 'canceled', 'rejected'];
+var ORDER_FIXABLE_STATUSES = ['sent', 'failed', 'abandoned', 'canceled', 'rejected', 'timeout'];
 /* 可编辑判据：云端模式 + 已解锁 + id 合法（本地模式订单库存本地库、无对应写接口，保持只读）。
    云端单的 id 合法判据 = **规范十进制**（`/^[0-9]+$/`），与后端 `re.fullmatch(r"[0-9]+")` 同源：
    内联 onclick 里的 id 已是引号字符串（不再当 JS 表达式求值），但 `'1e3'`/`'12-34'`/`'01'`
@@ -5317,11 +5319,10 @@ function openOrderStatusMenu(ev, oid) {
       (cur ? '<span class="st-menu-cur">✓ 当前</span>' : '') + '</button>';
   });
   if (!(ORDER_FIXABLE_STATUSES.indexOf(o.status) >= 0)) {
-    /* timeout 是终态（设备后续回报成功会自动救回 sent），别把它说成「还没结束」 */
-    var _hint = o.status === 'timeout'
-      ? '当前「超时」是终态，仍可人工订正为下列状态；设备之后回报打印成功会自动改回已完成'
-      : '当前「' + esc(statusLabel(o.status)) + '」不是终态，订正为下列状态后才算最终结果';
-    html += '<div class="st-menu-cur" style="padding:6px 8px;line-height:1.5">' + _hint + '</div>';
+    /* v7.19：timeout 已进白名单 ⇒ 走到这里的只可能是活跃态（排队中 / 打印中 / 预约 / 断线未知…），
+       必须让人看出「点了才算定案、现在还没结束」。 */
+    html += '<div class="st-menu-cur" style="padding:6px 8px;line-height:1.5">' +
+      '当前「' + esc(statusLabel(o.status)) + '」不是终态，订正为下列状态后才算最终结果</div>';
   }
   m.innerHTML = html;
   document.body.appendChild(m);
@@ -5899,9 +5900,19 @@ function _fileCalc(f) {
   var pages = _filePages(f) || 0;
   var copies = parseInt(f.copies, 10) || 1;
   if (pages <= 0) return { cost: 0, formula: '' };
+  // v7.19（L1-3）：营收接口已用 calculate_price（内部 _charge_units）算好单价与摊纸张数一并下发，
+  // 这里优先采用 —— 前端自己按**当前**定价复算，遇到历史单价/人工改价就会编出一条错算式。
+  var srv = Number(f.calc_price);
+  var useSrv = f.calc_price != null && f.calc_price !== '' && isFinite(srv) && srv >= 0;
   var cost = 0, formula = '';
   if (f.duplex === 'on') {
-    var units = _chargeUnitsOf(pages, f.simplex_pages);
+    var srvDup = Number(f.calc_dup_sheets), srvSingle = Number(f.calc_single_sheets);
+    var units;
+    if (useSrv && isFinite(srvDup) && isFinite(srvSingle)) {
+      units = { pairs: srvDup, remainder: srvSingle };
+    } else {
+      units = _chargeUnitsOf(pages, f.simplex_pages);
+    }
     var parts = [];
     if (units.pairs > 0) { parts.push(units.pairs + '张×' + dp.toFixed(2)); cost += units.pairs * dp; }
     if (units.remainder > 0) { parts.push(units.remainder + '张×' + sp.toFixed(2)); cost += units.remainder * sp; }
@@ -5911,6 +5922,7 @@ function _fileCalc(f) {
     cost = pages * sp;
   }
   if (!formula) return { cost: 0, formula: '' };
+  if (useSrv) cost = srv;          // 后端定价权威（历史单价/人工改价都得以它为准）
   cost = Math.round(cost * copies * 100) / 100;
   if (copies > 1) formula = '(' + formula + ')×' + copies + '份';
   return { cost: cost, formula: formula };
@@ -10809,7 +10821,7 @@ function renderAbout() {
     '<p style="margin-top:10px">v7.12：<b>明细区折叠成「一行摘要」</b> —— ① 十个明细区默认只显示一行摘要（点开才摊明细），顶部工具条给出「已收起 N / 10」与「全部展开 / 全部收起」；② KPI 四个数和结论卡重复度高，压成一条读数带，把纵向空间让给摘要行；③ 结算公式说明块挪到最后 —— 它的作用是核对算式，不该插在「结论 → 指令 → 现金记录」这条主线中间。</p>' +
     '<p style="margin-top:10px">v7.13：<b>结算公式块补开合动画</b> —— 它是整页唯一还留在原生 &lt;details&gt; 上的折叠块，开关是瞬时的；这一版给它补了 220ms 的高度动画（开关状态仍由 &lt;details&gt; 自己管）。动画口径后来被 v7.14 取代。</p>' +
     '<p style="margin-top:10px">v7.14：<b>全页只剩一套折叠实现</b> —— v7.13 给公式块单独写的动画，让同一页出现两套折叠（十个明细区一套、公式块一套）；这一版把公式块并进 secFold：开关状态、高度过渡、持久化都同一套代码，以后再改折叠行为只改一处。</p>' +
-    '<p style="margin-top:10px">v7.15：<b>订单明细：搜索 / 价格气泡 / 状态原因</b> —— ① 删掉顶部「本月结论」卡：结论都能在明细里查到，先抢一屏反而挡住主流程；② 订单明细新增搜索框，对文件名与订单备注做大小写不敏感的过滤，命中片段淡黄高亮；只筛列表，KPI 与图表仍按全量算；③ 点金额弹气泡：「复制价格」与「复制详细价格」，文案以本地打印工具为准；复算价与实收对不上时（历史单价 / 人工改价）只给金额、不编算式；④ 状态标签悬停给一套原因：人工订正过就说「谁在什么时候改成了什么」，设备判定的显示原因原文；⑤ 新增「超时」状态（设备长时间没回报结果，要人工核对）：只展示与筛选，不进人工订正白名单。</p>' +
+    '<p style="margin-top:10px">v7.15：<b>订单明细：搜索 / 价格气泡 / 状态原因</b> —— ① 删掉顶部「本月结论」卡：结论都能在明细里查到，先抢一屏反而挡住主流程；② 订单明细新增搜索框，对文件名与订单备注做大小写不敏感的过滤，命中片段淡黄高亮；只筛列表，KPI 与图表仍按全量算；③ 点金额弹气泡：「复制价格」与「复制详细价格」，文案以本地打印工具为准；复算价与实收对不上时（历史单价 / 人工改价）只给金额、不编算式；④ 状态标签悬停给一套原因：人工订正过就说「谁在什么时候改成了什么」，设备判定的显示原因原文；⑤ 新增「超时」状态（设备长时间没回报结果，要人工核对）：当时只做展示与筛选，不进人工订正白名单 —— 这条口径已被 v7.19 推翻。</p>' +
     '<p style="margin-top:10px">v7.16：<b>外部监视订单可以订正状态</b> —— ① 这类单来自本地账本、不在云端订单表，以前按 id 查库查不到，状态标签点不动；② 现在订正写回本地账本（订正状态 / 标记人 / 时间），与监视流程自己的状态正交，两条写路径互不覆盖；还没出纸的单不许先标失败；③ 订正成失败 / 放弃打印 / 已取消 / 被打回后，钱和纸自动不再计入（金额列仍显示这张单的面额，是刻意的展示口径）；④ 人工订正白名单在本地账本、页面、后端三处同源，只放终态 —— 改成排队中 / 打印中会被推送重新捡起来打印。</p>' +
     '<p style="margin-top:10px">v7.17：<b>订单搜索框能打中文了</b> —— ① 上一版「输入即筛」在每次按键时整块重绘列表，而搜索框就在被重绘的节点里：中文输入法组字期间不断触发的按键让输入框被销毁重建，正拼的拼音和候选一起丢掉（英文逐字提交、粘贴一次性提交，所以只有中文打不进）；② 现在组字期间只记词、不重绘，上屏后统一筛一次并恢复焦点与光标位置。</p>' +
     '<p style="margin-top:10px">v7.18：<b>订单「用户」列可改归属</b> —— '
@@ -10820,7 +10832,7 @@ function renderAbout() {
     + '（保留期配额仍按上传者算）。'
     + '③ 只能转给服务器上真实存在的用户；本地任务与外部监视订单没有云端归属，保持只读。'
     + '④ 每次调整都会记下操作人与时间，鼠标悬停用户标签即可看到。</p>' +
-    '<p style="margin-top:10px">v7.19：<b>本地来源订单也能改「用户」</b> —— ① v7.18 只放开了云端订单；现场大多数单是「来源=本地」，整列只读、改不了所属人，这一版补上；② 本地单没有云端账号可转，改的是「展示所属人」（orders.owner_name）—— 只影响展示与「按成员」统计分组，不涉及登录，也不会把本地单变成云端单；③ 文件的上传者记录、订单状态、打印作业一律不动（与云端订单同一条边界）。</p>' +
+    '<p style="margin-top:10px">v7.19：<b>本地来源订单也能改「用户」</b> —— ① v7.18 只放开了云端订单；现场大多数单是「来源=本地」，整列只读、改不了所属人，这一版补上；② 本地单没有云端账号可转，改的是「展示所属人」（orders.owner_name）—— 只影响展示与「按成员」统计分组，不涉及登录，也不会把本地单变成云端单；③ 文件的上传者记录、订单状态、打印作业一律不动（与云端订单同一条边界）。④ 超时单也能人工订正（v7.15「只展示不订正」的口径作废）：设备长时间没回报时，纸可能其实出了、也可能确实没出，只有操作员知道 —— 订正成「已完成」才计入营收，否则这笔钱永远是 0。⑤ 白名单仍只放终态：排队中 / 打印中 / 预约 / 断线未知一律不给入口，改成它们会被推送与预约调度重新捡起来打。</p>' +
     '<p style="margin-top:10px">v7.20：<b>外部监视单的「用户 / 类型」两列也可订正</b> —— ① 以前外部监视单只有「状态」能改；现在这两列同样解锁后可用，写入本地账本（与状态改动同一本账）；② 类型只允许「接单 / 自打」两种，改完金额与「自打不计收益」的口径立即跟上；③ 外部监视单不在云端订单表里，所以这两条改动都不经云端接口。</p>' +
     '<p style="margin-top:10px">v7.22：<b>离线（本地）模式补齐「🔐 授权」页</b> —— '
     + '① 本地模式不再隐藏「授权」入口，页内新增<b>「💻 本设备」</b>卡片（计算机名称 / 设备 ID / 接单状态，'

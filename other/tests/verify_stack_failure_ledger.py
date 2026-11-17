@@ -56,6 +56,7 @@ import gui  # noqa: E402
 import paths  # noqa: E402
 import duplex_stack  # noqa: E402
 import duplex_remedy  # noqa: E402
+import pdf_printer  # noqa: E402
 import manual_duplex  # noqa: E402
 
 
@@ -142,20 +143,23 @@ check("②-d 整叠计划里也没有失败单的页",
       plan.pass_pages(1))
 check("②-e 张数按剩下的两单算（共 2 张）", plan.sheet_count == 2, plan.sheet_count)
 
-print("── ③ 运行期：_keep_stack_stall 落台账 ──")
+print("── ③ 运行期：_keep_stack_stall 落台账（stage 按「第 2 趟有没有真出纸」判）──")
 win = new_win()
 win._config.printer_name = "Fake Print"
 win._stack = st
 _before = len(duplex_remedy.pending())
-rec = win._keep_stack_stall([e1, e2, e3], bdir, "攒批第 2 趟失败：boom")
+# PARTIAL_MARKER = print_pdf 已经执行过 StartPage（纸真的出来了）——见 pdf_printer.py:21-45。
+# 第 2 趟打到一半失败：纸叠已经不能再用，只能整单重打 ⇒ stage 必须 pass2_partial。
+rec = win._keep_stack_stall([e1, e2, e3], bdir,
+                            pdf_printer.PARTIAL_MARKER + "攒批第 2 趟失败：boom")
 check("③-a 返回了台账记录", isinstance(rec, dict) and bool(rec.get("id")), rec)
 check("③-b 写进了台账（pending 多一条）",
       len(duplex_remedy.pending()) == _before + 1,
       f"{_before} -> {len(duplex_remedy.pending())}")
 _rid = (rec or {}).get("id") or ""
 _stored = duplex_remedy.get(_rid) if _rid else None
-check("③-c 落盘记录也是 step=pass1_done（可只补第 2 趟）",
-      bool(_stored) and _stored.get("stage") == duplex_remedy.STAGE_PASS1_DONE,
+check("③-c 第 2 趟已出过纸 ⇒ stage=pass2_partial（硬编码 pass1_done 会红）",
+      bool(_stored) and _stored.get("stage") == duplex_remedy.STAGE_PASS2_PARTIAL,
       (_stored or {}).get("stage"))
 check("③-d 半成品 PDF 存在（不删证据）",
       bool(_stored) and duplex_remedy.pdf_available(_stored))
@@ -168,6 +172,16 @@ check("③-f 记录里有每单任务快照（含 tab_key）",
 check("③-g 张数/面数与整叠一致",
       bool(_stored) and _stored.get("sheet_count") == plan.sheet_count,
       (_stored or {}).get("sheet_count"))
+# 反例（同一入口、只是消息里没有 PARTIAL_MARKER）：第 2 趟一张没出、纸叠完好，
+# 仍然可以只补第 2 趟 ⇒ stage 必须还是 pass1_done（别一律升级成整单重打）。
+_rec_ok = win._keep_stack_stall([e1, e2, e3], bdir, "攒批第 2 趟失败：打印机离线（未出纸）")
+_stored_ok = duplex_remedy.get((_rec_ok or {}).get("id") or "")
+check("③-h 第 2 趟没出纸（无 marker）⇒ stage=pass1_done（可只补第 2 趟）",
+      bool(_stored_ok) and _stored_ok.get("stage") == duplex_remedy.STAGE_PASS1_DONE,
+      (_stored_ok or {}).get("stage"))
+check("③-i 两条都落盘了（pending 共 +2）",
+      len(duplex_remedy.pending()) == _before + 2,
+      f"{_before} -> {len(duplex_remedy.pending())}")
 
 print("── ④ 运行期：第 2 趟失败 → 不再按失败上报、批次目录保留 ──")
 # 造一个能找回 job 的标签页：把 tab_key 设成 1，并把 job 放进配置
@@ -188,11 +202,13 @@ def _fake_warning(*a, **k):
 
 gui.QMessageBox.warning = staticmethod(_fake_warning)
 _pending_before = len(duplex_remedy.pending())
+_ids_before = {x.get("id") for x in duplex_remedy.load_all()}
 win._stack = st
 win._stack_flush_snapshot = [e1, e2, e3]
 win._stack_flush_worker = None
 try:
-    win._on_stack_flush_done(False, "第 2 趟中途失败", 0)
+    # 真 worker 在失败时会把 print_pdf 的 marker 保留在消息开头（见 DuplexFlushWorker.run）
+    win._on_stack_flush_done(False, pdf_printer.PARTIAL_MARKER + "整叠第 2 趟失败：中途失败", 0)
     crashed = None
 except Exception as e:  # noqa: BLE001
     crashed = f"{type(e).__name__}: {e}"
@@ -207,6 +223,10 @@ _warn_txt = "\n".join(" ".join(str(x) for x in w) if isinstance(w, tuple) else s
                      for w in warn)
 check("④-e 弹窗说的是「可补救」而不是「已按失败上报」",
       "半成品补救" in _warn_txt and "已按失败上报" not in _warn_txt, _warn_txt[:200])
+_new4 = [x for x in duplex_remedy.load_all() if x.get("id") not in _ids_before]
+check("④-f 收尾落盘 stage=pass2_partial（第 2 趟出过纸，不能再补第 2 趟）",
+      len(_new4) == 1 and _new4[0].get("stage") == duplex_remedy.STAGE_PASS2_PARTIAL,
+      [x.get("stage") for x in _new4])
 
 print("── ⑤ 运行期：第 1 趟失败的单不能被整叠的成功顺带报成功 ──")
 win2 = new_win()
@@ -232,7 +252,11 @@ check("⑤-b 说明里写清「第 1 趟打印失败」",
       bool(_bad) and "第 1 趟打印失败" in _bad[0][1], got)
 
 print("── ⑥ 台账内容可读（补救窗要显示的东西都在）──")
-_txt = duplex_remedy.describe(_stored) if _stored else ""
+check("⑥-0 上面 ③ 的两条记录 stage 不同（判据真的按出没出纸）",
+      bool(_stored) and bool(_stored_ok)
+      and _stored.get("stage") != _stored_ok.get("stage"),
+      ((_stored or {}).get("stage"), (_stored_ok or {}).get("stage")))
+_txt = duplex_remedy.describe(_stored_ok) if _stored_ok else ""
 check("⑥-a 说明里有第 1 趟/第 2 趟页序", "第 1 趟" in _txt and "第 2 趟" in _txt, _txt[:120])
 check("⑥-b 说明里有「补打第 2 趟」的处理办法", "补打第 2 趟" in _txt)
 check("⑥-c 说明里没有 markdown 星号", "**" not in _txt)
@@ -245,6 +269,68 @@ except Exception as _e:  # noqa: BLE001
     _json_ok = False
     print(f"    （清单读取失败：{type(_e).__name__}: {_e}）")
 check("⑥-d 台账文件是合法 JSON（跨进程可读）", _json_ok, _manifest)
+
+print("── ⑦ 运行期：第 2 趟失败但一张没出 → stage=pass1_done（可只补第 2 趟）──")
+st2 = duplex_stack.DuplexStack()
+st2.new_batch("testbatch2")
+bdir2 = duplex_stack.batch_dir(paths.duplex_stack_dir(), st2.batch_id)
+os.makedirs(bdir2, exist_ok=True)
+q1 = make_pdf(os.path.join(bdir2, "entry_0001.pdf"), 2)
+q2 = make_pdf(os.path.join(bdir2, "entry_0002.pdf"), 2)
+f1 = mk_entry(1, "D-OK", q1, 2, duplex_stack.STATE_PRINTING, task_id=101)
+f2 = mk_entry(2, "E-OK", q2, 2, duplex_stack.STATE_PRINTING, task_id=102)
+st2.add(f1)
+st2.add(f2)
+win3 = new_win()
+win3._config.printer_name = "Fake Print"
+win3._stack = st2
+win3._stack_flush_snapshot = [f1, f2]
+win3._stack_flush_worker = None
+_ids7 = {x.get("id") for x in duplex_remedy.load_all()}
+try:
+    win3._on_stack_flush_done(False, "整叠第 2 趟失败：打印机离线", 0)
+    _crash7 = None
+except Exception as e:  # noqa: BLE001
+    _crash7 = f"{type(e).__name__}: {e}"
+check("⑦-a 收尾不抛异常", _crash7 is None, _crash7)
+_new7 = [x for x in duplex_remedy.load_all() if x.get("id") not in _ids7]
+check("⑦-b stage=pass1_done（一张没出，纸叠完好，不需要整单重打）",
+      len(_new7) == 1 and _new7[0].get("stage") == duplex_remedy.STAGE_PASS1_DONE,
+      [x.get("stage") for x in _new7])
+check("⑦-c 批次目录仍保留（有台账记录就不删证据）", os.path.isdir(bdir2), bdir2)
+
+print("── ⑧ 反例：第 1 趟中途失败**不进**补救台账（攒批口径；手动双面另走 L2-3 的台账）──")
+_entry_done_src = src_gui.split("def _on_stack_entry_done(", 1)[1].split("\n    def ", 1)[0]
+check("⑧-a _on_stack_entry_done() 里没有落台账的调用",
+      "_keep_stack_stall(" not in _entry_done_src
+      and "duplex_remedy.add(" not in _entry_done_src,
+      _entry_done_src[:300])
+st8 = duplex_stack.DuplexStack()
+st8.new_batch("testbatch8")
+bdir8 = duplex_stack.batch_dir(paths.duplex_stack_dir(), st8.batch_id)
+os.makedirs(bdir8, exist_ok=True)
+p8 = make_pdf(os.path.join(bdir8, "entry_0001.pdf"), 2)
+e8 = mk_entry(1, "D-PASS1-FAIL", p8, 2, duplex_stack.STATE_PRINTING)
+st8.add(e8)
+win._stack = st8
+win._sync_stack_button = lambda: None
+win._refresh_stack_dialog = lambda: None
+duplex_stack.save_manifest(bdir8, st8)
+_before8 = len(duplex_remedy.load_all())
+_crash8 = None
+try:
+    # 带 PARTIAL_MARKER = 驱动真出过纸；攒批这一支仍然只标记失败、不落补救台账
+    win._on_stack_entry_done(1, False,
+                             pdf_printer.PARTIAL_MARKER + "第 1 趟中途失败：卡纸", 0)
+except Exception as e:  # noqa: BLE001
+    _crash8 = f"{type(e).__name__}: {e}"
+check("⑧-b 第 1 趟中途失败不抛异常", _crash8 is None, _crash8)
+check("⑧-c 台账条数不变（第 1 趟失败不写补救计划）",
+      len(duplex_remedy.load_all()) == _before8,
+      f"{_before8} -> {len(duplex_remedy.load_all())}")
+check("⑧-d 失败被记住：该单标 FAILED、整叠被 taint",
+      e8.state == duplex_stack.STATE_FAILED and bool(getattr(st8, "tainted", False)),
+      (e8.state, getattr(st8, "tainted", None)))
 
 print()
 print(f"PASS {len(_ok)}  FAIL {len(_fail)}")

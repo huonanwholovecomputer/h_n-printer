@@ -236,7 +236,7 @@ def main() -> int:
 
     print("\n" + "=" * 56)
     if skipped:
-        print("跳过：", "; ".join(skipped))
+        print("[HN-SKIP] 跳过：", "; ".join(skipped))
     print("Office 外部引用剥离验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")
     return 0 if ok_all else 1
 

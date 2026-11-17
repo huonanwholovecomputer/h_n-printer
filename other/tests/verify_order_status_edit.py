@@ -192,11 +192,13 @@ m_fe = re.search(r"var ORDER_FIXABLE_STATUSES = \[([^\]]+)\]", html)
 m_be = re.search(r"MANUAL_FIX_STATUSES = \(([^)]+)\)", app_src)
 fe_list = [s.strip().strip("'") for s in m_fe.group(1).split(",")] if m_fe else []
 be_list = [s.strip().strip('"') for s in m_be.group(1).split(",")] if m_be else []
-chk("前端 ORDER_FIXABLE_STATUSES 存在且 = 后端 MANUAL_FIX_STATUSES",
-    fe_list == be_list and len(fe_list) == 5, "fe=%s be=%s" % (fe_list, be_list))
-chk("白名单只含终态（sent/failed/abandoned/canceled/rejected）——"
-    "排队中/打印中会被推送与预约调度重新捡起来打印，不能人工改",
-    set(fe_list) == {"sent", "failed", "abandoned", "canceled", "rejected"})
+chk("前端 ORDER_FIXABLE_STATUSES 存在且 = 后端 MANUAL_FIX_STATUSES（逐项同顺序）",
+    bool(fe_list) and fe_list == be_list, "fe=%s be=%s" % (fe_list, be_list))
+chk("白名单只含终态（sent/failed/abandoned/canceled/rejected/timeout）——"
+    "排队中/打印中会被推送与预约调度重新捡起来打印，不能人工改；"
+    "timeout 必须在内（超时单只有操作员知道出没出纸，不给入口这笔钱永远对不上）",
+    set(fe_list) == {"sent", "failed", "abandoned", "canceled", "rejected", "timeout"}
+    and "timeout" in fe_list)
 chk("本地模式不给订正入口（本地订单库存本地库、无对应写接口）",
     re.search(r"FINANCE_MODE === 'local'[\s\S]{0,160}?return false", _gate_body) is not None and
     re.search(r"function _orderStatusLockHTML\(\) \{\s*\n\s*if \(FINANCE_MODE === 'local'\) return '';", html) is not None)
@@ -406,16 +408,20 @@ r_int = post({"order_id": oid_ab, "status": "sent"})   # 整数 id 仍正常
 chk("整数 order_id 照常可用（拦的是畸形，不是正常调用）", r_int.status_code == 200,
     r_int.get_json())
 
-print("\n-- B2 五种终态：父订单 + 全部子任务一起改 --")
+print("\n-- B2 六种终态：父订单 + 全部子任务一起改 --")
+# v7.19（L1-2）：人工订正的前置是「**当前**状态已是终态」，活跃态一律 409（这份前置由
+# other/tests/verify_status_fix_terminal.py 专测）。因此夹具从另一个终态起步 ——
+# 这一段测的仍是「父订单 + 全部子任务一起改、聚合状态跟着变、locked_at 清空」。
 cases = [
-    ("sent",       [("queued", 2.30, "2026-10-18 10:00:00"), ("printing", 2.30, "2026-10-18 10:00:05")]),
-    ("failed",     [("printing", 2.30, "2026-10-18 10:00:00"), ("accepted", 2.30, "2026-10-18 10:00:05")]),
-    ("abandoned",  [("queued", 2.30, "2026-10-18 10:00:00")]),
-    ("canceled",   [("printing", 2.30, "2026-10-18 10:00:00"), ("sent", 2.30, "")]),
-    ("rejected",   [("queued", 2.30, "2026-10-18 10:00:00"), ("failed", 2.30, "")]),
+    ("failed",    "sent",      [("failed", 2.30, "2026-10-18 10:00:00"), ("sent", 2.30, "")]),
+    ("sent",      "failed",    [("sent", 2.30, "2026-10-18 10:00:00"), ("abandoned", 2.30, "2026-10-18 10:00:05")]),
+    ("failed",    "abandoned", [("failed", 2.30, "2026-10-18 10:00:00")]),
+    ("timeout",   "canceled",  [("timeout", 2.30, "2026-10-18 10:00:00"), ("sent", 2.30, "")]),
+    ("abandoned", "rejected",  [("abandoned", 2.30, "2026-10-18 10:00:00"), ("failed", 2.30, "")]),
+    ("canceled",  "timeout",   [("canceled", 2.30, "2026-10-18 10:00:00")]),
 ]
-for i, (target, files) in enumerate(cases):
-    oid = mk_order("queued", files, number="HN-FIX-%d" % i)
+for i, (start, target, files) in enumerate(cases):
+    oid = mk_order(start, files, number="HN-FIX-%d" % i)
     r = post({"order_id": oid, "status": target})
     j = r.get_json() or {}
     o_st, f_list, agg = db_state(oid)
@@ -430,7 +436,7 @@ for i, (target, files) in enumerate(cases):
     chk("改为 %s：locked_at 全部清空（终态不再被 3 分钟超时/保活盯上）" % target,
         all(lk == "" for _, lk in f_list), f_list)
     chk("改为 %s：回执带 order_id/status/previous_status" % target,
-        j.get("order_id") == str(oid) and j.get("status") == target and j.get("previous_status") == "queued",
+        j.get("order_id") == str(oid) and j.get("status") == target and j.get("previous_status") == start,
         j)
 
 print("\n-- B3 幂等 / 无子任务的历史老单 --")
@@ -539,8 +545,9 @@ _n_b5 = [0]
 
 def _b5_case(target, *, operator="", last="", target_client=""):
     _n_b5[0] += 1
-    oid = mk_order("queued", [("printing", 2.30, "2026-10-18 10:00:00")],
-                   number="HN-B5-%d" % _n_b5[0])
+    # v7.19：前置是「当前已是终态」⇒ 夹具从 sent 起步；这一段测的是「订正后通知设备」
+    # 这一条语义，不该被活跃态前置条件顶掉（前置由 verify_status_fix_terminal.py 专测）。
+    oid = mk_order("sent", [("sent", 2.30, "")], number="HN-B5-%d" % _n_b5[0])
     _set_owner(oid, operator=operator, last=last, target=target_client)
     tids = _sub_ids(oid)
     SOCK_A.get_received()
@@ -618,8 +625,7 @@ def _reject_reason(tid):
 
 
 for _st in ("canceled", "abandoned", "rejected"):
-    oid = mk_order("queued", [("printing", 2.30, "2026-10-18 10:00:00")],
-                   number="HN-B6-%s" % _st)
+    oid = mk_order("sent", [("sent", 2.30, "")], number="HN-B6-%s" % _st)
     _set_owner(oid, operator=DEV_A, last=DEV_A)
     tid = _sub_ids(oid)[0]
     post({"order_id": oid, "status": _st})
@@ -635,7 +641,7 @@ for _st in ("canceled", "abandoned", "rejected"):
     chk("B6① 订正 %s → sent 覆盖时清空 reject_reason（已成 sent 的单不该留着旧失败原因）" % _st,
         _reject_reason(tid) == "", _reject_reason(tid))
 
-oid = mk_order("queued", [("printing", 2.30, "2026-10-18 10:00:00")], number="HN-B6-failed")
+oid = mk_order("sent", [("sent", 2.30, "")], number="HN-B6-failed")
 _set_owner(oid, operator=DEV_A, last=DEV_A)
 tid = _sub_ids(oid)[0]
 post({"order_id": oid, "status": "failed"})
@@ -652,8 +658,7 @@ chk("B6② 订正 failed 后迟到 print_success → 救回 sent（2026-09 既�
 # 刻意不对称）。典型来源是「取消正在打印的订单」时本地工具对剩余任务回报的 error="已取消"：
 # 放行只会把「已取消」标签弄成「打印失败」（release 现场可见的假回归），且失败回报不带来收益。
 for _st in ("canceled", "abandoned", "rejected"):
-    oid = mk_order("queued", [("printing", 2.30, "2026-10-18 10:00:00")],
-                   number="HN-B6f-%s" % _st)
+    oid = mk_order("sent", [("sent", 2.30, "")], number="HN-B6f-%s" % _st)
     _set_owner(oid, operator=DEV_A, last=DEV_A)
     tid = _sub_ids(oid)[0]
     post({"order_id": oid, "status": _st})
@@ -715,10 +720,11 @@ def _print_started_at(oid):
 
 
 for _st in ("abandoned", "rejected", "canceled"):
-    oid = mk_order("waiting", [("waiting", 2.30, "")], number="HN-B56-%s" % _st)
+    # v7.19：活跃态（waiting）不许订正 ⇒ 从 sent 起步，订正后再把子任务放回 waiting。
+    oid = mk_order("sent", [("sent", 2.30, "")], number="HN-B56-%s" % _st)
     _set_owner(oid, operator=DEV_A, last=DEV_A)
     tid = _sub_ids(oid)[0]
-    post({"order_id": oid, "status": _st})          # 父订单=waiting、子任务=waiting → 订正为终态
+    post({"order_id": oid, "status": _st})          # 父订单=sent（终态）→ 订正为另一个终态
     _set_child_status(tid, "waiting")               # 还原设备侧状态（见上方说明）
     _parent_before = db_state(oid)[0]
     SOCK_A.get_received()
@@ -735,7 +741,7 @@ for _st in ("abandoned", "rejected", "canceled"):
         (_o_now, _parent_before, _print_started_at(oid)))
 
 # 对照组：failed 不在三终态常量里（纸可能已经出来了，仍可被救回/继续打完）→ start_printing 放行
-oid = mk_order("waiting", [("waiting", 2.30, "")], number="HN-B56-failed")
+oid = mk_order("sent", [("sent", 2.30, "")], number="HN-B56-failed")
 _set_owner(oid, operator=DEV_A, last=DEV_A)
 tid = _sub_ids(oid)[0]
 post({"order_id": oid, "status": "failed"})
@@ -758,7 +764,7 @@ _mut_st = None
 try:
     if _orig_nlp is not None:
         backend.NO_LONGER_PRINTABLE_STATUSES = ("canceled",)
-        oid_m = mk_order("waiting", [("waiting", 2.30, "")], number="HN-B56-mut")
+        oid_m = mk_order("sent", [("sent", 2.30, "")], number="HN-B56-mut")
         _set_owner(oid_m, operator=DEV_A, last=DEV_A)
         tid_m = _sub_ids(oid_m)[0]
         post({"order_id": oid_m, "status": "abandoned"})

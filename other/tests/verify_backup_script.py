@@ -66,6 +66,11 @@ H.chk("★ PROJECT_DIR 缺省 = 脚本所在目录（不写死 /opt，换部署�
       'PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)' in script_src)
 H.chk("★ 一个库都没备到 ⇒ 非 0 退出（绝不假绿）",
       "备份失败：在 $PROJECT_DIR 下没有找到任何数据库文件" in script_src and "exit 3" in script_src)
+H.chk("★ 备份 /etc/hn-printer/config.py（凭据只有这一处原文；程序目录那份是 644 副本）",
+      "/etc/hn-printer/config.py" in script_src and "CONFIG_PRODUCED" in script_src
+      and 'chmod 600 "$OUT_CFG"' in script_src)
+H.chk("配置备份也进保留期清理与恢复演练",
+      "config_*.py.gz" in script_src and 'gzip -t "$f"' in script_src)
 H.chk("journald 容量上限 drop-in 已入库",
       os.path.exists(os.path.join(BACKEND, "ops", "journald-hn-limits.conf"))
       and "SystemMaxUse=300M" in open(os.path.join(BACKEND, "ops", "journald-hn-limits.conf"),
@@ -128,7 +133,29 @@ def _read_backup_orders(gz_path):
 
 
 if not BASH:
-    print("SKIP: 本机没有 bash（无法跑 backup.sh 的行为验收）")
+    # 备份/恢复演练是数据安全最后一道闸：没 bash 就是"这一轮没验过"，
+    # 绝不能以 PASS 身份出现在全量回归里（[HN-SKIP] 会被 run_all 记成跳过）。
+    print("[HN-SKIP] 本机没有 bash：backup.sh 的行为段（真备份 / WAL / 恢复演练）这一轮没跑，"
+          "静态段通过不等于备份可用")
+    H.finish()
+    sys.exit(0)
+
+
+def _bash_has(tool):
+    try:
+        p = subprocess.run([BASH, "-c", "command -v " + tool],
+                           capture_output=True, text=True, timeout=20)
+        return p.returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_missing = [t for t in ("gzip", "tar") if not _bash_has(t)]
+if _missing:
+    # 2026-11-17 审计：缺 gzip 时原来会连报 7 条看不懂的 FAIL（backup.sh 第 73 行 set -e 退 127）。
+    # 缺依赖 = 环境不满足，明确说清楚并记成"跳过"，不再伪装成"验收失败"。
+    print("[HN-SKIP] 本机 bash 环境缺 " + " / ".join(_missing) +
+          "（backup.sh 依赖）：行为段没跑，静态段通过不等于备份可用")
     H.finish()
     sys.exit(0)
 

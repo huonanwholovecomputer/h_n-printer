@@ -105,6 +105,7 @@ from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx
 import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 import duplex_stack  # 攒批模式（多任务合并翻纸）的纸叠账本（纯逻辑，见 duplex_stack.py）
 import duplex_remedy  # 手动双面「半成品」补救台账：跳过/超时/第 2 趟失败后补打第 2 趟（见 duplex_remedy.py）
+import pdf_printer  # L2-1：stage 判据用 is_partial / PARTIAL_MARKER（模块级；也修好 4480 处的 NameError）
 import safe_confirm  # 危险确认统一口径：默认按钮永不是「执行」（见 safe_confirm.py）
 import print_watch   # 外部打印监视（绕过本工具的作业：只检测+记账，不阻断，见 print_watch.py）
 import pass2_watch   # 「上一批第 2 趟可能还在出纸」的跨批次计时（插单会串页，见 pass2_watch.py）
@@ -985,8 +986,11 @@ class ManualDuplexDialog(QDialog):
 
     HP 驱动的手动双面向导从打印开始就常驻在屏幕上，操作员不必等弹窗、也不会被突然弹出的
     窗口打断；我们照做，用状态机切换同一个窗口：
-      ① 批次开始 → 窗口出现：「正在打印第 1 趟」（继续按钮禁用）
-      ② 第 1 趟出纸 → 「可翻纸」：按钮启用 + 倒计时 + 出纸张数提示
+      ① 批次开始 → 窗口出现：「正在打印第 1 趟」；继续按钮**从窗口出现那刻就可点**
+         （硬规矩 12：点击那一刻 = 第 1 趟结束、计时就地冻结；不按时间闸门自动放行，
+         也不等打印机/worker 回报 flip_required —— 主机型只报「数据送进端口」）。
+         只有「上一个任务还在出纸」（announce_waiting）期间才保持禁用。
+      ② 第 1 趟出纸 → 「可翻纸」：倒计时 + 出纸张数提示（按钮仍可点，状态不变）
       ③ 点了继续 → 「正在打印第 2 趟」（按钮禁用，防重复点）
       ④ 批次结束 → 自动收起
     **关窗 = 跳过**（绝不因为关窗就擅自把第 2 趟打了）。
@@ -1916,6 +1920,32 @@ def _stack_original_sheet_count(stack) -> int:
                 pass
         total += max(0, int(getattr(e, "sheet_count", 0) or 0))
     return total
+
+
+def _stack_resume_hazards(st) -> list:
+    """启动续打前必须让操作员看见的风险（空列表 = 没有额外风险）。
+
+    `DuplexStack.pass2_inflight` 是"这一叠开打过第 2 趟、但没走到结束路径"的
+    崩溃痕迹（L2-2）：纸叠里可能混着只打了单面/打了背面的纸，**绝不能**按
+    「还没打第 2 趟」整叠重打（重复出纸），必须先让人核对。
+    """
+    risks: list = []
+    try:
+        active = bool(st.pass2_inflight_active())
+    except Exception:
+        active = False
+    if active:
+        try:
+            at = str((st.pass2_inflight or {}).get("at") or "")
+        except Exception:
+            at = ""
+        risks.append(
+            "上次第 2 趟可能只打了一半"
+            + (f"（{at} 开打）" if at else "")
+            + " —— 这一叠是在打第 2 趟的过程中被强杀/断电的，出纸槽里可能混着"
+              "只打了单面或打了背面的纸。不能直接整叠重打（会重复出纸），"
+              "请先人工核对出纸槽；确认纸叠作废就选「否」放弃后整单重打。")
+    return risks
 
 
 def _stack_entry_sheet_count(entry) -> int:
@@ -5121,6 +5151,27 @@ class PrintWorker(QThread):
                 self.log_message.emit(
                     f"  ⚠ 第 1 趟没打完（{msg1}）—— 出纸槽里可能有 {n1} 张里的前几张，"
                     "请清掉再重打")
+                # L2-3（2026-11-17 审计）：驱动**真出过纸**时（PARTIAL_MARKER /
+                # MID_PRINT_MARKER = StartPage 已执行，见 pdf_printer.py:21-45），出纸槽里
+                # 可能已经压着本批前几张。只发日志再按失败 return，主线程和重启后的程序
+                # 都以为槽是空的 —— 下一批翻纸就把别人的纸算成本批的（整叠错位）。
+                # 这叠纸前几张的页序不可信 ⇒ 不能补打第 2 趟，只能整单重打/作废
+                # ⇒ 记 stage=pass2_partial（补救窗对它的按钮正好是这两个）。
+                # 一张都没出（无 marker）不记：纸叠没被动过，按普通失败上报重打即可。
+                if _pp.is_partial(msg1):
+                    _rec1 = _keep_stall(
+                        f"手动双面第 1 趟中途失败: {_pp.strip_partial(msg1)}",
+                        duplex_remedy.STAGE_PASS2_PARTIAL)
+                    _rid1 = str((_rec1 or {}).get("id") or "")
+                    if _rid1:
+                        return False, (f"手动双面第 1 趟中途失败: {msg1}"
+                                       f"（出纸槽里可能已有本批前几张纸）—— 已记入"
+                                       f"「半成品补救」：这叠纸页序不可信，不能补打第 2 趟，"
+                                       f"请整单重打或作废"), n1
+                    if _rec1 is not None:
+                        return False, (f"手动双面第 1 趟中途失败: {msg1}"
+                                       f"（出纸槽里可能已有本批前几张纸）—— 半成品台账没写成，"
+                                       f"合批 PDF 已尽量留档，请人工核对后整单重打"), n1
                 return False, f"手动双面第 1 趟失败: {msg1}", n1
             # 第 1 趟的纸已经压进出纸槽了：台账往前推 —— 下一批（长短边混排拆出的第 2 批）
             # 翻纸时就该把这一批的纸算成"槽里已有的"
@@ -5994,10 +6045,26 @@ class DuplexFlushWorker(QThread):
         self._dpi = int(dpi or 0)
         # 纸张大小：与 PrintWorker 同源（全局默认），整叠第 2 趟也必须用同一张纸
         self._paper = (paper or "").strip()
+        # L2-1：第 2 趟是否已进入打印循环（异常路径据此判断「可能已出纸」）
+        self._pass2_started = False
+        # L2-2：取消标志（closeEvent 先 cancel 再 wait）
+        self._cancel = False
+
+    def cancel(self):
+        """请求尽快停下（退出/放弃整叠时用）。
+
+        ⚠ 只能停在**阶段之间**：`print_plan_pass` 里没有中断钩子，已经进打印循环的
+        那一趟不可能从这里打断 —— 那种情况按"崩溃"处理（inflight 痕迹留给重启判据，
+        见 `DuplexStack.pass2_inflight`）。
+        """
+        self._cancel = True
 
     def run(self):
         import pdf_printer as _pp
         try:
+            if self._cancel:
+                self.log_message.emit("⏹ 整叠第 2 趟已取消（还没开始，未出纸）")
+                return
             pdfs = self._stack.entry_pdfs(self._batch_dir)
             if not pdfs:
                 self.done.emit(False, "纸叠里没有可打的单", 0)
@@ -6026,6 +6093,9 @@ class DuplexFlushWorker(QThread):
             self.log_message.emit(
                 f"▶ 攒批第 2 趟：{self._stack.count} 单 / {present} 张纸，逐张纸补偿："
                 f"转 180° {_n_rot} 面、不转 {len(_flags) - _n_rot} 面")
+            if self._cancel:
+                self.log_message.emit("⏹ 整叠第 2 趟已取消（合并 PDF 前，未出纸）")
+                return
             ok, msg = _pp.merge_pdfs(pdfs, merged)
             if not ok:
                 self.done.emit(False, f"整叠合并失败：{msg}", 0)
@@ -6039,17 +6109,38 @@ class DuplexFlushWorker(QThread):
             # （2026-10-27 起 `print_plan_pass` 从 `plan.pass_rotate()` 取 `rotate_slots`）。
             # 旧写法传 `bool(self._stack.rotate)`：整叠一个开关 ⇒ 长边/短边混排只能拆叠，
             # 而拆叠在攒批里等于"另一个订单永远排不上队"（2026-10-28 事故）。
+            if self._cancel:
+                self.log_message.emit("⏹ 整叠第 2 趟已取消（进打印循环前，未出纸）")
+                return
+            self._pass2_started = True
             ok2, msg2 = print_plan_pass(
                 plan, merged, self._printer_name, 2,
                 second_rotate_180=True,
                 progress_callback=_on_side, dpi=self._dpi, paper=self._paper)
             if not ok2:
-                self.done.emit(False, f"整叠第 2 趟失败：{msg2}", total)
+                # PARTIAL_MARKER 必须留在消息**开头**：主窗口用 is_partial(msg) 判
+                # 「第 2 趟到底出没出过纸」；把文案拼到 marker 前面会让 startswith
+                # 失效，半成品被记成「第 1 趟已完成」（L2-1）。
+                _p2 = _pp.is_partial(msg2)
+                self.done.emit(
+                    False,
+                    ((_pp.PARTIAL_MARKER if _p2 else "")
+                     + "整叠第 2 趟失败："
+                     + (_pp.strip_partial(msg2) if _p2 else msg2)),
+                    total)
                 return
             self.done.emit(True, f"整叠第 2 趟完成（{self._stack.count} 单 / "
                                  f"{present} 张纸 / {total} 面）", total)
         except Exception as e:
-            self.done.emit(False, f"整叠第 2 趟异常：{type(e).__name__}: {e}", 0)
+            import pdf_printer as _ppx
+            # 打印已经开始后抛异常 ⇒ 出了几张纸无从得知。宁可当「可能出过纸」
+            # （人工核对/整单重打），也绝不能记成 pass1_done 让操作员照补第 2 趟。
+            _p2x = bool(getattr(self, "_pass2_started", False))
+            self.done.emit(
+                False,
+                ((_ppx.PARTIAL_MARKER if _p2x else "")
+                 + f"整叠第 2 趟异常：{type(e).__name__}: {e}"),
+                0)
 
 
 class DuplexRemedyDialog(QDialog):
@@ -8247,11 +8338,15 @@ class MainWindow(QMainWindow):
                   f"（第 1 趟共 {original} 张"
                   + (f"，已取走 {taken} 张" if taken else "") + "）"
                   f"（{st.created_at or '时间未知'}）")
-        uncertain = any(e.state != duplex_stack.STATE_DONE for e in st.entries) or st.tainted
+        _hazards = _stack_resume_hazards(st)
+        uncertain = (bool(_hazards)
+                     or any(e.state != duplex_stack.STATE_DONE for e in st.entries)
+                     or st.tainted)
         detail = "\n".join(st.describe_lines())
-        warn = ("\n\n⚠ 清单里有单的第 1 趟没有正常收尾（或进程是被强杀的），"
-                "出纸槽里的纸到底有几张无法确定 —— 若页数对不上，"
-                "打第 2 趟会整叠错位，请人工核对后选择「否」放弃。" if uncertain else "")
+        warn = "".join(f"\n\n⚠ {_h}" for _h in _hazards)
+        warn += ("\n\n⚠ 清单里有单的第 1 趟没有正常收尾（或进程是被强杀的），"
+                 "出纸槽里的纸到底有几张无法确定 —— 若页数对不上，"
+                 "打第 2 趟会整叠错位，请人工核对后选择「否」放弃。" if uncertain else "")
         reply = QMessageBox.question(
             self, "上次的攒批还没打第 2 趟",
             f"进纸盒里应有 {present} 张纸（第 1 趟共 {original} 张"
@@ -19710,6 +19805,28 @@ class MainWindow(QMainWindow):
             # —— 否则只会白抽一遍纸，而且 done 回调会把成品当半成品。
             self._finish_empty_stack_second_pass()
             return
+        # L2-5：口径对账 —— 「出纸槽占用数 present」必须等于「第 2 趟实际要送的槽位 slots」。
+        # present_sheet_count 把第 1 趟失败的单也算在内（duplex_stack.py:744-771 不排除
+        # STATE_FAILED），而 build_plan() 只送 active 单的背面（duplex_stack.py:892-935
+        # 跳过 STATE_FAILED）⇒ 有失败单时 present > slots：进纸盒里到底几张、哪几张属于
+        # 这叠无法确认，继续打就是整叠错位（第 2 趟打到别人的纸 / 漏页）。这里必须拦，
+        # 不能只告警继续 —— 错位的纸是物理损失，没有"事后对账"能补回来。
+        if slots > 0 and present != slots:
+            _failed_n = sum(1 for e in self._stack.entries
+                            if str(getattr(e, "state", "") or "") == duplex_stack.STATE_FAILED)
+            _manifest = duplex_stack.manifest_path(self._stack_batch_dir())
+            self._log(f"🛑 拒绝启动整叠第 2 趟：口径对不上 —— 出纸槽占用 {present} 张"
+                      f"（含第 1 趟失败 {_failed_n} 单），但第 2 趟只该送 {slots} 张；"
+                      f"进纸盒里到底有几张无法确认，先人工核对清单：{_manifest}")
+            QMessageBox.warning(
+                self, "第 2 趟页数对不上，已拒绝启动",
+                f"出纸槽按台账应有 {present} 张（含第 1 趟失败 {_failed_n} 单的纸），\n"
+                f"但第 2 趟只该送 {slots} 张 —— 两者不一致，说明有单的第 1 趟没打全。\n\n"
+                f"继续打会整叠错位（第 2 趟打到别人的纸或漏页），所以这次不启动。\n"
+                f"请先人工核对出纸槽里的纸；必要时用「⚠ 半成品补救」整单重打。\n\n"
+                f"清单：{_manifest}")
+            self._refresh_stack_queue()
+            return
         # 落机对账闸门：启动 worker **之前**必须确认进纸盒里就是这 M 张（见方法注释）
         if not self._stack_reconcile_gate():
             self._refresh_stack_queue()   # 点了「否」= 这次不打，纸叠原样保留、按钮照旧可用
@@ -19743,6 +19860,14 @@ class MainWindow(QMainWindow):
         w.done.connect(self._on_stack_flush_done)
         self._stack_flush_worker = w
         self._progress_bar.setValue(0)
+        # L2-2：第 2 趟开打**之前**落 inflight 痕迹并落盘 —— 顺序不能反（先 start 再落盘
+        # 的话"start 之后、落盘之前"被强杀就丢掉痕迹，重启仍会整叠重打 = 重复出纸）。
+        try:
+            self._stack.mark_pass2_inflight()
+            duplex_stack.save_manifest(bdir, self._stack)
+        except Exception as _e_inf:
+            self._log(f"⚠ 第 2 趟 inflight 痕迹落盘失败（{type(_e_inf).__name__}: {_e_inf}）"
+                      " —— 崩溃后无法识别「上次第 2 趟可能只打了一半」，请留意")
         w.start()
         self._refresh_stack_queue()       # 列表立刻切到「正在打整叠第 2 趟」+ 按钮禁用
 
@@ -19761,7 +19886,8 @@ class MainWindow(QMainWindow):
         if text and label is not None:
             label.setText(text)
 
-    def _keep_stack_stall(self, entries: list, bdir: str, reason: str) -> dict | None:
+    def _keep_stack_stall(self, entries: list, bdir: str, reason: str,
+                          stage: str = "") -> dict | None:
         """把「整叠第 2 趟失败」的半成品落进「半成品补救」台账；返回记录，失败返回 None。
 
         留的是什么：整叠合并 PDF 的副本（各单 PDF 按加入顺序再拼一遍，页号偏移与
@@ -19809,7 +19935,12 @@ class MainWindow(QMainWindow):
                     items.append(_it)
             _papers = {str(getattr(_e, "paper", "") or "") for _e in entries}
             rec = duplex_remedy.make_record(
-                stage=duplex_remedy.STAGE_PASS1_DONE,
+                # stage 由调用方按「第 2 趟有没有真出过纸」判（见 _on_stack_flush_done）；
+                # 没给就按 reason 里的 PARTIAL_MARKER 兜底 —— 有 marker = 真出过纸
+                # （pdf_printer.py:21-45），这叠只能整单重打。
+                stage=(stage or (duplex_remedy.STAGE_PASS2_PARTIAL
+                                 if _pp.is_partial(reason)
+                                 else duplex_remedy.STAGE_PASS1_DONE)),
                 reason=reason,
                 printer=self._config.printer_name,
                 # 补救要按"原样"补第 2 趟：各单纸张一致才沿用，混合走驱动默认纸
@@ -19836,6 +19967,55 @@ class MainWindow(QMainWindow):
             self._log(f"⚠ 攒批半成品台账记录失败（{type(e).__name__}: {e}）→ 只能按失败收尾")
             return None
 
+    def _clear_stack_pass2_inflight(self, reason: str = "") -> None:
+        """清掉「这一叠正在打第 2 趟」的痕迹并立刻落盘（L2-2）。
+
+        调用点只有三处：第 2 趟收尾（成功/失败）、取消/退出。必须落盘，否则
+        下次启动会误报「上次第 2 趟可能只打了一半」；反过来漏清则更糟：
+        操作员会按"半成品"处理一叠其实已经打完的纸。
+        """
+        try:
+            st = getattr(self, "_stack", None)
+            if st is None or not getattr(st, "pass2_inflight", None):
+                return
+            st.clear_pass2_inflight()
+            bdir = self._stack_batch_dir()
+            if bdir and os.path.isdir(bdir):
+                duplex_stack.save_manifest(bdir, st)
+        except Exception as e:
+            self._log(f"⚠ 清除第 2 趟 inflight 痕迹失败（{type(e).__name__}: {e}）")
+
+    def _cancel_stack_flush(self, timeout_ms: int = 8000) -> bool:
+        """先请求整叠第 2 趟停下、再等线程（L2-2）；返回 True = 线程确实结束。
+
+        旧写法只 `wait(8000)` 然后直接放弃：worker 还可能在打印循环里，进程退出时
+        QThread 被销毁 —— 既没有"取消"语义，也没机会清掉 inflight 痕迹。
+        等不到（已进 spooler 的那一趟停不下）就**保留**痕迹：那正是"上次第 2 趟
+        可能只打了一半"该被认出来的现场。
+        """
+        w = getattr(self, "_stack_flush_worker", None)
+        if w is None:
+            return True
+        try:
+            w.cancel()
+        except Exception as e:
+            self._log(f"⚠ 请求整叠第 2 趟取消失败（{type(e).__name__}: {e}）")
+        ended = True
+        try:
+            if w.isRunning():
+                self._log("⏳ 等待整叠第 2 趟打印线程结束…")
+                ended = bool(w.wait(int(timeout_ms)))
+        except Exception as e:
+            self._log(f"⚠ 等待整叠第 2 趟线程失败（{type(e).__name__}: {e}）")
+            ended = False
+        if ended:
+            self._clear_stack_pass2_inflight("已取消/退出")
+            self._log("⏹ 整叠第 2 趟线程已结束（第 2 趟 inflight 痕迹已清）")
+        else:
+            self._log("⚠ 整叠第 2 趟线程没在超时内停下 —— 清单保留 inflight 痕迹，"
+                      "下次启动会提示「上次第 2 趟可能只打了一半」，请人工核对出纸槽")
+        return ended
+
     def _on_stack_flush_done(self, ok: bool, msg: str, sides: int):
         """整叠第 2 趟结束（成功/失败）→ 统一收尾所有单的任务。
 
@@ -19845,6 +20025,9 @@ class MainWindow(QMainWindow):
         """
         try:
             self._stack_flush_worker = None
+            # L2-2：第 2 趟走到结束路径（成功/失败）⇒ 清掉 inflight 痕迹并落盘。
+            # 不等 discard_batch：失败时目录会保留（证据），痕迹不清下次启动会误报。
+            self._clear_stack_pass2_inflight()
             # 用第 2 趟开始时的快照收尾（而非当下的 _stack.entries）：第 2 趟期间混进来的
             # 新单只打了第 1 趟，绝不能按成品 report_success（🔴-3 的第二道防线）
             entries = list(self._stack_flush_snapshot or self._stack.entries)
@@ -19867,7 +20050,17 @@ class MainWindow(QMainWindow):
             # 由补救窗决定补打第 2 趟 / 整单重打 / 作废。
             _stalled_rec = None
             if not ok:
-                _stalled_rec = self._keep_stack_stall(entries, bdir, str(final_msg))
+                # 🔴-B1（L2-1）：stage 不许再硬编码「第 1 趟已完成」。
+                # print_pdf 只在 StartPage 真执行过之后才给消息加 PARTIAL_MARKER
+                # （pdf_printer.py:21-45）⇒ 有 marker = 第 2 趟真的出过纸，纸叠作废，
+                # 只能整单重打（pass2_partial）；没 marker = 一张都没出，纸叠完好，
+                # 仍然可以只补第 2 趟（pass1_done）。
+                # 判据用**原始信号 msg**，不用 final_msg：后者是给人看的文案。
+                _p2_partial = pdf_printer.is_partial(msg)
+                _stalled_rec = self._keep_stack_stall(
+                    entries, bdir, str(final_msg),
+                    stage=(duplex_remedy.STAGE_PASS2_PARTIAL if _p2_partial
+                           else duplex_remedy.STAGE_PASS1_DONE))
             if _stalled_rec is not None:
                 self._log("⚠ 整叠是半成品 —— 已记入「半成品补救」"
                           f"（{_stalled_rec.get('id')}）：清单与各单 PDF 都留着，"
@@ -23090,9 +23283,10 @@ class MainWindow(QMainWindow):
                 self._closing = False
                 self._force_quit = False  # 用户改主意不退了：别让 _quit_app 误判成"已经退出"
                 return
-            if self._stack_flush_worker is not None and self._stack_flush_worker.isRunning():
-                self._log("⏳ 等待整叠第 2 趟打印线程结束…")
-                self._stack_flush_worker.wait(8000)
+            # L2-2：先 cancel 再 wait（旧写法只 wait 后直接放弃，QThread 可能还在
+            # 打印循环里；等不到就保留 inflight 痕迹，让下次启动提示人工核对）
+            if self._stack_flush_worker is not None:
+                self._cancel_stack_flush(8000)
 
         # 打印进行中 → 询问用户：等待完成 / 取消打印 / 继续打印
         if self._worker is not None and self._worker.isRunning():

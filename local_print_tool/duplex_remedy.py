@@ -50,6 +50,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import threading
@@ -83,6 +84,7 @@ MAX_ITEMS = 200
 MAX_FILE_PLANS = 400
 
 _lock = threading.RLock()
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────── 路径与基础工具 ───────────────────────
@@ -334,7 +336,12 @@ def add(record: dict) -> dict:
         rec["state"] = STATE_PENDING
         recs = [r for r in recs if r.get("id") != rid]
         recs.append(rec)
-        save(recs)
+        # L2-4：落盘失败**不能**假装成功 —— 调用方会把这个 id 写进
+        # job.remedy_pending，下次启动却读不到这条补救计划（纸是半成品、
+        # 台账里却没有它）。返回空 dict，让调用方退回「按失败收尾」。
+        if not save(recs):
+            logger.warning("补救台账写入失败（add: %s）—— 不写入内存/调用方", rid)
+            return {}
         return rec
 
 

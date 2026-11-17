@@ -78,6 +78,32 @@ def _count_range_pages(page_range: str, page_count: int) -> int:
     except Exception:
         return total
 
+
+def _file_sheets(page_count: int, duplex: str, page_range: str = "",
+                 simplex_pages: str = "") -> tuple[int, int]:
+    """单个文件的 (有效页数, 张数)。**张数与 calc_cost/后端 _charge_units 同一实现**。
+
+    v7.19（L1-4）：这里原来是 (eff + 1) // 2 的第三份双面摊纸算法，它不认识
+    「封面单独打印」—— 封面页在双面模式下也各占 1 张单面纸，漏掉就少算单面张，
+    结算页的张数与实收金额、真实出纸量三边对不上。所以改为调 manual_duplex.charge_units
+    （printer_config.calc_cost 内部用的就是它），本文件不再自己算。
+    取不到实现时按单面口径降级（宁可把张数显示多，也不静默少算钱）。
+    """
+    eff = _count_range_pages(page_range or "", page_count)
+    if duplex != "on":
+        return eff, eff
+    try:
+        from printer_config import selected_pages as _selected
+        from printer_config import simplex_page_set as _simplex_set
+        from manual_duplex import charge_units as _charge
+        dup, single = _charge(_selected(page_range or "", int(page_count or 0)),
+                              _simplex_set(page_range or "", int(page_count or 0),
+                                           simplex_pages or ""))
+        return eff, dup + single
+    except Exception:
+        logger.warning("张数折算取不到 manual_duplex，降级为单面口径", exc_info=True)
+        return eff, eff
+
 # ── 云端代理连接池（连接复用 + 自动重试）──
 # 收支清算页的代理请求走共享 Session：keep-alive 复用 TCP 连接，配合重试适配器
 # 消化校园/宿舍 NAT 等网络的瞬时连接波动（ConnectTimeout/ReadTimeout）——
@@ -2547,10 +2573,11 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                         is_free = bool(f.get("is_free", False))
                         duplex = (f.get("duplex") or "on")
                         page_range = f.get("page_range", "") or ""
-                        # 有效口径（v7.2）：与云端 revenue 同构 —— 页数/张数按页码范围折算后下发，
-                        # 结算页只展示不折算（云端 q 与本地 q 必须是同一套字段与同一套算法）。
-                        eff = _count_range_pages(page_range, page_count)
-                        per_sheets = (eff + 1) // 2 if duplex == "on" else eff
+                        simplex_pages = f.get("simplex_pages", "") or ""
+                        # 有效口径（v7.2 / v7.19）：与云端 revenue 同构 —— 页数/张数按页码范围
+                        # 与「封面单独打印」折算后下发，结算页只展示不折算（云端 q 与本地 q
+                        # 必须是同一套字段与同一套算法；张数统一走 _file_sheets）。
+                        eff, per_sheets = _file_sheets(page_count, duplex, page_range, simplex_pages)
                         files.append({
                             "id": seq,
                             "file_name": f.get("file_name", ""),
@@ -2558,6 +2585,8 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                             "page_count": page_count,
                             "duplex": duplex,
                             "page_range": page_range,
+                            # v7.19（L1-4）：页面复算要按同一页集合摊纸，缺这个键就只能按整份双面算
+                            "simplex_pages": simplex_pages,
                             "total_price": round(cost, 2),           # 元（与云端 revenue 的 total_price 单位一致）
                             "status": row_status,                    # 与订单级同口径（未同步 ≠ 已完成）
                             "is_free": is_free,

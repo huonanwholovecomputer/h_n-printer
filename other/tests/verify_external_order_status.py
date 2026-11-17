@@ -98,8 +98,9 @@ def read_app():
 # ══════════════════════════════════════════════════════════════════
 section("① 账本层：终态白名单 / 脏值净化 / 订正与监视状态正交")
 # ══════════════════════════════════════════════════════════════════
-check("① MANUAL_STATUSES 就是云端同款五条终态（顺序也一致）",
-      tuple(pw.MANUAL_STATUSES) == ("sent", "failed", "abandoned", "canceled", "rejected"),
+check("① MANUAL_STATUSES 就是云端同款终态（v7.19 起六条，含 timeout；顺序也一致）",
+      tuple(pw.MANUAL_STATUSES) == ("sent", "failed", "abandoned", "canceled", "rejected",
+                                    "timeout"),
       repr(pw.MANUAL_STATUSES))
 check("① 监视状态与订单状态是两套常量（订正不会把作业标成 queued/printing）",
       "queued" not in pw.MANUAL_STATUSES and "printing" not in pw.MANUAL_STATUSES

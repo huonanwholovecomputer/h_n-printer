@@ -69,6 +69,10 @@ await page.addInitScript((base) => {
   try {
     window.__HN_TEST_BASE_URL__ = base;
     localStorage.setItem('hn_theme_mode', 'dark');
+    // 2026-11-17 审计：APP 首次启动会弹「文件保留与隐私」告知（print.js 的 loadPrivacyPrefs：
+    // 没同意过就 openPrivacySheet）。那张遮罩盖在卡片上，elementFromPoint 全部命中遮罩 →
+    // 采样点定位失败。这里按「已经同意过的老用户」预置标记（只影响本地状态，不动产品代码）。
+    localStorage.setItem('hn_privacy_agreed_v1', '1');
   } catch (e) {}
 }, `http://127.0.0.1:${port}`);
 await page.route('**/api/**', (route) => route.request().url().startsWith(`http://127.0.0.1:${port}`)

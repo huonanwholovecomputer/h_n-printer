@@ -54,6 +54,16 @@ c.save()
 from PySide6.QtWidgets import QApplication  # noqa: E402
 app = QApplication.instance() or QApplication([])
 
+
+def _pump(ms=300):
+    """把事件队列跑干净：后台暂存线程通过信号改表格文字，_wait_staging_idle 只等线程结束，
+    队列里的重绘可能还没执行 —— 2026-11-17 审计实测这里会偶发 FAIL（约 1/5 次），
+    表格还在显示「⚠️ 副本名」而不是原件名。只加「等它画完」，判据不变。"""
+    t0 = time.time()
+    while time.time() - t0 < ms / 1000.0:
+        app.processEvents()
+        time.sleep(0.01)
+
 import gui as _gui  # noqa: E402
 
 # 关闭窗口时若有未打印任务会弹确认框（offscreen 下无人可答会死等）→ 自动回「是」
@@ -73,15 +83,23 @@ print("… 主窗口就绪", flush=True)
 print("=== 1. 拖拽添加（走真实 _add_files_to_table）===")
 win._add_files_to_table([SRC])
 win._wait_staging_idle(60.0)   # 2026-11-17：复制/解析在后台线程
+_pump()                        # 再把信号触发的重绘跑完，否则表格文字可能还是占位名
 jobs = win._get_current_jobs()
 check("任务已加入列表", len(jobs) == 1, f"n={len(jobs)}")
 if jobs:
     job = jobs[0]
     check("列表任务使用暂存副本", staging.is_staged(job.file_path), job.file_path)
     check("原件路径记录在 source_path", job.source_path == os.path.abspath(SRC), job.source_path)
+    # 表格文字可能是「⚠️ 原件名」：字体缺失检查（gui.py:12391-12398）会给文件名前面加
+    # ⚠️ 并标黄。那是另一件事的标记（reportlab 生成的标准字体本来就没嵌入，必然命中），
+    # 与本判据无关 —— 只把标记剥掉再比，同时断言暂存副本自己的文件名绝不露脸。
+    # 注意：暂存副本本身**沿用原文件名**（只是换了目录），所以「副本名不露脸」只能靠
+    # 「表格里没有 file_cache 路径」来体现，不能拿 basename 比 —— 两边本来就同名。
+    _shown = win._table.item(0, win.COL_FILE).text()
+    _bare = _shown[len("⚠️ "):] if _shown.startswith("⚠️ ") else _shown
     check("表格显示原始文件名（副本名不露脸）",
-          win._table.item(0, win.COL_FILE).text() == os.path.basename(SRC),
-          win._table.item(0, win.COL_FILE).text())
+          _bare == os.path.basename(SRC) and "file_cache" not in _shown,
+          _shown)
     check("双击/打开位置用的路径指向原件",
           os.path.normcase(win._job_user_path(0)) == os.path.normcase(os.path.abspath(SRC)))
     check("工具提示展示原件路径", os.path.abspath(SRC) in win._table.item(0, win.COL_FILE).toolTip())
@@ -89,6 +107,7 @@ if jobs:
     # 同一文件重复添加 → 跳过（沿用原逻辑）
     win._add_files_to_table([SRC])
     win._wait_staging_idle(60.0)
+    _pump()
     check("同一文件重复添加被跳过", len(win._get_current_jobs()) == 1)
 
 print("=== 2. 原件（解压临时目录）被清理后仍可打印 ===")

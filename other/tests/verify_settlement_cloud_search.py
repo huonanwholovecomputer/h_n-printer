@@ -62,8 +62,18 @@ print("=== #6 删除本月结论卡 ===")
 check("renderDash 不再挂 #dashVerdict 锚点", 'id="dashVerdict"' not in src)
 check("dashVerdictHTML 函数已删除（不留死函数）", not re.search(r"function\s+dashVerdictHTML\s*\(", src))
 verdict_lines = [ln.strip() for ln in src.splitlines() if "本月结论" in ln]
-check("「本月结论」文案已从页面移除（只在删除说明注释里出现）",
-      all(ln.startswith(("/*", "*", "//")) for ln in verdict_lines), verdict_lines)
+
+
+def _mention_allowed(ln):
+    """允许两种提及：① 代码注释（删除说明）② 关于页的版本更新条目
+    （v7.15 那条公开写着"删掉顶部「本月结论」卡"，它是说明文字不是界面卡）。"""
+    if ln.startswith(("/*", "*", "//")):
+        return True
+    return re.search(r"<p[^>]*>\s*v7\.\d+：", ln) is not None
+
+
+check("「本月结论」只出现在注释与关于页版本说明里（不得再作为界面文案渲染）",
+      all(_mention_allowed(ln) for ln in verdict_lines), verdict_lines)
 check("_refreshDashSummary 不再重绘 #dashVerdict", "#dashVerdict" not in body("_refreshDashSummary"))
 check("删卡后 ustate 仍保留给状态条 / 入场动画",
       "var ustate = usageStateOfMonth(currentKey);" in src
@@ -186,10 +196,12 @@ check("状态筛选下拉静态补 timeout 入口（后端没下发时也能选�
       'if (!statusCount.timeout) h += \'<option value="timeout"' in src
       and '>超时 (0)</option>' in src)
 
-fixable = re.search(r"var ORDER_FIXABLE_STATUSES = \[[^\]]*\];", src)
-check("人工订正白名单未变（只允许终态）",
-      fixable is not None and fixable.group(0)
-      == "var ORDER_FIXABLE_STATUSES = ['sent', 'failed', 'abandoned', 'canceled', 'rejected'];")
+fixable = re.search(r"var ORDER_FIXABLE_STATUSES = \[([^\]]*)\];", src)
+_fix_list = ([x.strip().strip("'\"") for x in fixable.group(1).split(",") if x.strip()]
+             if fixable else [])
+check("人工订正白名单只放终态（v7.19 起含 timeout；与后端 MANUAL_FIX_STATUSES 同序）",
+      _fix_list == ["sent", "failed", "abandoned", "canceled", "rejected", "timeout"],
+      repr(_fix_list))
 check("标记人下拉用成员名单名字，不用云端昵称",
       "getMembers()" in body("_memberNames") and "nickname" not in body("_memberNames"))
 check("标记人默认取上次选择，失效回退第一个",

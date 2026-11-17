@@ -348,23 +348,30 @@ if not m or not m2:
     check("能从结算页提取 _fileSheets / _filePages", False)
 else:
     sheets_js = os.path.join(tmp, "sheets.js")
-    cases = [[pc, copies, duplex, pr] for pc in (1, 2, 3, 4, 5, 9, 10)
+    # v7.19（L1-4）：加 simplex 维度 —— 「封面单独打印」的页在双面模式下也各占 1 张
+    # 单面纸，旧用例全是无 simplex 的，这条口径从来没有被对拍过。
+    cases = [[pc, copies, duplex, pr, sx] for pc in (1, 2, 3, 4, 5, 9, 10)
              for copies in (1, 2, 3) for duplex in ("on", "off")
-             for pr in ("", "1-3", "2", "1,3,5")]
+             for pr in ("", "1-3", "2", "1,3,5")
+             for sx in ("", "1", "2", "1,3")]
     # 每组喂「后端折算好的字段」，页面必须原样展示（与后端逐组一致）
     payload = []
-    for (pc, copies, duplex, pr) in cases:
-        st = backend._file_range_stats(pc, copies, duplex, pr)
+    for (pc, copies, duplex, pr, sx) in cases:
+        st = backend._file_range_stats(pc, copies, duplex, pr, sx)
         payload.append({"page_count": pc, "copies": copies, "duplex": duplex,
-                        "page_range": pr, "effective_pages": st["effective_pages"],
+                        "page_range": pr, "simplex_pages": sx,
+                        "effective_pages": st["effective_pages"],
                         "sheets": st["sheets"], "total_pages": st["total_pages"],
                         "total_sheets": st["total_sheets"]})
+    payload_path = os.path.join(tmp, "payload.json")
+    open(payload_path, "w", encoding="utf-8").write(json.dumps(payload))
     open(sheets_js, "w", encoding="utf-8").write(
         m2.group(0) + "\n" + m.group(0) + "\n"
-        "const cs = JSON.parse(process.argv[2]);\n"
+        "const fs = require('fs');\n"
+        "const cs = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));\n"
         "process.stdout.write(JSON.stringify(cs.map(f => "
         "[_filePages(f), _fileSheets(f)])));\n")
-    r2 = subprocess.run(["node", sheets_js, json.dumps(payload)],
+    r2 = subprocess.run(["node", sheets_js, payload_path],
                         capture_output=True, text=True, encoding="utf-8")
     if r2.returncode != 0:
         check("结算页折算函数可在 Node 中运行", False, (r2.stderr or "")[:300])
@@ -373,8 +380,77 @@ else:
         diff = [(c, s) for c, s in zip(cases, shown)
                 if tuple(s) != (backend._file_range_stats(*c)["effective_pages"],
                                 backend._file_range_stats(*c)["total_sheets"])]
-        check(f"★ 结算页页数/张数逐组等于后端折算值（{len(cases)} 组）", not diff,
+        check(f"★ 结算页页数/张数逐组等于后端折算值（{len(cases)} 组，含 simplex）", not diff,
               f"不一致 {len(diff)} 组，例：{diff[0] if diff else ''}")
+
+    # ── E2) 小程序张数口径 vs 后端 _charge_units（含**非连号**用例）──
+    # 唯一实现：utils/pages.js chargeUnits ↔ app.py _charge_units（两者按「该页是否单面」
+    # 切段，不看页号连号）。历史 bug：pages.js 多了一条连号判据，range=1,3,5 + 封面=1
+    # 时它算 3 张、后端实收按 2 张 ⇒ 确认页显示价恒高于实收。
+    PAGES_JS = os.path.join(REPO, "mobile_apps", "h_n_print", "utils", "pages.js")
+    pages_js_path = sys.argv[1] if len(sys.argv) > 1 else PAGES_JS  # 路径参数仅供变异自证
+    units_cases = [[pc, pr, sx] for pc in (1, 2, 3, 4, 5, 9, 10)
+                   for pr in ("", "1-3", "2", "1,3,5", "1-5,7") for sx in ("", "1", "2", "1,3")]
+    # 显式钉两条「整份文件 + 单面页在中间」的用例（price_copy 旧的独立实现会算错的地方）：
+    # S=[1..8]、X={4} ⇒ 后端 2 双面张 + 1 单面张（旧 price_copy: 3 双面 + 0 单面）。
+    units_cases += [[8, "", "4"], [5, "", "3-4"]]
+    units_probe = r"""
+const fs = require('fs');
+const m = { exports: {} };
+new Function('module', 'exports', fs.readFileSync(process.argv[2], 'utf8'))(m, m.exports);
+const cases = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+// 2026-11-17 审计：price_copy.js 的摊纸张数原来自带第 4 份实现（按「单面页数 + 其余折半」
+// 算），与后端 _charge_units 不等价。现在它复用 pages.js；这里把两处都真跑一遍对拍，
+// 防止再次分叉（price_copy 的 pairs 对应后端 dup_sheets、remainder 对应 single_sheets）。
+const pcPath = process.argv[4];
+const pc = { exports: {} };
+new Function('module', 'exports', 'require', fs.readFileSync(pcPath, 'utf8'))(pc, pc.exports, (dep) => {
+  if (dep !== './pages') throw new Error('price_copy 意外 require ' + dep);
+  return m.exports;
+});
+const out = cases.map(([pc_, pr, sx]) => {
+  const sel = m.exports.pageRangeSet(pr, pc_);
+  const pages = sel.size ? Array.from(sel) : Array.from({ length: pc_ }, (_, i) => i + 1);
+  const set = sx ? m.exports.pageRangeSet(sx, pc_) : new Set();
+  const u = m.exports.chargeUnits(pages, set);
+  // price_copy.chargeUnitsOf(eff, sx) 的输入是「整份文件的页数」，只在页码范围恰好是全份
+  // （1..pc 全选）时才可比；选定子集时它没有「只打一部分页」的概念，不参与对拍。
+  const full = pages.length === pc_ && pages.every((v, i) => v === i + 1);
+  const v = pc.exports.chargeUnitsOf(pages.length, sx);
+  return [u.dupSheets, u.singleSheets, u.sheets, v.pairs, v.remainder, full ? 1 : 0];
+});
+process.stdout.write(JSON.stringify(out));
+"""
+    units_js = os.path.join(tmp, "units.js")
+    units_path = os.path.join(tmp, "units.json")
+    open(units_js, "w", encoding="utf-8").write(units_probe)
+    open(units_path, "w", encoding="utf-8").write(json.dumps(units_cases))
+    PRICE_COPY_JS = os.path.join(REPO, "mobile_apps", "h_n_print", "utils", "price_copy.js")
+    r5 = subprocess.run(["node", units_js, pages_js_path, units_path, PRICE_COPY_JS],
+                        capture_output=True, text=True, encoding="utf-8")
+    if r5.returncode != 0:
+        check("小程序 pages.js 可在 Node 中加载", False,
+              (r5.stderr or "")[:300] or f"exit {r5.returncode}（路径 {pages_js_path}）")
+    else:
+        js_units = json.loads(r5.stdout)
+        want_units = []
+        for (pc, pr, sx) in units_cases:
+            dup, single = backend._charge_units(pc, pr, sx)
+            want_units.append([dup, single, dup + single])
+        bad_units = [(c, j, w) for c, j, w in zip(units_cases, js_units, want_units) if j[:3] != w]
+        full_cases = [(c, j) for c, j in zip(units_cases, js_units) if j[5]]
+        pc_bad = [(c, j) for c, j in full_cases if [j[3], j[4]] != [j[0], j[1]]]
+
+        check(f"★ price_copy.js 复制明细的摊纸张数与后端同口径（{len(full_cases)} 组整份文件）",
+              not pc_bad, f"不一致 {len(pc_bad)} 组，例：{pc_bad[0] if pc_bad else ''}")
+        check(f"★ 小程序 pages.js 张数与后端 _charge_units 逐组同值（{len(units_cases)} 组）",
+              not bad_units, f"不一致 {len(bad_units)} 组，例：{bad_units[0] if bad_units else ''}")
+        # 非连号专用：1,3,5 三页 + 封面 1 单面 ⇒ 1 双面张 + 1 单面张 = 2 张（旧 bug 3 张）
+        special = [c for c in units_cases if c == [5, "1,3,5", "1"]]
+        if special:
+            idx = units_cases.index(special[0])
+            check("★ 非连号 1,3,5 + 封面单独 1 → 2 张（后端与小程序同值，旧实现 3 张）",
+                  js_units[idx][:3] == [1, 1, 2], js_units[idx][:3])
 
     # 降级分支：字段缺失时按整份口径（**文档化的降级**，旧缓存/旧本地库才走）
     legacy_js = os.path.join(tmp, "legacy.js")

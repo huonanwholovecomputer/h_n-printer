@@ -80,29 +80,41 @@ async function api(path, opts = {}) {
 async function refreshToken() {
   if (_refreshing) return _refreshing;
   _refreshing = (async () => {
+    // 最多两次：第一次带本地密钥；若后端 403（凭证失效 / 服务端重置过 device_secrets.json）
+    // 就清掉本地密钥再试一次 —— 服务端在宽限期内会重新下发。不能递归调 refreshToken()：
+    // 那会 await 到自己这个未完成的 promise（自锁）。
     try {
-      // S1-09：这条是**裸 fetch**（不走 api()），必须自己挂 AbortController 超时，
-      // 否则弱网/校园网抖动时会永久挂起（401 刷新卡住 ⇒ 所有重试都排队等它）。
-      const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
-      const t = ctrl ? setTimeout(() => ctrl.abort(), API_TIMEOUT_MS) : null;
-      let r;
-      try {
-        r = await fetch(BASE_URL + '/api/device_login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ device_id: getDeviceId() }),
-          ...(ctrl ? { signal: ctrl.signal } : {}),
-        });
-      } finally {
-        if (t) clearTimeout(t);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        // S1-09：这条是**裸 fetch**（不走 api()），必须自己挂 AbortController 超时，
+        // 否则弱网/校园网抖动时会永久挂起（401 刷新卡住 ⇒ 所有重试都排队等它）。
+        const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const t = ctrl ? setTimeout(() => ctrl.abort(), API_TIMEOUT_MS) : null;
+        let r;
+        try {
+          r = await fetch(BASE_URL + '/api/device_login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ device_id: getDeviceId(), device_secret: getDeviceSecret() }),
+            ...(ctrl ? { signal: ctrl.signal } : {}),
+          });
+        } catch (e) {
+          return false;
+        } finally {
+          if (t) clearTimeout(t);
+        }
+        let data = null;
+        try { data = await r.json(); } catch (e) { /* 非 JSON */ }
+        if (data && data.device_secret) setDeviceSecret(data.device_secret);
+        if (data && data.success && data.token) {
+          setAuth(data.token, data.openid || '');
+          return true;
+        }
+        if (r.status === 403 && getDeviceSecret()) {
+          clearDeviceSecret();
+          continue;
+        }
+        return false;
       }
-      const data = await r.json();
-      if (data.success && data.token) {
-        setAuth(data.token, data.openid || '');
-        return true;
-      }
-      return false;
-    } catch (e) {
       return false;
     } finally {
       _refreshing = null;
@@ -211,6 +223,25 @@ function getDeviceId() {
     localStorage.setItem('hn_device_id', id);
   }
   return id;
+}
+
+/* 设备密钥（S1-06）：后端首次登录下发一次，之后凭它换 token —— 不再只凭自报 device_id。
+   2026-11-17 审计：这个机制服务端早就有了，但网页/APP 端从来没保存、也没回传过，
+   于是每次登录都走"老客户端轮换"分支（宽限期被无限续命）；一旦按注释把宽限期改成 0，
+   所有设备会直接 403 锁死。这里补上客户端的一半。 */
+const DEVICE_SECRET_KEY = 'hn_device_secret';
+
+function getDeviceSecret() {
+  try { return localStorage.getItem(DEVICE_SECRET_KEY) || ''; } catch (e) { return ''; }
+}
+
+function setDeviceSecret(secret) {
+  if (!secret || typeof secret !== 'string') return;
+  try { localStorage.setItem(DEVICE_SECRET_KEY, secret); } catch (e) { /* 隐私模式/配额满：忽略 */ }
+}
+
+function clearDeviceSecret() {
+  try { localStorage.removeItem(DEVICE_SECRET_KEY); } catch (e) { /* 同上 */ }
 }
 
 /* ================= 会话 ================= */

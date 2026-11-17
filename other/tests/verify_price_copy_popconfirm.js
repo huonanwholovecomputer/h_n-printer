@@ -80,7 +80,16 @@ const PRICE_COPY_MOD = (() => {
   const m = { exports: {} };
   new Function('module', 'exports', 'require', fs.readFileSync(p, 'utf8'))(m, m.exports, (dep) => {
     if (dep === './pages') {
-      return { countPagesInRange: (range, count) => (range ? 0 : (Number(count) || 0)) };
+      /* 2026-11-17 审计：price_copy 的摊纸张数不再自带实现，改为复用 utils/pages.js
+         （chargeUnits / pageRangeSet）。这里以前返回一个只有 countPagesInRange 的桩，
+         会让「依赖真的存在且导出齐」这件事验不出来 —— 改成真实加载。 */
+      const pp = path.join(REPO, 'mobile_apps', 'h_n_print', 'utils', 'pages.js');
+      const pm = { exports: {} };
+      new Function('module', 'exports', fs.readFileSync(pp, 'utf8'))(pm, pm.exports);
+      ['countPagesInRange', 'pageRangeSet', 'chargeUnits'].forEach((k) => {
+        if (typeof pm.exports[k] !== 'function') throw new Error('utils/pages.js 未导出 ' + k);
+      });
+      return pm.exports;
     }
     throw new Error('utils/price_copy.js 意外 require 了 ' + dep);
   });

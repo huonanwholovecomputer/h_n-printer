@@ -10,7 +10,7 @@ tests/verify_settlement_order_ux.js 用 Node+vm 真跑页面函数覆盖。
   2. 时间戳统一 YYYY-MM-DD HH:MM:SS（ISO 的 T 转空格、截到秒）。
   3. 订单行与文件行的状态标签都挂 title，且都走同一个 _statusTip。
   4. timeout=超时 进标签/色板/异常分组/筛选下拉（琥珀色，深色主题可读）。
-  5. ORDER_FIXABLE_STATUSES 仍是 5 个终态，timeout 不进人工订正白名单。
+  5. ORDER_FIXABLE_STATUSES 含 timeout（v7.19：超时单可人工订正）且只含终态；关于页有说明。
   6. 标记人：成员名单名字、localStorage 记忆、空名单禁用、body 带 by。
   7. 文案无 markdown 星号、无 alert。
 
@@ -104,12 +104,20 @@ check(".status-dot.timeout 圆点琥珀色", re.search(r"\.status-dot\.timeout \
 check("筛选下拉静态补 timeout 项（动态列表没有它时入口仍在）",
       re.search(r"if \(!statusCount\.timeout\)[^\n]*value=\"timeout\"", src) is not None)
 
-print("== 5. 人工订正白名单不变 ==")
+print("== 5. 人工订正白名单：含 timeout、只含终态 ==")
 m_list = re.search(r"ORDER_FIXABLE_STATUSES = \[([^\]]*)\]", src)
 fe = set(re.findall(r"'([a-z_]+)'", m_list.group(1))) if m_list else set()
-check("ORDER_FIXABLE_STATUSES 仍是 5 个终态", fe == {"sent", "failed", "abandoned", "canceled", "rejected"}, str(sorted(fe)))
-check("timeout 不在人工订正白名单里", "timeout" not in fe)
+_TERMINAL = {"sent", "failed", "abandoned", "canceled", "rejected", "timeout"}
+check("ORDER_FIXABLE_STATUSES 含 timeout（超时单营收恒为 0，只有操作员知道出没出纸）",
+      "timeout" in fe, str(sorted(fe)))
+check("白名单只含终态（⊆ 终态集；排队中/打印中/预约/断线未知一个都不许进）",
+      bool(fe) and fe <= _TERMINAL, str(sorted(fe)))
 check("applyOrderStatus 仍先过白名单校验", "ORDER_FIXABLE_STATUSES.indexOf(status) < 0" in src)
+_about = re.findall(r"<p\b[^>]*>((?:(?!</p>)[\s\S])*?v7\.19：(?:(?!</p>)[\s\S])*?)</p>", src)
+check("关于页只有一段 v7.19（版本号不许重复），且说明超时单可人工订正（纯文本、无星号）",
+      len(_about) == 1 and "超时" in _about[0] and "订正" in _about[0]
+      and "*" not in _about[0] and "不进人工订正白名单：只展示" not in _about[0],
+      (len(_about), _about[0][-160:] if _about else ""))
 
 print("== 6. 标记人（成员名单 / 记忆 / 空名单 / body） ==")
 sel = body("_manualBySelectHTML")

@@ -104,6 +104,13 @@ STATE_PRINTING = "pass1_printing"   # 第 1 趟正在打（崩溃后状态未知
 STATE_DONE = "pass1_done"           # 第 1 趟已完成，纸在叠里
 STATE_FAILED = "pass1_failed"       # 第 1 趟报错（可能只出了一部分纸 → 整叠存疑）
 
+# L2-2：整叠第 2 趟「已经开打」的持久化痕迹（崩溃识别用）。
+# ⚠ 与上面三个 pass1_* **不同层**：那些是 StackEntry.state（单的第 1 趟状态），
+#   这个是 DuplexStack.pass2_inflight（整叠级）。开打前落盘、成功/失败/取消后清掉；
+#   进程被强杀时留在清单里 ⇒ 重启续打弹窗必须提示「上次第 2 趟可能只打了一半」，
+#   绝不能按「还没打第 2 趟」整叠重打（重复出纸）。
+PASS2_INFLIGHT = "pass2_inflight"
+
 
 def _bool_or(value, default: bool) -> bool:
     """三态布尔容错：只认 bool 与 0/1，其余（None/字符串/缺键）回落 default。
@@ -724,6 +731,8 @@ class DuplexStack:
         self.entries: list[StackEntry] = []
         self.tainted: bool = False           # 有单的第 1 趟失败/崩溃 → 整叠页序存疑
         self.taint_reason: str = ""
+        # L2-2：整叠第 2 趟的 inflight 痕迹（dict；空 = 没在打/没打残）
+        self.pass2_inflight: dict = {}
 
     # ── 只读视图 ──
 
@@ -765,6 +774,32 @@ class DuplexStack:
     def taken_sheet_count(self) -> int:
         """已被取走的张数（原始 − 在叠；按计划实算，最小 0）。"""
         return max(0, self.original_sheets_count - self.present_sheet_count)
+
+    # ── 第 2 趟 inflight 痕迹（L2-2）──
+
+    def mark_pass2_inflight(self, now: float | None = None) -> dict:
+        """打第 2 趟**之前**落一个持久化记号；调用方必须紧接着 save_manifest()。
+
+        顺序不能反过来：先 start() 再落盘的话，"start 之后、落盘之前"被强杀就正好
+        丢掉这条痕迹，重启仍会整叠重打（重复出纸）。
+        """
+        ts = float(now if now is not None else time.time())
+        self.pass2_inflight = {
+            "stage": PASS2_INFLIGHT,
+            "batch_id": str(self.batch_id or ""),
+            "at": _fmt_time(ts),
+            "ts": ts,
+        }
+        return dict(self.pass2_inflight)
+
+    def clear_pass2_inflight(self):
+        """第 2 趟结束（成功/失败/取消）后清掉痕迹（调用方负责落盘）。"""
+        self.pass2_inflight = {}
+
+    def pass2_inflight_active(self) -> bool:
+        """清单是否声称「这一叠开打过第 2 趟、但没走到结束路径」（= 崩溃痕迹）。"""
+        d = self.pass2_inflight
+        return isinstance(d, dict) and str(d.get("stage") or "") == PASS2_INFLIGHT
 
     def active_entries(self) -> list:
         """还有在叠文件计划的单（第 2 趟真正要处理的单）。"""
@@ -980,6 +1015,8 @@ class DuplexStack:
             # 续打弹窗还能告诉操作员"进纸盒里应该有 N 张"（真正的权威仍是各单计划）。
             "present_sheet_count": int(self.present_sheet_count),
             "original_sheet_count": int(self.original_sheets_count),
+            # L2-2：崩溃痕迹（空 dict = 没开打/已正常收尾）
+            "pass2_inflight": dict(self.pass2_inflight or {}),
             "entries": [e.to_dict() for e in self.entries],
         }
 
@@ -999,6 +1036,16 @@ class DuplexStack:
         st.reverse_second = _bool_or(d.get("reverse_second"), True)
         st.tainted = bool(d.get("tainted", False))
         st.taint_reason = str(d.get("taint_reason", "") or "")
+        # L2-2：只认本版本写下的合法痕迹；坏值一律当"没在打"（否则每次启动都误报）
+        _inf = d.get("pass2_inflight")
+        if isinstance(_inf, dict) and str(_inf.get("stage") or "") == PASS2_INFLIGHT:
+            _ts = _inf.get("ts", 0.0)
+            st.pass2_inflight = {
+                "stage": PASS2_INFLIGHT,
+                "batch_id": str(_inf.get("batch_id", "") or ""),
+                "at": str(_inf.get("at", "") or ""),
+                "ts": float(_ts) if isinstance(_ts, (int, float)) else 0.0,
+            }
         raw_entries = [x for x in (d.get("entries") or []) if isinstance(x, dict)]
         st.entries = [StackEntry.from_dict(x) for x in raw_entries]
         # 「已取走」的坏值一律标存疑：`taken_plans` 决定第 2 趟送哪几张纸，

@@ -386,7 +386,8 @@ try {
       await page.waitForTimeout(200);
       const items = await page.$$eval('#stMenu .st-menu-item', (els) => els.map((e) => e.textContent.trim()));
       await page.evaluate(() => window.closeOrderStatusMenu && window.closeOrderStatusMenu());
-      return items.length === 5 && items.some((t) => t.indexOf('已取消') >= 0 || t.indexOf('取消') >= 0);
+      // v7.19：人工订正白名单加了 timeout ⇒ 菜单六项（已取消 / 打印失败 / 放弃 / 超时 / 拒单 / 已完成）
+      return items.length === 6 && items.some((t) => t.indexOf('已取消') >= 0 || t.indexOf('取消') >= 0);
     })());
   chk('④4 点外部订单的类型标签能弹菜单（接单 / 自打两项）',
     await (async () => {

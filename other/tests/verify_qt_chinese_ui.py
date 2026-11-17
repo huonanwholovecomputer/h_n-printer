@@ -174,7 +174,7 @@ if os.path.isdir(os.path.join(LOCAL_TOOL, "dist", "HN打印工具")):
     check("打包版带 qtbase_zh_CN.qm（PyInstaller Qt hook 收集）",
           os.path.isfile(os.path.join(_dist, "qtbase_zh_CN.qm")), _dist)
 else:
-    print("  · 跳过：本机没有打包产物（dist/HN打印工具）")
+    print("  · [HN-SKIP] 跳过：本机没有打包产物（dist/HN打印工具）")
 
 print("── F 没有手写英文标准按钮")
 _bad = []

@@ -1,4 +1,5 @@
 ﻿# One-click debug APK build (JDK 17 + Android SDK in C:\Users\Administrator\android-tools)
+param([switch]$AllowStaleAssets)
 $ErrorActionPreference = 'Stop'
 $tools = 'C:\Users\Administrator\android-tools'
 $env:JAVA_HOME = "$tools\jdk-17.0.20+8"
@@ -17,8 +18,12 @@ if (Test-Path $capCli) {
   & node $capCli telemetry off 2>&1 | Out-Null
   & node $capCli sync android
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} elseif ($AllowStaleAssets) {
+  # 显式豁免才允许跳过：默认 fail-closed（硬规矩 9：只跑 gradlew 会打出旧 web 资源）
+  Write-Warning "cap CLI not found at $capCli - 已显式允许 -AllowStaleAssets：APK 里是旧 web 资源，仅供调试"
 } else {
-  Write-Warning "cap CLI not found at $capCli - SKIPPING sync! APK will use stale web assets. Run npm install first."
+  Write-Error "cap CLI 缺失：$capCli。先在本目录 npm install；确需跳过请显式加 -AllowStaleAssets。"
+  exit 1
 }
 
 Set-Location (Join-Path $PSScriptRoot 'android')

@@ -81,6 +81,27 @@ PY
   fi
 done
 
+# ── 配置备份（2026-11-17 审计补充）─────────────────────────────────────
+# 之前只备 orders.db/users.db：/etc/hn-printer/config.py 里是微信 AppSecret、SECRET_KEY、
+# 管理员 openid、S3 凭据 —— 丢了等于全站凭据没了；它不随代码发版、不在 git 里，而部署时
+# 程序目录那份 config.py 只是 644 副本（删掉后凭据就只剩 /etc 一处）。两处都备，权限 600。
+CONFIG_PRODUCED=()
+for cfg in "/etc/hn-printer/config.py" "$PROJECT_DIR/config.py"; do
+  [[ -f "$cfg" ]] || continue
+  case "$cfg" in
+    /etc/*) cfg_tag="etc_hn-printer_config" ;;
+    *)      cfg_tag="dir_config" ;;
+  esac
+  OUT_CFG="$BACKUP_DIR/config_${cfg_tag}_${TS}.py.gz"
+  gzip -c "$cfg" > "$OUT_CFG"
+  chmod 600 "$OUT_CFG"
+  echo "[$(LOG_TS)] 已备份配置 $cfg → $(basename "$OUT_CFG")（权限 600）"
+  CONFIG_PRODUCED+=("$OUT_CFG")
+done
+if [[ ${#CONFIG_PRODUCED[@]} -eq 0 ]]; then
+  echo "[$(LOG_TS)] [WARN] 没找到 config.py（/etc/hn-printer/ 与 $PROJECT_DIR 都没有）：凭据未被备份" >&2
+fi
+
 # 一个库都没备到 ⇒ 直接失败。绝不能"什么都没做却 exit 0"：
 # 生产上首次跑就撞到过（PROJECT_DIR 指错 ⇒ 跳过两个库 ⇒ 恢复演练空跑还报 ok）。
 if [[ ${#PRODUCED[@]} -eq 0 ]]; then
@@ -100,10 +121,11 @@ if [[ -n "${BACKUP_REMOTE:-}" ]]; then
   done
 fi
 
-# 清理过期备份（orders_/users_ 两类、明文与加密两种后缀都算）
+# 清理过期备份（orders_/users_ 两类、明文与加密两种后缀都算；config_ 也一起清）
 DELETED=$(find "$BACKUP_DIR" -maxdepth 1 -type f \
             \( -name 'orders_*.db.gz' -o -name 'orders_*.db.gz.gpg' \
-               -o -name 'users_*.db.gz'  -o -name 'users_*.db.gz.gpg' \) \
+               -o -name 'users_*.db.gz'  -o -name 'users_*.db.gz.gpg' \
+               -o -name 'config_*.py.gz' \) \
             -mtime +"$RETENTION_DAYS" -print -delete | wc -l)
 echo "[$(LOG_TS)] 清理超过 ${RETENTION_DAYS} 天的旧备份：$DELETED 个"
 
@@ -127,6 +149,15 @@ if [[ "${1:-}" == "--restore-check" ]]; then
         ;;
       *) cp "$f" "$RESTORE_DIR/" ;;
     esac
+  done
+  # 配置备份也验一下能解开：坏包等于没备；只做 gzip -t，不把明文落进临时目录
+  for f in ${CONFIG_PRODUCED[@]+"${CONFIG_PRODUCED[@]}"}; do
+    [[ -f "$f" ]] || continue
+    if gzip -t "$f"; then
+      echo "[$(LOG_TS)] 配置备份可解压：$(basename "$f")"
+    else
+      echo "[$(LOG_TS)] [WARN] 配置备份损坏：$(basename "$f")" >&2
+    fi
   done
   "$PYTHON" - "$RESTORE_DIR" "$PROJECT_DIR" <<'PY'
 import os, sqlite3, sys

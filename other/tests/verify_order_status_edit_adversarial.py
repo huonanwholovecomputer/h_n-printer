@@ -218,7 +218,9 @@ STRICT_RAW = (_r0 == _r1)
 note("原始文件(order s.db/-wal)哈希在无写入请求前后%s → 本轮%s原始字节断言"
      % ("一致" if STRICT_RAW else "不一致", "启用" if STRICT_RAW else "仅作参考不判定"))
 
-CANARY = mk("canary", "printing", [("printing", 2.30, "2026-10-18 08:00:00")],
+# canary 必须是**终态**：§9c 会拿它的裸 id 发一条合法订正请求（要求真的改到它），
+# 若 canary 还在 printing，新闸门会 409，那条自证就会变成假红。
+CANARY = mk("canary", "failed", [("failed", 2.30, "2026-10-18 08:00:00")],
             created_at="2026-10-18 07:00:00")
 CANARY_BEFORE = state(CANARY)
 note("canary 订单 #%d = %s（每次订正后校验它没被捎带改到）" % (CANARY, CANARY_BEFORE))
@@ -228,14 +230,19 @@ note("canary 订单 #%d = %s（每次订正后校验它没被捎带改到）" % 
 # 矩阵会「0 组合 0 失败」空转成假绿。
 FIX_TARGETS = tuple(getattr(backend, "MANUAL_FIX_STATUSES", ()) or ())
 print("\n(夹具矩阵) 目标白名单 MANUAL_FIX_STATUSES = %s" % (FIX_TARGETS,))
-chk("后端暴露终态白名单 MANUAL_FIX_STATUSES（缺了的话下面的 5×5 矩阵会空转）",
-    len(FIX_TARGETS) == 5, FIX_TARGETS)
+# 2026-11-17：白名单从 5 项扩到 6 项（v7.19 把 timeout 也纳入人工订正）。
+chk("后端暴露终态白名单 MANUAL_FIX_STATUSES（缺了的话下面的矩阵会空转）",
+    len(FIX_TARGETS) == 6, FIX_TARGETS)
 
 
 # ============================================================================
-sec("1. 父子一致性（5 目标 × 5 形态，含混合终态/全 sent/无子任务/非终态）")
+# 2026-11-17 v7.19：订正只允许对**已经是终态**的订单做（app.py 的 _manual_fix_reject_reason：
+# 非终态 ⇒ 409 + current_status，因为排队/打印中的单还会被分发与预约调度捡起来打）。原来这张
+# 形态表里混着一个「非终态混排 printing+queued」形态，那是旧契约（任何当前态都能改），已挪到
+# 下面的 1b 段当**负向**用例。
+sec("1. 父子一致性（6 目标 × 4 终态形态：含混合终态/全 sent/无子任务）")
 
-# 形态：tag → (父状态, [(子状态, 价格, locked_at), ...])
+# 形态：tag → (父状态, [(子状态, 价格, locked_at), ...])；父与子全部是终态
 SHAPES = {
     "混合终态 sent+abandoned": ("sent", [("sent", 2.30, ""), ("abandoned", 2.30, "2026-10-18 08:00:00")]),
     "全部子任务已 sent": ("sent", [("sent", 2.30, "2026-10-18 08:00:00"), ("sent", 2.30, "2026-10-18 08:00:00")]),
@@ -243,8 +250,6 @@ SHAPES = {
     "5 文件各不相同终态": ("failed", [("sent", 1.0, ""), ("failed", 1.0, "2026-10-18 08:00:00"),
                                       ("abandoned", 1.0, ""), ("canceled", 1.0, "2026-10-18 08:00:00"),
                                       ("rejected", 1.0, "2026-10-18 08:00:00")]),
-    "非终态混排 printing+queued": ("queued", [("printing", 2.30, "2026-10-18 08:00:00"),
-                                              ("queued", 2.30, "")]),
 }
 
 matrix_fail = 0
@@ -275,8 +280,11 @@ for target in FIX_TARGETS:
         if state(CANARY) != CANARY_BEFORE:
             chk("canary 未被波及 [%s/%s]" % (target, tag), False, state(CANARY))
 
-chk("矩阵 25 组合（5 目标 × 5 形态：父订单+全部子任务+聚合+refresh 回写 全部等于目标）",
-    len(FIX_TARGETS) == 5 and matrix_fail == 0, "%d 组合失败" % matrix_fail)
+N_MATRIX = len(FIX_TARGETS) * len(SHAPES)
+chk("矩阵 %d 组合（%d 目标 × %d 终态形态：父订单+全部子任务+聚合+refresh 回写 全部等于目标）"
+    % (N_MATRIX, len(FIX_TARGETS), len(SHAPES)),
+    len(FIX_TARGETS) == 6 and N_MATRIX == 24 and matrix_fail == 0,
+    "%d 组合失败" % matrix_fail)
 chk("canary 订单在所有订正后保持原状（WHERE order_id 作用域无溢出）",
     state(CANARY) == CANARY_BEFORE, "%s → %s" % (CANARY_BEFORE, state(CANARY)))
 
@@ -296,6 +304,49 @@ chk("反向订正闭环 sent→failed→sent：每一步父/子/聚合三者同�
     o2 == "failed" and all(s == "failed" for s, _ in f2) and a2 == "failed"
     and o3 == "sent" and all(s == "sent" for s, _ in f3) and a3 == "sent",
     [(o2, f2, a2), (o3, f3, a3)])
+
+
+# ============================================================================
+# 1b 新增闸门（2026-11-17 v7.19）：**当前状态必须已是终态**才能人工订正。
+#    排队/打印/预约中的单还会被任务分发与预约调度捡起来打印，这时候改状态就成了
+#    「页面说已结束、机器还在出纸」——所以后端先判当前态，非终态一律 409 + current_status。
+sec("1b. 非终态订单不得人工订正（409 + current_status，库零变化）")
+
+NONTERMINAL = ["queued", "printing", "accepted", "scheduled", "waiting", "downloading",
+               "reserved", "offline_unknown"]
+nt_fail = []
+for _i, st in enumerate(NONTERMINAL):
+    oid_nt = mk("NT%d" % _i, st, [(st, 1.0, "2026-10-18 08:00:00")])
+    fp_before = db_fp()
+    r = post({"order_id": oid_nt, "status": "sent"})
+    j = r.get_json() or {}
+    fp_after = db_fp()
+    got = state(oid_nt)
+    if not (r.status_code == 409 and j.get("success") is not True
+            and j.get("current_status") == st and fp_after == fp_before
+            and got[0] == st):
+        nt_fail.append("%s→http=%s current_status=%r db_changed=%s state=%s"
+                       % (st, r.status_code, j.get("current_status"),
+                          fp_after != fp_before, got))
+chk("8 种非终态当前态一律 409（带 current_status）、不落库、不 500", not nt_fail, nt_fail)
+
+# 父单已经是终态，但下面还有活跃子任务（还没打完）→ 也必须拒，并点名是哪些任务
+oid_ac = mk("AC", "sent", [("sent", 1.0, "2026-10-18 08:00:00"),
+                           ("printing", 1.0, "2026-10-18 08:00:00")])
+_conn = raw()
+_ac_live = _conn.execute("SELECT id FROM order_files WHERE order_id=? AND status='printing'",
+                         (oid_ac,)).fetchone()[0]
+_conn.close()
+fp_before = db_fp()
+r = post({"order_id": oid_ac, "status": "failed"})
+j = r.get_json() or {}
+_ac_ids = j.get("active_task_ids")
+chk("父单终态但有活跃子任务 → 409 + active_task_ids（并指出是哪一条）",
+    r.status_code == 409 and j.get("success") is not True
+    and isinstance(_ac_ids, (list, tuple))
+    and str(_ac_live) in [str(x) for x in _ac_ids]
+    and db_fp() == fp_before,
+    "http=%s active=%r json=%s" % (r.status_code, _ac_ids, j))
 
 
 # ============================================================================
@@ -532,8 +583,9 @@ chk("PRINTER_TOKEN 未配置（None）→ 403 fail-closed（任何 token 都不�
 # ============================================================================
 sec("4. 事务性（注入 UPDATE 失败 → 必须整体回滚；4 线程并发 → 终态自洽）")
 
-oid_tx = mk("TX", "queued", [("queued", 2.30, "2026-10-18 08:00:00"),
-                             ("printing", 2.30, "2026-10-18 08:00:00")])
+# 2026-11-17：订正只允许对终态订单做（非终态 409），所以事务夹具也用终态父子单。
+oid_tx = mk("TX", "sent", [("sent", 2.30, "2026-10-18 08:00:00"),
+                         ("sent", 2.30, "2026-10-18 08:00:00")])
 TX_BEFORE = state(oid_tx)
 c = raw()
 c.execute("""CREATE TRIGGER adv_tx_fail BEFORE UPDATE OF status ON orders
@@ -553,8 +605,8 @@ chk("注入失败后：响应非 200/success（实际 %s）" % tx_code,
     "%s %s" % (tx_code, tx_body))
 chk("注入失败后：**子任务的写入也被回滚**（不留「父没改、子改了」的半截状态）",
     TX_AFTER == TX_BEFORE, "%s → %s" % (TX_BEFORE, TX_AFTER))
-chk("注入失败后：父订单仍为 queued、子任务仍为原状态（无半截状态）",
-    TX_AFTER == TX_BEFORE and TX_AFTER[0] == "queued", TX_AFTER)
+chk("注入失败后：父订单仍为 sent、子任务仍为原状态（无半截状态）",
+    TX_AFTER == TX_BEFORE and TX_AFTER[0] == "sent", TX_AFTER)
 
 c = raw()
 c.execute("DROP TRIGGER adv_tx_fail")
@@ -567,7 +619,7 @@ chk("移除注入后再提交 → 200 且库正常改写（会话未残留坏事
     and all(s == "failed" for s, _ in f_tx), (r.status_code, o_tx, f_tx, a_tx))
 
 # 4b 并发
-oid_cc = mk("CC", "queued", [("queued", 2.30, "") for _ in range(4)])
+oid_cc = mk("CC", "sent", [("sent", 2.30, "") for _ in range(4)])
 results = []
 lock_r = threading.Lock()
 
@@ -618,12 +670,13 @@ chk("404 早返回（try 内 return，未显式 rollback）之后另开连接可
 # ============================================================================
 sec("5. locked_at 清空（含 NULL 行）+ 作用域")
 
-oid_lk = mk("LK", "printing", [("printing", 2.30, "2026-10-18 08:00:00"),
-                               ("accepted", 2.30, "2026-10-18 08:00:05")])
+# 终态夹具：父 sent + 子 sent（都带 locked_at），另插一行 locked_at IS NULL 的终态子任务。
+oid_lk = mk("LK", "sent", [("sent", 2.30, "2026-10-18 08:00:00"),
+                           ("rejected", 2.30, "2026-10-18 08:00:05")])
 c = raw()
 c.execute("INSERT INTO order_files (order_id, file_name, copies, page_count, total_price,"
           " status, created_at, page_range, locked_at) VALUES (?,?,?,?,?,?,?,?,NULL)",
-          (oid_lk, "null_locked.pdf", 1, 2, 2.30, "printing", "2026-10-18 08:00:00", ""))
+          (oid_lk, "null_locked.pdf", 1, 2, 2.30, "abandoned", "2026-10-18 08:00:00", ""))
 c.commit()
 c.close()
 before_lk = state(oid_lk)
@@ -657,21 +710,26 @@ be_list = [s.strip().strip("'\"") for s in m_be.group(1).split(",") if s.strip()
 chk("两侧清单都存在且非空", bool(fe_list) and bool(be_list), "fe=%s be=%s" % (fe_list, be_list))
 chk("两侧集合与**顺序**完全一致（顺序不同也算漂移：菜单渲染顺序与白名单同源）",
     fe_list == be_list, "fe=%s be=%s" % (fe_list, be_list))
-chk("前端清单 == 后端接口实际接受的集合（用接口动态探测，5/5 全 200）",
-    all(post({"order_id": mk("DYN", "queued", [("queued", 1.0, "")]), "status": s}).status_code == 200
-        for s in fe_list), fe_list)
+_dyn_bad = []
+for s in fe_list:
+    _oid_dyn = mk("DYN", "sent", [("sent", 1.0, "")])
+    _code = post({"order_id": _oid_dyn, "status": s}).status_code
+    if _code != 200:
+        _dyn_bad.append("%s→%s" % (s, _code))
+chk("前端清单 == 后端接口实际接受的集合（用接口动态探测，%d/%d 全 200）"
+    % (len(fe_list) - len(_dyn_bad), len(fe_list)), not _dyn_bad, _dyn_bad)
 
 prio_keys = re.findall(r'"([a-z_]+)":\s*\d+', app_src.split("_STATUS_PRIORITY = {")[1].split("}")[0])
 note("_STATUS_PRIORITY 里的全部状态（后端已知状态全集）= %s" % sorted(set(prio_keys)))
 mismatch = []
 for s in sorted(set(prio_keys)):
-    oid_probe = mk("PROBE", "queued", [("queued", 1.0, "")])
+    oid_probe = mk("PROBE", "sent", [("sent", 1.0, "")])
     code = post({"order_id": oid_probe, "status": s}).status_code
     expect = 200 if s in be_list else 400
     if code != expect:
         mismatch.append("%s→%s(期望 %s)" % (s, code, expect))
-chk("后端已知状态全集中，只有白名单里的 5 个放行、其余一律 400（无暗门状态）",
-    not mismatch, mismatch)
+chk("后端已知状态全集中，只有白名单里的 %d 个放行、其余一律 400（无暗门状态）"
+    % len(be_list), not mismatch, mismatch)
 extra_non_terminal = [s for s in ("printing", "queued", "waiting", "downloading",
                                  "accepted", "scheduled", "offline_unknown", "reserved")
                       if s in be_list]
@@ -957,8 +1015,8 @@ for label, oid_val in INJ_IDS:
         chk("  ↑ 指向 canary 的合法请求确实改到了 canary（说明 9c 其余项没误伤）",
             state(CANARY)[0] == "sent", state(CANARY))
         c = raw()
-        c.execute("UPDATE orders SET status='printing' WHERE id=?", (CANARY,))
-        c.execute("UPDATE order_files SET status='printing', locked_at='2026-10-18 08:00:00'"
+        c.execute("UPDATE orders SET status='failed' WHERE id=?", (CANARY,))
+        c.execute("UPDATE order_files SET status='failed', locked_at='2026-10-18 08:00:00'"
                   " WHERE order_id=?", (CANARY,))
         c.commit()
         c.close()
