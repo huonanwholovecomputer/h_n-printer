@@ -1,8 +1,8 @@
 {
-  "version":  "1.1.69",
-  "versionCode":  70,
-  "url":  "https://hn-space.cn/updates/h_n-printer_android_v1.1.69.apk",
-  "md5":  "ff10f7d960e3399eb483f9344cdc6c48",
-  "notes":  "v1.1.69：Tab 栏滑块的「脱手」手感——拖动时玻璃不再钉在手指下，而是略微落后地追上来，手一停它自己滑到位；只滞后位置，不拉伸不变形。",
-  "force":  false
+  "version": "1.1.70",
+  "versionCode": 71,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.70.apk",
+  "md5": "b9064f67f1a9015ae0b976db0ec2c023",
+  "notes": "v1.1.70：修复登录凭证「宽限期」被无限续命的问题 —— 原来每登录一次就把 14 天宽限往后推，到期也永远不强制重新绑定；现在宽限期从首次签发时刻算起，到期后必须重新验证设备。App 同时把设备凭证存在本地，换机或清数据后能自动重新登记。",
+  "force": false
 }

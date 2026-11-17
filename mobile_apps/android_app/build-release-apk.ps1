@@ -91,7 +91,7 @@ if (Test-Path $apk) {
     # 风格不一致，每打一次包就把三份清单整体重写一遍（diff 噪声大）。这里统一成原风格。
     $json = ($payload | ConvertTo-Json -Depth 5)
     $json = $json -replace "`r`n", "`n"
-    $json = $json -replace '"(w+)":s+', '"$1": '
+    $json = $json -replace '"(\w+)":\s+', '"$1": '
     $json = $json -replace "(?m)^    ", "  "
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     foreach ($mf in $manifestPaths) {
