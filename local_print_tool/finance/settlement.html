@@ -249,6 +249,11 @@ tbody tr:hover { background: var(--card-2); }
   transition: border-color .18s ease, box-shadow .18s ease;
 }
 .input:focus, input:focus, select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+/* 密码框不使用 type=password —— Chrome 见到任何 password 字段都会当成登录表单，
+   在弹窗关闭时弹「要保存密码吗？」（现场 2026-11-16）。改用文本输入 + 文字遮罩：
+   外观与 password 一致，但浏览器不再把它当密码字段，既不弹保存提示、也不会被自动填入。 */
+input.pw-mask { -webkit-text-security: disc; }
+
 input[type=number] { width: 110px; }
 input[type=date] { width: 150px; }
 input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
@@ -1210,7 +1215,7 @@ function mergeStores(localStore, cloudStore) {
 /* ==================== 全局状态 ==================== */
 /* 版本号唯一来源：关于页标题 + 版本说明的最末条目都从它取。发版时只改这一处，
    别再在 renderAbout 里写死字面量（2026-11-16 现场：标题还停在 v7.10，日志已到 v7.25）。 */
-var APP_VER = 'v7.26';
+var APP_VER = 'v7.26.0';
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
@@ -3001,6 +3006,16 @@ function toast(msg, type, replace) {
 }
 
 /* ==================== 模态框 ==================== */
+/* 密码输入框统一由 pwInput() 生成：见上面 input.pw-mask 的说明（去 password 语义，避免
+   Chrome 的「要保存密码吗？」）。不支持 -webkit-text-security 的浏览器回落到 type=password。 */
+var _PW_MASK_OK = (function () {
+  try { return !!(window.CSS && CSS.supports && CSS.supports('-webkit-text-security', 'disc')); } catch (e) { return false; }
+})();
+function pwInput(attrs) {
+  return '<input ' + (_PW_MASK_OK ? 'type="text" class="pw-mask"' : 'type="password"')
+    + ' autocomplete="new-password" spellcheck="false" autocapitalize="off" autocorrect="off" '
+    + (attrs || '') + '>';
+}
 function openModal(opts) {
   return new Promise(function (resolve) {
     var root = $('#modalRoot');
@@ -3018,7 +3033,14 @@ function openModal(opts) {
     var inputEl = null;
     if (opts.input) {
       inputEl = document.createElement('input');
-      inputEl.type = opts.input.type || 'text';
+      var _isPw = (opts.input.type === 'password');
+      inputEl.type = (_isPw && _PW_MASK_OK) ? 'text' : (opts.input.type || 'text');
+      if (_isPw) {
+        if (_PW_MASK_OK) inputEl.className = 'pw-mask';
+        inputEl.setAttribute('autocomplete', 'new-password');
+        inputEl.setAttribute('spellcheck', 'false');
+      }
+      if (opts.input.id) inputEl.id = opts.input.id;
       inputEl.placeholder = opts.input.placeholder || '';
       m.querySelector('.modal-body').appendChild(inputEl);
     }
@@ -3086,7 +3108,7 @@ function requestPassword(key, label) {
     title: '🔒 解锁' + label,
     body: '<p style="margin:0 0 12px;color:var(--muted);font-size:.88rem">输入「' + label + '」密码以继续编辑'
       + '<br><span style="font-size:.8rem">（密码由本机服务端校验，解锁后 30 分钟内有效）</span></p>',
-    input: { type: 'password', placeholder: '请输入密码' },
+    input: { type: 'password', id: 'financeUnlockPwd', placeholder: '请输入密码' },
     confirmText: '解锁', cancelText: '取消'
   }).then(function (pwd) {
     if (pwd === null) return false;
@@ -3159,8 +3181,8 @@ function _renderSetupModal(need) {
       + '默认密码（旧版的 <code>123456</code>）已被服务端停用。以下模块还没有密码：<b>' + esc(names) + '</b>。<br>'
       + '请设置一个新密码（至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位；服务端以 PBKDF2-HMAC-SHA256 + 每模块独立 salt 保存），'
       + '设置完成后各模块仍需分别解锁。</p>'
-      + '<input id="fpNew1" type="password" placeholder="新密码（≥' + FINANCE_PASSWORD_MIN_LEN + ' 位）" autocomplete="new-password" style="width:100%;margin-bottom:8px">'
-      + '<input id="fpNew2" type="password" placeholder="再次输入新密码" autocomplete="new-password" style="width:100%">'
+      + pwInput('id="fpNew1" placeholder="新密码（≥' + FINANCE_PASSWORD_MIN_LEN + ' 位）" style="width:100%;margin-bottom:8px"')
+      + pwInput('id="fpNew2" placeholder="再次输入新密码" style="width:100%"')
       + '<p style="margin:8px 0 0;color:var(--muted);font-size:.78rem">忘记密码只能删除本机收支数据后重新设置（钱相关，刻意不做自助找回）。</p>',
     confirmText: '设置密码', cancelText: '稍后设置'
   }).then(function (val) {
@@ -9386,7 +9408,7 @@ function renderSettings() {
     + '<span id="financeSetupSlot"></span></div>';
   PASSWORD_KEYS.forEach(function (k) {
     h += '<div class="settings-row"><label>' + MODULE_NAMES[k] + ' 密码</label>';
-    h += '<input type="password" id="pwd-' + k + '" placeholder="输入新密码（至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位）" style="width:200px" autocomplete="new-password">';
+    h += pwInput('id="pwd-' + k + '" placeholder="输入新密码（至少 ' + FINANCE_PASSWORD_MIN_LEN + ' 位）" style="width:200px"');
     h += '<button class="btn green sm" onclick="updatePassword(\'' + k + '\')">保存</button>';
     h += '<span style="color:var(--muted);font-size:.78rem">当前：' + (k === 'settings' ? '管理密码' : '编辑密码') + '</span>';
     h += '</div>';
@@ -10673,7 +10695,8 @@ function renderAbout() {
     '<div class="section" style="text-align:center;padding:46px 20px">' +
     '<div style="font-size:3rem;margin-bottom:12px">🖨️</div>' +
     '<h2 style="font-size:1.35rem;margin-bottom:6px;justify-content:center;text-align:center">打印项目 · 收支清算</h2>' +
-    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:18px">' + APP_VER + '</div>' +
+    '<div style="font-size:1rem;color:var(--primary);font-weight:700;margin-bottom:8px">' + APP_VER + '</div>' +
+    '<div style="font-size:.8rem;color:var(--muted);margin-bottom:16px;line-height:1.7">v7.26 之前为历史编号，不自洽（有跳号、撞号），按日期读即可；从 v7.26.0 起按「X 口径 · Y 功能 · Z 修复」三段编号</div>' +
     '<div style="width:100%;text-align:left;line-height:1.9;font-size:.9rem;color:var(--muted)">' +
     '<p>多人均摊采购 · 按服务贡献分配收入 · 智能转账清算 · 云端订单对账。</p>' +
     '<p style="margin-top:10px">v3.0 重构：日期流水自动归月、分模块密码保护、云端成员维度统计、现代化布局与动画。</p>' +
@@ -10782,6 +10805,13 @@ function renderAbout() {
     + '「按用量分摊」的权重仍是出纸<b>页数</b>，不因废纸改变。'
     + '⑤ 为了让预估拿得到「失败 / 放弃打印 / 已取消」的订单，用量接口改为按全部状态取数后在前端分口径统计'
     + '（正常用量仍只算真正出纸的完成单，与旧口径一致）。</p>' +
+    '<p style="margin-top:10px">v7.11：<b>同一笔钱全页只算一次</b> —— ① 以前有 6 处「同一件事在页面两处各算一遍」，现在统一只认 calcMonth() 的结果：应得盈亏直接取 bookPL（旧写法漏了「收损耗费」机器的 ±W，于是「经营损益 · 本月盈亏」和「实际盈亏 · 应得盈亏」两个数会对不上）、公式块 ΣB 同源并逐人自检 bookPL = R − A − D + W、垫付清算表头跟生效判据走（不再出现「表头写按用量、数按人头」）。② 转账合法性只剩 _validTransfers() 一处判据，建议转账与「已转」标记共用。③ 用纸合计把「未归属」的正常量也算进来（灰行画了纸却不进合计，合计就 ≠ 摊销量）。④ 「打印机折旧」页的页数只算正常用量终态，已取消 / 已拒绝 / 预约中里仍是 sent 的页不再算进去。⑤ 收支清算拆成 10 个纯块函数（KPI / 采购 / 分摊到人 / 设备折旧 / 收入分配 / 经营损益 / 垫付清算 / 资金重分配 / 实际转账），每块只管一段。</p>' +
+    '<p style="margin-top:10px">v7.12：<b>明细区折叠成「一行摘要」</b> —— ① 十个明细区默认只显示一行摘要（点开才摊明细），顶部工具条给出「已收起 N / 10」与「全部展开 / 全部收起」；② KPI 四个数和结论卡重复度高，压成一条读数带，把纵向空间让给摘要行；③ 结算公式说明块挪到最后 —— 它的作用是核对算式，不该插在「结论 → 指令 → 现金记录」这条主线中间。</p>' +
+    '<p style="margin-top:10px">v7.13：<b>结算公式块补开合动画</b> —— 它是整页唯一还留在原生 &lt;details&gt; 上的折叠块，开关是瞬时的；这一版给它补了 220ms 的高度动画（开关状态仍由 &lt;details&gt; 自己管）。动画口径后来被 v7.14 取代。</p>' +
+    '<p style="margin-top:10px">v7.14：<b>全页只剩一套折叠实现</b> —— v7.13 给公式块单独写的动画，让同一页出现两套折叠（十个明细区一套、公式块一套）；这一版把公式块并进 secFold：开关状态、高度过渡、持久化都同一套代码，以后再改折叠行为只改一处。</p>' +
+    '<p style="margin-top:10px">v7.15：<b>订单明细：搜索 / 价格气泡 / 状态原因</b> —— ① 删掉顶部「本月结论」卡：结论都能在明细里查到，先抢一屏反而挡住主流程；② 订单明细新增搜索框，对文件名与订单备注做大小写不敏感的过滤，命中片段淡黄高亮；只筛列表，KPI 与图表仍按全量算；③ 点金额弹气泡：「复制价格」与「复制详细价格」，文案以本地打印工具为准；复算价与实收对不上时（历史单价 / 人工改价）只给金额、不编算式；④ 状态标签悬停给一套原因：人工订正过就说「谁在什么时候改成了什么」，设备判定的显示原因原文；⑤ 新增「超时」状态（设备长时间没回报结果，要人工核对）：只展示与筛选，不进人工订正白名单。</p>' +
+    '<p style="margin-top:10px">v7.16：<b>外部监视订单可以订正状态</b> —— ① 这类单来自本地账本、不在云端订单表，以前按 id 查库查不到，状态标签点不动；② 现在订正写回本地账本（订正状态 / 标记人 / 时间），与监视流程自己的状态正交，两条写路径互不覆盖；还没出纸的单不许先标失败；③ 订正成失败 / 放弃打印 / 已取消 / 被打回后，钱和纸自动不再计入（金额列仍显示这张单的面额，是刻意的展示口径）；④ 人工订正白名单在本地账本、页面、后端三处同源，只放终态 —— 改成排队中 / 打印中会被推送重新捡起来打印。</p>' +
+    '<p style="margin-top:10px">v7.17：<b>订单搜索框能打中文了</b> —— ① 上一版「输入即筛」在每次按键时整块重绘列表，而搜索框就在被重绘的节点里：中文输入法组字期间不断触发的按键让输入框被销毁重建，正拼的拼音和候选一起丢掉（英文逐字提交、粘贴一次性提交，所以只有中文打不进）；② 现在组字期间只记词、不重绘，上屏后统一筛一次并恢复焦点与光标位置。</p>' +
     '<p style="margin-top:10px">v7.18：<b>订单「用户」列可改归属</b> —— '
     + '① 「收支清算」订单明细的「用户」表头新增 🔒 开关，与「状态 / 类型」共用同一个密码：'
     + '解锁后点一位用户的标签，从名单里选另一位用户，即可把这一单转给他；'
@@ -10790,12 +10820,16 @@ function renderAbout() {
     + '（保留期配额仍按上传者算）。'
     + '③ 只能转给服务器上真实存在的用户；本地任务与外部监视订单没有云端归属，保持只读。'
     + '④ 每次调整都会记下操作人与时间，鼠标悬停用户标签即可看到。</p>' +
+    '<p style="margin-top:10px">v7.19：<b>本地来源订单也能改「用户」</b> —— ① v7.18 只放开了云端订单；现场大多数单是「来源=本地」，整列只读、改不了所属人，这一版补上；② 本地单没有云端账号可转，改的是「展示所属人」（orders.owner_name）—— 只影响展示与「按成员」统计分组，不涉及登录，也不会把本地单变成云端单；③ 文件的上传者记录、订单状态、打印作业一律不动（与云端订单同一条边界）。</p>' +
+    '<p style="margin-top:10px">v7.20：<b>外部监视单的「用户 / 类型」两列也可订正</b> —— ① 以前外部监视单只有「状态」能改；现在这两列同样解锁后可用，写入本地账本（与状态改动同一本账）；② 类型只允许「接单 / 自打」两种，改完金额与「自打不计收益」的口径立即跟上；③ 外部监视单不在云端订单表里，所以这两条改动都不经云端接口。</p>' +
     '<p style="margin-top:10px">v7.22：<b>离线（本地）模式补齐「🔐 授权」页</b> —— '
     + '① 本地模式不再隐藏「授权」入口，页内新增<b>「💻 本设备」</b>卡片（计算机名称 / 设备 ID / 接单状态，'
     + '取自本地打印工具的 /api/local/device 快照，完全离线可读）；'
     + '② 云端设备列表、本设备所有者绑定、自动双面能力标注仍只在云端模式提供（要读后端设备注册表），'
     + '本地模式不画这两块、也不发对应请求，绝不假装有数据；'
     + '③ 打印机台账 / 折旧 / 订单归属仍在「🖨️ 打印机折旧」页。</p>' +
+    '<p style="margin-top:10px">v7.23：<b>健康探测不再刷「假故障」</b> —— ① 页面每 30 秒探一次云端连接，而 nginx 回收空闲连接的时限也正好是 30 秒：连接池里那条连接的空闲时长刚好撞上服务端回收，日志里就会周期性出现 RemoteDisconnected 警告（随后重试成功、功能无损，但看着像故障）；② 现在这条探测固定用一次性连接（Connection: close），其余接口照旧走连接池。</p>' +
+    '<p style="margin-top:10px">v7.24：<b>离线（本地）模式的两处口径缺口</b> —— ① 订单明细「文件」列整列显示 undefined：本地接口没带文件数，现在后端补上、页面也对老版本后端兜底；② 完成率虚高 100%：环形图的分母漏了「⏳ 离线未同步」，这类单既不算完成也不算进行中，于是「2 张已完成 + 1 张未同步」也显示 100%，现在归入待处理。</p>' +
     '<p style="margin-top:10px">v7.25：<b>采购分摊按支出类别分计量单位</b> —— '
     + '① 以前「按用量分摊」一律拿各人的<b>出纸页数</b>当权重，可 A4 纸是按<b>张</b>买的：'
     + '一张双面的纸只消耗一张纸，却占两页，于是双面打得多的人被按约 1.5~2 倍权重摊了纸钱。'
@@ -10808,7 +10842,7 @@ function renderAbout() {
     + '历史月份的「按用量」数字会跟着重算 —— 这与 v7.4 的选择同一性质。'
     + '⑤ 顺带把本页<b>版本号收成单一来源</b>（<code>APP_VER</code>）：标题以前写死字面量，'
     + '从 v7.10 起就没再跟上更新日志，标题与日志对不上。</p>' +
-    '<p style="margin-top:10px">v7.26：<b>每一笔采购各用各的用量权重</b> —— '
+    '<p style="margin-top:10px">v7.26.0：<b>每一笔采购各用各的用量权重</b> —— '
     + '① 现场反馈：把纸和几支硒鼓的金额加起来、只按纸的比例重分，看不出「谁用了哪笔、该给垫付人多少钱」。'
     + '现在采购分摊<b>不再先把同类合并成一个池子</b>，而是逐笔算：<b>A4 纸</b>按各人出纸张数；'
     + '<b>指定了所属打印机的硒鼓</b>只摊给在这台机上印过的人（买给 M232 的鼓不再由只用 1020 的人分担）；'

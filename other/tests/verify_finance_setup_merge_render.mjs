@@ -198,14 +198,28 @@ const toasts = () => page.evaluate(() => [...document.querySelectorAll('#toastWr
 const writes = () => state.posts.filter((x) => x.url === '/api/proxy/finance/config' || x.url === '/api/local/data');
 const shot = async (name) => { await page.screenshot({ path: path.join(OUT_DIR, name), fullPage: false }); };
 
+/* 2026-11-16：Chrome 见到任何 <input type="password"> 都会把它当登录表单，在框关闭时弹
+   「要保存密码吗？」。解锁框改成「文本输入 + -webkit-text-security 遮罩」后，页面里不该再有任何
+   password 字段 —— 这里在框还开着时就地取样，作为「不会再弹」的 DOM 级证据。 */
+let lastUnlockProbe = null;
 async function unlockSettings() {
   await page.click('#tabNav button[data-tab="settings"]');
   await page.waitForTimeout(300);
   const locked = await page.evaluate(() => /设置已锁定/.test(document.querySelector('#tab-settings').textContent));
   if (locked) {
     await page.click('#tab-settings .btn.pri');
-    await page.waitForSelector('#modalRoot .modal-card input[type=password]', { timeout: 5000 });
-    await page.fill('#modalRoot .modal-card input[type=password]', TEST_PWD);
+    await page.waitForSelector('#modalRoot .modal-card input#financeUnlockPwd', { timeout: 5000 });
+    lastUnlockProbe = await page.evaluate(() => {
+      const el = document.getElementById('financeUnlockPwd');
+      const cs = el ? getComputedStyle(el) : null;
+      return {
+        pwFields: document.querySelectorAll('input[type=password]').length,
+        type: el ? el.type : '',
+        mask: cs ? (cs.webkitTextSecurity || cs.getPropertyValue('-webkit-text-security')) : '',
+        autocomplete: el ? (el.getAttribute('autocomplete') || '') : ''
+      };
+    });
+    await page.fill('#modalRoot .modal-card input#financeUnlockPwd', TEST_PWD);
     await page.click('#modalRoot .modal-card [data-act=ok]');
     await page.waitForTimeout(600);
   }
@@ -244,6 +258,10 @@ try {
 
   const wasLocked = await unlockSettings();
   chk('A 设置模块本来锁着，用密码解锁成功（走真实解锁弹窗）', wasLocked);
+  chk('A 解锁框不是 password 字段（Chrome 不会再弹「要保存密码吗？」）',
+    !!lastUnlockProbe && lastUnlockProbe.pwFields === 0 && lastUnlockProbe.type === 'text'
+    && lastUnlockProbe.mask === 'disc' && lastUnlockProbe.autocomplete === 'new-password',
+    lastUnlockProbe);
   const slotHTML = await page.evaluate(() => (document.getElementById('financeSetupSlot') || {}).innerHTML || '');
   chk('A 7 个模块都已设密码 → 设置页**不再显示**「首次设置/批量重置未设置模块」按钮',
     !/批量设置|首次设置/.test(slotHTML) && !/批量设置/.test(await page.evaluate(() => document.body.innerText)),
@@ -328,8 +346,8 @@ try {
   const lockedC = await page.evaluate(() => /设置已锁定/.test(document.querySelector('#tab-settings').textContent));
   if (lockedC) {
     await page.click('#tab-settings .btn.pri');
-    await page.waitForSelector('#modalRoot .modal-card input[type=password]', { timeout: 5000 });
-    await page.fill('#modalRoot .modal-card input[type=password]', TEST_PWD);
+    await page.waitForSelector('#modalRoot .modal-card input#financeUnlockPwd', { timeout: 5000 });
+    await page.fill('#modalRoot .modal-card input#financeUnlockPwd', TEST_PWD);
     await page.click('#modalRoot .modal-card [data-act=ok]');
     await page.waitForTimeout(600);
   }

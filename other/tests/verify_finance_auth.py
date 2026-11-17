@@ -299,6 +299,18 @@ def static_html():
     chk("改密框有两个密码输入 + 长度校验 + 两次一致性校验",
         all(k in html for k in ('id="fpNew1"', 'id="fpNew2"', "两次输入不一致",
                                 "FINANCE_PASSWORD_MIN_LEN")))
+    # 2026-11-16 现场（用户截图）：Chrome 把 <input type="password"> 一律当登录表单，
+    # 解锁框一关就弹「要保存密码吗？」。密码框因此统一走 pwInput()：文本输入 +
+    # -webkit-text-security:disc 遮罩（不支持该属性的浏览器才回落到 type=password）。
+    # 判据：整页只允许 pwInput() 的回落分支出现一次 type="password"。
+    chk("密码框不再使用 type=password（否则 Chrome 弹「要保存密码吗？」）——只留 pwInput 的回落分支",
+        html.count('type="password"') == 1
+        and re.search(r'function pwInput\(attrs\)[\s\S]{0,400}?type="password"', html) is not None,
+        html.count('type="password"'))
+    chk("pwInput 用 -webkit-text-security 遮罩，且三处密码框（解锁 / 首设两框 / 设置页改密）都经它生成",
+        "input.pw-mask { -webkit-text-security: disc; }" in html
+        and html.count("pwInput('") >= 2
+        and "input: { type: 'password', id: 'financeUnlockPwd'" in html)
     chk("改密框**可以关**（取消按钮存在；强制靠服务端拒绝默认密码，不靠关不掉的窗）",
         re.search(r"confirmText: '设置密码', cancelText: '稍后设置'", html) is not None
         and re.search(r"if \(!val\) \{[\s\S]{0,260}?return;", html) is not None

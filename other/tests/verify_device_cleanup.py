@@ -251,7 +251,7 @@ _m_about = re.search(r"function renderAbout\(\) \{([\s\S]*?)\n\}", html)
 _about_body = _m_about.group(1) if _m_about else ""
 # 2026-11-16：标题版本号改为单一来源 var APP_VER（renderAbout 渲染它），原来在 renderAbout
 # 里找 `>vX.Y</div>` 字面量，改成 APP_VER 后就取不到了。
-_m_ver = re.search(r"var APP_VER = 'v(\d+)\.(\d+)';", html)
+_m_ver = re.search(r"var APP_VER = 'v(\d+)\.(\d+)(?:\.(\d+))?';", html)  # v7.26.0 起三段制
 check("版本记录已写 v6.7（版本号走 APP_VER 单一来源、「不早于 v6.7」，不钉死具体值 —— "
       "每加一版功能都会递增，钉死字面量会误报；已锚定 renderAbout 区块）",
       "v6.7：测试设备不再堆在授权页" in html

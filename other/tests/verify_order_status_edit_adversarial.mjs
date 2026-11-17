@@ -293,7 +293,7 @@ try {
   // A4 正常解锁（真实密码流程；S1-05：密码由服务端校验，默认 123456 已被停用）
   await page.click('.order-table thead th:nth-child(5) .st-lock');
   await page.waitForSelector('#modalRoot .modal-card', { timeout: 5000 });
-  await page.fill('#modalRoot .modal-card input[type=password]', ADV_PWD);
+  await page.fill('#modalRoot .modal-card input#financeUnlockPwd', ADV_PWD);
   await page.click('#modalRoot .modal-card [data-act=ok]');
   await page.waitForTimeout(600);
   s = await snap();

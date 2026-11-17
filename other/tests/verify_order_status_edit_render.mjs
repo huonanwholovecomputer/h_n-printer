@@ -270,7 +270,7 @@ const snap = () => page.evaluate(() => ({
 async function tryUnlock(pwd) {
   await page.click('.order-table thead th:nth-child(5) .st-lock');
   await page.waitForSelector('#modalRoot .modal-card', { timeout: 5000 });
-  await page.fill('#modalRoot .modal-card input[type=password]', pwd);
+  await page.fill('#modalRoot .modal-card input#financeUnlockPwd', pwd);
   await page.click('#modalRoot .modal-card [data-act=ok]');
   await page.waitForTimeout(500);
 }
@@ -470,7 +470,7 @@ try {
     await (async () => {
       const btn = await page.$('#tab-settings .btn.pri');
       if (btn) { await btn.click(); await page.waitForSelector('#modalRoot .modal-card');
-                 await page.fill('#modalRoot .modal-card input[type=password]', TEST_PWD.settings);
+                 await page.fill('#modalRoot .modal-card input#financeUnlockPwd', TEST_PWD.settings);
                  await page.click('#modalRoot .modal-card [data-act=ok]'); await page.waitForTimeout(600); }
       return !!(await page.$('#pwd-orderstatus'));
     })());
