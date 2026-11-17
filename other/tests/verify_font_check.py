@@ -523,7 +523,11 @@ if _has_gui:
     check("行 tooltip 走 _font_tip_blocks（文案只留一份，别内联复制）",
           "join(self._font_tip_blocks(job))" in _src)
     check("启动时会初始化字体检测", "self._init_font_check()" in _src)
-    check("加文件后排队检查", "self._queue_font_checks(jobs[rows_before:]" in _src)
+    # 加文件已改成后台暂存（2026-11-17 StageFilesWorker）：排队检查仍在同一条链上，
+    # 只是落地动作搬进了 _apply_staged_files —— 两个方法里的调用都算数。
+    _af_src = _src.split("def _add_files_to_table(", 1)[1].split("\n    def _drain_staging_queue(", 1)[0]
+    _af_src += _src.split("def _apply_staged_files(", 1)[1].split("\n    def ", 1)[0]
+    check("加文件后排队检查", "self._queue_font_checks(" in _af_src)
     check("字体变了会作废 PDF 缓存", "font_check.purge_pdf_cache()" in _src)
 
     check("打印前闸门走 selective（只清引用、不删 PDF）",

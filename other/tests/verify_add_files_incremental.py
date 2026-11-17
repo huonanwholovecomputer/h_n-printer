@@ -76,6 +76,9 @@ print("=== 1. 逐个添加 4 个非 PDF 文件：累计只应触发 4 次预转�
 files = [mk(f"f{i}", ".txt") for i in range(4)]
 for f in files:
     win._add_files_to_table([f])
+    # 2026-11-17：添加文件已改为后台线程（复制/解析在 StageFilesWorker 里），
+    # 断言前必须等它落地，否则读到的是空表。
+    win._wait_staging_idle(60.0)
 
 print(f"    实际触发序列: {calls}")
 check("累计触发次数 == 新增文件数（4）", len(calls) == 4,
@@ -92,16 +95,19 @@ check("预转换带了 tab_key（不是空串）", all(t == win._current_tab for
 print("\n=== 2. 只增不重：再加 1 个文件后，旧行不再被碰 ===")
 calls.clear()
 win._add_files_to_table([mk("f4", ".txt")])
+win._wait_staging_idle(60.0)
 check("只触发 1 次预转换（第 5 行）", calls == [4], f"calls={calls}（改前为 0,1,2,3,4 共 5 次）")
 
 print("\n=== 3. PDF 不参与预转换（原本就只对非 PDF）===")
 calls.clear()
 win._add_files_to_table([mk("f5", ".pdf")])
+win._wait_staging_idle(60.0)
 check("添加 PDF 不触发预转换", calls == [], f"calls={calls}")
 
 print("\n=== 4. 同一批一次添加 3 个：只处理这 3 个新行 ===")
 calls.clear()
 win._add_files_to_table([mk("f6", ".txt"), mk("f7", ".png"), mk("f8", ".md")])
+win._wait_staging_idle(60.0)
 check("一次添加 3 个 → 恰好 3 次（行号连续且不重复）",
       sorted(calls) == [6, 7, 8], f"calls={sorted(calls)}")
 

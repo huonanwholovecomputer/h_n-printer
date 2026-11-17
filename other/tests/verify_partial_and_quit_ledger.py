@@ -162,7 +162,9 @@ _i_in = SRC_GUI.find("_keep_interrupt_stall(_snap")
 _ce_start = SRC_GUI.rfind("def closeEvent(", 0, _i_in) if _i_in >= 0 else -1
 _ce = SRC_GUI[_ce_start:] if _ce_start >= 0 else ""
 _ce = _ce.split("\n    def ", 1)[0] if "\n    def " in _ce else _ce
-_i_cancel = _ce.find(".cancel()")
+# 必须找**打印 worker** 的那次 cancel：closeEvent 里还先取消了后台暂存线程
+# （StageFilesWorker，2026-11-17），散写成 .cancel() 的第一次出现已经不是打印线程了。
+_i_cancel = _ce.find("self._worker.cancel()")
 check("⑤-a 先落台账再 cancel（否则连 job 快照都没了）",
       0 <= _i_in and _ce_start >= 0 and 0 <= _i_cancel and
       (_i_in - _ce_start) < _i_cancel,

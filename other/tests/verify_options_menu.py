@@ -308,7 +308,11 @@ _win3._queue_font_checks = lambda *a, **k: None       # 别真去数字体（要
 # 显式回到"从未配置"状态（开发机 cwd 下可能留着上次的 print_config.json，不能靠环境干净）
 _win3._config.default_task_options = {}
 _win3._config.paper_size = "A4"
-_add_impl = getattr(_win3, "_MainWindow__add_files_to_table_impl")
+# 2026-11-17：加文件改为后台线程（复制/解析在 StageFilesWorker 里），旧的私有同步实现已删。
+# 这里包一层：调完等它落地，否则下面立刻读 jobs 会读到空表。
+def _add_impl(files, _target=None):
+    _win3._add_files_to_table(list(files))
+    _win3._wait_staging_idle(60.0)
 
 # —— 没配过默认参数：新增任务逐项等于「改动前」的行为 ——
 _detected_tail = _win3._detect_blank_tail(_pdf1)

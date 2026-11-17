@@ -511,9 +511,17 @@ check("第 2 趟实测走 _record_speed_sample（与第 1 趟同一条口径）"
 
 _i_ce = GUI_SRC.index("    def closeEvent(self, ev):")
 _ce_block = GUI_SRC[_i_ce:_i_ce + 2000]
+_ce_close = _ce_block.split("super().closeEvent")[0]
+# 判据只关心「哪些态算跳过」，不钉死整行字面量（2026-11-17 补救态 remedy 也加进来了，
+# 钉死元组文本会让正常的口径扩展变成假红）。这里把元组解析出来逐项判。
+_names = []
+_i_t = _ce_close.find("if self._mode in (")
+if _i_t >= 0:
+    _tuple_txt = _ce_close[_i_t:_ce_close.find("):", _i_t)]
+    _names = [x.strip().strip("'\"") for x in _tuple_txt.split("(", 1)[1].split(",")]
 check("★ 关窗算跳过的态里**没有** prev2（等上一批出纸时关窗不等于跳过）",
-      'if self._mode in ("pass1", "flip", "flip_gate"):' in _ce_block,
-      _ce_block.split("super().closeEvent")[0][-120:])
+      "pass1" in _names and "prev2" not in _names and "remedy_pass2" not in _names,
+      f"{_names}")
 
 print()
 if ok_all:

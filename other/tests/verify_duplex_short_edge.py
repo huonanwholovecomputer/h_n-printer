@@ -84,9 +84,13 @@ check("mixed → long-edge（不猜）", m("mixed") == "long-edge")
 check("None / 大小写 / 空格都归一", m(None) == "long-edge" and m(" LANDSCAPE ") == "short-edge")
 
 gui_src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+# 本地加文件那条在 PrintJob(...) 里写成了「配置值 or 推导」，云端那条是直接赋值；
+# 两种写法都算同一个入口，判据仍是「恰好 2 处推导」（多一处 = 又有人手写一套）。
+_m_derive = (gui_src.count("duplex_mode = self._duplex_mode_for_orientation(orientation)")
+             + gui_src.count("or self._duplex_mode_for_orientation(orientation)"))
 check("★ 云端落单 + 本地加文件都走同一个入口（调用点恰好 2 处）",
-      gui_src.count("duplex_mode = self._duplex_mode_for_orientation(orientation)") == 2,
-      gui_src.count("duplex_mode = self._duplex_mode_for_orientation(orientation)"))
+      _m_derive == 2,
+      _m_derive)
 check("★ 旧的三元表达式已绝迹（不许再各处手写一套）",
       'duplex_mode = "short-edge" if orientation == "landscape" else "long-edge"' not in gui_src)
 check("★ 转换完成回调里有「翻转轴复核」块", "翻转轴复核" in gui_src

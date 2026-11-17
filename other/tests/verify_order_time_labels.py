@@ -218,11 +218,12 @@ check("换号补报先取标签页 created_at，再退回 finished_at（顺序�
       and "_created_at = _tab_created or next(" in SRC
       and SRC.index("_tab_created = next((str(t2.created_at)")
       < SRC.index("_created_at = _tab_created or next("))
+_reserved_src = SRC.split("def _upload_reserved_order")[1].split("\n    def ")[0]
 check("预留上报不出现「拿 finished_at 直接当 created_at」的写法",
       '"created_at": next((getattr(j' not in SRC
-      and 'getattr(j, "finished_at", "")), "")' not in SRC.split("_upload_reserved_order")[1]
-      .split("def ")[0]
-      and 'created_at = self._mark_order_created(self._current_tab)' in SRC)
+      and 'getattr(j, "finished_at", "")), "")' not in _reserved_src
+      # 时间源已按 tab_key 取（多标签页时段），不再是 self._current_tab
+      and 'created_at = self._mark_order_created(tab_key)' in _reserved_src)
 check("云端接单标签页写入后端下发的 created_at",
       "_cloud_created = str(getattr(task, 'created_at', '')" in SRC
       and "tab_settings.created_at = _cloud_created" in SRC)
@@ -231,7 +232,9 @@ check("开打时同时记 created_at（兜底）与 started_at",
       and "self._mark_print_started(target_key)" in SRC)
 check("本地加文件：只有「加之前这一页是空的」才写 first_added_at（老配置不伪造时间）",
       "if rows_before == 0:" in SRC
-      and "self._mark_tab_first_added(self._current_tab)" in SRC)
+      # 加文件改成后台暂存后写的是 key（本批文件落地的标签页），语义不变
+      and ("self._mark_tab_first_added(self._current_tab)" in SRC
+           or "self._mark_tab_first_added(key)" in SRC))
 check("云端任务落地：这一页拿到第一条任务时写 first_added_at",
       "if len(self._config.tabs[new_key].jobs) == 1:" in SRC
       and "self._mark_tab_first_added(new_key)" in SRC)

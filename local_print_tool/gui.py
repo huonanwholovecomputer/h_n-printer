@@ -1120,6 +1120,13 @@ class ManualDuplexDialog(QDialog):
         self._prev_t0 = QElapsedTimer()  # 本窗在这个态里又走了多久（无效 = 不在这个态）
         self._prev_deadline = 0.0        # 到点自动放行（没人确认也不再等）
 
+        # 补救态（2026-11-17 现场）：补救（半成品补打 / 整单重打）用的计时与文案与正常批次
+        # 不是一回事 —— 正常批次的「第 1 趟计时」从 announce() 起跑，而补救路径根本不走
+        # announce()，于是窗口从头到尾停在「第 1 趟用时 00:00」（用户现场报的就是这个）。
+        # 这里单独记「本次补打真正送印已用」，起表时刻 = 操作员点「▶ 开始补打」那一下。
+        self._remedy_t0 = QElapsedTimer()   # 无效 = 本轮还没开始送纸
+        self._remedy_what = ""              # 这一轮补救叫什么（补打第 2 趟 / 整单重打）
+
     # ── 第 1 趟计时/预估 ──
 
     PASS1_GREEN = "#27ae60"      # 在预估内（含宽容带）
@@ -1260,6 +1267,9 @@ class ManualDuplexDialog(QDialog):
         **既不等打印机的完成回报，也不按时间放行** —— 按钮从窗口出现那刻就可点，
         第 1 趟什么时候算打完由操作员看纸判定。这里只负责刷新计时文案与配色。
         """
+        if self._mode in ("remedy", "remedy_pass2"):
+            self._remedy_tick()
+            return
         if self._mode == "prev2":
             # 确认态（2026-11-12）：显示的是**上一批第 2 趟**的已用/预计 —— 本批第 1 趟
             # 还没开打，绝不能拿本批的计时去显示（那正是现场"计时起点早于送纸"的老 bug）。
@@ -1544,6 +1554,17 @@ class ManualDuplexDialog(QDialog):
         否则迟到的回报会把「③ 正在打印第 2 趟」拉回可翻纸，重复 emit continue_requested
         （第 2 趟会被打两遍）。
         """
+        if self._mode in ("remedy", "remedy_pass2"):
+            # 补救：按钮在 begin_remedy() 那一刻就已可点，这里只把 worker 的正式就位说明铺上去。
+            # 绝不能走 _open_flip_gate() —— 那套文案是「② 第 1 趟的数据已全部送进打印队列」，
+            # 而补救时第 1 趟是几小时前打的，写出来只会误导（2026-11-17 现场）。
+            self._flip_text = text
+            self._detail.setText(text)
+            try:
+                self._flip_timeout = max(1, int(timeout_sec))
+            except (TypeError, ValueError):
+                pass
+            return
         # idle/waiting 只是"兜底入口"（正常流程 announce 先到）；pass2/skipped/done 一律拒绝，
         # 否则迟到的回报会把已经打完第 2 趟的窗口拉回可翻纸。
         if self._mode not in ("idle", "waiting", "pass1", "flip_gate", "flip"):
@@ -1610,6 +1631,89 @@ class ManualDuplexDialog(QDialog):
         self._btn_skip.setEnabled(True)
         self._close_timer.start(1500)
 
+    # ── 补救（半成品补打 / 整单重打）态（2026-11-17）──
+    #
+    # 现场两个症状：① 补救窗的计时器一直不动（永远 00:00）；② 补救结束后窗不肯收，
+    # 下一轮补救被「另一个补救补打还在跑」永久挡住。根因两条：
+    #   ① 补救只调 set_flippable()，从不走 announce() —— announce() 里才有起表那一行
+    #      （_t0.restart + _pass1_timer.start），所以计时器压根没跑；
+    #   ② 补救跑完没人调 finish()，窗口永远停在 pass2 态（按钮全灰）；而下一轮补救的
+    #      set_flippable() 又被"态势守卫"挡掉（mode 不是 idle/waiting/pass1/flip）⇒
+    #      界面永远不出现，那一轮 worker 干等到 10 分钟超时，期间所有补救都被忙判据挡住。
+    # 修法：补救自己一套状态 remedy（等纸就位）→ remedy_pass2（正在补打），计时只记
+    # 「本次补打送印已用」，收尾一律走 finish_remedy()（一定把状态放回 done）。
+
+    def begin_remedy(self, text: str, what: str = "补打第 2 趟", sheets: int = 0,
+                     estimate_sec: float = 0.0, timeout_sec: int = 0):
+        """补救起手式：不管窗口上一轮停在什么状态，一律强制切到「等纸就位」。
+
+        必须由主线程在补救 worker 启动**之前**调用：worker 的 flip_required 一到，
+        set_flippable() 才认得出这是补救（见那里的 remedy 分支），否则又回到"界面不出现"。
+        """
+        self._timer.stop()
+        self._pass1_timer.stop()
+        self._close_timer.stop()
+        self._apply_batch_params(sheets, estimate_sec, None, 0.0)
+        self._remedy_what = str(what or "补打第 2 趟")
+        self._remedy_t0.invalidate()
+        self._mode = "remedy"
+        self._flip_text = text
+        try:
+            self._flip_timeout = max(1, int(timeout_sec or self.FLIP_WAIT_DEFAULT_SEC))
+        except (TypeError, ValueError):
+            self._flip_timeout = self.FLIP_WAIT_DEFAULT_SEC
+        self._status.setText(
+            f"① {self._remedy_what}：按下面说明把纸放好，然后点「▶ 开始{self._remedy_what}」")
+        self._detail.setText(text)
+        self._countdown.setText("")
+        self._pass1.setText("")          # 还没送纸，不给秒数（也不给颜色）
+        self._pass1.setStyleSheet("")
+        self._btn_go.setText(f"▶ 开始{self._remedy_what}")
+        self._btn_go.setEnabled(True)    # 硬规矩 12：按钮出现那刻就可点，不等任何回报
+        self._btn_skip.setText("⏭ 取消本次补打")
+        self._btn_skip.setEnabled(True)
+
+    def _remedy_elapsed(self) -> float:
+        """本轮补打真正送印到现在的秒数（还没开始送纸时是 0）。"""
+        if not self._remedy_t0.isValid():
+            return 0.0
+        return max(0.0, self._remedy_t0.elapsed() / 1000.0)
+
+    def _remedy_tick(self):
+        """补打计时刷新：只记「点开始 → 现在」的送印耗时，别再拿"第 1 趟"的名义写。"""
+        if self._mode != "remedy_pass2" or not self._remedy_t0.isValid():
+            return
+        self._pass1.setText(
+            f"⏱ {self._remedy_what}已用 {format_duration(self._remedy_elapsed())}")
+        self._pass1.setStyleSheet(f"color: {self.PASS1_GREEN};")
+
+    def finish_remedy(self, text: str = ""):
+        """补救收尾：停表 + 写结果 + 稍候自动关窗，**并且一定把状态放回 done**。
+
+        这一步是第二个症状的正解：窗口不回到 done，下一轮补救的 set_flippable() 就被
+        态势守卫挡掉、界面永远不出现（操作员只看到"卡住了"）。
+        """
+        self._timer.stop()
+        self._pass1_timer.stop()
+        started = self._remedy_t0.isValid()      # 本轮到底有没有真的送过纸
+        elapsed = self._remedy_elapsed()
+        self._remedy_t0.invalidate()
+        self._mode = "done"
+        self._status.setText(text or f"{self._remedy_what or '补救'}已结束")
+        if started:
+            self._pass1.setText(
+                f"⏱ {self._remedy_what or '补救'}用时 {format_duration(elapsed)}")
+            self._pass1.setStyleSheet(f"color: {self.PASS1_GREEN};")
+        else:
+            self._pass1.setText("")
+        self._countdown.setText("")
+        self._flip_gate_at = 0.0
+        self._btn_go.setText("▶ 继续打第 2 趟")
+        self._btn_go.setEnabled(False)
+        self._btn_skip.setText("关闭")
+        self._btn_skip.setEnabled(True)
+        self._close_timer.start(1500)
+
     def _tick(self):
         if self._mode != "flip":
             return
@@ -1636,6 +1740,21 @@ class ManualDuplexDialog(QDialog):
             self._btn_go.setEnabled(False)
             self._btn_skip.setEnabled(False)
             self.prev_pass2_confirmed.emit()
+            return
+        if self._mode == "remedy":
+            # 补救开打：点击这一刻才真的往打印机送纸（纸已就位）⇒ 补打计时从 0 起跑。
+            # 补救没有"本批第 1 趟"，所以上面那套 _freeze_pass1_at_gate 一概不碰。
+            self._mode = "remedy_pass2"
+            self._status.setText(f"③ 正在{self._remedy_what}…（请勿再动纸叠）")
+            self._countdown.setText("")
+            self._btn_go.setText("打印中…")
+            self._btn_go.setEnabled(False)
+            self._btn_skip.setEnabled(False)
+            self._pass1_done = False
+            self._remedy_t0.start()
+            self._remedy_tick()
+            self._pass1_timer.start(500)
+            self.continue_requested.emit()
             return
         # 「第 1 趟结束」的判据就是这一次点击（2026-11-11 用户口径）——所以 pass1 态
         # （第 1 趟还在送数据/纸还在出）也允许点，点了就立刻往下走第 2 趟。
@@ -1684,7 +1803,10 @@ class ManualDuplexDialog(QDialog):
         # ⚠ "prev2"（等上一个任务第 2 趟出完）**不算跳过**：这时本批一个字节都还没送进
         #   打印机，关窗只表示"别再问我了"。worker 仍按到期（预估 + 宽限）自动放行，
         #   绝不能因为关个窗口就把一整批纸判成失败/半成品。
-        if self._mode in ("pass1", "flip", "flip_gate"):
+        # "remedy"（补救等你把纸放回纸盘 2）同样算取消：关窗 = 我不补了，worker 收到 False
+        # 立刻收手、记录保留。"remedy_pass2" 不算 —— 那时纸已经在印，关窗只是收窗口
+        # （与 "pass2" 同一口径，绝不因为收窗把正在印的补救判掉）。
+        if self._mode in ("pass1", "flip", "flip_gate", "remedy"):
             self._on_skip()
         super().closeEvent(ev)
 
@@ -6516,6 +6638,133 @@ def _cleanup_temp(path: str | None) -> None:
 
 
 # ============================================================
+# 添加文件的「重活」：复制工作副本 / 读页数与末页空白 / 方向与引擎探测
+# ============================================================
+
+# 图片后缀（与 _add_files_to_table 的 allowed_types 保持一致）
+_IMAGE_EXTS = frozenset({".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"})
+
+
+def _file_md5(path: str) -> str:
+    """整文件 MD5（64KB 分块，不占内存）。失败返回空串 —— 缓存只是加速，算不出来照旧转换。"""
+    try:
+        import hashlib
+        m = hashlib.md5()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                m.update(chunk)
+        return m.hexdigest()
+    except Exception as e:
+        logger.warning(f"计算 MD5 失败（不影响打印，只是用不上转换缓存）: {path} → {e}")
+        return ""
+
+
+class StageFilesWorker(QThread):
+    """把「添加文件」里最重的几段搬出主线程：复制工作副本 + 读文件属性（含 MD5）。
+
+    2026-11-17 现场：往窗口里拖一批文件，界面整段假死 —— 复制 N 份副本（stage_file 是
+    shutil.copy2）、PDF 逐页判朝向（PyPDF2）、栅格化末页查空白（PyMuPDF）、DOCX 解包、
+    算整文件 MD5，全都跑在 dropEvent 的调用栈里（主线程）。文件一大就是几十秒点不动。
+
+    这里只做"文件里的事"，**绝不碰任何 Qt 对象**（在 QThread 里动控件是未定义行为）：
+    结果经 done 信号交回主线程（MainWindow 的槽 ⇒ 自动排队到 GUI 线程），由
+    _apply_staged_files 建 PrintJob、刷表格、起预转换。
+
+    ⚠ 副本在**复制前**就先 staging.reserve() 占位、挂到任务上再由主线程 unreserve()：
+    否则"复制完 → 还没挂上任务"的空窗里，只要触发一次清扫（加/删文件、退出、定时保留期
+    清理都会触发）就能把刚复制好的副本删掉，任务当场变成"文件不存在"。
+    """
+
+    done = Signal(object)
+
+    def __init__(self, items, image_orientation: str = "auto", parent=None):
+        super().__init__(parent)
+        self._items = list(items)          # [(src, ext), ...]，主线程已做过存在性/后缀过滤
+        self._image_orientation = image_orientation or "auto"
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """退出时叫停（主线程仍会等 run() 返回；半截 .part 由 stage_file 下次自己清）。"""
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            from converter import _read_docx_last_editor, get_available_engines
+        except Exception:                  # 引擎探测不可用 ⇒ 一律按 word（与旧行为一致）
+            _read_docx_last_editor = None
+            get_available_engines = None
+        available = None
+        engines_probed = False
+        out: list = []
+        for src, ext in self._items:
+            if self._cancelled:
+                break
+            rec = {
+                "src": src, "ext": ext, "work_path": src, "staged": False,
+                "page_count": 0, "orientation": "", "blank_tail": 0,
+                "engine": "word", "md5": "", "error": "",
+            }
+            reserved = ""
+            try:
+                # ① 复制工作副本（原件之后被删/临时目录被清理都不影响打印）
+                if not staging.is_staged(src):
+                    try:
+                        reserved = staging.staged_path_for(src)
+                        staging.reserve(reserved)
+                    except Exception:
+                        reserved = ""
+                work_path = staging.stage_file(src)
+                if work_path != src:
+                    rec["staged"] = True
+                    if reserved and (os.path.normcase(os.path.abspath(work_path))
+                                     != os.path.normcase(os.path.abspath(reserved))):
+                        # 复用了一份同源旧副本 ⇒ 改占真正要用的那一份
+                        staging.unreserve(reserved)
+                        staging.reserve(work_path)
+                elif reserved:
+                    staging.unreserve(reserved)
+                rec["work_path"] = work_path
+                # ② 文件属性（预转换要用 MD5 查缓存；PDF 要页数/朝向/末页空白）
+                if ext != ".pdf":
+                    rec["md5"] = _file_md5(work_path)
+                if ext == ".pdf":
+                    info = get_pdf_info(work_path) or {}
+                    rec["page_count"] = int(info.get("page_count") or 0)
+                    rec["orientation"] = str(info.get("orientation") or "")
+                    try:
+                        rec["blank_tail"] = int(detect_trailing_blank_pages(work_path) or 0)
+                    except Exception:
+                        rec["blank_tail"] = 0
+                elif ext == ".docx":
+                    rec["orientation"] = get_docx_orientation(work_path) or ""
+                elif ext in _IMAGE_EXTS:
+                    info = get_image_info(work_path, self._image_orientation) or {}
+                    rec["page_count"] = int(info.get("page_count") or 0)
+                    rec["orientation"] = str(info.get("orientation") or "")
+                # ③ Office 转换引擎（只探测 exe 是否存在，绝不 Dispatch COM ⇒ 可离线跑）
+                if ext in (".doc", ".docx") and get_available_engines is not None:
+                    if not engines_probed:
+                        available = get_available_engines() or {}
+                        engines_probed = True
+                    try:
+                        editor = _read_docx_last_editor(work_path) if ext == ".docx" else None
+                    except Exception:
+                        editor = None
+                    preferred = "wps" if editor == "wps" else "word"
+                    for eng in [preferred] + [e for e in ("word", "wps", "libreoffice")
+                                              if e != preferred]:
+                        if available.get(eng, False):
+                            rec["engine"] = eng
+                            break
+            except Exception as e:
+                rec["error"] = f"{type(e).__name__}: {e}"
+                logger.warning(f"添加文件时读属性失败（按默认值加入）: {src} → {e}",
+                               exc_info=True)
+            out.append(rec)
+        self.done.emit(out)
+
+
+# ============================================================
 # ============================================================
 # DropTableWidget — 支持拖放文件
 # ============================================================
@@ -7430,6 +7679,11 @@ class MainWindow(QMainWindow):
         self._config_save_fail_ts: float = 0.0
         self._configSaveFailed.connect(self._on_config_save_failed)
         self._worker: Optional[PrintWorker] = None
+        # 「添加文件」的后台批次（复制工作副本 / 解析文件属性，见 StageFilesWorker）：
+        # 同一时刻只有一个在跑，其余按标签页排队 —— 主线程一段都不许再同步复制文件。
+        self._staging_worker = None
+        self._staging_queue: list = []
+        self._staging_batch_tab = None
         # ── 手动双面「半成品补救」（2026-11-10）──
         # 翻纸被跳过/超时/第 2 趟失败时，这一单的纸只出了一半；这里保存补打线程、
         # 常驻补救窗、菜单项与"本批出现过半成品"标记（用来把收尾文案从
@@ -16171,19 +16425,281 @@ class MainWindow(QMainWindow):
         self._add_files_to_table(files)
 
     def _add_files_to_table(self, files: list[str]):
-        """添加文件到任务列表的核心逻辑。"""
+        """添加文件到任务列表：主线程只做闸门 + 便宜过滤 + 排队，重活交给后台线程。
+
+        2026-11-17 现场：往窗口里拖一批文件，界面整段假死 —— 复制工作副本（stage_file 是
+        shutil.copy2）、PDF 逐页判朝向、栅格化末页查空白、解包 DOCX、算整文件 MD5，全都跑在
+        dropEvent 的调用栈里（主线程）。文件一大就是几十秒点不动的窗口。
+
+        现在这里只剩"看一眼后缀、记住是哪个标签页、把活排上队"，耗时与文件大小无关；
+        复制与解析在 StageFilesWorker 里（见该类注释）。
+
+        排队而不是拒绝：以前上一批没处理完就 return + 一句"请稍候"，用户再拖一次还是被弹回，
+        文件就此丢掉。现在一律入 _staging_queue，按到达顺序一批批发出去。
+        """
         if self._is_current_tab_frozen():
             self._log("🔒 该标签页已固定，不可添加文件")
             return
         self._cancel_undo_if_active()
-        if getattr(self, '_loading_files', False):
-            self._log("⏳ 正在加载文件，请稍候（上一批文件尚未处理完成）")
+        tab = self._config.tabs.get(self._current_tab)
+        if tab is None:
+            self._log(f"⚠ 标签页 {self._current_tab} 不存在，文件未添加")
             return
-        self._loading_files = True
+        # HTML/HTM 已移除；表格 (.xls/.xlsx) 自 2026-11-02 起支持本地打印
+        # （Excel/WPS 自己的排版，见 xlsx_printer.py）。
+        allowed_types = {
+            ".pdf", ".doc", ".docx",
+            ".xls", ".xlsx",
+            ".txt", ".md",
+            ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
+        }
+        html_rejected: list[str] = []
+        picked: list = []
+        for f in files:
+            if not f:
+                continue
+            src = os.path.abspath(f)
+            if not os.path.isfile(src):
+                self._log(f"⚠ 已跳过不存在的文件: {f}")
+                continue
+            ext = os.path.splitext(src)[1].lower()
+            if ext in (".html", ".htm"):
+                # S0-09 / D-2：HTML 打印支持**永久删除**。不静默 continue，收上来统一提示
+                html_rejected.append(src)
+                continue
+            if ext not in allowed_types:
+                continue
+            picked.append((src, ext))
+        if html_rejected:
+            # 拖入/粘贴/对话框选择 .html/.htm：明确告知不支持并给出替代路径
+            self._warn_html_unsupported(html_rejected)
+        if not picked:
+            return
+        self._staging_queue.append((tab, picked))
+        if self._staging_worker is not None:
+            self._log(f"⏳ 正在复制/解析上一批文件，这 {len(picked)} 个已排队"
+                      "（界面照常可用）")
+            return
+        self._drain_staging_queue()
+
+    # ── 添加文件：后台批次（复制/解析在线程里，见 StageFilesWorker）──────────────
+
+    def _tab_key_of(self, tab) -> str:
+        """标签页对象 → 现在的 key（空串 = 这个对象已不在配置里，即该页被删了）。
+
+        异步结果只认**对象身份**：_renumber_tabs 重编号时是把 tab 对象原样搬到新 key
+        （new_tabs[new_key] = old_tabs[old_key]），记 key 会挂到别人页上；记对象则天然跟着走。
+        """
+        for k, t in (self._config.tabs or {}).items():
+            if t is tab:
+                return k
+        return ""
+
+    def _drain_staging_queue(self) -> None:
+        """把排队中的批次发出去（同一时刻只允许一个 StageFilesWorker 在跑）。"""
+        if self._staging_worker is not None:
+            return
+        while self._staging_queue:
+            tab, picked = self._staging_queue.pop(0)
+            key = self._tab_key_of(tab)
+            if not key:
+                self._log("⚠ 目标标签页已被删除，这一批文件未添加")
+                continue
+            jobs = list(tab.jobs or [])
+            existing_paths = {getattr(j, "file_path", "") for j in jobs
+                              if getattr(j, "file_path", "")}
+            existing_sources = {os.path.normcase(os.path.abspath(j.source_path))
+                                for j in jobs if getattr(j, "source_path", "")}
+            todo = [(src, ext) for src, ext in picked
+                    if src not in existing_paths
+                    and os.path.normcase(src) not in existing_sources]
+            if not todo:
+                self._log(f"ℹ 标签页 {key}: 这些文件已经在列表里，已跳过")
+                continue
+            self._start_staging_batch(tab, todo)
+            return
+
+    def _start_staging_batch(self, tab, todo) -> None:
+        """开一批后台"复制 + 解析"（结果回 _apply_staged_files）。"""
         try:
-            self.__add_files_to_table_impl(files)
+            _opts = dict(self._config.default_task_options or {})
+        except Exception:
+            _opts = {}
+        worker = StageFilesWorker(todo, str(_opts.get("image_orientation") or "auto"))
+        # 必须连到 self 的绑定方法（接收者是本窗口这个 QObject）—— 连 lambda 时没有接收者
+        # 对象，Qt 会在**发射信号的线程**里直接执行它，等于把这些活又搬回了非 GUI 线程。
+        worker.done.connect(self._on_stage_batch_done)
+        worker.finished.connect(self._on_stage_worker_finished)
+        self._staging_batch_tab = tab
+        self._staging_worker = worker
+        self._log(f"⏳ 正在复制/解析 {len(todo)} 个文件（后台进行，界面照常可用）…")
+        worker.start()
+
+    def _on_stage_batch_done(self, payload) -> None:
+        """后台批次出结果（本槽在 GUI 线程执行，done 是跨线程的排队连接）。"""
+        tab = self._staging_batch_tab
+        self._staging_batch_tab = None
+        if tab is None:
+            return
+        self._apply_staged_files(tab, payload)
+
+    def _on_stage_worker_finished(self) -> None:
+        """run() 已返回 ⇒ 可以安全丢引用、起下一批（QThread 运行中被销毁会直接崩）。"""
+        worker = self._staging_worker
+        self._staging_worker = None
+        try:
+            if worker is not None:
+                worker.deleteLater()
+        except Exception:
+            pass
+        self._drain_staging_queue()
+
+    def _wait_staging_idle(self, timeout: float = 60.0) -> bool:
+        """等"添加文件"的排队与在跑的批次全部落地（退出收尾与验收脚本共用）。"""
+        deadline = time.time() + max(0.0, float(timeout))
+        while self._staging_worker is not None or self._staging_queue:
+            if time.time() >= deadline:
+                return False
+            QApplication.processEvents()
+            time.sleep(0.01)
+        return True
+
+    def _discard_staged(self, recs, why: str) -> None:
+        """整批作废（页被删/被固定）：把预占的副本交还，别让它们永远躲过清扫。"""
+        n = 0
+        for rec in (recs or []):
+            wp = str(rec.get("work_path") or "") if isinstance(rec, dict) else ""
+            if isinstance(rec, dict) and rec.get("staged") and wp:
+                try:
+                    staging.unreserve(wp)
+                except Exception:
+                    pass
+                n += 1
+        if n:
+            self._log(f"⚠ {why}：{n} 个暂存副本已丢弃（未加入任务）")
+
+    def _apply_staged_files(self, tab, payload) -> None:
+        """后台批次落地：建 PrintJob、挂到**发起这批的标签页**、刷界面、起预转换。
+
+        2026-12 兼容性修复（压缩包拖拽）仍然成立：任务只用暂存副本（rec["work_path"]），
+        原件路径记在 job.source_path（界面显示与双击打开仍用原件）。
+        """
+        recs = payload if isinstance(payload, list) else []
+        if not recs:
+            return
+        key = self._tab_key_of(tab)
+        if not key:
+            self._discard_staged(recs, "目标标签页已被删除")
+            return
+        if bool(getattr(tab, "frozen", False)):
+            self._discard_staged(recs, f"标签页 {key} 已被固定")
+            return
+        try:
+            custom = dict(self._config.default_task_options or {})
+        except Exception:
+            custom = {}
+        jobs = list(tab.jobs or [])
+        rows_before = len(jobs)
+        existing_paths = {getattr(j, "file_path", "") for j in jobs
+                          if getattr(j, "file_path", "")}
+        existing_sources = {os.path.normcase(os.path.abspath(j.source_path))
+                            for j in jobs if getattr(j, "source_path", "")}
+        new_jobs: list = []
+        to_unreserve: list[str] = []
+        staged_count = 0
+        try:
+            for rec in recs:
+                if not isinstance(rec, dict):
+                    continue
+                work_path = str(rec.get("work_path") or rec.get("src") or "")
+                if rec.get("staged") and work_path:
+                    to_unreserve.append(work_path)
+                try:
+                    if rec.get("error"):
+                        self._log(f"⚠ {os.path.basename(str(rec.get('src') or ''))}："
+                                  f"读属性失败，按默认值加入（{rec['error']}）")
+                    if not work_path or not os.path.isfile(work_path):
+                        self._log(f"⚠ 跳过 {os.path.basename(str(rec.get('src') or ''))}："
+                                  "工作副本不可用")
+                        continue
+                    src = str(rec.get("src") or "")
+                    src_key = os.path.normcase(os.path.abspath(src)) if src else ""
+                    if work_path in existing_paths or (src_key and src_key in existing_sources):
+                        continue          # 已在列表（重复拖入 / 上一批刚刚加过）
+                    ext = str(rec.get("ext") or os.path.splitext(work_path)[1]).lower()
+                    is_image = ext in _IMAGE_EXTS
+                    orientation = str(rec.get("orientation") or "")
+                    job = PrintJob(
+                        file_path=work_path, copies=1,
+                        source_path=src,  # 用户原件路径（显示/打开文件用；副本丢失时按此重建）
+                        # 后台已经算好 MD5：预转换直接用它查缓存，别再在主线程整文件读一遍
+                        source_md5=str(rec.get("md5") or ""),
+                        # 「选项 → 默认任务参数…」只存**改过的键**（差量）。键不在 dict 里 = 该项
+                        # 仍按原有逻辑推导/检测，所以没配过的人逐项行为与改动前完全一致：
+                        # ● 双面：图片仍强制单面（既有规矩），文本/PDF 才吃默认值；
+                        duplex="off" if is_image else (str(custom.get("duplex") or "on")),
+                        # ● 双面模式：没配过就按页面方向推导（配置一次长边不会永久钉死长边）；
+                        duplex_mode=(str(custom.get("duplex_mode") or "")
+                                     or self._duplex_mode_for_orientation(orientation)),
+                        page_count=int(rec.get("page_count") or 0),
+                        orientation=orientation,
+                        engine=str(rec.get("engine") or "word"),
+                        # ● 排除末尾空白页：blank_tail 只存**检测结果**（文件事实）。默认开启的
+                        #   排除由 _auto_exclude_blank_tail 真正落到 page_range 上（2026-11-13）。
+                        blank_tail=int(rec.get("blank_tail") or 0),
+                        dpi=int(custom.get("dpi") or 0),  # 0 = 跟随全局 DPI
+                        image_orientation=str(custom.get("image_orientation") or "auto"),
+                        # ● 封面单独打印：与 UI 同一口径 —— 勾了但页范围是空的等于没勾；
+                        simplex_enabled=(bool(custom.get("simplex_enabled"))
+                                         and bool(str(custom.get("simplex_pages") or "").strip())),
+                        simplex_pages=str(custom.get("simplex_pages") or ""),
+                    )
+                    jobs.append(job)
+                    new_jobs.append(job)
+                    existing_paths.add(work_path)
+                    if src_key:
+                        existing_sources.add(src_key)
+                    if rec.get("staged"):
+                        staged_count += 1
+                    # 本地默认「排除末尾空白页」（默认开启）：PDF 当场有页数就先排掉；Office
+                    # 要等转换完成（_on_convert_finished）或缓存命中再走同一条路。
+                    self._auto_exclude_blank_tail(job)
+                except Exception as e:
+                    logger.warning(f"添加文件失败（已跳过该文件）: {work_path} → {e}",
+                                   exc_info=True)
+            if not new_jobs:
+                return
+            # 副本先被任务引用（tab.jobs），再在下面 finally 里交还清扫 —— 顺序反了就有
+            # "刚复制好、还没人引用" 的空窗，一次清扫就能把它删掉。
+            tab.jobs = jobs
         finally:
-            self._loading_files = False
+            for wp in to_unreserve:
+                try:
+                    staging.unreserve(wp)
+                except Exception:
+                    pass
+        if rows_before == 0:
+            # 首次添加时间（2026-11 用户口径）：只有"加之前这一页是空的"才算首次 ——
+            # 老配置里已有文件却没有这个字段时不补写，免得把"现在"当成几小时前的时刻。
+            self._mark_tab_first_added(key)
+        if key == self._current_tab:
+            self._set_current_jobs(jobs)   # 含"两页别共享同一 list"守卫 + _save_config()
+            self._rebuild_table()
+            self._refresh_tab_display()
+        else:
+            self._save_config()
+        _msg = f"标签页 {key}: 已添加 {len(new_jobs)} 个文件"
+        if staged_count:
+            _msg += f"（{staged_count} 个已复制到暂存副本，原件删除/移动不影响打印）"
+        self._log(_msg)
+        # 字体缺失检测（2026-10-31）：只对新加的这批排后台检查（查的是源文件，不是预转换 PDF）
+        self._queue_font_checks(new_jobs, key)
+        # 只为**本次新增**的行启动预转换（行号连续；别把 rows_before 之前的老行再渲染一遍）
+        for off, job in enumerate(new_jobs):
+            if os.path.splitext(job.file_path)[1].lower() != ".pdf":
+                self._start_convert_worker(rows_before + off, job.file_path, job.engine,
+                                           tab_key=key)
+
 
     def _on_shortcut_copy_total(self):
         """Ctrl+C：仅在非文本编辑状态下复制总价格。"""
@@ -16583,12 +17099,19 @@ class MainWindow(QMainWindow):
 
     def _remedy_busy_reason(self) -> str:
         """补救也要用同一台打印机与同一个出纸槽，忙的时候不能插队。"""
+        # 线程已经结束、对象却没被清掉（done 信号丢失等极端情况）→ 就地清掉，
+        # 否则"另一个补救补打还在跑"会永久挡住所有补救（2026-11-17 现场症状 ②）。
+        _rw = self._remedy_worker
+        if _rw is not None and not _rw.isRunning():
+            self._remedy_worker = None
+            self._remedy_mode = ""
         if self._worker is not None and self._worker.isRunning():
             return "有打印任务正在进行"
         if self._stack_flush_worker is not None and self._stack_flush_worker.isRunning():
             return "整叠第 2 趟正在打印（出纸槽被那一叠独占）"
         if self._remedy_worker is not None and self._remedy_worker.isRunning():
-            return "另一个补救补打还在跑"
+            return ("另一轮补救还没结束 —— 若它正停在等纸就位，请到「手动双面打印」窗点"
+                    "「⏭ 取消本次补打」，然后再回来重试")
         if self._print_starting:
             return "正在取号/上报订单"
         return ""
@@ -16619,6 +17142,19 @@ class MainWindow(QMainWindow):
         if not self._has_members():
             self._show_no_member_hint()
             return False
+        # 先把常驻窗强制切到「补救」态，再起线程：顺序不能反 —— worker 的 flip_required
+        # 一到就要靠这个状态被 set_flippable() 认出来。不切的话窗口会停在上一轮留下的
+        # pass2/done 态，界面永远不出现（现场"补救卡死"的直接原因，2026-11-17）。
+        _what = "整单重打" if mode == "reprint" else "补打第 2 趟"
+        try:
+            _dlg = self._ensure_duplex_dialog()
+            _dlg.begin_remedy(
+                f"正在准备{_what}……出纸槽和纸盘都留给这一叠，别插别的打印任务。",
+                what=_what, sheets=int(rec.get("sheet_count") or 0),
+                estimate_sec=0.0, timeout_sec=DuplexRemedyWorker.FLIP_TIMEOUT_SEC)
+            self._show_duplex_dialog(_dlg)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
         worker = DuplexRemedyWorker(
             rec, mode=mode,
             printer_name=(self._config.printer_name or ""),
@@ -16661,6 +17197,13 @@ class MainWindow(QMainWindow):
                 _w.wait(5000)
             except (RuntimeError, AttributeError):
                 pass
+        # 常驻窗必须收回到「结束」态（= 一定调 finish_remedy，里面把 _mode 置回 done）：
+        # 不收的话下一轮补救的 set_flippable() 会被态势守卫挡掉、界面永远不出现，
+        # 操作员看到的就是"补救状态卡住、再也启动不了下一个补救"（2026-11-17 现场）。
+        try:
+            self._ensure_duplex_dialog().finish_remedy(("✓ " if ok else "✗ ") + str(message or ""))
+        except (AttributeError, RuntimeError, TypeError):
+            pass
         self._log(("✓ " if ok else "✗ ") + message)
         rec = duplex_remedy.get(rid) if rid else None
         jobs = self._find_jobs_for_remedy(rec) if rec else []
@@ -22493,6 +23036,18 @@ class MainWindow(QMainWindow):
         # 两个常驻提示窗已不是主窗口的子对象（见 _make_resident_tool_window）：不会随主窗口关闭
         # 被销毁，必须在这里显式收掉，否则会留下孤岛窗口（没有托盘时事件循环不退出）。
         self._close_resident_windows()
+        # 「添加文件」的后台批次：QThread 在运行中被销毁会直接崩，而且它复制出来的暂存副本
+        # 这会儿还只是 staging.reserve 占着、没挂到任何任务上 —— 必须等它落地（一般 <1 秒，
+        # 拖一批大文件最多等 30 秒），超时则叫停线程；半截 .part 由 stage_file 下次自己清。
+        if not self._wait_staging_idle(30.0):
+            _sw = self._staging_worker
+            logger.warning("退出前仍有「添加文件」后台线程在跑，已强制叫停")
+            if _sw is not None:
+                try:
+                    _sw.cancel()
+                    _sw.wait(2000)
+                except Exception:
+                    pass
         # 外部打印监视：退出前停线程 + 关 spooler 通知句柄（别指望进程退出时的隐式清理）
         self._stop_external_watch()
         # 智能助手接口：同理由我们自己关掉（HTTP 线程是 daemon，但端口要立刻放出来）
@@ -23440,145 +23995,3 @@ class MainWindow(QMainWindow):
     def _refresh_config_jobs_from_table(self):
         """从表格同步任务列表到配置（已通过实时保存自动处理）。"""
         pass
-
-    # ──────── 添加文件核心实现 ────────
-
-    def __add_files_to_table_impl(self, files, target_order_key=None):
-        """添加文件到当前标签页的核心逻辑。
-
-        2026-12 兼容性修复（压缩包拖拽）：每个文件先复制一份「工作副本」到本地暂存目录
-        （staging.stage_file），列表任务只用副本路径。从压缩包直接拖出来的文件位于解压
-        软件的临时目录（%TEMP%\\Rar$DIa0.123\\...），解压软件退出/临时目录被清理后原文件
-        就没了，原先要等到打印时才报「文件不存在」。原件路径记录在 job.source_path
-        （界面显示与双击打开仍用原件）；副本的回收见 _sweep_staged_files()。
-        """
-        # HTML/HTM 已移除；表格 (.xls/.xlsx) 自 2026-11-02 起支持本地打印
-        # （Excel/WPS 自己的排版，见 xlsx_printer.py）。
-        allowed_types = {
-            ".pdf", ".doc", ".docx",
-            ".xls", ".xlsx",
-            ".txt", ".md",
-            ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp",
-        }
-        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-        html_rejected: list[str] = []
-
-        self._cancel_undo_if_active()
-        jobs = self._get_current_jobs()
-        rows_before = len(jobs)
-        existing_paths = {j.file_path for j in jobs if j.file_path}
-        # 原件路径（含副本已在列表里的情况）：同一文件重复添加仍按原逻辑跳过
-        existing_sources = {
-            os.path.normcase(os.path.abspath(j.source_path))
-            for j in jobs if getattr(j, "source_path", "")
-        }
-        staged_count = 0
-
-        for f in files:
-            if not f:
-                continue
-            src = os.path.abspath(f)
-            if not os.path.isfile(src):
-                self._log(f"⚠ 已跳过不存在的文件: {f}")
-                continue
-            src_key = os.path.normcase(src)
-            if src in existing_paths or src_key in existing_sources:
-                continue  # 已在列表中
-            ext = os.path.splitext(src)[1].lower()
-            if ext in (".html", ".htm"):
-                # S0-09 / D-2：HTML 打印支持**永久删除**。不静默 continue，收上来统一提示
-                html_rejected.append(src)
-                continue
-            if ext not in allowed_types:
-                continue
-            # 关键：复制工作副本（原件之后被删/临时目录被系统清理都不影响打印）
-            work_path = staging.stage_file(src)
-            if work_path != src:
-                staged_count += 1
-            if work_path in existing_paths:
-                continue
-            existing_paths.add(work_path)
-            existing_sources.add(src_key)
-
-            page_count = 0; orientation = ""; blank_tail = 0
-            # 「选项 → 默认任务参数…」的差量默认值（主窗口级配置，整批共用；空 dict = 从未配置）
-            # 提前到这里：图片的方向列要按**默认图片方向**判，否则「默认横向」下加一张竖图，
-            # 列表先显示"竖"、转换完又变"横"（2026-11-06 用户要求这类显示不一致一并修掉）。
-            _custom = dict(self._config.default_task_options or {})
-            if ext == ".pdf":
-                info = get_pdf_info(work_path); page_count = info["page_count"]; orientation = info["orientation"]
-                blank_tail = self._detect_blank_tail(work_path)
-            elif ext == ".docx":
-                orientation = get_docx_orientation(work_path)
-            elif ext in image_exts:
-                info = get_image_info(work_path, str(_custom.get("image_orientation") or "auto"))
-                page_count = info["page_count"]; orientation = info["orientation"]
-            engine = "word"
-            if ext in (".doc", ".docx"):
-                from converter import _read_docx_last_editor, get_available_engines
-                available = get_available_engines()
-                editor = _read_docx_last_editor(work_path) if ext == ".docx" else None
-                preferred = "wps" if editor == "wps" else "word"
-                for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
-                    if available.get(eng, False): engine = eng; break
-            is_image = ext in image_exts
-            # 短边/长边只按**方向**推导（未知方向=长边）；转换完成后由 _on_convert_finished 复核
-            duplex_mode = self._duplex_mode_for_orientation(orientation)
-
-            job = PrintJob(
-                file_path=work_path, copies=1,
-                source_path=src,  # 用户原件路径（显示/打开文件用；副本丢失时按此重建）
-                # 「选项 → 默认任务参数…」只存**改过的键**（差量）。键不在 dict 里 = 该项仍按
-                # 原有逻辑推导/检测，所以没配过的人（dict 为空）逐项行为与改动前完全一致：
-                # ● 双面：图片仍强制单面（既有规矩），文本/PDF 才吃默认值；
-                duplex="off" if is_image else (str(_custom.get("duplex") or "on")),
-                # ● 双面模式：没配过就保留按页面方向推导的结果（配置一次长边不会永久钉死长边）；
-                duplex_mode=str(_custom.get("duplex_mode") or "") or duplex_mode,
-                page_count=page_count, orientation=orientation, engine=engine,
-                # ● 排除末尾空白页：blank_tail 只存**检测结果**（文件事实）。默认开启的排除
-                #   由构造后的 _auto_exclude_blank_tail 真正落到 page_range 上（2026-11-13）；
-                #   旧代码在这里写 1 是伪造检测值，既不真排除又会误删真实末页。
-                blank_tail=blank_tail,
-                dpi=int(_custom.get("dpi") or 0),  # 0 = 跟随全局 DPI
-                image_orientation=str(_custom.get("image_orientation") or "auto"),
-                # ● 封面单独打印：与 UI 同一口径 —— 勾了但页范围是空的等于没勾；
-                simplex_enabled=(bool(_custom.get("simplex_enabled"))
-                                 and bool(str(_custom.get("simplex_pages") or "").strip())),
-                simplex_pages=str(_custom.get("simplex_pages") or ""),
-            )
-            jobs.append(job)
-            # 本地默认「排除末尾空白页」（默认开启）：PDF 当场有页数就先排掉；Office
-            # 要等转换完成（_on_convert_finished）或缓存命中再走同一条路。
-            self._auto_exclude_blank_tail(job)
-
-        if html_rejected:
-            # 拖入/粘贴/对话框选择 `.html/.htm`：明确告知不支持并给出替代路径
-            self._warn_html_unsupported(html_rejected)
-
-        if len(jobs) > rows_before:
-            # 首次添加时间（2026-11 用户口径）：只有"加之前这一页是空的"才算首次 ——
-            # 老配置里已有文件却没有这个字段时不补写，免得把"现在"当成几小时前的时刻。
-            if rows_before == 0:
-                self._mark_tab_first_added(self._current_tab)
-            self._set_current_jobs(jobs)
-            self._rebuild_table()
-            self._refresh_tab_display()
-            _msg = f"标签页 {self._current_tab}: 已添加 {len(jobs) - rows_before} 个文件"
-            if staged_count:
-                _msg += f"（{staged_count} 个已复制到暂存副本，原件删除/移动不影响打印）"
-            self._log(_msg)
-            # 字体缺失检测（2026-10-31）：只对新加的这批排后台检查，查完在 _on_font_checked 里
-            # 把缺字体的文件名标黄 ⚠️（查的是**源文件**，不是预转换出来的 PDF —— 理由见 _font_gate）
-            self._queue_font_checks(jobs[rows_before:], self._current_tab)
-            # 只为**本次新增**的行启动预转换（rows_before 之前的行上次已处理过）。
-            # 原先遍历整个 jobs ⇒ 添加第 N 个文件时把前 N-1 个全部重新渲染一遍（O(n²)，
-            # 现场：7 个图片渲染 18+ 次、首个文件 50 秒内被渲染 4 次）。
-            for i in range(rows_before, len(jobs)):
-                job = jobs[i]
-                ext = os.path.splitext(job.file_path)[1].lower()
-                if ext != ".pdf":
-                    # 所有非 PDF 文件都在添加时预转换为 PDF 并缓存（图片/TXT/Word 等）
-                    # 这样崩溃恢复后即使源文件不可用，缓存 PDF 仍可用于打印
-                    # tab_key 显式传当前页（2026-11）：转换结果必须回到"加文件的那个标签页"
-                    self._start_convert_worker(i, job.file_path, job.engine,
-                                               tab_key=self._current_tab)

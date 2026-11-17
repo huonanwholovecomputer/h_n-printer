@@ -158,6 +158,7 @@ def reserved_posts():
 
 print("=== 1. 加文件（5 页 PDF）===")
 win._add_files_to_table([PDF])
+win._wait_staging_idle(60.0)   # 2026-11-17：加文件改后台线程
 jobs = win._get_current_jobs()
 check("文件已加入当前标签页", len(jobs) == 1, f"n={len(jobs)}")
 check("页数已解析（5 页）", bool(jobs) and jobs[0].page_count == 5,

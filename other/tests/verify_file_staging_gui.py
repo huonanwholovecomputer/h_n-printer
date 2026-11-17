@@ -72,6 +72,7 @@ print("… 主窗口就绪", flush=True)
 
 print("=== 1. 拖拽添加（走真实 _add_files_to_table）===")
 win._add_files_to_table([SRC])
+win._wait_staging_idle(60.0)   # 2026-11-17：复制/解析在后台线程
 jobs = win._get_current_jobs()
 check("任务已加入列表", len(jobs) == 1, f"n={len(jobs)}")
 if jobs:
@@ -87,6 +88,7 @@ if jobs:
 
     # 同一文件重复添加 → 跳过（沿用原逻辑）
     win._add_files_to_table([SRC])
+    win._wait_staging_idle(60.0)
     check("同一文件重复添加被跳过", len(win._get_current_jobs()) == 1)
 
 print("=== 2. 原件（解压临时目录）被清理后仍可打印 ===")
@@ -121,6 +123,7 @@ check("无任务时暂存目录无残留文件", staging.cache_size()[0] == 0, s
 
 print("=== 5. 清空列表（撤回窗口）不影响副本，撤回后仍可打印 ===")
 win._add_files_to_table([SRC])
+win._wait_staging_idle(60.0)
 jobs = win._get_current_jobs()
 _copy = jobs[0].file_path if jobs else ""
 win._on_clear_list()

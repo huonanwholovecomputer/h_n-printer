@@ -156,6 +156,7 @@ _CONV_GATE.clear()                                   # 卡住转换，先切页
 files = [mk_docx(f"a{i:02d}.docx") for i in range(13)]
 tab1 = win._current_tab
 win._add_files_to_table(files)
+win._wait_staging_idle(120.0)   # 2026-11-17：复制/解析在后台线程
 pump(0.3)
 tab2 = win._new_tab()
 print(f"    转换途中新建标签页：{tab1} -> {tab2}")
@@ -191,6 +192,7 @@ check("留了一条日志（改动前完全静默）", any("无对应行" in m f
 print("\n=== ③ 转换失败：'?' + 日志 + 自动重试一次 ===")
 fail_file = mk_docx("b_fail.docx")
 win._add_files_to_table([fail_file])
+win._wait_staging_idle(60.0)
 pump(0.3)
 _fail_row = None
 _fail_job_path = ""
@@ -238,6 +240,7 @@ def _row_by_basename(tab_key, path):
 _defer_file = mk_docx("b_defer.docx")
 win._start_convert_worker = _orig_start        # 先恢复正常预转换，别把"添加"也记成重试
 win._add_files_to_table([_defer_file])
+win._wait_staging_idle(60.0)
 pump(0.5)
 _defer_row, _defer_path = _row_by_basename(tab1, _defer_file)
 _defer_retries: list[tuple] = []               # 只记录这一小节的重试
@@ -304,6 +307,7 @@ _retries_before = len(retries)
 logs.clear()
 _cancel_p = mk_docx("e_cancel.docx")
 win._add_files_to_table([_cancel_p])
+win._wait_staging_idle(60.0)
 pump(0.3)
 _cancel_row = None
 _cancel_path = ""

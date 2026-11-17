@@ -19,7 +19,7 @@
 
   B 静态（gui.py / version_info.txt / 移动端）
     - 文件对话框「文本」过滤器无 *.html / *.htm；_format_engine_label 无 html/htm 引擎分支；
-      __add_files_to_table_impl 的准入集合无 html/htm，且拒绝时给明确文案；
+      _add_files_to_table 的准入集合无 html/htm，且拒绝时给明确文案；
     - 拒绝文案 =「本工具已不支持 HTML 文件，请另存为 PDF/DOCX 后打印」；
     - APP_VERSION 与 version_info.txt 同步为 4.5.32；
     - 移动端小程序 supportedExts 与 APP SUPPORTED_EXTS 本就**不含** html/htm（只断言，不改）。
@@ -190,7 +190,7 @@ def static_gui_checks() -> None:
         seg = seg[:seg.index("}")]
     except ValueError:
         seg = ""
-    check("__add_files_to_table_impl 准入集合无 .html/.htm",
+    check("_add_files_to_table 准入集合无 .html/.htm",
           bool(seg) and ".html" not in seg and ".htm" not in seg, f"allowed_types={seg!r}")
     check('准入处对 .html/.htm 有显式拒绝分支（ext in (".html", ".htm")）',
           'ext in (".html", ".htm")' in gui)
