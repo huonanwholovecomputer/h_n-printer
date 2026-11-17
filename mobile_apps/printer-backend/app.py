@@ -9846,6 +9846,7 @@ def printer_release():
         return jsonify({"success": False, "message": "token 无效"}), 403
     data = request.get_json(silent=True) or {}
     client_id = (data.get("client_id") or "").strip()
+    released = False
     with _claim_lock:
         claim = _load_claim_impl()
         devices = claim.get("claiming_devices")
@@ -9853,10 +9854,16 @@ def printer_release():
             devices.pop(client_id, None)
             claim["claiming_devices"] = devices
             _save_claim_impl(claim)
-            broadcast_printer_state()
-            print(f"[CLAIM] 设备 {client_id} 已关闭接单（剩余 {len(devices)} 台可接单设备）")
-            return jsonify({"success": True, "message": "接单已关闭"})
-    return jsonify({"success": True, "message": "当前设备未启用接单"})
+            released = True
+    if not released:
+        return jsonify({"success": True, "message": "当前设备未启用接单"})
+    # 2026-11-17 生产事故：这两行原本在 `with _claim_lock:` 块内。broadcast_printer_state()
+    # → _printer_state_payload() → get_claiming_devices() → load_claim() 会**再次**获取
+    # _claim_lock（threading.Lock，非重入）⇒ 自锁，worker 线程永不释放，16 个 gthread
+    # 全部排队等锁，整站 API 冻结（/api/pricing 都 499）。广播/打印一律留在锁外。
+    broadcast_printer_state()
+    print(f"[CLAIM] 设备 {client_id} 已关闭接单（剩余 {len(devices)} 台可接单设备）")
+    return jsonify({"success": True, "message": "接单已关闭"})
 
 
 @app.route("/api/printer/token/create", methods=["POST"])
