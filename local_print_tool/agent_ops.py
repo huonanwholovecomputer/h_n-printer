@@ -62,7 +62,7 @@ from agent_api import AgentOpError
 
 logger = logging.getLogger(__name__)
 
-# 与 `MainWindow.__add_files_to_table_impl` 里的 allowed_types 必须一致
+# 与 `MainWindow._add_files_to_table` 里的 allowed_types 必须一致
 # （tests/verify_agent_api.py 会解析 gui.py 源码比对，防两处漂移）。
 ALLOWED_EXTS = {
     ".pdf", ".doc", ".docx",
@@ -527,6 +527,11 @@ class AgentOps:
         before = list(tab.jobs)
         try:
             win._add_files_to_table(paths)
+            # 2026-11-17：添加文件已改为后台线程（复制/解析在 StageFilesWorker 里）。
+            # 这里必须等它落地，否则下面读到的 jobs 还是空的，接口会误报"没有文件被加入"。
+            _wait_idle = getattr(win, "_wait_staging_idle", None)
+            if callable(_wait_idle):
+                _wait_idle(120.0)
         except Exception as e:
             logger.exception(f"[agent-api] 添加文件异常: {e}")
             raise AgentOpError("internal", f"添加文件失败: {e}")

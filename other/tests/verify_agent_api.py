@@ -747,7 +747,7 @@ check("④l2 取消勾选后 ping 失败", agent_api.ping(timeout=1).get("ok") i
 section("⑤ 静态一致性")
 
 src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
-start = src.find("def __add_files_to_table_impl")
+start = src.find("def _add_files_to_table(")
 seg = src[start:start + 4000]
 lit_start = seg.find("allowed_types = {") + len("allowed_types = {")
 lit_end = seg.find("}", lit_start)
