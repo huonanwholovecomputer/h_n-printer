@@ -114,6 +114,14 @@ docs/*.md
 # 以未跟踪文件身份出现在 git status，一次 `git add -A` 就会被带进公开仓库。
 mobile_apps/docs/*.md
 
+# 根目录的内部工作文档与对外经营文档（审计报告 / 修复计划 / 隐私与取件须知 docx+png）：
+# `docs/*.md` 只覆盖 docs/ 子树，根目录的 md/docx/png 盖不住 —— 2026-11-17 这四份文件
+# 就是这样被一次全量提交带进公开仓库的（已用 filter-branch 重写 482 个 commit 撤回）。
+# 规矩：commit 前逐项过 `git status --short`，先问「这份东西能公开吗」。
+审计报告_*.md
+修复计划_*.md
+隐私与取件须知*
+
 # 拆分基线（拆分前的 CLAUDE.md 原文，供 other/tests/verify_context_docs.py 逐字节对账）。
 # 目录不是 .md 文件，`docs/*.md` 盖不住，必须显式忽略，否则 134 KB 原文会被 `git add -A` 带进仓库。
 docs/拆分基线_2026-10-30/
