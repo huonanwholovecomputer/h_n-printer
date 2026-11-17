@@ -38,6 +38,7 @@ sys.path.insert(0, LOCAL_TOOL)
 os.chdir(LOCAL_TOOL)
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 
 _app = QApplication.instance() or QApplication([])
 
@@ -1155,6 +1156,38 @@ dlg5._on_go()
 check("第 1 趟期间点「继续」就算数（这一趟打没打完由操作员说了算）",
       evts5 == ["go"] and dlg5._mode == "pass2" and dlg5._pass1_done and not dlg5._pass1_timer.isActive(),
       f"{evts5} {dlg5._mode}")
+
+# ── 2026-11-16 现场（用户报「回車/空格误触跳过」）：默认按钮必须**不存在** ──────
+print("\n=== ⑥b 默认按钮与焦点（回车、空格不许替操作员做决定）===")
+_dlgk = gui.ManualDuplexDialog()
+_kev = []
+_dlgk.continue_requested.connect(lambda: _kev.append("go"))
+_dlgk.skip_requested.connect(lambda: _kev.append("skip"))
+_dlgk.show()                 # 现场顺序：窗口先立起来，此时「继续」还是禁用态
+_app.processEvents()
+_dlgk.announce("第 1 趟（现在打）：1 3 5")
+_app.processEvents()
+check("立窗顺序复刻：两个按钮都不是默认按钮，焦点也不落在按钮上",
+      not _dlgk._btn_go.isDefault() and not _dlgk._btn_skip.isDefault()
+      and not _dlgk._btn_go.autoDefault() and not _dlgk._btn_skip.autoDefault()
+      and QApplication.focusWidget() not in (_dlgk._btn_go, _dlgk._btn_skip),
+      f"go.default={_dlgk._btn_go.isDefault()} skip.default={_dlgk._btn_skip.isDefault()}"
+      f" focus={type(QApplication.focusWidget()).__name__}")
+QTest.keyClick(_dlgk, gui.Qt.Key_Return)
+QTest.keyClick(_dlgk, gui.Qt.Key_Space)
+_app.processEvents()
+check("★ 回车 + 空格都不触发任何按钮（跳过 = 整批半成品，绝不能被误触）",
+      _kev == [] and _dlgk._mode == "pass1", f"{_kev} {_dlgk._mode}")
+QTest.keyClick(_dlgk, gui.Qt.Key_Tab)
+_app.processEvents()
+_fw = QApplication.focusWidget()
+check("键盘可用性不丢：Tab 能到「继续打第 2 趟」，这时空格才真的按它",
+      _fw is _dlgk._btn_go and _kev == [], f"{type(_fw).__name__}")
+QTest.keyClick(_fw, gui.Qt.Key_Space)
+_app.processEvents()
+check("空格只会按**聚焦的那个**按钮（不会再落到「跳过」上）",
+      _kev == ["go"] and _dlgk._mode == "pass2", f"{_kev} {_dlgk._mode}")
+_dlgk.hide()
 
 # ============================================================
 # ⑧ 翻纸间隙的并发保护（第 1 趟打完 → 操作员确认之间，别的任务不能插进来）

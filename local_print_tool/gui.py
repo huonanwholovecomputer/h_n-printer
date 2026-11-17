@@ -105,6 +105,7 @@ from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx
 import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 import duplex_stack  # 攒批模式（多任务合并翻纸）的纸叠账本（纯逻辑，见 duplex_stack.py）
 import duplex_remedy  # 手动双面「半成品」补救台账：跳过/超时/第 2 趟失败后补打第 2 趟（见 duplex_remedy.py）
+import safe_confirm  # 危险确认统一口径：默认按钮永不是「执行」（见 safe_confirm.py）
 import print_watch   # 外部打印监视（绕过本工具的作业：只检测+记账，不阻断，见 print_watch.py）
 import pass2_watch   # 「上一批第 2 趟可能还在出纸」的跨批次计时（插单会串页，见 pass2_watch.py）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
@@ -1041,6 +1042,17 @@ class ManualDuplexDialog(QDialog):
         row.addWidget(self._btn_skip)
         lay.addLayout(row)
 
+        # ★ 2026-11-16 现场（用户报「回车/空格会误触跳过」）：立窗那一刻「▶ 继续打第 2 趟」
+        #   还是禁用态，Qt 于是把唯一可点的「⏭ 跳过本任务」选成**默认按钮**并获得焦点；
+        #   之后 announce() 把继续按钮使能，Qt **不会**把默认按钮改回来 —— 操作员随手一回车
+        #   或空格，整批就被判跳过（纸白打、订单记失败）。两个按钮因此都不是默认按钮，
+        #   窗口显示时焦点也不落在任何按钮上：回车/空格一律不替操作员做决定
+        #   （硬规矩 12：第 2 趟只认操作员点击）。Tab 仍可到按钮（键盘可用性不丢）。
+        for _b in (self._btn_go, self._btn_skip):
+            _b.setAutoDefault(False)
+            _b.setDefault(False)
+        self.setFocusPolicy(Qt.StrongFocus)
+
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
@@ -1634,6 +1646,14 @@ class ManualDuplexDialog(QDialog):
         self._btn_skip.setEnabled(False)
         self.skip_requested.emit()
 
+    def showEvent(self, ev):
+        # ★ 2026-11-16：窗口显示时焦点落在窗口本身，**不落在任何一个按钮**上。
+        #   立窗那一刻「▶ 继续打第 2 趟」还是禁用态，若放任 Qt 自己安排焦点，它会挑中
+        #   「⏭ 跳过本任务」——之后使能继续按钮也不会改回来，操作员随手空格/回车就整批跳过。
+        #   见 __init__ 里那段说明。
+        super().showEvent(ev)
+        self.setFocus(Qt.OtherFocusReason)
+
     def closeEvent(self, ev):
         # 还没点「继续」就关窗 → 视为跳过（不能让关窗把第 2 趟放过去）。
         # "pass1" 也算：2026-11-11 起按钮在第 1 趟还在出纸时就可点，关窗同样是一次明确的
@@ -2020,6 +2040,13 @@ class StackQueueDialog(QDialog):
         row.addWidget(self._btn_refresh)
         row.addWidget(self._btn_close)
         lay.addLayout(row)
+        # ★ 2026-11-16：不可逆动作按钮一律不是默认按钮（回车不替操作员做决定）。
+        #   「✓ 我已取走」一按就把这几单按成品收尾（清单删除、不再打第 2 趟），
+        #   「⏭ 放弃整叠」直接按失败收尾，「▶ 开始打印第 2 趟」会真的出纸 ——
+        #   旧写法把默认按钮交给 Qt 的「显示那一刻第一个可用的 autoDefault」规则，
+        #   窗口一冒出来回车就可能连点两次。口径见 safe_confirm.py。
+        safe_confirm.defuse_dialog_buttons(
+            self._btn_take, self._btn_start, self._btn_abandon, self._btn_close)
 
         self._tree_left.itemSelectionChanged.connect(self._on_left_selection)
 
@@ -2629,6 +2656,8 @@ class StackQueueDialog(QDialog):
         super().showEvent(ev)
         if self._has_local() and not self._vsplit_user_moved:
             QTimer.singleShot(0, self._reset_queue_ratio)
+        # ★ 2026-11-16：焦点落窗口本身、不落按钮 —— 空格也不会替操作员点「我已取走」。
+        safe_confirm.focus_dialog_not_button(self)
 
     def closeEvent(self, ev):
         """点窗口 × / Esc：只发信号，是否真的隐藏由主窗口决定（它会调 hide()）。"""
@@ -5951,6 +5980,16 @@ class DuplexRemedyDialog(QDialog):
         row.addStretch(1)
         row.addWidget(self._btn_close)
         root.addLayout(row)
+        # ★ 2026-11-16：三个动作按钮都不是默认按钮 —— 「▶ 补打第 2 趟」一按就真的走纸，
+        #   「🖨 整单重打」白打一遍第 1 趟，「✖ 作废」把订单按失败收尾。旧写法让 Qt
+        #   在显示那一刻挑第一个可用的 autoDefault，回车/空格就会误触。见 safe_confirm.py。
+        safe_confirm.defuse_dialog_buttons(
+            self._btn_pass2, self._btn_reprint, self._btn_abandon, self._btn_close)
+
+    def showEvent(self, ev):
+        # 焦点落窗口本身、不落按钮：回车/空格不替操作员执行补打或作废。
+        super().showEvent(ev)
+        safe_confirm.focus_dialog_not_button(self)
 
     # ── 数据 ──
 
@@ -6794,7 +6833,8 @@ class ExternalPrintDialog(QDialog):
 
     def _on_clear(self):
         if QMessageBox.question(self, "清空账本",
-                                "清空后这些外部打印记录就没了（建议先导出 CSV）。确定清空？") \
+                                "清空后这些外部打印记录就没了（建议先导出 CSV）。确定清空？",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) \
                 != QMessageBox.Yes:
             return
         self._store.clear()
@@ -6911,8 +6951,18 @@ class CloudTaskListWindow(QDialog):
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self._on_close)
         btn_row.addWidget(close_btn)
+        # ★ 2026-11-16：「📥 全部添加到新标签页」「↩ 全部打回」都不是默认按钮。
+        #   旧场景：回车先在确认框里点了「是」，随即又把窗口里这个按钮点掉 ——
+        #   两下回车就把一整批订单建了标签页 / 打回。见 safe_confirm.py。
+        safe_confirm.defuse_dialog_buttons(
+            self._accept_all_btn, self._reject_all_btn, close_btn)
 
         layout.addLayout(btn_row)
+
+    def showEvent(self, ev):
+        # 焦点落窗口本身、不落按钮：回车/空格不替操作员批量添加或打回。
+        super().showEvent(ev)
+        safe_confirm.focus_dialog_not_button(self)
 
     # ── 公共 API ──
 
@@ -7061,7 +7111,7 @@ class CloudTaskListWindow(QDialog):
             return
         reply = QMessageBox.question(
             self, "全部添加", f"将为 {len(pending_orders)} 个订单各创建一个新标签页，确定吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
@@ -7077,7 +7127,7 @@ class CloudTaskListWindow(QDialog):
             return
         reply = QMessageBox.question(
             self, "全部打回", f"将打回 {len(pending_orders)} 个待确认订单，确定吗？",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
@@ -7242,6 +7292,15 @@ class OfflineOrdersDialog(QDialog):
         btns.addWidget(refresh_btn)
         btns.addWidget(close_btn)
         root.addLayout(btns)
+        # ★ 2026-11-16：「🔄 重试选中」「🔄 全部重试」都不是默认按钮 —— 它们会真的
+        #   重新投单打印。见 safe_confirm.py。
+        safe_confirm.defuse_dialog_buttons(
+            self._retry_selected_btn, self._retry_all_btn, refresh_btn, close_btn)
+
+    def showEvent(self, ev):
+        # 焦点落窗口本身、不落按钮：回车/空格不替操作员重试投单。
+        super().showEvent(ev)
+        safe_confirm.focus_dialog_not_button(self)
 
     # ── 数据 ──
 
@@ -8506,7 +8565,7 @@ class MainWindow(QMainWindow):
             "重启会关闭当前窗口，本轮所有未打印的任务不会被自动保存（请先确认无需打印）。\n\n"
             "是否立即重启？",
             QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+            QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
             self._restart_app()
@@ -8527,7 +8586,7 @@ class MainWindow(QMainWindow):
             "机器配置（打印机、价格、派送地点）会保留；未同步订单会先尝试上传云端。\n\n"
             "是否继续关闭？",
             QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+            QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return False
@@ -15376,10 +15435,10 @@ class MainWindow(QMainWindow):
         available = get_available_engines()
         return available.get("word", False) or available.get("wps", False) or available.get("libreoffice", False)
 
-    def _current_owner_params(self) -> dict:
-        """当前标签页的归属参数（owner_name / is_admin_print），供预留/上报随请求传给后端。
+    def _current_owner_params(self, tab_key: str = "") -> dict:
+        """指定标签页的归属参数（tab_key 空 = 当前页），供预留/上报随请求传给后端。
         建单前已校验存在成员（_has_members），owner_name 恒为真实成员；空值兜底由后端处理。"""
-        tab = self._config.tabs.get(self._current_tab)
+        tab = self._config.tabs.get(tab_key or self._current_tab)
         return {
             "owner_name": (tab.owner_name if tab else "") or "",
             "is_admin_print": "1" if (bool(tab.is_admin_print) if tab else True) else "0",
@@ -15504,25 +15563,30 @@ class MainWindow(QMainWindow):
         except Exception as e:              # 槽内异常会崩进程（6.11），这里只降级
             logger.debug(f"清空标签页订单时间失败: {e}")
 
-    def _ensure_order_number(self) -> str:
-        """确保当前标签页有订单号。连线时从后端获取，离线时生成本地临时号（-L 前缀）。"""
-        jobs = self._get_current_jobs()
+    def _ensure_order_number(self, tab_key: str = "") -> str:
+        """确保指定标签页有订单号（tab_key 空 = 当前页）。连线时从后端获取，离线时生成本地临时号（-L 前缀）。
+
+        2026-11：参数化 —— 智能助手发价前也要落单（agent op `tabs.price_detail` → 桥
+        `print_price_detail`）。取号逻辑只有这一份，别在助手/桥里再写一遍。
+        """
+        tab_key = str(tab_key or self._current_tab)
+        tab = self._config.tabs.get(tab_key)
+        jobs = tab.jobs if tab else []
         if not jobs:
             return ""
         for j in jobs:
             if j.order_number:
                 return j.order_number
         # 已固定的标签页不再申请新订单号
-        if self._is_current_tab_frozen():
+        if tab is not None and getattr(tab, "frozen", False):
             return ""
         # 尝试从后端获取（网络放后台线程 + processEvents 保活事件循环，
         # 避免同步 GET 冻结主线程导致云端推送/下载完成等信号延迟处理）
         online = self._cloud_client and self._cloud_client.is_connected()
         if online and self._cloud_client.api_url and self._cloud_client.auth_token:
-            tab_key = self._current_tab
             # 取号幂等键：这次请求的响应万一丢包，重连换号时还会用同一把钥匙拿回同一个号
-            _req_id = self._order_request_id(self._config.tabs.get(tab_key))
-            _params = dict(self._current_owner_params())
+            _req_id = self._order_request_id(tab)
+            _params = dict(self._current_owner_params(tab_key))
             if _req_id:
                 _params["request_id"] = _req_id
             result: dict = {}
@@ -15553,23 +15617,29 @@ class MainWindow(QMainWindow):
             if self._closing:
                 return ""  # 等待期间窗口被关闭，中止
             if order_number:
-                # 等待期间用户可能已切换标签页：仅当仍在原标签页时才写回
-                if self._current_tab == tab_key:
-                    for j in jobs: j.order_number = order_number
+                # 单号写回**这一页**（不是"当前页"）：2026-11 起助手可对后台页发价，
+                # 等待期间用户切走也不能丢号（旧实现只在仍在前台时写回，后台页就白建一张单）。
+                for j in jobs: j.order_number = order_number
+                # 订单创建时间（#7）：第一次拿到正式号的那一刻，写一次就不再变
+                self._mark_order_created(tab_key)
+                if tab_key == self._current_tab:
                     self._set_current_jobs(jobs)
-                    # 订单创建时间（#7）：第一次拿到正式号的那一刻，写一次就不再变
-                    self._mark_order_created(tab_key)
                     self._refresh_tab_display()
-                    self._log(f"📋 已分配订单号: {order_number}")
+                else:
+                    self._save_config(sync_ui=False)
+                self._log(f"📋 已分配订单号: {order_number}")
                 return order_number
         # 离线：生成本地临时号（统一 -L 格式，连线后自动换正式号）
         order_number = self._generate_local_order_number_l()
         for j in jobs:
             j.order_number = order_number
-        self._set_current_jobs(jobs)
         # 离线号也是"订单第一次生成"⇒ 同样写创建时间（换正式号时**不改**它）
-        self._mark_order_created()
-        self._refresh_tab_display()
+        self._mark_order_created(tab_key)
+        if tab_key == self._current_tab:
+            self._set_current_jobs(jobs)
+            self._refresh_tab_display()
+        else:
+            self._save_config(sync_ui=False)
         self._log(f"📋 已分配本地订单号: {order_number}（连线后将自动同步）")
         return order_number
 
@@ -15815,13 +15885,15 @@ class MainWindow(QMainWindow):
             pass
         return round(total, 2)
 
-    def _upload_reserved_order(self, order_number: str):
-        """后台线程：以 reserved 状态上报当前标签页完整订单信息（文件明细 + 备注 + 价格 + 归属）。
+    def _upload_reserved_order(self, order_number: str, tab_key: str = ""):
+        """后台线程：以 reserved 状态上报指定标签页完整订单信息（tab_key 空 = 当前页）。
 
         v4.6：复制价格后即把订单同步到后端，"已预留"不再是空占位；后续添加/修改文件
-        再次复制价格会覆盖（后端按 order_number 删旧插新），保证后端信息与本地一致。"""
-        jobs = self._get_current_jobs()
-        tab = self._config.tabs.get(self._current_tab)
+        再次复制价格会覆盖（后端按 order_number 删旧插新），保证后端信息与本地一致。
+        2026-11：参数化以支持智能助手对后台标签页发价（agent op `tabs.price_detail`）。"""
+        tab_key = str(tab_key or self._current_tab)
+        tab = self._config.tabs.get(tab_key)
+        jobs = tab.jobs if tab else []
         client = self._cloud_client
         if not jobs or not tab or not client:
             return
@@ -15858,7 +15930,7 @@ class MainWindow(QMainWindow):
         # "现在"顶上 —— reserved 上报会在复制金额、补报、同步时反复触发，一旦用了可变的
         # 时间源，同一张订单的 created_at 会随每次上报漂移（旧实现在换号补报里就犯过这个错）。
         # 标签页还没有创建时间（老配置/极端路径）时补写一次，随后固定。
-        created_at = self._mark_order_created(self._current_tab)
+        created_at = self._mark_order_created(tab_key)
         payload = {
             "order_number": order_number,
             "status": "reserved",
@@ -16696,7 +16768,7 @@ class MainWindow(QMainWindow):
                 self, "半成品补救",
                 f"上次有 {n} 个批次只打了第 1 趟（翻纸被跳过/超时/第 2 趟失败），"
                 "这些纸还在出纸槽或纸盘里。\n\n现在打开「半成品补救」处理吗？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) == QMessageBox.Yes:
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
             self._open_duplex_remedy_dialog()
 
     def _is_startup_interactive(self) -> bool:
@@ -17296,7 +17368,7 @@ class MainWindow(QMainWindow):
             f"空白页不费碳粉，也不需要翻纸）。" + chr(10) + chr(10) +
             f"用来测出「启动开销 + 每张纸耗时」，之后翻纸窗就能显示第 1 趟的预计耗时。" + chr(10) +
             f"请确认纸盒有纸，然后点「开始」。",
-            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Ok)
+            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
         if reply != QMessageBox.Ok:
             return
         w = SpeedCalibrationWorker(self._config.printer_name)
@@ -22384,7 +22456,7 @@ class MainWindow(QMainWindow):
                 "「否」= 取消打印并退出\n"
                 "「取消」= 继续打印，不退出",
                 QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
-                QMessageBox.Yes,
+                QMessageBox.Cancel,
             )
             if reply == QMessageBox.Cancel:
                 event.ignore()
@@ -22547,21 +22619,31 @@ class MainWindow(QMainWindow):
 
     # ──────── 复制详情 ────────
 
-    def _on_copy_detail(self):
-        """复制当前标签页的计费明细到剪贴板（含订单号）。无成员时禁止创建订单。"""
-        if not self._has_members():
-            self._show_no_member_hint()
-            return
-        jobs = self._get_current_jobs()
+    def _price_detail_text(self, tab_key: str = "", create: bool = True) -> tuple[str, str]:
+        """拼出「复制计费明细」那段原文，并（默认）确保这一页已有订单号 + reserved 预留单。
+
+        返回 (文本, 订单号)。2026-11 从 `_on_copy_detail` 抽出来给两条调用方共用：
+          · 界面按钮 `_on_copy_detail`（写剪贴板）
+          · 智能助手 op `tabs.price_detail`（小印发价前落单；桥 print_price_detail 用它）
+        文本格式被 tests/verify_copy_reserved_sync.py 与 verify_copy_price_*.js 逐字钉住，别改。
+        create=False：只取已有单号、不取号也不上报（打印中的页用，免得把 sent 打回 reserved）。
+        """
+        tab_key = str(tab_key or self._current_tab)
+        tab = self._config.tabs.get(tab_key)
+        jobs = tab.jobs if tab else []
         if not jobs:
-            return
-        order_number = self._ensure_order_number()
-        # v4.6 同口径（与「复制」`_on_copy_total` 一致）：复制计费明细也算"确认下单"，
-        # 同样把文件明细 + 备注 + 价格 + 附加服务同步到后端（reserved 非空占位）。
-        # 缺这一步会出现：只点「复制计费明细」不点「复制」时，云端订单还是旧数据/空占位
-        # （钉住：tests/verify_copy_reserved_sync.py）。
-        if order_number and self._cloud_client and self._cloud_client.is_connected():
-            self._upload_reserved_order(order_number)
+            return "", ""
+        if create:
+            order_number = self._ensure_order_number(tab_key)
+            # v4.6 同口径（与「复制」`_on_copy_total` 一致）：复制计费明细也算"确认下单"，
+            # 同样把文件明细 + 备注 + 价格 + 附加服务同步到后端（reserved 非空占位）。
+            # 缺这一步会出现：只点「复制计费明细」不点「复制」时，云端订单还是旧数据/空占位
+            # （钉住：tests/verify_copy_reserved_sync.py）。
+            if order_number and self._cloud_client and self._cloud_client.is_connected():
+                self._upload_reserved_order(order_number, tab_key)
+        else:
+            order_number = next((str(j.order_number) for j in jobs
+                                 if getattr(j, "order_number", "")), "")
         lines = []
         if order_number:
             lines.append(f"订单号: {order_number}")
@@ -22581,7 +22663,6 @@ class MainWindow(QMainWindow):
                               self._config.simplex_price, self._config.duplex_price,
                               j.page_range, job_simplex_pages(j))[0] for j in jobs)
         # 与界面合计（_update_total_cost）口径一致：附加服务费（派送/加急/首页）
-        tab = self._config.tabs.get(self._current_tab)
         extra = tab.calc_extra_total(total, self._config) if tab else 0.0
         if extra > 0:
             lines.append(f"附加服务费: ¥{extra:.2f}")
@@ -22589,7 +22670,17 @@ class MainWindow(QMainWindow):
         # 「💰合计」同口径）。钉住：tests/verify_copy_reserved_sync.py ③b
         lines.append("-" * 14)
         lines.append(f"💰合计: ¥{total + extra:.2f}")
-        QApplication.clipboard().setText("\n".join(lines))
+        return "\n".join(lines), order_number
+
+    def _on_copy_detail(self):
+        """复制当前标签页的计费明细到剪贴板（含订单号）。无成员时禁止创建订单。"""
+        if not self._has_members():
+            self._show_no_member_hint()
+            return
+        text, _order_number = self._price_detail_text()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
         if self._copy_detail_btn:
             self._copy_detail_btn.setText("✅ 已复制")
             self._copy_detail_btn.setEnabled(False)
