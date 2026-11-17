@@ -960,6 +960,26 @@ class RangeListWidget(QWidget):
             return None
 
 
+def _make_resident_tool_window(dlg: "QDialog") -> None:
+    """把常驻提示窗从「主窗口的被拥有子窗口」改成独立顶层窗（2026-11-17 用户要求）。
+
+    现场问题：翻纸窗、攒批列表原来是 QDialog(parent=MainWindow)。Windows 的 owner 规则是
+    「激活被拥有的窗口 → 系统连带激活并抬升它的 owner」，于是操作员只是想点一下翻纸窗看一眼，
+    藏在后面的主界面就被一起顶到最前（干活时被反复打断）。Qt 里这条关系只由 parent 决定，
+    所以必须在构造时就把 parent 传 None —— setParent(None) 会销毁并重建原生句柄，
+    窗口位置、置顶标志、已设的样式全丢。
+
+    Qt.Tool：不进任务栏、不进 Alt+Tab。用户要的是「两个窗别绑在一起」，不是「主界面旁边多出
+    两个任务栏按钮」。主题是 QApplication 级 QSS（theme_manager._apply），图标同理，
+    去掉 parent 都不受影响。
+
+    ⚠ 代价与配套：① 系统不再负责「子窗永远压在 owner 之上」，改为主窗口激活时 raise 一下
+    （MainWindow._raise_resident_windows）；② 系统不再随 owner 隐藏/销毁它们，退出前要显式
+    收掉（MainWindow._close_resident_windows，否则会留下孤岛窗口、没有托盘时事件循环不退出）。
+    """
+    dlg.setWindowFlag(Qt.Tool, True)
+
+
 class ManualDuplexDialog(QDialog):
     """手动双面**常驻**提示窗（对齐 HP 官方工具：打印一开始就在，而不是打完才弹）。
 
@@ -981,9 +1001,12 @@ class ManualDuplexDialog(QDialog):
     #   （2026-10-20 用户要求：攒批第一趟弹这个窗、还从第一趟就开始计时，完全是复用旧窗导致的误伤）。
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        # 2026-11-17：parent 只为兼容老调用保留，一律丢弃（见 _make_resident_tool_window）：
+        # 只要它还是主窗口的子窗，点它就会把主界面一起抬到最前。
+        super().__init__(None)
         self.setWindowTitle("手动双面打印")
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        _make_resident_tool_window(self)
         self.setMinimumWidth(600)
         self._mode = "idle"
         self._left = 0
@@ -1924,8 +1947,10 @@ class StackQueueDialog(QDialog):
     }
 
     def __init__(self, parent=None):
-        super().__init__(parent)
+        # 2026-11-17：parent 一律丢弃（见 _make_resident_tool_window）。
+        super().__init__(None)
         self.setWindowTitle("🖐 攒批列表")
+        _make_resident_tool_window(self)
         self.setMinimumSize(1180, 520)
         self._stack = None
         self._busy = False
@@ -14850,6 +14875,9 @@ class MainWindow(QMainWindow):
                 self._refresh_owner_names_from_cloud()
             except Exception:
                 pass
+            # 常驻提示窗（翻纸窗 / 攒批列表）已脱离主窗口，系统不再把它们压在 owner 之上
+            # （见 _make_resident_tool_window）：主界面一出来就把它们抬回来。
+            self._raise_resident_windows()
         super().changeEvent(event)
 
     def _owner_refresh_net_thread(self):
@@ -17092,7 +17120,8 @@ class MainWindow(QMainWindow):
     def _ensure_duplex_dialog(self) -> ManualDuplexDialog:
         dlg = getattr(self, "_duplex_dialog", None)
         if dlg is None:
-            dlg = ManualDuplexDialog(self)
+            # 不传 parent：本窗必须是独立顶层窗（见 _make_resident_tool_window）
+            dlg = ManualDuplexDialog()
             dlg.continue_requested.connect(self._on_duplex_continue)
             dlg.skip_requested.connect(self._on_duplex_skip)
             # 纯时间放行（2026-11-09）：闸门到点时若窗口被关了/最小化了，这里把它重新立起来
@@ -17117,11 +17146,70 @@ class MainWindow(QMainWindow):
                 dlg.showNormal()
             else:
                 dlg.show()
+            self._place_resident_window(dlg)
             dlg.raise_()
             dlg.activateWindow()
             QApplication.alert(self, 0)          # 任务栏闪烁，叫回操作员
         except Exception:
             pass
+
+    # ── 脱离主窗口后的三件配套事（见 _make_resident_tool_window）──
+
+    def _place_resident_window(self, dlg):
+        """常驻窗第一次显示时摆到主窗口正中（只摆一次，之后尊重操作员拖到的位置）。
+
+        脱离 owner 后系统不再按父窗口帮我们摆位，不摆的话它会落在屏幕左上角/系统默认位置，
+        看起来像「程序乱弹窗」。主窗口收在托盘里（不可见）时不动它 —— 没有可参照的中心，
+        硬摆反而会把它抖到别的屏幕上。
+        """
+        if getattr(dlg, "_hn_placed", False):
+            return
+        try:
+            if not self.isVisible():
+                return
+            owner_geo = self.frameGeometry()
+            fg = dlg.frameGeometry()
+            dlg.move(owner_geo.center().x() - fg.width() // 2,
+                     owner_geo.center().y() - fg.height() // 2)
+            dlg._hn_placed = True
+        except Exception:
+            pass
+
+    def _raise_resident_windows(self):
+        """主窗口被激活时，把常驻窗抬到主窗口之上（只 raise，不抢焦点）。
+
+        原来是 Windows 的 owner 规则帮我们维持这个层次；脱离之后没人管，主界面一激活就会盖住
+        攒批列表，而它们又是工具窗（没有任务栏按钮），操作员再也点不回来。翻纸窗本身置顶、
+        不受影响；攒批列表靠这里维持「主界面看得见，它也看得见」。
+        """
+        for attr in ("_duplex_dialog", "_stack_queue_dialog"):
+            dlg = getattr(self, attr, None)
+            if dlg is None:
+                continue
+            try:
+                if dlg.isVisible():
+                    dlg.raise_()
+            except (RuntimeError, AttributeError):
+                pass
+
+    def _close_resident_windows(self):
+        """真退出前收掉两个常驻窗（hide + deleteLater，不走 close()）。
+
+        为什么不 close()：ManualDuplexDialog.closeEvent 把「关窗」解释成跳过本任务
+        （_mode ∈ pass1/flip/flip_gate ⇒ 记跳过），退出时绝不能因为收窗口就把一整批纸判成
+        跳过/失败；只 hide 就已经能让「最后一个窗口关闭」成立，剩下交给进程退出。
+        为什么必须收：它们已经不是主窗口的子对象，主窗口关掉不会带走它们 —— 托盘不可用时
+        setQuitOnLastWindowClosed 没被置 False，留一个可见窗口在那儿事件循环就不退（进程僵着）。
+        """
+        for attr in ("_duplex_dialog", "_stack_queue_dialog"):
+            dlg = getattr(self, attr, None)
+            if dlg is None:
+                continue
+            try:
+                dlg.hide()
+                dlg.deleteLater()
+            except (RuntimeError, AttributeError):
+                pass
 
     def _on_duplex_plan(self, sheets: int, estimate_sec: float):
         """批次开始播报「第 1 趟几张纸 / 预计多久」——常驻窗据此计时并按超时变色。"""
@@ -18517,7 +18605,8 @@ class MainWindow(QMainWindow):
     def _ensure_stack_queue_dialog(self) -> StackQueueDialog:
         dlg = getattr(self, "_stack_queue_dialog", None)
         if dlg is None:
-            dlg = StackQueueDialog(self)
+            # 不传 parent：本窗必须是独立顶层窗（见 _make_resident_tool_window）
+            dlg = StackQueueDialog()
             dlg.toggle_requested.connect(self._on_stack_taken_toggle)
             dlg.toggle_many_requested.connect(self._on_stack_taken_toggle_many)
             dlg.start_second_requested.connect(self._on_stack_flush)
@@ -18540,6 +18629,7 @@ class MainWindow(QMainWindow):
                 dlg.showNormal()
             else:
                 dlg.show()
+            self._place_resident_window(dlg)
             if activate:
                 dlg.raise_()
                 dlg.activateWindow()
@@ -22400,6 +22490,9 @@ class MainWindow(QMainWindow):
             self._minimize_to_tray()
             return
         self._closing = True  # 打印启动等待（processEvents）期间检测到关窗 → 中止启动流程
+        # 两个常驻提示窗已不是主窗口的子对象（见 _make_resident_tool_window）：不会随主窗口关闭
+        # 被销毁，必须在这里显式收掉，否则会留下孤岛窗口（没有托盘时事件循环不退出）。
+        self._close_resident_windows()
         # 外部打印监视：退出前停线程 + 关 spooler 通知句柄（别指望进程退出时的隐式清理）
         self._stop_external_watch()
         # 智能助手接口：同理由我们自己关掉（HTTP 线程是 daemon，但端口要立刻放出来）
