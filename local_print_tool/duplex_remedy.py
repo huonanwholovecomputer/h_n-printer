@@ -34,6 +34,7 @@
   stage         pass1_done（第 1 趟已打、第 2 趟未打）| pass2_partial（第 2 趟打了一半失败）
   reason        人话原因（操作员跳过 / 翻纸等待超时 / 第 2 趟失败: …）
   printer / paper / dpi        补打要用同一台打印机、同一种纸、同一 DPI
+  scale_mode / scale_percent   同一套打印缩放（fit / actual / percent），缺省 fit/100
   rotate_mode   per_file（生产路径，逐文件按装订方向）| fixed（整批统一 rotate）
   rotate        rotate_mode=fixed 时的固定值
   first / reverse_second / second_rotate_180 / landscape_fill   档案参数（页序/补偿唯一来源）
@@ -59,6 +60,8 @@ from typing import Any
 
 import manual_duplex
 import paths as _paths
+# 缩放的词表/收敛只有 pdf_printer 一份（补打与第一趟必须同口径，别在这里另写一套）
+import pdf_printer
 
 VERSION = 1
 MANIFEST_NAME = "duplex_pending.json"
@@ -216,6 +219,7 @@ def _normalize(raw) -> dict | None:
             items.append(n)
         if len(items) >= MAX_ITEMS:
             break
+    _sc = pdf_printer.normalize_scale(raw.get("scale_mode"), raw.get("scale_percent"))
     rec = {
         "version": VERSION,
         "id": rid,
@@ -227,6 +231,10 @@ def _normalize(raw) -> dict | None:
         "printer": _as_str(raw.get("printer")),
         "paper": _as_str(raw.get("paper")),
         "dpi": _as_int(raw.get("dpi"), 0),
+        # 打印缩放：补打/重打必须与第 1 趟同口径，否则一张纸正反面物理尺度不一致。
+        # 缺键/坏值收敛成 fit/100（= 旧记录的语义）。
+        "scale_mode": _sc[0],
+        "scale_percent": _sc[1],
         "rotate_mode": (_as_str(raw.get("rotate_mode"), ROTATE_PER_FILE)
                         if _as_str(raw.get("rotate_mode")) in (ROTATE_PER_FILE, ROTATE_FIXED)
                         else ROTATE_PER_FILE),
@@ -546,6 +554,8 @@ def file_plans_to_dicts(file_plans) -> list[dict]:
 
 
 def make_record(*, stage: str, reason: str, printer: str, paper: str = "", dpi: int = 0,
+                scale_mode: str = pdf_printer.SCALE_FIT,
+                scale_percent: int = pdf_printer.SCALE_PERCENT_DEFAULT,
                 rotate_mode: str = ROTATE_PER_FILE, rotate: bool = False,
                 first: str = manual_duplex.FIRST_ODD, reverse_second: bool = True,
                 second_rotate_180: bool = True, landscape_fill: bool = True,
@@ -554,7 +564,10 @@ def make_record(*, stage: str, reason: str, printer: str, paper: str = "", dpi: 
     """构造一条记录（不落盘；落盘用 add()）。
 
     items 里每项应带 tab_key，补打成功后主界面据此把 job 找回来收尾。
+    scale_mode / scale_percent：这一批当时用的打印缩放 —— 补打/重打必须原样复现
+      （一张纸的正面 actual、背面 fit 会一大一小，肉眼就看得出）。
     """
+    _sc = pdf_printer.normalize_scale(scale_mode, scale_percent)
     return {
         "version": VERSION,
         "id": "",
@@ -566,6 +579,8 @@ def make_record(*, stage: str, reason: str, printer: str, paper: str = "", dpi: 
         "printer": _as_str(printer),
         "paper": _as_str(paper),
         "dpi": _as_int(dpi, 0),
+        "scale_mode": _sc[0],
+        "scale_percent": _sc[1],
         "rotate_mode": (rotate_mode if rotate_mode in (ROTATE_PER_FILE, ROTATE_FIXED)
                         else ROTATE_PER_FILE),
         "rotate": bool(rotate),
@@ -641,7 +656,8 @@ def describe(rec: dict) -> str:
     lines = [
         f"【{stage_label(rec)}】{_as_str(rec.get('created_at'))}",
         f"打印机：{_as_str(rec.get('printer')) or '(未知)'}"
-        f"    纸张：{_as_str(rec.get('paper')) or '打印机默认'}",
+        f"    纸张：{_as_str(rec.get('paper')) or '打印机默认'}"
+        f"    缩放：{pdf_printer.describe_scale(rec.get('scale_mode'), rec.get('scale_percent'))}",
         f"本批 {sheets} 张纸"
         + (f"（出纸槽里当时还压着 {foreign} 张别的纸，不在本批里）" if foreign > 0 else ""),
     ]

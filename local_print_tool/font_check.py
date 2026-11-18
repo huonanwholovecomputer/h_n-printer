@@ -304,6 +304,39 @@ def is_installed(name: str) -> bool:
     return not _missing_key(_norm(name))
 
 
+# 扩展区专用族（SimSun-ExtB 之类）：只有扩展 B 区字形，system_fonts 明确拒收（见其文件头）
+_EXT_ONLY_TOKENS = frozenset({"exta", "extb", "extc", "extd", "extg", "ext"})
+
+
+def _name_tokens(name: str) -> list[str]:
+    """字体名 → 小写 token（剥离 PS 厂商/样式后缀前先看词：`STSong-Light-UniGB` → stsong/light/unigb）。"""
+    return [t for t in re.split(r"[^0-9a-z\u4e00-\u9fff]+", _norm(name)) if t]
+
+
+def uses_system_glyphs(name: str) -> bool:
+    """「PDF 没嵌字形」时，这个字体打印会不会真的用**本机装的字形**渲染？
+
+    口径来自 system_fonts.py：它只给 MuPDF 装了 **CJK** 回调（拉丁字体不做替换，排版风险大、
+    收益小）。于是「文件没带字形」这一条分两种下场：
+
+      · True  —— 中文/日韩族名：本机装了同名族就用本机字形渲染，纸面与原件一致；
+      · False —— 拉丁族名（Times New Roman / Arial / Courier…）：一律走 MuPDF 内置等价字形，
+                 本机装没装都改不了纸面（只差笔画细节），页数/分页/位置不变。
+
+    只用于文案与「要不要让用户去补字体」的判断，不影响打印本身。2026-11-18 现场：用户把
+    Times/Arial 全装齐了，详情窗却仍把「打印时用系统字形渲染」贴在这几个西文名后面，
+    还跟着四步「怎么补字体」，看起来像"装了却没替换"。
+    """
+    toks = _name_tokens(name)
+    if not toks:
+        return False
+    if any(t in _EXT_ONLY_TOKENS for t in toks):
+        return False            # 扩展区族：system_fonts 不接管，退回内置兜底
+    if any(t in _ALIAS for t in toks):
+        return True
+    return any("\u4e00" <= ch <= "\u9fff" for ch in "".join(toks))
+
+
 def _is_word_cloud(key: str) -> bool:
     """Word 自带（云端/私有）字族：系统字体表里查不到，但 Word 一定拿得到（见 _WORD_CLOUD_FAMILIES）。"""
     return any(key == p or key.startswith(p) for p in _WORD_CLOUD_FAMILIES)

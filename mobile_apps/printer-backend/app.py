@@ -9690,6 +9690,21 @@ def submit_order():
           f"schedule_mode={schedule_mode}, scheduled_at={scheduled_at}, "
           f"is_admin_print={admin_print}, owner_name={owner_name!r}")
 
+    # 诊断（2026-11-18 订单 HN20261118-0017 排查后加）：逐文件回显「页码范围 / 单独打印页」。
+    # 顾客报了「封面单独打印开了却没生效」，而全库 simplex_pages 从来没出现过非空值 ——
+    # 有这一行就能一眼分清是「客户端根本没送」还是「后端收到了却丢了」。
+    # 只打这两个字段（都不含隐私），最多 MAX_ORDER_FILES=20 项。
+    if sub_tasks:
+        _diag = " | ".join(
+            "%s:range=%r,simplex=%r" % (
+                st.get("file_name") or st.get("file_id"),
+                st.get("page_range", ""),
+                st.get("simplex_pages", ""),
+            )
+            for st in sub_tasks
+        )
+        print("  [SUBMIT-FILES] " + _diag)
+
     # S2-02：响应体保护 —— 子任务列表超过 MAX_ECHO_FILES 条时只回前 N 条 + 汇总
     # （现在入口上限是 MAX_ORDER_FILES=20，正常永远不触发；留着是为了将来放宽上限时
     #  不会把一个 MB 级的列表一次回显出去）。

@@ -149,6 +149,21 @@ check("子集前缀 ABCDEF+ 被剥掉",
       font_check._norm("ABCDEF+SimSun"))
 check("空格与竖排 @ 被清掉",
       font_check._norm("@Microsoft  YaHei") == font_check._norm("Microsoft YaHei"))
+# 2026-11-18：文件没嵌字形时分两种下场 —— 中文族名用系统字形，西文一律内置等价字形
+# （system_fonts 只给 MuPDF 装了 CJK 回调）。这条判据供 gui 的文案分派使用。
+check("uses_system_glyphs：西文族名（含 PS 名）不做系统字形替换",
+      font_check.uses_system_glyphs("TimesNewRomanPS-BoldMT") is False
+      and font_check.uses_system_glyphs("Arial-BoldMT") is False
+      and font_check.uses_system_glyphs("ArialMT") is False)
+check("uses_system_glyphs：中文/日韩族名（含 PS 变体）走系统字形",
+      font_check.uses_system_glyphs("SimSun") is True
+      and font_check.uses_system_glyphs("STSong-Light-UniGB-UCS2-H") is True
+      and font_check.uses_system_glyphs("Microsoft YaHei") is True)
+check("uses_system_glyphs：扩展区专用族退回内置兜底",
+      font_check.uses_system_glyphs("SimSun-ExtB") is False)
+check("uses_system_glyphs：空名/垃圾名不判成系统字形",
+      font_check.uses_system_glyphs("") is False
+      and font_check.uses_system_glyphs("F1") is False)
 
 print("② 误报过滤：主题引用 / 匿名资源名 / 语言标签 / 占位符")
 for junk in ("+mn-lt", "+mj-ea", "F1", "C2_0", "TT0", "zh-CN", "en-US", "", "-"):
@@ -483,8 +498,10 @@ if _has_gui:
           and "本机没装这些字体" in _tip_both, _tip_both[:240])
     check("tooltip 点名了两个字体名",
           "STSong-Light" in _tip_both and "测试缺字体XY" in _tip_both, _tip_both[:240])
-    check("未嵌入那段说明「装了就用它渲染」并把重新导出列为最稳出路",
-          "本机装了这个字体 ⇒ 打印时自动用它渲染" in _tip_both
+    # 2026-11-18：中文/日韩族名才「装了就用它渲染」，西文一律内置等价字形 ——
+    # 文案分派只有 font_check.uses_system_glyphs 一处，断言用模块常量别写死整句。
+    check("未嵌入那段说明「本机装了就照常渲染」并把重新导出列为最稳出路",
+          gui.FONT_NOTE_SYSTEM_GLYPH in _tip_both
           and "重新导出「嵌入字体」的 PDF" in _tip_both)
     # 2026-11-02：出路从「重新添加这个文件」改成右键「🔄 重新转换」——
     # 因为重加文件走的是同一份转换缓存 + 同一份进程内字体缓存，
@@ -501,7 +518,24 @@ if _has_gui:
     _tip_ne = "\n\n".join(_Stub()._font_tip_blocks(_ne_only))
     check("只有未嵌入时，tooltip 不出现「本机没装」误诊",
           "本机没装这些字体" not in _tip_ne
-          and "本机装了这个字体 ⇒ 打印时自动用它渲染" in _tip_ne, _tip_ne[:240])
+          and gui.FONT_NOTE_SYSTEM_GLYPH in _tip_ne, _tip_ne[:240])
+    # 2026-11-18 现场：装好 SimSun 后行 tooltip 照旧说「没装 ⇒ 用内置字形代替」，
+    # 用户以为装了个寂寞。逐个名字标出本机装没装，全都装了就用 ℹ 抬头。
+    _tip_ne_ok = "\n\n".join(_Stub()._font_tip_blocks(
+        printer_config.PrintJob(file_path=ne_pdf, copies=1, nonembedded_fonts=["Arial"])))
+    check("未嵌入但本机已装 ⇒ 抬头是 ℹ，并说清「这不是本机没装」",
+          "ℹ" in _tip_ne_ok and "这不是「本机没装」" in _tip_ne_ok, _tip_ne_ok[:200])
+    check("未嵌入但本机已装 ⇒ 点名那个字体并标「本机已装」",
+          "· Arial（本机已装" in _tip_ne_ok, _tip_ne_ok[:200])
+    check("未嵌入但本机已装 ⇒ 西文按内置等价字形说（不说系统字形）",
+          gui.FONT_NOTE_BUILTIN_GLYPH in _tip_ne_ok
+          and gui.FONT_NOTE_SYSTEM_GLYPH not in _tip_ne_ok, _tip_ne_ok[:260])
+    check("未嵌入但本机已装 ⇒ 明确说不用再装一遍",
+          "不用再装一遍" in _tip_ne_ok, _tip_ne_ok[:240])
+    _tip_ne_no = "\n\n".join(_Stub()._font_tip_blocks(
+        printer_config.PrintJob(file_path=ne_pdf, copies=1, nonembedded_fonts=["假字体族XY"])))
+    check("未嵌入且本机没装 ⇒ 仍用 ⚠ 并逐个标「本机也没装」",
+          "⚠" in _tip_ne_no and "本机也没装" in _tip_ne_no, _tip_ne_no[:200])
     _tip_miss = "\n\n".join(_Stub()._font_tip_blocks(
         printer_config.PrintJob(file_path=docx, copies=1, missing_fonts=["测试缺字体XY"])))
     check("只有本机没装时，tooltip 不出现「没嵌入」误诊",
@@ -520,6 +554,8 @@ if _has_gui:
     _auto_sites = _src.count("interactive=False")
     check("自动打印线都传了 interactive=False（≥4 处）", _auto_sites >= 4, str(_auto_sites))
     check("_fill_table_row 里有缺字体标黄分支", 'name_item.setText(f"⚠️ {display}")' in _src)
+    check("只差「文件没带字形」而本机字体都装了 ⇒ 不标黄不加标记（说明只留在 tooltip）",
+          "_ne_all_ok" in _src and "name_item.setText(display)" in _src)
     check("行 tooltip 走 _font_tip_blocks（文案只留一份，别内联复制）",
           "join(self._font_tip_blocks(job))" in _src)
     check("启动时会初始化字体检测", "self._init_font_check()" in _src)

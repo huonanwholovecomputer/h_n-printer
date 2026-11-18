@@ -94,10 +94,66 @@ MONO_THRESHOLD = 136               # 8bit 灰度 → 1bit 的硬阈值（< 阈�
 # 页面含非纯黑内容（图片/灰底纹/彩字）时整页改抖动：阈值会把浅灰内容抹成白色（见 _page_needs_dither）
 
 
+# ── 打印缩放（2026-11-18）──
+#
+# 口径对齐 Windows 打印对话框的「缩放(%)」三段，都是**物理尺寸**的事（与渲染 DPI 无关）：
+#   · fit     = 调整为可打印区域大小：内容超出可打印区才缩，小页面**不放大**（默认值 = 旧行为）
+#   · actual  = 实际大小：按 100% 物理尺寸贴图，超出可打印区的部分居中裁掉
+#   · percent = 自定义百分比：物理尺寸 × p%，同样居中、超出裁掉
+#
+# ⚠ 与「默认任务参数」里表格（xlsx）的 scale/fit 不是一回事：那里是 Excel 自己的版式缩放
+#   （PageSetup.Zoom / FitToPagesWide），走 COM 不走这条光栅管线，别把两套混在一起。
+SCALE_FIT = "fit"
+SCALE_ACTUAL = "actual"
+SCALE_PERCENT = "percent"
+SCALE_MODES = (SCALE_FIT, SCALE_ACTUAL, SCALE_PERCENT)
+SCALE_PERCENT_MIN = 10
+SCALE_PERCENT_MAX = 400
+SCALE_PERCENT_DEFAULT = 100
+
+
+def normalize_scale(mode, percent) -> tuple[str, int]:
+    """把 (模式, 百分比) 收敛成合法二元组。未知模式回落 fit；百分比夹在 10–400。"""
+    _m = str(mode or "").strip().lower()
+    if _m not in SCALE_MODES:
+        _m = SCALE_FIT
+    try:
+        _p = int(round(float(percent)))
+    except (TypeError, ValueError):
+        _p = SCALE_PERCENT_DEFAULT
+    if _p < SCALE_PERCENT_MIN:
+        _p = SCALE_PERCENT_MIN
+    if _p > SCALE_PERCENT_MAX:
+        _p = SCALE_PERCENT_MAX
+    return _m, _p
+
+
+def scale_factor(mode, percent) -> Optional[float]:
+    """给定模式的固定倍率；fit 返回 None（倍率取决于页面与可打印区，由 plan_page_raster 算）。"""
+    _m, _p = normalize_scale(mode, percent)
+    if _m == SCALE_ACTUAL:
+        return 1.0
+    if _m == SCALE_PERCENT:
+        return _p / 100.0
+    return None
+
+
+def describe_scale(mode, percent) -> str:
+    """给人看的缩放说明（日志 / 界面）。⚠ 不许出现 Markdown 星号。"""
+    _m, _p = normalize_scale(mode, percent)
+    if _m == SCALE_ACTUAL:
+        return "实际大小（100%）"
+    if _m == SCALE_PERCENT:
+        return f"自定义缩放 {_p}%"
+    return "调整为可打印区域大小"
+
+
 def plan_page_raster(page_w_pts: float, page_h_pts: float,
                      native_dpi_x: float, native_dpi_y: float,
                      printable_w: int, printable_h: int,
-                     dpi_cap: int = 0, pixel_limit: int = 0) -> tuple[int, int, int, int, bool]:
+                     dpi_cap: int = 0, pixel_limit: int = 0,
+                     scale_mode: str = SCALE_FIT,
+                     scale_percent: int = SCALE_PERCENT_DEFAULT) -> tuple[int, int, int, int, bool]:
     """纯逻辑：算一页的「目标设备尺寸」与「实际渲染尺寸」（离线可验收，不碰打印机）。
 
     返回 (draw_w, draw_h, render_w, render_h, capped)
@@ -105,6 +161,10 @@ def plan_page_raster(page_w_pts: float, page_h_pts: float,
                    贴图按这个矩形画，保证物理尺寸与渲染 DPI 无关；
       · render_* = 实际让 MuPDF 渲染的位图尺寸；默认 == draw_* ⇒ 1:1、零重采样；
       · capped   = 是否因 dpi_cap / pixel_limit 降了分辨率（此时 GDI 会放大一次，属主动取舍）。
+
+    scale_mode / scale_percent 决定「物理尺寸倍率」（见 SCALE_FIT 注释）：
+    fit 时只缩不放（旧行为）；actual / percent 可以**大于**可打印区 ⇒ draw_* 超过
+    printable_*，由调用方居中贴图、GDI 自动裁掉两侧（负坐标裁剪）。
     """
     dev_w = page_w_pts * native_dpi_x / 72.0
     dev_h = page_h_pts * native_dpi_y / 72.0
@@ -112,9 +172,11 @@ def plan_page_raster(page_w_pts: float, page_h_pts: float,
     if printable_w <= 0 or printable_h <= 0:
         printable_w = max(1, int(round(dev_w)))
         printable_h = max(1, int(round(dev_h)))
-    fit = min(1.0, printable_w / max(1.0, dev_w), printable_h / max(1.0, dev_h))
-    draw_w = max(1, int(round(dev_w * fit)))
-    draw_h = max(1, int(round(dev_h * fit)))
+    factor = scale_factor(scale_mode, scale_percent)
+    if factor is None:      # fit：内容超出可打印区才缩，小页面保持原尺寸
+        factor = min(1.0, printable_w / max(1.0, dev_w), printable_h / max(1.0, dev_h))
+    draw_w = max(1, int(round(dev_w * factor)))
+    draw_h = max(1, int(round(dev_h * factor)))
 
     render_w, render_h = draw_w, draw_h
     capped = False
@@ -143,7 +205,9 @@ def plan_page_draw(page_w_pts: float, page_h_pts: float,
                    native_dpi_x: float, native_dpi_y: float,
                    printable_w: int, printable_h: int,
                    dpi_cap: int = 0, pixel_limit: int = 0,
-                   landscape_fill: bool = True) -> tuple[int, int, int, int, int, bool]:
+                   landscape_fill: bool = True,
+                   scale_mode: str = SCALE_FIT,
+                   scale_percent: int = SCALE_PERCENT_DEFAULT) -> tuple[int, int, int, int, int, bool]:
     """一页该怎么摆到纸上：要不要**整页转 90°**，以及转完之后的绘制/渲染尺寸。
 
     返回 (angle, draw_w, draw_h, render_w, render_h, capped)。
@@ -171,6 +235,7 @@ def plan_page_draw(page_w_pts: float, page_h_pts: float,
     draw_w, draw_h, render_w, render_h, capped = plan_page_raster(
         eff_w, eff_h, native_dpi_x, native_dpi_y, printable_w, printable_h,
         dpi_cap=dpi_cap, pixel_limit=pixel_limit,
+        scale_mode=scale_mode, scale_percent=scale_percent,
     )
     return angle, draw_w, draw_h, render_w, render_h, capped
 
@@ -462,6 +527,118 @@ BLANK_FURNITURE_MAX_INK = 0.01       # 只剩家具时整页墨量上限（A4@72
 # 墨量判据：正文区只要有一行字 / 一条表格框线（p6 实测 2169 px），就绝不是空白。
 BLANK_FURNITURE_BODY_MAX_INK = 0.0002  # A4@72dpi ≈ 100 px（另与 40 px 绝对下限取大）
 
+# 2026-11-18 现场（WPS 的 .doc）：页码是一个**放在页脚位置的独立文本框**，字号 14pt，
+# 导出后文字 bbox 是 y 762.8~776.8，而 A4 的下家具带从 774.6 开始 ⇒ 只有 2.2pt 压在
+# 版心线下面就被判成"正文"，整页于是算有内容（末尾那张只有「— 2 —」的白纸照样打出来）。
+# 判据不能为它整体放宽（那会重新踩 2026-11-01 标题被当页眉的坑），只对**看起来就是页码**
+# 的文字给一点越界余量：含阿拉伯数字/罗马数字，且除数字与页码常见装饰（— - / 第 页 共）
+# 外没有任何文字。正文里的标题/句子一律不含规整的页码特征 ⇒ 仍严格按带边界判。
+BLANK_FURNITURE_PAGENO_PAD = 0.02    # 页码文本框允许探出家具带 2% 页高（A4 ≈ 16.8 pt）
+BLANK_FURNITURE_PAGENO_MAX_LEN = 20  # 页码串最长这么多字符（「第 12 页 共 30 页」= 10）
+
+# 页码里允许出现的字符：数字、罗马数字、常见分隔与中文页码词
+_PAGENO_ALLOWED = set("0123456789-—–－_·.、,，:：;；/\\|()（）[]【】第页共ofIVXivx ")
+
+
+def _looks_like_page_number(text: str) -> bool:
+    """这串文字像不像"页码"（「12」/「— 2 —」/「第 6 页」/「12 / 30」）。
+
+    只用来决定**要不要给越界余量**，不是"空白的判据"：真正的判定仍看墨量与家具
+    （见 page_is_blank）。判据刻意窄 —— 必须含数字，且除数字与页码装饰外没有别的字；
+    「2.思考题（课后完成）」这种带汉字的标题一律不算页码（汉字不在允许集里）。
+    """
+    t = "".join(ch for ch in str(text or "") if not ch.isspace())
+    if not t or len(t) > BLANK_FURNITURE_PAGENO_MAX_LEN:
+        return False
+    if not any(ch.isdigit() for ch in t):
+        return False
+    # 连着的点/破折号 = 目录点线（「…… 12」）或装饰线，不是页码；页码装饰都是单字符。
+    for a, b in zip(t, t[1:]):
+        if a == b and a in ".·…_—-–－":
+            return False
+    return all(ch in _PAGENO_ALLOWED for ch in t)
+
+
+def page_text_is_page_number_only(page) -> bool:
+    """整页非空文字是否只有页码（供放宽家具带边界时用）。读不出来一律 False。
+
+    按**整页拼接**判（WPS 的页码会被拆成「—」「 2 」「—」三个 span，逐 span 判会因为
+    单独的破折号没有数字而失败）。
+    """
+    try:
+        pagedict = page.get_text("dict")
+    except Exception:
+        return False
+    parts = []
+    for block in pagedict.get("blocks", []) or []:
+        for line in block.get("lines", []) or []:
+            for span in line.get("spans", []) or []:
+                text = str(span.get("text", "")).strip()
+                if text:
+                    parts.append(text)
+    if not parts:
+        return False
+    return _looks_like_page_number(" ".join(parts))
+
+
+def _furniture_band_scan(page) -> tuple[bool, float]:
+    """家具带扫描：返回 (文字是否只有家具, 需要给正文区墨量放宽的页高比例)。
+
+    规则（2026-11-18 起）：
+    · 每个非空 span 要么**完整落在**上下家具带内 —— 直接算家具；
+    · 要么落在带边界外 pad（BLANK_FURNITURE_PAGENO_PAD）以内 —— 只有**该侧带内的
+      全部文字拼起来像页码**时才放行（WPS 把「— 2 —」拆成三个 span，逐 span 判会因为
+      单独的破折号没有数字而失败；页眉 + 页码并存的申请表模板则是常见形态）；
+    · 其余（压进版心、正文区）⇒ 有内容。
+
+    读不出来 / 有图片块 ⇒ (False, 0.0)，按"有内容"处理（fail-open，绝不误排真内容）。
+    """
+    try:
+        pagedict = page.get_text("dict")
+        height = float(page.rect.height) or 1.0
+    except Exception:
+        return False, 0.0
+    band = BLANK_FURNITURE_BAND * height
+    pad = BLANK_FURNITURE_PAGENO_PAD * height
+    top_text, bottom_text = [], []
+    top_cross = bottom_cross = False
+    total = 0
+    for block in pagedict.get("blocks", []) or []:
+        if block.get("type", 0) != 0:
+            return False, 0.0           # 图片块：交给墨量判据，这里不当作家具
+        for line in block.get("lines", []) or []:
+            for span in line.get("spans", []) or []:
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
+                bbox = span.get("bbox") or (0, 0, 0, 0)
+                try:
+                    y0, y1 = float(bbox[1]), float(bbox[3])
+                except Exception:
+                    return False, 0.0
+                if y1 <= band:
+                    top_text.append(text)
+                elif y0 >= height - band:
+                    bottom_text.append(text)
+                elif y1 <= band + pad:
+                    top_text.append(text)
+                    top_cross = True
+                elif y0 >= height - band - pad:
+                    bottom_text.append(text)
+                    bottom_cross = True
+                else:
+                    return False, 0.0   # 压到版心/正文区 ⇒ 有内容
+                if len(text) > BLANK_FURNITURE_MAX_LINE_CHARS:
+                    return False, 0.0   # 带上出现一整段文字 ⇒ 当正文
+                total += len(text)
+                if total > BLANK_FURNITURE_MAX_CHARS:
+                    return False, 0.0
+    if top_cross and not _looks_like_page_number("".join(top_text)):
+        return False, 0.0
+    if bottom_cross and not _looks_like_page_number("".join(bottom_text)):
+        return False, 0.0
+    return True, (BLANK_FURNITURE_PAGENO_PAD if (top_cross or bottom_cross) else 0.0)
+
 
 def page_text_is_furniture(page) -> bool:
     """页面上的文字是否只有"家具"（页码 / 页眉 / 页脚），没有正文。
@@ -474,48 +651,30 @@ def page_text_is_furniture(page) -> bool:
     即要求文字**完全落在正文区**才算内容；于是紧贴版心的标题（y0 已在顶部带内、y1 只超出
     band 2.8 pt）被当成页眉，整页判成空白。现改为要求文字**完全落在带内**才算家具，
     跨带边界一律算正文 —— 空白页上的页码/页眉本来也不会压到版心线上。
+
+    2026-11-18 唯一的例外：**页码样**的文字允许探出带外 BLANK_FURNITURE_PAGENO_PAD
+    （WPS 把页码放在页脚文本框里，导出后压进版心 2.2 pt）。余量按"带内那一侧的文字整体
+    看起来是页码"给，带汉字的标题/正文不受影响（详见 _furniture_band_scan）。
     """
-    try:
-        pagedict = page.get_text("dict")
-        height = float(page.rect.height) or 1.0
-    except Exception:
-        return False
-    band = BLANK_FURNITURE_BAND * height
-    total = 0
-    for block in pagedict.get("blocks", []) or []:
-        if block.get("type", 0) != 0:
-            return False                 # 图片块：交给墨量判据，这里不当作家具
-        for line in block.get("lines", []) or []:
-            for span in line.get("spans", []) or []:
-                text = str(span.get("text", "")).strip()
-                if not text:
-                    continue
-                bbox = span.get("bbox") or (0, 0, 0, 0)
-                try:
-                    y0, y1 = float(bbox[1]), float(bbox[3])
-                except Exception:
-                    return False
-                if not (y1 <= band or y0 >= height - band):
-                    return False         # 不在任何家具带内（压到版心/正文区）⇒ 有内容
-                if len(text) > BLANK_FURNITURE_MAX_LINE_CHARS:
-                    return False         # 带上出现一整段文字 ⇒ 当正文
-                total += len(text)
-                if total > BLANK_FURNITURE_MAX_CHARS:
-                    return False
-    return True
+    ok, _pad = _furniture_band_scan(page)
+    return ok
 
 
-def _body_ink(data, width: int, height: int, dark_max: int = 245) -> int:
+def _body_ink(data, width: int, height: int, dark_max: int = 245,
+              pad_ratio: float = 0.0) -> int:
     """72dpi 灰度栅格里"正文区"（上下家具带以外）的暗像素数。
 
-    家具带按页高比例算，与 page_text_is_furniture 同一口径（BLANK_FURNITURE_BAND）。
-    栅格按行存储（行索引 = y），所以只取中间那一段行做统计，带内整行跳过。
-    统计失败一律返回极大值 ⇒ 调用方判"有内容"（fail-open，绝不误排真内容）。
+    家具带按页高比例算，与 page_text_is_furniture 同一口径（BLANK_FURNITURE_BAND）；
+    `pad_ratio` 是额外放宽量（只有 _furniture_band_scan 判出"带内那一侧的文字像页码"时
+    调用方才会给，见 page_is_blank）。栅格按行存储（行索引 = y），所以只取中间那一段行
+    做统计，带内整行跳过。统计失败一律返回极大值 ⇒ 调用方判"有内容"
+    （fail-open，绝不误排真内容）。
     """
     try:
         if not data or width <= 0 or height <= 0:
             return 1 << 30
-        band_rows = int(round(BLANK_FURNITURE_BAND * height))
+        ratio = BLANK_FURNITURE_BAND + max(0.0, float(pad_ratio or 0.0))
+        band_rows = int(round(ratio * height))
         band_rows = max(0, min(band_rows, height // 2))
         start, end = band_rows * width, (height - band_rows) * width
         if start >= end:
@@ -559,6 +718,10 @@ def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
       离"最空内容页 1.89%"仍有 10 倍余量。
     2026-11-01 追加正文区墨量口径（修现场误判）：示波器的使用.pdf 第 6 页整页墨量
       0.786%（家具上限内）、正文区 2169 px（正文区上限 251 px 的 8.6 倍）⇒ 判为有内容。
+    2026-11-18 现场（WPS 的 .doc，页码是页脚里的独立文本框）：页码 bbox 只探出家具带
+      2.2 pt，旧的"必须完整落在带内"判据把它当正文 ⇒ 末页白纸照样打。现在带内那一侧的
+      文字拼起来像页码时，允许探出 BLANK_FURNITURE_PAGENO_PAD（2% 页高）；正文区墨量也
+      按放宽后的带算。带汉字的标题/句子不享受这个余量（仍由上面两条判据兜住）。
     """
     try:
         has_text = bool(page.get_text("text").strip())
@@ -579,8 +742,11 @@ def page_is_blank(page, max_ink: float = BLANK_PAGE_MAX_INK) -> bool:
         return dark <= max(float(BLANK_PAGE_MIN_INK_PX), float(max_ink) * len(data))
     if dark > float(BLANK_FURNITURE_MAX_INK) * len(data):
         return False            # 字只有几个，但墨量不小（大图/粗框/整页底纹）⇒ 有内容
+    # 页码文本框可能压进版心一点点（2026-11-18 WPS 现场）：带内那一侧的文字看着是页码时，
+    # 正文区按放宽后的带统计；真标题/正文照样会被算成正文区有墨（见 _furniture_band_scan）。
+    _ok, pad_ratio = _furniture_band_scan(page)
     body_ink = _body_ink(data, int(getattr(pix, "width", 0) or 0),
-                         int(getattr(pix, "height", 0) or 0))
+                         int(getattr(pix, "height", 0) or 0), pad_ratio=pad_ratio)
     if body_ink > max(float(BLANK_PAGE_MIN_INK_PX),
                       float(BLANK_FURNITURE_BODY_MAX_INK) * len(data)):
         # 正文区有墨（一行字 / 表格框线 / 插图）⇒ 有内容。压在版心线上的标题只有这条
@@ -1239,6 +1405,8 @@ def print_pdf(
     rotate_slots: Optional[list[bool]] = None,
     landscape_fill: bool = True,
     paper: str = "",
+    scale_mode: str = SCALE_FIT,
+    scale_percent: int = SCALE_PERCENT_DEFAULT,
 ) -> tuple[bool, str]:
     """
     静默打印 PDF 文件。
@@ -1268,6 +1436,9 @@ def print_pdf(
                     等所有经 pdf_printer 出纸的路径都受它约束；xlsx 另有 PageSetup.PaperSize
                     由引擎侧设置，两处取值口径一致。SumatraPDF 降级路径无法设置纸张，
                     会在日志里明确声明"纸张设置未生效"。
+        scale_mode: 打印缩放模式 "fit"（调整为可打印区域大小，默认；只缩不放）|
+                    "actual"（实际大小 100%）| "percent"（自定义百分比）。见 SCALE_FIT 注释。
+        scale_percent: 自定义百分比 10–400（仅 scale_mode="percent" 时生效）。
 
     Returns:
         (success, message)
@@ -1304,8 +1475,12 @@ def print_pdf(
     print(f"[打印] 文件: {os.path.basename(pdf_path)}")
     print(f"[打印] 参数: {duplex_label} | {copies} 份 | 页码: '{page_range or '全部'}'" +
           (f" | 方向: {orient_label}" if orient_label else ""))
+    scale_mode, scale_percent = normalize_scale(scale_mode, scale_percent)
+    if (scale_mode, scale_percent) != (SCALE_FIT, SCALE_PERCENT_DEFAULT):
+        print(f"[打印] 缩放: {describe_scale(scale_mode, scale_percent)}")
     logger.info(f"开始打印: pdf={pdf_path}, printer={printer_name or '(默认)'}, "
-                f"duplex={duplex}/{duplex_mode}, copies={copies}, pages='{page_range}', orientation='{orientation}'")
+                f"duplex={duplex}/{duplex_mode}, copies={copies}, pages='{page_range}', orientation='{orientation}', "
+                f"scale={scale_mode}/{scale_percent}%")
 
     # ── 请求双面时先核一遍打印机能力（防"静默打成单面却报成功"）──
     # 依据：实测无自动双面的驱动会把 DEVMODE 的 Duplex 改回 1(SIMPLEX)，此时任何策略
@@ -1340,7 +1515,8 @@ def print_pdf(
         print("[打印] 方案1: 尝试 Windows 原生 GDI 打印...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range,
                                     copies, orientation, progress_callback, dpi, pages_override,
-                                    rotate_180, rotate_slots, landscape_fill, paper)
+                                    rotate_180, rotate_slots, landscape_fill, paper,
+                                    scale_mode, scale_percent)
         if ok:
             print(f"[打印] ✓ 成功 ({msg})")
             return True, msg
@@ -1375,6 +1551,11 @@ def print_pdf(
                 logger.warning(f"SumatraPDF 降级：纸张大小 {paper} 未生效（Sumatra 命令行不支持设定纸张，"
                                f"只能按 PDF 页面尺寸走驱动默认纸）")
                 print(f"[打印] ⚠ SumatraPDF 无法设置纸张（{paper}），本次按打印机默认纸输出")
+            if scale_mode != SCALE_FIT:
+                logger.warning(f"SumatraPDF 降级：打印缩放 {describe_scale(scale_mode, scale_percent)} 未生效"
+                               f"（Sumatra 命令行不认缩放倍率，只能按 PDF 原始页面尺寸出纸）")
+                print(f"[打印] ⚠ SumatraPDF 无法应用缩放"
+                      f"（{describe_scale(scale_mode, scale_percent)}），本次按原始页面尺寸输出")
             ok, msg = _print_via_sumatra(sumatra, pdf_path, printer_name, duplex, duplex_mode, page_range, copies, orientation, progress_callback)
             if ok:
                 print(f"[打印] ✓ 成功 ({msg})")
@@ -1386,7 +1567,8 @@ def print_pdf(
         print("[打印] 方案3: 应用层循环打印（兜底）...")
         ok, msg = _print_via_loop(pdf_path, printer_name, duplex, duplex_mode, page_range, copies,
                                   orientation, progress_callback, dpi, pages_override, rotate_180,
-                                  rotate_slots, landscape_fill, paper)
+                                  rotate_slots, landscape_fill, paper,
+                                  scale_mode, scale_percent)
         print(f"[打印] {'✓ 成功' if ok else '✗ 失败'} ({msg})")
         return ok, msg
     else:
@@ -1407,6 +1589,8 @@ def print_plan_pass(
     dpi: int = 0,
     landscape_fill: bool = True,
     paper: str = "",
+    scale_mode: str = SCALE_FIT,
+    scale_percent: int = SCALE_PERCENT_DEFAULT,
 ) -> tuple[bool, str]:
     """按 manual_duplex.PrintPlan 打印第 which 趟（1/2）。
 
@@ -1424,6 +1608,8 @@ def print_plan_pass(
       可以混排，不必再拆成两批各翻一次纸。
     landscape_fill：横向页整页转 90° 铺满纸张（见 plan_page_draw），随打印机档案走。
     paper：纸张大小（"A4"/"A3"/…/""=打印机默认），见 print_pdf。
+    scale_mode / scale_percent：打印缩放（见 SCALE_FIT）。两趟必须同口径，否则同一张纸
+      正反面物理尺度不一致（补打/重打走 duplex_remedy 记录回放同一套值）。
     """
     which = 2 if int(which) == 2 else 1
     slots = plan.pass_page_indices(which)
@@ -1444,6 +1630,7 @@ def print_plan_pass(
         progress_callback=progress_callback, dpi=dpi,
         landscape_fill=landscape_fill,
         paper=paper,
+        scale_mode=scale_mode, scale_percent=scale_percent,
     )
 
 
@@ -1462,6 +1649,8 @@ def _print_pdf_native(
     rotate_slots: Optional[list[bool]] = None,
     landscape_fill: bool = True,
     paper: str = "",
+    scale_mode: str = SCALE_FIT,
+    scale_percent: int = SCALE_PERCENT_DEFAULT,
 ) -> tuple[bool, str]:
     """
     Windows 原生 GDI 打印：PyMuPDF 渲染 + win32ui 输出到打印机。
@@ -1482,6 +1671,9 @@ def _print_pdf_native(
                 纵向纸上打横向页，缩放居中只占纸张 49%，读起来像"横向文件打成了竖的"。
     paper: 纸张大小（"A4"/"A3"/"A5"/"Letter"/"Legal"/"B5"/""=驱动默认）。经 DEVMODE
                 dmPaperSize + DM_PAPERSIZE 生效，DocumentProperties 校验后回读实际值。
+    scale_mode / scale_percent: 打印缩放（见 SCALE_FIT 注释）。"fit" 只缩不放（旧行为）、
+                "actual" 按 100% 物理尺寸、percent 按自定义百分比；后两者超出可打印区的
+                部分居中裁掉（GDI 负坐标裁剪），日志里会留一句裁剪证据。
     """
     import fitz
 
@@ -1659,6 +1851,7 @@ def _print_pdf_native(
         # 填充结果与源尺寸无关（走的是内容页同一条 StretchDIBits 路径，驱动本就在放大）。
         blank_dib = None
         cap_noted = False        # 「本次打印因上限降了分辨率」只提示一次，别刷屏
+        overflow_noted = False   # 「缩放后超出可打印区、两侧被裁」只提示一次
         for page_idx in render_seq:
             page_seq += 1
 
@@ -1687,6 +1880,7 @@ def _print_pdf_native(
                 page_w_pts, page_h_pts, native_dpi_x, native_dpi_y,
                 printable_w, printable_h, dpi_cap=dpi, pixel_limit=pixel_limit,
                 landscape_fill=landscape_fill and _rot90 is not None,
+                scale_mode=scale_mode, scale_percent=scale_percent,
             )
             # 这一面要不要 180° 补偿：给了逐面表就按表（同一批里长边/短边可混排），否则按整趟
             slot_rotate_180 = (bool(rotate_slots[page_seq - 1])
@@ -1707,6 +1901,19 @@ def _print_pdf_native(
                                f"目标 {draw_w}x{draw_h}（本次打印 GDI 会放大一次）")
                 print(f"[GDI] ⚠ 渲染位图 {render_w}×{render_h} → 目标 {draw_w}×{draw_h}"
                       f"（dpi上限/像素上限触发，GDI 将放大一次）")
+
+            # 缩放（实际大小 / 自定义 >100%）可以把页面撑出可打印区：居中贴图后由 GDI 裁掉两侧。
+            # 这不是错误，但必须留一句证据，否则现场只会看到"右边一截不见了"。
+            if not overflow_noted and (draw_w > printable_w or draw_h > printable_h):
+                overflow_noted = True
+                cut_x = max(0, (draw_w - printable_w + 1) // 2)
+                cut_y = max(0, (draw_h - printable_h + 1) // 2)
+                logger.warning(f"GDI: 页面 {draw_w}x{draw_h} 超出可打印区 "
+                               f"{printable_w}x{printable_h}（缩放={describe_scale(scale_mode, scale_percent)}），"
+                               f"居中裁剪：左右各 {cut_x}px、上下各 {cut_y}px")
+                print(f"[GDI] ⚠ 缩放「{describe_scale(scale_mode, scale_percent)}」后页面 "
+                      f"{draw_w}×{draw_h} 超出可打印区 {printable_w}×{printable_h}："
+                      f"左右各裁 {cut_x}px、上下各裁 {cut_y}px")
 
             # 先渲染、后 StartPage：渲染失败时尚未出纸，可安全降级重试
             # 转 90° 时：位图宽对应页面**高**、位图高对应页面**宽**（转置后才是 draw_*）
@@ -2161,17 +2368,21 @@ def _print_via_loop(
     rotate_slots: Optional[list[bool]] = None,
     landscape_fill: bool = True,
     paper: str = "",
+    scale_mode: str = SCALE_FIT,
+    scale_percent: int = SCALE_PERCENT_DEFAULT,
 ) -> tuple[bool, str]:
     """终极兜底：应用层循环打印，每次只打 1 份。成功率最高。
 
     pages_override / rotate_180 原样透传（手动双面/校准的精确序列与第 2 趟旋转
-    必须逐趟保持一致，这里只是把"份数"拆成多次单份调用，序列本身不受影响）。"""
+    必须逐趟保持一致，这里只是把"份数"拆成多次单份调用，序列本身不受影响）。
+    缩放同理：多份之间绝不能一张缩、一张不缩。"""
     print(f"[循环打印] 共 {copies} 份，每次 1 份...")
     for i in range(copies):
         print(f"[循环打印] 第 {i + 1}/{copies} 份...")
         ok, msg = _print_pdf_native(pdf_path, printer_name, duplex, duplex_mode, page_range,
                                     1, orientation, progress_callback, dpi, pages_override,
-                                    rotate_180, rotate_slots, landscape_fill, paper)
+                                    rotate_180, rotate_slots, landscape_fill, paper,
+                                    scale_mode, scale_percent)
         if not ok:
             print(f"[循环打印] ✗ 第 {i + 1} 份失败: {msg}")
             # 双面不可用是终止型失败：原样上抛，别被改写成"第 N 份失败"而丢掉语义

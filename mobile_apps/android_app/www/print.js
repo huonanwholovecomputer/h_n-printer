@@ -1243,6 +1243,11 @@ function stopPageCountPoll(f) {
  * 手输 "1-999999999" 会循环 10 亿次并往 Set 里塞 10 亿个元素（内存爆 + 界面卡死）。
  * 上限取 1 万，同时保证 Math.max(...pages) 展开不会触到 V8 的参数个数上限（约 6.5 万）。 */
 const RANGE_SPAN_CAP = 10000;
+/* 「封面单独打印」开关打开时预填的单面页。开关本身是纯布尔 —— 只开开关不填页，
+   提交体里 simplex_pages 就是空串（契约里空串 = 关闭），出纸仍按整份双面。
+   2026-11-18 现场（订单 HN20261118-0017，小程序端）：顾客说开了这个功能，库里 simplex_pages 却是空的。
+   默认填封面（第 1 页），顾客可改可删。小程序端同名常量在 h_n_print/pages/index/index.js。 */
+const SIMPLEX_DEFAULT_PAGES = '1';
 
 function parseSingleRange(text, total) {
   text = (text || '').trim();
@@ -2227,6 +2232,13 @@ function onSubmit() {
       renderFileList();
       return;
     }
+    // 开着却一行合法页都没有 ⇒ 拦下（空串 = 关闭，静默提交等于顾客以为开了、实际整份双面；
+    // 2026-11-18 订单 HN20261118-0017 就是这个形态）
+    if (!f.simplexPages) {
+      showToast('"' + f.name + '" 已打开「封面单独打印」但没填单面页（如 1）', 2400);
+      renderFileList();
+      return;
+    }
   }
   const scheduleErr = validateSchedule();
   if (scheduleErr) { showToast(scheduleErr, 2500); return; }
@@ -2866,6 +2878,11 @@ function setupPrintButtons() {
         sf.simplexEnabled = !sf.simplexEnabled;
         if (sf.simplexEnabled) {
           if (!sf.simplexLines || !sf.simplexLines.length) sf.simplexLines = [{ value: '', error: '' }];
+          // 打开时必须是「有页」的状态：空行等于没开（提交体空串 = 关闭，见 SIMPLEX_DEFAULT_PAGES）。
+          if (!(sf.simplexLines || []).some(l => (l.value || '').trim())) {
+            sf.simplexLines = [{ value: SIMPLEX_DEFAULT_PAGES, error: '' }];
+            _normalizeAndValidateSimplexLines(sf, false);
+          }
           // 已有合法值 → 先收成摘要行（点摘要再编辑）；否则直接展开空行并聚焦
           sf.simplexEditing = !sf.simplexPages;
           sf.simplexFocusLine = sf.simplexEditing ? 0 : -1;

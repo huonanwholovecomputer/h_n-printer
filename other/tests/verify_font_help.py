@@ -134,6 +134,14 @@ def main() -> int:
     check("正文点名文件名", "十八.pdf" in txt, txt[:200])
     check("本机没装 / PDF 没嵌入 两段分开",
           "本机没装（装上就能救）" in txt and "PDF 生成时没嵌进字形" in txt, txt[:400])
+    # 2026-11-18 现场：装好 SimSun 后清单里照旧列着它，用户以为「装了还是没装」。
+    # 正文必须当场把两类说清，并且逐个名字标出本机到底装没装。
+    check("正文抬头把两类分开讲（① 本机没装 ② 文件没带字形）",
+          "这两类不要混" in txt and "装了就修好" in txt and "装不装都改不了" in txt, txt[:400])
+    check("没嵌入的那类逐个标出本机装没装",
+          "本机已装 ✓" in txt or "本机也没装" in txt, txt[:600])
+    check("抬头统计的是「有提示的文件数」，不是传进来的文件数",
+          "共 1 个文件有字体提示" in txt, txt[:40])
     check("两种缺的字体名都列了出来",
           all(n in txt for n in ("TimesNewRomanPS-BoldMT", "ArialMT",
                                  "TimesNewRomanPS-ItalicMT")), txt[:400])
@@ -141,6 +149,25 @@ def main() -> int:
           "复制字体名" in txt and "安装字体文件" in txt and "已装好，重新检查" in txt, "")
     check("说明西文不替换（别指望装 Arial 改变打印）",
           "西文" in txt and "等价字形" in txt, txt[-400:])
+    # 2026-11-18 现场：Times/Arial 全装齐了，详情窗却把「打印时用系统字形渲染」贴在西文名后面，
+    # 用户以为「装了却没替换」。西文本来就不走系统字形（system_fonts 只装 CJK 回调）。
+    _latin_line = [ln for ln in txt.split("\n") if "TimesNewRomanPSMT" in ln][0]
+    check("西文已装时提示的是内置等价字形，不是系统字形",
+          gui.FONT_NOTE_BUILTIN_GLYPH in _latin_line
+          and gui.FONT_NOTE_SYSTEM_GLYPH not in _latin_line, _latin_line)
+    _orig_inst4 = gui.font_check.is_installed
+    gui.font_check.is_installed = lambda n: True
+    try:
+        _txt_all = gui.font_help_text([printer_config.PrintJob(
+            file_path=r"C:\tmp\全装齐.pdf", copies=1,
+            nonembedded_fonts=["ArialMT", "SimSun"])])
+    finally:
+        gui.font_check.is_installed = _orig_inst4
+    check("本机全装齐时不再给下载安装指引（没有要补的字体）",
+          gui.FONT_NOTE_BUILTIN_GLYPH in _txt_all and "ttf" not in _txt_all,
+          _txt_all[:300])
+    check("中文族名仍然按系统字形说（两类不能一刀切）",
+          gui.FONT_NOTE_SYSTEM_GLYPH in _txt_all, _txt_all[:300])
     check("提醒子集字体 / 改名字体救不了别的文件",
           "子集" in txt and "冒充" in txt, txt[-400:])
     check("没有提示的文件不进正文", "没提示.pdf" not in txt, "")
@@ -179,6 +206,35 @@ def main() -> int:
     check("点「已装好，重新检查」置 recheck_requested 并关窗",
           dlg.recheck_requested is True, "recheck_requested=False")
 
+    print("⑤b 装完字体当场重判（2026-11-18 现场：装好 SimSun 仍显示没装）")
+    import tempfile  # noqa: E402
+    _tmpd = tempfile.mkdtemp(prefix="hn_font_help_")
+    _pdf = os.path.join(_tmpd, "sample.pdf")
+    with open(_pdf, "wb") as _f:
+        _f.write(b"%PDF-1.4\n%%EOF\n")
+    _job = printer_config.PrintJob(file_path=_pdf, copies=1, nonembedded_fonts=["SimSun"])
+    _dlg2 = gui.FontHelpDialog(None, [_job])
+    _before_txt2 = _dlg2.view.toPlainText()
+    _orig_check = gui.font_check.check_file
+    _orig_inst = gui.font_check.is_installed
+    # 假装 SimSun 已经装好、文件里仍然只有字体名没有字形
+    gui.font_check.is_installed = lambda n: True
+    gui.font_check.check_file = lambda p: {"ok": True, "fonts": ["SimSun"],
+                                           "missing": [], "nonembedded": ["SimSun"]}
+    try:
+        _left = _dlg2._refresh_reports()
+        _txt2 = _dlg2.view.toPlainText()
+    finally:
+        gui.font_check.check_file = _orig_check
+        gui.font_check.is_installed = _orig_inst
+    _has_mark = ("SimSun" in _txt2) and ("\u2713" in _txt2)
+    check("重判后正文换成新结果（不再显示打开窗口时那份快照）",
+          _has_mark and (_txt2 != _before_txt2), _txt2[:200])
+    check("重判把「本机没装」清空（装了就是装了）",
+          list(_job.missing_fonts) == [], str(_job.missing_fonts))
+    check("重判后仍有「文件没带字形」提示 ⇒ 返回该文件给状态行",
+          list(_left) == [_job], str(len(_left)))
+
     print("⑥ 源码接线（漏一处功能等于没做）")
     src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8", errors="replace").read()
     check("_queue_font_checks 会 refresh_installed（装完字体加文件不能沿用旧快照）",
@@ -187,6 +243,8 @@ def main() -> int:
           "字体缺失详情" in src and "_open_font_help" in src)
     check("重新检查走 _font_recheck_jobs",
           "def _font_recheck_jobs" in src and "self._font_recheck_jobs(" in src)
+    check("装完字体立刻在本窗口重判（不留装之前的快照）",
+          "def _refresh_reports" in src and "self._refresh_reports()" in src)
     check("tooltip 指出了字体详情入口",
           "🖋 字体缺失详情…" in src)
 

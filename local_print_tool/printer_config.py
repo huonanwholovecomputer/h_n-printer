@@ -52,6 +52,15 @@ from typing import Any
 # 所以这里直接引它，不在本模块里另写一份配对/张数算式。
 import manual_duplex
 
+# 打印缩放的词表与收敛规则只此一份（pdf_printer 不反向依赖本模块，无循环）。
+# 配置里存"用户选了什么"，真正算像素在 pdf_printer.plan_page_raster。
+from pdf_printer import (
+    SCALE_FIT,
+    SCALE_PERCENT_DEFAULT,
+    describe_scale,
+    normalize_scale,
+)
+
 logger = logging.getLogger(__name__)
 
 # 最近一次「配置读坏了、已退回默认值」的说明（🟡8，2026-11-10 体检）。
@@ -710,6 +719,16 @@ def _dict_or_default(value, default: dict):
     if isinstance(value, dict) and value:
         return value
     return default
+
+
+def _scale_pair(data) -> tuple[str, int]:
+    """从配置 dict 取 (scale_mode, scale_percent) 并收敛。
+
+    老配置没有这两个键 ⇒ fit / 100 = 改动前的「只缩不放」，零回归；
+    手改成 "zoom"/"150%" 这类坏值也不抛异常（normalize_scale 会应收敛）。
+    """
+    src = data if isinstance(data, dict) else {}
+    return normalize_scale(src.get("scale_mode"), src.get("scale_percent"))
 
 
 # ── 默认任务参数（2026-11 用户需求 #11b / #10；2026-11-13 收窄生效范围）──────
@@ -1588,6 +1607,21 @@ class PrinterConfig:
     # 语义：空 dict = 用户从未配置过 ⇒ 引擎侧维持旧行为（xlsx 不传 print_options）。
     # 非空则整份归一后使用（缺项补内置默认）。由 normalize_task_options 收口。
     default_task_options: dict = field(default_factory=dict)
+    # ---- 打印缩放（2026-11-18 用户需求：对齐 Windows 打印对话框的「缩放(%)」）----
+    # 与上面 default_task_options 里的 scale/fit **不是一回事**：那一组是表格走 Excel
+    # 自己的版式缩放（PageSetup.Zoom），这里是 pdf_printer 光栅管线的**物理尺寸倍率**，
+    # Word/PDF/图片等所有经 GDI 出纸的路径都受它约束（见 pdf_printer.SCALE_FIT 注释）。
+    # 默认 fit（调整为可打印区域大小）= 旧行为（只缩不放）⇒ 老配置缺键零回归。
+    scale_mode: str = SCALE_FIT
+    scale_percent: int = SCALE_PERCENT_DEFAULT
+
+    def print_scale(self) -> tuple[str, int]:
+        """打印缩放（模式, 百分比），已收敛到合法值；透传给 pdf_printer 的那两个参数。"""
+        return normalize_scale(self.scale_mode, self.scale_percent)
+
+    def scale_text(self) -> str:
+        """给界面/日志看的一句话（如「调整为可打印区域大小」）。"""
+        return describe_scale(*self.print_scale())
 
     def task_options(self) -> dict:
         """解析后的默认任务参数（键齐、夹过范围），paper 与 self.paper_size 同源。"""
@@ -1663,6 +1697,9 @@ class PrinterConfig:
             # 纸张大小 + 默认任务参数（老配置没有这两个键 ⇒ A4 / {}，零回归）
             "paper_size": normalize_paper_size(self.paper_size),
             "default_task_options": dict(self.default_task_options or {}),
+            # 打印缩放（老配置没有 ⇒ fit/100 = 旧行为「只缩不放」，零回归）
+            "scale_mode": self.print_scale()[0],
+            "scale_percent": self.print_scale()[1],
         }
 
     @classmethod
@@ -1742,6 +1779,9 @@ class PrinterConfig:
             default_task_options=(normalize_task_options(data.get("default_task_options"))
                                   if _dict_or_default(data.get("default_task_options"), {})
                                   else {}),
+            # 打印缩放（老配置没有这两个键 ⇒ fit/100 = 旧行为；坏值由 normalize_scale 收敛）
+            scale_mode=_scale_pair(data)[0],
+            scale_percent=_scale_pair(data)[1],
         )
 
     def save(self, path: str) -> None:

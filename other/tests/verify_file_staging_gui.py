@@ -127,11 +127,27 @@ _src = jobs[0].source_path
 _new = staging.stage_file(_src)
 check("可从原件重建副本", os.path.isfile(_new))
 
-print("=== 4. 移除任务 → 暂存副本回收 ===")
+print("=== 4. 移除任务 → 撤销窗口内保留副本，过期后回收 ===")
 win._table.selectRow(0)
 win._on_remove_selected()
 check("任务已从列表移除", len(win._get_current_jobs()) == 0)
-check("暂存副本已回收（不残留占盘）", not os.path.isfile(_new))
+# 2026-11-18（Ctrl+Z 撤销删除）：删掉的行在 5 分钟撤销窗口内必须留着暂存副本，
+# 否则撤销回来的任务指向一个已删的文件，打出来就是空壳。窗口过期才回收。
+check("撤销窗口内副本保留（否则撤销回来打不出来）", os.path.isfile(_new))
+check("删除操作进了撤销栈",
+      any(e.get("action") == "remove" for e in getattr(win, "_edit_undo_stack", [])))
+win._on_shortcut_undo()
+check("撤销删除把任务放回来", len(win._get_current_jobs()) == 1)
+check("撤销后副本仍可打印",
+      bool(win._get_current_jobs()) and os.path.isfile(win._get_current_jobs()[0].file_path))
+# 再删一次，然后把这条历史做旧到撤销窗口之外 → 清扫应回收副本
+win._table.selectRow(0)
+win._on_remove_selected()
+for _stack in (win._edit_undo_stack, win._edit_redo_stack):
+    for _entry in _stack:
+        _entry["ts"] = time.time() - 400
+win._sweep_staged_files("测试：撤销窗口过期", min_age_seconds=0.0)
+check("撤销窗口过期后副本被回收", not os.path.isfile(_new))
 # 副本目录：刚清空时留宽限期（防「建目录→马上写入」被清扫打断），过期后回收
 _copy_dir = os.path.dirname(_new)
 if os.path.isdir(_copy_dir):

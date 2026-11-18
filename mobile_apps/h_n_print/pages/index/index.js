@@ -130,6 +130,12 @@ function pyRound2(x) {
  * 上限取 1 万，同时保证 Math.max(...pages) 展开不会触到 V8 的参数个数上限（约 6.5 万）。 */
 const RANGE_SPAN_CAP = 10000
 
+/* 「封面单独打印」开关打开时预填的单面页。开关本身是纯布尔 —— 只开开关不填页，
+ * 提交体里 simplex_pages 就是空串（契约里空串 = 关闭），出纸仍按整份双面。
+ * 2026-11-18 现场（订单 HN20261118-0017）：顾客说开了这个功能，库里 simplex_pages 却是空的，
+ * 两个 3 页封皮文件照样双面出纸。默认填封面（第 1 页），顾客可改可删。 */
+const SIMPLEX_DEFAULT_PAGES = '1'
+
 /* ---- 页数可信度：复制价格的前置校验 -------------------------------------------
 
    后端只对 PDF 能自己数页（pypdf）；Word / Excel / Markdown / TXT / CSV 都必须由
@@ -2126,8 +2132,15 @@ Component({
         patch['selectedFiles[' + fileIndex + '].simplexFocusLine'] = -1
         patch['selectedFiles[' + fileIndex + '].simplexEditing'] = false
         patch['selectedFiles[' + fileIndex + '].simplexPages'] = ''
+      } else if (!(file.simplexLines || []).some(l => (l.value || '').trim())) {
+        // 打开时必须是「有页」的状态：空行等于没开（提交体空串 = 关闭）。
+        // 默认填封面第 1 页并把光标放进去，顾客想改别的页直接改。
+        patch['selectedFiles[' + fileIndex + '].simplexLines'] = [{ value: SIMPLEX_DEFAULT_PAGES, error: '' }]
+        patch['selectedFiles[' + fileIndex + '].simplexFocusLine'] = 0
       }
       this.setData(patch)
+      // 预填的页也要过一遍校验（超页数 / 不在页码范围 → 当场标红，提交时拦下）
+      if (on) this._normalizeAndValidateSimplexLines(fileIndex)
       // 展开/收起整块输入区 → 卡片高度变化，滚动边界必须重算
       this._recalcFileListHeight()
       this._scheduleMeasure(200)
@@ -2274,6 +2287,28 @@ Component({
       if (!file || !file.simplexEnabled) return false
       if (!this._simplexUsable(file)) return false
       return (file.simplexLines || []).some(line => !!line.error)
+    },
+
+    // 提交体里的 simplex_pages：把合法行合并成 "1,16-23"；没有合法行 ⇒ 空串（= 关闭）。
+    // 与 _doSubmit 用的是同一份逻辑（以前那段合并只写在 _doSubmit 里，判空/拦截拿不到）。
+    _simplexMergedPages(file) {
+      if (!file || !file.simplexEnabled) return ''
+      const lines = (file.simplexLines || []).filter(l => (l.value || '').trim() && !l.error)
+      if (!lines.length) return ''
+      const set = new Set()
+      lines.forEach(l => {
+        pageRangeSet(l.value.trim(), file.pageCount || 0).forEach(p => set.add(p))
+      })
+      return set.size ? rangePages(set) : ''
+    },
+
+    // 开关开着但一行合法单面页都没有 ⇒ 提交前拦下。
+    // 为什么必须拦：契约里空串 = 关闭，静默提交等于「顾客以为开了、实际按整份双面打」
+    // （2026-11-18 订单 HN20261118-0017 就是这个形态，库里 simplex_pages 全空）。
+    _simplexEnabledButEmpty(file) {
+      if (!file || !file.simplexEnabled) return false
+      if (this._effectiveDuplex(file) !== 'on') return false
+      return !this._simplexMergedPages(file)
     },
 
     // ==================== 页数网格选择弹窗（页数已知时替代文本输入） ====================
@@ -3715,6 +3750,15 @@ Component({
         }
       }
 
+      // 开关开着却没填单面页 ⇒ 也拦下（静默发空串等于关闭，见 _simplexEnabledButEmpty）
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const f = selectedFiles[i]
+        if (this._simplexEnabledButEmpty(f)) {
+          wx.showToast({ title: `"${f.name}" 已打开「封面单独打印」但没填单面页（如 1）`, icon: 'none', duration: 2400 })
+          return
+        }
+      }
+
       // 无障碍打印预约校验（指定时间已过 / 倒计时无效 → 拦截）
       const scheduleErr = this._validateSchedule()
       if (scheduleErr) {
@@ -3783,17 +3827,8 @@ Component({
         const range = lines.map(l => l.value.trim()).join(',')
         const duplex = (f.isImage || f.pageCount === 1 || f.singlePage) ? 'off' : (f.duplex || 'on')
         // 单面页同理：blur 前也从多行输入现合并（契约：勾选且合法才有值，否则空串=关闭）
-        let simplexPages = ''
-        if (f.simplexEnabled && duplex === 'on') {
-          const simplexLines = (f.simplexLines || []).filter(l => (l.value || '').trim() && !l.error)
-          if (simplexLines.length) {
-            const set = new Set()
-            simplexLines.forEach(l => {
-              pageRangeSet(l.value.trim(), f.pageCount || 0).forEach(p => set.add(p))
-            })
-            simplexPages = set.size ? rangePages(set) : ''
-          }
-        }
+        // 合并逻辑收到 _simplexMergedPages 里，提交前的「开了没填页」拦截用同一份判据
+        const simplexPages = (f.simplexEnabled && duplex === 'on') ? this._simplexMergedPages(f) : ''
         return {
           file_id: f.fileId,
           file: f.name,

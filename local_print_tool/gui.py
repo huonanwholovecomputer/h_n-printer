@@ -101,7 +101,10 @@ from converter import get_converter, UniversalConverter, set_office_sandbox
 from pdf_printer import (print_pdf, list_system_printers, get_pdf_info, get_docx_orientation,
                          get_image_info, estimate_print_sides, estimate_manual_duplex_sides,
                          print_plan_pass, wait_for_output, count_pdf_pages,
-                         detect_trailing_blank_pages)
+                         detect_trailing_blank_pages,
+                         SCALE_ACTUAL, SCALE_FIT, SCALE_PERCENT,
+                         SCALE_PERCENT_DEFAULT, SCALE_PERCENT_MAX, SCALE_PERCENT_MIN,
+                         describe_scale, normalize_scale)
 import manual_duplex  # 手动双面两趟页序引擎（无自动双面器的机型；页序唯一真相）
 import duplex_stack  # 攒批模式（多任务合并翻纸）的纸叠账本（纯逻辑，见 duplex_stack.py）
 import duplex_remedy  # 手动双面「半成品」补救台账：跳过/超时/第 2 趟失败后补打第 2 趟（见 duplex_remedy.py）
@@ -3275,6 +3278,16 @@ XLSX_RANGE_VALUES = RANGE_VALUES + ("selection",)
 XLSX_WORKSHEET_FOLLOW_LABEL = "跟随文件"
 IMAGE_ORIENT_LABELS = ("自动方向", "横向", "竖向")
 IMAGE_ORIENT_VALUES = ("auto", "landscape", "portrait")
+
+# ── 打印缩放（选项 → 打印缩放…，2026-11-18 用户需求）────────────────────────────
+# 与上面那套 xlsx 的「缩放」（FIT_LABELS，Excel 版式自己的 Zoom/FitToPages）**不是一回事**：
+# 这里说的是"PDF 页面按多大比例画到纸上"，Word/PDF/图片都吃这一项；表格不受影响。
+SCALE_MODE_LABELS = ("调整为可打印区域大小（超出时缩小，不放大）",
+                     "实际大小（100%）",
+                     "自定义百分比")
+SCALE_MODE_VALUES = (SCALE_FIT, SCALE_ACTUAL, SCALE_PERCENT)
+# 右侧「任务参数」面板那一行用的是短文案（面板可以被拖到 ~180px，长句会被省略号吃掉）
+SCALE_PANEL_LABELS = ("适合可打印区", "实际大小（100%）", "自定义百分比")
 ORIENTATION_LABELS = ("纵向", "横向")
 ORIENTATION_VALUES = ("portrait", "landscape")
 
@@ -3545,6 +3558,118 @@ class DefaultTaskOptionsDialog(QDialog):
         return normalize_task_options(out)
 
 
+class PrintScaleDialog(QDialog):
+    """选项 → 打印缩放…：PDF 页面按多大比例画到纸上（2026-11-18 用户需求）。
+
+    三档（与打印机驱动对话框里的「缩放」同语义，但由**我们**在渲染时落地，不靠驱动）：
+
+      · 调整为可打印区域大小 —— 页面比可打印区大就等比缩小到刚好放下；比它小就原样
+        （**只缩不放**，与本次改动之前的行为逐像素一致 ⇒ 老用户零感知）；
+      · 实际大小（100%）—— 按纸的物理尺寸 1:1 画；超出可打印区的部分居中裁掉
+        （喷墨/激光的物理不可打印边距之外的空白本来就印不出来）；
+      · 自定义百分比 —— 10%–400%，100% 与「实际大小」等价，大于 100% 同样按居中裁剪。
+
+    ⚠ 只管 PDF 光栅那一路（Word/PDF/图片最终都转成 PDF 再打）；表格由 Excel 版式自己
+    缩放（默认任务参数里的那一组），两者不能叠加，否则同一个数字会被缩两次。
+    """
+
+    def __init__(self, parent=None, scale_mode: str = SCALE_FIT,
+                 scale_percent: int = SCALE_PERCENT_DEFAULT, theme_manager=None):
+        super().__init__(parent)
+        self._theme_manager = theme_manager
+        self.setWindowTitle("打印缩放")
+        self.setMinimumWidth(480)
+        mode, percent = normalize_scale(scale_mode, scale_percent)
+        lay = QVBoxLayout(self)
+
+        head = QLabel("PDF / Word / 图片出纸时的缩放比例（表格由 Excel 版式自己缩放，"
+                      "不受这一项影响）。")
+        head.setWordWrap(True)
+        head.setStyleSheet("font-size: 11px; color: #7f8c8d;")
+        lay.addWidget(head)
+
+        g = QGroupBox("缩放")
+        f = QFormLayout(g)
+        self._mode = _combo(SCALE_MODE_LABELS)
+        _disable_combo_wheel(self._mode)
+        self._mode.setCurrentIndex(_index_of(SCALE_MODE_VALUES, mode))
+        self._mode.setToolTip("调整为可打印区域大小：超出时等比缩小、不放大（默认，"
+                              "与改动前一致）；实际大小：1:1 画，超出的边居中裁掉；"
+                              "自定义百分比：10%–400%")
+        f.addRow("缩放方式：", self._mode)
+        self._percent = QSpinBox()
+        self._percent.setRange(SCALE_PERCENT_MIN, SCALE_PERCENT_MAX)
+        self._percent.setSingleStep(5)
+        self._percent.setSuffix(" %")
+        self._percent.setValue(int(percent))
+        self._percent.setToolTip("只在「自定义百分比」时使用；100% 等于实际大小，"
+                                 "大于 100% 的超出部分会被居中裁掉")
+        _hide_spin_buttons(self._percent)
+        f.addRow("百分比：", self._percent)
+        self._note = QLabel("")
+        self._note.setWordWrap(True)
+        self._note.setStyleSheet("font-size: 11px; color: #7f8c8d;")
+        f.addRow("", self._note)
+        lay.addWidget(g)
+
+        hint = QLabel("手动双面的两趟、攒批整叠、首页封面与「半成品补救」补打都用同一套缩放"
+                      "——同一张纸的正反面不会一大一小。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 11px; color: #7f8c8d;")
+        lay.addWidget(hint)
+
+        row = QHBoxLayout()
+        self._btn_reset = QPushButton("恢复默认")
+        self._btn_reset.setToolTip("恢复成「调整为可打印区域大小」（保存后才生效）")
+        self._btn_reset.clicked.connect(self._on_reset)
+        row.addWidget(self._btn_reset)
+        row.addStretch(1)
+        btn_ok = QPushButton("保存")
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_ok)
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        row.addWidget(btn_cancel)
+        lay.addLayout(row)
+        self._btn_save, self._btn_cancel = btn_ok, btn_cancel
+
+        self._mode.currentIndexChanged.connect(self._sync_percent_enabled)
+        self._percent.valueChanged.connect(self._sync_percent_enabled)
+        self._sync_percent_enabled()
+
+    # ---- 现值 ----
+    def _mode_value(self) -> str:
+        return SCALE_MODE_VALUES[max(0, self._mode.currentIndex())]
+
+    def values(self) -> tuple[str, int]:
+        """(scale_mode, scale_percent) —— 已被 normalize_scale 归一，可直接落配置。"""
+        return normalize_scale(self._mode_value(), int(self._percent.value()))
+
+    def _sync_percent_enabled(self, *_args) -> None:
+        """「自定义百分比」之外没有消费者 ⇒ 灰掉；灰掉的值不参与落盘（见 values）。"""
+        try:
+            self._percent.setEnabled(self._mode_value() == SCALE_PERCENT)
+            mode, percent = self.values()
+            if mode == SCALE_PERCENT:
+                txt = f"按 {percent}% 打：比纸小的内容会留白，超出可打印区的部分居中裁掉。"
+            elif mode == SCALE_ACTUAL:
+                txt = "按 100% 打：超出可打印区的部分居中裁掉（空白边距本来就印不出来）。"
+            else:
+                txt = "只有页面比可打印区大时才缩小，不会放大；整页都塞得进去。"
+            self._note.setText(txt)
+        except Exception:
+            logger.debug("同步缩放下拉失败", exc_info=True)
+
+    def _on_reset(self) -> None:
+        try:
+            self._mode.setCurrentIndex(_index_of(SCALE_MODE_VALUES, SCALE_FIT))
+            self._percent.setValue(SCALE_PERCENT_DEFAULT)
+            self._sync_percent_enabled()
+        except Exception:
+            logger.debug("恢复默认打印缩放失败", exc_info=True)
+
+
 class SpeedCalibrationWorker(QThread):
     """打印速度两点标定：打 1 张 + 10 张**空白页**（单面，不需要翻纸）→ 交给档案拟合。
 
@@ -3667,6 +3792,16 @@ class FontCheckWorker(QThread):
 # 这里给一份可整段复制的清单 + 一条装字体的捷径（拷进当前用户的字体目录）。
 
 
+# 「PDF 没嵌字形」这一条其实有两种下场（2026-11-18 用户现场：Times/Arial 全装齐了，
+# 详情窗却把「打印时用系统字形渲染」贴在这几个西文名后面，还跟着四步「怎么补字体」，
+# 看起来像"装了却没替换"）：
+#   · 中文/日韩字体 —— system_fonts 装了 MuPDF 的 CJK 回调，本机装了同名族就用本机字形；
+#   · 拉丁字体（Times/Arial/...）—— 不接管，走 MuPDF 内置等价字形，装不装纸面都一样。
+# 分派判据只有 font_check.uses_system_glyphs() 一处，别再写死一句话。
+FONT_NOTE_SYSTEM_GLYPH = "打印时用系统字形渲染"
+FONT_NOTE_BUILTIN_GLYPH = "西文不做字形替换，打印用内置等价字形（笔画略有差别，页数/分页不变）"
+
+
 def _font_help_names(job) -> tuple:
     """(本机没装的名字, PDF 里没嵌入字形的名字)。"""
     miss = [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
@@ -3691,19 +3826,59 @@ def font_help_text(jobs) -> str:
         if ne:
             body.append("  PDF 生成时没嵌进字形（装不装字体都改不了这一条）：")
             for n in ne:
-                body.append("    · " + n)
+                if not font_check.is_installed(n):
+                    body.append("    · " + n + "    ← 本机也没装，先把它装上")
+                elif font_check.uses_system_glyphs(n):
+                    body.append("    · " + n + "    ← 本机已装 ✓ " + FONT_NOTE_SYSTEM_GLYPH)
+                else:
+                    body.append("    · " + n + "    ← 本机已装 ✓ " + FONT_NOTE_BUILTIN_GLYPH)
         body.append("")
-    lines = ["共 %d 个文件有字体提示。" % len(jobs), ""]
+    _n_tip = sum(1 for j in jobs if any(_font_help_names(j)))
+    lines = ["共 %d 个文件有字体提示。" % _n_tip, ""]
+    if _n_tip:
+        # 2026-11-18 现场：用户装好 SimSun 后仍看见清单里列着 SimSun，以为「装了还是没装」。
+        # 两类必须当场分开说：① 本机没装（装了就好）② 文件自己没嵌字形（装不装都改不了）。
+        # 只有 ① 真的存在时才把两条都摆出来 —— 西文那类本来就没有「装了没装」的问题，
+        # 清单下面只挂一条「本机没装」会把用户又绕回「是不是装错了」。
+        _has_miss = any(_font_help_names(j)[0] for j in jobs)
+        if _has_miss:
+            lines += ["这两类不要混：",
+                      "  ① 本机没装 —— 装了就修好，表格里的 ⚠ 会消失；",
+                      "  ② PDF 生成时没嵌字形 —— 文件里只写了字体名、没带字形，"
+                      "装不装都改不了这一条；打印时中文用「系统字形」、西文用「内置兜底字形」。",
+                      ""]
+        else:
+            lines += ["这一类不是「本机没装」：文件生成时就没带字形，装不装字体都改不了这一条 —— "
+                      "打印时中文用「系统字形」、西文用「内置兜底字形」。",
+                      ""]
     lines += body or ["（这些文件当前没有字体提示）", ""]
+    # 「怎么补字体」只在真的还有要补的字体时才给：本机没装的，或中文/日韩字形本机也缺的。
+    # 2026-11-18 现场：Times/Arial 全装齐了，清单下面仍跟着这四步，用户以为要自己动手替换。
+    _need: list = []
+    for j in jobs:
+        _miss_n, _ne_n = _font_help_names(j)
+        _need += _miss_n
+        _need += [n for n in _ne_n
+                  if font_check.uses_system_glyphs(n) and not font_check.is_installed(n)]
+    if _need:
+        lines += [
+            "怎么补字体",
+            "1) 点下方「⧉ 复制字体名」：上面列出的名字会一起进剪贴板（每行一个）。",
+            "2) 拿去搜下载：搜「字体名 字体 ttf」就行（Google / GitHub / 字体站都可以）。",
+            "   要装名字对得上的那一份 —— 有的站把别的字体改名冒充：本机实测一份"
+            "「ArialMT.ttf」实际是 Bitstream Vera Sans，装上也没用。",
+            "3) 下载到 .ttf / .otf 后点「📂 安装字体文件…」：装进当前用户，不需要管理员。",
+            "4) 装完这里会自动按新字体重判（想再判一遍就点「✅ 已装好，重新检查」）。",
+            "",
+        ]
+    elif _n_tip:
+        lines += [
+            "要补的字体：没有。",
+            "上面这些本机都装了 —— 中文用系统字形打印，西文用内置等价字形，"
+            "直接打就行，不用再装一遍字体。",
+            "",
+        ]
     lines += [
-        "怎么补字体",
-        "1) 点下方「⧉ 复制字体名」：上面列出的名字会一起进剪贴板（每行一个）。",
-        "2) 拿去搜下载：搜「字体名 字体 ttf」就行（Google / GitHub / 字体站都可以）。",
-        "   要装名字对得上的那一份 —— 有的站把别的字体改名冒充：本机实测一份"
-        "「ArialMT.ttf」实际是 Bitstream Vera Sans，装上也没用。",
-        "3) 下载到 .ttf / .otf 后点「📂 安装字体文件…」：装进当前用户，不需要管理员。",
-        "4) 装完点「✅ 已装好，重新检查」，这一批文件的字体提示会按新字体重判。",
-        "",
         "两点要知道",
         "· 西文（Times New Roman / Arial 这一类）本工具不做替换（排版风险大）：PDF 没嵌入时"
         "一律用内置等价字形，笔画略有差别，页数/分页不受影响。装齐字体主要解决中文"
@@ -3747,7 +3922,7 @@ class FontHelpDialog(QDialog):
         self.btn_recheck.clicked.connect(self._recheck)
         self.btn_close.clicked.connect(self.reject)
         lay = QVBoxLayout(self)
-        head = QLabel("缺的字体清单在下面，可以整段复制。装好字体后点「已装好，重新检查」。")
+        head = QLabel("字体提示清单在下面，可以整段复制。装字体文件后这里会当场按新字体重判。")
         head.setWordWrap(True)
         lay.addWidget(head)
         lay.addWidget(self.view, 1)
@@ -3768,6 +3943,42 @@ class FontHelpDialog(QDialog):
                 if n not in out:
                     out.append(n)
         return out
+
+    def _refresh_reports(self) -> list:
+        """按**当前**已装字体重新判定这批文件，并把正文清单换成新结果。
+
+        2026-11-18 现场：用户装完 SimSun，窗口里那份清单还是装之前的快照 ——
+        正文照旧列着 SimSun，看起来就像「装了还是没装」。装完必须当场重判一次：
+        新枚举本机字体 → 逐个文件 `font_check.check_file` 回写两个字段 → 重画正文。
+        返回仍有提示的文件列表（给调用方决定状态行怎么说）。
+        """
+        try:
+            font_check.refresh_installed(QFontDatabase.families())
+        except Exception:
+            logger.debug("字体枚举刷新失败", exc_info=True)
+        try:
+            fp = font_check.fonts_fingerprint()
+        except Exception:
+            fp = ""
+        for job in self._jobs:
+            path = getattr(job, "file_path", "") or ""
+            if not path or not font_check.checkable(path):
+                continue
+            try:
+                rep = font_check.check_file(path)
+            except Exception:
+                logger.debug("重判字体失败：%s", path, exc_info=True)
+                continue
+            try:
+                job.missing_fonts = [str(x) for x in (rep.get("missing") or []) if str(x).strip()]
+                job.nonembedded_fonts = [str(x) for x in (rep.get("nonembedded") or [])
+                                         if str(x).strip()]
+                job.font_checked = True
+                job.font_fp = fp
+            except Exception:
+                logger.debug("回写字体判定失败：%s", path, exc_info=True)
+        self.view.setPlainText(font_help_text(self._jobs))
+        return [j for j in self._jobs if any(_font_help_names(j))]
 
     def _copy_names(self) -> None:
         names = self._all_names()
@@ -3820,13 +4031,27 @@ class FontHelpDialog(QDialog):
         if not msg:
             msg.append("没有装进任何字体。")
         self.installed_any = bool(ok) or bool(skipped)
+        if ok:
+            # 装完立刻重判：否则正文还是装之前那份清单，用户会以为「装了没生效」
+            _left = self._refresh_reports()
+            _left_missing = sorted({n for j in _left for n in _font_help_names(j)[0]})
+            _left_ne = sorted({n for j in _left for n in _font_help_names(j)[1]})
+            if _left_missing:
+                msg.append("重判结果：仍缺 " + "、".join(_left_missing)
+                           + "（本机还是没装到这几个，或者是改名的冒牌字体）")
+            else:
+                msg.append("重判结果：这批文件不再缺字体了 ✓")
+            if _left_ne:
+                msg.append("仍会列在「PDF 生成时没嵌进字形」里的：" + "、".join(_left_ne)
+                           + " —— 那是文件本身没带字形，装不装都改不了；"
+                             "本机装了就用系统字形打印，纸面跟原件一致。")
         self.status.setText(msg[0])
         self.view.appendPlainText("")
         self.view.appendPlainText("── 安装结果 ──")
         for line in msg:
             self.view.appendPlainText(line)
         if ok:
-            self.view.appendPlainText("已装好 ⇒ 点「✅ 已装好，重新检查」重判这批文件。")
+            self.view.appendPlainText("关闭这个窗口后，表格里的字体提示也会跟着更新。")
         else:
             QMessageBox.warning(self, "安装失败", "\n".join(msg))
 
@@ -3907,6 +4132,8 @@ class PrintWorker(QThread):
         stack_rotate: bool = True,
         stack_more_pending=None,
         paper: str = "",
+        scale_mode: str = SCALE_FIT,
+        scale_percent: int = SCALE_PERCENT_DEFAULT,
         pass2_watch=None,
         parent=None,
     ):
@@ -3933,6 +4160,11 @@ class PrintWorker(QThread):
         # 逐趟透传给 pdf_printer 的 paper= —— Word / PDF / 图片 都按同一纸张出纸。
         # 空串 = 沿用打印机默认（旧行为，仅当调用方没给值时）。
         self._paper = (paper or "").strip()
+        # 打印缩放（2026-11-18 用户需求）：全局默认在「选项 → 打印缩放…」里配，
+        # 逐趟透传给 pdf_printer 的 scale_mode= / scale_percent=（fit = 只缩不放，旧行为）。
+        # 手动双面两趟、攒批整叠、封面、补救补打都用同一套值（同一张纸的正反面不能一大一小）。
+        self._scale_mode, self._scale_percent = pdf_printer.normalize_scale(
+            scale_mode, scale_percent)
         # 「后面还排着别的单吗」回调（主线程给的无参可调用对象，worker 线程里只读一个 bool）。
         # 为真时攒批第 1 趟**不阻塞等物理出纸**：打完立刻收工、让下一单的第 1 趟马上进打印
         # 队列（spooler 按提交顺序出纸，连续几单的第 1 趟本来就该叠在一起）。2026-11-02 用户
@@ -4373,6 +4605,8 @@ class PrintWorker(QThread):
                 paper=self._paper_for([r.get("job") for r in group
                                        if r.get("idx") in merged_ids]),
                 dpi=self._render_dpi,
+                scale_mode=self._scale_mode,
+                scale_percent=self._scale_percent,
                 items=items,
                 pdf=pdf_copy,
             )
@@ -4501,6 +4735,8 @@ class PrintWorker(QThread):
                     task_ref, base_offset, total_sides + extra_sides),
                 dpi=int(group[0]["dpi"] or 0),
                 paper=self._paper_for([r.get("job") for r in mergeable]),
+                scale_mode=self._scale_mode,
+                scale_percent=self._scale_percent,
             )
             if ok:
                 self.log_message.emit(f"  ✓ {msg}")
@@ -4657,6 +4893,8 @@ class PrintWorker(QThread):
             progress_callback=job_progress,
             dpi=dpi,
             paper=self._paper_for([job]),
+            scale_mode=self._scale_mode,
+            scale_percent=self._scale_percent,
         )
 
     def _rotate_for_job(self, job: PrintJob) -> bool:
@@ -5032,6 +5270,8 @@ class PrintWorker(QThread):
                     rec = duplex_remedy.make_record(
                         stage=stage, reason=reason, printer=self._printer_name,
                         paper=_batch_paper, dpi=self._render_dpi,
+                        scale_mode=self._scale_mode,
+                        scale_percent=self._scale_percent,
                         rotate_mode=(duplex_remedy.ROTATE_FIXED if rotate is not None
                                      else duplex_remedy.ROTATE_PER_FILE),
                         rotate=bool(rotate), first=p.first,
@@ -5140,7 +5380,9 @@ class PrintWorker(QThread):
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset, map1),
                                         landscape_fill=bool(getattr(p, "landscape_fill", True)),
-                                        paper=_batch_paper)
+                                        paper=_batch_paper,
+                                        scale_mode=self._scale_mode,
+                                        scale_percent=self._scale_percent)
             if not ok1:
                 # 🔴-B5（2026-11-10 体检）：第 1 趟**失败**时也要推台账 —— 驱动可能已经
                 # 送出/弹出前几页（一部分纸在槽里、一部分没出），而这一支原来直接 return，
@@ -5267,7 +5509,9 @@ class PrintWorker(QThread):
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset + n1, map2),
                                         landscape_fill=bool(getattr(p, "landscape_fill", True)),
-                                        paper=_batch_paper)
+                                        paper=_batch_paper,
+                                        scale_mode=self._scale_mode,
+                                        scale_percent=self._scale_percent)
             if not ok2:
                 _rec = _keep_stall(f"第 2 趟失败: {msg2}",
                                    duplex_remedy.STAGE_PASS2_PARTIAL)
@@ -5440,7 +5684,9 @@ class PrintWorker(QThread):
                                         second_rotate_180=self._stack_rotate,
                                         progress_callback=_cb(base_offset, map1),
                                         landscape_fill=bool(getattr(p, "landscape_fill", True)),
-                                        paper=_stack_paper)
+                                        paper=_stack_paper,
+                                        scale_mode=self._scale_mode,
+                                        scale_percent=self._scale_percent)
             if self._cancelled:
                 self.stack_entry_done.emit(self._stack_seq, False, "已取消", n1)
                 return False, "已取消", n1
@@ -5671,6 +5917,8 @@ class PrintWorker(QThread):
                             progress_callback=None,
                             dpi=self._render_dpi,
                             paper=self._paper,
+                            scale_mode=self._scale_mode,
+                            scale_percent=self._scale_percent,
                         )
                         if cover_ok:
                             self.log_message.emit(f"  ✓ 首页: {cover_msg}")
@@ -6037,7 +6285,9 @@ class DuplexFlushWorker(QThread):
     done = Signal(bool, str, int)     # (ok, message, 第 2 趟打印面数)
 
     def __init__(self, stack, batch_dir: str, printer_name: str,
-                 dpi: int = 0, paper: str = "", parent=None):
+                 dpi: int = 0, paper: str = "",
+                 scale_mode: str = SCALE_FIT,
+                 scale_percent: int = SCALE_PERCENT_DEFAULT, parent=None):
         super().__init__(parent)
         self._stack = stack
         self._batch_dir = batch_dir
@@ -6045,6 +6295,10 @@ class DuplexFlushWorker(QThread):
         self._dpi = int(dpi or 0)
         # 纸张大小：与 PrintWorker 同源（全局默认），整叠第 2 趟也必须用同一张纸
         self._paper = (paper or "").strip()
+        # 打印缩放：整叠第 2 趟的各单第 1 趟是**同一套缩放**打出来的，第 2 趟必须照抄，
+        # 否则正反面一张缩成 80%、一张原大（页面对不齐、装订边错位）。
+        self._scale_mode, self._scale_percent = pdf_printer.normalize_scale(
+            scale_mode, scale_percent)
         # L2-1：第 2 趟是否已进入打印循环（异常路径据此判断「可能已出纸」）
         self._pass2_started = False
         # L2-2：取消标志（closeEvent 先 cancel 再 wait）
@@ -6116,7 +6370,8 @@ class DuplexFlushWorker(QThread):
             ok2, msg2 = print_plan_pass(
                 plan, merged, self._printer_name, 2,
                 second_rotate_180=True,
-                progress_callback=_on_side, dpi=self._dpi, paper=self._paper)
+                progress_callback=_on_side, dpi=self._dpi, paper=self._paper,
+                scale_mode=self._scale_mode, scale_percent=self._scale_percent)
             if not ok2:
                 # PARTIAL_MARKER 必须留在消息**开头**：主窗口用 is_partial(msg) 判
                 # 「第 2 趟到底出没出过纸」；把文案拼到 marker 前面会让 startswith
@@ -6343,7 +6598,9 @@ class DuplexRemedyWorker(QThread):
     FLIP_GRACE_SEC = 20
 
     def __init__(self, record: dict, mode: str = "pass2", printer_name: str = "",
-                 paper: str = "", dpi: int = 0, parent=None):
+                 paper: str = "", dpi: int = 0,
+                 scale_mode: str | None = None,
+                 scale_percent: int | None = None, parent=None):
         super().__init__(parent)
         self._rec = dict(record or {})
         self._rid = str(self._rec.get("id") or "")
@@ -6351,6 +6608,13 @@ class DuplexRemedyWorker(QThread):
         self._printer_name = (printer_name or str(self._rec.get("printer") or "")).strip()
         self._paper = (paper or str(self._rec.get("paper") or "")).strip()
         self._dpi = int(dpi or self._rec.get("dpi") or 0)
+        # 打印缩放：**记录值优先**（补打的是当时那叠纸，必须与第 1 趟同一套缩放，
+        # 否则背面比正面小/大一圈，页面对不齐）。调用方没给（None）才回落台账记录；
+        # 注意 fit/100 是**有效值**，不能用 `or` 判空 —— 那会把显式传入的 fit 当成没给。
+        _mode_in = scale_mode if scale_mode is not None else self._rec.get("scale_mode")
+        _pct_in = scale_percent if scale_percent is not None else self._rec.get("scale_percent")
+        self._scale_mode, self._scale_percent = pdf_printer.normalize_scale(
+            _mode_in, _pct_in)
         self._flip_event = threading.Event()
         self._flip_continue = False
         self._cancelled = False
@@ -6387,7 +6651,9 @@ class DuplexRemedyWorker(QThread):
             second_rotate_180=True,
             progress_callback=_on_side, dpi=self._dpi,
             landscape_fill=bool(self._rec.get("landscape_fill", True)),
-            paper=self._paper)
+            paper=self._paper,
+            scale_mode=self._scale_mode,
+            scale_percent=self._scale_percent)
 
     def _ask_flip(self, plan) -> bool:
         p1 = " ".join("空白" if p is None else str(p) for p in plan.pass_pages(1))
@@ -7872,6 +8138,10 @@ class MainWindow(QMainWindow):
         self._cleared_jobs_backup: dict[str, list[PrintJob]] = {}
         # 清空时一并暂存的订单时间（created_at, started_at）—— 供 5 秒内「撤回清空」还原
         self._cleared_times_backup: dict[str, tuple[str, str]] = {}
+        # 撤销/反撤销（Ctrl+Z / Ctrl+Y，2026-11-18 用户需求）：只记「添加文件」「删除文件」
+        # 两种结构变化，每条带时间戳；只允许撤销 5 分钟内的修改（`EDIT_UNDO_TIMEOUT`）。
+        self._edit_undo_stack: list[dict] = []
+        self._edit_redo_stack: list[dict] = []
         # 已处理的云端任务 ID（防重复弹窗；跨重启持久化，防重启后重复打印）
         self._processed_cloud_tasks: set[int] = self._load_processed_tasks()
         # 无障碍自动打印：启动失败（打印机忙 / 页数还没统计完）时暂存的重试队列，
@@ -9395,6 +9665,15 @@ class MainWindow(QMainWindow):
         default_task_action.triggered.connect(self._on_default_task_options)
         options_menu.addAction(default_task_action)
 
+        # 打印缩放：PDF 页面按多大比例画到纸上（调整为可打印区域大小 / 实际大小 / 自定义 %）。
+        # 与上面那个「默认任务参数 → 缩放」不是一回事：那一项是 Excel 表格的版式缩放。
+        scale_action = QAction("打印缩放…(&S)", self)
+        scale_action.setToolTip("PDF/Word/图片按多大比例打到纸上：调整为可打印区域大小、"
+                                "实际大小（100%，超出裁掉）或自定义百分比；"
+                                "手动双面的两趟/攒批整叠/首页/补打都用同一套（表格不受影响）")
+        scale_action.triggered.connect(self._on_print_scale_options)
+        options_menu.addAction(scale_action)
+
         options_menu.addSeparator()
 
         # 外部打印监视（A 档最小版）：勾上 = 订阅本机 spooler，绕过本工具的作业一律记账（不阻断）。
@@ -9505,6 +9784,13 @@ class MainWindow(QMainWindow):
         self._shortcut_ctrl_d = QShortcut(QKeySequence("Ctrl+D"), self)
         self._shortcut_ctrl_d.setContext(Qt.ApplicationShortcut)
         self._shortcut_ctrl_d.activated.connect(self._on_remove_selected)
+        # Ctrl+Z / Ctrl+Y：撤销、反撤销「添加文件 / 删除文件」（只认 5 分钟内，2026-11-18）
+        self._shortcut_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self._shortcut_undo.setContext(Qt.ApplicationShortcut)
+        self._shortcut_undo.activated.connect(self._on_shortcut_undo)
+        self._shortcut_redo = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self._shortcut_redo.setContext(Qt.ApplicationShortcut)
+        self._shortcut_redo.activated.connect(self._on_shortcut_redo)
         self._shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self)
         self._shortcut_paste.setContext(Qt.ApplicationShortcut)
         self._shortcut_paste.activated.connect(self._on_shortcut_paste)
@@ -10607,6 +10893,7 @@ class MainWindow(QMainWindow):
         for key in removed_keys:
             self._cleanup_scheduled_orders_for_tab(key, reason="标签页已删除")
             self._drop_auto_print_retry_for_tab(key)
+            self._forget_edit_history(key)   # 撤销历史不跟着已删的标签页走
         self._cleanup_orphan_pdf_cache(all_jobs)
         self._renumber_tabs()
         self._save_config()
@@ -10739,6 +11026,9 @@ class MainWindow(QMainWindow):
             abandoned = self._abandon_tab_jobs(tab, skip=keep_jobs)
             tab.jobs = []
             tab.frozen = False
+            # Ctrl+W 清空这一页 = 这条线到此为止（确认框里也写了「删了无法恢复」）
+            # ⇒ 撤销历史一并丢掉，别让 Ctrl+Z 把刚放弃的任务又静悄悄塞回来。
+            self._forget_edit_history(key)
             # 文件已清空 ⇒ 这张订单到此为止：创建/发起时间一起作废，下一单重新计时
             self._reset_tab_order_times(key)
             self._cleanup_scheduled_orders_for_tab(key, reason="标签页已清空")
@@ -12054,14 +12344,42 @@ class MainWindow(QMainWindow):
         _ne = [str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()]
         blocks = []
         if _ne:
+            # 2026-11-18 现场：装好 SimSun 后 tooltip 照旧说「没装 ⇒ 用内置字形代替」，
+            # 用户以为装了个寂寞。这里逐个名字标出本机到底装没装：
+            # 已装 = 这条只是「文件没带字形」，打印用的是系统字形，纸面不会走样。
+            _ne_no = [n for n in _ne[:8] if not font_check.is_installed(n)]
+            _sys = [n for n in _ne[:8] if font_check.uses_system_glyphs(n)]
+            _west = [n for n in _ne[:8] if not font_check.uses_system_glyphs(n)]
+            _lines = []
+            for n in _ne[:8]:
+                if not font_check.is_installed(n):
+                    _lines.append(f"· {n}（本机也没装 ⇒ 用内置字形代替）")
+                elif font_check.uses_system_glyphs(n):
+                    _lines.append(f"· {n}（本机已装 ✓ 用系统字形）")
+                else:
+                    _lines.append(f"· {n}（本机已装 ✓ 西文不替换，用内置等价字形）")
+            _head = ("ℹ 这份 PDF 生成时没把字体嵌进文件（只写了字体名，没带字形）—— "
+                     "这不是「本机没装」。" if not _ne_no else
+                     "⚠ 这份 PDF 生成时没把字体嵌进文件（只写了字体名，没带字形）：")
+            if not _ne_no:
+                _parts = []
+                if _sys:
+                    _parts.append("中文/日韩字体本机都装了 ⇒ 打印时用系统字形渲染")
+                if _west:
+                    _parts.append(FONT_NOTE_BUILTIN_GLYPH)
+                _what = "；".join(_parts) + "；"
+            else:
+                _what = ("本机装了的中文/日韩字体 ⇒ " + FONT_NOTE_SYSTEM_GLYPH + "（2026-11-01 起）；"
+                         "西文不做字形替换；没装的一律用内置字形代替，笔画/字宽可能和屏幕上看到的不同；")
             blocks.append(
-                "⚠ 这份 PDF 生成时没把字体嵌进文件（只写了字体名，没带字形）：\n"
-                + "\n".join(f"· {n}" for n in _ne[:8])
+                _head + "\n"
+                + "\n".join(_lines)
                 + ("\n…" if len(_ne) > 8 else "")
-                + "\n本机装了这个字体 ⇒ 打印时自动用它渲染（2026-11-01 起）；"
-                  "没装 ⇒ 用内置字形代替，笔画/字宽可能和屏幕上看到的不同。\n"
-                  "页数、位置、分页不受影响。要纸面与原件完全一致，"
-                  "最稳的还是让生成方重新导出「嵌入字体」的 PDF。")
+                + "\n" + _what
+                + "页数、位置、分页不受影响。要纸面与原件完全一致，"
+                  "最稳的还是让生成方重新导出「嵌入字体」的 PDF。"
+                + ("" if _ne_no else
+                   "\n（上面这些本机都装了，不用再装一遍。）"))
         if _miss:
             blocks.append(
                 "⚠ 本机没装这些字体：\n"
@@ -12390,7 +12708,18 @@ class MainWindow(QMainWindow):
         name_item.setToolTip(_tip)
         _miss = list(getattr(job, "missing_fonts", []) or [])        # 本机没装：装上就能救
         _ne = list(getattr(job, "nonembedded_fonts", []) or [])      # 文件没嵌入：装字体救不了
-        if _miss or _ne:
+        try:
+            _ne_all_ok = bool(_ne) and not _miss and all(
+                font_check.is_installed(str(n)) for n in _ne if str(n).strip())
+        except Exception:
+            _ne_all_ok = False
+        if _ne_all_ok:
+            # 2026-11-18 现场：用户装好 SimSun 后，这一行还是黄的 ⚠️ —— 看着就像「装了没生效」。
+            # 文件里没带字形、可本机字体都在 ⇒ 打印时用系统字形，纸面与原件一致，没有要修的东西：
+            # 文件名照常显示（不加标记，免得又像"缺字体"），说明只留在 tooltip 里。
+            name_item.setText(display)
+            name_item.setToolTip(_tip + "\n\n" + "\n\n".join(self._font_tip_blocks(job)))
+        elif _miss or _ne:
             # 只提示、不拦：真正的拦截放在打印前（_font_gate 弹一次确认）—— 行上标黄是为了
             # 让操作员在点「开始打印」之前就看见，而不是打完才发现字形不对。
             # 这里**不读文件**（每行都查会拖慢整表重画）：结论全部来自后台线程回写的两个字段。
@@ -12731,6 +13060,13 @@ class MainWindow(QMainWindow):
         # 但选中的是图片/单页文件时双面控件整个灰掉、物理上也不会双面 ⇒ 提示跟着收起来，
         # 免得面板一边灰着"单面"一边还写着"分两趟打印"（见 _update_duplex_label）。
         self._duplex_usable = duplex_usable
+        # 打印缩放（2026-11-18 用户口径）：没选中文件不可点；只有选中的全是 PDF/Word 才可点
+        # —— 图片按原幅面走、表格由 Excel 版式缩放，这两类没有"页面缩放"可调。
+        # 注意缩放在物理上是**整批一个值**（合并打印一次 print_pdf），所以按"整片选区都吃
+        # 这一项"判：混选（PDF + 图片）时灰着，避免"以为只调了 PDF、其实图片也变了"。
+        self._set_scale_edit_enabled(
+            (not frozen) and bool(jobs)
+            and all(self._job_scale_applies(j) for j in self._selection_jobs(jobs, sorted(rows))))
 
         # 同步编辑控件
         self._edit_copies.blockSignals(True)
@@ -12908,6 +13244,8 @@ class MainWindow(QMainWindow):
                     w.setVisible(False)
                 except Exception:
                     pass
+        # 没有选中任务 ⇒ 缩放行也不可点（用户口径：灰着才算对）
+        self._set_scale_edit_enabled(False)
 
     def _sync_edit_enabled(self, enabled: bool):
         """统一启用/禁用编辑面板所有控件。"""
@@ -12917,6 +13255,105 @@ class MainWindow(QMainWindow):
             w.setEnabled(enabled)
         if not enabled:
             self._selected_file_label.setText("(未选中任务)")
+            self._set_scale_edit_enabled(False)
+
+    # ── 打印缩放（右侧面板那一行 + 选项菜单对话框，2026-11-18 用户需求）────────
+    def _scale_panel_values(self) -> tuple[str, int]:
+        """面板两个控件当前值 → 归一后的 (mode, percent)。纯读，不写任何状态。"""
+        idx = int(self._edit_scale_mode.currentIndex())
+        mode = SCALE_MODE_VALUES[idx] if 0 <= idx < len(SCALE_MODE_VALUES) else SCALE_FIT
+        percent = int(self._edit_scale_percent.value())
+        return normalize_scale(mode, percent)
+
+    def _sync_scale_edit(self):
+        """配置 → 面板（启动、菜单对话框保存后都走这里；屏蔽信号避免回写）。"""
+        if not hasattr(self, "_edit_scale_mode"):
+            return
+        mode, percent = self._config.print_scale()
+        idx = SCALE_MODE_VALUES.index(mode) if mode in SCALE_MODE_VALUES else 0
+        self._edit_scale_mode.blockSignals(True)
+        self._edit_scale_mode.setCurrentIndex(idx)
+        self._edit_scale_mode.blockSignals(False)
+        self._edit_scale_percent.blockSignals(True)
+        self._edit_scale_percent.setValue(int(percent))
+        self._edit_scale_percent.blockSignals(False)
+        self._sync_scale_percent_state()
+
+    # 打印缩放只对"有页面尺寸概念"的文稿有意义：PDF / Word 系文档走 GDI 光栅，放大缩小
+    # 是像素级的；图片按原幅面走，表格由 Excel 的 Zoom/FitToPages 自己缩放 —— 这一项对它们
+    # 没有可调的东西。用户口径（2026-11-18）：「没选中文件时灰色不可用；选中 PDF、Word
+    # 类型才可用，其余灰色不可用」。
+    _SCALE_EXTS = (".pdf", ".doc", ".docx", ".docm", ".rtf", ".odt")
+
+    def _job_scale_applies(self, job) -> bool:
+        """该文件是否吃「打印缩放」这一项（PDF / Word 系）。"""
+        ext = os.path.splitext(getattr(job, "file_path", "") or "")[1].lower()
+        return ext in self._SCALE_EXTS
+
+    def _set_scale_edit_enabled(self, enabled: bool):
+        """整行（下拉 + 百分比）的可用性：只有选中 PDF/Word 才可调。"""
+        if not hasattr(self, "_edit_scale_mode"):
+            return
+        self._scale_row_usable = bool(enabled)
+        self._label_scale.setEnabled(self._scale_row_usable)
+        self._edit_scale_mode.setEnabled(self._scale_row_usable)
+        self._sync_scale_percent_state()
+
+    def _sync_scale_percent_state(self):
+        """百分比框只在「自定义百分比」档可用；提示行按当前档位讲清这一档会发生什么。"""
+        if not hasattr(self, "_edit_scale_mode"):
+            return
+        usable = bool(getattr(self, "_scale_row_usable", True))
+        idx = int(self._edit_scale_mode.currentIndex())
+        mode = SCALE_MODE_VALUES[idx] if 0 <= idx < len(SCALE_MODE_VALUES) else SCALE_FIT
+        self._edit_scale_percent.setEnabled(usable and mode == SCALE_PERCENT)
+        # 通知统一在下面拼成一句：全局设置（下一批生效），表格不吃这一项
+        if mode == SCALE_FIT:
+            tip = "超出才缩，小页面不放大（默认）"
+        elif mode == SCALE_ACTUAL:
+            tip = "按 100% 物理尺寸，超出部分居中裁掉"
+        else:
+            tip = f"按 {int(self._edit_scale_percent.value())}% 出纸（10–400）"
+        if usable:
+            self._label_scale_hint.setText(f"{tip}；全局设置，下一批生效，表格不受影响")
+        else:
+            # 灰着的时候要说清"为什么不能点"，否则用户以为功能没做（2026-11-18 反馈）
+            self._label_scale_hint.setText(f"{tip}（选中 PDF / Word 文件后可调）")
+        self._edit_scale_mode.setToolTip(
+            "把页面按多大比例画到纸上：\n"
+            "调整为可打印区域大小 = 超出才缩、小页面不放大（默认，与旧版行为一致）\n"
+            "实际大小 = 100% 物理尺寸，超出可打印区的部分左右/上下居中裁掉\n"
+            "自定义百分比 = 10–400%，100% 等同于实际大小\n"
+            "这是全局设置（所有文件同一口径）；表格由 Excel 版式自己缩放，不叠加。\n"
+            "只有选中 PDF / Word 文件时才可调（图片按原幅面走，表格有 Excel 自己的缩放）。")
+        self._edit_scale_percent.setToolTip("自定义缩放百分比（10–400）")
+
+    def _on_scale_edit_changed(self, *_args):
+        """面板里改了缩放 → 写全局配置并落盘（与「选项 → 打印缩放…」同一份配置）。
+
+        注意：**不写回选中的 job** —— 缩放是打印级别的参数，合并打印时一批只有一个值；
+        写成逐文件参数会让"同一张纸正反面尺度不同"，那是比"没地方调"更糟的现场。
+        """
+        try:
+            if self._is_current_tab_frozen():
+                return
+            if not getattr(self, "_scale_row_usable", False):
+                # 灰着的控件不回写配置（没选中 / 图片 / 表格时这一行没有可调的意义）
+                return
+            mode, percent = self._scale_panel_values()
+            self._sync_scale_percent_state()
+            if (mode, percent) == self._config.print_scale():
+                return
+            self._config.scale_mode = mode
+            self._config.scale_percent = int(percent)
+            self._save_config()
+            self._log(f"🔍 打印缩放已设为：{describe_scale(mode, percent)}（下一批打印生效）")
+        except Exception as e:
+            # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
+            logger.exception("保存打印缩放失败")
+            QMessageBox.warning(self, "打印缩放",
+                                f"保存失败：{type(e).__name__}: {e}")
+            self._sync_scale_edit()
 
     # ── 表格版式面板（2026-11 用户需求 #10）──────────────────────────────────
     # 面板**只收集参数**：真正改 PageSetup 的是表格引擎（转换时写临时副本），本工具从不动
@@ -14523,6 +14960,64 @@ class MainWindow(QMainWindow):
         self._edit_dpi.currentIndexChanged.connect(self._auto_apply_edit)
         gl.addWidget(self._edit_dpi)
 
+        # 打印缩放（2026-11-18 用户需求）：用户在 Windows 驱动对话框里看到的那一组
+        # 「缩放(%)：调整为可打印区域大小 / 实际大小 / 自定义」。**这一行是全局设置**，
+        # 不是逐文件参数 —— 一批里的多份文件常常被合并成一个 PDF 一次打印（`_print_merged_group`），
+        # 物理缩放在一次 print_pdf 里只能有一个值，做成分文件就会出现"同一张纸正反面尺度不同"。
+        # 所以它不走 `_auto_apply_edit`（不写 job），改的是 PrinterConfig，下一批打印生效；
+        # 与「选项 → 打印缩放…」对话框是同一份配置的两个入口（互相实时同步）。
+        self._label_scale = QLabel("缩放：")
+        gl.addWidget(self._label_scale)
+        _scale_row = QHBoxLayout()
+        _scale_row.setContentsMargins(0, 0, 0, 0)
+        _scale_row.setSpacing(6)
+        self._edit_scale_mode = QComboBox()
+        self._edit_scale_mode.addItems(list(SCALE_PANEL_LABELS))
+        _disable_combo_wheel(self._edit_scale_mode)
+        # 面板最窄被拖到 ~180px：下拉按可用宽度收缩、但保底 60px，
+        # 否则按最长项要 ~200px，会把整个编辑面板的最小宽度顶回 240px 以上
+        # —— verify_duplex_hint_layout 量的就是这个。
+        # 2026-11-18 用户反馈「文字和数字的比例不对，文字要大一些」：数字框改成固定窄框
+        # （`_edit_scale_percent` 只有 "100 %" 几个字符），剩下的宽度全给下拉 —— 否则
+        # 下拉连"适合可打印区"都显示不全（现场截图里只剩「适合」+ 省略号）。
+        self._edit_scale_mode.setMinimumWidth(60)
+        self._edit_scale_mode.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._edit_scale_mode.setMinimumContentsLength(4)
+        self._edit_scale_mode.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # 弹层列表单独放宽：合上时下拉可能还剩省略号，但点开必须能看全整句
+        # （2026-11-18 第二次反馈「继续加大文字所占的比例」—— 文字区优先，数字只能占最窄）。
+        self._edit_scale_mode.view().setMinimumWidth(176)
+        _scale_row.addWidget(self._edit_scale_mode, 1)
+        self._edit_scale_percent = QSpinBox()
+        self._edit_scale_percent.setRange(SCALE_PERCENT_MIN, SCALE_PERCENT_MAX)
+        self._edit_scale_percent.setSingleStep(5)
+        self._edit_scale_percent.setSuffix("%")
+        self._edit_scale_percent.setAlignment(Qt.AlignCenter)
+        self._edit_scale_percent.setMinimumWidth(0)
+        # 数字框固定成"刚好放下 400%"的窄框：宽度不再随面板伸缩，
+        # 面板变窄时省下来的像素全部归下拉文字（比例 2.5:1 以上）。
+        self._edit_scale_percent.setFixedWidth(64)
+        # keyboardTracking=False：逐字输入（1 → 15 → 150）不逐位夹到下限/触发落盘，
+        # 只有回车/失焦/点上下箭头才发一次 valueChanged。
+        self._edit_scale_percent.setKeyboardTracking(False)
+        _hide_spin_buttons(self._edit_scale_percent)
+        _scale_row.addWidget(self._edit_scale_percent, 0)
+        gl.addLayout(_scale_row)
+        self._label_scale_hint = QLabel("")
+        self._label_scale_hint.setObjectName("sectionHint")
+        self._label_scale_hint.setWordWrap(True)
+        # 与 duplexHint / selectedFileLabel 同策略：折行 + 水平 Ignored + 最小宽 0，
+        # 否则这句说明会把编辑面板的最小宽度撑起来（窄面板下就是"整句被裁掉"）
+        self._label_scale_hint.setMinimumWidth(0)
+        self._label_scale_hint.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        gl.addWidget(self._label_scale_hint)
+        self._edit_scale_mode.currentIndexChanged.connect(self._on_scale_edit_changed)
+        self._edit_scale_percent.valueChanged.connect(self._on_scale_edit_changed)
+        # 启动时没有选中文件 ⇒ 先灰着（_on_table_selection 选中文稿后再放开）
+        self._scale_row_usable = False
+        self._set_scale_edit_enabled(False)
+
         # 图片方向（仅图片文件可用）：auto=自动 / landscape=横向 / portrait=竖向
         self._label_img_orientation = QLabel("图片方向：")
         gl.addWidget(self._label_img_orientation)
@@ -14745,6 +15240,9 @@ class MainWindow(QMainWindow):
         # 全局渲染 DPI
         dpi_map = {0: 0, 200: 1, 300: 2, 400: 3, 600: 4}
         self._render_dpi_combo.setCurrentIndex(dpi_map.get(self._config.render_dpi, 0))
+
+        # 打印缩放（右侧面板那一行 + 选项菜单对话框共用同一份配置）
+        self._sync_scale_edit()
 
         # 附加服务
         self._delivery_onoff_combo.blockSignals(True)
@@ -16787,6 +17285,12 @@ class MainWindow(QMainWindow):
         if staged_count:
             _msg += f"（{staged_count} 个已复制到暂存副本，原件删除/移动不影响打印）"
         self._log(_msg)
+        # 可撤销（Ctrl+Z）：只记这一批新增的行；5 分钟外的历史自动作废
+        self._push_edit_history({
+            "action": "add", "tab": key, "tab_obj": tab,
+            "jobs": list(new_jobs),
+            "rows": list(range(rows_before, rows_before + len(new_jobs))),
+        })
         # 字体缺失检测（2026-10-31）：只对新加的这批排后台检查（查的是源文件，不是预转换 PDF）
         self._queue_font_checks(new_jobs, key)
         # 只为**本次新增**的行启动预转换（行号连续；别把 rows_before 之前的老行再渲染一遍）
@@ -16945,8 +17449,14 @@ class MainWindow(QMainWindow):
         return paths
 
     def _staged_reference_paths(self) -> set[str]:
-        """收集仍被引用的暂存副本路径：全部标签页任务 + 撤回备份 + 打印批次 + 未落地的云端任务。"""
+        """收集仍被引用的暂存副本路径：全部标签页任务 + 撤回备份 + 打印批次 + 未落地的云端任务
+        + 撤销/反撤销历史（5 分钟内删掉的文件要能原地放回来）。"""
         refs: list[str] = []
+        # 顺手把过期的撤销历史丢掉 —— 过期条目里的文件就可以被清扫了
+        try:
+            self._prune_edit_history()
+        except Exception:
+            pass
         for tab in self._config.tabs.values():
             for job in (tab.jobs or []):
                 if getattr(job, 'file_path', ''):
@@ -16955,6 +17465,12 @@ class MainWindow(QMainWindow):
             for job in (jobs or []):
                 if getattr(job, 'file_path', ''):
                     refs.append(job.file_path)
+        for stack in (getattr(self, '_edit_undo_stack', None),
+                      getattr(self, '_edit_redo_stack', None)):
+            for entry in (stack or []):
+                for job in (entry.get("jobs") or []):
+                    if getattr(job, 'file_path', ''):
+                        refs.append(job.file_path)
         for job in (getattr(self, '_flat_jobs', None) or []):
             if getattr(job, 'file_path', ''):
                 refs.append(job.file_path)
@@ -17052,6 +17568,186 @@ class MainWindow(QMainWindow):
         if jobs:
             # 撤回已取消 = 清空确认 → 回收这些任务的暂存副本
             self._sweep_staged_files("清空已确认")
+
+    # ──────── 撤销 / 反撤销（Ctrl+Z / Ctrl+Y，2026-11-18 用户需求）────────
+    # 只记「添加文件」「删除文件」两种结构变化：改份数/页码/双面这些是字段级实时编辑，
+    # 各自有回退逻辑，再套一层撤销栈只会让 Ctrl+Z 变得不可预料。
+    # 只允许撤销 5 分钟内的修改（`EDIT_UNDO_TIMEOUT`）：更早的操作多半已经开打/离开工位，
+    # 让人按一次 Ctrl+Z 把半小时前的文件清单改回去，比不能撤销更危险。
+    EDIT_UNDO_TIMEOUT = 300.0
+    EDIT_UNDO_LIMIT = 60
+
+    def _prune_edit_history(self) -> None:
+        """把超过 5 分钟的历史丢掉（撤销与反撤销都按这个窗口作废）。"""
+        cutoff = time.time() - float(self.EDIT_UNDO_TIMEOUT)
+        for stack in (self._edit_undo_stack, self._edit_redo_stack):
+            stack[:] = [e for e in stack if float(e.get("ts") or 0.0) >= cutoff]
+
+    def _push_edit_history(self, entry: dict) -> None:
+        """记一条可撤销的结构变化。新操作 ⇒ 反撤销栈作废（与文本编辑器的口径一致）。"""
+        try:
+            self._prune_edit_history()
+            entry["ts"] = time.time()
+            self._edit_undo_stack.append(entry)
+            if len(self._edit_undo_stack) > self.EDIT_UNDO_LIMIT:
+                del self._edit_undo_stack[:-self.EDIT_UNDO_LIMIT]
+            self._edit_redo_stack.clear()
+        except Exception as e:              # 记账失败绝不能影响加文件/删文件本身
+            logger.warning(f"记录撤销历史失败: {e}")
+
+    def _forget_edit_history(self, tab_key: str = "") -> None:
+        """丢掉某标签页的历史（清空列表、关闭标签页这类「整页状态重置」之后用）。"""
+        key = str(tab_key or self._current_tab)
+        for stack in (self._edit_undo_stack, self._edit_redo_stack):
+            stack[:] = [e for e in stack if str(e.get("tab") or "") != key]
+
+    def _edit_entry_block_reason(self, entry: dict, action: str = "") -> str:
+        """这条历史按 `action`（add/remove）现在还能不能应用；返回空串 = 可以。"""
+        action = action or str(entry.get("action") or "")
+        key = str(entry.get("tab") or "")
+        tab = self._config.tabs.get(key)
+        if tab is None:
+            return f"标签页 {key} 已被关闭"
+        if entry.get("tab_obj") is not None and entry.get("tab_obj") is not tab:
+            # 标签页被删过又重编号（1→2），旧条目对不上具体那个页面了
+            return "标签页已经重建，旧历史对不上了"
+        if bool(getattr(tab, "frozen", False)):
+            return f"标签页 {key} 已锁定（已提交打印）"
+        jobs = list(getattr(tab, "jobs", []) or [])
+        targets = list(entry.get("jobs") or [])
+        for job in targets:
+            if bool(getattr(job, "sent", False)):
+                return "有文件已经打印/提交，不能撤销"
+        present = [any(j is job for j in jobs) for job in targets]
+        if action == "remove" and not all(present):
+            return "有文件已经不在列表里了"
+        if action == "add" and all(present):
+            return "这些文件已经在列表里了"
+        return ""
+
+    def _apply_edit_entry(self, entry: dict, invert: bool = False) -> bool:
+        """应用一条历史（`invert=True` = 撤销时执行它的相反动作）。"""
+        action = str(entry.get("action") or "")
+        if invert:
+            action = "remove" if action == "add" else "add"
+        reason = self._edit_entry_block_reason(entry, action)
+        if reason:
+            verb = "撤销" if invert else "反撤销"
+            self._log(f"↶ 不能{verb}：{reason}")
+            return False
+        key = str(entry.get("tab") or "")
+        if not self._goto_tab(key):
+            self._log(f"↶ 标签页 {key} 已经不见了，无法撤销")
+            return False
+        tab = self._config.tabs.get(key)
+        if tab is None:
+            return False
+        jobs_now = list(getattr(tab, "jobs", []) or [])
+        if action == "remove":
+            targets = list(entry.get("jobs") or [])
+            kept = [j for j in jobs_now if not any(j is t for t in targets)]
+            if len(kept) == len(jobs_now):
+                self._log("↶ 这些文件已经不在列表里了，无法撤销")
+                return False
+            for job in targets:
+                try:
+                    # 云端/预留订单要报「放弃」：撤销一次添加 = 这一单不打了，
+                    # 不报的话顾客那头一直挂在"打印中"（与手动移除同一套动作）。
+                    if not getattr(job, "sent", False):
+                        self._abandon_cloud_job(job)
+                except Exception as e:
+                    logger.warning(f"撤销添加时放弃订单失败: {e}", exc_info=True)
+                try:
+                    self._cancel_convert_worker_for_path(job.file_path)
+                except Exception:
+                    pass
+            self._set_jobs_of_tab(key, kept)
+            # 撤销「添加」后暂存副本先留着（反撤销要把它放回来），过期由清扫按年龄回收
+            self._sweep_staged_files("撤销添加", min_age_seconds=self.EDIT_UNDO_TIMEOUT + 30)
+            self._log(f"↶ 已撤销添加 {len(targets)} 个文件（标签页 {key}）")
+            return True
+        if action == "add":
+            targets = [j for j in (entry.get("jobs") or [])
+                       if not any(j is k for k in jobs_now)]
+            if not targets:
+                self._log("↶ 这些文件已经在列表里了")
+                return False
+            rows = list(entry.get("rows") or [])
+            pairs = sorted(zip(rows, targets), key=lambda p: int(p[0] or 0))
+            jobs = list(jobs_now)
+            for row, job in pairs:
+                pos = max(0, min(int(row or 0), len(jobs)))
+                jobs.insert(pos, job)
+            self._set_jobs_of_tab(key, jobs)
+            times = entry.get("times")
+            if times:
+                cur = self._config.tabs.get(key)
+                if cur is not None and not (getattr(cur, "created_at", "")
+                                            or getattr(cur, "started_at", "")
+                                            or getattr(cur, "first_added_at", "")):
+                    # 删光时订单时间被作废过 ⇒ 撤销把同一单的时间还回去
+                    cur.created_at = str(times[0] or "")
+                    cur.started_at = str(times[1] or "")
+                    cur.first_added_at = str(times[2] or "")
+                    self._save_config()
+            self._log(f"↶ 已撤销删除 {len(targets)} 个文件（标签页 {key}）")
+            return True
+        return False
+
+    def _set_jobs_of_tab(self, key: str, jobs: list) -> None:
+        """把任务列表写回指定标签页并刷新界面（撤销/反撤销专用入口）。"""
+        tab = self._config.tabs.get(key)
+        if tab is None:
+            return
+        if key == self._current_tab:
+            # 走既有入口：含「两页别共享同一份 list」守卫 + _save_config()
+            self._set_current_jobs(list(jobs))
+        else:
+            tab.jobs = list(jobs)
+            self._save_config()
+        if not jobs:
+            self._reset_tab_order_times(key)
+        if key == self._current_tab:
+            self._rebuild_table()
+            self._update_total_cost()
+            self._refresh_tab_display()
+            self._sync_edit_enabled(False)
+
+    def _on_shortcut_undo(self):
+        """Ctrl+Z：撤销最近一次「添加文件 / 删除文件」（只认 5 分钟内）。"""
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            return                      # 输入框里 Ctrl+Z 是文本撤销，别抢
+        try:
+            self._prune_edit_history()
+            if not self._edit_undo_stack:
+                self._log("↶ 没有可撤销的操作（只记录 5 分钟内的添加/删除）")
+                return
+            entry = self._edit_undo_stack.pop()
+            if not self._apply_edit_entry(entry, invert=True):
+                return
+            self._edit_redo_stack.append(entry)
+        except Exception as e:
+            logger.exception("撤销失败")
+            self._log(f"↶ 撤销失败：{e}")
+
+    def _on_shortcut_redo(self):
+        """Ctrl+Y：反撤销（恢复刚才被撤销的添加/删除）。"""
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QTextEdit, QPlainTextEdit)):
+            return
+        try:
+            self._prune_edit_history()
+            if not self._edit_redo_stack:
+                self._log("↷ 没有可反撤销的操作（只记录 5 分钟内的添加/删除）")
+                return
+            entry = self._edit_redo_stack.pop()
+            if not self._apply_edit_entry(entry, invert=False):
+                return
+            self._edit_undo_stack.append(entry)
+        except Exception as e:
+            logger.exception("反撤销失败")
+            self._log(f"↷ 反撤销失败：{e}")
 
     def _on_progress(self, current: int, total: int, status: str):
         """更新进度条。"""
@@ -17257,6 +17953,7 @@ class MainWindow(QMainWindow):
             # 驱动默认纸）。这里不再用全局 paper_size，否则补救一趟又会把 A4 压给 Word/PDF。
             paper="",
             dpi=int(self._config.render_dpi or 0),
+            # 缩放：**不传**（None）—— 让 worker 用台账记录里那一批的值，补打才是原样复现。
             parent=self)
         worker.progress.connect(self._on_progress)
         worker.log_message.connect(self._log)
@@ -17672,6 +18369,34 @@ class MainWindow(QMainWindow):
             # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
             logger.exception("保存默认任务参数失败")
             QMessageBox.warning(self, "默认任务参数",
+                                f"保存失败：{type(e).__name__}: {e}")
+
+    def _on_print_scale_options(self):
+        """选项 → 打印缩放…：PDF 按多大比例画到纸上（2026-11-18 用户需求）。
+
+        只管渲染那一路（`pdf_printer.plan_page_raster` 的缩放因子）：Word/PDF/图片
+        最终都转成 PDF 再光栅化，所以都吃这一项；表格由 Excel 版式自己缩放，不叠加。
+        值存在 `PrinterConfig.scale_mode/scale_percent`，随 print_config.json 落盘，
+        **下一批打印生效**（已经在打的那一批不会中途换缩放）。
+        """
+        try:
+            dlg = PrintScaleDialog(
+                self,
+                scale_mode=self._config.scale_mode,
+                scale_percent=self._config.scale_percent,
+                theme_manager=self._theme_manager)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            mode, percent = dlg.values()
+            self._config.scale_mode = mode
+            self._config.scale_percent = int(percent)
+            self._save_config()
+            self._sync_scale_edit()   # 右侧面板那一行跟着变（两个入口一份配置）
+            self._log(f"🔍 打印缩放已设为：{describe_scale(mode, percent)}（下一批打印生效）")
+        except Exception as e:
+            # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
+            logger.exception("保存打印缩放失败")
+            QMessageBox.warning(self, "打印缩放",
                                 f"保存失败：{type(e).__name__}: {e}")
 
     def _on_printer_duplex_capability(self):
@@ -19852,9 +20577,12 @@ class MainWindow(QMainWindow):
                               dpi=self._config.render_dpi)
         # 纸张大小用属性赋值而不是构造关键字，因为验收脚本里的 DuplexFlushWorker 桩
         # 只认 (stack, batch_dir, printer_name, dpi)；真实类在 __init__ 里总会建好
-        # self._paper（默认 "" = 沿用打印机默认纸）。
+        # self._paper（默认 "" = 沿用打印机默认纸）。缩放同理：整叠第 2 趟必须与各单
+        # 第 1 趟同一套缩放（正反面一张缩、一张不缩 ⇒ 页面对不齐）。
         if hasattr(w, "_paper"):
             w._paper = _flush_paper
+        if hasattr(w, "_scale_mode"):
+            w._scale_mode, w._scale_percent = self._config.print_scale()
         w.progress.connect(self._on_progress)
         w.log_message.connect(self._log)
         w.done.connect(self._on_stack_flush_done)
@@ -19945,6 +20673,8 @@ class MainWindow(QMainWindow):
                 printer=self._config.printer_name,
                 # 补救要按"原样"补第 2 趟：各单纸张一致才沿用，混合走驱动默认纸
                 paper=(_papers.pop() if len(_papers) == 1 else ""),
+                scale_mode=self._config.print_scale()[0],
+                scale_percent=self._config.print_scale()[1],
                 rotate_mode=(duplex_remedy.ROTATE_PER_FILE if self._stack.rotate is None
                              else duplex_remedy.ROTATE_FIXED),
                 rotate=bool(self._stack.rotate),
@@ -20811,6 +21541,9 @@ class MainWindow(QMainWindow):
             stack_more_pending=lambda: bool(getattr(self, "_stack_entry_wait", None)),
             # 纸张大小：跨文件类型的全局默认（配置里没有这个键的老配置 ⇒ A4）
             paper=self._config.paper_size,
+            # 打印缩放：全局默认（选项 → 打印缩放…）；两趟/封面/整叠都从这一份传下去
+            scale_mode=self._config.scale_mode,
+            scale_percent=self._config.scale_percent,
             pass2_watch=getattr(self, "_pass2_watch", None),
         )
         worker.progress.connect(self._on_progress)
@@ -21703,6 +22436,10 @@ class MainWindow(QMainWindow):
             "<tr><td><b>Ctrl+C</b></td><td>复制合计金额</td></tr>"
             "<tr><td><b>Ctrl+Shift+C</b></td><td>复制计费明细</td></tr>"
             "<tr><td><b>Delete</b> / <b>Ctrl+D</b></td><td>删除选中文件</td></tr>"
+            "<tr><td><b>Ctrl+Z</b></td>"
+            "<td>撤销添加/删除文件（只认 5 分钟内的操作；输入框里是文本撤销）</td></tr>"
+            "<tr><td><b>Ctrl+Y</b></td>"
+            "<td>反撤销（恢复刚才被撤销的添加/删除）</td></tr>"
             "<tr><td><b>Ctrl+V</b></td><td>粘贴文件</td></tr>"
             "<tr><td><b>Ctrl+T</b> / <b>Ctrl+N</b></td><td>新建标签页</td></tr>"
             "<tr><td><b>Ctrl+W</b></td><td>关闭当前标签页（未打印的先确认）</td></tr>"
@@ -23179,6 +23916,8 @@ class MainWindow(QMainWindow):
                     self._config.paper_size,
                     [str(getattr(_j, "file_path", "") or "") for _j in (jobs or [])]),
                 dpi=int(self._config.render_dpi or 0),
+                scale_mode=self._config.print_scale()[0],
+                scale_percent=self._config.print_scale()[1],
                 tray_foreign=_n,
                 items=items,
                 pdf="",
@@ -24100,6 +24839,8 @@ class MainWindow(QMainWindow):
             str(getattr(_tab_cleared, "first_added_at", "") or ""))
         self._reset_tab_order_times(self._current_tab)
         self._set_current_jobs([])
+        # 清空 = 整页状态重置：之前的加/删历史对不上现在的列表了，一并丢掉
+        self._forget_edit_history(self._current_tab)
         # 预约单指向该标签页 → 联动清理状态机（防到点打印空标签页/假打印）
         self._cleanup_scheduled_orders_for_tab(self._current_tab, reason="标签页已清空")
         self._rebuild_table()
@@ -24144,6 +24885,12 @@ class MainWindow(QMainWindow):
         if not rows:
             return
         jobs = self._get_current_jobs()
+        # 可撤销（Ctrl+Z）：先留一份「删了谁、原来在第几行」的账，删除成功后再入栈
+        _removed_items = [(int(row), jobs[row]) for row in sorted(rows)
+                          if 0 <= row < len(jobs)]
+        _times_before = (str(getattr(self._config.tabs.get(self._current_tab), "created_at", "") or ""),
+                         str(getattr(self._config.tabs.get(self._current_tab), "started_at", "") or ""),
+                         str(getattr(self._config.tabs.get(self._current_tab), "first_added_at", "") or ""))
         # 通知后端放弃被移除的云端任务（已完成的跳过）
         for row in rows:
             if row < len(jobs):
@@ -24167,6 +24914,17 @@ class MainWindow(QMainWindow):
         self._update_total_cost()
         self._refresh_tab_display()
         self._sync_edit_enabled(False)
+        # 可撤销（Ctrl+Z）：删了哪些、原来在第几行、当时的订单时间都记下（5 分钟内可还原）
+        # 必须先入栈再清扫：清扫只删「没人引用」的暂存副本，历史里的任务要算引用，
+        # 否则撤销回来的是一个指向已被删掉文件的空壳。
+        if _removed_items:
+            self._push_edit_history({
+                "action": "remove", "tab": self._current_tab,
+                "tab_obj": self._config.tabs.get(self._current_tab),
+                "jobs": [job for _row, job in _removed_items],
+                "rows": [row for row, _job in _removed_items],
+                "times": _times_before,
+            })
         # 被移除任务的暂存副本已无人引用 → 立即回收（仍被其他标签页/打印批次引用的会保留）
         self._sweep_staged_files("移除任务")
 

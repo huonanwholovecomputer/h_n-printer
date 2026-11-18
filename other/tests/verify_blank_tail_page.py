@@ -41,7 +41,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import paths  # noqa: E402
 from pdf_printer import (detect_trailing_blank_pages, page_is_blank,  # noqa: E402
-                         page_text_is_furniture)
+                         page_text_is_furniture, page_text_is_page_number_only)
 from printer_config import (PrintJob, TabSettings, _count_pages_in_range,  # noqa: E402
                             calc_cost, format_page_selection, split_tail_blank)
 
@@ -95,6 +95,23 @@ def build_pdf(name, spec):
             page.draw_rect(fitz.Rect(55.45, 28.75, 539.9, 780.6), width=1)
             page.insert_text((79.8, 45), "2.思考题（课后完成）", fontsize=10)
             page.insert_text((280, 832), "第 6 页", fontsize=9)
+        elif kind == "footer_box":
+            # 2026-11-18 现场（WPS 的 .doc）：页码是页脚里的独立文本框，14pt，
+            # 导出后文字 bbox 探出下家具带 2.2pt（y1≈777.9 vs 带边界 774.6）⇒
+            # 旧判据「必须完整落在带内」把它当正文，末页白纸照样打出来。
+            page.insert_text((62, 776.8), "- 2 -", fontsize=14)
+        elif kind == "footer_box_far":
+            # 同样长相的页码但压进版心约 30pt（超出页码余量）⇒ 仍按有内容处理：
+            # 宁可多打一张白纸，也不能把真内容当空白排掉。
+            page.insert_text((62, 745), "- 2 -", fontsize=14)
+        elif kind == "header_box_pageno":
+            # 2026-11-18 补充形态：页眉标题**完整落在顶带内** + 页脚文本框页码（探出下带）。
+            # 学校申请表模板的常见长相 —— 不能因为"整页文字不全都是页码"就整页不放宽。
+            page.insert_text((72, 40), "附件5：本专科生国家助学金申请表", fontsize=9)
+            page.insert_text((62, 776.8), "- 2 -", fontsize=14)
+        elif kind == "body_number_mid":
+            # 正文中间孤零零一个数字（不是页码）：不能因为"像页码"就放宽判定
+            page.insert_text((280, 420), "3", fontsize=14)
         elif kind == "body_bottom":
             # 正文区最后一行（Word 默认下边距 72pt ⇒ 正文落在页脚带以外）
             page.insert_text((72, 760), "最后一行正文内容", fontsize=10)
@@ -140,6 +157,38 @@ p_header_rule = build_pdf("a_header_rule.pdf", [("text", "page1"), ("header_rule
 check("★ 页码 + 页眉标题 + 页眉装饰线（现场第 3 页长相）⇒ 1",
       detect_trailing_blank_pages(p_header_rule) == 1,
       str(detect_trailing_blank_pages(p_header_rule)))
+
+# 2026-11-18 现场（WPS 的 .doc）：页码装在页脚文本框里，14pt，bbox 只探出下家具带 2.2pt
+p_footer_box = build_pdf("a_footer_box.pdf", [("text", "page1"), ("footer_box",)])
+check("★ 页码在页脚文本框里、探出家具带 2.2pt（2026-11-18 WPS 现场）⇒ 1",
+      detect_trailing_blank_pages(p_footer_box) == 1,
+      str(detect_trailing_blank_pages(p_footer_box)))
+check("★ 该页「整页文字就是页码」判据为真（余量只给页码样文字）⇒ True",
+      page_text_is_page_number_only(fitz.open(p_footer_box)[1]) is True)
+check("★ 同页 page_text_is_furniture 也必须为真（余量在家具判据里生效）⇒ True",
+      page_text_is_furniture(fitz.open(p_footer_box)[1]) is True)
+check("★ 内容页第 1 页的「整页文字就是页码」判据为假 ⇒ False",
+      page_text_is_page_number_only(fitz.open(p_footer_box)[0]) is False)
+
+p_footer_far = build_pdf("a_footer_box_far.pdf", [("text", "page1"), ("footer_box_far",)])
+check("★ 页码压进版心约 30pt（超出页码余量）⇒ 0（宁可多打一张白纸，也不误排内容）",
+      detect_trailing_blank_pages(p_footer_far) == 0,
+      str(detect_trailing_blank_pages(p_footer_far)))
+
+# 2026-11-18 补充形态：页眉标题 + 页脚文本框页码（申请表模板常见）—— 余量按"带内那一侧
+# 的文字整体像不像页码"给，别因为页面还有页眉就把整页的余量取消
+p_header_box = build_pdf("a_header_box_pageno.pdf",
+                         [("text", "page1"), ("header_box_pageno",)])
+check("★ 页眉标题 + 页脚文本框页码（探出下带 2.2pt）⇒ 1",
+      detect_trailing_blank_pages(p_header_box) == 1,
+      str(detect_trailing_blank_pages(p_header_box)))
+check("★ 同页 page_text_is_furniture 为真（页眉在带内、页码走余量）⇒ True",
+      page_text_is_furniture(fitz.open(p_header_box)[1]) is True)
+
+p_body_num = build_pdf("a_body_number.pdf", [("text", "page1"), ("body_number_mid",)])
+check("★ 正文中间一个孤立数字（不是页码）⇒ 0",
+      detect_trailing_blank_pages(p_body_num) == 0,
+      str(detect_trailing_blank_pages(p_body_num)))
 
 p_body_bottom = build_pdf("a_body_bottom.pdf", [("text", "page1"), ("body_bottom",)])
 check("★ 末页正文区最后一行有字（Word 默认下边距，正文在页脚带外）⇒ 0（不能误判）",
