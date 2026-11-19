@@ -1,9 +1,9 @@
 {
-  "version": "4.6.14",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.14.exe",
-  "md5": "bb6236550398c9c215815d6974eb7a13",
-  "sha256": "e33a81a72773f6f0f5055b3b764693ae71222b68fe71328214d4bbcef7ec1059",
-  "notes": "v4.6.14：一次全面审计后的修复，重点是「别再悄悄丢单」。① 攒批：第 1 趟中途失败的单不再被记成「已打完」，改记半成品补救；第 2 趟开打前先落痕迹，崩溃或退出后重开能看见，不再当无事发生；第 2 趟页数与出纸槽实收对不上时拒绝启动。② 手动双面：第 1 趟中途失败进补救台账，不再算第 1 趟打完；台账写盘失败会明确报错。③ 钱：超时单可以人工订正了（六项终态白名单 + 当前状态必须是终态 + 有活跃子任务就拒绝）；收支清算与统计按「单面页」真实计价，单面页不再按双面收费。",
+  "version": "4.6.17",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.17.exe",
+  "md5": "856d0fd1677a98ef2a2476eb4d768d8c",
+  "sha256": "b27f7d957ce700204f89c63bffb290a89eb2d815ceafff39566fbcb56a260ffb",
+  "notes": "v4.6.17：四个现场问题一次修完。① 本机外部打印监视以前在装机版里一条都记不到——打包漏收了 win32timezone，枚举打印队列每轮直接报错又被日志吞掉；现已补全依赖、加了兜底并让扫描异常可见。② 收支清算里现在每一单都有首页缩略图（本地单由本机渲染，不再依赖云端文件）。③ 同一批纸被记成两张单（取号超时后晚到的云端号另起一单）已修，晚到的号会接管本地临时号。④ 没有自动双面器的打印机有了「第一趟中/第二趟等待中/第二趟中」三个中间状态，哪一趟被跳过会写进失败原因，半成品补救补打成功后状态自动修回。另外：CAD 里 0 宽细线以前会被打成白纸，现在保真；收支清算取数改成压缩传输 + 索引化，整月数据从 3~4 秒降到 0.3 秒内；结算页预览放大/还原加了过渡动画。",
   "sig_algo": "ed25519",
-  "sig": "RPXOAbzjKB40V7Xe9ynGXs0ltWjHisSKFxdeqG8z16eDIzodwJox1pP07+OeSjT77EmFZooQs0IOl8RVbcQADQ=="
+  "sig": "lY+OR9ekCPbLQ+N7MKXB1t68I6G0o7lBeShaMOAv88UyiKFQusXcmdwnhNXRCoFjMO4u9oa8mLcjWH39z5zBAg=="
 }
