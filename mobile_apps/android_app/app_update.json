@@ -1,8 +1,8 @@
 {
-  "version": "1.1.70",
-  "versionCode": 71,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.70.apk",
-  "md5": "b9064f67f1a9015ae0b976db0ec2c023",
-  "notes": "v1.1.70：修复登录凭证「宽限期」被无限续命的问题 —— 原来每登录一次就把 14 天宽限往后推，到期也永远不强制重新绑定；现在宽限期从首次签发时刻算起，到期后必须重新验证设备。App 同时把设备凭证存在本地，换机或清数据后能自动重新登记。",
+  "version": "1.1.71",
+  "versionCode": 72,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.71.apk",
+  "md5": "8b77939b917563e38655e72c184c90a8",
+  "notes": "v1.1.71：订单列表的预览图改成分层尺寸 + WebP 协商 —— 同一张首页图小 17 倍左右，弱网下列表滚动明显跟手；打印页新增「打印缩放」与 Ctrl+Z 撤销，并补上末页空白页、封面页守卫与字体缺字提示。",
   "force": false
 }

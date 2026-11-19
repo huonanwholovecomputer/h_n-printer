@@ -71,9 +71,21 @@ else:
                     'New-Item -ItemType Directory -Force -Path $distDir | Out-Null\n'
                     "[IO.File]::WriteAllText($apk, 'fake apk')\n") % app.replace('\\', '\\\\')
             open(harness, 'w', encoding='utf-8-sig').write(head + block)
+            # 2026-11-19 现场：父进程（pwsh 7 / CI）不会把 PSModulePath 导给子进程，而 Windows
+            # PowerShell 5.1 少了它就加载不到 Microsoft.PowerShell.Utility ⇒ 脚本里的
+            # Get-FileHash 变成「无法识别的 cmdlet」、md5 写成 null（假构建环境的假红）。
+            # 显式补上 5.1 的默认模块路径，让这段代码的行为与用户真跑脚本时一致。
+            env = dict(os.environ)
+            if not env.get('PSModulePath'):
+                env['PSModulePath'] = ';'.join([
+                    os.path.join(os.environ.get('USERPROFILE') or os.path.expanduser('~'),
+                                 'Documents', 'WindowsPowerShell', 'Modules'),
+                    r'C:\Program Files\WindowsPowerShell\Modules',
+                    r'C:\Windows\system32\WindowsPowerShell\v1.0\Modules',
+                ])
             r = subprocess.run([pwsh, '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
                                 '-File', harness], capture_output=True, text=True,
-                               encoding='utf-8', errors='replace', timeout=120)
+                               encoding='utf-8', errors='replace', timeout=120, env=env)
             chk('回写代码块能跑通（rc=0）', r.returncode == 0, (r.stdout + r.stderr)[-400:])
             for rel in ('app_update.json', 'updates/app_update.json', 'dist/app_update.json'):
                 p = os.path.join(app, rel)
