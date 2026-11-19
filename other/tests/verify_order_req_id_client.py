@@ -309,6 +309,11 @@ class _FakeOffline:
                                      "cost": 0.3, "duplex": "off", "page_range": ""}]),
                 0.3, "2026-10-25 12:00:00", "乙成员", 0, "")
 
+    def request_id_of(self, num):
+        # 2026-11-19 起离线库多了 request_id 列；这条用例是「孤儿单」（标签页已清理），
+        # 真库查不到键 ⇒ 必须回空串，绝不允许客户端现编一把新键。
+        return ""
+
 
 win._config.tabs = {"4": TabSettings(jobs=[])}       # 目标标签页里没有这个本地号的 job
 win._current_tab = "4"

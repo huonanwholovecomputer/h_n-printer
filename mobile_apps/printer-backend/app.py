@@ -3667,6 +3667,30 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 字段已存在
 
+    # v7.28 迁移（2026-11-19 用户要求）：orders 添加「手动双面前进到哪一趟」的**显示层**状态。
+    #   duplex_stage TEXT：'' / pass1（第一趟中）/ pass2_wait（第二趟等待中）/ pass2（第二趟中）
+    #                      / pass2_skipped（第二趟被跳过）/ pass1_skipped（第一趟被跳过）
+    #                      / pass2_failed（第二趟失败）
+    #   duplex_note  TEXT：给人看的一句话（如「第二趟被跳过（第 1 趟已打 3 张纸）」）
+    #   为什么不改 status：本地单在**打印启动那刻**就写 status='sent'（单据化 + 幂等），
+    #   攒批/手动双面的中间态从来不是失败（硬规矩：跳过不判失败，进半成品补救台账），
+    #   改 status 会同时改掉结算口径（_count_pages_in_range 只认 sent）→ 盈亏跟着错。
+    #   所以另立两列，只影响结算页的「状态」标签与悬浮说明。
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+        _added_duplex = False
+        if "duplex_stage" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN duplex_stage TEXT DEFAULT ''")
+            _added_duplex = True
+        if "duplex_note" not in cols:
+            conn.execute("ALTER TABLE orders ADD COLUMN duplex_note TEXT DEFAULT ''")
+            _added_duplex = True
+        if _added_duplex:
+            conn.commit()
+            print("  已添加 orders.duplex_stage / orders.duplex_note 列（手动双面中间态，仅显示层）")
+    except sqlite3.OperationalError:
+        pass  # 字段已存在
+
     # v28 迁移：order_files 添加 last_operator_client 列（**上次**领取该子任务的设备）。
     #   背景（🔴-D3）：事件处理器的归属校验写成「operator_client 为空即放行」，而
     #   operator_client 会被**断线回滚**（on_disconnect）与**孤儿回收**
@@ -4236,7 +4260,20 @@ def aggregate_order_status(conn, order_id):
     ).fetchall()
     if not rows:
         return None
-    statuses = [r["status"] for r in rows]
+    return aggregate_status_from_statuses([r["status"] for r in rows])
+
+
+def aggregate_status_from_statuses(statuses):
+    """按一组子任务状态算父订单聚合状态（纯函数，无 IO）。
+
+    2026-11-19：从 aggregate_order_status() 抽出来的 —— 结算明细一次要聚合上千个订单，
+    原先逐单 `SELECT status FROM order_files WHERE order_id = ?` 是 N+1（实测 1500 次
+    0.009 s，数据再长就是几百毫秒）。那边已经有整批 of_rows（含 status），直接喂进来即可，
+    语义与逐单查询**完全同一份代码**，不存在第二套口径。
+    """
+    statuses = list(statuses or [])
+    if not statuses:
+        return None
     if all(s == "sent" for s in statuses):
         return "sent"
     if all(s == "rejected" for s in statuses):
@@ -7699,8 +7736,51 @@ def _preview_tier_files(file_id: str) -> list[str]:
     return out
 
 
+# 一次盘点目录 → 「哪些 file_id 有首页缩略图」的集合（按目录 mtime 缓存）。
+# 2026-11-19 实测：结算明细整段刷新 2936 个子任务逐文件 glob 要 0.402 s（占整个接口 0.36 s
+# 的大头，且随缓存文件数与订单量同时变慢）；改成一次 listdir 后约 1 ms。
+_PREVIEW_INDEX_CACHE = {"stamp": None, "ids": frozenset()}
+
+
+def _preview_id_index():
+    """PREVIEW_DIR 里已有首页缩略图的 safe_id 集合；目录读不到时返回 None（退回逐个 glob）。
+
+    命名规则与 `_preview_stem` 同源：`<safe_id>_<mtime>[_p<页号>]_<t|p>.<ext>`。
+    用 `_PREVIEW_TIER_RE` 找末尾的 `_<mtime>_<t|p>.<ext>`，它前面的那段就是 safe_id ——
+    与老实现（`glob(f"{safe_id}_*")` + 同一条正则）逐 id 等价，见
+    other/tests/verify_revenue_perf.py 的 B 段对拍。
+    """
+    try:
+        stamp = os.stat(PREVIEW_DIR).st_mtime_ns
+    except OSError:
+        return None
+    cached = _PREVIEW_INDEX_CACHE
+    if cached.get("stamp") == stamp:
+        return cached.get("ids") or frozenset()
+    ids = set()
+    try:
+        names = os.listdir(PREVIEW_DIR)
+    except OSError:
+        return None
+    for nm in names:
+        m = _PREVIEW_TIER_RE.search(nm)
+        if m and m.start() > 0:
+            ids.add(nm[:m.start()])
+    ids = frozenset(ids)
+    cached["stamp"] = stamp
+    cached["ids"] = ids
+    return ids
+
+
 def _preview_tier_exists(file_id: str) -> bool:
-    return bool(_preview_tier_files(file_id))
+    safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64]
+    if not safe_id:
+        return False
+    ids = _preview_id_index()
+    if ids is None:
+        # 目录不可读时退回老口径，宁可慢也不误判「这一行没有预览图」
+        return bool(_preview_tier_files(file_id))
+    return safe_id in ids
 
 
 def _preview_tier_file(file_id: str, mtime_token: str, size_tok: str = "p",
@@ -12004,6 +12084,125 @@ def local_order_status():
                     "previous_status": old_status, "status": "failed"})
 
 
+# ── 手动双面中间态（2026-11-19 用户要求）──────────────────────────────────────
+# 不支持自动双面的打印机（HP LaserJet 1020）一单双面要打两趟、中间还要操作员翻纸。
+# 结算页原先这一段时间只能看到「已完成」——看不出纸走到第几趟，也看不出是哪一趟被跳过。
+# 这里只写两列**显示层**字段，status 一个字都不改：
+#   · orders.duplex_stage：pass1 / pass2_wait / pass2 / pass2_skipped / pass1_skipped
+#                          / pass2_failed / ''（结束）
+#   · orders.duplex_note ：给人看的一句话（如「第二趟被跳过（第 1 趟已打 3 张纸）」）
+# 不改 status 的三个理由：
+#   ① 本地单「打印启动即完成」是既有口径（/api/local_orders 写在开机那刻、幂等）；
+#   ② 跳过/翻纸未确认**不是失败**（硬规矩 13：进半成品补救台账，发 job_stalled）；
+#   ③ 结算口径只认 sent（_count_pages_in_range，硬规矩 7），动 status 会连带改盈亏。
+# 半成品补救补打成功后，客户端发 stage='' + restore=true，把这一单从 failed 修回 sent。
+DUPLEX_STAGES = ("", "pass1", "pass2_wait", "pass2",
+                 "pass2_skipped", "pass1_skipped", "pass2_failed")
+
+
+@app.route("/api/local/order_stage", methods=["POST"])
+def local_order_stage():
+    """本地打印工具回报「这一单手动双面走到哪一趟了」（只碰显示层字段）。
+
+    请求体：{"order_number": "HN20261119-0040", "stage": "pass2_wait",
+             "reason": "等待操作员翻纸", "restore": false}
+      · stage 为空 = 这一单的双面流程结束（成功或放弃），清掉中间态；
+      · restore=true 且 stage 为空 = 半成品补救**补打成功**，把 failed 修回 sent；
+      · 云端单（source=wechat/app）一律忽略：它们的双面由设备端自己管，按订单号改会
+        绕过任务归属校验。
+    畸形请求体（数组/字符串/数字/布尔）一律 fail-closed：未认证 403 / 带 token 400。
+    """
+    try:
+        data = request.get_json(silent=True)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        data = {}
+    token = _get_printer_token() or str(data.get("token") or "")
+    if not _authenticate_printer(token):
+        return jsonify({"success": False, "message": "token 无效"}), 403
+
+    order_number = data.get("order_number")
+    if not isinstance(order_number, str):
+        return jsonify({"success": False, "message": "缺少 order_number"}), 400
+    order_number = order_number.strip()
+    if not order_number or len(order_number) > 64:
+        return jsonify({"success": False, "message": "order_number 不合法"}), 400
+    raw_stage = data.get("stage", "")
+    stage = raw_stage.strip().lower() if isinstance(raw_stage, str) else ""
+    if stage not in DUPLEX_STAGES:
+        return jsonify({"success": False,
+                        "message": "stage 不合法（只支持 " +
+                                   " / ".join(s or "空" for s in DUPLEX_STAGES) + "）"}), 400
+    note = str(data.get("reason") or data.get("note") or "")[:200]
+    restore = bool(data.get("restore"))
+
+    with db_lock:
+        conn = get_db_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT id, status, openid, source, duplex_stage FROM orders"
+                " WHERE order_number = ?",
+                (order_number,),
+            ).fetchone()
+            if not row:
+                conn.rollback()
+                return jsonify({"success": True, "changed": False,
+                                "message": "订单不存在（可能还没上报成功）"})
+            order_id = row["id"]
+            old_status = str(row["status"] or "")
+            old_stage = str(row["duplex_stage"] or "")
+            is_local = (str(row["openid"] or "") == "local"
+                        or str(row["source"] or "") in ("", "local"))
+            if not is_local:
+                conn.rollback()
+                try:
+                    app.logger.warning(
+                        "local_order_stage 忽略云端订单: order_number=%s openid=%s source=%s",
+                        order_number, row["openid"], row["source"])
+                except Exception:
+                    pass
+                return jsonify({"success": True, "changed": False, "ignored": True,
+                                "message": "该订单属于云端订单，已忽略（双面由设备端自己管）"})
+            if old_status in ("canceled", "abandoned", "rejected"):
+                conn.rollback()
+                return jsonify({"success": True, "changed": False, "order_id": order_id,
+                                "message": f"订单已是终态 {old_status}，不覆盖"})
+            new_status = old_status
+            # 「半成品补救」补打成功 → 把这一单从 failed 修回 sent（唯一的回滚入口）。
+            # 只认显式 restore=true，避免普通收尾（stage=''）把人工订正的失败单洗白。
+            if restore and stage == "" and old_status == "failed":
+                conn.execute(
+                    "UPDATE order_files SET status = 'sent', reject_reason = ''"
+                    " WHERE order_id = ? AND status = 'failed'",
+                    (order_id,),
+                )
+                conn.execute("UPDATE orders SET status = 'sent' WHERE id = ?", (order_id,))
+                new_status = "sent"
+            conn.execute(
+                "UPDATE orders SET duplex_stage = ?, duplex_note = ? WHERE id = ?",
+                (stage, note, order_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    _tail = ""
+    if new_status != old_status:
+        _tail += f"，状态 {old_status} → {new_status}"
+    if note:
+        _tail += f"（{note}）"
+    print(f"  [LOCAL-STAGE] 本地订单 {order_number} #{order_id}"
+          f" 双面阶段 {old_stage or '-'} → {stage or '-'}{_tail}")
+    return jsonify({"success": True, "changed": True, "order_id": order_id,
+                    "duplex_stage": stage, "previous_stage": old_stage,
+                    "previous_status": old_status, "status": new_status})
+
+
 # ==================== 用户身份接口 ====================
 
 
@@ -14216,8 +14415,11 @@ def admin_statistics_revenue():
     by_user = []
 
     # ── 订单明细（时间倒序） ──
-    # v25 重构：LEFT JOIN 保留无子任务的订单（如本地放弃单），子任务状态条件移入 ON；
-    #          补充附加服务/自动打印/预约/地址等字段供收支清算云端页展示。
+    # v25 重构：保留无子任务的订单（如本地放弃单）；补充附加服务/自动打印/预约/地址等字段。
+    # 2026-11-19 性能：去掉原来的 `LEFT JOIN order_files of ON … AND of.status IN (…)`
+    # + `GROUP BY o.id` —— 这个 JOIN 不筛订单行、也不取子任务列，只是把每个订单按子任务数
+    # 物化成多行再 GROUP BY 去重（2936 个子任务 ⇒ 2936 行再收 1500 行）。子任务本来就在
+    # 下面单独批量查，等价且更快。
     order_rows = conn.execute(
         f"""SELECT o.id, o.order_number, o.source, o.openid, o.status,
                    o.total_price, o.created_at, o.delivery_enabled,
@@ -14228,14 +14430,13 @@ def admin_statistics_revenue():
                    o.pickup_address, o.remark, o.print_started_at,
                    o.received_client, o.target_client,
                    o.manual_status_by, o.manual_status_at,
-                   o.manual_user_by, o.manual_user_at
+                   o.manual_user_by, o.manual_user_at,
+                   o.duplex_stage, o.duplex_note
             FROM orders o
-            LEFT JOIN order_files of ON o.id = of.order_id AND of.status IN ({status_placeholders})
             WHERE o.created_at >= ? AND o.created_at <= ?
               AND o.status IN ({status_placeholders})
-            GROUP BY o.id
             ORDER BY o.created_at DESC""",
-        allowed_statuses + [start_date + " 00:00:00", end_date + " 23:59:59"] + allowed_statuses,
+        [start_date + " 00:00:00", end_date + " 23:59:59"] + allowed_statuses,
     ).fetchall()
 
     # 收集所有订单 ID 用于批量查询子文件
@@ -14344,7 +14545,9 @@ def admin_statistics_revenue():
         files = files_by_order.get(oid, [])
         # 状态与移动端完全一致：用子任务实时聚合（orders.status 存储值可能滞后，
         # 如任务推送后回退 queued 未刷新父订单），聚合逻辑与 /api/orders 相同。
-        agg_status = aggregate_order_status(conn, oid) or row["status"]
+        # 2026-11-19 性能：直接喂上面已批量查到的子任务状态，省掉逐单再查一次（N+1）。
+        agg_status = aggregate_status_from_statuses(
+            [f["status"] for f in files]) or row["status"]
         # 金额口径：已入账 = sent 子任务合计；应收未收 = 其余未排除状态（排队/打印中/断线未知）合计；
         # 取消/放弃/打回/失败不计（失败单大概率不收费，仍可在明细状态列看到）。
         # 文件级 is_free 免费文件不计入金额但单独计数。
@@ -14419,6 +14622,9 @@ def admin_statistics_revenue():
             # v7.18：订单归属用户的人工调整留痕（用户列 tooltip 显示"谁在何时改的归属"）
             "manual_user_by": row["manual_user_by"] or "",
             "manual_user_at": row["manual_user_at"] or "",
+            # v7.28：手动双面中间态（只影响结算页「状态」标签，不改 status 与金额口径）
+            "duplex_stage": str(row["duplex_stage"] or ""),
+            "duplex_note": str(row["duplex_note"] or ""),
             "files": files,
         })
 

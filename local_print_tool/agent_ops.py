@@ -345,7 +345,9 @@ class AgentOps:
         prev = str(self.win._current_tab)
         key = self.win._new_tab()
         if not params.get("switch", True) and prev in self._tabs():
-            self.win._goto_tab(prev)
+            # 助手在后台切页不置前（bring_to_front=False）：置前是给"要操作员看"的跳转
+            # 留的，助手连切几次会把焦点从用户手上抢走（2026-11-18 口径）
+            self.win._goto_tab(prev, bring_to_front=False)
         self.win._log(f"🤖 助手新建标签页 {key}")
         return {"tab": key, "current_tab": str(self.win._current_tab)}
 
@@ -463,7 +465,7 @@ class AgentOps:
                                               f"的页码范围无效: {raw}")
 
         if not self._is_current(key):
-            self.win._goto_tab(key)
+            self.win._goto_tab(key, bring_to_front=False)
         ok = win._start_print_worker(list(tab.jobs), tab_key=key, interactive=False)
         if not ok:
             raise AgentOpError("print_blocked", "打印没有启动（可能忙/被拦），详见程序日志")
@@ -515,7 +517,7 @@ class AgentOps:
             key = win._new_tab()
         else:
             key, _tab = self._tab(params.get("tab"))
-            if not self._is_current(key) and not win._goto_tab(key):
+            if not self._is_current(key) and not win._goto_tab(key, bring_to_front=False):
                 raise AgentOpError("not_found", f"标签页 {key} 打不开")
 
         tab = self._tabs().get(key)
@@ -554,7 +556,7 @@ class AgentOps:
             win._rebuild_table()
             raise
         if not params.get("switch", True) and prev in self._tabs() and prev != key:
-            win._goto_tab(prev)
+            win._goto_tab(prev, bring_to_front=False)
         names = "、".join((getattr(j, "display_name", "") or os.path.basename(j.file_path))
                          for j in added[:3])
         more = f" 等 {len(added)} 个" if len(added) > 3 else ""

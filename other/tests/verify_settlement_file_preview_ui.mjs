@@ -111,6 +111,17 @@ function fileGone() {
            total_sheets: 2, duplex: 'off', total_price: 0.6, status: 'sent',
            file_id: 'fidERR9', has_preview: true };
 }
+/* v7.27：本地单（整单没有 file_id）—— 缩略图由本地打印工具渲染，走 /api/local/order_thumb */
+function fileLocal() {
+  return { id: 14, file_name: '本地单文件.pdf', copies: 1, page_count: 1, total_pages: 1,
+           total_sheets: 1, duplex: 'off', total_price: 0.3, status: 'sent',
+           file_id: '', has_preview: false };
+}
+function fileLocalMissing() {
+  return { id: 15, file_name: '老单还没有图.pdf', copies: 1, page_count: 1, total_pages: 1,
+           total_sheets: 1, duplex: 'off', total_price: 0.3, status: 'sent',
+           file_id: '', has_preview: false };
+}
 function ord(id, files) {
   return { order_id: id, order_number: 'HN20261119-00' + id, source: 'local', openid: 'local',
            nickname: '', owner_name: '张三', status: 'sent',
@@ -120,7 +131,11 @@ function ord(id, files) {
            total_sheet_count: files.reduce((a, f) => a + f.total_sheets, 0),
            received_client: 'c1020', received_label: '', files: files };
 }
-const ORDERS = [ord(9001, [filePreviewable(), filePlain()]), ord(9002, [fileGone()])];
+const ORDERS = [ord(9001, [filePreviewable(), filePlain()]), ord(9002, [fileGone()]),
+                ord(9003, [fileLocal()]), ord(9004, [fileLocalMissing()])];
+/* 本地缩略图桩：只有 9003 那单有图，9004 故意 404（验「没生成过」时的提示文案） */
+const THUMB_ORDER_OK = 'HN20261119-009003';
+const THUMB_ORDER_MISSING = 'HN20261119-009004';
 
 /* 预览图夹具：800×1600 的 SVG（v7.26.2 起要验「放大按原始像素显示」，
    1×1 的 GIF 撑不出这个差异）。Chromium 能解码 <img> 里的 SVG，naturalWidth=800。 */
@@ -139,6 +154,7 @@ const PAGES_OK = 2;
 
 /* ── 桩服务 ───────────────────────────────────────────────────────────── */
 const previewHits = [];
+const thumbHits = [];
 const json = (res, obj) => { res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(obj)); };
 
 const server = http.createServer((req, res) => {
@@ -182,6 +198,20 @@ const server = http.createServer((req, res) => {
                          simplex_price: 0.3, duplex_price: 0.4, owner_name: '' });
     }
     /* 本地二进制预览通道：真页面就是这个路径，桩只负责按 id 回图 / 回错。 */
+    if (p.startsWith('/api/local/order_thumb/')) {
+      const num = p.slice('/api/local/order_thumb/'.length);
+      thumbHits.push({ order: num, name: u.searchParams.get('name') || '',
+                       token: req.headers['x-launch-token'] || '' });
+      if (num === THUMB_ORDER_MISSING) {
+        res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ success: false,
+          message: '这一单还没有本地缩略图（换新版本地工具重打一次即可生成）' }));
+      }
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Content-Length': PREVIEW_IMG.length,
+                           'X-Preview-Page': '1', 'X-Preview-Pages': '1',
+                           'Cache-Control': 'no-store' });
+      return res.end(PREVIEW_IMG);
+    }
     if (p.startsWith('/api/local/file_preview/')) {
       const id = p.slice('/api/local/file_preview/'.length);
       const page = parseInt(u.searchParams.get('page') || '1', 10);
@@ -388,11 +418,33 @@ try {
              btn: (btn.textContent || '').trim() };
   });
   chk('U13a 默认是 300×300 小舞台（图按高度适配 300），按钮文案「放大」',
+      /* 容差 3px：开窗动画 pmIn 的曲线 cubic-bezier(.2,.9,.3,1.25) 有回弹，
+         正好量在回弹帧上会读到 301（不是布局错，是 transform 把 rect 撑了 0.3%） */
       zoomBefore.zoomed === false && zoomBefore.stageW === 300 &&
-      zoomBefore.imgH === 300 && zoomBefore.natW === PREVIEW_NAT_W &&
+      Math.abs(zoomBefore.imgH - 300) <= 3 && zoomBefore.natW === PREVIEW_NAT_W &&
       zoomBefore.btn.indexOf('放大') >= 0, zoomBefore);
 
   await page.evaluate(() => document.querySelector('#fPrevMenu .fp-zoom-btn').click());
+  /* U16（v7.29）：放大要有形变过渡 —— 点下去那刻 transform 正在过渡（0.32s），结束时清干净。
+     先断过渡本身（时序稳定），再等它跑完才量尺寸，否则量到的是中间帧。 */
+  const u16 = await page.evaluate(() => {
+    const m = document.getElementById('fPrevMenu');
+    const cs = getComputedStyle(m);
+    const r = m.getBoundingClientRect();
+    return { prop: cs.transitionProperty, dur: cs.transitionDuration,
+             zooming: m.classList.contains('fp-zooming'),
+             anim: cs.animationName,
+             w: Math.round(r.width) };
+  });
+  chk('U16a 放大走 transform 过渡（0.32s），不是瞬间换尺寸',
+      u16.prop.indexOf('transform') >= 0 && u16.dur === '0.32s' && u16.zooming === true
+      && u16.w < 900, u16);
+  chk('U16b 过渡期间开窗动画 pmIn 让位（fill:both 会压住 inline transform）',
+      u16.anim === 'none', u16);
+  await page.waitForFunction(() => {
+    const m = document.getElementById('fPrevMenu');
+    return !!m && !m._fpAnimTimer && !m.style.transform && !m.style.transition;
+  }, null, { timeout: 3000 });
   await page.waitForFunction(() => {
     const m = document.getElementById('fPrevMenu');
     return !!m && m.classList.contains('fp-zoom');
@@ -443,6 +495,11 @@ try {
     const m = document.getElementById('fPrevMenu');
     return !!m && !m.classList.contains('fp-zoom');
   }, null, { timeout: 5000 });
+  /* v7.29：还原也有 320ms 过渡，等它跑完再量（否则量到中间帧） */
+  await page.waitForFunction(() => {
+    const m = document.getElementById('fPrevMenu');
+    return !!m && !m._fpAnimTimer && !m.style.transform && !m.style.transition;
+  }, null, { timeout: 3000 });
   const restored = await page.evaluate(() => {
     const m = document.getElementById('fPrevMenu');
     const st = m.querySelector('.fp-stage');
@@ -454,6 +511,46 @@ try {
   chk('U13f 点图片还原：回到 300×300 缩略舞台，按钮文案回到「放大」',
       restored.stageW === 300 && restored.imgH === 300 && restored.btn.indexOf('放大') >= 0,
       restored);
+
+  /* U17（v7.29）：放大态下关闭也要有动画 —— 先缩回缩略舞台（220ms）再摘节点，
+     不能一个视口级大窗硬切掉。用户当场问过「放大的状态没做关闭动画吗」。 */
+  await page.evaluate(() => document.querySelector('#fPrevMenu .fp-zoom-btn').click());
+  await page.waitForFunction(() => {
+    const m = document.getElementById('fPrevMenu');
+    return !!m && !m._fpAnimTimer && !m.style.transform && !m.style.transition;
+  }, null, { timeout: 3000 });
+  await page.evaluate(() => {
+    const btns = Array.prototype.slice.call(document.querySelectorAll('#fPrevMenu .fp-bar button'));
+    (btns.find((b) => (b.textContent || '').indexOf('✕') >= 0) || btns[btns.length - 1]).click();
+  });
+  const closing = await page.evaluate(() => {
+    const m = document.getElementById('fPrevMenu');
+    if (!m) return { here: false };
+    const cs = getComputedStyle(m);
+    return { here: true, prop: cs.transitionProperty, dur: cs.transitionDuration,
+             closing: m.classList.contains('pm-closing'),
+             stillZoom: m.classList.contains('fp-zoom'),
+             w: Math.round(m.getBoundingClientRect().width) };
+  });
+  await page.waitForTimeout(120);
+  const midClose = await page.evaluate(() => {
+    const m = document.getElementById('fPrevMenu');
+    return { here: !!m, w: m ? Math.round(m.getBoundingClientRect().width) : 0 };
+  });
+  await page.waitForTimeout(320);
+  const closedAt = await page.evaluate(() => !document.getElementById('fPrevMenu'));
+  chk('U17a 放大态关闭：先缩回缩略舞台（transform 过渡 0.22s），不是瞬间消失',
+      closing.here === true && closing.prop.indexOf('transform') >= 0
+      && closing.dur.indexOf('0.22s') >= 0 && closing.stillZoom === false && closing.w >= 600,
+      closing);
+  chk('U17b 放大态关闭：120ms 时浮层还在且正在缩小，约 440ms 后摘干净',
+      midClose.here === true && midClose.w > 0 && midClose.w < closing.w && closedAt === true,
+      { closingW: closing.w, midClose, closedAt });
+
+  /* 重新开一个（U8 要用小窗去关） */
+  await page.click('tr.file-expand.open .fn.pv-can');
+  await page.waitForSelector('#fPrevMenu');
+  await page.waitForTimeout(150);
 
   /* U8 ✕ 关闭 + blob 释放（同样用 JS dispatch，理由见 U7 上方的注释） */
   await page.evaluate(() => {
@@ -532,6 +629,70 @@ try {
   });
   chk('U11 云端 404 → 预览窗显示云端 message（不是白屏 / 不是裸 404）',
       errState.hint.indexOf('文件已清理') >= 0 && errState.hintVisible && !errState.imgShown, errState);
+
+  /* U14 v7.27：本地单（整单没有 file_id）的文件名也该能点 —— 图由本地打印工具渲染，
+     请求走 /api/local/order_thumb/<订单号>?name=<文件名>，只出首页（下一页禁用）。 */
+  await page.evaluate(() => {
+    const rows = Array.prototype.slice.call(document.querySelectorAll('tr.order-row'));
+    const third = rows.find((r) => (r.textContent || '').indexOf('HN20261119-009003') >= 0);
+    const icon = third && third.querySelector('.expand-icon');
+    if (icon) icon.click();
+  });
+  await page.waitForSelector('tr.file-expand[data-suborder="9003"].open', { timeout: 10000 });
+  await page.evaluate(() => {
+    const el = document.querySelector('tr.file-expand[data-suborder="9003"] .fn.pv-can');
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    el.click();
+  });
+  await page.waitForFunction(() => {
+    const img = document.querySelector('#fPrevMenu .fp-stage img');
+    return img && img.naturalWidth > 0;
+  }, null, { timeout: 15000 });
+  const locHit = thumbHits[thumbHits.length - 1] || {};
+  const locState = await page.evaluate(() => {
+    const m = document.getElementById('fPrevMenu');
+    const btns = Array.prototype.slice.call(m.querySelectorAll('.fp-bar button'));
+    return { pageTxt: (m.querySelector('.fp-page') || {}).textContent || '',
+             nextDis: (btns.find((b) => (b.textContent || '').indexOf('下一页') >= 0) || {}).disabled };
+  });
+  chk('U14 本地单文件名可点，请求走 /api/local/order_thumb/<订单号>?name=<文件名>（带令牌）',
+      thumbHits.length === 1 && locHit.order === THUMB_ORDER_OK &&
+      locHit.name === '本地单文件.pdf' && locHit.token === TOKEN, { hits: thumbHits });
+  chk('U14b 本地缩略图只出首页：页码栏「第 1 页」且下一页禁用',
+      locState.pageTxt.indexOf('第 1 页') >= 0 && locState.nextDis === true, locState);
+
+  /* U15 本地图还没生成过（老订单）：404 的 message 要原样显示成提示，不许白屏。 */
+  await page.evaluate(() => { window.closeFilePreview(); });
+  await menuGone();
+  await page.evaluate(() => {
+    const rows = Array.prototype.slice.call(document.querySelectorAll('tr.order-row'));
+    const fourth = rows.find((r) => (r.textContent || '').indexOf('HN20261119-009004') >= 0);
+    const icon = fourth && fourth.querySelector('.expand-icon');
+    if (icon) icon.click();
+  });
+  await page.waitForSelector('tr.file-expand[data-suborder="9004"].open', { timeout: 10000 });
+  await page.evaluate(() => {
+    const el = document.querySelector('tr.file-expand[data-suborder="9004"] .fn.pv-can');
+    if (el && el.scrollIntoView) el.scrollIntoView({ block: 'center', behavior: 'instant' });
+    el.click();
+  });
+  await page.waitForFunction(() => {
+    const m = document.getElementById('fPrevMenu');
+    if (!m) return false;
+    const h = m.querySelector('.fp-hint');
+    return h && (h.textContent || '').indexOf('本地缩略图') >= 0;
+  }, null, { timeout: 10000 });
+  const missState = await page.evaluate(() => {
+    const m = document.getElementById('fPrevMenu');
+    const h = m.querySelector('.fp-hint');
+    const btns = Array.prototype.slice.call(m.querySelectorAll('.fp-bar button'));
+    return { hint: (h.textContent || '').trim(),
+             nextDis: (btns.find((b) => (b.textContent || '').indexOf('下一页') >= 0) || {}).disabled };
+  });
+  chk('U15 本地还没生成过图 → 显示接口的 message（不是白屏），下一页仍禁用',
+      missState.hint.indexOf('本地缩略图') >= 0 && missState.nextDis === true, missState);
+  chk('U15b 本地取图路径没有被误用到云端通道（previewHits 没有新增本地单请求）',
+      previewHits.every((h) => h.id.indexOf('fid') === 0), previewHits);
 
   /* U12 全程干净 */
   chk('U12 无 JS 运行时错误（pageerror）', pageErrors.length === 0, pageErrors.slice(0, 3));

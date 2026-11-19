@@ -424,6 +424,10 @@ mark.hit { background: #fff3b0; color: #3b2f00; border-radius: 3px; padding: 0 1
 .file-grid .fn.pv-can:hover { color: var(--accent, #4f6ef7); text-decoration: underline dotted rgba(127,127,127,.6); text-underline-offset: 3px; }
 #fPrevMenu { position: fixed; z-index: 240; padding: 8px; background: var(--card); border: 1px solid var(--border-strong);
   border-radius: 12px; box-shadow: 0 14px 34px rgba(0,0,0,.26); animation: pmIn .16s cubic-bezier(.2,.9,.3,1.25) both; }
+/* v7.29：放大/还原做形变过渡时要把开窗动画停掉 —— pmIn 带 fill:both，会一直压着 inline transform，
+   过渡根本看不到。这条必须排在 .pm-closing 之**前**：两者同特异度、靠源码顺序决胜，
+   排在后面会把收起动画 pmOut 一起压死（放大态下关闭就没动画了，2026-11-19 用户当场发现）。 */
+#fPrevMenu.fp-zooming { animation: none; }
 #fPrevMenu.pm-closing { animation: pmOut .13s ease both; pointer-events: none; }
 #fPrevMenu .fp-title { font-size: .7rem; color: var(--muted); padding: 2px 4px 6px; line-height: 1.5; border-bottom: 1px solid var(--border); margin-bottom: 6px;
   max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -1251,7 +1255,7 @@ function mergeStores(localStore, cloudStore) {
 /* ==================== 全局状态 ==================== */
 /* 版本号唯一来源：关于页标题 + 版本说明的最末条目都从它取。发版时只改这一处，
    别再在 renderAbout 里写死字面量（2026-11-16 现场：标题还停在 v7.10，日志已到 v7.25）。 */
-var APP_VER = 'v7.26.2';
+var APP_VER = 'v7.29';
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
@@ -3540,6 +3544,31 @@ var STATUS_LABELS = {
 var STATUS_CLASSES = { sent: 'st-sent', printing: 'st-printing', queued: 'st-queued', failed: 'st-failed', canceled: 'st-canceled', rejected: 'st-rejected', accepted: 'st-accepted', abandoned: 'st-abandoned', reserved: 'st-reserved', offline_unknown: 'st-offline_unknown', timeout: 'st-timeout', scheduled: 'st-scheduled', waiting: 'st-waiting', downloading: 'st-downloading', unsynced: 'st-unsynced', unsynced_rejected: 'st-unsynced-rejected' };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 function statusClass(s) { return STATUS_CLASSES[s] || ''; }
+/* v7.28（2026-11-19 用户要求）：手动双面中间态。
+   不支持自动双面的打印机（HP LaserJet 1020）一单双面要打两趟、中间还要操作员翻纸。
+   云端 orders.duplex_stage 由本地工具在两趟之间上报，这里只替换**显示**：
+   状态列显示「第一趟中 / 第二趟等待中 / 第二趟中」，跳过/失败显示「第 N 趟被跳过/失败」。
+   o.status 一个字都不动 —— 金额、页数、趋势、状态筛选、KPI 全部仍按 sent/failed 口径。 */
+var DUPLEX_STAGE_LABELS = {
+  pass1: '第一趟中', pass2_wait: '第二趟等待中', pass2: '第二趟中',
+  pass1_skipped: '第一趟被跳过', pass2_skipped: '第二趟被跳过', pass2_failed: '第二趟失败'
+};
+var DUPLEX_STAGE_CLASSES = {
+  pass1: 'st-printing', pass2_wait: 'st-waiting', pass2: 'st-printing',
+  pass1_skipped: 'st-failed', pass2_skipped: 'st-failed', pass2_failed: 'st-failed'
+};
+function duplexStageOf(o) {
+  var ds = String((o && o.duplex_stage) || '').trim();
+  return DUPLEX_STAGE_LABELS[ds] ? ds : '';
+}
+function _orderStatusLabel(o) {
+  var ds = duplexStageOf(o);
+  return ds ? DUPLEX_STAGE_LABELS[ds] : statusLabel((o && o.status) || '');
+}
+function _orderStatusClass(o) {
+  var ds = duplexStageOf(o);
+  return ds ? DUPLEX_STAGE_CLASSES[ds] : statusClass((o && o.status) || '');
+}
 var CHART_COLORS = {
   status: { sent: '#2E7D32', printing: '#1565C0', queued: '#E65100', failed: '#C62828', canceled: '#9E9E9E', rejected: '#E65100', accepted: '#1565C0', abandoned: '#7B1FA2', offline_unknown: '#F57F17', timeout: '#F59E0B', reserved: '#F57F17', scheduled: '#F57F17', waiting: '#00897B', downloading: '#1565C0', unsynced: '#6D4C41', unsynced_rejected: '#AD1457' },
   palette: ['#4f6ef7', '#34a853', '#f59e0b', '#8b5cf6', '#d97706', '#16a34a', '#e11d48', '#38bdf8', '#f472b6', '#a855f7', '#14b8a6', '#f97316']
@@ -4929,6 +4958,19 @@ function _statusTip(o, st) {
   var by = String(o.manual_status_by || '').trim();
   if (by) return by + '在' + (_fmtStamp(o.manual_status_at) || '未知时间') + '被标记为' + label;
   var reason = String(o.status_reason || o.reject_reason || '').trim();
+  // v7.28：手动双面中间态优先 —— 用户要看的是「纸走到哪一趟、哪一趟被跳过」，
+  // 而不是笼统一句「已完成」。duplex_note 是本地工具报上来的一句话（含跳过时打了几张纸）。
+  var dnote = String(o.duplex_note || '').trim();
+  var ds = duplexStageOf(o);
+  if (ds) {
+    var where = { pass1: '正在打第 1 趟', pass2: '正在打第 2 趟',
+                  pass2_wait: '第 1 趟已打完，等待操作员翻纸',
+                  pass1_skipped: '第 1 趟没有打出来',
+                  pass2_skipped: '第 2 趟被跳过，纸是半成品（见「半成品补救」）',
+                  pass2_failed: '第 2 趟打印失败，纸是半成品（见「半成品补救」）' }[ds] || '';
+    var _tail = dnote ? ('：' + dnote) : (reason ? ('：' + reason) : '');
+    return DUPLEX_STAGE_LABELS[ds] + '（' + where + '）' + _tail;
+  }
   if (reason) return label + '：' + reason;
   return '当前状态：' + label;
 }
@@ -5500,6 +5542,9 @@ function applyOrderStatus(oid, status) {
        因此不必整页重新拉数（那会把操作者正在看的页面刷成加载态）。 */
     o.status = status;
     (o.files || []).forEach(function (f) { f.status = status; });
+    /* v7.28：人工订正了状态 → 手动双面中间态作废（否则「第二趟中」会盖住刚订正出的终态） */
+    o.duplex_stage = '';
+    o.duplex_note = '';
     /* 本地同步标记人/标记时间，tooltip 立刻显示「谁在什么时候改的」；
        时间优先用服务器回传的（多端一致），没回传才用本地时间兜底。 */
     if (by) {
@@ -5793,8 +5838,9 @@ function _renderOrderListHTML() {
             _userTag + '<button type="button" class="st-caret" tabindex="-1">▾</button></span>'
         : _userTag) + '</td>';
       /* 状态列：锁定（默认）时是纯标签；解锁后标签可点、右侧带小箭头，点开即选终态（v7.0）。
-         点状态标签时要拦住行点击（否则会同时展开文件明细）。 */
-      var _stTag = '<span class="tag ' + esc(statusClass(o.status)) + '" title="' + esc(_statusTip(o, o.status)) + '">' + esc(statusLabel(o.status)) + '</span>';
+         点状态标签时要拦住行点击（否则会同时展开文件明细）。
+         v7.28：手动双面进行中/被跳过时标签换成「第一趟中/第二趟等待中/第二趟中…」（只改显示）。 */
+      var _stTag = '<span class="tag ' + esc(_orderStatusClass(o)) + '" title="' + esc(_statusTip(o, o.status)) + '">' + esc(_orderStatusLabel(o)) + '</span>';
       h += '<td style="white-space:nowrap">' + (_orderStatusEditable(oidS)
         ? '<span class="st-edit can" title="点击订正订单状态" onclick="event.stopPropagation();openOrderStatusMenu(event,\'' + oidS + '\')">' +
             _stTag + '<button type="button" class="st-caret" tabindex="-1">▾</button></span>'
@@ -5823,13 +5869,26 @@ function _renderOrderListHTML() {
           h += '<div class="order-remark" title="订单备注">📝 备注：' + _hlText(o.remark, _ordersSearchQuery()) + '</div>';
         }
         h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span title="有效打印页数（按页码范围折算）">页数</span><span title="有效纸张张数（按页码范围折算，含份数）">张数</span><span>单/双面</span><span>状态</span></div>';
+        // v7.27：这一单是不是"整单都没有云端文件副本"（= 本机手动打印的本地单）。
+        // 本地单上报 /api/local_orders 时 file_id 一律为 NULL，所以整单都点不出云端预览；
+        // 反过来，只要单里有一个文件带 file_id（云端上传过），其余行也不该降级去查本机
+        // —— 那种行要么是已清理、要么是打回，点开只会是假的"有图"承诺。
+        var _anyCloudFile = (o.files || []).some(function (x) { return !!(x && x.file_id); });
         o.files.forEach(function (f, _fi) {
           h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + (f.reject_reason ? ' · ' + esc(f.reject_reason) : '') + '">';
           // v7.21：可预览的文件名点开看首页缩略图（file_id + has_preview 都由云端算好，
           // 不可渲染的扩展名 / 文件已被清理时 has_preview 为 false，保持纯文本，点了也不会 404）
-          var _pvCan = !!(f.file_id && f.has_preview);
+          // v7.27：本地单（order_files 的 file_id 为 NULL）改看本机渲染的缩略图
+          // （本地打印工具在打印结束时生成，/api/local/order_thumb/<订单号>），
+          // 所以"能不能点"不再只由 file_id 决定 —— 有订单号 + 文件名就给出入口，
+          // 真没图时由接口回 404 的 message 用 toast 解释，不做虚假承诺。
+          var _pvCloud = !!(f.file_id && f.has_preview);
+          var _pvLocal = !_pvCloud && !_anyCloudFile && !!(o.order_number && f.file_name);
+          var _pvCan = _pvCloud || _pvLocal;
           h += '<span class="fn' + (_pvCan ? ' pv-can' : '') + '"'
-            + (_pvCan ? ' title="点击查看首页预览（共 ' + (parseInt(f.page_count, 10) || 1) + ' 页）"'
+            + (_pvCan ? ' title="' + (_pvCloud
+                ? '点击查看首页预览（共 ' + (parseInt(f.page_count, 10) || 1) + ' 页）'
+                : '点击查看本机生成的首页缩略图（本地单，云端没有文件副本）') + '"'
                        + ' onclick="event.stopPropagation();openFilePreview(event,\'' + oidS + '\',' + _fi + ')"'
                       : '')
             + '>📄 ' + _hlText(f.file_name, _ordersSearchQuery()) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
@@ -6258,6 +6317,39 @@ function _fpReleaseUrl() {
     _fpObjUrl = '';
   }
 }
+/* v7.29：放大态下关闭要「缩回缩略舞台」再摘节点。
+   原来放大的大窗直接播 pmOut（130ms 淡出 + scale .96）—— 一个 1024 的窗只缩 4%，眼里就是「啪」地
+   消失，用户当场问「放大的状态没做关闭动画吗」。这里复用放大那套 FLIP：把窗从当前大框缩回小框
+   （锚点角一起回去）、顺带淡到 .35，够 220ms 再摘。返回过渡时长；0 表示没做成形变，交回老路径。 */
+var _FP_CLOSE_MS = 220;
+function _fpCloseMorph(m) {
+  var first = m.getBoundingClientRect();
+  if (!first.width || !first.height) return 0;
+  m.classList.remove('fp-zoom');
+  if (!m.classList.contains('fp-zooming')) m.classList.add('fp-zooming');
+  m.style.pointerEvents = 'none';
+  _fpPlace(m);
+  _fpEndZoomAnim(m);   /* 连点/动画未收时先清干净，再按新尺寸量 */
+  var last = m.getBoundingClientRect();
+  if (!last.width || !last.height) return 0;
+  var sx = first.width / last.width, sy = first.height / last.height;
+  if (!isFinite(sx) || !isFinite(sy) || !sx || !sy) return 0;
+  var below = (m._fpBelow !== false);
+  var tx = first.left - last.left;
+  var ty = below ? (first.top - last.top)
+                 : ((first.top + first.height) - (last.top + last.height));
+  m.style.willChange = 'transform, opacity';
+  m.style.transition = 'none';
+  m.style.transform = 'translate(' + tx.toFixed(2) + 'px,' + ty.toFixed(2) + 'px) scale(' +
+                      sx.toFixed(5) + ',' + sy.toFixed(5) + ')';
+  m.style.opacity = '1';
+  void m.offsetWidth;
+  m.style.transition = 'transform ' + _FP_CLOSE_MS + 'ms ' + _FP_ZOOM_EASE +
+                       ', opacity ' + _FP_CLOSE_MS + 'ms ease';
+  m.style.transform = 'none';
+  m.style.opacity = '.35';
+  return _FP_CLOSE_MS;
+}
 function closeFilePreview(immediate) {
   document.removeEventListener('click', _fpOutside, true);
   _fpUnbindScroll();
@@ -6270,6 +6362,17 @@ function closeFilePreview(immediate) {
     _fpReleaseUrl();
   };
   if (immediate === true || !m.classList || _prefersReduced()) { drop(); return; }
+  /* 放大态：先缩回小舞台再摘（v7.29），别让一个视口级大窗硬切掉 */
+  if (m.classList.contains('fp-zoom')) {
+    var morphMs = 0;
+    try { morphMs = _fpCloseMorph(m); } catch (e) { morphMs = 0; }
+    if (morphMs > 0) {
+      if (!m.classList.contains('pm-closing')) m.classList.add('pm-closing');
+      m.style.animation = 'none';   /* 形变已经够，别让 pmOut 再把 transform 抢回去 */
+      _fpCloseTimer = setTimeout(drop, morphMs + 40);
+      return;
+    }
+  }
   if (!m.classList.contains('pm-closing')) m.classList.add('pm-closing');
   /* 每次 close 都（重新）挂一个摘除定时器。旧写法在「已经 pm-closing 就 return」之前
      先把上一个定时器清掉了 —— 二次 close（点 ✕ 的同时又滚动/点外部）会留下一个
@@ -6332,13 +6435,30 @@ function _fpPlace(m) {
     below = false;
   }
   m.style.transformOrigin = below ? 'top left' : 'bottom left';
+  m._fpBelow = below;   /* 放大过渡要从这一点缩放，锚点角必须和贴位角是同一个（v7.29） */
   m.style.left = x + 'px';
   m.style.top = y + 'px';
 }
-/* 放大 / 还原（v7.26.2）：只切 class 与按钮文案，图片本身不动 —— 翻页时保持当前缩放。 */
+/* 放大 / 还原（v7.26.2）：切 class 与按钮文案，图片本身不动 —— 翻页时保持当前缩放。
+   v7.29（2026-11-19 用户要求「放大加个自然过渡的动画，缩小也加一下」）：用 FLIP 做形变过渡。
+   做法：切 class 前后各量一次窗体外框 → 先把「新尺寸的窗」反向缩放+平移到「旧框」的位置，
+   再用 transform 过渡回 none。看上去就是小窗从文件名那里长成大窗、大窗缩回小窗，锚点角钉住不动。 */
+var _FP_ZOOM_MS = 320;
+var _FP_ZOOM_EASE = 'cubic-bezier(.22,.85,.24,1)';
+function _fpMotionOff() {
+  return !!(_mqReduce && _mqReduce.matches);
+}
+function _fpEndZoomAnim(m) {
+  if (!m) return;
+  if (m._fpAnimTimer) { clearTimeout(m._fpAnimTimer); m._fpAnimTimer = null; }
+  m.style.transition = '';
+  m.style.transform = '';
+  m.style.willChange = '';
+}
 function fpToggleZoom() {
   var m = document.getElementById('fPrevMenu');
   if (!m) return;
+  var first = m.getBoundingClientRect();
   var on = !m.classList.contains('fp-zoom');
   if (on) m.classList.add('fp-zoom'); else m.classList.remove('fp-zoom');
   var b = m.querySelector('.fp-zoom-btn');
@@ -6347,6 +6467,35 @@ function fpToggleZoom() {
     b.title = on ? '恢复缩略尺寸' : '按原始像素放大查看（画质更好）';
   }
   _fpPlace(m);
+  /* 量终态前先把上一轮的动画收干净（连点两下时不能叠着算） */
+  _fpEndZoomAnim(m);
+  if (_fpMotionOff() || !first.width || !first.height) return;
+  var last = m.getBoundingClientRect();
+  if (!last.width || !last.height) return;
+  var sx = first.width / last.width, sy = first.height / last.height;
+  if (!isFinite(sx) || !isFinite(sy) || sx === 0 || sy === 0) return;
+  /* 锚点角：贴位在上方 ⇒ 底左角，否则左上角（与 transform-origin 一致） */
+  var below = (m._fpBelow !== false);
+  var tx = first.left - last.left;
+  var ty = below ? (first.top - last.top)
+                 : ((first.top + first.height) - (last.top + last.height));
+  /* pmIn 动画带 fill:both，会一直压着 inline transform —— 过渡期间先把它关掉（class 而不是 inline
+     animation，否则收起动画 pmOut 也会被 inline 压死） */
+  if (!m.classList.contains('fp-zooming')) m.classList.add('fp-zooming');
+  m.style.willChange = 'transform';
+  m.style.transition = 'none';
+  m.style.transform = 'translate(' + tx.toFixed(2) + 'px,' + ty.toFixed(2) + 'px) scale(' +
+                      sx.toFixed(5) + ',' + sy.toFixed(5) + ')';
+  void m.offsetWidth;   /* 让反向变换先落一帧，否则会被合并掉、看不到过渡 */
+  m.style.transition = 'transform ' + _FP_ZOOM_MS + 'ms ' + _FP_ZOOM_EASE;
+  m.style.transform = 'none';
+  m._fpAnimTimer = setTimeout(function () {
+    m._fpAnimTimer = null;
+    if (!m.parentNode) return;
+    m.style.transition = '';
+    m.style.transform = '';
+    m.style.willChange = '';
+  }, _FP_ZOOM_MS + 80);
 }
 /* 打开预览：rowKey 与价格气泡同一套（云端=order_id，外部=extrow-…），fileIdx 是明细下标 */
 function openFilePreview(ev, rowKey, fileIdx) {
@@ -6356,7 +6505,12 @@ function openFilePreview(ev, rowKey, fileIdx) {
   var o = _findOrderByRowKey(rowKey);
   var idx = parseInt(fileIdx, 10);
   var f = (o && o.files && idx >= 0) ? o.files[idx] : null;
-  if (!f || !f.file_id) { toast('❌ 这行没有可预览的云端文件（可能已被清理）', 'error'); return; }
+  if (!f) { toast('❌ 这行没有文件信息', 'error'); return; }
+  /* v7.27：两种取图后端 —— ①云端（file_id + has_preview，下载过的云端文件）
+     ②本机（本地单没有 file_id，用订单号 + 文件名查本地打印工具渲染的缩略图）。 */
+  var cloud = !!(f.file_id && f.has_preview);
+  var localOk = !cloud && !!(o && o.order_number && f.file_name);
+  if (!cloud && !localOk) { toast('❌ 这行没有可预览的文件（可能已被清理）', 'error'); return; }
   /* 三个浮层互斥：别的先收，免得互相压住 / 抢 click 监听 */
   closeOrderStatusMenu(); closeOrderTypeMenu(); closeOrderUserMenu(); closePriceMenu(true);
   if (_fpCloseTimer) { clearTimeout(_fpCloseTimer); _fpCloseTimer = null; }
@@ -6364,18 +6518,22 @@ function openFilePreview(ev, rowKey, fileIdx) {
   var m = document.createElement('div');
   m.id = 'fPrevMenu';
   m._fpFile = f;
+  m._fpOrder = o;
+  m._fpCloud = cloud;
   m._fpPage = 1;
-  m._fpPages = 0;
+  m._fpPages = cloud ? 0 : 1;
   m._fpSeq = ++_fpSeq;
   m.innerHTML = '<div class="fp-title" title="' + esc(f.file_name) + '">📄 ' + esc(f.file_name) + '</div>' +
-    '<div class="fp-stage" onclick="fpToggleZoom()"><img alt="预览" style="display:none" title="点击放大"><div class="fp-hint">正在生成预览…</div></div>' +
+    '<div class="fp-stage" onclick="fpToggleZoom()"><img alt="预览" style="display:none" title="点击放大"><div class="fp-hint">' +
+    (cloud ? '正在生成预览…' : '正在读取本地缩略图…') + '</div></div>' +
     '<div class="fp-bar"><button type="button" class="fp-prev" onclick="fpGo(-1)">‹ 上一页</button>' +
     '<span class="fp-page"></span>' +
     '<button type="button" class="fp-next" onclick="fpGo(1)">下一页 ›</button>' +
     '<button type="button" class="fp-zoom-btn" title="按原始像素放大查看（画质更好）" onclick="fpToggleZoom()">⤢ 放大</button>' +
     '<button type="button" title="关闭" onclick="closeFilePreview()">✕</button></div>';
   document.body.appendChild(m);
-  _fpRenderBar(m, 1, 0);
+  /* 本机缩略图只渲染首页 ⇒ 一开始就把页数定成 1，别让「下一页」先亮后可点（点了也只有同一张） */
+  _fpRenderBar(m, 1, cloud ? 0 : 1);
   /* 贴住被点的文件名：默认下方 8px；右侧/下方越界就翻到左侧、上方（_fpPlace 负责，放大后重贴） */
   m._fpAnchor = (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect)
     ? ev.currentTarget.getBoundingClientRect()
@@ -6404,14 +6562,20 @@ function _fpLoad(page) {
   if (!m) return;
   var f = m._fpFile;
   var seq = m._fpSeq = ++_fpSeq;
-  _fpSetHint(m, page > 1 ? ('正在生成第 ' + page + ' 页…') : '正在生成预览…');
+  var cloud = m._fpCloud !== false;
+  _fpSetHint(m, cloud ? (page > 1 ? ('正在生成第 ' + page + ' 页…') : '正在生成预览…')
+                      : '正在读取本地缩略图…');
   var img = m.querySelector('.fp-stage img');
   if (img) img.style.display = 'none';
   // 2026-11-19：要 1024 档的 WebP（同尺寸比 JPEG 小 60%，而这张图既当 300px 缩略图
   // 又当「放大」后的大图 —— 一份数据两种用法，省一次请求）。服务端编不出 WebP 会自动回 JPEG，
   // 两种字节浏览器都认，所以这里不需要回退逻辑。
-  var url = '/api/local/file_preview/' + encodeURIComponent(f.file_id) +
-    '?page=' + page + '&size=z&fmt=webp';
+  // v7.27：本地单没有 file_id，改查本机渲染的缩略图（订单号 + 文件名；只渲染首页）。
+  var url = cloud
+    ? ('/api/local/file_preview/' + encodeURIComponent(f.file_id) +
+       '?page=' + page + '&size=z&fmt=webp')
+    : ('/api/local/order_thumb/' + encodeURIComponent((m._fpOrder && m._fpOrder.order_number) || '') +
+       '?name=' + encodeURIComponent(f.file_name || ''));
   fetch(url, { headers: { 'X-Launch-Token': LAUNCH_TOKEN } })
     .then(function (res) {
       if (!res.ok) {
@@ -11211,6 +11375,28 @@ function renderAbout() {
     + '③ 大图超出窗口时可在预览窗内滚动查看（滚轮/触控滑动都行，不会被「滑动即收」误关），'
     + '翻页时保持当前缩放；再点一次「⤡ 还原」回到缩略尺寸，窗口会重新贴住文件名不跑出屏幕。'
     + '④ 收起仍是点 ✕ / 点窗外 / 页面滚动，与原来一致。</p>' +
+    '<p style="margin-top:10px">v7.27：<b>本地单也有缩略图了</b> —— ' +
+    '① 现场反馈：预览只在「云端单」上能点开 —— 那些单的文件在云端有副本、有 file_id；' +
+    '而本机手动批量打印的<b>本地单</b>上报时根本没有 file_id（后端那几行 order_files 是现建的），' +
+    '于是「本机打的单」永远点不出图，像是功能没了。' +
+    '② 现在本地打印工具在<b>打印结束时</b>自己把首页渲成 640px WebP 存在本机' +
+    '（%APPDATA%\\HN打印工具\\order_thumbs\\&lt;订单号&gt;），本页点文件名改走' +
+    '<code>/api/local/order_thumb/&lt;订单号&gt;?name=&lt;文件名&gt;</code> 现取现发 —— 不经过云端、离线也能看。' +
+    '③ 本地图只渲染首页（翻页按钮直接禁用）；没生成过的老订单点开会给一句人话提示，' +
+    '重新用新版工具打一次就有了。</p>' +
+    '<p style="margin-top:10px">v7.28：<b>手动双面看得见走到哪一趟</b> —— ' +
+    '① 现场反馈：这台 HP LaserJet 1020 没有自动双面器，一单双面要打两趟、中间还得人工翻纸，' +
+    '可状态列从头到尾只写「已完成」，看不出纸走到第几趟，也看不出是哪一趟被跳过。' +
+    '② 现在本地工具在两趟之间把阶段报给云端（<code>orders.duplex_stage</code>，' +
+    '<b>只写显示层</b>）：状态列会显示<b>第一趟中 / 第二趟等待中 / 第二趟中</b>，' +
+    '跳过或打失败时显示<b>第 N 趟被跳过/失败</b>，悬浮说明里带上「第 1 趟已打出 N 张纸」这类细节。' +
+    '③ 订单状态、金额、页数、趋势、KPI 的统计口径<b>一个字都没改</b>（仍按 sent/failed 算）；' +
+    '半成品补救<b>补打成功</b>后自动清掉中间态，这一单回到「已完成」。</p>' +
+    '<p style="margin-top:10px">v7.29：<b>放大/还原有过渡了</b> —— ' +
+    '① 现场反馈：点「⤢ 放大」时预览窗是<b>瞬间换尺寸</b>的，小窗一下子变成大窗、连位置都跳过去，看着生硬。' +
+    '② 现在用形变过渡：小窗从文件名那一角<b>长成</b>大窗，点「⤡ 还原」再<b>缩回</b>小窗，锚点角钉住不动，' +
+    '320ms 缓出曲线；系统开了「减少动态效果」时自动不加动画（直接切）。' +
+    '③ 只改这段过渡，取图、翻页、窗内滚动、点窗外收起的行为都与原来一致。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

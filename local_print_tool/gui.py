@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
@@ -111,6 +112,7 @@ import duplex_remedy  # 手动双面「半成品」补救台账：跳过/超时/
 import pdf_printer  # L2-1：stage 判据用 is_partial / PARTIAL_MARKER（模块级；也修好 4480 处的 NameError）
 import safe_confirm  # 危险确认统一口径：默认按钮永不是「执行」（见 safe_confirm.py）
 import print_watch   # 外部打印监视（绕过本工具的作业：只检测+记账，不阻断，见 print_watch.py）
+import order_thumbs  # 本地订单首页缩略图（结算页"略缩图"；本地单没有云端 file_id，见 order_thumbs.py）
 import pass2_watch   # 「上一批第 2 趟可能还在出纸」的跨批次计时（插单会串页，见 pass2_watch.py）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 from cloud_client import (CloudClient, CloudTask, cache_engine_for, pdf_cache_key,
@@ -128,7 +130,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.6.14"
+APP_VERSION = "4.6.17"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -4091,6 +4093,12 @@ class PrintWorker(QThread):
     # 批次结束（成功/失败/跳过）再发一次让主线程收尾关闭。
     duplex_announce = Signal(str)
     duplex_finished = Signal(str)
+    # 手动双面「走到哪一趟」（2026-11-19 用户要求）：payload = {stage, reason, orders}
+    #   stage: pass1 / pass2_wait / pass2 / pass1_skipped / pass2_skipped / pass2_failed / ''
+    #   只在云端订单上有意义（本地 -L 单由离线库自己管）；主线程据此 POST
+    #   /api/local/order_stage，写的是**显示层**字段（orders.duplex_stage / duplex_note），
+    #   订单 status 与金额口径一个字都不动。
+    duplex_stage = Signal(object)
     # 第 1 趟的「张数 + 预计秒数」（2026-10）：常驻窗据此显示计时器并按超时变色。
     duplex_plan = Signal(int, float)
     # 上一个任务的纸还在出（打印队列没排空）→ 常驻窗进「等待上一个任务」态：立窗但**不计时**。
@@ -5194,6 +5202,26 @@ class PrintWorker(QThread):
         # 本批的翻纸回执从头清空：这样"第 1 趟还在打时操作员就点了跳过"的预置答案能生效
         self._flip_continue = False
         self._flip_event.clear()
+        # v7.28（2026-11-19 用户要求）：「这一单的手动双面走到哪一趟」上报给云端。
+        #   需求原话：不支持自动双面的打印机要有「第一趟中 / 第二趟中 / 第二趟等待中」
+        #   三个中间状态，任何阶段被跳过都要在失败原因里写清是哪一趟。
+        #   实现：只发**显示层**字段（云端 orders.duplex_stage / duplex_note），
+        #   订单 status、金额、页数口径全都不动（硬规矩 7/13）。
+        _stage_orders: list[str] = []
+        for _si, _sj, _sp, _st in items:
+            _sn = str(getattr(_sj, "order_number", "") or "").strip()
+            if _sn and _sn not in _stage_orders:
+                _stage_orders.append(_sn)
+
+        def _stage(stage: str, reason: str = "") -> None:
+            """上报手动双面阶段（stage='' 表示这一单的双面流程结束）。"""
+            if not _stage_orders:
+                return
+            try:
+                self.duplex_stage.emit({"stage": stage, "reason": reason,
+                                        "orders": list(_stage_orders)})
+            except Exception:
+                pass
         # 本批只有一个 DEVMODE：整批都是表格/图片才套用全局纸张，混合批次走驱动默认纸
         # （Word/PDF 用自己的页面设置，见 `_paper_for`）。第 1/2 趟与半成品台账同源。
         _batch_paper = self._paper_for([it[1] for it in items])
@@ -5376,6 +5404,7 @@ class PrintWorker(QThread):
             _rot_arg = bool(rotate) if rotate is not None else bool(p.second_rotate_180)
             _t_pass1 = time.perf_counter()
             self._pass_state = "第 1 趟进行中"
+            _stage("pass1", f"第 1 趟打印中（{plan.sheet_count} 张纸）")
             ok1, msg1 = print_plan_pass(plan, merged, self._printer_name, 1,
                                         second_rotate_180=_rot_arg,
                                         progress_callback=_cb(base_offset, map1),
@@ -5401,6 +5430,8 @@ class PrintWorker(QThread):
                 # ⇒ 记 stage=pass2_partial（补救窗对它的按钮正好是这两个）。
                 # 一张都没出（无 marker）不记：纸叠没被动过，按普通失败上报重打即可。
                 if _pp.is_partial(msg1):
+                    _stage("pass1_skipped",
+                           f"第 1 趟中途失败（{_pp.strip_partial(msg1)}），纸叠页序不可信")
                     _rec1 = _keep_stall(
                         f"手动双面第 1 趟中途失败: {_pp.strip_partial(msg1)}",
                         duplex_remedy.STAGE_PASS2_PARTIAL)
@@ -5414,11 +5445,15 @@ class PrintWorker(QThread):
                         return False, (f"手动双面第 1 趟中途失败: {msg1}"
                                        f"（出纸槽里可能已有本批前几张纸）—— 半成品台账没写成，"
                                        f"合批 PDF 已尽量留档，请人工核对后整单重打"), n1
+                _stage("pass1_skipped", f"第 1 趟失败（{msg1}）")
                 return False, f"手动双面第 1 趟失败: {msg1}", n1
             # 第 1 趟的纸已经压进出纸槽了：台账往前推 —— 下一批（长短边混排拆出的第 2 批）
             # 翻纸时就该把这一批的纸算成"槽里已有的"
             self._tray_sheets = tray_foreign + plan.sheet_count
             if self._cancelled:
+                # 第 1 趟已出纸、第 2 趟不打了 ⇒ 用户口径里的「第二趟被跳过」
+                _stage("pass2_skipped",
+                       f"第二趟被跳过（第 1 趟已打出 {plan.sheet_count} 张纸，操作员取消）")
                 _rec = _keep_stall(f"已取消（第 1 趟已打出 {plan.sheet_count} 张纸）",
                                    duplex_remedy.STAGE_PASS1_DONE)
                 if _rec is not None:
@@ -5481,11 +5516,18 @@ class PrintWorker(QThread):
                         "  ⚠ 出纸等待超时（队列没排空）→ 本次实测不写进速度样本")
 
             self._pass_state = "等待翻纸"
+            # 「第二趟等待中」：第 1 趟的纸已经在槽里，就等操作员翻纸点「继续」
+            _stage("pass2_wait",
+                   f"第一趟已打完 {plan.sheet_count} 张纸，等待翻纸")
             if not self._ask_operator_to_flip(plan, tray_foreign, warn=_drain_warn):
                 if self._cancelled:
                     _reason = f"已取消（第 1 趟已打出 {plan.sheet_count} 张纸）"
                 else:
                     _reason = "翻纸未确认/被跳过（第 1 趟已打出，第 2 趟未打）"
+                # 用户要求：阶段被跳过必须在失败原因里写清是**哪一趟**被跳过
+                _stage("pass2_skipped",
+                       f"第二趟被跳过（第 1 趟已打出 {plan.sheet_count} 张纸，"
+                       f"第 2 趟未打，纸是半成品）")
                 _rec = _keep_stall(_reason, duplex_remedy.STAGE_PASS1_DONE)
                 if _rec is not None:
                     return False, (f"手动双面未完成：第 1 趟已打出（{plan.sheet_count} 张纸、"
@@ -5496,6 +5538,7 @@ class PrintWorker(QThread):
                                f"纸叠是半成品，请人工处理"), n1
 
             self._pass_state = "第 2 趟进行中"
+            _stage("pass2", f"第二趟打印中（{plan.sheet_count} 张纸）")
             # ★ 第 2 趟的纸还会出一会儿，但 print_plan_pass 提交完就返回、worker 随即收工
             #   （2026-11-12）：从这里起跑「上一批第 2 趟可能还在出纸」的计时，下一个批次
             #   开打第 1 趟之前会拿它拦一下（见 _wait_prev_pass2_gate / pass2_watch.py）。
@@ -5513,6 +5556,8 @@ class PrintWorker(QThread):
                                         scale_mode=self._scale_mode,
                                         scale_percent=self._scale_percent)
             if not ok2:
+                _stage("pass2_failed",
+                       f"第二趟失败（{msg2}），纸是半成品，已记入半成品补救")
                 _rec = _keep_stall(f"第 2 趟失败: {msg2}",
                                    duplex_remedy.STAGE_PASS2_PARTIAL)
                 if _rec is not None:
@@ -5520,6 +5565,8 @@ class PrintWorker(QThread):
                                    f"一部分）—— 已记入「半成品补救」：纸叠不能再补第 2 趟，"
                                    f"请整单重打或作废"), plan.total_sides
                 return False, f"手动双面第 2 趟失败: {msg2}（第 1 趟已打出）", plan.total_sides
+            # 两趟都打完 ⇒ 清掉中间态，结算页回到「已完成」
+            _stage("")
             return True, (f"手动双面完成（{len(items)} 个文件 / {plan.sheet_count} 张纸 / 2 趟，"
                           f"只翻一次纸）"), plan.total_sides
         finally:
@@ -8078,9 +8125,38 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
 
-            self._file_logger.addHandler(
-                daily_log.make_handler(self._log_dir, keep_days=daily_log.KEEP_LOG_DAYS,
-                                       on_prune=_on_logs_pruned))
+            _handler = daily_log.make_handler(self._log_dir, keep_days=daily_log.KEEP_LOG_DAYS,
+                                              on_prune=_on_logs_pruned)
+            # 2026-11-19：把 handler 也挂到 root 之后，这两个模块的 INFO 会**写两遍** ——
+            # 它们本来就把同一条文案通过回调镜像进 GUI（`_emit_log` / cloud_client 的日志
+            # 回调 → `_log` → "hn_local_tool"），root 再落一次档案就重复了。只放行它们的
+            # WARNING 及以上（那才是这次要补上的、以前一条都进不了文件的部分）。
+            class _MirrorDupFilter(logging.Filter):
+                _MIRRORED = frozenset({"print_watch", "cloud_client"})
+
+                def filter(self, record):   # noqa: D102
+                    if record.levelno < logging.WARNING:
+                        if str(record.name).split(".", 1)[0] in self._MIRRORED:
+                            return False
+                    return True
+
+            _handler.addFilter(_MirrorDupFilter())
+            self._file_logger.addHandler(_handler)
+            # 🟠 2026-11-19（"外部打印监视在跑却一条也不记"的排障坑）：文件 handler 只挂在
+            # "hn_local_tool" 上，而 main.py 的 basicConfig 只到 stdout —— 于是
+            # print_watch / cloud_client / offline_sync 这些 `logging.getLogger(__name__)`
+            # 的模块日志**一次都没进过日志文件**（当天日志里 WARNING/ERROR 是 0 行，真出事了
+            # 现场什么也看不到）。这里把同一个 handler 也挂到 root：模块 WARNING 直落文件；
+            # "hn_local_tool" 自身不再向 root 传播（否则同一行会被写两遍）。
+            try:
+                _root = logging.getLogger()
+                if _handler not in _root.handlers:
+                    _root.addHandler(_handler)
+                    if _root.level == logging.WARNING or _root.level == logging.NOTSET:
+                        _root.setLevel(logging.INFO)
+                    self._file_logger.propagate = False
+            except Exception as e:
+                logger.debug(f"挂载 root 日志 handler 失败: {e}")
         # 2026-11-01 用户要求：每次启动都把当前版本号写进日志文件 —— 自更新/覆盖安装之后
         # 想确认「今天这一整天跑的到底是哪个版本」，直接翻 logs/YYYY-MM-DD.log 第一行就够。
         self._file_logger.info(f"HN 本地打印工具启动 · 版本 v{APP_VERSION}")
@@ -9886,6 +9962,56 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _bring_main_window_to_front(self):
+        """把主窗口叫到最前面（程序主动把操作员切到某个标签页时用）。
+
+        为什么单独一个函数（2026-11-18 用户现场）：`_restore_from_tray()` 只保证"窗口是
+        可见的"，被别的程序盖住（可见、非前台）时它什么都不做 —— 退出确认框点「去到这个
+        标签页」后标签页确实切了，主窗口却仍在浏览器后面，操作员看到的就是"点了没反应"。
+        三种状态都要能叫回来：最小化 → showNormal；收进托盘（hide）→ show；
+        只是被盖住 → raise/activate，Qt 抢不到前台时用 Win32 兜底。
+        """
+        self._restore_from_tray()
+        try:
+            _wh = self.windowHandle()
+            if _wh is not None:
+                _wh.requestActivate()
+        except Exception as e:
+            logger.debug(f"requestActivate 失败（继续 Win32 兜底）: {e}")
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            _u32 = ctypes.windll.user32
+            _u32.GetForegroundWindow.restype = wintypes.HWND
+            _u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                      ctypes.POINTER(wintypes.DWORD)]
+            _u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            _u32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+            _u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            _u32.SetForegroundWindow.restype = wintypes.BOOL
+            _u32.BringWindowToTop.argtypes = [wintypes.HWND]
+            _hwnd = wintypes.HWND(int(self.winId()))
+            if _u32.SetForegroundWindow(_hwnd):
+                return
+            # 前台锁：SetForegroundWindow 只对"当前前台进程"放行。被拒时把本线程的输入
+            # 队列临时挂到当前前台线程上再抢一次，成功后摘下来（失败也只是任务栏闪一下，
+            # 窗口已经 raise 过，不影响使用）。
+            _tid_me = ctypes.windll.kernel32.GetCurrentThreadId()
+            _fg = _u32.GetForegroundWindow()
+            _tid_fg = _u32.GetWindowThreadProcessId(_fg, None) if _fg else 0
+            _attached = False
+            if _tid_fg and _tid_fg != _tid_me:
+                _attached = bool(_u32.AttachThreadInput(_tid_me, _tid_fg, True))
+            try:
+                _u32.BringWindowToTop(_hwnd)
+                _u32.SetForegroundWindow(_hwnd)
+            finally:
+                if _attached:
+                    _u32.AttachThreadInput(_tid_me, _tid_fg, False)
+        except Exception as e:
+            logger.debug(f"Win32 置前兜底失败（窗口已 raise，忽略）: {e}")
+
     def _ensure_visible_for_close_dialog(self):
         """退出流程要弹确认框之前，才把藏在托盘里的主窗口叫回前台。
 
@@ -10677,15 +10803,23 @@ class MainWindow(QMainWindow):
         if delta < 0:
             self._cleanup_empty_tabs(after_key=self._current_tab)
 
-    def _goto_tab(self, key: str) -> bool:
+    def _goto_tab(self, key: str, bring_to_front: bool = True) -> bool:
         """切到**指定**标签页（退出确认框「去到这个标签页」的落点）。
 
         `_switch_tab()` 只认 ±1，这里要按 key 直达；key 不在配置里（刚好被清理/重编号）
         就返回 False，调用方不必再管。
+
+        `bring_to_front`（2026-11-18 用户要求）：程序主动把操作员切到某一页，就是要他
+        看这一页 —— 默认置前，最小化 / 收在托盘 / 被别的程序盖住都叫得回来（走
+        `_bring_main_window_to_front()`）。助手批量操作（agent_ops）显式传 False，
+        免得它在后台连切几次把焦点从用户手上抢走。
         """
         key = str(key or "")
         if key not in self._config.tabs:
             return False
+        if bring_to_front:
+            # 即使目标就是当前页也要置前：调用方的意图是"让人看见这一页"
+            self._bring_main_window_to_front()
         if key == self._current_tab:
             return True
         self._cancel_undo_if_active()      # 撤回备份属于旧标签页（与 _switch_tab 同口径）
@@ -11347,6 +11481,70 @@ class MainWindow(QMainWindow):
         except Exception:
             return True  # 判定失败时按主线程处理（保持旧行为，不丢 UI 同步）
 
+    # ──────── 本地订单缩略图（2026-11-19：结算页"略缩图"不再只认云端 file_id）────────
+    #
+    # 背景：收支清算的订单明细里，点文件名看缩略图走的是 /api/local/file_preview/<file_id>，
+    # 而**本地单**上报 /api/local_orders 时没有 file_id（后端那几行 order_files 是现建的），
+    # 于是本机打的单永远点不出图。现在打印一结束（cached_pdf 已就绪）就在后台把首页渲成
+    # 640px WebP 存在本机（order_thumbs.py），结算页改走 /api/local/order_thumb/<订单号>。
+    # 刻意放在后台线程：渲染一页 Word 要 1~3 秒，绝不能让收尾回调卡在打印队列里。
+
+    def _queue_order_thumb(self, job) -> None:
+        """把一个已完成任务丢进缩略图渲染队列（去重、绝不影响打印主流程）。"""
+        try:
+            num = str(getattr(job, "order_number", "") or "").strip()
+            name = str(getattr(job, "display_name", "") or "").strip()
+            path = str(getattr(job, "file_path", "") or "")
+            pdf = str(getattr(job, "cached_pdf", "") or "")
+            if not name:
+                name = os.path.basename(path)
+            if not num or not name or not (pdf or path):
+                return
+            item = (num, name, path, pdf)
+            pending = getattr(self, "_thumb_pending", None)
+            if pending is None:
+                pending = set()
+                self._thumb_pending = pending
+            if item in pending:
+                return
+            pending.add(item)
+            q = getattr(self, "_thumb_q", None)
+            if q is None:
+                q = queue.Queue()
+                self._thumb_q = q
+            q.put(item)
+            t = getattr(self, "_thumb_thread", None)
+            if t is None or not t.is_alive():
+                t = threading.Thread(target=self._thumb_worker, name="hn-order-thumb", daemon=True)
+                t.start()
+                self._thumb_thread = t
+        except Exception:  # noqa: BLE001  缩略图是锦上添花，任何异常都不许冒到打印流程
+            pass
+
+    def _thumb_worker(self) -> None:
+        """后台消费渲染队列：一单多个文件串行渲，失败只记一条日志。"""
+        q = getattr(self, "_thumb_q", None)
+        if q is None:
+            return
+        while True:
+            item = q.get()
+            if item is None:
+                return
+            num, name, path, pdf = item
+            made = ""
+            try:
+                made = order_thumbs.render_job(num, name, path, pdf)
+            except Exception:  # noqa: BLE001
+                made = ""
+            pending = getattr(self, "_thumb_pending", None)
+            if isinstance(pending, set):
+                pending.discard(item)
+            # 主线程安全通道（_cloudConnSyncLog 已连到 _log）
+            if made:
+                self._cloudConnSyncLog.emit(f"🖼 本地缩略图已生成：{num} / {name}")
+            else:
+                logger.debug("本地缩略图渲染失败：%s / %s", num, name)
+
     # ──────── 外部打印监视（A 档最小版：只检测 + 记账，不阻断出纸）────────
 
     def _external_store(self) -> "print_watch.ExternalPrintStore":
@@ -11835,13 +12033,9 @@ class MainWindow(QMainWindow):
             if 0 <= row < len(tab_keys):
                 key = tab_keys[row]
                 if key != self._current_tab:
-                    self._cancel_undo_if_active()
-                    self._current_tab = key
-                    self._config.active_tab = key
-                    self._save_config()
-                    self._rebuild_table()
-                    self._refresh_tab_display()
-                    self._sync_edit_enabled(False)
+                    # 统一走 _goto_tab（同一套切页副作用 + 把主窗口置前，2026-11-18）；
+                    # 这里原来是手抄的一份，置前逻辑漏了就会"切了页但窗口还在后面"。
+                    self._goto_tab(key)
                 dlg.accept()  # 切换后关闭标签页管理器
         table.cellDoubleClicked.connect(_on_double_click)
 
@@ -15553,9 +15747,12 @@ class MainWindow(QMainWindow):
                 self._owner_combo.setEnabled(False)
             if hasattr(self, '_admin_print_check') and self._admin_print_check:
                 self._admin_print_check.setEnabled(False)
-            if cloud_locked:
-                # 云端订单（未冻结）：展示订单下发值（只读），而非残留上一个标签页的值
-                self._apply_tab_settings_values(tab, editable=False)
+            # 锁定页也要把**本页**的值显示出来（只读）。这些控件是全局共享的，不刷新就一直是
+            # 上一次渲染的标签页的值 —— 旧实现在这里提前 return，切到已冻结的标签页时
+            # 归属/附加服务停在上一页（往往正是刚进来的云端订单页）的取值上。
+            # 2026-11-18 现场：云端订单 HN20261118-0058/0059（归属闫承翰）落地后，三个已锁定
+            # 标签页（0055/0056/0057，云端归属霍楠）全部显示成「闫承翰」。
+            self._apply_tab_settings_values(tab, editable=False)
             return
         self._apply_tab_settings_values(tab, editable=True)
 
@@ -15591,7 +15788,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_owner_combo') and self._owner_combo:
             if editable:
                 self._owner_combo.setEnabled(True)
-            self._update_owner_combo_items()   # 内部同步 admin_print_check 启用态（无成员时禁用）
+            self._update_owner_combo_items(tab)   # 内部同步 admin_print_check 启用态（无成员时禁用）
             if not editable:
                 # _update_owner_combo_items 可能按成员名单重新启用 → 云端订单恢复锁定
                 self._owner_combo.setEnabled(False)
@@ -15652,12 +15849,15 @@ class MainWindow(QMainWindow):
         if self._owner_combo and self._owner_combo.itemText(index) == "(无成员)":
             self._show_no_member_hint()
 
-    def _update_owner_combo_items(self):
+    def _update_owner_combo_items(self, tab=None):
         """按成员名单重建归属下拉，尽量保持当前选中。
         成员名单来源：云端模式 = 云端收支配置成员（_refresh_owner_names_from_cloud）；
         本地模式 = 本地 print_data.json 成员（_refresh_owner_names_from_local）。
-        无成员时下拉仅显示「(无成员)」，且禁止创建订单（复制/开始打印会弹提示）。"""
-        tab = self._config.tabs.get(self._current_tab)
+        无成员时下拉仅显示「(无成员)」，且禁止创建订单（复制/开始打印会弹提示）。
+        `tab`：要显示归属的标签页（默认当前标签页）—— 必须由调用方显式传入，
+        否则「渲染哪个页」和「写回哪个页」会各说各话。"""
+        if tab is None:
+            tab = self._config.tabs.get(self._current_tab)
         names = self._member_names()
         tab_owner = (tab.owner_name if tab else "") or ""
         # v5.25：未绑定顾客订单的固定归属「普通用户」——即使不在成员名单也作为合法候选，
@@ -15667,10 +15867,24 @@ class MainWindow(QMainWindow):
             candidates.append(FALLBACK_OWNER_NAME)
         # v5.26：云端订单标签页的归属来自下单方（绑定成员/普通用户）→ 即使暂不在成员名单
         # （名单尚未同步）也保留，不被「落到第一个成员」覆盖
-        if tab and self._is_cloud_order_tab(tab) and tab_owner and tab_owner not in candidates:
-            candidates.append(tab_owner)
-        if candidates:
-            # 有候选：标签页归属为空/占位名/已不在候选 → 自动落到第一个真实成员（写回标签页，保证建单归属非空）
+        # v5.27（2026-11-18）：冻结页同理 —— 归属是已出单的历史事实，成员被删/改名后
+        # 只能原样展示，不能被兜底改写成第一个成员。
+        locked = bool(tab) and (self._is_cloud_order_tab(tab) or getattr(tab, "frozen", False))
+        if locked:
+            # 冻结页 / 云端订单页：只展示本页归属，**不做任何兜底替换**。
+            # 归属是已经上报、已经出账的事实 —— 哪怕它不在成员名单里（成员被删/改名）、
+            # 是空白、或还是旧版占位名，也照原样显示；拿第一个成员冒充本页归属，
+            # 就是 2026-11-18 现场「0055/0056/0057 全显示成云端单的闫承翰」那一幕。
+            act_owner = tab_owner
+            combo_items = list(candidates)
+            if not act_owner:
+                # 共享下拉只读：空白必须作为一个候选项存在，否则 setCurrentText("") 无效，
+                # 下拉会继续显示上一页（往往正是刚进来的云端订单页）的归属。
+                combo_items = [""] + combo_items
+            elif act_owner not in combo_items:
+                combo_items = [act_owner] + combo_items
+        elif candidates:
+            # 可编辑页：归属为空/占位名/已不在候选 → 自动落到第一个真实成员（写回标签页，保证建单归属非空）
             if (not tab_owner) or tab_owner in PLACEHOLDER_OWNER_NAMES or tab_owner not in candidates:
                 act_owner = candidates[0]
             else:
@@ -15689,7 +15903,10 @@ class MainWindow(QMainWindow):
             self._owner_combo.setCurrentText(act_owner)
             self._owner_combo.blockSignals(False)
         # 写回标签页归属（真实成员；无成员时置空）
-        if tab:
+        # 只写「当前且可编辑」的标签页：冻结页/云端订单页的归属是已经上报、已经出账的事实，
+        # 成员名单一变（含云端名单瞬时为空/顺序变化）就把它改写成第一个成员，
+        # 会让结算归属和云端订单归属一起串页。这类页只展示、不回写。
+        if tab and self._is_tab_editable(tab) and tab is self._config.tabs.get(self._current_tab):
             new_owner = act_owner if act_owner != "(无成员)" else ""
             if tab.owner_name != new_owner:
                 tab.owner_name = new_owner
@@ -15748,6 +15965,11 @@ class MainWindow(QMainWindow):
         """本地模式：从本地 print_data.json 读成员名单，严格采用（清洗占位名）。
         收支统计成员管理是唯一权威来源：成员被删除后，归属下拉立即不再显示该名字
         （不保留"标签页仍引用的旧名字"，标签页归属会在 _update_owner_combo_items 中被重置）。
+        例外：**云端才是成员权威时**（已配云端 api_url + token），本地这份文件里的
+        `members` 通常本来就是空的（成员管理搬到了云端收支清算），读不到成员不等于
+        "成员被删光" —— 照抄空名单会把归属下拉、以及可编辑标签页的归属一起清空，
+        云端重连后再兜底成第一个成员（2026-11-18 现场：断线窗口里归属被成批改写）。
+        这种情况保留原名单，等云端刷新覆盖。
         无 UI 操作，可在后台线程执行；UI 刷新由调用方经 _ownerComboRefreshed 信号。"""
         try:
             data = load_local_data_file()
@@ -15759,11 +15981,22 @@ class MainWindow(QMainWindow):
                         names.append(n)
             base = list(self._config.admin_names or [])
             merged = list(names)   # 严格 = 收支统计成员名单（不并入任何其他来源的名字）
+            if not merged and base and self._cloud_is_member_authority():
+                logger.debug("本地成员名单为空但云端才是权威来源 → 保留现有成员名单，等云端覆盖")
+                return
             if merged != base:
                 self._config.admin_names = merged
                 self._save_config(sync_ui=False)   # 后台线程（owner-name-sync）→ 不读 UI 控件
         except Exception as e:
             logger.debug(f"同步本地成员名单失败: {e}")
+
+    def _cloud_is_member_authority(self) -> bool:
+        """成员名单的权威来源是不是云端：已配云端地址 + 设备 token。
+        （纯本地部署返回 False，此时 print_data.json 就是权威，空名单 = 真的没有成员。）"""
+        client = getattr(self, "_cloud_client", None)
+        if client is None:
+            return False
+        return bool(getattr(client, "api_url", "") and getattr(client, "auth_token", ""))
 
     def _refresh_owner_names_from_cloud_net(self):
         """云端成员名单拉取 + 写盘（无 UI 操作，可在后台线程执行）。
@@ -16550,7 +16783,10 @@ class MainWindow(QMainWindow):
                     candidates[num] = {
                         "owner_name": (row[5] or ""),
                         "is_admin_print": bool(row[6]),
-                        "request_id": "",
+                        # 这张单当初取号用的幂等键（离线行现在会存）——带上它，后端把上次
+                        # 已经建好的占位号还给我们，同一批纸不会再拿一个新号（0040/0041 重复单）
+                        "request_id": (self._offline_sync.request_id_of(num)
+                                       if self._offline_sync else ""),
                     }
         if not candidates:
             return
@@ -17769,7 +18005,10 @@ class MainWindow(QMainWindow):
         """单个任务完成回调：上报云端 + 标记完成（新 UI 无表格行操作）。"""
         flat_jobs = getattr(self, '_flat_jobs', [])
         if 0 <= idx < len(flat_jobs):
-            self._report_job_result(flat_jobs[idx], success, message)
+            job = flat_jobs[idx]
+            self._report_job_result(job, success, message)
+            # 2026-11-19：本地单在云端没有 file_id，结算页的缩略图只能由本机渲染
+            self._queue_order_thumb(job)
 
     # ──────── 手动双面「半成品补救」（2026-11-10）────────
     # 背景：翻纸窗上的「⏭ 跳过本任务」、倒计时归零、关窗，原先一律把整批判"失败"。
@@ -17964,6 +18203,12 @@ class MainWindow(QMainWindow):
         worker.start()
         self._log(f"▶ 开始补救：{'整单重打' if self._remedy_mode == 'reprint' else '补打第 2 趟'}"
                   f"（{duplex_remedy.summary_line(rec)}）")
+        # v7.28：结算页立刻显示「第 N 趟中」，而不是一直挂着「第 2 趟被跳过」
+        _stage = "pass1" if self._remedy_mode == "reprint" else "pass2"
+        for _num in self._remedy_order_numbers(rec):
+            self._report_order_stage(
+                _num, _stage,
+                f"半成品补救：{'整单重打第 1 趟中' if _stage == 'pass1' else '补打第 2 趟中'}")
         self._refresh_remedy_action_text()
         return True
 
@@ -18010,6 +18255,10 @@ class MainWindow(QMainWindow):
             for job in jobs:
                 self._report_job_result(job, True, message)
                 self._log(f"✓ 任务已补完：{getattr(job, 'display_name', '') or ''}")
+            # v7.28：补打成功 ⇒ 清掉「第 N 趟被跳过」的中间态；若这一单曾被判 failed
+            # （操作员作废后又反悔补打），restore=true 把它修回 sent（结算页回到「已完成」）。
+            for _num in self._remedy_order_numbers(rec):
+                self._report_order_stage(_num, "", "半成品补救补打成功", restore=True)
         else:
             # 没打完就保持 pending（纸还是半成品），只记一次尝试与原因；
             # 不判失败 —— 判失败会把"打了前一半"的单记成"没打"。
@@ -18019,6 +18268,10 @@ class MainWindow(QMainWindow):
                 _stage = duplex_remedy.STAGE_PASS2_PARTIAL
             duplex_remedy.mark_stalled(rid, reason=message, stage=_stage)
             self._log("→ 半成品记录保留，随时可以再试（或整单重打 / 作废）")
+            # v7.28：补给云端一个明确的「第二趟失败」，结算页别停在「第二趟中」
+            for _num in self._remedy_order_numbers(rec):
+                self._report_order_stage(
+                    _num, "pass2_failed", f"第二趟补救失败：{str(message or '')[:80]}")
         self._refresh_remedy_action_text()
         dlg = getattr(self, '_remedy_dialog', None)
         if dlg is not None:
@@ -18033,6 +18286,18 @@ class MainWindow(QMainWindow):
 
     def _on_remedy_pass2(self, rid: str):
         self._start_remedy_worker(rid, mode="pass2")
+
+    def _remedy_order_numbers(self, rec) -> list:
+        """半成品台账记录里涉及哪些订单号（补打成功/作废时要把阶段报回去）。"""
+        nums: list = []
+        for it in ((rec or {}).get("items") or []):
+            try:
+                num = str((it or {}).get("order_number") or "").strip()
+            except Exception:
+                num = ""
+            if num and num not in nums:
+                nums.append(num)
+        return nums
 
     def _on_remedy_reprint(self, rid: str):
         rec = duplex_remedy.get(rid)
@@ -18063,9 +18328,15 @@ class MainWindow(QMainWindow):
             job.remedy_pending = ""
         if jobs:
             self._save_config()
-        _msg = "手动双面未完成（第 1 趟已打出，操作员作废）"
+        # v7.28 用户要求：失败原因要写清是**哪一趟**没完成（不能只说「手动双面未完成」）
+        _msg = "手动双面未完成：第二趟被跳过（第 1 趟已打出，操作员作废半成品）"
         for job in jobs:
             self._report_job_result(job, False, _msg)
+        # 结算页状态列显示「第二趟被跳过」（status 仍是 failed，金额口径不变）
+        for _num in self._remedy_order_numbers(rec):
+            self._report_order_stage(
+                _num, "pass2_skipped",
+                "第二趟被跳过（第 1 趟已打出，操作员在「半成品补救」窗作废）")
         self._log(f"✖ 已作废半成品 {rid}（{len(jobs)} 个任务按失败收尾）")
         self._refresh_remedy_action_text()
         dlg = getattr(self, '_remedy_dialog', None)
@@ -18260,6 +18531,80 @@ class MainWindow(QMainWindow):
                     f"⚠️ 本地订单 {order_number} 失败状态回落异常: {e}")
 
         threading.Thread(target=_net, daemon=True).start()
+
+    # ── 手动双面中间态上报（v7.28，2026-11-19 用户要求）────────────────────
+    # 需求原话：「对于不支持自动双面的打印机，其订单状态需要有『第一趟中』『第二趟中』
+    # 『第二趟等待中』三个中间状态，而且任何一个阶段被跳过，都需要在失败原因中写详细的
+    # 失败阶段」。落地方式：本地工具在两趟之间把阶段报给云端，云端只写**显示层**列
+    # （orders.duplex_stage / duplex_note），订单 status 与金额/页数口径一个字都不动
+    # （硬规矩 7：结算只认 sent；硬规矩 13：跳过不是失败）。半成品补救补打成功后发
+    # restore=True 把这一单从 failed 修回 sent。
+    DUPLEX_STAGE_LABELS_ZH = {
+        "pass1": "第一趟中", "pass2_wait": "第二趟等待中", "pass2": "第二趟中",
+        "pass1_skipped": "第一趟被跳过", "pass2_skipped": "第二趟被跳过",
+        "pass2_failed": "第二趟失败",
+    }
+
+    def _report_order_stage(self, order_number: str, stage: str, reason: str = "",
+                            restore: bool = False) -> None:
+        """把一个本地单的手动双面阶段报给云端（后台线程，失败只写日志）。
+
+        · `-L` / `LOCAL-` 临时号跳过：云端还没有这笔单，换号补报后阶段已经过期；
+        · 只在「手动双面（无自动双面器）」路径上调用，攒批模式不报（那边有自己的出纸槽台账）；
+        · `restore=True` + `stage=''` ⇒ 半成品补救补打成功，把 failed 修回 sent。
+        """
+        order_number = str(order_number or "").strip()
+        client = self._cloud_client
+        if not order_number or client is None:
+            return
+        upper = order_number.upper()
+        if "-L" in upper or upper.startswith("LOCAL-"):
+            return
+        api_url = (client.api_url or "").rstrip("/")
+        token = client.auth_token or ""
+        if not api_url or not token:
+            return
+        payload = {
+            "order_number": order_number,
+            "stage": str(stage or ""),
+            "reason": str(reason or "")[:200],
+        }
+        if restore:
+            payload["restore"] = True
+
+        def _net():
+            try:
+                resp = http_requests.post(
+                    f"{api_url}/api/local/order_stage",
+                    headers=auth_headers(token), json=payload, timeout=10)
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                if not (resp.ok and isinstance(body, dict) and body.get("success")):
+                    _msg = ((body.get("message") if isinstance(body, dict) else "")
+                            or resp.text[:120])
+                    logger.warning(
+                        f"手动双面阶段上报未成功: {order_number} {stage or '(清空)'} → {_msg}")
+            except Exception as e:
+                logger.warning(f"手动双面阶段上报异常: {order_number} {stage or '(清空)'} → {e}")
+
+        threading.Thread(target=_net, daemon=True).start()
+
+    def _on_duplex_stage(self, payload):
+        """PrintWorker.duplex_stage 信号 → 逐个订单上报（只写显示层，不改订单状态）。"""
+        if not isinstance(payload, dict):
+            return
+        stage = str(payload.get("stage") or "")
+        reason = str(payload.get("reason") or "")
+        orders = payload.get("orders") or []
+        if not isinstance(orders, (list, tuple)):
+            return
+        for num in orders:
+            self._report_order_stage(str(num or ""), stage, reason)
+        if stage:
+            _label = self.DUPLEX_STAGE_LABELS_ZH.get(stage, stage)
+            self._log(f"🖨 手动双面阶段：{_label}" + (f"（{reason}）" if reason else ""))
 
     # ──────── 手动双面（无自动双面器的机型：程序自己分两趟 + 人工翻纸）────────
 
@@ -21561,6 +21906,8 @@ class MainWindow(QMainWindow):
             self._on_stack_announce if stack_entry else self._on_duplex_announce)
         worker.duplex_finished.connect(self._on_duplex_finished)
         worker.duplex_plan.connect(self._on_duplex_plan)
+        # v7.28：手动双面「走到哪一趟」→ 云端显示层（结算页状态标签用）
+        worker.duplex_stage.connect(self._on_duplex_stage)
         # 「上一个任务还在出纸」→ 常驻窗的等待态（不计时）。攒批第 1 趟不发这个信号
         # （`_print_stack_pass1` 只发 duplex_announce，且那边的收件人是 _on_stack_announce）。
         worker.duplex_waiting.connect(self._on_duplex_waiting)
@@ -21627,6 +21974,9 @@ class MainWindow(QMainWindow):
                 owner_name=(tab.owner_name if tab else ""),
                 is_admin_print=bool(tab.is_admin_print) if tab else True,
                 remark=(tab.remark if tab else ''),
+                # 取号幂等键跟着这张单落库（2026-11-19 HN20261119-0040/0041）：离线行以前
+                # 没有键，重启后换号只能空手去取号 ⇒ 后端必然发一个新号 ⇒ 同一批纸两条订单。
+                request_id=(self._order_request_id(tab) if tab is not None else ""),
             )
             self._log(f"📴 本地单已缓存（{reason or '取号未成功'}）：{num} "
                       f"({len(files_data)} 个文件，换到云端号后自动补报)")
@@ -21673,6 +22023,7 @@ class MainWindow(QMainWindow):
                             owner_name=(tab.owner_name if tab else ""),
                             is_admin_print=bool(tab.is_admin_print) if tab else True,
                             remark=(tab.remark if tab else ''),
+                            request_id=(self._order_request_id(tab) if tab is not None else ""),
                         )
                         self._log(f"📴 离线未同步：任务只在本地（离线模式），联网后自动上传 "
                                   f"({len(files_data)} 个文件)")
@@ -21718,6 +22069,13 @@ class MainWindow(QMainWindow):
                 self._cache_local_order_locally(
                     result["order_number"], files_data, total_price, created_at, tab,
                     reason="取号超时")
+                # 🔴 2026-11-19 现场（殷建泷那单 HN20261119-0040/0041）：主线程超时放弃之后，
+                # 后台取号线程**照样会跑完**并拿着云端号上报 /api/local_orders —— 于是同一次
+                # 物理打印有了两个身份：云端 0040（后台线程晚到的）+ 离线库 L0060（主线程兜底的），
+                # 重启后换号流程把 L0060 换成 0041 又上报一次 ⇒ 结算页两张一模一样的订单。
+                # 现在晚到的云端号要**接管**这个本地临时号（改名离线库 + jobs），换号流程因此
+                # 不会再申请第二个号，补报也只落在同一个号上（后端幂等）。
+                self._watch_late_order_number(result, result["order_number"], flat_jobs, tab)
             else:
                 # 取号失败时 net 分支也会回 -L 临时号（见 _acquire_order_number_and_upload_net），
                 # 这里统一补一次本地落库（已是云端号时该函数自己跳过）
@@ -21727,6 +22085,105 @@ class MainWindow(QMainWindow):
             return result.get("order_number") or "", bool(result.get("uploaded", False))
         finally:
             self._print_starting = False
+
+    def _watch_late_order_number(self, result: dict, fallback: str, jobs, tab):
+        """盯着「取号超时之后才姗姗来迟的云端号」，来了就接管本地临时号。
+
+        背景（2026-11-19 现场 HN20261119-0040/0041：殷建泷那单被记了两次）：
+        主线程只等 4 秒就退回 -L 临时号开打并落离线库，可后台取号线程**不会被取消**，
+        它稍后拿到云端号并照样 POST /api/local_orders —— 同一次物理打印因此有了两个身份。
+        重启后换号流程把离线库里那条 -L 换成「另一个新号」再报一次 ⇒ 结算页出现两张
+        完全相同的订单。所以这里把晚到的云端号当作**改名**信号，而不是第二张单。
+        """
+        watch = getattr(self, "_late_number_watch", None)
+        timer = getattr(self, "_late_number_timer", None)
+        if watch is None:
+            watch = []
+            self._late_number_watch = watch
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(1000)
+            timer.timeout.connect(self._poll_late_order_numbers)
+            self._late_number_timer = timer
+        # 上一轮全部出队后定时器已停：这里必须重新 start，否则第二次「取号超时」再没人看着
+        # （watch 列表在、timer 停着 = 永远等不到接管，重复单原地复发）。
+        if not timer.isActive():
+            timer.start()
+        watch.append({
+            "result": result,
+            "fallback": str(fallback or ""),
+            "jobs": list(jobs or []),
+            "tab": tab,
+            # 90 秒还没等到就不等了（网络恢复后换号流程会把离线行换成正式号，那条路仍然稳）
+            "until": time.time() + 90.0,
+        })
+
+    def _poll_late_order_numbers(self):
+        """主线程定时器：检查后台取号线程是否在超时之后拿到了云端号。"""
+        watch = list(getattr(self, "_late_number_watch", []) or [])
+        if not watch:
+            timer = getattr(self, "_late_number_timer", None)
+            if timer is not None:
+                timer.stop()
+            return
+        now = time.time()
+        keep = []
+        for item in watch:
+            fallback = item.get("fallback") or ""
+            cloud = str((item.get("result") or {}).get("order_number") or "")
+            upper = cloud.upper()
+            late = bool(cloud) and cloud != fallback and "-L" not in upper \
+                and not upper.startswith("LOCAL-")
+            if late:
+                self._adopt_late_order_number(fallback, cloud,
+                                              item.get("jobs") or [], item.get("tab"))
+                continue
+            if now < float(item.get("until") or 0):
+                keep.append(item)
+        self._late_number_watch = keep
+        if not keep:
+            timer = getattr(self, "_late_number_timer", None)
+            if timer is not None:
+                timer.stop()
+
+    def _adopt_late_order_number(self, fallback: str, cloud: str, jobs, tab):
+        """把本地临时号换成晚到的云端号（离线库 + jobs + 标签页），不留第二个身份。"""
+        fallback = str(fallback or "")
+        cloud = str(cloud or "")
+        if not fallback or not cloud or fallback == cloud:
+            return
+        touched = 0
+        for j in list(jobs or []):
+            cur = str(getattr(j, "order_number", "") or "")
+            if cur in ("", fallback):
+                j.order_number = cloud
+                touched += 1
+        if tab is not None:
+            for j in list(getattr(tab, "jobs", []) or []):
+                if str(getattr(j, "order_number", "") or "") in ("", fallback):
+                    j.order_number = cloud
+                    touched += 1
+        try:
+            if self._offline_sync:
+                self._offline_sync.rename_order_number(fallback, cloud)
+                if tab is not None:
+                    self._offline_sync.set_request_id(cloud, self._order_request_id(tab))
+        except Exception as e:
+            logger.warning(f"晚到云端号改名失败（{fallback} → {cloud}）: {e}")
+        try:
+            self._save_config(sync_ui=False)
+        except Exception as e:
+            logger.warning(f"晚到云端号保存配置失败: {e}")
+        self._log(f"📋 晚到的云端号已接管本地临时号：{fallback} → {cloud}"
+                  f"（{touched} 个任务；这一单不会再报第二次）")
+        try:
+            self._refresh_offline_badge()
+        except Exception:
+            pass
+        try:
+            self._tabDisplayRefresh.emit()
+        except Exception:
+            pass
 
     def _acquire_order_number_and_upload_net(
         self, existing_order, files_data, total_price, extra_fields, tab, created_at,
@@ -22018,6 +22475,11 @@ class MainWindow(QMainWindow):
                     tab_key = found
                     tab = self._config.tabs[found]
                     self._log(f"⚡ 补打订单 #{order_id}: 标签页已重编号，按订单号定位到标签页 {tab_key}")
+            # 同一订单还有文件在防抖窗口里等入页 ⇒ 先别打（这条覆盖 `_on_all_finished`
+            # 直接调进来的路径，它不经过 `_pump_auto_print_retry` 的预检）。
+            if self._auto_print_order_still_collecting(order_id):
+                self._arm_auto_print_retry_timer()
+                return False
             if tab is not None and tab.jobs:
                 # 半成品（remedy_pending）不算"未打印"：重打会把第 1 趟再出一遍，
                 # 纸叠里多一套单面纸，补第 2 趟必然串页。它们由「半成品补救」窗接管。
@@ -22066,6 +22528,26 @@ class MainWindow(QMainWindow):
             pass
         return False
 
+    def _auto_print_order_still_collecting(self, order_id) -> bool:
+        """同一订单是否还有文件在无障碍防抖队列里等批量入页（正常 ≤ AUTO_PRINT_DEBOUNCE_MS）。
+
+        2026-11-18 现场 HN20261118-0051（订单 #1451 / 3 个文件 / 全双面 / 需人工翻纸）：
+        21:11:58 第一个文件就绪并起 8 秒防抖，21:12:06 防抖到期时只有它一个文件；
+        21:12:07 就绪的第二个文件把防抖重置到 21:12:17 —— 可中间 21:12:09 重试队列的抽水
+        看到「标签页里已经有 job」就开打了，于是这单被劈成两批：先 1 个文件 6 张纸，
+        另 2 个文件 5 张纸等下一轮收尾再打，整单多翻一次纸、spooler 里多两个作业。
+
+        抽水 / 排空都必须先问这一句：**同一订单还在收集文件就别抢跑**，等防抖把其余文件
+        并进同一标签页（`_find_tab_for_order` 会复用）后由 `_process_auto_print_order`
+        一次性开打（它取的本来就是「该标签页里所有未 sent 的 job」）。
+        """
+        if not order_id:
+            return False
+        try:
+            return bool(self._auto_print_queue.get(order_id))
+        except (AttributeError, RuntimeError):
+            return False
+
     def _pump_auto_print_retry(self) -> None:
         """定时抽水：能打就打；此刻打不了（打印中 / 页数还在统计）就 2 秒后再来一次。
 
@@ -22097,6 +22579,11 @@ class MainWindow(QMainWindow):
         item = self._auto_print_retry[0]
         tab_key = item.get("tab_key", "")
         order_id = item.get("order_id", 0)
+        # 同一订单还在防抖收集文件（其余文件马上会并进同一标签页）⇒ 别抢跑，见
+        # `_auto_print_order_still_collecting`（2026-11-18 HN20261118-0051 被劈成两批）。
+        if self._auto_print_order_still_collecting(order_id):
+            self._arm_auto_print_retry_timer()
+            return
         tab = self._config.tabs.get(tab_key) if tab_key else None
         if tab is None and order_id:
             found = self._find_tab_key_by_order_id(order_id)
@@ -23965,6 +24452,12 @@ class MainWindow(QMainWindow):
             self._minimize_to_tray()
             return
         self._closing = True  # 打印启动等待（processEvents）期间检测到关窗 → 中止启动流程
+        # 退出前最后看一眼「取号超时后晚到的云端号」：如果后台线程刚上报成功、1 秒定时器
+        # 还没轮到，这一单就会以离线库里的 -L 临时号留在本地，下次启动换号又报一次（0040/0041）。
+        try:
+            self._poll_late_order_numbers()
+        except Exception as e:
+            logger.debug(f"退出前接管晚到订单号失败: {e}")
         # 两个常驻提示窗已不是主窗口的子对象（见 _make_resident_tool_window）：不会随主窗口关闭
         # 被销毁，必须在这里显式收掉，否则会留下孤岛窗口（没有托盘时事件循环不退出）。
         self._close_resident_windows()

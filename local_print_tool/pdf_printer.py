@@ -93,6 +93,71 @@ MONO_RENDER_PIXELS = max_render_pixels(_PIXEL_BYTES_GRAY)   # 单色机（灰度
 MONO_THRESHOLD = 136               # 8bit 灰度 → 1bit 的硬阈值（< 阈值判黑）
 # 页面含非纯黑内容（图片/灰底纹/彩字）时整页改抖动：阈值会把浅灰内容抹成白色（见 _page_needs_dither）
 
+# ── 细线（hairline）保真（2026-11-19 现场：CAD 图纸整页打白，只剩中心几个圆圈）──
+#
+# PDF 里 stroke width = 0 的语义是"1 个设备像素"（hairline）。MuPDF 带抗锯齿渲染时
+# 把它摊到相邻 2 个像素上 ⇒ 每个像素覆盖率常常只有 30%~45%（灰度 140~180），而单色
+# 路径的硬阈值是 136 ⇒ **整条线被判成白**。现场那张 Drawing1(4)(cad2pdf).pdf（430 条
+# 0 宽线）打出来几乎全白，只有中心线叠加处、小圆圈（同一位置画了两遍、覆盖率更高）
+# 留下了痕迹；同一文件 Edge 打出来是完整的。
+#
+# 修法：渲染前把 MuPDF 的"最小线宽"抬到 1 N 设备像素。线仍然是细线（1.6px@600dpi
+# ≈ 0.19pt ≈ 67µm，比打印机的点还小），但每个像素都有足够覆盖率，阈值不再把线吃掉。
+# 实测这张图：ink 0.013% → 0.36%（27 倍），圆圈连续无断点；正文页不受影响（正文是
+# 实心笔画，本来就不靠这个阈值边缘吃饭）。
+# 单位是**设备像素**：实测 600dpi 下传 1.6 画出来约 2px；若按 pt 解释会是 13px。
+MONO_MIN_LINE_WIDTH = 1.6
+_MIN_LINE_WIDTH_LOCK = threading.Lock()
+
+
+class _MinLineWidth:
+    """临时抬高 MuPDF 最小线宽（设备像素）。
+
+    MuPDF 的这个设置是**进程级全局**，缩略图线程也在渲染 ⇒ 进出都持锁并恢复原值，
+    否则一次打印会把之后所有缩略图/预览的线全都画粗。拿不到 API 的老版本静默退化为
+    空操作（宁可不修，也不能因为设置失败把整页打印搞崩）。
+    """
+
+    __slots__ = ("_width", "_prev", "_locked")
+
+    def __init__(self, width: float):
+        self._width = float(width or 0)
+        self._prev = None
+        self._locked = False
+
+    def __enter__(self):
+        if self._width <= 0:
+            return self
+        self._locked = _MIN_LINE_WIDTH_LOCK.acquire(timeout=30)
+        if not self._locked:
+            return self
+        try:
+            import pymupdf as fitz
+            tools = getattr(fitz, "TOOLS", None)
+            if tools is not None:
+                self._prev = float((tools.show_aa_level() or {}).get("graphics_min_line_width") or 0.0)
+                tools.set_graphics_min_line_width(self._width)
+        except Exception as exc:               # noqa: BLE001 —— 拿不到就退化为空操作
+            logger.debug(f"最小线宽设置失败（不影响打印）：{exc}")
+            self._prev = None
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._prev is not None:
+                try:
+                    import pymupdf as fitz
+                    fitz.TOOLS.set_graphics_min_line_width(self._prev)
+                except Exception:
+                    pass
+        finally:
+            if self._locked:
+                try:
+                    _MIN_LINE_WIDTH_LOCK.release()
+                except Exception:
+                    pass
+        return False
+
 
 # ── 打印缩放（2026-11-18）──
 #
@@ -1921,11 +1986,17 @@ def _print_pdf_native(
                 mat = fitz.Matrix(render_h / page_w_pts, render_w / page_h_pts)
             else:
                 mat = fitz.Matrix(render_w / page_w_pts, render_h / page_h_pts)
-            pix = page.get_pixmap(
-                matrix=mat,
-                colorspace=fitz.csGRAY if mono else fitz.csRGB,
-                alpha=False,
-            )
+            # 细线（hairline）保真：CAD/工程图里 stroke width = 0 的线在 600dpi 下只有
+            # 1 个像素宽，抗锯齿把覆盖率摊薄到阈值以下 ⇒ 整条线被吃掉（2026-11-19 现场
+            # 那张 CAD 图纸整页白）。抖动页是灰阶内容，不走阈值，不需要（也不该）加粗。
+            _dither = _page_needs_dither(page) if mono else False
+            _lw = MONO_MIN_LINE_WIDTH if (mono and not _dither) else 0.0
+            with _MinLineWidth(_lw):
+                pix = page.get_pixmap(
+                    matrix=mat,
+                    colorspace=fitz.csGRAY if mono else fitz.csRGB,
+                    alpha=False,
+                )
 
             if mono:
                 gray = Image.frombuffer(
@@ -1933,7 +2004,7 @@ def _print_pdf_native(
                     pix.samples, "raw", "L", pix.stride, 1,
                 )
                 # 图片大面积覆盖 → 抖动保灰阶；纯文字/线条 → 硬阈值保锐度
-                img = gray.convert("1") if _page_needs_dither(page) else _to_bilevel(gray)
+                img = gray.convert("1") if _dither else _to_bilevel(gray)
             else:
                 img = Image.frombuffer(
                     "RGB", (pix.width, pix.height),

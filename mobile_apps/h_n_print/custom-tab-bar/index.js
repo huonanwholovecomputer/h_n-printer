@@ -1,24 +1,33 @@
 // custom-tab-bar/index.js
-// 原生自定义 tabBar — 固定配色（不随主题变化），避免重建时首帧闪色
-// 2026-11-16：加玻璃滑块。几何与选中格由这里下发（cfg），拖动/滞后/吸附/船式起伏全部
-// 在视图层（utils/tabbar.wxs）逐帧完成 —— 手势期间逻辑层一次 setData 都不参与。
-// 这里只负责「要切页」这一刻：先让当前页播 160ms 退出动画，再 switchTab。
-// 本次启动期内的「已落定格」：同一次启动里多份 tabBar 实例（每个 tab 页各一份）共享。
+// 原生自定义 tabBar。
+//
+// 第 18 轮（2026-11-19，用户口径：「小程序端就不要药丸动画了，直接切换就行，手动滑动也删掉」）：
+// 这个组件里**没有任何动画，也没有任何手势**。
+//   · 药丸是静态指示块：位置 = 本页自己那一格 × 格宽，由 data 直接算出来，没有 transition；
+//   · 视图层不再有 utils/tabbar.wxs —— 跟手拖动 / 85ms 滞后 / 橡皮筋 / 松手吸附 /
+//     整条栏船式起伏 / 整排 wave / 落位动效，全部删除；
+//   · 选中态（图标透明度、文字颜色、图标容器底色）也没有 200ms 过渡，切页那一帧一次换完。
+//
+// 为什么这样反而最稳：每个 tab 页各持一份 tabBar 实例，被隐藏的 webview 不再出帧 ——
+// 屏上第一帧永远是它上次离场时的最后一帧。只要「本页 data 永远等于本页那一格」，
+// 离场最后一帧 = 到场第一帧，两边天然对齐：
+// 不需要交接点、不需要事后纠正、也没有「标志位没被清掉就永久错位」的死锁。
+// （第 6~17 轮那些方案与踩过的坑记在 mobile_apps/docs/移动端_小程序.md 的 Tab 栏各轮小节里。）
+//
+// 本次启动内的「已落定格」：同一次启动里多份 tabBar 实例（每个 tab 页各一份）共享。
 // 冷启动从 -1 开始，**绝不**回读 storage 里的 _tabCur —— 那里是上一条命留下的值，
 // 页面栈还空的那一瞬读到它，药丸就会落到上一次的格（现场：在打印页、药丸在「我」）。
 let sessionCur = -1
+
 Component({
   data: {
     hideBorder: false,
     dark: false,
     selected: 0,
-    wave: false,
-    cfg: null,
-    // 位移层由 data 兜底的落位（px）：视图层抹掉内联样式后的最后一道保险
+    // 药丸位移（px）：本页格 × 一格宽。落位后在整个页面生命周期里都不再变化。
     thumbX: 0,
-    // 首帧显隐门：新页面刚建出来的 tabBar 实例在拿到 cfg / 落位之前，药丸先不显形。
-    // 用 data 驱动的 class（不是视图层写的内联 opacity，那个会被 setData 抹掉），
-    // 只有 _refresh / _repaint 把「落位 + thumbReady」放进同一次 setData，才会一起显形。
+    // 首帧显隐门（第 4 轮）：新实例 first paint 时 data 还是默认的 0，先不显形；
+    // 「落位 + thumbReady」放进同一次 setData，于是显形即正确。
     thumbReady: false,
     list: [
       { text: '打印', icon: '/images/tab/print.png', pagePath: 'pages/index/index', active: true },
@@ -27,36 +36,40 @@ Component({
   },
   lifetimes: {
     attached() {
-      this._rev = 0
-      this._handledTapAt = 0
-      this._waveTimer = 0
       this._geo = null
-      this._quiet = false
       this._settleTimer = 0
       this._refresh()
     },
     detached() {
-      if (this._waveTimer) { clearTimeout(this._waveTimer); this._waveTimer = 0 }
       if (this._settleTimer) { clearTimeout(this._settleTimer); this._settleTimer = 0 }
     },
   },
   pageLifetimes: {
-    show() { this._refresh() },
+    // 回到屏上：清闸门 + 按真实 route 落一次位（位置本来就对，这一次 setData 通常只是把
+    // selected / active 与真实页面校一遍）。
+    show() {
+      this._pageHidden = false
+      this._refresh()
+    },
+    // 页面**真的被换走**（switchTab 落地）才会触发 —— 这是「切页到底落没落地」最可靠的信号。
+    // _reconcile 靠它区分「switchTab 没生效」和「只是页面栈还没换成新页」：后者绝不能清 _tabWant
+    // （第 9 轮现场：switchTab 落地慢了一拍，450ms 的核对把目标格当失败清掉了）。
+    hide() {
+      this._pageHidden = true
+    },
   },
   observers: {
-    // 页面会直接对 tabBar setData（提交时切 hideBorder、onShow 时切 selected）：
-    // 每次 setData 框架都会重新下发节点 style，把视图层写的位移整条抹掉，
-    // 所以这两个字段一变就补画一次（只重画，不动位置）。
-    hideBorder() { if (!this._quiet) this._repaint() },
-    // 页面声明的选中格与药丸位置不一致就补画 —— 这里**不再看 _quiet**：
-    // 现场那次事故正是「页面 onShow 的 setData 恰好落在 _markQuiet() 与清闸之间」，
-    // 补画被吞掉，屏上停在「打印高亮 + 药丸在『我』」，且没有任何后续事件能纠回来。
-    // 已经对上（_refresh / _goTab 自己下发的那一次）就什么都不做，不会多打一轮 setData。
+    // 页面会直接对本组件 setData（提交时切 hideBorder、onShow 时切 selected）：
+    // 每次 setData 框架都会重新下发节点样式，所以这两个字段一变就按 data 补画一次。
+    hideBorder() { this._repaint() },
+    // 页面声明的选中格与药丸位置不一致就补画。这里不看任何「静默期」标志：
+    // 现场那次事故正是「页面 onShow 的 setData 恰好落在静默期里」，补画被吞、药丸永久停在错格。
+    // 已经对上就什么都不做（_refresh 自己下发的那一次不会多打一轮 setData）。
     selected() { this.syncPill() },
   },
   methods: {
-    // 几何：一格多少 px、药丸允许探出多少（= 左右内缩 / 格宽）。与 index.wxss 的
-    // left: 9rpx / width: calc(50% - 18rpx) 必须一致，否则药丸落位会偏。
+    // 几何：一格多少 px。与 index.wxss 的 left: 9rpx / width: calc(50% - 18rpx) 必须一致，
+    // 否则药丸落位会偏。
     _measure() {
       let winW = 375
       try {
@@ -65,22 +78,16 @@ Component({
       } catch (e) { /* 老基础库：用 375 兜底 */ }
       const pxPerRpx = winW / 750
       const barW = winW - 160 * pxPerRpx
-      const slot = barW / 2
-      const inset = 9 * pxPerRpx
-      this._geo = { step: slot, over: inset / slot, maxIdx: this.data.list.length - 1 }
+      this._geo = { step: barW / 2 }
       return this._geo
     },
 
-    // 页面出现/切回时对齐选中格（新页面的 tabBar 是新建实例，药丸直接落在这一格）
-    _refresh() {
-      const geo = this._measure()
-      // 落位口径（第 6 轮，三层）：
-      // ① route 命中哪一格就是哪一格（常规路径）；
-      // ② route 拿不到时（切 tab 落地那一刻 getCurrentPages() 可能还是空/旧页）用本次启动里
-      //    已落定过的格（模块内存 sessionCur）——**不要**回退到 data.selected：新实例的默认值
-      //    是 0，那就是「药丸画到左格」；迟到创建的那份实例（如被隐藏的打印页）同样画左格，
-      //    叠在当前栏上就成了「切页几秒后药丸又闪一下」；
-      // ③ _goTab 在 1.5s 内记下的目标格优先于上面两层（它代表用户的最新意图）。
+    // 本页应该落哪一格。三层（第 6 轮口径，第 18 轮保留）：
+    // ① route 命中哪一格就是哪一格；
+    // ② route 拿不到时用本次启动里已落定过的格（模块内存 sessionCur）——**不要**回退到
+    //    data.selected：新实例的默认值是 0，那就是「药丸画到左格」；
+    // ③ _goTab 在 1.5s 内记下的目标格优先于上面两层（它代表用户的最新意图）。
+    _ownIdx() {
       let idx = -1
       let route = ''
       try {
@@ -95,97 +102,86 @@ Component({
       if (idx < 0 && sessionCur >= 0 && sessionCur <= this.data.list.length - 1) idx = sessionCur
       if (idx < 0) idx = this.data.selected
       // 切 tab 落地这一刻页面栈可能还没换成新页：route 仍是上一页，而且它会「命中」旧页那一格
-      // （不是未命中），所以兜底不能只写在 found < 0 的分支里 —— 那正是「药丸先闪回打印、
-      // 再被页面 onShow 的 setData 拽回我」的现场：_refresh 落 0 → 两帧后 _repaint 落 1。
-      // 口径：_goTab 在 1.5s 内记下的目标格优先于 route（route 只在这 1.5s 之外才作数）。
+      // （不是未命中），所以这条兜底不能只写在 found < 0 的分支里。
       try {
         const want = Number(wx.getStorageSync('_tabWant'))
         const at = Number(wx.getStorageSync('_tabWantAt') || 0)
         if (want >= 0 && want <= this.data.list.length - 1 && at && Date.now() - at < 1500) idx = want
       } catch (e) {}
-      // 落定之后就记住（本次启动内跨实例共享）——必须写在这里，不能写在上面 route 分支之后：
-      // _tabWant 会把 idx 改掉，记早了 sessionCur 就跟真正下发的格不一致。
+      return idx
+    },
+
+    // 页面出现/切回时对齐选中格（新页面的 tabBar 是新建实例，药丸直接落在这一格）
+    _refresh() {
+      const geo = this._measure()
+      const idx = this._ownIdx()
       sessionCur = idx
       let dark = false
       try { dark = !!(getApp().globalData && getApp().globalData.isDarkMode) } catch (e) {}
-      // 只有「刚切 tab 落到本页」才播整排 wave；从子页返回不播，免得每回一次抖一下
-      let arriving = false
-      try {
-        const at = Number(wx.getStorageSync('_tabWaveAt') || 0)
-        if (at && Date.now() - at < 1500) {
-          arriving = true
-          wx.removeStorageSync('_tabWaveAt')
-        }
-      } catch (e) {}
-      this._rev += 1
       const patch = {
         selected: idx,
         dark,
         thumbX: idx * geo.step,
-        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel: idx, rev: this._rev, snap: true },
         thumbReady: true,
       }
-      if (arriving) patch.wave = true
-      this._markQuiet()
       this.data.list.forEach((item, i) => {
         if (item.active !== (i === idx)) patch['list[' + i + '].active'] = (i === idx)
       })
       this.setData(patch)
       try { wx.setStorageSync('_tabCur', idx) } catch (e) {}   // 仅诊断镜像，不作落位依据
-      if (arriving) {
-        // 收 wave 也是一次 setData：此时药丸已经停在选中格，抹掉再补画看不出差别
-        if (this._waveTimer) clearTimeout(this._waveTimer)
-        this._waveTimer = setTimeout(() => {
-          this._waveTimer = 0
-          this._rev += 1
-          this._markQuiet()
-          this.setData({
-            wave: false,
-            cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, rev: this._rev, snap: false },
-          })
-        }, 700)
-      }
     },
 
-    // 自己 setData 期间不要触发 observers 的补画（否则一次切换会多打一轮）
-    _markQuiet() {
-      this._quiet = true
-      const done = () => { this._quiet = false }
-      if (wx.nextTick) wx.nextTick(done)
-      else setTimeout(done, 0)
-    },
-
-    // 页面直接对本组件 setData（onShow 切 selected、提交时切 hideBorder）之后，
-    // 框架会把节点样式重新下发、把视图层写的位移抹掉 —— 这里按逻辑层的 selected 重新落位。
-    // 注意 snap 必须为 true：snap:false 只是「按视图层的 state.pill 重画」，
-    // 一旦 state.pill 停在旧格（切页落地时页面栈还没换成新页），药丸就会一直停在上一个 tab 上。
+    // 页面直接对本组件 setData 之后，按逻辑层的 selected 重新落位（位置永远由 selected 决定）
     _repaint() {
       const geo = this._geo || this._measure()
       const sel = this.data.selected || 0
       sessionCur = sel
+      this.setData({ thumbX: sel * geo.step, thumbReady: true })
       try { wx.setStorageSync('_tabCur', sel) } catch (e) {}   // 仅诊断镜像，不作落位依据
-      this._rev += 1
-      this.setData({
-        thumbX: sel * geo.step,
-        thumbReady: true,
-        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel, rev: this._rev, snap: true },
-      })
     },
 
     // 页面 onShow 声明完选中格之后主动对一次（公开方法，两个 tab 页都会调）。
-    // 为什么不能只靠 selected 观察者：_goTab 只挪药丸、不改 selected，页面随后
-    // setData({selected: 同一个值}) 等于什么都没发生，观察者压根不开火 —— 药丸就停在那儿了。
+    // 为什么不能只靠 selected 观察者：页面随后 setData({selected: 同一个值}) 等于什么都没发生，
+    // 观察者压根不开火 —— 药丸就停在那儿了。
     syncPill() {
       const geo = this._geo || this._measure()
       const sel = this.data.selected || 0
       const want = sel * geo.step
-      if (Math.abs((Number(this.data.thumbX) || 0) - want) < 0.5) return
+      if (Math.abs((Number(this.data.thumbX) || 0) - want) < 0.5) {
+        // 位置与 selected 对得上，但两者有可能**一起**被旧 route 带偏（现场：切到「我」之后整条栏
+        // 按打印页重画，selected=0、thumbX=0，屏上「打印高亮 + 药丸在左」，而页面明明是「我」）。
+        // 这种「一致地错」靠位置比对永远发现不了 —— 必须拿真实页面校一次。
+        if (this._disagreesWithRoute(sel)) this._refresh()
+        return
+      }
       this._repaint()
     },
 
-    // 切页到底落没落地：药丸是乐观先滑过去的，switchTab 可能压根没生效
-    // （转场中重复调用 / 页面正被隐藏 / 低端机超时）。那时页面栈还停在原格，
-    // syncPill 也救不了（页面 onShow 的 setData 值没变），只能按真实 route 把药丸收回来。
+    // 事先声明的格与「当前真实页面」是否冲突（_goTab 刚记下的目标格优先，切页途中不算冲突）
+    _disagreesWithRoute(sel) {
+      // 本页不在屏上时不算冲突：当前 route 指向的是**别人那一页**，拿它来校这一份实例，
+      // 只会把它拽到别人的格上。
+      if (this._pageHidden) return false
+      let route = ''
+      try {
+        const pages = getCurrentPages()
+        const cur = pages[pages.length - 1]
+        if (cur && cur.route) route = cur.route
+      } catch (e) { return false }
+      if (!route) return false
+      const found = this.data.list.findIndex((item) => item.pagePath === route)
+      if (found < 0 || found === sel) return false
+      try {
+        const want = Number(wx.getStorageSync('_tabWant'))
+        const at = Number(wx.getStorageSync('_tabWantAt') || 0)
+        if (want === sel && at && Date.now() - at < 1500) return false
+      } catch (e) {}
+      return true
+    },
+
+    // 切页到底落没落地：switchTab 可能压根没生效（转场中重复调用 / 页面正被隐藏 / 低端机超时）。
+    // 那时页面栈还停在原格，而它 onShow 的 setData({selected: 上一个值}) 因为「值没变」不会触发补画
+    // —— 屏上就是「打印高亮 + 药丸在『我』」而且一直不恢复。450ms 后按真实 route 核一次。
     // pagePath 传的是**本实例所属那一页**（原页）：route 还是它 ⇒ switchTab 没落地。
     _reconcile(pagePath) {
       let route = ''
@@ -195,53 +191,40 @@ Component({
         if (cur && cur.route) route = cur.route
       } catch (e) { return }
       if (!route || route !== pagePath) return
+      // 页面已经被换走（pageLifetimes.hide 已触发）⇒ 切页真的落地了，只是 getCurrentPages()
+      // 还没换成新页。这时候清 _tabWant 就是在拆自己刚铺的路：新页面的那份实例拿不到目标格，
+      // 只能按旧 route 落回上一格 —— 现场「切到我又跳回打印、且永久停住」。
+      if (this._pageHidden) return
       try {
         wx.removeStorageSync('_tabWant')
         wx.removeStorageSync('_tabWantAt')
-        wx.removeStorageSync('_tabWaveAt')
       } catch (e) {}
       this._refresh()
     },
 
-    // 兜底：视图层没接住这一下时（老基础库/JS 层事件）仍能切页。
-    // 视图层的点按会先 callMethod('onTabTap')，600ms 内的 bindtap 一律忽略。
+    // 点按切页（视图层 bindtap）。第 18 轮起视图层没有任何手势回调，这里是唯一入口。
     switchTab(e) {
-      if (Date.now() - (this._handledTapAt || 0) < 600) return
       const index = Number(e.currentTarget.dataset.index)
-      this._handledTapAt = Date.now()
       this._goTab(index)
-    },
-
-    onTabTap(arg) {
-      this._handledTapAt = Date.now()
-      this._goTab(Number(arg && arg.index))
-    },
-
-    onTabDragTo(arg) {
-      this._handledTapAt = Date.now()
-      this._goTab(Number(arg && arg.to))
-    },
-
-    onTabDragBack() {
-      // 拖回原格：不切页，但抑制随后可能补发的 bindtap
-      this._handledTapAt = Date.now()
     },
 
     _goTab(index) {
       const target = this.data.list[index]
       if (!target || index === this.data.selected) return
       const prev = this.data.selected
+      // 每次切页重新计：本页此后是否真的被换走，只看这一次的 pageLifetimes.hide
+      this._pageHidden = false
       // 目标格必须先落盘：animateExit 在「有弹窗」时会自己接管切页（关弹窗 → switchTab），
       // 不会回到下面这段 —— 那条路上的新页面 tabBar 拿不到 _tabWant，只能按旧 route 落 0，
       // 一帧后再被页面 onShow 的 setData(selected) 拽回来，看上去就是药丸先闪回上一格。
+      // _tabFrom / _tabTo 是页面侧入场动画用的（pages/index/index.js、pages/me/me.js 都会读）。
       try {
         wx.setStorageSync('_tabFrom', prev)
         wx.setStorageSync('_tabTo', index)
-        wx.setStorageSync('_tabWaveAt', Date.now())
         wx.setStorageSync('_tabWant', index)
         wx.setStorageSync('_tabWantAt', Date.now())
         // 目标格同时也是「本次启动的当前格」：切页途中若有一份新实例被创建（如被隐藏的打印页），
-        // 它的 _refresh 拿不到 route，就会读这个值 —— 落在目标格，叠在当前栏上也看不出变化。
+        // 它的 _refresh 拿不到 route，就会读这个值 —— 落在目标格。
         sessionCur = index
         wx.setStorageSync('_tabCur', index)   // 仅诊断镜像，不作落位依据
       } catch (e) {}
@@ -249,6 +232,18 @@ Component({
       const isDark = app.globalData.isDarkMode
       wx.setBackgroundColor({ backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7', backgroundColorTop: isDark ? '#1C1C1E' : '#F2F2F7', backgroundColorBottom: isDark ? '#1C1C1E' : '#F2F2F7' })
       wx.setNavigationBarColor({ frontColor: isDark ? '#ffffff' : '#000000', backgroundColor: isDark ? '#1C1C1E' : '#F2F2F7' })
+      // 这里**一次 setData 都不发**（第 13 轮起的口径，第 18 轮沿用）：
+      // 药丸停在本页格不动，选中态也留给切过去之后那一页的 _refresh ——
+      // 因为每份实例的离场最后一帧就是下次到场的第一帧，本页只要一开始挪药丸，
+      // 下一帧在别人那一页上就得再挪回来（第 6~17 轮的同一个坑）。
+      // 点按的即时反馈由 hover 态 + 本页 160ms 退出动画承担。
+      const fromPath = (this.data.list[prev] && this.data.list[prev].pagePath) || ''
+      if (this._settleTimer) clearTimeout(this._settleTimer)
+      // 这条核对必须两边都排：有弹窗时页面自己接管切页（下面 return），那条路同样需要兜底。
+      this._settleTimer = setTimeout(() => {
+        this._settleTimer = 0
+        this._reconcile(fromPath)
+      }, 450)
       const dir = prev === 0 ? 'left' : 'right'
       let cp = null
       try {
@@ -256,35 +251,10 @@ Component({
         cp = pages[pages.length - 1]
       } catch (e) {}
       if (cp && typeof cp.animateExit === 'function' && !cp.animateExit(dir)) return
-      // 立刻把「目标格」写进 data（第 6 轮）：
-      // ① data.thumbX 一改，WXML 上的内联 transform 就换成目标格 —— 由 .tab-thumb 的 CSS 过渡
-      //    把药丸滑过去（160ms，与页面退出动画同长），不再靠视图层逐帧动画；
-      // ② 更要紧的是：换页那一瞬框架若重下发本组件的 style，下发的就是**目标格**。
-      //    以前这一步排在 200ms 之后、还跟在 switchTab 后面 —— 重下发时用的仍是上一格，
-      //    于是「已经滑到『我』又闪回『打印』」。这是切页闪的第二半。
-      // cfg 带 quiet：视图层只同步状态，不要再写一次 transform，否则会把过渡打断成瞬移。
-      // 选中态 / 整排 wave 仍交给切过去之后那一页的 _refresh（旧实例不改选中态）。
-      const geo = this._geo || this._measure()
-      this._rev += 1
-      this._markQuiet()
-      this.setData({
-        thumbX: index * geo.step,
-        cfg: { step: geo.step, maxIdx: geo.maxIdx, over: geo.over, sel: index, rev: this._rev, quiet: true },
-      })
-      // 200ms > 页面退出动画 160ms：药丸滑到位、页面滑出去之后再换页
+      // 200ms > 页面退出动画 160ms：页面滑出去之后再换页
       setTimeout(() => {
         wx.switchTab({ url: '/' + target.pagePath })
       }, 200)
-      // 落地位核对（第 7 轮）：药丸是「乐观」先滑过去的，switchTab 有可能压根没落地
-      // （转场中重复调用 / 页面正被隐藏 / 低端机超时）。那时页面还停在原格，而它 onShow 的
-      // setData({selected: 上一个值}) 因为「值没变」不会触发补画 —— 屏上就是
-      // 「打印高亮 + 药丸在『我』」而且一直不恢复。450ms 后按真实 route 核一次。
-      const fromPath = (this.data.list[prev] && this.data.list[prev].pagePath) || ''
-      if (this._settleTimer) clearTimeout(this._settleTimer)
-      this._settleTimer = setTimeout(() => {
-        this._settleTimer = 0
-        this._reconcile(fromPath)
-      }, 450)
     },
   },
 })

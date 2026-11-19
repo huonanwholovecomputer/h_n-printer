@@ -40,6 +40,13 @@ from typing import Any, Callable, Iterable, Optional
 
 from printer_config import calc_cost
 
+try:  # Windows 专属；非 Windows 机器 import 本模块也不能炸（验收可能不在 Windows 跑）
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+except Exception:  # pragma: no cover - 仅非 Windows
+    _ctypes = None  # type: ignore[assignment]
+    _wintypes = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 # 本工具提交的作业文档名前缀（排除自家作业的唯一依据，见模块头 ①）
@@ -193,8 +200,15 @@ def _as_int(value: Any, default: int = 0) -> int:
     try:
         if value is None:
             return default
+        # 🟠 2026-11-19 实机（HP LaserJet 1020 + pywin32，源码版探针实测）：EnumJobs 的
+        # `Submitted` 给的是 **pywintypes.datetime**，不是 int —— 直接 int() 抛 TypeError，
+        # 于是 submitted 恒为 0，作业身份退化成 (printer, job_id)：JobId 一旦在 spooler
+        # 会话间撞号（11-18 现场 12/13 与 11-13 历史撞号），整批打印就被当 duplicate 静默
+        # 丢掉。datetime（含 pywintypes.datetime 子类）走 timestamp()，其余仍按数字解析。
+        if hasattr(value, "timestamp"):
+            return int(float(value.timestamp()))
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OSError, OverflowError):
         return default
 
 
@@ -342,6 +356,11 @@ class ExternalPrint:
     copies: int = 1
     size_bytes: int = 0
     detected_at: str = ""
+    # spooler 的 Submitted（unix 秒；0 = 老账本行或驱动没填）。JobId 只在一次 spooler 会话内
+    # 唯一 —— spooler 重启/打印机重连后从 1 重新编号，所以「作业身份」必须带上它。
+    # 2026-11-18 现场：昨夜外部打印的两单拿到 JobId 12/13，与 11-13 的两条历史行撞号，
+    # 被当 duplicate 静默丢弃（账本一整天没进一条，日志连一行都没有）。
+    submitted: int = 0
     printer_virtual: bool = False
     status: str = STATUS_NEW
     # 人工订正过的**订单状态**（"" = 没订正过，展示时按 sent 处理）。
@@ -360,6 +379,15 @@ class ExternalPrint:
 
     def job_key(self) -> tuple[str, int]:
         return (self.printer, int(self.job_id))
+
+    def identity(self) -> tuple[str, int, int]:
+        """作业身份（去重口径）：(printer, job_id, submitted)。
+
+        JobId 不是作业身份 —— spooler 重启后从 1 重新编号，撞上历史行就会被当 duplicate
+        静默丢掉。老账本行没有 submitted（读进来是 0），因此老行永远不会挡住新作业
+        （新作业的 Submitted 是真实 unix 秒，> 0）。
+        """
+        return (self.printer, int(self.job_id), int(self.submitted or 0))
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -383,6 +411,7 @@ class ExternalPrint:
         item.document = str(item.document or "")
         item.user = str(item.user or "")
         item.detected_at = str(item.detected_at or "")
+        item.submitted = _as_int(item.submitted, 0)
         item.pages_source = str(item.pages_source or SOURCE_UNKNOWN)
         if item.pages_source not in (SOURCE_AUTO, SOURCE_CONFIRMED, SOURCE_UNKNOWN):
             item.pages_source = SOURCE_UNKNOWN
@@ -484,7 +513,7 @@ def _default_virtual_check(printer: str) -> bool:
 
 
 def should_record(job: Any, self_titles: Iterable[str] = (), now: Optional[datetime] = None,
-                  *, known_keys: Iterable[tuple[str, int]] = (),
+                  *, known_keys: Iterable[tuple] = (),
                   virtual_check: Optional[Callable[[str], bool]] = None,
                   printer: str = "") -> tuple[bool, str]:
     """纯函数：这条作业要不要记账。返回 (要不要记, 原因)。
@@ -497,6 +526,9 @@ def should_record(job: Any, self_titles: Iterable[str] = (), now: Optional[datet
 
     spooling：见 JOB_STATUS_SPOOLING —— 这一阶段 pDocument 还是「本地下层文档」占位串、
     TotalPages 还是 0，判自家/判页数都会错，所以**本轮先跳过**，等作业进 PRINTING 再判。
+
+    known_keys 是账本里的**作业身份**三元组 (printer, job_id, submitted)（老调用方只给
+    二元组时按旧口径兜底，见函数体的 submitted<=0 分支）。
     """
     now = now or datetime.now()
     job_id = _as_int(job_get(job, "JobId"), 0)
@@ -515,9 +547,14 @@ def should_record(job: Any, self_titles: Iterable[str] = (), now: Optional[datet
     except Exception as e:                # 判定本身出错不能把整条作业吞掉
         logger.warning(f"外部打印监视：虚拟打印机判定异常（{name}）: {e}")
     known = set(known_keys or ())
-    if (name, job_id) in known:
-        return False, "duplicate"
     submitted = _as_int(job_get(job, "Submitted"), 0)
+    # 去重按**作业身份**判：(printer, job_id, submitted)。只比 (printer, job_id) 会被
+    # spooler 重启后的 JobId 复用骗到（历史行挡住新作业 ⇒ 静默漏记，2026-11-18 现场）。
+    if (name, job_id, submitted) in known:
+        return False, "duplicate"
+    if submitted <= 0 and (name, job_id) in known:
+        # 驱动没给 Submitted（拿不到真实身份）时退回旧口径：宁可漏记也不能同一作业记两遍
+        return False, "duplicate"
     if submitted > 0:
         try:
             if (now - datetime.fromtimestamp(submitted)).total_seconds() > STALE_AFTER_SEC:
@@ -552,6 +589,7 @@ def build_external(job: Any, now: Optional[datetime] = None, *,
         copies=copies_of(job),
         size_bytes=_as_int(job_get(job, "Size"), 0),
         detected_at=job_detected_at(job, now),
+        submitted=_as_int(job_get(job, "Submitted"), 0),
         printer_virtual=bool(virtual),
         status=STATUS_NEW,
     )
@@ -650,11 +688,21 @@ class ExternalPrintStore:
     def __len__(self) -> int:
         return len(self.load())
 
-    def known_job_keys(self) -> set[tuple[str, int]]:
-        return {item.job_key() for item in self.load()}
+    def known_job_keys(self) -> set[tuple[str, int, int]]:
+        """账本里已有的**作业身份**集合（见 ExternalPrint.identity）。
 
-    def has(self, printer: str, job_id: int) -> bool:
-        return (str(printer or ""), _as_int(job_id, 0)) in self.known_job_keys()
+        为什么不是 (printer, job_id)：JobId 是 spooler 会话内的序号，重启后从 1 重新编号，
+        历史行会挡住新作业（2026-11-18 漏记两单的真凶）。带 submitted 后，老账本行
+        （submitted=0）不会与任何新作业相撞。
+        """
+        return {item.identity() for item in self.load()}
+
+    def has(self, printer: str, job_id: int, submitted: Optional[int] = None) -> bool:
+        """该作业是否已记账。给 submitted 时按完整身份判，否则只比 (printer, job_id)。"""
+        name, jid = str(printer or ""), _as_int(job_id, 0)
+        if submitted is None:
+            return any(k[0] == name and k[1] == jid for k in self.known_job_keys())
+        return (name, jid, _as_int(submitted, 0)) in self.known_job_keys()
 
     # ── 写 ──
 
@@ -845,8 +893,120 @@ class SpoolerApi:
         return int(self._k32.WaitForSingleObject(notif, int(timeout_ms)))
 
 
+class _SYSTEMTIME(_ctypes.Structure if _ctypes else object):
+    """ctypes.wintypes 没有 SYSTEMTIME（win32 里也没导出），自己声明一份。"""
+
+
+class _JOB_INFO_1W(_ctypes.Structure if _ctypes else object):
+    """winspool 的 JOB_INFO_1W（EnumJobs level 1）—— 兜底枚举用，只取要用的字段。
+
+    2026-11-19 装机版现场：`win32print.EnumJobs(level=2)` 会把 `Submitted` 的 SYSTEMTIME
+    转成 `pywintypes.datetime`，这一步要 import win32timezone。打包漏收 win32timezone ⇒
+    每轮都抛 `ModuleNotFoundError: No module named 'win32timezone'`，整只监视「在跑却
+    永远扫不到作业」（白天还因为日志没接 root 而完全看不见）。
+
+    兜底故意用 **level 1**：它字段少、布局已实测对得上（`Submitted` 自己解 SYSTEMTIME，
+    不碰 win32timezone），page/status/文档名这些判定必需的信息一样不少；只少了 pDevMode
+    （单双面/份数会回落成「待确认」，由界面人工补录）——比整只监视瘫掉好得多。
+    """
+
+
+if _ctypes:
+    _U16 = _wintypes.WORD if hasattr(_wintypes, "WORD") else _ctypes.c_ushort
+    _SYSTEMTIME._fields_ = [
+        ("wYear", _U16), ("wMonth", _U16), ("wDayOfWeek", _U16), ("wDay", _U16),
+        ("wHour", _U16), ("wMinute", _U16), ("wSecond", _U16), ("wMilliseconds", _U16),
+    ]
+    _JOB_INFO_1W._fields_ = [
+        ("JobId", _wintypes.DWORD),
+        ("pPrinterName", _wintypes.LPWSTR),
+        ("pMachineName", _wintypes.LPWSTR),
+        ("pUserName", _wintypes.LPWSTR),
+        ("pDocument", _wintypes.LPWSTR),
+        ("pDatatype", _wintypes.LPWSTR),
+        ("pStatus", _wintypes.LPWSTR),
+        ("Status", _wintypes.DWORD),
+        ("Priority", _wintypes.DWORD),
+        ("Position", _wintypes.DWORD),
+        ("TotalPages", _wintypes.DWORD),
+        ("PagesPrinted", _wintypes.DWORD),
+        ("Submitted", _SYSTEMTIME),
+    ]
+
+
+def _systemtime_to_epoch(st) -> int:
+    """SYSTEMTIME（spooler 给的是 **UTC**）→ epoch 秒；字段缺失/非法一律 0。"""
+    try:
+        import calendar
+        return int(calendar.timegm((int(st.wYear), int(st.wMonth), int(st.wDay),
+                                    int(st.wHour), int(st.wMinute), int(st.wSecond), 0, 0, 0)))
+    except Exception:
+        return 0
+
+
+def _ctypes_enum_jobs(printer: str) -> list[dict]:
+    """EnumJobs(level 1) 的 ctypes 兜底 —— 只读，不依赖 pywin32 的 datetime 转换。"""
+    if not _ctypes:
+        return []
+    try:
+        import ctypes
+        winspool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+        winspool.OpenPrinterW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+        winspool.OpenPrinterW.restype = ctypes.c_int
+        winspool.EnumJobsW.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+                                       ctypes.c_void_p, ctypes.c_ulong,
+                                       ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong)]
+        winspool.EnumJobsW.restype = ctypes.c_int
+        winspool.ClosePrinter.argtypes = [ctypes.c_void_p]
+        winspool.ClosePrinter.restype = ctypes.c_int
+        handle = ctypes.c_void_p()
+        if not winspool.OpenPrinterW(str(printer or ""), ctypes.byref(handle), None):
+            logger.warning(f"外部打印监视：ctypes 兜底打开打印机失败（{printer}）: {ctypes.get_last_error()}")
+            return []
+        try:
+            need = ctypes.c_ulong(0)
+            returned = ctypes.c_ulong(0)
+            # 先探所需字节数（EnumJobs 会以 ERROR_INSUFFICIENT_BUFFER 失败并回填 need）
+            winspool.EnumJobsW(handle, 0, 99, 1, None, 0, ctypes.byref(need), ctypes.byref(returned))
+            if not need.value:
+                return []
+            buf = ctypes.create_string_buffer(need.value)
+            returned = ctypes.c_ulong(0)
+            if not winspool.EnumJobsW(handle, 0, 99, 1, buf, need.value,
+                                      ctypes.byref(need), ctypes.byref(returned)):
+                logger.warning(f"外部打印监视：ctypes 兜底枚举失败（{printer}）: {ctypes.get_last_error()}")
+                return []
+            jobs: list[dict] = []
+            raw = ctypes.cast(buf, ctypes.POINTER(_JOB_INFO_1W))
+            for i in range(int(returned.value)):
+                j = raw[i]
+                jobs.append({
+                    "JobId": int(j.JobId),
+                    "pPrinterName": str(j.pPrinterName or ""),
+                    "pUserName": str(j.pUserName or ""),
+                    "pDocument": str(j.pDocument or ""),
+                    "Status": int(j.Status),
+                    "TotalPages": int(j.TotalPages),
+                    "PagesPrinted": int(j.PagesPrinted),
+                    "Submitted": _systemtime_to_epoch(j.Submitted),
+                })
+            return jobs
+        finally:
+            try:
+                winspool.ClosePrinter(handle)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"外部打印监视：ctypes 兜底异常（{printer}）: {e}")
+        return []
+
+
 def default_enum_jobs(printer: str) -> list[dict]:
-    """EnumJobs(level 2) —— 只读，不发作业、不暂停/删除任何作业（红线）。"""
+    """EnumJobs(level 2) —— 只读，不发作业、不暂停/删除任何作业（红线）。
+
+    pywin32 走主路径；它失败（最常见：打包漏收 win32timezone）时退回 ctypes 兜底，
+    保证「看得见本机打印」不被一个漏收的包整体废掉。
+    """
     import win32print
     handle = None
     try:
@@ -854,8 +1014,11 @@ def default_enum_jobs(printer: str) -> list[dict]:
         jobs = win32print.EnumJobs(handle, 0, 99, 2) or []
         return [job for job in jobs if isinstance(job, dict)]
     except Exception as e:
-        logger.warning(f"外部打印监视：枚举作业失败（{printer}）: {e}")
-        return []
+        logger.warning(f"外部打印监视：枚举作业失败（{printer}）: {e}（改用 ctypes 兜底）")
+        fallback = _ctypes_enum_jobs(str(printer or ""))
+        if fallback:
+            logger.info(f"外部打印监视：{printer} ctypes 兜底枚举成功（{len(fallback)} 个作业）")
+        return fallback
     finally:
         if handle is not None:
             try:
@@ -993,6 +1156,13 @@ class PrintJobWatcher:
 
     def _loop(self) -> None:
         # 事件只是唤醒信号：1020 从不产生 307、有时连 ADD_JOB 都晚到，所以到点也照扫一遍。
+        #
+        # 🟠 2026-11-19：这条路以前**出错等于没出错** —— 这里只写 logger.warning，而
+        # `logging.getLogger(__name__)` 在装机版里根本没挂到 logs/YYYY-MM-DD.log（GUI 只给
+        # "hn_local_tool" 挂过文件 handler，basicConfig 只到 stdout）。结果"监视在跑、却一条
+        # 也没记"这种事故在日志里一点痕迹都没有。现在异常要**数出来并发到界面上**（节流：
+        # 第 1 次 + 之后每 30 次一条），恢复时也报一声，现场一眼能看出是监视坏了还是没人打印。
+        errors = 0
         while not self._stopping.is_set():
             try:
                 self._wait_once()
@@ -1003,8 +1173,17 @@ class PrintJobWatcher:
                 break
             try:
                 self.scan_once()
+                if errors:
+                    self._emit_log(f"✅ 外部打印监视恢复正常（此前连续异常 {errors} 次）")
+                    errors = 0
             except Exception as e:
+                errors += 1
                 logger.warning(f"外部打印监视：扫描出错: {e}")
+                if errors == 1 or errors % 30 == 0:
+                    self._emit_log(
+                        f"⚠ 外部打印监视扫描异常（连续第 {errors} 次）：{e}"
+                        " —— 这一轮没扫到任何作业，本机打印可能正在漏记")
+                self._stopping.wait(1.0)
 
     def _wait_once(self) -> None:
         if not self._handles:
@@ -1028,7 +1207,15 @@ class PrintJobWatcher:
                 logger.warning(f"外部打印监视：取「{printer}」作业列表失败: {e}")
                 continue
             for job in jobs:
-                item = self.consider(printer, job, now)
+                # 单个坏作业（驱动字段畸形、DEVMODE 解析炸）不许拖垮整轮扫描：以前一个
+                # 异常会让这一队列后面的作业全部跳过，而日志里只有一行看不见的 warning。
+                try:
+                    item = self.consider(printer, job, now)
+                except Exception as e:
+                    logger.warning(
+                        f"外部打印监视：作业解析失败（{printer} / "
+                        f"{job_get(job, 'JobId', '?')}）: {e}")
+                    continue
                 if item is not None:
                     added += 1
         return added
@@ -1098,9 +1285,11 @@ class PrintJobWatcher:
         pages, source = decide_pages(job)
         if pages <= 0:
             return
-        key = (str(printer or ""), _as_int(job_get(job, "JobId"), 0))
+        # 按完整身份找那条记录：只用 (printer, job_id) 会把新作业的页数写进撞号的历史行
+        ident = (str(printer or ""), _as_int(job_get(job, "JobId"), 0),
+                 _as_int(job_get(job, "Submitted"), 0))
         for item in store.load():
-            if item.job_key() != key or item.pages > 0:
+            if item.identity() != ident or item.pages > 0:
                 continue
             item.pages = pages
             item.pages_source = source

@@ -81,11 +81,18 @@ print("=== A. 静态接线：营收 SQL / files[] 字段 / 单价来源 ===")
 rev = func_body(app_src, "admin_statistics_revenue")
 chk("A0 取到 admin_statistics_revenue 函数体", bool(rev.strip()))
 
-# A1 子任务 SELECT 必须带 simplex_pages（就是这一行漏列导致金额按全双面算）
-_sel = re.search(r"SELECT id, order_id, file_name, copies, page_count, duplex,"
-                 r"[\s\S]{0,200}?FROM order_files", rev)
+# A1 子任务 SELECT 必须带 simplex_pages（就是这一行漏列导致金额按全双面算）。
+# 判据语义是「子任务 SELECT 取到了 simplex_pages」，与列顺序无关 ⇒ 不锚列名前缀：
+# 2026-11-19 给这行加了 file_id（结算页点文件名看缩略图），锚 "id, order_id, file_name,"
+# 的旧写法会假红（契约没破，破的是判据写法）。
+_sel_text = ""
+_fm = rev.find("FROM order_files")
+if _fm >= 0:
+    _st = rev.rfind("SELECT", 0, _fm)
+    if _st >= 0:
+        _sel_text = rev[_st:_fm + len("FROM order_files")]
 chk("A1 子任务 SELECT 含 simplex_pages（漏列 ⇒ _row_simplex_pages 永远拿空串）",
-    bool(_sel) and "simplex_pages" in _sel.group(0), (_sel.group(0)[:160] if _sel else "无 SELECT 匹配"))
+    bool(_sel_text) and "simplex_pages" in _sel_text, (_sel_text[:200] or "无 SELECT 匹配"))
 
 # A2 files[] 必须把 simplex_pages 与后端算价一起下发（前端才算得出算式）
 chk("A2 files[] 下发 simplex_pages（结算页 _fileCalc 依据它摊纸）",

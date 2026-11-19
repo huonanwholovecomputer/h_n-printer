@@ -154,7 +154,15 @@ class TrayController(QObject):
     # ──────────────────────────── 动作 ────────────────────────────
 
     def show_window(self) -> None:
-        """显示应用：恢复主窗口（隐藏 / 最小化 / 背后都拉回前台）。"""
+        """显示应用：恢复主窗口（隐藏 / 最小化 / 背后都拉回前台）。
+
+        优先走 `_bring_main_window_to_front()`（2026-11-18 起）：`_restore_from_tray()`
+        只处理"看不见"，被别的程序盖住时不会置前；托盘菜单写的就是"背后也拉回前台"。
+        """
+        bring = getattr(self._window, "_bring_main_window_to_front", None)
+        if callable(bring):
+            bring()
+            return
         restore = getattr(self._window, "_restore_from_tray", None)
         if callable(restore):
             restore()

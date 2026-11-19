@@ -45,6 +45,29 @@ def _webp_ready() -> bool:
         return False
 
 
+class _Noop:
+    """拿不到 MuPDF 最小线宽 API 时的空操作（缩略图宁可不修，也不能因此做不出来）。"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _min_line_width(width: float):
+    """渲染缩略图时临时抬高 MuPDF 最小线宽（设备像素）。
+
+    实现借自 `pdf_printer._MinLineWidth`（同一把进程级锁、进出恢复原值）：MuPDF 的
+    这个设置是全局的，打印线程与缩略图线程同时在渲染，不能各自裸改。
+    """
+    try:
+        from pdf_printer import _MinLineWidth
+        return _MinLineWidth(float(width))
+    except Exception:  # noqa: BLE001
+        return _Noop()
+
+
 def _encode(im, edge: int = THUMB_EDGE):
     """等比缩到长边 ≤ edge 并编码，返回 `(bytes, "webp"|"jpeg")`。"""
     from PIL import Image
@@ -87,7 +110,11 @@ def _from_pdf(path: str):
         # 目标长边 640：page.rect 是 pt（72dpi），zoom = 640 / 长边
         long_side = max(page.rect.width, page.rect.height) or 1.0
         zoom = max(0.2, min(4.0, THUMB_EDGE / long_side))
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        # 细线保真（2026-11-19 现场）：CAD/工程图里 stroke width = 0 的线在 640px 缩略图上
+        # 只有 0.2 个像素，抗锯齿后几乎全透明 ⇒ 缩略图一片白。把最小线宽抬到 1 个设备像素，
+        # 线条至少占满一格，缩略图才看得出是一张图纸（正文页的文字本来也有 1px 以上）。
+        with _min_line_width(1.0):
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
         from PIL import Image
         im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
         return _encode(im)

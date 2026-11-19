@@ -1285,6 +1285,11 @@ class _FinWin:
         # 2026-11-12：出队只认队首对象身份（治嵌套事件循环重入时的空队列弹出）。
         return gui.MainWindow._pop_retry_head(self, item)
 
+    def _auto_print_order_still_collecting(self, order_id):
+        # 2026-11-18：抽水/排空前面多了一道「同一订单还在防抖收集文件」闸门，
+        # 替身没有 `_auto_print_queue`（真实现里取不到就当 False），直接借用真实现。
+        return gui.MainWindow._auto_print_order_still_collecting(self, order_id)
+
     def _arm_auto_print_retry_timer(self, delay_ms=2000):
         # 2026-11-02：排空逻辑抽成 `_drain_auto_print_retry`，末尾会 arm 定时器自驱。
         # 本替身不需要定时器（队列已空/已出队），记下来供断言用。

@@ -322,6 +322,58 @@ check("⑦f 是队首 ⇒ 弹掉并返回 True",
       win._pop_retry_head(_head) is True and win._auto_print_retry == [{"order_id": 2}])
 check("⑦g 队列已空时再弹不抛异常", win._pop_retry_head({"order_id": 9}) is False)
 
+# ═══════════════ ⑧ 同一订单还在防抖收集文件 ⇒ 重试队列不许抢跑（2026-11-18）═══════════════
+# 现场 HN20261118-0051（订单 #1451 / 3 个文件 / 全双面 / 需人工翻纸）：第一个文件 21:11:58
+# 就绪并起 8 秒防抖，21:12:06 到期时只有它；另两个文件 21:12:07 / 21:12:09 才就绪、把防抖
+# 重置到 21:12:17。中间的 21:12:09 重试队列抽水看到「标签页里已经有 job」就开打了 ⇒ 整单被
+# 劈成两批（先 1 个文件 6 张纸，后 2 个文件 5 张纸），多翻一次纸、spooler 多两个作业。
+win._auto_print_queue = {}
+reset([{"order_id": 1451, "tab_key": "1", "task_ids": [2863]}])
+seed([job_of("三次作业.docx", order_id=1451)])
+win._auto_print_queue = {1451: [object()]}       # 还有文件在防抖里等批量入页
+_stub_start(True)
+_logs_before_pump = len(LOGS)
+win._pump_auto_print_retry()
+check("⑧a 同订单仍在防抖收集 ⇒ 抽水不抢跑（别把一单劈成两批）", STARTED == [], str(STARTED))
+check("⑧b 队首留在重试队列里", len(win._auto_print_retry) == 1, str(win._auto_print_retry))
+check("⑧c 已自动重排下一次 tick",
+      win._auto_print_retry_timer is not None and win._auto_print_retry_timer.isActive())
+# 让路的几个分支都不写日志（`_pump_auto_print_retry` 的预检注释里写明了这一点）⇒
+# 「有没有伪报可以开打」用**日志条数没变**来判，比拿中文文案当契约稳（那条
+# 「现在可以开打」的文案改一次就会假红，而且守卫的棘轮不许再加这种判据）。
+check("⑧d 让路时一行日志都不刷（不伪报「现在可以开打」）",
+      len(LOGS) == _logs_before_pump, " | ".join(LOGS[_logs_before_pump:][-3:]))
+
+# 事件驱动那条（`_on_all_finished` → `_drain_auto_print_retry`）同样要让路
+reset([{"order_id": 1451, "tab_key": "1", "task_ids": [2863]}])
+seed([job_of("三次作业.docx", order_id=1451)])
+win._auto_print_queue = {1451: [object()]}
+_stub_start(True)
+_p8 = win._drain_auto_print_retry()
+check("⑧e `_on_all_finished` 直排路径同样让路", _p8 is False and STARTED == []
+      and len(win._auto_print_retry) == 1, str(STARTED))
+
+# 防抖到期 ⇒ 三个文件都并进同一标签页了，这一次要整单一次开打
+win._auto_print_queue = {}                       # `_process_auto_print_order` 已 pop 掉队列
+reset([{"order_id": 1451, "tab_key": "1", "task_ids": [2863]}])
+seed([job_of("三次作业.docx", order_id=1451),
+      job_of("实验报告 正反打印zc.docx", order_id=1451),
+      job_of("gjq.docx", order_id=1451)])
+_stub_start(True)
+win._pump_auto_print_retry()
+check("⑧f 防抖到期后整单一次开打（3 个文件同一批）",
+      len(STARTED) == 1 and len(STARTED[0]["jobs"]) == 3, str(STARTED))
+check("⑧g 启动成功 ⇒ 出队", win._auto_print_retry == [], str(win._auto_print_retry))
+
+# ⑧h 闸门只认「同一订单」：别的订单在防抖里，不该挡住这一单
+win._auto_print_queue = {1452: [object()]}
+reset([{"order_id": 1451, "tab_key": "1", "task_ids": [2863]}])
+seed([job_of("三次作业.docx", order_id=1451)])
+_stub_start(True)
+win._pump_auto_print_retry()
+check("⑧h 别的订单在防抖里也照打（闸门按订单号认人）", len(STARTED) == 1, str(STARTED))
+win._auto_print_queue = {}
+
 print()
 print("=" * 60)
 print("全部通过 ✅" if ok_all else "存在失败 ❌")

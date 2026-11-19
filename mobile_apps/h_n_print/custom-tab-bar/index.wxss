@@ -1,10 +1,10 @@
-/* Apple Liquid Glass Custom Tab Bar — 低透明度 + 适度模糊 + 层次感 */
-
-/* 2026-11-16：加玻璃滑块。分层与 APP 端 mobile_apps/android_app/www/index.html 的 tabBar 对应：
-     .tab-bar   整条栏：拖动时随手指位移（≤10px，WXS 写 transform）
-     .tab-glass 玻璃本体：背景/模糊/阴影 + 船式起伏的 scale 都在这一层（与位移分开，互不覆盖）
-     .tab-thumb 位移层：只做平移，硬质玻璃 —— 不缩放、不拉伸
-     .tab-pill  玻璃块：渐变 + 三层阴影（深色模式是黑玻璃） */
+/* Apple Liquid Glass Custom Tab Bar —— 低透明度 + 适度模糊 + 层次感
+   第 18 轮（2026-11-19，用户口径：「小程序端就不要药丸动画了，直接切换就行，手动滑动也删掉」）：
+   这里不再有任何 transition / animation —— 药丸是静态指示块，切页就是「换页 + 换选中态」。
+   .tab-bar   整条栏
+   .tab-glass 玻璃本体：背景 / 模糊 / 阴影
+   .tab-thumb 位移层：只做平移（位置由 data.thumbX 给出，固定不变）
+   .tab-pill  玻璃块：渐变 + 三层阴影（深色模式是黑玻璃） */
 
 /* ── Tab Bar ── */
 .tab-bar {
@@ -14,7 +14,6 @@
   right: 80rpx;
   height: 110rpx;
   z-index: 9999;
-  touch-action: none;
 }
 
 /* ── 玻璃本体 ── */
@@ -35,8 +34,6 @@
     inset 0 1rpx 0 rgba(255, 255, 255, 0.20),
     inset 0 -1rpx 0 rgba(0, 0, 0, 0.04),
     0 0 0 0.5rpx rgba(0, 0, 0, 0.04);
-  transform-origin: 50% 50%;
-  will-change: transform;
 }
 
 .tab-bar.border-hidden .tab-glass {
@@ -44,14 +41,13 @@
 }
 
 /* 首帧显隐门（2026-11-16 第 4 轮）：新页面刚建出来的 tabBar 实例，first paint 时 data 还是
-   默认的 selected:0 / thumbX:0 —— 不看这一下就会看到「药丸在第 1 格闪一下、再跳回正确格」
-   （每切一次 tab 都有一次）。门开在 .tab-glass 的 class 上，由 data 的 thumbReady 驱动：
-   它和「正确落位 + cfg」在同一次 setData 里到达，所以显形即正确。前面那句「不能用 opacity
-   藏起来」说的是视图层内联 opacity（会被 setData 重下发 style 抹掉），class 不受影响。 */
+   默认的 selected:0 / thumbX:0 —— 不看这一下就会看到「药丸在第 1 格闪一下、再跳回正确格」。
+   门开在 .tab-glass 的 class 上，由 data 的 thumbReady 驱动：它和「正确落位」在同一次
+   setData 里到达，所以显形即正确。 */
 .tab-glass .tab-thumb { opacity: 0; }
 .tab-glass.ready .tab-thumb { opacity: 1; }
 
-/* ── 玻璃滑块 ── */
+/* ── 药丸 ── */
 .tab-thumb {
   position: absolute;
   left: 9rpx;
@@ -59,15 +55,9 @@
   width: calc(50% - 18rpx);
   height: calc(100% - 14rpx);
   z-index: 1;
-  pointer-events: none;   /* 命中面留给下面的 .tab-item，拖动不从药丸上起手 */
-  /* 不要在本块写 opacity 显隐：这里是视图层逐帧 setStyle 的地盘，逻辑层每次 setData 都会
-     重新下发节点的 style，把内联样式整条抹掉 ⇒ 表现为「一点药丸就没了」。
-     显隐统一走上面那句 .tab-glass.ready 的 class 门（data 驱动，setData 抹不掉）；
-     落位由 WXML 上 data 兜底的 transform + 视图层逐帧覆盖（见 index.wxml / tabbar.wxs）。 */
-  will-change: transform;
-  /* 点按滑到目标格：data.thumbX 一变就由这段过渡把药丸送过去（与页面退出动画同长）。
-     手势期间视图层会把这条 transition 临时写成 none，让药丸 1:1 跟手。 */
-  transition: transform 160ms cubic-bezier(0.2, 0, 0, 1);
+  pointer-events: none;   /* 命中面留给下面的 .tab-item */
+  /* 第 18 轮：**没有 transition**。药丸的位置由 data.thumbX 直接给出，切页时不移动；
+     新页面的那份实例上屏第一帧就在自己的格上（首帧显隐门保证它不会先在 0 格显形）。 */
 }
 
 .tab-pill {
@@ -141,30 +131,9 @@
   padding: 14rpx 0 8rpx;
 }
 
-/* Touch-down feedback */
+/* 按下反馈：只降透明度，不动、不弹、不过渡 */
 .tab-hover {
   opacity: 0.6;
-}
-.tab-hover .tab-icon {
-  animation: iconBounce 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-@keyframes iconBounce {
-  0%   { transform: scale(1); }
-  35%  { transform: scale(0.78); }
-  100% { transform: scale(1); }
-}
-
-/* 整排 wave：点按切换时两格先后压一下再弹回（stagger 26ms，460ms 过冲曲线） */
-.tab-item.wave {
-  animation: tabWave 0.46s cubic-bezier(0.34, 1.56, 0.64, 1) both;
-}
-.tab-item.wave.w0 { animation-delay: 0s; }
-.tab-item.wave.w1 { animation-delay: 0.026s; }
-@keyframes tabWave {
-  0%   { transform: scale(1); }
-  28%  { transform: scale(0.93) translateY(1.5px); }
-  62%  { transform: scale(1.035) translateY(-1px); }
-  100% { transform: scale(1); }
 }
 
 /* Icon container */
@@ -176,7 +145,6 @@
   align-items: center;
   justify-content: center;
   margin-bottom: 2rpx;
-  transition: background-color 0.2s ease;
 }
 
 /* 选中态底衬交给药丸，图标容器本身不再铺底（否则会盖住玻璃） */
@@ -188,11 +156,9 @@
   width: 50rpx;
   height: 50rpx;
   opacity: 0.5;
-  transition: opacity 0.2s ease;
 }
 
-.icon-active .tab-icon,
-.tab-item.active .tab-icon {
+.icon-active .tab-icon {
   opacity: 1;
 }
 
@@ -202,7 +168,6 @@
   font-weight: 500;
   color: var(--tab-text, #8E8E93);
   letter-spacing: 0.01em;
-  transition: color 0.2s ease;
 }
 
 .text-active {

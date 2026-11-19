@@ -1,12 +1,8 @@
 <!--custom-tab-bar/index.wxml-->
-<!-- 结构与 APP 端一致：.tab-bar（整条栏位移）> .tab-glass（玻璃本体 / 船式起伏）
-     > .tab-thumb（位移层，只平移）> .tab-pill（玻璃块）。手势见 utils/tabbar.wxs -->
-<wxs module="tabbar" src="../utils/tabbar.wxs"></wxs>
-<view
-  class="tab-bar {{hideBorder ? 'border-hidden' : ''}} {{dark ? 'theme-dark' : ''}}"
-  cfg="{{cfg}}"
-  change:cfg="{{tabbar.onConfig}}"
->
+<!-- 第 18 轮（2026-11-19）：不要药丸动画、不要手动滑动。
+     结构只剩两层：.tab-bar（整条栏）> .tab-glass（玻璃本体）> .tab-thumb（静态药丸位移层）+ 两个 .tab-item。
+     视图层不再引用 utils/tabbar.wxs，也没有任何 bindtouch* —— 点按只走 bindtap → switchTab。 -->
+<view class="tab-bar {{hideBorder ? 'border-hidden' : ''}} {{dark ? 'theme-dark' : ''}}">
   <view class="tab-glass {{thumbReady ? 'ready' : ''}}">
     <view class="tab-thumb" style="transform: translate3d({{thumbX}}px, 0, 0)">
       <view class="tab-pill"><view class="tab-pill-gloss"></view></view>
@@ -15,20 +11,16 @@
     <view
       wx:for="{{list}}"
       wx:key="pagePath"
-      class="tab-item {{wave ? 'wave ' + (index === 0 ? 'w0' : 'w1') : ''}}"
+      class="tab-item"
       data-index="{{index}}"
       bindtap="switchTab"
       hover-class="tab-hover"
       hover-start-time="0"
-      bindtouchstart="{{tabbar.touchstart}}"
-      bindtouchmove="{{tabbar.touchmove}}"
-      bindtouchend="{{tabbar.touchend}}"
-      bindtouchcancel="{{tabbar.touchcancel}}"
     >
-      <view class="tab-icon-wrap {{item.active && thumbReady ? 'icon-active' : ''}}">
+      <view class="tab-icon-wrap {{item.active ? 'icon-active' : ''}}">
         <image class="tab-icon" src="{{item.icon}}" />
       </view>
-      <text class="tab-text {{item.active && thumbReady ? 'text-active' : ''}}">{{item.text}}</text>
+      <text class="tab-text {{item.active ? 'text-active' : ''}}">{{item.text}}</text>
     </view>
   </view>
 </view>

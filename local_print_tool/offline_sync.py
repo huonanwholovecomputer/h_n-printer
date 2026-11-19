@@ -136,6 +136,11 @@ class OfflineSync:
             # /api/local_order_status 把它改成 failed（后端那条路本来就有）。
             if "print_failed" not in cols:
                 conn.execute("ALTER TABLE offline_orders ADD COLUMN print_failed INTEGER DEFAULT 0")
+            # 2026-11-19（HN20261119-0040/0041 重复单）：取号幂等键必须**跟着这张单**落库。
+            # 以前离线行没有 request_id，重启后换号流程只能空着键去 GET /api/next_order_number，
+            # 后端当然给一个新号 —— 同一批纸于是有了两个云端身份（0040 + 0041）。
+            if "request_id" not in cols:
+                conn.execute("ALTER TABLE offline_orders ADD COLUMN request_id TEXT DEFAULT ''")
             # 旧库回填：synced=1 的行 status 必须是 'synced'（否则会被当成"未同步"再上报一次）
             conn.execute(
                 f"UPDATE offline_orders SET status = '{STATUS_SYNCED}' "
@@ -178,6 +183,7 @@ class OfflineSync:
         owner_name: str = "",
         is_admin_print: bool = True,
         remark: str = "",
+        request_id: str = "",
     ) -> str:
         """将订单保存到本地数据库。返回保存的临时订单号。"""
         with self._lock:
@@ -185,11 +191,11 @@ class OfflineSync:
             conn.execute(
                 """INSERT INTO offline_orders (order_number, files_json, total_price, created_at,
                                                owner_name, is_admin_print, remark, synced,
-                                               status, next_retry_at, last_error)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, '')""",
+                                               status, next_retry_at, last_error, request_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, '', ?)""",
                 (order_number, json.dumps(files_data, ensure_ascii=False), total_price,
                  created_at, owner_name or DEFAULT_OWNER_NAME, 1 if is_admin_print else 0,
-                 str(remark or "")[:100], STATUS_PENDING),
+                 str(remark or "")[:100], STATUS_PENDING, str(request_id or "")[:64]),
             )
             # P2: 队列无上限保护 —— 超过 OFFLINE_QUEUE_MAX 条时丢弃最旧记录
             cur = conn.execute(
@@ -611,6 +617,40 @@ class OfflineSync:
                 "UPDATE offline_orders SET order_number = ? WHERE order_number = ? AND synced = 0",
                 (new_number, old_number),
             )
+            conn.commit()
+            n = cur.rowcount
+            conn.close()
+        if n > 0:
+            self._notify_change()
+        return n
+
+    def request_id_of(self, order_number: str) -> str:
+        """取号幂等键（这张单当初取号用的 request_id；没有就是空串）。
+
+        换号流程必须带着它去 /api/next_order_number：响应丢包时后端已经把占位单建好了，
+        凭同一把钥匙重试会拿回**同一个号**，而不是又发一个新号（重复单的根因之一）。
+        """
+        num = str(order_number or "").strip()
+        if not num:
+            return ""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT COALESCE(request_id, '') FROM offline_orders "
+                "WHERE order_number = ? ORDER BY id DESC LIMIT 1", (num,)).fetchone()
+            conn.close()
+        return str(row[0] or "") if row else ""
+
+    def set_request_id(self, order_number: str, request_id: str) -> int:
+        """把幂等键写到这张单的待同步行上（晚到接管／换号后保持同一条身份）。"""
+        num, rid = str(order_number or "").strip(), str(request_id or "")[:64]
+        if not num or not rid:
+            return 0
+        with self._lock:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "UPDATE offline_orders SET request_id = ? WHERE order_number = ? AND synced = 0",
+                (rid, num))
             conn.commit()
             n = cur.rowcount
             conn.close()

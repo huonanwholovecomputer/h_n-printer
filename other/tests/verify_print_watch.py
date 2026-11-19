@@ -931,6 +931,142 @@ check("⑥ 假脱机跳过不刷 UI 日志（同一作业每轮都扫到，刷�
       str(_logs_sp))
 
 
+# ══════════════════════════════════════════════════════════════════
+section("⑭ JobId 复用（spooler 重启后从 1 重编号）不许被历史行挡住（11-18 漏记两单）")
+# ══════════════════════════════════════════════════════════════════
+# 现场：2026-11-18 23:28 用户在外面用 Word 打了两份，spooler 给的 JobId 是 12/13，
+# 而账本里 11-13 那两单正好也是 12/13 ⇒ 旧口径 (printer, job_id) 判 duplicate，静默丢弃，
+# 账本一整天没进一条、日志里连一行跳过都没有。作业身份必须带 spooler 的 Submitted。
+
+st_k = new_store("jobid_reuse")
+st_k.add(pw.ExternalPrint(job_id=12, printer="HP LaserJet 1020",
+                          document="02_题库_高等代数(1).pdf", pages=3,
+                          pages_source=pw.SOURCE_CONFIRMED, duplex=pw.DUPLEX_OFF,
+                          detected_at="2026-11-13 19:58:34"))
+check("⑭-a 老账本行（没有 submitted 字段）读进来 submitted=0，身份 = (printer, 12, 0)",
+      st_k.load()[0].submitted == 0
+      and st_k.load()[0].identity() == ("HP LaserJet 1020", 12, 0),
+      f"{st_k.load()[0].identity()}")
+
+_nov18 = datetime(2026, 11, 18, 23, 28, 33)
+_new12 = job(job_id=12, doc="实验报告.docx", total=2, duplex=1,
+             submitted=int(_nov18.timestamp()))
+wk = pw.PrintJobWatcher(st_k, enum_jobs=lambda p: [], printers=["HP LaserJet 1020"],
+                        virtual_check=not_virtual, on_log=lambda m: None)
+_got12 = wk.consider("HP LaserJet 1020", _new12, datetime(2026, 11, 18, 23, 28, 40))
+check("⑭-b 撞号的新作业照样记账（退回 (printer, job_id) 口径此项必红：那是 11-18 的 bug）",
+      _got12 is not None and len(st_k) == 2, f"got={_got12} 账本 {len(st_k)} 条")
+check("⑭-c 新作业记的是自己的文档名/页数/Submitted，历史行原样不动",
+      len(st_k) == 2
+      and sorted(x.pages for x in st_k.load()) == [2, 3]
+      and any(x.document == "实验报告.docx" and x.submitted == int(_nov18.timestamp())
+              for x in st_k.load())
+      and any(x.document == "02_题库_高等代数(1).pdf" and x.pages == 3 for x in st_k.load()),
+      f"{[(x.document, x.pages, x.submitted) for x in st_k.load()]}")
+
+_again = wk.consider("HP LaserJet 1020", _new12, datetime(2026, 11, 18, 23, 28, 42))
+check("⑭-d 同一作业每 2 秒再扫一次仍只有 2 条（身份稳定 ⇒ 不会因带 submitted 就重复记）",
+      _again is None and len(st_k) == 2, f"again={_again} 账本 {len(st_k)} 条")
+
+# 页数补全只认完整身份：新作业后补的页数不许写进撞号的历史行
+st_k2 = new_store("jobid_reuse_fill")
+st_k2.add(pw.ExternalPrint(job_id=12, printer="HP LaserJet 1020", document="老单.pdf",
+                           pages=0, pages_source=pw.SOURCE_UNKNOWN,
+                           detected_at="2026-11-13 19:58:34"))
+wk2 = pw.PrintJobWatcher(st_k2, enum_jobs=lambda p: [], printers=["HP LaserJet 1020"],
+                         virtual_check=not_virtual, on_log=lambda m: None)
+_early = job(job_id=12, doc="新单.docx", total=0, submitted=int(_nov18.timestamp()))
+wk2.consider("HP LaserJet 1020", _early, datetime(2026, 11, 18, 23, 28, 40))
+_later = job(job_id=12, doc="新单.docx", total=6, submitted=int(_nov18.timestamp()))
+wk2.consider("HP LaserJet 1020", _later, datetime(2026, 11, 18, 23, 29, 0))
+_rows = st_k2.load()
+check("⑭-e 后补页数只补到自己那条（新单 6 页），历史行仍是 pages=0 且文档名没被改",
+      len(_rows) == 2
+      and any(x.document == "新单.docx" and x.pages == 6 for x in _rows)
+      and any(x.document == "老单.pdf" and x.pages == 0 for x in _rows),
+      f"{[(x.document, x.pages) for x in _rows]}")
+
+# 落盘/重读：submitted 必须跟着走（否则重启工具后又变回撞号）
+_reloaded = pw.ExternalPrintStore(st_k2.path)
+check("⑭-f submitted 落盘并被重读（重启工具后身份不变，老行=0 / 新行=unix 秒）",
+      sorted(x.submitted for x in _reloaded.load()) == [0, int(_nov18.timestamp())],
+      f"{sorted(x.submitted for x in _reloaded.load())}")
+
+# 老账本文件（完全没有 submitted 键）也读得出来：字段缺失走默认值，不丢整份账本
+_old_json = os.path.join(TMP, "legacy_no_submitted.json")
+with open(_old_json, "w", encoding="utf-8") as f:
+    json.dump([{"job_id": 5, "printer": "HP LaserJet 1020", "document": "旧.json",
+                "pages": 2, "detected_at": "2026-11-01 09:00:00"}], f, ensure_ascii=False)
+_legacy_store = pw.ExternalPrintStore(_old_json)
+check("⑭-g 老账本文件没有 submitted 键也照读（绝不因新增字段丢账本）",
+      len(_legacy_store) == 1 and _legacy_store.load()[0].submitted == 0,
+      f"{len(_legacy_store)} 条")
+
+
+# ═══════════ ⑮ 日志可见性：模块 WARNING 必须进文件，且镜像进 GUI 的模块不许写两遍 ═══════════
+# 现场（2026-11-19）：监视在跑却一条不记，查日志才发现整份文件 WARNING/ERROR 是 0 行 ——
+# 文件 handler 只挂在 "hn_local_tool" 上，`logging.getLogger(__name__)` 的模块日志全丢。
+section("⑮ 文件日志必须覆盖模块 logger，且不重复写镜像行")
+_gui_src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+check("⑮-a 文件 handler 也挂到 root（模块 WARNING 才进得了文件）",
+      "_root.addHandler(_handler)" in _gui_src)
+check("⑮-b 「hn_local_tool」不再向 root 传播（同一行不写两遍）",
+      "_file_logger.propagate = False" in _gui_src)
+check("⑮-c 镜像模块（print_watch / cloud_client）的低级别日志被过滤，只剩 WARNING+",
+      "_MirrorDupFilter" in _gui_src and '"print_watch"' in _gui_src
+      and '"cloud_client"' in _gui_src and "levelno < logging.WARNING" in _gui_src)
+check("⑮-d 过滤器挂在 handler 上（不是只定义不用）",
+      "_handler.addFilter(_MirrorDupFilter())" in _gui_src)
+check("⑮-e 扫描异常会走 _emit_log（现场可见，不再只写看不见的 logger.warning）",
+      "_emit_log(" in open(os.path.join(LOCAL_TOOL, "print_watch.py"),
+                           encoding="utf-8").read())
+
+
+# ═══════════ ⑯ 打包漏收 win32timezone：装机版「在跑却永远扫不到作业」的回归守卫 ═══════════
+# 现场（2026-11-19 20:56，装机版 v4.6.15）：日志每 2 秒一条
+#   「外部打印监视：枚举作业失败（HP LaserJet 1020）: No module named 'win32timezone'」
+# win32print.EnumJobs 把 Submitted 的 SYSTEMTIME 转成 pywintypes.datetime 时要 import
+# win32timezone；PyInstaller 没把（没有任何 import 语句的）win32timezone 收进去 ⇒
+# 每轮枚举都炸、监视全挂。源码版有它，所以探针一直测不到 —— 直到日志接上 root 才现形。
+section("⑯ 打包必须带上 win32timezone，且漏收时还有 ctypes 兜底")
+_spec_src = open(os.path.join(LOCAL_TOOL, "HN打印工具.spec"), encoding="utf-8").read()
+check("⑯-a spec 的 hiddenimports 收了 win32timezone（漏收 = EnumJobs 每轮 ImportError）",
+      "win32timezone" in _spec_src)
+check("⑯-b spec 里写明了漏收的后果（下一个人不会再删）",
+      "win32timezone" in _spec_src and "EnumJobs" in _spec_src.replace("enumjobs", "EnumJobs"))
+_pw_src = open(os.path.join(LOCAL_TOOL, "print_watch.py"), encoding="utf-8").read()
+check("⑯-c pywin32 枚举失败时会退回 ctypes 兜底（不再整只监视瘫掉）",
+      "_ctypes_enum_jobs" in _pw_src and "_ctypes_enum_jobs(str(printer or \"\"))" in _pw_src)
+check("⑯-d 兜底用 level 1（不碰 win32timezone，字段少但够判定）",
+      "EnumJobsW" in _pw_src and "0, 99, 1," in _pw_src)
+check("⑯-e 兜底结构体自带 Submitted 解析（SYSTEMTIME → epoch）",
+      "_systemtime_to_epoch" in _pw_src and "calendar.timegm" in _pw_src)
+
+# 功能断言：把 pywin32 的 EnumJobs 打成「缺 win32timezone」，兜底必须接住
+_orig_enum = pw.default_enum_jobs
+_orig_ct = pw._ctypes_enum_jobs
+try:
+    def _boom(printer):
+        raise ModuleNotFoundError("No module named 'win32timezone'")
+    pw._ctypes_enum_jobs = lambda printer: [{"JobId": 77, "pDocument": "兜底.txt", "Status": 0,
+                                             "TotalPages": 2, "PagesPrinted": 0, "Submitted": 1}]
+    import win32print as _w32p
+    _orig_w32_enum = _w32p.EnumJobs
+    _w32p.EnumJobs = lambda *a, **kw: (_ for _ in ()).throw(
+        ModuleNotFoundError("No module named 'win32timezone'"))
+    try:
+        _jobs = pw.default_enum_jobs("HP LaserJet 1020")
+    finally:
+        _w32p.EnumJobs = _orig_w32_enum
+    check("⑯-f pywin32 抛「缺 win32timezone」时兜底顶上，作业照样看得见",
+          len(_jobs) == 1 and _jobs[0]["JobId"] == 77, f"{_jobs}")
+finally:
+    pw.default_enum_jobs = _orig_enum
+    pw._ctypes_enum_jobs = _orig_ct
+check("⑯-g 兜底对不存在的队列不抛（只记日志、返回空）",
+      pw._ctypes_enum_jobs("HN-没有这个队列") == [])
+
+
 print("\n" + "=" * 78)
 print("全部通过 ✅" if ok_all else "有失败项 ❌")
 print("=" * 78)

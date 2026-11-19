@@ -268,9 +268,13 @@ QComboBox {
 QComboBox:hover {
     border-color: #bcc0cc;
 }
+/* 下拉箭头区宽度归零（2026-11-18 现场，深色/浅色两套同步改）：本主题**从不画箭头**
+   （没有 ::down-arrow 规则，也没有图片资源），那 24px 就是一块纯空白。合上时文字被它
+   硬裁掉半截，看着就像有个黑块挡住文字。归零后文字拿到整行宽度；点框内任意位置照旧
+   弹出列表。 */
 QComboBox::drop-down {
     border: none;
-    width: 24px;
+    width: 0px;
 }
 QComboBox QAbstractItemView {
     background-color: #eff1f5;

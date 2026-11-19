@@ -313,8 +313,13 @@ def static_page(html):
     checks = {
         "文件名有可点态 class": "pv-can" in html,
         "文件名点击 → openFilePreview": "openFilePreview(event," in html,
-        "入口条件：file_id + has_preview": re.search(
-            r"var\s+_pvCan\s*=\s*!!\(f\.file_id\s*&&\s*f\.has_preview\)", html) is not None,
+        # v7.27 起入口条件分两路：云端（file_id + has_preview）或本地单
+        # （没有 file_id 的本地订单，靠本机 order_thumbs 渲的首页图）。
+        "入口条件：云端 file_id + has_preview": re.search(
+            r"var\s+_pvCloud\s*=\s*!!\(f\.file_id\s*&&\s*f\.has_preview\)", html) is not None,
+        "入口条件：本地单 order_number + file_name（v7.27 本地缩略图）": re.search(
+            r"var\s+_pvLocal\s*=", html) is not None
+        and re.search(r"var\s+_pvCan\s*=\s*_pvCloud\s*\|\|\s*_pvLocal", html) is not None,
         "fetch 本地预览路由": "'/api/local/file_preview/' + encodeURIComponent(f.file_id)" in html,
         "带启动令牌头": "'X-Launch-Token': LAUNCH_TOKEN" in html,
         "读 X-Preview-Pages": "X-Preview-Pages" in html,
@@ -331,6 +336,27 @@ def static_page(html):
             '<div class="fp-stage" onclick="fpToggleZoom()">' in html,
         "切换缩放后重新贴位（_fpPlace）":
             "function _fpPlace(m)" in html and "_fpPlace(m);" in html,
+        # v7.29：放大/还原走 FLIP 形变过渡（用户：放大加个自然过渡，缩小也加一下）
+        "放大过渡：切 class 前后各量一次窗体外框（FLIP）":
+            re.search(r"function fpToggleZoom\(\)\s*\{[^}]*getBoundingClientRect\(\)", html, re.S) is not None
+            and re.search(r"var\s+last\s*=\s*m\.getBoundingClientRect\(\)", html) is not None,
+        "放大过渡：反向 transform 落在同一锚点角（与 _fpPlace 同角）":
+            "m._fpBelow" in html and "first.top + first.height) - (last.top + last.height)" in html,
+        "放大过渡：transition 用缓出曲线且有尽头的清理定时器":
+            "_FP_ZOOM_MS + 80" in html and "'transform ' + _FP_ZOOM_MS + 'ms ' + _FP_ZOOM_EASE" in html,
+        "放大过渡：开窗动画 pmIn 的 fill:both 必须先让位（class 关动画）":
+            "#fPrevMenu.fp-zooming { animation: none; }" in html
+            and "classList.add('fp-zooming')" in html,
+        "放大过渡：尊重系统「减少动态效果」":
+            "function _fpMotionOff()" in html and "_mqReduce && _mqReduce.matches" in html,
+        # v7.29：放大态下关闭也要有过渡（先缩回缩略舞台再摘），以及 CSS 顺序守卫
+        "放大态关闭走缩回形变（_fpCloseMorph + 0.22s）":
+            "function _fpCloseMorph(m)" in html and "_FP_CLOSE_MS = 220" in html
+            and "if (m.classList.contains('fp-zoom'))" in html,
+        "★ CSS 顺序守卫：.fp-zooming 必须排在 .pm-closing 之前":
+            html.find("#fPrevMenu.fp-zooming") != -1
+            and html.find("#fPrevMenu.pm-closing") != -1
+            and html.find("#fPrevMenu.fp-zooming") < html.find("#fPrevMenu.pm-closing"),
     }
     return checks
 

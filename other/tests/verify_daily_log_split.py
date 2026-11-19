@@ -188,7 +188,11 @@ try:
 
     def gui_wired(src):
         i = src.find("self._file_logger = logging.getLogger")
-        chunk = src[i:i + 900]
+        # 2026-11-19 起这段里多了「root 也挂同一个 handler + 镜像模块去重」的注释与
+        # _MirrorDupFilter，900 字符窗口会在 make_handler 之前被截断（判据红、功能没坏），
+        # 所以窗口放宽到 1500；判据本身不变（只认 daily_log.make_handler 前缀 + keep_days，
+        # 且这一段里不许出现 FileHandler( / local_tool.log）。
+        chunk = src[i:i + 1500]
         # 2026-10-30 起 make_handler 多了 keep_days / on_prune（30 天保留），
         # 所以判据只认前缀调用，不再要求右括号紧跟；但仍必须带保留参数。
         return ("daily_log.make_handler(self._log_dir" in chunk

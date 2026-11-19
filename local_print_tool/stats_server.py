@@ -598,6 +598,14 @@ _LOCAL_PREVIEW_ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
 _LOCAL_PREVIEW_TIMEOUT = (5, 135)
 _LOCAL_PREVIEW_MAX_BYTES = 8 * 1024 * 1024   # 预览图 ≤1024×1024 JPEG，正常 <300KB；超限当异常
 
+# ── 本地订单缩略图（2026-11-19）：本地单在云端没有 file_id，只能查本机 ──
+#   GET /api/local/order_thumb/<订单号>?name=<文件名>
+# 图片是本地打印工具打印时自己渲染的（order_thumbs.py，640px WebP，存
+# %APPDATA%\HN打印工具\order_thumbs\<订单号>\）。与上面那条云端的区别：
+# **不出站**、不碰 cloud_client，离线也能看；没有图就是 404（页面 toast 提示）。
+_LOCAL_ORDER_THUMB_PREFIX = "/api/local/order_thumb/"
+_LOCAL_ORDER_THUMB_MAX_BYTES = 4 * 1024 * 1024
+
 # ⑦ 所有响应都带的安全头；HTML 额外加 CSP。CSP 必须真的不把页面打坏：页面有内联
 # script/style（'unsafe-inline'）、Chart.js 本地文件（'self'）与 jsdelivr CDN 兜底
 # （显式放行该域名 —— **不要**为了 CSP 把 CDN 兜底删掉）。
@@ -1953,6 +1961,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if path.startswith(_LOCAL_PREVIEW_PREFIX):
             return self._handle_local_file_preview(path, parsed.query)
 
+        # 本地订单缩略图（本机打印时自己渲染的那张，不走云端）
+        if path.startswith(_LOCAL_ORDER_THUMB_PREFIX):
+            return self._handle_local_order_thumb(path, parsed.query)
+
         # 默认：静态文件
         return self._serve_static(path)
 
@@ -2734,6 +2746,49 @@ class _StatsHandler(SimpleHTTPRequestHandler):
             msg = ""
         code = resp.status_code if resp.status_code in (403, 404, 415) else 502
         self._send_json({"success": False, "message": msg or "云端没有返回预览图"}, code)
+
+    def _handle_local_order_thumb(self, path: str, query: str):
+        """本地订单的首页缩略图（打印时由本地工具渲染，存在本机）。
+
+        GET /api/local/order_thumb/<订单号>?name=<文件名>
+          · 订单号/文件名都只当**查表键**用（order_thumbs 自己做路径净化，绝不拼接
+            用户输入到路径里）；
+          · 命中就回 image/webp，并带 X-Preview-Page/Pages: 1/1（结算页的翻页条
+            据此隐藏"下一页"——本地只渲染首页）；
+          · 没有就 404 + JSON message（页面 toast 一句人话，而不是一个破图标）。
+        """
+        order_number = urllib.parse.unquote(path[len(_LOCAL_ORDER_THUMB_PREFIX):] or "")
+        order_number = order_number.strip().strip("/")
+        if not order_number:
+            return self._send_json({"success": False, "message": "订单号不能为空"}, 400)
+        qs = urllib.parse.parse_qs(query or "", keep_blank_values=True)
+        name = urllib.parse.unquote((qs.get("name", [""])[0] or "")).strip()
+        try:
+            import order_thumbs
+            thumb = order_thumbs.find(order_number, name)
+        except Exception as e:                        # noqa: BLE001
+            logger.warning("本地订单缩略图查询失败 %s: %s", order_number, type(e).__name__)
+            thumb = ""
+        if not thumb:
+            return self._send_json({"success": False,
+                                    "message": "这一单还没有本地缩略图（换新版本地工具重打一次即可生成）"},
+                                   404)
+        try:
+            with open(thumb, "rb") as f:
+                body = f.read()
+        except OSError:
+            return self._send_json({"success": False, "message": "缩略图读不出来"}, 404)
+        if not body or len(body) > _LOCAL_ORDER_THUMB_MAX_BYTES:
+            return self._send_json({"success": False, "message": "缩略图异常"}, 502)
+        ctype = "image/webp" if thumb.lower().endswith(".webp") else "image/jpeg"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", len(body))
+        self.send_header("X-Preview-Page", "1")
+        self.send_header("X-Preview-Pages", "1")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        return self._write_body(body)
 
     def _handle_post_external_status(self):
         """POST /api/local/external_prints/status —— 外部监视单的订单状态订正。

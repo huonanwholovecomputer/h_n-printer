@@ -35,6 +35,12 @@ a = Analysis(
                    # cloud_client 里是**延迟 import**（缩略图失败不该影响下载），
                    # PyInstaller 静态分析看不到 ⇒ 漏收 = 打包版永远不上传缩略图（静默）。
                    'cloud_thumb',
+                   # 2026-11-19 现场：外部打印监视在装机版上「跑着却一条不记」。
+                   # 根因 = 这里漏收 win32timezone：win32print.EnumJobs 把 Submitted 的
+                   # SYSTEMTIME 转成 pywintypes.datetime 时要 import win32timezone，
+                   # 打包版缺它 ⇒ 每轮 EnumJobs 抛 ModuleNotFoundError，监视静默全挂。
+                   # 源码版有 win32timezone 所以探针能测到、装机版测不到，掩盖了很久。
+                   'win32timezone', 'pywintypes', 'win32print', 'win32api',
                    'cryptography', 'cryptography.exceptions',
                    'cryptography.hazmat.primitives.asymmetric.ed25519',
                    'cryptography.hazmat.primitives.serialization',
