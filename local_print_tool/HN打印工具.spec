@@ -31,6 +31,10 @@ a = Analysis(
     # 但打包漏收的后果是「门店机一启动就 ImportError」，故与 cryptography 一样显式列一遍。
     hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client',
                    'win32crypt', 'daily_log',
+                   # 2026-11-19 阶段二：云订单首页缩略图（本地生成后回传）。
+                   # cloud_client 里是**延迟 import**（缩略图失败不该影响下载），
+                   # PyInstaller 静态分析看不到 ⇒ 漏收 = 打包版永远不上传缩略图（静默）。
+                   'cloud_thumb',
                    'cryptography', 'cryptography.exceptions',
                    'cryptography.hazmat.primitives.asymmetric.ed25519',
                    'cryptography.hazmat.primitives.serialization',

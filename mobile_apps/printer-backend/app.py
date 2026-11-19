@@ -31,6 +31,7 @@ if _GEVENT:                                                    # pragma: no cove
             "HN_RUNTIME=gevent 但未安装 gevent：pip install -r requirements.txt") from _e
 
 import copy
+import base64
 import glob
 import hashlib
 import hmac
@@ -5073,6 +5074,8 @@ def push_print_task_to_client(sub_task_id, file_id, file_name, copies, duplex, p
         "order_number": order_number,
         "file_url": download_url,
         "file_name": file_name,          # 原始文件名（含扩展名）
+        # 2026-11-19 阶段二：本地工具回传首页缩略图要用它（旧客户端忽略未知字段即可）
+        "file_id": file_id,
         "source_md5": "",               # 由后续代码填充
         "auto_print": auto_print,       # 无障碍打印：本地工具收到后自动建标签页并开始打印
         # 预约打印（无障碍打印的预约形式）：阶段①先下发文件，本地到 scheduled_ts 再开始打印
@@ -7401,7 +7404,9 @@ def _my_file_item(row, display_name: str, order_item: dict, busy: bool,
     else:
         retention_label = "不自动删除"
     name_or_path = row["original_name"] or row["path"] or ""
-    has_preview = _has_preview_for(name_or_path)
+    # 2026-11-19 阶段二：txt/csv/md 这类服务端不会渲的类型，只要本地打印工具回传过
+    # 首页缩略图也照样算「有预览」—— 判定要和 GET 的 415 闸门保持同一份语义。
+    has_preview = _has_preview_for(name_or_path) or _preview_tier_exists(row["id"])
     return {
         "file_id": row["id"],
         # 展示名：老客户端上传留下的微信临时名（tmp_<hex>.pdf）用
@@ -7668,6 +7673,49 @@ def _preview_stem(file_id: str, mtime_token: str) -> str:
     safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64] or "x"
     safe_mt = re.sub(r"[^0-9]", "", str(mtime_token))[:20] or "0"
     return f"{safe_id}_{safe_mt}"
+
+
+# ── 客户端回传的首页缩略图（2026-11-19 阶段二）──────────────────────────────
+# 本地打印工具把文件转成 PDF 打印时顺手光栅化首页、编码成 640px WebP/JPEG 上传，
+# 服务端直接落进 GET 会先查的那条缓存路径 ⇒ 从此不再自己渲染（省掉串行 soffice）。
+# 纯文本 txt/csv/md 服务端**没有**「首页」这个概念，只有客户端能渲，所以这一档的
+# 415 闸门放宽为「有客户端缩略图就放行」。
+_PREVIEW_UPLOAD_MAX_BYTES = 512 * 1024     # 正常 7~30 KB；512 KB 只是防呆上限
+# `<stem>_t.jpg` / `<stem>_p.webp`：中段是档位字母、后面直接跟扩展名。
+# 老的多页缓名叫 `<stem>_p2.jpg`（中段是页号），两者只差一个字符 —— 必须用正则区分，
+# 否则「第 2 页的 JPEG」会被当成 p 档。
+_PREVIEW_TIER_RE = re.compile(r"_\d+_[tp]\.(?:jpe?g|webp)$")
+
+
+def _preview_tier_files(file_id: str) -> list[str]:
+    """该文件已上传的首页缩略图（t/p 档、不分格式）。"""
+    safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64]
+    if not safe_id or not os.path.isdir(PREVIEW_DIR):
+        return []
+    out = []
+    for p in glob.glob(os.path.join(PREVIEW_DIR, f"{safe_id}_*")):
+        if _PREVIEW_TIER_RE.search(os.path.basename(p)):
+            out.append(p)
+    return out
+
+
+def _preview_tier_exists(file_id: str) -> bool:
+    return bool(_preview_tier_files(file_id))
+
+
+def _preview_tier_file(file_id: str, mtime_token: str, size_tok: str = "p",
+                       fmt_tok: str = _PREVIEW_FMT_JPEG) -> str:
+    """服务端不会渲染的类型，退回客户端上传的缩略图（先精确档位，再逐级放宽）。"""
+    seen = set()
+    for sz in (size_tok, "p", "t", "z"):
+        for fm in (fmt_tok, _PREVIEW_FMT_WEBP, _PREVIEW_FMT_JPEG):
+            if (sz, fm) in seen:
+                continue
+            seen.add((sz, fm))
+            p = _preview_cache_path(file_id, mtime_token, 1, sz, fm)
+            if os.path.isfile(p):
+                return p
+    return ""
 
 
 def _preview_size_token(raw) -> str:
@@ -8251,14 +8299,16 @@ def _preview_request_context(file_id, openid, allow_any=False, actor="user"):
         _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor=actor)
         return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
     display = row["original_name"] or src_path
-    if not _has_preview_for(display):
-        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
-                           ext=os.path.splitext(display)[1].lower().lstrip("."))
-        return jsonify({"success": False, "message": "该类型没有预览图"}), 415
     try:
         mtime_token = str(int(os.path.getmtime(src_path)))
     except OSError:
         mtime_token = "0"
+    # 2026-11-19：服务端自己不会渲的类型（txt/csv/md …），只要本地工具上传过首页缩略图
+    # 就照样算「有预览」—— 否则 415 闸门会挡在缓存检查之前，上传的图永远打不开。
+    if not _has_preview_for(display) and not _preview_tier_exists(file_id):
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
+                           ext=os.path.splitext(display)[1].lower().lstrip("."))
+        return jsonify({"success": False, "message": "该类型没有预览图"}), 415
     return {"row": row, "src_path": src_path, "display": display,
             "mtime_token": mtime_token}
 
@@ -8298,6 +8348,14 @@ def _preview_page_response(file_id, ctx, openid="", actor="user"):
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor)
         return _send_preview_file(cache_path, page_no, int(meta.get("pages") or page_no))
     ext = os.path.splitext(display)[1].lower()
+    # 服务端不会渲的类型（txt/csv/md）：有本地工具上传的首页缩略图就直接发那张。
+    # 只认第 1 页 —— 客户端只传首页，拿首页冒充第 2 页比没有更糟。
+    if page_no == 1 and not _has_preview_for(display):
+        tier = _preview_tier_file(file_id, mtime_token, size_tok, fmt_tok)
+        if tier:
+            _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
+                               ext=ext.lstrip("."))
+            return _send_preview_file(tier, 1, 1)
     fail_key = (str(file_id), mtime_token, int(page_no))
     if _preview_fail_hit(fail_key):
         # 刚失败过（典型：损坏的 docx / 服务器内存吃紧）：这次不再重试，直接回落图标。
@@ -8400,6 +8458,86 @@ def admin_file_preview(file_id):
     return _preview_page_response(file_id, ctx, openid="", actor="printer")
 
 
+@app.route("/api/local/file_thumb", methods=["POST"])
+@require_printer_scope("admin")
+def local_file_thumb():
+    """本地打印工具回传首页缩略图（2026-11-19 阶段二）。
+
+    为什么由客户端生成：服务端渲 .doc/.xls 要串行起 soffice（2GB 内存只许一个，超时 120s），
+    而客户端本来就要把文件转成 PDF 打印，顺手光栅化一页几乎零成本；纯文本 txt/csv/md
+    更是只有客户端能渲（服务端没有「文本首页」这个概念）。
+
+    请求体 JSON：`{file_id, page:1, size:"t|p|z", fmt:"jpeg|webp", data:<base64>}`
+    - 图片格式按**真实字节**判定，不信请求里的 fmt（客户端传错也收，落盘名跟着真实格式走）
+    - 落盘路径就是 GET 先查的那条缓存路径 ⇒ 服务端从此直接命中，不再自己渲染
+    - 与文件保留期同删：`_drop_previews` 按 `{file_id}_*` 前缀把档位文件一并清掉
+    - 幂等：同一 (file_id, mtime, 档位) 重复上传就是覆盖（mtime 变了才换新前缀）
+    """
+    payload = request.get_json(silent=True) or {}
+    file_id = str(payload.get("file_id") or "").strip()
+    if not file_id:
+        return jsonify({"success": False, "message": "缺少 file_id"}), 400
+    try:
+        page_no = int(payload.get("page") or 1)
+    except (TypeError, ValueError):
+        page_no = 1
+    if page_no != 1:
+        return jsonify({"success": False, "message": "只接受首页缩略图"}), 400
+    try:
+        data = base64.b64decode(str(payload.get("data") or ""), validate=True)
+    except Exception:  # noqa: BLE001  坏 base64 当参数错
+        return jsonify({"success": False, "message": "图片数据不是合法 base64"}), 400
+    if not data:
+        return jsonify({"success": False, "message": "图片数据为空"}), 400
+    if len(data) > _PREVIEW_UPLOAD_MAX_BYTES:
+        return jsonify({"success": False,
+                        "message": f"图片过大（{len(data)} > {_PREVIEW_UPLOAD_MAX_BYTES} 字节）"}), 400
+    actual_fmt = _sniff_image_fmt(data)
+    if not actual_fmt:
+        return jsonify({"success": False, "message": "只接受 JPEG / WebP"}), 400
+    if actual_fmt == _PREVIEW_FMT_WEBP and not _preview_webp_ready():
+        return jsonify({"success": False, "message": "服务端不支持 WebP，请改传 JPEG"}), 415
+    size_tok = _preview_size_token(payload.get("size"))
+
+    # 文件行 + mtime：与 GET 同源（前缀必须一模一样，否则「上传了却打不开」）
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id, path FROM files WHERE id = ?", (file_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None or not row["path"]:
+        return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
+    src_path = _resolve_files_path(row["path"])
+    if not src_path or not os.path.isfile(src_path):
+        return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
+    try:
+        mtime_token = str(int(os.path.getmtime(src_path)))
+    except OSError:
+        mtime_token = "0"
+
+    cache_path = _preview_cache_path(file_id, mtime_token, 1, size_tok, actual_fmt)
+    try:
+        os.makedirs(PREVIEW_DIR, exist_ok=True)
+        tmp = cache_path + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, cache_path)          # 原子替换：GET 永远不会读到半张图
+    except OSError as e:
+        try:
+            os.remove(cache_path + ".part")
+        except OSError:
+            pass
+        print(f"  [PREVIEW] 保存上传缩略图失败 {file_id}: {e}")
+        return jsonify({"success": False, "message": "保存失败"}), 500
+    # 之前渲染失败留下的负缓存要清掉，否则 10 分钟内 GET 还是回落图标
+    _preview_fail_cache.pop((str(file_id), mtime_token, 1), None)
+    _audit_file_access("preview", "upload", file_id=file_id, openid="", actor="printer")
+    print(f"  [PREVIEW] 已接收客户端缩略图 file_id={file_id[:8]}… "
+          f"{size_tok}/{actual_fmt} {len(data)} B")
+    return jsonify({"success": True, "size": size_tok, "fmt": actual_fmt,
+                    "bytes": len(data)})
+
+
 @app.route("/api/file_preview/<file_id>/info", methods=["GET"])
 def file_preview_info(file_id):
     """预览元信息（总页数）：先把前 N 页预热出来，再回 `{success, pages, rendered}`。
@@ -8420,6 +8558,11 @@ def file_preview_info(file_id):
         print(f"  [PREVIEW] 预热失败 file_id={file_id}: {e}")
     meta = _read_preview_meta(file_id, mtime_token)
     pages = int(meta.get("pages") or 0)
+    if pages <= 0 and _preview_tier_exists(file_id):
+        # 2026-11-19 阶段二：服务端不会渲、但有本地工具回传的首页图（txt/csv/md）
+        # ⇒ 告诉前端「就 1 页」，否则它拿到 415 只会显示类型图标，点了没反应。
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
+        return jsonify({"success": True, "pages": 1, "rendered": 1})
     if pages <= 0:
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
         return jsonify({"success": False, "message": "该文件暂时没有预览图"}), 415
@@ -14138,8 +14281,11 @@ def admin_statistics_revenue():
                 # 可渲染**时才为真 —— 老订单/本地放弃单的 file_id 是空，点开只会 404。
                 # 判定与预览端点同一份 _has_preview_for（那边 415 的清单就是这一份）。
                 "file_id": of_row["file_id"] or "",
+                # 2026-11-19 阶段二：客户端回传过首页缩略图的类型（txt/csv/md）也算有预览，
+                # 否则结算页那一行仍点不开 —— 判定与 GET 的 415 闸门同一份语义。
                 "has_preview": bool(of_row["file_id"]) and
-                               _has_preview_for(of_row["file_name"] or ""),
+                               (_has_preview_for(of_row["file_name"] or "") or
+                                _preview_tier_exists(of_row["file_id"])),
                 "copies": of_row["copies"] or 1,
                 "page_count": of_row["page_count"] or 0,
                 "duplex": of_row["duplex"] or "on",

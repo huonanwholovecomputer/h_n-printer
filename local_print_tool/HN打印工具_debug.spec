@@ -17,7 +17,9 @@ a = Analysis(
     # （theme_settings.json 已移除：它按 paths.py 属用户数据，主题缺失时程序按默认主题启动。）
     datas=[('styles_dark.qss', '.'), ('styles_light.qss', '.'), ('HN_printer.png', '.'), ('finance/settlement.html', 'finance'), ('finance/chart.umd.min.js', 'finance'), ('assets/katex', 'assets/katex')],  # assets/katex：md 里的 LaTeX（katex.min.js + auto-render.min.js + 内联字体的 css）
     # 漏收 = 打包版公式静默回落成原始 TeX 文本（converter._katex_assets 抛错后走 wkhtmltopdf 兜底）
-    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client'],
+    hiddenimports=['PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'pythoncom', 'win32com', 'win32com.client',
+                   # 2026-11-19 阶段二：云订单首页缩略图（延迟 import，静态分析看不到）
+                   'cloud_thumb'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

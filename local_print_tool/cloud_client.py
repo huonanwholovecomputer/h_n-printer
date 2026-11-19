@@ -318,6 +318,8 @@ class CloudTask:
         "page_range", "download_url", "created_at",
         "local_path", "download_progress", "status",
         "error_message", "source_md5",
+        # 2026-11-19 阶段二：云端 files.id —— 回传首页缩略图要用（旧后端不下发 ⇒ 空串）
+        "file_id",
         "image_orientation",
         "delivery_enabled", "delivery_location", "urgency", "cover_page", "cover_page_price",
         "owner_name", "is_admin_print",
@@ -343,6 +345,8 @@ class CloudTask:
         self.order_id: int | None = data.get("order_id")
         self.order_number: str = data.get("order_number", "")
         self.file_name: str = data.get("file_name", data.get("file", ""))
+        # 云端 files.id（2026-11-19 阶段二：本地回传首页缩略图要用它）。旧后端不下发 ⇒ 空串。
+        self.file_id: str = data.get("file_id", "") or ""
         self.copies: int = int(options.get("copies", data.get("copies", 1)) or 0)  # P1: or 0 防御空值
         self.duplex: str = options.get("duplex", data.get("duplex", "on")) or "on"
         self.page_range: str = options.get("page_range", data.get("page_range", "")) or ""
@@ -2011,6 +2015,7 @@ class CloudClient(QObject):
                         f"☁ 缓存命中 #{task_id}: {task.file_name} (MD5={task.source_md5[:8]}...，跳过下载)"
                     )
                     self._report_file_ready_if_scheduled(task)
+                    self._spawn_thumb_upload(task, owned or cached_pdf, task.file_name)
                     return
 
         dest: str = ""
@@ -2060,6 +2065,7 @@ class CloudClient(QObject):
                 + (" ⚡无障碍" if task.auto_print else "")
             )
             self._report_file_ready_if_scheduled(task)
+            self._spawn_thumb_upload(task, dest, original_name)
 
         except Exception as e:
             task.status = "error"
@@ -2689,6 +2695,69 @@ class CloudClient(QObject):
         except Exception as e:
             logger.warning(f"LibreOffice 转换异常: {e}")
             return None
+
+    # ── 首页缩略图回传（2026-11-19 阶段二）──────────────────────────────
+    # 服务端渲 .doc/.xls 必须串行起 soffice（线上 2GB 内存只许一个），而本地本来就要把
+    # 同一份文件转成 PDF 打印；txt/csv/md 更是只有本地能渲（服务端没有「文本首页」）。
+    # 缩略图是锦上添花：出任何问题只记一行日志，绝不影响下载/打印主流程。
+
+    def _spawn_thumb_upload(self, task: CloudTask, local_path: str, original_name: str):
+        """后台回传首页缩略图（不占用下载/打印线程）。"""
+        if os.environ.get("HN_CLOUD_THUMB", "1").strip().lower() in ("0", "false", "no", "off"):
+            return
+        if not getattr(task, "file_id", "") or not local_path or not os.path.isfile(local_path):
+            return
+        t = threading.Thread(target=self._upload_thumb,
+                             args=(task, local_path, original_name),
+                             name=f"thumb-{task.task_id}", daemon=True)
+        t.start()
+        self._download_threads.append(t)     # 纳入 stop() 的 join 管理
+
+    def _upload_thumb(self, task: CloudTask, local_path: str, original_name: str):
+        """生成并 POST 缩略图。服务端按真实字节判格式，这里只保证「能出图就传」。"""
+        import base64
+
+        try:
+            from cloud_thumb import OFFICE_EXTS, make_thumb
+        except Exception as e:  # noqa: BLE001  模块缺失（旧安装包）就当没这功能
+            logger.info(f"缩略图模块不可用，跳过 #{task.task_id}: {e}")
+            return
+        ext = os.path.splitext(original_name or local_path)[1].lower()
+        pdf_path = ""
+        if ext in OFFICE_EXTS and getattr(task, "source_md5", ""):
+            # 借打印/页数分析留下的转换缓存（zip 里只有 PDF 才能光栅化）；
+            # 缓存里没有就交给服务端自己渲 —— 绝不在这里起 Word/WPS/LibreOffice 抢实例池。
+            try:
+                pdf_path, _meta = self._get_cached_pdf(task.source_md5, task.image_orientation)
+            except Exception:  # noqa: BLE001
+                pdf_path = ""
+        result = make_thumb(local_path, original_name, pdf_path=pdf_path)
+        if not result:
+            logger.info(f"缩略图生成不了，跳过 #{task.task_id} {original_name}")
+            return
+        data, fmt = result
+        url = (self.api_url or "").rstrip("/") + "/api/local/file_thumb"
+        try:
+            headers = dict(self._auth_headers())
+            headers["Content-Type"] = "application/json"
+            resp = http_requests.post(url, headers=headers, timeout=20, json={
+                "file_id": task.file_id,
+                "page": 1,
+                "size": "p",
+                "fmt": fmt,
+                "data": base64.b64encode(data).decode("ascii"),
+            })
+            ok = False
+            try:
+                ok = resp.status_code == 200 and bool((resp.json() or {}).get("success"))
+            except Exception:  # noqa: BLE001  非 JSON 响应（网关错误页）
+                ok = False
+            if ok:
+                logger.info(f"缩略图已回传 #{task.task_id}: {fmt} {len(data)} B")
+            else:
+                logger.info(f"缩略图回传未成功 #{task.task_id}: HTTP {resp.status_code}")
+        except Exception as e:  # noqa: BLE001  网络问题不影响主流程
+            logger.info(f"缩略图回传失败 #{task.task_id}: {e}")
 
     def _report_page_count(self, file_id: str, file_name: str, page_count: int, orientation: str):
         """回报页数分析结果到后端。"""
