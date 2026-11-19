@@ -871,6 +871,7 @@
             <image wx:if="{{shot.ready}}"
                    class="myfile-preview {{shot.loaded ? 'myfile-preview-loaded' : ''}}"
                    src="{{shot.url}}" mode="aspectFit"
+                   webp="{{f.previewFmt !== 'jpeg'}}"
                    bindload="onMyFilePreviewLoad" binderror="onMyFilePreviewError"
                    bindtap="onOpenMyFilePreview"
                    data-id="{{f.file_id}}" data-scope="{{scope}}"

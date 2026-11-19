@@ -305,6 +305,14 @@ mpCtx.data.myFiles = [
   mpApi._decorateMyFile.call(mpCtx, { file_id: '8', original_name: 'b.pdf', has_preview: true, preview_url: '/api/file_preview/8' }),
 ];
 mpCtx.data.myFilesDetailId = '7';
+// 2026-11-19 两步语义：第一次失败只把整块换成 JPEG（previewFmt），第二次才判真失败。
+mpApi.onMyFilePreviewError.call(mpCtx, ev('7'));
+check('预览图加载失败第一下 ⇒ 先退回 JPEG（previewFmt=jpeg）而不是直接判死',
+  mpCtx.data.myFiles[0].previewFmt === 'jpeg' &&
+  mpCtx.data.myFiles[0].previewFailed === false);
+check('JPEG 回退只换 URL，不收起详情',
+  (mpCtx.data.myFiles[0].previewShots || []).length > 0 &&
+  mpCtx.data.myFiles[0].previewShots[0].url.indexOf('fmt=jpeg') > 0);
 mpApi.onMyFilePreviewError.call(mpCtx, ev('7'));
 check('预览失败 ⇒ 该行 previewFailed=true（退回图标，不弹错误）',
   mpCtx.data.myFiles[0].previewFailed === true);
@@ -553,6 +561,8 @@ mpCtx.data.myFiles = mpCtx.data.myFiles.map((f) => Object.assign({}, f, {
   previewShots: mpApi._myFilePreviewShots.call(mpCtx, '21', 9, 0, f.previewShots),
 }));
 mpApi.onMyFilePreviewError.call(mpCtx, { currentTarget: { dataset: { id: '21', page: '1', scope: 'list' } } });
+// 第一下是 WebP → JPEG 的整块回退（2026-11-19），第二下才是某一页真失败
+mpApi.onMyFilePreviewError.call(mpCtx, { currentTarget: { dataset: { id: '21', page: '1', scope: 'list' } } });
 check('多页时单页失败 ⇒ 仍留着预览块（previewFailed 保持 false）',
   mpCtx.data.myFiles[0].previewFailed === false &&
   mpCtx.data.myFiles[0].previewShots[0].failed === true);
@@ -602,6 +612,8 @@ const appFnNames = [
 const appBody = [
   escHtmlSrc,
   'let myfileAnimTimer = null;',
+  // 2026-11-19：预览图格式协商的模块级状态（webp 失败会被 myFilePreviewError 切成 jpeg）
+  "let previewFmt = 'webp';",
   ...appFnNames.map((n) => extractFn(APP_ME_JS, n)),
 ].filter(Boolean).join('\n\n');
 
@@ -683,6 +695,10 @@ meState.myFiles = [appApi.decorateMyFile({
   file_id: '7', original_name: 'a.pdf', has_preview: true, preview_url: '/api/file_preview/7',
 })];
 meState.myFilesDetailId = '7';
+// 2026-11-19：第一次失败是 WebP→JPEG 的整块回退，第二次才判真失败退回图标
+appApi.myFilePreviewError('7');
+check('APP：预览图失败第一下 ⇒ 先退回 JPEG 重渲染，不立刻换成 fallback',
+  els['myFilesList'].innerHTML.indexOf('myfile-preview-fallback') < 0);
 appApi.myFilePreviewError('7');
 check('APP：预览失败 ⇒ 该行退回 fallback（且不弹错误）',
   els['myFilesList'].innerHTML.indexOf('myfile-preview-fallback') >= 0);

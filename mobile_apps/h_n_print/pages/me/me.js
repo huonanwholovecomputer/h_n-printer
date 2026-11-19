@@ -1666,8 +1666,11 @@ Component({
         expireText: expireText,
         previewUrl: previewUrl,
         previewPages: previewPages,
+        // 2026-11-19：默认要 WebP（体积只有 JPEG 的六成）；<image> 加载失败会
+        // 由 onMyFilePreviewError 整块退回 JPEG 重建 URL —— 见那里的事故说明。
+        previewFmt: 'webp',
         previewShots: previewUrl
-          ? [this._myFilePreviewShot(this._myFilePreviewUrl(f.file_id, 1), 1, true)]
+          ? [this._myFilePreviewShot(this._myFilePreviewUrl(f.file_id, 1, 'p', 'webp'), 1, true)]
           : [],
         previewIndex: 0,
         previewLoading: !!previewUrl,
@@ -1683,11 +1686,15 @@ Component({
       })
     },
 
-    // 单页预览图地址：<BASE>/api/file_preview/<id>?token=..&page=N（<image> 带不了 Bearer 头）
-    _myFilePreviewUrl(fileId, page) {
+    // 单页预览图地址：<BASE>/api/file_preview/<id>?token=..&page=N&size=p&fmt=webp
+    // （<image> 带不了 Bearer 头，所以 token 走 query）
+    // 2026-11-19 分层尺寸 + 格式协商：size t=320（列表）/ p=640（预览）/ z=1024（全屏放大）；
+    // fmt webp 同尺寸比 JPEG 小 34~39%，服务端编不出来会自动回落 JPEG（响应体自证格式）。
+    _myFilePreviewUrl(fileId, page, size, fmt) {
       const token = (wx.getStorageSync('token') || '')
       return CONFIG.BASE_URL + '/api/file_preview/' + encodeURIComponent(fileId) +
-        '?token=' + encodeURIComponent(token) + '&page=' + (Number(page) || 1)
+        '?token=' + encodeURIComponent(token) + '&page=' + (Number(page) || 1) +
+        '&size=' + (size || 'p') + '&fmt=' + (fmt || 'webp')
     },
 
     _myFilePreviewShot(url, page, ready) {
@@ -1695,7 +1702,8 @@ Component({
     },
 
     // 只让当前页 ±1 页真的发请求：一份 12 页的 PDF 不该一展开就拉 12 张图
-    _myFilePreviewShots(fileId, total, index, keepLoaded) {
+    // fmt 由调用方给（默认 webp）：加载失败会整块退回 jpeg 重建这批 URL。
+    _myFilePreviewShots(fileId, total, index, keepLoaded, fmt) {
       const n = Math.max(1, Math.min(PREVIEW_MAX_PAGES, Number(total) || 1))
       const cur = Number(index) || 0
       const old = {}
@@ -1705,7 +1713,7 @@ Component({
         const prev = old[p]
         shots.push({
           page: p,
-          url: this._myFilePreviewUrl(fileId, p),
+          url: this._myFilePreviewUrl(fileId, p, 'p', fmt || 'webp'),
           ready: prev ? !!prev.ready : Math.abs(p - 1 - cur) <= 1,
           loaded: prev ? !!prev.loaded : false,
           failed: prev ? !!prev.failed : false,
@@ -1734,8 +1742,10 @@ Component({
       const fileId = item.file_id
       const pages = Math.max(0, Number(item.preview_pages) || 0)
       const total = pages > 0 ? Math.min(pages, PREVIEW_MAX_PAGES) : 1
+      const fmt = item.previewFmt || 'webp'
       apply({
-        previewShots: this._myFilePreviewShots(fileId, total, 0, item.previewShots),
+        previewFmt: fmt,
+        previewShots: this._myFilePreviewShots(fileId, total, 0, item.previewShots, fmt),
         previewIndex: 0,
         previewLoading: true,
         previewFailed: false,
@@ -1759,7 +1769,8 @@ Component({
           const cur = Number(item.preview_pages) || 0
           if (cur === n) return
           apply({
-            previewShots: this._myFilePreviewShots(fileId, n, 0, item.previewShots),
+            previewShots: this._myFilePreviewShots(fileId, n, 0, item.previewShots,
+              item.previewFmt || 'webp'),
             previewPages: n,
           })
         },
@@ -1807,11 +1818,22 @@ Component({
       if (!item) return
       const shots = (item.previewShots || []).filter((s) => s.url)
       if (!shots.length) return
-      const urls = shots.map((s) => s.url)
+      // 2026-11-19：全屏是唯一真的「要看细节」的场合，所以这里才要 z 档（1024）。
+      // 列表与详情弹窗用 p 档（640）就够 —— 省下来的都是手机流量。
+      const fmt = item.previewFmt || 'webp'
+      const pages = shots.map((s) => Number(s.page) || 1)
+      const urls = pages.map((p) => this._myFilePreviewUrl(item.file_id, p, 'z', fmt))
       const idx = Math.max(0, Math.min(urls.length - 1, Number(ds.index) || 0))
       // 自绘全屏层（双击放大 / 双指捏合 / 左右滑翻页）——不再用 wx.previewImage：
       // 原生预览层的双击放大随微信版本/机型而变，用户 2026-11-13 明确要求双击放大。
       pvCore().open(this, urls, idx)
+      // open() 会把 pv 整个覆盖掉，所以来源文件 / 页号 / 格式要在它之后补回去：
+      // 全屏层的 WebP 回退（onPvImageError）要靠这几个字段重建 JPEG 地址。
+      this.setData({
+        'pv.fileId': item.file_id,
+        'pv.pages': pages,
+        'pv.fmt': fmt,
+      })
     },
 
     /* ---------------- 全屏预览层（模板 pages/me/preview-viewer.wxml） ---------------- */
@@ -1822,7 +1844,23 @@ Component({
     onPvClose() { pvCore().close(this) },
     onPvPrev() { pvCore().page(this, -1) },
     onPvNext() { pvCore().page(this, 1) },
-    onPvImageError() { this.setData({ 'pv.failed': true }) },
+    onPvImageError() {
+      // 全屏层同样要先给 WebP 一次翻案机会：换 jpeg 地址后 <image> 会重新加载，
+      // 直接记 failed 会让「真机不认 WebP」的机型在大图上也白屏。
+      const pv = this.data.pv || {}
+      if (pv.fmt !== 'jpeg' && pv.fileId && (pv.pages || []).length) {
+        const urls = pv.pages.map((p) => this._myFilePreviewUrl(pv.fileId, p, 'z', 'jpeg'))
+        const idx = Math.max(0, Math.min(urls.length - 1, Number(pv.index) || 0))
+        this.setData({
+          'pv.urls': urls,
+          'pv.url': urls[idx],
+          'pv.fmt': 'jpeg',
+          'pv.failed': false,
+        })
+        return
+      }
+      this.setData({ 'pv.failed': true })
+    },
 
     // 订单卡片「文件列表」→ 文件详情弹窗（GET /api/file_detail/<id>，与列表项同形状）
     /* 订单卡片里那一行文件对象（详情弹窗拿它兜底：没有云端文件时也要把打印参数摊开） */
@@ -2066,8 +2104,12 @@ Component({
       })
     },
 
-    // 预览图加载失败（415 / 403 / 网络）→ 静默退回类型图标，不弹错误框：
+    // 预览图加载失败（415 / 403 / 网络 / WebP 解码不了）→ 静默退回类型图标，不弹错误框：
     // 预览图是锦上添花，不能因为它把整行详情搞红。
+    //
+    // 2026-11-19：小程序 <image> 对 WebP 的支持在部分 iOS 机型上不可靠（社区 2024-06 起持续报
+    // 「开发者工具能显示、真机空白」），所以第一次失败先整块退回 JPEG：换 URL 后 <image> 会自己
+    // 重新加载。JPEG 也失败，才当这个文件真的没有预览图。
     onMyFilePreviewError(e) {
       const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
       const fileId = ds.id || ''
@@ -2077,6 +2119,17 @@ Component({
         ? this._patchFileDetail(fn)
         : this._patchMyFile(fileId, fn))
       apply((f) => {
+        if ((f.previewFmt || 'webp') !== 'jpeg') {
+          const prev = (f.previewShots || []).map((s) => (
+            { page: s.page, ready: s.ready, loaded: false }
+          ))
+          return {
+            previewFmt: 'jpeg',
+            previewShots: this._myFilePreviewShots(fileId, prev.length || 1, 0, prev, 'jpeg'),
+            previewLoading: true,
+            previewFailed: false,
+          }
+        }
         const shots = (f.previewShots || []).map((s) => (
           s.page === page ? Object.assign({}, s, { failed: true, loaded: false }) : s
         ))

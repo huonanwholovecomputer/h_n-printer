@@ -794,7 +794,7 @@ Component({
           if (!cur || cur.local_only || String(cur.file_id) !== fid) return
           const pages = Math.max(1, Number(data.pages) || 1)
           const built = fileDetailCard.shots(CONFIG.BASE_URL, token, fid, pages,
-            cur.previewIndex || 0, cur.previewShots)
+            cur.previewIndex || 0, cur.previewShots, cur.previewFmt || 'webp')
           this.setData({
             'fileDetail.previewShots': built.shots,
             'fileDetail.previewIndex': built.index,
@@ -812,7 +812,7 @@ Component({
       const index = Number(e && e.detail && e.detail.current) || 0
       const keep = detail.previewShots || []
       const built = fileDetailCard.shots(CONFIG.BASE_URL, wx.getStorageSync('token'),
-        detail.file_id, keep.length || 1, index, keep)
+        detail.file_id, keep.length || 1, index, keep, detail.previewFmt || 'webp')
       this.setData({
         'fileDetail.previewIndex': built.index,
         'fileDetail.previewShots': built.shots,
@@ -837,6 +837,19 @@ Component({
       if (isNaN(index)) return
       const detail = this.data.fileDetail
       if (!detail || !detail.previewShots || !detail.previewShots[index]) return
+      // 2026-11-19：与前一个挂载点同一条规矩 —— WebP 真机解码失败先整块退回 JPEG，
+      // 换 URL 后 <image> 会自己重新加载；JPEG 也坏才算这页没有预览图。
+      if ((detail.previewFmt || 'webp') !== 'jpeg') {
+        const n = (detail.previewShots || []).length || 1
+        const built = fileDetailCard.shots(CONFIG.BASE_URL, wx.getStorageSync('token'),
+          detail.file_id, n, 0, [], 'jpeg')
+        this.setData({
+          'fileDetail.previewFmt': 'jpeg',
+          'fileDetail.previewShots': built.shots,
+          'fileDetail.previewLoading': true,
+        })
+        return
+      }
       const patch = {}
       patch['fileDetail.previewShots[' + index + '].failed'] = true
       patch['fileDetail.previewShots[' + index + '].loaded'] = false
@@ -853,10 +866,20 @@ Component({
       const shots = detail.previewShots || []
       const index = Number(ds.index)
       const base = isNaN(index) ? 0 : index
-      const urls = shots.map(s => s.url)
-      if (!urls.length) return
+      if (!shots.length) return
+      // 2026-11-19：全屏才要 z 档（1024）——列表里 640 够看，没人会在缩略图上数小字
+      const fmt = detail.previewFmt || 'webp'
+      const token = wx.getStorageSync('token') || ''
+      const pages = shots.map(s => Number(s.page) || 1)
+      const urls = pages.map(p => fileDetailCard.previewUrl(
+        CONFIG.BASE_URL, detail.file_id, p, token, 'z', fmt))
       // 自绘全屏层（双击放大 / 双指捏合 / 左右滑翻页），与「我」页同一套
       pvCore().open(this, urls, base)
+      this.setData({
+        'pv.fileId': detail.file_id,
+        'pv.pages': pages,
+        'pv.fmt': fmt,
+      })
     },
 
     /* ---------------- 全屏预览层（模板 pages/me/preview-viewer.wxml） ---------------- */
@@ -867,7 +890,24 @@ Component({
     onPvClose() { pvCore().close(this) },
     onPvPrev() { pvCore().page(this, -1) },
     onPvNext() { pvCore().page(this, 1) },
-    onPvImageError() { this.setData({ 'pv.failed': true }) },
+    onPvImageError() {
+      // 全屏层同样先给 WebP 一次翻案机会（换 jpeg 地址后 <image> 会重新加载）
+      const pv = this.data.pv || {}
+      if (pv.fmt !== 'jpeg' && pv.fileId && (pv.pages || []).length) {
+        const token = wx.getStorageSync('token') || ''
+        const urls = pv.pages.map(p => fileDetailCard.previewUrl(
+          CONFIG.BASE_URL, pv.fileId, p, token, 'z', 'jpeg'))
+        const idx = Math.max(0, Math.min(urls.length - 1, Number(pv.index) || 0))
+        this.setData({
+          'pv.urls': urls,
+          'pv.url': urls[idx],
+          'pv.fmt': 'jpeg',
+          'pv.failed': false,
+        })
+        return
+      }
+      this.setData({ 'pv.failed': true })
+    },
 
     onCloseFileDetail() {
       if (this._uoFileDetailTimer) clearTimeout(this._uoFileDetailTimer)

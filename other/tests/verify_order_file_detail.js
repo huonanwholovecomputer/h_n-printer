@@ -44,9 +44,9 @@ const decorated = CARD.decorate({
 check('decorate 的字段名与 myfileDetailCard 模板一致',
   decorated.sizeText === '2.0 KB' && decorated.createdAtText === '2026-11-08 23:18:00' &&
   decorated.orderText === 'HN20261108-0013' && decorated.typeIcon === '📘');
-check('第一张图 URL 带 token 与 &page=1（<image> 不能带头，只能拼查询串）',
+check('第一张图 URL 带 token 与 &page=1&size=p&fmt=webp（<image> 不能带头，只能拼查询串）',
   decorated.previewShots.length === 1 &&
-  decorated.previewShots[0].url === 'https://api.test/api/file_preview/9?token=tok%2B9%2F1&page=1',
+  decorated.previewShots[0].url === 'https://api.test/api/file_preview/9?token=tok%2B9%2F1&page=1&size=p&fmt=webp',
   decorated.previewShots.length ? decorated.previewShots[0].url : '(空)');
 check('页数先用列表给的 preview_pages（再问 /info 纠偏）', decorated.previewPages === 3);
 check('没有预览能力时不拼图片地址（走图标 + 提示）',

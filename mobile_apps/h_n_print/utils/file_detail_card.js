@@ -50,14 +50,17 @@ function typeIcon(name) {
 }
 
 // <image> 带不了 Authorization 头，只能把 token 拼进查询串（后端 _openid_for_media 认这个）
-function previewUrl(baseUrl, fileId, page, token) {
+// 2026-11-19 分层尺寸 + 格式协商：size t=320 / p=640（详情默认）/ z=1024（全屏）；
+// fmt webp 同尺寸比 JPEG 小 34~39%，真机解码不了时页面会把整块退回 jpeg（见各页 onMyFilePreviewError）。
+function previewUrl(baseUrl, fileId, page, token, size, fmt) {
   const p = Number(page) > 0 ? Math.floor(Number(page)) : 1
   return String(baseUrl) + '/api/file_preview/' + encodeURIComponent(String(fileId)) +
-    '?token=' + encodeURIComponent(String(token || '')) + '&page=' + p
+    '?token=' + encodeURIComponent(String(token || '')) + '&page=' + p +
+    '&size=' + (size || 'p') + '&fmt=' + (fmt || 'webp')
 }
 
 // 只让当前页 ±1 页真的发请求：一份 12 页的 PDF 不该一展开就拉 12 张图
-function shots(baseUrl, token, fileId, total, index, keepLoaded) {
+function shots(baseUrl, token, fileId, total, index, keepLoaded, fmt) {
   const n = Math.max(1, Math.min(PREVIEW_MAX_PAGES, Number(total) || 1))
   let cur = Number(index) || 0
   if (cur < 0) cur = 0
@@ -70,7 +73,7 @@ function shots(baseUrl, token, fileId, total, index, keepLoaded) {
     const near = Math.abs(p - 1 - cur) <= 1
     out.push({
       page: p,
-      url: previewUrl(baseUrl, fileId, p, token),
+      url: previewUrl(baseUrl, fileId, p, token, 'p', fmt || 'webp'),
       // 翻到第 N 页时，第 N 页及其左右各一页必须变 ready（否则 swiper 停在一张
       // 永远不发请求的骨架上）；已经 ready 的页保持 ready，loaded 也不重拉。
       ready: prev ? (!!prev.ready || near) : near,
@@ -104,7 +107,7 @@ function decorate(file, opt) {
   // 后端在 has_preview=false 或没有 preview_url 时不给图；否则拼 ?token=&page=1
   const hasShot = f.has_preview !== false && !!previewPath
   const slug = String(f.file_id == null ? '' : f.file_id)
-  const first = hasShot && slug ? previewUrl(baseUrl, slug, 1, token) : ''
+  const first = hasShot && slug ? previewUrl(baseUrl, slug, 1, token, 'p', 'webp') : ''
   const pages = Number(f.page_count) || 0
   const hint = Math.max(0, Number(f.preview_pages) || 0)
   return Object.assign({}, f, {
@@ -112,6 +115,8 @@ function decorate(file, opt) {
     retentionText: retentionText,
     expireText: expireText,
     previewUrl: first,
+    // 2026-11-19：默认 WebP，页面 <image> 加载失败时整块退回 jpeg 重建（各页 onMyFilePreviewError）
+    previewFmt: 'webp',
     previewPages: hint > 0 ? Math.min(hint, PREVIEW_MAX_PAGES) : (first ? 1 : 0),
     previewShots: first ? [{ page: 1, url: first, ready: true, loaded: false, failed: false }] : [],
     previewIndex: 0,

@@ -7588,6 +7588,8 @@ def list_my_files():
 # 落地口径：
 #   · **懒生成**：第一次请求才渲染，结果落盘缓存到 `uploads/previews/<file_id>_<mtime>.jpg`，
 #     之后直接 send_file（不动原文件、不重复解码、mtime 变了自动换新文件）；
+#   · **分层尺寸 + 格式协商（2026-11-19）**：`?size=t|p|z` + `?fmt=jpeg|webp`；
+#     缓存文件名带档位后缀（`<stem>_p2_p.webp`），1024/JPEG 沿用老名字所以旧缓存照样命中；
 #   · 覆盖面（2026-11-13 追加「缩略图尽量显示一下」后从「图片 + PDF」扩到 Office）：
 #       图片类 → PIL 直读；PDF → PyMuPDF，兜底 pdftoppm；
 #       Word/Excel/PPT（doc docx xls xlsx ppt pptx）→ LibreOffice 转 PDF 再取第 1 页。
@@ -7603,6 +7605,23 @@ def list_my_files():
 #     （与 `/api/file/<id>` 下载同口径）。
 PREVIEW_DIR = os.path.join(UPLOAD_DIR, "previews")
 PREVIEW_MAX_PX = 1024                      # 长边像素上限（需求写的就是 1024×1024）
+# 2026-11-19（用户要求「服务器带宽受限，要极低体积」）：预览图分三档尺寸 + WebP/JPEG 协商。
+#   t=320 列表小图 / p=640 预览默认 / z=1024 放大（接结算页 v7.26.2 的「⤢ 放大」）。
+#   老客户端不带 size/fmt ⇒ 维持 1024 + JPEG（线上零行为变化）；小程序/APP 显式传 p + webp。
+#   实测（A4 文本页，同一页）：z/jpeg(q95) 149KB → p/webp 27KB，带宽 5.5 倍；
+#   同尺寸 WebP 比 JPEG 再省 35~40%，所以「降分辨率」是大头、换格式是第二步。
+_PREVIEW_SIZES = {"t": 320, "p": 640, "z": PREVIEW_MAX_PX}
+_PREVIEW_DEFAULT_SIZE = "z"
+_PREVIEW_FMT_JPEG = "jpeg"
+_PREVIEW_FMT_WEBP = "webp"
+_PREVIEW_JPEG_QUALITY = 82                 # 1024 文本页 ≈ 91KB（q95 是 149KB，肉眼几乎无差）
+_PREVIEW_WEBP_QUALITY = 80                 # PIL 编码；服务端 Pillow 没带 webp 时自动回落 JPEG
+_PREVIEW_MIME = {"jpeg": "image/jpeg", "webp": "image/webp"}
+_preview_caps = {}                         # {"webp": bool}：能力探测一次，别每张图都问 PIL
+# 上传预热只做「小程序/APP 真正会请求的那一档」：p × jpeg/webp。
+# t（结算页小图）与 z（放大）按需生成 —— 一页光栅化才几十毫秒，预热它们只会让上传更慢。
+_PREVIEW_WARM_SIZES = ("p",)
+_PREVIEW_WARM_FMTS = (_PREVIEW_FMT_JPEG, _PREVIEW_FMT_WEBP)
 _PREVIEW_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff")
 # Office 家族：必须同时落在 UPLOAD_EXT_WHITELIST 里（见本文件"上传校验"一节）
 _PREVIEW_OFFICE_EXTS = (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
@@ -7651,13 +7670,63 @@ def _preview_stem(file_id: str, mtime_token: str) -> str:
     return f"{safe_id}_{safe_mt}"
 
 
-def _preview_cache_path(file_id: str, mtime_token: str, page: int = 1) -> str:
-    """第 1 页沿用旧文件名（历史缓存继续命中）；第 N 页加 `_pN` 后缀。"""
+def _preview_size_token(raw) -> str:
+    """解析 `?size=`：认 t/p/z，其它（含空、大小写混杂、乱填）一律回落默认档。"""
+    tok = str(raw or "").strip().lower()
+    return tok if tok in _PREVIEW_SIZES else _PREVIEW_DEFAULT_SIZE
+
+
+def _preview_webp_ready() -> bool:
+    """服务端 Pillow 能不能编 WebP（只探一次；没有就永远回落 JPEG，绝不让预览挂掉）。"""
+    if "webp" not in _preview_caps:
+        try:
+            from PIL import features              # 函数内导入：PIL 缺失不影响后端启动
+            _preview_caps["webp"] = bool(features.check("webp"))
+        except Exception:  # noqa: BLE001
+            _preview_caps["webp"] = False
+        if not _preview_caps["webp"]:
+            print("  [PREVIEW] 服务端 Pillow 没有 WebP 编码能力，预览一律回落 JPEG")
+    return bool(_preview_caps["webp"])
+
+
+def _preview_fmt_token(raw) -> str:
+    """解析 `?fmt=`：只认 jpeg/webp；要 WebP 但服务端编不出来 ⇒ 回落 JPEG。"""
+    tok = str(raw or "").strip().lower()
+    if tok in (_PREVIEW_FMT_WEBP, "image/webp"):
+        return _PREVIEW_FMT_WEBP if _preview_webp_ready() else _PREVIEW_FMT_JPEG
+    return _PREVIEW_FMT_JPEG
+
+
+def _sniff_image_fmt(data) -> str:
+    """按魔数认回真实格式（WebP 编码失败回落 JPEG 时，缓存扩展名/mimetype 得跟着变）。"""
+    head = bytes(data or b"")[:16]
+    if head.startswith(b"\xff\xd8\xff"):
+        return _PREVIEW_FMT_JPEG
+    if len(head) >= 12 and head[8:12] == b"WEBP":
+        return _PREVIEW_FMT_WEBP
+    return ""
+
+
+def _preview_cache_path(file_id: str, mtime_token: str, page: int = 1,
+                        size: str = _PREVIEW_DEFAULT_SIZE,
+                        fmt: str = _PREVIEW_FMT_JPEG) -> str:
+    """缓存文件名：默认档（1024/JPEG）沿用旧名字（历史缓存继续命中），其它档加后缀。
+
+    `<stem>.jpg` / `<stem>_p2.jpg` = z+jpeg（2026-11-13 之前的唯一产物）
+    `<stem>_p<size>.<ext>` / `<stem>_p<N>_<size>.<ext>` = 新档位
+    """
     stem = _preview_stem(file_id, mtime_token)
-    page = int(page or 1)
+    page = max(1, int(page or 1))
+    size = size if size in _PREVIEW_SIZES else _PREVIEW_DEFAULT_SIZE
+    fmt = _PREVIEW_FMT_WEBP if fmt == _PREVIEW_FMT_WEBP else _PREVIEW_FMT_JPEG
+    if size == _PREVIEW_DEFAULT_SIZE and fmt == _PREVIEW_FMT_JPEG:
+        if page <= 1:
+            return os.path.join(PREVIEW_DIR, f"{stem}.jpg")
+        return os.path.join(PREVIEW_DIR, f"{stem}_p{page}.jpg")
+    ext = "webp" if fmt == _PREVIEW_FMT_WEBP else "jpg"
     if page <= 1:
-        return os.path.join(PREVIEW_DIR, f"{stem}.jpg")
-    return os.path.join(PREVIEW_DIR, f"{stem}_p{page}.jpg")
+        return os.path.join(PREVIEW_DIR, f"{stem}_{size}.{ext}")
+    return os.path.join(PREVIEW_DIR, f"{stem}_p{page}_{size}.{ext}")
 
 
 def _preview_pdf_path(file_id: str, mtime_token: str) -> str:
@@ -7775,23 +7844,36 @@ def _flatten_to_rgb(im):
     return im.convert("RGB")
 
 
-def _render_image_preview(src_path: str) -> bytes:
-    """图片 → 1024 以内 JPEG bytes。只缩不放（小图保持原样，避免糊）。"""
+def _encode_preview_image(im, fmt: str = _PREVIEW_FMT_JPEG) -> bytes:
+    """PIL 图 → 目标格式 bytes。WebP 编码失败要抛（上层按真实格式改扩展名），不静默串格式。"""
+    buf = io.BytesIO()
+    if fmt == _PREVIEW_FMT_WEBP:
+        im.save(buf, "WEBP", quality=_PREVIEW_WEBP_QUALITY, method=4)
+        return buf.getvalue()
+    im.save(buf, "JPEG", quality=_PREVIEW_JPEG_QUALITY, optimize=True)
+    return buf.getvalue()
+
+
+def _render_image_preview(src_path: str, max_px: int = PREVIEW_MAX_PX,
+                          fmt: str = _PREVIEW_FMT_JPEG) -> bytes:
+    """图片 → 长边 ≤ max_px 的 JPEG/WebP bytes。只缩不放（小图保持原样，避免糊）。"""
     from PIL import Image
     with Image.open(src_path) as im:
         im = _flatten_to_rgb(im)
-        im.thumbnail((PREVIEW_MAX_PX, PREVIEW_MAX_PX), Image.LANCZOS)
-        buf = io.BytesIO()
-        im.save(buf, "JPEG", quality=82, optimize=True)
-        return buf.getvalue()
+        im.thumbnail((int(max_px), int(max_px)), Image.LANCZOS)
+        return _encode_preview_image(im, fmt)
 
 
-def _render_pdf_page_bytes(pdf_path: str, page_index: int) -> bytes:
-    """PDF 第 page_index 页（0 基）→ 长边 ≤ PREVIEW_MAX_PX 的 JPEG bytes。
+def _render_pdf_page_bytes(pdf_path: str, page_index: int,
+                           max_px: int = PREVIEW_MAX_PX,
+                           fmt: str = _PREVIEW_FMT_JPEG) -> bytes:
+    """PDF 第 page_index 页（0 基）→ 长边 ≤ max_px 的 JPEG/WebP bytes。
 
     能力降级：PyMuPDF → pdftoppm → 抛 RuntimeError（上层回落 415）。
+    JPEG 走 PyMuPDF 直出（`jpg_quality`）省一次编解码；WebP 必须过 PIL。
     """
     page_index = max(0, int(page_index or 0))
+    max_px = max(64, int(max_px or PREVIEW_MAX_PX))
     try:
         import fitz                            # PyMuPDF（可选依赖）
     except ImportError:
@@ -7803,9 +7885,15 @@ def _render_pdf_page_bytes(pdf_path: str, page_index: int) -> bytes:
             page = doc.load_page(min(page_index, doc.page_count - 1))
             w = float(page.rect.width) or 1.0
             h = float(page.rect.height) or 1.0
-            zoom = min(PREVIEW_MAX_PX / w, PREVIEW_MAX_PX / h, 4.0)
+            zoom = min(max_px / w, max_px / h, 4.0)
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            return pix.tobytes("jpeg")
+            if fmt != _PREVIEW_FMT_WEBP:
+                return pix.tobytes("jpeg", jpg_quality=_PREVIEW_JPEG_QUALITY)
+            from PIL import Image                # WebP：先拿无损像素再编码
+            im = Image.open(io.BytesIO(pix.tobytes("png")))
+            im = _flatten_to_rgb(im)
+            im.thumbnail((max_px, max_px), Image.LANCZOS)
+            return _encode_preview_image(im, fmt)
     exe = shutil.which("pdftoppm")
     if not exe:
         raise RuntimeError("服务端没有 PDF 光栅化能力（缺 PyMuPDF 与 pdftoppm）")
@@ -7813,13 +7901,13 @@ def _render_pdf_page_bytes(pdf_path: str, page_index: int) -> bytes:
     try:
         n = page_index + 1
         subprocess.run(
-            [exe, "-f", str(n), "-l", str(n), "-scale-to", str(PREVIEW_MAX_PX),
+            [exe, "-f", str(n), "-l", str(n), "-scale-to", str(max_px),
              "-jpeg", "-singlefile", pdf_path, os.path.join(tmpdir, "page")],
             timeout=60, check=False, capture_output=True)
         hits = sorted(glob.glob(os.path.join(tmpdir, "page*.jpg")))
         if not hits:
             raise RuntimeError("pdftoppm 没有输出页面")
-        return _render_image_preview(hits[0])   # 再统一压到 1024 以内
+        return _render_image_preview(hits[0], max_px, fmt)   # 再统一压到 max_px 以内
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -7993,15 +8081,17 @@ def _preview_pdf_for(src_path: str, ext: str, file_id: str, mtime_token: str) ->
 
 
 def _render_preview_page(src_path: str, display_name: str, file_id: str,
-                         mtime_token: str, page_index: int) -> bytes:
-    """任意可预览文件第 page_index 页（0 基）→ JPEG bytes。"""
+                         mtime_token: str, page_index: int,
+                         max_px: int = PREVIEW_MAX_PX,
+                         fmt: str = _PREVIEW_FMT_JPEG) -> bytes:
+    """任意可预览文件第 page_index 页（0 基）→ 目标尺寸/格式的 bytes。"""
     ext = os.path.splitext(display_name or src_path)[1].lower()
     if ext in _PREVIEW_IMAGE_EXTS:
         if page_index > 0:
             raise RuntimeError("图片只有一页")
-        return _render_image_preview(src_path)
+        return _render_image_preview(src_path, max_px, fmt)
     pdf_path = _preview_pdf_for(src_path, ext, file_id, mtime_token)
-    return _render_pdf_page_bytes(pdf_path, page_index)
+    return _render_pdf_page_bytes(pdf_path, page_index, max_px, fmt)
 
 
 def _preview_total_pages(src_path: str, display_name: str, file_id: str,
@@ -8056,25 +8146,37 @@ def _prewarm_previews(file_id: str) -> bool:
         os.makedirs(PREVIEW_DIR, exist_ok=True)
         rendered = 0
         for i in range(limit):
-            cache_path = _preview_cache_path(file_id, mtime_token, i + 1)
-            if os.path.isfile(cache_path):
-                rendered += 1
-                continue
-            try:
-                data = _render_preview_page(src_path, display, file_id, mtime_token, i)
-            except Exception as e:      # noqa: BLE001  单页失败不影响其它页
-                print(f"  [PREVIEW] 预热第 {i + 1} 页失败 file_id={file_id}: {e}")
+            ok_page = True
+            for size_tok in _PREVIEW_WARM_SIZES:
+                for fmt_tok in _PREVIEW_WARM_FMTS:
+                    cache_path = _preview_cache_path(file_id, mtime_token, i + 1,
+                                                     size_tok, fmt_tok)
+                    if os.path.isfile(cache_path):
+                        continue
+                    try:
+                        data = _render_preview_page(src_path, display, file_id,
+                                                    mtime_token, i,
+                                                    _PREVIEW_SIZES[size_tok], fmt_tok)
+                    except Exception as e:  # noqa: BLE001  单页失败不影响其它页
+                        print(f"  [PREVIEW] 预热第 {i + 1} 页（{size_tok}/{fmt_tok}）失败"
+                              f" file_id={file_id}: {e}")
+                        ok_page = False
+                        break
+                    try:
+                        with open(cache_path, "wb") as fh:
+                            fh.write(data)
+                    except OSError as e:
+                        print(f"  [PREVIEW] 写缓存失败 {cache_path}: {e}")
+                        ok_page = False
+                        break
+                if not ok_page:
+                    break
+            if not ok_page:
                 break
-            try:
-                with open(cache_path, "wb") as fh:
-                    fh.write(data)
-                rendered += 1
-            except OSError as e:
-                print(f"  [PREVIEW] 写缓存失败 {cache_path}: {e}")
-                break
+            rendered += 1
         _write_preview_meta(file_id, mtime_token, total, rendered)
         print(f"  [PREVIEW] 已预热 {_redact_filename(display)} 共 {total} 页"
-              f"（已生成 {rendered} 页）")
+              f"（已生成 {rendered} 页，档位 {'/'.join(_PREVIEW_WARM_SIZES)}）")
         return True
     finally:
         lock.release()
@@ -8113,7 +8215,7 @@ def _drop_previews(file_id: str) -> None:
         print(f"  [PREVIEW] 清理预览缓存失败 {file_id}: {e}")
 
 
-def _preview_request_context(file_id, openid):
+def _preview_request_context(file_id, openid, allow_any=False, actor="user"):
     """预览类端点的公共前置：鉴权后的属主判定、物理文件、类型。
 
     返回 dict（`row/src_path/display/mtime_token`）；不满足时返回 Flask 响应元组
@@ -8122,6 +8224,12 @@ def _preview_request_context(file_id, openid):
       两边都是 tuple 时视图会把 ctx 当响应元组交给 Flask ⇒ 500
       `TypeError: The view function did not return a valid response tuple.`
       （2026-11-13 线上真踩：所有预览请求一律 500）
+
+    `allow_any=True` 只给**管理端**入口（`/api/admin/file_preview/*`）用：那边已经过
+    `@require_printer_scope("admin")`（printer token 的 admin scope），调用方根本不是
+    openid 用户，属主判定对"看账"没有意义 —— 能拿 admin scope 就等于能看结算账。
+    用户端入口一律 `allow_any=False`（属主或管理员本人），别为了省事把它当默认值。
+    `actor` 只影响审计日志里的调用方身份（user / printer），不影响任何判定。
     """
     conn = get_db()
     try:
@@ -8131,19 +8239,20 @@ def _preview_request_context(file_id, openid):
     finally:
         conn.close()
     if row is None:
-        _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor="user")
+        _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor=actor)
         return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
-    owner = str(row["openid"] or "")
-    if owner != openid and not is_admin(openid):
-        _audit_file_access("preview", "denied", file_id=file_id, openid=openid, actor="user")
-        return jsonify({"success": False, "message": "无权查看该文件"}), 403
+    if not allow_any:
+        owner = str(row["openid"] or "")
+        if owner != openid and not is_admin(openid):
+            _audit_file_access("preview", "denied", file_id=file_id, openid=openid, actor=actor)
+            return jsonify({"success": False, "message": "无权查看该文件"}), 403
     src_path = _resolve_files_path(row["path"])
     if not src_path or not os.path.isfile(src_path):
-        _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor="user")
+        _audit_file_access("preview", "not_found", file_id=file_id, openid=openid, actor=actor)
         return jsonify({"success": False, "message": "文件不存在或已清理"}), 404
     display = row["original_name"] or src_path
     if not _has_preview_for(display):
-        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
                            ext=os.path.splitext(display)[1].lower().lstrip("."))
         return jsonify({"success": False, "message": "该类型没有预览图"}), 415
     try:
@@ -8155,57 +8264,73 @@ def _preview_request_context(file_id, openid):
 
 
 def _send_preview_file(path: str, page_no: int, pages: int):
-    """发图 + 页码/总页数响应头（多页 swiper 用得到）。"""
-    resp = send_file(path, mimetype="image/jpeg", max_age=86400, conditional=True)
+    """发图 + 页码/总页数响应头（多页 swiper 用得到）。mimetype 跟着扩展名走。"""
+    mime = _PREVIEW_MIME["webp"] if os.path.splitext(path)[1].lower() == ".webp" \
+        else _PREVIEW_MIME["jpeg"]
+    resp = send_file(path, mimetype=mime, max_age=86400, conditional=True)
     resp.headers["X-Preview-Page"] = str(int(page_no))
     resp.headers["X-Preview-Pages"] = str(int(pages))
     return resp
 
 
-@app.route("/api/file_preview/<file_id>", methods=["GET"])
-def file_preview(file_id):
-    """文件预览图（≤1024×1024 JPEG）。见本节顶部的口径说明。
+def _preview_page_response(file_id, ctx, openid="", actor="user"):
+    """预览主逻辑：命中缓存直接回图；否则渲染一页、写缓存（渲染失败一律 415）。
 
-    参数：`page`（1 基，默认 1）—— 多页文档翻页用（2026-11-13 用户要求支持多页）。
-    返回：
-      · 200 + image/jpeg —— 命中缓存或刚生成；响应头 X-Preview-Page / X-Preview-Pages；
-      · 404 —— 文件不存在/已清理；
-      · 403 —— 不是你的文件（管理员可看）；
-      · 415 —— 该类型没有预览图 / 服务端暂时渲染不了（前端静默退回类型图标）。
+    两个入口共用这同一份：`/api/file_preview/<id>`（用户端）与
+    `/api/admin/file_preview/<id>`（管理端，收支清算页）。缓存文件名、页数元信息、
+    失败缓存、审计都在这里 —— 分叉成两份的那天，两边行为必然开始漂移。
+    `ctx` 必须来自 `_preview_request_context()`（已鉴权 + 已判类型）。
+
+    2026-11-19 起支持 `?size=t|p|z` 与 `?fmt=jpeg|webp`（见本节顶部）；不带参数 = 1024/JPEG，
+    与改造前逐字节一致，所以老客户端不必跟着发版。
     """
-    openid = _openid_for_media()
-    if not openid:
-        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
-    ctx = _preview_request_context(file_id, openid)
-    if isinstance(ctx, tuple):
-        return ctx
     src_path = ctx["src_path"]
     display = ctx["display"]
     mtime_token = ctx["mtime_token"]
     page_no = request.args.get("page", 1, type=int) or 1
     page_no = max(1, min(999, int(page_no)))
+    size_tok = _preview_size_token(request.args.get("size"))
+    fmt_tok = _preview_fmt_token(request.args.get("fmt"))
+    max_px = _PREVIEW_SIZES[size_tok]
     meta = _read_preview_meta(file_id, mtime_token)
-    cache_path = _preview_cache_path(file_id, mtime_token, page_no)
+    cache_path = _preview_cache_path(file_id, mtime_token, page_no, size_tok, fmt_tok)
     if os.path.isfile(cache_path):
-        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor)
         return _send_preview_file(cache_path, page_no, int(meta.get("pages") or page_no))
     ext = os.path.splitext(display)[1].lower()
     fail_key = (str(file_id), mtime_token, int(page_no))
     if _preview_fail_hit(fail_key):
         # 刚失败过（典型：损坏的 docx / 服务器内存吃紧）：这次不再重试，直接回落图标。
-        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
                            ext=ext.lstrip("."))
         return jsonify({"success": False, "message": "该文件暂时没有预览图"}), 415
     try:
-        data = _render_preview_page(src_path, display, file_id, mtime_token, page_no - 1)
+        data = _render_preview_page(src_path, display, file_id, mtime_token,
+                                    page_no - 1, max_px, fmt_tok)
     except Exception as e:  # noqa: BLE001  预览失败绝不 500
-        print(f"  [PREVIEW] 生成失败 file_id={file_id} page={page_no} ext={ext}: {e}")
-        _preview_fail_note(fail_key, e)
-        data = None
+        if fmt_tok == _PREVIEW_FMT_WEBP:
+            # WebP 编码失败（编解码器缺失/OOM）不该让整页没有预览：就地回落 JPEG 再试一次。
+            print(f"  [PREVIEW] WebP 编码失败，回落 JPEG file_id={file_id} page={page_no}: {e}")
+            fmt_tok = _PREVIEW_FMT_JPEG
+            try:
+                data = _render_preview_page(src_path, display, file_id, mtime_token,
+                                            page_no - 1, max_px, fmt_tok)
+            except Exception as e2:  # noqa: BLE001
+                print(f"  [PREVIEW] 生成失败 file_id={file_id} page={page_no} ext={ext}: {e2}")
+                _preview_fail_note(fail_key, e2)
+                data = None
+        else:
+            print(f"  [PREVIEW] 生成失败 file_id={file_id} page={page_no} ext={ext}: {e}")
+            _preview_fail_note(fail_key, e)
+            data = None
     if not data:
-        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user",
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
                            ext=ext.lstrip("."))
         return jsonify({"success": False, "message": "该文件暂时没有预览图"}), 415
+    # 真实格式可能与请求的不同（WebP 回落），缓存扩展名与 mimetype 都要跟着它走
+    actual_fmt = _sniff_image_fmt(data) or fmt_tok
+    if actual_fmt != fmt_tok:
+        cache_path = _preview_cache_path(file_id, mtime_token, page_no, size_tok, actual_fmt)
     try:
         os.makedirs(PREVIEW_DIR, exist_ok=True)
         with open(cache_path, "wb") as fh:
@@ -8220,11 +8345,59 @@ def file_preview(file_id):
         except Exception:  # noqa: BLE001
             pages = page_no
         _write_preview_meta(file_id, mtime_token, pages, 1)
-    _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor="user")
-    resp = send_file(io.BytesIO(data), mimetype="image/jpeg", max_age=86400)
+    _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor)
+    resp = send_file(io.BytesIO(data),
+                     mimetype=_PREVIEW_MIME.get(actual_fmt, _PREVIEW_MIME["jpeg"]),
+                     max_age=86400)
     resp.headers["X-Preview-Page"] = str(int(page_no))
     resp.headers["X-Preview-Pages"] = str(int(pages))
     return resp
+
+
+@app.route("/api/file_preview/<file_id>", methods=["GET"])
+def file_preview(file_id):
+    """文件预览图（≤1024×1024）。见本节顶部的口径说明。
+
+    参数：
+      · `page`（1 基，默认 1）—— 多页文档翻页用（2026-11-13 用户要求支持多页）；
+      · `size`（t=320 / p=640 / z=1024，默认 z）—— 列表小图 / 预览默认 / 放大（2026-11-19 分层）；
+      · `fmt`（jpeg / webp，默认 jpeg）—— 服务端 Pillow 编不出 WebP 时自动回落 JPEG。
+    返回：
+      · 200 + image/jpeg 或 image/webp —— 命中缓存或刚生成；头 X-Preview-Page / X-Preview-Pages；
+      · 404 —— 文件不存在/已清理；
+      · 403 —— 不是你的文件（管理员可看）；
+      · 415 —— 该类型没有预览图 / 服务端暂时渲染不了（前端静默退回类型图标）。
+    """
+    openid = _openid_for_media()
+    if not openid:
+        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
+    ctx = _preview_request_context(file_id, openid)
+    if isinstance(ctx, tuple):
+        return ctx
+    return _preview_page_response(file_id, ctx, openid=openid, actor="user")
+
+
+# ── 管理端预览（收支清算「订单明细」点文件名看首页缩略图）────────────────────────
+# 页面在**本地** stats_server 上（finance/settlement.html），它只知道 printer token
+# （代理出站走 X-Printer-Token），没有小程序 openid ⇒ 上面的 /api/file_preview/<id>
+# 对它永远是 401。所以另开一条只认 admin scope 的入口，渲染/缓存/415 语义**完全复用**
+# _preview_page_response，不写第二份：
+#   · 鉴权：@require_printer_scope("admin")（内部已 _authenticate_printer，含全局 TOKEN=print+admin）
+#   · 属主：不做判定（allow_any=True）—— 能拿 admin scope 就等于能看结算账；判定本身
+#     对"看账的人不是下单的人"只会误杀
+#   · 审计：actor="printer"（与 user 分开记，事后能看出是谁读的）
+# 注意：只在 stats_server 里以 /api/local/file_preview/<id> 暴露（那条路会带上 X-Launch-Token
+# 的本地闸门并原样透传二进制）；**不要**把它加进 /api/proxy 白名单 —— 那条代理只透传
+# JSON 白名单字段，图片会被 _extract_proxy_body 吃成"响应格式错误"。
+
+@app.route("/api/admin/file_preview/<file_id>", methods=["GET"])
+@require_printer_scope("admin")
+def admin_file_preview(file_id):
+    """管理端文件预览图（同 /api/file_preview/<id>，鉴权换成 printer token admin scope）。"""
+    ctx = _preview_request_context(file_id, "", allow_any=True, actor="printer")
+    if isinstance(ctx, tuple):
+        return ctx
+    return _preview_page_response(file_id, ctx, openid="", actor="printer")
 
 
 @app.route("/api/file_preview/<file_id>/info", methods=["GET"])
@@ -13928,7 +14101,7 @@ def admin_statistics_revenue():
     if order_ids:
         of_placeholders = ",".join("?" for _ in order_ids)
         of_rows = conn.execute(
-            f"""SELECT id, order_id, file_name, copies, page_count, duplex,
+            f"""SELECT id, order_id, file_id, file_name, copies, page_count, duplex,
                        page_range, simplex_pages, total_price, status, created_at,
                        image_orientation, is_free, reject_reason
                 FROM order_files
@@ -13960,6 +14133,13 @@ def admin_statistics_revenue():
             files_by_order[oid].append({
                 "id": of_row["id"],
                 "file_name": of_row["file_name"],
+                # v7.21（收支清算点文件名看首页缩略图）：子任务行要带 files.id 与"有没有预览图"，
+                # 页面才知道这一行的文件名能不能点。has_preview 只在**有 file_id 且扩展名
+                # 可渲染**时才为真 —— 老订单/本地放弃单的 file_id 是空，点开只会 404。
+                # 判定与预览端点同一份 _has_preview_for（那边 415 的清单就是这一份）。
+                "file_id": of_row["file_id"] or "",
+                "has_preview": bool(of_row["file_id"]) and
+                               _has_preview_for(of_row["file_name"] or ""),
                 "copies": of_row["copies"] or 1,
                 "page_count": of_row["page_count"] or 0,
                 "duplex": of_row["duplex"] or "on",

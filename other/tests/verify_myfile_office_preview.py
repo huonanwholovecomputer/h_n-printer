@@ -99,7 +99,12 @@ WANTED_CONST = {"_PREVIEW_IMAGE_EXTS", "_PREVIEW_OFFICE_EXTS", "_PREVIEW_OFFICE_
                 "_PREVIEW_FAIL_TTL", "_preview_fail_cache", "_soffice_path",
                 "_CALC_ONE_PAGE_FILTER", "UPLOAD_DIR", "PREVIEW_DIR", "PREVIEW_MAX_PAGES",
                 "_PREVIEW_LOCK_GUARD", "_preview_page_locks",
-                "_preview_meta_index_cache"}
+                "_preview_meta_index_cache",
+                # 2026-11-19 分层尺寸 + 格式协商（size=t/p/z，fmt=jpeg/webp）
+                "PREVIEW_MAX_PX", "_PREVIEW_SIZES", "_PREVIEW_DEFAULT_SIZE",
+                "_PREVIEW_FMT_JPEG", "_PREVIEW_FMT_WEBP",
+                "_PREVIEW_JPEG_QUALITY", "_PREVIEW_WEBP_QUALITY", "_PREVIEW_MIME",
+                "_preview_caps", "_PREVIEW_WARM_SIZES", "_PREVIEW_WARM_FMTS"}
 # 注意：`_render_pdf_page_bytes` / `_pdf_page_total` 故意**不**从源码抠（它们依赖 PyMuPDF/
 # pdftoppm），改由 build_ns 注入桩函数，本脚本才能在任何机器上跑。
 WANTED_FUNC = {"_has_preview_for", "_soffice_bin", "_preview_fail_hit", "_preview_fail_note",
@@ -108,7 +113,10 @@ WANTED_FUNC = {"_has_preview_for", "_soffice_bin", "_preview_fail_hit", "_previe
                "_preview_total_pages", "_prewarm_previews", "_drop_previews",
                "_preview_stem", "_preview_cache_path", "_preview_pdf_path",
                "_preview_meta_path", "_read_preview_meta", "_write_preview_meta",
-               "_preview_pages_hint", "_preview_lock_for", "_preview_meta_index"}
+               "_preview_pages_hint", "_preview_lock_for", "_preview_meta_index",
+               # 2026-11-19 新增（档位/格式解析、WebP 能力探测、编解码器嗅探、编码）
+               "_preview_size_token", "_preview_webp_ready", "_preview_fmt_token",
+               "_sniff_image_fmt", "_encode_preview_image"}
 
 pieces = []
 for node in TREE.body:
@@ -184,8 +192,14 @@ def build_ns(which_hit="/usr/bin/soffice", produced=True, run_hook=None):
         "tempfile": TempfileStub,
         "_render_pdf_preview": lambda p: b"JPEG:" + os.path.basename(p).encode(),
         # 光栅化 / 页数：注入桩（真实现要 PyMuPDF 或 pdftoppm，本机不一定有）
-        "_render_pdf_page_bytes": lambda p, i: (b"JPEG:" + os.path.basename(p).encode()
-                                                + b"#" + str(int(i)).encode()),
+        # 2026-11-19 起 _render_preview_page 会带 max_px / fmt 两个参数（分层尺寸 + 格式协商），
+        # 桩必须同签名接收，否则 TypeError。
+        "_render_pdf_page_bytes": lambda p, i, max_px=None, fmt=None: (
+            b"JPEG:" + os.path.basename(p).encode()
+            + b"#" + str(int(i)).encode()
+            + b"/" + (str(max_px).encode() if max_px is not None else b"-")
+            + b"/" + (str(fmt).encode() if fmt else b"-")),
+        "_render_image_preview": lambda p, max_px=None, fmt=None: b"IMG:" + os.path.basename(p).encode(),
         "_pdf_page_total": lambda p: int(total_box[0]),
         "_redact_filename": lambda s: s,
         "__total_box__": total_box,
@@ -447,7 +461,8 @@ try:
     check("docx 的总页数取自转换后的 PDF（不是 files.page_count）",
           ns["_preview_total_pages"]("a.docx", "a.docx", "f2", "17") == 5)
     page2 = ns["_render_preview_page"]("a.docx", "a.docx", "f2", "17", 1)
-    check("第 2 页传给光栅化的是 1 基页-1（0 基）", page2.endswith(b"#1"), page2)
+    # 2026-11-19 起桩的返回值多了「档位/格式」尾巴（/1024/jpeg），所以用前缀判定 0 基页码
+    check("第 2 页传给光栅化的是 1 基页-1（0 基）", b"#1/" in page2, page2)
     try:
         ns["_render_preview_page"]("a.jpg", "a.jpg", "f3", "17", 1)
         raised = False
@@ -579,6 +594,48 @@ try:
 finally:
     os.chdir(_saved_cwd)
     shutil.rmtree(tmp_root, ignore_errors=True)
+
+# --------------------------------------------------------------------------------------
+# 八、分层尺寸 + 格式协商（2026-11-19）：size=t/p/z、fmt=jpeg/webp、缓存命名、格式嗅探
+# --------------------------------------------------------------------------------------
+print("\n--- 8) 分层尺寸 / 格式协商（?size=t|p|z&fmt=jpeg|webp） ---")
+ns7, _unused = build_ns()
+try:
+    check("_PREVIEW_SIZES 三档：t=320 / p=640 / z=1024（默认 z）",
+          ns7["_PREVIEW_SIZES"] == {"t": 320, "p": 640, "z": 1024}
+          and ns7["_PREVIEW_DEFAULT_SIZE"] == "z")
+    check("size 只认 t/p/z，别的值一律回落默认 z（防拼错把 max_px 变 NaN）",
+          ns7["_preview_size_token"]("t") == "t"
+          and ns7["_preview_size_token"]("P") == "p"
+          and ns7["_preview_size_token"]("z") == "z"
+          and ns7["_preview_size_token"]("xxl") == "z"
+          and ns7["_preview_size_token"](None) == "z")
+    webp_ok = ns7["_preview_webp_ready"]()
+    check("fmt 只认 jpeg/webp（含 image/webp 别名），Pillow 没有 WebP 编码能力时回落 jpeg",
+          ns7["_preview_fmt_token"]("jpeg") == "jpeg"
+          and ns7["_preview_fmt_token"]("webp") == ("webp" if webp_ok else "jpeg")
+          and ns7["_preview_fmt_token"]("image/webp") == ("webp" if webp_ok else "jpeg")
+          and ns7["_preview_fmt_token"]("gif") == "jpeg"
+          and ns7["_preview_fmt_token"](None) == "jpeg",
+          "webp_ready=%r" % (webp_ok,))
+    # 默认档（1024/JPEG）必须沿用 2026-11-13 的老文件名，历史缓存才不会一夜失效
+    check("默认档（z/jpeg）沿用老缓存名，老站升级后历史预览继续命中",
+          ns7["_preview_cache_path"]("abc", "17", 1).endswith("abc_17.jpg")
+          and ns7["_preview_cache_path"]("abc", "17", 2).endswith("abc_17_p2.jpg"))
+    check("新档位加后缀：p/jpeg → _p.jpg，z/webp → _z.webp，t 第 3 页 → _p3_t.webp",
+          ns7["_preview_cache_path"]("abc", "17", 1, "p", "jpeg").endswith("abc_17_p.jpg")
+          and ns7["_preview_cache_path"]("abc", "17", 1, "z", "webp").endswith("abc_17_z.webp")
+          and ns7["_preview_cache_path"]("abc", "17", 3, "t", "webp").endswith("abc_17_p3_t.webp"))
+    check("格式嗅探：JPEG 魔数 / RIFF-WEBP / 未知内容分得开",
+          ns7["_sniff_image_fmt"](b"\xff\xd8\xff\xe0" + b"0" * 20) == "jpeg"
+          and ns7["_sniff_image_fmt"](b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"0" * 8) == "webp"
+          and ns7["_sniff_image_fmt"](b"<html>nope</html>") == "")
+    check("MIME 表：jpeg→image/jpeg、webp→image/webp",
+          ns7["_PREVIEW_MIME"] == {"jpeg": "image/jpeg", "webp": "image/webp"})
+    check("预热档位只用 p（1024 与 320 都不预热：前者按需取，后者太小不值得占磁盘）",
+          ns7["_PREVIEW_WARM_SIZES"] == ("p",))
+finally:
+    shutil.rmtree(ns7["PREVIEW_DIR"], ignore_errors=True)
 
 # --------------------------------------------------------------------------------------
 print("\n" + ("=" * 60))

@@ -3282,6 +3282,20 @@ function toggleMyFileDetail(fileId) {
    预览图是锦上添花，不能因为它把整行详情搞红。 */
 function myFilePreviewError(fileId) {
   if (!fileId) return;
+  // 2026-11-19：第一次失败先怪 WebP —— 整块换回 JPEG 重渲染一次（同一张图会重新请求）。
+  // JPEG 也失败，才当这个文件真的没有预览图。
+  if (previewFmt !== 'jpeg') {
+    previewFmt = 'jpeg';
+    const f0 = (meState.myFiles || []).find(x => x.file_id === fileId);
+    if (f0) { f0.previewFailed = false; renderMyFiles(); }
+    const m0 = meState.fileDetailFile;
+    if (m0 && String(m0.file_id) === String(fileId)) {
+      m0.previewFailed = false;
+      const body0 = document.getElementById('myFileDetailBody');
+      if (body0) body0.innerHTML = renderMyFiles(m0);
+    }
+    return;
+  }
   const f = (meState.myFiles || []).find(x => x.file_id === fileId);
   if (!f || f.previewFailed) return;
   f.previewFailed = true;
@@ -3405,7 +3419,8 @@ function renderMyFiles(onlyFile) {
     let preview;
     if (!f.previewFailed && f.previewUrl) {
       const base = String(f.previewUrl);
-      const shotUrl = (p) => base + (base.indexOf('?') >= 0 ? '&' : '?') + 'page=' + p;
+      const shotUrl = (p) => base + (base.indexOf('?') >= 0 ? '&' : '?') +
+        'page=' + p + '&size=p&fmt=' + previewFmt;
       let slides = '';
       for (let p = 1; p <= pages; p += 1) {
         // 只给当前页和左右各一页真 src，其余挂 data-src —— 12 页一次性请求会把 WebView 拖死
@@ -3520,6 +3535,10 @@ function deleteMyFile(fileId, name) {
    --------------------------------------------------------------------------------- */
 
 const PREVIEW_MAX_PAGES = 12;   // 一次最多渲染 12 页；再多只提示总页数（12 张图同时解码会吃爆 WebView）
+// 2026-11-19 分层尺寸 + 格式协商：列表/详情用 p 档（640），全屏才要 z 档（1024）；
+// WebP 同尺寸比 JPEG 小 34~39%（APP 的 WebView 是 Chromium，WebP 自 Chrome 32 起支持）。
+// 真机上万一解码不了，myFilePreviewError 会整块退回 JPEG 重渲染一次。
+let previewFmt = 'webp';
 let pfvWired = false;           // setupMyFilePreviewUI 只装一遍监听
 let pfvHostTouch = null;        // 缩略图上的手势识别（左右滑翻页 vs 点开全屏）
 let pfvSwipeAt = 0;             // 刚滑完的时间戳：压掉紧随其后的合成 click
@@ -3535,12 +3554,14 @@ function previewStateOf(fileId) {
   return meState.filePreview[id];
 }
 
-/* 第 n 页预览图 URL：复用 decorateMyFile 拼好的 previewUrl（已带 token），只补 page=N */
-function previewShotUrl(f, page) {
+/* 第 n 页预览图 URL：复用 decorateMyFile 拼好的 previewUrl（已带 token），补 page/size/fmt。
+   size：p=640（列表与详情，默认）/ z=1024（全屏）。fmt 跟 previewFmt（WebP 失败会整块退回 JPEG）。 */
+function previewShotUrl(f, page, size) {
   const base = String((f && f.previewUrl) || '');
   if (!base) return '';
   const n = Number(page) > 0 ? Math.floor(Number(page)) : 1;
-  return base + (base.indexOf('?') >= 0 ? '&' : '?') + 'page=' + n;
+  return base + (base.indexOf('?') >= 0 ? '&' : '?') +
+    'page=' + n + '&size=' + (size || 'p') + '&fmt=' + previewFmt;
 }
 
 /* 文件对象：先找「我的文件」列表里那份（已修饰），再找订单文件详情弹窗里的 */
@@ -3919,7 +3940,7 @@ function pfvShowPage(page) {
   if (mask) mask.classList.remove('pfv-loaded');
   if (img) {
     img.style.visibility = 'hidden';
-    img.setAttribute('src', previewShotUrl(f, next));
+    img.setAttribute('src', previewShotUrl(f, next, 'z'));
   }
   pfvApplyTransform();
   pfvUpdateBar();
@@ -3978,7 +3999,7 @@ function openPreviewViewer(fileId, page) {
   const img = document.getElementById('pfvImg');
   if (img) {
     img.style.visibility = 'hidden';
-    img.setAttribute('src', previewShotUrl(f, pfvState.page));
+    img.setAttribute('src', previewShotUrl(f, pfvState.page, 'z'));
   }
   pfvApplyTransform();
   pfvUpdateBar();
@@ -4184,6 +4205,15 @@ function setupMyFilePreviewUI() {
         if (tip) tip.textContent = '正在加载预览图…';
       });
       img.addEventListener('error', () => {
+        // 2026-11-19：全屏图同样先给 WebP 一次翻案机会（换成 JPEG 重载），再报失败。
+        if (previewFmt !== 'jpeg' && pfvState.open) {
+          previewFmt = 'jpeg';
+          const f = previewFileOf(pfvState.fileId);
+          if (f) {
+            img.setAttribute('src', previewShotUrl(f, pfvState.page, 'z'));
+            return;
+          }
+        }
         img.style.visibility = 'hidden';
         mask.classList.remove('pfv-loaded');
         const tip = document.getElementById('pfvLoadingText');

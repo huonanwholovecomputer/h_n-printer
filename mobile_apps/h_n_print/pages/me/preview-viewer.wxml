@@ -17,6 +17,7 @@
       <image class="pv-img {{pv.failed ? 'pv-img-hidden' : ''}}"
              src="{{pv.url}}"
              mode="aspectFit"
+             webp="{{pv.fmt !== 'jpeg'}}"
              style="transform: translate3d({{pv.x}}px, {{pv.y}}px, 0) scale({{pv.scale}}); transition: {{pv.animating ? 'transform 220ms cubic-bezier(0.22,0.61,0.36,1)' : 'none'}};"
              binderror="onPvImageError"></image>
     </view>
