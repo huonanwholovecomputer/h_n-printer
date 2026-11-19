@@ -323,6 +323,75 @@ setTimeout(() => {
   chk('「复制价格」写入剪贴板的正是单行格式', sandbox.__COPIED === 'HN20261103-0001 \u2014 \u00a52.00',
     JSON.stringify(sandbox.__COPIED) + (sandbox.__COPY_ERR ? ' err=' + sandbox.__COPY_ERR : ''));
 
+  /* ============ #5b 订正气泡（状态 / 类型 / 归属人）也要「滑动即收起」 ============ */
+  console.log('--- #5b 订正气泡外滑动收起（与价格气泡同一套口径）---');
+  /* 2026-11-18 用户现场：类型列的「接单/自打」气泡弹出后，底下表格一滚气泡就飘到别处去了。
+     三个订正气泡（stMenu / tyMenu / usMenu）原本只有「点外部关闭」，没有滚动收起。 */
+  const mkStMenu = () => ({
+    _removed: false,
+    remove() { this._removed = true; },
+    contains(t) { return !!(t && t.__inMenu); },
+  });
+  let stMenus = {};
+  documentProto.getElementById = (id) => (stMenus[id] || null);
+
+  stMenus = { tyMenu: mkStMenu() };
+  vm.runInContext('_stMenuOnScroll({ target: {} })', sandbox);
+  chk('类型气泡（接单/自打）在气泡之外的滚动会收起', stMenus.tyMenu._removed);
+
+  stMenus = { stMenu: mkStMenu() };
+  vm.runInContext('_stMenuOnSlide({ target: {} })', sandbox);
+  chk('状态气泡在气泡之外的滚轮 / 触控滑动会收起', stMenus.stMenu._removed);
+
+  stMenus = { usMenu: mkStMenu() };
+  vm.runInContext('_stMenuOnScroll({ target: { __inMenu: true } })', sandbox);
+  chk('在归属人气泡内部滑动不收起（长名单本身要能滚）', !stMenus.usMenu._removed);
+
+  stMenus = {};
+  let stErr = null;
+  try { vm.runInContext('_stMenuOnScroll({ target: {} })', sandbox); } catch (e) { stErr = e.message; }
+  chk('没有气泡开着时滚动是空操作（不抛异常）', !stErr, stErr);
+
+  const fnBody = (name) => {
+    const m = js.match(new RegExp('function ' + name + '\\([^)]*\\) \\{([\\s\\S]*?)\\n\\}'));
+    return m ? m[1] : '';
+  };
+  chk('三个订正气泡的 open 都绑定了滚动收起（漏一个 = 那个气泡照旧飘）',
+    ['openOrderStatusMenu', 'openOrderTypeMenu', 'openOrderUserMenu']
+      .every((n) => fnBody(n).includes('_stMenuBindScroll()')), '');
+  chk('三个订正气泡的 close 都解绑了滚动收起（关掉后不该继续收监听）',
+    ['closeOrderStatusMenu', 'closeOrderTypeMenu', 'closeOrderUserMenu']
+      .every((n) => fnBody(n).includes('_stMenuUnbindScroll()')), '');
+  chk('绑定用 capture 才能收到内层表格（.table-wrap）的滚动 —— scroll 不冒泡',
+    fnBody('_stMenuBindScroll').includes("addEventListener('scroll', _stMenuOnScroll, true)"));
+  chk('滚轮与触控滑动都覆盖（passive + capture）',
+    fnBody('_stMenuBindScroll').includes("addEventListener('wheel', _stMenuOnSlide")
+    && fnBody('_stMenuBindScroll').includes("addEventListener('touchmove', _stMenuOnSlide"));
+
+  /* 2026-11-19 用户要求：类型 / 归属人气泡的手感要与金额气泡一致（动效 + 收起动效）。 */
+  const stCss = (html.match(/\.st-menu\s*\{[^}]*\}/) || [''])[0];
+  chk('.st-menu 入场用 pmIn（与金额气泡同一套关键帧）', /animation:\s*pmIn\b/.test(stCss), stCss.slice(0, 160));
+  chk('.st-menu 的入场关键帧是 both 且不残留 transform', /animation:\s*pmIn[^;]*\bboth\b/.test(stCss));
+  const stClosingCss = (html.match(/\.st-menu\.st-closing\s*\{[^}]*\}/) || [''])[0];
+  chk('.st-menu.st-closing 播 pmOut 且不吃点击', /animation:\s*pmOut\b/.test(stClosingCss)
+    && /pointer-events:\s*none/.test(stClosingCss), stClosingCss);
+
+  chk('三个订正气泡的 close 都走 _stMenuFadeOut（不是瞬间 remove）',
+    ['closeOrderStatusMenu', 'closeOrderTypeMenu', 'closeOrderUserMenu']
+      .every((n) => fnBody(n).includes('_stMenuFadeOut(')));
+  chk('三个订正气泡的 open 都设了 transformOrigin（从触发点长出来）',
+    ['openOrderStatusMenu', 'openOrderTypeMenu', 'openOrderUserMenu']
+      .every((n) => fnBody(n).includes('transformOrigin')));
+  chk('open 先 _stMenuDropNow 摘掉同一 id 的残影（否则 getElementById 命中淡出中的节点）',
+    ['openOrderStatusMenu', 'openOrderTypeMenu', 'openOrderUserMenu']
+      .every((n) => fnBody(n).includes('_stMenuDropNow(')));
+  chk('toggle 判据排除正在收起的节点（130ms 内重点标签不该被当成收起）',
+    ['openOrderStatusMenu', 'openOrderTypeMenu', 'openOrderUserMenu']
+      .every((n) => fnBody(n).includes('!same._stClosing')));
+  chk('收起动效时长与金额气泡同为 130ms', /_stMenuFadeOut[\s\S]{0,900}?\},\s*130\);/.test(js));
+  chk('开了金额气泡先收干净三个订正气泡（_stMenuCloseAll）', fnBody('openPriceMenu').includes('_stMenuCloseAll()'));
+  documentProto.getElementById = origGet;
+
   /* ==================== #5 气泡：弹出 / 收起动效 + 气泡外滑动收起 ==================== */
   console.log('--- #5 气泡动效与气泡外滑动收起 ---');
   /* 沙箱的窗对象是 Proxy 桩，matchMedia 的 .matches 恒真 ⇒ 会走「减少动效」直删分支。

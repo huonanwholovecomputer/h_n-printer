@@ -381,7 +381,12 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .st-edit.can { cursor: pointer; padding-right: 2px; outline: 1px dashed rgba(79,110,247,.55); outline-offset: 2px; }
 .st-edit.can:hover { background: rgba(79,110,247,.12); }
 .st-caret { border: none; background: transparent; color: var(--primary); cursor: pointer; font-size: .66rem; line-height: 1; padding: 0 1px; pointer-events: none; }
-.st-menu { position: fixed; z-index: 220; min-width: 138px; padding: 5px; background: var(--card); border: 1px solid var(--border-strong); border-radius: 11px; box-shadow: 0 12px 30px rgba(0,0,0,.22); }
+/* 三个订正气泡（状态 / 类型 / 归属人）与金额气泡（#priceMenu）同一套手感（2026-11-19 统一）：
+   入场弹簧 + 130ms 收起动效。关键帧复用 pmIn/pmOut —— 终点必须 transform:none（不写
+   translateY(0)），带 fill 时残留的 transform 会让气泡变成层叠上下文。 */
+.st-menu { position: fixed; z-index: 220; min-width: 138px; padding: 5px; background: var(--card); border: 1px solid var(--border-strong); border-radius: 11px; box-shadow: 0 12px 30px rgba(0,0,0,.22);
+  animation: pmIn .16s cubic-bezier(.2,.9,.3,1.25) both; }
+.st-menu.st-closing { animation: pmOut .13s ease both; pointer-events: none; }
 .st-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; padding: 6px 8px; border: none; background: transparent; border-radius: 8px; cursor: pointer; font-size: .8rem; color: var(--text); }
 .st-menu-item:hover { background: rgba(79,110,247,.14); }
 .st-menu-item.cur { background: rgba(79,110,247,.10); cursor: default; }
@@ -412,6 +417,37 @@ mark.hit { background: #fff3b0; color: #3b2f00; border-radius: 3px; padding: 0 1
 #priceMenu .pm-item:hover { background: rgba(79,110,247,.14); }
 .price-copy { cursor: pointer; text-decoration: underline dotted rgba(127,127,127,.6); text-underline-offset: 3px; }
 .price-copy:hover { filter: brightness(1.1); }
+/* 订单明细「文件名」预览（v7.21）：可点的文件名带放大镜提示，点开弹预览窗。
+   预览图必须带 X-Launch-Token 才取得到（<img src> 带不了请求头），所以走 fetch + blob:
+   —— CSP 的 img-src 已在 stats_server._HTML_CSP 里补了 blob:。 */
+.file-grid .fn.pv-can { cursor: zoom-in; }
+.file-grid .fn.pv-can:hover { color: var(--accent, #4f6ef7); text-decoration: underline dotted rgba(127,127,127,.6); text-underline-offset: 3px; }
+#fPrevMenu { position: fixed; z-index: 240; padding: 8px; background: var(--card); border: 1px solid var(--border-strong);
+  border-radius: 12px; box-shadow: 0 14px 34px rgba(0,0,0,.26); animation: pmIn .16s cubic-bezier(.2,.9,.3,1.25) both; }
+#fPrevMenu.pm-closing { animation: pmOut .13s ease both; pointer-events: none; }
+#fPrevMenu .fp-title { font-size: .7rem; color: var(--muted); padding: 2px 4px 6px; line-height: 1.5; border-bottom: 1px solid var(--border); margin-bottom: 6px;
+  max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#fPrevMenu .fp-stage { position: relative; display: flex; align-items: center; justify-content: center;
+  width: 300px; height: 300px; background: var(--card-2); border-radius: 8px; overflow: hidden; }
+#fPrevMenu .fp-stage img { max-width: 100%; max-height: 100%; display: block; }
+#fPrevMenu .fp-hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: .78rem; color: var(--muted); text-align: center; padding: 0 14px; line-height: 1.6; }
+#fPrevMenu .fp-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 2px 0; }
+#fPrevMenu .fp-bar button { border: 1px solid var(--border-strong); background: var(--card); color: var(--text);
+  border-radius: 8px; padding: 3px 9px; font-size: .76rem; cursor: pointer; font-family: inherit; }
+#fPrevMenu .fp-bar button:disabled { opacity: .4; cursor: default; }
+#fPrevMenu .fp-page { font-size: .72rem; color: var(--muted); white-space: nowrap; }
+/* v7.26.2：预览图可放大。点图或按「⤢ 放大」把 300×300 的小舞台换成视口级大舞台，
+   图片按**原始像素**显示（云端预览长边本来就 ≤1024，放大后是真细节，不是把小图撑糊）。
+   大舞台上超出的部分在窗内滚动查看：_fpOnScroll / _fpOnSlide 对窗内目标一律放行，
+   所以在预览窗里滚轮/触控滑动不会把它收掉。 */
+#fPrevMenu .fp-stage img { cursor: zoom-in; }
+#fPrevMenu.fp-zoom { padding: 10px; }
+#fPrevMenu.fp-zoom .fp-stage { display: block; overflow: auto; cursor: zoom-out;
+  width: min(88vw, 1024px); height: min(78vh, 1024px); }
+#fPrevMenu.fp-zoom .fp-stage img { max-width: none; max-height: none; display: block;
+  margin: 0 auto; cursor: zoom-out; }
+#fPrevMenu.fp-zoom .fp-title { max-width: min(88vw, 1024px); }
 /* timeout=超时：琥珀色（与 failed 的红、offline_unknown 的黄区分开） */
 .tag.st-timeout { background: #FFF8E1; color: #B45309; }
 [data-theme="dark"] .tag.st-timeout { background: rgba(245,158,11,.18); color: #FBBF24; }
@@ -1215,7 +1251,7 @@ function mergeStores(localStore, cloudStore) {
 /* ==================== 全局状态 ==================== */
 /* 版本号唯一来源：关于页标题 + 版本说明的最末条目都从它取。发版时只改这一处，
    别再在 renderAbout 里写死字面量（2026-11-16 现场：标题还停在 v7.10，日志已到 v7.25）。 */
-var APP_VER = 'v7.26.0';
+var APP_VER = 'v7.26.2';
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
@@ -4947,21 +4983,24 @@ function _orderTypeLockHTML() {
 }
 function closeOrderTypeMenu() {
   var m = document.getElementById('tyMenu');
-  if (m) m.remove();
+  if (m) _stMenuFadeOut(m, function () { m.remove(); });
   document.removeEventListener('click', _stMenuOutside);
+  _stMenuUnbindScroll();
 }
 /* 类型选择菜单：只列接单/自打两种（与后端 MANUAL_FIX_ORDER_TYPES 同源） */
 function openOrderTypeMenu(ev, oid) {
   if (ev && ev.stopPropagation) ev.stopPropagation();
   closeOrderUserMenu();
-  /* 与状态列同一套行为：同一单的菜单已开着 → 再点收起 */
+  /* 与状态列同一套行为：同一单的菜单已开着 → 再点收起。
+     正在收起（.st-closing）的节点不算「开着」——它 130ms 后就没了，这时点标签应当重新弹出。 */
   var same = document.getElementById('tyMenu');
-  if (same && same.getAttribute('data-oid') === String(oid)) {
+  if (same && !same._stClosing && same.getAttribute('data-oid') === String(oid)) {
     closeOrderTypeMenu();
     return;
   }
   closeOrderStatusMenu();
   closeOrderTypeMenu();
+  _stMenuDropNow('tyMenu');   /* 收起动效会留 130ms，同 id 双节点会让新气泡点不动 */
   if (!_orderTypeEditable(oid)) {
     if (FINANCE_MODE === 'local') toast('❌ 本地模式下不支持订正订单类型', 'error');
     else toast(oid ? '🔒 请先解锁订单状态/类型订正' : '❌ 订单 id 不合法', 'error');
@@ -4992,9 +5031,10 @@ function openOrderTypeMenu(ev, oid) {
   var left = Math.max(8, Math.min(r.left, (window.innerWidth || 1024) - mw - 8));
   var top = r.bottom + 6;
   if (top + mh > (window.innerHeight || 768) - 8) top = Math.max(8, r.top - mh - 6);
+  m.style.transformOrigin = (top > r.bottom) ? 'top left' : 'bottom left';
   m.style.left = left + 'px';
   m.style.top = top + 'px';
-  setTimeout(function () { document.addEventListener('click', _stMenuOutside); }, 0);
+  setTimeout(function () { document.addEventListener('click', _stMenuOutside); _stMenuBindScroll(); }, 0);
 }
 var _orderTypeSaving = false;
 /* 提交类型订正：写库 → 本地落地（is_admin_print 决定金额/收益口径）→ 重绘整页。
@@ -5112,20 +5152,22 @@ function _localOwnerCandidates(o) {
 }
 function closeOrderUserMenu() {
   var m = document.getElementById('usMenu');
-  if (m) m.remove();
+  if (m) _stMenuFadeOut(m, function () { m.remove(); });
   document.removeEventListener('click', _stMenuOutside);
+  _stMenuUnbindScroll();
 }
 /* 用户选择菜单：openid 不拼进 HTML（只传序号），避免昵称/ID 里的引号破坏内联事件 */
 function openOrderUserMenu(ev, oid) {
   if (ev && ev.stopPropagation) ev.stopPropagation();
   var same = document.getElementById('usMenu');
-  if (same && same.getAttribute('data-oid') === String(oid)) {
+  if (same && !same._stClosing && same.getAttribute('data-oid') === String(oid)) {
     closeOrderUserMenu();
     return;
   }
   closeOrderStatusMenu();
   closeOrderTypeMenu();
   closeOrderUserMenu();
+  _stMenuDropNow('usMenu');   /* 收起动效会留 130ms，同 id 双节点会让新气泡点不动 */
   if (!_orderUserEditable(oid)) {
     if (FINANCE_MODE === 'local') toast('❌ 本地模式下不支持调整订单用户', 'error');
     else toast(oid ? '🔒 请先解锁订单状态/类型订正' : '❌ 订单 id 不合法', 'error');
@@ -5170,10 +5212,11 @@ function openOrderUserMenu(ev, oid) {
   var left = Math.max(8, Math.min(r.left, (window.innerWidth || 1024) - mw - 8));
   var top = r.bottom + 6;
   if (top + mh > (window.innerHeight || 768) - 8) top = Math.max(8, r.top - mh - 6);
+  m.style.transformOrigin = (top > r.bottom) ? 'top left' : 'bottom left';
   m.style.left = left + 'px';
   m.style.top = top + 'px';
   /* 本轮点击不再触发「点外部关闭」（延后一拍注册监听） */
-  setTimeout(function () { document.addEventListener('click', _stMenuOutside); }, 0);
+  setTimeout(function () { document.addEventListener('click', _stMenuOutside); _stMenuBindScroll(); }, 0);
 }
 var _orderUserSaving = false;
 /* 提交：只改归属；成功后本地改归属字段（云端 openid/nickname、本地 owner_name）与
@@ -5268,6 +5311,43 @@ function _applyExternalOrderMeta(o, ownerName, orderType, done) {
     toast('❌ 网络错误，改动未保存', 'error', true);
   });
 }
+/* —— 收起动效（2026-11-19 用户要求：三个订正气泡与金额气泡手感统一）——
+   金额气泡（#priceMenu）先落地：入场弹簧 + 130ms 收起动效。三个订正气泡原先都是直接
+   m.remove()，弹出生硬、关掉瞬间消失。这里把三条 close 统一到同一套判据：
+     · 先挂 .st-closing 播 pmOut，130ms 后由定时器摘节点；
+     · 「减少动效」/ 节点已不在 DOM / 不支持 classList ⇒ 立即摘（与 closePriceMenu 同源）；
+     · 重复调用不重复挂定时器（点外部 + 滚动可能同一帧各触发一次）。 */
+function _stMenuFadeOut(m, onDone) {
+  if (!m || !m.parentNode) { if (onDone) onDone(); return; }
+  if (m._stClosing) return;                     /* 已在收起：撤它的定时器会留下摘不掉的浮层 */
+  if (!m.classList || _prefersReduced()) { if (onDone) onDone(); return; }
+  m._stClosing = true;
+  m.classList.add('st-closing');
+  m._stTimer = setTimeout(function () {
+    m._stClosing = false;
+    m._stTimer = null;
+    if (onDone) onDone();
+  }, 130);
+}
+/* 换气泡 / 重绘时立刻摘掉旧节点：留着收起动效会出现同 id 的两个节点
+   （getElementById 命中的是正在淡出的那个 ⇒ 新气泡点上去像点空了）。
+   金额气泡那边用 closePriceMenu(true) 是同一个理由。 */
+function _stMenuDropNow(id) {
+  var m = document.getElementById(id);
+  if (!m) return;
+  if (m._stTimer) { clearTimeout(m._stTimer); m._stTimer = null; }
+  m._stClosing = false;
+  m.remove();
+}
+/* 三个订正气泡一起收（开金额气泡 / 换订正目标前先清场：浮层不同时开） */
+function _stMenuCloseAll() {
+  closeOrderStatusMenu();
+  closeOrderTypeMenu();
+  closeOrderUserMenu();
+  _stMenuDropNow('stMenu');
+  _stMenuDropNow('tyMenu');
+  _stMenuDropNow('usMenu');
+}
 function _stMenuOutside(e) {
   // 一把锁 / 三个菜单：点外部时各自判断（关掉状态菜单不应顺手改别的菜单的可见性，反之亦然）
   var m = document.getElementById('stMenu');
@@ -5277,10 +5357,50 @@ function _stMenuOutside(e) {
   var um = document.getElementById('usMenu');
   if (um && e.target !== um && !um.contains(e.target)) closeOrderUserMenu();
 }
+/* —— 「在气泡之外滑动就收起」（与价格气泡 _priceMenuBindScroll 同一套；2026-11-18 用户要求）——
+   三个订正气泡（状态 / 类型 / 归属人）都是 fixed 定位、贴着被点的那个标签，底下表格一滚它
+   就跟标签错位，所以滚动（窗口 / 明细表横向）、滚轮、触控滑动一律收起。用 capture 才能收到
+   .table-wrap 这类内层容器的滚动（scroll 不冒泡，但捕获阶段会经过 window）；气泡自己的滑动
+   （归属人列表可滚）不算。三个气泡同一时刻只会开一个（各自 open 前先 close 其它），所以共用
+   一对绑定函数即可。 */
+function _stMenuBindScroll() {
+  window.addEventListener('scroll', _stMenuOnScroll, true);
+  window.addEventListener('wheel', _stMenuOnSlide, { passive: true, capture: true });
+  window.addEventListener('touchmove', _stMenuOnSlide, { passive: true, capture: true });
+}
+function _stMenuUnbindScroll() {
+  window.removeEventListener('scroll', _stMenuOnScroll, true);
+  window.removeEventListener('wheel', _stMenuOnSlide, { passive: true, capture: true });
+  window.removeEventListener('touchmove', _stMenuOnSlide, { passive: true, capture: true });
+}
+function _stMenuIds() { return ['stMenu', 'tyMenu', 'usMenu']; }
+function _stMenuOpenCount() {
+  var ids = _stMenuIds(), n = 0;
+  for (var i = 0; i < ids.length; i++) { if (document.getElementById(ids[i])) n++; }
+  return n;
+}
+function _stMenuContains(target) {
+  var ids = _stMenuIds();
+  for (var i = 0; i < ids.length; i++) {
+    var m = document.getElementById(ids[i]);
+    if (m && target && m.contains && m.contains(target)) return true;
+  }
+  return false;
+}
+function _stMenuOnScroll(ev) {
+  if (!_stMenuOpenCount()) { _stMenuUnbindScroll(); return; }
+  if (_stMenuContains(ev && ev.target)) return;
+  closeOrderStatusMenu();
+  closeOrderTypeMenu();
+  closeOrderUserMenu();
+  _stMenuUnbindScroll();
+}
+function _stMenuOnSlide(ev) { _stMenuOnScroll(ev); }
 function closeOrderStatusMenu() {
   var m = document.getElementById('stMenu');
-  if (m) m.remove();
+  if (m) _stMenuFadeOut(m, function () { m.remove(); });
   document.removeEventListener('click', _stMenuOutside);
+  _stMenuUnbindScroll();
 }
 /* 状态选择菜单（挂在 body 上，用 fixed 定位贴着状态标签；点外部关闭）。
    守卫与 applyOrderStatus / 渲染模板**同源**（_orderStatusEditable）：本地模式或未解锁时
@@ -5292,11 +5412,12 @@ function openOrderStatusMenu(ev, oid) {
   /* 同一单的菜单已经开着 → 再点一次 = 收起（toggle）。
      旧写法每次都先 close 再 open，点同一个标签永远只是重开，用户没法"点一下关掉"。 */
   var same = document.getElementById('stMenu');
-  if (same && same.getAttribute('data-oid') === String(oid)) {
+  if (same && !same._stClosing && same.getAttribute('data-oid') === String(oid)) {
     closeOrderStatusMenu();
     return;
   }
   closeOrderStatusMenu();
+  _stMenuDropNow('stMenu');   /* 收起动效会留 130ms，同 id 双节点会让新气泡点不动 */
   if (!_orderStatusEditable(oid)) {
     if (FINANCE_MODE === 'local') toast('❌ 本地模式下不支持订正订单状态', 'error');
     else toast(oid ? '🔒 请先解锁订单状态订正' : '❌ 订单 id 不合法', 'error');
@@ -5332,10 +5453,11 @@ function openOrderStatusMenu(ev, oid) {
   var left = Math.max(8, Math.min(r.left, (window.innerWidth || 1024) - mw - 8));
   var top = r.bottom + 6;
   if (top + mh > (window.innerHeight || 768) - 8) top = Math.max(8, r.top - mh - 6);
+  m.style.transformOrigin = (top > r.bottom) ? 'top left' : 'bottom left';
   m.style.left = left + 'px';
   m.style.top = top + 'px';
   /* 本轮点击不再触发「点外部关闭」（延后一拍注册监听） */
-  setTimeout(function () { document.addEventListener('click', _stMenuOutside); }, 0);
+  setTimeout(function () { document.addEventListener('click', _stMenuOutside); _stMenuBindScroll(); }, 0);
 }
 var _orderStatusSaving = false;
 /* 提交订正：写库（父订单 + 全部子任务）→ 本地落地 → 整页重绘（KPI/图表/明细一起按新状态重算）。
@@ -5703,7 +5825,14 @@ function _renderOrderListHTML() {
         h += '<div class="file-grid file-sub-head"><span class="fn">📄 文件名</span><span>金额</span><span>份数</span><span title="有效打印页数（按页码范围折算）">页数</span><span title="有效纸张张数（按页码范围折算，含份数）">张数</span><span>单/双面</span><span>状态</span></div>';
         o.files.forEach(function (f, _fi) {
           h += '<div class="file-grid file-sub-row" title="' + esc(f.file_name) + (f.reject_reason ? ' · ' + esc(f.reject_reason) : '') + '">';
-          h += '<span class="fn">📄 ' + _hlText(f.file_name, _ordersSearchQuery()) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
+          // v7.21：可预览的文件名点开看首页缩略图（file_id + has_preview 都由云端算好，
+          // 不可渲染的扩展名 / 文件已被清理时 has_preview 为 false，保持纯文本，点了也不会 404）
+          var _pvCan = !!(f.file_id && f.has_preview);
+          h += '<span class="fn' + (_pvCan ? ' pv-can' : '') + '"'
+            + (_pvCan ? ' title="点击查看首页预览（共 ' + (parseInt(f.page_count, 10) || 1) + ' 页）"'
+                       + ' onclick="event.stopPropagation();openFilePreview(event,\'' + oidS + '\',' + _fi + ')"'
+                      : '')
+            + '>📄 ' + _hlText(f.file_name, _ordersSearchQuery()) + (f.is_free ? ' <span class="bound-badge yes">免费</span>' : '') + '</span>';
           h += '<span style="font-weight:700;color:' + revColor + '"><span class="price-copy" title="点击复制价格" onclick="event.stopPropagation();openPriceMenu(event,\'' + oidS + '\',' + _fi + ')">' + RMB(parseCents(f.total_price)) + '</span></span>';
           h += '<span>' + f.copies + '份</span>';
           // 页数 = **有效打印页数**（折页码范围）；括号注明文件本身共几页（两者不同才标）。
@@ -6064,7 +6193,8 @@ function openPriceMenu(ev, rowKey, fileIdx) {
   if (ev && ev.preventDefault) ev.preventDefault();
   var o = _findOrderByRowKey(rowKey);
   if (!o) { toast('❌ 订单已不在当前列表，请刷新后重试', 'error'); return; }
-  closeOrderStatusMenu();   // 两个浮层不同时开，避免互相压住
+  /* 浮层不同时开：三个订正气泡（状态 / 类型 / 归属人）一起立刻收掉，避免两层叠着互相压住 */
+  _stMenuCloseAll();
   /* 立刻换：收起动效不能挡住下一次弹出（否则旧定时器会把新气泡一起删掉） */
   if (_pmCloseTimer) { clearTimeout(_pmCloseTimer); _pmCloseTimer = null; }
   closePriceMenu(true);
@@ -6110,6 +6240,208 @@ function copyPrice(detail) {
     _copyText(num + ' — ' + RMB(f ? cents : _orderFinalCents(o)), '✅ 已复制价格');
   }
   closePriceMenu();
+}
+
+/* ── 订单明细「文件名」首页预览（v7.21）────────────────────────────────────
+   点文件名 → 取云端首页缩略图（经本地 /api/local/file_preview/<file_id>，带 X-Launch-Token）
+   → blob: 塞进 <img>（<img src> 带不了请求头，所以只能 fetch 成 blob；CSP 已补 blob:）。
+   Office 文档首次预览云端要现渲染（最长约 120s），先显示「正在生成预览…」占位。
+   浮层 fixed 贴住被点的文件名，滚动 / 滚轮 / 触控 / 点外部一律收起（和价格气泡同一套理由：
+   底表一滚，浮层就和它对着的那个文件名错位）。 */
+var _fpCloseTimer = null;
+var _fpSeq = 0;        /* 每次打开/翻页自增：慢响应回来时不许覆盖已经翻到的新页 */
+var _fpObjUrl = '';    /* 当前 blob: URL，收起时 revoke，防止反复点开攒着泄漏 */
+
+function _fpReleaseUrl() {
+  if (_fpObjUrl) {
+    try { URL.revokeObjectURL(_fpObjUrl); } catch (e) {}
+    _fpObjUrl = '';
+  }
+}
+function closeFilePreview(immediate) {
+  document.removeEventListener('click', _fpOutside, true);
+  _fpUnbindScroll();
+  var m = document.getElementById('fPrevMenu');
+  if (!m || !m.parentNode) { _fpReleaseUrl(); return; }
+  if (_fpCloseTimer) { clearTimeout(_fpCloseTimer); _fpCloseTimer = null; }
+  var drop = function () {
+    _fpCloseTimer = null;
+    if (m.parentNode) m.parentNode.removeChild(m);
+    _fpReleaseUrl();
+  };
+  if (immediate === true || !m.classList || _prefersReduced()) { drop(); return; }
+  if (!m.classList.contains('pm-closing')) m.classList.add('pm-closing');
+  /* 每次 close 都（重新）挂一个摘除定时器。旧写法在「已经 pm-closing 就 return」之前
+     先把上一个定时器清掉了 —— 二次 close（点 ✕ 的同时又滚动/点外部）会留下一个
+     去掉不掉的浮层：class 有 pm-closing、但没有定时器摘它，整块永久糊在屏幕上。
+     2026-11-19 由 verify_settlement_file_preview_ui.mjs 的 U8 逮到（偶发 1/6）。 */
+  _fpCloseTimer = setTimeout(drop, 130);
+}
+function _fpBindScroll() {
+  window.addEventListener('scroll', _fpOnScroll, true);
+  window.addEventListener('wheel', _fpOnSlide, { passive: true, capture: true });
+  window.addEventListener('touchmove', _fpOnSlide, { passive: true, capture: true });
+}
+function _fpUnbindScroll() {
+  window.removeEventListener('scroll', _fpOnScroll, true);
+  window.removeEventListener('wheel', _fpOnSlide, { passive: true, capture: true });
+  window.removeEventListener('touchmove', _fpOnSlide, { passive: true, capture: true });
+}
+function _fpOnScroll(ev) {
+  var m = document.getElementById('fPrevMenu');
+  if (!m) { _fpUnbindScroll(); return; }
+  if (ev && ev.target && m.contains && m.contains(ev.target)) return;
+  closeFilePreview();
+}
+function _fpOnSlide(ev) {
+  var m = document.getElementById('fPrevMenu');
+  if (!m) { _fpUnbindScroll(); return; }
+  if (ev && m.contains && m.contains(ev.target)) return;
+  closeFilePreview();
+}
+function _fpOutside(ev) {
+  var m = document.getElementById('fPrevMenu');
+  if (!m) { document.removeEventListener('click', _fpOutside, true); return; }
+  if (ev && m.contains(ev.target)) return;
+  closeFilePreview();
+}
+function _fpSetHint(m, text) {
+  var h = m.querySelector('.fp-hint');
+  if (!h) return;
+  h.textContent = text || '';
+  h.style.display = text ? 'flex' : 'none';
+}
+function _fpRenderBar(m, page, pages) {
+  var lbl = m.querySelector('.fp-page');
+  if (lbl) lbl.textContent = (pages > 1) ? ('第 ' + page + ' / ' + pages + ' 页') : ('第 ' + page + ' 页');
+  var prev = m.querySelector('.fp-prev'), next = m.querySelector('.fp-next');
+  if (prev) prev.disabled = (page <= 1);
+  if (next) next.disabled = (!pages || page >= pages);
+}
+/* 贴住被点的文件名：默认下方 8px；右侧/下方越界就翻到左侧、上方。
+   放大/还原会改整窗尺寸，所以单独抽出来，切尺寸后重新贴一次（v7.26.2）。 */
+function _fpPlace(m) {
+  var r = m._fpAnchor;
+  var x = r ? r.left : 12;
+  var y = r ? (r.bottom + 8) : 12;
+  var w = m.offsetWidth || 316, hh = m.offsetHeight || 380;
+  var below = true;
+  if (x + w > window.innerWidth - 10) x = Math.max(10, window.innerWidth - w - 10);
+  if (y + hh > window.innerHeight - 10) {
+    y = Math.max(10, ((r && r.top != null) ? r.top : y) - hh - 8);
+    below = false;
+  }
+  m.style.transformOrigin = below ? 'top left' : 'bottom left';
+  m.style.left = x + 'px';
+  m.style.top = y + 'px';
+}
+/* 放大 / 还原（v7.26.2）：只切 class 与按钮文案，图片本身不动 —— 翻页时保持当前缩放。 */
+function fpToggleZoom() {
+  var m = document.getElementById('fPrevMenu');
+  if (!m) return;
+  var on = !m.classList.contains('fp-zoom');
+  if (on) m.classList.add('fp-zoom'); else m.classList.remove('fp-zoom');
+  var b = m.querySelector('.fp-zoom-btn');
+  if (b) {
+    b.textContent = on ? '⤡ 还原' : '⤢ 放大';
+    b.title = on ? '恢复缩略尺寸' : '按原始像素放大查看（画质更好）';
+  }
+  _fpPlace(m);
+}
+/* 打开预览：rowKey 与价格气泡同一套（云端=order_id，外部=extrow-…），fileIdx 是明细下标 */
+function openFilePreview(ev, rowKey, fileIdx) {
+  ev = ev || window.event;
+  if (ev && ev.stopPropagation) ev.stopPropagation();
+  if (ev && ev.preventDefault) ev.preventDefault();
+  var o = _findOrderByRowKey(rowKey);
+  var idx = parseInt(fileIdx, 10);
+  var f = (o && o.files && idx >= 0) ? o.files[idx] : null;
+  if (!f || !f.file_id) { toast('❌ 这行没有可预览的云端文件（可能已被清理）', 'error'); return; }
+  /* 三个浮层互斥：别的先收，免得互相压住 / 抢 click 监听 */
+  closeOrderStatusMenu(); closeOrderTypeMenu(); closeOrderUserMenu(); closePriceMenu(true);
+  if (_fpCloseTimer) { clearTimeout(_fpCloseTimer); _fpCloseTimer = null; }
+  closeFilePreview(true);
+  var m = document.createElement('div');
+  m.id = 'fPrevMenu';
+  m._fpFile = f;
+  m._fpPage = 1;
+  m._fpPages = 0;
+  m._fpSeq = ++_fpSeq;
+  m.innerHTML = '<div class="fp-title" title="' + esc(f.file_name) + '">📄 ' + esc(f.file_name) + '</div>' +
+    '<div class="fp-stage" onclick="fpToggleZoom()"><img alt="预览" style="display:none" title="点击放大"><div class="fp-hint">正在生成预览…</div></div>' +
+    '<div class="fp-bar"><button type="button" class="fp-prev" onclick="fpGo(-1)">‹ 上一页</button>' +
+    '<span class="fp-page"></span>' +
+    '<button type="button" class="fp-next" onclick="fpGo(1)">下一页 ›</button>' +
+    '<button type="button" class="fp-zoom-btn" title="按原始像素放大查看（画质更好）" onclick="fpToggleZoom()">⤢ 放大</button>' +
+    '<button type="button" title="关闭" onclick="closeFilePreview()">✕</button></div>';
+  document.body.appendChild(m);
+  _fpRenderBar(m, 1, 0);
+  /* 贴住被点的文件名：默认下方 8px；右侧/下方越界就翻到左侧、上方（_fpPlace 负责，放大后重贴） */
+  m._fpAnchor = (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect)
+    ? ev.currentTarget.getBoundingClientRect()
+    : { left: (ev && ev.clientX) || 12, bottom: ((ev && ev.clientY) || 12) - 8 };
+  _fpPlace(m);
+  setTimeout(function () {
+    if (!m.parentNode) return;
+    document.addEventListener('click', _fpOutside, true);
+    _fpBindScroll();
+  }, 0);
+  _fpLoad(1);
+}
+function fpGo(delta) {
+  var m = document.getElementById('fPrevMenu');
+  if (!m) return;
+  var pages = m._fpPages || 0;
+  var p = (m._fpPage || 1) + delta;
+  if (p < 1) return;
+  if (pages && p > pages) return;
+  _fpLoad(p);
+}
+/* 取一页：成功换 <img>；403/404/415 把云端 message 原样给用户看；其它走通用失败文案。
+   seq 守卫针对「翻页比响应快」：旧响应回来时不覆盖新页。 */
+function _fpLoad(page) {
+  var m = document.getElementById('fPrevMenu');
+  if (!m) return;
+  var f = m._fpFile;
+  var seq = m._fpSeq = ++_fpSeq;
+  _fpSetHint(m, page > 1 ? ('正在生成第 ' + page + ' 页…') : '正在生成预览…');
+  var img = m.querySelector('.fp-stage img');
+  if (img) img.style.display = 'none';
+  // 2026-11-19：要 1024 档的 WebP（同尺寸比 JPEG 小 60%，而这张图既当 300px 缩略图
+  // 又当「放大」后的大图 —— 一份数据两种用法，省一次请求）。服务端编不出 WebP 会自动回 JPEG，
+  // 两种字节浏览器都认，所以这里不需要回退逻辑。
+  var url = '/api/local/file_preview/' + encodeURIComponent(f.file_id) +
+    '?page=' + page + '&size=z&fmt=webp';
+  fetch(url, { headers: { 'X-Launch-Token': LAUNCH_TOKEN } })
+    .then(function (res) {
+      if (!res.ok) {
+        return res.json().catch(function () { return {}; }).then(function (j) {
+          throw new Error((j && j.message) || ('预览不可用（HTTP ' + res.status + '）'));
+        });
+      }
+      var served = parseInt(res.headers.get('X-Preview-Page') || String(page), 10) || page;
+      var pages = parseInt(res.headers.get('X-Preview-Pages') || '0', 10) || 0;
+      return res.blob().then(function (blob) { return { blob: blob, page: served, pages: pages }; });
+    })
+    .then(function (r) {
+      if (!document.getElementById('fPrevMenu') || seq !== m._fpSeq) return;
+      _fpReleaseUrl();
+      _fpObjUrl = URL.createObjectURL(r.blob);
+      if (img) {
+        img.onload = function () { if (seq === m._fpSeq) _fpSetHint(m, ''); };
+        img.src = _fpObjUrl;
+        img.style.display = 'block';
+        if (img.complete && img.naturalWidth) _fpSetHint(m, '');
+      }
+      m._fpPage = r.page;
+      m._fpPages = r.pages || m._fpPages || page;
+      _fpRenderBar(m, m._fpPage, m._fpPages);
+    })
+    .catch(function (e) {
+      if (!document.getElementById('fPrevMenu') || seq !== m._fpSeq) return;
+      _fpSetHint(m, (e && e.message) || '预览不可用');
+      _fpRenderBar(m, m._fpPage || 1, m._fpPages || 0);
+    });
 }
 
 /* 成员映射 */
@@ -10863,6 +11195,22 @@ function renderAbout() {
     + '右侧给每个人「用了多少 → 该付多少」，末行是各人合计 —— 垫付人与应摊一目了然。'
     + '③ 每笔各自走整数分最大余数法，<b>Σ每人应摊 ≡ 采购合计</b>仍成立；耗材摊销行会带上所属打印机。'
     + '④ 历史月份的「按用量」数字会因此重算（与 v7.4 同性质），均摊口径不变。</p>' +
+    '<p style="margin-top:10px">v7.26.1：<b>订单明细三个气泡的手感统一</b> —— '
+    + '① 现场反馈：「类型」（接单 / 自打）与「用户」（归属人）两列的下拉气泡点开是「啪」地出现、'
+    + '点外部「啪」地消失，跟「金额」列的复制价格气泡不是一套手感。'
+    + '② 现在三者共用金额气泡那套动效：从被点的标签处展开（160ms 回弹），收起先播 130ms 淡出'
+    + '（淡出期间不吃点击），换气泡/松开手都不会叠出两个。'
+    + '③ 气泡之外滚动、滚轮、触控滑动都收起（与金额气泡同一套 capture 监听，内层表格滚动也收得到），'
+    + '在气泡内部滑动不收起（长名单还要能滚）。'
+    + '④ 同一标签再点一下仍是「收起」（toggle 保留），但正在收起的节点不算「开着」—— '
+    + '否则 130ms 内重新点标签会被误判成收起、反而打不开。</p>' +
+    '<p style="margin-top:10px">v7.26.2：<b>文件预览图可以放大了</b> —— '
+    + '① 现场反馈：订单明细里点文件名弹出的预览窗只有 300×300，写满公式/表格的扫描页根本看不清。'
+    + '② 现在预览窗底部多了「⤢ 放大」（点图片本身也行）：小舞台换成视口级大舞台（最大 1024×1024），'
+    + '图片按<b>原始像素</b>显示 —— 云端预览图本来就是长边 1024 生成，放大看到的是真细节，不是把小图撑糊。'
+    + '③ 大图超出窗口时可在预览窗内滚动查看（滚轮/触控滑动都行，不会被「滑动即收」误关），'
+    + '翻页时保持当前缩放；再点一次「⤡ 还原」回到缩略尺寸，窗口会重新贴住文件名不跑出屏幕。'
+    + '④ 收起仍是点 ✕ / 点窗外 / 页面滚动，与原来一致。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

@@ -14,7 +14,7 @@
  * 绝不发外网请求），Playwright 打开 settlement.html → 切「云端数据」→ 逐场景断言：
  *   ① 默认锁定：表头 🔒、行内无箭头/无点击入口；
  *   ② 密码错 → 仍锁定；默认密码 123456 → 仍锁定（服务端拒绝）；TEST_PWD → 🔓 且每行出现 ▾；
- *   ③ 点状态标签 → 菜单列出 5 个终态、当前项 ✓ 当前 且不可点；
+ *   ③ 点状态标签 → 菜单列出 6 个终态（v7.19 起含「超时」）、当前项 ✓ 当前 且不可点；
  *   ④ 选「打印失败」→ 真实 POST /api/proxy/admin/order_status（order_id + status），
  *      行内标签变「打印失败」、文件级状态一起变、云端收益记录 KPI 跟着少掉该单金额；
  *   ⑤ 点 🔓 锁定 → 箭头消失、菜单收起，锁定态点状态标签不弹菜单；
@@ -345,14 +345,14 @@ try {
     && caret.lhA === caret.lhB && caret.txt === '▾' && caret.overflow > 0,
     JSON.stringify(caret));
 
-  /* ── ③ 菜单：5 个终态 + 当前项标注 ───────────────────────────────────── */
+  /* ── ③ 菜单：6 个终态 + 当前项标注 ───────────────────────────────────── */
   await page.click('tr.order-row:nth-child(1) td:nth-child(5) .st-edit');
   await page.waitForSelector('#stMenu', { timeout: 3000 });
   s = await snap();
   chk('点状态标签弹出菜单', s.menu);
-  chk('菜单列出 5 个终态（已完成/失败/放弃打印/已取消/被打回，标签与其他列同一套 statusLabel）',
-    ['已完成', '失败', '放弃打印', '已取消', '被打回'].every((t) => s.menuItems.some((x) => x.indexOf(t) === 0)) &&
-    s.menuItems.length === 5, JSON.stringify(s.menuItems));
+  chk('菜单列出 6 个终态（已完成/失败/放弃打印/已取消/被打回/超时，标签与其他列同一套 statusLabel）',
+    ['已完成', '失败', '放弃打印', '已取消', '被打回', '超时'].every((t) => s.menuItems.some((x) => x.indexOf(t) === 0)) &&
+    s.menuItems.length === 6, JSON.stringify(s.menuItems));
   chk('菜单标明当前状态（✓ 当前）且该项不可点',
     s.menuCur.length === 1 && s.menuCur[0].includes('已完成') &&
     await page.evaluate(() => document.querySelector('#stMenu .st-menu-item.cur').disabled === true),
@@ -367,6 +367,28 @@ try {
   await page.waitForTimeout(250);
   chk('③b 再点同一个状态标签 → 菜单收起（旧写法只会重开、关不掉）',
     !(await page.$('#stMenu')));
+  await page.click('tr.order-row:nth-child(1) td:nth-child(5) .st-edit');
+  await page.waitForSelector('#stMenu', { timeout: 3000 });
+
+  /* ── ③c 与金额气泡同一套手感（2026-11-19 用户要求统一）：入场动效 / 气泡外滑动收起 ── */
+  const stMotion = await page.evaluate(() => {
+    const m = document.getElementById('stMenu');
+    const cs = getComputedStyle(m);
+    return { anim: cs.animationName, origin: m.style.transformOrigin || cs.transformOrigin };
+  });
+  chk('③c 订正气泡入场播 pmIn（与金额气泡同一套关键帧）', stMotion.anim === 'pmIn', JSON.stringify(stMotion));
+  chk('③c 气泡从触发点长出来（transformOrigin 已设）',
+    !!stMotion.origin && stMotion.origin !== 'none', JSON.stringify(stMotion));
+  await page.mouse.move(600, 520);
+  await page.mouse.wheel(0, 240);
+  await page.waitForTimeout(60);
+  const closing = await page.evaluate(() => {
+    const m = document.getElementById('stMenu');
+    return m ? m.classList.contains('st-closing') : null;
+  });
+  chk('③c 气泡之外滚动 → 先挂 st-closing 播收起动效（不是瞬间消失）', closing === true, String(closing));
+  await page.waitForTimeout(250);
+  chk('③c 收起动效结束后（130ms）节点真的从 DOM 移除', !(await page.$('#stMenu')));
   await page.click('tr.order-row:nth-child(1) td:nth-child(5) .st-edit');
   await page.waitForSelector('#stMenu', { timeout: 3000 });
 
@@ -409,6 +431,11 @@ try {
   chk('类型菜单没有底部那一长串说明（只留两项 + ✓当前）',
     !/只决定结算归类|不改打印状态/.test(
       await page.evaluate(() => (document.getElementById('tyMenu') || {}).textContent || '')));
+  chk('类型菜单与金额气泡同一套入场动效（pmIn + transformOrigin）',
+    await page.evaluate(() => {
+      const m = document.getElementById('tyMenu');
+      return getComputedStyle(m).animationName === 'pmIn' && !!m.style.transformOrigin;
+    }));
   await page.screenshot({ path: path.join(OUT_DIR, '04b-类型菜单.png') });
   await page.click(TYPE_SEL + ' .st-edit');
   await page.waitForTimeout(250);
@@ -532,7 +559,7 @@ try {
       itemCount: m.querySelectorAll('.st-menu-item').length,
     };
   });
-  chk('深色主题下菜单可见且 5 项齐全', dark.size !== '0x0' && dark.itemCount === 5, JSON.stringify(dark));
+  chk('深色主题下菜单可见且 6 项齐全', dark.size !== '0x0' && dark.itemCount === 6, JSON.stringify(dark));
   chk('深色主题下菜单不越出视口（贴边翻转逻辑生效）', dark.inside, JSON.stringify(dark));
   chk('深色主题下状态标签走深色配色（浅色 #E8F5E9 → 深色 rgba(129,199,132,.15)）',
     dark.sentBg === 'rgba(129, 199, 132, 0.15)', JSON.stringify(dark));

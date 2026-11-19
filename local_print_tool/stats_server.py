@@ -586,6 +586,18 @@ _PROXY_ALLOWED_TARGETS = frozenset({
     "/api/printer/devices/delete",
 })
 
+# ── 云端文件预览（收支清算「订单明细」点文件名看首页缩略图，v7.21）──
+# 这条**不走** _PROXY_ALLOWED_TARGETS：图片是二进制，而 /api/proxy 只透传 JSON 白名单字段
+# （_extract_proxy_body 会把 image/jpeg 吃成「云端响应格式错误」）。单独的本地路由：
+#   GET /api/local/file_preview/<file_id>?page=N  →  云端 /api/admin/file_preview/<id>?page=N
+_LOCAL_PREVIEW_PREFIX = "/api/local/file_preview/"
+# file_id 是云端 files.id（uuid 形态）；只放安全字符，防目录/查询串注入
+_LOCAL_PREVIEW_ID_RE = re.compile(r"^[0-9A-Za-z_-]{1,64}$")
+# 首屏渲染 Office 文档云端最长要 120 秒（app.py `_PREVIEW_OFFICE_TIMEOUT`），读超时给 135s。
+# 代理那 15s 只适合 JSON 小响应 —— 拿它发预览，点开 Word 会一律 502，而那正是最常见类型。
+_LOCAL_PREVIEW_TIMEOUT = (5, 135)
+_LOCAL_PREVIEW_MAX_BYTES = 8 * 1024 * 1024   # 预览图 ≤1024×1024 JPEG，正常 <300KB；超限当异常
+
 # ⑦ 所有响应都带的安全头；HTML 额外加 CSP。CSP 必须真的不把页面打坏：页面有内联
 # script/style（'unsafe-inline'）、Chart.js 本地文件（'self'）与 jsdelivr CDN 兜底
 # （显式放行该域名 —— **不要**为了 CSP 把 CDN 兜底删掉）。
@@ -598,7 +610,9 @@ _HTML_CSP = (
     "default-src 'self'; "
     "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
     "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: https:; "
+    # blob: 是订单明细缩略图的必需项：预览图必须带 X-Launch-Token 头才取得到，
+    # 所以页面用 fetch 取回 blob 再 createObjectURL 塞进 <img>（img 标签带不了请求头）。
+    "img-src 'self' data: blob: https:; "
     "connect-src 'self'; "
     "frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
 )
@@ -1935,6 +1949,10 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         if path == "/api/local/external_prints":
             return self._handle_local_external_prints(parsed.query)
 
+        # 云端文件预览图（订单明细点文件名看缩略图）—— 二进制通道，不进 /api/proxy
+        if path.startswith(_LOCAL_PREVIEW_PREFIX):
+            return self._handle_local_file_preview(path, parsed.query)
+
         # 默认：静态文件
         return self._serve_static(path)
 
@@ -2651,6 +2669,71 @@ class _StatsHandler(SimpleHTTPRequestHandler):
                                         getattr(self, "token", ""))
         self._send_json(build_external_prints_payload(
             items, simplex_price, duplex_price, owner_name, start_date, end_date))
+
+    def _handle_local_file_preview(self, path: str, query: str):
+        """云端文件预览图（订单明细点文件名 → 首页缩略图）：二进制**原样**转发。
+
+        页面在本地 stats_server 上，只知道启动令牌与 printer token：
+          · 页面用 fetch + X-Launch-Token 取 blob（<img src> 带不了请求头），
+            因此这条路由和别的 /api/* 一样只认启动令牌头，**没有** query 令牌后门；
+          · 出站走云端 /api/admin/file_preview/<id>（admin scope）+ X-Printer-Token
+            请求头（与 _proxy_get 同一套：绝不用 ?token=，否则 VPS access log 留凭据）。
+        回包：
+          · 200 image/jpeg 原样回，带上 X-Preview-Page / X-Preview-Pages（页面翻页用）；
+          · 403/404/415 把云端的 message 转成 JSON（图片自己解释不了错误，页面要靠它 toast）；
+          · 其它状态与网络异常一律 502。
+        为什么不走 /api/proxy：那条代理只透传 {success,message,data} 白名单字段
+        （_extract_proxy_body），图片会被吃成「云端响应格式错误」。
+        """
+        file_id = path[len(_LOCAL_PREVIEW_PREFIX):]
+        if not _LOCAL_PREVIEW_ID_RE.match(file_id or ""):
+            return self._send_json({"success": False, "message": "文件 id 不合法"}, 400)
+        if not (getattr(self, "api_url", "") or "") or not (getattr(self, "token", "") or ""):
+            return self._send_json({"success": False,
+                                    "message": "未连接云端，无法读取文件预览"}, 503)
+        qs = urllib.parse.parse_qs(query or "", keep_blank_values=True)
+        page = (qs.get("page", ["1"])[0] or "1").strip()
+        page = page if (page.isdigit() and 1 <= int(page) <= 999) else "1"
+        # 2026-11-19：分层尺寸 / 格式协商原样透传（白名单校验，避免把任意串拼进上行 URL）。
+        # 结算页缩略图只要 300px ⇒ ?size=t；「⤢ 放大」才要 ?size=z。
+        size = (qs.get("size", [""])[0] or "").strip().lower()
+        size = size if size in ("t", "p", "z") else ""
+        fmt = (qs.get("fmt", [""])[0] or "").strip().lower()
+        fmt = fmt if fmt in ("jpeg", "webp") else ""
+        url = "%s/api/admin/file_preview/%s?page=%s" % (self.api_url, file_id, page)
+        if size:
+            url += "&size=" + size
+        if fmt:
+            url += "&fmt=" + fmt
+        try:
+            resp = _get_proxy_session().get(url, timeout=_LOCAL_PREVIEW_TIMEOUT,
+                                            headers={"X-Printer-Token": self.token})
+        except Exception as e:                        # 不拼完整 URL / 不带异常文本
+            logger.error("云端文件预览请求失败 %s: %s", file_id, type(e).__name__)
+            return self._send_json({"success": False,
+                                    "message": "请求云端预览失败（%s）" % type(e).__name__}, 502)
+        ctype = str(resp.headers.get("Content-Type") or "")
+        if resp.status_code == 200 and ctype.startswith("image/"):
+            body = resp.content or b""
+            if len(body) > _LOCAL_PREVIEW_MAX_BYTES:
+                return self._send_json({"success": False, "message": "预览图异常（过大）"}, 502)
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", len(body))
+            for _h in ("X-Preview-Page", "X-Preview-Pages"):
+                _v = resp.headers.get(_h)
+                if _v:
+                    self.send_header(_h, _v)
+            # 不缓存：文件可能已被清理/重传，页面每次点开都按需取
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return self._write_body(body)
+        try:
+            msg = (resp.json() or {}).get("message") or ""
+        except Exception:
+            msg = ""
+        code = resp.status_code if resp.status_code in (403, 404, 415) else 502
+        self._send_json({"success": False, "message": msg or "云端没有返回预览图"}, code)
 
     def _handle_post_external_status(self):
         """POST /api/local/external_prints/status —— 外部监视单的订单状态订正。
