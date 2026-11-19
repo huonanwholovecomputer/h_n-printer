@@ -411,12 +411,15 @@ def main():
     # 原因：预热会在后台常驻 Office 进程（且旧实现用 Dispatch 会附着用户已打开的实例）；
     # 引擎可用性第一次真正需要时（选中 Word 文件重建下拉 / 转换前）才算，探测本身也不再碰 COM。
     # 需要预热的老办法仍可用：设置 HN_WARM_OFFICE=1（converter.start_*_warmup 会生效）。
-    from converter import start_word_warmup, stop_word_warmup, start_wps_warmup, stop_wps_warmup
+    from converter import (start_word_warmup, stop_word_warmup, start_wps_warmup,
+                           stop_wps_warmup, shutdown_office_pools)
     start_word_warmup()   # 默认 no-op（HN_WARM_OFFICE!=1）；显式设置时才预热
     start_wps_warmup()
     # 应用退出时清理预热实例（未预热时是 no-op）
     app.aboutToQuit.connect(stop_word_warmup)
     app.aboutToQuit.connect(stop_wps_warmup)
+    # 2026-11-19：转换实例池的常驻 Word/WPS 实例也要在退出时 Quit（否则留下孤儿进程）
+    app.aboutToQuit.connect(shutdown_office_pools)
 
     logger.info("HN 本地打印工具已启动")
     sys.exit(app.exec())

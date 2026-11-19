@@ -9,10 +9,12 @@ converter.py — 通用文件转换器 UniversalConverter
 
 from __future__ import annotations
 
+import atexit
 import base64
 import logging
 import os
 import platform
+import queue
 import re
 import shutil
 import subprocess
@@ -157,11 +159,15 @@ def should_sandbox(file_path: str, from_cloud: bool = False) -> bool:
     return (not from_cloud) and ext_of(file_path) in COM_OFFICE_EXTS and office_sandbox_enabled()
 
 
-def _harden_office_com_app(app, label: str) -> dict[str, bool]:
+def _harden_office_com_app(app, label: str, quiet: bool = False) -> dict[str, bool]:
     """在 `Documents.Open` **之前**把 Word / WPS 的 COM 实例收紧到「不执行宏、不弹窗、不更新链接」。
 
     返回 `{设置项: 是否真的生效}`，并把它写进日志 —— 属性在某种 Office 版本上不存在时
     不谎报成功（`try/except` 逐项记录）。调用方只需调用，不需要判断返回值。
+
+    `quiet=True` 只把结果日志降到 DEBUG：转换实例池里**每转一份文件都要重新收紧一次**
+    （常驻实例不等于可以放松），逐份刷 INFO 会把日志淹掉；真出错（属性取不到）仍走
+    `logger.warning`，不会被静音。
 
     WPS 的实际行为（如实记录，别在文档里夸大成"和 Word 完全一样"）：
       · `Visible` / `DisplayAlerts` —— WPS 的 COM 对象模型是 Word 的克隆，这两个一直可用；
@@ -207,10 +213,17 @@ def _harden_office_com_app(app, label: str) -> dict[str, bool]:
         logger.debug(f"{label}: Options.UpdateLinksAtOpen=False 未生效 ({e})")
 
     if all(applied.values()):
-        logger.info(f"{label} COM 安全设置已生效: {', '.join(applied)}")
+        if quiet:
+            logger.debug(f"{label} COM 安全设置已生效: {', '.join(applied)}")
+        else:
+            logger.info(f"{label} COM 安全设置已生效: {', '.join(applied)}")
     else:
-        logger.info(f"{label} COM 安全设置（部分属性该版本不支持）: "
-                    + ", ".join(f"{k}={'✓' if v else '✗'}" for k, v in applied.items()))
+        if quiet:
+            logger.debug(f"{label} COM 安全设置（部分属性该版本不支持）: "
+                         + ", ".join(f"{k}={'✓' if v else '✗'}" for k, v in applied.items()))
+        else:
+            logger.info(f"{label} COM 安全设置（部分属性该版本不支持）: "
+                        + ", ".join(f"{k}={'✓' if v else '✗'}" for k, v in applied.items()))
     return applied
 
 
@@ -656,7 +669,14 @@ def _convert_via_word_com(file_path: str, output_pdf: str) -> None:
     使用 Microsoft Word COM 将 .doc/.docx 文档转为 PDF。
     布局保真度最高 — 使用 Word 自身渲染引擎。
     操作临时副本，不干扰原文件。
+
+    默认交给「转换实例池」（见上方 _ComPool 说明）：复用常驻私有实例，省掉每份文件
+    一次 Office 冷启动。`HN_CONVERT_POOL=0` 时走下面的老路径（每文件新实例）。
     """
+    if _convert_pool_enabled():
+        _pool_convert("word", file_path, output_pdf)
+        return
+
     import pythoncom
     import win32com.client
 
@@ -719,7 +739,14 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
     """
     使用 WPS Office COM 将 .doc/.docx 文档转为 PDF。
     对中文文档排版兼容性好。
+
+    与 Word 同上：默认走转换实例池（常驻 WPS 实例循环复用）；`HN_CONVERT_POOL=0`
+    时走下面的老路径（每文件新实例）。
     """
+    if _convert_pool_enabled():
+        _pool_convert("wps", file_path, output_pdf)
+        return
+
     global _wps_progid
     import pythoncom
     import win32com.client
@@ -778,6 +805,316 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
                 os.remove(temp_input)
             except OSError:
                 pass
+
+
+# ============================================================
+# 转换实例池（2026-11-19）：复用常驻 Word / WPS COM 实例
+# ============================================================
+#
+# 为什么要池（现场实测，数字见 docs/本地打印工具_架构与管线.md「转换实例池」）：
+# 老实现每转一份文件就 `DispatchEx` 一个**新** Office 进程、转完 `Quit`。本机同一批
+# 6 份同模板文档：老路径总 9.08 s（1.37~1.66 s/份）；复用同一个私有实例循环
+# Open/Export/Close，同样 6 份只要 3.15 s（0.19~0.56 s/份）⇒ **瓶颈是进程冷启动，
+# 不是并发度**。28 份小文件：1 实例 9.65 s / 2 实例 6.62 s / 3 实例 6.08 s ——
+# 实例数超过 2 收益已经很小（还会各占一份内存），所以默认 2。
+#
+# 语义保证（与老路径逐条对齐，改这里之前先读完）：
+#   · 仍然只用 `DispatchEx` 私有实例 —— 绝不附着用户已打开的 Word/WPS（见 `_dispatch_ex`）；
+#   · **每次 `Documents.Open` 之前都重新收紧**（harden）—— 实例常驻不等于可以放松；
+#   · 单份转换失败 ⇒ 不拖垮实例；连续两次失败或实例已失联 ⇒ 该实例 Quit 后按需重建；
+#   · 空闲超过 `_convert_pool_idle_ttl()` 秒自动 Quit 退出，不长期占内存/句柄；
+#   · 进程退出（GUI aboutToQuit / 沙箱 worker 结束 / atexit）调 `shutdown_office_pools()`；
+#   · `HN_CONVERT_POOL=0` ⇒ 完全回到老路径（每文件新实例），现场回退用。
+
+# 单份文件在池里最长等多久；超时的实例标记为「卡死」不再派活（它会一直占着那个线程），
+# 由看门狗在调用方抛错，GUI 照旧降级到 LibreOffice。
+_POOL_JOB_TIMEOUT = 600.0
+
+
+def _convert_pool_enabled() -> bool:
+    """实例池开关：默认开；`HN_CONVERT_POOL=0/false/no/off` 回到「每文件新实例」。"""
+    env = (os.environ.get("HN_CONVERT_POOL") or "").strip().lower()
+    return env not in ("0", "false", "no", "off")
+
+
+def _convert_pool_size() -> int:
+    """每个引擎最多几个常驻实例（`HN_CONVERT_POOL_SIZE`，默认 2，夹在 1~4）。
+
+    为什么默认 2 而不是"有多少核开多少"：实测 28 份小文件 1/2/3 实例 = 9.65/6.62/6.08 s，
+    并行收益在 2 之后急剧衰减；而每个实例是一整个 Office 进程（几十~几百 MB），
+    在用户的打印前台机上是实打实的内存占用。
+    """
+    raw = (os.environ.get("HN_CONVERT_POOL_SIZE") or "").strip()
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 2
+    return max(1, min(4, n))
+
+
+def _convert_pool_idle_ttl() -> float:
+    """常驻实例空闲多久自动退出（`HN_CONVERT_POOL_IDLE`，默认 90 秒，夹在 5~600）。"""
+    raw = (os.environ.get("HN_CONVERT_POOL_IDLE") or "").strip()
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        v = 90.0
+    return max(5.0, min(600.0, v))
+
+
+class _PoolJob:
+    """池里的一件活：把 `src` 转成 `dst`。`done` 由执行线程置位，`error` 原样带回调用方。"""
+
+    __slots__ = ("src", "dst", "done", "error")
+
+    def __init__(self, src: str, dst: str):
+        self.src = src
+        self.dst = dst
+        self.done = threading.Event()
+        self.error: BaseException | None = None
+
+
+# 队列里的两种哨兵：停止（收尾）/ 预热（只建实例，不转文件）
+_STOP = object()
+_WARM = object()
+
+
+class _ComPoolWorker(threading.Thread):
+    """一个常驻的 Office COM 执行线程：本线程内 CoInitialize + 持有 app，串行干活。
+
+    COM 对象有线程套间亲和性，所以实例必须由**同一个线程**创建和使用 —— 这也是
+    "池"是一组线程而不是一组进程的原因（跨线程复用同一个 COM 指针会踩 marshal 坑）。
+    """
+
+    def __init__(self, engine: str, label: str, index: int):
+        super().__init__(daemon=True, name=f"com-pool-{engine}-{index}")
+        self.engine = engine
+        self.label = label
+        self._q: "queue.Queue" = queue.Queue()
+        self._app = None
+        self._busy = False
+        self._hung = False       # 单份任务超时 ⇒ 这个实例卡死了，别再派活给它
+        self._failures = 0       # 连续失败次数（成功一次就清零）
+
+    # ── 供池（主线程）读取的状态 ──
+    def load(self) -> int:
+        """当前负载 = 排队数 + 正在转（1）。用来挑最闲的实例。"""
+        return self._q.qsize() + (1 if self._busy else 0)
+
+    def usable(self) -> bool:
+        return (not self._hung) and self.is_alive()
+
+    def submit(self, job) -> None:
+        self._q.put(job)
+
+    def mark_hung(self) -> None:
+        self._hung = True
+
+    # ── 实例生命周期（只在本线程里调用）──
+    def _ensure_app(self):
+        if self._app is not None:
+            return self._app
+        app = _safe_word_dispatch() if self.engine == "word" else _safe_wps_dispatch()
+        self._app = app
+        self._failures = 0
+        logger.info(f"{self.label} 转换实例已常驻（池化复用，后续文件不再冷启动）")
+        return app
+
+    def _app_alive(self) -> bool:
+        """轻量探活：读一个属性。实例被系统回收/进程崩掉时这里会抛 com_error。"""
+        try:
+            _ = self._app.Name
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _reset_app(self) -> None:
+        """关掉当前实例（尽力而为）。下次拿到任务时按需重建。"""
+        app, self._app = self._app, None
+        if app is None:
+            return
+        try:
+            for i in range(int(app.Documents.Count), 0, -1):
+                try:
+                    app.Documents(i).Close(SaveChanges=0)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            app.Quit()
+            logger.info(f"{self.label} 转换实例已退出")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _convert_one(self, job: "_PoolJob") -> None:
+        """转一份文件。**必须在 Open 之前重新收紧实例**（宏在 Open 期间就会跑）。"""
+        app = self._app
+        temp_input = _copy_to_temp(job.src)
+        try:
+            _harden_office_com_app(app, self.label, quiet=True)
+            doc = app.Documents.Open(os.path.abspath(temp_input), ReadOnly=True)
+            try:
+                # ExportFormat=17 = wdExportFormatPDF
+                doc.ExportAsFixedFormat(os.path.abspath(job.dst), ExportFormat=17)
+            finally:
+                try:
+                    doc.Close(SaveChanges=0)
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            if os.path.isfile(temp_input):
+                try:
+                    os.remove(temp_input)
+                except OSError:
+                    pass
+
+    def run(self) -> None:
+        import pythoncom
+
+        pythoncom.CoInitialize()
+        try:
+            while True:
+                try:
+                    job = self._q.get(timeout=_convert_pool_idle_ttl())
+                except queue.Empty:
+                    logger.info(f"{self.label} 转换实例空闲 {_convert_pool_idle_ttl():.0f} 秒，"
+                                f"退出（下次转换按需重建）")
+                    break
+                if job is _STOP:
+                    break
+                if job is _WARM:
+                    try:
+                        self._ensure_app()
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug(f"{self.label} 池预热失败: {e}")
+                    continue
+                self._busy = True
+                try:
+                    self._ensure_app()
+                    self._convert_one(job)
+                    self._failures = 0
+                except Exception as e:  # noqa: BLE001
+                    job.error = e
+                    self._failures += 1
+                    # 单份坏文档不该拖垮池（连续失败阈值留一次容错）；
+                    # 但实例真的失联了（探活失败）必须立刻换一个。
+                    if self._failures >= 2 or not self._app_alive():
+                        self._reset_app()
+                finally:
+                    job.done.set()
+                    self._busy = False
+        finally:
+            self._reset_app()
+            _com_uninitialize_quietly()
+
+
+class _ComPool:
+    """按引擎（word / wps）分池；同一引擎内的实例数不超过 `_convert_pool_size()`。"""
+
+    def __init__(self, engine: str, label: str):
+        self.engine = engine
+        self.label = label
+        self._workers: list[_ComPoolWorker] = []
+        self._lock = threading.Lock()
+
+    def _dispatch(self, job) -> _ComPoolWorker:
+        """选一个实例并把任务放进它的队列（选+投必须原子，否则并发时都挑到同一个）。"""
+        with self._lock:
+            self._workers = [w for w in self._workers if w.usable()]
+            workers = self._workers
+            worker = None
+            # 优先复用空闲实例：串行拖一批文件时始终只有 1 个 Office 进程（现场 20~30 份的顺序批）。
+            for w in workers:
+                if w.load() == 0:
+                    worker = w
+                    break
+            if worker is None:
+                if len(workers) < _convert_pool_size():
+                    worker = _ComPoolWorker(self.engine, self.label, len(workers))
+                    worker.start()
+                    workers.append(worker)
+                else:
+                    worker = min(workers, key=lambda x: x.load())
+            worker.submit(job)
+            return worker
+
+    def submit_and_wait(self, src: str, dst: str) -> None:
+        """把一份文件交给池里的实例并等它转完（异常原样抛出）。"""
+        job = _PoolJob(src, dst)
+        worker = self._dispatch(job)
+        deadline = time.monotonic() + _POOL_JOB_TIMEOUT
+        while not job.done.wait(0.2):
+            if time.monotonic() > deadline:
+                worker.mark_hung()
+                raise RuntimeError(f"{self.label} 转换超时（{_POOL_JOB_TIMEOUT:.0f} 秒）")
+        if job.error is not None:
+            name = "Microsoft Word" if self.engine == "word" else "WPS Office"
+            raise RuntimeError(f"{name} 转换失败: {job.error}") from job.error
+
+    def warm(self) -> None:
+        """后台先把实例建好（只建实例，不转文件）。"""
+        try:
+            self._dispatch(_WARM)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def shutdown(self, timeout: float = 3.0) -> None:
+        with self._lock:
+            workers = [w for w in self._workers if w.usable()]
+            self._workers = []
+        for w in workers:
+            w.submit(_STOP)
+        end = time.monotonic() + timeout
+        for w in workers:
+            w.join(max(0.0, end - time.monotonic()))
+
+
+_pools: dict[str, _ComPool] = {}
+_pools_lock = threading.Lock()
+
+
+def _get_pool(engine: str) -> _ComPool:
+    with _pools_lock:
+        pool = _pools.get(engine)
+        if pool is None:
+            pool = _ComPool(engine, "Word" if engine == "word" else "WPS")
+            _pools[engine] = pool
+        return pool
+
+
+def _pool_convert(engine: str, file_path: str, output_pdf: str) -> None:
+    """把一份文件的转换交给常驻实例池，并同步等结果（异常原样抛出）。"""
+    _get_pool(engine).submit_and_wait(file_path, output_pdf)
+
+
+def warm_office_pool(engine: str) -> None:
+    """在后台把该引擎的常驻实例先建好（省掉第一个文件的冷启动）。
+
+    只建实例、不转文件；池关闭（`HN_CONVERT_POOL=0`）时是 no-op。
+    """
+    if not _convert_pool_enabled():
+        return
+    try:
+        _get_pool(engine).warm()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def shutdown_office_pools(timeout: float = 3.0) -> None:
+    """进程退出前收尾：让每个常驻实例 Quit。GUI aboutToQuit / 沙箱 worker 结束都要调。"""
+    with _pools_lock:
+        pools = list(_pools.values())
+        _pools.clear()
+    for pool in pools:
+        try:
+            pool.shutdown(timeout)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# 兜底：解释器退出时也尽量把常驻 Office 进程收掉（线程是 daemon，不能指望它们自己结束）。
+atexit.register(shutdown_office_pools)
 
 
 # ============================================================

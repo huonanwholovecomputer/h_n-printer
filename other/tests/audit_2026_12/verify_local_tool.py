@@ -488,8 +488,8 @@ check("AST 中不再存在 `if com_init == 0` 形式的判断",
               and any(isinstance(s, ast.Name) and s.id == "com_init" for s in ast.walk(n.test))
               for n in ast.walk(tree)))
 
-check(f"CoInitialize 调用数 = {n_ci}（2 处预热线程 + 5 处转换函数）", n_ci == 7, f"n_ci={n_ci}")
-check(f"_com_uninitialize_quietly 调用数 = {n_helper}（5 处配对）", n_helper == 5, f"n_helper={n_helper}")
+check(f"CoInitialize 调用数 = {n_ci}（2 处预热线程 + 5 处转换函数 + 1 处转换实例池线程）", n_ci == 8, f"n_ci={n_ci}")
+check(f"_com_uninitialize_quietly 调用数 = {n_helper}（5 处转换函数 + 1 处池线程）", n_helper == 6, f"n_helper={n_helper}")
 check(f"CoUninitialize 调用数 = {n_cu}（1 处 helper 内部 + 2 处预热线程）", n_cu == 3, f"n_cu={n_cu}")
 check(f"配对平衡：CoInitialize({n_ci}) == 预热配对(2) + helper 配对({n_helper})",
       n_ci == 2 + n_helper, f"{n_ci} vs {2 + n_helper}")
