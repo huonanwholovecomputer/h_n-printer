@@ -86,6 +86,7 @@ function loadRecentPage(opts) {
           },
         };
       }
+      if (p.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('unexpected require: ' + p);
     },
     Component: (c) => { cfg = c; },

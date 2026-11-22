@@ -156,6 +156,7 @@ function loadMiniProgram() {
         };
       }
       if (dep.indexOf('preview_viewer') >= 0) return PV_VIEWER_STUB;
+      if (dep.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {
@@ -705,6 +706,7 @@ function loadMiniProgramUserOrders() {
         };
       }
       if (dep.indexOf('preview_viewer') >= 0) return PV_VIEWER_STUB;
+      if (dep.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {

@@ -89,6 +89,18 @@ function _normalizeOrderRow(order) {
   return order
 }
 
+/* ===== 安卓物理返回键（唯一实现见 utils/back_guard.js）=====
+   这个数组就是「弹层栈」，**从上到下**：按返回先收预览/气泡，最后收整页弹窗，一次一层。
+   与 user-orders.wxml 末尾 <page-container> 的 show 表达式是两处清单，改一处必须同步另一处
+   （other/tests/verify_mp_back_guard.py 会核对两边标志集合一致、且每个收层方法真实存在）。
+   closing = 正在播退场动画的标志：连按返回时吞掉这次，不重复触发同一层的收尾。 */
+const backGuard = require('../../utils/back_guard')
+const BACK_LAYERS = [
+  { flag: 'pv.visible', close: 'onPvClose' },
+  { flag: 'fileDetailVisible', close: 'onCloseFileDetail', closing: 'fileDetailClosing' },
+  { flag: 'showPricePop', close: 'onClosePricePop' },
+]
+
 Component({
   properties: {
     openid:    { type: String, value: '' },
@@ -97,6 +109,8 @@ Component({
   },
 
   data: {
+    // 返回键守卫重挂闸（utils/back_guard.js）：程序性关容器同样会走 beforeleave，没有它一次返回会连关两层
+    backGuardHold: false,
     pv: { visible: false, url: '', urls: [], index: 0, count: 0, scale: 1, x: 0, y: 0, animating: false, failed: false },   // 全屏预览层状态（见 utils/preview_viewer.js）
     pageSlide: 'page-init',
     pageExit: '',
@@ -235,6 +249,10 @@ Component({
   },
 
   methods: {
+    // 安卓物理返回键 / 右滑手势：收掉最上层弹层；弹层都收完了就把返回交回页面栈（与 App 的 finish() 同口径）
+    onBackGuardLeave() {
+      return backGuard.leave(this, BACK_LAYERS)
+    },
     // 空handler：订单卡内的状态气泡（catchtouchmove）用它把手势终止在气泡层，
     // 不让事件冒泡到外层 .scroller 的 WXS 滚动引擎（气泡里是可滚的文本，不能带着页面一起滚）
     noop() {},

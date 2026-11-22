@@ -100,6 +100,7 @@ function loadMe() {
       if (dep.endsWith('utils/request')) {
         return { request: (opts) => { captured.lastOpts = opts; } };
       }
+      if (dep.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {

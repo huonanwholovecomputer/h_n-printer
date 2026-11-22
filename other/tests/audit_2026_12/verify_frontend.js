@@ -268,6 +268,7 @@ function runMiniProgram() {
       if (p.indexOf('utils/request') >= 0) {
         return { request: (opt) => { sandbox.__requests.push(opt); } };
       }
+      if (p.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('unexpected require: ' + p);
     },
     Page: (cfg) => { pageConfig = cfg; },

@@ -89,6 +89,7 @@ function runMiniProgram() {
       if (p.indexOf('utils/pages') >= 0) return __PAGES_EXPORTS;
       if (p.indexOf('utils/config') >= 0) return { CONFIG: { BASE_URL: 'https://example.test' } };
       if (p.indexOf('utils/request') >= 0) return { request: () => {} };
+      if (p.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('unexpected require: ' + p);
     },
     Page: (cfg) => { pageConfig = cfg; },

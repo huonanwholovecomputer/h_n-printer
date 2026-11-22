@@ -234,6 +234,7 @@ function loadRecentOrdersPage({ role = 'admin', token = 'tk' } = {}) {
         };
       }
       if (dep.indexOf('utils/price_copy') >= 0) return PRICE_COPY_MOD;
+      if (dep.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {
@@ -404,6 +405,7 @@ function loadMpMeJs() {
         };
       }
       if (dep.indexOf('utils/price_copy') >= 0) return PRICE_COPY_MOD;
+      if (dep.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('shim 未提供的 require: ' + dep);
     },
     wx: {

@@ -50,8 +50,20 @@ function _initialPerPage() {
   return PER_PAGE_OPTIONS.indexOf(saved) >= 0 ? saved : 20
 }
 
+/* ===== 安卓物理返回键（唯一实现见 utils/back_guard.js）=====
+   这个数组就是「弹层栈」，**从上到下**：按返回先收预览/气泡，最后收整页弹窗，一次一层。
+   与 recent-orders.wxml 末尾 <page-container> 的 show 表达式是两处清单，改一处必须同步另一处
+   （other/tests/verify_mp_back_guard.py 会核对两边标志集合一致、且每个收层方法真实存在）。
+   closing = 正在播退场动画的标志：连按返回时吞掉这次，不重复触发同一层的收尾。 */
+const backGuard = require('../../utils/back_guard')
+const BACK_LAYERS = [
+  { flag: 'showStatusPop', close: 'onCloseStatusPop' },
+]
+
 Component({
   data: {
+    // 返回键守卫重挂闸（utils/back_guard.js）：程序性关容器同样会走 beforeleave，没有它一次返回会连关两层
+    backGuardHold: false,
     pageSlide: 'page-init',
     pageExit: '',
     isDarkMode: wx.getStorageSync('isDarkMode') || false,
@@ -147,6 +159,10 @@ Component({
   },
 
   methods: {
+    // 安卓物理返回键 / 右滑手势：收掉最上层弹层；弹层都收完了就把返回交回页面栈（与 App 的 finish() 同口径）
+    onBackGuardLeave() {
+      return backGuard.leave(this, BACK_LAYERS)
+    },
     // ==================== WXS 滚动引擎（与 user-orders 同一套） ====================
     _initScrollEngine() {
       this._scrollerH = 0

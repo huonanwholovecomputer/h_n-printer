@@ -149,6 +149,7 @@ async function runMiniProgram() {
             createPollScheduler: () => ({ start() {}, stop() {}, isRunning() { return false; } }),
           };
         }
+        if (p.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
         throw new Error('unexpected require: ' + p);
       },
       Page: (cfg) => { pageConfig = cfg; },

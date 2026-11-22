@@ -918,3 +918,18 @@
 
 <!-- 全屏预览层：放在所有弹层之后，z-index 最高（模板内容固定在 page-root 外，position:fixed） -->
 <template is="previewViewer" data="{{pv: pv}}" />
+
+<!-- 安卓物理返回键守卫（唯一实现见 utils/back_guard.js）：隐形 page-container。
+     有弹层在就 show=true ⇒ 用户按返回只关容器、不动页面；beforeleave 里收掉最上层弹层再重新挂上。
+     show 表达式与 me.js 的 BACK_LAYERS 必须同步（verify_mp_back_guard.py 核对）。
+     容器透明 + pointer-events:none + z-index=1，压在 .modal-mask(1000) 之下，不挡任何点击。 -->
+<page-container
+  show="{{!backGuardHold && (pv.visible || cropVisible || fileDetailVisible || showStatusPop || showPricePop || showMyFiles || showConfirmModal || showNicknameInput || showNicknamePicker)}}"
+  duration="0"
+  z-index="1"
+  overlay="{{false}}"
+  custom-style="background: transparent; pointer-events: none;"
+  bind:beforeleave="onBackGuardLeave"
+>
+  <view class="back-guard-sentinel"></view>
+</page-container>

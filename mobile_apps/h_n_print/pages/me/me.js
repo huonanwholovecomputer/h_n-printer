@@ -133,8 +133,28 @@ function _fmtStatusTime(v) {
    本文件不再保留第二份：PRICE_DASH / _money / _chargeUnitsOf / _calcCostFormula 均已删除。
    页面这边只负责气泡定位、深层剪贴板调用与按钮状态。 */
 
+/* ===== 安卓物理返回键（唯一实现见 utils/back_guard.js）=====
+   这个数组就是「弹层栈」，**从上到下**：按返回先收预览/气泡，最后收整页弹窗，一次一层。
+   与 me.wxml 末尾 <page-container> 的 show 表达式是两处清单，改一处必须同步另一处
+   （other/tests/verify_mp_back_guard.py 会核对两边标志集合一致、且每个收层方法真实存在）。
+   closing = 正在播退场动画的标志：连按返回时吞掉这次，不重复触发同一层的收尾。 */
+const backGuard = require('../../utils/back_guard')
+const BACK_LAYERS = [
+  { flag: 'pv.visible', close: 'onPvClose' },
+  { flag: 'cropVisible', close: 'onCropCancel' },
+  { flag: 'fileDetailVisible', close: 'onCloseFileDetail', closing: 'fileDetailClosing' },
+  { flag: 'showStatusPop', close: 'onCloseStatusPop' },
+  { flag: 'showPricePop', close: 'onClosePricePop' },
+  { flag: 'showMyFiles', close: 'onCloseMyFiles', closing: 'myFilesClosing' },
+  { flag: 'showConfirmModal', close: 'onCancelConfirm', closing: 'modalClosing' },
+  { flag: 'showNicknameInput', close: 'onCancelCustomNickname', closing: 'modalClosing' },
+  { flag: 'showNicknamePicker', close: 'onCancelNicknamePicker', closing: 'modalClosing' },
+]
+
 Component({
   data: {
+    // 返回键守卫重挂闸（utils/back_guard.js）：程序性关容器同样会走 beforeleave，没有它一次返回会连关两层
+    backGuardHold: false,
     pv: { visible: false, url: '', urls: [], index: 0, count: 0, scale: 1, x: 0, y: 0, animating: false, failed: false },   // 全屏预览层状态（见 utils/preview_viewer.js）
     nickname: '',
     avatarUrl: '',
@@ -481,6 +501,10 @@ Component({
     },
   },
   methods: {
+    // 安卓物理返回键 / 右滑手势：收掉最上层弹层；弹层都收完了就把返回交回页面栈（与 App 的 finish() 同口径）
+    onBackGuardLeave() {
+      return backGuard.leave(this, BACK_LAYERS)
+    },
     // 由 tabBar 调用：退出动画 → 回调中切换页面
     // 弹窗打开时：播放关闭动画 → 关闭弹窗 + 切换 tab（一气呵成）
     animateExit(direction) {

@@ -172,8 +172,31 @@ const PREVIEW_DOC_TYPES = { pdf: 'pdf', doc: 'doc', docx: 'docx', xls: 'xls', xl
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024
 const PREVIEW_MAX_CHARS = 20000
 
+/* ===== 安卓物理返回键（唯一实现见 utils/back_guard.js）=====
+   这个数组就是「弹层栈」，**从上到下**：按返回先收预览/气泡，最后收整页弹窗，一次一层。
+   与 index.wxml 末尾 <page-container> 的 show 表达式是两处清单，改一处必须同步另一处
+   （other/tests/verify_mp_back_guard.py 会核对两边标志集合一致、且每个收层方法真实存在）。
+   closing = 正在播退场动画的标志：连按返回时吞掉这次，不重复触发同一层的收尾。 */
+const backGuard = require('../../utils/back_guard')
+const BACK_LAYERS = [
+  { flag: 'showPreview', close: 'onClosePreview' },
+  { flag: 'showSuccessModal', close: 'onCloseModal', closing: 'modalClosing' },
+  { flag: 'showAccessDeniedModal', close: 'onBackCloseAccessDenied', closing: 'modalClosing' },
+  { flag: 'showScheduleDayPicker', close: 'onCloseScheduleDayPicker', closing: 'modalClosing' },
+  { flag: 'showScheduleTimePicker', close: 'onCloseScheduleTimePicker', closing: 'modalClosing' },
+  { flag: 'showScheduleCountdownPicker', close: 'onCloseScheduleCountdownPicker', closing: 'modalClosing' },
+  { flag: 'showRangePicker', close: 'onCloseRangePicker', closing: 'rangePickerClosing' },
+  { flag: 'showPageCountWarning', close: 'onCancelForceSubmit', closing: 'modalClosing' },
+  { flag: 'showUnsupportedSkipModal', close: 'onCancelSkipUnsupported', closing: 'modalClosing' },
+  { flag: 'showPrivacyNotice', close: 'onClosePrivacyNotice', closing: 'privacyNoticeClosing' },
+  { flag: 'privacySheetVisible', close: 'onClosePrivacySheet', closing: 'privacySheetClosing' },
+  { flag: 'deviceOrderVisible', close: 'onCloseDeviceOrderSheet', closing: 'deviceOrderClosing' },
+]
+
 Component({
   data: {
+    // 返回键守卫重挂闸（utils/back_guard.js）：程序性关容器同样会走 beforeleave，没有它一次返回会连关两层
+    backGuardHold: false,
     // 多文件列表：每项 { name, size, path, fileId, uploading, progress, failed, copies }
     selectedFiles: [],
     duplex: 'on',
@@ -510,6 +533,15 @@ Component({
     },
   },
   methods: {
+    // 安卓物理返回键 / 右滑手势：收掉最上层弹层；弹层都收完了就把返回交回页面栈（与 App 的 finish() 同口径）
+    onBackGuardLeave() {
+      return backGuard.leave(this, BACK_LAYERS)
+    },
+    // 返回键专用：只收起「设备未授权」弹窗，**不跳**「我」页
+    // （onAccessDeniedConfirm 会 switchTab，那是点按钮的口径，不是按返回的口径）
+    onBackCloseAccessDenied() {
+      this.setData({ showAccessDeniedModal: false, modalClosing: false })
+    },
     // 由 tabBar 调用：退出动画 → 回调中切换页面
     // 弹窗打开时：播放关闭动画 → 关闭弹窗 + 切换 tab（一气呵成）
     animateExit(direction) {

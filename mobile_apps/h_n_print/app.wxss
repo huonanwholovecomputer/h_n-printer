@@ -1327,3 +1327,13 @@ page {
   70%  { box-shadow: 0 0 0 10rpx rgba(0, 122, 255, 0); }
   100% { box-shadow: 0 0 0 0 rgba(0, 122, 255, 0); }
 }
+
+/* 返回键守卫（唯一实现见 utils/back_guard.js）：<page-container> 里那 1rpx 透明占位。
+   容器本身在 custom-style 里已置 background:transparent + pointer-events:none，
+   这里只是保证占位节点不带任何尺寸/视觉/命中区域，别删（删了容器内空节点行为随版本浮动）。 */
+.back-guard-sentinel {
+  width: 1rpx;
+  height: 1rpx;
+  background: transparent;
+  pointer-events: none;
+}

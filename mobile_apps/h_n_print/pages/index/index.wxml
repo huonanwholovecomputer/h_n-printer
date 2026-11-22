@@ -743,3 +743,18 @@
     </view>
   </view>
 </view>
+
+<!-- 安卓物理返回键守卫（唯一实现见 utils/back_guard.js）：隐形 page-container。
+     有弹层在就 show=true ⇒ 用户按返回只关容器、不动页面；beforeleave 里收掉最上层弹层再重新挂上。
+     show 表达式与 index.js 的 BACK_LAYERS 必须同步（verify_mp_back_guard.py 核对）。
+     容器透明 + pointer-events:none + z-index=1，压在 .modal-mask(1000) 之下，不挡任何点击。 -->
+<page-container
+  show="{{!backGuardHold && (showPreview || showSuccessModal || showAccessDeniedModal || showScheduleDayPicker || showScheduleTimePicker || showScheduleCountdownPicker || showRangePicker || showPageCountWarning || showUnsupportedSkipModal || showPrivacyNotice || privacySheetVisible || deviceOrderVisible)}}"
+  duration="0"
+  z-index="1"
+  overlay="{{false}}"
+  custom-style="background: transparent; pointer-events: none;"
+  bind:beforeleave="onBackGuardLeave"
+>
+  <view class="back-guard-sentinel"></view>
+</page-container>

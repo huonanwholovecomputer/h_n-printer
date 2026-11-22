@@ -88,6 +88,7 @@ function loadPage() {
       if (p.indexOf('utils/request') >= 0) {
         return { request: (opts) => { box.requests.push(opts); } };
       }
+      if (p.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('unexpected require: ' + p);
     },
     Page: (cfg) => { pageConfig = cfg; },

@@ -116,6 +116,7 @@ function loadMePage() {
       if (p.indexOf('utils/pages') >= 0) return { countPagesInRange: () => 1 };
       if (p.indexOf('utils/price_copy') >= 0) return PRICE_COPY_MOD;
       if (p.indexOf('utils/avatar_crop') >= 0) return {};
+      if (p.indexOf('back_guard') >= 0) return { leave() { return false; }, closeTopLayer() { return false; } };
       throw new Error('unexpected require: ' + p);
     },
     Component: (c) => { cfg = c; },
