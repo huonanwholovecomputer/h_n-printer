@@ -176,9 +176,18 @@ def _convert_slots() -> threading.Semaphore:
 # 无障碍自动打印的防抖窗口（毫秒）。同一订单的文件是**逐个下载完成**推送的，间隔可达数秒；
 # 原来的 3000ms 会被"击穿"——每批先到的文件立即被当成整单处理并把队列 pop 清空
 # （🔴-B4-2 现场实测：订单 #535 的 11 个文件分 7 批打印、同一订单号被上报 4 次）。
-# 这是客户端能做的缓解；**根治**需后端在 push/accept 响应里下发订单级 file_count，
-# 由客户端按"已到 / 总数"判定整单到齐（见 docs/修复计划_2026-10.md 批次 E）。
+# 这是客户端能做的缓解；**更彻底的判据**是「本机已收到但还没 ready 的同订单任务」
+# （`_auto_print_order_downloads_pending` + AUTO_PRINT_ORDER_SETTLE_MS，2026-11-23 见下）。
 AUTO_PRINT_DEBOUNCE_MS = 8000
+
+# 无障碍订单「等齐再打」的上限（毫秒）：同一订单的文件下载完成时间可能相差几十秒
+# （2026-11-23 现场 HN20261122-0024：3 个文件同时推送，ready 分别是 22:00:33 / 22:01:03 /
+# 22:01:08 —— 第一个文件就绪 8 秒后防抖到期，只拿 Turtle 一个文件建页开打，剩下两个
+# 实验报告 30 秒后才到，于是同一订单被劈成两批、多翻一次纸、多建一个首页）。
+# 本地能看到的「整单到齐」证据只有：本机已收到但还没 ready 的同订单任务
+# （`_auto_print_order_downloads_pending`）。等它们全部 ready 再一次性建页开打；
+# 文件一直下不下来也不能无限等 —— 超过这个上限就按已就绪的文件先打。
+AUTO_PRINT_ORDER_SETTLE_MS = 180000
 
 # ---- 标签页选择器几何口径（2026-10）----
 # 需求：**无论有没有状态图标，−/＋ 按钮的位置都不许动**。
@@ -8372,6 +8381,9 @@ class MainWindow(QMainWindow):
         # 无障碍打印：按订单收集自动任务，防抖后批量创建标签页并自动开始打印
         self._auto_print_queue: dict[int, list[CloudTask]] = {}  # order_id → tasks
         self._auto_print_timers: dict[int, QTimer] = {}          # order_id → debounce timer
+        # 2026-11-23 现场 HN20261122-0024：订单级「等文件下载完」的起点（order_id → monotonic），
+        # 只用来给 `_auto_print_order_downloads_pending` 算是否已等满 AUTO_PRINT_ORDER_SETTLE_MS。
+        self._auto_print_settle_since: dict[int, float] = {}
         # 无障碍打印预约单（指定时间/倒计时）：到点才自动打印的状态机
         # order_id → {
         #   "target_ts": int,          # 预约起点 epoch（来自任务 scheduled_ts）
@@ -22814,14 +22826,60 @@ class MainWindow(QMainWindow):
             pass
         return False
 
+    def _auto_print_order_downloads_pending(self, order_id) -> list:
+        """该订单是否还有文件没下载完（任务已收到、状态仍是 pending/downloading）。
+
+        2026-11-23 现场 HN20261122-0024（闫承翰 / 3 个文件 / 全双面 / 需人工翻纸）：
+        #3216/#3217/#3218 三个任务同时推送，但下载完成时间差 30 秒（22:00:33 / 22:01:03 /
+        22:01:08）。旧逻辑只要第一个文件 ready 就起 8 秒防抖，到点只拿这 1 个文件建标签页
+        并开打，另两个 30 秒后才就绪、又各自建页 ⇒ 同一订单被劈成两批（多翻一次纸）。
+        本机唯一能判断「整单到齐」的依据就是这里：`_cloud_tasks` 里同订单还有没 ready 的任务。
+        返回这部分任务（非空 = 先别抢跑）；超过 AUTO_PRINT_ORDER_SETTLE_MS 则放行并留日志。
+        """
+        if not order_id:
+            return []
+        try:
+            waiting = [
+                t for t in (getattr(self, "_cloud_tasks", None) or {}).values()
+                if getattr(t, "order_id", None) == order_id
+                and getattr(t, "status", "") in ("pending", "downloading")
+                and getattr(t, "task_id", 0) not in self._processed_cloud_tasks
+            ]
+        except (AttributeError, RuntimeError):
+            return []
+        if not waiting:
+            try:
+                self._auto_print_settle_since.pop(order_id, None)
+            except (AttributeError, RuntimeError):
+                pass
+            return []
+        now = time.monotonic()
+        try:
+            since = self._auto_print_settle_since.get(order_id)
+            if since is None:
+                self._auto_print_settle_since[order_id] = now
+                self._log(f"⚡ 订单 #{order_id}：还有 {len(waiting)} 个文件没下载完，"
+                          f"等齐再一次性建页开打（最多等 {AUTO_PRINT_ORDER_SETTLE_MS // 60000} 分钟）")
+            elif (now - since) * 1000.0 >= AUTO_PRINT_ORDER_SETTLE_MS:
+                self._auto_print_settle_since.pop(order_id, None)
+                self._log(f"⚠ 订单 #{order_id}：等文件下载超过 {AUTO_PRINT_ORDER_SETTLE_MS // 60000} 分钟，"
+                          f"先用已就绪的文件开打")
+                return []
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        return waiting
+
     def _auto_print_order_still_collecting(self, order_id) -> bool:
-        """同一订单是否还有文件在无障碍防抖队列里等批量入页（正常 ≤ AUTO_PRINT_DEBOUNCE_MS）。
+        """同一订单是否还有文件在收集（防抖队列里等批量入页，或还没下载完）。
 
         2026-11-18 现场 HN20261118-0051（订单 #1451 / 3 个文件 / 全双面 / 需人工翻纸）：
         21:11:58 第一个文件就绪并起 8 秒防抖，21:12:06 防抖到期时只有它一个文件；
         21:12:07 就绪的第二个文件把防抖重置到 21:12:17 —— 可中间 21:12:09 重试队列的抽水
         看到「标签页里已经有 job」就开打了，于是这单被劈成两批：先 1 个文件 6 张纸，
         另 2 个文件 5 张纸等下一轮收尾再打，整单多翻一次纸、spooler 里多两个作业。
+
+        2026-11-23 HN20261122-0024 补上另一半：文件**还没下载完**时根本不在防抖队列里，
+        只查 `_auto_print_queue` 会漏（现场第一个文件到点就开打，另两个还在下载）。
 
         抽水 / 排空都必须先问这一句：**同一订单还在收集文件就别抢跑**，等防抖把其余文件
         并进同一标签页（`_find_tab_for_order` 会复用）后由 `_process_auto_print_order`
@@ -22830,9 +22888,11 @@ class MainWindow(QMainWindow):
         if not order_id:
             return False
         try:
-            return bool(self._auto_print_queue.get(order_id))
+            if self._auto_print_queue.get(order_id):
+                return True
         except (AttributeError, RuntimeError):
             return False
+        return bool(self._auto_print_order_downloads_pending(order_id))
 
     def _pump_auto_print_retry(self) -> None:
         """定时抽水：能打就打；此刻打不了（打印中 / 页数还在统计）就 2 秒后再来一次。
@@ -23360,11 +23420,23 @@ class MainWindow(QMainWindow):
             # 无障碍打印任务出错：从队列中移除（并解除这些任务的"已入队"守卫，
             # 否则同一 task_id 重新推送 ready 时会被幂等守卫误拦、再也打不出来）
             if task.auto_print and task.order_id:
-                for _t in self._auto_print_queue.pop(task.order_id, []):
-                    self._enqueued_cloud_tasks.discard(_t.task_id)
-                t = self._auto_print_timers.pop(task.order_id, None)
-                if t:
-                    t.stop()
+                # 2026-11-23：等齐窗口最长 AUTO_PRINT_ORDER_SETTLE_MS，期间某个文件下载
+                # 失败不能把同订单**已就绪的其它文件**一起丢掉（旧写法整组 pop）。只剔除
+                # 失败的那个，剩下的留在队列里续 timer 继续等/打。
+                _left = [t for t in self._auto_print_queue.get(task.order_id, [])
+                         if t.task_id != task.task_id]
+                self._enqueued_cloud_tasks.discard(task.task_id)
+                if _left:
+                    self._auto_print_queue[task.order_id] = _left
+                    _tm = self._auto_print_timers.get(task.order_id)
+                    if _tm is not None:
+                        _tm.start(AUTO_PRINT_DEBOUNCE_MS)
+                else:
+                    for _t in self._auto_print_queue.pop(task.order_id, []):
+                        self._enqueued_cloud_tasks.discard(_t.task_id)
+                    t = self._auto_print_timers.pop(task.order_id, None)
+                    if t:
+                        t.stop()
         elif task.status == "ready":
             # 「下载完成」那行同样由 cloud_client 输出（带文件名/字节数/⚡无障碍），此处不再重复。
             if task.auto_print:
@@ -23405,6 +23477,19 @@ class MainWindow(QMainWindow):
 
     def _process_auto_print_order(self, order_id: int):
         """防抖定时器触发：收集该订单全部就绪任务，创建标签页并自动开始打印。"""
+        # 2026-11-23 现场 HN20261122-0024：防抖到期时同订单还有文件在下载（另两个 task
+        # 30 秒后才 ready）⇒ 此时建页开打会把整单劈成两批。先不 pop、只续 timer，
+        # 等齐（或超过 AUTO_PRINT_ORDER_SETTLE_MS）再进来一次性建页。
+        if self._auto_print_order_downloads_pending(order_id):
+            timer = self._auto_print_timers.get(order_id)
+            if timer is None:
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(lambda o=order_id: self._process_auto_print_order(o))
+                self._auto_print_timers[order_id] = timer
+            timer.start(AUTO_PRINT_DEBOUNCE_MS)
+            return
+
         tasks = self._auto_print_queue.pop(order_id, [])
         self._auto_print_timers.pop(order_id, None)
         # 出队即解除"已入队"守卫，随后由 _processed_cloud_tasks 接管（见 _enqueue_auto_print_task）

@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -75,6 +76,7 @@ class CloudStub:
         self.accepted = []
         self.success = []
         self.failed = []
+        self.rejected = []
 
     def accept_order_to_server(self, order_id):
         self.accepted.append(order_id)
@@ -85,6 +87,9 @@ class CloudStub:
 
     def report_fail(self, task_id, reason=""):
         self.failed.append((task_id, reason))
+
+    def reject_task(self, task_id):
+        self.rejected.append(task_id)
 
     def abandon_order_to_server(self, *a, **kw):
         pass
@@ -252,6 +257,97 @@ check("★ 标签页没有被标记「待人工翻纸」（不该亮 ⏸ 等人�
 check("★ 日志如实说明「直接开始第 1 趟、第 2 趟仍等翻纸确认」",
       any("直接开始第 1 趟" in m for m in win6._log_text.toPlainText().splitlines()),
       win6._log_text.toPlainText()[-160:])
+
+print("\n=== 8. 2026-11-23 现场 HN20261122-0024：同订单还有文件在下载 ⇒ 等齐再一次性建页 ===")
+# 三个任务同时推送、下载完成时间差 30 秒（22:00:33 / 22:01:03 / 22:01:08）：旧逻辑第一个
+# 文件 ready 就起 8 秒防抖，到点只拿它建页开打，另两个 30 秒后才到 ⇒ 同一订单被劈成两批
+# （多翻一次纸、多一个首页/标签页）。修法：`_cloud_tasks` 里同订单还有 pending/downloading
+# 的任务时，`_process_auto_print_order` 只续 timer、不 pop、不建页。
+win8 = new_win()
+_started8 = []
+
+
+def _start8(jobs, **kw):
+    _started8.append([j.task_id for j in jobs])
+    return True
+
+
+win8._start_print_worker = _start8
+_t_ready = FakeTask(3218, 1583)                      # Turtle，22:00:33 就绪
+_t_dl1 = FakeTask(3217, 1583, status="downloading")  # 实验报告，22:01:03 才就绪
+_t_dl2 = FakeTask(3216, 1583, status="downloading")  # 实验报告(2)(2)，22:01:08 才就绪
+win8._cloud_tasks = {3218: _t_ready, 3217: _t_dl1, 3216: _t_dl2}
+win8._enqueue_auto_print_task(_t_ready)
+check("还有 2 个文件在下载 ⇒ 判为「整单还在收集」",
+      win8._auto_print_order_still_collecting(1583) is True)
+win8._process_auto_print_order(1583)
+check("防抖到期也不抢跑（没有建页 / 没有 accept / 没有开打）",
+      win8._cloud_client.accepted == [] and _started8 == [],
+      f"accepted={win8._cloud_client.accepted} started={_started8}")
+check("已就绪的那个文件仍留在收集队列里（不 pop）",
+      len(win8._auto_print_queue.get(1583, [])) == 1,
+      f"{len(win8._auto_print_queue.get(1583, []))}")
+check("防抖 timer 已续上（等下载完再来一次）",
+      win8._auto_print_timers.get(1583) is not None
+      and win8._auto_print_timers[1583].isActive())
+
+_t_dl1.status = "ready"
+_t_dl2.status = "ready"
+win8._enqueue_auto_print_task(_t_dl1)
+win8._enqueue_auto_print_task(_t_dl2)
+win8._process_auto_print_order(1583)
+check("三个文件齐了 ⇒ 只 accept 一次、只开打一次",
+      win8._cloud_client.accepted == [1583] and len(_started8) == 1,
+      f"accepted={win8._cloud_client.accepted} started={_started8}")
+check("同一批带上全部 3 个文件（不再劈成两批）",
+      sorted(_started8[0]) == [3216, 3217, 3218],
+      f"{_started8}")
+
+# 下载一直不完成 → 不能让订单无限等：超过 AUTO_PRINT_ORDER_SETTLE_MS 就按已就绪的先打
+win8b = new_win()
+_started8b = []
+win8b._start_print_worker = lambda jobs, **kw: (_started8b.append([j.task_id for j in jobs]) or True)
+_tr = FakeTask(4001, 9001)
+_tdl = FakeTask(4002, 9001, status="downloading")
+win8b._cloud_tasks = {4001: _tr, 4002: _tdl}
+win8b._enqueue_auto_print_task(_tr)
+win8b._auto_print_settle_since[9001] = time.monotonic() - (
+    gui.AUTO_PRINT_ORDER_SETTLE_MS / 1000.0 + 1.0)
+win8b._process_auto_print_order(9001)
+check("等下载超过上限 ⇒ 按已就绪的文件先打（不无限等）",
+      _started8b == [[4001]], f"{_started8b}")
+check("日志说明「先用已就绪的文件开打」",
+      any("先用已就绪的文件开打" in m
+          for m in win8b._log_text.toPlainText().splitlines()),
+      win8b._log_text.toPlainText()[-200:])
+
+for _w in (win8, win8b):
+    try:
+        _w.close()
+    except Exception:
+        pass
+
+# 等齐窗口里某个文件下载失败：不能把同订单已就绪的其它文件一起丢掉（旧写法整组 pop）
+win8c = new_win()
+_started8c = []
+win8c._start_print_worker = lambda jobs, **kw: (_started8c.append([j.task_id for j in jobs]) or True)
+_ok1 = FakeTask(5001, 9101)
+_bad = FakeTask(5002, 9101, status="downloading")
+win8c._cloud_tasks = {5001: _ok1, 5002: _bad}
+win8c._enqueue_auto_print_task(_ok1)
+_bad.status = "error"
+_bad.error_message = "模拟下载失败"
+win8c._on_cloud_task_updated(_bad)
+check("一个文件下载失败后，已就绪的另一个仍留在队列里",
+      [t.task_id for t in win8c._auto_print_queue.get(9101, [])] == [5001],
+      f"{[t.task_id for t in win8c._auto_print_queue.get(9101, [])]}")
+win8c._process_auto_print_order(9101)
+check("已就绪的文件照常打出来（不因同单另一个失败而丢单）",
+      _started8c == [[5001]], f"{_started8c}")
+try:
+    win8c.close()
+except Exception:
+    pass
 
 print("\n" + ("全部通过" if ok_all else "存在失败项"))
 shutil.rmtree(_SANDBOX, ignore_errors=True)
