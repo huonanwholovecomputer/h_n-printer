@@ -523,6 +523,61 @@ check("★ 关窗算跳过的态里**没有** prev2（等上一批出纸时关�
       "pass1" in _names and "prev2" not in _names and "remedy_pass2" not in _names,
       f"{_names}")
 
+
+# ============================================================
+# ⑥ 2026-11-22 现场补齐：闸门覆盖**所有**路径 / 双击尾击 / 确认态收窗
+# ============================================================
+print("\n=== ⑥ 全路径闸门 + 双击尾击 + 确认态收窗 ===")
+
+_i_run_gate = GUI_SRC.index("if self._pass2_watch is not None:")
+_i_cover = GUI_SRC.index("📋 正在生成打印首页")
+check("★ 第 2 趟闸门在 run() 开头、首页与任何送纸之前（单面直打/攒批也拦）",
+      GUI_SRC.index("def run(self)") < _i_run_gate < _i_cover)
+check("闸门放行且本批没有手动双面批次 → 通知主线程把确认态窗口收掉",
+      "self.duplex_gate_passed.emit()" in GUI_SRC
+      and "worker.duplex_gate_passed.connect(self._on_duplex_gate_passed)" in GUI_SRC
+      and "dlg.finish_prev2()" in GUI_SRC)
+
+# 双击尾击：确认「上一个任务已完成」→ 窗口立刻换成可点的「继续打第 2 趟」，
+# 连点的第二下会被当成"第 1 趟打完了"（现场 0041 的第 2 趟就是这样秒发的）。
+_dlg6 = gui.ManualDuplexDialog()
+_cont6, _conf6 = [], []
+_dlg6.continue_requested.connect(lambda: _cont6.append(1))
+_dlg6.prev_pass2_confirmed.connect(lambda: _conf6.append(1))
+_dlg6.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)
+_dlg6._on_go()
+check("第 1 趟态点击照常算「打完了」（早确认口径不变）",
+      _cont6 == [1] and _dlg6._mode == "pass2", f"{_cont6} {_dlg6._mode}")
+
+_dlg6b = gui.ManualDuplexDialog()
+_cont6b, _conf6b = [], []
+_dlg6b.continue_requested.connect(lambda: _cont6b.append(1))
+_dlg6b.prev_pass2_confirmed.connect(lambda: _conf6b.append(1))
+_dlg6b.announce_prev_pass2("上一批还在出纸", sheets=8, estimate_sec=60.0, elapsed_sec=10.0)
+_dlg6b._on_go()
+check("确认上一个任务只发 prev_pass2_confirmed（绝不发 continue_requested）",
+      _conf6b == [1] and not _cont6b, f"{_conf6b} {_cont6b}")
+_dlg6b.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)
+_dlg6b._on_go()
+check("★ 确认后的双击尾击被吃掉（第 1 趟没出纸就不会被判打完）",
+      not _cont6b and _dlg6b._mode == "pass1", f"{_cont6b} {_dlg6b._mode}")
+_dlg6b._prev2_confirmed_at = time.monotonic() - 5.0
+_dlg6b._on_go()
+check("过了 0.8s 尾击窗口照常可点", _cont6b == [1] and _dlg6b._mode == "pass2")
+
+_dlg6c = gui.ManualDuplexDialog()
+_dlg6c.announce_prev_pass2("上一批还在出纸", sheets=8, estimate_sec=60.0, elapsed_sec=10.0)
+_dlg6c._on_go()
+_dlg6c.finish_prev2()
+check("★ 确认态能收窗（finish() 在 prev2 会早退，finish_prev2 才收得掉）",
+      _dlg6c._mode == "done" and _dlg6c._close_timer.isActive(), _dlg6c._mode)
+
+for _d in (_dlg6, _dlg6b, _dlg6c):
+    _d._close_timer.stop()
+    _d._pass1_timer.stop()
+    _d._timer.stop()
+    _d.close()
+
 print()
 if ok_all:
     print("全部通过 ✅（手动双面第 2 趟后台计时 + 插单确认）")

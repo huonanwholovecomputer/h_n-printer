@@ -1128,6 +1128,11 @@ class ManualDuplexDialog(QDialog):
         self._prev_base = 0.0            # 立窗那一刻，上一批第 2 趟已经用掉的秒数
         self._prev_t0 = QElapsedTimer()  # 本窗在这个态里又走了多久（无效 = 不在这个态）
         self._prev_deadline = 0.0        # 到点自动放行（没人确认也不再等）
+        # 操作员按「✔ 确定上一个任务已完成」的时刻（2026-11-22）。Announce() 紧接着会把
+        # 同一位置的同一个按钮变成可点的「▶ 继续打第 2 趟」——操作员连点两下时，第二下会
+        # 落在它上面，worker 立刻当成「第 1 趟打完了」⇒ 第 2 趟秒发（现场串页）。
+        # 这个时刻用来在 `_on_go` 里吃掉"确认后的双击尾击"。
+        self._prev2_confirmed_at = 0.0
 
         # 补救态（2026-11-17 现场）：补救（半成品补打 / 整单重打）用的计时与文案与正常批次
         # 不是一回事 —— 正常批次的「第 1 趟计时」从 announce() 起跑，而补救路径根本不走
@@ -1640,6 +1645,19 @@ class ManualDuplexDialog(QDialog):
         self._btn_skip.setEnabled(True)
         self._close_timer.start(1500)
 
+    def finish_prev2(self, text: str = ""):
+        """「等上一批第 2 趟」的确认态收尾（2026-11-22）：闸门放行后把窗收掉。
+
+        为什么不能直接 `finish()`：`finish()` 在 prev2 / prev2_confirmed 会早退（那是为了
+        防"上一批迟到的 duplex_finished 把确认窗关掉"），而这里恰恰是**确认之后**要收窗。
+        只认确认态：若下一个批次的 `announce()` 已经接管（mode 变成 pass1/flip），这里
+        一个键都不碰 —— 那是新批次自己的窗口，不能替它收。
+        """
+        if self._mode not in ("prev2", "prev2_confirmed"):
+            return
+        self._mode = "done"
+        self.finish(text or "✔ 上一个任务已确认完成，本批开始打印")
+
     # ── 补救（半成品补打 / 整单重打）态（2026-11-17）──
     #
     # 现场两个症状：① 补救窗的计时器一直不动（永远 00:00）；② 补救结束后窗不肯收，
@@ -1743,6 +1761,7 @@ class ManualDuplexDialog(QDialog):
             self._pass1_timer.stop()
             self._prev_t0.invalidate()
             self._mode = "prev2_confirmed"
+            self._prev2_confirmed_at = time.monotonic()
             self._status.setText("▶ 已确认上一个任务的第 2 趟打完了 —— 本批马上开始第 1 趟…")
             self._countdown.setText("")
             self._btn_go.setText("✔ 已确认，正在开始…")
@@ -1768,6 +1787,12 @@ class ManualDuplexDialog(QDialog):
         # 「第 1 趟结束」的判据就是这一次点击（2026-11-11 用户口径）——所以 pass1 态
         # （第 1 趟还在送数据/纸还在出）也允许点，点了就立刻往下走第 2 趟。
         if self._mode not in ("pass1", "flip", "flip_gate"):
+            return
+        # 双击尾击保护（2026-11-22 现场）：确认「✔ 确定上一个任务已完成」之后，announce()
+        # 会把同一位置的同一个按钮换成可点的「▶ 继续打第 2 趟」。操作员连点两下时，第二下
+        # 落在新按钮上 ⇒ 第 1 趟还没出纸就被判"打完了"→ 第 2 趟秒发、与上一批的纸串在一起。
+        # 确认后极短时间里（0.8s）来的点击一律当双击尾击吃掉；过了这个窗口照常可点。
+        if (time.monotonic() - float(getattr(self, "_prev2_confirmed_at", 0.0))) < 0.8:
             return
         self._timer.stop()
         if not self._pass1_done:
@@ -4116,6 +4141,10 @@ class PrintWorker(QThread):
     # 上一批第 2 趟的**实测**（张数, 秒数）：只在操作员亲手按了「确定上一个任务已完成」时
     # 才发（到点自动放行不发 —— 那个数字没人看见纸，不可信）。写进同一份速度档案。
     duplex_pass2_sample = Signal(int, float)
+    # 上一批第 2 趟的闸门放行了，但本批**没有手动双面批次**（单面直打 / 攒批）——
+    # 不会有 `duplex_announce` 来接管常驻窗，请主线程把停在「已确认」态的窗口收掉
+    # （2026-11-22 现场：确认后窗口一直盖在屏幕上，像卡住了）。
+    duplex_gate_passed = Signal()
     # ── 攒批模式（多任务合并翻纸，2026-10）──
     # 本单第 1 趟**已排好页序、即将开打**时发射（payload=dict）：
     # 主线程据此把这一单落进纸叠清单（**打印前**就落盘，崩溃后才知道纸槽里有什么）。
@@ -5468,7 +5497,14 @@ class PrintWorker(QThread):
             # 排空，打印机离线时还会白等到超时）。这个等待随时可被那次点击打断，只承担两件事：
             #   ① 给「应有 N 张纸」一个事后诊断（数不够就先别翻）；
             #   ② 量一笔**不掺操作员手速**的第 1 趟用时（写速度样本）。
-            w = self._wait_pass1_output(n1)
+            # ⚠ 超时按本批张数缩放（2026-11-22 现场 HN20261122-0041）：固定 120s 对 32 张
+            #   纸（预估 186s）必然先到点 —— 程序在纸还在出的时候就宣布「第 1 趟已打完 32 张纸」
+            #   并弹「可能没全出来」，操作员随后一点「继续」，第 2 趟就压在还在出的纸后面。
+            #   改成「预估 × 1.2 + 30s，且不低于 120s」：正常批次按自己的预估等，
+            #   打印机真卡住时操作员仍可随时点「继续」（点击优先，见硬规矩 12）。
+            _p1_est = self._estimate_first_pass(n1)
+            _p1_timeout = max(120.0, float(_p1_est) * 1.2 + 30.0)
+            w = self._wait_pass1_output(n1, timeout=_p1_timeout)
             # 🟡6：队列没排空 = 纸不一定全出来了（离线/卡纸/缺纸）。以前这里只把这条事实
             # 用在不写速度样本上，翻纸提示照旧说"应有 N 张，数够再翻" —— 操作员数不够 N 张
             # 时没有任何退路（照翻就串页，不翻只能干等超时）。现在把不确定直接摆到提示窗上。
@@ -5909,6 +5945,30 @@ class PrintWorker(QThread):
 
         self.progress.emit(0, total_sides, f"共 {task_count} 个任务, 预估 {total_sides} 面")
         self.log_message.emit(f"共 {task_count} 个任务待处理")
+
+        # ── 上一批第 2 趟可能还在出纸：**任何路径**送纸之前都先问一句（2026-11-22 现场）──
+        # 闸门原来只写在 `_print_manual_batch` 里 —— 手动双面批次会问，单面直打 / 攒批
+        # 压根不查 `_pass2_watch`。现场 HN20261122-0041（32 张，第 2 趟还在出）之后，
+        # 0042（11 页单面）一点「开始打印」就直接送纸，两批纸叠在出纸槽里。
+        # 放在 run() 最前面：首页、单面直打、攒批第 1 趟、手动双面批次都从这一刻起才可能送纸。
+        # 闸门只读计时器；操作员点「确定上一个任务已完成」或窗口到点才放行。
+        if self._pass2_watch is not None:
+            _p2_ok, _p2_msg = self._wait_prev_pass2_gate()
+            if not _p2_ok:
+                # 一张纸都没送：按「本批未开始」收尾（与批次中途取消同一口径：判失败、
+                # 不写速度样本），并把常驻窗从确认态收掉，免得一直盖在屏幕上。
+                self.log_message.emit(f"  ⏹ 本批未开始：{_p2_msg}")
+                self.duplex_finished.emit(f"⏹ 本批未开始打印：{_p2_msg}")
+                for _rest_idx, _rest_job in enumerate(self._jobs):
+                    self.job_finished.emit(
+                        _rest_idx, False, _p2_msg or "已取消：本批还没开始打印")
+                    fail_count += 1
+                self.all_finished.emit(success_count, fail_count)
+                return
+            # 本批没有手动双面批次（单面直打 / 攒批）⇒ 不会有 duplex_announce 来接管窗口，
+            # 让主线程现在就把「已确认」态的窗口收掉；有手动双面批次的稍后 announce 自己立窗。
+            if not any(self._uses_manual_duplex(j) for j in self._jobs):
+                self.duplex_gate_passed.emit()
 
         # ── 打印首页 (Cover Page) ──
         # 攒批模式：首页**不在这里单独打** —— 出纸槽被这一叠独占，单独打一张首页会插进
@@ -19425,6 +19485,17 @@ class MainWindow(QMainWindow):
         if dlg is not None:
             dlg.finish(text)
 
+    def _on_duplex_gate_passed(self):
+        """上一批第 2 趟的闸门放行、本批又不会走手动双面批次（单面直打 / 攒批）。
+
+        2026-11-22 现场：闸门现在在**所有**路径之前（见 `PrintWorker.run`），但只有手动
+        双面/攒批批次会发 `duplex_announce` 接管常驻窗。单面单确认完之后没人接手，窗口就
+        一直停在「✔ 已确认，正在开始…」盖在屏幕上 —— 操作员以为程序卡住了。这里把它收掉。
+        """
+        dlg = getattr(self, "_duplex_dialog", None)
+        if dlg is not None:
+            dlg.finish_prev2()
+
     def _on_flip_required(self, text: str, timeout_sec: int):
         """Worker 打完第 1 趟 → 常驻窗切到"可翻纸"（启用按钮 + 倒计时）。"""
         dlg = self._ensure_duplex_dialog()
@@ -22124,6 +22195,8 @@ class MainWindow(QMainWindow):
         # 上一批第 2 趟可能还在出纸（2026-11-12）：确认态 + 那笔实测（只有确认过才发）。
         worker.duplex_pass2_watch.connect(self._on_duplex_pass2_watch)
         worker.duplex_pass2_sample.connect(self._on_duplex_pass2_sample)
+        # 闸门放行、但本批没有手动双面批次接手窗口（单面直打/攒批）→ 把确认态窗口收掉
+        worker.duplex_gate_passed.connect(self._on_duplex_gate_passed)
         if stack_entry:
             worker.stack_entry_planned.connect(self._on_stack_entry_planned)
             worker.stack_entry_done.connect(self._on_stack_entry_done)

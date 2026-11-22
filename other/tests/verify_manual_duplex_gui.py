@@ -1858,9 +1858,10 @@ check("★ 第 2 趟放行只认操作员点击（早回报既不冻结计时、
       # 2026-11-11：闸门态整块删除 —— 既不按时间放行，也不等 spooler 排空
       and 'self._mode = "flip_gate"' not in src
       and "_open_flip_gate(by_time" not in src
-      # 第 1 趟出纸等待改成"操作员一点继续就立刻返回"
+      # 第 1 趟出纸等待改成"操作员一点继续就立刻返回"（2026-11-22：超时按张数缩放）
       and "def _wait_pass1_output(" in src
-      and "w = self._wait_pass1_output(n1)" in src
+      and "w = self._wait_pass1_output(n1, timeout=_p1_timeout)" in src
+      and "_p1_timeout = max(120.0, float(_p1_est) * 1.2 + 30.0)" in src
       and "interrupted" in src)
 check("★ 半成品补救在跑时禁止新单启动（插单会与第 2 趟串页）",
       "_remedy_worker is not None and self._remedy_worker.isRunning()" in
