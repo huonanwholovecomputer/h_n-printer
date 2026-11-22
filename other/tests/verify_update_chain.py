@@ -468,12 +468,30 @@ def run_static():
           "setDefaultButton(btn_later)" in result_fn)
     check("不再用「默认 Yes」的二选一框（QMessageBox.Yes 计数为 0）",
           "QMessageBox.Yes" not in result_fn)
-    check("整个 GUI 只有一处发起下载（self._perform_update 调用点 == 1）",
-          gui.count("self._perform_update(") == 1,
-          f"count={gui.count('self._perform_update(')}")
-    check("该调用点位于 manual 分支（先 if manual:）",
-          result_fn.find("if manual:") >= 0
-          and result_fn.find("if manual:") < result_fn.find("self._perform_update(manifest)"))
+    # 2026-11（COS 下载码）：发起下载的入口从「一处」变成「两种用户动作」——
+    #   ① 检查更新结果框里（manual 分支，用户点了下载/输了码）；
+    #   ② 「下载码未通过校验」后再点「重新输入下载码」（_on_update_ready 里，同样是用户点出来的）。
+    # 判据没放松：仍然是「所有发起下载都排在任何自动路径之后，且必先拿到用户的码」。
+    ready_fn = func_source(gui, "_on_update_ready")
+    calls_in_result = result_fn.count("self._perform_update(")
+    calls_in_ready = ready_fn.count("self._perform_update(")
+    check("发起下载的调用点只在这两处：检查更新结果框 + 「重新输入下载码」回调",
+          gui.count("self._perform_update(") == calls_in_result + calls_in_ready
+          and calls_in_result >= 1,
+          f"total={gui.count('self._perform_update(')} result={calls_in_result} ready={calls_in_ready}")
+    manual_pos = result_fn.find("if manual:")
+    first_call = result_fn.find("self._perform_update(")
+    check("结果框里所有发起下载都在 manual 分支之后（启动静默检查绝不自动下载）",
+          manual_pos >= 0 and first_call > manual_pos,
+          f"manual@{manual_pos} first_call@{first_call}")
+    check("需要下载码的清单：先问码（_ask_download_code）再下载",
+          first_call >= 0
+          and "_ask_download_code(" in result_fn
+          and result_fn.find("_ask_download_code(") < first_call)
+    check("「重新输入下载码」回调同样先问码再下载",
+          "_ask_download_code(" in ready_fn
+          and ready_fn.find("_ask_download_code(") < ready_fn.find("self._perform_update(")
+          if calls_in_ready >= 1 else True)
     check("下载时传 user_confirmed=True（第二道闸）",
           "user_confirmed=True" in func_source(gui, "_update_download_worker"))
     check("生成 update.cmd 时显式 allow_silent_install=True",

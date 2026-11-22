@@ -572,6 +572,8 @@ _NONCE_MAX_PENDING = 32          # 未消费 nonce 上限（每次点开页面�
 # （验收脚本会拿 settlement.html 的调用面反查本集合，防止"页面加了接口、白名单忘了加"）。
 _PROXY_PREFIX = "/api/proxy"
 _PROXY_ALLOWED_TARGETS = frozenset({
+    "/api/admin/dl/codes",
+    "/api/admin/dl/switch",
     "/api/admin/order_status",
     "/api/admin/order_type",
     "/api/admin/order_user",
@@ -585,6 +587,12 @@ _PROXY_ALLOWED_TARGETS = frozenset({
     "/api/printer/devices/cleanup",
     "/api/printer/devices/delete",
 })
+
+# 带资源 id 的管理接口（settlement.html 的「🔑 COS 下载码」卡片：/api/admin/dl/codes/12/rotate）
+# 精确集合装不下 —— 但**绝不做前缀放行**（那等于把白名单变成通配）。只认「数字 id + 固定动作」。
+_PROXY_ALLOWED_PATTERNS = (
+    re.compile(r"^/api/admin/dl/codes/\d{1,12}/(?:rotate|revoke|extend)$"),
+)
 
 # ── 云端文件预览（收支清算「订单明细」点文件名看首页缩略图，v7.21）──
 # 这条**不走** _PROXY_ALLOWED_TARGETS：图片是二进制，而 /api/proxy 只透传 JSON 白名单字段
@@ -1653,7 +1661,9 @@ def normalize_proxy_target(proxy_path: str):
     if posixpath.normpath(target) != target:            # 归一化后必须**原样**（双斜杠等一律拒）
         return "", "bad_path"
     if target not in _PROXY_ALLOWED_TARGETS:
-        return "", "not_allowed"
+        # 带 id 的管理接口走正则（只认「数字 id + 固定动作」）；绝不做前缀放行。
+        if not any(p.match(target) for p in _PROXY_ALLOWED_PATTERNS):
+            return "", "not_allowed"
     return target, ""
 
 

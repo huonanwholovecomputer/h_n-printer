@@ -9841,6 +9841,11 @@ class MainWindow(QMainWindow):
         self._update_action = QAction("检查更新(&U)", self)
         self._update_action.triggered.connect(lambda: self._start_update_check(manual=True))
         help_menu.addAction(self._update_action)
+        # 2026-11：COS 桶私有化后，更新要一枚「下载码」。这里只**只读展示 + 复制**
+        # （创建/轮换在小程序「我」页和结算页），方便在别的机器上手动更新时抄。
+        dlcode_action = QAction("安装包下载码(&D)", self)
+        dlcode_action.triggered.connect(self._on_show_download_code)
+        help_menu.addAction(dlcode_action)
         help_menu.addSeparator()
         about_action = QAction("关于(&A)", self)
         about_action.triggered.connect(self._on_about)
@@ -10154,7 +10159,7 @@ class MainWindow(QMainWindow):
         elif kind in ("latest", "none", "error", "rejected", "manifest_error"):
             if kind in ("latest", "none"):
                 self._update_pending_version = ""
-        if kind in ("ready", "download_fail"):
+        if kind in ("ready", "download_fail", "code_fail"):
             self._on_update_ready(result)
             return
         # 检查结束（无更新/有更新待确认）→ 恢复菜单项
@@ -10162,6 +10167,15 @@ class MainWindow(QMainWindow):
         if kind == "available":
             version = manifest.get("version", "")
             notes = (manifest.get("notes") or "").strip()
+            # 下载码体系（4.7.0+）：清单可以不带 url，改由「凭码换令牌」拿下载地址。
+            # 判断只认「有没有 url」，不看版本号 —— 过渡期两种清单都能被同一条逻辑处理。
+            try:
+                from updater import manifest_needs_code
+                needs_code = manifest_needs_code(manifest)
+            except Exception:
+                needs_code = False
+            # 「重新输入下载码」用：不开新一轮网络请求也能重试（版本信息已经校验过了）
+            self._update_needs_code_manifest = manifest if needs_code else None
             msg = f"发现新版本 v{version}（当前 v{APP_VERSION}）"
             if notes:
                 msg += f"\n\n更新说明：\n{notes}"
@@ -10172,32 +10186,49 @@ class MainWindow(QMainWindow):
                 return
             if manual:
                 # S1-02 改动 4（2026-10-23）：只有**这一次明确点击**才允许进入下载 → 生成
-                # update.cmd（/VERYSILENT 静默安装）。默认按钮是「稍后」：回车/直接关窗
-                # 都等于不更新，绝不默认「立即更新」。
-                msg += "\n\n是否立即下载并更新？（更新过程需退出程序，配置数据不会丢失）"
+                # update.cmd（/VERYSILENT 静默安装）。
+                # 2026-11 起默认按钮改成「从 GitHub 下载」：GitHub Release 免费、公开、
+                # 不限量；本站 COS 通道是内部人员用的，要走它必须有超级管理员创建的下载码。
+                if needs_code:
+                    code = self._ask_download_code(manifest)
+                    if code:
+                        self._perform_update(manifest, code=code)
+                    return
+                msg += ("\n\n推荐直接从 GitHub 下载安装包（免费、不限速，任何人都能下）。\n"
+                        "本站加速通道仅限内部工作人员使用，需要超级管理员创建的下载码。")
                 box = QMessageBox(self)
                 box.setIcon(QMessageBox.Question)
                 box.setWindowTitle("发现新版本")
                 box.setText(msg)
-                btn_now = box.addButton("立即下载并更新", QMessageBox.AcceptRole)
+                btn_gh = box.addButton("从 GitHub 下载", QMessageBox.AcceptRole)
+                btn_code = box.addButton("输入下载码后更新", QMessageBox.ActionRole)
                 btn_later = box.addButton("稍后", QMessageBox.RejectRole)
-                box.setDefaultButton(btn_later)
+                box.setDefaultButton(btn_gh)
                 box.exec()
-                if box.clickedButton() is btn_now:
-                    self._perform_update(manifest)
+                clicked = box.clickedButton()
+                if clicked is btn_gh:
+                    self._open_github_release()
+                elif clicked is btn_code:
+                    code = self._ask_download_code(manifest)
+                    if code:
+                        self._perform_update(manifest, code=code)
             else:
                 # 启动检查（manual=False）：**只提示**，不下载、不写 update.cmd、不安装。
                 # 用户此刻多半正要开工，自动装会打断打印（旧行为：启动 4 秒弹「是否立即更新」，
                 # 默认按钮还是「是」）。这里只给一个「稍后」，把决定权交回菜单。
                 msg += ("\n\n为避免打断正在进行的打印，启动时不会自动更新。\n"
-                        "需要升级时请点「帮助 → 检查更新」手动下载安装。")
+                        "需要升级时请点「帮助 → 检查更新」手动下载安装，\n"
+                        "也可以直接到 GitHub Release 下载。")
                 box = QMessageBox(self)
                 box.setIcon(QMessageBox.Information)
                 box.setWindowTitle("发现新版本")
                 box.setText(msg)
+                btn_gh = box.addButton("从 GitHub 下载", QMessageBox.ActionRole)
                 btn_later = box.addButton("稍后", QMessageBox.RejectRole)
                 box.setDefaultButton(btn_later)
                 box.exec()
+                if box.clickedButton() is btn_gh:
+                    self._open_github_release()
         elif kind == "rejected":
             # 清单没通过安全校验（host 白名单 / 哈希必填 / ed25519 验签）→ 绝不降级更新。
             detail = manifest if isinstance(manifest, str) else str(manifest)
@@ -10222,13 +10253,17 @@ class MainWindow(QMainWindow):
         elif kind == "error" and manual:
             QMessageBox.warning(self, "检查更新", "检查更新失败，请检查网络连接后重试")
 
-    def _perform_update(self, manifest: dict):
-        """用户明确点击「立即更新」后才走到这里：检查打印状态 → 下载进度窗口 → 后台下载
+    def _perform_update(self, manifest: dict, code: str = ""):
+        """用户明确点击后才走到这里：检查打印状态 → 下载进度窗口 → 后台下载
         → 生成 update.cmd（/VERYSILENT）→ 退出主程序。
 
         S1-02 改动 4（2026-10-23）：本方法是**唯一**能让更新进入"下载 + 静默安装"的入口，
-        只由 _on_update_check_result 的 manual 分支在用户点「立即下载并更新」后调用；
-        启动自动检查不会、也不能调用它。"""
+        只由 _on_update_check_result 的 manual 分支在用户明确选择后调用；
+        启动自动检查不会、也不能调用它。
+
+        2026-11：`code` 非空表示走「下载码 → 短时令牌 → COS」这条内部通道；
+        否则说明清单自带 url（过渡期的老清单）。
+        """
         if self._worker and self._worker.isRunning():
             reply = QMessageBox.question(
                 self, "正在打印",
@@ -10252,7 +10287,8 @@ class MainWindow(QMainWindow):
         self._update_cancelled = False
         self._updateProgress.connect(self._on_update_progress)
         dlg.canceled.connect(self._on_update_download_cancel)
-        threading.Thread(target=self._update_download_worker, args=(manifest,), daemon=True).start()
+        threading.Thread(target=self._update_download_worker, args=(manifest, code),
+                         daemon=True).start()
 
     def _on_update_progress(self, downloaded: int, total: int):
         """主线程：更新下载进度弹窗。"""
@@ -10272,10 +10308,11 @@ class MainWindow(QMainWindow):
         self._update_cancelled = True
         self._log("☁ 已取消更新下载")
 
-    def _update_download_worker(self, manifest: dict):
-        """后台：下载安装包（带进度回调）→ MD5 校验 → 写 update.cmd → 最小化运行。"""
+    def _update_download_worker(self, manifest: dict, code: str = ""):
+        """后台：下载安装包（带进度回调）→ 哈希校验 → 写 update.cmd → 最小化运行。"""
         try:
-            from updater import (prepare_update, write_update_cmd, write_update_note,
+            from updater import (prepare_update, prepare_update_with_code, DownloadCodeError,
+                                 write_update_cmd, write_update_note, device_id,
                                  _run_cmd_minimized)
             import sys as _sys
 
@@ -10285,10 +10322,23 @@ class MainWindow(QMainWindow):
                 return not getattr(self, '_update_cancelled', False)
 
             # S1-02（2026-10-23）：user_confirmed=True —— 本函数只由 _perform_update（用户
-            # 明确点击「立即下载并更新」）启动；updater 会再次校验清单（host 白名单 + 哈希必填
-            # + ed25519 验签），验签失败在这里就会返回 None，一步安装包都不会下载。
-            result = prepare_update(manifest, APP_VERSION, progress_cb=_progress,
-                                    user_confirmed=True)
+            # 明确点击）启动；updater 会再次校验清单（host 白名单 + 哈希必填 + ed25519 验签），
+            # 验签失败在这里就会返回 None，一步安装包都不会下载。
+            if code:
+                # 内部通道：清单里没有下载地址，凭下载码换一枚 10 分钟、单次使用的令牌，
+                # 服务端 302 到 COS 预签名直链。哈希仍然只认**签名过的清单**。
+                try:
+                    result = prepare_update_with_code(
+                        manifest, APP_VERSION, code, hwid=device_id(),
+                        progress_cb=_progress, user_confirmed=True)
+                except DownloadCodeError as e:
+                    logger.warning(f"下载码校验失败: {e.code} {e.message}")
+                    self._updateCheckDone.emit(
+                        ("code_fail", (e.message, bool(e.suggest_github)), False))
+                    return
+            else:
+                result = prepare_update(manifest, APP_VERSION, progress_cb=_progress,
+                                        user_confirmed=True)
             if not result:
                 self._updateCheckDone.emit(("download_fail", None, False))
                 return
@@ -10341,11 +10391,127 @@ class MainWindow(QMainWindow):
             # 必须走 _quit_app：4.6.0 起裸 close() 只是收进托盘，update.cmd 等不到进程退出，
             # 安装永远装不上。_quit_app 置 _force_quit 走完整退出流程。
             self._quit_app()  # update.cmd 轮询到进程退出后执行静默安装并启动新版本
+        elif kind == "code_fail":
+            message, suggest_github = (manifest if isinstance(manifest, tuple)
+                                       else (str(manifest), True))
+            self._log(f"⚠ 下载码未通过校验：{message}")
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("下载码未通过校验")
+            box.setText(f"{message}\n\n"
+                        "下载码由超级管理员创建，形如 ABCD-EFGH，区分不了大小写。")
+            btn_gh = None
+            if suggest_github:
+                btn_gh = box.addButton("从 GitHub 下载", QMessageBox.AcceptRole)
+            btn_retry = box.addButton("重新输入下载码", QMessageBox.ActionRole)
+            btn_close = box.addButton("关闭", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_gh or btn_close)
+            box.exec()
+            clicked = box.clickedButton()
+            if btn_gh is not None and clicked is btn_gh:
+                self._open_github_release()
+            elif clicked is btn_retry:
+                # 版本信息还在（预先存下），不需要重新请求清单
+                manifest2 = getattr(self, '_update_needs_code_manifest', None)
+                if isinstance(manifest2, dict):
+                    code = self._ask_download_code(manifest2)
+                    if code:
+                        self._perform_update(manifest2, code=code)
         elif kind == "download_fail":
             if getattr(self, '_update_cancelled', False):
                 QMessageBox.information(self, "更新已取消", "更新下载已取消。")
             else:
                 QMessageBox.warning(self, "更新失败", "下载或准备更新安装包失败，请稍后重试。")
+
+    def _open_github_release(self) -> None:
+        """打开 GitHub Release 页（公开、免费、不限量的推荐下载渠道）。"""
+        try:
+            from updater import GITHUB_RELEASE_URL
+        except Exception:
+            GITHUB_RELEASE_URL = "https://github.com/huonanwholovecomputer/h_n-printer/releases/latest"
+        self._log(f"☁ 已打开 GitHub Release 下载页：{GITHUB_RELEASE_URL}")
+        QDesktopServices.openUrl(QUrl(GITHUB_RELEASE_URL))
+
+    def _on_show_download_code(self):
+        """帮助 → 安装包下载码：只读取并展示当前内部下载码（不做创建/轮换）。
+
+        创建、轮换、永不过期开关都在管理端（小程序「我」页 → COS 下载码；结算页 → 授权页）；
+        本机只负责「把码抄到另一台机器上去更新」。取不到就照实说，不弹错误框 ——
+        这条菜单项不该因为服务器没配 COS、或本机 token 没有 admin scope 而变红。
+        """
+        client = getattr(self, "_cloud_client", None)
+        if client is None:
+            QMessageBox.information(self, "安装包下载码", "云端未连接，暂时取不到下载码。")
+            return
+        try:
+            res = client.fetch_download_code() or {}
+        except Exception as e:  # noqa: BLE001
+            res = {"success": False, "message": str(e)}
+        if not res.get("success"):
+            QMessageBox.information(
+                self, "安装包下载码",
+                "暂时取不到下载码：" + str(res.get("message") or "未知原因")
+                + "\n\n（这一项只有超级管理员在管理端可见；"
+                "普通用户请直接从 GitHub Release 下载安装包。）")
+            return
+        code = str(res.get("code") or "")
+        mode = str(res.get("mode") or "")
+        expires = str(res.get("expires_at") or "")
+        if mode == "permanent":
+            valid = "永不过期"
+        elif expires:
+            valid = "有效期至 " + expires
+        else:
+            valid = "定期更换"
+        text = (f"当前安装包下载码：{code}\n{valid}\n\n"
+                "更新时在「立即下载并更新」的输入框里填这串码即可（不分大小写）。\n"
+                "公开用户请直接从 GitHub Release 下载安装包（免费、不限量）。")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("安装包下载码")
+        box.setText(text)
+        btn_copy = box.addButton("复制下载码", QMessageBox.ActionRole)
+        box.addButton("关闭", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is btn_copy:
+            QApplication.clipboard().setText(code)
+            self._log("☁ 安装包下载码已复制到剪贴板")
+
+    def _ask_download_code(self, manifest: dict):
+        """向用户要「下载码」（由超级管理员创建，8 位字母数字）。
+
+        返回规范化后的 `XXXX-XXXX`；用户取消返回空串（并在确认后打开 GitHub）。
+        """
+        from PySide6.QtWidgets import QInputDialog
+        try:
+            from updater import normalize_download_code, GITHUB_RELEASE_URL
+        except Exception:
+            return ""
+        version = str((manifest or {}).get("version") or "")
+        while True:
+            box = QInputDialog(self)
+            box.setWindowTitle("从本站加速通道更新")
+            box.setLabelText(
+                f"新版本 v{version} 需要下载码才能从本站加速通道下载。\n\n"
+                "下载码由管理员创建，形如 ABCD-EFGH（不分大小写）。\n"
+                "如果手上没有下载码，请点「取消」，改从 GitHub Release 下载\n"
+                "（公开、免费、不限量）。")
+            box.setInputMode(QInputDialog.TextInput)
+            box.resize(520, 220)
+            ok = box.exec()
+            if not ok:
+                ans = QMessageBox.question(
+                    self, "没有下载码？",
+                    "本站加速通道仅限内部工作人员使用。\n\n"
+                    "要现在打开 GitHub Release 下载页吗？（免费、不限量，任何人都能下）",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if ans == QMessageBox.Yes:
+                    self._open_github_release()
+                return ""
+            try:
+                return normalize_download_code(box.textValue())
+            except ValueError as e:
+                QMessageBox.warning(self, "下载码格式不对", f"{e}\n\n请核对后重新输入。")
 
     def _setup_theme_menu(self, menu):
         """构建主题切换子菜单（单选模式）。"""

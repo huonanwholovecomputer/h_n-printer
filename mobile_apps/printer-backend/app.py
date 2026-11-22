@@ -58,7 +58,7 @@ from functools import wraps
 from urllib import request as urlrequest, parse as urlparse
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, g, request, jsonify, send_file
+from flask import Flask, g, request, jsonify, send_file, redirect, Response
 from flask_socketio import SocketIO, emit, disconnect, join_room
 from flask_cors import CORS
 import requests
@@ -70,6 +70,14 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 # S3-04（DS-24）：文件访问审计（谁、读了哪个文件、何时）。
 # 独立模块：不 import Flask、不依赖 app 的任何全局量；坏了也只影响"记不记"，不影响主流程。
 import file_audit
+
+# COS 只读预签名（下载码体系）。这个模块是纯标准库实现，缺文件时整体降级为
+# 「通道未配置」，不会把服务拖挂。
+try:
+    import update_cos
+except Exception as _e:  # noqa: BLE001
+    update_cos = None
+    print(f"[WARN] update_cos 模块加载失败，COS 下载通道不可用: {type(_e).__name__}: {_e}")
 
 try:
     from PIL import Image
@@ -1443,6 +1451,23 @@ def _load_config_module():
     return None
 
 
+# ── 安装包分发（COS 下载码体系）默认值 ──────────────────────────────────
+# 密钥只读（该桶 GetObject），桶私有读；**未配置时通道自动关闭**：/dl 返回
+# 503，客户端回退 GitHub Release，所以这套东西可以在没配密钥前就先上线。
+UPDATE_COS_SECRET_ID = ""
+UPDATE_COS_SECRET_KEY = ""
+UPDATE_COS_BUCKET = ""
+UPDATE_COS_REGION = ""
+UPDATE_COS_URL_TTL = 180
+# 桶内安装包对象名模板（与 coscmd 上传时保持一致）
+UPDATE_OBJECT_TEMPLATE = "h_n-printer_setup_{version}.exe"
+# 换直链的服务地址：客户端只接受 https + hn-space.cn，别写内网地址
+UPDATE_DL_BASE_URL = "https://hn-space.cn"
+# 每日 COS 下载配额（按「发出的令牌」计；超额当日只放行 GitHub）
+UPDATE_DL_DAILY_QUOTA = 30
+# 推荐渠道：任何人都能直接下载，不设限
+UPDATE_GITHUB_RELEASE_URL = "https://github.com/huonanwholovecomputer/h_n-printer/releases/latest"
+
 try:
     config = _load_config_module()
     if config is None:
@@ -1456,6 +1481,16 @@ try:
     PRINTER_NAME = getattr(config, "PRINTER_NAME", PRINTER_NAME)
     ADMIN_OPENIDS = set(getattr(config, "ADMIN_OPENIDS", []))
     SUPER_ADMIN_OPENID = getattr(config, "SUPER_ADMIN_OPENID", SUPER_ADMIN_OPENID)
+    UPDATE_COS_SECRET_ID = getattr(config, "UPDATE_COS_SECRET_ID", "")
+    UPDATE_COS_SECRET_KEY = getattr(config, "UPDATE_COS_SECRET_KEY", "")
+    UPDATE_COS_BUCKET = getattr(config, "UPDATE_COS_BUCKET", "")
+    UPDATE_COS_REGION = getattr(config, "UPDATE_COS_REGION", "")
+    UPDATE_COS_URL_TTL = int(getattr(config, "UPDATE_COS_URL_TTL", UPDATE_COS_URL_TTL) or 180)
+    UPDATE_OBJECT_TEMPLATE = getattr(config, "UPDATE_OBJECT_TEMPLATE", UPDATE_OBJECT_TEMPLATE)
+    UPDATE_DL_BASE_URL = getattr(config, "UPDATE_DL_BASE_URL", UPDATE_DL_BASE_URL)
+    UPDATE_DL_DAILY_QUOTA = int(getattr(config, "UPDATE_DL_DAILY_QUOTA", UPDATE_DL_DAILY_QUOTA) or 30)
+    UPDATE_GITHUB_RELEASE_URL = getattr(config, "UPDATE_GITHUB_RELEASE_URL",
+                                        UPDATE_GITHUB_RELEASE_URL)
     if WECHAT_APPID and WECHAT_APPSECRET and SECRET_KEY != "fallback-dev-key-please-change-in-production":
         print("已加载 config.py 微信配置")
     else:
@@ -3288,6 +3323,73 @@ def init_db():
         pass
     # 迁移纠偏：已使用（used_by 非空）的行保持 used，未使用的行标记 unused
     user_conn.execute("UPDATE license_keys SET status = 'unused' WHERE used_by IS NULL")
+    user_conn.commit()
+
+    # ── 安装包下载码（COS 分发闸门）──────────────────────────────────────
+    # 设计要点：下载码只换「一次性下载令牌」，令牌再换「COS 预签名直链」；
+    # COS 桶本身改成私有读，桶里没有公开链接可用，所以绕过路径只有三种，
+    # 全部在 /api/dl/grant 里挡住（旧客户端、直连对象名、无码人工访问）。
+    #   family=internal  内部工作人员长期用的那一个码（自动轮换，可永不过期）
+    #   family=temp      临时码（给某个人一次下载，默认 24h / 1 次 / 1 设备）
+    user_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS download_codes (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            code              TEXT    UNIQUE NOT NULL,
+            family            TEXT    NOT NULL DEFAULT 'temp',
+            mode              TEXT    NOT NULL DEFAULT 'periodic',
+            created_by        TEXT    NOT NULL DEFAULT '',
+            created_at        TEXT    NOT NULL,
+            expires_at        TEXT    DEFAULT NULL,
+            rotate_every_days INTEGER DEFAULT 0,
+            grace_hours       INTEGER DEFAULT 0,
+            max_uses          INTEGER DEFAULT NULL,
+            max_devices       INTEGER DEFAULT NULL,
+            used_count        INTEGER NOT NULL DEFAULT 0,
+            device_count      INTEGER NOT NULL DEFAULT 0,
+            status            TEXT    NOT NULL DEFAULT 'active',
+            superseded_by     INTEGER DEFAULT NULL,
+            note              TEXT    DEFAULT '',
+            revoked_at        TEXT    DEFAULT NULL,
+            revoked_by        TEXT    DEFAULT NULL,
+            last_used_at      TEXT    DEFAULT NULL
+        )
+        """
+    )
+    user_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dl_codes_family ON download_codes(family, status)"
+    )
+    user_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS download_grants (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash  TEXT    UNIQUE NOT NULL,
+            code_id     INTEGER NOT NULL,
+            version     TEXT    NOT NULL,
+            hwid        TEXT    DEFAULT '',
+            ip          TEXT    DEFAULT '',
+            ua          TEXT    DEFAULT '',
+            created_at  TEXT    NOT NULL,
+            expires_at  TEXT    NOT NULL,
+            consumed_at TEXT    DEFAULT NULL,
+            hit_count   INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    user_conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_dl_grants_code ON download_grants(code_id, created_at)"
+    )
+    # 通用开关表（下载通道总闸等；value 一律存字符串，读时自行解释）
+    user_conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_flags (
+            name       TEXT PRIMARY KEY,
+            value      TEXT    NOT NULL DEFAULT '',
+            updated_at TEXT    NOT NULL DEFAULT '',
+            updated_by TEXT    NOT NULL DEFAULT ''
+        )
+        """
+    )
     user_conn.commit()
 
     # 用户移除记录（被谁、何时移除；重新授权时清空，密钥记录仍保留）
@@ -13249,6 +13351,709 @@ def cleanup_expired_license_keys():
     conn.close()
 
 
+# ==================== 安装包下载码（COS 分发闸门） ====================
+#
+# 链路是三跳，每一跳单独可关：
+#   ① POST /api/dl/grant {code, version, hwid}
+#        校验下载码 → 查配额/设备数 → 发一枚 10 分钟有效的下载令牌
+#   ② GET  /dl/<令牌>
+#        302 到 COS 预签名直链（默认 180 秒、只绑 host，过期即失效）
+#   ③ COS 桶私有读
+#        没有桶的密钥就一个字节也拿不到
+#
+# 为什么这样做：桶转私有之后，仓库/历史里那些公开的 COS 对象名（GitHub 仓库本身是
+# 公开的）就退化成无害字符串；旧客户端拿到「不含 url」的清单会直接拒绝更新，
+# 「用旧版本自己下新版本」这条路自然断掉，不需要另加版本封锁逻辑。
+#
+# 内部码（family=internal）永远只有「一个当前码」：过期就自动换新，旧码按
+# grace_hours 留一段过渡期（给已经打印出去的说明纸留面子），然后正式作废。
+
+_DL_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # 去掉 I/L/O/0/1：念得清、抄不错
+_DL_CODE_LEN = 8
+_DL_VERSION_RE = re.compile(r"^\d+(\.\d+){1,3}$")
+_DL_TOKEN_TTL = 600        # 令牌有效期（秒）：够点下载、不够转发到群里
+_DL_TOKEN_MAX_HITS = 12    # 同一令牌允许的 GET 次数（浏览器多连接/断点续传）
+_DL_FMT = "%Y-%m-%d %H:%M:%S"
+_DL_INTERNAL_DAYS = 30     # 内部码默认轮换周期
+_DL_INTERNAL_GRACE = 24    # 旧内部码默认过渡期（小时）
+
+
+def _dl_now():
+    return datetime.now()
+
+
+def _dl_fmt(dt):
+    return dt.strftime(_DL_FMT)
+
+
+def _dl_parse(s):
+    try:
+        return datetime.strptime(str(s or "").strip(), _DL_FMT)
+    except Exception:
+        return None
+
+
+def _dl_norm_code(raw):
+    """用户输入的码归一化：去掉连字符/空格，统一大写。"""
+    return re.sub(r"[^0-9A-Za-z]", "", str(raw or "")).upper()
+
+
+def _dl_format_code(code):
+    """展示形态 XXXX-XXXX（念给对方听、手抄都不容易错）。"""
+    c = _dl_norm_code(code)
+    if len(c) == _DL_CODE_LEN:
+        return f"{c[:4]}-{c[4:]}"
+    return c
+
+
+def _dl_gen_code():
+    return "".join(secrets.choice(_DL_ALPHABET) for _ in range(_DL_CODE_LEN))
+
+
+def _dl_cos_ready():
+    return bool(update_cos is not None and UPDATE_COS_SECRET_ID and UPDATE_COS_SECRET_KEY
+                and UPDATE_COS_BUCKET and UPDATE_COS_REGION)
+
+
+def _dl_presign(version, ttl=None):
+    """给某个版本的安装包签一条只读直链；通道未配置返回空串。"""
+    if not _dl_cos_ready():
+        return ""
+    key = str(UPDATE_OBJECT_TEMPLATE or "h_n-printer_setup_{version}.exe").format(version=version)
+    t = UPDATE_COS_URL_TTL if ttl is None else ttl
+    return update_cos.presign_get_url(UPDATE_COS_SECRET_ID, UPDATE_COS_SECRET_KEY,
+                                      UPDATE_COS_BUCKET, UPDATE_COS_REGION, key, ttl=t)
+
+
+def _dl_flag_get(name, default=""):
+    try:
+        conn = get_user_db()
+        try:
+            row = conn.execute("SELECT value FROM app_flags WHERE name = ?", (name,)).fetchone()
+            return row["value"] if row else default
+        finally:
+            conn.close()
+    except Exception:
+        return default
+
+
+def _dl_flag_set(name, value, by=""):
+    conn = get_user_db()
+    try:
+        conn.execute(
+            "INSERT INTO app_flags(name, value, updated_at, updated_by) VALUES(?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET value=excluded.value, "
+            "updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (name, str(value), _dl_fmt(_dl_now()), str(by or "")),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dl_channel_enabled():
+    """总闸：没显式设过就以「COS 配置齐全」为准。"""
+    v = _dl_flag_get("dl_channel_enabled", "")
+    if v == "":
+        return _dl_cos_ready()
+    return v == "1"
+
+
+def _dl_row_status(row, now_str):
+    """算当前状态（不改库）：revoked / expired / exhausted / active。"""
+    st = (row["status"] or "active")
+    if st != "active":
+        return st
+    if row["expires_at"] and str(row["expires_at"]) <= now_str:
+        return "expired"
+    if row["max_uses"] is not None and int(row["used_count"] or 0) >= int(row["max_uses"]):
+        return "exhausted"
+    return "active"
+
+
+def _dl_today_prefix():
+    return _dl_fmt(_dl_now())[:10]
+
+
+def _dl_quota_used(conn):
+    row = conn.execute("SELECT COUNT(*) AS n FROM download_grants WHERE created_at LIKE ?",
+                       (_dl_today_prefix() + "%",)).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
+def _dl_new_code(conn, family="temp", mode="periodic", expires_at=None, rotate_every_days=0,
+                 grace_hours=0, max_uses=None, max_devices=None, note="", by=""):
+    """生成并插入一个新码，返回 (id, 原始码)。"""
+    code = ""
+    for _ in range(30):
+        cand = _dl_gen_code()
+        if not conn.execute("SELECT 1 FROM download_codes WHERE code = ?", (cand,)).fetchone():
+            code = cand
+            break
+    if not code:
+        raise RuntimeError("下载码生成失败（连续 30 次撞码）")
+    cur = conn.execute(
+        "INSERT INTO download_codes(code, family, mode, created_by, created_at, expires_at,"
+        " rotate_every_days, grace_hours, max_uses, max_devices, status, note)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,'active',?)",
+        (code, family, mode, str(by or ""), _dl_fmt(_dl_now()), expires_at,
+         int(rotate_every_days or 0), int(grace_hours or 0), max_uses, max_devices,
+         str(note or "")),
+    )
+    return cur.lastrowid, code
+
+
+def _dl_current_internal(conn):
+    return conn.execute(
+        "SELECT * FROM download_codes WHERE family = 'internal' AND status = 'active'"
+        " AND superseded_by IS NULL ORDER BY id DESC LIMIT 1").fetchone()
+
+
+def _dl_new_internal(conn, mode="periodic", days=_DL_INTERNAL_DAYS,
+                     grace_hours=_DL_INTERNAL_GRACE, note="内部工作人员下载码", by="system"):
+    now = _dl_now()
+    if mode == "permanent":
+        expires, rotate_days = None, 0
+    else:
+        days = max(1, int(days or _DL_INTERNAL_DAYS))
+        expires, rotate_days = _dl_fmt(now + timedelta(days=days)), days
+    return _dl_new_code(conn, family="internal", mode=mode, expires_at=expires,
+                        rotate_every_days=rotate_days, grace_hours=grace_hours,
+                        note=note, by=by)
+
+
+def _dl_rotate_internal(conn, row, by="system", mode=None, days=None):
+    """换一个内部码：新码立刻生效，旧码保留 grace_hours 过渡期。
+
+    `mode` / `days` 是可选覆盖（管理端「设为永不过期 / 改成定期更换」用）：
+    不传就沿用旧码的策略，所以单纯「立即更换」不会悄悄改掉有效期设置。
+    """
+    now = _dl_now()
+    mode = mode if mode in ("periodic", "permanent") else (row["mode"] or "periodic")
+    days = int(days or row["rotate_every_days"] or 0) or _DL_INTERNAL_DAYS
+    grace = int(row["grace_hours"] or 0)
+    new_id, new_code = _dl_new_internal(
+        conn, mode=mode, days=days or _DL_INTERNAL_DAYS, grace_hours=grace,
+        note=(row["note"] or "内部工作人员下载码"), by=by)
+    old_exp = _dl_fmt(now + timedelta(hours=grace)) if grace > 0 else _dl_fmt(now)
+    conn.execute("UPDATE download_codes SET superseded_by = ?, expires_at = ? WHERE id = ?",
+                 (new_id, old_exp, row["id"]))
+    return new_id, new_code
+
+
+def ensure_internal_download_code(conn=None, by="system"):
+    """保证「当前内部码」存在且有效；没有就建，过期了就轮换。返回行 dict。"""
+    own = conn is None
+    if own:
+        conn = get_user_db()
+    try:
+        now_str = _dl_fmt(_dl_now())
+        row = _dl_current_internal(conn)
+        if row is not None and _dl_row_status(row, now_str) == "active":
+            return dict(row)
+        if row is not None:
+            new_id, _ = _dl_rotate_internal(conn, row, by=by)
+        else:
+            new_id, _ = _dl_new_internal(conn, by=by)
+        conn.commit()
+        nrow = conn.execute("SELECT * FROM download_codes WHERE id = ?", (new_id,)).fetchone()
+        return dict(nrow) if nrow is not None else {}
+    finally:
+        if own:
+            conn.close()
+
+
+def rotate_due_download_codes():
+    """APScheduler 每 10 分钟：内部码到期自动换新 + 清理过期令牌记录。"""
+    conn = None
+    try:
+        conn = get_user_db()
+        now = _dl_now()
+        now_str = _dl_fmt(now)
+        row = _dl_current_internal(conn)
+        if row is None:
+            _nid, code = _dl_new_internal(conn, by="system")
+            print(f"[下载码] 已初始化内部下载码 {_dl_format_code(code)}")
+        elif _dl_row_status(row, now_str) == "expired" and (row["mode"] or "periodic") == "periodic":
+            _nid, code = _dl_rotate_internal(conn, row, by="system")
+            print(f"[下载码] 内部下载码到期，已自动轮换为 {_dl_format_code(code)}")
+        # 过渡期结束的旧码正式作废（记录保留，作废不等于删除）
+        conn.execute(
+            "UPDATE download_codes SET status = 'expired' WHERE status = 'active'"
+            " AND superseded_by IS NOT NULL AND expires_at IS NOT NULL AND expires_at <= ?",
+            (now_str,))
+        # 令牌记录只留 7 天（审计够用，别把 users.db 撑大）
+        conn.execute("DELETE FROM download_grants WHERE created_at < ?",
+                     (_dl_fmt(now - timedelta(days=7)),))
+        conn.commit()
+    except Exception as e:  # noqa: BLE001
+        print(f"[下载码] 轮换任务异常: {type(e).__name__}: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _dl_is_super_admin():
+    return bool(SUPER_ADMIN_OPENID) and getattr(g, "openid", None) == SUPER_ADMIN_OPENID
+
+
+def _dl_client_ip():
+    fwd = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return fwd or (request.headers.get("X-Real-IP") or "").strip() or (request.remote_addr or "")
+
+
+def _dl_html(msg, status=403):
+    body = (
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>安装包下载</title></head>"
+        "<body style=\"font:16px/1.7 system-ui,-apple-system,'Microsoft YaHei',sans-serif;"
+        "padding:40px 24px;color:#1f2329;background:#f6f7f9;max-width:640px;margin:0 auto\">"
+        f"<h2 style=\"font-size:18px;margin:0 0 12px;font-weight:600\">{msg}</h2>"
+        "<p style=\"color:#6b7280;margin:0 0 8px\">请回到「HN 打印工具」客户端，"
+        "在更新窗口里重新申请下载；</p>"
+        f"<p style=\"color:#6b7280;margin:0\">或直接到 <a href=\"{UPDATE_GITHUB_RELEASE_URL}\">"
+        "GitHub Release</a> 下载安装包（推荐，永久免费）。</p>"
+        "</body></html>"
+    )
+    resp = Response(body, status=status, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+def _dl_fail(code, message, status=400):
+    return jsonify({
+        "success": False,
+        "code": code,
+        "message": message,
+        "github_url": UPDATE_GITHUB_RELEASE_URL,
+    }), status
+
+
+def _dl_row_to_dict(row, now=None):
+    now = now or _dl_now()
+    expires = _dl_parse(row["expires_at"])
+    days_left = None
+    if expires is not None:
+        days_left = round((expires - now).total_seconds() / 86400.0, 1)
+    return {
+        "id": row["id"],
+        "code": _dl_format_code(row["code"]),
+        "cdkey": row["code"],
+        "family": row["family"] or "temp",
+        "mode": row["mode"] or "periodic",
+        "status": _dl_row_status(row, _dl_fmt(now)),
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"] or "",
+        "expires_at": row["expires_at"] or "",
+        "days_left": days_left,
+        "rotate_every_days": int(row["rotate_every_days"] or 0),
+        "grace_hours": int(row["grace_hours"] or 0),
+        "max_uses": row["max_uses"],
+        "max_devices": row["max_devices"],
+        "used_count": int(row["used_count"] or 0),
+        "device_count": int(row["device_count"] or 0),
+        "note": row["note"] or "",
+        "superseded_by": row["superseded_by"],
+        "last_used_at": row["last_used_at"] or "",
+        "revoked_at": row["revoked_at"] or "",
+    }
+
+
+@app.route("/api/dl/grant", methods=["POST"])
+def dl_grant():
+    """凭下载码换下载令牌（客户端更新时调用；无需登录，但要码 + 限速 + 配额）。"""
+    if not _dl_cos_ready():
+        return _dl_fail("cos_not_configured", "COS 下载通道未配置，请改从 GitHub Release 下载", 503)
+    ip = _dl_client_ip()
+    if not _rate_limit_ok(f"dl_grant:{ip}", 20, 600):
+        return _dl_fail("rate_limited", "请求过于频繁，请稍后再试", 429)
+    if not _dl_channel_enabled():
+        return _dl_fail("channel_closed", "下载通道已关闭，请改从 GitHub Release 下载", 403)
+
+    data = request.get_json(silent=True) or {}
+    code = _dl_norm_code(data.get("code") or request.form.get("code") or "")
+    version = str(data.get("version") or request.form.get("version") or "").strip()
+    hwid = re.sub(r"[^0-9A-Za-z_\-]", "", str(data.get("hwid") or ""))[:96]
+    if len(code) != _DL_CODE_LEN:
+        return _dl_fail("invalid_code", "下载码不正确")
+    if not _DL_VERSION_RE.match(version):
+        return _dl_fail("bad_version", "版本号不正确")
+
+    now = _dl_now()
+    now_str = _dl_fmt(now)
+    conn = get_user_db()
+    try:
+        if UPDATE_DL_DAILY_QUOTA > 0 and _dl_quota_used(conn) >= UPDATE_DL_DAILY_QUOTA:
+            return _dl_fail("daily_quota",
+                            "今日 COS 下载额度已用完，请改从 GitHub Release 下载", 429)
+        row = conn.execute("SELECT * FROM download_codes WHERE code = ?", (code,)).fetchone()
+        if row is None:
+            return _dl_fail("invalid_code", "下载码不正确")
+        st = _dl_row_status(row, now_str)
+        if st == "revoked":
+            return _dl_fail("code_revoked", "该下载码已作废，请联系管理员", 403)
+        if st == "expired":
+            return _dl_fail("code_expired", "下载码已过期，请向管理员索取新码", 403)
+        if st == "exhausted":
+            return _dl_fail("code_exhausted", "该下载码的使用次数已用完", 403)
+        max_dev = row["max_devices"]
+        if max_dev:
+            if not hwid:
+                return _dl_fail("device_required", "缺少设备标识，请重新打开客户端", 400)
+            seen = {r["hwid"] for r in conn.execute(
+                "SELECT DISTINCT hwid FROM download_grants WHERE code_id = ? AND hwid <> ''",
+                (row["id"],))}
+            if hwid not in seen and len(seen) >= int(max_dev):
+                return _dl_fail("device_limit", "该下载码已绑定其他设备，请联系管理员", 403)
+
+        token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO download_grants(token_hash, code_id, version, hwid, ip, ua,"
+            " created_at, expires_at) VALUES(?,?,?,?,?,?,?,?)",
+            (token_hash, row["id"], version, hwid, ip,
+             (request.headers.get("User-Agent") or "")[:200], now_str,
+             _dl_fmt(now + timedelta(seconds=_DL_TOKEN_TTL))))
+        devices = len({r["hwid"] for r in conn.execute(
+            "SELECT DISTINCT hwid FROM download_grants WHERE code_id = ? AND hwid <> ''",
+            (row["id"],))})
+        conn.execute("UPDATE download_codes SET used_count = used_count + 1,"
+                     " last_used_at = ?, device_count = ? WHERE id = ?",
+                     (now_str, devices, row["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+
+    base = str(UPDATE_DL_BASE_URL or "").rstrip("/")
+    return jsonify({
+        "success": True,
+        "version": version,
+        "url": f"{base}/dl/{token}",
+        "expires_in": _DL_TOKEN_TTL,
+        "expires_at": _dl_fmt(now + timedelta(seconds=_DL_TOKEN_TTL)),
+        "github_url": UPDATE_GITHUB_RELEASE_URL,
+    })
+
+
+@app.route("/dl/<path:token>", methods=["GET"])
+def dl_fetch(token):
+    """令牌 → 302 到 COS 预签名直链。浏览器直接点这里也只会拿到 10 分钟内的那一份。"""
+    if not _dl_cos_ready():
+        return _dl_html("COS 下载通道未配置", 503)
+    if not _dl_channel_enabled():
+        return _dl_html("下载通道已关闭，请改从 GitHub Release 下载", 403)
+    th = hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+    conn = get_user_db()
+    version = ""
+    try:
+        grow = conn.execute("SELECT * FROM download_grants WHERE token_hash = ?",
+                            (th,)).fetchone()
+        if grow is None:
+            return _dl_html("下载链接无效或已被清理", 404)
+        now = _dl_now()
+        exp = _dl_parse(grow["expires_at"])
+        if exp is None or exp <= now:
+            return _dl_html("下载链接已过期，请回到客户端重新申请", 410)
+        crow = conn.execute("SELECT * FROM download_codes WHERE id = ?",
+                            (grow["code_id"],)).fetchone()
+        if crow is None or (crow["status"] or "") == "revoked":
+            return _dl_html("该下载码已作废，请联系管理员", 403)
+        if int(grow["hit_count"] or 0) >= _DL_TOKEN_MAX_HITS:
+            return _dl_html("下载链接使用次数过多，请回到客户端重新申请", 429)
+        conn.execute("UPDATE download_grants SET hit_count = hit_count + 1,"
+                     " consumed_at = COALESCE(consumed_at, ?) WHERE id = ?",
+                     (_dl_fmt(now), grow["id"]))
+        conn.commit()
+        version = grow["version"] or ""
+    finally:
+        conn.close()
+
+    ttl = max(30, min(int(UPDATE_COS_URL_TTL or 180), 300))
+    url = _dl_presign(version, ttl=ttl)
+    if not url:
+        return _dl_html("COS 下载通道未配置", 503)
+    resp = redirect(url, code=302)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/admin/dl/codes", methods=["GET"])
+@login_required
+def dl_admin_codes():
+    """超管：当前内部码 + 最近创建的码 + 通道状态。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    now = _dl_now()
+    conn = get_user_db()
+    try:
+        ensure_internal_download_code(conn, by=g.openid)  # 首次进来就有一个可用码
+        conn.commit()
+        rows = conn.execute(
+            "SELECT * FROM download_codes ORDER BY (family = 'internal') DESC, id DESC"
+            " LIMIT 200").fetchall()
+        codes = [_dl_row_to_dict(r, now) for r in rows]
+        used_today = _dl_quota_used(conn)
+    finally:
+        conn.close()
+    current = next((c for c in codes
+                    if c["family"] == "internal" and c["status"] == "active"
+                    and not c["superseded_by"]), None)
+    return jsonify({
+        "success": True,
+        "codes": codes,
+        "current": current,
+        "channel": {
+            "enabled": _dl_channel_enabled(),
+            "cos_ready": _dl_cos_ready(),
+            "daily_quota": UPDATE_DL_DAILY_QUOTA,
+            "used_today": used_today,
+            "github_url": UPDATE_GITHUB_RELEASE_URL,
+            "object_template": UPDATE_OBJECT_TEMPLATE,
+        },
+    })
+
+
+@app.route("/api/admin/dl/codes", methods=["POST"])
+@login_required
+def dl_admin_create():
+    """超管：新建内部码（若还没有）或临时码。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    data = request.get_json(silent=True) or {}
+    family = str(data.get("family") or "temp").strip()
+    note = str(data.get("note") or "").strip()[:80]
+    created_by = g.openid
+    conn = get_user_db()
+    try:
+        if family == "internal":
+            if _dl_current_internal(conn) is not None:
+                return jsonify({"success": False,
+                                "message": "已存在当前内部码，要换请用「立即更换」"}), 400
+            mode = "permanent" if data.get("permanent") else "periodic"
+            days = max(1, min(int(data.get("days") or _DL_INTERNAL_DAYS), 3650))
+            grace = max(0, min(int(data.get("grace_hours") or _DL_INTERNAL_GRACE), 720))
+            new_id, code = _dl_new_internal(
+                conn, mode=mode, days=days, grace_hours=grace,
+                note=note or "内部工作人员下载码", by=created_by)
+        elif family == "temp":
+            hours = max(1, min(int(data.get("hours") or 24), 24 * 90))
+            max_uses = data.get("max_uses", 1)
+            max_uses = None if max_uses in (None, "", 0) else max(1, min(int(max_uses), 999))
+            max_devices = data.get("max_devices", 1)
+            max_devices = (None if max_devices in (None, "", 0)
+                           else max(1, min(int(max_devices), 99)))
+            new_id, code = _dl_new_code(
+                conn, family="temp", mode="periodic",
+                expires_at=_dl_fmt(_dl_now() + timedelta(hours=hours)),
+                max_uses=max_uses, max_devices=max_devices, note=note, by=created_by)
+        else:
+            return jsonify({"success": False, "message": "下载码类型不正确"}), 400
+        conn.commit()
+        row = conn.execute("SELECT * FROM download_codes WHERE id = ?", (new_id,)).fetchone()
+        out = _dl_row_to_dict(row)
+    finally:
+        conn.close()
+    return jsonify({"success": True, "code": out["code"], "cdkey": out["cdkey"], "item": out})
+
+
+@app.route("/api/admin/dl/codes/<int:cid>/rotate", methods=["POST"])
+@login_required
+def dl_admin_rotate(cid):
+    """超管：立即更换（内部码走轮换+过渡期；临时码直接作废旧码）。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    data = request.get_json(silent=True) or {}
+    now = _dl_now()
+    conn = get_user_db()
+    try:
+        row = conn.execute("SELECT * FROM download_codes WHERE id = ?", (cid,)).fetchone()
+        if row is None:
+            return jsonify({"success": False, "message": "下载码不存在"}), 404
+        if (row["status"] or "") == "revoked":
+            return jsonify({"success": False, "message": "该下载码已作废，不能更换"}), 400
+        if (row["family"] or "") == "internal":
+            # 「设为永不过期 / 改成定期更换」也走这里：换码的同时改策略是同一件事
+            # （旧码一律留 grace_hours 过渡期，现场那台机器不会立刻失效）
+            mode = data.get("mode") if data.get("mode") in ("periodic", "permanent") else None
+            days_arg = data.get("days")
+            days = (max(1, min(int(days_arg), 3650))
+                    if days_arg not in (None, "") else None)
+            new_id, code = _dl_rotate_internal(conn, row, by=g.openid, mode=mode, days=days)
+        else:
+            exp, created = _dl_parse(row["expires_at"]), _dl_parse(row["created_at"])
+            hours = 24
+            if exp and created:
+                hours = max(1, int((exp - created).total_seconds() // 3600))
+            new_id, code = _dl_new_code(
+                conn, family="temp", mode="periodic",
+                expires_at=_dl_fmt(now + timedelta(hours=hours)),
+                max_uses=row["max_uses"], max_devices=row["max_devices"],
+                note=row["note"] or "", by=g.openid)
+            conn.execute("UPDATE download_codes SET superseded_by = ?, status = 'revoked',"
+                         " revoked_at = ?, revoked_by = ? WHERE id = ?",
+                         (new_id, _dl_fmt(now), g.openid, row["id"]))
+        conn.commit()
+        nrow = conn.execute("SELECT * FROM download_codes WHERE id = ?", (new_id,)).fetchone()
+        out = _dl_row_to_dict(nrow)
+    finally:
+        conn.close()
+    return jsonify({"success": True, "code": out["code"], "cdkey": out["cdkey"], "item": out})
+
+
+@app.route("/api/admin/dl/codes/<int:cid>/extend", methods=["POST"])
+@login_required
+def dl_admin_extend(cid):
+    """超管：续期（小时/天），从「原到期时间与现在取晚」起算。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    data = request.get_json(silent=True) or {}
+    hours = int(data.get("hours") or 0)
+    days = int(data.get("days") or 0)
+    if hours <= 0 and days <= 0:
+        return jsonify({"success": False, "message": "请指定续期时长"}), 400
+    span = timedelta(hours=max(0, hours), days=max(0, days))
+    now = _dl_now()
+    conn = get_user_db()
+    try:
+        row = conn.execute("SELECT * FROM download_codes WHERE id = ?", (cid,)).fetchone()
+        if row is None:
+            return jsonify({"success": False, "message": "下载码不存在"}), 404
+        if (row["mode"] or "periodic") == "permanent" or not row["expires_at"]:
+            return jsonify({"success": False, "message": "该下载码永不过期，无需续期"}), 400
+        if (row["status"] or "") == "revoked":
+            return jsonify({"success": False, "message": "该下载码已作废，不能续期"}), 400
+        base = _dl_parse(row["expires_at"]) or now
+        base = max(base, now)
+        conn.execute("UPDATE download_codes SET expires_at = ?, status = 'active' WHERE id = ?",
+                     (_dl_fmt(base + span), cid))
+        if (row["family"] or "") == "internal":
+            conn.execute("UPDATE download_codes SET rotate_every_days = ? WHERE id = ?",
+                         (max(1, int((base + span - (_dl_parse(row["created_at"]) or now))
+                                     .total_seconds() // 86400)), cid))
+        conn.commit()
+        nrow = conn.execute("SELECT * FROM download_codes WHERE id = ?", (cid,)).fetchone()
+        out = _dl_row_to_dict(nrow)
+    finally:
+        conn.close()
+    return jsonify({"success": True, "item": out})
+
+
+@app.route("/api/admin/dl/codes/<int:cid>/revoke", methods=["POST"])
+@login_required
+def dl_admin_revoke(cid):
+    """超管：立即作废（保留记录）。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    conn = get_user_db()
+    try:
+        row = conn.execute("SELECT * FROM download_codes WHERE id = ?", (cid,)).fetchone()
+        if row is None:
+            return jsonify({"success": False, "message": "下载码不存在"}), 404
+        conn.execute("UPDATE download_codes SET status = 'revoked', revoked_at = ?,"
+                     " revoked_by = ? WHERE id = ?",
+                     (_dl_fmt(_dl_now()), g.openid, cid))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/dl/codes/<int:cid>", methods=["DELETE"])
+@login_required
+def dl_admin_delete(cid):
+    """超管：删除气流码。**已使用过的只作废、不删除**（分发记录必须留痕）。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    conn = get_user_db()
+    try:
+        row = conn.execute("SELECT * FROM download_codes WHERE id = ?", (cid,)).fetchone()
+        if row is None:
+            return jsonify({"success": False, "message": "下载码不存在"}), 404
+        if (row["family"] or "") == "internal":
+            return jsonify({"success": False,
+                            "message": "内部下载码不能删除，请用「立即更换」或「作废」"}), 400
+        if int(row["used_count"] or 0) > 0:
+            return jsonify({"success": False,
+                            "message": "该下载码已被使用过，只作废不删除（保留分发记录）"}), 400
+        conn.execute("DELETE FROM download_codes WHERE id = ?", (cid,))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/admin/dl/switch", methods=["POST"])
+@login_required
+def dl_admin_switch():
+    """超管：COS 下载总闸。关掉之后所有人都只能走 GitHub Release。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    _dl_flag_set("dl_channel_enabled", "1" if enabled else "0", by=g.openid)
+    return jsonify({"success": True, "enabled": enabled})
+
+
+@app.route("/api/admin/dl/grants", methods=["GET"])
+@login_required
+def dl_admin_grants():
+    """超管：最近的下载令牌记录（谁、何时、哪个码、哪个版本、是否已取货）。"""
+    if not _dl_is_super_admin():
+        return jsonify({"success": False, "message": "仅限超级管理员操作"}), 403
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 500))
+    except (TypeError, ValueError):
+        limit = 50
+    conn = get_user_db()
+    try:
+        rows = conn.execute(
+            "SELECT gr.*, c.code AS code FROM download_grants gr"
+            " LEFT JOIN download_codes c ON c.id = gr.code_id"
+            " ORDER BY gr.id DESC LIMIT ?", (limit,)).fetchall()
+        items = [{
+            "id": r["id"],
+            "code": _dl_format_code(r["code"] or ""),
+            "version": r["version"],
+            "hwid": r["hwid"] or "",
+            "ip": r["ip"] or "",
+            "ua": r["ua"] or "",
+            "created_at": r["created_at"],
+            "expires_at": r["expires_at"],
+            "fetched": bool(r["consumed_at"]),
+            "hits": int(r["hit_count"] or 0),
+        } for r in rows]
+        used_today = _dl_quota_used(conn)
+    finally:
+        conn.close()
+    return jsonify({"success": True, "items": items, "used_today": used_today,
+                    "daily_quota": UPDATE_DL_DAILY_QUOTA})
+
+
+@app.route("/api/printer/dl/code", methods=["GET"])
+@require_printer_scope("admin")
+def dl_printer_current_code():
+    """设备端（本地打印工具）：只读拿当前内部码，给内部人员复制用。"""
+    conn = get_user_db()
+    try:
+        row = ensure_internal_download_code(conn, by="printer")
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({
+        "success": True,
+        "code": _dl_format_code(row.get("code") or ""),
+        "cdkey": row.get("code") or "",
+        "mode": row.get("mode") or "periodic",
+        "expires_at": row.get("expires_at") or "",
+        "cos_ready": _dl_cos_ready(),
+        "github_url": UPDATE_GITHUB_RELEASE_URL,
+    })
+
+
 @app.route("/api/admin/users", methods=["GET"])
 @login_required
 def admin_users_list():
@@ -15288,6 +16093,7 @@ if __name__ == "__main__":
     scheduler.add_job(process_scheduled_orders, "interval", seconds=30, id="scan_scheduled")
     scheduler.add_job(check_printing_timeout, "interval", seconds=60, id="check_timeout")
     scheduler.add_job(cleanup_expired_license_keys, "interval", minutes=10, id="cleanup_licenses")
+    scheduler.add_job(rotate_due_download_codes, "interval", minutes=10, id="rotate_dl_codes")
     scheduler.add_job(cleanup_expired_files, "interval", minutes=10, id="cleanup_files")
     scheduler.add_job(recover_orphaned_printing_tasks, "interval", minutes=2, id="recover_orphans")
     scheduler.add_job(recover_stale_downloading, "interval", minutes=2, id="recover_stale_downloads")

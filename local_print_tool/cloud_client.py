@@ -674,6 +674,27 @@ class CloudClient(QObject):
 
     # ── 公共 API ──
 
+    def fetch_download_code(self) -> dict:
+        """只读取「安装包下载码」（超管在小程序「我」页或结算页创建，内部人员更新时要用）。
+
+        从 4.7.0 起 COS 桶不再公开：客户端要更新得先有这枚 8 位码，换一枚 10 分钟令牌。
+        本机只是**只读展示 + 复制**（创建/轮换都在管理端），所以这里任何失败都不抛异常，
+        一律返回 {"success": False, "message": ...} —— 菜单项点开时不会因为服务器没配
+        COS 或 token 没 admin scope 而崩。
+        """
+        if not self.api_url or not self.token:
+            return {"success": False, "message": "未配置云端地址或 token"}
+        try:
+            resp = http_requests.get(f"{self.api_url}/api/printer/dl/code",
+                                     headers=self._auth_headers(), timeout=10)
+            data = resp.json() if resp.content else {}
+            if resp.ok and isinstance(data, dict):
+                return data
+            msg = str(data.get("message") or "") if isinstance(data, dict) else ""
+            return {"success": False, "message": msg or f"HTTP {resp.status_code}"}
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "message": str(e)}
+
     def start(self):
         """启动云客户端（后台线程）。"""
         if self._thread is not None and self._thread.is_alive():

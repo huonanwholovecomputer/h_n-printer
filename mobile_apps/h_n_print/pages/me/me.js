@@ -266,6 +266,12 @@ Component({
     tempUserDeleteOpacity: {},     // { openid: 0~1 }
     redeemKey: '',
     redeeming: false,
+    // 超管专属：COS 下载码（安装包不再公开直链，凭码换令牌才能从 COS 下）
+    dlCurrent: null,
+    dlChannel: null,
+    dlExpiryText: '',
+    dlLoading: false,
+    dlBusy: false,
     // 账号绑定入口（管理功能在独立页面 pages/bind/bind，这里只显示已绑定设备数）
     bindDeviceCount: 0,
     // 临时授权倒计时
@@ -407,6 +413,7 @@ Component({
           this.loadRecentOrders()   // 「近 N 条订单」：进入页面拉一次（15s 内去重）
           if (this.data.isSuperAdmin) {
             this.loadAdmins()
+            this.loadDownloadCodes()   // COS 下载码卡片（码本身后端首次访问会自动建一个）
           }
         }
         try {
@@ -470,6 +477,7 @@ Component({
           this.loadRecentOrders()   // 「近 N 条订单」：进入页面拉一次（15s 内去重）
           if (this.data.isSuperAdmin) {
             this.loadAdmins()
+            this.loadDownloadCodes()   // COS 下载码卡片（码本身后端首次访问会自动建一个）
           }
         }
       }
@@ -1230,6 +1238,7 @@ Component({
               this._startKeyPolling()
               if (isSuper) {
                 this.loadAdmins()
+                this.loadDownloadCodes()
               }
             } else {
               this._stopKeyPolling()
@@ -2366,6 +2375,160 @@ Component({
           }
         },
         fail: () => wx.showToast({ title: '网络错误', icon: 'none' })
+      })
+    },
+
+    // ==================== 超级管理员：COS 下载码 ====================
+    // 为什么有这东西：COS 桶里的安装包不再给公开直链（怕被白嫖流量），要下必须先有
+    // 一个「下载码」→ 换一枚 10 分钟、单次使用的令牌 → 302 到 COS 预签名地址。
+    // 普通用户一律走 GitHub Release（免费、不限量），所以这张卡片只有超管看得到。
+    // 接口：GET/POST /api/admin/dl/codes、/codes/<id>/rotate、/codes/<id>/revoke、/switch
+
+    loadDownloadCodes() {
+      const token = wx.getStorageSync('token')
+      if (!token || !this.data.isSuperAdmin) return
+      if (this._dlLoadingNow) return
+      this._dlLoadingNow = true
+      this.setData({ dlLoading: true })
+      request({
+        url: CONFIG.BASE_URL + '/api/admin/dl/codes',
+        method: 'GET',
+        header: { 'Authorization': 'Bearer ' + token },
+        success: (res) => {
+          this._dlLoadingNow = false
+          const d = res.data || {}
+          if (d.success) {
+            this._applyDownloadCode(d.current || null, d.channel || null)
+          } else {
+            this.setData({ dlLoading: false })
+          }
+        },
+        fail: () => {
+          this._dlLoadingNow = false
+          this.setData({ dlLoading: false })
+        }
+      })
+    },
+
+    // 把「当前码 + 通道状态」落到 data 里，顺带算好给人看的有效期文案
+    _applyDownloadCode(current, channel) {
+      let expiry = ''
+      if (!current) {
+        expiry = '尚未创建'
+      } else if (current.mode === 'permanent') {
+        expiry = '永不过期'
+      } else if (current.expires_at) {
+        const days = Number(current.days_left)
+        expiry = isFinite(days)
+          ? `还有 ${Math.max(0, days)} 天（至 ${String(current.expires_at).slice(0, 10)}）`
+          : `至 ${String(current.expires_at).slice(0, 16)}`
+      } else {
+        expiry = '定期更换'
+      }
+      this.setData({
+        dlLoading: false,
+        dlCurrent: current,
+        dlChannel: channel,
+        dlExpiryText: expiry,
+      })
+      this._scheduleMeasure()
+    },
+
+    _dlPost(path, body, okTitle) {
+      const token = wx.getStorageSync('token')
+      if (!token || this.data.dlBusy) return
+      this.setData({ dlBusy: true })
+      request({
+        url: CONFIG.BASE_URL + path,
+        method: 'POST',
+        header: {
+          'Authorization': 'Bearer ' + token,
+          'Content-Type': 'application/json',
+        },
+        data: body || {},
+        success: (res) => {
+          this.setData({ dlBusy: false })
+          const d = res.data || {}
+          if (d.success) {
+            if (okTitle) wx.showToast({ title: okTitle, icon: 'none' })
+            this.loadDownloadCodes()
+          } else {
+            wx.showToast({ title: d.message || '操作失败，请稍后重试', icon: 'none' })
+          }
+        },
+        fail: () => {
+          this.setData({ dlBusy: false })
+          wx.showToast({ title: '网络异常，请稍后重试', icon: 'none' })
+        }
+      })
+    },
+
+    onCopyDownloadCode() {
+      const c = this.data.dlCurrent
+      if (!c || !c.code) return
+      wx.setClipboardData({
+        data: c.code,
+        success: () => wx.showToast({ title: '下载码已复制', icon: 'none' })
+      })
+    },
+
+    onRotateDownloadCode() {
+      const c = this.data.dlCurrent
+      if (!c || this.data.dlBusy) return
+      wx.showModal({
+        title: '立即更换下载码',
+        content: '新码立刻生效，旧码保留 24 小时过渡期：'
+          + '正在更新中的机器不会当场失效，但新来的人必须用新码。',
+        confirmText: '更换',
+        success: (r) => {
+          if (r.confirm) {
+            this._dlPost(`/api/admin/dl/codes/${c.id}/rotate`, {}, '下载码已更换')
+          }
+        }
+      })
+    },
+
+    onToggleDownloadPermanent() {
+      const c = this.data.dlCurrent
+      if (!c || this.data.dlBusy) return
+      const toPermanent = c.mode !== 'permanent'
+      wx.showModal({
+        title: toPermanent ? '设为永不过期' : '改成定期更换',
+        content: toPermanent
+          ? '设为永不过期后不再自动轮换（会换一个新码）。'
+            + '只建议内部人少的时期用：码一旦流出就只能手动更换。'
+          : '会换一个新码，之后每 30 天自动轮换一次，旧码留 24 小时过渡期。',
+        confirmText: '确定',
+        success: (r) => {
+          if (!r.confirm) return
+          this._dlPost(
+            `/api/admin/dl/codes/${c.id}/rotate`,
+            toPermanent ? { mode: 'permanent' } : { mode: 'periodic', days: 30 },
+            toPermanent ? '已设为永不过期' : '已改成定期更换')
+        }
+      })
+    },
+
+    onToggleDownloadChannel() {
+      const ch = this.data.dlChannel
+      if (!ch || this.data.dlBusy) return
+      const toOn = !ch.enabled
+      const cosReady = ch.cos_ready !== false
+      wx.showModal({
+        title: toOn ? '开启 COS 加速通道' : '关闭 COS 加速通道',
+        content: toOn
+          ? (cosReady
+            ? '开启后，持有下载码的人可以从 COS 加速下载安装包。'
+            : '服务器还没有配好 COS 只读密钥，开启后也会自动回退到 GitHub。')
+          : '关闭后所有人都只能走 GitHub Release —— 不产生 COS 流量费，'
+            + '但国内下载可能较慢。',
+        confirmText: toOn ? '开启' : '关闭',
+        success: (r) => {
+          if (r.confirm) {
+            this._dlPost('/api/admin/dl/switch', { enabled: toOn },
+              toOn ? 'COS 通道已开启' : 'COS 通道已关闭')
+          }
+        }
       })
     },
 

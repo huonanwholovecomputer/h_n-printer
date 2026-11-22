@@ -2376,3 +2376,35 @@
 }
 
 
+
+/* ── 超管：COS 下载码卡片（2026-11） ───────────────────────────────────
+   各家样式尽量复用许可密钥那一套（license-card / key-row / copy-btn），
+   这里只补三样：说明文字更小更淡、通道状态行、右侧「开启/关闭」文字按钮。 */
+.dl-hint {
+  margin: 0 0 10rpx;
+  font-size: 24rpx;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+.dl-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12rpx;
+  gap: 12rpx;
+}
+.dl-meta {
+  flex: 1;
+  font-size: 22rpx;
+  line-height: 1.5;
+  color: var(--text-quaternary);
+}
+.dl-switch {
+  flex-shrink: 0;
+  padding: 6rpx 18rpx;
+  font-size: 22rpx;
+  font-weight: 600;
+  color: var(--blue);
+  border: 1rpx solid var(--separator);
+  border-radius: 999rpx;
+}

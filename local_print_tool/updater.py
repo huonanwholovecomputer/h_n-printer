@@ -64,6 +64,11 @@ import net_direct  # 更新流量也走云端直连（见 net_direct.py）
 logger = logging.getLogger(__name__)
 
 UPDATE_MANIFEST_URL = "https://hn-space.cn/updates/update.json"
+# 下载码体系（2026-11）：清单可以不含 url，改由这里凭码换一枚短时令牌。
+#   POST {"code": "ABCD-EFGH", "version": "4.7.0", "hwid": "..."} → {"url": "https://hn-space.cn/dl/<token>"}
+UPDATE_GRANT_URL = "https://hn-space.cn/api/dl/grant"
+# 推荐渠道：公开、不限速、不花钱，UI 上永远与 COS 那一行并排展示
+GITHUB_RELEASE_URL = "https://github.com/huonanwholovecomputer/h_n-printer/releases/latest"
 FETCH_TIMEOUT = 10
 DOWNLOAD_CHUNK = 65536
 _WAIT_MAX_LOOPS = 60  # update.cmd 轮询等待主程序退出上限（约 2 分钟）
@@ -123,6 +128,29 @@ class VersionFormatError(ValueError):
 
 class ManifestError(ValueError):
     """更新清单未通过安全校验（host / 哈希 / 签名）。整份清单作废。"""
+
+
+class DownloadCodeError(Exception):
+    """下载码换令牌失败（码错/过期/次数用完/设备超限/配额用完/通道关闭）。
+
+    `code` 是后端给的机读码（invalid_code / code_expired / daily_quota …），
+    `message` 是可以直接显示给用户的中文。GUI 用 message 做弹窗文案，
+    `code` 只用于判断要不要额外提示"去 GitHub 下载"。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message or code or "下载码校验失败")
+        self.code = str(code or "")
+        self.message = str(message or "")
+
+    @property
+    def suggest_github(self) -> bool:
+        """这些情况继续试 COS 没有意义，直接引导去 GitHub Release。"""
+        return self.code in (
+            "daily_quota", "channel_closed", "cos_not_configured",
+            "rate_limited", "code_expired", "code_exhausted",
+            "code_revoked", "device_limit", "invalid_code",
+        )
 
 
 def last_reject_reason() -> str:
@@ -353,22 +381,30 @@ def verify_manifest_signature(manifest: dict, public_key_b64: str | None = None)
 # 清单校验 / 拉取
 # ============================================================================
 
-def validate_manifest(manifest: dict) -> dict:
+def validate_manifest(manifest: dict, require_url: bool = True) -> dict:
     """校验整份清单的安全字段；不合法抛 ManifestError。
 
     顺序：结构 → 版本 → 下载 URL（host 白名单）→ **验签** → 哈希字段。
     验签放在哈希之前是刻意的：哈希字段本身也在签名保护范围内，先验签才能信任它。
+
+    `require_url=False` 用于「发现清单」（下载码体系的 4.7.0+）：清单里**故意没有
+    url**，下载地址由 `/api/dl/grant` 凭码现发。此时 url 若仍存在，照样要过白名单
+    （防止把公开直链偷偷塞回来绕开下载码）。
     """
     if not isinstance(manifest, dict):
         raise ManifestError("更新清单不是 JSON 对象")
     if not str(manifest.get("version") or "").strip():
         raise ManifestError("更新清单缺少 version 字段")
     manifest = dict(manifest)
-    try:
-        manifest["url"] = validate_download_url(manifest.get("url", ""))
-    except ValueError as e:
-        # 统一成 ManifestError：调用方只需处理一种"清单不可信"异常
-        raise ManifestError(str(e)) from e
+    has_url = bool(str(manifest.get("url") or "").strip())
+    if require_url or has_url:
+        try:
+            manifest["url"] = validate_download_url(manifest.get("url", ""))
+        except ValueError as e:
+            # 统一成 ManifestError：调用方只需处理一种"清单不可信"异常
+            raise ManifestError(str(e)) from e
+    else:
+        manifest.pop("url", None)
 
     state = verify_manifest_signature(manifest)
     if state == SIG_UNSIGNED:
@@ -380,6 +416,108 @@ def validate_manifest(manifest: dict) -> dict:
 
     expected_hash(manifest)  # 缺失/非法 → ManifestError
     return manifest
+
+
+def validate_discovery_manifest(manifest: dict) -> dict:
+    """发现清单（不含 url，需要下载码换令牌）的校验入口。"""
+    return validate_manifest(manifest, require_url=False)
+
+
+def manifest_needs_code(manifest: dict) -> bool:
+    """这份清单是否必须凭下载码才能下载（= 没带 url）。"""
+    return not str((manifest or {}).get("url") or "").strip()
+
+
+def normalize_download_code(raw: str) -> str:
+    """把用户输入的下载码归一化成 `XXXX-XXXX`；长度不对抛 ValueError。"""
+    c = re.sub(r"[^0-9A-Za-z]", "", str(raw or "")).upper()
+    if len(c) != 8:
+        raise ValueError("下载码是 8 位字母数字（形如 ABCD-EFGH）")
+    return f"{c[:4]}-{c[4:]}"
+
+
+def device_id() -> str:
+    """稳定的匿名设备标识：给「一个码最多几台机器」和审计用。
+
+    只写 `%APPDATA%\\HN打印工具\\.hwid`（首次生成 hostname-随机串），不含用户名、
+    不含任何硬件序列号，也不上报别的东西。
+    """
+    import socket
+    import uuid
+
+    base = os.environ.get("APPDATA") or tempfile.gettempdir()
+    folder = os.path.join(base, "HN打印工具")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        folder = tempfile.gettempdir()
+    path = os.path.join(folder, ".hwid")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            val = f.read().strip()
+        if len(val) >= 8:
+            return val
+    except OSError:
+        pass
+    val = f"{socket.gethostname()}-{uuid.uuid4().hex[:12]}"
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(val)
+    except OSError:
+        logger.warning("设备标识写入失败（不影响更新，仅少一层设备绑定）")
+    return val
+
+
+def request_download_url(code: str, version: str, hwid: str = "",
+                         timeout: int = FETCH_TIMEOUT) -> str:
+    """凭下载码向服务端换一枚下载令牌的 URL；失败抛 DownloadCodeError。
+
+    返回的地址是 `https://hn-space.cn/dl/<token>`，仍然要过 `validate_download_url`
+    （哪怕后端被攻破，也只能把用户导向白名单域名）。
+    """
+    payload = json.dumps({
+        "code": str(code or ""),
+        "version": str(version or ""),
+        "hwid": str(hwid or ""),
+    }).encode("utf-8")
+    net_direct.ensure_direct(UPDATE_GRANT_URL)
+    opener = _build_opener()
+    req = urllib.request.Request(
+        UPDATE_GRANT_URL, data=payload, method="POST",
+        headers={"User-Agent": "HN-Print-Updater/2.0",
+                 "Content-Type": "application/json; charset=utf-8"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read(MAX_MANIFEST_BYTES)
+    except urllib.error.HTTPError as e:
+        # 4xx/5xx 的 body 里带着 {"code","message"}，优先用它给用户看人话
+        body = b""
+        try:
+            body = e.read(MAX_MANIFEST_BYTES)
+        except Exception:
+            pass
+        data = {}
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            data = {}
+        raise DownloadCodeError(
+            str(data.get("code") or f"http_{e.code}"),
+            str(data.get("message") or f"下载码校验失败（HTTP {e.code}）")) from e
+    except Exception as e:
+        raise DownloadCodeError("network_error", f"连不上下载服务：{e}") from e
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise DownloadCodeError("bad_response", "下载服务返回了无法解析的内容") from e
+    if not isinstance(data, dict) or not data.get("success"):
+        raise DownloadCodeError(str(data.get("code") or "failed"),
+                                str(data.get("message") or "下载码校验失败"))
+    try:
+        return validate_download_url(str(data.get("url") or ""))
+    except ValueError as e:
+        raise DownloadCodeError("bad_url", f"下载服务返回的地址不可信：{e}") from e
 
 
 def fetch_update_info(timeout: int = FETCH_TIMEOUT) -> dict | None:
@@ -874,6 +1012,39 @@ def prepare_update(manifest: dict, current_version: str, progress_cb=None,
     setup_path = download_setup(
         manifest.get("url", ""), digest, updates_root(),
         progress_cb=progress_cb, algo=algo)
+    return _finish_prepare(setup_path, algo, digest)
+
+
+def prepare_update_with_code(manifest: dict, current_version: str, code: str,
+                             hwid: str = "", progress_cb=None,
+                             user_confirmed: bool = False) -> tuple[str, str] | None:
+    """凭下载码准备更新（4.7.0+ 的清单不含 url 时走这条）。
+
+    顺序：发现清单校验（含**验签**）→ 凭码换令牌（后端给 https://hn-space.cn/dl/…）
+    → 下载 → 校验签名过的哈希 → 落盘复算。任何一步失败返回 None，
+    GUI 那边用 `request_download_url` 的异常拿到人话提示。
+
+    与 `prepare_update` 共用尾部（`_finish_prepare`），哈希口径只有一个来源：
+    **签名过的清单**。服务端返回的 url 换掉了也改不了要校验的哈希。
+    """
+    if not user_confirmed:
+        logger.error("拒绝准备更新：未获得用户明确确认（下载码只在用户点击后使用）")
+        return None
+    try:
+        manifest = validate_discovery_manifest(dict(manifest or {}))
+        algo, digest = expected_hash(manifest)
+        version = str(manifest.get("version") or "").strip()
+    except (ManifestError, ValueError) as e:
+        logger.error(f"更新清单未通过安全校验，拒绝下载: {e}")
+        return None
+    url = request_download_url(code, version, hwid)  # 失败抛 DownloadCodeError
+    setup_path = download_setup(url, digest, updates_root(),
+                                progress_cb=progress_cb, algo=algo)
+    return _finish_prepare(setup_path, algo, digest)
+
+
+def _finish_prepare(setup_path: str | None, algo: str, digest: str):
+    """下载完之后的公共收尾：落盘复算 + 返回 (setup, exe)。"""
     if not setup_path:
         return None
     # 交给安装器之前**再复算一次**（这是最后一次能便宜地发现"文件被换掉"的机会）

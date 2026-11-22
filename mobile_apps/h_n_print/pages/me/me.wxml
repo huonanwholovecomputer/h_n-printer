@@ -527,6 +527,51 @@
       </view>
     </view>
 
+    <!-- 超级管理员：COS 下载码（2026-11）。
+         安装包不再给公开直链：内部工作人员更新时填这个 8 位码，换 10 分钟单次令牌后
+         由服务端 302 到 COS 预签名地址；普通用户一律走 GitHub Release（免费、不限量）。
+         所以这张卡片只有超管可见，且判据是 isSuperAdmin（userRole === 'super_admin' 永不命中）。 -->
+    <view wx:if="{{isSuperAdmin}}" class="license-section admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}">
+      <view class="section-title">
+        <view class="section-bar"></view>
+        <text>COS 下载码</text>
+        <text wx:if="{{dlCurrent}}" class="order-count">今日 {{dlChannel.used_today || 0}}/{{dlChannel.daily_quota || 0}}</text>
+      </view>
+      <view class="license-card">
+        <text class="redeem-desc dl-hint">内部工作人员更新时填写此码；普通用户请走 GitHub Release（免费、不限量）。</text>
+
+        <view wx:if="{{dlCurrent}}" class="key-row">
+          <view class="key-left">
+            <text class="key-label">当前下载码</text>
+            <text class="key-value">{{dlCurrent.code}}</text>
+          </view>
+          <view class="key-right">
+            <text class="key-countdown {{dlCurrent.status === 'active' ? '' : 'countdown-expired'}}">{{dlExpiryText}}</text>
+          </view>
+        </view>
+        <view wx:elif="{{dlLoading}}" class="key-row">
+          <text class="redeem-desc dl-hint">正在读取下载码…</text>
+        </view>
+        <view wx:else class="key-row">
+          <text class="redeem-desc dl-hint">还没有下载码（首次进入会自动生成，也可点下面按钮）。</text>
+        </view>
+
+        <view class="key-actions">
+          <button wx:if="{{dlCurrent}}" class="copy-btn" bindtap="onCopyDownloadCode" hover-class="tap-active">复制</button>
+          <button wx:if="{{dlCurrent}}" class="copy-btn" bindtap="onRotateDownloadCode" hover-class="tap-active" disabled="{{dlBusy}}">立即更换</button>
+          <button wx:if="{{dlCurrent}}" class="copy-btn" bindtap="onToggleDownloadPermanent" hover-class="tap-active" disabled="{{dlBusy}}">{{dlCurrent.mode === 'permanent' ? '改成定期更换' : '设为永不过期'}}</button>
+        </view>
+
+        <view wx:if="{{dlChannel}}" class="dl-meta-row">
+          <text class="dl-meta">加速通道{{dlChannel.enabled ? '已开启' : '已关闭'}}（今日 {{dlChannel.used_today || 0}}/{{dlChannel.daily_quota}} 次，超出只放行 GitHub）</text>
+          <text class="dl-switch" bindtap="onToggleDownloadChannel" hover-class="tap-active">{{dlChannel.enabled ? '关闭' : '开启'}}</text>
+        </view>
+        <view wx:if="{{dlChannel && !dlChannel.cos_ready}}" class="dl-meta-row">
+          <text class="dl-meta">服务器未配置 COS 只读密钥，加速通道暂不可用（会自动回退 GitHub）。</text>
+        </view>
+      </view>
+    </view>
+
     <!-- 管理员/超级管理员：历史授权用户 -->
     <view class="role-actions admin-collapsible {{userRole === 'admin' ? 'admin-expanded' : ''}}">
       <view class="role-btn user-btn" bindtap="onGoAuthorizedUsers" hover-class="role-btn-pressing" hover-start-time="0" hover-stay-time="100">

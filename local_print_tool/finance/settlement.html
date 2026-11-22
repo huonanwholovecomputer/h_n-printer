@@ -11244,8 +11244,154 @@ function renderAuth() {
   h += '<div class="section"><h2>📡 云端设备列表 <span class="hint">（连接过云服务器的所有设备 · 在线状态实时 · 可标注自动双面能力）</span></h2>';
   h += '<div id="auth-devices" style="color:var(--muted)">加载中…</div>'
     + '<div style="margin-top:10px;font-size:.78rem;color:var(--muted)">🖨️ <b>打印机台账 / 折旧 / 订单归属</b>在「🖨️ 打印机折旧」页（独立密码，与授权模块分开）。</div></div>';
+  // 2026-11：COS 安装包下载码（安装包不再给公开直链，内部工作人员更新时要填这个码）。
+  // 只有超级管理员能读写；普通管理员会看到一句 403 提示，不弹错。
+  h += '<div class="section"><h2>🔑 COS 下载码 <span class="hint">（发给内部工作人员；普通用户走 GitHub Release）</span></h2>';
+  h += '<div id="auth-dlcodes" style="color:var(--muted)">加载中…</div></div>';
   el.innerHTML = h;
   loadAuthData(members);
+  loadDownloadCodesPanel();
+}
+
+/* ==================== COS 下载码（超级管理员） ====================
+   为什么有这一块：COS 桶里不再放公开直链 —— 谁要下安装包，先得有这个 8 位码，
+   客户端拿它换一枚 10 分钟、单次使用的令牌，服务端 302 到 COS 预签名地址。
+   普通用户应当一律走 GitHub Release（免费、不限量），所以这张卡片只在云端模式出现，
+   且对非超管只显示一句提示（接口 403）。 */
+function loadDownloadCodesPanel() {
+  var box = $('#auth-dlcodes');
+  if (!box) return;
+  fetch('/api/proxy/admin/dl/codes', { headers: apiHeaders() })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      var b = $('#auth-dlcodes');
+      if (!b) return;
+      if (!res || !res.success) {
+        b.innerHTML = '<span style="color:var(--muted)">' +
+          esc((res && res.message) || '下载码读取失败（需超级管理员身份 + 云端连接）') + '</span>';
+        return;
+      }
+      _dlPanelData = res;
+      b.innerHTML = dlCodesPanelHtml(res);
+    })
+    .catch(function () {
+      var b = $('#auth-dlcodes');
+      if (b) b.innerHTML = '<span style="color:var(--muted)">下载码读取失败（云端未连接？）</span>';
+    });
+}
+
+var _dlPanelData = null;
+
+function dlCodesPanelHtml(res) {
+  var cur = res.current || null;
+  var ch = res.channel || {};
+  var h = '';
+  if (!cur) {
+    h += '<div style="color:var(--muted);margin-bottom:10px">还没有下载码（客户端首次访问管理接口会自动生成一个）。</div>';
+  } else {
+    var expiry = cur.mode === 'permanent' ? '永不过期'
+      : (cur.expires_at ? '至 ' + esc(String(cur.expires_at).slice(0, 16)) : '定期更换');
+    h += '<div style="display:flex;flex-wrap:wrap;gap:16px;align-items:center;margin-bottom:10px">';
+    h += '<div><span style="color:var(--muted);font-size:.8rem">当前下载码</span>'
+      + '<div style="font-family:monospace;font-weight:700;font-size:1.05rem;letter-spacing:1px">'
+      + esc(cur.code || '') + '</div></div>';
+    h += '<div><span style="color:var(--muted);font-size:.8rem">有效期</span><div>' + expiry + '</div></div>';
+    h += '<div><span style="color:var(--muted);font-size:.8rem">已使用</span><div>'
+      + (cur.used_count || 0) + ' 次 / ' + (cur.device_count || 0) + ' 台设备</div></div>';
+    h += '</div>';
+    var cid = Number(cur.id) || 0;
+    h += '<div>';
+    h += '<button class="btn sm" onclick="copyDownloadCode()">📋 复制</button>';
+    h += '<button class="btn sm" style="margin-left:8px" onclick="rotateDownloadCode(' + cid + ')">🔄 立即更换</button>';
+    h += '<button class="btn sm" style="margin-left:8px" onclick="toggleDownloadPermanent(' + cid + ')">'
+      + (cur.mode === 'permanent' ? '⏱ 改成定期更换' : '♾ 设为永不过期') + '</button>';
+    h += '</div>';
+  }
+  if (ch && typeof ch.enabled !== 'undefined') {
+    h += '<div style="margin-top:12px;font-size:.78rem;color:var(--muted)">'
+      + '加速通道' + (ch.enabled ? '已开启' : '已关闭')
+      + ' · 今日 ' + (ch.used_today || 0) + '/' + (ch.daily_quota || 0) + ' 次（超出只放行 GitHub）'
+      + (ch.cos_ready === false ? ' · ⚠ 服务器未配置 COS 只读密钥，通道实际不可用' : '')
+      + '</div>';
+    h += '<div style="margin-top:8px">'
+      + '<button class="btn sm" onclick="toggleDownloadChannel()">'
+      + (ch.enabled ? '⏸ 关闭加速通道' : '▶ 开启加速通道') + '</button>'
+      + (ch.github_url ? '<a class="btn sm" style="margin-left:8px;text-decoration:none" href="'
+        + esc(ch.github_url) + '" target="_blank" rel="noopener">🐙 GitHub Release</a>' : '')
+      + '</div>';
+  }
+  h += '<div style="margin-top:10px;font-size:.78rem;color:var(--muted)">'
+    + '更换后旧码保留 24 小时过渡期：正在更新中的机器不会当场失效。'
+    + '定期模式下每 30 天自动换一次。</div>';
+  return h;
+}
+
+function _dlCall(path, body, okMsg) {
+  fetch(path, {
+    method: 'POST',
+    headers: apiHeaders(),
+    body: JSON.stringify(body || {})
+  }).then(function (r) { return r.json(); }).then(function (res) {
+    if (res && res.success) {
+      toast(okMsg || '✅ 已保存', 'success');
+      loadDownloadCodesPanel();
+    } else {
+      toast('❌ ' + ((res && res.message) || '操作失败'), 'error');
+    }
+  }).catch(function () { toast('❌ 网络错误', 'error'); });
+}
+
+function copyDownloadCode() {
+  var cur = _dlPanelData && _dlPanelData.current;
+  if (!cur || !cur.code) return;
+  var text = cur.code;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function () { toast('📋 下载码已复制', 'success'); },
+      function () { fallbackCopyDownloadCode(text); });
+  } else {
+    fallbackCopyDownloadCode(text);
+  }
+}
+
+function fallbackCopyDownloadCode(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); toast('📋 下载码已复制', 'success'); }
+  catch (e) { toast('❌ 复制失败，请手动选择：' + text, 'error'); }
+  document.body.removeChild(ta);
+}
+
+function rotateDownloadCode(cid) {
+  if (!cid) return;
+  if (!confirm('立即更换下载码？\n新码立刻生效，旧码保留 24 小时过渡期（正在更新的机器不会当场失效）。')) return;
+  _dlCall('/api/proxy/admin/dl/codes' + '/' + cid + '/rotate', {}, '🔄 下载码已更换');
+}
+
+function toggleDownloadPermanent(cid) {
+  if (!cid) return;
+  var cur = _dlPanelData && _dlPanelData.current;
+  var toPermanent = !(cur && cur.mode === 'permanent');
+  var msg = toPermanent
+    ? '设为永不过期？会换一个新码，之后不再自动轮换。\n只建议内部人少的时期用：码一旦流出只能手动更换。'
+    : '改成定期更换？会换一个新码，之后每 30 天自动轮换一次（旧码留 24 小时过渡期）。';
+  if (!confirm(msg)) return;
+  _dlCall('/api/proxy/admin/dl/codes' + '/' + cid + '/rotate',
+    toPermanent ? { mode: 'permanent' } : { mode: 'periodic', days: 30 },
+    toPermanent ? '♾ 已设为永不过期' : '⏱ 已改成定期更换');
+}
+
+function toggleDownloadChannel() {
+  var ch = _dlPanelData && _dlPanelData.channel;
+  var toOn = !(ch && ch.enabled);
+  if (!confirm(toOn
+    ? '开启 COS 加速通道？\n持有下载码的人可以从 COS 加速下载（按流量计费）。'
+    : '关闭 COS 加速通道？\n关闭后所有人都只能走 GitHub Release —— 不再产生 COS 流量费，但国内可能较慢。')) return;
+  _dlCall('/api/proxy/admin/dl/switch', { enabled: toOn },
+    toOn ? '▶ 加速通道已开启' : '⏸ 加速通道已关闭');
 }
 
 function loadLocalDeviceCard() {
