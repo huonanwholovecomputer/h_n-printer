@@ -202,20 +202,30 @@ const measureApp = () => page.evaluate(() => {
   };
 });
 
+/* 量 rect 之前必须让动画真的到终态：无头 Chrome 的动画时钟可能被冻在首帧
+   （sheetSpringIn 的 from 是 translateY+scale(0.94) ⇒ 量出来会整体缩水 6%，实测 223.13 vs 237.84）。
+   不靠「等多少毫秒」，直接把当前所有动画 finish 到终态再量。 */
+const settleAnimations = async () => {
+  await page.evaluate(() => {
+    document.getAnimations().forEach((a) => { try { a.finish(); } catch (e) { /* 无限动画 finish 会抛，忽略 */ } });
+  });
+  await page.waitForTimeout(60);
+};
+
 /* 两态：未同意（7 字「我已阅读并同意」）/ 已同意（2 字「完成」），走真实 renderPrivacySheetState */
 await page.evaluate(() => {
   try { localStorage.removeItem(PRIVACY_AGREE_KEY); } catch (e) {}
   printState.privacyAgreed = false;
   openPrivacySheet();
 });
-await page.waitForTimeout(700);            /* 等 sheetSpringIn(0.4s) + fadeIn(0.2s) 收尾，transform 会影响 rect */
+await settleAnimations();
 const app7 = await measureApp();
 
 await page.evaluate(() => {
   printState.privacyAgreed = true;
   renderPrivacySheetState();
 });
-await page.waitForTimeout(150);
+await settleAnimations();
 const app2 = await measureApp();
 
 console.log('\n--- APP 实测（430px 宽，cqw 缩放）---');
