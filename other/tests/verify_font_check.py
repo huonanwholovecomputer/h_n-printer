@@ -19,6 +19,8 @@
   ⑦ `purge_pdf_cache` 只删 `*.pdf`/`*.pdf.tmp`，**索引 json 必须留着**；
   ⑧ `PrintJob` 往返：`missing_fonts`/`font_checked`/`font_fp` 存得下、读得回；
   ⑨ 打印前闸门：缺字体时弹确认，点「否」必须**返回 False**（调用方据此不冻结、不取号、不上报）；
+  ⑨b 未嵌入字形但本机**装着** ⇒ 闸门与表格行同一口径（不标黄、不弹、不拦），只记一行日志
+      （2026-11-22 现场：行上没标黄，点开始打印反而弹「字体缺失」）；
   ⑩ 自动打印线（云端自动开始/无障碍预约/空闲补打/攒批放行）传 `interactive=False` 时
      **绝不弹模态**，只记日志 —— 那台机器要能无人值守，弹窗会把整条队列堵到第二天。
 
@@ -113,29 +115,34 @@ def _make_pdf(path: str, text: str = "hello") -> None:
     doc.close()
 
 
-def _make_nonembedded_pdf(path: str) -> None:
+def _make_nonembedded_pdf(path: str, basefont: str = "STSong-Light",
+                          pages: int = 1) -> None:
     """造一份**没有嵌入字形**的 Type0/CID 字体 PDF —— 就是 2026-10-31 那张成绩单的样子。
 
     iText 5.5 那类生成器只写 `BaseFont=STSong-Light` + `Encoding=UniGB-UCS2-H`，不给 FontFile
     字体程序 ⇒ 文件里只有字体名、没有轮廓，谁渲染谁替（查看器有自己的东方字体包，我们走
     MuPDF 光栅化就被换成内置无衬线兜底字形 —— 现场"屏幕宋体、纸上雅黑"的根因）。
+
+    `pages>1` 时每页各带一份字体资源（xref 不同、名字相同）—— 2026-11-22 现场就是这样：
+    SimSun 在第 0、4 页各有一份非嵌入资源，旧代码把同名报了两遍。
     """
     import fitz
     doc = fitz.open()
-    page = doc.new_page()
-    fd = doc.get_new_xref()
-    doc.update_object(fd, "<</Type/FontDescriptor/FontName/STSong-Light/Flags 4"
-                          "/FontBBox[0 -200 1000 900]/ItalicAngle 0"
-                          "/Ascent 880/Descent -120/CapHeight 700/StemV 80>>")
-    cid = doc.get_new_xref()
-    doc.update_object(cid, "<</Type/Font/Subtype/CIDFontType0/BaseFont/STSong-Light"
-                           "/CIDSystemInfo<</Registry(Adobe)/Ordering(GB1)/Supplement(4)>>"
-                           f"/FontDescriptor {fd} 0 R/DW 1000>>")
-    fnt = doc.get_new_xref()
-    doc.update_object(fnt, "<</Type/Font/Subtype/Type0/BaseFont/STSong-Light"
-                           f"/Encoding/UniGB-UCS2-H/DescendantFonts[{cid} 0 R]>>")
-    # 整块写 Resources（`Resources/Font/...` 走不通：新页的 Resources 是间接对象）
-    doc.xref_set_key(page.xref, "Resources", f"<</Font<</F1 {fnt} 0 R>>>>")
+    for _ in range(max(1, int(pages))):
+        page = doc.new_page()
+        fd = doc.get_new_xref()
+        doc.update_object(fd, f"<</Type/FontDescriptor/FontName/{basefont}/Flags 4"
+                              "/FontBBox[0 -200 1000 900]/ItalicAngle 0"
+                              "/Ascent 880/Descent -120/CapHeight 700/StemV 80>>")
+        cid = doc.get_new_xref()
+        doc.update_object(cid, f"<</Type/Font/Subtype/CIDFontType0/BaseFont/{basefont}"
+                               "/CIDSystemInfo<</Registry(Adobe)/Ordering(GB1)/Supplement(4)>>"
+                               f"/FontDescriptor {fd} 0 R/DW 1000>>")
+        fnt = doc.get_new_xref()
+        doc.update_object(fnt, f"<</Type/Font/Subtype/Type0/BaseFont/{basefont}"
+                               f"/Encoding/UniGB-UCS2-H/DescendantFonts[{cid} 0 R]>>")
+        # 整块写 Resources（`Resources/Font/...` 走不通：新页的 Resources 是间接对象）
+        doc.xref_set_key(page.xref, "Resources", f"<</Font<</F1 {fnt} 0 R>>>>")
     doc.save(path, garbage=1, deflate=True)
     doc.close()
 
@@ -294,6 +301,17 @@ check("pdf_nonembedded_fonts 同口径",
       "STSong-Light" in font_check.pdf_nonembedded_fonts(ne_pdf),
       str(font_check.pdf_nonembedded_fonts(ne_pdf)))
 
+# 2026-11-22 现场：同一字体在几页各有一份非嵌入资源（xref 不同、名字相同）⇒ 只报一次。
+# 旧代码按 (xref, 名字) 去重，于是「SimSun、SimSun」在弹框/日志/tooltip 里列两遍。
+_dedup_pdf = os.path.join(tmp, "nonembedded_twopage.pdf")
+_make_nonembedded_pdf(_dedup_pdf, "SimSun", pages=2)
+_dd_ne = font_check.pdf_nonembedded_fonts(_dedup_pdf)
+check("同名未嵌入字体（两页两份资源）只报一次",
+      _dd_ne == ["SimSun"], str(_dd_ne))
+check("check_file 的 nonembedded 也去重",
+      font_check.check_file(_dedup_pdf).get("nonembedded") == ["SimSun"],
+      str(font_check.check_file(_dedup_pdf).get("nonembedded")))
+
 print("⑥ check_epoch 记账")
 _st = os.path.join(tmp, "epoch.json")
 _r1 = font_check.check_epoch(state_path=_st, record=True)
@@ -420,17 +438,36 @@ if _has_gui:
               "没有把字体嵌进文件" in _txt and "本机没有安装的字体" not in _txt, _txt[:160])
         check("弹框里点名了那个字体和 PDF 文件名",
               "STSong-Light" in _txt and "nonembedded.pdf" in _txt, _txt[:160])
+        check("弹框标题分得清是「PDF 没嵌字形」还是「本机缺字体」",
+              bool(_asked) and _asked[0][0] == "PDF 没有嵌入字体", str(_asked[:1])[:80])
 
-        # 关键：**本机装了字体也一样要拦** —— 字形不在文件里，装字体不解决问题。
-        # （现场：用户装完 STSong-Light 后 missing 变空，但打出来还是雅黑字形）
+        # 没嵌入 + 本机没装 ⇒ 照拦（跟 missing_fonts 有没有被清空无关，判据看 is_installed）
         _asked.clear()
         _ne_job2 = printer_config.PrintJob(file_path=ne_pdf, copies=1, page_count=1,
                                            missing_fonts=[])
         _stub_ne2 = _Stub()
         _r_ne2 = _stub_ne2._font_gate([_ne_job2], interactive=True)
-        check("PDF 没嵌入字体：即使 missing_fonts 已为空也照样弹确认",
+        check("PDF 没嵌字形且本机没装：即使 missing_fonts 已为空也照样弹确认",
               len(_asked) == 1 and "没有把字体嵌进文件" in (_asked[0][1] if _asked else ""),
               f"asked={len(_asked)}")
+
+        # 2026-11-22 现场：没嵌字形但本机装着（SimSun，system_fonts 会按本机字形渲染）
+        # ⇒ 表格行按设计不标黄，闸门也不许弹。两处必须同一口径，否则又成了
+        # 「行上没事、点开始打印反而被拦」（用户现场就是这么被问住的）。
+        _ne_ok_pdf = os.path.join(tmp, "nonembedded_installed.pdf")
+        _make_nonembedded_pdf(_ne_ok_pdf, "SimSun")
+        _asked.clear()
+        _stub_ok = _Stub()
+        _ok_job = printer_config.PrintJob(file_path=_ne_ok_pdf, copies=1, page_count=1)
+        _r_ok = _stub_ok._font_gate([_ok_job], interactive=True)
+        check("PDF 没嵌字形但本机已装 ⇒ 不弹框、直接放行",
+              _r_ok is True and not _asked, f"r={_r_ok} asked={len(_asked)}")
+        check("不弹框时仍记一行「没嵌字形但本机装着」日志",
+              any("本机装着" in m for m in _stub_ok.logs), str(_stub_ok.logs[:2]))
+        check("本机已装未嵌入字体 ⇒ missing_fonts 为空（这不是缺字体）",
+              _ok_job.missing_fonts == [], str(_ok_job.missing_fonts))
+        check("本机已装未嵌入字体 ⇒ nonembedded_fonts 仍回写（tooltip 要讲清）",
+              _ok_job.nonembedded_fonts == ["SimSun"], str(_ok_job.nonembedded_fonts))
 
         # 自动线：interactive=False 时一个框都不许弹
         _asked.clear()
@@ -571,6 +608,11 @@ if _has_gui:
     _gate_body = _src.split("def _font_gate(", 1)[1].split("\n    def ", 1)[0]
     check("打印前闸门里**不调** purge_pdf_cache（2026-11-11 现场：删了 34 份 PDF ⇒ 预览失效）",
           "purge_pdf_cache" not in _gate_body)
+    # 2026-11-22：行上不标黄（_ne_all_ok）与闸门不弹必须是同一个判据，否则又会出现
+    # 「表格说没事、点开始打印被拦」。闸门里那道判据必须查 is_installed。
+    check("闸门与表格行同一口径：未嵌入字体先过 is_installed 才拦",
+          "_ne_bad" in _gate_body and "font_check.is_installed(n)" in _gate_body,
+          _gate_body[:0] or "见 _font_gate")
 
     # ⑫ selective 的行为级验收：只清"用到变更字体"那几个，其余 cached_pdf 一动不动，
     #    并且**一个 PDF 文件都不删**（删文件 = 预览失效，2026-11-11 现场）。

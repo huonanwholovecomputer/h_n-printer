@@ -689,6 +689,10 @@ def _fonts_in_pdf_detail(path: str) -> tuple[list[str], list[str], list[str], bo
       · `本机没装` ＝ 文件里写着要这个字体，这台机没装（docx 走 Word 转换时被替换）。
     现场 2026-10-31：iText 5.5.10 生成的学生成绩单 PDF，字体 `STSong-Light` + `UniGB-UCS2-H`
     编码、extract_font 返回 0 字节 ＝ 纯非嵌入 CID 字体。
+
+    `missing` / `nonembedded` 按字体名去重（同一字体在多个 xref / 多页各有一份资源）；
+    2026-11-22 现场：`C++第四次作业(1).pdf` 里 SimSun 在第 0、4 页各有一份非嵌入资源，
+    弹框与日志于是列成「SimSun、SimSun」。
     """
     try:
         import fitz  # PyMuPDF
@@ -698,6 +702,8 @@ def _fonts_in_pdf_detail(path: str) -> tuple[list[str], list[str], list[str], bo
     used: list[str] = []
     missing: list[str] = []
     nonembedded: list[str] = []
+    _ne_seen: set[str] = set()      # 按字体名去重：同一字体在几页/几个 xref 各有一份资源
+    _miss_seen: set[str] = set()    # 只该报一次（2026-11-22 现场：SimSun 被列了两遍）
     try:
         doc = fitz.open(path)
     except Exception as e:
@@ -730,12 +736,21 @@ def _fonts_in_pdf_detail(path: str) -> tuple[list[str], list[str], list[str], bo
                     embedded = False
                 # Type3 没有独立字体文件（内容就是字形绘制指令），交给驱动即可印
                 _is_type3 = str(ftype or "") == "Type3"
-                if not embedded and not _is_type3:
-                    nonembedded.append(base)
+                _no_glyphs = not embedded and not _is_type3
+                if _no_glyphs:
+                    # 去重：同一份非嵌入字体在每页的 Resources 里都有一条（xref 不同），
+                    # 不去重则「SimSun、SimSun」这样列两遍，tooltip 与弹框都在重复。
+                    _ne_key = _norm(base)
+                    if _ne_key not in _ne_seen:
+                        _ne_seen.add(_ne_key)
+                        nonembedded.append(base)
                 if not _missing_key(_norm(base)):
                     continue
-                if not embedded and not _is_type3:
-                    missing.append(base)
+                if _no_glyphs:
+                    _miss_key = _norm(base)
+                    if _miss_key not in _miss_seen:
+                        _miss_seen.add(_miss_key)
+                        missing.append(base)
     finally:
         try:
             doc.close()
@@ -751,9 +766,9 @@ def fonts_in_pdf(path: str) -> tuple[list[str], list[str], bool]:
 
 
 def pdf_nonembedded_fonts(path: str) -> list[str]:
-    """这份 PDF 里**没有嵌入字形**的字体名（打印时只能被替换）。"""
+    """这份 PDF 里**没有嵌入字形**的字体名（打印时只能被替换）。同名只报一次。"""
     try:
-        return list(_fonts_in_pdf_detail(path)[2])
+        return list(dict.fromkeys(_fonts_in_pdf_detail(path)[2]))
     except Exception:
         return []
 

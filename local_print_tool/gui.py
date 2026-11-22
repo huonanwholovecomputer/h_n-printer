@@ -3805,9 +3805,11 @@ FONT_NOTE_BUILTIN_GLYPH = "西文不做字形替换，打印用内置等价字�
 
 
 def _font_help_names(job) -> tuple:
-    """(本机没装的名字, PDF 里没嵌入字形的名字)。"""
-    miss = [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
-    ne = [str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()]
+    """(本机没装的名字, PDF 里没嵌入字形的名字)。同名只留一次（旧配置里存过重复）。"""
+    miss = list(dict.fromkeys(
+        str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()))
+    ne = list(dict.fromkeys(
+        str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()))
     return miss, ne
 
 
@@ -12714,8 +12716,10 @@ class MainWindow(QMainWindow):
         2026-11-02 现场：装了字体、把文件重新添加一遍提示照旧（转换缓存与字体指纹都命中）
         ⇒ 台词改成指路右键「🔄 重新转换」，那条路径会重新枚举字体并清掉转换缓存。
         """
-        _miss = [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
-        _ne = [str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()]
+        _miss = list(dict.fromkeys(
+            str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()))
+        _ne = list(dict.fromkeys(
+            str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()))
         blocks = []
         if _ne:
             # 2026-11-18 现场：装好 SimSun 后 tooltip 照旧说「没装 ⇒ 用内置字形代替」，
@@ -12947,14 +12951,20 @@ class MainWindow(QMainWindow):
             self._log("🖋 已按当前已装字体重查 %d 个文件的字体提示" % len(fresh))
 
     def _font_gate(self, flat_jobs: list, interactive: bool = True) -> bool:
-        """打印前拦一道：这批文件里有本机没装的字体就问一句。返回 False = 用户取消。
+        """打印前拦一道：这批文件里有**本机确实没装**的字体就问一句。返回 False = 用户取消。
 
         两种"缺"要分开讲，别混成一句话：
           · `.docx` 缺字体＝本机没装这个字体，Word 转换时会静默替换（排版真的会变）；
-          · `.pdf` 没嵌入字体＝文件里只有字体名、没有字形数据，谁渲染谁替（查看器自带东方
-            字体包所以屏幕上正常，我们走 MuPDF 光栅化就换成内置无衬线兜底字形）。
+          · `.pdf` 没嵌入字体＝文件里只有字体名、没有字形数据，**本机又没装** ⇒ 谁渲染谁替
+            （查看器自带东方字体包所以屏幕上正常，我们走 MuPDF 光栅化就换成内置兜底字形）。
         所以这里**查源文件、不查转换后的 PDF**（对 docx 而言）：转换出来的 PDF 里写的已经是
         替换后的字体名 —— 查它永远查不出缺字体。
+
+        2026-11-22 现场：`C++第四次作业(1).pdf` 只有两页的 SimSun 没嵌字形，本机却装着
+        SimSun（`system_fonts` 给 MuPDF 装了 CJK 回调，按本机字形渲染，纸面与原件一致）。
+        表格行按设计不标黄，点开始打印却弹「字体缺失」——同一件事两套判据。现在闸门与表格行
+        （`_fill_table_row` 的 `_ne_all_ok`）用**同一口径**：文件没带字形、本机装着 ⇒ 不拦，
+        只记一行日志；只有「本机确实没有」的字体才提醒。
         """
         # 会话中途装了/删了字体：旧缓存是按替换字体排的版 ⇒ 只作废这些文件的
         # cached_pdf 引用（**不删文件**：删了预览就再也打不开，2026-11-11 现场）。
@@ -12966,8 +12976,9 @@ class MainWindow(QMainWindow):
             fp = font_check.fonts_fingerprint()
         except Exception:
             fp = ""
-        # [(显示名, 缺的字体名列表, 是不是 PDF, 其中没嵌入的字体名小写集合)]
+        # [(显示名, 要提醒的字体名列表, 是不是 PDF, 其中没嵌入的字体名小写集合)]
         entries: list = []
+        _settled: list = []     # 没带字形但本机装着：不拦，放行时只记一行日志
         for job in (flat_jobs or []):
             path = getattr(job, "file_path", "") or ""
             if not path:
@@ -12988,24 +12999,33 @@ class MainWindow(QMainWindow):
             _ne_names: list = []
             if _is_pdf:
                 try:                    # 只在 PDF 上多读一次，0.02s 量级
-                    _ne_names = [str(x) for x in font_check.pdf_nonembedded_fonts(path)
-                                 if str(x).strip()]
+                    _ne_names = list(dict.fromkeys(
+                        str(x) for x in font_check.pdf_nonembedded_fonts(path)
+                        if str(x).strip()))
                     _ne = {x.strip().lower() for x in _ne_names}
                     # 顺手回写，让表格 tooltip 与闸门口径一致（行不会重画也不影响，下次重画即对齐）
                     job.nonembedded_fonts = list(_ne_names)
                 except Exception:
                     _ne, _ne_names = set(), []
-            # 要警的字体 = 本机没装 ∪ PDF 没嵌入。
-            # 注意：**PDF 没嵌入的字体即使本机装了也照样替**（字形不在文件里，MuPDF 不查系统字体）
-            # ⇒ 这一路必须单独算，不能只靠 missing_fonts（用户装完字体后 missing 就空了）。
-            _miss = list(dict.fromkeys(
-                [str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()]
-                + _ne_names))
-            if not _miss:
+            # 与表格行（_fill_table_row 的 _ne_all_ok）**同一判据**：文件没带字形、但本机
+            # 字体都装着 ⇒ system_fonts 用本机字形渲染，纸面和原件一致，没有要修的东西，
+            # 不拦也不弹。真正要提醒的只有「本机确实没有」的字体。
+            # 2026-11-22 现场：SimSun 只在两页没嵌字形、本机却装着，行上不标黄，开打却弹框。
+            _missing_fonts = list(dict.fromkeys(
+                str(x).strip() for x in (getattr(job, "missing_fonts", []) or [])
+                if str(x).strip()))
+            _ne_bad = [n for n in _ne_names if not font_check.is_installed(n)]
+            _show = list(dict.fromkeys(_missing_fonts + _ne_bad))
+            if not _show:
+                if _ne_names:
+                    _settled.append(job.display_name or os.path.basename(path))
                 continue
             # 用 list 而不是按显示名做 key：同名文件（两个「作业(1).docx」）不许互相顶掉
-            entries.append((job.display_name or os.path.basename(path), _miss, _is_pdf, _ne))
+            entries.append((job.display_name or os.path.basename(path), _show, _is_pdf, _ne))
         if not entries:
+            for _name in _settled:
+                self._log("ℹ " + str(_name) + "：PDF 没把字体嵌进文件，但本机装着"
+                          "（中文用系统字形、西文用内置等价字形），不提示、不拦。")
             return True
 
         def _all_nonembedded(_job_fonts, _ne) -> bool:
@@ -13022,18 +13042,21 @@ class MainWindow(QMainWindow):
         _pure_pdf = all(_is_pdf and _all_nonembedded(fonts, _ne)
                         for _n, fonts, _is_pdf, _ne in entries)
         if _pure_pdf:
-            self._log("⚠ 下列 PDF 没有嵌入字体（文件里只有字体名，没有字形数据）：\n" + detail)
+            self._log("⚠ 下列 PDF 没把字体嵌进文件、本机也没装（打印时用内置字形代替）：\n"
+                      + detail)
+            _title = "PDF 没有嵌入字体"
             _intro = ("以下 PDF 生成时没有把字体嵌进文件里（文件里只有字体名，没有字形数据）：\n\n"
                       + detail
                       + "\n\n打印时只能用替代字形 —— 你在 PDF 查看器里看是正常的，是因为查看器"
                         "自带那套字体；本工具走光栅化渲染，会换成另一套字形，所以纸上的字体"
                         "可能和你屏幕上看到的不同。\n"
                         "页数、位置、分页不受影响，只是字形不同。\n"
-                        "想让纸面完全一致：让生成方重新导出「嵌入字体」的 PDF，或用能自带该"
-                        "字体的阅读器直接打印这份文件。\n\n仍要继续打印吗？")
+                        "想让纸面完全一致：让生成方重新导出「嵌入字体」的 PDF，或先把上面这些"
+                        "字体装到本机再打（装了以后中文按本机字形渲染）。\n\n仍要继续打印吗？")
         else:
             self._log("⚠ 本机缺少下列字体（转换/渲染时会被相近字体替换，排版可能有出入）：\n"
                       + detail)
+            _title = "缺少字体"
             _intro = ("以下文件用到了本机没有安装的字体：\n\n" + detail
                       + "\n\nWord 转换 PDF 时会用相近字体替换（PDF 则看生成方有没有把字体嵌进去），"
                         "打印结果的字形/字宽/换行可能与该文件原样不同。\n"
@@ -13044,7 +13067,7 @@ class MainWindow(QMainWindow):
             self._log("▶ 自动打印任务：已记录字体问题，继续打印")
             return True
         reply = QMessageBox.question(
-            self, "字体缺失", _intro,
+            self, _title, _intro,
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
